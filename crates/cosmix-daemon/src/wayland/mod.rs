@@ -20,7 +20,7 @@ use cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_
 // Re-export for use in submodules
 pub(crate) use wayland_client;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ToplevelInfo {
     pub title: String,
     pub app_id: String,
@@ -40,7 +40,7 @@ pub struct Geometry {
     pub height: i32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct WorkspaceInfo {
     pub name: String,
     pub active: bool,

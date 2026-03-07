@@ -53,62 +53,52 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn dispatch(request: IpcRequest, _state: &SharedState, _events: &EventBus) -> IpcResponse {
+async fn dispatch(request: IpcRequest, state: &SharedState, _events: &EventBus) -> IpcResponse {
     match request {
         IpcRequest::Ping => IpcResponse::success(serde_json::json!("pong")),
 
         IpcRequest::ListWindows => {
-            // Use direct Wayland connection for fresh data
-            match crate::wayland::connect() {
-                Ok((_conn, _eq, wl_state)) => {
-                    let mut windows: Vec<serde_json::Value> = wl_state.toplevels.values()
-                        .filter(|w| !w.app_id.is_empty() || !w.title.is_empty())
-                        .map(|w| {
-                            serde_json::json!({
-                                "app_id": w.app_id,
-                                "title": w.title,
-                                "activated": w.activated,
-                                "maximized": w.maximized,
-                                "minimized": w.minimized,
-                                "fullscreen": w.fullscreen,
-                                "sticky": w.sticky,
-                                "geometry": w.geometry.as_ref().map(|g| serde_json::json!({
-                                    "x": g.x, "y": g.y, "width": g.width, "height": g.height
-                                })),
-                            })
-                        }).collect();
-                    windows.sort_by(|a, b| {
-                        let a_id = a["app_id"].as_str().unwrap_or("");
-                        let b_id = b["app_id"].as_str().unwrap_or("");
-                        a_id.cmp(b_id)
-                    });
-                    IpcResponse::success(serde_json::Value::Array(windows))
-                }
-                Err(e) => IpcResponse::error(&e.to_string()),
-            }
+            let s = state.read().unwrap();
+            let mut windows: Vec<serde_json::Value> = s.windows.values()
+                .map(|w| {
+                    serde_json::json!({
+                        "app_id": w.app_id,
+                        "title": w.title,
+                        "activated": w.activated,
+                        "maximized": w.maximized,
+                        "minimized": w.minimized,
+                        "fullscreen": w.fullscreen,
+                        "sticky": w.sticky,
+                        "geometry": w.geometry.as_ref().map(|g| serde_json::json!({
+                            "x": g.x, "y": g.y, "width": g.width, "height": g.height
+                        })),
+                    })
+                }).collect();
+            windows.sort_by(|a, b| {
+                let a_id = a["app_id"].as_str().unwrap_or("");
+                let b_id = b["app_id"].as_str().unwrap_or("");
+                a_id.cmp(b_id)
+            });
+            IpcResponse::success(serde_json::Value::Array(windows))
         }
 
         IpcRequest::ListWorkspaces => {
-            match crate::wayland::connect() {
-                Ok((_conn, _eq, wl_state)) => {
-                    let mut workspaces: Vec<serde_json::Value> = wl_state.workspaces.values().map(|ws| {
-                        serde_json::json!({
-                            "name": ws.name,
-                            "active": ws.active,
-                            "urgent": ws.urgent,
-                            "hidden": ws.hidden,
-                            "coordinates": ws.coordinates,
-                        })
-                    }).collect();
-                    workspaces.sort_by(|a, b| {
-                        let a_name = a["name"].as_str().unwrap_or("");
-                        let b_name = b["name"].as_str().unwrap_or("");
-                        a_name.cmp(b_name)
-                    });
-                    IpcResponse::success(serde_json::Value::Array(workspaces))
-                }
-                Err(e) => IpcResponse::error(&e.to_string()),
-            }
+            let s = state.read().unwrap();
+            let mut workspaces: Vec<serde_json::Value> = s.workspaces.values().map(|ws| {
+                serde_json::json!({
+                    "name": ws.name,
+                    "active": ws.active,
+                    "urgent": ws.urgent,
+                    "hidden": ws.hidden,
+                    "coordinates": ws.coordinates,
+                })
+            }).collect();
+            workspaces.sort_by(|a, b| {
+                let a_name = a["name"].as_str().unwrap_or("");
+                let b_name = b["name"].as_str().unwrap_or("");
+                a_name.cmp(b_name)
+            });
+            IpcResponse::success(serde_json::Value::Array(workspaces))
         }
 
         IpcRequest::GetClipboard => {

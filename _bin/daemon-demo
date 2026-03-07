@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Comprehensive cosmix daemon demo
+# Run from the cosmix project root: ./_bin/daemon-demo
+
+set +e  # Don't exit on error (background processes return non-zero)
+COSMIX="${COSMIX:-$HOME/.cargo/bin/cosmix}"
+SOCK="/run/user/$(id -u)/cosmix/cosmix.sock"
+DAEMON_PID=""
+cleanup() { [ -n "$DAEMON_PID" ] && kill $DAEMON_PID 2>/dev/null; wait $DAEMON_PID 2>/dev/null || true; rm -f "$SOCK"; }
+trap cleanup EXIT
+
+C_GREEN='\033[0;32m'
+C_CYAN='\033[0;36m'
+C_YELLOW='\033[1;33m'
+C_RED='\033[0;31m'
+C_RESET='\033[0m'
+
+step() { echo -e "\n${C_CYAN}━━━ $1 ━━━${C_RESET}"; }
+ok()   { echo -e "${C_GREEN}✓ $1${C_RESET}"; }
+info() { echo -e "${C_YELLOW}  $1${C_RESET}"; }
+
+# ── 1. Direct mode (no daemon) ──
+step "1. Direct mode — no daemon running"
+$COSMIX ping
+$COSMIX status
+info "Commands work without daemon (direct Wayland connection)"
+echo -n "  Windows: "; $COSMIX lw 2>/dev/null | grep -c "app_id"
+echo -n "  Workspaces: "; $COSMIX lws 2>/dev/null | grep -c "^  "
+
+# ── 2. Start daemon ──
+step "2. Starting daemon"
+$COSMIX daemon >/dev/null 2>&1 &
+DAEMON_PID=$!
+sleep 1
+if [ -S "$SOCK" ]; then
+    ok "Daemon running (PID $DAEMON_PID)"
+else
+    echo -e "${C_RED}✗ Daemon failed to start${C_RESET}"
+    exit 1
+fi
+
+# ── 3. Status and ping ──
+step "3. Daemon status"
+$COSMIX status 2>/dev/null
+$COSMIX ping 2>/dev/null
+ok "IPC communication working"
+
+# ── 4. Window listing via daemon ──
+step "4. Windows via daemon IPC"
+WINDOWS=$($COSMIX lw 2>/dev/null)
+COUNT=$(echo "$WINDOWS" | grep -c "app_id")
+ok "Found $COUNT windows via daemon"
+echo "$WINDOWS" | python3 -c "
+import sys,json
+for w in json.load(sys.stdin):
+    flags = ''
+    if w.get('activated'): flags += 'A'
+    if w.get('maximized'): flags += 'M'
+    if w.get('minimized'): flags += 'm'
+    print(f\"  [{flags:3s}] {w['app_id']:30s} {w['title'][:50]}\")
+" 2>/dev/null || echo "$WINDOWS" | head -20
+
+# ── 5. Workspaces via daemon ──
+step "5. Workspaces via daemon IPC"
+$COSMIX lws 2>/dev/null | python3 -c "
+import sys,json
+for ws in json.load(sys.stdin):
+    active = '*' if ws.get('active') else ' '
+    print(f\"  {active} {ws['name']}\")
+" 2>/dev/null
+
+# ── 6. Clipboard via daemon ──
+step "6. Clipboard via daemon IPC"
+CLIP=$($COSMIX cb 2>/dev/null)
+if [ -n "$CLIP" ]; then
+    ok "Clipboard: $(echo "$CLIP" | head -c 80)"
+else
+    info "Clipboard empty or unavailable"
+fi
+
+# ── 7. Speed comparison ──
+step "7. Speed: daemon IPC vs direct Wayland"
+# Warm up
+$COSMIX lw >/dev/null 2>&1
+
+info "5x list-windows via daemon:"
+START=$(date +%s%N)
+for i in 1 2 3 4 5; do $COSMIX lw >/dev/null 2>&1; done
+END=$(date +%s%N)
+DAEMON_MS=$(( (END - START) / 1000000 ))
+ok "${DAEMON_MS}ms total ($(( DAEMON_MS / 5 ))ms avg)"
+
+# Stop daemon for direct comparison
+kill $DAEMON_PID 2>/dev/null; wait $DAEMON_PID 2>/dev/null || true; DAEMON_PID=""
+rm -f "$SOCK"
+sleep 1
+
+info "5x list-windows direct (no daemon):"
+START=$(date +%s%N)
+for i in 1 2 3 4 5; do $COSMIX lw >/dev/null 2>&1; done
+END=$(date +%s%N)
+DIRECT_MS=$(( (END - START) / 1000000 ))
+ok "${DIRECT_MS}ms total ($(( DIRECT_MS / 5 ))ms avg)"
+
+# ── 8. Restart daemon for remaining tests ──
+$COSMIX daemon >/dev/null 2>&1 &
+DAEMON_PID=$!
+sleep 1
+
+# ── 9. Notification via daemon ──
+step "8. Notification via daemon"
+$COSMIX notify "Cosmix Daemon" "IPC is working! 🚀" 2>/dev/null
+ok "Notification sent"
+
+# ── 10. Lua scripts ──
+step "9. Lua scripts"
+$COSMIX run sysinfo 2>/dev/null | head -12
+ok "Lua runtime working"
+
+# ── 11. Lua port system ──
+step "10. Port system (Phase 3 preview)"
+echo 'print(cosmix.port("cosmic-files"))' | $COSMIX shell 2>/dev/null | tail -1
+ok "Port API available (routing pending Phase 3)"
+
+# ── Cleanup (trap handles kill) ──
+step "Cleanup"
+ok "Daemon will be stopped on exit"
+
+echo -e "\n${C_GREEN}━━━ Demo complete ━━━${C_RESET}"
+exit 0

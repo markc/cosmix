@@ -67,6 +67,18 @@ impl Daemon {
         let events = self.events.clone();
         let config = Arc::new(self.config);
 
+        // Start Wayland poller thread (populates shared state every 500ms)
+        let poller_state = state.clone();
+        let _poller = state::spawn_wayland_poller(poller_state, 500);
+
+        // Do initial sync before accepting IPC (blocking, ensures state is populated)
+        if let Ok((_conn, _eq, wl_state)) = crate::wayland::connect() {
+            let mut s = state.write().unwrap();
+            s.sync_from_wayland(&wl_state);
+            tracing::info!("Initial state: {} windows, {} workspaces",
+                s.windows.len(), s.workspaces.len());
+        }
+
         // Start IPC server
         let ipc_config = config.clone();
         let ipc_state = state.clone();
