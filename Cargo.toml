@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/cosmix-daemon"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/markc/cosmix"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+cosmic-protocols = { version = "0.2", features = ["client"] }
+zbus = "5"

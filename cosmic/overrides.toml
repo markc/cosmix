@@ -1,0 +1,40 @@
+# Cosmic-comp override configuration
+#
+# Each section maps to a source file in cosmic-comp/src/
+# Keys are constant names, values are the desired Duration in milliseconds.
+#
+# To apply: ./patch.sh apply
+# To check: ./patch.sh status
+# To reset: ./patch.sh reset
+#
+# Source repo: ~/.gh/cosmic/cosmic-comp
+
+[shell.mod]
+# src/shell/mod.rs — overview/resize mode transitions
+ANIMATION_DURATION = 1
+
+[shell.layout.floating.mod]
+# src/shell/layout/floating/mod.rs — floating layout
+ANIMATION_DURATION = 1
+MINIMIZE_ANIMATION_DURATION = 1
+
+[shell.layout.tiling.mod]
+# src/shell/layout/tiling/mod.rs — tiling layout + workspace switch
+ANIMATION_DURATION = 1
+MINIMIZE_ANIMATION_DURATION = 1
+MOUSE_ANIMATION_DELAY = 0
+INITIAL_MOUSE_ANIMATION_DELAY = 0
+
+[shell.workspace]
+# src/shell/workspace.rs — fullscreen transitions
+FULLSCREEN_ANIMATION_DURATION = 1
+
+[shell.element.stack.tabs]
+# src/shell/element/stack/tabs.rs — tab bar animations
+SCROLL_ANIMATION_DURATION = 1
+TAB_ANIMATION_DURATION = 1
+
+[shell.grabs.moving]
+# src/shell/grabs/moving.rs — window rescale during drag
+# NOTE: This constant is f64, not Duration::from_millis() — uses f64 pattern
+RESCALE_ANIMATION_DURATION = "1.0:f64"

@@ -1,0 +1,19 @@
+# Rust
+target/
+**/*.rs.bk
+
+# COSMIC comp source (cloned separately, not tracked)
+cosmic/cosmic-comp/
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
