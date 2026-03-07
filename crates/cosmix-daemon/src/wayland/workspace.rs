@@ -1,48 +1,16 @@
-use anyhow::{Context, Result};
-use std::collections::HashMap;
-use wayland_client::{
-    Connection, Dispatch, Proxy, QueueHandle, WEnum,
-    protocol::{wl_output, wl_registry},
-};
+use anyhow::Result;
+use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum};
 use wayland_protocols::ext::workspace::v1::client::{
     ext_workspace_group_handle_v1::{self, ExtWorkspaceGroupHandleV1},
-    ext_workspace_handle_v1::{self, ExtWorkspaceHandleV1, State},
+    ext_workspace_handle_v1::{self, ExtWorkspaceHandleV1, State as WsState},
     ext_workspace_manager_v1::{self, ExtWorkspaceManagerV1},
 };
 
-#[derive(Debug, Default)]
-struct WorkspaceInfo {
-    name: String,
-    active: bool,
-    urgent: bool,
-    hidden: bool,
-}
+use super::{State, WorkspaceInfo};
 
-#[derive(Debug, Default)]
-struct WState {
-    workspaces: HashMap<u32, WorkspaceInfo>,
-    done: bool,
-}
+// ── ext_workspace_manager dispatch ──
 
-impl Dispatch<wl_registry::WlRegistry, ()> for WState {
-    fn event(
-        _state: &mut Self,
-        registry: &wl_registry::WlRegistry,
-        event: wl_registry::Event,
-        _data: &(),
-        _conn: &Connection,
-        qh: &QueueHandle<Self>,
-    ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
-            if interface == "ext_workspace_manager_v1" {
-                registry.bind::<ExtWorkspaceManagerV1, _, _>(name, version.min(1), qh, ());
-                tracing::debug!("Bound ext_workspace_manager_v1");
-            }
-        }
-    }
-}
-
-impl Dispatch<ExtWorkspaceManagerV1, ()> for WState {
+impl Dispatch<ExtWorkspaceManagerV1, ()> for State {
     fn event(
         state: &mut Self,
         _proxy: &ExtWorkspaceManagerV1,
@@ -52,17 +20,12 @@ impl Dispatch<ExtWorkspaceManagerV1, ()> for WState {
         _qh: &QueueHandle<Self>,
     ) {
         match event {
-            ext_workspace_manager_v1::Event::WorkspaceGroup { workspace_group: _ } => {
-                tracing::debug!("New workspace group");
-            }
+            ext_workspace_manager_v1::Event::WorkspaceGroup { .. } => {}
             ext_workspace_manager_v1::Event::Workspace { workspace } => {
                 let id = workspace.id().protocol_id();
                 state.workspaces.insert(id, WorkspaceInfo::default());
-                tracing::debug!("New workspace: id={id}");
             }
-            ext_workspace_manager_v1::Event::Done => {
-                state.done = true;
-            }
+            ext_workspace_manager_v1::Event::Done => {}
             _ => {}
         }
     }
@@ -74,12 +37,14 @@ impl Dispatch<ExtWorkspaceManagerV1, ()> for WState {
         match opcode {
             0 => qh.make_data::<ExtWorkspaceGroupHandleV1, _>(()),
             1 => qh.make_data::<ExtWorkspaceHandleV1, _>(()),
-            _ => panic!("Unknown child-creating opcode: {opcode}"),
+            _ => panic!("ext_workspace_manager: unknown child opcode {opcode}"),
         }
     }
 }
 
-impl Dispatch<ExtWorkspaceGroupHandleV1, ()> for WState {
+// ── ext_workspace_group_handle dispatch ──
+
+impl Dispatch<ExtWorkspaceGroupHandleV1, ()> for State {
     fn event(
         _state: &mut Self,
         _proxy: &ExtWorkspaceGroupHandleV1,
@@ -91,19 +56,9 @@ impl Dispatch<ExtWorkspaceGroupHandleV1, ()> for WState {
     }
 }
 
-impl Dispatch<wl_output::WlOutput, ()> for WState {
-    fn event(
-        _state: &mut Self,
-        _proxy: &wl_output::WlOutput,
-        _event: wl_output::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-    }
-}
+// ── ext_workspace_handle dispatch ──
 
-impl Dispatch<ExtWorkspaceHandleV1, ()> for WState {
+impl Dispatch<ExtWorkspaceHandleV1, ()> for State {
     fn event(
         state: &mut Self,
         proxy: &ExtWorkspaceHandleV1,
@@ -119,11 +74,17 @@ impl Dispatch<ExtWorkspaceHandleV1, ()> for WState {
             ext_workspace_handle_v1::Event::Name { name } => {
                 info.name = name;
             }
+            ext_workspace_handle_v1::Event::Coordinates { coordinates } => {
+                info.coordinates = coordinates
+                    .chunks(4)
+                    .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+            }
             ext_workspace_handle_v1::Event::State { state: ws_state } => {
                 if let WEnum::Value(s) = ws_state {
-                    info.active = s.contains(State::Active);
-                    info.urgent = s.contains(State::Urgent);
-                    info.hidden = s.contains(State::Hidden);
+                    info.active = s.contains(WsState::Active);
+                    info.urgent = s.contains(WsState::Urgent);
+                    info.hidden = s.contains(WsState::Hidden);
                 }
             }
             ext_workspace_handle_v1::Event::Removed => {
@@ -134,34 +95,47 @@ impl Dispatch<ExtWorkspaceHandleV1, ()> for WState {
     }
 }
 
+// ── Public commands ──
+
 pub fn list_workspaces() -> Result<()> {
-    let conn = Connection::connect_to_env().context("Failed to connect to Wayland compositor")?;
-    let display = conn.display();
-    let mut event_queue = conn.new_event_queue();
-    let qh = event_queue.handle();
-
-    let mut state = WState::default();
-
-    display.get_registry(&qh, ());
-
-    // Roundtrips to get globals then workspace events
-    event_queue.roundtrip(&mut state).context("Wayland roundtrip failed")?;
-    event_queue.roundtrip(&mut state).context("Wayland roundtrip failed")?;
+    let (_conn, _eq, state) = super::connect()?;
 
     if state.workspaces.is_empty() {
         println!("No workspaces found.");
         return Ok(());
     }
 
-    println!("{:<20} {:>6} {:>6} {:>6}", "NAME", "ACTIVE", "URGENT", "HIDDEN");
-    println!("{:<20} {:>6} {:>6} {:>6}", "----", "------", "------", "------");
-    for info in state.workspaces.values() {
+    println!(
+        "{:>4} {:<16} {:>6} {:>6} {:>6} {}",
+        "#", "NAME", "ACTIVE", "URGENT", "HIDDEN", "COORDS"
+    );
+    println!(
+        "{:>4} {:<16} {:>6} {:>6} {:>6} {}",
+        "-", "----", "------", "------", "------", "------"
+    );
+
+    let mut entries: Vec<_> = state.workspaces.values().collect();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    for (i, info) in entries.iter().enumerate() {
+        let coords = if info.coordinates.is_empty() {
+            String::new()
+        } else {
+            info.coordinates
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+
         println!(
-            "{:<20} {:>6} {:>6} {:>6}",
+            "{:>4} {:<16} {:>6} {:>6} {:>6} {}",
+            i + 1,
             info.name,
             if info.active { "*" } else { "" },
             if info.urgent { "*" } else { "" },
             if info.hidden { "*" } else { "" },
+            coords,
         );
     }
 
