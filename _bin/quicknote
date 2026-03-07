@@ -1,0 +1,15 @@
+#!/usr/bin/env -S cosmix run
+-- Quick note — dialog input, append to notes file
+-- Note: Lua script for cosmix desktop automation. cosmix.exec("date") is a
+-- trusted system call, not user input. No injection risk.
+local dialog = require("cosmix.dialog")
+
+local note = dialog.input("Quick note:")
+if note then
+    local home = cosmix.env("HOME")
+    local file = home .. "/.config/cosmix/notes.md"
+    local ts = cosmix.exec("date '+%Y-%m-%d %H:%M'"):gsub("\n", "")
+    local existing = cosmix.read_file(file) or ""
+    cosmix.write_file(file, existing .. "- " .. ts .. " — " .. note .. "\n")
+    cosmix.notify("Note saved", note)
+end

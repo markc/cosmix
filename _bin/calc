@@ -1,0 +1,21 @@
+#!/usr/bin/env -S cosmix run
+-- Quick calculator — evaluate Lua math expression
+local dialog = require("cosmix.dialog")
+
+local expr = dialog.input("Calculate:")
+if not expr then return end
+
+-- Lua math functions available: math.sin, math.sqrt, etc.
+local fn, err = loadstring("return " .. expr)
+if fn then
+    local ok, result = pcall(fn)
+    if ok then
+        local s = tostring(result)
+        cosmix.set_clipboard(s)
+        cosmix.notify("= " .. s, expr .. " (copied)")
+    else
+        cosmix.notify("Error", tostring(result))
+    end
+else
+    cosmix.notify("Error", tostring(err))
+end

@@ -1,0 +1,30 @@
+#!/usr/bin/env -S cosmix run
+-- Volume control — up/down/mute with notification
+-- Usage: volume up | volume down | volume mute | volume (shows dialog)
+-- Note: Lua script for cosmix desktop automation. All cosmix.exec() calls
+-- run trusted system commands (pactl), not user input.
+local dialog = require("cosmix.dialog")
+
+local arg = arg and arg[1]
+
+if not arg then
+    local choice = dialog.list("Volume:", {"Up 5%", "Down 5%", "Mute toggle"})
+    if choice == "Up 5%" then arg = "up"
+    elseif choice == "Down 5%" then arg = "down"
+    elseif choice == "Mute toggle" then arg = "mute"
+    else return end
+end
+
+if arg == "up" then
+    cosmix.exec("pactl set-sink-volume @DEFAULT_SINK@ +5%")
+elseif arg == "down" then
+    cosmix.exec("pactl set-sink-volume @DEFAULT_SINK@ -5%")
+elseif arg == "mute" then
+    cosmix.exec("pactl set-sink-mute @DEFAULT_SINK@ toggle")
+end
+
+-- Show current volume in notification
+local vol = cosmix.exec("pactl get-sink-volume @DEFAULT_SINK@ | head -1 | awk '{print $5}'"):gsub("\n", "")
+local muted = cosmix.exec("pactl get-sink-mute @DEFAULT_SINK@"):match("yes")
+local status = muted and "Muted" or vol
+cosmix.notify("Volume", status)

@@ -1,0 +1,21 @@
+#!/usr/bin/env -S cosmix run
+-- App launcher — pick from installed apps and launch
+local dialog = require("cosmix.dialog")
+local h = require("cosmix.helpers")
+
+local apps = cosmix.apps()
+local names = {}
+local lookup = {}
+for _, app in ipairs(apps) do
+    local label = app.name
+    if app.comment ~= "" then
+        label = label .. " — " .. h.truncate(app.comment, 40)
+    end
+    names[#names + 1] = label
+    lookup[label] = app
+end
+
+local choice = dialog.list("Launch app:", names)
+if choice and lookup[choice] then
+    cosmix.spawn(lookup[choice].exec)
+end

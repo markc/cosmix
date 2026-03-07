@@ -1,0 +1,33 @@
+#!/usr/bin/env -S cosmix run
+-- Transform clipboard text — upper/lower/title/trim/reverse
+local dialog = require("cosmix.dialog")
+
+local ok, clip = pcall(cosmix.clipboard)
+if not ok or #clip == 0 then
+    cosmix.notify("Clipboard", "Empty or unavailable")
+    return
+end
+
+local transforms = {"UPPERCASE", "lowercase", "Title Case", "Trim whitespace", "Reverse"}
+local choice = dialog.list("Transform clipboard:", transforms)
+if not choice then return end
+
+local result
+if choice == "UPPERCASE" then
+    result = clip:upper()
+elseif choice == "lowercase" then
+    result = clip:lower()
+elseif choice == "Title Case" then
+    result = clip:lower():gsub("(%a)([%w_']*)", function(first, rest)
+        return first:upper() .. rest
+    end)
+elseif choice == "Trim whitespace" then
+    result = clip:match("^%s*(.-)%s*$")
+elseif choice == "Reverse" then
+    result = clip:reverse()
+end
+
+if result then
+    cosmix.set_clipboard(result)
+    cosmix.notify("Clipboard transformed", choice)
+end

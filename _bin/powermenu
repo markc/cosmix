@@ -1,0 +1,27 @@
+#!/usr/bin/env -S cosmix run
+-- Power menu — lock, suspend, reboot, shutdown
+local dialog = require("cosmix.dialog")
+
+local actions = {
+    "Lock screen",
+    "Suspend",
+    "Reboot",
+    "Shutdown",
+    "Log out",
+}
+
+local choice = dialog.list("Power:", actions)
+if not choice then return end
+
+local cmds = {
+    ["Lock screen"] = "loginctl lock-session",
+    ["Suspend"]     = "systemctl suspend",
+    ["Reboot"]      = "systemctl reboot",
+    ["Shutdown"]    = "systemctl poweroff",
+    ["Log out"]     = "cosmic-session exit",
+}
+
+local cmd = cmds[choice]
+if cmd and (choice == "Lock screen" or choice == "Suspend" or dialog.confirm(choice .. "?")) then
+    cosmix.spawn(cmd)
+end

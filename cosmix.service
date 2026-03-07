@@ -1,0 +1,12 @@
+[Unit]
+Description=Cosmix Desktop Automation Daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/cosmix daemon
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

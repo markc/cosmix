@@ -1,0 +1,19 @@
+#!/usr/bin/env -S cosmix run
+-- Timer — set minutes, notify when done
+local dialog = require("cosmix.dialog")
+
+local input = dialog.input("Timer (minutes):")
+if not input then return end
+
+local mins = tonumber(input)
+if not mins or mins <= 0 then
+    cosmix.notify("Timer", "Invalid number: " .. input)
+    return
+end
+
+cosmix.notify("Timer set", mins .. " minute" .. (mins == 1 and "" or "s"))
+
+-- Sleep in background (ms)
+cosmix.sleep(mins * 60 * 1000)
+
+cosmix.notify("Timer done!", mins .. " minute" .. (mins == 1 and "" or "s") .. " elapsed")

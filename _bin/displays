@@ -1,0 +1,4 @@
+#!/usr/bin/env -S cosmix run
+-- Display info via COSMIC's native cosmic-randr
+-- This Lua script calls a hardcoded trusted command, not user input.
+print(cosmix.exec("cosmic-randr list"))

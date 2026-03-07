@@ -1,0 +1,5 @@
+#!/usr/bin/env -S cosmix run
+-- Screenshot via COSMIC's native cosmic-screenshot
+-- Usage: screenshot | screenshot ~/Pictures
+local dir = arg and arg[1]
+cosmix.screenshot(dir)

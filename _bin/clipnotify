@@ -1,0 +1,10 @@
+#!/usr/bin/env -S cosmix run
+-- Show clipboard contents in a notification
+local ok, clip = pcall(cosmix.clipboard)
+if ok and #clip > 0 then
+    local preview = clip:sub(1, 200)
+    if #clip > 200 then preview = preview .. "..." end
+    cosmix.notify("Clipboard", preview)
+else
+    cosmix.notify("Clipboard", "Empty or unavailable")
+end

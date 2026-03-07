@@ -1,0 +1,35 @@
+#!/usr/bin/env -S cosmix run
+-- System info summary
+-- Note: This is a Lua script for cosmix desktop automation, not Node.js.
+-- cosmix.exec() calls here run trusted system commands (uptime, uname, free),
+-- not user-supplied input. No injection risk.
+local h = require("cosmix.helpers")
+
+local host = cosmix.hostname()
+local user = cosmix.env("USER") or "unknown"
+local shell = cosmix.env("SHELL") or "unknown"
+local display = cosmix.env("WAYLAND_DISPLAY") or "unknown"
+local desktop = cosmix.env("XDG_CURRENT_DESKTOP") or "unknown"
+local uptime = cosmix.exec("uptime -p"):gsub("\n", "")
+local kernel = cosmix.exec("uname -r"):gsub("\n", "")
+local mem = cosmix.exec("free -h | awk '/Mem:/ {print $3 \"/\" $2}'"):gsub("\n", "")
+local load = cosmix.exec("cat /proc/loadavg | cut -d' ' -f1-3"):gsub("\n", "")
+
+print("=== System Info ===")
+print("  Host:      " .. host)
+print("  User:      " .. user)
+print("  Kernel:    " .. kernel)
+print("  Desktop:   " .. desktop)
+print("  Display:   " .. display)
+print("  Shell:     " .. shell)
+print("  Uptime:    " .. uptime)
+print("  Memory:    " .. mem)
+print("  Load:      " .. load)
+
+print("\n=== Desktop ===")
+local wins = cosmix.windows()
+print("  Windows:   " .. #wins)
+print("  Active WS: " .. (h.active_workspace() or "?"))
+
+local ws = cosmix.workspaces()
+print("  Workspaces: " .. #ws)

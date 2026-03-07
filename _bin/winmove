@@ -1,0 +1,34 @@
+#!/usr/bin/env -S cosmix run
+-- Move a window to another workspace (coming soon — needs workspace switch API)
+-- For now: pick a window, toggle maximize/minimize/fullscreen/sticky
+local dialog = require("cosmix.dialog")
+local h = require("cosmix.helpers")
+
+local wins = cosmix.windows()
+local names = {}
+local lookup = {}
+for _, w in ipairs(wins) do
+    local flags = ""
+    if w.maximized then flags = flags .. "[Max] " end
+    if w.minimized then flags = flags .. "[Min] " end
+    if w.fullscreen then flags = flags .. "[Full] " end
+    if w.sticky then flags = flags .. "[Sticky] " end
+    local label = flags .. w.app_id .. "  " .. h.truncate(w.title, 40)
+    names[#names + 1] = label
+    lookup[label] = w
+end
+
+local choice = dialog.list("Pick window:", names)
+if not choice or not lookup[choice] then return end
+
+local w = lookup[choice]
+local actions = {"Maximize", "Minimize", "Fullscreen", "Sticky", "Close"}
+local action = dialog.list(w.app_id .. ":", actions)
+if not action then return end
+
+if action == "Maximize" then cosmix.maximize(w.app_id)
+elseif action == "Minimize" then cosmix.minimize(w.app_id)
+elseif action == "Fullscreen" then cosmix.fullscreen(w.app_id)
+elseif action == "Sticky" then cosmix.sticky(w.app_id)
+elseif action == "Close" then cosmix.close(w.app_id)
+end

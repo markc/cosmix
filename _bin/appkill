@@ -1,0 +1,22 @@
+#!/usr/bin/env -S cosmix run
+-- Pick a window and close it (with confirmation)
+local dialog = require("cosmix.dialog")
+local h = require("cosmix.helpers")
+
+local wins = cosmix.windows()
+local names = {}
+local lookup = {}
+for _, w in ipairs(wins) do
+    local label = w.app_id .. "  " .. h.truncate(w.title, 50)
+    names[#names + 1] = label
+    lookup[label] = w
+end
+
+local choice = dialog.list("Close which window?", names)
+if choice and lookup[choice] then
+    local w = lookup[choice]
+    if dialog.confirm("Close " .. w.app_id .. "?") then
+        cosmix.close(w.app_id)
+        cosmix.notify("Closed", w.app_id)
+    end
+end

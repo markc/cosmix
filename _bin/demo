@@ -1,0 +1,41 @@
+#!/usr/bin/env -S cosmix run
+-- cosmix demo script
+local h = require("cosmix.helpers")
+
+print("=== Windows ===")
+local wins = cosmix.windows()
+for i, w in ipairs(wins) do
+    local flags = ""
+    if w.activated then flags = flags .. "A" end
+    if w.maximized then flags = flags .. "M" end
+    if w.minimized then flags = flags .. "m" end
+    local geo = ""
+    if w.geometry then
+        geo = string.format("%dx%d+%d+%d", w.geometry.width, w.geometry.height, w.geometry.x, w.geometry.y)
+    end
+    print(string.format("  [%s] %-30s %s  %s", flags, w.app_id, w.title:sub(1, 40), geo))
+end
+
+print("\n=== Workspaces ===")
+print("  Active: " .. (h.active_workspace() or "none"))
+local ws = cosmix.workspaces()
+for i, w in ipairs(ws) do
+    local active = w.active and " *" or ""
+    print(string.format("  %s%s", w.name, active))
+end
+
+print("\n=== Clipboard ===")
+local ok, clip = pcall(cosmix.clipboard)
+if ok then
+    if #clip > 80 then
+        print("  " .. clip:sub(1, 80) .. "...")
+    else
+        print("  " .. clip)
+    end
+else
+    print("  (no clipboard content: " .. tostring(clip) .. ")")
+end
+
+print("\n=== Notification ===")
+cosmix.notify("Cosmix", "Lua scripting is working!")
+print("  Notification sent!")

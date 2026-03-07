@@ -350,3 +350,55 @@ pub fn maximize_window(query: &str) -> Result<()> {
 
     Ok(())
 }
+
+pub fn fullscreen_window(query: &str) -> Result<()> {
+    let (conn, _eq, state) = super::connect()?;
+
+    let ext_id = find_toplevel(&state, query)
+        .ok_or_else(|| anyhow::anyhow!("No window matching '{query}'"))?;
+
+    let cosmic_handle = state.cosmic_handles.get(&ext_id)
+        .ok_or_else(|| anyhow::anyhow!("No cosmic handle for window"))?;
+
+    let manager = state.toplevel_manager.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("zcosmic_toplevel_manager not available"))?;
+
+    let info = &state.toplevels[&ext_id];
+    if info.fullscreen {
+        manager.unset_fullscreen(cosmic_handle);
+        conn.flush()?;
+        println!("Unfullscreened: {} — {}", info.app_id, info.title);
+    } else {
+        manager.set_fullscreen(cosmic_handle, None);
+        conn.flush()?;
+        println!("Fullscreened: {} — {}", info.app_id, info.title);
+    }
+
+    Ok(())
+}
+
+pub fn sticky_window(query: &str) -> Result<()> {
+    let (conn, _eq, state) = super::connect()?;
+
+    let ext_id = find_toplevel(&state, query)
+        .ok_or_else(|| anyhow::anyhow!("No window matching '{query}'"))?;
+
+    let cosmic_handle = state.cosmic_handles.get(&ext_id)
+        .ok_or_else(|| anyhow::anyhow!("No cosmic handle for window"))?;
+
+    let manager = state.toplevel_manager.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("zcosmic_toplevel_manager not available"))?;
+
+    let info = &state.toplevels[&ext_id];
+    if info.sticky {
+        manager.unset_sticky(cosmic_handle);
+        conn.flush()?;
+        println!("Unstickied: {} — {}", info.app_id, info.title);
+    } else {
+        manager.set_sticky(cosmic_handle);
+        conn.flush()?;
+        println!("Stickied: {} — {}", info.app_id, info.title);
+    }
+
+    Ok(())
+}
