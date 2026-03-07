@@ -97,6 +97,10 @@ impl App {
 
 **NO Python. Ever.**
 
+## GUI Policy
+
+All cosmix GUI apps **must use libcosmic** (`pop-os/libcosmic`), not raw `iced`. libcosmic provides the COSMIC header bar, theming, window decorations, and navigation — apps should not reimplement these. Use `cosmic::Application` trait, `cosmic::app::run()`, and `cosmic::widget::*`.
+
 ## Key Crates
 
 | Crate | Purpose |

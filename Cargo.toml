@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/cosmix-daemon"]
+members = ["crates/cosmix-daemon", "crates/cosmix-mail", "crates/cosmix-port", "crates/cosmix-calc"]
 
 [workspace.package]
 edition = "2024"
@@ -17,6 +17,7 @@ anyhow = "1"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
 cosmic-protocols = { version = "0.2", features = ["client"] }
 zbus = "5"
 mlua = { version = "0.11", features = ["luajit", "vendored", "serialize"] }
@@ -24,5 +25,8 @@ os_pipe = "1"
 glob = "0.3"
 libc = "0.2"
 iced = { version = "0.13", features = ["tokio"] }
+libcosmic = { git = "https://github.com/pop-os/libcosmic/", default-features = false, features = ["debug", "winit", "tokio", "wgpu", "wayland"] }
 toml_cfg = { package = "toml", version = "0.8" }
 directories = "6"
+ureq = { version = "3", features = ["json"] }
+meval = "0.2"
