@@ -2,9 +2,6 @@
 target/
 **/*.rs.bk
 
-# COSMIC comp source (cloned separately, not tracked)
-cosmic/cosmic-comp/
-
 # Editor/IDE
 .idea/
 .vscode/
