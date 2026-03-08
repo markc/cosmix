@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/cosmix-daemon", "crates/cosmix-mail", "crates/cosmix-port", "crates/cosmix-calc", "crates/cosmix-view"]
+members = ["crates/cosmix-daemon", "crates/cosmix-mail", "crates/cosmix-markdown", "crates/cosmix-port", "crates/cosmix-calc", "crates/cosmix-view"]
 
 [workspace.package]
 edition = "2024"
@@ -30,3 +30,5 @@ toml_cfg = { package = "toml", version = "0.8" }
 directories = "6"
 ureq = { version = "3", features = ["json"] }
 meval = "0.2"
+png = "0.17"
+chrono = "0.4"

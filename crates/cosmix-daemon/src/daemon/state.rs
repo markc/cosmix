@@ -6,6 +6,8 @@ use crate::wayland::WorkspaceInfo;
 /// Re-export ToplevelInfo as WindowInfo for a cleaner public API.
 pub use crate::wayland::ToplevelInfo as WindowInfo;
 
+use super::registry::PortRegistry;
+
 /// Thread-safe shared daemon state.
 pub type SharedState = Arc<RwLock<DaemonState>>;
 
@@ -21,6 +23,9 @@ pub struct DaemonState {
     /// Current clipboard text content, if any.
     pub clipboard_text: Option<String>,
 
+    /// Registry of discovered app ports (Layer 3).
+    pub port_registry: PortRegistry,
+
     /// Set to `false` to signal all daemon tasks to shut down.
     pub running: bool,
 }
@@ -32,6 +37,7 @@ impl DaemonState {
             windows: HashMap::new(),
             workspaces: HashMap::new(),
             clipboard_text: None,
+            port_registry: PortRegistry::new(),
             running: true,
         }))
     }

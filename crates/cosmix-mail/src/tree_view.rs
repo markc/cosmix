@@ -249,7 +249,7 @@ impl TreeView {
     ) -> Element<'_, Message> {
         let spacing = cosmic::theme::spacing();
 
-        widget_view(&self.model, on_activate, spacing.space_xs)
+        widget_view(&self.model, on_activate, spacing.space_m)
     }
 }
 

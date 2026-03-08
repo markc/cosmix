@@ -138,6 +138,18 @@ fn try_via_daemon(command: &str, args: &[String]) -> Option<Result<()>> {
                 .and_then(|s| serde_json::from_str(s).ok());
             Some(ipc::protocol::IpcRequest::DbusCall { service, path, interface, method, args: dbus_args, system: true })
         }
+        "call" => {
+            let port = args.get(2)?.to_string();
+            let port_command = args.get(3)?.to_string();
+            let call_args: Option<serde_json::Value> = args.get(4)
+                .and_then(|s| serde_json::from_str(s).ok());
+            Some(ipc::protocol::IpcRequest::CallPort { port, port_command, args: call_args })
+        }
+        "list-ports" | "lp" => Some(ipc::protocol::IpcRequest::ListPorts),
+        "screenshot" | "ss" => {
+            let path = args.get(2).cloned();
+            Some(ipc::protocol::IpcRequest::Screenshot { path })
+        }
         "status" => Some(ipc::protocol::IpcRequest::Status),
         "ping" => Some(ipc::protocol::IpcRequest::Ping),
         _ => None,
@@ -286,6 +298,67 @@ fn run_direct(command: &str, args: &[String]) -> Result<()> {
             println!("{result}");
         }
 
+        // Port commands (direct mode — no daemon)
+        "call" => {
+            let port_name = require_arg(args, 2, "cosmix call <port> <command> [args_json]");
+            let command = require_arg(args, 3, "cosmix call <port> <command> [args_json]");
+            let call_args: serde_json::Value = args.get(4)
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(serde_json::Value::Null);
+
+            // Try conventional socket path
+            let lower = port_name.to_lowercase();
+            let socket_path = cosmix_port::Port::socket_path(&lower);
+            if !socket_path.exists() {
+                anyhow::bail!("Port '{port_name}' not found (no socket at {})", socket_path.display());
+            }
+            let rt = tokio::runtime::Runtime::new()?;
+            let result = rt.block_on(cosmix_port::call_port(
+                &socket_path.to_string_lossy(),
+                command,
+                call_args,
+            ))?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        "list-ports" | "lp" => {
+            // In direct mode, just scan the port directory
+            let port_dir = daemon::config::DaemonConfig::default().daemon.port_dir;
+            let dir = std::path::Path::new(&port_dir);
+            println!("Built-in ports:");
+            for name in &["clipboard", "windows", "screenshot", "dbus", "config", "mail", "midi", "notify", "input"] {
+                println!("  {name}");
+            }
+            println!("\nApp ports:");
+            if dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) == Some("sock") {
+                            if let Some(name) = path.file_stem().and_then(|f| f.to_str()) {
+                                println!("  {} ({})", name.to_uppercase(), path.display());
+                            }
+                        }
+                    }
+                }
+            } else {
+                println!("  (none — port directory does not exist)");
+            }
+        }
+
+        // Screenshot (native Wayland)
+        "screenshot" | "ss" => {
+            let path = match args.get(2) {
+                Some(p) => std::path::PathBuf::from(p),
+                None => {
+                    let dir = wayland::screenshot::screenshots_dir();
+                    let ts = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+                    dir.join(format!("Screenshot_{ts}.png"))
+                }
+            };
+            let result = wayland::screenshot::capture_screenshot(&path)?;
+            println!("{}", result.display());
+        }
+
         // Lua scripting
         "run" | "r" => {
             let path = require_arg(args, 2, "cosmix run <script> [args...]");
@@ -367,6 +440,13 @@ fn print_help() {
     eprintln!("  dbus <service> <path> <iface> <method> [args_json]  Call session bus");
     eprintln!("  dbus-system <service> <path> <iface> <method> [args_json]  Call system bus");
     eprintln!("  dbus-list <service> [path]            Introspect D-Bus service");
+    eprintln!();
+    eprintln!("Screenshot (native Wayland, no external tools):");
+    eprintln!("  screenshot (ss) [path]  Capture full-screen screenshot as PNG");
+    eprintln!();
+    eprintln!("Port commands (ARexx-style):");
+    eprintln!("  call <port> <cmd> [json] Call a command on an app port");
+    eprintln!("  list-ports (lp)          List all registered ports");
     eprintln!();
     eprintln!("Lua scripting:");
     eprintln!("  run (r) <script>        Execute a Lua script");

@@ -1,9 +1,60 @@
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use cosmic::app::Settings;
-use cosmic::iced::{Length, Size};
-use cosmic::widget::{button, column, container, row, text, text_input};
+use cosmic::iced::{self, Length, Size};
+use cosmic::widget::menu::{self, key_bind::Modifier, ItemHeight, ItemWidth, KeyBind};
+use cosmic::widget::{button, column, container, icon, row, text, text_input};
 use cosmic::{executor, Core, Element};
+
+static MENU_ID: LazyLock<iced::id::Id> = LazyLock::new(|| iced::id::Id::new("calc_menu"));
+
+// ── Menu Actions ──
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MenuAction {
+    CopyResult,
+    CopyExpression,
+    Paste,
+    ClearHistory,
+    Quit,
+    About,
+}
+
+impl menu::Action for MenuAction {
+    type Message = Msg;
+
+    fn message(&self) -> Msg {
+        match self {
+            MenuAction::CopyResult => Msg::CopyResult,
+            MenuAction::CopyExpression => Msg::CopyExpression,
+            MenuAction::Paste => Msg::Paste,
+            MenuAction::ClearHistory => Msg::ClearHistory,
+            MenuAction::Quit => Msg::Quit,
+            MenuAction::About => Msg::About,
+        }
+    }
+}
+
+fn key_binds() -> HashMap<KeyBind, MenuAction> {
+    use iced::keyboard::{key::Named, Key};
+
+    let mut kb = HashMap::new();
+    macro_rules! bind {
+        ([$($m:ident),+], $key:expr, $action:ident) => {
+            kb.insert(KeyBind { modifiers: vec![$(Modifier::$m),+], key: $key }, MenuAction::$action);
+        };
+    }
+
+    bind!([Ctrl], Key::Character("c".into()), CopyResult);
+    bind!([Ctrl, Shift], Key::Character("c".into()), CopyExpression);
+    bind!([Ctrl], Key::Character("v".into()), Paste);
+    bind!([Ctrl], Key::Character("q".into()), Quit);
+    bind!([Ctrl], Key::Named(Named::Delete), ClearHistory);
+
+    kb
+}
 
 // ── Calculator Engine ──
 
@@ -161,13 +212,26 @@ enum Msg {
     MemAdd,
     MemSub,
     ExprInput(String),
+    // Menu
+    CopyResult,
+    CopyExpression,
+    Paste,
+    Pasted(Option<String>),
+    ClearHistory,
+    Quit,
+    About,
+    Surface(cosmic::surface::Action),
+    SyncFromPort,
 }
 
 struct CalcApp {
     core: Core,
     engine: Arc<Mutex<CalcEngine>>,
+    port_dirty: Arc<AtomicBool>,
+    keybinds: HashMap<KeyBind, MenuAction>,
     display_cache: String,
     memory_cache: String,
+    history_count: usize,
     _port_handle: Option<cosmix_port::PortHandle>,
 }
 
@@ -191,50 +255,223 @@ impl cosmic::Application for CalcApp {
         core.window.content_container = true;
 
         let engine = Arc::new(Mutex::new(CalcEngine::new()));
-        let port_handle = start_port(engine.clone());
+        let port_dirty = Arc::new(AtomicBool::new(false));
+        let port_handle = start_port(engine.clone(), port_dirty.clone());
 
         (
             Self {
                 core,
                 engine,
+                port_dirty,
+                keybinds: key_binds(),
                 display_cache: "0".into(),
                 memory_cache: String::new(),
+                history_count: 0,
                 _port_handle: port_handle,
             },
             cosmic::app::Task::none(),
         )
     }
 
+    fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
+        vec![cosmic::widget::responsive_menu_bar()
+            .item_height(ItemHeight::Dynamic(40))
+            .item_width(ItemWidth::Uniform(240))
+            .spacing(4.0)
+            .into_element(
+                self.core(),
+                &self.keybinds,
+                MENU_ID.clone(),
+                Msg::Surface,
+                vec![(
+                    "File".into(),
+                    vec![
+                        menu::Item::Button(
+                            "Copy Result",
+                            Some(icon::from_name("edit-copy-symbolic").into()),
+                            MenuAction::CopyResult,
+                        ),
+                        menu::Item::Button(
+                            "Copy Expression",
+                            None,
+                            MenuAction::CopyExpression,
+                        ),
+                        menu::Item::Button(
+                            "Paste",
+                            Some(icon::from_name("edit-paste-symbolic").into()),
+                            MenuAction::Paste,
+                        ),
+                        menu::Item::Divider,
+                        menu::Item::Button(
+                            "Clear History",
+                            Some(icon::from_name("edit-clear-all-symbolic").into()),
+                            MenuAction::ClearHistory,
+                        ),
+                        menu::Item::Divider,
+                        menu::Item::Button(
+                            "About",
+                            Some(icon::from_name("help-about-symbolic").into()),
+                            MenuAction::About,
+                        ),
+                        menu::Item::Button(
+                            "Quit",
+                            Some(icon::from_name("window-close-symbolic").into()),
+                            MenuAction::Quit,
+                        ),
+                    ],
+                )],
+            )]
+    }
+
     fn update(&mut self, message: Self::Message) -> cosmic::app::Task<Self::Message> {
-        let mut eng = self.engine.lock().unwrap();
         match message {
-            Msg::Digit(d) => eng.push(d),
-            Msg::Op(op) => eng.push(op),
-            Msg::Dot => eng.push('.'),
-            Msg::Paren(p) => eng.push(p),
-            Msg::Func(f) => eng.push_str(&format!("{f}(")),
-            Msg::Equals => { eng.evaluate(None); }
-            Msg::Clear => eng.clear(),
-            Msg::ClearEntry => eng.clear_entry(),
-            Msg::Backspace => eng.backspace(),
-            Msg::Negate => eng.negate(),
-            Msg::Percent => eng.push_str("/100"),
-            Msg::MemClear => eng.mem_clear(),
-            Msg::MemRecall => eng.mem_recall(),
-            Msg::MemAdd => eng.mem_add(),
-            Msg::MemSub => eng.mem_sub(),
+            // Calculator buttons
+            Msg::Digit(d) => self.engine.lock().unwrap().push(d),
+            Msg::Op(op) => self.engine.lock().unwrap().push(op),
+            Msg::Dot => self.engine.lock().unwrap().push('.'),
+            Msg::Paren(p) => self.engine.lock().unwrap().push(p),
+            Msg::Func(f) => self.engine.lock().unwrap().push_str(&format!("{f}(")),
+            Msg::Equals => {
+                self.engine.lock().unwrap().evaluate(None);
+            }
+            Msg::Clear => self.engine.lock().unwrap().clear(),
+            Msg::ClearEntry => self.engine.lock().unwrap().clear_entry(),
+            Msg::Backspace => self.engine.lock().unwrap().backspace(),
+            Msg::Negate => self.engine.lock().unwrap().negate(),
+            Msg::Percent => self.engine.lock().unwrap().push_str("/100"),
+            Msg::MemClear => self.engine.lock().unwrap().mem_clear(),
+            Msg::MemRecall => self.engine.lock().unwrap().mem_recall(),
+            Msg::MemAdd => self.engine.lock().unwrap().mem_add(),
+            Msg::MemSub => self.engine.lock().unwrap().mem_sub(),
             Msg::ExprInput(s) => {
+                let mut eng = self.engine.lock().unwrap();
                 eng.expression = s;
                 eng.display = eng.expression.clone();
             }
+            // Menu actions
+            Msg::CopyResult => {
+                let eng = self.engine.lock().unwrap();
+                let result = eng.display.clone();
+                drop(eng);
+                return cosmic::app::Task::perform(
+                    async move {
+                        let mut child = tokio::process::Command::new("wl-copy")
+                            .stdin(std::process::Stdio::piped())
+                            .spawn()
+                            .ok()?;
+                        if let Some(mut stdin) = child.stdin.take() {
+                            use tokio::io::AsyncWriteExt;
+                            stdin.write_all(result.as_bytes()).await.ok()?;
+                        }
+                        child.wait().await.ok()?;
+                        Some(())
+                    },
+                    |_| cosmic::Action::App(Msg::Pasted(None)),
+                );
+            }
+            Msg::CopyExpression => {
+                let eng = self.engine.lock().unwrap();
+                let expr = eng.expression.clone();
+                drop(eng);
+                return cosmic::app::Task::perform(
+                    async move {
+                        let mut child = tokio::process::Command::new("wl-copy")
+                            .stdin(std::process::Stdio::piped())
+                            .spawn()
+                            .ok()?;
+                        if let Some(mut stdin) = child.stdin.take() {
+                            use tokio::io::AsyncWriteExt;
+                            stdin.write_all(expr.as_bytes()).await.ok()?;
+                        }
+                        child.wait().await.ok()?;
+                        Some(())
+                    },
+                    |_| cosmic::Action::App(Msg::About),
+                );
+            }
+            Msg::Paste => {
+                return cosmic::app::Task::perform(
+                    async {
+                        let output = tokio::process::Command::new("wl-paste")
+                            .arg("--no-newline")
+                            .output()
+                            .await
+                            .ok()?;
+                        String::from_utf8(output.stdout).ok()
+                    },
+                    |result| cosmic::Action::App(Msg::Pasted(result)),
+                );
+            }
+            Msg::Pasted(Some(text)) => {
+                let cleaned: String = text
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || "+-*/^%.()".contains(*c))
+                    .collect();
+                if !cleaned.is_empty() {
+                    let mut eng = self.engine.lock().unwrap();
+                    eng.push_str(&cleaned);
+                }
+            }
+            Msg::Pasted(None) => {}
+            Msg::ClearHistory => {
+                self.engine.lock().unwrap().history.clear();
+            }
+            Msg::Quit => return cosmic::iced::exit(),
+            Msg::About => {
+                return cosmic::app::Task::perform(
+                    async {
+                        let cosmic_ver = tokio::process::Command::new("cosmic-comp")
+                            .arg("--version")
+                            .output()
+                            .await
+                            .ok()
+                            .and_then(|o| String::from_utf8(o.stdout).ok())
+                            .unwrap_or_else(|| "unknown".into());
+                        let body = format!(
+                            "Cosmix Calc v{}\nScientific calculator for COSMIC\n\nCOSMIC: {}\nPort: cosmix-calc\nLicense: MIT",
+                            env!("CARGO_PKG_VERSION"),
+                            cosmic_ver.trim(),
+                        );
+                        let _ = tokio::process::Command::new("notify-send")
+                            .arg("--app-name=Cosmix Calc")
+                            .arg("--icon=accessories-calculator")
+                            .arg("--expire-time=0")
+                            .arg("Cosmix Calc")
+                            .arg(&body)
+                            .status()
+                            .await;
+                    },
+                    |_| cosmic::Action::App(Msg::Pasted(None)), // no-op
+                );
+            }
+            Msg::Surface(a) => {
+                return cosmic::task::message(cosmic::Action::Cosmic(
+                    cosmic::app::Action::Surface(a),
+                ));
+            }
+            Msg::SyncFromPort => {
+                if !self.port_dirty.swap(false, Ordering::Relaxed) {
+                    return cosmic::app::Task::none();
+                }
+                // Fall through to update caches below
+            }
         }
+
+        // Update caches
+        let eng = self.engine.lock().unwrap();
         self.display_cache = eng.display.clone();
         self.memory_cache = if eng.memory != 0.0 {
             format!("M: {}", format_number(eng.memory))
         } else {
             String::new()
         };
+        self.history_count = eng.history.len();
         cosmic::app::Task::none()
+    }
+
+    fn subscription(&self) -> cosmic::iced::Subscription<Self::Message> {
+        cosmic::iced::time::every(std::time::Duration::from_millis(100))
+            .map(|_| Msg::SyncFromPort)
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
@@ -307,7 +544,14 @@ impl cosmic::Application for CalcApp {
             ("=", BtnStyle::Equals, Msg::Equals),
         ]);
 
-        column::with_capacity(8)
+        // Status bar with history count
+        let status = if self.history_count > 0 {
+            format!("{} calculations", self.history_count)
+        } else {
+            String::new()
+        };
+
+        column::with_capacity(9)
             .push(display)
             .push(mem_row)
             .push(func_row)
@@ -315,6 +559,7 @@ impl cosmic::Application for CalcApp {
             .push(row2)
             .push(row3)
             .push(row4)
+            .push(text::caption(status))
             .spacing(8)
             .padding(12)
             .into()
@@ -358,13 +603,17 @@ fn calc_button(label: &str, style: BtnStyle, msg: Msg) -> Element<'static, Msg> 
 
 // ── Cosmix Port Integration ──
 
-fn start_port(engine: Arc<Mutex<CalcEngine>>) -> Option<cosmix_port::PortHandle> {
+fn start_port(engine: Arc<Mutex<CalcEngine>>, dirty: Arc<AtomicBool>) -> Option<cosmix_port::PortHandle> {
     let e1 = engine.clone();
     let e2 = engine.clone();
     let e3 = engine.clone();
     let e4 = engine.clone();
     let e5 = engine.clone();
     let e6 = engine.clone();
+    let d1 = dirty.clone();
+    let d3 = dirty.clone();
+    let d5 = dirty.clone();
+    let d6 = dirty.clone();
 
     let port = cosmix_port::Port::new("cosmix-calc")
         .command("calc", move |args| {
@@ -372,7 +621,11 @@ fn start_port(engine: Arc<Mutex<CalcEngine>>) -> Option<cosmix_port::PortHandle>
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("expected string expression"))?;
             let mut eng = e1.lock().unwrap();
-            let result = eng.evaluate(Some(expr));
+            // Set expression and evaluate — updates display so GUI reflects result
+            eng.expression = expr.to_string();
+            eng.display = expr.to_string();
+            let result = eng.evaluate(None);
+            d1.store(true, Ordering::Relaxed);
             Ok(serde_json::json!(result))
         })
         .command("result", move |_| {
@@ -382,6 +635,7 @@ fn start_port(engine: Arc<Mutex<CalcEngine>>) -> Option<cosmix_port::PortHandle>
         .command("clear", move |_| {
             let mut eng = e3.lock().unwrap();
             eng.clear();
+            d3.store(true, Ordering::Relaxed);
             Ok(serde_json::json!("cleared"))
         })
         .command("history", move |_| {
@@ -403,6 +657,7 @@ fn start_port(engine: Arc<Mutex<CalcEngine>>) -> Option<cosmix_port::PortHandle>
                 "clear" | "mc" => eng.mem_clear(),
                 _ => return Err(anyhow::anyhow!("unknown memory op: {op}")),
             }
+            d5.store(true, Ordering::Relaxed);
             Ok(serde_json::json!(format_number(eng.memory)))
         })
         .command("press", move |args| {
@@ -418,12 +673,15 @@ fn start_port(engine: Arc<Mutex<CalcEngine>>) -> Option<cosmix_port::PortHandle>
                     eng.push(key.chars().next().unwrap());
                 }
                 "." => eng.push('.'),
-                "=" | "enter" => { eng.evaluate(None); }
+                "=" | "enter" => {
+                    eng.evaluate(None);
+                }
                 "c" | "clear" => eng.clear(),
                 "ce" => eng.clear_entry(),
                 "backspace" => eng.backspace(),
                 _ => return Err(anyhow::anyhow!("unknown key: {key}")),
             }
+            d6.store(true, Ordering::Relaxed);
             Ok(serde_json::json!(eng.display))
         });
 
@@ -446,8 +704,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter("cosmix_calc=info")
         .init();
 
-    let settings = Settings::default()
-        .size(Size::new(380.0, 420.0));
+    let settings = Settings::default().size(Size::new(380.0, 460.0));
 
     cosmic::app::run::<CalcApp>(settings, ())?;
 

@@ -190,14 +190,24 @@ Does NOT contain Lua — Lua lives in the daemon. Per-app library is just IPC + 
 
 ## Implementation Phases
 
-| Phase | Layer | Work |
+See `_doc/2026-03-08-arexx-adoption-plan.md` for the full 8-phase ARexx adoption plan.
+
+| Phase | Focus | Work |
 |-------|-------|------|
-| 1 | L1 | External daemon: AT-SPI2 introspection, EIS input, D-Bus discovery |
-| 2 | L1 | Lua runtime in daemon, expose Layer 1 capabilities to scripts |
-| 3 | L2 | Embed mlua in cosmic-comp, Lua window rules and workspace scripting |
-| 4 | L3 | Build cosmix-port crate, integrate into libcosmic (feature-gated) |
-| 5 | L3 | Upstream proposal to System76, per-app command registration |
-| 6 | All | meshd integration, cross-node scripting via AMP |
+| 1 | Port Registry | inotify discovery, HELP handshake, daemon routing to app sockets |
+| 2 | Standard Vocab | OPEN/SAVE/QUIT/HELP/INFO/ACTIVATE, RC 0/5/10/20 error codes |
+| 3 | Clip List | SETCLIP/GETCLIP shared key/value store, named queues |
+| 4 | Macro Menus | Script directory scanning, Scripts menu in apps, pre-addressed scripts |
+| 5 | Orchestration | ADDRESS, process launching, wait_for_port, orchestrator/watcher patterns |
+| 6 | Modules | Lua function libraries in ~/.config/cosmix/modules/ |
+| 7 | Network Mesh | meshd bridge, @node.amp addressing, markweb web gateway |
+| 8 | AI Agents | MCP server, natural language → Lua, agent templates |
+
+## Standard Command Vocabulary
+
+Every cosmix-port app MUST support: `OPEN`, `SAVE`, `SAVEAS`, `CLOSE`, `QUIT`, `HELP`, `INFO`, `ACTIVATE`.
+Error codes: 0=success, 5=warning, 10=error, 20=failure (matching ARexx convention).
+See `_doc/2026-03-08-arexx-adoption-plan.md` §3.2 for full specification.
 
 ## Commands
 

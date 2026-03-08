@@ -27,6 +27,12 @@ pub enum IpcRequest {
     ConfigRead { component: String, key: String },
     ConfigWrite { component: String, key: String, value: String },
     DbusCall { service: String, path: String, interface: String, method: String, args: Option<Vec<serde_json::Value>>, system: bool },
+    /// Call a command on an app port (Layer 3)
+    CallPort { port: String, port_command: String, args: Option<serde_json::Value> },
+    /// List all registered ports (built-in + app)
+    ListPorts,
+    /// Take a native Wayland screenshot
+    Screenshot { path: Option<String> },
     Status,
     Ping,
 }

@@ -1,5 +1,6 @@
 pub mod config;
 pub mod events;
+pub mod registry;
 pub mod state;
 
 use anyhow::{Context, Result};
@@ -67,6 +68,9 @@ impl Daemon {
         let events = self.events.clone();
         let config = Arc::new(self.config);
 
+        // Make shared state available to Lua port resolution
+        *crate::lua::DAEMON_STATE.lock().unwrap() = Some(state.clone());
+
         // Start Wayland poller thread (populates shared state every 500ms)
         let poller_state = state.clone();
         let _poller = state::spawn_wayland_poller(poller_state, 500);
@@ -78,6 +82,11 @@ impl Daemon {
             tracing::info!("Initial state: {} windows, {} workspaces",
                 s.windows.len(), s.workspaces.len());
         }
+
+        // Start port watcher (scans for app sockets every 2s)
+        let watcher_state = state.clone();
+        let watcher_port_dir = config.daemon.port_dir.clone();
+        let _port_watcher = registry::spawn_port_watcher(watcher_state, watcher_port_dir, 2000);
 
         // Start IPC server
         let ipc_config = config.clone();

@@ -235,6 +235,68 @@ async fn dispatch(request: IpcRequest, state: &SharedState, _events: &EventBus) 
             }
         }
 
+        IpcRequest::CallPort { port, port_command, args } => {
+            // Find the port socket from registry
+            let socket_path = {
+                let s = state.read().unwrap();
+                s.port_registry.socket_path(&port)
+            };
+
+            match socket_path {
+                Some(path) => {
+                    let path_str = path.to_string_lossy().to_string();
+                    let json_args = args.unwrap_or(serde_json::Value::Null);
+                    match cosmix_port::call_port(&path_str, &port_command, json_args).await {
+                        Ok(data) => IpcResponse::success(data),
+                        Err(e) => IpcResponse::error(&format!("Port call failed: {e}")),
+                    }
+                }
+                None => IpcResponse::error(&format!("Port '{port}' not found in registry")),
+            }
+        }
+
+        IpcRequest::ListPorts => {
+            let s = state.read().unwrap();
+            let mut ports: Vec<serde_json::Value> = Vec::new();
+
+            // Built-in ports
+            for name in &["clipboard", "windows", "screenshot", "dbus", "config", "mail", "midi", "notify", "input"] {
+                ports.push(serde_json::json!({
+                    "name": name,
+                    "type": "builtin",
+                }));
+            }
+
+            // App ports from registry
+            for info in s.port_registry.ports.values() {
+                ports.push(serde_json::json!({
+                    "name": info.name,
+                    "type": "app",
+                    "socket": info.socket.to_string_lossy(),
+                    "commands": info.commands,
+                }));
+            }
+
+            IpcResponse::success(serde_json::Value::Array(ports))
+        }
+
+        IpcRequest::Screenshot { path } => {
+            let save_path = match path {
+                Some(p) => std::path::PathBuf::from(p),
+                None => {
+                    let dir = crate::wayland::screenshot::screenshots_dir();
+                    let ts = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+                    dir.join(format!("Screenshot_{ts}.png"))
+                }
+            };
+            match crate::wayland::screenshot::capture_screenshot(&save_path) {
+                Ok(p) => IpcResponse::success(serde_json::json!({
+                    "path": p.to_string_lossy(),
+                })),
+                Err(e) => IpcResponse::error(&e.to_string()),
+            }
+        }
+
         IpcRequest::ListApps => {
             match crate::desktop::list_apps() {
                 Ok(apps) => {

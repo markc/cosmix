@@ -6,7 +6,7 @@ use tree_view::{TreeNode, TreeView};
 use cosmic::app::Settings;
 use cosmic::iced::{self, Alignment, Length, Size};
 use cosmic::widget::menu::{self, KeyBind};
-use cosmic::widget::{self, icon, markdown, nav_bar, text_editor};
+use cosmic::widget::{self, icon, markdown, nav_bar, pane_grid, text_editor};
 use cosmic::{executor, Core, Element};
 use cosmix_lib::mail::JmapClient;
 use std::collections::HashMap;
@@ -32,6 +32,12 @@ enum MenuAction {
     MarkUnread,
     TogglePreview,
     About,
+    Account0,
+    Account1,
+    Account2,
+    Account3,
+    Account4,
+    AddAccount,
 }
 
 impl menu::Action for MenuAction {
@@ -49,7 +55,23 @@ impl menu::Action for MenuAction {
             MenuAction::MarkUnread => Message::MarkUnread,
             MenuAction::TogglePreview => Message::TogglePreview,
             MenuAction::About => Message::About,
+            MenuAction::Account0 => Message::AccountSelected(0),
+            MenuAction::Account1 => Message::AccountSelected(1),
+            MenuAction::Account2 => Message::AccountSelected(2),
+            MenuAction::Account3 => Message::AccountSelected(3),
+            MenuAction::Account4 => Message::AccountSelected(4),
+            MenuAction::AddAccount => Message::ShowAddAccount,
         }
+    }
+}
+
+fn account_action(idx: usize) -> MenuAction {
+    match idx {
+        0 => MenuAction::Account0,
+        1 => MenuAction::Account1,
+        2 => MenuAction::Account2,
+        3 => MenuAction::Account3,
+        _ => MenuAction::Account4,
     }
 }
 
@@ -57,6 +79,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = Settings::default().size(Size::new(1200., 750.));
     cosmic::app::run::<MailApp>(settings, ())?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Pane layout
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum PaneKind {
+    Folders,
+    Messages,
+    Content,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +101,7 @@ struct MailApp {
     accounts: Vec<Account>,
     active_account: usize,
     mailbox_tree: TreeView,
+    panes: pane_grid::State<PaneKind>,
     keybinds: HashMap<KeyBind, MenuAction>,
     emails: Vec<EmailSummary>,
     selected_email_id: Option<String>,
@@ -95,6 +129,12 @@ enum RightPane {
     Reply {
         original: EmailDetail,
         body: text_editor::Content,
+    },
+    AddAccount {
+        name: String,
+        url: String,
+        user: String,
+        pass: String,
     },
 }
 
@@ -160,7 +200,7 @@ enum Message {
     Refresh,
     DismissError,
     CancelCompose,
-    MarkdownLink(markdown::Uri),
+    MarkdownLink(String),
     SelectAll,
     MarkRead,
     MarkUnread,
@@ -168,6 +208,14 @@ enum Message {
     About,
     Quit,
     Surface(cosmic::surface::Action),
+    PaneResized(pane_grid::ResizeEvent),
+    FolderSelected(widget::segmented_button::Entity),
+    ShowAddAccount,
+    AddAccountName(String),
+    AddAccountUrl(String),
+    AddAccountUser(String),
+    AddAccountPass(String),
+    SaveAccount,
 }
 
 struct ConnectResult {
@@ -280,11 +328,7 @@ impl cosmic::Application for MailApp {
             })
             .unwrap_or_default();
 
-        let error = if config.is_none() {
-            Some("Create ~/.config/cosmix/mail.toml with [[accounts]]".into())
-        } else {
-            None
-        };
+        let no_accounts = config.is_none() || accounts.is_empty();
 
         use cosmic::iced::keyboard::{Key, key::Named};
         use cosmic::widget::menu::key_bind::Modifier;
@@ -297,19 +341,42 @@ impl cosmic::Application for MailApp {
             (KeyBind { modifiers: vec![], key: Key::Named(Named::Delete) }, MenuAction::Delete),
         ]);
 
+        let pane_config = pane_grid::Configuration::Split {
+            axis: pane_grid::Axis::Vertical,
+            ratio: 0.18,
+            a: Box::new(pane_grid::Configuration::Pane(PaneKind::Folders)),
+            b: Box::new(pane_grid::Configuration::Split {
+                axis: pane_grid::Axis::Vertical,
+                ratio: 0.4,
+                a: Box::new(pane_grid::Configuration::Pane(PaneKind::Messages)),
+                b: Box::new(pane_grid::Configuration::Pane(PaneKind::Content)),
+            }),
+        };
+        let panes = pane_grid::State::with_configuration(pane_config);
+
         let mut app = MailApp {
             core,
             accounts,
             active_account: 0,
             mailbox_tree: TreeView::new(),
+            panes,
             keybinds,
             emails: Vec::new(),
             selected_email_id: None,
             selected_email: None,
             markdown_items: Vec::new(),
-            right_pane: RightPane::Preview,
+            right_pane: if no_accounts {
+                RightPane::AddAccount {
+                    name: String::new(),
+                    url: "https://".into(),
+                    user: String::new(),
+                    pass: String::new(),
+                }
+            } else {
+                RightPane::Preview
+            },
             show_preview: true,
-            error,
+            error: None,
         };
 
         let task = if !app.accounts.is_empty() {
@@ -323,115 +390,108 @@ impl cosmic::Application for MailApp {
     }
 
     fn nav_model(&self) -> Option<&nav_bar::Model> {
-        Some(self.mailbox_tree.model())
-    }
-
-    fn on_nav_select(&mut self, id: nav_bar::Id) -> cosmic::app::Task<Message> {
-        // Check if the activated item has children — toggle expand/collapse
-        if let Some(node_id) = self.mailbox_tree.activated(id) {
-            let node_id = node_id.to_string();
-            if self.mailbox_tree.has_children(&node_id) {
-                self.mailbox_tree.toggle(&node_id);
-                return cosmic::Task::none();
-            }
-        }
-
-        // Leaf node — select and load emails
-        self.mailbox_tree.model_mut().activate(id);
-
-        let mailbox_id = self.mailbox_tree.activated(id).map(|s| s.to_string());
-        self.selected_email_id = None;
-        self.selected_email = None;
-        self.markdown_items.clear();
-        self.right_pane = RightPane::Preview;
-
-        let idx = self.active_account;
-        if let Some(client) = self.accounts[idx].client.clone() {
-            load_emails(idx, client, mailbox_id)
-        } else {
-            cosmic::Task::none()
-        }
+        None
     }
 
     fn header_start(&self) -> Vec<Element<'_, Message>> {
-        vec![cosmic::widget::responsive_menu_bar()
-            .item_height(menu::ItemHeight::Dynamic(40))
-            .item_width(menu::ItemWidth::Uniform(280))
-            .spacing(4.0)
-            .into_element(
-                self.core(),
-                &self.keybinds,
-                MENU_ID.clone(),
-                Message::Surface,
-                vec![
+        let trees: Vec<(String, Vec<menu::Item<MenuAction, String>>)> = vec![
                     (
                         "File".into(),
                         vec![
-                            menu::Item::Button("New Message", Some(icon::from_name("mail-message-new-symbolic").into()), MenuAction::Compose),
+                            menu::Item::Button("New Message".into(), Some(icon::from_name("mail-message-new-symbolic").into()), MenuAction::Compose),
                             menu::Item::Divider,
-                            menu::Item::Button("Refresh", Some(icon::from_name("view-refresh-symbolic").into()), MenuAction::Refresh),
+                            menu::Item::Button("Refresh".into(), Some(icon::from_name("view-refresh-symbolic").into()), MenuAction::Refresh),
                             menu::Item::Divider,
-                            menu::Item::Button("Quit", Some(icon::from_name("window-close-symbolic").into()), MenuAction::Quit),
+                            menu::Item::Button("About Cosmix Mail".into(), Some(icon::from_name("help-about-symbolic").into()), MenuAction::About),
+                            menu::Item::Divider,
+                            menu::Item::Button("Quit".into(), Some(icon::from_name("window-close-symbolic").into()), MenuAction::Quit),
                         ],
                     ),
                     (
                         "Edit".into(),
                         vec![
-                            menu::Item::Button("Reply", Some(icon::from_name("mail-reply-all-symbolic").into()), MenuAction::Reply),
+                            menu::Item::Button("Reply".into(), Some(icon::from_name("mail-reply-all-symbolic").into()), MenuAction::Reply),
                             menu::Item::Divider,
-                            menu::Item::Button("Select All", None, MenuAction::SelectAll),
+                            menu::Item::Button("Select All".into(), None, MenuAction::SelectAll),
                             menu::Item::Divider,
-                            menu::Item::Button("Mark as Read", None, MenuAction::MarkRead),
-                            menu::Item::Button("Mark as Unread", None, MenuAction::MarkUnread),
+                            menu::Item::Button("Mark as Read".into(), None, MenuAction::MarkRead),
+                            menu::Item::Button("Mark as Unread".into(), None, MenuAction::MarkUnread),
                             menu::Item::Divider,
-                            menu::Item::Button("Delete", Some(icon::from_name("edit-delete-symbolic").into()), MenuAction::Delete),
+                            menu::Item::Button("Delete".into(), Some(icon::from_name("edit-delete-symbolic").into()), MenuAction::Delete),
+                            menu::Item::Divider,
+                            menu::Item::CheckBox("Preview Pane".into(), None, self.show_preview, MenuAction::TogglePreview),
                         ],
                     ),
                     (
-                        "View".into(),
-                        vec![
-                            menu::Item::CheckBox("Preview Pane", None, self.show_preview, MenuAction::TogglePreview),
-                        ],
+                        "Mailboxes".into(),
+                        {
+                            let mut items: Vec<menu::Item<MenuAction, String>> = self
+                                .accounts
+                                .iter()
+                                .enumerate()
+                                .map(|(i, acc)| {
+                                    let label = match &acc.status {
+                                        AccountStatus::Disconnected => acc.config.name.clone(),
+                                        AccountStatus::Connecting => {
+                                            format!("... {}", acc.config.name)
+                                        }
+                                        AccountStatus::Connected => {
+                                            let unread: u64 =
+                                                acc.mailboxes.iter().map(|m| m.unread).sum();
+                                            if unread > 0 {
+                                                format!("{} ({})", acc.config.name, unread)
+                                            } else {
+                                                acc.config.name.clone()
+                                            }
+                                        }
+                                        AccountStatus::Error(_) => {
+                                            format!("! {}", acc.config.name)
+                                        }
+                                    };
+                                    let is_active = i == self.active_account;
+                                    menu::Item::CheckBox(
+                                        label,
+                                        Some(
+                                            icon::from_name("mail-folder-inbox-symbolic").into(),
+                                        ),
+                                        is_active,
+                                        account_action(i),
+                                    )
+                                })
+                                .collect();
+                            items.push(menu::Item::Divider);
+                            items.push(menu::Item::Button(
+                                "+ Add Account".to_string(),
+                                Some(icon::from_name("list-add-symbolic").into()),
+                                MenuAction::AddAccount,
+                            ));
+                            items
+                        },
                     ),
-                    (
-                        "Help".into(),
-                        vec![
-                            menu::Item::Button("About Cosmix Mail", Some(icon::from_name("help-about-symbolic").into()), MenuAction::About),
-                        ],
-                    ),
-                ],
-            )]
+        ];
+
+        let bar = menu::bar(
+            trees
+                .into_iter()
+                .map(|mt| {
+                    menu::Tree::with_children(
+                        cosmic::widget::RcElementWrapper::new(Element::from(menu::root(mt.0))),
+                        menu::items(&self.keybinds, mt.1),
+                    )
+                })
+                .collect(),
+        )
+        .item_width(menu::ItemWidth::Uniform(240))
+        .item_height(menu::ItemHeight::Dynamic(36))
+        .spacing(2.0)
+        .on_surface_action(Message::Surface)
+        .window_id_maybe(self.core().main_window_id());
+
+        vec![bar.into()]
     }
 
     fn header_end(&self) -> Vec<Element<'_, Message>> {
-        let mut items: Vec<Element<'_, Message>> = Vec::new();
-
-        // Account switcher buttons
-        for (i, account) in self.accounts.iter().enumerate() {
-            let label = match &account.status {
-                AccountStatus::Disconnected => account.config.name.clone(),
-                AccountStatus::Connecting => format!("... {}", account.config.name),
-                AccountStatus::Connected => {
-                    let unread: u64 = account.mailboxes.iter().map(|m| m.unread).sum();
-                    if unread > 0 {
-                        format!("{} ({})", account.config.name, unread)
-                    } else {
-                        account.config.name.clone()
-                    }
-                }
-                AccountStatus::Error(_) => format!("! {}", account.config.name),
-            };
-
-            let btn = if i == self.active_account {
-                widget::button::suggested(label)
-            } else {
-                widget::button::standard(label)
-            };
-
-            items.push(btn.on_press_maybe(Some(Message::AccountSelected(i))).into());
-        }
-
-        items
+        Vec::new()
     }
 
     fn update(&mut self, message: Message) -> cosmic::app::Task<Message> {
@@ -680,9 +740,116 @@ impl cosmic::Application for MailApp {
                 ));
             }
 
-            Message::MarkdownLink(url) => {
+            Message::PaneResized(event) => {
+                self.panes.resize(event.split, event.ratio);
+            }
+
+            Message::FolderSelected(entity) => {
+                // Check if the activated item has children — toggle expand/collapse
+                if let Some(node_id) = self.mailbox_tree.activated(entity) {
+                    let node_id = node_id.to_string();
+                    if self.mailbox_tree.has_children(&node_id) {
+                        self.mailbox_tree.toggle(&node_id);
+                        return cosmic::Task::none();
+                    }
+                }
+
+                // Leaf node — select and load emails
+                self.mailbox_tree.model_mut().activate(entity);
+
+                let mailbox_id = self.mailbox_tree.activated(entity).map(|s| s.to_string());
+                self.selected_email_id = None;
+                self.selected_email = None;
+                self.markdown_items.clear();
+                self.right_pane = RightPane::Preview;
+
+                let idx = self.active_account;
+                if let Some(client) = self.accounts[idx].client.clone() {
+                    return load_emails(idx, client, mailbox_id);
+                }
+            }
+
+            Message::ShowAddAccount => {
+                self.right_pane = RightPane::AddAccount {
+                    name: String::new(),
+                    url: "https://".into(),
+                    user: String::new(),
+                    pass: String::new(),
+                };
+            }
+
+            Message::AddAccountName(v) => {
+                if let RightPane::AddAccount { name, .. } = &mut self.right_pane {
+                    *name = v;
+                }
+            }
+
+            Message::AddAccountUrl(v) => {
+                if let RightPane::AddAccount { url, .. } = &mut self.right_pane {
+                    *url = v;
+                }
+            }
+
+            Message::AddAccountUser(v) => {
+                if let RightPane::AddAccount { user, .. } = &mut self.right_pane {
+                    *user = v;
+                }
+            }
+
+            Message::AddAccountPass(v) => {
+                if let RightPane::AddAccount { pass, .. } = &mut self.right_pane {
+                    *pass = v;
+                }
+            }
+
+            Message::SaveAccount => {
+                if let RightPane::AddAccount {
+                    name,
+                    url,
+                    user,
+                    pass,
+                } = &self.right_pane
+                {
+                    if name.is_empty() || url.is_empty() || user.is_empty() || pass.is_empty() {
+                        self.error = Some("All fields are required".into());
+                        return cosmic::Task::none();
+                    }
+
+                    let new_config = AccountConfig {
+                        name: name.clone(),
+                        url: url.clone(),
+                        user: user.clone(),
+                        pass: pass.clone(),
+                    };
+
+                    // Save to config file
+                    let mut mail_config = MailConfig::load().unwrap_or(MailConfig {
+                        accounts: Vec::new(),
+                    });
+                    mail_config.accounts.push(new_config.clone());
+                    if let Err(e) = mail_config.save() {
+                        self.error = Some(format!("Failed to save config: {e}"));
+                        return cosmic::Task::none();
+                    }
+
+                    // Add to runtime state
+                    let idx = self.accounts.len();
+                    self.accounts.push(Account {
+                        config: new_config.clone(),
+                        client: None,
+                        mailboxes: Vec::new(),
+                        status: AccountStatus::Connecting,
+                    });
+                    self.active_account = idx;
+                    self.right_pane = RightPane::Preview;
+
+                    return connect_account(idx, new_config);
+                }
+            }
+
+            Message::MarkdownLink(ref url) => {
                 let _ = std::process::Command::new("xdg-open")
-                    .arg(&url)
+                    .arg(url)
                     .spawn();
             }
         }
@@ -714,12 +881,18 @@ impl cosmic::Application for MailApp {
             );
         }
 
-        // Two-pane: email list | email content
-        let panes = widget::row()
-            .push(self.view_email_list())
-            .push(widget::divider::vertical::default())
-            .push(self.view_content_pane())
-            .height(Length::Fill);
+        // Three-pane layout with resizable dividers
+        let panes = cosmic::widget::PaneGrid::new(&self.panes, |_id, kind, _maximized| {
+            let body: Element<'_, Message> = match kind {
+                PaneKind::Folders => self.view_folders(),
+                PaneKind::Messages => self.view_email_list(),
+                PaneKind::Content => self.view_content_pane(),
+            };
+            pane_grid::Content::new(body)
+        })
+        .on_resize(4, Message::PaneResized)
+        .width(Length::Fill)
+        .height(Length::Fill);
 
         content = content.push(panes);
 
@@ -775,6 +948,67 @@ impl MailApp {
         }
     }
 
+    fn view_folders(&self) -> Element<'_, Message> {
+        let spacing = cosmic::theme::spacing();
+
+        let new_msg_btn = widget::button::suggested("+ New Message")
+            .leading_icon(icon::from_name("mail-message-new-symbolic"))
+            .on_press_maybe(Some(Message::ShowCompose))
+            .width(Length::Fill)
+            .class(cosmic::theme::Button::Custom {
+                active: Box::new(|_focused, theme| {
+                    let c = &theme.cosmic().accent_button;
+                    cosmic::widget::button::Style {
+                        background: Some(cosmic::iced::Background::Color(c.base.into())),
+                        text_color: Some(c.on.into()),
+                        icon_color: Some(c.on.into()),
+                        border_radius: [4.0; 4].into(),
+                        ..Default::default()
+                    }
+                }),
+                disabled: Box::new(|theme| {
+                    let c = &theme.cosmic().accent_button;
+                    cosmic::widget::button::Style {
+                        background: Some(cosmic::iced::Background::Color(c.base.into())),
+                        text_color: Some(c.on.into()),
+                        icon_color: Some(c.on.into()),
+                        border_radius: [4.0; 4].into(),
+                        ..Default::default()
+                    }
+                }),
+                hovered: Box::new(|_focused, theme| {
+                    let c = &theme.cosmic().accent_button;
+                    cosmic::widget::button::Style {
+                        background: Some(cosmic::iced::Background::Color(c.hover.into())),
+                        text_color: Some(c.on.into()),
+                        icon_color: Some(c.on.into()),
+                        border_radius: [4.0; 4].into(),
+                        ..Default::default()
+                    }
+                }),
+                pressed: Box::new(|_focused, theme| {
+                    let c = &theme.cosmic().accent_button;
+                    cosmic::widget::button::Style {
+                        background: Some(cosmic::iced::Background::Color(c.pressed.into())),
+                        text_color: Some(c.on.into()),
+                        icon_color: Some(c.on.into()),
+                        border_radius: [4.0; 4].into(),
+                        ..Default::default()
+                    }
+                }),
+            });
+
+        let tree = self.mailbox_tree.view(Message::FolderSelected);
+
+        widget::column()
+            .push(
+                widget::container(new_msg_btn).padding(spacing.space_xxs),
+            )
+            .push(widget::scrollable::vertical(tree))
+            .height(Length::Fill)
+            .into()
+    }
+
     fn view_email_list(&self) -> Element<'_, Message> {
         let spacing = cosmic::theme::spacing();
         let mut col = widget::column().spacing(1).padding(spacing.space_xxs);
@@ -797,14 +1031,13 @@ impl MailApp {
             let item = widget::column()
                 .push(
                     widget::row()
-                        .push(widget::text::body(&email.subject))
+                        .push(widget::text::caption(&email.from))
                         .push(widget::space().width(Length::Fill))
                         .push(widget::text::caption(&email.date))
                         .spacing(spacing.space_xs),
                 )
-                .push(widget::text::caption(&email.from))
-                .push(widget::text::caption(&email.preview))
-                .spacing(1);
+                .push(widget::text::body(&email.subject))
+                .spacing(2);
 
             let btn = widget::button::custom(item)
                 .on_press(Message::EmailSelected(email.id.clone()))
@@ -821,7 +1054,7 @@ impl MailApp {
         }
 
         widget::container(widget::scrollable::vertical(col))
-            .width(320)
+            .width(Length::Fill)
             .height(Length::Fill)
             .into()
     }
@@ -831,6 +1064,12 @@ impl MailApp {
             RightPane::Preview => self.view_email_preview(),
             RightPane::Compose { to, subject, body } => self.view_compose(to, subject, body),
             RightPane::Reply { original, body } => self.view_reply(original, body),
+            RightPane::AddAccount {
+                name,
+                url,
+                user,
+                pass,
+            } => self.view_add_account(name, url, user, pass),
         };
 
         widget::container(content)
@@ -879,24 +1118,28 @@ impl MailApp {
                     .spacing(spacing.space_xxs)
                     .padding([0, spacing.space_s as u16]);
 
-                // Email body with markdown rendering on white background
-                let light_palette = cosmic::iced::Theme::Light.palette();
-                let md_settings =
-                    markdown::Settings::with_style(markdown::Style::from_palette(light_palette));
-                let body_view = widget::scrollable::vertical(
-                    widget::container(
-                        markdown::view(&self.markdown_items, md_settings)
-                            .map(Message::MarkdownLink),
-                    )
-                    .padding(spacing.space_s)
-                    .width(Length::Fill)
-                    .style(|_theme| widget::container::Style {
-                        background: Some(cosmic::iced::Background::Color(
-                            cosmic::iced::Color::WHITE,
-                        )),
-                        ..Default::default()
-                    }),
+                // Email body with GFM markdown, black text on white background
+                let md_theme = cosmix_markdown::Theme::light();
+                let md_view = cosmix_markdown::view(
+                    &detail.body,
+                    &md_theme,
+                    Message::MarkdownLink,
                 );
+                let body_view = widget::container(
+                    widget::scrollable::vertical(
+                        widget::container(md_view)
+                            .padding(spacing.space_s)
+                            .width(Length::Fill),
+                    ),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|_theme| widget::container::Style {
+                    background: Some(cosmic::iced::Background::Color(
+                        cosmic::iced::Color::WHITE,
+                    )),
+                    ..Default::default()
+                });
 
                 widget::column()
                     .push(toolbar)
@@ -1010,6 +1253,73 @@ impl MailApp {
                 )
                 .height(Length::Fill),
             )
+            .into()
+    }
+
+    fn view_add_account<'a>(
+        &'a self,
+        name: &'a str,
+        url: &'a str,
+        user: &'a str,
+        pass: &'a str,
+    ) -> Element<'a, Message> {
+        let spacing = cosmic::theme::spacing();
+
+        let can_save = !name.is_empty() && !url.is_empty() && !user.is_empty() && !pass.is_empty();
+
+        widget::column()
+            .push(
+                widget::row()
+                    .push(widget::text::title4("Add Mail Account"))
+                    .push(widget::space().width(Length::Fill))
+                    .push(
+                        widget::button::suggested("Save")
+                            .leading_icon(icon::from_name("document-save-symbolic"))
+                            .on_press_maybe(can_save.then_some(Message::SaveAccount)),
+                    )
+                    .push(
+                        widget::button::standard("Cancel")
+                            .on_press_maybe(Some(Message::CancelCompose)),
+                    )
+                    .spacing(spacing.space_s)
+                    .padding(spacing.space_xs),
+            )
+            .push(widget::divider::horizontal::default())
+            .push(
+                widget::container(
+                    widget::column()
+                        .push(widget::text::body(
+                            "Enter your JMAP mail server details below.",
+                        ))
+                        .push(widget::space().height(spacing.space_s))
+                        .push(
+                            widget::text_input::text_input("Account name (e.g. Work)", name)
+                                .on_input(Message::AddAccountName),
+                        )
+                        .push(
+                            widget::text_input::text_input(
+                                "Server URL (e.g. https://mail.example.com:8443)",
+                                url,
+                            )
+                            .on_input(Message::AddAccountUrl),
+                        )
+                        .push(
+                            widget::text_input::text_input("Username / Email", user)
+                                .on_input(Message::AddAccountUser),
+                        )
+                        .push(
+                            widget::text_input::secure_input("Password", pass, None, false)
+                                .on_input(Message::AddAccountPass),
+                        )
+                        .spacing(spacing.space_s)
+                        .padding(spacing.space_m)
+                        .max_width(500),
+                )
+                .width(Length::Fill)
+                .align_x(Alignment::Center)
+                .padding(spacing.space_l),
+            )
+            .height(Length::Fill)
             .into()
     }
 }

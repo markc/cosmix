@@ -3,8 +3,15 @@ pub mod ports;
 
 use anyhow::{Context, Result};
 use mlua::prelude::*;
+use std::sync::Mutex;
 
-fn lua_value_to_json(val: &LuaValue) -> Result<serde_json::Value, LuaError> {
+use crate::daemon::state::SharedState;
+
+/// Global handle to daemon shared state, set when running inside the daemon.
+/// Lua port resolution reads this to find app sockets from the registry.
+pub static DAEMON_STATE: Mutex<Option<SharedState>> = Mutex::new(None);
+
+pub(crate) fn lua_value_to_json(val: &LuaValue) -> Result<serde_json::Value, LuaError> {
     match val {
         LuaValue::Nil => Ok(serde_json::Value::Null),
         LuaValue::Boolean(b) => Ok(serde_json::json!(*b)),
@@ -201,30 +208,19 @@ fn create_lua() -> std::result::Result<Lua, LuaError> {
         Ok(tbl)
     })?)?;
 
-    // cosmix.screenshot(mode?, save_path?) — COSMIC native screenshot
-    // mode: "full" (default), "window", "region"
-    cosmix.set("screenshot", lua.create_function(|_, (mode, save_path): (Option<String>, Option<String>)| {
-        let mode = mode.unwrap_or_else(|| "full".into());
-        let save_dir = if let Some(ref p) = save_path {
-            std::path::Path::new(p).parent()
-                .map(|d| d.to_string_lossy().into_owned())
-                .unwrap_or_else(|| {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-                    format!("{home}/Pictures")
-                })
-        } else {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            format!("{home}/Pictures")
+    // cosmix.screenshot(save_path?) — native Wayland full-screen screenshot
+    cosmix.set("screenshot", lua.create_function(|_, save_path: Option<String>| {
+        let path = match save_path {
+            Some(p) => std::path::PathBuf::from(p),
+            None => {
+                let dir = crate::wayland::screenshot::screenshots_dir();
+                let ts = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+                dir.join(format!("Screenshot_{ts}.png"))
+            }
         };
-        let mut cmd = std::process::Command::new("cosmic-screenshot");
-        match mode.as_str() {
-            "window" => { cmd.arg("--window"); }
-            "region" => { cmd.arg("--region"); }
-            _ => {} // "full" is the default
-        }
-        cmd.args(["-s", &save_dir, "--interactive=false"]);
-        cmd.spawn().map_err(LuaError::external)?;
-        Ok(())
+        let result = crate::wayland::screenshot::capture_screenshot(&path)
+            .map_err(LuaError::external)?;
+        Ok(result.to_string_lossy().to_string())
     })?)?;
 
     // cosmix.fullscreen(query)

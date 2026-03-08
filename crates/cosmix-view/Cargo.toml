@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 cosmix-port = { path = "../cosmix-port" }
+cosmix-markdown = { path = "../cosmix-markdown" }
 libcosmic.workspace = true
 image = { version = "0.25", default-features = true }
 anyhow.workspace = true
@@ -19,3 +20,10 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 rfd = "0.15"
+tokio = { version = "1", features = ["process", "rt"] }
+imageproc = "0.25"
+ab_glyph = "0.2"
+chrono = "0.4"
+directories.workspace = true
+kamadak-exif = "0.5"
+resvg = "0.44"

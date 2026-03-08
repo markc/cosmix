@@ -1,3 +1,4 @@
+pub mod screenshot;
 pub mod toplevel;
 pub mod virtual_keyboard;
 pub mod workspace;

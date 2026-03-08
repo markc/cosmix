@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MailConfig {
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AccountConfig {
     pub name: String,
     pub url: String,
@@ -16,12 +16,16 @@ pub struct AccountConfig {
 }
 
 impl MailConfig {
-    pub fn load() -> Result<Self> {
+    fn config_path() -> std::path::PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let path = std::path::Path::new(&home)
+        std::path::Path::new(&home)
             .join(".config")
             .join("cosmix")
-            .join("mail.toml");
+            .join("mail.toml")
+    }
+
+    pub fn load() -> Result<Self> {
+        let path = Self::config_path();
 
         if !path.exists() {
             anyhow::bail!(
@@ -45,5 +49,18 @@ impl MailConfig {
         }
 
         Ok(config)
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = Self::config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+        let content = toml_cfg::to_string_pretty(self)
+            .with_context(|| "Failed to serialize config")?;
+        std::fs::write(&path, content)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        Ok(())
     }
 }
