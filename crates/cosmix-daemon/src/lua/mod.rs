@@ -4,6 +4,57 @@ pub mod ports;
 use anyhow::{Context, Result};
 use mlua::prelude::*;
 
+fn lua_value_to_json(val: &LuaValue) -> Result<serde_json::Value, LuaError> {
+    match val {
+        LuaValue::Nil => Ok(serde_json::Value::Null),
+        LuaValue::Boolean(b) => Ok(serde_json::json!(*b)),
+        LuaValue::Integer(n) => Ok(serde_json::json!(*n)),
+        LuaValue::Number(n) => Ok(serde_json::json!(*n)),
+        LuaValue::String(s) => {
+            let s = s.to_str().map_err(LuaError::external)?;
+            Ok(serde_json::Value::String(s.to_string()))
+        }
+        LuaValue::Table(t) => {
+            // Check if array (sequential integer keys starting at 1)
+            let len = t.raw_len();
+            if len > 0 {
+                let mut arr = Vec::new();
+                for i in 1..=len {
+                    let v: LuaValue = t.raw_get(i)?;
+                    arr.push(lua_value_to_json(&v)?);
+                }
+                Ok(serde_json::Value::Array(arr))
+            } else {
+                let mut map = serde_json::Map::new();
+                for pair in t.clone().pairs::<String, LuaValue>() {
+                    let (k, v) = pair?;
+                    map.insert(k, lua_value_to_json(&v)?);
+                }
+                Ok(serde_json::Value::Object(map))
+            }
+        }
+        _ => Err(LuaError::external(anyhow::anyhow!("Unsupported Lua type for JSON conversion: {}", val.type_name()))),
+    }
+}
+
+fn lua_args_to_json(args: Option<LuaValue>) -> Result<Option<Vec<serde_json::Value>>, LuaError> {
+    match args {
+        None | Some(LuaValue::Nil) => Ok(None),
+        Some(LuaValue::Table(t)) => {
+            let mut result = Vec::new();
+            let len = t.raw_len();
+            for i in 1..=len {
+                let v: LuaValue = t.raw_get(i)?;
+                result.push(lua_value_to_json(&v)?);
+            }
+            Ok(Some(result))
+        }
+        Some(other) => {
+            Ok(Some(vec![lua_value_to_json(&other)?]))
+        }
+    }
+}
+
 fn project_root() -> std::path::PathBuf {
     // Walk up from CWD looking for _bin/, or fall back to CWD
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -36,7 +87,6 @@ fn create_lua() -> std::result::Result<Lua, LuaError> {
     package.set("path", new_path)?;
 
     lua.globals().set("cosmix", lua.create_table()?)?;
-    ports::register_port_api(&lua)?;
 
     let cosmix: LuaTable = lua.globals().get("cosmix")?;
 
@@ -151,18 +201,29 @@ fn create_lua() -> std::result::Result<Lua, LuaError> {
         Ok(tbl)
     })?)?;
 
-    // cosmix.screenshot(save_dir?) — COSMIC native screenshot
-    cosmix.set("screenshot", lua.create_function(|_, save_dir: Option<String>| {
-        let mut cmd = vec!["cosmic-screenshot".to_string()];
-        if let Some(dir) = save_dir {
-            cmd.push("-s".into());
-            cmd.push(dir);
-            cmd.push("--interactive=false".into());
+    // cosmix.screenshot(mode?, save_path?) — COSMIC native screenshot
+    // mode: "full" (default), "window", "region"
+    cosmix.set("screenshot", lua.create_function(|_, (mode, save_path): (Option<String>, Option<String>)| {
+        let mode = mode.unwrap_or_else(|| "full".into());
+        let save_dir = if let Some(ref p) = save_path {
+            std::path::Path::new(p).parent()
+                .map(|d| d.to_string_lossy().into_owned())
+                .unwrap_or_else(|| {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+                    format!("{home}/Pictures")
+                })
+        } else {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            format!("{home}/Pictures")
+        };
+        let mut cmd = std::process::Command::new("cosmic-screenshot");
+        match mode.as_str() {
+            "window" => { cmd.arg("--window"); }
+            "region" => { cmd.arg("--region"); }
+            _ => {} // "full" is the default
         }
-        std::process::Command::new(&cmd[0])
-            .args(&cmd[1..])
-            .spawn()
-            .map_err(LuaError::external)?;
+        cmd.args(["-s", &save_dir, "--interactive=false"]);
+        cmd.spawn().map_err(LuaError::external)?;
         Ok(())
     })?)?;
 
@@ -251,6 +312,161 @@ fn create_lua() -> std::result::Result<Lua, LuaError> {
         Ok(tbl)
     })?)?;
 
+    // cosmix.type_text(text, delay_us?) — inject text via virtual keyboard
+    cosmix.set("type_text", lua.create_function(|_, (text, delay_us): (String, Option<u64>)| {
+        let delay = delay_us.unwrap_or(5000);
+        crate::wayland::virtual_keyboard::type_text(&text, delay)
+            .map_err(LuaError::external)
+    })?)?;
+
+    // cosmix.send_key(combo, delay_us?) — send key combo via virtual keyboard
+    cosmix.set("send_key", lua.create_function(|_, (combo, delay_us): (String, Option<u64>)| {
+        let delay = delay_us.unwrap_or(5000);
+        crate::wayland::virtual_keyboard::send_key(&combo, delay)
+            .map_err(LuaError::external)
+    })?)?;
+
+    // cosmix.midi table
+    {
+        let midi = lua.create_table()?;
+
+        midi.set("list_ports", lua.create_function(|lua, ()| {
+            let (outputs, inputs) = crate::pipewire::list_ports().map_err(LuaError::external)?;
+            let tbl = lua.create_table()?;
+            let out_tbl = lua.create_table()?;
+            for (i, p) in outputs.iter().enumerate() {
+                out_tbl.set(i + 1, p.name.as_str())?;
+            }
+            let in_tbl = lua.create_table()?;
+            for (i, p) in inputs.iter().enumerate() {
+                in_tbl.set(i + 1, p.name.as_str())?;
+            }
+            tbl.set("outputs", out_tbl)?;
+            tbl.set("inputs", in_tbl)?;
+            Ok(tbl)
+        })?)?;
+
+        midi.set("list_connections", lua.create_function(|lua, ()| {
+            let connections = crate::pipewire::list_connections().map_err(LuaError::external)?;
+            let tbl = lua.create_table()?;
+            for (i, (out, inp)) in connections.iter().enumerate() {
+                let pair = lua.create_table()?;
+                pair.set("output", out.as_str())?;
+                pair.set("input", inp.as_str())?;
+                tbl.set(i + 1, pair)?;
+            }
+            Ok(tbl)
+        })?)?;
+
+        midi.set("connect", lua.create_function(|_, (output, input): (String, String)| {
+            crate::pipewire::connect(&output, &input).map_err(LuaError::external)?;
+            Ok(true)
+        })?)?;
+
+        midi.set("disconnect", lua.create_function(|_, (output, input): (String, String)| {
+            crate::pipewire::disconnect(&output, &input).map_err(LuaError::external)?;
+            Ok(true)
+        })?)?;
+
+        cosmix.set("midi", midi)?;
+    }
+
+    // cosmix.mail table
+    {
+        let mail = lua.create_table()?;
+
+        mail.set("connect", lua.create_function(|_, (url, user, pass): (String, String, String)| {
+            crate::mail::connect(&url, &user, &pass).map_err(LuaError::external)
+        })?)?;
+
+        mail.set("mailboxes", lua.create_function(|lua, ()| {
+            let result = crate::mail::mailboxes().map_err(LuaError::external)?;
+            lua.to_value(&result).map_err(LuaError::external)
+        })?)?;
+
+        mail.set("query", lua.create_function(|lua, (mailbox, limit): (Option<String>, Option<u32>)| {
+            let result = crate::mail::query(mailbox.as_deref(), limit).map_err(LuaError::external)?;
+            lua.to_value(&result).map_err(LuaError::external)
+        })?)?;
+
+        mail.set("read", lua.create_function(|lua, id: String| {
+            let result = crate::mail::read(&id).map_err(LuaError::external)?;
+            lua.to_value(&result).map_err(LuaError::external)
+        })?)?;
+
+        mail.set("send", lua.create_function(|lua, (to, subject, body): (String, String, String)| {
+            let result = crate::mail::send(&to, &subject, &body).map_err(LuaError::external)?;
+            lua.to_value(&result).map_err(LuaError::external)
+        })?)?;
+
+        mail.set("reply", lua.create_function(|lua, (id, body): (String, String)| {
+            let result = crate::mail::reply(&id, &body).map_err(LuaError::external)?;
+            lua.to_value(&result).map_err(LuaError::external)
+        })?)?;
+
+        cosmix.set("mail", mail)?;
+    }
+
+    // cosmix.dbus(service, path, interface, method, args?) -> result
+    cosmix.set("dbus", lua.create_function(|lua, (service, path, interface, method, args): (String, String, String, String, Option<LuaValue>)| {
+        let json_args = lua_args_to_json(args)?;
+        let rt = tokio::runtime::Runtime::new().map_err(LuaError::external)?;
+        let result = rt.block_on(crate::dbus::generic::dbus_call(&service, &path, &interface, &method, json_args.as_deref(), false))
+            .map_err(LuaError::external)?;
+        lua.to_value(&result).map_err(LuaError::external)
+    })?)?;
+
+    // cosmix.dbus_system(service, path, interface, method, args?) -> result
+    cosmix.set("dbus_system", lua.create_function(|lua, (service, path, interface, method, args): (String, String, String, String, Option<LuaValue>)| {
+        let json_args = lua_args_to_json(args)?;
+        let rt = tokio::runtime::Runtime::new().map_err(LuaError::external)?;
+        let result = rt.block_on(crate::dbus::generic::dbus_call(&service, &path, &interface, &method, json_args.as_deref(), true))
+            .map_err(LuaError::external)?;
+        lua.to_value(&result).map_err(LuaError::external)
+    })?)?;
+
+    // cosmix.dbus_list(service, path?) -> introspection XML
+    cosmix.set("dbus_list", lua.create_function(|_, (service, path): (String, Option<String>)| {
+        let path = path.unwrap_or_else(|| "/".into());
+        let rt = tokio::runtime::Runtime::new().map_err(LuaError::external)?;
+        rt.block_on(crate::dbus::generic::dbus_introspect(&service, &path, false))
+            .map_err(LuaError::external)
+    })?)?;
+
+    // cosmix.config_list() -> table of component names
+    cosmix.set("config_list", lua.create_function(|lua, ()| {
+        let components = crate::cosmic_config::list_components()
+            .map_err(LuaError::external)?;
+        let tbl = lua.create_table()?;
+        for (i, c) in components.iter().enumerate() {
+            tbl.set(i + 1, c.as_str())?;
+        }
+        Ok(tbl)
+    })?)?;
+
+    // cosmix.config_keys(component) -> table of key names
+    cosmix.set("config_keys", lua.create_function(|lua, component: String| {
+        let keys = crate::cosmic_config::list_keys(&component)
+            .map_err(LuaError::external)?;
+        let tbl = lua.create_table()?;
+        for (i, k) in keys.iter().enumerate() {
+            tbl.set(i + 1, k.as_str())?;
+        }
+        Ok(tbl)
+    })?)?;
+
+    // cosmix.config_read(component, key) -> string
+    cosmix.set("config_read", lua.create_function(|_, (component, key): (String, String)| {
+        crate::cosmic_config::read_key(&component, &key)
+            .map_err(LuaError::external)
+    })?)?;
+
+    // cosmix.config_write(component, key, value)
+    cosmix.set("config_write", lua.create_function(|_, (component, key, value): (String, String, String)| {
+        crate::cosmic_config::write_key(&component, &key, &value)
+            .map_err(LuaError::external)
+    })?)?;
+
     // cosmix.json_encode(table) -> string
     cosmix.set("json_encode", lua.create_function(|_, val: LuaValue| {
         let json = serde_json::to_string(&val).map_err(LuaError::external)?;
@@ -262,6 +478,9 @@ fn create_lua() -> std::result::Result<Lua, LuaError> {
         let val: serde_json::Value = serde_json::from_str(&s).map_err(LuaError::external)?;
         lua.to_value(&val).map_err(LuaError::external)
     })?)?;
+
+    // Register port system (must be after all cosmix.* functions)
+    ports::register_port_api(&lua)?;
 
     Ok(lua)
 }

@@ -1,6 +1,8 @@
 mod config;
+mod tree_view;
 
 use config::{AccountConfig, MailConfig};
+use tree_view::{TreeNode, TreeView};
 use cosmic::app::Settings;
 use cosmic::iced::{self, Alignment, Length, Size};
 use cosmic::widget::menu::{self, KeyBind};
@@ -65,7 +67,7 @@ struct MailApp {
     core: Core,
     accounts: Vec<Account>,
     active_account: usize,
-    nav_model: nav_bar::Model,
+    mailbox_tree: TreeView,
     keybinds: HashMap<KeyBind, MenuAction>,
     emails: Vec<EmailSummary>,
     selected_email_id: Option<String>,
@@ -299,7 +301,7 @@ impl cosmic::Application for MailApp {
             core,
             accounts,
             active_account: 0,
-            nav_model: nav_bar::Model::default(),
+            mailbox_tree: TreeView::new(),
             keybinds,
             emails: Vec::new(),
             selected_email_id: None,
@@ -321,13 +323,23 @@ impl cosmic::Application for MailApp {
     }
 
     fn nav_model(&self) -> Option<&nav_bar::Model> {
-        Some(&self.nav_model)
+        Some(self.mailbox_tree.model())
     }
 
     fn on_nav_select(&mut self, id: nav_bar::Id) -> cosmic::app::Task<Message> {
-        self.nav_model.activate(id);
+        // Check if the activated item has children — toggle expand/collapse
+        if let Some(node_id) = self.mailbox_tree.activated(id) {
+            let node_id = node_id.to_string();
+            if self.mailbox_tree.has_children(&node_id) {
+                self.mailbox_tree.toggle(&node_id);
+                return cosmic::Task::none();
+            }
+        }
 
-        let mailbox_id = self.nav_model.active_data::<String>().cloned();
+        // Leaf node — select and load emails
+        self.mailbox_tree.model_mut().activate(id);
+
+        let mailbox_id = self.mailbox_tree.activated(id).map(|s| s.to_string());
         self.selected_email_id = None;
         self.selected_email = None;
         self.markdown_items.clear();
@@ -342,47 +354,53 @@ impl cosmic::Application for MailApp {
     }
 
     fn header_start(&self) -> Vec<Element<'_, Message>> {
-        vec![cosmic::widget::responsive_menu_bar().into_element(
-            self.core(),
-            &self.keybinds,
-            MENU_ID.clone(),
-            Message::Surface,
-            vec![
-                (
-                    "File".into(),
-                    vec![
-                        menu::Item::Button("New Message", Some(icon::from_name("mail-message-new-symbolic").into()), MenuAction::Compose),
-                        menu::Item::Divider,
-                        menu::Item::Button("Refresh", Some(icon::from_name("view-refresh-symbolic").into()), MenuAction::Refresh),
-                        menu::Item::Divider,
-                        menu::Item::Button("Quit", Some(icon::from_name("window-close-symbolic").into()), MenuAction::Quit),
-                    ],
-                ),
-                (
-                    "Edit".into(),
-                    vec![
-                        menu::Item::Button("Select All", None, MenuAction::SelectAll),
-                        menu::Item::Divider,
-                        menu::Item::Button("Mark as Read", None, MenuAction::MarkRead),
-                        menu::Item::Button("Mark as Unread", None, MenuAction::MarkUnread),
-                        menu::Item::Divider,
-                        menu::Item::Button("Delete", Some(icon::from_name("edit-delete-symbolic").into()), MenuAction::Delete),
-                    ],
-                ),
-                (
-                    "View".into(),
-                    vec![
-                        menu::Item::CheckBox("Preview Pane", None, self.show_preview, MenuAction::TogglePreview),
-                    ],
-                ),
-                (
-                    "Help".into(),
-                    vec![
-                        menu::Item::Button("About Cosmix Mail", Some(icon::from_name("help-about-symbolic").into()), MenuAction::About),
-                    ],
-                ),
-            ],
-        )]
+        vec![cosmic::widget::responsive_menu_bar()
+            .item_height(menu::ItemHeight::Dynamic(40))
+            .item_width(menu::ItemWidth::Uniform(280))
+            .spacing(4.0)
+            .into_element(
+                self.core(),
+                &self.keybinds,
+                MENU_ID.clone(),
+                Message::Surface,
+                vec![
+                    (
+                        "File".into(),
+                        vec![
+                            menu::Item::Button("New Message", Some(icon::from_name("mail-message-new-symbolic").into()), MenuAction::Compose),
+                            menu::Item::Divider,
+                            menu::Item::Button("Refresh", Some(icon::from_name("view-refresh-symbolic").into()), MenuAction::Refresh),
+                            menu::Item::Divider,
+                            menu::Item::Button("Quit", Some(icon::from_name("window-close-symbolic").into()), MenuAction::Quit),
+                        ],
+                    ),
+                    (
+                        "Edit".into(),
+                        vec![
+                            menu::Item::Button("Reply", Some(icon::from_name("mail-reply-all-symbolic").into()), MenuAction::Reply),
+                            menu::Item::Divider,
+                            menu::Item::Button("Select All", None, MenuAction::SelectAll),
+                            menu::Item::Divider,
+                            menu::Item::Button("Mark as Read", None, MenuAction::MarkRead),
+                            menu::Item::Button("Mark as Unread", None, MenuAction::MarkUnread),
+                            menu::Item::Divider,
+                            menu::Item::Button("Delete", Some(icon::from_name("edit-delete-symbolic").into()), MenuAction::Delete),
+                        ],
+                    ),
+                    (
+                        "View".into(),
+                        vec![
+                            menu::Item::CheckBox("Preview Pane", None, self.show_preview, MenuAction::TogglePreview),
+                        ],
+                    ),
+                    (
+                        "Help".into(),
+                        vec![
+                            menu::Item::Button("About Cosmix Mail", Some(icon::from_name("help-about-symbolic").into()), MenuAction::About),
+                        ],
+                    ),
+                ],
+            )]
     }
 
     fn header_end(&self) -> Vec<Element<'_, Message>> {
@@ -626,7 +644,7 @@ impl cosmic::Application for MailApp {
             Message::Refresh => {
                 let idx = self.active_account;
                 if let Some(client) = self.accounts[idx].client.clone() {
-                    let mb_id = self.nav_model.active_data::<String>().cloned();
+                    let mb_id = self.mailbox_tree.active_id().map(|s| s.to_string());
                     return load_emails(idx, client, mb_id);
                 }
             }
@@ -718,34 +736,42 @@ impl cosmic::Application for MailApp {
 
 impl MailApp {
     fn rebuild_nav_model(&mut self) {
-        self.nav_model = nav_bar::Model::default();
         let account = &self.accounts[self.active_account];
 
-        for mb in &account.mailboxes {
-            let label = if mb.unread > 0 {
-                format!("{} ({}/{})", mb.name, mb.unread, mb.total)
-            } else if mb.total > 0 {
-                format!("{} ({})", mb.name, mb.total)
-            } else {
-                mb.name.clone()
-            };
-
-            self.nav_model
-                .insert()
-                .text(label)
-                .icon(icon::from_name(mailbox_icon_name(&mb.name)))
-                .data::<String>(mb.id.clone());
-        }
-
-        // Activate inbox by default
-        if let Some(pos) = account
+        // JMAP mailboxes can have parentId for nesting.
+        // For now, build a flat list (depth 0) since our JMAP client
+        // doesn't expose parentId yet. The TreeView is ready for
+        // nested structure when we add parentId support.
+        let nodes: Vec<TreeNode> = account
             .mailboxes
             .iter()
-            .position(|m| m.name.eq_ignore_ascii_case("inbox"))
+            .map(|mb| {
+                let label = if mb.unread > 0 {
+                    format!("{} ({}/{})", mb.name, mb.unread, mb.total)
+                } else if mb.total > 0 {
+                    format!("{} ({})", mb.name, mb.total)
+                } else {
+                    mb.name.clone()
+                };
+                TreeNode::new(
+                    &mb.id,
+                    label,
+                    mailbox_icon_name(&mb.name),
+                    0,     // depth — flat for now
+                    false, // has_children — flat for now
+                )
+            })
+            .collect();
+
+        self.mailbox_tree.set_nodes(nodes);
+
+        // Activate inbox by default
+        if let Some(inbox) = account
+            .mailboxes
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case("inbox"))
         {
-            self.nav_model.activate_position(pos as u16);
-        } else {
-            self.nav_model.activate_position(0);
+            self.mailbox_tree.activate(&inbox.id);
         }
     }
 

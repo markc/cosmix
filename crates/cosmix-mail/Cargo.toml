@@ -1,0 +1,18 @@
+[package]
+name = "cosmix-mail"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cosmix-mail"
+path = "src/main.rs"
+
+[dependencies]
+cosmix_lib = { package = "cosmix-daemon", path = "../cosmix-daemon" }
+libcosmic = { workspace = true, features = ["markdown"] }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml_cfg.workspace = true

@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+fn default_delay() -> u64 { 5000 }
+
 /// All CLI commands that can be sent to the cosmix daemon over IPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -18,6 +20,13 @@ pub enum IpcRequest {
     Notify { summary: String, body: String },
     RunScript { name: String, args: Vec<String> },
     ListApps,
+    TypeText { text: String, #[serde(default = "default_delay")] delay_us: u64 },
+    SendKey { combo: String, #[serde(default = "default_delay")] delay_us: u64 },
+    ConfigList,
+    ConfigKeys { component: String },
+    ConfigRead { component: String, key: String },
+    ConfigWrite { component: String, key: String, value: String },
+    DbusCall { service: String, path: String, interface: String, method: String, args: Option<Vec<serde_json::Value>>, system: bool },
     Status,
     Ping,
 }

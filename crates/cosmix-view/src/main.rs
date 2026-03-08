@@ -77,7 +77,7 @@ fn key_binds() -> HashMap<KeyBind, Action> {
     bind!([Ctrl], Key::Character("q".into()), Quit);
     bind!([Ctrl], Key::Character("=".into()), ZoomIn);
     bind!([Ctrl], Key::Character("+".into()), ZoomIn);
-    bind!([Ctrl], Key::Character("-".into()), ZoomIn);
+    bind!([Ctrl], Key::Character("-".into()), ZoomOut);
     bind!([Ctrl], Key::Character("0".into()), ZoomFit);
     bind!([], Key::Named(Named::ArrowLeft), Prev);
     bind!([], Key::Named(Named::ArrowRight), Next);

@@ -184,6 +184,57 @@ async fn dispatch(request: IpcRequest, state: &SharedState, _events: &EventBus) 
             }))
         }
 
+        IpcRequest::TypeText { text, delay_us } => {
+            match crate::wayland::virtual_keyboard::type_text(&text, delay_us) {
+                Ok(()) => IpcResponse::success(serde_json::json!({
+                    "typed": text.len()
+                })),
+                Err(e) => IpcResponse::error(&e.to_string()),
+            }
+        }
+
+        IpcRequest::SendKey { combo, delay_us } => {
+            match crate::wayland::virtual_keyboard::send_key(&combo, delay_us) {
+                Ok(()) => IpcResponse::ok(),
+                Err(e) => IpcResponse::error(&e.to_string()),
+            }
+        }
+
+        IpcRequest::ConfigList => {
+            match crate::cosmic_config::list_components() {
+                Ok(components) => IpcResponse::success(serde_json::json!(components)),
+                Err(e) => IpcResponse::error(&e.to_string()),
+            }
+        }
+
+        IpcRequest::ConfigKeys { component } => {
+            match crate::cosmic_config::list_keys(&component) {
+                Ok(keys) => IpcResponse::success(serde_json::json!(keys)),
+                Err(e) => IpcResponse::error(&e.to_string()),
+            }
+        }
+
+        IpcRequest::ConfigRead { component, key } => {
+            match crate::cosmic_config::read_key(&component, &key) {
+                Ok(value) => IpcResponse::success(serde_json::Value::String(value)),
+                Err(e) => IpcResponse::error(&e.to_string()),
+            }
+        }
+
+        IpcRequest::ConfigWrite { component, key, value } => {
+            match crate::cosmic_config::write_key(&component, &key, &value) {
+                Ok(()) => IpcResponse::ok(),
+                Err(e) => IpcResponse::error(&e.to_string()),
+            }
+        }
+
+        IpcRequest::DbusCall { service, path, interface, method, args, system } => {
+            match crate::dbus::generic::dbus_call(&service, &path, &interface, &method, args.as_deref(), system).await {
+                Ok(value) => IpcResponse::success(value),
+                Err(e) => IpcResponse::error(&e.to_string()),
+            }
+        }
+
         IpcRequest::ListApps => {
             match crate::desktop::list_apps() {
                 Ok(apps) => {

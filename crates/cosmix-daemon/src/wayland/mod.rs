@@ -1,4 +1,5 @@
 pub mod toplevel;
+pub mod virtual_keyboard;
 pub mod workspace;
 
 use std::collections::HashMap;

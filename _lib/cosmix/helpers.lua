@@ -64,4 +64,58 @@ function M.truncate(s, maxlen)
     return s:sub(1, i)
 end
 
+--- Map a function over a table
+function M.map(t, fn)
+    local result = {}
+    for i, v in ipairs(t) do
+        result[i] = fn(v, i)
+    end
+    return result
+end
+
+--- Filter a table by predicate
+function M.filter(t, fn)
+    local result = {}
+    for _, v in ipairs(t) do
+        if fn(v) then
+            result[#result + 1] = v
+        end
+    end
+    return result
+end
+
+--- Get keys of a table
+function M.keys(t)
+    local result = {}
+    for k, _ in pairs(t) do
+        result[#result + 1] = k
+    end
+    return result
+end
+
+--- Get values of a table
+function M.values(t)
+    local result = {}
+    for _, v in pairs(t) do
+        result[#result + 1] = v
+    end
+    return result
+end
+
+--- Retry a function up to n times with delay between attempts
+function M.retry(fn, attempts, delay_ms)
+    attempts = attempts or 3
+    delay_ms = delay_ms or 1000
+    local last_err
+    for i = 1, attempts do
+        local ok, result = pcall(fn)
+        if ok then return result end
+        last_err = result
+        if i < attempts then
+            cosmix.sleep(delay_ms)
+        end
+    end
+    error("Failed after " .. attempts .. " attempts: " .. tostring(last_err))
+end
+
 return M

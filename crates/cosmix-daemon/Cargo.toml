@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "cosmix_lib"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cosmix"
 path = "src/main.rs"
@@ -17,6 +21,7 @@ tracing-subscriber.workspace = true
 wayland-client.workspace = true
 wayland-protocols.workspace = true
 wayland-protocols-wlr.workspace = true
+wayland-protocols-misc.workspace = true
 cosmic-protocols.workspace = true
 zbus.workspace = true
 mlua.workspace = true
@@ -28,3 +33,4 @@ serde_json.workspace = true
 iced.workspace = true
 toml_cfg.workspace = true
 directories.workspace = true
+ureq.workspace = true

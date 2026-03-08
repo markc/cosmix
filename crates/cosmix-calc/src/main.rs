@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use cosmic::app::Settings;
-use cosmic::iced::Size;
+use cosmic::iced::{Length, Size};
 use cosmic::widget::{button, column, container, row, text, text_input};
 use cosmic::{executor, Core, Element};
 
@@ -188,7 +188,7 @@ impl cosmic::Application for CalcApp {
 
     fn init(mut core: Core, _flags: Self::Flags) -> (Self, cosmic::app::Task<Self::Message>) {
         core.window.header_title = "Cosmix Calc".into();
-        core.window.content_container = false;
+        core.window.content_container = true;
 
         let engine = Arc::new(Mutex::new(CalcEngine::new()));
         let port_handle = start_port(engine.clone());
@@ -244,14 +244,14 @@ impl cosmic::Application for CalcApp {
                     text_input("0", &self.display_cache)
                         .on_input(Msg::ExprInput)
                         .on_submit(|_| Msg::Equals)
-                        .size(26)
-                        .padding(6),
+                        .size(28)
+                        .padding(8),
                 )
                 .push(text::body(&self.memory_cache).size(11))
-                .spacing(1),
+                .spacing(2),
         )
-        .padding([4, 4])
-        .width(cosmic::iced::Length::Fill);
+        .padding([8, 8])
+        .width(Length::Fill);
 
         let mem_row = btn_row(vec![
             ("MC", BtnStyle::Mem, Msg::MemClear),
@@ -307,7 +307,7 @@ impl cosmic::Application for CalcApp {
             ("=", BtnStyle::Equals, Msg::Equals),
         ]);
 
-        column::with_capacity(7)
+        column::with_capacity(8)
             .push(display)
             .push(mem_row)
             .push(func_row)
@@ -315,8 +315,8 @@ impl cosmic::Application for CalcApp {
             .push(row2)
             .push(row3)
             .push(row4)
-            .spacing(1)
-            .padding(3)
+            .spacing(8)
+            .padding(12)
             .into()
     }
 }
@@ -331,11 +331,11 @@ enum BtnStyle {
 }
 
 fn btn_row(buttons: Vec<(&str, BtnStyle, Msg)>) -> Element<'static, Msg> {
-    let mut r = row::with_capacity(buttons.len()).spacing(1);
+    let mut r = row::with_capacity(buttons.len()).spacing(8);
     for (label, style, msg) in buttons {
         r = r.push(calc_button(label, style, msg));
     }
-    r.width(cosmic::iced::Length::Fill).into()
+    r.width(Length::Fill).into()
 }
 
 fn calc_button(label: &str, style: BtnStyle, msg: Msg) -> Element<'static, Msg> {
@@ -348,10 +348,11 @@ fn calc_button(label: &str, style: BtnStyle, msg: Msg) -> Element<'static, Msg> 
         BtnStyle::Digit => button::standard(label),
     }
     .on_press(msg)
-    .width(cosmic::iced::Length::Fill);
+    .width(Length::Fill);
 
     container(btn)
-        .width(cosmic::iced::Length::FillPortion(1))
+        .width(Length::FillPortion(1))
+        .center_x(Length::Fill)
         .into()
 }
 
@@ -446,7 +447,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let settings = Settings::default()
-        .size(Size::new(340.0, 420.0));
+        .size(Size::new(380.0, 420.0));
 
     cosmic::app::run::<CalcApp>(settings, ())?;
 
