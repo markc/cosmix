@@ -3,10 +3,14 @@ mod daemon;
 mod dbus;
 mod desktop;
 mod dialog;
+mod fmt;
+mod http;
 mod ipc;
 mod lua;
 mod mail;
+mod mesh;
 mod pipewire;
+mod sqlite;
 mod wayland;
 
 use anyhow::Result;
@@ -145,7 +149,87 @@ fn try_via_daemon(command: &str, args: &[String]) -> Option<Result<()>> {
                 .and_then(|s| serde_json::from_str(s).ok());
             Some(ipc::protocol::IpcRequest::CallPort { port, port_command, args: call_args })
         }
+        // Clip List
+        "clip" => {
+            let sub = args.get(2).map(|s| s.as_str()).unwrap_or("list");
+            match sub {
+                "set" => {
+                    let key = args.get(3)?.to_string();
+                    let raw = args.get(4)?.to_string();
+                    let value: serde_json::Value = serde_json::from_str(&raw)
+                        .unwrap_or(serde_json::Value::String(raw));
+                    let ttl_secs: Option<u64> = args.get(5).and_then(|s| s.parse().ok());
+                    Some(ipc::protocol::IpcRequest::SetClip { key, value, set_by: Some("cli".into()), ttl_secs })
+                }
+                "get" => {
+                    let key = args.get(3)?.to_string();
+                    Some(ipc::protocol::IpcRequest::GetClip { key })
+                }
+                "del" => {
+                    let key = args.get(3)?.to_string();
+                    Some(ipc::protocol::IpcRequest::DelClip { key })
+                }
+                "list" => Some(ipc::protocol::IpcRequest::ListClips),
+                _ => None,
+            }
+        }
+        // Named Queues
+        "queue" => {
+            let sub = args.get(2).map(|s| s.as_str()).unwrap_or("list");
+            match sub {
+                "push" => {
+                    let queue = args.get(3)?.to_string();
+                    let raw = args.get(4)?.to_string();
+                    let item: serde_json::Value = serde_json::from_str(&raw)
+                        .unwrap_or(serde_json::Value::String(raw));
+                    Some(ipc::protocol::IpcRequest::PushQueue { queue, item })
+                }
+                "pop" => {
+                    let queue = args.get(3)?.to_string();
+                    Some(ipc::protocol::IpcRequest::PopQueue { queue })
+                }
+                "size" => {
+                    let queue = args.get(3)?.to_string();
+                    Some(ipc::protocol::IpcRequest::QueueSize { queue })
+                }
+                "list" => Some(ipc::protocol::IpcRequest::ListQueues),
+                _ => None,
+            }
+        }
+        // Script macro menus
+        "rescan-scripts" | "rs" => {
+            let port = args.get(2).cloned();
+            Some(ipc::protocol::IpcRequest::RescanScripts { port })
+        }
+        "run-for" | "rf" => {
+            let script_path = args.get(2)?.to_string();
+            let caller_port = args.get(3)?.to_string();
+            Some(ipc::protocol::IpcRequest::RunScriptForApp { script_path, caller_port })
+        }
         "list-ports" | "lp" => Some(ipc::protocol::IpcRequest::ListPorts),
+        "mesh" => {
+            let sub = args.get(2).map(|s| s.as_str()).unwrap_or("status");
+            match sub {
+                "status" | "s" => Some(ipc::protocol::IpcRequest::MeshStatus),
+                "peers" | "p" => Some(ipc::protocol::IpcRequest::MeshPeers),
+                "send" => {
+                    let node = args.get(3)?.to_string();
+                    let mesh_command = args.get(4)?.to_string();
+                    let send_args: Option<serde_json::Value> = args.get(5)
+                        .and_then(|s| serde_json::from_str(s).ok());
+                    Some(ipc::protocol::IpcRequest::MeshSend { node, mesh_command, args: send_args })
+                }
+                "call" => {
+                    let node = args.get(3)?.to_string();
+                    let port = args.get(4)?.to_string();
+                    let port_command = args.get(5)?.to_string();
+                    let call_args: Option<serde_json::Value> = args.get(6)
+                        .and_then(|s| serde_json::from_str(s).ok());
+                    Some(ipc::protocol::IpcRequest::MeshCall { node, port, port_command, args: call_args })
+                }
+                _ => None,
+            }
+        }
         "screenshot" | "ss" => {
             let path = args.get(2).cloned();
             Some(ipc::protocol::IpcRequest::Screenshot { path })
@@ -359,6 +443,13 @@ fn run_direct(command: &str, args: &[String]) -> Result<()> {
             println!("{}", result.display());
         }
 
+        // Clip List / Queues require daemon
+        "clip" | "queue" | "mesh" => {
+            eprintln!("Error: '{}' commands require the cosmix daemon to be running.", command);
+            eprintln!("Start it with: cosmix daemon");
+            std::process::exit(1);
+        }
+
         // Lua scripting
         "run" | "r" => {
             let path = require_arg(args, 2, "cosmix run <script> [args...]");
@@ -447,6 +538,28 @@ fn print_help() {
     eprintln!("Port commands (ARexx-style):");
     eprintln!("  call <port> <cmd> [json] Call a command on an app port");
     eprintln!("  list-ports (lp)          List all registered ports");
+    eprintln!();
+    eprintln!("Clip List (ARexx SETCLIP/GETCLIP — requires daemon):");
+    eprintln!("  clip set <key> <value> [ttl_secs]  Set a named value");
+    eprintln!("  clip get <key>                     Get a named value");
+    eprintln!("  clip del <key>                     Delete a named value");
+    eprintln!("  clip list                          List all clips");
+    eprintln!();
+    eprintln!("Script Macro Menus (requires daemon):");
+    eprintln!("  rescan-scripts (rs) [port]  Rescan and push scripts to port(s)");
+    eprintln!("  run-for (rf) <script> <port> Run script with port pre-addressed");
+    eprintln!();
+    eprintln!("Mesh networking (requires daemon + [mesh] config):");
+    eprintln!("  mesh status (s)                    Show mesh status");
+    eprintln!("  mesh peers (p)                     List connected peers");
+    eprintln!("  mesh send <node> <cmd> [json]      Send command to remote node");
+    eprintln!("  mesh call <node> <port> <cmd> [json] Call remote port command");
+    eprintln!();
+    eprintln!("Named Queues (ARexx PUSH/PULL — requires daemon):");
+    eprintln!("  queue push <name> <value>  Push value onto queue");
+    eprintln!("  queue pop <name>           Pop value from queue");
+    eprintln!("  queue size <name>          Get queue size");
+    eprintln!("  queue list                 List all queues");
     eprintln!();
     eprintln!("Lua scripting:");
     eprintln!("  run (r) <script>        Execute a Lua script");

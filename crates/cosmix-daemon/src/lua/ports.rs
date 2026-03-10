@@ -6,6 +6,9 @@ const BUILTIN_PORTS: &[&str] = &[
     "mail", "midi", "notify", "input",
 ];
 
+/// Registry key for the default ADDRESS target port name.
+const ADDRESS_KEY: &str = "__cosmix_address__";
+
 pub fn register_port_api(lua: &Lua) -> LuaResult<()> {
     let cosmix: LuaTable = lua.globals().get("cosmix")?;
 
@@ -32,9 +35,14 @@ pub fn register_port_api(lua: &Lua) -> LuaResult<()> {
             "notify" => build_notify_port(lua, &cosmix)?,
             "input" => build_input_port(lua, &cosmix)?,
             _ => {
-                // Try app port from registry — resolve socket path
-                let socket_path = resolve_app_port(&name)?;
-                build_app_port(lua, &name, &socket_path)?
+                // Check for remote port syntax: "portname@node"
+                if let Some((port_name, node_name)) = name.split_once('@') {
+                    build_remote_port(lua, port_name, node_name)?
+                } else {
+                    // Try app port from registry — resolve socket path
+                    let socket_path = resolve_app_port(&name)?;
+                    build_app_port(lua, &name, &socket_path)?
+                }
             }
         };
 
@@ -100,6 +108,36 @@ pub fn register_port_api(lua: &Lua) -> LuaResult<()> {
             }
         }
 
+        // Remote ports from mesh peers
+        let guard = crate::lua::DAEMON_STATE.lock().unwrap();
+        if let Some(ref state) = *guard {
+            let s = state.read().unwrap();
+            if let Some(ref mesh_handle) = s.mesh {
+                let manager = mesh_handle.manager.clone();
+                drop(s);
+                drop(guard);
+                let rt = tokio::runtime::Runtime::new().map_err(LuaError::external)?;
+                let peers = rt.block_on(manager.status());
+                for peer in peers {
+                    if peer.connected {
+                        for rp in &peer.remote_ports {
+                            let entry = lua.create_table()?;
+                            entry.set("name", rp.name.as_str())?;
+                            entry.set("type", "remote")?;
+                            entry.set("node", peer.name.as_str())?;
+                            let cmd_tbl = lua.create_table()?;
+                            for (j, cmd) in rp.commands.iter().enumerate() {
+                                cmd_tbl.set(j + 1, cmd.as_str())?;
+                            }
+                            entry.set("commands", cmd_tbl)?;
+                            tbl.set(i, entry)?;
+                            i += 1;
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(tbl)
     })?)?;
 
@@ -121,7 +159,101 @@ pub fn register_port_api(lua: &Lua) -> LuaResult<()> {
         }
     })?)?;
 
+    // cosmix.address(port_name) — set default port target (ARexx ADDRESS equivalent)
+    cosmix.set("address", lua.create_function(|lua, name: String| {
+        // Validate the port exists (built-in or app)
+        if !BUILTIN_PORTS.contains(&name.to_lowercase().as_str()) {
+            resolve_app_port(&name)?;
+        }
+        lua.set_named_registry_value(ADDRESS_KEY, name)?;
+        Ok(())
+    })?)?;
+
+    // cosmix.send(command, args?) — send to current ADDRESS target
+    cosmix.set("send", lua.create_function(|lua, (command, args): (String, Option<LuaValue>)| {
+        let name: Option<String> = lua.named_registry_value(ADDRESS_KEY).ok();
+        let name = name.filter(|s| !s.is_empty()).ok_or_else(|| {
+            LuaError::RuntimeError(
+                "No default port set. Call cosmix.address(\"PORT_NAME\") first.".into()
+            )
+        })?;
+
+        // Get or build the port table, then call its send method
+        let port_table = make_port_table(lua, &name)?;
+        let send_fn: LuaFunction = port_table.get("send")?;
+        send_fn.call::<LuaTable>((port_table, command, args))
+    })?)?;
+
+    // cosmix.launch(name_or_cmd, opts?) — launch an app and optionally wait for its port
+    // opts = { wait = true, timeout = 5000 }
+    cosmix.set("launch", lua.create_function(|_, (name, opts): (String, Option<LuaTable>)| {
+        let wait = opts.as_ref().and_then(|t| t.get::<bool>("wait").ok()).unwrap_or(false);
+        let timeout_ms = opts.as_ref().and_then(|t| t.get::<u64>("timeout").ok()).unwrap_or(5000);
+
+        // Try to find the binary: check if it's a known cosmix app or use as-is
+        let cmd = if name.contains('/') || name.contains(' ') {
+            name.clone()
+        } else {
+            // Try to find in desktop entries
+            match find_app_exec(&name) {
+                Some(exec) => exec,
+                None => name.clone(), // Use as-is (assume it's in PATH)
+            }
+        };
+
+        let child = std::process::Command::new("sh")
+            .args(["-c", &cmd])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(LuaError::external)?;
+
+        let pid = child.id();
+
+        if wait {
+            // Derive port name from app name: "cosmix-view" -> try as-is
+            let port_name = name.to_uppercase().replace('-', "-");
+            let start = std::time::Instant::now();
+            let interval = std::time::Duration::from_millis(100);
+            let deadline = std::time::Duration::from_millis(timeout_ms);
+
+            loop {
+                if resolve_app_port(&port_name).is_ok() {
+                    break;
+                }
+                if start.elapsed() >= deadline {
+                    break;
+                }
+                std::thread::sleep(interval);
+            }
+        }
+
+        Ok(pid)
+    })?)?;
+
     Ok(())
+}
+
+/// Try to find an app's Exec= line from .desktop files.
+fn find_app_exec(name: &str) -> Option<String> {
+    let apps = crate::desktop::list_apps().ok()?;
+    let lower = name.to_lowercase();
+
+    // Try exact match on desktop entry name or exec basename
+    for app in &apps {
+        let exec_base = app.exec.split('/').last().unwrap_or(&app.exec)
+            .split_whitespace().next().unwrap_or(&app.exec);
+        if exec_base.to_lowercase() == lower || app.name.to_lowercase() == lower {
+            // Strip desktop entry field codes (%f, %F, %u, %U, etc.)
+            let exec = app.exec.split_whitespace()
+                .filter(|s| !s.starts_with('%'))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Some(exec);
+        }
+    }
+    None
 }
 
 // ── App port resolution (reads daemon shared state) ──
@@ -187,6 +319,13 @@ fn get_app_port_infos() -> Option<Vec<(String, Vec<String>)>> {
 }
 
 // ── Build app port table with :send() method ──
+
+/// Create a port table for a named port (resolves socket via registry/filesystem).
+/// Used by both cosmix.port(name) and cosmix.self().
+pub fn make_port_table(lua: &Lua, name: &str) -> LuaResult<LuaTable> {
+    let socket_path = resolve_app_port(name)?;
+    build_app_port(lua, name, &socket_path)
+}
 
 fn build_app_port(lua: &Lua, name: &str, socket_path: &str) -> LuaResult<LuaTable> {
     let t = lua.create_table()?;
@@ -356,5 +495,60 @@ fn build_input_port(lua: &Lua, cosmix: &LuaTable) -> LuaResult<LuaTable> {
     let t = lua.create_table()?;
     t.set("type", delegate(lua, cosmix, "type_text")?)?;
     t.set("key", delegate(lua, cosmix, "send_key")?)?;
+    Ok(t)
+}
+
+/// Build a remote port table that routes commands through mesh.
+fn build_remote_port(lua: &Lua, port_name: &str, node_name: &str) -> LuaResult<LuaTable> {
+    let t = lua.create_table()?;
+    t.set("_name", port_name.to_string())?;
+    t.set("_node", node_name.to_string())?;
+    t.set("_remote", true)?;
+
+    // port:send(command, args?) -> response table  (uses mesh call)
+    t.set("send", lua.create_function(|lua, (this, command, args): (LuaTable, String, Option<LuaValue>)| {
+        let port_name: String = this.get("_name")?;
+        let node_name: String = this.get("_node")?;
+
+        let json_args = match args {
+            None | Some(LuaValue::Nil) => None,
+            Some(val) => Some(super::lua_value_to_json(&val)?),
+        };
+
+        let req = crate::ipc::protocol::IpcRequest::MeshCall {
+            node: node_name.clone(),
+            port: port_name.clone(),
+            port_command: command.clone(),
+            args: json_args,
+        };
+
+        match super::clip_ipc_call(&req) {
+            Ok(resp) if resp.ok => {
+                let response = lua.create_table()?;
+                response.set("ok", true)?;
+                if let Some(data) = resp.data {
+                    let lua_data = json_to_lua(lua, &data)?;
+                    response.set("data", lua_data)?;
+                }
+                Ok(response)
+            }
+            Ok(resp) => {
+                let response = lua.create_table()?;
+                response.set("ok", false)?;
+                response.set("error", resp.error.unwrap_or_else(|| "remote call failed".into()))?;
+                response.set("port", port_name)?;
+                response.set("node", node_name)?;
+                response.set("command", command)?;
+                Ok(response)
+            }
+            Err(e) => {
+                let response = lua.create_table()?;
+                response.set("ok", false)?;
+                response.set("error", e.to_string())?;
+                Ok(response)
+            }
+        }
+    })?)?;
+
     Ok(t)
 }

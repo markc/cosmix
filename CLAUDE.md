@@ -6,6 +6,25 @@ Umbrella project unifying desktop automation, mesh networking, web services, and
 
 Build the modern ARexx: a universal scripting layer where Lua scripts orchestrate Rust-powered desktop apps, mesh services, and web APIs. COSMIC is the platform, Lua is the lingua franca, Rust is the engine.
 
+**The consolidation principle:** Replace Go/C/C++/PHP/Python services with Rust binaries that have cosmix ports built in. Every service becomes scriptable, discoverable, and orchestratable through the same ARexx-style IPC.
+
+### Service Replacement Strategy
+
+Two patterns for absorbing existing services:
+
+- **Pattern A: Embed** — wrap a Rust library directly (e.g. hickory-dns replaces PowerDNS, mistral.rs replaces Ollama). The cosmix binary IS the service.
+- **Pattern B: Client port** — thin cosmix-port frontend to a mature external service (e.g. Stalwart stays as-is, cosmix-mail just gives it a port). Use when the service is too complex/mature to rewrite.
+
+| Service today | Replaced by | Pattern | Rust crate |
+|--------------|-------------|---------|------------|
+| PowerDNS (C++) | **cosmix-dns** | A (embed) | hickory-dns |
+| Ollama (Go) | **cosmix-llama** | A (embed) | mistral.rs |
+| FrankenPHP + Laravel (PHP) | **cosmix-web** | A (embed) | axum + HTMX |
+| meshd (Rust) | **cosmix-daemon** | A (absorbed) | already done |
+| Caddy (Go) | **cosmix-web** | A (embed) | axum + rustls |
+| Stalwart (Rust) | Keep + port | B (client) | JMAP/DAV proxy |
+| PostgreSQL (C) | Keep | — | too fundamental to replace |
+
 ## Name
 
 **Cosmix** — COSMIC + remix/mix. Your AI-powered desktop companion that scripts, automates, and orchestrates across the COSMIC desktop and mesh network.
@@ -61,28 +80,44 @@ impl App {
 }
 ```
 
-## Subprojects
+## Crates (monorepo)
 
-| Subproject | Location | Stack | Role |
-|------------|----------|-------|------|
-| **appmesh** | `~/.gh/appmesh/` | Rust+Lua (refactoring from PHP/QML) | Desktop automation — ARexx port system, D-Bus, input injection, COSMIC app control |
-| **nodemesh** | `~/.gh/nodemesh/` | Rust | Mesh control plane — meshd daemon, AMP protocol, WebRTC SFU |
-| **markweb** | `~/.gh/markweb/` | Laravel 12 + React + Reverb | Web interface — AI agent, mail, chat, DCS panels. Self-contained web world. |
-| **cosmic** | `~/.gh/cosmic/` | Rust | COSMIC desktop patches and extensions (cosmic-comp, future cosmic apps) |
+| Crate | Type | Role |
+|-------|------|------|
+| **cosmix-daemon** | binary | Desktop automation, mesh networking, Lua scripting, port registry |
+| **cosmix-web** | binary | Web UI (Axum + HTMX), AI chat, mail proxy, daemon IPC client |
+| **cosmix-port** | library | AMP wire format, Unix socket IPC, command registry — shared by all cosmix apps |
 
-## Two Worlds
+### Future Crates
+
+| Crate | Type | Wraps | Role |
+|-------|------|-------|------|
+| **cosmix-dns** | binary | hickory-dns | DNS authority server with cosmix port |
+| **cosmix-llama** | binary | mistral.rs | LLM inference with cosmix port |
+| **cosmix-mail** | binary | JMAP client | Mail client port to Stalwart |
+
+### Legacy Subprojects (being absorbed)
+
+| Subproject | Status | Absorbed into |
+|------------|--------|---------------|
+| **nodemesh** (`~/.gh/nodemesh/`) | **Absorbed** | cosmix-daemon mesh module (Phase 7) |
+| **markweb** (`~/.gh/markweb/`) | **Replacing** | cosmix-web (Axum + HTMX replaces Laravel + React) |
+| **appmesh** (`~/.gh/appmesh/`) | Refactoring | cosmix-daemon + cosmix-port |
+| **cosmic** (`~/.gh/cosmic/`) | Active | COSMIC desktop patches (cosmic-comp) |
+
+## Architecture
 
 ```
 +-------------------------------------+     +--------------------------+
 |        COSMIC DESKTOP WORLD         |     |       WEB WORLD          |
 |                                     |     |                          |
-|  Lua scripts ("ARexx")              |     |  Laravel + React + Reverb|
+|  Lua scripts ("ARexx")              |     |  Axum + HTMX             |
 |    v calls into                     |     |                          |
-|  Rust runtime (mlua)                |<--->|  markweb                 |
-|    +-- cosmix daemon (Layer 1)      | WS  |  REST/WS APIs            |
+|  Rust runtime (mlua)                |<--->|  cosmix-web              |
+|    +-- cosmix-daemon (Layer 1)      | IPC |  REST/WS APIs            |
 |    +-- cosmic-comp (Layer 2)        |     |  DCS panels              |
-|    +-- cosmix-port in apps (Layer 3)|     |                          |
-|    +-- meshd (mesh control plane)   |     |                          |
+|    +-- cosmix-port in apps (Layer 3)|     |  Ollama AI chat          |
+|    +-- mesh (absorbed from meshd)   |     |  Stalwart JMAP proxy     |
 +-------------------------------------+     +--------------------------+
 ```
 
@@ -90,38 +125,42 @@ impl App {
 
 | Domain | Language | Rationale |
 |--------|----------|-----------|
-| Performance, daemons, desktop | **Rust** | Native, safe, COSMIC-native |
+| Everything: daemons, services, web, desktop | **Rust** | Native, safe, single-binary deployment |
 | Scripting, automation, glue | **Lua** | Embeddable via mlua, hot-reloadable, minimal |
-| Web frontend + backend | **PHP + React** | Laravel ecosystem, self-contained |
+| Web frontend | **HTMX** | Server-rendered HTML fragments, no build step |
 | Interactive shell one-liners | **bash** | Stays for interactive use, not programming |
 
-**NO Python. Ever.**
+**NO Python. Ever. NO PHP — being removed (see `_doc/2026-03-09-gcwg-php-removal-plan.md`).**
 
 ## GUI Policy
 
 All cosmix GUI apps **must use libcosmic** (`pop-os/libcosmic`), not raw `iced`. libcosmic provides the COSMIC header bar, theming, window decorations, and navigation — apps should not reimplement these. Use `cosmic::Application` trait, `cosmic::app::run()`, and `cosmic::widget::*`.
 
-## Key Crates
+## Key Dependencies
 
 | Crate | Purpose |
 |-------|---------|
 | `mlua` | Embed LuaJIT/Lua 5.4 in Rust, expose APIs to Lua scripts |
-| `axum` | HTTP/WebSocket server (meshd, future APIs) |
+| `axum` | HTTP/WebSocket server (cosmix-web, mesh) |
 | `zbus` | D-Bus client (COSMIC app automation) |
 | `atspi` | AT-SPI2 accessibility tree introspection |
 | `tokio` | Async runtime |
 | `tokio-tungstenite` | WebSocket (mesh peer connections) |
-| `str0m` | WebRTC SFU (media plane) |
-| `iced` | COSMIC UI toolkit (future native apps) |
+| `iced` / `libcosmic` | COSMIC UI toolkit (native GUI apps) |
 | `serde` / `serde_json` | Serialization |
 | `clap` | CLI argument parsing |
+| `hickory-dns` | DNS server (future cosmix-dns, replaces PowerDNS) |
+| `mistral.rs` | LLM inference (future cosmix-llama, replaces Ollama) |
+| `sea-orm` / `sqlx` | Database (cosmix-web PostgreSQL) |
+| `tower-sessions` | Web session management |
+| `bcrypt` | Password verification (Laravel-compatible) |
 
 ## Transport
 
 | Scope | Transport | Why |
 |-------|-----------|-----|
 | Per-app IPC (Layer 3) | **Unix socket** (`/run/user/$UID/cosmix/`) | Local, fast, auto-discoverable |
-| Cross-node mesh | **WebSocket** (over WireGuard) | meshd handles this |
+| Cross-node mesh | **WebSocket** (over WireGuard) | cosmix-daemon mesh module |
 | Consuming existing interfaces | **D-Bus** | For what COSMIC already exposes |
 
 ## AMP Protocol

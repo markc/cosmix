@@ -126,6 +126,16 @@ pub fn daemon_event_to_lua(
             };
             Some(("port_message", LuaValue::Table(tbl)))
         }
+        DaemonEvent::MeshPeerConnected { node } => {
+            let tbl = lua.create_table().ok()?;
+            tbl.set("node", node.as_str()).ok()?;
+            Some(("mesh_peer_connected", LuaValue::Table(tbl)))
+        }
+        DaemonEvent::MeshPeerDisconnected { node } => {
+            let tbl = lua.create_table().ok()?;
+            tbl.set("node", node.as_str()).ok()?;
+            Some(("mesh_peer_disconnected", LuaValue::Table(tbl)))
+        }
         // Timer and Shutdown are internal daemon events, not dispatched to Lua scripts.
         DaemonEvent::Timer { .. } | DaemonEvent::Shutdown => None,
     }

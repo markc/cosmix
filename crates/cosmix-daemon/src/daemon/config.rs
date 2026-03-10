@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Returns the current user's UID as a string.
@@ -24,12 +25,12 @@ fn default_port_dir() -> String {
     format!("/run/user/{}/cosmix/ports", uid())
 }
 
-fn default_meshd_socket() -> String {
-    "/run/meshd/meshd.sock".into()
-}
-
 fn default_node_name() -> String {
     hostname()
+}
+
+fn default_listen_port() -> u16 {
+    9800
 }
 
 fn default_true() -> bool {
@@ -85,27 +86,42 @@ impl Default for DaemonSection {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-#[allow(dead_code)]
 pub struct MeshSection {
     pub enabled: bool,
 
-    #[serde(default = "default_meshd_socket")]
-    pub meshd_socket: String,
-
     #[serde(default = "default_node_name")]
     pub node_name: String,
+
+    #[serde(default = "default_listen_port")]
+    pub listen_port: u16,
+
+    #[serde(default)]
+    pub wg_ip: String,
+
+    #[serde(default)]
+    pub peers: HashMap<String, PeerConfig>,
 }
 
 impl Default for MeshSection {
     fn default() -> Self {
         Self {
             enabled: false,
-            meshd_socket: default_meshd_socket(),
             node_name: default_node_name(),
+            listen_port: default_listen_port(),
+            wg_ip: String::new(),
+            peers: HashMap::new(),
         }
     }
+}
+
+/// Configuration for a mesh peer.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PeerConfig {
+    pub wg_ip: String,
+    #[serde(default = "default_listen_port")]
+    pub port: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -237,5 +253,28 @@ serve = false
         let cfg: DaemonConfig = toml_cfg::from_str("").unwrap();
         assert!(!cfg.mesh.enabled);
         assert!(cfg.clipboard.serve);
+    }
+
+    #[test]
+    fn parse_mesh_with_peers() {
+        let toml = r#"
+[mesh]
+enabled = true
+node_name = "cachyos"
+listen_port = 9800
+wg_ip = "172.16.2.5"
+
+[mesh.peers.mko]
+wg_ip = "172.16.2.210"
+port = 9800
+"#;
+        let cfg: DaemonConfig = toml_cfg::from_str(toml).unwrap();
+        assert!(cfg.mesh.enabled);
+        assert_eq!(cfg.mesh.node_name, "cachyos");
+        assert_eq!(cfg.mesh.listen_port, 9800);
+        assert_eq!(cfg.mesh.wg_ip, "172.16.2.5");
+        assert_eq!(cfg.mesh.peers.len(), 1);
+        assert_eq!(cfg.mesh.peers["mko"].wg_ip, "172.16.2.210");
+        assert_eq!(cfg.mesh.peers["mko"].port, 9800);
     }
 }

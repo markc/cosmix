@@ -6,6 +6,8 @@ use crate::wayland::WorkspaceInfo;
 /// Re-export ToplevelInfo as WindowInfo for a cleaner public API.
 pub use crate::wayland::ToplevelInfo as WindowInfo;
 
+use super::cliplist::ClipList;
+use super::queues::QueueStore;
 use super::registry::PortRegistry;
 
 /// Thread-safe shared daemon state.
@@ -26,6 +28,15 @@ pub struct DaemonState {
     /// Registry of discovered app ports (Layer 3).
     pub port_registry: PortRegistry,
 
+    /// ARexx-style Clip List — persistent global key/value store.
+    pub clip_list: ClipList,
+
+    /// Session-scoped named queues for inter-script communication.
+    pub queue_store: QueueStore,
+
+    /// Mesh handle (None if mesh is disabled).
+    pub mesh: Option<crate::mesh::MeshHandle>,
+
     /// Set to `false` to signal all daemon tasks to shut down.
     pub running: bool,
 }
@@ -33,11 +44,17 @@ pub struct DaemonState {
 impl DaemonState {
     /// Create a new shared state wrapped in `Arc<RwLock>`.
     pub fn new() -> SharedState {
+        // Load persistent clip list
+        let clip_list = super::cliplist::load_from_file(&super::cliplist::cliplist_path());
+
         Arc::new(RwLock::new(Self {
             windows: HashMap::new(),
             workspaces: HashMap::new(),
             clipboard_text: None,
             port_registry: PortRegistry::new(),
+            clip_list,
+            queue_store: QueueStore::new(),
+            mesh: None,
             running: true,
         }))
     }

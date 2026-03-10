@@ -127,6 +127,7 @@ pub async fn scan_ports(state: &SharedState, port_dir: &str) {
     }
 
     // Discover new ports
+    let mut newly_registered = Vec::new();
     for (key, socket_path) in &found_sockets {
         let already_known = {
             let s = state.read().unwrap();
@@ -153,14 +154,34 @@ pub async fn scan_ports(state: &SharedState, port_dir: &str) {
             };
 
             let info = PortInfo {
-                name: upper_name,
+                name: upper_name.clone(),
                 socket: socket_path.clone(),
                 commands,
                 discovered_at: Instant::now(),
             };
 
+            newly_registered.push((key.clone(), upper_name, socket_path.clone()));
             let mut s = state.write().unwrap();
             s.port_registry.ports.insert(key.clone(), info);
+        }
+    }
+
+    // Push scripts to newly registered ports
+    for (_key, port_name, socket_path) in &newly_registered {
+        let dir_name = port_name
+            .split('.')
+            .next()
+            .unwrap_or(port_name)
+            .to_lowercase();
+        let script_dir = super::scripts::scripts_dir().join(&dir_name);
+        let scripts = super::scripts::scan_scripts(&script_dir);
+        if !scripts.is_empty() {
+            let sock = socket_path.to_string_lossy().to_string();
+            if let Err(e) = super::scripts::push_scripts_to_port(&sock, &scripts).await {
+                tracing::debug!("Failed to push scripts to {port_name}: {e}");
+            } else {
+                tracing::info!("Pushed {} scripts to {port_name}", scripts.len());
+            }
         }
     }
 }

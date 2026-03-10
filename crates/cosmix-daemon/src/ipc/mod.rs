@@ -1,7 +1,7 @@
 pub mod protocol;
 
 use anyhow::Result;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
 
 use crate::daemon::events::EventBus;
@@ -30,23 +30,12 @@ async fn handle_connection(
     state: SharedState,
     events: EventBus,
 ) -> Result<()> {
-    // Read length prefix (4 bytes big-endian)
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-
-    if len > 1_048_576 {
-        anyhow::bail!("Request too large: {len} bytes");
-    }
-
-    // Read JSON payload
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-
-    let request: IpcRequest = serde_json::from_slice(&buf)?;
+    // Read AMP request (client shuts down write side to signal EOF)
+    let msg = cosmix_port::amp::read_from_stream(&mut stream).await?;
+    let request = protocol::decode_amp_request(&msg)?;
     let response = dispatch(request, &state, &events).await;
 
-    // Write response
+    // Write AMP response
     let resp_bytes = protocol::encode(&response);
     stream.write_all(&resp_bytes).await?;
 
@@ -297,6 +286,226 @@ async fn dispatch(request: IpcRequest, state: &SharedState, _events: &EventBus) 
             }
         }
 
+        // --- Clip List ---
+        IpcRequest::SetClip { key, value, set_by, ttl_secs } => {
+            let set_by = set_by.unwrap_or_else(|| "ipc".to_string());
+            let entry = crate::daemon::cliplist::ClipEntry::new(value, set_by, ttl_secs);
+            let mut s = state.write().unwrap();
+            s.clip_list.insert(key, entry);
+            IpcResponse::ok()
+        }
+
+        IpcRequest::GetClip { key } => {
+            let s = state.read().unwrap();
+            match s.clip_list.get(&key) {
+                Some(entry) if !entry.is_expired() => {
+                    IpcResponse::success(serde_json::json!({
+                        "key": key,
+                        "value": entry.value,
+                        "set_by": entry.set_by,
+                        "set_at": entry.set_at,
+                        "ttl_remaining": entry.remaining_ttl(),
+                    }))
+                }
+                _ => IpcResponse::error(format!("Clip '{key}' not found")),
+            }
+        }
+
+        IpcRequest::ListClips => {
+            let s = state.read().unwrap();
+            let clips: Vec<serde_json::Value> = s.clip_list.iter()
+                .filter(|(_, e)| !e.is_expired())
+                .map(|(k, e)| serde_json::json!({
+                    "key": k,
+                    "value": e.value,
+                    "set_by": e.set_by,
+                    "set_at": e.set_at,
+                    "ttl_remaining": e.remaining_ttl(),
+                }))
+                .collect();
+            IpcResponse::success(serde_json::Value::Array(clips))
+        }
+
+        IpcRequest::DelClip { key } => {
+            let mut s = state.write().unwrap();
+            if s.clip_list.remove(&key).is_some() {
+                IpcResponse::ok()
+            } else {
+                IpcResponse::error(format!("Clip '{key}' not found"))
+            }
+        }
+
+        // --- Named Queues ---
+        IpcRequest::PushQueue { queue, item } => {
+            let mut s = state.write().unwrap();
+            s.queue_store.push(&queue, item);
+            IpcResponse::success(serde_json::json!({
+                "queue": queue,
+                "size": s.queue_store.size(&queue),
+            }))
+        }
+
+        IpcRequest::PopQueue { queue } => {
+            let mut s = state.write().unwrap();
+            match s.queue_store.pop(&queue) {
+                Some(value) => IpcResponse::success(value),
+                None => IpcResponse::error(format!("Queue '{queue}' is empty")),
+            }
+        }
+
+        IpcRequest::QueueSize { queue } => {
+            let s = state.read().unwrap();
+            IpcResponse::success(serde_json::json!({
+                "queue": queue,
+                "size": s.queue_store.size(&queue),
+            }))
+        }
+
+        IpcRequest::ListQueues => {
+            let s = state.read().unwrap();
+            let queues: Vec<serde_json::Value> = s.queue_store.list().into_iter()
+                .map(|(name, size)| serde_json::json!({
+                    "queue": name,
+                    "size": size,
+                }))
+                .collect();
+            IpcResponse::success(serde_json::Value::Array(queues))
+        }
+
+        // --- Script Macro Menus ---
+        IpcRequest::RunScriptForApp { script_path, caller_port } => {
+            match crate::lua::run_file_for_app(&script_path, &caller_port) {
+                Ok(()) => IpcResponse::ok(),
+                Err(e) => IpcResponse::error(&e.to_string()),
+            }
+        }
+
+        IpcRequest::RescanScripts { port } => {
+            let ports = {
+                let s = state.read().unwrap();
+                s.port_registry.ports.clone()
+            };
+
+            match port {
+                Some(port_name) => {
+                    // Rescan for a specific port
+                    let dir_name = port_name.split('.').next().unwrap_or(&port_name).to_lowercase();
+                    let script_dir = crate::daemon::scripts::scripts_dir().join(&dir_name);
+                    let scripts = crate::daemon::scripts::scan_scripts(&script_dir);
+                    if let Some(info) = ports.values().find(|p| p.name.eq_ignore_ascii_case(&port_name)) {
+                        let sock = info.socket.to_string_lossy().to_string();
+                        match crate::daemon::scripts::push_scripts_to_port(&sock, &scripts).await {
+                            Ok(()) => IpcResponse::success(serde_json::json!({"port": port_name, "scripts": scripts.len()})),
+                            Err(e) => IpcResponse::error(&e.to_string()),
+                        }
+                    } else {
+                        IpcResponse::error(&format!("Port '{port_name}' not found"))
+                    }
+                }
+                None => {
+                    // Rescan all ports
+                    crate::daemon::scripts::push_scripts_to_all_ports(&ports).await;
+                    IpcResponse::ok()
+                }
+            }
+        }
+
+        IpcRequest::MeshStatus => {
+            let manager = {
+                let s = state.read().unwrap();
+                s.mesh.as_ref().map(|h| h.manager.clone())
+            };
+            match manager {
+                Some(manager) => {
+                    let peers = manager.status().await;
+                    IpcResponse::success(serde_json::json!({
+                        "connected_peers": peers.iter().filter(|p| p.connected).count(),
+                        "total_peers": peers.len(),
+                        "peers": peers,
+                    }))
+                }
+                None => IpcResponse::error("mesh is not enabled"),
+            }
+        }
+
+        IpcRequest::MeshPeers => {
+            let manager = {
+                let s = state.read().unwrap();
+                s.mesh.as_ref().map(|h| h.manager.clone())
+            };
+            match manager {
+                Some(manager) => {
+                    let peers = manager.status().await;
+                    IpcResponse::success(serde_json::json!(peers))
+                }
+                None => IpcResponse::error("mesh is not enabled"),
+            }
+        }
+
+        IpcRequest::MeshSend { node, mesh_command, args } => {
+            let manager = {
+                let s = state.read().unwrap();
+                s.mesh.as_ref().map(|h| h.manager.clone())
+            };
+            match manager {
+                Some(manager) => {
+                    let mut msg = cosmix_port::amp::AmpMessage::new()
+                        .with_header("type", "request")
+                        .with_header("command", &mesh_command);
+                    if let Some(a) = args {
+                        msg.body = serde_json::to_string(&a).unwrap_or_default();
+                    }
+                    match manager.send_to(&node, msg).await {
+                        Ok(()) => IpcResponse::ok(),
+                        Err(e) => IpcResponse::error(&e),
+                    }
+                }
+                None => IpcResponse::error("mesh is not enabled"),
+            }
+        }
+
+        IpcRequest::MeshCall { node, port, port_command, args } => {
+            let manager = {
+                let s = state.read().unwrap();
+                s.mesh.as_ref().map(|h| h.manager.clone())
+            };
+            match manager {
+                Some(manager) => {
+                    let to_addr = if port.is_empty() {
+                        format!("{node}.amp")
+                    } else {
+                        format!("{port}.cosmix.{node}.amp")
+                    };
+                    let mut msg = cosmix_port::amp::AmpMessage::new()
+                        .with_header("command", &port_command)
+                        .with_header("to", &to_addr);
+                    if let Some(a) = args {
+                        msg.body = serde_json::to_string(&a).unwrap_or_default();
+                    }
+                    match manager.request(&node, msg).await {
+                        Ok(response) => {
+                            let rc: u8 = response.get("rc").and_then(|s| s.parse().ok()).unwrap_or(0);
+                            if rc == 0 || rc == 5 {
+                                if response.body.is_empty() {
+                                    IpcResponse::ok()
+                                } else {
+                                    match serde_json::from_str(&response.body) {
+                                        Ok(data) => IpcResponse::success(data),
+                                        Err(_) => IpcResponse::success(serde_json::Value::String(response.body)),
+                                    }
+                                }
+                            } else {
+                                let error = response.get("error").unwrap_or("remote error");
+                                IpcResponse::error(error)
+                            }
+                        }
+                        Err(e) => IpcResponse::error(&e),
+                    }
+                }
+                None => IpcResponse::error("mesh is not enabled"),
+            }
+        }
+
         IpcRequest::ListApps => {
             match crate::desktop::list_apps() {
                 Ok(apps) => {
@@ -325,19 +534,14 @@ pub fn client_request(socket_path: &str, request: &IpcRequest) -> Result<IpcResp
         let mut stream = tokio::net::UnixStream::connect(socket_path).await
             .map_err(|e| anyhow::anyhow!("Cannot connect to daemon at {socket_path}: {e}"))?;
 
+        // Write AMP request and signal end
         let req_bytes = protocol::encode_request(request);
         stream.write_all(&req_bytes).await?;
+        stream.shutdown().await?;
 
-        // Read response length
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-
-        let mut buf = vec![0u8; len];
-        stream.read_exact(&mut buf).await?;
-
-        let response: IpcResponse = serde_json::from_slice(&buf)?;
-        Ok(response)
+        // Read AMP response
+        let resp_msg = cosmix_port::amp::read_from_stream(&mut stream).await?;
+        protocol::decode_amp_response(&resp_msg)
     })
 }
 

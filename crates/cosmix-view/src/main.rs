@@ -1,15 +1,20 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use cosmic::app::Settings;
+use cosmic::iced::futures::SinkExt;
+use cosmic::iced::stream;
 use cosmic::iced::widget::image as iced_image;
-use cosmic::iced::{self, Length, Size};
+use cosmic::iced::{self, Length, Size, Subscription};
 use cosmic::iced_widget::Action as CanvasAction;
 use cosmic::widget::canvas::{self, Cache, Frame, Geometry, Path as CPath, Stroke, Text as CText};
 use cosmic::widget::menu::{self, key_bind::Modifier, ItemHeight, ItemWidth, KeyBind};
 use cosmic::widget::{button, column, icon, row, text, text_input, Canvas};
 use cosmic::{executor, Core, Element};
+
+type PortRx = Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<cosmix_port::PortEvent>>>;
+static PORT_RX: OnceLock<PortRx> = OnceLock::new();
 use image::{DynamicImage, GenericImageView, RgbaImage};
 
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif", "svg"];
@@ -116,6 +121,8 @@ enum MenuAction {
     ToggleGallery,
     SetWallpaper,
     About,
+    RunScript(usize),
+    RescanScripts,
 }
 
 impl menu::Action for MenuAction {
@@ -147,6 +154,8 @@ impl menu::Action for MenuAction {
             MenuAction::ToggleGallery => Msg::ToggleGallery,
             MenuAction::SetWallpaper => Msg::SetWallpaper,
             MenuAction::About => Msg::About,
+            MenuAction::RunScript(i) => Msg::RunScript(*i),
+            MenuAction::RescanScripts => Msg::RescanScripts,
         }
     }
 }
@@ -1118,6 +1127,11 @@ enum Msg {
     Quit,
     About,
     Surface(cosmic::surface::Action),
+    SyncFromPort,
+    PortActivate,
+    RunScript(usize),
+    RescanScripts,
+    ScriptsUpdated(Vec<cosmix_port::ScriptInfo>),
 }
 
 // ── App ──
@@ -1149,6 +1163,7 @@ struct ViewApp {
     content_mode: ContentMode,
     gallery_entries: Vec<GalleryEntry>,
     markdown_source: String,
+    port_scripts: Vec<cosmix_port::ScriptInfo>,
     _port: Option<cosmix_port::PortHandle>,
 }
 
@@ -1519,7 +1534,9 @@ impl cosmic::Application for ViewApp {
         core.window.content_container = true;
 
         let engine = Arc::new(Mutex::new(ViewEngine::new()));
-        let port = start_port(engine.clone());
+        let (port_tx, port_rx) = tokio::sync::mpsc::unbounded_channel();
+        PORT_RX.set(Arc::new(tokio::sync::Mutex::new(port_rx))).ok();
+        let port = start_port(engine.clone(), port_tx);
 
         let mut app = Self {
             core,
@@ -1546,6 +1563,7 @@ impl cosmic::Application for ViewApp {
             content_mode: ContentMode::Image,
             gallery_entries: Vec::new(),
             markdown_source: String::new(),
+            port_scripts: Vec::new(),
             _port: port,
         };
 
@@ -1568,6 +1586,159 @@ impl cosmic::Application for ViewApp {
     }
 
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
+        let mut menus = vec![
+            (
+                "File".into(),
+                vec![
+                    menu::Item::Button(
+                        "Capture Full Screen",
+                        Some(icon::from_name("camera-photo-symbolic").into()),
+                        MenuAction::ScreenFull,
+                    ),
+                    menu::Item::Button(
+                        "Capture Interactive",
+                        Some(icon::from_name("edit-select-all-symbolic").into()),
+                        MenuAction::ScreenInteractive,
+                    ),
+                    menu::Item::Divider,
+                    menu::Item::Button(
+                        "Open",
+                        Some(icon::from_name("document-open-symbolic").into()),
+                        MenuAction::Open,
+                    ),
+                    menu::Item::Button(
+                        "Save",
+                        Some(icon::from_name("document-save-symbolic").into()),
+                        MenuAction::Save,
+                    ),
+                    menu::Item::Button(
+                        "Save As",
+                        Some(icon::from_name("document-save-as-symbolic").into()),
+                        MenuAction::SaveAs,
+                    ),
+                    menu::Item::Divider,
+                    menu::Item::Button(
+                        "Copy to Clipboard",
+                        Some(icon::from_name("edit-copy-symbolic").into()),
+                        MenuAction::CopyClipboard,
+                    ),
+                    menu::Item::Divider,
+                    menu::Item::Button(
+                        "Set as Wallpaper",
+                        Some(icon::from_name("preferences-desktop-wallpaper-symbolic").into()),
+                        MenuAction::SetWallpaper,
+                    ),
+                    menu::Item::Divider,
+                    menu::Item::Button(
+                        "Quit",
+                        Some(icon::from_name("window-close-symbolic").into()),
+                        MenuAction::Quit,
+                    ),
+                ],
+            ),
+            (
+                "Edit".into(),
+                vec![
+                    menu::Item::Button(
+                        "Rotate Left",
+                        Some(icon::from_name("object-rotate-left-symbolic").into()),
+                        MenuAction::RotateLeft,
+                    ),
+                    menu::Item::Button(
+                        "Rotate Right",
+                        Some(icon::from_name("object-rotate-right-symbolic").into()),
+                        MenuAction::RotateRight,
+                    ),
+                    menu::Item::Divider,
+                    menu::Item::Button(
+                        "Flip Horizontal",
+                        Some(icon::from_name("object-flip-horizontal-symbolic").into()),
+                        MenuAction::FlipH,
+                    ),
+                    menu::Item::Button(
+                        "Flip Vertical",
+                        Some(icon::from_name("object-flip-vertical-symbolic").into()),
+                        MenuAction::FlipV,
+                    ),
+                    menu::Item::Divider,
+                    menu::Item::Button("Crop", None, MenuAction::Crop),
+                    menu::Item::Button("Scale", None, MenuAction::Scale),
+                    menu::Item::Divider,
+                    menu::Item::Button("Undo Annotation", None, MenuAction::Undo),
+                    menu::Item::Button(
+                        "Clear Annotations",
+                        None,
+                        MenuAction::ClearAnnotations,
+                    ),
+                ],
+            ),
+            (
+                "View".into(),
+                vec![
+                    menu::Item::Button(
+                        "Zoom In",
+                        Some(icon::from_name("zoom-in-symbolic").into()),
+                        MenuAction::ZoomIn,
+                    ),
+                    menu::Item::Button(
+                        "Zoom Out",
+                        Some(icon::from_name("zoom-out-symbolic").into()),
+                        MenuAction::ZoomOut,
+                    ),
+                    menu::Item::Button(
+                        "Fit to Window",
+                        Some(icon::from_name("zoom-fit-best-symbolic").into()),
+                        MenuAction::ZoomFit,
+                    ),
+                    menu::Item::Divider,
+                    menu::Item::Button("Previous Image", None, MenuAction::Prev),
+                    menu::Item::Button("Next Image", None, MenuAction::Next),
+                    menu::Item::Divider,
+                    menu::Item::Button(
+                        "Gallery",
+                        Some(icon::from_name("view-grid-symbolic").into()),
+                        MenuAction::ToggleGallery,
+                    ),
+                    menu::Item::Button(
+                        "EXIF Metadata",
+                        Some(icon::from_name("document-properties-symbolic").into()),
+                        MenuAction::ToggleExif,
+                    ),
+                ],
+            ),
+            (
+                "Help".into(),
+                vec![menu::Item::Button(
+                    "About Cosmix View",
+                    Some(icon::from_name("help-about-symbolic").into()),
+                    MenuAction::About,
+                )],
+            ),
+        ];
+
+        // Scripts menu (populated by daemon via __scripts__ port command)
+        if !self.port_scripts.is_empty() {
+            let mut script_items: Vec<menu::Item<MenuAction, &str>> = self.port_scripts
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let name: &str = Box::leak(s.display_name.clone().into_boxed_str());
+                    menu::Item::Button(
+                        name,
+                        Some(icon::from_name("text-x-script-symbolic").into()),
+                        MenuAction::RunScript(i),
+                    )
+                })
+                .collect();
+            script_items.push(menu::Item::Divider);
+            script_items.push(menu::Item::Button(
+                "Rescan Scripts",
+                Some(icon::from_name("view-refresh-symbolic").into()),
+                MenuAction::RescanScripts,
+            ));
+            menus.push(("Scripts".into(), script_items));
+        }
+
         vec![cosmic::widget::responsive_menu_bar()
             .item_height(ItemHeight::Dynamic(40))
             .item_width(ItemWidth::Uniform(280))
@@ -1577,135 +1748,7 @@ impl cosmic::Application for ViewApp {
                 &self.keybinds,
                 MENU_ID.clone(),
                 Msg::Surface,
-                vec![
-                    (
-                        "File".into(),
-                        vec![
-                            menu::Item::Button(
-                                "Capture Full Screen",
-                                Some(icon::from_name("camera-photo-symbolic").into()),
-                                MenuAction::ScreenFull,
-                            ),
-                            menu::Item::Button(
-                                "Capture Interactive",
-                                Some(icon::from_name("edit-select-all-symbolic").into()),
-                                MenuAction::ScreenInteractive,
-                            ),
-                            menu::Item::Divider,
-                            menu::Item::Button(
-                                "Open",
-                                Some(icon::from_name("document-open-symbolic").into()),
-                                MenuAction::Open,
-                            ),
-                            menu::Item::Button(
-                                "Save",
-                                Some(icon::from_name("document-save-symbolic").into()),
-                                MenuAction::Save,
-                            ),
-                            menu::Item::Button(
-                                "Save As",
-                                Some(icon::from_name("document-save-as-symbolic").into()),
-                                MenuAction::SaveAs,
-                            ),
-                            menu::Item::Divider,
-                            menu::Item::Button(
-                                "Copy to Clipboard",
-                                Some(icon::from_name("edit-copy-symbolic").into()),
-                                MenuAction::CopyClipboard,
-                            ),
-                            menu::Item::Divider,
-                            menu::Item::Button(
-                                "Set as Wallpaper",
-                                Some(icon::from_name("preferences-desktop-wallpaper-symbolic").into()),
-                                MenuAction::SetWallpaper,
-                            ),
-                            menu::Item::Divider,
-                            menu::Item::Button(
-                                "Quit",
-                                Some(icon::from_name("window-close-symbolic").into()),
-                                MenuAction::Quit,
-                            ),
-                        ],
-                    ),
-                    (
-                        "Edit".into(),
-                        vec![
-                            menu::Item::Button(
-                                "Rotate Left",
-                                Some(icon::from_name("object-rotate-left-symbolic").into()),
-                                MenuAction::RotateLeft,
-                            ),
-                            menu::Item::Button(
-                                "Rotate Right",
-                                Some(icon::from_name("object-rotate-right-symbolic").into()),
-                                MenuAction::RotateRight,
-                            ),
-                            menu::Item::Divider,
-                            menu::Item::Button(
-                                "Flip Horizontal",
-                                Some(icon::from_name("object-flip-horizontal-symbolic").into()),
-                                MenuAction::FlipH,
-                            ),
-                            menu::Item::Button(
-                                "Flip Vertical",
-                                Some(icon::from_name("object-flip-vertical-symbolic").into()),
-                                MenuAction::FlipV,
-                            ),
-                            menu::Item::Divider,
-                            menu::Item::Button("Crop", None, MenuAction::Crop),
-                            menu::Item::Button("Scale", None, MenuAction::Scale),
-                            menu::Item::Divider,
-                            menu::Item::Button("Undo Annotation", None, MenuAction::Undo),
-                            menu::Item::Button(
-                                "Clear Annotations",
-                                None,
-                                MenuAction::ClearAnnotations,
-                            ),
-                        ],
-                    ),
-                    (
-                        "View".into(),
-                        vec![
-                            menu::Item::Button(
-                                "Zoom In",
-                                Some(icon::from_name("zoom-in-symbolic").into()),
-                                MenuAction::ZoomIn,
-                            ),
-                            menu::Item::Button(
-                                "Zoom Out",
-                                Some(icon::from_name("zoom-out-symbolic").into()),
-                                MenuAction::ZoomOut,
-                            ),
-                            menu::Item::Button(
-                                "Fit to Window",
-                                Some(icon::from_name("zoom-fit-best-symbolic").into()),
-                                MenuAction::ZoomFit,
-                            ),
-                            menu::Item::Divider,
-                            menu::Item::Button("Previous Image", None, MenuAction::Prev),
-                            menu::Item::Button("Next Image", None, MenuAction::Next),
-                            menu::Item::Divider,
-                            menu::Item::Button(
-                                "Gallery",
-                                Some(icon::from_name("view-grid-symbolic").into()),
-                                MenuAction::ToggleGallery,
-                            ),
-                            menu::Item::Button(
-                                "EXIF Metadata",
-                                Some(icon::from_name("document-properties-symbolic").into()),
-                                MenuAction::ToggleExif,
-                            ),
-                        ],
-                    ),
-                    (
-                        "Help".into(),
-                        vec![menu::Item::Button(
-                            "About Cosmix View",
-                            Some(icon::from_name("help-about-symbolic").into()),
-                            MenuAction::About,
-                        )],
-                    ),
-                ],
+                menus,
             )]
     }
 
@@ -2025,8 +2068,61 @@ impl cosmic::Application for ViewApp {
                     cosmic::app::Action::Surface(a),
                 ));
             }
+            Msg::RunScript(i) => {
+                if let Some(script) = self.port_scripts.get(i) {
+                    let path = script.path.clone();
+                    return cosmic::app::Task::perform(
+                        async move {
+                            let _ = tokio::process::Command::new("cosmix")
+                                .args(["run-for", &path, "COSMIX-VIEW.1"])
+                                .output()
+                                .await;
+                        },
+                        |_| cosmic::Action::App(Msg::SyncFromPort),
+                    );
+                }
+            }
+            Msg::RescanScripts => {
+                return cosmic::app::Task::perform(
+                    async {
+                        let _ = tokio::process::Command::new("cosmix")
+                            .args(["rescan-scripts", "COSMIX-VIEW.1"])
+                            .output()
+                            .await;
+                    },
+                    |_| cosmic::Action::App(Msg::SyncFromPort),
+                );
+            }
+            Msg::ScriptsUpdated(scripts) => {
+                self.port_scripts = scripts;
+            }
+            Msg::SyncFromPort | Msg::PortActivate => {}
         }
         cosmic::app::Task::none()
+    }
+
+    fn subscription(&self) -> Subscription<Self::Message> {
+        Subscription::run(|| {
+            stream::channel(16, |mut output: cosmic::iced::futures::channel::mpsc::Sender<_>| async move {
+                let rx = PORT_RX.get().expect("port receiver not initialized");
+                loop {
+                    match rx.lock().await.recv().await {
+                        Some(cosmix_port::PortEvent::Activate) => {
+                            let _ = output.send(Msg::PortActivate).await;
+                        }
+                        Some(cosmix_port::PortEvent::ScriptsUpdated(scripts)) => {
+                            let _ = output.send(Msg::ScriptsUpdated(scripts)).await;
+                        }
+                        Some(cosmix_port::PortEvent::Command { .. }) => {
+                            let _ = output.send(Msg::SyncFromPort).await;
+                        }
+                        None => {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                }
+            })
+        })
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
@@ -2144,7 +2240,10 @@ fn num_input<'a>(
 
 // ── Cosmix Port Integration ──
 
-fn start_port(engine: Arc<Mutex<ViewEngine>>) -> Option<cosmix_port::PortHandle> {
+fn start_port(
+    engine: Arc<Mutex<ViewEngine>>,
+    notifier: tokio::sync::mpsc::UnboundedSender<cosmix_port::PortEvent>,
+) -> Option<cosmix_port::PortHandle> {
     let e1 = engine.clone();
     let e2 = engine.clone();
     let e3 = engine.clone();
@@ -2157,7 +2256,8 @@ fn start_port(engine: Arc<Mutex<ViewEngine>>) -> Option<cosmix_port::PortHandle>
     let e10 = engine.clone();
 
     let port = cosmix_port::Port::new("cosmix-view")
-        .command("open", move |args| {
+        .events(notifier)
+        .command("open", "Open an image file", move |args| {
             let path = args
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("expected file path string"))?;
@@ -2170,7 +2270,7 @@ fn start_port(engine: Arc<Mutex<ViewEngine>>) -> Option<cosmix_port::PortHandle>
                 "height": h,
             }))
         })
-        .command("save", move |args| {
+        .command("save", "Save the current image", move |args| {
             let obj = args.as_object().ok_or_else(|| {
                 anyhow::anyhow!("expected object with 'path' and optional 'quality'")
             })?;
@@ -2186,17 +2286,17 @@ fn start_port(engine: Arc<Mutex<ViewEngine>>) -> Option<cosmix_port::PortHandle>
             eng.save(Path::new(path), quality)?;
             Ok(serde_json::json!({ "saved": path, "quality": quality }))
         })
-        .command("next", move |_| {
+        .command("next", "Navigate to next image in directory", move |_| {
             let mut eng = e3.lock().unwrap();
             eng.navigate(1)?;
             Ok(serde_json::json!({ "file": eng.filename() }))
         })
-        .command("prev", move |_| {
+        .command("prev", "Navigate to previous image in directory", move |_| {
             let mut eng = e4.lock().unwrap();
             eng.navigate(-1)?;
             Ok(serde_json::json!({ "file": eng.filename() }))
         })
-        .command("rotate", move |args| {
+        .command("rotate", "Rotate the image (cw or ccw)", move |args| {
             let dir = args.as_str().unwrap_or("cw");
             let mut eng = e5.lock().unwrap();
             match dir {
@@ -2207,7 +2307,7 @@ fn start_port(engine: Arc<Mutex<ViewEngine>>) -> Option<cosmix_port::PortHandle>
             let (w, h) = eng.dimensions().unwrap_or((0, 0));
             Ok(serde_json::json!({ "width": w, "height": h }))
         })
-        .command("flip", move |args| {
+        .command("flip", "Flip the image (h or v)", move |args| {
             let dir = args.as_str().unwrap_or("h");
             let mut eng = e6.lock().unwrap();
             match dir {
@@ -2217,7 +2317,7 @@ fn start_port(engine: Arc<Mutex<ViewEngine>>) -> Option<cosmix_port::PortHandle>
             }
             Ok(serde_json::json!("flipped"))
         })
-        .command("crop", move |args| {
+        .command("crop", "Crop the image to x, y, w, h", move |args| {
             let obj = args
                 .as_object()
                 .ok_or_else(|| anyhow::anyhow!("expected object with x, y, w, h"))?;
@@ -2236,7 +2336,7 @@ fn start_port(engine: Arc<Mutex<ViewEngine>>) -> Option<cosmix_port::PortHandle>
             let (nw, nh) = eng.dimensions().unwrap_or((0, 0));
             Ok(serde_json::json!({ "width": nw, "height": nh }))
         })
-        .command("scale", move |args| {
+        .command("scale", "Scale the image to w, h", move |args| {
             let obj = args
                 .as_object()
                 .ok_or_else(|| anyhow::anyhow!("expected object with w, h"))?;
@@ -2252,7 +2352,7 @@ fn start_port(engine: Arc<Mutex<ViewEngine>>) -> Option<cosmix_port::PortHandle>
             eng.scale(w, h);
             Ok(serde_json::json!({ "width": w, "height": h }))
         })
-        .command("info", move |_| {
+        .command("fileinfo", "Get current image file metadata", move |_| {
             let eng = e9.lock().unwrap();
             let (w, h) = eng.dimensions().unwrap_or((0, 0));
             Ok(serde_json::json!({
@@ -2265,7 +2365,7 @@ fn start_port(engine: Arc<Mutex<ViewEngine>>) -> Option<cosmix_port::PortHandle>
                 "size": eng.file_size(),
             }))
         })
-        .command("capture", move |args| {
+        .command("capture", "Take a screenshot (full or interactive)", move |args| {
             let mode = args.as_str().unwrap_or("full");
             let interactive = mode != "full";
             let rt = tokio::runtime::Runtime::new()
@@ -2281,7 +2381,10 @@ fn start_port(engine: Arc<Mutex<ViewEngine>>) -> Option<cosmix_port::PortHandle>
                 "width": w,
                 "height": h,
             }))
-        });
+        })
+        .standard_help()
+        .standard_info("Cosmix View", env!("CARGO_PKG_VERSION"))
+        .standard_activate();
 
     match port.start() {
         Ok(handle) => {

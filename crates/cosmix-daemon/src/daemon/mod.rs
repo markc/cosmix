@@ -1,6 +1,9 @@
+pub mod cliplist;
 pub mod config;
 pub mod events;
+pub mod queues;
 pub mod registry;
+pub mod scripts;
 pub mod state;
 
 use anyhow::{Context, Result};
@@ -88,6 +91,23 @@ impl Daemon {
         let watcher_port_dir = config.daemon.port_dir.clone();
         let _port_watcher = registry::spawn_port_watcher(watcher_state, watcher_port_dir, 2000);
 
+        // Start mesh if enabled
+        if config.mesh.enabled {
+            let mesh_state = state.clone();
+            let mesh_config = config.mesh.clone();
+            match crate::mesh::start_mesh(&mesh_config, mesh_state).await {
+                Ok(handle) => {
+                    let mut s = state.write().unwrap();
+                    s.mesh = Some(handle);
+                    tracing::info!("Mesh enabled: node={}, port={}, peers={}",
+                        mesh_config.node_name, mesh_config.listen_port, mesh_config.peers.len());
+                }
+                Err(e) => {
+                    tracing::error!("Failed to start mesh: {e}");
+                }
+            }
+        }
+
         // Start IPC server
         let ipc_config = config.clone();
         let ipc_state = state.clone();
@@ -101,9 +121,14 @@ impl Daemon {
         // Wait for shutdown signal
         let shutdown_events = events.clone();
         let shutdown_state = state.clone();
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("Failed to register SIGTERM handler")?;
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("Received SIGINT, shutting down");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM, shutting down");
             }
             _ = async {
                 let mut rx = shutdown_events.subscribe();
@@ -116,6 +141,17 @@ impl Daemon {
                 }
             } => {
                 tracing::info!("Received shutdown event");
+            }
+        }
+
+        // Persist clip list before shutdown
+        {
+            let s = shutdown_state.read().unwrap();
+            let path = cliplist::cliplist_path();
+            if let Err(e) = cliplist::save_to_file(&path, &s.clip_list) {
+                tracing::warn!("Failed to save clip list: {e}");
+            } else {
+                tracing::info!("Saved {} clips to {}", s.clip_list.len(), path.display());
             }
         }
 

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Cosmix Toot
+Exec=cosmix-toot %u
+Terminal=false
+Type=Application
+StartupNotify=true
+Icon=com.cosmix.Toot
+Categories=COSMIC;
+Keywords=toot;mastodon;fediverse;cosmix;
+MimeType=x-scheme-handler/toot;

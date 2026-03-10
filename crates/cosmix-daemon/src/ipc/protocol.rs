@@ -33,6 +33,34 @@ pub enum IpcRequest {
     ListPorts,
     /// Take a native Wayland screenshot
     Screenshot { path: Option<String> },
+    /// Clip List — set a named value
+    SetClip { key: String, value: serde_json::Value, set_by: Option<String>, ttl_secs: Option<u64> },
+    /// Clip List — get a named value
+    GetClip { key: String },
+    /// Clip List — list all entries
+    ListClips,
+    /// Clip List — delete a named value
+    DelClip { key: String },
+    /// Named queue — push a value
+    PushQueue { queue: String, item: serde_json::Value },
+    /// Named queue — pop a value
+    PopQueue { queue: String },
+    /// Named queue — get size
+    QueueSize { queue: String },
+    /// Named queue — list all queues
+    ListQueues,
+    /// Run a script with a calling port pre-addressed (for macro menus)
+    RunScriptForApp { script_path: String, caller_port: String },
+    /// Rescan and push scripts to a specific port
+    RescanScripts { port: Option<String> },
+    /// Send a raw AMP message to a mesh peer
+    MeshSend { node: String, mesh_command: String, args: Option<serde_json::Value> },
+    /// Call a port command on a remote node (waits for response)
+    MeshCall { node: String, port: String, port_command: String, args: Option<serde_json::Value> },
+    /// Get mesh status
+    MeshStatus,
+    /// List connected mesh peers
+    MeshPeers,
     Status,
     Ping,
 }
@@ -76,50 +104,74 @@ impl IpcResponse {
     }
 }
 
-/// Encode an [`IpcResponse`] into a length-prefixed frame.
+/// Encode an [`IpcResponse`] into AMP wire format.
 ///
-/// Wire format: 4-byte big-endian length prefix followed by JSON bytes.
+/// Format: `---\nrc: N\n[error: ...]\n---\n[json_body]\n`
 pub fn encode(response: &IpcResponse) -> Vec<u8> {
-    let json = serde_json::to_vec(response).expect("IpcResponse should always serialize");
-    let len = (json.len() as u32).to_be_bytes();
-    let mut buf = Vec::with_capacity(4 + json.len());
-    buf.extend_from_slice(&len);
-    buf.extend_from_slice(&json);
-    buf
+    let mut msg = cosmix_port::amp::AmpMessage::new();
+    msg.set("rc", if response.ok { "0" } else { "10" });
+    if let Some(ref error) = response.error {
+        msg.set("error", error);
+    }
+    if let Some(ref data) = response.data {
+        msg.body = serde_json::to_string(data).unwrap_or_default();
+    }
+    msg.to_bytes()
 }
 
-/// Encode an [`IpcRequest`] into a length-prefixed frame (client side).
+/// Encode an [`IpcRequest`] into AMP wire format (client side).
 ///
-/// Wire format: 4-byte big-endian length prefix followed by JSON bytes.
+/// Serializes the enum to JSON, extracts the `command` tag into an AMP header,
+/// and puts the remaining fields in the body.
 pub fn encode_request(request: &IpcRequest) -> Vec<u8> {
-    let json = serde_json::to_vec(request).expect("IpcRequest should always serialize");
-    let len = (json.len() as u32).to_be_bytes();
-    let mut buf = Vec::with_capacity(4 + json.len());
-    buf.extend_from_slice(&len);
-    buf.extend_from_slice(&json);
-    buf
+    let json = serde_json::to_value(request).expect("IpcRequest should always serialize");
+    let mut map = json.as_object().expect("IpcRequest serializes to object").clone();
+
+    let command = map.remove("command").expect("tagged enum has command field");
+    let command_str = command.as_str().expect("command is a string");
+
+    let mut msg = cosmix_port::amp::AmpMessage::new();
+    msg.set("command", command_str);
+
+    // Only include body if there are extra fields beyond the command tag
+    if !map.is_empty() {
+        msg.body = serde_json::to_string(&map).unwrap_or_default();
+    }
+
+    msg.to_bytes()
 }
 
-/// Decode a length-prefixed frame into an [`IpcRequest`].
+/// Decode an AMP message into an [`IpcRequest`].
 ///
-/// Expects the full frame: 4-byte big-endian length prefix followed by that
-/// many bytes of JSON. Returns the parsed request.
-#[allow(dead_code)]
-pub fn decode_request(bytes: &[u8]) -> Result<IpcRequest> {
-    anyhow::ensure!(
-        bytes.len() >= 4,
-        "frame too short: need at least 4 bytes for length prefix, got {}",
-        bytes.len()
-    );
+/// Reads the `command` header and merges it with the body JSON to reconstruct
+/// the tagged enum that serde expects.
+pub fn decode_amp_request(msg: &cosmix_port::amp::AmpMessage) -> Result<IpcRequest> {
+    let command = msg.get("command")
+        .ok_or_else(|| anyhow::anyhow!("Missing 'command' header in AMP request"))?;
 
-    let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    if msg.body.is_empty() {
+        // No extra fields — just the command
+        let json = serde_json::json!({"command": command});
+        serde_json::from_value(json).context("failed to deserialize IpcRequest")
+    } else {
+        // Merge command into body JSON
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&msg.body).context("AMP body is not valid JSON object")?;
+        map.insert("command".to_string(), serde_json::Value::String(command.to_string()));
+        serde_json::from_value(serde_json::Value::Object(map))
+            .context("failed to deserialize IpcRequest from AMP")
+    }
+}
 
-    anyhow::ensure!(
-        bytes.len() >= 4 + len,
-        "incomplete frame: header says {} bytes but only {} available",
-        len,
-        bytes.len() - 4
-    );
-
-    serde_json::from_slice(&bytes[4..4 + len]).context("failed to deserialize IpcRequest")
+/// Decode an AMP message into an [`IpcResponse`].
+pub fn decode_amp_response(msg: &cosmix_port::amp::AmpMessage) -> Result<IpcResponse> {
+    let rc: u8 = msg.get("rc").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let ok = rc == 0;
+    let error = msg.get("error").map(|s| s.to_string());
+    let data = if msg.body.is_empty() {
+        None
+    } else {
+        Some(serde_json::from_str(&msg.body).context("AMP response body is not valid JSON")?)
+    };
+    Ok(IpcResponse { ok, data, error })
 }

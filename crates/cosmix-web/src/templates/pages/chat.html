@@ -1,0 +1,14 @@
+<div class="page-chat">
+    <h2>Agent Chat</h2>
+    <div id="messages" class="chat-messages">
+        <div class="chat-msg chat-msg-assistant">
+            <strong>Assistant</strong>
+            <p>Hello! How can I help you today?</p>
+        </div>
+    </div>
+    <form hx-post="/api/chat/send" hx-target="#messages" hx-swap="beforeend" class="chat-input"
+          hx-on::after-request="this.reset(); document.querySelector('#messages').scrollTop = document.querySelector('#messages').scrollHeight">
+        <input type="text" name="message" placeholder="Type a message..." autocomplete="off" autofocus>
+        <button type="submit" class="btn">Send</button>
+    </form>
+</div>

@@ -12,6 +12,8 @@ pub enum DaemonEvent {
     ClipboardChanged,
     PortMessage { from: String, command: String, body: Option<String> },
     Timer { id: String },
+    MeshPeerConnected { node: String },
+    MeshPeerDisconnected { node: String },
     Shutdown,
 }
 

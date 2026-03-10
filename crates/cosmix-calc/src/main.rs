@@ -1,12 +1,16 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use cosmic::app::Settings;
-use cosmic::iced::{self, Length, Size};
+use cosmic::iced::stream;
+use cosmic::iced::{self, Length, Size, Subscription};
 use cosmic::widget::menu::{self, key_bind::Modifier, ItemHeight, ItemWidth, KeyBind};
 use cosmic::widget::{button, column, container, icon, row, text, text_input};
+use cosmic::iced::futures::SinkExt;
 use cosmic::{executor, Core, Element};
+
+type PortRx = Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<cosmix_port::PortEvent>>>;
+static PORT_RX: OnceLock<PortRx> = OnceLock::new();
 
 static MENU_ID: LazyLock<iced::id::Id> = LazyLock::new(|| iced::id::Id::new("calc_menu"));
 
@@ -20,6 +24,8 @@ enum MenuAction {
     ClearHistory,
     Quit,
     About,
+    RunScript(usize),
+    RescanScripts,
 }
 
 impl menu::Action for MenuAction {
@@ -33,6 +39,8 @@ impl menu::Action for MenuAction {
             MenuAction::ClearHistory => Msg::ClearHistory,
             MenuAction::Quit => Msg::Quit,
             MenuAction::About => Msg::About,
+            MenuAction::RunScript(i) => Msg::RunScript(*i),
+            MenuAction::RescanScripts => Msg::RescanScripts,
         }
     }
 }
@@ -220,18 +228,22 @@ enum Msg {
     ClearHistory,
     Quit,
     About,
+    RunScript(usize),
+    RescanScripts,
     Surface(cosmic::surface::Action),
     SyncFromPort,
+    PortActivate,
+    ScriptsUpdated(Vec<cosmix_port::ScriptInfo>),
 }
 
 struct CalcApp {
     core: Core,
     engine: Arc<Mutex<CalcEngine>>,
-    port_dirty: Arc<AtomicBool>,
     keybinds: HashMap<KeyBind, MenuAction>,
     display_cache: String,
     memory_cache: String,
     history_count: usize,
+    port_scripts: Vec<cosmix_port::ScriptInfo>,
     _port_handle: Option<cosmix_port::PortHandle>,
 }
 
@@ -255,18 +267,19 @@ impl cosmic::Application for CalcApp {
         core.window.content_container = true;
 
         let engine = Arc::new(Mutex::new(CalcEngine::new()));
-        let port_dirty = Arc::new(AtomicBool::new(false));
-        let port_handle = start_port(engine.clone(), port_dirty.clone());
+        let (port_tx, port_rx) = tokio::sync::mpsc::unbounded_channel();
+        PORT_RX.set(Arc::new(tokio::sync::Mutex::new(port_rx))).ok();
+        let port_handle = start_port(engine.clone(), port_tx);
 
         (
             Self {
                 core,
                 engine,
-                port_dirty,
                 keybinds: key_binds(),
                 display_cache: "0".into(),
                 memory_cache: String::new(),
                 history_count: 0,
+                port_scripts: Vec::new(),
                 _port_handle: port_handle,
             },
             cosmic::app::Task::none(),
@@ -274,6 +287,68 @@ impl cosmic::Application for CalcApp {
     }
 
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
+        let mut menus = vec![(
+            "File".into(),
+            vec![
+                menu::Item::Button(
+                    "Copy Result",
+                    Some(icon::from_name("edit-copy-symbolic").into()),
+                    MenuAction::CopyResult,
+                ),
+                menu::Item::Button(
+                    "Copy Expression",
+                    None,
+                    MenuAction::CopyExpression,
+                ),
+                menu::Item::Button(
+                    "Paste",
+                    Some(icon::from_name("edit-paste-symbolic").into()),
+                    MenuAction::Paste,
+                ),
+                menu::Item::Divider,
+                menu::Item::Button(
+                    "Clear History",
+                    Some(icon::from_name("edit-clear-all-symbolic").into()),
+                    MenuAction::ClearHistory,
+                ),
+                menu::Item::Divider,
+                menu::Item::Button(
+                    "About",
+                    Some(icon::from_name("help-about-symbolic").into()),
+                    MenuAction::About,
+                ),
+                menu::Item::Button(
+                    "Quit",
+                    Some(icon::from_name("window-close-symbolic").into()),
+                    MenuAction::Quit,
+                ),
+            ],
+        )];
+
+        // Scripts menu (populated by daemon via __scripts__ port command)
+        if !self.port_scripts.is_empty() {
+            let mut script_items: Vec<menu::Item<MenuAction, &str>> = self.port_scripts
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    // Leak the string to get 'static lifetime (menu items need &str)
+                    let name: &str = Box::leak(s.display_name.clone().into_boxed_str());
+                    menu::Item::Button(
+                        name,
+                        Some(icon::from_name("text-x-script-symbolic").into()),
+                        MenuAction::RunScript(i),
+                    )
+                })
+                .collect();
+            script_items.push(menu::Item::Divider);
+            script_items.push(menu::Item::Button(
+                "Rescan Scripts",
+                Some(icon::from_name("view-refresh-symbolic").into()),
+                MenuAction::RescanScripts,
+            ));
+            menus.push(("Scripts".into(), script_items));
+        }
+
         vec![cosmic::widget::responsive_menu_bar()
             .item_height(ItemHeight::Dynamic(40))
             .item_width(ItemWidth::Uniform(240))
@@ -283,43 +358,7 @@ impl cosmic::Application for CalcApp {
                 &self.keybinds,
                 MENU_ID.clone(),
                 Msg::Surface,
-                vec![(
-                    "File".into(),
-                    vec![
-                        menu::Item::Button(
-                            "Copy Result",
-                            Some(icon::from_name("edit-copy-symbolic").into()),
-                            MenuAction::CopyResult,
-                        ),
-                        menu::Item::Button(
-                            "Copy Expression",
-                            None,
-                            MenuAction::CopyExpression,
-                        ),
-                        menu::Item::Button(
-                            "Paste",
-                            Some(icon::from_name("edit-paste-symbolic").into()),
-                            MenuAction::Paste,
-                        ),
-                        menu::Item::Divider,
-                        menu::Item::Button(
-                            "Clear History",
-                            Some(icon::from_name("edit-clear-all-symbolic").into()),
-                            MenuAction::ClearHistory,
-                        ),
-                        menu::Item::Divider,
-                        menu::Item::Button(
-                            "About",
-                            Some(icon::from_name("help-about-symbolic").into()),
-                            MenuAction::About,
-                        ),
-                        menu::Item::Button(
-                            "Quit",
-                            Some(icon::from_name("window-close-symbolic").into()),
-                            MenuAction::Quit,
-                        ),
-                    ],
-                )],
+                menus,
             )]
     }
 
@@ -449,11 +488,39 @@ impl cosmic::Application for CalcApp {
                     cosmic::app::Action::Surface(a),
                 ));
             }
-            Msg::SyncFromPort => {
-                if !self.port_dirty.swap(false, Ordering::Relaxed) {
-                    return cosmic::app::Task::none();
+            Msg::RunScript(i) => {
+                if let Some(script) = self.port_scripts.get(i) {
+                    let path = script.path.clone();
+                    return cosmic::app::Task::perform(
+                        async move {
+                            let _ = tokio::process::Command::new("cosmix")
+                                .args(["run-for", &path, "COSMIX-CALC.1"])
+                                .output()
+                                .await;
+                        },
+                        |_| cosmic::Action::App(Msg::Pasted(None)),
+                    );
                 }
-                // Fall through to update caches below
+            }
+            Msg::RescanScripts => {
+                return cosmic::app::Task::perform(
+                    async {
+                        let _ = tokio::process::Command::new("cosmix")
+                            .args(["rescan-scripts", "COSMIX-CALC.1"])
+                            .output()
+                            .await;
+                    },
+                    |_| cosmic::Action::App(Msg::Pasted(None)),
+                );
+            }
+            Msg::SyncFromPort => {
+                // Port event received — fall through to update caches
+            }
+            Msg::PortActivate => {
+                // Bring window to front — fall through to update caches
+            }
+            Msg::ScriptsUpdated(scripts) => {
+                self.port_scripts = scripts;
             }
         }
 
@@ -469,9 +536,28 @@ impl cosmic::Application for CalcApp {
         cosmic::app::Task::none()
     }
 
-    fn subscription(&self) -> cosmic::iced::Subscription<Self::Message> {
-        cosmic::iced::time::every(std::time::Duration::from_millis(100))
-            .map(|_| Msg::SyncFromPort)
+    fn subscription(&self) -> Subscription<Self::Message> {
+        Subscription::run(|| {
+            stream::channel(16, |mut output: cosmic::iced::futures::channel::mpsc::Sender<_>| async move {
+                let rx = PORT_RX.get().expect("port receiver not initialized");
+                loop {
+                    match rx.lock().await.recv().await {
+                        Some(cosmix_port::PortEvent::Activate) => {
+                            let _ = output.send(Msg::PortActivate).await;
+                        }
+                        Some(cosmix_port::PortEvent::ScriptsUpdated(scripts)) => {
+                            let _ = output.send(Msg::ScriptsUpdated(scripts)).await;
+                        }
+                        Some(cosmix_port::PortEvent::Command { .. }) => {
+                            let _ = output.send(Msg::SyncFromPort).await;
+                        }
+                        None => {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                }
+            })
+        })
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
@@ -603,42 +689,39 @@ fn calc_button(label: &str, style: BtnStyle, msg: Msg) -> Element<'static, Msg> 
 
 // ── Cosmix Port Integration ──
 
-fn start_port(engine: Arc<Mutex<CalcEngine>>, dirty: Arc<AtomicBool>) -> Option<cosmix_port::PortHandle> {
+fn start_port(
+    engine: Arc<Mutex<CalcEngine>>,
+    notifier: tokio::sync::mpsc::UnboundedSender<cosmix_port::PortEvent>,
+) -> Option<cosmix_port::PortHandle> {
     let e1 = engine.clone();
     let e2 = engine.clone();
     let e3 = engine.clone();
     let e4 = engine.clone();
     let e5 = engine.clone();
     let e6 = engine.clone();
-    let d1 = dirty.clone();
-    let d3 = dirty.clone();
-    let d5 = dirty.clone();
-    let d6 = dirty.clone();
 
     let port = cosmix_port::Port::new("cosmix-calc")
-        .command("calc", move |args| {
+        .events(notifier)
+        .command("calc", "Evaluate a mathematical expression", move |args| {
             let expr = args
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("expected string expression"))?;
             let mut eng = e1.lock().unwrap();
-            // Set expression and evaluate — updates display so GUI reflects result
             eng.expression = expr.to_string();
             eng.display = expr.to_string();
             let result = eng.evaluate(None);
-            d1.store(true, Ordering::Relaxed);
             Ok(serde_json::json!(result))
         })
-        .command("result", move |_| {
+        .command("result", "Get the current display value", move |_| {
             let eng = e2.lock().unwrap();
             Ok(serde_json::json!(eng.display))
         })
-        .command("clear", move |_| {
+        .command("clear", "Clear the calculator", move |_| {
             let mut eng = e3.lock().unwrap();
             eng.clear();
-            d3.store(true, Ordering::Relaxed);
             Ok(serde_json::json!("cleared"))
         })
-        .command("history", move |_| {
+        .command("history", "Get calculation history", move |_| {
             let eng = e4.lock().unwrap();
             let h: Vec<serde_json::Value> = eng
                 .history
@@ -647,7 +730,7 @@ fn start_port(engine: Arc<Mutex<CalcEngine>>, dirty: Arc<AtomicBool>) -> Option<
                 .collect();
             Ok(serde_json::Value::Array(h))
         })
-        .command("memory", move |args| {
+        .command("memory", "Memory operations: add/sub/recall/clear", move |args| {
             let op = args.as_str().unwrap_or("recall");
             let mut eng = e5.lock().unwrap();
             match op {
@@ -657,10 +740,9 @@ fn start_port(engine: Arc<Mutex<CalcEngine>>, dirty: Arc<AtomicBool>) -> Option<
                 "clear" | "mc" => eng.mem_clear(),
                 _ => return Err(anyhow::anyhow!("unknown memory op: {op}")),
             }
-            d5.store(true, Ordering::Relaxed);
             Ok(serde_json::json!(format_number(eng.memory)))
         })
-        .command("press", move |args| {
+        .command("press", "Simulate a button press", move |args| {
             let key = args
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("expected key string"))?;
@@ -681,9 +763,11 @@ fn start_port(engine: Arc<Mutex<CalcEngine>>, dirty: Arc<AtomicBool>) -> Option<
                 "backspace" => eng.backspace(),
                 _ => return Err(anyhow::anyhow!("unknown key: {key}")),
             }
-            d6.store(true, Ordering::Relaxed);
             Ok(serde_json::json!(eng.display))
-        });
+        })
+        .standard_help()
+        .standard_info("Cosmix Calc", env!("CARGO_PKG_VERSION"))
+        .standard_activate();
 
     match port.start() {
         Ok(handle) => {

@@ -80,16 +80,18 @@ fn project_root() -> std::path::PathBuf {
 fn create_lua() -> std::result::Result<Lua, LuaError> {
     let lua = Lua::new();
 
-    // Set up package.path: _lib/ (project) + ~/.config/cosmix/lib/ (user)
+    // Set up package.path: _lib/ (project) + ~/.config/cosmix/lib/ + ~/.config/cosmix/modules/ (user)
     let root = project_root();
     let lib_path = root.join("_lib");
     let user_lib = dirs().join("lib");
+    let user_modules = dirs().join("modules");
     let package: LuaTable = lua.globals().get("package")?;
     let existing_path: String = package.get("path")?;
     let new_path = format!(
-        "{}/?.lua;{}/?/init.lua;{}/?.lua;{}/?/init.lua;{existing_path}",
+        "{}/?.lua;{}/?/init.lua;{}/?.lua;{}/?/init.lua;{}/?.lua;{}/?/init.lua;{existing_path}",
         lib_path.display(), lib_path.display(),
         user_lib.display(), user_lib.display(),
+        user_modules.display(), user_modules.display(),
     );
     package.set("path", new_path)?;
 
@@ -403,6 +405,89 @@ fn create_lua() -> std::result::Result<Lua, LuaError> {
         cosmix.set("mail", mail)?;
     }
 
+    // cosmix.mesh table — mesh networking
+    {
+        let mesh = lua.create_table()?;
+
+        // cosmix.mesh.status() -> table with peer info
+        mesh.set("status", lua.create_function(|lua, ()| {
+            let req = crate::ipc::protocol::IpcRequest::MeshStatus;
+            match clip_ipc_call(&req) {
+                Ok(resp) if resp.ok => {
+                    if let Some(data) = resp.data {
+                        lua.to_value(&data).map_err(LuaError::external)
+                    } else {
+                        Ok(LuaValue::Nil)
+                    }
+                }
+                Ok(resp) => Err(LuaError::RuntimeError(
+                    resp.error.unwrap_or_else(|| "mesh not available".into())
+                )),
+                Err(e) => Err(LuaError::external(e)),
+            }
+        })?)?;
+
+        // cosmix.mesh.peers() -> table of peer info
+        mesh.set("peers", lua.create_function(|lua, ()| {
+            let req = crate::ipc::protocol::IpcRequest::MeshPeers;
+            match clip_ipc_call(&req) {
+                Ok(resp) if resp.ok => {
+                    if let Some(data) = resp.data {
+                        lua.to_value(&data).map_err(LuaError::external)
+                    } else {
+                        Ok(LuaValue::Table(lua.create_table()?))
+                    }
+                }
+                Ok(resp) => Err(LuaError::RuntimeError(
+                    resp.error.unwrap_or_else(|| "mesh not available".into())
+                )),
+                Err(e) => Err(LuaError::external(e)),
+            }
+        })?)?;
+
+        // cosmix.mesh.send(node, command, args?) -> ok/error
+        mesh.set("send", lua.create_function(|_, (node, command, args): (String, String, Option<LuaValue>)| {
+            let json_args = match args {
+                Some(val) => Some(lua_value_to_json(&val)?),
+                None => None,
+            };
+            let req = crate::ipc::protocol::IpcRequest::MeshSend { node, mesh_command: command, args: json_args };
+            match clip_ipc_call(&req) {
+                Ok(resp) if resp.ok => Ok(true),
+                Ok(resp) => Err(LuaError::RuntimeError(
+                    resp.error.unwrap_or_else(|| "send failed".into())
+                )),
+                Err(e) => Err(LuaError::external(e)),
+            }
+        })?)?;
+
+        // cosmix.mesh.call(node, port, command, args?) -> response data
+        mesh.set("call", lua.create_function(|lua, (node, port, command, args): (String, String, String, Option<LuaValue>)| {
+            let json_args = match args {
+                Some(val) => Some(lua_value_to_json(&val)?),
+                None => None,
+            };
+            let req = crate::ipc::protocol::IpcRequest::MeshCall {
+                node, port, port_command: command, args: json_args,
+            };
+            match clip_ipc_call(&req) {
+                Ok(resp) if resp.ok => {
+                    if let Some(data) = resp.data {
+                        lua.to_value(&data).map_err(LuaError::external)
+                    } else {
+                        Ok(LuaValue::Nil)
+                    }
+                }
+                Ok(resp) => Err(LuaError::RuntimeError(
+                    resp.error.unwrap_or_else(|| "remote call failed".into())
+                )),
+                Err(e) => Err(LuaError::external(e)),
+            }
+        })?)?;
+
+        cosmix.set("mesh", mesh)?;
+    }
+
     // cosmix.dbus(service, path, interface, method, args?) -> result
     cosmix.set("dbus", lua.create_function(|lua, (service, path, interface, method, args): (String, String, String, String, Option<LuaValue>)| {
         let json_args = lua_args_to_json(args)?;
@@ -463,6 +548,34 @@ fn create_lua() -> std::result::Result<Lua, LuaError> {
             .map_err(LuaError::external)
     })?)?;
 
+    // cosmix.modules() -> table of available module names from ~/.config/cosmix/modules/
+    cosmix.set("modules", lua.create_function(|lua, ()| {
+        let tbl = lua.create_table()?;
+        let modules_dir = dirs().join("modules");
+        let mut i = 1;
+        if let Ok(entries) = std::fs::read_dir(&modules_dir) {
+            let mut names: Vec<String> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let path = e.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("lua") && path.is_file() {
+                        path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string())
+                    } else if path.is_dir() && path.join("init.lua").is_file() {
+                        path.file_name().and_then(|s| s.to_str()).map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            names.sort();
+            for name in names {
+                tbl.set(i, name.as_str())?;
+                i += 1;
+            }
+        }
+        Ok(tbl)
+    })?)?;
+
     // cosmix.json_encode(table) -> string
     cosmix.set("json_encode", lua.create_function(|_, val: LuaValue| {
         let json = serde_json::to_string(&val).map_err(LuaError::external)?;
@@ -475,10 +588,245 @@ fn create_lua() -> std::result::Result<Lua, LuaError> {
         lua.to_value(&val).map_err(LuaError::external)
     })?)?;
 
+    // cosmix.self() -> port handle or nil (set when script is run for an app)
+    // The __cosmix_caller_port__ global is set by run_file_for_app()
+    cosmix.set("self", lua.create_function(|lua, ()| {
+        let caller: Option<String> = lua.globals().get("__cosmix_caller_port__").ok();
+        match caller {
+            Some(port_name) if !port_name.is_empty() => {
+                // Return a port handle just like cosmix.port(name) would
+                let port_tbl = ports::make_port_table(lua, &port_name)?;
+                Ok(LuaValue::Table(port_tbl))
+            }
+            _ => Ok(LuaValue::Nil),
+        }
+    })?)?;
+
+    // --- Clip List API (ARexx SETCLIP/GETCLIP) ---
+    // Works in-process (daemon) or via IPC (client scripts)
+
+    // cosmix.setclip(key, value, opts?) — opts = { ttl = seconds }
+    cosmix.set("setclip", lua.create_function(|_, (key, value, opts): (String, LuaValue, Option<LuaTable>)| {
+        let json_value = lua_value_to_json(&value)?;
+        let ttl_secs = opts.and_then(|t| t.get::<u64>("ttl").ok());
+        let guard = DAEMON_STATE.lock().unwrap();
+        if let Some(ref state) = *guard {
+            let entry = crate::daemon::cliplist::ClipEntry::new(json_value, "lua".to_string(), ttl_secs);
+            let mut s = state.write().unwrap();
+            s.clip_list.insert(key, entry);
+            Ok(())
+        } else {
+            drop(guard);
+            // Fall back to IPC
+            let req = crate::ipc::protocol::IpcRequest::SetClip {
+                key, value: json_value, set_by: Some("lua".into()), ttl_secs,
+            };
+            clip_ipc_call(&req).map(|_| ()).map_err(LuaError::external)
+        }
+    })?)?;
+
+    // cosmix.getclip(key) -> value or nil
+    cosmix.set("getclip", lua.create_function(|lua, key: String| {
+        let guard = DAEMON_STATE.lock().unwrap();
+        if let Some(ref state) = *guard {
+            let s = state.read().unwrap();
+            match s.clip_list.get(&key) {
+                Some(entry) if !entry.is_expired() => {
+                    lua.to_value(&entry.value).map_err(LuaError::external)
+                }
+                _ => Ok(LuaValue::Nil),
+            }
+        } else {
+            drop(guard);
+            let req = crate::ipc::protocol::IpcRequest::GetClip { key };
+            match clip_ipc_call(&req) {
+                Ok(resp) if resp.ok => {
+                    if let Some(data) = resp.data {
+                        let val = data.get("value").cloned().unwrap_or(serde_json::Value::Null);
+                        lua.to_value(&val).map_err(LuaError::external)
+                    } else {
+                        Ok(LuaValue::Nil)
+                    }
+                }
+                _ => Ok(LuaValue::Nil),
+            }
+        }
+    })?)?;
+
+    // cosmix.listclips() -> table of {key, value, set_by, set_at}
+    cosmix.set("listclips", lua.create_function(|lua, ()| {
+        let guard = DAEMON_STATE.lock().unwrap();
+        if let Some(ref state) = *guard {
+            let s = state.read().unwrap();
+            let tbl = lua.create_table()?;
+            let mut i = 1;
+            for (key, entry) in s.clip_list.iter() {
+                if entry.is_expired() { continue; }
+                let row = lua.create_table()?;
+                row.set("key", key.as_str())?;
+                let val = lua.to_value(&entry.value).map_err(LuaError::external)?;
+                row.set("value", val)?;
+                row.set("set_by", entry.set_by.as_str())?;
+                row.set("set_at", entry.set_at)?;
+                if let Some(remaining) = entry.remaining_ttl() {
+                    row.set("ttl_remaining", remaining)?;
+                }
+                tbl.set(i, row)?;
+                i += 1;
+            }
+            Ok(tbl)
+        } else {
+            drop(guard);
+            let req = crate::ipc::protocol::IpcRequest::ListClips;
+            match clip_ipc_call(&req) {
+                Ok(resp) if resp.ok => {
+                    if let Some(serde_json::Value::Array(arr)) = resp.data {
+                        let tbl = lua.create_table()?;
+                        for (i, item) in arr.iter().enumerate() {
+                            let row = lua.to_value(item).map_err(LuaError::external)?;
+                            tbl.set(i + 1, row)?;
+                        }
+                        Ok(tbl)
+                    } else {
+                        Ok(lua.create_table()?)
+                    }
+                }
+                _ => Ok(lua.create_table()?),
+            }
+        }
+    })?)?;
+
+    // cosmix.delclip(key) -> true if deleted, false if not found
+    cosmix.set("delclip", lua.create_function(|_, key: String| {
+        let guard = DAEMON_STATE.lock().unwrap();
+        if let Some(ref state) = *guard {
+            let mut s = state.write().unwrap();
+            Ok(s.clip_list.remove(&key).is_some())
+        } else {
+            drop(guard);
+            let req = crate::ipc::protocol::IpcRequest::DelClip { key };
+            match clip_ipc_call(&req) {
+                Ok(resp) => Ok(resp.ok),
+                Err(_) => Ok(false),
+            }
+        }
+    })?)?;
+
+    // --- Named Queues API (ARexx PUSH/PULL) ---
+
+    // cosmix.queue(name) -> queue object with :push(), :pop(), :size(), :clear()
+    cosmix.set("queue", lua.create_function(|lua, name: String| {
+        let q = lua.create_table()?;
+        let qname = name.clone();
+        q.set("name", name.as_str())?;
+
+        // :push(value)
+        let push_name = qname.clone();
+        q.set("push", lua.create_function(move |_, (_self, value): (LuaTable, LuaValue)| {
+            let json_value = lua_value_to_json(&value)?;
+            let guard = DAEMON_STATE.lock().unwrap();
+            if let Some(ref state) = *guard {
+                let mut s = state.write().unwrap();
+                s.queue_store.push(&push_name, json_value);
+                Ok(())
+            } else {
+                drop(guard);
+                let req = crate::ipc::protocol::IpcRequest::PushQueue {
+                    queue: push_name.clone(), item: json_value,
+                };
+                clip_ipc_call(&req).map(|_| ()).map_err(LuaError::external)
+            }
+        })?)?;
+
+        // :pop() -> value or nil
+        let pop_name = qname.clone();
+        q.set("pop", lua.create_function(move |lua, _self: LuaTable| {
+            let guard = DAEMON_STATE.lock().unwrap();
+            if let Some(ref state) = *guard {
+                let mut s = state.write().unwrap();
+                match s.queue_store.pop(&pop_name) {
+                    Some(v) => lua.to_value(&v).map_err(LuaError::external),
+                    None => Ok(LuaValue::Nil),
+                }
+            } else {
+                drop(guard);
+                let req = crate::ipc::protocol::IpcRequest::PopQueue { queue: pop_name.clone() };
+                match clip_ipc_call(&req) {
+                    Ok(resp) if resp.ok => {
+                        if let Some(data) = resp.data {
+                            lua.to_value(&data).map_err(LuaError::external)
+                        } else {
+                            Ok(LuaValue::Nil)
+                        }
+                    }
+                    _ => Ok(LuaValue::Nil),
+                }
+            }
+        })?)?;
+
+        // :size() -> number
+        let size_name = qname.clone();
+        q.set("size", lua.create_function(move |_, _self: LuaTable| {
+            let guard = DAEMON_STATE.lock().unwrap();
+            if let Some(ref state) = *guard {
+                let s = state.read().unwrap();
+                Ok(s.queue_store.size(&size_name) as u64)
+            } else {
+                drop(guard);
+                let req = crate::ipc::protocol::IpcRequest::QueueSize { queue: size_name.clone() };
+                match clip_ipc_call(&req) {
+                    Ok(resp) if resp.ok => {
+                        let size = resp.data.as_ref()
+                            .and_then(|d| d.get("size"))
+                            .and_then(|s| s.as_u64())
+                            .unwrap_or(0);
+                        Ok(size)
+                    }
+                    _ => Ok(0u64),
+                }
+            }
+        })?)?;
+
+        // :clear()
+        let clear_name = qname.clone();
+        q.set("clear", lua.create_function(move |_, _self: LuaTable| {
+            let guard = DAEMON_STATE.lock().unwrap();
+            if let Some(ref state) = *guard {
+                let mut s = state.write().unwrap();
+                s.queue_store.clear(&clear_name);
+                Ok(())
+            } else {
+                drop(guard);
+                // Pop until empty — no dedicated clear IPC
+                loop {
+                    let req = crate::ipc::protocol::IpcRequest::PopQueue { queue: clear_name.clone() };
+                    match clip_ipc_call(&req) {
+                        Ok(resp) if resp.ok => continue,
+                        _ => break,
+                    }
+                }
+                Ok(())
+            }
+        })?)?;
+
+        Ok(q)
+    })?)?;
+
+    // Register infrastructure modules
+    crate::http::register(&lua, &cosmix)?;
+    crate::sqlite::register(&lua, &cosmix)?;
+    crate::fmt::register(&lua, &cosmix)?;
+
     // Register port system (must be after all cosmix.* functions)
     ports::register_port_api(&lua)?;
 
     Ok(lua)
+}
+
+/// Helper: send an IPC request to the running daemon (for Lua functions in client mode).
+fn clip_ipc_call(req: &crate::ipc::protocol::IpcRequest) -> Result<crate::ipc::protocol::IpcResponse> {
+    let config = crate::daemon::config::DaemonConfig::load()?;
+    crate::ipc::client_request(&config.daemon.socket, req)
 }
 
 fn resolve_script(name: &str) -> Result<std::path::PathBuf> {
@@ -495,7 +843,7 @@ fn resolve_script(name: &str) -> Result<std::path::PathBuf> {
         return Ok(with_ext);
     }
 
-    // 3. User scripts: ~/.config/cosmix/
+    // 3. User scripts: ~/.config/cosmix/ and ~/.config/cosmix/scripts/
     if let Ok(config) = std::env::var("XDG_CONFIG_HOME") {
         let user_path = std::path::Path::new(&config).join("cosmix").join(name);
         if user_path.exists() { return Ok(user_path); }
@@ -507,6 +855,13 @@ fn resolve_script(name: &str) -> Result<std::path::PathBuf> {
     if user_path.exists() { return Ok(user_path); }
     let user_lua = user_path.with_extension("lua");
     if user_lua.exists() { return Ok(user_lua); }
+
+    // 3b. User scripts in subdirectories: ~/.config/cosmix/scripts/{appname}/
+    let scripts_dir = home_config.join("scripts");
+    let scripts_path = scripts_dir.join(name);
+    if scripts_path.exists() { return Ok(scripts_path); }
+    let scripts_lua = scripts_path.with_extension("lua");
+    if scripts_lua.exists() { return Ok(scripts_lua); }
 
     // 4. Project _bin/
     let root = project_root();
@@ -521,6 +876,23 @@ fn resolve_script(name: &str) -> Result<std::path::PathBuf> {
 fn dirs() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     std::path::PathBuf::from(home).join(".config").join("cosmix")
+}
+
+/// Run a script with a caller port pre-addressed (for macro menus).
+/// Sets `__cosmix_caller_port__` global so `cosmix.self()` returns the calling app's port.
+pub fn run_file_for_app(script_path: &str, caller_port: &str) -> Result<()> {
+    let path = resolve_script(script_path)?;
+    let lua = create_lua().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Set the caller port global (read by cosmix.self())
+    lua.globals().set("__cosmix_caller_port__", caller_port.to_string())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let code = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    lua.load(&code).set_name(path.to_string_lossy()).exec()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
 }
 
 pub fn run_file(name: &str, script_args: &[String]) -> Result<()> {

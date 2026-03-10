@@ -1,0 +1,7 @@
+<div class="panel-mesh">
+    <h3>Mesh Peers</h3>
+    <ul id="mesh-peers"
+        hx-get="/api/panel/mesh" hx-trigger="every 30s" hx-swap="innerHTML">
+        <li class="placeholder">Checking mesh status...</li>
+    </ul>
+</div>

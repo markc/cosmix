@@ -12,8 +12,11 @@ path = "src/main.rs"
 [dependencies]
 cosmix_lib = { package = "cosmix-daemon", path = "../cosmix-daemon" }
 cosmix-markdown = { path = "../cosmix-markdown" }
+cosmix-port = { path = "../cosmix-port" }
 libcosmic = { workspace = true, features = ["markdown"] }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 toml_cfg.workspace = true

@@ -4,13 +4,18 @@ mod tree_view;
 use config::{AccountConfig, MailConfig};
 use tree_view::{TreeNode, TreeView};
 use cosmic::app::Settings;
-use cosmic::iced::{self, Alignment, Length, Size};
+use cosmic::iced::futures::SinkExt;
+use cosmic::iced::stream;
+use cosmic::iced::{self, Alignment, Length, Size, Subscription};
 use cosmic::widget::menu::{self, KeyBind};
 use cosmic::widget::{self, icon, markdown, nav_bar, pane_grid, text_editor};
 use cosmic::{executor, Core, Element};
 use cosmix_lib::mail::JmapClient;
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+
+type PortRx = Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<cosmix_port::PortEvent>>>;
+static PORT_RX: OnceLock<PortRx> = OnceLock::new();
 
 const APP_ID: &str = "org.cosmix.Mail";
 
@@ -38,6 +43,8 @@ enum MenuAction {
     Account3,
     Account4,
     AddAccount,
+    RunScript(usize),
+    RescanScripts,
 }
 
 impl menu::Action for MenuAction {
@@ -61,6 +68,8 @@ impl menu::Action for MenuAction {
             MenuAction::Account3 => Message::AccountSelected(3),
             MenuAction::Account4 => Message::AccountSelected(4),
             MenuAction::AddAccount => Message::ShowAddAccount,
+            MenuAction::RunScript(i) => Message::RunScript(*i),
+            MenuAction::RescanScripts => Message::RescanScripts,
         }
     }
 }
@@ -72,6 +81,40 @@ fn account_action(idx: usize) -> MenuAction {
         2 => MenuAction::Account2,
         3 => MenuAction::Account3,
         _ => MenuAction::Account4,
+    }
+}
+
+// ── Cosmix Port Integration ──
+
+fn start_port(
+    state: Arc<Mutex<MailPortState>>,
+    notifier: tokio::sync::mpsc::UnboundedSender<cosmix_port::PortEvent>,
+) -> Option<cosmix_port::PortHandle> {
+    let s1 = state.clone();
+
+    let port = cosmix_port::Port::new("cosmix-mail")
+        .events(notifier)
+        .command("status", "Get mail app status summary", move |_| {
+            let ps = s1.lock().unwrap();
+            Ok(serde_json::json!({
+                "accounts": ps.account_count,
+                "emails": ps.email_count,
+                "selected": ps.selected_email,
+            }))
+        })
+        .standard_help()
+        .standard_info("Cosmix Mail", env!("CARGO_PKG_VERSION"))
+        .standard_activate();
+
+    match port.start() {
+        Ok(handle) => {
+            tracing::info!("Cosmix port started at {}", handle.socket_path.display());
+            Some(handle)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to start cosmix port: {e}");
+            None
+        }
     }
 }
 
@@ -96,6 +139,13 @@ enum PaneKind {
 // State
 // ---------------------------------------------------------------------------
 
+/// Shared state exposed to port command handlers (read-only queries).
+struct MailPortState {
+    account_count: usize,
+    email_count: usize,
+    selected_email: Option<String>,
+}
+
 struct MailApp {
     core: Core,
     accounts: Vec<Account>,
@@ -110,6 +160,9 @@ struct MailApp {
     right_pane: RightPane,
     show_preview: bool,
     error: Option<String>,
+    port_state: Arc<Mutex<MailPortState>>,
+    port_scripts: Vec<cosmix_port::ScriptInfo>,
+    _port_handle: Option<cosmix_port::PortHandle>,
 }
 
 struct Account {
@@ -216,6 +269,11 @@ enum Message {
     AddAccountUser(String),
     AddAccountPass(String),
     SaveAccount,
+    SyncFromPort,
+    PortActivate,
+    RunScript(usize),
+    RescanScripts,
+    ScriptsUpdated(Vec<cosmix_port::ScriptInfo>),
 }
 
 struct ConnectResult {
@@ -312,6 +370,15 @@ impl cosmic::Application for MailApp {
     }
 
     fn init(core: Core, _flags: ()) -> (Self, cosmic::app::Task<Message>) {
+        let port_state = Arc::new(Mutex::new(MailPortState {
+            account_count: 0,
+            email_count: 0,
+            selected_email: None,
+        }));
+        let (port_tx, port_rx) = tokio::sync::mpsc::unbounded_channel();
+        PORT_RX.set(Arc::new(tokio::sync::Mutex::new(port_rx))).ok();
+        let port_handle = start_port(port_state.clone(), port_tx);
+
         let config = MailConfig::load().ok();
         let accounts: Vec<Account> = config
             .as_ref()
@@ -377,7 +444,16 @@ impl cosmic::Application for MailApp {
             },
             show_preview: true,
             error: None,
+            port_state: port_state.clone(),
+            port_scripts: Vec::new(),
+            _port_handle: port_handle,
         };
+
+        // Sync initial port state
+        {
+            let mut ps = port_state.lock().unwrap();
+            ps.account_count = app.accounts.len();
+        }
 
         let task = if !app.accounts.is_empty() {
             app.accounts[0].status = AccountStatus::Connecting;
@@ -394,7 +470,7 @@ impl cosmic::Application for MailApp {
     }
 
     fn header_start(&self) -> Vec<Element<'_, Message>> {
-        let trees: Vec<(String, Vec<menu::Item<MenuAction, String>>)> = vec![
+        let mut trees: Vec<(String, Vec<menu::Item<MenuAction, String>>)> = vec![
                     (
                         "File".into(),
                         vec![
@@ -469,6 +545,28 @@ impl cosmic::Application for MailApp {
                         },
                     ),
         ];
+
+        // Scripts menu
+        if !self.port_scripts.is_empty() {
+            let mut script_items: Vec<menu::Item<MenuAction, String>> = self.port_scripts
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    menu::Item::Button(
+                        s.display_name.clone(),
+                        Some(icon::from_name("text-x-script-symbolic").into()),
+                        MenuAction::RunScript(i),
+                    )
+                })
+                .collect();
+            script_items.push(menu::Item::Divider);
+            script_items.push(menu::Item::Button(
+                "Rescan Scripts".to_string(),
+                Some(icon::from_name("view-refresh-symbolic").into()),
+                MenuAction::RescanScripts,
+            ));
+            trees.push(("Scripts".into(), script_items));
+        }
 
         let bar = menu::bar(
             trees
@@ -852,9 +950,70 @@ impl cosmic::Application for MailApp {
                     .arg(url)
                     .spawn();
             }
+            Message::SyncFromPort | Message::PortActivate => {}
+            Message::RunScript(i) => {
+                if let Some(script) = self.port_scripts.get(i) {
+                    let path = script.path.clone();
+                    return cosmic::app::Task::perform(
+                        async move {
+                            let _ = tokio::process::Command::new("cosmix")
+                                .args(["run-for", &path, "COSMIX-MAIL.1"])
+                                .output()
+                                .await;
+                        },
+                        |_| cosmic::Action::App(Message::SyncFromPort),
+                    );
+                }
+            }
+            Message::RescanScripts => {
+                return cosmic::app::Task::perform(
+                    async {
+                        let _ = tokio::process::Command::new("cosmix")
+                            .args(["rescan-scripts", "COSMIX-MAIL.1"])
+                            .output()
+                            .await;
+                    },
+                    |_| cosmic::Action::App(Message::SyncFromPort),
+                );
+            }
+            Message::ScriptsUpdated(scripts) => {
+                self.port_scripts = scripts;
+            }
+        }
+
+        // Sync port state for read-only queries
+        {
+            let mut ps = self.port_state.lock().unwrap();
+            ps.account_count = self.accounts.len();
+            ps.email_count = self.emails.len();
+            ps.selected_email = self.selected_email_id.clone();
         }
 
         cosmic::Task::none()
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        Subscription::run(|| {
+            stream::channel(16, |mut output: cosmic::iced::futures::channel::mpsc::Sender<_>| async move {
+                let rx = PORT_RX.get().expect("port receiver not initialized");
+                loop {
+                    match rx.lock().await.recv().await {
+                        Some(cosmix_port::PortEvent::Activate) => {
+                            let _ = output.send(Message::PortActivate).await;
+                        }
+                        Some(cosmix_port::PortEvent::ScriptsUpdated(scripts)) => {
+                            let _ = output.send(Message::ScriptsUpdated(scripts)).await;
+                        }
+                        Some(cosmix_port::PortEvent::Command { .. }) => {
+                            let _ = output.send(Message::SyncFromPort).await;
+                        }
+                        None => {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                }
+            })
+        })
     }
 
     // -----------------------------------------------------------------------

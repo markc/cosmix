@@ -12,6 +12,13 @@ target/
 # Claude Code
 .claude/
 
+# Secrets / credentials
+_etc/nsctl/.env
+
 # OS
 .DS_Store
 wtype
+
+# Excluded dependencies (AGPL)
+sieve-rs/
+crates/cosmix-dns/

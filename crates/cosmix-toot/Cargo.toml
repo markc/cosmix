@@ -1,0 +1,36 @@
+[package]
+name = "cosmix-toot"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cosmix-toot"
+path = "src/main.rs"
+
+[dependencies]
+cosmix-port = { path = "../cosmix-port" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+libcosmic = { workspace = true, features = ["a11y", "dbus-config", "multi-window", "single-instance", "about"] }
+capitalize = "0.3.4"
+futures-util = "0.3"
+html2text = "0.13"
+i18n-embed = { version = "0.15", features = ["fluent-system", "desktop-requester"] }
+i18n-embed-fl = "0.9"
+keytar = "0.1.6"
+open = "5"
+reqwest = "0.12"
+rust-embed = "8"
+anyhow = { workspace = true }
+thiserror = "2"
+time = "0.3"
+
+[dependencies.mastodon-async]
+git = "https://github.com/edfloreshz-ext/mastodon-async"
+features = ["all"]

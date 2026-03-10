@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/cosmix-daemon", "crates/cosmix-mail", "crates/cosmix-markdown", "crates/cosmix-port", "crates/cosmix-calc", "crates/cosmix-view"]
+members = ["crates/cosmix-daemon", "crates/cosmix-jmap", "crates/cosmix-mail", "crates/cosmix-markdown", "crates/cosmix-port", "crates/cosmix-calc", "crates/cosmix-view", "crates/cosmix-toot", "crates/cosmix-web", "crates/cosmix-embed", "crates/cosmix-portd"]
 
 [workspace.package]
 edition = "2024"
@@ -32,3 +32,15 @@ ureq = { version = "3", features = ["json"] }
 meval = "0.2"
 png = "0.17"
 chrono = "0.4"
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+axum = { version = "0.8", features = ["ws"] }
+askama = "0.12"
+askama_axum = "0.4"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+tower-sessions = "0.14"
+bcrypt = "0.17"
+sea-orm = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+comfy-table = "7"

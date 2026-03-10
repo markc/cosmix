@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en" class="preload dark">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Cosmix</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.ico">
+    <link rel="stylesheet" href="/static/base.css">
+    <link rel="stylesheet" href="/static/app.css">
+    <script>
+        // FOUC prevention: restore theme before paint
+        (function() {
+            try {
+                const s = JSON.parse(localStorage.getItem('base-state') || '{}');
+                if (s.theme) document.documentElement.classList.replace(
+                    s.theme === 'dark' ? 'light' : 'dark', s.theme);
+                if (s.scheme && s.scheme !== 'default')
+                    document.documentElement.classList.add('scheme-' + s.scheme);
+            } catch(e) {}
+        })();
+    </script>
+</head>
+<body>
+    <!-- Sidebar toggle buttons -->
+    <button class="menu-toggle" data-sidebar="left" aria-label="Toggle left sidebar">&#9776;</button>
+    <button class="menu-toggle" data-sidebar="right" aria-label="Toggle right sidebar">&#9881;</button>
+
+    <!-- Left sidebar -->
+    <aside class="sidebar sidebar-left">
+        <div class="carousel-header">
+            <button class="pin-toggle" data-sidebar="left" aria-label="Pin sidebar">&#128204;</button>
+            <div class="carousel-nav">
+                <span class="carousel-chevron" data-sidebar="left" data-dir="prev">&lsaquo;</span>
+                <div class="carousel-dots">
+                    <span class="carousel-dot active" data-sidebar="left" data-panel="0"></span>
+                    <span class="carousel-dot" data-sidebar="left" data-panel="1"></span>
+                    <span class="carousel-dot" data-sidebar="left" data-panel="2"></span>
+                </div>
+                <span class="carousel-chevron" data-sidebar="left" data-dir="next">&rsaquo;</span>
+            </div>
+        </div>
+        <div class="panel-viewport">
+            <div class="panel-track">
+                <!-- Panel 0: Navigation -->
+                <div class="panel">
+                    <div class="panel-title">Navigation</div>
+                    <div class="panel-content" id="panel-nav"
+                         hx-get="/api/panel/nav" hx-trigger="load" hx-swap="innerHTML">
+                    </div>
+                </div>
+                <!-- Panel 1: Conversations -->
+                <div class="panel">
+                    <div class="panel-title">Conversations</div>
+                    <div class="panel-content" id="panel-conversations"
+                         hx-get="/api/panel/conversations" hx-trigger="revealed" hx-swap="innerHTML">
+                    </div>
+                </div>
+                <!-- Panel 2: Mailboxes -->
+                <div class="panel">
+                    <div class="panel-title">Mailboxes</div>
+                    <div class="panel-content" id="panel-mailboxes"
+                         hx-get="/api/panel/mailboxes" hx-trigger="revealed" hx-swap="innerHTML">
+                    </div>
+                </div>
+            </div>
+        </div>
+    </aside>
+
+    <!-- Top navigation -->
+    <nav class="topnav">
+        <h1><a href="/" class="brand">Cosmix</a></h1>
+        <div class="topnav-user">
+            <span class="text-sm text-muted">{{user_name}}</span>
+            <form method="post" action="/auth/logout" style="margin:0">
+                <button type="submit" class="btn btn-ghost btn-sm">Logout</button>
+            </form>
+        </div>
+    </nav>
+
+    <!-- Main content -->
+    <main id="content"
+          hx-get="/api/page/chat" hx-trigger="load" hx-swap="innerHTML">
+    </main>
+
+    <!-- Right sidebar -->
+    <aside class="sidebar sidebar-right">
+        <div class="carousel-header">
+            <div class="carousel-nav">
+                <span class="carousel-chevron" data-sidebar="right" data-dir="prev">&lsaquo;</span>
+                <div class="carousel-dots">
+                    <span class="carousel-dot active" data-sidebar="right" data-panel="0"></span>
+                    <span class="carousel-dot" data-sidebar="right" data-panel="1"></span>
+                </div>
+                <span class="carousel-chevron" data-sidebar="right" data-dir="next">&rsaquo;</span>
+            </div>
+            <button class="pin-toggle" data-sidebar="right" aria-label="Pin sidebar">&#128204;</button>
+        </div>
+        <div class="panel-viewport">
+            <div class="panel-track">
+                <!-- Panel 0: Theme -->
+                <div class="panel">
+                    <div class="panel-title">Appearance</div>
+                    <div class="panel-content" id="panel-theme"
+                         hx-get="/api/panel/theme" hx-trigger="load" hx-swap="innerHTML">
+                    </div>
+                </div>
+                <!-- Panel 1: Mesh -->
+                <div class="panel">
+                    <div class="panel-title">Mesh</div>
+                    <div class="panel-content" id="panel-mesh"
+                         hx-get="/api/panel/mesh" hx-trigger="revealed" hx-swap="innerHTML">
+                    </div>
+                </div>
+            </div>
+        </div>
+    </aside>
+
+    <!-- Overlay for mobile sidebar -->
+    <div class="overlay"></div>
+
+    <!-- WebSocket for live updates (HTMX OOB swaps) -->
+    <div hx-ext="ws" ws-connect="/ws" style="display:none"></div>
+
+    <script src="/static/htmx.min.js"></script>
+    <script src="/static/ext/ws.js"></script>
+    <script src="/static/base.js"></script>
+    <script src="/static/app.js"></script>
+</body>
+</html>
