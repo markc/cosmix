@@ -29,6 +29,10 @@ pub struct Config {
     pub dkim_selector: Option<String>,
     /// Path to DKIM private key (PEM)
     pub dkim_private_key: Option<String>,
+    /// Path to TLS certificate (PEM)
+    pub tls_cert: Option<String>,
+    /// Path to TLS private key (PEM)
+    pub tls_key: Option<String>,
 }
 
 impl Default for Config {
@@ -44,6 +48,8 @@ impl Default for Config {
             max_message_size: None,
             dkim_selector: None,
             dkim_private_key: None,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }

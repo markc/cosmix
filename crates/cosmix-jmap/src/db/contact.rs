@@ -153,45 +153,53 @@ pub async fn query_contact_ids(
     pool: &PgPool,
     account_id: i32,
     addressbook_id: Option<Uuid>,
+    text: Option<&str>,
     position: i64,
     limit: i64,
 ) -> Result<(Vec<Uuid>, i64)> {
-    let (ids, total): (Vec<(Uuid,)>, (i64,)) = if let Some(ab_id) = addressbook_id {
-        let ids: Vec<(Uuid,)> = sqlx::query_as(
-            "SELECT id FROM contacts WHERE account_id = $1 AND addressbook_id = $2 \
-             ORDER BY full_name OFFSET $3 LIMIT $4",
-        )
-        .bind(account_id)
-        .bind(ab_id)
-        .bind(position)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
-        let total: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM contacts WHERE account_id = $1 AND addressbook_id = $2",
-        )
-        .bind(account_id)
-        .bind(ab_id)
-        .fetch_one(pool)
-        .await?;
-        (ids, total)
-    } else {
-        let ids: Vec<(Uuid,)> = sqlx::query_as(
-            "SELECT id FROM contacts WHERE account_id = $1 ORDER BY full_name OFFSET $2 LIMIT $3",
-        )
-        .bind(account_id)
-        .bind(position)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
-        let total: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM contacts WHERE account_id = $1",
-        )
-        .bind(account_id)
-        .fetch_one(pool)
-        .await?;
-        (ids, total)
-    };
+    let mut where_parts = vec!["account_id = $1".to_string()];
+    let mut param_idx = 1u32;
+
+    if addressbook_id.is_some() {
+        param_idx += 1;
+        where_parts.push(format!("addressbook_id = ${param_idx}"));
+    }
+    if text.is_some() {
+        param_idx += 1;
+        where_parts.push(format!(
+            "(full_name ILIKE ${param_idx} OR email ILIKE ${param_idx} OR company ILIKE ${param_idx})"
+        ));
+    }
+
+    let where_clause = where_parts.join(" AND ");
+    let offset_idx = param_idx + 1;
+    let limit_idx = param_idx + 2;
+
+    let select_sql = format!(
+        "SELECT id FROM contacts WHERE {where_clause} ORDER BY full_name OFFSET ${offset_idx} LIMIT ${limit_idx}"
+    );
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM contacts WHERE {where_clause}"
+    );
+
+    let mut select_q = sqlx::query_as::<_, (Uuid,)>(&select_sql).bind(account_id);
+    let mut count_q = sqlx::query_as::<_, (i64,)>(&count_sql).bind(account_id);
+
+    if let Some(ab_id) = addressbook_id {
+        select_q = select_q.bind(ab_id);
+        count_q = count_q.bind(ab_id);
+    }
+    if let Some(t) = text {
+        let pattern = format!("%{t}%");
+        select_q = select_q.bind(pattern.clone());
+        count_q = count_q.bind(pattern);
+    }
+
+    select_q = select_q.bind(position).bind(limit);
+
+    let ids: Vec<(Uuid,)> = select_q.fetch_all(pool).await?;
+    let total: (i64,) = count_q.fetch_one(pool).await?;
+
     Ok((ids.into_iter().map(|r| r.0).collect(), total.0))
 }
 

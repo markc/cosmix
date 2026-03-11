@@ -1,12 +1,12 @@
 //! SMTP session state machine.
 //!
-//! Handles the SMTP conversation: EHLO → AUTH → MAIL FROM → RCPT TO → DATA.
+//! Handles the SMTP conversation: EHLO → STARTTLS → AUTH → MAIL FROM → RCPT TO → DATA.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use super::SmtpState;
@@ -20,6 +20,7 @@ struct Session {
     mail_from: Option<String>,
     rcpt_to: Vec<String>,
     ehlo_host: Option<String>,
+    tls_active: bool,
 }
 
 impl Session {
@@ -32,12 +33,17 @@ impl Session {
             mail_from: None,
             rcpt_to: Vec::new(),
             ehlo_host: None,
+            tls_active: false,
         }
     }
 
     fn reset_transaction(&mut self) {
         self.mail_from = None;
         self.rcpt_to.clear();
+    }
+
+    fn tls_available(&self) -> bool {
+        !self.tls_active && self.state.tls_acceptor.is_some()
     }
 }
 
@@ -58,16 +64,51 @@ pub async fn handle(
     let hostname = &session.state.config.hostname;
     write_line(&mut writer, &format!("220 {hostname} ESMTP cosmix-jmap")).await?;
 
+    // Run the session — may return with a request to upgrade to TLS
+    let upgrade = run_session(&mut session, &mut reader, &mut writer).await?;
+
+    if upgrade {
+        // Perform TLS upgrade
+        let acceptor = session.state.tls_acceptor.clone()
+            .expect("STARTTLS without TLS acceptor");
+
+        // Reassemble the TcpStream from split halves
+        let tcp_stream = reader.into_inner().reunite(writer)?;
+        let tls_stream = acceptor.accept(tcp_stream).await?;
+        let (tls_reader, mut tls_writer) = tokio::io::split(tls_stream);
+        let mut tls_reader = BufReader::new(tls_reader);
+
+        session.tls_active = true;
+        // Reset EHLO state per RFC 3207
+        session.ehlo_host = None;
+        session.reset_transaction();
+
+        run_session(&mut session, &mut tls_reader, &mut tls_writer).await?;
+    }
+
+    tracing::debug!(peer = %session.peer, "SMTP session ended");
+    Ok(())
+}
+
+/// Run the SMTP command loop. Returns true if STARTTLS upgrade was requested.
+async fn run_session<R, W>(
+    session: &mut Session,
+    reader: &mut BufReader<R>,
+    writer: &mut W,
+) -> Result<bool>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut buf = Vec::with_capacity(4096);
     let mut data_mode = false;
     let mut data_buf = Vec::new();
 
     loop {
-        // Read a line
         buf.clear();
-        let n = read_line(&mut reader, &mut buf).await?;
+        let n = read_line(reader, &mut buf).await?;
         if n == 0 {
-            break; // Connection closed
+            break;
         }
 
         if data_mode {
@@ -84,28 +125,27 @@ pub async fn handle(
 
                 match result {
                     Ok(()) => {
-                        write_line(&mut writer, "250 2.0.0 Message accepted").await?;
+                        write_line(writer, "250 2.0.0 Message accepted").await?;
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "Delivery failed");
-                        write_line(&mut writer, "451 4.3.0 Temporary delivery failure").await?;
+                        write_line(writer, "451 4.3.0 Temporary delivery failure").await?;
                     }
                 }
                 session.reset_transaction();
                 data_buf.clear();
             } else {
-                // Dot-unstuffing: if line starts with ".." remove one dot
+                // Dot-unstuffing
                 if buf.starts_with(b"..") {
                     data_buf.extend_from_slice(&buf[1..]);
                 } else {
                     data_buf.extend_from_slice(&buf);
                 }
 
-                // Size limit check
                 if data_buf.len() > session.state.config.max_message_size {
                     data_mode = false;
                     data_buf.clear();
-                    write_line(&mut writer, "552 5.3.4 Message too big").await?;
+                    write_line(writer, "552 5.3.4 Message too big").await?;
                     session.reset_transaction();
                 }
             }
@@ -115,7 +155,6 @@ pub async fn handle(
         let line = String::from_utf8_lossy(&buf);
         let line = line.trim_end();
 
-        // Parse SMTP command
         let (cmd, args) = match line.find(' ') {
             Some(pos) => (&line[..pos], line[pos + 1..].trim()),
             None => (line, ""),
@@ -128,81 +167,96 @@ pub async fn handle(
                 let hostname = &session.state.config.hostname;
                 let max_size = session.state.config.max_message_size;
                 if cmd.eq_ignore_ascii_case("EHLO") {
-                    write_line(&mut writer, &format!("250-{hostname}")).await?;
-                    write_line(&mut writer, &format!("250-SIZE {max_size}")).await?;
-                    write_line(&mut writer, "250-8BITMIME").await?;
-                    write_line(&mut writer, "250-PIPELINING").await?;
-                    if session.require_auth {
-                        write_line(&mut writer, "250-AUTH PLAIN LOGIN").await?;
+                    write_line(writer, &format!("250-{hostname}")).await?;
+                    write_line(writer, &format!("250-SIZE {max_size}")).await?;
+                    write_line(writer, "250-8BITMIME").await?;
+                    write_line(writer, "250-PIPELINING").await?;
+                    if session.tls_available() {
+                        write_line(writer, "250-STARTTLS").await?;
                     }
-                    write_line(&mut writer, "250 ENHANCEDSTATUSCODES").await?;
+                    if session.require_auth && (session.tls_active || session.state.tls_acceptor.is_none()) {
+                        // Only advertise AUTH after TLS, or if TLS is not configured
+                        write_line(writer, "250-AUTH PLAIN LOGIN").await?;
+                    }
+                    write_line(writer, "250 ENHANCEDSTATUSCODES").await?;
                 } else {
-                    write_line(&mut writer, &format!("250 {hostname}")).await?;
+                    write_line(writer, &format!("250 {hostname}")).await?;
                 }
+            }
+
+            "STARTTLS" => {
+                if !session.tls_available() {
+                    write_line(writer, "502 5.5.1 STARTTLS not available").await?;
+                    continue;
+                }
+                write_line(writer, "220 2.0.0 Ready to start TLS").await?;
+                return Ok(true); // Signal caller to upgrade
             }
 
             "AUTH" => {
                 if !session.require_auth {
-                    write_line(&mut writer, "502 5.5.1 AUTH not available on this port").await?;
+                    write_line(writer, "502 5.5.1 AUTH not available on this port").await?;
                     continue;
                 }
                 if session.authenticated_account.is_some() {
-                    write_line(&mut writer, "503 5.5.1 Already authenticated").await?;
+                    write_line(writer, "503 5.5.1 Already authenticated").await?;
+                    continue;
+                }
+                // Require TLS before AUTH when TLS is configured
+                if session.state.tls_acceptor.is_some() && !session.tls_active {
+                    write_line(writer, "530 5.7.0 Must issue STARTTLS first").await?;
                     continue;
                 }
 
                 let result = handle_auth(
                     args,
                     &session.state,
-                    &mut reader,
-                    &mut writer,
+                    reader,
+                    writer,
                 ).await?;
 
                 match result {
                     Some(account_id) => {
                         session.authenticated_account = Some(account_id);
-                        write_line(&mut writer, "235 2.7.0 Authentication successful").await?;
+                        write_line(writer, "235 2.7.0 Authentication successful").await?;
                     }
                     None => {
-                        write_line(&mut writer, "535 5.7.8 Authentication failed").await?;
+                        write_line(writer, "535 5.7.8 Authentication failed").await?;
                     }
                 }
             }
 
             "MAIL" => {
                 if session.ehlo_host.is_none() {
-                    write_line(&mut writer, "503 5.5.1 Say EHLO first").await?;
+                    write_line(writer, "503 5.5.1 Say EHLO first").await?;
                     continue;
                 }
                 if session.require_auth && session.authenticated_account.is_none() {
-                    write_line(&mut writer, "530 5.7.0 Authentication required").await?;
+                    write_line(writer, "530 5.7.0 Authentication required").await?;
                     continue;
                 }
 
-                // Parse "FROM:<addr>"
                 let from = parse_mail_from(args);
                 match from {
                     Some(addr) => {
                         session.mail_from = Some(addr);
-                        write_line(&mut writer, "250 2.1.0 OK").await?;
+                        write_line(writer, "250 2.1.0 OK").await?;
                     }
                     None => {
-                        write_line(&mut writer, "501 5.1.7 Bad sender address").await?;
+                        write_line(writer, "501 5.1.7 Bad sender address").await?;
                     }
                 }
             }
 
             "RCPT" => {
                 if session.mail_from.is_none() {
-                    write_line(&mut writer, "503 5.5.1 MAIL FROM first").await?;
+                    write_line(writer, "503 5.5.1 MAIL FROM first").await?;
                     continue;
                 }
 
-                // Parse "TO:<addr>"
                 let to = parse_rcpt_to(args);
                 match to {
                     Some(addr) => {
-                        // For inbound: check if recipient is local
                         if !session.require_auth {
                             let local = crate::db::account::get_by_email(
                                 &session.state.db.pool,
@@ -211,56 +265,54 @@ pub async fn handle(
                             match local {
                                 Ok(Some(_)) => {
                                     session.rcpt_to.push(addr);
-                                    write_line(&mut writer, "250 2.1.5 OK").await?;
+                                    write_line(writer, "250 2.1.5 OK").await?;
                                 }
                                 _ => {
-                                    write_line(&mut writer, "550 5.1.1 User not found").await?;
+                                    write_line(writer, "550 5.1.1 User not found").await?;
                                 }
                             }
                         } else {
-                            // Submission: allow any recipient
                             session.rcpt_to.push(addr);
-                            write_line(&mut writer, "250 2.1.5 OK").await?;
+                            write_line(writer, "250 2.1.5 OK").await?;
                         }
                     }
                     None => {
-                        write_line(&mut writer, "501 5.1.3 Bad recipient address").await?;
+                        write_line(writer, "501 5.1.3 Bad recipient address").await?;
                     }
                 }
             }
 
             "DATA" => {
                 if session.mail_from.is_none() || session.rcpt_to.is_empty() {
-                    write_line(&mut writer, "503 5.5.1 MAIL FROM and RCPT TO required").await?;
+                    write_line(writer, "503 5.5.1 MAIL FROM and RCPT TO required").await?;
                     continue;
                 }
-                write_line(&mut writer, "354 Start mail input; end with <CRLF>.<CRLF>").await?;
+                write_line(writer, "354 Start mail input; end with <CRLF>.<CRLF>").await?;
                 data_mode = true;
                 data_buf.clear();
             }
 
             "RSET" => {
                 session.reset_transaction();
-                write_line(&mut writer, "250 2.0.0 OK").await?;
+                write_line(writer, "250 2.0.0 OK").await?;
             }
 
             "NOOP" => {
-                write_line(&mut writer, "250 2.0.0 OK").await?;
+                write_line(writer, "250 2.0.0 OK").await?;
             }
 
             "QUIT" => {
-                write_line(&mut writer, "221 2.0.0 Bye").await?;
+                write_line(writer, "221 2.0.0 Bye").await?;
                 break;
             }
 
             _ => {
-                write_line(&mut writer, "502 5.5.2 Command not recognized").await?;
+                write_line(writer, "502 5.5.2 Command not recognized").await?;
             }
         }
     }
 
-    tracing::debug!(peer = %session.peer, "SMTP session ended");
-    Ok(())
+    Ok(false)
 }
 
 /// Handle AUTH PLAIN or AUTH LOGIN.
@@ -271,8 +323,8 @@ async fn handle_auth<R, W>(
     writer: &mut W,
 ) -> Result<Option<i32>>
 where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
 {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -285,7 +337,6 @@ where
             let encoded = if parts.len() > 1 && !parts[1].is_empty() {
                 parts[1].to_string()
             } else {
-                // Send challenge
                 write_line(writer, "334 ").await?;
                 let mut buf = Vec::new();
                 read_line(reader, &mut buf).await?;
@@ -326,12 +377,20 @@ where
     }
 }
 
-/// Authenticate against the accounts database.
+/// Authenticate against the accounts database using bcrypt.
 async fn authenticate(state: &SmtpState, email: &str, password: &str) -> Result<Option<i32>> {
     let account = crate::db::account::get_by_email(&state.db.pool, email).await?;
     match account {
-        Some(a) if a.password == password => Ok(Some(a.id)),
-        _ => Ok(None),
+        Some(a) => {
+            let hash = a.password.clone();
+            // Run bcrypt verify on blocking thread to avoid stalling async runtime
+            let pwd = password.to_string();
+            let valid = tokio::task::spawn_blocking(move || {
+                bcrypt::verify(&pwd, &hash).unwrap_or(false)
+            }).await.unwrap_or(false);
+            if valid { Ok(Some(a.id)) } else { Ok(None) }
+        }
+        None => Ok(None),
     }
 }
 
@@ -366,14 +425,13 @@ fn extract_angle_addr(s: &str) -> Option<String> {
             Some(addr.to_lowercase())
         }
     } else {
-        // Bare address — take up to first space (ESMTP params)
         let addr = s.split_whitespace().next()?;
         Some(addr.to_lowercase())
     }
 }
 
 /// Read a line (terminated by \n) from the stream.
-async fn read_line<R: tokio::io::AsyncRead + Unpin>(
+async fn read_line<R: AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut Vec<u8>,
 ) -> Result<usize> {
@@ -396,7 +454,7 @@ async fn read_line<R: tokio::io::AsyncRead + Unpin>(
 }
 
 /// Write a line with CRLF.
-async fn write_line<W: tokio::io::AsyncWrite + Unpin>(
+async fn write_line<W: AsyncWrite + Unpin>(
     writer: &mut W,
     line: &str,
 ) -> Result<()> {

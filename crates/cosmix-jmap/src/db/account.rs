@@ -30,8 +30,12 @@ pub async fn create(pool: &PgPool, email: &str, password_hash: &str, name: Optio
     .fetch_one(pool)
     .await?;
 
-    // Create default mailboxes
+    // Create default mailboxes, calendar, and addressbook
     sqlx::query("SELECT create_default_mailboxes($1)")
+        .bind(row.0)
+        .execute(pool)
+        .await?;
+    sqlx::query("SELECT create_default_pim($1)")
         .bind(row.0)
         .execute(pool)
         .await?;

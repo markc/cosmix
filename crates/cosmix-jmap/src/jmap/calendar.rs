@@ -148,14 +148,23 @@ pub async fn event_get(db: &Db, account_id: i32, args: serde_json::Value) -> Res
 /// CalendarEvent/query
 pub async fn event_query(db: &Db, account_id: i32, args: serde_json::Value) -> Result<serde_json::Value> {
     let acct = account_id.to_string();
-    let calendar_id = args.get("filter")
+    let filter = args.get("filter");
+    let calendar_id = filter
         .and_then(|f| f.get("calendarId"))
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<Uuid>().ok());
+    let after = filter
+        .and_then(|f| f.get("after"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
+    let before = filter
+        .and_then(|f| f.get("before"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
     let position = args.get("position").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as i64;
 
-    let (ids, total) = db::calendar::query_event_ids(&db.pool, account_id, calendar_id, position, limit).await?;
+    let (ids, total) = db::calendar::query_event_ids(&db.pool, account_id, calendar_id, after, before, position, limit).await?;
     let state = db::changelog::current_state(&db.pool, account_id, "CalendarEvent").await?;
     let resp = QueryResponse {
         account_id: acct,

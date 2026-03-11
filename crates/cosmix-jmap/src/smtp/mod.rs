@@ -22,6 +22,8 @@ pub struct SmtpConfig {
     pub max_message_size: usize,
     pub dkim_selector: Option<String>,
     pub dkim_private_key: Option<String>,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
 }
 
 impl Default for SmtpConfig {
@@ -33,6 +35,8 @@ impl Default for SmtpConfig {
             max_message_size: 25 * 1024 * 1024, // 25 MB
             dkim_selector: None,
             dkim_private_key: None,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -42,13 +46,36 @@ impl Default for SmtpConfig {
 pub struct SmtpState {
     pub db: Db,
     pub config: SmtpConfig,
+    pub tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 }
 
 /// Start SMTP listeners (inbound + submission).
 pub async fn start(db: Db, config: SmtpConfig) -> Result<()> {
+    // Load TLS certificate if configured
+    let tls_acceptor = if let (Some(cert_path), Some(key_path)) = (&config.tls_cert, &config.tls_key) {
+        let cert_data = std::fs::read(cert_path)?;
+        let key_data = std::fs::read(key_path)?;
+
+        let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_data[..])
+            .filter_map(|r| r.ok())
+            .collect();
+        let key = rustls_pemfile::private_key(&mut &key_data[..])
+            .ok()
+            .flatten()
+            .ok_or_else(|| anyhow::anyhow!("No private key found in {key_path}"))?;
+
+        let tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)?;
+        Some(tokio_rustls::TlsAcceptor::from(Arc::new(tls_config)))
+    } else {
+        None
+    };
+
     let state = Arc::new(SmtpState {
         db,
         config,
+        tls_acceptor,
     });
 
     // Start queue delivery worker

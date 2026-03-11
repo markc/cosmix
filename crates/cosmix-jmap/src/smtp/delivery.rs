@@ -6,6 +6,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use hickory_resolver::{Resolver, TokioResolver};
 
+use mail_auth::common::crypto::RsaKey;
+use mail_auth::common::headers::HeaderWriter;
+use mail_auth::dkim::DkimSigner;
+
 use super::SmtpState;
 use super::queue;
 use crate::db;
@@ -50,6 +54,13 @@ async fn process_queue(state: &SmtpState, resolver: &TokioResolver) -> Result<us
             tracing::error!(queue_id = entry.id, "Blob not found for queue entry");
             queue::mark_permanent_failure(&state.db.pool, entry.id, "blob not found").await?;
             continue;
+        };
+
+        // DKIM-sign the message if configured
+        let data = if let Some(signed) = dkim_sign(state, &data) {
+            signed
+        } else {
+            data
         };
 
         // Group recipients by domain for efficient delivery
@@ -272,6 +283,49 @@ async fn read_response<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Resul
     }
 
     Ok(result.trim().to_string())
+}
+
+/// DKIM-sign a message if selector and private key are configured.
+fn dkim_sign(state: &SmtpState, data: &[u8]) -> Option<Vec<u8>> {
+    let selector = state.config.dkim_selector.as_deref()?;
+    let key_path = state.config.dkim_private_key.as_deref()?;
+
+    let key_pem = match std::fs::read_to_string(key_path) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(error = %e, path = key_path, "Failed to read DKIM private key");
+            return None;
+        }
+    };
+
+    let pk = match RsaKey::from_pkcs8_pem(&key_pem)
+        .or_else(|_| RsaKey::from_rsa_pem(&key_pem))
+    {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to parse DKIM RSA key");
+            return None;
+        }
+    };
+
+    let signer = DkimSigner::from_key(pk)
+        .domain(&state.config.hostname)
+        .selector(selector)
+        .headers(["From", "To", "Subject", "Date", "Message-ID"]);
+
+    match signer.sign(data) {
+        Ok(signature) => {
+            let header = signature.to_header();
+            let mut signed = Vec::with_capacity(header.len() + data.len());
+            signed.extend_from_slice(header.as_bytes());
+            signed.extend_from_slice(data);
+            Some(signed)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "DKIM signing failed");
+            None
+        }
+    }
 }
 
 /// Group email addresses by domain.

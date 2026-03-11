@@ -186,46 +186,60 @@ pub async fn query_event_ids(
     pool: &PgPool,
     account_id: i32,
     calendar_id: Option<Uuid>,
+    after: Option<chrono::DateTime<chrono::Utc>>,
+    before: Option<chrono::DateTime<chrono::Utc>>,
     position: i64,
     limit: i64,
 ) -> Result<(Vec<Uuid>, i64)> {
-    let (ids, total): (Vec<(Uuid,)>, (i64,)) = if let Some(cal_id) = calendar_id {
-        let ids: Vec<(Uuid,)> = sqlx::query_as(
-            "SELECT id FROM calendar_events WHERE account_id = $1 AND calendar_id = $2 \
-             ORDER BY start_dt OFFSET $3 LIMIT $4",
-        )
-        .bind(account_id)
-        .bind(cal_id)
-        .bind(position)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
-        let total: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM calendar_events WHERE account_id = $1 AND calendar_id = $2",
-        )
-        .bind(account_id)
-        .bind(cal_id)
-        .fetch_one(pool)
-        .await?;
-        (ids, total)
-    } else {
-        let ids: Vec<(Uuid,)> = sqlx::query_as(
-            "SELECT id FROM calendar_events WHERE account_id = $1 \
-             ORDER BY start_dt OFFSET $2 LIMIT $3",
-        )
-        .bind(account_id)
-        .bind(position)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
-        let total: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM calendar_events WHERE account_id = $1",
-        )
-        .bind(account_id)
-        .fetch_one(pool)
-        .await?;
-        (ids, total)
-    };
+    // Build dynamic WHERE clause
+    let mut where_parts = vec!["account_id = $1".to_string()];
+    let mut param_idx = 1u32;
+
+    if calendar_id.is_some() {
+        param_idx += 1;
+        where_parts.push(format!("calendar_id = ${param_idx}"));
+    }
+    if after.is_some() {
+        param_idx += 1;
+        where_parts.push(format!("end_dt >= ${param_idx}"));
+    }
+    if before.is_some() {
+        param_idx += 1;
+        where_parts.push(format!("start_dt < ${param_idx}"));
+    }
+
+    let where_clause = where_parts.join(" AND ");
+    let offset_idx = param_idx + 1;
+    let limit_idx = param_idx + 2;
+
+    let select_sql = format!(
+        "SELECT id FROM calendar_events WHERE {where_clause} ORDER BY start_dt OFFSET ${offset_idx} LIMIT ${limit_idx}"
+    );
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM calendar_events WHERE {where_clause}"
+    );
+
+    let mut select_q = sqlx::query_as::<_, (Uuid,)>(&select_sql).bind(account_id);
+    let mut count_q = sqlx::query_as::<_, (i64,)>(&count_sql).bind(account_id);
+
+    if let Some(cal_id) = calendar_id {
+        select_q = select_q.bind(cal_id);
+        count_q = count_q.bind(cal_id);
+    }
+    if let Some(a) = after {
+        select_q = select_q.bind(a);
+        count_q = count_q.bind(a);
+    }
+    if let Some(b) = before {
+        select_q = select_q.bind(b);
+        count_q = count_q.bind(b);
+    }
+
+    select_q = select_q.bind(position).bind(limit);
+
+    let ids: Vec<(Uuid,)> = select_q.fetch_all(pool).await?;
+    let total: (i64,) = count_q.fetch_one(pool).await?;
+
     Ok((ids.into_iter().map(|r| r.0).collect(), total.0))
 }
 

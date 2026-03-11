@@ -140,14 +140,18 @@ pub async fn contact_get(db: &Db, account_id: i32, args: serde_json::Value) -> R
 /// Contact/query
 pub async fn contact_query(db: &Db, account_id: i32, args: serde_json::Value) -> Result<serde_json::Value> {
     let acct = account_id.to_string();
-    let addressbook_id = args.get("filter")
+    let filter = args.get("filter");
+    let addressbook_id = filter
         .and_then(|f| f.get("addressBookId"))
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<Uuid>().ok());
+    let text = filter
+        .and_then(|f| f.get("text"))
+        .and_then(|v| v.as_str());
     let position = args.get("position").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as i64;
 
-    let (ids, total) = db::contact::query_contact_ids(&db.pool, account_id, addressbook_id, position, limit).await?;
+    let (ids, total) = db::contact::query_contact_ids(&db.pool, account_id, addressbook_id, text, position, limit).await?;
     let state = db::changelog::current_state(&db.pool, account_id, "Contact").await?;
     let resp = QueryResponse {
         account_id: acct,

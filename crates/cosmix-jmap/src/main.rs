@@ -100,7 +100,9 @@ async fn main() -> Result<()> {
 
         Command::Account { action } => match action {
             AccountAction::Add { email, password, name } => {
-                let id = db::account::create(&database.pool, &email, &password, name.as_deref()).await?;
+                let hash = bcrypt::hash(&password, bcrypt::DEFAULT_COST)
+                    .map_err(|e| anyhow::anyhow!("bcrypt error: {e}"))?;
+                let id = db::account::create(&database.pool, &email, &hash, name.as_deref()).await?;
                 println!("Created account {email} (id: {id})");
             }
             AccountAction::List => {
@@ -159,6 +161,8 @@ async fn main() -> Result<()> {
                 max_message_size: cfg.max_message_size.unwrap_or(25 * 1024 * 1024),
                 dkim_selector: cfg.dkim_selector.clone(),
                 dkim_private_key: cfg.dkim_private_key.clone(),
+                tls_cert: cfg.tls_cert.clone(),
+                tls_key: cfg.tls_key.clone(),
             };
             smtp::start(database.clone(), smtp_config).await?;
 
