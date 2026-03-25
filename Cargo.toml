@@ -6,6 +6,7 @@ members = [
     "crates/cosmix-mesh",
     "crates/cosmix-port",
     "crates/cosmix-embed",
+    "crates/cosmix-web",
 ]
 
 [workspace.package]

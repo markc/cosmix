@@ -1,0 +1,25 @@
+[package]
+name = "cosmix-web"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lightweight web server — serves Dioxus WASM apps + CMS API backed by SQLite"
+
+[[bin]]
+name = "cosmix-web"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+rusqlite = { workspace = true, features = ["bundled"] }
+clap.workspace = true
+mimalloc.workspace = true
+reqwest.workspace = true
