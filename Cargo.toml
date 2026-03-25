@@ -10,7 +10,7 @@ members = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/markc/cosmix"
+repository = "https://github.com/markc/cosmixos"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
