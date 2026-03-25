@@ -6,7 +6,7 @@ default_platform = "desktop"
 enable_default_menu_bar = false
 
 [web.app]
-title = "cosmix-mail"
+title = ""
 
 [web.watcher]
 reload_html = true
