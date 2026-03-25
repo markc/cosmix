@@ -458,7 +458,9 @@ async fn main() -> Result<()> {
             let state = Arc::new(AppState {
                 db: Mutex::new(conn),
                 jmap_upstream,
-                http_client: reqwest::Client::new(),
+                http_client: reqwest::Client::builder()
+                    .danger_accept_invalid_certs(true)
+                    .build()?,
             });
 
             let router = build_router(state, www_dir);
