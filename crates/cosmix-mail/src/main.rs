@@ -124,7 +124,25 @@ fn app() -> Element {
 
     rsx! {
         document::Link { rel: "stylesheet", href: TAILWIND_CSS }
-        document::Style { "html,body,#main{{ margin:0!important; padding:0!important; background:#030712!important; width:100%!important; height:100%!important; overflow:hidden!important; }}" }
+        document::Style { "html,body,#main{{ margin:0!important; padding:0!important; background:#030712!important; width:100%!important; height:100%!important; overflow:hidden!important; }}
+@media (max-width: 639px) {{
+  .pane-sidebar {{ display:none!important; }}
+  .pane-sidebar.mobile-active {{ display:flex!important; width:100%!important; min-width:100%!important; }}
+  .pane-emails {{ display:none!important; }}
+  .pane-emails.mobile-active {{ display:flex!important; width:100%!important; min-width:100%!important; }}
+  .pane-reader {{ display:none!important; }}
+  .pane-reader.mobile-active {{ display:flex!important; }}
+  .mobile-back {{ display:flex!important; }}
+  .desktop-only {{ display:none!important; }}
+  .pane-sidebar button {{ min-height:44px; font-size:14px!important; }}
+  .pane-emails button {{ min-height:56px; }}
+  .action-bar button {{ min-height:40px; padding:8px 14px!important; font-size:13px!important; }}
+  .prose {{ font-size:1rem; }}
+}}
+@media (min-width: 640px) {{
+  .mobile-back {{ display:none!important; }}
+  .mobile-only {{ display:none!important; }}
+}}" }
         div {
             style: "position:absolute; top:0; left:0; right:0; bottom:0; display:flex; flex-direction:row; overflow:hidden; background:#030712; color:#e5e7eb; font-size:13px; font-family:system-ui,-apple-system,sans-serif;",
             // Error banner
