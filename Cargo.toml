@@ -16,6 +16,13 @@ members = [
     "crates/cosmix-edit",
     "crates/cosmix-wg",
     "crates/cosmix-backup",
+    "crates/cosmix-dns/bin",
+    "crates/cosmix-dns/util",
+    "crates/cosmix-dns/crates/net",
+    "crates/cosmix-dns/crates/proto",
+    "crates/cosmix-dns/crates/resolver",
+    "crates/cosmix-dns/crates/server",
+    "crates/cosmix-dns/ui",
 ]
 
 [workspace.package]
@@ -50,4 +57,4 @@ mail-builder = "0.4"
 directories = "6"
 toml_cfg = { package = "toml", version = "0.8" }
 spamlite = { path = "../spamlite" }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["bundled"] }

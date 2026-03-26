@@ -9,16 +9,15 @@ for DNS record resolution.
 documentation = "https://docs.rs/hickory-resolver"
 readme = "README.md"
 
-version.workspace = true
-authors.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-homepage.workspace = true
-repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
-license.workspace = true
-
+version = "0.26.0-alpha.1"
+authors = ["The contributors to Hickory DNS"]
+edition = "2021"
+rust-version = "1.88"
+homepage = "https://hickory-dns.org/"
+repository = "https://github.com/hickory-dns/hickory-dns"
+keywords = ["dns", "dnssec"]
+categories = ["network-programming"]
+license = "MIT OR Apache-2.0"
 [features]
 default = ["system-config", "tokio"]
 
@@ -56,54 +55,53 @@ tokio = ["dep:tokio", "tokio/rt", "hickory-net/tokio"]
 metrics = ["dep:metrics"]
 
 [dependencies]
-async-recursion = { workspace = true, optional = true }
-cfg-if.workspace = true
+async-recursion = { version = "1.0.0", optional = true }
+cfg-if = "1"
 futures-util = { workspace = true, default-features = false, features = [
     "std",
 ] }
-metrics = { workspace = true, optional = true }
-ipnet = { workspace = true, features = ["serde"] }
-lru-cache = { workspace = true, optional = true }
-moka = { workspace = true, features = ["sync"] }
-once_cell.workspace = true
-parking_lot.workspace = true
-quinn = { workspace = true, optional = true, features = [
+metrics = { version = "0.24.1", optional = true }
+ipnet = { version = "2.3.0", default-features = false, features = ["serde"] }
+lru-cache = { version = "0.1.2", optional = true }
+moka = { version = "0.12", features = ["sync"] }
+once_cell = { version = "1.20.0", default-features = false, features = ["critical-section"] }
+parking_lot = "0.12"
+quinn = { version = "0.11.2", default-features = false, optional = true, features = [
     "log",
     "runtime-tokio",
 ] }
-rand.workspace = true
-resolv-conf = { workspace = true, optional = true, features = ["system"] }
-rustls = { workspace = true, optional = true }
-serde = { workspace = true, features = ["derive", "rc"], optional = true }
-smallvec.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
-tokio = { workspace = true, optional = true }
-tokio-rustls = { workspace = true, optional = true }
-toml = { workspace = true, optional = true }
-hickory-net = { workspace = true }
-hickory-proto = { workspace = true, features = ["access-control"] }
-webpki-roots = { workspace = true, optional = true }
+rand = { version = "0.10.0", default-features = false, features = ["alloc"] }
+resolv-conf = { version = "0.7.0", features = ["system"], optional = true }
+rustls = { version = "0.23.23", default-features = false, features = ["logging", "std", "tls12"], optional = true }
+serde = { version = "1.0", features = ["derive", "rc"], optional = true }
+smallvec = "1.6"
+thiserror = { version = "2", default-features = false }
+tracing = { version = "0.1.30", default-features = false }
+tokio = { version = "1.21", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, optional = true }
+toml = { version = "1.0.1", optional = true }
+hickory-net = { version = "0.26.0-alpha.1", path = "../net", default-features = false }
+hickory-proto = { version = "0.26.0-alpha.1", path = "../proto", default-features = false, features = ["access-control", "std"] }
+webpki-roots = { version = "1", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-ipconfig = { workspace = true, optional = true }
+ipconfig = { version = "0.3.0", optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
-jni = { workspace = true, optional = true }
-ndk-context = { workspace = true, optional = true }
+jni = { version = "0.22.1", optional = true }
+ndk-context = { version = "0.1.1", optional = true }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
-system-configuration = { workspace = true, optional = true }
+system-configuration = { version = "0.7", optional = true }
 
 [dev-dependencies]
-futures-executor = { workspace = true, default-features = false, features = ["std"] }
-hickory-proto = { workspace = true }
-metrics-util = { workspace = true, features = ["debugging"] }
-serde_json = { workspace = true }
-test-support.workspace = true
-tokio = { workspace = true, features = ["macros", "test-util"] }
-toml.workspace = true
-tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "std"] }
+futures-executor = { version = "0.3.5", default-features = false, features = ["std"] }
+hickory-proto = { version = "0.26.0-alpha.1", path = "../proto", default-features = false, features = ["std"] }
+metrics-util = { version = "0.20.0", default-features = false, features = ["debugging"] }
+serde_json = "1"
+tokio = { version = "1.21", features = ["macros", "test-util"] }
+toml = "1.0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "std"] }
 
 [package.metadata.docs.rs]
 all-features = true
@@ -127,9 +125,26 @@ required-features = ["tokio", "system-config"]
 name = "multithreaded_runtime"
 required-features = ["tokio", "system-config"]
 
-[lints]
-workspace = true
+[lints.rust]
+non_snake_case = "warn"
+non_upper_case_globals = "warn"
+rust_2018_idioms = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(nightly)"] }
+unnameable_types = "warn"
+unreachable_pub = "warn"
+unused_extern_crates = "warn"
+unused_import_braces = "warn"
+unused_qualifications = "warn"
 
+[lints.clippy]
+bool_to_int_with_if = "allow"
+default_trait_access = "warn"
+manual_let_else = "warn"
+or_fun_call = "warn"
+single_component_path_imports = "allow"
+unimplemented = "warn"
+upper_case_acronyms = "allow"
+use_self = "warn"
 [package.metadata.cargo-all-features]
 skip_optional_dependencies = true
 max_combination_size = 2

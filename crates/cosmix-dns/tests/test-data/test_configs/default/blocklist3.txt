@@ -1,3 +1,0 @@
-test.com
-0.0.0.0 anothertest.com
-0.0.0.0 *.anothertest.com

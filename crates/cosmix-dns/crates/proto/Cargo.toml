@@ -9,16 +9,15 @@ library used by the other higher-level Hickory DNS crates.
 documentation = "https://docs.rs/hickory-proto"
 readme = "README.md"
 
-version.workspace = true
-authors.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-homepage.workspace = true
-repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
-license.workspace = true
-
+version = "0.26.0-alpha.1"
+authors = ["The contributors to Hickory DNS"]
+edition = "2021"
+rust-version = "1.88"
+homepage = "https://hickory-dns.org/"
+repository = "https://github.com/hickory-dns/hickory-dns"
+keywords = ["dns", "dnssec"]
+categories = ["network-programming"]
+license = "MIT OR Apache-2.0"
 [features]
 std = [
     "data-encoding/std",
@@ -52,41 +51,56 @@ wasm-bindgen = ["dep:wasm-bindgen-crate", "dep:js-sys"]
 access-control  = ["std", "dep:prefix-trie"]
 
 [dependencies]
-aws-lc-rs = { workspace = true, optional = true }
-bitflags = { workspace = true, optional = true }
-critical-section = { workspace = true, optional = true }
-data-encoding = { workspace = true, features = ["alloc"] }
-idna.workspace = true
-ipnet.workspace = true
-js-sys = { workspace = true, optional = true }
-once_cell = { workspace = true }
-prefix-trie = {  workspace = true, optional = true }
-rand = { workspace = true, features = ["std_rng"] }
-ring = { workspace = true, optional = true, features = ["std"] }
-rustls-pki-types = { workspace = true, optional = true }
-serde = { workspace = true, features = ["derive"], optional = true }
-thiserror.workspace = true
-time = { workspace = true, optional = true }
-tinyvec = { workspace = true, features = ["alloc"] }
-tracing = { workspace = true, default-features = false }
-url = { workspace = true }
-wasm-bindgen-crate = { workspace = true, optional = true }
+aws-lc-rs = { version = "1.12.3", default-features = false, features = ["prebuilt-nasm"], optional = true }
+bitflags = { version = "2.4.1", optional = true }
+critical-section = { version = "1.1.1", optional = true }
+data-encoding = { version = "2.2.0", default-features = false, features = ["alloc"] }
+idna = { version = "1.0.3", default-features = false, features = ["alloc", "compiled_data"] }
+ipnet = { version = "2.3.0", default-features = false }
+js-sys = { version = "0.3.44", optional = true }
+once_cell = { version = "1.20.0", default-features = false, features = ["critical-section"] }
+prefix-trie = { version = "0.8", optional = true }
+rand = { version = "0.10.0", default-features = false, features = ["alloc", "std_rng"] }
+ring = { version = "0.17", features = ["std"], optional = true }
+rustls-pki-types = { version = "1.10", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+thiserror = { version = "2", default-features = false }
+time = { version = "0.3", optional = true }
+tinyvec = { version = "1.1.1", features = ["alloc"] }
+tracing = { version = "0.1.30", default-features = false }
+url = { version = "2.5.4", default-features = false }
+wasm-bindgen-crate = { version = "0.2.58", package = "wasm-bindgen", optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
-jni = { workspace = true }
+jni = "0.22.1"
 
 [dev-dependencies]
-test-support.workspace = true
-
 [package.metadata.docs.rs]
 all-features = true
 default-target = "x86_64-unknown-linux-gnu"
 targets = ["x86_64-apple-darwin", "x86_64-pc-windows-msvc"]
 rustdoc-args = ["--cfg", "docsrs"]
 
-[lints]
-workspace = true
+[lints.rust]
+non_snake_case = "warn"
+non_upper_case_globals = "warn"
+rust_2018_idioms = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(nightly)"] }
+unnameable_types = "warn"
+unreachable_pub = "warn"
+unused_extern_crates = "warn"
+unused_import_braces = "warn"
+unused_qualifications = "warn"
 
+[lints.clippy]
+bool_to_int_with_if = "allow"
+default_trait_access = "warn"
+manual_let_else = "warn"
+or_fun_call = "warn"
+single_component_path_imports = "allow"
+unimplemented = "warn"
+upper_case_acronyms = "allow"
+use_self = "warn"
 [package.metadata.cargo-all-features]
 skip_optional_dependencies = true
 max_combination_size = 2

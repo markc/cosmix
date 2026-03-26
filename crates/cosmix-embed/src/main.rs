@@ -367,9 +367,9 @@ impl VectorDb {
     }
 
     fn stats(&self, db_path: &str) -> Result<StatsResponse> {
-        let total: usize =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
+        let total: usize = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get::<_, i64>(0).map(|v| v as usize))?;
         let db_size = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
         Ok(StatsResponse {
             total_vectors: total,

@@ -9,16 +9,15 @@ library used by the other higher-level Hickory DNS crates.
 documentation = "https://docs.rs/hickory-net"
 readme = "README.md"
 
-version.workspace = true
-authors.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-homepage.workspace = true
-repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
-license.workspace = true
-
+version = "0.26.0-alpha.1"
+authors = ["The contributors to Hickory DNS"]
+edition = "2021"
+rust-version = "1.88"
+homepage = "https://hickory-dns.org/"
+repository = "https://github.com/hickory-dns/hickory-dns"
+keywords = ["dns", "dnssec"]
+categories = ["network-programming"]
+license = "MIT OR Apache-2.0"
 [features]
 tls-aws-lc-rs = ["tokio-rustls/aws-lc-rs", "__tls"]
 https-aws-lc-rs = ["tls-aws-lc-rs", "__https"]
@@ -54,49 +53,48 @@ name = "hickory_net"
 path = "src/lib.rs"
 
 [dependencies]
-async-trait.workspace = true
-aws-lc-rs = { workspace = true, optional = true }
-bitflags = { workspace = true, optional = true }
-bytes = { workspace = true, optional = true }
-cfg-if.workspace = true
-data-encoding = { workspace = true, features = ["alloc"] }
-futures-channel = { workspace = true, default-features = false, features = ["alloc", "std"] }
-futures-io = { workspace = true, default-features = false, features = ["std"] }
-futures-util = { workspace = true, default-features = false, features = ["alloc", "async-await-macro", "std"] }
-h2 = { workspace = true, features = ["stream"], optional = true }
-h3 = { workspace = true, optional = true }
-h3-quinn = { workspace = true, optional = true }
-hickory-proto.workspace = true
-http = { workspace = true, optional = true }
-idna.workspace = true
-ipnet.workspace = true
-lru-cache = { workspace = true, optional = true }
-parking_lot = { workspace = true, optional = true }
-pin-project-lite = { workspace = true, optional = true }
-quinn = { workspace = true, optional = true, features = ["log", "runtime-tokio"] }
-rand = { workspace = true, features = ["std_rng"] }
-ring = { workspace = true, optional = true, features = ["std"] }
-rustls = { workspace = true, optional = true, default-features = false }
-rustls-pki-types = { workspace = true, optional = true }
-rustls-platform-verifier = { workspace = true, optional = true }
-serde = { workspace = true, features = ["derive"], optional = true }
-socket2 = { workspace = true, optional = true }
-thiserror.workspace = true
-time = { workspace = true, optional = true }
-tinyvec = { workspace = true, features = ["alloc"] }
-tracing = { workspace = true, default-features = false }
-tokio = { workspace = true, features = ["io-util", "macros"], optional = true }
-tokio-rustls = { workspace = true, optional = true, features = ["early-data"] }
-url = { workspace = true }
-webpki-roots = { workspace = true, optional = true }
+async-trait = "0.1.43"
+aws-lc-rs = { version = "1.12.3", default-features = false, features = ["prebuilt-nasm"], optional = true }
+bitflags = { version = "2.4.1", optional = true }
+bytes = { version = "1", optional = true }
+cfg-if = "1"
+data-encoding = { version = "2.2.0", default-features = false, features = ["alloc"] }
+futures-channel = { version = "0.3.5", default-features = false, features = ["alloc", "std"] }
+futures-io = { version = "0.3.5", default-features = false, features = ["std"] }
+futures-util = { version = "0.3.5", default-features = false, features = ["alloc", "async-await-macro", "std"] }
+h2 = { version = "0.4.0", features = ["stream"], optional = true }
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true }
+hickory-proto = { version = "0.26.0-alpha.1", path = "../proto", default-features = false, features = ["std"] }
+http = { version = "1.1", optional = true }
+idna = { version = "1.0.3", default-features = false, features = ["alloc", "compiled_data"] }
+ipnet = { version = "2.3.0", default-features = false }
+lru-cache = { version = "0.1.2", optional = true }
+parking_lot = { version = "0.12", optional = true }
+pin-project-lite = { version = "0.2", optional = true }
+quinn = { version = "0.11.2", default-features = false, features = ["log", "runtime-tokio"], optional = true }
+rand = { version = "0.10.0", default-features = false, features = ["alloc", "std_rng"] }
+ring = { version = "0.17", features = ["std"], optional = true }
+rustls = { version = "0.23.23", default-features = false, features = ["logging", "std", "tls12"], optional = true }
+rustls-pki-types = { version = "1.10", optional = true }
+rustls-platform-verifier = { version = "0.6", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+socket2 = { version = "0.6", optional = true }
+thiserror = { version = "2", default-features = false }
+time = { version = "0.3", optional = true }
+tinyvec = { version = "1.1.1", features = ["alloc"] }
+tracing = { version = "0.1.30", default-features = false }
+tokio = { version = "1.21", features = ["io-util", "macros"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["early-data"], optional = true }
+url = { version = "2.5.4", default-features = false }
+webpki-roots = { version = "1", optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
-jni = { workspace = true }
+jni = "0.22.1"
 
 [dev-dependencies]
-futures-executor = { workspace = true, default-features = false, features = ["std"] }
-test-support.workspace = true
-tokio = { workspace = true, features = ["rt", "time", "macros", "test-util"] }
+futures-executor = { version = "0.3.5", default-features = false, features = ["std"] }
+tokio = { version = "1.21", features = ["macros", "rt", "test-util", "time"] }
 
 [package.metadata.docs.rs]
 all-features = true
@@ -104,9 +102,26 @@ default-target = "x86_64-unknown-linux-gnu"
 targets = ["x86_64-apple-darwin", "x86_64-pc-windows-msvc"]
 rustdoc-args = ["--cfg", "docsrs"]
 
-[lints]
-workspace = true
+[lints.rust]
+non_snake_case = "warn"
+non_upper_case_globals = "warn"
+rust_2018_idioms = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(nightly)"] }
+unnameable_types = "warn"
+unreachable_pub = "warn"
+unused_extern_crates = "warn"
+unused_import_braces = "warn"
+unused_qualifications = "warn"
 
+[lints.clippy]
+bool_to_int_with_if = "allow"
+default_trait_access = "warn"
+manual_let_else = "warn"
+or_fun_call = "warn"
+single_component_path_imports = "allow"
+unimplemented = "warn"
+upper_case_acronyms = "allow"
+use_self = "warn"
 [package.metadata.cargo-all-features]
 skip_optional_dependencies = true
 max_combination_size = 2
