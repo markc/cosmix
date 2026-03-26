@@ -189,34 +189,28 @@ fn app() -> Element {
                     ComposeView {
                         state: state,
                         on_back: move |_| { mobile_view.set(MobileView::Emails); },
-                        on_send: move |_cs: ComposeState| {
-                            #[cfg(not(target_arch = "wasm32"))]
-                            {
-                                let c = client.peek().clone();
-                                let drafts_id = find_mailbox("drafts").unwrap_or_default();
-                                let cs = _cs;
-                                spawn(async move {
-                                    let to_addrs: Vec<String> = cs.to.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-                                    let cc_addrs: Vec<String> = cs.cc.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-                                    match c.send_compose(
-                                        JMAP_USER,
-                                        &to_addrs,
-                                        &cc_addrs,
-                                        &cs.subject,
-                                        &cs.body,
-                                        cs.in_reply_to.as_deref(),
-                                        &drafts_id,
-                                    ).await {
-                                        Ok(()) => {
-                                            compose.set(None);
-                                            refresh.set(refresh() + 1);
-                                        }
-                                        Err(e) => error_msg.set(Some(format!("Send failed: {e}"))),
+                        on_send: move |cs: ComposeState| {
+                            let c = client.peek().clone();
+                            let drafts_id = find_mailbox("drafts").unwrap_or_default();
+                            spawn(async move {
+                                let to_addrs: Vec<String> = cs.to.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                                let cc_addrs: Vec<String> = cs.cc.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                                match c.send_compose(
+                                    JMAP_USER,
+                                    &to_addrs,
+                                    &cc_addrs,
+                                    &cs.subject,
+                                    &cs.body,
+                                    cs.in_reply_to.as_deref(),
+                                    &drafts_id,
+                                ).await {
+                                    Ok(()) => {
+                                        compose.set(None);
+                                        refresh.set(refresh() + 1);
                                     }
-                                });
-                            }
-                            #[cfg(target_arch = "wasm32")]
-                            error_msg.set(Some("Send not yet supported in web mode".into()));
+                                    Err(e) => error_msg.set(Some(format!("Send failed: {e}"))),
+                                }
+                            });
                         },
                         on_discard: move |_| {
                             compose.set(None);

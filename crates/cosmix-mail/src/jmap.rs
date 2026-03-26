@@ -1,6 +1,4 @@
 use anyhow::{anyhow, Result};
-#[cfg(not(target_arch = "wasm32"))]
-use mail_builder::MessageBuilder;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -389,7 +387,6 @@ impl JmapClient {
     }
 
     /// High-level compose + send: build MIME → upload blob → create email → submit.
-    #[cfg(not(target_arch = "wasm32"))]
     pub async fn send_compose(
         &self,
         from: &str,
@@ -400,26 +397,7 @@ impl JmapClient {
         in_reply_to: Option<&str>,
         drafts_mailbox_id: &str,
     ) -> Result<()> {
-        // Build RFC 5322 MIME message
-        let mut msg = MessageBuilder::new();
-        msg = msg.from(from.to_string());
-        for addr in to {
-            msg = msg.to(addr.trim().to_string());
-        }
-        for addr in cc {
-            let trimmed = addr.trim();
-            if !trimmed.is_empty() {
-                msg = msg.cc(trimmed.to_string());
-            }
-        }
-        msg = msg.subject(subject);
-        if let Some(reply_id) = in_reply_to {
-            msg = msg.in_reply_to(reply_id.to_string());
-        }
-        msg = msg.text_body(body);
-
-        let mime_bytes = msg.write_to_vec()
-            .map_err(|e| anyhow!("Failed to build MIME: {e}"))?;
+        let mime_bytes = build_mime(from, to, cc, subject, body, in_reply_to);
 
         // Upload blob
         let blob_id = self.upload_blob(&mime_bytes).await?;
@@ -438,4 +416,38 @@ impl JmapClient {
 
         Ok(())
     }
+}
+
+/// Build a minimal RFC 5322 plain text message without external crates.
+fn build_mime(
+    from: &str,
+    to: &[String],
+    cc: &[String],
+    subject: &str,
+    body: &str,
+    in_reply_to: Option<&str>,
+) -> Vec<u8> {
+    let message_id = format!("<{}.{}@cosmix>", uuid::Uuid::new_v4(), chrono::Utc::now().timestamp());
+    let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S +0000").to_string();
+
+    let mut mime = String::new();
+    mime.push_str(&format!("From: {from}\r\n"));
+    mime.push_str(&format!("To: {}\r\n", to.join(", ")));
+    if !cc.is_empty() {
+        mime.push_str(&format!("Cc: {}\r\n", cc.join(", ")));
+    }
+    mime.push_str(&format!("Subject: {subject}\r\n"));
+    mime.push_str(&format!("Date: {date}\r\n"));
+    mime.push_str(&format!("Message-ID: {message_id}\r\n"));
+    if let Some(reply_id) = in_reply_to {
+        mime.push_str(&format!("In-Reply-To: <{reply_id}>\r\n"));
+        mime.push_str(&format!("References: <{reply_id}>\r\n"));
+    }
+    mime.push_str("MIME-Version: 1.0\r\n");
+    mime.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+    mime.push_str("Content-Transfer-Encoding: 8bit\r\n");
+    mime.push_str("\r\n");
+    mime.push_str(body);
+
+    mime.into_bytes()
 }
