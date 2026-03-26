@@ -4,17 +4,17 @@
 
 ## Physical Layout
 
-```
+```text
 Internet (NBN 1000/100)
     │
     ▼
-┌─ gw (GL-iNet GL-MT6000, OpenWrt) ──────────────────────────────┐
-│  WAN: 120.88.117.136/22 (eth1, 2.5G)                           │
-│  LAN: 192.168.1.1/24 (br-lan)                                  │
-│  WG:  172.16.1.1/24 (wg0:51820), 172.16.2.1/24 (wg1:51822)    │
-│  Services: nginx, postfix, dovecot, dnsmasq, opendkim, crowdsec│
-│  SSL: *.kanary.org wildcard cert                                │
-└─────────────────────────────────────────────────────────────────┘
+┌─ gw (GL-iNet GL-MT6000, OpenWrt) ─────────────────────────
+│  WAN: 120.88.117.136/22 (eth1, 2.5G)
+│  LAN: 192.168.1.1/24 (br-lan)
+│  WG:  172.16.1.1/24 (wg0:51820), 172.16.2.1/24 (wg1:51822)
+│  Services: nginx, postfix, dovecot, dnsmasq, opendkim, crowdsec
+│  SSL: *.kanary.org wildcard cert
+└───────────────────────────────────────────────────────────
     │ LAN (192.168.1.0/24, untrusted)
     │
     ├── gw2 (OpenWrt CT on pve5) ◄── DOUBLE-NAT BOUNDARY
@@ -42,7 +42,7 @@ Corosync (air-gapped): 192.168.10.0/24 (vmbr1, PVE cluster only)
 
 ## WireGuard Mesh
 
-```
+```text
 wg0 (172.16.1.0/24, port 51820) — infrastructure mesh
     Hub: gw (172.16.1.1)
     ├── cachyos   172.16.1.4   (via 192.168.1.200)
@@ -72,7 +72,7 @@ wgtest (10.200.0.0/24, port 51821) — nameserver mesh
 
 ## DNS Resolution
 
-```
+```text
 cachyos query → systemd-resolved (127.0.0.53)
   → gw2 dnsmasq (192.168.2.1)
     → gw dnsmasq (192.168.1.1) if not local

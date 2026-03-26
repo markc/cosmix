@@ -38,7 +38,7 @@ pub fn MailboxList(
                         let id = mbox.id.clone();
                         let is_selected = selected.as_deref() == Some(&id);
                         let icon = mailbox_icon(mbox.role.as_deref());
-                        let bg = if is_selected { "background:#2563eb; color:#fff;" } else { "color:#9ca3af;" };
+                        let bg = if is_selected { "background:#2563eb; color:#fff;" } else { "background:transparent; color:#9ca3af;" };
                         rsx! {
                             button {
                                 key: "{id}",

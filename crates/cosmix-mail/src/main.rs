@@ -22,6 +22,15 @@ enum MobileView {
     Reader,
 }
 
+/// Static head elements — isolated component so it never re-renders.
+#[component]
+fn HeadStyles() -> Element {
+    rsx! {
+        document::Link { rel: "stylesheet", href: TAILWIND_CSS }
+        document::Style { "html,body,#main{{ margin:0!important; padding:0!important; background:#030712!important; width:100%!important; height:100%!important; overflow:hidden!important; }}" }
+    }
+}
+
 fn main() {
     #[cfg(target_os = "linux")]
     unsafe {
@@ -123,8 +132,7 @@ fn app() -> Element {
     let reader_class = if mv == MobileView::Reader { "pane-reader mobile-active" } else { "pane-reader" };
 
     rsx! {
-        document::Link { rel: "stylesheet", href: TAILWIND_CSS }
-        document::Style { "html,body,#main{{ margin:0!important; padding:0!important; background:#030712!important; width:100%!important; height:100%!important; overflow:hidden!important; }}" }
+        HeadStyles {}
         div {
             style: "position:absolute; top:0; left:0; right:0; bottom:0; display:flex; flex-direction:row; overflow:hidden; background:#030712; color:#e5e7eb; font-size:13px; font-family:system-ui,-apple-system,sans-serif;",
             // Error banner
