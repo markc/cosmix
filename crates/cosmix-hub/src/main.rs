@@ -2,6 +2,9 @@
 //!
 //! Apps connect via WebSocket at `ws://localhost:4200/ws`, register with a
 //! service name, and the hub routes AMP messages between them by `to` header.
+//!
+//! If the `to` address targets a remote mesh node (e.g. `files.mko.amp`),
+//! the hub bridges the message over WireGuard to that node's hub.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,7 +15,8 @@ use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use clap::Parser;
-use cosmix_port::amp::{self, AmpMessage};
+use cosmix_mesh::{MeshConfig, MeshPeers};
+use cosmix_port::amp::{self, AmpAddress, AmpMessage};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{RwLock, mpsc};
 
@@ -27,6 +31,14 @@ struct Cli {
     /// Port to listen on
     #[arg(long, default_value = "4200")]
     port: u16,
+
+    /// This node's name on the mesh (e.g. "cachyos", "mko")
+    #[arg(long, default_value = "localhost")]
+    node: String,
+
+    /// Path to mesh config file (peers list)
+    #[arg(long)]
+    mesh_config: Option<String>,
 }
 
 // ── App state ──
@@ -37,6 +49,8 @@ type Registry = Arc<RwLock<HashMap<String, mpsc::UnboundedSender<String>>>>;
 #[derive(Clone)]
 struct AppState {
     registry: Registry,
+    mesh: Arc<MeshPeers>,
+    node_name: String,
 }
 
 // ── Main ──
@@ -52,17 +66,59 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Load mesh config
+    let mesh_config = if let Some(ref path) = cli.mesh_config {
+        MeshConfig::load(path)?
+    } else {
+        MeshConfig::load_default(&cli.node)
+    };
+
+    tracing::info!(
+        node = %mesh_config.node_name,
+        peers = mesh_config.peers.len(),
+        "Mesh config loaded"
+    );
+
+    // Channel for messages arriving from remote hubs
+    let (mesh_incoming_tx, mut mesh_incoming_rx) = mpsc::unbounded_channel::<AmpMessage>();
+
+    let mesh = Arc::new(MeshPeers::new(mesh_config, mesh_incoming_tx));
+    let registry: Registry = Arc::new(RwLock::new(HashMap::new()));
+
+    // Spawn a task to deliver messages from remote hubs to local services
+    let registry_for_mesh = registry.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = mesh_incoming_rx.recv().await {
+            let target = msg.to_addr().unwrap_or("").to_string();
+            // Strip mesh addressing — extract just the service name
+            let service = if let Some(amp_addr) = AmpAddress::parse(&target) {
+                amp_addr.app.unwrap_or(target.clone())
+            } else {
+                target.clone()
+            };
+
+            let registry = registry_for_mesh.read().await;
+            if let Some(tx) = registry.get(&service) {
+                let _ = tx.send(msg.to_wire());
+            } else {
+                tracing::debug!(target = %service, "No local service for incoming mesh message");
+            }
+        }
+    });
+
     let state = AppState {
-        registry: Arc::new(RwLock::new(HashMap::new())),
+        registry,
+        mesh,
+        node_name: cli.node.clone(),
     };
 
     let app = Router::new()
         .route("/ws", axum::routing::get(ws_handler))
         .with_state(state);
 
-    let addr = format!("127.0.0.1:{}", cli.port);
+    let addr = format!("0.0.0.0:{}", cli.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("Hub listening on ws://localhost:{}", cli.port);
+    tracing::info!(node = %cli.node, "Hub listening on ws://0.0.0.0:{}", cli.port);
 
     axum::serve(listener, app).await?;
 
@@ -119,28 +175,48 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         // Check if message is addressed to the hub itself
         let target = amp_msg.to_addr().unwrap_or("hub");
         if target == "hub" {
-            handle_hub_command(&amp_msg, &tx, &state.registry, &mut service_name).await;
+            handle_hub_command(&amp_msg, &tx, &state, &mut service_name).await;
             continue;
         }
 
-        // Route to target service
-        let registry = state.registry.read().await;
-        if let Some(target_tx) = registry.get(target) {
-            if target_tx.send(text).is_err() {
-                drop(registry);
-                // Target disconnected, remove it
-                state.registry.write().await.remove(target);
-                let err = AmpMessage::new()
-                    .with_header("rc", "10")
-                    .with_header("error", &format!("Service '{target}' disconnected"));
-                let _ = tx.send(err.to_wire());
+        // Check if target is a mesh address (e.g. "files.mko.amp")
+        if let Some(amp_addr) = AmpAddress::parse(target) {
+            if !amp_addr.is_for_node(&state.node_name) {
+                // Remote node — bridge via mesh
+                let node = amp_addr.node.clone();
+                if state.mesh.is_remote_peer(&node) {
+                    let tx_clone = tx.clone();
+                    let mesh = state.mesh.clone();
+                    tokio::spawn(async move {
+                        match mesh.call(&node, amp_msg).await {
+                            Ok(resp) => {
+                                let _ = tx_clone.send(resp.to_wire());
+                            }
+                            Err(e) => {
+                                let err = AmpMessage::new()
+                                    .with_header("rc", "10")
+                                    .with_header("error", &format!("Mesh bridge error: {e}"));
+                                let _ = tx_clone.send(err.to_wire());
+                            }
+                        }
+                    });
+                } else {
+                    let err = AmpMessage::new()
+                        .with_header("rc", "10")
+                        .with_header("error", &format!("Unknown mesh node: '{}'", amp_addr.node));
+                    let _ = tx.send(err.to_wire());
+                }
+                continue;
             }
-        } else {
-            let err = AmpMessage::new()
-                .with_header("rc", "10")
-                .with_header("error", &format!("Service '{target}' not found"));
-            let _ = tx.send(err.to_wire());
+
+            // Local node — extract the service name from the AMP address
+            let local_service = amp_addr.app.as_deref().unwrap_or(target);
+            route_local(&state.registry, local_service, &text, &tx).await;
+            continue;
         }
+
+        // Plain service name — route locally
+        route_local(&state.registry, target, &text, &tx).await;
     }
 
     // Cleanup: remove service from registry on disconnect
@@ -152,12 +228,37 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     send_task.abort();
 }
 
+/// Route a message to a local service by name.
+async fn route_local(
+    registry: &Registry,
+    service: &str,
+    raw: &str,
+    caller_tx: &mpsc::UnboundedSender<String>,
+) {
+    let reg = registry.read().await;
+    if let Some(target_tx) = reg.get(service) {
+        if target_tx.send(raw.to_string()).is_err() {
+            drop(reg);
+            registry.write().await.remove(service);
+            let err = AmpMessage::new()
+                .with_header("rc", "10")
+                .with_header("error", &format!("Service '{service}' disconnected"));
+            let _ = caller_tx.send(err.to_wire());
+        }
+    } else {
+        let err = AmpMessage::new()
+            .with_header("rc", "10")
+            .with_header("error", &format!("Service '{service}' not found"));
+        let _ = caller_tx.send(err.to_wire());
+    }
+}
+
 // ── Hub internal commands ──
 
 async fn handle_hub_command(
     msg: &AmpMessage,
     tx: &mpsc::UnboundedSender<String>,
-    registry: &Registry,
+    state: &AppState,
     service_name: &mut Option<String>,
 ) {
     let command = msg.command_name().unwrap_or("");
@@ -188,10 +289,10 @@ async fn handle_hub_command(
             };
 
             if let Some(old_name) = service_name.take() {
-                registry.write().await.remove(&old_name);
+                state.registry.write().await.remove(&old_name);
             }
 
-            registry.write().await.insert(from.clone(), tx.clone());
+            state.registry.write().await.insert(from.clone(), tx.clone());
             *service_name = Some(from.clone());
             tracing::info!("Service '{}' registered", from);
 
@@ -202,7 +303,7 @@ async fn handle_hub_command(
         }
 
         "hub.list" => {
-            let reg = registry.read().await;
+            let reg = state.registry.read().await;
             let services: Vec<&str> = reg.keys().map(|s| s.as_str()).collect();
             let body = serde_json::to_string(&services).unwrap_or_else(|_| "[]".to_string());
 
@@ -216,6 +317,19 @@ async fn handle_hub_command(
             let mut resp = respond("0");
             resp.set("command", "hub.ping");
             resp.body = r#"{"pong": true}"#.to_string();
+            let _ = tx.send(resp.to_wire());
+        }
+
+        "hub.peers" => {
+            let peer_names = state.mesh.peer_names();
+            let body = serde_json::json!({
+                "node": state.node_name,
+                "peers": peer_names,
+            });
+
+            let mut resp = respond("0");
+            resp.set("command", "hub.peers");
+            resp.body = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
             let _ = tx.send(resp.to_wire());
         }
 

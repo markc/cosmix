@@ -1,0 +1,16 @@
+# Cosmix mesh config — place at ~/.config/cosmix/mesh.toml
+# or pass via --mesh-config flag to cosmix-hub
+
+# This node's name (used in AMP addressing: service.node.amp)
+node_name = "cachyos"
+
+# Known mesh peers (connected via WireGuard)
+[[peers]]
+name = "mko"
+mesh_ip = "172.16.2.210"
+hub_port = 4200
+
+[[peers]]
+name = "pve5"
+mesh_ip = "172.16.2.4"
+hub_port = 4200

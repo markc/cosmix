@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 cosmix-port = { path = "../cosmix-port" }
+cosmix-mesh = { path = "../cosmix-mesh" }
 tokio.workspace = true
 axum.workspace = true
 serde.workspace = true
