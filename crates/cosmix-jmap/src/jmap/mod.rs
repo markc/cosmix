@@ -5,20 +5,31 @@ pub mod contact;
 pub mod email;
 pub mod mailbox;
 pub mod submission;
+pub mod thread;
 pub mod types;
+pub mod vacation;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::extract::{Json, Path, State};
+use axum::extract::{Json, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
 
 use crate::auth;
 use crate::db::{self, Db};
 use crate::filter::SpamFilter;
 use types::*;
+
+/// State change notification sent via broadcast channel.
+#[derive(Clone, Debug)]
+pub struct StateChange {
+    pub account_id: i32,
+    pub object_type: String,
+    pub new_state: String,
+}
 
 /// Shared application state.
 #[derive(Clone)]
@@ -26,6 +37,7 @@ pub struct AppState {
     pub db: Db,
     pub base_url: String,
     pub spam_filter: Arc<SpamFilter>,
+    pub state_tx: tokio::sync::broadcast::Sender<StateChange>,
 }
 
 /// GET /.well-known/jmap — Session resource.
@@ -110,6 +122,17 @@ pub async fn api(
 
         match result {
             Ok(value) => {
+                // Emit state change for mutating methods
+                if method.ends_with("/set") || method.ends_with("/import") {
+                    let object_type = method.split('/').next().unwrap_or("");
+                    if let Ok(new_state) = db::changelog::current_state(&state.db.conn, account_id, object_type).await {
+                        let _ = state.state_tx.send(StateChange {
+                            account_id,
+                            object_type: object_type.to_string(),
+                            new_state,
+                        });
+                    }
+                }
                 responses.push(MethodResponse(method.clone(), value, call_id.clone()));
             }
             Err(e) => {
@@ -154,6 +177,13 @@ async fn dispatch(
         "Email/query" => email::query(db, account_id, args).await,
         "Email/set" => email::set(db, account_id, args, spam_filter).await,
         "Email/changes" => email::changes(db, account_id, args).await,
+        "Email/import" => email::import(db, account_id, args).await,
+
+        "Thread/get" => thread::get(db, account_id, args).await,
+        "Thread/changes" => thread::changes(db, account_id, args).await,
+
+        "EmailSubmission/get" => submission::get(db, account_id, args).await,
+        "EmailSubmission/changes" => submission::changes(db, account_id, args).await,
 
         "Identity/get" => submission::identity_get(db, account_id, args).await,
         "EmailSubmission/set" => submission::set(db, account_id, args).await,
@@ -177,6 +207,9 @@ async fn dispatch(
         "Contact/query" => contact::contact_query(db, account_id, args).await,
         "Contact/set" => contact::contact_set(db, account_id, args).await,
         "Contact/changes" => contact::contact_changes(db, account_id, args).await,
+
+        "VacationResponse/get" => vacation::get(db, account_id, args).await,
+        "VacationResponse/set" => vacation::set(db, account_id, args).await,
 
         _ => {
             let err = JmapError::method_not_found(method);
@@ -242,4 +275,89 @@ pub async fn blob_upload(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "upload failed"}))).into_response()
         }
     }
+}
+
+/// EventSource query parameters (RFC 8620 §7.3).
+#[derive(Debug, serde::Deserialize)]
+pub struct EventSourceParams {
+    /// Comma-separated list of "TypeName" to listen for, or "*" for all.
+    pub types: Option<String>,
+    /// If true, close the connection after the next event.
+    #[serde(rename = "closeafter")]
+    pub close_after: Option<String>,
+    /// Client-requested ping interval in seconds.
+    pub ping: Option<u64>,
+}
+
+/// GET /jmap/eventsource — Server-Sent Events for state changes (RFC 8620 §7.3).
+pub async fn eventsource(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<EventSourceParams>,
+) -> impl IntoResponse {
+    let Some(account_id) = auth::basic::authenticate(&state.db, &headers).await else {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    };
+
+    let close_after_state = params.close_after.as_deref() == Some("state");
+    let ping_secs = params.ping.unwrap_or(30).max(1).min(300);
+
+    // Parse which types to listen for
+    let type_filter: Option<Vec<String>> = params.types
+        .filter(|t| t != "*")
+        .map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
+
+    let mut rx = state.state_tx.subscribe();
+
+    let stream = async_stream::stream! {
+        loop {
+            tokio::select! {
+                result = rx.recv() => {
+                    match result {
+                        Ok(change) => {
+                            if change.account_id != account_id {
+                                continue;
+                            }
+                            if let Some(ref types) = type_filter {
+                                if !types.contains(&change.object_type) {
+                                    continue;
+                                }
+                            }
+
+                            let data = serde_json::json!({
+                                "@type": "StateChange",
+                                "changed": {
+                                    change.account_id.to_string(): {
+                                        &change.object_type: &change.new_state
+                                    }
+                                }
+                            });
+
+                            yield Ok::<_, std::convert::Infallible>(
+                                Event::default()
+                                    .event("state")
+                                    .data(data.to_string())
+                            );
+
+                            if close_after_state {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::debug!(skipped = n, "EventSource client lagged");
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(ping_secs)) => {
+                    yield Ok(Event::default().comment("ping"));
+                }
+            }
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(ping_secs)))
+        .into_response()
 }

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Serialize)]
@@ -123,61 +123,169 @@ pub async fn get_by_ids(conn: &Arc<Mutex<Connection>>, account_id: i32, ids: &[U
     }).await?
 }
 
+/// RFC 8621 §4.4 Email/query FilterCondition.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmailFilter {
+    #[serde(rename = "inMailbox")]
+    pub in_mailbox: Option<String>,
+    #[serde(rename = "inMailboxOtherThan")]
+    pub in_mailbox_other_than: Option<Vec<String>>,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    #[serde(rename = "minSize")]
+    pub min_size: Option<i64>,
+    #[serde(rename = "maxSize")]
+    pub max_size: Option<i64>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub cc: Option<String>,
+    pub subject: Option<String>,
+    pub text: Option<String>,
+    #[serde(rename = "hasAttachment")]
+    pub has_attachment: Option<bool>,
+    #[serde(rename = "hasKeyword")]
+    pub has_keyword: Option<String>,
+    #[serde(rename = "notKeyword")]
+    pub not_keyword: Option<String>,
+}
+
 pub async fn query_ids(
     conn: &Arc<Mutex<Connection>>,
     account_id: i32,
-    mailbox_id: Option<Uuid>,
+    filter: Option<&EmailFilter>,
     sort_desc: bool,
     position: i64,
     limit: i64,
 ) -> Result<(Vec<Uuid>, i64)> {
     let conn = conn.clone();
-    let mailbox_id = mailbox_id.map(|u| u.to_string());
+    let filter = filter.cloned();
     tokio::task::spawn_blocking(move || {
         let conn = conn.lock().map_err(|e| anyhow::anyhow!("lock error: {e}"))?;
         let order = if sort_desc { "DESC" } else { "ASC" };
 
-        if let Some(ref mb_id) = mailbox_id {
-            // Filter by mailbox — check JSON array membership
-            let sql = format!(
-                "SELECT id FROM emails WHERE account_id = ?1 AND mailbox_ids LIKE ?2 \
-                 ORDER BY received_at {order} LIMIT ?3 OFFSET ?4"
-            );
-            let pattern = format!("%\"{mb_id}\"%");
-            let count_sql = "SELECT COUNT(*) FROM emails WHERE account_id = ?1 AND mailbox_ids LIKE ?2";
+        // Build WHERE clauses dynamically
+        let mut conditions = vec!["e.account_id = ?1".to_string()];
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        param_values.push(Box::new(account_id));
+        let mut idx = 2u32;
 
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![account_id, pattern, limit, position], |row| {
-                let id_str: String = row.get(0)?;
-                Ok(id_str)
-            })?;
-            let mut ids = Vec::new();
-            for row in rows {
-                ids.push(row?.parse::<Uuid>()?);
+        // FTS5 join needed?
+        let mut use_fts = false;
+
+        if let Some(ref f) = filter {
+            if let Some(ref mb_id) = f.in_mailbox {
+                conditions.push(format!("e.mailbox_ids LIKE ?{idx}"));
+                param_values.push(Box::new(format!("%\"{mb_id}\"%")));
+                idx += 1;
             }
-
-            let total: i64 = conn.query_row(count_sql, params![account_id, pattern], |row| row.get(0))?;
-            Ok((ids, total))
-        } else {
-            let sql = format!(
-                "SELECT id FROM emails WHERE account_id = ?1 \
-                 ORDER BY received_at {order} LIMIT ?2 OFFSET ?3"
-            );
-            let count_sql = "SELECT COUNT(*) FROM emails WHERE account_id = ?1";
-
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![account_id, limit, position], |row| {
-                let id_str: String = row.get(0)?;
-                Ok(id_str)
-            })?;
-            let mut ids = Vec::new();
-            for row in rows {
-                ids.push(row?.parse::<Uuid>()?);
+            if let Some(ref others) = f.in_mailbox_other_than {
+                for mb_id in others {
+                    conditions.push(format!("e.mailbox_ids NOT LIKE ?{idx}"));
+                    param_values.push(Box::new(format!("%\"{mb_id}\"%")));
+                    idx += 1;
+                }
             }
-
-            let total: i64 = conn.query_row(count_sql, params![account_id], |row| row.get(0))?;
-            Ok((ids, total))
+            if let Some(ref before) = f.before {
+                conditions.push(format!("e.received_at < ?{idx}"));
+                param_values.push(Box::new(before.clone()));
+                idx += 1;
+            }
+            if let Some(ref after) = f.after {
+                conditions.push(format!("e.received_at >= ?{idx}"));
+                param_values.push(Box::new(after.clone()));
+                idx += 1;
+            }
+            if let Some(min) = f.min_size {
+                conditions.push(format!("e.size >= ?{idx}"));
+                param_values.push(Box::new(min));
+                idx += 1;
+            }
+            if let Some(max) = f.max_size {
+                conditions.push(format!("e.size <= ?{idx}"));
+                param_values.push(Box::new(max));
+                idx += 1;
+            }
+            if let Some(ref from) = f.from {
+                conditions.push(format!("e.from_addr LIKE ?{idx}"));
+                param_values.push(Box::new(format!("%{from}%")));
+                idx += 1;
+            }
+            if let Some(ref to) = f.to {
+                conditions.push(format!("e.to_addr LIKE ?{idx}"));
+                param_values.push(Box::new(format!("%{to}%")));
+                idx += 1;
+            }
+            if let Some(ref cc) = f.cc {
+                conditions.push(format!("e.cc_addr LIKE ?{idx}"));
+                param_values.push(Box::new(format!("%{cc}%")));
+                idx += 1;
+            }
+            if let Some(ref subject) = f.subject {
+                conditions.push(format!("e.subject LIKE ?{idx}"));
+                param_values.push(Box::new(format!("%{subject}%")));
+                idx += 1;
+            }
+            if let Some(ref text) = f.text {
+                use_fts = true;
+                conditions.push(format!("emails_fts MATCH ?{idx}"));
+                param_values.push(Box::new(text.clone()));
+                idx += 1;
+            }
+            if let Some(has_att) = f.has_attachment {
+                let val = if has_att { 1i32 } else { 0 };
+                conditions.push(format!("e.has_attachment = ?{idx}"));
+                param_values.push(Box::new(val));
+                idx += 1;
+            }
+            if let Some(ref kw) = f.has_keyword {
+                conditions.push(format!("e.keywords LIKE ?{idx}"));
+                param_values.push(Box::new(format!("%\"{kw}\"%")));
+                idx += 1;
+            }
+            if let Some(ref kw) = f.not_keyword {
+                conditions.push(format!("e.keywords NOT LIKE ?{idx}"));
+                param_values.push(Box::new(format!("%\"{kw}\"%")));
+                idx += 1;
+            }
         }
+
+        let where_clause = conditions.join(" AND ");
+
+        let (from_clause, id_col) = if use_fts {
+            ("emails e JOIN emails_fts ON emails_fts.rowid = e.rowid", "e.id")
+        } else {
+            ("emails e", "e.id")
+        };
+
+        let sql = format!(
+            "SELECT {id_col} FROM {from_clause} WHERE {where_clause} \
+             ORDER BY e.received_at {order} LIMIT ?{idx} OFFSET ?{}",
+            idx + 1,
+        );
+        param_values.push(Box::new(limit));
+        param_values.push(Box::new(position));
+
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM {from_clause} WHERE {where_clause}"
+        );
+
+        let refs: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+
+        // Count query uses only the filter params (not limit/offset)
+        let count_refs: Vec<&dyn rusqlite::types::ToSql> = refs[..refs.len() - 2].to_vec();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(refs.as_slice(), |row| {
+            let id_str: String = row.get(0)?;
+            Ok(id_str)
+        })?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?.parse::<Uuid>()?);
+        }
+
+        let total: i64 = conn.query_row(&count_sql, count_refs.as_slice(), |row| row.get(0))?;
+        Ok((ids, total))
     }).await?
 }
 

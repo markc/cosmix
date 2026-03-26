@@ -1,7 +1,6 @@
 //! JMAP Email methods (RFC 8621).
 
 use anyhow::Result;
-use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::db::{self, Db};
@@ -23,6 +22,7 @@ pub async fn get(db: &Db, account_id: i32, args: serde_json::Value) -> Result<se
         db::email::get_by_ids(&db.conn, account_id, &uuids).await?
     } else {
         let (ids, _) = db::email::query_ids(&db.conn, account_id, None, true, 0, 100).await?;
+
         db::email::get_by_ids(&db.conn, account_id, &ids).await?
     };
 
@@ -115,27 +115,31 @@ fn add_body_parts(val: &mut serde_json::Value, data: &[u8], fetch_text: bool, fe
     val["bodyValues"] = serde_json::Value::Object(body_values);
 }
 
-/// Email/query
+/// Email/query — supports RFC 8621 §4.4 FilterCondition properties.
 pub async fn query(db: &Db, account_id: i32, args: serde_json::Value) -> Result<serde_json::Value> {
     let acct = account_id.to_string();
 
-    #[derive(Deserialize)]
-    struct Filter {
-        #[serde(rename = "inMailbox")]
-        in_mailbox: Option<String>,
-    }
-
-    let filter: Option<Filter> = args.get("filter")
+    let filter: Option<db::email::EmailFilter> = args.get("filter")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
-
-    let mailbox_id = filter
-        .and_then(|f| f.in_mailbox)
-        .and_then(|s| s.parse::<Uuid>().ok());
 
     let position = args.get("position").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as i64;
 
-    let (ids, total) = db::email::query_ids(&db.conn, account_id, mailbox_id, true, position, limit).await?;
+    // Parse sort — array of {property, isAscending} objects
+    let sort_desc = if let Some(sort) = args.get("sort").and_then(|v| v.as_array()) {
+        if let Some(first) = sort.first() {
+            // Default isAscending=false for receivedAt (most recent first)
+            !first.get("isAscending").and_then(|v| v.as_bool()).unwrap_or(false)
+        } else {
+            true
+        }
+    } else {
+        true
+    };
+
+    let (ids, total) = db::email::query_ids(
+        &db.conn, account_id, filter.as_ref(), sort_desc, position, limit,
+    ).await?;
     let state = db::changelog::current_state(&db.conn, account_id, "Email").await?;
 
     let resp = QueryResponse {
@@ -419,6 +423,49 @@ fn extract_addresses(addr: Option<&mail_parser::Address<'_>>) -> Option<serde_js
             Some(serde_json::Value::Array(addrs))
         }
     }
+}
+
+/// Email/import (RFC 8621 §4.6) — import raw RFC 5322 messages.
+pub async fn import(db: &Db, account_id: i32, args: serde_json::Value) -> Result<serde_json::Value> {
+    let acct = account_id.to_string();
+    let old_state = db::changelog::current_state(&db.conn, account_id, "Email").await?;
+
+    let mut created_map = std::collections::HashMap::new();
+    let mut not_created = std::collections::HashMap::new();
+
+    // "emails" is a map of client-id → {blobId, mailboxIds, keywords, receivedAt}
+    if let Some(emails) = args.get("emails").and_then(|v| v.as_object()) {
+        for (client_id, entry) in emails {
+            match create_from_blob(db, account_id, entry).await {
+                Ok(email_id) => {
+                    db::changelog::record(&db.conn, account_id, "Email", email_id, "created").await?;
+                    created_map.insert(client_id.clone(), serde_json::json!({
+                        "id": email_id.to_string(),
+                        "blobId": entry.get("blobId").and_then(|v| v.as_str()).unwrap_or(""),
+                        "size": 0,
+                    }));
+                }
+                Err(e) => {
+                    not_created.insert(client_id.clone(), SetError {
+                        error_type: "invalidArguments".into(),
+                        description: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+    }
+
+    let new_state = db::changelog::current_state(&db.conn, account_id, "Email").await?;
+
+    let resp = serde_json::json!({
+        "accountId": acct,
+        "oldState": old_state,
+        "newState": new_state,
+        "created": created_map,
+        "notCreated": not_created.into_iter().map(|(k, v)| (k, serde_json::to_value(v).unwrap())).collect::<std::collections::HashMap<_, _>>(),
+    });
+
+    Ok(resp)
 }
 
 /// Email/changes

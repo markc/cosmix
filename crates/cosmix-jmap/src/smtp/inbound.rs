@@ -134,6 +134,54 @@ pub async fn deliver(
             target,
             "Delivered inbound message"
         );
+
+        // Vacation auto-reply (skip for spam, bounces, and Auto-Submitted messages)
+        if spam_verdict.as_deref() != Some("SPAM")
+            && !mail_from.is_empty()
+            && !is_auto_submitted(&message)
+        {
+            if let Ok(Some(vr)) = db::vacation::is_active(&state.db.conn, account.id).await {
+                let vacation_subject = vr.subject.unwrap_or_else(|| {
+                    format!("Auto: {}", subject.as_deref().unwrap_or("Out of Office"))
+                });
+                let vacation_body = vr.text_body.unwrap_or_else(|| {
+                    "I am currently out of the office and will respond when I return.".to_string()
+                });
+
+                let reply_msg = format!(
+                    "From: <{rcpt}>\r\n\
+                     To: <{mail_from}>\r\n\
+                     Subject: {vacation_subject}\r\n\
+                     Date: {}\r\n\
+                     Message-ID: <vacation-{}@{}>\r\n\
+                     In-Reply-To: {}\r\n\
+                     Auto-Submitted: auto-replied\r\n\
+                     MIME-Version: 1.0\r\n\
+                     Content-Type: text/plain; charset=utf-8\r\n\
+                     \r\n\
+                     {vacation_body}",
+                    chrono::Utc::now().to_rfc2822(),
+                    uuid::Uuid::new_v4(),
+                    state.config.hostname,
+                    message_id.as_deref().unwrap_or(""),
+                );
+
+                // Queue the auto-reply for outbound delivery
+                let reply_data = reply_msg.into_bytes();
+                let reply_blob = db::blob::store(
+                    &state.db.conn, &state.db.blob_dir, account.id, &reply_data,
+                ).await;
+                if let Ok(blob_id) = reply_blob {
+                    let _ = crate::smtp::queue::enqueue(
+                        &state.db.conn,
+                        rcpt,
+                        &[mail_from.to_string()],
+                        blob_id,
+                    ).await;
+                    tracing::info!(to = %mail_from, "Vacation auto-reply queued");
+                }
+            }
+        }
     }
 
     Ok(())
@@ -190,6 +238,30 @@ async fn verify_authentication(
     results.push(format!("spf={:?}", spf_output.result()));
 
     results.join("; ")
+}
+
+/// Check if a message has Auto-Submitted header (prevents vacation reply loops).
+fn is_auto_submitted(message: &mail_parser::Message<'_>) -> bool {
+    // Check for Auto-Submitted header (RFC 3834)
+    for header in message.headers() {
+        if header.name() == "Auto-Submitted" {
+            if let HeaderValue::Text(val) = header.value() {
+                if val.as_ref() != "no" {
+                    return true;
+                }
+            }
+        }
+        // Also check Precedence: bulk/list/junk
+        if header.name() == "Precedence" {
+            if let HeaderValue::Text(val) = header.value() {
+                let v = val.to_lowercase();
+                if v == "bulk" || v == "list" || v == "junk" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Extract addresses from a mail-parser Address into JSON.

@@ -42,3 +42,5 @@ rusqlite.workspace = true
 webpki-roots = "0.26"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 hyper = { version = "1", features = ["server"] }
+tokio-stream = "0.1"
+async-stream = "0.3"

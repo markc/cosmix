@@ -182,11 +182,15 @@ async fn main() -> Result<()> {
             };
             smtp::start(database.clone(), smtp_config, spam_filter.clone()).await?;
 
+            // State change broadcast channel for EventSource push
+            let (state_tx, _) = tokio::sync::broadcast::channel::<jmap::StateChange>(256);
+
             // Start JMAP HTTP server
             let state = Arc::new(jmap::AppState {
                 db: database,
                 base_url: cfg.base_url.clone(),
                 spam_filter,
+                state_tx,
             });
 
             let cors = tower_http::cors::CorsLayer::new()
@@ -199,6 +203,7 @@ async fn main() -> Result<()> {
                 .route("/jmap", axum::routing::post(jmap::api))
                 .route("/jmap/blob/{blobId}", axum::routing::get(jmap::blob_download))
                 .route("/jmap/upload/{accountId}", axum::routing::post(jmap::blob_upload))
+                .route("/jmap/eventsource", axum::routing::get(jmap::eventsource))
                 .layer(cors)
                 .with_state(state);
 

@@ -171,8 +171,136 @@ async fn create_submission(db: &Db, account_id: i32, obj: &serde_json::Value) ->
         let _ = db::email::update_mailboxes(&db.conn, account_id, email_uuid, &[sent_id]).await;
     }
 
+    // Persist submission record
     let submission_id = Uuid::new_v4();
+    let to_json = serde_json::to_string(&to_addrs)?;
+    let sub_conn = db.conn.clone();
+    let sub_id_str = submission_id.to_string();
+    let email_id_str = email_uuid.to_string();
+    let from_clone = from_addr.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = sub_conn.lock().map_err(|e| anyhow::anyhow!("lock error: {e}"))?;
+        conn.execute(
+            "INSERT INTO email_submissions (id, account_id, email_id, envelope_from, envelope_to, undo_status) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'final')",
+            rusqlite::params![sub_id_str, account_id, email_id_str, from_clone, to_json],
+        )?;
+        Ok::<_, anyhow::Error>(())
+    }).await??;
+
+    db::changelog::record(&db.conn, account_id, "EmailSubmission", submission_id, "created").await?;
+
     Ok(submission_id)
+}
+
+/// EmailSubmission/get — query submission status.
+pub async fn get(db: &Db, account_id: i32, args: serde_json::Value) -> Result<serde_json::Value> {
+    let acct = account_id.to_string();
+
+    let ids: Option<Vec<String>> = args.get("ids")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+    let conn = db.conn.clone();
+    let submissions = tokio::task::spawn_blocking(move || {
+        let conn = conn.lock().map_err(|e| anyhow::anyhow!("lock error: {e}"))?;
+        let mut results = Vec::new();
+
+        if let Some(ids) = ids {
+            for id in &ids {
+                let result: rusqlite::Result<(String, String, String, String, String, String)> = conn.query_row(
+                    "SELECT id, email_id, envelope_from, envelope_to, send_at, undo_status \
+                     FROM email_submissions WHERE id = ?1 AND account_id = ?2",
+                    rusqlite::params![id, account_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                );
+                if let Ok((id, email_id, from, to_json, send_at, undo_status)) = result {
+                    let to_addrs: Vec<String> = serde_json::from_str(&to_json).unwrap_or_default();
+                    let rcpt_to: Vec<serde_json::Value> = to_addrs.iter()
+                        .map(|e| serde_json::json!({"email": e}))
+                        .collect();
+                    results.push(serde_json::json!({
+                        "id": id,
+                        "emailId": email_id,
+                        "envelope": {
+                            "mailFrom": {"email": from},
+                            "rcptTo": rcpt_to,
+                        },
+                        "sendAt": send_at,
+                        "undoStatus": undo_status,
+                        "deliveryStatus": {},
+                    }));
+                }
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, email_id, envelope_from, envelope_to, send_at, undo_status \
+                 FROM email_submissions WHERE account_id = ?1 ORDER BY created_at DESC LIMIT 100"
+            )?;
+            let rows = stmt.query_map(rusqlite::params![account_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, email_id, from, to_json, send_at, undo_status) = row?;
+                let to_addrs: Vec<String> = serde_json::from_str(&to_json).unwrap_or_default();
+                let rcpt_to: Vec<serde_json::Value> = to_addrs.iter()
+                    .map(|e| serde_json::json!({"email": e}))
+                    .collect();
+                results.push(serde_json::json!({
+                    "id": id,
+                    "emailId": email_id,
+                    "envelope": {
+                        "mailFrom": {"email": from},
+                        "rcptTo": rcpt_to,
+                    },
+                    "sendAt": send_at,
+                    "undoStatus": undo_status,
+                    "deliveryStatus": {},
+                }));
+            }
+        }
+        Ok::<_, anyhow::Error>(results)
+    }).await??;
+
+    let state = db::changelog::current_state(&db.conn, account_id, "EmailSubmission").await?;
+
+    Ok(serde_json::json!({
+        "accountId": acct,
+        "state": state,
+        "list": submissions,
+        "notFound": [],
+    }))
+}
+
+/// EmailSubmission/changes — returns changes since a given state.
+pub async fn changes(db: &Db, account_id: i32, args: serde_json::Value) -> Result<serde_json::Value> {
+    let acct = account_id.to_string();
+    let since_state = args.get("sinceState")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+
+    let max = args.get("maxChanges").and_then(|v| v.as_i64()).unwrap_or(500);
+
+    let result = db::changelog::changes_since(&db.conn, account_id, "EmailSubmission", since_state, max).await?;
+
+    let resp = ChangesResponse {
+        account_id: acct,
+        old_state: since_state.to_string(),
+        new_state: result.new_state,
+        has_more_changes: result.has_more_changes,
+        created: result.created,
+        updated: result.updated,
+        destroyed: result.destroyed,
+    };
+
+    Ok(serde_json::to_value(resp)?)
 }
 
 /// Identity/get — list configured sender identities.

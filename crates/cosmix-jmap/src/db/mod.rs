@@ -8,6 +8,7 @@ pub mod contact;
 pub mod email;
 pub mod mailbox;
 pub mod thread;
+pub mod vacation;
 
 use std::sync::{Arc, Mutex};
 
@@ -207,5 +208,35 @@ CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts (full_name);
 -- FTS5 for email search
 CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(
     subject, preview, from_addr, content=emails, content_rowid=rowid
+);
+
+-- email_submissions — JMAP EmailSubmission tracking
+CREATE TABLE IF NOT EXISTS email_submissions (
+    id              TEXT PRIMARY KEY,
+    account_id      INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    email_id        TEXT NOT NULL,
+    identity_id     TEXT,
+    envelope_from   TEXT NOT NULL,
+    envelope_to     TEXT NOT NULL DEFAULT '[]',
+    send_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    undo_status     TEXT NOT NULL DEFAULT 'final',
+    delivery_status TEXT NOT NULL DEFAULT '{}',
+    queue_id        INTEGER,
+    created_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_submissions_account ON email_submissions (account_id);
+
+-- vacation_responses — JMAP VacationResponse (RFC 8621 §8)
+CREATE TABLE IF NOT EXISTS vacation_responses (
+    id              TEXT PRIMARY KEY DEFAULT 'singleton',
+    account_id      INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    is_enabled      INTEGER NOT NULL DEFAULT 0,
+    from_date       TEXT,
+    to_date         TEXT,
+    subject         TEXT,
+    text_body       TEXT,
+    html_body       TEXT,
+    UNIQUE(account_id)
 );
 "#;
