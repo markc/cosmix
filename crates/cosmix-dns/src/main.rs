@@ -1,4 +1,4 @@
-//! cosmix-dns-ui — Dioxus management UI for the Hickory DNS server.
+//! cosmix-dns — Authoritative DNS server with zone management UI.
 //!
 //! Provides a desktop interface for:
 //! - Viewing and editing zone files
@@ -15,15 +15,7 @@ use hickory_proto::rr::Name;
 use hickory_proto::serialize::txt::Parser;
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("cosmix_dns_ui=info".parse().unwrap()),
-        )
-        .init();
-
-    #[cfg(target_os = "linux")]
-    std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+    cosmix_ui::desktop::init_linux_env();
 
     #[cfg(feature = "desktop")]
     {
@@ -337,7 +329,7 @@ fn app() -> Element {
                     }
 
                     match &*view.read() {
-                        View::ZoneRecords(ref f) => {
+                        View::ZoneRecords(f) => {
                             let f = f.clone();
                             rsx! {
                                 button {
@@ -347,7 +339,7 @@ fn app() -> Element {
                                 }
                             }
                         }
-                        View::ZoneEdit(ref f) => {
+                        View::ZoneEdit(f) => {
                             let f = f.clone();
                             let f2 = f.clone();
                             rsx! {
@@ -467,16 +459,16 @@ fn type_color(rtype: &str) -> &'static str {
     }
 }
 
-// ── Theme (inline since this is a separate workspace from cosmix-ui) ──
+// ── Theme ──
 
-const BG_BASE: &str = "#0d1117";
-const BG_SURFACE: &str = "#161b22";
-const BG_ELEVATED: &str = "#1c2128";
-const BORDER: &str = "#30363d";
-const TEXT_PRIMARY: &str = "#e6edf3";
-const TEXT_SECONDARY: &str = "#c9d1d9";
-const TEXT_MUTED: &str = "#8b949e";
-const TEXT_DIM: &str = "#6e7681";
+const BG_BASE: &str = cosmix_ui::theme::BG_BASE;
+const BG_SURFACE: &str = cosmix_ui::theme::BG_SURFACE;
+const BG_ELEVATED: &str = cosmix_ui::theme::BG_ELEVATED;
+const BORDER: &str = cosmix_ui::theme::BORDER_DEFAULT;
+const TEXT_PRIMARY: &str = cosmix_ui::theme::TEXT_PRIMARY;
+const TEXT_SECONDARY: &str = cosmix_ui::theme::TEXT_SECONDARY;
+const TEXT_MUTED: &str = cosmix_ui::theme::TEXT_MUTED;
+const TEXT_DIM: &str = cosmix_ui::theme::TEXT_DIM;
 
 const CSS: &str = r#"
 html, body, #main {

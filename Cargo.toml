@@ -16,13 +16,7 @@ members = [
     "crates/cosmix-edit",
     "crates/cosmix-wg",
     "crates/cosmix-backup",
-    "crates/cosmix-dns/bin",
-    "crates/cosmix-dns/util",
-    "crates/cosmix-dns/crates/net",
-    "crates/cosmix-dns/crates/proto",
-    "crates/cosmix-dns/crates/resolver",
-    "crates/cosmix-dns/crates/server",
-    "crates/cosmix-dns/ui",
+    "crates/cosmix-dns",
 ]
 
 [workspace.package]
