@@ -14,6 +14,8 @@ members = [
     "crates/cosmix-files",
     "crates/cosmix-mon",
     "crates/cosmix-edit",
+    "crates/cosmix-wg",
+    "crates/cosmix-backup",
 ]
 
 [workspace.package]
