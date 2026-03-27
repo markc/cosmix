@@ -20,6 +20,9 @@ members = [
     "crates/cosmix-wg",
     "crates/cosmix-backup",
     "crates/cosmix-dns",
+    "crates/cosmix-config",
+    "crates/cosmix-configd",
+    "crates/cosmix-settings",
 ]
 
 [workspace.package]
@@ -55,3 +58,4 @@ directories = "6"
 toml_cfg = { package = "toml", version = "0.8" }
 spamlite = { path = "../spamlite" }
 rusqlite = { version = "0.38", features = ["bundled"] }
+notify = { version = "7", default-features = false, features = ["macos_fsevent"] }

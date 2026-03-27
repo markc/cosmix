@@ -2,22 +2,30 @@ use std::sync::Arc;
 
 use dioxus::prelude::*;
 use serde::Serialize;
+use cosmix_ui::menu::{menubar, standard_file_menu, MenuBar};
+
+// ── Global font size (loaded from config, refreshed every 30s) ──
+
+static FONT_SIZE: GlobalSignal<u16> = Signal::global(|| {
+    cosmix_config::store::load()
+        .map(|s| s.global.font_size)
+        .unwrap_or(14)
+});
 
 fn main() {
     cosmix_ui::desktop::init_linux_env();
 
     #[cfg(feature = "desktop")]
     {
-        use dioxus_desktop::{Config, LogicalSize, WindowBuilder};
+        use dioxus_desktop::{muda::Menu, Config, LogicalSize, WindowBuilder};
 
-        let menu = build_menu();
         let cfg = Config::new()
             .with_window(
                 WindowBuilder::new()
                     .with_title("cosmix-files")
                     .with_inner_size(LogicalSize::new(900.0, 640.0)),
             )
-            .with_menu(menu);
+            .with_menu(Menu::new());
 
         LaunchBuilder::new().with_cfg(cfg).launch(app);
         return;
@@ -28,19 +36,6 @@ fn main() {
         eprintln!("Desktop feature not enabled");
         std::process::exit(1);
     }
-}
-
-#[cfg(feature = "desktop")]
-fn build_menu() -> dioxus_desktop::muda::Menu {
-    use dioxus_desktop::muda::*;
-
-    let menu = Menu::new();
-    let file_menu = Submenu::new("&File", true);
-    file_menu
-        .append(&MenuItem::with_id("quit", "&Quit\tCtrl+Q", true, None))
-        .ok();
-    menu.append(&file_menu).ok();
-    menu
 }
 
 // ── Data ──
@@ -214,14 +209,22 @@ fn app() -> Element {
         });
     });
 
-    #[cfg(feature = "desktop")]
-    {
-        dioxus_desktop::use_muda_event_handler(move |event| {
-            if event.id().0.as_str() == "quit" {
-                std::process::exit(0);
+    // Poll config every 30s for font size changes
+    use_effect(move || {
+        spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if let Ok(settings) = cosmix_config::store::load() {
+                    let new_fs = settings.global.font_size;
+                    if new_fs != *FONT_SIZE.read() {
+                        *FONT_SIZE.write() = new_fs;
+                    }
+                }
             }
         });
-    }
+    });
+
+    let app_menu = menubar(vec![standard_file_menu(vec![])]);
 
     let mut navigate = move |path: String| {
         selected.set(None);
@@ -239,6 +242,9 @@ fn app() -> Element {
             }
         }
     };
+
+    let fs = *FONT_SIZE.read();
+    let fs_sm = fs.saturating_sub(2);
 
     // Build breadcrumb segments from current path
     let dir = current_dir();
@@ -263,7 +269,15 @@ fn app() -> Element {
         div {
             tabindex: "0",
             onkeydown: onkeydown,
-            style: "outline:none; width:100%; height:100vh; display:flex; flex-direction:column; background:{BG_BASE}; color:{TEXT_PRIMARY}; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif; font-size:13px;",
+            style: "outline:none; width:100%; height:100vh; display:flex; flex-direction:column; background:{BG_BASE}; color:{TEXT_PRIMARY}; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif; font-size:{fs}px;",
+
+            MenuBar {
+                menu: app_menu,
+                on_action: move |id: String| match id.as_str() {
+                    "quit" => std::process::exit(0),
+                    _ => {}
+                },
+            }
 
             // Breadcrumb bar
             div {
@@ -292,7 +306,7 @@ fn app() -> Element {
 
                 // Header row
                 div {
-                    style: "display:flex; align-items:center; padding:6px 12px; background:{BG_ELEVATED}; border-bottom:1px solid {BORDER}; color:{TEXT_DIM}; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em;",
+                    style: "display:flex; align-items:center; padding:6px 12px; background:{BG_ELEVATED}; border-bottom:1px solid {BORDER}; color:{TEXT_DIM}; font-size:{fs_sm}px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em;",
                     span { style: "flex:1; min-width:0;", "Name" }
                     span { style: "width:80px; text-align:right; margin-right:16px;", "Size" }
                     span { style: "width:130px;", "Modified" }
@@ -353,8 +367,8 @@ fn app() -> Element {
                                     dangerous_inner_html: "{icon}"
                                 }
                                 span { style: "flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; color:{name_color};", "{name}" }
-                                span { style: "width:80px; text-align:right; margin-right:16px; color:{TEXT_DIM}; font-size:12px;", "{size_str}" }
-                                span { style: "width:130px; color:{TEXT_DIM}; font-size:12px;", "{modified}" }
+                                span { style: "width:80px; text-align:right; margin-right:16px; color:{TEXT_DIM}; font-size:{fs_sm}px;", "{size_str}" }
+                                span { style: "width:130px; color:{TEXT_DIM}; font-size:{fs_sm}px;", "{modified}" }
                             }
                         }
                     }
@@ -363,7 +377,7 @@ fn app() -> Element {
 
             // Status bar
             div {
-                style: "padding:4px 12px; background:{BG_SURFACE}; border-top:1px solid {BORDER}; color:{TEXT_DIM}; font-size:11px; flex-shrink:0;",
+                style: "padding:4px 12px; background:{BG_SURFACE}; border-top:1px solid {BORDER}; color:{TEXT_DIM}; font-size:{fs_sm}px; flex-shrink:0;",
                 "{entries().len()} items"
             }
         }

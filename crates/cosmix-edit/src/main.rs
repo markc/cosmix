@@ -11,22 +11,30 @@
 use std::sync::Arc;
 
 use dioxus::prelude::*;
+use cosmix_ui::menu::{action_shortcut, menubar, standard_file_menu, separator, submenu, MenuBar, Shortcut};
+
+// ── Global font size (loaded from config, updated via hub config.changed) ──
+
+static FONT_SIZE: GlobalSignal<u16> = Signal::global(|| {
+    cosmix_config::store::load()
+        .map(|s| s.global.font_size)
+        .unwrap_or(14)
+});
 
 fn main() {
     cosmix_ui::desktop::init_linux_env();
 
     #[cfg(feature = "desktop")]
     {
-        use dioxus_desktop::{Config, LogicalSize, WindowBuilder};
+        use dioxus_desktop::{muda::Menu, Config, LogicalSize, WindowBuilder};
 
-        let menu = build_menu();
         let cfg = Config::new()
             .with_window(
                 WindowBuilder::new()
                     .with_title("cosmix-edit")
                     .with_inner_size(LogicalSize::new(800.0, 600.0)),
             )
-            .with_menu(menu);
+            .with_menu(Menu::new());
 
         LaunchBuilder::new().with_cfg(cfg).launch(app);
         return;
@@ -37,21 +45,6 @@ fn main() {
         eprintln!("Desktop feature not enabled");
         std::process::exit(1);
     }
-}
-
-#[cfg(feature = "desktop")]
-fn build_menu() -> dioxus_desktop::muda::Menu {
-    use dioxus_desktop::muda::*;
-
-    let menu = Menu::new();
-    let file_menu = Submenu::new("&File", true);
-    file_menu.append(&MenuItem::with_id("open", "&Open\tCtrl+O", true, None)).ok();
-    file_menu.append(&MenuItem::with_id("save", "&Save\tCtrl+S", true, None)).ok();
-    file_menu.append(&MenuItem::with_id("save-as", "Save &As\tCtrl+Shift+S", true, None)).ok();
-    file_menu.append(&PredefinedMenuItem::separator()).ok();
-    file_menu.append(&MenuItem::with_id("quit", "&Quit\tCtrl+Q", true, None)).ok();
-    menu.append(&file_menu).ok();
-    menu
 }
 
 // ── Shared state for hub commands to update the editor ──
@@ -68,6 +61,13 @@ struct OpenRequest {
 // ── Hub command handling ──
 
 async fn handle_hub_commands(client: Arc<cosmix_client::HubClient>) {
+    // Register for config change notifications
+    let _ = client.call(
+        "configd",
+        "config.watch",
+        serde_json::json!({ "watcher": "edit" }),
+    ).await;
+
     let mut rx = match client.incoming_async().await {
         Some(rx) => rx,
         None => return,
@@ -79,6 +79,12 @@ async fn handle_hub_commands(client: Arc<cosmix_client::HubClient>) {
             "edit.goto" => handle_edit_goto(&cmd),
             "edit.compose" => handle_edit_compose(&cmd),
             "edit.get" => Ok(r#"{"status": "ok"}"#.to_string()),
+            "config.changed" => {
+                if let Ok(settings) = cosmix_config::store::load() {
+                    *FONT_SIZE.write() = settings.global.font_size;
+                }
+                Ok(r#"{"status": "ok"}"#.to_string())
+            }
             _ => Err(format!("unknown command: {}", cmd.command)),
         };
 
@@ -165,6 +171,7 @@ fn app() -> Element {
     let mut modified = use_signal(|| false);
     let mut status_msg = use_signal(String::new);
     let mut line_count = use_signal(|| 1usize);
+    let mut hub_client: Signal<Option<Arc<cosmix_client::HubClient>>> = use_signal(|| None);
 
     // Connect to hub
     use_effect(move || {
@@ -173,6 +180,7 @@ fn app() -> Element {
                 Ok(client) => {
                     let client = Arc::new(client);
                     tracing::info!("connected to cosmix-hub as 'edit'");
+                    hub_client.set(Some(client.clone()));
                     tokio::spawn(handle_hub_commands(client));
                 }
                 Err(_) => {
@@ -266,33 +274,36 @@ fn app() -> Element {
         });
     };
 
-    // Menu event handler
-    #[cfg(feature = "desktop")]
-    {
-        let do_open_menu = do_open.clone();
-        let mut do_save_menu = do_save.clone();
-        let do_save_as_menu = do_save_as.clone();
-        dioxus_desktop::use_muda_event_handler(move |event| {
-            match event.id().0.as_str() {
-                "open" => do_open_menu(),
-                "save" => do_save_menu(),
-                "save-as" => do_save_as_menu(),
-                "quit" => std::process::exit(0),
-                _ => {}
-            }
-        });
-    }
+    // Menu definition
+    let app_menu = menubar(vec![
+        standard_file_menu(vec![
+            action_shortcut("open", "Open...", Shortcut::ctrl('o')),
+            action_shortcut("save", "Save", Shortcut::ctrl('s')),
+            action_shortcut("save-as", "Save As...", Shortcut::ctrl_shift('s')),
+            separator(),
+        ]),
+        submenu("View", vec![
+            action_shortcut("preview", "Preview in Viewer", Shortcut::ctrl('p')),
+        ]),
+    ]);
 
-    // Keyboard shortcuts
-    let onkeydown = move |e: KeyboardEvent| {
-        if e.modifiers().ctrl() {
-            if let Key::Character(ref c) = e.key() {
-                match c.as_str() {
-                    "s" if e.modifiers().shift() => do_save_as(),
-                    "s" => do_save(),
-                    "o" => do_open(),
-                    "q" => std::process::exit(0),
-                    _ => {}
+    let mut do_save_action = do_save.clone();
+    let do_save_as_action = do_save_as.clone();
+    let do_open_action = do_open.clone();
+
+    // Keyboard shortcuts (handles same actions as menu)
+    let onkeydown = {
+        use dioxus::prelude::ModifiersInteraction;
+        move |e: KeyboardEvent| {
+            if e.modifiers().ctrl() {
+                if let Key::Character(ref c) = e.key() {
+                    match c.as_str() {
+                        "s" if e.modifiers().shift() => do_save_as(),
+                        "s" => do_save(),
+                        "o" => do_open(),
+                        "q" => std::process::exit(0),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -310,20 +321,52 @@ fn app() -> Element {
         .unwrap_or_else(|| format!("untitled{title_suffix}"));
 
     let lines = line_count();
+    let fs = *FONT_SIZE.read();
+    let fs_sm = fs.saturating_sub(2);
 
     rsx! {
         document::Style { "{CSS}" }
         div {
             tabindex: "0",
             onkeydown: onkeydown,
-            style: "outline:none; width:100%; height:100vh; display:flex; flex-direction:column; background:{BG_BASE}; color:{TEXT_PRIMARY}; font-family:monospace;",
+            style: "outline:none; width:100%; height:100vh; display:flex; flex-direction:column; background:{BG_BASE}; color:{TEXT_PRIMARY}; font-family:monospace; font-size:{fs}px;",
+
+            // Menu bar
+            MenuBar {
+                menu: app_menu,
+                hub: Some(hub_client),
+                on_action: move |id: String| match id.as_str() {
+                    "open" => do_open_action(),
+                    "save" => do_save_action(),
+                    "save-as" => do_save_as_action(),
+                    "preview" => {
+                        if let Some(ref path) = file_path() {
+                            if let Some(ref client) = hub_client() {
+                                let client = client.clone();
+                                let path = path.clone();
+                                spawn(async move {
+                                    let args = serde_json::json!({ "path": path });
+                                    match client.call("view", "view.open", args).await {
+                                        Ok(_) => tracing::info!("Opened {path} in viewer"),
+                                        Err(e) => tracing::warn!("Preview failed: {e}"),
+                                    }
+                                });
+                            } else {
+                                tracing::warn!("Hub not connected — cannot preview");
+                            }
+                        }
+                    }
+                    "quit" => std::process::exit(0),
+                    _ => {}
+                },
+            }
 
             // Title bar
             div {
-                style: "padding:6px 12px; background:{BG_SURFACE}; border-bottom:1px solid {BORDER}; font-size:13px; display:flex; align-items:center;",
+                style: "padding:3px 12px; background:{BG_SURFACE}; border-bottom:1px solid {BORDER}; font-size:{fs}px; display:flex; align-items:center;",
                 span { style: "font-weight:600; font-family:sans-serif;", "{title}" }
                 if let Some(ref path) = file_path() {
-                    span { style: "margin-left:8px; color:{TEXT_DIM}; font-size:11px; font-family:sans-serif;", "{path}" }
+                    span { style: "margin-left:8px; color:{TEXT_DIM}; font-size:{fs_sm}px; font-family:sans-serif;", "{path}" }
                 }
             }
 
@@ -333,7 +376,7 @@ fn app() -> Element {
 
                 // Line numbers
                 div {
-                    style: "width:48px; background:{BG_SURFACE}; border-right:1px solid {BORDER}; padding:8px 4px; text-align:right; color:{TEXT_DIM}; font-size:13px; line-height:1.5; overflow:hidden; user-select:none;",
+                    style: "width:48px; background:{BG_SURFACE}; border-right:1px solid {BORDER}; padding:8px 4px; text-align:right; color:{TEXT_DIM}; font-size:{fs_sm}px; line-height:1.5; overflow:hidden; user-select:none;",
                     for i in 1..=lines {
                         div { "{i}" }
                     }
@@ -341,7 +384,7 @@ fn app() -> Element {
 
                 // Text area
                 textarea {
-                    style: "flex:1; background:{BG_BASE}; color:{TEXT_PRIMARY}; border:none; outline:none; padding:8px; font-size:13px; font-family:'JetBrains Mono',monospace; line-height:1.5; resize:none; tab-size:4;",
+                    style: "flex:1; background:{BG_BASE}; color:{TEXT_PRIMARY}; border:none; outline:none; padding:8px; font-size:{fs}px; font-family:'JetBrains Mono',monospace; line-height:1.5; resize:none; tab-size:4;",
                     spellcheck: false,
                     value: "{content}",
                     oninput: move |e| {
@@ -355,7 +398,7 @@ fn app() -> Element {
 
             // Status bar
             div {
-                style: "padding:4px 12px; background:{BG_SURFACE}; border-top:1px solid {BORDER}; color:{TEXT_DIM}; font-size:11px; display:flex; gap:16px; font-family:sans-serif;",
+                style: "padding:4px 12px; background:{BG_SURFACE}; border-top:1px solid {BORDER}; color:{TEXT_DIM}; font-size:{fs_sm}px; display:flex; gap:16px; font-family:sans-serif;",
                 span { "{status_msg}" }
                 span { style: "margin-left:auto;", "{lines} lines" }
             }

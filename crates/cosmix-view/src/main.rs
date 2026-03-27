@@ -5,6 +5,15 @@ use dioxus::prelude::*;
 use dioxus::prelude::Key;
 use std::path::PathBuf;
 use std::sync::Arc;
+use cosmix_ui::menu::{action_shortcut, amp_action, menubar, standard_file_menu, submenu, MenuBar, Shortcut};
+
+// ── Global font size (loaded from config, refreshed every 30s) ──
+
+static FONT_SIZE: GlobalSignal<u16> = Signal::global(|| {
+    cosmix_config::store::load()
+        .map(|s| s.global.font_size)
+        .unwrap_or(14)
+});
 
 fn main() {
     let arg = std::env::args().nth(1);
@@ -42,9 +51,8 @@ fn main() {
 
     #[cfg(feature = "desktop")]
     {
-        use dioxus_desktop::{Config, WindowBuilder};
+        use dioxus_desktop::{muda::Menu, Config, WindowBuilder};
 
-        let menu = build_menu();
         let title = path.as_ref()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
@@ -56,7 +64,7 @@ fn main() {
                     .with_title(&title)
                     .with_inner_size(dioxus_desktop::LogicalSize::new(960.0, 800.0)),
             )
-            .with_menu(menu);
+            .with_menu(Menu::new());
 
         // SAFETY: single-threaded at this point, before Dioxus launch
         if let Some(ref p) = path {
@@ -72,21 +80,6 @@ fn main() {
         eprintln!("Desktop feature not enabled");
         std::process::exit(1);
     }
-}
-
-#[cfg(feature = "desktop")]
-fn build_menu() -> dioxus_desktop::muda::Menu {
-    use dioxus_desktop::muda::*;
-
-    let menu = Menu::new();
-
-    let file_menu = Submenu::new("&File", true);
-    file_menu.append(&MenuItem::with_id("open", "&Open...\tCtrl+O", true, None)).ok();
-    file_menu.append(&PredefinedMenuItem::separator()).ok();
-    file_menu.append(&MenuItem::with_id("quit", "&Quit\tCtrl+Q", true, None)).ok();
-
-    menu.append(&file_menu).ok();
-    menu
 }
 
 fn is_image(path: &PathBuf) -> bool {
@@ -122,6 +115,21 @@ fn app() -> Element {
         });
     });
 
+    // Poll config every 30s for font size changes
+    use_effect(move || {
+        spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if let Ok(settings) = cosmix_config::store::load() {
+                    let new_fs = settings.global.font_size;
+                    if new_fs != *FONT_SIZE.read() {
+                        *FONT_SIZE.write() = new_fs;
+                    }
+                }
+            }
+        });
+    });
+
     let open_file = move || {
         spawn(async move {
             let picked = rfd::AsyncFileDialog::new()
@@ -138,17 +146,18 @@ fn app() -> Element {
         });
     };
 
-    #[cfg(feature = "desktop")]
-    {
-        let open_file = open_file.clone();
-        dioxus_desktop::use_muda_event_handler(move |event| {
-            match event.id().0.as_str() {
-                "open" => open_file(),
-                "quit" => std::process::exit(0),
-                _ => {}
-            }
-        });
-    }
+    let app_menu = menubar(vec![
+        standard_file_menu(vec![
+            action_shortcut("open", "Open...", Shortcut::ctrl('o')),
+        ]),
+        submenu("Edit", vec![
+            action_shortcut("open-in-editor", "Open in Editor", Shortcut::ctrl('e')),
+        ]),
+        submenu("Services", vec![
+            amp_action("mon-status", "Monitor Status", "mon", "mon.status"),
+        ]),
+    ]);
+    let open_for_menu = open_file.clone();
 
     let onkeydown = move |e: KeyboardEvent| {
         if e.modifiers().ctrl() {
@@ -174,6 +183,9 @@ fn app() -> Element {
         }
     };
 
+    let fs = *FONT_SIZE.read();
+    let font_css = format!("html, body, .markdown-body {{ font-size: {fs}px; }}");
+
     let content = match file_path() {
         Some(ref path) if is_image(path) => render_image(path),
         Some(ref path) if is_dot(path) => render_dot_file(path),
@@ -182,11 +194,40 @@ fn app() -> Element {
     };
 
     rsx! {
+        document::Style { "{font_css}" }
         div {
             tabindex: "0",
             onkeydown: onkeydown,
-            style: "outline:none; width:100%; height:100%;",
-            {content}
+            style: "outline:none; width:100%; height:100vh; display:flex; flex-direction:column; font-size:{fs}px;",
+            MenuBar {
+                menu: app_menu,
+                hub: Some(hub_client),
+                on_action: move |id: String| match id.as_str() {
+                    "open" => open_for_menu(),
+                    "open-in-editor" => {
+                        if let Some(ref path) = file_path() {
+                            if let Some(ref client) = hub_client() {
+                                let client = client.clone();
+                                let path_str = path.to_string_lossy().to_string();
+                                spawn(async move {
+                                    let args = serde_json::json!({ "path": path_str });
+                                    match client.call("edit", "edit.open", args).await {
+                                        Ok(_) => tracing::info!("Opened {path_str} in editor"),
+                                        Err(e) => tracing::warn!("Open in editor failed: {e}"),
+                                    }
+                                });
+                            } else {
+                                tracing::warn!("Hub not connected — cannot open in editor");
+                            }
+                        }
+                    }
+                    "quit" => std::process::exit(0),
+                    _ => {}
+                },
+            }
+            div { style: "flex:1; overflow:auto;",
+                {content}
+            }
         }
     }
 }
@@ -312,7 +353,6 @@ html, body, #main {
     margin: 0 auto;
     padding: 40px 32px 80px;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-    font-size: 16px;
     line-height: 1.6;
     color: #1f2937;
     word-wrap: break-word;
