@@ -215,37 +215,82 @@ fn app() -> Element {
         });
     });
 
+    // Shared action closures
+    let do_open = move || {
+        spawn(async move {
+            if let Some(path) = cosmix_ui::desktop::pick_file(
+                &[("Text files", &["txt", "md", "rs", "toml", "json", "yaml", "sh", "py", "lua"])],
+            ).await {
+                *OPEN_REQUEST.write() = Some(OpenRequest {
+                    path: Some(path.to_string_lossy().to_string()),
+                    content: None,
+                    line: None,
+                });
+            }
+        });
+    };
+
+    let mut do_save = move || {
+        if let Some(ref path) = file_path() {
+            match save_file(path, &content()) {
+                Ok(()) => {
+                    modified.set(false);
+                    status_msg.set(format!("Saved {path}"));
+                }
+                Err(e) => status_msg.set(format!("Save error: {e}")),
+            }
+        } else {
+            status_msg.set("No file path — use Save As".into());
+        }
+    };
+
+    let do_save_as = move || {
+        spawn(async move {
+            let mut dialog = rfd::AsyncFileDialog::new().set_title("Save As");
+            if let Some(ref path) = file_path() {
+                if let Some(name) = std::path::Path::new(path).file_name() {
+                    dialog = dialog.set_file_name(name.to_string_lossy());
+                }
+            }
+            if let Some(handle) = dialog.save_file().await {
+                let path = handle.path().to_string_lossy().to_string();
+                match save_file(&path, &content()) {
+                    Ok(()) => {
+                        file_path.set(Some(path.clone()));
+                        modified.set(false);
+                        status_msg.set(format!("Saved {path}"));
+                    }
+                    Err(e) => status_msg.set(format!("Save error: {e}")),
+                }
+            }
+        });
+    };
+
+    // Menu event handler
+    #[cfg(feature = "desktop")]
+    {
+        let do_open_menu = do_open.clone();
+        let mut do_save_menu = do_save.clone();
+        let do_save_as_menu = do_save_as.clone();
+        dioxus_desktop::use_muda_event_handler(move |event| {
+            match event.id().0.as_str() {
+                "open" => do_open_menu(),
+                "save" => do_save_menu(),
+                "save-as" => do_save_as_menu(),
+                "quit" => std::process::exit(0),
+                _ => {}
+            }
+        });
+    }
+
     // Keyboard shortcuts
     let onkeydown = move |e: KeyboardEvent| {
         if e.modifiers().ctrl() {
             if let Key::Character(ref c) = e.key() {
                 match c.as_str() {
-                    "s" => {
-                        if let Some(ref path) = file_path() {
-                            match save_file(path, &content()) {
-                                Ok(()) => {
-                                    modified.set(false);
-                                    status_msg.set(format!("Saved {path}"));
-                                }
-                                Err(e) => status_msg.set(format!("Save error: {e}")),
-                            }
-                        } else {
-                            status_msg.set("No file path — use Save As".into());
-                        }
-                    }
-                    "o" => {
-                        spawn(async move {
-                            if let Some(path) = cosmix_ui::desktop::pick_file(
-                                &[("Text files", &["txt", "md", "rs", "toml", "json", "yaml", "sh", "py", "lua"])],
-                            ).await {
-                                *OPEN_REQUEST.write() = Some(OpenRequest {
-                                    path: Some(path.to_string_lossy().to_string()),
-                                    content: None,
-                                    line: None,
-                                });
-                            }
-                        });
-                    }
+                    "s" if e.modifiers().shift() => do_save_as(),
+                    "s" => do_save(),
+                    "o" => do_open(),
                     "q" => std::process::exit(0),
                     _ => {}
                 }
