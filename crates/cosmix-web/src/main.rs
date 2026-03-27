@@ -7,12 +7,15 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::Router;
 use axum::extract::{Path, State};
+use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use clap::{Parser, Subcommand};
+use futures_util::{SinkExt, StreamExt};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::Message as TungMessage;
 use tower_http::services::ServeDir;
 use tracing::info;
 
@@ -47,6 +50,10 @@ enum Command {
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         jmap_upstream: String,
 
+        /// Upstream hub WebSocket URL (proxied at /ws for WASM apps)
+        #[arg(long, default_value = "ws://localhost:4200/ws")]
+        hub_ws: String,
+
         /// TLS certificate file (PEM). Enables HTTPS when set.
         #[arg(long)]
         tls_cert: Option<PathBuf>,
@@ -70,6 +77,7 @@ enum Command {
 struct AppState {
     db: Mutex<Connection>,
     jmap_upstream: String,
+    hub_ws: String,
     http_client: reqwest::Client,
 }
 
@@ -386,6 +394,70 @@ async fn jmap_proxy(
 }
 
 // ---------------------------------------------------------------------------
+// WebSocket proxy to hub (for WASM apps)
+// ---------------------------------------------------------------------------
+
+async fn ws_proxy_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let hub_url = state.hub_ws.clone();
+    ws.on_upgrade(move |browser_ws| ws_proxy(browser_ws, hub_url))
+}
+
+async fn ws_proxy(browser_ws: WebSocket, hub_url: String) {
+    // Connect to the upstream hub
+    let hub_conn = match tokio_tungstenite::connect_async(&hub_url).await {
+        Ok((stream, _)) => stream,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to connect to hub for WS proxy");
+            return;
+        }
+    };
+
+    let (mut browser_sink, mut browser_stream) = browser_ws.split();
+    let (mut hub_sink, mut hub_stream) = hub_conn.split();
+
+    // Browser → Hub
+    let browser_to_hub = async {
+        while let Some(Ok(msg)) = browser_stream.next().await {
+            let tung_msg = match msg {
+                AxumMessage::Text(t) => TungMessage::Text(t.to_string().into()),
+                AxumMessage::Binary(b) => TungMessage::Binary(b.into()),
+                AxumMessage::Close(_) => break,
+                AxumMessage::Ping(p) => TungMessage::Ping(p.into()),
+                AxumMessage::Pong(p) => TungMessage::Pong(p.into()),
+            };
+            if hub_sink.send(tung_msg).await.is_err() {
+                break;
+            }
+        }
+    };
+
+    // Hub → Browser
+    let hub_to_browser = async {
+        while let Some(Ok(msg)) = hub_stream.next().await {
+            let axum_msg = match msg {
+                TungMessage::Text(t) => AxumMessage::Text(t.to_string().into()),
+                TungMessage::Binary(b) => AxumMessage::Binary(b.into()),
+                TungMessage::Close(_) => break,
+                TungMessage::Ping(p) => AxumMessage::Ping(p.into()),
+                TungMessage::Pong(p) => AxumMessage::Pong(p.into()),
+                _ => continue,
+            };
+            if browser_sink.send(axum_msg).await.is_err() {
+                break;
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = browser_to_hub => {}
+        _ = hub_to_browser => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -403,9 +475,13 @@ fn build_router(state: Arc<AppState>, www_dir: PathBuf) -> Router {
         .route("/jmap", axum::routing::any(jmap_proxy))
         .route("/jmap/{*rest}", axum::routing::any(jmap_proxy));
 
+    let ws_proxy = Router::new()
+        .route("/ws", axum::routing::get(ws_proxy_handler));
+
     Router::new()
         .merge(api)
         .merge(jmap)
+        .merge(ws_proxy)
         .fallback_service(ServeDir::new(www_dir))
         .with_state(state)
 }
@@ -455,6 +531,7 @@ async fn main() -> Result<()> {
             www_dir,
             db_path,
             jmap_upstream,
+            hub_ws,
             tls_cert,
             tls_key,
         } => {
@@ -472,6 +549,7 @@ async fn main() -> Result<()> {
             let state = Arc::new(AppState {
                 db: Mutex::new(conn),
                 jmap_upstream,
+                hub_ws,
                 http_client: reqwest::Client::builder()
                     .danger_accept_invalid_certs(true)
                     .build()?,

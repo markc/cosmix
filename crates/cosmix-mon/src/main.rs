@@ -1,19 +1,18 @@
-//! cosmix-mon — System monitor service for the cosmix appmesh.
+//! cosmix-mon — System monitor GUI for the cosmix appmesh.
 //!
-//! Registers as "mon" on the hub. Handles:
-//! - `mon.status` — CPU, memory, disk, network, uptime
-//! - `mon.processes` — top processes by CPU/memory
+//! Pure client: queries cosmix-mond (the headless daemon) via the hub.
+//! Builds as both desktop (native window) and WASM (browser via cosmix-web).
 //!
-//! UI shows local system stats with auto-refresh.
-//! Query remote nodes via mesh: `mon.mko.amp`
+//! Desktop: `cargo build -p cosmix-mon`
+//! WASM:    `cd crates/cosmix-mon && dx build --platform web`
 
 use std::sync::Arc;
 
 use dioxus::prelude::*;
-use serde::{Deserialize, Serialize};
-use sysinfo::System;
+use serde::Deserialize;
 
 fn main() {
+    #[cfg(not(target_arch = "wasm32"))]
     cosmix_ui::desktop::init_linux_env();
 
     #[cfg(feature = "desktop")]
@@ -31,15 +30,12 @@ fn main() {
     }
 
     #[allow(unreachable_code)]
-    {
-        eprintln!("Desktop feature not enabled");
-        std::process::exit(1);
-    }
+    dioxus::launch(app);
 }
 
-// ── System data ──
+// ── Data types (deserialized from mond responses) ──
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Default)]
 struct SystemStatus {
     hostname: String,
     uptime_secs: u64,
@@ -54,84 +50,12 @@ struct SystemStatus {
     load_avg: [f64; 3],
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Default)]
 struct DiskInfo {
     mount: String,
     total_gb: f64,
     used_gb: f64,
     percent: f32,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct ProcessInfo {
-    pid: u32,
-    name: String,
-    cpu: f32,
-    mem_mb: u64,
-}
-
-fn gather_status() -> SystemStatus {
-    let mut sys = System::new_all();
-    sys.refresh_all();
-
-    let cpu_usage = sys.global_cpu_usage();
-    let mem_total = sys.total_memory();
-    let mem_used = sys.used_memory();
-    let swap_total = sys.total_swap();
-    let swap_used = sys.used_swap();
-
-    let disks: Vec<DiskInfo> = sysinfo::Disks::new_with_refreshed_list()
-        .iter()
-        .filter(|d| {
-            let mp = d.mount_point().to_string_lossy();
-            mp == "/" || mp.starts_with("/home") || mp.starts_with("/data")
-        })
-        .map(|d| {
-            let total = d.total_space() as f64 / 1_073_741_824.0;
-            let used = (d.total_space() - d.available_space()) as f64 / 1_073_741_824.0;
-            let pct = if total > 0.0 { (used / total * 100.0) as f32 } else { 0.0 };
-            DiskInfo {
-                mount: d.mount_point().to_string_lossy().to_string(),
-                total_gb: (total * 10.0).round() / 10.0,
-                used_gb: (used * 10.0).round() / 10.0,
-                percent: pct,
-            }
-        })
-        .collect();
-
-    let load = System::load_average();
-
-    SystemStatus {
-        hostname: System::host_name().unwrap_or_else(|| "unknown".into()),
-        uptime_secs: System::uptime(),
-        cpu_count: sys.cpus().len(),
-        cpu_usage,
-        mem_total_mb: mem_total / 1_048_576,
-        mem_used_mb: mem_used / 1_048_576,
-        mem_percent: if mem_total > 0 { (mem_used as f32 / mem_total as f32) * 100.0 } else { 0.0 },
-        swap_total_mb: swap_total / 1_048_576,
-        swap_used_mb: swap_used / 1_048_576,
-        disks,
-        load_avg: [load.one, load.five, load.fifteen],
-    }
-}
-
-fn gather_processes(limit: usize) -> Vec<ProcessInfo> {
-    let mut sys = System::new_all();
-    sys.refresh_all();
-
-    let mut procs: Vec<ProcessInfo> = sys.processes().values().map(|p| {
-        ProcessInfo {
-            pid: p.pid().as_u32(),
-            name: p.name().to_string_lossy().to_string(),
-            cpu: p.cpu_usage(),
-            mem_mb: p.memory() / 1_048_576,
-        }
-    }).collect();
-
-    procs.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
-    procs.truncate(limit);
-    procs
 }
 
 fn format_uptime(secs: u64) -> String {
@@ -147,75 +71,70 @@ fn format_uptime(secs: u64) -> String {
     }
 }
 
-// ── Hub command handling ──
-
-async fn handle_hub_commands(client: Arc<cosmix_client::HubClient>) {
-    let mut rx = match client.incoming_async().await {
-        Some(rx) => rx,
-        None => return,
-    };
-
-    while let Some(cmd) = rx.recv().await {
-        let result = match cmd.command.as_str() {
-            "mon.status" => {
-                let status = gather_status();
-                serde_json::to_string(&status).map_err(|e| e.to_string())
-            }
-            "mon.processes" => {
-                let limit = cmd.args.get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(15) as usize;
-                let procs = gather_processes(limit);
-                serde_json::to_string(&procs).map_err(|e| e.to_string())
-            }
-            _ => Err(format!("unknown command: {}", cmd.command)),
-        };
-
-        match result {
-            Ok(body) => {
-                if let Err(e) = client.respond(&cmd, 0, &body).await {
-                    tracing::warn!("failed to send response: {e}");
-                }
-            }
-            Err(msg) => {
-                let err_body = serde_json::json!({"error": msg}).to_string();
-                if let Err(e) = client.respond(&cmd, 10, &err_body).await {
-                    tracing::warn!("failed to send error response: {e}");
-                }
-            }
-        }
-    }
-}
-
 // ── UI ──
 
 fn app() -> Element {
-    let mut status = use_signal(gather_status);
+    let mut status: Signal<Option<SystemStatus>> = use_signal(|| None);
     let mut remote_status: Signal<Option<SystemStatus>> = use_signal(|| None);
     let mut remote_node = use_signal(|| String::new());
     let mut hub_client: Signal<Option<Arc<cosmix_client::HubClient>>> = use_signal(|| None);
+    let mut error_msg: Signal<Option<String>> = use_signal(|| None);
 
-    // Connect to hub + auto-refresh every 5 seconds
+    // Connect to hub + periodic refresh
     use_effect(move || {
         spawn(async move {
-            match cosmix_client::HubClient::connect_default("mon").await {
-                Ok(client) => {
-                    let client = Arc::new(client);
-                    hub_client.set(Some(client.clone()));
-                    tracing::info!("connected to cosmix-hub as 'mon'");
-                    tokio::spawn(handle_hub_commands(client));
+            // Connect anonymously (we don't register, just query)
+            let client = {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    cosmix_client::HubClient::connect_anonymous_default().await
                 }
-                Err(_) => {
-                    tracing::debug!("hub not available, running standalone");
+                #[cfg(target_arch = "wasm32")]
+                {
+                    cosmix_client::HubClient::connect_anonymous_default()
+                }
+            };
+
+            match client {
+                Ok(c) => {
+                    let client = Arc::new(c);
+                    hub_client.set(Some(client.clone()));
+                    error_msg.set(None);
+
+                    // Initial fetch
+                    if let Ok(val) = client.call("mon", "mon.status", serde_json::Value::Null).await {
+                        if let Ok(s) = serde_json::from_value::<SystemStatus>(val) {
+                            status.set(Some(s));
+                        }
+                    }
+                }
+                Err(e) => {
+                    error_msg.set(Some(format!("Hub: {e}")));
                 }
             }
         });
 
-        // Periodic refresh
+        // Periodic refresh every 5 seconds
         spawn(async move {
             loop {
+                #[cfg(not(target_arch = "wasm32"))]
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                status.set(gather_status());
+                #[cfg(target_arch = "wasm32")]
+                gloo_timers::future::TimeoutFuture::new(5_000).await;
+
+                if let Some(client) = hub_client() {
+                    match client.call("mon", "mon.status", serde_json::Value::Null).await {
+                        Ok(val) => {
+                            if let Ok(s) = serde_json::from_value::<SystemStatus>(val) {
+                                status.set(Some(s));
+                                error_msg.set(None);
+                            }
+                        }
+                        Err(e) => {
+                            error_msg.set(Some(format!("Refresh: {e}")));
+                        }
+                    }
+                }
             }
         });
     });
@@ -243,78 +162,93 @@ fn app() -> Element {
         });
     };
 
-    let s = status();
-
-    rsx! {
-        document::Style { "{CSS}" }
-        div {
-            style: "width:100%; height:100vh; display:flex; flex-direction:column; background:{BG_BASE}; color:{TEXT_PRIMARY}; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif; font-size:13px; overflow-y:auto;",
-
-            // Header
+    // Render
+    match status() {
+        None => rsx! {
+            document::Style { "{CSS}" }
             div {
-                style: "padding:12px 16px; background:{BG_SURFACE}; border-bottom:1px solid {BORDER}; display:flex; align-items:center; gap:12px;",
-                span { style: "font-weight:600; font-size:15px;", "{s.hostname}" }
-                span { style: "color:{TEXT_DIM}; font-size:12px;", "up {format_uptime(s.uptime_secs)}" }
-                span { style: "color:{TEXT_DIM}; font-size:12px;", "load {s.load_avg[0]:.2} {s.load_avg[1]:.2} {s.load_avg[2]:.2}" }
-
-                // Remote query
-                div { style: "margin-left:auto; display:flex; align-items:center; gap:6px;",
-                    input {
-                        style: "background:{BG_ELEVATED}; border:1px solid {BORDER}; color:{TEXT_PRIMARY}; padding:4px 8px; border-radius:4px; width:100px; font-size:12px;",
-                        placeholder: "node name",
-                        value: "{remote_node}",
-                        oninput: move |e| remote_node.set(e.value()),
+                style: "width:100%; height:100vh; display:flex; align-items:center; justify-content:center; background:{BG_BASE}; color:{TEXT_MUTED}; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;",
+                if let Some(err) = error_msg() {
+                    div { style: "text-align:center;",
+                        div { style: "font-size:14px; color:#ef4444; margin-bottom:8px;", "{err}" }
+                        div { style: "font-size:12px;", "Ensure cosmix-hub and cosmix-mond are running" }
                     }
-                    button {
-                        style: "background:{BG_ELEVATED}; border:1px solid {BORDER}; color:{TEXT_MUTED}; padding:4px 10px; border-radius:4px; cursor:pointer; font-size:12px;",
-                        onclick: fetch_remote,
-                        "Query"
-                    }
+                } else {
+                    "Connecting to hub..."
                 }
             }
+        },
+        Some(s) => rsx! {
+            document::Style { "{CSS}" }
+            div {
+                style: "width:100%; height:100vh; display:flex; flex-direction:column; background:{BG_BASE}; color:{TEXT_PRIMARY}; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif; font-size:13px; overflow-y:auto;",
 
-            // Main content
-            div { style: "padding:16px; display:flex; flex-direction:column; gap:16px;",
+                // Header
+                div {
+                    style: "padding:12px 16px; background:{BG_SURFACE}; border-bottom:1px solid {BORDER}; display:flex; align-items:center; gap:12px;",
+                    span { style: "font-weight:600; font-size:15px;", "{s.hostname}" }
+                    span { style: "color:{TEXT_DIM}; font-size:12px;", "up {format_uptime(s.uptime_secs)}" }
+                    span { style: "color:{TEXT_DIM}; font-size:12px;", "load {s.load_avg[0]:.2} {s.load_avg[1]:.2} {s.load_avg[2]:.2}" }
 
-                // CPU + Memory row
-                div { style: "display:flex; gap:16px;",
-                    {stat_card("CPU", &format!("{:.1}%", s.cpu_usage), &format!("{} cores", s.cpu_count), pct_color(s.cpu_usage))}
-                    {stat_card("Memory", &format!("{} / {} MB", s.mem_used_mb, s.mem_total_mb), &format!("{:.1}%", s.mem_percent), pct_color(s.mem_percent))}
-                    if s.swap_total_mb > 0 {
-                        {stat_card("Swap", &format!("{} / {} MB", s.swap_used_mb, s.swap_total_mb), "", TEXT_MUTED)}
+                    // Remote query
+                    div { style: "margin-left:auto; display:flex; align-items:center; gap:6px;",
+                        input {
+                            style: "background:{BG_ELEVATED}; border:1px solid {BORDER}; color:{TEXT_PRIMARY}; padding:4px 8px; border-radius:4px; width:100px; font-size:12px;",
+                            placeholder: "node name",
+                            value: "{remote_node}",
+                            oninput: move |e| remote_node.set(e.value()),
+                        }
+                        button {
+                            style: "background:{BG_ELEVATED}; border:1px solid {BORDER}; color:{TEXT_MUTED}; padding:4px 10px; border-radius:4px; cursor:pointer; font-size:12px;",
+                            onclick: fetch_remote,
+                            "Query"
+                        }
                     }
                 }
 
-                // Disks
-                if !s.disks.is_empty() {
-                    div { style: "background:{BG_SURFACE}; border-radius:6px; padding:12px;",
-                        div { style: "font-weight:600; margin-bottom:8px; color:{TEXT_MUTED};", "Disks" }
-                        for disk in s.disks.iter() {
-                            div { style: "display:flex; align-items:center; gap:12px; margin-bottom:6px;",
-                                span { style: "width:120px; color:{TEXT_SECONDARY}; font-size:12px;", "{disk.mount}" }
-                                div { style: "flex:1; height:8px; background:{BG_ELEVATED}; border-radius:4px; overflow:hidden;",
-                                    div { style: "height:100%; width:{disk.percent}%; background:{pct_color(disk.percent)}; border-radius:4px;" }
-                                }
-                                span { style: "width:120px; text-align:right; color:{TEXT_DIM}; font-size:12px;",
-                                    "{disk.used_gb:.1} / {disk.total_gb:.1} GB"
+                // Main content
+                div { style: "padding:16px; display:flex; flex-direction:column; gap:16px;",
+
+                    // CPU + Memory row
+                    div { style: "display:flex; gap:16px;",
+                        {stat_card("CPU", &format!("{:.1}%", s.cpu_usage), &format!("{} cores", s.cpu_count), pct_color(s.cpu_usage))}
+                        {stat_card("Memory", &format!("{} / {} MB", s.mem_used_mb, s.mem_total_mb), &format!("{:.1}%", s.mem_percent), pct_color(s.mem_percent))}
+                        if s.swap_total_mb > 0 {
+                            {stat_card("Swap", &format!("{} / {} MB", s.swap_used_mb, s.swap_total_mb), "", TEXT_MUTED)}
+                        }
+                    }
+
+                    // Disks
+                    if !s.disks.is_empty() {
+                        div { style: "background:{BG_SURFACE}; border-radius:6px; padding:12px;",
+                            div { style: "font-weight:600; margin-bottom:8px; color:{TEXT_MUTED};", "Disks" }
+                            for disk in s.disks.iter() {
+                                div { style: "display:flex; align-items:center; gap:12px; margin-bottom:6px;",
+                                    span { style: "width:120px; color:{TEXT_SECONDARY}; font-size:12px;", "{disk.mount}" }
+                                    div { style: "flex:1; height:8px; background:{BG_ELEVATED}; border-radius:4px; overflow:hidden;",
+                                        div { style: "height:100%; width:{disk.percent}%; background:{pct_color(disk.percent)}; border-radius:4px;" }
+                                    }
+                                    span { style: "width:120px; text-align:right; color:{TEXT_DIM}; font-size:12px;",
+                                        "{disk.used_gb:.1} / {disk.total_gb:.1} GB"
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                // Remote node status (if queried)
-                if let Some(ref rs) = remote_status() {
-                    div { style: "background:{BG_SURFACE}; border-radius:6px; padding:12px; border:1px solid #2563eb44;",
-                        div { style: "font-weight:600; margin-bottom:8px; color:#60a5fa;", "Remote: {rs.hostname}" }
-                        div { style: "display:flex; gap:16px;",
-                            {stat_card("CPU", &format!("{:.1}%", rs.cpu_usage), &format!("{} cores", rs.cpu_count), pct_color(rs.cpu_usage))}
-                            {stat_card("Memory", &format!("{} / {} MB", rs.mem_used_mb, rs.mem_total_mb), &format!("{:.1}%", rs.mem_percent), pct_color(rs.mem_percent))}
+                    // Remote node status (if queried)
+                    if let Some(ref rs) = remote_status() {
+                        div { style: "background:{BG_SURFACE}; border-radius:6px; padding:12px; border:1px solid #2563eb44;",
+                            div { style: "font-weight:600; margin-bottom:8px; color:#60a5fa;", "Remote: {rs.hostname}" }
+                            div { style: "display:flex; gap:16px;",
+                                {stat_card("CPU", &format!("{:.1}%", rs.cpu_usage), &format!("{} cores", rs.cpu_count), pct_color(rs.cpu_usage))}
+                                {stat_card("Memory", &format!("{} / {} MB", rs.mem_used_mb, rs.mem_total_mb), &format!("{:.1}%", rs.mem_percent), pct_color(rs.mem_percent))}
+                            }
                         }
                     }
                 }
             }
-        }
+        },
     }
 }
 

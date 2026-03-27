@@ -27,3 +27,5 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
+tokio-tungstenite.workspace = true
+futures-util.workspace = true

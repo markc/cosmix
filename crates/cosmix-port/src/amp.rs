@@ -16,7 +16,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use anyhow::Result;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ── AMP Message ──
 
@@ -177,37 +176,46 @@ pub fn parse(raw: &str) -> Result<AmpMessage> {
     })
 }
 
-// ── Transport helpers ──
+// ── Transport helpers (native only) ──
 
-/// Read an AMP message from a Unix stream (reads until EOF).
-///
-/// The sender must shut down their write side to signal EOF.
-pub async fn read_from_stream(stream: &mut tokio::net::UnixStream) -> Result<AmpMessage> {
-    let mut buf = Vec::with_capacity(4096);
+#[cfg(feature = "native")]
+mod transport {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // Read with timeout to prevent hanging on misbehaving clients
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        stream.read_to_end(&mut buf),
-    ).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => anyhow::bail!("Read error: {e}"),
-        Err(_) => anyhow::bail!("AMP read timed out (10s)"),
+    /// Read an AMP message from a Unix stream (reads until EOF).
+    ///
+    /// The sender must shut down their write side to signal EOF.
+    pub async fn read_from_stream(stream: &mut tokio::net::UnixStream) -> Result<AmpMessage> {
+        let mut buf = Vec::with_capacity(4096);
+
+        // Read with timeout to prevent hanging on misbehaving clients
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_end(&mut buf),
+        ).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => anyhow::bail!("Read error: {e}"),
+            Err(_) => anyhow::bail!("AMP read timed out (10s)"),
+        }
+
+        if buf.is_empty() {
+            anyhow::bail!("Empty AMP message (no data received)");
+        }
+
+        let raw = String::from_utf8(buf)?;
+        parse(&raw)
     }
 
-    if buf.is_empty() {
-        anyhow::bail!("Empty AMP message (no data received)");
+    /// Write an AMP message to a Unix stream.
+    pub async fn write_to_stream(stream: &mut tokio::net::UnixStream, msg: &AmpMessage) -> Result<()> {
+        stream.write_all(&msg.to_bytes()).await?;
+        Ok(())
     }
-
-    let raw = String::from_utf8(buf)?;
-    parse(&raw)
 }
 
-/// Write an AMP message to a Unix stream.
-pub async fn write_to_stream(stream: &mut tokio::net::UnixStream, msg: &AmpMessage) -> Result<()> {
-    stream.write_all(&msg.to_bytes()).await?;
-    Ok(())
-}
+#[cfg(feature = "native")]
+pub use transport::{read_from_stream, write_to_stream};
 
 // ── AMP Address ──
 

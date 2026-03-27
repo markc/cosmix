@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "System monitor service for the cosmix appmesh"
+description = "System monitor GUI — queries cosmix-mond via hub, desktop + WASM dual-target"
 
 [[bin]]
 name = "cosmix-mon"
@@ -12,18 +12,24 @@ path = "src/main.rs"
 
 [features]
 default = ["desktop"]
-desktop = ["dioxus/desktop", "dep:dioxus-desktop", "dep:tao"]
+desktop = ["dioxus/desktop", "dep:dioxus-desktop", "dep:tao", "cosmix-ui/desktop"]
+web = ["dioxus/web"]
 
 [dependencies]
 dioxus = { version = "0.7", features = [] }
 dioxus-desktop = { version = "0.7", optional = true }
 tao = { version = "0.34", default-features = false, optional = true }
-cosmix-ui = { path = "../cosmix-ui" }
+cosmix-ui = { path = "../cosmix-ui", default-features = false }
 cosmix-client = { path = "../cosmix-client" }
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
 anyhow.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-sysinfo = "0.35"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+gloo-timers = { version = "0.3", features = ["futures"] }

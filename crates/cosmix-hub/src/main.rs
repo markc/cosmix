@@ -46,9 +46,14 @@ struct Cli {
 /// Maps service name → sender for that service's WebSocket.
 type Registry = Arc<RwLock<HashMap<String, mpsc::UnboundedSender<String>>>>;
 
+/// Maps message id → sender for the caller who is waiting for a response.
+/// Used to route responses back to the originating connection (e.g. mesh bridge).
+type PendingResponses = Arc<RwLock<HashMap<String, mpsc::UnboundedSender<String>>>>;
+
 #[derive(Clone)]
 struct AppState {
     registry: Registry,
+    pending_responses: PendingResponses,
     mesh: Arc<MeshPeers>,
     node_name: String,
 }
@@ -106,8 +111,11 @@ async fn main() -> Result<()> {
         }
     });
 
+    let pending_responses: PendingResponses = Arc::new(RwLock::new(HashMap::new()));
+
     let state = AppState {
         registry,
+        pending_responses,
         mesh,
         node_name: cli.node.clone(),
     };
@@ -172,6 +180,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             }
         };
 
+        // Check if this is a response to a pending request (e.g. from mesh bridge)
+        if amp_msg.message_type() == Some("response") {
+            if let Some(id) = amp_msg.get("id") {
+                let pending = state.pending_responses.read().await;
+                if let Some(caller_tx) = pending.get(id) {
+                    let _ = caller_tx.send(text.clone());
+                    drop(pending);
+                    state.pending_responses.write().await.remove(id);
+                    continue;
+                }
+            }
+        }
+
         // Check if message is addressed to the hub itself
         let target = amp_msg.to_addr().unwrap_or("hub");
         if target == "hub" {
@@ -211,12 +232,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
             // Local node — extract the service name from the AMP address
             let local_service = amp_addr.app.as_deref().unwrap_or(target);
-            route_local(&state.registry, local_service, &text, &tx).await;
+            if local_service == "hub" {
+                handle_hub_command(&amp_msg, &tx, &state, &mut service_name).await;
+            } else {
+                route_local(&state.registry, &state.pending_responses, local_service, &text, &amp_msg, &tx).await;
+            }
             continue;
         }
 
         // Plain service name — route locally
-        route_local(&state.registry, target, &text, &tx).await;
+        route_local(&state.registry, &state.pending_responses, target, &text, &amp_msg, &tx).await;
     }
 
     // Cleanup: remove service from registry on disconnect
@@ -229,17 +254,29 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 }
 
 /// Route a message to a local service by name.
+///
+/// If the message has an `id` header, registers a pending response so the
+/// reply routes back to the caller (important for mesh-bridged requests).
 async fn route_local(
     registry: &Registry,
+    pending_responses: &PendingResponses,
     service: &str,
     raw: &str,
+    msg: &AmpMessage,
     caller_tx: &mpsc::UnboundedSender<String>,
 ) {
     let reg = registry.read().await;
     if let Some(target_tx) = reg.get(service) {
+        // Track pending response so reply routes back to caller
+        if let Some(id) = msg.get("id") {
+            pending_responses.write().await.insert(id.to_string(), caller_tx.clone());
+        }
         if target_tx.send(raw.to_string()).is_err() {
             drop(reg);
             registry.write().await.remove(service);
+            if let Some(id) = msg.get("id") {
+                pending_responses.write().await.remove(id);
+            }
             let err = AmpMessage::new()
                 .with_header("rc", "10")
                 .with_header("error", &format!("Service '{service}' disconnected"));

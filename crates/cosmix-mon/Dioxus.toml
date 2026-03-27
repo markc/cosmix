@@ -1,0 +1,13 @@
+[application]
+name = "cosmix-mon"
+default_platform = "desktop"
+
+[desktop]
+enable_default_menu_bar = false
+
+[web.app]
+title = "cosmix-mon"
+
+[web.watcher]
+reload_html = true
+watch_path = ["src"]

@@ -1,0 +1,23 @@
+[package]
+name = "cosmix-mond"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless system monitor daemon — registers on hub, serves mon.status/mon.processes via AMP"
+
+[[bin]]
+name = "cosmix-mond"
+path = "src/main.rs"
+
+[dependencies]
+cosmix-client = { path = "../cosmix-client" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+mimalloc.workspace = true
+sysinfo = "0.35"
