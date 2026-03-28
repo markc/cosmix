@@ -75,17 +75,7 @@ enum QueueAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Install rustls crypto provider before any TLS usage
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("Failed to install rustls crypto provider");
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("cosmix_jmap=info".parse()?)
-        )
-        .init();
+    cosmix_daemon::init_tracing("cosmix_maild");
 
     let cli = Cli::parse();
 
@@ -212,19 +202,7 @@ async fn main() -> Result<()> {
 
             // Use TLS if cert/key configured
             if let (Some(cert_path), Some(key_path)) = (&cfg.tls_cert, &cfg.tls_key) {
-                let cert_data = std::fs::read(cert_path)?;
-                let key_data = std::fs::read(key_path)?;
-                let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_data[..])
-                    .filter_map(|r| r.ok())
-                    .collect();
-                let key = rustls_pemfile::private_key(&mut &key_data[..])
-                    .ok()
-                    .flatten()
-                    .ok_or_else(|| anyhow::anyhow!("No private key found in {key_path}"))?;
-                let tls_config = rustls::ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_single_cert(certs, key)?;
-                let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+                let tls_acceptor = cosmix_daemon::load_tls_config(cert_path, key_path)?;
 
                 tracing::info!("JMAP HTTPS enabled");
                 loop {

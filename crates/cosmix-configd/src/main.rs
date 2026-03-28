@@ -234,12 +234,7 @@ async fn watch_config_file(state: Arc<AppState>) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "cosmix_configd=info".into()),
-        )
-        .init();
+    cosmix_daemon::init_tracing("cosmix_configd");
 
     let cli = Cli::parse();
 

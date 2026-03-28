@@ -172,12 +172,7 @@ async fn handle_hub_commands(client: Arc<cosmix_client::HubClient>) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "cosmix_mond=info".into()),
-        )
-        .init();
+    cosmix_daemon::init_tracing("cosmix_mond");
 
     let cli = Cli::parse();
 

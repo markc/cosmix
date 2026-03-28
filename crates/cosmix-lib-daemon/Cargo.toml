@@ -1,0 +1,26 @@
+[package]
+name = "cosmix-lib-daemon"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared infrastructure for cosmix daemon services"
+
+[lib]
+name = "cosmix_daemon"
+path = "src/lib.rs"
+
+[features]
+default = []
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+
+# TLS (optional)
+rustls = { version = "0.23", features = ["ring"], optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }

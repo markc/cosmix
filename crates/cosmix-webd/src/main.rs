@@ -510,12 +510,7 @@ impl QueryRowOptional for Result<Post, rusqlite::Error> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    cosmix_daemon::init_tracing("cosmix_webd");
 
     let cli = Cli::parse();
 
@@ -559,19 +554,10 @@ async fn main() -> Result<()> {
             let listener = tokio::net::TcpListener::bind(&listen).await?;
 
             if let (Some(cert_path), Some(key_path)) = (&tls_cert, &tls_key) {
-                let cert_data = std::fs::read(cert_path)?;
-                let key_data = std::fs::read(key_path)?;
-                let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_data[..])
-                    .filter_map(|r| r.ok())
-                    .collect();
-                let key = rustls_pemfile::private_key(&mut &key_data[..])
-                    .ok()
-                    .flatten()
-                    .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
-                let tls_config = rustls::ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_single_cert(certs, key)?;
-                let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+                let tls_acceptor = cosmix_daemon::load_tls_config(
+                    &cert_path.to_string_lossy(),
+                    &key_path.to_string_lossy(),
+                )?;
 
                 info!("cosmix-web listening on {listen} (HTTPS)");
                 loop {

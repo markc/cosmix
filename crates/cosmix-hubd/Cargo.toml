@@ -11,6 +11,7 @@ name = "cosmix-hubd"
 path = "src/main.rs"
 
 [dependencies]
+cosmix_daemon = { package = "cosmix-lib-daemon", path = "../cosmix-lib-daemon" }
 cosmix_amp = { package = "cosmix-lib-amp", path = "../cosmix-lib-amp" }
 cosmix_mesh = { package = "cosmix-lib-mesh", path = "../cosmix-lib-mesh" }
 tokio.workspace = true
@@ -18,7 +19,6 @@ axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 anyhow.workspace = true
 mimalloc = { workspace = true }
 futures-util.workspace = true
