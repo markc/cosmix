@@ -24,7 +24,7 @@ const MENU_CSS: &str = r#"
 .cmx-menu-trigger {
     padding: 2px 10px;
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--font-size-sm, 12px);
     color: var(--fg-secondary, #e5e7eb);
     border-radius: 3px;
     height: 22px;
@@ -48,7 +48,7 @@ const MENU_CSS: &str = r#"
 .cmx-menu-item {
     padding: 4px 32px 4px 12px;
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--font-size-sm, 12px);
     color: var(--fg-primary, #f3f4f6);
     display: flex;
     justify-content: space-between;
@@ -66,7 +66,7 @@ const MENU_CSS: &str = r#"
 }
 .cmx-shortcut {
     color: var(--fg-muted, #6b7280);
-    font-size: 11px;
+    font-size: calc(var(--font-size-sm, 12px) - 1px);
     flex-shrink: 0;
 }
 .cmx-sep {

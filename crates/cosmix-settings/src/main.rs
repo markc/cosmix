@@ -316,33 +316,6 @@ fn theme_presets(settings: Signal<cosmix_config::CosmixSettings>, dirty: Signal<
                 }
             }
 
-            // Dark/Light toggle
-            div {
-                style: "margin-top:12px;display:flex;align-items:center;gap:8px;",
-                span { style: "font-size:13px;color:var(--fg-secondary);", "Dark mode" }
-                input {
-                    r#type: "checkbox",
-                    checked: settings().global.theme_dark,
-                    style: "width:18px;height:18px;accent-color:var(--accent);",
-                    onchange: move |e: Event<FormData>| {
-                        let is_dark = e.value() == "true";
-                        let ok = cosmix_config::store::set_value(
-                            &mut settings.write(),
-                            "global.theme_dark",
-                            serde_json::json!(is_dark),
-                        ).is_ok();
-                        if ok {
-                            dirty.set(true);
-                            let s = settings();
-                            *THEME.write() = ThemeParams {
-                                hue: s.global.theme_hue,
-                                dark: s.global.theme_dark,
-                                font_size: s.global.font_size,
-                            };
-                        }
-                    },
-                }
-            }
         }
     }
 }
@@ -363,8 +336,17 @@ fn field_input(
                     style: "width:18px;height:18px;accent-color:var(--accent);",
                     onchange: move |e: Event<FormData>| {
                         let new_val = serde_json::Value::Bool(e.value() == "true");
-                        if let Ok(()) = cosmix_config::store::set_value(&mut settings.write(), &dotpath, new_val) {
+                        let ok = cosmix_config::store::set_value(&mut settings.write(), &dotpath, new_val).is_ok();
+                        if ok {
                             dirty.set(true);
+                            if dotpath.starts_with("global.theme_") {
+                                let s = settings();
+                                *THEME.write() = ThemeParams {
+                                    hue: s.global.theme_hue,
+                                    dark: s.global.theme_dark,
+                                    font_size: s.global.font_size,
+                                };
+                            }
                         }
                     },
                 }
@@ -423,8 +405,17 @@ fn field_input(
                                 } else {
                                     return;
                                 };
-                                if let Ok(()) = cosmix_config::store::set_value(&mut settings.write(), &dotpath, new_val) {
+                                let ok = cosmix_config::store::set_value(&mut settings.write(), &dotpath, new_val).is_ok();
+                                if ok {
                                     dirty.set(true);
+                                    if dotpath == "global.font_size" {
+                                        let s = settings();
+                                        *THEME.write() = ThemeParams {
+                                            hue: s.global.theme_hue,
+                                            dark: s.global.theme_dark,
+                                            font_size: s.global.font_size,
+                                        };
+                                    }
                                 }
                             }
                         },
