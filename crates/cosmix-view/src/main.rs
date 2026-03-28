@@ -6,13 +6,18 @@ use dioxus::prelude::Key;
 use std::path::PathBuf;
 use std::sync::Arc;
 use cosmix_ui::menu::{action_shortcut, amp_action, menubar, standard_file_menu, submenu, MenuBar, Shortcut};
+use cosmix_ui::theme::{ThemeParams, generate_css};
 
-// ── Global font size (loaded from config, refreshed every 30s) ──
+// ── Theme params (loaded from config, refreshed every 30s) ──
 
-static FONT_SIZE: GlobalSignal<u16> = Signal::global(|| {
+static THEME: GlobalSignal<ThemeParams> = Signal::global(|| {
     cosmix_config::store::load()
-        .map(|s| s.global.font_size)
-        .unwrap_or(14)
+        .map(|s| ThemeParams {
+            hue: s.global.theme_hue,
+            dark: s.global.theme_dark,
+            font_size: s.global.font_size,
+        })
+        .unwrap_or_default()
 });
 
 fn main() {
@@ -51,20 +56,12 @@ fn main() {
 
     #[cfg(feature = "desktop")]
     {
-        use dioxus_desktop::{muda::Menu, Config, WindowBuilder};
-
         let title = path.as_ref()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "cosmix-view".into());
 
-        let cfg = Config::new()
-            .with_window(
-                WindowBuilder::new()
-                    .with_title(&title)
-                    .with_inner_size(dioxus_desktop::LogicalSize::new(960.0, 800.0)),
-            )
-            .with_menu(Menu::new());
+        let cfg = cosmix_ui::desktop::window_config(&title, 960.0, 800.0);
 
         // SAFETY: single-threaded at this point, before Dioxus launch
         if let Some(ref p) = path {
@@ -115,15 +112,24 @@ fn app() -> Element {
         });
     });
 
-    // Poll config every 30s for font size changes
+    // Poll config every 30s for theme changes
     use_effect(move || {
         spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 if let Ok(settings) = cosmix_config::store::load() {
-                    let new_fs = settings.global.font_size;
-                    if new_fs != *FONT_SIZE.read() {
-                        *FONT_SIZE.write() = new_fs;
+                    let new = ThemeParams {
+                        hue: settings.global.theme_hue,
+                        dark: settings.global.theme_dark,
+                        font_size: settings.global.font_size,
+                    };
+                    let current = THEME.read();
+                    if new.font_size != current.font_size
+                        || new.hue != current.hue
+                        || new.dark != current.dark
+                    {
+                        drop(current);
+                        *THEME.write() = new;
                     }
                 }
             }
@@ -183,8 +189,9 @@ fn app() -> Element {
         }
     };
 
-    let fs = *FONT_SIZE.read();
-    let font_css = format!("html, body, .markdown-body {{ font-size: {fs}px; }}");
+    let theme = THEME.read().clone();
+    let theme_css = generate_css(&theme);
+    let fs = theme.font_size;
 
     let content = match file_path() {
         Some(ref path) if is_image(path) => render_image(path),
@@ -194,7 +201,7 @@ fn app() -> Element {
     };
 
     rsx! {
-        document::Style { "{font_css}" }
+        document::Style { "{theme_css}" }
         div {
             tabindex: "0",
             onkeydown: onkeydown,
@@ -239,9 +246,9 @@ fn render_welcome() -> Element {
             class: "markdown-body",
             style: "display:flex; align-items:center; justify-content:center; min-height:80vh; text-align:center;",
             div {
-                h2 { style: "color:#9ca3af; font-weight:400;", "cosmix-view" }
-                p { style: "color:#6b7280;", "Open a file with File > Open or Ctrl+O" }
-                p { style: "color:#9ca3af; font-size:0.85em;", "Supports Markdown, DOT graphs, and images" }
+                h2 { style: "color:var(--fg-muted); font-weight:400;", "cosmix-view" }
+                p { style: "color:var(--fg-muted);", "Open a file with File > Open or Ctrl+O" }
+                p { style: "color:var(--fg-secondary); font-size:0.85em;", "Supports Markdown, DOT graphs, and images" }
             }
         }
     }

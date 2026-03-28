@@ -12,15 +12,15 @@ path = "src/main.rs"
 
 [features]
 default = ["desktop"]
-desktop = ["dioxus/desktop", "dep:dioxus-desktop", "dep:tao", "cosmix-ui/desktop"]
+desktop = ["dioxus/desktop", "dep:dioxus-desktop", "dep:tao", "cosmix_ui/desktop"]
 web = ["dioxus/web"]
 
 [dependencies]
 dioxus = { version = "0.7", features = [] }
 dioxus-desktop = { version = "0.7", optional = true }
 tao = { version = "0.34", default-features = false, optional = true }
-cosmix-ui = { path = "../cosmix-ui", default-features = false }
-cosmix-client = { path = "../cosmix-client" }
+cosmix_ui = { package = "cosmix-lib-ui", path = "../cosmix-lib-ui", default-features = false }
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
@@ -29,7 +29,7 @@ anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-cosmix-config = { path = "../cosmix-config" }
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }

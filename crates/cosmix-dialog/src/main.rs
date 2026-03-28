@@ -108,15 +108,7 @@ fn main() {
 
     #[cfg(feature = "desktop")]
     {
-        use dioxus_desktop::{Config, LogicalSize, WindowBuilder};
-
-        let cfg = Config::new().with_window(
-            WindowBuilder::new()
-                .with_title(&title)
-                .with_inner_size(LogicalSize::new(width as f64, height as f64))
-                .with_resizable(true),
-        );
-
+        let cfg = cosmix_ui::desktop::window_config(&title, width as f64, height as f64);
         LaunchBuilder::new().with_cfg(cfg).launch(app);
     }
 

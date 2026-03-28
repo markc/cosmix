@@ -1,28 +1,33 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/cosmix-jmap",
-    "crates/cosmix-mail",
-    "crates/cosmix-mesh",
-    "crates/cosmix-port",
-    "crates/cosmix-embed",
-    "crates/cosmix-web",
-    "crates/cosmix-view",
-    "crates/cosmix-ui",
-    "crates/cosmix-hub",
-    "crates/cosmix-client",
-    "crates/cosmix-files",
-    "crates/cosmix-mon",
-    "crates/cosmix-mond",
-    "crates/cosmix-launcher",
-    "crates/cosmix-dialog",
-    "crates/cosmix-edit",
-    "crates/cosmix-wg",
+    # Libraries
+    "crates/cosmix-lib-amp",
+    "crates/cosmix-lib-client",
+    "crates/cosmix-lib-config",
+    "crates/cosmix-lib-mesh",
+    "crates/cosmix-lib-ui",
+    # GUI apps
     "crates/cosmix-backup",
+    "crates/cosmix-dialog",
     "crates/cosmix-dns",
-    "crates/cosmix-config",
-    "crates/cosmix-configd",
+    "crates/cosmix-edit",
+    "crates/cosmix-files",
+    "crates/cosmix-mail",
+    "crates/cosmix-menu",
+    "crates/cosmix-mon",
+    "crates/cosmix-scripts",
     "crates/cosmix-settings",
+    "crates/cosmix-shell",
+    "crates/cosmix-view",
+    "crates/cosmix-wg",
+    # Daemons
+    "crates/cosmix-configd",
+    "crates/cosmix-hubd",
+    "crates/cosmix-indexd",
+    "crates/cosmix-maild",
+    "crates/cosmix-mond",
+    "crates/cosmix-webd",
 ]
 
 [workspace.package]

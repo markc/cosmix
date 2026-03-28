@@ -1,0 +1,40 @@
+[package]
+name = "cosmix-shell"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DCS (Dual Carousel Sidebar) shell — primary UI surface for the cosmix stack"
+
+[[bin]]
+name = "cosmix-shell"
+path = "src/main.rs"
+
+[lib]
+name = "cosmix_shell"
+path = "src/lib.rs"
+
+[features]
+default = ["desktop"]
+desktop = ["dioxus/desktop", "dep:dioxus-desktop", "dep:tao", "cosmix_ui/desktop", "cosmix_client/native"]
+web = ["dioxus/web"]
+
+[dependencies]
+dioxus = { version = "0.7", features = [] }
+dioxus-desktop = { version = "0.7", optional = true }
+tao = { version = "0.34", default-features = false, optional = true }
+cosmix_ui = { package = "cosmix-lib-ui", path = "../cosmix-lib-ui", default-features = false, features = ["hub"] }
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio.workspace = true
+tracing-subscriber.workspace = true
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config" }
+mimalloc.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+gloo-timers = { version = "0.3", features = ["futures"] }

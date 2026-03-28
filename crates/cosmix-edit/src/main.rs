@@ -12,13 +12,18 @@ use std::sync::Arc;
 
 use dioxus::prelude::*;
 use cosmix_ui::menu::{action_shortcut, menubar, standard_file_menu, separator, submenu, MenuBar, Shortcut};
+use cosmix_ui::theme::{ThemeParams, generate_css};
 
-// ── Global font size (loaded from config, updated via hub config.changed) ──
+// ── Theme params (loaded from config, updated via hub config.changed) ──
 
-static FONT_SIZE: GlobalSignal<u16> = Signal::global(|| {
+static THEME: GlobalSignal<ThemeParams> = Signal::global(|| {
     cosmix_config::store::load()
-        .map(|s| s.global.font_size)
-        .unwrap_or(14)
+        .map(|s| ThemeParams {
+            hue: s.global.theme_hue,
+            dark: s.global.theme_dark,
+            font_size: s.global.font_size,
+        })
+        .unwrap_or_default()
 });
 
 fn main() {
@@ -26,16 +31,7 @@ fn main() {
 
     #[cfg(feature = "desktop")]
     {
-        use dioxus_desktop::{muda::Menu, Config, LogicalSize, WindowBuilder};
-
-        let cfg = Config::new()
-            .with_window(
-                WindowBuilder::new()
-                    .with_title("cosmix-edit")
-                    .with_inner_size(LogicalSize::new(800.0, 600.0)),
-            )
-            .with_menu(Menu::new());
-
+        let cfg = cosmix_ui::desktop::window_config("cosmix-edit", 800.0, 600.0);
         LaunchBuilder::new().with_cfg(cfg).launch(app);
         return;
     }
@@ -81,7 +77,11 @@ async fn handle_hub_commands(client: Arc<cosmix_client::HubClient>) {
             "edit.get" => Ok(r#"{"status": "ok"}"#.to_string()),
             "config.changed" => {
                 if let Ok(settings) = cosmix_config::store::load() {
-                    *FONT_SIZE.write() = settings.global.font_size;
+                    *THEME.write() = ThemeParams {
+                        hue: settings.global.theme_hue,
+                        dark: settings.global.theme_dark,
+                        font_size: settings.global.font_size,
+                    };
                 }
                 Ok(r#"{"status": "ok"}"#.to_string())
             }
@@ -321,15 +321,17 @@ fn app() -> Element {
         .unwrap_or_else(|| format!("untitled{title_suffix}"));
 
     let lines = line_count();
-    let fs = *FONT_SIZE.read();
+    let theme = THEME.read().clone();
+    let css = generate_css(&theme);
+    let fs = theme.font_size;
     let fs_sm = fs.saturating_sub(2);
 
     rsx! {
-        document::Style { "{CSS}" }
+        document::Style { "{css}" }
         div {
             tabindex: "0",
             onkeydown: onkeydown,
-            style: "outline:none; width:100%; height:100vh; display:flex; flex-direction:column; background:{BG_BASE}; color:{TEXT_PRIMARY}; font-family:monospace; font-size:{fs}px;",
+            style: "outline:none; width:100%; height:100vh; display:flex; flex-direction:column; background:var(--bg-primary); color:var(--fg-primary); font-family:var(--font-mono); font-size:{fs}px;",
 
             // Menu bar
             MenuBar {
@@ -363,10 +365,10 @@ fn app() -> Element {
 
             // Title bar
             div {
-                style: "padding:3px 12px; background:{BG_SURFACE}; border-bottom:1px solid {BORDER}; font-size:{fs}px; display:flex; align-items:center;",
-                span { style: "font-weight:600; font-family:sans-serif;", "{title}" }
+                style: "padding:3px 12px; background:var(--bg-secondary); border-bottom:1px solid var(--border); font-size:{fs}px; display:flex; align-items:center;",
+                span { style: "font-weight:600; font-family:var(--font-sans);", "{title}" }
                 if let Some(ref path) = file_path() {
-                    span { style: "margin-left:8px; color:{TEXT_DIM}; font-size:{fs_sm}px; font-family:sans-serif;", "{path}" }
+                    span { style: "margin-left:8px; color:var(--fg-muted); font-size:{fs_sm}px; font-family:var(--font-sans);", "{path}" }
                 }
             }
 
@@ -376,7 +378,7 @@ fn app() -> Element {
 
                 // Line numbers
                 div {
-                    style: "width:48px; background:{BG_SURFACE}; border-right:1px solid {BORDER}; padding:8px 4px; text-align:right; color:{TEXT_DIM}; font-size:{fs_sm}px; line-height:1.5; overflow:hidden; user-select:none;",
+                    style: "width:48px; background:var(--bg-secondary); border-right:1px solid var(--border); padding:8px 4px; text-align:right; color:var(--fg-muted); font-size:{fs_sm}px; line-height:1.5; overflow:hidden; user-select:none;",
                     for i in 1..=lines {
                         div { "{i}" }
                     }
@@ -384,7 +386,7 @@ fn app() -> Element {
 
                 // Text area
                 textarea {
-                    style: "flex:1; background:{BG_BASE}; color:{TEXT_PRIMARY}; border:none; outline:none; padding:8px; font-size:{fs}px; font-family:'JetBrains Mono',monospace; line-height:1.5; resize:none; tab-size:4;",
+                    style: "flex:1; background:var(--bg-primary); color:var(--fg-primary); border:none; outline:none; padding:8px; font-size:{fs}px; font-family:var(--font-mono); line-height:1.5; resize:none; tab-size:4;",
                     spellcheck: false,
                     value: "{content}",
                     oninput: move |e| {
@@ -398,31 +400,10 @@ fn app() -> Element {
 
             // Status bar
             div {
-                style: "padding:4px 12px; background:{BG_SURFACE}; border-top:1px solid {BORDER}; color:{TEXT_DIM}; font-size:{fs_sm}px; display:flex; gap:16px; font-family:sans-serif;",
+                style: "padding:4px 12px; background:var(--bg-secondary); border-top:1px solid var(--border); color:var(--fg-muted); font-size:{fs_sm}px; display:flex; gap:16px; font-family:var(--font-sans);",
                 span { "{status_msg}" }
                 span { style: "margin-left:auto;", "{lines} lines" }
             }
         }
     }
 }
-
-// ── Theme ──
-
-const BG_BASE: &str = cosmix_ui::theme::BG_BASE;
-const BG_SURFACE: &str = cosmix_ui::theme::BG_SURFACE;
-const BORDER: &str = cosmix_ui::theme::BORDER_DEFAULT;
-const TEXT_PRIMARY: &str = cosmix_ui::theme::TEXT_PRIMARY;
-const TEXT_DIM: &str = cosmix_ui::theme::TEXT_DIM;
-
-const CSS: &str = r#"
-html, body, #main {
-    margin: 0; padding: 0;
-    width: 100%; height: 100%;
-    overflow: hidden;
-}
-textarea { caret-color: #60a5fa; }
-::-webkit-scrollbar { width: 8px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #374151; border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: #4b5563; }
-"#;

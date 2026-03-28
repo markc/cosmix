@@ -30,38 +30,42 @@ pub fn ComposeView(
 
     let can_send = !to().trim().is_empty() && !sending();
 
+    let send_style = if can_send {
+        "padding:6px 14px; background:var(--accent); color:var(--accent-fg); border:none; border-radius:var(--radius-md); cursor:pointer; font-size:var(--font-size-sm); font-weight:500; display:flex; align-items:center; gap:4px;"
+    } else {
+        "padding:6px 14px; background:var(--accent-subtle); color:var(--fg-muted); border:none; border-radius:var(--radius-md); cursor:not-allowed; font-size:var(--font-size-sm); font-weight:500; display:flex; align-items:center; gap:4px;"
+    };
+
+    let input_style = "flex:1; background:transparent; border:none; outline:none; color:var(--fg-primary); padding:10px 0; font-size:var(--font-size); font-family:inherit;";
+
     rsx! {
         div {
-            style: "flex:1; display:flex; flex-direction:column; min-width:0; overflow:hidden; background:#030712; height:100%;",
+            style: "flex:1; display:flex; flex-direction:column; min-width:0; overflow:hidden; background:var(--bg-primary); height:100%;",
             // Header bar
             div {
-                style: "flex-shrink:0; padding:12px 24px; border-bottom:1px solid #1f2937; background:rgba(17,24,39,0.3); display:flex; align-items:center; justify-content:space-between;",
+                style: "flex-shrink:0; padding:12px 24px; border-bottom:1px solid var(--border); background:var(--bg-secondary); display:flex; align-items:center; justify-content:space-between;",
                 div {
                     style: "display:flex; align-items:center; gap:8px;",
                     button {
                         class: "mobile-back",
-                        style: "display:none; background:none; border:none; color:#9ca3af; cursor:pointer; padding:4px;",
+                        style: "display:none; background:none; border:none; color:var(--fg-muted); cursor:pointer; padding:4px;",
                         onclick: move |_| on_back.call(()),
                         dangerous_inner_html: "{ICON_BACK}"
                     }
-                    span { style: "font-size:14px; font-weight:600; color:#f3f4f6;", "New Message" }
+                    span { style: "font-size:var(--font-size); font-weight:600; color:var(--fg-primary);", "New Message" }
                 }
                 div {
                     style: "display:flex; gap:8px;",
                     // Discard
                     button {
-                        style: "padding:6px 14px; background:none; border:1px solid #374151; color:#9ca3af; border-radius:5px; cursor:pointer; font-size:12px; display:flex; align-items:center; gap:4px;",
+                        style: "padding:6px 14px; background:none; border:1px solid var(--border); color:var(--fg-muted); border-radius:var(--radius-md); cursor:pointer; font-size:var(--font-size-sm); display:flex; align-items:center; gap:4px;",
                         onclick: move |_| on_discard.call(()),
                         span { dangerous_inner_html: "{ICON_X}" }
                         "Discard"
                     }
                     // Send
                     button {
-                        style: if can_send {
-                            "padding:6px 14px; background:#2563eb; color:#fff; border:none; border-radius:5px; cursor:pointer; font-size:12px; font-weight:500; display:flex; align-items:center; gap:4px;"
-                        } else {
-                            "padding:6px 14px; background:#1e3a5f; color:#6b7280; border:none; border-radius:5px; cursor:not-allowed; font-size:12px; font-weight:500; display:flex; align-items:center; gap:4px;"
-                        },
+                        style: "{send_style}",
                         disabled: !can_send,
                         onclick: {
                             let in_reply_to = in_reply_to.clone();
@@ -84,13 +88,13 @@ pub fn ComposeView(
             }
             // Form fields
             div {
-                style: "flex-shrink:0; border-bottom:1px solid #1f2937;",
+                style: "flex-shrink:0; border-bottom:1px solid var(--border);",
                 // To
                 div {
-                    style: "display:flex; align-items:center; padding:0 24px; border-bottom:1px solid rgba(31,41,55,0.4);",
-                    label { style: "width:50px; font-size:12px; color:#6b7280; flex-shrink:0;", "To" }
+                    style: "display:flex; align-items:center; padding:0 24px; border-bottom:1px solid var(--border-muted);",
+                    label { style: "width:50px; font-size:var(--font-size-sm); color:var(--fg-muted); flex-shrink:0;", "To" }
                     input {
-                        style: "flex:1; background:transparent; border:none; outline:none; color:#e5e7eb; padding:10px 0; font-size:13px; font-family:inherit;",
+                        style: "{input_style}",
                         r#type: "text",
                         value: "{to}",
                         placeholder: "recipient@example.com",
@@ -99,10 +103,10 @@ pub fn ComposeView(
                 }
                 // Cc
                 div {
-                    style: "display:flex; align-items:center; padding:0 24px; border-bottom:1px solid rgba(31,41,55,0.4);",
-                    label { style: "width:50px; font-size:12px; color:#6b7280; flex-shrink:0;", "Cc" }
+                    style: "display:flex; align-items:center; padding:0 24px; border-bottom:1px solid var(--border-muted);",
+                    label { style: "width:50px; font-size:var(--font-size-sm); color:var(--fg-muted); flex-shrink:0;", "Cc" }
                     input {
-                        style: "flex:1; background:transparent; border:none; outline:none; color:#e5e7eb; padding:10px 0; font-size:13px; font-family:inherit;",
+                        style: "{input_style}",
                         r#type: "text",
                         value: "{cc}",
                         oninput: move |e| cc.set(e.value()),
@@ -110,10 +114,10 @@ pub fn ComposeView(
                 }
                 // Bcc
                 div {
-                    style: "display:flex; align-items:center; padding:0 24px; border-bottom:1px solid rgba(31,41,55,0.4);",
-                    label { style: "width:50px; font-size:12px; color:#6b7280; flex-shrink:0;", "Bcc" }
+                    style: "display:flex; align-items:center; padding:0 24px; border-bottom:1px solid var(--border-muted);",
+                    label { style: "width:50px; font-size:var(--font-size-sm); color:var(--fg-muted); flex-shrink:0;", "Bcc" }
                     input {
-                        style: "flex:1; background:transparent; border:none; outline:none; color:#e5e7eb; padding:10px 0; font-size:13px; font-family:inherit;",
+                        style: "{input_style}",
                         r#type: "text",
                         value: "{bcc}",
                         oninput: move |e| bcc.set(e.value()),
@@ -122,9 +126,9 @@ pub fn ComposeView(
                 // Subject
                 div {
                     style: "display:flex; align-items:center; padding:0 24px;",
-                    label { style: "width:50px; font-size:12px; color:#6b7280; flex-shrink:0;", "Subject" }
+                    label { style: "width:50px; font-size:var(--font-size-sm); color:var(--fg-muted); flex-shrink:0;", "Subject" }
                     input {
-                        style: "flex:1; background:transparent; border:none; outline:none; color:#e5e7eb; padding:10px 0; font-size:13px; font-weight:500; font-family:inherit;",
+                        style: "{input_style} font-weight:500;",
                         r#type: "text",
                         value: "{subject}",
                         oninput: move |e| subject.set(e.value()),
@@ -135,7 +139,7 @@ pub fn ComposeView(
             div {
                 style: "flex:1; overflow:hidden;",
                 textarea {
-                    style: "width:100%; height:100%; background:transparent; border:none; outline:none; color:#e5e7eb; padding:16px 24px; font-size:13px; font-family:system-ui,-apple-system,sans-serif; resize:none; line-height:1.6;",
+                    style: "width:100%; height:100%; background:transparent; border:none; outline:none; color:var(--fg-primary); padding:16px 24px; font-size:var(--font-size); font-family:var(--font-sans); resize:none; line-height:1.6;",
                     value: "{body}",
                     placeholder: "Write your message...",
                     oninput: move |e| body.set(e.value()),

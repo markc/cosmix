@@ -27,12 +27,12 @@ echo "=== Building musl (static) binaries ==="
 echo "  RUSTFLAGS: $RUSTFLAGS"
 
 # Binaries that have no system deps — build directly
-echo "  cosmix-embed, cosmix-jmap..."
-cargo build --release --target "$TARGET" -p cosmix-embed -p cosmix-jmap
+echo "  cosmix-indexd, cosmix-maild..."
+cargo build --release --target "$TARGET" -p cosmix-indexd -p cosmix-maild
 
 # Binaries that need Lua — use lua54 feature instead of luajit
-echo "  cosmix-web (lua54)..."
-cargo build --release --target "$TARGET" -p cosmix-web \
+echo "  cosmix-webd (lua54)..."
+cargo build --release --target "$TARGET" -p cosmix-webd \
     --no-default-features --features lua54,cosmix
 
 echo "  cosmix-portd (lua54)..."
@@ -49,7 +49,7 @@ cargo build --release --bin cosmix
 if $STRIP; then
     echo ""
     echo "=== Stripping binaries ==="
-    for bin in cosmix-web cosmix-portd cosmix-embed cosmix-jmap; do
+    for bin in cosmix-webd cosmix-portd cosmix-indexd cosmix-maild; do
         [ -f "$MUSL_DIR/$bin" ] && strip "$MUSL_DIR/$bin" && echo "  stripped $bin (musl)"
     done
     [ -f "$GLIBC_DIR/cosmix" ] && strip "$GLIBC_DIR/cosmix" && echo "  stripped cosmix (glibc)"
@@ -58,7 +58,7 @@ fi
 echo ""
 echo "=== Build summary ==="
 echo "Static (musl):"
-for bin in cosmix-web cosmix-portd cosmix-embed cosmix-jmap; do
+for bin in cosmix-webd cosmix-portd cosmix-indexd cosmix-maild; do
     if [ -f "$MUSL_DIR/$bin" ]; then
         sz=$(du -h "$MUSL_DIR/$bin" | cut -f1)
         echo "  $bin  ${sz}  $(file -b "$MUSL_DIR/$bin" | cut -d, -f1-2)"
@@ -80,7 +80,7 @@ if $INSTALL; then
     mkdir -p "$DEST"
 
     # Install musl binaries
-    for bin in cosmix-web cosmix-portd cosmix-embed cosmix-jmap; do
+    for bin in cosmix-webd cosmix-portd cosmix-indexd cosmix-maild; do
         [ -f "$MUSL_DIR/$bin" ] && cp "$MUSL_DIR/$bin" "$DEST/" && echo "  installed $bin"
     done
 

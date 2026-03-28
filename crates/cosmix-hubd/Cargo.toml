@@ -1,0 +1,25 @@
+[package]
+name = "cosmix-hubd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local WebSocket message broker for the cosmix appmesh"
+
+[[bin]]
+name = "cosmix-hubd"
+path = "src/main.rs"
+
+[dependencies]
+cosmix_amp = { package = "cosmix-lib-amp", path = "../cosmix-lib-amp" }
+cosmix_mesh = { package = "cosmix-lib-mesh", path = "../cosmix-lib-mesh" }
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+mimalloc = { workspace = true }
+futures-util.workspace = true
+clap.workspace = true

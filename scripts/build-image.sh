@@ -53,8 +53,8 @@ fi
 mkdir -p "$DIST_DIR"
 
 # Binaries to include per variant
-MESH_BINS=(cosmix-web cosmix-portd cosmix-embed cosmix-jmap)
-DESKTOP_BINS=(cosmix cosmix-web cosmix-portd cosmix-embed cosmix-jmap
+MESH_BINS=(cosmix-webdcosmix-portd cosmix-indexd cosmix-maild)
+DESKTOP_BINS=(cosmix cosmix-webdcosmix-portd cosmix-indexd cosmix-maild
               cosmix-calc cosmix-view cosmix-mail)
 # cosmix-toot excluded: keytar→libsecret→gmodule→dlopen incompatible with static linking
 
@@ -96,7 +96,7 @@ build_variant() {
     local repo_dir
     repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
     echo "  Installing service files..."
-    for svc in cosmix cosmix-web cosmix-portd; do
+    for svc in cosmix cosmix-webdcosmix-portd; do
         local svc_src="${repo_dir}/scripts/etc/init.d/${svc}"
         if [ -f "$svc_src" ]; then
             incus file push "$svc_src" "${ct}/etc/init.d/${svc}"

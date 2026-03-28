@@ -19,10 +19,10 @@ if [ $# -eq 0 ]; then
     NODES=(gcwg mko mmc)
 fi
 
-BINS=(cosmix cosmix-web)
+BINS=(cosmix cosmix-webd)
 
 echo "=== Clean changed crates (ZFS bind mount workaround) ==="
-cargo clean -p cosmix-daemon -p cosmix-web 2>/dev/null || true
+cargo clean -p cosmix-daemon -p cosmix-webd 2>/dev/null || true
 
 echo ""
 echo "=== Building headless binaries ==="
@@ -45,10 +45,10 @@ for node in "${NODES[@]}"; do
     echo "=== Deploying to $node ==="
     scp -q "${BINS[@]/#/$REL/}" "$node:/tmp/" || { echo "  scp failed — skipping $node"; continue; }
     ssh "$node" "
-        systemctl stop cosmix cosmix-web 2>/dev/null
+        systemctl stop cosmix cosmix-webd 2>/dev/null
         cp ${BINS[*]/#//tmp/} $DEST/
         chmod 755 ${BINS[*]/#/$DEST/}
-        systemctl start cosmix cosmix-web 2>/dev/null
+        systemctl start cosmix cosmix-webd 2>/dev/null
         echo '  started services'
     " 2>&1
     echo "  done"
@@ -57,7 +57,7 @@ done
 echo ""
 echo "=== Verify ==="
 for node in "${NODES[@]}"; do
-    status=$(ssh "$node" "systemctl is-active cosmix-web 2>&1" 2>&1)
-    version=$(ssh "$node" "cosmix-web --help 2>&1 | head -1" 2>&1)
-    echo "  $node: cosmix-web=$status  ($version)"
+    status=$(ssh "$node" "systemctl is-active cosmix-webd 2>&1" 2>&1)
+    version=$(ssh "$node" "cosmix-webd --help 2>&1 | head -1" 2>&1)
+    echo "  $node: cosmix-webd=$status  ($version)"
 done

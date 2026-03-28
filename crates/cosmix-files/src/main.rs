@@ -3,13 +3,18 @@ use std::sync::Arc;
 use dioxus::prelude::*;
 use serde::Serialize;
 use cosmix_ui::menu::{menubar, standard_file_menu, MenuBar};
+use cosmix_ui::theme::{ThemeParams, generate_css};
 
-// ── Global font size (loaded from config, refreshed every 30s) ──
+// ── Theme params (loaded from config, refreshed every 30s) ──
 
-static FONT_SIZE: GlobalSignal<u16> = Signal::global(|| {
+static THEME: GlobalSignal<ThemeParams> = Signal::global(|| {
     cosmix_config::store::load()
-        .map(|s| s.global.font_size)
-        .unwrap_or(14)
+        .map(|s| ThemeParams {
+            hue: s.global.theme_hue,
+            dark: s.global.theme_dark,
+            font_size: s.global.font_size,
+        })
+        .unwrap_or_default()
 });
 
 fn main() {
@@ -17,16 +22,7 @@ fn main() {
 
     #[cfg(feature = "desktop")]
     {
-        use dioxus_desktop::{muda::Menu, Config, LogicalSize, WindowBuilder};
-
-        let cfg = Config::new()
-            .with_window(
-                WindowBuilder::new()
-                    .with_title("cosmix-files")
-                    .with_inner_size(LogicalSize::new(900.0, 640.0)),
-            )
-            .with_menu(Menu::new());
-
+        let cfg = cosmix_ui::desktop::window_config("cosmix-files", 900.0, 640.0);
         LaunchBuilder::new().with_cfg(cfg).launch(app);
         return;
     }
@@ -209,15 +205,24 @@ fn app() -> Element {
         });
     });
 
-    // Poll config every 30s for font size changes
+    // Poll config every 30s for theme changes
     use_effect(move || {
         spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 if let Ok(settings) = cosmix_config::store::load() {
-                    let new_fs = settings.global.font_size;
-                    if new_fs != *FONT_SIZE.read() {
-                        *FONT_SIZE.write() = new_fs;
+                    let new = ThemeParams {
+                        hue: settings.global.theme_hue,
+                        dark: settings.global.theme_dark,
+                        font_size: settings.global.font_size,
+                    };
+                    let current = THEME.read();
+                    if new.font_size != current.font_size
+                        || new.hue != current.hue
+                        || new.dark != current.dark
+                    {
+                        drop(current);
+                        *THEME.write() = new;
                     }
                 }
             }
@@ -243,7 +248,9 @@ fn app() -> Element {
         }
     };
 
-    let fs = *FONT_SIZE.read();
+    let theme = THEME.read().clone();
+    let css = generate_css(&theme);
+    let fs = theme.font_size;
     let fs_sm = fs.saturating_sub(2);
 
     // Build breadcrumb segments from current path
@@ -265,11 +272,11 @@ fn app() -> Element {
     };
 
     rsx! {
-        document::Style { "{CSS}" }
+        document::Style { "{css}" }
         div {
             tabindex: "0",
             onkeydown: onkeydown,
-            style: "outline:none; width:100%; height:100vh; display:flex; flex-direction:column; background:{BG_BASE}; color:{TEXT_PRIMARY}; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif; font-size:{fs}px;",
+            style: "outline:none; width:100%; height:100vh; display:flex; flex-direction:column; background:var(--bg-primary); color:var(--fg-primary); font-family:var(--font-sans); font-size:{fs}px;",
 
             MenuBar {
                 menu: app_menu,
@@ -281,16 +288,16 @@ fn app() -> Element {
 
             // Breadcrumb bar
             div {
-                style: "display:flex; align-items:center; gap:2px; padding:8px 12px; background:{BG_SURFACE}; border-bottom:1px solid {BORDER}; flex-shrink:0; overflow-x:auto; white-space:nowrap;",
+                style: "display:flex; align-items:center; gap:2px; padding:8px 12px; background:var(--bg-secondary); border-bottom:1px solid var(--border); flex-shrink:0; overflow-x:auto; white-space:nowrap;",
                 for (i, (label, path)) in segments.iter().enumerate() {
                     if i > 0 {
-                        span { style: "color:{TEXT_DIM}; margin:0 2px;", "/" }
+                        span { style: "color:var(--fg-muted); margin:0 2px;", "/" }
                     }
                     {
                         let path = path.clone();
                         rsx! {
                             span {
-                                style: "color:{TEXT_MUTED}; cursor:pointer; padding:2px 4px; border-radius:3px;",
+                                style: "color:var(--fg-secondary); cursor:pointer; padding:2px 4px; border-radius:var(--radius-sm);",
                                 onmouseover: move |_| {},
                                 onclick: move |_| navigate(path.clone()),
                                 "{label}"
@@ -306,7 +313,7 @@ fn app() -> Element {
 
                 // Header row
                 div {
-                    style: "display:flex; align-items:center; padding:6px 12px; background:{BG_ELEVATED}; border-bottom:1px solid {BORDER}; color:{TEXT_DIM}; font-size:{fs_sm}px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em;",
+                    style: "display:flex; align-items:center; padding:6px 12px; background:var(--bg-tertiary); border-bottom:1px solid var(--border); color:var(--fg-muted); font-size:{fs_sm}px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em;",
                     span { style: "flex:1; min-width:0;", "Name" }
                     span { style: "width:80px; text-align:right; margin-right:16px;", "Size" }
                     span { style: "width:130px;", "Modified" }
@@ -323,14 +330,14 @@ fn app() -> Element {
                             .unwrap_or_else(|| "/".to_string());
                         rsx! {
                             div {
-                                style: "display:flex; align-items:center; padding:5px 12px; cursor:pointer; border-bottom:1px solid {BORDER_SUBTLE};",
+                                style: "display:flex; align-items:center; padding:5px 12px; cursor:pointer; border-bottom:1px solid var(--border-muted);",
                                 onclick: move |_| navigate(parent.clone()),
                                 onmouseenter: move |_| {},
                                 span {
-                                    style: "margin-right:8px; color:{TEXT_DIM};",
+                                    style: "margin-right:8px; color:var(--fg-muted);",
                                     dangerous_inner_html: "{ICON_FOLDER}"
                                 }
-                                span { style: "flex:1; color:{TEXT_MUTED};", ".." }
+                                span { style: "flex:1; color:var(--fg-secondary);", ".." }
                             }
                         }
                     } else {
@@ -344,17 +351,17 @@ fn app() -> Element {
                         let entry_path = entry.path.clone();
                         let entry_is_dir = entry.is_dir;
                         let is_selected = selected() == Some(idx);
-                        let bg = if is_selected { BG_ELEVATED } else { "transparent" };
+                        let bg = if is_selected { "var(--bg-tertiary)" } else { "transparent" };
                         let icon = if entry.is_dir { ICON_FOLDER } else { ICON_FILE };
-                        let icon_color = if entry.is_dir { "#60a5fa" } else { TEXT_DIM };
-                        let name_color = if entry.is_dir { TEXT_PRIMARY } else { TEXT_SECONDARY };
+                        let icon_color = if entry.is_dir { "var(--accent)" } else { "var(--fg-muted)" };
+                        let name_color = if entry.is_dir { "var(--fg-primary)" } else { "var(--fg-secondary)" };
                         let size_str = if entry.is_dir { String::new() } else { format_size(entry.size) };
                         let name = entry.name.clone();
                         let modified = entry.modified.clone();
 
                         rsx! {
                             div {
-                                style: "display:flex; align-items:center; padding:5px 12px; cursor:pointer; border-bottom:1px solid {BORDER_SUBTLE}; background:{bg};",
+                                style: "display:flex; align-items:center; padding:5px 12px; cursor:pointer; border-bottom:1px solid var(--border-muted); background:{bg};",
                                 onclick: move |_| {
                                     if entry_is_dir {
                                         navigate(entry_path.clone());
@@ -367,8 +374,8 @@ fn app() -> Element {
                                     dangerous_inner_html: "{icon}"
                                 }
                                 span { style: "flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; color:{name_color};", "{name}" }
-                                span { style: "width:80px; text-align:right; margin-right:16px; color:{TEXT_DIM}; font-size:{fs_sm}px;", "{size_str}" }
-                                span { style: "width:130px; color:{TEXT_DIM}; font-size:{fs_sm}px;", "{modified}" }
+                                span { style: "width:80px; text-align:right; margin-right:16px; color:var(--fg-muted); font-size:{fs_sm}px;", "{size_str}" }
+                                span { style: "width:130px; color:var(--fg-muted); font-size:{fs_sm}px;", "{modified}" }
                             }
                         }
                     }
@@ -377,37 +384,14 @@ fn app() -> Element {
 
             // Status bar
             div {
-                style: "padding:4px 12px; background:{BG_SURFACE}; border-top:1px solid {BORDER}; color:{TEXT_DIM}; font-size:{fs_sm}px; flex-shrink:0;",
+                style: "padding:4px 12px; background:var(--bg-secondary); border-top:1px solid var(--border); color:var(--fg-muted); font-size:{fs_sm}px; flex-shrink:0;",
                 "{entries().len()} items"
             }
         }
     }
 }
 
-// ── Theme constants ──
-
-const BG_BASE: &str = cosmix_ui::theme::BG_BASE;
-const BG_SURFACE: &str = cosmix_ui::theme::BG_SURFACE;
-const BG_ELEVATED: &str = cosmix_ui::theme::BG_ELEVATED;
-const BORDER: &str = cosmix_ui::theme::BORDER_DEFAULT;
-const BORDER_SUBTLE: &str = cosmix_ui::theme::BORDER_SUBTLE;
-const TEXT_PRIMARY: &str = cosmix_ui::theme::TEXT_PRIMARY;
-const TEXT_SECONDARY: &str = cosmix_ui::theme::TEXT_SECONDARY;
-const TEXT_MUTED: &str = cosmix_ui::theme::TEXT_MUTED;
-const TEXT_DIM: &str = cosmix_ui::theme::TEXT_DIM;
+// ── Icons ──
 
 const ICON_FOLDER: &str = cosmix_ui::icons::ICON_FOLDER;
 const ICON_FILE: &str = cosmix_ui::icons::ICON_FILE_EDIT;
-
-const CSS: &str = r#"
-html, body, #main {
-    margin: 0; padding: 0;
-    width: 100%; height: 100%;
-    overflow: hidden;
-}
-::-webkit-scrollbar { width: 8px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #374151; border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: #4b5563; }
-div[style*="cursor:pointer"]:hover { background: #1f2937 !important; }
-"#;

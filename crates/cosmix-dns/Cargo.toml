@@ -18,8 +18,8 @@ desktop = ["dioxus/desktop", "dep:dioxus-desktop", "dep:tao"]
 dioxus = { version = "0.7", features = [] }
 dioxus-desktop = { version = "0.7", optional = true }
 tao = { version = "0.34", default-features = false, optional = true }
-cosmix-ui = { path = "../cosmix-ui" }
-cosmix-client = { path = "../cosmix-client" }
+cosmix_ui = { package = "cosmix-lib-ui", path = "../cosmix-lib-ui" }
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client" }
 hickory-server = { version = "0.25", features = ["toml"] }
 hickory-proto = { version = "0.25", features = ["text-parsing"] }
 serde.workspace = true

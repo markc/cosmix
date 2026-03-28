@@ -2,7 +2,8 @@ use dioxus::prelude::*;
 use crate::jmap::Email;
 use super::icons::*;
 use cosmix_ui::icons::{ICON_REPLY, ICON_FORWARD, ICON_MAIL_OPEN, ICON_BACK};
-use cosmix_ui::theme::ACTION_BTN;
+
+const ACTION_BTN: &str = "padding:4px 10px; background:none; border:1px solid var(--border); color:var(--fg-muted); border-radius:var(--radius-sm); cursor:pointer; font-size:var(--font-size-sm); display:flex; align-items:center; gap:4px;";
 
 #[component]
 pub fn EmailView(
@@ -17,10 +18,10 @@ pub fn EmailView(
     let Some(email) = email else {
         return rsx! {
             div {
-                style: "flex:1; display:flex; align-items:center; justify-content:center; color:#4b5563; height:100%;",
+                style: "flex:1; display:flex; align-items:center; justify-content:center; color:var(--fg-muted); height:100%;",
                 div { style: "text-align:center;",
                     div { style: "margin-bottom:8px; opacity:0.3;", dangerous_inner_html: r#"<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>"# }
-                    span { style: "font-size:12px;", "Select a message to read" }
+                    span { style: "font-size:var(--font-size-sm);", "Select a message to read" }
                 }
             }
         };
@@ -31,7 +32,7 @@ pub fn EmailView(
     } else if let Some(text) = email.text_body_value() {
         render_markdown(text)
     } else {
-        "<p style=\"color:#6b7280\">No content</p>".to_string()
+        "<p style=\"color:var(--fg-muted)\">No content</p>".to_string()
     };
 
     let to_display = email
@@ -56,39 +57,39 @@ pub fn EmailView(
 
     rsx! {
         div {
-            style: "flex:1; display:flex; flex-direction:column; min-width:0; overflow:hidden; background:#030712; height:100%;",
+            style: "flex:1; display:flex; flex-direction:column; min-width:0; overflow:hidden; background:var(--bg-primary); height:100%;",
             // Email header
             div {
-                style: "flex-shrink:0; padding:12px 16px 10px; border-bottom:1px solid #1f2937; background:rgba(17,24,39,0.3);",
+                style: "flex-shrink:0; padding:12px 16px 10px; border-bottom:1px solid var(--border); background:var(--bg-secondary);",
                 // Mobile back + subject row
                 div {
                     style: "display:flex; align-items:center; gap:8px; margin-bottom:6px;",
                     button {
                         class: "mobile-back",
-                        style: "display:none; background:none; border:none; color:#9ca3af; cursor:pointer; padding:4px; flex-shrink:0;",
+                        style: "display:none; background:none; border:none; color:var(--fg-muted); cursor:pointer; padding:4px; flex-shrink:0;",
                         onclick: move |_| on_back.call(()),
                         dangerous_inner_html: "{ICON_BACK}"
                     }
-                    h2 { style: "font-size:15px; font-weight:600; color:#f3f4f6; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
+                    h2 { style: "font-size:var(--font-size-lg); font-weight:600; color:var(--fg-primary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
                         "{email.subject.as_deref().unwrap_or(\"(no subject)\")}"
                     }
                 }
                 div {
-                    style: "display:flex; flex-wrap:wrap; gap:8px 12px; font-size:12px; color:#6b7280; align-items:center;",
+                    style: "display:flex; flex-wrap:wrap; gap:8px 12px; font-size:var(--font-size-sm); color:var(--fg-muted); align-items:center;",
                     span { style: "display:inline-flex; align-items:center; gap:4px;",
                         span { dangerous_inner_html: "{ICON_USER}" }
-                        span { style: "color:#d1d5db;", "{email.from_display()}" }
+                        span { style: "color:var(--fg-secondary);", "{email.from_display()}" }
                     }
                     span { style: "display:inline-flex; align-items:center; gap:4px;",
                         "To: "
-                        span { style: "color:#9ca3af;", "{to_display}" }
+                        span { style: "color:var(--fg-secondary);", "{to_display}" }
                     }
                     span { style: "display:inline-flex; align-items:center; gap:4px;",
                         span { dangerous_inner_html: "{ICON_CLOCK}" }
                         "{email.date_short()}"
                     }
                     if email.has_attachment.unwrap_or(false) {
-                        span { style: "display:inline-flex; align-items:center; gap:4px; color:#f59e0b;",
+                        span { style: "display:inline-flex; align-items:center; gap:4px; color:var(--warning);",
                             span { dangerous_inner_html: "{ICON_PAPERCLIP}" }
                             "attachment"
                         }
@@ -98,7 +99,7 @@ pub fn EmailView(
             // Action bar
             div {
                 class: "action-bar",
-                style: "flex-shrink:0; padding:8px 16px; border-bottom:1px solid #1f2937; display:flex; flex-wrap:wrap; gap:6px; background:rgba(17,24,39,0.15);",
+                style: "flex-shrink:0; padding:8px 16px; border-bottom:1px solid var(--border); display:flex; flex-wrap:wrap; gap:6px; background:var(--bg-secondary);",
                 button {
                     style: "{ACTION_BTN}",
                     onclick: move |_| on_reply.call(email_reply.clone()),

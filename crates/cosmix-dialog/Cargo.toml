@@ -18,6 +18,6 @@ desktop = ["dioxus/desktop", "dep:dioxus-desktop", "dep:tao"]
 dioxus = { version = "0.7", features = [] }
 dioxus-desktop = { version = "0.7", optional = true }
 tao = { version = "0.34", default-features = false, optional = true }
-cosmix-ui = { path = "../cosmix-ui" }
+cosmix_ui = { package = "cosmix-lib-ui", path = "../cosmix-lib-ui" }
 clap.workspace = true
 mimalloc.workspace = true

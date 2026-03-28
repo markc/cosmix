@@ -6,18 +6,54 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Cosmix is a self-hosted sovereign intelligence stack: JMAP mail server + Dioxus cross-platform client + AMP mesh networking + AI inference pipeline. All Rust, no Python/Node/JavaScript except as Dioxus build output.
 
-**Current phase:** Phase 3 (cosmix-jmap core server). Phases 4–7 build on top: CalDAV/CardDAV, AI inference, Dioxus client, mesh SMTP bypass.
+**Current phase:** Phase 3 (cosmix-maild core server). Phases 4–7 build on top: CalDAV/CardDAV, AI inference, Dioxus client, mesh SMTP bypass.
 
 ## Workspace
 
-Four-crate monorepo, Rust 2024 edition:
+24-crate monorepo, Rust 2024 edition. Naming convention distinguishes crate types:
 
-| Crate | Type | Purpose |
-|-------|------|---------|
-| `cosmix-jmap` | binary | JMAP (RFC 8620/8621) + SMTP server, axum + sqlx + PostgreSQL |
-| `cosmix-mail` | binary | Dioxus 0.7 desktop/web mail client (early scaffold) |
-| `cosmix-mesh` | library | WireGuard mesh networking, WebSocket peer sync |
-| `cosmix-port` | library | ARexx-inspired IPC — Unix socket command ports, AMP wire format |
+- `cosmix-lib-*` — libraries (Rust module name: `cosmix_*`)
+- `cosmix-*` — GUI apps (Dioxus desktop/web)
+- `cosmix-*d` — headless daemons/services
+
+### Libraries
+
+| Crate | Rust module | Purpose |
+|-------|------------|---------|
+| `cosmix-lib-amp` | `cosmix_amp` | AMP wire format + IPC |
+| `cosmix-lib-client` | `cosmix_client` | AMP WebSocket client (native + WASM) |
+| `cosmix-lib-config` | `cosmix_config` | Typed config structs + TOML load/save |
+| `cosmix-lib-mesh` | `cosmix_mesh` | WireGuard mesh networking, WebSocket peer sync |
+| `cosmix-lib-ui` | `cosmix_ui` | Shared Dioxus components, theme, icons |
+
+### GUI Apps
+
+| Crate | Purpose |
+|-------|---------|
+| `cosmix-backup` | Proxmox Backup Server dashboard |
+| `cosmix-dialog` | Transient dialog utility (zenity replacement) |
+| `cosmix-dns` | DNS zone management UI |
+| `cosmix-edit` | Text editor |
+| `cosmix-files` | File browser |
+| `cosmix-mail` | JMAP mail client (Dioxus desktop/web) |
+| `cosmix-menu` | System tray app launcher |
+| `cosmix-mon` | System monitor GUI (desktop + WASM) |
+| `cosmix-scripts` | Lua + Bash script manager |
+| `cosmix-settings` | Settings/preferences editor |
+| `cosmix-shell` | DCS shell — primary UI surface (desktop + WASM) |
+| `cosmix-view` | Markdown/image viewer |
+| `cosmix-wg` | WireGuard mesh admin |
+
+### Daemons
+
+| Crate | Purpose |
+|-------|---------|
+| `cosmix-configd` | Config watcher, serves settings via AMP |
+| `cosmix-hubd` | WebSocket message broker |
+| `cosmix-indexd` | Semantic indexing + vector storage (candle + sqlite-vec) |
+| `cosmix-maild` | JMAP (RFC 8620/8621) + SMTP mail server |
+| `cosmix-mond` | System monitor daemon |
+| `cosmix-webd` | WASM app server + CMS API |
 
 External path dependency: `spamlite` at `~/.gh/spamlite` (Bayesian spam classifier).
 
@@ -25,8 +61,8 @@ External path dependency: `spamlite` at `~/.gh/spamlite` (Bayesian spam classifi
 
 ```bash
 cargo build                             # entire workspace
-cargo build -p cosmix-jmap              # single crate
-cargo build -p cosmix-jmap --release    # release build
+cargo build -p cosmix-maild             # single crate
+cargo build -p cosmix-maild --release   # release build
 cargo check                             # type-check without codegen
 ```
 
@@ -39,16 +75,16 @@ cd crates/cosmix-mail && dx serve --hotpatch        # Rust hot-patch
 
 No test suite yet. Manual validation via curl (JMAP) and nc/swaks (SMTP).
 
-## cosmix-jmap CLI
+## cosmix-maild CLI
 
 ```bash
-cosmix-jmap migrate                     # apply SQL migrations
-cosmix-jmap account add <email> <pwd>   # create account (auto-creates default mailboxes + PIM)
-cosmix-jmap account list
-cosmix-jmap account delete <email>
-cosmix-jmap queue list                  # SMTP outbound queue
-cosmix-jmap queue flush                 # retry queued messages
-cosmix-jmap serve                       # start JMAP HTTP + SMTP listeners
+cosmix-maild migrate                    # apply SQL migrations
+cosmix-maild account add <email> <pwd>  # create account (auto-creates default mailboxes + PIM)
+cosmix-maild account list
+cosmix-maild account delete <email>
+cosmix-maild queue list                 # SMTP outbound queue
+cosmix-maild queue flush                # retry queued messages
+cosmix-maild serve                      # start JMAP HTTP + SMTP listeners
 ```
 
 ## Configuration
@@ -64,7 +100,7 @@ Config loaded from `~/.config/cosmix/jmap.toml` or `/etc/cosmix/jmap.toml`. Key 
 
 ## Database Architecture
 
-PostgreSQL with sqlx (async, compile-time checked queries). Four migrations in `crates/cosmix-jmap/migrations/`:
+PostgreSQL with sqlx (async, compile-time checked queries). Four migrations in `crates/cosmix-maild/migrations/`:
 
 **State tracking:** All mutations write to `changelog(account_id, object_type, object_id, change_type)`. JMAP state = max changelog ID per (account_id, object_type). This powers `/changes` and `/query` efficiently.
 
@@ -89,7 +125,7 @@ PostgreSQL with sqlx (async, compile-time checked queries). Four migrations in `
 
 **SMTP outbound:** EmailSubmission/set → mail-builder constructs MIME → mail-send delivers. Failed deliveries go to `smtp_queue` with exponential backoff (max 10 attempts).
 
-## AMP Wire Format (cosmix-port)
+## AMP Wire Format (cosmix-lib-amp)
 
 All cosmix IPC uses AMP (AppMesh Protocol) — markdown frontmatter with BTreeMap headers + optional body:
 

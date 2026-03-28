@@ -295,7 +295,7 @@ echo ""
 echo "--- Service files ---"
 
 # OpenRC init scripts
-for svc_file in /etc/init.d/cosmix /etc/init.d/cosmix-web /etc/init.d/cosmix-portd; do
+for svc_file in /etc/init.d/cosmix /etc/init.d/cosmix-webd /etc/init.d/cosmix-portd; do
     if [ -f "$svc_file" ]; then
         if grep -q 'command_user="cosmic"' "$svc_file" 2>/dev/null; then
             change "fix $svc_file: cosmic → cosmix"
@@ -393,9 +393,9 @@ if [ "$DRY_RUN" = true ]; then
         echo "    1. Snapshot/backup the node"
         echo "    2. Stop cosmix services:"
         if [ "$INIT_SYSTEM" = "openrc" ]; then
-            echo "       rc-service cosmix-web stop; rc-service cosmix stop"
+            echo "       rc-service cosmix-webd stop; rc-service cosmix stop"
         else
-            echo "       systemctl stop cosmix-web cosmix"
+            echo "       systemctl stop cosmix-webd cosmix"
         fi
         echo "    3. Run: $0 --apply"
     fi
@@ -406,9 +406,9 @@ else
     echo "    1. Update web.toml database_url if not auto-fixed"
     echo "    2. Restart services:"
     if [ "$INIT_SYSTEM" = "openrc" ]; then
-        echo "       rc-service cosmix-web start; rc-service cosmix start"
+        echo "       rc-service cosmix-webd start; rc-service cosmix start"
     else
-        echo "       systemctl start cosmix-web cosmix"
+        echo "       systemctl start cosmix-webd cosmix"
     fi
     echo "    3. Verify: psql -U cosmix -d cosmix -c '\\dt'"
 fi

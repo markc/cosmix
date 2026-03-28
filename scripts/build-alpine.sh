@@ -18,7 +18,7 @@ DEST="$HOME/.local/bin"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/alpine}"
 REL="$CARGO_TARGET_DIR/$TARGET/release"
 
-HEADLESS_BINS=(cosmix cosmix-web cosmix-portd cosmix-embed cosmix-jmap)
+HEADLESS_BINS=(cosmix cosmix-webdcosmix-portd cosmix-indexd cosmix-maild)
 DESKTOP_BINS=(cosmix-calc cosmix-view cosmix-mail)
 ALL_BINS=("${HEADLESS_BINS[@]}" "${DESKTOP_BINS[@]}")
 
@@ -42,11 +42,11 @@ if [[ "$TIER" == "headless" || "$TIER" == "all" ]]; then
     echo ""
     echo "--- Tier 1+2: Headless binaries ---"
 
-    echo "  cosmix-embed, cosmix-jmap..."
-    cargo build --release --target "$TARGET" -p cosmix-embed -p cosmix-jmap
+    echo "  cosmix-indexd, cosmix-maild..."
+    cargo build --release --target "$TARGET" -p cosmix-indexd -p cosmix-maild
 
-    echo "  cosmix-web (lua54)..."
-    cargo build --release --target "$TARGET" -p cosmix-web \
+    echo "  cosmix-webd(lua54)..."
+    cargo build --release --target "$TARGET" -p cosmix-webd\
         --no-default-features --features lua54,cosmix
 
     echo "  cosmix-portd (lua54)..."

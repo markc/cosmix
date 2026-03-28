@@ -11,7 +11,7 @@ name = "cosmix-mond"
 path = "src/main.rs"
 
 [dependencies]
-cosmix-client = { path = "../cosmix-client" }
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

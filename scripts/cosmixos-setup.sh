@@ -430,7 +430,7 @@ rc-update add wg-quick.wg0 default 2>/dev/null || true
 wg-quick up wg0 2>/dev/null && echo "WireGuard interface up" || echo "WARNING: wg-quick up failed"
 
 # Start cosmix services if present
-for svc in cosmix-web cosmix-portd cosmix-embed cosmix-jmap; do
+for svc in cosmix-webd cosmix-portd cosmix-indexd cosmix-maild; do
     if [ -f "/etc/init.d/$svc" ]; then
         rc-service "$svc" start 2>/dev/null || true
     fi

@@ -12,11 +12,11 @@ path = "src/main.rs"
 
 [features]
 default = ["desktop"]
-desktop = ["dioxus/desktop", "dep:dioxus-desktop", "dep:tao", "cosmix-ui/desktop"]
+desktop = ["dioxus/desktop", "dep:dioxus-desktop", "dep:tao", "cosmix_ui/desktop"]
 
 [dependencies]
-cosmix-config = { path = "../cosmix-config" }
-cosmix-ui = { path = "../cosmix-ui", default-features = false }
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config" }
+cosmix_ui = { package = "cosmix-lib-ui", path = "../cosmix-lib-ui", default-features = false }
 dioxus = "0.7"
 dioxus-desktop = { version = "0.7", optional = true }
 tao = { version = "0.33", optional = true }
