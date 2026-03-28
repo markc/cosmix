@@ -116,6 +116,8 @@ fn launch_app(exec: &str) {
 struct CosmixTray;
 
 impl ksni::Tray for CosmixTray {
+    const MENU_ON_ACTIVATE: bool = true;
+
     fn id(&self) -> String {
         "cosmix-menu".into()
     }
