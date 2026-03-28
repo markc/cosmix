@@ -41,16 +41,21 @@ pub fn reload_theme() {
 
 // ── Theme CSS hook ──
 
-/// Returns the current theme CSS string for injection via `document::Style`.
+/// Returns a reactive memo of the current theme CSS string.
+///
+/// The memo automatically re-computes when THEME changes, ensuring
+/// `document::Style` updates immediately.
 ///
 /// Usage in any app's `app()`:
 /// ```ignore
 /// let css = use_theme_css();
 /// rsx! { document::Style { "{css}" } ... }
 /// ```
-pub fn use_theme_css() -> String {
-    let theme = THEME.read();
-    generate_css(&theme)
+pub fn use_theme_css() -> Memo<String> {
+    use_memo(move || {
+        let theme = THEME.read();
+        generate_css(&theme)
+    })
 }
 
 // ── Theme polling hook ──
