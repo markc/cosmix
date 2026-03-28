@@ -1,7 +1,8 @@
 pub mod amp;
 
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "native")]
+use anyhow::Result;
 
 // ── RC codes (ARexx convention) ──
 
