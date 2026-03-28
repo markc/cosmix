@@ -15,7 +15,7 @@ default = ["desktop"]
 desktop = ["dep:dioxus-desktop", "dep:tao", "dep:rfd"]
 web = []
 config = ["dep:cosmix_config", "dep:tokio"]
-hub = ["dep:cosmix_client", "dep:serde_json"]
+hub = ["dep:cosmix_client"]
 
 [dependencies]
 dioxus = { version = "0.7", features = [] }
@@ -25,7 +25,7 @@ rfd = { version = "0.15", optional = true }
 cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client", optional = true, default-features = false }
 cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", optional = true }
 tokio = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 pulldown-cmark = { workspace = true }
 base64 = { workspace = true }

@@ -8,6 +8,7 @@ members = [
     "crates/cosmix-lib-mesh",
     "crates/cosmix-lib-ui",
     "crates/cosmix-lib-daemon",
+    "crates/cosmix-lib-script",
     # GUI apps
     "crates/cosmix-backup",
     "crates/cosmix-dialog",

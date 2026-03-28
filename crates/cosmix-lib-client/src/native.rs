@@ -282,12 +282,16 @@ impl HubClient {
 
             let msg_id = msg.get("id").map(|s| s.to_string());
 
-            // If message has an id that matches a pending request, treat as response
-            let is_response = if let Some(ref id) = msg_id {
-                let mut p = pending.lock().await;
-                if let Some(tx) = p.remove(id) {
-                    let _ = tx.send(msg.clone());
-                    true
+            // If message is a response with an id that matches a pending request, resolve it
+            let is_response = if msg.get("type").is_some_and(|t| t == "response") {
+                if let Some(ref id) = msg_id {
+                    let mut p = pending.lock().await;
+                    if let Some(tx) = p.remove(id) {
+                        let _ = tx.send(msg.clone());
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }

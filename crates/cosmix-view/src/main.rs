@@ -1,10 +1,12 @@
 mod dot;
 mod markdown;
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use dioxus::prelude::*;
 use dioxus::prelude::Key;
-use std::path::PathBuf;
-use cosmix_ui::app_init::{THEME, use_theme_css, use_theme_poll, use_hub_client};
+use cosmix_ui::app_init::{THEME, use_theme_css, use_theme_poll, use_hub_client, use_hub_handler};
 use cosmix_ui::menu::{action_shortcut, amp_action, menubar, standard_file_menu, submenu, MenuBar, Shortcut};
 
 #[global_allocator]
@@ -69,6 +71,41 @@ fn main() {
     }
 }
 
+// ── Hub command handling ──
+
+static VIEW_REQUEST: GlobalSignal<Option<ViewRequest>> = Signal::global(|| None);
+static VIEW_PATH: GlobalSignal<Option<String>> = Signal::global(|| None);
+
+#[derive(Clone, Debug)]
+enum ViewRequest {
+    OpenFile(String),
+    ShowMarkdown(String),
+}
+
+fn dispatch_command(cmd: &cosmix_client::IncomingCommand) -> Result<String, String> {
+    match cmd.command.as_str() {
+        "view.open" => {
+            let path = cmd.args.get("path")
+                .and_then(|v| v.as_str())
+                .ok_or("missing path argument")?;
+            *VIEW_REQUEST.write() = Some(ViewRequest::OpenFile(path.to_string()));
+            Ok(serde_json::json!({"opened": path}).to_string())
+        }
+        "view.show-markdown" => {
+            let content = cmd.args.get("content")
+                .and_then(|v| v.as_str())
+                .ok_or("missing content argument")?;
+            *VIEW_REQUEST.write() = Some(ViewRequest::ShowMarkdown(content.to_string()));
+            Ok(r#"{"status":"ok"}"#.to_string())
+        }
+        "view.get-path" => {
+            let path = VIEW_PATH.read().clone();
+            Ok(serde_json::json!({"path": path}).to_string())
+        }
+        _ => Err(format!("unknown command: {}", cmd.command)),
+    }
+}
+
 fn is_image(path: &PathBuf) -> bool {
     cosmix_ui::util::is_image(path)
 }
@@ -83,13 +120,42 @@ fn mime_from_ext(path: &PathBuf) -> &'static str {
 
 fn app() -> Element {
     let mut file_path: Signal<Option<PathBuf>> = use_signal(|| {
-        std::env::var("COSMIX_VIEW_PATH").ok().map(PathBuf::from)
+        let p = std::env::var("COSMIX_VIEW_PATH").ok().map(PathBuf::from);
+        if let Some(ref path) = p {
+            *VIEW_PATH.write() = Some(path.to_string_lossy().to_string());
+        }
+        p
     });
 
     let hub_client = use_hub_client("view");
+    use_hub_handler(hub_client, "view", dispatch_command);
 
     // Poll config every 30s for theme changes
     use_theme_poll(30);
+
+    // Watch for incoming view requests from hub commands
+    let mut markdown_content: Signal<Option<String>> = use_signal(|| None);
+    use_effect(move || {
+        spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let req = VIEW_REQUEST.write().take();
+                if let Some(req) = req {
+                    match req {
+                        ViewRequest::OpenFile(path) => {
+                            *VIEW_PATH.write() = Some(path.clone());
+                            file_path.set(Some(PathBuf::from(path)));
+                            markdown_content.set(None);
+                        }
+                        ViewRequest::ShowMarkdown(content) => {
+                            file_path.set(None);
+                            markdown_content.set(Some(content));
+                        }
+                    }
+                }
+            }
+        });
+    });
 
     let open_file = move || {
         spawn(async move {
@@ -117,6 +183,7 @@ fn app() -> Element {
         submenu("Services", vec![
             amp_action("mon-status", "Monitor Status", "mon", "mon.status"),
         ]),
+        cosmix_script::user_menu("view"),
     ]);
     let open_for_menu = open_file.clone();
 
@@ -147,11 +214,15 @@ fn app() -> Element {
     use_theme_css();
     let fs = THEME.read().font_size;
 
-    let content = match file_path() {
-        Some(ref path) if is_image(path) => render_image(path),
-        Some(ref path) if is_dot(path) => render_dot_file(path),
-        Some(ref path) => render_markdown(path),
-        None => render_welcome(),
+    let content = if let Some(ref md) = markdown_content() {
+        render_markdown_content(md)
+    } else {
+        match file_path() {
+            Some(ref path) if is_image(path) => render_image(path),
+            Some(ref path) if is_dot(path) => render_dot_file(path),
+            Some(ref path) => render_markdown(path),
+            None => render_welcome(),
+        }
     };
 
     rsx! {
@@ -182,6 +253,26 @@ fn app() -> Element {
                         }
                     }
                     "quit" => std::process::exit(0),
+                    "script:reload" => { /* menu rebuilt each render */ }
+                    "script:open-folder" => {
+                        let dir = cosmix_script::scripts_dir().join("view");
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+                    }
+                    id if id.starts_with("script:") => {
+                        if let Some(ref client) = hub_client() {
+                            let client = client.clone();
+                            let id = id.to_string();
+                            spawn(async move {
+                                let mut vars = HashMap::new();
+                                if let Some(ref p) = *VIEW_PATH.read() {
+                                    vars.insert("CURRENT_FILE".into(), p.clone());
+                                }
+                                vars.insert("SERVICE_NAME".into(), "view".into());
+                                cosmix_script::handle_script_action(&id, "view", &client, &vars).await;
+                            });
+                        }
+                    }
                     _ => {}
                 },
             }
@@ -213,6 +304,17 @@ fn render_markdown(path: &PathBuf) -> Element {
     let base_dir = path.parent().map(|p| p.to_path_buf());
     let html = markdown::render_gfm(&content, base_dir.as_ref());
 
+    rsx! {
+        document::Style { "{CSS}" }
+        div {
+            class: "markdown-body",
+            dangerous_inner_html: "{html}"
+        }
+    }
+}
+
+fn render_markdown_content(content: &str) -> Element {
+    let html = markdown::render_gfm(content, None);
     rsx! {
         document::Style { "{CSS}" }
         div {

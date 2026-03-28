@@ -8,6 +8,8 @@
 //!
 //! Other apps delegate: mail sends `edit.compose`, files sends `edit.open`.
 
+use std::collections::HashMap;
+
 use dioxus::prelude::*;
 use cosmix_ui::app_init::{THEME, use_hub_client, use_hub_handler, use_theme_css};
 use cosmix_ui::menu::{action_shortcut, menubar, standard_file_menu, separator, submenu, MenuBar, Shortcut};
@@ -22,6 +24,8 @@ fn main() {
 // ── Shared state for hub commands to update the editor ──
 
 static OPEN_REQUEST: GlobalSignal<Option<OpenRequest>> = Signal::global(|| None);
+static EDITOR_CONTENT: GlobalSignal<String> = Signal::global(String::new);
+static EDITOR_PATH: GlobalSignal<Option<String>> = Signal::global(|| None);
 
 #[derive(Clone, Debug)]
 struct OpenRequest {
@@ -37,6 +41,16 @@ fn dispatch_command(cmd: &cosmix_client::IncomingCommand) -> Result<String, Stri
         "edit.open" => handle_edit_open(cmd),
         "edit.goto" => handle_edit_goto(cmd),
         "edit.compose" => handle_edit_compose(cmd),
+        "edit.get-content" => {
+            let content = EDITOR_CONTENT.peek().clone();
+            tracing::info!("edit.get-content: {} bytes", content.len());
+            Ok(serde_json::json!({"content": content}).to_string())
+        }
+        "edit.get-path" => {
+            let path = EDITOR_PATH.peek().clone();
+            tracing::info!("edit.get-path: {:?}", path);
+            Ok(serde_json::json!({"path": path}).to_string())
+        }
         "edit.get" => Ok(r#"{"status": "ok"}"#.to_string()),
         _ => Err(format!("unknown command: {}", cmd.command)),
     }
@@ -123,6 +137,8 @@ fn app() -> Element {
                     if let Some(path) = &req.path {
                         match load_file(path) {
                             Ok(text) => {
+                                *EDITOR_CONTENT.write() = text.clone();
+                                *EDITOR_PATH.write() = Some(path.clone());
                                 content.set(text.clone());
                                 file_path.set(Some(path.clone()));
                                 modified.set(false);
@@ -208,6 +224,7 @@ fn app() -> Element {
         submenu("View", vec![
             action_shortcut("preview", "Preview in Viewer", Shortcut::ctrl('p')),
         ]),
+        cosmix_script::user_menu("edit"),
     ]);
 
     let mut do_save_action = do_save.clone();
@@ -281,6 +298,26 @@ fn app() -> Element {
                         }
                     }
                     "quit" => std::process::exit(0),
+                    "script:reload" => { /* menu is rebuilt each render from disk */ }
+                    "script:open-folder" => {
+                        let dir = cosmix_script::scripts_dir().join("edit");
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+                    }
+                    id if id.starts_with("script:") => {
+                        if let Some(ref client) = hub_client() {
+                            let client = client.clone();
+                            let id = id.to_string();
+                            spawn(async move {
+                                let mut vars = HashMap::new();
+                                if let Some(ref p) = *EDITOR_PATH.read() {
+                                    vars.insert("CURRENT_FILE".into(), p.clone());
+                                }
+                                vars.insert("SERVICE_NAME".into(), "edit".into());
+                                cosmix_script::handle_script_action(&id, "edit", &client, &vars).await;
+                            });
+                        }
+                    }
                     _ => {}
                 },
             }
@@ -314,6 +351,7 @@ fn app() -> Element {
                     oninput: move |e| {
                         let val = e.value();
                         line_count.set(val.lines().count().max(1));
+                        *EDITOR_CONTENT.write() = val.clone();
                         content.set(val);
                         modified.set(true);
                     },

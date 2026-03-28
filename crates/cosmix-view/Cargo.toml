@@ -29,3 +29,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 layout-rs = "0.1"
 rfd = "0.15"
+cosmix_script = { package = "cosmix-lib-script", path = "../cosmix-lib-script", features = ["menu"] }

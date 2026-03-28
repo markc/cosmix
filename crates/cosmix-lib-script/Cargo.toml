@@ -1,0 +1,23 @@
+[package]
+name = "cosmix-lib-script"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ARexx-style scripting: script discovery, TOML definitions, variable substitution, and menu generation"
+
+[lib]
+name = "cosmix_script"
+path = "src/lib.rs"
+
+[features]
+default = []
+menu = ["dep:cosmix_ui"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml_cfg = { workspace = true }
+tracing = { workspace = true }
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client" }
+cosmix_ui = { package = "cosmix-lib-ui", path = "../cosmix-lib-ui", optional = true, default-features = false }

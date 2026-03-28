@@ -1,4 +1,7 @@
 //! Grid-based table header component.
+//!
+//! **Deprecated:** Prefer [`super::DataTable`] for new code — it includes
+//! sortable headers, row rendering, selection, and pagination.
 
 use dioxus::prelude::*;
 
