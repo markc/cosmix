@@ -76,7 +76,7 @@ fn app() -> Element {
                 // Tell configd to reload + notify all watchers
                 spawn(async move {
                     if let Some(client) = hub() {
-                        let _ = client.call("configd", "config.reload", serde_json::Value::Null).await;
+                        let _ = client.call("config", "config.reload", serde_json::Value::Null).await;
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;

@@ -117,7 +117,7 @@ pub fn use_theme_hub_watch(
             if let Some(c) = client() {
                 // Register as config watcher
                 let _ = c.call(
-                    "configd",
+                    "config",
                     "config.watch",
                     serde_json::json!({ "watcher": service_name }),
                 ).await;
@@ -217,7 +217,7 @@ pub fn use_hub_handler<F>(
             {
                 let _ = c
                     .call(
-                        "configd",
+                        "config",
                         "config.watch",
                         serde_json::json!({ "watcher": service_name }),
                     )
