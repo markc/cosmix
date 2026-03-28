@@ -112,11 +112,10 @@ fn app() -> Element {
         }
     };
 
-    let css = use_theme_css();
+    use_theme_css();
     let app_menu = menubar(vec![standard_file_menu(vec![])]);
 
     rsx! {
-        document::Style { "{css}" }
         div {
             style: "width:100%;height:100vh;display:flex;flex-direction:column;background:var(--bg-primary);color:var(--fg-primary);font-family:var(--font-sans);",
 

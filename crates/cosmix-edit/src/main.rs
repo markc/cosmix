@@ -244,13 +244,12 @@ fn app() -> Element {
         .unwrap_or_else(|| format!("untitled{title_suffix}"));
 
     let lines = line_count();
-    let css = use_theme_css();
+    use_theme_css();
     let theme = THEME.read();
     let fs = theme.font_size;
     let fs_sm = fs.saturating_sub(2);
 
     rsx! {
-        document::Style { "{css}" }
         div {
             tabindex: "0",
             onkeydown: onkeydown,

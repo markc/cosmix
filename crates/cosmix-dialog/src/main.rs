@@ -131,11 +131,10 @@ fn exit(code: i32) {
 // ── UI ──
 
 fn app() -> Element {
-    let css = use_theme_css();
+    use_theme_css();
     let mode = DIALOG_MODE.get().unwrap();
 
     rsx! {
-        document::Style { "{css}" }
         {match mode {
             Mode::TextInfo { .. } => text_info_view(),
             Mode::Info { text, .. } => message_view(text, "info"),

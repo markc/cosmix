@@ -144,7 +144,7 @@ fn app() -> Element {
         }
     };
 
-    let theme_css = use_theme_css();
+    use_theme_css();
     let fs = THEME.read().font_size;
 
     let content = match file_path() {
@@ -155,7 +155,6 @@ fn app() -> Element {
     };
 
     rsx! {
-        document::Style { "{theme_css}" }
         div {
             tabindex: "0",
             onkeydown: onkeydown,

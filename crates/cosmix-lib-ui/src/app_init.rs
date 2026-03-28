@@ -39,23 +39,39 @@ pub fn reload_theme() {
     }
 }
 
-// ── Theme CSS hook ──
+// ── Theme CSS injection ──
 
-/// Returns a reactive memo of the current theme CSS string.
+/// Injects theme CSS into the document and reactively updates it when THEME changes.
 ///
-/// The memo automatically re-computes when THEME changes, ensuring
-/// `document::Style` updates immediately.
+/// Uses `document::eval()` to create/update a `<style id="cosmix-theme">` element,
+/// because `document::Style` is write-once and ignores prop changes after first render.
 ///
-/// Usage in any app's `app()`:
+/// Call once in your app's root component. No `document::Style` needed in rsx.
+///
 /// ```ignore
-/// let css = use_theme_css();
-/// rsx! { document::Style { "{css}" } ... }
+/// fn app() -> Element {
+///     use_theme_css();
+///     rsx! { div { style: "background:var(--bg-primary);", "themed!" } }
+/// }
 /// ```
-pub fn use_theme_css() -> Memo<String> {
-    use_memo(move || {
+pub fn use_theme_css() {
+    use_effect(move || {
         let theme = THEME.read();
-        generate_css(&theme)
-    })
+        let css = generate_css(&theme);
+        // Escape backticks in CSS (unlikely but safe)
+        let css = css.replace('`', "\\`");
+        document::eval(&format!(
+            r#"
+            let el = document.getElementById('cosmix-theme');
+            if (!el) {{
+                el = document.createElement('style');
+                el.id = 'cosmix-theme';
+                document.head.appendChild(el);
+            }}
+            el.textContent = `{css}`;
+            "#
+        ));
+    });
 }
 
 // ── Theme polling hook ──

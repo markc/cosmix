@@ -104,7 +104,7 @@ fn app() -> Element {
     let emails_class = if mv == MobileView::Emails { "pane-emails mobile-active" } else { "pane-emails" };
     let reader_class = if mv == MobileView::Reader { "pane-reader mobile-active" } else { "pane-reader" };
 
-    let theme_css = use_theme_css();
+    use_theme_css();
     let fs = THEME.read().font_size;
 
     let app_menu = menubar(vec![
@@ -118,7 +118,6 @@ fn app() -> Element {
     ]);
 
     rsx! {
-        document::Style { "{theme_css}" }
         document::Style { "{MAIL_CSS}" }
         div {
             style: "width:100%; height:100vh; display:flex; flex-direction:column; background:var(--bg-primary); color:var(--fg-primary); font-size:{fs}px; font-family:var(--font-sans);",

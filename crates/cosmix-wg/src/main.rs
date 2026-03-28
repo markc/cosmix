@@ -221,7 +221,7 @@ fn app() -> Element {
 
     let total_peers: usize = interfaces().iter().map(|i| i.peers.len()).sum();
 
-    let css = use_theme_css();
+    use_theme_css();
     let theme = THEME.read();
     let fs = theme.font_size;
     let fs_sm = fs.saturating_sub(2);
@@ -229,7 +229,6 @@ fn app() -> Element {
     let app_menu = menubar(vec![standard_file_menu(vec![])]);
 
     rsx! {
-        document::Style { "{css}" }
         div {
             style: "width:100%; height:100vh; display:flex; flex-direction:column; background:var(--bg-primary); color:var(--fg-primary); font-family:var(--font-sans); font-size:{fs}px;",
 

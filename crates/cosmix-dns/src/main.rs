@@ -195,7 +195,7 @@ enum View {
 
 fn app() -> Element {
     use_theme_poll(30);
-    let css = use_theme_css();
+    use_theme_css();
 
     let mut zones: Signal<Vec<ZoneInfo>> = use_signal(Vec::new);
     let mut records: Signal<Vec<RecordEntry>> = use_signal(Vec::new);
@@ -275,7 +275,6 @@ fn app() -> Element {
     let zdir = zone_dir().display().to_string();
 
     rsx! {
-        document::Style { "{css}" }
         div {
             style: "width:100%; height:100vh; display:flex; flex-direction:column; background:var(--bg-primary); color:var(--fg-primary); font-family:var(--font-sans); font-size:13px;",
 

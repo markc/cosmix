@@ -30,7 +30,7 @@ pub const RIGHT_PANELS: &[&str] = &["Monitor", "Settings", "Notifications"];
 
 /// The main shell component.
 pub fn shell_app() -> Element {
-    let css = use_theme_css();
+    use_theme_css();
 
     let left_pinned = *LEFT_PINNED.read();
     let right_pinned = *RIGHT_PINNED.read();
@@ -43,7 +43,6 @@ pub fn shell_app() -> Element {
     };
 
     rsx! {
-        document::Style { "{css}" }
         div {
             style: "width:100%; height:100vh; display:flex; flex-direction:column; background:var(--bg-primary); color:var(--fg-primary); font-family:var(--font-sans);",
 
