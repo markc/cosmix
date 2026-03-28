@@ -6,6 +6,7 @@
 
 use dioxus::prelude::*;
 use cosmix_ui::app_init::{THEME, use_theme_css};
+use cosmix_ui::menu::{menubar, standard_file_menu, MenuBar};
 use cosmix_ui::theme::ThemeParams;
 
 #[global_allocator]
@@ -103,11 +104,23 @@ fn app() -> Element {
     };
 
     let css = use_theme_css();
+    let app_menu = menubar(vec![standard_file_menu(vec![])]);
 
     rsx! {
         document::Style { "{css}" }
         div {
-            style: "width:100%;height:100vh;display:flex;background:var(--bg-primary);color:var(--fg-primary);font-family:var(--font-sans);",
+            style: "width:100%;height:100vh;display:flex;flex-direction:column;background:var(--bg-primary);color:var(--fg-primary);font-family:var(--font-sans);",
+
+            MenuBar {
+                menu: app_menu,
+                on_action: move |id: String| match id.as_str() {
+                    "quit" => std::process::exit(0),
+                    _ => {}
+                },
+            }
+
+            div {
+                style: "flex:1;display:flex;overflow:hidden;",
 
             // Sidebar
             div {
@@ -186,6 +199,7 @@ fn app() -> Element {
                         }
                     }
                 }
+            }
             }
         }
     }
