@@ -80,11 +80,25 @@ Handled generically before falling through to app-specific `dispatch_command()`.
 - Never positional (`toolbar-btn-3`) or structural (`panel-left-save`)
 - `ui.list` supports prefix filtering for scalable discovery
 
-## Security Model
+## Security Model — Trust Domains
 
-- Local Lua scripts: full `ui.*` access by default
-- Remote AMP (cross-node): `ui.invoke` DENIED by default, requires explicit per-app opt-in
-- Scope field on `UiCommand` dispatch to enforce this at the hub level
+A single WireGuard /24 network is a **single trust domain**. All nodes belong to the person who controls the primary node. Mesh membership IS the credential — the ARexx model extended from "one machine" to "the /24."
+
+**Intra-mesh (same /24):** Full `ui.*` access everywhere. No per-widget ACLs, no capability tokens, no auth headers. The hub just routes. If the packet arrived on the WireGuard interface, it's trusted.
+
+**Inter-mesh (bridge between /24s):** This is where gating lives. Bridge node is the policy enforcement point. Only explicitly shared endpoints cross the bridge. All `ui.*` commands from foreign meshes rejected by default.
+
+**Not needed now:** per-widget ACLs, per-app remote-UI policy, capability tokens, auth on AMP messages.
+
+**Needed from day one (zero cost, prevents retrofit):** Every AMP message carries a `from:` origin field. No one checks it today. The bridge checks it when inter-mesh arrives.
+
+```yaml
+---
+command: ui.invoke
+to: save-btn.edit.cachyos.amp
+from: phone.amp
+---
+```
 
 ## Implementation Order
 
@@ -155,14 +169,6 @@ to: edit.cachyos.amp
 
 One round trip, three actions. Design for batching early.
 
-### Security at Mesh Scale
-
-Local scripts driving your own editor: fine. Remote invocation of `rm-all-btn.admin.netserva.amp` from any mesh node: catastrophic.
-
-- Per-app remote-UI policy: app declares which widget IDs are remotely addressable
-- Node hub enforces policy *before* routing to the app
-- Default deny for all `ui.*` commands from remote origins
-
 ### Build Sequence
 
 Each layer delivers value independently:
@@ -180,4 +186,7 @@ Layer 3 is layer 2 with the node hub doing a DNS lookup first. If layer 2 has op
 - **ID stability:** Semantic IDs are an API surface. Renaming = breaking change. Document them
 - **Partial coverage:** If only some elements are addressable, scripts break silently on the rest. Commit per-app or keep to action-level commands
 - **`ui.list` must include state:** Without current values, scripts can invoke but can't observe — half-blind automation
-- **Performance:** Registry signal updates on render cycles. Use fine-grained signals per element, not a single global signal that triggers mass re-renders
+- **Performance:** Registry updates on every render. Acceptable now; if it becomes a bottleneck, switch to dirty-flag updates
+- **`from:` field from day one:** Stamp every AMP message with origin node. Zero cost now, prevents painful retrofit when inter-mesh bridging arrives
+- **Batching:** `ui.batch` exists. Use it for cross-node scripts — chaining sequential round trips feels sluggish
+- **Registry in render body, not effects:** `use_effect` captures props by value and doesn't re-run when props change. Register directly in the component body so state is always current (learned the hard way with AmpToggle)
