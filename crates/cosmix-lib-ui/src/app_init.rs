@@ -242,6 +242,7 @@ pub fn use_hub_handler<F>(
                     "menu.list" => handle_menu_list(&cmd),
                     "menu.invoke" | "menu.highlight" | "menu.close" => handle_menu_command(&cmd),
                     "ui.list" => handle_ui_list(&cmd),
+                    "ui.get" => handle_ui_get(&cmd),
                     "ui.invoke" | "ui.highlight" | "ui.set" => handle_ui_command(&cmd),
                     "ui.batch" => handle_ui_batch(&cmd),
                     _ => handler(&cmd),
@@ -408,6 +409,30 @@ fn handle_ui_list(
     let prefix = cmd.args.get("prefix").and_then(|v| v.as_str());
     let registry = UI_REGISTRY.read();
     let items = registry.list(prefix);
+    Ok(serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string()))
+}
+
+/// Handle `ui.get` — return current state of specific elements.
+///
+/// Accepts `{"id": "..."}` for a single element or `{"ids": ["a","b"]}` for multiple.
+#[cfg(all(not(target_arch = "wasm32"), feature = "hub"))]
+fn handle_ui_get(
+    cmd: &cosmix_client::IncomingCommand,
+) -> Result<String, String> {
+    use crate::components::UI_REGISTRY;
+
+    let registry = UI_REGISTRY.read();
+
+    // Support single id or array of ids
+    let ids: Vec<&str> = if let Some(id) = cmd.args.get("id").and_then(|v| v.as_str()) {
+        vec![id]
+    } else if let Some(arr) = cmd.args.get("ids").and_then(|v| v.as_array()) {
+        arr.iter().filter_map(|v| v.as_str()).collect()
+    } else {
+        return Err("ui.get requires {\"id\": \"...\"} or {\"ids\": [...]}".to_string());
+    };
+
+    let items = registry.get(&ids);
     Ok(serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string()))
 }
 

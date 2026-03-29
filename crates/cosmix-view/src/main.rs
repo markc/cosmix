@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use dioxus::prelude::*;
 use dioxus::prelude::Key;
 use cosmix_ui::app_init::{THEME, use_theme_css, use_theme_poll, use_hub_client, use_hub_handler};
-use cosmix_ui::components::AmpButton;
+use cosmix_ui::components::{AmpButton, AmpToggle, AmpInput};
 use cosmix_ui::menu::{action_shortcut, amp_action, menubar, standard_file_menu, submenu, MenuBar, Shortcut};
 
 #[global_allocator]
@@ -215,8 +215,13 @@ fn app() -> Element {
         }
     };
 
+    // AMP-addressable UI state
+    let mut word_wrap = use_signal(|| true);
+    let path_display = file_path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+
     use_theme_css();
     let fs = THEME.read().font_size;
+    let wrap_style = if word_wrap() { "word-wrap: break-word;" } else { "white-space: pre; overflow-x: auto;" };
 
     let content = if let Some(ref md) = markdown_content() {
         render_markdown_content(md)
@@ -280,7 +285,26 @@ fn app() -> Element {
                     _ => {}
                 },
             }
-            div { style: "flex:1; overflow:auto;",
+            // Toolbar with AMP-addressable widgets
+            div {
+                style: "display:flex; align-items:center; gap:12px; padding:4px 12px; background:var(--bg-secondary,#111827); border-bottom:1px solid var(--border,#1f2937); flex-shrink:0;",
+                AmpToggle {
+                    id: "view.word-wrap",
+                    label: "Wrap",
+                    checked: word_wrap(),
+                    on_change: move |v: bool| word_wrap.set(v),
+                }
+                AmpInput {
+                    id: "view.path",
+                    label: "File path",
+                    value: path_display.clone(),
+                    placeholder: "No file open",
+                    disabled: true,
+                    on_change: move |_: String| {},
+                    class: "flex:1".to_string(),
+                }
+            }
+            div { style: "flex:1; overflow:auto; {wrap_style}",
                 {content}
             }
         }

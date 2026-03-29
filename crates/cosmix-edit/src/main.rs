@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use dioxus::prelude::*;
 use cosmix_ui::app_init::{THEME, use_hub_client, use_hub_handler, use_theme_css};
+use cosmix_ui::components::{AmpToggle, AmpInput};
 use cosmix_ui::menu::{action_shortcut, menubar, standard_file_menu, separator, submenu, MenuBar, Shortcut};
 
 #[global_allocator]
@@ -268,6 +269,9 @@ fn app() -> Element {
         .unwrap_or_else(|| format!("untitled{title_suffix}"));
 
     let lines = line_count();
+    let mut show_line_nums = use_signal(|| true);
+    let path_display = file_path().unwrap_or_default();
+
     use_theme_css();
     let theme = THEME.read();
     let fs = theme.font_size;
@@ -332,24 +336,38 @@ fn app() -> Element {
                 },
             }
 
-            // Title bar
+            // Toolbar with AMP-addressable widgets
             div {
-                style: "padding:3px 12px; background:var(--bg-secondary); border-bottom:1px solid var(--border); font-size:{fs}px; display:flex; align-items:center;",
-                span { style: "font-weight:600; font-family:var(--font-sans);", "{title}" }
-                if let Some(ref path) = file_path() {
-                    span { style: "margin-left:8px; color:var(--fg-muted); font-size:{fs_sm}px; font-family:var(--font-sans);", "{path}" }
+                style: "padding:3px 12px; background:var(--bg-secondary); border-bottom:1px solid var(--border); font-size:{fs_sm}px; display:flex; align-items:center; gap:12px; font-family:var(--font-sans);",
+                span { style: "font-weight:600; font-size:{fs}px;", "{title}" }
+                AmpToggle {
+                    id: "edit.line-numbers",
+                    label: "Lines",
+                    checked: show_line_nums(),
+                    on_change: move |v: bool| show_line_nums.set(v),
+                }
+                AmpInput {
+                    id: "edit.path",
+                    label: "File path",
+                    value: path_display.clone(),
+                    placeholder: "untitled",
+                    disabled: true,
+                    on_change: move |_: String| {},
+                    class: "flex:1".to_string(),
                 }
             }
 
-            // Editor area with line numbers
+            // Editor area with optional line numbers
             div {
                 style: "flex:1; display:flex; overflow:hidden;",
 
-                // Line numbers
-                div {
-                    style: "width:48px; background:var(--bg-secondary); border-right:1px solid var(--border); padding:8px 4px; text-align:right; color:var(--fg-muted); font-size:{fs_sm}px; line-height:1.5; overflow:hidden; user-select:none;",
-                    for i in 1..=lines {
-                        div { "{i}" }
+                // Line numbers (toggle-able via AMP)
+                if show_line_nums() {
+                    div {
+                        style: "width:48px; background:var(--bg-secondary); border-right:1px solid var(--border); padding:8px 4px; text-align:right; color:var(--fg-muted); font-size:{fs_sm}px; line-height:1.5; overflow:hidden; user-select:none;",
+                        for i in 1..=lines {
+                            div { "{i}" }
+                        }
                     }
                 }
 
