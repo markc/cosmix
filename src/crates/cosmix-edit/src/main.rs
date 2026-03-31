@@ -41,7 +41,7 @@ fn dispatch_command(cmd: &cosmix_client::IncomingCommand) -> Result<String, Stri
     match cmd.command.as_str() {
         "edit.open" => handle_edit_open(cmd),
         "edit.goto" => handle_edit_goto(cmd),
-        "edit.compose" => handle_edit_compose(cmd),
+        "edit.compose" | "edit.set-content" => handle_edit_compose(cmd),
         "edit.get-content" => {
             let content = EDITOR_CONTENT.peek().clone();
             tracing::info!("edit.get-content: {} bytes", content.len());

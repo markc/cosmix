@@ -212,13 +212,13 @@ pub fn use_hub_handler<F>(
 
             let Some(c) = client() else { return };
 
-            // Register for config change notifications (fire-and-forget —
-            // must not block if configd is not running, otherwise the command
-            // dispatch loop below never starts).
+            // Register for config change notifications.
+            // Uses call() so the response is consumed here (not leaked
+            // into the incoming command stream as a stale message).
             #[cfg(feature = "config")]
             {
                 let _ = c
-                    .send(
+                    .call(
                         "config",
                         "config.watch",
                         serde_json::json!({ "watcher": service_name }),
