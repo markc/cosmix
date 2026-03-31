@@ -22,5 +22,5 @@ toml_cfg = { workspace = true }
 tracing = { workspace = true }
 cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client" }
 cosmix_ui = { package = "cosmix-lib-ui", path = "../cosmix-lib-ui", optional = true, default-features = false }
-mix-core = { path = "../../../mix/crates/mix-core", features = ["json"], optional = true }
+mix-core = { path = "../../../../.mix/src/crates/mix-core", features = ["json"], optional = true }
 tokio = { workspace = true, optional = true }

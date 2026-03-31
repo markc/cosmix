@@ -1,5 +1,5 @@
-/target
-Cargo.lock
+src/target
+src/Cargo.lock
 *.swp
 *.swo
 .env

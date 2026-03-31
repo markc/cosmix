@@ -171,7 +171,7 @@ fn app() -> Element {
     let do_open = move || {
         spawn(async move {
             if let Some(path) = cosmix_ui::desktop::pick_file(
-                &[("Text files", &["txt", "md", "rs", "toml", "json", "yaml", "sh", "py", "lua"])],
+                &[("Text files", &["txt", "md", "rs", "toml", "json", "yaml", "sh", "py", "mx"])],
             ).await {
                 *OPEN_REQUEST.write() = Some(OpenRequest {
                     path: Some(path.to_string_lossy().to_string()),

@@ -58,12 +58,12 @@ impl PortResponse {
 
 // ── Script info (for macro menus) ──
 
-/// Metadata for a Lua script that appears in an app's Scripts menu.
+/// Metadata for a script that appears in an app's Scripts menu.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScriptInfo {
     /// Display name (derived from filename, e.g. "Add Watermark")
     pub display_name: String,
-    /// Full path to the .lua file
+    /// Full path to the script file
     pub path: String,
 }
 

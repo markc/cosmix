@@ -10,7 +10,7 @@ Cosmix is a self-hosted sovereign intelligence stack: JMAP mail server + Dioxus 
 
 ## Workspace
 
-24-crate monorepo, Rust 2024 edition. Naming convention distinguishes crate types:
+Monorepo with Cargo workspace under `src/`. Top level is clean (docs + config only). Rust 2024 edition. Naming convention distinguishes crate types:
 
 - `cosmix-lib-*` — libraries (Rust module name: `cosmix_*`)
 - `cosmix-*` — GUI apps (Dioxus desktop/web)
@@ -24,6 +24,7 @@ Cosmix is a self-hosted sovereign intelligence stack: JMAP mail server + Dioxus 
 | `cosmix-lib-client` | `cosmix_client` | AMP WebSocket client (native + WASM) |
 | `cosmix-lib-config` | `cosmix_config` | Typed config structs + TOML load/save |
 | `cosmix-lib-mesh` | `cosmix_mesh` | WireGuard mesh networking, WebSocket peer sync |
+| `cosmix-lib-script` | `cosmix_script` | Script discovery, TOML defs, Mix runtime bridge, User menu |
 | `cosmix-lib-ui` | `cosmix_ui` | Shared Dioxus components, theme, icons |
 
 ### GUI Apps
@@ -38,7 +39,7 @@ Cosmix is a self-hosted sovereign intelligence stack: JMAP mail server + Dioxus 
 | `cosmix-mail` | JMAP mail client (Dioxus desktop/web) |
 | `cosmix-menu` | System tray app launcher |
 | `cosmix-mon` | System monitor GUI (desktop + WASM) |
-| `cosmix-scripts` | Lua + Bash script manager |
+| `cosmix-scripts` | Mix + Bash script manager |
 | `cosmix-settings` | Settings/preferences editor |
 | `cosmix-shell` | DCS shell — primary UI surface (desktop + WASM) |
 | `cosmix-view` | Markdown/image viewer |
@@ -55,22 +56,25 @@ Cosmix is a self-hosted sovereign intelligence stack: JMAP mail server + Dioxus 
 | `cosmix-mond` | System monitor daemon |
 | `cosmix-webd` | WASM app server + CMS API |
 
-External path dependency: `spamlite` at `~/.gh/spamlite` (Bayesian spam classifier).
+External path dependencies:
+- `spamlite` at `~/.gh/spamlite` (Bayesian spam classifier)
+- `mix-core` at `~/.mix/src/crates/mix-core` (Mix scripting language core)
 
 ## Build Commands
 
 ```bash
-cargo build                             # entire workspace
-cargo build -p cosmix-maild             # single crate
-cargo build -p cosmix-maild --release   # release build
-cargo check                             # type-check without codegen
+cd src                                            # Cargo workspace root
+cargo build                                       # entire workspace
+cargo build -p cosmix-maild                        # single crate
+cargo build -p cosmix-maild --release              # release build
+cargo check                                        # type-check without codegen
 ```
 
 Dioxus client (requires `dx` CLI — `cargo binstall dioxus-cli`):
 ```bash
-cd crates/cosmix-mail && dx serve                  # desktop hot-reload
-cd crates/cosmix-mail && dx serve --platform web    # browser WASM
-cd crates/cosmix-mail && dx serve --hotpatch        # Rust hot-patch
+cd src/crates/cosmix-mail && dx serve                  # desktop hot-reload
+cd src/crates/cosmix-mail && dx serve --platform web    # browser WASM
+cd src/crates/cosmix-mail && dx serve --hotpatch        # Rust hot-patch
 ```
 
 No test suite yet. Manual validation via curl (JMAP) and nc/swaks (SMTP).
@@ -100,7 +104,7 @@ Config loaded from `~/.config/cosmix/jmap.toml` or `/etc/cosmix/jmap.toml`. Key 
 
 ## Database Architecture
 
-PostgreSQL with sqlx (async, compile-time checked queries). Four migrations in `crates/cosmix-maild/migrations/`:
+PostgreSQL with sqlx (async, compile-time checked queries). Four migrations in `src/crates/cosmix-maild/migrations/`:
 
 **State tracking:** All mutations write to `changelog(account_id, object_type, object_id, change_type)`. JMAP state = max changelog ID per (account_id, object_type). This powers `/changes` and `/query` efficiently.
 
@@ -147,6 +151,7 @@ RC codes: 0=success, 5=warning, 10=error, 20=failure. Used across Unix sockets (
 - **Dioxus 0.7** for client — not libcosmic (old stack was libcosmic, pivoted to Dioxus)
 - **AI lives in the server** — any JMAP client gets AI via email; cosmix-mail just gets richer UI
 - **No Docker** — Incus or Proxmox containers only
+- **Mix** for scripting — pure-Rust language at `~/.mix/`, replaces Lua. Native AMP IPC via `send`/`address`/`emit` keywords. `mix-core` embedded in `cosmix-lib-script` and `cosmix-scripts` as path dep.
 - **mimalloc** allocator in all binaries
 - **`paru`** for AUR packages on CachyOS/Arch
 
@@ -156,4 +161,4 @@ RC codes: 0=success, 5=warning, 10=error, 20=failure. Used across Unix sockets (
 - `spamlite` is a sibling path dep (`../spamlite`), not on crates.io
 - Spam databases are per-account SQLite files, not shared — prevents cross-user model contamination
 - Thread formation (Message-ID + In-Reply-To matching) is not yet implemented
-- The `_doc/` directory contains 30 design documents from the cosmix-cosmic era — check these before guessing at architectural intent
+- The `src/_doc/` directory contains 30+ design documents — check these before guessing at architectural intent

@@ -272,14 +272,14 @@ impl Default for MeshSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LauncherSettings {
-    pub lua_scripts_dir: String,
+    pub scripts_dir: String,
     pub editor: String,
 }
 
 impl Default for LauncherSettings {
     fn default() -> Self {
         Self {
-            lua_scripts_dir: "~/.local/lua".into(),
+            scripts_dir: "~/.local/scripts".into(),
             editor: "cosmix-edit".into(),
         }
     }

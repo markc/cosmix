@@ -15,6 +15,6 @@ clap.workspace = true
 mimalloc.workspace = true
 tokio.workspace = true
 dirs-next = "2"
-mix-core = { path = "../../../mix/crates/mix-core", features = ["json"] }
+mix-core = { path = "../../../../.mix/src/crates/mix-core", features = ["json"] }
 cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client" }
 cosmix_script = { package = "cosmix-lib-script", path = "../cosmix-lib-script" }

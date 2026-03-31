@@ -37,7 +37,7 @@ members = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/markc/cosmixos"
+repository = "https://github.com/markc/cosmix"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -66,6 +66,6 @@ pulldown-cmark = { version = "0.12", default-features = false, features = ["html
 mail-builder = "0.4"
 directories = "6"
 toml_cfg = { package = "toml", version = "0.8" }
-spamlite = { path = "../spamlite" }
+spamlite = { path = "../../.gh/spamlite" }
 rusqlite = { version = "0.38", features = ["bundled"] }
 notify = { version = "7", default-features = false, features = ["macos_fsevent"] }

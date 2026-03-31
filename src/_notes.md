@@ -12,7 +12,7 @@ Last updated: 2026-03-25
 |-----------|------|----------|
 | cosmix-jmap | `mail.db` (accounts, mailboxes, emails, calendars, contacts, changelog) — rusqlite + FTS5 | ~10MB |
 | cosmix-embed | `vectors.db` (embeddings via sqlite-vec) + nomic-embed-text model (on-demand) | ~7MB |
-| cosmix-portd | AMP IPC + Lua scripting | ~5MB |
+| cosmix-lib-script + cosmix-scripts | Mix scripting + Bash | ~5MB |
 | cosmix-web | HTTPS frontend | ~5MB |
 | **Total** | **Two SQLite files, zero daemons** | **~27MB** |
 
@@ -87,7 +87,7 @@ After nodes are deployed and receiving real mail:
 ### Phase C: Hardening + Polish
 
 1. Rate limiting, health check, graceful shutdown (J7)
-2. Wire cosmix-port into cosmix-jmap (J6)
+2. Wire Mix scripting into cosmix-jmap (J6)
 3. JMAP compliance tests
 4. Sieve filtering (J4)
 
@@ -112,7 +112,7 @@ After nodes are deployed and receiving real mail:
 - **Phase 1-2:** COSMIC desktop + Dioxus 0.7 toolchain validated
 - **Phase 3 J1-J3:** JMAP Core + Email + SMTP + Calendars + Contacts (22 methods)
 - **Phase 4:** CalDAV/CardDAV pivoted to native JMAP methods
-- **cosmix-port:** AMP wire format library (441 LOC)
+- **cosmix-lib-script + cosmix-scripts:** Mix scripting + Bash integrated
 - **cosmix-mail UI:** Compose, Reply, Forward, Actions toolbar, unread badges
 - **cosmix-embed:** Lazy load/unload, 7MB idle, deployed to mko
 - **Server Email/set create:** Upload blob → create email record from MIME
