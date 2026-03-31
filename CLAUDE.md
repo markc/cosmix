@@ -49,10 +49,13 @@ Monorepo with Cargo workspace under `src/`. Top level is clean (docs + config on
 
 | Crate | Purpose |
 |-------|---------|
+| `cosmix-claude` | Claude Code agent daemon |
 | `cosmix-configd` | Config watcher, serves settings via AMP |
 | `cosmix-hubd` | WebSocket message broker |
 | `cosmix-indexd` | Semantic indexing + vector storage (candle + sqlite-vec) |
+| `cosmix-logd` | Structured log aggregation |
 | `cosmix-maild` | JMAP (RFC 8620/8621) + SMTP mail server |
+| `cosmix-mcp` | Model Context Protocol bridge for Claude Code |
 | `cosmix-mond` | System monitor daemon |
 | `cosmix-webd` | WASM app server + CMS API |
 
@@ -158,7 +161,7 @@ RC codes: 0=success, 5=warning, 10=error, 20=failure. Used across Unix sockets (
 ## Gotchas
 
 - Linux WebKit black screen: cosmix-mail sets `WEBKIT_DISABLE_COMPOSITING_MODE=1` before Dioxus launch
-- `spamlite` is a sibling path dep (`../spamlite`), not on crates.io
+- `spamlite` is a path dep at `~/.gh/spamlite`, not on crates.io
 - Spam databases are per-account SQLite files, not shared — prevents cross-user model contamination
 - Thread formation (Message-ID + In-Reply-To matching) is not yet implemented
 - The `src/_doc/` directory contains 30+ design documents — check these before guessing at architectural intent

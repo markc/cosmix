@@ -92,6 +92,10 @@ fn dispatch_command(cmd: &cosmix_client::IncomingCommand) -> Result<String, Stri
             let content = cmd.args.get("content")
                 .and_then(|v| v.as_str())
                 .ok_or("missing content argument")?;
+            // Optional source path — lets "Edit this file" work after show-markdown
+            if let Some(path) = cmd.args.get("path").and_then(|v| v.as_str()) {
+                *VIEW_PATH.write() = Some(path.to_string());
+            }
             eprintln!("[view] view.show-markdown: {} bytes", content.len());
             *VIEW_REQUEST.write() = Some(ViewRequest::ShowMarkdown(content.to_string()));
             Ok(r#"{"status":"ok"}"#.to_string())
@@ -168,6 +172,8 @@ fn app() -> Element {
                 .pick_file()
                 .await;
             if let Some(handle) = picked {
+                let path_str = handle.path().to_string_lossy().to_string();
+                *VIEW_PATH.write() = Some(path_str);
                 file_path.set(Some(handle.path().to_path_buf()));
             }
         });
