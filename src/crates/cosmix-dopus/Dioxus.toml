@@ -1,0 +1,10 @@
+[application]
+name = "cosmix-dopus"
+default_platform = "desktop"
+
+[desktop]
+enable_default_menu_bar = false
+
+[application.tools.tailwindcss]
+input = "input.css"
+output = "assets/tailwind.css"

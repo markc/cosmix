@@ -1,0 +1,48 @@
+@import "tailwindcss";
+@source "./src/**/*.{rs,html}";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --color-bg-primary: var(--bg-primary);
+  --color-bg-secondary: var(--bg-secondary);
+  --color-bg-tertiary: var(--bg-tertiary);
+  --color-fg-primary: var(--fg-primary);
+  --color-fg-secondary: var(--fg-secondary);
+  --color-fg-muted: var(--fg-muted);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-subtle: var(--accent-subtle);
+  --color-border: var(--border);
+  --color-border-muted: var(--border-muted);
+  --color-success: var(--success);
+  --color-danger: var(--danger);
+  --color-warning: var(--warning);
+}
+
+@layer base {
+  *, *::before, *::after { box-sizing: border-box; }
+  button, input, select, textarea {
+    all: unset;
+    font: inherit;
+    color: inherit;
+  }
+  button { cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
+  input, textarea { cursor: text; }
+
+  [data-state="on"], [data-state="active"] {
+    background: var(--accent-subtle);
+    color: var(--fg-primary);
+  }
+  [data-disabled="true"] {
+    opacity: 0.5;
+    pointer-events: none;
+  }
+}
+
+@layer components {
+  .border-safe { border-color: rgba(128,128,128,0.4); }
+  .border-b-safe { border-bottom: 1px solid rgba(128,128,128,0.4); }
+  .border-t-safe { border-top: 1px solid rgba(128,128,128,0.4); }
+}

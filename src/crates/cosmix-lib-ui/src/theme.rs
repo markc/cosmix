@@ -124,6 +124,38 @@ pub fn generate_css(p: &ThemeParams) -> String {
   --radius-lg: 8px;
   --duration-fast: 150ms;
   --duration-base: 200ms;
+  /* dx-components bridge — maps their vars to our OKLCH theme */
+  --primary-color: {bg1};
+  --primary-color-1: {bg1};
+  --primary-color-2: {bg2};
+  --primary-color-3: {bg2};
+  --primary-color-4: {bg3};
+  --primary-color-5: {bg3};
+  --primary-color-6: {border};
+  --primary-color-7: {border_muted};
+  --secondary-color: {fg1};
+  --secondary-color-1: {fg1};
+  --secondary-color-2: {accent};
+  --secondary-color-3: {fg2};
+  --secondary-color-4: {fg1};
+  --secondary-color-5: {fg3};
+  --secondary-color-6: {border};
+  --focused-border-color: {accent};
+  --primary-error-color: {danger};
+  --secondary-error-color: {danger};
+  --contrast-error-color: {fg1};
+  --primary-success-color: {success};
+  --secondary-success-color: {success};
+  --primary-warning-color: {warning};
+  --secondary-warning-color: {warning};
+  --primary-info-color: {bg3};
+  --secondary-info-color: {fg2};
+  --sidebar-background: {bg2};
+  --sidebar-foreground: {fg1};
+  --sidebar-border: {border};
+  --sidebar-accent: {accent_subtle};
+  --sidebar-accent-foreground: {fg1};
+  --sidebar-ring: {accent};
 }}
 html, body, #main {{
   margin: 0; padding: 0;

@@ -1,5 +1,20 @@
-// Lucide SVG icons (24x24 viewBox, stroke-based)
-// Shared across all cosmix Dioxus apps
+//! Icon system for cosmix apps.
+//!
+//! Provides two icon APIs:
+//! - **lucide-dioxus components** (preferred): `use cosmix_ui::icons::lucide::*;`
+//!   then `rsx! { Folder { size: 16 } }` — 1000+ icons, proper Dioxus components.
+//! - **Legacy SVG constants** (deprecated): `ICON_FOLDER` etc. — used by existing
+//!   apps, will be migrated to lucide components over time.
+
+/// Lucide icon components — re-exported from lucide-dioxus.
+///
+/// Usage: `use cosmix_ui::icons::lucide::*;`
+/// Then in RSX: `Folder { size: 16 }` or `Mail { class: "text-accent" }`
+pub mod lucide {
+    pub use lucide_dioxus::*;
+}
+
+// ── Legacy SVG icon constants (deprecated — use lucide module instead) ──
 
 // Navigation
 pub const ICON_BACK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>"#;

@@ -25,7 +25,7 @@ Monorepo with Cargo workspace under `src/`. Top level is clean (docs + config on
 | `cosmix-lib-config` | `cosmix_config` | Typed config structs + TOML load/save |
 | `cosmix-lib-mesh` | `cosmix_mesh` | WireGuard mesh networking, WebSocket peer sync |
 | `cosmix-lib-script` | `cosmix_script` | Mix script discovery, runtime bridge, cosmix prelude, User menu |
-| `cosmix-lib-ui` | `cosmix_ui` | Shared Dioxus components, theme, icons |
+| `cosmix-lib-ui` | `cosmix_ui` | **THE shared UI library** — theme, MenuBar, dx-components, icons, app shell. Priority: centralize ALL shared UI here. |
 
 ### GUI Apps
 
@@ -155,6 +155,42 @@ RC codes: 0=success, 5=warning, 10=error, 20=failure. Used across Unix sockets (
 - **Mix** for scripting — pure-Rust language at `~/.mix/`, replaces Lua. Native AMP IPC via `send`/`address`/`emit` keywords. `mix-core` embedded in `cosmix-lib-script` and `cosmix-scripts` as path dep.
 - **mimalloc** allocator in all binaries
 - **`paru`** for AUR packages on CachyOS/Arch
+
+## cosmix-lib-ui — The Shared UI Foundation (PRIORITY)
+
+cosmix-lib-ui is the most important crate for GUI consistency. **Centralize everything shared here.** Every reusable component, theme logic, menu system, and layout pattern must live in this library — never duplicated across apps.
+
+### What it provides
+
+- **Theme system** (`theme.rs`) — OKLCH `generate_css()` outputs all CSS custom properties including the dx-components bridge vars. `use_theme_css()` hook reactively injects theme CSS. Light/dark mode toggle works instantly because bridge vars use concrete OKLCH values, not CSS variable chains.
+- **MenuBar** (`menu/`) — Standard app menu bar with File/Help menus, keyboard shortcuts, AMP integration, caption buttons. Used by every app.
+- **dx-components** (`dx_components/`) — 40 official DioxusLabs styled components (Button, Card, Dialog, Sidebar, Tabs, etc.) imported via `dx components add` then moved here for shared access. All apps import from `cosmix_ui::dx_components::*`.
+- **Primitives** (`primitives.rs`) — Re-exports from `dioxus-primitives` (34 unstyled accessible behavioural components).
+- **Icons** (`icons.rs`) — `lucide-dioxus` re-exports (1000+ icons) via `cosmix_ui::icons::lucide::*`.
+- **Components** (`components/`) — Custom cosmix widgets: DataTable, StatusBar, ErrorBanner, AMP UI registry.
+- **App init** (`app_init.rs`) — `launch_desktop()`, hub connection, theme polling, command dispatch.
+
+### Standard app shell pattern
+
+Every cosmix app MUST follow this layout:
+
+```rust
+fn app() -> Element {
+    use_theme_css();  // Reactive theme injection
+    rsx! {
+        div { class: "flex flex-col w-full h-full",
+            MenuBar { menu: app_menu, on_action: handler }  // Always on top
+            div { class: "flex-1 overflow-y-auto",           // Content fills below
+                // App content here (may include Sidebar, Tabs, etc.)
+            }
+        }
+    }
+}
+```
+
+### Preview app
+
+`cosmix-preview` is the test bed for all components. Launch with `cd src/crates/cosmix-preview && dx serve`. Demonstrates all 40 dx-components + custom components using Tailwind v4 classes. Use it to validate any UI changes before propagating to other apps.
 
 ## WebKitGTK UI Rules (CRITICAL — read before any UI work)
 

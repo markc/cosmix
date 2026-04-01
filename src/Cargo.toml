@@ -24,6 +24,7 @@ members = [
     "crates/cosmix-view",
     "crates/cosmix-wg",
     "crates/cosmix-dopus",
+    "crates/cosmix-preview",
     # Daemons
     "crates/cosmix-noded",
     "crates/cosmix-indexd",
@@ -68,3 +69,5 @@ toml_cfg = { package = "toml", version = "0.8" }
 spamlite = { path = "../../.gh/spamlite" }
 rusqlite = { version = "0.38", features = ["bundled"] }
 notify = { version = "7", default-features = false, features = ["macos_fsevent"] }
+dioxus-primitives = { git = "https://github.com/DioxusLabs/components", default-features = false, features = ["router"] }
+lucide-dioxus = "2.577"
