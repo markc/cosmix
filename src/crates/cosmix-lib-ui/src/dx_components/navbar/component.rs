@@ -7,7 +7,7 @@ use dioxus_primitives::icon;
 #[component]
 pub fn Navbar(props: NavbarProps) -> Element {
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("./style.css") }
+        document::Style { {include_str!("./style.css")} }
         navbar::Navbar {
             class: "navbar",
             disabled: props.disabled,

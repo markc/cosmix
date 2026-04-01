@@ -8,7 +8,7 @@ use dioxus_primitives::icon;
 #[component]
 pub fn Select<T: Clone + PartialEq + 'static>(props: SelectProps<T>) -> Element {
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("./style.css") }
+        document::Style { {include_str!("./style.css")} }
         select::Select {
             class: "select",
             value: props.value,

@@ -9,7 +9,7 @@ use dioxus_primitives::icon::Icon;
 #[component]
 pub fn Calendar(props: CalendarProps) -> Element {
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("./style.css") }
+        document::Style { {include_str!("./style.css")} }
         calendar::Calendar {
             class: "calendar",
             selected_date: props.selected_date,
@@ -34,7 +34,7 @@ pub fn Calendar(props: CalendarProps) -> Element {
 #[component]
 pub fn RangeCalendar(props: RangeCalendarProps) -> Element {
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("./style.css") }
+        document::Style { {include_str!("./style.css")} }
         calendar::RangeCalendar {
             class: "calendar",
             selected_range: props.selected_range,

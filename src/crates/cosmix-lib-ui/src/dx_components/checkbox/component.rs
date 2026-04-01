@@ -5,7 +5,7 @@ use dioxus_primitives::icon;
 #[component]
 pub fn Checkbox(props: CheckboxProps) -> Element {
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("./style.css") }
+        document::Style { {include_str!("./style.css")} }
         checkbox::Checkbox {
             class: "checkbox",
             checked: props.checked,

@@ -71,3 +71,8 @@ rusqlite = { version = "0.38", features = ["bundled"] }
 notify = { version = "7", default-features = false, features = ["macos_fsevent"] }
 dioxus-primitives = { git = "https://github.com/DioxusLabs/components", default-features = false, features = ["router"] }
 lucide-dioxus = "2.577"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

@@ -39,7 +39,7 @@ pub struct BadgeProps {
 #[component]
 pub fn Badge(props: BadgeProps) -> Element {
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("./style.css") }
+        document::Style { {include_str!("./style.css")} }
 
         BadgeElement {
             "padding": true,

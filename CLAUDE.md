@@ -192,6 +192,14 @@ fn app() -> Element {
 
 `cosmix-preview` is the test bed for all components. Launch with `cd src/crates/cosmix-preview && dx serve`. Demonstrates all 40 dx-components + custom components using Tailwind v4 classes. Use it to validate any UI changes before propagating to other apps.
 
+### Build rules for GUI apps
+
+- **Development:** `cd src/crates/<app> && dx serve` — runs Tailwind watcher, hot-reload
+- **Release:** `cd src/crates/<app> && dx build --release` — compiles Tailwind, bundles assets. **NEVER use `cargo build --release` for GUI apps with Tailwind** — it skips the Tailwind compiler and CSS classes won't work.
+- **Daemons:** `cargo build -p cosmix-noded --release` — no Tailwind, `cargo` is fine
+- **Install:** `cp target/dx/<app>/release/linux/app/<binary> ~/.local/bin/` + copy `assets/` next to binary if external assets exist
+- Release profile: `strip = true`, `lto = true`, `codegen-units = 1` — configured in workspace `[profile.release]`
+
 ## WebKitGTK UI Rules (CRITICAL — read before any UI work)
 
 Dioxus desktop uses WebKitGTK on Linux. These rules prevent layout shifts and rendering bugs:

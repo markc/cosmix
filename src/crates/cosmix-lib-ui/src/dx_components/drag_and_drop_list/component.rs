@@ -43,7 +43,7 @@ pub fn DragAndDropList(props: DragAndDropListProps) -> Element {
         .collect();
 
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("./style.css") }
+        document::Style { {include_str!("./style.css")} }
         drag_and_drop_list::DragAndDropList {
             items,
             aria_label: props.aria_label,

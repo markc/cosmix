@@ -284,7 +284,7 @@ impl HubClient {
             let msg_type = msg.get("type").unwrap_or("unknown");
             let msg_cmd = msg.get("command").unwrap_or("?");
             let msg_from = msg.get("from").unwrap_or("?");
-            eprintln!("[hub-client:{service_name}] recv type={msg_type} cmd={msg_cmd} from={msg_from} id={msg_id:?}");
+            tracing::debug!("[hub-client:{service_name}] recv type={msg_type} cmd={msg_cmd} from={msg_from} id={msg_id:?}");
 
             // If message is a response with an id that matches a pending request, resolve it
             let is_response = if msg.get("type").is_some_and(|t| t == "response") {

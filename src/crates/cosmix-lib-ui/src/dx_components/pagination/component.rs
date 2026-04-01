@@ -40,7 +40,7 @@ pub fn Pagination(
     children: Element,
 ) -> Element {
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("./style.css") }
+        document::Style { {include_str!("./style.css")} }
         nav {
             class: "pagination",
             "data-slot": "pagination",

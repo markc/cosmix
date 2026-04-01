@@ -7,7 +7,7 @@ use dioxus_primitives::icon;
 #[component]
 pub fn Accordion(props: AccordionProps) -> Element {
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("./style.css") }
+        document::Style { {include_str!("./style.css")} }
         accordion::Accordion {
             class: "accordion",
             width: "15rem",

@@ -1,4 +1,5 @@
-use dioxus::prelude::{KeyboardEvent, ModifiersInteraction};
+use std::collections::HashMap;
+use dioxus::prelude::*;
 use serde_json;
 
 // ── AMP menu commands ─────────────────────────────────────────────────────
@@ -100,6 +101,10 @@ pub enum MenuItem {
         label: String,
         items: Vec<MenuItem>,
     },
+    /// Named injection point — services add items here at runtime via AMP.
+    Slot {
+        name: String,
+    },
 }
 
 /// A complete menu bar definition — top-level items must be `Submenu` variants.
@@ -119,23 +124,48 @@ impl MenuBarDef {
     }
 
     /// Collect all actionable menu items for `menu.list` discovery.
+    /// Includes items injected into slots.
     pub fn collect_items(&self) -> Vec<MenuItemInfo> {
         let mut out = Vec::new();
+        let registry = SLOT_REGISTRY.peek();
         for top in &self.menus {
-            if let MenuItem::Submenu { label, items } = top {
-                collect_items_recursive(items, label, &mut out);
+            match top {
+                MenuItem::Submenu { label, items } => {
+                    collect_items_recursive(items, label, &registry, &mut out);
+                }
+                MenuItem::Slot { name } => {
+                    for entry in registry.resolve(name) {
+                        if let MenuItem::Submenu { label, items } = &entry.item {
+                            collect_items_recursive(items, label, &registry, &mut out);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         out
     }
 
     /// Find which top-level menu index contains an item with the given ID.
-    /// Returns (menu_index, reference to the MenuItem).
-    pub fn find_item(&self, id: &str) -> Option<(usize, &MenuItem)> {
+    /// Returns (menu_index, cloned MenuItem). Searches both static menus and slot-injected items.
+    pub fn find_item(&self, id: &str) -> Option<(usize, MenuItem)> {
         for (idx, top) in self.menus.iter().enumerate() {
             if let MenuItem::Submenu { items, .. } = top {
                 if let Some(item) = find_in_items(items, id) {
-                    return Some((idx, item));
+                    return Some((idx, item.clone()));
+                }
+            }
+        }
+        // Also search slot-injected items
+        let registry = SLOT_REGISTRY.peek();
+        for (idx, top) in self.menus.iter().enumerate() {
+            if let MenuItem::Slot { name } = top {
+                for entry in registry.resolve(name) {
+                    if let MenuItem::Submenu { items, .. } = &entry.item {
+                        if let Some(item) = find_in_items(items, id) {
+                            return Some((idx, item.clone()));
+                        }
+                    }
                 }
             }
         }
@@ -143,7 +173,7 @@ impl MenuBarDef {
     }
 }
 
-fn collect_items_recursive(items: &[MenuItem], menu_label: &str, out: &mut Vec<MenuItemInfo>) {
+fn collect_items_recursive(items: &[MenuItem], menu_label: &str, registry: &SlotRegistry, out: &mut Vec<MenuItemInfo>) {
     for item in items {
         match item {
             MenuItem::Action { id, label, shortcut, enabled, .. } => {
@@ -156,7 +186,26 @@ fn collect_items_recursive(items: &[MenuItem], menu_label: &str, out: &mut Vec<M
                 });
             }
             MenuItem::Submenu { label, items } => {
-                collect_items_recursive(items, label, out);
+                collect_items_recursive(items, label, registry, out);
+            }
+            MenuItem::Slot { name } => {
+                for entry in registry.resolve(name) {
+                    match &entry.item {
+                        MenuItem::Action { id, label, shortcut, enabled, .. } => {
+                            out.push(MenuItemInfo {
+                                id: id.clone(),
+                                label: label.clone(),
+                                shortcut: shortcut.as_ref().map(|s| s.label()),
+                                enabled: *enabled,
+                                menu: menu_label.to_string(),
+                            });
+                        }
+                        MenuItem::Submenu { label, items } => {
+                            collect_items_recursive(items, label, registry, out);
+                        }
+                        _ => {}
+                    }
+                }
             }
             MenuItem::Separator => {}
         }
@@ -190,3 +239,77 @@ impl MenuItemInfo {
         })
     }
 }
+
+// ── Dynamic menu slots ──────────────────────────────────────────────────
+
+/// An item injected into a named slot by a service.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlotEntry {
+    /// Unique item ID (must not collide with static menu IDs).
+    pub id: String,
+    /// Service that injected this item (for cleanup on disconnect).
+    pub owner: String,
+    /// The menu item to render.
+    pub item: MenuItem,
+}
+
+/// Registry of dynamically injected menu items, keyed by slot name.
+#[derive(Clone, Debug, Default)]
+pub struct SlotRegistry {
+    pub slots: HashMap<String, Vec<SlotEntry>>,
+}
+
+impl SlotRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add an item to a named slot. Rejects duplicate IDs across all slots.
+    pub fn add(&mut self, slot_name: &str, owner: &str, id: &str, item: MenuItem) -> Result<(), String> {
+        // Check for duplicate ID across all slots
+        for entries in self.slots.values() {
+            if entries.iter().any(|e| e.id == id) {
+                return Err(format!("duplicate slot item ID: {id}"));
+            }
+        }
+        self.slots.entry(slot_name.to_string()).or_default().push(SlotEntry {
+            id: id.to_string(),
+            owner: owner.to_string(),
+            item,
+        });
+        Ok(())
+    }
+
+    /// Remove an item by ID from any slot. Returns true if found.
+    pub fn remove(&mut self, id: &str) -> bool {
+        for entries in self.slots.values_mut() {
+            if let Some(pos) = entries.iter().position(|e| e.id == id) {
+                entries.remove(pos);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove all items in a named slot.
+    pub fn clear_slot(&mut self, slot_name: &str) {
+        self.slots.remove(slot_name);
+    }
+
+    /// Remove all items owned by a given service.
+    pub fn clear_owner(&mut self, owner: &str) {
+        for entries in self.slots.values_mut() {
+            entries.retain(|e| e.owner != owner);
+        }
+        // Clean up empty slots
+        self.slots.retain(|_, v| !v.is_empty());
+    }
+
+    /// Get items for a named slot (for rendering).
+    pub fn resolve(&self, slot_name: &str) -> &[SlotEntry] {
+        self.slots.get(slot_name).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+}
+
+/// Global slot registry — services inject menu items here via AMP.
+pub static SLOT_REGISTRY: GlobalSignal<SlotRegistry> = Signal::global(|| SlotRegistry::new());

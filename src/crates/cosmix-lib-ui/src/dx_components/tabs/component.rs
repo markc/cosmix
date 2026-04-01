@@ -66,7 +66,7 @@ impl TabsVariant {
 #[component]
 pub fn Tabs(props: TabsProps) -> Element {
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("./style.css") }
+        document::Style { {include_str!("./style.css")} }
         tabs::Tabs {
             class: props.class + " tabs",
             "data-variant": props.variant.to_class(),

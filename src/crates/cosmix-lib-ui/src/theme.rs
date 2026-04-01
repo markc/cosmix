@@ -157,6 +157,10 @@ pub fn generate_css(p: &ThemeParams) -> String {
   --sidebar-accent-foreground: {fg1};
   --sidebar-ring: {accent};
 }}
+@keyframes cmx-fade-in {{
+  from {{ opacity: 0; }}
+  to {{ opacity: 1; }}
+}}
 html, body, #main {{
   margin: 0; padding: 0;
   width: 100%; height: 100%;
@@ -164,6 +168,9 @@ html, body, #main {{
   font-size: {fs}px;
   background: var(--bg-primary);
   color: var(--fg-primary);
+}}
+#main {{
+  animation: cmx-fade-in 200ms ease-out;
 }}
 ::-webkit-scrollbar {{ width: 8px; }}
 ::-webkit-scrollbar-track {{ background: transparent; }}

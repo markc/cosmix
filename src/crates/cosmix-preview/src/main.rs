@@ -55,7 +55,8 @@ use cosmix_ui::dx_components::virtual_list::*;
 // Cosmix menu system
 use cosmix_ui::app_init::{use_theme_css, THEME};
 use cosmix_ui::menu::{
-    action, menubar, separator, standard_file_menu, standard_help_menu, submenu, MenuBar,
+    action, menubar, separator, slot, standard_file_menu, standard_help_menu, submenu, MenuBar,
+    SLOT_REGISTRY, MenuItem, MenuAction,
 };
 
 // Existing cosmix components
@@ -126,6 +127,15 @@ fn app() -> Element {
         submenu("Custom", vec![
             action("data_table", "DataTable"),
         ]),
+        slot("app-tools"),       // Dynamic: services inject menus here
+        slot("app-services"),    // Dynamic: remote nodes inject here
+        submenu("Dynamic", vec![
+            action("slot_add_tool", "Add Tool Menu"),
+            action("slot_add_service", "Add Service Menu"),
+            action("slot_remove_tool", "Remove Tool Menu"),
+            action("slot_remove_service", "Remove Service Menu"),
+            action("slot_clear_all", "Clear All Slots"),
+        ]),
         submenu("Theme", vec![
             action("theme_light", "Light Mode"),
             action("theme_dark", "Dark Mode"),
@@ -149,6 +159,39 @@ fn app() -> Element {
                     "about" => show_about.set(true),
                     "theme_light" => { THEME.write().dark = false; },
                     "theme_dark" => { THEME.write().dark = true; },
+                    // Dynamic slot demo actions
+                    "slot_add_tool" => {
+                        let _ = SLOT_REGISTRY.write().add(
+                            "app-tools", "preview", "demo-tools",
+                            MenuItem::Submenu {
+                                label: "Tools".to_string(),
+                                items: vec![
+                                    MenuItem::Action { id: "tool-lint".to_string(), label: "Lint Code".to_string(), shortcut: None, action: MenuAction::Local("tool-lint".to_string()), enabled: true },
+                                    MenuItem::Action { id: "tool-format".to_string(), label: "Format Code".to_string(), shortcut: None, action: MenuAction::Local("tool-format".to_string()), enabled: true },
+                                    MenuItem::Separator,
+                                    MenuItem::Action { id: "tool-build".to_string(), label: "Build Project".to_string(), shortcut: None, action: MenuAction::Local("tool-build".to_string()), enabled: true },
+                                ],
+                            },
+                        );
+                    },
+                    "slot_add_service" => {
+                        let _ = SLOT_REGISTRY.write().add(
+                            "app-services", "preview", "demo-services",
+                            MenuItem::Submenu {
+                                label: "Services".to_string(),
+                                items: vec![
+                                    MenuItem::Action { id: "svc-mon-mko".to_string(), label: "mon.mko Status".to_string(), shortcut: None, action: MenuAction::Local("svc-mon-mko".to_string()), enabled: true },
+                                    MenuItem::Action { id: "svc-mon-gcwg".to_string(), label: "mon.gcwg Status".to_string(), shortcut: None, action: MenuAction::Local("svc-mon-gcwg".to_string()), enabled: true },
+                                ],
+                            },
+                        );
+                    },
+                    "slot_remove_tool" => { SLOT_REGISTRY.write().remove("demo-tools"); },
+                    "slot_remove_service" => { SLOT_REGISTRY.write().remove("demo-services"); },
+                    "slot_clear_all" => {
+                        SLOT_REGISTRY.write().clear_slot("app-tools");
+                        SLOT_REGISTRY.write().clear_slot("app-services");
+                    },
                     other => selected.set(other.replace("_demo", "").to_string()),
                 },
             }
@@ -905,7 +948,7 @@ fn DemoSidebar() -> Element {
     let side = use_signal(|| SidebarSide::Left);
     let collapsible = use_signal(|| SidebarCollapsible::Offcanvas);
     rsx! {
-        document::Stylesheet { href: asset!("/assets/sidebar-demo.css") }
+        document::Style { {include_str!("../assets/sidebar-demo.css")} }
         SidebarProvider {
             Sidebar {
                 variant: SidebarVariant::Sidebar, collapsible: collapsible(), side: side(),

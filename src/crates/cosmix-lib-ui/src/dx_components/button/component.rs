@@ -43,7 +43,7 @@ pub fn Button(
     let merged = merge_attributes(vec![base, attributes]);
 
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("./style.css") }
+        document::Style { {include_str!("./style.css")} }
 
         button {
             onclick: move |event| {

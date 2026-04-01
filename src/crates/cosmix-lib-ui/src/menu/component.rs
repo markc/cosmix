@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use super::types::{MenuAction, MenuBarDef, MenuCommand, MenuItem};
+use super::types::{MenuAction, MenuBarDef, MenuCommand, MenuItem, SLOT_REGISTRY};
 
 #[cfg(feature = "hub")]
 use std::sync::Arc;
@@ -130,6 +130,21 @@ const MENU_CSS: &str = r#"
     width: 12px;
     height: 12px;
 }
+/* App icon (top-left, balances close button on top-right) */
+.cmx-app-icon {
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    padding: 4px;
+    color: var(--accent, #60a5fa);
+}
+.cmx-app-icon svg {
+    width: 18px;
+    height: 18px;
+}
 "#;
 
 // ── Caption button icons ─────────────────────────────────────────────────
@@ -148,6 +163,10 @@ pub struct MenuBarProps {
     pub on_action: EventHandler<String>,
     #[props(default)]
     pub hub: Option<Signal<Option<Arc<HubClient>>>>,
+    /// Optional app icon element for the top-left corner. If not provided,
+    /// a default cosmix icon is shown.
+    #[props(default)]
+    pub icon: Option<Element>,
 }
 
 #[cfg(not(feature = "hub"))]
@@ -155,6 +174,10 @@ pub struct MenuBarProps {
 pub struct MenuBarProps {
     pub menu: MenuBarDef,
     pub on_action: EventHandler<String>,
+    /// Optional app icon element for the top-left corner. If not provided,
+    /// a default cosmix icon is shown.
+    #[props(default)]
+    pub icon: Option<Element>,
 }
 
 // ── Component ─────────────────────────────────────────────────────────────
@@ -177,6 +200,7 @@ pub fn MenuBar(props: MenuBarProps) -> Element {
     let mut highlight_id: Signal<Option<String>> = use_signal(|| None);
 
     let menu = props.menu.clone();
+    let app_icon = props.icon;
     let on_action = props.on_action.clone();
     #[cfg(feature = "hub")]
     let hub = props.hub.clone();
@@ -221,7 +245,7 @@ pub fn MenuBar(props: MenuBarProps) -> Element {
                         highlight_id.set(Some(id.clone()));
 
                         // Fire the action through the normal dispatch path
-                        if let MenuItem::Action { action, .. } = item {
+                        if let MenuItem::Action { ref action, .. } = item {
                             #[cfg(feature = "hub")]
                             dispatch_amp_action(action, &on_action2, &hub2);
                             #[cfg(not(feature = "hub"))]
@@ -254,8 +278,19 @@ pub fn MenuBar(props: MenuBarProps) -> Element {
                 }
             }
 
-            // Top-level menu triggers
-            for (idx, top_item) in menu.menus.iter().enumerate() {
+            // App icon (top-left)
+            div { class: "cmx-app-icon",
+                if let Some(icon) = app_icon {
+                    {icon}
+                } else {
+                    {cosmix_icon()}
+                }
+            }
+
+            // Resolve slots: flatten MenuItem::Slot into their injected entries.
+            // Reading SLOT_REGISTRY creates a reactive subscription — when slots
+            // change, the menu bar re-renders automatically.
+            for (idx, top_item) in resolve_menu_slots(&menu.menus).iter().enumerate() {
                 if let MenuItem::Submenu { label, items } = top_item {
                     {
                         let label = label.clone();
@@ -545,6 +580,7 @@ fn render_item_shared(
                 }
             }
         }
+        MenuItem::Slot { .. } => rsx! {},
     }
 }
 
@@ -590,7 +626,45 @@ fn render_item_shared(
                 }
             }
         }
+        MenuItem::Slot { .. } => rsx! {},
     }
+}
+
+// ── Default app icon ─────────────────────────────────────────────────────
+
+/// Render the Cosmix brand icon as a native Dioxus SVG element.
+fn cosmix_icon() -> Element {
+    rsx! {
+        svg {
+            width: "18",
+            height: "18",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "1.5",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            path { d: "M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" }
+            path { d: "M15 9.4a4 4 0 1 0 0 5.2" }
+        }
+    }
+}
+
+// ── Slot resolution ──────────────────────────────────────────────────────
+
+/// Resolve `MenuItem::Slot` variants by looking up `SLOT_REGISTRY` and
+/// replacing each slot with its injected entries. Non-slot items pass through.
+/// Reading `SLOT_REGISTRY` creates a Dioxus reactive subscription.
+fn resolve_menu_slots(menus: &[MenuItem]) -> Vec<MenuItem> {
+    let registry = SLOT_REGISTRY.read();
+    menus.iter().flat_map(|item| {
+        match item {
+            MenuItem::Slot { name } => {
+                registry.resolve(name).iter().map(|e| e.item.clone()).collect::<Vec<_>>()
+            }
+            other => vec![other.clone()],
+        }
+    }).collect()
 }
 
 // ── Action dispatch ────────────────────────────────────────────────────────

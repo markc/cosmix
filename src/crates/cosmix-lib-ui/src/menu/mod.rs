@@ -3,9 +3,9 @@ mod builder;
 mod component;
 mod shortcuts;
 
-pub use types::{MenuAction, MenuBarDef, MenuCommand, MenuItem, MenuItemInfo, Shortcut};
+pub use types::{MenuAction, MenuBarDef, MenuCommand, MenuItem, MenuItemInfo, Shortcut, SlotEntry, SlotRegistry, SLOT_REGISTRY};
 pub use builder::{
-    action, action_shortcut, separator, submenu, menubar,
+    action, action_shortcut, separator, slot, submenu, menubar,
     standard_file_menu, standard_help_menu,
 };
 pub use component::{MenuBar, MENU_CMD, MENU_DEF};

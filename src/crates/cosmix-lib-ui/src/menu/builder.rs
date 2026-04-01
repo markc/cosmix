@@ -64,6 +64,11 @@ pub fn separator() -> MenuItem {
     MenuItem::Separator
 }
 
+/// Named injection point — services add items here at runtime via AMP.
+pub fn slot(name: &str) -> MenuItem {
+    MenuItem::Slot { name: name.to_string() }
+}
+
 pub fn submenu(label: &str, items: Vec<MenuItem>) -> MenuItem {
     MenuItem::Submenu { label: label.to_string(), items }
 }

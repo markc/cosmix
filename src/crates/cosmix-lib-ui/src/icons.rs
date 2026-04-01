@@ -1,10 +1,20 @@
 //! Icon system for cosmix apps.
 //!
-//! Provides two icon APIs:
+//! Provides three icon APIs:
+//! - **Cosmix brand icon**: `COSMIX_ICON` — the official SVG logo (hexagon-C).
+//!   Use at any size: menu bar, splash screen, favicon, desktop file, system tray.
 //! - **lucide-dioxus components** (preferred): `use cosmix_ui::icons::lucide::*;`
 //!   then `rsx! { Folder { size: 16 } }` — 1000+ icons, proper Dioxus components.
 //! - **Legacy SVG constants** (deprecated): `ICON_FOLDER` etc. — used by existing
 //!   apps, will be migrated to lucide components over time.
+
+// ── Cosmix brand icon ───────────────────────────────────────────────────
+
+/// The official Cosmix brand icon — a hexagon with a stylized "C".
+/// Pure SVG, resolution-independent, inherits color via `currentColor`.
+/// Used as the default app icon in the MenuBar and available for
+/// splash screens, favicons, desktop files, about dialogs, etc.
+pub const COSMIX_ICON: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M15 9.4a4 4 0 1 0 0 5.2"/></svg>"#;
 
 /// Lucide icon components — re-exported from lucide-dioxus.
 ///

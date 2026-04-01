@@ -6,7 +6,7 @@ use dioxus_primitives::popover::{
 #[component]
 pub fn PopoverRoot(props: PopoverRootProps) -> Element {
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("./style.css") }
+        document::Style { {include_str!("./style.css")} }
         popover::PopoverRoot {
             class: "popover",
             is_modal: props.is_modal,
