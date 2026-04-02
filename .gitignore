@@ -4,3 +4,8 @@ src/Cargo.lock
 *.swo
 .env
 dioxus/
+
+# Temporary exploration
+docs/
+docsite/
+scripts/

@@ -1,7 +1,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::path::PathBuf;
+use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -9,9 +9,10 @@ use axum::Router;
 use axum::extract::{Path, State};
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Json, Response};
+use axum::response::{Html, IntoResponse, Json, Response};
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
+use pulldown_cmark::{Options, Parser as MdParser};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -54,6 +55,10 @@ enum Command {
         #[arg(long, default_value = "ws://localhost:4200/ws")]
         hub_ws: String,
 
+        /// Directory of markdown files to serve at /docs/
+        #[arg(long)]
+        docs_dir: Option<PathBuf>,
+
         /// TLS certificate file (PEM). Enables HTTPS when set.
         #[arg(long)]
         tls_cert: Option<PathBuf>,
@@ -79,6 +84,7 @@ struct AppState {
     jmap_upstream: String,
     hub_ws: String,
     http_client: reqwest::Client,
+    docs_dir: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +464,275 @@ async fn ws_proxy(browser_ws: WebSocket, hub_url: String) {
 }
 
 // ---------------------------------------------------------------------------
+// Markdown docs handler
+// ---------------------------------------------------------------------------
+
+/// Build a sidebar navigation from the docs directory structure.
+fn build_sidebar(docs_dir: &StdPath, current_path: &str) -> String {
+    let mut sections: Vec<(String, Vec<(String, String)>)> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(docs_dir) {
+        let mut dirs: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        dirs.sort_by_key(|e| e.file_name());
+
+        for entry in &dirs {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path = entry.path();
+            if path.is_dir() && !name.starts_with('.') {
+                // Section title: strip numeric prefix "00-getting-started" -> "Getting Started"
+                let title = name
+                    .trim_start_matches(|c: char| c.is_ascii_digit() || c == '-')
+                    .replace(['-', '_'], " ");
+                let title = title
+                    .split_whitespace()
+                    .map(|w| {
+                        let mut c = w.chars();
+                        match c.next() {
+                            None => String::new(),
+                            Some(f) => f.to_uppercase().to_string() + c.as_str(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                let mut pages = Vec::new();
+                if let Ok(files) = std::fs::read_dir(&path) {
+                    let mut files: Vec<_> = files.filter_map(|e| e.ok()).collect();
+                    files.sort_by_key(|e| e.file_name());
+                    for file in &files {
+                        let fname = file.file_name().to_string_lossy().to_string();
+                        if fname.ends_with(".md") {
+                            let slug = fname.trim_end_matches(".md");
+                            let href = format!("/docs/{name}/{slug}");
+                            let page_title = if slug == "index" {
+                                "Overview".to_string()
+                            } else {
+                                slug.replace(['-', '_'], " ")
+                            };
+                            pages.push((href, page_title));
+                        }
+                    }
+                }
+                if !pages.is_empty() {
+                    sections.push((title, pages));
+                }
+            }
+        }
+    }
+
+    let mut html = String::from("<nav class=\"sidebar\">\n<h2><a href=\"/docs\">Docs</a></h2>\n");
+    for (title, pages) in &sections {
+        html.push_str(&format!("<details{}>\n<summary>{title}</summary>\n<ul>\n",
+            if pages.iter().any(|(href, _)| href.trim_end_matches("/index") == format!("/docs/{}", current_path.split('/').next().unwrap_or(""))) { " open" } else { "" }
+        ));
+        for (href, page_title) in pages {
+            let active = if current_path == href.trim_start_matches("/docs/") { " class=\"active\"" } else { "" };
+            html.push_str(&format!("<li{active}><a href=\"{href}\">{page_title}</a></li>\n"));
+        }
+        html.push_str("</ul>\n</details>\n");
+    }
+    html.push_str("</nav>\n");
+    html
+}
+
+/// Resolve a docs path to its raw markdown content.
+fn resolve_markdown_path(docs_dir: &StdPath, rel_path: &str) -> Option<String> {
+    let candidates = [
+        docs_dir.join(format!("{rel_path}.md")),
+        docs_dir.join(rel_path).join("index.md"),
+        docs_dir.join(rel_path),
+    ];
+
+    let file_path = candidates.iter().find(|p| p.is_file())?;
+
+    // Security: ensure resolved path is under docs_dir
+    let canonical = file_path.canonicalize().ok()?;
+    let docs_canonical = docs_dir.canonicalize().ok()?;
+    if !canonical.starts_with(&docs_canonical) {
+        return None;
+    }
+
+    std::fs::read_to_string(&canonical).ok()
+}
+
+/// Render a markdown file to a full HTML page.
+fn render_markdown(docs_dir: &StdPath, rel_path: &str) -> Option<String> {
+    let content = resolve_markdown_path(docs_dir, rel_path)?;
+
+    // Parse markdown
+    let opts = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_HEADING_ATTRIBUTES;
+    let parser = MdParser::new_ext(&content, opts);
+    let mut body_html = String::new();
+    pulldown_cmark::html::push_html(&mut body_html, parser);
+
+    // Convert <img> tags pointing to .mp4/.webm to <video> tags
+    let video_re = regex_lite::Regex::new(
+        r#"<img src="([^"]+\.(?:mp4|webm|mov))" alt="([^"]*)"(?: /)?>"#
+    ).unwrap();
+    body_html = video_re.replace_all(&body_html, |caps: &regex_lite::Captures| {
+        let src = &caps[1];
+        let alt = &caps[2];
+        format!(r#"<video src="{src}" alt="{alt}" controls muted autoplay loop style="max-width:100%;border-radius:0.5rem;margin:1rem 0"></video>"#)
+    }).to_string();
+
+    // Extract title from first <h1>
+    let title = content
+        .lines()
+        .find(|l| l.starts_with("# "))
+        .map(|l| l.trim_start_matches("# "))
+        .unwrap_or("Docs");
+
+    let sidebar = build_sidebar(docs_dir, rel_path);
+
+    Some(format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  :root {{
+    --bg: #1a1a2e; --fg: #e0e0e0; --sidebar-bg: #16213e; --accent: #0f3460;
+    --link: #6cb4ee; --code-bg: #0d1117; --border: #2a2a4a;
+    --active-bg: #0f3460; --hover-bg: #1a1a3e;
+  }}
+  @media (prefers-color-scheme: light) {{
+    :root {{
+      --bg: #fff; --fg: #1a1a1a; --sidebar-bg: #f5f5f5; --accent: #e8e8e8;
+      --link: #0366d6; --code-bg: #f6f8fa; --border: #d0d0d0;
+      --active-bg: #e2e8f0; --hover-bg: #edf2f7;
+    }}
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--fg); line-height: 1.6;
+    display: flex; min-height: 100vh;
+  }}
+  .sidebar {{
+    width: 16rem; min-height: 100vh; padding: 1.5rem 1rem;
+    background: var(--sidebar-bg); border-right: 1px solid var(--border);
+    overflow-y: auto; flex-shrink: 0; position: sticky; top: 0;
+    max-height: 100vh;
+  }}
+  .sidebar h2 {{ margin-bottom: 1rem; font-size: 1.25rem; }}
+  .sidebar h2 a {{ color: var(--fg); text-decoration: none; }}
+  .sidebar details {{ margin-bottom: 0.25rem; }}
+  .sidebar summary {{
+    cursor: pointer; padding: 0.3rem 0.5rem; font-weight: 600;
+    font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--fg); opacity: 0.7;
+  }}
+  .sidebar ul {{ list-style: none; padding-left: 0.5rem; }}
+  .sidebar li {{ margin: 0.1rem 0; }}
+  .sidebar li a {{
+    display: block; padding: 0.2rem 0.5rem; color: var(--link);
+    text-decoration: none; font-size: 0.85rem; border-radius: 0.25rem;
+  }}
+  .sidebar li a:hover {{ background: var(--hover-bg); }}
+  .sidebar li.active a {{ background: var(--active-bg); font-weight: 600; }}
+  .content {{
+    flex: 1; max-width: 52rem; padding: 2rem 3rem; min-width: 0;
+  }}
+  .content h1 {{ font-size: 2rem; margin-bottom: 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }}
+  .content h2 {{ font-size: 1.5rem; margin: 2rem 0 0.75rem; }}
+  .content h3 {{ font-size: 1.2rem; margin: 1.5rem 0 0.5rem; }}
+  .content p {{ margin: 0.75rem 0; }}
+  .content a {{ color: var(--link); }}
+  .content img {{ max-width: 100%; border-radius: 0.5rem; margin: 1rem 0; }}
+  .content ul, .content ol {{ margin: 0.75rem 0; padding-left: 1.5rem; }}
+  .content li {{ margin: 0.25rem 0; }}
+  .content table {{ border-collapse: collapse; width: 100%; margin: 1rem 0; }}
+  .content th, .content td {{ border: 1px solid var(--border); padding: 0.5rem 0.75rem; text-align: left; }}
+  .content th {{ background: var(--sidebar-bg); }}
+  .content blockquote {{
+    border-left: 3px solid var(--link); padding: 0.5rem 1rem;
+    margin: 1rem 0; background: var(--code-bg); border-radius: 0 0.25rem 0.25rem 0;
+  }}
+  .content pre {{
+    background: var(--code-bg); padding: 1rem; border-radius: 0.5rem;
+    overflow-x: auto; margin: 1rem 0; border: 1px solid var(--border);
+    font-size: 0.875rem; line-height: 1.5;
+  }}
+  .content code {{
+    font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.875em;
+  }}
+  .content :not(pre) > code {{
+    background: var(--code-bg); padding: 0.15rem 0.35rem; border-radius: 0.25rem;
+  }}
+  @media (max-width: 768px) {{
+    body {{ flex-direction: column; }}
+    .sidebar {{ width: 100%; max-height: none; position: static; border-right: none; border-bottom: 1px solid var(--border); }}
+    .content {{ padding: 1.5rem; }}
+  }}
+</style>
+</head>
+<body>
+{sidebar}
+<main class="content">
+{body_html}
+</main>
+</body>
+</html>"#
+    ))
+}
+
+async fn serve_docs(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<String>,
+    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let docs_dir = match &state.docs_dir {
+        Some(d) => d,
+        None => return (StatusCode::NOT_FOUND, "docs not configured").into_response(),
+    };
+
+    let path = path.trim_end_matches('/');
+
+    // ?format=md returns raw markdown
+    if query.get("format").map(|v| v.as_str()) == Some("md") {
+        return match resolve_markdown_path(docs_dir, path) {
+            Some(content) => (
+                [(axum::http::header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+                content,
+            ).into_response(),
+            None => (StatusCode::NOT_FOUND, "page not found").into_response(),
+        };
+    }
+
+    match render_markdown(docs_dir, path) {
+        Some(html) => Html(html).into_response(),
+        None => (StatusCode::NOT_FOUND, "page not found").into_response(),
+    }
+}
+
+async fn serve_docs_index(State(state): State<Arc<AppState>>) -> Response {
+    let docs_dir = match &state.docs_dir {
+        Some(d) => d,
+        None => return (StatusCode::NOT_FOUND, "docs not configured").into_response(),
+    };
+
+    match render_markdown(docs_dir, "index") {
+        Some(html) => Html(html).into_response(),
+        None => {
+            // No index.md — generate a directory listing
+            let sidebar = build_sidebar(docs_dir, "");
+            let html = format!(
+                r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Docs</title></head>
+<body style="display:flex">{sidebar}<main style="padding:2rem"><h1>Documentation</h1>
+<p>Select a section from the sidebar.</p></main></body></html>"#
+            );
+            Html(html).into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -478,10 +753,34 @@ fn build_router(state: Arc<AppState>, www_dir: PathBuf) -> Router {
     let ws_proxy = Router::new()
         .route("/ws", axum::routing::get(ws_proxy_handler));
 
-    Router::new()
+    let docs = Router::new()
+        .route("/docs", axum::routing::get(serve_docs_index))
+        .route("/docs/", axum::routing::get(serve_docs_index))
+        .route("/docs/{*path}", axum::routing::get(serve_docs));
+
+    // Serve docs assets (images, videos) at /assets/ if docs_dir has an assets/ subdir
+    let docs_assets = if let Some(ref docs_dir) = state.docs_dir {
+        let assets_path = docs_dir.join("assets");
+        if assets_path.is_dir() {
+            Some(Router::new().nest_service("/assets", ServeDir::new(assets_path)))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut router = Router::new()
         .merge(api)
         .merge(jmap)
         .merge(ws_proxy)
+        .merge(docs);
+
+    if let Some(assets_router) = docs_assets {
+        router = router.merge(assets_router);
+    }
+
+    router
         .fallback_service(ServeDir::new(www_dir))
         .with_state(state)
 }
@@ -527,6 +826,7 @@ async fn main() -> Result<()> {
             db_path,
             jmap_upstream,
             hub_ws,
+            docs_dir,
             tls_cert,
             tls_key,
         } => {
@@ -541,6 +841,10 @@ async fn main() -> Result<()> {
             let conn = open_db(&db_path)?;
             conn.execute_batch(SCHEMA)?;
 
+            if let Some(ref d) = docs_dir {
+                info!("serving markdown docs from {}", d.display());
+            }
+
             let state = Arc::new(AppState {
                 db: Mutex::new(conn),
                 jmap_upstream,
@@ -548,6 +852,7 @@ async fn main() -> Result<()> {
                 http_client: reqwest::Client::builder()
                     .danger_accept_invalid_certs(true)
                     .build()?,
+                docs_dir,
             });
 
             let app = build_router(state, www_dir);

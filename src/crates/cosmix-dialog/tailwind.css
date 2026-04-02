@@ -1,5 +1,5 @@
 @import "tailwindcss";
-@source "./src/**/*.{rs,html}";
+@source "./src/**/*.{rs,html,css}";
 
 @theme inline {
   --color-bg-primary: var(--bg-primary);
@@ -23,11 +23,10 @@
 
 @layer base {
   *, *::before, *::after { box-sizing: border-box; }
-  button, input, select, textarea {
-    all: unset;
-    font: inherit;
-    color: inherit;
-  }
-  button { cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
-  input, textarea { cursor: text; }
+}
+
+@layer components {
+  .border-safe { border-color: rgba(128,128,128,0.4); }
+  .border-b-safe { border-bottom: 1px solid rgba(128,128,128,0.4); }
+  .border-t-safe { border-top: 1px solid rgba(128,128,128,0.4); }
 }

@@ -422,20 +422,6 @@
   *, *::before, *::after {
     box-sizing: border-box;
   }
-  button, input, select, textarea {
-    all: unset;
-    font: inherit;
-    color: inherit;
-  }
-  button {
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-  }
-  input, textarea {
-    cursor: text;
-  }
   [data-state="on"], [data-state="active"] {
     background: var(--accent-subtle);
     color: var(--fg-primary);

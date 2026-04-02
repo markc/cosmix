@@ -78,6 +78,14 @@ cd src/crates/cosmix-mail && dx serve --platform web    # browser WASM
 cd src/crates/cosmix-mail && dx serve --hotpatch        # Rust hot-patch
 ```
 
+**Keep dx CLI and dioxus crates in sync.** The `dx` CLI version must match the dioxus crate versions in Cargo.lock — mismatches cause build warnings or failures. Check and fix regularly:
+```bash
+dx --version                                              # e.g. 0.7.4
+grep -A1 '^name = "dioxus"$' src/Cargo.lock | head -2    # check locked version
+cargo update -p dioxus@0.7.3 --precise 0.7.4             # bump to match dx CLI
+dx components update                                      # update dx-components too
+```
+
 No test suite yet. Manual validation via curl (JMAP) and nc/swaks (SMTP).
 
 ## cosmix-maild CLI

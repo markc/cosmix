@@ -6,6 +6,9 @@ pub fn init_linux_env() {
     #[cfg(target_os = "linux")]
     unsafe {
         std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        // Suppress "Support for this platform is experimental with Xe KMD" warnings
+        // from Mesa's Intel Xe driver (emitted twice: UI process + WebKit web process)
+        std::env::set_var("MESA_LOG_LEVEL", "error");
     }
 }
 
@@ -15,7 +18,8 @@ pub fn init_linux_env() {
 /// - No system menu bar (replaced by MenuBar component)
 /// - Drag-to-move and caption buttons provided by the MenuBar component
 ///
-/// All cosmix Dioxus desktop apps should use this instead of building Config manually.
+/// This approach works identically on desktop (WebKitGTK) and WASM (browser)
+/// with no dependency on any specific Wayland compositor.
 pub fn window_config(title: &str, width: f64, height: f64) -> dioxus_desktop::Config {
     use dioxus_desktop::{muda::Menu, Config, LogicalSize, WindowBuilder};
 

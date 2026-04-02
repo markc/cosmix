@@ -16,26 +16,32 @@ pub static MENU_CMD: GlobalSignal<Option<MenuCommand>> = Signal::global(|| None)
 pub static MENU_DEF: GlobalSignal<Option<MenuBarDef>> = Signal::global(|| None);
 
 // ── CSS ───────────────────────────────────────────────────────────────────
+//
+// Uses CSS custom properties with sensible fallback values. The variables
+// are injection points for cosmix-confd (future AMP-driven global theming).
+// Fallbacks are Tailwind gray-900 palette so the menu renders correctly
+// even without any theme injection.
 
 const MENU_CSS: &str = r#"
 .cmx-menubar {
     display: flex;
     align-items: center;
-    height: 28px;
+    height: 2rem;
     background: var(--bg-secondary, #111827);
     border-bottom: 1px solid var(--border, #1f2937);
     user-select: none;
     flex-shrink: 0;
     font-family: system-ui, sans-serif;
+    font-size: 1rem;
     position: relative;
 }
 .cmx-menu-trigger {
-    padding: 2px 10px;
+    padding: 0.125rem 0.625rem;
     cursor: pointer;
-    font-size: var(--font-size-sm, 12px);
+    font-size: 0.8125rem;
     color: var(--fg-secondary, #e5e7eb);
-    border-radius: 3px;
-    height: 22px;
+    border-radius: 0.1875rem;
+    height: 1.625rem;
     display: flex;
     align-items: center;
 }
@@ -45,23 +51,23 @@ const MENU_CSS: &str = r#"
 }
 .cmx-dropdown {
     position: fixed;
-    min-width: 180px;
+    min-width: 11.25rem;
     background: var(--bg-secondary, #111827);
     border: 1px solid var(--border, #374151);
-    border-radius: 4px;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.6);
+    border-radius: 0.25rem;
+    box-shadow: 0 0.25rem 1rem rgba(0,0,0,0.6);
     z-index: 9999;
-    padding: 4px 0;
+    padding: 0.25rem 0;
 }
 .cmx-menu-item {
-    padding: 4px 32px 4px 12px;
+    padding: 0.25rem 2rem 0.25rem 0.75rem;
     cursor: pointer;
-    font-size: var(--font-size-sm, 12px);
+    font-size: 0.75rem;
     color: var(--fg-primary, #f3f4f6);
     display: flex;
     justify-content: space-between;
     align-items: center;
-    gap: 24px;
+    gap: 1.5rem;
     white-space: nowrap;
 }
 .cmx-menu-item:hover {
@@ -74,20 +80,19 @@ const MENU_CSS: &str = r#"
 }
 .cmx-shortcut {
     color: var(--fg-muted, #6b7280);
-    font-size: calc(var(--font-size-sm, 12px) - 1px);
+    font-size: 0.6875rem;
     flex-shrink: 0;
 }
 .cmx-sep {
     height: 1px;
     background: var(--border, #374151);
-    margin: 4px 0;
+    margin: 0.25rem 0;
 }
 .cmx-overlay {
     position: fixed;
     inset: 0;
     z-index: 9998;
 }
-/* AMP highlight pulse — applied to menu items targeted by menu.highlight/invoke */
 .cmx-amp-highlight {
     background: var(--bg-tertiary, #1f2937);
     animation: amp-pulse 400ms ease-out;
@@ -96,20 +101,20 @@ const MENU_CSS: &str = r#"
     0%   { box-shadow: inset 0 0 0 2px var(--accent, #3b82f6); }
     100% { box-shadow: inset 0 0 0 0 transparent; }
 }
-/* Drag region — the spacer area between menus and caption buttons */
+/* Drag region — spacer between menus and caption buttons */
 .cmx-drag-region {
     flex: 1;
     height: 100%;
 }
-/* Caption buttons */
+/* Caption buttons — CSD for frameless windows */
 .cmx-caption-btns {
     display: flex;
     align-items: center;
     height: 100%;
 }
 .cmx-caption-btn {
-    width: 36px;
-    height: 28px;
+    width: 2.25rem;
+    height: 2rem;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -127,23 +132,23 @@ const MENU_CSS: &str = r#"
     color: #fff;
 }
 .cmx-caption-btn svg {
-    width: 12px;
-    height: 12px;
+    width: 0.75rem;
+    height: 0.75rem;
 }
 /* App icon (top-left, balances close button on top-right) */
 .cmx-app-icon {
-    width: 28px;
-    height: 28px;
+    width: 1.75rem;
+    height: 2rem;
     display: flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
-    padding: 4px;
+    padding: 0.25rem;
     color: var(--accent, #60a5fa);
 }
 .cmx-app-icon svg {
-    width: 18px;
-    height: 18px;
+    width: 1.125rem;
+    height: 1.125rem;
 }
 "#;
 
@@ -185,10 +190,12 @@ pub struct MenuBarProps {
 /// Horizontal menu bar with integrated caption buttons (minimize/maximize/close)
 /// and a draggable region for frameless windows.
 ///
-/// On desktop, apps should use `cosmix_ui::desktop::window_config()` which sets
-/// `with_decorations(false)` — the MenuBar replaces the compositor's header bar.
+/// On desktop, apps use `cosmix_ui::desktop::window_config()` which sets
+/// `with_decorations(false)` — the MenuBar provides all window chrome (CSD).
+/// This avoids any dependency on specific Wayland compositors.
 ///
-/// On WASM, caption buttons are hidden (no native window to control).
+/// On WASM, caption buttons provide fullscreen toggle and tab close.
+/// The same MenuBar works identically in both environments.
 #[component]
 pub fn MenuBar(props: MenuBarProps) -> Element {
     // Index of currently open top-level menu, None = all closed

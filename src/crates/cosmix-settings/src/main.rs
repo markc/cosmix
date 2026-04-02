@@ -69,7 +69,7 @@ fn app() -> Element {
                 // Update live theme preview
                 let s = settings();
                 *THEME.write() = ThemeParams {
-                    hue: s.global.theme_hue,
+
                     dark: s.global.theme_dark,
                     font_size: s.global.font_size,
                 };
@@ -93,7 +93,7 @@ fn app() -> Element {
         match cosmix_config::store::load() {
             Ok(new) => {
                 *THEME.write() = ThemeParams {
-                    hue: new.global.theme_hue,
+
                     dark: new.global.theme_dark,
                     font_size: new.global.font_size,
                 };
@@ -302,7 +302,7 @@ fn theme_presets(settings: Signal<cosmix_config::CosmixSettings>, dirty: Signal<
                                         dirty.set(true);
                                         let s = settings();
                                         *THEME.write() = ThemeParams {
-                                            hue: s.global.theme_hue,
+                        
                                             dark: s.global.theme_dark,
                                             font_size: s.global.font_size,
                                         };
@@ -342,7 +342,7 @@ fn field_input(
                             if dotpath.starts_with("global.theme_") {
                                 let s = settings();
                                 *THEME.write() = ThemeParams {
-                                    hue: s.global.theme_hue,
+                
                                     dark: s.global.theme_dark,
                                     font_size: s.global.font_size,
                                 };
@@ -376,7 +376,7 @@ fn field_input(
                                             dirty.set(true);
                                             let s = settings();
                                             *THEME.write() = ThemeParams {
-                                                hue: s.global.theme_hue,
+                            
                                                 dark: s.global.theme_dark,
                                                 font_size: s.global.font_size,
                                             };
@@ -411,7 +411,7 @@ fn field_input(
                                     if dotpath == "global.font_size" {
                                         let s = settings();
                                         *THEME.write() = ThemeParams {
-                                            hue: s.global.theme_hue,
+                        
                                             dark: s.global.theme_dark,
                                             font_size: s.global.font_size,
                                         };

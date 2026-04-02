@@ -1,0 +1,238 @@
+/* cosmix-dialog — full-window alert dialog styling.
+   Adapted from dx-components AlertDialog pattern but designed to fill
+   the entire window rather than float as a centered modal.
+   Uses cosmix CSS custom properties with Tailwind palette fallbacks. */
+
+/* Container fills the window below the MenuBar */
+.alert-dialog {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  padding: 0.75rem 1rem;
+  background: var(--bg-primary, #030712);
+  color: var(--fg-primary, #f3f4f6);
+  font-family: var(--font-sans, system-ui, -apple-system, sans-serif);
+  gap: 0.5rem;
+}
+
+.alert-dialog-title {
+  margin: 0;
+  color: var(--fg-primary, #f3f4f6);
+  font-size: 0.875rem;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.alert-dialog-description {
+  margin: 0;
+  color: var(--fg-secondary, #d1d5db);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+/* Icon + title row for message/question dialogs */
+.alert-dialog-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.alert-dialog-icon {
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+/* Body area — vertically centers content */
+.alert-dialog-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  justify-content: center;
+}
+
+/* Use this on body when content should fill available space */
+.alert-dialog-body-fill {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  overflow-y: auto;
+}
+
+/* Detail/pre block for error details */
+.alert-dialog-detail {
+  margin: 0;
+  padding: 0.5rem;
+  background: var(--bg-tertiary, #1f2937);
+  border-radius: 0.25rem;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.75rem;
+  white-space: pre-wrap;
+  overflow-y: auto;
+  max-height: 10rem;
+  color: var(--fg-primary, #f3f4f6);
+}
+
+/* Input area between body and actions */
+.alert-dialog-input {
+  padding: 0;
+}
+
+/* Footer — distinct section matching menubar style */
+.alert-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  background: var(--bg-secondary, #111827);
+  border-top: 1px solid var(--border, #1f2937);
+  margin: 0 -1rem -0.75rem;
+  flex-shrink: 0;
+}
+
+/* Cancel button */
+.alert-dialog-cancel {
+  padding: 0.375rem 1rem;
+  border: 1px solid rgba(128, 128, 128, 0.4);
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--fg-primary, #f3f4f6);
+  cursor: pointer;
+  font-size: 0.8125rem;
+}
+
+.alert-dialog-cancel:hover {
+  background: var(--bg-tertiary, #1f2937);
+}
+
+/* Action/confirm button */
+.alert-dialog-action {
+  padding: 0.375rem 1rem;
+  border: 1px solid var(--accent, #3b82f6);
+  border-radius: 0.25rem;
+  background: var(--accent, #3b82f6);
+  color: var(--accent-fg, #ffffff);
+  cursor: pointer;
+  font-size: 0.8125rem;
+}
+
+.alert-dialog-action:hover {
+  background: var(--accent-hover, #60a5fa);
+}
+
+/* Ghost button (for optional Cancel in question dialogs) */
+.alert-dialog-ghost {
+  padding: 0.375rem 1rem;
+  border: 1px solid transparent;
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--fg-muted, #6b7280);
+  cursor: pointer;
+  font-size: 0.8125rem;
+}
+
+.alert-dialog-ghost:hover {
+  background: var(--bg-tertiary, #1f2937);
+  color: var(--fg-primary, #f3f4f6);
+}
+
+/* Scrollable content area (text viewer, lists) */
+.alert-dialog-scroll {
+  flex: 1;
+  overflow-y: auto;
+  background: var(--bg-tertiary, #1f2937);
+  border: 1px solid rgba(128, 128, 128, 0.4);
+  border-radius: 0.25rem;
+}
+
+/* List items (checklist, radiolist) */
+.alert-dialog-list-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.75rem;
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
+
+.alert-dialog-list-item:hover {
+  background: var(--accent-subtle, rgba(59, 130, 246, 0.15));
+}
+
+/* Form field */
+.alert-dialog-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1875rem;
+}
+
+.alert-dialog-field-label {
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.alert-dialog-field-help {
+  font-size: 0.6875rem;
+  color: var(--fg-muted, #6b7280);
+}
+
+/* Shared input styling */
+.alert-dialog-field-input,
+.alert-dialog-field-select,
+.alert-dialog-field-textarea {
+  width: 100%;
+  padding: 0.375rem 0.5rem;
+  border: 1px solid rgba(128, 128, 128, 0.4);
+  border-radius: 0.25rem;
+  background: var(--bg-tertiary, #1f2937);
+  color: var(--fg-primary, #f3f4f6);
+  font-size: 0.8125rem;
+  outline: none;
+}
+
+.alert-dialog-field-input:focus,
+.alert-dialog-field-select:focus,
+.alert-dialog-field-textarea:focus {
+  border-color: var(--accent, #3b82f6);
+}
+
+.alert-dialog-field-textarea {
+  font-family: var(--font-mono, monospace);
+  resize: vertical;
+}
+
+/* Progress bar */
+.alert-dialog-progress-track {
+  width: 100%;
+  height: 0.5rem;
+  background: var(--bg-tertiary, #1f2937);
+  border-radius: 0.25rem;
+  overflow: hidden;
+}
+
+.alert-dialog-progress-fill {
+  height: 100%;
+  background: var(--accent, #3b82f6);
+  border-radius: 0.25rem;
+  transition: width 0.2s ease;
+}
+
+@keyframes dlg-pulse {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(433%); }
+}
+
+.alert-dialog-progress-pulsate {
+  height: 100%;
+  background: var(--accent, #3b82f6);
+  border-radius: 0.25rem;
+  width: 30%;
+  animation: dlg-pulse 1.5s ease-in-out infinite;
+}

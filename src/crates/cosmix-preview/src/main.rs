@@ -154,7 +154,10 @@ fn app() -> Element {
             MenuBar {
                 menu: app_menu,
                 on_action: move |id: String| match id.as_str() {
-                    "quit" => dioxus::desktop::window().close(),
+                    "quit" => {
+                        #[cfg(feature = "desktop")]
+                        dioxus::desktop::window().close();
+                    }
                     "about" => show_about.set(true),
                     "theme_light" => { THEME.write().dark = false; },
                     "theme_dark" => { THEME.write().dark = true; },

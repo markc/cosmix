@@ -1,7 +1,11 @@
 //! Shared app initialization for all cosmix Dioxus apps.
 //!
-//! Provides the global THEME signal, theme polling/hub-watch hooks,
-//! and the `launch_desktop()` helper that replaces boilerplate in every app's `main()`.
+//! Provides the global THEME signal, theme CSS injection via `use_theme_css()`,
+//! theme polling/hub-watch hooks, and the `launch_desktop()` helper.
+//!
+//! The CSS custom properties (`--bg-primary`, `--accent`, etc.) are injection
+//! points for the future cosmix-confd global theming system. Currently they
+//! are set to static Tailwind gray/blue palette values.
 
 use dioxus::prelude::*;
 use crate::theme::{ThemeParams, generate_css};
@@ -15,7 +19,6 @@ pub static THEME: GlobalSignal<ThemeParams> = Signal::global(|| {
     {
         cosmix_config::store::load()
             .map(|s| ThemeParams {
-                hue: s.global.theme_hue,
                 dark: s.global.theme_dark,
                 font_size: s.global.font_size,
             })
@@ -32,7 +35,6 @@ pub static THEME: GlobalSignal<ThemeParams> = Signal::global(|| {
 pub fn reload_theme() {
     if let Ok(settings) = cosmix_config::store::load() {
         *THEME.write() = ThemeParams {
-            hue: settings.global.theme_hue,
             dark: settings.global.theme_dark,
             font_size: settings.global.font_size,
         };
@@ -41,27 +43,24 @@ pub fn reload_theme() {
 
 // ── Theme CSS injection ──
 
-/// Injects theme CSS into the document and reactively updates it when THEME changes.
+/// Injects theme CSS custom properties into the document and reactively
+/// updates them when THEME changes (dark/light toggle, font size).
 ///
-/// Uses `document::eval()` to create/update a `<style id="cosmix-theme">` element,
-/// because `document::Style` is write-once and ignores prop changes after first render.
+/// Does two things:
+/// 1. Injects a `<style id="cosmix-theme">` with all `--bg-*`, `--fg-*`, etc. variables
+/// 2. Sets `data-theme="dark"|"light"` on `<html>` to activate the dx-components
+///    `--dark`/`--light` toggle (defined in dx-components-theme.css)
 ///
-/// Call once in your app's root component. No `document::Style` needed in rsx.
-///
-/// ```ignore
-/// fn app() -> Element {
-///     use_theme_css();
-///     rsx! { div { style: "background:var(--bg-primary);", "themed!" } }
-/// }
-/// ```
+/// Call once in your app's root component.
 pub fn use_theme_css() {
     use_effect(move || {
         let theme = THEME.read();
         let css = generate_css(&theme);
-        // Escape backticks in CSS (unlikely but safe)
         let css = css.replace('`', "\\`");
+        let data_theme = if theme.dark { "dark" } else { "light" };
         document::eval(&format!(
             r#"
+            document.documentElement.setAttribute('data-theme', '{data_theme}');
             let el = document.getElementById('cosmix-theme');
             if (!el) {{
                 el = document.createElement('style');

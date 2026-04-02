@@ -4,7 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "GUI dialog utility for cosmix — info, error, confirm, input, text-info (stdin)"
+description = "GUI dialog system for cosmix — CLI, Mix-builtin, and AMP-service modes"
+
+[lib]
+name = "cosmix_dialog"
+path = "src/lib.rs"
 
 [[bin]]
 name = "cosmix-dialog"
@@ -21,3 +25,7 @@ tao = { version = "0.34", default-features = false, optional = true }
 cosmix_ui = { package = "cosmix-lib-ui", path = "../cosmix-lib-ui", features = ["config"] }
 clap.workspace = true
 mimalloc.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { version = "1", features = ["time"] }
+dioxus-primitives = { git = "https://github.com/DioxusLabs/components", version = "0.0.1", default-features = false }

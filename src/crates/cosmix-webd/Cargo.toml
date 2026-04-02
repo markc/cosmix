@@ -29,3 +29,5 @@ rustls-pemfile = "2"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
+pulldown-cmark.workspace = true
+regex-lite = "0.1"

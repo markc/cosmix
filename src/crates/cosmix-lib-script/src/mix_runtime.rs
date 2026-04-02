@@ -118,7 +118,7 @@ async fn source_prelude(eval: &mut Evaluator) {
         tracing::warn!("Cosmix prelude parse error (lexer): {}", path.display());
         return;
     };
-    let mut parser = mix_core::parser::Parser::new(tokens);
+    let mut parser = mix_core::parser::Parser::new(tokens, &source);
     let Ok(stmts) = parser.parse_program() else {
         tracing::warn!("Cosmix prelude parse error (parser): {}", path.display());
         return;
@@ -148,7 +148,7 @@ pub async fn execute_mix(
             };
         }
     };
-    let mut parser = mix_core::parser::Parser::new(tokens);
+    let mut parser = mix_core::parser::Parser::new(tokens, &source);
     let stmts = match parser.parse_program() {
         Ok(s) => s,
         Err(e) => {
