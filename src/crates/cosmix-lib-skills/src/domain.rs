@@ -9,7 +9,7 @@
 //!   ~/Dev/php/laravel/app     → "Dev/php/laravel"
 //!   /tmp/random               → "general"
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Detect the project domain from a working directory.
 ///
@@ -72,6 +72,7 @@ fn path_to_domain(project_root: &Path, home: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_path_to_domain() {

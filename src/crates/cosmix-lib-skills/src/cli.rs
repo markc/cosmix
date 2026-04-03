@@ -106,6 +106,13 @@ enum Command {
         limit: usize,
     },
 
+    /// Show database stats: vector counts by source, DB size, search latency
+    Stats {
+        /// Run N search benchmarks to measure latency (default: 5)
+        #[arg(short = 'n', default_value = "5")]
+        bench_runs: usize,
+    },
+
     /// Create a sample transcript JSON for testing
     SampleTranscript,
 }
@@ -153,6 +160,7 @@ async fn main() -> Result<()> {
         Command::Refine { id, success, notes } => cmd_refine(&resolved, *id, *success, notes).await,
         Command::Delete { id } => cmd_delete(&resolved, *id).await,
         Command::Format { query, limit } => cmd_format(&resolved, query, *limit).await,
+        Command::Stats { bench_runs } => cmd_stats(&resolved, *bench_runs).await,
         Command::SampleTranscript => cmd_sample_transcript(),
     }
 }
@@ -329,6 +337,91 @@ async fn cmd_format(cli: &ResolvedConfig, query: &str, limit: usize) -> Result<(
 
     let formatted = format_skills_for_prompt(&skills);
     println!("{formatted}");
+    Ok(())
+}
+
+async fn cmd_stats(cli: &ResolvedConfig, bench_runs: usize) -> Result<()> {
+    use std::time::Instant;
+
+    let mut indexd = IndexdClient::connect(Some(&cli.socket)).await?;
+    let stats = indexd.stats().await?;
+
+    println!("=== Vector Database Stats ===");
+    println!();
+
+    // DB size
+    let size_kb = stats.db_size_bytes as f64 / 1024.0;
+    let size_mb = size_kb / 1024.0;
+    if size_mb >= 1.0 {
+        println!("  DB size:        {size_mb:.1} MB");
+    } else {
+        println!("  DB size:        {size_kb:.0} KB");
+    }
+
+    println!("  Total vectors:  {}", stats.total_vectors);
+    println!("  Model loaded:   {}", if stats.model_loaded { "yes" } else { "no" });
+    println!();
+
+    // Per-source breakdown
+    if !stats.by_source.is_empty() {
+        println!("  By source:");
+        for sc in &stats.by_source {
+            println!("    {:<12} {}", sc.source, sc.count);
+        }
+        println!();
+    }
+
+    // Domain breakdown for skills
+    let (skills, _total) = indexd.list_skills(1000, 0).await?;
+    if !skills.is_empty() {
+        let mut domain_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for (_id, doc) in &skills {
+            let d = if doc.domain.is_empty() { "general" } else { &doc.domain };
+            *domain_counts.entry(d.to_string()).or_default() += 1;
+        }
+        println!("  Skills by domain:");
+        for (domain, count) in &domain_counts {
+            println!("    {:<20} {}", domain, count);
+        }
+        println!();
+    }
+
+    // Search latency benchmark
+    if stats.total_vectors > 0 && bench_runs > 0 {
+        println!("  Search latency ({bench_runs} runs):");
+
+        let queries = [
+            "implement a streaming protocol parser",
+            "debug email delivery issues",
+            "add pagination to REST API",
+            "configure WireGuard mesh networking",
+            "refactor database schema migration",
+        ];
+
+        let mut latencies = Vec::new();
+        for i in 0..bench_runs {
+            let query = queries[i % queries.len()];
+            let start = Instant::now();
+            let _ = indexd.search_skills(query, 5).await?;
+            let elapsed = start.elapsed();
+            latencies.push(elapsed.as_millis() as u64);
+        }
+
+        latencies.sort();
+        let p50 = latencies[latencies.len() / 2];
+        let p95 = latencies[(latencies.len() as f64 * 0.95) as usize];
+        let min = latencies[0];
+        let max = latencies[latencies.len() - 1];
+        let avg: u64 = latencies.iter().sum::<u64>() / latencies.len() as u64;
+
+        println!("    min: {min}ms  avg: {avg}ms  p50: {p50}ms  p95: {p95}ms  max: {max}ms");
+
+        // Note about first-run model loading
+        if !stats.model_loaded {
+            println!("    (first search loads embedding model — subsequent runs faster)");
+        }
+    }
+
     Ok(())
 }
 

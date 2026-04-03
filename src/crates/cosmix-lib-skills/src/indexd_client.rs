@@ -157,6 +157,12 @@ impl IndexdClient {
         Ok(())
     }
 
+    /// Get database statistics from indexd.
+    pub async fn stats(&mut self) -> Result<StatsResponse> {
+        let req = serde_json::json!({"action": "stats"});
+        self.request(&req.to_string()).await
+    }
+
     /// Raw embed request (useful for testing).
     pub async fn embed(&mut self, texts: &[String], prefix: &str) -> Result<Vec<Vec<f32>>> {
         let req = serde_json::json!({
@@ -235,4 +241,20 @@ struct DeleteResp {
 #[derive(Deserialize)]
 struct EmbedResp {
     embeddings: Vec<Vec<f32>>,
+}
+
+/// Statistics from the indexd vector database.
+#[derive(Debug, Deserialize)]
+pub struct StatsResponse {
+    pub total_vectors: usize,
+    pub db_size_bytes: u64,
+    pub model_loaded: bool,
+    #[serde(default)]
+    pub by_source: Vec<SourceCount>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SourceCount {
+    pub source: String,
+    pub count: usize,
 }

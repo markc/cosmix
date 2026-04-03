@@ -169,6 +169,14 @@ struct StatsResponse {
     total_vectors: usize,
     db_size_bytes: u64,
     model_loaded: bool,
+    #[serde(default)]
+    by_source: Vec<SourceCount>,
+}
+
+#[derive(Serialize)]
+struct SourceCount {
+    source: String,
+    count: usize,
 }
 
 #[derive(Serialize)]
@@ -586,10 +594,26 @@ impl VectorDb {
             .conn
             .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get::<_, i64>(0).map(|v| v as usize))?;
         let db_size = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+
+        let mut by_source = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT source, COUNT(*) FROM chunks GROUP BY source ORDER BY COUNT(*) DESC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SourceCount {
+                source: row.get(0)?,
+                count: row.get::<_, i64>(1).map(|v| v as usize)?,
+            })
+        })?;
+        for row in rows {
+            by_source.push(row?);
+        }
+
         Ok(StatsResponse {
             total_vectors: total,
             db_size_bytes: db_size,
             model_loaded: false, // caller fills this in
+            by_source,
         })
     }
 }
