@@ -17,4 +17,4 @@ tokio.workspace = true
 dirs-next = "2"
 mix-core = { path = "../../../../.mix/src/crates/mix-core", features = ["json"] }
 cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client" }
-cosmix_script = { package = "cosmix-lib-script", path = "../cosmix-lib-script" }
+cosmix_script = { package = "cosmix-lib-script", path = "../cosmix-lib-script", features = ["dialog"] }

@@ -1,0 +1,17 @@
+[package]
+name = "cosmix-dialog-iced"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "POC: Pure Rust layer-shell dialog using Iced + iced_layershell (no GTK, no C deps)"
+
+[[bin]]
+name = "cosmix-dialog-iced"
+path = "src/main.rs"
+
+[dependencies]
+iced = { version = "0.14", default-features = false, features = ["tiny-skia", "wgpu", "wayland", "thread-pool"] }
+iced_layershell = "0.17"
+clap.workspace = true
+mimalloc.workspace = true

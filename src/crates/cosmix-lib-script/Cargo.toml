@@ -13,6 +13,7 @@ path = "src/lib.rs"
 [features]
 default = []
 menu = ["dep:cosmix_ui"]
+dialog = ["dep:cosmix_dialog"]
 
 [dependencies]
 serde = { workspace = true }
@@ -20,5 +21,6 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client" }
 cosmix_ui = { package = "cosmix-lib-ui", path = "../cosmix-lib-ui", optional = true, default-features = false }
+cosmix_dialog = { package = "cosmix-dialog", path = "../cosmix-dialog", optional = true, default-features = false, features = ["layer-shell"] }
 mix-core = { path = "../../../../.mix/src/crates/mix-core", features = ["json"] }
 tokio = { workspace = true }

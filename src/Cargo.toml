@@ -12,6 +12,8 @@ members = [
     # GUI apps
     "crates/cosmix-backup",
     "crates/cosmix-dialog",
+    "crates/cosmix-dialog-layer",
+    "crates/cosmix-dialog-iced",
     "crates/cosmix-dns",
     "crates/cosmix-edit",
     "crates/cosmix-files",

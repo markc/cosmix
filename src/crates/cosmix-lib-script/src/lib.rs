@@ -30,6 +30,9 @@ pub mod discovery;
 pub mod executor;
 pub mod mix_runtime;
 
+#[cfg(feature = "dialog")]
+pub mod dialog_ext;
+
 #[cfg(feature = "menu")]
 pub mod menu;
 

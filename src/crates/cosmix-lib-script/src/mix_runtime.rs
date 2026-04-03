@@ -90,6 +90,10 @@ pub fn create_evaluator(
         eval.set_global(k, Value::String(v.clone()));
     }
 
+    // Register dialog builtin functions
+    #[cfg(feature = "dialog")]
+    crate::dialog_ext::register(&mut eval);
+
     (eval, stdout, stderr)
 }
 

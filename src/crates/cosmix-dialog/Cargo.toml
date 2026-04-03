@@ -15,8 +15,12 @@ name = "cosmix-dialog"
 path = "src/main.rs"
 
 [features]
-default = ["desktop"]
+default = ["desktop", "layer-shell"]
 desktop = ["dioxus/desktop", "dep:dioxus-desktop", "dep:tao"]
+layer-shell = ["dep:gtk", "dep:gdk", "dep:glib"]
+
+[build-dependencies]
+pkg-config = "0.3"
 
 [dependencies]
 dioxus = { version = "0.7", features = [] }
@@ -29,3 +33,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { version = "1", features = ["time"] }
 dioxus-primitives = { git = "https://github.com/DioxusLabs/components", version = "0.0.1", default-features = false }
+
+# Layer-shell backend (GTK3 native)
+gtk = { version = "0.18", features = ["v3_24"], optional = true }
+gdk = { version = "0.18", optional = true }
+glib = { version = "0.18", optional = true }

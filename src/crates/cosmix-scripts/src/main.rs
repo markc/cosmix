@@ -129,20 +129,58 @@ async fn run_mix_script(path: &Path, no_hub: bool) {
             std::process::exit(1);
         }
     } else {
-        // Run without AMP — basic Mix execution only
-        match mix_core::run_capturing(&source).await {
-            Ok((_val, stdout, stderr)) => {
-                if !stdout.is_empty() {
-                    print!("{stdout}");
-                }
-                if !stderr.is_empty() {
-                    eprint!("{stderr}");
-                }
+        // Run without AMP — still register dialog builtins
+        run_mix_no_hub(&source).await;
+    }
+}
+
+/// Run a Mix script without AMP hub but with dialog builtins.
+async fn run_mix_no_hub(source: &str) {
+    use mix_core::evaluator::{Evaluator, SharedBuf};
+    use mix_core::lexer::Lexer;
+    use mix_core::parser::Parser;
+
+    let mut lexer = Lexer::new(source);
+    let tokens = match lexer.tokenize() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Parse error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut parser = Parser::new(tokens, source);
+    let stmts = match parser.parse_program() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Parse error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let stdout = SharedBuf::new();
+    let stderr = SharedBuf::new();
+    let mut eval = Evaluator::with_output(
+        Box::new(stdout.clone()),
+        Box::new(stderr.clone()),
+    );
+
+    // Register dialog builtins even without AMP
+    cosmix_script::dialog_ext::register(&mut eval);
+
+    match eval.execute(&stmts).await {
+        Ok(_) => {
+            let out = stdout.to_string_lossy();
+            let err = stderr.to_string_lossy();
+            if !out.is_empty() {
+                print!("{out}");
             }
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(1);
+            if !err.is_empty() {
+                eprint!("{err}");
             }
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
         }
     }
 }

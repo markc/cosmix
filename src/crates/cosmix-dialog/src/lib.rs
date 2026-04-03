@@ -11,6 +11,10 @@ pub mod types;
 pub mod cli;
 pub mod window;
 pub mod render;
+pub mod backend;
+
+#[cfg(feature = "layer-shell")]
+pub mod layer;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -67,14 +71,17 @@ impl DialogRequest {
     }
 
     /// Get the default window size for this dialog kind.
+    ///
+    /// Sizes below 240px are achievable via the layer-shell backend.
+    /// The Dioxus backend will be clamped to 240px by cosmic-comp.
     pub fn default_size(&self) -> (u32, u32) {
         self.size.unwrap_or_else(|| match &self.kind {
-            // cosmic-comp enforces 240px min height for Wayland windows
-            DialogKind::Message { detail: Some(_), .. } => (420, 280),
-            DialogKind::Message { .. } => (340, 240),
-            DialogKind::Question { cancel: true, .. } => (380, 240),
-            DialogKind::Question { .. } => (340, 240),
-            DialogKind::Entry { .. } | DialogKind::Password { .. } => (360, 240),
+            DialogKind::Message { detail: Some(_), .. } => (420, 200),
+            DialogKind::Message { .. } => (340, 120),
+            DialogKind::Question { cancel: true, .. } => (400, 130),
+            DialogKind::Question { .. } => (360, 130),
+            DialogKind::Entry { .. } => (360, 140),
+            DialogKind::Password { .. } => (360, 130),
             DialogKind::TextInput { .. } | DialogKind::TextViewer { .. } => (560, 360),
             DialogKind::ComboBox { .. } => (380, 150),
             DialogKind::CheckList { items, .. } | DialogKind::RadioList { items, .. } => {
@@ -86,10 +93,10 @@ impl DialogRequest {
                 let h = 100 + (fields.len() as u32 * 44).min(440);
                 (520, h)
             }
-            DialogKind::Progress { .. } => (420, 150),
+            DialogKind::Progress { .. } => (420, 100),
             DialogKind::Scale { .. } => (420, 180),
             DialogKind::Calendar { .. } => (360, 400),
-            DialogKind::Notification { .. } => (320, 100),
+            DialogKind::Notification { .. } => (320, 80),
             _ => (420, 200),
         })
     }

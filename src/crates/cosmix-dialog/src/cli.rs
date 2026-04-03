@@ -4,6 +4,7 @@
 
 use clap::{Parser, Subcommand};
 
+use crate::backend::BackendOverride;
 use crate::types::*;
 use crate::DialogRequest;
 
@@ -32,6 +33,10 @@ pub struct Cli {
     /// Timeout in seconds (0 = no timeout).
     #[arg(long, global = true, default_value = "0")]
     pub timeout: u32,
+
+    /// Rendering backend: auto (default), dioxus (WebKitGTK), or layer (GTK layer-shell).
+    #[arg(long, global = true, value_enum)]
+    pub backend: Option<BackendOverride>,
 }
 
 #[derive(Subcommand)]
