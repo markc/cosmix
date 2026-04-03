@@ -13,8 +13,11 @@ path = "src/main.rs"
 [dependencies]
 rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
 cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client" }
+cosmix_skills = { package = "cosmix-lib-skills", path = "../cosmix-lib-skills" }
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config" }
 serde_json.workspace = true
 serde.workspace = true
 schemars = "1"
 tokio.workspace = true
 tracing.workspace = true
+chrono.workspace = true

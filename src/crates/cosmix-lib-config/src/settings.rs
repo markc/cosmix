@@ -311,7 +311,7 @@ impl Default for LlmSettings {
             command: "ask".into(),
         });
         Self {
-            default: "ollama".into(),
+            default: "claude-api".into(),
             backends,
         }
     }
