@@ -21,6 +21,7 @@ pub struct CosmixSettings {
     pub wg: WgSettings,
     pub backup: BackupSettings,
     pub embed: EmbedSettings,
+    pub llm: LlmSettings,
     pub skills: SkillsSettings,
     pub mesh: MeshSettings,
     pub launcher: LauncherSettings,
@@ -269,26 +270,90 @@ impl Default for EmbedSettings {
     }
 }
 
+/// LLM backend configuration — supports multiple named backends.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LlmSettings {
+    /// Which backend to use by default (key into `backends` table).
+    pub default: String,
+    /// Named backend configurations.
+    pub backends: std::collections::BTreeMap<String, LlmBackendConfig>,
+}
+
+impl Default for LlmSettings {
+    fn default() -> Self {
+        let mut backends = std::collections::BTreeMap::new();
+        backends.insert("ollama".into(), LlmBackendConfig {
+            provider: "ollama".into(),
+            model: "qwen3:30b-a3b-nt".into(),
+            base_url: "http://localhost:11434".into(),
+            api_key_env: String::new(),
+            api_key_cmd: String::new(),
+            port: String::new(),
+            command: String::new(),
+        });
+        backends.insert("claude-api".into(), LlmBackendConfig {
+            provider: "anthropic".into(),
+            model: "claude-haiku-4-5-20251001".into(),
+            base_url: "https://api.anthropic.com".into(),
+            api_key_env: "ANTHROPIC_API_KEY".into(),
+            api_key_cmd: String::new(),
+            port: String::new(),
+            command: String::new(),
+        });
+        backends.insert("claud".into(), LlmBackendConfig {
+            provider: "amp".into(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key_env: String::new(),
+            api_key_cmd: String::new(),
+            port: "claud".into(),
+            command: "ask".into(),
+        });
+        Self {
+            default: "ollama".into(),
+            backends,
+        }
+    }
+}
+
+/// Configuration for a single LLM backend.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct LlmBackendConfig {
+    /// Provider type: "anthropic", "openai", "ollama", "amp".
+    pub provider: String,
+    /// Model identifier (e.g. "claude-haiku-4-5-20251001", "gpt-4o-mini", "qwen3:30b-a3b-nt").
+    pub model: String,
+    /// Base URL for HTTP-based providers.
+    pub base_url: String,
+    /// Environment variable name containing the API key.
+    pub api_key_env: String,
+    /// Shell command that outputs the API key (alternative to env var).
+    pub api_key_cmd: String,
+    /// AMP port name (for "amp" provider only).
+    pub port: String,
+    /// AMP command name (for "amp" provider, default "ask").
+    pub command: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SkillsSettings {
-    /// Ollama API base URL.
-    pub llm_url: String,
-    /// LLM model name for skill evaluation/extraction.
-    pub llm_model: String,
     /// Minimum confidence threshold for skill retrieval (0.0–1.0).
     pub min_confidence: f64,
     /// Maximum skills injected into agent prompts.
     pub max_skills: u32,
+    /// LLM backend name to use (key in [llm.backends], empty = use [llm].default).
+    pub llm_backend: String,
 }
 
 impl Default for SkillsSettings {
     fn default() -> Self {
         Self {
-            llm_url: "http://localhost:11434".into(),
-            llm_model: "qwen3:30b-a3b-nt".into(),
             min_confidence: 0.3,
             max_skills: 3,
+            llm_backend: String::new(),
         }
     }
 }

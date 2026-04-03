@@ -1,6 +1,6 @@
-//! cosmix-claude — Claude AI AMP port daemon.
+//! cosmix-claud — Claude AI AMP port daemon.
 //!
-//! Listens on `/run/user/{uid}/cosmix/ports/claude.sock` and exposes
+//! Listens on `/run/user/{uid}/cosmix/ports/claud.sock` and exposes
 //! Claude CLI operations as AMP commands:
 //!
 //!   ask      — Send a prompt to Claude, return the response
@@ -8,8 +8,8 @@
 //!   generate — Generate code for a given task
 //!
 //! Usage from Mix:
-//!   send "claude" "ask" prompt="What is 2+2?"
-//!   address "claude"
+//!   send "claud" "ask" prompt="What is 2+2?"
+//!   address "claud"
 //!       ask prompt="Explain recursion"
 //!       analyze code=$src error=$err
 //!   end
@@ -102,9 +102,9 @@ fn handle_generate(args: serde_json::Value) -> anyhow::Result<serde_json::Value>
 
 #[tokio::main]
 async fn main() {
-    let _log = cosmix_daemon::init_tracing("cosmix_claude");
+    let _log = cosmix_daemon::init_tracing("cosmix_claud");
 
-    tracing::info!("Starting cosmix-claude AMP port");
+    tracing::info!("Starting cosmix-claud AMP port");
 
     // Check claude CLI is available
     let has_claude = std::process::Command::new("which")
@@ -117,26 +117,26 @@ async fn main() {
 
     if !has_claude {
         tracing::error!("Claude CLI not found on PATH");
-        eprintln!("cosmix-claude: requires Claude Code CLI (https://claude.ai/code)");
+        eprintln!("cosmix-claud: requires Claude Code CLI (https://claude.ai/code)");
         std::process::exit(1);
     }
 
-    let port = Port::new("claude")
+    let port = Port::new("claud")
         .command("ask", "Send a prompt to Claude and return the response", handle_ask)
         .command("analyze", "Analyze code or errors with Claude", handle_analyze)
         .command("generate", "Generate code for a given task", handle_generate)
         .standard_help()
-        .standard_info("cosmix-claude", env!("CARGO_PKG_VERSION"));
+        .standard_info("cosmix-claud", env!("CARGO_PKG_VERSION"));
 
     let _handle = match port.start() {
         Ok(h) => {
-            tracing::info!("Claude port listening on {}", h.socket_path.display());
-            println!("cosmix-claude listening on {}", h.socket_path.display());
+            tracing::info!("Claud port listening on {}", h.socket_path.display());
+            println!("cosmix-claud listening on {}", h.socket_path.display());
             h
         }
         Err(e) => {
             tracing::error!("Failed to start port: {e}");
-            eprintln!("cosmix-claude: failed to start: {e}");
+            eprintln!("cosmix-claud: failed to start: {e}");
             std::process::exit(1);
         }
     };

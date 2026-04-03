@@ -1,13 +1,13 @@
 [package]
-name = "cosmix-claude"
+name = "cosmix-claud"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Claude AI AMP port — exposes Claude CLI as a Cosmix service on claude.sock"
+description = "Claude AI AMP port — exposes Claude CLI as a Cosmix service on claud.sock"
 
 [[bin]]
-name = "cosmix-claude"
+name = "cosmix-claud"
 path = "src/main.rs"
 
 [dependencies]

@@ -10,6 +10,7 @@ members = [
     "crates/cosmix-lib-daemon",
     "crates/cosmix-lib-script",
     "crates/cosmix-lib-skills",
+    "crates/cosmix-lib-llm",
     # GUI apps
     "crates/cosmix-backup",
     "crates/cosmix-dialog",
@@ -34,7 +35,7 @@ members = [
     "crates/cosmix-maild",
     "crates/cosmix-webd",
     "crates/cosmix-mcp",
-    "crates/cosmix-claude",
+    "crates/cosmix-claud",
 ]
 
 [workspace.package]

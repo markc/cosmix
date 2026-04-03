@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 pub struct SkillDocument {
     pub name: String,
     pub version: u32,
+    /// Project domain derived from CLAUDE.md location (e.g. "cosmix", "ns", "gh/wg-admin").
+    #[serde(default)]
+    pub domain: String,
     /// When this skill should be applied (natural language trigger condition).
     pub trigger: String,
     /// Step-by-step approach for executing this skill.

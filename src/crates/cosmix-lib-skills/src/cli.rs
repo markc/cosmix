@@ -1,20 +1,25 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use cosmix_skills::{
-    evaluate_task, extract_skill, format_skills_for_prompt, refine_skill, retrieve_skills,
+    evaluate_task, extract_skill, format_skills_for_prompt, refine_skill,
+    retrieve_skills_domain, detect_domain_cwd,
     EvalScore, IndexdClient, LlmClient, TaskOutcome, TaskTranscript,
 };
 
 #[derive(Parser)]
 #[command(name = "cosmix-skills-cli", about = "Test the Hermes skill learning loop")]
 struct Cli {
-    /// Ollama base URL (default from settings.toml [skills])
+    /// LLM backend name from settings.toml [llm.backends] (default: [llm].default)
     #[arg(long)]
-    llm_url: Option<String>,
+    backend: Option<String>,
 
-    /// LLM model name (default from settings.toml [skills])
+    /// Project domain filter (default: auto-detect from $PWD via CLAUDE.md)
     #[arg(long)]
-    model: Option<String>,
+    domain: Option<String>,
+
+    /// Search all domains (ignore domain filter)
+    #[arg(long)]
+    all_domains: bool,
 
     /// indexd Unix socket path (default from settings.toml [embed])
     #[arg(long)]
@@ -25,8 +30,8 @@ struct Cli {
 }
 
 struct ResolvedConfig {
-    llm_url: String,
-    model: String,
+    backend: Option<String>,
+    domain: Option<String>,
     socket: String,
 }
 
@@ -116,11 +121,28 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let cfg = cosmix_config::store::load().unwrap_or_default();
+
+    // Use skills-specific backend override if set, else CLI arg, else [llm].default
+    let backend = cli.backend.or_else(|| {
+        let b = &cfg.skills.llm_backend;
+        if b.is_empty() { None } else { Some(b.clone()) }
+    });
+    let domain = if cli.all_domains {
+        None
+    } else {
+        Some(cli.domain.unwrap_or_else(detect_domain_cwd))
+    };
     let resolved = ResolvedConfig {
-        llm_url: cli.llm_url.unwrap_or(cfg.skills.llm_url),
-        model: cli.model.unwrap_or(cfg.skills.llm_model),
+        backend,
+        domain,
         socket: cli.socket.unwrap_or(cfg.embed.socket_path),
     };
+
+    if let Some(d) = &resolved.domain {
+        eprintln!("Domain: {d}");
+    } else {
+        eprintln!("Domain: (all)");
+    }
 
     match &cli.command {
         Command::Evaluate { path } => cmd_evaluate(&resolved, path).await,
@@ -143,7 +165,7 @@ fn load_transcript(path: &str) -> Result<TaskTranscript> {
 
 async fn cmd_evaluate(cli: &ResolvedConfig, path: &str) -> Result<()> {
     let transcript = load_transcript(path)?;
-    let llm = LlmClient::new(Some(&cli.llm_url), Some(&cli.model));
+    let llm = LlmClient::from_config(cli.backend.as_deref())?;
 
     println!("Evaluating task: {}", transcript.task_description);
     match evaluate_task(&llm, &transcript).await? {
@@ -164,7 +186,7 @@ async fn cmd_evaluate(cli: &ResolvedConfig, path: &str) -> Result<()> {
 
 async fn cmd_extract(cli: &ResolvedConfig, path: &str) -> Result<()> {
     let transcript = load_transcript(path)?;
-    let llm = LlmClient::new(Some(&cli.llm_url), Some(&cli.model));
+    let llm = LlmClient::from_config(cli.backend.as_deref())?;
 
     println!("Extracting skill from: {}", transcript.task_description);
     let eval = EvalScore {
@@ -179,7 +201,7 @@ async fn cmd_extract(cli: &ResolvedConfig, path: &str) -> Result<()> {
 
 async fn cmd_learn(cli: &ResolvedConfig, path: &str) -> Result<()> {
     let transcript = load_transcript(path)?;
-    let llm = LlmClient::new(Some(&cli.llm_url), Some(&cli.model));
+    let llm = LlmClient::from_config(cli.backend.as_deref())?;
 
     println!("=== Evaluate ===");
     let eval = match evaluate_task(&llm, &transcript).await? {
@@ -219,7 +241,9 @@ async fn cmd_learn(cli: &ResolvedConfig, path: &str) -> Result<()> {
 
 async fn cmd_search(cli: &ResolvedConfig, query: &str, limit: usize) -> Result<()> {
     let mut indexd = IndexdClient::connect(Some(&cli.socket)).await?;
-    let results = indexd.search_skills(query, limit).await?;
+    let results = indexd
+        .search_skills_domain(query, limit, cli.domain.as_deref())
+        .await?;
 
     if results.is_empty() {
         println!("No skills found.");
@@ -228,8 +252,9 @@ async fn cmd_search(cli: &ResolvedConfig, query: &str, limit: usize) -> Result<(
 
     for (id, doc, distance) in &results {
         println!(
-            "[{id}] {} — confidence: {:.0}%, used: {} times, distance: {distance:.4}",
+            "[{id}] {} [{}] — confidence: {:.0}%, used: {} times, distance: {distance:.4}",
             doc.name,
+            if doc.domain.is_empty() { "general" } else { &doc.domain },
             doc.confidence * 100.0,
             doc.use_count,
         );
@@ -245,9 +270,10 @@ async fn cmd_list(cli: &ResolvedConfig, limit: usize, offset: usize) -> Result<(
     println!("Skills ({total} total, showing {}-{}):", offset + 1, offset + skills.len());
     for (id, doc) in &skills {
         println!(
-            "  [{id}] {} v{} — confidence: {:.0}%, used: {}, success: {}",
+            "  [{id}] {} v{} [{}] — confidence: {:.0}%, used: {}, success: {}",
             doc.name,
             doc.version,
+            if doc.domain.is_empty() { "general" } else { &doc.domain },
             doc.confidence * 100.0,
             doc.use_count,
             doc.success_count,
@@ -258,7 +284,7 @@ async fn cmd_list(cli: &ResolvedConfig, limit: usize, offset: usize) -> Result<(
 
 async fn cmd_refine(cli: &ResolvedConfig, id: i64, success: bool, notes: &str) -> Result<()> {
     let mut indexd = IndexdClient::connect(Some(&cli.socket)).await?;
-    let llm = LlmClient::new(Some(&cli.llm_url), Some(&cli.model));
+    let llm = LlmClient::from_config(cli.backend.as_deref())?;
 
     // Fetch the existing skill
     let results = indexd.list_skills(100, 0).await?;
@@ -294,7 +320,7 @@ async fn cmd_delete(cli: &ResolvedConfig, id: i64) -> Result<()> {
 
 async fn cmd_format(cli: &ResolvedConfig, query: &str, limit: usize) -> Result<()> {
     let mut indexd = IndexdClient::connect(Some(&cli.socket)).await?;
-    let skills = retrieve_skills(&mut indexd, query, limit).await?;
+    let skills = retrieve_skills_domain(&mut indexd, query, limit, cli.domain.as_deref()).await?;
 
     if skills.is_empty() {
         println!("No relevant skills found.");

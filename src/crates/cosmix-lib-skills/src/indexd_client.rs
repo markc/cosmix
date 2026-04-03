@@ -69,17 +69,34 @@ impl IndexdClient {
     }
 
     /// Search for skills relevant to a task description.
+    /// If `domain` is Some, only returns skills from that domain.
+    /// If None, returns skills from all domains.
     pub async fn search_skills(
         &mut self,
         task_description: &str,
         limit: usize,
     ) -> Result<Vec<(i64, SkillDocument, f64)>> {
-        let req = serde_json::json!({
+        self.search_skills_domain(task_description, limit, None).await
+    }
+
+    /// Search with optional domain filtering.
+    pub async fn search_skills_domain(
+        &mut self,
+        task_description: &str,
+        limit: usize,
+        domain: Option<&str>,
+    ) -> Result<Vec<(i64, SkillDocument, f64)>> {
+        let mut req = serde_json::json!({
             "action": "search",
             "query": task_description,
             "limit": limit,
             "source": "skill",
         });
+        if let Some(d) = domain {
+            req["metadata_filter"] = serde_json::json!([
+                {"field": "domain", "op": "eq", "value": d}
+            ]);
+        }
 
         let resp: SearchResp = self.request(&req.to_string()).await?;
         let mut skills = Vec::new();

@@ -25,6 +25,7 @@ Monorepo with Cargo workspace under `src/`. Top level is clean (docs + config on
 | `cosmix-lib-config` | `cosmix_config` | Typed config structs + TOML load/save |
 | `cosmix-lib-mesh` | `cosmix_mesh` | WireGuard mesh networking, WebSocket peer sync |
 | `cosmix-lib-script` | `cosmix_script` | Mix script discovery, runtime bridge, cosmix prelude, User menu |
+| `cosmix-lib-llm` | `cosmix_llm` | Generic multi-backend LLM client (Anthropic, OpenAI, Ollama, AMP) |
 | `cosmix-lib-ui` | `cosmix_ui` | **THE shared UI library** — theme, MenuBar, dx-components, icons, app shell. Priority: centralize ALL shared UI here. |
 
 ### GUI Apps
@@ -50,7 +51,7 @@ Monorepo with Cargo workspace under `src/`. Top level is clean (docs + config on
 | Crate | Purpose |
 |-------|---------|
 | `cosmix-noded` | **Consolidated node daemon** — hub + config + monitor + logger in one binary |
-| `cosmix-claude` | Claude Code agent daemon |
+| `cosmix-claud` | Claude Code AMP port daemon |
 | `cosmix-indexd` | Semantic indexing + vector storage (candle + sqlite-vec) |
 | `cosmix-maild` | JMAP (RFC 8620/8621) + SMTP mail server |
 | `cosmix-mcp` | Model Context Protocol bridge for Claude Code |
