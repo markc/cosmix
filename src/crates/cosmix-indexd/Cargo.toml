@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 cosmix_daemon = { package = "cosmix-lib-daemon", path = "../cosmix-lib-daemon" }
 cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config" }
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

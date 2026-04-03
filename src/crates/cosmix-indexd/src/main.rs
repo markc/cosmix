@@ -686,6 +686,22 @@ async fn main() -> Result<()> {
 
     info!("ready — model loads on first request, unloads after {idle_timeout_secs}s idle");
 
+    // Spawn AMP hub registration (non-blocking — if hub isn't running, indexd still works)
+    let amp_state = state.clone();
+    let amp_activity_tx = activity_tx.clone();
+    tokio::spawn(async move {
+        match cosmix_client::HubClient::connect_default("indexd").await {
+            Ok(client) => {
+                info!("registered as AMP service 'indexd' on hub");
+                let client = std::sync::Arc::new(client);
+                handle_amp_commands(client, amp_state, amp_activity_tx).await;
+            }
+            Err(e) => {
+                info!("hub not available, running socket-only mode: {e}");
+            }
+        }
+    });
+
     // Spawn idle watchdog
     let watchdog_state = state.clone();
     tokio::spawn(async move {
@@ -735,6 +751,44 @@ async fn main() -> Result<()> {
             }
         });
     }
+}
+
+/// Handle incoming AMP commands from the hub mesh.
+/// Maps AMP commands to the same JSON protocol used by the Unix socket.
+async fn handle_amp_commands(
+    client: std::sync::Arc<cosmix_client::HubClient>,
+    state: Arc<Mutex<AppState>>,
+    activity_tx: tokio::sync::mpsc::Sender<()>,
+) {
+    let mut rx = match client.incoming_async().await {
+        Some(rx) => rx,
+        None => return,
+    };
+
+    while let Some(cmd) = rx.recv().await {
+        // The AMP command args ARE the JSON request, just add the "action" field
+        // e.g. amp_call("indexd", "indexd.search", {"query": "...", "limit": 5})
+        // becomes {"action": "search", "query": "...", "limit": 5}
+        let action = cmd.command.strip_prefix("indexd.").unwrap_or(&cmd.command);
+
+        let request_json = if cmd.args.is_object() {
+            let mut args = cmd.args.clone();
+            args.as_object_mut().unwrap().insert("action".into(), serde_json::Value::String(action.into()));
+            args.to_string()
+        } else {
+            serde_json::json!({"action": action}).to_string()
+        };
+
+        let response = process_request(&request_json, &state, &activity_tx).await;
+
+        // Check if response is an error
+        let rc = if response.contains("\"error\"") { 10 } else { 0 };
+        if let Err(e) = client.respond(&cmd, rc, &response).await {
+            error!("failed to send AMP response: {e}");
+        }
+    }
+
+    info!("hub connection closed");
 }
 
 async fn handle_connection(
