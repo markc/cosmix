@@ -879,10 +879,20 @@ impl ServerHandler for CosmixMcp {
 
 #[tokio::main]
 async fn main() {
+    // Init tracing subscriber so RUST_LOG=trace shows rmcp internals on stderr
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
     eprintln!("[cosmix-mcp] starting (hub + indexd connections deferred until first tool call)");
     let server = CosmixMcp { hub: OnceCell::new(), tool_router: CosmixMcp::tool_router() };
-    if let Err(e) = server.serve(rmcp::transport::io::stdio()).await {
-        eprintln!("[cosmix-mcp] error: {e}");
-        std::process::exit(1);
-    }
+    let service = match server.serve(rmcp::transport::io::stdio()).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[cosmix-mcp] error: {e}");
+            std::process::exit(1);
+        }
+    };
+    // Wait for the service to finish (client disconnect / EOF)
+    service.waiting().await;
 }
