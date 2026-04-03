@@ -193,6 +193,9 @@ struct ErrorResp {
 struct StoreResp {
     #[allow(dead_code)]
     stored: usize,
+    #[serde(default)]
+    #[allow(dead_code)]
+    duplicates: usize,
     ids: Vec<i64>,
 }
 
@@ -255,6 +258,14 @@ pub struct StatsResponse {
     pub total_vectors: usize,
     pub db_size_bytes: u64,
     pub model_loaded: bool,
+    #[serde(default)]
+    pub model_circuit: String,
+    #[serde(default)]
+    pub embed_cache_entries: usize,
+    #[serde(default)]
+    pub embed_cache_hits: u64,
+    #[serde(default)]
+    pub embed_cache_misses: u64,
     #[serde(default)]
     pub by_source: Vec<SourceCount>,
 }
