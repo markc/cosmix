@@ -296,12 +296,18 @@ impl CosmixMcp {
             })
         };
 
+        // Load knowledge settings for trust weighting + journal decay
+        let k = cosmix_config::store::load()
+            .map(|c| c.knowledge)
+            .unwrap_or_default();
+
         let mut result = serde_json::json!({
             "domain": domain.as_deref().unwrap_or("all"),
             "query": &p.query,
             "skills": [],
             "docs": [],
             "journals": [],
+            "memory": [],
         });
 
         // Search skills (domain-filtered)
@@ -317,11 +323,18 @@ impl CosmixMcp {
 
         if let Ok(resp) = indexd.raw_request(&skill_req).await {
             if let Some(hits) = resp.get("results").and_then(|r| r.as_array()) {
-                let skills: Vec<serde_json::Value> = hits.iter().filter_map(|h| {
+                let mut skills: Vec<serde_json::Value> = hits.iter().filter_map(|h| {
                     let meta: serde_json::Value = h.get("metadata")
                         .and_then(|m| m.as_str())
                         .and_then(|s| serde_json::from_str(s).ok())?;
-                    let dist = h.get("distance").and_then(|d| d.as_f64()).unwrap_or(1.0);
+                    // Skip superseded skills (they have a non-zero superseded_by)
+                    if meta.get("superseded_by").and_then(|v| v.as_i64()).unwrap_or(0) > 0 {
+                        return None;
+                    }
+                    let raw = h.get("distance").and_then(|d| d.as_f64()).unwrap_or(1.0);
+                    let graduated = meta.get("graduated").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let trust = if graduated { k.trust_weight_graduated } else { k.trust_weight_skill };
+                    let adj = raw - trust;
                     Some(serde_json::json!({
                         "id": h.get("id"),
                         "name": meta.get("name"),
@@ -329,20 +342,81 @@ impl CosmixMcp {
                         "approach": meta.get("approach"),
                         "failure_modes": meta.get("failure_modes"),
                         "confidence": meta.get("confidence"),
-                        "distance": dist,
+                        "graduated": graduated,
+                        "distance": adj,
                     }))
                 }).collect();
+                skills.sort_by(|a, b| {
+                    let da = a.get("distance").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                    let db = b.get("distance").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                });
                 result["skills"] = serde_json::Value::Array(skills);
             }
         }
 
         // Search docs (domain-filtered, then cross-domain if few results)
-        let doc_results = search_source(&mut indexd, &p.query, "doc", domain.as_deref(), limit).await;
+        let mut doc_results = search_source(&mut indexd, &p.query, "doc", domain.as_deref(), limit).await;
+        for hit in doc_results.iter_mut() {
+            if let Some(d) = hit.get_mut("distance").and_then(|v| v.as_f64()) {
+                hit["distance"] = serde_json::json!(d - k.trust_weight_doc);
+            }
+        }
+        doc_results.sort_by(|a, b| {
+            let da = a.get("distance").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let db = b.get("distance").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
         result["docs"] = serde_json::Value::Array(doc_results);
 
-        // Search journals (domain-filtered, then cross-domain)
-        let journal_results = search_source(&mut indexd, &p.query, "journal", domain.as_deref(), limit).await;
+        // Search journals (domain-filtered, then cross-domain), with temporal decay
+        let mut journal_results = search_source(&mut indexd, &p.query, "journal", domain.as_deref(), limit).await;
+        let today = chrono::Local::now().date_naive();
+        journal_results.retain_mut(|hit| {
+            let date_str = hit.get("date").and_then(|v| v.as_str()).unwrap_or("");
+            let days_old = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+                .map(|d| (today - d).num_days().max(0))
+                .unwrap_or(0);
+            if k.journal_max_age_days > 0 && days_old as u32 > k.journal_max_age_days {
+                return false;
+            }
+            if let Some(raw) = hit.get("distance").and_then(|v| v.as_f64()) {
+                let decay = (days_old as f64 / 30.0) * k.journal_decay_per_month;
+                let adj = raw + decay - k.trust_weight_journal;
+                hit["distance"] = serde_json::json!(adj);
+            }
+            true
+        });
+        journal_results.sort_by(|a, b| {
+            let da = a.get("distance").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let db = b.get("distance").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
         result["journals"] = serde_json::Value::Array(journal_results);
+
+        // Search _memory/ (CMM-generated observations), with same temporal decay as journals.
+        let mut memory_results = search_source(&mut indexd, &p.query, "memory", domain.as_deref(), limit).await;
+        memory_results.retain_mut(|hit| {
+            let date_str = hit.get("date").and_then(|v| v.as_str()).unwrap_or("");
+            let days_old = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+                .map(|d| (today - d).num_days().max(0))
+                .unwrap_or(0);
+            if k.journal_max_age_days > 0 && days_old as u32 > k.journal_max_age_days {
+                return false;
+            }
+            if let Some(raw) = hit.get("distance").and_then(|v| v.as_f64()) {
+                let decay = (days_old as f64 / 30.0) * k.journal_decay_per_month;
+                let adj = raw + decay - k.trust_weight_memory;
+                hit["distance"] = serde_json::json!(adj);
+            }
+            true
+        });
+        memory_results.sort_by(|a, b| {
+            let da = a.get("distance").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let db = b.get("distance").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        result["memory"] = serde_json::Value::Array(memory_results);
 
         serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".into())
     }
@@ -546,6 +620,7 @@ impl CosmixMcp {
             created: now.clone(),
             updated: now,
             graduated: false,
+            superseded_by: None,
         };
 
         match indexd.store_skill(&skill).await {
@@ -601,15 +676,16 @@ impl CosmixMcp {
         };
 
         match cosmix_skills::refine_skill(&llm, &mut indexd, p.id, &existing, &outcome).await {
-            Ok(updated) => {
-                // Check if skill qualifies for graduation after refinement
-                let graduated = cosmix_skills::check_graduation(&mut indexd, p.id, &updated)
+            Ok((new_id, updated)) => {
+                // Check if the new skill version qualifies for graduation
+                let graduated = cosmix_skills::check_graduation(&mut indexd, new_id, &updated)
                     .await
                     .unwrap_or(false);
 
                 serde_json::json!({
                     "refined": true,
-                    "id": p.id,
+                    "old_id": p.id,
+                    "id": new_id,
                     "name": &updated.name,
                     "version": updated.version,
                     "confidence": updated.confidence,
@@ -846,17 +922,19 @@ fn format_search_hits(resp: &serde_json::Value) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-/// Find _doc/ and _journal/ directories under a workspace root.
+/// Find _doc/, _journal/, and _memory/ directories under a workspace root.
 fn find_content_dirs(root: &std::path::Path) -> Vec<(std::path::PathBuf, &'static str)> {
     let mut dirs = Vec::new();
 
-    // Walk up to 3 levels deep looking for _doc/ and _journal/
+    // Walk up to 3 levels deep looking for content dirs
     for entry in walkdir(root, 3) {
         let name = entry.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if name == "_doc" && entry.is_dir() {
             dirs.push((entry, "doc"));
         } else if name == "_journal" && entry.is_dir() {
             dirs.push((entry, "journal"));
+        } else if name == "_memory" && entry.is_dir() {
+            dirs.push((entry, "memory"));
         }
     }
 

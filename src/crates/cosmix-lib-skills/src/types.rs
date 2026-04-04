@@ -25,6 +25,10 @@ pub struct SkillDocument {
     /// Whether this skill has been graduated to CLAUDE.md as a permanent rule.
     #[serde(default)]
     pub graduated: bool,
+    /// If set, this skill version has been superseded by the chunk with this ID
+    /// (supersede-don't-delete semantics — history preserved for rollback/audit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<i64>,
 }
 
 impl SkillDocument {

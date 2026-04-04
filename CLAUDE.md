@@ -92,7 +92,6 @@ No test suite yet. Manual validation via curl (JMAP) and nc/swaks (SMTP).
 ## cosmix-maild CLI
 
 ```bash
-cosmix-maild migrate                    # apply SQL migrations
 cosmix-maild account add <email> <pwd>  # create account (auto-creates default mailboxes + PIM)
 cosmix-maild account list
 cosmix-maild account delete <email>
@@ -105,7 +104,7 @@ cosmix-maild serve                      # start JMAP HTTP + SMTP listeners
 
 Config loaded from `~/.config/cosmix/jmap.toml` or `/etc/cosmix/jmap.toml`. Key fields:
 
-- `database_url` — PostgreSQL connection (requires pgvector extension for future AI phase)
+- `database_path` — SQLite database file (default `~/.local/share/cosmix-jmap/mail.db`)
 - `blob_dir` — on-disk blob storage path
 - `smtp.listen_inbound` — SMTP port (default 2525, production 25)
 - `tls.cert` / `tls.key` — rustls TLS
@@ -114,17 +113,21 @@ Config loaded from `~/.config/cosmix/jmap.toml` or `/etc/cosmix/jmap.toml`. Key 
 
 ## Database Architecture
 
-PostgreSQL with sqlx (async, compile-time checked queries). Four migrations in `src/crates/cosmix-maild/migrations/`:
+SQLite with rusqlite (synchronous driver, wrapped in `tokio::task::spawn_blocking`). Schema embedded in `db/mod.rs` with auto-creation on connect. WAL mode, foreign keys enforced, 5s busy timeout.
+
+**13 tables** across 9 db modules: accounts, mailboxes, threads, blobs, emails, changelog, smtp_queue, calendars, calendar_events, addressbooks, contacts, email_submissions, vacation_responses.
 
 **State tracking:** All mutations write to `changelog(account_id, object_type, object_id, change_type)`. JMAP state = max changelog ID per (account_id, object_type). This powers `/changes` and `/query` efficiently.
 
-**UUID primary keys** on mailboxes, threads, blobs, calendars, events, contacts. Account IDs are SERIAL INT.
+**UUID primary keys** (generated in Rust via `Uuid::new_v4()`) on mailboxes, threads, blobs, calendars, events, contacts. Account IDs are INTEGER PRIMARY KEY AUTOINCREMENT.
 
-**JSONB for flexibility:** email addresses, keywords, calendar events (JSCalendar RFC 8984), contacts (JSContact RFC 9553) stored as JSONB.
+**JSON as TEXT:** email addresses, keywords, calendar events (JSCalendar RFC 8984), contacts (JSContact RFC 9553) stored as JSON-serialized TEXT. Mailbox IDs and in-reply-to stored as JSON arrays.
+
+**Full-text search:** FTS5 virtual table on email subject, preview, from_addr.
 
 **Blob storage:** BLAKE3 hashed, size tracked, stored on disk at `{blob_dir}/{id}`.
 
-**Account creation** triggers `create_default_mailboxes()` (Inbox/Drafts/Sent/Trash/Junk/Archive) and `create_default_pim()` (Personal calendar + Contacts addressbook).
+**Account creation** inline in `account::create()` — inserts default mailboxes (Inbox/Drafts/Sent/Trash/Junk/Archive) and default PIM (Personal calendar + Contacts addressbook).
 
 ## JMAP Server Architecture
 
@@ -156,7 +159,7 @@ RC codes: 0=success, 5=warning, 10=error, 20=failure. Used across Unix sockets (
 ## Key Decisions
 
 - **axum** for all HTTP — not actix, not warp
-- **sqlx** for database — not sea-orm, not diesel
+- **rusqlite** for maild database — SQLite for node-local simplicity, no external DB server needed
 - **tokio** async runtime throughout
 - **Dioxus 0.7** for client — not libcosmic (old stack was libcosmic, pivoted to Dioxus)
 - **AI lives in the server** — any JMAP client gets AI via email; cosmix-mail just gets richer UI

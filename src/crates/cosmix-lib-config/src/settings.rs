@@ -23,6 +23,7 @@ pub struct CosmixSettings {
     pub embed: EmbedSettings,
     pub llm: LlmSettings,
     pub skills: SkillsSettings,
+    pub knowledge: KnowledgeSettings,
     pub mesh: MeshSettings,
     pub launcher: LauncherSettings,
 }
@@ -363,6 +364,41 @@ impl Default for SkillsSettings {
             graduation_confidence: 0.9,
             graduation_min_uses: 5,
             graduation_min_successes: 4,
+        }
+    }
+}
+
+/// Knowledge base ranking: trust weights per source type + temporal decay.
+/// Applied in MCP context_search after indexd returns raw vector-similarity results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KnowledgeSettings {
+    /// Distance bonus for `_doc/` chunks (curated design truth). Subtracted from distance.
+    pub trust_weight_doc: f64,
+    /// Distance bonus for skills that have graduated to CLAUDE.md.
+    pub trust_weight_graduated: f64,
+    /// Distance bonus for ungraduated (provisional) skills.
+    pub trust_weight_skill: f64,
+    /// Distance bonus for journal entries (operational residue, usually 0.0).
+    pub trust_weight_journal: f64,
+    /// Distance bonus for _memory/ chunks (CMM-generated observations).
+    pub trust_weight_memory: f64,
+    /// Journal decay: distance penalty per month of age.
+    pub journal_decay_per_month: f64,
+    /// Journals older than this many days are excluded from results entirely.
+    pub journal_max_age_days: u32,
+}
+
+impl Default for KnowledgeSettings {
+    fn default() -> Self {
+        Self {
+            trust_weight_doc: 0.08,
+            trust_weight_graduated: 0.06,
+            trust_weight_skill: 0.03,
+            trust_weight_journal: 0.0,
+            trust_weight_memory: 0.01,
+            journal_decay_per_month: 0.02,
+            journal_max_age_days: 180,
         }
     }
 }

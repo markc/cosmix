@@ -102,6 +102,8 @@ impl IndexdClient {
         let mut skills = Vec::new();
         for result in resp.results {
             if let Ok(doc) = serde_json::from_str::<SkillDocument>(&result.metadata) {
+                // Filter out superseded skills — only return current versions
+                if doc.superseded_by.is_some() { continue; }
                 skills.push((result.id, doc, result.distance));
             }
         }
@@ -122,6 +124,29 @@ impl IndexdClient {
 
         let _resp: UpdateResp = self.request(&req.to_string()).await?;
         Ok(())
+    }
+
+    /// Supersede-don't-delete: store the refined skill as a new chunk, then mark the
+    /// old chunk as superseded by the new one. Preserves the old skill's content
+    /// (history is available for rollback/audit via list_skills).
+    /// Returns the new chunk ID.
+    pub async fn supersede_skill(
+        &mut self,
+        old_id: i64,
+        old_skill: &SkillDocument,
+        updated: &SkillDocument,
+    ) -> Result<i64> {
+        // Ensure the new version does not carry a stale superseded_by pointer.
+        let mut new_skill = updated.clone();
+        new_skill.superseded_by = None;
+        let new_id = self.store_skill(&new_skill).await?;
+
+        // Mark the old chunk as superseded, preserving its original content/metadata.
+        let mut marked = old_skill.clone();
+        marked.superseded_by = Some(new_id);
+        self.update_skill(old_id, &marked).await?;
+
+        Ok(new_id)
     }
 
     /// List all skills, paginated.
@@ -160,6 +185,28 @@ impl IndexdClient {
     /// Get database statistics from indexd.
     pub async fn stats(&mut self) -> Result<StatsResponse> {
         let req = serde_json::json!({"action": "stats"});
+        self.request(&req.to_string()).await
+    }
+
+    /// Query staleness candidates: chunks matching any of the three staleness buckets.
+    pub async fn stale(
+        &mut self,
+        source: Option<&str>,
+        never_retrieved_age_days: i64,
+        low_value_min_retrievals: i64,
+        long_dormant_days: i64,
+        per_bucket_limit: usize,
+    ) -> Result<StaleResponse> {
+        let mut req = serde_json::json!({
+            "action": "stale",
+            "never_retrieved_age_days": never_retrieved_age_days,
+            "low_value_min_retrievals": low_value_min_retrievals,
+            "long_dormant_days": long_dormant_days,
+            "per_bucket_limit": per_bucket_limit,
+        });
+        if let Some(s) = source {
+            req["source"] = serde_json::Value::String(s.to_string());
+        }
         self.request(&req.to_string()).await
     }
 
@@ -274,4 +321,26 @@ pub struct StatsResponse {
 pub struct SourceCount {
     pub source: String,
     pub count: usize,
+}
+
+/// Staleness query response: chunks split into 3 buckets + total count.
+#[derive(Debug, Deserialize)]
+pub struct StaleResponse {
+    pub never_retrieved_old: Vec<StaleChunk>,
+    pub low_value: Vec<StaleChunk>,
+    pub long_dormant: Vec<StaleChunk>,
+    pub total_chunks: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StaleChunk {
+    pub id: i64,
+    pub source: String,
+    pub preview: String,
+    pub retrieval_count: i64,
+    pub feedback_score: i64,
+    pub last_retrieved: Option<String>,
+    pub created: String,
+    pub path: Option<String>,
+    pub filename: Option<String>,
 }

@@ -97,6 +97,7 @@ pub async fn extract_skill(
         created: now.clone(),
         updated: now,
         graduated: false,
+        superseded_by: None,
     };
 
     info!(name = %skill.name, "skill extracted");
@@ -161,13 +162,15 @@ pub fn format_skills_for_prompt(skills: &[(i64, SkillDocument)]) -> String {
 }
 
 /// After using a skill, report the outcome to refine it.
+/// Uses supersede-don't-delete: creates a new chunk for the refined skill and marks
+/// the old chunk as superseded. Returns (new_chunk_id, refined_skill).
 pub async fn refine_skill(
     llm: &LlmClient,
     indexd: &mut IndexdClient,
     skill_id: i64,
     existing: &SkillDocument,
     outcome: &TaskOutcome,
-) -> Result<SkillDocument> {
+) -> Result<(i64, SkillDocument)> {
     let existing_json = serde_json::to_string_pretty(existing)?;
 
     let user_prompt = fill_template(
@@ -207,18 +210,21 @@ pub async fn refine_skill(
         created: existing.created.clone(),
         updated: now,
         graduated: existing.graduated,
+        superseded_by: None,
     };
 
-    indexd.update_skill(skill_id, &updated).await?;
+    let new_id = indexd.supersede_skill(skill_id, existing, &updated).await?;
 
     info!(
         name = %updated.name,
         version = updated.version,
         confidence = updated.confidence,
-        "skill refined"
+        old_id = skill_id,
+        new_id = new_id,
+        "skill refined (superseded)"
     );
 
-    Ok(updated)
+    Ok((new_id, updated))
 }
 
 /// Check if a skill qualifies for graduation to CLAUDE.md.

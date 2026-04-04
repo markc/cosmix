@@ -222,6 +222,7 @@ enum Request {
     Delete(DeleteRequest),
     List(ListRequest),
     Feedback(FeedbackRequest),
+    Stale(StaleRequest),
     Stats,
 }
 
@@ -302,6 +303,51 @@ struct FeedbackRequest {
     useful: bool,
 }
 
+#[derive(Deserialize)]
+struct StaleRequest {
+    /// Only include chunks of this source (empty = all sources).
+    #[serde(default)]
+    source: String,
+    /// "Never retrieved & old" bucket: age > this many days (default 90).
+    #[serde(default = "default_stale_age_days")]
+    never_retrieved_age_days: i64,
+    /// "Low value" bucket: retrieval_count > this AND feedback_score <= 0 (default 3).
+    #[serde(default = "default_low_value_retrievals")]
+    low_value_min_retrievals: i64,
+    /// "Long dormant" bucket: last_retrieved older than this many days (default 180).
+    #[serde(default = "default_dormant_days")]
+    long_dormant_days: i64,
+    /// Max chunks per bucket (default 50).
+    #[serde(default = "default_stale_limit")]
+    per_bucket_limit: usize,
+}
+
+fn default_stale_age_days() -> i64 { 90 }
+fn default_low_value_retrievals() -> i64 { 3 }
+fn default_dormant_days() -> i64 { 180 }
+fn default_stale_limit() -> usize { 50 }
+
+#[derive(Serialize)]
+struct StaleChunk {
+    id: i64,
+    source: String,
+    preview: String,
+    retrieval_count: i64,
+    feedback_score: i64,
+    last_retrieved: Option<String>,
+    created: String,
+    path: Option<String>,
+    filename: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StaleResponse {
+    never_retrieved_old: Vec<StaleChunk>,
+    low_value: Vec<StaleChunk>,
+    long_dormant: Vec<StaleChunk>,
+    total_chunks: usize,
+}
+
 fn default_doc_prefix() -> String {
     "search_document: ".into()
 }
@@ -330,6 +376,10 @@ struct SearchResult {
     metadata: String,
     distance: f64,
     feedback_score: i64,
+    retrieval_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_retrieved: Option<String>,
+    created: String,
 }
 
 #[derive(Serialize)]
@@ -516,6 +566,7 @@ impl VectorDb {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
 
+        // Create base tables (index on content_hash deferred — may not exist on upgraded DBs)
         conn.execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS chunks (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -525,8 +576,6 @@ impl VectorDb {
                 content_hash  BLOB,
                 created       TEXT NOT NULL DEFAULT (datetime('now'))
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_content_hash
-                ON chunks(content_hash) WHERE content_hash IS NOT NULL;
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
                 embedding float[{EMBEDDING_DIM}]
             );"
@@ -555,6 +604,24 @@ impl VectorDb {
                 "ALTER TABLE chunks ADD COLUMN feedback_score INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
+
+        // Migration: add retrieval tracking columns (implicit negative signal + staleness)
+        let has_retrieval_col: bool = conn
+            .prepare("SELECT retrieval_count FROM chunks LIMIT 0")
+            .is_ok();
+        if !has_retrieval_col {
+            info!("migrating: adding retrieval_count + last_retrieved columns");
+            conn.execute_batch(
+                "ALTER TABLE chunks ADD COLUMN retrieval_count INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE chunks ADD COLUMN last_retrieved TEXT;",
+            )?;
+        }
+
+        // Ensure content_hash index exists (must come AFTER content_hash migration above).
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_content_hash
+                 ON chunks(content_hash) WHERE content_hash IS NOT NULL;",
+        )?;
 
         let version: String = conn.query_row("SELECT vec_version()", [], |r| r.get(0))?;
         info!("vector db opened at {path} (sqlite-vec {version})");
@@ -624,7 +691,8 @@ impl VectorDb {
 
         // Build the base query — sqlite-vec requires MATCH + k in the WHERE clause
         let mut sql = String::from(
-            "SELECT v.rowid, v.distance, c.content, c.source, c.metadata, c.feedback_score
+            "SELECT v.rowid, v.distance, c.content, c.source, c.metadata, c.feedback_score,
+                    c.retrieval_count, c.last_retrieved, c.created
              FROM vec_chunks v
              JOIN chunks c ON c.id = v.rowid
              WHERE v.embedding MATCH ?1
@@ -699,6 +767,9 @@ impl VectorDb {
                 source: row.get(3)?,
                 metadata: row.get(4)?,
                 feedback_score: row.get::<_, i64>(5).unwrap_or(0),
+                retrieval_count: row.get::<_, i64>(6).unwrap_or(0),
+                last_retrieved: row.get::<_, Option<String>>(7).ok().flatten(),
+                created: row.get::<_, String>(8).unwrap_or_default(),
             })
         })?;
 
@@ -706,13 +777,31 @@ impl VectorDb {
         for row in rows {
             results.push(row?);
         }
-        // Re-sort by feedback-adjusted distance (lower = better)
+        // Re-sort by adjusted distance: feedback boost - implicit negative - staleness penalty.
+        // Lower adjusted distance = better rank.
+        let now_days = days_since_epoch_utc();
         results.sort_by(|a, b| {
-            let adj_a = a.distance - (a.feedback_score as f64 * 0.05);
-            let adj_b = b.distance - (b.feedback_score as f64 * 0.05);
+            let adj_a = adjusted_distance(a, now_days);
+            let adj_b = adjusted_distance(b, now_days);
             adj_a.partial_cmp(&adj_b).unwrap_or(std::cmp::Ordering::Equal)
         });
         Ok(results)
+    }
+
+    /// Fire-and-forget: mark these chunk IDs as retrieved (increment count, update timestamp).
+    /// Silently ignores errors — retrieval tracking is best-effort.
+    fn mark_retrieved(&self, ids: &[i64]) {
+        if ids.is_empty() { return; }
+        let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "UPDATE chunks SET retrieval_count = retrieval_count + 1,
+                               last_retrieved = datetime('now')
+             WHERE id IN ({placeholders})"
+        );
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> =
+            ids.iter().map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>).collect();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let _ = self.conn.execute(&sql, &*refs);
     }
 
     fn update(
@@ -860,6 +949,95 @@ impl VectorDb {
                 .execute("DELETE FROM vec_chunks WHERE rowid = ?1", [id])?;
         }
         Ok(deleted)
+    }
+
+    /// Return staleness candidates split into 3 buckets:
+    /// 1. Never retrieved AND older than `never_retrieved_age_days` days
+    /// 2. Retrieved > `low_value_min_retrievals` times with feedback_score <= 0
+    /// 3. Last retrieved older than `long_dormant_days` days ago
+    fn stale_query(&self, req: &StaleRequest) -> Result<StaleResponse> {
+        let total: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunks", [],
+            |r| r.get::<_, i64>(0).map(|v| v as usize),
+        )?;
+
+        // Build optional source clause — always put source param at position 3 if present.
+        let (src_clause, src_param): (&str, Option<&str>) = if req.source.is_empty() {
+            ("", None)
+        } else {
+            (" AND source = ?3", Some(req.source.as_str()))
+        };
+        let limit = req.per_bucket_limit as i64;
+
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<StaleChunk> {
+            let metadata: String = row.get(7)?;
+            let (path, filename) = extract_path_fields(&metadata);
+            Ok(StaleChunk {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                preview: row.get(2)?,
+                retrieval_count: row.get(3)?,
+                feedback_score: row.get(4)?,
+                last_retrieved: row.get(5)?,
+                created: row.get(6)?,
+                path,
+                filename,
+            })
+        };
+
+        let run_query = |sql: String, p1: i64| -> Result<Vec<StaleChunk>> {
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = if let Some(s) = src_param {
+                stmt.query_map(rusqlite::params![p1, limit, s], map_row)?
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                stmt.query_map(rusqlite::params![p1, limit], map_row)?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            Ok(rows)
+        };
+
+        let never_retrieved_old = run_query(
+            format!(
+                "SELECT id, source, substr(content, 1, 200), retrieval_count, feedback_score,
+                        last_retrieved, created, metadata
+                 FROM chunks
+                 WHERE last_retrieved IS NULL
+                   AND julianday('now') - julianday(created) > ?1{src_clause}
+                 ORDER BY created ASC LIMIT ?2"
+            ),
+            req.never_retrieved_age_days,
+        )?;
+
+        let low_value = run_query(
+            format!(
+                "SELECT id, source, substr(content, 1, 200), retrieval_count, feedback_score,
+                        last_retrieved, created, metadata
+                 FROM chunks
+                 WHERE retrieval_count > ?1 AND feedback_score <= 0{src_clause}
+                 ORDER BY retrieval_count DESC LIMIT ?2"
+            ),
+            req.low_value_min_retrievals,
+        )?;
+
+        let long_dormant = run_query(
+            format!(
+                "SELECT id, source, substr(content, 1, 200), retrieval_count, feedback_score,
+                        last_retrieved, created, metadata
+                 FROM chunks
+                 WHERE last_retrieved IS NOT NULL
+                   AND julianday('now') - julianday(last_retrieved) > ?1{src_clause}
+                 ORDER BY last_retrieved ASC LIMIT ?2"
+            ),
+            req.long_dormant_days,
+        )?;
+
+        Ok(StaleResponse {
+            never_retrieved_old,
+            low_value,
+            long_dormant,
+            total_chunks: total,
+        })
     }
 
     fn stats(&self, db_path: &str) -> Result<StatsResponse> {
@@ -1116,6 +1294,7 @@ async fn process_request(
         Request::Delete(req) => handle_delete(req, state).await,
         Request::List(req) => handle_list(req, state).await,
         Request::Feedback(req) => handle_feedback(req, state).await,
+        Request::Stale(req) => handle_stale(req, state).await,
         Request::Stats => handle_stats(state).await,
     }
 }
@@ -1191,11 +1370,153 @@ async fn handle_embed(
     }
 }
 
+/// Days since Unix epoch, UTC. Used for staleness penalties without a date crate.
+fn days_since_epoch_utc() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86400) as i64)
+        .unwrap_or(0)
+}
+
+/// Parse "YYYY-MM-DD HH:MM:SS" (SQLite datetime('now')) or "YYYY-MM-DDTHH:MM:SS" to days-since-epoch.
+/// Returns None on any parse failure (no date crate — naive conversion using days-per-month).
+fn sqlite_datetime_to_days(s: &str) -> Option<i64> {
+    if s.len() < 10 { return None; }
+    let b = s.as_bytes();
+    if b[4] != b'-' || b[7] != b'-' { return None; }
+    let y: i64 = s[0..4].parse().ok()?;
+    let m: i64 = s[5..7].parse().ok()?;
+    let d: i64 = s[8..10].parse().ok()?;
+    // Days from epoch: count years+leap days, month days, day of month.
+    // Using the common algorithm (Howard Hinnant's date algorithms, shifted-year form).
+    let y = y - (if m <= 2 { 1 } else { 0 });
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as i64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146097 + doe - 719468)
+}
+
+/// Compute ranking-adjusted distance for a search result.
+/// Lower is better. Combines: feedback_score boost, implicit negative signal, staleness penalty.
+fn adjusted_distance(r: &SearchResult, now_days: i64) -> f64 {
+    let feedback_boost = r.feedback_score as f64 * 0.05;
+
+    // Implicit negative: retrieved >3 times with non-positive feedback = weak penalty.
+    let implicit_penalty = if r.retrieval_count > 3 && r.feedback_score <= 0 {
+        (r.retrieval_count as f64 - 3.0) * 0.01
+    } else {
+        0.0
+    };
+
+    // Staleness penalty: never-retrieved old chunks, or long-unretrieved chunks.
+    let staleness_penalty = match r.last_retrieved.as_deref() {
+        None => {
+            // Never retrieved — penalize if chunk is old.
+            if let Some(created_days) = sqlite_datetime_to_days(&r.created) {
+                let age = now_days - created_days;
+                if age > 90 { 0.03 } else { 0.0 }
+            } else { 0.0 }
+        }
+        Some(lr) => {
+            if let Some(lr_days) = sqlite_datetime_to_days(lr) {
+                let since = now_days - lr_days;
+                if since > 180 { 0.02 } else { 0.0 }
+            } else { 0.0 }
+        }
+    };
+
+    r.distance - feedback_boost + implicit_penalty + staleness_penalty
+}
+
+/// Extract `path` and `filename` from a JSON metadata string.
+fn extract_path_fields(metadata: &str) -> (Option<String>, Option<String>) {
+    let meta: serde_json::Value = match serde_json::from_str(metadata) {
+        Ok(v) => v,
+        Err(_) => return (None, None),
+    };
+    let path = meta.get("path").and_then(|v| v.as_str()).map(String::from);
+    let filename = meta.get("filename").and_then(|v| v.as_str()).map(String::from);
+    (path, filename)
+}
+
+/// Quick YYYY-MM-DD validator (no external date crate needed).
+fn is_valid_ymd(s: &str) -> bool {
+    if s.len() != 10 { return false; }
+    let b = s.as_bytes();
+    if b[4] != b'-' || b[7] != b'-' { return false; }
+    let year: u32 = match s[0..4].parse() { Ok(n) => n, Err(_) => return false };
+    let month: u32 = match s[5..7].parse() { Ok(n) => n, Err(_) => return false };
+    let day: u32 = match s[8..10].parse() { Ok(n) => n, Err(_) => return false };
+    year >= 1970 && year <= 9999 && (1..=12).contains(&month) && (1..=31).contains(&day)
+}
+
+/// Validate source type + required metadata fields. Enforces layer separation:
+/// each source type has a distinct contract, not just a label.
+fn validate_store_entry(source: &str, metadata_json: &str) -> Result<(), String> {
+    // Skip validation for empty metadata (legacy/test path)
+    if metadata_json.is_empty() {
+        return Ok(());
+    }
+    let meta: serde_json::Value = serde_json::from_str(metadata_json)
+        .map_err(|e| format!("metadata is not valid JSON: {e}"))?;
+    let has = |f: &str| meta.get(f).is_some_and(|v| !v.is_null());
+    match source {
+        "skill" => {
+            for f in ["name", "trigger", "approach"] {
+                if !has(f) {
+                    return Err(format!("skill metadata missing required field: {f}"));
+                }
+            }
+        }
+        "doc" => {
+            for f in ["path", "domain"] {
+                if !has(f) {
+                    return Err(format!("doc metadata missing required field: {f}"));
+                }
+            }
+        }
+        "journal" => {
+            for f in ["path", "domain", "date"] {
+                if !has(f) {
+                    return Err(format!("journal metadata missing required field: {f}"));
+                }
+            }
+            let date_str = meta.get("date").and_then(|v| v.as_str()).unwrap_or("");
+            if !is_valid_ymd(date_str) {
+                return Err(format!("journal date '{date_str}' not valid YYYY-MM-DD"));
+            }
+        }
+        "memory" => {
+            // CMM-generated observations. Requires generator + date for provenance.
+            for f in ["path", "domain", "date", "generator"] {
+                if !has(f) {
+                    return Err(format!("memory metadata missing required field: {f}"));
+                }
+            }
+            let date_str = meta.get("date").and_then(|v| v.as_str()).unwrap_or("");
+            if !is_valid_ymd(date_str) {
+                return Err(format!("memory date '{date_str}' not valid YYYY-MM-DD"));
+            }
+        }
+        "" => {} // allow unset source (some callers use empty)
+        other => return Err(format!("unknown source type: {other}")),
+    }
+    Ok(())
+}
+
 async fn handle_store(
     req: StoreRequest,
     state: &Arc<Mutex<AppState>>,
     activity_tx: &tokio::sync::mpsc::Sender<()>,
 ) -> String {
+    // Layer separation enforcement: validate each entry's metadata
+    for meta_str in req.metadata.iter() {
+        if let Err(e) = validate_store_entry(&req.source, meta_str) {
+            return json_error(&format!("validation failed: {e}"));
+        }
+    }
+
     let mut guard = state.lock().await;
 
     let prefix = "search_document: ";
@@ -1282,7 +1603,12 @@ async fn handle_search(
         .db
         .search(&query_emb, req.limit, &req.source, &req.metadata_filter)
     {
-        Ok(results) => serde_json::to_string(&SearchResponse { results }).unwrap(),
+        Ok(results) => {
+            // Fire-and-forget: track that these chunks were retrieved (implicit feedback signal).
+            let ids: Vec<i64> = results.iter().map(|r| r.id).collect();
+            guard.db.mark_retrieved(&ids);
+            serde_json::to_string(&SearchResponse { results }).unwrap()
+        }
         Err(e) => json_error(&format!("search failed: {e}")),
     }
 }
@@ -1358,6 +1684,14 @@ async fn handle_feedback(req: FeedbackRequest, state: &Arc<Mutex<AppState>>) -> 
             serde_json::json!({"ok": true, "id": req.id, "feedback_score": new_score}).to_string()
         }
         Err(e) => json_error(&format!("feedback failed: {e}")),
+    }
+}
+
+async fn handle_stale(req: StaleRequest, state: &Arc<Mutex<AppState>>) -> String {
+    let guard = state.lock().await;
+    match guard.db.stale_query(&req) {
+        Ok(resp) => serde_json::to_string(&resp).unwrap(),
+        Err(e) => json_error(&format!("stale query failed: {e}")),
     }
 }
 

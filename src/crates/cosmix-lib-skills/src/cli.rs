@@ -1,9 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use cosmix_skills::{
-    evaluate_task, extract_skill, format_skills_for_prompt, refine_skill,
+    check_graduation, evaluate_task, extract_skill, format_skills_for_prompt, refine_skill,
     retrieve_skills_domain, detect_domain_cwd,
-    EvalScore, IndexdClient, LlmClient, TaskOutcome, TaskTranscript,
+    EvalScore, IndexdClient, LlmClient, StaleChunk, TaskOutcome, TaskTranscript,
 };
 
 #[derive(Parser)]
@@ -115,6 +115,18 @@ enum Command {
 
     /// Create a sample transcript JSON for testing
     SampleTranscript,
+
+    /// Sweep all skills checking graduation eligibility; emit markdown report to stdout.
+    /// Used by CMM graduation_sweep job (30m tier).
+    GraduateAll,
+
+    /// Query indexd for stale chunks in 3 buckets; emit markdown report to stdout.
+    /// Used by CMM staleness_report job (60m tier).
+    StalenessReport {
+        /// Only report chunks of this source (empty = all)
+        #[arg(long, default_value = "")]
+        source: String,
+    },
 }
 
 #[tokio::main]
@@ -162,6 +174,8 @@ async fn main() -> Result<()> {
         Command::Format { query, limit } => cmd_format(&resolved, query, *limit).await,
         Command::Stats { bench_runs } => cmd_stats(&resolved, *bench_runs).await,
         Command::SampleTranscript => cmd_sample_transcript(),
+        Command::GraduateAll => cmd_graduate_all(&resolved).await,
+        Command::StalenessReport { source } => cmd_staleness_report(&resolved, source).await,
     }
 }
 
@@ -309,8 +323,8 @@ async fn cmd_refine(cli: &ResolvedConfig, id: i64, success: bool, notes: &str) -
         duration_ms: 0,
     };
 
-    let updated = refine_skill(&llm, &mut indexd, id, &existing, &outcome).await?;
-    println!("Refined: {} v{}", updated.name, updated.version);
+    let (new_id, updated) = refine_skill(&llm, &mut indexd, id, &existing, &outcome).await?;
+    println!("Refined: {} v{} (old chunk {id} superseded by {new_id})", updated.name, updated.version);
     println!(
         "  confidence: {:.0}% → {:.0}%",
         existing.confidence * 100.0,
@@ -466,5 +480,115 @@ fn cmd_sample_transcript() -> Result<()> {
     };
 
     println!("{}", serde_json::to_string_pretty(&sample)?);
+    Ok(())
+}
+
+/// CMM graduation sweep: iterate all skills, call check_graduation on each,
+/// emit a markdown report to stdout. Silent-ok if no skills graduate.
+async fn cmd_graduate_all(cli: &ResolvedConfig) -> Result<()> {
+    let mut indexd = IndexdClient::connect(Some(&cli.socket)).await?;
+    let (skills, total) = indexd.list_skills(1000, 0).await?;
+
+    println!("## Summary\n");
+    println!("Scanned {total} skill entries.\n");
+
+    let cfg = cosmix_config::store::load().unwrap_or_default().skills;
+    println!("Thresholds: confidence >= {:.2}, use_count >= {}, success_count >= {}\n",
+        cfg.graduation_confidence, cfg.graduation_min_uses, cfg.graduation_min_successes);
+
+    let mut graduated_now = Vec::new();
+    let mut already_graduated = Vec::new();
+    let mut below_threshold = Vec::new();
+    let mut superseded = 0;
+
+    for (id, doc) in &skills {
+        if doc.superseded_by.is_some() {
+            superseded += 1;
+            continue;
+        }
+        if doc.graduated {
+            already_graduated.push((*id, doc.clone()));
+            continue;
+        }
+        match check_graduation(&mut indexd, *id, doc).await {
+            Ok(true) => graduated_now.push((*id, doc.clone())),
+            Ok(false) => below_threshold.push((*id, doc.clone())),
+            Err(e) => eprintln!("WARN: graduation check failed for skill {id}: {e}"),
+        }
+    }
+
+    println!("## Graduated this run: {}\n", graduated_now.len());
+    for (id, doc) in &graduated_now {
+        println!("- [{id}] **{}** ({}) — confidence {:.0}%, {} uses, {} successes",
+            doc.name, doc.domain, doc.confidence * 100.0, doc.use_count, doc.success_count);
+    }
+
+    println!("\n## Already graduated: {}\n", already_graduated.len());
+    for (id, doc) in &already_graduated {
+        println!("- [{id}] {} ({})", doc.name, doc.domain);
+    }
+
+    println!("\n## Below threshold: {}\n", below_threshold.len());
+    for (id, doc) in &below_threshold {
+        let need_conf = (cfg.graduation_confidence as f32 - doc.confidence).max(0.0);
+        let need_uses = cfg.graduation_min_uses.saturating_sub(doc.use_count);
+        let need_succ = cfg.graduation_min_successes.saturating_sub(doc.success_count);
+        println!("- [{id}] {} ({}) — gap: conf+{:.2}, uses+{}, successes+{}",
+            doc.name, doc.domain, need_conf, need_uses, need_succ);
+    }
+
+    if superseded > 0 {
+        println!("\n_{superseded} superseded entries skipped._");
+    }
+
+    Ok(())
+}
+
+/// CMM staleness report: query indexd's stale buckets, emit a markdown report.
+async fn cmd_staleness_report(cli: &ResolvedConfig, source: &str) -> Result<()> {
+    let mut indexd = IndexdClient::connect(Some(&cli.socket)).await?;
+    let src = if source.is_empty() { None } else { Some(source) };
+    let resp = indexd.stale(src, 90, 3, 180, 50).await?;
+
+    println!("## Summary\n");
+    println!("Total chunks in index: {}\n", resp.total_chunks);
+    if let Some(s) = src {
+        println!("Filtered to source: `{s}`\n");
+    }
+
+    let emit_bucket = |title: &str, subtitle: &str, chunks: &[StaleChunk]| {
+        println!("## {}: {}\n", title, chunks.len());
+        println!("_{}_\n", subtitle);
+        for c in chunks {
+            let name = c.filename.clone()
+                .or_else(|| c.path.clone())
+                .unwrap_or_else(|| format!("chunk #{}", c.id));
+            println!(
+                "- [{}] `{}` ({}) — retrieved {}×, feedback {}, created {}, last retrieved {}",
+                c.id, name, c.source,
+                c.retrieval_count, c.feedback_score,
+                c.created,
+                c.last_retrieved.as_deref().unwrap_or("never"),
+            );
+        }
+        println!();
+    };
+
+    emit_bucket(
+        "Never retrieved & old (>90d)",
+        "Candidates for archival — were indexed long ago but have never been useful.",
+        &resp.never_retrieved_old,
+    );
+    emit_bucket(
+        "Low-value (retrieved >3× with feedback ≤0)",
+        "Candidates for reshaping — they surface in searches but agents never upvote them.",
+        &resp.low_value,
+    );
+    emit_bucket(
+        "Long-dormant (not retrieved in 180d)",
+        "Candidates for refresh — were useful once, may be out of date now.",
+        &resp.long_dormant,
+    );
+
     Ok(())
 }
