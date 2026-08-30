@@ -114,6 +114,15 @@ end
 $d.die_if(len($nodes) != len($requested),
   "one or more selected mesh nodes are absent from the fleet rollout order")
 
+$REMOTE = {}
+for each $node in $nodes
+  if $d.is_foreign($ROSTER, $node) then
+    $REMOTE[$node] = $node
+  else
+    $REMOTE[$node] = "root@" .. $d.mesh_ip($node)
+  end
+end
+
 $CFG_PATH = "/etc/cosmix/maild/config.conf.mix"
 $FILTER_PATH = "/etc/cosmix/maild/inbound-filter.mix"
 $BACKUP_PATH = $CFG_PATH .. ".bak-filter"
@@ -123,7 +132,8 @@ $reach_token = uuid()
 -- old format refusal and prevents a bad later node from causing an avoidable
 -- partial fleet edit.
 for each $node in $nodes
-  $probe = ssh_mix($node, '
+  $remote = $REMOTE[$node]
+  $probe = ssh_mix($remote, '
 if not is_file($cfg_path) then
   eprint("maild config is absent: " .. $cfg_path)
   exit(7)
@@ -133,8 +143,16 @@ if substr(trim($cfg), 0, 1) == "{" then
   eprint("brace/JSON config — normalise it first")
   exit(8)
 end
+$loaded = data_parse($cfg)
+$quoted_key = data_encode("inbound_filter") .. ":"
+if contains($cfg, "inbound_filter:") or contains($cfg, $quoted_key) then
+  if $loaded["inbound_filter"] != $filter_path then
+    eprint("existing inbound_filter does not name the canonical filter path")
+    exit(9)
+  end
+end
 print($token)
-', {bindings: {cfg_path: $CFG_PATH, token: $reach_token}})
+', {bindings: {cfg_path: $CFG_PATH, filter_path: $FILTER_PATH, token: $reach_token}})
   $d.die_if(not $probe["ok"] or trim($probe["stdout"]) != $reach_token,
     $node .. " preflight failed: " .. trim($probe["stdout"]) .. " " .. trim($probe["stderr"]))
   print("[preflight " .. $node .. "] native maild config readable")
@@ -145,14 +163,15 @@ $_lock = $m.mesh_take_write_lock("ensure_maild_filter_cfg apply")
 
 for each $node in $nodes
   print("[" .. $node .. "] ensure inbound_filter")
-  $result = ssh_mix($node, '
+  $remote = $REMOTE[$node]
+  $result = ssh_mix($remote, '
 $cfg = replace(read_file($cfg_path), "\u{FEFF}", "")
 if substr(trim($cfg), 0, 1) == "{" then
   print("ERROR: brace/JSON config — normalise it first")
 else
   $quoted_key = data_encode("inbound_filter") .. ":"
   if contains($cfg, "inbound_filter:") or contains($cfg, $quoted_key) then
-    $loaded = load_data($cfg_path)
+    $loaded = data_parse($cfg)
     if $loaded["inbound_filter"] == $filter_path then
       print("ALREADY")
     else
@@ -160,8 +179,17 @@ else
     end
   else
     write_file($backup_path, $cfg)
-    write_file($cfg_path, $cfg .. "\ninbound_filter: " .. data_encode($filter_path) .. "\n")
-    $loaded = load_data($cfg_path)
+    if read_file($backup_path) != $cfg then
+      print("ERROR: backup is not byte-identical to the pre-edit config")
+      exit(0)
+    end
+    $new_cfg = $cfg .. "\ninbound_filter: " .. data_encode($filter_path) .. "\n"
+    write_file($cfg_path, $new_cfg)
+    if read_file($cfg_path) != $new_cfg then
+      print("ERROR: live config is not byte-identical to the intended bytes")
+      exit(0)
+    end
+    $loaded = data_parse($new_cfg)
     if $loaded["inbound_filter"] == $filter_path then
       print("INSERTED")
     else

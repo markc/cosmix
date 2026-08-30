@@ -276,8 +276,8 @@ try
     $_sleep = run_argv(["sleep", "3"])
     $journal = run_argv(["journalctl", "-M", $CT, "-u", $UNIT, "--no-pager"],
       {timeout: 15, max_output: 67108864})
-    if $journal["exit_code"] == 0 and not $journal["stdout_truncated"] and
-        contains($journal["stdout"], "live KMS first frame submitted") then
+    if ($journal["exit_code"] == 0 and not $journal["stdout_truncated"] and
+        contains($journal["stdout"], "live KMS first frame submitted")) then
       $lit = true
     end
     $unit_active = run_argv(["systemctl", "-M", $CT, "is-active", $UNIT .. ".service"])
@@ -430,8 +430,8 @@ try
     $post_ok = true
     $diff = run_argv(["zfs", "diff", $pre_snap, $post_snap],
       {timeout: 120, max_output: 67108864})
-    if $diff["exit_code"] == 0 and not $diff["stdout_truncated"] and
-        not $diff["stderr_truncated"] then
+    if ($diff["exit_code"] == 0 and not $diff["stdout_truncated"] and
+        not $diff["stderr_truncated"]) then
       $diff_ok = true
       $diff_lines = split($diff["stdout"], "\n")
       $diff_total = len($diff_lines)

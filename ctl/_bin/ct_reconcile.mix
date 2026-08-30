@@ -1,0 +1,989 @@
+#!/usr/bin/env mix
+-- ct_reconcile.mix — resolve ambiguous provision_ct and provision_dns jobs.
+--
+-- A reconcile job has an uncertain external outcome, so its lane remains
+-- blocked until this operator tool proves whether the resource is healthy,
+-- absent, or unsafe to touch. The service owns database transitions; this
+-- tool owns external probes and any explicitly requested destruction.
+--
+--   mix _bin/ct_reconcile.mix --list
+--   mix _bin/ct_reconcile.mix --adopt <job_id>
+--   mix _bin/ct_reconcile.mix --retry <job_id>
+--   mix _bin/ct_reconcile.mix --cancel <job_id>
+--   [--base-url URL] [--secret-file PATH]
+
+$d = require("../_lib/deploy_lib.mix")
+$prov = require("../_lib/provisiond_worker_lib.mix")
+
+$g = getopt(args(), {
+  "base-url": {arg: true},
+  "secret-file": {arg: true},
+  list: {arg: false},
+  adopt: {arg: true},
+  retry: {arg: true},
+  cancel: {arg: true}
+})
+if len($g["errors"]) != 0 then
+  print("bad options: " .. join($g["errors"], "; "))
+  exit(2)
+end
+
+$has_action = ($g["opts"]["list"] == true or
+  $g["opts"]["adopt"] != nil or
+  $g["opts"]["retry"] != nil or
+  $g["opts"]["cancel"] != nil)
+if not $has_action then
+  print("usage: mix _bin/ct_reconcile.mix --list | --adopt <id> | --retry <id> | --cancel <id>")
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/ct_reconcile.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no CT reconcile config at " .. $CONF_PATH ..
+    " — create it from ct_reconcile.conf.mix.example before reconciling")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["ct_reconcile"], {
+    schema_version: {type: "integer", enum: [1]},
+    base_url: {type: "string", nonblank: true},
+    pve_hosts: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}},
+    dns_node: {type: "string", nonblank: true},
+    dns_server: {type: "string", nonblank: true},
+    dnsmasq_dropin: {type: "string", nonblank: true},
+    ct_description_prefix: {type: "string", nonblank: true}
+  })
+catch $e
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn valid_ipv4($address)
+  $parts = split($address, ".")
+  if len($parts) != 4 then
+    return false
+  end
+  for each $part in $parts
+    if not regex_match("^[0-9]{1,3}$", $part) then
+      return false
+    end
+    $octet = to_number($part)
+    if $octet < 0 or $octet > 255 then
+      return false
+    end
+  end
+  return true
+end
+
+fn validate_url($url)
+  if not starts_with($url, "http://") and not starts_with($url, "https://") then
+    config_error("base_url must start with http:// or https://")
+  end
+  if contains($url, "\n") or contains($url, "\r") then
+    config_error("base_url must be one line")
+  end
+end
+
+fn validate_absolute($key, $path)
+  if (not starts_with($path, "/") or contains($path, "\n") or
+      contains($path, "\r")) then
+    config_error($key .. " must be a one-line absolute path")
+  end
+end
+
+validate_url($CONF["base_url"])
+validate_absolute("dnsmasq_dropin", $CONF["dnsmasq_dropin"])
+if not valid_ipv4($CONF["dns_server"]) then
+  config_error("dns_server must be an IPv4 address")
+end
+if (contains($CONF["ct_description_prefix"], "\n") or
+    contains($CONF["ct_description_prefix"], "\r")) then
+  config_error("ct_description_prefix must be one line")
+end
+
+$ROSTER = $d.roster()
+$seen_hosts = []
+for each $host in $CONF["pve_hosts"]
+  $d.assert_node($ROSTER, $host)
+  for each $seen in $seen_hosts
+    if $seen == $host then
+      config_error("duplicate pve_hosts entry: " .. $host)
+    end
+  end
+  push($seen_hosts, $host)
+end
+$d.assert_node($ROSTER, $CONF["dns_node"])
+
+$BASE = $CONF["base_url"]
+if env("CT_BASE_URL") != "" then
+  $BASE = env("CT_BASE_URL")
+end
+if $g["opts"]["base-url"] != nil then
+  $BASE = "" .. $g["opts"]["base-url"]
+end
+validate_url($BASE)
+
+$SECRET = $prov.load_secret($g["opts"]["secret-file"])
+$HEADERS = {"X-Provision-Secret": $SECRET}
+$JSON_HEADERS = {
+  "X-Provision-Secret": $SECRET,
+  "Content-Type": "application/json"
+}
+$PVE_HOSTS = $CONF["pve_hosts"]
+$DNS_NODE = $CONF["dns_node"]
+$DNS_SERVER = $CONF["dns_server"]
+$DNSMASQ_DROPIN = $CONF["dnsmasq_dropin"]
+$CT_DESCRIPTION_PREFIX = $CONF["ct_description_prefix"]
+
+-- Destructive and reboot work must finish comfortably within the service's
+-- reconcile lease. Renewals fence long operations; the local deadline stops a
+-- stale holder beginning another destructive step.
+$DEADLINE = time() + 900
+
+fn remote_target($node)
+  if $d.is_foreign($ROSTER, $node) then
+    return $node
+  end
+  return "root@" .. $d.mesh_ip($node)
+end
+
+fn pct_list($host)
+  return ssh_mix(remote_target($host), '
+$out = run("pct list")
+if $rc != 0 then
+  exit($rc)
+end
+print($out)
+', {connect_timeout: 8, timeout: 20, batch: true})
+end
+
+fn pct_config($host, $vmid)
+  return ssh_mix(remote_target($host), '
+$out = run("pct config " .. $vmid)
+if $rc != 0 then
+  exit($rc)
+end
+print($out)
+', {bindings: {vmid: $vmid}, connect_timeout: 8, timeout: 15, batch: true})
+end
+
+fn pct_action($host, $vmid, $action, $timeout)
+  return ssh_mix(remote_target($host), '
+$out = ""
+if $action == "shutdown" then
+  $out = run("pct shutdown " .. $vmid)
+else if $action == "status" then
+  $out = run("pct status " .. $vmid)
+else if $action == "start" then
+  $out = run("pct start " .. $vmid)
+else if $action == "stop" then
+  $out = run("pct stop " .. $vmid)
+else if $action == "unmount" then
+  $out = run("pct unmount " .. $vmid)
+else if $action == "destroy" then
+  $out = run("pct destroy " .. $vmid .. " --force")
+else
+  exit(64)
+end
+if $rc != 0 then
+  exit($rc)
+end
+print($out)
+', {bindings: {vmid: $vmid, action: $action}, connect_timeout: 8,
+      timeout: $timeout, batch: true})
+end
+
+fn ct_probe($host, $vmid, $probe, $timeout)
+  return ssh_mix(remote_target($host), '
+$out = ""
+if $probe == "node_config" then
+  $out = run("pct exec " .. $vmid .. " -- cat /etc/cosmix/node.conf.mix")
+else if $probe == "running" then
+  $out = run("pct exec " .. $vmid .. " -- systemctl is-system-running")
+else if $probe == "failed_units" then
+  $out = run("pct exec " .. $vmid .. " -- systemctl --failed --no-legend")
+else if $probe == "eth0" then
+  $out = run("pct exec " .. $vmid .. " -- ip -4 -br addr show eth0")
+else if $probe == "wg0" then
+  $out = run("pct exec " .. $vmid .. " -- ip link show wg0")
+else
+  exit(64)
+end
+if $rc != 0 then
+  exit($rc)
+end
+print($out)
+', {bindings: {vmid: $vmid, probe: $probe}, connect_timeout: 8,
+      timeout: $timeout, batch: true})
+end
+
+-- pct renders a trailing newline in a CT description as URL-encoded %0A.
+-- Normalising it is required for exact ownership-marker comparisons.
+fn desc_value($config_line)
+  $value = trim(substr(trim($config_line), 12, len(trim($config_line))))
+  if ends_with($value, "%0A") then
+    $value = trim(substr($value, 0, len($value) - 3))
+  end
+  return $value
+end
+
+-- Search every configured Proxmox host locally. Any failed probe is uncertain,
+-- never evidence that the CT is absent.
+fn find_cts($job_id)
+  $wanted = $CT_DESCRIPTION_PREFIX .. ("" .. $job_id)
+  $hits = []
+  for each $host in $PVE_HOSTS
+    if time() > $DEADLINE then
+      return {uncertain: true, host: "deadline", hits: []}
+    end
+    $listed = pct_list($host)
+    if not $listed["ok"] then
+      return {uncertain: true, host: $host, hits: []}
+    end
+    for each $line in split($listed["stdout"], "\n")
+      $vmid = split(trim($line), " ")[0]
+      if regex_match("^[0-9]+$", $vmid) then
+        if time() > $DEADLINE then
+          return {uncertain: true, host: "deadline", hits: []}
+        end
+        $config = pct_config($host, $vmid)
+        if not $config["ok"] then
+          return {uncertain: true, host: $host, hits: []}
+        end
+        for each $config_line in split($config["stdout"], "\n")
+          if (starts_with(trim($config_line), "description:") and
+              desc_value($config_line) == $wanted) then
+            push($hits, {host: $host, vmid: $vmid})
+          end
+        end
+      end
+    end
+  end
+  return {uncertain: false, hits: $hits}
+end
+
+-- Read the CT's own configuration; this is its authoritative identity.
+fn ct_fqdn($host, $vmid)
+  $result = ct_probe($host, $vmid, "node_config", 20)
+  if not $result["ok"] then
+    return ""
+  end
+  $double_quote = '"'
+  $quoted = split($result["stdout"], $double_quote)
+  $i = 0
+  while $i + 2 < len($quoted)
+    if $quoted[$i] == "fqdn" then
+      return $quoted[$i + 2]
+    end
+    $i = $i + 1
+  end
+  return ""
+end
+
+-- Mirror the worker's complete external success bar. An empty list is healthy.
+fn verify_ct($host, $vmid, $fqdn, $ip)
+  $bad = []
+  if $fqdn == "" then
+    push($bad, "no fqdn in node.conf")
+    return $bad
+  end
+
+  $running = ct_probe($host, $vmid, "running", 15)
+  if not $running["ok"] or trim($running["stdout"]) != "running" then
+    push($bad, "not running")
+  end
+
+  $failed = ct_probe($host, $vmid, "failed_units", 20)
+  if not $failed["ok"] or trim($failed["stdout"]) != "" then
+    push($bad, "failed units")
+  end
+
+  $https = http_get("https://" .. $fqdn .. "/", {}, {timeout: 10})
+  if ("" .. $https["status"]) != "200" then
+    push($bad, "HTTPS!=200")
+  end
+
+  $address = ct_probe($host, $vmid, "eth0", 20)
+  if (not $address["ok"] or
+      pos($ip .. "/", $address["stdout"]) == 0) then
+    push($bad, "eth0 lacks " .. $ip)
+  end
+
+  $wg = ct_probe($host, $vmid, "wg0", 15)
+  if $wg["ok"] then
+    push($bad, "wg0 present")
+  end
+
+  $a = run_argv(["dig", "+short", "@" .. $DNS_SERVER, $fqdn], {timeout: 15})
+  if $a["exit_code"] != 0 or trim($a["stdout"]) != $ip then
+    push($bad, "DNS A wrong")
+  end
+  $ptr = run_argv(["dig", "+short", "@" .. $DNS_SERVER, "-x", $ip],
+    {timeout: 15})
+  if $ptr["exit_code"] != 0 or pos($fqdn, $ptr["stdout"]) == 0 then
+    push($bad, "DNS PTR wrong")
+  end
+  $mx = run_argv(["dig", "+short", "@" .. $DNS_SERVER, "MX", $fqdn],
+    {timeout: 15})
+  if $mx["exit_code"] != 0 or pos($fqdn, $mx["stdout"]) == 0 then
+    push($bad, "DNS MX wrong")
+  end
+  $smtp = run_argv(["curl", "-s", "--max-time", "5",
+    "telnet://" .. $ip .. ":25"], {timeout: 10})
+  if ($smtp["exit_code"] != 0 or pos("220", $smtp["stdout"]) == 0 or
+      pos($fqdn, $smtp["stdout"]) == 0) then
+    push($bad, "no SMTP 220/" .. $fqdn)
+  end
+  return $bad
+end
+
+-- Adoption is permitted only after shutdown, restart, bounded readiness, and
+-- a full re-verification. This proves the resource survives its service cycle.
+fn reboot_survives($host, $vmid, $fqdn, $ip)
+  if not pct_action($host, $vmid, "shutdown", 120)["ok"] then
+    return "pct shutdown failed"
+  end
+  $i = 0
+  while $i < 30
+    $status = pct_action($host, $vmid, "status", 15)
+    if $status["ok"] and pos("stopped", $status["stdout"]) > 0 then
+      break
+    end
+    sleep(1)
+    $i = $i + 1
+  end
+  if not pct_action($host, $vmid, "start", 120)["ok"] then
+    return "pct start failed"
+  end
+
+  $j = 0
+  while $j < 60 and time() <= $DEADLINE
+    $running = ct_probe($host, $vmid, "running", 10)
+    $https = http_get("https://" .. $fqdn .. "/", {}, {timeout: 5})
+    if ($running["ok"] and trim($running["stdout"]) == "running" and
+        ("" .. $https["status"]) == "200") then
+      break
+    end
+    sleep(1)
+    $j = $j + 1
+  end
+  $bad = verify_ct($host, $vmid, $fqdn, $ip)
+  if len($bad) != 0 then
+    return "post-reboot verify: " .. join($bad, "; ")
+  end
+  return ""
+end
+
+-- Probe DNS/DHCP residue by exact comma-separated field, across every identity
+-- the job may have carried. Any SSH or parser failure is uncertain.
+fn dns_residue($ip, $fqdns)
+  $result = ssh_mix(remote_target($DNS_NODE), '
+fn field_matches($value, $ip, $fqdns)
+  if $value == $ip then
+    return true
+  end
+  for each $fqdn in $fqdns
+    if $fqdn != "" and $value == $fqdn then
+      return true
+    end
+  end
+  return false
+end
+
+$residue = false
+if is_file($dropin) then
+  for each $line in split(read_file($dropin), "\n")
+    $text = trim($line)
+    if $text != "" and not starts_with($text, "#") then
+      $equals = split($text, "=")
+      if len($equals) >= 2 then
+        for each $field in split($equals[1], ",")
+          if field_matches(trim($field), $ip, $fqdns) then
+            $residue = true
+          end
+        end
+      end
+    end
+  end
+end
+if $residue then
+  print("RESIDUE")
+else
+  print("CLEAN")
+end
+', {bindings: {dropin: $DNSMASQ_DROPIN, ip: $ip, fqdns: $fqdns},
+      connect_timeout: 8, timeout: 20, batch: true})
+  if not $result["ok"] then
+    return "PROBE-UNCERTAIN"
+  end
+  if contains($result["stdout"], "RESIDUE") then
+    return "residue present"
+  end
+  return ""
+end
+
+-- Remove only exact matching DNS/DHCP fields and the exact IP lease. Candidate
+-- and full dnsmasq tests precede restart; every failed mutation rolls back.
+-- Success is attested only after residue absence and active-service checks.
+fn clean_dns($ip, $fqdns)
+  $result = ssh_mix(remote_target($DNS_NODE), '
+fn field_matches($value, $ip, $fqdns)
+  if $value == $ip then
+    return true
+  end
+  for each $fqdn in $fqdns
+    if $fqdn != "" and $value == $fqdn then
+      return true
+    end
+  end
+  return false
+end
+
+$lease = "/var/lib/misc/dnsmasq.leases"
+$lease_orig = ""
+if is_file($lease) then
+  $lease_orig = read_file($lease)
+  $kept_leases = []
+  for each $line in split($lease_orig, "\n")
+    $keep = true
+    if $line != "" then
+      $fields = split($line, " ")
+      if len($fields) >= 3 and $fields[2] == $ip then
+        $keep = false
+      end
+    end
+    if $keep and $line != "" then
+      push($kept_leases, $line)
+    end
+  end
+  write_file($lease, join($kept_leases, "\n") .. "\n")
+end
+
+$dropin_orig = ""
+if is_file($dropin) then
+  $dropin_orig = read_file($dropin)
+  $kept = []
+  for each $line in split($dropin_orig, "\n")
+    $keep = true
+    $text = trim($line)
+    if $text != "" and not starts_with($text, "#") then
+      $equals = split($text, "=")
+      if len($equals) >= 2 then
+        for each $field in split($equals[1], ",")
+          if field_matches(trim($field), $ip, $fqdns) then
+            $keep = false
+          end
+        end
+      end
+    end
+    if $keep then
+      push($kept, $line)
+    end
+  end
+
+  $new = join($kept, "\n")
+  if not ends_with($new, "\n") then
+    $new = $new .. "\n"
+  end
+  $temp = "/tmp/ct-reconcile-dns-" .. uuid() .. ".conf"
+  write_file($temp, $new)
+  chmod($temp, 0o644)
+  $_candidate = run("dnsmasq --test --conf-file=" .. $temp)
+  $candidate_rc = $rc
+  if $candidate_rc != 0 then
+    remove($temp)
+    if $lease_orig != "" then
+      write_file($lease, $lease_orig)
+    end
+    print("CLEAN-FAIL: candidate dnsmasq test failed; lease rolled back")
+    exit(7)
+  end
+
+  copy($temp, $dropin)
+  remove($temp)
+  chmod($dropin, 0o644)
+  $_full = run("dnsmasq --test -C /etc/dnsmasq.conf --conf-dir=/etc/dnsmasq.d")
+  $full_rc = $rc
+  if $full_rc != 0 then
+    write_file($dropin, $dropin_orig)
+    chmod($dropin, 0o644)
+    if $lease_orig != "" then
+      write_file($lease, $lease_orig)
+    end
+    print("CLEAN-FAIL: full dnsmasq test failed; rolled back")
+    exit(8)
+  end
+end
+
+$_restart = run("systemctl restart dnsmasq")
+$restart_rc = $rc
+if $restart_rc != 0 then
+  if $dropin_orig != "" then
+    write_file($dropin, $dropin_orig)
+    chmod($dropin, 0o644)
+  end
+  if $lease_orig != "" then
+    write_file($lease, $lease_orig)
+  end
+  $_rollback_restart = run("systemctl restart dnsmasq")
+  print("CLEAN-FAIL: dnsmasq restart failed; rolled back")
+  exit(9)
+end
+
+$residue = false
+if is_file($dropin) then
+  for each $line in split(read_file($dropin), "\n")
+    $text = trim($line)
+    if $text != "" and not starts_with($text, "#") then
+      $equals = split($text, "=")
+      if len($equals) >= 2 then
+        for each $field in split($equals[1], ",")
+          if field_matches(trim($field), $ip, $fqdns) then
+            $residue = true
+          end
+        end
+      end
+    end
+  end
+end
+
+$lease_residue = false
+if is_file($lease) then
+  for each $line in split(read_file($lease), "\n")
+    if $line != "" then
+      $fields = split($line, " ")
+      if len($fields) >= 3 and $fields[2] == $ip then
+        $lease_residue = true
+      end
+    end
+  end
+end
+
+$_active = run("systemctl is-active --quiet dnsmasq")
+$active = $rc == 0
+if $residue then
+  print("CLEAN-FAIL: dropin residue")
+  exit(10)
+end
+if $lease_residue then
+  print("CLEAN-FAIL: lease residue")
+  exit(11)
+end
+if not $active then
+  print("CLEAN-FAIL: dnsmasq inactive")
+  exit(12)
+end
+print("CLEAN-OK")
+', {bindings: {dropin: $DNSMASQ_DROPIN, ip: $ip, fqdns: $fqdns},
+      connect_timeout: 8, timeout: 60, batch: true})
+
+  if not $result["ok"] then
+    return "DNS clean failed: " .. trim($result["stderr"]) .. " " ..
+      trim($result["stdout"])
+  end
+  if not contains($result["stdout"], "CLEAN-OK") then
+    return "clean not verified: " .. trim($result["stdout"])
+  end
+  return ""
+end
+
+-- Re-read the exact ownership marker immediately before destruction so a
+-- reused VMID can never be destroyed using stale discovery evidence.
+fn destroy_ct($host, $vmid, $job_id)
+  $config = pct_config($host, $vmid)
+  if not $config["ok"] then
+    return "pct config re-check failed for " .. $vmid .. " on " .. $host
+  end
+  $owned = false
+  $wanted = $CT_DESCRIPTION_PREFIX .. ("" .. $job_id)
+  for each $line in split($config["stdout"], "\n")
+    if (starts_with(trim($line), "description:") and
+        desc_value($line) == $wanted) then
+      $owned = true
+    end
+  end
+  if not $owned then
+    return "vmid " .. $vmid .. " on " .. $host ..
+      " no longer carries this job's description — refusing to destroy"
+  end
+
+  $_shutdown = pct_action($host, $vmid, "shutdown", 90)
+  $_stop = pct_action($host, $vmid, "stop", 30)
+  $_unmount = pct_action($host, $vmid, "unmount", 30)
+  $destroyed = pct_action($host, $vmid, "destroy", 120)
+  if not $destroyed["ok"] then
+    return "pct destroy " .. $vmid .. " on " .. $host .. " failed: " ..
+      trim($destroyed["stderr"]) .. " " .. trim($destroyed["stdout"])
+  end
+  return ""
+end
+
+fn rc_list_jobs()
+  $result = http_get($BASE .. "/biz/reconcile-list", $HEADERS, {timeout: 15})
+  if to_number($result["status"]) != 200 then
+    print("reconcile-list failed: " .. ("" .. $result["status"]))
+    exit(1)
+  end
+  return json_parse($result["body"])["jobs"]
+end
+
+fn rc_claim_job($job_id)
+  $result = http_post($BASE .. "/biz/reconcile-claim",
+    json_encode({job_id: $job_id}), $JSON_HEADERS, {timeout: 15})
+  if to_number($result["status"]) == 409 then
+    print("job " .. $job_id ..
+      " not claimable (already leased or not reconcile=1)")
+    exit(1)
+  end
+  if to_number($result["status"]) != 200 then
+    print("reconcile-claim failed: " .. ("" .. $result["status"]) .. " " ..
+      ("" .. $result["body"]))
+    exit(1)
+  end
+  return json_parse($result["body"])
+end
+
+fn rc_resolve_job($payload)
+  $result = http_post($BASE .. "/biz/reconcile-resolve",
+    json_encode($payload), $JSON_HEADERS, {timeout: 20})
+  if to_number($result["status"]) != 200 then
+    print("reconcile-resolve failed: " .. ("" .. $result["status"]) .. " " ..
+      ("" .. $result["body"]))
+    exit(1)
+  end
+  print("resolved job " .. $payload["job_id"] .. ": " ..
+    $payload["disposition"])
+end
+
+-- Renew before and around long work. Losing the lease is terminal because a
+-- second reconciler may now own the same job.
+fn rc_renew_job($job_id, $lease_token)
+  $result = http_post($BASE .. "/biz/reconcile-renew",
+    json_encode({job_id: $job_id, lease_token: $lease_token}),
+    $JSON_HEADERS, {timeout: 15})
+  if to_number($result["status"]) != 200 then
+    print("reconcile-renew failed for job " .. $job_id ..
+      " (lease lost/expired?): " .. ("" .. $result["status"]) .. " " ..
+      ("" .. $result["body"]))
+    exit(1)
+  end
+end
+
+-- If the service persisted an FQDN, the CT must report the same identity.
+fn job_fqdn($claim, $host, $vmid)
+  $observed = ct_fqdn($host, $vmid)
+  $persisted = trim("" .. $claim["fqdn"])
+  if $persisted != "" and $observed != $persisted then
+    return ""
+  end
+  return $observed
+end
+
+-- Classify DNS from the authoritative node-local drop-in. Exact desired A and
+-- MX records permit adoption; partial, conflicting, inactive, or uncertain
+-- state blocks. Only proven absence permits retry or cancellation.
+fn classify_dns($job, $ip)
+  $fqdn = lower(trim("" .. $job["fqdn"]))
+  if $fqdn == "" then
+    return {code: "BLOCKED", text: "dns job has no stored fqdn"}
+  end
+  $result = ssh_mix(remote_target($DNS_NODE), '
+$host_record = "host-record=" .. $fqdn .. "," .. $ip
+$mx_record = "mx-host=" .. $fqdn .. "," .. $fqdn .. ",10"
+$host_prefix = "host-record=" .. $fqdn .. ","
+$ip_suffix = "," .. $ip
+$mx_prefix = "mx-host=" .. $fqdn .. ","
+$_active = run("systemctl is-active dnsmasq")
+$active = $rc == 0
+$host_present = false
+$mx_present = false
+$conflict = ""
+$original = ""
+if is_file($dropin) then
+  $original = read_file($dropin)
+end
+for each $line in split($original, "\n")
+  $text = trim($line)
+  if $text == $host_record then
+    $host_present = true
+  end
+  if $text == $mx_record then
+    $mx_present = true
+  end
+  if starts_with($text, $host_prefix) and $text != $host_record then
+    $conflict = $text
+  end
+  if (starts_with($text, "host-record=") and ends_with($text, $ip_suffix) and
+      $text != $host_record) then
+    $conflict = $text
+  end
+  if starts_with($text, $mx_prefix) and $text != $mx_record then
+    $conflict = $text
+  end
+end
+print(data_encode({active: $active, host_present: $host_present,
+  mx_present: $mx_present, conflict: $conflict}))
+', {bindings: {dropin: $DNSMASQ_DROPIN, fqdn: $fqdn, ip: $ip},
+      decode: "data", connect_timeout: 8, timeout: 20, batch: true})
+
+  if not $result["ok"] or $result["value"] == nil then
+    return {code: "BLOCKED", text: "dns probe uncertain: " ..
+      trim($result["stderr"]) .. " " .. trim($result["stdout"])}
+  end
+  $probe = $result["value"]
+  if not $probe["active"] then
+    return {code: "BLOCKED", text: "dnsmasq not active — cannot verify dns state"}
+  end
+  if $probe["conflict"] != "" then
+    return {code: "BLOCKED", text: "dns conflict: " .. $probe["conflict"]}
+  end
+  if $probe["host_present"] and $probe["mx_present"] then
+    return {code: "ADOPT", text: "dns " .. $fqdn .. " -> " .. $ip ..
+      " (exact config present)", fqdn: $fqdn, ip: $ip}
+  end
+  if $probe["host_present"] or $probe["mx_present"] then
+    return {code: "BLOCKED", text: "dns records are partial"}
+  end
+  return {code: "RETRY", text: "dns records absent for " .. $fqdn}
+end
+
+fn classify($job)
+  $job_id = $job["job_id"]
+  $ip = "" .. $job["ip"]
+  if ("" .. $job["kind"]) == "provision_dns" then
+    return classify_dns($job, $ip)
+  end
+  $probe = find_cts($job_id)
+  if $probe["uncertain"] then
+    return {code: "BLOCKED", text: "fleet probe uncertain on " ..
+      $probe["host"]}
+  end
+  $count = len($probe["hits"])
+  if $count > 1 then
+    return {code: "BLOCKED", text: ("" .. $count) .. " matching CTs"}
+  end
+  if $count == 0 then
+    $expected_fqdn = trim("" .. $job["fqdn"])
+    if $expected_fqdn == "" then
+      $requested = $job["requested"]
+      $requested_name = lower(trim("" .. $requested["node_name"]))
+      if $requested_name != "" then
+        $expected_fqdn = $requested_name .. "." ..
+          lower(trim("" .. $requested["domain"]))
+      end
+    end
+    $residue = dns_residue($ip, [$expected_fqdn])
+    if $residue == "" then
+      return {code: "RETRY", text: "no CT, no DNS residue"}
+    end
+    return {code: "BLOCKED", text: "no CT but DNS residue: " .. $residue}
+  end
+
+  $match = $probe["hits"][0]
+  $fqdn = job_fqdn($job, $match["host"], $match["vmid"])
+  $bad = verify_ct($match["host"], $match["vmid"], $fqdn, $ip)
+  if len($bad) == 0 then
+    return {code: "ADOPT", text: $match["host"] .. ":" ..
+      $match["vmid"] .. " " .. $fqdn .. " healthy",
+      host: $match["host"], vmid: $match["vmid"], fqdn: $fqdn}
+  end
+  return {code: "BLOCKED", text: $match["host"] .. ":" ..
+    $match["vmid"] .. " unhealthy: " .. join($bad, "; ")}
+end
+
+if $g["opts"]["list"] then
+  $jobs = rc_list_jobs()
+  if len($jobs) == 0 then
+    print("no reconcile=1 jobs")
+    exit(0)
+  end
+  for each $job in $jobs
+    $verdict = classify($job)
+    print("job " .. $job["job_id"] .. " ip=" .. ("" .. $job["ip"]) ..
+      " leased=" .. ("" .. $job["leased"]) .. " -> " ..
+      $verdict["code"] .. " (" .. $verdict["text"] .. ")  err: " ..
+      trim("" .. $job["error"]))
+  end
+  exit(0)
+end
+
+if $g["opts"]["adopt"] != nil then
+  $job_id = to_number($g["opts"]["adopt"])
+  $claim = rc_claim_job($job_id)
+  if ("" .. $claim["kind"]) == "provision_dns" then
+    $dns_verdict = classify($claim)
+    if $dns_verdict["code"] != "ADOPT" then
+      rc_resolve_job({job_id: $job_id,
+        lease_token: $claim["lease_token"], disposition: "hold",
+        evidence: "dns adopt aborted: " .. $dns_verdict["text"]})
+      print("NOT adopted (" .. $dns_verdict["code"] .. "): " ..
+        $dns_verdict["text"])
+      exit(1)
+    end
+    rc_resolve_job({job_id: $job_id, lease_token: $claim["lease_token"],
+      disposition: "adopt", fqdn: $dns_verdict["fqdn"],
+      observed_ip: "" .. $claim["ip"]})
+    exit(0)
+  end
+
+  $verdict = classify($claim)
+  if $verdict["code"] != "ADOPT" then
+    rc_resolve_job({job_id: $job_id, lease_token: $claim["lease_token"],
+      disposition: "hold", evidence: "adopt aborted: " .. $verdict["text"]})
+    print("NOT adopted (" .. $verdict["code"] .. "): " .. $verdict["text"])
+    exit(1)
+  end
+  if time() > $DEADLINE then
+    rc_resolve_job({job_id: $job_id, lease_token: $claim["lease_token"],
+      disposition: "hold",
+      evidence: "adopt aborted: reconcile deadline reached before reboot test"})
+    exit(1)
+  end
+  rc_renew_job($job_id, $claim["lease_token"])
+  $reboot_error = reboot_survives($verdict["host"], $verdict["vmid"],
+    $verdict["fqdn"], "" .. $claim["ip"])
+  if $reboot_error != "" then
+    rc_resolve_job({job_id: $job_id, lease_token: $claim["lease_token"],
+      disposition: "hold", evidence: "adopt aborted: reboot-survival: " ..
+        $reboot_error})
+    print("NOT adopted: reboot-survival failed: " .. $reboot_error)
+    exit(1)
+  end
+  $final_verdict = classify($claim)
+  if ($final_verdict["code"] != "ADOPT" or
+      $final_verdict["host"] != $verdict["host"] or
+      ("" .. $final_verdict["vmid"]) != ("" .. $verdict["vmid"])) then
+    rc_resolve_job({job_id: $job_id, lease_token: $claim["lease_token"],
+      disposition: "hold", evidence: "adopt aborted: state changed on re-probe: " ..
+        $final_verdict["text"]})
+    print("NOT adopted: state changed on re-probe: " .. $final_verdict["text"])
+    exit(1)
+  end
+  rc_resolve_job({job_id: $job_id, lease_token: $claim["lease_token"],
+    disposition: "adopt", vmid: to_number($final_verdict["vmid"]),
+    pve_host: $final_verdict["host"], fqdn: $final_verdict["fqdn"],
+    observed_ip: "" .. $claim["ip"]})
+  exit(0)
+end
+
+if $g["opts"]["retry"] != nil or $g["opts"]["cancel"] != nil then
+  $is_cancel = $g["opts"]["cancel"] != nil
+  $job_id = to_number($g["opts"]["retry"])
+  if $is_cancel then
+    $job_id = to_number($g["opts"]["cancel"])
+  end
+  $claim = rc_claim_job($job_id)
+  $ip = "" .. $claim["ip"]
+
+  -- DNS jobs have no durable ownership marker, so retry/cancel never removes
+  -- records. Only exact absence is clean; live records require adoption and
+  -- partial, conflicting, or uncertain state remains held for repair.
+  if ("" .. $claim["kind"]) == "provision_dns" then
+    $dns_verdict = classify($claim)
+    if $dns_verdict["code"] == "ADOPT" then
+      rc_resolve_job({job_id: $job_id, lease_token: $claim["lease_token"],
+        disposition: "hold",
+        evidence: "dns records are LIVE — use --adopt, not retry/cancel"})
+      print("NOT cleaned: dns records present for this service — use --adopt")
+      exit(1)
+    end
+    if $dns_verdict["code"] != "RETRY" then
+      rc_resolve_job({job_id: $job_id, lease_token: $claim["lease_token"],
+        disposition: "hold", evidence: "dns state not cleanly absent: " ..
+          $dns_verdict["text"]})
+      print("NOT cleaned: " .. $dns_verdict["text"])
+      exit(1)
+    end
+    $dns_disposition = "retry_clean"
+    if $is_cancel then
+      $dns_disposition = "cancel_clean"
+    end
+    rc_resolve_job({job_id: $job_id, lease_token: $claim["lease_token"],
+      disposition: $dns_disposition, attest_clean: true})
+    exit(0)
+  end
+
+  $probe = find_cts($job_id)
+  if $probe["uncertain"] then
+    rc_resolve_job({job_id: $job_id, lease_token: $claim["lease_token"],
+      disposition: "hold", evidence: "clean aborted: fleet probe uncertain on " ..
+        $probe["host"]})
+    exit(1)
+  end
+  if len($probe["hits"]) > 1 then
+    rc_resolve_job({job_id: $job_id, lease_token: $claim["lease_token"],
+      disposition: "hold", evidence: "clean aborted: " ..
+        ("" .. len($probe["hits"])) ..
+        " matching CTs — resolve manually"})
+    print("NOT cleaned: multiple matching CTs")
+    exit(1)
+  end
+  if time() > $DEADLINE then
+    rc_resolve_job({job_id: $job_id, lease_token: $claim["lease_token"],
+      disposition: "hold",
+      evidence: "clean aborted: reconcile deadline reached before destructive work"})
+    exit(1)
+  end
+
+  -- Clean the union of observed, persisted, and explicitly requested names.
+  -- Renew immediately before CT and DNS mutation so a slow operation cannot be
+  -- overtaken by another lease holder.
+  rc_renew_job($job_id, $claim["lease_token"])
+  $fqdns = []
+  for each $match in $probe["hits"]
+    $observed = ct_fqdn($match["host"], $match["vmid"])
+    if $observed != "" then
+      push($fqdns, $observed)
+    end
+    $destroy_error = destroy_ct($match["host"], $match["vmid"], $job_id)
+    if $destroy_error != "" then
+      rc_resolve_job({job_id: $job_id,
+        lease_token: $claim["lease_token"], disposition: "hold",
+        evidence: "clean aborted: " .. $destroy_error})
+      exit(1)
+    end
+  end
+  $persisted_fqdn = trim("" .. $claim["fqdn"])
+  if $persisted_fqdn != "" then
+    push($fqdns, $persisted_fqdn)
+  end
+  $requested_name = lower(trim("" .. $claim["requested"]["node_name"]))
+  if $requested_name != "" then
+    push($fqdns, $requested_name .. "." ..
+      lower(trim("" .. $claim["requested"]["domain"])))
+  end
+
+  rc_renew_job($job_id, $claim["lease_token"])
+  $dns_error = clean_dns($ip, $fqdns)
+  if $dns_error != "" then
+    rc_resolve_job({job_id: $job_id, lease_token: $claim["lease_token"],
+      disposition: "hold", evidence: "clean aborted: " .. $dns_error})
+    exit(1)
+  end
+  $final_probe = find_cts($job_id)
+  if $final_probe["uncertain"] or len($final_probe["hits"]) != 0 then
+    rc_resolve_job({job_id: $job_id, lease_token: $claim["lease_token"],
+      disposition: "hold",
+      evidence: "clean aborted: CT still present/uncertain after destroy"})
+    exit(1)
+  end
+  $disposition = "retry_clean"
+  if $is_cancel then
+    $disposition = "cancel_clean"
+  end
+  rc_resolve_job({job_id: $job_id, lease_token: $claim["lease_token"],
+    disposition: $disposition, attest_clean: true})
+  exit(0)
+end
+
+print("usage: mix _bin/ct_reconcile.mix --list | --adopt <id> | --retry <id> | --cancel <id>")
+exit(2)

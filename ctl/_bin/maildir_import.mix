@@ -1,0 +1,305 @@
+#!/usr/bin/env mix
+-- maildir_import.mix — import one configured Maildir into cosmix-maild via
+-- JMAP Email/import.
+--
+--   mix _bin/maildir_import.mix <job>
+--
+-- The private hub configuration owns every site fact: target node, account,
+-- paths, endpoint routing and TLS policy. A manifest records imported message
+-- filenames so re-runs are delta passes. Maildir flags map to JMAP keywords;
+-- trashed messages are skipped.
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn config_error($message)
+  print("  ERROR: " .. $message)
+  exit(2)
+end
+
+fn is_role($role)
+  for each $candidate in ["inbox", "sent", "drafts", "junk", "trash", "archive"]
+    if $role == $candidate then
+      return true
+    end
+  end
+  return false
+end
+
+-- Dispatch before loading private state so the usage pre-flight is inert.
+$argv = args()
+if len($argv) != 1 then
+  print("usage: mix maildir_import.mix <job>")
+  exit(2)
+end
+$JOB_NAME = $argv[0]
+
+$CONF_PATH = $d.hub_root() .. "/_etc/maildir_import.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no maildir import configuration at " .. $CONF_PATH)
+  print("         copy _etc/maildir_import.conf.mix.example there and configure a job")
+  exit(2)
+end
+$CONF_DOC = load_data($CONF_PATH)
+if type($CONF_DOC) != "map" or type($CONF_DOC["maildir_import"]) != "map" then
+  config_error($CONF_PATH .. " must contain a maildir_import map")
+end
+$CONF = $CONF_DOC["maildir_import"]
+if $CONF["schema_version"] != 1 or type($CONF["jobs"]) != "map" then
+  config_error($CONF_PATH .. " needs maildir_import.schema_version: 1 and a jobs map")
+end
+$JOB = $CONF["jobs"][$JOB_NAME]
+if type($JOB) != "map" then
+  config_error("unknown maildir import job '" .. $JOB_NAME .. "' in " .. $CONF_PATH)
+end
+
+for each $key in ["node", "maildir_root", "account", "password_file", "manifest_file", "role", "session_url"]
+  if type($JOB[$key]) != "string" or trim($JOB[$key]) == "" then
+    config_error("job '" .. $JOB_NAME .. "' needs a non-empty " .. $key)
+  end
+end
+if not is_role($JOB["role"]) then
+  config_error("job '" .. $JOB_NAME .. "' has unsupported role '" .. $JOB["role"] .. "'")
+end
+if type($JOB["ssl_verify"]) != "bool" then
+  config_error("job '" .. $JOB_NAME .. "' needs boolean ssl_verify")
+end
+if type($JOB["routes"]) != "list" then
+  config_error("job '" .. $JOB_NAME .. "' needs a routes list")
+end
+for each $route in $JOB["routes"]
+  if type($route) != "map" then
+    config_error("job '" .. $JOB_NAME .. "' routes must contain maps")
+  end
+  for each $key in ["public_origin", "connect_origin", "host_header"]
+    if type($route[$key]) != "string" or trim($route[$key]) == "" then
+      config_error("job '" .. $JOB_NAME .. "' route needs a non-empty " .. $key)
+    end
+  end
+end
+
+$ROSTER = $d.roster()
+$d.assert_node($ROSTER, $JOB["node"])
+$NODE = $JOB["node"]
+$TOKEN = uuid()
+
+-- FOREIGN roster nodes are valid: ssh_mix invokes their installed system Mix
+-- directly and does not depend on their login shell or mesh inventory.
+$reach = ssh_mix($NODE, 'print("MAILDIR_IMPORT_REACH " .. $token)', {
+  bindings: {token: $TOKEN}
+})
+$d.die_if(not $reach["ok"] or not contains($reach["stdout"], "MAILDIR_IMPORT_REACH " .. $TOKEN),
+  $NODE .. " unreachable or not running the system Mix interpreter: " ..
+  trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+
+$result = ssh_mix($NODE, '
+fn fail($message)
+  print("FATAL: " .. $message)
+  exit(1)
+end
+
+fn routed($url, $routes)
+  for each $route in $routes
+    $from = $route["public_origin"]
+    if starts_with($url, $from) then
+      return {
+        url: $route["connect_origin"] .. substr($url, len($from), len($url) - len($from)),
+        host: $route["host_header"]
+      }
+    end
+  end
+  return {url: $url, host: ""}
+end
+
+fn request($method, $url, $body, $content_type, $auth, $routes, $ssl_verify)
+  $target = routed($url, $routes)
+  $headers = {"Authorization": $auth}
+  if $target["host"] != "" then
+    $headers["Host"] = $target["host"]
+  end
+  if $content_type != "" then
+    $headers["Content-Type"] = $content_type
+  end
+  return http_request($method, $target["url"], $body, $headers,
+    {timeout: 0, ssl_verify: $ssl_verify})
+end
+
+fn response_json($response, $what)
+  if $response["status"] < 200 or $response["status"] >= 300 then
+    fail($what .. " HTTP " .. $response["status"] .. ": " .. ("" .. $response["error"]))
+  end
+  if type($response["body"]) != "string" then
+    fail($what .. " returned a non-text response")
+  end
+  return json_parse($response["body"])
+end
+
+if not is_dir($maildir_root) then
+  fail("Maildir root not found: " .. $maildir_root)
+end
+if not is_dir($maildir_root .. "/cur") and not is_dir($maildir_root .. "/new") then
+  fail("Maildir has neither cur nor new: " .. $maildir_root)
+end
+if not is_file($password_file) then
+  fail("password file not found: " .. $password_file)
+end
+if not is_dir(dirname($manifest_file)) then
+  fail("manifest parent directory not found: " .. dirname($manifest_file))
+end
+$password = trim(read_file($password_file))
+if $password == "" then
+  fail("password file is empty: " .. $password_file)
+end
+$auth = "Basic " .. base64_encode($account .. ":" .. $password)
+
+-- Session discovery and target-mailbox selection are preflights: no message
+-- is uploaded until both have succeeded.
+$session_response = request("GET", $session_url, nil, "", $auth, $routes, $ssl_verify)
+$session = response_json($session_response, "JMAP session")
+$primary = $session["primaryAccounts"]
+if type($primary) != "map" then
+  fail("JMAP session has no primaryAccounts map")
+end
+$account_id = $primary["urn:ietf:params:jmap:mail"]
+if type($account_id) != "string" or $account_id == "" then
+  fail("JMAP session has no primary mail account")
+end
+$api_url = $session["apiUrl"]
+$upload_template = $session["uploadUrl"]
+if type($api_url) != "string" or type($upload_template) != "string" then
+  fail("JMAP session lacks apiUrl or uploadUrl")
+end
+$upload_url = replace($upload_template, "{accountId}", $account_id)
+print("account: " .. $account_id)
+
+$mailboxes_response = request("POST", $api_url, json_encode({
+  using: ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+  methodCalls: [["Mailbox/get", {accountId: $account_id, ids: nil}, "0"]]
+}), "application/json", $auth, $routes, $ssl_verify)
+$mailboxes = response_json($mailboxes_response, "Mailbox/get")
+$mailbox_id = ""
+try
+  for each $mailbox in $mailboxes["methodResponses"][0][1]["list"]
+    if $mailbox["role"] == $role then
+      $mailbox_id = $mailbox["id"]
+    end
+  end
+catch $mailbox_error
+  fail("invalid Mailbox/get response: " .. $mailbox_error)
+end
+if $mailbox_id == "" then
+  fail("no mailbox with role " .. $role)
+end
+$mailbox_ids = {}
+$mailbox_ids[$mailbox_id] = true
+print("target mailbox (" .. $role .. "): " .. $mailbox_id)
+
+$done = {}
+if is_file($manifest_file) then
+  for each $line in split(read_file($manifest_file), "\n")
+    if trim($line) != "" then
+      $done[trim($line)] = true
+    end
+  end
+end
+
+$imported = 0
+$skipped = 0
+$failed = 0
+for each $subdir in ["cur", "new"]
+  $dir = $maildir_root .. "/" .. $subdir
+  if not is_dir($dir) then
+    continue
+  end
+  for each $filename in ls($dir)
+    if $done[$filename] == true then
+      $skipped = $skipped + 1
+      continue
+    end
+
+    $keywords = {}
+    $flag_pos = pos(":2,", $filename)
+    if $flag_pos > 0 then
+      $flags = substr($filename, $flag_pos + 2, len($filename) - $flag_pos - 2)
+      if contains($flags, "T") then
+        $skipped = $skipped + 1
+        continue
+      end
+      if contains($flags, "S") then $keywords["$" .. "seen"] = true end
+      if contains($flags, "R") then $keywords["$" .. "answered"] = true end
+      if contains($flags, "F") then $keywords["$" .. "flagged"] = true end
+      if contains($flags, "D") then $keywords["$" .. "draft"] = true end
+    end
+
+    $path = $dir .. "/" .. $filename
+    $received_at = date_format(stat($path)["mtime"], "%Y-%m-%dT%H:%M:%S%:z")
+    $upload = nil
+    try
+      $upload_response = request("POST", $upload_url, read_file_bytes($path),
+        "message/rfc822", $auth, $routes, $ssl_verify)
+      if $upload_response["status"] >= 200 and $upload_response["status"] < 300 and
+          type($upload_response["body"]) == "string" then
+        $upload = json_parse($upload_response["body"])
+      end
+    catch $upload_error
+      $upload = nil
+    end
+    if type($upload) != "map" or $upload["blobId"] == nil then
+      print("UPLOAD FAIL: " .. $filename)
+      $failed = $failed + 1
+      continue
+    end
+
+    $import_response = nil
+    try
+      $import_http = request("POST", $api_url, json_encode({
+        using: ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+        methodCalls: [["Email/import", {accountId: $account_id, emails: {m1: {
+          blobId: $upload["blobId"], mailboxIds: $mailbox_ids,
+          keywords: $keywords, receivedAt: $received_at
+        }}}, "0"]]
+      }), "application/json", $auth, $routes, $ssl_verify)
+      if $import_http["status"] >= 200 and $import_http["status"] < 300 and
+          type($import_http["body"]) == "string" then
+        $import_response = json_parse($import_http["body"])
+      end
+    catch $import_error
+      $import_response = nil
+    end
+
+    $ok = false
+    try
+      if $import_response["methodResponses"][0][1]["created"]["m1"] != nil then
+        $ok = true
+      end
+    catch $response_error
+      $ok = false
+    end
+    if $ok then
+      append_file($manifest_file, $filename .. "\n")
+      $done[$filename] = true
+      $imported = $imported + 1
+    else
+      print("IMPORT FAIL: " .. $filename .. " -> " .. json_encode($import_response))
+      $failed = $failed + 1
+    end
+  end
+end
+print("imported=" .. $imported .. " skipped=" .. $skipped .. " failed=" .. $failed)
+print("MAILDIR_IMPORT_OK " .. $token)
+', {bindings: {
+  maildir_root: $JOB["maildir_root"],
+  account: $JOB["account"],
+  password_file: $JOB["password_file"],
+  manifest_file: $JOB["manifest_file"],
+  role: $JOB["role"],
+  session_url: $JOB["session_url"],
+  routes: $JOB["routes"],
+  ssl_verify: $JOB["ssl_verify"],
+  token: $TOKEN
+}})
+
+if trim($result["stdout"]) != "" then
+  print($result["stdout"])
+end
+$d.die_if(not $result["ok"] or not contains($result["stdout"], "MAILDIR_IMPORT_OK " .. $TOKEN),
+  "maildir import on " .. $NODE .. " failed: " .. trim($result["stderr"]))

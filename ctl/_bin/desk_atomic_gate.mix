@@ -1,0 +1,684 @@
+#!/usr/bin/env mix
+-- desk_atomic_gate.mix — unattended local atomic-presentation gate.
+--
+-- Runs the freshly built desktop compositor inside a configured local
+-- systemd-nspawn container, switches away from and back to its bound VT, and
+-- proves that every pause completes and rendering resumes. This flips the
+-- physical display repeatedly; do not run it during an active desktop session.
+--
+-- Usage (root):
+--   mix _bin/desk_atomic_gate.mix [cycles] [dwell-seconds]
+--
+-- Optional environment arms:
+--   DESK_GATE_COMP=/path             compositor override; default is the
+--                                    desktop release build under $COSMIX
+--   DESK_GATE_DWELLS=3,5,8,15,45    per-cycle dwell list
+--   DESK_GATE_CAPTURE=1              enable capture in the container
+--   DESK_GATE_DMABUF=1               enable the separate dmabuf-probe arm
+--   DESK_GATE_STACK_SAMPLE=1         sample stacks during the first >=30s dwell
+--   DESK_GATE_CHROME=mac|win11|cosmix
+--   DESK_GATE_SCALE=1.0|2.5
+--   DESK_GATE_DEFAULT_PRESENTATION=1 omit --presentation to prove the default
+--   DESK_GATE_FINAL_HOLD=seconds     steady-state hold after all cycles
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn config_error($message)
+  print("  ERROR: " .. $message)
+  exit(2)
+end
+
+fn has_str($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn assert_only_keys($value, $allowed, $where)
+  if type($value) != "map" then
+    config_error($where .. " must be a map")
+  end
+  for each $key in keys($value)
+    if not has_str($allowed, $key) then
+      config_error($where .. " contains unknown key '" .. $key .. "'")
+    end
+  end
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/desk_atomic_gate.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no desk_atomic_gate configuration at " .. $CONF_PATH)
+  print("         copy _etc/desk_atomic_gate.conf.mix.example there and set this workstation's display values")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  assert_only_keys($loaded, ["desk_atomic_gate"], $CONF_PATH)
+  $CONF = validate($loaded["desk_atomic_gate"], {
+    schema_version: {type: "integer", enum: [1]},
+    container_name: {type: "string", nonblank: true},
+    bound_vt: {type: "integer", min: 1, max: 63},
+    away_vt: {type: "integer", min: 1, max: 63},
+    restore_fallback_vt: {type: "integer", min: 1, max: 63},
+    tty_path: {type: "string", nonblank: true},
+    container_root: {type: "string", nonblank: true},
+    container_compositor_path: {type: "string", nonblank: true},
+    drm_device: {type: "string", nonblank: true},
+    drm_connector: {type: "string", nonblank: true},
+    capture_dir: {type: "string", nonblank: true}
+  })
+  assert_only_keys($CONF, [
+    "schema_version", "container_name", "bound_vt", "away_vt",
+    "restore_fallback_vt", "tty_path", "container_root",
+    "container_compositor_path", "drm_device", "drm_connector",
+    "capture_dir"
+  ], "desk_atomic_gate")
+catch $e
+  config_error("invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+end
+
+$CT = $CONF["container_name"]
+$VT = to_string($CONF["bound_vt"])
+$AWAY_VT = to_string($CONF["away_vt"])
+$RESTORE_FALLBACK_VT = to_string($CONF["restore_fallback_vt"])
+$TTY = $CONF["tty_path"]
+$CT_ROOT = $CONF["container_root"]
+$CT_COMP = $CONF["container_compositor_path"]
+$DEVICE = $CONF["drm_device"]
+$CONN = $CONF["drm_connector"]
+$CAPTURE_DIR = $CONF["capture_dir"]
+
+if not regex_match("^[A-Za-z0-9_.-]+$", $CT) then
+  config_error("desk_atomic_gate.container_name contains unsafe characters")
+end
+for each $path in [$TTY, $CT_ROOT, $CT_COMP, $DEVICE, $CAPTURE_DIR]
+  if not starts_with($path, "/") then
+    config_error("desk_atomic_gate paths must be absolute (got '" .. $path .. "')")
+  end
+end
+if $TTY != "/dev/tty" .. $VT then
+  config_error("desk_atomic_gate.tty_path must match bound_vt (/dev/tty" .. $VT .. ")")
+end
+if $AWAY_VT == $VT then
+  config_error("desk_atomic_gate.away_vt must differ from bound_vt")
+end
+if $RESTORE_FALLBACK_VT == $VT then
+  config_error("desk_atomic_gate.restore_fallback_vt must differ from bound_vt")
+end
+
+$DESKTOP = $d.cosmix_root() .. "/src/desktop"
+$COMP_SRC = env("DESK_GATE_COMP", $DESKTOP .. "/target/release/cosmix-comp")
+$LOGDIR = env("DESK_VT_LOG_DIR", "/tmp/cosmix-desk-vt")
+$LOCK = "/run/lock/desk-vt-run"
+$STAGED_HOST_PATH = $CT_ROOT .. $CT_COMP
+$DRM_STATUS = "/sys/class/drm/" .. basename($DEVICE) .. "-" .. $CONN .. "/status"
+$FIRST_FRAME_DEADLINE = 60
+$PAUSE_DEADLINE = 20
+$RESUME_DEADLINE = 30
+$DWELLS_RAW = env("DESK_GATE_DWELLS", "")
+$ARM_CAPTURE = env("DESK_GATE_CAPTURE", "")
+$ARM_DMABUF = env("DESK_GATE_DMABUF", "")
+$ARM_STACK = env("DESK_GATE_STACK_SAMPLE", "")
+$CHROME = env("DESK_GATE_CHROME", "mac")
+$SCALE = env("DESK_GATE_SCALE", "1.0")
+$DEFAULT_PRES = env("DESK_GATE_DEFAULT_PRESENTATION", "")
+$FINAL_HOLD = env("DESK_GATE_FINAL_HOLD", "0")
+
+fn usage($msg)
+  print("desk_atomic_gate: " .. $msg)
+  print("usage: mix _bin/desk_atomic_gate.mix [cycles] [dwell-seconds]")
+  exit(1)
+end
+
+fn unit_gone($state)
+  return $state == "inactive" or $state == "failed"
+end
+
+fn must_argv($argv, $what)
+  $result = run_argv($argv)
+  if $result["exit_code"] != 0 then
+    raise("PROCESS_EXIT_NONZERO", $what .. ": " .. trim($result["stdout"]) .. " " .. trim($result["stderr"]), {
+      result: $result
+    })
+  end
+  return $result
+end
+
+fn count_matching($text, $pattern)
+  $count = 0
+  for each $line in split($text, "\n")
+    if regex_match($pattern, $line) then
+      $count = $count + 1
+    end
+  end
+  return $count
+end
+
+fn matching_tail($text, $pattern, $limit)
+  $matches = []
+  for each $line in split($text, "\n")
+    if regex_match($pattern, $line) then
+      push($matches, $line)
+    end
+  end
+  $start = length($matches) - $limit
+  if $start < 0 then
+    $start = 0
+  end
+  $tail = []
+  $i = $start
+  while $i < length($matches) do
+    push($tail, $matches[$i])
+    $i = $i + 1
+  end
+  return join($tail, "\n")
+end
+
+fn journal_text($container, $unit, $timeout)
+  $result = run_argv([
+    "journalctl", "-M", $container, "-u", $unit, "--no-pager"
+  ], {timeout: $timeout, max_output: 67108864})
+  if $result["exit_code"] != 0 then
+    return ""
+  end
+  return $result["stdout"]
+end
+
+fn journal_count($container, $unit, $pattern)
+  return count_matching(journal_text($container, $unit, 15), $pattern)
+end
+
+fn container_path_count($container, $path)
+  $result = run_argv([
+    "systemd-run", "-M", $container, "--pipe", "--wait", "--quiet", "--",
+    "ls", "-1", $path
+  ], {timeout: 15})
+  if $result["exit_code"] != 0 then
+    return "?"
+  end
+  $count = 0
+  for each $line in split($result["stdout"], "\n")
+    if trim($line) != "" then
+      $count = $count + 1
+    end
+  end
+  return to_string($count)
+end
+
+fn process_sample($container, $pid)
+  if not regex_match("^[0-9]+$", $pid) then
+    return {fds: "?", threads: "?"}
+  end
+  return {
+    fds: container_path_count($container, "/proc/" .. $pid .. "/fd"),
+    threads: container_path_count($container, "/proc/" .. $pid .. "/task")
+  }
+end
+
+$cycles = 5
+$dwell = 5
+$argv = args()
+if length($argv) > 2 then
+  usage("too many arguments")
+end
+if length($argv) > 0 then
+  $cycles = to_number($argv[0])
+  if $cycles == nil or $cycles < 1 or $cycles > 100 then
+    usage("cycles must be 1..100")
+  end
+end
+if length($argv) > 1 then
+  $dwell = to_number($argv[1])
+  if $dwell == nil or $dwell < 2 or $dwell > 120 then
+    usage("dwell-seconds must be 2..120")
+  end
+end
+
+$dwell_list = []
+if $DWELLS_RAW != "" then
+  for each $entry in split($DWELLS_RAW, ",")
+    $dwell_number = to_number(trim($entry))
+    if $dwell_number == nil or $dwell_number < 2 or $dwell_number > 120 then
+      usage("DESK_GATE_DWELLS entries must be numbers 2..120")
+    end
+    push($dwell_list, $dwell_number)
+  end
+end
+if $ARM_DMABUF == "1" and $ARM_CAPTURE == "1" then
+  usage("the dmabuf-probe arm is separate; do not combine it with capture")
+end
+if not has_str(["mac", "win11", "cosmix"], $CHROME) then
+  usage("DESK_GATE_CHROME must be mac|win11|cosmix")
+end
+if not has_str(["1.0", "2.5"], $SCALE) then
+  usage("DESK_GATE_SCALE must be 1.0 or 2.5")
+end
+$final_hold = to_number($FINAL_HOLD)
+if $final_hold == nil or $final_hold < 0 or $final_hold > 3600 then
+  usage("DESK_GATE_FINAL_HOLD must be 0..3600 seconds")
+end
+$max_dwell = $dwell
+for each $listed_dwell in $dwell_list
+  if $listed_dwell > $max_dwell then
+    $max_dwell = $listed_dwell
+  end
+end
+
+-- Fail closed before taking the lock or touching the display.
+$uid = run_argv(["id", "-u"])
+$d.die_if($uid["exit_code"] != 0 or trim($uid["stdout"]) != "0", "must run as root")
+
+$state = run_argv(["machinectl", "show", $CT, "--property=State", "--value"])
+$d.die_if($state["exit_code"] != 0 or trim($state["stdout"]) != "running", $CT .. " is not running")
+
+$getty_unit = "getty@tty" .. $VT .. ".service"
+$getty_enabled = run_argv(["systemctl", "is-enabled", $getty_unit])
+$d.die_if(trim($getty_enabled["stdout"]) != "masked", "host " .. $getty_unit .. " is not masked")
+$getty_active = run_argv(["systemctl", "is-active", $getty_unit])
+$d.die_if(trim($getty_active["stdout"]) != "inactive",
+  "host " .. $getty_unit .. " is not INACTIVE (got '" .. trim($getty_active["stdout"]) .. "')")
+
+$fuser = run_argv(["fuser", "-s", $TTY])
+$d.die_if($fuser["exit_code"] == 0, $TTY .. " is in use — clear the stale holder first")
+$d.die_if($fuser["exit_code"] != 1, "fuser could not examine " .. $TTY .. " — refusing to assume it is free")
+
+$d.die_if(not is_file($DRM_STATUS), "DRM connector status is missing: " .. $DRM_STATUS)
+$connector_status = trim(read_file($DRM_STATUS))
+$d.die_if($connector_status != "connected", $CONN .. " is not connected (status: " .. $connector_status .. ")")
+$d.die_if(not is_file($COMP_SRC),
+  "gate compositor missing: " .. $COMP_SRC .. " (build the desktop release target or set DESK_GATE_COMP)")
+
+$marker = run_argv(["strings", $COMP_SRC], {timeout: 60, max_output: 67108864})
+if $marker["exit_code"] != 0 or not contains($marker["stdout"], "presentation atomic") then
+  print("  NOTE: no 'presentation atomic' marker found by strings — proceeding; the named refusal will tell the truth")
+end
+
+$seatd = run_argv([
+  "systemd-run", "-M", $CT, "--pipe", "--wait", "--quiet", "--",
+  "systemctl", "is-active", "seatd"
+])
+$d.die_if($seatd["exit_code"] != 0 or trim($seatd["stdout"]) != "active", "seatd is not active inside " .. $CT)
+
+$existing = run_argv([
+  "systemd-run", "-M", $CT, "--pipe", "--wait", "--quiet", "--",
+  "pgrep", "-x", "cosmix-comp"
+])
+$d.die_if($existing["exit_code"] == 0, "a cosmix-comp is ALREADY running inside " .. $CT)
+$d.die_if($existing["exit_code"] != 1, "could not probe for a running compositor inside " .. $CT)
+
+$foreground = run_argv(["fgconsole"])
+$d.die_if($foreground["exit_code"] != 0, "fgconsole failed: " .. trim($foreground["stderr"]))
+$restore_vt = trim($foreground["stdout"])
+$d.die_if(not regex_match("^[0-9]+$", $restore_vt), "fgconsole returned '" .. $restore_vt .. "'")
+if $restore_vt == $VT then
+  print("  NOTE: display already on tty" .. $VT .. "; will restore to tty" .. $RESTORE_FALLBACK_VT)
+  $restore_vt = $RESTORE_FALLBACK_VT
+end
+
+mkdir($LOGDIR)
+$lock = run_argv(["mkdir", $LOCK])
+$d.die_if($lock["exit_code"] != 0, "another desk VT run holds " .. $LOCK .. " (rmdir it if stale)")
+
+$timestamp = replace(to_string(time()), ".", "-")
+$UNIT = "cosmix-desk-atomic-" .. $timestamp
+$TIMER = "desk-vt-restore-" .. $timestamp
+$tag = "atomic-gate-" .. to_string($cycles) .. "x-" .. $timestamp
+$log = $LOGDIR .. "/" .. $tag .. ".log"
+$bound = 120 + ($cycles * ($max_dwell + $RESUME_DEADLINE + $PAUSE_DEADLINE)) + 180 + $final_hold
+
+print("ATOMIC GATE " .. $tag .. ": " .. to_string($cycles) .. " external cycles, dwell " .. to_string($dwell) .. "s")
+print("  compositor: " .. $COMP_SRC)
+print("  (display flips repeatedly; restore VT = " .. $restore_vt .. ")")
+
+-- Stage the tested build without changing the container's shipped /opt tier.
+$copy = run_argv(["cp", $COMP_SRC, $STAGED_HOST_PATH])
+if $copy["exit_code"] != 0 then
+  $_unlock_copy = run_argv(["rmdir", $LOCK])
+  $d.die_if(true, "could not stage the gate compositor: " .. trim($copy["stderr"]))
+end
+$chmod = run_argv([
+  "systemd-run", "-M", $CT, "--pipe", "--wait", "--quiet", "--",
+  "chmod", "+x", $CT_COMP
+])
+if $chmod["exit_code"] != 0 then
+  $_cleanup_chmod = run_argv(["rm", "-f", $STAGED_HOST_PATH])
+  $_unlock_chmod = run_argv(["rmdir", $LOCK])
+  $d.die_if(true, "could not make the staged compositor executable inside " .. $CT)
+end
+
+$verdict = "aborted-preflight"
+$exit_status = ""
+$unit_final = ""
+$lit = false
+$cycles_passed = 0
+$cycle_fail = ""
+$int_delivered = false
+$restore_ok = false
+$timer_cancelled = false
+$pid0 = "?"
+$pid1 = "?"
+$fd0 = "?"
+$fd1 = "?"
+$th0 = "?"
+$th1 = "?"
+$stack_done = false
+
+try
+  $_timer_start = must_argv([
+    "systemd-run", "--unit=" .. $TIMER, "--on-active=" .. to_string($bound + 90),
+    "--timer-property=AccuracySec=1s", "--", "/usr/bin/chvt", $restore_vt
+  ], "could not arm the VT restore timer")
+  $_switch_bound = must_argv(["chvt", $VT], "could not switch to the bound VT")
+  $verdict = "aborted-mid-bracket"
+
+  $launch = [
+    "systemd-run", "-M", $CT, "--unit=" .. $UNIT,
+    "-p", "TTYPath=" .. $TTY,
+    "-p", "StandardInput=tty",
+    "-p", "StandardOutput=journal",
+    "-p", "StandardError=journal",
+    "-p", "Environment=RUST_LOG=info",
+    "-p", "Environment=LIBSEAT_BACKEND=seatd",
+    "-p", "RuntimeDirectory=cosmix-desk",
+    "-p", "RuntimeDirectoryMode=0700",
+    "-p", "Environment=XDG_RUNTIME_DIR=/run/cosmix-desk",
+    "-p", "RuntimeMaxSec=" .. to_string($bound)
+  ]
+  if $ARM_CAPTURE == "1" then
+    $launch = concat($launch, [
+      "-p", "Environment=COSMIX_CAPTURE_DIR=" .. $CAPTURE_DIR,
+      "-p", "Environment=COSMIX_CAPTURE_EVERY=1"
+    ])
+  end
+  if $ARM_DMABUF == "1" then
+    $launch = concat($launch, ["-p", "Environment=COSMIX_DMABUF_PROBE=1"])
+  end
+  $launch = concat($launch, [
+    "--", $CT_COMP, "kms-live", "--device", $DEVICE, "--connector", $CONN,
+    "--scale", $SCALE
+  ])
+  if $DEFAULT_PRES != "1" then
+    $launch = concat($launch, ["--presentation", "atomic"])
+  end
+  if $ARM_DMABUF != "1" then
+    $launch = concat($launch, ["--chrome", $CHROME])
+  end
+  $_launched = must_argv($launch, "could not launch the gate compositor")
+  print("  launched " .. $UNIT .. " (TERM backstop " .. to_string($bound) .. "s)")
+
+  $first_frame_deadline = time() + $FIRST_FRAME_DEADLINE
+  while time() < $first_frame_deadline and not $lit do
+    $_sleep_first = run_argv(["sleep", "3"])
+    if journal_count($CT, $UNIT, "live KMS first frame submitted") > 0 then
+      $lit = true
+    end
+    $active = run_argv(["systemctl", "-M", $CT, "is-active", $UNIT .. ".service"])
+    if not $lit and unit_gone(trim($active["stdout"])) then
+      break
+    end
+  end
+
+  if $lit then
+    print("  FIRST LIGHT in atomic mode — settling 5s, then " .. to_string($cycles) .. " external cycles")
+    $_sleep_settle = run_argv(["sleep", "5"], {timeout: 0})
+    $pid0 = trim(run_argv([
+      "systemctl", "-M", $CT, "show", $UNIT .. ".service", "--property=MainPID", "--value"
+    ])["stdout"])
+    $sample = process_sample($CT, $pid0)
+    $fd0 = $sample["fds"]
+    $th0 = $sample["threads"]
+    print("  baseline: pid=" .. $pid0 .. " fds=" .. $fd0 .. " threads=" .. $th0)
+
+    $i = 0
+    while $i < $cycles do
+      $i = $i + 1
+      -- Lazily opened steady-state resources make the post-cycle-1 sample the
+      -- meaningful flatness baseline for multi-cycle runs.
+      if $i == 2 then
+        $sample = process_sample($CT, $pid0)
+        $fd0 = $sample["fds"]
+        $th0 = $sample["threads"]
+        print("  steady baseline (post-cycle-1): fds=" .. $fd0 .. " threads=" .. $th0)
+      end
+
+      $paused_before = journal_count($CT, $UNIT, "lifecycle boundary state=.Paused")
+      $telemetry_before = journal_count($CT, $UNIT, "submitted-frame telemetry")
+      $switch_away = run_argv(["chvt", $AWAY_VT])
+      if $switch_away["exit_code"] != 0 then
+        $cycle_fail = "cycle " .. to_string($i) .. ": chvt away failed"
+        break
+      end
+
+      $pause_deadline = time() + $PAUSE_DEADLINE
+      $paused = false
+      while time() < $pause_deadline and not $paused do
+        $_sleep_pause = run_argv(["sleep", "2"])
+        if journal_count($CT, $UNIT, "lifecycle boundary state=.Paused") > $paused_before then
+          $paused = true
+        end
+        $active = run_argv(["systemctl", "-M", $CT, "is-active", $UNIT .. ".service"])
+        if not $paused and unit_gone(trim($active["stdout"])) then
+          break
+        end
+      end
+      if not $paused then
+        $cycle_fail = "cycle " .. to_string($i) .. ": Paused boundary NOT reached within " ..
+          to_string($PAUSE_DEADLINE) .. "s of chvt-away"
+        break
+      end
+
+      $cycle_dwell = $dwell
+      if length($dwell_list) > 0 then
+        $dwell_index = $i - 1
+        while $dwell_index >= length($dwell_list) do
+          $dwell_index = $dwell_index - length($dwell_list)
+        end
+        $cycle_dwell = $dwell_list[$dwell_index]
+      end
+
+      if $ARM_STACK == "1" and not $stack_done and $cycle_dwell >= 30 then
+        $host_process = run_argv(["pgrep", "-f", $CT_COMP])
+        $host_pid = trim($host_process["stdout"])
+        if $host_process["exit_code"] == 0 and regex_match("^[0-9]+$", $host_pid) then
+          $stack_path = $LOGDIR .. "/" .. $tag .. "-paused-stacks.txt"
+          $stack_result = run_argv([
+            "gdb", "-p", $host_pid, "-batch", "-ex", "set pagination off",
+            "-ex", "thread apply all bt 8"
+          ], {timeout: 60, stderr: "stdout", max_output: 67108864})
+          write_file($stack_path, $stack_result["stdout"])
+          print("  stack sample (cycle " .. to_string($i) .. ", dwell " ..
+            to_string($cycle_dwell) .. "s): rc=" .. to_string($stack_result["exit_code"]) ..
+            " -> " .. basename($stack_path))
+          $stack_done = true
+        end
+      end
+
+      $_sleep_dwell = run_argv(["sleep", to_string($cycle_dwell)], {timeout: 0})
+      $switch_back = run_argv(["chvt", $VT])
+      if $switch_back["exit_code"] != 0 then
+        $cycle_fail = "cycle " .. to_string($i) .. ": chvt back failed"
+        break
+      end
+
+      $resume_deadline = time() + $RESUME_DEADLINE
+      $resumed = false
+      while time() < $resume_deadline and not $resumed do
+        $_sleep_resume = run_argv(["sleep", "2"])
+        if journal_count($CT, $UNIT, "submitted-frame telemetry") > $telemetry_before then
+          $resumed = true
+        end
+        $active = run_argv(["systemctl", "-M", $CT, "is-active", $UNIT .. ".service"])
+        if not $resumed and unit_gone(trim($active["stdout"])) then
+          break
+        end
+      end
+      if not $resumed then
+        $cycle_fail = "cycle " .. to_string($i) .. ": no fresh frame telemetry within " ..
+          to_string($RESUME_DEADLINE) .. "s of chvt-back"
+        break
+      end
+      $cycles_passed = $cycles_passed + 1
+      print("  cycle " .. to_string($i) .. "/" .. to_string($cycles) ..
+        ": paused + resumed OK (dwell " .. to_string($cycle_dwell) .. "s)")
+    end
+
+    if $final_hold > 0 and $cycle_fail == "" then
+      print("  soak hold: " .. to_string($final_hold) .. "s at steady state")
+      $_sleep_hold = run_argv(["sleep", to_string($final_hold)], {timeout: 0})
+    end
+
+    $pid1 = trim(run_argv([
+      "systemctl", "-M", $CT, "show", $UNIT .. ".service", "--property=MainPID", "--value"
+    ])["stdout"])
+    $sample = process_sample($CT, $pid1)
+    $fd1 = $sample["fds"]
+    $th1 = $sample["threads"]
+    print("  pre-close: pid=" .. $pid1 .. " fds=" .. $fd1 .. " threads=" .. $th1)
+
+    $active = run_argv(["systemctl", "-M", $CT, "is-active", $UNIT .. ".service"])
+    if unit_gone(trim($active["stdout"])) then
+      print("  comp died before the close (after " .. to_string($cycles_passed) .. " cycles)")
+    else
+      $interrupt = run_argv([
+        "systemctl", "-M", $CT, "kill", "--signal=INT", "--kill-whom=main", $UNIT .. ".service"
+      ])
+      if $interrupt["exit_code"] == 0 then
+        $int_delivered = true
+      end
+    end
+  else
+    print("  NO first light — closing")
+    $_interrupt_dark = run_argv([
+      "systemctl", "-M", $CT, "kill", "--signal=INT", "--kill-whom=main", $UNIT .. ".service"
+    ])
+  end
+
+  $close_deadline = time() + 30
+  $unit_final = "unknown"
+  while time() < $close_deadline do
+    $active = run_argv(["systemctl", "-M", $CT, "is-active", $UNIT .. ".service"])
+    $unit_final = trim($active["stdout"])
+    if unit_gone($unit_final) then
+      break
+    end
+    $_sleep_close = run_argv(["sleep", "2"])
+  end
+  if not unit_gone($unit_final) then
+    $_stop = run_argv(["systemctl", "-M", $CT, "stop", $UNIT .. ".service"], {timeout: 150})
+    $stop_deadline = time() + 120
+    while time() < $stop_deadline do
+      $active = run_argv(["systemctl", "-M", $CT, "is-active", $UNIT .. ".service"])
+      $unit_final = trim($active["stdout"])
+      if unit_gone($unit_final) then
+        break
+      end
+      $_sleep_stop = run_argv(["sleep", "2"])
+    end
+  end
+  if unit_gone($unit_final) then
+    $show_status = run_argv([
+      "systemctl", "-M", $CT, "show", $UNIT .. ".service", "--property=ExecMainStatus", "--value"
+    ])
+    $exit_status = trim($show_status["stdout"])
+  end
+
+  if not $lit then
+    $verdict = "never-lit"
+  else
+    if $cycles_passed < $cycles then
+      $verdict = "cycles-failed-at-" .. to_string($cycles_passed) .. "-of-" .. to_string($cycles)
+    else
+      if $exit_status == "130" and $int_delivered then
+        $verdict = "atomic-gate-green"
+      else
+        $verdict = "cycles-ok-but-close-" .. $exit_status
+      end
+    end
+  end
+catch $message
+  print("  ABORTED: " .. $message)
+  $_catch_stop = run_argv(["systemctl", "-M", $CT, "stop", "--no-block", $UNIT .. ".service"])
+finally
+  $restore = run_argv(["chvt", $restore_vt])
+  if $restore["exit_code"] == 0 then
+    $restore_ok = true
+    $cancel_timer = run_argv(["systemctl", "stop", $TIMER .. ".timer"])
+    if $cancel_timer["exit_code"] == 0 then
+      $timer_cancelled = true
+    else
+      print("  WARNING: could not cancel " .. $TIMER .. ".timer")
+    end
+  else
+    print("  WARNING: chvt restore FAILED — leaving " .. $TIMER .. ".timer ARMED")
+  end
+  $_reset_timer = run_argv(["systemctl", "reset-failed", $TIMER .. ".service"])
+end
+
+-- Evidence is derived from the unit's actual final journal and state.
+$err_count = "log-dump-failed"
+$ledger_bad = "?"
+$ledger_boundaries = "?"
+$telemetry_tail = ""
+try
+  $dump = run_argv([
+    "journalctl", "-M", $CT, "-u", $UNIT, "--no-pager"
+  ], {timeout: 60, stderr: "stdout", max_output: 67108864})
+  if $dump["exit_code"] == 0 then
+    $journal = $dump["stdout"]
+    write_file($log, $journal)
+    $err_count = to_string(count_matching($journal, " ERROR |panicked|[Dd]evice ?[Ll]ost"))
+    $ledger_bad = to_string(count_matching($journal, "ledger_paired=false|retained_ledger_healthy=false"))
+    $ledger_boundaries = to_string(count_matching($journal, "lifecycle boundary"))
+    $telemetry_tail = matching_tail($journal,
+      "atomic presentation telemetry|submitted-frame telemetry", 5)
+  end
+finally
+  $_reset_unit = run_argv(["systemctl", "-M", $CT, "reset-failed", $UNIT .. ".service"])
+  $_cleanup_stage = run_argv(["rm", "-f", $STAGED_HOST_PATH])
+  $_unlock = run_argv(["rmdir", $LOCK])
+end
+
+print("")
+print("=== ATOMIC GATE " .. $tag .. ": " .. $verdict .. " ===")
+print("  cycles passed: " .. to_string($cycles_passed) .. "/" .. to_string($cycles))
+if $cycle_fail != "" then
+  print("  cycle failure: " .. $cycle_fail)
+end
+print("  unit final: " .. $unit_final .. "  ExecMainStatus: " .. $exit_status)
+print("  log: " .. $log .. "  (death markers: " .. $err_count .. ")")
+print("  banked evidence: pid " .. $pid0 .. "->" .. $pid1 .. "  fds " .. $fd0 .. "->" .. $fd1 ..
+  "  threads " .. $th0 .. "->" .. $th1 .. "  boundaries=" .. $ledger_boundaries .. " unpaired=" .. $ledger_bad)
+print("  telemetry tail:")
+print($telemetry_tail)
+
+if $verdict != "atomic-gate-green" then
+  exit(1)
+end
+if $err_count != "0" then
+  print("  NOTE: death-marker lines present — read the log")
+  exit(1)
+end
+if not $restore_ok or not $timer_cancelled then
+  print("  NOTE: VT restore or timer cancel failed — not green")
+  exit(1)
+end
+if $pid0 == "?" or $pid0 != $pid1 then
+  print("  NOTE: PID changed or unsampled (" .. $pid0 .. "->" .. $pid1 .. ") — not green")
+  exit(1)
+end
+if $fd0 == "?" or $fd0 != $fd1 or $th0 == "?" or $th0 != $th1 then
+  print("  NOTE: fd/thread count not flat (fds " .. $fd0 .. "->" .. $fd1 ..
+    ", threads " .. $th0 .. "->" .. $th1 .. ") — not green")
+  exit(1)
+end
+if $ledger_bad != "0" then
+  print("  NOTE: " .. $ledger_bad .. " unpaired ledger boundaries — not green")
+  exit(1)
+end
+print("  VERDICT: GREEN — first light + " .. to_string($cycles) ..
+  " cycles + INT-130 + restored + pid-stable + flat fds/threads + paired ledger")

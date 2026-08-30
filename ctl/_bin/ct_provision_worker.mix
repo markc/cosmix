@@ -86,8 +86,11 @@ fn has_item($items, $wanted)
 end
 
 fn safe_path($key, $path)
-  if not starts_with($path, "/") or contains($path, "//") or
-      contains($path, "\n") or contains($path, "\r") then
+  $bad = not starts_with($path, "/")
+  $bad = $bad or contains($path, "//")
+  $bad = $bad or contains($path, "\n")
+  $bad = $bad or contains($path, "\r")
+  if $bad then
     config_error($key .. " must be a normalised one-line absolute path")
   end
   for each $part in split($path, "/")
@@ -127,18 +130,15 @@ fn valid_domain($domain)
     $domain)
 end
 
-if not starts_with($CONF["default_base_url"], "http://") and
-    not starts_with($CONF["default_base_url"], "https://") then
+if not starts_with($CONF["default_base_url"], "http://") and not starts_with($CONF["default_base_url"], "https://") then
   config_error("default_base_url must start with http:// or https://")
 end
-if contains($CONF["default_base_url"], "\n") or
-    contains($CONF["default_base_url"], "\r") then
+if contains($CONF["default_base_url"], "\n") or contains($CONF["default_base_url"], "\r") then
   config_error("default_base_url must be one line")
 end
 for each $key in ["default_relid", "preseed_node_min_relid"]
   $value = $CONF[$key]
-  if not regex_match("^[A-Za-z0-9][A-Za-z0-9._-]*$", $value) or
-      contains($value, "..") then
+  if not regex_match("^[A-Za-z0-9][A-Za-z0-9._-]*$", $value) or contains($value, "..") then
     config_error($key .. " must be a slug without '..'")
   end
 end
@@ -161,8 +161,7 @@ $TOKEN_KEYS = [
 for each $key in $TOKEN_KEYS
   $_token = safe_token($key, $CONF[$key])
 end
-if not valid_ipv4($CONF["dns_server"]) or
-    not valid_ipv4($CONF["preseed_nameserver"]) then
+if not valid_ipv4($CONF["dns_server"]) or not valid_ipv4($CONF["preseed_nameserver"]) then
   config_error("dns_server and preseed_nameserver must be canonical IPv4 addresses")
 end
 for each $domain in $CONF["allowed_domains"]
@@ -171,9 +170,9 @@ for each $domain in $CONF["allowed_domains"]
   end
 end
 for each $range in $CONF["provision_ip_pool"]
-  if not regex_match("^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.$",
-      $range["prefix"]) or
-      not valid_ipv4($range["prefix"] .. "0") then
+  $bad_prefix = not regex_match("^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.$", $range["prefix"])
+  $bad_prefix = $bad_prefix or not valid_ipv4($range["prefix"] .. "0")
+  if $bad_prefix then
     config_error("provision_ip_pool prefix must be a canonical IPv4 /24 prefix")
   end
   if $range["first"] > $range["last"] then
@@ -182,11 +181,22 @@ for each $range in $CONF["provision_ip_pool"]
 end
 
 $ROSTER = $d.roster()
+$seen_pve = []
 for each $host in $CONF["pve_hosts"]
+  if not regex_match("^[A-Za-z0-9][A-Za-z0-9_.-]*$", $host) then
+    config_error("PVE host is not a safe roster/SSH name: " .. $host)
+  end
+  if has_item($seen_pve, $host) then
+    config_error("duplicate PVE host: " .. $host)
+  end
+  push($seen_pve, $host)
   $d.assert_node($ROSTER, $host)
   if not $d.is_foreign($ROSTER, $host) then
     config_error("PVE host '" .. $host .. "' must be foreign in the fleet roster")
   end
+end
+if not regex_match("^[A-Za-z0-9][A-Za-z0-9_.-]*$", $CONF["dns_node"]) then
+  config_error("dns_node is not a safe roster/SSH name")
 end
 $d.assert_node($ROSTER, $CONF["dns_node"])
 $DNS_REMOTE = $CONF["dns_node"]
@@ -211,8 +221,9 @@ if $BASE == "" then $BASE = $CONF["default_base_url"] end
 if $g["opts"]["base-url"] != nil then
   $BASE = "" .. $g["opts"]["base-url"]
 end
-if (not starts_with($BASE, "http://") and not starts_with($BASE, "https://")) or
-    contains($BASE, "\n") or contains($BASE, "\r") then
+$bad_base = not starts_with($BASE, "http://") and not starts_with($BASE, "https://")
+$bad_base = $bad_base or contains($BASE, "\n") or contains($BASE, "\r")
+if $bad_base then
   print("--base-url/CT_BASE_URL must be a one-line HTTP(S) URL")
   exit(2)
 end
@@ -220,8 +231,7 @@ end
 $RELID = env("CT_RELID")
 if $RELID == "" then $RELID = $CONF["default_relid"] end
 if $g["opts"]["relid"] != nil then $RELID = "" .. $g["opts"]["relid"] end
-if not regex_match("^[A-Za-z0-9][A-Za-z0-9._-]*$", $RELID) or
-    contains($RELID, "..") then
+if not regex_match("^[A-Za-z0-9][A-Za-z0-9._-]*$", $RELID) or contains($RELID, "..") then
   print("--relid/CT_RELID must be a slug without '..': '" .. $RELID .. "'")
   exit(2)
 end
@@ -538,3 +548,411 @@ fn verify_probe($phase, $probe)
       join($bad, "; "))
   end
 end
+
+fn ip_is_allowed($address)
+  for each $range in $CONF["provision_ip_pool"]
+    if starts_with($address, $range["prefix"]) then
+      $suffix = substr($address, len($range["prefix"]), len($address))
+      if regex_match("^[0-9]{1,3}$", $suffix) then
+        $octet = to_number($suffix)
+        if ("" .. $octet) == $suffix and $octet >= $range["first"] and $octet <= $range["last"] then
+          return true
+        end
+      end
+    end
+  end
+  return false
+end
+
+if not has_item($CONF["pve_hosts"], $PVE) then
+  fail_job("cloning", "pve_host is not in the configured PVE host set: '" ..
+    $PVE .. "'")
+end
+if not ip_is_allowed($IP) then
+  fail_job("cloning", "ip is outside the configured provision_ip_pool: '" ..
+    $IP .. "'")
+end
+if not valid_domain($DOMAIN) then
+  fail_job("cloning", "domain is not a valid DNS name: '" .. $DOMAIN .. "'")
+end
+if not has_item($CONF["allowed_domains"], $DOMAIN) then
+  fail_job("cloning", "domain is not in allowed_domains: '" .. $DOMAIN .. "'")
+end
+if $NODE_NAME != "" and $RELID < $CONF["preseed_node_min_relid"] then
+  fail_job("cloning", "node_name must be blank for template " .. $RELID ..
+    " because explicit names require release >= " ..
+    $CONF["preseed_node_min_relid"] .. ". Got: '" .. $NODE_NAME .. "'")
+end
+if $NODE_NAME != "" and not regex_match(
+    "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", $NODE_NAME) then
+  fail_job("cloning", "node_name is not a DNS label: '" .. $NODE_NAME .. "'")
+end
+if $NODE_NAME != "" and len($NODE_NAME .. "." .. $DOMAIN) > 253 then
+  fail_job("cloning", "explicit node_name + domain exceeds the 253-character FQDN limit: '" ..
+    $NODE_NAME .. "." .. $DOMAIN .. "'")
+end
+
+-- Reach every host that the collision scan or DNS commit can touch before the
+-- first provisioning mutation. Each challenge is invocation-specific.
+for each $host in $CONF["pve_hosts"]
+  $token = uuid()
+  $reach = ssh_mix($host, 'print("CT_REACH " .. $token)', {
+    bindings: {token: $token}, connect_timeout: 8, timeout: 15, batch: true
+  })
+  if not $reach["ok"] or trim($reach["stdout"]) != "CT_REACH " .. $token then
+    fail_job("cloning", $host .. " unreachable or has no working system Mix: " ..
+      exec_err($reach))
+  end
+end
+$dns_token = uuid()
+$dns_reach = ssh_mix($DNS_REMOTE, 'print("CT_DNS_REACH " .. $token)', {
+  bindings: {token: $dns_token}, connect_timeout: 8, timeout: 15, batch: true
+})
+if not $dns_reach["ok"] or trim($dns_reach["stdout"]) != "CT_DNS_REACH " .. $dns_token then
+  fail_job("cloning", $CONF["dns_node"] ..
+    " unreachable or has no working system Mix: " .. exec_err($dns_reach))
+end
+
+$template = $CONF["template_prefix"] .. $RELID .. $CONF["template_suffix"]
+$_template = safe_token("derived template name", $template)
+$certificate_dir = $CONF["certificate_root"] .. "/" .. $DOMAIN
+$CERT_FULLCHAIN = $certificate_dir .. "/" ..
+  $CONF["certificate_fullchain_name"]
+$CERT_PRIVKEY = $certificate_dir .. "/" ..
+  $CONF["certificate_private_key_name"]
+$credential_dir = env("CREDENTIALS_DIRECTORY")
+if $credential_dir != "" then
+  $credential_fullchain = $credential_dir .. "/" ..
+    $CONF["credential_fullchain_name"]
+  $credential_privkey = $credential_dir .. "/" ..
+    $CONF["credential_private_key_name"]
+  if is_file($credential_fullchain) then
+    $CERT_FULLCHAIN = $credential_fullchain
+    $CERT_PRIVKEY = $credential_privkey
+  end
+end
+if not is_file($CERT_FULLCHAIN) or stat($CERT_FULLCHAIN)["size"] == 0 then
+  fail_job("cloning", "certificate fullchain is missing or empty (" ..
+    $CERT_FULLCHAIN .. ")")
+end
+if not is_file($CERT_PRIVKEY) or stat($CERT_PRIVKEY)["size"] == 0 then
+  fail_job("cloning", "certificate private key is missing or empty (" ..
+    $CERT_PRIVKEY .. ")")
+end
+
+progress("staging")
+$remote_template = $CONF["template_cache_dir"] .. "/" .. $template
+$cached = remote_exec($PVE_REMOTE, ["test", "-f", $remote_template], 15)
+if not $cached["ok"] then
+  $release = $CONF["release_root"] .. "/" .. $RELID .. "/" ..
+    $CONF["release_archive_name"]
+  if not is_file($release) then
+    fail_job("cloning", "release rootfs not found: " .. $release)
+  end
+  $copy = run_argv([
+    "scp", "-q", "-o", "BatchMode=yes", $release,
+    $PVE_REMOTE .. ":" .. $remote_template
+  ], {timeout: 900})
+  if $copy["exit_code"] != 0 then
+    fail_job("cloning", "release upload to " .. $PVE ..
+      " failed (or exceeded 15m): " .. exec_err($copy))
+  end
+  $landed = remote_exec($PVE_REMOTE, ["test", "-s", $remote_template], 15)
+  if not $landed["ok"] then
+    fail_job("cloning", "release upload returned success but no non-empty template landed")
+  end
+end
+
+fn description_value($line)
+  $value = trim(substr(trim($line), 12, len(trim($line))))
+  if ends_with($value, "%0A") then
+    $value = trim(substr($value, 0, len($value) - 3))
+  end
+  return $value
+end
+
+progress("cloning")
+$description = $CONF["description_prefix"] .. $JOB_ID
+$SCAN_DEADLINE = time() + 300
+$scan_heartbeat = time() + $HEARTBEAT_SECS
+$hits = []
+for each $host in $CONF["pve_hosts"]
+  $listing = remote_exec($host, ["pct", "list"], 20)
+  if not $listing["ok"] then
+    fail_collision("fleet list on " .. $host .. " failed (uncertain): " ..
+      exec_err($listing))
+  end
+  for each $line in split($listing["stdout"], "\n")
+    if time() > $SCAN_DEADLINE then
+      fail_collision("fleet collision scan exceeded its 300s budget — treating the incomplete scan as uncertain")
+    end
+    if time() >= $scan_heartbeat then
+      progress("cloning")
+      $scan_heartbeat = time() + $HEARTBEAT_SECS
+    end
+    $candidate_vmid = split(trim($line), " ")[0]
+    if regex_match("^[0-9]+$", $candidate_vmid) then
+      $candidate = remote_exec($host,
+        ["pct", "config", $candidate_vmid], 15)
+      if not $candidate["ok"] then
+        fail_collision("pct config " .. $candidate_vmid .. " on " .. $host ..
+          " failed (uncertain): " .. exec_err($candidate))
+      end
+      for each $config_line in split($candidate["stdout"], "\n")
+        if starts_with(trim($config_line), "description:") and description_value($config_line) == $description then
+          push($hits, $host .. ":" .. $candidate_vmid)
+        end
+      end
+    end
+  end
+end
+if len($hits) > 0 then
+  fail_collision("a CT for this job already exists (" .. join($hits, ", ") ..
+    ") — not building a duplicate; reconcile required")
+end
+
+$VMID = remote_must($PVE_REMOTE,
+  ["pvesh", "get", "/cluster/nextid"], "cloning", 30)
+if not regex_match("^[0-9]+$", $VMID) then
+  fail_job("cloning", "pvesh nextid returned an invalid VMID: '" .. $VMID .. "'")
+end
+remote_must($PVE_REMOTE, [
+  "pct", "create", $VMID,
+  $CONF["template_storage"] .. ":vztmpl/" .. $template,
+  "--ostype", "unmanaged", "--unprivileged", "1",
+  "--features", $CONF["pct_features"],
+  "--net0", "name=eth0,bridge=" .. $CONF["network_bridge"] .. ",ip=dhcp",
+  "--rootfs", $CONF["rootfs_storage"] .. ":" .. $CONF["disk_gib"],
+  "--cores", "" .. $CONF["cores"],
+  "--memory", "" .. $CONF["memory_mib"],
+  "--onboot", "1", "--description", $description
+], "cloning", 180)
+
+$config_raw = remote_must($PVE_REMOTE,
+  ["pct", "config", $VMID], "cloning", 30)
+$mac = ""
+for each $line in split($config_raw, "\n")
+  if contains($line, "hwaddr=") then
+    $parts = split($line, "hwaddr=")
+    if len($parts) > 1 then $mac = split($parts[1], ",")[0] end
+  end
+end
+if $mac == "" then
+  fail_job("cloning", "pct config did not contain a net0 hwaddr")
+end
+$derived = shortname($mac)
+if $NODE_NAME == "" then $NODE_NAME = $derived end
+$FQDN = $NODE_NAME .. "." .. $DOMAIN
+remote_must($PVE_REMOTE,
+  ["pct", "set", $VMID, "--hostname", $NODE_NAME], "cloning", 30)
+
+progress("preseeding")
+fault_hook("post_create_pre_dns")
+$fullchain = read_file($CERT_FULLCHAIN)
+$private_key = read_file($CERT_PRIVKEY)
+if byte_length($fullchain) == 0 or byte_length($private_key) == 0 then
+  fail_job("preseeding", "staged certificate material is empty")
+end
+$mounted = remote_exec($PVE_REMOTE, ["pct", "mount", $VMID], 60)
+if not $mounted["ok"] then
+  fail_job("preseeding", "pct mount " .. $VMID .. " failed: " ..
+    exec_err($mounted))
+end
+$mount = $CONF["ct_mount_root"] .. "/" .. $VMID .. "/rootfs"
+$ssl_dir = $mount .. "/etc/ssl/" .. $FQDN
+$preseed = data_encode({
+  domain: $DOMAIN, nameserver: $CONF["preseed_nameserver"], node: $NODE_NAME
+}) .. "\n"
+$shift_root = "" .. $CONF["uid_shift_root"]
+$shift_tls = "" .. $CONF["gid_shift_tls"]
+remote_must($PVE_REMOTE, [
+  "install", "-d", "-o", $shift_root, "-g", $shift_root, "-m", "0755",
+  $mount .. "/etc/cosmix"
+], "preseeding", 30)
+remote_must($PVE_REMOTE, [
+  "install", "-d", "-o", $shift_root, "-g", $shift_root, "-m", "0755",
+  $ssl_dir
+], "preseeding", 30)
+remote_write($PVE_REMOTE, $mount .. "/etc/cosmix/preseed.conf.mix", $preseed,
+  "0644", 0o644, $shift_root, $shift_root, "preseeding")
+remote_write($PVE_REMOTE, $ssl_dir .. "/" ..
+  $CONF["certificate_fullchain_name"], $fullchain,
+  "0644", 0o644, $shift_root, $shift_root, "preseeding")
+remote_write($PVE_REMOTE, $ssl_dir .. "/" ..
+  $CONF["certificate_private_key_name"], $private_key,
+  "0640", 0o640, $shift_root, $shift_tls, "preseeding")
+remote_must($PVE_REMOTE, ["pct", "unmount", $VMID], "preseeding", 60)
+
+progress("dns")
+-- One remote process owns the complete candidate-test, install, full-test,
+-- restart and rollback transaction. Splitting it would expose half-applied
+-- DNS/DHCP state between SSH calls.
+$dns_apply = ssh_mix($DNS_REMOTE, '
+fn fail($message)
+  eprint($message)
+  exit(1)
+end
+
+for each $path in [$dropin, $main_config, $conf_dir, $lease_file]
+  if not regex_match("^/[A-Za-z0-9._/-]+$", $path) then
+    fail("unsafe configured dnsmasq path")
+  end
+end
+if not regex_match("^[A-Za-z0-9_.@-]+$", $service) then
+  fail("unsafe configured dnsmasq service")
+end
+
+$header = "# Provisioned containers — one DHCP host, A/PTR record and MX record per CT.\n"
+$original = $header
+if is_file($dropin) then $original = read_file($dropin) end
+for each $line in split($original, "\n")
+  if starts_with($line, "host-record=" .. $fqdn .. ",") or starts_with($line, "mx-host=" .. $fqdn .. ",") then
+    fail($fqdn .. " already registered")
+  end
+  if contains($line, "," .. $ip) then
+    fail($ip .. " already reserved")
+  end
+end
+
+$candidate = $original .. "dhcp-host=" .. $mac .. "," .. $ip ..
+  "\nhost-record=" .. $fqdn .. "," .. $ip ..
+  "\nmx-host=" .. $fqdn .. "," .. $fqdn .. ",10\n"
+$temporary = "/tmp/ct-dns-" .. uuid() .. ".conf"
+write_file($temporary, $candidate)
+chmod($temporary, 0o644)
+$output = run("dnsmasq --test --conf-file=" .. $temporary, {timeout: 20})
+if $rc != 0 then
+  remove($temporary)
+  fail("candidate dnsmasq test failed: " .. trim($output))
+end
+copy($temporary, $dropin)
+remove($temporary)
+chmod($dropin, 0o644)
+
+$output = run("dnsmasq --test -C " .. $main_config .. " --conf-dir=" ..
+  $conf_dir, {timeout: 20})
+if $rc != 0 then
+  write_file($dropin, $original)
+  chmod($dropin, 0o644)
+  fail("full dnsmasq test failed; config rolled back: " .. trim($output))
+end
+
+$lease_original = ""
+if is_file($lease_file) then $lease_original = read_file($lease_file) end
+$output = run("systemctl stop " .. $service, {timeout: 20})
+if $rc != 0 then
+  write_file($dropin, $original)
+  chmod($dropin, 0o644)
+  fail("dnsmasq stop failed; config rolled back: " .. trim($output))
+end
+
+if $lease_original != "" then
+  $kept = []
+  for each $line in split($lease_original, "\n")
+    if $line != "" and not contains($line, " " .. $ip .. " ") and not contains(lower($line), lower($mac)) then
+      push($kept, $line)
+    end
+  end
+  write_file($lease_file, join($kept, "\n") .. "\n")
+end
+
+$output = run("systemctl start " .. $service, {timeout: 20})
+if $rc != 0 then
+  write_file($dropin, $original)
+  chmod($dropin, 0o644)
+  if $lease_original != "" then write_file($lease_file, $lease_original) end
+  $_restart = run("systemctl start " .. $service, {timeout: 20})
+  fail("dnsmasq start failed; config and lease rolled back: " .. trim($output))
+end
+print("DNS_COMMIT_OK " .. $token)
+', {bindings: {
+    dropin: $CONF["dnsmasq_dropin"],
+    main_config: $CONF["dnsmasq_main_config"],
+    conf_dir: $CONF["dnsmasq_conf_dir"],
+    lease_file: $CONF["dnsmasq_lease_file"],
+    service: $CONF["dnsmasq_service"],
+    mac: $mac, ip: $IP, fqdn: $FQDN, token: uuid()
+  }, connect_timeout: 8, timeout: 60, batch: true})
+if not $dns_apply["ok"] or not contains($dns_apply["stdout"],
+    "DNS_COMMIT_OK ") then
+  fail_job("dns", "remote DNS transaction on " .. $CONF["dns_node"] ..
+    " failed: " .. exec_err($dns_apply))
+end
+
+fault_hook("post_dns_commit")
+remote_must($DNS_REMOTE,
+  ["systemctl", "is-active", $CONF["dnsmasq_service"]], "dns", 15)
+$answer = must_argv([
+  "dig", "+short", "@" .. $CONF["dns_server"], $FQDN
+], "dns")
+if $answer != $IP then
+  fail_job("dns", "configured DNS server did not serve " .. $FQDN ..
+    " -> " .. $IP .. " (got '" .. $answer .. "')")
+end
+$mx = must_argv([
+  "dig", "+short", "@" .. $CONF["dns_server"], "MX", $FQDN
+], "dns")
+if pos($FQDN, $mx) == 0 then
+  fail_job("dns", "configured DNS server did not serve MX for " .. $FQDN ..
+    " (got '" .. $mx .. "')")
+end
+$ptr = must_argv([
+  "dig", "+short", "@" .. $CONF["dns_server"], "-x", $IP
+], "dns")
+if pos($FQDN, $ptr) == 0 then
+  fail_job("dns", "configured DNS server did not serve PTR " .. $IP ..
+    " -> " .. $FQDN .. " (got '" .. $ptr .. "')")
+end
+
+progress("starting")
+remote_must($PVE_REMOTE, ["pct", "start", $VMID], "starting", 120)
+
+progress("verifying")
+verify_probe("boot", probe($VMID, $FQDN))
+$node_config = remote_must($PVE_REMOTE, [
+  "pct", "exec", $VMID, "--", "cat", "/etc/cosmix/node.conf.mix"
+], "verifying", 30)
+$double_quote = '"'
+if pos($double_quote .. $FQDN .. $double_quote, $node_config) == 0 then
+  fail_job("verifying", "appliance node.conf.mix lacks fqdn " .. $FQDN ..
+    " — firstboot identity is unproven: " .. $node_config)
+end
+$address = remote_must($PVE_REMOTE, [
+  "pct", "exec", $VMID, "--", "ip", "-4", "-br", "addr", "show", "eth0"
+], "verifying", 30)
+if pos($IP .. "/", $address) == 0 then
+  fail_job("verifying", "CT eth0 lacks reserved IP " .. $IP ..
+    " (reservation not honoured?): " .. $address)
+end
+$wireguard = remote_exec($PVE_REMOTE, [
+  "pct", "exec", $VMID, "--", "ip", "link", "show", "wg0"
+], 15)
+if $wireguard["ok"] then
+  fail_job("verifying", "wg0 exists — provisioned edge CTs must be standalone")
+end
+$smtp_result = run_argv([
+  "curl", "-s", "--max-time", "5", "telnet://" .. $IP .. ":25"
+], {timeout: 10})
+$smtp = $smtp_result["stdout"]
+if $smtp_result["exit_code"] != 0 or pos("220", $smtp) == 0 or pos($FQDN, $smtp) == 0 then
+  fail_job("verifying", "no SMTP 220/" .. $FQDN .. " banner from " .. $IP ..
+    ":25 — service not reachable or wrong host: '" .. trim($smtp) .. "'")
+end
+remote_must($PVE_REMOTE, ["pct", "shutdown", $VMID], "verifying", 120)
+$stopped_result = remote_exec($PVE_REMOTE, ["pct", "status", $VMID], 15)
+$stopped = trim($stopped_result["stdout"])
+if not $stopped_result["ok"] or pos("stopped", $stopped) == 0 then
+  fail_job("verifying", "CT " .. $VMID .. " did not stop ('" .. $stopped ..
+    "') — reboot test unsound")
+end
+remote_must($PVE_REMOTE, ["pct", "start", $VMID], "verifying", 120)
+verify_probe("reboot", probe($VMID, $FQDN))
+
+fault_hook("pre_success_apply")
+post_apply({
+  job_id: $JOB_ID, ok: true, step: "done", service_id: $SERVICE_ID,
+  node: $NODE_NAME, vmid: $VMID, ip: $IP, fqdn: $FQDN, pve_host: $PVE
+})
+print("provisioned job " .. $JOB_ID .. ": CT " .. $VMID .. " " ..
+  $FQDN .. " " .. $IP .. " on " .. $PVE)
+drain_exit("processed_ok")

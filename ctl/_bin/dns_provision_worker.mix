@@ -101,9 +101,9 @@ fn validate_url($url)
 end
 
 validate_url($CONF["base_url"])
-if not starts_with($CONF["dnsmasq_dropin"], "/etc/dnsmasq.d/") or
+if (not starts_with($CONF["dnsmasq_dropin"], "/etc/dnsmasq.d/") or
     not regex_match("^/[-A-Za-z0-9_./]+[.]conf$", $CONF["dnsmasq_dropin"]) or
-    contains($CONF["dnsmasq_dropin"], "//") then
+    contains($CONF["dnsmasq_dropin"], "//")) then
   conf_error("dnsmasq_dropin must be a normalised, shell-safe .conf path under /etc/dnsmasq.d")
 end
 for each $path_part in split($CONF["dnsmasq_dropin"], "/")

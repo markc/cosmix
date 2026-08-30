@@ -1,0 +1,16 @@
+-- desk_atomic_gate.conf.mix.example — private local display topology.
+-- Copy this file to desk_atomic_gate.conf.mix in the private control hub and
+-- replace every example value with the workstation/container's real value.
+desk_atomic_gate: {
+  schema_version: 1,
+  container_name: "alpha-desktop",
+  bound_vt: 7,
+  away_vt: 1,
+  restore_fallback_vt: 1,
+  tty_path: "/dev/tty7",
+  container_root: "/var/lib/machines/alpha-desktop/root",
+  container_compositor_path: "/home/user/cosmix-comp-gate",
+  drm_device: "/dev/dri/card0",
+  drm_connector: "HDMI-A-1",
+  capture_dir: "/home/user/cosmix-capture"
+}

@@ -1,0 +1,11 @@
+-- Private workstation inputs for syncthing-bus-bridge.mix. Copy this file to
+-- syncthing-bus-bridge.conf.mix in the private control hub and replace the
+-- placeholders with the Syncthing and Bus layout for that workstation.
+syncthing_bus_bridge: {
+  schema_version: 1,
+  endpoint: "http://127.0.0.1:8384",
+  syncthing_config_path: "/home/user/.config/syncthing/config.xml",
+  checkpoint_path: "/home/user/.local/state/cosmix/syncthing-bus-bridge.since",
+  conflict_marker: ".conflict-",
+  status_topic: "file.transfer-status"
+}

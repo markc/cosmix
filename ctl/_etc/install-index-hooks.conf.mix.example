@@ -1,0 +1,13 @@
+-- install-index-hooks.conf.mix.example — private workstation repositories.
+-- Copy this file to install-index-hooks.conf.mix in the private control hub
+-- and replace the placeholders. Repository names resolve below home_dir as
+-- dot-prefixed directories; variants select tracked post-commit hook bodies.
+install_index_hooks: {
+  schema_version: 1,
+  home_dir: "/home/user",
+  repositories: [
+    {name: "alpha", variant: "knowledge"},
+    {name: "beta", variant: "code"},
+    {name: "gamma", variant: "hub"}
+  ]
+}

@@ -1,0 +1,111 @@
+#!/usr/bin/env mix
+-- jsonl_tail.mix — print one summary line per recent Claude Code session
+-- JSONL record.
+--
+--   mix <hub>/_bin/jsonl_tail.mix <path-to-jsonl> [n=20]
+--
+-- Output columns: <iso-timestamp>  <role>  <preview>
+-- Records without `message.role` (system and summary markers) are skipped.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$PREVIEW_MAX = 200
+
+-- Collapse tool-result text blocks to a single string.
+fn flatten_text($value)
+  if $value == nil then
+    return ""
+  end
+  if type($value) == "string" then
+    return $value
+  end
+  if type($value) == "list" then
+    $out = ""
+    for each $block in $value
+      if $block["type"] == "text" then
+        if length($out) > 0 then
+          $out = $out .. " "
+        end
+        $out = $out .. $block["text"]
+      end
+    end
+    return $out
+  end
+  return ""
+end
+
+-- Collapse message content to one line and cap it at PREVIEW_MAX characters.
+fn preview($content)
+  if $content == nil then
+    return ""
+  end
+
+  $summary = ""
+  if type($content) == "string" then
+    $summary = $content
+  end
+  if type($content) == "list" then
+    $parts = []
+    for each $block in $content
+      $kind = $block["type"]
+      if $kind == "text" then
+        push($parts, $block["text"] or "")
+      end
+      if $kind == "tool_use" then
+        push($parts, "[tool " .. ($block["name"] or "?") .. "]")
+      end
+      if $kind == "tool_result" then
+        push($parts, "[result] " .. flatten_text($block["content"]))
+      end
+      if $kind != "text" and $kind != "tool_use" and $kind != "tool_result" then
+        push($parts, "[" .. ($kind or "?") .. "]")
+      end
+    end
+    $summary = join($parts, " || ")
+  end
+
+  $summary = replace($summary, "\n", " ")
+  $summary = replace($summary, "\r", " ")
+  if length($summary) > $PREVIEW_MAX then
+    $summary = substr($summary, 0, $PREVIEW_MAX - 1) .. "…"
+  end
+  return $summary
+end
+
+$argv = args()
+if length($argv) < 1 then
+  print("usage: mix " .. $d.hub_root() .. "/_bin/jsonl_tail.mix <path-to-jsonl> [n=20]")
+  exit(2)
+end
+
+$path = $argv[0]
+$count = 20
+if length($argv) > 1 then
+  $count = to_number($argv[1])
+end
+
+$lines = split(read_file($path), "\n")
+$total = length($lines)
+-- A final newline creates an empty split element; exclude it so count means
+-- real records.
+if $total > 0 and length($lines[$total - 1]) == 0 then
+  $total = $total - 1
+end
+
+$start = $total - $count
+if $start < 0 then
+  $start = 0
+end
+
+$index = $start
+while $index < $total
+  $line = $lines[$index]
+  if length($line) > 0 then
+    $record = json_parse($line)
+    $message = $record["message"]
+    if $message != nil and $message["role"] != nil then
+      print(($record["timestamp"] or "") .. "  " .. $message["role"] .. "  " .. preview($message["content"]))
+    end
+  end
+  $index = $index + 1
+end

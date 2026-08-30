@@ -1,0 +1,31 @@
+-- Private hub configuration for maildir_import.mix.
+-- Copy this file to `_etc/maildir_import.conf.mix` in the control hub and
+-- replace every placeholder with site values. Store the password itself only
+-- in the named file on the target node.
+maildir_import: {
+  schema_version: 1,
+  jobs: {
+    legacy_inbox: {
+      node: "alpha",
+      maildir_root: "/home/user/Maildir",
+      account: "user@example.org",
+      password_file: "/home/user/.config/cosmix/mail-import.password",
+      manifest_file: "/home/user/.local/state/cosmix/mail-import.manifest",
+      role: "inbox",
+      session_url: "https://mail.example.org/.well-known/jmap",
+      ssl_verify: false,
+      routes: [
+        {
+          public_origin: "https://mail.example.org",
+          connect_origin: "https://192.0.2.10",
+          host_header: "mail.example.org"
+        },
+        {
+          public_origin: "https://upload.example.org",
+          connect_origin: "https://192.0.2.10",
+          host_header: "upload.example.org"
+        }
+      ]
+    }
+  }
+}

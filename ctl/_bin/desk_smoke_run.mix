@@ -57,8 +57,7 @@ try
     foot_bin: {type: "string", nonblank: true},
     drm_device: {type: "string", nonblank: true},
     drm_connector: {type: "string", nonblank: true},
-    log_dir: {type: "string", nonblank: true},
-    staged_comp: {type: "string", nonblank: true}
+    log_dir: {type: "string", nonblank: true}
   })
 catch $error
   print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
@@ -76,10 +75,17 @@ $DEVICE = $CONF["drm_device"]
 $CONN = $CONF["drm_connector"]
 $LOGDIR = $CONF["log_dir"]
 
-if starts_with($CONF["staged_comp"], "/") or contains($CONF["staged_comp"], "..") then
-  usage("staged_comp must be a path relative to $COSMIX without '..'")
+-- deploy_lib locates the main Cargo workspace only. Desktop is a separate
+-- workspace, so its release artefacts need the same CARGO_TARGET_DIR rule
+-- rooted at src/desktop when no override is set.
+fn desktop_bin($name)
+  $target = env("CARGO_TARGET_DIR")
+  if $target != "" then
+    return $target .. "/release/" .. $name
+  end
+  return $d.cosmix_root() .. "/src/desktop/target/release/" .. $name
 end
-$STAGED_COMP = $d.cosmix_root() .. "/" .. $CONF["staged_comp"]
+$STAGED_COMP = desktop_bin("cosmix-comp")
 $COMP = "/opt/cosmix/bin/cosmix-comp"
 $FILEMGR = "/opt/cosmix/bin/cosmix-filemgr"
 $QUOIN = "/opt/cosmix/bin/cosmix-quoin-demo"

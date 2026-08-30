@@ -21,7 +21,7 @@ fn load_secret($explicit_file)
     $path = "" .. $explicit_file
   end
   if $path == "" then
-    print("ERROR: no provisiond secret source (need --secret-file, CT_SECRET_FILE, or CREDENTIALS_DIRECTORY/provisiond_secret)")
+    print('ERROR: no provisiond secret source (need --secret-file, CT_SECRET_FILE, or $CREDENTIALS_DIRECTORY/provisiond_secret)')
     exit(1)
   end
   if not is_file($path) then

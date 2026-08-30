@@ -46,7 +46,26 @@ end
 $MAIL_ROSTER = {mesh: [], foreign: [], all: $configured, order: nil}
 $parsed = $d.parse_nodes($MAIL_ROSTER, args(), [])
 $requested = $parsed["nodes"]
-$nodes = $d.order_subset($ROSTER, $requested)
+$requested_mesh = []
+$requested_foreign = []
+for each $node in $requested
+  if $d.is_foreign($ROSTER, $node) then
+    push($requested_foreign, $node)
+  else
+    push($requested_mesh, $node)
+  end
+end
+$nodes = []
+if $ROSTER["order"] != nil then
+  $nodes = $d.order_subset($ROSTER, $requested)
+else
+  if len($requested_mesh) > 0 then
+    $nodes = $d.order_subset($ROSTER, $requested_mesh)
+  end
+  for each $node in $requested_foreign
+    push($nodes, $node)
+  end
+end
 $d.die_if(len($nodes) != len($requested),
   "mail node selection contains a duplicate or a node absent from fleet rollout order")
 

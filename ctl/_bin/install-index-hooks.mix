@@ -1,0 +1,209 @@
+#!/usr/bin/env mix
+-- install-index-hooks.mix — install the tracked post-commit indexd hooks.
+--
+--   mix _bin/install-index-hooks.mix             install or refresh all repos
+--   mix _bin/install-index-hooks.mix --status    report, change nothing
+--   mix _bin/install-index-hooks.mix --force     preserve and replace a hook
+--                                                without our ownership marker
+--   mix _bin/install-index-hooks.mix alpha beta  limit to named repos
+--
+-- Repository names, variants, and the workstation home are private operator
+-- state. The hook bodies remain tracked under _bin/git-hooks in the hub.
+-- Git resolves the effective hooks directory so core.hooksPath is honoured.
+-- Markerless hooks are refused unless --force preserves the old hook first;
+-- accepted writes are staged beside the target and renamed atomically.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$MARKER = "cosmix-index-hook"
+$CONF_PATH = $d.hub_root() .. "/_etc/install-index-hooks.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no index-hook installer config at " .. $CONF_PATH ..
+    " — create it from install-index-hooks.conf.mix.example")
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  if type($loaded) != "map" or type($loaded["install_index_hooks"]) != "map" then
+    config_error("must contain an install_index_hooks strict-data map")
+  end
+  $CONF = validate($loaded["install_index_hooks"], {
+    schema_version: {type: "integer", enum: [1]},
+    home_dir: {type: "string", nonblank: true},
+    repositories: {
+      type: "list",
+      min_length: 1,
+      items: {
+        type: "map",
+        schema: {
+          name: {type: "string", nonblank: true},
+          variant: {type: "string", enum: ["knowledge", "code", "hub"]}
+        }
+      }
+    }
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+if not starts_with($CONF["home_dir"], "/") then
+  config_error("home_dir must be an absolute path")
+end
+
+fn find_repo($repositories, $name)
+  $found = nil
+  for each $repo in $repositories
+    if $repo["name"] == $name then
+      if $found != nil then
+        config_error("duplicate repository name '" .. $name .. "'")
+      end
+      $found = $repo
+    end
+  end
+  return $found
+end
+
+for each $repo in $CONF["repositories"]
+  $name = $repo["name"]
+  if not regex_match("^[A-Za-z0-9][A-Za-z0-9._-]*$", $name) then
+    config_error("repository name '" .. $name .. "' is not a safe home-directory basename")
+  end
+  find_repo($CONF["repositories"], $name)
+end
+
+$status_only = false
+$force = false
+$only = []
+for each $arg in args()
+  if $arg == "--status" then
+    $status_only = true
+  else
+    if $arg == "--force" then
+      $force = true
+    else
+      if find_repo($CONF["repositories"], $arg) != nil then
+        push($only, $arg)
+      else
+        print("install-index-hooks: unknown arg/repo '" .. $arg .. "'")
+        exit(2)
+      end
+    end
+  end
+end
+
+fn selected($names, $name)
+  if len($names) == 0 then
+    return true
+  end
+  for each $candidate in $names
+    if $candidate == $name then
+      return true
+    end
+  end
+  return false
+end
+
+fn head_has_marker($content)
+  -- Ownership is positional: a hook that merely mentions the marker in prose
+  -- is foreign. Tracked templates put it at the start of line two.
+  $lines = split($content, "\n")
+  if len($lines) < 2 then
+    return false
+  end
+  return pos("-- " .. $MARKER, $lines[1]) == 1
+end
+
+$SOURCE_DIR = $d.hub_root() .. "/_bin/git-hooks"
+$changed = 0
+$failed = 0
+for each $repo_conf in $CONF["repositories"]
+  $name = $repo_conf["name"]
+  if not selected($only, $name) then
+    continue
+  end
+
+  $variant = $repo_conf["variant"]
+  $repo = $CONF["home_dir"] .. "/." .. $name
+  $template = $SOURCE_DIR .. "/post-commit." .. $variant
+  $label = "~/." .. $name .. " (" .. $variant .. ")"
+  if not is_dir($repo) then
+    print("  SKIP  " .. $label .. " — no such directory")
+    continue
+  end
+  if not is_file($template) then
+    print("  FAIL  " .. $label .. " — hook template missing: " .. $template)
+    $failed = $failed + 1
+    continue
+  end
+
+  $result = run_argv(["git", "-C", $repo, "rev-parse", "--path-format=absolute", "--git-path", "hooks"])
+  if $result["exit_code"] != 0 then
+    print("  FAIL  " .. $label .. " — not a git repo? " .. trim($result["stderr"]))
+    $failed = $failed + 1
+    continue
+  end
+
+  $hooks_dir = trim($result["stdout"])
+  $target = $hooks_dir .. "/post-commit"
+  $wanted = read_file($template)
+  $state = "install"
+  if is_file($target) then
+    $have = read_file($target)
+    if $have == $wanted then
+      $state = "unchanged"
+    else
+      if head_has_marker($have) then
+        $state = "update"
+      else
+        $state = "foreign"
+      end
+    end
+  end
+
+  if $status_only then
+    print("  " .. $state .. "  " .. $label .. " -> " .. $target)
+    continue
+  end
+  if $state == "unchanged" then
+    print("  unchanged  " .. $label)
+    continue
+  end
+  if $state == "foreign" and not $force then
+    print("  REFUSE  " .. $label .. " — existing hook lacks the " .. $MARKER ..
+      " marker; re-run with --force to preserve it as post-commit.pre-index" ..
+      " and overwrite")
+    $failed = $failed + 1
+    continue
+  end
+  if $state == "foreign" then
+    copy($target, $target .. ".pre-index")
+    print("  (preserved foreign hook as " .. $target .. ".pre-index)")
+  end
+  if not is_dir($hooks_dir) then
+    mkdir($hooks_dir)
+  end
+  $temporary = $target .. ".index-tmp"
+  remove($temporary)
+  write_new($temporary, $wanted, 0o755)
+  rename($temporary, $target)
+  print("  " .. $state .. "  " .. $label .. " -> " .. $target)
+  $changed = $changed + 1
+end
+
+if $status_only then
+  print("install-index-hooks: status only — nothing changed")
+else
+  print("install-index-hooks: " .. ("" .. $changed) .. " hook(s) written, " ..
+    ("" .. $failed) .. " failure(s)")
+end
+if $failed > 0 then
+  exit(1)
+end

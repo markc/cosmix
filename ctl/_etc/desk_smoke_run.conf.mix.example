@@ -11,6 +11,5 @@ desk_smoke_run: {
   foot_bin: "/usr/bin/foot",
   drm_device: "/dev/dri/card0",
   drm_connector: "DP-1",
-  log_dir: "/home/user/.local/state/cosmix/desk-smoke",
-  staged_comp: "src/desktop/target/release/cosmix-comp"
+  log_dir: "/home/user/.local/state/cosmix/desk-smoke"
 }
