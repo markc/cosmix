@@ -30,6 +30,32 @@ use crate::types::IncomingCommand;
 type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 type PendingMap = HashMap<String, oneshot::Sender<BusMessage>>;
 
+/// Abort a spawned task if construction is cancelled before ownership of the
+/// task has safely transferred to the returned client.
+struct AbortOnDrop {
+    handle: Option<tokio::task::AbortHandle>,
+}
+
+impl AbortOnDrop {
+    fn new(handle: tokio::task::AbortHandle) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.handle = None;
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 /// RAII removal guard for an entry in [`NodedClient::pending`].
 ///
 /// Inserting a `(id, oneshot::Sender)` entry into the pending-request map
@@ -145,6 +171,11 @@ impl NodedClient {
             reader_connected,
             reader_service,
         ));
+        // `register()` awaits a broker response after the reader has taken the
+        // socket's read half. If an outer timeout drops this connect future,
+        // the half-built `NodedClient` alone cannot abort that detached reader.
+        // Keep an independent abort handle armed until registration succeeds.
+        let mut reader_guard = AbortOnDrop::new(reader_handle.abort_handle());
 
         let client = Self {
             service_name: RwLock::new(service_name.to_string()),
@@ -169,6 +200,8 @@ impl NodedClient {
             client.close().await;
             return Err(e);
         }
+
+        reader_guard.disarm();
 
         Ok(client)
     }
@@ -907,5 +940,48 @@ mod pending_guard_tests {
              harmless — covers the response-path-faster-than-disarm \
              race and the explicit-no-insert test setup"
         );
+    }
+}
+
+#[cfg(test)]
+mod connect_cancellation_tests {
+    use super::*;
+    use std::time::Duration;
+
+    use futures_util::StreamExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio_tungstenite::accept_async;
+
+    #[tokio::test]
+    async fn cancelling_registration_aborts_reader_and_closes_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (register_seen_tx, register_seen_rx) = oneshot::channel();
+        let (disconnected_tx, disconnected_rx) = oneshot::channel();
+        let broker = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            let request = websocket.next().await.expect("registration request");
+            assert!(request.is_ok());
+            let _ = register_seen_tx.send(());
+            // Deliberately withhold the registration response. Dropping the
+            // connect future must still close this socket promptly.
+            let _ = websocket.next().await;
+            let _ = disconnected_tx.send(());
+        });
+
+        let connect = tokio::spawn(async move {
+            NodedClient::connect("cancelled-service", &format!("ws://{address}")).await
+        });
+        register_seen_rx.await.unwrap();
+        connect.abort();
+        let _ = connect.await;
+
+        tokio::time::timeout(Duration::from_secs(60), disconnected_rx)
+            .await
+            .expect("cancelled connect must not retain the reader/socket")
+            .unwrap();
+        broker.await.unwrap();
     }
 }

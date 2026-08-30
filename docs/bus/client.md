@@ -14,6 +14,13 @@ registers the service name with `noded.register`. `connect_with_provenance`
 also sends a `RegisterProvenance` record, while `connect_anonymous` opens a
 call-capable connection without registering a name.
 
+Named connection setup is cancellation-safe. If an outer timeout or task
+cancellation drops the connect future while `noded.register` is awaiting its
+reply, the half-built client's socket reader is aborted and the socket closes;
+retries cannot accumulate orphan reader tasks. Once a client has been returned,
+call `close()` for deterministic teardown because plain drop does not abort its
+long-lived reader.
+
 Incoming non-response messages become `IncomingCommand` values. They expose
 `from`, `command`, `id`, parsed JSON `args`, the original body, and every Bus
 header. A client takes the incoming receiver once with `incoming()` or

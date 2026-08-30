@@ -1,0 +1,25 @@
+# ~/.config/systemd/user/cosmix-powerd.service
+#
+# UPower is read from the system D-Bus, while the Cosmix Bus connection belongs
+# to the logged-in session. The SPEC-10 cosmix-powerd row reserves daemon and
+# namespace identity; this user unit deliberately runs as the session user.
+#
+# Install:  cp this -> ~/.config/systemd/user/cosmix-powerd.service
+#           systemctl --user daemon-reload
+#           systemctl --user enable --now cosmix-powerd
+
+[Unit]
+Description=Cosmix battery and power citizen
+Documentation=https://cosmix.dev/cos/powerd
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/opt/cosmix/bin/cosmix-powerd serve
+Restart=on-failure
+RestartSec=60s
+TimeoutStopSec=75s
+
+[Install]
+WantedBy=graphical-session.target

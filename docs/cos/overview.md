@@ -37,6 +37,7 @@ Pick any component in the sidebar for its own page.
 - **[indexd](indexd.md)** — vector knowledge base; auto-indexes workspaces on commit and powers agent recall.
 - **[disp-skia](disp-skia.md)** — Skia display compositor rendering a markdown-over-Bus UI: the desktop surface.
 - **[agentd](agentd.md)** — agent supervision.
+- **[powerd](powerd.md)** — event-driven UPower battery and power-source state.
 
 ### Bridge & libraries
 

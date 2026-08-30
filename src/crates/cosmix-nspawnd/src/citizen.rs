@@ -1,7 +1,7 @@
 //! SPEC-10 daemon identity legibility surface.
 
 pub const BUS_SERVICE: &str = "nspawnd";
-const SPEC10_VERSION: &str = "1.4.4";
+const SPEC10_VERSION: &str = "1.4.5";
 const DAEMON_NAME: &str = "cosmix-nspawnd";
 const DAEMON_UID: u32 = 518;
 const DAEMON_GID: u32 = 518;

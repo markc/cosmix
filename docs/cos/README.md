@@ -28,6 +28,7 @@ exhaustive manpages. For the language that drives these daemons, see the
 - **[disp-skia](disp-skia.md)** — Skia display compositor; the desktop surface.
 - **[cosmix-comp](cosmix-comp.md)** — Wayland compositor and supported protocol globals.
 - **[agentd](agentd.md)** — agent supervision.
+- **[powerd](powerd.md)** — event-driven UPower battery and power state.
 
 ## Bridge & libraries
 

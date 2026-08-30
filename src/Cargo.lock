@@ -1235,7 +1235,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-client"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",
@@ -1858,6 +1858,23 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+ "zbus",
+]
+
+[[package]]
+name = "cosmix-powerd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cosmix-lib-buildinfo",
+ "cosmix-lib-bus",
+ "cosmix-lib-client",
+ "cosmix-lib-config",
+ "cosmix-lib-props-core",
+ "futures-util",
+ "serde_json",
+ "tokio",
  "zbus",
 ]
 

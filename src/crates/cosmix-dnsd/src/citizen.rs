@@ -8,7 +8,7 @@
 //! mechanisms, none of which is bespoke Rust code in the daemon:
 //!
 //!   1. the shared sysusers fragment `src/_etc/sysusers/cosmix.conf`
-//!      (provisions `cosmix-dnsd` UID/GID 506, SPEC-10 v1.4.4);
+//!      (provisions `cosmix-dnsd` UID/GID 506, SPEC-10 v1.4.5);
 //!   2. the systemd unit's `User=cosmix-dnsd`/`Group=cosmix-dnsd`
 //!      (the kernel sets euid/egid *before* this process runs — landed
 //!      in P2-D alongside `StateDirectory=cosmix/dnsd`);
@@ -89,14 +89,14 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-/// SPEC-10 v1.4.4 registered daemon-identity facts for `cosmix-dnsd`.
+/// SPEC-10 v1.4.5 registered daemon-identity facts for `cosmix-dnsd`.
 /// These MUST track SPEC-10 Appendix A / §2.2 / §9.3 exactly. Drift is
 /// caught two ways: the registry-generic `spec10_postcheck.mix` lint
 /// out of process, and the unit test below cross-checking these
 /// constants against the checked-in `src/_etc/sysusers/cosmix.conf`
 /// projection (so a registry renumber/rename trips `cargo test`, not
 /// only the Mix gate).
-const SPEC10_VERSION: &str = "1.4.4";
+const SPEC10_VERSION: &str = "1.4.5";
 const DAEMON_NAME: &str = "cosmix-dnsd";
 const DAEMON_UID: u32 = 506;
 /// SPEC-10 §2.2: every daemon-identity row has GID == UID.
@@ -375,7 +375,7 @@ mod tests {
             .expect("checked-in sysusers fragment must be readable from the workspace");
 
         // Header line pins the registry version the fragment was
-        // generated from: `... cosmix-daemon-identity v1.4.4.`
+        // generated from: `... cosmix-daemon-identity v1.4.5.`
         let version = conf
             .lines()
             .find_map(|l| l.split("cosmix-daemon-identity v").nth(1))
