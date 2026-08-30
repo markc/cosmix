@@ -1,0 +1,209 @@
+#!/usr/bin/env mix
+-- smoke_chrome_shaders.mix — prove the compositor's chrome shaders on a GPU.
+--
+-- This workstation-only gate starts cage with a headless backend, launches a
+-- decorated foot toplevel, and requires positive evidence that server-side
+-- chrome was created around a mapped surface before accepting quiet shader
+-- logs. It never reads the fleet roster or contacts the mesh.
+--
+-- Usage:
+--   mix _bin/smoke_chrome_shaders.mix
+--   SMOKE_CHROME_STYLES="cosmix win11" mix _bin/smoke_chrome_shaders.mix
+--
+-- Exit 0 means every requested style drew chrome without a shader or ERROR
+-- diagnostic. Exit 1 means at least one style failed. Configuration refusals
+-- exit 2.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/smoke_chrome_shaders.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no chrome shader smoke config at " .. $CONF_PATH ..
+    " — create it from smoke_chrome_shaders.conf.mix.example")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["smoke_chrome_shaders"], {
+    schema_version: {type: "integer", enum: [1]},
+    evidence_dir: {type: "string", nonblank: true}
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+$LOG_DIR = $CONF["evidence_dir"]
+if not starts_with($LOG_DIR, "/") or not regex_match("^[A-Za-z0-9/._-]+$", $LOG_DIR) then
+  print("  ERROR: " .. $CONF_PATH ..
+    ": smoke_chrome_shaders.evidence_dir must be an absolute path containing only [A-Za-z0-9/._-]")
+  exit(2)
+end
+
+-- deploy_lib resolves the main Cargo workspace. The desktop is a separate
+-- workspace, but an explicit CARGO_TARGET_DIR still has Cargo-wide meaning.
+fn desktop_bin($name)
+  if env("CARGO_TARGET_DIR") != "" then
+    return $d.cosmix_bin($name)
+  end
+  return $d.cosmix_root() .. "/src/desktop/target/release/" .. $name
+end
+
+$COMP = desktop_bin("cosmix-comp")
+$STYLES_RAW = env("SMOKE_CHROME_STYLES", "cosmix win11 mac")
+$ALLOWED_STYLES = ["cosmix", "win11", "mac"]
+$styles = []
+for each $style in split(trim($STYLES_RAW), " ")
+  if $style != "" then
+    if not contains($ALLOWED_STYLES, $style) then
+      print("  ERROR: SMOKE_CHROME_STYLES contains unsupported style '" .. $style ..
+        "' — valid: " .. join($ALLOWED_STYLES, " "))
+      exit(2)
+    end
+    push($styles, $style)
+  end
+end
+if len($styles) == 0 then
+  print("  ERROR: SMOKE_CHROME_STYLES selected no styles")
+  exit(2)
+end
+
+$XDG = env("XDG_RUNTIME_DIR")
+if $XDG == "" then
+  print("  ERROR: XDG_RUNTIME_DIR is unset; cage has nowhere to bind its socket")
+  exit(1)
+end
+$d.die_if(not is_file($COMP) or not access($COMP, "x"),
+  "missing executable " .. $COMP .. " — build the desktop release target first")
+
+$CAGE = which("cage")
+$FOOT = which("foot")
+$SLEEP = which("sleep")
+$SYSTEMD_RUN = which("systemd-run")
+$SYSTEMCTL = which("systemctl")
+$d.die_if($CAGE == nil, "no executable cage found on PATH")
+$d.die_if($FOOT == nil, "no executable foot found on PATH")
+$d.die_if($SLEEP == nil, "no executable sleep found on PATH")
+$d.die_if($SYSTEMD_RUN == nil, "no executable systemd-run found on PATH")
+$d.die_if($SYSTEMCTL == nil, "no executable systemctl found on PATH")
+
+mkdir($LOG_DIR, {parents: true})
+
+-- Run one style end to end and return a result map. A failed style does not
+-- stop later styles: the final verdict reports the complete requested set.
+fn smoke($style)
+  $suffix = $style .. "-" .. to_string(pid())
+  $socket = "cosmix-chrome-smoke-" .. $suffix
+  $socket_path = $XDG .. "/" .. $socket
+  $log = $LOG_DIR .. "/smoke-" .. $style .. ".log"
+  $unit = "cosmix-chrome-smoke-" .. $suffix
+  $failure = ""
+  $started = false
+
+  remove($socket_path)
+  write_file($log, "")
+
+  try
+    -- Mix has no argv-form background-process primitive. A transient user unit
+    -- supplies concurrency without a shell and kills the whole cage process
+    -- group after 60 seconds even if this script is interrupted.
+    $launch = run_argv([
+      $SYSTEMD_RUN, "--user", "--quiet", "--collect", "--unit=" .. $unit,
+      "--property=Type=exec",
+      "--property=RuntimeMaxSec=60s",
+      "--property=KillSignal=KILL",
+      "--property=KillMode=control-group",
+      "--property=StandardOutput=append:" .. $log,
+      "--property=StandardError=append:" .. $log,
+      "--setenv=WLR_BACKENDS=headless",
+      "--setenv=WLR_LIBINPUT_NO_DEVICES=1",
+      "--setenv=WLR_RENDERER_ALLOW_SOFTWARE=1",
+      "--setenv=RUST_LOG=info,cosmix_comp::protocol::handlers=debug",
+      "--setenv=XDG_RUNTIME_DIR=" .. $XDG,
+      "--", $CAGE, "--", $COMP, "--nested", "--no-keybindings",
+      "--socket", $socket, "--chrome", $style
+    ], {timeout: 15})
+    if $launch["exit_code"] != 0 then
+      $failure = "could not start headless compositor unit: " ..
+        trim($launch["stdout"]) .. " " .. trim($launch["stderr"])
+    else
+      $started = true
+      $deadline = time() + 30
+      while time() < $deadline and not exists($socket_path) do
+        sleep(0.5)
+      end
+      if not exists($socket_path) then
+        $failure = "compositor never came up (no socket); see " .. $log
+      else
+        -- foot directly execs sleep; no shell participates. Its result remains
+        -- deliberately non-gating because the compositor log carries the
+        -- positive decoration and mapped-buffer proofs.
+        $_client = run_argv([$FOOT, $SLEEP, "8"], {
+          env: {WAYLAND_DISPLAY: $socket},
+          timeout: 15
+        })
+        sleep(2)
+      end
+    end
+  finally
+    if $started then
+      $_stop = run_argv([$SYSTEMCTL, "--user", "stop", $unit .. ".service"], {timeout: 15})
+    end
+    remove($socket_path)
+  end
+
+  if $failure != "" then
+    return {style: $style, ok: false, why: $failure}
+  end
+  if not is_file($log) then
+    return {style: $style, ok: false, why: "compositor log was not created: " .. $log}
+  end
+
+  -- tracing colours field names and separators independently; strip ANSI
+  -- sequences before looking for exact positive evidence.
+  $text = regex_replace("\u{1b}\\[[0-9;]*m", read_file($log), "")
+
+  -- Positive gate 1: without an acknowledged server-side decoration there is
+  -- no chrome entity, so an otherwise quiet log proves nothing.
+  if pos("acknowledged_decoration=Some(ServerSide)", $text) == 0 then
+    return {style: $style, ok: false,
+      why: "client never acked ServerSide decorations — chrome was never spawned; see " .. $log}
+  end
+
+  -- Positive gate 2: a buffer must land so the toplevel mapped and gave the
+  -- decoration pass something to draw around.
+  if pos("first surface buffer committed", $text) == 0 then
+    return {style: $style, ok: false,
+      why: "no surface buffer committed — toplevel never mapped; see " .. $log}
+  end
+
+  if pos("failed to process shader", $text) > 0 then
+    return {style: $style, ok: false, why: "SHADER COMPILATION FAILED; see " .. $log}
+  end
+  if pos("ERROR", $text) > 0 then
+    return {style: $style, ok: false, why: "compositor logged an ERROR; see " .. $log}
+  end
+
+  return {style: $style, ok: true, why: "chrome drawn, shaders compiled; " .. $log}
+end
+
+$results = map($styles, function($style) = smoke($style))
+$failed = 0
+for each $result in $results
+  if $result["ok"] then
+    print("ok    " .. $result["style"] .. ": " .. $result["why"])
+  else
+    print("FAIL  " .. $result["style"] .. ": " .. $result["why"])
+    $failed = $failed + 1
+  end
+end
+
+if $failed > 0 then
+  print("")
+  print(to_string($failed) .. " of " .. to_string(len($results)) .. " chrome styles failed")
+  exit(1)
+end
+print("")
+print("all " .. to_string(len($results)) .. " chrome styles compiled and drew chrome")

@@ -1,0 +1,12 @@
+-- gallery_spike_render.conf.mix.example — private local gallery paths.
+-- Copy this file to gallery_spike_render.conf.mix in the private control hub.
+{
+  gallery_spike_render: {
+    schema_version: 1,
+
+    -- SQLite media index to read and directory to receive generated HTML.
+    -- The renderer expects thumbnails and previews below output_dir/cache/.
+    database_path: "/home/user/media/gallery-spike/index.db",
+    output_dir: "/home/user/media/gallery-spike/gallery"
+  }
+}

@@ -1,0 +1,19 @@
+-- smoke_desktop_nested.conf.mix.example — private local nested-smoke values.
+-- Copy this file to smoke_desktop_nested.conf.mix in the private control hub
+-- and adapt every value to the developer workstation. The smoke tool drives a
+-- live nested compositor and GPU; do not run it merely to test this template.
+{
+  smoke_desktop_nested: {
+    schema_version: 1,
+
+    -- Non-CosMix client used to prove server-side decoration negotiation.
+    foot_bin: "/usr/bin/foot",
+
+    -- Local evidence directory and Wayland socket reserved for this smoke.
+    log_dir: "/tmp/cosmix-desktop-nested",
+    socket: "cosmix-example",
+
+    -- The protocol handler debug target is required by the SSD gate.
+    rust_log: "info,cosmix_comp::protocol::handlers=debug"
+  }
+}

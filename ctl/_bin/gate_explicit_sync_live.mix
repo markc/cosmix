@@ -1,0 +1,294 @@
+#!/usr/bin/env mix
+-- gate_explicit_sync_live.mix — live DRM explicit-sync syscall gate.
+--
+--   mix _bin/gate_explicit_sync_live.mix <test-filter> \
+--       [set-master-count] [required-ioctl,...] [contact|no-contact]
+--
+-- This is a workstation-local gate. It builds the explicit-sync live tests,
+-- traces their DRM access, and proves that the test touched only the configured
+-- render node with the expected request policy. It drives a real GPU when run.
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn config_error($message)
+  print("  ERROR: " .. $message)
+  exit(2)
+end
+
+fn has_str($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn assert_only_keys($value, $allowed, $where)
+  if type($value) != "map" then
+    config_error($where .. " must be a map")
+  end
+  for each $key in keys($value)
+    if not has_str($allowed, $key) then
+      config_error($where .. " contains unknown key '" .. $key .. "'")
+    end
+  end
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/gate_explicit_sync_live.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no gate_explicit_sync_live configuration at " .. $CONF_PATH)
+  print("         copy _etc/gate_explicit_sync_live.conf.mix.example there and set this workstation's values")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  assert_only_keys($loaded, ["gate_explicit_sync_live"], $CONF_PATH)
+  $CONF = validate($loaded["gate_explicit_sync_live"], {
+    schema_version: {type: "integer", enum: [1]},
+    render_node: {type: "string", nonblank: true},
+    evidence_dir: {type: "string", nonblank: true}
+  })
+  assert_only_keys($CONF, [
+    "schema_version", "render_node", "evidence_dir"
+  ], "gate_explicit_sync_live")
+catch $e
+  config_error("invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+end
+
+$NODE = $CONF["render_node"]
+$EVIDENCE_DIR = $CONF["evidence_dir"]
+for each $path in [$NODE, $EVIDENCE_DIR]
+  if not starts_with($path, "/") then
+    config_error("gate_explicit_sync_live paths must be absolute (got '" .. $path .. "')")
+  end
+end
+
+$DESKTOP = $d.cosmix_root() .. "/src/desktop"
+$COMP = $DESKTOP .. "/crates/cosmix-comp"
+$FEATURE = "explicit-sync-live-test"
+
+$filter = $1
+$expect_master = 1
+if $2 != nil then
+  $expect_master = to_number($2)
+  if $expect_master == nil then
+    print("usage: set-master-count must be a number, got " .. $2)
+    exit(2)
+  end
+end
+$required = []
+if $3 != nil then
+  $required = split($3, ",")
+end
+
+-- Some live tests deliberately decline device exposure. Both contact states
+-- are asserted; neither becomes an unchecked arm.
+$contact = "contact"
+if $expect_master == 0 then
+  $contact = "no-contact"
+end
+if $4 != nil then
+  $contact = $4
+end
+if $contact != "contact" and $contact != "no-contact" then
+  print("usage: device-contact must be 'contact' or 'no-contact', got " .. $contact)
+  exit(2)
+end
+
+if $filter == nil then
+  print("usage: gate_explicit_sync_live.mix <test-filter> [set-master-count] [required-ioctl,...] [contact|no-contact]")
+  exit(2)
+end
+
+-- Refuse before spawning anything. The gate never discovers or substitutes a
+-- DRM node: the private workstation binding must identify one explicitly.
+if not exists($NODE) then
+  print("REFUSING: render node does not exist: " .. $NODE)
+  exit(2)
+end
+$st = stat($NODE)
+-- S_IFMT 0o170000 = 61440, S_IFCHR 0o020000 = 8192.
+if band($st.mode, 61440) != 8192 then
+  print("REFUSING: not a character device: " .. $NODE .. " mode=" .. $st.mode)
+  exit(2)
+end
+if not starts_with(basename($NODE), "renderD") then
+  print("REFUSING: not a render minor: " .. $NODE)
+  exit(2)
+end
+
+mkdir($EVIDENCE_DIR, {parents: true})
+
+-- Discover the binary from this build. A hardcoded hash could trace an older
+-- artefact and report a clean result about code that is no longer current.
+$build = run_argv(
+  ["memguard", "cargo", "test", "--no-run", "--features", $FEATURE],
+  {timeout: 1800, cwd: $COMP, max_output: 0}
+)
+if $build["exit_code"] != 0 then
+  print("BUILD FAILED exit=" .. $build["exit_code"])
+  print($build["stderr"])
+  exit(1)
+end
+
+$bins = []
+for each $line in split($build["stderr"], "\n")
+  if contains($line, "Executable") then
+    $open = split($line, "(")
+    if len($open) >= 2 then
+      $close = split($open[len($open) - 1], ")")
+      $bins = concat($bins, [trim($close[0])])
+    end
+  end
+end
+if len($bins) != 1 then
+  print("EXPECTED EXACTLY ONE TEST EXECUTABLE, GOT " .. len($bins))
+  for each $candidate in $bins
+    print("  " .. $candidate)
+  end
+  exit(1)
+end
+$bin = $bins[0]
+if not starts_with($bin, "/") then
+  $bin = $DESKTOP .. "/" .. $bin
+end
+
+$trace = $EVIDENCE_DIR .. "/strace.txt"
+-- -y anchors each fd to its path. Single-threaded libtest execution keeps the
+-- SET_MASTER count deterministic and the trace readable.
+$run = run_argv(
+  ["strace", "-f", "-y", "-o", $trace, "-e", "trace=openat,open,ioctl",
+   $bin, "--ignored", "--test-threads", "1", "--nocapture", $filter],
+  {timeout: 900, max_output: 0, env: {COSMIX_TEST_RENDER_NODE: $NODE}}
+)
+
+$lines = split(read_file($trace), "\n")
+$bad = 0
+
+print("binary=" .. basename($bin))
+print("node=" .. $NODE)
+print("exit=" .. $run["exit_code"] .. " trace_lines=" .. len($lines))
+
+if $run["exit_code"] != 0 then
+  print("FAIL: test run exited non-zero")
+  print($run["stdout"])
+  print($run["stderr"])
+  $bad = $bad + 1
+end
+if not contains($run["stdout"], "test result: ok.") then
+  print("FAIL: no passing test-result line — a binary that ran nothing proves nothing")
+  $bad = $bad + 1
+end
+-- Match libtest's exact empty-result wording. The substring "0 passed" also
+-- appears inside larger counts and would reject a real passing suite.
+if contains($run["stdout"], "ok. 0 passed") then
+  print("FAIL: filter '" .. $filter .. "' matched no test")
+  $bad = $bad + 1
+end
+$solibs = filter($lines, fn($line) = contains($line, "openat") and contains($line, ".so"))
+if len($solibs) == 0 then
+  print("FAIL: trace captured no .so openat — every zero below would be vacuous")
+  $bad = $bad + 1
+end
+
+-- SET_MASTER must occur and fail with EACCES when expected. DROP_MASTER must
+-- never be requested because a refused acquire cannot confer master status.
+$set_master = filter($lines, fn($line) = contains($line, "DRM_IOCTL_SET_MASTER"))
+$drop_master = filter($lines, fn($line) = contains($line, "DRM_IOCTL_DROP_MASTER"))
+print("set_master=" .. len($set_master) .. " (expect " .. $expect_master .. ") drop_master=" .. len($drop_master) .. " (expect 0)")
+
+if len($set_master) != $expect_master then
+  print("FAIL: SET_MASTER count is " .. len($set_master) .. ", expected " .. $expect_master)
+  for each $line in $set_master
+    print("    " .. $line)
+  end
+  $bad = $bad + 1
+end
+for each $line in $set_master
+  if not contains($line, "= -1 EACCES") then
+    print("FAIL: SET_MASTER did not fail with EACCES: " .. $line)
+    $bad = $bad + 1
+  end
+end
+if len($drop_master) != 0 then
+  print("FAIL: DROP_MASTER requested — something believed it held master")
+  for each $line in $drop_master
+    print("    " .. $line)
+  end
+  $bad = $bad + 1
+end
+
+-- Every DRM path and ioctl must remain on the configured render node.
+$dri = filter($lines, fn($line) = contains($line, "/dev/dri/"))
+$offnode = filter($dri, fn($line) = not contains($line, $NODE))
+print("dev_dri_lines=" .. len($dri) .. " off_node=" .. len($offnode) .. " expect=" .. $contact)
+if $contact == "contact" and len($dri) == 0 then
+  print("FAIL: no /dev/dri activity at all — this run never reached the device")
+  $bad = $bad + 1
+end
+if $contact == "no-contact" and len($dri) > 0 then
+  print("FAIL: expected no device contact, but the node was touched")
+  for each $line in $dri
+    print("    " .. $line)
+  end
+  $bad = $bad + 1
+end
+if len($offnode) > 0 then
+  print("FAIL: touched a DRM path other than " .. $NODE)
+  for each $line in $offnode
+    print("    " .. $line)
+  end
+  $bad = $bad + 1
+end
+
+$drm = filter($lines, fn($line) = contains($line, "DRM_IOCTL"))
+$unanchored = filter($drm, fn($line) = not contains($line, "<" .. $NODE .. ">"))
+print("drm_ioctl=" .. len($drm) .. " not_on_node=" .. len($unanchored))
+if len($unanchored) > 0 then
+  print("FAIL: DRM ioctl on an fd that is not " .. $NODE)
+  for each $line in $unanchored
+    print("    " .. $line)
+  end
+  $bad = $bad + 1
+end
+
+$forbidden = [
+  "DRM_IOCTL_MODE_",
+  "DRM_IOCTL_WAIT_VBLANK",
+  "DRM_IOCTL_ADD_CTX",
+  "DRM_IOCTL_LOCK",
+  "DRM_IOCTL_AGP_",
+  "DRM_IOCTL_SG_"
+]
+for each $family in $forbidden
+  $hits = filter($drm, fn($line) = contains($line, $family))
+  if len($hits) > 0 then
+    print("FAIL: forbidden request family " .. $family)
+    for each $line in $hits
+      print("    " .. $line)
+    end
+    $bad = $bad + 1
+  end
+end
+
+for each $need in $required
+  $request = trim($need)
+  if $request != "" then
+    $hits = filter($drm, fn($line) = contains($line, $request))
+    print("required " .. $request .. "=" .. len($hits))
+    if len($hits) == 0 then
+      print("FAIL: required request never issued: " .. $request)
+      $bad = $bad + 1
+    end
+  end
+end
+
+print("trace=" .. $trace)
+print("ESL_GATE_BAD=" .. $bad)
+if $bad > 0 then
+  exit(1)
+end
+exit(0)

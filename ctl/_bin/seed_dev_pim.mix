@@ -1,0 +1,316 @@
+#!/usr/bin/env mix
+-- seed_dev_pim.mix — seed one configured development mail account with
+-- contacts, calendar events and inbox messages for PIM presentation work.
+--
+--   mix _bin/seed_dev_pim.mix <password>
+--
+-- Every site fact lives in the private hub configuration. The password is a
+-- required runtime value and is passed to the selected node only as an
+-- ssh_mix binding. Re-running creates another batch, matching the old tool.
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn usage()
+  print("usage: mix _bin/seed_dev_pim.mix <password>")
+  exit(2)
+end
+
+fn conf_error($path, $message)
+  print("  ERROR: invalid " .. $path .. ": " .. $message)
+  exit(2)
+end
+
+fn valid_email($value)
+  return regex_match("^[A-Za-z0-9._+%-]+@[A-Za-z0-9.-]+$", $value)
+end
+
+-- Refuse before loading private state or making any network connection.
+$argv = args()
+if len($argv) != 1 or $argv[0] == "" then
+  usage()
+end
+$PASSWORD = $argv[0]
+
+$CONF_PATH = $d.hub_root() .. "/_etc/seed_dev_pim.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no development PIM seed configuration at " .. $CONF_PATH)
+  print("         copy _etc/seed_dev_pim.conf.mix.example there and replace every placeholder")
+  exit(2)
+end
+
+$CONF_DOC = nil
+try
+  $CONF_DOC = load_data($CONF_PATH)
+catch $message
+  conf_error($CONF_PATH, "invalid strict-data config: " .. $message)
+end
+if type($CONF_DOC) != "map" then
+  conf_error($CONF_PATH, "must contain a strict-data map")
+end
+
+$CONF = nil
+try
+  $CONF = validate($CONF_DOC["seed_dev_pim"], {
+    schema_version: {type: "integer", enum: [1]},
+    node: {type: "string", nonblank: true},
+    account_email: {type: "string", nonblank: true},
+    jmap_port: {type: "integer", min: 1, max: 65535},
+    smtp_port: {type: "integer", min: 1, max: 65535},
+    ssl_verify: {type: "bool"},
+    contacts: {type: "list", min_length: 1, items: {type: "map", schema: {
+      full_name: {type: "string", nonblank: true},
+      email: {type: "string", nonblank: true},
+      company: {type: "string"},
+      phone: {type: "string", nonblank: true}
+    }}},
+    events: {type: "list", min_length: 1, items: {type: "map", schema: {
+      title: {type: "string", nonblank: true},
+      start: {type: "string", nonblank: true},
+      end: {type: "string", nonblank: true}
+    }}},
+    messages: {type: "list", min_length: 1, items: {type: "map", schema: {
+      from: {type: "string", nonblank: true},
+      subject: {type: "string", nonblank: true},
+      date: {type: "string", nonblank: true},
+      body: {type: "string", nonblank: true}
+    }}}
+  })
+catch $message
+  conf_error($CONF_PATH, "invalid seed_dev_pim map: " .. $message)
+end
+
+if not valid_email($CONF["account_email"]) then
+  conf_error($CONF_PATH, "seed_dev_pim.account_email is not a safe email address")
+end
+for each $contact in $CONF["contacts"]
+  if not valid_email($contact["email"]) then
+    conf_error($CONF_PATH, "a contacts[].email value is not a safe email address")
+  end
+end
+for each $message in $CONF["messages"]
+  if not valid_email($message["from"]) then
+    conf_error($CONF_PATH, "a messages[].from value is not a safe email address")
+  end
+end
+
+$ROSTER = $d.roster()
+$NODE = $CONF["node"]
+$d.assert_node($ROSTER, $NODE)
+if $d.is_foreign($ROSTER, $NODE) then
+  conf_error($CONF_PATH, "seed_dev_pim.node must be an active mesh node")
+end
+$REMOTE = $d.mesh_ip($NODE)
+$TOKEN = uuid()
+
+-- Reachability and required remote capabilities are checked before the first
+-- create. This would still refuse if the seed operation did nothing.
+$reach = ssh_mix($REMOTE, '
+if which("curl") == nil then
+  raise("curl is unavailable")
+end
+print("PIM_SEED_REACH " .. $token)
+', {bindings: {token: $TOKEN}, connect_timeout: 8, timeout: 15})
+$d.die_if(not $reach["ok"] or not contains($reach["stdout"], "PIM_SEED_REACH " .. $TOKEN),
+  $NODE .. " unreachable, missing system Mix, or missing curl: " ..
+  trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+
+$result = ssh_mix($REMOTE, '
+fn fail($message)
+  print("FATAL: " .. $message)
+  exit(1)
+end
+
+fn response_json($response, $what)
+  if $response["status"] < 200 or $response["status"] >= 300 then
+    fail($what .. " HTTP " .. $response["status"] .. ": " ..
+      ("" .. $response["error"]))
+  end
+  if type($response["body"]) != "string" then
+    fail($what .. " returned a non-text response")
+  end
+  try
+    return json_parse($response["body"])
+  catch $message
+    fail($what .. " returned invalid JSON: " .. $message)
+  end
+end
+
+fn method_payload($document, $index, $name, $what)
+  $responses = $document["methodResponses"]
+  if type($responses) != "list" or len($responses) <= $index then
+    fail($what .. " returned no method response")
+  end
+  $response = $responses[$index]
+  if type($response) != "list" or len($response) < 2 or $response[0] != $name then
+    fail($what .. " failed or returned an unexpected method response")
+  end
+  if type($response[1]) != "map" then
+    fail($what .. " returned an invalid payload")
+  end
+  return $response[1]
+end
+
+fn jmap_post($url, $auth, $ssl_verify, $body, $what)
+  return response_json(http_post($url, json_encode($body), {
+    "Authorization": $auth,
+    "Content-Type": "application/json"
+  }, {timeout: 60, ssl_verify: $ssl_verify}), $what)
+end
+
+$auth = "Basic " .. base64_encode($account_email .. ":" .. $password)
+$origin = "https://" .. $mesh_ip .. ":" .. ("" .. $jmap_port)
+$session = response_json(http_get($origin .. "/.well-known/jmap", {
+  "Authorization": $auth
+}, {timeout: 30, ssl_verify: $ssl_verify}), "JMAP session")
+$primary = $session["primaryAccounts"]
+if type($primary) != "map" then
+  fail("JMAP session has no primaryAccounts map")
+end
+$account_id = $primary["urn:ietf:params:jmap:mail"]
+if type($account_id) != "string" or $account_id == "" then
+  fail("JMAP session has no primary mail account")
+end
+
+-- Resolve both destination collections before creating anything.
+$ids = jmap_post($origin .. "/jmap", $auth, $ssl_verify, {
+  using: [
+    "urn:ietf:params:jmap:core",
+    "urn:ietf:params:jmap:contacts",
+    "urn:ietf:params:jmap:calendars"
+  ],
+  methodCalls: [
+    ["AddressBook/get", {accountId: $account_id}, "a"],
+    ["Calendar/get", {accountId: $account_id}, "c"]
+  ]
+}, "collection discovery")
+$books = method_payload($ids, 0, "AddressBook/get", "AddressBook/get")["list"]
+$calendars = method_payload($ids, 1, "Calendar/get", "Calendar/get")["list"]
+if type($books) != "list" or len($books) == 0 or
+    type($books[0]["id"]) != "string" or $books[0]["id"] == "" then
+  fail("AddressBook/get returned no usable address book")
+end
+if type($calendars) != "list" or len($calendars) == 0 or
+    type($calendars[0]["id"]) != "string" or $calendars[0]["id"] == "" then
+  fail("Calendar/get returned no usable calendar")
+end
+$book_id = $books[0]["id"]
+$calendar_id = $calendars[0]["id"]
+print("account=" .. $account_id .. " addressBook=" .. $book_id ..
+  " calendar=" .. $calendar_id)
+
+$contact_create = {}
+$contact_count = 0
+for each $contact in $contacts
+  $contact_count = $contact_count + 1
+  $contact_create["c" .. ("" .. $contact_count)] = {
+    addressBookId: $book_id,
+    fullName: $contact["full_name"],
+    email: $contact["email"],
+    company: $contact["company"],
+    phone: $contact["phone"]
+  }
+end
+$contact_doc = jmap_post($origin .. "/jmap", $auth, $ssl_verify, {
+  using: ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:contacts"],
+  methodCalls: [["Contact/set", {
+    accountId: $account_id,
+    create: $contact_create
+  }, "contacts"]]
+}, "Contact/set")
+$contact_result = method_payload($contact_doc, 0, "Contact/set", "Contact/set")
+if type($contact_result["created"]) != "map" or
+    len($contact_result["created"]) != $contact_count then
+  fail("Contact/set did not create every configured contact")
+end
+if type($contact_result["notCreated"]) == "map" and
+    len($contact_result["notCreated"]) > 0 then
+  fail("Contact/set reported one or more notCreated entries")
+end
+print("contacts: created " .. $contact_count)
+
+$event_create = {}
+$event_count = 0
+for each $event in $events
+  $event_count = $event_count + 1
+  $event_create["e" .. ("" .. $event_count)] = {
+    calendarId: $calendar_id,
+    title: $event["title"],
+    start: $event["start"],
+    end: $event["end"]
+  }
+end
+$event_doc = jmap_post($origin .. "/jmap", $auth, $ssl_verify, {
+  using: ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"],
+  methodCalls: [["CalendarEvent/set", {
+    accountId: $account_id,
+    create: $event_create
+  }, "events"]]
+}, "CalendarEvent/set")
+$event_result = method_payload($event_doc, 0, "CalendarEvent/set", "CalendarEvent/set")
+if type($event_result["created"]) != "map" or
+    len($event_result["created"]) != $event_count then
+  fail("CalendarEvent/set did not create every configured event")
+end
+if type($event_result["notCreated"]) == "map" and
+    len($event_result["notCreated"]) > 0 then
+  fail("CalendarEvent/set reported one or more notCreated entries")
+end
+print("events: created " .. $event_count)
+
+-- SMTP is the one required capability without a Mix builtin. The command is
+-- constant apart from a UUID path; all site values are written to curl's
+-- private config file, so none are interpreted by a shell.
+$smtp_origin = "smtp://" .. $mesh_ip .. ":" .. ("" .. $smtp_port)
+$message_count = 0
+for each $message in $messages
+  $message_count = $message_count + 1
+  $stem = "/tmp/cosmix-seed-dev-pim-" .. uuid()
+  $mail_path = $stem .. ".eml"
+  $curl_path = $stem .. ".curl"
+  $eml = "From: " .. $message["from"] .. "\r\n" ..
+    "To: " .. $account_email .. "\r\n" ..
+    "Subject: " .. $message["subject"] .. "\r\n" ..
+    "Date: " .. $message["date"] .. "\r\n" ..
+    "MIME-Version: 1.0\r\n" ..
+    "Content-Type: text/plain; charset=utf-8\r\n\r\n" ..
+    $message["body"] .. "\r\n"
+  write_file($mail_path, $eml)
+  chmod($mail_path, 0o600)
+  write_file($curl_path,
+    "silent\nshow-error\nurl = \"" .. $smtp_origin .. "\"\n" ..
+    "mail-from = \"" .. $message["from"] .. "\"\n" ..
+    "mail-rcpt = \"" .. $account_email .. "\"\n" ..
+    "upload-file = \"" .. $mail_path .. "\"\n")
+  chmod($curl_path, 0o600)
+  try
+    $_smtp = run("curl --config " .. $curl_path)
+  catch $message_error
+    remove($mail_path)
+    remove($curl_path)
+    fail("SMTP delivery " .. $message_count .. " failed: " .. $message_error)
+  end
+  remove($mail_path)
+  remove($curl_path)
+  print("mail " .. $message_count .. ": accepted")
+end
+print("PIM_SEED_OK " .. $token .. " contacts=" .. $contact_count ..
+  " events=" .. $event_count .. " messages=" .. $message_count)
+', {bindings: {
+  token: $TOKEN,
+  mesh_ip: $REMOTE,
+  account_email: $CONF["account_email"],
+  password: $PASSWORD,
+  jmap_port: $CONF["jmap_port"],
+  smtp_port: $CONF["smtp_port"],
+  ssl_verify: $CONF["ssl_verify"],
+  contacts: $CONF["contacts"],
+  events: $CONF["events"],
+  messages: $CONF["messages"]
+}, connect_timeout: 8, timeout: 300})
+
+$d.die_if(not $result["ok"] or
+    not contains($result["stdout"], "PIM_SEED_OK " .. $TOKEN),
+  $NODE .. " PIM seed failed: " .. trim($result["stdout"]) .. " " ..
+  trim($result["stderr"]))
+print(trim($result["stdout"]))
+

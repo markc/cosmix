@@ -1,0 +1,116 @@
+#!/usr/bin/env mix
+-- musicd_playlist.mix — play a configured MIDI playlist through the local
+-- cosmix-musicd service and announce each title with a desktop notification.
+-- Pacing comes from duration_s in each successful musicd.play reply; a failed
+-- request keeps the original conservative fallback delay before the next song.
+--
+-- Requires cosmix-musicd on the local broker and a graphical session whose
+-- notification service is reachable through the caller's environment.
+--
+-- usage: mix _bin/musicd_playlist.mix
+
+$d = require("../_lib/deploy_lib.mix")
+
+if len(args()) != 0 then
+  print("musicd_playlist: no arguments accepted")
+  print("usage: mix _bin/musicd_playlist.mix")
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/musicd_playlist.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no musicd playlist config at " .. $CONF_PATH ..
+    " — create it from musicd_playlist.conf.mix.example")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  if type($loaded) != "map" or type($loaded["musicd_playlist"]) != "map" then
+    print("  ERROR: " .. $CONF_PATH ..
+      " must contain a musicd_playlist strict-data map")
+    exit(2)
+  end
+  $CONF = validate($loaded["musicd_playlist"], {
+    schema_version: {type: "integer", enum: [1]},
+    songs_root: {type: "string", nonblank: true},
+    playlist: {
+      type: "list",
+      min_length: 1,
+      items: {
+        type: "map",
+        schema: {
+          title: {type: "string", nonblank: true},
+          slug: {type: "string", nonblank: true}
+        }
+      }
+    }
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+$SONGS = $CONF["songs_root"]
+if not starts_with($SONGS, "/") or contains($SONGS, "\n") or contains($SONGS, "\r") then
+  print("  ERROR: " .. $CONF_PATH ..
+    ": musicd_playlist.songs_root must be a one-line absolute path")
+  exit(2)
+end
+if not is_dir($SONGS) then
+  print("  ERROR: configured songs_root is not a directory: " .. $SONGS)
+  exit(2)
+end
+
+$PLAYLIST = $CONF["playlist"]
+for each $song in $PLAYLIST
+  $slug = $song["slug"]
+  if not regex_match("^[A-Za-z0-9][A-Za-z0-9._-]*$", $slug) then
+    print("  ERROR: " .. $CONF_PATH .. ": playlist slug '" .. $slug ..
+      "' must contain only letters, digits, dot, underscore, or hyphen")
+    exit(2)
+  end
+  $file = $SONGS .. "/" .. $slug .. ".mid"
+  if not is_file($file) then
+    print("  ERROR: playlist MIDI file not found: " .. $file)
+    exit(2)
+  end
+end
+
+$NOTIFY = which("notify-send")
+$d.die_if($NOTIFY == nil,
+  "notify-send is not installed or executable on PATH")
+
+fn announce($summary, $body)
+  $notice = run_argv([
+    $NOTIFY, "-a", "cosmix-musicd", "-i", "audio-x-generic", "-t", "6000",
+    $summary, $body
+  ], {timeout: 10})
+  if $notice["exit_code"] != 0 then
+    print("  WARNING: notify-send failed: " .. trim($notice["stderr"]))
+  end
+end
+
+$n = len($PLAYLIST)
+$i = 0
+for each $song in $PLAYLIST
+  $i = $i + 1
+  $title = $song["title"]
+  $file = $SONGS .. "/" .. $song["slug"] .. ".mid"
+  $body = "cosmix-musicd · " .. to_string($i) .. "/" .. to_string($n)
+
+  announce("♪ " .. $title, $body)
+
+  send musicd musicd.play midi_path=$file
+  $dur = 16.0
+  if $rc == 0 then
+    $dur = $result["duration_s"] + 2.0
+  end
+  print(to_string($i) .. "/" .. to_string($n) .. "  " .. $title ..
+    "  [" .. to_string($dur) .. "s]")
+  sleep($dur)
+end
+
+announce("Playlist complete", "cosmix-musicd · " .. to_string($n) .. " songs")
+print("done")

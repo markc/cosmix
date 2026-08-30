@@ -44,7 +44,14 @@ for each $node in $CONF["nodes"]
 end
 
 $MAIL_ROSTER = {mesh: [], foreign: [], all: $configured, order: nil}
-$parsed = $d.parse_nodes($MAIL_ROSTER, args(), [])
+-- An explicit action is required: with no arguments this used to normalise
+-- AND restart maild on every mail node — too much to do by accident.
+$argv = args()
+if len($argv) == 0 or $argv[0] != "apply" then
+  print("usage: mix normalize_maild_configs.mix apply [node...]")
+  exit(2)
+end
+$parsed = $d.parse_nodes($MAIL_ROSTER, slice($argv, 1, len($argv)), [])
 $requested = $parsed["nodes"]
 $requested_mesh = []
 $requested_foreign = []

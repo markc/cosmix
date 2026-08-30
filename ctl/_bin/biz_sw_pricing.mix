@@ -1,0 +1,251 @@
+#!/usr/bin/env mix
+-- biz_sw_pricing.mix — refresh a configured CMS site's domain pricing from
+-- Synergy Wholesale on its nominated mesh node.
+--
+--   mix _bin/biz_sw_pricing.mix alpha [--db /srv/www/example.org/data/cms.db]
+--
+-- The slow registrar request runs outside webd's handler deadline. Wholesale
+-- renew prices become each domain's private cost, and the configured database
+-- markup becomes its customer price. The write is one SQLite transaction and
+-- a post-commit readback verifies every priced row.
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn config_error($message)
+  print("  ERROR: " .. $message)
+  exit(2)
+end
+
+-- Require an explicit node confirmation before private state is loaded or any
+-- remote operation is possible. The config then pins that node independently.
+$g = getopt(args(), {db: {arg: true}})
+if len($g["errors"]) != 0 then
+  print("  ERROR: bad options: " .. join($g["errors"], "; "))
+  print("usage: mix biz_sw_pricing.mix <node> [--db <absolute-path>]")
+  exit(2)
+end
+if len($g["rest"]) != 1 then
+  print("usage: mix biz_sw_pricing.mix <node> [--db <absolute-path>]")
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/biz_sw_pricing.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no biz_sw_pricing configuration at " .. $CONF_PATH)
+  print("         copy _etc/biz_sw_pricing.conf.mix.example there and set the site values")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["biz_sw_pricing"], {
+    schema_version: {type: "integer", enum: [1]},
+    node: {type: "string", nonblank: true},
+    database_path: {type: "string", nonblank: true},
+    sw_app_path: {type: "string", nonblank: true},
+    default_markup_pct: {type: "integer"}
+  })
+catch $config_failure
+  config_error("invalid strict-data config " .. $CONF_PATH .. ": " .. $config_failure)
+end
+
+$ROSTER = $d.roster()
+$parsed = $d.parse_nodes($ROSTER, $g["rest"], [])
+$NODE = $parsed["nodes"][0]
+if $NODE != $CONF["node"] then
+  config_error("node '" .. $NODE .. "' does not match configured biz_sw_pricing.node '" ..
+    $CONF["node"] .. "'")
+end
+
+$DB = $CONF["database_path"]
+if env("CT_DB") != "" then
+  $DB = env("CT_DB")
+end
+if $g["opts"]["db"] != nil then
+  $DB = "" .. $g["opts"]["db"]
+end
+if not starts_with($DB, "/") then
+  config_error("database path must be absolute")
+end
+if not starts_with($CONF["sw_app_path"], "/") then
+  config_error("biz_sw_pricing.sw_app_path must be absolute")
+end
+
+$REMOTE = $d.mesh_ip($NODE)
+$TOKEN = uuid()
+
+-- A current challenge distinguishes this invocation from stale SSH output.
+$reach = ssh_mix($REMOTE, 'print("BIZ_SW_PRICING_REACH " .. $token)', {
+  bindings: {token: $TOKEN}
+})
+$d.die_if(not $reach["ok"] or not contains($reach["stdout"], "BIZ_SW_PRICING_REACH " .. $TOKEN),
+  $NODE .. " unreachable or not running the system Mix interpreter: " ..
+  trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+
+-- Validate both remote inputs and the required schema read-only before the
+-- registrar call. A missing site, app, or schema must never become a partial
+-- pricing run.
+$preflight = ssh_mix($REMOTE, '
+fn fail($message)
+  print("FATAL: " .. $message)
+  exit(1)
+end
+
+if not is_file($database_path) then
+  fail("database not found: " .. $database_path)
+end
+if not is_file($sw_app_path) then
+  fail("Synergy Wholesale app not found: " .. $sw_app_path)
+end
+
+$db = nil
+try
+  $db = sqlopen($database_path, "ro")
+  $_settings = sqlexec($db, "SELECT value FROM biz_settings WHERE key = ?1", ["domain_markup_pct"])
+  $_domains = sqlexec($db, "SELECT id, lower(domain) AS domain FROM domains LIMIT 1", [])
+  sqlclose($db)
+catch $error
+  if $db != nil then
+    try
+      sqlclose($db)
+    catch $close_error
+      nil
+    end
+  end
+  fail("database preflight failed: " .. $error)
+end
+print("BIZ_SW_PRICING_PREFLIGHT " .. $token)
+', {bindings: {
+  database_path: $DB,
+  sw_app_path: $CONF["sw_app_path"],
+  token: $TOKEN
+}})
+$d.die_if(not $preflight["ok"] or
+  not contains($preflight["stdout"], "BIZ_SW_PRICING_PREFLIGHT " .. $TOKEN),
+  $NODE .. " pricing preflight failed: " .. trim($preflight["stdout"]) .. " " ..
+  trim($preflight["stderr"]))
+
+-- sw.mix expects biz_setting() in the including scope. The app path is a
+-- private binding, while include keeps that legacy caller-supplied seam.
+$result = ssh_mix($REMOTE, '
+fn fail($message)
+  print("FATAL: " .. $message)
+  exit(1)
+end
+
+$DBH = nil
+fn biz_setting($key)
+  $rows = sqlexec($DBH, "SELECT value FROM biz_settings WHERE key = ?1", [$key])
+  if len($rows) == 0 then
+    return ""
+  end
+  return trim("" .. $rows[0]["value"])
+end
+
+try
+  $DBH = sqlopen($database_path, "rw")
+catch $open_error
+  fail("opening database: " .. $open_error)
+end
+
+include $sw_app_path
+
+$markup = to_number(biz_setting("domain_markup_pct"))
+if $markup == nil then
+  $markup = $default_markup_pct
+end
+print("markup=" .. ("" .. $markup) .. "%")
+
+$pricing = sw_get_pricing()
+if not $pricing["ok"] then
+  sqlclose($DBH)
+  fail("getDomainPricing failed: " .. $pricing["error"])
+end
+$tlds = $pricing["tlds"]
+print("SW TLDs priced: " .. ("" .. len(keys($tlds))))
+
+$domains = nil
+try
+  $domains = sqlexec($DBH, "SELECT id, lower(domain) AS domain FROM domains", [])
+catch $read_error
+  sqlclose($DBH)
+  fail("reading domains: " .. $read_error)
+end
+
+$expected = []
+$unpriced = 0
+$skipped = 0
+for each $row in $domains
+  $idn = to_number("" .. $row["id"])
+  if $idn == nil then
+    $skipped = $skipped + 1
+  else
+    $domain = trim("" .. $row["domain"])
+    $dot = pos(".", $domain)
+    if $dot > 0 then
+      $tld = substr($domain, $dot, len($domain) - $dot)
+      $cost = $tlds[$tld]
+      if $cost == nil then
+        $unpriced = $unpriced + 1
+      else
+        push($expected, {
+          id: floor($idn),
+          cost: $cost,
+          price: round($cost * (100 + $markup) / 100)
+        })
+      end
+    end
+  end
+end
+
+$in_transaction = false
+try
+  sqlexec($DBH, "BEGIN IMMEDIATE", [])
+  $in_transaction = true
+  for each $want in $expected
+    sqlexec($DBH,
+      "UPDATE domains SET cost_price_cents = ?1, price_cents = ?2 WHERE id = ?3",
+      [$want["cost"], $want["price"], $want["id"]])
+  end
+  sqlexec($DBH, "COMMIT", [])
+  $in_transaction = false
+catch $write_error
+  if $in_transaction then
+    try
+      sqlexec($DBH, "ROLLBACK", [])
+    catch $rollback_error
+      nil
+    end
+  end
+  sqlclose($DBH)
+  fail("pricing transaction failed: " .. $write_error)
+end
+
+$mismatches = 0
+for each $want in $expected
+  $rows = sqlexec($DBH,
+    "SELECT cost_price_cents, price_cents FROM domains WHERE id = ?1", [$want["id"]])
+  if len($rows) != 1 or to_number("" .. $rows[0]["cost_price_cents"]) != $want["cost"] or
+      to_number("" .. $rows[0]["price_cents"]) != $want["price"] then
+    $mismatches = $mismatches + 1
+  end
+end
+sqlclose($DBH)
+if $mismatches != 0 then
+  fail("post-commit verification found " .. ("" .. $mismatches) .. " mismatched rows")
+end
+
+print("BIZ_SW_PRICING_OK " .. $token .. " updated=" .. ("" .. len($expected)) ..
+  " unpriced=" .. ("" .. $unpriced) .. " skipped=" .. ("" .. $skipped))
+', {bindings: {
+  database_path: $DB,
+  default_markup_pct: $CONF["default_markup_pct"],
+  sw_app_path: $CONF["sw_app_path"],
+  token: $TOKEN
+}, timeout: 120})
+
+$d.die_if(not $result["ok"] or not contains($result["stdout"], "BIZ_SW_PRICING_OK " .. $TOKEN),
+  $NODE .. " pricing refresh failed: " .. trim($result["stdout"]) .. " " ..
+  trim($result["stderr"]))
+print(trim($result["stdout"]))

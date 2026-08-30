@@ -1,0 +1,18 @@
+-- musicd_playlist.conf.mix.example — private local MIDI playlist settings.
+-- Copy this file to musicd_playlist.conf.mix in the private control hub and
+-- replace the media path and ordered playlist with local values.
+{
+  musicd_playlist: {
+    schema_version: 1,
+
+    -- Directory containing each configured slug as <slug>.mid.
+    songs_root: "/home/user/Music/midi",
+
+    -- Played in order. Slugs are relative names without the .mid suffix.
+    playlist: [
+      {title: "Example Prelude", slug: "example-prelude"},
+      {title: "Example Interlude", slug: "example-interlude"},
+      {title: "Example Finale", slug: "example-finale"}
+    ]
+  }
+}

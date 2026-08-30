@@ -1,0 +1,481 @@
+#!/usr/bin/env mix
+-- smoke_desktop_nested.mix — nested desktop-composition smoke gate.
+--
+-- Runs cosmix-comp --nested with foot, cosmix-filemgr and
+-- cosmix-quoin-demo. It proves that the compositor socket appears, each
+-- client maps a newly attributed toplevel, foot negotiates server-side
+-- decoration, the clients survive a settle window, the final compositor log
+-- stays free of shader failures and ERROR lines, and SIGTERM produces the
+-- compositor's exit-143 contract.
+--
+-- This is a workstation-only tool. It drives a live nested compositor and GPU;
+-- lint it statically, but do not execute it merely to verify a port.
+--
+-- Usage:
+--   mix _bin/smoke_desktop_nested.mix
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn config_error($message)
+  print("  ERROR: " .. $message)
+  exit(2)
+end
+
+fn has_str($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn assert_only_keys($value, $allowed, $where)
+  if type($value) != "map" then
+    config_error($where .. " must be a map")
+  end
+  for each $key in keys($value)
+    if not has_str($allowed, $key) then
+      config_error($where .. " contains unknown key '" .. $key .. "'")
+    end
+  end
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/smoke_desktop_nested.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no nested desktop smoke config at " .. $CONF_PATH)
+  print("         copy _etc/smoke_desktop_nested.conf.mix.example there and set this workstation's values")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  assert_only_keys($loaded, ["smoke_desktop_nested"], $CONF_PATH)
+  $CONF = validate($loaded["smoke_desktop_nested"], {
+    schema_version: {type: "integer", enum: [1]},
+    foot_bin: {type: "string", nonblank: true},
+    log_dir: {type: "string", nonblank: true},
+    socket: {type: "string", nonblank: true},
+    rust_log: {type: "string", nonblank: true}
+  })
+  assert_only_keys($CONF, [
+    "schema_version", "foot_bin", "log_dir", "socket", "rust_log"
+  ], "smoke_desktop_nested")
+catch $error
+  config_error("invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+end
+
+-- deploy_lib locates the main Cargo workspace. Desktop is a separate
+-- workspace, so derive its normal release target from the located checkout.
+-- A shared CARGO_TARGET_DIR still wins, matching Cargo's placement rule.
+fn desktop_bin($name)
+  $target = env("CARGO_TARGET_DIR")
+  if $target != "" then
+    return $target .. "/release/" .. $name
+  end
+  return $d.cosmix_root() .. "/src/desktop/target/release/" .. $name
+end
+
+$comp = desktop_bin("cosmix-comp")
+$filemgr = desktop_bin("cosmix-filemgr")
+$quoin = desktop_bin("cosmix-quoin-demo")
+$foot = $CONF["foot_bin"]
+$log_dir = $CONF["log_dir"]
+$sock = $CONF["socket"]
+$log_filter = $CONF["rust_log"]
+
+$comp_log = $log_dir .. "/comp.log"
+$runtime_dir = env("XDG_RUNTIME_DIR")
+$sock_path = ($runtime_dir ?? "") .. "/" .. $sock
+$unit_prefix = "cosmix-smoke-" .. $sock
+$comp_unit = $unit_prefix .. "-comp.service"
+
+-- Strip tracing's ANSI colouring before matching; field names may otherwise
+-- be split by escapes and evade plain substring tests.
+fn log_text($path)
+  if not exists($path) then return "" end
+  return regex_replace("\u{1b}\\[[0-9;]*m", read_file($path), "") .. "\n"
+end
+
+-- pos() is needle-first.
+fn has($needle, $haystack)
+  return pos($needle, $haystack) > 0
+end
+
+-- Surface IDs whose toplevels have committed a first buffer. Both line
+-- markers are required; tracing field order is deliberately not assumed.
+fn mapped_ids($text)
+  $ids = {}
+  for each $line in grep("first surface buffer committed", $text)
+    if has("role=\"toplevel\"", $line) then
+      $found = regex_find("surface_id=([0-9]+)", $line)
+      if len($found) > 0 then
+        $ids[$found[0]["groups"][0]] = true
+      end
+    end
+  end
+  return $ids
+end
+
+-- A launch passes attribution only when a surface ID appears that was absent
+-- before that client started. This prevents an earlier client's existing
+-- window from satisfying a later client's gate.
+fn wait_new_toplevel($before, $secs, $who)
+  for each $i in range(1, $secs * 2)
+    $now = mapped_ids(log_text($comp_log))
+    for each $id in keys($now)
+      if $before[$id] != true then return $id end
+    end
+    sleep(0.5)
+  end
+  print("  FAIL: " .. $who .. " never mapped a NEW toplevel in its window")
+  return ""
+end
+
+-- The service main process is timeout. Requiring the expected executable as
+-- an exact NUL-separated argv element prevents PID reuse from faking liveness
+-- or making teardown signal an unrelated process.
+fn pid_matches($pid, $binary)
+  $cmdline = ""
+  $comm = ""
+  try
+    $cmdline = read_file("/proc/" .. $pid .. "/cmdline")
+    $comm = trim(read_file("/proc/" .. $pid .. "/comm"))
+  catch $error
+    return false
+  end
+  if $comm != "timeout" then return false end
+  for each $arg in split($cmdline, "\u{0}")
+    if $arg == $binary then return true end
+  end
+  return false
+end
+
+fn alive($pid_file, $binary)
+  if not exists($pid_file) then return false end
+  $pid = trim(read_file($pid_file))
+  if $pid == "" then return false end
+  return pid_matches($pid, $binary)
+end
+
+fn unit_property($unit, $property)
+  $result = run_argv([
+    "systemctl", "--user", "show", $unit, "--property=" .. $property, "--value"
+  ], {timeout: 10})
+  if $result["exit_code"] != 0 then return "" end
+  return trim($result["stdout"])
+end
+
+fn unit_running($unit)
+  $state = unit_property($unit, "ActiveState")
+  return $state == "active" or $state == "activating"
+end
+
+fn wait_main_pid($unit)
+  for each $i in range(1, 40)
+    $pid = unit_property($unit, "MainPID")
+    if $pid != "" and $pid != "0" then return $pid end
+    if not unit_running($unit) then return "" end
+    sleep(0.25)
+  end
+  return ""
+end
+
+-- run_argv has no detached argv mode. A transient user service supplies only
+-- supervision and structured file routing; timeout remains the main process,
+-- so the original PID identity and bounded-lifetime contracts stay observable.
+fn launch_service($name, $binary, $binary_argv, $environment)
+  $unit = $unit_prefix .. "-" .. $name .. ".service"
+  $log = $log_dir .. "/" .. $name .. ".log"
+  $_reset = run_argv(["systemctl", "--user", "reset-failed", $unit], {timeout: 10})
+  $command = [
+    "systemd-run", "--user", "--quiet", "--unit=" .. $unit,
+    "--property=Type=exec",
+    "--property=KillMode=control-group",
+    "--property=TimeoutStopSec=15s",
+    "--property=RuntimeMaxSec=1800s",
+    "--property=StandardOutput=append:" .. $log,
+    "--property=StandardError=append:" .. $log
+  ]
+  for each $binding in $environment
+    push($command, "--setenv=" .. $binding)
+  end
+  push($command, "--")
+  $command = concat($command, ["timeout", "-k", "10", "-s", "TERM", "1800", $binary])
+  $command = concat($command, $binary_argv)
+  $started = run_argv($command, {timeout: 30})
+  if $started["exit_code"] != 0 then
+    raise("SMOKE_LAUNCH_FAILED", name .. " launch failed: " ..
+      trim($started["stdout"]) .. " " .. trim($started["stderr"]))
+  end
+  $pid = wait_main_pid($unit)
+  if $pid == "" or not pid_matches($pid, $binary) then
+    raise("SMOKE_LAUNCH_IDENTITY", $name .. " launch did not expose the expected timeout process")
+  end
+  write_file($log .. ".pid", $pid .. "\n")
+  return $unit
+end
+
+fn launch_client($name, $binary)
+  return launch_service($name, $binary, [], ["WAYLAND_DISPLAY=" .. $sock])
+end
+
+-- TERM the whole supervised cgroup, wait beyond timeout's ten-second KILL
+-- bound, then force KILL if the identity-checked wrapper still exists.
+fn kill_from($pid_file, $binary, $unit)
+  if not exists($pid_file) then return end
+  $pid = trim(read_file($pid_file))
+  if $pid == "" or not pid_matches($pid, $binary) then return end
+  $_term = run_argv([
+    "systemctl", "--user", "kill", "--signal=TERM", "--kill-whom=all", $unit
+  ], {timeout: 15})
+  for each $i in range(1, 30)
+    if not pid_matches($pid, $binary) then return end
+    sleep(0.5)
+  end
+  $_kill = run_argv([
+    "systemctl", "--user", "kill", "--signal=KILL", "--kill-whom=all", $unit
+  ], {timeout: 15})
+end
+
+-- ---------------------------------------------------------------- preflight
+
+-- These values become argv, systemd properties, a process-match regex or
+-- local paths. Preserve the narrow old grammar and reject traversal.
+for each $path in [$comp, $filemgr, $quoin, $foot, $log_dir, $runtime_dir ?? ""]
+  if not regex_match("^/[A-Za-z0-9/._-]+$", $path) or has("..", $path) then
+    config_error("SMOKE_BAD_PATH: '" .. $path ..
+      "' (need absolute, charset [A-Za-z0-9/._-], no '..')")
+  end
+end
+if not regex_match("^[A-Za-z0-9_,:=.*-]+$", $log_filter) then
+  config_error("SMOKE_BAD_RUST_LOG: '" .. $log_filter ..
+    "' (charset [A-Za-z0-9_,:=.*-])")
+end
+if not regex_match("^cosmix-[A-Za-z0-9-]+$", $sock) then
+  config_error("SMOKE_BAD_SOCKET: '" .. $sock ..
+    "' (must match ^cosmix-[A-Za-z0-9-]+$ and must not name the live session socket)")
+end
+if not starts_with($log_dir, "/tmp/") or $log_dir == "/tmp/" then
+  config_error("SMOKE_BAD_LOG_DIR: " .. $log_dir ..
+    " (must be a subdirectory under /tmp; stale evidence is swept there)")
+end
+for each $binary in [$comp, $filemgr, $quoin, $foot]
+  if not is_file($binary) then
+    config_error("SMOKE_NO_BINARY: missing " .. $binary)
+  end
+end
+for each $tool in ["pgrep", "pkill", "ss", "systemctl", "systemd-run", "timeout"]
+  if which($tool) == nil then
+    config_error("SMOKE_NO_TOOL: missing required local command " .. $tool)
+  end
+end
+$manager = run_argv(["systemctl", "--user", "show-environment"], {timeout: 10})
+if $manager["exit_code"] != 0 then
+  config_error("SMOKE_NO_USER_MANAGER: systemd user manager is unavailable: " ..
+    trim($manager["stderr"]))
+end
+
+-- The full anchored pattern matches only this exact compositor launch. Dots
+-- need escaping; the validated path grammar excludes other regex metacharacters.
+$comp_pattern = "^" .. replace($comp, ".", "\\.") ..
+  " --nested --chrome mac --socket " .. $sock .. "$"
+
+-- One run per socket, then one run per evidence directory. Both resources
+-- are shared independently and either collision could corrupt attribution.
+if not flock($runtime_dir .. "/cosmix-smoke-" .. $sock .. ".lock") then
+  config_error("SMOKE_CONCURRENT: another smoke run holds " .. $sock .. " — refusing")
+end
+
+-- A killed runner may leave its exact compositor alive. Sweep only the fully
+-- anchored launch shape, then prove KILL actually removed it.
+$stale = run_argv(["pgrep", "-f", "--", $comp_pattern])
+if $stale["exit_code"] == 0 then
+  print("  note: stale compositor from a previous run — sweeping")
+  $_term_stale = run_argv(["pkill", "-TERM", "-f", "--", $comp_pattern])
+  sleep(3)
+  $_kill_stale = run_argv(["pkill", "-KILL", "-f", "--", $comp_pattern])
+  sleep(1)
+  if run_argv(["pgrep", "-f", "--", $comp_pattern])["exit_code"] == 0 then
+    config_error("SMOKE_STALE_IMMORTAL: a previous compositor survived KILL — inspect by hand")
+  end
+end
+
+mkdir($log_dir, {parents: true})
+-- The lexical /tmp check is insufficient when a path component is a symlink.
+if not starts_with(realpath($log_dir), "/tmp/") then
+  config_error("SMOKE_BAD_LOG_DIR: " .. $log_dir ..
+    " resolves outside /tmp through a symlink — refusing")
+end
+if not flock($log_dir .. "/.lock") then
+  config_error("SMOKE_CONCURRENT: another smoke run holds log dir " .. $log_dir .. " — refusing")
+end
+
+-- Stale evidence must never satisfy a new run's positive gates.
+for each $glob_pat in ["/*.log", "/*.pid", "/*.exit"]
+  for each $stale_file in glob($log_dir .. $glob_pat)
+    remove($stale_file)
+  end
+end
+
+-- A stale socket file is removable only after ss proves no live listener owns
+-- it. This protects a manually started compositor with a different argv shape.
+$ss = run_argv(["ss", "-lxH"])
+if $ss["exit_code"] != 0 then
+  config_error("SMOKE_NO_SS: cannot check for a live listener on " .. $sock_path ..
+    " (ss failed rc=" .. to_string($ss["exit_code"]) .. ") — refusing to unlink it blind")
+end
+$sock_busy = false
+for each $line in split($ss["stdout"], "\n")
+  for each $token in split($line, " ")
+    if $token == $sock_path then $sock_busy = true end
+  end
+end
+if $sock_busy then
+  config_error("SMOKE_SOCKET_BUSY: a live listener holds " .. $sock_path ..
+    " but the stale sweep did not match it — stop it or choose another socket")
+end
+if exists($sock_path, {follow_symlinks: false}) then
+  remove($sock_path)
+end
+
+print("=== nested desktop composition smoke ===")
+print("comp:    " .. $comp)
+print("clients: foot, cosmix-filemgr, cosmix-quoin-demo (in that order)")
+print("socket:  " .. $sock .. "  logs: " .. $log_dir)
+print("")
+
+$failures = []
+fn gate($ok, $label)
+  if $ok then
+    print("  ok: " .. $label)
+  else
+    push($failures, $label)
+    print("  FAIL: " .. $label)
+  end
+end
+
+$foot_unit = $unit_prefix .. "-foot.service"
+$filemgr_unit = $unit_prefix .. "-filemgr.service"
+$quoin_unit = $unit_prefix .. "-quoin.service"
+
+-- --------------------------------------------------------------------- run
+
+try
+  $comp_unit = launch_service("comp", $comp,
+    ["--nested", "--chrome", "mac", "--socket", $sock],
+    ["RUST_LOG=" .. $log_filter])
+
+  $sock_up = false
+  for each $i in range(1, 60)
+    if exists($sock_path) then
+      $sock_up = true
+      break
+    end
+    sleep(0.5)
+  end
+  gate($sock_up, "compositor socket up (" .. $sock_path .. ")")
+  if not $sock_up then
+    raise("SMOKE_NO_SOCKET", "compositor never came up — see " .. $comp_log)
+  end
+
+  -- Launch sequentially; each attribution window starts from a fresh ID set.
+  $seen = mapped_ids(log_text($comp_log))
+  $foot_unit = launch_client("foot", $foot)
+  $foot_id = wait_new_toplevel($seen, 60, "foot")
+  gate($foot_id != "", "foot mapped a NEW toplevel (surface_id=" .. $foot_id .. ")")
+
+  $seen = mapped_ids(log_text($comp_log))
+  $filemgr_unit = launch_client("filemgr", $filemgr)
+  $filemgr_id = wait_new_toplevel($seen, 90, "cosmix-filemgr")
+  gate($filemgr_id != "", "filemgr mapped a NEW toplevel (surface_id=" .. $filemgr_id .. ")")
+
+  $seen = mapped_ids(log_text($comp_log))
+  $quoin_unit = launch_client("quoin", $quoin)
+  $quoin_id = wait_new_toplevel($seen, 90, "cosmix-quoin-demo")
+  gate($quoin_id != "",
+    "quoin-demo mapped a NEW toplevel (surface_id=" .. $quoin_id .. ")")
+
+  sleep(5)
+  gate(alive($log_dir .. "/foot.log.pid", $foot), "foot still alive after settle")
+  gate(alive($log_dir .. "/filemgr.log.pid", $filemgr), "filemgr still alive after settle")
+  gate(alive($log_dir .. "/quoin.log.pid", $quoin), "quoin-demo still alive after settle")
+
+  -- Foot's own surface must acknowledge ServerSide. An unattributed count
+  -- would allow a different client to create a false green result.
+  $text = log_text($comp_log)
+  $foot_acked = false
+  for each $line in grep("acknowledged_decoration=Some\\(ServerSide\\)", $text)
+    if has("surface_id=" .. $foot_id .. " ", $line) then $foot_acked = true end
+  end
+  gate($foot_acked, "foot's surface (id=" .. $foot_id .. ") acked ServerSide")
+  print("  note: ServerSide ack lines seen: " ..
+    to_string(len(grep("acknowledged_decoration=Some\\(ServerSide\\)", $text))) ..
+    " (foot is gated; the other clients may keep client-side decoration)")
+finally
+  -- Clients leave first so the compositor observes clean disconnects. Their
+  -- supervised cgroups ensure a TERM-resistant child cannot outlive the run.
+  kill_from($log_dir .. "/foot.log.pid", $foot, $foot_unit)
+  kill_from($log_dir .. "/filemgr.log.pid", $filemgr, $filemgr_unit)
+  kill_from($log_dir .. "/quoin.log.pid", $quoin, $quoin_unit)
+  sleep(1)
+
+  -- Signal the exact compositor child, not timeout. timeout then records 143,
+  -- preserving the clean-exit contract and distinguishing an earlier crash.
+  $pre_exited = not unit_running($comp_unit)
+  $term = run_argv(["pkill", "-TERM", "-f", "--", $comp_pattern])
+  if not $pre_exited and $term["exit_code"] != 0 then
+    push($failures, "compositor not found at teardown (never started or died silently)")
+    print("  FAIL: compositor not found at teardown (never started or died silently)")
+  end
+
+  $deadline = time() + 30
+  while time() < $deadline and unit_running($comp_unit) do
+    sleep(0.5)
+  end
+  if unit_running($comp_unit) then
+    print("  note: compositor ignored TERM for 30s — escalating to KILL")
+    $_comp_kill = run_argv(["pkill", "-KILL", "-f", "--", $comp_pattern])
+    $kill_deadline = time() + 10
+    while time() < $kill_deadline and unit_running($comp_unit) do
+      sleep(0.5)
+    end
+  end
+
+  $code = unit_property($comp_unit, "ExecMainStatus")
+  if $code == "143" then
+    print("  ok: compositor exited 143 on SIGTERM (clean-exit contract)")
+  else
+    if unit_running($comp_unit) or $code == "" then
+      push($failures, "compositor never produced an exit status after TERM and KILL escalation")
+      print("  FAIL: compositor never produced an exit status after TERM and KILL escalation")
+    else
+      push($failures, "compositor exit code was " .. $code .. ", expected 143")
+      print("  FAIL: compositor exit code was " .. $code .. ", expected 143")
+    end
+  end
+
+  -- Read the final log after teardown so late failures cannot evade the gate.
+  $final_text = log_text($comp_log)
+  gate(not has("failed to process shader", $final_text), "no shader failure (final log)")
+  gate(not has("ERROR", $final_text), "no compositor ERROR (final log)")
+
+  if exists($sock_path, {follow_symlinks: false}) then
+    remove($sock_path)
+  end
+  for each $unit in [$foot_unit, $filemgr_unit, $quoin_unit, $comp_unit]
+    $_unit_reset = run_argv(["systemctl", "--user", "reset-failed", $unit], {timeout: 10})
+  end
+end
+
+print("")
+if len($failures) > 0 then
+  print("nested composition smoke: " .. to_string(len($failures)) .. " FAILURE(S)")
+  for each $failure in $failures
+    print("  - " .. $failure)
+  end
+  exit(1)
+end
+print("nested composition smoke: ALL GATES GREEN")
+print("(pixels, input, chrome appearance and corner behaviour remain eyes-only checks)")

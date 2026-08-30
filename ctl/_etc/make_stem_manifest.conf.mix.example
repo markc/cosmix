@@ -1,0 +1,13 @@
+-- make_stem_manifest.conf.mix.example — private local stem-session inputs.
+-- Copy this file to make_stem_manifest.conf.mix in the private control hub
+-- and replace the paths and release metadata.
+{
+  make_stem_manifest: {
+    schema_version: 1,
+    stems_dir: "/home/user/media/example-session/stems",
+    output_path: "/home/user/media/example-session/stem-session.json",
+    title: "Example Session",
+    artist: "Example Artist",
+    copyright: "Copyright Example Artist"
+  }
+}

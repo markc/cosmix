@@ -1,0 +1,118 @@
+#!/usr/bin/env mix
+-- make_stem_manifest.mix — emit a hash-verified stem-session.v1 manifest from
+-- a configured directory of per-track stems (`cosmix-musicd render
+-- --per-track` output, tNN-Name.wav). Names derive from the filename
+-- (CamelCase → spaced words); length_frames is the longest stem because
+-- musicd zero-pads shorter ones. The result is deterministic across re-runs.
+
+$d = require("../_lib/deploy_lib.mix")
+
+if len(args()) != 0 then
+  print("  ERROR: make_stem_manifest.mix takes no arguments; configure _etc/make_stem_manifest.conf.mix")
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/make_stem_manifest.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no stem-manifest configuration at " .. $CONF_PATH)
+  print("         copy _etc/make_stem_manifest.conf.mix.example there and set the private paths and metadata")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  if type($loaded) != "map" or type($loaded["make_stem_manifest"]) != "map" then
+    print("  ERROR: " .. $CONF_PATH .. " must contain a make_stem_manifest strict-data map")
+    exit(2)
+  end
+  $CONF = validate($loaded["make_stem_manifest"], {
+    schema_version: {type: "integer", enum: [1]},
+    stems_dir: {type: "string", nonblank: true},
+    output_path: {type: "string", nonblank: true},
+    title: {type: "string", nonblank: true},
+    artist: {type: "string"},
+    copyright: {type: "string"}
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+$RATE = 48000
+$dir = $CONF["stems_dir"]
+$out = $CONF["output_path"]
+$title = $CONF["title"]
+$artist = $CONF["artist"]
+$copyright = $CONF["copyright"]
+
+-- Mix glob() has no [0-9] character classes, so filter the broad glob with a
+-- regex before any probe or output write.
+$all = sort(glob($dir .. "/t*.wav"))
+$files = []
+for each $path in $all
+  if regex_match("^t[0-9][0-9]-.+\\.wav$", basename($path)) then
+    push($files, $path)
+  end
+end
+if len($files) == 0 then
+  raise("NO_STEMS", "no tNN-*.wav stems in " .. $dir)
+end
+
+$stems = []
+$frames = 0
+for each $path in $files
+  $base = basename($path)
+  -- tNN-Name.wav → channel NN-1, name "Camel Case".
+  $nn = to_number(substr($base, 1, 2))
+  if $nn < 1 then
+    raise("BAD_STEM_NAME", $base .. ": expected tNN- prefix")
+  end
+  $raw = substr($base, 4, byte_length($base) - 8)
+  $name = regex_replace("([a-z])([A-Z])", $raw, "$1 $2")
+  $name = regex_replace("([A-Za-z])([0-9])", $name, "$1 $2")
+
+  $probe = run_argv([
+    "ffprobe", "-v", "error", "-select_streams", "a:0",
+    "-show_entries", "stream=sample_rate,channels,duration_ts",
+    "-of", "csv=p=0", $path
+  ], {timeout: 30})
+  $d.die_if($probe["exit_code"] != 0,
+    "ffprobe failed for " .. $path .. ": " .. trim($probe["stderr"]))
+
+  $fields = split(trim($probe["stdout"]), ",")
+  $d.die_if(len($fields) < 3, "ffprobe returned malformed stream data for " .. $path)
+  $sample_rate = to_number($fields[0])
+  $channels = to_number($fields[1])
+  $stem_frames = to_number($fields[2])
+  $d.die_if($sample_rate == nil or $channels == nil or $stem_frames == nil,
+    "ffprobe returned non-numeric stream data for " .. $path)
+  if $sample_rate != $RATE then
+    raise("BAD_RATE", $path .. ": sample_rate " .. $sample_rate)
+  end
+  if $channels != 1 then
+    raise("BAD_CHANNELS", $path .. ": channels " .. $channels)
+  end
+  if $stem_frames > $frames then
+    $frames = $stem_frames
+  end
+  push($stems, {
+    channel: $nn - 1,
+    name: $name,
+    path: $path,
+    sha256: hash_file($path, "sha256")
+  })
+end
+
+$manifest = {
+  schema: "stem-session.v1",
+  sample_rate: $RATE,
+  length_frames: $frames,
+  title: $title,
+  artist: $artist,
+  copyright: $copyright,
+  stems: $stems
+}
+
+write_file($out, json_encode($manifest, true) .. "\n")
+print("wrote " .. $out .. " (" .. len($stems) .. " stems, " .. $frames .. " frames)")

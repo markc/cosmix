@@ -1,0 +1,13 @@
+-- Private site facts for biz_seed_settings.mix.
+-- Copy this file to biz_seed_settings.conf.mix in the private control hub.
+biz_seed_settings: {
+  schema_version: 1,
+  target_nodes: ["alpha", "beta", "gamma"],
+  cms_db_path: "/srv/www.example.org/web/var/cms.db",
+  settings: {
+    provision_allowed_domains: "example.org",
+    provision_ip_pool: "192.0.2.100-130,192.0.2.224-231",
+    provision_pve_hosts: "alpha,beta",
+    house_bootstrap_email: "admin@example.org"
+  }
+}

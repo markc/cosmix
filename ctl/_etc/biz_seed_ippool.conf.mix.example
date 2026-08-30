@@ -1,0 +1,14 @@
+-- Private hub configuration for biz_seed_ippool.mix.
+-- Copy this file to `_etc/biz_seed_ippool.conf.mix` in the control hub and
+-- replace every placeholder with site values. Each entry seeds one address.
+biz_seed_ippool: {
+  schema_version: 1,
+  seeds: {
+    development: {
+      target_node: "alpha",
+      database_path: "/home/user/sites/biz.example.org/data/biz.db",
+      ip: "192.0.2.20",
+      pool_node: "beta"
+    }
+  }
+}

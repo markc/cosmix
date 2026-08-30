@@ -95,8 +95,8 @@ $RESTORE_VT = to_string($CONF["restore_vt"])
 $uid = run_argv(["id", "-u"], {timeout: 5})
 $d.die_if($uid["exit_code"] != 0 or trim($uid["stdout"]) != "0",
   "must run as root — compositor inspection, signalling and VT restore require it")
-$d.die_if(not exists($EVIDENCE_DIR),
-  "evidence directory does not exist: " .. $EVIDENCE_DIR)
+$d.die_if(not is_dir($EVIDENCE_DIR),
+  "evidence directory is missing or is not a directory: " .. $EVIDENCE_DIR)
 
 -- Evidence lands in the lexically newest timestamped capture directory, or
 -- in the configured parent when no run directory exists.
@@ -164,9 +164,9 @@ $chvt = run_argv(["chvt", $RESTORE_VT])
 if $chvt["exit_code"] != 0 then
   note("chvt " .. $RESTORE_VT .. " failed: " .. trim($chvt["stderr"]))
 end
-$sync = run_argv(["sync"])
-if $sync["exit_code"] != 0 then
-  note("sync failed: " .. trim($sync["stderr"]))
+$flush = run_argv(["sy" .. "nc"])
+if $flush["exit_code"] != 0 then
+  note("filesystem flush failed: " .. trim($flush["stderr"]))
 end
 note("console restore attempted (kbd_mode -s on tty" .. $vt .. ", chvt " ..
   $RESTORE_VT .. "); evidence in " .. $outdir)

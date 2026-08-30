@@ -1,0 +1,7 @@
+-- smoke_chrome_shaders.conf.mix.example — private workstation evidence path.
+-- Copy this file to smoke_chrome_shaders.conf.mix in the private control hub
+-- and replace the placeholder with the developer workstation's real path.
+smoke_chrome_shaders: {
+  schema_version: 1,
+  evidence_dir: "/home/user/.local/state/cosmix/chrome-shader-smoke"
+}

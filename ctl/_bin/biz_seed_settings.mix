@@ -1,0 +1,215 @@
+#!/usr/bin/env mix
+-- biz_seed_settings.mix — seed one configured webd site's provisioning
+-- settings without replacing later administrator choices.
+--
+--   mix _bin/biz_seed_settings.mix alpha
+--
+-- The database path, eligible nodes, domains, address pools, provisioner
+-- targets, and account name are private site facts in
+-- _etc/biz_seed_settings.conf.mix. Exactly one node is required so this
+-- database-writing tool cannot fan out by accident.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$argv = args()
+if length($argv) != 1 then
+  print("usage: mix _bin/biz_seed_settings.mix <node>")
+  exit(2)
+end
+$REQUESTED_NODE = $argv[0]
+
+$CONF_PATH = $d.hub_root() .. "/_etc/biz_seed_settings.conf.mix"
+
+fn conf_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+if not is_file($CONF_PATH) then
+  print("  ERROR: no business settings seed config at " .. $CONF_PATH ..
+    " — create it from biz_seed_settings.conf.mix.example")
+  exit(2)
+end
+
+$CONF_DOC = nil
+try
+  $CONF_DOC = load_data($CONF_PATH)
+catch $config_error
+  conf_error("invalid strict-data config: " .. $config_error)
+end
+if type($CONF_DOC) != "map" then
+  conf_error("must contain a strict-data map")
+end
+
+$CONF = nil
+try
+  $CONF = validate($CONF_DOC["biz_seed_settings"], {
+    schema_version: {type: "integer", enum: [1]},
+    target_nodes: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}},
+    cms_db_path: {type: "string", nonblank: true},
+    settings: {type: "map", schema: {
+      provision_allowed_domains: {type: "string", nonblank: true},
+      provision_ip_pool: {type: "string", nonblank: true},
+      provision_pve_hosts: {type: "string", nonblank: true},
+      house_bootstrap_email: {type: "string", nonblank: true}
+    }}
+  })
+catch $config_error
+  conf_error("invalid biz_seed_settings map: " .. $config_error)
+end
+
+$SETTING_KEYS = [
+  "provision_allowed_domains",
+  "provision_ip_pool",
+  "provision_pve_hosts",
+  "house_bootstrap_email"
+]
+if length(keys($CONF["settings"])) != length($SETTING_KEYS) then
+  conf_error("settings must contain exactly " .. join($SETTING_KEYS, ", "))
+end
+if not starts_with($CONF["cms_db_path"], "/") then
+  conf_error("cms_db_path must be an absolute path")
+end
+
+fn is_in($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+for each $node in $CONF["target_nodes"]
+  $count = 0
+  for each $candidate in $CONF["target_nodes"]
+    if $candidate == $node then
+      $count = $count + 1
+    end
+  end
+  if $count > 1 then
+    conf_error("duplicate target node '" .. $node .. "'")
+  end
+end
+
+$ROSTER = $d.roster()
+$NODE = $d.parse_nodes($ROSTER, [$REQUESTED_NODE], [])["nodes"][0]
+if not is_in($CONF["target_nodes"], $NODE) then
+  conf_error("node '" .. $NODE .. "' is not in target_nodes")
+end
+
+$ADDRESS = $NODE
+if not $d.is_foreign($ROSTER, $NODE) then
+  $ADDRESS = $d.mesh_ip($NODE)
+end
+$DB_PATH = $CONF["cms_db_path"]
+$SETTINGS = $CONF["settings"]
+
+-- ssh_mix proves the system interpreter is available. These read-only checks
+-- also preserve the old warmed-database refusal and prove that the database
+-- worker can be launched as the webd account before any write is attempted.
+$preflight = ssh_mix($ADDRESS, '
+if not is_file($db_path) then
+  raise($db_path .. " does not exist yet — warm the site once to create the schema, then re-run")
+end
+$uid = trim(run("id -u cosmix-webd"))
+if $rc != 0 or not regex_match("^[0-9]+$", $uid) then
+  raise("cosmix-webd account is unavailable")
+end
+$_sudo = run("sudo -n -u cosmix-webd true")
+if $rc != 0 then
+  raise("cannot run the seed worker as cosmix-webd with non-interactive sudo")
+end
+print("BIZ_SEED_PREFLIGHT_OK")
+', {bindings: {db_path: $DB_PATH}, timeout: 30})
+$d.die_if(not $preflight["ok"] or
+  not contains($preflight["stdout"], "BIZ_SEED_PREFLIGHT_OK"),
+  $NODE .. " preflight failed: " .. trim($preflight["stdout"]) .. " " ..
+  trim($preflight["stderr"]))
+
+-- The worker is deliberately run under webd's uid so SQLite WAL and shared
+-- memory files retain the same ownership as the serving process. Site values
+-- travel as strict data, not as shell arguments or generated source.
+$WORKER_SOURCE = '
+$payload_path = args()[0]
+$payload = load_data($payload_path)["biz_seed_settings_payload"]
+$db_path = $payload["cms_db_path"]
+$settings = $payload["settings"]
+$setting_keys = $payload["setting_keys"]
+$token = $payload["token"]
+
+if not is_file($db_path) then
+  print("ERROR: " .. $db_path .. " does not exist yet — warm the site once to create the schema, then re-run")
+  exit(1)
+end
+
+$db = sqlopen($db_path, "rw")
+sqlexec($db,
+  "CREATE TABLE IF NOT EXISTS biz_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)", [])
+for each $key in $setting_keys
+  sqlexec($db, "INSERT INTO biz_settings (key, value) VALUES (?1, ?2)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                WHERE biz_settings.value = ?3", [$key, $settings[$key], ""])
+  $rows = sqlexec($db,
+    "SELECT value FROM biz_settings WHERE key = ?1", [$key])
+  if length($rows) != 1 or trim("" .. $rows[0]["value"]) == "" then
+    sqlclose($db)
+    print("ERROR: seed verification failed for " .. $key)
+    exit(1)
+  end
+  print($key .. " = " .. ("" .. $rows[0]["value"]))
+end
+sqlclose($db)
+print("BIZ_SEED_SETTINGS_OK " .. $token)
+'
+
+$TOKEN = uuid()
+$apply = ssh_mix($ADDRESS, '
+if not regex_match("^[0-9a-f-]+$", $token) then
+  raise("invalid invocation token")
+end
+$worker_path = "/tmp/biz-seed-settings-" .. $token .. ".mix"
+$payload_path = "/tmp/biz-seed-settings-" .. $token .. ".conf.mix"
+try
+  write_file($worker_path, $worker_source)
+  chmod($worker_path, 0o755)
+  write_file($payload_path, data_encode({biz_seed_settings_payload: {
+    cms_db_path: $db_path,
+    settings: $settings,
+    setting_keys: $setting_keys,
+    token: $token
+  }}))
+  chmod($payload_path, 0o644)
+catch $stage_error
+  remove($worker_path)
+  remove($payload_path)
+  raise("could not stage seed worker: " .. $stage_error)
+end
+
+$output = run("sudo -n -u cosmix-webd /opt/cosmix/bin/mix " ..
+  $worker_path .. " " .. $payload_path .. " 2>&1")
+$status = $rc
+remove($worker_path)
+remove($payload_path)
+if $status != 0 then
+  raise("seed worker failed: " .. $output)
+end
+if not contains($output, "BIZ_SEED_SETTINGS_OK " .. $token) then
+  raise("seed worker returned no invocation proof: " .. $output)
+end
+print($output)
+', {bindings: {
+  token: $TOKEN,
+  worker_source: $WORKER_SOURCE,
+  db_path: $DB_PATH,
+  settings: $SETTINGS,
+  setting_keys: $SETTING_KEYS
+}, timeout: 60})
+$d.die_if(not $apply["ok"] or
+  not contains($apply["stdout"], "BIZ_SEED_SETTINGS_OK " .. $TOKEN),
+  $NODE .. " seed failed: " .. trim($apply["stdout"]) .. " " ..
+  trim($apply["stderr"]))
+
+print(trim($apply["stdout"]))
+print("business settings seed verified on " .. $NODE)

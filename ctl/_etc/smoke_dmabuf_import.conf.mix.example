@@ -1,0 +1,8 @@
+-- smoke_dmabuf_import.conf.mix.example — private workstation GPU bindings.
+-- Copy this file to smoke_dmabuf_import.conf.mix in the private control hub
+-- and replace the placeholders with the developer workstation's real values.
+smoke_dmabuf_import: {
+  schema_version: 1,
+  render_node: "/dev/dri/renderD128",
+  evidence_dir: "/home/user/.local/state/cosmix/dmabuf-import-smoke"
+}

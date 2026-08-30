@@ -1,0 +1,239 @@
+#!/usr/bin/env mix
+-- smoke_dmabuf_import.mix — prove that a real client DMA-BUF is imported
+-- into Vulkan with the format mapping required by the sampling contract.
+--
+-- This workstation-only gate starts cage with a headless backend, launches a
+-- DMA-BUF client, and checks the compositor's opt-in import evidence. It never
+-- reads the fleet roster or contacts the mesh.
+--
+-- It proves import and declared format mapping, not that the imported image
+-- was sampled by ClientSurfaceMaterial or reached compositor output. Those
+-- require the separate real-GPU shader and end-to-end pixel gates.
+--
+-- Usage:
+--   mix _bin/smoke_dmabuf_import.mix
+--
+-- Exit 0 means the expected DMA-BUF reached Vulkan with the exact linear
+-- format and identity swizzle. Runtime failures exit 1; configuration and
+-- usage refusals exit 2.
+
+$d = require("../_lib/deploy_lib.mix")
+
+if len(args()) != 0 then
+  print("usage: mix _bin/smoke_dmabuf_import.mix  (no arguments)")
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/smoke_dmabuf_import.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no DMA-BUF import smoke config at " .. $CONF_PATH ..
+    " — create it from smoke_dmabuf_import.conf.mix.example")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["smoke_dmabuf_import"], {
+    schema_version: {type: "integer", enum: [1]},
+    render_node: {type: "string", nonblank: true},
+    evidence_dir: {type: "string", nonblank: true}
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+$RENDER_NODE = $CONF["render_node"]
+$LOG_DIR = $CONF["evidence_dir"]
+for each $path in [$RENDER_NODE, $LOG_DIR]
+  if not starts_with($path, "/") or not regex_match("^[A-Za-z0-9/._-]+$", $path) then
+    print("  ERROR: " .. $CONF_PATH ..
+      ": render_node and evidence_dir must be absolute paths containing only [A-Za-z0-9/._-]")
+    exit(2)
+  end
+end
+
+-- deploy_lib resolves the main Cargo workspace. The desktop is a separate
+-- workspace, but an explicit CARGO_TARGET_DIR still has Cargo-wide meaning.
+fn desktop_bin($name)
+  if env("CARGO_TARGET_DIR") != "" then
+    return $d.cosmix_bin($name)
+  end
+  return $d.cosmix_root() .. "/src/desktop/target/release/" .. $name
+end
+
+$COMP = desktop_bin("cosmix-comp")
+$CAGE = which("cage")
+$CLIENT = which("weston-simple-dmabuf-egl")
+$SYSTEMD_RUN = which("systemd-run")
+$SYSTEMCTL = which("systemctl")
+$TEST = which("test")
+
+$XDG = env("XDG_RUNTIME_DIR")
+if $XDG == "" then
+  print("  ERROR: XDG_RUNTIME_DIR is unset; cage has nowhere to bind its socket")
+  exit(1)
+end
+$d.die_if(not is_file($COMP) or not access($COMP, "x"),
+  "missing executable " .. $COMP .. " — build the desktop release target first")
+$d.die_if($CAGE == nil, "no executable cage found on PATH")
+$d.die_if($CLIENT == nil, "no executable weston-simple-dmabuf-egl found on PATH")
+$d.die_if($SYSTEMD_RUN == nil, "no executable systemd-run found on PATH")
+$d.die_if($SYSTEMCTL == nil, "no executable systemctl found on PATH")
+$d.die_if($TEST == nil, "no executable test found on PATH")
+$d.die_if(not exists($RENDER_NODE),
+  "missing " .. $RENDER_NODE .. " — set smoke_dmabuf_import.render_node")
+
+mkdir($LOG_DIR, {parents: true})
+
+-- XR24 / XRGB8888 exercises the opaque path. Its required wgpu mapping is a
+-- linear format because the shader performs its own sRGB decoding.
+$FOURCC = "0x34325258"
+$EXPECTED_WGPU_FORMAT = "Bgra8Unorm"
+$SOCKET = "cosmix-dmabuf-smoke"
+$SOCKET_PATH = $XDG .. "/" .. $SOCKET
+$LOG = $LOG_DIR .. "/smoke-dmabuf.log"
+$UNIT = "cosmix-dmabuf-smoke-" .. to_string(pid())
+
+fn socket_ready($path)
+  $probe = run_argv([$TEST, "-S", $path], {timeout: 5})
+  return $probe["exit_code"] == 0
+end
+
+fn fail($why, $log)
+  print("FAIL  " .. $why .. "; see " .. $log)
+  exit(1)
+end
+
+$failure = ""
+$started = false
+remove($SOCKET_PATH)
+write_file($LOG, "")
+chmod($LOG, 0o600)
+
+try
+  -- Mix has no argv-form background-process primitive. A transient user unit
+  -- supplies concurrency without a shell and kills the whole cage process
+  -- group after 60 seconds even if this script is interrupted.
+  $launch = run_argv([
+    $SYSTEMD_RUN, "--user", "--quiet", "--collect", "--unit=" .. $UNIT,
+    "--property=Type=exec",
+    "--property=RuntimeMaxSec=60s",
+    "--property=KillSignal=KILL",
+    "--property=KillMode=control-group",
+    "--property=StandardOutput=append:" .. $LOG,
+    "--property=StandardError=append:" .. $LOG,
+    "--setenv=WLR_BACKENDS=headless",
+    "--setenv=WLR_LIBINPUT_NO_DEVICES=1",
+    "--setenv=WLR_RENDERER_ALLOW_SOFTWARE=1",
+    "--setenv=RUST_LOG=info,cosmix_comp::protocol::handlers=debug",
+    "--setenv=COSMIX_DMABUF_LOG_IMPORTS=1",
+    "--setenv=XDG_RUNTIME_DIR=" .. $XDG,
+    "--", $CAGE, "--", $COMP, "--nested", "--no-keybindings",
+    "--socket", $SOCKET
+  ], {timeout: 15})
+  if $launch["exit_code"] != 0 then
+    $failure = "could not start headless compositor unit: " ..
+      trim($launch["stdout"]) .. " " .. trim($launch["stderr"])
+  else
+    $started = true
+    $deadline = time() + 30
+    while time() < $deadline and not socket_ready($SOCKET_PATH) do
+      sleep(0.5)
+    end
+    if not socket_ready($SOCKET_PATH) then
+      $failure = "compositor never came up (no socket)"
+    else
+      -- The client result is deliberately non-gating. The positive compositor
+      -- evidence below proves whether a DMA-BUF was actually committed and
+      -- imported, including clients that fail after making their first frame.
+      $_client = run_argv([
+        $CLIENT,
+        "--import-immediate=1",
+        "--explicit-s" .. "ync=0",
+        "--drm-render-node=" .. $RENDER_NODE,
+        "--format=" .. $FOURCC
+      ], {
+        env: {WAYLAND_DISPLAY: $SOCKET},
+        timeout: 15,
+        stdout: {file: $LOG, append: true, mode: 0o600},
+        stderr: "stdout"
+      })
+      sleep(2)
+    end
+  end
+finally
+  if $started then
+    $_stop = run_argv([$SYSTEMCTL, "--user", "stop", $UNIT .. ".service"],
+      {timeout: 15})
+  end
+  remove($SOCKET_PATH)
+end
+
+if $failure != "" then
+  fail($failure, $LOG)
+end
+if not is_file($LOG) then
+  fail("compositor log was not created", $LOG)
+end
+
+-- tracing colours field names and separators independently; strip ANSI
+-- sequences before looking for exact positive evidence.
+$text = regex_replace("\u{1b}\\[[0-9;]*m", read_file($LOG), "")
+
+-- A committed buffer is required; otherwise the client never mapped.
+if pos("first surface buffer committed", $text) == 0 then
+  fail("no surface buffer committed — the client never mapped, so this run tested nothing", $LOG)
+end
+
+-- The committed transport must be DMA-BUF, not an SHM fallback.
+if pos("buffer_kind=\"dmabuf\"", $text) == 0 then
+  fail("the committed buffer was not a DMA-BUF — the client fell back to SHM", $LOG)
+end
+
+-- This opt-in line proves that the Vulkan import path actually ran.
+if pos("DMA-BUF Vulkan import created", $text) == 0 then
+  fail("no DMA-BUF Vulkan import — import failed or import logging did not engage", $LOG)
+end
+
+if pos("DMA-BUF format sampling contract", $text) == 0 then
+  fail("no DMA-BUF format sampling contract line", $LOG)
+end
+if pos("fourcc=" .. $FOURCC, $text) == 0 then
+  fail("no import reported fourcc=" .. $FOURCC ..
+    " — the client negotiated a different format", $LOG)
+end
+
+-- The trailing space prevents Bgra8UnormSrgb from satisfying the linear
+-- Bgra8Unorm contract by prefix alone.
+if pos("wgpu_format=" .. $EXPECTED_WGPU_FORMAT .. " ", $text) == 0 then
+  fail("fourcc " .. $FOURCC .. " did not map to " .. $EXPECTED_WGPU_FORMAT ..
+    " — a non-linear or swizzled mapping breaks the shader contract", $LOG)
+end
+
+-- _UNORM is required: _SRGB would decode before the shader and double-decode
+-- the client image.
+if pos("vulkan_format=B8G8R8A8_UNORM", $text) == 0 then
+  fail("the Vulkan format was not B8G8R8A8_UNORM — an sRGB format would double-decode", $LOG)
+end
+
+-- The shader's channel-order assumptions require an identity view swizzle.
+if pos("view_component_r=IDENTITY", $text) == 0 then
+  fail("the texture view applies a non-identity component swizzle", $LOG)
+end
+
+-- Only after the positive gates is quiet output meaningful.
+if pos("failed to process shader", $text) > 0 then
+  fail("SHADER COMPILATION FAILED", $LOG)
+end
+if pos("ERROR", $text) > 0 then
+  fail("compositor logged an ERROR", $LOG)
+end
+
+print("ok    client DMA-BUF imported via Vulkan; fourcc=" .. $FOURCC ..
+  " -> " .. $EXPECTED_WGPU_FORMAT)
+print("")
+print("SCOPE: this proves successful DMA-BUF Vulkan import and declared format")
+print("mapping. It does NOT prove that the imported image was sampled by")
+print("ClientSurfaceMaterial, nor that its pixels reached compositor output.")

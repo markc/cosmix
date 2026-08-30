@@ -1,0 +1,51 @@
+-- Private site facts for seed_dev_pim.mix.
+-- Copy this file to seed_dev_pim.conf.mix in the private control hub and
+-- replace every placeholder. Supply the account password only at runtime.
+seed_dev_pim: {
+  schema_version: 1,
+  node: "alpha",
+  account_email: "admin@example.org",
+  jmap_port: 8443,
+  smtp_port: 25,
+  ssl_verify: false,
+  contacts: [
+    {
+      full_name: "Alice Example",
+      email: "alice@example.org",
+      company: "Example Company",
+      phone: "+61 400 111 222"
+    },
+    {
+      full_name: "Bob Example",
+      email: "bob@example.net",
+      company: "Example Studio",
+      phone: "+61 400 333 444"
+    }
+  ],
+  events: [
+    {
+      title: "Team stand-up",
+      start: "2026-09-01T09:00:00Z",
+      end: "2026-09-01T09:30:00Z"
+    },
+    {
+      title: "Design review",
+      start: "2026-09-02T04:00:00Z",
+      end: "2026-09-02T05:00:00Z"
+    }
+  ],
+  messages: [
+    {
+      from: "alice@example.org",
+      subject: "Welcome to the development site",
+      date: "Tue, 01 Sep 2026 10:30:00 +1000",
+      body: "Hello Admin,\r\n\r\nThis is sample content for the Mail page.\r\n\r\nAlice"
+    },
+    {
+      from: "newsletter@example.net",
+      subject: "Weekly development digest",
+      date: "Wed, 02 Sep 2026 11:30:00 +1000",
+      body: "Two updates this week:\r\n\r\n1. The sample site is ready\r\n2. PIM data is available for styling"
+    }
+  ]
+}

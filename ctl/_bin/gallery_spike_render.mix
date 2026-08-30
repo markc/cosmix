@@ -1,0 +1,173 @@
+#!/usr/bin/env mix
+-- gallery_spike_render.mix — render a static gallery from a media index.
+--
+-- Reads indexed media metadata and writes an album index plus one thumbnail
+-- grid per top-level source directory. Thumbnail and preview files are
+-- expected in the output directory's cache/ child.
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn config_error($message)
+  print("  ERROR: " .. $message)
+  exit(2)
+end
+
+fn has_str($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn assert_only_keys($value, $allowed, $where)
+  if type($value) != "map" then
+    config_error($where .. " must be a map")
+  end
+  for each $key in keys($value)
+    if not has_str($allowed, $key) then
+      config_error($where .. " contains unknown key '" .. $key .. "'")
+    end
+  end
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/gallery_spike_render.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no gallery renderer configuration at " .. $CONF_PATH)
+  print("         copy _etc/gallery_spike_render.conf.mix.example there and set the local paths")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  assert_only_keys($loaded, ["gallery_spike_render"], $CONF_PATH)
+  $CONF = validate($loaded["gallery_spike_render"], {
+    schema_version: {type: "integer", enum: [1]},
+    database_path: {type: "string", nonblank: true},
+    output_dir: {type: "string", nonblank: true}
+  })
+  assert_only_keys($CONF, [
+    "schema_version", "database_path", "output_dir"
+  ], "gallery_spike_render")
+catch $error
+  config_error("invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+end
+
+$DB = $CONF["database_path"]
+$OUT = $CONF["output_dir"]
+if not starts_with($DB, "/") or not starts_with($OUT, "/") then
+  config_error($CONF_PATH .. " database_path and output_dir must be absolute paths")
+end
+if not is_file($DB) then
+  config_error("media index not found: " .. $DB)
+end
+if is_file($OUT) then
+  config_error("output_dir is a file, not a directory: " .. $OUT)
+end
+
+mkdir($OUT)
+$h = sqlopen($DB)
+
+fn esc($value)
+  return html_escape("" .. $value)
+end
+
+fn page($title, $body)
+  return "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>" .. esc($title) .. "</title>\n<style>body{font-family:system-ui,sans-serif;margin:0;background:#111;color:#eee}header{padding:1rem;background:#1a1a1a;position:sticky;top:0}a{color:#7ab8ff}h1{margin:0;font-size:1.1rem}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:6px;padding:8px}.grid a{display:block;aspect-ratio:16/9;overflow:hidden;background:#000;border-radius:4px}.grid img{width:100%;height:100%;object-fit:cover;display:block}.badge{font-size:.7rem;color:#999}.albums{padding:1rem;line-height:2}nav a{margin-right:1rem}</style></head>\n<body>" .. $body .. "</body></html>\n"
+end
+
+-- A top-level album is the first source-relative path segment.
+fn top_dir($relative_path)
+  $separator = pos("/", $relative_path)
+  if $separator == 0 then
+    return "(root)"
+  end
+  return substr($relative_path, 0, $separator - 1)
+end
+
+$rows = sqlexec($h, "SELECT id, relpath, kind, taken_at, date_source FROM media WHERE deleted = 0 ORDER BY taken_at")
+$albums = {}
+$album_order = []
+$years = {}
+$year_order = []
+$undated = 0
+$total = 0
+for each $row in $rows
+  $total = $total + 1
+  $dir = top_dir($row.relpath)
+  if $albums[$dir] == nil then
+    $albums[$dir] = []
+    push($album_order, $dir)
+  end
+  -- Lists read from maps are values: mutate a local list, then store it back.
+  $items = $albums[$dir]
+  push($items, $row)
+  $albums[$dir] = $items
+
+  $year = "unknown"
+  if $row.taken_at != nil and length("" .. $row.taken_at) >= 4 then
+    $year = substr("" .. $row.taken_at, 0, 4)
+  end
+  if $years[$year] == nil then
+    $years[$year] = 0
+    push($year_order, $year)
+  end
+  $years[$year] = $years[$year] + 1
+  if $row.date_source == "mtime" then
+    $undated = $undated + 1
+  end
+end
+
+fn tile($row)
+  $thumb = "cache/" .. ("" .. $row.id) .. "_256.webp"
+  $preview = "cache/" .. ("" .. $row.id) .. "_1600.webp"
+  $estimated = ""
+  if $row.date_source == "mtime" then
+    $estimated = "<span class=\"badge\">~est</span>"
+  end
+  $video = ""
+  if $row.kind == "video" then
+    $video = "&#9654;"
+  end
+  return "<a href=\"../" .. $preview .. "\" title=\"" .. esc($row.relpath) .. "\"><img loading=\"lazy\" src=\"../" .. $thumb .. "\" alt=\"" .. esc($row.relpath) .. "\">" .. $video .. $estimated .. "</a>"
+end
+
+mkdir($OUT .. "/albums")
+$sorted_albums = sort($album_order)
+for each $dir in $sorted_albums
+  $items = $albums[$dir]
+  $grid = "<div class=\"grid\">"
+  for each $row in $items
+    $grid = $grid .. tile($row)
+  end
+  $grid = $grid .. "</div>"
+  $body = "<header><nav><a href=\"../index.html\">&larr; Albums</a></nav><h1>" .. esc($dir) .. " &middot; " .. ("" .. length($items)) .. " items</h1></header>" .. $grid
+  write_file($OUT .. "/albums/" .. $dir .. ".html", page($dir, $body))
+end
+
+$album_body = "<div class=\"albums\"><h1>Albums (by folder)</h1>"
+for each $dir in $sorted_albums
+  $album_body = $album_body .. "<div><a href=\"albums/" .. esc($dir) .. ".html\">" .. esc($dir) .. "</a> <span class=\"badge\">" .. ("" .. length($albums[$dir])) .. "</span></div>"
+end
+$album_body = $album_body .. "</div>"
+
+$timeline = "<div class=\"albums\"><h1>Timeline (by capture date)</h1>"
+$sorted_years = sort($year_order)
+for each $year in $sorted_years
+  $timeline = $timeline .. "<div>" .. esc($year) .. " <span class=\"badge\">" .. ("" .. $years[$year]) .. "</span></div>"
+end
+$timeline = $timeline .. "</div>"
+
+$stats = "<div class=\"albums\"><span class=\"badge\">" .. ("" .. $total) .. " items &middot; " .. ("" .. length($sorted_albums)) .. " albums &middot; " .. ("" .. $undated) .. " date-estimated (needs review)</span></div>"
+$body = "<header><h1>Media gallery</h1></header>" .. $stats .. $album_body .. $timeline
+write_file($OUT .. "/index.html", page("Gallery", $body))
+
+print("=== gallery rendered ===")
+print("out:    " .. $OUT)
+print("items:  " .. ("" .. $total))
+print("albums: " .. ("" .. length($sorted_albums)))
+print("years:  " .. ("" .. length($sorted_years)))
+print("undated:" .. ("" .. $undated))
+sqlclose($h)

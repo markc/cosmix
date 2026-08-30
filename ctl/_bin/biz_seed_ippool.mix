@@ -1,0 +1,175 @@
+#!/usr/bin/env mix
+-- biz_seed_ippool.mix — seed one configured `free` ip_pool row in a webd
+-- site's business database.
+--
+--   mix _bin/biz_seed_ippool.mix <seed>
+--
+-- The private hub owns the target node, database path, address and provision
+-- node. An address already tracked in any state is left untouched. The insert
+-- and its exact postcondition are checked on the database host.
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn usage()
+  print("usage: mix _bin/biz_seed_ippool.mix <seed>")
+  exit(2)
+end
+
+fn config_error($path, $message)
+  print("  ERROR: invalid " .. $path .. ": " .. $message)
+  exit(2)
+end
+
+-- Keep the old token gate even though values now cross SSH and SQLite only as
+-- typed bindings. It rejects malformed site data before any network access.
+fn safe_token($value)
+  if $value == "" then
+    return false
+  end
+  $i = 0
+  while $i < len($value)
+    $char = substr($value, $i, 1)
+    $ok = (($char >= "a" and $char <= "z") or
+      ($char >= "0" and $char <= "9") or
+      $char == "." or $char == "-")
+    if not $ok then
+      return false
+    end
+    $i = $i + 1
+  end
+  return true
+end
+
+fn remote_host($roster, $node)
+  if $d.is_foreign($roster, $node) then
+    return $node
+  end
+  return $d.mesh_ip($node)
+end
+
+-- Refuse before loading private state or touching the network.
+$argv = args()
+if len($argv) != 1 then
+  usage()
+end
+$SEED_NAME = $argv[0]
+
+$CONF_PATH = $d.hub_root() .. "/_etc/biz_seed_ippool.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no biz_seed_ippool configuration at " .. $CONF_PATH)
+  print("         copy _etc/biz_seed_ippool.conf.mix.example there and configure a seed")
+  exit(2)
+end
+
+$CONF_DOC = nil
+try
+  $CONF_DOC = load_data($CONF_PATH)
+catch $message
+  config_error($CONF_PATH, "invalid strict-data config: " .. $message)
+end
+if type($CONF_DOC) != "map" or type($CONF_DOC["biz_seed_ippool"]) != "map" then
+  config_error($CONF_PATH, "expected a biz_seed_ippool map")
+end
+$CONF = $CONF_DOC["biz_seed_ippool"]
+if $CONF["schema_version"] != 1 or type($CONF["seeds"]) != "map" then
+  config_error($CONF_PATH, "expected biz_seed_ippool.schema_version: 1 and a seeds map")
+end
+$SEED = $CONF["seeds"][$SEED_NAME]
+if type($SEED) != "map" then
+  config_error($CONF_PATH, "unknown seed '" .. $SEED_NAME .. "'")
+end
+for each $key in ["target_node", "database_path", "ip", "pool_node"]
+  if type($SEED[$key]) != "string" or trim($SEED[$key]) == "" then
+    config_error($CONF_PATH, "seed '" .. $SEED_NAME .. "' needs a non-empty " .. $key)
+  end
+end
+if not safe_token($SEED["ip"]) or not safe_token($SEED["pool_node"]) then
+  config_error($CONF_PATH,
+    "seed '" .. $SEED_NAME .. "' has invalid ip/pool_node (allowed: a-z 0-9 . -)")
+end
+
+$ROSTER = $d.roster()
+$d.assert_node($ROSTER, $SEED["target_node"])
+$d.assert_node($ROSTER, $SEED["pool_node"])
+$TARGET = remote_host($ROSTER, $SEED["target_node"])
+$TOKEN = uuid()
+
+$reach = ssh_mix($TARGET, 'print("BIZ_IPPOOL_REACH " .. $token)', {
+  bindings: {token: $TOKEN}, connect_timeout: 8, timeout: 15
+})
+$d.die_if(not $reach["ok"] or
+  not contains($reach["stdout"], "BIZ_IPPOOL_REACH " .. $TOKEN),
+  $SEED["target_node"] .. " unreachable or not running the system Mix interpreter: " ..
+  trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+
+$result = ssh_mix($TARGET, '
+fn fail($message)
+  print("ERROR: " .. $message)
+  exit(1)
+end
+
+if not is_file($database_path) then
+  fail("db not found: " .. $database_path)
+end
+
+$db = nil
+try
+  $db = sqlopen($database_path, "rw")
+  $existing = sqlexec($db,
+    "SELECT status FROM ip_pool WHERE ip = ?", [$ip])
+  if len($existing) > 0 then
+    $status = "" .. $existing[0]["status"]
+    sqlclose($db)
+    $db = nil
+    print(data_encode({result: "exists", ip: $ip, status: $status, token: $token}))
+    exit(0)
+  end
+
+  $inserted = sqlexec($db,
+    "INSERT INTO ip_pool (ip, node, status) VALUES (?, ?, ?)",
+    [$ip, $pool_node, "free"])
+  if $inserted["affected"] != 1 then
+    fail("insert affected " .. $inserted["affected"] .. " rows; expected 1")
+  end
+  $check = sqlexec($db,
+    "SELECT node, status FROM ip_pool WHERE ip = ?", [$ip])
+  if len($check) != 1 or $check[0]["node"] != $pool_node or
+      $check[0]["status"] != "free" then
+    fail("post-insert row does not exactly match the requested node and free status")
+  end
+  sqlclose($db)
+  $db = nil
+  print(data_encode({result: "seeded", ip: $ip, node: $pool_node,
+    status: "free", token: $token}))
+catch $db_error
+  if $db != nil then
+    try
+      sqlclose($db)
+    catch $close_error
+      nil
+    end
+  end
+  fail("database operation failed: " .. $db_error)
+end
+', {bindings: {
+  database_path: $SEED["database_path"],
+  ip: $SEED["ip"],
+  pool_node: $SEED["pool_node"],
+  token: $TOKEN
+}, decode: "data", connect_timeout: 8, timeout: 30})
+
+$d.die_if(not $result["ok"],
+  "ip_pool seed failed on " .. $SEED["target_node"] .. ": " ..
+  trim($result["stdout"]) .. " " .. trim($result["stderr"]))
+$d.die_if(type($result["value"]) != "map" or $result["value"]["token"] != $TOKEN,
+  "ip_pool seed returned no matching completion token from " .. $SEED["target_node"])
+
+if $result["value"]["result"] == "exists" then
+  print("ip_pool row for " .. $SEED["ip"] .. " already exists (status=" ..
+    $result["value"]["status"] .. ") — leaving it alone")
+else
+  $d.die_if($result["value"]["result"] != "seeded",
+    "ip_pool seed returned an unknown result from " .. $SEED["target_node"])
+  print("seeded ip_pool: " .. $SEED["ip"] .. " node=" ..
+    $SEED["pool_node"] .. " status=free")
+end

@@ -1,0 +1,10 @@
+-- Private site configuration for biz_sw_pricing.mix.
+-- Copy to biz_sw_pricing.conf.mix in the control hub and replace the
+-- placeholders. The public starter deliberately ships no active config.
+biz_sw_pricing: {
+  schema_version: 1,
+  node: "alpha",
+  database_path: "/srv/www/example.org/web/data/cms.db",
+  sw_app_path: "/srv/www/example.org/shared/apps/sw.mix",
+  default_markup_pct: 20
+}

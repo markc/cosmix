@@ -1,0 +1,8 @@
+-- gate_explicit_sync_live.conf.mix.example — private local DRM gate bindings.
+-- Copy this file to gate_explicit_sync_live.conf.mix in the private control
+-- hub and replace the placeholders with values for the developer workstation.
+gate_explicit_sync_live: {
+  schema_version: 1,
+  render_node: "/dev/dri/renderD128",
+  evidence_dir: "/home/user/.local/state/cosmix/explicit-sync-live"
+}
