@@ -137,15 +137,15 @@ end
 -- (nightly job, another session) landing mid-deploy cannot make node N+1
 -- receive different bytes from node N. Caller removes it when done.
 fn snapshot_bin($bin)
-  $mk = run_rc("mktemp /tmp/cosmix-deploy-XXXXXX")
+  $mk = run_argv(["mktemp", "/tmp/cosmix-deploy-XXXXXX"])
   $snap = trim($mk["stdout"])
-  if $mk["rc"] != 0 or $snap == "" then
+  if $mk["exit_code"] != 0 or $snap == "" then
     print("  ERROR: mktemp failed for binary snapshot: " .. trim($mk["stderr"]))
     exit(1)
   end
-  $cp = run_rc("cp -f " .. shell_quote($bin) .. " " .. shell_quote($snap))
-  if $cp["rc"] != 0 then
-    $_rm = run_rc("rm -f " .. shell_quote($snap))
+  $cp = run_argv(["cp", "-f", $bin, $snap])
+  if $cp["exit_code"] != 0 then
+    $_rm = run_argv(["rm", "-f", $snap])
     print("  ERROR: binary snapshot cp failed: " .. trim($cp["stderr"]))
     exit(1)
   end

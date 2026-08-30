@@ -32,13 +32,13 @@ $ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
 -- The binary must exist AND accept a program on stdin (`mix -`) — a stale
 -- build lacking the feature must never ship fleet-wide. Purely local.
 $BIN = $d.cosmix_bin("mix")
-$probe = run_rc("printf 'print(\"stdin-ok\")\\n' | " .. shell_quote($BIN) .. " -")
-$d.die_if($probe["rc"] != 0 or not contains($probe["stdout"], "stdin-ok"),
+$probe = run_argv([$BIN, "-"], {stdin: "print(\"stdin-ok\")\n"})
+$d.die_if($probe["exit_code"] != 0 or not contains($probe["stdout"], "stdin-ok"),
   "local release binary missing or lacks `mix -` (build it first: cd $COSMIX/src && cargo build --release -p cosmix-mix): " .. trim($probe["stderr"]))
 print("local build: " .. $BIN .. " -> mix - OK")
 
-$bv = run_rc(shell_quote($BIN) .. " --version")
-$d.die_if($bv["rc"] != 0, "local --version failed: " .. trim($bv["stderr"]))
+$bv = run_argv([$BIN, "--version"])
+$d.die_if($bv["exit_code"] != 0, "local --version failed: " .. trim($bv["stderr"]))
 $ver = trim($bv["stdout"])
 print("local build version: " .. $ver)
 
@@ -77,8 +77,8 @@ fn deploy_remote($host)
 
   -- Transfer: scp works on a mix-shell node because sshd serves it through the
   -- internal-sftp subsystem, bypassing the login shell.
-  $scp = run_rc("scp -q -o BatchMode=yes -o ConnectTimeout=8 " .. shell_quote($BIN) .. " " .. shell_quote($host .. ":/opt/cosmix/bin/mix.new"))
-  $d.die_if($scp["rc"] != 0, "scp -> " .. $host .. ": " .. trim($scp["stderr"]))
+  $scp = run_argv(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", $BIN, $host .. ":/opt/cosmix/bin/mix.new"], {timeout: 120})
+  $d.die_if($scp["exit_code"] != 0, "scp -> " .. $host .. ": " .. trim($scp["stderr"]))
 
   -- Atomic install over the live login-shell binary (running shells keep
   -- their old inode); the new on-disk binary reports its version, which must
@@ -107,11 +107,16 @@ end
 fn deploy_foreign($host)
   print("")
   print("[" .. $host .. "] scp mix -> /opt/cosmix/bin/mix (foreign/bash)")
-  $mk = ssh_run($host, "mkdir -p /opt/cosmix/bin")
-  $d.die_if(not $mk["ok"], $host .. " mkdir failed: " .. trim($mk["stderr"]))
+  -- In Mix, on the node's own mix. A foreign node that has never had mix
+  -- installed cannot run this — that is provisioning, not deploying: use
+  -- provision_mix.mix for it first.
+  $mk = ssh_mix($host, 'mkdir("/opt/cosmix/bin", {parents: true}); print("mkdir-ok")')
+  $d.die_if(not $mk["ok"] or not contains($mk["stdout"], "mkdir-ok"),
+    $host .. " has no working /opt/cosmix/bin/mix (provision it with provision_mix.mix first): " .. trim($mk["stderr"]))
 
-  -- Plain string over the bash channel; a node with no mix yet is not a downgrade.
-  $pre = ssh_run($host, "/opt/cosmix/bin/mix --version")
+  -- ssh_mix runs the node's own mix; a node with no mix yet fails this and is
+  -- simply not a downgrade.
+  $pre = ssh_mix($host, 'print(run("/opt/cosmix/bin/mix --version"))')
   if $pre["ok"] then
     $d.assert_not_downgrade($host, $pre["stdout"], $ver, $ALLOW_DOWNGRADE)
   end
@@ -123,18 +128,18 @@ fn deploy_foreign($host)
   -- a no-op: the gates below interrogate the binary that landed. Foreign-only —
   -- legacy scp runs a remote `scp -t` through the login shell, which on a mesh
   -- node is Mix.
-  $scp_tail = " -q -o BatchMode=yes -o ConnectTimeout=8 " .. shell_quote($BIN) .. " " .. shell_quote($host .. ":/opt/cosmix/bin/mix")
-  $scp = run_rc("scp" .. $scp_tail)
-  if $scp["rc"] != 0 then
+  $scp_args = ["-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", $BIN, $host .. ":/opt/cosmix/bin/mix"]
+  $scp = run_argv(concat(["scp"], $scp_args), {timeout: 120})
+  if $scp["exit_code"] != 0 then
     print("  scp (sftp mode) failed, retrying with -O (legacy protocol): " .. trim($scp["stderr"]))
-    $scp = run_rc("scp -O" .. $scp_tail)
+    $scp = run_argv(concat(["scp", "-O"], $scp_args), {timeout: 120})
   end
-  $d.die_if($scp["rc"] != 0, "scp -> " .. $host .. ": " .. trim($scp["stderr"]))
+  $d.die_if($scp["exit_code"] != 0, "scp -> " .. $host .. ": " .. trim($scp["stderr"]))
 
   -- Same three assertions as the mesh path, over the bash channel. This path
   -- once stopped at the scp and reported "installed" — so a foreign node's
   -- real version was unknown until someone probed it by hand.
-  $ver_r = ssh_run($host, "/opt/cosmix/bin/mix --version")
+  $ver_r = ssh_mix($host, 'print(run("/opt/cosmix/bin/mix --version"))')
   $d.die_if(not $ver_r["ok"] or not contains($ver_r["stdout"], $ver),
     $host .. " version mismatch (want " .. $ver .. "): " .. trim($ver_r["stdout"]) .. " " .. trim($ver_r["stderr"]))
   print("  installed: " .. trim($ver_r["stdout"]))
@@ -161,7 +166,7 @@ for each $h in $nodes
     deploy_remote($h)
   end
 end
-$_rm = run_rc("rm -f " .. shell_quote($BIN))
+$_rm = run_argv(["rm", "-f", $BIN])
 
 print("")
 print("deploy complete: mix installed, --version asserted + mix -c and which(\"sh\") smokes verified on " .. join($nodes, " "))
