@@ -127,7 +127,7 @@ $AUTOSTART_DEST = "/etc/xdg/autostart"
 -- entry. Both live under a prefix the session already searches:
 -- /usr/local/share is in the default XDG_DATA_DIRS that dbus-daemon's
 -- <standard_session_servicedirs/> expands, and /usr/local/lib/systemd/user is
--- in `systemd-analyze --user unit-paths` (both verified on this machine).
+-- in the standard user-unit search path.
 $DBUS_DEST = "/usr/local/share/dbus-1/services"
 $USER_UNIT_DEST = "/usr/local/lib/systemd/user"
 $MANIFEST = "/opt/cosmix/share/cosmix-desktop.manifest"
@@ -1770,7 +1770,7 @@ for each $pinst in $plasmoid_installs
   assert_root_private_chain(["/", "/usr", "/usr/local", "/usr/local/share", "/usr/local/share/plasma", $PLASMOID_DEST, $p_root], true)
   $interior = ssh_mix($TARGET, '
 $bad = []
-for each $path in walk($root, {max_depth: 32, follow_symlinks: false, include_dirs: true})
+for each $path in walk($root, {follow_symlinks: false, include_dirs: true})
   $info = stat($path, {follow_symlinks: false})
   if not $info["is_dir"] and not $info["is_file"] then
     push($bad, $path)
@@ -1798,20 +1798,20 @@ print(data_encode($bad))
   -- scratch). The copy itself must never DEREFERENCE the user path either:
   -- GNU install follows a source symlink, so a tar swapped for a link to
   -- /dev/zero would have root fill the scratch filesystem, and a link to a
-  -- root-only file would pull its bytes (cold review 2026-07-28, #3 round 3).
+  -- root-only file would pull its bytes.
   -- dd opens the source exactly once with O_NOFOLLOW|O_NONBLOCK (iflag), so a
   -- swapped symlink fails at open instead of being followed, a writerless FIFO
   -- fails with EAGAIN instead of blocking, and a FIFO with a writer streaming
   -- zeros is capped by count= at 65 MiB of root-scratch garbage that the size
   -- check and tar audit below then refuse -- the unbounded-fill and
-  -- root-only-read oracles both die at this open (cold review 2026-07-28, #3
-  -- round 4). Mix's copy() has no nofollow/bound options yet; that gap is
+  -- root-only-read oracles both die at this open. Mix's copy() has no
+  -- nofollow/bound options yet; that gap is
   -- recorded as a Mix bug, and dd is the correct external tool meanwhile.
   --
   -- O_NOFOLLOW only covers the LAST component, so root must not read the tar
   -- out of the build stage at all: $HOME/.cache/... is user-owned end to end,
-  -- and swapping any ancestor for a symlink defeats the flag entirely (cold
-  -- review 2026-07-28, #3 round 5). The archive is handed over in a directory
+  -- and swapping any ancestor for a symlink defeats the flag entirely. The
+  -- archive is handed over in a directory
   -- root creates under the root-owned /opt/cosmix/share ancestry probed above:
   -- the LEAF is chowned to the invoking user so the unprivileged side can write
   -- the tar, but replacing the leaf itself needs write permission on
@@ -1883,7 +1883,7 @@ print("unpack-ok")
   end
   $eaudit = ssh_mix($TARGET, '
 $entries = []
-for each $path in walk($tree, {max_depth: 32, follow_symlinks: false, include_dirs: true})
+for each $path in walk($tree, {follow_symlinks: false, include_dirs: true})
   $info = stat($path, {follow_symlinks: false})
   $kind = $info["is_file"] ? "f" : ($info["is_dir"] ? "d" : "other")
   push($entries, {kind: $kind, path: substr($path, length($tree) + 1)})
@@ -1985,7 +1985,7 @@ function flush_ledger($shared_now)
   -- $SELECTED_APPS_ALL, not $APPS: the merge treats the selected list as "this
   -- run rewrites these entries". Merging with the Rust-only list preserved the
   -- EXISTING plasmoid entry and appended the fresh one -- a duplicate that the
-  -- validator refuses on the next partial run (cold review 2026-07-28, #1).
+  -- validator refuses on the next partial run.
   write_manifest(merge_manifest($existing_manifest, $installed, $SELECTED_APPS_ALL, concat($intent_shared, $shared_now)), $stage)
 end
 
@@ -2070,7 +2070,7 @@ if length($icon_installs) > 0 and $have_kiconfinder then
     -- not add anything -- but because $ICON_DEST precedes /usr/share in the
     -- default XDG_DATA_DIRS, the first index.theme found wins and a partial
     -- Directories= list SHADOWS the system theme: every hicolor-only icon on
-    -- the machine (verified 2026-07-26 with btop, brave-desktop, carla) stops
+    -- the machine stops
     -- resolving. Unresolvable icons are an environment fault to report, never
     -- one to paper over.
     print "unresolved icon names after install: " .. join($missing, ", ")
