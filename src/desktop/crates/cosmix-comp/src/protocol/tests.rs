@@ -1229,6 +1229,7 @@ const TEST_TOPLEVEL_ID: u32 = 11;
 const TEST_SUBSURFACE_SURFACE_ID: u32 = 12;
 const TEST_SUBSURFACE_ID: u32 = 13;
 const TEST_LINUX_DMABUF_ID: u32 = 14;
+const TEST_LAYER_SHELL_ID: u32 = 15;
 
 struct KeybindingHarness {
     server: ProtocolServer,
@@ -1488,7 +1489,7 @@ impl KeybindingHarness {
             renderer_events,
             _kms_commands: kms_commands,
             client_state,
-            next_callback_id: 15,
+            next_callback_id: 16,
             input,
         };
         harness.create_focused_subsurface_client();
@@ -1581,6 +1582,7 @@ impl KeybindingHarness {
         let (seat, seat_version) = globals["wl_seat"];
         let (subcompositor, subcompositor_version) = globals["wl_subcompositor"];
         let (linux_dmabuf, linux_dmabuf_version) = globals["zwp_linux_dmabuf_v1"];
+        let (layer_shell, layer_shell_version) = globals["zwlr_layer_shell_v1"];
         bind_global(
             &mut self.client,
             compositor,
@@ -1655,6 +1657,13 @@ impl KeybindingHarness {
             "zwp_linux_dmabuf_v1",
             linux_dmabuf_version.min(4),
             TEST_LINUX_DMABUF_ID,
+        );
+        bind_global(
+            &mut self.client,
+            layer_shell,
+            "zwlr_layer_shell_v1",
+            layer_shell_version.min(4),
+            TEST_LAYER_SHELL_ID,
         );
         self.registry_globals = globals;
         send_request(&mut self.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
@@ -11512,6 +11521,267 @@ fn chrome_resize_point(harness: &KeybindingHarness, edge: cosmix_deco::ResizeEdg
         ResizeEdge::BottomRight => (right + 1.0, bottom + 1.0),
     };
     (f64::from(outer.0 + local.0), f64::from(outer.1 + local.1))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TestLayerSpec {
+    layer: u32,
+    size: (u32, u32),
+    anchor: u32,
+    exclusive_zone: i32,
+    margin: (i32, i32, i32, i32),
+}
+
+impl Default for TestLayerSpec {
+    fn default() -> Self {
+        Self {
+            layer: WlrLayer::Top as u32,
+            size: (64, 32),
+            anchor: 0,
+            exclusive_zone: -1,
+            margin: (0, 0, 0, 0),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TestLayerSurface {
+    surface: u32,
+    layer_surface: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TestLayerPopup {
+    surface: u32,
+    xdg_surface: u32,
+    popup: u32,
+}
+
+fn create_test_layer_surface(
+    harness: &mut KeybindingHarness,
+    output: u32,
+    spec: TestLayerSpec,
+) -> TestLayerSurface {
+    let surface = harness.allocate_object_id();
+    let layer_surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface]),
+    );
+    let mut get_layer_surface = words(&[layer_surface, surface, output, spec.layer]);
+    get_layer_surface.extend_from_slice(&wire_string_argument("cosmix-test-layer"));
+    send_request(
+        &mut harness.client,
+        TEST_LAYER_SHELL_ID,
+        0,
+        &get_layer_surface,
+    );
+    set_test_layer_surface_state(harness, layer_surface, spec);
+    TestLayerSurface {
+        surface,
+        layer_surface,
+    }
+}
+
+fn set_test_layer_surface_state(
+    harness: &mut KeybindingHarness,
+    layer_surface: u32,
+    spec: TestLayerSpec,
+) {
+    send_request(
+        &mut harness.client,
+        layer_surface,
+        0,
+        &words(&[spec.size.0, spec.size.1]),
+    );
+    send_request(
+        &mut harness.client,
+        layer_surface,
+        1,
+        &words(&[spec.anchor]),
+    );
+    send_request(
+        &mut harness.client,
+        layer_surface,
+        2,
+        &words(&[spec.exclusive_zone as u32]),
+    );
+    send_request(
+        &mut harness.client,
+        layer_surface,
+        3,
+        &words(&[
+            spec.margin.0 as u32,
+            spec.margin.1 as u32,
+            spec.margin.2 as u32,
+            spec.margin.3 as u32,
+        ]),
+    );
+}
+
+fn configured_layer(traffic: &[(u32, u16, Vec<u8>)], layer_surface: u32) -> (u32, u32, u32) {
+    traffic
+        .iter()
+        .rev()
+        .find_map(|(object, opcode, body)| {
+            (*object == layer_surface && *opcode == 0).then(|| {
+                (
+                    u32::from_ne_bytes(body[0..4].try_into().expect("layer configure serial")),
+                    u32::from_ne_bytes(body[4..8].try_into().expect("layer configure width")),
+                    u32::from_ne_bytes(body[8..12].try_into().expect("layer configure height")),
+                )
+            })
+        })
+        .expect("layer surface receives a configure")
+}
+
+fn initial_configure_test_layer(
+    harness: &mut KeybindingHarness,
+    layer: TestLayerSurface,
+) -> (u32, u32, u32) {
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    configured_layer(&harness.sync(), layer.layer_surface)
+}
+
+fn map_test_layer_surface(
+    harness: &mut KeybindingHarness,
+    output: u32,
+    spec: TestLayerSpec,
+) -> (TestLayerSurface, (u32, u32, u32)) {
+    let layer = create_test_layer_surface(harness, output, spec);
+    let configured = initial_configure_test_layer(harness, layer);
+    send_request(
+        &mut harness.client,
+        layer.layer_surface,
+        6,
+        &words(&[configured.0]),
+    );
+    let buffer = harness.create_dmabuf_buffer_sized(configured.1.max(1), configured.2.max(1));
+    send_request(
+        &mut harness.client,
+        layer.surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    (layer, configured)
+}
+
+fn test_layer_record(harness: &KeybindingHarness, surface: u32) -> &SurfaceRecord {
+    harness
+        .server
+        .state
+        .surfaces
+        .values()
+        .find(|record| record.role.wl_surface().id().protocol_id() == surface)
+        .expect("layer surface remains tracked")
+}
+
+fn test_layer_protocol_configure_state(
+    harness: &KeybindingHarness,
+    surface: u32,
+) -> (bool, bool, Option<Serial>) {
+    let wl_surface = test_layer_record(harness, surface).role.wl_surface();
+    compositor::with_states(wl_surface, |states| {
+        let attributes = states
+            .data_map
+            .get::<LayerSurfaceData>()
+            .expect("test layer protocol attributes")
+            .lock()
+            .expect("layer attributes lock");
+        (
+            attributes.initial_configure_sent,
+            attributes.configured,
+            attributes.configure_serial,
+        )
+    })
+}
+
+fn create_test_layer_popup(
+    harness: &mut KeybindingHarness,
+    layer: TestLayerSurface,
+) -> TestLayerPopup {
+    let positioner = harness.allocate_object_id();
+    let surface = harness.allocate_object_id();
+    let xdg_surface = harness.allocate_object_id();
+    let popup = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        1,
+        &words(&[positioner]),
+    );
+    send_request(&mut harness.client, positioner, 1, &words(&[32, 24]));
+    send_request(&mut harness.client, positioner, 2, &words(&[0, 0, 16, 16]));
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        2,
+        &words(&[xdg_surface, surface]),
+    );
+    send_request(
+        &mut harness.client,
+        xdg_surface,
+        2,
+        &words(&[popup, 0, positioner]),
+    );
+    send_request(
+        &mut harness.client,
+        layer.layer_surface,
+        5,
+        &words(&[popup]),
+    );
+    harness.dispatch_client();
+    TestLayerPopup {
+        surface,
+        xdg_surface,
+        popup,
+    }
+}
+
+fn initial_configure_test_popup(
+    harness: &mut KeybindingHarness,
+    popup: TestLayerPopup,
+) -> (u32, Vec<(u32, u16, Vec<u8>)>) {
+    send_request(&mut harness.client, popup.surface, 6, &[]);
+    let traffic = harness.sync();
+    let serial = traffic
+        .iter()
+        .rev()
+        .find_map(|(object, opcode, body)| {
+            (*object == popup.xdg_surface && *opcode == 0)
+                .then(|| u32::from_ne_bytes(body[0..4].try_into().expect("popup serial")))
+        })
+        .expect("layer popup receives an initial configure");
+    (serial, traffic)
+}
+
+fn map_test_layer_popup(
+    harness: &mut KeybindingHarness,
+    layer: TestLayerSurface,
+) -> TestLayerPopup {
+    let popup = create_test_layer_popup(harness, layer);
+    let (serial, _) = initial_configure_test_popup(harness, popup);
+    send_request(&mut harness.client, popup.xdg_surface, 4, &words(&[serial]));
+    let buffer = harness.create_dmabuf_buffer_sized(32, 24);
+    send_request(
+        &mut harness.client,
+        popup.surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, popup.surface, 6, &[]);
+    harness.dispatch_client();
+    popup
 }
 
 fn map_test_popup(harness: &mut KeybindingHarness, grab_serial: Option<u32>) -> (ObjectId, u32) {
@@ -24905,4 +25175,1681 @@ fn an_overflowing_validation_queue_refuses_without_blocking_the_protocol_thread(
     for call in calls.iter() {
         assert_eq!(*call, expected_probed_buffer(call.thread.clone()));
     }
+}
+
+#[test]
+fn layer_shell_global_is_advertised_at_v4_and_bound_by_the_wire_harness() {
+    let mut harness = KeybindingHarness::new(true);
+    let &(name, version) = harness
+        .registry_globals
+        .get("zwlr_layer_shell_v1")
+        .expect("layer-shell global is advertised");
+    assert_ne!(name, 0);
+    assert_eq!(version, 4);
+
+    let layer = create_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    harness.dispatch_client();
+    harness.assert_client_connected("after binding and creating a layer surface");
+    assert!(matches!(
+        test_layer_record(&harness, layer.surface).role,
+        SurfaceRole::Layer(_)
+    ));
+}
+
+#[test]
+fn layer_surface_receives_no_configure_before_its_first_empty_commit() {
+    let mut harness = KeybindingHarness::new(true);
+    let layer = create_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let traffic = harness.sync();
+    assert!(
+        traffic
+            .iter()
+            .all(|(object, opcode, _)| *object != layer.layer_surface || *opcode != 0)
+    );
+    assert_eq!(
+        test_layer_record(&harness, layer.surface).required_configure,
+        None
+    );
+}
+
+#[test]
+fn layer_role_creation_rejects_a_previously_committed_buffer() {
+    let mut harness = KeybindingHarness::new(true);
+    let surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface]),
+    );
+    let buffer = harness.create_dmabuf_buffer_sized(16, 8);
+    send_request(&mut harness.client, surface, 1, &words(&[buffer, 0, 0]));
+    send_request(&mut harness.client, surface, 6, &[]);
+    harness.dispatch_client();
+
+    let layer_surface = harness.allocate_object_id();
+    let mut get_layer_surface = words(&[layer_surface, surface, 0, WlrLayer::Top as u32]);
+    get_layer_surface.extend_from_slice(&wire_string_argument("already-constructed"));
+    send_request(
+        &mut harness.client,
+        TEST_LAYER_SHELL_ID,
+        0,
+        &get_layer_surface,
+    );
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(
+        offending, TEST_LAYER_SHELL_ID,
+        "already_constructed belongs to the layer-shell global: {message}"
+    );
+    assert_eq!(code, zwlr_layer_shell_v1::Error::AlreadyConstructed as u32);
+    assert!(
+        harness
+            .server
+            .state
+            .surfaces
+            .keys()
+            .all(|object| object.protocol_id() != surface),
+        "the refused layer role is never registered"
+    );
+}
+
+#[test]
+fn layer_role_creation_allows_a_roleless_empty_commit() {
+    let mut harness = KeybindingHarness::new(true);
+    let surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface]),
+    );
+    send_request(&mut harness.client, surface, 6, &[]);
+    harness.dispatch_client();
+
+    let layer_surface = harness.allocate_object_id();
+    let mut request = words(&[layer_surface, surface, 0, WlrLayer::Top as u32]);
+    request.extend_from_slice(&wire_string_argument("empty-commit"));
+    send_request(&mut harness.client, TEST_LAYER_SHELL_ID, 0, &request);
+    harness.dispatch_client();
+
+    harness.assert_client_connected("after assigning a layer role following an empty commit");
+    assert!(matches!(
+        test_layer_record(&harness, surface).role,
+        SurfaceRole::Layer(_)
+    ));
+}
+
+#[test]
+fn existing_surface_role_precedes_layer_already_constructed() {
+    let mut harness = KeybindingHarness::new(true);
+    let parent = harness.allocate_object_id();
+    let child = harness.allocate_object_id();
+    let subsurface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[parent]),
+    );
+    send_request(&mut harness.client, TEST_COMPOSITOR_ID, 0, &words(&[child]));
+    send_request(
+        &mut harness.client,
+        TEST_SUBCOMPOSITOR_ID,
+        1,
+        &words(&[subsurface, child, parent]),
+    );
+    let buffer = harness.create_dmabuf_buffer_sized(16, 8);
+    send_request(&mut harness.client, child, 1, &words(&[buffer, 0, 0]));
+
+    let layer_surface = harness.allocate_object_id();
+    let mut request = words(&[layer_surface, child, 0, WlrLayer::Top as u32]);
+    request.extend_from_slice(&wire_string_argument("existing-role"));
+    send_request(&mut harness.client, TEST_LAYER_SHELL_ID, 0, &request);
+    harness.dispatch_client();
+
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(
+        offending, TEST_LAYER_SHELL_ID,
+        "the existing role takes precedence over buffer history: {message}"
+    );
+    assert_eq!(code, zwlr_layer_shell_v1::Error::Role as u32);
+}
+
+#[test]
+fn dormant_layer_role_cannot_be_reconstructed_on_the_same_surface() {
+    let mut harness = KeybindingHarness::new(true);
+    let layer = create_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    send_request(&mut harness.client, layer.layer_surface, 7, &[]);
+    harness.dispatch_client();
+    assert!(matches!(
+        test_layer_record(&harness, layer.surface).role,
+        SurfaceRole::Dormant(_)
+    ));
+
+    let replacement = harness.allocate_object_id();
+    let mut request = words(&[replacement, layer.surface, 0, WlrLayer::Top as u32]);
+    request.extend_from_slice(&wire_string_argument("dormant-role"));
+    send_request(&mut harness.client, TEST_LAYER_SHELL_ID, 0, &request);
+    harness.dispatch_client();
+
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(
+        offending, TEST_LAYER_SHELL_ID,
+        "the dormant compositor role remains authoritative: {message}"
+    );
+    assert_eq!(code, zwlr_layer_shell_v1::Error::Role as u32);
+}
+
+#[test]
+fn layer_role_creation_remembers_attach_then_detach_without_commit() {
+    let mut harness = KeybindingHarness::new(true);
+    let surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface]),
+    );
+    let buffer = harness.create_dmabuf_buffer_sized(16, 8);
+    send_request(&mut harness.client, surface, 1, &words(&[buffer, 0, 0]));
+    send_request(&mut harness.client, surface, 1, &words(&[0, 0, 0]));
+
+    let layer_surface = harness.allocate_object_id();
+    let mut request = words(&[layer_surface, surface, 0, WlrLayer::Top as u32]);
+    request.extend_from_slice(&wire_string_argument("attach-then-detach"));
+    send_request(&mut harness.client, TEST_LAYER_SHELL_ID, 0, &request);
+    harness.dispatch_client();
+
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(
+        offending, TEST_LAYER_SHELL_ID,
+        "the first non-null attach is permanent construction history: {message}"
+    );
+    assert_eq!(code, zwlr_layer_shell_v1::Error::AlreadyConstructed as u32);
+}
+
+#[test]
+fn layer_first_empty_commit_arranges_then_emits_one_gated_initial_configure() {
+    let mut harness = KeybindingHarness::new(true);
+    let layer = create_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    let traffic = harness.sync();
+    let configures = traffic
+        .iter()
+        .filter(|(object, opcode, _)| *object == layer.layer_surface && *opcode == 0)
+        .count();
+    assert_eq!(configures, 1);
+    let (serial, width, height) = configured_layer(&traffic, layer.layer_surface);
+    assert_eq!((width, height), (64, 32));
+    let record = test_layer_record(&harness, layer.surface);
+    assert_eq!(record.required_configure.map(u32::from), Some(serial));
+    assert_eq!(record.last_acked_configure, None);
+}
+
+#[test]
+fn waybar_layer_sequence_keeps_the_client_configured_through_its_first_buffer() {
+    const WIDTH: u32 = 320;
+    const HEIGHT: u32 = 30;
+    const STRIDE: u32 = WIDTH * 4;
+    const POOL_BYTES: u32 = STRIDE * HEIGHT;
+    const TOP_LEFT_RIGHT: u32 = 1 | 4 | 8;
+
+    let mut harness = KeybindingHarness::new(true);
+    let &(output_name, output_version) = harness
+        .registry_globals
+        .get("wl_output")
+        .expect("nested output global");
+    let output = harness.allocate_object_id();
+    bind_global(
+        &mut harness.client,
+        output_name,
+        "wl_output",
+        output_version.min(4),
+        output,
+    );
+    let &(shm_name, shm_version) = harness
+        .registry_globals
+        .get("wl_shm")
+        .expect("wl_shm global");
+    let shm = harness.allocate_object_id();
+    bind_global(
+        &mut harness.client,
+        shm_name,
+        "wl_shm",
+        shm_version.min(1),
+        shm,
+    );
+    let _ = harness.sync();
+
+    let surface = harness.allocate_object_id();
+    let layer_surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface]),
+    );
+    send_request(&mut harness.client, surface, 1, &words(&[0, 0, 0]));
+    let mut get_layer_surface = words(&[layer_surface, surface, output, WlrLayer::Bottom as u32]);
+    get_layer_surface.extend_from_slice(&wire_string_argument("waybar"));
+    send_request(
+        &mut harness.client,
+        TEST_LAYER_SHELL_ID,
+        0,
+        &get_layer_surface,
+    );
+    send_request(&mut harness.client, layer_surface, 4, &words(&[0]));
+    send_request(&mut harness.client, layer_surface, 2, &words(&[HEIGHT]));
+    send_request(
+        &mut harness.client,
+        layer_surface,
+        1,
+        &words(&[TOP_LEFT_RIGHT]),
+    );
+    send_request(&mut harness.client, layer_surface, 3, &words(&[0, 0, 0, 0]));
+    send_request(&mut harness.client, layer_surface, 0, &words(&[0, HEIGHT]));
+    send_request(&mut harness.client, surface, 6, &[]);
+    let configured = harness.sync();
+    let (serial, configured_width, configured_height) =
+        configured_layer(&configured, layer_surface);
+    assert_eq!((configured_width, configured_height), (WIDTH, HEIGHT));
+    assert_eq!(
+        test_layer_protocol_configure_state(&harness, surface),
+        (true, false, None),
+        "Smithay tracks the emitted initial configure while the common gate waits for it"
+    );
+    send_request(&mut harness.client, layer_surface, 6, &words(&[serial]));
+
+    send_request(&mut harness.client, surface, 8, &words(&[1]));
+    let pool = harness.allocate_object_id();
+    let buffer = harness.allocate_object_id();
+    let frame = harness.allocate_object_id();
+    let name = CString::new("cosmix-waybar-layer").expect("static memfd name");
+    // SAFETY: name is a live NUL-terminated C string and the returned
+    // descriptor is transferred immediately into File.
+    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(
+        raw_fd >= 0,
+        "create anonymous test pool: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: memfd_create returned a new owned descriptor on success.
+    let pool_file = unsafe { File::from_raw_fd(raw_fd) };
+    pool_file
+        .set_len(u64::from(POOL_BYTES))
+        .expect("size anonymous waybar test pool");
+    send_request_with_fd(
+        &mut harness.client,
+        shm,
+        0,
+        &words(&[pool, POOL_BYTES]),
+        pool_file.as_fd(),
+    );
+    send_request(
+        &mut harness.client,
+        pool,
+        0,
+        &words(&[
+            buffer,
+            0,
+            WIDTH,
+            HEIGHT,
+            STRIDE,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    );
+    send_request(&mut harness.client, surface, 1, &words(&[buffer, 0, 0]));
+    send_request(&mut harness.client, surface, 8, &words(&[1]));
+    send_request(
+        &mut harness.client,
+        surface,
+        2,
+        &words(&[0, 0, WIDTH, HEIGHT]),
+    );
+    send_request(&mut harness.client, surface, 5, &words(&[0]));
+    send_request(&mut harness.client, surface, 3, &words(&[frame]));
+    send_request(&mut harness.client, surface, 6, &[]);
+    let _ = harness.sync();
+
+    harness.assert_client_connected("after the waybar-shaped first buffer commit");
+    let record = test_layer_record(&harness, surface);
+    assert!(record.mapped);
+    assert_eq!(record.buffer_dimensions, Some((WIDTH, HEIGHT)));
+    assert_eq!(record.required_configure, record.last_acked_configure);
+    assert_eq!(
+        test_layer_protocol_configure_state(&harness, surface),
+        (true, true, Some(Serial::from(serial))),
+        "Smithay and the common gate retain the same acknowledged configure"
+    );
+}
+
+#[test]
+fn layer_acknowledged_hint_applies_only_on_commit_without_resizing_content() {
+    let mut harness = KeybindingHarness::new(true);
+    let layer = create_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let configured = initial_configure_test_layer(&mut harness, layer);
+    let before = test_layer_record(&harness, layer.surface).layout;
+    send_request(
+        &mut harness.client,
+        layer.layer_surface,
+        6,
+        &words(&[configured.0]),
+    );
+    harness.dispatch_client();
+    let record = test_layer_record(&harness, layer.surface);
+    assert_eq!(
+        record.layout, before,
+        "ack alone cannot mutate scene geometry"
+    );
+    assert_eq!(record.configured_size, (1, 1));
+    assert_eq!(record.last_acked_size, Some((64, 32)));
+
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    let record = test_layer_record(&harness, layer.surface);
+    assert_eq!(record.configured_size, (64, 32));
+    assert_eq!(
+        record.layout, before,
+        "committing the hint without content does not invent texture geometry"
+    );
+
+    let buffer = harness.create_dmabuf_buffer_sized(16, 8);
+    send_request(
+        &mut harness.client,
+        layer.surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    let record = test_layer_record(&harness, layer.surface);
+    assert_eq!((record.layout.width, record.layout.height), (16.0, 8.0));
+}
+
+#[test]
+fn later_layer_map_configure_serial_blocks_the_pre_ack_buffer() {
+    const ALL_EDGES: u32 = 1 | 2 | 4 | 8;
+    let mut harness = KeybindingHarness::new(true);
+    let (first, initial) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            size: (0, 0),
+            anchor: ALL_EDGES,
+            ..TestLayerSpec::default()
+        },
+    );
+    assert!(harness.server.state.backend.resize_host_output((400, 300)));
+    let second = create_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    send_request(&mut harness.client, second.surface, 6, &[]);
+    let traffic = harness.sync();
+    let later = configured_layer(&traffic, first.layer_surface);
+    assert_ne!(later.0, initial.0);
+    assert_eq!((later.1, later.2), (400, 300));
+    assert_eq!(
+        test_layer_record(&harness, first.surface)
+            .required_configure
+            .map(u32::from),
+        Some(later.0)
+    );
+    let previous_dimensions = test_layer_record(&harness, first.surface).buffer_dimensions;
+    let previous_commits = test_layer_record(&harness, first.surface).commit_count;
+
+    let buffer = harness.create_dmabuf_buffer_sized(400, 300);
+    send_request(
+        &mut harness.client,
+        first.surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, first.surface, 6, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after refusing a buffer for an unacked later configure");
+    let refused = test_layer_record(&harness, first.surface);
+    assert_eq!(refused.buffer_dimensions, previous_dimensions);
+    assert_eq!(refused.commit_count, previous_commits);
+
+    send_request(
+        &mut harness.client,
+        first.layer_surface,
+        6,
+        &words(&[later.0]),
+    );
+    let accepted_buffer = harness.create_dmabuf_buffer_sized(400, 300);
+    send_request(
+        &mut harness.client,
+        first.surface,
+        1,
+        &words(&[accepted_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, first.surface, 6, &[]);
+    harness.dispatch_client();
+    let accepted = test_layer_record(&harness, first.surface);
+    assert_eq!(
+        accepted.buffer_dimensions,
+        Some((400, 300)),
+        "the same-sized buffer is accepted after the newest configure is acknowledged"
+    );
+    assert_eq!(accepted.required_configure, accepted.last_acked_configure);
+}
+
+#[test]
+fn output_resize_rearranges_all_edge_layer_and_gates_its_new_serial() {
+    const ALL_EDGES: u32 = 1 | 2 | 4 | 8;
+    let mut harness = KeybindingHarness::new(true);
+    let (layer, initial) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            size: (0, 0),
+            anchor: ALL_EDGES,
+            ..TestLayerSpec::default()
+        },
+    );
+    harness.server.state.resize_output(400, 300);
+    let traffic = harness.sync();
+    let resized = configured_layer(&traffic, layer.layer_surface);
+    assert_ne!(resized.0, initial.0);
+    assert_eq!((resized.1, resized.2), (400, 300));
+    let record = test_layer_record(&harness, layer.surface);
+    assert_eq!(record.required_configure.map(u32::from), Some(resized.0));
+    assert_eq!((record.layout.width, record.layout.height), (320.0, 240.0));
+}
+
+#[test]
+fn hostile_layer_margin_is_rejected_before_layer_map_arrange() {
+    const LEFT: u32 = 4;
+    let mut harness = KeybindingHarness::new(true);
+    let output = harness
+        .server
+        .state
+        .backend
+        .default_output()
+        .expect("nested output");
+    let layer = create_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: LEFT,
+            margin: (0, 0, 0, i32::MIN),
+            ..TestLayerSpec::default()
+        },
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(layer_map_for_output(&output).len(), 0);
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(
+        offending, layer.layer_surface,
+        "wrong error object: {message}"
+    );
+    assert_eq!(code, zwlr_layer_surface_v1::Error::InvalidSize as u32);
+}
+
+#[test]
+fn neutral_layer_is_rejected_when_prior_exclusive_zone_exhausts_its_margins() {
+    const TOP_LEFT_RIGHT: u32 = 1 | 4 | 8;
+    let mut harness = KeybindingHarness::new(true);
+    let _ = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT_RIGHT,
+            exclusive_zone: 200,
+            ..TestLayerSpec::default()
+        },
+    );
+    let neutral = create_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT_RIGHT,
+            exclusive_zone: 0,
+            margin: (50, 0, 0, 0),
+            ..TestLayerSpec::default()
+        },
+    );
+    send_request(&mut harness.client, neutral.surface, 6, &[]);
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(
+        offending, neutral.layer_surface,
+        "the neutral layer owns the negative progressive source: {message}"
+    );
+    assert_eq!(code, zwlr_layer_surface_v1::Error::InvalidSize as u32);
+    assert!(message.contains("negative arrangement area"));
+}
+
+#[test]
+fn zero_remaining_layer_zone_accepts_following_neutral_and_dont_care() {
+    const TOP_LEFT_RIGHT: u32 = 1 | 4 | 8;
+    let exhausting = TestLayerSpec {
+        anchor: TOP_LEFT_RIGHT,
+        exclusive_zone: 1080,
+        ..TestLayerSpec::default()
+    };
+
+    let mut sole = KeybindingHarness::new(true);
+    sole.server.state.resize_output(1920, 1080);
+    let _ = map_test_layer_surface(&mut sole, 0, exhausting);
+    let sole_output = sole
+        .server
+        .state
+        .backend
+        .default_output()
+        .expect("nested output");
+    assert_eq!(layer_map_for_output(&sole_output).len(), 1);
+    sole.assert_client_connected("after one layer legally consumes the full output height");
+
+    let mut neutral = KeybindingHarness::new(true);
+    neutral.server.state.resize_output(1920, 1080);
+    let _ = map_test_layer_surface(&mut neutral, 0, exhausting);
+    let (_, neutral_configure) = map_test_layer_surface(
+        &mut neutral,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT_RIGHT,
+            exclusive_zone: 0,
+            ..TestLayerSpec::default()
+        },
+    );
+    assert_eq!(
+        neutral_configure.2, 0,
+        "Smithay configures a zero-height neutral layer from the exhausted progressive source"
+    );
+    let neutral_output = neutral
+        .server
+        .state
+        .backend
+        .default_output()
+        .expect("nested output");
+    assert_eq!(layer_map_for_output(&neutral_output).len(), 2);
+    neutral.assert_client_connected("after a neutral layer accepts a zero progressive source");
+
+    let mut dont_care = KeybindingHarness::new(true);
+    dont_care.server.state.resize_output(1920, 1080);
+    let _ = map_test_layer_surface(&mut dont_care, 0, exhausting);
+    let _ = map_test_layer_surface(
+        &mut dont_care,
+        0,
+        TestLayerSpec {
+            exclusive_zone: -1,
+            ..TestLayerSpec::default()
+        },
+    );
+    let dont_care_output = dont_care
+        .server
+        .state
+        .backend
+        .default_output()
+        .expect("nested output");
+    assert_eq!(layer_map_for_output(&dont_care_output).len(), 2);
+    dont_care.assert_client_connected("after a DontCare layer ignores the exhausted zone");
+}
+
+#[test]
+fn cumulative_exclusive_zones_are_capped_per_output_before_arrange() {
+    let mut harness = KeybindingHarness::new(true);
+    let individually_valid = (MAX_LAYER_GEOMETRY_VALUE / 2 + 1) as i32;
+    let _ = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            exclusive_zone: individually_valid,
+            ..TestLayerSpec::default()
+        },
+    );
+    let overflowing = create_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            exclusive_zone: individually_valid,
+            ..TestLayerSpec::default()
+        },
+    );
+    send_request(&mut harness.client, overflowing.surface, 6, &[]);
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(
+        offending, overflowing.layer_surface,
+        "the layer that crosses the cumulative cap owns the error: {message}"
+    );
+    assert_eq!(code, zwlr_layer_surface_v1::Error::InvalidSize as u32);
+    assert!(message.contains("cumulative exclusive zone"));
+}
+
+#[test]
+fn removed_layer_output_binding_migrates_default_and_closes_explicit() {
+    let harness = KeybindingHarness::new(true);
+    let live = harness
+        .server
+        .state
+        .backend
+        .default_output()
+        .expect("nested output");
+    let detached = Output::new(
+        "detached-layer-output".into(),
+        PhysicalProperties {
+            size: (1, 1).into(),
+            subpixel: Subpixel::Unknown,
+            make: "CosMix".into(),
+            model: "Detached test output".into(),
+        },
+    );
+    assert!(matches!(
+        LayerOutputBinding::Default(detached.clone()).transition(Some(&live), |_| false),
+        LayerOutputTransition::Migrate(output) if output == live
+    ));
+    assert!(matches!(
+        LayerOutputBinding::Explicit(detached).transition(Some(&live), |_| false),
+        LayerOutputTransition::Close
+    ));
+    assert!(matches!(
+        LayerOutputBinding::Default(live).transition(None, |_| true),
+        LayerOutputTransition::Keep
+    ));
+}
+
+#[test]
+fn layer_map_arranges_anchor_exclusive_and_margin_cases_to_its_geometry() {
+    const TOP: u32 = 1;
+    const BOTTOM: u32 = 2;
+    const LEFT: u32 = 4;
+    const RIGHT: u32 = 8;
+    let cases = [
+        (
+            "centred-dont-care",
+            0,
+            -1,
+            (0, 0, 0, 0),
+            (140, 110, 40, 20),
+            (0, 0, 320, 240),
+        ),
+        (
+            "top-neutral",
+            TOP,
+            0,
+            (0, 0, 0, 0),
+            (140, 0, 40, 20),
+            (0, 0, 320, 240),
+        ),
+        (
+            "top-exclusive",
+            TOP,
+            10,
+            (0, 0, 0, 0),
+            (140, 0, 40, 20),
+            (0, 10, 320, 230),
+        ),
+        (
+            "bottom-exclusive",
+            BOTTOM,
+            10,
+            (0, 0, 0, 0),
+            (140, 220, 40, 20),
+            (0, 0, 320, 230),
+        ),
+        (
+            "left-exclusive",
+            LEFT,
+            10,
+            (0, 0, 0, 0),
+            (0, 110, 40, 20),
+            (10, 0, 310, 240),
+        ),
+        (
+            "right-exclusive",
+            RIGHT,
+            10,
+            (0, 0, 0, 0),
+            (280, 110, 40, 20),
+            (0, 0, 310, 240),
+        ),
+        (
+            "all-edges-with-margins",
+            TOP | BOTTOM | LEFT | RIGHT,
+            0,
+            (1, 2, 3, 4),
+            (4, 1, 314, 236),
+            (0, 0, 320, 240),
+        ),
+    ];
+
+    for (name, anchor, exclusive_zone, margin, expected, expected_zone) in cases {
+        let mut harness = KeybindingHarness::new(true);
+        let spec = TestLayerSpec {
+            size: (40, 20),
+            anchor,
+            exclusive_zone,
+            margin,
+            ..TestLayerSpec::default()
+        };
+        let (layer, configured) = map_test_layer_surface(&mut harness, 0, spec);
+        let record = test_layer_record(&harness, layer.surface);
+        let SurfaceRole::Layer(role) = &record.role else {
+            panic!("{name}: expected layer role")
+        };
+        let output = role.output.output().expect("mapped layer has an output");
+        let map = layer_map_for_output(output);
+        let geometry = map
+            .layer_geometry(&role.surface)
+            .unwrap_or_else(|| panic!("{name}: layer is in LayerMap"));
+        assert_eq!(
+            (geometry.loc.x, geometry.loc.y),
+            (expected.0, expected.1),
+            "{name}: LayerMap location"
+        );
+        let zone = map.non_exclusive_zone();
+        assert_eq!(
+            (zone.loc.x, zone.loc.y, zone.size.w, zone.size.h),
+            expected_zone,
+            "{name}: LayerMap non-exclusive zone"
+        );
+        assert_eq!(
+            (configured.1 as i32, configured.2 as i32),
+            (expected.2, expected.3),
+            "{name}: configure uses arranged size"
+        );
+        assert_eq!(
+            (record.layout.x as i32, record.layout.y as i32),
+            (expected.0, expected.1),
+            "{name}: scene location follows LayerMap"
+        );
+        assert_eq!(
+            (record.layout.width as i32, record.layout.height as i32),
+            (expected.2, expected.3),
+            "{name}: scene size follows the acknowledged configure"
+        );
+    }
+}
+
+#[test]
+fn layer_buffer_on_the_initial_commit_is_refused_before_any_configure() {
+    let mut harness = KeybindingHarness::new(true);
+    let layer = create_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(
+        &mut harness.client,
+        layer.surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    let (offending, _, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(
+        offending, layer.layer_surface,
+        "wrong error object: {message}"
+    );
+}
+
+#[test]
+fn layer_attach_then_detach_before_initial_configure_is_fatal() {
+    let mut harness = KeybindingHarness::new(true);
+    let layer = create_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(
+        &mut harness.client,
+        layer.surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, layer.surface, 1, &words(&[0, 0, 0]));
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(
+        offending, layer.layer_surface,
+        "wrong error object: {message}"
+    );
+    assert_eq!(code, zwlr_layer_shell_v1::Error::AlreadyConstructed as u32);
+    assert!(message.contains("never been configured"));
+}
+
+#[test]
+fn layer_attach_then_detach_after_unmap_reset_is_fatal() {
+    let mut harness = KeybindingHarness::new(true);
+    let (layer, _) = map_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    send_request(&mut harness.client, layer.surface, 1, &words(&[0, 0, 0]));
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        test_layer_record(&harness, layer.surface).required_configure,
+        None
+    );
+
+    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(
+        &mut harness.client,
+        layer.surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, layer.surface, 1, &words(&[0, 0, 0]));
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(
+        offending, layer.layer_surface,
+        "wrong error object: {message}"
+    );
+    assert_eq!(code, zwlr_layer_shell_v1::Error::AlreadyConstructed as u32);
+    assert!(message.contains("never been configured"));
+}
+
+#[test]
+fn layer_buffer_after_configure_but_before_matching_ack_is_refused() {
+    let mut harness = KeybindingHarness::new(true);
+    let layer = create_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let _ = initial_configure_test_layer(&mut harness, layer);
+    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(
+        &mut harness.client,
+        layer.surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    let (offending, _, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(
+        offending, layer.layer_surface,
+        "wrong error object: {message}"
+    );
+}
+
+#[test]
+fn matching_layer_ack_maps_visible_content_without_untracked_warning() {
+    let mut harness = KeybindingHarness::new(true);
+    let (layer, configured) = map_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    {
+        let record = test_layer_record(&harness, layer.surface);
+        assert!(record.mapped);
+        assert!(record.layout.visible);
+        assert_eq!(
+            record.last_acked_configure.map(u32::from),
+            Some(configured.0)
+        );
+        assert_eq!(record.last_acked_size, Some((64, 32)));
+        assert!(matches!(record.role, SurfaceRole::Layer(_)));
+    }
+    let replacement = harness.create_dmabuf_buffer_sized(16, 8);
+    send_request(
+        &mut harness.client,
+        layer.surface,
+        1,
+        &words(&[replacement, 0, 0]),
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    let record = test_layer_record(&harness, layer.surface);
+    assert_eq!(
+        (record.layout.width, record.layout.height),
+        (16.0, 8.0),
+        "a smaller layer buffer presents at its own size"
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        (
+            test_layer_record(&harness, layer.surface).layout.width,
+            test_layer_record(&harness, layer.surface).layout.height,
+        ),
+        (16.0, 8.0),
+        "a later no-buffer commit does not snap back to the configure hint"
+    );
+    assert!(harness.server.state.warned_unsupported_surfaces.is_empty());
+}
+
+#[test]
+fn null_layer_buffer_unmaps_scene_without_destroying_the_layer_role() {
+    let mut harness = KeybindingHarness::new(true);
+    let (layer, configured) = map_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let output = harness
+        .server
+        .state
+        .backend
+        .default_output()
+        .expect("nested output");
+    send_request(&mut harness.client, layer.surface, 1, &words(&[0, 0, 0]));
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    let record = test_layer_record(&harness, layer.surface);
+    assert!(!record.mapped);
+    assert!(!record.layout.visible);
+    assert!(matches!(record.role, SurfaceRole::Layer(_)));
+    assert_eq!(record.required_configure, None);
+    assert_eq!(record.last_acked_configure, None);
+    assert_eq!(layer_map_for_output(&output).len(), 0);
+    assert_eq!(
+        test_layer_protocol_configure_state(&harness, layer.surface),
+        (false, false, None),
+        "unmap clears Smithay's sent, configured and last-acked attributes"
+    );
+
+    let SurfaceRole::Layer(role) = &record.role else {
+        unreachable!("asserted layer role above")
+    };
+    let reset = role.surface.cached_state();
+    assert_eq!((reset.size.w, reset.size.h), (0, 0));
+    assert_eq!(reset.anchor, Anchor::empty());
+    assert_eq!(
+        (
+            reset.margin.top,
+            reset.margin.right,
+            reset.margin.bottom,
+            reset.margin.left,
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(reset.exclusive_zone, ExclusiveZone::Neutral);
+    assert_eq!(
+        reset.keyboard_interactivity,
+        smithay::wayland::shell::wlr_layer::KeyboardInteractivity::None
+    );
+    assert_eq!(reset.layer, WlrLayer::Top);
+
+    set_test_layer_surface_state(&mut harness, layer.layer_surface, TestLayerSpec::default());
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    let traffic = harness.sync();
+    let remap = configured_layer(&traffic, layer.layer_surface);
+    assert_ne!(remap.0, configured.0, "remap gets a fresh configure serial");
+    assert_eq!(layer_map_for_output(&output).len(), 1);
+    let record = test_layer_record(&harness, layer.surface);
+    assert_eq!(record.required_configure.map(u32::from), Some(remap.0));
+    assert_eq!(record.last_acked_configure, None);
+
+    let buffer = harness.create_dmabuf_buffer_sized(remap.1.max(1), remap.2.max(1));
+    send_request(
+        &mut harness.client,
+        layer.surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(
+        offending, layer.layer_surface,
+        "the unconfigured-buffer error belongs to the remapped layer: {message}"
+    );
+    assert_eq!(code, zwlr_layer_shell_v1::Error::AlreadyConstructed as u32);
+    assert!(message.contains("never been configured"));
+}
+
+#[test]
+fn null_layer_buffer_after_configure_restarts_an_unmapped_surface_cycle() {
+    let mut harness = KeybindingHarness::new(true);
+    let layer = create_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let initial = initial_configure_test_layer(&mut harness, layer);
+    let output = harness
+        .server
+        .state
+        .backend
+        .default_output()
+        .expect("nested output");
+    send_request(
+        &mut harness.client,
+        layer.layer_surface,
+        6,
+        &words(&[initial.0]),
+    );
+    harness.dispatch_client();
+    assert!(!test_layer_record(&harness, layer.surface).mapped);
+    assert_eq!(
+        test_layer_record(&harness, layer.surface).last_acked_configure,
+        Some(Serial::from(initial.0))
+    );
+    assert_eq!(layer_map_for_output(&output).len(), 1);
+
+    send_request(&mut harness.client, layer.surface, 1, &words(&[0, 0, 0]));
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    let reset = test_layer_record(&harness, layer.surface);
+    assert!(!reset.mapped);
+    assert_eq!(reset.required_configure, None);
+    assert_eq!(reset.last_acked_configure, None);
+    assert_eq!(layer_map_for_output(&output).len(), 0);
+
+    set_test_layer_surface_state(&mut harness, layer.layer_surface, TestLayerSpec::default());
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    let traffic = harness.sync();
+    let remap = configured_layer(&traffic, layer.layer_surface);
+    assert_ne!(remap.0, initial.0, "restart emits a fresh configure serial");
+    assert_eq!(layer_map_for_output(&output).len(), 1);
+
+    let buffer = harness.create_dmabuf_buffer_sized(remap.1.max(1), remap.2.max(1));
+    send_request(
+        &mut harness.client,
+        layer.surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(
+        offending, layer.layer_surface,
+        "wrong error object: {message}"
+    );
+    assert_eq!(code, zwlr_layer_shell_v1::Error::AlreadyConstructed as u32);
+    assert!(message.contains("never been configured"));
+}
+
+#[test]
+fn destroying_layer_role_unmaps_layer_map_and_leaves_dormant_surface() {
+    let mut harness = KeybindingHarness::new(true);
+    let (layer, _) = map_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let output = harness
+        .server
+        .state
+        .backend
+        .default_output()
+        .expect("nested output");
+    assert_eq!(layer_map_for_output(&output).len(), 1);
+    send_request(&mut harness.client, layer.layer_surface, 7, &[]);
+    harness.dispatch_client();
+    assert_eq!(layer_map_for_output(&output).len(), 0);
+    assert!(matches!(
+        test_layer_record(&harness, layer.surface).role,
+        SurfaceRole::Dormant(_)
+    ));
+}
+
+#[test]
+fn null_and_explicit_layer_outputs_resolve_exactly_and_missing_default_closes() {
+    let mut default_harness = KeybindingHarness::new(true);
+    let (default_layer, _) =
+        map_test_layer_surface(&mut default_harness, 0, TestLayerSpec::default());
+    let default_output = default_harness
+        .server
+        .state
+        .backend
+        .default_output()
+        .expect("nested default output");
+    let SurfaceRole::Layer(default_role) =
+        &test_layer_record(&default_harness, default_layer.surface).role
+    else {
+        panic!("default output layer role")
+    };
+    assert!(matches!(
+        default_role.output,
+        LayerOutputBinding::Default(_)
+    ));
+    assert_eq!(default_role.output.output(), Some(&default_output));
+
+    let mut explicit_harness = KeybindingHarness::new(true);
+    let &(output_global, output_version) = explicit_harness
+        .registry_globals
+        .get("wl_output")
+        .expect("nested output global");
+    let output_resource = explicit_harness.allocate_object_id();
+    bind_global(
+        &mut explicit_harness.client,
+        output_global,
+        "wl_output",
+        output_version.min(4),
+        output_resource,
+    );
+    let _ = explicit_harness.sync();
+    let explicit_default_output = explicit_harness
+        .server
+        .state
+        .backend
+        .default_output()
+        .expect("explicit harness nested output");
+    let (explicit_layer, _) = map_test_layer_surface(
+        &mut explicit_harness,
+        output_resource,
+        TestLayerSpec::default(),
+    );
+    let SurfaceRole::Layer(explicit_role) =
+        &test_layer_record(&explicit_harness, explicit_layer.surface).role
+    else {
+        panic!("explicit output layer role")
+    };
+    assert!(matches!(
+        explicit_role.output,
+        LayerOutputBinding::Explicit(_)
+    ));
+    assert_eq!(
+        explicit_role.output.output(),
+        Some(&explicit_default_output)
+    );
+
+    let mut missing = KeybindingHarness::new_with_backend(true, BackendKind::Kms);
+    assert!(missing.server.state.backend.default_output().is_none());
+    let closed = create_test_layer_surface(&mut missing, 0, TestLayerSpec::default());
+    send_request(&mut missing.client, closed.surface, 6, &[]);
+    let traffic = missing.sync();
+    assert!(
+        traffic
+            .iter()
+            .any(|(object, opcode, _)| *object == closed.layer_surface && *opcode == 1)
+    );
+    let record = test_layer_record(&missing, closed.surface);
+    assert!(matches!(
+        record.role,
+        SurfaceRole::Layer(LayerRole {
+            output: LayerOutputBinding::Closed,
+            ..
+        })
+    ));
+    assert!(!record.mapped);
+    assert_eq!(record.required_configure, None);
+
+    let mut stale_explicit = KeybindingHarness::new_with_backend(true, BackendKind::Kms);
+    let &(stale_global, stale_version) = stale_explicit
+        .registry_globals
+        .get("wl_output")
+        .expect("bootstrap output global remains advertised to the client");
+    let stale_resource = stale_explicit.allocate_object_id();
+    bind_global(
+        &mut stale_explicit.client,
+        stale_global,
+        "wl_output",
+        stale_version.min(4),
+        stale_resource,
+    );
+    let _ = stale_explicit.sync();
+    let stale = create_test_layer_surface(
+        &mut stale_explicit,
+        stale_resource,
+        TestLayerSpec::default(),
+    );
+    let traffic = stale_explicit.sync();
+    assert!(
+        traffic
+            .iter()
+            .any(|(object, opcode, _)| *object == stale.layer_surface && *opcode == 1),
+        "an output resource absent from the KMS registry is closed"
+    );
+    assert!(matches!(
+        test_layer_record(&stale_explicit, stale.surface).role,
+        SurfaceRole::Layer(LayerRole {
+            output: LayerOutputBinding::Closed,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn closed_layer_ignores_a_racing_buffer_attach_before_configure() {
+    let mut harness = KeybindingHarness::new_with_backend(true, BackendKind::Kms);
+    let layer = create_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    harness.dispatch_client();
+    assert!(matches!(
+        test_layer_record(&harness, layer.surface).role,
+        SurfaceRole::Layer(LayerRole {
+            output: LayerOutputBinding::Closed,
+            ..
+        })
+    ));
+
+    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(
+        &mut harness.client,
+        layer.surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    let _ = harness.sync();
+    harness.assert_client_connected("after a closed layer ignores a racing buffer attach");
+
+    let ignored = test_layer_record(&harness, layer.surface);
+    assert!(!ignored.mapped);
+    assert_eq!(ignored.required_configure, None);
+    assert_eq!(ignored.buffer_dimensions, None);
+    assert!(harness.server.state.warned_unsupported_surfaces.is_empty());
+}
+
+#[test]
+fn parentless_xdg_popup_is_deferred_then_adopted_by_layer_surface() {
+    let mut harness = KeybindingHarness::new(true);
+    let (layer, _) = map_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let positioner = harness.allocate_object_id();
+    let popup_surface = harness.allocate_object_id();
+    let xdg_surface = harness.allocate_object_id();
+    let popup = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        1,
+        &words(&[positioner]),
+    );
+    send_request(&mut harness.client, positioner, 1, &words(&[32, 24]));
+    send_request(&mut harness.client, positioner, 2, &words(&[0, 0, 16, 16]));
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[popup_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        2,
+        &words(&[xdg_surface, popup_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        xdg_surface,
+        2,
+        &words(&[popup, 0, positioner]),
+    );
+    harness.dispatch_client();
+    let popup_object = harness
+        .server
+        .state
+        .pending_parentless_popups
+        .keys()
+        .find(|object| object.protocol_id() == popup_surface)
+        .cloned()
+        .expect("parentless popup state is deferred by wl_surface object id");
+    send_request(
+        &mut harness.client,
+        layer.layer_surface,
+        5,
+        &words(&[popup]),
+    );
+    harness.dispatch_client();
+    assert!(
+        !harness
+            .server
+            .state
+            .pending_parentless_popups
+            .contains_key(&popup_object)
+    );
+    let record = test_layer_record(&harness, popup_surface);
+    assert!(matches!(record.role, SurfaceRole::Popup(_)));
+    let SurfaceRole::Popup(popup_role) = &record.role else {
+        unreachable!("asserted popup role above")
+    };
+    assert_eq!(
+        popup_role.get_parent_surface().map(|parent| parent.id()),
+        Some(
+            test_layer_record(&harness, layer.surface)
+                .role
+                .wl_surface()
+                .id()
+        )
+    );
+}
+
+#[test]
+fn layer_popup_can_register_before_parent_maps_then_map_after_it() {
+    let mut harness = KeybindingHarness::new(true);
+    let layer = create_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let popup = create_test_layer_popup(&mut harness, layer);
+    let staged = test_layer_record(&harness, popup.surface);
+    assert!(matches!(staged.role, SurfaceRole::Popup(_)));
+    assert!(!staged.mapped);
+
+    let layer_configure = initial_configure_test_layer(&mut harness, layer);
+    send_request(
+        &mut harness.client,
+        layer.layer_surface,
+        6,
+        &words(&[layer_configure.0]),
+    );
+    let layer_buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(
+        &mut harness.client,
+        layer.surface,
+        1,
+        &words(&[layer_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    assert!(test_layer_record(&harness, layer.surface).mapped);
+
+    let (popup_serial, traffic) = initial_configure_test_popup(&mut harness, popup);
+    assert!(
+        traffic
+            .iter()
+            .all(|(object, opcode, _)| *object != popup.popup || *opcode != 1),
+        "registration under an initially unmapped layer is not dismissed"
+    );
+    send_request(
+        &mut harness.client,
+        popup.xdg_surface,
+        4,
+        &words(&[popup_serial]),
+    );
+    let popup_buffer = harness.create_dmabuf_buffer_sized(32, 24);
+    send_request(
+        &mut harness.client,
+        popup.surface,
+        1,
+        &words(&[popup_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, popup.surface, 6, &[]);
+    harness.dispatch_client();
+    let mapped = test_layer_record(&harness, popup.surface);
+    assert!(mapped.mapped);
+    assert!(mapped.layout.visible);
+}
+
+#[test]
+fn layer_popup_buffer_is_dismissed_if_parent_is_still_unmapped() {
+    let mut harness = KeybindingHarness::new(true);
+    let layer = create_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let popup = create_test_layer_popup(&mut harness, layer);
+    let (popup_serial, initial) = initial_configure_test_popup(&mut harness, popup);
+    assert!(
+        initial
+            .iter()
+            .all(|(object, opcode, _)| *object != popup.popup || *opcode != 1),
+        "the empty initial popup commit is legal before its layer parent maps"
+    );
+    send_request(
+        &mut harness.client,
+        popup.xdg_surface,
+        4,
+        &words(&[popup_serial]),
+    );
+    let popup_buffer = harness.create_dmabuf_buffer_sized(32, 24);
+    send_request(
+        &mut harness.client,
+        popup.surface,
+        1,
+        &words(&[popup_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, popup.surface, 6, &[]);
+    let traffic = harness.sync();
+    assert!(
+        traffic
+            .iter()
+            .any(|(object, opcode, _)| *object == popup.popup && *opcode == 1),
+        "popup_done rejects the popup's map while its layer parent is unmapped"
+    );
+    assert!(!test_layer_record(&harness, popup.surface).mapped);
+    assert!(!test_layer_record(&harness, layer.surface).mapped);
+}
+
+#[test]
+fn layer_null_unmap_dismisses_and_unmaps_mapped_popup_descendants() {
+    let mut harness = KeybindingHarness::new(true);
+    let (layer, _) = map_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let popup = map_test_layer_popup(&mut harness, layer);
+    assert!(test_layer_record(&harness, popup.surface).mapped);
+    assert!(test_layer_record(&harness, popup.surface).layout.visible);
+
+    send_request(&mut harness.client, layer.surface, 1, &words(&[0, 0, 0]));
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    let traffic = harness.sync();
+    assert!(
+        traffic
+            .iter()
+            .any(|(object, opcode, _)| *object == popup.popup && *opcode == 1),
+        "unmapping the layer recursively dismisses its popup tree"
+    );
+    let dismissed = test_layer_record(&harness, popup.surface);
+    assert!(!dismissed.mapped);
+    assert!(!dismissed.layout.visible);
+    assert_eq!(dismissed.buffer_dimensions, None);
+    assert_eq!(dismissed.required_configure, None);
+
+    set_test_layer_surface_state(&mut harness, layer.layer_surface, TestLayerSpec::default());
+    let remap = initial_configure_test_layer(&mut harness, layer);
+    send_request(
+        &mut harness.client,
+        layer.layer_surface,
+        6,
+        &words(&[remap.0]),
+    );
+    let layer_buffer = harness.create_dmabuf_buffer_sized(remap.1.max(1), remap.2.max(1));
+    send_request(
+        &mut harness.client,
+        layer.surface,
+        1,
+        &words(&[layer_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+
+    assert!(test_layer_record(&harness, layer.surface).mapped);
+    let stale_popup = test_layer_record(&harness, popup.surface);
+    assert!(!stale_popup.mapped);
+    assert!(!stale_popup.layout.visible);
+}
+
+#[test]
+fn layer_root_subsurface_visibility_follows_layer_mapping() {
+    let mut harness = KeybindingHarness::new(true);
+    let (layer, _) = map_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let child = harness.allocate_object_id();
+    let subsurface = harness.allocate_object_id();
+    send_request(&mut harness.client, TEST_COMPOSITOR_ID, 0, &words(&[child]));
+    send_request(
+        &mut harness.client,
+        TEST_SUBCOMPOSITOR_ID,
+        1,
+        &words(&[subsurface, child, layer.surface]),
+    );
+    let buffer = harness.create_dmabuf_buffer_sized(16, 16);
+    send_request(&mut harness.client, child, 1, &words(&[buffer, 0, 0]));
+    send_request(&mut harness.client, child, 6, &[]);
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    let child_record = test_layer_record(&harness, child);
+    assert!(child_record.mapped);
+    assert!(child_record.layout.visible);
+
+    send_request(&mut harness.client, layer.surface, 1, &words(&[0, 0, 0]));
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    assert!(!test_layer_record(&harness, child).layout.visible);
+}
+
+#[test]
+fn layer_rearrange_shifts_subsurface_and_popup_layout_and_hit_testing() {
+    const BOTTOM_RIGHT: u32 = 2 | 8;
+    let mut harness = KeybindingHarness::new(true);
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: BOTTOM_RIGHT,
+            ..TestLayerSpec::default()
+        },
+    );
+
+    let child = harness.allocate_object_id();
+    let subsurface = harness.allocate_object_id();
+    send_request(&mut harness.client, TEST_COMPOSITOR_ID, 0, &words(&[child]));
+    send_request(
+        &mut harness.client,
+        TEST_SUBCOMPOSITOR_ID,
+        1,
+        &words(&[subsurface, child, layer.surface]),
+    );
+    send_request(&mut harness.client, subsurface, 1, &words(&[80, 40]));
+    let child_buffer = harness.create_dmabuf_buffer_sized(16, 16);
+    send_request(&mut harness.client, child, 1, &words(&[child_buffer, 0, 0]));
+    send_request(&mut harness.client, child, 6, &[]);
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+
+    let positioner = harness.allocate_object_id();
+    let popup_surface = harness.allocate_object_id();
+    let popup_xdg_surface = harness.allocate_object_id();
+    let popup = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        1,
+        &words(&[positioner]),
+    );
+    send_request(&mut harness.client, positioner, 1, &words(&[32, 24]));
+    send_request(&mut harness.client, positioner, 2, &words(&[5, 5, 16, 16]));
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[popup_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        2,
+        &words(&[popup_xdg_surface, popup_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        popup_xdg_surface,
+        2,
+        &words(&[popup, 0, positioner]),
+    );
+    send_request(
+        &mut harness.client,
+        layer.layer_surface,
+        5,
+        &words(&[popup]),
+    );
+    send_request(&mut harness.client, popup_surface, 6, &[]);
+    let traffic = harness.sync();
+    let popup_serial = traffic
+        .iter()
+        .rev()
+        .find_map(|(object, opcode, body)| {
+            (*object == popup_xdg_surface && *opcode == 0).then(|| word(body, 0))
+        })
+        .expect("layer popup receives its initial configure");
+    send_request(
+        &mut harness.client,
+        popup_xdg_surface,
+        4,
+        &words(&[popup_serial]),
+    );
+    let popup_buffer = harness.create_dmabuf_buffer_sized(32, 24);
+    send_request(
+        &mut harness.client,
+        popup_surface,
+        1,
+        &words(&[popup_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, popup_surface, 6, &[]);
+    harness.dispatch_client();
+
+    let repositioner = harness.allocate_object_id();
+    const REPOSITION_TOKEN: u32 = 73;
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        1,
+        &words(&[repositioner]),
+    );
+    send_request(&mut harness.client, repositioner, 1, &words(&[40, 28]));
+    send_request(
+        &mut harness.client,
+        repositioner,
+        2,
+        &words(&[11, 7, 20, 18]),
+    );
+    send_request(
+        &mut harness.client,
+        popup,
+        2,
+        &words(&[repositioner, REPOSITION_TOKEN]),
+    );
+    let reposition_traffic = harness.sync();
+    let reposition_serial = reposition_traffic
+        .iter()
+        .rev()
+        .find_map(|(object, opcode, body)| {
+            (*object == popup_xdg_surface && *opcode == 0).then(|| word(body, 0))
+        })
+        .expect("popup reposition receives a configure");
+    let (pending_layout_before, pending_origin_before) = {
+        let pending = test_layer_record(&harness, popup_surface)
+            .pending_popup_reposition
+            .as_ref()
+            .expect("reposition remains pending before its ack");
+        (pending.layout, pending.window_origin)
+    };
+
+    let root_before = test_layer_record(&harness, layer.surface).layout;
+    let child_before = test_layer_record(&harness, child).layout;
+    let popup_before = test_layer_record(&harness, popup_surface).layout;
+    let child_id = test_layer_record(&harness, child).id;
+    let popup_id = test_layer_record(&harness, popup_surface).id;
+    assert_eq!(
+        child_before.parent,
+        Some(test_layer_record(&harness, layer.surface).id)
+    );
+    assert_eq!(
+        popup_before.parent,
+        Some(test_layer_record(&harness, layer.surface).id)
+    );
+
+    harness.server.state.resize_output(400, 300);
+    let root_after = test_layer_record(&harness, layer.surface).layout;
+    let child_after = test_layer_record(&harness, child).layout;
+    let popup_after = test_layer_record(&harness, popup_surface).layout;
+    let delta = (root_after.x - root_before.x, root_after.y - root_before.y);
+    assert_ne!(delta, (0.0, 0.0));
+    assert_eq!(
+        (child_after.x, child_after.y),
+        (child_before.x + delta.0, child_before.y + delta.1)
+    );
+    assert_eq!(
+        (popup_after.x, popup_after.y),
+        (popup_before.x + delta.0, popup_before.y + delta.1)
+    );
+    let pending_after = test_layer_record(&harness, popup_surface)
+        .pending_popup_reposition
+        .as_ref()
+        .expect("root movement preserves the unacknowledged reposition");
+    assert_eq!(
+        (pending_after.layout.x, pending_after.layout.y),
+        (
+            pending_layout_before.x + delta.0,
+            pending_layout_before.y + delta.1,
+        )
+    );
+    assert_eq!(
+        pending_after.window_origin,
+        (
+            pending_origin_before.0 + delta.0,
+            pending_origin_before.1 + delta.1,
+        )
+    );
+
+    send_request(
+        &mut harness.client,
+        popup_xdg_surface,
+        4,
+        &words(&[reposition_serial]),
+    );
+    send_request(&mut harness.client, popup_surface, 6, &[]);
+    harness.dispatch_client();
+    let popup_repositioned = test_layer_record(&harness, popup_surface).layout;
+    assert_eq!(
+        (popup_repositioned.x, popup_repositioned.y),
+        (
+            pending_layout_before.x + delta.0,
+            pending_layout_before.y + delta.1,
+        ),
+        "the ack applies the reposition in the moved root coordinate space"
+    );
+
+    let child_hit = harness
+        .server
+        .state
+        .surface_at(
+            f64::from(child_after.x + child_after.width / 2.0),
+            f64::from(child_after.y + child_after.height / 2.0),
+        )
+        .map(|record| record.id);
+    assert_eq!(child_hit, Some(child_id));
+    let popup_hit = harness
+        .server
+        .state
+        .surface_at(
+            f64::from(popup_repositioned.x + popup_repositioned.width / 2.0),
+            f64::from(popup_repositioned.y + popup_repositioned.height / 2.0),
+        )
+        .map(|record| record.id);
+    assert_eq!(popup_hit, Some(popup_id));
 }

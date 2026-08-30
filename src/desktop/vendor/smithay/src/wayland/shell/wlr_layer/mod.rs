@@ -422,6 +422,31 @@ impl LayerSurface {
         configured
     }
 
+    /// Reset this surface to the state immediately after it was constructed.
+    // cosmix addition: expose the protocol-mandated unmap reset without exposing private configure queues.
+    pub fn reset_after_unmap(&self, initial_layer: Layer) {
+        compositor::with_states(&self.wl_surface, |states| {
+            states
+                .data_map
+                .get::<Mutex<LayerSurfaceAttributes>>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .reset();
+
+            let initial_state = LayerSurfaceCachedState {
+                layer: initial_layer,
+                ..Default::default()
+            };
+            let mut cached = states.cached_state.get::<LayerSurfaceCachedState>();
+            *cached.pending() = initial_state;
+            *cached.current() = initial_state;
+            for state in cached.cached() {
+                *state = initial_state;
+            }
+        });
+    }
+
     /// Send a "close" event to the client
     pub fn send_close(&self) {
         self.shell_surface.closed()

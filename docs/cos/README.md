@@ -26,6 +26,7 @@ exhaustive manpages. For the language that drives these daemons, see the
 - **[dnsd](dnsd.md)** — authoritative WireGuard-mesh DNS.
 - **[indexd](indexd.md)** — vector knowledge base / indexer.
 - **[disp-skia](disp-skia.md)** — Skia display compositor; the desktop surface.
+- **[cosmix-comp](cosmix-comp.md)** — Wayland compositor and supported protocol globals.
 - **[agentd](agentd.md)** — agent supervision.
 
 ## Bridge & libraries

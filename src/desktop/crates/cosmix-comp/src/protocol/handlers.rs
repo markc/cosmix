@@ -283,27 +283,34 @@ impl CompositorHandler for WaylandState {
             return;
         }
 
-        let invalid_popup =
-            self.surfaces
-                .get(&surface.id())
-                .and_then(|record| match &record.role {
-                    SurfaceRole::Popup(popup) => popup
-                        .get_parent_surface()
-                        .filter(|parent| {
-                            self.surfaces
-                                .get(&parent.id())
-                                .is_some_and(|parent_record| {
-                                    parent_record.mapped
-                                        && parent_record.layout.visible
-                                        && !matches!(parent_record.role, SurfaceRole::Dormant(_))
-                                })
-                        })
-                        .is_none()
-                        .then_some(popup.clone()),
-                    SurfaceRole::Toplevel(_)
-                    | SurfaceRole::Subsurface { .. }
-                    | SurfaceRole::Dormant(_) => None,
-                });
+        let invalid_popup = matches!(buffer.as_ref(), Some(BufferAssignment::NewBuffer(_)))
+            .then(|| {
+                self.surfaces
+                    .get(&surface.id())
+                    .and_then(|record| match &record.role {
+                        SurfaceRole::Popup(popup) => popup
+                            .get_parent_surface()
+                            .filter(|parent| {
+                                self.surfaces
+                                    .get(&parent.id())
+                                    .is_some_and(|parent_record| {
+                                        parent_record.mapped
+                                            && parent_record.layout.visible
+                                            && !matches!(
+                                                parent_record.role,
+                                                SurfaceRole::Dormant(_)
+                                            )
+                                    })
+                            })
+                            .is_none()
+                            .then_some(popup.clone()),
+                        SurfaceRole::Toplevel(_)
+                        | SurfaceRole::Layer(_)
+                        | SurfaceRole::Subsurface { .. }
+                        | SurfaceRole::Dormant(_) => None,
+                    })
+            })
+            .flatten();
         if let Some(popup) = invalid_popup {
             if let Some(BufferAssignment::NewBuffer(buffer)) = buffer {
                 self.retire_buffer_immediately(buffer);
@@ -317,17 +324,46 @@ impl CompositorHandler for WaylandState {
         }
         self.apply_acked_popup_reposition(surface);
 
-        let xdg_target = self
-            .surfaces
-            .get(&surface.id())
-            .and_then(|record| match &record.role {
-                SurfaceRole::Toplevel(toplevel) => {
-                    Some(XdgConfigureTarget::Toplevel(toplevel.clone()))
-                }
-                SurfaceRole::Popup(popup) => Some(XdgConfigureTarget::Popup(popup.clone())),
-                SurfaceRole::Subsurface { .. } | SurfaceRole::Dormant(_) => None,
+        if self.layer_role_is_closed(surface) {
+            if let Some(BufferAssignment::NewBuffer(buffer)) = buffer {
+                self.retire_buffer_immediately(buffer);
+            }
+            return;
+        }
+        let layer_restarts_configure_cycle =
+            self.surfaces.get(&surface.id()).is_some_and(|record| {
+                matches!(record.role, SurfaceRole::Layer(_))
+                    && record.required_configure.is_some()
+                    && matches!(buffer, Some(BufferAssignment::Removed))
             });
-        if xdg_target.is_some() {
+        if layer_restarts_configure_cycle {
+            self.dismiss_popup_descendants(surface);
+            self.unmap_layer_from_output(surface);
+            self.reset_configure_sequence(surface);
+        } else if self.layer_output_for_surface(surface).is_some() {
+            if let Err(error) = self.validate_layer_surface_state(surface) {
+                if let Some(BufferAssignment::NewBuffer(buffer)) = buffer {
+                    self.retire_buffer_immediately(buffer);
+                }
+                self.unmap_layer_from_output(surface);
+                self.post_invalid_layer_state(surface, error);
+                return;
+            }
+            self.ensure_layer_mapped_and_arranged(surface);
+        }
+
+        let configure_target =
+            self.surfaces
+                .get(&surface.id())
+                .and_then(|record| match &record.role {
+                    SurfaceRole::Toplevel(toplevel) => {
+                        Some(ConfigureTarget::Toplevel(toplevel.clone()))
+                    }
+                    SurfaceRole::Popup(popup) => Some(ConfigureTarget::Popup(popup.clone())),
+                    SurfaceRole::Layer(role) => Some(ConfigureTarget::Layer(role.surface.clone())),
+                    SurfaceRole::Subsurface { .. } | SurfaceRole::Dormant(_) => None,
+                });
+        if configure_target.is_some() && !layer_restarts_configure_cycle {
             let initial_sent = self
                 .surfaces
                 .get(&surface.id())
@@ -335,14 +371,14 @@ impl CompositorHandler for WaylandState {
             if !initial_sent {
                 if let Some(BufferAssignment::NewBuffer(buffer)) = buffer.as_ref() {
                     self.retire_buffer_immediately(buffer.clone());
-                    let _ = self.ensure_current_xdg_sequence_is_acked(surface);
+                    let _ = self.ensure_current_configure_sequence_is_acked(surface);
                     return;
                 }
-                let _ = self.send_initial_xdg_configure(surface);
+                let _ = self.send_initial_configure(surface);
                 return;
             }
             if matches!(buffer.as_ref(), Some(BufferAssignment::NewBuffer(_)))
-                && !self.ensure_current_xdg_sequence_is_acked(surface)
+                && !self.ensure_current_configure_sequence_is_acked(surface)
             {
                 if let Some(BufferAssignment::NewBuffer(buffer)) = buffer.as_ref() {
                     self.retire_buffer_immediately(buffer.clone());
@@ -350,6 +386,7 @@ impl CompositorHandler for WaylandState {
                 return;
             }
         }
+        self.apply_acked_layer_state(surface);
         self.apply_committed_toplevel_state(surface, scene_commit);
 
         if self.commit_cursor_surface(
@@ -424,7 +461,7 @@ impl CompositorHandler for WaylandState {
                     self.reset_chrome_pointer_tracking(&surface.id());
                     self.minimized_toplevels
                         .retain(|object| *object != surface.id());
-                    self.reset_xdg_configure_sequence(surface);
+                    self.reset_configure_sequence(surface);
                     if interactive_surface(self.interactive_pointer.as_ref())
                         .is_some_and(|interactive| interactive == surface)
                     {
@@ -508,6 +545,7 @@ impl CompositorHandler for WaylandState {
 
     fn destroyed(&mut self, surface: &WlSurface) {
         let former_root = self.toplevel_root_for_surface(surface);
+        self.buffer_history_surfaces.remove(&surface.id());
         self.warned_unsupported_surfaces.remove(&surface.id());
         self.damage_requests_since_apply.remove(&surface.id());
         self.remove_subsurface_topology(surface);
@@ -528,6 +566,232 @@ impl CompositorHandler for WaylandState {
         // apply a fused sibling's commit; that commit is charged against the shm and
         // dmabuf budgets this surface's teardown has only just refunded above.
         self.destroy_surface_acquire_gates(surface);
+    }
+}
+
+impl WlrLayerShellHandler for WaylandState {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: WlrLayerSurface,
+        output: Option<wl_output_protocol::WlOutput>,
+        layer: WlrLayer,
+        namespace: String,
+    ) {
+        let surface_object = surface.wl_surface().id();
+        let desktop_surface = DesktopLayerSurface::new(surface.clone(), namespace);
+        let output_binding = match output {
+            Some(output) => self
+                .backend
+                .output_from_resource(&output)
+                .map(LayerOutputBinding::Explicit)
+                .unwrap_or(LayerOutputBinding::Closed),
+            None => self
+                .backend
+                .default_output()
+                .map(LayerOutputBinding::Default)
+                .unwrap_or(LayerOutputBinding::Closed),
+        };
+        let mapped_output = output_binding.output().cloned();
+        let output_origin = mapped_output
+            .as_ref()
+            .map(Output::current_location)
+            .unwrap_or_default();
+
+        self.next_z = self.next_z.saturating_add(1);
+        let layout = SurfaceLayout {
+            x: output_origin.x as f32,
+            y: output_origin.y as f32,
+            width: 1.0,
+            height: 1.0,
+            z: self.next_z as f32,
+            source: None,
+            parent: None,
+            transform: SurfaceTransform::Normal,
+            visible: false,
+            toplevel: None,
+        };
+        let role = LayerRole {
+            surface: desktop_surface.clone(),
+            output: output_binding,
+            initial_layer: layer,
+        };
+        let id = if let Some(record) = self.surfaces.get_mut(&surface_object) {
+            let id = record.id;
+            record.role = SurfaceRole::Layer(role);
+            record.mapped = false;
+            record.layout = layout;
+            record.title = None;
+            record.window_origin = (layout.x, layout.y);
+            record.configured_size = (1, 1);
+            record.required_configure = None;
+            record.last_acked_configure = None;
+            record.last_acked_size = None;
+            record.decoration_object_bound = false;
+            record.committed_decoration = SceneDecorationMode::Unbound;
+            record.requested_maximized = false;
+            record.committed_maximized = false;
+            record.normal_restore = None;
+            record.pending_window_state = None;
+            record.configured_window_states.clear();
+            record.minimized = false;
+            record.focused = false;
+            record.committed_window_geometry = None;
+            record.committed_window_geometry_explicit = false;
+            record.pending_popup_reposition = None;
+            record.parent_association_committed = true;
+            id
+        } else {
+            let id = SurfaceId(self.next_surface_id);
+            self.next_surface_id = self.next_surface_id.saturating_add(1);
+            self.surfaces.insert(
+                surface_object.clone(),
+                SurfaceRecord {
+                    id,
+                    role: SurfaceRole::Layer(role),
+                    mapped: false,
+                    layout,
+                    title: None,
+                    window_origin: (layout.x, layout.y),
+                    configured_size: (1, 1),
+                    commit_count: 0,
+                    shm_backing: None,
+                    dmabuf_backing: None,
+                    buffer_dimensions: None,
+                    required_configure: None,
+                    last_acked_configure: None,
+                    last_acked_size: None,
+                    decoration_object_bound: false,
+                    committed_decoration: SceneDecorationMode::Unbound,
+                    requested_maximized: false,
+                    committed_maximized: false,
+                    normal_restore: None,
+                    pending_window_state: None,
+                    configured_window_states: Vec::new(),
+                    minimized: false,
+                    focused: false,
+                    chrome_pointer: ChromePointerSceneState::default(),
+                    committed_window_geometry: None,
+                    committed_window_geometry_explicit: false,
+                    pending_popup_reposition: None,
+                    parent_association_committed: true,
+                    pixel_probe_logged: false,
+                    logged_diagnostics: HashSet::new(),
+                },
+            );
+            self.surface_objects.insert(id, surface_object.clone());
+            id
+        };
+        self.committed_surface_stacks
+            .insert(surface_object.clone(), vec![surface_object.clone()]);
+
+        // Layer state is double-buffered and the requests that initialise it
+        // follow get_layer_surface. Defer LayerMap insertion until the first
+        // wl_surface commit so validation sees that committed state.
+        let mapped = mapped_output.is_some();
+        if !mapped {
+            if let Some(record) = self.surfaces.get_mut(&surface_object)
+                && let SurfaceRole::Layer(role) = &mut record.role
+            {
+                role.output = LayerOutputBinding::Closed;
+            }
+            surface.send_close();
+        }
+
+        tracing::info!(
+            surface_id = id.0,
+            surface = ?surface_object,
+            ?layer,
+            mapped,
+            "new layer-shell surface staged"
+        );
+    }
+
+    fn new_popup(&mut self, parent: WlrLayerSurface, popup: PopupSurface) {
+        let popup_object = popup.wl_surface().id();
+        let parent_is_layer = self
+            .surfaces
+            .get(&parent.wl_surface().id())
+            .is_some_and(|record| matches!(record.role, SurfaceRole::Layer(_)));
+        let Some(positioner) = self.pending_parentless_popups.remove(&popup_object) else {
+            tracing::warn!(
+                popup = ?popup_object,
+                "dismissed layer popup without deferred xdg popup state"
+            );
+            popup.send_popup_done();
+            return;
+        };
+        if !parent_is_layer {
+            popup.send_popup_done();
+            return;
+        }
+        <Self as XdgShellHandler>::new_popup(self, popup, positioner);
+    }
+
+    fn ack_configure(&mut self, surface: WlSurface, configure: LayerSurfaceConfigure) {
+        let configured_size = configure
+            .state
+            .size
+            .map(|size| (size.w.max(1), size.h.max(1)))
+            .unwrap_or((1, 1));
+        let gate = if let Some(record) = self.surfaces.get_mut(&surface.id())
+            && matches!(record.role, SurfaceRole::Layer(_))
+        {
+            record.last_acked_configure = Some(configure.serial);
+            record.last_acked_size = Some(configured_size);
+            Some((record.id, record.required_configure))
+        } else {
+            None
+        };
+        let smithay_state = compositor::with_states(&surface, |states| {
+            let attributes = states
+                .data_map
+                .get::<LayerSurfaceData>()
+                .expect("layer ack owns protocol attributes")
+                .lock()
+                .expect("layer attributes lock");
+            (
+                attributes.configured,
+                attributes.configure_serial,
+                attributes.initial_configure_sent,
+            )
+        });
+        if let Some((surface_id, required_configure)) = gate {
+            debug_assert!(smithay_state.0);
+            debug_assert_eq!(smithay_state.1, Some(configure.serial));
+            tracing::debug!(
+                surface_id = surface_id.0,
+                surface = ?surface.id(),
+                serial = ?configure.serial,
+                ?required_configure,
+                smithay_configured = smithay_state.0,
+                smithay_acked = ?smithay_state.1,
+                smithay_initial_configure_sent = smithay_state.2,
+                "acknowledged layer configure in Smithay and common gate"
+            );
+        }
+    }
+
+    fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        let role = self
+            .surfaces
+            .get(&surface.wl_surface().id())
+            .and_then(|record| {
+                let SurfaceRole::Layer(role) = &record.role else {
+                    return None;
+                };
+                Some((role.surface.clone(), role.output.output().cloned()))
+            });
+        let Some((desktop_surface, output)) = role else {
+            return;
+        };
+        if let Some(output) = output.as_ref() {
+            self.update_layer_map(output, |layer_map| layer_map.unmap_layer(&desktop_surface));
+        }
+        self.deactivate_surface_role(surface.wl_surface());
     }
 }
 
@@ -683,13 +947,15 @@ impl XdgShellHandler for WaylandState {
         }
 
         let Some(parent) = surface.get_parent_surface() else {
-            surface.send_popup_done();
+            self.pending_parentless_popups
+                .insert(surface_object, positioner);
             return;
         };
         if !self.surfaces.get(&parent.id()).is_some_and(|record| {
-            record.mapped
-                && record.layout.visible
-                && !matches!(record.role, SurfaceRole::Dormant(_))
+            matches!(record.role, SurfaceRole::Layer(_))
+                || (record.mapped
+                    && record.layout.visible
+                    && !matches!(record.role, SurfaceRole::Dormant(_)))
         }) {
             tracing::warn!(
                 surface = ?surface.wl_surface().id(),
@@ -1086,6 +1352,7 @@ impl XdgShellHandler for WaylandState {
 
     fn popup_destroyed(&mut self, surface: PopupSurface) {
         let surface_id = surface.wl_surface().id();
+        self.pending_parentless_popups.remove(&surface_id);
         self.xdg_surface_objects
             .retain(|_, mapped_surface| mapped_surface != &surface_id);
         self.deactivate_surface_role(surface.wl_surface());
@@ -1466,6 +1733,31 @@ impl Dispatch<wl_surface::WlSurface, SurfaceUserData> for WaylandState {
                 DamageCapAction::Drop => return,
             }
         }
+        if matches!(
+            &request,
+            wl_surface::Request::Attach {
+                buffer: Some(_),
+                ..
+            }
+        ) {
+            state.buffer_history_surfaces.insert(surface.id());
+            let unconfigured_layer = state.surfaces.get(&surface.id()).and_then(|record| {
+                if record.required_configure.is_some() {
+                    return None;
+                }
+                let SurfaceRole::Layer(role) = &record.role else {
+                    return None;
+                };
+                if matches!(role.output, LayerOutputBinding::Closed) {
+                    return None;
+                }
+                Some(role.surface.layer_surface().clone())
+            });
+            if let Some(layer) = unconfigured_layer {
+                let _ = layer.ensure_configured();
+                return;
+            }
+        }
         <CompositorState as Dispatch<
             wl_surface::WlSurface,
             SurfaceUserData,
@@ -1701,3 +1993,41 @@ smithay::delegate_drm_syncobj!(WaylandState);
 delegate_seat!(WaylandState);
 delegate_data_device!(WaylandState);
 delegate_output!(WaylandState);
+smithay::reexports::wayland_server::delegate_global_dispatch!(WaylandState: [
+    ZwlrLayerShellV1: WlrLayerShellGlobalData
+] => WlrLayerShellState);
+smithay::reexports::wayland_server::delegate_dispatch!(WaylandState: [
+    ZwlrLayerSurfaceV1: WlrLayerSurfaceUserData
+] => WlrLayerShellState);
+
+impl Dispatch<ZwlrLayerShellV1, ()> for WaylandState {
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        shell: &ZwlrLayerShellV1,
+        request: zwlr_layer_shell_v1::Request,
+        data: &(),
+        display: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        if let zwlr_layer_shell_v1::Request::GetLayerSurface { surface, .. } = &request {
+            if compositor::get_role(surface).is_some() {
+                shell.post_error(
+                    zwlr_layer_shell_v1::Error::Role,
+                    "Surface already has a role.",
+                );
+                return;
+            }
+            if state.layer_role_creation_is_already_constructed(surface) {
+                shell.post_error(
+                    zwlr_layer_shell_v1::Error::AlreadyConstructed,
+                    "wl_surface already has a buffer attached",
+                );
+                return;
+            }
+        }
+        <WlrLayerShellState as Dispatch<ZwlrLayerShellV1, (), WaylandState>>::request(
+            state, client, shell, request, data, display, data_init,
+        );
+    }
+}

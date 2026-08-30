@@ -66,13 +66,18 @@ use cosmix_wgpu_dmabuf::{
     RetirementWorker, RetirementWorkerError, RetirementWorkerReport, ValidateDmabuf,
     WaitForSubmittedWork, spawn_retirement_worker,
 };
+use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::server::{
+    zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
+    zwlr_layer_surface_v1::{self, ZwlrLayerSurfaceV1},
+};
 use smithay::{
     backend::allocator::{Buffer as _, Format, dmabuf::Dmabuf},
     backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonState, KeyState, TouchSlot},
     delegate_data_device, delegate_dmabuf, delegate_fractional_scale, delegate_output,
     delegate_seat, delegate_shm, delegate_viewporter,
     desktop::{
-        PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, find_popup_root_surface,
+        LayerMap, LayerSurface as DesktopLayerSurface, PopupKeyboardGrab, PopupKind, PopupManager,
+        PopupPointerGrab, find_popup_root_surface, layer_map_for_output,
     },
     input::{
         Seat, SeatHandler, SeatState,
@@ -133,6 +138,11 @@ use smithay::{
                 set_data_device_focus,
             },
         },
+        shell::wlr_layer::{
+            Anchor, ExclusiveZone, Layer as WlrLayer, LayerSurface as WlrLayerSurface,
+            LayerSurfaceConfigure, LayerSurfaceData, WlrLayerShellGlobalData, WlrLayerShellHandler,
+            WlrLayerShellState, WlrLayerSurfaceUserData,
+        },
         shell::xdg::{
             Configure, PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface,
             XdgPopupSurfaceData, XdgPositionerUserData, XdgShellHandler, XdgShellState,
@@ -151,6 +161,7 @@ const DEFAULT_TOPLEVEL_WIDTH: i32 = 640;
 const DEFAULT_TOPLEVEL_HEIGHT: i32 = 420;
 const DEFAULT_TOPLEVEL_OUTPUT_SHARE: f32 = 0.72;
 const CASCADE_ORIGIN: f32 = 36.0;
+const MAX_LAYER_GEOMETRY_VALUE: i64 = 1 << 24;
 const CASCADE_STEP: f32 = 48.0;
 const OUTPUT_MARGIN: f32 = 24.0;
 const MAX_SURFACE_DIMENSION: u32 = 8192;
@@ -1976,6 +1987,7 @@ impl ProtocolServer {
         let output_manager_state =
             OutputManagerState::new_with_xdg_output::<WaylandState>(&display_handle);
         let xdg_shell_state = XdgShellState::new::<WaylandState>(&display_handle);
+        let layer_shell_state = WlrLayerShellState::new::<WaylandState>(&display_handle);
         let xdg_decoration_state = XdgDecorationState::new::<WaylandState>(&display_handle);
         let fractional_scale_state =
             FractionalScaleManagerState::new::<WaylandState>(&display_handle);
@@ -2082,6 +2094,7 @@ impl ProtocolServer {
             compositor_state,
             output_manager_state,
             xdg_shell_state,
+            layer_shell_state,
             xdg_decoration_state,
             fractional_scale_state,
             viewporter_state,
@@ -2122,9 +2135,11 @@ impl ProtocolServer {
             interactive_pointer: None,
             minimized_toplevels: Vec::new(),
             surfaces: HashMap::new(),
+            buffer_history_surfaces: HashSet::new(),
             surface_objects: HashMap::new(),
             xdg_surface_objects: HashMap::new(),
             dispatching_xdg_surface: None,
+            pending_parentless_popups: HashMap::new(),
             committed_surface_stacks: HashMap::new(),
             warned_unsupported_surfaces: HashSet::new(),
             events: Vec::new(),
@@ -2269,19 +2284,24 @@ impl ProtocolServer {
                                 let mapped_surfaces = state
                                     .surfaces
                                     .values()
-                                    .filter(|record| record.layout.visible)
+                                    .filter(|record| {
+                                        record.layout.visible
+                                            && !matches!(record.role, SurfaceRole::Layer(_))
+                                    })
                                     .map(|record| record.role.wl_surface().clone())
                                     .collect::<Vec<_>>();
                                 state.backend.reconcile_kms_client_output::<WaylandState>(
                                     &state.display_handle,
                                     &mapped_surfaces,
                                 );
+                                state.reconcile_layer_output_bindings();
                                 let scale = state.backend.output_scale();
                                 if scale != previous_scale {
                                     state.publish_surface_preferred_scale(scale);
                                 }
                                 if state.logical_output_rect() != previous_output {
                                     state.reconfigure_window_states_for_output();
+                                    state.arrange_all_layer_outputs();
                                 }
                             }
                             for command in commands {
@@ -3436,6 +3456,7 @@ struct PendingPopupReposition {
 enum SurfaceRole {
     Toplevel(ToplevelSurface),
     Popup(PopupSurface),
+    Layer(LayerRole),
     Subsurface {
         surface: WlSurface,
         parent: WlSurface,
@@ -3443,9 +3464,59 @@ enum SurfaceRole {
     Dormant(WlSurface),
 }
 
-enum XdgConfigureTarget {
+struct LayerRole {
+    surface: DesktopLayerSurface,
+    output: LayerOutputBinding,
+    initial_layer: WlrLayer,
+}
+
+enum LayerOutputBinding {
+    Default(Output),
+    Explicit(Output),
+    Closed,
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+enum LayerOutputTransition {
+    Keep,
+    Migrate(Output),
+    Close,
+}
+
+impl LayerOutputBinding {
+    fn output(&self) -> Option<&Output> {
+        match self {
+            Self::Default(output) | Self::Explicit(output) => Some(output),
+            Self::Closed => None,
+        }
+    }
+
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    fn transition(
+        &self,
+        default_output: Option<&Output>,
+        output_is_registered: impl FnOnce(&Output) -> bool,
+    ) -> LayerOutputTransition {
+        let Some(output) = self.output() else {
+            return LayerOutputTransition::Keep;
+        };
+        if output_is_registered(output) {
+            return LayerOutputTransition::Keep;
+        }
+        match self {
+            Self::Explicit(_) => LayerOutputTransition::Close,
+            Self::Default(_) => default_output
+                .cloned()
+                .map_or(LayerOutputTransition::Close, LayerOutputTransition::Migrate),
+            Self::Closed => LayerOutputTransition::Keep,
+        }
+    }
+}
+
+enum ConfigureTarget {
     Toplevel(ToplevelSurface),
     Popup(PopupSurface),
+    Layer(DesktopLayerSurface),
 }
 
 enum XdgConfigureRequest {
@@ -3460,6 +3531,7 @@ impl SurfaceRole {
             Self::Toplevel(_) => SceneSurfaceKind::Toplevel,
             Self::Subsurface { .. } => SceneSurfaceKind::Subsurface,
             Self::Popup(_) => SceneSurfaceKind::Popup,
+            Self::Layer(_) => SceneSurfaceKind::Subsurface,
             // Dormant records are excluded by `surface_is_presentable`, so
             // this value can never cross the protocol-to-scene boundary.
             Self::Dormant(_) => SceneSurfaceKind::Subsurface,
@@ -3470,6 +3542,7 @@ impl SurfaceRole {
         match self {
             Self::Toplevel(surface) => surface.wl_surface(),
             Self::Popup(surface) => surface.wl_surface(),
+            Self::Layer(role) => role.surface.wl_surface(),
             Self::Subsurface { surface, .. } => surface,
             Self::Dormant(surface) => surface,
         }
@@ -3478,14 +3551,14 @@ impl SurfaceRole {
     fn toplevel(&self) -> Option<&ToplevelSurface> {
         match self {
             Self::Toplevel(surface) => Some(surface),
-            Self::Popup(_) | Self::Subsurface { .. } | Self::Dormant(_) => None,
+            Self::Popup(_) | Self::Layer(_) | Self::Subsurface { .. } | Self::Dormant(_) => None,
         }
     }
 
     fn parent_surface(&self) -> Option<&WlSurface> {
         match self {
             Self::Subsurface { parent, .. } => Some(parent),
-            Self::Toplevel(_) | Self::Popup(_) | Self::Dormant(_) => None,
+            Self::Toplevel(_) | Self::Popup(_) | Self::Layer(_) | Self::Dormant(_) => None,
         }
     }
 
@@ -3493,6 +3566,7 @@ impl SurfaceRole {
         match self {
             Self::Toplevel(_) => "toplevel",
             Self::Popup(_) => "popup",
+            Self::Layer(_) => "layer",
             Self::Subsurface { .. } => "subsurface",
             Self::Dormant(_) => "dormant",
         }
@@ -3706,6 +3780,7 @@ struct WaylandState {
     #[allow(dead_code)]
     output_manager_state: OutputManagerState,
     xdg_shell_state: XdgShellState,
+    layer_shell_state: WlrLayerShellState,
     #[allow(dead_code)]
     xdg_decoration_state: XdgDecorationState,
     #[allow(dead_code)]
@@ -3759,9 +3834,11 @@ struct WaylandState {
     interactive_pointer: Option<InteractivePointer>,
     minimized_toplevels: Vec<ObjectId>,
     surfaces: HashMap<ObjectId, SurfaceRecord>,
+    buffer_history_surfaces: HashSet<ObjectId>,
     surface_objects: HashMap<SurfaceId, ObjectId>,
     xdg_surface_objects: HashMap<ObjectId, ObjectId>,
     dispatching_xdg_surface: Option<ObjectId>,
+    pending_parentless_popups: HashMap<ObjectId, PositionerState>,
     committed_surface_stacks: HashMap<ObjectId, Vec<ObjectId>>,
     warned_unsupported_surfaces: HashSet<ObjectId>,
     events: Vec<ProtocolEvent>,
@@ -4772,6 +4849,685 @@ impl WaylandState {
         }
     }
 
+    fn update_layer_map<R>(
+        &mut self,
+        output: &Output,
+        update: impl FnOnce(&mut LayerMap) -> R,
+    ) -> R {
+        let output_origin = output.current_location();
+        let existing = {
+            let layer_map = layer_map_for_output(output);
+            layer_map.layers().cloned().collect::<Vec<_>>()
+        };
+        let configured = existing
+            .iter()
+            .filter(|layer| {
+                compositor::with_states(layer.wl_surface(), |states| {
+                    let mut attributes = states
+                        .data_map
+                        .get::<LayerSurfaceData>()
+                        .expect("desktop layer owns protocol attributes")
+                        .lock()
+                        .expect("layer attributes lock");
+                    if attributes.initial_configure_sent {
+                        attributes.initial_configure_sent = false;
+                        true
+                    } else {
+                        false
+                    }
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let (result, arranged) = {
+            let mut layer_map = layer_map_for_output(output);
+            let result = update(&mut layer_map);
+            let arranged = layer_map
+                .layers()
+                .filter_map(|layer| {
+                    let geometry = layer_map.layer_geometry(layer)?;
+                    Some((
+                        layer.clone(),
+                        (
+                            output_origin.x + geometry.loc.x,
+                            output_origin.y + geometry.loc.y,
+                        ),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            (result, arranged)
+        };
+
+        for layer in &configured {
+            compositor::with_states(layer.wl_surface(), |states| {
+                states
+                    .data_map
+                    .get::<LayerSurfaceData>()
+                    .expect("desktop layer owns protocol attributes")
+                    .lock()
+                    .expect("layer attributes lock")
+                    .initial_configure_sent = true;
+            });
+        }
+
+        for (layer, _) in &arranged {
+            if configured.contains(layer)
+                && let Some(serial) = layer.layer_surface().send_pending_configure()
+            {
+                self.record_layer_required_configure(
+                    layer.wl_surface(),
+                    serial,
+                    "layer-map arrange",
+                );
+            }
+        }
+
+        let mut moved_roots = Vec::new();
+        for (layer, location) in arranged {
+            let Some(record) = self.surfaces.get_mut(&layer.wl_surface().id()) else {
+                continue;
+            };
+            if !matches!(record.role, SurfaceRole::Layer(_)) {
+                continue;
+            }
+            let location = (location.0 as f32, location.1 as f32);
+            if (record.layout.x, record.layout.y) == location {
+                continue;
+            }
+            let delta = (location.0 - record.layout.x, location.1 - record.layout.y);
+            record.layout.x = location.0;
+            record.layout.y = location.1;
+            record.window_origin = location;
+            moved_roots.push((record.id, delta));
+            if record.mapped {
+                self.events.push(ProtocolEvent::SurfaceRelayout {
+                    id: record.id,
+                    scene: record.scene_snapshot(),
+                });
+            }
+        }
+        for (root, delta) in moved_roots {
+            self.shift_surface_descendants(root, delta);
+        }
+        result
+    }
+
+    fn record_layer_required_configure(
+        &mut self,
+        surface: &WlSurface,
+        serial: Serial,
+        source: &'static str,
+    ) {
+        let protocol_state = compositor::with_states(surface, |states| {
+            let attributes = states
+                .data_map
+                .get::<LayerSurfaceData>()
+                .expect("desktop layer owns protocol attributes")
+                .lock()
+                .expect("layer attributes lock");
+            (
+                attributes.initial_configure_sent,
+                attributes.configured,
+                attributes.configure_serial,
+            )
+        });
+        let Some(record) = self.surfaces.get_mut(&surface.id()) else {
+            return;
+        };
+        if !matches!(record.role, SurfaceRole::Layer(_)) {
+            return;
+        }
+        record.required_configure = Some(serial);
+        debug_assert!(protocol_state.0);
+        tracing::debug!(
+            surface_id = record.id.0,
+            surface = ?surface.id(),
+            ?serial,
+            source,
+            smithay_initial_configure_sent = protocol_state.0,
+            smithay_configured = protocol_state.1,
+            smithay_acked = ?protocol_state.2,
+            "sent layer configure and updated common gate"
+        );
+    }
+
+    fn arrange_layer_output(&mut self, output: &Output) {
+        if let Err((surface, error)) = self.validate_layer_output_arrangement(output, None) {
+            self.post_invalid_layer_state(&surface, error);
+            return;
+        }
+        self.update_layer_map(output, |layer_map| {
+            layer_map.arrange();
+        });
+    }
+
+    fn map_layer_on_output(&mut self, output: &Output, layer: &DesktopLayerSurface) -> bool {
+        if let Err((surface, error)) = self.validate_layer_output_arrangement(output, Some(layer)) {
+            self.post_invalid_layer_state(&surface, error);
+            return false;
+        }
+        let configured = compositor::with_states(layer.wl_surface(), |states| {
+            let mut attributes = states
+                .data_map
+                .get::<LayerSurfaceData>()
+                .expect("desktop layer owns protocol attributes")
+                .lock()
+                .expect("layer attributes lock");
+            let configured = attributes.initial_configure_sent;
+            attributes.initial_configure_sent = false;
+            configured
+        });
+        let result = self.update_layer_map(output, |layer_map| {
+            if layer_map.layer_geometry(layer).is_none() {
+                layer_map.map_layer(layer).is_ok()
+            } else {
+                layer_map.arrange();
+                true
+            }
+        });
+        if configured {
+            compositor::with_states(layer.wl_surface(), |states| {
+                states
+                    .data_map
+                    .get::<LayerSurfaceData>()
+                    .expect("desktop layer owns protocol attributes")
+                    .lock()
+                    .expect("layer attributes lock")
+                    .initial_configure_sent = true;
+            });
+            if result && let Some(serial) = layer.layer_surface().send_pending_configure() {
+                self.record_layer_required_configure(
+                    layer.wl_surface(),
+                    serial,
+                    "mapped-layer arrange",
+                );
+            }
+        }
+        result
+    }
+
+    fn ensure_layer_mapped_and_arranged(&mut self, surface: &WlSurface) {
+        let role = self.surfaces.get(&surface.id()).and_then(|record| {
+            let SurfaceRole::Layer(role) = &record.role else {
+                return None;
+            };
+            Some((role.surface.clone(), role.output.output()?.clone()))
+        });
+        let Some((layer, output)) = role else {
+            return;
+        };
+        let _ = self.map_layer_on_output(&output, &layer);
+    }
+
+    fn unmap_layer_from_output(&mut self, surface: &WlSurface) {
+        let role = self.surfaces.get(&surface.id()).and_then(|record| {
+            let SurfaceRole::Layer(role) = &record.role else {
+                return None;
+            };
+            Some((role.surface.clone(), role.output.output()?.clone()))
+        });
+        if let Some((layer, output)) = role {
+            self.update_layer_map(&output, |layer_map| layer_map.unmap_layer(&layer));
+        }
+    }
+
+    fn arrange_all_layer_outputs(&mut self) {
+        let mut outputs = Vec::new();
+        for record in self.surfaces.values() {
+            if let SurfaceRole::Layer(role) = &record.role
+                && let Some(output) = role.output.output()
+                && !outputs.contains(output)
+            {
+                outputs.push(output.clone());
+            }
+        }
+        for output in outputs {
+            self.arrange_layer_output(&output);
+        }
+    }
+
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    fn reconcile_layer_output_bindings(&mut self) {
+        let default_output = self.backend.default_output();
+        let transitions = self
+            .surfaces
+            .iter()
+            .filter_map(|(object, record)| {
+                let SurfaceRole::Layer(role) = &record.role else {
+                    return None;
+                };
+                let transition = role.output.transition(default_output.as_ref(), |output| {
+                    self.backend.output_is_registered(output)
+                });
+                let in_layer_map = role.output.output().is_some_and(|output| {
+                    layer_map_for_output(output)
+                        .layer_geometry(&role.surface)
+                        .is_some()
+                });
+                (!matches!(transition, LayerOutputTransition::Keep)).then(|| {
+                    (
+                        object.clone(),
+                        role.surface.clone(),
+                        role.output.output().cloned(),
+                        transition,
+                        record.mapped,
+                        in_layer_map,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut closed_surfaces = Vec::new();
+        for (object, layer, old_output, transition, was_mapped, in_layer_map) in transitions {
+            if let Some(old_output) = old_output {
+                self.update_layer_map(&old_output, |layer_map| layer_map.unmap_layer(&layer));
+            }
+            match transition {
+                LayerOutputTransition::Migrate(output) => {
+                    if let Some(record) = self.surfaces.get_mut(&object)
+                        && let SurfaceRole::Layer(role) = &mut record.role
+                    {
+                        role.output = LayerOutputBinding::Default(output.clone());
+                    }
+                    let mapped = !in_layer_map || self.map_layer_on_output(&output, &layer);
+                    if !mapped {
+                        if let Some(record) = self.surfaces.get_mut(&object)
+                            && let SurfaceRole::Layer(role) = &mut record.role
+                        {
+                            role.output = LayerOutputBinding::Closed;
+                        }
+                        layer.layer_surface().send_close();
+                        closed_surfaces.push(layer.wl_surface().clone());
+                    }
+                }
+                LayerOutputTransition::Close => {
+                    let unmapped = self.surfaces.get_mut(&object).and_then(|record| {
+                        let SurfaceRole::Layer(role) = &mut record.role else {
+                            return None;
+                        };
+                        role.output = LayerOutputBinding::Closed;
+                        record.mapped = false;
+                        was_mapped.then_some(record.id)
+                    });
+                    layer.layer_surface().send_close();
+                    closed_surfaces.push(layer.wl_surface().clone());
+                    if let Some(id) = unmapped {
+                        self.events.push(ProtocolEvent::SurfaceUnmapped { id });
+                    }
+                }
+                LayerOutputTransition::Keep => unreachable!("filtered above"),
+            }
+        }
+        if !closed_surfaces.is_empty() {
+            self.recompute_effective_visibility();
+            for surface in closed_surfaces {
+                self.clear_focus_for_surface(&surface);
+            }
+        }
+    }
+
+    fn layer_output_for_surface(&self, surface: &WlSurface) -> Option<Output> {
+        self.surfaces
+            .get(&surface.id())
+            .and_then(|record| match &record.role {
+                SurfaceRole::Layer(role) => role.output.output().cloned(),
+                _ => None,
+            })
+    }
+
+    fn layer_role_is_closed(&self, surface: &WlSurface) -> bool {
+        self.surfaces.get(&surface.id()).is_some_and(|record| {
+            matches!(
+                record.role,
+                SurfaceRole::Layer(LayerRole {
+                    output: LayerOutputBinding::Closed,
+                    ..
+                })
+            )
+        })
+    }
+
+    fn validate_layer_surface_state(&self, surface: &WlSurface) -> Result<(), String> {
+        let (layer, output) = self
+            .surfaces
+            .get(&surface.id())
+            .and_then(|record| {
+                let SurfaceRole::Layer(role) = &record.role else {
+                    return None;
+                };
+                Some((role.surface.clone(), role.output.output()?.clone()))
+            })
+            .ok_or_else(|| "layer surface has no live output".to_string())?;
+        self.validate_layer_output_arrangement(&output, Some(&layer))
+            .map_err(|(_, error)| error)
+    }
+
+    fn validate_layer_output_arrangement(
+        &self,
+        output: &Output,
+        include: Option<&DesktopLayerSurface>,
+    ) -> Result<(), (WlSurface, String)> {
+        #[derive(Clone, Copy)]
+        struct CheckedRect {
+            x: i64,
+            y: i64,
+            width: i64,
+            height: i64,
+        }
+
+        fn checked_add(value: i64, delta: i64, field: &str) -> Result<i64, String> {
+            value
+                .checked_add(delta)
+                .ok_or_else(|| format!("layer {field} arithmetic overflow"))
+        }
+
+        fn checked_sub(value: i64, delta: i64, field: &str) -> Result<i64, String> {
+            value
+                .checked_sub(delta)
+                .ok_or_else(|| format!("layer {field} arithmetic overflow"))
+        }
+
+        fn validate_rect(rect: CheckedRect, label: &str) -> Result<(), String> {
+            if rect.width < 0 || rect.height < 0 {
+                return Err(format!("{label} has a negative arrangement area"));
+            }
+            let right = checked_add(rect.x, rect.width, "right edge")?;
+            let bottom = checked_add(rect.y, rect.height, "bottom edge")?;
+            if [rect.x, rect.y, rect.width, rect.height, right, bottom]
+                .into_iter()
+                .any(|value| value.abs() > MAX_LAYER_GEOMETRY_VALUE)
+            {
+                return Err(format!(
+                    "{label} exceeds the layer geometry bound {MAX_LAYER_GEOMETRY_VALUE}"
+                ));
+            }
+            Ok(())
+        }
+
+        fn validate_remaining_zone(rect: CheckedRect) -> Result<(), String> {
+            if rect.width < 0 || rect.height < 0 {
+                return Err("remaining layer zone has a negative arrangement area".into());
+            }
+            let right = checked_add(rect.x, rect.width, "right edge")?;
+            let bottom = checked_add(rect.y, rect.height, "bottom edge")?;
+            if [rect.x, rect.y, rect.width, rect.height, right, bottom]
+                .into_iter()
+                .any(|value| value.abs() > MAX_LAYER_GEOMETRY_VALUE)
+            {
+                return Err(format!(
+                    "remaining layer zone exceeds the layer geometry bound {MAX_LAYER_GEOMETRY_VALUE}"
+                ));
+            }
+            Ok(())
+        }
+
+        let mut layers = layer_map_for_output(output)
+            .layers()
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(include) = include
+            && !layers.contains(include)
+        {
+            layers.push(include.clone());
+        }
+        let Some(first_surface) = layers.first().map(|layer| layer.wl_surface().clone()) else {
+            return Ok(());
+        };
+        let mode = output.current_mode().ok_or_else(|| {
+            (
+                first_surface.clone(),
+                "layer output has no current mode".to_string(),
+            )
+        })?;
+        let logical = mode
+            .size
+            .to_f64()
+            .to_logical(output.current_scale().fractional_scale())
+            .to_i32_round::<i32>();
+        let logical = output.current_transform().transform_size(logical);
+        let output_rect = CheckedRect {
+            x: 0,
+            y: 0,
+            width: i64::from(logical.w),
+            height: i64::from(logical.h),
+        };
+        validate_rect(output_rect, "layer output").map_err(|error| (first_surface, error))?;
+
+        let mut zone = output_rect;
+        let mut total_exclusive_zone = 0_i64;
+        for layer in layers {
+            let surface = layer.wl_surface().clone();
+            let state = layer.cached_state();
+            let result = (|| {
+                let values = [
+                    ("width", i64::from(state.size.w)),
+                    ("height", i64::from(state.size.h)),
+                    ("top margin", i64::from(state.margin.top)),
+                    ("right margin", i64::from(state.margin.right)),
+                    ("bottom margin", i64::from(state.margin.bottom)),
+                    ("left margin", i64::from(state.margin.left)),
+                ];
+                if let Some((name, value)) = values
+                    .into_iter()
+                    .find(|(_, value)| value.abs() > MAX_LAYER_GEOMETRY_VALUE)
+                {
+                    return Err(format!(
+                        "{name} {value} exceeds the layer geometry bound {MAX_LAYER_GEOMETRY_VALUE}"
+                    ));
+                }
+                if state.size.w < 0 || state.size.h < 0 {
+                    return Err("layer requested a negative size".into());
+                }
+
+                if let ExclusiveZone::Exclusive(amount) = state.exclusive_zone {
+                    let amount = i64::from(amount);
+                    if amount > MAX_LAYER_GEOMETRY_VALUE {
+                        return Err(format!(
+                            "exclusive zone {amount} exceeds the layer geometry bound {MAX_LAYER_GEOMETRY_VALUE}"
+                        ));
+                    }
+                    total_exclusive_zone =
+                        checked_add(total_exclusive_zone, amount, "cumulative exclusive zone")?;
+                    if total_exclusive_zone > MAX_LAYER_GEOMETRY_VALUE {
+                        return Err(format!(
+                            "cumulative exclusive zone {total_exclusive_zone} exceeds the per-output bound {MAX_LAYER_GEOMETRY_VALUE}"
+                        ));
+                    }
+                }
+
+                let mut source = match state.exclusive_zone {
+                    ExclusiveZone::Exclusive(_) | ExclusiveZone::Neutral => zone,
+                    ExclusiveZone::DontCare => output_rect,
+                };
+                if state.anchor.contains(Anchor::LEFT) {
+                    source.width =
+                        checked_sub(source.width, i64::from(state.margin.left), "source width")?;
+                }
+                if state.anchor.contains(Anchor::RIGHT) {
+                    source.width =
+                        checked_sub(source.width, i64::from(state.margin.right), "source width")?;
+                }
+                if state.anchor.contains(Anchor::TOP) {
+                    source.height =
+                        checked_sub(source.height, i64::from(state.margin.top), "source height")?;
+                }
+                if state.anchor.contains(Anchor::BOTTOM) {
+                    source.height = checked_sub(
+                        source.height,
+                        i64::from(state.margin.bottom),
+                        "source height",
+                    )?;
+                }
+                validate_rect(source, "layer source")?;
+
+                let mut width = i64::from(state.size.w).min(source.width);
+                let mut height = i64::from(state.size.h).min(source.height);
+                if width == 0 {
+                    width = source.width / 2;
+                }
+                if height == 0 {
+                    height = source.height / 2;
+                }
+                if state.anchor.anchored_horizontally() {
+                    width = source.width;
+                }
+                if state.anchor.anchored_vertically() {
+                    height = source.height;
+                }
+                let x = if state.anchor.contains(Anchor::LEFT) {
+                    checked_add(source.x, i64::from(state.margin.left), "location x")?
+                } else if state.anchor.contains(Anchor::RIGHT) {
+                    checked_add(
+                        source.x,
+                        checked_sub(source.width, width, "right anchored width")?,
+                        "location x",
+                    )?
+                } else {
+                    checked_add(
+                        source.x,
+                        checked_sub(source.width / 2, width / 2, "centred width")?,
+                        "location x",
+                    )?
+                };
+                let y = if state.anchor.contains(Anchor::TOP) {
+                    checked_add(source.y, i64::from(state.margin.top), "location y")?
+                } else if state.anchor.contains(Anchor::BOTTOM) {
+                    checked_add(
+                        source.y,
+                        checked_sub(source.height, height, "bottom anchored height")?,
+                        "location y",
+                    )?
+                } else {
+                    checked_add(
+                        source.y,
+                        checked_sub(source.height / 2, height / 2, "centred height")?,
+                        "location y",
+                    )?
+                };
+                validate_rect(
+                    CheckedRect {
+                        x,
+                        y,
+                        width,
+                        height,
+                    },
+                    "layer geometry",
+                )?;
+
+                if let ExclusiveZone::Exclusive(amount) = state.exclusive_zone {
+                    let amount = i64::from(amount);
+                    let anchor = state.anchor;
+                    if anchor.contains(Anchor::TOP) && anchor.contains(Anchor::BOTTOM) {
+                        zone.width = checked_sub(zone.width, amount, "remaining zone width")?;
+                        if anchor.contains(Anchor::LEFT) {
+                            let delta = checked_add(
+                                amount,
+                                i64::from(state.margin.left),
+                                "left exclusive edge",
+                            )?;
+                            zone.x = checked_add(zone.x, delta, "remaining zone x")?;
+                            zone.width = checked_sub(
+                                zone.width,
+                                i64::from(state.margin.left),
+                                "remaining zone width",
+                            )?;
+                        }
+                        if anchor.contains(Anchor::RIGHT) {
+                            zone.width = checked_sub(
+                                zone.width,
+                                i64::from(state.margin.right),
+                                "remaining zone width",
+                            )?;
+                        }
+                    } else if anchor.contains(Anchor::LEFT) && anchor.contains(Anchor::RIGHT) {
+                        zone.height = checked_sub(zone.height, amount, "remaining zone height")?;
+                        if anchor.contains(Anchor::TOP) {
+                            let delta = checked_add(
+                                amount,
+                                i64::from(state.margin.top),
+                                "top exclusive edge",
+                            )?;
+                            zone.y = checked_add(zone.y, delta, "remaining zone y")?;
+                            zone.height = checked_sub(
+                                zone.height,
+                                i64::from(state.margin.top),
+                                "remaining zone height",
+                            )?;
+                        }
+                        if anchor.contains(Anchor::BOTTOM) {
+                            zone.height = checked_sub(
+                                zone.height,
+                                i64::from(state.margin.bottom),
+                                "remaining zone height",
+                            )?;
+                        }
+                    } else if anchor == Anchor::all() {
+                        zone.width = 0;
+                        zone.height = 0;
+                    } else if anchor.contains(Anchor::LEFT) && !anchor.contains(Anchor::RIGHT) {
+                        let delta = checked_add(
+                            amount,
+                            i64::from(state.margin.left),
+                            "left exclusive edge",
+                        )?;
+                        zone.x = checked_add(zone.x, delta, "remaining zone x")?;
+                        zone.width = checked_sub(zone.width, delta, "remaining zone width")?;
+                    } else if anchor.contains(Anchor::TOP) && !anchor.contains(Anchor::BOTTOM) {
+                        let delta =
+                            checked_add(amount, i64::from(state.margin.top), "top exclusive edge")?;
+                        zone.y = checked_add(zone.y, delta, "remaining zone y")?;
+                        zone.height = checked_sub(zone.height, delta, "remaining zone height")?;
+                    } else if anchor.contains(Anchor::RIGHT) && !anchor.contains(Anchor::LEFT) {
+                        let delta = checked_add(
+                            amount,
+                            i64::from(state.margin.right),
+                            "right exclusive edge",
+                        )?;
+                        zone.width = checked_sub(zone.width, delta, "remaining zone width")?;
+                    } else if anchor.contains(Anchor::BOTTOM) && !anchor.contains(Anchor::TOP) {
+                        let delta = checked_add(
+                            amount,
+                            i64::from(state.margin.bottom),
+                            "bottom exclusive edge",
+                        )?;
+                        zone.height = checked_sub(zone.height, delta, "remaining zone height")?;
+                    }
+                    validate_remaining_zone(zone)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                return Err((surface, error));
+            }
+        }
+        Ok(())
+    }
+
+    fn post_invalid_layer_state(&self, surface: &WlSurface, message: String) {
+        if let Some(layer) = self.surfaces.get(&surface.id()).and_then(|record| {
+            let SurfaceRole::Layer(role) = &record.role else {
+                return None;
+            };
+            Some(role.surface.layer_surface().clone())
+        }) {
+            layer
+                .shell_surface()
+                .post_error(zwlr_layer_surface_v1::Error::InvalidSize, message);
+        }
+    }
+
+    fn apply_acked_layer_state(&mut self, surface: &WlSurface) {
+        let Some(record) = self.surfaces.get_mut(&surface.id()) else {
+            return;
+        };
+        if matches!(record.role, SurfaceRole::Layer(_))
+            && configure_sequence_is_acked(record.required_configure, record.last_acked_configure)
+            && let Some(size) = record.last_acked_size
+        {
+            record.configured_size = size;
+        }
+    }
+
     fn emit_xdg_configure(
         &mut self,
         surface: &WlSurface,
@@ -4790,28 +5546,33 @@ impl WaylandState {
             }
             match &record.role {
                 SurfaceRole::Toplevel(toplevel) => {
-                    Some(XdgConfigureTarget::Toplevel(toplevel.clone()))
+                    Some(ConfigureTarget::Toplevel(toplevel.clone()))
                 }
-                SurfaceRole::Popup(popup) => Some(XdgConfigureTarget::Popup(popup.clone())),
-                SurfaceRole::Subsurface { .. } | SurfaceRole::Dormant(_) => None,
+                SurfaceRole::Popup(popup) => Some(ConfigureTarget::Popup(popup.clone())),
+                SurfaceRole::Layer(role) if role.output.output().is_some() => {
+                    Some(ConfigureTarget::Layer(role.surface.clone()))
+                }
+                SurfaceRole::Layer(_)
+                | SurfaceRole::Subsurface { .. }
+                | SurfaceRole::Dormant(_) => None,
             }
         })?;
 
         let serial = match (target, &request) {
-            (XdgConfigureTarget::Toplevel(toplevel), XdgConfigureRequest::Initial) => toplevel
+            (ConfigureTarget::Toplevel(toplevel), XdgConfigureRequest::Initial) => toplevel
                 .send_pending_configure()
                 .unwrap_or_else(|| toplevel.send_configure()),
-            (XdgConfigureTarget::Toplevel(toplevel), XdgConfigureRequest::Toplevel { force }) => {
+            (ConfigureTarget::Toplevel(toplevel), XdgConfigureRequest::Toplevel { force }) => {
                 if *force {
                     toplevel.send_configure()
                 } else {
                     toplevel.send_pending_configure()?
                 }
             }
-            (XdgConfigureTarget::Popup(popup), XdgConfigureRequest::PopupReposition { token }) => {
+            (ConfigureTarget::Popup(popup), XdgConfigureRequest::PopupReposition { token }) => {
                 popup.send_repositioned(*token)
             }
-            (XdgConfigureTarget::Popup(popup), XdgConfigureRequest::Initial) => {
+            (ConfigureTarget::Popup(popup), XdgConfigureRequest::Initial) => {
                 match popup.send_configure() {
                     Ok(serial) => serial,
                     Err(error) => {
@@ -4825,15 +5586,29 @@ impl WaylandState {
                     }
                 }
             }
-            (XdgConfigureTarget::Toplevel(_), XdgConfigureRequest::PopupReposition { .. })
-            | (XdgConfigureTarget::Popup(_), XdgConfigureRequest::Toplevel { .. }) => return None,
+            (ConfigureTarget::Layer(layer), XdgConfigureRequest::Initial) => {
+                layer.layer_surface().send_configure()
+            }
+            (ConfigureTarget::Toplevel(_), XdgConfigureRequest::PopupReposition { .. })
+            | (ConfigureTarget::Popup(_), XdgConfigureRequest::Toplevel { .. })
+            | (ConfigureTarget::Layer(_), XdgConfigureRequest::Toplevel { .. })
+            | (ConfigureTarget::Layer(_), XdgConfigureRequest::PopupReposition { .. }) => {
+                return None;
+            }
         };
         if matches!(
             request,
             XdgConfigureRequest::Initial | XdgConfigureRequest::PopupReposition { .. }
-        ) && let Some(record) = self.surfaces.get_mut(&surface.id())
-        {
-            record.required_configure = Some(serial);
+        ) {
+            let is_layer = self
+                .surfaces
+                .get(&surface.id())
+                .is_some_and(|record| matches!(record.role, SurfaceRole::Layer(_)));
+            if is_layer {
+                self.record_layer_required_configure(surface, serial, "initial empty commit");
+            } else if let Some(record) = self.surfaces.get_mut(&surface.id()) {
+                record.required_configure = Some(serial);
+            }
         }
         if let Some(record) = self.surfaces.get_mut(&surface.id())
             && matches!(record.role, SurfaceRole::Toplevel(_))
@@ -4846,14 +5621,14 @@ impl WaylandState {
         Some(serial)
     }
 
-    fn send_initial_xdg_configure(&mut self, surface: &WlSurface) -> bool {
+    fn send_initial_configure(&mut self, surface: &WlSurface) -> bool {
         let Some(serial) = self.emit_xdg_configure(surface, XdgConfigureRequest::Initial) else {
             return false;
         };
         tracing::debug!(
             surface = ?surface.id(),
             ?serial,
-            "sent initial xdg configure after empty commit"
+            "sent initial shell configure after empty commit"
         );
         true
     }
@@ -4922,14 +5697,14 @@ impl WaylandState {
         });
     }
 
-    fn current_xdg_sequence_is_acked(&self, surface: &WlSurface) -> bool {
+    fn current_configure_sequence_is_acked(&self, surface: &WlSurface) -> bool {
         self.surfaces.get(&surface.id()).is_some_and(|record| {
             configure_sequence_is_acked(record.required_configure, record.last_acked_configure)
         })
     }
 
-    fn ensure_current_xdg_sequence_is_acked(&mut self, surface: &WlSurface) -> bool {
-        if self.current_xdg_sequence_is_acked(surface) {
+    fn ensure_current_configure_sequence_is_acked(&mut self, surface: &WlSurface) -> bool {
+        if self.current_configure_sequence_is_acked(surface) {
             return true;
         }
         let target = self
@@ -4937,47 +5712,103 @@ impl WaylandState {
             .get(&surface.id())
             .and_then(|record| match &record.role {
                 SurfaceRole::Toplevel(toplevel) => {
-                    Some(XdgConfigureTarget::Toplevel(toplevel.clone()))
+                    Some(ConfigureTarget::Toplevel(toplevel.clone()))
                 }
-                SurfaceRole::Popup(popup) => Some(XdgConfigureTarget::Popup(popup.clone())),
-                SurfaceRole::Subsurface { .. } | SurfaceRole::Dormant(_) => None,
+                SurfaceRole::Popup(popup) => Some(ConfigureTarget::Popup(popup.clone())),
+                SurfaceRole::Layer(role) if role.output.output().is_some() => {
+                    Some(ConfigureTarget::Layer(role.surface.clone()))
+                }
+                SurfaceRole::Layer(_)
+                | SurfaceRole::Subsurface { .. }
+                | SurfaceRole::Dormant(_) => None,
             });
         let Some(target) = target else {
             return true;
         };
-        set_xdg_configured(surface, false);
         match target {
-            XdgConfigureTarget::Toplevel(toplevel) => {
+            ConfigureTarget::Toplevel(toplevel) => {
+                set_xdg_configured(surface, false);
                 let _ = toplevel.ensure_configured();
             }
-            XdgConfigureTarget::Popup(popup) => {
+            ConfigureTarget::Popup(popup) => {
+                set_xdg_configured(surface, false);
                 let _ = popup.ensure_configured();
+            }
+            ConfigureTarget::Layer(layer) => {
+                let (configured, acked) = compositor::with_states(layer.wl_surface(), |states| {
+                    let attributes = states
+                        .data_map
+                        .get::<LayerSurfaceData>()
+                        .expect("desktop layer owns protocol attributes")
+                        .lock()
+                        .expect("layer attributes lock");
+                    (attributes.configured, attributes.configure_serial)
+                });
+                if !configured {
+                    let _ = layer.layer_surface().ensure_configured();
+                } else {
+                    let gate = self.surfaces.get(&surface.id()).map(|record| {
+                        (
+                            record.id,
+                            record.required_configure,
+                            record.last_acked_configure,
+                        )
+                    });
+                    if let Some((surface_id, required_configure, last_acked_configure)) = gate {
+                        tracing::debug!(
+                            surface_id = surface_id.0,
+                            surface = ?surface.id(),
+                            ?required_configure,
+                            ?last_acked_configure,
+                            smithay_configured = configured,
+                            smithay_acked = ?acked,
+                            "refused layer buffer pending the newest configure acknowledgement"
+                        );
+                    }
+                }
             }
         }
         false
     }
 
-    fn reset_xdg_configure_sequence(&mut self, surface: &WlSurface) {
+    fn reset_configure_sequence(&mut self, surface: &WlSurface) {
+        let initial_layer = self.surfaces.get(&surface.id()).and_then(|record| {
+            let SurfaceRole::Layer(role) = &record.role else {
+                return None;
+            };
+            Some(role.initial_layer)
+        });
         let target = self
             .surfaces
             .get(&surface.id())
             .and_then(|record| match &record.role {
                 SurfaceRole::Toplevel(toplevel) => {
-                    Some(XdgConfigureTarget::Toplevel(toplevel.clone()))
+                    Some(ConfigureTarget::Toplevel(toplevel.clone()))
                 }
-                SurfaceRole::Popup(popup) => Some(XdgConfigureTarget::Popup(popup.clone())),
+                SurfaceRole::Popup(popup) => Some(ConfigureTarget::Popup(popup.clone())),
+                SurfaceRole::Layer(role) => Some(ConfigureTarget::Layer(role.surface.clone())),
                 SurfaceRole::Subsurface { .. } | SurfaceRole::Dormant(_) => None,
             });
-        match target {
-            Some(XdgConfigureTarget::Toplevel(toplevel)) => {
+        let reset_xdg_protocol_state = match target {
+            Some(ConfigureTarget::Toplevel(toplevel)) => {
                 toplevel.reset_initial_configure_sent();
+                true
             }
-            Some(XdgConfigureTarget::Popup(popup)) => {
+            Some(ConfigureTarget::Popup(popup)) => {
                 popup.reset_initial_configure_sent();
+                true
+            }
+            Some(ConfigureTarget::Layer(layer)) => {
+                layer
+                    .layer_surface()
+                    .reset_after_unmap(initial_layer.expect("layer configure target owns role"));
+                false
             }
             None => return,
+        };
+        if reset_xdg_protocol_state {
+            set_xdg_configured(surface, false);
         }
-        set_xdg_configured(surface, false);
         if let Some(record) = self.surfaces.get_mut(&surface.id()) {
             record.required_configure = None;
             record.last_acked_configure = None;
@@ -4985,6 +5816,92 @@ impl WaylandState {
             record.configured_window_states.clear();
             record.pending_popup_reposition = None;
         }
+    }
+
+    /// Dismiss every xdg-popup branch rooted at `surface` and retire the
+    /// compositor-side mappings for those popups.
+    ///
+    /// Smithay owns the popup protocol tree and recursively emits
+    /// `popup_done`; cosmix owns the scene records and buffer lifetimes. Both
+    /// halves must be unwound together or remapping a layer parent can reveal
+    /// popup content from the parent's previous map cycle.
+    fn dismiss_popup_descendants(&mut self, surface: &WlSurface) {
+        let Some(root_id) = self.surfaces.get(&surface.id()).map(|record| record.id) else {
+            return;
+        };
+        let popup_objects = self
+            .surfaces
+            .iter()
+            .filter_map(|(object, record)| {
+                matches!(record.role, SurfaceRole::Popup(_))
+                    .then(|| record_root_id(&self.surfaces, &self.surface_objects, object.clone()))
+                    .flatten()
+                    .filter(|candidate| *candidate == root_id)
+                    .map(|_| object.clone())
+            })
+            .collect::<Vec<_>>();
+        let tracked_popups = PopupManager::popups_for_surface(surface)
+            .map(|(popup, _)| popup)
+            .collect::<Vec<_>>();
+        for popup in tracked_popups {
+            let _ = PopupManager::dismiss_popup(surface, &popup);
+        }
+        if popup_objects.is_empty() {
+            return;
+        }
+
+        let mut retired = Vec::new();
+        for object in popup_objects {
+            let Some(popup_surface) =
+                self.surfaces
+                    .get(&object)
+                    .and_then(|record| match &record.role {
+                        SurfaceRole::Popup(popup) => Some(popup.wl_surface().clone()),
+                        _ => None,
+                    })
+            else {
+                continue;
+            };
+            self.reset_configure_sequence(&popup_surface);
+            let Some(record) = self.surfaces.get_mut(&object) else {
+                continue;
+            };
+            let released_shm_bytes = record
+                .shm_backing
+                .take()
+                .map_or(0, |backing| backing.rgba.len());
+            let released_dmabuf_token = record
+                .dmabuf_backing
+                .take()
+                .map(|backing| backing.retention_token);
+            record.buffer_dimensions = None;
+            record.minimized = false;
+            let unmapped = record.mapped.then_some(record.id);
+            record.mapped = false;
+            retired.push((
+                popup_surface,
+                unmapped,
+                released_shm_bytes,
+                released_dmabuf_token,
+            ));
+        }
+
+        for (popup_surface, _, released_shm_bytes, released_dmabuf_token) in &retired {
+            if *released_shm_bytes > 0 {
+                self.release_shm_bytes(popup_surface, *released_shm_bytes);
+            }
+            if let Some(token) = released_dmabuf_token {
+                self.release_buffer_token(*token);
+            }
+        }
+        self.recompute_effective_visibility();
+        for (popup_surface, unmapped, _, _) in retired {
+            self.clear_focus_for_surface(&popup_surface);
+            if let Some(id) = unmapped {
+                self.events.push(ProtocolEvent::SurfaceUnmapped { id });
+            }
+        }
+        self.refresh_chrome_pointer_after_scene_change();
     }
 
     fn recompute_effective_visibility(&mut self) {
@@ -5012,7 +5929,7 @@ impl WaylandState {
             let association_visible = match record.role {
                 SurfaceRole::Subsurface { .. } => record.parent_association_committed,
                 SurfaceRole::Dormant(_) => false,
-                SurfaceRole::Toplevel(_) | SurfaceRole::Popup(_) => true,
+                SurfaceRole::Toplevel(_) | SurfaceRole::Popup(_) | SurfaceRole::Layer(_) => true,
             };
             let visible = effectively_visible(
                 record.mapped && !record.minimized,
@@ -5203,6 +6120,13 @@ impl WaylandState {
         self.reset_chrome_pointer_tracking(&surface.id());
         self.minimized_toplevels
             .retain(|object| *object != surface.id());
+        if self
+            .surfaces
+            .get(&surface.id())
+            .is_some_and(|record| matches!(record.role, SurfaceRole::Layer(_)))
+        {
+            self.dismiss_popup_descendants(surface);
+        }
         let Some(record) = self.surfaces.get_mut(&surface.id()) else {
             return;
         };
@@ -5271,6 +6195,13 @@ impl WaylandState {
         self.reset_chrome_pointer_tracking(&surface.id());
         self.minimized_toplevels
             .retain(|object| *object != surface.id());
+        if self
+            .surfaces
+            .get(&surface.id())
+            .is_some_and(|record| matches!(record.role, SurfaceRole::Layer(_)))
+        {
+            self.dismiss_popup_descendants(surface);
+        }
         let Some(record) = self.surfaces.remove(&surface.id()) else {
             return;
         };
@@ -7145,6 +8076,7 @@ impl WaylandState {
         }
         self.events
             .push(ProtocolEvent::OutputResized { width, height });
+        self.arrange_all_layer_outputs();
 
         let mut shifted_roots = Vec::new();
         let mut configure_surfaces = Vec::new();
@@ -7437,6 +8369,12 @@ impl WaylandState {
             record.layout.y += delta.1;
             record.window_origin.0 += delta.0;
             record.window_origin.1 += delta.1;
+            if let Some(pending) = record.pending_popup_reposition.as_mut() {
+                pending.layout.x += delta.0;
+                pending.layout.y += delta.1;
+                pending.window_origin.0 += delta.0;
+                pending.window_origin.1 += delta.1;
+            }
             let scene = record.scene_snapshot();
             if record.mapped {
                 self.events.push(ProtocolEvent::SurfaceRelayout {
@@ -7656,7 +8594,9 @@ impl WaylandState {
             match &record.role {
                 SurfaceRole::Subsurface { parent, .. } => current = parent.clone(),
                 SurfaceRole::Toplevel(_) => return Some(current),
-                SurfaceRole::Popup(_) | SurfaceRole::Dormant(_) => return None,
+                SurfaceRole::Popup(_) | SurfaceRole::Layer(_) | SurfaceRole::Dormant(_) => {
+                    return None;
+                }
             }
         }
     }
@@ -8097,6 +9037,10 @@ impl WaylandState {
     fn retire_buffer_immediately(&mut self, buffer: wl_buffer::WlBuffer) {
         let token = self.retain_buffer(buffer);
         self.release_buffer_token(token);
+    }
+
+    fn layer_role_creation_is_already_constructed(&self, surface: &WlSurface) -> bool {
+        self.buffer_history_surfaces.contains(&surface.id())
     }
 
     /// Retire content committed before a role that cannot adopt that commit.

@@ -20,7 +20,7 @@ pub(crate) mod worker;
 
 use smithay::{
     output::{Mode, Output},
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    reexports::wayland_server::protocol::{wl_output::WlOutput, wl_surface::WlSurface},
 };
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -29,9 +29,7 @@ use std::collections::BTreeMap;
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 use smithay::{
     output::{PhysicalProperties, Scale, Subpixel},
-    reexports::wayland_server::{
-        DisplayHandle, GlobalDispatch, backend::GlobalId, protocol::wl_output::WlOutput,
-    },
+    reexports::wayland_server::{DisplayHandle, GlobalDispatch, backend::GlobalId},
     utils::Transform,
     wayland::output::WlOutputData,
 };
@@ -117,6 +115,29 @@ impl KmsBackendData {
 }
 
 impl BackendData {
+    /// The output used when a protocol request deliberately leaves output
+    /// selection to the compositor.
+    pub(crate) fn default_output(&self) -> Option<Output> {
+        match self {
+            Self::Winit(data) => Some(data.output.clone()),
+            Self::Kms(data) => data.default_output(),
+        }
+    }
+
+    /// Resolve a client output only while it remains in this backend's live
+    /// protocol registry. `Output::from_resource` alone also resolves disabled
+    /// globals retained by existing client resources after hot-unplug.
+    pub(crate) fn output_from_resource(&self, resource: &WlOutput) -> Option<Output> {
+        Output::from_resource(resource).filter(|output| self.output_is_registered(output))
+    }
+
+    pub(crate) fn output_is_registered(&self, output: &Output) -> bool {
+        match self {
+            Self::Winit(data) => data.output == *output,
+            Self::Kms(data) => data.output_is_registered(output),
+        }
+    }
+
     /// Perform backend-specific maintenance after one protocol dispatch.
     ///
     /// The nested backend owns one Smithay output that needs cleanup. The KMS
@@ -347,6 +368,40 @@ impl BackendData {
 }
 
 impl KmsBackendData {
+    fn default_output(&self) -> Option<Output> {
+        #[cfg(any(all(feature = "kms-live", not(test)), test))]
+        {
+            if let Some(selected) = self.topology.selected_client_output()
+                && let Some(output) = self.client_outputs.outputs.get(&selected.key)
+            {
+                return Some(output.output.clone());
+            }
+            self.client_outputs
+                .outputs
+                .values()
+                .next()
+                .map(|output| output.output.clone())
+        }
+        #[cfg(not(any(all(feature = "kms-live", not(test)), test)))]
+        {
+            None
+        }
+    }
+
+    fn output_is_registered(&self, _output: &Output) -> bool {
+        #[cfg(any(all(feature = "kms-live", not(test)), test))]
+        {
+            self.client_outputs
+                .outputs
+                .values()
+                .any(|registered| registered.output == *_output)
+        }
+        #[cfg(not(any(all(feature = "kms-live", not(test)), test)))]
+        {
+            false
+        }
+    }
+
     fn apply_render_reply(
         &mut self,
         reply: KmsRenderReply,
