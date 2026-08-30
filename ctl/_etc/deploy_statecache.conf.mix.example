@@ -1,0 +1,10 @@
+-- deploy_statecache.conf.mix.example — private statecache target selection.
+{
+  deploy_statecache: {
+    schema_version: 1,
+    -- Every node on which this hub permits statecache deployment.
+    target_nodes: ["alpha", "beta", "gamma"],
+    -- Used by `deploy_statecache.mix deploy` when no nodes are named.
+    default_nodes: ["beta", "gamma"]
+  }
+}

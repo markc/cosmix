@@ -1,0 +1,20 @@
+// toolsd (mirrors the provisiond trust split): the ABP wake citizen user
+// cosmix-toolsd-wake may start ONLY the tool drain oneshot — nothing else. This lets the
+// credential-free citizen trigger the drain without being root or holding generic
+// systemctl authority.
+//
+// Anything outside this exact (user, verb, unit) triple falls through to the polkit
+// default (deny for a system user with no active session). In particular the wake user
+// cannot start, stop or restart ANY other unit — including provisiond's drain, which is
+// the identity that holds the PVE-root SSH key.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        subject.user == "cosmix-toolsd-wake") {
+        var unit = action.lookup("unit");
+        var verb = action.lookup("verb");
+        if (verb == "start" && unit == "cosmix-toolsd-drain.service") {
+            return polkit.Result.YES;
+        }
+        return polkit.Result.NOT_HANDLED;
+    }
+});

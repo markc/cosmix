@@ -1,0 +1,32 @@
+[Unit]
+Description=Cosmix toolsd ABP wake citizen (credential-free; starts the tool drain)
+After=network.target cosmix-noded.service
+Wants=cosmix-noded.service
+
+[Service]
+Type=simple
+User=cosmix-toolsd-wake
+Group=cosmix-toolsd-wake
+ExecStart=/opt/cosmix/bin/mix --serve /opt/cosmix/share/cosmix/toolsd.mix --name toolsd
+Restart=on-failure
+RestartSec=2
+
+# This identity holds NO credential — not even the tools claim secret (that belongs to
+# the drain alone). Its ONLY authority is a polkit rule permitting exactly one action:
+# `systemctl start cosmix-toolsd-drain.service`. It needs the ABP broker (loopback) and
+# the system bus (polkit), and nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

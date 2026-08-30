@@ -1,0 +1,13 @@
+-- deploy_loki.conf.mix.example — private Loki deployment inputs.
+-- Copy this file to deploy_loki.conf.mix in the private control hub and
+-- replace every placeholder. target_node must exist in its fleet roster and
+-- mesh inventory. config_file is an absolute local path to the private Loki
+-- YAML; deploy_version is the monotonic config/unit bundle generation.
+deploy_loki: {
+  schema_version: 1,
+  target_node: "alpha",
+  config_file: "/home/user/.ctl/_etc/cosmix/loki/loki.yml",
+  expected_loki_version: "3.7.2",
+  deploy_version: "1.0.0",
+  ready_port: 3100
+}

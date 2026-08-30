@@ -1,0 +1,44 @@
+-- toolsd.mix — the toolsd ABP WAKE citizen.
+--
+-- Runs as `mix --serve toolsd.mix --name toolsd` under the LOW-privilege
+-- cosmix-toolsd-wake user. It holds NO credential (not even the tools claim secret —
+-- that belongs to the drain alone) and does NO work: its only power is starting ONE unit,
+-- the drain oneshot, via a narrowly-scoped polkit rule.
+--
+-- This mirrors provisiond's wake/drain shape, but for a DIFFERENT reason. provisiond
+-- splits to keep the ABP-facing surface away from the PVE-root SSH key. toolsd holds no
+-- credentials at all — it splits because `run_argv` is a BLOCKING builtin and Mix `async`
+-- (Class C) handlers only yield at send/reply/sleep_ms. A 30s whois executed in-process
+-- would head-of-line block every other ABP caller, so the execution must happen in a
+-- separate, short-lived process.
+--
+-- `toolsd.wake` is AUTHORITY-FREE — it takes no args and names no target. It cannot say
+-- WHICH tool to run or for WHOM: it only nudges the drain to go and claim whatever webd
+-- has already authorised and queued, through the separately-authenticated seam. That is
+-- exactly the property that lets webd hold it as a delegated-safe verb (the same
+-- exception provisiond.wake takes).
+
+-- The drain unit this wake activates. Overridable via Environment= in the unit for a
+-- staged bring-up; polkit independently constrains which unit may actually start, so a
+-- tampered value here cannot widen the authority.
+$DRAIN_UNIT = env("TOOLSD_DRAIN_UNIT")
+if $DRAIN_UNIT == "" then
+  $DRAIN_UNIT = "cosmix-toolsd-drain.service"
+end
+
+on toolsd.wake
+  -- Activate FIRST, then reply — replying before the activation request would ack a wake
+  -- that was never submitted. --no-block returns as soon as systemd QUEUES the job (not
+  -- when the drain finishes), which is what keeps this handler non-blocking and the
+  -- citizen responsive. --no-ask-password keeps it non-interactive.
+  --
+  -- Repeated wakes during one drain coalesce into a single run (systemd will not start an
+  -- already-active oneshot); the drain's claim-until-empty loop plus the lazy timer are
+  -- the correctness backstop for the final-exit race.
+  $r = run_argv(["/usr/bin/systemctl", "--no-block", "--no-ask-password", "start", $DRAIN_UNIT], { timeout: 3 })
+  if $r.ok then
+    reply(0, { accepted: true })
+  else
+    reply(1, { accepted: false, error: "drain activation failed: " .. trim($r.stderr) .. trim("" .. $r.error) })
+  end
+end

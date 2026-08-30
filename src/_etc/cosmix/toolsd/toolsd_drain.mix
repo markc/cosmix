@@ -1,0 +1,380 @@
+-- toolsd_drain.mix — the toolsd DRAIN: claim a tool run, execute it, report the output.
+--
+-- Runs as the UNPRIVILEGED `cosmix-toolsd` user under a systemd oneshot (flock'd), woken
+-- by the ABP citizen (toolsd.mix) or, as a backstop, by a lazy timer. It holds exactly
+-- ONE credential — the tools claim secret — and holds no other authority: no PVE key, no
+-- ssh identity, no polkit rule. Its network egress is confined by the unit (private/mesh
+-- ranges denied; only the resolver stub, webd, and the public internet are reachable).
+--
+--   claim → re-validate → exec (run_argv) → report → repeat until the queue is empty
+--
+-- WHY A SEPARATE PROCESS from the citizen: `run_argv` is a BLOCKING builtin, and Mix
+-- `async` (Class C) handlers only yield at send/reply/sleep_ms — so a 30s whois inside the
+-- citizen would head-of-line block every other ABP caller. The citizen must stay
+-- responsive, so the work happens out here. (provisiond splits for a different reason —
+-- credentials; toolsd splits for responsiveness. Both identities here are unprivileged.)
+--
+-- SECURITY, in order of application:
+--   1. The claim endpoint is secret-gated and serves ONLY tool runs — it is a different
+--      queue, endpoint and credential from provisiond's, so this identity can never lease
+--      a CT-provisioning job.
+--   2. Every claimed run is RE-VALIDATED here (tool registered? role sufficient? params
+--      still valid?) — webd's checks are not trusted transitively.
+--   3. argv is built from the DAEMON-SIDE registry (tools_exec.mix); the payload only
+--      fills declared parameter slots. Exec targets are re-checked root-owned /
+--      non-symlink / not group-or-other-writable immediately before running.
+--   4. run_argv spawns a real argv with NO shell, a deadline, an output cap, a fixed
+--      minimal env and a non-writable cwd. On timeout Mix kills the whole PROCESS GROUP
+--      (setsid + SIGTERM→SIGKILL), so a whois that forked can't outlive its deadline.
+
+include "/opt/cosmix/share/cosmix/tools_exec.mix"
+
+-- Where webd lives, and the credential. Both come from the unit (Environment= /
+-- LoadCredential=), never hardcoded.
+$BASE = env("TOOLS_BASE_URL")
+if $BASE == "" then
+  eprintf("toolsd-drain: TOOLS_BASE_URL not set\n")
+  exit(1)
+end
+
+-- The claim secret: systemd LoadCredential= puts it in $CREDENTIALS_DIRECTORY, which is
+-- 0400 root-readable-by-the-unit-user only and never lands in the environment.
+function tools_load_secret()
+  $dir = env("CREDENTIALS_DIRECTORY")
+  if $dir != "" and is_file($dir .. "/tools_secret") then
+    return trim(read_file($dir .. "/tools_secret"))
+  end
+  $f = env("TOOLS_SECRET_FILE")
+  if $f != "" and is_file($f) then
+    return trim(read_file($f))
+  end
+  return ""
+end
+
+$SECRET = tools_load_secret()
+if $SECRET == "" then
+  eprintf("toolsd-drain: no tools_secret (CREDENTIALS_DIRECTORY/tools_secret or TOOLS_SECRET_FILE) — cannot claim\n")
+  exit(1)
+end
+
+-- The vhost's cert is the mesh's own; ca_file lets us verify it honestly rather than
+-- disabling verification (never ssl_verify:false — that is the dishonest readiness check).
+$CA = env("TOOLS_CA_FILE")
+$HDRS = { "Content-Type": "application/json", "X-Tools-Secret": $SECRET }
+
+function tools_http_opts($timeout)
+  $o = { timeout: $timeout }
+  if $CA != "" then
+    $o["ca_file"] = $CA
+  end
+  return $o
+end
+
+-- Bound the drain so a wedged queue can't spin forever; the timer backstop re-runs us.
+--
+-- The unit's TimeoutStartSec MUST exceed the worst wall this can produce, or systemd
+-- SIGKILLs a legitimate drain mid-run (Codex MAJOR: the original 20 runs x 40s only
+-- counted EXECUTION, ignoring the 15s claim + 20s report per run, so the true worst case
+-- was ~1500s against a 900s unit timeout).
+--
+-- So bound WALL, not just count: stop CLAIMING once the budget is spent, and never start
+-- a run we cannot finish (MAX_WALL - WORST_RUN is the cutoff).
+--
+-- MAX_RUNS is the CLOCK-INDEPENDENT fallback and must be safe ON ITS OWN: time() is
+-- SystemTime, not monotonic, so a backwards clock step could keep the wall check happy
+-- forever (Codex). At 8 runs x WORST_RUN (75s) = 600s < TimeoutStartSec (900s), systemd
+-- cannot kill a legitimate drain even if the wall budget never trips. Whatever is left is
+-- picked up by the next wake or the backstop timer.
+$MAX_RUNS = 8
+$MAX_WALL = 600
+$WORST_RUN = 75
+$runs = 0
+$started = time()
+
+-- POST /tools/claim-next → { run_id, tool, params, requested_by, requested_role,
+-- lease_token } | nil when the queue is empty (204).
+function claim_next()
+  $r = http_post($BASE .. "/tools/claim-next", "{}", $HDRS, tools_http_opts(15))
+  $st = to_number("" .. $r["status"])
+  if $st == 204 then
+    return nil
+  end
+  if $st != 200 then
+    eprintf("toolsd-drain: claim HTTP %s %s\n", "" .. $r["status"], "" .. tools_or_x($r["error"], ""))
+    return nil
+  end
+  try
+    return json_parse($r["body"])
+  catch $e
+    eprintf("toolsd-drain: bad claim json: %s\n", "" .. $e)
+    return nil
+  end
+end
+
+-- POST /tools/report — fenced by (run_id, lease_token).
+-- $trunc: whether the DRAIN had to cut the output to the tool cap. webd stores it, so
+-- tool_runs.truncated reflects what actually happened rather than only webd backstop hits.
+function report($run, $ok, $exit_code, $output, $err, $trunc)
+  $body = json_encode({ run_id: $run["run_id"], lease_token: $run["lease_token"],
+                        ok: $ok, exit_code: $exit_code, output: $output, error: $err,
+                        truncated: $trunc })
+  $r = http_post($BASE .. "/tools/report", $body, $HDRS, tools_http_opts(20))
+  $st = to_number("" .. $r["status"])
+  if $st != 200 then
+    eprintf("toolsd-drain: report HTTP %s (run %s)\n", "" .. $r["status"], "" .. $run["run_id"])
+  end
+end
+
+-- POST /tools/report — a PROGRESS append (no `ok`, carries seq+chunk). Renews the lease
+-- server-side. Returns true to continue, false to stop. A transient network failure is
+-- RETRIED a bounded number of times (the server is idempotent on seq, so re-sending the
+-- same seq after a lost response is safe — Codex): otherwise a single dropped response
+-- would strand the run claimed until its lease expires. A 4xx (fenced/gap) is terminal.
+function report_progress($run, $seq, $chunk)
+  $body = json_encode({ run_id: $run["run_id"], lease_token: $run["lease_token"],
+                        seq: $seq, chunk: $chunk })
+  $try = 0
+  while $try < 3
+    $r = http_post($BASE .. "/tools/report", $body, $HDRS, tools_http_opts(15))
+    $st = to_number("" .. $r["status"])
+    if $st == 200 then
+      return true
+    end
+    -- A definite rejection (fenced, gap, bad request) means stop — do not retry.
+    if $st != nil and $st >= 400 and $st < 500 then
+      return false
+    end
+    -- transport/5xx → retry the SAME seq (idempotent server-side).
+    $try = $try + 1
+    sleep(0.3)
+  end
+  return false
+end
+
+-- ── T2 streaming: traceroute, one hop per progress report ────────────────────────
+--
+-- traceroute -f N -m N probes exactly ONE hop, so the drain loops N=1..max_hops, runs a
+-- single-hop run_argv each, and appends the hop line via a progress report — the modal
+-- <pre> grows hop-by-hop as it polls. Bounded by max_hops (forced into argv, never a
+-- caller value) and the run's timeout. Stops early when a hop reaches the destination.
+function stream_trace($run, $host)
+  -- Resolve ONCE to an IP, then trace the IP: with -n the hop lines are IPs, so arrival is
+  -- detected by the target IP appearing (the domain NAME would never match a -n line).
+  $ips = []
+  try
+    $ips = dns_lookup($host)
+  catch $e
+  end
+  if length($ips) == 0 then
+    report($run, false, nil, "", "could not resolve " .. $host, false)
+    return
+  end
+  -- Prefer an IPv4 target: plain `traceroute` speaks IPv4, and an IPv6-first result would
+  -- have it probing an address family it can't route (every hop a timeout). An IPv4 is the
+  -- dotted-quad one (has ".", not ":").
+  $target = "" .. $ips[0]
+  for each $ip in $ips
+    if pos(".", "" .. $ip) > 0 and pos(":", "" .. $ip) == 0 then
+      $target = "" .. $ip
+    end
+  end
+  if pos(":", $target) > 0 then
+    report($run, false, nil, "", "no IPv4 address for " .. $host .. " (IPv6 trace not supported)", false)
+    return
+  end
+  -- One overall wall for the whole trace, not just per-hop: a run of all-timeout hops must
+  -- not exceed the tool's budget (Codex — otherwise 20 hops x per-hop deadline > timeout).
+  $deadline = time() + 55
+  $max = tools_trace_max_hops()
+  $seq = 0
+  -- First line names what we're tracing (the modal shows it immediately).
+  if not report_progress($run, 1, "traceroute to " .. $host .. " (" .. $target .. "), " .. ("" .. $max) .. " hops max\n") then
+    return
+  end
+  $seq = 1
+  $i = 1
+  while $i <= $max
+    if time() > $deadline then
+      $seq = $seq + 1
+      $_ = report_progress($run, $seq, "… trace deadline reached\n")
+      break
+    end
+    $a = tools_trace_argv($target, $i)
+    if $a["ok"] != true then
+      report($run, false, nil, "", "" .. $a["error"], false)
+      return
+    end
+    -- Short per-hop deadline: one hop that can't be reached returns a "* * *" line fast.
+    $r = run_argv($a["argv"], { timeout: 8, max_output: 4096,
+                                cwd: $TOOLS_CWD, env: $TOOLS_ENV, clear_env: true })
+    -- Extract the hop line whose first token is this hop number (drops any
+    -- "traceroute to …" banner traceroute prints on the first probe). A blank/timed-out
+    -- hop → a "* " placeholder so the trace still advances and terminates.
+    $line = " " .. $i .. "  *"
+    for each $ln in split("" .. tools_or_x($r["stdout"], ""), "\n")
+      if word($ln, 1) == ("" .. $i) then
+        $line = trim($ln)
+      end
+    end
+    $seq = $seq + 1
+    if not report_progress($run, $seq, $line .. "\n") then
+      -- lease gone — stop rather than stream into a dead run.
+      return
+    end
+    -- Destination reached? Compare the hop's ADDRESS TOKEN exactly (with -n -q1 the line
+    -- is "<n>  <ip>  <rtt> ms"), not a substring — target 1.1.1.1 must not match an
+    -- intermediate 11.1.1.10 and truncate the trace early (Codex).
+    if word($line, 2) == $target then
+      break
+    end
+    $i = $i + 1
+  end
+  -- Finalize WITHOUT output (nil) so webd PRESERVES the accumulated hops.
+  report($run, true, 0, nil, "", false)
+end
+
+-- Re-validate a claimed run against the registry. Returns "" when it may execute, else
+-- the refusal reason. This is defence in depth: webd already checked all of it, but webd
+-- is a different (internet-facing) trust domain and is not trusted transitively.
+function tools_recheck($run)
+  $tool = "" .. tools_or_x($run["tool"], "")
+  $spec = tools_spec($tool)
+  if $spec == nil then
+    return "unregistered tool: " .. $tool
+  end
+  -- Authz gate #2, on the SERVER-ATTESTED role from the claim envelope, via the shared
+  -- role LADDER. A literal `== "admin"` test would admit every role the moment a tool
+  -- declared min_role:"author" (Codex); unknown role / unknown min_role → denied.
+  if not tools_role_ok($spec, tools_or_x($run["requested_role"], "")) then
+    return "insufficient role for " .. $tool
+  end
+  return ""
+end
+
+-- Execute one claimed run.
+function run_one($run)
+  $tool = "" .. tools_or_x($run["tool"], "")
+  $why = tools_recheck($run)
+  if $why != "" then
+    report($run, false, nil, "", $why, false)
+    return
+  end
+  -- Re-parse and RE-VALIDATE the params (never exec straight off the wire).
+  $raw = {}
+  try
+    $raw = json_parse("" .. tools_or_x($run["params"], "{}"))
+  catch $e
+    report($run, false, nil, "", "bad params json", false)
+    return
+  end
+  $v = tools_validate($tool, $raw)
+  if $v["ok"] != true then
+    report($run, false, nil, "", "" .. $v["error"], false)
+    return
+  end
+  -- Streaming tools (trace) go through the hop-loop + progress reports, not a single run.
+  if tools_is_stream($tool) then
+    stream_trace($run, "" .. $v["params"]["domain"])
+    return
+  end
+  $a = tools_argv($tool, $v["params"])
+  if $a["ok"] != true then
+    report($run, false, nil, "", "" .. $a["error"], false)
+    return
+  end
+
+  $r = run_argv($a["argv"], { timeout: $a["timeout"], max_output: $a["max_output"],
+                              cwd: $TOOLS_CWD, env: $TOOLS_ENV, clear_env: true })
+
+  -- The tool's own diagnostics (whois timing out, dig failing) are part of what the
+  -- operator wants to SEE, exactly as in a terminal — so stderr is appended to the
+  -- output rather than hidden. It is plain text and stays plain text.
+  $out = "" .. tools_or_x($r["stdout"], "")
+  $errtxt = trim("" .. tools_or_x($r["stderr"], ""))
+  if $errtxt != "" then
+    -- Guarantee a boundary: stdout may not end in a newline, and concatenating a trimmed
+    -- stderr straight onto it would fuse the two streams' last/first lines into one
+    -- misleading line ("resultwarning") — Codex.
+    if $out != "" and not ends_with($out, "\n") then
+      $out = $out .. "\n"
+    end
+    $out = $out .. $errtxt .. "\n"
+  end
+  if $r["timed_out"] == true then
+    $out = $out .. "\n… timed out after " .. ("" .. $a["timeout"]) .. "s\n"
+  end
+  if $r["stdout_truncated"] == true or $r["stderr_truncated"] == true then
+    $out = $out .. "\n… output truncated at " .. ("" .. $a["max_output"]) .. " bytes\n"
+  end
+
+  -- Enforce the tool's COMBINED byte cap here, after merging. run_argv caps stdout and
+  -- stderr INDEPENDENTLY, so a tool declaring 64 KiB could otherwise store ~128 KiB
+  -- (Codex). Reserve room for the marker so the stored value never exceeds the cap, and
+  -- binary-search the cut point rather than stepping (substr is codepoint-based, so a
+  -- linear step is both slow and over-truncating on multibyte output).
+  $trunc = false
+  if $r["stdout_truncated"] == true or $r["stderr_truncated"] == true then
+    $trunc = true
+  end
+  $cap = to_number("" .. $a["max_output"])
+  if $cap != nil and byte_length($out) > $cap then
+    $trunc = true
+    $marker = "\n… output truncated at " .. ("" .. $cap) .. " bytes\n"
+    $budget = $cap - byte_length($marker)
+    if $budget < 0 then
+      $budget = 0
+    end
+    $lo = 0
+    $hi = length($out)
+    while $lo < $hi
+      $mid = floor(($lo + $hi + 1) / 2)
+      if byte_length(substr($out, 0, $mid)) <= $budget then
+        $lo = $mid
+      else
+        $hi = $mid - 1
+      end
+    end
+    $out = substr($out, 0, $lo) .. $marker
+  end
+
+  -- run_argv encodes ordinary failure in the VALUE (it never raises), so a non-zero exit
+  -- is reported as a completed run with that exit code — the operator sees the output AND
+  -- the code, like a shell would show. Only a spawn/timeout failure is an `error`.
+  $ec = to_number("" .. tools_or_x($r["exit_code"], ""))
+  $ok = $r["ok"] == true
+  if $ok or $ec != nil then
+    report($run, true, $ec, $out, "", $trunc)
+    return
+  end
+  report($run, false, nil, $out, "" .. tools_or_x($r["error_code"], "spawn failed"), $trunc)
+end
+
+-- ── drain loop ─────────────────────────────────────────────────────────────────
+while $runs < $MAX_RUNS
+  -- Wall budget checked BEFORE claiming, so we never lease a run we might be killed
+  -- mid-way through (a killed run's lease would expire and — for a retryable tool — be
+  -- re-queued, but the operator would still watch a dead spinner). Whatever is left in the
+  -- queue is picked up by the next wake, or by the backstop timer.
+  if (time() - $started) > ($MAX_WALL - $WORST_RUN) then
+    print("toolsd-drain: wall budget spent after " .. ("" .. $runs) .. " runs — leaving the rest to the next wake")
+    break
+  end
+  $run = claim_next()
+  if $run == nil then
+    -- Queue empty (or a claim error) → done. The wake that raced our exit is covered by
+    -- the lazy timer backstop: starting an ALREADY-ACTIVE oneshot does not schedule
+    -- another run, so a wake arriving in our last microsecond could otherwise be lost.
+    break
+  end
+  $runs = $runs + 1
+  try
+    run_one($run)
+  catch $e
+    -- Never let one bad run kill the drain — report it and take the next.
+    eprintf("toolsd-drain: run %s failed: %s\n", "" .. tools_or_x($run["run_id"], "?"), "" .. $e)
+    try
+      report($run, false, nil, "", "drain error", false)
+    catch $e2
+    end
+  end
+end

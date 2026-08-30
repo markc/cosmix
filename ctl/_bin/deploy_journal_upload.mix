@@ -1,0 +1,394 @@
+#!/usr/bin/env mix
+-- deploy_journal_upload.mix — configure systemd-journal-upload on the
+-- configured leaf nodes, or a named configured subset.
+--
+--   mix _bin/deploy_journal_upload.mix                     -- configured leaves
+--   mix _bin/deploy_journal_upload.mix alpha               -- one configured leaf
+--   mix _bin/deploy_journal_upload.mix --allow-downgrade … -- deliberate rollback
+--
+-- The hub-private config supplies the mesh/foreign target sets and their
+-- receiver URLs. Mesh addresses come from the inventory; foreign targets use
+-- their rostered SSH names because they are not mesh-inventory members.
+-- Deploys stop on the first failed gate and order any selected hub last.
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_journal_upload.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no journal-upload deploy config at " .. $CONF_PATH ..
+    " — create it from deploy_journal_upload.conf.mix.example before deploying")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["deploy_journal_upload"], {
+    schema_version: {type: "integer", enum: [1]},
+    mesh_nodes: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}},
+    foreign_nodes: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}},
+    receiver_urls: {type: "map", schema: {
+      mesh: {type: "string", nonblank: true},
+      foreign: {type: "string", nonblank: true}
+    }}
+  })
+catch $e
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn contains_item($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn validate_url($name, $url)
+  if not starts_with($url, "http://") and not starts_with($url, "https://") then
+    config_error("receiver_urls." .. $name .. " must start with http:// or https://")
+  end
+  if contains($url, "\n") or contains($url, "\r") then
+    config_error("receiver_urls." .. $name .. " must be one line")
+  end
+end
+
+validate_url("mesh", $CONF["receiver_urls"]["mesh"])
+validate_url("foreign", $CONF["receiver_urls"]["foreign"])
+
+$ROSTER = $d.roster()
+$configured = concat($CONF["mesh_nodes"], $CONF["foreign_nodes"])
+for each $node in $configured
+  $d.assert_node($ROSTER, $node)
+end
+for each $node in $CONF["mesh_nodes"]
+  if $d.is_foreign($ROSTER, $node) then
+    config_error("mesh_nodes contains foreign roster node '" .. $node .. "'")
+  end
+end
+for each $node in $CONF["foreign_nodes"]
+  if not $d.is_foreign($ROSTER, $node) then
+    config_error("foreign_nodes contains mesh roster node '" .. $node .. "'")
+  end
+end
+$seen = []
+for each $node in $configured
+  if contains_item($seen, $node) then
+    config_error("target node '" .. $node .. "' is repeated")
+  end
+  push($seen, $node)
+end
+
+$raw_args = args()
+$requested = []
+for each $arg in $raw_args
+  if $arg != "--allow-downgrade" then
+    push($requested, $arg)
+  end
+end
+$parse_args = $raw_args
+if len($requested) == 0 then
+  $parse_args = concat($configured, $raw_args)
+end
+$parsed = $d.parse_nodes($ROSTER, $parse_args, ["--allow-downgrade"])
+$selected = $parsed["nodes"]
+$ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
+
+$REMOTE = {}
+$URLS = {}
+for each $node in $selected
+  if not contains_item($configured, $node) then
+    config_error("'" .. $node .. "' is not a configured journal-upload target")
+  end
+  if $d.is_foreign($ROSTER, $node) then
+    $REMOTE[$node] = $node
+    $URLS[$node] = $CONF["receiver_urls"]["foreign"]
+  else
+    $REMOTE[$node] = "root@" .. $d.mesh_ip($node)
+    $URLS[$node] = $CONF["receiver_urls"]["mesh"]
+  end
+end
+
+-- Foreign leaves go first. The library's canonical mesh rollout supplies the
+-- spoke order; its hub set is split into the final tail explicitly so a
+-- malformed private order cannot put a spoke after a hub.
+$rollout = $d.rollout_order($ROSTER)
+$hubs = $d.mesh_hubs()
+for each $node in $selected
+  if not $d.is_foreign($ROSTER, $node) and not contains_item($rollout, $node) then
+    config_error("selected mesh node '" .. $node .. "' is absent from rollout_order")
+  end
+end
+$nodes = []
+for each $node in $ROSTER["foreign"]
+  if contains_item($selected, $node) then
+    push($nodes, $node)
+  end
+end
+for each $node in $rollout
+  if contains_item($selected, $node) and not contains_item($hubs, $node) then
+    push($nodes, $node)
+  end
+end
+for each $node in $rollout
+  if contains_item($selected, $node) and contains_item($hubs, $node) then
+    push($nodes, $node)
+  end
+end
+if len($nodes) != len($selected) then
+  config_error("ordered target count differs from selected target count")
+end
+
+-- The uploader is a system package plus configuration, not a local binary.
+-- This marker gives the deployed mechanism a monotonic generation for
+-- downgrade refusal and an exact post-install version assertion.
+$DEPLOY_VERSION = "1.0.0"
+$UPLOAD_CONF = "/etc/systemd/journal-upload.conf"
+$DROPIN = "/etc/systemd/system/systemd-journal-upload.service.d/10-cosmix.conf"
+$MARKER = "/etc/cosmix/journal-upload/deploy-version"
+$DROPIN_CONTENT = "[Unit]\nStartLimitIntervalSec=0\n[Service]\nWatchdogSec=600\nRestart=always\nRestartSec=15s\n"
+
+fn deploy_node($node)
+  $remote = $REMOTE[$node]
+  $url = $URLS[$node]
+  print("")
+  print("[" .. $node .. "] deploy systemd-journal-upload " .. $DEPLOY_VERSION)
+
+  $reach = ssh_mix($remote, '
+$hostname = trim(run("/usr/bin/hostname"))
+if $rc != 0 or $hostname == "" then
+  exit(7)
+end
+print($hostname)
+', {connect_timeout: 8, timeout: 10})
+  $d.die_if(not $reach["ok"],
+    $node .. " unreachable or not a working Mix node: " ..
+    trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+  print("  connected: " .. trim($reach["stdout"]))
+
+  -- Refuse a backwards deploy generation before package or config changes.
+  $pre = ssh_mix($remote, '
+if is_file($marker) then
+  print(trim(read_file($marker)))
+end
+', {bindings: {marker: $MARKER}, connect_timeout: 8, timeout: 10})
+  $d.die_if(not $pre["ok"],
+    $node .. " could not read the installed deploy version: " .. trim($pre["stderr"]))
+  if trim($pre["stdout"]) != "" then
+    $d.assert_not_downgrade($node, $pre["stdout"], $DEPLOY_VERSION, $ALLOW_DOWNGRADE)
+  end
+
+  $result = ssh_mix($remote, '
+fn fail($code, $message)
+  print("ERROR: " .. $message)
+  exit($code)
+end
+
+fn command($source, $label, $code)
+  $out = run($source)
+  if $rc != 0 then
+    fail($code, $label .. " failed: " .. trim($out))
+  end
+  return $out
+end
+
+fn atomic_install($path, $content, $mode)
+  $tmp = $path .. ".new"
+  write_file($tmp, $content)
+  chmod($tmp, $mode)
+  chown($tmp, 0, 0)
+  rename($tmp, $path)
+end
+
+fn assert_file($path, $content, $mode)
+  $st = stat($path, {follow_symlinks: false})
+  if $st["is_file"] != true or $st["is_symlink"] == true then
+    fail(20, $path .. " is not an installed regular file")
+  end
+  if $st["uid"] != 0 or $st["gid"] != 0 or $st["perm"] != $mode then
+    fail(21, $path .. " owner or mode mismatch")
+  end
+  if read_file($path) != $content then
+    fail(22, $path .. " content mismatch")
+  end
+end
+
+for each $bin in ["/usr/bin/systemctl", "/usr/bin/journalctl"]
+  if not is_file($bin) then
+    fail(8, $bin .. " is required")
+  end
+end
+
+-- Debian-family nodes obtain the uploader from systemd-journal-remote. Other
+-- systems must already provide the vendor unit. This check remains before any
+-- deploy-owned file is changed.
+$apt = which("apt-get")
+if $apt != nil and $apt != "" then
+  $_pkg = command(
+    "/usr/bin/env DEBIAN_FRONTEND=noninteractive " .. $apt ..
+      " install -y systemd-journal-remote",
+    "systemd-journal-remote package install", 9)
+end
+$_unit = command(
+  "/usr/bin/systemctl cat systemd-journal-upload.service",
+  "journal uploader unit lookup", 10)
+
+$previous_invocation = trim(run(
+  "/usr/bin/systemctl show systemd-journal-upload.service -p InvocationID --value"))
+if $rc != 0 then
+  $previous_invocation = ""
+end
+
+$_stop = command(
+  "/usr/bin/systemctl stop systemd-journal-upload.service",
+  "journal uploader stop", 11)
+$cursor_output = command(
+  "/usr/bin/journalctl --show-cursor -n 0 --no-pager",
+  "journal cursor lookup", 12)
+$cursor = ""
+for each $line in split($cursor_output, "\n")
+  $line = trim($line)
+  if starts_with($line, "-- cursor:") then
+    $cursor = trim(substr($line, 10, length($line) - 10))
+  end
+end
+if not starts_with($cursor, "s=") then
+  fail(12, "journal cursor lookup returned no usable cursor")
+end
+
+mkdir("/etc/systemd/system/systemd-journal-upload.service.d", {parents: true})
+mkdir("/var/lib/systemd/journal-upload", {parents: true})
+mkdir("/etc/cosmix/journal-upload", {parents: true})
+$upload_content = "[Upload]\nURL=" .. $url .. "\n"
+$state_content = "# This is private data. Do not parse.\nLAST_CURSOR=" .. $cursor .. "\n"
+atomic_install($upload_conf, $upload_content, 0o644)
+atomic_install($dropin, $dropin_content, 0o644)
+atomic_install("/var/lib/systemd/journal-upload/state", $state_content, 0o666)
+
+assert_file($upload_conf, $upload_content, 0o644)
+assert_file($dropin, $dropin_content, 0o644)
+assert_file("/var/lib/systemd/journal-upload/state", $state_content, 0o666)
+
+$_reload = command("/usr/bin/systemctl daemon-reload", "systemd daemon reload", 13)
+$_reset = command(
+  "/usr/bin/systemctl reset-failed systemd-journal-upload.service",
+  "journal uploader failure reset", 14)
+$_enable = command(
+  "/usr/bin/systemctl enable systemd-journal-upload.service",
+  "journal uploader enable", 15)
+$_restart = command(
+  "/usr/bin/systemctl restart systemd-journal-upload.service",
+  "journal uploader restart", 16)
+sleep(4)
+
+$active = trim(command(
+  "/usr/bin/systemctl is-active systemd-journal-upload.service",
+  "journal uploader active check", 17))
+if $active != "active" then
+  fail(17, "journal uploader is not active: " .. $active)
+end
+$enabled = trim(command(
+  "/usr/bin/systemctl is-enabled systemd-journal-upload.service",
+  "journal uploader enabled check", 18))
+if $enabled != "enabled" then
+  fail(18, "journal uploader is not enabled: " .. $enabled)
+end
+
+$invocation = trim(command(
+  "/usr/bin/systemctl show systemd-journal-upload.service -p InvocationID --value",
+  "journal uploader invocation lookup", 19))
+if $invocation == "" or
+    ($previous_invocation != "" and $invocation == $previous_invocation) then
+  fail(19, "journal uploader did not enter a new systemd invocation")
+end
+
+$lines = 0
+$attempt = 0
+while $attempt < 8 and $lines == 0
+  $logs = trim(run("/usr/bin/journalctl _SYSTEMD_INVOCATION_ID=" .. $invocation ..
+    " -o cat --no-pager"))
+  if $rc == 0 and $logs != "" then
+    $lines = len(split($logs, "\n"))
+  end
+  $attempt = $attempt + 1
+  if $lines == 0 and $attempt < 8 then
+    sleep(1)
+  end
+end
+if $lines == 0 then
+  fail(19, "journal uploader has no journald line for its current invocation")
+end
+
+-- Write the generation only after every install and runtime gate has passed.
+-- A failed partial rollout therefore cannot advertise success on the next run.
+atomic_install($marker, $deploy_version .. "\n", 0o644)
+assert_file($marker, $deploy_version .. "\n", 0o644)
+if trim(read_file($marker)) != $deploy_version then
+  fail(23, "installed deploy version mismatch")
+end
+
+print(data_encode({
+  version: trim(read_file($marker)),
+  invocation_id: $invocation,
+  log_lines: $lines,
+  active: $active,
+  enabled: $enabled
+}))
+', {
+    bindings: {
+      url: $url,
+      upload_conf: $UPLOAD_CONF,
+      dropin: $DROPIN,
+      dropin_content: $DROPIN_CONTENT,
+      marker: $MARKER,
+      deploy_version: $DEPLOY_VERSION
+    },
+    decode: "data", connect_timeout: 8, timeout: 180
+  })
+
+  if not $result["ok"] then
+    print("  remote install failed; last 40 journal-upload log lines:")
+    $journal = ssh_mix($remote,
+      'print(run("/usr/bin/journalctl -u systemd-journal-upload.service -n 40 --no-pager"))',
+      {connect_timeout: 8, timeout: 15})
+    print($journal["stdout"])
+    print($journal["stderr"])
+  end
+  $d.die_if(not $result["ok"],
+    $node .. " journal-upload install failed: " ..
+    trim($result["stdout"]) .. " " .. trim($result["stderr"]))
+
+  $value = $result["value"]
+  $d.die_if($value["version"] != $DEPLOY_VERSION,
+    $node .. " installed deploy version mismatch")
+  $d.die_if($value["active"] != "active" or $value["enabled"] != "enabled",
+    $node .. " journal uploader is not active and enabled")
+  $d.die_if($value["log_lines"] < 1,
+    $node .. " current journal-upload invocation has no log lines")
+  print("  version/content/modes: " .. $value["version"] .. " OK")
+  print("  service: active + enabled; cursor seeded to current journal tail")
+  print("  logging: " .. $value["log_lines"] ..
+    " line/s for current invocation " .. $value["invocation_id"])
+  print("  [" .. $node .. "] DEPLOY OK")
+end
+
+print("targets: " .. join($nodes, " "))
+$_lock = $m.mesh_take_write_lock("deploy_journal_upload")
+for each $node in $nodes
+  deploy_node($node)
+end
+
+print("")
+print("deploy complete: journal-upload generation, config/state content and modes, " ..
+  "active/enabled state, new invocation, and current-invocation logging verified on " ..
+  join($nodes, " "))

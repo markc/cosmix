@@ -141,6 +141,17 @@ $SOURCES = {
   registry: $ROOT .. "/src/crates/cosmix-webd/vhosts/apps/tools_registry.mix"
 }
 
+-- Unit files that carry site-specific values (a drain unit with a mesh address
+-- in its environment, say) are CONFIG, not template: they live in the hub's
+-- private _etc/systemd/ and take precedence over the public template when present.
+$HUB_UNITS = $d.hub_root() .. "/_etc/systemd"
+for each $name in ["wake_unit", "drain_unit", "drain_timer"]
+  $private = $HUB_UNITS .. "/" .. basename($SOURCES[$name])
+  if is_file($private) then
+    $SOURCES[$name] = $private
+  end
+end
+
 $ASSETS = {}
 for each $name in keys($SOURCES)
   $path = $SOURCES[$name]

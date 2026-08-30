@@ -1,0 +1,254 @@
+-- tools_exec.mix — the DAEMON-SIDE half of the tool registry: the argv templates and the
+-- fail-closed exec preconditions. Lives ONLY on the toolsd node
+-- (/opt/cosmix/share/cosmix/tools_exec.mix); webd never sees it.
+--
+-- The split is the security boundary (Codex 019f5bc3): webd knows tool NAMES, PARAMS and
+-- ROLES (tools_registry.mix — shared) but has no idea what binary a tool maps to. Only
+-- this file turns "shwho" into an argv. A webd compromise can therefore name a registered
+-- tool and fill its declared parameter slots — it can never choose an executable.
+--
+--   "Registry lookup determines executable/script positions; payload values can fill
+--    parameter slots only."  — Codex
+--
+-- Everything here is absolute-pathed, and every exec target is re-checked (root-owned,
+-- not group/other-writable, not a symlink) immediately before it runs. That check is
+-- FAIL-CLOSED: if the file is missing, world-writable, or has been swapped for a symlink,
+-- the run errors instead of executing.
+
+include "/opt/cosmix/share/cosmix/tools_registry.mix"
+
+$TOOLS_MIX = "/opt/cosmix/bin/mix"
+$TOOLS_ASSET_DIR = "/opt/cosmix/share/cosmix/tools"
+$TOOLS_WHOIS = "/usr/bin/whois"
+$TOOLS_DIG = "/usr/bin/dig"
+$TOOLS_TRACEROUTE = "/usr/bin/traceroute"
+
+-- Hard cap on trace hops — forced into argv, NEVER a caller value (Codex: a streaming
+-- tool must not invite unbounded duration).
+function tools_trace_max_hops()
+  return 20
+end
+
+-- argv for ONE traceroute hop (TTL = $hop). `-n` no DNS, `-w2` 2s wait, `-q1` one probe,
+-- `-f $hop -m $hop` = exactly this TTL. The path is preflight-checked before use.
+function tools_trace_argv($host, $hop)
+  $safe = tools_exec_safe($TOOLS_TRACEROUTE)
+  if $safe["ok"] != true then
+    return { ok: false, error: "" .. $safe["error"] }
+  end
+  $h = to_number("" .. $hop)
+  if $h == nil or $h < 1 or $h > tools_trace_max_hops() then
+    return { ok: false, error: "hop out of range" }
+  end
+  -- Exec the CANONICAL path (safe["path"]), not the symlink.
+  return { ok: true, argv: [$safe["path"], "-n", "-w2", "-q1", "-f", "" .. $h, "-m", "" .. $h, "--", "" .. $host] }
+end
+
+-- A fixed, minimal environment. No HOME (so nothing loads a user rc/config), a controlled
+-- PATH (belt-and-braces: every executable is absolute anyway), and a non-writable cwd.
+-- Codex: "Fixed non-writable working directory, minimal fixed environment, controlled
+-- PATH, and no user startup/config loading from HOME."
+$TOOLS_ENV = { PATH: "/usr/bin:/bin", LC_ALL: "C", TZ: "UTC" }
+$TOOLS_CWD = "/"
+
+-- st_mode perm bits: is the group- or other-WRITE bit set? Mix has no bitwise operators
+-- (a real gap — worth a `bitand` builtin), so test the octal digits arithmetically.
+-- perm is mode & 0o7777 as a decimal number: 0o755 -> 493.
+function tools_world_writable($perm)
+  $p = to_number("" .. $perm)
+  if $p == nil then
+    return true
+  end
+  $other = $p % 8
+  $group = floor($p / 8) % 8
+  -- the write bit within an octal digit is 2 (r=4, w=2, x=1)
+  $ow = floor($other / 2) % 2
+  $gw = floor($group / 2) % 2
+  return $ow == 1 or $gw == 1
+end
+
+-- One path element: root-owned and not group/other-writable. lstat (follow_symlinks:false)
+-- so a symlink is judged on ITS OWN ownership — a root-owned symlink in a root-owned dir
+-- cannot be repointed by a non-root attacker, so it is safe to follow. We do NOT reject
+-- symlinks outright: Debian's alternatives system makes /usr/bin/traceroute a root-owned
+-- symlink chain (→ /etc/alternatives/traceroute → /usr/bin/traceroute.db), all root-owned.
+function tools_elem_safe($p)
+  $st = nil
+  try
+    $st = stat($p, { follow_symlinks: false })
+  catch $e
+    return "not found: " .. $p
+  end
+  if $st == nil then
+    return "not found: " .. $p
+  end
+  if to_number("" .. $st["uid"]) != 0 then
+    return "not root-owned: " .. $p
+  end
+  -- A SYMLINK's own mode bits are meaningless — Linux stores them 0777 and the kernel
+  -- ignores them. Its swappability is governed by its OWNER (root, checked above) and its
+  -- PARENT DIR (checked as its own walk element), NOT by these bits. So the group/other-
+  -- writable test applies only to real files/dirs; on a symlink it would false-positive
+  -- every time (e.g. Debian's lrwxrwxrwx /usr/bin/traceroute).
+  if $st["is_symlink"] != true and tools_world_writable($st["perm"]) then
+    return "group/other-writable: " .. $p
+  end
+  return ""
+end
+
+-- Walk every prefix of an ABSOLUTE path (incl. "/" itself, the parent of every absolute
+-- exec), requiring each element root-owned + not group/other-writable.
+function tools_walk_safe($path)
+  $bad = tools_elem_safe("/")
+  if $bad != "" then
+    return $bad
+  end
+  $parts = split("" .. $path, "/")
+  $prefix = ""
+  $i = 1
+  while $i < length($parts)
+    $prefix = $prefix .. "/" .. $parts[$i]
+    $bad = tools_elem_safe($prefix)
+    if $bad != "" then
+      return $bad
+    end
+    $i = $i + 1
+  end
+  return ""
+end
+
+-- Fail-closed exec-target check. Returns { ok: true, path: <CANONICAL> } — the caller
+-- MUST exec the returned CANONICAL path, not the original — or { ok: false, error }.
+--
+-- Execing the canonical (fully symlink-resolved) path is what closes the hijack: the
+-- canonical has NO symlinks, so exec re-traverses no intermediate symlink hop that an
+-- attacker could repoint between the check and the exec (Codex — validating the original's
+-- chain leaves an unwalked intermediate hop, e.g. a symlink whose target lives in an
+-- attacker-writable dir). We still validate the given chain (A) + the canonical chain (B)
+-- so the resolved location is proven root-owned + non-writable, and (C) the canonical
+-- target is a root-owned, non-group/other-writable REGULAR FILE in that chain — which a
+-- non-root attacker cannot swap. realpath() is normalisation only; the safety comes from
+-- execing its symlink-free result.
+function tools_exec_safe($path)
+  $p = "" .. $path
+  if not starts_with($p, "/") then
+    return { ok: false, error: "refusing a relative exec path: " .. $p }
+  end
+  $bad = tools_walk_safe($p)
+  if $bad != "" then
+    return { ok: false, error: $bad }
+  end
+  $canon = realpath($p)
+  if $canon == nil or not starts_with("" .. $canon, "/") then
+    return { ok: false, error: "cannot resolve: " .. $p }
+  end
+  $cp = "" .. $canon
+  if $cp != $p then
+    $bad = tools_walk_safe($cp)
+    if $bad != "" then
+      return { ok: false, error: $bad }
+    end
+  end
+  -- The canonical target: a root-owned, non-writable regular file (canon has no trailing
+  -- symlink to follow).
+  $st = nil
+  try
+    $st = stat($cp, { follow_symlinks: false })
+  catch $e
+    return { ok: false, error: "not found: " .. $cp }
+  end
+  if $st == nil or $st["is_file"] != true then
+    return { ok: false, error: "not a regular file: " .. $cp }
+  end
+  if to_number("" .. $st["uid"]) != 0 then
+    return { ok: false, error: "not root-owned: " .. $cp }
+  end
+  if tools_world_writable($st["perm"]) then
+    return { ok: false, error: "group/other-writable: " .. $cp }
+  end
+  return { ok: true, path: $cp }
+end
+
+-- Build the argv for a validated tool + params. Returns { ok, argv, timeout, max_output }
+-- or { ok:false, error }. The PARAMS ARE ALREADY VALIDATED (webd at enqueue, toolsd again
+-- at claim) — this only places them into fixed slots.
+--
+-- Note the `--` terminators: the validators already reject a leading '-', so this is the
+-- backstop, not the primary defence (Codex: "use `--` where supported").
+function tools_argv($tool, $params)
+  $spec = tools_spec($tool)
+  if $spec == nil then
+    return { ok: false, error: "unknown tool: " .. ("" .. $tool) }
+  end
+  $t = "" .. $tool
+  $dom = "" .. tools_or_x($params["domain"], "")
+  $argv = nil
+
+  if $t == "shwho" then
+    -- Option A (Codex): run the IMMUTABLE, root-owned, reviewed copy of the shwho
+    -- script, so the output is byte-identical to the CLI by construction rather than
+    -- re-implemented (and re-drifted) in a composition layer.
+    --
+    -- shwho's DEPENDENCIES are checked too, not just the script: it execs /usr/bin/whois
+    -- and /usr/bin/dig itself, so without this a permissions/symlink regression that makes
+    -- the direct `whois` tool fail closed would still be executed via shwho (Codex).
+    $script = $TOOLS_ASSET_DIR .. "/shwho.mix"
+    -- Validate mix + the script + shwho's own deps (whois/dig it execs internally); exec
+    -- the CANONICAL mix + script paths.
+    $mixc = tools_exec_safe($TOOLS_MIX)
+    if $mixc["ok"] != true then
+      return { ok: false, error: "" .. $mixc["error"] }
+    end
+    $scriptc = tools_exec_safe($script)
+    if $scriptc["ok"] != true then
+      return { ok: false, error: "" .. $scriptc["error"] }
+    end
+    $whoisc = tools_exec_safe($TOOLS_WHOIS)
+    if $whoisc["ok"] != true then
+      return { ok: false, error: "" .. $whoisc["error"] }
+    end
+    $digc = tools_exec_safe($TOOLS_DIG)
+    if $digc["ok"] != true then
+      return { ok: false, error: "" .. $digc["error"] }
+    end
+    -- Pass the CANONICAL whois/dig paths to shwho.mix so IT execs the symlink-free real
+    -- files too — the script would otherwise exec its own hardcoded /usr/bin/whois|dig, and
+    -- the HIGH (an intermediate symlink hop repointed after the check) would reappear inside
+    -- the script (Codex). Positional after the domain; shwho.mix reads argv[i+1]/[i+2].
+    $argv = [$mixc["path"], $scriptc["path"], "--", $dom, $whoisc["path"], $digc["path"]]
+  end
+
+  if $t == "whois" then
+    $safe = tools_exec_safe($TOOLS_WHOIS)
+    if $safe["ok"] != true then
+      return { ok: false, error: "" .. $safe["error"] }
+    end
+    $argv = [$safe["path"], "--", $dom]
+  end
+
+  if $t == "dig" then
+    $safe = tools_exec_safe($TOOLS_DIG)
+    if $safe["ok"] != true then
+      return { ok: false, error: "" .. $safe["error"] }
+    end
+    $ty = "" .. tools_or_x($params["type"], "a")
+    $argv = [$safe["path"], "+short", $ty, $dom]
+  end
+
+  if $argv == nil then
+    -- A registered tool with no argv mapping here is a DEPLOY skew (webd knows a tool
+    -- this daemon doesn't). Fail closed rather than guess.
+    return { ok: false, error: "no argv mapping for tool: " .. $t }
+  end
+  return { ok: true, argv: $argv,
+           timeout: to_number("" .. $spec["timeout"]),
+           max_output: to_number("" .. $spec["max_output"]) }
+end
+
+-- Local `or` helper (tools_lib.mix's tools_or is webd-side and not loaded here).
+function tools_or_x($v, $d)
+  if $v == nil then
+    return $d
+  end
+  return $v
+end

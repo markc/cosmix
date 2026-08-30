@@ -1,0 +1,13 @@
+-- deploy_journal_upload.conf.mix.example — private journal-upload targets and
+-- receiver endpoints. Copy this file to deploy_journal_upload.conf.mix in the
+-- private control hub and replace every placeholder. Node names must exist in
+-- the matching mesh or foreign section of its fleet roster.
+deploy_journal_upload: {
+  schema_version: 1,
+  mesh_nodes: ["alpha", "beta"],
+  foreign_nodes: ["gamma"],
+  receiver_urls: {
+    mesh: "http://192.0.2.10:19532",
+    foreign: "http://192.0.2.20:19532"
+  }
+}

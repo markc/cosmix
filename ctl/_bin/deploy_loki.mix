@@ -1,0 +1,362 @@
+#!/usr/bin/env mix
+-- deploy_loki.mix — install the Loki config and Cosmix-managed systemd unit
+-- on the configured observability node, then prove the restarted service is
+-- healthy.
+--
+--   mix _bin/deploy_loki.mix                     -- configured target
+--   mix _bin/deploy_loki.mix alpha               -- explicit target
+--   mix _bin/deploy_loki.mix --allow-downgrade   -- deliberate rollback
+--
+-- The hub-private config names the sole target, the operator-owned Loki YAML,
+-- its expected package version, readiness port and bundle version. Addresses
+-- come from the mesh inventory. The roster rollout order is applied even to
+-- the singleton target so the same hubs-last invariant remains explicit.
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_loki.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no Loki deploy config at " .. $CONF_PATH ..
+    " — create it from deploy_loki.conf.mix.example before deploying")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["deploy_loki"], {
+    schema_version: {type: "integer", enum: [1]},
+    target_node: {type: "string", nonblank: true},
+    config_file: {type: "string", nonblank: true},
+    expected_loki_version: {type: "string", nonblank: true},
+    deploy_version: {type: "string", nonblank: true},
+    ready_port: {type: "integer", min: 1, max: 65535}
+  })
+catch $e
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn is_numeric_version($version)
+  return regex_match("^[0-9]+([.][0-9]+)+$", $version)
+end
+
+if not starts_with($CONF["config_file"], "/") then
+  config_error("config_file must be an absolute path")
+end
+if not is_numeric_version($CONF["expected_loki_version"]) then
+  config_error("expected_loki_version must be dotted numeric text")
+end
+if not is_numeric_version($CONF["deploy_version"]) then
+  config_error("deploy_version must be dotted numeric text")
+end
+
+$ROSTER = $d.roster()
+$TARGET = $CONF["target_node"]
+$d.assert_node($ROSTER, $TARGET)
+if $d.is_foreign($ROSTER, $TARGET) then
+  config_error("target_node is foreign; Loki requires a mesh node with Mix as root login shell")
+end
+
+$raw_args = args()
+$has_named_node = false
+for each $arg in $raw_args
+  if $arg != "--allow-downgrade" then
+    $has_named_node = true
+  end
+end
+$parse_args = $raw_args
+if not $has_named_node then
+  $parse_args = concat([$TARGET], $raw_args)
+end
+$parsed = $d.parse_nodes($ROSTER, $parse_args, ["--allow-downgrade"])
+$selected = $parsed["nodes"]
+$ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
+if len($selected) != 1 or $selected[0] != $TARGET then
+  config_error("the only permitted target is target_node '" .. $TARGET .. "'")
+end
+
+-- Resolve the address and canonical order before reading deploy artefacts or
+-- taking the writer lock. A bad selection is side-effect free.
+$REMOTE = "root@" .. $d.mesh_ip($TARGET)
+$nodes = $d.order_subset($ROSTER, $selected)
+if len($nodes) != 1 or $nodes[0] != $TARGET then
+  config_error("target_node is absent from the roster rollout_order")
+end
+
+$ROOT = $d.cosmix_root()
+$CONFIG_SOURCE = $CONF["config_file"]
+$UNIT_NAME = "cosmix-loki.service"
+$UNIT_SOURCE = $ROOT .. "/src/_etc/systemd-system/" .. $UNIT_NAME
+$CONFIG_DEST = "/etc/cosmix/loki/loki.yml"
+$UNIT_DEST = "/etc/systemd/system/" .. $UNIT_NAME
+$VERSION_FILE = "/etc/cosmix/loki/deploy-version"
+$TOKEN_FILE = "/etc/cosmix/loki/deploy-invocation"
+$LOKI_BIN = "/usr/bin/loki"
+
+$d.die_if(not is_file($CONFIG_SOURCE), "Loki config missing: " .. $CONFIG_SOURCE)
+$d.die_if(not is_file($UNIT_SOURCE), "systemd unit template missing: " .. $UNIT_SOURCE)
+$CONFIG = read_file($CONFIG_SOURCE)
+$UNIT = read_file($UNIT_SOURCE)
+$CONFIG_HASH = hash_sha256($CONFIG)
+$UNIT_HASH = hash_sha256($UNIT)
+$DEPLOY_VERSION = $CONF["deploy_version"]
+$EXPECTED_LOKI_VERSION = $CONF["expected_loki_version"]
+$READY_PORT = $CONF["ready_port"]
+$DEPLOY_TOKEN = uuid()
+
+fn fail_remote($host, $step, $result)
+  $d.die_if(not $result["ok"], $host .. " " .. $step .. ": " ..
+    trim($result["stdout"]) .. " " .. trim($result["stderr"]))
+end
+
+fn verify_logging($host, $remote, $previous_invocation)
+  $try = 0
+  while $try < 4
+    $probe = ssh_mix($remote, '
+$iid = trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value"))
+if $rc != 0 or $iid == "" then
+  exit(7)
+end
+$logs = trim(run("/usr/bin/journalctl _SYSTEMD_INVOCATION_ID=" .. $iid .. " -o cat --no-pager"))
+if $rc != 0 then
+  exit(8)
+end
+$lines = 0
+if $logs != "" then
+  $lines = len(split($logs, "\n"))
+end
+print(data_encode({invocation_id: $iid, lines: $lines}))
+', {bindings: {unit: $UNIT_NAME}, decode: "data", connect_timeout: 8, timeout: 15})
+    if $probe["ok"] then
+      $current = $probe["value"]["invocation_id"]
+      $d.die_if($previous_invocation != "" and $current == $previous_invocation,
+        $host .. " service invocation did not change after restart")
+      $lines = $probe["value"]["lines"]
+      if $lines >= 1 then
+        print("  logging verified (" .. $lines .. " line/s, current invocation)")
+        return nil
+      end
+    end
+    $try = $try + 1
+    if $try < 4 then
+      sleep(1)
+    end
+  end
+  $d.die_if(true,
+    $host .. " cosmix-loki is active but has zero journald lines for the current systemd invocation")
+end
+
+fn deploy($host)
+  print("")
+  print("[" .. $host .. "] deploy cosmix-loki " .. $DEPLOY_VERSION)
+
+  $reach = ssh_mix($REMOTE, '
+$hostname = trim(run("/usr/bin/hostname"))
+if $rc != 0 or $hostname == "" then
+  exit(7)
+end
+print($hostname)
+', {connect_timeout: 8, timeout: 10})
+  fail_remote($host, "unreachable or not a working Mix node", $reach)
+  print("  connected: " .. trim($reach["stdout"]))
+
+  -- The package binary is an input to this bundle, not an artefact copied by
+  -- the deploy. Assert its exact configured version before any mutation.
+  $package = ssh_mix($REMOTE, '
+$out = trim(run($bin .. " --version"))
+if $rc != 0 or not contains($out, "version " .. $expected .. " ") then
+  exit(7)
+end
+print($out)
+', {bindings: {bin: $LOKI_BIN, expected: $EXPECTED_LOKI_VERSION},
+    connect_timeout: 8, timeout: 10})
+  fail_remote($host, "Loki package version mismatch (want " .. $EXPECTED_LOKI_VERSION .. ")", $package)
+  print("  package: " .. trim($package["stdout"]))
+
+  -- Refuse an older config/unit bundle before transmitting its contents.
+  $pre = ssh_mix($REMOTE, '
+if is_file($version_file) then
+  print(trim(read_file($version_file)))
+end
+', {bindings: {version_file: $VERSION_FILE}, connect_timeout: 8, timeout: 10})
+  if $pre["ok"] and trim($pre["stdout"]) != "" then
+    $d.assert_not_downgrade($host, $pre["stdout"], $DEPLOY_VERSION, $ALLOW_DOWNGRADE)
+  end
+
+  $identity = ssh_mix($REMOTE, '
+$uid = trim(run("/usr/bin/id -u cosmix-loki"))
+if $rc != 0 or $uid != "511" then
+  exit(7)
+end
+$gid = trim(run("/usr/bin/id -g cosmix-loki"))
+if $rc != 0 or $gid != "511" then
+  exit(8)
+end
+print("uid=" .. $uid .. " gid=" .. $gid)
+', {connect_timeout: 8, timeout: 10})
+  fail_remote($host, "cosmix-loki uid/gid 511 identity is missing", $identity)
+  print("  user: " .. trim($identity["stdout"]))
+
+  $previous = ssh_mix($REMOTE, '
+$iid = trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value"))
+if $rc == 0 then
+  print($iid)
+end
+', {bindings: {unit: $UNIT_NAME}, connect_timeout: 8, timeout: 10})
+  $previous_invocation = trim($previous["stdout"])
+
+  -- Install the private config, public unit, version marker and unique token
+  -- atomically. Exact hashes and the per-run token make this gate no-op proof.
+  $install = ssh_mix($REMOTE, '
+mkdir("/etc/cosmix/loki", {parents: true})
+chown("/etc/cosmix/loki", 511, 511)
+chmod("/etc/cosmix/loki", 0o755)
+$config_new = $config_dest .. ".new"
+write_file($config_new, $config)
+chown($config_new, 511, 511)
+chmod($config_new, 0o644)
+rename($config_new, $config_dest)
+$unit_new = $unit_dest .. ".new"
+write_file($unit_new, $unit_source)
+chown($unit_new, 0, 0)
+chmod($unit_new, 0o644)
+rename($unit_new, $unit_dest)
+write_file($version_file .. ".new", $deploy_version .. "\n")
+chown($version_file .. ".new", 0, 0)
+chmod($version_file .. ".new", 0o644)
+rename($version_file .. ".new", $version_file)
+write_file($token_file .. ".new", $deploy_token .. "\n")
+chown($token_file .. ".new", 0, 0)
+chmod($token_file .. ".new", 0o600)
+rename($token_file .. ".new", $token_file)
+print(data_encode({
+  config_hash: hash_file($config_dest, "sha256"),
+  unit_hash: hash_file($unit_dest, "sha256"),
+  version: trim(read_file($version_file)),
+  token: trim(read_file($token_file))
+}))
+', {bindings: {
+      config_dest: $CONFIG_DEST, config: $CONFIG,
+      unit_dest: $UNIT_DEST, unit_source: $UNIT,
+      version_file: $VERSION_FILE, deploy_version: $DEPLOY_VERSION,
+      token_file: $TOKEN_FILE, deploy_token: $DEPLOY_TOKEN
+    }, decode: "data", connect_timeout: 8, timeout: 30})
+  fail_remote($host, "bundle install failed", $install)
+  $d.die_if($install["value"]["config_hash"] != $CONFIG_HASH,
+    $host .. " installed Loki config hash mismatch")
+  $d.die_if($install["value"]["unit_hash"] != $UNIT_HASH,
+    $host .. " installed Loki unit hash mismatch")
+  $d.die_if($install["value"]["version"] != $DEPLOY_VERSION,
+    $host .. " installed bundle version mismatch")
+  $d.die_if($install["value"]["token"] != $DEPLOY_TOKEN,
+    $host .. " installed deployment token mismatch")
+  print("  bundle installed: config + unit hashes, version and invocation token OK")
+
+  -- The distribution unit would contend for the same listener. Its final
+  -- masked and inactive state is asserted, not inferred from command success.
+  $mask = ssh_mix($REMOTE, '
+$_stop = run("/usr/bin/systemctl disable --now loki.service")
+remove("/etc/systemd/system/loki.service")
+$_mask = run("/usr/bin/systemctl mask --now --force loki.service")
+$enabled = trim(run("/usr/bin/systemctl is-enabled loki.service"))
+$enabled_rc = $rc
+$active = trim(run("/usr/bin/systemctl is-active loki.service"))
+if $enabled != "masked" or $active == "active" then
+  exit(7)
+end
+print(data_encode({enabled: $enabled, enabled_rc: $enabled_rc, active: $active}))
+', {decode: "data", connect_timeout: 8, timeout: 30})
+  fail_remote($host, "could not mask the distribution Loki service", $mask)
+  print("  distribution loki.service: masked, not active")
+
+  -- Parse the freshly installed config with the target Loki binary before a
+  -- restart can replace a known-good service invocation.
+  $config_smoke = ssh_mix($REMOTE, '
+$_verify = run($bin .. " -verify-config -config.file=" .. $config)
+if $rc != 0 then
+  exit(7)
+end
+print("config-ok")
+', {bindings: {bin: $LOKI_BIN, config: $CONFIG_DEST},
+    connect_timeout: 8, timeout: 30})
+  fail_remote($host, "installed Loki config smoke failed", $config_smoke)
+  print("  config smoke: OK")
+
+  $start = ssh_mix($REMOTE, '
+$_reload = run("/usr/bin/systemctl daemon-reload")
+if $rc != 0 then
+  exit(7)
+end
+$_enable = run("/usr/bin/systemctl enable " .. $unit)
+if $rc != 0 then
+  exit(8)
+end
+$_restart = run("/usr/bin/systemctl restart " .. $unit)
+if $rc != 0 then
+  exit(9)
+end
+sleep(4)
+$active = trim(run("/usr/bin/systemctl is-active " .. $unit))
+if $rc != 0 or $active != "active" then
+  exit(10)
+end
+$version = trim(run($bin .. " --version"))
+if $rc != 0 or not contains($version, "version " .. $expected .. " ") then
+  exit(11)
+end
+print(data_encode({active: $active, version: $version}))
+', {bindings: {unit: $UNIT_NAME, bin: $LOKI_BIN, expected: $EXPECTED_LOKI_VERSION},
+    decode: "data", connect_timeout: 8, timeout: 30})
+  if not $start["ok"] then
+    $logs = ssh_mix($REMOTE,
+      'print(run("/usr/bin/journalctl -u " .. $unit .. " -n 40 --no-pager"))',
+      {bindings: {unit: $UNIT_NAME}, connect_timeout: 8, timeout: 15})
+    print("  ERROR: start/version assertion failed; last 40 log lines:")
+    print(trim($logs["stdout"]))
+    exit(1)
+  end
+  print("  active: " .. $start["value"]["active"] ..
+    "; package version asserted after install")
+
+  -- Loki deliberately returns a non-200 status during its post-start grace.
+  -- Poll for at most 90 seconds, entirely as remote Mix source.
+  $ready = ssh_mix($REMOTE, '
+$code = ""
+$tries = 0
+while $tries < 45
+  $probe = trim(run("/usr/bin/curl -sS -o /dev/null -w %{http_code} http://127.0.0.1:" ..
+    ("" .. $port) .. "/ready"))
+  if $rc == 0 and $probe == "200" then
+    $code = "200"
+    $tries = 45
+  else
+    sleep(2)
+    $tries = $tries + 1
+  end
+end
+print($code)
+', {bindings: {port: $READY_PORT}, connect_timeout: 8, timeout: 120})
+  $d.die_if(not $ready["ok"] or trim($ready["stdout"]) != "200",
+    $host .. " Loki /ready never reached HTTP 200: " .. trim($ready["stderr"]))
+  print("  /ready http: 200")
+
+  verify_logging($host, $REMOTE, $previous_invocation)
+  print("  [" .. $host .. "] DEPLOY OK")
+end
+
+-- Loki changes mesh-observability state. Serialise it with every other mesh
+-- writer before the first remote mutation.
+$_lock = $m.mesh_take_write_lock("deploy_loki")
+for each $host in $nodes
+  deploy($host)
+end
+
+print("")
+print("deploy complete: bundle bytes/version/token, package version, masked distribution unit, active state, readiness and current-invocation logging verified on " .. join($nodes, " "))

@@ -1,0 +1,50 @@
+[Unit]
+Description=Cosmix toolsd drain backstop (covers a missed/failed wake)
+
+[Timer]
+# The ABP wake (webd amp_call -> citizen -> systemctl start drain) is the PRIMARY trigger
+# and is what makes the modal's spinner start immediately. This timer is never the
+# mechanism, and it is REQUIRED (Codex) for TWO duties:
+#   (a) a lost wake — starting an already-active oneshot does not schedule another run, so
+#       a wake arriving in the drain's final microsecond would otherwise be lost and its
+#       run would sit queued forever;
+#   (b) a TRUNCATED drain — see below: all four of the drain's exits can leave work
+#       queued, and the wake that would have covered it has already been spent. Nothing
+#       else re-arms, so this timer is what picks that work up.
+# (b) is not a missed-wake case, so do not describe this unit as "only" a missed-wake
+# backstop; that wording contradicts the exit analysis below and has been wrong before.
+#
+# 5min is the ADR's MINIMUM backstop, not a tuned value: the previous 1min violated
+# _decisions/2026-07-20-no-poll-event-driven-amp-wake.md, which bans sub-5min timers so a
+# backstop can never quietly become the mechanism. So the interval is set by the rule, and
+# the question is only what it costs when it is the thing that fires.
+#
+# It can cost the full interval. Do NOT read the drain as "loops until the queue is
+# empty" — it has FOUR exits, and ALL FOUR can leave work queued (toolsd_drain.mix):
+#   1. claim answers 204            — 204 means "empty OR another run is already claimed"
+#                                     (tools_lib.mix, global concurrency is 1), so this
+#                                     exit never proves an empty queue;
+#   2. $MAX_RUNS (8) reached        — a 9th job in one burst is simply left;
+#   3. wall budget ($MAX_WALL - $WORST_RUN = 525s) spent;
+#   4. a claim HTTP/JSON error      — returns the same nil as 204 and breaks the loop.
+# In 2-4 the enqueuer's wake has already been spent (it coalesced into the drain that was
+# running), so nothing re-wakes the leftovers. Exit 1 is the same story one step removed:
+# the queue may be non-empty with a concurrent run holding the claim, and that run is
+# bounded by these same four exits — so if it also truncates, this timer is again the only
+# thing left. Either way an interactive spinner waits up to 5min + AccuracySec. That is the
+# real worst case; it is accepted for now because the tools queue is operator-driven and
+# rarely bursts past 8, NOT because it cannot happen.
+#
+# Fixing it properly means the drain signalling "I exited with work outstanding" and
+# something re-arming promptly — tracked in _plan/2026-07-23-consolidated-backlog.md
+# ("toolsd drain has no continuation"). Until then this comment is the warning.
+#
+# A redundant run against an empty queue costs one claim (204) and exits. OnBootSec gives
+# a delayed post-boot recovery for jobs enqueued while the workstation was down.
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=10s
+Unit=cosmix-toolsd-drain.service
+
+[Install]
+WantedBy=timers.target

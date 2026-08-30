@@ -1,0 +1,116 @@
+-- shwho.mix — toolsd's IMMUTABLE, root-owned copy of the shwho tool.
+--
+-- Deployed to /opt/cosmix/share/cosmix/tools/shwho.mix as root:root 0444, under
+-- root-owned non-writable parents. toolsd (which runs UNPRIVILEGED) may execute it but
+-- can never modify it, and verifies ownership/mode before every exec (tools_exec.mix).
+--
+-- This is a DEPLOYED COPY of ~/.rc/_bin/shwho, NOT a live reference to it (Codex
+-- 019f5bc3: "Copying ~/.rc/_bin/shwho directly is inappropriate: deploy an immutable,
+-- root-owned toolsd asset with reviewed dependencies and absolute executable paths").
+-- Two deliberate divergences from the CLI original, both security-driven:
+--
+--   1. ABSOLUTE executable paths (/usr/bin/whois, /usr/bin/dig) — the original used
+--      which(), which is PATH-dependent. toolsd runs with a fixed minimal PATH, but the
+--      absolute path is what makes that guarantee unconditional.
+--   2. A `--` argv terminator is tolerated (and skipped) so the drain can pass one.
+--
+-- The OUTPUT is byte-identical to the CLI. That is the whole point: the modal is meant
+-- to be "the comfy web UI version of running shwho in a console — same expectations,
+-- same experience". Reformatting it in a composition layer would drift from the CLI.
+--
+--   shwho.mix [--] <domain>
+--
+-- The domain has ALREADY been validated (LDH labels, no leading '-', length caps) by
+-- webd at enqueue AND by toolsd at exec. run_argv() spawns with a real argv — no shell
+-- — so it cannot be injected into regardless.
+
+-- Defaults; the drain OVERRIDES these with the CANONICAL (symlink-resolved) whois/dig
+-- paths it validated, passed positionally after the domain — so this script execs the
+-- symlink-free real files, not /usr/bin/whois|dig which on Debian are alternatives symlink
+-- chains an intermediate hop could hijack (Codex).
+$WHOIS = "/usr/bin/whois"
+$DIG = "/usr/bin/dig"
+
+$argv = args()
+
+-- Skip the `--` terminator if the caller passed one (the drain always does).
+$i = 0
+if length($argv) > 0 and $argv[0] == "--" then
+  $i = 1
+end
+
+if length($argv) <= $i then
+  print("Usage: shwho [--] <domain> [whois_path] [dig_path]")
+  exit(1)
+end
+$dom = $argv[$i]
+-- Optional canonical tool paths (drain passes them; must be absolute).
+if length($argv) > $i + 1 and starts_with("" .. $argv[$i + 1], "/") then
+  $WHOIS = "" .. $argv[$i + 1]
+end
+if length($argv) > $i + 2 and starts_with("" .. $argv[$i + 2], "/") then
+  $DIG = "" .. $argv[$i + 2]
+end
+
+-- Hard requirements: bail loudly rather than print a blank report.
+$missing = []
+if not is_file($WHOIS) then
+  push($missing, $WHOIS)
+end
+if not is_file($DIG) then
+  push($missing, $DIG)
+end
+if length($missing) > 0 then
+  eprintf("ERROR: shwho needs %s — not found\n", join($missing, " and "))
+  exit(1)
+end
+
+-- dig one record type, return the answers as a list of trimmed lines.
+fn dig($type, $name)
+  $r = run_argv([$DIG, "+short", $type, $name], {timeout: 15})
+  if not $r.ok or trim($r.stdout) == "" then
+    return []
+  end
+  return split(trim($r.stdout), "\n")
+end
+
+-- Strip the trailing dot dig puts on an FQDN.
+fn unfqdn($s)
+  if ends_with($s, ".") then
+    return left($s, length($s) - 1)
+  end
+  return $s
+end
+
+-- Registrar / nameservers / DNSSEC, straight out of the whois record.
+-- whois can be slow (and hang on rate-limited TLD servers), hence the deadline.
+$w = run_argv([$WHOIS, $dom], {timeout: 30})
+if $w.timed_out then
+  eprintf("WARN: whois %s timed out\n", $dom)
+end
+for each $line in grep("^(Registrar:|Registrar Name:|Name Server:|DNSSEC:)", $w.stdout)
+  print(trim($line))
+end
+
+-- A/AAAA records for the domain itself, space-joined on one line.
+printf("%s = %s\n", $dom, join(dig("a", $dom), " "))
+
+-- Each MX host, its IP, and the reverse (PTR) — the mail-side sanity check
+-- the original was really written for.
+for each $mx in dig("mx", $dom)
+  $host = unfqdn(word($mx, 2))          -- "10 mail.example.com." -> "mail.example.com"
+  if $host == nil then
+    continue
+  end
+  $ips = dig("a", $host)
+  if length($ips) == 0 then
+    continue
+  end
+  printf("%s = %s\n", $host, join($ips, " "))
+  for each $ip in $ips
+    $ptr = dig("-x", $ip)
+    if length($ptr) > 0 then
+      printf("%s = %s\n", $ip, unfqdn($ptr[0]))
+    end
+  end
+end

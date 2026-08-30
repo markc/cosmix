@@ -1,0 +1,356 @@
+#!/usr/bin/env mix
+-- deploy_statecache.mix — install the SPEC-18 statecache citizen script and
+-- systemd unit on configured mesh nodes, then prove the new invocation works.
+--
+--   mix _bin/deploy_statecache.mix deploy
+--   mix _bin/deploy_statecache.mix deploy alpha beta
+--   mix _bin/deploy_statecache.mix deploy --allow-downgrade alpha
+--
+-- The hub-private _etc/deploy_statecache.conf.mix owns the permitted targets
+-- and defaults. Addresses come from mesh inventory, and rollout order is always
+-- filtered through the fleet roster so hub nodes are deployed last.
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+$argv = args()
+if len($argv) == 0 then
+  print("usage: mix deploy_statecache.mix deploy [--allow-downgrade] [node...]")
+  exit(2)
+end
+$stage = $argv[0]
+if $stage != "deploy" then
+  print("unknown stage: " .. $stage .. " (expected deploy)")
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_statecache.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no statecache deploy config at " .. $CONF_PATH ..
+    " — create it from deploy_statecache.conf.mix.example before deploying")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["deploy_statecache"], {
+    schema_version: {type: "integer", enum: [1]},
+    target_nodes: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}},
+    default_nodes: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}}
+  })
+catch $e
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn contains_item($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+for each $node in $CONF["target_nodes"]
+  $seen = 0
+  for each $candidate in $CONF["target_nodes"]
+    if $candidate == $node then
+      $seen = $seen + 1
+    end
+  end
+  if $seen != 1 then
+    config_error("duplicate target node '" .. $node .. "'")
+  end
+end
+for each $node in $CONF["default_nodes"]
+  if not contains_item($CONF["target_nodes"], $node) then
+    config_error("default node '" .. $node .. "' is absent from target_nodes")
+  end
+end
+
+$ROSTER = $d.roster()
+for each $node in $CONF["target_nodes"]
+  $d.assert_node($ROSTER, $node)
+  if $d.is_foreign($ROSTER, $node) then
+    config_error("target node '" .. $node .. "' is foreign; statecache requires a mesh Mix host")
+  end
+end
+
+$rest = []
+$first = true
+for each $arg in $argv
+  if $first then
+    $first = false
+  else
+    push($rest, $arg)
+  end
+end
+$named = []
+for each $arg in $rest
+  if $arg != "--allow-downgrade" then
+    push($named, $arg)
+  end
+end
+$parse_args = $rest
+if len($named) == 0 then
+  $parse_args = concat($CONF["default_nodes"], $rest)
+end
+$parsed = $d.parse_nodes($ROSTER, $parse_args, ["--allow-downgrade"])
+$selected = $parsed["nodes"]
+$ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
+
+$REMOTE = {}
+for each $node in $selected
+  if not contains_item($CONF["target_nodes"], $node) then
+    config_error("'" .. $node .. "' is not a configured statecache target")
+  end
+  if $d.is_foreign($ROSTER, $node) then
+    config_error("'" .. $node .. "' is foreign; statecache requires a mesh Mix host")
+  end
+  if has_key($REMOTE, $node) then
+    config_error("duplicate selected node '" .. $node .. "'")
+  end
+  $REMOTE[$node] = "root@" .. $d.mesh_ip($node)
+end
+
+$rollout = $d.rollout_order($ROSTER)
+for each $node in $selected
+  if not contains_item($rollout, $node) then
+    config_error("selected node '" .. $node .. "' is absent from the roster rollout_order")
+  end
+end
+$nodes = []
+for each $candidate in $rollout
+  if contains_item($selected, $candidate) then
+    push($nodes, $candidate)
+  end
+end
+
+-- A script citizen has no executable --version surface. The marker supplies a
+-- monotonic deploy generation for downgrade refusal and exact install checks;
+-- content hashes independently bind that generation to the shipped bytes.
+$DEPLOY_VERSION = "1.0.0"
+$ROOT = $d.cosmix_root()
+$SCRIPT = $ROOT .. "/src/_etc/cosmix/statecache.mix"
+$UNIT = $ROOT .. "/src/_etc/systemd-system/cosmix-statecache.service"
+$d.die_if(not is_file($SCRIPT), "statecache source asset missing: " .. $SCRIPT)
+$d.die_if(not is_file($UNIT), "statecache systemd unit missing: " .. $UNIT)
+
+$lint = run_argv([$d.mix_bin(), "lint", "--deny-warnings", $SCRIPT])
+$d.die_if($lint["exit_code"] != 0,
+  "statecache source lint failed: " .. trim($lint["stdout"]) .. " " .. trim($lint["stderr"]))
+$ASSETS = {script: read_file($SCRIPT), unit: read_file($UNIT)}
+$HASHES = {script: hash_file($SCRIPT, "sha256"), unit: hash_file($UNIT, "sha256")}
+print("statecache source: lint OK")
+print("rollout order: " .. join($nodes, " "))
+
+fn verify_logging($node, $remote, $previous_invocation)
+  $attempt = 0
+  while $attempt < 4
+    $probe = ssh_mix($remote, '
+$iid = trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value"))
+if $rc != 0 or $iid == "" then
+  exit(7)
+end
+$logs = trim(run("/usr/bin/journalctl _SYSTEMD_INVOCATION_ID=" .. $iid .. " -o cat --no-pager"))
+if $rc != 0 then
+  exit(8)
+end
+$lines = 0
+if $logs != "" then
+  $lines = len(split($logs, "\n"))
+end
+print(data_encode({invocation_id: $iid, lines: $lines}))
+', {bindings: {unit: "cosmix-statecache"}, decode: "data",
+      connect_timeout: 8, timeout: 15})
+    if $probe["ok"] then
+      $current = $probe["value"]["invocation_id"]
+      $d.die_if($previous_invocation != "" and $current == $previous_invocation,
+        $node .. " service invocation did not change after restart")
+      $lines = $probe["value"]["lines"]
+      if $lines >= 1 then
+        print("  logging verified (" .. $lines .. " line/s, current invocation)")
+        return nil
+      end
+    end
+    $attempt = $attempt + 1
+    if $attempt < 4 then
+      sleep(1)
+    end
+  end
+  $d.die_if(true,
+    $node .. " cosmix-statecache is active but has zero journald lines for the current systemd invocation")
+end
+
+fn deploy_node($node)
+  $remote = $REMOTE[$node]
+  print("")
+  print("[" .. $node .. "] deploy statecache " .. $DEPLOY_VERSION)
+
+  $reach = ssh_mix($remote, '
+$hostname = trim(run("/usr/bin/hostname"))
+if $rc != 0 or $hostname == "" then
+  exit(7)
+end
+print($hostname)
+', {connect_timeout: 8, timeout: 10})
+  $d.die_if(not $reach["ok"],
+    $node .. " unreachable or not a working Mix node: " .. trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+  print("  connected: " .. trim($reach["stdout"]))
+
+  -- A present marker must be parseable; an absent marker is the migration from
+  -- the unversioned deploy and is allowed exactly once.
+  $pre = ssh_mix($remote, '
+if is_file($marker) then
+  print(trim(read_file($marker)))
+end
+', {bindings: {marker: "/etc/cosmix/statecache/deploy-version"},
+    connect_timeout: 8, timeout: 10})
+  $d.die_if(not $pre["ok"],
+    $node .. " could not inspect the installed statecache deploy generation: " .. trim($pre["stderr"]))
+  if trim($pre["stdout"]) != "" then
+    $d.assert_not_downgrade($node, trim($pre["stdout"]), $DEPLOY_VERSION, $ALLOW_DOWNGRADE)
+  end
+
+  -- Prerequisites are checked before any deploy file is changed.
+  $prereq = ssh_mix($remote, '
+$account = trim(run("/usr/bin/getent passwd cosmix-statecache"))
+if $rc != 0 or $account == "" then
+  eprint("cosmix-statecache account is absent")
+  exit(7)
+end
+if not is_file("/opt/cosmix/bin/mix") then
+  eprint("/opt/cosmix/bin/mix is absent")
+  exit(8)
+end
+$mix_version = trim(run("/opt/cosmix/bin/mix --version"))
+if $rc != 0 or $mix_version == "" then
+  eprint("installed mix did not report a version")
+  exit(9)
+end
+print($mix_version)
+', {connect_timeout: 8, timeout: 10})
+  $d.die_if(not $prereq["ok"],
+    $node .. " prerequisite check failed: " .. trim($prereq["stdout"]) .. " " .. trim($prereq["stderr"]))
+  print("  prerequisites: account + " .. trim($prereq["stdout"]))
+
+  $before = ssh_mix($remote, '
+$iid = trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value"))
+if $rc == 0 then
+  print($iid)
+end
+', {bindings: {unit: "cosmix-statecache"}, connect_timeout: 8, timeout: 10})
+  $previous_invocation = $before["ok"] ? trim($before["stdout"]) : ""
+
+  -- Install beside each destination and rename over it, so a reader sees the
+  -- complete old or complete new file. Readback hashes and the version marker
+  -- make a failed or no-op transfer observable before systemd is touched.
+  $install = ssh_mix($remote, '
+fn atomic_install($path, $content, $mode)
+  $tmp = $path .. ".new"
+  write_file($tmp, $content)
+  chmod($tmp, $mode)
+  chown($tmp, 0, 0)
+  rename($tmp, $path)
+end
+
+mkdir("/opt/cosmix/share/cosmix", {parents: true})
+chown("/opt/cosmix/share/cosmix", 0, 0)
+chmod("/opt/cosmix/share/cosmix", 0o755)
+mkdir("/usr/lib/systemd/system", {parents: true})
+atomic_install("/opt/cosmix/share/cosmix/statecache.mix", $assets["script"], 0o644)
+atomic_install("/usr/lib/systemd/system/cosmix-statecache.service", $assets["unit"], 0o644)
+mkdir("/etc/cosmix/statecache", {parents: true})
+chown("/etc/cosmix/statecache", 0, 0)
+chmod("/etc/cosmix/statecache", 0o755)
+atomic_install("/etc/cosmix/statecache/deploy-version", $version .. "\n", 0o644)
+print(data_encode({
+  version: trim(read_file("/etc/cosmix/statecache/deploy-version")),
+  script_hash: hash_file("/opt/cosmix/share/cosmix/statecache.mix", "sha256"),
+  unit_hash: hash_file("/usr/lib/systemd/system/cosmix-statecache.service", "sha256")
+}))
+', {bindings: {assets: $ASSETS, version: $DEPLOY_VERSION}, decode: "data",
+    connect_timeout: 8, timeout: 20})
+  $d.die_if(not $install["ok"],
+    $node .. " atomic install failed: " .. trim($install["stdout"]) .. " " .. trim($install["stderr"]))
+  $d.die_if($install["value"]["version"] != $DEPLOY_VERSION,
+    $node .. " installed deploy generation mismatch")
+  $d.die_if($install["value"]["script_hash"] != $HASHES["script"],
+    $node .. " installed statecache script hash mismatch")
+  $d.die_if($install["value"]["unit_hash"] != $HASHES["unit"],
+    $node .. " installed statecache unit hash mismatch")
+  print("  script/unit installed: generation and hashes OK")
+
+  $restart = ssh_mix($remote, '
+$out = run("/usr/bin/systemctl daemon-reload")
+if $rc != 0 then
+  print($out)
+  exit(7)
+end
+$out = run("/usr/bin/systemctl enable " .. $unit)
+if $rc != 0 then
+  print($out)
+  exit(8)
+end
+$out = run("/usr/bin/systemctl restart " .. $unit)
+if $rc != 0 then
+  print($out)
+  exit(9)
+end
+sleep(2)
+$out = trim(run("/usr/bin/systemctl is-active " .. $unit))
+if $rc != 0 or $out != "active" then
+  print($out)
+  exit(10)
+end
+print($out)
+', {bindings: {unit: "cosmix-statecache"}, connect_timeout: 8, timeout: 30})
+  if not $restart["ok"] then
+    print("  restart failed; last 40 log lines:")
+    $journal = ssh_mix($remote,
+      'print(run("/usr/bin/journalctl -u " .. $unit .. " -n 40 --no-pager"))',
+      {bindings: {unit: "cosmix-statecache"}, connect_timeout: 8, timeout: 15})
+    print($journal["stdout"])
+    print($journal["stderr"])
+  end
+  $d.die_if(not $restart["ok"],
+    $node .. " daemon-reload/enable/restart/is-active failed: " .. trim($restart["stdout"]) .. " " .. trim($restart["stderr"]))
+  print("  active: " .. trim($restart["stdout"]))
+
+  verify_logging($node, $remote, $previous_invocation)
+
+  $probe = ssh_mix($remote, '
+send statecache statecache.get
+if $rc != 0 then
+  print("send rc=" .. $rc)
+  exit(7)
+end
+print("OK " .. ("" .. $result))
+', {connect_timeout: 8, timeout: 15})
+  $d.die_if(not $probe["ok"],
+    $node .. " BUS statecache.get failed: " .. trim($probe["stdout"]) .. " " .. trim($probe["stderr"]))
+  $body = trim($probe["stdout"])
+  $d.die_if(not starts_with($body, "OK"),
+    $node .. " BUS statecache.get returned an unexpected body: " .. $body)
+  print("  BUS statecache.get: " .. $body)
+  print("  [" .. $node .. "] DEPLOY OK")
+end
+
+-- Serialize deploy writers that can restart mesh citizens. The lock is taken
+-- only after all argument, config, inventory and local-asset pre-flight gates.
+$_lock = $m.mesh_take_write_lock("deploy_statecache deploy")
+for each $node in $nodes
+  deploy_node($node)
+end
+
+print("")
+print("deploy complete: generation/hashes, restart, current-invocation logging and BUS smoke verified on " .. join($nodes, " "))
