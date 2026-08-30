@@ -1,0 +1,19 @@
+{
+  deploy_obs: {
+    -- Bump only when this public template's data shape changes.
+    schema_version: 1,
+
+    -- Every node must exist in the private fleet roster and active mesh
+    -- inventory. The fleet rollout order is applied, so hubs remain last.
+    target_nodes: ["alpha"],
+
+    -- Hub-relative, private source paths. These files may contain real mesh
+    -- targets and domains; keep them in the private control hub.
+    prometheus_config: "_etc/cosmix/prometheus/prometheus.yml",
+    grafana_provisioning: "_etc/cosmix/grafana/provisioning",
+    grafana_dashboards: "_etc/cosmix/grafana/dashboards",
+
+    -- The query endpoint address comes from mesh inventory.
+    prometheus_query_port: 9090
+  }
+}

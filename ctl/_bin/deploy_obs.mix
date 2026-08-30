@@ -1,0 +1,436 @@
+#!/usr/bin/env mix
+-- deploy_obs.mix — deploy Prometheus and Grafana configuration to the
+-- hub-configured observation nodes.
+--
+--   mix _bin/deploy_obs.mix              -- Prometheus + Grafana
+--   mix _bin/deploy_obs.mix prometheus   -- Prometheus only
+--   mix _bin/deploy_obs.mix grafana      -- Grafana only
+--
+-- Prometheus is validated before installation and hot-reloaded so its TSDB
+-- stays warm. Grafana is restarted because it reads file provisioning only at
+-- startup. Every rollout follows the fleet order, with mesh hubs last.
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_obs.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: missing deploy_obs config: " .. $CONF_PATH)
+  print("         copy _etc/deploy_obs.conf.mix.example there and replace every placeholder")
+  exit(2)
+end
+
+$loaded = nil
+try
+  $loaded = load_data($CONF_PATH)
+catch $msg
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $msg)
+  exit(2)
+end
+
+fn conf_error($msg)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $msg)
+  exit(2)
+end
+
+if type($loaded) != "map" or type($loaded["deploy_obs"]) != "map" then
+  conf_error("top-level 'deploy_obs' must be a strict-data map")
+end
+$CONF = $loaded["deploy_obs"]
+if $CONF["schema_version"] != 1 then
+  conf_error("'schema_version' must be 1")
+end
+
+fn require_nodes($map, $key)
+  $nodes = $map[$key]
+  if type($nodes) != "list" or len($nodes) == 0 then
+    conf_error("'" .. $key .. "' must be a non-empty list")
+  end
+  $seen = {}
+  for each $node in $nodes
+    if type($node) != "string" or trim($node) == "" then
+      conf_error("'" .. $key .. "' entries must be non-empty strings")
+    end
+    if $seen[$node] == true then
+      conf_error("'" .. $key .. "' repeats node '" .. $node .. "'")
+    end
+    $seen[$node] = true
+  end
+  return $nodes
+end
+
+fn require_relative_path($map, $key)
+  $path = $map[$key]
+  if type($path) != "string" or trim($path) == "" or starts_with($path, "/") then
+    conf_error("'" .. $key .. "' must be a non-empty hub-relative path")
+  end
+  $allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-"
+  $i = 0
+  while $i < len($path)
+    if not contains($allowed, substr($path, $i, 1)) then
+      conf_error("'" .. $key .. "' contains an unsafe path character")
+    end
+    $i = $i + 1
+  end
+  for each $part in split($path, "/")
+    if $part == "" or $part == "." or $part == ".." then
+      conf_error("'" .. $key .. "' must be a normalised path below the hub")
+    end
+  end
+  return $path
+end
+
+$OBS_NODES = require_nodes($CONF, "target_nodes")
+$PROM_REL = require_relative_path($CONF, "prometheus_config")
+$GRAF_PROV_REL = require_relative_path($CONF, "grafana_provisioning")
+$GRAF_DASH_REL = require_relative_path($CONF, "grafana_dashboards")
+$PROM_PORT = $CONF["prometheus_query_port"]
+if type($PROM_PORT) != "number" or trunc($PROM_PORT) != $PROM_PORT or $PROM_PORT < 1 or $PROM_PORT > 65535 then
+  conf_error("'prometheus_query_port' must be an integer in 1..65535")
+end
+
+$targets = args()
+for each $target in $targets
+  if $target != "prometheus" and $target != "grafana" then
+    print("  ERROR: unknown component '" .. $target .. "' — valid: prometheus grafana")
+    exit(2)
+  end
+end
+
+fn want($items, $name)
+  if len($items) == 0 then return true end
+  for each $item in $items
+    if $item == $name then return true end
+  end
+  return false
+end
+
+fn has_item($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then return true end
+  end
+  return false
+end
+
+$ROSTER = $d.roster()
+$parsed = $d.parse_nodes($ROSTER, $OBS_NODES, [])
+$selected = $parsed["nodes"]
+$nodes = []
+for each $candidate in $d.rollout_order($ROSTER)
+  if has_item($selected, $candidate) then
+    if has_item($nodes, $candidate) then
+      conf_error("fleet rollout_order repeats target node '" .. $candidate .. "'")
+    end
+    push($nodes, $candidate)
+  end
+end
+if len($nodes) != len($selected) then
+  conf_error("a target node is absent from the fleet rollout_order")
+end
+
+$REMOTE = {}
+$PROM_QUERY = {}
+for each $node in $nodes
+  if $d.is_foreign($ROSTER, $node) then
+    conf_error("target '" .. $node .. "' is foreign; deploy_obs requires a mesh node with Mix as root login shell")
+  end
+  $ip = $d.mesh_ip($node)
+  $REMOTE[$node] = "root@" .. $ip
+  $PROM_QUERY[$node] = "http://" .. $ip .. ":" .. ("" .. $PROM_PORT)
+end
+
+$HUB = $d.hub_root()
+$PROM_CFG = $HUB .. "/" .. $PROM_REL
+$GRAF_PROV = $HUB .. "/" .. $GRAF_PROV_REL
+$GRAF_DASH = $HUB .. "/" .. $GRAF_DASH_REL
+
+if want($targets, "prometheus") and not is_file($PROM_CFG) then
+  conf_error("missing Prometheus config: " .. $PROM_CFG)
+end
+if want($targets, "grafana") and not is_dir($GRAF_PROV) then
+  conf_error("missing Grafana provisioning directory: " .. $GRAF_PROV)
+end
+if want($targets, "grafana") and not is_dir($GRAF_DASH) then
+  conf_error("missing Grafana dashboard directory: " .. $GRAF_DASH)
+end
+
+fn tree_manifest($root, $what)
+  $manifest = {}
+  for each $path in walk($root, {include_dirs: true})
+    $info = stat($path, {follow_symlinks: false})
+    if $info["is_symlink"] then
+      conf_error($what .. " contains a symlink, which this deploy refuses: " .. $path)
+    end
+    if $info["is_file"] then
+      $rel = substr($path, len($root) + 1, len($path) - len($root) - 1)
+      $manifest[$rel] = hash_file($path, "blake3")
+    end
+  end
+  if len(keys($manifest)) == 0 then
+    conf_error($what .. " contains no files: " .. $root)
+  end
+  return $manifest
+end
+
+$GRAF_PROV_MANIFEST = {}
+$GRAF_DASH_MANIFEST = {}
+if want($targets, "grafana") then
+  $GRAF_PROV_MANIFEST = tree_manifest($GRAF_PROV, "Grafana provisioning directory")
+  $GRAF_DASH_MANIFEST = tree_manifest($GRAF_DASH, "Grafana dashboard directory")
+end
+
+fn reach($node)
+  $result = ssh_mix($REMOTE[$node], 'print("reach-ok")', {connect_timeout: 8, timeout: 10})
+  $d.die_if(not $result["ok"] or trim($result["stdout"]) != "reach-ok",
+    $node .. " unreachable or has no working system Mix: " .. trim($result["stdout"]) .. " " .. trim($result["stderr"]))
+end
+
+fn scp_to($node, $local, $remote)
+  $result = run_argv([
+    "scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+    $local, $REMOTE[$node] .. ":" .. $remote
+  ], {timeout: 120})
+  $d.die_if($result["exit_code"] != 0,
+    "scp " .. $local .. " -> " .. $node .. ":" .. $remote .. ": " .. trim($result["stderr"]))
+end
+
+fn assert_manifest($node, $what, $wanted, $got)
+  $d.die_if(type($got) != "map" or len(keys($got)) != len(keys($wanted)),
+    $node .. " " .. $what .. " installed file set does not match the source")
+  for each $path in keys($wanted)
+    $d.die_if($got[$path] != $wanted[$path],
+      $node .. " " .. $what .. " byte verification failed for " .. $path)
+  end
+end
+
+fn deploy_prometheus($node)
+  $staged = "/tmp/cosmix-prometheus.yml.new"
+  $final = "/etc/cosmix/prometheus/prometheus.yml"
+  scp_to($node, $PROM_CFG, $staged)
+
+  -- Validate before installing. Prometheus keeps the previous configuration
+  -- when a reload rejects the new file, so an active service is not proof.
+  $check = ssh_mix($REMOTE[$node], '
+$output = run("promtool check config " .. $staged)
+if $rc != 0 then
+  eprint($output)
+  remove($staged)
+  exit(7)
+end
+print($output)
+', {bindings: {staged: $staged}, connect_timeout: 8, timeout: 30})
+  $d.die_if(not $check["ok"],
+    $node .. " promtool rejected the config: " .. trim($check["stdout"]) .. " " .. trim($check["stderr"]))
+  print("  promtool: OK")
+
+  $installed = ssh_mix($REMOTE[$node], '
+$uid_text = trim(run("id -u cosmix-prometheus"))
+$uid_rc = $rc
+$gid_text = trim(run("id -g cosmix-prometheus"))
+$gid_rc = $rc
+if $uid_rc != 0 or $gid_rc != 0 or $uid_text == "" or $gid_text == "" then
+  eprint("cannot resolve cosmix-prometheus uid/gid")
+  exit(7)
+end
+$new = $final .. ".new"
+mkdir(dirname($final), {parents: true})
+copy($staged, $new)
+chmod($new, 0o644)
+chown($new, to_number($uid_text), to_number($gid_text))
+rename($new, $final)
+remove($staged)
+print(hash_file($final, "blake3"))
+', {bindings: {staged: $staged, final: $final}, connect_timeout: 8, timeout: 20})
+  $d.die_if(not $installed["ok"],
+    $node .. " Prometheus config install failed: " .. trim($installed["stdout"]) .. " " .. trim($installed["stderr"]))
+  $d.die_if(trim($installed["stdout"]) != hash_file($PROM_CFG, "blake3"),
+    $node .. " Prometheus config byte verification failed")
+  print("  config: " .. $final .. " (bytes verified)")
+
+  -- Require this reload's success log. Merely checking is-active can pass
+  -- while Prometheus has rejected the new file and retained the old config.
+  $reload = ssh_mix($REMOTE[$node], '
+$started = time()
+$reload_output = run("systemctl reload cosmix-prometheus.service")
+$reload_rc = $rc
+sleep(3)
+$active = run("systemctl is-active cosmix-prometheus.service")
+$active_rc = $rc
+$logs = run("journalctl -u cosmix-prometheus.service --since=@" .. ("" .. $started) .. " --no-pager")
+$logs_rc = $rc
+print(data_encode({reload_rc: $reload_rc, reload_output: $reload_output, active_rc: $active_rc, active: $active, logs_rc: $logs_rc, logs: $logs}))
+', {decode: "data", connect_timeout: 8, timeout: 25})
+  $d.die_if(not $reload["ok"],
+    $node .. " Prometheus reload probe failed: " .. trim($reload["stdout"]) .. " " .. trim($reload["stderr"]))
+  $rv = $reload["value"]
+  if $rv["reload_rc"] != 0 or $rv["active_rc"] != 0 or trim($rv["active"]) != "active" then
+    print("  ERROR: " .. $node .. " Prometheus reload failed; current-invocation logs:")
+    print(trim($rv["logs"]))
+    exit(1)
+  end
+  $log_text = lower($rv["logs"])
+  $d.die_if($rv["logs_rc"] != 0,
+    $node .. " could not read Prometheus logs for the reload window")
+  $d.die_if(contains($log_text, "failed to apply") or contains($log_text, "error loading config"),
+    $node .. " Prometheus rejected the new config on reload — old config still live")
+  $d.die_if(not contains($log_text, "completed loading of configuration file"),
+    $node .. " Prometheus produced no successful config-load verdict for this reload")
+  print("  reloaded, active; current reload log verified")
+
+  $response = http_get($PROM_QUERY[$node] .. "/api/v1/targets?state=active", {timeout: 15})
+  $d.die_if($response["status"] != 200,
+    $node .. " Prometheus targets API: status " .. ("" .. $response["status"]) .. " " .. ("" .. $response["error_code"]))
+  $payload = nil
+  try
+    $payload = json_parse($response["body"])
+  catch $msg
+    $d.die_if(true, $node .. " Prometheus targets API returned invalid JSON: " .. $msg)
+  end
+  $d.die_if(type($payload) != "map" or $payload["status"] != "success" or
+    type($payload["data"]) != "map" or type($payload["data"]["activeTargets"]) != "list",
+    $node .. " Prometheus targets API returned an invalid success payload")
+
+  $health = {}
+  $jobs = {}
+  $down = []
+  for each $target in $payload["data"]["activeTargets"]
+    $state = $target["health"]
+    $job = $target["labels"]["job"]
+    $health[$state] = get_or($health, $state, 0) + 1
+    $jobs[$job] = get_or($jobs, $job, 0) + 1
+    if $state == "down" then
+      push($down, $job .. "/" .. $target["labels"]["instance"] .. ": " .. $target["lastError"])
+    end
+  end
+  print("  target health: " .. json_encode($health))
+  print("  targets per job: " .. json_encode($jobs))
+  $d.die_if(len(keys($jobs)) == 0,
+    $node .. " Prometheus reports no active targets — the new config scrapes nothing")
+  if len($down) > 0 then
+    print("  ERROR: " .. $node .. " has down Prometheus targets:")
+    for each $failure in $down
+      print("    " .. $failure)
+    end
+    exit(1)
+  end
+end
+
+fn deploy_grafana($node)
+  $stage = "/tmp/cosmix-obs-grafana"
+  $prepared = ssh_mix($REMOTE[$node], '
+remove_dir($stage)
+mkdir($stage .. "/provisioning", {parents: true})
+mkdir($stage .. "/dashboards", {parents: true})
+print("stage-ok")
+', {bindings: {stage: $stage}, connect_timeout: 8, timeout: 15})
+  $d.die_if(not $prepared["ok"] or trim($prepared["stdout"]) != "stage-ok",
+    $node .. " Grafana staging setup failed: " .. trim($prepared["stderr"]))
+
+  scp_to($node, $GRAF_PROV .. "/.", $stage .. "/provisioning/")
+  scp_to($node, $GRAF_DASH .. "/.", $stage .. "/dashboards/")
+  print("  staged provisioning + dashboards")
+
+  -- Install file-by-file with explicit ownership. The source manifest and
+  -- installed hashes prove that neither scp nor the copy loop was a no-op.
+  $installed = ssh_mix($REMOTE[$node], '
+$uid_text = trim(run("id -u cosmix-grafana"))
+$uid_rc = $rc
+$gid_text = trim(run("id -g cosmix-grafana"))
+$gid_rc = $rc
+if $uid_rc != 0 or $gid_rc != 0 or $uid_text == "" or $gid_text == "" then
+  eprint("cannot resolve cosmix-grafana uid/gid")
+  exit(7)
+end
+$uid = to_number($uid_text)
+$gid = to_number($gid_text)
+$out = {}
+for each $tree in [
+  {name: "provisioning", src: $stage .. "/provisioning", dst: "/etc/cosmix/grafana/provisioning"},
+  {name: "dashboards", src: $stage .. "/dashboards", dst: "/var/lib/cosmix/grafana/dashboards"}
+]
+  $manifest = {}
+  for each $path in walk($tree["src"], {include_dirs: true})
+    $info = stat($path, {follow_symlinks: false})
+    if $info["is_symlink"] then
+      eprint("staged Grafana tree contains a symlink: " .. $path)
+      exit(7)
+    end
+    if $info["is_file"] then
+      $rel = substr($path, len($tree["src"]) + 1, len($path) - len($tree["src"]) - 1)
+      $final = $tree["dst"] .. "/" .. $rel
+      $new = $final .. ".new"
+      mkdir(dirname($final), {parents: true})
+      copy($path, $new)
+      chmod($new, 0o644)
+      chown($new, $uid, $gid)
+      rename($new, $final)
+      $manifest[$rel] = hash_file($final, "blake3")
+    end
+  end
+  $out[$tree["name"]] = $manifest
+end
+remove_dir($stage)
+print(data_encode($out))
+', {bindings: {stage: $stage}, decode: "data", connect_timeout: 8, timeout: 60})
+  $d.die_if(not $installed["ok"],
+    $node .. " Grafana tree install failed: " .. trim($installed["stdout"]) .. " " .. trim($installed["stderr"]))
+  assert_manifest($node, "Grafana provisioning", $GRAF_PROV_MANIFEST, $installed["value"]["provisioning"])
+  assert_manifest($node, "Grafana dashboards", $GRAF_DASH_MANIFEST, $installed["value"]["dashboards"])
+  print("  provisioning + dashboards: installed bytes verified")
+
+  -- InvocationID must change, proving this restart occurred. Logs are then
+  -- read by that exact ID, not from an approximate recent-time window.
+  $restart = ssh_mix($REMOTE[$node], '
+$before = trim(run("systemctl show cosmix-grafana.service -p InvocationID --value"))
+$before_rc = $rc
+$restart_output = run("systemctl restart cosmix-grafana.service")
+$restart_rc = $rc
+sleep(6)
+$active = run("systemctl is-active cosmix-grafana.service")
+$active_rc = $rc
+$after = trim(run("systemctl show cosmix-grafana.service -p InvocationID --value"))
+$after_rc = $rc
+$safe_id = regex_match("^[0-9a-f]+$", $after)
+$logs = ""
+$logs_rc = 1
+if $safe_id then
+  $logs = run("journalctl -u cosmix-grafana.service _SYSTEMD_INVOCATION_ID=" .. $after .. " --no-pager")
+  $logs_rc = $rc
+end
+print(data_encode({before: $before, before_rc: $before_rc, restart_output: $restart_output, restart_rc: $restart_rc, active: $active, active_rc: $active_rc, after: $after, after_rc: $after_rc, safe_id: $safe_id, logs: $logs, logs_rc: $logs_rc}))
+', {decode: "data", connect_timeout: 8, timeout: 30})
+  $d.die_if(not $restart["ok"],
+    $node .. " Grafana restart probe failed: " .. trim($restart["stdout"]) .. " " .. trim($restart["stderr"]))
+  $gv = $restart["value"]
+  if $gv["restart_rc"] != 0 or $gv["active_rc"] != 0 or trim($gv["active"]) != "active" then
+    print("  ERROR: " .. $node .. " Grafana restart failed; current-invocation logs:")
+    print(trim($gv["logs"]))
+    exit(1)
+  end
+  $d.die_if($gv["before_rc"] != 0 or $gv["after_rc"] != 0 or not $gv["safe_id"] or
+    $gv["after"] == "" or $gv["after"] == $gv["before"],
+    $node .. " Grafana InvocationID did not change across restart")
+  $d.die_if($gv["logs_rc"] != 0,
+    $node .. " could not read logs for the new Grafana invocation")
+  for each $line in split(lower($gv["logs"]), "\n")
+    if contains($line, "provision") and (contains($line, "error") or contains($line, "fail")) then
+      print("  ERROR: " .. $node .. " Grafana provisioning error in the new invocation:")
+      print(trim($line))
+      exit(1)
+    end
+  end
+  print("  restarted, active; new-invocation provisioning logs clean")
+end
+
+$_lock = $m.mesh_take_write_lock("deploy_obs")
+for each $node in $nodes
+  print("")
+  print("[" .. $node .. "] deploy observation config")
+  reach($node)
+  if want($targets, "prometheus") then deploy_prometheus($node) end
+  if want($targets, "grafana") then deploy_grafana($node) end
+  print("  [" .. $node .. "] DEPLOY OK")
+end
+
+print("")
+print("deploy complete: observation configuration verified on " .. join($nodes, " "))

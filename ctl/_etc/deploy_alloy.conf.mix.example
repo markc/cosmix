@@ -1,0 +1,10 @@
+-- deploy_alloy.conf.mix.example — private Loki endpoints for deploy_alloy.mix.
+-- Copy to deploy_alloy.conf.mix in your private control hub and edit it there.
+-- Fleet nodes (for example alpha, beta, gamma) come from the private roster;
+-- this file deliberately contains no target or address table.
+deploy_alloy: {
+  schema_version: 1,
+  mesh_loki_push_url: "https://logs.example.org/loki/api/v1/push",
+  foreign_loki_push_url: "https://logs.example.net/loki/api/v1/push",
+  loki_query_url: "https://logs.example.org"
+}

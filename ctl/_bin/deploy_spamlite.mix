@@ -425,8 +425,8 @@ $ROSTER = $d.roster()
 $configured = []
 for each $node in $CONF["target_nodes"]
   $d.assert_node($ROSTER, $node)
-  $d.die_if($d.is_foreign($ROSTER, $node),
-    "spamlite target '" .. $node .. "' is foreign; deploy requires a Mix-login mesh node")
+  -- Foreign (bash-login) mail hosts are the normal spamlite targets: ssh_mix
+  -- ships the source into their own /opt/cosmix/bin/mix, login shell or not.
   $d.die_if(trim($d.mesh_ip($node)) == "",
     "spamlite target '" .. $node .. "' has no mesh address")
   $d.die_if(is_in($configured, $node),

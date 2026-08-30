@@ -1,0 +1,497 @@
+#!/usr/bin/env mix
+-- deploy_alloy.mix — install Grafana Alloy and its journal-shipping config on
+-- the hub's fleet roster (or a named subset), then prove the restarted service
+-- is active, logging, and delivering fresh samples to Loki.
+--
+--   mix _bin/deploy_alloy.mix
+--   mix _bin/deploy_alloy.mix alpha beta
+--   mix _bin/deploy_alloy.mix --config-only alpha
+--   mix _bin/deploy_alloy.mix --allow-downgrade alpha
+--
+-- The private hub owns only the Loki endpoints. Fleet membership and addresses
+-- come from the shared roster/inventory. Reusable config, unit, and sysusers
+-- templates come from the public CosMix source tree.
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_alloy.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no Alloy deploy config at " .. $CONF_PATH ..
+    " — create it from deploy_alloy.conf.mix.example before deploying")
+  exit(2)
+end
+$CONF_DOC = load_data($CONF_PATH)
+$d.die_if(type($CONF_DOC) != "map" or type($CONF_DOC["deploy_alloy"]) != "map",
+  "invalid " .. $CONF_PATH .. ": expected deploy_alloy strict-data map")
+$CONF = validate($CONF_DOC["deploy_alloy"], {
+  schema_version: {type: "integer", enum: [1]},
+  mesh_loki_push_url: {type: "string", nonblank: true},
+  foreign_loki_push_url: {type: "string", nonblank: true},
+  loki_query_url: {type: "string", nonblank: true}
+})
+
+fn validate_url($key, $value, $push)
+  $d.die_if(not starts_with($value, "http://") and not starts_with($value, "https://"),
+    $CONF_PATH .. " deploy_alloy." .. $key .. " must be an http(s) URL")
+  $d.die_if(contains($value, "\n") or contains($value, "\r") or contains($value, " ") or contains($value, "\t"),
+    $CONF_PATH .. " deploy_alloy." .. $key .. " must not contain whitespace")
+  if $push then
+    $d.die_if(not ends_with($value, "/loki/api/v1/push"),
+      $CONF_PATH .. " deploy_alloy." .. $key .. " must include /loki/api/v1/push")
+  end
+end
+
+validate_url("mesh_loki_push_url", $CONF["mesh_loki_push_url"], true)
+validate_url("foreign_loki_push_url", $CONF["foreign_loki_push_url"], true)
+validate_url("loki_query_url", $CONF["loki_query_url"], false)
+$LOKI_QUERY = regex_replace("/+$", $CONF["loki_query_url"], "")
+
+$ROSTER = $d.roster()
+$parsed = $d.parse_nodes($ROSTER, args(), ["--config-only", "--allow-downgrade"])
+$selected = $parsed["nodes"]
+$CONFIG_ONLY = $parsed["flags"]["--config-only"] == true
+$ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
+
+-- Resolve the complete target set before inspecting artefacts or contacting a
+-- node. Inventory is the only address authority, including non-citizen hosts.
+$REMOTE = {}
+$selected_set = {}
+for each $node in $selected
+  if has_key($selected_set, $node) then
+    print("  ERROR: duplicate target node '" .. $node .. "'")
+    exit(2)
+  end
+  $selected_set[$node] = true
+  $REMOTE[$node] = "root@" .. $d.mesh_ip($node)
+end
+
+-- Canonical mesh order, then foreign nodes, then mesh hubs. Splitting the
+-- library order around mesh_hubs keeps hubs last across the whole mixed fleet.
+$hub_set = {}
+for each $hub in $d.mesh_hubs()
+  $hub_set[$hub] = true
+end
+$nodes = []
+for each $node in $d.rollout_order($ROSTER)
+  if has_key($selected_set, $node) and not has_key($hub_set, $node) then
+    push($nodes, $node)
+  end
+end
+for each $node in $ROSTER["foreign"]
+  if has_key($selected_set, $node) then
+    push($nodes, $node)
+  end
+end
+for each $node in $d.rollout_order($ROSTER)
+  if has_key($selected_set, $node) and has_key($hub_set, $node) then
+    push($nodes, $node)
+  end
+end
+if len($nodes) != len($selected) then
+  print("  ERROR: selected targets are absent from the roster rollout order or duplicated across roster tiers")
+  exit(2)
+end
+
+$ROOT = $d.cosmix_root()
+$BIN_SOURCE = $d.hub_root() .. "/_bin/dist/alloy"
+$CONFIG = $ROOT .. "/src/_etc/cosmix/alloy/config.alloy"
+$UNIT_MESH = $ROOT .. "/src/_etc/systemd-system/cosmix-alloy.service"
+$UNIT_FOREIGN = $ROOT .. "/src/_etc/systemd-system/cosmix-alloy-foreign.service"
+$SYSUSERS_FOREIGN = $ROOT .. "/src/_etc/sysusers/cosmix-alloy-foreign.conf"
+
+for each $path in [$CONFIG, $UNIT_MESH, $UNIT_FOREIGN, $SYSUSERS_FOREIGN]
+  $d.die_if(not is_file($path), "required deploy artefact missing: " .. $path)
+end
+
+$BIN = ""
+$BIN_HASH = ""
+$LOCAL_VERSION = ""
+$LOCAL_SEMVER = ""
+
+-- Alloy prints a v-prefixed, comma-delimited version. Normalise only that
+-- presentation detail, then leave ordering and downgrade policy to deploy_lib.
+fn alloy_semver($line)
+  for each $token in split(trim($line), " ")
+    $candidate = regex_replace("^[^0-9]*", $token, "")
+    $candidate = regex_replace("[^0-9.].*$", $candidate, "")
+    if regex_match("^[0-9]+([.][0-9]+)+$", $candidate) then
+      return $candidate
+    end
+  end
+  $d.die_if(true, "no Alloy semantic version in: " .. trim($line))
+  return ""
+end
+
+if $CONFIG_ONLY then
+  print("note: --config-only — binary push skipped; remote /usr/bin/alloy must already work")
+else
+  $d.die_if(not is_file($BIN_SOURCE),
+    "Alloy binary missing: " .. $BIN_SOURCE .. " (use --config-only to ship config without it)")
+  $BIN = $d.snapshot_bin($BIN_SOURCE)
+  $version = run_argv([$BIN, "--version"], {timeout: 20})
+  $d.die_if($version["exit_code"] != 0 or trim($version["stdout"]) == "",
+    "local Alloy --version failed: " .. trim($version["stderr"]))
+  $LOCAL_VERSION = trim($version["stdout"])
+  $LOCAL_SEMVER = alloy_semver($LOCAL_VERSION)
+  $BIN_HASH = hash_file($BIN, "sha256")
+  print("local Alloy version: " .. $LOCAL_VERSION)
+end
+
+$CONFIG_HASH = hash_file($CONFIG, "sha256")
+$UNIT_MESH_HASH = hash_file($UNIT_MESH, "sha256")
+$UNIT_FOREIGN_HASH = hash_file($UNIT_FOREIGN, "sha256")
+$SYSUSERS_HASH = hash_file($SYSUSERS_FOREIGN, "sha256")
+
+fn inspect_binary($node)
+  $probe = ssh_mix($REMOTE[$node], '
+$reach = $token
+if $reach == "" then exit(7) end
+$present = is_file($bin)
+$version = ""
+$hash = ""
+if $present then
+  $version = trim(run($bin .. " --version"))
+  if $rc != 0 or $version == "" then exit(8) end
+  $hash = hash_file($bin, "sha256")
+end
+print(data_encode({token: $reach, present: $present, version: $version, hash: $hash}))
+', {
+    bindings: {token: uuid(), bin: "/usr/bin/alloy"},
+    decode: "data", connect_timeout: 8, timeout: 20
+  })
+  $d.die_if(not $probe["ok"],
+    $node .. " unreachable, not a working Mix node, or Alloy inspection failed: " ..
+      trim($probe["stdout"]) .. " " .. trim($probe["stderr"]))
+  return $probe["value"]
+end
+
+-- Read-only fleet pre-flight. Refuse missing config-only binaries and all
+-- downgrades before taking the write lock or transferring any bytes.
+$REMOTE_BINARY = {}
+for each $node in $nodes
+  $info = inspect_binary($node)
+  if $CONFIG_ONLY then
+    $d.die_if(not $info["present"],
+      "/usr/bin/alloy absent on " .. $node .. " — --config-only cannot bootstrap a node")
+  else
+    if $info["present"] then
+      $d.assert_not_downgrade($node, alloy_semver($info["version"]), $LOCAL_SEMVER, $ALLOW_DOWNGRADE)
+    end
+  end
+  $REMOTE_BINARY[$node] = $info
+end
+
+-- This serialises the shared deployment plane before the first remote write.
+$_lock = $m.mesh_take_write_lock("deploy_alloy")
+
+fn scp_file($node, $local_path, $remote_path, $timeout)
+  $copy_result = run_argv([
+    "scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+    $local_path, $REMOTE[$node] .. ":" .. $remote_path
+  ], {timeout: $timeout})
+  $d.die_if($copy_result["exit_code"] != 0,
+    "scp " .. $local_path .. " -> " .. $node .. ":" .. $remote_path .. ": " ..
+      trim($copy_result["stderr"]))
+end
+
+fn install_binary($node)
+  $remote = $REMOTE[$node]
+  $known = $REMOTE_BINARY[$node]
+  if $CONFIG_ONLY then
+    print("  binary: left in place (--config-only), remote sha " .. substr($known["hash"], 0, 12))
+  else
+    if $known["hash"] == $BIN_HASH then
+      print("  binary: up-to-date (sha match), skip push")
+    else
+      print("  binary: pushing content snapshot")
+      scp_file($node, $BIN, "/usr/bin/alloy.new", 900)
+      $installed = ssh_mix($remote, '
+chown($new_bin, 0, 0)
+chmod($new_bin, 0o755)
+rename($new_bin, $bin)
+print("installed")
+', {bindings: {new_bin: "/usr/bin/alloy.new", bin: "/usr/bin/alloy"}, timeout: 30})
+      $d.die_if(not $installed["ok"],
+        $node .. " binary install failed: " .. trim($installed["stderr"]))
+    end
+  end
+
+  -- This runs the installed artefact even when the content-hash fast path was
+  -- taken. A no-op or broken executable cannot pass by file presence alone.
+  $smoke = ssh_mix($remote, '
+$version = trim(run($bin .. " --version"))
+if $rc != 0 or $version == "" then exit(7) end
+$_help = run($bin .. " --help")
+if $rc != 0 then exit(8) end
+print(data_encode({version: $version, hash: hash_file($bin, "sha256")}))
+', {bindings: {bin: "/usr/bin/alloy"}, decode: "data", timeout: 30})
+  $d.die_if(not $smoke["ok"],
+    $node .. " installed Alloy --version/--help smoke failed: " ..
+      trim($smoke["stdout"]) .. " " .. trim($smoke["stderr"]))
+  if not $CONFIG_ONLY then
+    $d.die_if($smoke["value"]["version"] != $LOCAL_VERSION,
+      $node .. " installed Alloy version mismatch (want " .. $LOCAL_VERSION ..
+        ", got " .. $smoke["value"]["version"] .. ")")
+    $d.die_if($smoke["value"]["hash"] != $BIN_HASH,
+      $node .. " installed Alloy hash mismatch")
+  end
+  print("  binary smoke: " .. $smoke["value"]["version"] .. " (--help OK)")
+end
+
+fn install_files($node, $foreign, $unit, $unit_hash, $job, $push_url)
+  $remote = $REMOTE[$node]
+  $dirs = ssh_mix($remote, '
+mkdir($config_dir, {parents: true})
+chown($config_dir, 512, 512)
+chmod($config_dir, 0o755)
+print("dirs-ok")
+', {bindings: {config_dir: "/etc/cosmix/alloy"}, timeout: 20})
+  $d.die_if(not $dirs["ok"] or not contains($dirs["stdout"], "dirs-ok"),
+    $node .. " config directory setup failed: " .. trim($dirs["stderr"]))
+
+  if $foreign then
+    scp_file($node, $SYSUSERS_FOREIGN, "/etc/sysusers.d/cosmix-alloy.conf.new", 120)
+    $sysusers = ssh_mix($remote, '
+chown($new_path, 0, 0)
+chmod($new_path, 0o644)
+rename($new_path, $path)
+$out = run("/usr/bin/systemd-sysusers")
+if $rc != 0 then print($out); exit(7) end
+print(hash_file($path, "sha256"))
+', {bindings: {
+      new_path: "/etc/sysusers.d/cosmix-alloy.conf.new",
+      path: "/etc/sysusers.d/cosmix-alloy.conf"
+    }, timeout: 30})
+    $d.die_if(not $sysusers["ok"] or trim($sysusers["stdout"]) != $SYSUSERS_HASH,
+      $node .. " sysusers install/hash assertion failed: " ..
+        trim($sysusers["stdout"]) .. " " .. trim($sysusers["stderr"]))
+  end
+
+  $identity = ssh_mix($remote, '
+$uid = trim(run("/usr/bin/id -u cosmix-alloy"))
+if $rc != 0 then exit(7) end
+$gid = trim(run("/usr/bin/id -g cosmix-alloy"))
+if $rc != 0 then exit(8) end
+print(data_encode({uid: $uid, gid: $gid}))
+', {decode: "data", timeout: 20})
+  $d.die_if(not $identity["ok"] or $identity["value"]["uid"] != "512"
+      or $identity["value"]["gid"] != "512",
+    $node .. " cosmix-alloy UID/GID mismatch; expected 512:512")
+  print("  identity: UID/GID 512:512")
+
+  scp_file($node, $CONFIG, "/etc/cosmix/alloy/config.alloy.new", 120)
+  scp_file($node, $unit, "/etc/systemd/system/cosmix-alloy.service.new", 120)
+  $env_text = "ALLOY_HOST=" .. $node .. "\n" ..
+    "ALLOY_JOB=" .. $job .. "\n" ..
+    "ALLOY_LOKI_URL=" .. $push_url .. "\n"
+  $installed = ssh_mix($remote, '
+chown($config_new, 512, 512)
+chmod($config_new, 0o644)
+rename($config_new, $config_path)
+$env_new = $env_path .. ".new"
+write_file($env_new, $env_text)
+chown($env_new, 512, 512)
+chmod($env_new, 0o640)
+rename($env_new, $env_path)
+chown($unit_new, 0, 0)
+chmod($unit_new, 0o644)
+rename($unit_new, $unit_path)
+print(data_encode({
+  config_hash: hash_file($config_path, "sha256"),
+  env_hash: hash_file($env_path, "sha256"),
+  unit_hash: hash_file($unit_path, "sha256")
+}))
+', {bindings: {
+    config_new: "/etc/cosmix/alloy/config.alloy.new",
+    config_path: "/etc/cosmix/alloy/config.alloy",
+    env_path: "/etc/cosmix/alloy/service.env",
+    env_text: $env_text,
+    unit_new: "/etc/systemd/system/cosmix-alloy.service.new",
+    unit_path: "/etc/systemd/system/cosmix-alloy.service"
+  }, decode: "data", timeout: 30})
+  $d.die_if(not $installed["ok"],
+    $node .. " config/env/unit install failed: " .. trim($installed["stderr"]))
+  $d.die_if($installed["value"]["config_hash"] != $CONFIG_HASH,
+    $node .. " installed Alloy config hash mismatch")
+  $d.die_if($installed["value"]["env_hash"] != hash_sha256($env_text),
+    $node .. " installed Alloy service.env hash mismatch")
+  $d.die_if($installed["value"]["unit_hash"] != $unit_hash,
+    $node .. " installed Alloy unit hash mismatch")
+  print("  config/env/unit: hashes OK")
+end
+
+fn mask_distro_unit($node)
+  $probe = ssh_mix($REMOTE[$node], '
+$listing = run("/usr/bin/systemctl list-unit-files alloy.service")
+if $rc != 0 then exit(7) end
+$found = false
+for each $line in split($listing, "\n")
+  if starts_with(trim($line), "alloy.service") then $found = true end
+end
+if $found then
+  $disabled = run("/usr/bin/systemctl disable --now alloy.service")
+  $disable_rc = $rc
+  $masked = run("/usr/bin/systemctl mask alloy.service")
+  $mask_rc = $rc
+  print(data_encode({found: true, disable_rc: $disable_rc, mask_rc: $mask_rc,
+    disabled: $disabled, masked: $masked}))
+else
+  print(data_encode({found: false, disable_rc: 0, mask_rc: 0, disabled: "", masked: ""}))
+end
+', {decode: "data", timeout: 30})
+  if not $probe["ok"] then
+    print("  note: distro Alloy unit check did not complete: " .. trim($probe["stderr"]))
+  else
+    if $probe["value"]["found"] then
+      if $probe["value"]["disable_rc"] != 0 then
+        print("  note: distro alloy.service disable failed: " .. trim($probe["value"]["disabled"]))
+      end
+      if $probe["value"]["mask_rc"] != 0 then
+        print("  note: distro alloy.service mask failed: " .. trim($probe["value"]["masked"]))
+      else
+        print("  note: masked distro alloy.service")
+      end
+    end
+  end
+end
+
+fn previous_invocation($node)
+  $probe = ssh_mix($REMOTE[$node], '
+$iid = trim(run("/usr/bin/systemctl show cosmix-alloy.service -p InvocationID --value"))
+if $rc == 0 then print($iid) end
+', {timeout: 15})
+  if $probe["ok"] then
+    return trim($probe["stdout"])
+  end
+  return ""
+end
+
+fn restart_service($node)
+  $restart = ssh_mix($REMOTE[$node], '
+$out = run("/usr/bin/systemctl daemon-reload")
+if $rc != 0 then print($out); exit(7) end
+$out = run("/usr/bin/systemctl enable cosmix-alloy.service")
+if $rc != 0 then print($out); exit(8) end
+$out = run("/usr/bin/systemctl restart cosmix-alloy.service")
+if $rc != 0 then print($out); exit(9) end
+sleep(5)
+$out = trim(run("/usr/bin/systemctl is-active cosmix-alloy.service"))
+if $rc != 0 or $out != "active" then print($out); exit(10) end
+print($out)
+', {timeout: 40})
+  if not $restart["ok"] then
+    print("  restart failed; last 30 log lines:")
+    $journal = ssh_mix($REMOTE[$node],
+      'print(run("/usr/bin/journalctl -u cosmix-alloy.service -n 30 --no-pager -o cat"))',
+      {timeout: 15})
+    print($journal["stdout"])
+    print($journal["stderr"])
+  end
+  $d.die_if(not $restart["ok"],
+    $node .. " daemon-reload/enable/restart/is-active failed: " ..
+      trim($restart["stdout"]) .. " " .. trim($restart["stderr"]))
+  print("  active: " .. trim($restart["stdout"]))
+end
+
+fn verify_logging($node, $previous)
+  $try = 0
+  while $try < 4
+    $probe = ssh_mix($REMOTE[$node], '
+$iid = trim(run("/usr/bin/systemctl show cosmix-alloy.service -p InvocationID --value"))
+if $rc != 0 or $iid == "" then exit(7) end
+$logs = trim(run("/usr/bin/journalctl _SYSTEMD_INVOCATION_ID=" .. $iid .. " -o cat --no-pager"))
+if $rc != 0 then exit(8) end
+$lines = $logs == "" ? 0 : len(split($logs, "\n"))
+print(data_encode({invocation_id: $iid, lines: $lines}))
+', {decode: "data", timeout: 20})
+    if $probe["ok"] then
+      $current = $probe["value"]["invocation_id"]
+      $d.die_if($previous != "" and $current == $previous,
+        $node .. " service invocation did not change after restart")
+      if $probe["value"]["lines"] >= 1 then
+        print("  logging verified (" .. $probe["value"]["lines"] ..
+          " line/s, current invocation)")
+        return $current
+      end
+    end
+    $try = $try + 1
+    if $try < 4 then sleep(1) end
+  end
+  $d.die_if(true,
+    $node .. " cosmix-alloy is active but has zero journald lines for the current invocation")
+  return ""
+end
+
+fn loki_has_result($body)
+  $doc = nil
+  try
+    $doc = json_decode($body)
+  catch $error
+    return false
+  end
+  if type($doc) != "map" or $doc["status"] != "success" then return false end
+  if type($doc["data"]) != "map" or type($doc["data"]["result"]) != "list" then return false end
+  return len($doc["data"]["result"]) > 0
+end
+
+fn verify_loki($node, $job)
+  $query = 'count_over_time({fleet="bus",host="' .. $node .. '",job="' .. $job .. '"}[2m])'
+  $seen = false
+  $last_error = ""
+  $try = 0
+  while $try < 12 and not $seen
+    $result = run_argv([
+      "curl", "--silent", "--show-error", "--fail-with-body", "--get",
+      $LOKI_QUERY .. "/loki/api/v1/query", "--data-urlencode", "query=" .. $query
+    ], {timeout: 20})
+    if $result["exit_code"] == 0 and loki_has_result($result["stdout"]) then
+      $seen = true
+    else
+      $last_error = trim($result["stderr"])
+      if $last_error == "" then $last_error = trim($result["stdout"]) end
+      $try = $try + 1
+      if $try < 12 then sleep(5) end
+    end
+  end
+  if not $seen then
+    print("  Loki gate failed; last 15 Alloy log lines:")
+    $journal = ssh_mix($REMOTE[$node],
+      'print(run("/usr/bin/journalctl -u cosmix-alloy.service -n 15 --no-pager -o cat"))',
+      {timeout: 15})
+    print($journal["stdout"])
+    print($journal["stderr"])
+  end
+  $d.die_if(not $seen,
+    "no recent Loki samples for " .. $node .. " / " .. $job .. ": " .. $last_error)
+  print("  Loki gate: fresh labelled samples visible")
+end
+
+fn deploy_node($node)
+  $foreign = $d.is_foreign($ROSTER, $node)
+  $tier = $foreign ? "foreign" : "mesh"
+  $unit = $foreign ? $UNIT_FOREIGN : $UNIT_MESH
+  $unit_hash = $foreign ? $UNIT_FOREIGN_HASH : $UNIT_MESH_HASH
+  $job = $foreign ? "foreign-journal" : "mesh-journal"
+  $push_url = $foreign ? $CONF["foreign_loki_push_url"] : $CONF["mesh_loki_push_url"]
+
+  print("")
+  print("[" .. $node .. "] deploy cosmix-alloy (" .. $tier .. ")")
+  $previous = previous_invocation($node)
+  install_binary($node)
+  install_files($node, $foreign, $unit, $unit_hash, $job, $push_url)
+  mask_distro_unit($node)
+  restart_service($node)
+  $_invocation = verify_logging($node, $previous)
+  verify_loki($node, $job)
+end
+
+print("rollout order: " .. join($nodes, " "))
+for each $node in $nodes
+  deploy_node($node)
+end
+if $BIN != "" then remove($BIN) end
+
+print("")
+print("deploy complete: Alloy version/help, hashes, restart invocation, journald, and Loki gates passed on " ..
+  join($nodes, " "))
