@@ -1,0 +1,274 @@
+#!/usr/bin/env mix
+-- mesh_reconcile.mix — compare the authenticated declared mesh with live
+-- WireGuard and local Bus membership. Read-only: it observes but never mutates.
+--
+-- Reports:
+--   MISSING-ON-WIRE    active declared member with no WG peer for its mesh_ip
+--   KEY-MISMATCH       on-wire key matches none of the member's current creds
+--   NO-CURRENT-CRED    on-wire active member has no current kind:wg credential
+--   STALE-ON-WIRE      tombstoned member is still a WG peer
+--   NOT-DECLARED       on-wire peer IP is absent from the inventory
+--   DUPLICATE-ON-WIRE  the same mesh_ip appears more than once in the WG dump
+--   BROAD-ALLOWED-IP   an in-subnet allowed-ip is broader than /32
+--   PENDING-JOIN       active Bus member is on WG but not in the local roster
+--
+-- The signed inventory supplies the full-peer-view hub. The local broker's
+-- noded.peers response is deliberately a local-roster view, not a mesh-wide
+-- membership authority. Exit 0 iff there is no unexpected membership drift;
+-- pending joins are informational.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/mesh_reconcile.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no mesh_reconcile configuration at " .. $CONF_PATH)
+  print("         copy _etc/mesh_reconcile.conf.mix.example there and edit it")
+  exit(2)
+end
+$CONF = load_data($CONF_PATH)
+if type($CONF) != "map" or type($CONF["mesh_reconcile"]) != "map" then
+  print("  ERROR: " .. $CONF_PATH .. " must contain a mesh_reconcile map")
+  exit(2)
+end
+$RECON = $CONF["mesh_reconcile"]
+if $RECON["schema_version"] != 1 then
+  print("  ERROR: " .. $CONF_PATH .. " needs mesh_reconcile.schema_version: 1")
+  exit(2)
+end
+if type($RECON["expected_mesh"]) != "string" or trim($RECON["expected_mesh"]) == "" then
+  print("  ERROR: " .. $CONF_PATH .. " needs a non-empty mesh_reconcile.expected_mesh")
+  exit(2)
+end
+if type($RECON["wg_interface"]) != "string" or not regex_match("^[A-Za-z0-9_.-]{1,15}$", $RECON["wg_interface"]) then
+  print("  ERROR: " .. $CONF_PATH .. " needs mesh_reconcile.wg_interface as a 1-15 character interface name")
+  exit(2)
+end
+
+$m = require("../_lib/mesh_lib.mix")
+
+$INVENTORY = $d.hub_root() .. "/_etc/mesh/inventory.mix"
+$SIGNED = $d.hub_root() .. "/_etc/mesh/inventory.signed"
+$BASELINE = $d.hub_root() .. "/_etc/mesh/epoch.baseline.mix"
+$IFACE = $RECON["wg_interface"]
+
+-- Reconcile only against authenticated bytes. against_authored refuses an
+-- unsealed edit, while the baseline refuses a valid but stale signed payload.
+$vi = $m.verified_inventory($SIGNED, {
+  mesh: $RECON["expected_mesh"],
+  against_authored: $INVENTORY,
+  baseline: $BASELINE
+})
+$mesh = $vi["inventory"]
+
+-- Keep the topology-coherence gate explicit at the trust boundary. A valid
+-- signature establishes authorship, not structural correctness.
+$m.validate_inventory($mesh)
+
+$declared_by_ip = {}
+$declared_by_name = {}
+$declared_names = []
+for each $member in $mesh["members"]
+  $declared_by_ip[$member["mesh_ip"]] = $member
+  $declared_by_name[$member["name"]] = $member
+  push($declared_names, $member["name"])
+end
+$declared_names = sort($declared_names)
+
+print("mesh_reconcile — declared-vs-live membership")
+print("  inventory : " .. $SIGNED .. "  (epoch " .. ("" .. $mesh["epoch"]) .. ")")
+print("  provenance: VERIFIED — signed payload, authored file and freshness floor checked")
+
+-- One /24 per inventory is asserted by validate_inventory().
+$net_prefix = $m.prefix24(split($mesh["subnet"], "/")[0])
+
+-- The hub has the full WireGuard peer view. Its own key is an interface field,
+-- not a peer line, so it is added below under its declared mesh IP.
+$hub = $mesh["hub"][0]
+if $declared_by_name[$hub] == nil then
+  print("ERROR: declared hub '" .. ("" .. $hub) .. "' is not an inventory member")
+  exit(1)
+end
+
+$pk = ssh_mix($hub, 'print(run("wg show " .. $iface .. " public-key"))', {
+  bindings: {iface: $IFACE}
+})
+if not $pk["ok"] then
+  print("ERROR: cannot read WG public key from hub '" .. $hub .. "': " .. trim($pk["stderr"]))
+  exit(1)
+end
+$hub_pubkey = trim($pk["stdout"])
+
+$dump = ssh_mix($hub, 'print(run("wg show " .. $iface .. " dump"))', {
+  bindings: {iface: $IFACE}
+})
+if not $dump["ok"] then
+  print("ERROR: cannot read WG dump from hub '" .. $hub .. "': " .. trim($dump["stderr"]))
+  exit(1)
+end
+
+-- A peer may carry extra routes. Select the allowed IP inside the declared
+-- mesh subnet, and accept it as membership only when it preserves /32 pinning.
+$live_wg = {}
+$live_ips = []
+$dups = []
+$broad = []
+$lines = split(trim($dump["stdout"]), "\n")
+$idx = 0
+for each $line in $lines
+  if $idx > 0 then
+    $fields = split($line, "\t")
+    if length($fields) >= 4 then
+      $peerkey = $fields[0]
+      $ip = ""
+      for each $allowed in split($fields[3], ",")
+        $parts = split($allowed, "/")
+        $candidate = $parts[0]
+        if $m.prefix24($candidate) == $net_prefix then
+          $prefix_len = "32"
+          if length($parts) > 1 then
+            $prefix_len = $parts[1]
+          end
+          if $prefix_len == "32" then
+            if $ip == "" then
+              $ip = $candidate
+            end
+          else
+            push($broad, $candidate .. "/" .. $prefix_len)
+          end
+        end
+      end
+      if $ip != "" then
+        if $live_wg[$ip] != nil then
+          push($dups, $ip)
+        else
+          $live_wg[$ip] = $peerkey
+          push($live_ips, $ip)
+        end
+      end
+    end
+  end
+  $idx = $idx + 1
+end
+
+$hub_ip = $declared_by_name[$hub]["mesh_ip"]
+if $live_wg[$hub_ip] == nil then
+  $live_wg[$hub_ip] = $hub_pubkey
+  push($live_ips, $hub_ip)
+end
+
+-- Local Bus view. Failure is reported as a skipped cross-check, matching the
+-- validator's original contract; WireGuard drift remains fully evaluated.
+$bus_has = {}
+$bus_ok = false
+$bus_node = "?"
+send noded noded.peers
+$peers_rc = $rc
+if $peers_rc == 0 and $result["node"] != nil then
+  $bus_ok = true
+  $bus_node = $result["node"]
+  $bus_has[$result["node"]] = true
+  $peers = $result["peers"]
+  if $peers != nil then
+    for each $peer in $peers
+      if type($peer) == "string" then
+        $bus_has[$peer] = true
+      else
+        $bus_has[$peer["name"]] = true
+      end
+    end
+  end
+end
+
+$unexpected = 0
+print("")
+print("-- WG reconcile (declared inventory vs `wg show " .. $IFACE .. " dump` @ " .. $hub .. ") --")
+for each $name in $declared_names
+  $member = $declared_by_name[$name]
+  $ip = $member["mesh_ip"]
+  $have = $live_wg[$ip]
+  if $member["status"] == "tombstoned" then
+    if $have == nil then
+      print("  ok(tombstoned)   " .. rpad($name, 10) .. " " .. rpad($ip, 14) .. " absent (expected)")
+    else
+      print("  STALE-ON-WIRE    " .. rpad($name, 10) .. " " .. $ip .. " tombstoned but still a WG peer")
+      $unexpected = $unexpected + 1
+    end
+  else
+    $wants = $m.wg_current_pubkeys($member, $mesh["epoch"])
+    if $have == nil then
+      print("  MISSING-ON-WIRE  " .. rpad($name, 10) .. " " .. $ip)
+      $unexpected = $unexpected + 1
+    else
+      if length($wants) == 0 then
+        print("  NO-CURRENT-CRED  " .. rpad($name, 10) .. " " .. $ip ..
+          " (no current kind:wg credential at epoch " .. ("" .. $mesh["epoch"]) .. ")")
+        $unexpected = $unexpected + 1
+      else
+        if $m.contains_str($wants, $have) then
+          print("  ok               " .. rpad($name, 10) .. " " .. rpad($ip, 14) .. " key=match")
+        else
+          print("  KEY-MISMATCH     " .. rpad($name, 10) .. " " .. $ip)
+          print("                     declared one-of=" .. join($wants, " "))
+          print("                     on-wire        =" .. $have)
+          $unexpected = $unexpected + 1
+        end
+      end
+    end
+  end
+end
+
+for each $ip in $live_ips
+  if $declared_by_ip[$ip] == nil then
+    print("  NOT-DECLARED     (on wire) " .. $ip .. "  key=" .. $live_wg[$ip])
+    $unexpected = $unexpected + 1
+  end
+end
+for each $ip in $dups
+  print("  DUPLICATE-ON-WIRE " .. $ip .. " appears more than once in the WG dump")
+  $unexpected = $unexpected + 1
+end
+for each $route in $broad
+  print("  BROAD-ALLOWED-IP  " .. $route .. " in-subnet route is not a /32")
+  $unexpected = $unexpected + 1
+end
+
+$pending = 0
+print("")
+if not $bus_ok then
+  print("-- BUS registration: local broker unreachable or malformed (noded.peers rc=" ..
+    ("" .. $peers_rc) .. ") — skipped --")
+else
+  print("-- BUS registration (declared Bus vs noded.peers @ local broker '" .. $bus_node .. "') --")
+  for each $name in $declared_names
+    $member = $declared_by_name[$name]
+    if $member["bus"] == true and $member["status"] == "active" then
+      if $bus_has[$name] == true then
+        print("  ok               " .. rpad($name, 10) .. " in local roster")
+      else
+        if $live_wg[$member["mesh_ip"]] != nil then
+          print("  PENDING-JOIN     " .. rpad($name, 10) .. " on WG wire, not yet in local Bus roster")
+          $pending = $pending + 1
+        else
+          print("  ABSENT           " .. rpad($name, 10) .. " not on WG and not in Bus roster (see WG reconcile)")
+        end
+      end
+    end
+  end
+end
+
+print("")
+print("-- summary --")
+print("  declared members : " .. ("" .. length($mesh["members"])))
+print("  unexpected drift : " .. ("" .. $unexpected) ..
+  "   (MISSING/STALE-ON-WIRE, KEY-MISMATCH, NO-CURRENT-CRED, NOT-DECLARED, DUPLICATE, BROAD-ALLOWED-IP)")
+print("  pending joins    : " .. ("" .. $pending) .. "   (on WG, Bus not yet complete)")
+print("  NOTE: admission checks for intra-mesh masquerade and broker bind address")
+print("        are not evaluated; a clean result covers WG+Bus membership only.")
+print("")
+if $unexpected == 0 then
+  print("RESULT: zero unexpected WG/Bus membership drift; " .. ("" .. $pending) .. " pending join(s).")
+  exit(0)
+else
+  print("RESULT: " .. ("" .. $unexpected) .. " unexpected drift item(s) — investigate.")
+  exit(1)
+end

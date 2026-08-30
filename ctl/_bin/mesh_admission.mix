@@ -1,0 +1,330 @@
+#!/usr/bin/env mix
+-- mesh_admission.mix <off|observe|enforce> [node...] — roll the noded
+-- admission posture across the mesh.
+--
+-- With no node arguments, every rostered mesh member is restarted in the
+-- canonical rollout order, with hubs last. Named foreign roster nodes are
+-- valid targets and are reached through their SSH aliases.
+--
+-- The signed inventory must authenticate, match the authored inventory and
+-- satisfy the freshness floor before any node is changed. Every target is
+-- then preflighted before the shared mesh write lock is taken. The remote edit
+-- preserves every other node.conf.mix value, replaces the file atomically,
+-- restarts cosmix-noded, and is independently re-read before the next node.
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+$argv = args()
+if len($argv) == 0 then
+  print("usage: mix _bin/mesh_admission.mix <off|observe|enforce> [node...]")
+  exit(2)
+end
+
+$MODE = $argv[0]
+if $MODE != "off" and $MODE != "observe" and $MODE != "enforce" then
+  print("  ERROR: mode must be off|observe|enforce, got '" .. $MODE .. "'")
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/mesh_admission.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no mesh admission configuration at " .. $CONF_PATH)
+  print("         copy _etc/mesh_admission.conf.mix.example there and set expected_mesh")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["mesh_admission"], {
+    schema_version: {type: "integer", enum: [1]},
+    expected_mesh: {type: "string", nonblank: true}
+  })
+catch $config_error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $config_error)
+  exit(2)
+end
+
+fn contains_item($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn same_strings($left, $right)
+  if len($left) != len($right) then
+    return false
+  end
+  for each $item in $left
+    if not contains_item($right, $item) then
+      return false
+    end
+  end
+  return true
+end
+
+$ROSTER = $d.roster()
+$rest = []
+$skip_mode = true
+for each $arg in $argv
+  if $skip_mode then
+    $skip_mode = false
+  else
+    push($rest, $arg)
+  end
+end
+
+-- The old roll targeted mesh citizens by default. Foreign roster nodes remain
+-- available when explicitly named, but do not become implicit mesh targets.
+$parse_args = $rest
+if len($parse_args) == 0 then
+  $parse_args = $d.rollout_order($ROSTER)
+end
+$parsed = $d.parse_nodes($ROSTER, $parse_args, [])
+$selected = $parsed["nodes"]
+
+$seen_selected = []
+for each $node in $selected
+  if contains_item($seen_selected, $node) then
+    print("  ERROR: duplicate target node '" .. $node .. "'")
+    exit(2)
+  end
+  push($seen_selected, $node)
+end
+
+$SIGNED = $d.hub_root() .. "/_etc/mesh/inventory.signed"
+$AUTHORED = $d.hub_root() .. "/_etc/mesh/inventory.mix"
+$BASELINE = $d.hub_root() .. "/_etc/mesh/epoch.baseline.mix"
+$vi = $m.verified_inventory($SIGNED, {
+  mesh: $CONF["expected_mesh"],
+  against_authored: $AUTHORED,
+  baseline: $BASELINE
+})
+$mesh = $vi["inventory"]
+
+$active = []
+for each $member in $mesh["members"]
+  if $member["status"] == "active" then
+    push($active, $member["name"])
+  end
+end
+$d.die_if(not same_strings($ROSTER["mesh"], $active),
+  "fleet roster mesh nodes must exactly match the verified active inventory")
+
+$hubs = $d.mesh_hubs()
+$d.die_if(not same_strings($hubs, $mesh["hub"]),
+  "authored and verified inventories disagree on hub membership")
+
+-- Validate the complete canonical order before selecting from it. A private
+-- rollout must neither omit/repeat a mesh member nor put a spoke after a hub.
+$canonical = $d.rollout_order($ROSTER)
+$seen_rollout = []
+$in_hub_tail = false
+for each $node in $canonical
+  $d.die_if(not contains_item($ROSTER["mesh"], $node),
+    "rollout_order contains non-mesh node '" .. $node .. "'")
+  $d.die_if(contains_item($seen_rollout, $node),
+    "rollout_order repeats node '" .. $node .. "'")
+  if contains_item($hubs, $node) then
+    $in_hub_tail = true
+  else
+    $d.die_if($in_hub_tail,
+      "rollout_order is not hubs-last: spoke '" .. $node .. "' follows a hub")
+  end
+  push($seen_rollout, $node)
+end
+$d.die_if(not same_strings($seen_rollout, $ROSTER["mesh"]),
+  "rollout_order must contain every rostered mesh node exactly once")
+
+-- Foreign aliases sit before the hub tail. This keeps them valid without
+-- querying mesh_ip() for a host that is not an inventory member.
+$nodes = []
+for each $candidate in $canonical
+  if contains_item($selected, $candidate) and not contains_item($hubs, $candidate) then
+    push($nodes, $candidate)
+  end
+end
+for each $node in $selected
+  if $d.is_foreign($ROSTER, $node) then
+    push($nodes, $node)
+  end
+end
+for each $candidate in $canonical
+  if contains_item($selected, $candidate) and contains_item($hubs, $candidate) then
+    push($nodes, $candidate)
+  end
+end
+$d.die_if(len($nodes) != len($selected),
+  "one or more selected mesh nodes are absent from rollout_order")
+
+$REMOTE = {}
+for each $node in $nodes
+  if $d.is_foreign($ROSTER, $node) then
+    $REMOTE[$node] = $node
+  else
+    $REMOTE[$node] = "root@" .. $d.mesh_ip($node)
+  end
+end
+
+$CFG = "/etc/cosmix/node.conf.mix"
+$UNIT = "cosmix-noded"
+$INVOCATIONS = {}
+$reach_token = uuid()
+
+-- Read every target before taking the lock or changing the first one. A bad
+-- later target therefore cannot leave an otherwise avoidable partial roll.
+for each $node in $nodes
+  $remote = $REMOTE[$node]
+  $probe = ssh_mix($remote, '
+if not is_file($cfg) then
+  eprint("node config is absent: " .. $cfg)
+  exit(7)
+end
+$document = json_parse(read_file($cfg))
+if type($document) != "map" then
+  eprint("node config is not a map")
+  exit(8)
+end
+$noded = $document["noded"]
+if $noded != nil and type($noded) != "map" then
+  eprint("node config noded value is not a map")
+  exit(9)
+end
+$invocation = trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value"))
+if $rc != 0 then
+  eprint("could not inspect " .. $unit .. " invocation")
+  exit(10)
+end
+$posture = nil
+if $noded != nil then
+  $posture = $noded["admission"]
+end
+print(data_encode({token: $token, posture: $posture, invocation: $invocation}))
+', {bindings: {cfg: $CFG, unit: $UNIT, token: $reach_token},
+      decode: "data", connect_timeout: 8, timeout: 15})
+  $d.die_if(not $probe["ok"] or $probe["value"]["token"] != $reach_token,
+    $node .. " preflight failed: " .. trim($probe["stdout"]) .. " " .. trim($probe["stderr"]))
+  $INVOCATIONS[$node] = $probe["value"]["invocation"]
+  $was = $probe["value"]["posture"]
+  if $was == nil then
+    $was = "unset"
+  end
+  print("[preflight " .. $node .. "] admission=" .. ("" .. $was))
+end
+
+print("")
+print("mesh_admission — set admission=" .. $MODE .. " on: " .. join($nodes, " "))
+print("  verified epoch " .. ("" .. $vi["epoch"]) .. ", hubs last")
+
+-- Serialise the config replacement and daemon restart with other mesh writers.
+$_lock = $m.mesh_take_write_lock("mesh_admission")
+-- This roll uses the authenticated member set and canonical order to apply
+-- component state. Record only its epoch axis; recovery acceptance remains the
+-- responsibility of the inventory distributors, as mesh_lib requires.
+$m.mesh_baseline_ratchet_epoch($BASELINE, $vi)
+$roll_token = uuid()
+
+for each $node in $nodes
+  $remote = $REMOTE[$node]
+  $before_invocation = $INVOCATIONS[$node]
+  print("")
+  print("[" .. $node .. "] set admission=" .. $MODE .. " + restart " .. $UNIT)
+  $apply = ssh_mix($remote, '
+fn fail($message, $code)
+  eprint($message)
+  exit($code)
+end
+
+$current_invocation = trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value"))
+if $rc != 0 then
+  fail("could not recheck service invocation", 7)
+end
+if $current_invocation != $before_invocation then
+  fail("service invocation changed after preflight; refusing a concurrent restart", 8)
+end
+if not is_file($cfg) then
+  fail("node config disappeared after preflight", 9)
+end
+$document = json_parse(read_file($cfg))
+if type($document) != "map" then
+  fail("node config is not a map", 10)
+end
+$noded = $document["noded"]
+if $noded == nil then
+  $noded = {}
+end
+if type($noded) != "map" then
+  fail("node config noded value is not a map", 11)
+end
+$noded["admission"] = $mode
+$document["noded"] = $noded
+$bytes = json_encode($document)
+$temporary = $cfg .. ".admission-" .. $token .. ".new"
+write_file($temporary, $bytes)
+chown($temporary, 0, 0)
+chmod($temporary, 0o644)
+rename($temporary, $cfg)
+if read_file($cfg) != $bytes then
+  fail("atomic config replacement is not byte-identical to the approved bytes", 12)
+end
+$restart = run("/usr/bin/systemctl restart " .. $unit)
+if $rc != 0 then
+  fail("restart failed: " .. $restart, 13)
+end
+$after_invocation = trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value"))
+if $rc != 0 or $after_invocation == "" or $after_invocation == $before_invocation then
+  fail("service invocation did not change after restart", 14)
+end
+$active = trim(run("/usr/bin/systemctl is-active " .. $unit))
+if $rc != 0 or $active != "active" then
+  fail("service is not active after restart: " .. $active, 15)
+end
+$loaded = json_parse(read_file($cfg))
+if $loaded["noded"]["admission"] != $mode then
+  fail("on-disk admission posture does not match the request", 16)
+end
+print(data_encode({token: $token, posture: $loaded["noded"]["admission"],
+  active: $active, invocation: $after_invocation, bytes_blake3: hash_blake3(read_file($cfg))}))
+', {bindings: {cfg: $CFG, unit: $UNIT, mode: $MODE, token: $roll_token,
+      before_invocation: $before_invocation}, decode: "data",
+      connect_timeout: 8, timeout: 45})
+  $d.die_if(not $apply["ok"] or $apply["value"]["token"] != $roll_token,
+    $node .. " apply failed: " .. trim($apply["stdout"]) .. " " .. trim($apply["stderr"]))
+
+  -- A separate SSH execution is the trustworthy postcondition: it re-reads
+  -- the installed path and the service manager after the mutator has exited.
+  $verify = ssh_mix($remote, '
+$document = json_parse(read_file($cfg))
+$posture = $document["noded"]["admission"]
+$active = trim(run("/usr/bin/systemctl is-active " .. $unit))
+if $rc != 0 then
+  exit(7)
+end
+$invocation = trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value"))
+if $rc != 0 then
+  exit(8)
+end
+print(data_encode({posture: $posture, active: $active, invocation: $invocation,
+  bytes_blake3: hash_blake3(read_file($cfg))}))
+', {bindings: {cfg: $CFG, unit: $UNIT}, decode: "data",
+      connect_timeout: 8, timeout: 15})
+  $d.die_if(not $verify["ok"],
+    $node .. " post-install verification failed: " .. trim($verify["stdout"]) .. " " .. trim($verify["stderr"]))
+  $d.die_if($verify["value"]["posture"] != $MODE,
+    $node .. " on-disk admission posture is " .. ("" .. $verify["value"]["posture"]) ..
+    ", expected " .. $MODE)
+  $d.die_if($verify["value"]["active"] != "active",
+    $node .. " " .. $UNIT .. " is not active after restart")
+  $d.die_if($verify["value"]["invocation"] != $apply["value"]["invocation"],
+    $node .. " service invocation changed during post-install verification")
+  $d.die_if($verify["value"]["bytes_blake3"] != $apply["value"]["bytes_blake3"],
+    $node .. " node config changed during post-install verification")
+  print("[" .. $node .. "] OK — admission=" .. $MODE .. ", " .. $UNIT .. " active")
+end
+
+print("")
+print("admission roll complete: " .. join($nodes, " ") .. " -> " .. $MODE)

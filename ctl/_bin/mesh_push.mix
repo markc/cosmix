@@ -1,0 +1,302 @@
+#!/usr/bin/env mix
+-- mesh_push.mix — select, verify, and install a signed inventory locally.
+--
+-- The order is load-bearing: select or sign -> verify -> push -> restart ->
+-- confirm. Installing first would make the daemon the first verifier, after
+-- unverified bytes had already crossed the trust boundary.
+--
+-- The genesis anchor is create-only. An absent anchor may be provisioned, an
+-- equal anchor is left alone, and a different anchor is refused. Trust-root
+-- rotation is a separate ceremony from publishing an inventory.
+--
+-- This script targets the local node only. Fleet distribution is a separate,
+-- deliberate operation.
+--
+--   mix _bin/mesh_push.mix
+--   mix _bin/mesh_push.mix --dry-run
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+$SIGN = $d.cosmix_bin("cosmix-mesh-sign")
+$INV = $d.hub_root() .. "/_etc/mesh/inventory.mix"
+$SIGNED = $d.hub_root() .. "/_etc/mesh/inventory.signed"
+$PROPOSAL = $d.hub_root() .. "/_etc/mesh/inventory.proposal.signed"
+$ANCHOR = "/etc/cosmix/noded/genesis.pub"
+
+$dry = false
+for each $arg in args()
+  if $arg == "--dry-run" then
+    $dry = true
+  else
+    print("  ERROR: unknown argument '" .. ("" .. $arg) .. "' (usage: mesh_push.mix [--dry-run])")
+    exit(2)
+  end
+end
+
+if not $dry then
+  $_lock = $m.mesh_take_write_lock("mesh_push")
+end
+
+-- A pending fleet proposal is resumable state. Re-signing the same authored
+-- epoch here could let the local node pin different canonical bytes at the
+-- same freshness pair and strand the fleet proposal. A real push refuses; a
+-- dry run reports the refusal and continues the rehearsal.
+$proposal_present = exists($PROPOSAL, {follow_symlinks: false})
+if $proposal_present then
+  if $dry then
+    print("[proposal] a real run would REFUSE until " .. $PROPOSAL ..
+      " is resumed or explicitly discarded by the fleet distributor")
+  else
+    $d.die_if(true, "signed fleet proposal exists at " .. $PROPOSAL ..
+      " — resume or explicitly discard it with the fleet distributor; local push must not fork its bytes")
+  end
+end
+
+-- Read the locked control floor once. A normal payload carries exactly this
+-- recovery generation; it may not infer or advance it.
+$floor = $m.mesh_baseline_read($m.MESH_BASELINE)
+
+print("mesh_push — signed inventory operator push (local node)")
+if $dry then
+  print("  DRY-RUN — the canonical cache and daemon are not touched")
+end
+print("")
+
+-- Select bytes into a private temp path for both real and dry runs. Reusing
+-- canonical bytes avoids minting a different canonical hash at an accepted
+-- freshness pair. A private path also ensures that the bytes installed later
+-- are the exact bytes verified here, even if a shared path changes meanwhile.
+$mk = run_argv(["mktemp", "-d"])
+$d.die_if($mk["exit_code"] != 0, "mktemp -d failed: " .. trim($mk["stderr"]))
+$work = trim($mk["stdout"])
+$d.die_if(is_empty($work), "mktemp -d produced no path")
+
+-- Hash before and after the copy so a concurrent authored-inventory change
+-- cannot produce a snapshot different from the one this run selected.
+$authored_sha = hash_sha256(read_file($INV))
+$authored_snapshot = $work .. "/inventory.mix"
+$copy = run_argv(["cp", $INV, $authored_snapshot])
+$d.die_if($copy["exit_code"] != 0,
+  "could not snapshot " .. $INV .. ": " .. trim($copy["stderr"]))
+$d.die_if(hash_sha256(read_file($authored_snapshot)) != $authored_sha,
+  "authored inventory changed while it was being snapshotted; retry the push")
+
+$out = $work .. "/inventory.signed"
+$mesh = load_data($authored_snapshot)["inventory"]
+$m.validate_inventory($mesh)
+$endpoint_findings = $m.signed_endpoint_preflight($mesh)
+$d.die_if(len($endpoint_findings) > 0,
+  "signed endpoint preflight failed: " .. join($endpoint_findings, "; "))
+
+$reuse = false
+$proposal_stored = false
+$rehearsing_proposal = false
+if $dry and $proposal_present and is_file($PROPOSAL) then
+  $rehearsing_proposal = true
+  $proposal_bytes = read_file($PROPOSAL)
+  write_file($out, $proposal_bytes)
+  $d.die_if(read_file($out) != $proposal_bytes,
+    "proposal rehearsal snapshot does not read back byte-identically")
+  print("  selected : pending fleet proposal (report-only; a real local push refuses it)")
+else
+  if is_file($SIGNED) then
+    $drift = $m.authored_drift($SIGNED, $authored_snapshot, $m.MESH_EXPECTED)
+    $reuse = $drift["in_sync"]
+  end
+  if $reuse then
+    $rolled_bytes = read_file($SIGNED)
+    write_file($out, $rolled_bytes)
+    $d.die_if(read_file($out) != $rolled_bytes,
+      "canonical snapshot does not read back byte-identically")
+    print("  selected : rolled-out canonical bytes")
+  else
+    $authored_epoch = $mesh["epoch"]
+    $d.die_if($authored_epoch <= $floor["epoch"],
+      "authored inventory epoch " .. ("" .. $authored_epoch) ..
+      " does not advance the rolled-out floor epoch " .. ("" .. $floor["epoch"]) ..
+      "; refusing to mint new bytes at an accepted freshness pair — bump the authored epoch or resume fleet distribution; if this checkout is stale, update it — do not re-sign")
+    -- Recovery distribution has a separate ceremony and resume contract.
+    $sign = run_argv([$SIGN, "sign", $authored_snapshot, "-o", $out,
+      "--recovery-generation", "" .. $floor["recovery_generation"]])
+    $d.die_if($sign["exit_code"] != 0,
+      "sign failed (exit " .. ("" .. $sign["exit_code"]) .. "): " .. trim($sign["stderr"]))
+    print("  signed   : " .. $out)
+  end
+end
+
+-- Obtain the public key only. The anchor is never replaced as a side effect.
+$pk = run_argv([$SIGN, "pubkey"])
+$d.die_if($pk["exit_code"] != 0,
+  "cosmix-mesh-sign pubkey failed: " .. trim($pk["stderr"]))
+$pub = trim($pk["stdout"])
+$d.die_if(is_empty($pub),
+  "cosmix-mesh-sign pubkey returned empty — refusing to install a blank anchor")
+
+if not $dry then
+  $mkdirs = run_argv(["sudo", "-n", "install", "-d", "-m", "0755",
+    "/etc/cosmix/noded", "/var/lib/cosmix/noded"])
+  $d.die_if($mkdirs["exit_code"] != 0,
+    "mkdir noded dirs: " .. trim($mkdirs["stderr"]))
+end
+
+-- Read through the same privilege used for installation. A failed stat must
+-- not be mistaken for absence and thereby authorise an anchor overwrite.
+$anchor_read = $m.anchor_read_local($ANCHOR)
+$d.die_if(not $anchor_read["ok"],
+  "reading the local trust anchor: " .. $anchor_read["value"])
+$current_anchor = $anchor_read["value"]
+
+-- For first provisioning, a dry run verifies against a private copy of the
+-- key that would be installed so the rehearsal exercises the real path.
+$verify_anchor = $ANCHOR
+if $dry then
+  if $current_anchor == "__ABSENT__" then
+    print("  genesis  : " .. $pub .. "  (would INSTALL — anchor absent)")
+    $verify_anchor = dirname($out) .. "/genesis.pub.rehearsal"
+    write_file($verify_anchor, $pub .. "\n")
+  else
+    if $current_anchor == $pub then
+      print("  genesis  : " .. $pub .. "  (would be left UNCHANGED — create-only)")
+    else
+      print("  genesis  : would REFUSE — installed anchor is not the signer")
+      exit(1)
+    end
+  end
+else
+  if $current_anchor == "__ABSENT__" then
+    -- The create-only helper uses a hard-link race gate, so a concurrent first
+    -- provisioning cannot silently replace the trust root.
+    $anchor_install = $m.anchor_install_local($ANCHOR, $pub)
+    $d.die_if(not $anchor_install["ok"],
+      "installing genesis anchor: " .. $anchor_install["value"])
+    print("  genesis  : " .. $pub .. "  (INSTALLED — first provisioning)")
+  else
+    if $current_anchor != $pub then
+      print("  ERROR: the local trust anchor is NOT this signing key.")
+      print("    anchor : " .. $current_anchor)
+      print("    signer : " .. $pub)
+      print("    Refusing: replacing a trust root is a deliberate ceremony, not a")
+      print("    side effect of an operator push.")
+      exit(1)
+    end
+    print("  genesis  : " .. $pub .. "  (unchanged — create-only)")
+  end
+end
+
+-- Verify before pushing. Fresh and reused bytes must authenticate under the
+-- selected anchor and, except for a pending-proposal rehearsal, match the
+-- authored snapshot byte-for-content through its authoring hash.
+$verify_opts = {mesh: $m.MESH_EXPECTED, genesis_pub: $verify_anchor}
+if not $rehearsing_proposal then
+  $verify_opts["against_authored"] = $authored_snapshot
+end
+$vi = $m.verified_inventory($out, $verify_opts)
+if $dry then
+  if $rehearsing_proposal then
+    $proposal_drift = $m.authored_drift($out, $authored_snapshot, $m.MESH_EXPECTED)
+    if not $proposal_drift["in_sync"] then
+      print("[proposal] the pending proposal no longer matches the authored inventory; " ..
+        "resume or discard it with the fleet distributor")
+    end
+  end
+  $generation_findings = $m.distributor_generation_findings($vi, $floor)
+  for each $finding in $generation_findings
+    print("[generation] a real run would REFUSE: " .. $finding)
+  end
+else
+  $m.assert_distributor_generation($vi, $floor)
+  if not $reuse then
+    $m.store_signed_proposal($out, $PROPOSAL)
+    $proposal_stored = true
+    print("  proposal : durably retained at " .. $PROPOSAL .. " before local acceptance")
+  end
+end
+print("  verified : epoch " .. ("" .. $vi["epoch"]) ..
+  ", authoring " .. $vi["authoring_blake3"])
+
+if $dry then
+  $cleanup = run_argv(["rm", "-rf", dirname($out)])
+  if $cleanup["exit_code"] != 0 then
+    print("  note: could not remove the rehearsal temp dir " .. dirname($out))
+  end
+  print("")
+  print("dry-run complete: would push epoch " .. ("" .. $vi["epoch"]) ..
+    " to /var/lib/cosmix/noded/inventory.signed and restart cosmix-noded")
+  exit(0)
+end
+
+-- Atomically install the verified bytes into the plane-A cache.
+$m.install_atomic($out, "/var/lib/cosmix/noded/inventory.signed",
+  "root", "root", "0644")
+print("  pushed   : /var/lib/cosmix/noded/inventory.signed")
+
+$restart = run_argv(["sudo", "-n", "systemctl", "restart", "cosmix-noded"])
+$d.die_if($restart["exit_code"] != 0,
+  "restart cosmix-noded: " .. trim($restart["stderr"]))
+print("  reloaded : cosmix-noded restarted")
+
+-- Confirm the daemon accepted this exact payload. Each attempt reconnects
+-- because a failed Bus probe is latched until explicitly reset, and each send
+-- has a deadline so a connected but silent broker cannot hang after mutation.
+$attempt = 0
+$rc = -1
+while $attempt < 5 and $rc != 0
+  $sleep = run_argv(["sleep", "2"])
+  $d.die_if($sleep["exit_code"] != 0,
+    "sleep failed: " .. trim($sleep["stderr"]))
+  bus_reconnect()
+  send noded noded.inventory timeout=15
+  $attempt = $attempt + 1
+end
+$d.die_if($rc != 0,
+  "cosmix-noded did not answer noded.inventory after " .. ("" .. $attempt) ..
+  " attempts (last rc " .. ("" .. $rc) .. ") — the cache was pushed and the daemon restarted, but nothing here confirms it accepted the new trust root. Check: systemctl status cosmix-noded")
+$d.die_if(type($result) != "map",
+  "noded.inventory answered rc 0 but not with a map — cannot confirm acceptance")
+
+if $result.posture != "verified" then
+  print("  verify   : posture=" .. $result.posture .. " reason=" .. $result.reason)
+  exit(1)
+end
+if ("" .. $result.epoch) != ("" .. $vi["epoch"]) then
+  print("  ERROR: noded reports epoch " .. ("" .. $result.epoch) ..
+    " but this push selected epoch " .. ("" .. $vi["epoch"]) .. ".")
+  print("    It is running a DIFFERENT inventory than the one just pushed.")
+  exit(1)
+end
+if $result.hash != $vi["canonical_blake3"] then
+  print("  ERROR: noded accepted a payload this push did not produce.")
+  print("    noded  : " .. $result.hash)
+  print("    pushed : " .. $vi["canonical_blake3"])
+  exit(1)
+end
+print("  verify   : ACCEPTED — posture=verified epoch=" .. ("" .. $result.epoch) ..
+  " members=" .. ("" .. len($result.members)) ..
+  " hash=" .. substr($result.hash, 0, 12) .. "...")
+
+-- Raise the floor before publishing. An interruption then leaves a loud stale
+-- cache refusal, rather than a newly published cache silently passing an old
+-- floor. Publish from the exact private bytes the daemon accepted.
+$m.mesh_baseline_raise($m.MESH_BASELINE, $vi)
+$publish_bytes = nil
+try
+  $publish_bytes = read_file($out)
+catch $publish_error
+  $d.die_if(true, "publish inventory.signed: could not read the verified artifact " ..
+    $out .. ": " .. $publish_error)
+end
+$m.write_leaf($SIGNED, $publish_bytes)
+print("  published: " .. $SIGNED)
+
+if $proposal_stored then
+  $d.die_if(read_file($PROPOSAL) != read_file($SIGNED),
+    "published canonical cache differs from the retained local-push proposal; refusing to remove either")
+  $m.remove_published_proposal($PROPOSAL)
+  print("  proposal : published byte-identically and removed")
+end
+
+$cleanup_final = run_argv(["rm", "-rf", $work])
+if $cleanup_final["exit_code"] != 0 then
+  print("  note: could not remove the temp dir " .. $work)
+end

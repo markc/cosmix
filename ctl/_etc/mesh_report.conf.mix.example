@@ -1,0 +1,7 @@
+-- mesh_report.conf.mix.example — private settings for mesh_report.mix.
+-- Copy to mesh_report.conf.mix in your private control hub and edit it there.
+-- The public starter deliberately does not ship an active configuration.
+mesh_report: {
+  schema_version: 1,
+  expected_mesh: "example.org"
+}

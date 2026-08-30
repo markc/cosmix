@@ -1,0 +1,8 @@
+-- mesh_reconcile.conf.mix.example — private settings for mesh_reconcile.mix.
+-- Copy to mesh_reconcile.conf.mix in your private control hub and edit it.
+-- The public starter deliberately does not ship an active configuration.
+mesh_reconcile: {
+  schema_version: 1,
+  expected_mesh: "example.org",
+  wg_interface: "wg-example"
+}

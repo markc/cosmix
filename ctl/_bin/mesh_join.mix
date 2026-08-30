@@ -1,0 +1,403 @@
+#!/usr/bin/env mix
+-- mesh_join.mix — author one node into a mesh inventory and create a signed
+-- proposal for a later deliberate rollout.
+--
+--   mix _bin/mesh_join.mix <node> <wg-pubkey> <inventory.mix> \
+--     [--secrets-db DB] [--no-sign] [--no-gen]
+--
+-- The inventory argument is mandatory: a bare run cannot mutate the canonical
+-- trust root. The node supplies its own WireGuard public key; this script never
+-- handles its private WireGuard key. It allocates an address, mints the node's
+-- d2 admission key, rewrites and validates the authored inventory, and signs a
+-- proposal. Distribution and shared artefact generation remain separate steps.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/mesh_join.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no mesh_join configuration at " .. $CONF_PATH)
+  print("         copy _etc/mesh_join.conf.mix.example there and set the private values")
+  exit(2)
+end
+$CONF = load_data($CONF_PATH)
+if type($CONF) != "map" or type($CONF["mesh_join"]) != "map" then
+  print("  ERROR: " .. $CONF_PATH .. " must contain a mesh_join map")
+  exit(2)
+end
+$JOIN_CONF = $CONF["mesh_join"]
+if $JOIN_CONF["schema_version"] != 1 then
+  print("  ERROR: " .. $CONF_PATH .. " needs mesh_join.schema_version: 1")
+  exit(2)
+end
+if type($JOIN_CONF["default_secrets_db"]) != "string" or trim($JOIN_CONF["default_secrets_db"]) == "" or not starts_with($JOIN_CONF["default_secrets_db"], "/") then
+  print("  ERROR: " .. $CONF_PATH .. " needs an absolute mesh_join.default_secrets_db")
+  exit(2)
+end
+if type($JOIN_CONF["expected_mesh"]) != "string" or trim($JOIN_CONF["expected_mesh"]) == "" then
+  print("  ERROR: " .. $CONF_PATH .. " needs a non-empty mesh_join.expected_mesh")
+  exit(2)
+end
+
+-- mesh_lib owns inventory validation and verification, address allocation,
+-- production bootstrap checks, the freshness witness and the mesh write lock.
+$m = require("../_lib/mesh_lib.mix")
+
+$HUB = $d.hub_root()
+$MS = $d.cosmix_bin("cosmix-mesh-sign")
+$DEFAULT_DB = $JOIN_CONF["default_secrets_db"]
+$EXPECTED_MESH = $JOIN_CONF["expected_mesh"]
+$CANON_INV = $HUB .. "/_etc/mesh/inventory.mix"
+$PROD_SIGNED = $HUB .. "/_etc/mesh/inventory.signed"
+$BASELINE = $HUB .. "/_etc/mesh/epoch.baseline.mix"
+
+-- node, WG public key and inventory are positional and required.
+$node = ""
+$wgpub = ""
+$INVENTORY = ""
+$DB = $DEFAULT_DB
+$do_sign = true
+$do_gen = true
+$prod_ok = false
+$pos = []
+$i = 0
+$argv = args()
+while $i < len($argv)
+  $arg = $argv[$i]
+  if $arg == "--secrets-db" then
+    if $i + 1 >= len($argv) then
+      print("  ERROR: --secrets-db needs a path")
+      exit(2)
+    end
+    $i = $i + 1
+    $DB = $argv[$i]
+  else
+    if $arg == "--no-sign" then
+      $do_sign = false
+    else
+      if $arg == "--no-gen" then
+        $do_gen = false
+      else
+        if $arg == "--i-know-this-is-production" then
+          $prod_ok = true
+        else
+          push($pos, $arg)
+        end
+      end
+    end
+  end
+  $i = $i + 1
+end
+if len($pos) != 3 then
+  print("  ERROR: usage: mix mesh_join.mix <node> <wg-pubkey> <inventory.mix> [--secrets-db DB] [--no-sign] [--no-gen]")
+  exit(2)
+end
+$node = $pos[0]
+$wgpub = $pos[1]
+$INVENTORY = $pos[2]
+
+-- An unsigned inventory is rejected by every node, so deriving configs from it
+-- is pointless. Keep --no-gen accepted, although generation is always deferred.
+if not $do_sign then
+  $do_gen = false
+end
+
+$d.die_if(not is_file($INVENTORY), "inventory not found: " .. $INVENTORY)
+
+-- Resolve an absent leaf through its parent. This is used only after every
+-- ancestor has been proven searchable, so an access denial cannot masquerade
+-- as an absent lab database.
+fn db_path_key($path)
+  $dir = realpath(dirname($path))
+  if $dir == nil then
+    return $path
+  end
+  return $dir .. "/" .. basename($path)
+end
+
+fn ancestors_searchable($path)
+  $dir = realpath(dirname($path)) or dirname($path)
+  $walk = ""
+  for each $segment in split($dir, "/")
+    if is_empty($segment) then
+      $walk = "/"
+    else
+      if $walk == "/" then
+        $walk = "/" .. $segment
+      else
+        $walk = $walk .. "/" .. $segment
+      end
+    end
+    if not access($walk, "x") then
+      return false
+    end
+  end
+  return true
+end
+
+fn absence_is_provable($path)
+  if exists($path, {follow_symlinks: false}) then
+    return false
+  end
+  return ancestors_searchable($path)
+end
+
+-- Classify the inventory by inode, not spelling. A canonical hardlink alias is
+-- refused because the atomic rename would detach that alias from the live file.
+$inv_is_canon = false
+if is_file($CANON_INV) then
+  $inv_stat = stat($INVENTORY)
+  $canon_stat = stat($CANON_INV)
+  $inv_is_canon = $inv_stat["ino"] == $canon_stat["ino"] and $inv_stat["dev"] == $canon_stat["dev"]
+end
+if $inv_is_canon then
+  $inv_path = realpath(dirname($INVENTORY)) .. "/" .. basename($INVENTORY)
+  $canon_path = realpath(dirname($CANON_INV)) .. "/" .. basename($CANON_INV)
+  $d.die_if($inv_path != $canon_path,
+    "this is the production inventory reached through an alias; the atomic rewrite would detach the alias from the production file; run mesh_join against the canonical path directly")
+end
+
+-- Classify an existing secrets DB by inode. If either candidate appears absent,
+-- require provable absence before falling back to canonical parent+leaf paths.
+$db_is_canon = false
+if is_file($DB) and is_file($DEFAULT_DB) then
+  $db_stat = stat($DB)
+  $default_stat = stat($DEFAULT_DB)
+  $db_is_canon = $db_stat["ino"] == $default_stat["ino"] and $db_stat["dev"] == $default_stat["dev"]
+else
+  for each $probe in [$DB, $DEFAULT_DB]
+    if not is_file($probe) and not absence_is_provable($probe) then
+      print("  ERROR: cannot classify this run as production or lab")
+      print("         " .. $probe .. " is neither a readable regular file nor provably absent")
+      print("         Fix its path permissions and re-run; this gate will not guess")
+      exit(1)
+    end
+  end
+  $db_is_canon = db_path_key($DB) == db_path_key($DEFAULT_DB)
+end
+
+-- Pin the paths selected by classification. Reasserting inode identity before
+-- every mutation narrows canonicalise-then-use races without claiming to make
+-- path lookup atomic.
+$resolved_inventory = realpath($INVENTORY)
+$d.die_if($resolved_inventory == nil, "cannot resolve the inventory path: " .. $INVENTORY)
+$INVENTORY = $resolved_inventory
+$INV_ID = stat($INVENTORY)
+
+$DB_ID = nil
+if is_file($DB) then
+  $resolved_db = realpath($DB)
+  $d.die_if($resolved_db == nil, "cannot resolve the secrets db path: " .. $DB)
+  $DB = $resolved_db
+  $DB_ID = stat($DB)
+end
+
+fn assert_db_pin()
+  if type($DB_ID) == "map" then
+    $m.assert_same_file($DB, $DB_ID, "secrets db")
+    return true
+  end
+  if $db_is_canon then
+    return true
+  end
+  if is_file($DB) and is_file($DEFAULT_DB) then
+    $current = stat($DB)
+    $canonical = stat($DEFAULT_DB)
+    $d.die_if($current["ino"] == $canonical["ino"] and
+      $current["dev"] == $canonical["dev"],
+      "the production secrets DB has appeared at " .. $DB .. " since this run classified it as absent; refusing to mint into a DB the production gate never saw")
+  end
+  return true
+end
+
+fn mint_pin_db()
+  if type($DB_ID) == "map" then
+    return true
+  end
+  $d.die_if(not is_file($DB), "d2-gen reported success but no secrets DB exists at " .. $DB)
+  $DB_ID = stat($DB)
+  return true
+end
+
+-- Canonical authoring needs an explicit opt-in, and production/lab inventory
+-- and DB identities must agree before the first mutation.
+$d.die_if($inv_is_canon and not $prod_ok,
+  "refusing to mutate the production inventory (" .. $INVENTORY .. " is the live " .. $CANON_INV .. ") without --i-know-this-is-production")
+if $inv_is_canon != $db_is_canon then
+  $inventory_world = "lab"
+  if $inv_is_canon then
+    $inventory_world = "production"
+  end
+  $db_world = "lab"
+  if $db_is_canon then
+    $db_world = "production"
+  end
+  print("  inventory  : " .. $INVENTORY .. " (" .. $inventory_world .. ")")
+  print("  secrets db : " .. $DB .. " (" .. $db_world .. ")")
+  $d.die_if(true,
+    "refusing a mixed production/lab pair; use the canonical inventory with the canonical DB, or a lab copy with a lab DB")
+end
+
+-- The canonical trust root is shared mutable state. The mesh library's lock is
+-- held until process exit, spanning the key mint, authoring and proposal sign.
+if $inv_is_canon then
+  $m.mesh_take_write_lock("mesh_join")
+end
+
+-- Never overwrite an unfinished proposal. Lab proposals stay beside their lab
+-- inventory; canonical authoring has one fixed proposal name.
+$PROPOSAL = $INVENTORY .. ".proposal.signed"
+if len($INVENTORY) >= 4 and substr($INVENTORY, len($INVENTORY) - 4, 4) == ".mix" then
+  $PROPOSAL = substr($INVENTORY, 0, len($INVENTORY) - 4) .. ".proposal.signed"
+end
+if $inv_is_canon then
+  $PROPOSAL = $HUB .. "/_etc/mesh/inventory.proposal.signed"
+end
+$d.die_if(exists($PROPOSAL, {follow_symlinks: false}),
+  "signed proposal already exists at " .. $PROPOSAL .. "; resume it with mesh_sync or discard it there by full canonical_blake3 before authoring another join")
+
+-- A lab inventory is a separate world. A signed canonical proposal inherits
+-- the current recovery generation from the shared freshness witness.
+$floor = {recovery_generation: 0}
+if $do_sign and $inv_is_canon then
+  $floor = $m.mesh_baseline_read($BASELINE)
+end
+
+$d.die_if(not $m.is_valid_b64key($wgpub),
+  "wg-pubkey is not a 44-char base64 key: '" .. $wgpub .. "'")
+$d.die_if(not $m.is_valid_label($node),
+  "invalid node name '" .. $node .. "' (SPEC 01 label grammar)")
+
+$inv = load_data($INVENTORY)["inventory"]
+$m.validate_inventory($inv)
+$mesh = "" .. $inv["mesh"]
+
+-- Refuse duplicate names and WireGuard keys before minting anything.
+for each $member in $inv["members"]
+  $d.die_if($member["name"] == $node,
+    "node '" .. $node .. "' is already a member of mesh '" .. $mesh .. "'")
+  for each $credential in $member["credentials"]
+    $d.die_if($credential["kind"] == "wg" and $credential["pubkey"] == $wgpub,
+      "wg pubkey already used by member '" .. $member["name"] .. "'; not re-joining")
+  end
+end
+
+-- Allocate across both authored and last rolled-out coverage so an address held
+-- only by the currently accepted inventory cannot be re-issued.
+$rolled_out = $inv
+if $inv_is_canon then
+  if is_file($PROD_SIGNED) then
+    $rolled_vi = $m.verified_inventory($PROD_SIGNED, {mesh: $EXPECTED_MESH})
+    $rolled_out = $rolled_vi["inventory"]
+  else
+    $m.assert_canonical_absence_is_bootstrap()
+    print("note: canonical inventory.signed is absent; bootstrap allocation uses authored coverage only")
+  end
+end
+$ip = $m.next_free_ip_union($inv, $rolled_out)
+$new_epoch = $inv["epoch"] + 1
+print("[join] node=" .. $node .. " mesh=" .. $mesh .. " wg_ip=" .. $ip ..
+  " epoch " .. ("" .. $inv["epoch"]) .. "->" .. ("" .. $new_epoch))
+
+-- Reassert both pins immediately before d2-gen, the first mutation. The signer
+-- is invoked as argv throughout; no shell command is constructed.
+$m.assert_same_file($INVENTORY, $INV_ID, "inventory")
+assert_db_pin()
+$ms_args = [$MS, "--secrets-db", $DB, "--mesh", $mesh]
+$generated = run_argv(concat($ms_args, ["d2-gen", $node]), {timeout: 60})
+$d.die_if($generated["exit_code"] != 0,
+  "d2-gen failed: " .. trim($generated["stderr"]))
+mint_pin_db()
+$published = run_argv(concat($ms_args, ["d2-pubkey", $node]), {timeout: 60})
+$d.die_if($published["exit_code"] != 0,
+  "d2-pubkey failed: " .. trim($published["stderr"]))
+$d2pub = trim($published["stdout"])
+$d.die_if(not $m.is_valid_b64key($d2pub),
+  "minted d2 pubkey is not a 44-char base64 key: '" .. $d2pub .. "'")
+print("[join] d2 minted: " .. $d2pub)
+
+-- Insert the member first and bump only indented inventory keys, preserving the
+-- hand-authored comments and formatting around the strict-data map.
+$member_text = "    {\n      name: \"" .. $node .. "\",\n      mesh_ip: \"" .. $ip .. "\",\n      bus: true,\n      status: \"active\",\n      credentials: [\n        { kind: \"wg\", pubkey: \"" .. $wgpub .. "\", from_epoch: " .. ("" .. $new_epoch) .. ", until_epoch: nil },\n        { kind: \"d2\", pubkey: \"" .. $d2pub .. "\", from_epoch: " .. ("" .. $new_epoch) .. ", until_epoch: nil }\n      ],\n      last_touched_epoch: " .. ("" .. $new_epoch) .. "\n    },"
+
+$source = read_file($INVENTORY)
+$output = []
+$inserted_member = false
+$updated_epoch = false
+for each $line in split($source, "\n")
+  $indented = substr($line, 0, 1) == " "
+  if not $updated_epoch and $indented and pos("epoch:", trim($line)) == 1 then
+    push($output, "  epoch: " .. ("" .. $new_epoch) .. ",")
+    $updated_epoch = true
+  else
+    push($output, $line)
+    if not $inserted_member and $indented and pos("members:", trim($line)) == 1 then
+      push($output, $member_text)
+      $inserted_member = true
+    end
+  end
+end
+$d.die_if(not $updated_epoch,
+  "could not find an indented `epoch:` line to bump in " .. $INVENTORY)
+$d.die_if(not $inserted_member,
+  "could not find an indented `members:` array to insert into in " .. $INVENTORY)
+
+-- Stage exclusively in a sibling, validate those exact bytes, then atomically
+-- rename. Carry the staged inode across the rename so a substituted file is
+-- never blessed or signed.
+$m.assert_same_file($INVENTORY, $INV_ID, "inventory")
+$tmp = $INVENTORY .. ".join-tmp." .. ("" .. pid())
+try
+  remove($tmp)
+catch $clear_error
+  $d.die_if(true, "could not clear the staging name " .. $tmp .. ": " .. $clear_error)
+end
+try
+  write_new($tmp, join($output, "\n"), "0644")
+catch $write_error
+  $d.die_if(true, "could not stage the rewritten inventory at " .. $tmp .. ": " .. $write_error)
+end
+$staged_inventory = load_data($tmp)["inventory"]
+$m.validate_inventory($staged_inventory)
+$STAGED_ID = stat($tmp)
+try
+  rename($tmp, $INVENTORY)
+catch $rename_error
+  remove($tmp)
+  $d.die_if(true, "could not place the rewritten inventory at " .. $INVENTORY .. ": " .. $rename_error)
+end
+$INV_ID = stat($INVENTORY)
+$d.die_if($INV_ID["ino"] != $STAGED_ID["ino"] or $INV_ID["dev"] != $STAGED_ID["dev"],
+  "the inventory at " .. $INVENTORY .. " is not the file this run staged and validated; refusing to sign it")
+print("[join] authored member into " .. $INVENTORY ..
+  " (epoch " .. ("" .. $new_epoch) .. "), re-validated OK")
+
+-- Signing authorises bytes, so inventory and DB identities are checked again.
+-- The accepted canonical inventory remains untouched until mesh_sync rolls out.
+if $do_sign then
+  $m.assert_same_file($INVENTORY, $INV_ID, "inventory")
+  assert_db_pin()
+  $signed = run_argv(concat($ms_args,
+    ["sign", $INVENTORY, "-o", $PROPOSAL,
+     "--recovery-generation", "" .. $floor["recovery_generation"]]), {timeout: 60})
+  $d.die_if($signed["exit_code"] != 0,
+    "sign failed: " .. trim($signed["stderr"]))
+  print("[join] signed proposal -> " .. $PROPOSAL)
+else
+  print("[join] --no-sign: inventory left unsigned (fail-closed until signed)")
+end
+
+if $do_gen then
+  print("[join] shared generation deferred; mesh_sync owns rollout and canonical publication")
+else
+  print("[join] --no-gen: shared generation is deferred")
+end
+
+print("")
+print("=== JOIN AUTHORED: " .. $node .. " (" .. $ip .. ") in mesh '" .. $mesh ..
+  "' epoch " .. ("" .. $new_epoch) .. " ===")
+print("NEXT (deliberate rollout/deploy steps; not run here):")
+print("  1. distribute the signed inventory, trust anchor and d2 seed with mesh_sync.mix")
+print("  2. seal shared artefacts with mesh_gen.mix seal after rollout")
+print("  3. deploy the sealed WireGuard and DNS state")
+print("  4. provision the joining node with its signed inventory, trust material and WG state")
+print("  the node's d2 seed is in " .. $DB .. " under vnode='" .. $node .. "'")

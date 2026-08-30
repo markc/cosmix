@@ -1,0 +1,91 @@
+#!/usr/bin/env mix
+-- mesh_zones_check.mix — assert that the committed zones.mix is current.
+--
+-- The generated DNS zones are a committed artifact derived from the verified
+-- signed inventory plus the private overlay and header. This gate regenerates
+-- the artifact through mesh_lib and requires byte identity, so an unsigned
+-- inventory edit, a stale generation, or a hand edit cannot pass.
+--
+--   mix _bin/mesh_zones_check.mix
+
+$d = require("../_lib/deploy_lib.mix")
+
+if len(args()) != 0 then
+  print("usage: mix _bin/mesh_zones_check.mix")
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/mesh_zones_check.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no mesh_zones_check configuration at " .. $CONF_PATH)
+  print("         copy _etc/mesh_zones_check.conf.mix.example there and set expected_mesh")
+  exit(2)
+end
+
+$loaded = nil
+try
+  $loaded = load_data($CONF_PATH)
+catch $msg
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $msg)
+  exit(2)
+end
+if type($loaded) != "map" or type($loaded["mesh_zones_check"]) != "map" then
+  print("  ERROR: " .. $CONF_PATH .. " must contain a mesh_zones_check map")
+  exit(2)
+end
+$CONF = $loaded["mesh_zones_check"]
+if $CONF["schema_version"] != 1 then
+  print("  ERROR: " .. $CONF_PATH .. " needs mesh_zones_check.schema_version: 1")
+  exit(2)
+end
+$EXPECTED_MESH = $CONF["expected_mesh"]
+if type($EXPECTED_MESH) != "string" or trim($EXPECTED_MESH) == "" then
+  print("  ERROR: " .. $CONF_PATH .. " needs a non-empty mesh_zones_check.expected_mesh")
+  exit(2)
+end
+
+$m = require("../_lib/mesh_lib.mix")
+
+$HUB = $d.hub_root()
+$SIGNED = $HUB .. "/_etc/mesh/inventory.signed"
+$AUTHORED = $HUB .. "/_etc/mesh/inventory.mix"
+$OVERLAY = $HUB .. "/_etc/cosmix/dnsd/zones.overlay.mix"
+$HEADER = $HUB .. "/_etc/cosmix/dnsd/zones.header"
+$COMMITTED = $HUB .. "/_etc/cosmix/dnsd/zones.mix"
+$GENPATH = $HUB .. "/_share/cosmix/gen/zones.mix"
+
+for each $path in [$SIGNED, $AUTHORED, $OVERLAY, $HEADER, $COMMITTED]
+  if not is_file($path) then
+    print("  ERROR: required zones-check input is missing: " .. $path)
+    exit(2)
+  end
+end
+
+-- Hold the shared mesh writer lock while reading the authority inputs and
+-- publishing the preview, so a concurrent seal cannot mix two generations.
+$_lock = $m.mesh_take_write_lock("mesh_zones_check")
+
+$vi = $m.verified_inventory($SIGNED, {
+  mesh: $EXPECTED_MESH,
+  against_authored: $AUTHORED
+})
+
+$gen = $m.gen_zones_from_verified($vi, $OVERLAY, $HEADER)
+mkdir(dirname($GENPATH), {parents: true})
+$m.write_leaf($GENPATH, $gen)
+
+$diff = run_argv(["diff", "-u", $COMMITTED, $GENPATH])
+if $diff["exit_code"] == 0 then
+  print("OK: committed zones.mix matches a fresh regenerate from the VERIFIED")
+  print("    inventory (epoch " .. ("" .. $vi["epoch"]) .. ", authoring " .. $vi["authoring_blake3"] .. ", " .. ("" .. byte_length($gen)) .. " bytes)")
+  print("    regenerate -> " .. $GENPATH)
+else
+  if $diff["exit_code"] == 1 then
+    print("DRIFT: committed zones.mix differs from a fresh regenerate (- committed / + regenerate):")
+    print($diff["stdout"])
+    print("Fix: mix _bin/mesh_gen.mix seal  (then commit _etc/cosmix/dnsd/zones.mix)")
+  else
+    print("  ERROR: diff failed while comparing committed and regenerated zones: " .. trim($diff["stderr"]))
+  end
+  exit(1)
+end

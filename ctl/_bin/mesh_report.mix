@@ -1,0 +1,204 @@
+#!/usr/bin/env mix
+-- mesh_report.mix — report the mesh substrate state observed over Bus.
+--
+--   mix _bin/mesh_report.mix           -- report every rostered mesh node
+--   mix _bin/mesh_report.mix <node>    -- report one mesh node
+--   mix _bin/mesh_report.mix list      -- list the live Bus roster
+--
+-- The signed inventory is authenticated and freshness-checked before any Bus
+-- request. The displayed roster and node state remain observations from
+-- noded.peers/info/list, so this report can expose runtime drift. Read-only.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/mesh_report.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: missing mesh_report config: " .. $CONF_PATH)
+  print("         copy _etc/mesh_report.conf.mix.example there and set expected_mesh")
+  exit(2)
+end
+
+$loaded = nil
+try
+  $loaded = load_data($CONF_PATH)
+catch $msg
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $msg)
+  exit(2)
+end
+if type($loaded) != "map" or type($loaded["mesh_report"]) != "map" then
+  print("  ERROR: " .. $CONF_PATH .. " must contain a mesh_report map")
+  exit(2)
+end
+$CONF = $loaded["mesh_report"]
+if $CONF["schema_version"] != 1 then
+  print("  ERROR: " .. $CONF_PATH .. " needs mesh_report.schema_version: 1")
+  exit(2)
+end
+if type($CONF["expected_mesh"]) != "string" or trim($CONF["expected_mesh"]) == "" then
+  print("  ERROR: " .. $CONF_PATH .. " needs a non-empty mesh_report.expected_mesh")
+  exit(2)
+end
+
+-- mesh_lib owns authenticated inventory ingress and the freshness floor.
+$m = require("../_lib/mesh_lib.mix")
+
+$argv = args()
+if len($argv) > 1 then
+  print("  ERROR: usage: mix _bin/mesh_report.mix [list|node]")
+  exit(2)
+end
+
+-- This is a Bus mesh report. Foreign/bash nodes were outside the old script's
+-- discovered noded.peers roster, so they remain outside its accepted targets.
+$ROSTER = $d.roster()
+$MESH_ROSTER = {
+  mesh: $ROSTER["mesh"],
+  foreign: [],
+  all: $ROSTER["mesh"],
+  order: $ROSTER["order"]
+}
+$parsed = $d.parse_nodes($MESH_ROSTER, $argv, ["list"])
+$nodes = $parsed["nodes"]
+$list_only = $parsed["flags"]["list"] == true
+
+$SIGNED = $d.hub_root() .. "/_etc/mesh/inventory.signed"
+$AUTHORED = $d.hub_root() .. "/_etc/mesh/inventory.mix"
+$BASELINE = $d.hub_root() .. "/_etc/mesh/epoch.baseline.mix"
+$_vi = $m.verified_inventory($SIGNED, {
+  mesh: $CONF["expected_mesh"],
+  against_authored: $AUTHORED,
+  baseline: $BASELINE
+})
+
+-- "-" for a nil map or missing value.
+fn field($map, $key)
+  if $map == nil then
+    return "-"
+  end
+  $value = $map[$key]
+  if $value == nil then
+    return "-"
+  end
+  return "" .. $value
+end
+
+fn noded_addr($node)
+  return "noded." .. $node .. ".bus"
+end
+
+-- Full-P2P is the declared topology: the local node plus its peers is the
+-- live roster. A missing local broker is a hard refusal, as in the old tool.
+fn discover_roster()
+  send noded noded.peers
+  if $rc != 0 then
+    return nil
+  end
+  $reply = $result
+  $out = [{name: $reply["node"], wg_ip: $reply["wg_ip"], port: $reply["port"]}]
+  $peers = $reply["peers"]
+  if $peers != nil then
+    for each $peer in $peers
+      if type($peer) == "string" then
+        push($out, {name: $peer, wg_ip: nil, port: nil})
+      else
+        push($out, $peer)
+      end
+    end
+  end
+  return $out
+end
+
+fn report_node($node)
+  print("")
+  print("════════════════════════ " .. $node .. " ════════════════════════")
+  $addr = noded_addr($node)
+
+  send $addr noded.info
+  if $rc != 0 then
+    print("  UNREACHABLE (noded.info rc=" .. ("" .. $rc) .. ")")
+    return nil
+  end
+  $info = $result
+  $noded = $info["noded"]
+  print("  node      : " .. field($info, "node") .. "   wg_ip=" .. field($info, "wg_ip") ..
+    "   mesh=" .. field($info, "mesh"))
+  print("  broker    : noded " .. field($noded, "version") .. "  sha=" .. field($noded, "git_sha") ..
+    "  built=" .. field($noded, "build_time") .. "  pid=" .. field($noded, "pid") ..
+    "  dirty=" .. field($noded, "git_dirty"))
+  print("  uptime_s  : " .. field($info, "uptime_s") ..
+    "   service_count=" .. field($info, "service_count"))
+
+  send $addr noded.list
+  if $rc != 0 then
+    print("  services  : (noded.list rc=" .. ("" .. $rc) .. ")")
+  else
+    print("  services  :")
+    for each $service in $result
+      $line = "      " .. field($service, "name")
+      $line = $line .. "  v=" .. field($service, "version")
+      $line = $line .. "  sha=" .. field($service, "git_sha")
+      $line = $line .. "  bin=" .. field($service, "binary")
+      $line = $line .. "  pid=" .. field($service, "pid")
+      $line = $line .. "  built=" .. field($service, "build_time")
+      $line = $line .. "  registered=" .. field($service, "registered_at")
+      print($line)
+    end
+  end
+
+  send $addr noded.peers
+  $peers = nil
+  if $rc == 0 then
+    $peers = $result["peers"]
+  end
+  if $peers == nil or len($peers) == 0 then
+    print("  peers     : (none)")
+  else
+    $names = []
+    for each $peer in $peers
+      if type($peer) == "string" then
+        push($names, $peer)
+      else
+        push($names, field($peer, "name") .. "(" .. field($peer, "wg_ip") .. ")")
+      end
+    end
+    print("  peers     : " .. join($names, " "))
+  end
+end
+
+$live_roster = discover_roster()
+if $live_roster == nil then
+  print("ERROR: cannot reach the local broker (noded.peers) to discover the mesh")
+  exit(1)
+end
+
+$live_names = []
+for each $entry in $live_roster
+  push($live_names, field($entry, "name"))
+end
+
+if $list_only then
+  for each $entry in $live_roster
+    print(field($entry, "name") .. "\t" .. field($entry, "wg_ip") .. "\t" .. field($entry, "port"))
+  end
+else
+  for each $node in $nodes
+    if not contains($live_names, $node) then
+      print("ERROR: node '" .. $node .. "' is absent from live noded.peers — live: " ..
+        join($live_names, " ") .. " (or: list)")
+      exit(2)
+    end
+  end
+
+  -- Preserve the live roster order used by the old report.
+  $targets = []
+  for each $node in $live_names
+    if contains($nodes, $node) then
+      push($targets, $node)
+    end
+  end
+  for each $node in $targets
+    report_node($node)
+  end
+  print("")
+  print("mesh report complete: " .. join($targets, " "))
+end

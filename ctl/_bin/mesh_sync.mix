@@ -1,0 +1,639 @@
+#!/usr/bin/env mix
+-- mesh_sync.mix — gated signed-inventory fan-out for every bus+active node.
+--
+-- The authored inventory is frozen once, authorised bytes are selected or
+-- signed once, then verified under the fleet's existing genesis anchor before
+-- any roster is derived. Each node receives the roster and the exact signed
+-- bytes, restarts noded, and must report the matching epoch and canonical hash.
+-- Spokes precede hubs; a partial run retains its proposal and never publishes
+-- the canonical fleet cache.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/mesh_sync.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no mesh_sync configuration at " .. $CONF_PATH)
+  print("         copy _etc/mesh_sync.conf.mix.example there and set expected_mesh and local_node")
+  exit(2)
+end
+$CONF_DATA = load_data($CONF_PATH)
+if type($CONF_DATA) != "map" or type($CONF_DATA["mesh_sync"]) != "map" then
+  print("  ERROR: " .. $CONF_PATH .. " must contain a mesh_sync map")
+  exit(2)
+end
+$CONF = $CONF_DATA["mesh_sync"]
+if $CONF["schema_version"] != 1 then
+  print("  ERROR: " .. $CONF_PATH .. " needs mesh_sync.schema_version: 1")
+  exit(2)
+end
+if type($CONF["expected_mesh"]) != "string" or trim($CONF["expected_mesh"]) == "" then
+  print("  ERROR: " .. $CONF_PATH .. " needs a non-empty mesh_sync.expected_mesh")
+  exit(2)
+end
+if type($CONF["local_node"]) != "string" or trim($CONF["local_node"]) == "" then
+  print("  ERROR: " .. $CONF_PATH .. " needs a non-empty mesh_sync.local_node")
+  exit(2)
+end
+
+-- mesh_lib owns inventory validation and verification, roster derivation,
+-- proposal durability, the single-writer lock, and the freshness witnesses.
+$m = require("../_lib/mesh_lib.mix")
+
+$HUB = $d.hub_root()
+$SIGN = $d.cosmix_bin("cosmix-mesh-sign")
+$INV = $HUB .. "/_etc/mesh/inventory.mix"
+$SIGNED = $HUB .. "/_etc/mesh/inventory.signed"
+$PROPOSAL = $HUB .. "/_etc/mesh/inventory.proposal.signed"
+$BASELINE = $HUB .. "/_etc/mesh/epoch.baseline.mix"
+$LOCAL = $CONF["local_node"]
+$EXPECTED_MESH = $CONF["expected_mesh"]
+
+fn has_str($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn same_strings($left, $right)
+  if len($left) != len($right) then
+    return false
+  end
+  for each $item in $left
+    if not has_str($right, $item) then
+      return false
+    end
+  end
+  return true
+end
+
+fn snapshot_signed($src, $dst)
+  $bytes = nil
+  try
+    $bytes = read_file($src)
+  catch $err
+    print("  ERROR: snapshot signed inventory: could not read " .. $src .. ": " .. $err)
+    exit(1)
+  end
+  write_file($dst, $bytes)
+  $d.die_if(read_file($dst) != $bytes,
+    "signed snapshot does not read back byte-identically: " .. $dst)
+end
+
+-- Probe the existing trust anchor. A failed read is never treated as absence:
+-- that would turn a transport or permission failure into authority to replace
+-- the trust root.
+fn node_genesis_probe($node, $is_local)
+  $path = "/etc/cosmix/noded/genesis.pub"
+  if $is_local then
+    return $m.anchor_read_local($path)
+  end
+  $r = ssh_mix($node, '
+$path = "/etc/cosmix/noded/genesis.pub"
+if is_file($path) then
+  $value = trim(read_file($path))
+  if $value == "" then
+    print("__EMPTY__")
+  else
+    print($value)
+  end
+else
+  print("__ABSENT__")
+end
+')
+  if not $r["ok"] then
+    $why = trim($r["stderr"])
+    if $why == "" then
+      $why = trim($r["stdout"])
+    end
+    if $why == "" then
+      $why = "transport/read failure"
+    end
+    return {ok: false, value: $why}
+  end
+  $out = trim($r["stdout"])
+  if $out == "" or $out == "__EMPTY__" then
+    return {ok: false, value: "empty read — refusing to guess"}
+  end
+  return {ok: true, value: $out}
+end
+
+fn ensure_genesis($node, $is_local, $pub)
+  $probe = node_genesis_probe($node, $is_local)
+  $d.die_if(not $probe["ok"],
+    "reading genesis anchor on " .. $node .. ": " .. $probe["value"])
+  $current = $probe["value"]
+  if $current == $pub then
+    print("    genesis anchor: unchanged (create-only — not rotated)")
+    return nil
+  end
+  if $current == "__ABSENT__" then
+    if $is_local then
+      $installed = $m.anchor_install_local("/etc/cosmix/noded/genesis.pub", $pub)
+      $d.die_if(not $installed["ok"],
+        "installing genesis anchor on " .. $node .. ": " .. $installed["value"])
+    else
+      $created = ssh_mix($node, '
+$path = "/etc/cosmix/noded/genesis.pub"
+try
+  write_new($path, $pub .. "\n", "0644")
+  print("MESH_GENESIS_CREATED " .. $token)
+catch $err
+  print("ERROR: create-only anchor install refused: " .. $err)
+  exit(1)
+end
+', {bindings: {pub: $pub, token: uuid()}})
+      $d.die_if(not $created["ok"] or not contains($created["stdout"], "MESH_GENESIS_CREATED"),
+        "creating genesis anchor on " .. $node ..
+        " (it may have appeared concurrently; create-only refuses replacement): " ..
+        trim($created["stdout"]) .. " " .. trim($created["stderr"]))
+    end
+    print("    genesis anchor: INSTALLED (first provisioning)")
+    return nil
+  end
+  print("  ERROR: " .. $node .. " carries a DIFFERENT genesis anchor than this run's signing key.")
+  print("    on node : " .. $current)
+  print("    signer  : " .. $pub)
+  print("    Refusing: trust-anchor rotation is a separate deliberate ceremony.")
+  exit(1)
+end
+
+-- Remote atomic placement cannot use mesh_lib.install_atomic_via because that
+-- helper takes a remote argv runner, while this distributor must use ssh_mix.
+-- The same safety properties are retained here with
+-- write_new beside the destination, ownership/mode before publication, and
+-- rename(2) over the live name.
+fn remote_install_atomic($node, $dst, $bytes, $owner_group, $mode, $token)
+  $r = ssh_mix($node, '
+fn fail($message)
+  print("ERROR: " .. $message)
+  exit(1)
+end
+$tmp = dirname($dst) .. "/." .. basename($dst) .. ".tmp." .. uuid()
+try
+  write_new($tmp, $bytes, $mode)
+catch $err
+  fail("staging " .. $dst .. ": " .. $err)
+end
+try
+  run("chown " .. $owner_group .. " " .. $tmp)
+catch $err
+  remove($tmp)
+  fail("ownership for " .. $dst .. ": " .. $err)
+end
+try
+  rename($tmp, $dst)
+catch $err
+  remove($tmp)
+  fail("atomic rename for " .. $dst .. ": " .. $err)
+end
+if read_file($dst) != $bytes then
+  fail("installed bytes do not read back byte-identically: " .. $dst)
+end
+print("MESH_INSTALL_OK " .. $token .. " " .. $dst)
+', {bindings: {
+    dst: $dst,
+    bytes: $bytes,
+    owner_group: $owner_group,
+    mode: $mode,
+    token: $token
+  }})
+  $d.die_if(not $r["ok"] or not contains($r["stdout"], "MESH_INSTALL_OK " .. $token),
+    "install " .. $dst .. " on " .. $node .. ": " ..
+    trim($r["stdout"]) .. " " .. trim($r["stderr"]))
+end
+
+fn prepare_node($node, $is_local)
+  if $is_local then
+    $r = run_argv(["sudo", "-n", "install", "-d", "-m", "0755",
+      "/etc/cosmix/noded", "/var/lib/cosmix/noded"])
+    $d.die_if($r["exit_code"] != 0,
+      "local mkdir /etc|/var noded dirs: " .. trim($r["stderr"]))
+    return nil
+  end
+  $r = ssh_mix($node, '
+mkdir("/etc/cosmix/noded", {parents: true})
+mkdir("/var/lib/cosmix/noded", {parents: true})
+chmod("/etc/cosmix/noded", "0755")
+chmod("/var/lib/cosmix/noded", "0755")
+print("MESH_DIRS_OK " .. $token)
+', {bindings: {token: uuid()}})
+  $d.die_if(not $r["ok"] or not contains($r["stdout"], "MESH_DIRS_OK"),
+    "mkdir on " .. $node .. ": " .. trim($r["stdout"]) .. " " .. trim($r["stderr"]))
+end
+
+fn install_payload($node, $is_local, $src, $dst, $owner, $group, $mode)
+  if $is_local then
+    $m.install_atomic($src, $dst, $owner, $group, $mode)
+    return nil
+  end
+  remote_install_atomic($node, $dst, read_file($src), $owner .. ":" .. $group, $mode, uuid())
+end
+
+fn restart_noded($node, $is_local)
+  if $is_local then
+    $r = run_argv(["sudo", "-n", "systemctl", "restart", "cosmix-noded"])
+    $d.die_if($r["exit_code"] != 0,
+      "restart cosmix-noded (local): " .. trim($r["stderr"]))
+    return nil
+  end
+  $r = ssh_mix($node, 'print(run("systemctl restart cosmix-noded"))')
+  $d.die_if(not $r["ok"],
+    "restart cosmix-noded on " .. $node .. ": " .. trim($r["stdout"]) .. " " .. trim($r["stderr"]))
+end
+
+-- A fresh interpreter is load-bearing after the local broker restarts: the
+-- parent process's severed broker connection does not reconnect mid-process.
+fn verify_node($node, $is_local, $epoch, $hash)
+  $target = $is_local ? "noded" : "noded." .. $node .. ".bus"
+  $probe = "$t = " .. json_encode($target) .. "\n"
+  $probe = $probe .. "send $t noded.inventory timeout=15\n"
+  $probe = $probe .. "if type($result) == \"map\" and $result.posture == \"verified\" and (\"\" .. $result.epoch) == " .. json_encode("" .. $epoch) .. " and $result.hash == " .. json_encode($hash) .. " then\n"
+  $probe = $probe .. "  print(\"OK\")\nelse\n  print(\"WAIT rc=\" .. (\"\" .. $rc))\nend\n"
+  $attempt = 0
+  while $attempt < 8
+    $r = run_argv([$d.mix_bin(), "-"], {stdin: $probe, timeout: 20})
+    if $r["exit_code"] == 0 and contains(trim($r["stdout"]), "OK") then
+      print("    verified epoch=" .. ("" .. $epoch) .. " hash=" .. substr($hash, 0, 12) .. "...")
+      return nil
+    end
+    $attempt = $attempt + 1
+    sleep(2)
+  end
+  print("  ERROR: " .. $node .. " did not report verified epoch " .. ("" .. $epoch) ..
+    " carrying THIS payload (" .. substr($hash, 0, 12) .. "...) in time")
+  exit(1)
+end
+
+-- ── arguments and private roster ───────────────────────────────────────
+$ROSTER = $d.roster()
+$MESH_ROSTER = {
+  mesh: $ROSTER["mesh"], foreign: [], all: $ROSTER["mesh"], order: $ROSTER["order"]
+}
+$d.assert_node($MESH_ROSTER, $LOCAL)
+
+$argv = args()
+$discard = ""
+if len($argv) > 0 and $argv[0] == "--discard-proposal" then
+  if len($argv) != 2 then
+    print("  ERROR: --discard-proposal is standalone and requires the full canonical_blake3")
+    exit(2)
+  end
+  $discard = $argv[1]
+  if not regex_match("^[0-9a-f]{64}$", $discard) then
+    print("  ERROR: --discard-proposal requires exactly 64 lowercase hexadecimal characters")
+    exit(2)
+  end
+end
+
+$dry = false
+$requested = []
+if $discard == "" then
+  for each $arg in $argv
+    if $arg == "--no-gen" then
+      print("  ERROR: --no-gen is retired: rosters are always derived from the verified payload")
+      exit(2)
+    end
+  end
+  $parsed = $d.parse_nodes($MESH_ROSTER, $argv, ["--dry-run"])
+  $dry = $parsed["flags"]["--dry-run"] == true
+  if len($argv) > 0 then
+    for each $arg in $argv
+      if $arg != "--dry-run" then
+        push($requested, $arg)
+      end
+    end
+  end
+end
+
+if not $dry then
+  $_lock = $m.mesh_take_write_lock("mesh_sync")
+end
+
+-- Explicit abandonment authenticates the proposal but intentionally skips
+-- freshness: naming its full authenticated hash is the authority to discard.
+if $discard != "" then
+  $d.die_if(not is_file($PROPOSAL), "no signed proposal exists at " .. $PROPOSAL)
+  $verify = run_argv([$SIGN, "--secrets-db", $m.MESH_NO_SECRETS_DB,
+    "verify", $PROPOSAL, "--genesis-pub", $m.MESH_GENESIS_PUB,
+    "--expected-mesh", $EXPECTED_MESH, "--json"])
+  $d.die_if($verify["exit_code"] != 0,
+    "proposal verification failed; refusing to discard unauthenticated bytes: " ..
+    trim($verify["stderr"] .. $verify["stdout"]))
+  $json = json_parse($verify["stdout"])
+  $d.die_if(type($json) != "map" or $json["ok"] != true or
+    type($json["canonical_blake3"]) != "string",
+    "proposal verifier did not return an authenticated canonical_blake3")
+  $d.die_if($json["canonical_blake3"] != $discard,
+    "proposal canonical_blake3 is " .. $json["canonical_blake3"] ..
+    ", not the supplied " .. $discard)
+  try
+    remove($PROPOSAL)
+  catch $err
+    print("  ERROR: discard proposal: could not remove " .. $PROPOSAL .. ": " .. $err)
+    exit(1)
+  end
+  $sync = run_argv(["sync", dirname($PROPOSAL)])
+  $d.die_if($sync["exit_code"] != 0,
+    "proposal was removed but its directory entry could not be flushed: " ..
+    trim($sync["stderr"]) .. "; a crash could resurrect it")
+  print("discarded signed proposal " .. $discard .. " from " .. $PROPOSAL)
+  exit(0)
+end
+
+-- ── freeze and validate the authored plan ──────────────────────────────
+$floor = $m.mesh_baseline_read($BASELINE)
+$before = hash_file($INV, "sha256")
+$mk = run_argv(["mktemp", "-d"])
+$d.die_if($mk["exit_code"] != 0, "mktemp -d failed: " .. trim($mk["stderr"]))
+$WORK = trim($mk["stdout"])
+$d.die_if($WORK == "", "mktemp -d produced no path")
+chmod($WORK, "0700")
+$SNAP = $WORK .. "/inventory.mix"
+$SIGNED_PRIV = $WORK .. "/inventory.signed"
+try
+  copy($INV, $SNAP)
+catch $err
+  print("  ERROR: snapshot inventory: " .. $err)
+  exit(1)
+end
+$d.die_if(hash_file($SNAP, "sha256") != $before,
+  "inventory.mix changed while snapshotting — re-run mesh_sync")
+
+$planned = load_data($SNAP)["inventory"]
+$m.validate_inventory($planned)
+$epoch = $planned["epoch"]
+$bus_active = []
+for each $member in $planned["members"]
+  if $member["bus"] == true and $member["status"] == "active" then
+    push($bus_active, $member["name"])
+  end
+end
+
+-- Validate the private rollout as a complete, duplicate-free, hubs-last order.
+$rollout = $d.rollout_order($ROSTER)
+$seen = []
+$ordered = []
+$hub_tail = false
+$live_hubs = $d.mesh_hubs()
+$d.die_if(not same_strings($live_hubs, $planned["hub"]),
+  "located authored inventory changed while its frozen snapshot was being planned")
+$hubs = $planned["hub"]
+for each $node in $rollout
+  $d.die_if(not has_str($ROSTER["mesh"], $node),
+    "rollout_order contains non-mesh node '" .. $node .. "'")
+  $d.die_if(has_str($seen, $node), "rollout_order repeats node '" .. $node .. "'")
+  if has_str($hubs, $node) then
+    $hub_tail = true
+  else
+    $d.die_if($hub_tail, "rollout_order is not hubs-last: spoke '" .. $node .. "' follows a hub")
+  end
+  push($seen, $node)
+  if has_str($bus_active, $node) then
+    push($ordered, $node)
+  end
+end
+$d.die_if(not same_strings($seen, $ROSTER["mesh"]),
+  "rollout_order must contain every rostered mesh node exactly once")
+$d.die_if(not same_strings($ordered, $bus_active),
+  "fleet roster/rollout bus nodes must exactly match the authored bus+active inventory")
+
+$order = []
+if len($requested) == 0 then
+  for each $node in $ordered
+    push($order, $node)
+  end
+else
+  for each $node in $requested
+    $d.die_if(not has_str($bus_active, $node),
+      "requested node '" .. $node .. "' is not a bus+active inventory member")
+  end
+  for each $node in $ordered
+    if has_str($requested, $node) then
+      push($order, $node)
+    end
+  end
+end
+$d.die_if(len($order) == 0, "no nodes to sync (empty selection / inventory)")
+$partial = len($order) < len($ordered)
+
+print("mesh_sync — signed inventory distributor (epoch " .. ("" .. $epoch) .. ")")
+print("  inventory : " .. $INV .. "  (frozen snapshot)")
+print("  nodes     : " .. join($order, " ") .. "   (hubs last)")
+if $dry then
+  print("  DRY-RUN — no node is changed")
+end
+print("")
+
+$endpoint_findings = $m.signed_endpoint_preflight($planned)
+if $dry then
+  for each $finding in $endpoint_findings
+    print("[endpoint] a real run would REFUSE: " .. $finding)
+  end
+else
+  $d.die_if(len($endpoint_findings) > 0,
+    "signed endpoint preflight failed: " .. join($endpoint_findings, "; "))
+end
+
+-- ── select, verify, then derive ─────────────────────────────────────────
+$pub = ""
+$proposal_used = false
+$fresh_proposal = false
+$selected = ""
+$vi = nil
+if $dry then
+  print("[select] would resume an existing proposal, reuse matching canonical bytes,")
+  print("         or mint one fresh proposal from the frozen authored inventory")
+  print("[verify] would verify selected bytes under the existing fleet anchor")
+  $dry_signed = is_file($PROPOSAL) ? $PROPOSAL : $SIGNED
+  if is_file($dry_signed) then
+    $dry_vi = $m.verified_inventory($dry_signed, {mesh: $EXPECTED_MESH})
+    for each $finding in $m.distributor_generation_findings($dry_vi, $floor)
+      print("[generation] a real run would REFUSE: " .. $finding)
+    end
+    $dry_bundles = $m.gen_node_bundles_from_verified($dry_vi)
+    $missing = []
+    for each $node in $order
+      if $dry_bundles[$node] == nil then
+        push($missing, $node)
+      end
+    end
+    if len($missing) == 0 then
+      print("[roster] verified payload yields every planned roster")
+    else
+      print("[roster] a real run would REFUSE missing nodes: " .. join($missing, " "))
+    end
+    $drift = $m.authored_drift($dry_signed, $INV, $EXPECTED_MESH)
+    print("[authored] " .. ($drift["in_sync"] ? "in sync" : "DRIFT: " .. $drift["detail"]))
+  else
+    print("[select] no proposal or canonical inventory; a real run would mint a proposal")
+  end
+else
+  print("[select] choosing authorised bytes")
+  if is_file($PROPOSAL) then
+    $pvi = $m.verified_inventory($PROPOSAL, {mesh: $EXPECTED_MESH})
+    $m.assert_distributor_generation($pvi, $floor)
+    $pdr = $m.authored_drift($PROPOSAL, $SNAP, $EXPECTED_MESH)
+    if not $pdr["in_sync"] then
+      print("  ERROR: existing signed proposal does not match the frozen authored inventory")
+      print("    canonical_blake3: " .. $pvi["canonical_blake3"])
+      print("    " .. $pdr["detail"])
+      print("    discard explicitly with --discard-proposal " .. $pvi["canonical_blake3"])
+      exit(1)
+    end
+    snapshot_signed($PROPOSAL, $SIGNED_PRIV)
+    $proposal_used = true
+    $selected = "existing proposal " .. $pvi["canonical_blake3"]
+  else
+    $canonical_matches = false
+    if is_file($SIGNED) then
+      $canonical_matches = $m.authored_drift($SIGNED, $SNAP, $EXPECTED_MESH)["in_sync"]
+    end
+    if $canonical_matches then
+      $cvi = $m.verified_inventory($SIGNED, {
+        mesh: $EXPECTED_MESH, against_authored: $SNAP
+      })
+      $m.assert_distributor_generation($cvi, $floor)
+      snapshot_signed($SIGNED, $SIGNED_PRIV)
+      $selected = "rolled-out canonical bytes " .. $cvi["canonical_blake3"]
+    else
+      $d.die_if($epoch <= $floor["epoch"],
+        "authored epoch " .. ("" .. $epoch) .. " does not advance floor epoch " ..
+        ("" .. $floor["epoch"]) .. " at recovery generation " ..
+        ("" .. $floor["recovery_generation"]) .. "; bump the authored epoch")
+      print("[sign] minting fresh normal proposal at recovery generation " ..
+        ("" .. $floor["recovery_generation"]))
+      $sign = run_argv([$SIGN, "sign", $SNAP, "-o", $SIGNED_PRIV,
+        "--recovery-generation", "" .. $floor["recovery_generation"]])
+      $d.die_if($sign["exit_code"] != 0,
+        "sign failed (exit " .. ("" .. $sign["exit_code"]) .. "): " .. trim($sign["stderr"]))
+      $fresh_proposal = true
+      $selected = "fresh proposal"
+    end
+  end
+  $pk = run_argv([$SIGN, "pubkey"])
+  $d.die_if($pk["exit_code"] != 0,
+    "cosmix-mesh-sign pubkey failed: " .. trim($pk["stderr"]))
+  $pub = trim($pk["stdout"])
+  $d.die_if($pub == "", "cosmix-mesh-sign pubkey returned empty")
+  print("  selected: " .. $selected)
+  print("")
+
+  print("[verify] checking selected bytes against the fleet trust anchor")
+  $vi = $m.verified_inventory($SIGNED_PRIV, {
+    mesh: $EXPECTED_MESH, against_authored: $SNAP
+  })
+  $m.assert_distributor_generation($vi, $floor)
+  if $fresh_proposal then
+    $m.store_signed_proposal($SIGNED_PRIV, $PROPOSAL)
+    $proposal_used = true
+    print("  proposal: retained until canonical publication")
+  end
+  $d.die_if(("" .. $vi["epoch"]) != ("" .. $epoch),
+    "signed payload epoch differs from the frozen plan")
+  $verified_mesh = $vi["inventory"]
+  $d.die_if(not same_strings($verified_mesh["hub"], $planned["hub"]),
+    "authenticated hub membership differs from the frozen plan")
+  $verified_bus = []
+  for each $member in $verified_mesh["members"]
+    if $member["bus"] == true and $member["status"] == "active" then
+      push($verified_bus, $member["name"])
+    end
+  end
+  $d.die_if(not same_strings($verified_bus, $bus_active),
+    "authenticated bus+active membership differs from the frozen plan")
+  print("  verified: epoch " .. ("" .. $vi["epoch"]) ..
+    ", authoring " .. $vi["authoring_blake3"])
+  print("")
+
+  print("[roster] deriving rosters from the authenticated payload")
+  $bundles = $m.gen_node_bundles_from_verified($vi)
+  $roster_dir = $WORK .. "/roster"
+  mkdir($roster_dir)
+  chmod($roster_dir, "0700")
+  for each $node in $order
+    $bundle = $bundles[$node]
+    $d.die_if($bundle == nil,
+      "authenticated payload yields no roster for '" .. $node .. "'")
+    write_file($roster_dir .. "/" .. $node .. ".conf.mix", $bundle["config"])
+  end
+  print("  ok: " .. ("" .. len($order)) .. " roster(s)")
+  print("")
+end
+
+-- ── distribute, restart, verify; stop at the first failed node ──────────
+$done = []
+$floor_raised = false
+for each $node in $order
+  $is_local = $node == $LOCAL
+  $roster_file = $WORK .. "/roster/" .. $node .. ".conf.mix"
+  print("[" .. $node .. "] " .. ($is_local ? "local" : "remote"))
+  if $dry then
+    $anchor = node_genesis_probe($node, $is_local)
+    if not $anchor["ok"] then
+      print("  genesis anchor: UNREADABLE (" .. $anchor["value"] .. ") — real run refuses")
+    else
+      print("  genesis anchor: " .. ($anchor["value"] == "__ABSENT__" ?
+        "absent — would create once" : "present — would not rotate"))
+    end
+    print("  would atomically install roster + exact signed cache, restart noded, verify epoch+hash")
+  else
+    $d.die_if(not is_file($roster_file), "missing generated roster " .. $roster_file)
+    prepare_node($node, $is_local)
+    -- Anchor is checked before either mutable payload file reaches the node.
+    ensure_genesis($node, $is_local, $pub)
+    install_payload($node, $is_local, $roster_file,
+      "/etc/cosmix/noded/config.conf.mix", "root", "cosmix-noded", "0640")
+    install_payload($node, $is_local, $SIGNED_PRIV,
+      "/var/lib/cosmix/noded/inventory.signed", "root", "root", "0644")
+    restart_noded($node, $is_local)
+    sleep(2)
+    verify_node($node, $is_local, $epoch, $vi["canonical_blake3"])
+    if not $floor_raised then
+      $m.mesh_baseline_raise($BASELINE, $vi)
+      $floor_raised = true
+    end
+  end
+  push($done, $node)
+end
+
+if $partial then
+  print("")
+  print("  partial: canonical cache unchanged; freshness floor advanced/confirmed after first acceptance")
+  if $proposal_used then
+    print("           proposal retained for a later complete rollout")
+  end
+end
+
+if not $dry and not $partial then
+  $published = read_file($SIGNED_PRIV)
+  $m.write_leaf($SIGNED, $published)
+  $d.die_if(read_file($SIGNED) != $published,
+    "published canonical cache is not byte-identical to the run snapshot")
+  if $proposal_used then
+    $d.die_if(read_file($PROPOSAL) != read_file($SIGNED),
+      "published canonical differs from retained proposal; refusing deletion")
+    $m.remove_published_proposal($PROPOSAL)
+    print("  proposal: published byte-identically and removed")
+  end
+end
+
+$cleanup = run_argv(["rm", "-rf", $WORK])
+if $cleanup["exit_code"] != 0 then
+  print("  note: could not remove temp dir " .. $WORK)
+end
+
+print("")
+if $dry then
+  print("dry-run complete: would sync " .. ("" .. len($order)) .. " node(s)")
+else
+  if $partial then
+    print("mesh_sync PARTIAL: " .. join($done, " ") ..
+      " (verified epoch " .. ("" .. $epoch) .. "; no canonical publication)")
+  else
+    print("mesh_sync complete: " .. join($done, " ") ..
+      " (all verified epoch " .. ("" .. $epoch) .. ")")
+  end
+end

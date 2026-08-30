@@ -1,0 +1,8 @@
+-- mesh_sync.conf.mix.example — private settings for mesh_sync.mix.
+-- Copy to mesh_sync.conf.mix in your private control hub and edit it there.
+-- The public starter deliberately does not ship an active configuration.
+mesh_sync: {
+  schema_version: 1,
+  expected_mesh: "example-mesh",
+  local_node: "alpha"
+}

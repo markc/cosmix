@@ -1,0 +1,7 @@
+-- mesh_alloc.conf.mix.example — private settings for mesh_alloc.mix.
+-- Copy to mesh_alloc.conf.mix in your private control hub and edit it there.
+-- The public starter deliberately does not ship an active configuration.
+mesh_alloc: {
+  schema_version: 1,
+  expected_mesh: "example.org"
+}

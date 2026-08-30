@@ -1,0 +1,8 @@
+-- mesh_join.conf.mix.example — private settings for mesh_join.mix.
+-- Copy to mesh_join.conf.mix in your private control hub and edit it there.
+-- The public starter deliberately does not ship an active configuration.
+mesh_join: {
+  schema_version: 1,
+  default_secrets_db: "/home/user/.secrets/secrets.db",
+  expected_mesh: "example.org"
+}

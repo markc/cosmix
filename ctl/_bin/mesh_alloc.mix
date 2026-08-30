@@ -1,0 +1,86 @@
+#!/usr/bin/env mix
+-- mesh_alloc.mix — print the next free wg_ip in the mesh /24.
+--
+-- READ-ONLY: validates the selected authored inventory, then allocates the
+-- lowest free host address across authored and rolled-out coverage. When the
+-- selected file is the live authored inventory, the signed canonical is also
+-- verified so an address still present in the rollout cannot be re-issued.
+--
+--   mix _bin/mesh_alloc.mix [inventory.mix]
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/mesh_alloc.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: missing mesh_alloc config: " .. $CONF_PATH)
+  print("         copy _etc/mesh_alloc.conf.mix.example there and set expected_mesh")
+  exit(2)
+end
+
+$loaded = nil
+try
+  $loaded = load_data($CONF_PATH)
+catch $msg
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $msg)
+  exit(2)
+end
+if type($loaded) != "map" or type($loaded["mesh_alloc"]) != "map" then
+  print("  ERROR: " .. $CONF_PATH .. " must contain a mesh_alloc map")
+  exit(2)
+end
+$CONF = $loaded["mesh_alloc"]
+if $CONF["schema_version"] != 1 then
+  print("  ERROR: " .. $CONF_PATH .. " needs mesh_alloc.schema_version: 1")
+  exit(2)
+end
+if type($CONF["expected_mesh"]) != "string" or trim($CONF["expected_mesh"]) == "" then
+  print("  ERROR: " .. $CONF_PATH .. " needs a non-empty mesh_alloc.expected_mesh")
+  exit(2)
+end
+
+-- mesh_lib owns inventory validation, authenticated ingress, bootstrap-loss
+-- refusal, and union allocation. Keep those contracts in one implementation.
+$m = require("../_lib/mesh_lib.mix")
+
+$PROD_AUTHORED = $d.hub_root() .. "/_etc/mesh/inventory.mix"
+$PROD_SIGNED = $d.hub_root() .. "/_etc/mesh/inventory.signed"
+$INVENTORY = $PROD_AUTHORED
+if len(args()) > 0 then
+  $INVENTORY = args()[0]
+end
+if not is_file($INVENTORY) then
+  print("ERROR: inventory not found: " .. $INVENTORY)
+  exit(1)
+end
+
+$inv = load_data($INVENTORY)["inventory"]
+$m.validate_inventory($inv)
+
+-- Classify by filesystem identity, not path spelling: a symlink or alternate
+-- spelling of the live authored inventory still needs rolled-out coverage.
+$is_production = false
+$prod_stat = nil
+try
+  $prod_stat = stat($PROD_AUTHORED)
+catch $msg
+  -- Mix stat exposes no structured errno, so the ENOENT substring match is forced.
+  if not ends_with($msg, "(os error 2)") then
+    $d.die_if(true, "cannot classify against the production inventory: " .. $msg)
+  end
+end
+if $prod_stat != nil then
+  $arg_stat = stat($INVENTORY)
+  $is_production = ($arg_stat["ino"] == $prod_stat["ino"] and $arg_stat["dev"] == $prod_stat["dev"])
+end
+
+$rolled_out = $inv
+if $is_production then
+  if is_file($PROD_SIGNED) then
+    $rolled_vi = $m.verified_inventory($PROD_SIGNED, {mesh: $CONF["expected_mesh"]})
+    $rolled_out = $rolled_vi["inventory"]
+  else
+    $m.assert_canonical_absence_is_bootstrap()
+    print("note: production canonical inventory.signed is absent; bootstrap allocation uses authored coverage only")
+  end
+end
+print($m.next_free_ip_union($inv, $rolled_out))

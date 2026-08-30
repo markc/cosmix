@@ -1,0 +1,8 @@
+-- mesh_admission.conf.mix.example — private mesh identity for the admission
+-- posture roller. Copy to mesh_admission.conf.mix in the private control hub.
+{
+  mesh_admission: {
+    schema_version: 1,
+    expected_mesh: "example.org"
+  }
+}

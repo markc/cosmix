@@ -1,0 +1,301 @@
+#!/usr/bin/env mix
+-- mesh_gen.mix — reproducibly derive mesh artifacts from one inventory.
+--
+--   mix _bin/mesh_gen.mix preview [--authored PATH] [--out DIR]
+--   mix _bin/mesh_gen.mix seal [--signed PATH] [--authored PATH] [--nodes-only]
+--                                [--inherit-lock --lock-token TOKEN]
+--
+-- Preview reads the unsigned authoring surface and can write only to a
+-- non-production scratch tree. Seal authenticates the signed inventory
+-- against the authored file before writing deploy-consumed artifacts. This
+-- script only writes local staging and committed artifact paths; it never
+-- contacts a node.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/mesh_gen.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no mesh_gen configuration at " .. $CONF_PATH)
+  print("         copy _etc/mesh_gen.conf.mix.example there and set expected_mesh")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["mesh_gen"], {
+    schema_version: {type: "integer", enum: [1]},
+    expected_mesh: {type: "string", nonblank: true}
+  })
+catch $e
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+  exit(2)
+end
+
+$m = require("../_lib/mesh_lib.mix")
+
+$HUB = $d.hub_root()
+$INVENTORY = $HUB .. "/_etc/mesh/inventory.mix"
+$SIGNED = $HUB .. "/_etc/mesh/inventory.signed"
+$GENROOT = $HUB .. "/_share/cosmix/gen"
+$PREVIEWROOT = $HUB .. "/_share/cosmix/gen-preview"
+$OVERLAY = $HUB .. "/_etc/cosmix/dnsd/zones.overlay.mix"
+$ZHEADER = $HUB .. "/_etc/cosmix/dnsd/zones.header"
+$WGOVERLAY = $HUB .. "/_etc/mesh/wg.overlay.mix"
+$WGDIR = $HUB .. "/_etc/cosmix/wgd"
+$WRITE_LOCK = $m["MESH_WRITE_LOCK"]
+
+fn usage_exit()
+  print("usage: mix _bin/mesh_gen.mix preview [--authored PATH] [--out DIR]")
+  print("       mix _bin/mesh_gen.mix seal    [--signed PATH] [--authored PATH] [--nodes-only]")
+  print("                                     [--inherit-lock --lock-token TOKEN]")
+  print("")
+  print("  preview  derive from the AUTHORED unsigned inventory into a scratch dir.")
+  print("  seal     derive from the VERIFIED signed inventory into real artifacts.")
+  exit(2)
+end
+
+-- Parse modes explicitly. A bare path is refused because it cannot state
+-- whether its bytes are authenticated or where their derivatives may land.
+$argv = args()
+if len($argv) == 0 then
+  usage_exit()
+end
+$mode = $argv[0]
+if $mode != "preview" and $mode != "seal" then
+  print("mesh_gen: unknown mode '" .. ("" .. $mode) .. "' (expected preview|seal)")
+  print("")
+  print("NOTE: mesh_gen does not take a bare inventory path. Real artifacts require")
+  print("      a VERIFIED signed inventory; use seal, or preview an authored edit.")
+  usage_exit()
+end
+
+$authored_path = $INVENTORY
+$signed_path = $SIGNED
+$out_dir = $PREVIEWROOT
+$nodes_only = false
+$inherit_lock = false
+$lock_token = ""
+$i = 1
+while $i < len($argv)
+  $a = $argv[$i]
+  if $a == "--nodes-only" then
+    $nodes_only = true
+    $i = $i + 1
+  else
+    if $a == "--inherit-lock" then
+      $inherit_lock = true
+      $i = $i + 1
+    else
+      if $i + 1 >= len($argv) then
+        print("mesh_gen: " .. $a .. " requires a value")
+        usage_exit()
+      end
+      $val = $argv[$i + 1]
+      if $a == "--authored" then
+        $authored_path = $val
+      else
+        if $a == "--signed" then
+          $signed_path = $val
+        else
+          if $a == "--out" then
+            $out_dir = $val
+          else
+            if $a == "--lock-token" then
+              $lock_token = $val
+            else
+              print("mesh_gen: unknown option '" .. ("" .. $a) .. "'")
+              usage_exit()
+            end
+          end
+        end
+      end
+      $i = $i + 2
+    end
+  end
+end
+
+$sealed = $mode == "seal"
+
+-- Lock before reading shared mutable state. Inherited locking is accepted
+-- only when both the acquisition token and a live ancestor prove ownership;
+-- a failed flock alone proves only that somebody holds the lock.
+if $sealed then
+  if $inherit_lock then
+    if trim($lock_token) == "" then
+      print("  ERROR: --inherit-lock requires --lock-token <token>, the value")
+      print("         returned by the parent's mesh_take_write_lock().")
+      print("         Without it inheritance cannot be distinguished from a")
+      print("         coincidence of process ids.")
+      exit(1)
+    end
+    if flock($WRITE_LOCK) then
+      print("  ERROR: --inherit-lock, but " .. $WRITE_LOCK)
+      print("         is not held by anyone; sealing would run outside the lock.")
+      exit(1)
+    end
+    if not $m.mesh_lock_held_by_ancestor($lock_token) then
+      print("  ERROR: --inherit-lock, but " .. $WRITE_LOCK)
+      print("         is not held by an ancestor under the supplied token.")
+      print("         Refusing to inherit another writer's lock.")
+      exit(1)
+    end
+  else
+    $_lock_token = $m.mesh_take_write_lock("mesh_gen seal")
+  end
+end
+
+$vi = nil
+if $sealed then
+  if not is_file($signed_path) then
+    print("mesh_gen: signed inventory not a file: " .. $signed_path)
+    exit(2)
+  end
+  if not is_file($authored_path) then
+    print("mesh_gen: authored inventory not a file: " .. $authored_path)
+    exit(2)
+  end
+  -- against_authored binds the authenticated payload to the current editing
+  -- surface, preventing a valid signature over a different plan from sealing.
+  $vi = $m.verified_inventory($signed_path, {
+    mesh: $CONF["expected_mesh"],
+    against_authored: $authored_path
+  })
+  $mesh = $vi["inventory"]
+else
+  if not is_file($authored_path) then
+    print("mesh_gen: authored inventory not a file: " .. $authored_path)
+    exit(2)
+  end
+  $mesh = load_data($authored_path)["inventory"]
+
+  -- Canonicalise the requested root before checking it. This prevents a
+  -- preview path reached through a symlink from entering either production
+  -- tree while still appearing lexically unrelated.
+  mkdir($out_dir)
+  $real_out = realpath($out_dir)
+  if $real_out == nil then
+    print("mesh_gen: cannot resolve --out " .. $out_dir)
+    exit(2)
+  end
+  $out_dir = $real_out
+  $real_gen = realpath($GENROOT)
+  if $real_gen == nil then
+    $real_gen = $GENROOT
+  end
+  if $out_dir == $real_gen or starts_with($out_dir, $real_gen .. "/") then
+    print("mesh_gen: refusing --out inside the deploy-consumed staging tree " .. $real_gen)
+    print("          (" .. $real_out .. " resolves there)")
+    print("          preview output must never be mistaken for a sealed artifact.")
+    exit(2)
+  end
+  $real_etc = realpath($HUB .. "/_etc")
+  if $real_etc == nil then
+    $real_etc = $HUB .. "/_etc"
+  end
+  if $out_dir == $real_etc or starts_with($out_dir, $real_etc .. "/") then
+    print("mesh_gen: refusing --out inside the committed artifact tree " .. $real_etc)
+    exit(2)
+  end
+end
+
+print("mesh_gen — SPEC 13 derivation [" .. $mode .. "]")
+if $sealed then
+  print("  inventory : " .. $signed_path .. " (VERIFIED, epoch " ..
+    ("" .. $vi["epoch"]) .. ", mesh " .. $vi["mesh"] .. ")")
+  print("  authoring : " .. $vi["authoring_blake3"])
+  print("  authored  : " .. $authored_path .. " (matches the signed payload)")
+  print("  staging   : " .. $GENROOT)
+else
+  print("  inventory : " .. $authored_path .. " (AUTHORED, epoch " ..
+    ("" .. $mesh["epoch"]) .. ")")
+  print("  scratch   : " .. $out_dir)
+  print("")
+  print("  !! PREVIEW — these unsigned derivatives are not deployable.")
+  print("  !! Sign the inventory and run seal to produce real artifacts.")
+end
+print("")
+
+-- Both paths receive the same complete shape and uniqueness validation.
+$m.validate_inventory($mesh)
+
+-- mesh_lib owns the one canonical recipe shared with distributors and drift
+-- gates. Each destination directory must resolve directly below the already
+-- canonicalised root, and write_leaf refuses leaf-symlink redirection.
+$dest_root = $sealed ? $GENROOT : $out_dir
+$vsrc = $vi
+if not $sealed then
+  $vsrc = {inventory: $mesh}
+end
+$dest_rp = realpath($dest_root)
+if $dest_rp == nil then
+  print("ERROR: cannot resolve the output root: " .. $dest_root)
+  exit(1)
+end
+$bundles = $m.gen_node_bundles_from_verified($vsrc)
+$count = 0
+for each $self_name in sort(keys($bundles))
+  $bundle = $bundles[$self_name]
+  $dir = $dest_root .. "/" .. $self_name
+  mkdir($dir)
+  if realpath($dir) != $dest_rp .. "/" .. $self_name then
+    print("ERROR: " .. $dir .. " does not resolve directly under " .. $dest_rp)
+    print("       a symlinked node directory would redirect every generated artifact")
+    exit(1)
+  end
+  $m.write_leaf($dir .. "/config.conf.mix", $bundle["config"])
+  $m.write_leaf($dir .. "/hosts.bus", $bundle["hosts"])
+  $npeers = len(json_parse($bundle["config"])["peers"])
+  print("  " .. rpad($self_name, 10) .. " peers=" .. ("" .. $npeers) .. " -> " .. $dir)
+  $count = $count + 1
+end
+
+print("")
+print("generated " .. ("" .. $count) .. " node bundle(s) under " .. $dest_root)
+
+if not $sealed then
+  print("zones.mix + hub wg.conf NOT written (preview mode)")
+else
+  if $nodes_only then
+    print("zones.mix NOT regenerated (--nodes-only; a full seal regenerates it)")
+  else
+    if is_file($OVERLAY) and is_file($ZHEADER) then
+      $ztext = $m.gen_zones_from_verified($vi, $OVERLAY, $ZHEADER)
+      $zpath = $HUB .. "/_etc/cosmix/dnsd/zones.mix"
+      $m.write_leaf($zpath, $ztext)
+      print("regenerated zones.mix (" .. ("" .. byte_length($ztext)) .. " bytes) -> " .. $zpath)
+    else
+      print("zones.mix NOT regenerated (missing overlay or header; expected at " .. $OVERLAY .. ")")
+    end
+  end
+
+  if $nodes_only then
+    print("hub wg.conf NOT regenerated (--nodes-only; a full seal regenerates it)")
+  else
+    if is_file($WGOVERLAY) then
+      $wgov = load_data($WGOVERLAY)["wg_overlay"]
+      $wgtext = $m.gen_hub_wg_from_verified($vi, $WGOVERLAY)
+      $hub_iface = $m.wg_iface_of($wgov, $mesh["hub"][0])
+      mkdir($WGDIR)
+      $wgpath = $WGDIR .. "/" .. $hub_iface .. ".conf"
+      $m.write_leaf($wgpath, $wgtext)
+      print("regenerated hub " .. $hub_iface .. ".conf (" ..
+        ("" .. byte_length($wgtext)) .. " bytes) -> " .. $wgpath)
+    else
+      print("hub wg.conf NOT regenerated (missing wg.overlay; expected at " .. $WGOVERLAY .. ")")
+    end
+  end
+
+  -- An inherited holder can exit while generation is running. Re-prove both
+  -- lock occupancy and ancestry after the committed writes, so that loss is
+  -- detected rather than presenting possibly interleaved output as sealed.
+  if $inherit_lock then
+    if flock($WRITE_LOCK) or not $m.mesh_lock_held_by_ancestor($lock_token) then
+      print("")
+      print("  ERROR: the inherited write lock was released while this seal ran")
+      print("         the artifacts above may have interleaved with another writer.")
+      print("         Treat them as unverified and re-run seal under a lock.")
+      exit(1)
+    end
+  end
+end

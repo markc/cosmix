@@ -1,0 +1,152 @@
+#!/usr/bin/env mix
+-- mesh.mix — inspect the mesh through the local cosmix-noded broker.
+--
+--   mix _bin/mesh.mix             node names only (self first)
+--   mix _bin/mesh.mix -a|--all    trust identity and joined node table
+--   mix _bin/mesh.mix -j|--json   the same joined data as pretty JSON
+--
+-- The default view uses the broker's live transport snapshot. Detailed views
+-- join that snapshot to noded.inventory, the daemon's authenticated and
+-- freshness-checked public inventory summary, then probe each declared broker.
+-- This is read-only: it neither reads hub authoring state nor changes the mesh.
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+$o = getopt(args(), {
+  all:  {short: "a"},
+  json: {short: "j"}
+})
+if len($o["errors"]) > 0 or len($o["rest"]) > 0 then
+  for each $e in $o["errors"]
+    print("ERROR: " .. $e)
+  end
+  for each $arg in $o["rest"]
+    print("ERROR: unexpected argument '" .. $arg .. "'")
+  end
+  print("usage: mesh [-a|--all] [-j|--json]")
+  exit(2)
+end
+$all = $o["opts"]["all"]
+$json = $o["opts"]["json"]
+
+-- noded.peers is the live transport view for self + peers.
+send noded noded.peers
+$d.die_if($rc != 0, "cannot reach the local broker (noded.peers)")
+$self = $result["node"]
+$d.die_if(not $m.is_valid_label($self),
+  "local broker returned an invalid node name in noded.peers")
+
+-- Default view stays fast: no inventory request and no per-node pings.
+if not $all and not $json then
+  print($self)
+  for each $p in $result["peers"]
+    $d.die_if(not $m.is_valid_label($p["name"]),
+      "local broker returned an invalid peer name in noded.peers")
+    print($p["name"])
+  end
+  exit(0)
+end
+
+-- Snapshot transport data before the next send overwrites $result. Self is
+-- represented by the reply's top-level fields rather than in peers[].
+$tx = {}
+$tx[$self] = {wg_ip: $result["wg_ip"], port: $result["port"]}
+for each $p in $result["peers"]
+  $d.die_if(not $m.is_valid_label($p["name"]),
+    "local broker returned an invalid peer name in noded.peers")
+  $tx[$p["name"]] = {wg_ip: $p["wg_ip"], port: $p["port"]}
+end
+
+-- noded.inventory is derived from the signed inventory already accepted by
+-- cosmix-noded. mesh_lib's file verifier is deliberately not repeated here:
+-- this installed-node observer has no hub authoring file and must report the
+-- same atomically-published authority snapshot used for routing.
+send noded noded.inventory
+$d.die_if($rc != 0, "cannot reach the local broker (noded.inventory)")
+$d.die_if($result["posture"] != "verified",
+  "local broker inventory posture is not verified")
+
+-- Snapshot identity + members before the ping loop overwrites $result.
+$identity = {
+  mesh: $result["mesh"],
+  epoch: $result["epoch"],
+  posture: $result["posture"],
+  recovery_generation: $result["recovery_generation"],
+  via_recovery: $result["via_recovery"],
+  verified_by: $result["verified_by"],
+  verify_keys: $result["verify_keys"],
+  hash: $result["hash"]
+}
+$members = $result["members"]
+
+-- Join trust fields, transport fields, and a live reachability probe. A 2s
+-- timeout lets an offline node degrade to DOWN without hanging the report.
+$probe = fn($member)
+  $name = $member["name"]
+  $d.die_if(not $m.is_valid_label($name),
+    "local broker returned an invalid member name in noded.inventory")
+  $transport = $tx[$name]
+  $wg_ip = nil
+  $port = nil
+  if $transport != nil then
+    $wg_ip = $transport["wg_ip"]
+    $port = $transport["port"]
+  end
+  $address = "noded." .. $name .. ".bus"
+  send $address noded.ping timeout=2000
+  $reachable = $rc == 0
+  return {
+    name: $name,
+    wg_ip: $wg_ip,
+    port: $port,
+    bus: $member["bus"],
+    status: $member["status"],
+    reachable: $reachable,
+    is_self: $name == $self
+  }
+end
+$nodes = map($members, $probe)
+
+if $json then
+  print(json_encode({identity: $identity, nodes: $nodes}, true))
+  exit(0)
+end
+
+$verify_keys = ""
+for each $key in $identity["verify_keys"]
+  $verify_keys = $verify_keys .. $key["key_id"] .. "(" .. $key["status"] .. ") "
+end
+print("identity: mesh=" .. $identity["mesh"] .. " epoch=" .. ("" .. $identity["epoch"])
+  .. " posture=" .. $identity["posture"]
+  .. " recovery_gen=" .. ("" .. $identity["recovery_generation"])
+  .. " via_recovery=" .. ("" .. $identity["via_recovery"]))
+print("verified_by=" .. join($identity["verified_by"], ",") ..
+  "  verify_keys=" .. trim($verify_keys))
+print("hash=" .. $identity["hash"])
+print("")
+
+$row_of = fn($node)
+  $wg_ip = "?"
+  $port = "?"
+  if $node["wg_ip"] != nil then
+    $wg_ip = $node["wg_ip"]
+    $port = "" .. $node["port"]
+  end
+  $bus = $node["bus"] ? "yes" : "no"
+  $reach = $node["reachable"] ? "UP" : "DOWN"
+  $row = (rpad($node["name"], 9) .. rpad($wg_ip, 16) .. rpad($port, 6)
+    .. rpad($bus, 5) .. rpad($node["status"], 8) .. $reach)
+  if $node["is_self"] then
+    $row = $row .. "  (self)"
+  end
+  return $row
+end
+
+print(rpad("NAME", 9) .. rpad("WG_IP", 16) .. rpad("PORT", 6)
+  .. rpad("BUS", 5) .. rpad("STATUS", 8) .. "REACH")
+print(join(map($nodes, $row_of), "\n"))
+
+$down = filter($nodes, fn($node) = not $node["reachable"])
+print("")
+print(("" .. len($nodes)) .. " nodes, " .. ("" .. len($down)) .. " down")

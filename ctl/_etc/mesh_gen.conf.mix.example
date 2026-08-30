@@ -1,0 +1,7 @@
+-- mesh_gen.conf.mix.example — private identity for mesh generation.
+-- Copy to mesh_gen.conf.mix in your private control hub and edit it there.
+-- The public starter deliberately does not ship an active configuration.
+mesh_gen: {
+  schema_version: 1,
+  expected_mesh: "example.org"
+}

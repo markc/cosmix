@@ -1,0 +1,7 @@
+-- mesh_zones_check.conf.mix.example — private settings for the zones drift gate.
+-- Copy to mesh_zones_check.conf.mix in your private control hub and edit it there.
+-- The public starter deliberately does not ship an active configuration.
+mesh_zones_check: {
+  schema_version: 1,
+  expected_mesh: "example.org"
+}
