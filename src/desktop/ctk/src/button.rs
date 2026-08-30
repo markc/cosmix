@@ -879,6 +879,8 @@ mod tests {
     use bevy::picking::events::{Click, Pointer, Press};
     use bevy::picking::pointer::{Location, PointerButton, PointerId};
     use bevy::prelude::{App, Children, EntityEvent, Vec2};
+    #[cfg(feature = "theme")]
+    use bevy::prelude::{IntoScheduleConfigs, Update};
     use bevy::window::{PrimaryWindow, Window, WindowRef};
     use core::time::Duration;
     use cosmix_design::{
@@ -887,6 +889,11 @@ mod tests {
     };
 
     use crate::design::{design_resources_for_source, CtkDesignStatus};
+    #[cfg(feature = "theme")]
+    use crate::theme::{
+        apply_theme_requests, reload_theme_files, theme_file_watcher, ApplyTheme,
+        ThemeReloadSignal, ThemeRuntimeConfig, THEME_FILE,
+    };
     use crate::theme::{Mode, Scheme, ThemeSpec, ThemeState};
     use crate::widgets::{ControlChange, CtkWidgetsPlugin};
 
@@ -1319,6 +1326,84 @@ mod tests {
             .resource::<CtkDesignStatus>()
             .last_error()
             .is_none());
+    }
+
+    #[cfg(feature = "theme")]
+    #[test]
+    fn disk_edit_restyles_an_existing_buttons_colour_and_height_once() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let shared_path = temp.path().join(THEME_FILE);
+        std::fs::write(&shared_path, EMBEDDED_DEFAULT_SOURCE).unwrap();
+        let reload = ThemeReloadSignal::default();
+        reload.request_reload();
+        let mut app = test_app(&ThemeSpec::builtin());
+        app.insert_resource(ThemeRuntimeConfig {
+            shared_path: shared_path.clone(),
+            app_config_dir: None,
+        })
+        .init_resource::<crate::theme::ThemeLayerLastGood>()
+        .insert_resource(reload)
+        .add_message::<ApplyTheme>()
+        .add_systems(Update, (reload_theme_files, apply_theme_requests).chain());
+        let entity = spawn(
+            &mut app,
+            ButtonDef::text("Live").variant(ButtonVariant::Destructive),
+        );
+        app.update();
+        let before_revision = app.world().resource::<CtkDesign>().revision().unwrap();
+        let before_background = app.world().get::<BackgroundColor>(entity).unwrap().0;
+        let before_height = app.world().get::<Node>(entity).unwrap().height;
+        let (woke_tx, woke_rx) = std::sync::mpsc::sync_channel(1);
+        let wake = std::sync::Arc::new(move || {
+            let _ = woke_tx.try_send(());
+        });
+        let _watcher = theme_file_watcher(
+            vec![shared_path.clone()],
+            app.world().resource::<ThemeReloadSignal>().clone(),
+            wake,
+        )
+        .unwrap();
+
+        let edited = EMBEDDED_DEFAULT_SOURCE
+            .replacen("meter_red: \"#c21725\"", "meter_red: \"#006818\"", 1)
+            .replacen(
+                "danger_surface: \"#c21725\"",
+                "danger_surface: \"#006818\"",
+                1,
+            )
+            .replacen(
+                "\"status.danger\": { color_space: \"oklch\", l: 0.52, c: 0.20, h: 25.0 }",
+                "\"status.danger\": { color_space: \"oklch\", l: 0.45, c: 0.15, h: 145.0 }",
+                1,
+            )
+            .replacen(
+                "\"button.height.md\": { kind: \"px\", value: 28.0 }",
+                "\"button.height.md\": { kind: \"px\", value: 30.0 }",
+                1,
+            );
+        std::fs::write(&shared_path, edited).unwrap();
+        woke_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("directory watcher did not request the disk reload");
+        app.update();
+
+        assert_ne!(
+            app.world().get::<BackgroundColor>(entity).unwrap().0,
+            before_background
+        );
+        assert_ne!(
+            app.world().get::<Node>(entity).unwrap().height,
+            before_height
+        );
+        assert_eq!(app.world().get::<Node>(entity).unwrap().height, px(30));
+        assert_eq!(
+            app.world()
+                .resource::<CtkDesign>()
+                .revision()
+                .unwrap()
+                .get(),
+            before_revision.get() + 1
+        );
     }
 
     #[test]

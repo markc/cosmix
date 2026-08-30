@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.50.0 — 2026-08-30
+
+- Load a complete `design` section directly from the existing shared or
+  per-app `theme.conf.mix`, with `app ← shared ← embedded` source precedence.
+  Selection-only files contribute no design source; partial or invalid design
+  documents retain the last-known-good compiled table.
+- Watch the parent directories of both theme files through `notify`, coalesce
+  save bursts, and wake reactive Winit apps so changed button colours and
+  metrics repaint live. Focus gain and Bus `theme.changed` use the same reload
+  path as missed-event backstops, and byte-identical saves are no-ops.
+- Resolve the shared file through `cosmix_config::store::config_dir()`
+  (`COSMIX_ETC`, then a located checkout's `$COSMIX/etc`, then XDG/FHS), read
+  each layer once with a 4 MiB cap, and detect design authority from strict-map
+  key presence. Invalid or mid-save palette layers retain their last-good
+  values and design authority as one last-good layer and are logged once;
+  invalid design sections keep the last-good compiled table.
+- Restrict target-file watcher triggers to committed write-close, rename-to,
+  removal and rescan events so CTK neither self-triggers nor reads a transaction
+  before commit. Parent-directory events, focus and Bus reloads verify directory
+  identity and reinstall a watch after replacement. Relative configured paths
+  are made lexically absolute, while real paths are re-resolved on every
+  reload so replacing a directory or file symlink moves the active watch.
+
 ## 0.49.0 — 2026-08-30
 
 - Make the compiled `cosmix-design` button table the sole authority for every

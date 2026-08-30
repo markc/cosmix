@@ -1,9 +1,17 @@
 -- Cosmix theme (strict-data .conf.mix) — copy to one of:
---   ~/.config/cosmix/theme.conf.mix        (desktop-wide: every cosmix app)
---   <app config dir>/theme.conf.mix        (per-app override of the above)
+--   <cosmix config dir>/theme.conf.mix      (desktop-wide: every cosmix app)
+--   <app config dir>/theme.conf.mix         (per-app override of the above)
+--
+-- The shared Cosmix config dir resolves as: COSMIX_ETC when set; otherwise
+-- $COSMIX/etc when the running binary locates a checkout; otherwise the XDG
+-- Cosmix config directory for an unrooted user install.
 --
 -- Resolution cascade: built-in Ocean-light  ←  shared  ←  per-app.
--- A missing or malformed file is skipped, never fatal.
+-- Missing files clear their layer. Palette validation and design authority
+-- commit together: a malformed or mid-save layer is logged once and retains
+-- both last-good values. A present-but-invalid design keeps the last-known-good
+-- button table; it never silently falls through. Symlinked configured paths
+-- are re-resolved on every reload.
 --
 -- The palette model is shared verbatim with the web design system
 -- (dcs.spa / webd site.css): a scheme is a hue; only the accent's L/C is
@@ -20,8 +28,7 @@ mode: "dark"
 -- Uncomment to tweak individual console tokens; unset tokens keep the scheme.
 -- These colours hot-swap for legacy UiTheme-token consumers. CtkButton does
 -- not read these token overrides: its colours and metrics come from the
--- embedded revision-1 compiled design (or an in-memory complete-source
--- replacement). On-disk design sections are not read yet.
+-- compiled design source described below.
 --
 -- surface:        "#0b0d17"   -- window background
 -- panel:          "#141726"   -- strip panel
@@ -44,3 +51,17 @@ mode: "dark"
 -- fader_height:   250.0
 -- knob_size:      58.0
 -- meter_width:    28.0
+
+-- CtkButton design source contract
+-- --------------------------------
+-- This same theme.conf.mix may contain one COMPLETE `design` section copied
+-- from ctk's shipped revision-1 source. CTK selects one whole source:
+--
+--   per-app design  <-  shared design  <-  embedded revision-1 design
+--
+-- Omitting `design` (as this selection-only example does) contributes no
+-- design source. A partial or invalid section is rejected and the running app
+-- keeps its last-known-good buttons; CTK never merges partial design overlays.
+-- Saves are watched live, including atomic replacements. Byte-identical saves
+-- are no-ops. The complete reference document is:
+--   crates/cosmix-design/src/defaults/revision-1.theme.conf.mix

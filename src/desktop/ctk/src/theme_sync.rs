@@ -5,15 +5,12 @@
 //! local apps re-read durable state immediately; focus-gained file reload
 //! remains the missed-wake backstop.
 
-use bevy::ecs::message::{MessageReader, MessageWriter};
+use bevy::ecs::message::MessageReader;
 use bevy::ecs::system::Res;
 use serde::Deserialize;
 
 use crate::bus::{BusBridge, BusMessage};
-use crate::theme::{
-    resolve_app_theme, shared_theme_path, ApplyTheme, Mode, Scheme, ThemeRuntimeConfig,
-    ThemeWriteCompleted,
-};
+use crate::theme::{shared_theme_path, Mode, Scheme, ThemeReloadSignal, ThemeWriteCompleted};
 
 pub const THEME_CHANGED_TOPIC: &str = "theme.changed";
 
@@ -87,8 +84,7 @@ pub(crate) fn publish_shared_theme_changes(
 
 pub(crate) fn receive_theme_changed(
     bridge: Option<Res<BusBridge>>,
-    config: Res<ThemeRuntimeConfig>,
-    mut requests: MessageWriter<ApplyTheme>,
+    reload: Res<ThemeReloadSignal>,
 ) {
     let Some(message) = bridge.and_then(|bridge| bridge.drain_theme_changed()) else {
         return;
@@ -96,9 +92,7 @@ pub(crate) fn receive_theme_changed(
     if !is_valid_local_delivery(&message) {
         return;
     }
-    requests.write(ApplyTheme(resolve_app_theme(
-        config.app_config_dir.as_deref(),
-    )));
+    reload.request_reload();
 }
 
 #[cfg(all(feature = "theme", feature = "bus"))]
@@ -122,7 +116,8 @@ mod tests {
     use super::*;
     use crate::bus::{test_bridge, TestBusPeer};
     use crate::theme::{
-        apply_theme, apply_theme_requests, ThemeSpec, ThemeState, ThemeWriteRequest, THEME_FILE,
+        apply_theme, apply_theme_requests, reload_theme_files, ApplyTheme, ThemeReloadSignal,
+        ThemeRuntimeConfig, ThemeSpec, ThemeState, ThemeWriteRequest, THEME_FILE,
     };
 
     static TEST_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -164,17 +159,26 @@ mod tests {
             .insert_resource(theme)
             .insert_resource(state)
             .insert_resource(ThemeRuntimeConfig {
+                shared_path: app_config_dir.join("missing-shared-theme.conf.mix"),
                 app_config_dir: Some(app_config_dir.clone()),
             })
+            .init_resource::<crate::theme::ThemeLayerLastGood>()
+            .insert_resource(ThemeReloadSignal::default())
             .insert_resource(bridge)
             .add_message::<ApplyTheme>()
             .add_message::<ThemeWriteRequest>()
             .add_message::<ThemeWriteCompleted>()
             .add_systems(
                 Update,
-                (receive_theme_changed, apply_theme_requests).chain(),
+                (
+                    receive_theme_changed,
+                    reload_theme_files,
+                    apply_theme_requests,
+                )
+                    .chain(),
             )
             .add_systems(Last, publish_shared_theme_changes);
+        crate::design::init_design_resources(&mut app);
         (app, peer, app_config_dir)
     }
 

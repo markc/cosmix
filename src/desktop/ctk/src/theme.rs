@@ -8,7 +8,7 @@
 //! `Res<UiTheme>` each time they repaint.
 
 #[cfg(feature = "theme")]
-use bevy::app::AppExit;
+use bevy::app::{AppExit, PreStartup};
 use bevy::app::{PostUpdate, PropagateSet};
 use bevy::color::Color;
 use bevy::ecs::change_detection::DetectChangesMut;
@@ -20,6 +20,8 @@ use bevy::ecs::query::{Changed, Has, Or, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Commands, Query, Res, ResMut};
 use bevy::feathers::theme::{ThemeToken, UiTheme};
+#[cfg(feature = "theme")]
+use bevy::log::info;
 use bevy::log::warn;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::{App, Entity, Plugin, Update};
@@ -1351,20 +1353,40 @@ pub struct ThemeWriteCompleted {
     pub result: Result<(), String>,
 }
 
-/// Runtime colour-theme application and focus-gained reload support.
+/// Runtime colour-theme application and live `theme.conf.mix` reload support.
 ///
-/// With the `theme` feature, `app_config_dir` participates in
-/// `built-in ← shared ← app` resolution whenever a window gains focus.
-/// Legacy non-button metrics from those reloads are ignored until relaunch.
+/// With the `theme` feature, CTK watches the shared and optional per-app theme
+/// directories. Focus gain and Bus invalidations feed the same reload path as
+/// missed-event backstops. Legacy non-button metrics remain launch-time only.
 pub struct CtkThemePlugin {
     app_config_dir: Option<std::path::PathBuf>,
+    #[cfg(feature = "theme")]
+    shared_path: std::path::PathBuf,
 }
 
 impl CtkThemePlugin {
     /// Build the runtime plugin for an optional per-app theme directory.
     pub fn new(app_config_dir: Option<std::path::PathBuf>) -> Self {
-        Self { app_config_dir }
+        Self {
+            app_config_dir,
+            #[cfg(feature = "theme")]
+            shared_path: plugin_shared_theme_path(),
+        }
     }
+}
+
+#[cfg(all(feature = "theme", not(test)))]
+fn plugin_shared_theme_path() -> std::path::PathBuf {
+    shared_theme_path()
+}
+
+// Unit tests must never inherit the operator's real desktop theme. Tests that
+// exercise shared-file loading inject their own explicit temp path.
+#[cfg(all(feature = "theme", test))]
+fn plugin_shared_theme_path() -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join(format!("ctk-test-no-shared-theme-{}", std::process::id()))
+        .join(THEME_FILE)
 }
 
 impl Default for CtkThemePlugin {
@@ -1423,26 +1445,52 @@ impl Plugin for CtkThemePlugin {
             ),
         );
         #[cfg(feature = "theme")]
-        app.insert_resource(ThemeRuntimeConfig {
-            app_config_dir: self.app_config_dir.clone(),
-        })
-        .insert_resource(ThemeWriteWorker::start())
-        .add_message::<AppExit>()
-        .add_message::<WindowFocused>()
-        .add_message::<ThemeWriteRequest>()
-        .add_message::<ThemeWriteCompleted>()
-        .add_systems(
-            Update,
-            (
-                reload_theme_on_focus.before(apply_theme_requests),
-                service_theme_writes,
-            ),
-        )
-        .add_systems(bevy::app::Last, shutdown_theme_writer);
+        {
+            let reload = ThemeReloadSignal::default();
+            let shared_path = lexical_absolute_theme_path(&self.shared_path);
+            let app_config_dir = self
+                .app_config_dir
+                .as_deref()
+                .map(lexical_absolute_theme_path);
+            let app_theme_path = app_config_dir
+                .as_deref()
+                .map(|directory| directory.join(THEME_FILE));
+            let startup_file_exists = shared_path.exists()
+                || app_theme_path
+                    .as_deref()
+                    .is_some_and(std::path::Path::exists);
+            if startup_file_exists {
+                reload.request_reload();
+            }
+            app.insert_resource(ThemeRuntimeConfig {
+                shared_path,
+                app_config_dir,
+            })
+            .init_resource::<ThemeLayerLastGood>()
+            .insert_resource(StartupDiskDesignSourceLog {
+                pending: startup_file_exists,
+            })
+            .insert_resource(reload)
+            .insert_resource(ThemeWriteWorker::start())
+            .add_message::<AppExit>()
+            .add_message::<WindowFocused>()
+            .add_message::<ThemeWriteRequest>()
+            .add_message::<ThemeWriteCompleted>()
+            .add_systems(PreStartup, start_theme_file_watcher)
+            .add_systems(
+                Update,
+                (
+                    reload_theme_on_focus.before(reload_theme_files),
+                    reload_theme_files.before(apply_theme_requests),
+                    service_theme_writes,
+                ),
+            )
+            .add_systems(bevy::app::Last, shutdown_theme_writer);
+        }
         #[cfg(all(feature = "theme", feature = "bus"))]
         app.add_systems(
             Update,
-            crate::theme_sync::receive_theme_changed.before(apply_theme_requests),
+            crate::theme_sync::receive_theme_changed.before(reload_theme_files),
         )
         .add_systems(
             bevy::app::Last,
@@ -1469,7 +1517,303 @@ pub(crate) fn apply_theme_requests(
 #[cfg(feature = "theme")]
 #[derive(Resource)]
 pub(crate) struct ThemeRuntimeConfig {
+    pub(crate) shared_path: std::path::PathBuf,
     pub(crate) app_config_dir: Option<std::path::PathBuf>,
+}
+
+#[cfg(feature = "theme")]
+fn lexical_absolute_theme_path(path: &std::path::Path) -> std::path::PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(feature = "theme")]
+fn resolved_theme_path(path: &std::path::Path) -> std::path::PathBuf {
+    let absolute = lexical_absolute_theme_path(path);
+    if let Ok(canonical) = std::fs::canonicalize(&absolute) {
+        return canonical;
+    }
+    if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) {
+        if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+            return canonical_parent.join(name);
+        }
+    }
+    absolute
+}
+
+#[cfg(feature = "theme")]
+#[derive(Default, Resource)]
+pub(crate) struct ThemeLayerLastGood {
+    shared: CachedThemeLayer,
+    app: CachedThemeLayer,
+}
+
+#[cfg(feature = "theme")]
+#[derive(Default)]
+struct CachedThemeLayer {
+    path: Option<std::path::PathBuf>,
+    palette: Option<ThemeFile>,
+    design: Option<CachedDesignLayer>,
+}
+
+#[cfg(feature = "theme")]
+enum CachedDesignLayer {
+    Absent,
+    Present(Vec<u8>),
+}
+
+#[cfg(feature = "theme")]
+#[derive(Resource)]
+pub(crate) struct StartupDiskDesignSourceLog {
+    pending: bool,
+}
+
+#[cfg(feature = "theme")]
+#[derive(Default)]
+struct ThemeReloadState {
+    pending: std::sync::atomic::AtomicBool,
+    pending_reload_count: std::sync::atomic::AtomicU64,
+    logged_failures: std::sync::Mutex<std::collections::VecDeque<u64>>,
+}
+
+#[cfg(feature = "theme")]
+const LOGGED_THEME_FAILURE_CAPACITY: usize = 8;
+
+/// Coalesced ingress shared by the directory watcher, focus backstop and Bus.
+#[cfg(feature = "theme")]
+#[derive(Clone, Default, Resource)]
+pub(crate) struct ThemeReloadSignal(std::sync::Arc<ThemeReloadState>);
+
+#[cfg(feature = "theme")]
+impl ThemeReloadSignal {
+    /// Returns true only for the first request before the pending reload runs.
+    pub(crate) fn request_reload(&self) -> bool {
+        if self
+            .0
+            .pending
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return false;
+        }
+        self.0
+            .pending_reload_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
+    fn take_pending(&self) -> bool {
+        self.0
+            .pending
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    fn log_failure_once(&self, fingerprint: u64, message: &str) {
+        let mut logged = self
+            .0
+            .logged_failures
+            .lock()
+            .expect("CTK theme failure cache poisoned");
+        if logged.contains(&fingerprint) {
+            return;
+        }
+        if logged.len() == LOGGED_THEME_FAILURE_CAPACITY {
+            logged.pop_front();
+        }
+        logged.push_back(fingerprint);
+        warn!("CTK theme layer rejected: {message}");
+    }
+
+    #[cfg(test)]
+    fn pending_reload_count(&self) -> u64 {
+        self.0
+            .pending_reload_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn logged_failure_count(&self) -> usize {
+        self.0
+            .logged_failures
+            .lock()
+            .expect("CTK theme failure cache poisoned")
+            .len()
+    }
+}
+
+#[cfg(feature = "theme")]
+#[derive(Resource)]
+pub(crate) struct ThemeFileWatcher {
+    /// Stable configured identities. These remain lexical so replacing a
+    /// symlink in the configured path changes what the next reload reads.
+    targets: std::sync::Arc<Vec<std::path::PathBuf>>,
+    event_paths: std::sync::Arc<std::sync::RwLock<ThemeWatchPaths>>,
+    state: std::sync::Mutex<ThemeWatcherState>,
+    watch_generation: std::sync::atomic::AtomicU64,
+    watch_invalidation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(feature = "theme")]
+struct ThemeWatcherState {
+    watcher: notify::RecommendedWatcher,
+    watched_parents: std::collections::HashMap<std::path::PathBuf, DirectoryIdentity>,
+    observed_invalidation: u64,
+}
+
+#[cfg(feature = "theme")]
+#[derive(Clone, Default)]
+struct ThemeWatchPaths {
+    targets: Vec<std::path::PathBuf>,
+    parents: Vec<std::path::PathBuf>,
+}
+
+#[cfg(all(feature = "theme", unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(all(feature = "theme", not(unix)))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectoryIdentity(std::path::PathBuf);
+
+#[cfg(feature = "theme")]
+impl ThemeFileWatcher {
+    fn ensure_watches(&self) {
+        use notify::Watcher;
+
+        let event_paths = theme_watch_paths(&self.targets);
+        let parents: std::collections::HashSet<_> = event_paths.parents.iter().cloned().collect();
+        *self
+            .event_paths
+            .write()
+            .expect("CTK theme watcher paths poisoned") = event_paths;
+        let mut state = self.state.lock().expect("CTK theme watcher poisoned");
+        let invalidation = self
+            .watch_invalidation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let force_reinstall = state.observed_invalidation != invalidation;
+        let mut all_watched = true;
+        let obsolete: Vec<_> = state
+            .watched_parents
+            .keys()
+            .filter(|parent| !parents.contains(*parent))
+            .cloned()
+            .collect();
+        for parent in obsolete {
+            let _ = state.watcher.unwatch(&parent);
+            state.watched_parents.remove(&parent);
+        }
+        for parent in parents {
+            if force_reinstall && state.watched_parents.contains_key(&parent) {
+                let _ = state.watcher.unwatch(&parent);
+                state.watched_parents.remove(&parent);
+            }
+            if let Err(error) = std::fs::create_dir_all(&parent) {
+                warn!(
+                    "CTK cannot create theme directory {} for watching: {error}",
+                    parent.display()
+                );
+                all_watched = false;
+                continue;
+            }
+            let Some(identity) = directory_identity(&parent) else {
+                warn!(
+                    "CTK cannot identify theme directory {} for watching",
+                    parent.display()
+                );
+                all_watched = false;
+                continue;
+            };
+            if state.watched_parents.get(&parent) == Some(&identity) {
+                continue;
+            }
+            if state.watched_parents.contains_key(&parent) {
+                let _ = state.watcher.unwatch(&parent);
+                state.watched_parents.remove(&parent);
+            }
+            match state
+                .watcher
+                .watch(&parent, notify::RecursiveMode::NonRecursive)
+            {
+                Ok(()) => {
+                    state.watched_parents.insert(parent, identity);
+                    self.watch_generation
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(error) => {
+                    all_watched = false;
+                    warn!(
+                        "CTK cannot watch theme directory {}: {error}",
+                        parent.display()
+                    );
+                }
+            }
+        }
+        if all_watched {
+            state.observed_invalidation = invalidation;
+        }
+    }
+
+    #[cfg(test)]
+    fn watch_generation(&self) -> u64 {
+        self.watch_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(feature = "theme")]
+fn theme_watch_paths(targets: &[std::path::PathBuf]) -> ThemeWatchPaths {
+    fn push_unique(paths: &mut Vec<std::path::PathBuf>, path: std::path::PathBuf) {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+
+    let mut result = ThemeWatchPaths::default();
+    for configured in targets {
+        let configured = lexical_absolute_theme_path(configured);
+        let resolved = resolved_theme_path(&configured);
+        push_unique(&mut result.targets, configured.clone());
+        push_unique(&mut result.targets, resolved.clone());
+        if let Some(parent) = resolved.parent() {
+            push_unique(&mut result.parents, parent.to_path_buf());
+        }
+
+        // A watch installed through a symlink follows the destination inode
+        // and cannot see the directory entry itself being replaced. Watch the
+        // containing lexical directory and accept the symlink path as a
+        // target so an atomic rename-to causes the next reload to re-resolve.
+        let mut prefix = std::path::PathBuf::new();
+        for component in configured.components() {
+            prefix.push(component.as_os_str());
+            let is_symlink = std::fs::symlink_metadata(&prefix)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_symlink {
+                push_unique(&mut result.targets, prefix.clone());
+                if let Some(parent) = prefix.parent() {
+                    push_unique(&mut result.parents, parent.to_path_buf());
+                }
+            }
+        }
+    }
+    result
+}
+
+#[cfg(all(feature = "theme", unix))]
+fn directory_identity(path: &std::path::Path) -> Option<DirectoryIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(DirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(all(feature = "theme", not(unix)))]
+fn directory_identity(path: &std::path::Path) -> Option<DirectoryIdentity> {
+    std::fs::canonicalize(path).ok().map(DirectoryIdentity)
 }
 
 #[cfg(feature = "theme")]
@@ -1594,18 +1938,442 @@ fn publish_theme_write_completions(
 #[cfg(feature = "theme")]
 fn reload_theme_on_focus(
     mut focused: MessageReader<WindowFocused>,
-    config: bevy::ecs::system::Res<ThemeRuntimeConfig>,
-    mut requests: MessageWriter<ApplyTheme>,
+    reload: bevy::ecs::system::Res<ThemeReloadSignal>,
 ) {
     let mut gained = false;
     for event in focused.read() {
         gained |= event.focused;
     }
     if gained {
-        requests.write(ApplyTheme(resolve_app_theme(
-            config.app_config_dir.as_deref(),
-        )));
+        reload.request_reload();
     }
+}
+
+#[cfg(feature = "theme")]
+pub(crate) fn reload_theme_files(
+    config: Res<ThemeRuntimeConfig>,
+    reload: Res<ThemeReloadSignal>,
+    watcher: Option<Res<ThemeFileWatcher>>,
+    mut startup_source_log: Option<ResMut<StartupDiskDesignSourceLog>>,
+    mut last_good: ResMut<ThemeLayerLastGood>,
+    mut design: ResMut<crate::design::CtkDesignStatus>,
+    mut requests: MessageWriter<ApplyTheme>,
+) {
+    if !reload.take_pending() {
+        return;
+    }
+
+    if let Some(watcher) = watcher {
+        watcher.ensure_watches();
+    }
+
+    let app_path = config
+        .app_config_dir
+        .as_deref()
+        .map(|directory| directory.join(THEME_FILE));
+    let shared = read_theme_layer(&config.shared_path);
+    let app = app_path.as_deref().map(read_theme_layer);
+    requests.write(ApplyTheme(resolve_snapshot_theme(
+        &shared,
+        app.as_ref(),
+        &reload,
+        &mut last_good,
+    )));
+
+    let disk_design = resolve_cached_design(&last_good);
+    let log_startup_selection = startup_source_log
+        .as_mut()
+        .is_some_and(|log| std::mem::take(&mut log.pending));
+    if log_startup_selection {
+        if let DiskDesignSource::File { path, layer, .. } = &disk_design {
+            info!(
+                "CTK design source selected: {} (layer={})",
+                path.display(),
+                layer.name()
+            );
+        }
+    }
+    match disk_design {
+        DiskDesignSource::Embedded => design.use_embedded_source(),
+        DiskDesignSource::File { path, bytes, .. } => {
+            design.replace_source_bytes(path.to_string_lossy(), bytes);
+        }
+    }
+}
+
+#[cfg(feature = "theme")]
+enum DiskDesignSource {
+    Embedded,
+    File {
+        path: std::path::PathBuf,
+        bytes: Vec<u8>,
+        layer: ThemeLayer,
+    },
+}
+
+#[cfg(feature = "theme")]
+#[derive(Clone, Copy)]
+enum ThemeLayer {
+    App,
+    Shared,
+}
+
+#[cfg(feature = "theme")]
+impl ThemeLayer {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::App => "app",
+            Self::Shared => "shared",
+        }
+    }
+}
+
+#[cfg(feature = "theme")]
+const MAX_THEME_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+#[cfg(feature = "theme")]
+enum ThemeLayerSnapshot {
+    Missing,
+    Rejected { fingerprint: u64, message: String },
+    Loaded(Box<LoadedThemeLayer>),
+}
+
+#[cfg(feature = "theme")]
+struct LoadedThemeLayer {
+    path: std::path::PathBuf,
+    bytes: Vec<u8>,
+    has_design: bool,
+    theme: Result<ThemeFile, String>,
+}
+
+#[cfg(feature = "theme")]
+fn read_theme_layer(path: &std::path::Path) -> ThemeLayerSnapshot {
+    use std::io::Read;
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ThemeLayerSnapshot::Missing;
+        }
+        Err(error) => {
+            return ThemeLayerSnapshot::Rejected {
+                fingerprint: theme_layer_fingerprint(path, &[], "open-error"),
+                message: format!("theme {} could not be opened: {error}", path.display()),
+            };
+        }
+    };
+    let mut bytes = Vec::new();
+    if let Err(error) = file.take(MAX_THEME_FILE_BYTES + 1).read_to_end(&mut bytes) {
+        return ThemeLayerSnapshot::Rejected {
+            fingerprint: theme_layer_fingerprint(path, &bytes, "read-error"),
+            message: format!("theme {} could not be read: {error}", path.display()),
+        };
+    }
+    if bytes.is_empty() {
+        return ThemeLayerSnapshot::Rejected {
+            fingerprint: theme_layer_fingerprint(path, &bytes, "empty"),
+            message: format!("theme {} is empty", path.display()),
+        };
+    }
+    if bytes.len() as u64 > MAX_THEME_FILE_BYTES {
+        return ThemeLayerSnapshot::Rejected {
+            fingerprint: theme_layer_fingerprint(path, &bytes, "too-large"),
+            message: format!(
+                "theme {} exceeds the {} MiB limit",
+                path.display(),
+                MAX_THEME_FILE_BYTES / (1024 * 1024)
+            ),
+        };
+    }
+    let source = match std::str::from_utf8(&bytes) {
+        Ok(source) => source,
+        Err(error) => {
+            return ThemeLayerSnapshot::Rejected {
+                fingerprint: theme_layer_fingerprint(path, &bytes, "invalid-utf8"),
+                message: format!("theme {} is not UTF-8: {error}", path.display()),
+            };
+        }
+    };
+    let value = match cosmix_config::parse_mix_data(source) {
+        Ok(value) => value,
+        Err(error) => {
+            return ThemeLayerSnapshot::Rejected {
+                fingerprint: theme_layer_fingerprint(path, &bytes, "parse-error"),
+                message: format!("theme {} could not be parsed: {error}", path.display()),
+            };
+        }
+    };
+    let cosmix_mix::value::Value::Map(map) = &value else {
+        return ThemeLayerSnapshot::Rejected {
+            fingerprint: theme_layer_fingerprint(path, &bytes, "not-a-map"),
+            message: format!("theme {} must contain a top-level map", path.display()),
+        };
+    };
+    let has_design = map.contains_key("design");
+    let theme = cosmix_mix::from_value(&value)
+        .map_err(|error| format!("theme {}: {error}", path.display()));
+    ThemeLayerSnapshot::Loaded(Box::new(LoadedThemeLayer {
+        path: path.to_path_buf(),
+        bytes,
+        has_design,
+        theme,
+    }))
+}
+
+#[cfg(feature = "theme")]
+fn resolve_snapshot_theme(
+    shared: &ThemeLayerSnapshot,
+    app: Option<&ThemeLayerSnapshot>,
+    reload: &ThemeReloadSignal,
+    last_good: &mut ThemeLayerLastGood,
+) -> ThemeSpec {
+    let mut spec = ThemeSpec::builtin();
+    apply_snapshot_layer(
+        &mut spec,
+        shared,
+        &mut last_good.shared,
+        TypographyProvenance::SharedTheme,
+        reload,
+    );
+    if let Some(app) = app {
+        apply_snapshot_layer(
+            &mut spec,
+            app,
+            &mut last_good.app,
+            TypographyProvenance::AppTheme,
+            reload,
+        );
+    } else {
+        last_good.app = CachedThemeLayer::default();
+    }
+    spec.check_selection_contrast();
+    spec
+}
+
+#[cfg(feature = "theme")]
+fn apply_snapshot_layer(
+    spec: &mut ThemeSpec,
+    snapshot: &ThemeLayerSnapshot,
+    last_good: &mut CachedThemeLayer,
+    provenance: TypographyProvenance,
+    reload: &ThemeReloadSignal,
+) {
+    match snapshot {
+        ThemeLayerSnapshot::Missing => {
+            *last_good = CachedThemeLayer::default();
+        }
+        ThemeLayerSnapshot::Rejected {
+            fingerprint,
+            message,
+        } => {
+            reload.log_failure_once(*fingerprint, message);
+            apply_cached_palette(spec, last_good, provenance, reload);
+        }
+        ThemeLayerSnapshot::Loaded(layer) => match &layer.theme {
+            Ok(theme) => {
+                let mut candidate = spec.clone();
+                match candidate.overlay_with_provenance(theme, provenance) {
+                    Ok(()) => {
+                        *spec = candidate;
+                        last_good.path = Some(layer.path.clone());
+                        last_good.palette = Some(theme.clone());
+                        last_good.design = Some(if layer.has_design {
+                            CachedDesignLayer::Present(layer.bytes.clone())
+                        } else {
+                            CachedDesignLayer::Absent
+                        });
+                    }
+                    Err(error) => {
+                        let message = format!(
+                            "theme {}: {error} (last-good palette retained)",
+                            layer.path.display()
+                        );
+                        reload.log_failure_once(
+                            theme_layer_fingerprint(&layer.path, &layer.bytes, "palette-overlay"),
+                            &message,
+                        );
+                        apply_cached_palette(spec, last_good, provenance, reload);
+                    }
+                }
+            }
+            Err(message) => {
+                reload.log_failure_once(
+                    theme_layer_fingerprint(&layer.path, &layer.bytes, "palette-deserialize"),
+                    message,
+                );
+                apply_cached_palette(spec, last_good, provenance, reload);
+            }
+        },
+    }
+}
+
+#[cfg(feature = "theme")]
+fn apply_cached_palette(
+    spec: &mut ThemeSpec,
+    last_good: &CachedThemeLayer,
+    provenance: TypographyProvenance,
+    reload: &ThemeReloadSignal,
+) {
+    let (Some(path), Some(palette)) = (&last_good.path, &last_good.palette) else {
+        return;
+    };
+    if let Err(error) = spec.overlay_with_provenance(palette, provenance) {
+        let message = format!(
+            "theme {}: cached palette could not be reapplied: {error}",
+            path.display()
+        );
+        reload.log_failure_once(
+            theme_layer_fingerprint(path, &[], "cached-palette-overlay"),
+            &message,
+        );
+    }
+}
+
+/// Select the highest-precedence last accepted layer that contains a `design`
+/// key.
+/// Its complete original byte snapshot remains the compiler authority across
+/// a rejected mid-save read, including when the value itself is nil, partial or
+/// otherwise invalid. A committed map without the key or a removal clears that
+/// layer's cached design authority.
+#[cfg(feature = "theme")]
+fn resolve_cached_design(last_good: &ThemeLayerLastGood) -> DiskDesignSource {
+    for (cached, precedence) in [
+        (&last_good.app, ThemeLayer::App),
+        (&last_good.shared, ThemeLayer::Shared),
+    ] {
+        if let (Some(path), Some(CachedDesignLayer::Present(bytes))) =
+            (&cached.path, &cached.design)
+        {
+            return DiskDesignSource::File {
+                path: path.clone(),
+                bytes: bytes.clone(),
+                layer: precedence,
+            };
+        }
+    }
+    DiskDesignSource::Embedded
+}
+
+#[cfg(feature = "theme")]
+fn theme_layer_fingerprint(path: &std::path::Path, bytes: &[u8], category: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    bytes.hash(&mut hasher);
+    category.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg(feature = "theme")]
+fn start_theme_file_watcher(
+    mut commands: Commands,
+    config: Res<ThemeRuntimeConfig>,
+    reload: Res<ThemeReloadSignal>,
+    event_loop_proxy: Option<Res<bevy::winit::EventLoopProxyWrapper>>,
+) {
+    let mut paths = vec![config.shared_path.clone()];
+    if let Some(app_config_dir) = &config.app_config_dir {
+        paths.push(app_config_dir.join(THEME_FILE));
+    }
+    let wake: std::sync::Arc<dyn Fn() + Send + Sync> = if let Some(proxy) = event_loop_proxy {
+        let proxy = (**proxy).clone();
+        std::sync::Arc::new(move || {
+            let _ = proxy.send_event(bevy::winit::WinitUserEvent::WakeUp);
+        })
+    } else {
+        std::sync::Arc::new(|| {})
+    };
+    match theme_file_watcher(paths, (*reload).clone(), wake) {
+        Ok(watcher) => {
+            commands.insert_resource(watcher);
+        }
+        Err(error) => warn!("CTK theme directory watcher unavailable: {error}"),
+    }
+}
+
+#[cfg(feature = "theme")]
+pub(crate) fn theme_file_watcher(
+    paths: Vec<std::path::PathBuf>,
+    reload: ThemeReloadSignal,
+    wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+) -> Result<ThemeFileWatcher, String> {
+    let targets = std::sync::Arc::new(
+        paths
+            .iter()
+            .map(|path| lexical_absolute_theme_path(path))
+            .collect::<Vec<_>>(),
+    );
+    let event_paths = std::sync::Arc::new(std::sync::RwLock::new(theme_watch_paths(&targets)));
+    let callback_event_paths = std::sync::Arc::clone(&event_paths);
+    let watch_invalidation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let callback_invalidation = std::sync::Arc::clone(&watch_invalidation);
+    let watcher =
+        notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
+            Ok(event) => {
+                let event_paths = callback_event_paths
+                    .read()
+                    .expect("CTK theme watcher paths poisoned");
+                if theme_event_rechecks_watches(&event, &event_paths) {
+                    callback_invalidation.fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
+                if theme_event_requests_reload(&event, &event_paths) && reload.request_reload() {
+                    wake();
+                }
+            }
+            Err(error) => {
+                warn!("CTK theme directory watcher error: {error}");
+                callback_invalidation.fetch_add(1, std::sync::atomic::Ordering::Release);
+                if reload.request_reload() {
+                    wake();
+                }
+            }
+        })
+        .map_err(|error| error.to_string())?;
+    let result = ThemeFileWatcher {
+        targets,
+        event_paths,
+        state: std::sync::Mutex::new(ThemeWatcherState {
+            watcher,
+            watched_parents: std::collections::HashMap::new(),
+            observed_invalidation: 0,
+        }),
+        watch_generation: std::sync::atomic::AtomicU64::new(0),
+        watch_invalidation,
+    };
+    result.ensure_watches();
+    Ok(result)
+}
+
+#[cfg(feature = "theme")]
+fn theme_event_requests_reload(event: &notify::Event, paths: &ThemeWatchPaths) -> bool {
+    use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
+    use notify::EventKind;
+
+    if theme_event_rechecks_watches(event, paths) {
+        return true;
+    }
+    let committed_change = matches!(
+        event.kind,
+        EventKind::Modify(ModifyKind::Name(RenameMode::To | RenameMode::Both))
+            | EventKind::Remove(_)
+            | EventKind::Access(AccessKind::Close(AccessMode::Write))
+    );
+    committed_change
+        && event
+            .paths
+            .iter()
+            .any(|changed| paths.targets.iter().any(|target| changed == target))
+}
+
+#[cfg(feature = "theme")]
+fn theme_event_rechecks_watches(event: &notify::Event, paths: &ThemeWatchPaths) -> bool {
+    event.need_rescan()
+        || event.paths.is_empty()
+        || event
+            .paths
+            .iter()
+            .any(|changed| paths.parents.iter().any(|parent| changed == parent))
 }
 
 // ── Data-driven theme files (feature `theme`) ──────────────────────────────
@@ -1614,8 +2382,9 @@ fn reload_theme_on_focus(
 // per-app`. Every field is optional, so a file may override just a few tokens
 // or metrics. Colours are `#rrggbb` hex; metrics are pixels. Parsing goes
 // through cosmix-lib-config (the mandated substrate strict-data path — never
-// TOML/JSON), and a missing or malformed file is skipped, never fatal: a
-// broken theme must not brick the app.
+// TOML/JSON). The live reload path snapshots each layer once, retains the
+// last-good value across malformed or mid-save reads. Palette validation and
+// `design` authority commit together, so a rejected layer cannot split them.
 #[cfg(feature = "theme")]
 mod file {
     use super::{
@@ -1640,6 +2409,10 @@ mod file {
     pub struct ThemeFile {
         pub scheme: Option<String>,
         pub mode: Option<String>,
+        /// Compatibility sink only. The live loader detects key presence in
+        /// the parsed strict-data map before this typed deserialisation, then
+        /// `cosmix-design` validates the complete original byte snapshot.
+        pub design: Option<serde::de::IgnoredAny>,
         pub typography: Option<TypographyFile>,
         pub surface: Option<String>,
         pub panel: Option<String>,
@@ -1696,7 +2469,7 @@ mod file {
             Ok(())
         }
 
-        fn overlay_with_provenance(
+        pub(super) fn overlay_with_provenance(
             &mut self,
             file: &ThemeFile,
             provenance: TypographyProvenance,
@@ -1928,9 +2701,9 @@ mod file {
     /// The standard cosmix theme file name (shared dir + per-app dir alike).
     pub const THEME_FILE: &str = "theme.conf.mix";
 
-    /// The shared cosmix theme path — `~/.config/cosmix/theme.conf.mix`, the
-    /// desktop-wide selection every cosmix app reads (the native analogue of
-    /// the web design system's persisted scheme).
+    /// The shared cosmix theme path — the `theme.conf.mix` below
+    /// `cosmix_config::store::config_dir()` (`COSMIX_ETC`, a located checkout's
+    /// `$COSMIX/etc`, or the platform XDG/FHS default).
     pub fn shared_theme_path() -> std::path::PathBuf {
         cosmix_config::store::config_dir().join(THEME_FILE)
     }
@@ -3587,9 +4360,726 @@ mod tests {
 #[cfg(all(test, feature = "theme"))]
 mod theme_file_tests {
     use super::*;
+    use cosmix_design::{
+        ButtonCellKey, ButtonSize, ButtonVariant, DesignCompileOutcome, InteractionState,
+        EMBEDDED_DEFAULT_SOURCE,
+    };
+    use tempfile::TempDir;
+
+    use crate::design::{CtkDesign, CtkDesignStatus};
+    use crate::widgets::CtkWidgetsPlugin;
 
     fn hexc(s: &str) -> Color {
         Color::from(bevy::color::Srgba::hex(s).unwrap())
+    }
+
+    fn design_source_with_height(height: f32) -> String {
+        EMBEDDED_DEFAULT_SOURCE.replacen(
+            "\"button.height.md\": { kind: \"px\", value: 28.0 }",
+            &format!("\"button.height.md\": {{ kind: \"px\", value: {height:.1} }}"),
+            1,
+        )
+    }
+
+    fn disk_design_app(
+        shared_path: std::path::PathBuf,
+        app_dir: Option<std::path::PathBuf>,
+    ) -> App {
+        let reload = ThemeReloadSignal::default();
+        reload.request_reload();
+        let mut app = App::new();
+        app.add_plugins(CtkWidgetsPlugin)
+            .insert_resource(ThemeRuntimeConfig {
+                shared_path,
+                app_config_dir: app_dir,
+            })
+            .init_resource::<ThemeLayerLastGood>()
+            .insert_resource(reload)
+            .add_message::<ApplyTheme>()
+            .add_systems(Update, (reload_theme_files, apply_theme_requests).chain());
+        app
+    }
+
+    fn resting_default_cell(app: &App) -> &cosmix_design::ResolvedButtonCell {
+        app.world()
+            .resource::<CtkDesign>()
+            .button_cell(ButtonCellKey {
+                variant: ButtonVariant::Default,
+                size: ButtonSize::Md,
+                interaction: InteractionState::Resting,
+                focus_visible: false,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn shared_design_section_is_selected_on_first_update() {
+        let temp = TempDir::new().unwrap();
+        let shared_path = temp.path().join(THEME_FILE);
+        std::fs::write(&shared_path, design_source_with_height(31.0)).unwrap();
+        let mut app = App::new();
+        app.add_plugins((
+            CtkThemePlugin {
+                app_config_dir: None,
+                shared_path: shared_path.clone(),
+            },
+            CtkWidgetsPlugin,
+        ));
+
+        app.update();
+
+        assert_eq!(resting_default_cell(&app).height, 31.0);
+        assert_eq!(
+            app.world()
+                .resource::<CtkDesignStatus>()
+                .source_identity()
+                .as_str(),
+            shared_path.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn app_design_section_overrides_shared_design_section() {
+        let temp = TempDir::new().unwrap();
+        let shared_path = temp.path().join("shared").join(THEME_FILE);
+        let app_dir = temp.path().join("app");
+        std::fs::create_dir_all(shared_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(&shared_path, design_source_with_height(31.0)).unwrap();
+        let app_path = app_dir.join(THEME_FILE);
+        std::fs::write(&app_path, design_source_with_height(33.0)).unwrap();
+        let mut app = disk_design_app(shared_path, Some(app_dir));
+
+        app.update();
+
+        assert_eq!(resting_default_cell(&app).height, 33.0);
+        assert_eq!(
+            app.world()
+                .resource::<CtkDesignStatus>()
+                .source_identity()
+                .as_str(),
+            app_path.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn selection_only_file_keeps_the_embedded_design_source() {
+        let temp = TempDir::new().unwrap();
+        let shared_path = temp.path().join(THEME_FILE);
+        std::fs::write(&shared_path, "{ scheme: \"ocean\", mode: \"light\" }").unwrap();
+        let mut app = disk_design_app(shared_path, None);
+        let before = app.world().resource::<CtkDesign>().revision();
+
+        app.update();
+
+        assert_eq!(app.world().resource::<CtkDesign>().revision(), before);
+        assert_eq!(
+            app.world()
+                .resource::<CtkDesignStatus>()
+                .source_identity()
+                .as_str(),
+            "ctk:embedded-default"
+        );
+    }
+
+    #[test]
+    fn unchanged_disk_bytes_do_not_advance_the_design_revision() {
+        let temp = TempDir::new().unwrap();
+        let shared_path = temp.path().join(THEME_FILE);
+        let source = design_source_with_height(31.0);
+        std::fs::write(&shared_path, &source).unwrap();
+        let mut app = disk_design_app(shared_path.clone(), None);
+        app.update();
+        let revision = app.world().resource::<CtkDesign>().revision();
+
+        std::fs::write(&shared_path, &source).unwrap();
+        app.world().resource::<ThemeReloadSignal>().request_reload();
+        app.update();
+
+        assert_eq!(app.world().resource::<CtkDesign>().revision(), revision);
+    }
+
+    #[test]
+    fn removed_design_file_restores_the_embedded_source() {
+        let temp = TempDir::new().unwrap();
+        let shared_path = temp.path().join(THEME_FILE);
+        std::fs::write(&shared_path, design_source_with_height(31.0)).unwrap();
+        let mut app = disk_design_app(shared_path.clone(), None);
+        app.update();
+        assert_eq!(resting_default_cell(&app).height, 31.0);
+
+        std::fs::remove_file(&shared_path).unwrap();
+        app.world().resource::<ThemeReloadSignal>().request_reload();
+        app.update();
+
+        assert_eq!(resting_default_cell(&app).height, 28.0);
+        let status = app.world().resource::<CtkDesignStatus>();
+        assert_eq!(status.source_identity().as_str(), "ctk:embedded-default");
+        assert!(status.last_error().is_none());
+    }
+
+    #[test]
+    fn broken_disk_edit_keeps_last_good_and_fixed_bytes_advance_once() {
+        let temp = TempDir::new().unwrap();
+        let shared_path = temp.path().join(THEME_FILE);
+        std::fs::write(&shared_path, design_source_with_height(31.0)).unwrap();
+        let mut app = disk_design_app(shared_path.clone(), None);
+        app.update();
+        let last_good = app.world().resource::<CtkDesign>().revision();
+
+        std::fs::write(&shared_path, "design: nope").unwrap();
+        app.world().resource::<ThemeReloadSignal>().request_reload();
+        app.update();
+        assert_eq!(app.world().resource::<CtkDesign>().revision(), last_good);
+        let status = app.world().resource::<CtkDesignStatus>();
+        assert_eq!(
+            status.last_compile().map(|compile| compile.outcome),
+            Some(DesignCompileOutcome::Fatal)
+        );
+        assert!(status.last_error().is_some());
+
+        let fixed = design_source_with_height(34.0);
+        std::fs::write(&shared_path, &fixed).unwrap();
+        app.world().resource::<ThemeReloadSignal>().request_reload();
+        app.update();
+        let fixed_revision = app.world().resource::<CtkDesign>().revision();
+        assert_eq!(fixed_revision.unwrap().get(), last_good.unwrap().get() + 1);
+        assert_eq!(resting_default_cell(&app).height, 34.0);
+
+        app.world().resource::<ThemeReloadSignal>().request_reload();
+        app.update();
+        assert_eq!(
+            app.world().resource::<CtkDesign>().revision(),
+            fixed_revision
+        );
+    }
+
+    #[test]
+    fn empty_mid_save_snapshot_keeps_the_previous_palette_and_design() {
+        let temp = TempDir::new().unwrap();
+        let shared_path = temp.path().join("shared").join(THEME_FILE);
+        let app_dir = temp.path().join("app");
+        std::fs::create_dir_all(shared_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(&shared_path, "{ surface: \"#ffffff\" }").unwrap();
+        let app_path = app_dir.join(THEME_FILE);
+        std::fs::write(&app_path, design_source_with_height(31.0)).unwrap();
+        let mut app = disk_design_app(shared_path, Some(app_dir));
+        app.update();
+        let palette = app.world().resource::<ThemeState>().colors.surface;
+        let revision = app.world().resource::<CtkDesign>().revision();
+        assert_eq!(resting_default_cell(&app).height, 31.0);
+        assert_ne!(palette, hexc("#ffffff"));
+
+        std::fs::write(&app_path, []).unwrap();
+        app.world().resource::<ThemeReloadSignal>().request_reload();
+        app.update();
+
+        assert_eq!(app.world().resource::<ThemeState>().colors.surface, palette);
+        assert_eq!(app.world().resource::<CtkDesign>().revision(), revision);
+        assert_eq!(resting_default_cell(&app).height, 31.0);
+    }
+
+    #[test]
+    fn present_nil_design_is_rejected_and_keeps_last_good() {
+        let temp = TempDir::new().unwrap();
+        let shared_path = temp.path().join(THEME_FILE);
+        std::fs::write(&shared_path, design_source_with_height(31.0)).unwrap();
+        let mut app = disk_design_app(shared_path.clone(), None);
+        app.update();
+        let last_good = app.world().resource::<CtkDesign>().revision();
+
+        std::fs::write(&shared_path, "{ design: nil }").unwrap();
+        app.world().resource::<ThemeReloadSignal>().request_reload();
+        app.update();
+
+        assert_eq!(app.world().resource::<CtkDesign>().revision(), last_good);
+        let status = app.world().resource::<CtkDesignStatus>();
+        assert_eq!(
+            status.last_compile().map(|compile| compile.outcome),
+            Some(DesignCompileOutcome::Fatal)
+        );
+        assert!(status.last_error().is_some());
+        assert_eq!(
+            status.source_identity().as_str(),
+            shared_path.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn invalid_app_palette_does_not_mask_shared_design_and_logs_once() {
+        let temp = TempDir::new().unwrap();
+        let shared_path = temp.path().join("shared").join(THEME_FILE);
+        let app_dir = temp.path().join("app");
+        std::fs::create_dir_all(shared_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(&shared_path, design_source_with_height(31.0)).unwrap();
+        std::fs::write(app_dir.join(THEME_FILE), "{ scheme: 7 }").unwrap();
+        let mut app = disk_design_app(shared_path.clone(), Some(app_dir));
+
+        app.update();
+
+        assert_eq!(resting_default_cell(&app).height, 31.0);
+        assert_eq!(
+            app.world()
+                .resource::<CtkDesignStatus>()
+                .source_identity()
+                .as_str(),
+            shared_path.to_string_lossy()
+        );
+        let reload = app.world().resource::<ThemeReloadSignal>();
+        assert_eq!(reload.logged_failure_count(), 1);
+
+        reload.request_reload();
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ThemeReloadSignal>()
+                .logged_failure_count(),
+            1,
+            "the identical bad palette fingerprint must not log twice"
+        );
+    }
+
+    #[test]
+    fn rejected_palette_retains_its_design_until_a_valid_layer_withdraws_it() {
+        let temp = TempDir::new().unwrap();
+        let shared_path = temp.path().join("shared").join(THEME_FILE);
+        let app_dir = temp.path().join("app");
+        std::fs::create_dir_all(shared_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(&shared_path, design_source_with_height(30.0)).unwrap();
+        let app_path = app_dir.join(THEME_FILE);
+        std::fs::write(&app_path, design_source_with_height(31.0)).unwrap();
+        let mut app = disk_design_app(shared_path.clone(), Some(app_dir));
+        app.update();
+        let revision = app.world().resource::<CtkDesign>().revision();
+        let palette = app.world().resource::<ThemeState>().clone();
+        assert_eq!(resting_default_cell(&app).height, 31.0);
+
+        std::fs::write(&app_path, "{ scheme: 7 }").unwrap();
+        app.world().resource::<ThemeReloadSignal>().request_reload();
+        app.update();
+
+        assert_eq!(app.world().resource::<CtkDesign>().revision(), revision);
+        assert_eq!(resting_default_cell(&app).height, 31.0);
+        assert_eq!(app.world().resource::<ThemeState>().scheme, palette.scheme);
+        assert_eq!(app.world().resource::<ThemeState>().mode, palette.mode);
+        assert_eq!(app.world().resource::<ThemeState>().colors, palette.colors);
+        assert_eq!(
+            app.world()
+                .resource::<ThemeReloadSignal>()
+                .logged_failure_count(),
+            1
+        );
+
+        std::fs::write(&app_path, "{ scheme: \"forest\", mode: \"dark\" }").unwrap();
+        app.world().resource::<ThemeReloadSignal>().request_reload();
+        app.update();
+
+        assert_eq!(resting_default_cell(&app).height, 30.0);
+        assert_eq!(app.world().resource::<ThemeState>().scheme, Scheme::Forest);
+        assert_eq!(app.world().resource::<ThemeState>().mode, Mode::Dark);
+        assert_eq!(
+            app.world()
+                .resource::<CtkDesignStatus>()
+                .source_identity()
+                .as_str(),
+            shared_path.to_string_lossy()
+        );
+        assert_eq!(
+            app.world()
+                .resource::<CtkDesign>()
+                .revision()
+                .unwrap()
+                .get(),
+            revision.unwrap().get() + 1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_not_found_open_error_keeps_the_last_good_layer() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let app_dir = temp.path().join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let app_path = app_dir.join(THEME_FILE);
+        std::fs::write(&app_path, design_source_with_height(31.0)).unwrap();
+        let mut app = disk_design_app(temp.path().join("missing-shared"), Some(app_dir.clone()));
+        app.update();
+        let revision = app.world().resource::<CtkDesign>().revision();
+        let palette = app.world().resource::<ThemeState>().clone();
+
+        std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&app_path).is_ok() {
+            std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        app.world().resource::<ThemeReloadSignal>().request_reload();
+        app.update();
+        std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(app.world().resource::<CtkDesign>().revision(), revision);
+        assert_eq!(resting_default_cell(&app).height, 31.0);
+        assert_eq!(app.world().resource::<ThemeState>().colors, palette.colors);
+        assert_eq!(
+            app.world()
+                .resource::<ThemeReloadSignal>()
+                .logged_failure_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn non_map_app_layer_is_rejected_once_and_does_not_mask_shared_design() {
+        let temp = TempDir::new().unwrap();
+        let shared_path = temp.path().join("shared").join(THEME_FILE);
+        let app_dir = temp.path().join("app");
+        std::fs::create_dir_all(shared_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(&shared_path, design_source_with_height(32.0)).unwrap();
+        std::fs::write(app_dir.join(THEME_FILE), "[1, 2, 3]").unwrap();
+        let mut app = disk_design_app(shared_path.clone(), Some(app_dir));
+
+        app.update();
+
+        assert_eq!(resting_default_cell(&app).height, 32.0);
+        assert_eq!(
+            app.world()
+                .resource::<CtkDesignStatus>()
+                .source_identity()
+                .as_str(),
+            shared_path.to_string_lossy()
+        );
+        let reload = app.world().resource::<ThemeReloadSignal>();
+        assert_eq!(reload.logged_failure_count(), 1);
+        reload.request_reload();
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ThemeReloadSignal>()
+                .logged_failure_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn oversized_theme_layer_is_rejected_before_parsing() {
+        let temp = TempDir::new().unwrap();
+        let shared_path = temp.path().join(THEME_FILE);
+        std::fs::write(&shared_path, vec![b' '; MAX_THEME_FILE_BYTES as usize + 1]).unwrap();
+        let mut app = disk_design_app(shared_path, None);
+
+        app.update();
+
+        assert_eq!(
+            app.world()
+                .resource::<CtkDesignStatus>()
+                .source_identity()
+                .as_str(),
+            "ctk:embedded-default"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<ThemeReloadSignal>()
+                .logged_failure_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn directory_watcher_coalesces_a_burst_into_one_pending_reload() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(THEME_FILE);
+        let reload = ThemeReloadSignal::default();
+        let (woke_tx, woke_rx) = std::sync::mpsc::sync_channel(1);
+        let wake = std::sync::Arc::new(move || {
+            let _ = woke_tx.try_send(());
+        });
+        let _watcher = theme_file_watcher(vec![path.clone()], reload.clone(), wake).unwrap();
+
+        for height in 29..34 {
+            std::fs::write(&path, design_source_with_height(height as f32)).unwrap();
+        }
+        woke_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("directory watcher did not deliver the write burst");
+
+        assert_eq!(reload.pending_reload_count(), 1);
+    }
+
+    #[test]
+    fn watcher_event_filter_ignores_reads_and_accepts_content_invalidations() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, Flag, MetadataKind, ModifyKind,
+            RemoveKind, RenameMode,
+        };
+        use notify::{Event, EventKind};
+
+        let target = std::path::PathBuf::from("/tmp/ctk-filter/theme.conf.mix");
+        let paths = ThemeWatchPaths {
+            targets: vec![target.clone()],
+            parents: vec![target.parent().unwrap().to_path_buf()],
+        };
+        let event = |kind| Event::new(kind).add_path(target.clone());
+
+        assert!(!theme_event_requests_reload(
+            &event(EventKind::Access(AccessKind::Open(AccessMode::Read))),
+            &paths
+        ));
+        assert!(!theme_event_requests_reload(
+            &event(EventKind::Access(AccessKind::Close(AccessMode::Read))),
+            &paths
+        ));
+        assert!(!theme_event_requests_reload(
+            &event(EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any))),
+            &paths
+        ));
+        assert!(!theme_event_requests_reload(
+            &event(EventKind::Create(CreateKind::File)),
+            &paths
+        ));
+        assert!(!theme_event_requests_reload(
+            &event(EventKind::Modify(ModifyKind::Data(DataChange::Any))),
+            &paths
+        ));
+        assert!(!theme_event_requests_reload(
+            &event(EventKind::Modify(ModifyKind::Name(RenameMode::From))),
+            &paths
+        ));
+        assert!(theme_event_requests_reload(
+            &event(EventKind::Modify(ModifyKind::Name(RenameMode::To))),
+            &paths
+        ));
+        assert!(theme_event_requests_reload(
+            &event(EventKind::Modify(ModifyKind::Name(RenameMode::Both))),
+            &paths
+        ));
+        assert!(theme_event_requests_reload(
+            &event(EventKind::Access(AccessKind::Close(AccessMode::Write))),
+            &paths
+        ));
+        assert!(theme_event_requests_reload(
+            &event(EventKind::Remove(RemoveKind::File)),
+            &paths
+        ));
+        assert!(theme_event_requests_reload(
+            &Event::new(EventKind::Other).set_flag(Flag::Rescan),
+            &paths
+        ));
+        assert!(theme_event_requests_reload(
+            &Event::new(EventKind::Any),
+            &paths
+        ));
+        assert!(theme_event_requests_reload(
+            &Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+                .add_path(target.parent().unwrap().to_path_buf()),
+            &paths
+        ));
+    }
+
+    #[test]
+    fn watcher_does_not_request_another_reload_for_its_own_read() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(THEME_FILE);
+        std::fs::write(&path, design_source_with_height(29.0)).unwrap();
+        let reload = ThemeReloadSignal::default();
+        let (woke_tx, woke_rx) = std::sync::mpsc::sync_channel(2);
+        let wake = std::sync::Arc::new(move || {
+            let _ = woke_tx.try_send(());
+        });
+        let watcher = theme_file_watcher(vec![path.clone()], reload.clone(), wake).unwrap();
+        let mut app = disk_design_app(path.clone(), None);
+        app.insert_resource(reload.clone()).insert_resource(watcher);
+
+        std::fs::write(&path, design_source_with_height(30.0)).unwrap();
+        woke_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("directory watcher did not deliver the write");
+        assert!(
+            woke_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "the write burst should stay coalesced while its reload is pending"
+        );
+        app.update();
+        let completed_count = reload.pending_reload_count();
+
+        // A very heavily loaded CI worker could delay an erroneous event past
+        // this negative window and false-pass. The committed-write and parent-
+        // replacement positive tests are the load-bearing watcher coverage.
+        assert!(
+            woke_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_err(),
+            "the reload's own file read requested another reload"
+        );
+        assert_eq!(reload.pending_reload_count(), completed_count);
+    }
+
+    #[test]
+    fn parent_rename_requests_reload_and_reinstalls_without_focus() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("watched");
+        let moved = temp.path().join("moved");
+        let path = parent.join(THEME_FILE);
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(&path, "{ scheme: \"ocean\" }").unwrap();
+        let reload = ThemeReloadSignal::default();
+        let (woke_tx, woke_rx) = std::sync::mpsc::sync_channel(2);
+        let wake = std::sync::Arc::new(move || {
+            let _ = woke_tx.try_send(());
+        });
+        let watcher = theme_file_watcher(vec![path], reload.clone(), wake).unwrap();
+        let initial_generation = watcher.watch_generation();
+        let mut app = disk_design_app(parent.join(THEME_FILE), None);
+        app.insert_resource(reload.clone()).insert_resource(watcher);
+
+        std::fs::rename(&parent, &moved).unwrap();
+        std::fs::rename(&moved, &parent).unwrap();
+        woke_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("renaming the watched parent did not request a reload");
+        assert_eq!(reload.pending_reload_count(), 1);
+
+        app.update();
+        assert!(
+            app.world()
+                .resource::<ThemeFileWatcher>()
+                .watch_generation()
+                > initial_generation,
+            "parent invalidation did not force the watch to be reinstalled"
+        );
+    }
+
+    #[test]
+    fn relative_app_directory_is_absolutised_for_reads_and_watch_matches() {
+        let current = std::env::current_dir().unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("ctk-relative-theme-")
+            .tempdir_in(&current)
+            .unwrap();
+        let app_dir = temp.path().join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let relative_app = app_dir.strip_prefix(&current).unwrap().to_path_buf();
+        assert!(relative_app.is_relative());
+        let relative_target = relative_app.join(THEME_FILE);
+        std::fs::write(&relative_target, "{ scheme: \"ocean\" }").unwrap();
+
+        let mut app = App::new();
+        app.add_plugins(CtkThemePlugin::new(Some(relative_app)));
+        let config = app.world().resource::<ThemeRuntimeConfig>();
+        assert!(config.shared_path.is_absolute());
+        assert!(config.app_config_dir.as_ref().unwrap().is_absolute());
+
+        let reload = ThemeReloadSignal::default();
+        let (woke_tx, woke_rx) = std::sync::mpsc::sync_channel(1);
+        let wake = std::sync::Arc::new(move || {
+            let _ = woke_tx.try_send(());
+        });
+        let watcher =
+            theme_file_watcher(vec![relative_target.clone()], reload.clone(), wake).unwrap();
+        assert!(watcher.targets.iter().all(|target| target.is_absolute()));
+
+        std::fs::write(&relative_target, "{ scheme: \"forest\" }").unwrap();
+        woke_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("relative configured target did not match its absolute notify event");
+        assert_eq!(reload.pending_reload_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_config_symlink_swap_moves_the_watch_and_applies_the_new_design() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let real1 = temp.path().join("real1");
+        let real2 = temp.path().join("real2");
+        std::fs::create_dir_all(&real1).unwrap();
+        std::fs::create_dir_all(&real2).unwrap();
+        std::fs::write(real1.join(THEME_FILE), design_source_with_height(31.0)).unwrap();
+        std::fs::write(real2.join(THEME_FILE), design_source_with_height(35.0)).unwrap();
+        let configured_dir = temp.path().join("cfg");
+        symlink(&real1, &configured_dir).unwrap();
+        let configured_path = configured_dir.join(THEME_FILE);
+
+        let reload = ThemeReloadSignal::default();
+        let (woke_tx, woke_rx) = std::sync::mpsc::sync_channel(2);
+        let wake = std::sync::Arc::new(move || {
+            let _ = woke_tx.try_send(());
+        });
+        let watcher =
+            theme_file_watcher(vec![configured_path.clone()], reload.clone(), wake).unwrap();
+        let initial_generation = watcher.watch_generation();
+        reload.request_reload();
+        let mut app = disk_design_app(configured_path.clone(), None);
+        app.insert_resource(reload.clone()).insert_resource(watcher);
+        app.update();
+        assert_eq!(resting_default_cell(&app).height, 31.0);
+
+        let replacement = temp.path().join("cfg.next");
+        symlink(&real2, &replacement).unwrap();
+        std::fs::rename(&replacement, &configured_dir).unwrap();
+        woke_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("atomic config symlink swap did not request a reload");
+        app.update();
+
+        assert_eq!(resting_default_cell(&app).height, 35.0);
+        assert_eq!(
+            app.world()
+                .resource::<CtkDesignStatus>()
+                .source_identity()
+                .as_str(),
+            configured_path.to_string_lossy(),
+            "the configured lexical path remains the source identity"
+        );
+        let watcher = app.world().resource::<ThemeFileWatcher>();
+        assert!(watcher.watch_generation() > initial_generation);
+        let event_paths = watcher
+            .event_paths
+            .read()
+            .expect("CTK theme watcher paths poisoned");
+        assert!(event_paths.parents.contains(&real2));
+        assert!(!event_paths.parents.contains(&real1));
+    }
+
+    #[test]
+    fn focus_reload_reinstalls_a_watch_after_parent_recreation() {
+        let temp = TempDir::new().unwrap();
+        let watched_parent = temp.path().join("recreated");
+        let shared_path = watched_parent.join(THEME_FILE);
+        std::fs::create_dir_all(&watched_parent).unwrap();
+        std::fs::write(&shared_path, "{ scheme: \"ocean\" }").unwrap();
+        let mut app = App::new();
+        app.add_plugins(CtkThemePlugin {
+            app_config_dir: None,
+            shared_path,
+        });
+        app.update();
+        let first_generation = app
+            .world()
+            .resource::<ThemeFileWatcher>()
+            .watch_generation();
+
+        std::fs::remove_dir_all(&watched_parent).unwrap();
+        app.world_mut().write_message(WindowFocused {
+            window: bevy::prelude::Entity::PLACEHOLDER,
+            focused: true,
+        });
+        app.update();
+
+        assert!(watched_parent.is_dir());
+        assert!(
+            app.world()
+                .resource::<ThemeFileWatcher>()
+                .watch_generation()
+                > first_generation,
+            "the focus backstop did not replace the dead directory watch"
+        );
     }
 
     #[test]

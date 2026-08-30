@@ -65,15 +65,33 @@ Application identity and slug allocation are defined in
 [`desktop/APPS.md`](desktop/APPS.md). Desktop builds share
 `desktop/target/`:
 
-CTK compiles its embedded revision-1 design at plugin initialisation and
-re-syncs it when scheme or mode changes. The resolved button table is
-authoritative for colours, focus rings, height, minimum width, horizontal
-padding, border width and radius. Replacing the complete source in memory via
-`CtkDesignStatus::replace_source` recompiles once and restyles existing
-buttons; invalid source keeps the last-known-good table. On-disk
-`theme.conf.mix` `design` sections are not read yet; that is the next slice.
-The legacy public `CtkThemeMetrics::button_*` fields are deprecated and inert
-for `CtkButton`; other CTK metric fields retain their existing behaviour.
+CTK's resolved button table is authoritative for colours, focus rings, height,
+minimum width, horizontal padding, border width and radius. Under the `theme`
+feature, a complete `design` section in the per-app `theme.conf.mix` replaces
+one in the shared theme file resolved by
+`cosmix_config::store::config_dir()`. That directory is `COSMIX_ETC` when set,
+`$COSMIX/etc` for a located checkout, or the XDG Cosmix config directory for
+an unrooted user install. If neither file supplies a design, CTK uses its
+embedded revision-1 design. A selection-only `{scheme, mode}` file contributes
+no design source. Design sections are whole documents, not partial overlays:
+a present-but-invalid design keeps the last-known-good table and is logged once
+per recent failing fingerprint. Palette validation and design authority commit
+together: a malformed or mid-save layer retains both last-good values and is
+logged once; removal clears the layer.
+
+CTK watches both files' parent directories, so ordinary and atomic-replace
+saves wake a reactive app and restyle existing buttons on the next update.
+Only committed write-close, rename-to, removal and rescan events trigger file
+reads. Bursts are coalesced and byte-identical saves do not compile again.
+Parent-directory events, focus gain and Bus `theme.changed` notifications enter
+the same reload path and repair watches after a parent directory is replaced.
+Configured paths keep their lexical identity; symlink destinations are
+re-resolved on each reload and both sides are watched so an atomic symlink swap
+moves the active source.
+Theme files are capped at 4 MiB. `CtkDesignStatus::replace_source` remains
+available for a complete in-memory source. The legacy public
+`CtkThemeMetrics::button_*` fields are deprecated and inert for `CtkButton`;
+other CTK metric fields retain their existing behaviour.
 
 ```sh
 cd $COSMIX/src/desktop
