@@ -1,0 +1,114 @@
+#!/usr/bin/env mix
+-- compact-memory-index.mix — trim over-long hooks in a Claude memory MEMORY.md.
+--
+--   mix _bin/compact-memory-index.mix <MEMORY.md> [max_len] [--apply]
+--
+-- Relative paths are below the control hub; absolute paths may name a
+-- workstation memory index. Without --apply this only reports the proposed
+-- size change, so the result can be reviewed before it is written.
+--
+-- Rule: an index line is "<link> - <hook>". The hook's clauses are separated by
+-- ';'. Keep whole leading clauses while they fit under max_len; drop the rest,
+-- whose detail is by design already in the linked topic file. Never truncate
+-- mid-clause, and never touch the link itself.
+--
+-- Review the dropped clauses before applying. The heuristic assumes the first
+-- clause carries the headline, but later clauses can carry outstanding work or
+-- an action. An index that hides either is worse than one over its size cap.
+--
+-- Lines that are already short, section headings, and any line whose first
+-- clause alone exceeds the budget are left exactly as they are. A single
+-- unsplittable clause is deliberate content, not padding.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$argv = args()
+if len($argv) < 1 then
+  print("usage: compact-memory-index.mix <MEMORY.md> [max_len] [--apply]")
+  exit(2)
+end
+
+$path = $argv[0]
+if not starts_with($path, "/") then
+  $path = $d.hub_root() .. "/" .. $path
+end
+
+$max = 190
+if len($argv) > 1 then
+  if not starts_with($argv[1], "--") then
+    $max = to_number($argv[1])
+  end
+end
+$apply = contains($argv, "--apply")
+
+$src = read_file($path)
+$out = []
+$trimmed = 0
+$saved = 0
+
+for each $line in split($src, "\n")
+  if len($line) <= $max or not starts_with($line, "- ") then
+    push($out, $line)
+    continue
+  end
+
+  -- Split the link from the hook on the first supported separator.
+  $sep = " - "
+  $i = index_of($line, $sep)
+  if $i < 0 then
+    $sep = " — "
+    $i = index_of($line, $sep)
+  end
+  if $i < 0 then
+    push($out, $line)
+    continue
+  end
+
+  $link = slice($line, 0, $i)
+  $hook = slice($line, $i + len($sep))
+  $clauses = split($hook, ";")
+
+  -- Stop at the first clause that does not fit. Skipping it and accepting a
+  -- shorter later clause would invert the leading-clause rule.
+  $kept = ""
+  $stop = false
+  for each $clause in $clauses
+    if not $stop then
+      $candidate = $kept
+      if len($candidate) > 0 then
+        $candidate = $candidate .. ";"
+      end
+      $candidate = $candidate .. $clause
+      if len($link) + len($sep) + len($candidate) <= $max then
+        $kept = $candidate
+      else
+        $stop = true
+      end
+    end
+  end
+
+  if len($kept) == 0 then
+    -- The first clause alone exceeds the budget: leave the line unchanged.
+    push($out, $line)
+    continue
+  end
+
+  $new = $link .. $sep .. trim($kept)
+  if len($new) < len($line) then
+    $saved = $saved + (len($line) - len($new))
+    $trimmed = $trimmed + 1
+    push($out, $new)
+  else
+    push($out, $line)
+  end
+end
+
+$result = join($out, "\n")
+print("lines trimmed: " .. $trimmed .. "  bytes saved: " .. $saved)
+print("size: " .. len($src) .. " -> " .. len($result))
+if $apply then
+  write_file($path, $result)
+  print("APPLIED to " .. $path)
+else
+  print("(dry run — pass --apply to write)")
+end

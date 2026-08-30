@@ -1,0 +1,289 @@
+#!/usr/bin/env mix
+-- desk_smoke_run.mix — preflight the standing local compositor smoke bed.
+--
+-- This is a workstation-only tool. It controls a local nspawn container and a
+-- physical VT; it never reads the fleet roster or contacts the mesh. A live
+-- run would switch the physical display, so the currently unimplemented live
+-- phases refuse after preflight. --dry-run exercises the standing gates but
+-- does not call chvt or start the compositor unit.
+--
+-- Usage (root):
+--   mix _bin/desk_smoke_run.mix --dry-run [--runs N] [--hold S]
+--   mix _bin/desk_smoke_run.mix --runs N [--hold S] [--chords K]
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn usage($msg)
+  print("usage: mix _bin/desk_smoke_run.mix --dry-run | --runs N [--hold S] [--chords K]  (" .. $msg .. ")")
+  exit(2)
+end
+
+if len(args()) == 0 then
+  usage("choose --dry-run or an explicit --runs count")
+end
+
+$o = getopt(args(), {
+  "dry-run": {},
+  runs: {arg: true},
+  hold: {arg: true},
+  chords: {arg: true},
+  help: {short: "h"}
+})
+if len($o["errors"]) > 0 then
+  usage(join($o["errors"], "; "))
+end
+if len($o["rest"]) > 0 then
+  usage("unexpected arguments: " .. join($o["rest"], " "))
+end
+if $o["opts"]["help"] then
+  usage("help")
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/desk_smoke_run.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no desktop smoke config at " .. $CONF_PATH .. " — create it from desk_smoke_run.conf.mix.example")
+  exit(2)
+end
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["desk_smoke_run"], {
+    schema_version: {type: "integer", enum: [1]},
+    container: {type: "string", nonblank: true},
+    vt: {type: "integer", min: 1, max: 63},
+    fallback_restore_vt: {type: "integer", min: 1, max: 63},
+    dataset: {type: "string", nonblank: true},
+    container_root: {type: "string", nonblank: true},
+    foot_bin: {type: "string", nonblank: true},
+    drm_device: {type: "string", nonblank: true},
+    drm_connector: {type: "string", nonblank: true},
+    log_dir: {type: "string", nonblank: true},
+    staged_comp: {type: "string", nonblank: true}
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+$CT = $CONF["container"]
+$VT = to_string($CONF["vt"])
+$FALLBACK_RESTORE_VT = to_string($CONF["fallback_restore_vt"])
+$TTY = "/dev/tty" .. $VT
+$DATASET = $CONF["dataset"]
+$CTROOT = $CONF["container_root"]
+$FOOT = $CONF["foot_bin"]
+$DEVICE = $CONF["drm_device"]
+$CONN = $CONF["drm_connector"]
+$LOGDIR = $CONF["log_dir"]
+
+if starts_with($CONF["staged_comp"], "/") or contains($CONF["staged_comp"], "..") then
+  usage("staged_comp must be a path relative to $COSMIX without '..'")
+end
+$STAGED_COMP = $d.cosmix_root() .. "/" .. $CONF["staged_comp"]
+$COMP = "/opt/cosmix/bin/cosmix-comp"
+$FILEMGR = "/opt/cosmix/bin/cosmix-filemgr"
+$QUOIN = "/opt/cosmix/bin/cosmix-quoin-demo"
+$LOCK = "/run/lock/desk-smoke-run"
+$RUNTIME = "/run/cosmix-desk"
+$SOCKET = "cosmix-0"
+$FIRST_FRAME_DEADLINE = 60
+
+if not regex_match("^[A-Za-z0-9/._-]+$", $LOGDIR) then
+  usage("log_dir contains characters outside [A-Za-z0-9/._-]: " .. $LOGDIR)
+end
+
+fn in_ct($argv)
+  -- Run one argv command inside the local container and capture its result.
+  return run_argv(concat([
+    "systemd-run", "-M", $CT, "--pipe", "--wait", "--quiet", "--"
+  ], $argv), {timeout: 60})
+end
+
+fn ct_file_sha($path)
+  $r = in_ct(["sha256sum", $path])
+  if $r["exit_code"] != 0 then
+    return ""
+  end
+  return split(trim($r["stdout"]), " ")[0]
+end
+
+fn host_file_sha($path)
+  $r = run_argv(["sha256sum", $path], {timeout: 120})
+  if $r["exit_code"] != 0 then
+    return ""
+  end
+  return split(trim($r["stdout"]), " ")[0]
+end
+
+$dry = $o["opts"]["dry-run"]
+$runs = to_number(get_or($o["opts"], "runs", "1"))
+$hold = to_number(get_or($o["opts"], "hold", "30"))
+$chords = to_number(get_or($o["opts"], "chords", "3"))
+if $runs == nil or $runs < 1 or $runs > 50 then usage("--runs must be 1..50") end
+if $hold == nil or $hold < 5 or $hold > 600 then usage("--hold must be 5..600") end
+if $chords == nil or $chords < 0 or $chords > 20 then usage("--chords must be 0..20") end
+
+-- Every preflight below is a correctness gate: the run must not take over a
+-- display, collide with another compositor, or test bytes other than the
+-- bound artefacts it reports.
+$checks = []
+fn gate($ok, $label)
+  if $ok then
+    print("  ok    " .. $label)
+  else
+    print("  FAIL  " .. $label)
+  end
+  push($checks, $ok)
+  return $ok
+end
+
+$mode = "LIVE"
+if $dry then
+  $mode = "DRY RUN — no display action"
+end
+print("=== desktop smoke preflight (" .. $mode .. ")")
+
+$id = run_argv(["id", "-u"])
+$d.die_if($id["exit_code"] != 0 or trim($id["stdout"]) != "0",
+  "must run as root — VT, snapshot and machine control need it")
+
+$st = run_argv(["machinectl", "show", $CT, "--property=State", "--value"])
+gate($st["exit_code"] == 0 and trim($st["stdout"]) == "running",
+  $CT .. " is running (machinectl State=" .. trim($st["stdout"]) .. ")")
+
+$ge = run_argv(["systemctl", "is-enabled", "getty@tty" .. $VT .. ".service"])
+gate(trim($ge["stdout"]) == "masked",
+  "host getty@tty" .. $VT .. " is masked (got '" .. trim($ge["stdout"]) .. "')")
+
+$ga = run_argv(["systemctl", "is-active", "getty@tty" .. $VT .. ".service"])
+gate(trim($ga["stdout"]) == "inactive",
+  "host getty@tty" .. $VT .. " is inactive (got '" .. trim($ga["stdout"]) .. "')")
+
+$fu = run_argv(["fuser", "-s", $TTY])
+gate($fu["exit_code"] == 1,
+  $TTY .. " is free (fuser exit " .. to_string($fu["exit_code"]) .. "; 1 = nobody holds it)")
+
+$drm_status_path = "/sys/class/drm/" .. basename($DEVICE) .. "-" .. $CONN .. "/status"
+$conn_status = "missing"
+if is_file($drm_status_path) then
+  $conn_status = trim(read_file($drm_status_path))
+end
+gate($conn_status == "connected", $CONN .. " connected (status: " .. $conn_status .. ")")
+
+$markers = in_ct(["strings", $COMP])
+gate($markers["exit_code"] == 0 and contains($markers["stdout"], "--kms-confirm"),
+  "bound comp carries the opt-in --kms-confirm marker")
+gate($markers["exit_code"] == 0 and contains($markers["stdout"], "COSMIX_CAPTURE_DIR"),
+  "bound comp carries frame-capture (COSMIX_CAPTURE_DIR)")
+
+$sd = in_ct(["systemctl", "is-active", "seatd"])
+gate(trim($sd["stdout"]) == "active", "seatd active inside " .. $CT)
+
+$pc = in_ct(["pgrep", "-x", "cosmix-comp"])
+gate($pc["exit_code"] == 1,
+  "no cosmix-comp already running inside " .. $CT .. " (one compositor per container)")
+
+for each $binary in [$COMP, $FILEMGR, $QUOIN, $FOOT]
+  $x = in_ct(["test", "-x", $binary])
+  gate($x["exit_code"] == 0, "executable inside " .. $CT .. ": " .. $binary)
+end
+
+$fc = in_ct(["fc-match", "monospace"])
+gate($fc["exit_code"] == 0 and trim($fc["stdout"]) != "",
+  "fontconfig answers inside " .. $CT .. " (" .. trim($fc["stdout"]) .. ")")
+
+$bound_sha = ct_file_sha($COMP)
+$staged_sha = host_file_sha($STAGED_COMP)
+if $staged_sha == "" then
+  print("  note  no staged comp at " .. $STAGED_COMP .. " — the bound comp is what runs")
+elif $bound_sha == $staged_sha then
+  print("  ok    bound comp == staged comp (" .. substr($bound_sha, 0, 12) .. ")")
+else
+  print("  note  bound comp " .. substr($bound_sha, 0, 12) .. " != staged " ..
+    substr($staged_sha, 0, 12) .. " — deploy the staged build first if this run is meant to test it")
+end
+
+$date = run_argv(["date", "+%Y%m%d-%H%M%S"])
+$d.die_if($date["exit_code"] != 0, "could not generate evidence timestamp: " .. trim($date["stderr"]))
+$ts = trim($date["stdout"])
+$evidence = $LOGDIR .. "/smoke-" .. $ts
+$capture_ct = "/var/tmp/cosmix-capture/smoke-" .. $ts
+$capture_host = $CTROOT .. $capture_ct
+mkdir($LOGDIR, {parents: true})
+mkdir($evidence, {parents: true})
+gate(is_dir($evidence), "evidence dir on host: " .. $evidence)
+
+$mc = in_ct(["mkdir", "-p", $capture_ct])
+gate($mc["exit_code"] == 0 and is_dir($capture_host),
+  "capture dir inside container " .. $capture_ct .. " is visible on host at " .. $capture_host)
+
+$rt_mkdir = in_ct(["mkdir", "-p", $RUNTIME])
+$rt_chmod = in_ct(["chmod", "0700", $RUNTIME])
+$rt_test = in_ct(["test", "-d", $RUNTIME])
+gate($rt_mkdir["exit_code"] == 0 and $rt_chmod["exit_code"] == 0 and $rt_test["exit_code"] == 0,
+  "XDG runtime dir " .. $RUNTIME .. " creatable inside " .. $CT)
+
+$fg = run_argv(["fgconsole"])
+$restore_vt = trim($fg["stdout"])
+gate($fg["exit_code"] == 0 and regex_match("^[0-9]+$", $restore_vt),
+  "fgconsole answers (" .. $restore_vt .. ") — the VT to restore to")
+if $restore_vt == $VT then
+  $restore_vt = $FALLBACK_RESTORE_VT
+end
+
+-- Prove the restore-timer mechanism without flipping the display: arm a
+-- delayed transient timer, observe it, cancel it, and observe its absence.
+$TIMER = "desk-smoke-restore-probe-" .. $ts
+$arm = run_argv([
+  "systemd-run", "--unit=" .. $TIMER, "--on-active=600",
+  "--timer-property=AccuracySec=1s", "--", "/usr/bin/chvt", $restore_vt
+])
+$armed = run_argv(["systemctl", "is-active", $TIMER .. ".timer"])
+$stop = run_argv(["systemctl", "stop", $TIMER .. ".timer"])
+$gone = run_argv(["systemctl", "is-active", $TIMER .. ".timer"])
+$_reset = run_argv(["systemctl", "reset-failed", $TIMER .. ".service"])
+gate($arm["exit_code"] == 0 and trim($armed["stdout"]) == "active" and
+  $stop["exit_code"] == 0 and trim($gone["stdout"]) != "active",
+  "host restore timer arms and cancels (armed='" .. trim($armed["stdout"]) ..
+  "', after stop='" .. trim($gone["stdout"]) .. "')")
+
+$lk = run_argv(["mkdir", $LOCK])
+gate($lk["exit_code"] == 0, $LOCK .. " acquired (another run is not in flight)")
+if $lk["exit_code"] == 0 then
+  $rl = run_argv(["rmdir", $LOCK])
+  if $rl["exit_code"] != 0 then
+    print("  WARNING: could not release " .. $LOCK .. " — remove it by hand")
+  end
+end
+
+$failed = 0
+for each $check in $checks
+  if not $check then
+    $failed = $failed + 1
+  end
+end
+print("preflight: " .. to_string(len($checks) - $failed) .. "/" .. to_string(len($checks)) .. " gates passed")
+
+$plan = "plan: " .. to_string($runs) .. " run(s), hold " .. to_string($hold) ..
+  " s, " .. to_string($chords) .. " chord cycle(s) each; per run: lock → zfs pre-snapshot of " ..
+  $DATASET .. " → arm restore timer → chvt " .. $VT ..
+  " → transient container unit `cosmix-comp kms-live --device " .. $DEVICE ..
+  " --connector " .. $CONN .. " --presentation atomic --socket " .. $SOCKET ..
+  "` with COSMIX_CAPTURE_DIR=" .. $capture_ct ..
+  " → first-frame gate (<= " .. to_string($FIRST_FRAME_DEADLINE) ..
+  " s) → clients foot, filemgr, quoin as container units on WAYLAND_DISPLAY=" .. $SOCKET ..
+  " (gate: NEW toplevel each; SSD ack on foot's own surface) → fd-flatness samples → " ..
+  to_string($chords) ..
+  "× chvt away/back with dwell (comp must stay active, capture must continue) → hold → unit-scoped INT → verdict from the unit's final state (130) → chvt back + cancel timer → post-snapshot + diff → evidence: PNGs, journal, fd counts, chord log"
+print($plan)
+write_file($evidence .. "/plan.txt", $plan .. "\n")
+
+if $dry then
+  print("=== DRY RUN complete — no chvt, no compositor unit, nothing on the display. Evidence dir: " .. $evidence)
+  if $failed > 0 then exit(1) end
+  exit(0)
+end
+if $failed > 0 then
+  die("preflight failed " .. to_string($failed) .. " gate(s) — refusing to flip the display")
+end
+die("run phases are not implemented yet; use --dry-run")

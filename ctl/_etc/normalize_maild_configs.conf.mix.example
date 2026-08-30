@@ -1,0 +1,7 @@
+-- Private hub configuration for normalize_maild_configs.mix.
+-- Copy this file to `_etc/normalize_maild_configs.conf.mix` in the control hub.
+maild_normalize: {
+  schema_version: 1,
+  nodes: ["alpha", "beta", "gamma"],
+  config_path: "/etc/cosmix/maild/config.conf.mix"
+}

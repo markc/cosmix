@@ -1,0 +1,88 @@
+#!/usr/bin/env mix
+-- quarantine-journals.mix — move a named journal series out of journalctl's
+-- merge directory without deleting it.
+--
+-- A journal sequence that restarts under the same journal ID can leave older,
+-- higher sequence numbers ranked ahead of the live series. Cursor consumers
+-- then wait for records far beyond the live cursor. Quarantining the affected
+-- files restores merge ordering while keeping them readable with:
+--
+--   journalctl -D <quarantine-dir>
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn usage()
+  print("USAGE: quarantine-journals.mix <listfile> <quarantine-dir>")
+  print("       relative paths are resolved beneath " .. $d.hub_root())
+  exit(2)
+end
+
+fn hub_path($path)
+  if starts_with($path, "/") or $path == "" then
+    return $path
+  end
+  return $d.hub_root() .. "/" .. $path
+end
+
+$argv = args()
+if len($argv) != 2 or trim($argv[0]) == "" or trim($argv[1]) == "" then
+  usage()
+end
+
+$LIST = hub_path($argv[0])
+$QDIR = hub_path($argv[1])
+
+if not is_file($LIST) then
+  print("  ERROR: journal quarantine list not found: " .. $LIST)
+  exit(2)
+end
+
+$listed_paths = read_lines($LIST)
+$paths = []
+for each $path in $listed_paths
+  push($paths, hub_path($path))
+end
+print("quarantine list: " .. len($paths) .. " files")
+
+-- Every source must still be present before the first mutation. Refuse to
+-- move a partial set when the list no longer describes the filesystem.
+$missing = []
+for each $path in $paths
+  if not exists($path, {follow_symlinks: false}) then
+    push($missing, $path)
+  end
+end
+if len($missing) > 0 then
+  print("MISSING (aborting, nothing moved):")
+  for each $path in $missing
+    print("  " .. $path)
+  end
+  raise("PREFLIGHT", "refusing to move a partial set: " .. len($missing) .. " missing")
+end
+print("pre-flight: all " .. len($paths) .. " present")
+
+mkdir($QDIR, {parents: true})
+print("quarantine dir: " .. $QDIR)
+
+$moved = 0
+for each $src in $paths
+  $dst = $QDIR .. "/" .. basename($src)
+  if exists($dst, {follow_symlinks: false}) then
+    raise("COLLISION", "destination already exists: " .. $dst)
+  end
+  rename($src, $dst)
+  $moved = $moved + 1
+end
+print("moved: " .. $moved .. " files")
+
+-- The move is not complete unless every original name is now absent.
+$left = 0
+for each $path in $paths
+  if exists($path, {follow_symlinks: false}) then
+    $left = $left + 1
+  end
+end
+if $left != 0 then
+  raise("POSTCHECK", $left .. " source files still present after move")
+end
+print("post-check: 0 source files remain — OK")

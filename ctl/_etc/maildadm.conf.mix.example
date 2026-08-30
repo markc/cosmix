@@ -1,0 +1,7 @@
+-- Private hub configuration for maildadm.mix.
+-- Copy this file to `_etc/maildadm.conf.mix` in the control hub and replace
+-- the placeholders with rostered mesh or foreign nodes that run cosmix-maild.
+maildadm: {
+  schema_version: 1,
+  nodes: ["alpha", "beta", "gamma"]
+}

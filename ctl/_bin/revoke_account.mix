@@ -1,0 +1,207 @@
+#!/usr/bin/env mix
+-- revoke_account.mix — revoke both authorities that can keep an account's
+-- sessions alive on every selected mail node.
+--
+--   mix _bin/revoke_account.mix user@example.org
+--   mix _bin/revoke_account.mix user@example.org alpha beta
+--
+-- webd owns browser/CMS cookie epochs; maild owns JMAP/API bearer tokens.
+-- Both verbs are idempotent, so a partial failure is repaired by rerunning the
+-- same command. Once revocation starts, every leg on every node is attempted;
+-- the final report names each authority that could still be open.
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn usage()
+  print("usage: mix revoke_account.mix <email> [node...]")
+  exit(2)
+end
+
+fn conf_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn has_item($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn response_detail($reply)
+  if type($reply["value"]) == "map" and type($reply["value"]["detail"]) == "string" then
+    return $reply["value"]["detail"]
+  end
+  $out = trim($reply["stdout"])
+  $err = trim($reply["stderr"])
+  if $out != "" and $err != "" then
+    return $out .. " " .. $err
+  end
+  if $out != "" then
+    return $out
+  end
+  if $err != "" then
+    return $err
+  end
+  return "remote Mix invocation failed without diagnostics"
+end
+
+fn remote_host($roster, $node)
+  if $d.is_foreign($roster, $node) then
+    return $node
+  end
+  return $d.mesh_ip($node)
+end
+
+fn revoke_cookie($host, $email)
+  return ssh_mix($host, '
+send webd webd.session.revoke email=$email
+if $rc == 0 then
+  print(data_encode({status: "ok", detail: json_encode($result)}))
+else
+  print(data_encode({status: "error", detail: "" .. $result}))
+end
+', {bindings: {email: $email}, decode: "data", timeout: 30})
+end
+
+fn revoke_bearer($host, $email)
+  return ssh_mix($host, '
+send maild maild.accounts.revoke_tokens email=$email
+if $rc == 0 then
+  print(data_encode({status: "ok", detail: json_encode($result)}))
+else
+  $message = "" .. $result
+  $not_hosted = "account " .. $email .. " not found"
+  if contains($message, $not_hosted) then
+    print(data_encode({status: "skip", detail: "account not hosted here"}))
+  else
+    print(data_encode({status: "error", detail: $message}))
+  end
+end
+', {bindings: {email: $email}, decode: "data", timeout: 30})
+end
+
+$argv = args()
+if len($argv) < 1 then
+  usage()
+end
+$EMAIL = $argv[0]
+
+$CONF_PATH = $d.hub_root() .. "/_etc/revoke_account.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no revoke_account configuration at " .. $CONF_PATH)
+  print("         create it from _etc/revoke_account.conf.mix.example and set default_nodes")
+  exit(2)
+end
+
+$CONF_DOC = nil
+try
+  $CONF_DOC = load_data($CONF_PATH)
+catch $message
+  conf_error("invalid strict-data config: " .. $message)
+end
+if type($CONF_DOC) != "map" then
+  conf_error("top level must be a strict-data map")
+end
+$CONF = $CONF_DOC["revoke_account"]
+if type($CONF) != "map" then
+  conf_error("top-level 'revoke_account' must be a map")
+end
+if $CONF["schema_version"] != 1 then
+  conf_error("revoke_account.schema_version must be 1")
+end
+$DEFAULT_NODES = $CONF["default_nodes"]
+if type($DEFAULT_NODES) != "list" or len($DEFAULT_NODES) == 0 then
+  conf_error("revoke_account.default_nodes must be a non-empty list")
+end
+for each $node in $DEFAULT_NODES
+  if type($node) != "string" or trim($node) == "" then
+    conf_error("revoke_account.default_nodes entries must be non-empty strings")
+  end
+end
+
+$ROSTER = $d.roster()
+$seen_defaults = []
+for each $node in $DEFAULT_NODES
+  $d.assert_node($ROSTER, $node)
+  if has_item($seen_defaults, $node) then
+    conf_error("duplicate default node '" .. $node .. "'")
+  end
+  push($seen_defaults, $node)
+end
+
+$node_args = []
+$index = 1
+while $index < len($argv)
+  push($node_args, $argv[$index])
+  $index = $index + 1
+end
+if len($node_args) == 0 then
+  $node_args = $DEFAULT_NODES
+end
+$requested = $d.parse_nodes($ROSTER, $node_args, [])["nodes"]
+
+-- Foreign targets use their roster names and are never looked up in the mesh
+-- inventory. Mesh targets follow the shared rollout order.
+$nodes = []
+for each $node in $requested
+  if $d.is_foreign($ROSTER, $node) then
+    push($nodes, $node)
+  end
+end
+for each $node in $d.rollout_order($ROSTER)
+  if has_item($requested, $node) then
+    push($nodes, $node)
+  end
+end
+$d.die_if(len($nodes) != len($requested),
+  "selected nodes contain a duplicate or a mesh node absent from the fleet rollout order")
+
+print("revoking ALL sessions for " .. $EMAIL .. " on: " .. join($nodes, " "))
+
+$open_cookie = []
+$open_bearer = []
+
+for each $node in $nodes
+  $host = remote_host($ROSTER, $node)
+
+  $cookie = revoke_cookie($host, $EMAIL)
+  if $cookie["ok"] and type($cookie["value"]) == "map" and $cookie["value"]["status"] == "ok" then
+    print("  " .. $node .. " webd.session.revoke: OK " .. response_detail($cookie))
+  else
+    print("  " .. $node .. " webd.session.revoke: ERROR " .. response_detail($cookie))
+    push($open_cookie, $node)
+  end
+
+  $bearer = revoke_bearer($host, $EMAIL)
+  if $bearer["ok"] and type($bearer["value"]) == "map" and $bearer["value"]["status"] == "ok" then
+    print("  " .. $node .. " maild.accounts.revoke_tokens: OK " .. response_detail($bearer))
+  else
+    if $bearer["ok"] and type($bearer["value"]) == "map" and $bearer["value"]["status"] == "skip" then
+      print("  " .. $node .. " maild.accounts.revoke_tokens: skip (account not hosted here)")
+    else
+      print("  " .. $node .. " maild.accounts.revoke_tokens: ERROR " .. response_detail($bearer))
+      push($open_bearer, $node)
+    end
+  end
+end
+
+if len($open_cookie) > 0 or len($open_bearer) > 0 then
+  print("")
+  print("PARTIAL REVOCATION — doors still OPEN:")
+  if len($open_cookie) > 0 then
+    print("  cookie-path FAILED on: " .. join($open_cookie, " ") ..
+      "  -> BROWSER/CMS sessions for " .. $EMAIL .. " may still be valid there")
+  end
+  if len($open_bearer) > 0 then
+    print("  bearer-path FAILED on: " .. join($open_bearer, " ") ..
+      "  -> JMAP/API (bearer) sessions for " .. $EMAIL .. " may still be valid there")
+  end
+  print("Both verbs are idempotent — RE-RUN this script (same args) against the failed node(s) to close them.")
+  exit(1)
+end
+
+print("done — cookie epochs bumped + bearer tokens revoked on all " .. ("" .. len($nodes)) .. " node(s)")

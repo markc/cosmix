@@ -1,0 +1,186 @@
+#!/usr/bin/env mix
+-- ensure_maild_filter_cfg.mix — idempotently point maild at its canonical
+-- inbound filter on the hub-configured mail nodes.
+--
+--   mix _bin/ensure_maild_filter_cfg.mix apply
+--   mix _bin/ensure_maild_filter_cfg.mix apply alpha beta
+--
+-- The native config is backed up before insertion. Brace/JSON configs are
+-- refused before the idempotency check because they must be normalised first.
+-- Targets are handled sequentially in fleet rollout order and stop on the
+-- first error. Foreign roster nodes remain valid ssh_mix targets.
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+fn is_in($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+$argv = args()
+if len($argv) == 0 then
+  print("usage: mix ensure_maild_filter_cfg.mix apply [node...]")
+  exit(2)
+end
+if $argv[0] != "apply" then
+  print("unknown stage: " .. $argv[0] .. " (expected apply)")
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/ensure_maild_filter_cfg.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no maild filter config target list at " .. $CONF_PATH ..
+    " — create it from ensure_maild_filter_cfg.conf.mix.example")
+  exit(2)
+end
+
+$CONF_DOC = nil
+try
+  $CONF_DOC = load_data($CONF_PATH)
+catch $config_error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $config_error)
+  exit(2)
+end
+if type($CONF_DOC) != "map" then
+  print("  ERROR: " .. $CONF_PATH .. " must contain a strict-data map")
+  exit(2)
+end
+for each $key in keys($CONF_DOC)
+  if $key != "ensure_maild_filter_cfg" then
+    print("  ERROR: " .. $CONF_PATH .. ": unexpected top-level key " .. $key)
+    exit(2)
+  end
+end
+
+$CONF = nil
+try
+  $CONF = validate($CONF_DOC["ensure_maild_filter_cfg"], {
+    schema_version: {type: "integer", enum: [1]},
+    nodes: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}}
+  })
+catch $config_error
+  print("  ERROR: invalid ensure_maild_filter_cfg map in " .. $CONF_PATH .. ": " .. $config_error)
+  exit(2)
+end
+for each $key in keys($CONF)
+  if $key != "schema_version" and $key != "nodes" then
+    print("  ERROR: " .. $CONF_PATH .. ": unexpected ensure_maild_filter_cfg key " .. $key)
+    exit(2)
+  end
+end
+
+$ROSTER = $d.roster()
+$configured = []
+for each $node in $CONF["nodes"]
+  $d.assert_node($ROSTER, $node)
+  if is_in($configured, $node) then
+    print("  ERROR: duplicate mail node in " .. $CONF_PATH .. ": " .. $node)
+    exit(2)
+  end
+  push($configured, $node)
+end
+
+$rest = []
+$skip_stage = true
+for each $arg in $argv
+  if $skip_stage then
+    $skip_stage = false
+  else
+    push($rest, $arg)
+  end
+end
+$MAIL_ROSTER = {mesh: [], foreign: [], all: $configured, order: nil}
+$requested = $d.parse_nodes($MAIL_ROSTER, $rest, [])["nodes"]
+
+-- Foreign aliases precede the mesh rollout. Mesh nodes retain the shared
+-- hubs-last order without looking foreign nodes up in the mesh inventory.
+$nodes = []
+for each $node in $requested
+  if $d.is_foreign($ROSTER, $node) then
+    push($nodes, $node)
+  end
+end
+for each $node in $d.rollout_order($ROSTER)
+  if is_in($requested, $node) then
+    push($nodes, $node)
+  end
+end
+$d.die_if(len($nodes) != len($requested),
+  "one or more selected mesh nodes are absent from the fleet rollout order")
+
+$CFG_PATH = "/etc/cosmix/maild/config.conf.mix"
+$FILTER_PATH = "/etc/cosmix/maild/inbound-filter.mix"
+$BACKUP_PATH = $CFG_PATH .. ".bak-filter"
+$reach_token = uuid()
+
+-- Read every destination before taking the write lock. This preserves the
+-- old format refusal and prevents a bad later node from causing an avoidable
+-- partial fleet edit.
+for each $node in $nodes
+  $probe = ssh_mix($node, '
+if not is_file($cfg_path) then
+  eprint("maild config is absent: " .. $cfg_path)
+  exit(7)
+end
+$cfg = replace(read_file($cfg_path), "\u{FEFF}", "")
+if substr(trim($cfg), 0, 1) == "{" then
+  eprint("brace/JSON config — normalise it first")
+  exit(8)
+end
+print($token)
+', {bindings: {cfg_path: $CFG_PATH, token: $reach_token}})
+  $d.die_if(not $probe["ok"] or trim($probe["stdout"]) != $reach_token,
+    $node .. " preflight failed: " .. trim($probe["stdout"]) .. " " .. trim($probe["stderr"]))
+  print("[preflight " .. $node .. "] native maild config readable")
+end
+
+print("apply order: " .. join($nodes, " "))
+$_lock = $m.mesh_take_write_lock("ensure_maild_filter_cfg apply")
+
+for each $node in $nodes
+  print("[" .. $node .. "] ensure inbound_filter")
+  $result = ssh_mix($node, '
+$cfg = replace(read_file($cfg_path), "\u{FEFF}", "")
+if substr(trim($cfg), 0, 1) == "{" then
+  print("ERROR: brace/JSON config — normalise it first")
+else
+  $quoted_key = data_encode("inbound_filter") .. ":"
+  if contains($cfg, "inbound_filter:") or contains($cfg, $quoted_key) then
+    $loaded = load_data($cfg_path)
+    if $loaded["inbound_filter"] == $filter_path then
+      print("ALREADY")
+    else
+      print("ERROR: existing inbound_filter does not name the canonical filter path")
+    end
+  else
+    write_file($backup_path, $cfg)
+    write_file($cfg_path, $cfg .. "\ninbound_filter: " .. data_encode($filter_path) .. "\n")
+    $loaded = load_data($cfg_path)
+    if $loaded["inbound_filter"] == $filter_path then
+      print("INSERTED")
+    else
+      print("ERROR: inserted inbound_filter did not parse back as the canonical filter path")
+    end
+  end
+end
+', {bindings: {
+    cfg_path: $CFG_PATH,
+    filter_path: $FILTER_PATH,
+    backup_path: $BACKUP_PATH
+  }})
+  $answer = trim($result["stdout"])
+  $d.die_if(not $result["ok"],
+    $node .. " config ensure failed: " .. trim($result["stderr"]) .. " " .. $answer)
+  $d.die_if(starts_with($answer, "ERROR:"), $node .. " config ensure: " .. $answer)
+  $d.die_if($answer != "ALREADY" and $answer != "INSERTED",
+    $node .. " config ensure returned an unexpected result: " .. $answer)
+  print("  " .. $answer)
+end
+
+print("ensure complete: inbound_filter verified on " .. join($nodes, " "))

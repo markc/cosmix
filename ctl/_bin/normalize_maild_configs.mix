@@ -1,0 +1,236 @@
+#!/usr/bin/env mix
+-- normalize_maild_configs.mix [node...] — idempotently rewrite maild configs
+-- from brace/JSON form to native conf.mix `key: value` form.
+--
+-- The private hub config names the mail nodes and live config path. Each node
+-- is handled sequentially in fleet rollout order, stopping at the first error.
+-- The native form is rendered beside the live file, then the live file is
+-- backed up and atomically replaced. A failed restart restores the backup and
+-- reports whether the old configuration recovered the service.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/normalize_maild_configs.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no normalize_maild_configs configuration at " .. $CONF_PATH)
+  print("         copy _etc/normalize_maild_configs.conf.mix.example there and set maild_normalize")
+  exit(2)
+end
+$CONF_DOC = load_data($CONF_PATH)
+if type($CONF_DOC) != "map" or type($CONF_DOC["maild_normalize"]) != "map" then
+  print("  ERROR: " .. $CONF_PATH .. " must contain a maild_normalize map")
+  exit(2)
+end
+$CONF = $CONF_DOC["maild_normalize"]
+if $CONF["schema_version"] != 1 or type($CONF["nodes"]) != "list" or len($CONF["nodes"]) == 0 then
+  print("  ERROR: " .. $CONF_PATH .. " needs maild_normalize.schema_version: 1 and a non-empty nodes list")
+  exit(2)
+end
+if type($CONF["config_path"]) != "string" or not starts_with($CONF["config_path"], "/") then
+  print("  ERROR: " .. $CONF_PATH .. " needs an absolute maild_normalize.config_path")
+  exit(2)
+end
+
+$ROSTER = $d.roster()
+$configured = []
+$seen = {}
+for each $node in $CONF["nodes"]
+  $d.die_if(type($node) != "string" or trim($node) == "",
+    "invalid " .. $CONF_PATH .. ": every node must be a non-empty string")
+  $d.assert_node($ROSTER, $node)
+  $d.die_if($seen[$node] == true, "duplicate mail node in " .. $CONF_PATH .. ": " .. $node)
+  $seen[$node] = true
+  push($configured, $node)
+end
+
+$MAIL_ROSTER = {mesh: [], foreign: [], all: $configured, order: nil}
+$parsed = $d.parse_nodes($MAIL_ROSTER, args(), [])
+$requested = $parsed["nodes"]
+$nodes = $d.order_subset($ROSTER, $requested)
+$d.die_if(len($nodes) != len($requested),
+  "mail node selection contains a duplicate or a node absent from fleet rollout order")
+
+$RCFG = $CONF["config_path"]
+$RNEW = $RCFG .. ".native-new"
+$RBAK = $RCFG .. ".bak-native"
+
+fn deploy($host)
+  print("[" .. $host .. "] normalize maild config -> native")
+
+  $reach = ssh_mix($host, 'print("reach-ok")')
+  $d.die_if(not $reach["ok"] or not contains($reach["stdout"], "reach-ok"),
+    $host .. " unreachable or not running the system Mix interpreter: " ..
+    trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+
+  -- Render only to the staging path. Single-quoted values remain literal, so
+  -- interpolation and leading-tilde expansion cannot change config values.
+  $normal = ssh_mix($host, '
+fn esc_dq($s)
+  $s = replace($s, "\\", "\\\\")
+  $s = replace($s, "\"", "\\\"")
+  $s = replace($s, "\n", "\\n")
+  return $s
+end
+
+fn esc_sq($s)
+  $sq = bytes_to_string(base64_decode("Jw=="))
+  $s = replace($s, "\\", "\\\\")
+  $s = replace($s, $sq, "\\" .. $sq)
+  return $s
+end
+
+fn render_val($value)
+  $kind = type($value)
+  if $kind == "string" then
+    $sq = bytes_to_string(base64_decode("Jw=="))
+    return $sq .. esc_sq($value) .. $sq
+  end
+  if $kind == "bool" then
+    return $value ? "true" : "false"
+  end
+  if $kind == "number" then
+    return "" .. $value
+  end
+  if $kind == "nil" then
+    return "nil"
+  end
+  if $kind == "list" then
+    $parts = []
+    for each $item in $value
+      push($parts, render_val($item))
+    end
+    return "[ " .. join($parts, ", ") .. " ]"
+  end
+  if $kind == "map" then
+    $parts = []
+    for each $key in keys($value)
+      push($parts, "\"" .. esc_dq($key) .. "\": " .. render_val($value[$key]))
+    end
+    return "{ " .. join($parts, ", ") .. " }"
+  end
+  eprint("unsupported config value type: " .. $kind)
+  exit(1)
+end
+
+fn render_native($config)
+  $lines = []
+  for each $key in keys($config)
+    push($lines, $key .. ": " .. render_val($config[$key]))
+  end
+  return join($lines, "\n") .. "\n"
+end
+
+if not is_file($cfg) then
+  eprint("live config not found: " .. $cfg)
+  exit(1)
+end
+$raw = replace(read_file($cfg), "\u{FEFF}", "")
+if substr(trim($raw), 0, 1) != "{" then
+  print("ALREADY-NATIVE")
+else
+  $config = json_parse($raw)
+  if type($config) != "map" then
+    eprint("brace config must decode to a map")
+    exit(1)
+  end
+  write_file($new, render_native($config))
+  print("NORMALIZED " .. ("" .. len(keys($config))) .. " keys -> " .. $new)
+end
+', {bindings: {cfg: $RCFG, new: $RNEW}, timeout: 60})
+  $result = trim($normal["stdout"])
+  $d.die_if(not $normal["ok"],
+    $host .. " normalize failed: " .. trim($normal["stderr"]) .. " " .. $result)
+  $d.die_if(contains($result, "ERROR"), $host .. " normalize: " .. $result)
+
+  if $result == "ALREADY-NATIVE" then
+    print("  already native — skipped")
+    print("  [" .. $host .. "] OK")
+    return nil
+  end
+  $d.die_if(not starts_with($result, "NORMALIZED "),
+    $host .. " normalize returned an unexpected result: " .. $result)
+  print("  rendered: " .. $result)
+
+  -- The daemon's real startup parser is authoritative. Back up and atomically
+  -- swap first; any parse, TLS-validation, or startup failure rolls back.
+  $swap = ssh_mix($host, '
+try
+  copy($cfg, $bak)
+catch $backup_error
+  eprint("backup failed: " .. $backup_error)
+  exit(1)
+end
+try
+  rename($new, $cfg)
+catch $swap_error
+  eprint("swap failed: " .. $swap_error)
+  exit(1)
+end
+print("SWAP_OK")
+', {bindings: {cfg: $RCFG, bak: $RBAK, new: $RNEW}, timeout: 60})
+  $d.die_if(not $swap["ok"] or not contains($swap["stdout"], "SWAP_OK"),
+    $host .. " swap failed: " .. trim($swap["stdout"]) .. " " .. trim($swap["stderr"]))
+
+  $restart = ssh_mix($host, '
+print(run("/usr/bin/systemctl restart cosmix-maild"))
+sleep(2)
+print(run("/usr/bin/systemctl is-active cosmix-maild"))
+', {timeout: 60})
+  if not $restart["ok"] or trim($restart["stdout"]) != "active" then
+    print("  RESTART FAILED with native config — restoring backup")
+    $rollback = ssh_mix($host, '
+try
+  copy($bak, $cfg)
+catch $restore_error
+  eprint("restore copy failed: " .. $restore_error)
+  exit(1)
+end
+try
+  print(run("/usr/bin/systemctl restart cosmix-maild"))
+catch $restart_error
+  eprint("restart failed: " .. $restart_error)
+  exit(1)
+end
+sleep(2)
+print(trim(run("/usr/bin/systemctl is-active cosmix-maild")))
+', {bindings: {bak: $RBAK, cfg: $RCFG}, timeout: 90})
+    $journal = ssh_mix($host,
+      'print(run("/usr/bin/journalctl -u cosmix-maild -n 30 --no-pager"))')
+    print($journal["stdout"])
+    if $rollback["ok"] and trim($rollback["stdout"]) == "active" then
+      $d.die_if(true,
+        $host .. " maild failed to start with native config — ROLLED BACK and active on the prior config")
+    end
+    print("  !!! ROLLBACK ALSO FAILED — maild is DOWN on " .. $host ..
+      " (is-active: " .. trim($rollback["stdout"]) .. ")")
+    $d.die_if(true,
+      $host .. " maild DOWN and rollback FAILED — manual intervention required on " .. $host)
+  end
+  print("  active: " .. trim($restart["stdout"]))
+
+  -- Registration is advisory: an active daemon proves the new config parsed;
+  -- a broker hiccup is not repaired by restoring a valid config.
+  $probe = ssh_mix($host, '
+send noded noded.list
+if $rc != 0 then
+  print("send rc=" .. $rc)
+  exit(7)
+end
+print("" .. $result)
+')
+  if $probe["ok"] and contains($probe["stdout"], "maild") then
+    print("  BUS: maild registered with local noded")
+  else
+    print("  WARNING: maild active but noded re-registration NOT confirmed on " .. $host ..
+      " — config is valid (active); check noded health. stdout: " ..
+      trim($probe["stdout"]) .. " stderr: " .. trim($probe["stderr"]))
+  end
+  print("  [" .. $host .. "] OK (normalized + restarted)")
+end
+
+print("rollout order: " .. join($nodes, " "))
+for each $host in $nodes
+  deploy($host)
+end
+print("")
+print("normalize complete: " .. join($nodes, " "))

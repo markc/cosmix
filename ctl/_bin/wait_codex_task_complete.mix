@@ -1,0 +1,111 @@
+#!/usr/bin/env mix
+-- wait_codex_task_complete.mix — wait for a live Codex turn to finish.
+--
+-- Codex work can outlive an MCP tool's idle window. A process listing cannot
+-- see an agent thread, and source mtimes can stay unchanged during a long
+-- build or test. The rollout transcript is the authoritative signal: it keeps
+-- advancing while the turn runs and gains a task_complete event when it ends.
+--
+-- Usage: mix _bin/wait_codex_task_complete.mix [rollout.jsonl] [min_count]
+--   rollout:   defaults to the newest recent rollout under the configured
+--              Codex sessions directory
+--   min_count: task_complete events required (default 1); for a warm thread,
+--              use the current count plus one so an earlier turn cannot pass
+-- Exit 0 = task_complete seen · 1 = cap reached · 2 = transcript stalled.
+--
+-- Run it under a persistent monitor; a backgrounded invocation may be killed.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/wait_codex_task_complete.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no Codex task watcher config at " .. $CONF_PATH ..
+    " — create it from wait_codex_task_complete.conf.mix.example")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  if type($loaded) != "map" or type($loaded["wait_codex_task_complete"]) != "map" then
+    print("  ERROR: " .. $CONF_PATH ..
+      " must contain a wait_codex_task_complete strict-data map")
+    exit(2)
+  end
+  $CONF = validate($loaded["wait_codex_task_complete"], {
+    schema_version: {type: "integer", enum: [1]},
+    sessions_dir: {type: "string", nonblank: true}
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+if not starts_with($CONF["sessions_dir"], "/") then
+  print("  ERROR: " .. $CONF_PATH .. ": sessions_dir must be an absolute path")
+  exit(2)
+end
+
+$rollout = $1
+if $rollout == nil then
+  $newest = run_argv([
+    "/usr/bin/find", $CONF["sessions_dir"],
+    "-name", "rollout-*.jsonl", "-newermt", "-12 hours",
+    "-printf", "%T@ %p\n"
+  ], {timeout: 60})
+  if $newest["exit_code"] != 0 then
+    print("CODEX-WATCH: could not search " .. $CONF["sessions_dir"] .. ": " ..
+      trim($newest["stderr"]))
+    exit(2)
+  end
+  $lines = split(trim($newest["stdout"]), "\n")
+  if len($lines) == 0 or trim($newest["stdout"]) == "" then
+    print("CODEX-WATCH: no rollout transcript modified in the last 12 hours")
+    exit(2)
+  end
+  $best = ""
+  $best_ts = 0
+  for each $line in $lines
+    $parts = split(trim($line), " ")
+    $ts = to_number($parts[0])
+    if $ts > $best_ts then
+      $best_ts = $ts
+      $best = $parts[1]
+    end
+  end
+  $rollout = $best
+  print("CODEX-WATCH: watching " .. $rollout)
+end
+
+$min_count = 1
+if $2 != nil then
+  $min_count = to_number($2)
+end
+
+$deadline = time() + 3300
+
+while true
+  if time() > $deadline then
+    print("CODEX-WATCH: TIMEOUT — no task_complete after 55 minutes")
+    exit(1)
+  end
+  $done = run_argv(["/usr/bin/grep", "-c", "task_complete", $rollout], {timeout: 60})
+  -- grep exits 1 with "0" on no match; an unreadable path gives empty stdout,
+  -- and to_number("") is nil, which must not be compared with a number.
+  $seen = to_number(trim($done["stdout"]))
+  if $seen == nil then
+    $seen = 0
+  end
+  if $seen >= $min_count then
+    print("CODEX-WATCH: TASK_COMPLETE — codex finished the turn")
+    exit(0)
+  end
+  -- A transcript that stops growing without task_complete means the turn died
+  -- rather than finished; do not wait out the whole cap for that.
+  $stale = run_argv(["/usr/bin/find", $rollout, "-mmin", "+8"], {timeout: 60})
+  if trim($stale["stdout"]) != "" then
+    print("CODEX-WATCH: STALLED — transcript untouched for 8 minutes, no task_complete")
+    exit(2)
+  end
+  sleep(45)
+end

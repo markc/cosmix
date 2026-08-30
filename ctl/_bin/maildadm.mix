@@ -1,0 +1,186 @@
+#!/usr/bin/env mix
+-- maildadm.mix <node> <subcommand> [args] — read-only maild statistics.
+--
+-- Every request runs against the selected node's local broker. The private hub
+-- configuration limits this operator command to rostered nodes that run maild.
+-- Foreign roster nodes are valid because ssh_mix invokes their installed Mix
+-- directly rather than relying on their login shell.
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn usage()
+  print("usage: mix _bin/maildadm.mix <node> <who|server|status|mailboxes|top> [args]")
+  exit(2)
+end
+
+fn config_error($path, $message)
+  print("  ERROR: invalid " .. $path .. ": " .. $message)
+  exit(2)
+end
+
+-- Keep the old address guard even though ssh_mix bindings remove source and
+-- shell interpolation. It also rejects malformed account names before I/O.
+fn assert_account($account)
+  if $account == "" then
+    print("ERROR: this subcommand requires an <account> argument")
+    exit(2)
+  end
+  $i = 0
+  while $i < len($account)
+    $char = substr($account, $i, 1)
+    $ok = (($char >= "a" and $char <= "z") or
+      ($char >= "A" and $char <= "Z") or
+      ($char >= "0" and $char <= "9") or
+      $char == "@" or $char == "." or $char == "-" or
+      $char == "_" or $char == "+" or $char == "%")
+    if not $ok then
+      print("ERROR: account '" .. $account .. "' has an invalid character " ..
+        $char .. " — allowed: [A-Za-z0-9@._+%-]")
+      exit(2)
+    end
+    $i = $i + 1
+  end
+end
+
+fn numeric_limit($value)
+  if $value == "" then
+    print("ERROR: top limit must be a number, got ''")
+    exit(2)
+  end
+  $i = 0
+  while $i < len($value)
+    $char = substr($value, $i, 1)
+    if not ($char >= "0" and $char <= "9") then
+      print("ERROR: top limit must be a number, got '" .. $value .. "'")
+      exit(2)
+    end
+    $i = $i + 1
+  end
+  return to_number($value)
+end
+
+-- The mode selects a fixed send shape; values cross the SSH boundary only as
+-- strict-data bindings. A Bus refusal remains visible as the old `ERR rc=`
+-- result, while an SSH failure is reported without hiding it as an empty reply.
+fn call_maild($node, $mode, $verb, $account, $by, $limit, $has_limit)
+  $reply = ssh_mix($node, '
+if $mode == "plain" then
+  send maild $verb
+else if $mode == "account" then
+  send maild $verb account=$account
+else
+  if $has_limit then
+    send maild $verb by=$by limit=$limit
+  else
+    send maild $verb by=$by
+  end
+end
+if $rc != 0 then
+  print("ERR rc=" .. $rc .. " " .. $result)
+else
+  print("" .. $result)
+end
+', {bindings: {
+    mode: $mode,
+    verb: $verb,
+    account: $account,
+    by: $by,
+    limit: $limit,
+    has_limit: $has_limit
+  }})
+  if not $reply["ok"] then
+    return "ERR ssh " .. trim($reply["stderr"])
+  end
+  return trim($reply["stdout"])
+end
+
+-- Argument-count refusal comes before all configuration and network access.
+$argv = args()
+if len($argv) < 2 then
+  usage()
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/maildadm.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no maildadm configuration at " .. $CONF_PATH)
+  print("         copy _etc/maildadm.conf.mix.example there and set maildadm.nodes")
+  exit(2)
+end
+$CONF = load_data($CONF_PATH)
+if type($CONF) != "map" or type($CONF["maildadm"]) != "map" then
+  config_error($CONF_PATH, "expected a maildadm map")
+end
+$MAIL = $CONF["maildadm"]
+if $MAIL["schema_version"] != 1 then
+  config_error($CONF_PATH, "expected maildadm.schema_version: 1")
+end
+if type($MAIL["nodes"]) != "list" or len($MAIL["nodes"]) == 0 then
+  config_error($CONF_PATH, "expected a non-empty maildadm.nodes list")
+end
+
+$ROSTER = $d.roster()
+for each $configured_node in $MAIL["nodes"]
+  if type($configured_node) != "string" or trim($configured_node) == "" then
+    config_error($CONF_PATH, "every maildadm.nodes entry must be a non-empty string")
+  end
+  $d.assert_node($ROSTER, $configured_node)
+end
+
+$MAIL_ROSTER = {mesh: [], foreign: [], all: $MAIL["nodes"], order: nil}
+$node = $argv[0]
+$subcommand = $argv[1]
+$d.assert_node($MAIL_ROSTER, $node)
+
+if $subcommand == "who" then
+  print("[" .. $node .. "] maild.stats.online")
+  print(call_maild($node, "plain", "maild.stats.online", "", "", nil, false))
+  exit(0)
+end
+
+if $subcommand == "server" then
+  print("[" .. $node .. "] maild.stats.server")
+  print(call_maild($node, "plain", "maild.stats.server", "", "", nil, false))
+  exit(0)
+end
+
+if $subcommand == "status" or $subcommand == "mailboxes" then
+  $account = ""
+  if len($argv) >= 3 then
+    $account = $argv[2]
+  end
+  assert_account($account)
+  $verb = "maild.stats.account"
+  if $subcommand == "mailboxes" then
+    $verb = "maild.stats.mailboxes"
+  end
+  print("[" .. $node .. "] " .. $verb .. " account=" .. $account)
+  print(call_maild($node, "account", $verb, $account, "", nil, false))
+  exit(0)
+end
+
+if $subcommand == "top" then
+  $by = "size"
+  if len($argv) >= 3 then
+    $by = $argv[2]
+  end
+  if $by != "size" and $by != "count" then
+    print("ERROR: top sort must be 'size' or 'count', got '" .. $by .. "'")
+    exit(2)
+  end
+  $limit = nil
+  $has_limit = false
+  if len($argv) >= 4 then
+    $limit = numeric_limit($argv[3])
+    $has_limit = true
+  end
+  $label = " by=" .. $by
+  if $has_limit then
+    $label = $label .. " limit=" .. $argv[3]
+  end
+  print("[" .. $node .. "] maild.stats.top" .. $label)
+  print(call_maild($node, "top", "maild.stats.top", "", $by, $limit, $has_limit))
+  exit(0)
+end
+
+print("ERROR: unknown subcommand '" .. $subcommand .. "' — who|server|status|mailboxes|top")
+exit(2)

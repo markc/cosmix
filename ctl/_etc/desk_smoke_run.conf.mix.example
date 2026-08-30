@@ -1,0 +1,16 @@
+-- desk_smoke_run.conf.mix.example — private local compositor smoke bindings.
+-- Copy this file to desk_smoke_run.conf.mix in the private control hub and
+-- replace every placeholder with values for the developer workstation.
+desk_smoke_run: {
+  schema_version: 1,
+  container: "alpha",
+  vt: 7,
+  fallback_restore_vt: 2,
+  dataset: "pool/machines/alpha",
+  container_root: "/var/lib/machines/alpha",
+  foot_bin: "/usr/bin/foot",
+  drm_device: "/dev/dri/card0",
+  drm_connector: "DP-1",
+  log_dir: "/home/user/.local/state/cosmix/desk-smoke",
+  staged_comp: "src/desktop/target/release/cosmix-comp"
+}

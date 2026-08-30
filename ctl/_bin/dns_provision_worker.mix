@@ -101,8 +101,15 @@ fn validate_url($url)
 end
 
 validate_url($CONF["base_url"])
-if not regex_match("^/[-A-Za-z0-9_./]+[.]conf$", $CONF["dnsmasq_dropin"]) then
-  conf_error("dnsmasq_dropin must be a shell-safe absolute .conf path")
+if not starts_with($CONF["dnsmasq_dropin"], "/etc/dnsmasq.d/") or
+    not regex_match("^/[-A-Za-z0-9_./]+[.]conf$", $CONF["dnsmasq_dropin"]) or
+    contains($CONF["dnsmasq_dropin"], "//") then
+  conf_error("dnsmasq_dropin must be a normalised, shell-safe .conf path under /etc/dnsmasq.d")
+end
+for each $path_part in split($CONF["dnsmasq_dropin"], "/")
+  if $path_part == "." or $path_part == ".." then
+    conf_error("dnsmasq_dropin must not contain . or .. components")
+  end
 end
 if not valid_ipv4($CONF["dns_server"]) then
   conf_error("dns_server must be an IPv4 address")
@@ -215,7 +222,7 @@ if not $reach["ok"] or not contains($reach["stdout"], "DNS-REACH " .. $reach_tok
 end
 
 -- One remote Mix program owns the whole ENSURE transaction. Values cross the
--- boundary only as strict-data bindings; the source is static and shell-free.
+-- boundary only as strict-data bindings; only fixed system commands use run().
 $result = ssh_mix($REMOTE, '
 fn fail($message, $clean)
   if $clean then
@@ -344,6 +351,9 @@ if not $result["ok"] then
     trim($result["stderr"]) .. " " .. trim($result["stdout"]))
 end
 $outcome = trim($result["stdout"])
+if not contains($outcome, "ENSURED-NOOP") and not contains($outcome, "ENSURED-COMMIT") then
+  fail_dns(false, $DNS_TARGET .. " dns ensure returned no success marker: " .. $outcome)
+end
 
 fn dig($arguments, $label)
   $query = run_argv(concat(["dig", "+short", "@" .. $CONF["dns_server"]], $arguments),

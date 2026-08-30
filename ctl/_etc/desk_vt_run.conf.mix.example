@@ -1,0 +1,25 @@
+-- desk_vt_run.conf.mix.example — private local VT/compositor test settings.
+-- Copy this file to desk_vt_run.conf.mix in the private control hub and adapt
+-- every value to the developer workstation. The runner switches VTs and must
+-- never be exercised merely to test this example.
+{
+  desk_vt_run: {
+    schema_version: 1,
+
+    -- Local systemd-nspawn machine and its dedicated, masked-getty VT.
+    machine: "alpha",
+    vt: "7",
+    restore_vt_fallback: "1",
+
+    -- ZFS dataset bracketed before and after the compositor run.
+    dataset: "pool/machines/alpha",
+
+    -- Host-local evidence and atomic single-runner lock directories.
+    log_dir: "/tmp/cosmix-desk-vt",
+    lock_dir: "/run/lock/cosmix-desk-vt",
+
+    -- Local DRM card and connector selected for the live KMS run.
+    drm_device: "/dev/dri/card0",
+    drm_connector: "Virtual-1"
+  }
+}

@@ -1,0 +1,497 @@
+#!/usr/bin/env mix
+-- desk_vt_run.mix — run one checkpoint-bracketed kms-live test locally.
+--
+-- WARNING: this switches the physical display to the configured VT. A
+-- finally block switches it back on evaluator exits, and a transient host
+-- timer remains armed as the recovery net if the process is killed outright.
+-- Do not run it while the live session is in use.
+--
+-- Usage (root):
+--   mix _bin/desk_vt_run.mix [mac|win11|cosmix|none] [1.0|2.5] [hold-seconds]
+--
+-- The configured machine, VT, checkpoint dataset and display devices are
+-- private workstation state. The compositor is taken from the CosMix desktop
+-- release target, never from an operator-specific checkout path.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/desk_vt_run.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no desk VT runner config at " .. $CONF_PATH ..
+    " — create it from desk_vt_run.conf.mix.example")
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["desk_vt_run"], {
+    schema_version: {type: "integer", enum: [1]},
+    machine: {type: "string", nonblank: true},
+    vt: {type: "string", nonblank: true},
+    restore_vt_fallback: {type: "string", nonblank: true},
+    dataset: {type: "string", nonblank: true},
+    log_dir: {type: "string", nonblank: true},
+    drm_device: {type: "string", nonblank: true},
+    drm_connector: {type: "string", nonblank: true},
+    lock_dir: {type: "string", nonblank: true}
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+if not regex_match("^[0-9]+$", $CONF["vt"]) then
+  config_error("desk_vt_run.vt must contain decimal digits only")
+end
+if not regex_match("^[0-9]+$", $CONF["restore_vt_fallback"]) then
+  config_error("desk_vt_run.restore_vt_fallback must contain decimal digits only")
+end
+
+$CT = $CONF["machine"]
+$VT = $CONF["vt"]
+$RESTORE_VT_FALLBACK = $CONF["restore_vt_fallback"]
+$TTY = "/dev/tty" .. $VT
+$DATASET = $CONF["dataset"]
+$LOGDIR = env("DESK_VT_LOG_DIR", $CONF["log_dir"])
+$DEVICE = $CONF["drm_device"]
+$CONN = $CONF["drm_connector"]
+$LOCK = $CONF["lock_dir"]
+$FIRST_FRAME_DEADLINE = 60
+$STYLES = ["mac", "win11", "cosmix", "none"]
+$SCALES = ["1.0", "2.5"]
+
+for each $path in [$LOGDIR, $DEVICE, $LOCK]
+  if not starts_with($path, "/") or not regex_match("^[A-Za-z0-9/._-]+$", $path) then
+    config_error("paths must be absolute and contain only [A-Za-z0-9/._-]: " .. $path)
+  end
+end
+if not regex_match("^[A-Za-z0-9/._:-]+$", $DATASET) then
+  config_error("desk_vt_run.dataset contains unsupported characters")
+end
+
+-- deploy_lib does not yet distinguish the separate desktop Cargo workspace.
+-- CARGO_TARGET_DIR is shared Cargo behaviour, so let cosmix_bin own that path;
+-- otherwise locate the desktop target beneath the validated CosMix checkout.
+fn desktop_bin($name)
+  if env("CARGO_TARGET_DIR") != "" then
+    return $d.cosmix_bin($name)
+  end
+  return $d.cosmix_root() .. "/src/desktop/target/release/" .. $name
+end
+
+$COMP = desktop_bin("cosmix-comp")
+
+fn usage($message)
+  print("desk_vt_run: " .. $message)
+  print("usage: mix _bin/desk_vt_run.mix [mac|win11|cosmix|none] [1.0|2.5] [hold-seconds]")
+  exit(1)
+end
+
+-- A transient unit is gone only when systemd explicitly says so. Empty,
+-- timed-out and intermediate answers remain failures.
+fn unit_gone($state)
+  return $state == "inactive" or $state == "failed"
+end
+
+-- run_argv_must does not expose the command result needed in diagnostics.
+-- Raise after an argv-only call so the surrounding try/finally retains the
+-- old cleanup contract.
+fn must_run($argv)
+  $result = run_argv($argv)
+  if $result["exit_code"] != 0 then
+    raise("DESK_COMMAND_FAILED", "command failed: " .. join($argv, " ") .. ": " ..
+      trim($result["stdout"]) .. " " .. trim($result["stderr"]))
+  end
+  return $result["stdout"]
+end
+
+$style = "mac"
+$scale = "1.0"
+$hold = 30
+$argv = args()
+if len($argv) > 3 then
+  usage("too many arguments")
+end
+if len($argv) > 0 then
+  $style = $argv[0]
+end
+if len($argv) > 1 then
+  $scale = $argv[1]
+end
+if len($argv) > 2 then
+  $hold = to_number($argv[2])
+  if $hold == nil or $hold < 5 or $hold > 600 then
+    usage("hold-seconds must be a number in 5..600")
+  end
+end
+if not contains($STYLES, $style) then
+  usage("style must be mac, win11, cosmix or none, got: " .. $style)
+end
+if not contains($SCALES, $scale) then
+  usage("scale must be 1.0 or 2.5, got: " .. $scale)
+end
+if not regex_match("^[A-Za-z0-9/._-]+$", $LOGDIR) then
+  usage("DESK_VT_LOG_DIR contains characters outside [A-Za-z0-9/._-]: " .. $LOGDIR)
+end
+
+-- Every preflight is fail-closed: only the known-good answer advances.
+$id = run_argv(["id", "-u"])
+$d.die_if($id["exit_code"] != 0 or trim($id["stdout"]) != "0",
+  "must run as root — VT, checkpoint and machine control require it")
+
+$state = run_argv(["machinectl", "show", $CT, "--property=State", "--value"])
+$d.die_if($state["exit_code"] != 0 or trim($state["stdout"]) != "running",
+  $CT .. " is not running (machinectl State=" .. trim($state["stdout"]) .. ")")
+
+$getty_unit = "getty@tty" .. $VT .. ".service"
+$enabled = run_argv(["systemctl", "is-enabled", $getty_unit])
+$d.die_if(trim($enabled["stdout"]) != "masked",
+  $getty_unit .. " is not masked — it would race the machine for the VT")
+$active = run_argv(["systemctl", "is-active", $getty_unit])
+$d.die_if(trim($active["stdout"]) != "inactive",
+  $getty_unit .. " is not inactive (got '" .. trim($active["stdout"]) .. "') — stop it first")
+
+-- StandardInput=tty waits if another controlling process holds the terminal.
+-- fuser exit 1 means free; 0 means held; every other result is indeterminate.
+$fuser = run_argv(["fuser", "-s", $TTY])
+$d.die_if($fuser["exit_code"] == 0,
+  $TTY .. " is in use — clear the stale VT holder first")
+$d.die_if($fuser["exit_code"] != 1,
+  "fuser could not examine " .. $TTY .. " (exit " .. to_string($fuser["exit_code"]) ..
+  ") — refusing to assume it is free")
+
+$status_path = "/sys/class/drm/" .. basename($DEVICE) .. "-" .. $CONN .. "/status"
+$conn_status = trim(read_file($status_path))
+$d.die_if($conn_status != "connected",
+  $CONN .. " is not connected (status: " .. $conn_status .. ")")
+
+-- The unattended takeover requires the opt-in confirmation marker to exist in
+-- the build, even though this run deliberately does not enable confirmation.
+$marker = run_argv(["strings", $COMP], {timeout: 60, max_output: 67108864})
+$d.die_if($marker["exit_code"] != 0 or $marker["stdout_truncated"] or
+  not contains($marker["stdout"], "--kms-confirm"),
+  $COMP .. " lacks the --kms-confirm marker — build a compatible compositor first")
+
+$seatd = run_argv(["systemd-run", "-M", $CT, "--pipe", "--wait", "--quiet", "--",
+  "systemctl", "is-active", "seatd"])
+$d.die_if(trim($seatd["stdout"]) != "active",
+  "seatd is not active inside " .. $CT .. " (empty answer means machine systemd is unresponsive)")
+
+-- The marker is printed by Mix inside the machine. Its absence is a transport
+-- failure, distinct from pgrep's ordinary not-found exit.
+$probe_source = '$probe = run_argv(["pgrep", "-x", "cosmix-comp"])
+print("PGREP_RC=" .. to_string($probe["exit_code"]))'
+$probe = run_argv(["systemd-run", "-M", $CT, "--pipe", "--wait", "--quiet", "--",
+  $d.mix_bin(), "-c", $probe_source])
+$d.die_if(contains($probe["stdout"], "PGREP_RC=0"),
+  "a cosmix-comp is already running inside " .. $CT .. " — close it first")
+$d.die_if(not contains($probe["stdout"], "PGREP_RC=1"),
+  "could not prove that no compositor is running inside " .. $CT)
+
+$restore_vt = trim(must_run(["fgconsole"]))
+$d.die_if(not regex_match("^[0-9]+$", $restore_vt),
+  "fgconsole returned '" .. $restore_vt .. "' — cannot record a VT to restore")
+if $restore_vt == $VT then
+  print("  NOTE: display is already on tty" .. $VT .. "; using configured fallback tty" ..
+    $RESTORE_VT_FALLBACK)
+  $restore_vt = $RESTORE_VT_FALLBACK
+end
+
+mkdir($LOGDIR)
+
+-- mkdir is the atomic single-runner lock. It remains held through the
+-- post-snapshot so the complete evidence bracket belongs to one invocation.
+$lock = run_argv(["mkdir", $LOCK])
+$d.die_if($lock["exit_code"] != 0,
+  "another desk_vt_run holds " .. $LOCK .. " (remove it only if proven stale)")
+
+$ts = replace(to_string(time()), ".", "-")
+$UNIT = "cosmix-desk-kms-" .. $ts
+$TIMER = "desk-vt-restore-" .. $ts
+$tag = "vt-" .. $style .. "-" .. replace($scale, ".", "-") .. "-" .. $ts
+$pre_snap = $DATASET .. "@" .. $tag .. "-pre"
+$post_snap = $DATASET .. "@" .. $tag .. "-post"
+$log = $LOGDIR .. "/" .. $tag .. ".log"
+
+$comp_argv = [$COMP, "kms-live", "--device", $DEVICE, "--connector", $CONN, "--scale", $scale]
+if $style != "none" then
+  $comp_argv = concat($comp_argv, ["--chrome", $style])
+end
+
+$bound = $hold + 300
+print("VT run " .. $tag .. ": " .. $CT .. " on tty" .. $VT .. ", " .. $CONN ..
+  ", hold " .. to_string($hold) .. "s")
+print("  physical display restore VT = " .. $restore_vt)
+
+$verdict = "aborted-preflight"
+$exit_status = ""
+$unit_final = ""
+$lit = false
+$died_early = false
+$escalated = false
+$int_delivered = false
+$restore_ok = false
+$pre_ok = false
+$timer_cancelled = false
+try
+  $_pre = must_run(["zfs", "snapshot", $pre_snap])
+  $pre_ok = true
+  print("  pre-snapshot: " .. $pre_snap)
+
+  -- The timer covers process death paths that bypass finally.
+  $_timer = must_run(["systemd-run", "--unit=" .. $TIMER,
+    "--on-active=" .. to_string($bound + 90), "--timer-property=AccuracySec=1s",
+    "--", "/usr/bin/chvt", $restore_vt])
+
+  $_switch = must_run(["chvt", $VT])
+  $verdict = "aborted-mid-bracket"
+
+  $launch = ["systemd-run", "-M", $CT, "--unit=" .. $UNIT,
+    "-p", "TTYPath=" .. $TTY,
+    "-p", "StandardInput=tty",
+    "-p", "StandardOutput=journal",
+    "-p", "StandardError=journal",
+    "-p", "Environment=RUST_LOG=info,cosmix_comp::protocol::handlers=debug",
+    "-p", "Environment=LIBSEAT_BACKEND=seatd",
+    "-p", "RuntimeDirectory=cosmix-desk",
+    "-p", "RuntimeDirectoryMode=0700",
+    "-p", "Environment=XDG_RUNTIME_DIR=/run/cosmix-desk",
+    "-p", "RuntimeMaxSec=" .. to_string($bound),
+    "--"]
+  $launch = concat($launch, $comp_argv)
+  $_launched = must_run($launch)
+  print("  launched " .. $UNIT .. " in " .. $CT ..
+    " (TERM backstop at " .. to_string($bound) .. "s)")
+
+  -- Use a wall-clock deadline so journal and systemctl latency cannot stretch
+  -- the first-frame gate indefinitely.
+  $first_frame_deadline = time() + $FIRST_FRAME_DEADLINE
+  while time() < $first_frame_deadline and not $lit do
+    $_sleep = run_argv(["sleep", "3"])
+    $journal = run_argv(["journalctl", "-M", $CT, "-u", $UNIT, "--no-pager"],
+      {timeout: 15, max_output: 67108864})
+    if $journal["exit_code"] == 0 and not $journal["stdout_truncated"] and
+        contains($journal["stdout"], "live KMS first frame submitted") then
+      $lit = true
+    end
+    $unit_active = run_argv(["systemctl", "-M", $CT, "is-active", $UNIT .. ".service"])
+    if not $lit and unit_gone(trim($unit_active["stdout"])) then
+      break
+    end
+  end
+
+  if $lit then
+    print("  first frame submitted — holding " .. to_string($hold) .. "s")
+    $_hold = run_argv(["sleep", to_string($hold)], {timeout: 0})
+    $unit_active = run_argv(["systemctl", "-M", $CT, "is-active", $UNIT .. ".service"])
+    if unit_gone(trim($unit_active["stdout"])) then
+      $died_early = true
+      print("  compositor did not survive the hold (unit " ..
+        trim($unit_active["stdout"]) .. " before this run's INT)")
+    else
+      $kill = run_argv(["systemctl", "-M", $CT, "kill", "--signal=INT",
+        "--kill-whom=main", $UNIT .. ".service"])
+      if $kill["exit_code"] == 0 then
+        $int_delivered = true
+      else
+        print("  WARNING: systemctl kill INT failed (exit " ..
+          to_string($kill["exit_code"]) .. ")")
+      end
+    end
+  else
+    print("  NO first frame within " .. to_string($FIRST_FRAME_DEADLINE) ..
+      "s — closing whatever is there")
+    $kill = run_argv(["systemctl", "-M", $CT, "kill", "--signal=INT",
+      "--kill-whom=main", $UNIT .. ".service"])
+    if $kill["exit_code"] != 0 then
+      print("  close attempt on the never-lit unit exited " ..
+        to_string($kill["exit_code"]) .. " (it may already be gone)")
+    end
+  end
+
+  $close_deadline = time() + 30
+  $unit_final = "unknown"
+  while time() < $close_deadline do
+    $unit_active = run_argv(["systemctl", "-M", $CT, "is-active", $UNIT .. ".service"])
+    $unit_final = trim($unit_active["stdout"])
+    if unit_gone($unit_final) then
+      break
+    end
+    $_sleep = run_argv(["sleep", "2"])
+  end
+  if not unit_gone($unit_final) then
+    $escalated = true
+    print("  unit still '" .. $unit_final .. "' after 30s — escalating to systemctl stop")
+    $_stop = run_argv(["systemctl", "-M", $CT, "stop", $UNIT .. ".service"],
+      {timeout: 150})
+    $stop_deadline = time() + 120
+    while time() < $stop_deadline do
+      $unit_active = run_argv(["systemctl", "-M", $CT, "is-active", $UNIT .. ".service"])
+      $unit_final = trim($unit_active["stdout"])
+      if unit_gone($unit_final) then
+        break
+      end
+      $_sleep = run_argv(["sleep", "2"])
+    end
+  end
+
+  if unit_gone($unit_final) then
+    $show = run_argv(["systemctl", "-M", $CT, "show", $UNIT .. ".service",
+      "--property=ExecMainStatus", "--value"])
+    $exit_status = trim($show["stdout"])
+  end
+
+  if not $lit then
+    $verdict = "never-lit"
+  else
+    if not unit_gone($unit_final) then
+      $verdict = "wedged-close"
+      print("  unit is still not gone after escalation; the TERM backstop remains active")
+    else
+      if $escalated then
+        $verdict = "wedged-close-escalated-status-" .. $exit_status
+      else
+        if $died_early then
+          $verdict = "lit-but-died-during-hold-status-" .. $exit_status
+        else
+          if $exit_status == "130" and $int_delivered then
+            $verdict = "lit-closed-130"
+          else
+            if $exit_status == "143" then
+              $verdict = "lit-but-TERM-backstop-143"
+            else
+              $verdict = "lit-but-exited-" .. $exit_status
+            end
+          end
+        end
+      end
+    end
+  end
+catch $caught
+  print("  ABORTED: " .. $caught)
+  print("  pre-snapshot may be dangling: " .. $pre_snap)
+  $_catch_stop = run_argv(["systemctl", "-M", $CT, "stop", "--no-block",
+    $UNIT .. ".service"])
+finally
+  $back = run_argv(["chvt", $restore_vt])
+  if $back["exit_code"] == 0 then
+    $restore_ok = true
+    $timer_stop = run_argv(["systemctl", "stop", $TIMER .. ".timer"])
+    if $timer_stop["exit_code"] == 0 then
+      $timer_cancelled = true
+    else
+      print("  WARNING: could not cancel " .. $TIMER .. ".timer — it will switch to VT " ..
+        $restore_vt .. " later; stop it manually")
+    end
+  else
+    print("  WARNING: VT restore failed; leaving " .. $TIMER ..
+      ".timer armed as the recovery net")
+  end
+  $_timer_reset = run_argv(["systemctl", "reset-failed", $TIMER .. ".service"])
+end
+
+-- Evidence remains under the lock: the post-snapshot closes the bracket.
+$err_count = "log-dump-failed"
+$post_ok = false
+$diff_ok = false
+$diff_shown = ""
+$diff_err = ""
+$diff_total = 0
+try
+  $dump = run_argv(["journalctl", "-M", $CT, "-u", $UNIT, "--no-pager"], {
+    timeout: 60,
+    stdout: {file: $log, mode: 0o600},
+    stderr: "stdout"
+  })
+  if $dump["exit_code"] != 0 then
+    print("  WARNING: journal dump failed; " .. $log .. " may be partial")
+  else
+    $count = 0
+    for each $line in split(read_file($log), "\n")
+      if contains($line, " ERROR ") or regex_match("panicked|[Dd]evice ?[Ll]ost", $line) then
+        $count = $count + 1
+      end
+    end
+    $err_count = to_string($count)
+  end
+  $_unit_reset = run_argv(["systemctl", "-M", $CT, "reset-failed", $UNIT .. ".service"])
+
+  $post_snapshot = {exit_code: 1, stderr: "skipped: no pre-snapshot from this run"}
+  if $pre_ok then
+    $post_snapshot = run_argv(["zfs", "snapshot", $post_snap])
+  end
+  if $post_snapshot["exit_code"] == 0 then
+    $post_ok = true
+    $diff = run_argv(["zfs", "diff", $pre_snap, $post_snap],
+      {timeout: 120, max_output: 67108864})
+    if $diff["exit_code"] == 0 and not $diff["stdout_truncated"] and
+        not $diff["stderr_truncated"] then
+      $diff_ok = true
+      $diff_lines = split($diff["stdout"], "\n")
+      $diff_total = len($diff_lines)
+      $index = 0
+      for each $line in $diff_lines
+        if $index < 40 then
+          $diff_shown = $diff_shown .. $line .. "\n"
+        end
+        $index = $index + 1
+      end
+    else
+      if $diff["stdout_truncated"] or $diff["stderr_truncated"] then
+        $diff_err = "diff output exceeded the capture limit"
+      else
+        $diff_err = trim($diff["stderr"])
+      end
+    end
+  else
+    print("  WARNING: post-snapshot failed: " .. trim($post_snapshot["stderr"]))
+  end
+finally
+  $_unlock = run_argv(["rmdir", $LOCK])
+end
+
+print("")
+print("=== " .. $tag .. ": " .. $verdict .. " ===")
+print("  unit final state: " .. $unit_final .. "  ExecMainStatus: " .. $exit_status)
+print("  exit legend: 0 close-request / 1 render-or-device-lost / 130 INT / 143 TERM-backstop")
+print("  log: " .. $log .. " (ERROR/panic/DeviceLost lines: " .. $err_count .. ")")
+print("  snapshots: " .. $pre_snap .. " -> " .. $post_snap)
+if $post_ok and $diff_ok then
+  print("  rootfs diff pre->post (first 40 of " .. to_string($diff_total) .. " lines):")
+  print($diff_shown)
+else
+  if $post_ok then
+    print("  rootfs diff FAILED: " .. $diff_err)
+  else
+    print("  rootfs diff SKIPPED: no post-snapshot")
+  end
+end
+print("  rollback snapshot if wedged, with the machine stopped: " .. $pre_snap)
+
+-- Green requires every independent assertion, not merely a successful launch.
+if $verdict != "lit-closed-130" then
+  exit(1)
+end
+if $err_count != "0" then
+  print("  NOTE: death-marker lines are present or the log is missing")
+  exit(1)
+end
+if not $restore_ok then
+  print("  NOTE: VT restore failed")
+  exit(1)
+end
+if not $post_ok or not $diff_ok then
+  print("  NOTE: checkpoint bracket is incomplete")
+  exit(1)
+end
+if not $timer_cancelled then
+  print("  NOTE: restore timer is still armed")
+  exit(1)
+end
+print("  VERDICT: GREEN — lit, held, INT-closed 130, VT restored, timer cancelled, log clean, bracket complete")

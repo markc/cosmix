@@ -1,0 +1,7 @@
+-- Private hub configuration for ensure_maild_filter_cfg.mix.
+-- Copy this file to `_etc/ensure_maild_filter_cfg.conf.mix` in the control hub
+-- and replace the placeholders with rostered nodes that run cosmix-maild.
+ensure_maild_filter_cfg: {
+  schema_version: 1,
+  nodes: ["alpha", "beta", "gamma"]
+}
