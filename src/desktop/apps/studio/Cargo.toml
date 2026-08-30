@@ -1,0 +1,44 @@
+# desktop/apps/studio — CosMix Studio, the recording-studio/DAW desktop app.
+# It shares the desktop workspace while headless substrate remains in src/.
+# See desktop/APPS.md.
+[package]
+name = "cosmix-studio"
+version = "0.4.5"
+description = "CosMix Studio — the single-process CTK mixer (board + musicd DSP fused), the interaction testbed line"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+
+[package.metadata.cosmix]
+kind = "app"
+component = "studio"
+display = "CosMix Studio"
+engine = "bevy"
+views = ["mixer", "wave"]
+
+[[bin]]
+name = "cosmix-studio"
+path = "src/main.rs"
+
+[build-dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+
+[dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+bevy = { version = "=0.19.0", default-features = false, features = [
+    "ui",
+    "bevy_feathers",
+    "accesskit_unix",
+] }
+cosmix-mixer-schema = { path = "../../../crates/cosmix-mixer-schema" }
+cosmix-actions = { path = "../../../crates/cosmix-actions" }
+cosmix-musicd = { path = "../../../crates/cosmix-musicd", default-features = false, features = ["mixer-host"] }
+# The song document (edits + undo live in the UI; the engine only sees banks).
+cosmix-song = { path = "../../../crates/cosmix-song" }
+ctk = { path = "../../ctk", features = ["mixer", "bus", "theme", "icons", "actions"] }
+rtrb = "0.3"
+# The Bus app.song.load verb parses its request body and formats its reply.
+serde_json = "1"
+# Same pure-Rust synth musicd links — the edit loop passes Arc<SoundFont>
+# straight into song_bank_with. Version must track musicd's.
+rustysynth = "1.3.6"

@@ -1,0 +1,76 @@
+-- biz_provision_status.mix — admin JSON poll endpoint for CT provision jobs.
+-- GET /biz/provision-status?service=<id>. Session/admin gated like the other
+-- /biz pages; D9-safe because this is a read-only webd handler.
+include "/opt/cosmix/vhosts/shared/lib/lib.mix"
+include "/opt/cosmix/vhosts/shared/apps/biz.mix"
+
+function bps_label($status, $step)
+  $st = "" .. $status
+  $sp = "" .. $step
+  if $st == "pending" then return "queued" end
+  if $st == "done" then return "live" end
+  if $st == "failed" then return "failed" end
+  if $st == "abandoned" then return "abandoned" end
+  if $sp == "staging" then return "staging release" end
+  if $sp == "cloning" then return "cloning" end
+  if $sp == "preseeding" then return "preseeding" end
+  if $sp == "dns" then return "dns" end
+  if $sp == "starting" then return "starting" end
+  if $sp == "verifying" then return "verifying" end
+  if $sp == "claimed" then return "claimed" end
+  if $st == "running" then return "running" end
+  if $st == "" then return "not queued" end
+  return $st
+end
+
+function bps_req($raw)
+  $r = trim("" .. $raw)
+  if $r == "" then return {} end
+  try
+    $j = json_parse($r)
+    if $j != nil and type($j) == "map" then return $j end
+  catch $e
+  end
+  return {}
+end
+
+function bps_empty_nil($v)
+  if $v == nil then return "" end
+  return "" .. $v
+end
+
+function bps_doc($sid)
+  $sr = db_query("SELECT id, fqdn FROM services WHERE id = ?1", [$sid])
+  if length($sr) != 1 then return nil end
+  $jr = db_query("SELECT * FROM jobs WHERE kind = 'provision_ct' AND service_id = ?1
+                  ORDER BY id DESC LIMIT 1", [$sid])
+  $fqdn = "" .. $sr[0]["fqdn"]
+  if length($jr) == 0 then
+    return { status: "", step: "", phase_label: "not queued", fqdn: $fqdn,
+             ip: "", vmid: "", node: "", error: "", attempt: 0, updated: "" }
+  end
+  $j = $jr[0]
+  $req = bps_req($j["external_ref"])
+  if $fqdn == "" and trim("" .. $req["node_name"]) != "" and trim("" .. $req["domain"]) != "" then
+    $fqdn = lower(trim("" .. $req["node_name"])) .. "." .. lower(trim("" .. $req["domain"]))
+  end
+  return { status: bps_empty_nil($j["status"]), step: bps_empty_nil($j["step"]),
+           phase_label: bps_label($j["status"], $j["step"]), fqdn: $fqdn,
+           ip: bps_empty_nil($j["ip"]), vmid: bps_empty_nil($j["vmid"]), node: bps_empty_nil($j["node"]),
+           error: bps_empty_nil($j["error"]), attempt: to_number($j["attempt"]), updated: bps_empty_nil($j["updated"]) }
+end
+
+function biz_provision_status_main()
+  cms_init()
+  biz_init()
+  $user = current_user($HEADERS)
+  $deny = require_role($user, "admin")
+  if $deny != nil then return $deny end
+  if $METHOD != "GET" then return { status: 405, headers: {}, body: "GET only" } end
+  $q = parse_query($QUERY)
+  $sid = to_number($q["service"])
+  if $sid == nil then return { status: 400, headers: {}, body: "missing service" } end
+  $doc = bps_doc($sid)
+  if $doc == nil then return { status: 404, headers: {}, body: "not found" } end
+  return { status: 200, headers: { "Content-Type": "application/json" }, body: json_encode($doc) }
+end

@@ -1,0 +1,38 @@
+[Unit]
+Description=Cosmix nspawn placement controller or host executor
+Documentation=https://github.com/markc/cos
+After=network.target cosmix-noded.service
+
+[Service]
+Type=simple
+User=cosmix-nspawnd
+Group=cosmix-nspawnd
+StateDirectory=cosmix/nspawnd
+StateDirectoryMode=0700
+RuntimeDirectory=cosmix/nspawnd
+RuntimeDirectoryMode=0700
+EnvironmentFile=-/etc/cosmix/nspawnd.env
+LoadCredential=operation-token:/etc/cosmix/nspawnd/operation-token
+ExecStart=/opt/cosmix/bin/cosmix-nspawnd
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/cosmix/nspawnd /run/lock/cosmix-nspawnd
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,796 @@
+-- admin_posts.mix — post CRUD (GET/POST /admin/posts).
+--   GET  /admin/posts            → list
+--   GET  /admin/posts?new=1      → blank editor
+--   GET  /admin/posts?edit=<slug>→ editor for that post
+--   POST action=save             → create/update
+--   POST action=delete           → remove
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/admin_resource.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+include "/opt/cosmix/vhosts/shared/widgets/reader.mix"
+
+-- slug shape gate for delete ids (bulk_id is the slug — untrusted): trimmed,
+-- nonblank, bounded. nil = invalid (counts as a skip in bulk).
+function pv_slug_ok($raw)
+  if $raw == nil then
+    return nil
+  end
+  $s = trim("" .. $raw)
+  if $s == "" or length($s) > 200 then
+    return nil
+  end
+  return $s
+end
+
+function pv_fetch_by_slug($slug)
+  $r = db_query("SELECT id, slug, title FROM cms_posts WHERE slug = ?1", [$slug])
+  if length($r) == 1 then
+    return $r[0]
+  end
+  return nil
+end
+
+-- Foundation policy hooks: dt_try_delete_row wraps existence-check + the
+-- cms_delete_post_by_slug cascade in ONE tx (see admin_resource.mix). No guard
+-- (any entry is deletable) and no audit (the CMS db has no audit table).
+function pv_del_hooks()
+  return {
+    id_ok: fn($raw) = pv_slug_ok($raw),
+    fetch: fn($slug) = pv_fetch_by_slug($slug),
+    delete: fn($slug, $row) = cms_delete_post_by_slug($slug),
+    missing: "No such entry."
+  }
+end
+
+-- /post/ vs /page/ view base for a row's kind (used by the list row-actions).
+function pv_base($kind)
+  if ("" .. $kind) == "page" then
+    return "/page/"
+  end
+  return "/post/"
+end
+
+-- Map a post status to a Filament badge variant (whitelisted by dt_color_ok):
+-- published → green, anything else (draft) → gray.
+function post_status_variant($s)
+  if ("" .. $s) == "published" then
+    return "success"
+  end
+  return "gray"
+end
+
+-- Group-header display labels (Phase 4b grouping demo): a friendlier plural than the raw
+-- kind/status column value ("Type: Pages" rather than "Type: page").
+function pv_kind_label($k)
+  if ("" .. $k) == "page" then
+    return "Pages"
+  end
+  return "Posts"
+end
+function pv_status_label($s)
+  if ("" .. $s) == "published" then
+    return "Published"
+  end
+  return "Drafts"
+end
+
+-- The list datatable config (spec + opts), built ONCE so the POST handler can re-run
+-- dt_where for select-all-across-pages (S-5) with the EXACT same spec/filters the GET
+-- list renders. Returns { spec, opts }.
+function posts_list_config()
+  -- Filament-skin demo: title keeps a render lambda (bold + private lock); Status uses the
+  -- declarative `badge` opt; Author + Categories are relationship cols ($cols subqueries in
+  -- dt_sql). EVERY display column is toggleable via the Columns menu; default-VISIBLE =
+  -- Title, Categories, Author, Type; default-HIDDEN = Slug, Status, Created, Updated (the
+  -- table leads with content, not the slug/status/timestamps). Updated is datetime sugar.
+  -- Title cell: bold title + a private-lock dot. The slug moved to its OWN default-hidden
+  -- column (below), so it no longer rides as a subline here. tooltip = the full title (the
+  -- render lambda emits HTML, so the cell's hover title can't be auto-derived from a value).
+  $title_cell = fn($r) = '<strong>' .. esc($r["title"]) .. '</strong>' .. priv_dot($r["visibility"])
+  $title_tip = fn($r) = "" .. $r["title"]
+  $status_badge = fn($r) = { "text": $r["status"], "variant": post_status_variant($r["status"]) }
+  -- Phase 3 declarative row actions: Edit + View nav, Delete mutating (confirm-gated). Edit
+  -- navigates to the full-page toolbar editor (the modal-edit path was retired 2026-06-26 —
+  -- the toolbar editor's own field dialogs replace the whole-form modal).
+  $act_edit = dt_action("edit", { "label": "Edit", icon: "pencil", variant: "action", href: fn($r) = "/admin/posts?edit=" .. url_encode("" .. $r["slug"]) })
+  $act_view = dt_action("view", { "label": "View", icon: "eye", variant: "action", href: fn($r) = pv_base($r["kind"]) .. ("" .. $r["slug"]) })
+  $act_del = dt_action("delete", { "label": "Delete", icon: "trash", variant: "action-danger", action: "delete", confirm: "Delete this entry? This cannot be undone." })
+  $rowhref = fn($r) = "/admin/posts?edit=" .. url_encode("" .. $r["slug"])
+  $bulkid = fn($r) = "" .. $r["slug"]
+  $spec = [
+    dt_col("title", "Title", "title", { sortable: true, searchable: true, render: $title_cell, tooltip: $title_tip, toggleable: true }),
+    -- Categories: a relationship col — GROUP_CONCAT of the post's `category` terms ($cols
+    -- subquery in dt_sql). Sortable on the alias (SQLite ORDER BY accepts a SELECT alias,
+    -- like the `author` col); truncated so a many-category post can't blow the column out.
+    dt_col("categories", "Categories", "categories", { sortable: true, toggleable: true, placeholder: "—", limit: 40, width: "8.5rem" }),
+    dt_col("author", "Author", "author", { sortable: true, placeholder: "—", toggleable: true }),
+    dt_col("kind", "Type", "kind", { sortable: true, toggleable: true, align: "center", width: "5.5rem" }),
+    -- Slug: its OWN elided column (was the Title subline), default-HIDDEN in the Columns menu.
+    -- The `/`-prefixed value is CSS-clipped and recoverable via the cell hover tooltip.
+    dt_col("slug", "Slug", "slug", { sortable: true, toggleable: true, default_hidden: true, prefix: "/" }),
+    -- Status replaced Categories as the lead status signal is rarely needed at a glance;
+    -- kept in the Columns menu (toggleable) but default-HIDDEN. Badge render unchanged.
+    dt_col("status", "Status", "status", { sortable: true, badge: $status_badge, toggleable: true, default_hidden: true, width: "7.5rem" }),
+    -- created + updated: both available in the Columns menu, both default-HIDDEN (the table
+    -- leads with content, not timestamps). updated is the default sort (newest-edited first).
+    dt_col("created", "Created", "created", { sortable: true, type: "datetime", default_hidden: true }),
+    dt_col("updated", "Updated", "updated", { sortable: true, type: "datetime", default_hidden: true }),
+    dt_col("excerpt", "", "excerpt", { searchable: true, hidden: true }),
+    -- body: a hidden, searchable column so the content search box matches the post BODY,
+    -- not just title/excerpt (the body lives in the same cms_posts row). Display-only-hidden.
+    dt_col("body", "", "body", { searchable: true, hidden: true })
+  ]
+  -- Phase 2 filters: Status (multi) + Type select + Updated daterange. URL tokens only
+  -- == -select author-literal options / ISO-validated dates (the dt_state firewall).
+  $filters = [
+    dt_filter("status", "Status", { multiple: true, options: [
+      { value: "published", "label": "Published", col: "status", op: "=" },
+      { value: "draft", "label": "Draft", col: "status", op: "=" }
+    ] }),
+    dt_filter("type", "Type", { options: [
+      { value: "post", "label": "Post", col: "kind", op: "=" },
+      { value: "page", "label": "Page", col: "kind", op: "=" }
+    ] }),
+    dt_filter("updated", "Updated", { kind: "daterange", col: "date(updated)" })
+  ]
+  $opts = dt_admin_opts({
+    base_route: "/admin/posts", caption: "Content", noun: "content",
+    subtitle: "Posts and pages in this site.",
+    default_sort: "updated", default_dir: "desc", page_size: 12,
+    search_placeholder: "Search content…", search_split: true, live_search: true,
+    row_href: $rowhref, row_action_specs: [$act_edit, $act_view, $act_del],
+    bulk_id: $bulkid,
+    filters: $filters,
+    -- Phase 4b grouping demo: cluster by Type or Status (render-layer, SQL-only). Default
+    -- OFF — the "Group by" select turns it on; dt_sql prepends the group col to ORDER BY.
+    groups: [
+      dt_group("kind", "Type", "kind", { value: fn($r) = pv_kind_label($r["kind"]) }),
+      dt_group("status", "Status", "status", { value: fn($r) = pv_status_label($r["status"]) })
+    ],
+    header_actions: [ { "label": "New Post", "href": "/admin/posts?new=1", "icon": "plus", "variant": "primary" } ]
+  })
+  return { spec: $spec, opts: $opts }
+end
+
+-- The set of ids in the subtree rooted at $root_id (the root itself + every descendant),
+-- as a map id→true (the cycle guard). Preloads every page in ONE query, then walks the tree
+-- breadth-first in memory guarded only by a visited set (no frontier cap) — so it returns
+-- the COMPLETE descendant set and still terminates on a cycle in pre-existing data. Used to
+-- exclude self+descendants from the parent picker and to reject a crafted-POST cycle on save.
+function pp_descendant_set($root_id)
+  $seen = {}
+  $rid = to_number("" .. fm_or($root_id, 0))
+  if $rid == 0 then
+    return $seen
+  end
+  -- Load the whole page adjacency in ONE query, then BFS in memory. The visited set
+  -- ($seen) guarantees termination even on a pre-existing data cycle AND full coverage of
+  -- an arbitrarily large/deep tree — no per-node query, and no frontier cap that could
+  -- return a PARTIAL (and therefore unsafe) descendant set.
+  $rows = db_query("SELECT id, parent_id FROM cms_posts WHERE kind = 'page'", [])
+  $children = {}
+  for each $r in $rows
+    $pk = "0"
+    if $r["parent_id"] != nil and ("" .. $r["parent_id"]) != "" then
+      $pk = "" .. $r["parent_id"]
+    end
+    -- get → push → reassign: push($children[$pk], …) would mutate a COPY (Mix indexes maps
+    -- by value), leaving the map empty — pull the list out, append, write it back.
+    $lst = $children[$pk]
+    if $lst == nil then
+      $lst = []
+    end
+    push($lst, "" .. $r["id"])
+    $children[$pk] = $lst
+  end
+  $seen["" .. $rid] = true
+  $frontier = ["" .. $rid]
+  while length($frontier) > 0
+    $next = []
+    for each $fp in $frontier
+      $kids = $children[$fp]
+      if $kids != nil then
+        for each $cid in $kids
+          if $seen[$cid] != true then
+            $seen[$cid] = true
+            push($next, $cid)
+          end
+        end
+      end
+    end
+    $frontier = $next
+  end
+  return $seen
+end
+
+-- Parent-page <option> list for the editor's Parent picker (Part B: arbitrary depth). ANY
+-- published page may be a parent EXCEPT self and self's descendants (picking a descendant
+-- would create a cycle). A leading "(none)" (value "") = top-level. $cur_id is the post's
+-- own id (0/"" for a new post); $cur_parent pre-selects the saved parent. The descendant
+-- set is computed once via pp_descendant_set so the list and the save guard agree.
+function pp_parent_options($cur_id, $cur_parent)
+  $opts = [ { value: "", "label": "(none) — top-level" } ]
+  $cid = "" .. fm_or($cur_id, "")
+  if $cid == "" then
+    $cid = "0"
+  end
+  $exclude = pp_descendant_set($cid)
+  $rows = db_query("SELECT id, title FROM cms_posts WHERE kind = 'page' AND status = 'published' ORDER BY menu_order, title LIMIT 500", [])
+  for each $r in $rows
+    if $exclude["" .. $r["id"]] != true then
+      push($opts, { value: "" .. $r["id"], "label": "" .. $r["title"] })
+    end
+  end
+  return $opts
+end
+
+-- Existing categories as <select> options (value = term ID, so the save links the EXACT
+-- existing term — a renamed category can't mint a slug-derived duplicate the way a
+-- name→term_upsert would). A leading "(none)" (value "") clears the category. New
+-- categories are created in /admin/categories, not invented from this dropdown.
+function pp_category_options()
+  $opts = [ { value: "", "label": "(none)" } ]
+  $rows = db_query("SELECT id, name FROM terms WHERE taxonomy = 'category' AND name IS NOT NULL AND name != '' ORDER BY name", [])
+  for each $r in $rows
+    push($opts, { value: "" .. $r["id"], "label": "" .. $r["name"] })
+  end
+  return $opts
+end
+
+-- Existing tag names (for the Tags field hint — "showing available tags"). Capped so a
+-- large tag set doesn't blow out the help line.
+function pp_tag_names()
+  $rows = db_query("SELECT name FROM terms WHERE taxonomy = 'tag' AND name IS NOT NULL AND name != '' ORDER BY name LIMIT 40", [])
+  $names = []
+  for each $r in $rows
+    push($names, "" .. $r["name"])
+  end
+  return $names
+end
+
+-- The Body canvas: a bare markdown textarea (no "Body" label — the toolbar names it) on the LEFT
+-- and the shared rd_view reader as the live preview on the RIGHT, laid out by wb_canvas. The
+-- preview is HIDDEN by default; it appears in the canvas editor's Wide width-mode (html.wide),
+-- where Body | Preview go 50/50 side-by-side. It re-renders (debounced) via POST /admin/preview as
+-- you type — wb_preview_script patches the preview's <article> in place, keeping the reader chrome.
+-- The reader is built from cms_read_spec — the SAME spec the public /post & /page views use, so
+-- preview === view. The textarea keeps name="body" — POST round-trip unchanged.
+function pp_body_field($p, $user)
+  $bid = fm_id("body")
+  $ta = '<textarea class="fm-control fm-mono" id="' .. esc($bid) .. '" name="body" rows="18">' .. esc("" .. fm_val($p, "body")) .. '</textarea>'
+  $spec = cms_read_spec($p, $user, { body_id: "pp-preview-body", body_src: "/admin/preview", body_input: $bid })
+  -- The live preview sits INSIDE the editor — its rd_view Edit action + All-posts back duplicate the
+  -- toolbar's View/Edit + All Posts, so drop them; the preview is just the reader card + body. (The
+  -- public /post & /page views keep the full chrome — that's a different code path.)
+  $spec["actions"] = []
+  $spec["back"] = nil
+  return wb_canvas({ edit_html: $ta, read_html: rd_view($spec) })
+end
+
+-- (The live-preview wiring moved to the shared wb_preview_script in reader.mix — pp_form emits it.
+-- It now patches the rd_view <article> in place (chrome preserved) and live-fills the reader title.)
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- TOOLBAR EDITOR (2026-06-26). The full-page editor is a single top toolbar + a
+-- body-only canvas + three metadata DIALOGS (Title+slug+excerpt / Type+taxonomy /
+-- Media) that live INSIDE the post <form> (a showModal()'d <dialog> stays a DOM
+-- descendant, so its fields still submit on Save). [View] swaps the canvas for the
+-- rendered article; [Edit] swaps back. This is now the ONLY post editor — the old
+-- whole-form fm_form + the list-row modal-edit path were retired (a row Edit now
+-- navigates here). Backup of the pre-toolbar editor: git HEAD~ + scratchpad .bak.
+-- ══════════════════════════════════════════════════════════════════════════
+
+-- Toolbar icon set: reuse fm_icon for the shared glyphs, inline-SVG the rest
+-- (same 24×24 stroke style as fm_icon/md_icon). "" on an unknown name.
+function pp_ic($n)
+  if $n == "trash" then
+    return fm_icon("trash")
+  end
+  if $n == "eye" then
+    return fm_icon("eye")
+  end
+  if $n == "save" then
+    return fm_icon("save")
+  end
+  if $n == "check" then
+    return fm_icon("check")
+  end
+  if $n == "back" then
+    return fm_icon("arrow-left")
+  end
+  if $n == "title" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4v16"></path><path d="M18 4v16"></path><path d="M6 12h12"></path></svg>'
+  end
+  if $n == "excerpt" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16"></path><path d="M4 12h11"></path><path d="M4 18h14"></path></svg>'
+  end
+  if $n == "type" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 21v-7"></path><path d="M4 10V3"></path><path d="M12 21v-9"></path><path d="M12 8V3"></path><path d="M20 21v-5"></path><path d="M20 12V3"></path><path d="M2 14h4"></path><path d="M10 8h4"></path><path d="M18 16h4"></path></svg>'
+  end
+  if $n == "media" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"></rect><circle cx="9" cy="9" r="2"></circle><path d="m21 15-4.35-4.35a2 2 0 0 0-2.83 0L4 21"></path></svg>'
+  end
+  if $n == "edit" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"></path><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>'
+  end
+  return ""
+end
+
+-- The top toolbar. LEFT = action cluster [Delete][View][Save] + a divider + the four
+-- metadata openers [Title][Excerpt][Type][Media] (all .pp-edit-only). RIGHT = [Edit]
+-- (.pp-view-only, shown only while viewing) + [All Posts] (always). Delete targets the
+-- sibling delete form via form=; Save targets the field form via form=; View/Edit toggle
+-- the canvas vs the rendered article (pp_view_toggle_script). $orig "" = a new entry
+-- (no Delete). Buttons sit OUTSIDE the form and reach it through the form= attribute.
+function pp_toolbar($orig)
+  $existing = ($orig != "")
+  $h = '<div class="pp-bar">'
+  -- LEFT: the metadata openers (edit-only). One button each — Excerpt folded into Title so
+  -- a narrow viewport doesn't wrap the row. All btn-primary (one consistent button look).
+  $h = $h .. '<div class="pp-bar-left">'
+  $h = $h .. '<button type="button" class="btn btn-primary pp-edit-only" data-modal-open="md-title">' .. pp_ic("title") .. 'Title</button>'
+  $h = $h .. '<button type="button" class="btn btn-primary pp-edit-only" data-modal-open="md-type">' .. pp_ic("type") .. 'Type</button>'
+  $h = $h .. '<button type="button" class="btn btn-primary pp-edit-only" data-modal-open="md-media">' .. pp_ic("media") .. 'Media</button>'
+  $h = $h .. '</div>'
+  -- RIGHT: the actions. Delete (opens the styled md-del-confirm dialog, NOT a native confirm)
+  -- + Save + the View/Edit toggle (View and Edit share the same slot — only one shows per
+  -- mode) + All Posts. Delete only for an existing entry.
+  $h = $h .. '<div class="pp-bar-right">'
+  if $existing then
+    $h = $h .. '<button type="button" class="btn btn-primary pp-edit-only" data-modal-open="md-del-confirm">' .. pp_ic("trash") .. 'Delete</button>'
+  end
+  $h = $h .. '<button type="submit" form="pp-edit" class="btn btn-primary pp-edit-only">' .. pp_ic("save") .. 'Save</button>'
+  $h = $h .. '<button type="button" class="btn btn-primary pp-edit-only" data-pp-view>' .. pp_ic("eye") .. 'View</button>'
+  $h = $h .. '<button type="button" class="btn btn-primary pp-view-only" data-pp-edit>' .. pp_ic("edit") .. 'Edit</button>'
+  $h = $h .. '<a class="btn btn-primary" href="/admin/posts">' .. pp_ic("back") .. 'All Posts</a>'
+  $h = $h .. '</div>'
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- md-title body: Title + Slug SIDE BY SIDE, then the Excerpt (folded in from its own
+-- button). Title is NOT HTML5-`required` — it lives in a closed dialog (a hidden required
+-- control can't be focused → the browser throws on submit), and the save branch already
+-- defaults an empty title to "Untitled".
+function pp_title_body($p)
+  -- class:"wb-title" → wb_preview_script live-fills the reader preview's H1 as you type the title.
+  $ts = fm_text("title", "Title", { value: fm_val($p, "title"), help: "blank = Untitled", help_tip: true, class: "wb-title" })
+  $ts = $ts .. fm_text("slug", "Slug", { value: fm_val($p, "slug"), help: "blank = derived from the title", help_tip: true })
+  $h = fm_grid({ cols: 2 }, $ts)
+  $h = $h .. fm_textarea("excerpt", "Excerpt", { value: fm_val($p, "excerpt"), rows: 4, help: "blank = the first 160 chars of the body", help_tip: true })
+  return $h
+end
+
+-- md-type body: the Type switch, then EITHER the post taxonomy (Category + Tags) OR the
+-- page nav (Parent + Menu order) — both rendered, one shown at a time by kind (the .pp-typed
+-- container's state class is set server-side, flipped by pp_type_toggle_script). Visibility +
+-- Status apply to both. Every control submits with the form regardless of which group is shown.
+function pp_type_body($p, $user)
+  $kind_opts = [ { value: "post", "label": "Post (blog feed)" }, { value: "page", "label": "Page (standalone)" } ]
+  $vis_opts = [ { value: "public", "label": "Public" }, { value: "private", "label": "Private (notes)" } ]
+  $status_opts = [ { value: "draft", "label": "Draft" }, { value: "published", "label": "Published" } ]
+  -- State container: .pp-typed-post / .pp-typed-page (server-set from kind, flipped by
+  -- pp_type_toggle_script on a #f-kind change) selects which of .pp-when-post / .pp-when-page
+  -- shows — via CSS, never an inline style.
+  $typed = "pp-typed-post"
+  if (("" .. fm_val($p, "kind")) == "page") then
+    $typed = "pp-typed-page"
+  end
+  $h = '<div class="pp-typed ' .. $typed .. '">'
+  $h = $h .. fm_select("kind", "Type", $kind_opts, { value: fm_val($p, "kind"), help: "Post = blog feed · Page = standalone nav entry", help_tip: true })
+  -- post-only: Category (existing terms by id) + Tags (comma CSV).
+  $cat_opts = pp_category_options()
+  $taghelp = "comma-separated, e.g. linux, rust"
+  $tagnames = pp_tag_names()
+  if length($tagnames) > 0 then
+    $taghelp = "comma-separated · existing: " .. join($tagnames, ", ")
+  end
+  $tax = fm_select("category", "Category", $cat_opts, { value: fm_val($p, "category"), help: "add new ones in /admin/categories", help_tip: true })
+  $tax = $tax .. fm_text("tags", "Tags", { value: fm_val($p, "tags"), help: $taghelp, help_tip: true })
+  $h = $h .. '<div class="pp-when-post">' .. fm_grid({ cols: 2 }, $tax) .. '</div>'
+  -- page-only: Parent picker + Menu order.
+  $parent_opts = pp_parent_options(fm_val($p, "id"), fm_val($p, "parent_id"))
+  $pnav = fm_select("parent_id", "Parent page", $parent_opts, { value: fm_val($p, "parent_id"), help: "nests this page under another in the nav", help_tip: true })
+  $pnav = $pnav .. fm_number("menu_order", "Menu order", { value: fm_val($p, "menu_order"), help: "lower sorts first within a level (default 0)", help_tip: true })
+  -- page-only, ADMIN-only: body format (the canvas raw-HTML gate — save-side
+  -- enforcement in the POST path; this select is just the visible half). Sub-admin
+  -- editors never see the field; their saves preserve the row's format.
+  if role_rank("" .. $user["role"]) >= 3 then
+    $fmt_opts = [ { value: "markdown", "label": "Markdown (safe, default)" }, { value: "canvas", "label": "Canvas — raw HTML body" }, { value: "canvas-file", "label": "Canvas file — app/canvas/<slug>.html" } ]
+    $pnav = $pnav .. fm_select("format", "Format", $fmt_opts, { value: fm_val($p, "format"), help: "Canvas renders the body (or file) as RAW HTML in the content area — scripts run; the live preview pane still shows markdown rendering.", help_tip: true })
+  end
+  $h = $h .. '<div class="pp-when-page">' .. fm_grid({ cols: 2 }, $pnav) .. '</div>'
+  -- both:
+  $vs = fm_select("visibility", "Visibility", $vis_opts, { value: fm_val($p, "visibility") })
+  $vs = $vs .. fm_select("status", "Status", $status_opts, { value: fm_val($p, "status") })
+  -- Per-post/page comments toggle (OFF by default; opt-in). A select (not a checkbox) so it
+  -- always submits a value — the save treats "1" as on, anything else (incl. absent) as off.
+  $cmt_opts = [ { value: "1", "label": "On" }, { value: "0", "label": "Off" } ]
+  $cmt_val = "0"
+  if ("" .. fm_val($p, "comments_enabled")) == "1" then
+    $cmt_val = "1"
+  end
+  $vs = $vs .. fm_select("comments_enabled", "Comments", $cmt_opts, { value: $cmt_val, help: "Off by default — turn on to allow replies on this post/page.", help_tip: true })
+  $h = $h .. fm_grid({ cols: 2 }, $vs)
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- md-media body: the hidden cover field (#pp-cover, name="cover" → round-trips on save) +
+-- a live preview thumb + Remove + the media-library grid, all in ONE dialog (no nested
+-- dialog). pp_cover_pick_script wires a tile click → set #pp-cover + preview + selected
+-- outline (kept OPEN so the modal doubles as the picker); Remove clears it.
+function pp_media_body($cover)
+  $c = "" .. $cover
+  -- .pp-has-cover on the container shows the preview thumb + Remove button (CSS); absent =
+  -- both hidden. pp_cover_pick_script toggles the class — no inline style on the elements.
+  $curcls = "pp-media-current"
+  if $c != "" then
+    $curcls = "pp-media-current pp-has-cover"
+  end
+  $h = '<input type="hidden" name="cover" id="pp-cover" value="' .. esc($c) .. '">'
+  $h = $h .. '<div class="' .. $curcls .. '">'
+  $h = $h .. '<img id="pp-cover-preview" class="pp-cover-thumb" src="' .. esc($c) .. '" alt="">'
+  $h = $h .. '<div class="pp-cover-actions"><button type="button" class="btn btn-ghost pp-cover-clear">Remove cover</button></div>'
+  $h = $h .. '</div>'
+  $h = $h .. '<p class="fm-help">Click a thumbnail to set the post’s blog-index card image.</p>'
+  $media = db_query("SELECT id, filename, mime, storage, url_path FROM media WHERE mime LIKE 'image/%' ORDER BY created DESC LIMIT 200", [])
+  $grid = '<div class="pp-cover-grid">'
+  if length($media) == 0 then
+    $grid = $grid .. '<p class="fm-help">No images in the library yet. Upload some at <a href="/admin/media">Media</a>.</p>'
+  else
+    for each $m in $media
+      $url = media_url($m)
+      $selcls = "pp-cover-pick"
+      if $c != "" and ("" .. $url) == $c then
+        $selcls = "pp-cover-pick is-selected"
+      end
+      $grid = $grid .. '<button type="button" class="' .. $selcls .. '" data-cover-pick="' .. esc($url) .. '" title="' .. esc($m["filename"]) .. '"><img src="' .. esc($url) .. '" alt="" loading="lazy"></button>'
+    end
+  end
+  $grid = $grid .. '</div>'
+  return $h .. $grid
+end
+
+-- The inline view (hidden until [View]). pp_view_toggle_script fills the title from the
+-- live title input and the body from POST /admin/preview (the current, possibly unsaved
+-- markdown rendered the same way the public /post page renders it).
+function pp_view_container()
+  $h = '<div class="pp-view">'
+  $h = $h .. '<h1 class="pp-view-title"></h1>'
+  $h = $h .. '<article class="post pp-view-body"></article>'
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- The shared metadata-modal footer: a single primary [✓ Done] button pushed to the bottom
+-- RIGHT (the .md-done { margin-left:auto } rule) with the standard btn-primary fill+hover —
+-- replaces md_foot_band's default left-aligned ghost cancel for the Title/Type/Media dialogs.
+function pp_done_foot()
+  return '<button type="button" class="btn btn-primary md-done" data-modal-close>' .. pp_ic("check") .. 'Done</button>'
+end
+
+-- md-type's post/page group toggle: on a #f-kind change, flip the .pp-typed container's
+-- state class (pp-typed-post ⇄ pp-typed-page); CSS shows the matching group. No inline style.
+-- Idempotent; the server set the initial class so a no-JS / pre-sync state is correct.
+function pp_type_toggle_script()
+  return '<script>(function(){if(window.__ppType){return}window.__ppType=1;function sync(){var k=document.getElementById("f-kind");if(!k){return}var w=k.closest(".pp-typed");if(!w){return}var page=(k.value==="page");w.classList.toggle("pp-typed-page",page);w.classList.toggle("pp-typed-post",!page)}document.addEventListener("change",function(e){if(e.target&&e.target.id==="f-kind"){sync()}});sync()})();</script>'
+end
+
+-- Cover picker (md-media): a tile click sets #pp-cover + the preview thumb + the .pp-has-cover
+-- state class (shows preview + Remove via CSS) + the selected outline (modal stays open);
+-- .pp-cover-clear resets. No inline style toggling. Idempotent (window.__ppCover).
+function pp_cover_pick_script()
+  return '<script>(function(){if(window.__ppCover){return}window.__ppCover=1;function box(el){return el.closest(".pp-media-current")||document.querySelector(".pp-media-current")}document.addEventListener("click",function(e){var pick=e.target.closest("[data-cover-pick]");if(pick){var u=pick.getAttribute("data-cover-pick"),inp=document.getElementById("pp-cover"),pv=document.getElementById("pp-cover-preview"),b=box(pick);if(inp){inp.value=u}if(pv){pv.src=u}if(b){b.classList.add("pp-has-cover")}var g=pick.closest(".pp-cover-grid");if(g){g.querySelectorAll(".pp-cover-pick.is-selected").forEach(function(x){x.classList.remove("is-selected")})}pick.classList.add("is-selected");return}var clr=e.target.closest(".pp-cover-clear");if(clr){var i2=document.getElementById("pp-cover"),p2=document.getElementById("pp-cover-preview"),b2=box(clr);if(i2){i2.value=""}if(p2){p2.removeAttribute("src")}if(b2){b2.classList.remove("pp-has-cover")}var g2=document.querySelector(".pp-cover-grid");if(g2){g2.querySelectorAll(".pp-cover-pick.is-selected").forEach(function(x){x.classList.remove("is-selected")})}return}})})();</script>'
+end
+
+-- View/Edit toggle: [View] renders the current title + body (POST /admin/preview) into the
+-- .pp-view article and adds .is-viewing (CSS hides the canvas + edit-only toolbar, shows the
+-- view + [Edit]); [Edit] removes it. Idempotent (window.__ppView).
+function pp_view_toggle_script()
+  return '<script>(function(){if(window.__ppView){return}window.__ppView=1;function showView(){var root=document.querySelector(".pp-ed");if(!root){return}var t=document.getElementById("f-title"),body=document.getElementById("f-body"),vt=root.querySelector(".pp-view-title"),vb=root.querySelector(".pp-view-body");if(vt){vt.textContent=(t&&t.value.trim())?t.value:"Untitled"}if(vb){vb.innerHTML="";if(body){fetch("/admin/preview",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"body="+encodeURIComponent(body.value)}).then(function(r){return r.ok?r.text():null}).then(function(h){if(h!==null){vb.innerHTML=h}}).catch(function(){})}}root.classList.add("is-viewing")}function showEdit(){var root=document.querySelector(".pp-ed");if(root){root.classList.remove("is-viewing")}}document.addEventListener("click",function(e){if(e.target.closest("[data-pp-view]")){e.preventDefault();showView();return}if(e.target.closest("[data-pp-edit]")){e.preventDefault();showEdit();return}})})();</script>'
+end
+
+-- Full-page (canvas) editor: the top toolbar + a body-only canvas + the four metadata
+-- dialogs (inside the post form so their fields submit) + the sibling delete form + the
+-- inline view + the wiring scripts (all idempotent). .pp-editor wraps the body split so
+-- the existing Wide-mode 50/50 rule still applies.
+function pp_form($p, $orig, $heading, $viewbase, $user)
+  $existing = ($orig != "")
+  $h = '<div class="pp-ed">'
+  $h = $h .. pp_toolbar($orig)
+  $h = $h .. '<form method="post" action="/admin/posts" id="pp-edit" class="forms-skin fm-form pp-form">'
+  $h = $h .. fm_hidden("action", "save")
+  $h = $h .. fm_hidden("orig_slug", $orig)
+  $h = $h .. '<div class="pp-canvas pp-editor">' .. pp_body_field($p, $user) .. '</div>'
+  $h = $h .. md_modal("md-title", { title: "Title, slug & excerpt", subtitle: "The headline, URL slug and blog-index summary.", size: "lg", footer: pp_done_foot() }, pp_title_body($p))
+  $h = $h .. md_modal("md-type", { title: "Type & taxonomy", subtitle: "Post vs page, category/tags or nav, visibility + status.", size: "lg", footer: pp_done_foot() }, pp_type_body($p, $user))
+  $h = $h .. md_modal("md-media", { title: "Cover image", subtitle: "The blog-index card image.", size: "xl", footer: pp_done_foot() }, pp_media_body(fm_val($p, "cover")))
+  $h = $h .. '</form>'
+  if $existing then
+    -- Bare delete form (NO native onsubmit confirm) — the styled md-del-confirm dialog gates
+    -- it. The toolbar Delete opens the dialog; the dialog's Delete button submits this form
+    -- via form= (a <form> can't nest, so it's a sibling, reached by the form= attribute).
+    $h = $h .. '<form method="post" action="/admin/posts" id="pp-edit-delete" class="fm-delete-form">' .. fm_hidden("action", "delete") .. fm_hidden("slug", $orig) .. '</form>'
+    $delfoot = '<button type="button" class="btn btn-ghost" data-modal-close>Cancel</button>' .. '<button type="submit" form="pp-edit-delete" class="btn btn-danger">' .. pp_ic("trash") .. 'Delete</button>'
+    $h = $h .. md_modal("md-del-confirm", { confirm: true, icon: "trash", icon_variant: "danger", title: "Delete this entry?", subtitle: "This cannot be undone.", size: "sm", footer: $delfoot }, "")
+  end
+  $h = $h .. pp_view_container()
+  $h = $h .. '</div>'
+  $h = $h .. md_script()
+  $h = $h .. wb_preview_script()
+  $h = $h .. pp_cover_pick_script()
+  $h = $h .. pp_type_toggle_script()
+  $h = $h .. pp_view_toggle_script()
+  return $h
+end
+
+function admin_posts_main()
+cms_init()
+$user = current_user($HEADERS)
+$deny = require_role($user, "author")
+if $deny != nil then
+  return $deny
+end
+
+-- Email-to-post: pull any new emailed posts into the CMS before the list/editor
+-- (lazy, deduped, fail-soft) so they show up in the manager alongside web posts.
+cms_import_emailed_posts()
+
+if $METHOD == "POST" then
+  $f = parse_form($BODY)
+  $action = $f["action"]
+  if $action == nil then
+    $action = "save"
+  end
+  -- declarative row action (datatable.mix): action="row:<verb>:<id>". The id is the
+  -- slug (bulk_id), treated as untrusted → bound, never spliced. Deletes run
+  -- through the Foundation policy helper (tx + existence check; skip-and-report
+  -- on bulk — see admin_resource.mix).
+  $ra = dt_row_action($f)
+  if $ra != nil then
+    if $ra["verb"] == "delete" then
+      $block = dt_try_delete_row(pv_slug_ok($ra["id"]), pv_del_hooks())
+      if $block != "" then
+        return redirect_flash("/admin/posts", $block, "danger")
+      end
+    end
+    return redirect_flash("/admin/posts", "Entry deleted", "success")
+  end
+  if $action == "delete" then
+    $delslug = pv_slug_ok($f["slug"])
+    if $delslug != nil then
+      $block = dt_try_delete_row($delslug, pv_del_hooks())
+      if $block != "" then
+        return redirect_flash("/admin/posts", $block, "danger")
+      end
+    end
+    return redirect_flash("/admin/posts", "Entry deleted", "success")
+  end
+  if $action == "bulk_delete" then
+    -- select-all-across-pages (S-5): when the hidden flag is set, resolve the FULL
+    -- matching id set by re-running dt_where server-side over the POSTed q+filters —
+    -- NEVER trusting the posted sel_* ids. Otherwise act on the page selection. Either
+    -- way each slug is a bind, never spliced.
+    $delids = dt_selected_ids($f)
+    if dt_wants_all($f) then
+      $cfg = posts_list_config()
+      $delids = dt_all_ids("cms_posts", $cfg["spec"], dt_state_from_map($f, $cfg["spec"], $cfg["opts"]), "slug")
+    end
+    $rep = dt_bulk_report(dt_bulk_try_delete($delids, pv_del_hooks()), "entries")
+    return redirect_flash("/admin/posts", $rep["msg"], $rep["kind"])
+  end
+  -- save (create or update)
+  $title = $f["title"]
+  if $title == nil or trim($title) == "" then
+    $title = "Untitled"
+  end
+  $slug = $f["slug"]
+  if $slug == nil or trim($slug) == "" then
+    $slug = slugify($title)
+  else
+    $slug = slugify($slug)
+  end
+  $body = $f["body"]
+  if $body == nil then
+    $body = ""
+  end
+  $excerpt = $f["excerpt"]
+  if $excerpt == nil or trim($excerpt) == "" then
+    $excerpt = substr($body, 0, 160)
+  end
+  $status = $f["status"]
+  if $status != "published" then
+    $status = "draft"
+  end
+  $kind = $f["kind"]
+  if $kind != "page" then
+    $kind = "post"
+  end
+  $visibility = $f["visibility"]
+  if $visibility != "private" then
+    $visibility = "public"
+  end
+  -- Per-post/page comments toggle: ON only when explicitly "1" (off by default).
+  $comments_enabled = 0
+  if ("" .. fm_or($f["comments_enabled"], "0")) == "1" then
+    $comments_enabled = 1
+  end
+  -- cover: a media-library URL set by the picker. Only accept a SITE-relative path
+  -- ("/img/…" or "/media/<id>") — it is later rendered as <img src> on the public index,
+  -- so a crafted POST (the picker is bypassable; $f["cover"] is attacker-controlled) must
+  -- not store an external URL. A single leading "/" is required, but a protocol-relative
+  -- "//host" (and "/\host", which browsers normalise to "//host") is external and must be
+  -- rejected too; anything else clears it. (CSP img-src 'self' is the backstop, not this.)
+  $cover = $f["cover"]
+  $cv = "" .. $cover
+  if $cover == nil or not starts_with($cv, "/") or starts_with($cv, "//") or starts_with($cv, "/\\") then
+    $cover = ""
+  end
+  -- Taxonomy (P2): Tags (many) + Category (at most one). Parsed from the editor's
+  -- comma fields; applied AFTER the row exists (set_post_terms needs the post id).
+  $tagnames = split_terms($f["tags"])
+  -- Category is posted as an existing term ID by the editor's <select> (see
+  -- set_post_category_id), so it is NOT split/upserted by name here.
+  -- Page nav (P3): parent_id + menu_order. parent_id: "" / nil / "0" → 0 (top-level);
+  -- otherwise a numeric id. A self-parent (parent == this post's own id) is forced to 0
+  -- defensively (the picker already excludes self, but a crafted POST could send it).
+  -- Stored as 0 for top-level (the nav treats NULL and 0 identically). menu_order is a
+  -- coerced integer (default 0). These matter only for kind='page'.
+  $parent_raw = $f["parent_id"]
+  $parent_id = 0
+  if $parent_raw != nil and trim("" .. $parent_raw) != "" then
+    $parent_id = to_number("" .. $parent_raw)
+  end
+  -- Integrity (SAVE-side, not just the picker): only a page has a parent. With arbitrary
+  -- depth (Part B) the parent may be ANY published page — the only constraint is that it
+  -- must EXIST and be a page (a crafted POST could send a post id or a stale id). The
+  -- cycle guard (self / descendant) is applied on the update path below, once $pid is
+  -- known. A new page (no $pid yet) can't have descendants, so existence is enough here.
+  if $kind != "page" then
+    $parent_id = 0
+  end
+  if $parent_id != 0 then
+    $pexists = db_query("SELECT id FROM cms_posts WHERE id = ?1 AND kind = 'page'", [$parent_id])
+    if length($pexists) == 0 then
+      $parent_id = 0
+    end
+  end
+  $menu_order = to_number(fm_or($f["menu_order"], 0))
+  -- Body format (the canvas raw-HTML gate — see lib.mix cms_init). Whitelisted;
+  -- pages only; and ONLY an admin (rank>=3) may set or change it. A sub-admin
+  -- save posts no format (the select isn't rendered below rank 3) and a crafted
+  -- POST is discarded here — "" resolves to the row's existing format on update,
+  -- 'markdown' on create.
+  $format = "" .. fm_or($f["format"], "")
+  if $format != "markdown" and $format != "canvas" and $format != "canvas-file" then
+    $format = ""
+  end
+  if $kind != "page" then
+    $format = "markdown"
+  end
+  if role_rank("" .. $user["role"]) < 3 then
+    $format = ""
+  end
+  $orig = $f["orig_slug"]
+  $existing = []
+  if $orig != nil and $orig != "" then
+    $existing = db_query("SELECT id FROM cms_posts WHERE slug = ?1", [$orig])
+  end
+  $pid = 0
+  if length($existing) == 1 then
+    $pid = $existing[0]["id"]
+    -- Cycle guard (arbitrary depth): the chosen parent must not be self OR a descendant of
+    -- self, else the page would become its own ancestor. pp_descendant_set($pid) = self +
+    -- every descendant (ONE query, visited-guarded — terminates on any pre-existing data
+    -- cycle, no hop cap); if the candidate parent is in that set, reject (force top-level).
+    if $parent_id != 0 then
+      $banned = pp_descendant_set($pid)
+      if $banned["" .. $parent_id] == true then
+        $parent_id = 0
+      end
+    end
+    -- Update path: avoid a false self-collision on the post's own slug (the insert path
+    -- has no collision handling by design — a duplicate raises and is left to the editor;
+    -- only the update needs the except-id guard). Resolve the (possibly new) slug first.
+    $slug = cms_unique_slug_except_id($slug, $pid)
+    -- Snapshot this page's OWN parent BEFORE the update — if the page is demoted below it
+    -- becomes the grandparent its children reparent to (preserves their tree place).
+    $own_parent = 0
+    $opr = db_query("SELECT parent_id, format FROM cms_posts WHERE id = ?1", [$pid])
+    if length($opr) > 0 and $opr[0]["parent_id"] != nil then
+      $own_parent = $opr[0]["parent_id"]
+    end
+    -- Resolve a preserved format ("" = the caller may not set one) from the row.
+    if $format == "" then
+      $format = "markdown"
+      if length($opr) > 0 then
+        $format = "" .. fm_or($opr[0]["format"], "markdown")
+      end
+    end
+    -- A sub-admin may not MODIFY a canvas page at all — its body publishes as raw
+    -- HTML, so letting an author rewrite it is an HTML-injection path even with
+    -- the format flag itself locked. Refuse the whole save.
+    if $format != "markdown" and role_rank("" .. $user["role"]) < 3 then
+      return redirect_flash("/admin/posts", "Canvas pages are admin-only", "danger")
+    end
+    db_exec("UPDATE cms_posts SET slug=?1, title=?2, body=?3, excerpt=?4, status=?5, kind=?6, visibility=?7, cover=?8, parent_id=?9, menu_order=?10, comments_enabled=?11, format=?12, updated=datetime('now') WHERE id=?13", [$slug, $title, $body, $excerpt, $status, $kind, $visibility, $cover, $parent_id, $menu_order, $comments_enabled, $format, $pid])
+    -- If this page is no longer a valid published page-nav node (became a post, or a
+    -- draft), reparent its children to THIS node's own parent (the grandparent) so they
+    -- keep their place in the tree rather than jumping to top-level. cms_delete_post_by_slug
+    -- is the delete-path twin (same reparent-to-grandparent rule).
+    if $kind != "page" or $status != "published" then
+      db_exec("UPDATE cms_posts SET parent_id = ?2 WHERE parent_id = ?1", [$pid, $own_parent])
+    end
+  else
+    if $format == "" then
+      $format = "markdown"
+    end
+    db_exec("INSERT INTO cms_posts (slug, title, body, excerpt, status, kind, visibility, cover, parent_id, menu_order, comments_enabled, format, author_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)", [$slug, $title, $body, $excerpt, $status, $kind, $visibility, $cover, $parent_id, $menu_order, $comments_enabled, $format, $user["id"]])
+    $new = db_query("SELECT id FROM cms_posts WHERE slug = ?1", [$slug])
+    if length($new) > 0 then
+      $pid = $new[0]["id"]
+    end
+  end
+  if $pid != 0 then
+    set_post_terms($pid, "tag", $tagnames)
+    set_post_category_id($pid, $f["category"])
+  end
+  return redirect_flash("/admin/posts?edit=" .. $slug, "Saved", "success")
+end
+
+-- GET: decide list vs editor
+$q = parse_query($QUERY)
+$editslug = $q["edit"]
+$isnew = $q["new"]
+
+if $isnew != nil or $editslug != nil then
+  -- editor (the full-page toolbar editor — there is no longer a modal-fragment variant)
+  $p = { slug: "", title: "", body: "", excerpt: "", status: "draft", kind: "post", visibility: "public", cover: "", tags: "", category: "", parent_id: "", menu_order: "0", comments_enabled: "0", format: "markdown" }
+  $orig = ""
+  $heading = "New entry"
+  if $editslug != nil and $editslug != "" then
+    -- created + the author display (LEFT JOIN) are pulled so the live preview's byline matches the
+    -- public /post view exactly (cms_read_spec reads them); the editor's own fields are unchanged.
+    $rows = db_query("SELECT p.id AS id, p.slug AS slug, p.title AS title, p.body AS body, p.excerpt AS excerpt, p.status AS status, p.kind AS kind, p.visibility AS visibility, p.cover AS cover, p.parent_id AS parent_id, p.menu_order AS menu_order, p.comments_enabled AS comments_enabled, p.format AS format, p.created AS created, u.display AS author FROM cms_posts p LEFT JOIN users u ON u.id = p.author_id WHERE p.slug = ?1", [$editslug])
+    if length($rows) == 1 then
+      $p = $rows[0]
+      $orig = $p["slug"]
+      $heading = "Edit entry"
+      -- Pre-fill the taxonomy fields: Tags as a CSV, Category as the single term ID (if any).
+      $tagrows = post_terms($p["id"], "tag")
+      $tagnames = []
+      for each $t in $tagrows
+        push($tagnames, "" .. $t["name"])
+      end
+      $p["tags"] = join($tagnames, ", ")
+      -- Category prefill is the term ID (the <select> options are id-valued), not the name.
+      $catrows = db_query("SELECT t.id AS id FROM terms t JOIN term_relations r ON r.term_id = t.id WHERE r.post_id = ?1 AND t.taxonomy = 'category' ORDER BY t.id LIMIT 1", [$p["id"]])
+      $p["category"] = ""
+      if length($catrows) > 0 then
+        $p["category"] = "" .. $catrows[0]["id"]
+      end
+    end
+    -- a stale Edit link (the row was deleted) falls through to a blank "New entry" form.
+  end
+  $viewbase = "/post/"
+  if $p["kind"] == "page" then
+    $viewbase = "/page/"
+  end
+  return doc(200, $heading, $user, pp_form($p, $orig, $heading, $viewbase, $user))
+end
+
+-- list (posts + pages) — the admin panel Foundation (dt_admin_list). Config built
+-- by posts_list_config() so the POST bulk handler re-runs dt_where over the SAME
+-- spec/filters (select-all-across-pages, S-5). Author + Categories are correlated
+-- subquery projections (display-only relationship columns — a SELECT alias can't
+-- appear in WHERE, so neither joins the search OR-group; no N+1). live_search's
+-- #dt-results slot branch is handled inside dt_admin_list.
+$cfg = posts_list_config()
+return dt_admin_list({ title: "Content", user: $user, spec: $cfg["spec"], opts: $cfg["opts"],
+  table: "cms_posts",
+  select: "*, (SELECT display FROM users WHERE users.id = cms_posts.author_id) AS author, (SELECT GROUP_CONCAT(t.name, ', ') FROM terms t JOIN term_relations r ON r.term_id = t.id WHERE r.post_id = cms_posts.id AND t.taxonomy = 'category') AS categories",
+  modal: false })
+
+end

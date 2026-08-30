@@ -1,0 +1,24 @@
+[package]
+name = "cosmix-lib-log-props"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SPEC-12 `<svc>.log` namespace + live-reload watcher for cosmix_log (cos extension)"
+
+[lib]
+name = "cosmix_log_props"
+path = "src/lib.rs"
+
+[dependencies]
+cosmix_log = { package = "cosmix-lib-log", path = "../cosmix-lib-log" }
+cosmix-lib-props-store = { path = "../cosmix-lib-props-store" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+rusqlite = { workspace = true }
+tempfile = "3"

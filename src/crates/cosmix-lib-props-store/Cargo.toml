@@ -1,0 +1,54 @@
+[package]
+name = "cosmix-lib-props-store"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SPEC 12 substrate surface — storage backends, audit HMAC, mutation router, namespace/lifecycle. Paired with cosmix-lib-props-core (the SPEC 07 read surface)."
+
+[lib]
+name = "cosmix_props"
+path = "src/lib.rs"
+
+[features]
+default = ["cosmix", "sqlite"]
+# `tracing` is only needed by the C9 fan-out dispatcher, which is
+# Bus-citizen-only (uses NodedClient via the consumer's publisher
+# impl). Gated under `cosmix` so non-cosmix builds stay lean.
+cosmix = ["dep:cosmix-lib-bus", "dep:tracing", "tokio/rt", "tokio/macros", "cosmix-lib-props-core/bus"]
+sqlite = ["dep:rusqlite"]
+# SPEC 12 §15.5 / C10c — exposes `PropsRouter::allow_replay_only_for_tests`
+# to downstream test harnesses (autoresearch, integration-test crates).
+# Default-off: production daemon builds MUST NOT enable it. Internal
+# unit tests reach the same method via `cfg(test)` and do not need
+# this feature.
+replay-only-harness = []
+
+[dependencies]
+# Pure-type substrate surface — SPEC 07 §2 read types live in the
+# sibling bus repo's `cosmix-lib-props-core`. This crate adds the
+# SPEC 12 mutation/audit/storage layer on top.
+cosmix-lib-props-core = { path = "../cosmix-lib-props-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+cosmix-lib-bus = { path = "../cosmix-lib-bus", optional = true }
+tracing = { workspace = true, optional = true }
+chrono = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+# `sync` carries `Notify`, used by `Runtime` to wake the
+# C9 fan-out `Dispatcher` after every successful commit. The `rt` /
+# `macros` features are pulled in via the `cosmix` feature so non-cosmix
+# builds of the trait surface (autoresearch, isolated harnesses) don't
+# pay for the multi-thread runtime. We don't inherit the workspace
+# tokio spec because it pins `features = ["full"]`; the substrate trait
+# surface only needs `sync`.
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

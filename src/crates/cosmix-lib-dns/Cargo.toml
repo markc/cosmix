@@ -1,0 +1,44 @@
+[package]
+name = "cosmix-lib-dns"
+version = "0.3.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "cosmix-dnsd P1 core — authoritative WG-mesh DNS: zone model, .mix loader, hickory-proto codec, resolver, serve loops (no Bus/mesh/config)"
+
+[lib]
+name = "cosmix_dns"
+path = "src/lib.rs"
+
+# P1 core is pure logic. There is NO `cosmix` feature here: the
+# core/citizen split (CLAUDE.md mandate) lives on the *binary*
+# (cosmix-dnsd). hickory-proto / cosmix-lib-mix / tokio / arc-swap are
+# pure-logic deps (not cosmix-internal Bus/mesh/config), so
+# `cargo test -p cosmix-lib-dns --no-default-features` is the core gate
+# and is identical to the default build in P1.
+[features]
+default = []
+
+[dependencies]
+# Codec ONLY — op::Message / rr::{Record,Name,RData,RecordType} +
+# binary (de)serializer. MUST NOT use hickory-server/-resolver/-recursor
+# or Catalog/Authority (prompt §2/§6, hard rule 2).
+hickory-proto = { workspace = true }
+# Mandated strict-data parser for zones.mix (FOUNDATIONAL
+# substrate-mix-data-format decision; prompt §2). Pure, no side effects.
+cosmix-lib-mix = { path = "../cosmix-lib-mix" }
+# `Value::Map` is an `IndexMap`; naming that type in the loader needs
+# the same pure-logic crate cosmix-lib-mix already uses (not a
+# Cosmix-internal Bus/mesh/config dep — same precedent as indexmap in
+# cosmix-lib-mix).
+indexmap = "2"
+# Async runtime for the serve loops (not a cosmix-internal dep — same
+# precedent as maild core).
+tokio = { version = "1", features = ["net", "rt", "macros", "io-util", "sync", "time"] }
+# Lock-free snapshot swap (prompt §2; plan §2).
+arc-swap = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "macros", "io-util", "sync", "time"] }
+tempfile = "3"

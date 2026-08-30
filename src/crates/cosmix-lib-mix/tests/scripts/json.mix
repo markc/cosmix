@@ -1,0 +1,23 @@
+-- json.mix: test JSON parse and encode
+-- Expected output:
+-- Alex
+-- 42
+-- true
+-- 2
+-- {"active":true,"name":"Alex","score":42}
+-- string
+
+$data = json_parse('{"name": "Alex", "score": 42, "active": true, "tags": ["rust", "mix"]}')
+print $data.name
+print $data.score
+print $data.active
+print len($data.tags)
+
+-- encode back to JSON
+$obj = { name: "Alex", score: 42, active: true }
+$json = json_encode($obj)
+print $json
+
+-- json_parse returns proper types
+$num_data = json_parse('{"val": "hello"}')
+print type($num_data.val)

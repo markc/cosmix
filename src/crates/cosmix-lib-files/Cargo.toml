@@ -1,0 +1,38 @@
+[package]
+name = "cosmix-lib-files"
+version = "0.7.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Files-as-truth markdown corpus core: surgical frontmatter writer, atomic write, BLAKE3 hashing, UUIDv7 identity, link extraction, index schema + reconcile diff."
+
+[lib]
+name = "cosmix_files"
+
+# Core-first per CLAUDE.md "Crate architecture (core-first, citizen-on-feature)".
+# Default build is pure logic; `cargo test --no-default-features` is the pure test
+# surface. The one always-on cosmix dependency is `cosmix-lib-bus` pinned
+# `default-features = false` (no tokio/mesh runtime) — reused as the SINGLE
+# canonical `---`-fenced header reader so the corpus does not fork a second,
+# divergent frontmatter parser (the spike-proven trap; see
+# _plan/2026-06-29-cosmix-corpus-manager.md §3.1).
+#
+# The `sqlite` feature adds the rusqlite-backed `store` module (the index.db
+# persistence: schema apply, modseq allocator, change stream, upsert/tombstone/
+# rename). It lives here rather than in the daemon binary so the persistence is
+# unit-testable and reusable in-process by the daemon, the future desktop client,
+# and a Mix citizen. The daemon (cosmix-filesd) enables `sqlite` and adds the
+# notify watcher, Bus loop, and mds CAS — none of which live here.
+
+[features]
+default = []
+sqlite = ["dep:rusqlite"]
+
+[dependencies]
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus", default-features = false }
+blake3 = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = "1"
+rusqlite = { workspace = true, optional = true }

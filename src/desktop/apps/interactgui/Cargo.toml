@@ -1,0 +1,33 @@
+[package]
+name = "cosmix-interactgui"
+version = "0.1.1"
+description = "Interact GUI — the native CTK presenter for interactd dialogs"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+
+[package.metadata.cosmix]
+kind = "app"
+component = "interactgui"
+display = "Interact GUI"
+engine = "bevy"
+
+[[bin]]
+name = "interactgui"
+path = "src/main.rs"
+
+[build-dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+
+[dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+bevy = { version = "=0.19.0", default-features = false, features = [
+    "ui",
+    "bevy_feathers",
+    "accesskit_unix",
+] }
+ctk = { path = "../../ctk", default-features = false, features = ["bus", "theme"] }
+cosmix-interaction-schema = { path = "../../../crates/cosmix-interaction-schema" }
+cosmix-app-identity = { path = "../../../crates/cosmix-app-identity" }
+serde = "1"
+serde_json = "1"

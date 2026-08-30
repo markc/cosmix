@@ -1,0 +1,31 @@
+{
+  version: 1,
+  chord_timeout_ms: 1000,
+  defaults: [
+    { action: "transport.toggle", chord: ["Space"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "song-open", chord: ["Ctrl+O"], scope: "global", repeat: "ignore", allow_in_editable: true },
+    { action: "song-save", chord: ["Ctrl+Shift+S"], scope: "global", repeat: "ignore", allow_in_editable: true },
+    { action: "session-save", chord: ["Ctrl+Alt+S"], scope: "global", repeat: "ignore", allow_in_editable: true },
+    { action: "session-export-wav", chord: ["Ctrl+Alt+W"], scope: "global", repeat: "ignore", allow_in_editable: true },
+    { action: "session-export-flac", chord: ["Ctrl+Alt+F"], scope: "global", repeat: "ignore", allow_in_editable: true },
+    { action: "sf-open", chord: ["Ctrl+Shift+O"], scope: "global", repeat: "ignore", allow_in_editable: true },
+    { action: "wav-export", chord: ["Ctrl+E"], scope: "global", repeat: "ignore", allow_in_editable: true },
+    { action: "view-mixer", chord: ["Ctrl+1"], scope: "global", repeat: "ignore", allow_in_editable: true },
+    { action: "view-waves", chord: ["Ctrl+2"], scope: "global", repeat: "ignore", allow_in_editable: true },
+    { action: "view-roll", chord: ["Ctrl+3"], scope: "global", repeat: "ignore", allow_in_editable: true },
+    { action: "view-zoom-in", chord: ["Ctrl+Equal"], scope: "global", repeat: "allow", allow_in_editable: true },
+    { action: "view-zoom-out", chord: ["Ctrl+Minus"], scope: "global", repeat: "allow", allow_in_editable: true },
+    { action: "view-zoom-fit", chord: ["Ctrl+0"], scope: "global", repeat: "ignore", allow_in_editable: true },
+    { action: "settings", chord: ["Ctrl+Comma"], scope: "global", repeat: "ignore", allow_in_editable: true },
+    { action: "settings.close", chord: ["Escape"], scope: "modal:studio.settings", repeat: "ignore", allow_in_editable: true },
+    { action: "settings.activate", chord: ["Enter"], scope: "modal:studio.settings", repeat: "ignore", allow_in_editable: true },
+    { action: "theme.mode-toggle", chord: ["Ctrl+Alt+D"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "theme.scheme-ocean", chord: ["Ctrl+Alt+1"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "theme.scheme-crimson", chord: ["Ctrl+Alt+2"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "theme.scheme-stone", chord: ["Ctrl+Alt+3"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "theme.scheme-forest", chord: ["Ctrl+Alt+4"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "theme.scheme-sunset", chord: ["Ctrl+Alt+5"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "theme.scheme-mono", chord: ["Ctrl+Alt+6"], scope: "global", repeat: "ignore", allow_in_editable: false }
+  ],
+  custom: []
+}

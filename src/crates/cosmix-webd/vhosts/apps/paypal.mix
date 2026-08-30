@@ -1,0 +1,240 @@
+-- paypal.mix — PayPal Orders v2 client for the billing panel.
+-- Plan §3 P2: create (custom_id=invoice_id) → buyer approves → our return
+-- route captures server-side → PAYMENT.CAPTURE.COMPLETED webhook (verified
+-- via /v1/notifications/verify-webhook-signature) applies the payment.
+-- IPN is dead; this is the Orders-v2 + webhooks shape. Requires route
+-- capability "net". Creds in biz_settings (paypal_client_id/client_secret/
+-- webhook_id/mode) via /biz/settings.
+
+function pp_base()
+  if biz_setting("paypal_mode") == "live" then
+    return "https://api-m.paypal.com"
+  end
+  return "https://api-m.sandbox.paypal.com"
+end
+
+-- OAuth client_credentials → bearer. Cached in biz_settings with expiry
+-- (single-writer webd; a stale-token 401 just re-mints next call).
+function pp_token()
+  $cached = biz_setting("paypal_token_cache")
+  if $cached != "" then
+    $c = nil
+    try
+      $c = json_parse($cached)
+    catch $e
+    end
+    if $c != nil and to_number($c["exp"]) > time() + 60 then
+      return "" .. $c["token"]
+    end
+  end
+  $id = biz_setting("paypal_client_id")
+  $secret = biz_setting("paypal_client_secret")
+  if $id == "" or $secret == "" then
+    return ""
+  end
+  $hdrs = {
+    "Authorization": "Basic " .. base64_encode($id .. ":" .. $secret),
+    "Content-Type": "application/x-www-form-urlencoded"
+  }
+  try
+    $r = http_post(pp_base() .. "/v1/oauth2/token", "grant_type=client_credentials",
+                   $hdrs, { timeout: 4 })
+    if to_number($r["status"]) != 200 then
+      return ""
+    end
+    $b = json_parse("" .. $r["body"])
+    $tok = "" .. $b["access_token"]
+    $exp = time() + to_number($b["expires_in"])
+    biz_setting_set("paypal_token_cache", json_encode({ token: $tok, exp: $exp }))
+    return $tok
+  catch $e
+    return ""
+  end
+end
+
+-- JSON call against the PayPal API. Returns { ok, status, body, error }.
+function pp_api($method, $path, $json_body, $extra_hdrs)
+  $tok = pp_token()
+  if $tok == "" then
+    return { ok: false, status: 0, body: nil, error: "paypal not configured" }
+  end
+  $hdrs = { "Authorization": "Bearer " .. $tok, "Content-Type": "application/json" }
+  if $extra_hdrs != nil then
+    for each $k in keys($extra_hdrs)
+      $hdrs[$k] = $extra_hdrs[$k]
+    end
+  end
+  try
+    $r = http_request($method, pp_base() .. $path, $json_body, $hdrs, { timeout: 4 })
+    $st = to_number($r["status"])
+    if $st == nil or $st == 0 then
+      return { ok: false, status: 0, body: nil, error: "" .. $r["error"] }
+    end
+    $parsed = nil
+    try
+      $parsed = json_parse("" .. $r["body"])
+    catch $e
+    end
+    $ok = false
+    if $st >= 200 and $st < 300 then $ok = true end
+    $err = ""
+    if not $ok then $err = "paypal http " .. $st end
+    return { ok: $ok, status: $st, body: $parsed, error: $err }
+  catch $e
+    return { ok: false, status: 0, body: nil, error: "paypal transport: " .. $e }
+  end
+end
+
+-- cents → "12.34" (PayPal wants decimal string)
+function pp_amount($cents)
+  $n = to_number($cents)
+  $d = floor($n / 100)
+  $c = $n - $d * 100
+  $cs = "" .. $c
+  if $c < 10 then $cs = "0" .. $c end
+  return $d .. "." .. $cs
+end
+
+-- Create (or reuse) a PayPal Order for an open invoice; returns
+-- { ok, url (approve link), error }. Same payment_attempts discipline as
+-- Stripe: idempotency key minted first, external_id + approve URL recorded
+-- before any redirect.
+function pp_create_order($inv)
+  $now = biz_now()
+  -- ATOMIC reservation (same shape as st_create_checkout): net-paid recheck
+  -- + reuse check + attempt INSERT in one BEGIN IMMEDIATE; gateway call
+  -- stays outside the tx.
+  $ikey = biz_token()
+  $reuse_url = ""
+  db_exec("BEGIN IMMEDIATE")
+  try
+    if biz_net_paid_cents($inv["id"]) != 0 then
+      db_exec("ROLLBACK")
+      return { ok: false, url: "", error: "partial payment ledgered — checkout refused" }
+    end
+    $live = db_query("SELECT id, redirect_url FROM payment_attempts
+                      WHERE invoice_id = ?1 AND gateway = 'paypal' AND kind = 'paypal_order'
+                      AND status = 'created'", [$inv["id"]])
+    if length($live) > 0 and ("" .. $live[0].redirect_url) != "" then
+      $reuse_url = "" .. $live[0].redirect_url
+    else
+      db_exec("INSERT INTO payment_attempts (invoice_id, gateway, kind, idempotency_key,
+               amount_cents, currency, mode, status, created, updated)
+               VALUES (?1, 'paypal', 'paypal_order', ?2, ?3, 'aud', ?4, 'created', ?5, ?5)",
+              [$inv["id"], $ikey, $inv["total_cents"], biz_setting("paypal_mode"), $now])
+    end
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return { ok: false, url: "", error: "reservation failed: " .. $e }
+  end
+  if $reuse_url != "" then
+    return { ok: true, url: $reuse_url, error: "" }
+  end
+  $ret = biz_base_url() .. "/pay/" .. $inv["token"] .. "/paypal/return"
+  $cancel = biz_invoice_url($inv["token"])
+  $order = {
+    intent: "CAPTURE",
+    purchase_units: [{
+      custom_id: "" .. $inv["id"],
+      invoice_id: "INV-" .. $inv["id"],
+      amount: { currency_code: "AUD", value: pp_amount($inv["total_cents"]) }
+    }],
+    payment_source: { paypal: { experience_context: {
+      return_url: $ret, cancel_url: $cancel,
+      user_action: "PAY_NOW", shipping_preference: "NO_SHIPPING"
+    } } }
+  }
+  $r = pp_api("POST", "/v2/checkout/orders", json_encode($order),
+              { "PayPal-Request-Id": $ikey })
+  if not $r["ok"] then
+    db_exec("UPDATE payment_attempts SET status = 'failed', updated = ?2
+             WHERE idempotency_key = ?1", [$ikey, biz_now()])
+    return { ok: false, url: "", error: $r["error"] }
+  end
+  $b = $r["body"]
+  $approve = ""
+  for each $l in $b["links"]
+    if ("" .. $l["rel"]) == "payer-action" or ("" .. $l["rel"]) == "approve" then
+      $approve = "" .. $l["href"]
+    end
+  end
+  if $approve == "" then
+    -- unusable order (no approval link): retire the attempt so it doesn't
+    -- block the active-attempt unique index on the next try
+    db_exec("UPDATE payment_attempts SET status = 'failed', external_id = ?2, updated = ?3
+             WHERE idempotency_key = ?1", [$ikey, "" .. $b["id"], biz_now()])
+    return { ok: false, url: "", error: "no approve link in order" }
+  end
+  db_exec("UPDATE payment_attempts SET external_id = ?2, redirect_url = ?3, updated = ?4
+           WHERE idempotency_key = ?1", [$ikey, "" .. $b["id"], $approve, biz_now()])
+  return { ok: true, url: $approve, error: "" }
+end
+
+-- Server-side capture after buyer approval (idempotent: 422 ORDER_ALREADY_
+-- CAPTURED is success). The webhook applies the money; this just completes.
+function pp_capture_for_invoice($inv)
+  $att = db_query("SELECT * FROM payment_attempts WHERE invoice_id = ?1
+                   AND gateway = 'paypal' AND kind = 'paypal_order'
+                   AND status = 'created' AND external_id != ''", [$inv["id"]])
+  if length($att) == 0 then
+    return false
+  end
+  -- partial-payment fence: the order was minted at the FULL total; capture is
+  -- OUR server-side call, so refusing it here means the buyer is never
+  -- charged (the uncaptured order lapses at PayPal) instead of overpaying
+  if biz_net_paid_cents($inv["id"]) != 0 then
+    biz_audit("public", "paypal_capture_fenced", "payment_attempts", $att[0].id,
+              "partial payment ledgered — capture refused")
+    return false
+  end
+  $r = pp_api("POST", "/v2/checkout/orders/" .. $att[0].external_id .. "/capture",
+              "{}", { "PayPal-Request-Id": ("cap-" .. $att[0].idempotency_key) })
+  if $r["ok"] then
+    return true
+  end
+  if to_number($r["status"]) == 422 then
+    return true  -- already captured — webhook has/will apply it
+  end
+  biz_audit("public", "paypal_capture_error", "payment_attempts", $att[0].id, $r["error"])
+  return false
+end
+
+-- Webhook verification via PayPal's verify-webhook-signature API (the
+-- documented server-side path; no local cert dance). Returns
+-- { verified: bool, transient: bool } — transient=true means the verify
+-- SERVICE/token/transport failed (caller should 500 so PayPal retries),
+-- distinct from a genuine verification FAILURE (verified=false transient=
+-- false → 400, don't retry). Malformed input → 400 too.
+function pp_verify_webhook($headers, $raw_body)
+  $wid = biz_setting("paypal_webhook_id")
+  if $wid == "" then
+    return { verified: false, transient: true }  -- unconfigured: don't 400-drop
+  end
+  if $headers == nil then
+    return { verified: false, transient: false }
+  end
+  $evt = nil
+  try
+    $evt = json_parse($raw_body)
+  catch $e
+    return { verified: false, transient: false }
+  end
+  $req = {
+    auth_algo: "" .. $headers["paypal-auth-algo"],
+    cert_url: "" .. $headers["paypal-cert-url"],
+    transmission_id: "" .. $headers["paypal-transmission-id"],
+    transmission_sig: "" .. $headers["paypal-transmission-sig"],
+    transmission_time: "" .. $headers["paypal-transmission-time"],
+    webhook_id: $wid,
+    webhook_event: $evt
+  }
+  $r = pp_api("POST", "/v1/notifications/verify-webhook-signature", json_encode($req), nil)
+  if not $r["ok"] or $r["body"] == nil then
+    return { verified: false, transient: true }  -- verify service down → retry
+  end
+  if ("" .. $r["body"]["verification_status"]) == "SUCCESS" then
+    return { verified: true, transient: false }
+  end
+  return { verified: false, transient: false }  -- genuine failure → 400
+end

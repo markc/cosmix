@@ -1,0 +1,344 @@
+-- contextmenu.mix — shared SSR right-click (RMB) context-menu widget for the webd
+-- CMS/PIM tree. Sibling of widgets/datatable.mix + forms.mix + modals.mix +
+-- treeview.mix; same conventions.
+--
+-- Plan of record: _plan/2026-06-24-context-menu-widget.md (Codex-converged).
+--
+-- ONE copy at /opt/cosmix/vhosts/shared/widgets/contextmenu.mix; `include`-d by a
+-- handler AFTER lib.mix (so esc() resolves at call-time). Self-contained — composes
+-- with modals.mix (a menu item opens an md_shell dialog via md_script's fetch path)
+-- but does NOT depend on it.
+--
+-- MECHANISM. The server emits ONE inert <template id="cm-<menuId>"> per menu (a <ul>
+-- of items). An element becomes a right-click TARGET by carrying data-cm-menu="<menuId>"
+-- plus arbitrary data-cm-<key> payload attrs (use cm_bind). assets/site.js
+-- (Site.initContextMenu — a document-level delegated listener, so it catches SIDEBAR
+-- clones of the server-rendered tree that live OUTSIDE #content) clones the template on
+-- `contextmenu`, RESOLVES each item's {key} placeholders from the target's data-cm-<key>
+-- payload (Codex: resolve at clone time, NOT on click — md_script listens in CAPTURE
+-- phase, so a fill-in-on-click would be too late), positions a floating .cm-menu at the
+-- cursor clamped to the viewport, and closes on Escape / outside-click / scroll / resize /
+-- cms:swapped.
+--
+-- ITEM placeholders: a url template carries {key} tokens resolved (URL-encoded) at clone
+-- time from the target's data-cm-<key>. So a row binds data-cm-id="…" and an item with
+-- src="/pim/mail?folder_action=rename&fid={id}&modal=1" resolves to the bound folder.
+--
+-- DISCIPLINE (mirrors treeview.mix / modals.mix): escape-once firewall — every VALUE
+-- (label, url template) through esc() exactly once at emission; author literals (icon
+-- names, action names, the menu id) run through an ALLOWLIST charset (cm_token), never
+-- escaped-as-text; the menu id + an item's modal id are VALIDATED (cm_id_ok, die on bad —
+-- they flow into a DOM id + data-cm-menu + getElementById and MUST match on both sides).
+-- "" .. nil is the literal text "nil" — every value is nil-guarded before concat. NO
+-- mix-0.20 syntax (?? / ?:): webd embeds its own cosmix-lib-mix.
+--
+-- PUBLIC API:
+--   cm_menu($id, $items) -> the inert <template id="cm-<id>"> source for a menu.
+--       $items is a list of item maps (see cm_item); place the returned template
+--       anywhere in #content (NOT inside a data-dcs-panel template — it must not be
+--       cloned into the sidebar). One menu serves every target that names it.
+--   cm_bind($menu_id, $payload) -> the attribute string for a right-click TARGET:
+--       ` data-cm-menu="<id>" data-cm-<k>="<v>" …` for every key in $payload. Splice it
+--       into the target element's open tag.
+--   cm_item($it) -> one <li> (used by cm_menu; exposed for advanced composition).
+
+-- ───────────────────────────── helpers ─────────────────────────────
+
+-- nil-coalesce (the datatable dt_or / forms fm_or / treeview tv_or shape).
+function cm_or($v, $def)
+  if $v == nil then
+    return $def
+  end
+  return $v
+end
+
+-- Reduce a string to the DOM/lucide-safe token charset [a-z0-9-]; anything else is
+-- dropped (icon names, action names, a payload key). Empty result is "" — callers that
+-- need a fallback supply one (cm_icon).
+function cm_token($s)
+  if $s == nil then
+    return ""
+  end
+  $in = lower("" .. $s)
+  $out = ""
+  $i = 0
+  $n = length($in)
+  while $i < $n
+    $ch = substr($in, $i, 1)
+    if ($ch >= "a" and $ch <= "z") or ($ch >= "0" and $ch <= "9") or $ch == "-" then
+      $out = $out .. $ch
+    end
+    $i = $i + 1
+  end
+  return $out
+end
+
+-- Validate a menu / modal id: lowercase [a-z0-9_-], non-empty (matches md_id_ok so an id
+-- is valid identically whether opened by a modal trigger or a context-menu item). Flows
+-- into a DOM id + data-cm-menu + getElementById, so a typo is a loud config error, not a
+-- silent mismatch. The nil guard is load-bearing: "" .. nil is the literal "nil", which
+-- would otherwise pass the char check and accept a missing id as id="nil".
+function cm_id_ok($s)
+  if $s == nil then
+    return false
+  end
+  $str = "" .. $s
+  if $str == "" then
+    return false
+  end
+  $i = 0
+  $n = length($str)
+  while $i < $n
+    $ch = substr($str, $i, 1)
+    if not (($ch >= "a" and $ch <= "z") or ($ch >= "0" and $ch <= "9") or $ch == "-" or $ch == "_") then
+      return false
+    end
+    $i = $i + 1
+  end
+  return true
+end
+
+-- Sanitised lucide icon name; "circle" when missing/empty after tokenising.
+function cm_icon($name)
+  $t = cm_token($name)
+  if $t == "" then
+    return "circle"
+  end
+  return $t
+end
+
+-- ───────────────────────────── items ─────────────────────────────
+
+-- One menu <li>. $it is a map:
+--   {sep: true}                                   → a separator row (no other keys read)
+--   {label, icon?, danger?, disable_if?,          → an action / link item
+--    src?, modal?, href?, action?, submenu?}
+--     label      : the visible text (escaped)
+--     icon       : a lucide name (allowlisted), shown at the left
+--     danger     : true → destructive styling (red)
+--     disable_if : a payload key; the item is rendered DISABLED at clone time when the
+--                  target's data-cm-<key> is NON-empty (e.g. disable Rename/Delete on a
+--                  role mailbox via disable_if:"role"). The server ALSO re-validates.
+--     show_if    : a "key=value" match; the item's <li> is HIDDEN at clone time unless the
+--                  target's data-cm-<key> EQUALS value (e.g. show Empty Trash only on the
+--                  Trash mailbox via show_if:"role=trash"). Hidden (not greyed) — keyboard
+--                  nav skips it (offsetParent). Place a show_if item next to an always-
+--                  present sibling so hiding it never strands a separator.
+--     src        : a modal-fetch URL template ({key} placeholders); pairs with `modal`
+--     modal      : the md_shell dialog id to open with the fetched fragment (validated)
+--     href       : a navigable URL template ({key}); the open-in-new-tab / direct-URL
+--                  fallback for the resolved item (the MENU ITSELF is a JS enhancement —
+--                  with JS off the contextmenu never opens, so this is not a no-JS UI path)
+--     action     : a pure JS hook name (data-cm-action) for a consumer-wired action
+--     submenu    : a list of sub-items (a flyout), same schema — one level deep
+--     post       : a one-click POST target (a same-origin path, e.g. "/pim/mail"); pairs
+--                  with `fields`. On click site.js builds a temporary body-level
+--                  <form method=post> (NOT inside the menu — the menu's close lifecycle
+--                  would detach an in-menu form before submit) and submits it natively →
+--                  303 → flash. For a state-mutating one-click action (e.g. Mark Read);
+--                  never a GET (a crawler/prefetch must not mutate).
+--     fields     : a map of POST field name→value templates ({key} placeholders), emitted
+--                  as a `&`-joined data-cm-fields spec and resolved RAW per-target at click.
+-- The template's <a> carries the RAW {key} templates in data-cm-src / data-cm-href /
+-- data-cm-fields; site.js substitutes them per-target at clone/click time, never the
+-- server (one menu, N rows).
+function cm_item($it)
+  if $it["sep"] == true then
+    return '<li class="cm-sep" role="separator"></li>'
+  end
+
+  -- One-click POST item (no modal, no confirm): an <a> carrying data-cm-post (the action
+  -- path) + data-cm-fields (a &-joined k=v template). site.js builds+submits a body-level
+  -- form on click. Distinct enough from the link/modal item to render on its own branch.
+  if $it["post"] != nil then
+    $fstr = ""
+    if $it["fields"] != nil then
+      $sep = ""
+      for each $fk in keys($it["fields"])
+        $fstr = $fstr .. $sep .. $fk .. "=" .. ("" .. $it["fields"][$fk])
+        $sep = "&"
+      end
+    end
+    $pcls = "cm-item"
+    if $it["danger"] == true then
+      $pcls = $pcls .. " cm-danger"
+    end
+    $pa = '<a class="' .. $pcls .. '" role="menuitem" tabindex="-1" data-cm-post="' .. esc("" .. $it["post"]) .. '" data-cm-fields="' .. esc($fstr) .. '"'
+    -- Optional confirm text → a native-dialog gate before site.js submits the POST (so a
+    -- destructive one-click item keeps the column button's confirmation).
+    if $it["confirm"] != nil then
+      $pa = $pa .. ' data-cm-confirm="' .. esc("" .. $it["confirm"]) .. '"'
+    end
+    if $it["disable_if"] != nil then
+      $pa = $pa .. ' data-cm-disable-if="' .. cm_token($it["disable_if"]) .. '"'
+    end
+    $pa = $pa .. '>'
+    if $it["icon"] != nil then
+      $pa = $pa .. '<i class="cm-ic" data-lucide="' .. cm_icon($it["icon"]) .. '"></i>'
+    end
+    $pa = $pa .. '<span class="cm-label">' .. esc("" .. cm_or($it["label"], "")) .. '</span></a>'
+    return '<li class="cm-li">' .. $pa .. '</li>'
+  end
+  $cls = "cm-item"
+  if $it["danger"] == true then
+    $cls = $cls .. " cm-danger"
+  end
+  $sub = $it["submenu"]
+  $has_sub = ($sub != nil and length($sub) > 0)
+  if $has_sub then
+    $cls = $cls .. " cm-has-submenu"
+  end
+  $a = '<a class="' .. $cls .. '" role="menuitem" tabindex="-1"'
+  if $it["src"] != nil then
+    $a = $a .. ' data-cm-src="' .. esc("" .. $it["src"]) .. '"'
+  end
+  if $it["modal"] != nil then
+    if not cm_id_ok($it["modal"]) then
+      die("contextmenu: invalid item modal id (allowed [a-z0-9_-]): " .. ("" .. $it["modal"]))
+    end
+    $a = $a .. ' data-cm-modal="' .. esc("" .. $it["modal"]) .. '"'
+  end
+  if $it["href"] != nil then
+    $a = $a .. ' data-cm-href="' .. esc("" .. $it["href"]) .. '"'
+  end
+  if $it["action"] != nil then
+    $a = $a .. ' data-cm-action="' .. cm_token($it["action"]) .. '"'
+  end
+  if $it["disable_if"] != nil then
+    $a = $a .. ' data-cm-disable-if="' .. cm_token($it["disable_if"]) .. '"'
+  end
+  if $it["show_if"] != nil then
+    $a = $a .. ' data-cm-show-if="' .. esc("" .. $it["show_if"]) .. '"'
+  end
+  if $has_sub then
+    $a = $a .. ' aria-haspopup="true"'
+  end
+  $a = $a .. '>'
+  if $it["icon"] != nil then
+    $a = $a .. '<i class="cm-ic" data-lucide="' .. cm_icon($it["icon"]) .. '"></i>'
+  end
+  $a = $a .. '<span class="cm-label">' .. esc("" .. cm_or($it["label"], "")) .. '</span>'
+  if $has_sub then
+    $a = $a .. '<i class="cm-caret" data-lucide="chevron-right"></i>'
+  end
+  $a = $a .. '</a>'
+
+  $li = '<li class="cm-li">' .. $a
+  if $has_sub then
+    $li = $li .. '<ul class="cm-submenu" role="menu">'
+    for each $s in $sub
+      $li = $li .. cm_item($s)
+    end
+    $li = $li .. '</ul>'
+  end
+  return $li .. '</li>'
+end
+
+-- One toolbar icon-button (cm_menu opts.toolbar). The SAME action as a text-row twin, rendered
+-- icon-only with a title AND aria-label (lucide marks its <svg> aria-hidden, so the <a> needs
+-- its own accessible name). REQUIRES an icon; REJECTS a submenu (no flyout room) and show_if
+-- (cmResolveItem hides show_if via the closest .cm-li, which a toolbar button has none of — so
+-- a show_if here would silently never hide; die rather than mislead). disable_if IS supported
+-- (cmResolveItem greys the <a> itself). It is an <a class="cm-item cm-tbtn"> so ALL the existing
+-- site.js (cmResolveItem / click dispatch / cmItems keyboard-nav) drives it unchanged.
+function cm_tbtn($it)
+  if $it["icon"] == nil then
+    die("contextmenu: a toolbar item requires an icon")
+  end
+  if $it["submenu"] != nil and length($it["submenu"]) > 0 then
+    die("contextmenu: a toolbar item can't have a submenu")
+  end
+  if $it["show_if"] != nil then
+    die("contextmenu: a toolbar item can't use show_if (no .cm-li to hide)")
+  end
+  $lbl = "" .. cm_or($it["label"], "")
+  $cls = "cm-item cm-tbtn"
+  if $it["danger"] == true then
+    $cls = $cls .. " cm-danger"
+  end
+  $a = '<a class="' .. $cls .. '" role="menuitem" tabindex="-1" title="' .. esc($lbl) .. '" aria-label="' .. esc($lbl) .. '"'
+  -- Action attrs mirror cm_item: a one-click POST (data-cm-post + data-cm-fields), or a
+  -- link/modal (src/modal/href/action). esc() every value; tokenise action/disable_if.
+  if $it["post"] != nil then
+    $fstr = ""
+    if $it["fields"] != nil then
+      $sep = ""
+      for each $fk in keys($it["fields"])
+        $fstr = $fstr .. $sep .. $fk .. "=" .. ("" .. $it["fields"][$fk])
+        $sep = "&"
+      end
+    end
+    $a = $a .. ' data-cm-post="' .. esc("" .. $it["post"]) .. '" data-cm-fields="' .. esc($fstr) .. '"'
+  end
+  if $it["src"] != nil then
+    $a = $a .. ' data-cm-src="' .. esc("" .. $it["src"]) .. '"'
+  end
+  if $it["modal"] != nil then
+    if not cm_id_ok($it["modal"]) then
+      die("contextmenu: invalid toolbar item modal id (allowed [a-z0-9_-]): " .. ("" .. $it["modal"]))
+    end
+    $a = $a .. ' data-cm-modal="' .. esc("" .. $it["modal"]) .. '"'
+  end
+  if $it["href"] != nil then
+    $a = $a .. ' data-cm-href="' .. esc("" .. $it["href"]) .. '"'
+  end
+  if $it["action"] != nil then
+    $a = $a .. ' data-cm-action="' .. cm_token($it["action"]) .. '"'
+  end
+  if $it["disable_if"] != nil then
+    $a = $a .. ' data-cm-disable-if="' .. cm_token($it["disable_if"]) .. '"'
+  end
+  return $a .. '><i class="cm-ic" data-lucide="' .. cm_icon($it["icon"]) .. '"></i></a>'
+end
+
+-- ───────────────────────────── public API ─────────────────────────────
+
+-- The inert <template id="cm-<id>"> holding one menu's items. $id is VALIDATED (it flows
+-- into a DOM id + the targets' data-cm-menu + getElementById). Place it in #content but
+-- NOT inside a data-dcs-panel <template> (Codex D1: the sidebar reconcile must not clone
+-- the menu template into the carousel).
+-- $opts (optional) carries opts["toolbar"] = a list of icon-only items (same item schema,
+-- icon required) rendered as a horizontal icon row ABOVE the <ul>. site.js shows the toolbar
+-- and hides the duplicate text rows when it fits, else falls back to the rows (XOR); each
+-- toolbar button is the SAME action as its text-row twin. A 2-arg call (no $opts) is
+-- unchanged — Mix passes nil for the missing arg, so every existing caller is byte-identical.
+function cm_menu($id, $items, $opts)
+  if not cm_id_ok($id) then
+    die("contextmenu: invalid menu id (allowed [a-z0-9_-], non-empty): " .. ("" .. $id))
+  end
+  $h = '<template id="cm-' .. esc("" .. $id) .. '" class="cm-template">'
+  if $opts != nil and $opts["toolbar"] != nil and length($opts["toolbar"]) > 0 then
+    $h = $h .. '<div class="cm-toolbar" role="group" aria-label="Quick actions">'
+    for each $tit in $opts["toolbar"]
+      $h = $h .. cm_tbtn($tit)
+    end
+    $h = $h .. '</div>'
+  end
+  $h = $h .. '<ul class="cm-menu-list" role="menu">'
+  if $items != nil then
+    for each $it in $items
+      $h = $h .. cm_item($it)
+    end
+  end
+  return $h .. '</ul></template>'
+end
+
+-- The attribute string that makes an element a right-click TARGET for <menu_id>, carrying
+-- a data-cm-<k> for every key in $payload (URL-encoded into item templates at clone time).
+-- Splice the result into the target's open tag. Keys are tokenised ([a-z0-9-]); values are
+-- esc()'d. Reserved: "menu" (would collide with data-cm-menu) is dropped.
+function cm_bind($menu_id, $payload)
+  if not cm_id_ok($menu_id) then
+    die("contextmenu: invalid menu id: " .. ("" .. $menu_id))
+  end
+  $h = ' data-cm-menu="' .. esc("" .. $menu_id) .. '"'
+  if $payload != nil then
+    for each $k in keys($payload)
+      $tk = cm_token($k)
+      if $tk != "" and $tk != "menu" then
+        $h = $h .. ' data-cm-' .. $tk .. '="' .. esc("" .. cm_or($payload[$k], "")) .. '"'
+      end
+    end
+  end
+  return $h
+end

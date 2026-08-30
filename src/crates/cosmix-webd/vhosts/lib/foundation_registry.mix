@@ -1,0 +1,48 @@
+-- foundation_registry.mix — the FOUNDATIONS REGISTRY (strict data).
+-- Read by _bin/foundation_check.mix (the conformance probe): every admin list
+-- page DECLARES itself under `resources:` — the registry, not filesystem grep,
+-- is the source of truth for what must conform (Codex R11). Add a row when you
+-- build a panel. Profiles: "admin-list/1" (dt_admin_opts/dt_admin_list + the
+-- dt_try_delete_row policy helpers), "resource/1" (declarative spec +
+-- resource_engine.mix), "exempt/<why>" (+ note).
+-- `exemptions:` holds the CROSS-CUTTING sweep exemptions (P3, Codex R8):
+-- per-Foundation partitions of { handler, reason } — a reasonless or duplicate
+-- entry fails the probe; exemptions are DATA here, never probe-inline literals.
+resources: [
+  { handler: "h_admin_posts.mix",      route: "/admin/posts",      entity: "cms_posts",     profile: "admin-list/1", note: "slug-keyed (id_ok hook); live_search" },
+  { handler: "h_admin_users.mix",      route: "/admin/users",      entity: "users",         profile: "resource/1", spec: "users_resource", note: "password via derived salt/pass_hash; guard never self/last admin" },
+  { handler: "h_admin_categories.mix", route: "/admin/categories", entity: "terms",         profile: "admin-list/1", note: "delete = reparent+clean cascade in one tx" },
+  { handler: "h_admin_comments.mix",   route: "/admin/comments",   entity: "cms_threads",   profile: "admin-list/1", note: "moderation bulk_actions; custom verb dispatch" },
+  { handler: "h_admin_forum.mix",      route: "/admin/forum",      entity: "cms_posts",     profile: "admin-list/1", note: "slug-keyed (id_ok); topic+replies one tx; live_search" },
+  { handler: "h_admin_vtokens.mix",    route: "/admin/vtokens",    entity: "vtokens",       profile: "admin-list/1", note: "no deletes — rotate/disable bulk_actions only" },
+  { handler: "h_pim_contacts.mix",  route: "/pim/contacts",  entity: "jmap:Contact",       profile: "admin-list/1", note: "JMAP: no select_all/no 'all'; custom tail" },
+  { handler: "h_pim_calendar.mix",  route: "/pim/calendar",  entity: "jmap:CalendarEvent", profile: "admin-list/1", note: "JMAP: no search/select_all; custom tail" },
+  { handler: "h_pim_mail.mix",      route: "/pim/mail",      entity: "jmap:Email",         profile: "admin-list/1", note: "JMAP; rich-action RMB-only (row_actions_column:false); iconed bulk bar; custom tail" },
+  { handler: "h_biz_customers.mix", route: "/biz/customers", entity: "customers",          profile: "resource/1", spec: "customers_resource", note: "guarded delete (refs); send_setpw verb; custom ?view detail" },
+  { handler: "h_biz_services.mix",  route: "/biz/services",  entity: "services",           profile: "admin-list/1", note: "guarded delete (invoices + provisioning footprint)" },
+  { handler: "h_biz_domains.mix",   route: "/biz/domains",   entity: "domains",            profile: "admin-list/1", note: "dead-excluding subquery table" },
+  { handler: "h_biz_invoices.mix",  route: "/biz/invoices",  entity: "invoices",           profile: "admin-list/1", note: "bulk:false — immutable billing history" },
+  { handler: "h_admin_media.mix",   route: "/admin/media",   entity: "media",              profile: "exempt/gallery", note: "hand-wrapped gallery, not a dt list" },
+  { handler: "h_home.mix",          route: "/",              entity: "cms_posts",          profile: "exempt/public-page", note: "public blog index — widget state machinery without table chrome" },
+  { handler: "h_notes.mix",         route: "/notes",         entity: "filesd:corpus",      profile: "exempt/specialized", note: "corpus browse/read/edit over the bus_call seam — own surface, not an admin list" },
+  { handler: "h_ssh_hosts.mix",     route: "/ssh/hosts",     entity: "sshm:ssh_hosts",     profile: "admin-list/1", note: "P1 full CRUD (FS-first: filesd fs.write/fs.trash → single-stmt mirror upsert in the ATTACHed sshm.db + ssh_audit); OCC via file_hash; row+bulk delete; reindex/testall are POST header actions (bus-gate off-POST CSRF)" },
+  { handler: "h_ssh_keys.mix",      route: "/ssh/keys",      entity: "sshm:ssh_keys",      profile: "admin-list/1", note: "P1 CRUD; public-key metadata only (private keys never served); create = enqueue a keygen worker job; guarded delete (refused while any host references it, trashes the .pub); reindex is a POST header action" },
+  { handler: "h_ssh_scans.mix",     route: "/ssh/scans",     entity: "sshm:ssh_scans",     profile: "admin-list/1", note: "P0 read-only scan history (empty until the P2 worker); no deletes/bulk yet" },
+  { handler: "h_shop_admin.mix",    route: "/biz/products",  entity: "products",           profile: "resource/1", spec: "products_resource", note: "sold products refuse delete (order history references them); publish gated on goods file present; save_transform stamps sha256+size" }
+],
+exemptions: {
+  forms: [
+    { handler: "h_forum.mix",       reason: "public new-topic composer — deliberately minimal inline markup on a public page, not an admin form" },
+    { handler: "h_biz_sw.mix",      reason: "operator diagnostic console — the raw query input IS the surface" },
+    { handler: "h_files.mix",       reason: "file-manager app owns its own control set (fm-* JS world; future Foundation of its own)" },
+    { handler: "h_notes.mix",       reason: "corpus surface owns its editor controls (exempt/specialized resource)" },
+    { handler: "h_admin_posts.mix", reason: "markdown post/page editor — the big <textarea> body is a canvas markdown surface (Mark's canvas rule); other fields ARE fm_*" },
+    { handler: "h_pim_mail.mix",    reason: "compose is a markdown message editor (canvas surface); the list is admin-list/1" },
+    { handler: "h_admin_media.mix", reason: "file-upload widget (readonly URL echo + <input type=file> + JS) — dedicated surface, exempt/gallery resource" },
+    { handler: "h_shop.mix",        reason: "public storefront controls (add-to-cart / remove / guest checkout) — deliberately minimal anon-facing markup on public shop pages, not admin form surfaces" }
+  ],
+  modals: [
+    { handler: "h_files.mix",  reason: "hand-rolled fm-menu/prompt dialogs — dedicated surface, future Foundation candidate" }
+  ],
+  details: [ ]
+}

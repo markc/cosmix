@@ -1,0 +1,19 @@
+[package]
+name = "cosmix-lib-node-id"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "cosmix_node_id"
+
+# Pure-logic core crate per CLAUDE.md "Crate architecture (core-first,
+# citizen-on-feature)". No `cosmix-lib-bus` / `-client` / `-config` /
+# `-props` deps; `cargo test --no-default-features` is the test surface.
+# Node ID is a 5-hex value derived from the WireGuard public key.
+
+[dependencies]
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = "1"

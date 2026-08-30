@@ -1,0 +1,43 @@
+-- Mix standard prelude
+-- Auto-loaded before scripts and .mixrc
+
+function lines($s)
+    return split($s, "\n")
+end
+
+function chars($s)
+    $result = []
+    for $i = 0 to length($s) - 1
+        push($result, substr($s, $i, 1))
+end
+    return $result
+end
+
+function sum($list)
+    $total = 0
+    for each $item in $list
+        $total = $total + $item
+end
+    return $total
+end
+
+-- max, min, abs and clamp are now native math builtins (v0.19.0; see
+-- builtins.rs). A builtin shadows any same-named function, so these prelude
+-- shims were dead code — removed to keep the prelude the single source. The
+-- builtins preserve the value/ordering the shims selected (min/max are now
+-- also variadic, take a list, and still order strings lexicographically like
+-- the old `<`/`>`-based shims), with two deliberate refinements: a numeric
+-- result is normalized to a number (a numeric-string/bool arg no longer comes
+-- back with its original type), and clamp() errors on an inverted lo > hi
+-- range instead of silently returning a bound.
+
+function read_lines($path)
+    return lines(read_file($path))
+end
+
+function avg($list)
+    if is_empty($list) then
+        return 0
+    end
+    return sum($list) / len($list)
+end

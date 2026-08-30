@@ -1,0 +1,37 @@
+-- functions.mix: test function definitions and calls
+-- Expected output:
+-- Hello, Alex!
+-- G'day, Alex!
+-- 10
+-- 6
+-- inner
+-- outer
+
+function greet($name, $greeting = "Hello")
+    return "${greeting}, ${name}!"
+end
+
+print greet("Alex")
+print greet("Alex", "G'day")
+
+-- single expression function
+function double($n) = $n * 2
+print double(5)
+
+-- recursion
+function factorial($n)
+    if $n <= 1 then
+        return 1
+    end
+    return $n * factorial($n - 1)
+end
+print factorial(3)
+
+-- scope isolation: function can't see outer variables
+$scope_test = "outer"
+function check_scope()
+    $scope_test = "inner"
+    print $scope_test
+end
+check_scope()
+print $scope_test

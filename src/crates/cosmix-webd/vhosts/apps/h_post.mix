@@ -1,0 +1,44 @@
+-- post.mix — single post view (GET /post/<slug>). Renders through the shared rd_view reader
+-- widget (reader.mix). Post-specific logic (the slug lookup, the draft/private gate) stays here;
+-- the read SPEC (badges, byline, Edit action, taxonomy footer, back) is built by the shared
+-- cms_read_spec (lib.mix) — the SAME spec the editor's live preview uses, so preview === view.
+include "/opt/cosmix/vhosts/shared/widgets/reader.mix"
+include "/opt/cosmix/vhosts/shared/widgets/thread.mix"
+
+function post_main()
+cms_init()
+$user = current_user($HEADERS)
+-- Blog surface gate: a disabled blog hides the nav + 404s individual posts.
+if not feature("blog") then
+  return feature_off_doc($user, "The blog")
+end
+$slug = $PATH
+if pos("/post/", $slug) == 1 then
+  $slug = substr($slug, 6, length($slug) - 6)
+end
+$rows = db_query("SELECT p.id AS id, p.slug AS slug, p.title AS title, p.body AS body, p.created AS created, p.status AS status, p.visibility AS visibility, p.comments_enabled AS comments_enabled, u.display AS author FROM cms_posts p LEFT JOIN users u ON u.id = p.author_id WHERE p.slug = ?1 AND p.kind = 'post'", [$slug])
+if length($rows) == 0 then
+  return doc(404, "Not found", $user, '<div class="card"><h1>404</h1><p class="muted">No such post.</p><a class="btn btn-ghost" href="/">← Home</a></div>')
+end
+$p = $rows[0]
+-- Draft / private → author-or-admin only (a draft must not leak to anon OR a plain "user"-role
+-- maild login). Author+ sees it = the preview path (the editor's View button).
+if not can_preview_unpublished($user) and ($p["status"] != "published" or $p["visibility"] == "private") then
+  return doc(404, "Not found", $user, '<div class="card"><h1>404</h1></div>')
+end
+-- Comments: the SAME threaded-reply substrate the forum uses (thread.mix / cms_threads),
+-- rooted at this post (root_kind='post'). Replies submit to the shared /reply endpoint.
+-- Per-post toggle: a post with comments_enabled=0 renders without the comments section at all.
+$body = rd_view(cms_read_spec($p, $user, {}))
+if ("" .. thread_or($p["comments_enabled"], "0")) == "1" then
+  $ppath = "/post/" .. ("" .. $p["slug"])
+  $q = parse_query($QUERY)
+  -- mirror h_reply's gate: comments accepted only on a published+public post (a draft an
+  -- author is previewing shows no composer).
+  $cancmt = ($user != nil) and ($p["status"] == "published") and ($p["visibility"] != "private")
+  $copts = { root_kind: "post", root_id: $p["id"], base: $ppath, "return": $ppath, post_to: "/reply", can_reply: $cancmt, see_pending: can_preview_unpublished($user), reply_to: $q["reply_to"], heading: "Comments" }
+  $body = $body .. rd_thread($copts)
+end
+return doc(200, $p["title"], $user, $body)
+
+end

@@ -1,0 +1,453 @@
+-- biz_pay.mix — PUBLIC payment surface (token-scoped) + gateway webhooks.
+-- Plan §3 P2, Codex-converged design. Routes (billing vhost):
+--   GET  /invoice/<token>            → public SSR invoice document
+--   GET  /pay/<token>                → payment chooser
+--   POST /pay/<token>/stripe         → create/reuse Checkout Session → 303
+--   POST /pay/<token>/paypal         → create/reuse PayPal Order → 303 approve
+--   GET  /pay/<token>/paypal/return  → server-side capture, then back to invoice
+--   POST /pay/stripe/webhook         → signature-verified, attempt-correlated
+--   POST /pay/paypal/webhook         → verify-webhook-signature API, same
+-- SECURITY: these routes are ANONYMOUS. Every mutation is bounded by: the
+-- unguessable 64-hex token → ONE open invoice; the payment_attempts trust
+-- anchor (webhooks only apply against gateway objects WE minted, matched on
+-- amount+currency+mode+open); per-token rate limits; and the txn dedupe index.
+-- The webhook paths ("stripe"/"paypal" in the token slot) are reserved words —
+-- real tokens are 64 hex chars and can never collide.
+include "/opt/cosmix/vhosts/shared/apps/biz.mix"
+include "/opt/cosmix/vhosts/shared/apps/stripe.mix"
+include "/opt/cosmix/vhosts/shared/apps/paypal.mix"
+
+-- ---------------------------------------------------------------- helpers
+
+-- true iff every char is a lowercase hex digit and length is in range —
+-- webd's Mix build has no regex feature, so hand-roll the token format check
+-- (defence in depth; SQL is bound-param regardless).
+function bp_is_hex_token($s)
+  $n = length($s)
+  if $n < 40 or $n > 80 then return false end
+  $hex = "0123456789abcdef"
+  $i = 0
+  while $i < $n
+    if pos(substr($s, $i, 1), $hex) == 0 then return false end
+    $i = $i + 1
+  end
+  return true
+end
+
+-- token → the one invoice it names, or nil. Tokens only exist on issued
+-- (open/paid) invoices; format-check first so junk never reaches SQL.
+function bp_invoice_by_token($token)
+  if not bp_is_hex_token("" .. $token) then
+    return nil
+  end
+  $r = db_query("SELECT i.*, c.name AS c_name, c.email AS c_email
+                 FROM invoices i JOIN customers c ON c.id = i.customer_id
+                 WHERE i.token = ?1", [$token])
+  if length($r) == 0 then return nil end
+  return $r[0]
+end
+
+function bp_outstanding($inv)
+  $s = db_query("SELECT COALESCE(SUM(CASE kind WHEN 'payment' THEN amount_cents
+                 WHEN 'refund' THEN -amount_cents ELSE 0 END), 0) AS paid
+                 FROM transactions WHERE invoice_id = ?1", [$inv["id"]])
+  $left = to_number($inv["total_cents"]) - to_number($s[0].paid)
+  if $left < 0 then $left = 0 end
+  return $left
+end
+
+function bp_page($title, $body)
+  $h = "<!doctype html><html><head><meta charset=\"utf-8\">"
+  $h = $h .. "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+  $h = $h .. "<meta name=\"robots\" content=\"noindex\">"
+  $h = $h .. "<title>" .. html_escape($title) .. "</title>"
+  $h = $h .. "<link rel=\"stylesheet\" href=\"/assets/base.css\">"
+  $h = $h .. "<link rel=\"stylesheet\" href=\"/assets/site.css\"></head><body>"
+  $h = $h .. "<main style=\"\" class=\"cms-wrap\"><div class=\"card\" id=\"inv-public\">"
+  $h = $h .. $body .. "</div></main></body></html>"
+  return $h
+end
+
+-- Public invoice document: strictly customer-visible content (no admin chrome,
+-- no other-customer data). Title is "Invoice" — never "Tax Invoice" (D1).
+function bp_invoice_html($inv)
+  $items = db_query("SELECT description, amount_cents, period_start, period_end
+                     FROM invoice_items WHERE invoice_id = ?1 ORDER BY id", [$inv["id"]])
+  $status = "" .. $inv["status"]
+  $overdue = false
+  if $status == "open" and ("" .. $inv["due"]) < biz_today() then $overdue = true end
+  $h = "<div class=\"inv-doc\"><h1>Invoice INV-" .. $inv["id"] .. "</h1>"
+  $badge = "Paid"
+  if $status == "open" then $badge = "Awaiting payment" end
+  if $overdue then $badge = "Overdue" end
+  if $status == "cancelled" then $badge = "Cancelled" end
+  $h = $h .. "<p class=\"muted\">" .. $badge .. " · issued " .. $inv["issued"]
+  if $status == "open" then $h = $h .. " · due " .. $inv["due"] end
+  $h = $h .. "</p>"
+  $h = $h .. "<div class=\"inv-parties\"><div><h3>From</h3><p>" .. biz_seller_html() .. "</p></div>"
+  $h = $h .. "<div><h3>To</h3><p>" .. replace(html_escape("" .. $inv["bill_to"]), "\n", "<br>") .. "</p></div></div>"
+  $h = $h .. "<table class=\"inv-items\"><thead><tr><th>Description</th><th class=\"text-right\">Amount</th></tr></thead><tbody>"
+  for each $it in $items
+    $desc = html_escape("" .. $it.description)
+    $h = $h .. "<tr><td>" .. $desc .. "</td><td class=\"text-right\">" .. fmt_aud($it.amount_cents) .. "</td></tr>"
+  end
+  $h = $h .. "</tbody></table><div class=\"inv-totals\">"
+  $h = $h .. "<p>Subtotal: " .. fmt_aud($inv["subtotal_cents"]) .. "</p>"
+  if to_number($inv["credit_cents"]) > 0 then
+    $h = $h .. "<p>Credit applied: -" .. fmt_aud($inv["credit_cents"]) .. "</p>"
+  end
+  $h = $h .. "<p class=\"inv-amount\"><strong>Total: " .. fmt_aud($inv["total_cents"]) .. "</strong></p>"
+  $left = bp_outstanding($inv)
+  if $status == "open" and $left != to_number($inv["total_cents"]) then
+    $h = $h .. "<p>Outstanding: " .. fmt_aud($left) .. "</p>"
+  end
+  $h = $h .. "</div>"
+  if $status == "open" then
+    $h = $h .. "<div class=\"inv-pay\"><h3>Pay this invoice</h3>"
+    if biz_setting("stripe_secret_key") != "" then
+      $h = $h .. "<form method=\"post\" action=\"/pay/" .. $inv["token"] .. "/stripe\">"
+      $h = $h .. "<button class=\"btn btn-primary\" type=\"submit\">Pay by card (Stripe)</button></form> "
+    end
+    if biz_setting("paypal_client_id") != "" then
+      $h = $h .. "<form method=\"post\" action=\"/pay/" .. $inv["token"] .. "/paypal\">"
+      $h = $h .. "<button class=\"btn\" type=\"submit\">Pay with PayPal</button></form> "
+    end
+    -- bank block only when the tenant has configured account details
+    if biz_setting("bank_details") != "" then
+      $bank = html_escape(replace(biz_setting("bank_details"), "<number>", "" .. $inv["id"]))
+      $h = $h .. "<pre class=\"inv-bank\">" .. $bank .. "</pre>"
+    end
+    $h = $h .. "</div>"
+  end
+  $h = $h .. "<p class=\"muted small\">Questions? Email " .. esc(biz_support_email()) .. "</p></div>"
+  return $h
+end
+
+-- ---------------------------------------------------------------- webhooks
+
+-- Shared application step once an event is verified + object-id-correlated.
+-- Full §3 P2.3 gate BEFORE any paid transition: attempt still 'created',
+-- gateway mode matches, and the event amount equals BOTH the attempt amount
+-- AND the invoice's CURRENT total (an invoice edited/reissued since the
+-- attempt was minted must not be paid at a stale figure); currency matches.
+-- Returns {status, body}.
+-- Ledger a verified late/raced gateway payment (invoice closed or attempt
+-- retired) + settle the attempt. ok → 200; genuine ledger failure → 500 so
+-- the gateway retries rather than dropping verified money.
+function bp_ledger_late($att, $txn_ref, $evt_amount, $detail)
+  $lr = biz_ledger_late_gateway_payment($att.invoice_id, "" .. $att.gateway, $txn_ref,
+                                        $evt_amount, $detail)
+  if not $lr["ok"] then
+    return { status: 500, headers: {}, body: "late ledger failed" }
+  end
+  db_exec("UPDATE payment_attempts SET status = 'succeeded', updated = ?2
+           WHERE id = ?1 AND status != 'succeeded'", [$att.id, biz_now()])
+  return { status: 200, headers: {}, body: "late payment ledgered" }
+end
+
+function bp_apply_from_attempt($att, $txn_ref, $evt_amount, $evt_currency, $detail)
+  -- gateway mode gate (both gateways) — before anything is ledgered
+  $want_mode = biz_setting("stripe_mode")
+  if ("" .. $att.gateway) == "paypal" then $want_mode = biz_setting("paypal_mode") end
+  if ("" .. $att.mode) != $want_mode then
+    return { status: 400, headers: {}, body: "mode mismatch" }
+  end
+  if ("" .. $att.status) == "succeeded" then
+    -- its transaction is already ledgered — a pure replay; ack
+    return { status: 200, headers: {}, body: "already applied" }
+  end
+  $inv = db_query("SELECT status, total_cents FROM invoices WHERE id = ?1", [$att.invoice_id])
+  if length($inv) == 0 then
+    return { status: 200, headers: {}, body: "invoice gone" }
+  end
+  -- a VERIFIED completed payment landing on a non-created attempt (expired/
+  -- superseded) or a closed invoice: money moved at the gateway, so it is
+  -- LEDGERED (dedupe-guarded, loud audit, no paid-transition side effects)
+  -- rather than silently acked — "money moved, therefore ledger reality".
+  -- A genuine ledger failure 500s so the gateway retries.
+  if ("" .. $att.status) != "created" or ("" .. $inv[0].status) != "open" then
+    return bp_ledger_late($att, $txn_ref, $evt_amount, $detail)
+  end
+  $amt = to_number($evt_amount)
+  $amt_ok = $amt == to_number($att.amount_cents) and $amt == to_number($inv[0].total_cents)
+  $cur_ok = lower("" .. $evt_currency) == ("" .. $att.currency)
+  if not ($amt_ok and $cur_ok) then
+    biz_audit("webhook", "amount_mismatch", "payment_attempts", $att.id,
+              $evt_amount .. " " .. $evt_currency .. " vs attempt " .. $att.amount_cents ..
+              " / invoice " .. $inv[0].total_cents)
+    return { status: 400, headers: {}, body: "amount mismatch" }
+  end
+  $r = biz_apply_payment($att.invoice_id, "" .. $att.gateway, $txn_ref,
+                         $amt, 0, $detail, "webhook")
+  if $r["duplicate"] then
+    return { status: 200, headers: {}, body: "already applied" }
+  end
+  if not $r["ok"] then
+    -- invoice closed BETWEEN our read and biz_apply_payment's tx (raced with
+    -- a manual mark-paid): the verified money still gets LEDGERED via the
+    -- same late path — never silently acked; other failures 500 for retry
+    if contains($r["error"], "not open") then
+      return bp_ledger_late($att, $txn_ref, $evt_amount, $detail)
+    end
+    -- cross-invoice reference collision: already loudly audited inside
+    -- biz_apply_payment; retrying cannot resolve it — ack so the gateway
+    -- stops, the audit is the operator signal
+    if contains($r["error"], "already ledgered against") then
+      return { status: 200, headers: {}, body: "ref collision — audited for reconciliation" }
+    end
+    return { status: 500, headers: {}, body: "apply failed" }
+  end
+  db_exec("UPDATE payment_attempts SET status = 'succeeded', updated = ?2 WHERE id = ?1",
+          [$att.id, biz_now()])
+  return { status: 200, headers: {}, body: "ok" }
+end
+
+function bp_stripe_webhook()
+  $secret = biz_setting("stripe_webhook_secret")
+  $sig = ""
+  if $HEADERS != nil and $HEADERS["stripe-signature"] != nil then
+    $sig = "" .. $HEADERS["stripe-signature"]
+  end
+  if not st_verify_sig($BODY, $sig, $secret) then
+    return { status: 400, headers: {}, body: "bad signature" }
+  end
+  $evt = nil
+  try
+    $evt = json_parse($BODY)
+  catch $e
+    return { status: 400, headers: {}, body: "bad json" }
+  end
+  $type = "" .. $evt["type"]
+  $obj = $evt["data"]["object"]
+
+  -- type-first routing (plan §3 P2.3, Codex-converged)
+  if $type == "checkout.session.completed" then
+    $att_rows = db_query("SELECT * FROM payment_attempts WHERE gateway = 'stripe'
+                          AND external_id = ?1", ["" .. $obj["id"]])
+    if length($att_rows) == 0 then
+      -- ours-but-unrecorded (sub-second create race) → 500 retries; foreign → ack
+      if $obj["metadata"] != nil and $obj["metadata"]["invoice_id"] != nil then
+        return { status: 500, headers: {}, body: "attempt not yet recorded" }
+      end
+      return { status: 200, headers: {}, body: "not ours" }
+    end
+    if ("" .. $obj["payment_status"]) != "paid" then
+      return { status: 200, headers: {}, body: "not paid yet" }
+    end
+    -- child PI id is the transaction reference (webhook replays dedupe on it)
+    return bp_apply_from_attempt($att_rows[0], "" .. $obj["payment_intent"],
+                                 $obj["amount_total"], $obj["currency"],
+                                 "stripe checkout " .. $obj["id"])
+  end
+  if $type == "checkout.session.expired" then
+    db_exec("UPDATE payment_attempts SET status = 'expired', updated = ?2
+             WHERE gateway = 'stripe' AND external_id = ?1 AND status = 'created'",
+            ["" .. $obj["id"], biz_now()])
+    return { status: 200, headers: {}, body: "expired noted" }
+  end
+  if $type == "payment_intent.succeeded" or $type == "payment_intent.payment_failed" then
+    -- route by attempt kind via metadata.attempt_key (checkout child PIs are
+    -- expected traffic, acked; offsession PIs apply/fail here)
+    $akey = ""
+    if $obj["metadata"] != nil and $obj["metadata"]["attempt_key"] != nil then
+      $akey = "" .. $obj["metadata"]["attempt_key"]
+    end
+    if $akey == "" then
+      return { status: 200, headers: {}, body: "no attempt key — foreign" }
+    end
+    $att_rows = db_query("SELECT * FROM payment_attempts WHERE idempotency_key = ?1", [$akey])
+    if length($att_rows) == 0 then
+      if $obj["metadata"]["invoice_id"] != nil then
+        return { status: 500, headers: {}, body: "attempt not yet recorded" }
+      end
+      return { status: 200, headers: {}, body: "not ours" }
+    end
+    $att = $att_rows[0]
+    if ("" .. $att.kind) == "checkout" then
+      return { status: 200, headers: {}, body: "checkout child pi — cs event applies" }
+    end
+    -- offsession: correlate by the pi_ id WE stored, not metadata alone
+    if ("" .. $att.external_id) == "" then
+      return { status: 500, headers: {}, body: "attempt not yet recorded" }
+    end
+    if ("" .. $att.external_id) != ("" .. $obj["id"]) then
+      return { status: 400, headers: {}, body: "attempt/object id mismatch" }
+    end
+    if $type == "payment_intent.succeeded" then
+      return bp_apply_from_attempt($att, "" .. $obj["id"], $obj["amount"], $obj["currency"],
+                                   "stripe offsession")
+    end
+    -- payment_failed: record + let dunning/retry logic take over
+    db_exec("UPDATE payment_attempts SET status = 'failed', next_attempt_at = ?2, updated = ?3
+             WHERE id = ?1 AND status = 'created'",
+            [$att.id, biz_date_add(biz_today(), "+3 days"), biz_now()])
+    try
+      db_exec("INSERT INTO transactions (invoice_id, customer_id, gateway, txn_ref, kind,
+               amount_cents, at, detail)
+               SELECT ?1, i.customer_id, 'stripe', ?2, 'attempt_failed', ?3, ?4, 'card declined'
+               FROM invoices i WHERE i.id = ?1",
+              [$att.invoice_id, "" .. $obj["id"], to_number($att.amount_cents), biz_now()])
+    catch $e
+      -- duplicate failure event replay — fine
+    end
+    return { status: 200, headers: {}, body: "failure recorded" }
+  end
+  return { status: 200, headers: {}, body: "ignored: " .. $type }
+end
+
+function bp_paypal_webhook()
+  $v = pp_verify_webhook($HEADERS, $BODY)
+  if not $v["verified"] then
+    if $v["transient"] then
+      -- verify service/token/transport hiccup — 500 so PayPal retries a
+      -- genuine event rather than dropping it forever
+      return { status: 500, headers: {}, body: "verification unavailable" }
+    end
+    return { status: 400, headers: {}, body: "bad signature" }
+  end
+  $evt = nil
+  try
+    $evt = json_parse($BODY)
+  catch $e
+    return { status: 400, headers: {}, body: "bad json" }
+  end
+  if ("" .. $evt["event_type"]) != "PAYMENT.CAPTURE.COMPLETED" then
+    return { status: 200, headers: {}, body: "ignored" }
+  end
+  $res = $evt["resource"]
+  $order_id = ""
+  if $res["supplementary_data"] != nil and $res["supplementary_data"]["related_ids"] != nil then
+    $order_id = "" .. $res["supplementary_data"]["related_ids"]["order_id"]
+  end
+  if $order_id == "" then
+    return { status: 200, headers: {}, body: "no order id" }
+  end
+  $att_rows = db_query("SELECT * FROM payment_attempts WHERE gateway = 'paypal'
+                        AND external_id = ?1", [$order_id])
+  if length($att_rows) == 0 then
+    if $res["custom_id"] != nil then
+      return { status: 500, headers: {}, body: "attempt not yet recorded" }
+    end
+    return { status: 200, headers: {}, body: "not ours" }
+  end
+  $amount = $res["amount"]
+  $cents = round(to_number($amount["value"]) * 100)
+  return bp_apply_from_attempt($att_rows[0], "" .. $res["id"], $cents,
+                               lower("" .. $amount["currency_code"]),
+                               "paypal capture, order " .. $order_id)
+end
+
+-- Where this vhost sends a customer to VIEW an invoice (relative path): the
+-- order page (downloads live there) only when the invoice actually IS a shop
+-- order — a plain admin-created or service invoice on a shop vhost stays on
+-- the formal invoice document (the order page would 404 it). The query is
+-- shop-gated because invoice_items.product_id only exists where shop_init
+-- has run. Absolute-URL twin: biz_invoice_url().
+function bp_view_path($inv)
+  if biz_shop_enabled() then
+    -- bootstrap-order guard: a fresh shop db (shop_init not yet run) has no
+    -- product_id column — and no orders — so fall through to /invoice
+    $r = []
+    try
+      $r = db_query("SELECT 1 AS x FROM invoice_items WHERE invoice_id = ?1
+                     AND product_id IS NOT NULL LIMIT 1", [$inv["id"]])
+    catch $e
+    end
+    if length($r) == 1 then
+      return "/order/" .. $inv["token"]
+    end
+  end
+  return "/invoice/" .. $inv["token"]
+end
+
+-- ---------------------------------------------------------------- main
+
+function biz_pay_main()
+  cms_init()
+  biz_init()
+  $parts = split($PATH, "/")
+  -- $parts: ["", "invoice", "<token>"] or ["", "pay", ...]
+  if length($parts) < 3 then
+    return { status: 404, headers: {}, body: "not found" }
+  end
+  $kind = "" .. $parts[1]
+  $seg = "" .. $parts[2]
+
+  -- webhooks: /pay/stripe/webhook · /pay/paypal/webhook (reserved segments)
+  if $kind == "pay" and $seg == "stripe" and $METHOD == "POST" then
+    return bp_stripe_webhook()
+  end
+  if $kind == "pay" and $seg == "paypal" and $METHOD == "POST" then
+    return bp_paypal_webhook()
+  end
+
+  $inv = bp_invoice_by_token($seg)
+  if $inv == nil then
+    return { status: 404, headers: {}, body: bp_page("Not found", "<h1>Invoice not found</h1><p class=\"muted\">This link is invalid or has been superseded.</p>") }
+  end
+
+  -- GET /invoice/<token>
+  if $kind == "invoice" and $METHOD == "GET" then
+    return bp_page("Invoice INV-" .. $inv["id"], bp_invoice_html($inv))
+  end
+
+  if $kind != "pay" then
+    return { status: 404, headers: {}, body: "not found" }
+  end
+
+  -- everything below creates gateway objects: open invoices only + rate limit
+  $action = ""
+  if length($parts) >= 4 then $action = "" .. $parts[3] end
+  $sub = ""
+  if length($parts) >= 5 then $sub = "" .. $parts[4] end
+
+  if ("" .. $inv["status"]) != "open" then
+    return { status: 410, headers: {}, body: bp_page("Invoice INV-" .. $inv["id"],
+      "<h1>Invoice INV-" .. $inv["id"] .. "</h1><p>This invoice is " .. $inv["status"] ..
+      " — no payment is due. <a href=\"/invoice/" .. $inv["token"] .. "\">View invoice</a></p>") }
+  end
+  if not bp_rate_ok("pay:" .. $seg, 6, 60) then
+    return { status: 429, headers: {}, body: "slow down" }
+  end
+
+  -- GET /pay/<token> → chooser (the invoice/order page IS the chooser)
+  if $action == "" and $METHOD == "GET" then
+    return { status: 303, headers: { "Location": bp_view_path($inv) }, body: "" }
+  end
+
+  -- PARTIAL-PAYMENT FENCE: gateway attempts are minted at the invoice's FULL
+  -- total (and webhooks only apply full-total events), so once ANY partial
+  -- payment is ledgered a gateway charge would overpay. Route the remainder
+  -- to bank transfer instead of silently charging the full amount again.
+  if ($action == "stripe" or $action == "paypal") and $METHOD == "POST" and bp_outstanding($inv) != to_number($inv["total_cents"]) then
+    return bp_page("Payment", "<h1>Partial payment received</h1><p>This invoice has a partial payment recorded, so card/PayPal checkout is disabled for the remainder. Please pay the outstanding balance of <strong>" .. fmt_aud(bp_outstanding($inv)) .. "</strong> by bank transfer (details on the <a href=\"/invoice/" .. $inv["token"] .. "\">invoice</a>), or contact us.</p>")
+  end
+
+  if $action == "stripe" and $METHOD == "POST" then
+    $r = st_create_checkout($inv)
+    if not $r["ok"] then
+      biz_audit("public", "checkout_error", "invoices", $inv["id"], $r["error"])
+      return bp_page("Payment", "<h1>Card payment unavailable</h1><p>Please try again shortly, or use the bank details on the <a href=\"/invoice/" .. $inv["token"] .. "\">invoice</a>.</p>")
+    end
+    return { status: 303, headers: { "Location": $r["url"] }, body: "" }
+  end
+
+  if $action == "paypal" and $METHOD == "POST" then
+    $r = pp_create_order($inv)
+    if not $r["ok"] then
+      biz_audit("public", "paypal_error", "invoices", $inv["id"], $r["error"])
+      return bp_page("Payment", "<h1>PayPal unavailable</h1><p>Please try again shortly, or use the bank details on the <a href=\"/invoice/" .. $inv["token"] .. "\">invoice</a>.</p>")
+    end
+    return { status: 303, headers: { "Location": $r["url"] }, body: "" }
+  end
+
+  if $action == "paypal" and $sub == "return" and $METHOD == "GET" then
+    -- buyer approved → capture server-side (idempotent); the webhook is the
+    -- application source of truth — this just completes the order + bounces
+    -- back to the invoice, which will show Paid once the webhook lands
+    pp_capture_for_invoice($inv)
+    return { status: 303, headers: { "Location": bp_view_path($inv) .. "?processing=1" }, body: "" }
+  end
+
+  return { status: 404, headers: {}, body: "not found" }
+end

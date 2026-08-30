@@ -1,0 +1,90 @@
+-- routes.mix — shared route table for every webd CMS/PIM vhost. deploy_vhost.mix
+-- reads this ($ROUTES), generates one thin stub per unique handler `h`, and
+-- registers each route as "<prefix>_<id>" for the target vhost (prefix = the
+-- vhost's first label, e.g. "shop" for shop.example.org). Each `h` maps to a stub file
+-- "<h>.mix" (the route's handler_ref) which includes the shared "h_<h>.mix"
+-- (defining "<h>_main()"). Default capabilities ["db"]; jmap surfaces add "jmap".
+$ROUTES = [
+  -- home is public_cache'd (webd 0.9.11): its anonymous render is a pure content
+  -- read (same card-feed as /posts), so the email-to-post import was lifted off
+  -- the render into /admin/posts (admin_posts KEEPS the `jmap` cap for it). The
+  -- session-cookie gate means an authenticated admin still gets a fresh (uncached)
+  -- `/`. Per-vhost overrides ($REPO/<vhost>/routes.mix, run by deploy_vhost.mix)
+  -- may re-path this — e.g. a static-front vhost mounts `home` at /blog so / falls through to
+  -- its static landing page (h_home derives its links from $PATH).
+  { id: "home",            m: "GET", p: "/",               h: "home", c: ["db", "public_cache"] },
+  -- The stable blog index (P4): the SAME card-list feed as `/`, at a fixed URL so the
+  -- blog survives when `/` is made a static page via the `home_page_slug` setting. No
+  -- email import here (no jmap cap) — that stays home's job; default db caps suffice.
+  { id: "posts",           m: "GET", p: "/posts",          h: "posts", c: ["db", "public_cache"] },
+  { id: "post",            m: "GET", p: "/post/*",         h: "post", c: ["db", "public_cache"] },
+  { id: "page",            m: "GET", p: "/page/*",         h: "page", c: ["db", "public_cache"] },
+  -- Threaded forum (board index + topic pages) and the SHARED reply submit endpoint
+  -- (h_reply.mix) used by BOTH forum topics and blog comments — one substrate
+  -- (cms_threads). See _plan/2026-06-28-unified-message-surfaces.md §5. Default db caps.
+  { id: "forum",           m: "ANY", p: "/forum",          h: "forum" },
+  { id: "forum_topic",     m: "ANY", p: "/forum/*",        h: "forum" },
+  { id: "reply",           m: "POST", p: "/reply",         h: "reply" },
+  -- Taxonomy archives (P2): ONE generic h_archive infers the taxonomy from the path
+  -- prefix and lists published-public posts in the term (default db caps; read cms.db).
+  { id: "tag",             m: "GET", p: "/tag/*",          h: "archive", c: ["db", "public_cache"] },
+  { id: "category",        m: "GET", p: "/category/*",     h: "archive", c: ["db", "public_cache"] },
+  { id: "feed",            m: "GET", p: "/feed",           h: "feed", c: ["db", "public_cache"] },   -- RSS 2.0 of published posts
+  -- /blog (the separate mail-backed email-to-post surface) RETIRED 2026-06-22,
+  -- handler h_blog.mix DELETED 2026-06-23: email-to-post now imports into the CMS
+  -- (cms_posts), shown at / and /post/<slug> like any editor-authored post.
+  -- (one dev vhost's hand-registered `gc_blog` is independent and unaffected.)
+  { id: "login",           m: "ANY", p: "/login",          h: "login" },
+  { id: "logout",          m: "ANY", p: "/logout",         h: "logout" },
+  { id: "admin",           m: "ANY", p: "/admin",          h: "admin" },
+  { id: "aposts",          m: "ANY", p: "/admin/posts",    h: "admin_posts", c: ["db", "jmap"] },
+  { id: "apreview",        m: "POST", p: "/admin/preview", h: "preview", c: ["db"] },
+  { id: "ausers",          m: "ANY", p: "/admin/users",    h: "admin_users" },
+  { id: "asettings",       m: "ANY", p: "/admin/settings", h: "admin_settings" },
+  { id: "acats",           m: "ANY", p: "/admin/categories", h: "admin_categories" },
+  { id: "acomments",       m: "ANY", p: "/admin/comments",   h: "admin_comments" },
+  { id: "aforum",          m: "ANY", p: "/admin/forum",      h: "admin_forum" },
+  { id: "amedia",          m: "ANY", p: "/admin/media",    h: "admin_media" },
+  -- vtoken management (email-to-X token CRUD) over the delegated bus_call seam
+  -- (vtoken C2). SPLIT by method: the GET render grants ONLY the read-only
+  -- list (so a tokenless SSR navigation passes the gate); the POST grants the
+  -- mutating verbs (a plain-form POST relies on SameSite + the admin gate, so
+  -- no token, per the verb-aware CSRF rule). webd's admin gate authorizes;
+  -- maild binds the actor to its own domain.
+  { id: "avtokens",        m: "GET",  p: "/admin/vtokens", h: "admin_vtokens", c: ["db", "bus:maild.vtoken.list_opaque"] },
+  { id: "avtokens_post",   m: "POST", p: "/admin/vtokens", h: "admin_vtokens", c: ["db", "bus:maild.vtoken.list_opaque", "bus:maild.vtoken.mint_opaque", "bus:maild.vtoken.lookup_opaque", "bus:maild.vtoken.disable_opaque"] },
+  -- Markdown corpus surface (/notes) over the DELEGATED filesd bus_call seam
+  -- (corpus C2). filesd is single-node: the per-corpus daemon registers as Bus
+  -- service `filesd-notes`, so the route MUST carry `bus-svc:filesd-notes` (the
+  -- verb prefix `filesd` != the instance service). SPLIT by method per the
+  -- verb-aware CSRF rule: GET grants only the read-only verbs (a tokenless SSR nav
+  -- passes the gate); POST grants the mutating set (save/move/delete) + read (the
+  -- edit overlay-merge re-reads the original) — a plain-form POST relies on
+  -- SameSite + webd's admin gate, so no token. The seam is admin-only (webd injects
+  -- the bus capability only for rank>=3). Only effective where a filesd-<corpus>
+  -- daemon runs (the dev workstation today); elsewhere the handler degrades to a notice.
+  { id: "notes",           m: "GET",  p: "/notes", h: "notes", c: ["db", "bus-svc:filesd-notes", "bus:filesd.list", "bus:filesd.read", "bus:filesd.search"] },
+  { id: "notes_post",      m: "POST", p: "/notes", h: "notes", c: ["db", "bus-svc:filesd-notes", "bus:filesd.read", "bus:filesd.save", "bus:filesd.move", "bus:filesd.delete"] },
+  -- Dolphin-style dual-pane FILE MANAGER (/files) over the DELEGATED filesd
+  -- fs-mode bus_call seam (D3-A). The generic-FS daemon instance registers Bus
+  -- service `filesd-fs`, so the route MUST pin `bus-svc:filesd-fs` (the `fs.*`
+  -- prefix is not the service; an unpinned fs.* route is rejected by webd). SPLIT
+  -- by method per the verb-aware CSRF rule: GET grants only the read-only fs verbs
+  -- (a tokenless SSR nav passes the gate). The POST (write) route lands in S3. The
+  -- seam is admin-only (rank>=3); only effective where a `filesd-fs` daemon runs
+  -- (the dev workstation today) — elsewhere the handler degrades to a notice.
+  { id: "files",           m: "GET",  p: "/files", h: "files", c: ["db", "bus-svc:filesd-fs", "bus:fs.places", "bus:fs.list", "bus:fs.stat", "bus:fs.read_blob", "bus:fs.search", "bus:fs.trash.list", "bus:fs.tree"] },
+  -- The write surface (S3): the mutating fs.* verbs. A plain-form POST relies on
+  -- SameSite + webd's admin gate (tokenless, the verb-aware CSRF rule); the daemon
+  -- re-scopes + permission-checks every path (per-place writable, confirm on
+  -- delete/empty-trash).
+  { id: "files_post",      m: "POST", p: "/files", h: "files", c: ["db", "bus-svc:filesd-fs", "bus:fs.mkdir", "bus:fs.touch", "bus:fs.copy", "bus:fs.move", "bus:fs.trash", "bus:fs.trash.restore", "bus:fs.trash.empty", "bus:fs.delete"] },
+  { id: "media",           m: "GET", p: "/media/*",        h: "media" },
+  { id: "pim",             m: "GET", p: "/pim",            h: "pim" },
+  { id: "pim_contacts",      m: "GET",  p: "/pim/contacts", h: "pim_contacts", c: ["db", "jmap"] },
+  { id: "pim_contacts_post", m: "POST", p: "/pim/contacts", h: "pim_contacts", c: ["db", "jmap"] },
+  { id: "pim_mail",          m: "GET",  p: "/pim/mail",     h: "pim_mail",     c: ["db", "jmap"] },
+  { id: "pim_mail_post",     m: "POST", p: "/pim/mail",     h: "pim_mail",     c: ["db", "jmap"] },
+  { id: "pim_calendar",      m: "GET",  p: "/pim/calendar", h: "pim_calendar", c: ["db", "jmap"] },
+  { id: "pim_calendar_post", m: "POST", p: "/pim/calendar", h: "pim_calendar", c: ["db", "jmap"] }
+]

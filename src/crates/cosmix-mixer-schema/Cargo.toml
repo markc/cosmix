@@ -1,0 +1,17 @@
+[package]
+name = "cosmix-mixer-schema"
+version = "0.5.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "mixer.v1 domain contract for the display-renderer bake-off — property-leaf schema + frozen calibration, the fixed-width 465-byte A.6 meter-frame codec, centi-dBFS conversion, the validating 163-leaf final-state hash, and the write wire. Pure Rust, no cosmix deps (the durable bake-off artifact). MUST NOT be a dependency of any cosmix-disp-* renderer (B1/Q1). See ~/.cmctl/_decisions/2026-07-14-display-renderer-bakeoff.md §8."
+
+[lib]
+name = "cosmix_mixer_schema"
+
+[dependencies]
+serde = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

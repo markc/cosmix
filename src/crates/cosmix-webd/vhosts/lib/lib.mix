@@ -1,0 +1,1782 @@
+-- lib.mix — SHARED CMS library for every webd Mix-SSR vhost. Vhost-agnostic:
+-- per-vhost values (title/tagline/footer) come from $SITE, set by the per-vhost
+-- site.conf.mix the entry stub includes before this file. The shell template is
+-- read from the shared tree. One copy at /opt/cosmix/vhosts/shared/.
+-- Included by every handler: schema/seed, auth/sessions, the page() layout
+-- (the dcs.spa design-system shell, read from web/app/shell.html), and helpers.
+-- Theming is owned by dcs.spa (6 OKLCH schemes + light/dark via its Appearance
+-- sidebar) — there is no CMS theme setting. Pure function definitions — handlers
+-- call cms_init() then the rest. Capability profile: Pure+FsRead+Db.
+
+-- ─────────────────────────── schema + seed ───────────────────────────
+function cms_init()
+  db_exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, pass_hash TEXT NOT NULL, salt TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'author', display TEXT NOT NULL DEFAULT '', created TEXT NOT NULL DEFAULT (datetime('now')))", [])
+  db_exec("CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, created TEXT NOT NULL DEFAULT (datetime('now')), expires TEXT NOT NULL)", [])
+  -- `cms_posts` (not `posts`): webd auto-creates its own built-in `posts`
+  -- table in the cms_db, so we use a distinct name to avoid the schema clash.
+  db_exec("CREATE TABLE IF NOT EXISTS cms_posts (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT UNIQUE NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', excerpt TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'draft', author_id INTEGER, cover TEXT NOT NULL DEFAULT '', created TEXT NOT NULL DEFAULT (datetime('now')), updated TEXT NOT NULL DEFAULT (datetime('now')))", [])
+  db_exec("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')", [])
+  db_exec("CREATE TABLE IF NOT EXISTS media (id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT NOT NULL, mime TEXT NOT NULL, data TEXT NOT NULL, bytes INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT (datetime('now')))", [])
+  -- Idempotent migrations: `visibility` (public faces the internet / private =
+  -- personal notes, login-gated) and `kind` (post = blog feed / page =
+  -- standalone). ALTER throws on an existing column, so guard with try/catch.
+  ensure_col("cms_posts", "visibility TEXT NOT NULL DEFAULT 'public'")
+  ensure_col("cms_posts", "kind TEXT NOT NULL DEFAULT 'post'")
+  -- `cover` (a /img/… or /media/<id> reference to the post's featured image, shown on the
+  -- blog-index card). It's in the CREATE TABLE above, but that's a no-op on an existing db,
+  -- so retrofit it like visibility/kind — otherwise the index SELECT + editor save throw
+  -- "no such column: cover" on any vhost whose cms_posts predates the field.
+  ensure_col("cms_posts", "cover TEXT NOT NULL DEFAULT ''")
+  -- Body format (pages only today). 'markdown' (default) renders via render_body()
+  -- with raw HTML ESCAPED — safe for the untrusted write paths (email import,
+  -- author-rank editors). 'canvas' emits the DB body RAW into the shell's content
+  -- region; 'canvas-file' emits $SITE.app_root/canvas/<slug>.html RAW (repo-authored,
+  -- deployed like handlers — NOT under public/, so never fetchable as a document).
+  -- SECURITY: non-markdown formats are settable ONLY by rank>=3 via the editor
+  -- (h_admin_posts save gate); the email importer pins 'markdown' unconditionally.
+  ensure_col("cms_posts", "format TEXT NOT NULL DEFAULT 'markdown'")
+  -- Media storage discriminator: `inline` = base64 in the `data` column
+  -- (legacy path, media.mix serves it); `disk` = a real file under
+  -- public/img/ (webd writes it natively, ServeDir serves it via url_path).
+  -- webd's native upload route adds these same columns idempotently, so
+  -- either side may create them first.
+  ensure_col("media", "storage TEXT NOT NULL DEFAULT 'inline'")
+  ensure_col("media", "url_path TEXT NOT NULL DEFAULT ''")
+  ensure_col("media", "hash TEXT NOT NULL DEFAULT ''")
+  -- `updated` on media + users so every non-PIM datatable can default-sort on it (the
+  -- uniform datatable contract). SQLite ALTER ADD COLUMN needs a CONSTANT default, so add
+  -- DEFAULT '' then backfill from `created` (the row's only timestamp). media rows are
+  -- upload/delete-only so updated == created; users.updated is maintained on edit
+  -- (h_admin_users). cms_posts already has updated (maintained on save). The backfill is
+  -- idempotent — it only touches blank rows (a freshly-migrated db, or a native-upload media
+  -- row that didn't set it), so it's a no-op on the steady state.
+  ensure_col("media", "updated TEXT NOT NULL DEFAULT ''")
+  ensure_col("users", "updated TEXT NOT NULL DEFAULT ''")
+  db_exec("UPDATE media SET updated = created WHERE updated = '' OR updated IS NULL", [])
+  db_exec("UPDATE users SET updated = created WHERE updated = '' OR updated IS NULL", [])
+  -- Feed/list indexes: the home feed, /feed (RSS) and the post-admin list all
+  -- filter cms_posts by kind/status/visibility and sort by updated.
+  db_exec("CREATE INDEX IF NOT EXISTS idx_cms_posts_feed ON cms_posts(kind, status, visibility, updated)", [])
+  db_exec("CREATE INDEX IF NOT EXISTS idx_cms_posts_kind_updated ON cms_posts(kind, updated)", [])
+  -- Taxonomy (P2): flat tags + a single optional category. ONE `terms` table with a
+  -- `taxonomy` discriminator ('tag' | 'category'); `term_relations` is the post↔term
+  -- join. `parent_id` is reserved for future category nesting (no UI day one). Kept OUT
+  -- of cms_posts (no `tags TEXT`): structured rows are agent-legible + queryable. FK
+  -- enforcement is NOT relied on — relation cleanup on post/term delete is explicit.
+  db_exec("CREATE TABLE IF NOT EXISTS terms (id INTEGER PRIMARY KEY AUTOINCREMENT, taxonomy TEXT NOT NULL, slug TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', parent_id INTEGER, created TEXT NOT NULL DEFAULT (datetime('now')), updated TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE(taxonomy, slug))", [])
+  db_exec("CREATE TABLE IF NOT EXISTS term_relations (post_id INTEGER NOT NULL, term_id INTEGER NOT NULL, PRIMARY KEY(post_id, term_id))", [])
+  db_exec("CREATE INDEX IF NOT EXISTS idx_terms_taxonomy_slug ON terms(taxonomy, slug)", [])
+  db_exec("CREATE INDEX IF NOT EXISTS idx_term_relations_term ON term_relations(term_id, post_id)", [])
+  db_exec("CREATE INDEX IF NOT EXISTS idx_term_relations_post ON term_relations(post_id, term_id)", [])
+  -- Page hierarchy: an ARBITRARY-DEPTH page tree for the LHS nav. `parent_id` (nullable;
+  -- pages only — a top-level page has it NULL/0) + `menu_order` (manual sort within a
+  -- level). Both retrofitted onto an existing cms_posts via ensure_col (the CREATE TABLE
+  -- doesn't carry them). The editor's Parent picker excludes self + descendants and the
+  -- save re-checks the parent chain (cycle guard), so the tree stays acyclic at any depth;
+  -- build_nav_pages renders it recursively (visited-guarded, no depth cap). The nav index
+  -- matches the build_nav_pages queries (kind, parent_id, menu_order, title).
+  ensure_col("cms_posts", "parent_id INTEGER")
+  ensure_col("cms_posts", "menu_order INTEGER NOT NULL DEFAULT 0")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_cms_posts_pages_nav ON cms_posts(kind, parent_id, menu_order, title)", [])
+  -- Per-post/page comments toggle: 1 = allow replies on this post/page, 0 = closed. Drives the
+  -- comments section in h_post/h_page AND the server-side /reply gate. Comments are OFF by
+  -- default (opt-in per post/page) — they're an incidental bonus of the forum code, not a core
+  -- surface. A fresh column ADD backfills existing rows to 0; a DB that already had the column
+  -- at the old DEFAULT 1 is flipped ONCE below.
+  ensure_col("cms_posts", "comments_enabled INTEGER NOT NULL DEFAULT 0")
+  -- One-time baseline flip to comments-off, guarded by a settings flag so a later manual
+  -- per-item opt-in is never clobbered (cms_init runs every request — an unguarded UPDATE
+  -- would reset every opt-in). Only fires on a DB whose rows predate the off-by-default rule.
+  if ("" .. setting("comments_default_off_v1", "0")) != "1" then
+    db_exec("UPDATE cms_posts SET comments_enabled = 0", [])
+    -- Persist the done-flag with an UPSERT (not insert-if-absent): the flag MUST become "1"
+    -- even if the row somehow pre-exists blank, else the UPDATE re-fires every request and
+    -- clobbers per-item opt-ins.
+    db_exec("INSERT INTO settings (key, value) VALUES ('comments_default_off_v1', '1') ON CONFLICT(key) DO UPDATE SET value = '1'", [])
+  end
+  -- Threaded replies (forum discussion AND blog comments — ONE substrate, two consumers;
+  -- see _plan/2026-06-28-unified-message-surfaces.md §5). A reply hangs off a ROOT (a
+  -- cms_posts row): root_kind='forum' for a forum topic's discussion, 'post' for a blog
+  -- post's comments. `parent_id` nests replies (NULL/0 = top-level reply); the tree builds
+  -- exactly like the page tree (build_thread_children_map → get/push/reassign, visited-
+  -- guarded recursion). `status` gates visibility fail-closed (public queries filter
+  -- 'visible'); 'pending'/'spam'/'deleted' are moderation states. body is markdown, rendered
+  -- via markdown() at read (raw HTML escaped — safe for untrusted public-write content).
+  -- author_id → users.id (0/NULL = guest); author_name is the guest display fallback.
+  db_exec("CREATE TABLE IF NOT EXISTS cms_threads (id INTEGER PRIMARY KEY AUTOINCREMENT, root_kind TEXT NOT NULL, root_id INTEGER NOT NULL, parent_id INTEGER, author_id INTEGER, author_name TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'visible', created TEXT NOT NULL DEFAULT (datetime('now')), updated TEXT NOT NULL DEFAULT (datetime('now')))", [])
+  db_exec("CREATE INDEX IF NOT EXISTS idx_cms_threads_root ON cms_threads(root_kind, root_id, status, created)", [])
+  db_exec("CREATE INDEX IF NOT EXISTS idx_cms_threads_parent ON cms_threads(parent_id)", [])
+  cms_seed()
+end
+
+-- Add a column if it isn't already there (SQLite has no ADD COLUMN IF NOT
+-- EXISTS). `$table`/`$coldef` are fixed literals from cms_init, never client
+-- input. A duplicate-column ALTER raises; swallow it.
+function ensure_col($table, $coldef)
+  try
+    db_exec("ALTER TABLE " .. $table .. " ADD COLUMN " .. $coldef, [])
+  catch $e
+    -- column already exists — nothing to do
+  end
+end
+
+function set_default($k, $v)
+  $r = db_query("SELECT value FROM settings WHERE key = ?1", [$k])
+  if length($r) == 0 then
+    db_exec("INSERT INTO settings (key, value) VALUES (?1, ?2)", [$k, $v])
+  end
+end
+
+function cms_seed()
+  -- Declarative admins first, so a freshly-seeded welcome post gets a real author.
+  seed_admins()
+  set_default("site_title", $SITE["title"])
+  set_default("tagline", $SITE["tagline"])
+  set_default("footer", $SITE["footer"])
+  -- Seed the per-surface feature flags from $SITE (db-override-able at /admin/settings).
+  -- set_default is INSERT-if-missing, so an existing vhost db gets the new rows on
+  -- the next request without disturbing any admin override already present.
+  for each $fk in feature_keys()
+    set_default("feature_" .. $fk, feature_default_str($fk))
+  end
+  -- Reading model (WP show_on_front, Part A). Seed the master switch ONCE off the
+  -- EXISTING home_page_slug for back-compat: the live demo has home_page_slug set with
+  -- no show_on_front, so a non-empty slug → "page" (keep the static home), else "posts"
+  -- (the default for a fresh vhost). After this seed it's an explicit admin choice.
+  $existing_hps = trim("" .. setting("home_page_slug", ""))
+  $sof_default = "posts"
+  if $existing_hps != "" then
+    $sof_default = "page"
+  end
+  set_default("show_on_front", $sof_default)
+  set_default("posts_page_slug", "")
+  set_default("posts_per_page", "10")
+  set_default("feed_items", "20")
+  -- NOTE: no cms.db-PASSWORD admin is seeded — under the unified maild login the
+  -- admin is a maild account (seed_admins maps email→role only, never a password).
+  $p = db_query("SELECT count(*) AS c FROM cms_posts", [])
+  if $p[0]["c"] == 0 then
+    $aid = db_query("SELECT id FROM users ORDER BY id LIMIT 1", [])
+    $author = nil
+    if length($aid) > 0 then
+      $author = $aid[0]["id"]
+    end
+    $welcome = "Welcome to **" .. $SITE["title"] .. "**.\n\nEvery page is produced by an operator-authored `.mix` script running in-process inside `cosmix-webd`, reading and writing this vhost's own SQLite database through the `db_query`/`db_exec` builtins.\n\nThe visual shell is the **dcs.spa** dual-carousel design system, with the CMS content rendered into its main column. No React, no build step: just Mix, server-rendered HTML, and the dcs.spa CSS/JS. Edit a handler and reload; the change is live."
+    db_exec("INSERT INTO cms_posts (slug, title, excerpt, body, status, author_id) VALUES (?1, ?2, ?3, ?4, 'published', ?5)", ["hello", "Hello from " .. $SITE["title"], "This site is rendered entirely by Mix handlers inside cosmix-webd — server-side HTML over a per-vhost SQLite database — wrapped in the dcs.spa design-system shell.", $welcome, $author])
+  end
+end
+
+-- ─────────────────────────── email-to-post → CMS import ───────────────────────────
+-- vtoken email-to-post lands a daemon-content-marked message in the content
+-- account's top-level `Posts` folder. This turns each such message into a normal
+-- published cms_posts row (so it shows at / and /post/<slug> like any editor post),
+-- deduped by the stable jmap email id in `content_imported`. Idempotent + cheap;
+-- called lazily at the top of the home + post-admin handlers. Reads Posts via
+-- jmap() (the vhost's content identity), writes cms_posts via db_exec. Fully
+-- fail-soft: any jmap/db hiccup is swallowed so the page still renders.
+
+-- Plain-text body from a jmap Email (textBody[0].partId → bodyValues[pid].value).
+function cms_email_body_text($e)
+  $tb = $e["textBody"]
+  if $tb == nil or length($tb) == 0 then
+    return ""
+  end
+  $pid = $tb[0]["partId"]
+  if $pid == nil then
+    return ""
+  end
+  $bv = $e["bodyValues"]
+  if $bv == nil then
+    return ""
+  end
+  $part = $bv["" .. $pid]
+  if $part == nil then
+    return ""
+  end
+  $v = $part["value"]
+  if $v == nil then
+    return ""
+  end
+  return "" .. $v
+end
+
+-- Resolve cms author_id from the email From (sender-locked to the owner). Strips a
+-- `Name <addr>` wrapper, matches the address against users.username; nil if absent
+-- (the public render then shows an empty byline rather than failing).
+function cms_author_for_from($from)
+  if $from == nil then
+    return nil
+  end
+  $s = "" .. $from
+  $lt = pos("<", $s)
+  if $lt > 0 then
+    $gt = pos(">", $s)
+    if $gt > $lt then
+      $s = substr($s, $lt, $gt - $lt - 1)
+    end
+  end
+  $s = trim($s)
+  $rows = db_query("SELECT id FROM users WHERE username = ?1", [$s])
+  if length($rows) > 0 then
+    return $rows[0]["id"]
+  end
+  return nil
+end
+
+-- A cms_posts slug unique against the table (the editor doesn't dedupe; we must).
+function cms_unique_slug($base)
+  $b = "" .. $base
+  if trim($b) == "" then
+    $b = "post"
+  end
+  $slug = $b
+  $n = 1
+  while length(db_query("SELECT 1 FROM cms_posts WHERE slug = ?1", [$slug])) > 0
+    $n = $n + 1
+    $slug = $b .. "-" .. ("" .. $n)
+  end
+  return $slug
+end
+
+-- A cms_posts slug unique against the table, EXCLUDING one id (the editor's update
+-- path: a post's own slug must not false-collide with itself). Same -N suffix scheme
+-- as cms_unique_slug; the `id != ?2` guard skips the row being saved.
+function cms_unique_slug_except_id($base, $id)
+  $b = "" .. $base
+  if trim($b) == "" then
+    $b = "post"
+  end
+  $slug = $b
+  $n = 1
+  while length(db_query("SELECT 1 FROM cms_posts WHERE slug = ?1 AND id != ?2", [$slug, $id])) > 0
+    $n = $n + 1
+    $slug = $b .. "-" .. ("" .. $n)
+  end
+  return $slug
+end
+
+-- ─────────────────────────── taxonomy (terms) helpers ───────────────────────────
+-- P2: flat tags + a single optional category over the `terms`/`term_relations` tables
+-- (cms_init). Shared by the editor (h_admin_posts), the email importer
+-- (cms_import_one_post), the single-post display (h_post), and the archive (h_archive).
+-- All slugs go through slugify() so a term name and its URL stay in lockstep.
+
+-- Upsert a term by (taxonomy, name) → its id. Trims the name, derives the slug; an
+-- existing (taxonomy, slug) row wins (the UNIQUE constraint makes a duplicate a no-op).
+-- nil on a blank name/slug (the caller then skips it — no empty terms).
+function term_upsert($taxonomy, $name)
+  $nm = trim("" .. $name)
+  if $nm == "" then
+    return nil
+  end
+  $slug = slugify($nm)
+  if $slug == "" then
+    return nil
+  end
+  $r = db_query("SELECT id FROM terms WHERE taxonomy = ?1 AND slug = ?2", [$taxonomy, $slug])
+  if length($r) > 0 then
+    return $r[0]["id"]
+  end
+  db_exec("INSERT INTO terms (taxonomy, slug, name) VALUES (?1, ?2, ?3)", [$taxonomy, $slug, $nm])
+  $r2 = db_query("SELECT id FROM terms WHERE taxonomy = ?1 AND slug = ?2", [$taxonomy, $slug])
+  if length($r2) > 0 then
+    return $r2[0]["id"]
+  end
+  return nil
+end
+
+-- Parse a comma-separated string ("linux, rust") into a trimmed, blank-dropped
+-- list of term names. The editor's Tags field + the email front-matter both feed this.
+function split_terms($s)
+  $out = []
+  for each $part in split("" .. $s, ",")
+    $t = trim($part)
+    if $t != "" then
+      push($out, $t)
+    end
+  end
+  return $out
+end
+
+-- Replace a post's relations for ONE taxonomy with the given names (full replace, not
+-- merge): delete this post's relations in that taxonomy, then upsert + relink each name.
+-- INSERT OR IGNORE makes a repeated name harmless. Category callers pass at most one name.
+function set_post_terms($post_id, $taxonomy, $names)
+  db_exec("DELETE FROM term_relations WHERE post_id = ?1 AND term_id IN (SELECT id FROM terms WHERE taxonomy = ?2)", [$post_id, $taxonomy])
+  for each $n in $names
+    $tid = term_upsert($taxonomy, $n)
+    if $tid != nil then
+      db_exec("INSERT OR IGNORE INTO term_relations (post_id, term_id) VALUES (?1, ?2)", [$post_id, $tid])
+    end
+  end
+end
+
+-- Link a post to AT MOST ONE category by term ID (full replace). The editor's category
+-- <select> submits an existing term's id (not a name), so a RENAMED category links to the
+-- exact existing term — never a slug-derived duplicate the way name→term_upsert would
+-- (term_upsert matches by slugify(name), so a renamed category's new name would mint a new
+-- term). "" / nil / a non-category id → the post ends up with no category.
+function set_post_category_id($post_id, $cat_id_raw)
+  db_exec("DELETE FROM term_relations WHERE post_id = ?1 AND term_id IN (SELECT id FROM terms WHERE taxonomy = 'category')", [$post_id])
+  if $cat_id_raw == nil or trim("" .. $cat_id_raw) == "" then
+    return nil
+  end
+  $cid = to_number("" .. $cat_id_raw)
+  $ex = db_query("SELECT id FROM terms WHERE id = ?1 AND taxonomy = 'category'", [$cid])
+  if length($ex) > 0 then
+    db_exec("INSERT OR IGNORE INTO term_relations (post_id, term_id) VALUES (?1, ?2)", [$post_id, $cid])
+  end
+  return nil
+end
+
+-- A post's terms in one taxonomy as a list of {slug, name} rows, alpha by name. Used to
+-- pre-fill the editor (joined into a CSV) and to render the single-post tag/category line.
+function post_terms($post_id, $taxonomy)
+  return db_query("SELECT t.slug AS slug, t.name AS name FROM terms t JOIN term_relations r ON r.term_id = t.id WHERE r.post_id = ?1 AND t.taxonomy = ?2 ORDER BY t.name", [$post_id, $taxonomy])
+end
+
+-- "2026-01-08 21:32:57" → "Jan 8, 2026" (the house blog date style). Pure string work,
+-- short-circuits a too-short input to itself. Shared so the index cards (h_home) and the
+-- single-post byline (h_post) format publish dates identically — was an h_home local.
+function blog_date($s)
+  $t = "" .. $s
+  if length($t) < 10 then
+    return $t
+  end
+  $months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+  $mn = to_number(substr($t, 5, 2))
+  $name = substr($t, 5, 2)
+  if $mn >= 1 and $mn <= 12 then
+    $name = $months[$mn - 1]
+  end
+  $day = "" .. to_number(substr($t, 8, 2))
+  return $name .. " " .. $day .. ", " .. substr($t, 0, 4)
+end
+
+-- Delete a post by slug AND its taxonomy relations (SQLite FK enforcement isn't relied
+-- on, so the join rows are removed explicitly). Resolves the id first, deletes the
+-- term_relations by that id, then the cms_posts row. A no-op for an unknown slug. Used by
+-- every admin delete path (row action, single, bulk). Terms themselves are left (a term
+-- with no posts is harmless and may be reused); only the relations are cleaned.
+function cms_delete_post_by_slug($slug)
+  $r = db_query("SELECT id, parent_id FROM cms_posts WHERE slug = ?1", [$slug])
+  if length($r) == 0 then
+    return
+  end
+  $pid = $r[0]["id"]
+  db_exec("DELETE FROM term_relations WHERE post_id = ?1", [$pid])
+  -- Arbitrary-depth tree (Part B): reparent this node's children to its OWN parent (the
+  -- grandparent), NOT top-level — preserves their place in the tree. A NULL parent_id
+  -- coalesces to 0 (top-level), so a deleted top-level node's children become top-level.
+  $gp = $r[0]["parent_id"]
+  if $gp == nil then
+    $gp = 0
+  end
+  db_exec("UPDATE cms_posts SET parent_id = ?2 WHERE parent_id = ?1", [$pid, $gp])
+  db_exec("DELETE FROM cms_posts WHERE id = ?1", [$pid])
+end
+
+-- Look up one term by (taxonomy, slug) → {id, slug, name} or nil. The archive uses it to
+-- resolve a /tag/<slug> or /category/<slug> URL to a term (nil → a "nothing here" page).
+function term_by_slug($taxonomy, $slug)
+  $r = db_query("SELECT id, slug, name FROM terms WHERE taxonomy = ?1 AND slug = ?2", [$taxonomy, $slug])
+  if length($r) > 0 then
+    return $r[0]
+  end
+  return nil
+end
+
+-- Render a standalone page (kind='page') by slug to { title, html } — the SAME
+-- <h1> + draft/private badges + <article> markup h_page builds. Returns nil when the
+-- page doesn't exist, or when an anonymous viewer hits a draft/private page (so the
+-- caller answers 404). A signed-in user sees drafts/private. Shared by h_page (the
+-- /page/<slug> view) and h_home (the static front-page branch) so the two never drift.
+-- The `notes` feature gate stays in h_page (it owns the /page/* route); a static-home
+-- caller checks feature("notes") itself before invoking this.
+-- Body of a canvas-FILE page: $SITE.app_root/canvas/<slug>.html, read raw. The slug
+-- comes from the DB row (created via the editor's slugify), but guard traversal
+-- anyway — a slug is request-adjacent data (wire-trust rule). Missing file → a
+-- muted notice, never a 500 (the row exists; the file deploy lags).
+function canvas_file_body($slug)
+  $s = "" .. $slug
+  if $s == "" or contains($s, "/") or contains($s, "\\") or contains($s, "..") then
+    return '<p class="muted">Invalid canvas page reference.</p>'
+  end
+  $path = ("" .. $SITE["app_root"]) .. "/canvas/" .. $s .. ".html"
+  if not exists($path) then
+    return '<p class="muted">Canvas file not deployed yet: canvas/' .. esc($s) .. '.html</p>'
+  end
+  return read_file($path)
+end
+
+function render_page_by_slug($slug, $user)
+  $rows = db_query("SELECT slug, title, body, status, visibility, format FROM cms_posts WHERE slug = ?1 AND kind = 'page'", [$slug])
+  if length($rows) == 0 then
+    return nil
+  end
+  $p = $rows[0]
+  if not can_preview_unpublished($user) and ($p["status"] != "published" or $p["visibility"] == "private") then
+    return nil
+  end
+  -- Canvas formats (rank>=3-authored raw HTML; see the cms_init format column note):
+  -- the body goes out UNRENDERED and UNWRAPPED — no <h1>/badges/<article> chrome,
+  -- the page owns its own markup inside the shell's content region. Both `html` and
+  -- `body_html` carry the raw body so every caller (h_page's bare render, the h_home
+  -- static-front branch, the Mode-B intro) behaves identically.
+  $fmt = "" .. cms_or($p["format"], "markdown")
+  if $fmt == "canvas" or $fmt == "canvas-file" then
+    $raw = "" .. $p["body"]
+    if $fmt == "canvas-file" then
+      $raw = canvas_file_body($p["slug"])
+    end
+    return { title: "" .. $p["title"], html: $raw, body_html: $raw, slug: "" .. $p["slug"], status: "" .. $p["status"], visibility: "" .. $p["visibility"], format: $fmt }
+  end
+  -- Render the body ONCE. The plain `html` (title + badges + article) stays byte-identical for
+  -- the chrome-less callers — the static-home render (h_home) and the Mode-B posts-page intro
+  -- that sits ABOVE the feed. The standalone /page/<slug> viewer (h_page) ignores `html` and
+  -- rebuilds its reader chrome from the raw fields below via rd_view (reader.mix). So this
+  -- return is purely ADDITIVE — existing callers are unaffected.
+  $body_html = render_body($p["body"])
+  $art = '<h1>' .. esc($p["title"]) .. '</h1>'
+  if $p["status"] != "published" then
+    $art = $art .. ' <span class="tag draft">draft</span>'
+  end
+  if $p["visibility"] == "private" then
+    $art = $art .. ' <span class="tag">🔒 private</span>'
+  end
+  $art = $art .. '<article class="post">' .. $body_html .. '</article>'
+  return { title: "" .. $p["title"], html: $art, body_html: $body_html, slug: "" .. $p["slug"], status: "" .. $p["status"], visibility: "" .. $p["visibility"], format: "markdown" }
+end
+
+-- Nil-coalesce (lib-local; reader.mix's rd_or / forms.mix's fm_or load AFTER lib.mix, so the
+-- shared CMS layer keeps its own). Returns $def when $v is nil, else $v.
+function cms_or($v, $def)
+  if $v == nil then
+    return $def
+  end
+  return $v
+end
+
+-- The taxonomy footer for a post: category (one) + tags (many), each linking to its archive.
+-- "" when the post has neither. names esc()'d; slugs url_encode()'d. Shared by the public /post
+-- view and the editor preview through cms_read_spec (was an h_post.mix local before Step 2).
+function post_terms_footer($post_id)
+  $cats = post_terms($post_id, "category")
+  $tags = post_terms($post_id, "tag")
+  if length($cats) == 0 and length($tags) == 0 then
+    return ""
+  end
+  $foot = '<footer class="post-terms muted small">'
+  if length($cats) > 0 then
+    $c = $cats[0]
+    $foot = $foot .. '<span class="post-cat">in <a href="/category/' .. url_encode("" .. $c["slug"]) .. '">' .. esc($c["name"]) .. '</a></span>'
+  end
+  if length($tags) > 0 then
+    if length($cats) > 0 then
+      $foot = $foot .. ' · '
+    end
+    $foot = $foot .. '<span class="post-tags">tagged '
+    $first = true
+    for each $t in $tags
+      if not $first then
+        $foot = $foot .. ', '
+      end
+      $foot = $foot .. '<a href="/tag/' .. url_encode("" .. $t["slug"]) .. '">' .. esc($t["name"]) .. '</a>'
+      $first = false
+    end
+    $foot = $foot .. '</span>'
+  end
+  $foot = $foot .. '</footer>'
+  return $foot
+end
+
+-- Build the rd_view spec for a cms_posts row (post OR page) — the ONE source of truth for the
+-- read surface, so the public /post & /page views and the editor's live preview render through a
+-- single spec (preview === view by construction). Keys read from $row: kind, title, slug, status,
+-- visibility, id, created, author, and EITHER body (raw markdown) OR body_html (pre-rendered).
+-- $opts may carry { body_id, body_src, body_input } — passed straight to rd_view so the live
+-- listener can patch the body article in place. The Edit action is gated on author+ AND an
+-- existing slug (a brand-new unsaved entry has no slug to link to). Pages: no byline/footer
+-- (timeless standalone content), a Home back. Posts: a date·by-author byline (only when present),
+-- the taxonomy footer, an All-posts back. Caller renders it: rd_view(cms_read_spec($row,$user,$o)).
+function cms_read_spec($row, $user, $opts)
+  $kind = "post"
+  if ("" .. cms_or($row["kind"], "")) == "page" then
+    $kind = "page"
+  end
+  $slug = "" .. cms_or($row["slug"], "")
+  $status = "" .. cms_or($row["status"], "published")
+  $vis = "" .. cms_or($row["visibility"], "public")
+  $badges = []
+  if $status != "published" then
+    push($badges, { text: "draft", kind: "draft" })
+  end
+  if $vis == "private" then
+    push($badges, { text: "🔒 private", kind: "" })
+  end
+  $actions = []
+  if can_preview_unpublished($user) and $slug != "" then
+    push($actions, { "label": "Edit", icon: "pencil", variant: "ghost", href: "/admin/posts?edit=" .. url_encode($slug) })
+  end
+  -- body: a pre-rendered body_html wins (the page helper / a preview re-render); else render raw.
+  $body_html = $row["body_html"]
+  if $body_html == nil then
+    $body_html = render_body("" .. cms_or($row["body"], ""))
+  end
+  $spec = { title: "" .. cms_or($row["title"], ""), badges: $badges, body_html: "" .. $body_html, actions: $actions }
+  if $opts != nil then
+    if $opts["body_id"] != nil then
+      $spec["body_id"] = $opts["body_id"]
+    end
+    if $opts["body_src"] != nil then
+      $spec["body_src"] = $opts["body_src"]
+    end
+    if $opts["body_input"] != nil then
+      $spec["body_input"] = $opts["body_input"]
+    end
+  end
+  if $kind == "page" then
+    $spec["back"] = { "label": "Home", href: "/" }
+  else
+    $byline = blog_date("" .. cms_or($row["created"], ""))
+    $author = "" .. cms_or($row["author"], "")
+    if $author != "" then
+      $byline = $byline .. " · by " .. $author
+    end
+    -- Only show the byline row when there's something to show (a brand-new unsaved post in the
+    -- editor preview has neither a created date nor an author).
+    if $byline != "" then
+      $spec["meta"] = [ { "label": "", value: $byline } ]
+    end
+    if $row["id"] != nil then
+      $spec["footer_html"] = post_terms_footer($row["id"])
+    end
+    $spec["back"] = { "label": "All posts", href: "/" }
+  end
+  return $spec
+end
+
+-- Front-matter-lite parser for email-to-post (P2). Recognises leading `Tags:` and
+-- `Category:` lines (case-insensitive key) at the VERY TOP of the plain-text body and
+-- strips them (plus one trailing blank separator line) from the stored body. Stops at
+-- the first line that is neither blank nor a recognised `Key: value` — so a normal post
+-- with no front-matter is returned untouched. Returns a map:
+--   { body: <stripped body>, tags: [names…], category: <name or ""> }.
+-- Robust: only strips recognised leading keys; a `Tags:`/`Category:` deeper in the body
+-- is left in place. CRLF-tolerant (a trailing "\r" is trimmed off each line).
+function parse_front_matter($raw)
+  $lines = split("" .. $raw, "\n")
+  $n = length($lines)
+  $tags = []
+  $category = ""
+  -- Scan the leading run of `Tags:`/`Category:` lines.
+  $run = 0
+  $stop = false
+  while $run < $n and not $stop
+    $line = $lines[$run]
+    -- strip a trailing CR (CRLF bodies) for the match; the value is trimmed anyway.
+    if length($line) > 0 and substr($line, length($line) - 1, 1) == "\r" then
+      $line = substr($line, 0, length($line) - 1)
+    end
+    $t = trim($line)
+    $colon = pos(":", $t)
+    $key = ""
+    if $colon > 1 then
+      $key = lower(trim(substr($t, 0, $colon - 1)))
+    end
+    if $key == "tags" then
+      $tags = split_terms(substr($t, $colon, length($t) - $colon))
+      $run = $run + 1
+    else
+      if $key == "category" then
+        $cats = split_terms(substr($t, $colon, length($t) - $colon))
+        if length($cats) > 0 then
+          $category = $cats[0]
+        end
+        $run = $run + 1
+      else
+        $stop = true
+      end
+    end
+  end
+  -- A front-matter block counts ONLY when the leading key run is terminated by a
+  -- blank separator line (the convention). Without that separator, a body that
+  -- merely starts with "Tags: ..." is NOT metadata — return it untouched so real
+  -- content is never eaten.
+  $confirmed = false
+  if $run > 0 and $run < $n then
+    $sep = $lines[$run]
+    if length($sep) > 0 and substr($sep, length($sep) - 1, 1) == "\r" then
+      $sep = substr($sep, 0, length($sep) - 1)
+    end
+    if trim($sep) == "" then
+      $confirmed = true
+    end
+  end
+  if not $confirmed then
+    return { body: "" .. $raw, tags: [], category: "" }
+  end
+  -- body starts after the one blank separator line
+  $rest = []
+  $j = $run + 1
+  while $j < $n
+    push($rest, $lines[$j])
+    $j = $j + 1
+  end
+  return { body: join($rest, "\n"), tags: $tags, category: $category }
+end
+
+-- Import one emailed message if it is content-marked and not already imported.
+-- Import ONE message as a cms_posts row of the given $kind ("post" | "page"). The
+-- FOLDER is the signal: the message was filed into the top-level Posts/Pages folder,
+-- which is the operator's intent to publish — no custom keyword is required (maild's
+-- JMAP doesn't persist custom keywords like `content` reliably, so a keyword gate
+-- would silently import nothing). Deduped by jmap email id; fail-soft.
+function cms_import_one_post($e, $kind)
+  $k = "post"
+  if $kind == "page" then
+    $k = "page"
+  end
+  $eid = "" .. $e["id"]
+  $seen = db_query("SELECT 1 FROM content_imported WHERE email_id = ?1", [$eid])
+  if length($seen) > 0 then
+    return
+  end
+  $title = "" .. $e["subject"]
+  if trim($title) == "" then
+    $title = "Untitled"
+  end
+  $rawbody = cms_email_body_text($e)
+  -- Front-matter-lite: pull leading Tags:/Category: lines, store only the remaining body.
+  $fm = parse_front_matter($rawbody)
+  $body = $fm["body"]
+  $excerpt = substr($body, 0, 160)
+  $author = cms_author_for_from($e["from"])
+  $slug = cms_unique_slug(slugify($title))
+  -- Claim the email id first via the content_imported PK — this serialises concurrent
+  -- imports (a racing render's claim INSERT raises). A raised claim means it's already
+  -- imported/raced, so bail.
+  try
+    db_exec("INSERT INTO content_imported (email_id, slug) VALUES (?1, ?2)", [$eid, $slug])
+  catch $claimed
+    return
+  end
+  -- Create the post. body stays RAW markdown — render_body()/markdown() escapes at read,
+  -- exactly like an editor-authored post. If the INSERT fails, RELEASE the claim so a
+  -- later render retries — otherwise a failed insert would skip this email forever (the
+  -- claim would survive with no post).
+  $pid = 0
+  try
+    -- format is PINNED 'markdown' (explicitly, not via the column default): the email
+    -- path is untrusted write — it must never be able to mint a raw-HTML canvas page.
+    db_exec("INSERT INTO cms_posts (slug, title, body, excerpt, status, kind, visibility, cover, format, author_id) VALUES (?1, ?2, ?3, ?4, 'published', ?5, 'public', '', 'markdown', ?6)", [$slug, $title, $body, $excerpt, $k, $author])
+    $new = db_query("SELECT id FROM cms_posts WHERE slug = ?1", [$slug])
+    if length($new) > 0 then
+      $pid = $new[0]["id"]
+    end
+  catch $err
+    db_exec("DELETE FROM content_imported WHERE email_id = ?1", [$eid])
+    return
+  end
+  -- Taxonomy is best-effort: the (claimed) post already exists, so a term failure must
+  -- NOT release the claim — that would re-import a DUPLICATE on the next render. Swallow.
+  try
+    if $pid != 0 then
+      set_post_terms($pid, "tag", $fm["tags"])
+      if $fm["category"] != "" then
+        set_post_terms($pid, "category", [$fm["category"]])
+      end
+    end
+  catch $terr
+    -- term apply failed; the post stands and stays claimed — never duplicate on retry
+  end
+end
+
+-- Lazy import entry point: pull any new emailed posts into the CMS. Safe on every
+-- render (dedup makes it a near-no-op once caught up); no-op when there is no
+-- top-level Posts folder. Wrapped fail-soft so a jmap/db error never breaks /.
+-- Import every message in one mailbox id as cms_posts rows of $kind. Extracted so the
+-- Posts and Pages folders share the query/get/loop. No-op for a blank/missing id.
+function cms_import_from_mailbox($mbid, $kind)
+  if $mbid == nil or ("" .. $mbid) == "" then
+    return
+  end
+  $qr = jmap("Email/query", { filter: { inMailbox: $mbid } })
+  $ids = $qr["ids"]
+  if $ids == nil or length($ids) == 0 then
+    return
+  end
+  $gr = jmap("Email/get", { ids: $ids, properties: ["id", "from", "subject", "receivedAt", "textBody", "bodyValues"], fetchTextBodyValues: true })
+  $msgs = $gr["list"]
+  if $msgs == nil then
+    return
+  end
+  for each $e in $msgs
+    cms_import_one_post($e, $kind)
+  end
+end
+
+-- Lazy import entry point: pull any new emailed content into the CMS. The content
+-- account's top-level `Posts` folder → kind='post' (blog feed); the top-level
+-- `Pages` folder → kind='page' (standalone pages). Safe on every render (dedup makes
+-- it a near-no-op once caught up); no-op when neither folder exists. Fail-soft so a
+-- jmap/db error never breaks the page.
+function cms_import_emailed_posts()
+  try
+    db_exec("CREATE TABLE IF NOT EXISTS content_imported (email_id TEXT PRIMARY KEY, slug TEXT, imported_at TEXT NOT NULL DEFAULT (datetime('now')))", [])
+    -- Throttle: this runs on each /admin/posts render (admin-only since `/` became
+    -- public_cache'd, webd 0.9.11), so cap the JMAP round-trip to at most once per 15s
+    -- — the import is lazy/best-effort, not real-time. `content_import_at` is an
+    -- internal settings row (not surfaced or reset in /admin/settings). Stamp it BEFORE
+    -- the jmap calls so a burst of concurrent renders doesn't each fire the import.
+    $thr = db_query("SELECT (strftime('%s','now') - strftime('%s', value)) AS age FROM settings WHERE key = 'content_import_at'", [])
+    if length($thr) > 0 and $thr[0]["age"] != nil and to_number($thr[0]["age"]) < 15 then
+      return
+    end
+    db_exec("INSERT INTO settings (key, value) VALUES ('content_import_at', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = datetime('now')", [])
+    $mr = jmap("Mailbox/get", {})
+    $list = $mr["list"]
+    if $list == nil then
+      return
+    end
+    $posts_id = ""
+    $pages_id = ""
+    for each $m in $list
+      if $m["parentId"] == nil then
+        if ("" .. $m["name"]) == "Posts" then
+          $posts_id = "" .. $m["id"]
+        end
+        if ("" .. $m["name"]) == "Pages" then
+          $pages_id = "" .. $m["id"]
+        end
+      end
+    end
+    cms_import_from_mailbox($posts_id, "post")
+    cms_import_from_mailbox($pages_id, "page")
+  catch $err
+    -- best-effort import; never break the page over a jmap/db hiccup
+  end
+end
+
+-- ─────────────────────────── helpers ───────────────────────────
+function esc($s)
+  return html_escape("" .. $s)
+end
+
+-- XML text/attribute escape for the RSS feed. html_escape covers & < > " ' which
+-- is exactly what XML text nodes + double-quoted attributes need.
+function xml_esc($s)
+  return html_escape("" .. $s)
+end
+
+-- Canonical absolute site URL (no trailing slash). Operator override via the
+-- `site_url` setting; falls back to https://<vhost fqdn>. Feeds need absolute links.
+function site_url()
+  $u = "" .. setting("site_url", "")
+  if trim($u) != "" then
+    return $u
+  end
+  return "https://" .. $SITE["fqdn"]
+end
+
+-- Format a stored UTC `YYYY-MM-DD HH:MM:SS` timestamp as an RFC-822 date for RSS
+-- (`DD Mon YYYY HH:MM:SS GMT`). The optional weekday is omitted (valid per RFC-822);
+-- the stored value is already UTC (datetime('now')), so GMT is correct. "" on a
+-- malformed input (the caller then omits the element).
+function rfc822($dt)
+  $s = "" .. $dt
+  if length($s) < 19 then
+    return ""
+  end
+  $months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+  $mi = to_number(substr($s, 5, 2))
+  if $mi < 1 or $mi > 12 then
+    return ""
+  end
+  return substr($s, 8, 2) .. " " .. $months[$mi - 1] .. " " .. substr($s, 0, 4) .. " " .. substr($s, 11, 8) .. " GMT"
+end
+
+-- A media row's public URL: a disk row from its on-disk url_path (/img/…), a legacy
+-- inline row from /media/<id>. Only a site-relative url_path (leading "/") is honoured so
+-- a stored value can never smuggle a javascript:/data: scheme. Shared by the media gallery
+-- (h_admin_media) and the post-editor cover picker (h_admin_posts). Self-contained (no
+-- datatable dep) so any handler that includes lib.mix can resolve a media URL.
+function media_url($m)
+  $up = $m["url_path"]
+  if $up == nil then
+    $up = ""
+  end
+  $st = $m["storage"]
+  if $st == nil then
+    $st = ""
+  end
+  if ("" .. $st) == "disk" and starts_with("" .. $up, "/") then
+    return "" .. $up
+  end
+  return "/media/" .. ("" .. $m["id"])
+end
+
+function setting($k, $def)
+  $r = db_query("SELECT value FROM settings WHERE key = ?1", [$k])
+  if length($r) == 0 then
+    return $def
+  end
+  return $r[0]["value"]
+end
+
+-- ─────────────────────────── feature flags (two-tier) ───────────────────────────
+-- TWO-TIER SETTINGS MODEL (see _decisions/2026-06-20-settings-two-tier-model.md):
+--   Tier 1 (declarative, versioned): site.conf.mix $SITE — the shipped baseline.
+--   Tier 2 (runtime override, admin): cms.db `settings` — seeded from $SITE, edited
+--     at /admin/settings. setting(key, $SITE-default) resolves "db value if set,
+--     else the site.conf default" — db-wins. feature() is that contract for a flag.
+-- The five per-surface flags govern BOTH CMS and PIM surfaces:
+--   blog          → the blog feed (home /) + individual posts (/post/*) + the Posts
+--                   nav panels (cms_posts kind='post').
+--   notes         → standalone pages (/page/*) + the Pages nav entries (kind='page').
+--   pim_mail      → /pim/mail        (webmail)
+--   pim_contacts  → /pim/contacts    (address book)
+--   pim_calendar  → /pim/calendar    (events)
+-- A flag is stored as the settings row "feature_<key>" with value "1" (on) / "0"
+-- (off). A vhost whose $SITE has no `features` block defaults every surface ON, so
+-- the change is backward-compatible (existing vhosts keep all surfaces).
+function feature_keys()
+  return ["blog", "notes", "forum", "files", "vtokens", "pim_mail", "pim_contacts", "pim_calendar"]
+end
+
+-- The $SITE (declarative) default for one flag as a "1"/"0" string: "0" only when
+-- $SITE.features explicitly sets the key to false; otherwise "1" (on). This is the
+-- DEFAULT handed to setting(), so a db override always wins over it.
+function feature_default_str($key)
+  $feats = $SITE["features"]
+  -- A missing key indexes to nil (not false), so "0" fires ONLY on an explicit
+  -- `false` in $SITE.features; everything else (absent, true, no features block) → "1".
+  if $feats != nil and $feats[$key] == false then
+    return "0"
+  end
+  return "1"
+end
+
+-- feature(key) → bool. The db override ("feature_<key>" row) if present, else the
+-- $SITE declarative default. The single helper every handler + the nav consult so
+-- "where did this come from?" has one answer.
+function feature($key)
+  return ("" .. setting("feature_" .. $key, feature_default_str($key))) == "1"
+end
+
+-- Is this the billing vhost? Unlike the content features (opt-OUT, default on),
+-- billing is opt-IN: TRUE only when $SITE.features.billing is explicitly true, so
+-- the billing nav/portal never leaks onto any non-billing vhost.
+function is_billing_vhost()
+  $feats = $SITE["features"]
+  return $feats != nil and $feats["billing"] == true
+end
+
+-- Is the /ssh SSH-manager panel enabled on this vhost? Opt-IN (like billing):
+-- TRUE only when $SITE.features.sshm is explicitly true, so the panel never
+-- leaks onto another vhost. Gates NAV ONLY — route authorization is the
+-- independent require_sshm_operator gate (a nav flag must never be an authz seam).
+function is_sshm_vhost()
+  $feats = $SITE["features"]
+  return $feats != nil and $feats["sshm"] == true
+end
+
+-- Ensure each $SITE.admin_emails address maps to a CMS 'admin' role in this vhost's
+-- own users table. Declarative + versioned: "who is admin for this vhost" lives in
+-- site.conf.mix, idempotently re-applied on boot (no separate seed_admin.mix CLI
+-- run, no drift). Under the unified maild login the admin IS a maild account
+-- (pass_hash/salt are NOT NULL but UNUSED — maild authenticates), so we store random
+-- filler, never a usable cms.db password. Ensure-admin: insert a missing email as
+-- admin, promote an existing non-admin row; writes only on an actual change (no WAL
+-- churn on the steady-state). To DEMOTE a listed admin, edit site.conf.mix — a
+-- /admin/users demotion is re-applied on the next request by design.
+function seed_admins()
+  $emails = $SITE["admin_emails"]
+  if $emails == nil then
+    return
+  end
+  for each $em in $emails
+    -- Lowercase: maild presents $SESSION["email"] (→ current_user's username lookup)
+    -- as the canonical lowercase address, so seed the row lowercased too — otherwise
+    -- a mixed-case admin_emails typo would seed a row current_user() can't match and
+    -- the operator silently fails closed to role "user". Keep admin_emails lowercase.
+    $email = lower(trim("" .. $em))
+    if $email != "" then
+      $r = db_query("SELECT id, role FROM users WHERE username = ?1", [$email])
+      if length($r) == 0 then
+        -- stamp `updated` (the /admin/users default sort): seed_admins runs in cms_seed AFTER
+        -- the cms_init backfill, so without this a freshly-declared admin has a blank sort key
+        -- until the next request re-runs the backfill.
+        db_exec("INSERT INTO users (username, pass_hash, salt, role, display, updated) VALUES (?1, ?2, ?3, 'admin', ?4, datetime('now'))", [$email, random_password(16), random_password(24), $email])
+      else
+        if ("" .. $r[0]["role"]) != "admin" then
+          db_exec("UPDATE users SET role = 'admin' WHERE username = ?1", [$email])
+        end
+      end
+    end
+  end
+end
+
+function slugify($s)
+  $out = ""
+  $lower = lower("" .. $s)
+  $i = 0
+  $n = length($lower)
+  while $i < $n
+    $ch = substr($lower, $i, 1)
+    if ($ch >= "a" and $ch <= "z") or ($ch >= "0" and $ch <= "9") then
+      $out = $out .. $ch
+    else
+      if length($out) > 0 and substr($out, length($out) - 1, 1) != "-" then
+        $out = $out .. "-"
+      end
+    end
+    $i = $i + 1
+  end
+  if length($out) > 0 and substr($out, length($out) - 1, 1) == "-" then
+    $out = substr($out, 0, length($out) - 1)
+  end
+  if $out == "" then
+    $out = "post"
+  end
+  return $out
+end
+
+function new_salt()
+  return random_password(24)
+end
+
+function hash_pw($pw, $salt)
+  return hash_sha256($salt .. ":" .. ("" .. $pw))
+end
+
+function redirect($path)
+  return { status: 303, headers: { Location: $path }, body: "" }
+end
+
+-- Build the readyState-aware <script> that fires the shell toast (base.js Base.toast / the
+-- .toast pill, top-right) for a SERVER-rendered message. Self-contained (no forms.mix dep) so
+-- both doc()'s flash and forms.mix's fm_toast_trigger can share it. $type ∈ success / danger /
+-- warning (off-list → success). danger lingers 6s; success/warning 3s. The message is escaped
+-- for a single-quoted JS string AND every `<`→`\x3c` so it can't break out of the <script>
+-- (covers `</script>` + the `<!--<script` double-escape state); U+2028/9 → space. CSP allows
+-- this inline script ('unsafe-inline' in html_headers); the boost shim re-injects it on a swap.
+function toast_script($msg, $type)
+  $t = "success"
+  if $type == "danger" or $type == "warning" then
+    $t = "" .. $type
+  end
+  $dur = "3000"
+  if $t == "danger" then
+    $dur = "6000"
+  end
+  $m = "" .. $msg
+  $m = replace($m, "\\", "\\\\")
+  $m = replace($m, "'", "\\'")
+  $m = replace($m, "\n", " ")
+  $m = replace($m, "\r", " ")
+  $m = replace($m, "\u{2028}", " ")
+  $m = replace($m, "\u{2029}", " ")
+  $m = replace($m, "<", "\\x3c")
+  $js = "(function(){function f(){var b=window.Base;if(b&&b.toast){b.toast('" .. $m .. "','" .. $t .. "'," .. $dur .. ")}else if(window.showToast){showToast('" .. $m .. "','" .. $t .. "')}}if(document.readyState!='loading'){f()}else{document.addEventListener('DOMContentLoaded',f)}})();"
+  return '<script>' .. $js .. '</script>'
+end
+
+-- A 303 redirect that carries a ONE-SHOT flash message, shown as a toast on the landing GET
+-- (the Post/Redirect/Get success-feedback loop). The message rides a short-lived HttpOnly,
+-- SameSite=Lax cookie (server-read in doc(), then cleared) — so URLs stay clean and the toast
+-- fires exactly once. $type ∈ success (default) / danger / warning. Use it instead of redirect()
+-- after a mutating POST that should confirm itself ("Saved", "Deleted", …).
+function redirect_flash($path, $msg, $type)
+  $t = "success"
+  if $type == "danger" or $type == "warning" then
+    $t = "" .. $type
+  end
+  $m = "" .. $msg
+  if length($m) > 200 then
+    $m = substr($m, 0, 200)
+  end
+  $val = url_encode($t .. "|" .. $m)
+  $ck = "cosmix_flash=" .. $val .. "; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=45"
+  return { status: 303, headers: { Location: $path, "Set-Cookie": $ck }, body: "" }
+end
+
+-- Read the one-shot flash cookie (set by redirect_flash) → { html, clear } where html is the
+-- toast <script> to append to the page body and clear is the expiring Set-Cookie to send back
+-- (nil when there's no flash). Strict parse: url-decode, split type|msg on the FIRST "|",
+-- whitelist the type. Called by doc().
+function flash_consume()
+  $raw = cookie_get($HEADERS, "cosmix_flash")
+  if $raw == nil or ("" .. $raw) == "" then
+    return { html: "", clear: nil }
+  end
+  -- A PRESENT cookie is ALWAYS cleared this render, even if malformed/empty — so an
+  -- attacker-planted `cosmix_flash=…` can't survive every page load.
+  $clear = "cosmix_flash=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0"
+  $dec = url_decode("" .. $raw)
+  $bar = pos("|", $dec)
+  $ftype = "success"
+  $fmsg = $dec
+  if $bar > 0 then
+    $ftype = substr($dec, 0, $bar - 1)
+    $fmsg = substr($dec, $bar, length($dec) - $bar)
+  end
+  if $ftype != "success" and $ftype != "danger" and $ftype != "warning" then
+    $ftype = "success"
+  end
+  if trim("" .. $fmsg) == "" then
+    return { html: "", clear: $clear }
+  end
+  return { html: toast_script($fmsg, $ftype), clear: $clear }
+end
+
+-- Baseline security headers for every HTML document response. The CSP is tuned
+-- to exactly what the dcs.spa shell loads (shell.html): same-origin assets plus
+-- inline <script>/<style>/style="…" (so 'unsafe-inline' is required), Google
+-- Fonts (CSS from fonts.googleapis.com, webfonts from fonts.gstatic.com) and the
+-- unpkg lucide icon script. `frame-ancestors 'none'` blocks clickjacking of the
+-- admin UI, `nosniff` stops content-type guessing, `form-action 'self'` pins POST
+-- targets, `base-uri 'self'` blocks <base> hijack. Defence-in-depth on top of the
+-- existing html_escape()/markdown() output encoding — not a substitute for it.
+function html_headers()
+  $csp = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline' https://unpkg.com; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+  return { "Content-Type": "text/html; charset=utf-8", "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "strict-origin-when-cross-origin", "Content-Security-Policy": $csp }
+end
+
+-- is_datastar_request() — true when the boost shim (shell.html) fetched this
+-- view with a `Datastar-Request: true` header. Gated to GET: only boosted
+-- content-link/GET-form navigation sets it, and a POST render must always
+-- return the full shell (the shim never boosts POSTs). $HEADERS keys arrive
+-- lowercased from webd's collect_headers().
+function is_datastar_request()
+  if $METHOD != "GET" then
+    return false
+  end
+  if not has_key($HEADERS, "datastar-request") then
+    return false
+  end
+  return ("" .. $HEADERS["datastar-request"]) == "true"
+end
+
+-- Wrap page() in a full HTTP response carrying the security headers. $status lets
+-- the 200/404/403 paths all reuse the same envelope. Every handler returns this
+-- (or redirect()) so no HTML response leaves webd without the baseline headers.
+--
+-- DATASTAR boost branch (centralised here so handlers stay one-call and both
+-- vhosts can't drift): on a boosted GET we answer with a Datastar SSE stream
+-- that patches only `.cms-wrap` (the content column) + `<title>` instead of
+-- re-sending the whole shell — the chrome/sidebars/carousel persist on the
+-- client. $body is the SAME trusted handler HTML that fills {{CONTENT}} on a
+-- full render, so it is framed verbatim (ds_patch_elements does not escape; the
+-- handler already encoded it, exactly as for {{CONTENT}}); the title is esc()'d
+-- text. Anything that is NOT a boosted GET (no-JS, POST render, direct load)
+-- still gets the complete shell — the no-JS/full-SSR fallback is the default,
+-- the SSE path is the optimisation.
+function doc($status, $title, $user, $body)
+  -- one-shot success/error flash (redirect_flash → toast on the landing GET). Append the toast
+  -- <script> to the body (rides the shim's script re-injection on a boosted swap AND a full
+  -- load) and clear the cookie on this same response, on both render paths.
+  $flash = flash_consume()
+  $body = $body .. ("" .. $flash["html"])
+  -- The persistent settings-modal shell + shared modal shim, appended to $body so it rides
+  -- BOTH render paths: the full-page {{CONTENT}} AND the boosted `.cms-wrap` inner-patch below
+  -- (page() alone would put it only on full loads, so it would vanish after the first boost —
+  -- the trigger would then find no dialog and fall back to a full navigation). Inside .cms-wrap
+  -- (thus #content) so the `#content .forms-skin .fm-grid` rules apply; md_script is idempotent
+  -- (window.__mdInit) so re-injection on each boost is a no-op. Lets the "Settings" nav item —
+  -- CMS profile popup + Billing tree leaf — open as a popup from ANY page.
+  $body = $body .. md_shell("md-settings", { size: "lg" }) .. md_script()
+  if is_datastar_request() then
+    $site = setting("site_title", $SITE["title"])
+    $title_full = esc($title) .. " · " .. esc($site)
+    $events = [
+      ds_patch_elements($body, { selector: ".cms-wrap", mode: "inner" }),
+      ds_patch_elements($title_full, { selector: "title", mode: "inner" })
+    ]
+    $hdrs = { "Content-Type": "text/event-stream", "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store" }
+    if $flash["clear"] != nil then
+      $hdrs["Set-Cookie"] = $flash["clear"]
+    end
+    return { status: $status, headers: $hdrs, body: ds_sse($events) }
+  end
+  $hdrs = html_headers()
+  if $flash["clear"] != nil then
+    $hdrs["Set-Cookie"] = $flash["clear"]
+  end
+  return { status: $status, headers: $hdrs, body: page($title, $user, $body) }
+end
+
+-- The "surface not available" page for a route whose feature flag is off. The nav
+-- link is already hidden by feature(); a direct/stale hit still lands on the route,
+-- so it answers 404 ("not present on this vhost") with a small card rather than the
+-- real surface. $what is the human surface name (e.g. "Mail", "Pages"); the helper
+-- owns the page <title> ("Not available") so every call site is consistent.
+function feature_off_doc($user, $what)
+  $b = '<div class="card cms-card-narrow"><h1>Not available</h1><p class="muted">' .. esc($what) .. ' is not enabled on this site.</p><div style="margin-top:var(--space-5)"><a class="btn btn-ghost" href="/">← Home</a></div></div>'
+  return doc(404, "Not available", $user, $b)
+end
+
+-- Full CommonMark + GFM via the Mix `markdown()` builtin (pulldown-cmark):
+-- headings, lists, code, tables, blockquotes, links, etc. The builtin escapes
+-- raw HTML in the source and neutralises unsafe URL schemes, so author content
+-- renders safely. (Requires webd built with cosmix-lib-mix's `markdown` feature.)
+function render_body($raw)
+  return post_figures(markdown("" .. $raw))
+end
+
+-- Wrap a STANDALONE markdown image paragraph — markdown() emits `<p><img … /></p>` for an
+-- image on its own line — in a <figure>, surfacing the image's alt as a centred <figcaption>.
+-- Inline images (text alongside the img in the same <p>) are left untouched. Pure string
+-- scan (webd's embedded mix has no `regex` feature): walk each `<p><img …` paragraph, and
+-- only rewrap it when the paragraph is EXACTLY one self-closing <img> tag (pp_img_figure).
+-- Runs on markdown()'s already-sanitised output (raw HTML escaped, alt attribute-escaped):
+-- the rewrap adds no new author content, so it stays injection-safe — the alt is reused
+-- verbatim (already escaped) as figcaption text.
+function post_figures($html)
+  $out = ""
+  $rest = "" .. $html
+  while true
+    $i = pos("<p><img ", $rest)        -- 1-based; 0 = no more candidate paragraphs
+    if $i == 0 then
+      return $out .. $rest
+    end
+    $out = $out .. substr($rest, 0, $i - 1)              -- everything before the "<p>"
+    $afterp = substr($rest, $i - 1 + 3, length($rest))   -- after "<p>" → "<img …></p>…"
+    $k = pos("</p>", $afterp)
+    if $k == 0 then
+      -- malformed (no closing </p>): emit the "<p>" literally and keep scanning the tail.
+      return $out .. "<p>" .. $afterp
+    end
+    $inner = substr($afterp, 0, $k - 1)                  -- the paragraph's content
+    $fig = pp_img_figure($inner)
+    if $fig != "" then
+      $out = $out .. $fig
+    else
+      $out = $out .. "<p>" .. $inner .. "</p>"           -- not a lone image — leave as-is
+    end
+    $rest = substr($afterp, $k - 1 + 4, length($afterp)) -- after "</p>"
+  end
+end
+
+-- A paragraph body that is EXACTLY one self-closing <img …/> tag → its <figure> (with an alt
+-- <figcaption> when the alt is non-empty); "" if it's anything else (inline image + text, two
+-- images, etc.). The single-tag test = starts "<img ", ends "/>", and only one "<".
+function pp_img_figure($inner)
+  $t = trim("" .. $inner)
+  if not starts_with($t, "<img ") then
+    return ""
+  end
+  if not ends_with($t, "/>") then
+    return ""
+  end
+  if length(split($t, "<")) != 2 then
+    return ""
+  end
+  $alt = pp_attr($t, "alt")
+  if $alt != "" then
+    return "<figure class=\"post-figure\">" .. $t .. "<figcaption>" .. $alt .. "</figcaption></figure>"
+  end
+  return "<figure class=\"post-figure\">" .. $t .. "</figure>"
+end
+
+-- The value of a double-quoted attribute (`name="value"`) in $s, or "". The source is
+-- markdown()'s output, where attribute values are already entity-escaped (no literal ").
+function pp_attr($s, $name)
+  $key = $name .. "=\""
+  $p = pos($key, $s)
+  if $p == 0 then
+    return ""
+  end
+  $after = substr($s, $p - 1 + length($key), length($s))
+  $q = pos("\"", $after)
+  if $q == 0 then
+    return ""
+  end
+  return substr($after, 0, $q - 1)
+end
+
+function mdbold($s)
+  $segs = split($s, "**")
+  $out = ""
+  $bold = false
+  for each $seg in $segs
+    if $bold then
+      $out = $out .. "<strong>" .. $seg .. "</strong>"
+    else
+      $out = $out .. $seg
+    end
+    $bold = not $bold
+  end
+  return $out
+end
+
+-- ─────────────────────────── auth / sessions ───────────────────────────
+function cookie_get($headers, $name)
+  $raw = $headers["cookie"]
+  if $raw == nil then
+    $raw = $headers["Cookie"]
+  end
+  if $raw == nil then
+    return ""
+  end
+  $parts = split("" .. $raw, ";")
+  for each $p in $parts
+    $kv = trim($p)
+    $eq = pos("=", $kv)
+    if $eq > 0 then
+      $k = trim(substr($kv, 0, $eq - 1))
+      if $k == $name then
+        return trim(substr($kv, $eq, length($kv) - $eq))
+      end
+    end
+  end
+  return ""
+end
+
+-- UNIFIED LOGIN (app-level RBAC slice). Identity is the maild session: webd
+-- unseals the `cosmix_session` cookie and injects `$SESSION = {authenticated,
+-- email}` (the verified maild account — never the token). The per-vhost `users`
+-- table maps that email → a CMS role. An authenticated maild user with no
+-- `users` row is a plain "user" (signed in, PIM access, no CMS staff role).
+-- nil = not signed in. This is per-vhost by construction: each vhost has its own
+-- cms.db `users` + its own maild upstream, so every vhost gets its own identity +
+-- admin + users with the same code. (The old `sid`/cms.db-password login is
+-- retired; `/login` is the Mix-rendered maild login form, POSTing to webd's
+-- `/auth/login`.)
+function current_user($headers)
+  if not $SESSION["authenticated"] then
+    return nil
+  end
+  $email = "" .. $SESSION["email"]
+  if $email == "" then
+    return nil
+  end
+  -- A billing-portal (kind="customer") session is CAPPED at rank-1 "user" and
+  -- NEVER consults the users table — so it can't inherit an admin/author grant
+  -- if the customer's email collides with one. This is the Mix half of the
+  -- escalation guard; webd enforces the same cap on its native admin gates.
+  if ("" .. $SESSION["kind"]) == "customer" then
+    return { id: 0, username: $email, email: $email, role: "user",
+             kind: "customer", display: $email }
+  end
+  $r = db_query("SELECT id, username, role, display FROM users WHERE username = ?1", [$email])
+  if length($r) == 1 then
+    return $r[0]
+  end
+  return { id: 0, username: $email, email: $email, role: "user", display: $email }
+end
+
+-- CMS role ladder: anon(0) < user(1) < author(2) < admin(3).
+function role_rank($role)
+  $r = "" .. $role
+  if $r == "admin" then
+    return 3
+  end
+  if $r == "author" then
+    return 2
+  end
+  if $r == "user" then
+    return 1
+  end
+  return 0
+end
+
+-- True iff $user may PREVIEW unpublished/private CMS content (drafts, private notes): an
+-- author or admin (rank >= 2). Anon AND a plain "user"-role maild login may NOT — a draft
+-- must not leak to a signed-in-but-non-staff visitor (every maild login on the vhost is a
+-- "user" by default). The single gate for /post/, /page/, and the static-home page render.
+function can_preview_unpublished($user)
+  if $user == nil then
+    return false
+  end
+  return role_rank("" .. $user["role"]) >= 2
+end
+
+-- Gate a handler on a minimum role. Returns a response to RETURN when denied
+-- (login redirect if signed-out, 403 if under-privileged), or nil when allowed:
+--   $deny = require_role($user, "admin")
+--   if $deny != nil then return $deny end
+function require_role($user, $needed)
+  if $user == nil then
+    return redirect("/auth/login")
+  end
+  if role_rank($user["role"]) < role_rank($needed) then
+    return doc(403, "Forbidden", $user, '<div class="card"><h1>403</h1><p class="muted">You do not have permission for this area.</p></div>')
+  end
+  return nil
+end
+
+-- SSH-panel operator gate: admin rank AND membership in the $SITE.sshm_operators
+-- email allowlist (Tier-1 declarative, versioned in site.conf.mix — NOT the
+-- admin-editable settings table, so a vhost admin can't self-grant). Fails
+-- CLOSED when no operators are configured. The dev_session identity is
+-- excluded simply by not listing its email. Returns nil when allowed, else a
+-- 403 doc. $user["username"] is the session email in every current_user branch.
+function require_sshm_operator($user)
+  $deny = require_role($user, "admin")
+  if $deny != nil then return $deny end
+  $ops = $SITE["sshm_operators"]
+  if $ops == nil then
+    return doc(403, "Forbidden", $user, '<div class="card"><h1>403</h1><p class="muted">No SSH operators are configured for this site.</p></div>')
+  end
+  $em = lower(trim("" .. $user["username"]))
+  for each $op in $ops
+    if lower(trim("" .. $op)) == $em then return nil end
+  end
+  return doc(403, "Forbidden", $user, '<div class="card"><h1>403</h1><p class="muted">You are not an SSH operator on this site.</p></div>')
+end
+
+-- ─────────────────────────── layout (dcs.spa shell) ───────────────────────────
+-- The visual shell is the dcs.spa design system, read from a template file in
+-- the handler-root (web/app/shell.html — above the public docroot, so it is
+-- never web-served). page() substitutes the CMS bits into the template's
+-- placeholders. Theming (6 OKLCH schemes + light/dark) is owned entirely by
+-- dcs.spa's base.js/site.js + its Appearance sidebar — no CMS theme setting.
+
+-- Neutralise any "{{" in a substituted value so a user/DB string containing a
+-- literal placeholder (e.g. a post title "{{CONTENT}}") cannot collide with a
+-- later replace() pass. Applied to every value EXCEPT $bodyhtml, which is
+-- substituted last and may safely contain "{{".
+function tplsafe($s)
+  return replace("" .. $s, "{{", "&#123;&#123;")
+end
+
+-- A small lock marker for a private item (only ever rendered for a signed-in
+-- viewer, since private items aren't listed for the public). Lucide lock icon.
+function priv_dot($visibility)
+  if ("" .. $visibility) == "private" then
+    return '<span class="nav-lock"><i data-lucide="lock"></i></span>'
+  end
+  return ""
+end
+
+-- One nav <li> with a leading Lucide icon, a label, and an optional lock.
+function nav_link($href, $icon, $label, $visibility)
+  return '<li><a href="' .. $href .. '"><i data-lucide="' .. $icon .. '"></i><span class="nav-label">' .. esc($label) .. '</span>' .. priv_dot($visibility) .. '</a></li>'
+end
+
+-- The shared collapsible tree widget (tv_subtree / tv_tree / tv_leaf). Included HERE
+-- (not from a handler) because build_nav_pages below is its primary consumer; esc()
+-- and priv_dot() are already defined above, which is all treeview.mix needs at call
+-- time. `include` is load-once, so a handler that also pulls it in is a no-op.
+include "/opt/cosmix/vhosts/shared/widgets/treeview.mix"
+
+-- The shared modal widget (md_shell / md_script / md_panel …). Included HERE (not just
+-- from a handler) because the chrome's signed-OUT profile widget now opens a login
+-- modal — page() emits md_shell("login") + md_script() so the "Sign in" button works on
+-- every page (anon pages don't include modals.mix themselves). esc() is defined above;
+-- md_* calls resolve at call time. `include` is load-once → a handler that also pulls it
+-- in is a no-op.
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+
+-- Arbitrary-depth page tree for the nav, in two parts: build_page_children_map preloads
+-- every published page in ONE query into a parent_key→[rows] map ("0" = top-level), and
+-- treeview.mix's tv_subtree recurses over that map in memory. Each published page becomes a
+-- tree row (tv_leaf, or tv_branch + collapse wrapper when it has published children); the
+-- direct child-page count (length($map[id])) is its RHS badge. $vis is a fixed literal
+-- fragment (anon → public only). A visited set (threaded through the return, since Mix maps
+-- are by-value) stops a cycle in pre-existing data — no depth cap.
+-- Build a parent_key → [child page rows] map of ALL published pages in ONE query (top-level
+-- pages — parent_id NULL/0 — live under key "0"). $vis applies (anon sees only public). Feeds
+-- the recursive nav render below so the whole tree costs one query, not one-per-node (no N+1).
+function build_page_children_map($vis)
+  -- The static-front page (home_page_slug, when show_on_front=page) is excluded:
+  -- it IS the nav's Home leaf — listing it again under Pages would duplicate the
+  -- entry. Only while the page mode is ACTIVE (mode=posts → it's a normal page
+  -- again and belongs in the tree). "" excludes slug '' (matches nothing).
+  $hps = ""
+  if ("" .. setting("show_on_front", "posts")) == "page" then
+    $hps = trim("" .. setting("home_page_slug", ""))
+  end
+  $rows = db_query("SELECT id, slug, title, visibility, parent_id FROM cms_posts WHERE kind = 'page' AND status = 'published'" .. $vis .. " AND slug <> ?1 ORDER BY menu_order, title", [$hps])
+  $map = {}
+  for each $r in $rows
+    $pk = "0"
+    if $r["parent_id"] != nil and ("" .. $r["parent_id"]) != "" then
+      $pk = "" .. $r["parent_id"]
+    end
+    -- get → push → reassign: push($map[$pk], …) mutates a COPY (Mix indexes maps by value),
+    -- so the list must be pulled out, appended, and written back.
+    $lst = $map[$pk]
+    if $lst == nil then
+      $lst = []
+    end
+    push($lst, $r)
+    $map[$pk] = $lst
+  end
+  return $map
+end
+
+-- (The old render_page_subtree / render_cat_subtree pair — two near-identical
+-- recursive renderers — were unified into the shared, collapsible tv_subtree in
+-- treeview.mix. build_*_children_map below still preload the adjacency maps; the
+-- nav builders feed them to tv_subtree / tv_tree.)
+
+-- Arbitrary-depth CATEGORY tree for the nav (Part C) — the EXACT same two-part shape as the
+-- page tree above (build_page_children_map + tv_subtree), over the `terms` taxonomy
+-- 'category'. Categories have no public/private split, so there's no $vis fragment and the
+-- nav_link visibility arg is always "". Build a parent_key → [child term rows] map of ALL
+-- categories in ONE query (top-level — parent_id NULL/0 — live under key "0"). get → push →
+-- reassign (push($map[$k], …) mutates a COPY — Mix indexes maps by value), so the whole tree
+-- costs one query, not one-per-node.
+function build_cat_children_map()
+  -- Defensive: skip malformed terms with a NULL/blank slug or name (pre-existing junk rows
+  -- from earlier taxonomy experiments) — they'd render a broken /category/nil nav link.
+  $rows = db_query("SELECT id, slug, name, parent_id FROM terms WHERE taxonomy = 'category' AND slug IS NOT NULL AND slug != '' AND name IS NOT NULL AND name != '' ORDER BY name", [])
+  $map = {}
+  for each $r in $rows
+    $pk = "0"
+    if $r["parent_id"] != nil and ("" .. $r["parent_id"]) != "" and ("" .. $r["parent_id"]) != "0" then
+      $pk = "" .. $r["parent_id"]
+    end
+    $lst = $map[$pk]
+    if $lst == nil then
+      $lst = []
+    end
+    push($lst, $r)
+    $map[$pk] = $lst
+  end
+  return $map
+end
+
+-- Direct post count for ONE category term (term_relations rows pointing at it). NOT a
+-- descendant rollup — the /category/<slug> archive is direct, so the manager count matches.
+function cat_post_count($term_id)
+  $r = db_query("SELECT count(*) AS c FROM term_relations WHERE term_id = ?1", [$term_id])
+  if length($r) == 0 then
+    return 0
+  end
+  return $r[0]["c"]
+end
+
+-- term_id → published-post count for the WHOLE category set in ONE grouped query (no
+-- N+1 over nodes). $pvis must be the POST visibility fragment QUALIFIED to `p.`
+-- (anon → " AND p.visibility = 'public'") so the badge equals exactly what the
+-- /category/<slug> archive lists (h_archive: JOIN term_relations + kind='post' +
+-- status='published' + the same anon public-only filter). Keys are STRINGS ("" .. id)
+-- to match tv_subtree's $id lookup.
+function cat_post_count_map($pvis)
+  $rows = db_query("SELECT r.term_id AS term_id, count(*) AS c FROM term_relations r JOIN cms_posts p ON p.id = r.post_id WHERE p.kind = 'post' AND p.status = 'published'" .. $pvis .. " GROUP BY r.term_id", [])
+  $m = {}
+  for each $r in $rows
+    $m["" .. $r["term_id"]] = $r["c"]
+  end
+  return $m
+end
+
+-- Navigation panel (LHS panel 0): Home + standalone Pages, rendered as a collapsible
+-- tree (treeview.mix). Private pages are listed only for a signed-in user.
+function build_nav_pages($user)
+  $vis = ""        -- page visibility fragment (unqualified column)
+  $pvis = ""       -- post visibility fragment for the category count JOIN (p.-qualified)
+  if not can_preview_unpublished($user) then
+    $vis = " AND visibility = 'public'"
+    $pvis = " AND p.visibility = 'public'"
+  end
+  -- Home + the page tree share ONE <ul class="cms-nav-list tv-tree"> so they align and
+  -- Home is a leaf. PIM surfaces (Contacts/Calendar/Mail) live in the profile popup, not here.
+  $h = '<ul class="cms-nav-list tv-tree">'
+  $h = $h .. tv_leaf("/", "home", "Home", "", nil)
+  -- Forum (threaded discussion) — a top-level surface alongside Home, gated on `forum`.
+  if feature("forum") then
+    $h = $h .. tv_leaf("/forum", "messages-square", "Forum", "", nil)
+  end
+  -- Standalone pages (gated on `notes`): ONE query builds the parent→children map, then
+  -- tv_subtree recurses from the top level ("0"). The page badge is the direct child-page
+  -- count (count_map absent → child-count mode). $vis applies on every level; a visited set
+  -- guards cycles; no depth cap.
+  if feature("notes") then
+    $pmap = build_page_children_map($vis)
+    $pcfg = { "tree": "nav-pages", "icon": "file-text", "href_prefix": "/page/", "text_col": "title", "vis_col": "visibility" }
+    $ptree = tv_subtree($pmap, "0", $pcfg, {})
+    $h = $h .. $ptree["html"]
+  end
+  $h = $h .. '</ul>'
+  -- Billing nav (billing vhost only): admin sees the full ops set; a signed-in
+  -- customer (a user whose email matches a customers row) sees a reduced portal.
+  -- Its own LHS section so it reads as a distinct surface, WHMCS-style.
+  if is_billing_vhost() and $user != nil then
+    $h = $h .. build_nav_billing($user)
+  end
+  -- SSH manager (sshm vhost only; operators only — its own LHS section).
+  if is_sshm_vhost() and $user != nil then
+    $h = $h .. build_nav_sshm($user)
+  end
+  -- Categories block (gated on `blog`): the recursive category tree in its own section.
+  -- One adjacency query + one grouped post-count query (archive-matched). Rendered only when
+  -- at least one category exists, else the whole block (heading + list) is omitted.
+  if feature("blog") then
+    $cmap = build_cat_children_map()
+    $cnt = cat_post_count_map($pvis)
+    $ccfg = { "tree": "nav-cats", "icon": "tag", "href_prefix": "/category/", "text_col": "name", "count_map": $cnt }
+    $ctree = tv_tree($cmap, $ccfg)
+    if $ctree != "" then
+      -- No "Categories" heading — the category tree follows the pages directly (a
+      -- .cms-nav-section just for the top-margin separation).
+      $h = $h .. '<div class="cms-nav-section">' .. $ctree .. '</div>'
+    end
+  end
+  return $h
+end
+
+-- Posts panel (LHS panel 1 + the default RHS panel): published posts, newest
+-- first. Private posts only for a signed-in user.
+function build_nav_posts($user)
+  -- The Posts panels (LHS panel 1 + the RHS default panel) only carry content when
+  -- the `blog` surface is enabled; off → an empty-state list (the panel still exists
+  -- structurally in shell.html, it just shows nothing).
+  if not feature("blog") then
+    return '<ul class="cms-nav-list"><li class="cms-nav-empty">No posts</li></ul>'
+  end
+  $vis = ""
+  if not can_preview_unpublished($user) then
+    $vis = " AND visibility = 'public'"
+  end
+  $posts = db_query("SELECT slug, title, visibility FROM cms_posts WHERE kind = 'post' AND status = 'published'" .. $vis .. " ORDER BY id DESC LIMIT 25", [])
+  if length($posts) == 0 then
+    return '<ul class="cms-nav-list"><li class="cms-nav-empty">No posts yet</li></ul>'
+  end
+  $h = '<ul class="cms-nav-list">'
+  for each $p in $posts
+    $h = $h .. nav_link("/post/" .. esc($p["slug"]), "file-text", $p["title"], $p["visibility"])
+  end
+  $h = $h .. '</ul>'
+  return $h
+end
+
+-- Billing LHS nav section. Admin (rank>=3) gets the full ops set; a signed-in
+-- CUSTOMER (a user whose session email matches an open customers row) gets a
+-- reduced WHMCS-style portal set; anyone else on the billing vhost gets nothing.
+-- The customer lookup is guarded (the customers table may not exist on a "/"
+-- render that never ran biz_init) and keys on username (== the session email in
+-- both current_user() branches).
+function build_nav_billing($user)
+  if role_rank($user["role"]) >= 3 then
+    -- Billing is a collapsible treeview BRANCH (aligned + persistent open/closed
+    -- state, like the pages/categories trees) — not a bare heading. Its children
+    -- are the ops surfaces as tv_leaf rows (the icons align under Billing's).
+    $kids = tv_leaf("/biz", "layout-dashboard", "Dashboard", "", nil)
+    $kids = $kids .. tv_leaf("/biz/customers", "users", "Customers", "", nil)
+    $kids = $kids .. tv_leaf("/biz/services", "server", "Services", "", nil)
+    $kids = $kids .. tv_leaf("/biz/domains", "globe", "Domains", "", nil)
+    $kids = $kids .. tv_leaf("/biz/invoices", "receipt", "Invoices", "", nil)
+    $kids = $kids .. tv_leaf("/biz/sw", "badge-dollar-sign", "Synergy Wholesale", "", nil)
+    $kids = $kids .. tv_leaf("/biz/settings", "settings", "Settings", "", nil, 'data-modal-open="md-settings" data-modal-src="/biz/settings?modal=1"')
+    $h = '<div class="cms-nav-section"><ul class="cms-nav-list tv-tree">'
+    $h = $h .. tv_branch("biz", "root", "/biz", "building-2", "Billing", "", nil, $kids)
+    $h = $h .. '</ul></div>'
+    return $h
+  end
+  $cust = nil
+  try
+    $cr = db_query("SELECT id FROM customers WHERE email = ?1 AND status != 'closed' LIMIT 1",
+                   [$user["username"]])
+    if length($cr) > 0 then $cust = $cr[0] end
+  catch $e
+  end
+  if $cust == nil then return "" end
+  $kids = tv_leaf("/portal", "layout-dashboard", "Overview", "", nil)
+  $kids = $kids .. tv_leaf("/portal/services", "server", "My services", "", nil)
+  $kids = $kids .. tv_leaf("/portal/invoices", "receipt", "My invoices", "", nil)
+  $kids = $kids .. tv_leaf("/portal/profile", "user", "My profile", "", nil)
+  $h = '<div class="cms-nav-section"><ul class="cms-nav-list tv-tree">'
+  $h = $h .. tv_branch("portal", "root", "/portal", "user", "My account", "", nil, $kids)
+  $h = $h .. '</ul></div>'
+  return $h
+end
+
+-- SSH-manager LHS nav section (sshm vhost, operators only). Same collapsible
+-- treeview-branch shape as billing. Shows nothing to a non-operator admin (the
+-- route gate would 403 anyway; the nav just doesn't advertise it).
+function build_nav_sshm($user)
+  if role_rank($user["role"]) < 3 then return "" end
+  $ops = $SITE["sshm_operators"]
+  if $ops == nil then return "" end
+  $em = lower(trim("" .. $user["username"]))
+  $isop = false
+  for each $op in $ops
+    if lower(trim("" .. $op)) == $em then $isop = true end
+  end
+  if not $isop then return "" end
+  $kids = tv_leaf("/ssh/hosts", "server", "Hosts", "", nil)
+  $kids = $kids .. tv_leaf("/ssh/keys", "key-round", "Keys", "", nil)
+  $kids = $kids .. tv_leaf("/ssh/scans", "activity", "Scans", "", nil)
+  $h = '<div class="cms-nav-section"><ul class="cms-nav-list tv-tree">'
+  $h = $h .. tv_branch("sshm", "root", "/ssh/hosts", "terminal", "SSH", "", nil, $kids)
+  $h = $h .. '</ul></div>'
+  return $h
+end
+
+-- Strip HTML tags to plain text (webd Mix has NO regex). Used for the browser
+-- <title>: site_title may carry admin-authored markup for the header brand, but the
+-- tab title must be plain text. Removes every `<…>` span, keeps the rest.
+function strip_tags($s)
+  $out = ""
+  $in_tag = false
+  for each $ch in ("" .. $s)
+    if $ch == "<" then
+      $in_tag = true
+    else
+      if $ch == ">" then
+        $in_tag = false
+      else
+        if not $in_tag then $out = $out .. $ch end
+      end
+    end
+  end
+  return $out
+end
+
+-- page($title, $user, $bodyhtml) → full HTML document: the dcs.spa shell with the
+-- CMS content injected into #content. $bodyhtml is substituted LAST so post/admin
+-- content can never collide with a remaining {{...}} placeholder.
+function page($title, $user, $bodyhtml)
+  $site = setting("site_title", $SITE["title"])
+  $footer = setting("footer", "")
+  -- Tagline → the header brand's hover tooltip (the subtitle-as-tooltip pattern).
+  $tag = setting("tagline", $SITE["tagline"])
+  $brand_title = ""
+  if ("" .. $tag) != "" then
+    $brand_title = ' title="' .. esc("" .. $tag) .. '"'
+  end
+
+  -- Bottom-left profile widget — now driven by the unified maild login:
+  -- signed-out = a "Sign in" modal trigger (→ the Mix /login form, popup or full-page);
+  -- signed-in = avatar + name with a
+  -- popup. The CMS staff links (Dashboard/Posts/Media = author+, Users/Settings =
+  -- admin) appear only for the matching role; a plain signed-in maild user (role
+  -- "user") gets only Sign out. Sign out is a POST to webd's /auth/logout (CSRF
+  -- double-submit from the readable cosmix_csrf cookie) — only webd can clear the
+  -- sealed cookie.
+  -- Signed-out: a modal-trigger anchor — md_script (appended below) lazy-fetches the
+  -- /login form fragment into the persistent md_shell("login") dialog on click; the bare
+  -- href is the no-JS fallback (full-page /login). `next` = the current page so a
+  -- post-login redirect returns here. The empty dialog + shim live in the sidebar (this
+  -- {{PROFILE}} slot), OUTSIDE the .cms-wrap Datastar-swapped region, so an open modal
+  -- survives a boosted navigation.
+  $here = "" .. $PATH
+  -- On the billing vhost the primary anon visitor is a CUSTOMER, so "Sign in"
+  -- goes to the customer portal login (webd argon2 auth), not the maild modal.
+  -- Admin (Mark) signs in via /auth/login directly (the maild unified login).
+  if is_billing_vhost() then
+    $chref = "/portal/login"
+    if $here != "" and $here != "/" and starts_with($here, "/portal") == false then
+      $chref = $chref .. "?next=" .. url_encode($here)
+    end
+    $profile = '<a class="profile-btn" href="' .. $chref .. '"><i data-lucide="log-in"></i>Sign in</a>'
+  else
+    $src = "/login?modal=1"
+    $href = "/login"
+    if $here != "" and $here != "/" and $here != "/login" then
+      $src = $src .. "&next=" .. url_encode($here)
+      $href = $href .. "?next=" .. url_encode($here)
+    end
+    $profile = '<a class="profile-btn" data-modal-open="login" data-modal-src="' .. $src .. '" href="' .. $href .. '"><i data-lucide="log-in"></i>Sign in</a>'
+    $profile = $profile .. md_shell("login", { size: "sm" }) .. md_script()
+  end
+  if $user != nil then
+    $dn = "" .. $user["display"]
+    $ini = upper(substr($dn, 0, 1))
+    $rank = role_rank($user["role"])
+    -- The popup is emitted BEFORE the toggle button so it opens UPWARD: .profile is
+    -- bottom-pinned (margin-top:auto), so the button must be DOM-LAST to stay anchored at
+    -- the bottom when the block grows — a 2nd click then lands on the SAME button and
+    -- closes the menu (previously the button rode up as the block grew, leaving Sign out
+    -- under the cursor → an accidental logout). Sign out sits at the TOP of the popup
+    -- (farthest from the toggle); the links follow below it in MOST-USED-AT-THE-BOTTOM
+    -- order, so the last link (Mail) is closest to the toggle/click point. Admin staff
+    -- links + the PIM surfaces (moved out of the LHS nav) are unified here, each gated
+    -- individually so a hidden one just leaves the order intact.
+    $csrf = cookie_get($HEADERS, "cosmix_csrf")
+    $links = ""
+    if $rank >= 2 then
+      $links = $links .. '<a href="/admin"><i data-lucide="layout-dashboard"></i>Dashboard</a>'
+    end
+    if $rank >= 3 then
+      $links = $links .. '<a href="/admin/settings" data-modal-open="md-settings" data-modal-src="/admin/settings?modal=1"><i data-lucide="settings"></i>Settings</a>'
+      $links = $links .. '<a href="/admin/users"><i data-lucide="users"></i>Users</a>'
+    end
+    -- Content-management links (Media/Categories/Comments) are blog-surface tools —
+    -- gate on `blog` so a content-less vhost (e.g. the billing panel, blog:false)
+    -- isn't cluttered with them. Vtokens/Files stay admin-general.
+    if $rank >= 2 and feature("blog") then
+      $links = $links .. '<a href="/admin/media"><i data-lucide="image"></i>Media</a>'
+    end
+    if $rank >= 3 then
+      if feature("blog") then
+        $links = $links .. '<a href="/admin/categories"><i data-lucide="folder-tree"></i>Categories</a>'
+        $links = $links .. '<a href="/admin/comments"><i data-lucide="messages-square"></i>Comments</a>'
+      end
+      -- Vtokens + Files: admin-general but feature-gated so a vhost without the
+      -- route (vtokens:false / files:false in site.conf) shows no dead link.
+      if feature("vtokens") then
+        $links = $links .. '<a href="/admin/vtokens"><i data-lucide="key-round"></i>Vtokens</a>'
+      end
+      if feature("files") then
+        $links = $links .. '<a href="/files"><i data-lucide="folder-open"></i>Files</a>'
+      end
+    end
+    -- Forum MANAGEMENT (admin datatable of topics), not the public board — admin-only
+    -- to match /admin/forum's require_role(admin). The public board is the nav "Forum".
+    if $rank >= 3 and feature("forum") then
+      $links = $links .. '<a href="/admin/forum"><i data-lucide="message-square"></i>Forum</a>'
+    end
+    if feature("pim_calendar") then
+      $links = $links .. '<a href="/pim/calendar"><i data-lucide="calendar"></i>Calendar</a>'
+    end
+    if feature("pim_contacts") then
+      $links = $links .. '<a href="/pim/contacts"><i data-lucide="contact"></i>Contacts</a>'
+    end
+    if $rank >= 2 and feature("blog") then
+      $links = $links .. '<a href="/admin/posts"><i data-lucide="newspaper"></i>Posts</a>'
+    end
+    if feature("pim_mail") then
+      $links = $links .. '<a href="/pim/mail"><i data-lucide="mail"></i>Mail</a>'
+    end
+    $profile = '<div class="profile-pop">'
+    $profile = $profile .. '<form method="post" action="/auth/logout" class="profile-logout"><input type="hidden" name="csrf" value="' .. esc($csrf) .. '"><button type="submit"><i data-lucide="log-out"></i>Sign out</button></form>'
+    if $links != "" then
+      $profile = $profile .. '<div class="profile-sep"></div>' .. $links
+    end
+    $profile = $profile .. '</div>'
+    $profile = $profile .. '<button class="profile-btn" type="button"><span class="profile-av">' .. esc($ini) .. '</span><span class="profile-name">' .. esc($dn) .. '</span></button>'
+  end
+
+  $tpl = read_file("/opt/cosmix/vhosts/shared/lib/shell.html")
+  -- Browser tab title: PLAIN text (strip any markup from site_title).
+  $tpl = replace($tpl, "{{TITLE}}", tplsafe(esc($title) .. " · " .. esc(strip_tags($site))))
+  -- Header brand = the site_title SETTING rendered as TRUSTED markup (admin-authored;
+  -- e.g. 'Acme<span>CO</span> (dev)' — a <span> takes .topnav .brand span {color:var(--accent)}).
+  -- Editing Site title changes the header on every page of this vhost; the Tagline is its
+  -- hover tooltip. When site_title is NOT explicitly set, default to the shipped styled
+  -- brand_html (preserving it) then the plain title — so the current brand is never lost.
+  $brand_default = "" .. $SITE["title"]
+  if has_key($SITE, "brand_html") then
+    $brand_default = "" .. $SITE["brand_html"]
+  end
+  $tpl = replace($tpl, "{{BRAND}}", tplsafe("" .. setting("site_title", $brand_default)))
+  $tpl = replace($tpl, "{{BRAND_TITLE}}", tplsafe($brand_title))
+  $tpl = replace($tpl, "{{PROFILE}}", tplsafe($profile))
+  -- {{NAV_PAGES}} = Navigation panel (LHS 0). {{NAV_POSTS}} = Posts panel,
+  -- substituted in BOTH the LHS (panel 1) and the RHS (default panel 0) —
+  -- replace() is global so one value fills both occurrences.
+  -- The /notes corpus surface swaps the Navigation panel for its filesd-backed folder
+  -- tree (notes_nav_tree is defined in h_notes.mix, loaded ONLY for the /notes route —
+  -- the only route that both holds the bus:filesd.* capability and is a full page load,
+  -- not a Datastar boost). Every other route/vhost is byte-identical: the branch is not
+  -- taken, build_nav_pages runs exactly as before, and notes_nav_tree is never resolved.
+  $nav_pages = build_nav_pages($user)
+  if ("" .. $PATH) == "/notes" then
+    $nav_pages = notes_nav_tree($user)
+  end
+  -- The /files file manager does NOT swap the Navigation panel — it keeps the
+  -- normal Posts/Pages nav and INSTEAD ships a dedicated "Places" panel as a DCS
+  -- context-panel <template> that site.js syncContextPanels() mounts into the LHS
+  -- carousel (same shared mechanism as /pim/mail's Folders panel). So on /files the
+  -- LHS sidebar has 4 panes: Navigation, Posts, Tour, Places.
+  $tpl = replace($tpl, "{{NAV_PAGES}}", tplsafe($nav_pages))
+  $tpl = replace($tpl, "{{NAV_POSTS}}", tplsafe(build_nav_posts($user)))
+  $tpl = replace($tpl, "{{FOOTER}}", tplsafe(esc($footer)))
+  $tpl = replace($tpl, "{{CONTENT}}", $bodyhtml)
+  return $tpl
+end

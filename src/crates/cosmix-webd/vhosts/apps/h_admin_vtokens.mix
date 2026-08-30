@@ -1,0 +1,372 @@
+-- h_admin_vtokens.mix — OPAQUE vtoken management as a posts-standard datatable
+-- (GET/POST /admin/vtokens). Admin-only.
+--
+-- Manages email-to-X tokens via the DELEGATED bus_call seam. The routes grant the
+-- exact verbs bus:maild.vtoken.{list,lookup,mint,disable}_opaque (GET = list only;
+-- POST = the mutating set); webd's Rust admin/CSRF gate authorizes (rank>=3 admin;
+-- a plain-form POST relies on the SameSite session cookie); maild binds the actor
+-- (this admin's email) to the token's own domain and scopes the list to that domain.
+-- maild 0.4.0 dropped the segmented user_id/PIN model — an opaque token is a single
+-- sender-locked selector. The handler never sees a stored secret — ONLY a mint/rotate
+-- reply carries the freshly-minted plaintext address, shown ONCE.
+--
+-- The source is bus_call (NOT SQLite), so the list is a CUSTOM in-memory adapter
+-- (vt_fetch/vt_sorted/vt_slice/vt_adapter/vt_all_ids) mirroring h_notes.mix — dt_sql /
+-- dt_all_ids are SQLite-only. One list_opaque call holds the whole (small, domain-scoped)
+-- set; search filters in memory, then we own sort + pagination so the pager stays accurate.
+--
+--   GET  /admin/vtokens                 → datatable of this domain's opaque tokens
+--   GET  /admin/vtokens?new=1[&modal=1] → Mint form (modal fragment or full page)
+--   POST action=mint                    → mint a posts/local-auth token (secret shown ONCE inline)
+--   POST action=row:rotate:<hmac>       → mint a fresh token + disable the old (new address ONCE inline)
+--   POST action=row:disable:<hmac>      → revoke (303 PRG)
+--   POST action=bulk_disable            → revoke the selected / all-matching tokens (303 PRG)
+--
+-- SECRET-ONCE: mint_opaque AND rotate return a plaintext address that list/lookup never
+-- return again. A PRG redirect can't recarry it (the flash truncates at 200 chars), so
+-- mint + rotate RENDER the list inline (a normal 200 doc()) with a persistent secret card
+-- at the top. Disable + bulk-disable have no secret → a normal redirect_flash PRG.
+--
+-- IMPORTANT (webd-embedded mix): NO mix-0.20 syntax (?? / ?:) — use if/else + fm_or. A
+-- reserved word (`label`, `to`) MUST be a string map key ("label":). Concatenation is `..`.
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/admin_resource.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+
+-- Call one vtoken verb. bus_call RAISES on any failure (the gate denied it,
+-- maild replied rc>=10, or transport) — catch it and surface the message rather
+-- than 500 the page. Returns { ok, result } or { ok:false, err }.
+function vt_call($verb, $args)
+  try
+    $r = bus_call($verb, $args)
+    return { ok: true, result: $r }
+  catch $e
+    return { ok: false, err: ("" .. $e) }
+  end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- List adapter — fetch the whole domain via list_opaque, then filter/sort/paginate
+-- in memory (the dt_sql/dt_jmap contract: receive $state, return {rows, total}).
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Fetch + in-memory search for the current state. → { ok, rows, total, err }.
+-- One call: list_opaque returns the full domain-scoped set; we substring-filter it.
+function vt_fetch($state)
+  $res = vt_call("maild.vtoken.list_opaque", {})
+  if not $res["ok"] then
+    return { ok: false, rows: [], total: 0, err: $res["err"] }
+  end
+  $reply = $res["result"]
+  if $reply == nil then
+    return { ok: false, rows: [], total: 0, err: "empty list reply" }
+  end
+  $rows = $reply["tokens"]
+  if $rows == nil then
+    $rows = []
+  end
+  $q = "" .. fm_or($state["q"], "")
+  if $q != "" then
+    $needle = lower($q)
+    $filtered = []
+    for each $r in $rows
+      $hay = lower(("" .. fm_or($r["token_hmac"], "")) .. " " .. ("" .. fm_or($r["account"], "")) .. " " .. ("" .. fm_or($r["real_email"], "")) .. " " .. ("" .. fm_or($r["service"], "")))
+      if contains($hay, $needle) then
+        push($filtered, $r)
+      end
+    end
+    $rows = $filtered
+  end
+  return { ok: true, rows: $rows, total: length($rows), err: "" }
+end
+
+-- Sort key for a column ("" if missing). Every sortable vtoken column is a string,
+-- so a lexicographic `<`/`>` over the coerced value is correct.
+function vt_key($r, $col)
+  return "" .. fm_or($r[$col], "")
+end
+
+-- Stable selection sort by $col (version-proof: only length/index/push/`<`/`>`). A
+-- straight copy of h_notes.mix notes_sorted with a vt_ prefix (those live in h_notes,
+-- not in scope here).
+function vt_sorted($rows, $col, $asc)
+  $n = length($rows)
+  $used = {}
+  $out = []
+  $k = 0
+  while $k < $n
+    $best = -1
+    $i = 0
+    while $i < $n
+      if $used["" .. $i] == nil then
+        if $best == -1 then
+          $best = $i
+        else
+          $kb = vt_key($rows[$best], $col)
+          $ki = vt_key($rows[$i], $col)
+          $take = $ki < $kb
+          if not $asc then
+            $take = $ki > $kb
+          end
+          if $take then
+            $best = $i
+          end
+        end
+      end
+      $i = $i + 1
+    end
+    $used["" .. $best] = true
+    push($out, $rows[$best])
+    $k = $k + 1
+  end
+  return $out
+end
+
+-- Page slice [pos, pos+limit).
+function vt_slice($rows, $pos, $limit)
+  $out = []
+  $n = length($rows)
+  $end = $pos + $limit
+  if $end > $n then
+    $end = $n
+  end
+  $i = $pos
+  while $i < $end
+    push($out, $rows[$i])
+    $i = $i + 1
+  end
+  return $out
+end
+
+-- The {rows, total, err} adapter dt_render consumes.
+function vt_adapter($state)
+  $f = vt_fetch($state)
+  if not $f["ok"] then
+    return { rows: [], total: 0, err: $f["err"] }
+  end
+  $rows = $f["rows"]
+  $sc = "" .. fm_or($state["sort_col"], "")
+  if $sc != "" then
+    $rows = vt_sorted($rows, $sc, $state["asc"])
+  end
+  $page = vt_slice($rows, $state["pos"], $state["limit"])
+  return { rows: $page, total: $f["total"], err: "" }
+end
+
+-- The full id set matching the current filters, for a select-all-across-pages bulk
+-- disable (dt_all_ids is SQL-only; bus_call needs its own resolver). vt_fetch already
+-- loads the whole filtered set pre-pagination, so this just collects its token_hmacs.
+function vt_all_ids($state)
+  $f = vt_fetch($state)
+  $ids = []
+  if $f["ok"] then
+    for each $r in $f["rows"]
+      push($ids, "" .. $r["token_hmac"])
+    end
+  end
+  return $ids
+end
+
+-- The `active` JSON bool → a Filament badge (whitelisted variants success|gray). A
+-- named helper (NOT an inline if-expression) keeps this on the embedded-mix sync path.
+function vt_active_badge($active)
+  if $active == true then
+    return { "text": "active", "variant": "success" }
+  end
+  return { "text": "disabled", "variant": "gray" }
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- List config, built once (spec + opts) so the POST bulk handler re-runs the SAME
+-- spec/filters for select-all-across-pages.
+-- ─────────────────────────────────────────────────────────────────────────────
+function vt_list_config()
+  -- token_hmac lead col: a short <code> with the full value in the hover title (the
+  -- hmac is long; the render lambda emits HTML so the cell tooltip is set inline).
+  $hmac_cell = fn($r) = ('<code title="' .. esc("" .. $r["token_hmac"]) .. '">' .. esc(substr("" .. $r["token_hmac"], 0, 12)) .. '…</code>')
+  $active_badge = fn($r) = vt_active_badge($r["active"])
+
+  -- Row actions (auto-generated RMB menu via row_actions_contextmenu). Both MUTATING:
+  -- the menu posts action="row:<verb>:<id>" to base_route; dt_row_action parses it. No
+  -- delete verb — Disable IS the revoke (an opaque token is never hard-deleted here).
+  $act_rotate = dt_action("rotate", { "label": "Rotate", icon: "refresh-cw", variant: "action", action: "rotate", confirm: "Rotate this token? The current address stops working; a new one is shown once." })
+  $act_disable = dt_action("disable", { "label": "Disable", icon: "ban", variant: "action-danger", action: "disable", confirm: "Disable this token? This cannot be undone." })
+  $bulkid = fn($r) = ("" .. $r["token_hmac"])
+
+  $spec = [
+    dt_col("token_hmac", "Token", "token_hmac", { sortable: true, render: $hmac_cell }),
+    dt_col("account", "Account", "account", { sortable: true }),
+    dt_col("real_email", "Owner", "real_email", { toggleable: true }),
+    dt_col("service", "Service", "service", { sortable: true, toggleable: true }),
+    dt_col("verification_strength", "Strength", "verification_strength", { sortable: true, toggleable: true }),
+    dt_col("active", "Active", "active", { badge: $active_badge })
+  ]
+
+  $opts = dt_admin_opts({
+    base_route: "/admin/vtokens", caption: "vtokens", noun: "tokens",
+    subtitle: "Opaque email-to-post tokens in this domain.",
+    default_sort: "account", default_dir: "asc",
+    search_placeholder: "Search tokens…",
+    row_action_specs: [$act_rotate, $act_disable],
+    bulk_id: $bulkid,
+    -- tokens are never row-deleted (rotate/disable only) — the disable bar
+    -- replaces the default delete-only bulk action set.
+    bulk_actions: [ { "name": "disable", "label": "Disable selected", "class": "danger", "confirm": "Disable the selected tokens? This cannot be undone." } ],
+    header_actions: [ { "label": "Mint token", "href": "/admin/vtokens?new=1&modal=1", "icon": "plus", "variant": "primary" } ]
+  })
+  return { spec: $spec, opts: $opts }
+end
+
+-- The secret-once card: the freshly-minted plaintext address, shown ONLY on this one
+-- render (mint/rotate fall-through). "" when there is no secret to show.
+function vt_secret_card($address)
+  if $address == "" then
+    return ""
+  end
+  return '<div class="card"><strong>Secret address — copy now, shown once:</strong> <code>' .. esc("" .. $address) .. '</code></div>'
+end
+
+-- The Mint form — a modal fragment (X-Modal-Fetch) or a full page (no-JS / direct URL).
+-- The web form mints a posts/local-auth token (the common case); other services /
+-- strengths are available via the `vtoken` CLI.
+function vt_mint_form($user)
+  $m = md_is_modal_request()
+  $fields = fm_hidden("action", "mint")
+  $fields = $fields .. fm_text("account", "Content account", { required: true, autofocus: true, help: "An existing maild account in this vhost's domain (posts deliver here)." })
+  $fields = $fields .. fm_text("real_email", "Owner / sender-lock address", { required: true, help: "The token only fires for mail From this address." })
+  $spec = {
+    action: "/admin/vtokens", id: "vt-mint", title: "Mint email-to-post token",
+    fields: fm_grid({ cols: 1 }, $fields),
+    submit: { "label": "Mint token" }, cancel: { "label": "Cancel", href: "/admin/vtokens" }
+  }
+  if $m then
+    $spec["mode"] = "modal"
+    return md_fragment(fm_form($spec))
+  end
+  $spec["mode"] = "canvas"
+  $head = '<div class="cms-head"><h1>Mint email-to-post token</h1><a class="navlink" href="/admin/vtokens">← All tokens</a></div>'
+  return doc(200, "Mint token", $user, $head .. fm_form($spec))
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Entry point.
+-- ─────────────────────────────────────────────────────────────────────────────
+function admin_vtokens_main()
+  cms_init()
+  $user = current_user($HEADERS)
+  $deny = require_role($user, "admin")
+  if $deny != nil then
+    return $deny
+  end
+
+  -- The secret-once address (and an optional warning), set by a mint/rotate POST and
+  -- shown on the inline list render below (default "" → no card).
+  $secret = ""
+  $secret_note = ""
+
+  if $METHOD == "POST" then
+    $f = parse_form($BODY)
+    -- declarative row action (datatable.mix): action="row:<verb>:<id>". The id is the
+    -- token_hmac (bulk_id), treated as UNTRUSTED → passed as the bus arg value, never spliced.
+    $ra = dt_row_action($f)
+    if $ra != nil then
+      if $ra["verb"] == "disable" then
+        $res = vt_call("maild.vtoken.disable_opaque", { token_hmac: $ra["id"] })
+        if $res["ok"] then
+          return redirect_flash("/admin/vtokens", "Token disabled", "success")
+        end
+        return redirect_flash("/admin/vtokens", "Disable failed: " .. $res["err"], "danger")
+      end
+      if $ra["verb"] == "rotate" then
+        -- Opaque tokens don't rotate in place — look up the old binding, mint a fresh
+        -- token with the same fields, then disable the old. The NEW address is shown ONCE,
+        -- so render the list inline with the secret card (NOT a redirect).
+        $look = vt_call("maild.vtoken.lookup_opaque", { token_hmac: $ra["id"] })
+        if not $look["ok"] then
+          return redirect_flash("/admin/vtokens", "Rotate failed (lookup): " .. $look["err"], "danger")
+        end
+        $old = $look["result"]["token"]
+        $mint = vt_call("maild.vtoken.mint_opaque", { account: $old["account"], real_email: $old["real_email"], allowed_sender: $old["allowed_sender"], service: $old["service"], verification_strength: $old["verification_strength"] })
+        if not $mint["ok"] then
+          return redirect_flash("/admin/vtokens", "Rotate failed (mint): " .. $mint["err"], "danger")
+        end
+        $secret = "" .. fm_or($mint["result"]["address"], "")
+        $dis = vt_call("maild.vtoken.disable_opaque", { token_hmac: $ra["id"] })
+        if not $dis["ok"] then
+          $secret_note = "WARNING: the new address is live, but the OLD token could not be disabled (" .. $dis["err"] .. ") — disable it manually."
+        end
+        -- fall through to the inline list render with $secret shown
+      end
+    else
+      -- Multi-select bulk disable (the datatable's bulk bar posts action=bulk_disable).
+      if dt_bulk_action($f) == "disable" then
+        $ids = dt_selected_ids($f)
+        if dt_wants_all($f) then
+          -- select-all-across-pages: re-resolve the FULL matching id set server-side over
+          -- the POSTed q+filters — NEVER trust the posted sel_* ids.
+          $cfg = vt_list_config()
+          $ids = vt_all_ids(dt_state_from_map($f, $cfg["spec"], $cfg["opts"]))
+        end
+        $fail = 0
+        for each $hmac in $ids
+          $d = vt_call("maild.vtoken.disable_opaque", { token_hmac: $hmac })
+          if not $d["ok"] then
+            $fail = $fail + 1
+          end
+        end
+        if $fail > 0 then
+          return redirect_flash("/admin/vtokens", ("" .. $fail) .. " token(s) could not be disabled — check and retry", "danger")
+        end
+        return redirect_flash("/admin/vtokens", "Selected tokens disabled", "success")
+      end
+      -- Mint (the modal/full-page form). Mints a posts/local-auth token; the secret
+      -- address is shown ONCE, so render the list inline (NOT a redirect) on success.
+      if ("" .. fm_or($f["action"], "")) == "mint" then
+        $mint = vt_call("maild.vtoken.mint_opaque", { account: $f["account"], real_email: $f["real_email"], service: "posts", verification_strength: "local-auth" })
+        if $mint["ok"] then
+          $secret = "" .. fm_or($mint["result"]["address"], "")
+        else
+          return redirect_flash("/admin/vtokens", "Mint failed: " .. $mint["err"], "danger")
+        end
+        -- fall through to the inline list render with $secret shown
+      end
+    end
+  end
+
+  $q = parse_query($QUERY)
+
+  -- Mint form (modal fragment or full page).
+  if $q["new"] != nil then
+    return vt_mint_form($user)
+  end
+
+  -- LIST (default) — three-branch datatable dispatch over the custom bus_call adapter.
+  $cfg = vt_list_config()
+  $spec = $cfg["spec"]
+  $opts = $cfg["opts"]
+  $state = dt_state($QUERY, $spec, $opts)
+  $ares = vt_adapter($state)
+
+  -- A notice that rides EVERY render path: the secret-once card (mint/rotate
+  -- fall-through), an optional rotate warning, and a corpus-load error. It lives INSIDE
+  -- the region so a later sort/page/search swap refreshes and clears it.
+  $notice = vt_secret_card($secret)
+  if $secret_note != "" then
+    $notice = $notice .. '<div class="card"><strong>' .. esc($secret_note) .. '</strong></div>'
+  end
+  if $ares["err"] != "" then
+    $notice = $notice .. '<div class="card"><strong>Could not load tokens:</strong> ' .. esc($ares["err"]) .. '</div>'
+  end
+
+  if dt_wants_results() then
+    return dt_results_partial($notice .. dt_results_inner($spec, $opts, $state, $ares["rows"], $ares["total"], nil), "")
+  end
+  $dt = dt_render($spec, $opts, $state, $ares["rows"], $ares["total"], nil)
+  if dt_wants_partial() then
+    return dt_partial($notice .. $dt)
+  end
+  -- The RMB menu template + shim ride the FULL-page render only (the partial returns
+  -- above leave them untouched; the per-row data-cm-* bindings re-emit on every swap).
+  return doc(200, "vtokens", $user, dt_region($notice .. $dt, "", true) .. dt_actions_chrome($opts))
+end

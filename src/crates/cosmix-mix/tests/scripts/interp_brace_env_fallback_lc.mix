@@ -1,0 +1,17 @@
+-- interp_brace_env_fallback_lc.mix — Phase A contract: env-fallback
+-- fires for ALL heads, not only the uppercase env-var-shaped class.
+-- Codex round 3 raised this as an executable-contract requirement so
+-- the "all heads" rule isn't only audit-policy.
+--
+-- This script is driven out-of-process by
+-- crates/cosmix-mix/tests/env_fallback_lc.rs, which spawns the `mix`
+-- binary with `mix_interp_lowercase_probe=lowercase_ok` set on the
+-- child's env. The subprocess shape is mandatory: setting the env var
+-- in-process from a tokio integration test would race with concurrent
+-- `getenv` from other tests (tilde expansion, `env()` builtin, ...)
+-- under Rust 2024's parallel test runner.
+--
+-- Expected output (compared by env_fallback_lc.rs after trimming):
+-- lowercase env-fallback: true
+
+print "lowercase env-fallback: " .. ("${mix_interp_lowercase_probe}" == "lowercase_ok")

@@ -1,0 +1,157 @@
+-- admin_users.mix — user CRUD (GET/POST /admin/users). Admin-only. A resource/1
+-- panel: users_resource() declares list/form/policy and resource_engine.mix
+-- interprets it (list, md-edit modal + canvas editor, save with derived
+-- salt/pass_hash, guarded atomic deletes — never self, never the last admin).
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/admin_resource.mix"
+include "/opt/cosmix/vhosts/shared/lib/resource_engine.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+
+-- Map a user role to a Filament badge variant: admin → amber (primary), else gray.
+function user_role_variant($r)
+  if ("" .. $r) == "admin" then
+    return "primary"
+  end
+  return "gray"
+end
+
+-- The editor/save/delete surfaces are DECLARED in users_resource() and
+-- interpreted by resource_engine.mix (resource/1). Password is a NON-PERSISTENT
+-- input: only the declared derived columns (salt/pass_hash, produced by the
+-- save_transform below) ever persist a secret; blank password on edit = keep.
+
+-- domain validation: create needs a unique username + a password.
+function uu_validate($vals, $f, $editid)
+  if $editid == nil then
+    $dupe = db_query("SELECT id FROM users WHERE username = ?1", [$vals["username"]])
+    if length($dupe) > 0 then
+      return "That username already exists."
+    end
+    if $vals["password"] == nil then
+      return "A password is required for a new user."
+    end
+  end
+  return ""
+end
+
+-- password (when supplied) → fresh salt + hash, as DECLARED derived columns.
+function uu_save_transform($vals, $ctx)
+  if $vals["password"] == nil then
+    return { }
+  end
+  $salt = new_salt()
+  return { derived: { salt: $salt, pass_hash: hash_pw($vals["password"], $salt) } }
+end
+
+function users_resource($user)
+  $cfg = uu_list_config()
+  return {
+    entity: "users", noun: "user", base_route: "/admin/users",
+    list: { title: "Users", spec: $cfg["spec"], opts: $cfg["opts"],
+            select: "id, username, role, display, created, updated" },
+    form: {
+      cols: 2,
+      fields: [
+        { name: "username", kind: "text", "label": "Username", required: true, create_only: true,
+          help: "Sign-in identity (cannot be changed).", help_tip: true },
+        { name: "display", kind: "text", "label": "Display name" },
+        { name: "role", kind: "select", "label": "Role", default: "author", blank_default: "author", options: [
+          { value: "author", "label": "author" }, { value: "admin", "label": "admin" } ] },
+        { name: "password", kind: "password", "label": "Password",
+          help: "required for a new user; blank = keep current", help_tip: true }
+      ],
+      derived: ["salt", "pass_hash"],
+      stamps: { updated: "updated" },
+      validate: fn($vals, $f, $editid) = uu_validate($vals, $f, $editid),
+      save_transform: fn($vals, $ctx) = uu_save_transform($vals, $ctx),
+      saved_flash: "User saved"
+    },
+    policy: {
+      guard: fn($id) = uu_del_block($id, $user["id"]),
+      fetch: fn($id) = uu_get_one($id),
+      missing: "No such user.",
+      audit: false
+    }
+  }
+end
+
+-- Load one user by id → the row map, or nil. Columns match uu_fields' name= keys.
+function uu_get_one($id)
+  $r = db_query("SELECT id, username, display, role FROM users WHERE id = ?1", [$id])
+  if length($r) == 1 then
+    return $r[0]
+  end
+  return nil
+end
+
+-- Delete-guard: returns "" when $did may be deleted, else the reason. Never delete your own
+-- account, never the last admin. $self = the acting user's id.
+function uu_del_block($did, $self)
+  if ("" .. $did) == ("" .. $self) then
+    return "You can't delete your own account."
+  end
+  $target = db_query("SELECT role FROM users WHERE id = ?1", [$did])
+  if length($target) == 1 and ("" .. $target[0]["role"]) == "admin" then
+    $admins = db_query("SELECT count(*) AS c FROM users WHERE role = 'admin'", [])
+    if $admins[0]["c"] <= 1 then
+      return "Can't delete the last admin."
+    end
+  end
+  return ""
+end
+
+function admin_users_main()
+cms_init()
+$user = current_user($HEADERS)
+-- A modal fetch on an expired session must return a clean fragment, not a login redirect
+-- injected into the dialog (mirrors h_admin_posts).
+if md_is_modal_request() and $user == nil then
+  return md_session_expired("/admin/users")
+end
+$deny = require_role($user, "admin")
+if $deny != nil then
+  return $deny
+end
+
+return resource_main(users_resource($user), $user)
+
+end
+
+
+-- The list datatable config (spec + opts), built ONCE so the bulk select-all-across-pages
+-- path re-derives the SAME spec/filters server-side (mirrors h_admin_posts.posts_list_config).
+-- All lambdas are REAL (closed over esc only) — never nil: dt_opts rejects a nil bulk_id and
+-- dt_specs_have_mutation indexes the row-action specs, so a nil would crash; dt_where/dt_all_ids
+-- (the bulk re-derive) never invoke these lambdas, so passing real ones is free.
+function uu_list_config()
+  $user_cell = fn($u) = '<strong>' .. esc($u["display"]) .. '</strong><br><span class="dt-desc">@' .. esc($u["username"]) .. '</span>'
+  $role_badge = fn($u) = { "text": $u["role"], "variant": user_role_variant($u["role"]) }
+  $act_edit = dt_action("edit", { "label": "Edit", icon: "pencil", variant: "action", modal: "md-edit", href: fn($u) = "/admin/users?edit=" .. url_encode("" .. $u["id"]) .. "&modal=1" })
+  $act_del = dt_action("delete", { "label": "Delete", icon: "trash", variant: "action-danger", action: "delete", confirm: "Delete this user? This cannot be undone." })
+  $rowhref = fn($u) = "/admin/users?edit=" .. url_encode("" .. $u["id"])
+  $bulkid = fn($u) = "" .. $u["id"]
+  $spec = [
+    dt_col("user", "User", "display", { sortable: true, searchable: true, render: $user_cell }),
+    dt_col("username", "", "username", { searchable: true, hidden: true }),
+    dt_col("role", "Role", "role", { sortable: true, badge: $role_badge }),
+    dt_col("created", "Created", "created", { sortable: true, type: "datetime", default_hidden: true }),
+    dt_col("updated", "Updated", "updated", { sortable: true, type: "datetime", default_hidden: true }),
+    dt_col("id", "", "id", { sortable: true, hidden: true })
+  ]
+  -- RAW dt_admin_opts overrides — the engine (rs_list_opts) applies the preset.
+  $opts = {
+    base_route: "/admin/users", caption: "Users", noun: "users",
+    default_sort: "updated", default_dir: "desc",
+    search_placeholder: "Search users…",
+    row_href: $rowhref, row_action_specs: [$act_edit, $act_del],
+    bulk_id: $bulkid,
+    filters: [ dt_filter("role", "Role", { options: [
+      { value: "admin", "label": "Admin", col: "role", op: "=" },
+      { value: "author", "label": "Author", col: "role", op: "=" }
+    ] }) ],
+    groups: [ dt_group("role", "Role", "role", {}) ],
+    header_actions: [{ "label": "New user", icon: "plus", variant: "primary", modal: "md-edit", modal_src: "/admin/users?new=1&modal=1" }]
+  }
+  return { spec: $spec, opts: $opts }
+end

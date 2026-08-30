@@ -1,0 +1,68 @@
+-- interp_brace_env_fallback.mix — Phase A contract: ${X} falls back to
+-- process env after scope miss, and ERRORS when neither scope nor env
+-- have it (unless a `?? default` is given). Covers the uppercase
+-- env-var-shaped case in-process via `cargo test -p cosmix-lib-mix`.
+--
+-- The lowercase-head half of the contract ("all heads, not just
+-- uppercase") is pinned out-of-process by
+-- crates/cosmix-mix/tests/env_fallback_lc.rs, which subprocesses the
+-- mix binary with a probe env var set on the child. The subprocess
+-- shape is mandatory there: in-process `set_var` from a tokio test
+-- would race with concurrent `getenv` from sibling tests under Rust
+-- 2024's parallel runner.
+--
+-- NOTE: label text deliberately avoids the literal substring `${VAR}`
+-- because this script's own prints would interpolate it. Use prose
+-- labels ("brace PATH env-fallback") instead of literal syntax in
+-- expected-output lines and print() arguments alike.
+--
+-- Expected output:
+-- brace PATH env-fallback: true
+-- brace HOME env-fallback: true
+-- scope beats env: true
+-- missing both errors: true
+-- missing default fallback: true
+-- heredoc HOME env-fallback: true
+-- dotted env nonmap: true
+
+-- 1. ${PATH} unbound in scope, set in env → env-fallback fires.
+$exp_path = env("PATH")
+print "brace PATH env-fallback: " .. ("${PATH}" == $exp_path)
+
+-- 2. ${HOME} likewise.
+$exp_home = env("HOME")
+print "brace HOME env-fallback: " .. ("${HOME}" == $exp_home)
+
+-- 3. Scope wins over env when both present. Bind $PATH in scope;
+-- ${PATH} must return the scope value, not env("PATH").
+$PATH = "from_scope_override"
+print "scope beats env: " .. ("${PATH}" == "from_scope_override")
+
+-- 4. Neither scope nor env → HARD ERROR now (matches a bare `$X` read;
+-- louder than the old literal "nil" sentinel). A `?? default` opts back
+-- into a fallback value instead of erroring.
+$missing_errs = false
+try
+    $probe = "${MIX_INTERP_NOT_SET_PROBE_XYZ}"
+catch $e
+    $missing_errs = true
+end
+print "missing both errors: " .. $missing_errs
+print "missing default fallback: " .. ("${MIX_INTERP_NOT_SET_PROBE_XYZ ?? "sentinel"}" == "sentinel")
+
+-- 5. Heredoc interpolation walks the same evaluator code path as
+-- double-strings, so env-fallback fires identically. Use ${HOME}
+-- (never scope-bound in this script) to ensure the env path is what's
+-- being exercised — proves the heredoc producer chain
+-- (lexer.rs:675 → parser.rs:1242 → shared Expr::InterpolatedString
+-- consumers) routes through the same evaluator arms changed by
+-- Phase A.
+$herd = <<EOF
+${HOME}
+EOF
+print "heredoc HOME env-fallback: " .. (strip($herd) == $exp_home)
+
+-- 6. Dotted access on an env-fallback string: env returns a String,
+-- dot-access on non-Map yields nil (matches "non-map intermediate →
+-- nil" rule at evaluator.rs:3202-3211).
+print "dotted env nonmap: " .. ("${HOME.foo}" == "nil")

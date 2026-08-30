@@ -1,0 +1,32 @@
+-- tables.mix: test maps/stems
+-- Expected output:
+-- localhost
+-- 8080
+-- localhost
+-- 3
+-- name age city
+-- true
+-- false
+
+-- dot access (stem style)
+$config.host = "localhost"
+$config.port = 8080
+$config.debug = true
+
+print $config.host
+print $config.port
+
+-- bracket access with dynamic key
+$key = "host"
+print $config[$key]
+
+-- map literal
+$person = { name: "Alex", age: 42, city: "Test City" }
+print len($person)
+
+-- keys
+print join(keys($person), " ")
+
+-- has_key
+print has_key($person, "name")
+print has_key($person, "email")

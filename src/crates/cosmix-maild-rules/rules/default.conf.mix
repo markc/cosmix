@@ -1,0 +1,67 @@
+-- cosmix-maild-rules default rule pack — v1.0.
+--
+-- Spec: `_doc/2026-04-30-cosmix-maild-rules-spec.md`. Curated for the
+-- rules stage standalone gate ("no false-HardJunk on curated ham").
+-- All weights are small positive integers; the `EngineConfig` defaults
+-- (threshold=5.0, hard_junk_threshold=15.0) are calibrated against
+-- this pack's worst-case multi-match score.
+--
+-- Operator overrides should live in `/etc/cosmix/maild-rules.conf.mix`,
+-- not here — this file is the v1 baseline shipped with the crate.
+--
+-- Strict-data `.conf.mix` (parse_data): map entries inside `{ }` use
+-- `,` separators (newlines suppressed there); a literal `$` in a regex
+-- is written `\$`, and a literal backslash `\\`.
+
+pack_version: "v1.0"
+
+rule: [
+  -- ---- Header presence / absence ----
+  { id: "missing_message_id", description: "No Message-ID header", weight: 2,
+    match: { kind: "header_absent", name: "Message-ID" } },
+  { id: "missing_date", description: "No Date header", weight: 1,
+    match: { kind: "header_absent", name: "Date" } },
+  { id: "missing_subject", description: "No Subject header", weight: 1,
+    match: { kind: "header_absent", name: "Subject" } },
+
+  -- ---- Header pattern matches ----
+  { id: "all_uppercase_subject", description: "Subject is ALL CAPS, ≥15 chars", weight: 2,
+    match: { kind: "header_regex", name: "Subject", regex: "^[A-Z\\s\\d!?.,]{15,}\$" } },
+  { id: "subject_excessive_punctuation", description: "Subject contains 4+ consecutive ! or ?", weight: 2,
+    match: { kind: "header_regex", name: "Subject", regex: "[!?]{4,}" } },
+  { id: "x_priority_high", description: "X-Priority claims high", weight: 1,
+    match: { kind: "header_regex", name: "X-Priority", regex: "^[12]" } },
+
+  -- ---- Body content rules ----
+  { id: "phishing_password_reset", description: "Password-reset phishing language in HTML body", weight: 4,
+    match: { kind: "body_regex", regex: "(?i)verify your password|reset your account|account suspended", view: "html" } },
+  { id: "crypto_solicitation", description: "Cryptocurrency solicitation language", weight: 3,
+    match: { kind: "body_regex", regex: "(?i)(bitcoin|btc|usdt|eth) (wallet|address|transfer)", view: "combined" } },
+  { id: "contains_unsubscribe_evader", description: "Body urges recipient to remove themselves manually", weight: 2,
+    match: { kind: "body_substring", substring: "remove yourself from this list", view: "combined" } },
+
+  -- ---- URL / attachment / recipient counts ----
+  { id: "url_count_high", description: "More than 20 URLs in body", weight: 3,
+    match: { kind: "url_count", gt: 20 } },
+  { id: "url_count_extreme", description: "More than 100 URLs in body", weight: 4,
+    match: { kind: "url_count", gt: 100 } },
+  { id: "executable_attachment_present", description: "Message carries a .exe / .scr / .vbs / etc.", weight: 5,
+    match: { kind: "attachment_count", gt: 0, executable_only: true } },
+  { id: "many_recipients", description: "Envelope-to count exceeds 25", weight: 2,
+    match: { kind: "recipient_count", gt: 25 } },
+
+  -- ---- Structure ----
+  { id: "html_only_no_text", description: "HTML body without plain-text alternative", weight: 1,
+    match: { kind: "structure", html_only: true } },
+  { id: "executable_attachment_structure", description: "Has executable attachment (structural)", weight: 4,
+    match: { kind: "structure", has_executable_attachment: true } },
+
+  -- ---- Mail-auth signals (soft contributions) ----
+  -- Engine-level hard-fail kinds (SpfFailDmarcReject, DkimFailDmarcReject)
+  -- are decided by `EngineConfig.mail_auth_hard_fail_kinds`, not by the
+  -- pack. These rules contribute soft scores when auth is weak.
+  { id: "spf_fail_soft", description: "SPF hard fail (no DMARC reject policy)", weight: 4,
+    match: { kind: "mail_auth", spf: "fail" } },
+  { id: "dkim_fail_soft", description: "All DKIM signatures failed", weight: 3,
+    match: { kind: "mail_auth", dkim: "fail" } }
+]

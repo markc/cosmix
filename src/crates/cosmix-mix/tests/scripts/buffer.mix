@@ -1,0 +1,102 @@
+# Executable contract for the reference-semantic Value::Buffer type
+# (mix 0.26.0). Each check exits 1 on mismatch; the harness in
+# tests/buffer.rs asserts a clean exit + the final PASS marker.
+
+function check($label, $got, $want)
+  if to_string($got) != to_string($want) then
+    print("FAIL: " .. $label .. " got=" .. to_string($got) .. " want=" .. to_string($want))
+    exit(1)
+  end
+end
+
+# --- reference semantics: an alias sees in-place growth (unlike List) ---
+$a = buffer([1, 2])
+$b = $a
+buffer_push($b, 3)
+check("alias sees growth", bytes_len($a), 3)
+
+# --- buffer(x) makes an INDEPENDENT copy ---
+$c = buffer($a)
+buffer_push($c, 9)
+check("copy is independent", bytes_len($a), 3)
+check("copy grew alone", bytes_len($c), 4)
+
+# --- self-append is borrow-safe (doubles, no RefCell panic) ---
+$d = buffer([7, 8])
+buffer_push($d, $d)
+check("self-append doubles", bytes_len($d), 4)
+
+# --- freeze snapshots to value-semantic bytes ---
+$f = freeze($a)
+buffer_push($a, 99)
+check("freeze is a snapshot", bytes_len($f), 3)
+check("freeze yields bytes", type($f), "bytes")
+
+# --- variadic push mixes ints / strings / bytes / buffers ---
+$m = buffer()
+buffer_push($m, "AB", 67, freeze(buffer([68])))
+check("mixed push length", bytes_len($m), 4)
+check("mixed push decodes", bytes_to_string($m), "ABCD")
+
+# --- random access get / set + bounds ---
+$g = buffer([10, 20, 30])
+check("get in range", buffer_get($g, 1), 20)
+check("get OOB is nil", to_string(buffer_get($g, 99)), "nil")
+buffer_set($g, 1, 200)
+check("set mutates", buffer_get($g, 1), 200)
+
+# --- buffer(n) allocates n zero bytes ---
+check("alloc size", bytes_len(buffer(5)), 5)
+check("alloc zeroed", buffer_get(buffer(5), 3), 0)
+
+# --- == is content equality; buffer vs bytes is false ---
+check("content equality", buffer([1, 2, 3]) == buffer([1, 2, 3]), true)
+check("buffer != bytes", buffer([1]) == freeze(buffer([1])), false)
+
+# --- overloads: bytes_len / bytes_to_string / base64_encode / write_file ---
+$s = buffer("MThd")
+check("bytes_len overload", bytes_len($s), 4)
+check("decode overload", bytes_to_string($s), "MThd")
+check("base64 overload", base64_encode($s), "TVRoZA==")
+
+# --- round-trip through the value-semantic byte sink ---
+$hdr = buffer(["MThd", 0, 0, 0, 6])
+$path = "/tmp/mix-buffer-test-rt.bin"
+write_file($path, $hdr)
+$back = read_file_bytes($path)
+check("write/read round-trip", $back == freeze($hdr), true)
+remove($path)
+
+# --- type + placeholder + empty-is-falsy + is_empty ---
+check("type name", type($s), "buffer")
+check("print placeholder", to_string(buffer([1, 2])), "<buffer:2>")
+check("empty is falsy", buffer() ? "t" : "f", "f")
+check("is_empty on empty buffer", is_empty(buffer()), true)
+check("is_empty on non-empty buffer", is_empty(buffer([1])), false)
+
+# --- error surfaces (must raise, caught here) ---
+$errs = 0
+try
+  buffer([256])
+catch $e
+  $errs = $errs + 1
+end
+try
+  buffer_set(buffer([1]), 5, 1)
+catch $e
+  $errs = $errs + 1
+end
+try
+  freeze("not a buffer")
+catch $e
+  $errs = $errs + 1
+end
+try
+  # a huge / f64-saturated size must error gracefully, not OOM-abort
+  buffer(1000000000000000000)
+catch $e
+  $errs = $errs + 1
+end
+check("error surfaces", $errs, 4)
+
+print("ALL BUFFER CHECKS PASSED")

@@ -1,0 +1,27 @@
+-- fileio.mix: test file I/O builtins
+-- Expected output:
+-- true
+-- hello from mix
+-- true
+-- hello from mix
+-- goodbye
+-- false
+
+$tmpfile = "/tmp/mix_test_fileio.txt"
+
+-- write and read
+write_file($tmpfile, "hello from mix")
+print exists($tmpfile)
+print read_file($tmpfile)
+print is_file($tmpfile)
+
+-- append
+append_file($tmpfile, "\ngoodbye")
+$content = read_file($tmpfile)
+parse $content with $line1 "\n" $line2
+print $line1
+print $line2
+
+-- cleanup
+run("rm " .. $tmpfile)
+print exists($tmpfile)

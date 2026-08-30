@@ -1,0 +1,336 @@
+-- h_ssh_hosts.mix — /ssh/hosts : full-CRUD SSH host inventory (P1).
+--
+-- admin-list/1 over the sshm.ssh_hosts mirror (FS-authoritative). CRUD is
+-- imperative FS-first verbs (ssh_host_save / ssh_host_delete in ssh_lib.mix):
+-- write ~/.ssh via filesd FIRST, then project into the mirror + audit as single
+-- statements (NO tx). Editor = fm_form modal fetched over Datastar; RMB context
+-- menu (locked-on) + row edit/delete; guarded delete; bulk delete. OCC via a
+-- hidden file_hash checked against the LIVE fragment. ?view= = a read-only
+-- detail card. Scans: "Test all" enqueues a scan_all job (P2b).
+
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/admin_resource.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/detail.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+include "/opt/cosmix/vhosts/shared/apps/ssh_lib.mix"
+
+-- ── list column spec ────────────────────────────────────────────────────────
+function ssh_hosts_spec()
+  return [
+    dt_col("name", "Name", "name", { sortable: true, searchable: true, render: fn($r) = ('<a href="/ssh/hosts?view=' .. esc("" .. $r["name"]) .. '">' .. esc("" .. $r["name"]) .. '</a>') }),
+    dt_col("hostname", "Host", "hostname", { sortable: true, searchable: true, render: fn($r) = ssh_host_cell($r) }),
+    dt_col("user", "User", "user", { sortable: true, searchable: true }),
+    dt_col("key_name", "Key", "key_name", { sortable: true, badge: fn($r) = ssh_key_badge($r) }),
+    dt_col("ephemeral", "Ephemeral", "ephemeral", { sortable: true, type: "boolean" }),
+    dt_col("last_status", "Last test", "last_status", { sortable: true, badge: fn($r) = ssh_status_badge($r) })
+  ]
+end
+
+function ssh_host_cell($r)
+  $h = esc("" .. ssh_or($r["hostname"], ""))
+  $p = to_number("" .. ssh_or($r["port"], 22))
+  if $p == nil then $p = 22 end
+  if $p == 22 then return $h end
+  return $h .. '<span class="muted">:' .. ("" .. $p) .. '</span>'
+end
+
+function ssh_key_badge($r)
+  $k = "" .. ssh_or($r["key_name"], "")
+  if $k == "" then return { text: "none", variant: "muted" } end
+  return { text: $k, variant: "neutral" }
+end
+
+function ssh_status_badge($r)
+  $s = "" .. ssh_or($r["last_status"], "")
+  if $s == "" then return { text: "—", variant: "muted" } end
+  if $s == "ok" then return { text: "ok", variant: "success" } end
+  if $s == "git" then return { text: "git", variant: "info" } end
+  if $s == "offline" then return { text: "offline", variant: "warn" } end
+  if $s == "authfail" then return { text: "authfail", variant: "warn" } end
+  return { text: $s, variant: "danger" }
+end
+
+-- Uptime/Ping ride the toolsd `tools: true` opt-in (same gate as Shwho/Trace): the
+-- /ssh/host-tool routes are per-vhost, and the shared tree reaches prod, so an ungated
+-- action would render a 404 target wherever /ssh is enabled but toolsd is not.
+function ssh_host_actions($uptime, $ping, $edit, $copy, $del)
+  if $SITE["tools"] == true then
+    return [$uptime, $ping, $edit, $copy, $del]
+  end
+  return [$edit, $copy, $del]
+end
+
+-- ── list options (full CRUD: bulk + row edit/delete + New) ───────────────────
+function ssh_hosts_opts()
+  $act_edit = dt_action("edit", { "label": "Edit", icon: "pencil", variant: "action", modal: true, href: fn($r) = ("/ssh/hosts?edit=" .. url_encode("" .. $r["name"]) .. "&modal=1") })
+  $act_copy = dt_action("copykey", { "label": "Copy Key", icon: "key-round", variant: "action", modal: true, href: fn($r) = ("/ssh/hosts?copykey=" .. url_encode("" .. $r["name"]) .. "&modal=1") })
+  -- Operator tools: Uptime (ssh a fixed read-only readout) + Ping (local, streaming). Both
+  -- open the shared md-edit modal at /ssh/host-tool, which enqueues an sshm job by the row's
+  -- opaque id (resolved server-side through the roster — never a hostname). See h_ssh_tools.mix.
+  $act_uptime = dt_action("uptime", { "label": "Uptime", icon: "activity", variant: "action", modal: true, href: fn($r) = ("/ssh/host-tool?tool=uptime_host&host=" .. url_encode("" .. $r["id"]) .. "&modal=1") })
+  $act_ping = dt_action("ping", { "label": "Ping", icon: "radio", variant: "action", modal: true, href: fn($r) = ("/ssh/host-tool?tool=ping_host&host=" .. url_encode("" .. $r["id"]) .. "&modal=1") })
+  $act_del = dt_action("delete", { "label": "Delete", icon: "trash", variant: "action-danger", action: "delete", confirm: "Delete this host? The fragment moves to ~/.ssh trash (reversible)." })
+  return dt_admin_opts({
+    base_route: "/ssh/hosts",
+    caption: "SSH hosts",
+    noun: "hosts",
+    default_sort: "name",
+    default_dir: "asc",
+    search_placeholder: "Search hosts…",
+    -- Wider context-menu action modal (xl = 56rem) so the Uptime/Ping CLI output has room.
+    -- The row actions open the datatable's shared action shell (dt_actions_chrome), NOT the
+    -- md-edit shell — this is the knob that actually widens them. /biz/domains sets none, so
+    -- its Shwho/Trace modals stay the default md.
+    action_modal_size: "xl",
+    row_action_specs: ssh_host_actions($act_uptime, $act_ping, $act_edit, $act_copy, $act_del),
+    bulk_id: fn($r) = ("" .. $r["name"]),
+    bulk_label: "Delete Selected",
+    header_actions: [
+      { "label": "Test All", icon: "radar", variant: "secondary", post: true, href: "/ssh/hosts", action: "testall" },
+      { "label": "Reindex", icon: "refresh-cw", variant: "secondary", post: true, href: "/ssh/hosts", action: "reindex" },
+      { "label": "New Host", icon: "plus", variant: "primary", modal: "md-edit", modal_src: "/ssh/hosts?new=1&modal=1" }
+    ]
+  })
+end
+
+-- ── editor (create + edit; one fm_form, canvas or modal) ─────────────────────
+function ssh_host_fields($r, $isnew)
+  $h = fm_hidden("action", "save")
+  $h = $h .. fm_hidden("orig_name", "" .. ssh_or($r["name"], ""))
+  $h = $h .. fm_hidden("file_hash", "" .. ssh_or($r["file_hash"], ""))
+  $nameopts = { value: ssh_or($r["name"], ""), required: true, help: "Fragment name under ~/.ssh/hosts/. Letters, digits, _ . - only.", help_tip: true }
+  if not $isnew then $nameopts["readonly"] = true end
+  $h = $h .. fm_text("name", "Name", $nameopts)
+  $h = $h .. fm_text("hostname", "Host / IP", { value: ssh_or($r["hostname"], ""), required: true })
+  $h = $h .. fm_number("port", "Port", { value: ("" .. ssh_or($r["port"], 22)), min: 1, max: 65535 })
+  $h = $h .. fm_text("user", "User", { value: ssh_or($r["user"], "root") })
+  $h = $h .. fm_select("key_name", "Identity key", ssh_key_options("" .. ssh_or($r["key_name"], "")), { value: ("" .. ssh_or($r["key_name"], "")), placeholder: "(none)" })
+  return $h
+end
+
+function ssh_host_editor_form($r, $isnew, $err, $mode)
+  $heading = "Edit Host"
+  if $isnew then $heading = "New Host" end
+  return {
+    mode: $mode,
+    action: "/ssh/hosts",
+    id: "ssh-host-edit",
+    title: $heading,
+    fields: fm_grid({ cols: 2 }, ssh_host_fields($r, $isnew)),
+    submit: { "label": "Save" },
+    cancel: { "label": "Cancel", href: "/ssh/hosts" },
+    error: $err
+  }
+end
+
+-- Copy-key picker: append one of our PUBLIC keys to this host's authorized_keys
+-- (a keygen-style worker job — ssh-copy-id equivalent, D6). Default = the host's
+-- own configured identity key.
+function ssh_copykey_form($host, $curkey, $err, $mode)
+  $fields = fm_hidden("action", "copykey")
+  $fields = $fields .. fm_hidden("host", "" .. $host)
+  $fields = $fields .. fm_select("key_name", "Public key to copy", ssh_key_options("" .. $curkey), { value: ("" .. $curkey), required: true })
+  return {
+    mode: $mode,
+    action: "/ssh/hosts",
+    id: "ssh-host-copykey",
+    title: ("Copy key to " .. ("" .. $host)),
+    fields: fm_grid({ cols: 1 }, $fields),
+    submit: { "label": "Copy Key" },
+    cancel: { "label": "Cancel", href: "/ssh/hosts" },
+    error: $err
+  }
+end
+
+-- ── entry point ──────────────────────────────────────────────────────────────
+function ssh_hosts_main()
+  cms_init()
+  $user = current_user($HEADERS)
+  if md_is_modal_request() and $user == nil then
+    return md_session_expired("/ssh/hosts")
+  end
+  $deny = require_sshm_operator($user)
+  if $deny != nil then return $deny end
+
+  ssh_init()
+  $actor = "" .. ssh_or($user["username"], "")
+
+  -- ── POST: mutating verbs (operator-gated above, SameSite-protected) ──
+  if $METHOD == "POST" then
+    $f = parse_form($BODY)
+    $action = "" .. ssh_or($f["action"], "save")
+
+    if $action == "bulk_delete" then
+      $ids = dt_selected_ids($f)
+      if dt_wants_all($f) then
+        $spec = ssh_hosts_spec()
+        $ids = dt_all_ids("sshm.ssh_hosts", $spec, dt_state_from_map($f, $spec, ssh_hosts_opts()), "name")
+      end
+      $ndel = 0
+      $nskip = 0
+      $why = ""
+      for each $id in $ids
+        $block = ssh_host_delete("" .. $id, $actor)
+        if $block == "" then
+          $ndel = $ndel + 1
+        else
+          $nskip = $nskip + 1
+          if $why == "" then $why = $block end
+        end
+      end
+      $rep = dt_bulk_report({ deleted: $ndel, skipped: $nskip, why: $why }, "host(s)")
+      return redirect_flash("/ssh/hosts", $rep["msg"], $rep["kind"])
+    end
+
+    -- Reindex + Test-all are POST (they mutate: reindex rewrites the mirror, testall
+    -- creates a scan + enqueues jobs) AND each does a delegated bus_call — the bus
+    -- gate needs POST + same-origin for that on this mutating-verb route (a GET <a>
+    -- can't carry the required token), so these are header POST-form actions.
+    if $action == "reindex" then
+      $ri = ssh_reindex()
+      if $ri["ok"] then
+        return redirect_flash("/ssh/hosts", ("Reindexed: " .. ("" .. $ri["hosts"]) .. " hosts, " .. ("" .. $ri["keys"]) .. " keys"), "success")
+      end
+      return redirect_flash("/ssh/hosts", ("Reindex failed: " .. $ri["err"]), "error")
+    end
+    if $action == "testall" then
+      $sid = ssh_start_scan_all()
+      if $sid == nil then return redirect_flash("/ssh/hosts", "Couldn't start scan — no hosts, or the FS reindex failed.", "error") end
+      return redirect_flash("/ssh/scans?view=" .. ("" .. $sid), "Scan started.", "success")
+    end
+
+    -- Copy key: enqueue a copy_key worker job (appends our .pub to the host's
+    -- authorized_keys) → progress. host = the fragment alias ssh connects to.
+    if $action == "copykey" then
+      $ckhost = ssh_safe_name(ssh_or($f["host"], ""))
+      $ckkey = ssh_safe_name(ssh_or($f["key_name"], ""))
+      if $ckhost == "" then return redirect_flash("/ssh/hosts", "Invalid host.", "error") end
+      if $ckkey == "" then return redirect_flash("/ssh/hosts", "Pick a key to copy.", "error") end
+      -- Only copy to a REGISTERED host (a tampered POST can't push our key to an
+      -- arbitrary ssh destination outside the managed estate).
+      if length(db_query("SELECT name FROM sshm.ssh_hosts WHERE name=?1", [$ckhost])) == 0 then
+        return redirect_flash("/ssh/hosts", "No such host.", "error")
+      end
+      $jid = ssh_job_enqueue("copy_key", { host: $ckhost, key: $ckkey }, nil)
+      ssh_audit($actor, "copykey-queued", "ssh_hosts", nil, ($ckkey .. " -> " .. $ckhost))
+      if $jid == nil then return redirect_flash("/ssh/hosts", "Couldn't queue the key copy.", "error") end
+      return redirect_flash("/ssh/hosts?job=" .. ("" .. $jid), ("Copying key '" .. $ckkey .. "' to " .. $ckhost .. "…"), "success")
+    end
+
+    $ra = dt_row_action($f)
+    $delname = ""
+    if $ra != nil and $ra["verb"] == "delete" then $delname = "" .. $ra["id"] end
+    if $action == "delete" then $delname = "" .. ssh_or($f["name"], "") end
+    if $delname != "" then
+      $block = ssh_host_delete($delname, $actor)
+      if $block != "" then return redirect_flash("/ssh/hosts", $block, "danger") end
+      return redirect_flash("/ssh/hosts", ("Host '" .. $delname .. "' deleted."), "success")
+    end
+
+    -- save (create / edit)
+    $res = ssh_host_save($f, $actor)
+    if $res["ok"] then
+      $msg = "Host saved."
+      if not ssh_or($res["cache_ok"], true) then $msg = "Host saved to disk — but the cache update failed; click Reindex to sync." end
+      return redirect_flash("/ssh/hosts", $msg, "success")
+    end
+    -- re-render the editor with the error (modal fragment or canvas page)
+    $isnew = ssh_safe_name(ssh_or($f["orig_name"], "")) == ""
+    $rr = { name: ssh_or($f["name"], ""), hostname: ssh_or($f["hostname"], ""), port: ssh_or($f["port"], 22), user: ssh_or($f["user"], "root"), key_name: ssh_or($f["key_name"], ""), file_hash: ssh_or($f["file_hash"], "") }
+    if md_is_modal_request() then
+      return md_fragment(fm_form(ssh_host_editor_form($rr, $isnew, $res["err"], "modal")))
+    end
+    return doc(200, "Edit host", $user, fm_form(ssh_host_editor_form($rr, $isnew, $res["err"], "canvas")))
+  end
+
+  $q = parse_query($QUERY)
+
+  -- (Reindex + Test-all moved to POST header actions above — a GET bus_call on this
+  -- mutating-verb route can't satisfy the bus gate's off-POST CSRF requirement.)
+
+  -- Job progress (copy-key): poll /ssh/job-status, then redirect back to the list.
+  $jobid = "" .. ssh_or($q["job"], "")
+  if $jobid != "" then
+    return doc(200, "Working…", $user, ssh_job_progress_html($jobid, "Working…", "/ssh/hosts"))
+  end
+
+  -- Copy-key picker (modal fetch / canvas fallback): default to the host's key.
+  $ckname = "" .. ssh_or($q["copykey"], "")
+  if $ckname != "" then
+    $ckrows = db_query("SELECT key_name FROM sshm.ssh_hosts WHERE name=?1", [$ckname])
+    if length($ckrows) == 0 then
+      if md_is_modal_request() then return md_not_found("host", "/ssh/hosts") end
+      return doc(404, "Not found", $user, '<div class="card"><h1>404</h1><p class="muted">No such host.</p></div>')
+    end
+    $curkey = "" .. ssh_or($ckrows[0]["key_name"], "")
+    if md_is_modal_request() then return md_fragment(fm_form(ssh_copykey_form($ckname, $curkey, "", "modal"))) end
+    return doc(200, "Copy key", $user, fm_form(ssh_copykey_form($ckname, $curkey, "", "canvas")))
+  end
+
+  -- New / Edit editor (modal fragment when X-Modal-Fetch, else full canvas page).
+  $editname = "" .. ssh_or($q["edit"], "")
+  if ssh_or($q["new"], "") == "1" then
+    if md_is_modal_request() then
+      return md_fragment(fm_form(ssh_host_editor_form({}, true, "", "modal")))
+    end
+    return doc(200, "New Host", $user, fm_form(ssh_host_editor_form({}, true, "", "canvas")))
+  end
+  if $editname != "" then
+    $rows = db_query("SELECT * FROM sshm.ssh_hosts WHERE name=?1", [$editname])
+    if length($rows) == 0 then
+      if md_is_modal_request() then return md_not_found("host", "/ssh/hosts") end
+      return doc(404, "Not found", $user, '<div class="card"><h1>404</h1><p class="muted">No such host.</p></div>')
+    end
+    if md_is_modal_request() then
+      return md_fragment(fm_form(ssh_host_editor_form($rows[0], false, "", "modal")))
+    end
+    return doc(200, "Edit host", $user, fm_form(ssh_host_editor_form($rows[0], false, "", "canvas")))
+  end
+
+  -- Detail (?view=).
+  $view = "" .. ssh_or($q["view"], "")
+  if $view != "" then
+    return ssh_hosts_view($view, $user)
+  end
+
+  -- List.
+  $banner = ssh_drift_banner()
+  return dt_admin_list({
+    title: "SSH hosts",
+    user: $user,
+    spec: ssh_hosts_spec(),
+    opts: ssh_hosts_opts(),
+    table: "sshm.ssh_hosts",
+    select: "id, name, hostname, port, user, key_name, ephemeral, last_status, last_latency_ms, last_tested_at",
+    prefix_html: $banner
+  })
+end
+
+-- ── detail (?view=) ──────────────────────────────────────────────────────────
+function ssh_hosts_view($name, $user)
+  $rows = db_query("SELECT * FROM sshm.ssh_hosts WHERE name=?1", [$name])
+  if length($rows) == 0 then
+    return md_not_found("host", "/ssh/hosts")
+  end
+  $r = $rows[0]
+  $kv = dv_kv_table([
+    { label: "Hostname", value: ("" .. ssh_or($r["hostname"], "")) },
+    { label: "Port", value: ("" .. ssh_or($r["port"], 22)) },
+    { label: "User", value: ("" .. ssh_or($r["user"], "")) },
+    { label: "Identity key", value: ("" .. ssh_or($r["key_name"], "none")) },
+    { label: "Ephemeral", value: ssh_yesno($r["ephemeral"]) },
+    { label: "Last test", value: ("" .. ssh_or($r["last_status"], "never")) }
+  ])
+  $raw = '<div class="card"><h3>Raw fragment</h3><pre class="code-block">' .. esc("" .. ssh_or($r["raw"], "")) .. '</pre></div>'
+  $edit = '<a href="/ssh/hosts?edit=' .. esc("" .. $r["name"]) .. '&modal=1" class="btn btn-primary" data-modal-open="md-edit" data-modal-src="/ssh/hosts?edit=' .. esc("" .. $r["name"]) .. '&modal=1"><i data-lucide="pencil"></i> Edit</a>'
+  $head = dv_head("Host: " .. ("" .. $r["name"]), { back: { href: "/ssh/hosts", label: "SSH hosts" }, actions_html: $edit })
+  return doc(200, ("Host " .. ("" .. $r["name"])), $user, $head .. dv_card("Details", $kv) .. $raw .. md_shell("md-edit", { size: "lg" }) .. md_script())
+end
+
+function ssh_yesno($v)
+  $n = to_number("" .. ssh_or($v, 0))
+  if $n == nil then $n = 0 end
+  if $n == 1 then return "yes" end
+  return "no"
+end

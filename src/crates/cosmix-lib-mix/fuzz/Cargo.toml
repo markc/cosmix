@@ -1,0 +1,46 @@
+# P2 of the mix tokenizer fuzz/property corpus
+# (_doc/planned/mix-tokenizer-fuzz-corpus.md in the cosmix hub): coverage-guided
+# libFuzzer harness for the Mix lexer and parser. This is its OWN workspace (the
+# empty `[workspace]` table below) so it is NOT pulled into the parent
+# `~/.mix/src` workspace's default build/test — it runs on-demand under nightly:
+#
+#   cd crates/cosmix-lib-mix
+#   cargo +nightly fuzz run fuzz_lex   -- -max_total_time=60
+#   cargo +nightly fuzz run fuzz_parse -- -max_total_time=60
+[package]
+name = "cosmix-lib-mix-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# cosmix-lib-mix does NOT compile with reduced features (its `default = []` set
+# fails to build standalone — a separate feature-hygiene issue), so the harness
+# uses the same known-good set the crate's own tests do. The extra optional deps
+# (sqlite/http/crypto/…) bloat the binary but add NO fuzzed surface: the targets
+# call only `Lexer`/`Parser`, which are core and feature-independent.
+[dependencies.cosmix-lib-mix]
+path = ".."
+features = ["json", "regex", "toml", "datetime", "url", "crypto", "http", "sqlite", "tokio-sleep"]
+
+[[bin]]
+name = "fuzz_lex"
+path = "fuzz_targets/fuzz_lex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_parse"
+path = "fuzz_targets/fuzz_parse.rs"
+test = false
+doc = false
+bench = false
+
+# Keep this crate out of the parent workspace.
+[workspace]

@@ -1,0 +1,17 @@
+// Allow only the fixed cosmix-nspawnd identity to start/stop validated nspawn
+// template instances. All other systemd manager operations remain subject to
+// the host's normal policy.
+polkit.addRule(function(action, subject) {
+    if (action.id != "org.freedesktop.systemd1.manage-units" ||
+        subject.user != "cosmix-nspawnd")
+        return polkit.Result.NOT_HANDLED;
+
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    if (unit != null &&
+        /^systemd-nspawn@[a-z][a-z0-9-]{1,31}\.service$/.test(unit) &&
+        (verb == "start" || verb == "stop"))
+        return polkit.Result.YES;
+
+    return polkit.Result.NOT_HANDLED;
+});

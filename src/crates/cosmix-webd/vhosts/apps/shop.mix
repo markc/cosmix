@@ -1,0 +1,482 @@
+-- shop.mix — digital-goods e-shop core: schema bootstrap + helpers. Design
+-- Codex-converged 2026-07-17 (the cmctl _plan/ digital-eshop plan):
+-- the INVOICE IS THE ORDER (invoice_items.product_id, no second status
+-- machine); carts are cookie-token rows storing sha256(token); entitlements
+-- are DERIVED (paid invoice + product items + net-paid rule) — no hook inside
+-- biz_apply_payment; qty is structurally 1 per product per order.
+-- Included by h_shop.mix / h_shop_admin.mix / h_biz_tick.mix AFTER biz.mix.
+-- Only vhosts with features.shop=true ever run shop_init(), so shop tables
+-- and the invoice_items.product_id column exist only on shop vhosts.
+
+-- ---------------------------------------------------------------- schema
+
+function shop_init()
+  db_exec("CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY,
+    sku TEXT UNIQUE NOT NULL,
+    slug TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    price_cents INTEGER NOT NULL CHECK(price_cents > 0 AND price_cents <= 100000000),
+    currency TEXT NOT NULL DEFAULT 'aud',
+    delivery TEXT NOT NULL DEFAULT 'file' CHECK(delivery IN ('file','text')),
+    file_path TEXT NOT NULL DEFAULT '',
+    file_sha256 TEXT NOT NULL DEFAULT '',
+    file_bytes INTEGER NOT NULL DEFAULT 0,
+    mime TEXT NOT NULL DEFAULT 'application/octet-stream',
+    text_payload TEXT NOT NULL DEFAULT '',
+    image TEXT NOT NULL DEFAULT '',
+    published INTEGER NOT NULL DEFAULT 0,
+    sort INTEGER NOT NULL DEFAULT 0,
+    created TEXT, updated TEXT)")
+
+  -- carts: the cookie carries the RAW 64-hex token; we store only its sha256
+  -- (customer_tokens discipline — a db leak can't impersonate a live cart).
+  db_exec("CREATE TABLE IF NOT EXISTS carts (
+    id INTEGER PRIMARY KEY,
+    token_sha256 TEXT UNIQUE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','converted','expired')),
+    converted_invoice_id INTEGER REFERENCES invoices(id),
+    created TEXT, updated TEXT)")
+
+  -- qty is structurally 1: (cart_id, product_id) unique, no qty column.
+  db_exec("CREATE TABLE IF NOT EXISTS cart_items (
+    id INTEGER PRIMARY KEY,
+    cart_id INTEGER NOT NULL REFERENCES carts(id),
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    created TEXT,
+    UNIQUE(cart_id, product_id))")
+
+  -- download audit: row per successful file claim. IDs only, never tokens.
+  db_exec("CREATE TABLE IF NOT EXISTS download_log (
+    id INTEGER PRIMARY KEY,
+    invoice_id INTEGER NOT NULL REFERENCES invoices(id),
+    invoice_item_id INTEGER NOT NULL REFERENCES invoice_items(id),
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    at TEXT NOT NULL)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_dl_item ON download_log(invoice_item_id)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_cart_items ON cart_items(cart_id)")
+
+  -- an ORDER is an invoice whose items carry product_id (mutually exclusive
+  -- with service_id/domain_id by construction — checkout is the only writer
+  -- of product_id and never sets the other two; SQLite can't ALTER-in a CHECK).
+  try db_exec("ALTER TABLE invoice_items ADD COLUMN product_id INTEGER REFERENCES products(id)") catch $e end
+
+  -- canonical-email uniqueness (Codex ruling 3): REQUIRED for find-or-create
+  -- guest checkout. Fresh shop dbs are always clean; guard like Brick 1 so a
+  -- legacy db with duplicates degrades to checkout-refusal, not a bricked vhost.
+  $dup = db_query("SELECT lower(email) AS e FROM customers GROUP BY lower(email) HAVING COUNT(*) > 1 LIMIT 1")
+  if length($dup) == 0 then
+    db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_cust_email_canonical ON customers(lower(email))")
+    db_exec("DELETE FROM biz_settings WHERE key = 'shop_email_conflict'")
+  else
+    db_exec("INSERT OR IGNORE INTO biz_settings (key, value) VALUES ('shop_email_conflict', ?1)",
+            ["" .. $dup[0].e])
+  end
+
+  -- outbox signup-token provenance (additive on the biz-core table, same
+  -- pattern as invoice_items.product_id): `source` marks tokens the shop
+  -- outbox minted; `delivered` is PRE-STAMPED immediately BEFORE the send
+  -- attempt ("entered the send path — possibly in the customer's hands;
+  -- never invalidate") and retired afterwards only on DEFINITE
+  -- non-submission. delivered=0 therefore means "never reached a send
+  -- attempt": a crash orphan the sweep may retire — NOT "mail didn't leave".
+  try db_exec("ALTER TABLE customer_tokens ADD COLUMN source TEXT NOT NULL DEFAULT ''") catch $e end
+  try db_exec("ALTER TABLE customer_tokens ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0") catch $e end
+
+  biz_set_default("shop_download_cap", "5")
+  biz_set_default("shop_download_days", "30")
+  biz_set_default("shop_cart_days", "14")
+end
+
+-- ---------------------------------------------------------------- tokens & carts
+
+-- 40-80 lowercase hex chars (biz_token mints 64) — same defence-in-depth
+-- format check as the invoice-token path; junk never reaches SQL.
+function sh_is_hex_token($s)
+  $n = length($s)
+  if $n < 40 or $n > 80 then return false end
+  $hex = "0123456789abcdef"
+  $i = 0
+  while $i < $n
+    if pos(substr($s, $i, 1), $hex) == 0 then return false end
+    $i = $i + 1
+  end
+  return true
+end
+
+$SH_CART_COOKIE = "__Host-shop_cart"
+
+-- The visitor's OPEN cart from the cookie, or nil. Expiry is enforced here
+-- (created older than shop_cart_days) as well as swept by the tick.
+function sh_cart_days()
+  $d = biz_setting("shop_cart_days")
+  if $d == "" then $d = "14" end
+  return $d
+end
+
+-- cart age bound: biz_now()-stamped `created` compared against a Mix-computed
+-- LOCAL bound (never SQL datetime('now') — that is UTC and space-formatted)
+function sh_cart_age_bound()
+  $d = to_number(sh_cart_days())
+  if $d == nil or $d < 1 then $d = 14 end
+  return biz_now_ago($d * 86400)
+end
+
+function sh_cart_current()
+  $tok = cookie_get($HEADERS, $SH_CART_COOKIE)
+  if $tok == nil or not sh_is_hex_token("" .. $tok) then return nil end
+  $r = db_query("SELECT * FROM carts WHERE token_sha256 = ?1 AND status = 'open'
+                 AND created > ?2",
+                [hash_sha256("" .. $tok), sh_cart_age_bound()])
+  if length($r) == 0 then return nil end
+  return $r[0]
+end
+
+-- The cookie's cart in ANY status — checkout uses this so a double-submit on
+-- an already-converted cart redirects to its order instead of reading as
+-- "empty" (sh_cart_current's open-only filter would hide it).
+function sh_cart_any()
+  $tok = cookie_get($HEADERS, $SH_CART_COOKIE)
+  if $tok == nil or not sh_is_hex_token("" .. $tok) then return nil end
+  $r = db_query("SELECT * FROM carts WHERE token_sha256 = ?1", [hash_sha256("" .. $tok)])
+  if length($r) == 0 then return nil end
+  return $r[0]
+end
+
+-- Mint a cart + its cookie. Returns { cart, set_cookie }.
+function sh_cart_create()
+  $raw = biz_token()
+  db_exec("INSERT INTO carts (token_sha256, status, created, updated) VALUES (?1, 'open', ?2, ?2)",
+          [hash_sha256($raw), biz_now()])
+  $r = db_query("SELECT * FROM carts WHERE token_sha256 = ?1", [hash_sha256($raw)])
+  $ck = $SH_CART_COOKIE .. "=" .. $raw .. "; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=1209600"
+  return { cart: $r[0], set_cookie: $ck }
+end
+
+function sh_cart_items($cart_id)
+  return db_query("SELECT ci.id AS item_id, p.* FROM cart_items ci
+                   JOIN products p ON p.id = ci.product_id
+                   WHERE ci.cart_id = ?1 ORDER BY ci.id", [$cart_id])
+end
+
+function sh_cart_count($cart)
+  if $cart == nil then return 0 end
+  $r = db_query("SELECT COUNT(*) AS n FROM cart_items WHERE cart_id = ?1", [$cart["id"]])
+  return to_number($r[0].n)
+end
+
+-- ---------------------------------------------------------------- products
+
+function sh_products_published()
+  return db_query("SELECT * FROM products WHERE published = 1 ORDER BY sort, name")
+end
+
+function sh_product_by_slug($slug)
+  $s = lower(trim("" .. $slug))
+  if $s == "" or length($s) > 128 then return nil end
+  $r = db_query("SELECT * FROM products WHERE slug = ?1 AND published = 1", [$s])
+  if length($r) == 0 then return nil end
+  return $r[0]
+end
+
+-- ---------------------------------------------------------------- entitlement
+
+-- The refund/chargeback rule (Codex ruling 10.3): a paid invoice is entitled
+-- only while NET paid (payments - refunds) still covers the full total —
+-- a recorded refund kills downloads without any status flip.
+function sh_entitled($inv)
+  if ("" .. $inv["status"]) != "paid" then return false end
+  $s = db_query("SELECT COALESCE(SUM(CASE kind WHEN 'payment' THEN amount_cents
+                 WHEN 'refund' THEN -amount_cents ELSE 0 END), 0) AS paid
+                 FROM transactions WHERE invoice_id = ?1", [$inv["id"]])
+  return to_number($s[0].paid) >= to_number($inv["total_cents"])
+end
+
+-- Entitlement window: shop_download_days after paid_at ('' paid_at = no
+-- window). Both sides LOCAL 'T' format: paid_at is biz_now()-stamped, so
+-- the window end is strftime'd (T output) and compared against biz_now() —
+-- never SQL datetime('now') (UTC + space format).
+function sh_expired($inv)
+  $paid_at = "" .. $inv["paid_at"]
+  if $paid_at == "" or $paid_at == "nil" then return false end
+  $days = biz_setting("shop_download_days")
+  if $days == "" then $days = "30" end
+  $r = db_query("SELECT (strftime('%Y-%m-%dT%H:%M:%S', ?1, '+' || ?2 || ' days') < ?3) AS gone",
+                [$paid_at, $days, biz_now()])
+  return to_number($r[0].gone) == 1
+end
+
+-- The product items on an invoice (the order lines).
+function sh_order_items($invoice_id)
+  return db_query("SELECT ii.id AS item_id, ii.description, ii.amount_cents,
+                   p.id AS product_id, p.slug, p.name, p.delivery, p.file_path,
+                   p.mime, p.file_bytes, p.text_payload
+                   FROM invoice_items ii JOIN products p ON p.id = ii.product_id
+                   WHERE ii.invoice_id = ?1 ORDER BY ii.id", [$invoice_id])
+end
+
+-- true iff the invoice has at least one product line (i.e. it is a shop order).
+function sh_is_order($invoice_id)
+  $r = db_query("SELECT 1 AS x FROM invoice_items WHERE invoice_id = ?1
+                 AND product_id IS NOT NULL LIMIT 1", [$invoice_id])
+  return length($r) == 1
+end
+
+function sh_download_cap()
+  $cap = to_number(biz_setting("shop_download_cap"))
+  if $cap == nil or $cap < 1 then $cap = 5 end
+  return $cap
+end
+
+-- Non-consuming exhaustion precheck (advisory — the atomic claim below is
+-- the real gate): lets the download route refuse an exhausted token BEFORE
+-- buffering the whole artifact into memory.
+function sh_download_exhausted($item_id)
+  $c = db_query("SELECT COUNT(*) AS n FROM download_log WHERE invoice_item_id = ?1", [$item_id])
+  return to_number($c[0].n) >= sh_download_cap()
+end
+
+-- Atomically claim one download slot for an item. The ENTIRE entitlement is
+-- revalidated INSIDE the BEGIN IMMEDIATE — status, net-paid (a refund
+-- recorded after the route's precheck must revoke here), expiry window, and
+-- the claim counter — so no admin action can race a request between check
+-- and delivery. Returns { ok, remaining, error }.
+function sh_claim_download($inv, $item)
+  $cap = sh_download_cap()
+  db_exec("BEGIN IMMEDIATE")
+  try
+    $fresh = db_query("SELECT * FROM invoices WHERE id = ?1", [$inv["id"]])
+    if length($fresh) != 1 or not sh_entitled($fresh[0]) or sh_expired($fresh[0]) then
+      db_exec("ROLLBACK")
+      return { ok: false, remaining: 0, error: "not entitled" }
+    end
+    $c = db_query("SELECT COUNT(*) AS n FROM download_log WHERE invoice_item_id = ?1",
+                  [$item["item_id"]])
+    if to_number($c[0].n) >= $cap then
+      db_exec("ROLLBACK")
+      return { ok: false, remaining: 0, error: "download limit reached" }
+    end
+    db_exec("INSERT INTO download_log (invoice_id, invoice_item_id, product_id, at)
+             VALUES (?1, ?2, ?3, ?4)",
+            [$inv["id"], $item["item_id"], $item["product_id"], biz_now()])
+    db_exec("COMMIT")
+    return { ok: true, remaining: $cap - to_number($c[0].n) - 1, error: "" }
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return { ok: false, remaining: 0, error: "" .. $e }
+  end
+end
+
+-- Confine an admin-authored goods path under $SITE.app_root/goods/: lexical
+-- checks first (no absolute/../ backslash), then realpath BOTH sides so a
+-- symlink smuggled under goods/ cannot escape the tree — and the CANONICAL
+-- path is what gets returned/opened (realpath is normalisation, not a
+-- race-free gate; opening the resolved path leaves no symlink to re-follow).
+-- nil = refused or nonexistent.
+function sh_goods_path($file_path)
+  $p = "" .. $file_path
+  if $p == "" or starts_with($p, "/") or contains($p, "..") or contains($p, "\\") then
+    return nil
+  end
+  $base = realpath(("" .. $SITE["app_root"]) .. "/goods")
+  if $base == nil then return nil end
+  $full = realpath($base .. "/" .. $p)
+  if $full == nil or not starts_with($full, $base .. "/") then
+    return nil
+  end
+  return $full
+end
+
+-- The outbox's DURABLE signup-token claim. Inside ONE BEGIN IMMEDIATE:
+-- (1) retire crash-orphaned OUTBOX tokens — source='shop_outbox' ONLY,
+--     delivered=0, older than 15 min (== the send-lease horizon; both use
+--     biz_now_ago — Mix-computed LOCAL 'T' bounds, never SQL UTC now).
+--     Outbox tokens PRE-STAMP delivered=1 before their send attempt, so a
+--     >15-min delivered=0 outbox token can only be a crash orphan from the
+--     tiny no-HTTP window between mint tx and stamp — never a link a
+--     customer holds. Non-outbox (admin) tokens are NEVER swept: their
+--     delivered flag can be absent-at-mint history, and bc_send_setpw
+--     retires its own definite failures via used_at.
+-- (2) if any live 'set' token remains (delivered, or younger than 15 min —
+--     possibly another sender mid-send), return nil: the receipt omits the
+--     link, a live one is out there;
+-- (3) else mint (source='shop_outbox', delivered=0, created = $anchor) and
+--     return the raw token. $anchor is the CALLER'S LEASE STAMP: the token
+--     is created at the exact instant its lease was claimed, so "lease
+--     reclaimable" (stamp < bound) IMPLIES "its orphan token sweepable"
+--     (created = same stamp < same bound) — no anchor-skew window in which
+--     a reclaimed lease's retry sees a live-looking orphan. The sweep is
+--     source='shop_outbox' ONLY: outbox tokens always mint after shop_init
+--     (the tick runs it), so their delivered stamps are reliable; admin-
+--     minted tokens can predate the provenance columns (delivered=0 despite
+--     a successful send) and must never be retired on that evidence —
+--     bc_send_setpw retires its own failures via used_at, which exists on
+--     every db.
+function sh_issue_signup_token($customer_id, $anchor)
+  $raw = nil
+  db_exec("BEGIN IMMEDIATE")
+  try
+    db_exec("UPDATE customer_tokens SET used_at = ?2 WHERE customer_id = ?1
+             AND purpose = 'set' AND used_at IS NULL AND source = 'shop_outbox'
+             AND delivered = 0 AND created < ?3",
+            [$customer_id, "stale-undelivered:" .. biz_now(), biz_now_ago(900)])
+    $live = db_query("SELECT id FROM customer_tokens WHERE customer_id = ?1
+                      AND purpose = 'set' AND used_at IS NULL
+                      AND expires_at > datetime('now') LIMIT 1", [$customer_id])
+    if length($live) == 0 then
+      $raw = biz_token()
+      db_exec("INSERT INTO customer_tokens (customer_id, token_sha256, purpose, expires_at,
+               created, source, delivered)
+               VALUES (?1, ?2, 'set', datetime('now', '+72 hours'), ?3, 'shop_outbox', 0)",
+              [$customer_id, hash_sha256($raw), "" .. $anchor])
+    end
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return nil
+  end
+  return $raw
+end
+
+-- ---------------------------------------------------------------- tick hook
+
+-- Post-payment outbox (Codex ruling 10.1): durable + idempotent via
+-- notification_events (invoice_id, 'shop_receipt', paid date), in the same
+-- two-phase shape as dunning — RESERVE the event row first (INSERT OR IGNORE,
+-- sent_at NULL: the unique index arbitrates concurrent ticks BEFORE any mail
+-- goes), then sweep unsent rows and stamp each outcome. mail_mode=off stamps
+-- 'skipped-off:' (no backlog blast on a later live flip); a mail ERROR leaves
+-- the row unsent for the next tick (at-least-once, dunning's contract).
+-- Sends the order link and — for a customer with no portal password yet —
+-- the set-password magic link (this IS the signup flow); at most ONE set
+-- token per customer per run (a second paid order must not invalidate the
+-- link the first receipt carries). Also expires old carts.
+-- NOTE: biz_tick_main's generic dunning sweep EXCLUDES template
+-- 'shop_receipt' — its voided-when-not-open rule would void these (they are
+-- for PAID invoices) and its dunning body would be wrong for them.
+-- Called from biz_tick_main, gated on features.shop there.
+function shop_tick($today)
+  db_exec("UPDATE carts SET status = 'expired', updated = ?1
+           WHERE status = 'open' AND created < ?2",
+          [biz_now(), sh_cart_age_bound()])
+
+  -- phase 1: reserve an event per paid order that has none yet
+  $due = db_query("SELECT DISTINCT i.id, i.paid_at FROM invoices i
+                   JOIN invoice_items ii ON ii.invoice_id = i.id AND ii.product_id IS NOT NULL
+                   WHERE i.status = 'paid'
+                   AND NOT EXISTS (SELECT 1 FROM notification_events ne
+                                   WHERE ne.invoice_id = i.id AND ne.template = 'shop_receipt')")
+  for each $o in $due
+    $sched = substr("" .. $o.paid_at, 0, 10)
+    if $sched == "" or $sched == "nil" then $sched = $today end
+    db_exec("INSERT OR IGNORE INTO notification_events (invoice_id, template, scheduled_for)
+             VALUES (?1, 'shop_receipt', ?2)", [$o.id, $sched])
+  end
+
+  -- phase 2: sweep unsent receipts oldest-first, AT MOST 25 per tick (one
+  -- web request must not perform unbounded JMAP submissions; the backlog
+  -- drains across ticks). Each row is CLAIMED with a send-lease before any
+  -- mail goes — the guarded UPDATE is the arbiter, so two concurrent ticks
+  -- can never both send (or both mint a set token for) the same event. A
+  -- lease whose owner died mid-send ('sending:<stamp>' older than 15 min)
+  -- is retryable — crash recovery stays at-least-once, on a bounded window.
+  $sent = 0
+  -- stale-lease bound: computed in Mix as LOCAL 'T' time (leases embed
+  -- biz_now() stamps; SQL datetime()/strftime('now') are UTC — ~10h skewed
+  -- here — and datetime() is also space-formatted). 15 min, the SAME
+  -- horizon as the token orphan sweep so no reclaim window can outrun it.
+  $stale_bound = biz_now_ago(900)
+  $pending = db_query("SELECT n.id AS nid, i.id, i.token, i.customer_id,
+                       c.name AS c_name, c.email AS c_email, c.password_hash
+                       FROM notification_events n
+                       JOIN invoices i ON i.id = n.invoice_id
+                       JOIN customers c ON c.id = i.customer_id
+                       WHERE n.template = 'shop_receipt'
+                       AND (n.sent_at IS NULL
+                            OR (n.sent_at LIKE 'sending:%' AND substr(n.sent_at, 9) < ?1))
+                       ORDER BY n.id LIMIT 25", [$stale_bound])
+  for each $o in $pending
+    -- claim: single guarded UPDATE (SQLite serializes writers; changes()=0
+    -- means another tick owns it). $lease is this owner's exact marker —
+    -- every later stamp/release is owner-guarded on it, so a reclaimed-then-
+    -- resumed sender can never overwrite the new owner's state. The nonce
+    -- makes the lease unique even across same-second claims. $lstamp anchors
+    -- the token mint below to THIS lease's claim instant.
+    $lstamp = biz_now()
+    $lease = "sending:" .. $lstamp .. ":" .. substr(biz_token(), 0, 8)
+    db_exec("UPDATE notification_events SET sent_at = ?2 WHERE id = ?1
+             AND (sent_at IS NULL
+                  OR (sent_at LIKE 'sending:%' AND substr(sent_at, 9) < ?3))",
+            [$o.nid, $lease, $stale_bound])
+    $own = db_query("SELECT changes() AS n")
+    if to_number($own[0].n) == 1 then
+      $order_url = biz_base_url() .. "/order/" .. $o.token
+      $body = "Hi " .. $o.c_name .. ",\n\nThanks for your order. Your items are ready:\n\n"
+      $body = $body .. "  " .. $order_url .. "\n\n"
+      $body = $body .. "That page holds your downloads and your receipt (INV-" .. $o.id .. ").\n"
+      $raw = nil
+      if ("" .. $o.password_hash) == "" then
+        -- DURABLE per-customer claim with crash-orphan recovery (nil = a
+        -- live link is already out there — omit the paragraph, never
+        -- invalidate a sent link). Anchored to OUR lease stamp: reclaimable
+        -- lease ⇒ sweepable orphan, with zero skew.
+        $raw = sh_issue_signup_token($o.customer_id, $lstamp)
+        if $raw != nil then
+          $body = $body .. "\nCreate an account password to see all your orders any time:\n"
+          $body = $body .. "  " .. biz_base_url() .. "/portal/set-password?token=" .. $raw .. "\n"
+        end
+      end
+      $body = $body .. "\n— " .. ("" .. $SITE["title"]) .. "\n"
+      -- PRE-STAMP delivered=1 before the send: `delivered` means "entered
+      -- the send attempt — POSSIBLY in the customer's hands; never
+      -- invalidate". A crash anywhere inside/after biz_mail then leaves a
+      -- preserved token (worst case: an unused live token for 72h,
+      -- recoverable via portal forgot-password), never a retired link a
+      -- customer actually holds. The orphan sweep consequently only fires
+      -- for tokens whose owner died in the tiny no-HTTP window between the
+      -- mint tx and this stamp. Definite non-submission (skip, failure
+      -- before EmailSubmission/set, or an explicit notCreated refusal)
+      -- retires below; an INDETERMINATE outcome (biz_mail's flag: transport
+      -- error at/after submission, or a response neither confirming nor
+      -- refusing — may have delivered) keeps the token preserved.
+      if $raw != nil then
+        db_exec("UPDATE customer_tokens SET delivered = 1 WHERE token_sha256 = ?1
+                 AND used_at IS NULL", [hash_sha256($raw)])
+      end
+      $r = biz_mail("" .. $o.c_email, "Your order is ready — INV-" .. $o.id, $body)
+      if $r["skipped"] then
+        -- mail off (definite — biz_mail returns before any submission): the
+        -- receipt is consumed (no backlog blast) but OUR token never left —
+        -- retire it so it can't block a future real send for 72h
+        if $raw != nil then
+          db_exec("UPDATE customer_tokens SET used_at = ?2 WHERE token_sha256 = ?1
+                   AND used_at IS NULL",
+                  [hash_sha256($raw), "undelivered:" .. biz_now()])
+        end
+        db_exec("UPDATE notification_events SET sent_at = ?3 WHERE id = ?1 AND sent_at = ?2",
+                [$o.nid, $lease, "skipped-off:" .. biz_now()])
+      else
+        if $r["ok"] then
+          db_exec("UPDATE notification_events SET sent_at = ?3 WHERE id = ?1 AND sent_at = ?2",
+                  [$o.nid, $lease, biz_now()])
+          $sent = $sent + 1
+        else
+          -- DEFINITE non-submission: retire OUR token so the retry's claim
+          -- mints a fresh one. INDETERMINATE: preserve it — the link may be
+          -- in the customer's inbox; the retry omits the link paragraph.
+          if $raw != nil and not $r["indeterminate"] then
+            db_exec("UPDATE customer_tokens SET used_at = ?2 WHERE token_sha256 = ?1
+                     AND used_at IS NULL",
+                    [hash_sha256($raw), "undelivered:" .. biz_now()])
+          end
+          -- release OUR lease — next tick retries immediately
+          db_exec("UPDATE notification_events SET sent_at = NULL WHERE id = ?1 AND sent_at = ?2",
+                  [$o.nid, $lease])
+        end
+      end
+    end
+  end
+  return $sent
+end

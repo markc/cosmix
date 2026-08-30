@@ -1,0 +1,192 @@
+-- admin_settings.mix — the ONE managed settings surface for both CMS and PIM
+-- (GET/POST /admin/settings). Two-tier model: site.conf.mix $SITE = Tier-1 versioned
+-- defaults; cms.db `settings` = Tier-2 admin overrides (db-wins, seeded from $SITE).
+-- This page edits Tier-2: site identity (title/tagline/footer) + the per-surface
+-- feature flags (blog/notes + pim_mail/pim_contacts/pim_calendar), with a
+-- reset-to-defaults action that re-asserts the site.conf.mix baseline.
+-- Theming is owned by the dcs.spa Appearance sidebar (per visitor) — no CMS theme
+-- setting. See _decisions/2026-06-20-settings-two-tier-model.md.
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+
+-- Upsert one settings row (key→value). Field names below match the parse_form keys.
+function as_set($k, $v)
+  db_exec("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2", [$k, "" .. $v])
+end
+
+-- Feature-toggle UI metadata: { "key", "label", "desc" } in display order. The
+-- canonical key LIST is feature_keys() (lib.mix); this only adds human labels/help.
+function as_feature_meta()
+  return [
+    { "key": "blog",         "label": "Blog",     "desc": "Home feed and individual posts (/post/…)." },
+    { "key": "notes",        "label": "Pages",    "desc": "Standalone pages (/page/…) and their nav links." },
+    { "key": "pim_mail",     "label": "Mail",     "desc": "Webmail — read & compose (/pim/mail)." },
+    { "key": "pim_contacts", "label": "Contacts", "desc": "Address book (/pim/contacts)." },
+    { "key": "pim_calendar", "label": "Calendar", "desc": "Events (/pim/calendar)." }
+  ]
+end
+
+function admin_settings_main()
+cms_init()
+$user = current_user($HEADERS)
+-- A modal fetch on an expired session returns a clean fragment, not a login redirect injected
+-- into the open dialog (matches the other modal-capable admin handlers).
+if md_is_modal_request() and $user == nil then
+  return md_session_expired("/admin/settings")
+end
+$deny = require_role($user, "admin")
+if $deny != nil then
+  return $deny
+end
+-- Settings presents ONLY as a popup modal. A successful save/reset PRG and a direct (non-modal)
+-- GET both land on the vhost dashboard (billing → /biz, else /admin) — the success toast rides
+-- the flash cookie; a direct visit carries ?openmodal so md_script auto-opens the modal there.
+-- No orphan full page. (A validation error, if any, still returns to /admin/settings to re-open
+-- the modal — this handler coerces rather than rejects, so it has none.)
+$dash = "/admin"
+if is_billing_vhost() then
+  $dash = "/biz"
+end
+
+if $METHOD == "POST" then
+  $f = parse_form($BODY)
+  $action = $f["action"]
+  if $action == nil then
+    $action = "save"
+  end
+
+  if $action == "reset" then
+    -- Re-assert the site.conf.mix (Tier-1) baseline: identity + every feature flag.
+    as_set("site_title", $SITE["title"])
+    $dtag = $SITE["tagline"]
+    if $dtag == nil then
+      $dtag = ""
+    end
+    as_set("tagline", $dtag)
+    $dfoot = $SITE["footer"]
+    if $dfoot == nil then
+      $dfoot = ""
+    end
+    as_set("footer", $dfoot)
+    -- Reading model (Part A): consume the vhost's Tier-1 defaults when site.conf.mix
+    -- declares them — a canvas/static-front vhost MUST declare
+    -- show_on_front/home_page_slug or Reset destroys its landing page — falling back
+    -- to the WP-style baseline: / shows the latest posts, page pointers cleared.
+    as_set("show_on_front", $SITE["show_on_front"] ?? "posts")
+    as_set("home_page_slug", $SITE["home_page_slug"] ?? "")
+    as_set("posts_page_slug", $SITE["posts_page_slug"] ?? "")
+    as_set("posts_per_page", "10")
+    as_set("feed_items", "20")
+    for each $k in feature_keys()
+      as_set("feature_" .. $k, feature_default_str($k))
+    end
+    -- PRG → dashboard + one-shot toast (modal closes; no reopen loop through /admin/settings).
+    return redirect_flash($dash, "Settings reset to the site defaults.", "success")
+  else
+    -- Identity (a blank title falls back to the site.conf title).
+    $title = $f["site_title"]
+    if $title == nil or trim($title) == "" then
+      $title = $SITE["title"]
+    end
+    $tagline = $f["tagline"]
+    if $tagline == nil then
+      $tagline = ""
+    end
+    $footer = $f["footer"]
+    if $footer == nil then
+      $footer = ""
+    end
+    as_set("site_title", $title)
+    as_set("tagline", $tagline)
+    as_set("footer", $footer)
+    -- Reading model (Part A): the master switch + its two page pointers + the two
+    -- count caps. Field names match the setting keys. show_on_front is validated to the
+    -- two known values (anything else → "posts"); the slugs are trimmed (blank = clear
+    -- the pointer); the counts are coerced to integers with sane floors.
+    $sof = "" .. fm_or($f["show_on_front"], "posts")
+    if $sof != "page" then
+      $sof = "posts"
+    end
+    as_set("show_on_front", $sof)
+    -- Static front page: a published page slug shown at / when show_on_front=page (needs
+    -- Pages enabled). Blank = fall back to the blog feed. Trimmed; nil → "".
+    $hps = $f["home_page_slug"]
+    if $hps == nil then
+      $hps = ""
+    end
+    as_set("home_page_slug", trim("" .. $hps))
+    -- Posts page: when show_on_front=page, the published page whose /page/<slug> hosts the
+    -- relocated blog index (intro + feed). Blank = no dedicated posts page.
+    $ppsl = $f["posts_page_slug"]
+    if $ppsl == nil then
+      $ppsl = ""
+    end
+    as_set("posts_page_slug", trim("" .. $ppsl))
+    -- posts_per_page (blog feed page size, floor 1) + feed_items (RSS item count, floor 1).
+    $ppp = to_number(fm_or($f["posts_per_page"], 10))
+    if $ppp < 1 then
+      $ppp = 10
+    end
+    as_set("posts_per_page", "" .. $ppp)
+    $fit = to_number(fm_or($f["feed_items"], 20))
+    if $fit < 1 then
+      $fit = 20
+    end
+    as_set("feed_items", "" .. $fit)
+    -- Feature flags: an unchecked checkbox is ABSENT from the POST body, so derive
+    -- each flag from key PRESENCE ("1" present / "0" absent), never from a value.
+    -- Iterate ONLY the RENDERED toggles (as_feature_meta) — config-only flags
+    -- (files, vtokens, forum) have no form control, and iterating feature_keys()
+    -- here silently zeroed them on every save (the historic feature_forum bug).
+    for each $fm in as_feature_meta()
+      $k = $fm["key"]
+      $on = "0"
+      if $f["feature_" .. $k] != nil then
+        $on = "1"
+      end
+      as_set("feature_" .. $k, $on)
+    end
+    -- PRG → dashboard + one-shot toast (modal closes; no reopen loop through /admin/settings).
+    return redirect_flash($dash, "Settings saved.", "success")
+  end
+end
+
+-- ── render: the settings modal/page (fm_settings — flat 2-col grid, no section chrome) ──
+-- Field names (site_title / tagline / footer / show_on_front / home_page_slug /
+-- posts_page_slug / posts_per_page / feed_items / feature_<key>) match the parse_form keys
+-- read in the POST branch above — do not rename. Per-field help_tip tooltips only (the "?"
+-- pattern); no section headings, subtitles, or inline notes (Mark 2026-07-13).
+
+-- Identity.
+$fields = fm_text("site_title", "Site title", {value: setting("site_title", $SITE["title"]), help: "Shown in the browser tab and the site header. HTML like <span>…</span> is rendered, so wrap part of the title to give it the accent colour.", help_tip: true})
+$fields = $fields .. fm_text("tagline", "Tagline", {value: setting("tagline", ""), help: "A short line shown as the site-title tooltip.", help_tip: true})
+$fields = $fields .. fm_text("footer", "Footer", {value: setting("footer", ""), help: "Shown in the page footer across the site.", help_tip: true})
+
+-- Home & Reading (the WP show_on_front model). The two page selects list every published
+-- page (slug=value, title=label) plus a leading "(none)"; the counts are numbers.
+$page_rows = db_query("SELECT slug, title FROM cms_posts WHERE kind = 'page' AND status = 'published' ORDER BY title", [])
+$page_opts = [ { value: "", "label": "(none)" } ]
+for each $pr in $page_rows
+  push($page_opts, { value: "" .. $pr["slug"], "label": "" .. $pr["title"] })
+end
+$sof_opts = [ { value: "posts", "label": "Your latest posts" }, { value: "page", "label": "A static page" } ]
+$fields = $fields .. fm_select("show_on_front", "Your homepage displays", $sof_opts, {value: setting("show_on_front", "posts"), help: "“Your latest posts” = the blog feed at /. “A static page” = show the Home page below at / (the blog moves to the Posts page).", help_tip: true})
+$fields = $fields .. fm_select("home_page_slug", "Home page", $page_opts, {value: setting("home_page_slug", ""), help: "Shown at / when a static page is selected above. Needs Pages enabled.", help_tip: true})
+$fields = $fields .. fm_select("posts_page_slug", "Posts page", $page_opts, {value: setting("posts_page_slug", ""), help: "When a static homepage is set, this page’s /page/<slug> hosts the blog index — its body becomes an intro above the post feed.", help_tip: true})
+$fields = $fields .. fm_number("posts_per_page", "Blog pages show at most", {value: setting("posts_per_page", "10"), help: "Posts per page in the blog feed (default 10).", help_tip: true})
+$fields = $fields .. fm_number("feed_items", "Feeds show the most recent", {value: setting("feed_items", "20"), help: "Number of items in the RSS feed at /feed (default 20).", help_tip: true})
+
+-- Features: one toggle per surface (name feature_<key> → the POST keys above). No desc
+-- (labels are self-explanatory; "no descriptions" per the modal spec).
+for each $fm in as_feature_meta()
+  $fields = $fields .. fm_toggle("feature_" .. $fm["key"], $fm["label"], { "checked": feature($fm["key"]) })
+end
+
+$reset = { label: "Reset", confirm: "Reset all settings to the site defaults? Your admin overrides will be lost." }
+if md_is_modal_request() then
+  return md_fragment(fm_settings({ mode: "modal", title: "Settings", action: "/admin/settings", id: "admin-settings", fields: $fields, submit: "Save", reset: $reset }))
+end
+-- Direct (non-modal) visit → dashboard + auto-open the Settings modal there (no orphan page).
+return redirect($dash .. "?openmodal=admin-settings")
+
+end

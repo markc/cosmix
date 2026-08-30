@@ -1,0 +1,66 @@
+-- printf.mix: Phase 3 fmt / printf format spec
+-- Expected output:
+-- hello world
+-- count=42
+-- pi=3.14
+-- pi6=3.141593
+-- [  7]
+-- [7   ]
+-- [   7]
+-- 100% done
+-- [alice       |   72]
+-- [bob         |   41]
+-- [eve         |   85]
+-- name=alice score=72
+-- rate=99.50%
+-- done
+-- Digest — 2026-04-13
+
+-- %s basic
+print fmt("hello %s", "world")
+
+-- %d integer
+print fmt("count=%d", 42)
+
+-- %.Nf precision
+print fmt("pi=%.2f", 3.14159)
+
+-- %f default precision (6 decimals like C)
+print fmt("pi6=%f", 3.14159265)
+
+-- %Nd right-align integer
+print fmt("[%3d]", 7)
+
+-- %-Ns left-align string
+print fmt("[%-4s]", "7")
+
+-- %Ns right-align string
+print fmt("[%4s]", "7")
+
+-- %% literal
+print fmt("100%% done")
+
+-- The digest acceptance pattern: tabular output with mixed specifiers
+$users = [
+    {name: "alice", score: 72},
+    {name: "bob", score: 41},
+    {name: "eve", score: 85}
+]
+for each $u in $users
+    print fmt("[%-12s|%5d]", $u.name, $u.score)
+next
+
+-- printf writes to stdout directly (no trailing newline unless in template)
+printf("name=%s score=%d\n", "alice", 72)
+
+-- Escaped percent inside a wider template
+print fmt("rate=%.2f%%", 99.5)
+
+-- Number-to-string coercion via %s (any Value goes through to_mix_string)
+print fmt("%s", "done")
+
+-- v0.2.4 regression: multi-byte UTF-8 characters in the template
+-- must not be decomposed into single bytes. Pre-fix, the em-dash
+-- below showed up as 'â' because the byte-indexed format parser
+-- cast each byte through `as char` (latin-1 semantics).
+print fmt("Digest — %s", "2026-04-13")

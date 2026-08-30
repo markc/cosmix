@@ -1,0 +1,12 @@
+-- comment line
+if $c then
+  print(1)
+else
+  print(2)
+end
+for each $x in $list do
+  print($x)
+end
+while $n do
+  $n = $n - 1
+end

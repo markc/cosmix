@@ -1,0 +1,131 @@
+-- Expected output:
+-- 0
+-- hello from mock
+-- 0
+-- world from mock
+-- 0
+-- address-cmd from mock
+-- 0
+-- another-cmd from mock
+-- emitted ok
+-- 0
+-- edit.open:/tmp/file.txt from mock
+-- 0
+-- edit.goto:50 from mock
+-- 0
+-- search:inbox from mock
+-- 0
+-- open:/tmp/test.txt from mock
+-- 0
+-- ui.list: from mock
+-- 0
+-- dyn1 from mock
+-- 0
+-- dyn2 from mock
+-- 0
+-- dyn3 from mock
+-- 0
+-- edit.open:/tmp/dyn.txt from mock
+-- 0
+-- search:positional from mock
+
+-- Test send statement
+send "test-port" greet name="hello"
+print $rc
+print $result
+
+-- Test send expression in assignment
+$r = send "test-port" greet name="world"
+print $rc
+print $r
+
+-- Test address block
+address "test-port"
+    greet name="address-cmd"
+end
+print $rc
+print $result
+
+-- Test address block with multiple commands
+address "test-port"
+    greet name="another-cmd"
+end
+print $rc
+print $result
+
+-- Test emit (fire-and-forget)
+emit "test-port" log level="info" msg="test"
+print "emitted ok"
+
+-- Test dotted command names in send
+send "test-port" edit.open path="/tmp/file.txt"
+print $rc
+print $result
+
+-- Test dotted command names in address block
+address "test-port"
+    edit.goto line=50
+end
+print $rc
+print $result
+
+-- Test named args in address block
+address "test-port"
+    search query="inbox"
+end
+print $rc
+print $result
+
+-- Test variable interpolation in address args
+$file = "/tmp/test.txt"
+address "test-port"
+    open path=$file
+end
+print $rc
+print $result
+
+-- Test no-arg command in address block
+address "test-port"
+    ui.list
+end
+print $rc
+print $result
+
+-- ── Dynamic command (verb in a variable) ──
+
+-- Variable in send-statement command position
+$cmd = "greet"
+send "test-port" $cmd name="dyn1"
+print $rc
+print $result
+
+-- Variable in send-expression command position
+$r = send "test-port" $cmd name="dyn2"
+print $rc
+print $r
+
+-- Variable in address-body command position (implicit-send form)
+address "test-port"
+    $cmd name="dyn3"
+end
+print $rc
+print $result
+
+-- Concat expression built into a variable, then dispatched.
+-- (Inline `send target (a .. b) …` collides with the pre-existing
+-- "string-followed-by-LParen = function call" grammar in parse_primary;
+-- pre-building the verb in a variable is the user-facing pattern.)
+$svc = "edit"
+$verb = "open"
+$dotted = $svc .. "." .. $verb
+send "test-port" $dotted path="/tmp/dyn.txt"
+print $rc
+print $result
+
+-- Dynamic command followed by a positional string arg — locks down the
+-- `Token::String + Token::Assign` lookahead so the bare positional is
+-- not swallowed by the named-arg path.
+$verb2 = "search"
+send "test-port" $verb2 "positional"
+print $rc
+print $result

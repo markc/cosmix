@@ -1,0 +1,36 @@
+[workspace]
+members = [
+    "ctk",
+    "apps/studio",
+    "apps/filemgr",
+    "apps/tray",
+    "apps/trayd",
+    "apps/tower",
+    "apps/mail",
+    "apps/interactgui",
+    "apps/quoin",
+    "crates/cosmix-design",
+    "crates/cosmix-comp",
+    "crates/cosmix-deco",
+    "crates/cosmix-shell",
+    "crates/cosmix-wgpu-dmabuf",
+    "crates/cosmix-wl-dnd",
+    "spike/wl-dnd",
+]
+# Everything under vendor/ is a patch source, not a member: it must resolve as
+# the crates.io package it is a copy of, not as another crate in this workspace.
+# Without this, cargo walks up from vendor/<crate>/Cargo.toml, finds this
+# [workspace], and refuses to build a package that is neither listed nor excluded.
+exclude = ["vendor"]
+resolver = "3"
+
+# Vendored upstream sources with narrow local patches: see vendor/README.md for
+# provenance, exact patch shape and source-routing assertions.
+[patch.crates-io]
+smithay = { path = "vendor/smithay" }
+wgpu = { path = "vendor/wgpu" }
+wgpu-core = { path = "vendor/wgpu-core" }
+
+[profile.release]
+strip = true
+lto = "thin"

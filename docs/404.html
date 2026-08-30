@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>CosMix — redirecting…</title>
+    <meta name="robots" content="noindex">
+    <script>
+    /* Doc pages are served as pre-generated stubs at clean URLs
+       (cosmix.dev/mix/builtins — see build/gen-doc-pages.mix); raw .md
+       fetches (e.g. the `mix man` client hitting /mix/<topic>.md) resolve
+       directly and never reach this page. Landing here with a doc-shaped
+       path means the stub is missing — usually a doc added without
+       regenerating — so fall back to the front page's legacy hash route,
+       which renders it anyway. Anything unrecognised goes home. */
+    (function () {
+        var target = '/';
+        var r = location.pathname.match(/^\/(README|AGENTS|CLAUDE|VERSIONS)$/);
+        if (r) {
+            location.replace('/#' + r[1] + '.md' + (location.hash || ''));
+            return;
+        }
+        var m = location.pathname.match(/^\/(bus|cos|mix|bugs)(?:\/(.*))?$/);
+        if (m) {
+            var sec = m[1];
+            var rest = m[2] || '';
+            if (rest === '' || rest.slice(-1) === '/') rest += 'README.md';
+            else if (!/\.md$/i.test(rest)) rest += '.md';
+            target = '/#' + sec + '/' + rest + (location.hash || '');
+        }
+        location.replace(target);
+    })();
+    </script>
+</head>
+<body>
+    <p>Redirecting to <a href="/">cosmix.dev</a>…</p>
+</body>
+</html>

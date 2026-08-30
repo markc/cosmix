@@ -1,0 +1,106 @@
+-- feed.mix (h_feed) — RSS 2.0 feed of published public posts (GET /feed).
+--
+-- The blog's syndication surface. Both editor-authored and email-to-post posts
+-- (kind='post', imported into cms_posts) appear here. Returns XML DIRECTLY (not
+-- via doc(), which is HTML/Datastar) as a {status, headers, body} response.
+--
+-- PUBLIC-ONLY by construction: a feed is tokenless + cacheable, so it never
+-- includes private posts even for a signed-in viewer. Minimal correct RSS 2.0 —
+-- <description> carries the (escaped) excerpt, not rendered body; Atom,
+-- content:encoded and per-tag feeds are deliberate later additions (P4). Absolute
+-- links via site_url(). Gated on the `blog` feature like the home feed.
+function feed_main()
+  cms_init()
+  if not feature("blog") then
+    return { status: 404, headers: { "Content-Type": "text/plain; charset=utf-8", "X-Content-Type-Options": "nosniff" }, body: "not found" }
+  end
+
+  $base = site_url()
+  $title = setting("site_title", $SITE["title"])
+  $desc = setting("tagline", $SITE["tagline"])
+
+  -- Per-term feeds (P4): /feed?tag=<slug> or /feed?category=<slug> filters the items to
+  -- posts in that term and narrows the channel <title>. An unknown slug returns an empty
+  -- (but valid) RSS document titled "<site> — nothing here", never a 500. The unfiltered
+  -- /feed path is unchanged. Resolve the term to its id and filter via term_relations
+  -- with a bind (cms_posts aliased p so the subquery is unambiguous).
+  $qp = parse_query($QUERY)
+  $term = nil
+  $term_tax = ""
+  if $qp["tag"] != nil and trim("" .. $qp["tag"]) != "" then
+    $term_tax = "tag"
+    $term = term_by_slug("tag", trim("" .. $qp["tag"]))
+  else
+    if $qp["category"] != nil and trim("" .. $qp["category"]) != "" then
+      $term_tax = "category"
+      $term = term_by_slug("category", trim("" .. $qp["category"]))
+    end
+  end
+
+  -- feed_items setting (Part A — was a hardcoded 20): how many items the RSS feed carries,
+  -- clamped to 1..100 so a bad value can't return zero items or an unbounded dump. Passed
+  -- as a BIND (LIMIT ?n), never string-interpolated.
+  $lim = to_number(setting("feed_items", 20))
+  if $lim < 1 then
+    $lim = 1
+  end
+  if $lim > 100 then
+    $lim = 100
+  end
+
+  $rows = []
+  if $term_tax != "" and $term == nil then
+    -- A tag/category was requested but doesn't exist: empty feed, clear title, no 500.
+    $title = $title .. " — nothing here"
+  else
+    if $term != nil then
+      -- Filtered feed: only posts related to this term. Narrow the channel title.
+      if $term_tax == "category" then
+        $title = $title .. " — category: " .. ("" .. $term["name"])
+      else
+        $title = $title .. " — tagged " .. ("" .. $term["name"])
+      end
+      $rows = db_query("SELECT p.slug AS slug, p.title AS title, p.excerpt AS excerpt, p.body AS body, p.created AS created, p.updated AS updated FROM cms_posts p WHERE p.kind = 'post' AND p.status = 'published' AND p.visibility = 'public' AND p.id IN (SELECT post_id FROM term_relations WHERE term_id = ?1) ORDER BY p.updated DESC LIMIT ?2", [$term["id"], $lim])
+    else
+      -- Unfiltered feed: published + public posts, newest-updated first, bounded.
+      $rows = db_query("SELECT slug, title, excerpt, body, created, updated FROM cms_posts WHERE kind = 'post' AND status = 'published' AND visibility = 'public' ORDER BY updated DESC LIMIT ?1", [$lim])
+    end
+  end
+
+  $items = ""
+  $latest = ""
+  for each $p in $rows
+    $url = $base .. "/post/" .. url_encode("" .. $p["slug"])
+    -- description = excerpt, or a trimmed body fallback (never rendered HTML here)
+    $dsc = trim("" .. $p["excerpt"])
+    if $dsc == "" then
+      $dsc = substr("" .. $p["body"], 0, 200)
+    end
+    if $latest == "" then
+      $latest = rfc822($p["updated"])
+    end
+    $items = $items .. "<item>"
+    $items = $items .. "<title>" .. xml_esc($p["title"]) .. "</title>"
+    $items = $items .. "<link>" .. xml_esc($url) .. "</link>"
+    $items = $items .. "<guid isPermaLink=\"true\">" .. xml_esc($url) .. "</guid>"
+    $pub = rfc822($p["created"])
+    if $pub != "" then
+      $items = $items .. "<pubDate>" .. $pub .. "</pubDate>"
+    end
+    $items = $items .. "<description>" .. xml_esc($dsc) .. "</description>"
+    $items = $items .. "</item>"
+  end
+
+  $xml = '<?xml version="1.0" encoding="UTF-8"?>'
+  $xml = $xml .. '<rss version="2.0"><channel>'
+  $xml = $xml .. "<title>" .. xml_esc($title) .. "</title>"
+  $xml = $xml .. "<link>" .. xml_esc($base .. "/") .. "</link>"
+  $xml = $xml .. "<description>" .. xml_esc($desc) .. "</description>"
+  if $latest != "" then
+    $xml = $xml .. "<lastBuildDate>" .. $latest .. "</lastBuildDate>"
+  end
+  $xml = $xml .. $items
+  $xml = $xml .. "</channel></rss>"
+
+  return { status: 200, headers: { "Content-Type": "application/rss+xml; charset=utf-8", "X-Content-Type-Options": "nosniff", "Cache-Control": "max-age=300" }, body: $xml }
+end

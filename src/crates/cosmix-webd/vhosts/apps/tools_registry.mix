@@ -1,0 +1,245 @@
+-- tools_registry.mix — the DECLARATIVE tool registry: what may run, what params it
+-- takes, how they are validated, and the per-tool limits. Deployed to TWO trees from
+-- this ONE source (single source of truth):
+--
+--   /opt/cosmix/vhosts/shared/apps/tools_registry.mix   (webd — validate at enqueue)
+--   /opt/cosmix/share/cosmix/tools_registry.mix             (toolsd — validate again at exec)
+--
+-- Codex (019f5bc3) requires validation at BOTH ends: webd is the authenticated gate,
+-- toolsd re-validates because it is the thing that actually execs. This file therefore
+-- carries NO argv and NO I/O — the argv templates live ONLY in toolsd (tools_exec.mix),
+-- so a webd compromise cannot choose an executable, only name a registered tool and fill
+-- its parameter slots.
+--
+-- PURE: no db, no net, no exec, no regex (webd's embedded Mix is a feature-gated subset
+-- WITHOUT the regex feature — every validator below is hand-written on purpose).
+
+-- Characters a DNS label may contain, once lowercased. Anything outside this set is
+-- rejected outright — this is an allowlist, never a denylist.
+$TOOLS_LABEL_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789-"
+
+-- The dig record types we expose. An allowlist: dig takes a type positionally, so an
+-- unvalidated value here would be a free argv slot.
+$TOOLS_DNS_TYPES = ["a", "aaaa", "mx", "ns", "txt", "soa", "cname", "ptr", "srv", "caa"]
+
+-- Every char of $s is in $set. Empty string → false (callers want non-empty).
+function tools_chars_ok($s, $set)
+  $n = length($s)
+  if $n == 0 then
+    return false
+  end
+  $i = 0
+  while $i < $n
+    -- pos() is needle-first and 1-BASED; 0 = not found.
+    if pos(substr($s, $i, 1), $set) == 0 then
+      return false
+    end
+    $i = $i + 1
+  end
+  return true
+end
+
+-- A registrable domain name. Deliberately strict (Codex: "reject option-like values such
+-- as leading `-`, empty labels, excessive lengths, and unsupported Unicode BEFORE
+-- execution"). Returns the normalised (lowercased) name, or nil.
+--
+-- The leading-'-' rule is the load-bearing one: whois/dig take a bare positional
+-- argument, so a name like "-h" would otherwise be read as a FLAG. We also pass `--`
+-- at the argv layer, but this is the primary defence, not the backstop.
+function tools_valid_domain($raw)
+  $d = lower(trim("" .. $raw))
+  if $d == "" or length($d) > 253 then
+    return nil
+  end
+  if starts_with($d, "-") or starts_with($d, ".") or ends_with($d, ".") then
+    return nil
+  end
+  $labels = split($d, ".")
+  -- A bare label ("localhost") is not a lookup we want to hand to whois.
+  if length($labels) < 2 then
+    return nil
+  end
+  for each $l in $labels
+    if length($l) == 0 or length($l) > 63 then
+      return nil
+    end
+    if starts_with($l, "-") or ends_with($l, "-") then
+      return nil
+    end
+    -- Rejects every non-LDH byte, so unsupported Unicode / spaces / NUL / shell
+    -- metacharacters can never reach argv. (Punycode "xn--…" is pure LDH and passes.)
+    if not tools_chars_ok($l, $TOOLS_LABEL_CHARS) then
+      return nil
+    end
+  end
+  return $d
+end
+
+-- A dig record type, from the allowlist. Returns the normalised type, or nil.
+function tools_valid_dns_type($raw)
+  $t = lower(trim("" .. $raw))
+  if $t == "" then
+    return "a"
+  end
+  if not contains($TOOLS_DNS_TYPES, $t) then
+    return nil
+  end
+  return $t
+end
+
+-- ── the registry ───────────────────────────────────────────────────────────────
+--
+-- tool -> {
+--   label       : human name (menus, modal titles)
+--   min_role    : required role, enforced at enqueue (webd) AND at exec (toolsd).
+--                 A tool with NO min_role is DENIED (Codex: "default-deny tools missing
+--                 authz metadata") — see tools_spec().
+--   params      : ordered [{ name, type, required }]; `type` selects the validator.
+--   timeout     : seconds, per Codex's initial limits table.
+--   max_output  : hard byte cap on captured stdout+stderr.
+-- }
+--
+-- `shwho` is the requested composite (byte-identical to the CLI, because toolsd
+-- runs the reviewed script itself — see tools_exec.mix). `whois` and `dig` are the
+-- primitives, registered separately so sidebars/canvas pages can call them directly.
+--   retryable   : may this tool be RE-EXECUTED if its lease expires before the run was
+--                 reported (e.g. the drain died mid-report)? True only for side-effect-FREE
+--                 tools. A read-only lookup is safe to repeat; a future mutating tool MUST
+--                 set false, which makes an expired lease terminal rather than re-run it.
+function tools_registry()
+  return {
+    shwho: { label: "Shwho", min_role: "admin", timeout: 40, max_output: 131072, retryable: true,
+             params: [{ name: "domain", type: "domain", required: true }] },
+    whois: { label: "Whois", min_role: "admin", timeout: 30, max_output: 262144, retryable: true,
+             params: [{ name: "domain", type: "domain", required: true }] },
+    dig:   { label: "Dig",   min_role: "admin", timeout: 8,  max_output: 65536, retryable: true,
+             params: [{ name: "domain", type: "domain",    required: true },
+                      { name: "type",   type: "dns_type",  required: false }] },
+    -- T2: streaming traceroute to the domain's host, one hop at a time. `stream: true`
+    -- routes it through the drain's hop-loop (traceroute -f N -m N per hop) + progress
+    -- reports, so the modal <pre> grows hop-by-hop. Bound is forced into argv
+    -- (max_hops), never a caller value. Local tool — no ssh, no new identity.
+    trace: { label: "Trace", min_role: "admin", timeout: 60, max_output: 16384, retryable: true, stream: true,
+             params: [{ name: "domain", type: "domain", required: true }] }
+  }
+end
+
+-- Streaming tools go through the drain's progress path rather than a single run_argv.
+function tools_is_stream($tool)
+  $s = tools_spec($tool)
+  return $s != nil and $s["stream"] == true
+end
+
+-- ── roles ──────────────────────────────────────────────────────────────────────
+--
+-- An EXPLICIT ladder, because `min_role` is a string and a bare `== "admin"` test would
+-- silently pass EVERY role the moment a tool declares any other value (Codex: a tool with
+-- min_role:"author" would be reachable by a plain user, since nothing would compare).
+-- Unknown role → rank 0 → satisfies nothing. Unknown min_role → nil → DENY (fail closed).
+function tools_role_rank($role)
+  $r = lower(trim("" .. $role))
+  if $r == "admin" then
+    return 3
+  end
+  if $r == "author" then
+    return 2
+  end
+  if $r == "user" then
+    return 1
+  end
+  return 0
+end
+
+-- The rank a tool DEMANDS. nil ⇒ the registry names a role we don't know ⇒ deny.
+function tools_required_rank($spec)
+  $m = lower(trim("" .. $spec["min_role"]))
+  if $m != "admin" and $m != "author" and $m != "user" then
+    return nil
+  end
+  return tools_role_rank($m)
+end
+
+-- The single authz predicate, used at BOTH ends (webd at enqueue, toolsd at exec).
+function tools_role_ok($spec, $role)
+  $need = tools_required_rank($spec)
+  if $need == nil then
+    return false
+  end
+  return tools_role_rank($role) >= $need
+end
+
+-- The spec for one tool, or nil if it is not registered / carries no authz metadata.
+-- Default-deny: a registry entry without min_role is treated as UNREGISTERED.
+function tools_spec($tool)
+  $reg = tools_registry()
+  $t = "" .. $tool
+  if $reg[$t] == nil then
+    return nil
+  end
+  $spec = $reg[$t]
+  if $spec["min_role"] == nil or ("" .. $spec["min_role"]) == "" then
+    return nil
+  end
+  return $spec
+end
+
+-- Validate a caller's raw params against a tool's spec.
+--   → { ok: true,  params: <normalised map> }
+--   → { ok: false, error: "<reason>" }
+-- Only declared parameter names survive: an undeclared key is dropped, never passed on.
+-- The returned map is what gets persisted and what toolsd fills its argv slots from.
+function tools_validate($tool, $raw)
+  $spec = tools_spec($tool)
+  if $spec == nil then
+    return { ok: false, error: "unknown tool" }
+  end
+  $out = {}
+  for each $p in $spec["params"]
+    $name = "" .. $p["name"]
+    $val = ""
+    if $raw != nil and $raw[$name] != nil then
+      $val = "" .. $raw[$name]
+    end
+    if trim($val) == "" then
+      if $p["required"] == true then
+        return { ok: false, error: "missing required parameter: " .. $name }
+      end
+      -- Absent optional param: let the validator supply its default (dig type → "a").
+    end
+    $ty = "" .. $p["type"]
+    $norm = nil
+    if $ty == "domain" then
+      $norm = tools_valid_domain($val)
+    end
+    if $ty == "dns_type" then
+      $norm = tools_valid_dns_type($val)
+    end
+    -- An unknown param TYPE is a registry bug, not caller input → fail closed.
+    if $ty != "domain" and $ty != "dns_type" then
+      return { ok: false, error: "registry: unknown param type " .. $ty }
+    end
+    if $norm == nil then
+      return { ok: false, error: "invalid " .. $name }
+    end
+    $out[$name] = $norm
+  end
+  return { ok: true, params: $out }
+end
+
+-- Canonical JSON for the params map — the string that is persisted AND hashed into the
+-- idempotency key. Key order must be STABLE, so we emit in the registry's declared param
+-- order rather than trusting map iteration order.
+function tools_canonical_params($tool, $params)
+  $spec = tools_spec($tool)
+  if $spec == nil then
+    return "{}"
+  end
+  $ordered = {}
+  for each $p in $spec["params"]
+    $name = "" .. $p["name"]
+    if $params[$name] != nil then
+      $ordered[$name] = "" .. $params[$name]
+    end
+  end
+  return json_encode($ordered)
+end

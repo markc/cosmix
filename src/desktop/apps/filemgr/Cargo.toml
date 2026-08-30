@@ -1,0 +1,37 @@
+# desktop/apps/filemgr — CosMix FileMgr, the twin-pane desktop file manager.
+# It shares the desktop workspace while headless substrate remains in src/.
+# See desktop/APPS.md.
+[package]
+name = "cosmix-filemgr"
+version = "0.9.5"
+description = "CosMix FileMgr — a native CTK twin-pane file manager"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+
+[package.metadata.cosmix]
+kind = "app"
+component = "filemgr"
+display = "CosMix FileMgr"
+engine = "bevy"
+
+[[bin]]
+name = "cosmix-filemgr"
+path = "src/main.rs"
+
+[build-dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+
+[dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+bevy = { version = "=0.19.0", default-features = false, features = [
+    "ui",
+    "bevy_feathers",
+    "accesskit_unix",
+] }
+ctk = { path = "../../ctk", features = ["bus", "actions", "icons", "os-dnd", "theme"] }
+cosmix-actions = { path = "../../../crates/cosmix-actions" }
+cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

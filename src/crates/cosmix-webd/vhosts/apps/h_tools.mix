@@ -1,0 +1,282 @@
+-- h_tools.mix — the /tools surface: run a REGISTERED CLI tool and show its raw output.
+--
+--   GET  /tools/view?tool=&…&modal=1  → the popup modal (spinner + <pre> + Refresh)
+--   POST /tools/run                    → enqueue a run (admin; server-derived identity)
+--   GET  /tools/status?id=<n>          → poll one run (JSON; requester-only) (x-tools-token)
+--   POST /tools/claim-next             → the toolsd drain claims a run   (x-tools-secret)
+--   POST /tools/report                 → the toolsd drain reports back   (x-tools-secret)
+--
+-- webd cannot exec (its Mix sandbox denies Process/Env unconditionally), so /tools/run
+-- only ENQUEUES; the unprivileged toolsd drain does the actual run_argv and posts the
+-- output back. See tools_lib.mix for the queue + the trust reasoning, tools_registry.mix
+-- for what may run at all.
+--
+-- The two secret-gated seam endpoints are matched FIRST, before any session lookup: the
+-- drain is cookieless and has no session (webd's CSRF gate allows a both-absent
+-- Origin/cookie request precisely so machine callers work).
+
+include "/opt/cosmix/vhosts/shared/apps/tools_lib.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+
+-- The poll cadence: fast first, then backing off.
+--
+-- A flat 1s interval made a SHORT run feel slow — a cached dig that finished in 300ms sat
+-- there until the next tick, so the modal never felt "instant" the way the old PHP shwho
+-- did. But a flat 150ms would hammer the endpoint for the whole 40s of a cold whois. So:
+-- start at 150ms and grow per poll up to a ceiling.
+--
+-- The CEILING is what bounds how late a finished run is noticed — a run that completes just
+-- after a poll waits up to one full gap. A 1s ceiling therefore kept the old 1s worst case
+-- (measured: a shwho finishing at ~1.1s was seen at 1.7s, WORSE than the flat 1s poller
+-- that happened to tick right on it). 500ms halves that worst case while staying cheap: a
+-- 40s whois costs ~80 polls instead of ~40, each a single indexed SELECT.
+--
+-- Gaps: 150, 225, 337, 500, 500… → a fast tool answers on poll 1-2, and nothing ever waits
+-- more than half a second to be noticed.
+$TOOLS_POLL_FIRST_MS = 150
+$TOOLS_POLL_MAX_MS = 500
+-- x10 so the growth factor stays an integer in the emitted JS (1.5 == 15/10).
+$TOOLS_POLL_GROW_X10 = 15
+
+-- ── the modal fragment ─────────────────────────────────────────────────────────
+--
+-- Renders the shell ONLY. The output arrives via JS (POST /tools/run → poll
+-- /tools/status) and is written with textContent — escaped exactly once, and never
+-- reinterpreted as HTML/ANSI/Markdown/script (Codex).
+function tools_view_panel($tool, $spec, $params)
+  $title = ("" .. $spec["label"]) .. " — " .. ("" .. tools_or($params["domain"], ""))
+  $b = '<div class="tools-run" data-tool="' .. esc("" .. $tool) .. '">'
+  $b = $b .. '<div class="tools-status" data-tools-status>'
+  $b = $b .. '<span class="tools-spinner" aria-hidden="true"></span> <span data-tools-msg>Running ' .. esc("" .. $tool) .. '…</span>'
+  $b = $b .. '</div>'
+  -- The output surface. `tabindex` so it is keyboard-scrollable; the CLI look is CSS.
+  $b = $b .. '<pre class="tools-output" data-tools-output tabindex="0" aria-live="polite"></pre>'
+  $b = $b .. '</div>'
+  return $b
+end
+
+-- The client. Mints an invocation id ONCE (so a double-click / retry collapses to one
+-- run — the idempotency key folds it in), POSTs the run, then polls to terminal.
+-- Refresh mints a NEW invocation, which is what makes an explicit re-run legal.
+function tools_view_script($tool, $params)
+  -- Mix statements END AT A NEWLINE — there is no line continuation outside brackets.
+  -- Successive `$s = $s .. …` is also the in-place O(n) concat fast path (0.31.1).
+  $s = '<script>(function(){'
+  $s = $s .. 'var root=document.currentScript.closest(".md-panel")||document;'
+  $s = $s .. 'var out=root.querySelector("[data-tools-output]");'
+  $s = $s .. 'var msg=root.querySelector("[data-tools-msg]");'
+  $s = $s .. 'var box=root.querySelector("[data-tools-status]");'
+  $s = $s .. 'var btn=root.querySelector("[data-tools-refresh]");'
+  $s = $s .. 'var tool=' .. json_encode("" .. $tool) .. ';'
+  $s = $s .. 'var args=' .. json_encode($params) .. ';'
+  $s = $s .. 'var timer=null;'
+  $s = $s .. 'var delay=' .. ("" .. $TOOLS_POLL_FIRST_MS) .. ';'
+  -- uuid(): hex+dash only — the server validates the shape (tools_valid_invocation).
+  $s = $s .. 'function uuid(){if(window.crypto&&crypto.randomUUID)return crypto.randomUUID();'
+  $s = $s .. 'var s="";for(var i=0;i<32;i++){s+="0123456789abcdef"[Math.floor(Math.random()*16)];}return s;}'
+  $s = $s .. 'function stop(){if(timer){clearTimeout(timer);timer=null;}}'
+  -- Self-scheduling, so the NEXT poll is only queued once the previous one has answered.
+  -- setInterval fired on the clock regardless, which could stack overlapping requests on a
+  -- slow endpoint; a chained timeout cannot.
+  $s = $s .. 'function sched(id,tok){stop();timer=setTimeout(function(){poll(id,tok);},delay);'
+  $s = $s .. 'delay=Math.min(Math.round(delay*' .. ("" .. $TOOLS_POLL_GROW_X10) .. '/10),' .. ("" .. $TOOLS_POLL_MAX_MS) .. ');}'
+  $s = $s .. 'function fin(state,text){stop();box.className="tools-status tools-"+state;'
+  $s = $s .. 'msg.textContent=text;if(btn)btn.disabled=false;}'
+  -- textContent, NOT innerHTML: the tool output is plain text and STAYS plain text.
+  $s = $s .. 'function show(t){out.textContent=t||"";}'
+  -- The invocation id identifies THIS action, and is minted ONCE — so any retry of the
+  -- POST (a double-click, a dropped response) folds into the SAME run via the idempotency
+  -- key. Only an explicit Refresh rotates it, which is precisely what makes a re-run legal.
+  $s = $s .. 'var inv=uuid();'
+  -- The poller must FAIL TERMINALLY on a non-200. Swallowing every error left an eternal
+  -- spinner whenever the run became unreadable (an expired session, a token the server no
+  -- longer accepts, a run that predates the token column) — the user would sit and watch
+  -- it forever with no idea anything was wrong (Codex).
+  -- The token rides a HEADER, never the query string: it is a read-capability for the
+  -- run's output, and a query string lands in the request line — so it is copied into
+  -- webd's access log and any intermediary's, and is visible to anything reading URLs
+  -- (devtools, extensions, an operator over a shoulder). A header keeps it out of all of
+  -- those. Narrow claim deliberately: this is a background fetch(), so the URL never
+  -- entered browser history, and the output is written with textContent (see show()
+  -- below) so there is no link whose Referer could carry it — the log/intermediary
+  -- exposure is the whole reason, and it is reason enough.
+  --
+  -- Second, smaller benefit: X-Tools-Token is not a CORS-safelisted header, so a
+  -- cross-origin page cannot set it without a preflight this server does not answer.
+  -- That is a browser-enforced boundary, not an unforgeable capability — any non-browser
+  -- client can set the header freely. The token's secrecy is what protects the run.
+  $s = $s .. 'function poll(id,tok){fetch("/tools/status?id="+encodeURIComponent(id),'
+  $s = $s .. '{credentials:"same-origin",headers:{"X-Tools-Token":tok}})'
+  $s = $s .. '.then(function(r){if(!r.ok){throw new Error(r.status===404?"run not readable":("HTTP "+r.status));}return r.json();})'
+  $s = $s .. '.then(function(j){'
+  $s = $s .. 'if(j.output)show(j.output);'
+  $s = $s .. 'if(j.status==="done"){fin("ok",j.exit_code===0?"done":("exit "+j.exit_code));}'
+  $s = $s .. 'else if(j.status==="error"||j.status==="abandoned"){show(j.output||j.error||"");'
+  $s = $s .. 'fin("err",j.error||j.status);}'
+  -- still queued/claimed → queue the next poll (fin() would have cleared the timer).
+  $s = $s .. 'else{sched(id,tok);}'
+  $s = $s .. '}).catch(function(e){fin("err",(e&&e.message)||"lost contact with the server");});}'
+  -- Reset the backoff on every run, so a Refresh is as snappy as the first open.
+  $s = $s .. 'function run(){stop();delay=' .. ("" .. $TOOLS_POLL_FIRST_MS) .. ';'
+  $s = $s .. 'if(btn)btn.disabled=true;show("");box.className="tools-status";'
+  $s = $s .. 'msg.textContent="Running "+tool+"…";'
+  $s = $s .. 'var body=new URLSearchParams();body.set("tool",tool);body.set("invocation",inv);'
+  $s = $s .. 'for(var k in args){body.set(k,args[k]);}'
+  $s = $s .. 'fetch("/tools/run",{method:"POST",credentials:"same-origin",'
+  $s = $s .. 'headers:{"Content-Type":"application/x-www-form-urlencoded"},body:body.toString()})'
+  $s = $s .. '.then(function(r){return r.json().then(function(j){return {s:r.status,j:j};});})'
+  $s = $s .. '.then(function(res){if(res.s!==200||!res.j.run_id){fin("err",res.j.error||("HTTP "+res.s));return;}'
+  -- The FIRST poll fires immediately (the drain is woken synchronously with this POST, so a
+  -- cheap tool can already be done); poll() then chains its own backoff.
+  $s = $s .. 'var id=res.j.run_id;var tok=res.j.token||"";poll(id,tok);})'
+  $s = $s .. '.catch(function(){fin("err","request failed");});}'
+  -- Refresh = a NEW invocation ⇒ a genuinely new run (a double-click on Shwho would
+  -- otherwise just re-read the same one).
+  $s = $s .. 'if(btn)btn.addEventListener("click",function(){inv=uuid();run();});'
+  $s = $s .. 'run();'
+  $s = $s .. '})();</script>'
+  return $s
+end
+
+function tools_view($tool_raw, $q, $user)
+  $tool = "" .. tools_or($tool_raw, "")
+  $spec = tools_spec($tool)
+  if $spec == nil then
+    return md_fragment(md_panel({ title: "Unknown tool", submit: false, cancel: "Close" },
+      '<p class="fm-help">No such tool.</p>'))
+  end
+  -- Validate here too, so a bad domain is refused in the dialog rather than at enqueue.
+  $v = tools_validate($tool, $q)
+  if $v["ok"] != true then
+    return md_fragment(md_panel({ title: "" .. $spec["label"], submit: false, cancel: "Close" },
+      '<p class="fm-help">' .. esc("" .. $v["error"]) .. '</p>'))
+  end
+  $params = $v["params"]
+  $title = ("" .. $spec["label"]) .. " — " .. ("" .. tools_or($params["domain"], ""))
+  -- The Refresh control lives in the header band so it survives a long output scroll.
+  -- Refresh mints a NEW invocation id, which is exactly what makes a re-run legal
+  -- (the idempotency key folds the invocation in — a double-click does NOT re-run).
+  $hdr = '<div class="md-head-row"><h2 class="md-title">' .. esc($title) .. '</h2>'
+  $hdr = $hdr .. '<button type="button" class="btn btn-ghost btn-sm" data-tools-refresh disabled>'
+  $hdr = $hdr .. '<i data-lucide="refresh-cw" aria-hidden="true"></i> Refresh</button></div>'
+  $body = tools_view_panel($tool, $spec, $params) .. tools_view_script($tool, $params)
+  return md_fragment(md_panel({ header: $hdr, size: "lg", submit: false, cancel: "Close" }, $body))
+end
+
+-- ── POST /tools/run ────────────────────────────────────────────────────────────
+--
+-- The identity is taken from the SESSION, never the payload (Codex). The Bus wake is
+-- fire-and-forget: toolsd claims the run itself through the authenticated seam, so a
+-- failed wake only costs latency (the drain's timer backstop still picks it up).
+function tools_run($user)
+  $f = parse_form($BODY)
+  $tool = "" .. tools_or($f["tool"], "")
+  $who = "" .. tools_or($user["username"], "")
+  $role = "" .. tools_or($user["role"], "")
+  $vhost = "" .. tools_or($SITE["fqdn"], "")
+  $r = tools_enqueue($tool, $f, $who, $role, $vhost, tools_or($f["invocation"], ""))
+  if $r["ok"] != true then
+    return tools_reply(to_number("" .. $r["code"]), { error: "" .. $r["error"] })
+  end
+  -- The poll token goes back ONLY here, to the caller that enqueued the run. It is what
+  -- makes /tools/status requester-only on a shared dev_session identity.
+  $token = "" .. tools_or($r["token"], "")
+  -- Nudge the drain. Authority-free verb: no args, no target — it only asks toolsd to
+  -- drain runs it independently claims. A wake failure is NOT fatal.
+  if $r["duplicate"] != true then
+    try
+      $_ = bus_call("toolsd.wake", {})
+    catch $e
+    end
+  end
+  return tools_reply(200, { run_id: to_number("" .. $r["id"]), status: "" .. $r["status"], token: $token })
+end
+
+-- ── GET /tools/status?id=<n>  (X-Tools-Token: <t>) ─────────────────────────────
+function tools_status_json($id, $token, $user)
+  $who = "" .. tools_or($user["username"], "")
+  $r = tools_status($id, $who, $token)
+  if $r == nil then
+    -- Same answer for "no such run" and "wrong token": never confirm a run exists to a
+    -- caller who cannot read it.
+    return tools_reply(404, { error: "no such run" })
+  end
+  return tools_reply(200, {
+    run_id: to_number("" .. $r["id"]),
+    tool: "" .. $r["tool"],
+    status: "" .. $r["status"],
+    exit_code: to_number("" .. tools_or($r["exit_code"], "")),
+    output: "" .. tools_or($r["output"], ""),
+    error: "" .. tools_or($r["error"], ""),
+    truncated: to_number("" .. tools_or($r["truncated"], "0")),
+    terminal: tools_is_terminal($r["status"])
+  })
+end
+
+-- ── entry ──────────────────────────────────────────────────────────────────────
+function tools_main()
+  cms_init()
+  tools_init()
+
+  -- Machine seam FIRST: the drain is cookieless, so no session lookup may precede it.
+  if ends_with($PATH, "/tools/claim-next") then
+    if $METHOD != "POST" then
+      return tools_reply(405, { error: "POST only" })
+    end
+    if not tools_drain_authorized() then
+      return tools_reply(401, { error: "unauthorized" })
+    end
+    return tools_claim_next()
+  end
+  if ends_with($PATH, "/tools/report") then
+    if $METHOD != "POST" then
+      return tools_reply(405, { error: "POST only" })
+    end
+    if not tools_drain_authorized() then
+      return tools_reply(401, { error: "unauthorized" })
+    end
+    return tools_report()
+  end
+  -- Secret-gated liveness probe. NON-MUTATING by design: the deploy authenticates with it
+  -- instead of claim-next, which would lease (and strand) a real queued run.
+  if ends_with($PATH, "/tools/ping") then
+    if $METHOD != "POST" then
+      return tools_reply(405, { error: "POST only" })
+    end
+    if not tools_drain_authorized() then
+      return tools_reply(401, { error: "unauthorized" })
+    end
+    return tools_ping()
+  end
+
+  $user = current_user($HEADERS)
+  if md_is_modal_request() and $user == nil then
+    return md_session_expired("/biz/domains")
+  end
+  $deny = require_role($user, "admin")
+  if $deny != nil then
+    return $deny
+  end
+
+  $q = parse_query($QUERY)
+
+  if ends_with($PATH, "/tools/status") then
+    -- Header-only: a `?token=` in the query is deliberately NOT honoured, so a leaked or
+    -- bookmarked old-style URL cannot be replayed as a working capability.
+    $tok = ""
+    if $HEADERS != nil and $HEADERS["x-tools-token"] != nil then
+      $tok = "" .. $HEADERS["x-tools-token"]
+    end
+    return tools_status_json(tools_or($q["id"], ""), $tok, $user)
+  end
+  if ends_with($PATH, "/tools/run") then
+    if $METHOD != "POST" then
+      return tools_reply(405, { error: "POST only" })
+    end
+    return tools_run($user)
+  end
+  if ends_with($PATH, "/tools/view") then
+    return tools_view(tools_or($q["tool"], ""), $q, $user)
+  end
+  return { status: 404, headers: {}, body: "not found" }
+end

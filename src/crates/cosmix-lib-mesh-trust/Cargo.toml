@@ -1,0 +1,52 @@
+[package]
+name = "cosmix-lib-mesh-trust"
+version = "0.10.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "cosmix_mesh_trust"
+
+# Core / citizen split per CLAUDE.md "Crate architecture (core-first,
+# citizen-on-feature)". Core (`--no-default-features`) carries protocol-
+# level verification logic only: envelope parse, canonical bytes,
+# signature verify, freshness, capability-bag math against passed-in
+# fixtures. The `cosmix` feature adds SPEC-12 / Bus integration:
+# the `with_cross_mesh_grants` combinator factory, `TrustGrantsCache`,
+# and the wgd-side `NamespaceSpec` drafts.
+
+[features]
+default = ["cosmix"]
+cosmix = [
+    "dep:cosmix-lib-props-store",
+    "dep:cosmix-lib-client",
+    "cosmix-lib-bus/native",
+    "dep:tokio",
+    "dep:async-trait",
+    "dep:futures-util",
+    "dep:tracing",
+]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+thiserror = "1"
+cosmix-lib-bus = { path = "../cosmix-lib-bus", default-features = false }
+
+# `cosmix` feature only — substrate / mesh integration.
+cosmix-lib-props-store = { path = "../cosmix-lib-props-store", optional = true }
+cosmix-lib-client = { path = "../cosmix-lib-client", optional = true }
+tokio = { workspace = true, optional = true }
+async-trait = { version = "0.1", optional = true }
+futures-util = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+rand = { workspace = true }

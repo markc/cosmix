@@ -1,0 +1,666 @@
+scheme: "ocean"
+mode: "light"
+typography: { family: "Noto Sans", body_px: 13.333 }
+surface: "#f3fafc"
+panel: "#e9f4f7"
+master_panel: "#d8e8ed"
+track: "#e9f4f7"
+control: "#d8f4fd"
+control_active: "#006f87"
+thumb: "#005f75"
+meter_green: "#006818"
+meter_amber: "#c79600"
+meter_red: "#c21725"
+text: "#002631"
+text_dim: "#386b7b"
+border: "#d8e8ed"
+row_hover: "#e9f4f7"
+row_selected: "#1d5869"
+row_selected_text: "#e9f4f7"
+row_selected_text_dim: "#e9f4f7"
+scrim: "#00000000"
+danger_surface: "#c21725"
+control_gap: 8.0
+corner_radius: 5.0
+fader_width: 42.0
+fader_height: 250.0
+knob_size: 58.0
+meter_width: 28.0
+
+design: {
+  schema_version: 1,
+  "v1": {
+    kind: "base",
+    resolution_order: ["scheme", "mode"],
+    primitives: {
+      colors: {
+        "palette.background.1": { color_space: "oklch", l: 0.98, c: 0.008, h: 220.0 },
+        "palette.background.2": { color_space: "oklch", l: 0.96, c: 0.012, h: 220.0 },
+        "palette.background.3": { color_space: "oklch", l: 0.92, c: 0.018, h: 220.0 },
+        "palette.foreground.default": { color_space: "oklch", l: 0.25, c: 0.06, h: 220.0 },
+        "palette.foreground.muted": { color_space: "oklch", l: 0.50, c: 0.06, h: 220.0 },
+        "palette.accent.default": { color_space: "oklch", l: 0.50, c: 0.12, h: 220.0 },
+        "palette.accent.hover": { color_space: "oklch", l: 0.45, c: 0.14, h: 220.0 },
+        "status.success": { color_space: "oklch", l: 0.45, c: 0.15, h: 145.0 },
+        "status.warning": { color_space: "oklch", l: 0.70, c: 0.15, h: 85.0 },
+        "status.danger": { color_space: "oklch", l: 0.52, c: 0.20, h: 25.0 },
+        "transparent": { color_space: "oklch", l: 0.0, c: 0.0, h: 0.0, alpha: 0.0 }
+      },
+      metrics: {
+        "button.height.sm": { kind: "px", value: 24.0 },
+        "button.height.md": { kind: "px", value: 28.0 },
+        "button.height.lg": { kind: "px", value: 32.0 },
+        "button.min_width.none": { kind: "px", value: 0.0 },
+        "button.min_width.standard": { kind: "px", value: 72.0 },
+        "button.padding_x": { kind: "step", scale: "spacing", value: 5 },
+        "button.border_width": { kind: "px", value: 1.0 },
+        "radius": { kind: "px", value: 6.0 },
+        "radius.md": { kind: "step", scale: "radius", value: 1 },
+        "type.body": { kind: "step", scale: "type", value: 1 },
+        "type.compact": { kind: "step", scale: "type", value: 0 },
+        "lift.hover": { kind: "ratio", value: 0.06 },
+        "lift.ghost.hover": { kind: "ratio", value: 0.03 },
+        "lift.press": { kind: "ratio", value: 0.06 },
+        "lift.ghost.press": { kind: "ratio", value: 0.09 },
+        "lift.disabled": { kind: "ratio", value: 0.09 },
+        "lift.ghost.disabled": { kind: "ratio", value: 0.13 },
+        "disabled.chroma_reduction": { kind: "ratio", value: 0.50 },
+        "legacy.control_gap": { kind: "px", value: 8.0 },
+        "legacy.corner_radius": { kind: "px", value: 5.0 },
+        "legacy.fader_width": { kind: "px", value: 42.0 },
+        "legacy.fader_height": { kind: "px", value: 250.0 },
+        "legacy.knob_size": { kind: "px", value: 58.0 },
+        "legacy.meter_width": { kind: "px", value: 28.0 }
+      },
+      scales: {
+        spacing: [
+          { kind: "px", value: 0.0 },
+          { kind: "px", value: 2.0 },
+          { kind: "px", value: 4.0 },
+          { kind: "px", value: 6.0 },
+          { kind: "px", value: 8.0 },
+          { kind: "px", value: 10.0 },
+          { kind: "px", value: 12.0 },
+          { kind: "px", value: 16.0 },
+          { kind: "px", value: 20.0 },
+          { kind: "px", value: 24.0 }
+        ],
+        type: [
+          { kind: "px", value: 11.333 },
+          { kind: "px", value: 13.333 }
+        ]
+      }
+    },
+    modifiers: [
+      {
+        when: { scheme: "ocean", mode: "light" }
+      },
+      {
+        when: { scheme: "ocean", mode: "dark" },
+        primitives: {
+          colors: {
+            "palette.background.1": { color_space: "oklch", l: 0.12, c: 0.015, h: 220.0 },
+            "palette.background.2": { color_space: "oklch", l: 0.16, c: 0.02, h: 220.0 },
+            "palette.background.3": { color_space: "oklch", l: 0.22, c: 0.025, h: 220.0 },
+            "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.02, h: 220.0 },
+            "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.04, h: 220.0 },
+            "palette.accent.default": { color_space: "oklch", l: 0.75, c: 0.12, h: 220.0 },
+            "palette.accent.hover": { color_space: "oklch", l: 0.85, c: 0.10, h: 220.0 }
+          }
+        }
+      },
+      {
+        when: { scheme: "crimson", mode: "light" },
+        primitives: {
+          colors: {
+            "palette.background.1": { color_space: "oklch", l: 0.98, c: 0.008, h: 25.0 },
+            "palette.background.2": { color_space: "oklch", l: 0.96, c: 0.012, h: 25.0 },
+            "palette.background.3": { color_space: "oklch", l: 0.92, c: 0.018, h: 25.0 },
+            "palette.foreground.default": { color_space: "oklch", l: 0.25, c: 0.04, h: 25.0 },
+            "palette.foreground.muted": { color_space: "oklch", l: 0.50, c: 0.04, h: 25.0 },
+            "palette.accent.default": { color_space: "oklch", l: 0.47, c: 0.20, h: 25.0 },
+            "palette.accent.hover": { color_space: "oklch", l: 0.42, c: 0.22, h: 25.0 }
+          }
+        }
+      },
+      {
+        when: { scheme: "crimson", mode: "dark" },
+        primitives: {
+          colors: {
+            "palette.background.1": { color_space: "oklch", l: 0.10, c: 0.015, h: 25.0 },
+            "palette.background.2": { color_space: "oklch", l: 0.14, c: 0.02, h: 25.0 },
+            "palette.background.3": { color_space: "oklch", l: 0.20, c: 0.025, h: 25.0 },
+            "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.02, h: 25.0 },
+            "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.03, h: 25.0 },
+            "palette.accent.default": { color_space: "oklch", l: 0.63, c: 0.23, h: 25.0 },
+            "palette.accent.hover": { color_space: "oklch", l: 0.70, c: 0.25, h: 25.0 }
+          }
+        }
+      },
+      {
+        when: { scheme: "stone", mode: "light" },
+        primitives: {
+          colors: {
+            "palette.background.1": { color_space: "oklch", l: 0.98, c: 0.005, h: 60.0 },
+            "palette.background.2": { color_space: "oklch", l: 0.96, c: 0.008, h: 60.0 },
+            "palette.background.3": { color_space: "oklch", l: 0.92, c: 0.012, h: 60.0 },
+            "palette.foreground.default": { color_space: "oklch", l: 0.25, c: 0.02, h: 60.0 },
+            "palette.foreground.muted": { color_space: "oklch", l: 0.50, c: 0.015, h: 60.0 },
+            "palette.accent.default": { color_space: "oklch", l: 0.45, c: 0.05, h: 60.0 },
+            "palette.accent.hover": { color_space: "oklch", l: 0.35, c: 0.06, h: 60.0 }
+          }
+        }
+      },
+      {
+        when: { scheme: "stone", mode: "dark" },
+        primitives: {
+          colors: {
+            "palette.background.1": { color_space: "oklch", l: 0.12, c: 0.01, h: 60.0 },
+            "palette.background.2": { color_space: "oklch", l: 0.16, c: 0.012, h: 60.0 },
+            "palette.background.3": { color_space: "oklch", l: 0.22, c: 0.015, h: 60.0 },
+            "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.01, h: 60.0 },
+            "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.015, h: 60.0 },
+            "palette.accent.default": { color_space: "oklch", l: 0.80, c: 0.03, h: 60.0 },
+            "palette.accent.hover": { color_space: "oklch", l: 0.90, c: 0.02, h: 60.0 }
+          }
+        }
+      },
+      {
+        when: { scheme: "forest", mode: "light" },
+        primitives: {
+          colors: {
+            "palette.background.1": { color_space: "oklch", l: 0.98, c: 0.008, h: 150.0 },
+            "palette.background.2": { color_space: "oklch", l: 0.96, c: 0.012, h: 150.0 },
+            "palette.background.3": { color_space: "oklch", l: 0.92, c: 0.018, h: 150.0 },
+            "palette.foreground.default": { color_space: "oklch", l: 0.25, c: 0.06, h: 150.0 },
+            "palette.foreground.muted": { color_space: "oklch", l: 0.50, c: 0.06, h: 150.0 },
+            "palette.accent.default": { color_space: "oklch", l: 0.49, c: 0.12, h: 150.0 },
+            "palette.accent.hover": { color_space: "oklch", l: 0.44, c: 0.14, h: 150.0 }
+          }
+        }
+      },
+      {
+        when: { scheme: "forest", mode: "dark" },
+        primitives: {
+          colors: {
+            "palette.background.1": { color_space: "oklch", l: 0.12, c: 0.015, h: 150.0 },
+            "palette.background.2": { color_space: "oklch", l: 0.16, c: 0.02, h: 150.0 },
+            "palette.background.3": { color_space: "oklch", l: 0.22, c: 0.025, h: 150.0 },
+            "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.02, h: 150.0 },
+            "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.04, h: 150.0 },
+            "palette.accent.default": { color_space: "oklch", l: 0.70, c: 0.12, h: 150.0 },
+            "palette.accent.hover": { color_space: "oklch", l: 0.80, c: 0.10, h: 150.0 }
+          }
+        }
+      },
+      {
+        when: { scheme: "sunset", mode: "light" },
+        primitives: {
+          colors: {
+            "palette.background.1": { color_space: "oklch", l: 0.98, c: 0.01, h: 45.0 },
+            "palette.background.2": { color_space: "oklch", l: 0.96, c: 0.015, h: 45.0 },
+            "palette.background.3": { color_space: "oklch", l: 0.92, c: 0.02, h: 45.0 },
+            "palette.foreground.default": { color_space: "oklch", l: 0.30, c: 0.08, h: 45.0 },
+            "palette.foreground.muted": { color_space: "oklch", l: 0.50, c: 0.08, h: 45.0 },
+            "palette.accent.default": { color_space: "oklch", l: 0.52, c: 0.16, h: 45.0 },
+            "palette.accent.hover": { color_space: "oklch", l: 0.46, c: 0.18, h: 45.0 }
+          }
+        }
+      },
+      {
+        when: { scheme: "sunset", mode: "dark" },
+        primitives: {
+          colors: {
+            "palette.background.1": { color_space: "oklch", l: 0.12, c: 0.02, h: 45.0 },
+            "palette.background.2": { color_space: "oklch", l: 0.16, c: 0.025, h: 45.0 },
+            "palette.background.3": { color_space: "oklch", l: 0.22, c: 0.03, h: 45.0 },
+            "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.025, h: 45.0 },
+            "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.05, h: 45.0 },
+            "palette.accent.default": { color_space: "oklch", l: 0.72, c: 0.14, h: 45.0 },
+            "palette.accent.hover": { color_space: "oklch", l: 0.82, c: 0.12, h: 45.0 }
+          }
+        }
+      },
+      {
+        when: { scheme: "mono", mode: "light" },
+        primitives: {
+          colors: {
+            "palette.background.1": { color_space: "oklch", l: 0.98, c: 0.0, h: 0.0 },
+            "palette.background.2": { color_space: "oklch", l: 0.96, c: 0.0, h: 0.0 },
+            "palette.background.3": { color_space: "oklch", l: 0.92, c: 0.0, h: 0.0 },
+            "palette.foreground.default": { color_space: "oklch", l: 0.20, c: 0.0, h: 0.0 },
+            "palette.foreground.muted": { color_space: "oklch", l: 0.50, c: 0.0, h: 0.0 },
+            "palette.accent.default": { color_space: "oklch", l: 0.25, c: 0.0, h: 0.0 },
+            "palette.accent.hover": { color_space: "oklch", l: 0.35, c: 0.0, h: 0.0 }
+          }
+        }
+      },
+      {
+        when: { scheme: "mono", mode: "dark" },
+        primitives: {
+          colors: {
+            "palette.background.1": { color_space: "oklch", l: 0.10, c: 0.0, h: 0.0 },
+            "palette.background.2": { color_space: "oklch", l: 0.15, c: 0.0, h: 0.0 },
+            "palette.background.3": { color_space: "oklch", l: 0.22, c: 0.0, h: 0.0 },
+            "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.0, h: 0.0 },
+            "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.0, h: 0.0 },
+            "palette.accent.default": { color_space: "oklch", l: 0.85, c: 0.0, h: 0.0 },
+            "palette.accent.hover": { color_space: "oklch", l: 0.92, c: 0.0, h: 0.0 }
+          }
+        }
+      },
+      {
+        when: { mode: "dark" },
+        primitives: {
+          colors: {
+            "status.success": { color_space: "oklch", l: 0.70, c: 0.15, h: 145.0 },
+            "status.warning": { color_space: "oklch", l: 0.80, c: 0.15, h: 85.0 },
+            "status.danger": { color_space: "oklch", l: 0.70, c: 0.18, h: 25.0 }
+          }
+        },
+        semantics: {
+          pairs: {
+            muted: {
+              surface: "transparent",
+              foreground: "palette.foreground.default",
+              backdrop: "palette.background.1"
+            }
+          }
+        }
+      }
+    ],
+    semantics: {
+      pairs: {
+        base: { surface: "palette.background.1", foreground: "palette.foreground.default" },
+        card: { surface: "palette.background.1", foreground: "palette.foreground.default" },
+        popover: { surface: "palette.background.1", foreground: "palette.foreground.default" },
+        primary: {
+          derive: {
+            name: "selection_pair",
+            args: [
+              { kind: "colour", value: "palette.accent.default" },
+              { kind: "colour", value: "palette.background.2" }
+            ]
+          }
+        },
+        secondary: { surface: "palette.background.2", foreground: "palette.foreground.default" },
+        muted: {
+          surface: "transparent",
+          foreground: "palette.foreground.muted",
+          backdrop: "palette.background.1"
+        },
+        accent: {
+          derive: {
+            name: "control_pair",
+            args: [
+              { kind: "colour", value: "palette.background.3" },
+              { kind: "colour", value: "palette.accent.default" },
+              { kind: "colour", value: "palette.background.1" },
+              { kind: "colour", value: "palette.foreground.default" }
+            ]
+          }
+        },
+        destructive: { surface: "status.danger", foreground: "palette.background.1" }
+      },
+      non_text: {
+        border: { value: "palette.background.3", adjacent: ["secondary"] },
+        input: { value: "transparent", adjacent: ["muted"] },
+        ring: { value: "palette.accent.default", adjacent: ["accent", "muted", "secondary"] }
+      }
+    },
+    typography: {
+      records: {
+        "button.md": { family: "Noto Sans", type_step: "type.body", weight: 400 },
+        "button.sm": { family: "Noto Sans", type_step: "type.compact", weight: 400 }
+      }
+    },
+    families: {
+      button: {
+        coverage: "explicit",
+        base: {
+          pair: { kind: "pair", value: "secondary" },
+          border: { kind: "token", value: "border" },
+          ring: { kind: "null" },
+          height: { kind: "metric", value: "button.height.md" },
+          min_width: { kind: "metric", value: "button.min_width.standard" },
+          padding_x: { kind: "metric", value: "button.padding_x" },
+          border_width: { kind: "metric", value: "button.border_width" },
+          radius: { kind: "metric", value: "radius.md" },
+          typography: { kind: "typography", value: "button.md" }
+        },
+        variants: [
+          {
+            when: { variant: "primary" },
+            set: { pair: { kind: "pair", value: "primary" } }
+          },
+          {
+            when: { variant: "destructive" },
+            set: { pair: { kind: "pair", value: "destructive" } }
+          },
+          {
+            when: { variant: "ghost" },
+            set: {
+              pair: { kind: "pair", value: "muted" },
+              border: { kind: "token", value: "input" }
+            }
+          },
+          {
+            when: { size: "sm" },
+            set: {
+              height: { kind: "metric", value: "button.height.sm" },
+              min_width: { kind: "metric", value: "button.min_width.none" },
+              typography: { kind: "typography", value: "button.sm" }
+            }
+          },
+          {
+            when: { size: "lg" },
+            set: { height: { kind: "metric", value: "button.height.lg" } }
+          }
+        ],
+        states: [
+          {
+            when: { focus_visible: true },
+            set: {
+              ring: {
+                kind: "derive",
+                name: "focus_ring",
+                args: [
+                  { kind: "colour", value: "ring" },
+                  { kind: "pair", value: "secondary" }
+                ]
+              }
+            }
+          }
+        ],
+        compoundVariants: [
+          {
+            when: { variant: "primary", interaction: "hovered" },
+            set: {
+              pair: {
+                kind: "derive",
+                name: "contrast_safe_lift",
+                args: [
+                  { kind: "pair", value: "primary" },
+                  { kind: "ratio", value: "lift.hover" }
+                ]
+              }
+            }
+          },
+          {
+            when: { variant: "default", interaction: "hovered" },
+            set: {
+              pair: {
+                kind: "derive",
+                name: "contrast_safe_lift",
+                args: [
+                  { kind: "pair", value: "secondary" },
+                  { kind: "ratio", value: "lift.hover" }
+                ]
+              }
+            }
+          },
+          {
+            when: { variant: "destructive", interaction: "hovered" },
+            set: {
+              pair: {
+                kind: "derive",
+                name: "contrast_safe_lift",
+                args: [
+                  { kind: "pair", value: "destructive" },
+                  { kind: "ratio", value: "lift.hover" }
+                ]
+              }
+            }
+          },
+          {
+            when: { variant: "ghost", interaction: "hovered" },
+            set: {
+              pair: {
+                kind: "derive",
+                name: "contrast_safe_toward",
+                args: [
+                  { kind: "pair", value: "accent" },
+                  { kind: "ratio", value: "lift.ghost.hover" }
+                ]
+              }
+            }
+          },
+          {
+            when: { variant: "default", interaction: "pressed" },
+            set: {
+              pair: {
+                kind: "derive",
+                name: "contrast_safe_toward",
+                args: [
+                  { kind: "pair", value: "secondary" },
+                  { kind: "ratio", value: "lift.press" }
+                ]
+              }
+            }
+          },
+          {
+            when: { variant: "primary", interaction: "pressed" },
+            set: {
+              pair: {
+                kind: "derive",
+                name: "contrast_safe_toward",
+                args: [
+                  { kind: "pair", value: "primary" },
+                  { kind: "ratio", value: "lift.press" }
+                ]
+              }
+            }
+          },
+          {
+            when: { variant: "destructive", interaction: "pressed" },
+            set: {
+              pair: {
+                kind: "derive",
+                name: "contrast_safe_toward",
+                args: [
+                  { kind: "pair", value: "destructive" },
+                  { kind: "ratio", value: "lift.press" }
+                ]
+              }
+            }
+          },
+          {
+            when: { variant: "ghost", interaction: "pressed" },
+            set: {
+              pair: {
+                kind: "derive",
+                name: "contrast_safe_toward",
+                args: [
+                  { kind: "pair", value: "accent" },
+                  { kind: "ratio", value: "lift.ghost.press" }
+                ]
+              }
+            }
+          },
+          {
+            when: { variant: "default", interaction: "disabled" },
+            set: {
+              pair: {
+                kind: "derive",
+                name: "disabled_pair",
+                args: [
+                  { kind: "pair", value: "secondary" },
+                  { kind: "ratio", value: "lift.disabled" },
+                  { kind: "ratio", value: "disabled.chroma_reduction" }
+                ]
+              }
+            }
+          },
+          {
+            when: { variant: "primary", interaction: "disabled" },
+            set: {
+              pair: {
+                kind: "derive",
+                name: "disabled_pair",
+                args: [
+                  { kind: "pair", value: "primary" },
+                  { kind: "ratio", value: "lift.disabled" },
+                  { kind: "ratio", value: "disabled.chroma_reduction" }
+                ]
+              }
+            }
+          },
+          {
+            when: { variant: "destructive", interaction: "disabled" },
+            set: {
+              pair: {
+                kind: "derive",
+                name: "disabled_pair",
+                args: [
+                  { kind: "pair", value: "destructive" },
+                  { kind: "ratio", value: "lift.disabled" },
+                  { kind: "ratio", value: "disabled.chroma_reduction" }
+                ]
+              }
+            }
+          },
+          {
+            when: { variant: "ghost", interaction: "disabled" },
+            set: {
+              pair: {
+                kind: "derive",
+                name: "disabled_pair",
+                args: [
+                  { kind: "pair", value: "accent" },
+                  { kind: "ratio", value: "lift.ghost.disabled" },
+                  { kind: "ratio", value: "disabled.chroma_reduction" }
+                ]
+              }
+            }
+          },
+          {
+            when: { variant: "primary", focus_visible: true },
+            set: {
+              ring: {
+                kind: "derive",
+                name: "focus_ring",
+                args: [
+                  { kind: "colour", value: "ring" },
+                  { kind: "pair", value: "primary" }
+                ]
+              }
+            }
+          },
+          {
+            when: { variant: "destructive", focus_visible: true },
+            set: {
+              ring: {
+                kind: "derive",
+                name: "focus_ring",
+                args: [
+                  { kind: "colour", value: "ring" },
+                  { kind: "pair", value: "destructive" }
+                ]
+              }
+            }
+          },
+          {
+            when: { variant: "ghost", focus_visible: true },
+            set: {
+              ring: {
+                kind: "derive",
+                name: "focus_ring",
+                args: [
+                  { kind: "colour", value: "ring" },
+                  { kind: "pair", value: "muted" }
+                ]
+              }
+            }
+          },
+          {
+            when: { variant: "ghost", interaction: "hovered", focus_visible: true },
+            set: {
+              ring: {
+                kind: "derive",
+                name: "focus_ring",
+                args: [
+                  { kind: "colour", value: "ring" },
+                  { kind: "pair", value: "accent" }
+                ]
+              }
+            }
+          },
+          {
+            when: { variant: "ghost", interaction: "pressed", focus_visible: true },
+            set: {
+              ring: {
+                kind: "derive",
+                name: "focus_ring",
+                args: [
+                  { kind: "colour", value: "ring" },
+                  { kind: "pair", value: "accent" }
+                ]
+              }
+            }
+          },
+          {
+            when: { variant: "default", interaction: "disabled", focus_visible: true },
+            set: { ring: { kind: "null" } }
+          },
+          {
+            when: { variant: "primary", interaction: "disabled", focus_visible: true },
+            set: { ring: { kind: "null" } }
+          },
+          {
+            when: { variant: "destructive", interaction: "disabled", focus_visible: true },
+            set: { ring: { kind: "null" } }
+          },
+          {
+            when: { variant: "ghost", interaction: "disabled", focus_visible: true },
+            set: { ring: { kind: "null" } }
+          }
+        ]
+      }
+    },
+    v0_crosswalk: {
+      surface: { kind: "pair", value: "base", member: "surface" },
+      panel: { kind: "pair", value: "secondary", member: "surface" },
+      master_panel: { kind: "token", value: "palette.background.3" },
+      track: { kind: "token", value: "palette.background.2" },
+      control: { kind: "pair", value: "accent", member: "surface" },
+      control_active: { kind: "token", value: "palette.accent.default" },
+      thumb: { kind: "token", value: "palette.accent.hover" },
+      meter_green: { kind: "token", value: "status.success" },
+      meter_amber: { kind: "token", value: "status.warning" },
+      meter_red: { kind: "token", value: "status.danger" },
+      text: { kind: "pair", value: "base", member: "foreground" },
+      text_dim: { kind: "token", value: "palette.foreground.muted" },
+      border: { kind: "token", value: "border" },
+      row_hover: { kind: "pair", value: "secondary", member: "surface" },
+      row_selected: { kind: "pair", value: "primary", member: "surface" },
+      row_selected_text: { kind: "pair", value: "primary", member: "foreground" },
+      row_selected_text_dim: { kind: "pair", value: "primary", member: "foreground" },
+      scrim: { kind: "token", value: "transparent" },
+      danger_surface: { kind: "pair", value: "destructive", member: "surface" },
+      control_gap: { kind: "metric", value: "legacy.control_gap" },
+      corner_radius: { kind: "metric", value: "legacy.corner_radius" },
+      fader_width: { kind: "metric", value: "legacy.fader_width" },
+      fader_height: { kind: "metric", value: "legacy.fader_height" },
+      knob_size: { kind: "metric", value: "legacy.knob_size" },
+      meter_width: { kind: "metric", value: "legacy.meter_width" },
+      scheme: { kind: "modifier_axis_selection", axis: "scheme" },
+      mode: { kind: "modifier_axis_selection", axis: "mode" },
+      "typography.family": {
+        kind: "component_mapping_cell",
+        family: "button",
+        variant: "default",
+        size: "md",
+        part: "label",
+        property: "typography_family"
+      },
+      "typography.body_px": {
+        kind: "component_mapping_cell",
+        family: "button",
+        variant: "default",
+        size: "md",
+        part: "label",
+        property: "typography_body_px"
+      }
+    }
+  }
+}

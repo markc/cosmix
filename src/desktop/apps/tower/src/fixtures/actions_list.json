@@ -1,0 +1,28 @@
+{
+  "actions": [
+    {
+      "id": "song.open",
+      "label": "Open song",
+      "category": "file",
+      "icon_name": "folder-open",
+      "shortcut": "Ctrl+O",
+      "args_schema": {
+        "fields": [
+          {"name": "path", "kind": "string", "required": true}
+        ],
+        "allow_extra": false
+      },
+      "allowed_sources": {"bus": true},
+      "enabled": true
+    },
+    {
+      "id": "transport.toggle",
+      "label": "Play / pause",
+      "category": "transport",
+      "icon_name": "play",
+      "args_schema": {"fields": [], "allow_extra": false},
+      "allowed_sources": {"bus": true},
+      "enabled": true
+    }
+  ]
+}

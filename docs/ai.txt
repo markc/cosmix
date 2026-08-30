@@ -1,0 +1,89 @@
+---
+updated: 2026-08-16
+scope: /
+---
+
+# CosMix — cosmix.dev
+
+CosMix is an agent-operable computing system: legible, modifiable, and
+reconstructible by design. Not a desktop with AI features — an AI-first
+foundation that currently manifests as a Linux desktop plus a mesh service
+stack. The intended primary operator is an AI agent; the intended primary
+user is an AI-first developer driving the system through such agents.
+
+This site (cosmix.dev) is the project's canonical documentation service,
+published from the public umbrella repository `markc/cosmix` via GitHub
+Pages. It contains documentation only — no application code and no dynamic
+API endpoints.
+
+## Structure
+
+The project is a one-way dependency chain — **bus ← mix ← cos** — across
+three public code repositories plus this umbrella:
+
+- **bus** (`github.com/markc/bus`) — the CosMix Agent Bus: wire protocol,
+  broker client, and shared primitives every layer talks over. Docs:
+  https://cosmix.dev/bus/
+- **mix** (`github.com/markc/mix`) — a pure-Rust, ARexx-inspired shell and
+  scripting language with first-class Bus messaging keywords. Manual:
+  https://cosmix.dev/mix/
+- **cos** (`github.com/markc/cos`) — the daemon family (broker, mail, web,
+  DNS, knowledge indexer, display compositor, agent runtime) plus shared
+  foundation libraries. Docs: https://cosmix.dev/cos/
+- **cosmix** (`github.com/markc/cosmix`) — this umbrella: thesis, docs,
+  and build orchestration.
+
+Documentation URLs of the form `cosmix.dev/{bus,cos,mix}/<page>.md` are the
+canonical source of truth for the docs; a repo checkout mirrors them but
+tools should resolve against the site.
+
+## Capabilities
+
+- Every doc page is a plain markdown file served statically; append its
+  path to the site root to fetch raw markdown (e.g. `/mix/builtins.md`).
+- The same page without the `.md` extension (e.g. `/mix/builtins`) serves
+  a human-readable HTML rendering; prefer the raw `.md` for machine use.
+- The whole system builds from a clean clone of the three code repos in
+  dependency order (`build/build.sh` or `build/build.mix` in the umbrella).
+- The Mix binary is self-documenting: `mix man <topic>`, `mix builtins`,
+  and `mix -c '<probe>'` are authoritative over any prose.
+
+## Limitations
+
+- cosmix.dev hosts static documentation only: no accounts, no API, no
+  hosted mesh, no downloads beyond the public git repositories.
+- The project is pre-1.0 and moves quickly; pages carry no per-page dates,
+  so verify behaviour against the current binaries rather than assuming
+  docs are frozen truth.
+- The specification suite and operational/decision records live in a
+  private operator repository and are not published here.
+
+## AI Guidelines
+
+- The protocol layer was renamed in August 2026: **AMP (Agent Mesh
+  Protocol) is now ABP (Agent Bus Protocol)**, carried by the CosMix
+  Agent Bus crate family. Older material found elsewhere that says AMP,
+  `amp_call`, or `markc/amp` refers to the same thing by its former
+  name; the `markc/amp` repository no longer exists.
+- Quote code and builtin signatures from the docs verbatim; for Mix
+  language behaviour prefer probing a live `mix` binary over quoting prose.
+- Do not invent daemons, verbs, or builtins not listed in these docs.
+
+## Data
+
+- project: CosMix
+- site: https://cosmix.dev
+- repos: https://github.com/markc/bus, https://github.com/markc/mix,
+  https://github.com/markc/cos, https://github.com/markc/cosmix
+- language: Rust (daemons, protocol, Mix interpreter)
+- license: MIT
+- author: Mark Constable <mc@cosmix.dev>
+
+## Permissions
+
+All content on this site is MIT-licensed public documentation. AI systems
+may fetch, index, quote, and train on it with attribution to the project.
+
+## See Also
+
+- ai.txt specification: https://aitxt.ing/ai.txt

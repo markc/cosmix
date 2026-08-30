@@ -1,0 +1,294 @@
+-- sw.mix — Synergy Wholesale SOAP client for the billing panel.
+-- Wire reference: _doc/2026-07-08-synergy-wholesale-soap-reference.md.
+-- Plan §3 P3. Requires route capability "net". Uses xml_parse (webd 0.9.3+)
+-- + http_post (custom-header bug verified fixed). Creds + mode in biz_settings
+-- (sw_reseller_id / sw_api_key / sw_mode). READ-ONLY verbs first.
+--
+-- ⚠️ ENVELOPE IS INFERRED, NOT LIVE-CAPTURED. The reference PHP uses a
+-- non-WSDL SoapClient (SOAP 1.1, Apache-Map param0). This builder replicates
+-- that shape; the FIRST live call MUST be sw_balance() to confirm the exact
+-- encoding before any write verb is trusted. sw_mode gates everything:
+--   "off"  → every verb returns { ok:false, error:"sw disabled" } (default)
+--   "read" → read-only verbs live; register/renew/transfer still refuse
+--   "live" → all verbs (register/renew) permitted
+-- IP-whitelist this deployment's egress address in the SW portal or every call 403s.
+
+$SW_ENDPOINT = "https://api.synergywholesale.com/?wsdl"
+
+function sw_enabled($need_write)
+  $m = biz_setting("sw_mode")
+  if $m == "live" then return true end
+  if $m == "read" and not $need_write then return true end
+  return false
+end
+
+-- XML-escape a value for element text
+function sw_esc($s)
+  $s = replace("" .. $s, "&", "&amp;")
+  $s = replace($s, "<", "&lt;")
+  $s = replace($s, ">", "&gt;")
+  return $s
+end
+
+-- Build the Apache-Map <item> list from a Mix map of string params. Sequential
+-- (array) params (nameServers, address) are handled by sw_soap_array() callers
+-- who pre-render those items; this covers the flat string fields.
+function sw_map_items($params)
+  $x = ""
+  for each $k in keys($params)
+    $item = "<item><key xsi:type=\"xsd:string\">" .. sw_esc($k) .. "</key>"
+    $item = $item .. "<value xsi:type=\"xsd:string\">" .. sw_esc($params[$k]) .. "</value></item>"
+    $x = $x .. $item
+  end
+  return $x
+end
+
+-- POST one command with a flat-string param map. Returns
+-- { ok, status (SW status string), body (parsed response map), error }.
+-- The response is xml_parse'd (simple mode): SOAP-ENV:Envelope/Body/<cmd>Response
+-- → we walk to the return struct and expose it as a map.
+function sw_call($command, $params, $timeout)
+  if $timeout == nil then $timeout = 4 end
+  $rid = biz_setting("sw_reseller_id")
+  $key = biz_setting("sw_api_key")
+  if $rid == "" or $key == "" then
+    return { ok: false, status: "", body: nil, error: "sw creds not configured" }
+  end
+  -- auth merged into every request (reference §e)
+  $full = { resellerID: $rid, apiKey: $key }
+  for each $k in keys($params)
+    $full[$k] = $params[$k]
+  end
+  $env = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+  $env = $env .. "<SOAP-ENV:Envelope xmlns:SOAP-ENV=\"http://schemas.xmlsoap.org/soap/envelope/\""
+  $env = $env .. " xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\""
+  $env = $env .. " xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\""
+  $env = $env .. " xmlns:SOAP-ENC=\"http://schemas.xmlsoap.org/soap/encoding/\""
+  $env = $env .. " SOAP-ENV:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
+  $env = $env .. "<SOAP-ENV:Body><" .. $command .. ">"
+  $env = $env .. "<param0 xsi:type=\"ns2:Map\" xmlns:ns2=\"http://xml.apache.org/xml-soap\">"
+  $env = $env .. sw_map_items($full)
+  $env = $env .. "</param0></" .. $command .. "></SOAP-ENV:Body></SOAP-ENV:Envelope>"
+
+  $hdrs = {
+    "Content-Type": "text/xml; charset=utf-8",
+    "SOAPAction": "#" .. $command
+  }
+  try
+    $r = http_post($SW_ENDPOINT, $env, $hdrs, { timeout: $timeout })
+    $st = to_number($r["status"])
+    if $st == nil or $st == 0 then
+      return { ok: false, status: "", body: nil, error: "" .. $r["error"] }
+    end
+    if $st == 403 then
+      return { ok: false, status: "", body: nil, error: "403 — IP not whitelisted at SW" }
+    end
+    $parsed = nil
+    try
+      $parsed = xml_parse("" .. $r["body"])
+    catch $e
+      return { ok: false, status: "", body: nil, error: "unparseable SOAP: " .. $e }
+    end
+    -- walk Envelope → Body → first child (the <cmd>Response), then its return
+    $body = sw_response_return($parsed)
+    if $body == nil then
+      return { ok: false, status: "", body: $parsed, error: "no response body (see raw)" }
+    end
+    $status = "" .. $body["status"]
+    -- success = status starts with OK or AVAILABLE (reference §d)
+    $ok = starts_with($status, "OK") or starts_with($status, "AVAILABLE")
+    $err = ""
+    if not $ok then
+      $err = $status
+      if $body["errorMessage"] != nil then $err = $err .. ": " .. $body["errorMessage"] end
+    end
+    return { ok: $ok, status: $status, body: $body, error: $err }
+  catch $e
+    return { ok: false, status: "", body: nil, error: "sw transport: " .. $e }
+  end
+end
+
+-- SW encodes every response value with an xsi:type attribute, so xml_parse
+-- yields {#text: "OK", @type: "xsd:string"} instead of a bare "OK". Collapse
+-- those typed scalars to their #text recursively (arrays + nested structs
+-- recurse; @attr keys are dropped) so the verb functions read plain values.
+function sw_unwrap($v)
+  if type($v) == "map" then
+    if $v["#text"] != nil then
+      $only_attrs = true
+      for each $k in keys($v)
+        if $k != "#text" and not starts_with($k, "@") then $only_attrs = false end
+      end
+      if $only_attrs then return $v["#text"] end
+    end
+    $out = {}
+    for each $k in keys($v)
+      if not starts_with($k, "@") then
+        $out[$k] = sw_unwrap($v[$k])
+      end
+    end
+    return $out
+  end
+  if type($v) == "list" then
+    $out = []
+    for each $e in $v
+      $out = concat($out, [sw_unwrap($e)])
+    end
+    return $out
+  end
+  return $v
+end
+
+-- Navigate the xml_parse simple-mode tree to the response return struct.
+-- Shape (prefixes stripped by simple mode): {Envelope: {Body: {<cmd>Response:
+-- {return: {...}} | {...}}}}. SW sometimes puts fields directly under the
+-- Response element; handle both.
+function sw_response_return($parsed)
+  if $parsed == nil or type($parsed) != "map" then return nil end
+  $env = $parsed["Envelope"]
+  if $env == nil or type($env) != "map" then return nil end
+  $b = $env["Body"]
+  if $b == nil or type($b) != "map" then return nil end
+  -- SOAP fault?
+  if $b["Fault"] != nil then
+    $fs = "unknown fault"
+    if type($b["Fault"]) == "map" and $b["Fault"]["faultstring"] != nil then
+      $fs = "" .. $b["Fault"]["faultstring"]
+    end
+    return { status: "ERR_FAULT", errorMessage: $fs }
+  end
+  -- first (only) child under Body is the <cmd>Response element; unwrap the
+  -- xsi:type-typed scalars so callers get plain values (status/balance/etc.)
+  for each $k in keys($b)
+    $resp = $b[$k]
+    if type($resp) == "map" then
+      if $resp["return"] != nil and type($resp["return"]) == "map" then
+        return sw_unwrap($resp["return"])
+      end
+      return sw_unwrap($resp)
+    end
+  end
+  return nil
+end
+
+-- ---------------------------------------------------------------- read verbs
+
+-- balanceQuery — THE first-probe verb. Confirms creds, IP whitelist, and the
+-- envelope encoding all at once. Returns { ok, balance, error }.
+function sw_balance()
+  if not sw_enabled(false) then return { ok: false, balance: "", error: "sw disabled" } end
+  $r = sw_call("balanceQuery", {})
+  if not $r["ok"] then return { ok: false, balance: "", error: $r["error"] } end
+  $bal = ""
+  if $r["body"]["balance"] != nil then $bal = "" .. $r["body"]["balance"] end
+  return { ok: true, balance: $bal, error: "" }
+end
+
+-- domainInfo — registry status + expiry for one domain. Returns
+-- { ok, status, expiry (YYYY-MM-DD), nameservers (list), error }.
+function sw_domain_info($domain)
+  if not sw_enabled(false) then return { ok: false, error: "sw disabled" } end
+  $r = sw_call("domainInfo", { domainName: lower("" .. $domain) })
+  if not $r["ok"] then return { ok: false, error: $r["error"] } end
+  $b = $r["body"]
+  $expiry = ""
+  if $b["domain_expiry"] != nil then
+    $expiry = substr("" .. $b["domain_expiry"], 0, 10)  -- 'Y-m-d H:i:s' → date
+  end
+  -- nameServers may arrive as an Apache array {item:[...]}, a repeated-element
+  -- list, or a single scalar — normalise to a flat list (not sync-critical).
+  $ns = []
+  $nsraw = $b["nameServers"]
+  if $nsraw != nil then
+    if type($nsraw) == "map" and $nsraw["item"] != nil then $nsraw = $nsraw["item"] end
+    if type($nsraw) == "list" then
+      $ns = $nsraw
+    else
+      $ns = ["" .. $nsraw]
+    end
+  end
+  return { ok: true, status: "" .. $b["domain_status"], expiry: $expiry,
+           nameservers: $ns, error: "" }
+end
+
+-- checkDomain — availability + wholesale price for a sales-call lookup.
+-- $cmd is create|renew|transfer. Returns { ok, available, premium, price, error }.
+function sw_check_domain($domain, $cmd)
+  if not sw_enabled(false) then return { ok: false, error: "sw disabled" } end
+  $r = sw_call("checkDomain", { domainName: lower("" .. $domain), command: "" .. $cmd })
+  if not $r["ok"] then return { ok: false, error: $r["error"] } end
+  $b = $r["body"]
+  $avail = starts_with("" .. $b["status"], "AVAILABLE")
+  $price = ""
+  if $b["costPrice"] != nil then $price = "" .. $b["costPrice"] end
+  return { ok: true, available: $avail, premium: ("" .. $b["premium"]) == "true",
+           price: $price, error: "" }
+end
+
+-- listDomains — the AUTHORITATIVE bulk list of every domain in the reseller
+-- account (a big response — the reference PHP has no listDomains, but SW's raw
+-- API does; ~430 domains ≈ 1 MB, so it needs a long timeout). Returns
+-- { ok, domains: [ { domain, status, expiry } ], error }. domainList.item
+-- carries rich .au registrant/eligibility fields; we surface the essentials.
+function sw_list_domains()
+  if not sw_enabled(false) then return { ok: false, domains: [], error: "sw disabled" } end
+  $r = sw_call("listDomains", {}, 30)
+  if not $r["ok"] then return { ok: false, domains: [], error: $r["error"] } end
+  $out = []
+  $dl = $r["body"]["domainList"]
+  $items = nil
+  if $dl != nil and type($dl) == "map" and $dl["item"] != nil then
+    $items = $dl["item"]
+  end
+  if $items == nil then return { ok: true, domains: [], error: "" } end
+  if type($items) != "list" then $items = [$items] end
+  for each $it in $items
+    $dom = ""
+    if $it["domainName"] != nil then $dom = lower("" .. $it["domainName"]) end
+    $exp = ""
+    if $it["domain_expiry"] != nil then $exp = substr("" .. $it["domain_expiry"], 0, 10) end
+    $st = ""
+    if $it["domain_status"] != nil then $st = "" .. $it["domain_status"] end
+    if $dom != "" then
+      $out = concat($out, [{ domain: $dom, status: $st, expiry: $exp }])
+    end
+  end
+  return { ok: true, domains: $out, error: "" }
+end
+
+-- getDomainPricing — wholesale price list, all ~512 TLDs. Returns
+-- { ok, tlds: { <tld>: renew_cents }, error }. We key on the 1-year RENEW
+-- price (what annual billing charges); register/transfer are also present per
+-- TLD but not surfaced here. Big response → 30s timeout.
+function sw_get_pricing()
+  if not sw_enabled(false) then return { ok: false, tlds: {}, error: "sw disabled" } end
+  $r = sw_call("getDomainPricing", {}, 30)
+  if not $r["ok"] then return { ok: false, tlds: {}, error: $r["error"] } end
+  $p = $r["body"]["pricing"]
+  $items = nil
+  if type($p) == "map" and $p["item"] != nil then $items = $p["item"] end
+  if $items == nil then return { ok: true, tlds: {}, error: "" } end
+  if type($items) != "list" then $items = [$items] end
+  $out = {}
+  for each $it in $items
+    $tld = ""
+    if $it["tld"] != nil then $tld = lower("" .. $it["tld"]) end
+    if $tld != "" and $it["renew"] != nil then
+      $cents = round(to_number("" .. $it["renew"]) * 100)
+      $out[$tld] = $cents
+    end
+  end
+  return { ok: true, tlds: $out, error: "" }
+end
+
+-- ---------------------------------------------------------------- write verbs
+-- (sw_mode=live only; the actual registrar mutations — LAST in the plan)
+
+-- renewDomain — extend a registration. Called by the domain-renewal job runner
+-- ONLY after the renewal invoice is paid (fulfillment split, plan §P3.3).
+-- Returns { ok, error }.
+function sw_renew_domain($domain, $years)
+  if not sw_enabled(true) then return { ok: false, error: "sw not in live mode" } end
+  $r = sw_call("renewDomain", { domainName: lower("" .. $domain), years: "" .. $years })
+  return { ok: $r["ok"], error: $r["error"] }
+end

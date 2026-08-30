@@ -1,0 +1,71 @@
+-- archive.mix (h_archive) — ONE generic taxonomy archive for /tag/<slug> and
+-- /category/<slug> (P2). The taxonomy is inferred from the path prefix; the trailing
+-- segment is the term slug. Lists the published-public posts in that term as the SAME
+-- horizontal blog cards the home feed uses (reused via h_home's blog_card/blog_date).
+--
+-- Feature-gated on `blog` (the same surface the home feed + single posts live under). An
+-- unknown term renders a clean "nothing here" card (200, not a 404/500) so a stale or
+-- mistyped /tag/<slug> URL degrades gracefully. A signed-in viewer also sees their own
+-- private posts in the term (mirrors h_home's visibility scope); the public sees public.
+include "/opt/cosmix/vhosts/shared/apps/h_home.mix"
+
+function archive_main()
+cms_init()
+$user = current_user($HEADERS)
+-- Blog surface gate: a disabled blog hides the nav + 404s posts; archives follow it.
+if not feature("blog") then
+  return feature_off_doc($user, "The blog")
+end
+
+-- Infer taxonomy + extract the trailing slug from the path (mirrors h_post's
+-- pos()/substr() extraction). /tag/<slug> → 'tag'; /category/<slug> → 'category'.
+$path = $PATH
+$taxonomy = ""
+$slug = ""
+if pos("/tag/", $path) == 1 then
+  $taxonomy = "tag"
+  $slug = substr($path, 5, length($path) - 5)
+else
+  if pos("/category/", $path) == 1 then
+    $taxonomy = "category"
+    $slug = substr($path, 10, length($path) - 10)
+  end
+end
+$slug = trim("" .. $slug)
+$label = "Tag"
+if $taxonomy == "category" then
+  $label = "Category"
+end
+
+-- Unknown/empty term → a graceful empty card (200), never a 500.
+$term = nil
+if $taxonomy != "" and $slug != "" then
+  $term = term_by_slug($taxonomy, $slug)
+end
+if $term == nil then
+  $b = '<div class="card"><h1>' .. esc($label) .. '</h1><p class="muted">Nothing here.</p><div style="margin-top:var(--space-5)"><a class="btn btn-ghost" href="/">← Home</a></div></div>'
+  return doc(200, $label, $user, $b)
+end
+
+-- Published-public posts in this term, newest-edited first. A signed-in viewer also sees
+-- their own private posts (matches h_home's scope); the public sees public only.
+$vis = ""
+if not can_preview_unpublished($user) then
+  $vis = " AND p.visibility = 'public'"
+end
+$rows = db_query("SELECT p.slug AS slug, p.title AS title, p.excerpt AS excerpt, p.created AS created, p.cover AS cover, p.visibility AS visibility FROM cms_posts p JOIN term_relations r ON r.post_id = p.id WHERE r.term_id = ?1 AND p.kind = 'post' AND p.status = 'published'" .. $vis .. " ORDER BY p.updated DESC", [$term["id"]])
+
+$title = $label .. ": " .. ("" .. $term["name"])
+$h = '<div class="cms-head"><h1>' .. esc($title) .. '</h1><a class="navlink" href="/">← All posts</a></div>'
+if length($rows) == 0 then
+  $h = $h .. '<p class="muted">No posts in this ' .. esc(lower($label)) .. ' yet.</p>'
+else
+  $h = $h .. '<div class="blog-cards">'
+  for each $p in $rows
+    $h = $h .. blog_card($p)
+  end
+  $h = $h .. '</div>'
+end
+return doc(200, $title, $user, $h)
+
+end

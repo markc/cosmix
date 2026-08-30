@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","session_id":"sess-background-killed","model":"claude-sonnet-4-6","cwd":"/tmp"}
+{"type":"system","subtype":"task_started","task_id":"bash-landed","task_type":"local_bash","is_backgrounded":true,"description":"wait for helper"}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":100,"num_turns":1,"result":"Committed and verified.","session_id":"sess-background-killed","total_cost_usd":0.01,"usage":{"input_tokens":20,"output_tokens":5}}
+{"type":"system","subtype":"task_updated","task_id":"bash-landed","patch":{"status":"killed","end_time":1787461766074}}

@@ -1,0 +1,20 @@
+-- Expected output:
+-- bar
+-- /custom/bin:/usr/bin
+-- gs is aliased to git status
+-- ll is aliased to ls -la
+
+-- Test export sets env var
+export FOO = "bar"
+print env("FOO")
+
+-- Test export with interpolation
+$base = "/usr/bin"
+export MY_PATH = "/custom/bin:${base}"
+print env("MY_PATH")
+
+-- Test alias
+alias gs = "git status"
+alias ll = "ls -la"
+print "gs is aliased to git status"
+print "ll is aliased to ls -la"

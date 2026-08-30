@@ -1,0 +1,49 @@
+[package]
+name = "cosmix-lib-client"
+version = "0.3.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bus WebSocket client — connects to the cosmix-noded broker"
+
+[lib]
+name = "cosmix_client"
+path = "src/lib.rs"
+
+[features]
+default = ["native"]
+native = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:rand", "cosmix_bus/native"]
+
+[dependencies]
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+
+# Native-only. lib-client deliberately holds no config-file loading
+# or broker URL auto-resolution — callers supply the URL explicitly
+# to `NodedClient::connect`. The cos-side `cosmix_config::client_helpers`
+# (cos crate `cosmix-lib-config`, opt-in `client-helpers` feature)
+# adds an auto-resolve layer for nodes that ship a `node.toml`.
+tokio = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+
+# Native test harness — dev-dependencies for the in-process stub
+# broker used by the supervised-reconnect tests. cosmix-noded itself
+# has no embeddable variant; the stub stands in.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus", default-features = false, features = ["native"] }
+
+# WASM-only
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-net = { version = "0.6", features = ["websocket"] }
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "Location"] }
+futures-channel = "0.3"
+futures-util = "0.3"

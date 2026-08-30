@@ -1,0 +1,38 @@
+-- lists.mix: test list operations
+-- Expected output:
+-- 3
+-- a
+-- c
+-- 4
+-- d
+-- d
+-- a
+-- a, b, c
+-- 1
+-- 2
+-- 3
+
+$items = ["a", "b", "c"]
+print len($items)
+print $items[0]
+print $items[2]
+
+-- push
+push($items, "d")
+print len($items)
+print $items[3]
+
+-- pop
+$last = pop($items)
+print $last
+print $items[0]
+
+-- join
+$items = ["a", "b", "c"]
+print join($items, ", ")
+
+-- range
+$nums = range(1, 3)
+for each $n in $nums
+    print $n
+next

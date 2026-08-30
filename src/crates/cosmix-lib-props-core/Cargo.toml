@@ -1,0 +1,26 @@
+[package]
+name = "cosmix-lib-props-core"
+version = "0.3.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SPEC 07 property surface — pure-type core (PropTree, PropPath, PropValue) + opt-in Bus read wire"
+
+[lib]
+name = "cosmix_props_core"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Bus wire surface: SPEC 07 §2 `dispatch_props` + SPEC 07 §3/§4
+# `publish::*` builders. Pulls `cosmix-lib-bus` for `BusMessage` and
+# `chrono` for the RFC-3339 timestamp in
+# `publish::build_props_changed_message`. C2 of the lib-props split
+# moves the read-side Bus code into this feature.
+bus = ["dep:cosmix-lib-bus", "dep:chrono"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+cosmix-lib-bus = { path = "../cosmix-lib-bus", optional = true }
+chrono = { workspace = true, optional = true }

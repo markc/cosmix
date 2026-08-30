@@ -1,0 +1,10 @@
+[package]
+name = "scope-consumer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+renamed-leaf = { package = "scope-leaf", path = "../leaf" }
+
+[features]
+consumer-extra = []

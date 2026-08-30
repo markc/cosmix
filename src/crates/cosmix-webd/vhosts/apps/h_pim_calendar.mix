@@ -1,0 +1,420 @@
+-- h_pim_calendar.mix — SHARED SSR Calendar (event CRUD) for /pim/calendar.
+-- Defines pim_calendar_main(); the per-vhost stub includes site.conf.mix + lib.mix
+-- + this, then `return pim_calendar_main()`. Vhost-agnostic: identity is the maild
+-- session, data is the vhost's own maild over the jmap() seam (server-side,
+-- sealed-cookie Bearer; accountId auth-derived — not passed).
+--   GET  /pim/calendar              → upcoming events (?page=)
+--   GET  /pim/calendar?view=<id>    → event detail
+--   GET  /pim/calendar?edit=<id>    → edit form
+--   GET  /pim/calendar?new=1        → new-event form
+--   POST /pim/calendar action=save  → CalendarEvent/set create (no id) / update (id)
+--   POST /pim/calendar action=delete→ CalendarEvent/set destroy
+-- maild CalendarEvent: create needs calendarId (discovered via Calendar/query, like
+-- addressBookId); title/start/end are plain fields; start/end are RFC3339 UTC.
+-- UPDATE patches only title/start/end (description/location live in the JSCalendar
+-- `data` and are not patched on update), so v1 exposes title/start/end only. Times
+-- are treated as UTC (the datetime-local input carries no zone). CalendarEvent/query
+-- returns a full total + orders by start; Email/get-style reorder to query id order.
+
+-- esc'd event field, "" when absent.
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/admin_resource.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+include "/opt/cosmix/vhosts/shared/widgets/reader.mix"
+
+-- Datatable cell: the event title as a link to its detail view, "(untitled)"
+-- fallback. The widget supplies no row link (no row_href), so this owns its <a>.
+-- cv_field escapes the title.
+function cv_title_html($e)
+  $title = cv_field($e, "title")
+  if $title == "" then
+    $title = '<span class="muted">(untitled)</span>'
+  end
+  $id = url_encode("" .. $e["id"])
+  return '<a href="/pim/calendar?view=' .. $id .. '"><strong>' .. $title .. '</strong></a>'
+end
+
+function cv_field($e, $k)
+  $v = $e[$k]
+  if $v == nil then
+    return ""
+  end
+  return esc("" .. $v)
+end
+
+-- (the old per-handler fval() is gone — folded onto forms.mix's fm_val, Phase 2.)
+
+-- datetime-local "YYYY-MM-DDTHH:MM" → RFC3339 UTC (input treated as UTC). "" stays "".
+function cv_to_rfc($s)
+  if $s == "" then
+    return ""
+  end
+  if ends_with($s, "Z") then
+    return $s
+  end
+  if length($s) == 16 then
+    return $s .. ":00Z"
+  end
+  if length($s) == 19 then
+    return $s .. "Z"
+  end
+  return $s
+end
+
+-- RFC3339 → datetime-local "YYYY-MM-DDTHH:MM" for an <input>, "" when absent.
+function cv_to_local($v)
+  if $v == nil then
+    return ""
+  end
+  $t = "" .. $v
+  if length($t) >= 16 then
+    return substr($t, 0, 16)
+  end
+  return $t
+end
+
+-- RFC3339 → "YYYY-MM-DD HH:MM" for display, RAW (not esc'd) — for a caller that esc()s itself
+-- (rd_view's meta does). "" when absent.
+function cv_disp_raw($v)
+  if $v == nil then
+    return ""
+  end
+  $t = "" .. $v
+  if length($t) >= 16 then
+    return replace(substr($t, 0, 16), "T", " ")
+  end
+  return $t
+end
+
+-- RFC3339 → "YYYY-MM-DD HH:MM" for display (esc'd, for direct HTML injection), "" when absent.
+function cv_disp($v)
+  return esc(cv_disp_raw($v))
+end
+
+-- Sign-in card (no maild session).
+function cv_login()
+  $h = '<div class="card cms-card-narrow">'
+  $h = $h .. '<h1>Calendar</h1>'
+  $h = $h .. '<p class="muted">Sign in to your mail account to view your calendar.</p>'
+  $h = $h .. '<div style="margin-top:var(--space-5)"><a class="btn btn-primary" href="/auth/login?next=' .. url_encode("/pim/calendar") .. '">Sign in to mail</a></div>'
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- Service-error card (signed in, jmap() failed).
+function cv_error()
+  $h = '<div class="card cms-card-narrow">'
+  $h = $h .. '<h1>Calendar unavailable</h1>'
+  $h = $h .. '<p class="muted">The mail service could not be reached. Your session may have expired — try signing in again, or retry shortly.</p>'
+  $h = $h .. '<div class="cms-actions center">'
+  $h = $h .. '<a class="btn btn-ghost" href="/pim/calendar">Retry</a>'
+  $h = $h .. '<a class="btn btn-primary" href="/auth/login?next=' .. url_encode("/pim/calendar") .. '">Sign in again</a>'
+  $h = $h .. '</div></div>'
+  return $h
+end
+
+-- "Event not found" card.
+function cv_notfound()
+  return '<div class="card cms-card-narrow"><h1>Event not found</h1><p class="muted">It may have been deleted. <a href="/pim/calendar">← All events</a></p></div>'
+end
+
+-- The events list (agenda).
+-- (list rendering is now the shared datatable; see the list branch below)
+
+-- The rd_view read-spec for an event (the shared reader). No prose body — Start/End (each tagged
+-- UTC) are the meta rows; Edit is a link, Delete a POST action (data-confirm gates it, as the old
+-- inline form did). RAW values via cv_disp_raw — rd_view esc()s once (cv_disp would double-escape).
+function cv_read_spec($e)
+  $id = "" .. $e["id"]
+  $title = trim("" .. cms_or($e["title"], ""))
+  if $title == "" then
+    $title = "(untitled)"
+  end
+  $meta = []
+  $start = cv_disp_raw($e["start"])
+  if ("" .. $start) != "" then
+    push($meta, { "label": "Start", value: ("" .. $start) .. " UTC" })
+  end
+  $endv = cv_disp_raw($e["end"])
+  if ("" .. $endv) != "" then
+    push($meta, { "label": "End", value: ("" .. $endv) .. " UTC" })
+  end
+  $actions = [
+    { "label": "Edit", icon: "pencil", variant: "primary", href: "/pim/calendar?edit=" .. url_encode($id) },
+    { "label": "Delete", icon: "trash", variant: "danger", post: "/pim/calendar", confirm: "Delete this event?", fields: [ { name: "action", value: "delete" }, { name: "id", value: $id } ] }
+  ]
+  return { title: $title, meta: $meta, actions: $actions, back: { "label": "All events", href: "/pim/calendar" } }
+end
+
+-- Read-only event detail → the shared rd_view reader.
+function cv_detail($e)
+  return rd_view(cv_read_spec($e))
+end
+
+-- The shared event field set — the SAME name= keys the POST handler reads. Title is
+-- raw (fm_* esc()s once); start/end are the RFC3339 value run through cv_to_local for
+-- the datetime-local input (also raw → fm_* esc()s). The (UTC) note rides as fm help
+-- text. Hidden action=save + id round-trip preserved.
+function cv_fields($e)
+  $h = fm_hidden("action", "save")
+  $h = $h .. fm_hidden("id", "" .. $e["id"])
+  $h = $h .. fm_text("title", "Title", { value: fm_val($e, "title"), autofocus: true, span: 2 })
+  $h = $h .. fm_datetime("start", "Start", { value: cv_to_local($e["start"]), help: "UTC", help_tip: true })
+  $h = $h .. fm_datetime("end", "End", { value: cv_to_local($e["end"]), help: "UTC", help_tip: true })
+  return $h
+end
+
+-- The full-page create/edit form (skin on). $e = existing event (edit) or blank (new);
+-- $err = a flash above the form ("" = none). Posts action=save + id + title/start/end.
+-- ONE fm_form spec, rendered IDENTICALLY on the canvas and in the modal (only `mode` differs)
+-- — the post-editor unification, so canvas/modal can't drift. The handler adds the canvas
+-- cms-head; the modal heading rides `title`. Cancel returns to the list (or the just-edited
+-- event's view). action=save + id + title/start/end round-trip unchanged (in cv_fields).
+function cv_form_spec($e, $heading, $err, $mode)
+  $id = "" .. $e["id"]
+  $cancel = "/pim/calendar"
+  if $id != "" then
+    $cancel = "/pim/calendar?view=" .. url_encode($id)
+  end
+  return { mode: $mode, action: "/pim/calendar", id: "cv-edit", title: $heading,
+           fields: fm_grid({ cols: 2 }, cv_fields($e)),
+           submit: { "label": "Save" }, cancel: { "label": "Cancel", href: $cancel }, error: $err }
+end
+
+-- Canvas editor: the page cms-head + the shared fm_form (canvas mode).
+function cv_form($e, $heading, $err)
+  $h = '<div class="cms-head"><h1>' .. esc($heading) .. '</h1><a class="navlink" href="/pim/calendar">← All events</a></div>'
+  return $h .. fm_form(cv_form_spec($e, $heading, $err, "canvas"))
+end
+
+-- Modal-panel variant for modal-driven Edit (modals.mix): the SAME spec in modal mode.
+function cv_form_panel($e, $heading)
+  return fm_form(cv_form_spec($e, $heading, "", "modal"))
+end
+
+-- CalendarEvent/get one id → the event map, or nil. Raises on transport error.
+function cv_get_one($id)
+  $gr = jmap("CalendarEvent/get", { ids: [$id] })
+  $list = $gr["list"]
+  if length($list) > 0 then
+    return $list[0]
+  end
+  return nil
+end
+
+-- ─────────────────────────── handler ───────────────────────────
+function pim_calendar_main()
+  cms_init()
+  $user = current_user($HEADERS)
+
+  -- Feature gate: a vhost may disable Calendar (nav link hidden; route 404s here).
+  if not feature("pim_calendar") then
+    return feature_off_doc($user, "Calendar")
+  end
+
+  if not $SESSION["authenticated"] then
+    if $METHOD == "POST" then
+      return redirect("/auth/login?next=" .. url_encode("/pim/calendar"))
+    end
+    -- A modal-edit fetch on an expired session: return a clean sign-in fragment, not the
+    -- full login shell (which md_script would inject into the dialog). See contacts.
+    if md_is_modal_request() then
+      return md_session_expired("/pim/calendar")
+    end
+    return doc(200, "Calendar", $user, cv_login())
+  end
+
+  -- ── POST: save (create/update) or delete ──
+  if $METHOD == "POST" then
+    $f = parse_form($BODY)
+    $action = $f["action"]
+    if $action == nil then
+      $action = "save"
+    end
+    $id = trim(fm_val($f, "id"))
+
+    if $action == "delete" then
+      if $id != "" then
+        try
+          jmap("CalendarEvent/set", { destroy: [$id] })
+        catch $e
+          return doc(502, "Calendar", $user, cv_error())
+        end
+      end
+      return redirect_flash("/pim/calendar", "Event deleted", "success")
+    end
+
+    if $action == "bulk_delete" then
+      $sel = dt_selected_ids($f)
+      if length($sel) > 0 then
+        try
+          jmap("CalendarEvent/set", { destroy: $sel })
+        catch $e
+          return doc(502, "Calendar", $user, cv_error())
+        end
+      end
+      return redirect_flash("/pim/calendar", "Events deleted", "success")
+    end
+
+    $title = trim(fm_val($f, "title"))
+    $start = cv_to_rfc(trim(fm_val($f, "start")))
+    $endv = cv_to_rfc(trim(fm_val($f, "end")))
+    $fields = { title: $title, start: $start, "end": $endv }
+    if $title == "" and $start == "" then
+      $back = $fields
+      $back["id"] = $id
+      $heading = "New event"
+      if $id != "" then
+        $heading = "Edit event"
+      end
+      return doc(200, $heading, $user, cv_form($back, $heading, "Enter at least a title or start time."))
+    end
+
+    -- A valid converted datetime always ends in "Z" (cv_to_rfc appends it for a
+    -- len-16/19 datetime-local value). A non-empty value that did NOT convert is
+    -- malformed (e.g. a crafted POST) — reject it rather than let maild silently
+    -- store null. (Codex MINOR.)
+    if ($start != "" and not ends_with($start, "Z")) or ($endv != "" and not ends_with($endv, "Z")) then
+      $back = $fields
+      $back["id"] = $id
+      $heading = "New event"
+      if $id != "" then
+        $heading = "Edit event"
+      end
+      return doc(200, $heading, $user, cv_form($back, $heading, "Enter a valid start/end date and time."))
+    end
+
+    if $id != "" then
+      $upd = {}
+      $upd[$id] = $fields
+      try
+        jmap("CalendarEvent/set", { update: $upd })
+      catch $e
+        return doc(502, "Calendar", $user, cv_error())
+      end
+      return redirect_flash("/pim/calendar?view=" .. url_encode($id), "Event saved", "success")
+    end
+
+    -- create: discover a calendarId, then CalendarEvent/set create.
+    $calid = ""
+    $newid = ""
+    try
+      $cq = jmap("Calendar/query", {})
+      $cids = $cq["ids"]
+      if length($cids) > 0 then
+        $calid = "" .. $cids[0]
+      end
+      if $calid != "" then
+        $newobj = { calendarId: $calid, title: $title, start: $start, "end": $endv }
+        $r = jmap("CalendarEvent/set", { create: { "new": $newobj } })
+        $created = $r["created"]
+        if $created != nil then
+          $cnew = $created["new"]
+          if $cnew != nil then
+            $newid = "" .. $cnew["id"]
+          end
+        end
+      end
+    catch $e
+      return doc(502, "Calendar", $user, cv_error())
+    end
+    if $newid == "" then
+      $back = $fields
+      $back["id"] = ""
+      return doc(200, "New event", $user, cv_form($back, "New event", "The event could not be saved (no calendar?). Please try again."))
+    end
+    return redirect_flash("/pim/calendar?view=" .. url_encode($newid), "Event saved", "success")
+  end
+
+  -- ── GET: new / view / edit / list ──
+  $q = parse_query($QUERY)
+
+  if $q["new"] != nil then
+    $blank = { id: "", title: "", start: "", "end": "" }
+    return doc(200, "New event", $user, cv_form($blank, "New event", ""))
+  end
+
+  $viewid = $q["view"]
+  if $viewid != nil and $viewid != "" then
+    $e = nil
+    try
+      $e = cv_get_one($viewid)
+    catch $e2
+      return doc(502, "Calendar", $user, cv_error())
+    end
+    if $e == nil then
+      return doc(404, "Calendar", $user, cv_notfound())
+    end
+    return doc(200, "Event", $user, cv_detail($e))
+  end
+
+  $editid = $q["edit"]
+  if $editid != nil and $editid != "" then
+    -- ?edit=<id>&modal=1 fetched by md_script (X-Modal-Fetch) → the bare md_panel for the
+    -- persistent <dialog id="md-edit">; a no-JS full nav gets the whole edit page. Errors
+    -- return a fragment too (the dialog shows them; no page swap under an open modal).
+    $cv_modal = md_is_modal_request()
+    $e = nil
+    try
+      $e = cv_get_one($editid)
+    catch $e2
+      if $cv_modal then
+        return md_fragment(md_panel({ title: "Calendar unavailable", submit: false, cancel: "Close" }, '<p class="fm-help">The mail service could not be reached. Close and retry shortly.</p>'))
+      end
+      return doc(502, "Calendar", $user, cv_error())
+    end
+    if $e == nil then
+      if $cv_modal then
+        return md_not_found("event", "/pim/calendar")
+      end
+      return doc(404, "Calendar", $user, cv_notfound())
+    end
+    if $cv_modal then
+      return md_fragment(cv_form_panel($e, "Edit event"))
+    end
+    return doc(200, "Edit event", $user, cv_form($e, "Edit event", ""))
+  end
+
+  -- list — shared SSR datatable over maild. CalendarEvent/query has NO text
+  -- search and NO client sort (implicit start-time order) → {text:false,
+  -- sort:false}: pagination only. dt_jmap reorders the (unordered) /get list to
+  -- query order. Static headers (no sort links); the event title owns its link.
+  $start_cell = fn($e) = '<span class="muted small">' .. cv_disp($e["start"]) .. '</span>'
+  $title_cell = fn($e) = cv_title_html($e)
+  $end_cell = fn($e) = '<span class="muted small">' .. cv_disp($e["end"]) .. '</span>'
+  $bulkid = fn($e) = "" .. $e["id"]
+  -- Modal-driven Edit (mirrors contacts): per-row link, href = no-JS edit page AND the
+  -- data-modal-src; md_script lazy-fetches ?edit=<id>&modal=1 into the md-edit dialog below.
+  $cv_edit = dt_action("edit", { "label": "Edit", icon: "pencil", variant: "action", modal: "md-edit", href: fn($e) = "/pim/calendar?edit=" .. url_encode("" .. $e["id"]) .. "&modal=1" })
+  $spec = [
+    dt_col("start", "Start", "", { render: $start_cell }),
+    dt_col("title", "Event", "", { render: $title_cell }),
+    dt_col("end", "End", "", { toggleable: true, render: $end_cell })
+  ]
+  $opts = dt_admin_opts({
+    base_route: "/pim/calendar", caption: "Calendar", noun: "events",
+    subtitle: "Upcoming events.",
+    default_sort: "start", default_dir: "asc", page_size: 50,
+    -- no free-text search over events; JMAP-backed (no select-all / no "all").
+    search: false,
+    row_action_specs: [$cv_edit],
+    bulk_id: $bulkid,
+    select_all: false, page_sizes: [6, 12, 25, 50, 100],
+    header_actions: [ { "label": "New event", "href": "/pim/calendar?new=1", "icon": "plus", "variant": "primary" } ]
+  })
+  $state = dt_state($QUERY, $spec, $opts)
+  $body = ""
+  try
+    $res = dt_jmap("CalendarEvent", $spec, $state, { text: false, sort: false }, nil)
+    $dt = dt_render($spec, $opts, $state, $res["rows"], $res["total"])
+    if dt_wants_partial() then
+      return dt_partial($dt)
+    end
+    -- persistent (empty) Edit dialog + the once-per-page modal shim, OUTSIDE #dt-region.
+    $body = dt_region($dt, "", true) .. md_shell("md-edit", { size: "lg" }) .. md_script() .. dt_actions_chrome($opts)
+  catch $e3
+    return doc(502, "Calendar", $user, cv_error())
+  end
+  return doc(200, "Calendar", $user, $body)
+end

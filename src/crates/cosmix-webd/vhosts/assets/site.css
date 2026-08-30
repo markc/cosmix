@@ -1,0 +1,1472 @@
+/*
+ * DCS Site Theme - Marketing Layer
+ * Ocean (H=220) default with Crimson, Stone, Forest, Sunset schemes
+ * Copyright © 2026 Mark Constable <mc@dcs.spa> (MIT License)
+ */
+
+/* ============================================
+   LAYER DECLARATION
+   Must cascade after base.css layers
+   ============================================ */
+
+@layer site-tokens, site-components, site-utilities;
+
+/* === SITE TOKENS — the COLOUR contract + marketing tokens ===
+   This is the per-site theme layer: a clone recolours HERE (and may override any
+   base.css scale token by redeclaring it). base.css defines zero colours and depends
+   on every --* below being present. See the canonical methodology doc. */
+@layer site-tokens {
+    :root {
+        /* Marketing */
+        --hero-bg: url('/img/Server_Room_Dark.webp');
+        --particle-opacity: 0.3;
+
+        /* ===== Ocean (H=220) — light defaults ===== */
+        --bg-primary:   oklch(98% 0.008 220);
+        --bg-secondary: oklch(96% 0.012 220);
+        --bg-tertiary:  oklch(92% 0.018 220);
+        --fg-primary:   oklch(25% 0.06 220);
+        --fg-secondary: oklch(40% 0.08 220);
+        --fg-muted:     oklch(50% 0.06 220);
+        --accent:       oklch(50% 0.12 220);
+        --accent-hover: oklch(45% 0.14 220);
+        --accent-fg:    oklch(98% 0.01 220);
+        --accent-subtle:oklch(92% 0.025 220);
+        --accent-glow:  oklch(50% 0.12 220 / 0.3);
+        /* Over the dark hero image, adopt this scheme's dark-mode accent — see .hero-bg */
+        --accent-on-image:       oklch(75% 0.12 220);
+        --accent-on-image-hover: oklch(85% 0.1 220);
+        --accent-on-image-fg:    oklch(15% 0.04 220);
+        --accent-on-image-glow:  oklch(75% 0.12 220 / 0.4);
+        --border:       oklch(85% 0.02 220);
+        --border-muted: oklch(90% 0.015 220);
+        /* Semantic (+ hover/subtle for unified buttons & flashes) */
+        --success:      oklch(45% 0.15 145);
+        /* 52%, not 55%: --danger is also read as text on --bg-tertiary (92%) */
+        --danger:       oklch(52% 0.2 25);
+        --warning:      oklch(70% 0.15 85);
+        --info:         oklch(58% 0.14 240);
+        --success-hover:oklch(40% 0.15 145);
+        /* Follows --danger down: the hover must stay ~5 points darker to read as a
+           state change at all — at the old 50% it would sit 2 points from 52%. */
+        --danger-hover: oklch(47% 0.2 25);
+        --warning-hover:oklch(64% 0.15 85);
+        --info-hover:   oklch(52% 0.14 240);
+        /* Row hover wash + modal/overlay scrim (theme-invariant darks) */
+        --row-hover:    oklch(0% 0 0 / 0.04);
+        --overlay:      oklch(20% 0.012 220 / 0.55);
+        /* Glass */
+        --glass:        oklch(98% 0.008 220);
+        --glass-border: oklch(85% 0.02 220 / 0.5);
+        --nav-scrolled-bg: oklch(100% 0 0 / 0.95);
+    }
+
+    /* High-contrast: hard border (a11y). Lives in the colour layer so it actually
+       wins over the --border default above when the user opts in. */
+    @media (prefers-contrast: more) {
+        :root { --border: currentColor; }
+    }
+
+    /* Dark (system preference, unless .light pinned) */
+    @media (prefers-color-scheme: dark) {
+        :root:not(.light) {
+            --bg-primary:   oklch(12% 0.015 220);
+            --bg-secondary: oklch(16% 0.02 220);
+            --bg-tertiary:  oklch(22% 0.025 220);
+            --fg-primary:   oklch(95% 0.02 220);
+            --fg-secondary: oklch(75% 0.05 220);
+            --fg-muted:     oklch(61% 0.04 220);
+            --accent:       oklch(75% 0.12 220);
+            --accent-hover: oklch(85% 0.1 220);
+            --accent-fg:    oklch(15% 0.04 220);
+            --accent-subtle:oklch(25% 0.04 220);
+            --accent-glow:  oklch(75% 0.12 220 / 0.4);
+            /* Already a dark-ground accent; the image needs no substitution */
+            --accent-on-image:       oklch(75% 0.12 220);
+            --accent-on-image-hover: oklch(85% 0.1 220);
+            --accent-on-image-fg:    oklch(15% 0.04 220);
+            --accent-on-image-glow:  oklch(75% 0.12 220 / 0.4);
+            --border:       oklch(30% 0.03 220);
+            --border-muted: oklch(22% 0.02 220);
+            --success:      oklch(70% 0.15 145);
+            --danger:       oklch(70% 0.18 25);
+            --warning:      oklch(80% 0.15 85);
+            --info:         oklch(72% 0.13 240);
+            --success-hover:oklch(78% 0.15 145);
+            --danger-hover: oklch(78% 0.18 25);
+            --warning-hover:oklch(88% 0.15 85);
+            --info-hover:   oklch(80% 0.13 240);
+            --row-hover:    oklch(100% 0 0 / 0.04);
+            --overlay:      oklch(5% 0.01 220 / 0.62);
+            --glass:        oklch(16% 0.02 220 / 0.85);
+            --glass-border: oklch(30% 0.03 220 / 0.5);
+            --nav-scrolled-bg: oklch(12% 0.015 220 / 0.9);
+            --particle-opacity: 0.3;
+            --shadow-sm: 0 1px 3px oklch(0% 0 0 / 0.4), 0 1px 2px -1px oklch(0% 0 0 / 0.4);
+            --shadow-md: 0 4px 6px -1px oklch(0% 0 0 / 0.4), 0 2px 4px -2px oklch(0% 0 0 / 0.4);
+            --shadow-lg: 0 10px 15px -3px oklch(0% 0 0 / 0.4), 0 4px 6px -4px oklch(0% 0 0 / 0.4);
+            --shadow-popover: 0 12px 32px -8px oklch(0% 0 0 / 0.55);
+            --shadow-modal: 0 24px 60px -12px oklch(0% 0 0 / 0.6);
+        }
+    }
+
+    /* Dark (toggle) */
+    html.dark {
+        /* Bind native form controls (checkbox/radio/date/select) to the PINNED
+           theme — else color-scheme:light dark makes them follow the OS, so a
+           Light page on a dark-OS box renders dark checkbox squares (and v.v.). */
+        color-scheme: dark;
+        --bg-primary:   oklch(12% 0.015 220);
+        --bg-secondary: oklch(16% 0.02 220);
+        --bg-tertiary:  oklch(22% 0.025 220);
+        --fg-primary:   oklch(95% 0.02 220);
+        --fg-secondary: oklch(75% 0.05 220);
+        --fg-muted:     oklch(61% 0.04 220);
+        --accent:       oklch(75% 0.12 220);
+        --accent-hover: oklch(85% 0.1 220);
+        --accent-fg:    oklch(15% 0.04 220);
+        --accent-subtle:oklch(25% 0.04 220);
+        --accent-glow:  oklch(75% 0.12 220 / 0.4);
+        /* Already a dark-ground accent; the image needs no substitution */
+        --accent-on-image:       oklch(75% 0.12 220);
+        --accent-on-image-hover: oklch(85% 0.1 220);
+        --accent-on-image-fg:    oklch(15% 0.04 220);
+        --accent-on-image-glow:  oklch(75% 0.12 220 / 0.4);
+        --border:       oklch(30% 0.03 220);
+        --border-muted: oklch(22% 0.02 220);
+        --success:      oklch(70% 0.15 145);
+        --danger:       oklch(70% 0.18 25);
+        --warning:      oklch(80% 0.15 85);
+        --info:         oklch(72% 0.13 240);
+        --success-hover:oklch(78% 0.15 145);
+        --danger-hover: oklch(78% 0.18 25);
+        --warning-hover:oklch(88% 0.15 85);
+        --info-hover:   oklch(80% 0.13 240);
+        --row-hover:    oklch(100% 0 0 / 0.04);
+        --overlay:      oklch(5% 0.01 220 / 0.62);
+        --glass:        oklch(16% 0.02 220 / 0.85);
+        --glass-border: oklch(30% 0.03 220 / 0.5);
+        --nav-scrolled-bg: oklch(12% 0.015 220 / 0.9);
+        --particle-opacity: 0.3;
+        --shadow-sm: 0 1px 3px oklch(0% 0 0 / 0.4), 0 1px 2px -1px oklch(0% 0 0 / 0.4);
+        --shadow-md: 0 4px 6px -1px oklch(0% 0 0 / 0.4), 0 2px 4px -2px oklch(0% 0 0 / 0.4);
+        --shadow-lg: 0 10px 15px -3px oklch(0% 0 0 / 0.4), 0 4px 6px -4px oklch(0% 0 0 / 0.4);
+        --shadow-popover: 0 12px 32px -8px oklch(0% 0 0 / 0.55);
+        --shadow-modal: 0 24px 60px -12px oklch(0% 0 0 / 0.6);
+    }
+
+    /* Light (toggle) */
+    html.light {
+        color-scheme: light;   /* pin native form controls to light (see html.dark) */
+        --bg-primary:   oklch(98% 0.008 220);
+        --bg-secondary: oklch(96% 0.012 220);
+        --bg-tertiary:  oklch(92% 0.018 220);
+        --fg-primary:   oklch(25% 0.06 220);
+        --fg-secondary: oklch(40% 0.08 220);
+        --fg-muted:     oklch(50% 0.06 220);
+        --accent:       oklch(50% 0.12 220);
+        --accent-hover: oklch(45% 0.14 220);
+        --accent-fg:    oklch(98% 0.01 220);
+        --accent-subtle:oklch(92% 0.025 220);
+        --accent-glow:  oklch(50% 0.12 220 / 0.3);
+        /* Over the dark hero image, adopt this scheme's dark-mode accent — see .hero-bg */
+        --accent-on-image:       oklch(75% 0.12 220);
+        --accent-on-image-hover: oklch(85% 0.1 220);
+        --accent-on-image-fg:    oklch(15% 0.04 220);
+        --accent-on-image-glow:  oklch(75% 0.12 220 / 0.4);
+        --border:       oklch(85% 0.02 220);
+        --border-muted: oklch(90% 0.015 220);
+        --glass:        oklch(98% 0.008 220);
+        --glass-border: oklch(85% 0.02 220 / 0.5);
+        --nav-scrolled-bg: oklch(100% 0 0 / 0.95);
+        --particle-opacity: 0.15;
+    }
+
+    /* ===== Colour schemes (Crimson/Stone/Forest/Sunset/Mono) ===== */
+    .scheme-crimson:not(.dark) {
+        --bg-primary:   oklch(98% 0.008 25);
+        --bg-secondary: oklch(96% 0.012 25);
+        --bg-tertiary:  oklch(92% 0.018 25);
+        --fg-primary:   oklch(25% 0.04 25);
+        --fg-secondary: oklch(40% 0.06 25);
+        --fg-muted:     oklch(50% 0.04 25);
+        --accent:       oklch(47% 0.2 25);
+        --accent-hover: oklch(42% 0.22 25);
+        --accent-fg:    oklch(98% 0.01 25);
+        --accent-subtle:oklch(92% 0.04 25);
+        --accent-glow:  oklch(47% 0.2 25 / 0.3);
+        /* Over the dark hero image, adopt this scheme's dark-mode accent — see .hero-bg */
+        --accent-on-image:       oklch(63% 0.23 25);
+        --accent-on-image-hover: oklch(70% 0.25 25);
+        --accent-on-image-fg:    oklch(15% 0.04 25);
+        --accent-on-image-glow:  oklch(63% 0.23 25 / 0.4);
+        --border:       oklch(85% 0.02 25);
+        --border-muted: oklch(90% 0.015 25);
+        --glass:        oklch(98% 0.008 25);
+        --glass-border: oklch(85% 0.02 25 / 0.5);
+        --nav-scrolled-bg: oklch(98% 0.008 25 / 0.9);
+    }
+    .scheme-crimson.dark {
+        --bg-primary:   oklch(10% 0.015 25);
+        --bg-secondary: oklch(14% 0.02 25);
+        --bg-tertiary:  oklch(20% 0.025 25);
+        --fg-primary:   oklch(95% 0.02 25);
+        --fg-secondary: oklch(75% 0.04 25);
+        --fg-muted:     oklch(61% 0.03 25);
+        /* Crimson dark is the only dark scheme authored with a LIGHT --accent-fg.
+           No lightness exists at which a mid crimson both reads as link text on
+           bg1-3 and hosts a 98%-L label, so the label flips dark and the accent
+           lifts to clear the backgrounds. */
+        --accent:       oklch(63% 0.23 25);
+        --accent-hover: oklch(70% 0.25 25);
+        --accent-fg:    oklch(15% 0.04 25);
+        --accent-subtle:oklch(20% 0.05 25);
+        --accent-glow:  oklch(63% 0.23 25 / 0.4);
+        /* Already a dark-ground accent; the image needs no substitution */
+        --accent-on-image:       oklch(63% 0.23 25);
+        --accent-on-image-hover: oklch(70% 0.25 25);
+        --accent-on-image-fg:    oklch(15% 0.04 25);
+        --accent-on-image-glow:  oklch(63% 0.23 25 / 0.4);
+        --border:       oklch(28% 0.03 25);
+        --border-muted: oklch(20% 0.02 25);
+        --glass:        oklch(14% 0.02 25 / 0.85);
+        --glass-border: oklch(28% 0.03 25 / 0.5);
+        --nav-scrolled-bg: oklch(10% 0.015 25 / 0.9);
+    }
+    .scheme-stone:not(.dark) {
+        --bg-primary:   oklch(98% 0.005 60);
+        --bg-secondary: oklch(96% 0.008 60);
+        --bg-tertiary:  oklch(92% 0.012 60);
+        --fg-primary:   oklch(25% 0.02 60);
+        --fg-secondary: oklch(45% 0.02 60);
+        --fg-muted:     oklch(50% 0.015 60);
+        --accent:       oklch(45% 0.05 60);
+        --accent-hover: oklch(35% 0.06 60);
+        --accent-fg:    oklch(98% 0.005 60);
+        --accent-subtle:oklch(92% 0.015 60);
+        --accent-glow:  oklch(45% 0.05 60 / 0.3);
+        /* Over the dark hero image, adopt this scheme's dark-mode accent — see .hero-bg */
+        --accent-on-image:       oklch(80% 0.03 60);
+        --accent-on-image-hover: oklch(90% 0.02 60);
+        --accent-on-image-fg:    oklch(20% 0.02 60);
+        --accent-on-image-glow:  oklch(80% 0.03 60 / 0.3);
+        --border:       oklch(85% 0.01 60);
+        --border-muted: oklch(90% 0.008 60);
+        --glass:        oklch(98% 0.005 60);
+        --glass-border: oklch(85% 0.01 60 / 0.5);
+        --nav-scrolled-bg: oklch(98% 0.005 60 / 0.9);
+    }
+    .scheme-stone.dark {
+        --bg-primary:   oklch(12% 0.01 60);
+        --bg-secondary: oklch(16% 0.012 60);
+        --bg-tertiary:  oklch(22% 0.015 60);
+        --fg-primary:   oklch(95% 0.01 60);
+        --fg-secondary: oklch(75% 0.015 60);
+        --fg-muted:     oklch(61% 0.015 60);
+        --accent:       oklch(80% 0.03 60);
+        --accent-hover: oklch(90% 0.02 60);
+        --accent-fg:    oklch(20% 0.02 60);
+        --accent-subtle:oklch(25% 0.02 60);
+        --accent-glow:  oklch(80% 0.03 60 / 0.3);
+        /* Already a dark-ground accent; the image needs no substitution */
+        --accent-on-image:       oklch(80% 0.03 60);
+        --accent-on-image-hover: oklch(90% 0.02 60);
+        --accent-on-image-fg:    oklch(20% 0.02 60);
+        --accent-on-image-glow:  oklch(80% 0.03 60 / 0.3);
+        --border:       oklch(30% 0.015 60);
+        --border-muted: oklch(22% 0.012 60);
+        --glass:        oklch(16% 0.012 60 / 0.85);
+        --glass-border: oklch(30% 0.015 60 / 0.5);
+        --nav-scrolled-bg: oklch(12% 0.01 60 / 0.9);
+    }
+    .scheme-forest:not(.dark) {
+        --bg-primary:   oklch(98% 0.008 150);
+        --bg-secondary: oklch(96% 0.012 150);
+        --bg-tertiary:  oklch(92% 0.018 150);
+        --fg-primary:   oklch(25% 0.06 150);
+        --fg-secondary: oklch(40% 0.08 150);
+        --fg-muted:     oklch(50% 0.06 150);
+        --accent:       oklch(49% 0.12 150);
+        --accent-hover: oklch(44% 0.14 150);
+        --accent-fg:    oklch(98% 0.01 150);
+        --accent-subtle:oklch(92% 0.025 150);
+        --accent-glow:  oklch(49% 0.12 150 / 0.3);
+        /* Over the dark hero image, adopt this scheme's dark-mode accent — see .hero-bg */
+        --accent-on-image:       oklch(70% 0.12 150);
+        --accent-on-image-hover: oklch(80% 0.1 150);
+        --accent-on-image-fg:    oklch(15% 0.04 150);
+        --accent-on-image-glow:  oklch(70% 0.12 150 / 0.3);
+        --border:       oklch(85% 0.02 150);
+        --border-muted: oklch(90% 0.015 150);
+        --glass:        oklch(98% 0.008 150);
+        --glass-border: oklch(85% 0.02 150 / 0.5);
+        --nav-scrolled-bg: oklch(98% 0.008 150 / 0.9);
+    }
+    .scheme-forest.dark {
+        --bg-primary:   oklch(12% 0.015 150);
+        --bg-secondary: oklch(16% 0.02 150);
+        --bg-tertiary:  oklch(22% 0.025 150);
+        --fg-primary:   oklch(95% 0.02 150);
+        --fg-secondary: oklch(75% 0.05 150);
+        --fg-muted:     oklch(61% 0.04 150);
+        --accent:       oklch(70% 0.12 150);
+        --accent-hover: oklch(80% 0.1 150);
+        --accent-fg:    oklch(15% 0.04 150);
+        --accent-subtle:oklch(25% 0.04 150);
+        --accent-glow:  oklch(70% 0.12 150 / 0.3);
+        /* Already a dark-ground accent; the image needs no substitution */
+        --accent-on-image:       oklch(70% 0.12 150);
+        --accent-on-image-hover: oklch(80% 0.1 150);
+        --accent-on-image-fg:    oklch(15% 0.04 150);
+        --accent-on-image-glow:  oklch(70% 0.12 150 / 0.3);
+        --border:       oklch(30% 0.03 150);
+        --border-muted: oklch(22% 0.02 150);
+        --glass:        oklch(16% 0.02 150 / 0.85);
+        --glass-border: oklch(30% 0.03 150 / 0.5);
+        --nav-scrolled-bg: oklch(12% 0.015 150 / 0.9);
+    }
+    .scheme-sunset:not(.dark) {
+        --bg-primary:   oklch(98% 0.01 45);
+        --bg-secondary: oklch(96% 0.015 45);
+        --bg-tertiary:  oklch(92% 0.02 45);
+        --fg-primary:   oklch(30% 0.08 45);
+        --fg-secondary: oklch(42% 0.1 45);
+        --fg-muted:     oklch(50% 0.08 45);
+        --accent:       oklch(52% 0.16 45);
+        --accent-hover: oklch(46% 0.18 45);
+        --accent-fg:    oklch(98% 0.01 45);
+        --accent-subtle:oklch(92% 0.03 45);
+        --accent-glow:  oklch(52% 0.16 45 / 0.3);
+        /* Over the dark hero image, adopt this scheme's dark-mode accent — see .hero-bg */
+        --accent-on-image:       oklch(72% 0.14 45);
+        --accent-on-image-hover: oklch(82% 0.12 45);
+        --accent-on-image-fg:    oklch(15% 0.05 45);
+        --accent-on-image-glow:  oklch(72% 0.14 45 / 0.3);
+        --border:       oklch(85% 0.025 45);
+        --border-muted: oklch(90% 0.02 45);
+        --glass:        oklch(98% 0.01 45);
+        --glass-border: oklch(85% 0.025 45 / 0.5);
+        --nav-scrolled-bg: oklch(98% 0.01 45 / 0.9);
+    }
+    .scheme-sunset.dark {
+        --bg-primary:   oklch(12% 0.02 45);
+        --bg-secondary: oklch(16% 0.025 45);
+        --bg-tertiary:  oklch(22% 0.03 45);
+        --fg-primary:   oklch(95% 0.025 45);
+        --fg-secondary: oklch(75% 0.06 45);
+        --fg-muted:     oklch(61% 0.05 45);
+        --accent:       oklch(72% 0.14 45);
+        --accent-hover: oklch(82% 0.12 45);
+        --accent-fg:    oklch(15% 0.05 45);
+        --accent-subtle:oklch(25% 0.05 45);
+        --accent-glow:  oklch(72% 0.14 45 / 0.3);
+        /* Already a dark-ground accent; the image needs no substitution */
+        --accent-on-image:       oklch(72% 0.14 45);
+        --accent-on-image-hover: oklch(82% 0.12 45);
+        --accent-on-image-fg:    oklch(15% 0.05 45);
+        --accent-on-image-glow:  oklch(72% 0.14 45 / 0.3);
+        --border:       oklch(30% 0.035 45);
+        --border-muted: oklch(22% 0.025 45);
+        --glass:        oklch(16% 0.025 45 / 0.85);
+        --glass-border: oklch(30% 0.035 45 / 0.5);
+        --nav-scrolled-bg: oklch(12% 0.02 45 / 0.9);
+    }
+    .scheme-mono:not(.dark) {
+        --bg-primary:   oklch(98% 0 0);
+        --bg-secondary: oklch(96% 0 0);
+        --bg-tertiary:  oklch(92% 0 0);
+        --fg-primary:   oklch(20% 0 0);
+        --fg-secondary: oklch(40% 0 0);
+        --fg-muted:     oklch(50% 0 0);
+        --accent:       oklch(25% 0 0);
+        --accent-hover: oklch(35% 0 0);
+        --accent-fg:    oklch(98% 0 0);
+        --accent-subtle:oklch(90% 0 0);
+        --accent-glow:  oklch(25% 0 0 / 0.2);
+        /* Over the dark hero image, adopt this scheme's dark-mode accent — see .hero-bg */
+        --accent-on-image:       oklch(85% 0 0);
+        --accent-on-image-hover: oklch(92% 0 0);
+        --accent-on-image-fg:    oklch(12% 0 0);
+        --accent-on-image-glow:  oklch(85% 0 0 / 0.3);
+        --border:       oklch(85% 0 0);
+        --border-muted: oklch(90% 0 0);
+        --glass:        oklch(98% 0 0);
+        --glass-border: oklch(85% 0 0 / 0.5);
+        --nav-scrolled-bg: oklch(100% 0 0 / 0.95);
+    }
+    .scheme-mono.dark {
+        --bg-primary:   oklch(10% 0 0);
+        --bg-secondary: oklch(15% 0 0);
+        --bg-tertiary:  oklch(22% 0 0);
+        --fg-primary:   oklch(95% 0 0);
+        --fg-secondary: oklch(75% 0 0);
+        --fg-muted:     oklch(61% 0 0);
+        --accent:       oklch(85% 0 0);
+        --accent-hover: oklch(92% 0 0);
+        --accent-fg:    oklch(12% 0 0);
+        --accent-subtle:oklch(25% 0 0);
+        --accent-glow:  oklch(85% 0 0 / 0.3);
+        /* Already a dark-ground accent; the image needs no substitution */
+        --accent-on-image:       oklch(85% 0 0);
+        --accent-on-image-hover: oklch(92% 0 0);
+        --accent-on-image-fg:    oklch(12% 0 0);
+        --accent-on-image-glow:  oklch(85% 0 0 / 0.3);
+        --border:       oklch(30% 0 0);
+        --border-muted: oklch(22% 0 0);
+        --glass:        oklch(15% 0 0 / 0.85);
+        --glass-border: oklch(30% 0 0 / 0.5);
+        --nav-scrolled-bg: oklch(10% 0 0 / 0.9);
+    }
+}
+
+/* ============================================
+   SITE COMPONENTS - Marketing Layout
+   ============================================ */
+
+@layer site-components {
+    /* ============================================
+       TYPOGRAPHY - Heading Fonts
+       ============================================ */
+
+    h1, h2, h3, h4, h5, h6,
+    .section-title,
+    .footer-brand {
+        font-family: var(--font-heading);
+    }
+
+    /* ============================================
+       LAYOUT OVERRIDES - Edge-to-Edge Marketing
+       ============================================ */
+
+    /* Remove main padding so sections go edge-to-edge */
+    main {
+        padding: 0;
+    }
+
+    /* Overlay visible on mobile when sidebar open (base.css controls visibility) */
+
+    /* ============================================
+       APP SHELL - Translucent Sidebars
+       ============================================ */
+
+    .sidebar {
+        background: var(--glass);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+    }
+
+    .carousel-header {
+        border-block-end-color: var(--glass-border);
+    }
+
+    .sidebar nav a {
+        color: var(--fg-secondary);
+    }
+
+    .sidebar nav a:hover {
+        color: var(--accent);
+        background: var(--accent-subtle);
+    }
+
+    .sidebar nav a.active {
+        color: var(--accent);
+        background: var(--accent-subtle);
+        border-color: var(--accent);
+    }
+
+    /* Topnav styling */
+    .topnav {
+        background: var(--glass);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+        border-block-end: 1px solid var(--glass-border);
+    }
+
+    .topnav .brand {
+        font-family: var(--font-heading);
+        font-weight: 800; /* match the hero wordmark weight */
+        color: var(--fg-primary);
+    }
+
+    .topnav .brand span {
+        color: var(--accent);
+    }
+
+    /* ============================================
+       GLOBAL BACKGROUND IMAGE
+       ============================================ */
+
+    body {
+        background: var(--hero-bg) center/cover fixed;
+        background-attachment: fixed;
+        min-height: 100vh;
+    }
+
+    /* ============================================
+       HERO SECTION
+       ============================================ */
+
+    .hero {
+        text-align: center;
+        padding: var(--space-16) var(--space-4);
+    }
+
+    .hero-bg {
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: relative;
+    }
+
+    .hero-bg::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: var(--hero-overlay, rgb(0 0 0 / 0.6));
+        z-index: 0;
+    }
+
+    html.light {
+        --hero-overlay: rgb(0 0 0 / 0.3);
+    }
+
+    html.light .hero-bg p { color: #fff; }
+
+    /* The hero and the image sections sit on Server_Room_Dark.webp, which bakes in
+       its own darkening — a dark ground in every scheme and both modes. A light
+       mode's --accent is tuned for a near-white surface and loses contrast there,
+       so each context declares what its accent becomes over the image (light modes
+       nominate their own dark-mode accent; dark modes nominate themselves).
+
+       --accent-fg moves WITH --accent: .cta-btn.primary lives inside .hero-bg and
+       pairs them. The hand-authored mono rule this replaces moved only --accent,
+       which left a 98%-L label on a 90%-L button at 1.49:1.
+
+       GROUND CONTRACT — what counts as "over the image". .hero-canvas is listed
+       because it paints --hero-bg itself and its text sits directly on the photo. It
+       is normally authored alongside .hero-bg, but that pairing is markup discipline,
+       not something CSS enforces, so the ground declares itself rather than trusting
+       the author to pair them.
+
+       Deliberately NOT listed: .sheet-section and .img-panel. Both paint the photo,
+       neither carries text on it — .sheet-section's content sits on the opaque .sheet,
+       and .img-panel is a decorative half of a split grid. Substituting on them would
+       push the on-image accent INTO the opaque .sheet, which is the one composition
+       this model still gets wrong: a .sheet nested in an image ground inherits the
+       substitution with no way to undo it, because the un-substituted value is gone by
+       then. The fix is a mirror token (--accent-base and friends) an opaque descendant
+       can restore from; deferred deliberately, since it doubles the accent token
+       surface for a composition no checked-in markup authors — both sites use only
+       .hero-bg and .bg-image-section today. Revisit the moment a template puts
+       text-bearing content inside .sheet, or directly in .sheet-section. */
+    .hero-bg,
+    .bg-image-section,
+    .hero-canvas {
+        --accent:       var(--accent-on-image);
+        --accent-hover: var(--accent-on-image-hover);
+        --accent-fg:    var(--accent-on-image-fg);
+        --accent-glow:  var(--accent-on-image-glow);
+    }
+
+    .hero-bg > * {
+        position: relative;
+        z-index: 1;
+    }
+
+    .hero-bg h1 {
+        color: #fff;
+        font-size: clamp(2.5rem, 2rem + 5vw, 5rem);
+        line-height: 1.1;
+        margin-block-end: var(--space-4);
+    }
+
+    .hero-bg p {
+        color: rgba(255, 255, 255, 0.9);
+        font-size: var(--text-xl);
+        max-width: 600px;
+        margin-inline: auto;
+    }
+
+    .hero-content {
+        text-align: center;
+        max-width: var(--container-lg);
+        animation: fade-in-up 1s var(--ease-out);
+    }
+
+    /* Hero badge */
+    .hero-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-2);
+        background: rgb(255 255 255 / 0.1);
+        border: 1px solid rgb(255 255 255 / 0.2);
+        padding: var(--space-2) var(--space-5);
+        border-radius: var(--radius-full);
+        font-size: var(--text-xs);
+        color: #fff;
+        margin-block-end: var(--space-8);
+        backdrop-filter: blur(10px);
+    }
+
+    /* Gradient text - uses accent color */
+    .gradient-text {
+        color: var(--accent);
+    }
+
+    /* Shimmer gradient text */
+    .shimmer-text {
+        background: linear-gradient(
+            90deg,
+            var(--accent) 0%,
+            var(--accent) 35%,
+            oklch(95% 0.05 200) 50%,
+            var(--accent) 65%,
+            var(--accent) 100%
+        );
+        background-size: 200% 100%;
+        -webkit-background-clip: text;
+        background-clip: text;
+        -webkit-text-fill-color: transparent;
+        animation: shimmer 10s linear infinite;
+    }
+
+    @keyframes shimmer {
+        0% { background-position: 200% 0; }
+        100% { background-position: -200% 0; }
+    }
+
+    /* Page hero (shorter) */
+    .page-hero {
+        min-height: 50vh;
+    }
+
+    /* ============================================
+       SECTIONS
+       ============================================ */
+
+    /* Content section */
+    .content-section {
+        background: var(--bg-secondary);
+        padding: var(--space-16) var(--space-4);
+    }
+
+    /* Section with background image visible (no solid bg) */
+    .bg-image-section {
+        position: relative;
+        min-height: 30vh;
+        padding: var(--space-16) var(--space-4);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .bg-image-section::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: rgb(0 0 0 / 0.5);
+        z-index: 0;
+    }
+
+    .bg-image-section > * {
+        position: relative;
+        z-index: 1;
+    }
+
+    .bg-image-section .section-title,
+    .bg-image-section .section-subtitle { color: #fff; }
+
+    .bg-image-section .section-tag { color: var(--accent); }
+
+    .bg-image-section .section-header { margin-block-end: 0; }
+
+    /* Section header */
+    .section-header {
+        text-align: center;
+        margin-block-end: var(--space-12);
+    }
+
+    .section-tag {
+        display: inline-block;
+        color: var(--accent);
+        font-weight: 600;
+        font-size: var(--text-sm);
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        margin-block-end: var(--space-4);
+    }
+
+    .section-title {
+        font-size: var(--text-4xl);
+        font-weight: 700;
+        margin-block-end: var(--space-4);
+        color: var(--fg-primary);
+    }
+
+    .section-subtitle {
+        color: var(--fg-secondary);
+        font-size: var(--text-lg);
+        max-width: 600px;
+        margin-inline: auto;
+    }
+
+    .section-lede {
+        max-width: 720px;
+        margin: 0 auto var(--space-12);
+        text-align: center;
+        font-size: var(--text-lg);
+        line-height: 1.7;
+        color: var(--fg-secondary);
+    }
+
+    .section-lede code {
+        background: var(--bg-tertiary);
+        padding: 0.1em 0.4em;
+        border-radius: var(--radius-sm);
+        font-size: 0.9em;
+        color: var(--fg-primary);
+    }
+
+    .section-lede strong {
+        color: var(--fg-primary);
+    }
+
+    /* ============================================
+       SERVICE CARDS
+       ============================================ */
+
+    .services-grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: var(--space-4);
+        max-width: var(--container-xl);
+        margin-inline: auto;
+    }
+
+    .service-card {
+        background: var(--glass);
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        border: 1px solid var(--glass-border);
+        padding: var(--space-6);
+        border-radius: var(--radius-lg);
+        position: relative;
+        overflow: hidden;
+        /* Initial transparent shadow for smooth transition */
+        box-shadow: 0 20px 40px rgb(0 0 0 / 0), 0 0 20px transparent;
+        /* Explicit transition properties for reliable hover */
+        transition:
+            transform var(--transition-medium),
+            box-shadow var(--transition-medium),
+            border-color var(--transition-medium);
+    }
+
+    .service-card::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 3px;
+        background: var(--accent);
+        opacity: 0;
+        transition: opacity var(--transition-medium);
+    }
+
+    .service-card:hover,
+    .service-card.reveal.active:hover {
+        transform: translateY(-4px) scale(1);
+        border-color: var(--accent);
+        box-shadow: 0 20px 40px rgb(0 0 0 / 0.15), 0 0 20px var(--accent-glow);
+    }
+
+    .service-card:hover::before { opacity: 1; }
+
+    .service-icon {
+        font-size: 2rem;
+        margin-block-end: var(--space-4);
+        display: block;
+        color: var(--accent);
+        transition: transform var(--transition-medium);
+    }
+
+    .service-icon .lucide,
+    .service-icon [data-lucide] {
+        width: 2rem;
+        height: 2rem;
+        color: var(--accent);
+        stroke: var(--accent);
+    }
+
+    .service-card:hover .service-icon { transform: scale(1.1); }
+
+    .service-card h3 {
+        font-size: var(--text-lg);
+        font-weight: 600;
+        margin-block-end: var(--space-3);
+        color: var(--fg-primary);
+    }
+
+    .service-card ul { list-style: none; }
+
+    .service-card li {
+        padding: 0.3rem 0;
+        padding-inline-start: var(--space-5);
+        position: relative;
+        color: var(--fg-secondary);
+        font-size: var(--text-sm);
+    }
+
+    .service-card li::before {
+        content: "\2713";
+        position: absolute;
+        left: 0;
+        color: var(--accent);
+        font-weight: bold;
+    }
+
+    .services-grid-2col { grid-template-columns: 1fr; }
+
+    /* ============================================
+       PRICING TABLES
+       ============================================ */
+
+    .pricing-tables-grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: var(--space-6);
+        max-width: var(--container-xl);
+        margin-inline: auto;
+    }
+
+    .pricing-table {
+        background: var(--glass);
+        border: 1px solid var(--glass-border);
+        border-radius: var(--radius-lg);
+        overflow: hidden;
+    }
+
+    .pricing-table-header {
+        background: var(--accent);
+        color: var(--accent-fg);
+        padding: var(--space-4);
+        text-align: center;
+        font-family: var(--font-heading);
+        font-size: var(--text-lg);
+        font-weight: 600;
+    }
+
+    .pricing-table-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: var(--space-3) var(--space-4);
+        border-bottom: 1px solid var(--glass-border);
+        transition: background-color var(--transition-base);
+    }
+
+    .pricing-table-row:last-child { border-bottom: none; }
+    .pricing-table-row:hover { background: var(--accent-subtle); }
+    .pricing-table-row span:first-child { color: var(--fg-secondary); }
+    .pricing-table-row span:first-child strong { color: var(--fg-primary); }
+    .pricing-table-row span:last-child { color: var(--accent); font-weight: 600; }
+
+    /* ============================================
+       CTA BUTTONS
+       ============================================ */
+
+    .cta-group {
+        display: flex;
+        gap: var(--space-4);
+        justify-content: center;
+        flex-wrap: wrap;
+        margin-top: var(--space-8);
+    }
+
+    .cta-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-2);
+        padding: var(--space-3) var(--space-6);
+        border-radius: var(--radius-lg);
+        text-decoration: none;
+        font-weight: 600;
+        font-size: var(--text-base);
+        transition:
+            background-color var(--transition-base),
+            transform var(--transition-base),
+            box-shadow var(--transition-base);
+    }
+
+    .cta-btn.primary {
+        background: var(--accent);
+        color: var(--accent-fg);
+        box-shadow: 0 4px 20px var(--accent-glow);
+    }
+
+    .cta-btn.primary:hover {
+        background: var(--accent-hover);
+        transform: translateY(-2px);
+        box-shadow: 0 8px 30px var(--accent-glow);
+        text-decoration: none;
+    }
+
+    /* The outlined CTA was authored white-on-10%-white for the hero, but it is also
+       used in #build, an opaque .content-section (--bg-secondary, 96% L in light
+       mode) — white on 96% white is invisible text, not low contrast. So the base
+       rule is base.css's own .btn-outline treatment (transparent + --border +
+       --fg-primary) and the always-dark grounds keep the frosted white explicitly.
+       Same principle as --accent-on-image: the element does not guess its ground,
+       the ground declares itself.
+
+       --border does not itself clear the 1.4.11 3:1 non-text floor in any of the
+       twelve contexts (85% L over a 96% L --bg-secondary in light modes). That is a
+       palette-wide gap, not this button's — it is deliberately spent through the
+       token rather than patched here with a bespoke mix, so that raising --border
+       fixes this control along with every other bordered one. The label itself
+       clears AA, so the control stays identifiable meanwhile. */
+    .cta-btn.secondary {
+        background: transparent;
+        border: 1px solid var(--border);
+        color: var(--fg-primary);
+    }
+
+    /* base.css's .btn-outline:hover fills with --bg-secondary, which is exactly the
+       ground .content-section paints — inside #build that hover is invisible. This
+       deviates to --bg-tertiary, which differs from both --bg-primary and
+       --bg-secondary, so the hover reads on either ground. (The same latent flaw
+       sits in .btn-outline itself; that is framework-wide and belongs in base.css,
+       not here.) */
+    .cta-btn.secondary:hover {
+        background: var(--bg-tertiary);
+        border-color: var(--fg-muted);
+        transform: translateY(-2px);
+        text-decoration: none;
+    }
+
+    .hero-bg .cta-btn.secondary,
+    .bg-image-section .cta-btn.secondary,
+    .hero-canvas .cta-btn.secondary {
+        background: rgb(255 255 255 / 0.1);
+        border-color: rgb(255 255 255 / 0.3);
+        color: #fff;
+        backdrop-filter: blur(10px);
+    }
+
+    .hero-bg .cta-btn.secondary:hover,
+    .bg-image-section .cta-btn.secondary:hover,
+    .hero-canvas .cta-btn.secondary:hover {
+        background: rgb(255 255 255 / 0.2);
+        border-color: #fff;
+    }
+
+    /* ============================================
+       PARTICLES
+       ============================================ */
+
+    .particles {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        z-index: 0;
+        overflow: hidden;
+    }
+
+    .particle {
+        position: absolute;
+        width: 4px;
+        height: 4px;
+        background: var(--accent);
+        border-radius: var(--radius-full);
+        opacity: var(--particle-opacity);
+        animation: float-up 15s linear infinite;
+    }
+
+    @keyframes float-up {
+        0% { transform: translateY(100vh) scale(0); opacity: 0; }
+        10%, 90% { opacity: var(--particle-opacity); }
+        100% { transform: translateY(-100vh) scale(1); opacity: 0; }
+    }
+
+    /* ============================================
+       FOOTER
+       ============================================ */
+
+    .footer-main {
+        background: var(--bg-secondary);
+        border-block-start: 1px solid var(--glass-border);
+        padding: var(--space-12) var(--space-4) var(--space-8);
+    }
+
+    .footer-grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: var(--space-8);
+        max-width: var(--container-xl);
+        margin-inline: auto;
+    }
+
+    .footer-col .footer-brand {
+        font-size: 1.5rem;
+        font-weight: 700;
+        margin-block-end: var(--space-4);
+        color: var(--fg-primary);
+    }
+
+    .footer-col .footer-brand span { color: var(--accent); }
+
+    .footer-col h4 {
+        font-size: var(--text-base);
+        font-weight: 600;
+        color: var(--fg-primary);
+        margin-block-end: var(--space-4);
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+    }
+
+    .footer-col h4 .lucide,
+    .footer-col h4 [data-lucide] {
+        color: var(--accent);
+        stroke: var(--accent);
+    }
+
+    .footer-col p {
+        color: var(--fg-secondary);
+        font-size: var(--text-sm);
+        margin-block-end: var(--space-2);
+    }
+
+    .footer-col .contact-line {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        margin-block-end: var(--space-2);
+        font-size: var(--text-sm);
+        color: var(--fg-secondary);
+    }
+
+    .footer-col .contact-line .lucide,
+    .footer-col .contact-line [data-lucide] {
+        color: var(--accent);
+        stroke: var(--accent);
+        flex-shrink: 0;
+    }
+
+    .footer-col .contact-line a {
+        color: var(--fg-secondary);
+        text-decoration: none;
+        transition: color var(--transition-fast);
+    }
+
+    .footer-col .contact-line a:hover { color: var(--accent); }
+
+    .footer-copyright {
+        border-block-start: 1px solid var(--glass-border);
+        margin-block-start: var(--space-8);
+        padding-block-start: var(--space-6);
+        text-align: center;
+        color: var(--fg-muted);
+        font-size: var(--text-xs);
+    }
+
+    /* ============================================
+       ANIMATIONS
+       ============================================ */
+
+    @keyframes fade-in-up {
+        from { opacity: 0; transform: translateY(20px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+
+    .reveal {
+        opacity: 0;
+        transform: translateY(100px) scale(0.95);
+        transition: opacity var(--transition-long), transform var(--transition-long);
+    }
+
+    .reveal.active {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+
+    /* ============================================
+       RESPONSIVE - Standardized breakpoints
+       600px, 900px, 1200px
+       ============================================ */
+
+    @media (min-width: 600px) {
+        .services-grid { grid-template-columns: repeat(2, 1fr); }
+        .pricing-tables-grid { grid-template-columns: repeat(2, 1fr); }
+        .services-grid-2col { grid-template-columns: repeat(2, 1fr); }
+        .footer-grid { grid-template-columns: repeat(2, 1fr); }
+        .service-card { padding: var(--space-8); }
+    }
+
+    @media (min-width: 900px) {
+        .pricing-tables-3col,
+        .services-grid-3col { grid-template-columns: repeat(3, 1fr); }
+    }
+
+    @media (min-width: 1200px) {
+        .bg-image-section { min-height: 40vh; }
+        .services-grid { grid-template-columns: repeat(4, 1fr); }
+        .services-grid-2col { grid-template-columns: repeat(2, 1fr); }
+        .services-grid-3col { grid-template-columns: repeat(3, 1fr); }
+        .footer-grid { grid-template-columns: repeat(4, 1fr); }
+    }
+}
+
+/* ============================================
+   SITE UTILITIES - Site-specific only
+   No duplicates from base.css
+   ============================================ */
+
+@layer site-utilities {
+    /* Marketing-specific spacing (larger than base.css --space-8) */
+    .mt-8 { margin-block-start: var(--space-8); }
+    .mb-8 { margin-block-end: var(--space-8); }
+    .mt-12 { margin-block-start: var(--space-12); }
+    .mb-12 { margin-block-end: var(--space-12); }
+
+    /* Marketing-specific spacing utilities */
+    .mb-1 { margin-block-end: var(--space-4); }
+    .p-large { padding: var(--space-8); }
+
+    /* Container variant */
+    .container-md { max-width: 800px; }
+
+    /* Article text styling */
+    .article-heading { margin-block: var(--space-4) var(--space-2); }
+    .article-text { color: var(--fg-secondary); line-height: var(--leading-relaxed); }
+    .icon-header { display: flex; align-items: center; gap: var(--space-2); }
+}
+
+/* ============================================
+   CANVAS LAYOUT — marketing components for CMS
+   canvas pages (format='canvas'/'canvas-file'):
+   hero card, split sections, icon lists, glass
+   panels (.gpanel — NOT .panel, which is the
+   structural carousel panel in base.css), sheets,
+   tabs, tagline strip. Same dcs.spa lineage as the
+   marketing set above; additive class names only.
+   ============================================ */
+
+@layer site-components {
+    /* Hero over the photo. `fixed` attachment sizes/positions the image against
+       the VIEWPORT, so this hero and every .bg-image-section band below window
+       onto the SAME continuous image — the genuine dcs.spa mechanic — without a
+       body background (shell.html deliberately keeps <body> solid: a fixed body
+       image flashed through #content during boosted swaps). Inside the shell's
+       content column the hero is a tall section, not the full viewport (the
+       topnav/chrome own the rest). .hero-bg supplies centering + scrim + type. */
+    .hero-canvas {
+        padding: var(--space-16) var(--space-4);
+        min-height: 80vh;
+        background: var(--hero-bg) center/cover fixed;
+    }
+
+    .hero-bg h1 a { color: #fff; text-decoration: none; }
+    .hero-bg .hero-tld { font-size: 0.4em; font-weight: 400; color: rgb(255 255 255 / 0.55); }
+
+    .hero-bg h2 {
+        color: rgb(255 255 255 / 0.92);
+        font-size: var(--text-2xl);
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        margin-block-end: var(--space-6);
+    }
+
+    /* Window bands: same fixed image as the hero (note above). Overrides the
+       marketing-set .bg-image-section (same layer, later order), which assumed a
+       body bleed the shell never provides. scroll-margin keeps #named anchor
+       jumps clear of the fixed topnav. */
+    .bg-image-section {
+        background: var(--hero-bg) center/cover fixed;
+        scroll-margin-block-start: calc(var(--topnav-height) + var(--space-4));
+    }
+
+    /* Plain prose bed for a content-section — the old .sheet text styles without
+       the panel chrome. */
+    .section-body {
+        max-width: var(--container-xl);
+        margin-inline: auto;
+        color: var(--fg-secondary);
+    }
+
+    .section-body p { margin-block-end: var(--space-4); }
+
+    .section-body h3 {
+        color: var(--fg-primary);
+        font-size: var(--text-xl);
+        margin-block: var(--space-6) var(--space-3);
+    }
+
+    .section-body a { color: var(--accent); }
+
+    .section-body > .icon-list {
+        max-width: 640px;
+        margin-inline: auto;
+        margin-block-start: var(--space-2);
+    }
+
+    .hero-card {
+        position: relative;
+        z-index: 1;
+        background: var(--glass);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+        border: 1px solid var(--glass-border);
+        border-bottom: none;
+        border-radius: var(--radius-2xl) var(--radius-2xl) 0 0;
+        padding: var(--space-12) var(--space-8) var(--space-10);
+        text-align: center;
+        max-width: var(--container-xl);
+        width: 100%;
+        margin-inline: auto;
+        animation: fade-in-up 1s var(--ease-out);
+    }
+
+    .hero-card h1 {
+        font-size: var(--text-6xl);
+        line-height: 1.1;
+        margin-block-end: var(--space-4);
+    }
+
+    .hero-card h1 a { color: var(--fg-primary); text-decoration: none; }
+    .hero-card .hero-tld { font-size: 0.4em; font-weight: 400; color: var(--fg-muted); }
+
+    .hero-card h2 {
+        font-size: var(--text-2xl);
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        color: var(--fg-secondary);
+        margin-block-end: var(--space-6);
+    }
+
+    .hero-card p {
+        color: var(--fg-secondary);
+        font-size: var(--text-lg);
+        max-width: 760px;
+        margin-inline: auto;
+    }
+
+    /* Two-column split grid */
+    .split-grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: var(--space-6);
+        max-width: var(--container-xl);
+        margin-inline: auto;
+        align-items: stretch;
+    }
+
+    .split-grid.gap0 { gap: 0; }
+    .vcenter { display: flex; flex-direction: column; justify-content: center; }
+
+    /* Glass panel (marketing card). Named .gpanel: `.panel` is the structural
+       carousel panel (base.css) and must not be restyled. */
+    .gpanel {
+        background: var(--glass);
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        border: 1px solid var(--glass-border);
+        border-radius: var(--radius-lg);
+        padding: var(--space-8);
+        color: var(--fg-secondary);
+    }
+
+    .col-plain {
+        padding: var(--space-8) var(--space-4);
+        color: var(--fg-secondary);
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-6);
+        align-items: flex-start;
+        justify-content: center;
+    }
+
+    /* Icon lists */
+    .icon-list { list-style: none; padding: 0; margin: 0; }
+
+    .icon-list li,
+    .icon-list li > a,
+    .icon-list li > span {
+        display: flex;
+        align-items: flex-start;
+        gap: var(--space-3);
+        color: var(--fg-secondary);
+        text-decoration: none;
+    }
+
+    .icon-list li { padding-block: var(--space-1); }
+
+    .icon-list li .lucide,
+    .icon-list li [data-lucide] {
+        color: var(--accent);
+        stroke: var(--accent);
+        width: 1.2em;
+        height: 1.2em;
+        flex-shrink: 0;
+        margin-top: 0.2em;
+    }
+
+    .icon-list a:hover { color: var(--accent); }
+
+    .icon-list.dots li { padding-block: 2px; font-size: var(--text-sm); }
+    .icon-list.dots li .lucide { width: 0.8em; height: 0.8em; margin-top: 0.35em; }
+
+    .icon-list.contact-list li,
+    .icon-list.roles li {
+        font-size: var(--text-xl);
+        padding-block: var(--space-2);
+    }
+
+    .icon-list.contact-list li .lucide,
+    .icon-list.roles li .lucide { width: 1.3em; height: 1.3em; }
+
+    /* Image panel + roles strip */
+    .strip-section {
+        background: var(--bg-secondary);
+        padding: 0;
+    }
+
+    .strip-section .split-grid { max-width: var(--container-xl); }
+
+    .img-panel {
+        background: var(--hero-bg) center/cover;
+        min-height: 260px;
+        border-radius: var(--radius-lg);
+    }
+
+    .strip-section .vcenter { padding: var(--space-8) var(--space-4); }
+
+    /* Sheet over the photo background (.bg-image-section pairs above; inside the
+       shell the section supplies its own image rather than relying on body bleed). */
+    .sheet-section {
+        padding: var(--space-16) var(--space-4);
+        background: var(--hero-bg) center/cover;
+        border-radius: var(--radius-lg);
+        overflow: hidden;
+    }
+
+    .sheet {
+        position: relative;
+        z-index: 1;
+        background: var(--bg-primary);
+        border: 1px solid var(--glass-border);
+        border-radius: var(--radius-lg);
+        padding: var(--space-10) var(--space-8);
+        max-width: var(--container-xl);
+        width: 100%;
+        margin-inline: auto;
+        color: var(--fg-secondary);
+    }
+
+    .sheet .section-title { text-align: center; color: var(--fg-primary); }
+
+    .sheet ul:not(.icon-list) {
+        margin: var(--space-4) 0 0 var(--space-6);
+        color: var(--fg-secondary);
+    }
+
+    .sheet ul:not(.icon-list) li { padding-block: var(--space-1); }
+
+    .sheet h3 {
+        text-align: center;
+        color: var(--fg-primary);
+        font-size: var(--text-xl);
+        margin-block: var(--space-6) var(--space-3);
+    }
+
+    .sheet a { color: var(--accent); }
+
+    .callout {
+        font-size: var(--text-lg);
+        text-align: center;
+        background: var(--accent-subtle);
+        border-radius: var(--radius-md);
+        padding: var(--space-4) var(--space-8);
+        margin-block-start: var(--space-8);
+    }
+
+    /* Three-column checklists */
+    .check-cols {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: var(--space-4) var(--space-8);
+        margin-block-start: var(--space-6);
+    }
+
+    /* Section title helpers */
+    .section-title.center { text-align: center; }
+    .accent-title { color: var(--accent); }
+    .section-subtitle.center { text-align: center; margin-block-end: var(--space-8); }
+    .centered-text { text-align: center; }
+
+    /* Tabs */
+    .tabs { max-width: var(--container-xl); margin-inline: auto; }
+
+    .tab-titles { display: flex; flex-direction: column; }
+
+    .tab-title {
+        font-family: var(--font-heading);
+        font-size: var(--text-base);
+        font-weight: 600;
+        color: var(--accent);
+        background: none;
+        border: 1px solid var(--accent);
+        padding: var(--space-3) var(--space-6);
+        cursor: pointer;
+        transition: background-color var(--transition-base);
+    }
+
+    .tab-title:hover { background: var(--accent-subtle); }
+
+    /* Folder-tab look: the active tab stays dark (opaque theme bg, NOT glass —
+       it must cover the panel's top border in the 1px overlap strip below) and
+       "opens" into the panel by dropping its bottom border in row layout. */
+    .tab-title.active {
+        background: var(--bg-primary);
+        color: var(--fg-primary);
+    }
+
+    .tab-panels {
+        border: 1px solid var(--accent);
+        background: var(--glass);
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+    }
+
+    .tab-panel { padding: var(--space-6); color: var(--fg-secondary); }
+
+    /* Tagline strip */
+    .tagline-strip {
+        background: var(--bg-secondary);
+        text-align: center;
+        padding: var(--space-8) var(--space-4);
+    }
+
+    .tagline-strip h5 {
+        font-size: var(--text-base);
+        color: var(--fg-primary);
+        letter-spacing: 0.02em;
+    }
+
+    @media (min-width: 600px) {
+        /* -1px overlap collapses tab-bottom + panel-top into ONE 1px line;
+           z-index lifts the tabs so the active tab's opaque bg + transparent
+           bottom border punch the notch through the panel border. */
+        .tab-titles { flex-direction: row; margin-bottom: -1px; position: relative; z-index: 1; }
+        .tab-title + .tab-title { border-left: none; }
+        .tab-title.active { border-bottom-color: transparent; }
+    }
+
+    @media (min-width: 900px) {
+        .split-grid { grid-template-columns: 1fr 1fr; }
+        .check-cols { grid-template-columns: repeat(3, 1fr); }
+        .img-panel { min-height: 100%; }
+        .callout { padding: var(--space-4) var(--space-16); }
+    }
+}

@@ -1,0 +1,63 @@
+-- detail.mix — the webd DETAIL-PAGE FOUNDATION kit (dv_*).
+-- Contract: _doc/2026-07-12-webd-foundations.md (§ Detail pages) · probe: foundation_check
+-- §details (report-only inventory this round). Owns the NEUTRAL dv-* classes
+-- (app.css) — never rides biz-*/page-local semantics (Codex P3 ruling 6).
+-- Include after lib.mix (uses esc; includes nothing itself).
+--
+-- Vocabulary (deliberately small — the svc_kv/bc_card class generalized):
+--   dv_head($title, $opts)   — the page header band: escaped title, optional
+--       raw badge_html beside it, optional raw actions_html on the right,
+--       optional back {href, label} nav link.
+--   dv_card($title, $inner)  — a titled section card ($inner TRUSTED handler
+--       HTML, built from esc'd/fm_* parts at source).
+--   dv_kv_table($rows)       — the label/value table. Each row:
+--       { label, value }  — value ESCAPED here (plain text), or
+--       { label, html }   — EXPLICITLY trusted markup (badges, links, forms).
+--       nil/absent rows are skipped, so callers can push conditionally.
+
+function dv_head($title, $opts)
+  $o = $opts
+  if $o == nil then
+    $o = {}
+  end
+  $h = '<div class="cms-head dv-head"><h1>' .. esc("" .. $title)
+  if $o["badge_html"] != nil then
+    $h = $h .. ' ' .. $o["badge_html"]
+  end
+  $h = $h .. '</h1>'
+  $right = ""
+  if $o["actions_html"] != nil then
+    $right = "" .. $o["actions_html"]
+  end
+  if $o["back"] != nil then
+    $bl = "" .. fm_or($o["back"]["label"], "Back")
+    if $right != "" then
+      $right = $right .. " "
+    end
+    $right = $right .. '<a class="navlink" href="' .. esc("" .. $o["back"]["href"]) .. '">← ' .. esc($bl) .. '</a>'
+  end
+  if $right != "" then
+    $h = $h .. '<span>' .. $right .. '</span>'
+  end
+  return $h .. '</div>'
+end
+
+function dv_card($title, $inner)
+  return '<div class="card"><h2>' .. esc("" .. $title) .. '</h2>' .. $inner .. '</div>'
+end
+
+function dv_kv_table($rows)
+  $h = '<table class="dv-kv">'
+  for each $r in $rows
+    if $r != nil then
+      $val = ""
+      if $r["html"] != nil then
+        $val = "" .. $r["html"]
+      else
+        $val = esc("" .. fm_or($r["value"], ""))
+      end
+      $h = $h .. '<tr><th>' .. esc("" .. $r["label"]) .. '</th><td>' .. $val .. '</td></tr>'
+    end
+  end
+  return $h .. '</table>'
+end

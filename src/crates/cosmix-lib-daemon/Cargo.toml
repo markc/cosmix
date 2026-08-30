@@ -1,0 +1,110 @@
+[package]
+name = "cosmix-lib-daemon"
+version = "0.7.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared infrastructure for cosmix daemon services"
+
+[lib]
+name = "cosmix_daemon"
+path = "src/lib.rs"
+
+[features]
+default = []
+tls = [
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:rustls-pemfile",
+    "dep:cosmix_config",
+    "dep:sha2",
+    "dep:rustls-webpki",
+    "dep:webpki-roots",
+    "dep:x509-parser",
+    # ACME wrapper (Phase 2 — see `acme` module). Bundled into the
+    # existing `tls` feature so a webd / future-daemon build that
+    # opts into TLS automatically gets the LE-only ACME surface;
+    # there is no `acme`-without-`tls` use case (you can't issue a
+    # cert into a non-TLS server config).
+    "dep:instant-acme",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:rcgen",
+    "dep:time",
+    "dep:tempfile",
+    "dep:thiserror",
+]
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+
+# Powers the always-on `listen::ConnHandler` trait (dyn-dispatched
+# per-connection handler), so it is a base dep, not `tls`-gated — the
+# plain-TCP listener path needs it too.
+async-trait = "0.1"
+
+# Hot-swap slot for the per-listener `GuardPolicy` (`listen::guard`,
+# the runtime kill-switch/guard control) AND the TLS resolver
+# (`listen::tls::ListenerTls`). `guard` compiles in all builds, so
+# arc-swap is a base dep, not `tls`-gated.
+arc-swap.workspace = true
+
+# `TlsIdentityConfig` consumed by the shared SNI resolver
+# (`tls::sni`). Gated behind the `tls` feature so non-TLS consumers
+# of this crate do not transitively pull the config crate.
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", optional = true }
+
+# TLS (optional)
+rustls = { version = "0.23", features = ["ring"], optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+
+# LE chain validator (`tls::le_validator`) — same feature gate, no
+# extra Cargo feature so a `tls` consumer gets the validator without
+# having to know it exists.
+sha2 = { workspace = true, optional = true }
+rustls-webpki = { version = "0.103", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+# `verify` enables ring-backed self-signature verification on parsed
+# certs, used by
+# `tls::le_staging_roots::tests::staging_roots_self_signed_and_marked_staging`
+# to assert each vendored DER is *cryptographically* self-signed (not
+# just `subject == issuer`). Pulls in `ring`, which is already in the
+# dep graph via `rustls`'s `ring` feature — zero added blast radius.
+x509-parser = { version = "0.18", features = ["verify"], optional = true }
+
+# ACME wrapper deps (Phase 2 — `acme` module). Backend pinned to
+# `ring` so the ACME stack matches the rest of the daemon's
+# `rustls` (ring) choice; explicitly opting out of the crate's
+# default `aws-lc-rs` features keeps a single crypto backend in
+# the workspace. `rcgen` and `time` were dev-only in Phase 1 (SNI
+# resolver tests + chain synthesis); the `acme` module needs them
+# as regular deps for CSR generation and cert-expiry math, hence
+# the promotion here (still gated on `tls`, so a non-TLS consumer
+# pays nothing).
+instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "ring", "time", "rcgen"], optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+rcgen = { version = "0.13", optional = true }
+time = { version = "0.3", optional = true }
+# `tempfile::NamedTempFile::persist` powers the atomic
+# rename used to write `account.<provider>.meta.json` without a
+# torn-write window.
+tempfile = { version = "3", optional = true }
+# Typed `AcmeError` variants (`#[derive(thiserror::Error)]`) so the
+# eventual `webd` caller can branch on rate-limit vs. file-IO vs.
+# ToS-mismatch failures instead of stringly-matching on
+# `instant_acme::Error::Display`.
+thiserror = { version = "2", optional = true }
+
+[dev-dependencies]
+# Exercise the full PEM → CertifiedKey path in the SNI resolver
+# tests and synthesise rejection-class chains for the LE-validator
+# suite. `rcgen`, `tempfile`, and `time` are *regular* optional deps
+# now (promoted by the `acme` module above); listing the bare
+# `time` macro feature here keeps the existing
+# `time::macros::datetime!(…)` call sites in the validator tests
+# happy without re-declaring the dep itself.
+time = { version = "0.3", features = ["macros"] }

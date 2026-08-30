@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+  <head>
+    <link rel="preload"
+          href="https://assets.example/font.woff2"
+          imagesrcset="https://assets.example/preload-1.png 1x, https://assets.example/preload-2.png 2x">
+    <style>
+      @import "https://css.example/theme.css";
+      .escaped { background: u\72l("\68 ttps://css.example/escaped.png"); }
+    </style>
+    <title>url(https://false-positive.example/title.png)</title>
+  </head>
+  <body background="https://assets.example/legacy.png">
+    url(https://false-positive.example/body-text.png)
+    <div title="url(https://false-positive.example/title-attribute.png)">inert</div>
+    <div style="background-image: url(&quot;https://css.example/entity-decoded.png?a=1&amp;b=2&quot;)">styled</div>
+    <img src="https://media.example/image.png"
+         srcset="https://media.example/image-1.png 1x, https://media.example/image-2.png 2x">
+    <video src="https://media.example/video.mp4"
+           poster="https://media.example/poster.jpg"></video>
+    <audio src="https://media.example/audio.mp3"></audio>
+    <picture><source src="https://media.example/source.png"
+                     srcset="https://media.example/source-1.png 1x, https://media.example/source-2.png 2x"></picture>
+    <track src="https://media.example/captions.vtt">
+    <embed src="https://media.example/embed.bin">
+    <object data="https://media.example/object.bin"></object>
+  </body>
+</html>

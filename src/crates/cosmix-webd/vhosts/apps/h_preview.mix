@@ -1,0 +1,19 @@
+-- preview.mix — live markdown preview endpoint (POST /admin/preview).
+-- Takes a `body` field, returns render_body() (the markdown() builtin — full CommonMark/GFM,
+-- escapes raw HTML + neutralises unsafe URL schemes, so the output is safe to innerHTML) as an
+-- HTML fragment for the post/page editor's live preview pane. Author-gated; read-only (renders
+-- markdown, mutates nothing), so a same-origin POST is CSRF-irrelevant. Returns a bare 403 on
+-- under-privilege (not a login redirect) so the fetch sees !ok and leaves the pane unchanged.
+function preview_main()
+  cms_init()
+  $user = current_user($HEADERS)
+  if $user == nil or role_rank("" .. $user["role"]) < 2 then
+    return { status: 403, headers: { "Content-Type": "text/plain", "X-Content-Type-Options": "nosniff" }, body: "" }
+  end
+  $f = parse_form($BODY)
+  $body = $f["body"]
+  if $body == nil then
+    $body = ""
+  end
+  return { status: 200, headers: { "Content-Type": "text/html; charset=utf-8", "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store" }, body: render_body("" .. $body) }
+end

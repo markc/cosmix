@@ -1,0 +1,1844 @@
+/* app.css — the merged CMS app layer (P3). cms + datatable + forms + modals,
+ * concatenated IN CASCADE ORDER and ALL UNLAYERED so they beat the dcs.spa
+ * @layers (base/site) exactly as the four separate sheets did. Load order in
+ * shell.html: base.css -> site.css -> app.css. Within this file the order
+ * cms -> datatable -> forms -> modals preserves every specificity tie.
+ * Instance-only + the graduation conduit: proven-generic parts trickle DOWN into
+ * the canonical base.css over time (maturity-gated). See
+ * _decisions/2026-06-18-canonical-css-base-site-methodology.md */
+
+/* ===================================================================
+   cms.css
+   =================================================================== */
+/* cms.css — the #content (CMS/PIM) styling layer for the dcs.spa shell.
+ *
+ * Part C of the Datastar webd foundation: this was a ~135-line inline <style>
+ * in shell.html, re-read + re-sent on EVERY request. Externalised here so it's
+ * cached (one fetch, then 304s). Only the FOUC-critical theme-preload script +
+ * the body background stay inline in shell.html.
+ *
+ * CASCADE: these rules are INTENTIONALLY UNLAYERED. base.css declares
+ * `@layer reset, tokens, base, components, utilities, animations` and any
+ * unlayered rule beats every layer regardless of specificity — which is what
+ * the original inline block relied on to override base.css's component layer
+ * (link colour, table styling, active-sort opacity). Keeping cms.css unlayered
+ * AND loaded after base.css/site.css reproduces the original behaviour exactly.
+ * Do not wrap these in an @layer without re-checking every #content override. */
+
+/* CMS content layer — scoped to #content so it never fights the dcs.spa chrome.
+   Consumes the GLOBAL oklch theme tokens directly (--fg-primary / --glass /
+   --border / --accent / --accent-fg) — no local palette aliases — so handler
+   markup (.card/.btn/.tag, post prose, tables) is theme-aware and consistent with
+   the rest of the site. (Was: --head/--card/--accent2/--afg vestigial aliases +
+   a --border→--bg-tertiary remap that made content borders invisible.) */
+#content{
+    color: var(--fg-primary);
+    /* Content column surface — one shade stronger than the sidebars (--bg-secondary)
+       so the centre stands out; cards (.card = --glass) sit a shade lighter on top.
+       Flips light/dark. */
+    background: var(--bg-tertiary);
+    /* Fill the viewport below the topnav (4rem) so the footer anchors to the bottom
+       on short pages instead of floating where content ends (which left a dead band
+       of the darker body surface below it). Flex column + footer margin-top:auto
+       pushes the footer down; the --bg-tertiary fills the gap, matching the column. */
+    min-height: calc(100dvh - var(--topnav-height));
+    display: flex;
+    flex-direction: column;
+    /* Drop the base `main{padding:--space-4}` outer inset: the .cms-wrap owns its
+       own padding, and zeroing it lets the footer sit flush to the viewport bottom
+       and span the full column width — so its top border lines up with the LHS
+       sidebar profile footer (which is flush + full-width too). */
+    padding: 0;
+}
+/* Content width modes (Appearance → Narrow|Normal|Wide; persisted in base-state, applied
+   pre-paint as html.narrow / html.wide). MIRRORS dcs.spa's working --content-max variable
+   (dcs.spa site.css:29/153/154): narrow 50vw · normal 75vw · wide fill, set UNCONDITIONALLY.
+   Do NOT wrap these in @media (min-width:1280px): that gate silently disabled the WHOLE toggle
+   on any viewport under 1280 CSS px — e.g. a zoomed / HiDPI Chrome on a wide screen — leaving
+   the cap stuck (the exact bug). The variable inherits from #content down into .cms-wrap. */
+#content{--content-max:75vw}
+html.narrow #content{--content-max:50vw}
+html.wide #content{--content-max:none}
+#content .cms-wrap{width:100%;max-width:var(--content-max,75vw);margin-inline:auto;padding:1rem;font-size:1rem;line-height:1.65}
+/* Skip-to-content link: the first focusable element, off-screen until keyboard-focused, then a
+   visible accent pill top-left — lets a keyboard/AT user jump past the chrome to #content
+   (which carries tabindex=-1 so it can receive that focus). */
+.skip-link{position:fixed;top:var(--space-2);left:var(--space-2);z-index:9999;transform:translateY(-200%);background:var(--accent);color:var(--accent-fg);padding:var(--space-2) var(--space-4);border-radius:var(--radius-lg);font-weight:600;text-decoration:none;transition:transform .15s ease}
+.skip-link:focus{transform:translateY(0)}
+#content:focus{outline:none}
+/* ─── cascade contract: generic link-colour FALLBACKS live in @layer app-fallback ───
+   app.css is otherwise UNLAYERED (it loads last and beats every base/site @layer). A named
+   layer always loses to unlayered rules REGARDLESS of specificity, so parking the catch-all
+   `a{}` colour rules here means every component's own colour — `.btn`/`.btn-*`, the pager,
+   badges, `.dt-action` row links — automatically wins, with no `:not(.btn)` carve-out and no
+   specificity war. The layer is declared after site-* (app.css loads last) so these still beat
+   base/site link colours. RULE: a *catch-all* link/text colour goes in this layer; a component's
+   own colour stays unlayered. (See _doc/2026-06-24-web-styleguide.md §4.4.) */
+@layer app-fallback{
+  #content a{color:var(--accent);text-decoration:none}
+  #content a:hover{text-decoration:underline}
+}
+#content h1{font-size:2rem;letter-spacing:-.025em;margin:var(--space-1) var(--space-0) var(--space-3);color:var(--fg-primary)}
+#content h2{letter-spacing:-.02em;color:var(--fg-primary)}
+#content .muted{opacity:.62}
+#content .small{font-size:.875rem}
+#content .row{display:flex;gap:var(--space-2);align-items:center}
+#content .grid{display:grid;gap:var(--space-4)}
+#content .spacer{flex:1}
+/* ===== shared CMS layout helpers (P4 — hoisted from handler inline styles) ===== */
+/* page-head row: title + back-link (replaces .row style="justify-content:space-between") */
+#content .cms-head{display:flex;justify-content:space-between;align-items:center;gap:var(--space-2)}
+/* the head's title sits tight in the flex row (was inline margin:0 on detail/view h1s) */
+#content .cms-head h1{margin:0}
+/* centred narrow card for sign-in / service-error / not-found pages (one width, was 24/28/32rem) */
+#content .cms-card-narrow{max-width:32rem;margin:var(--space-10) auto;text-align:center}
+/* footer action-button row (replaces style="margin-top:1.25rem;gap:.625rem"); .center centres it */
+#content .cms-actions{display:flex;align-items:center;gap:var(--space-2);margin-top:var(--space-5);flex-wrap:wrap}
+#content .cms-actions.center{justify-content:center}
+/* HTML-only email rendered as stripped text: preserve its line breaks, wrap long lines. */
+#content .m-html-text{white-space:pre-wrap;overflow-wrap:anywhere;font-size:.875rem;line-height:1.6}
+
+/* Compact density (web-styleguide §4.6): table DATA rows + nav/menu link ENTRIES
+   carry 1px VERTICAL padding, set EXPLICITLY on each rule (search "1px vertical" /
+   the §4.6 rules: #content td, .cms-nav-list a, .profile-pop a, .cm-item, .fm-list
+   td, .fm-trash-list td). NO global `a{}`/`td{}` override, NO !important — a bare
+   inline link has no vertical padding to tighten, so only these classed entries
+   change, and buttons/pills/cards/headers keep their own padding by simply setting
+   it (they out-specify nothing, because there IS no global to fight). */
+/* read-only detail table: fixed-width label column (replaces <th style="width:8rem">) */
+#content .cms-detail th{width:8rem;white-space:nowrap}
+#content .who{font-size:.875rem;opacity:.62;margin:var(--space-0) var(--space-1)}
+#content .card{background:var(--glass);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid var(--glass-border);border-radius:var(--radius-xl);padding:var(--space-6);box-shadow:var(--shadow-sm)}
+/* Separate consecutive stacked bare cards (the convention elsewhere is a .grid
+   gap or an inline margin-top; this covers handlers that emit plain siblings). */
+#content .card + .card{margin-top:var(--space-6)}
+/* Cards in a grid row take their NATURAL height, top-aligned (align-self:start
+   overrides the grid default `stretch`) — so a shorter card doesn't get padded out
+   with blank space to match a taller row-mate. Keep card CONTENT uniform per row.
+   margin-top:0 undoes the `.card + .card` stacked-sibling margin above: inside a
+   grid the 2nd/3rd cards are adjacent siblings too, so that margin would shove them
+   DOWN (making the first card look pushed up) — the grid gap owns the spacing. */
+#content .grid > .card{align-self:start;margin-top:0}
+#content .navlink{font-size:.875rem;font-weight:600;padding:var(--space-1) var(--space-3);border-radius:var(--radius-lg)}
+#content .navlink:hover{background:color-mix(in srgb,var(--accent) 12%,transparent);text-decoration:none}
+/* ───────────────────────── unified button system ─────────────────────────
+   ONE button recipe for the whole site. CMS pages, the datatable widget, forms,
+   and modals ALL emit `.btn` + a `.btn-<variant>` — this supersedes the old
+   per-skin .dt-btn / .fm-btn / .md-btn families, which were ~identical recipes
+   that had drifted cosmetically. `.btn` is layout-only; a variant supplies the
+   colour. Primary's hover REVERSES fill→outline (accent text on the accent-fg
+   surface) over 250ms — the canvas/modal feel. Variant tokens all resolve to the
+   base theme tokens (--accent / --fg-primary / --border-muted / --danger / …),
+   so a button looks the same in every context (CMS, .datatable-skin, .forms-skin,
+   .md-modal — every dialog renders inside #content, so this scope reaches them).
+   The legacy space-form `.btn.ghost` / `.btn.danger` are kept as aliases. */
+#content .btn{display:inline-flex;align-items:center;gap:var(--space-2);background:transparent;font:inherit;font-size:.875rem;font-weight:600;line-height:1;padding:var(--space-2) var(--space-4);border-radius:var(--radius-lg);border:1px solid transparent;cursor:pointer;white-space:nowrap;text-decoration:none;transition:background .25s ease,border-color .25s ease,color .25s ease,filter .25s ease}
+#content .btn svg{width:1.05em;height:1.05em;flex:none}
+#content .btn:disabled,#content .btn[disabled]{opacity:.5;cursor:not-allowed}
+#content .btn-primary{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
+#content .btn-primary:hover,#content .btn-primary:focus-visible{background:var(--accent-fg);color:var(--accent);border-color:var(--accent);text-decoration:none;outline:none}
+#content .btn-ghost,#content .btn.ghost{background:transparent;color:var(--fg-primary);border-color:var(--border-muted)}
+#content .btn-ghost:hover,#content .btn.ghost:hover{background:var(--bg-secondary);color:var(--fg-primary);text-decoration:none}
+#content .btn-secondary{background:var(--bg-secondary);color:var(--fg-primary);border-color:var(--border-muted)}
+#content .btn-secondary:hover{background:var(--border-muted);color:var(--fg-primary);text-decoration:none}
+#content .btn-danger,#content .btn.danger{background:var(--danger);color:var(--accent-fg);border-color:var(--danger)}
+#content .btn-danger:hover,#content .btn.danger:hover{filter:brightness(1.06);color:var(--accent-fg);text-decoration:none}
+#content .btn-success{background:var(--success);color:var(--accent-fg);border-color:var(--success)}
+#content .btn-success:hover{filter:brightness(1.06);color:var(--accent-fg);text-decoration:none}
+#content .btn-info{background:var(--info);color:var(--accent-fg);border-color:var(--info)}
+#content .btn-info:hover{filter:brightness(1.06);color:var(--accent-fg);text-decoration:none}
+#content .btn-warning{background:var(--warning);color:var(--accent-fg);border-color:var(--warning)}
+#content .btn-warning:hover{filter:brightness(1.06);color:var(--accent-fg);text-decoration:none}
+#content input,#content textarea,#content select{width:100%;box-sizing:border-box;background:var(--bg-primary);color:inherit;border:1px solid var(--border);border-radius:var(--radius-lg);padding:var(--space-3) var(--space-3);font:inherit;font-size:1rem;transition:border-color .15s ease,box-shadow .15s ease}
+#content input:focus,#content textarea:focus,#content select:focus{outline:2px solid var(--accent);border-color:transparent}
+/* Native-control polish (Part C): tame the "sad" default <select> — strip the
+   platform chrome, add a theme-aware caret, and reserve room for it so long
+   options don't collide. Fully-custom open-lists stay out of scope. */
+#content select{appearance:none;-webkit-appearance:none;-moz-appearance:none;padding-right:2rem;cursor:pointer;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23808a99' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right .75rem center}
+#content label{display:block;font-size:.75rem;font-weight:600;opacity:.7;margin:var(--space-4) var(--space-0) var(--space-1)}
+#content .tag{display:inline-block;font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:var(--space-1) var(--space-2);border-radius:var(--radius-md);background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent)}
+#content .tag.draft{background:color-mix(in srgb,var(--warning) 24%,transparent);color:var(--warning)}
+#content table{width:100%;border-collapse:collapse}
+#content th,#content td{text-align:left;padding-inline:var(--space-2);border-bottom:1px solid var(--border);font-size:.875rem}
+#content th{padding-block:var(--space-3)}          /* headers keep their presence */
+#content td{padding-block:1px}                     /* §4.6 compact: 1px vertical on data rows */
+#content th{opacity:.6;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em}
+/* DataTable widget (shared widgets/datatable.mix): sortable headers, global
+   search, numbered pagination. Co-located here so it composes with the
+   #content-scoped table/card/btn rules above and shares their vars. */
+#content .visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+#content .datatable-scroll-wrapper{overflow-x:auto}
+#content table.datatable{width:100%;border-collapse:collapse}
+/* fixed_layout (opt-in): per-column widths are authoritative (no jump on sort) and a cell
+   that overflows its column elides with an ellipsis. Headers stay nowrap (labels are short).
+   Only tables that pass opts.fixed_layout get .dt-fixed, so every other table is unchanged. */
+#content table.datatable.dt-fixed{table-layout:fixed}
+#content .datatable.dt-fixed td{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#content .datatable.dt-fixed th{white-space:nowrap}
+/* whole-row navigation (a row carrying data-dt-href, e.g. the mail list): clickable, and
+   keyboard-focusable (tabindex=0 in the markup) with a visible focus ring — Enter/Space open
+   it (site.js initRowNav), the accessible equivalent of the click. */
+#content .datatable tr[data-dt-href]{cursor:pointer}
+#content .datatable tr[data-dt-href]:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+#content .datatable th.sortable-th{padding:0}
+#content .datatable th.sortable-th a{display:inline-flex;align-items:center;gap:var(--space-1);color:inherit;text-decoration:none;padding:var(--space-3) var(--space-2)}
+#content .datatable th.sortable-th a:hover{color:var(--accent);text-decoration:none}
+#content .datatable th[aria-sort]{opacity:1}
+#content .datatable th[aria-sort] a{color:var(--accent);font-weight:700}
+#content .datatable .dt-caret{font-size:.8em}
+#content .datatable tbody tr{transition:background .12s ease}
+#content .datatable tbody tr:hover{background:color-mix(in srgb,var(--accent) 7%,transparent)}
+#content .datatable-row-actions{text-align:right;white-space:nowrap}
+#content .datatable-results-count{font-weight:400;margin-inline-start:var(--space-2)}
+#content .datatable-toolbar{margin:var(--space-4) var(--space-0)}
+#content .datatable-toolbar-actions{display:flex;gap:var(--space-2);align-items:center}
+#content .datatable-empty-state{margin-top:var(--space-4)}
+#content .datatable-pagination-bar{display:flex;align-items:center;justify-content:center;flex-wrap:wrap;gap:var(--space-3);margin-top:var(--space-6)}
+#content .datatable-page-list{display:flex;align-items:center;gap:var(--space-2);list-style:none;padding:0;margin:0}
+#content .datatable-page-list li{margin:0}
+#content .datatable-page-list .btn{padding:var(--space-1) var(--space-3);font-size:.875rem}
+#content .page-number-btn{display:inline-flex;min-width:2rem;justify-content:center;padding:var(--space-1) var(--space-2);border-radius:var(--radius-md);text-decoration:none;color:var(--fg-primary);opacity:.7}
+#content .page-number-btn:hover{background:var(--bg-secondary);opacity:1;text-decoration:none}
+#content .page-number-active{background:var(--accent);color:var(--accent-fg);font-weight:700;opacity:1;pointer-events:none}
+#content .dt-ellipsis{padding:var(--space-0) var(--space-1);opacity:.5}
+#content .datatable-page-info{margin-inline-start:var(--space-2);opacity:.62}
+#content .datatable-pagesize{display:flex;align-items:center;gap:var(--space-2);justify-content:center;flex-wrap:wrap;margin-top:var(--space-3)}
+#content .datatable-pagesize a{padding:var(--space-1) var(--space-2);border-radius:var(--radius-md);text-decoration:none;color:var(--fg-primary);opacity:.7}
+#content .datatable-pagesize a:hover{background:var(--bg-secondary);opacity:1;text-decoration:none}
+#content .dt-pagesize-active{padding:var(--space-1) var(--space-2);border-radius:var(--radius-md);background:var(--accent);color:var(--accent-fg);font-weight:700}
+#content .dt-bulk-bar{display:flex;align-items:center;gap:var(--space-3);margin:var(--space-2) var(--space-0)}
+#content .dt-bulk-cell{width:var(--space-6);text-align:center}
+#content .dt-bulk-cell input{width:auto}
+#content .dt-bulk-act[disabled]{opacity:.45;cursor:default;filter:grayscale(.4)}
+#content .dt-bulk-bar .dt-bulk-act+.dt-bulk-act{margin-left:var(--space-1)}
+#content .dt-bool{font-weight:700}
+#content .dt-bool-yes{color:var(--accent)}
+#content .dt-bool-no{opacity:.4}
+@media (max-width:768px){#content .datatable tbody tr:nth-child(odd){background:color-mix(in srgb,var(--accent) 5%,transparent)}}
+#content .flash{background:color-mix(in srgb,var(--accent) 12%,transparent);border:1px solid color-mix(in srgb,var(--accent) 30%,transparent);border-radius:var(--radius-lg);padding:var(--space-3) var(--space-4);margin-bottom:var(--space-4);font-size:.875rem}
+#content article.post{font-size:1rem}
+#content article.post p{margin:var(--space-4) var(--space-0)}
+/* Rendered-markdown content (full GFM via the markdown() builtin). base.css
+   resets ul/ol list-style, so restore it for prose. */
+#content .post ul,#content .post ol{list-style:revert;padding-left:var(--space-6);margin:var(--space-4) var(--space-0)}
+#content .post li{margin:var(--space-1) var(--space-0)}
+/* GFM task-list items: the markdown() builtin (pulldown-cmark) emits a bare
+   <li><input type="checkbox">label with NO class. Without these two rules the
+   checkbox inherits the #content form-input rule (width:100% + border + padding),
+   rendering as a full-width rounded box that shoves the label onto the next line
+   under a leftover disc bullet. Drop the bullet and render the checkbox inline as
+   the list marker (natural size), so the label sits on the same line as the tick. */
+#content .post li:has(> input[type="checkbox"]){list-style:none}
+#content .post li > input[type="checkbox"]{width:auto;margin:0 var(--space-2) 0 0;padding:0;vertical-align:middle}
+#content .post h1,#content .post h2,#content .post h3,#content .post h4{margin:var(--space-6) var(--space-0) var(--space-3);color:var(--fg-primary)}
+/* First-child reset: the leading element (usually an H*) drops its top margin so .post
+   content sits flush at the top — kills the gap above the first heading in the editor
+   preview pane, the inline View, and the real /post + /page article. Mid-content headings
+   keep their space-6 top margin for section breathing room. */
+#content .post > :first-child{margin-top:0}
+@layer app-fallback{#content .post a{color:var(--accent)}}
+#content .post code{background:color-mix(in srgb,currentColor 8%,transparent);padding:var(--space-1) var(--space-1);border-radius:var(--radius-md);font-size:.9em}
+#content .post pre{background:color-mix(in srgb,currentColor 8%,transparent);border:1px solid var(--border);border-radius:var(--radius-lg);padding:var(--space-3) var(--space-4);overflow:auto}
+#content .post pre code{background:none;padding:0}
+#content .post blockquote{border-inline-start:3px solid var(--accent);margin:var(--space-4) var(--space-0);padding:var(--space-1) var(--space-4);opacity:.85}
+#content .post table{margin:var(--space-4) var(--space-0)}
+/* inline / non-standalone images: just constrain + round (no float). */
+#content .post img{max-width:100%;border-radius:var(--radius-lg)}
+/* an image sharing a paragraph with text is genuinely inline — base.css forces a global
+   img{display:block}, so restore inline flow for in-paragraph images (figures aren't in a
+   <p>, so .post-figure img keeps display:block). */
+#content .post p img{display:inline;vertical-align:middle}
+/* standalone images are wrapped in <figure class="post-figure"> by render_body/post_figures.
+   The FIGURE floats right at 40% (so its <figcaption> sits UNDER the image, not beside it);
+   clear:right stacks consecutive figures one-per-row; the .post clearfix keeps a tall figure
+   from bleeding past a short post. Caption: small, italic, muted, centred. */
+#content .post-figure{float:right;clear:right;width:40%;margin:0 0 var(--space-3) var(--space-4)}
+#content .post-figure img{display:block;width:100%}
+#content .post-figure figcaption{margin-top:var(--space-1);font-size:.75rem;font-style:italic;color:var(--fg-muted);text-align:center;line-height:1.4}
+#content .post::after{content:"";display:block;clear:both}
+/* On a narrow screen the 40% float cramps the wrapping text — go full-width, no float. */
+@media (max-width:640px){#content .post-figure{float:none;width:100%;margin:0 0 var(--space-3)}}
+#content .post hr{border:0;border-top:1px solid var(--border);margin:var(--space-6) var(--space-0)}
+/* left-sidebar blog nav */
+.cms-nav-section{margin:var(--space-0)}
+.cms-nav-title{font-size:.75rem;text-transform:uppercase;letter-spacing:.08em;opacity:.55;margin:var(--space-0) var(--space-0) var(--space-2)}
+.cms-nav-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:var(--space-0)}
+.cms-nav-list a{display:block;padding:1px var(--space-2);border-radius:var(--radius-md);font-size:.875rem;color:inherit;text-decoration:none}   /* §4.6 compact */
+.cms-nav-list a:hover{background:color-mix(in srgb,var(--accent) 14%,transparent)}
+.cms-nav-empty{opacity:.5;font-size:.875rem;padding:var(--space-2) var(--space-2)}
+.cms-tagline{font-size:.75rem;opacity:.6;line-height:1.4;margin:var(--space-0) var(--space-0) var(--space-4)}
+/* Footer bar height matches the LHS sidebar profile footer: avatar 1.75rem + the
+   four stacked --space-2 paddings (.profile + .profile-btn) + the 1px top border.
+   Flex-centred so the text sits mid-bar regardless of the min-height. */
+.cms-footer{margin-top:auto;display:flex;align-items:center;justify-content:center;min-height:calc(1.75rem + var(--space-2) * 4 + 1px);padding:var(--space-1) var(--space-6);border-top:1px solid color-mix(in srgb,currentColor 12%,transparent);opacity:.6;font-size:.875rem;text-align:center}
+/* Only the title band ("Message of the Day" / "Appearance") gets the solid
+   --bg-tertiary; the very top strip (pin/dots carousel-header) keeps the
+   default glass sidebar surface. */
+.sidebar .panel-title{background:var(--bg-tertiary)}
+/* Bottom-left profile widget + popup (replaces the topnav user links). */
+.profile{margin-top:auto;border-block-start:1px solid var(--border);padding:var(--space-2)}
+.profile-btn{display:flex;align-items:center;gap:var(--space-2);width:100%;padding:var(--space-2) var(--space-2);border-radius:var(--radius-lg);background:transparent;border:0;color:inherit;cursor:pointer;font:inherit;text-decoration:none}
+.profile-btn:hover{background:color-mix(in srgb,var(--accent) 12%,transparent)}
+.profile-av{width:1.75rem;height:1.75rem;border-radius:50%;background:var(--accent);color:var(--accent-fg);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:.75rem;flex:none}
+.profile-name{font-weight:600;font-size:.875rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.profile-pop{display:none;flex-direction:column;gap:var(--space-1);margin:var(--space-1) var(--space-0) var(--space-1);padding:var(--space-1);border:1px solid var(--border);border-radius:var(--radius-lg);background:var(--bg-secondary)}
+.profile.open .profile-pop{display:flex}
+.profile-pop a{display:flex;align-items:center;gap:var(--space-2);padding:1px var(--space-3);border-radius:var(--radius-lg);font-size:.875rem;color:inherit;text-decoration:none}   /* §4.6 compact */
+.profile-pop a:hover{background:color-mix(in srgb,var(--accent) 14%,transparent)}
+.profile-pop a svg{width:1rem;height:1rem;flex:none;opacity:.7}
+.profile-pop form{margin:0}
+.profile-pop form button{display:flex;align-items:center;gap:var(--space-2);width:100%;padding:var(--space-2) var(--space-3);border-radius:var(--radius-lg);font:inherit;font-size:.875rem;color:inherit;background:none;border:0;cursor:pointer;text-align:left}
+.profile-pop form button:hover{background:color-mix(in srgb,var(--accent) 14%,transparent)}
+.profile-pop form button svg{width:1rem;height:1rem;flex:none;opacity:.7}
+.profile-sep{height:1px;background:var(--border);margin:var(--space-1) var(--space-1)}
+.profile-btn svg{width:1rem;height:1rem;flex:none;opacity:.8}
+/* CMS nav (LHS Navigation/Posts panels + RHS Posts panel): side padding to
+   match the Appearance panel (var(--space-4)); flex links with a leading
+   Lucide icon, an ellipsised label, and a trailing lock for private items. */
+.cms-nav{padding:var(--space-4)}
+/* A nav panel that hosts a treeview keeps a flush LEFT edge (the tree chevron/icon
+   column aligns to it) but a 1rem RIGHT gutter (Mark 2026-07-12(b)): the active/hover
+   highlight + count badges get breathing room and the link fills to (panel width −
+   1rem), fluid with the panel — never a hardwired fixed width. Vertical padding stays. */
+.cms-nav:has(.tv-tree){padding-inline:0 var(--space-4)}
+/* Clip horizontal overflow: a deep treeview's compounding per-level indent (.tv-sub-list
+   margin+padding) can push a nested row past the sidebar width and h-scroll the panel.
+   The labels already ellipsise (min-width:0 + text-overflow on .nav-label/.tv-link), so
+   clipping is a safety net, not a content loss. .cms-nav height is auto (== its content),
+   so overflow-y is never triggered here — the panel-content remains the vertical scroller. */
+.cms-nav{min-width:0;overflow-x:hidden}
+/* The nav/treeview panel needs the SAME two-part width-clamp the .deck panels get
+   (base.css:1044-1045): min-width:0 on BOTH the .panel (a flex item — its default
+   min-width:auto lets the tree's min-content force the whole panel WIDER than the
+   sidebar, so at ~20% width the panel escapes the sidebar edge and the right gutter
+   + count badges spill into the gap) AND its .panel-content. With both, the panel
+   tracks the sidebar width and the --space-4 right gutter is preserved at any width. */
+.sidebar-left .panel:has(.cms-nav){min-width:0}
+.sidebar-left .panel:has(.cms-nav) .panel-content{min-width:0;overflow-x:hidden}
+.cms-nav-list a{display:flex;align-items:center;gap:var(--space-2);transition:background .12s ease,color .12s ease}
+.cms-nav-list a svg{width:1rem;height:1rem;flex:none;opacity:.6}
+.cms-nav-list .nav-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cms-nav-list .nav-lock{flex:none;opacity:.55;display:inline-flex;align-items:center}
+.cms-nav-list .nav-lock svg{width:.875rem;height:.875rem}
+/* Active nav item (set by the boost shim on swap; applies to .tv-link too since the
+   tree <ul>s carry .cms-nav-list). [aria-current=page] is the SERVER-rendered active
+   marker for query-string links (e.g. the mail Folders context panel's /pim/mail?box=
+   links): the boost shim's setActive() matches .active by pathname ONLY, so it would
+   strip a query-string folder link — aria-current is outside its reach, so the active
+   folder survives every swap. Same styling as .active. */
+.cms-nav-list a.active,
+.cms-nav-list a[aria-current="page"]{background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent)}
+/* (The old .cms-nav-kids / .cms-nav-sub page-tree indent rules were removed: the page
+   and category nav now render through treeview.mix and use the .tv-* tree below. The
+   category MANAGER keeps its own .cms-cat-* rules. Per-level indent lives on .tv-sub-list.) */
+
+/* Category manager (/admin/categories) — a recursive tree of rows, each with inline
+   Rename / Move / Delete forms. The nested <ul class="cms-cat-sub"> indents each level
+   (compounding margin-left + a left rule), mirroring the .cms-nav-sub nav tree. */
+.cms-cat-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:var(--space-2)}
+.cms-cat-sub{list-style:none;margin:var(--space-2) 0 0;padding:0 0 0 var(--space-4);margin-left:var(--space-3);border-left:1px solid var(--border);display:flex;flex-direction:column;gap:var(--space-2)}
+.cms-cat-kids{list-style:none}
+.cms-cat-node{list-style:none}
+.cms-cat-row{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-3);padding:var(--space-2) var(--space-3);border:1px solid var(--border);border-radius:var(--radius-lg);background:var(--bg-elev,transparent)}
+.cms-cat-head{display:flex;flex-direction:column;min-width:12rem;flex:1}
+.cms-cat-name{font-weight:600;color:inherit;text-decoration:none}
+.cms-cat-name:hover{text-decoration:underline}
+.cms-cat-meta{font-size:.75rem;opacity:.6}
+.cms-cat-actions{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-2)}
+.cms-cat-form{display:flex;align-items:center;gap:var(--space-1);margin:0}
+.cms-cat-input{width:auto;min-width:7rem;padding:var(--space-1) var(--space-2);font-size:.875rem}
+
+/* ── Collapsible tree widget (treeview.mix tv_*) ───────────────────────────────
+   A nested, collapsible nav tree: each parent row has a chevron <button> (▸ closed →
+   ▾ open) BESIDE a normal <a> link, so the parent stays navigable. The tree <ul>s also
+   carry .cms-nav-list, so the link skin (app.css:217) + setActive() .active + the lucide
+   icon sizing all apply for free; .tv-* adds only the row layout, chevron, count pill and
+   the collapse animation. The server renders every branch .tv-open; assets/site.js toggles
+   .tv-open (persisted by data-tv-key) and never collapses the active path. Indent compounds
+   per nested .tv-sub-list, mirroring .cms-nav-sub. Tokens only — no literal colours. */
+.tv-row{display:flex;align-items:center;gap:var(--space-1)}
+.tv-chev,.tv-chev-spacer{flex:none;width:1.125rem;height:1.125rem;display:inline-flex;align-items:center;justify-content:center}
+.tv-chev{appearance:none;-webkit-appearance:none;background:none;border:0;padding:0;margin:0;cursor:pointer;color:inherit;opacity:.55;border-radius:var(--radius-sm,.25rem)}
+.tv-chev:hover{opacity:1;background:color-mix(in srgb,currentColor 12%,transparent)}
+.tv-chev svg{width:.875rem;height:.875rem;transition:transform var(--transition-fast,.15s ease)}
+.tv-branch.tv-open>.tv-row>.tv-chev svg{transform:rotate(90deg)}
+.tv-link{flex:1;min-width:0}
+/* Drop the .cms-nav-list a left padding on tree links so the icon sits right after
+   the chevron (tight, like the FM table's .fm-namelink) — and match its .35rem gap. */
+.tv-row .tv-link{padding-inline-start:0;gap:.35rem}
+.tv-count{flex:none;margin-left:var(--space-1);font-size:.75rem;font-weight:600;line-height:1;padding:.125rem .375rem;border-radius:var(--radius-full);background:color-mix(in srgb,var(--accent) 14%,transparent);color:var(--accent)}
+/* collapse wrapper: grid 1fr↔0fr (base.css:743 idiom), .tv-sub-inner clips the overflow.
+   The transition is gated on .tv-ready (added by site.js AFTER the first state reconcile)
+   so stored-collapsed branches snap shut on load instead of flash-animating closed. */
+.tv-sub{display:grid;grid-template-rows:1fr}
+.tv-tree.tv-ready .tv-sub{transition:grid-template-rows var(--transition,.2s ease)}
+.tv-branch:not(.tv-open)>.tv-sub{grid-template-rows:0fr}
+.tv-sub-inner{overflow:hidden;min-height:0}
+.tv-sub-list{list-style:none;margin:var(--space-0) 0 0;padding:0 0 0 var(--space-3);margin-left:var(--space-3);border-left:1px solid color-mix(in srgb,currentColor 14%,transparent);display:flex;flex-direction:column;gap:var(--space-0)}
+@media (prefers-reduced-motion:reduce){.tv-chev svg,.tv-sub{transition:none}}
+
+/* Content-swap animation (Part A.4): swapped-in content fades + rises in. The
+   first/no-JS full-page load animates via this rule directly; on a boosted
+   swap the .cms-wrap element persists (only its innerHTML changes), so the
+   boost shim restarts this animation with a reflow nudge. Honours
+   reduced-motion. */
+#content .cms-wrap{animation:cms-fade-in .25s var(--ease-out,cubic-bezier(.16,1,.3,1))}
+/* #dt-region (targeted datatable partial swaps) fades the same way as a full
+   content swap — the boost shim restarts it after patching the region. */
+#content #dt-region{animation:cms-fade-in .25s var(--ease-out,cubic-bezier(.16,1,.3,1))}
+/* Page-load / boosted-swap entrance = FADE ONLY (no translateY). The slide-up belongs to
+   scroll-reveal of content sections coming above the fold (the `.reveal`/`fade-in-up` rule
+   in site.css, untouched) — it was never meant to fire on a page load / content swap. */
+@keyframes cms-fade-in{from{opacity:0}to{opacity:1}}
+
+/* Top loading bar during a boosted nav (Part A.4 shim toggles `.on` + width).
+   Fixed, above the chrome; accent-coloured with a soft glow. */
+#nav-progress{position:fixed;top:0;left:0;height:2px;width:0;background:linear-gradient(90deg,var(--accent),var(--accent-hover,var(--accent)));box-shadow:0 0 8px var(--accent-glow,transparent);opacity:0;z-index:1000;transition:width .2s ease,opacity .2s ease;pointer-events:none}
+#nav-progress.on{opacity:1}
+
+@media (prefers-reduced-motion:reduce){
+    #content .cms-wrap,#content #dt-region{animation:none}
+    #content .btn{transition:none}
+    #nav-progress{transition:opacity .15s ease}
+}
+
+
+/* ===================================================================
+   datatable.css
+   =================================================================== */
+/* datatable.css — the Filament 5 "skin" for the shared SSR datatable widget.
+ *
+ * Plan of record: _plan/2026-06-15-datatable-filament-parity.md (Phase 1, §4, S-8).
+ * Visual target: Filament 5 Tables overview (filamentphp.com/docs; screenshots deleted 2026-07-23, git history).
+ *
+ * SCOPING — the whole sheet is scoped under `.datatable-skin`, a wrapper class
+ * the handler opts INTO (dt_region($html, $id, true) → adds it to #dt-region).
+ * A page that does NOT opt in renders byte-identical to before, even though this
+ * file is loaded globally: every rule below needs the `.datatable-skin` ancestor
+ * to match, so the 5 un-converted live pages are untouched. The `#content`
+ * prefix (+ the extra `.datatable-skin` class) gives these rules higher
+ * specificity than cms.css's `#content .foo` table/btn/tag rules, so they win;
+ * loaded AFTER cms.css, unlayered, so equal-specificity ties also go to us.
+ *
+ * THEME — the skin now RIDES the shell theme: every --dt-* token is a thin alias
+ * onto the global oklch tokens (site.css: --accent / --bg-* / --fg-* /
+ * --border-muted / semantic), so the table follows the selected scheme
+ * (Ocean/Crimson/…) AND light/dark automatically. No private palette and no
+ * light/dark split here — the globals it aliases are already theme-aware. The
+ * table is FLAT (.dt-card carries no chrome); .dt-surface is the opt-in themed
+ * card for NON-table region content (e.g. the media gallery).
+ *
+ * CLASS VOCABULARY — this ships the FULL canonical class set now (S-8),
+ * including the modal / filter-popover / column-toggle / drag-handle / row-tint
+ * classes that Phases 2–5 will emit, so those phases are pure handler work
+ * against a ready skin and never re-invent a class name. Phase 1 emits the
+ * header / toolbar / table / badge / ring / action / footer / pager subset.
+ */
+
+/* ───────────────────────────── tokens ───────────────────────────── */
+/* The skin no longer carries its own palette — every --dt-* is a thin ALIAS onto the
+   global theme tokens (site.css), so the table follows the selected scheme + light/dark
+   automatically. Single block (no light/dark split): the globals it points at are
+   already theme-aware. .datatable-skin is the token scope; it rides the persistent
+   #dt-region so the skin survives partial swaps.
+   NB --dt-border → --border-MUTED (the subtler sibling of --border) for faint row
+   separators at table density. */
+#content .datatable-skin{
+    --dt-accent:       var(--accent);
+    --dt-accent-hover: var(--accent-hover);
+    --dt-accent-fg:    var(--accent-fg);
+    --dt-card:         var(--bg-primary);    /* search input / popover / modal surface */
+    --dt-page:         var(--bg-tertiary);
+    --dt-strip:        var(--bg-secondary);  /* header / toolbar / thead / bulk-bar strip */
+    --dt-row-hover:    var(--row-hover);
+    --dt-border:       var(--border-muted);
+    --dt-text:         var(--fg-primary);
+    --dt-muted:        var(--fg-muted);
+    --dt-info:         var(--info);
+    --dt-success:      var(--success);
+    --dt-warning:      var(--warning);
+    --dt-danger:       var(--danger);
+    --dt-r-lg:         var(--radius-lg);
+    --dt-r-md:         var(--radius-md);
+    --dt-r-sm:         var(--radius-sm);
+}
+
+/* The datatable is FLAT — no card chrome. dt_render still wraps the table in
+   .dt-card, but it carries no bg/border/shadow/radius now, so the table sits flush
+   on the #content surface. (Kept the element so a 1-line surface can return later.) */
+/* Neutralise ONLY the inner table's .card scroll wrapper (never other .card content
+   a handler appends to the region) so the table sits flush. */
+#content .datatable-skin .datatable-scroll-wrapper{
+    background:none;border:0;border-radius:0;box-shadow:none;
+    -webkit-backdrop-filter:none;backdrop-filter:none;padding:0;overflow-x:auto;
+    /* Gap below the search/New-Post header → match the editor's toolbar→canvas gap
+       (.pp-ed gap = space-4). Lives HERE in CSS, never as an inline style on the element
+       (an inline margin is invisible to the cascade and painful to debug). */
+    margin-top:var(--space-4);
+}
+/* .dt-surface — the opt-in THEMED card for non-table region content (e.g. the media
+   gallery) that still wants a container now that .dt-card is flat. Theme-aware via
+   the aliased tokens. */
+#content .datatable-skin .dt-surface{
+    background:var(--dt-card);
+    color:var(--dt-text);
+    border:1px solid var(--dt-border);
+    border-radius:var(--radius-xl);
+    overflow:hidden;
+    box-shadow:var(--shadow-sm);
+}
+/* generic datatable-skin link colour — a FALLBACK (see the @layer note up top): every
+   skin component (.btn CTA, pager, .dt-action row links) is unlayered and beats this. */
+@layer app-fallback{
+  #content .datatable-skin a{color:var(--dt-accent);text-decoration:none}
+  #content .datatable-skin a:hover{color:var(--dt-accent-hover);text-decoration:none}
+}
+#content .datatable-skin svg{width:1.05em;height:1.05em;vertical-align:-.15em;flex:none}
+
+/* ───────────────────────────── header band ───────────────────────────── */
+#content .datatable-skin .dt-header{
+    display:flex;align-items:flex-start;justify-content:space-between;gap:var(--space-4);
+    padding:var(--space-5) var(--space-5);
+}
+#content .datatable-skin .dt-title{
+    font-size:1.375rem;line-height:1.2;font-weight:700;letter-spacing:-.01em;
+    color:var(--dt-text);margin:0;
+}
+/* .dt-count — a forward-declared hook (S-8). Filament's header (the visual
+   target) shows NO count chip; the row count lives in the footer range label
+   ("Showing X to Y of Z results"). dt_header_band deliberately omits it; a
+   handler that wants an inline count can emit <span class="dt-count">. */
+#content .datatable-skin .dt-count{
+    font-size:.75rem;font-weight:600;color:var(--dt-muted);
+    margin-inline-start:var(--space-2);vertical-align:.1em;
+}
+#content .datatable-skin .dt-subtitle{
+    margin:var(--space-1) 0 0;font-size:.875rem;color:var(--dt-muted);
+}
+#content .datatable-skin .dt-header-actions{display:flex;gap:var(--space-2);align-items:center;flex:none}
+
+/* ── compact header (opts.compact): one dense row — title hard-left, controls right ── */
+#content .datatable-skin .dt-header-compact{align-items:center;padding:0 var(--space-4);flex-wrap:wrap}
+/* the right-aligned control cluster: trash · search · funnel · group · columns · actions */
+#content .datatable-skin .dt-header-cluster{
+    display:flex;align-items:center;gap:var(--space-2);margin-inline-start:auto;flex-wrap:wrap;justify-content:flex-end;
+}
+#content .datatable-skin .dt-header-cluster .dt-header-actions{display:contents}
+/* the compact search is ~25% narrower than the standalone toolbar search (13rem → ~10rem) */
+#content .datatable-skin .dt-search-compact{display:inline-flex}
+#content .datatable-skin .dt-search-compact .dt-search-wrap{min-width:10rem}
+/* the bulk Delete → a trash icon button; danger-tinted, disabled until rows are selected */
+#content .datatable-skin .dt-bulk-trash{position:relative}
+#content .datatable-skin .dt-bulk-trash:not([disabled]){color:var(--dt-danger)}
+#content .datatable-skin .dt-bulk-trash:not([disabled]):hover{color:var(--dt-danger);border-color:var(--dt-danger);background:color-mix(in srgb,var(--dt-danger) 12%,transparent)}
+#content .datatable-skin .dt-bulk-trash[disabled]{opacity:.4;cursor:not-allowed}
+#content .datatable-skin .dt-bulk-count-badge{
+    position:absolute;top:calc(var(--space-1) * -1);right:calc(var(--space-1) * -1);min-width:1rem;height:1rem;padding:0 var(--space-1);
+    display:inline-flex;align-items:center;justify-content:center;border-radius:var(--radius-full);
+    background:var(--dt-danger);color:var(--accent-fg);font-size:.625rem;font-weight:700;line-height:1;
+}
+/* compact across-pages prompt: a BARE span (no .dt-bulk-bar strip), `hidden` → zero
+   footprint idle; when JS unhides it, a thin inline-block bar above the table. */
+#content .datatable-skin .dt-sel-all-prompt-compact:not([hidden]){display:inline-block;padding:var(--space-2) var(--space-1)}
+@media (max-width:680px){
+    #content .datatable-skin .dt-header-compact{flex-direction:row}
+    #content .datatable-skin .dt-header-cluster{width:100%;margin-inline-start:0}
+}
+
+/* Buttons: the datatable uses the site-wide unified `.btn` / `.btn-<variant>`
+   system (defined once near the top of this file) — no datatable-specific button
+   recipe. Context-only tweaks (toolbar/pager/bulk sizing) live in their sections. */
+
+/* ───────────────────────────── toolbar band ───────────────────────────── */
+/* The widget's search form (class .datatable-toolbar) becomes the toolbar band:
+   a strip with the search box + icon buttons (filter funnel / column toggle)
+   right-aligned. .dt-toolbar is the skin-emitted wrapper; .datatable-toolbar is
+   the historic form class — both styled so either renders correctly. */
+#content .datatable-skin .dt-toolbar,
+#content .datatable-skin form.datatable-toolbar{
+    display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap;
+    margin:0;padding:var(--space-3) var(--space-5);
+    background:var(--dt-strip);border-top:1px solid var(--dt-border);
+}
+#content .datatable-skin .dt-toolbar-left{display:flex;align-items:center;gap:var(--space-2)}
+#content .datatable-skin .dt-toolbar-right{display:flex;align-items:center;gap:var(--space-2);margin-inline-start:auto}
+
+/* search box: a pill with a leading magnifier. Under the skin the widget wraps
+   the <input> in .dt-search-wrap; on the historic form the bare input is styled
+   to match so a non-wrapped search still looks right. */
+#content .datatable-skin .dt-search-wrap{position:relative;display:inline-flex;align-items:center;min-width:13rem}
+/* the leading magnifier only (direct child) — NOT the in-input clear × (inside a button) */
+#content .datatable-skin .dt-search-wrap>svg{position:absolute;left:var(--space-3);color:var(--dt-muted);pointer-events:none}
+#content .datatable-skin .dt-search-wrap input,
+#content .datatable-skin form.datatable-toolbar input[type=search],
+#content .datatable-skin form.datatable-toolbar input:not([type]){
+    width:100%;background:var(--dt-card);color:var(--dt-text);
+    border:1px solid var(--dt-border);border-radius:var(--radius-lg);
+    padding:var(--space-1) var(--space-3) var(--space-1) var(--space-8);font:inherit;font-size:.875rem;
+}
+/* live-search clear (×): in-input, right-aligned, shown only when non-empty (JS toggles the
+   `hidden` attr). Reserve right padding so text never slides under it. We render our own ×,
+   so suppress the browser's native type=search clear button. */
+#content .datatable-skin .dt-search-wrap input[data-dt-live]{padding-right:var(--space-8)}
+#content .datatable-skin .dt-search-wrap input[data-dt-live][type=search]::-webkit-search-cancel-button{-webkit-appearance:none;display:none}
+#content .datatable-skin .dt-search-clear{
+    position:absolute;right:var(--space-2);display:inline-flex;align-items:center;justify-content:center;
+    width:1.25rem;height:1.25rem;padding:0;border:0;background:transparent;color:var(--dt-muted);
+    cursor:pointer;border-radius:var(--radius-full)
+}
+#content .datatable-skin .dt-search-clear:hover{color:var(--dt-text);background:var(--dt-strip)}
+#content .datatable-skin .dt-search-clear svg{position:static;left:auto;width:.75rem;height:.75rem;pointer-events:none}
+#content .datatable-skin .dt-search-wrap input:focus,
+#content .datatable-skin form.datatable-toolbar input:focus{
+    outline:none;border-color:var(--dt-accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--dt-accent) 22%,transparent);
+}
+/* search submit + clear sit quietly next to the box */
+#content .datatable-skin form.datatable-toolbar .btn{font-size:.875rem}
+
+/* icon buttons (funnel / column-toggle); count badge on the funnel */
+#content .datatable-skin .dt-iconbtn{
+    position:relative;display:inline-flex;align-items:center;justify-content:center;
+    width:2.125rem;height:2.125rem;border-radius:var(--radius-lg);
+    background:transparent;border:1px solid transparent;color:var(--dt-muted);cursor:pointer;
+}
+#content .datatable-skin .dt-iconbtn:hover{background:var(--dt-card);color:var(--dt-text);border-color:var(--dt-border)}
+/* list/card view toggle (media gallery; the future file-manager seed): a pair of
+   .dt-iconbtn links where the active view is filled with the theme accent. */
+#content .datatable-skin .dt-view-toggle{display:inline-flex;gap:var(--space-1);align-items:center}
+#content .datatable-skin .dt-view-toggle .dt-view-active,
+#content .datatable-skin .dt-view-toggle .dt-view-active:hover{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
+
+/* ── media gallery (h_admin_media): list thumbnail + the card-grid view. All
+   layout in CSS (no inline styles); the card is a right-click target like a row. */
+#content .datatable-skin .media-thumb{width:2.4rem;height:2.4rem;object-fit:cover;border-radius:var(--radius-sm);display:block;background:var(--bg-tertiary)}
+#content .datatable-skin .media-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(11rem,1fr));gap:var(--space-3);padding:var(--space-4) var(--space-5)}
+#content .datatable-skin .media-tile{padding:var(--space-2)}
+#content .datatable-skin .media-tile-img{width:100%;height:7.5rem;object-fit:cover;border-radius:var(--radius-md);background:var(--bg-tertiary);display:block}
+#content .datatable-skin .media-tile-name{margin-top:var(--space-2);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#content .datatable-skin .media-tile-url{margin-top:var(--space-2);width:100%;padding:var(--space-1) var(--space-2);font-size:.75rem}
+#content .datatable-skin .media-empty{padding:var(--space-4) var(--space-5)}
+#content .flash-error{background:color-mix(in srgb,var(--fm-danger) 13%,transparent);border-color:color-mix(in srgb,var(--fm-danger) 32%,transparent);color:var(--fm-danger)}
+#content .datatable-skin .dt-badge-count{
+    position:absolute;top:calc(var(--space-1) * -1);right:calc(var(--space-1) * -1);min-width:1rem;height:1rem;
+    padding:0 var(--space-1);border-radius:var(--radius-full);background:var(--dt-accent);color:var(--dt-accent-fg);
+    font-size:.625rem;font-weight:700;line-height:1rem;text-align:center;
+}
+
+/* ───────────────────────────── table ───────────────────────────── */
+#content .datatable-skin table.datatable{width:100%;border-collapse:collapse;font-size:.875rem;table-layout:fixed}
+/* table-layout:fixed → column widths stop depending on each page's content, so
+   sorting/paging no longer reflows the columns (the "table jump"). Structural
+   columns (checkbox/reorder/actions) take fixed widths from their header cell;
+   the data columns share the remaining space equally. Overflowing cell text is
+   clipped with an ellipsis instead of widening its column. */
+#content .datatable-skin .datatable th,
+#content .datatable-skin .datatable td{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* the title cell's slug subline is a display:block child → it needs its own clip */
+#content .datatable-skin .datatable .dt-desc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+/* actions column: wide enough for labeled action sets (PIM), narrow for icon-only
+   sets (the admin tables, action_labels:false). Width on the <th> drives the column. */
+#content .datatable-skin .datatable .dt-actions-th{width:13rem}
+#content .datatable-skin .datatable .dt-actions-th.dt-actions-icons{width:7rem}
+/* the actions cell opts OUT of the data-cell ellipsis clip: it is already fixed-width
+   with nowrap content, so it never needed clipping. (NB: this un-clips the CELL only; the
+   optional row-actions dropdown — opts.row_actions_menu → .dt-row-menu-panel, currently
+   unused by any handler — would still be clipped by the pre-existing
+   .datatable-scroll-wrapper{overflow-x:auto} ancestor, so enabling that path needs a
+   popover-positioning fix independent of this rule.) */
+#content .datatable-skin .datatable .datatable-row-actions{overflow:visible}
+#content .datatable-skin .datatable thead tr{background:var(--dt-strip)}
+#content .datatable-skin .datatable th{
+    text-align:left;padding:var(--space-2) var(--space-4);color:var(--dt-muted);
+    font-size:.75rem;font-weight:700;text-transform:none;letter-spacing:0;
+    border-top:1px solid var(--dt-border);border-bottom:1px solid var(--dt-border);
+    white-space:nowrap;opacity:1;
+}
+#content .datatable-skin .datatable th.sortable-th{padding:0}
+#content .datatable-skin .datatable th.sortable-th a{
+    display:inline-flex;align-items:center;gap:var(--space-1);color:var(--dt-muted);
+    padding:var(--space-2) var(--space-4);font-weight:700;
+}
+#content .datatable-skin .datatable th.sortable-th a:hover{color:var(--dt-text)}
+#content .datatable-skin .datatable th[aria-sort] a{color:var(--dt-text)}
+#content .datatable-skin .datatable .dt-caret{color:var(--dt-accent);font-size:.9em}
+#content .datatable-skin .datatable td{
+    padding:1px var(--space-4);border-bottom:1px solid var(--dt-border);color:var(--dt-text);vertical-align:middle;   /* §4.6 compact: data rows tight (group-header/summary cells below keep presence) */
+}
+#content .datatable-skin .datatable tbody tr{transition:background .12s ease}
+#content .datatable-skin .datatable tbody tr:hover{background:var(--dt-row-hover)}
+#content .datatable-skin .datatable tbody tr:last-child td{border-bottom:0}
+#content .datatable-skin .datatable td .muted,
+#content .datatable-skin .datatable .dt-desc{color:var(--dt-muted)}
+#content .datatable-skin .datatable .dt-desc{display:block;font-size:.75rem;margin-top:var(--space-1)}
+#content .datatable-skin .datatable td strong{font-weight:600;color:var(--dt-text)}
+/* alignment helpers — forward-declared hooks (S-8) for a future `align` col opt
+   (deferred; the screenshots are all left-aligned). Emit on <td>/<th> when it lands. */
+#content .datatable-skin .dt-cell-center{text-align:center}
+#content .datatable-skin .dt-cell-right{text-align:right}
+
+/* selection checkbox column */
+#content .datatable-skin .dt-bulk-cell{width:1.5rem;text-align:center}
+#content .datatable-skin .dt-bulk-cell input{width:auto;accent-color:var(--dt-accent)}
+
+/* ───────────────────────────── badge pills ───────────────────────────── */
+#content .datatable-skin .dt-badge{
+    display:inline-flex;align-items:center;gap:var(--space-1);
+    padding:var(--space-1) var(--space-2);border-radius:var(--radius-full);
+    font-size:.75rem;font-weight:600;line-height:1.4;white-space:nowrap;
+    border:1px solid transparent;
+}
+#content .datatable-skin .dt-badge svg{width:.85em;height:.85em}
+#content .datatable-skin .dt-badge-primary{background:color-mix(in srgb,var(--dt-accent) 18%,transparent);color:var(--dt-accent);border-color:color-mix(in srgb,var(--dt-accent) 35%,transparent)}
+#content .datatable-skin .dt-badge-success{background:color-mix(in srgb,var(--dt-success) 16%,transparent);color:var(--dt-success);border-color:color-mix(in srgb,var(--dt-success) 32%,transparent)}
+#content .datatable-skin .dt-badge-warning{background:color-mix(in srgb,var(--dt-warning) 18%,transparent);color:var(--dt-warning);border-color:color-mix(in srgb,var(--dt-warning) 34%,transparent)}
+#content .datatable-skin .dt-badge-danger{background:color-mix(in srgb,var(--dt-danger) 16%,transparent);color:var(--dt-danger);border-color:color-mix(in srgb,var(--dt-danger) 32%,transparent)}
+#content .datatable-skin .dt-badge-info{background:color-mix(in srgb,var(--dt-info) 16%,transparent);color:var(--dt-info);border-color:color-mix(in srgb,var(--dt-info) 32%,transparent)}
+#content .datatable-skin .dt-badge-gray{background:color-mix(in srgb,var(--dt-muted) 16%,transparent);color:var(--dt-muted);border-color:color-mix(in srgb,var(--dt-muted) 30%,transparent)}
+
+/* ───────────────────────────── ring + boolean icons ───────────────────────────── */
+#content .datatable-skin .dt-icon-ring{
+    display:inline-flex;align-items:center;justify-content:center;
+    width:1.5rem;height:1.5rem;border-radius:var(--radius-full);border:2px solid currentColor;
+}
+#content .datatable-skin .dt-icon-ring svg{width:.95em;height:.95em}
+#content .datatable-skin .dt-ring-yes{color:var(--dt-success)}
+#content .datatable-skin .dt-ring-no{color:var(--dt-danger)}
+/* the historic ✓/✗ glyph cell, re-tinted under the skin */
+#content .datatable-skin .dt-bool-yes{color:var(--dt-success)}
+#content .datatable-skin .dt-bool-no{color:var(--dt-danger);opacity:1}
+
+/* ───────────────────────────── row actions ───────────────────────────── */
+#content .datatable-skin .datatable-row-actions{text-align:right;white-space:nowrap}
+/* a row action is ALWAYS a `.dt-action` link or a `.btn` button (dt_action_class), so target
+   `.dt-action` directly — no generic `.datatable-row-actions a` catch-all that would re-colour
+   a `.btn` row action. */
+#content .datatable-skin .dt-action{
+    display:inline-flex;align-items:center;gap:var(--space-1);
+    font-size:1rem;font-weight:600;color:var(--dt-accent);
+    border-radius:var(--dt-r-sm);
+}
+#content .datatable-skin .dt-action:hover{background:color-mix(in srgb,var(--dt-accent) 12%,transparent);color:var(--dt-accent-hover)}
+#content .datatable-skin .dt-action-danger{color:var(--dt-danger)}
+#content .datatable-skin .dt-action-danger:hover{background:color-mix(in srgb,var(--dt-danger) 12%,transparent);color:var(--dt-danger)}
+#content .datatable-skin .datatable-row-actions a+a,
+#content .datatable-skin .dt-action+.dt-action{margin-inline-start:var(--space-1)}
+
+/* ───────────────────────────── bulk bar ───────────────────────────── */
+#content .datatable-skin .dt-bulk-bar{
+    display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap;
+    padding:var(--space-3) var(--space-5);background:var(--dt-strip);border-top:1px solid var(--dt-border);
+}
+#content .datatable-skin .dt-bulk-bar .btn{
+    display:inline-flex;align-items:center;gap:var(--space-1);
+    background:transparent;border:1px solid var(--dt-border);color:var(--dt-text);
+    font-size:.875rem;font-weight:600;padding:var(--space-2) var(--space-3);border-radius:var(--radius-lg);
+}
+#content .datatable-skin .dt-bulk-bar .btn-danger,#content .datatable-skin .dt-bulk-bar .btn.danger{color:var(--dt-danger);border-color:color-mix(in srgb,var(--dt-danger) 40%,transparent);background:transparent}
+#content .datatable-skin .dt-bulk-bar .btn-danger:hover,#content .datatable-skin .dt-bulk-bar .btn.danger:hover{background:color-mix(in srgb,var(--dt-danger) 12%,transparent)}
+#content .datatable-skin .dt-bulk-act[disabled]{opacity:.45;cursor:default;filter:grayscale(.4)}
+/* select-all-across-pages prompt (Phase 3, S-5) */
+#content .datatable-skin .dt-sel-all-prompt{color:var(--dt-muted)}
+#content .datatable-skin .dt-sel-all-link{background:none;border:0;padding:0;color:var(--dt-accent);font-weight:600;font-size:inherit;cursor:pointer;text-decoration:underline}
+#content .datatable-skin .dt-sel-all-link:hover{color:var(--dt-accent-hover)}
+#content .datatable-skin .dt-bulk-count{color:var(--dt-muted);font-size:.875rem}
+
+/* ───────────────────────────── row tints (row_class → dt-row-*) ───────────────────────────── */
+#content .datatable-skin .datatable tr.dt-row-green td{box-shadow:inset 3px 0 0 var(--dt-success);background:color-mix(in srgb,var(--dt-success) 7%,transparent)}
+#content .datatable-skin .datatable tr.dt-row-amber td{box-shadow:inset 3px 0 0 var(--dt-warning);background:color-mix(in srgb,var(--dt-warning) 7%,transparent)}
+#content .datatable-skin .datatable tr.dt-row-red td{box-shadow:inset 3px 0 0 var(--dt-danger);background:color-mix(in srgb,var(--dt-danger) 7%,transparent)}
+
+/* ───────────────────────────── footer (range / per-page / pager) ───────────────────────────── */
+#content .datatable-skin .dt-footer{
+    display:flex;align-items:center;gap:var(--space-4);flex-wrap:wrap;
+    padding:var(--space-3) var(--space-5);border-top:1px solid var(--dt-border);
+}
+#content .datatable-skin .dt-results-range{color:var(--dt-muted);font-size:.875rem;margin-inline-end:auto}
+#content .datatable-skin .dt-perpage{display:flex;align-items:center;gap:var(--space-2);margin:0}
+#content .datatable-skin .dt-perpage-label{color:var(--dt-muted);font-size:.875rem;font-weight:500;margin:0}
+#content .datatable-skin .dt-perpage-select{
+    width:auto;background:var(--dt-strip);color:var(--dt-text);
+    border:1px solid var(--dt-border);border-radius:var(--radius-lg);
+    padding:var(--space-1) var(--space-8) var(--space-1) var(--space-3);font:inherit;font-size:.875rem;cursor:pointer;
+}
+#content .datatable-skin .dt-perpage-go{
+    background:var(--dt-strip);color:var(--dt-text);border:1px solid var(--dt-border);
+    border-radius:var(--radius-lg);padding:var(--space-1) var(--space-3);font:inherit;font-size:.75rem;cursor:pointer;
+}
+
+/* pager: numbered amber boxes + chevron prev/next + « » extreme links */
+#content .datatable-skin .datatable-pagination-bar{
+    display:flex;align-items:center;gap:var(--space-1);margin:0;padding:0;justify-content:flex-end;
+}
+#content .datatable-skin .datatable-page-list{display:flex;align-items:center;gap:var(--space-1);list-style:none;padding:0;margin:0}
+#content .datatable-skin .datatable-page-list .btn,
+#content .datatable-skin .page-number-btn,
+#content .datatable-skin .dt-page-extreme{
+    display:inline-flex;align-items:center;justify-content:center;
+    min-width:2.125rem;height:2.125rem;padding:0 var(--space-2);
+    background:var(--dt-strip);border:1px solid var(--dt-border);border-radius:var(--radius-lg);
+    color:var(--dt-text);font-size:.75rem;font-weight:normal;opacity:1;
+}
+#content .datatable-skin .datatable-page-list .btn:hover,
+#content .datatable-skin .page-number-btn:hover,
+#content .datatable-skin .dt-page-extreme:hover{background:var(--dt-card);border-color:var(--dt-accent);color:var(--dt-text)}
+#content .datatable-skin .page-number-active{
+    background:var(--dt-accent);border-color:var(--dt-accent);color:var(--dt-accent-fg);
+    pointer-events:none;font-weight:700;
+}
+#content .datatable-skin .dt-ellipsis{padding:0 var(--space-1);color:var(--dt-muted);align-self:center}
+#content .datatable-skin .datatable-page-info{display:none}  /* "Page N of M" → the range label carries the count under the skin */
+
+/* historic standalone pager/size-selector, kept usable if a skin page still
+   emits them (e.g. partial paths): re-tint so they never show shell-blue */
+#content .datatable-skin .datatable-pagesize a{color:var(--dt-text)}
+#content .datatable-skin .dt-pagesize-active{background:var(--dt-accent);color:var(--dt-accent-fg)}
+
+/* ───────────────────────────── empty state ───────────────────────────── */
+#content .datatable-skin .datatable-empty-state{
+    margin:0;padding:var(--space-10) var(--space-5);text-align:center;background:none;border:0;border-radius:0;
+}
+#content .datatable-skin .datatable-empty-state p{color:var(--dt-muted)}
+
+/* ═══════════════════════ Phase 2–5 classes (shipped now, S-8) ═══════════════════════ */
+
+/* filter funnel popover — native <details>; inline JS adds click-away/float (Phase 2) */
+#content .datatable-skin .dt-filter-pop,#content .datatable-skin .dt-groupby-pop{position:relative;display:inline-block}
+#content .datatable-skin .dt-filter-pop>summary,#content .datatable-skin .dt-groupby-pop>summary{list-style:none;cursor:pointer}
+#content .datatable-skin .dt-filter-pop>summary::-webkit-details-marker,#content .datatable-skin .dt-groupby-pop>summary::-webkit-details-marker{display:none}
+#content .datatable-skin .dt-filter-panel,#content .datatable-skin .dt-groupby-panel{
+    position:absolute;right:0;top:calc(100% + var(--space-2));z-index:50;min-width:16rem;
+    background:var(--dt-card);border:1px solid var(--dt-border);border-radius:var(--radius-xl);
+    box-shadow:var(--shadow-popover);padding:var(--space-4);
+}
+#content .datatable-skin .dt-filter-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--space-3)}
+#content .datatable-skin .dt-filter-head strong{font-size:.875rem;color:var(--dt-text)}
+#content .datatable-skin .dt-filter-reset{color:var(--dt-danger);font-size:.875rem;font-weight:600}
+#content .datatable-skin .dt-filter-field{margin:var(--space-3) 0}
+#content .datatable-skin .dt-filter-field label{display:block;font-size:.75rem;color:var(--dt-muted);margin-bottom:var(--space-1);font-weight:600}
+#content .datatable-skin .dt-filter-apply{margin-top:var(--space-2)}
+#content .datatable-skin .dt-filter-chip{
+    display:inline-flex;align-items:center;gap:var(--space-1);
+    background:color-mix(in srgb,var(--dt-accent) 14%,transparent);color:var(--dt-accent);
+    border:1px solid color-mix(in srgb,var(--dt-accent) 30%,transparent);
+    border-radius:var(--radius-full);padding:var(--space-1) var(--space-2);font-size:.75rem;font-weight:600;
+}
+#content .datatable-skin .dt-filter-chip:hover{background:color-mix(in srgb,var(--dt-accent) 22%,transparent)}
+/* the search form is a flex row so it lays out beside the funnel in the wrapper */
+#content .datatable-skin .dt-search-form{display:flex;align-items:center;gap:var(--space-3);margin:0}
+/* active-filter chips strip (below the toolbar) */
+#content .datatable-skin .dt-filter-chips{
+    display:flex;flex-wrap:wrap;gap:var(--space-2);align-items:center;
+    padding:var(--space-3) var(--space-5);background:var(--dt-strip);border-top:1px solid var(--dt-border);
+}
+/* the funnel panel's controls */
+#content .datatable-skin .dt-filter-field select,
+#content .datatable-skin .dt-filter-field input{
+    width:100%;padding:var(--space-2) var(--space-2);border-radius:var(--radius-lg);
+    background:var(--dt-page);border:1px solid var(--dt-border);color:var(--dt-text);font-size:.875rem;
+}
+#content .datatable-skin .dt-filter-field select:focus,
+#content .datatable-skin .dt-filter-field input:focus{outline:2px solid var(--dt-accent);outline-offset:-1px}
+/* multiple-select filter: a checkbox group (JS joins to one comma value on submit) */
+#content .datatable-skin .dt-filter-checks{display:flex;flex-direction:column;gap:var(--space-1);margin-top:var(--space-1)}
+#content .datatable-skin .dt-check{display:flex;align-items:center;gap:var(--space-2);font-size:.875rem;color:var(--dt-text);font-weight:500;cursor:pointer}
+/* reset the generic .dt-filter-field input styling for the checkboxes */
+#content .datatable-skin .dt-check input{width:auto;flex:0 0 auto;padding:0;border:0;background:none;accent-color:var(--dt-accent)}
+/* daterange: two native date inputs */
+#content .datatable-skin .dt-daterange{display:flex;align-items:center;gap:var(--space-2)}
+#content .datatable-skin .dt-daterange input{flex:1;min-width:0}
+#content .datatable-skin .dt-daterange-sep{color:var(--dt-muted);flex:0 0 auto}
+
+/* column-visibility toggle popover (Phase 2) */
+#content .datatable-skin .dt-col-toggle{position:relative;display:inline-block}
+#content .datatable-skin .dt-col-toggle>summary{list-style:none;cursor:pointer}
+#content .datatable-skin .dt-col-toggle>summary::-webkit-details-marker{display:none}
+#content .datatable-skin .dt-col-panel{
+    position:absolute;right:0;top:calc(100% + var(--space-2));z-index:50;min-width:12rem;
+    background:var(--dt-card);border:1px solid var(--dt-border);border-radius:var(--radius-xl);
+    box-shadow:var(--shadow-popover);padding:var(--space-3);
+}
+#content .datatable-skin .dt-col-panel label{display:flex;align-items:center;gap:var(--space-2);padding:var(--space-1) var(--space-2);font-size:.875rem;color:var(--dt-text);border-radius:var(--dt-r-sm)}
+#content .datatable-skin .dt-col-panel label:hover{background:var(--dt-strip)}
+/* row-action "⋮" dropdown (Phase 3) — a <details> menu of action links/buttons */
+#content .datatable-skin .dt-row-menu{position:relative;display:inline-block}
+#content .datatable-skin .dt-row-menu>summary{list-style:none;cursor:pointer}
+#content .datatable-skin .dt-row-menu>summary::-webkit-details-marker{display:none}
+#content .datatable-skin .dt-row-menu-panel{
+    position:absolute;right:0;top:calc(100% + var(--space-1));z-index:40;min-width:9rem;
+    background:var(--dt-card);border:1px solid var(--dt-border);border-radius:var(--radius-xl);
+    box-shadow:var(--shadow-popover);padding:var(--space-1);display:flex;flex-direction:column;gap:1px;
+}
+/* Dropdown ⋮-menu rows reuse .dt-action but need a comfortable tap target — the
+   inline-row padding removal must NOT leak here, so restore vertical padding. */
+#content .datatable-skin .dt-row-menu-panel>.dt-action,
+#content .datatable-skin .dt-row-menu-panel>.btn{justify-content:flex-start;width:100%;padding:var(--space-2) var(--space-2)}
+/* column manager rows are toggle LINKS (Lane A, no-JS-correct) */
+#content .datatable-skin .dt-col-item{display:flex;align-items:center;gap:var(--space-2);padding:var(--space-1) var(--space-2);font-size:.875rem;color:var(--dt-muted);border-radius:var(--dt-r-sm);text-decoration:none;white-space:nowrap}
+#content .datatable-skin .dt-col-item:hover{background:var(--dt-strip)}
+#content .datatable-skin .dt-col-item.dt-col-on{color:var(--dt-text)}
+#content .datatable-skin .dt-col-item svg{color:var(--dt-accent)}
+#content .datatable-skin .dt-col-item .dt-col-box{width:1em;height:1em;border:1px solid var(--dt-border);border-radius:var(--dt-r-sm);flex:none}
+
+/* native <dialog> confirm modal (Phase 3) — S-6 canonical: .dt-modal + ::backdrop */
+#content .datatable-skin .dt-modal,
+.datatable-skin .dt-modal{
+    /* Explicit viewport centering (same as .md-modal) — the shell overrides the native
+       <dialog> UA centering, so without this the confirm pops to the top-left corner. */
+    position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);margin:0;
+    border:1px solid var(--dt-border,rgba(255,255,255,.08));border-radius:var(--radius-xl);
+    background:var(--dt-card,#0f172a);color:var(--dt-text,#f8fafc);
+    padding:var(--space-6);max-width:24rem;width:calc(100% - var(--space-8));
+    box-shadow:var(--shadow-modal);
+}
+.datatable-skin .dt-modal::backdrop{background:var(--overlay)}
+.datatable-skin .dt-modal-icon{
+    display:flex;align-items:center;justify-content:center;width:3rem;height:3rem;margin:0 auto var(--space-3);
+    border-radius:var(--radius-full);background:color-mix(in srgb,var(--dt-danger,#f43f5e) 18%,transparent);color:var(--dt-danger,#f43f5e);
+}
+.datatable-skin .dt-modal-title{text-align:center;font-size:1rem;font-weight:700;margin:0 0 var(--space-1)}
+.datatable-skin .dt-modal-body{text-align:center;color:var(--dt-muted,#94a3b8);font-size:.875rem;margin:0 0 var(--space-4)}
+.datatable-skin .dt-modal-actions{display:flex;gap:var(--space-3);justify-content:center}
+
+/* column alignment (deferred Phase-1 `align` opt) — works skin or unskinned */
+#content .datatable .dt-align-left{text-align:left}
+#content .datatable .dt-align-center{text-align:center}
+#content .datatable .dt-align-right{text-align:right}
+
+/* grouping (Phase 4b) — flat spanning group-header rows + the Group-by select */
+#content .datatable-skin .datatable tr.dt-group-header td{
+    background:var(--dt-strip);font-weight:600;color:var(--dt-text);
+    padding:var(--space-2) var(--space-4);border-top:1px solid var(--dt-border)
+}
+#content .datatable-skin .dt-group-label{
+    color:var(--dt-muted);font-weight:500;text-transform:uppercase;
+    font-size:.75rem;letter-spacing:.04em;margin-inline-end:var(--space-2)
+}
+#content .datatable-skin .dt-groupby{display:inline-flex;align-items:center;gap:var(--space-2)}
+
+/* summary footer (Phase 4a) — <tfoot> aggregate row over the filtered dataset */
+#content .datatable-skin .datatable tfoot tr.dt-summary-row{background:var(--dt-strip);border-top:2px solid var(--dt-border)}
+#content .datatable-skin .datatable tfoot .dt-summary-cell{padding:var(--space-3) var(--space-4);font-weight:600;color:var(--dt-text);font-variant-numeric:tabular-nums;white-space:nowrap}
+
+/* drag-reorder handle (the handle class is reserved; Phase 5 ships move-links below) */
+#content .datatable-skin .dt-drag-handle{color:var(--dt-muted);cursor:grab;display:inline-flex;align-items:center}
+#content .datatable-skin .dt-drag-handle:active{cursor:grabbing}
+
+/* reorder move-links (Phase 5) — ▲/▼ submit buttons in a narrow leading column */
+#content .datatable-skin .dt-reorder-cell{width:3.5rem;white-space:nowrap;text-align:center}
+#content .datatable-skin .dt-reorder{display:inline-flex;flex-direction:column;gap:1px;line-height:1}
+#content .datatable-skin .dt-move-btn{
+    appearance:none;border:1px solid var(--dt-border);background:transparent;color:var(--dt-muted);
+    cursor:pointer;font-size:.625rem;line-height:1;padding:var(--space-1) var(--space-2);border-radius:var(--dt-r-sm)
+}
+#content .datatable-skin .dt-move-btn:hover{color:var(--dt-accent);border-color:var(--dt-accent)}
+
+/* ───────────────────────────── responsive + motion ───────────────────────────── */
+@media (max-width:680px){
+    #content .datatable-skin .dt-header{flex-direction:column;gap:var(--space-3)}
+    #content .datatable-skin .dt-footer{justify-content:center}
+    #content .datatable-skin .dt-results-range{margin-inline-end:0;width:100%;text-align:center}
+}
+@media (prefers-reduced-motion:reduce){
+    #content .datatable-skin .datatable tbody tr{transition:none}
+}
+
+
+/* ===================================================================
+   forms.css
+   =================================================================== */
+/* forms.css — the Filament 5 "skin" for the shared SSR forms widget (forms.mix).
+ *
+ * Plan of record: _plan/2026-06-17-forms-widget.md (§5).
+ * Visual target: Filament 5 Forms (filamentphp.com/docs; screenshots deleted 2026-07-23, git history — ANATOMY only, never
+ * its palette: Filament's orange/blue accent is replaced everywhere by the global
+ * --accent ocean-blue).
+ *
+ * SCOPING — the whole sheet is scoped under `.forms-skin`, a wrapper class fm_open
+ * adds to the <form> when opts.skin == true. A form that does NOT opt in renders
+ * through the existing cms.css #content styling (no .forms-skin match here), so the
+ * un-converted forms are untouched even though this file loads globally. The
+ * `#content` prefix + the extra `.forms-skin` class give these rules higher
+ * specificity than cms.css's `#content input/label/.btn` rules, so they win; loaded
+ * AFTER cms.css, unlayered, so equal-specificity ties also go to us.
+ *
+ * THEME — like datatable.css, the skin RIDES the shell theme: every --fm-* token is
+ * a thin alias onto the global oklch tokens (site.css: --accent / --bg-* / --fg-* /
+ * --border / --border-muted / semantic). One block, NO light/dark split — the
+ * globals it aliases are already theme-aware (html.light/html.dark + scheme-*).
+ *
+ * CLASS VOCABULARY — ships the full canonical set now; the affix-button (password
+ * eye-toggle), color-swatch, and segment (toggle-buttons) classes are forward-
+ * declared hooks for later phases so those phases are pure handler/JS work.
+ */
+
+/* ───────────────────────────── tokens ───────────────────────────── */
+#content .forms-skin{
+    --fm-accent:        var(--accent);
+    --fm-accent-hover:  var(--accent-hover);
+    --fm-accent-fg:     var(--accent-fg);
+    --fm-card:          var(--bg-primary);    /* control + section surface */
+    --fm-page:          var(--bg-tertiary);
+    --fm-strip:         var(--bg-secondary);  /* affix face / section header tint */
+    --fm-border:        var(--border-muted);
+    --fm-border-strong: var(--border);
+    --fm-text:          var(--fg-primary);
+    --fm-muted:         var(--fg-muted);
+    --fm-info:          var(--info);
+    --fm-success:       var(--success);
+    --fm-warning:       var(--warning);
+    --fm-danger:        var(--danger);
+    --fm-r-lg:          var(--radius-lg);
+    --fm-r-md:          var(--radius-md);
+    --fm-r-sm:          var(--radius-sm);
+    /* the ONE vertical gap between form fields/rows — read by BOTH the canvas form's
+       fm_grid row-gap AND the modal body's flex gap, so the two can't drift (both .forms-skin
+       carries this var). Change here to retune every form, canvas or modal, at once. */
+    --fm-row-gap:       var(--space-3);
+}
+
+#content .forms-skin.fm-form{margin:0}
+#content .forms-skin svg{width:1.05em;height:1.05em;vertical-align:-.15em;flex:none}
+
+/* ───────────────────────────── section card ───────────────────────────── */
+#content .forms-skin .fm-section{
+    background:var(--fm-card);
+    color:var(--fm-text);
+    border:1px solid var(--fm-border);
+    border-radius:var(--radius-xl);
+    overflow:hidden;
+    box-shadow:var(--shadow-sm);
+    margin:0 0 var(--space-5);
+}
+#content .forms-skin .fm-section-head{
+    display:flex;align-items:flex-start;justify-content:space-between;gap:var(--space-4);
+    padding:var(--space-4) var(--space-5);border-bottom:1px solid var(--fm-border);
+}
+#content .forms-skin .fm-section-title{
+    font-size:1rem;line-height:1.25;font-weight:700;letter-spacing:-.01em;
+    color:var(--fm-text);margin:0;
+}
+#content .forms-skin .fm-section-sub{margin:var(--space-1) 0 0;font-size:.875rem;color:var(--fm-muted)}
+/* forward-declared collapse chevron hook (Phase 2+) */
+#content .forms-skin .fm-section-chevron{color:var(--fm-muted);flex:none}
+#content .forms-skin .fm-section-body{padding:var(--space-5)}
+/* Post-editor action row: [Delete post] left, [View][Save] right, on one line. The
+   buttons submit their forms (pp-delete / pp-edit) via the HTML5 form= attribute, so
+   they can sit in this shared row instead of inside the forms. */
+#content .pp-actionbar{display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap;margin-top:var(--space-5)}
+#content .pp-actionbar-right{display:flex;align-items:center;gap:var(--space-2);margin-left:auto}
+/* (The post editor's width is governed by the global Narrow|Normal|Wide .cms-wrap
+   toggle, same as every page — full width is Wide mode. No editor-specific max-width
+   override here: forcing it would make Normal ≡ Wide and break the 3-way toggle.) */
+/* (?) help badge in a field label: a small circle whose hover/focus tooltip carries the
+   help text (data-tip). Replaces the below-field help for help_tip fields. */
+#content .fm-tip{display:inline-flex;align-items:center;justify-content:center;width:1rem;height:1rem;margin-left:var(--space-1);border-radius:50%;border:1px solid var(--border-muted,var(--border));color:var(--fg-muted,inherit);opacity:.7;font-size:.75rem;font-weight:700;line-height:1;cursor:help;position:relative;vertical-align:middle;-webkit-user-select:none;user-select:none}
+#content .fm-tip:hover,#content .fm-tip:focus-visible{opacity:1;border-color:var(--accent);color:var(--accent);outline:none}
+/* min-height = the (?) badge height so a label band is the SAME height whether or not it
+   carries a tip — fields in the same grid row then align their inputs (Title/Slug fix). */
+#content .fm-label-row{display:flex;align-items:center;gap:var(--space-1);min-height:1rem}
+/* left-anchored to the badge so the tooltip extends rightward (never clipped off the left
+   edge); rendered BELOW the badge (top:100%) not above — a field at the top of a scrolling
+   modal (e.g. Slug) would clip its tooltip against the panel's top edge if it opened upward.
+   TRADE-OFF: a help field at the very BOTTOM of a scrolling modal could now clip downward
+   instead. No current form puts a tooltip'd field at a modal's bottom edge (the editor's
+   bottom rows — Type/Visibility/Status/Cover — carry no tips), so this is latent; revisit
+   with a position-aware flip (Popover API / JS) if that changes. */
+#content .fm-tip[data-tip]:hover::after,#content .fm-tip[data-tip]:focus-visible::after{content:attr(data-tip);position:absolute;left:0;top:calc(100% + .5rem);white-space:normal;width:max-content;max-width:20rem;padding:var(--space-2) var(--space-3);background:var(--fg-primary);color:var(--bg-primary);font-size:.75rem;font-weight:500;line-height:1.45;text-align:left;border-radius:var(--radius-md,.375rem);box-shadow:var(--shadow-md,0 4px 12px rgba(0,0,0,.18));z-index:60;pointer-events:none}
+
+/* ───────────────────────────── field grid ───────────────────────────── */
+/* row-gap (--fm-row-gap) > the in-field label→input gap (space-1) so each label binds
+   visually to ITS control and field groups are clearly separated; col-gap unchanged.
+   The row-gap is the shared var so canvas + modal field spacing stay identical. */
+#content .forms-skin .fm-grid{display:grid;gap:var(--fm-row-gap,var(--space-3)) var(--space-5);align-items:start}
+#content .forms-skin .fm-cols-1{grid-template-columns:minmax(0,1fr)}
+#content .forms-skin .fm-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+#content .forms-skin .fm-cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}
+#content .forms-skin .fm-cols-4{grid-template-columns:repeat(4,minmax(0,1fr))}
+#content .forms-skin .fm-span-2{grid-column:1 / -1}
+/* collapse to one column on narrow viewports (placed AFTER the cols rules so it
+   wins the equal-specificity tie when active; inactive at wide widths) */
+@media (max-width:640px){
+    #content .forms-skin .fm-grid{grid-template-columns:minmax(0,1fr)}
+}
+
+/* ───────────────────────────── field ───────────────────────────── */
+/* gap = label→control distance: tight (space-1) so the label hugs its own input,
+   not the field above it (paired with the larger fm-grid row-gap). */
+#content .forms-skin .fm-field{display:flex;flex-direction:column;gap:var(--space-1);min-width:0}
+#content .forms-skin .fm-label{
+    display:block;margin:0;font-size:.875rem;font-weight:600;line-height:1.3;
+    color:var(--fm-text);opacity:1;
+    /* indent the label to line up EXACTLY with the control's text — controls have
+       space-3 left padding, so match it. Applies to every form field, canvas or modal. */
+    padding-left:var(--space-3);
+}
+#content .forms-skin .fm-req{color:var(--fm-danger);font-weight:700;margin-inline-start:var(--space-1)}
+#content .forms-skin .fm-help{margin:0;font-size:.75rem;line-height:1.4;color:var(--fm-muted)}
+#content .forms-skin .fm-error{margin:0;font-size:.75rem;line-height:1.4;color:var(--fm-danger);font-weight:500}
+#content .forms-skin .fm-note{
+    grid-column:1 / -1;margin:var(--space-1) 0 0;font-size:.75rem;line-height:1.5;color:var(--fm-muted);
+}
+
+/* ───────────────────────────── controls ───────────────────────────── */
+/* background-COLOR (not the shorthand) so the select caret background-image survives. */
+#content .forms-skin .fm-control{
+    width:100%;box-sizing:border-box;
+    background-color:var(--fm-card);color:var(--fm-text);
+    border:1px solid var(--fm-border);border-radius:var(--radius-lg);
+    padding:var(--space-2) var(--space-3);font:inherit;font-size:.875rem;line-height:1.4;
+    transition:border-color .14s ease,box-shadow .14s ease;
+}
+#content .forms-skin .fm-control:hover{border-color:var(--fm-border-strong)}
+#content .forms-skin .fm-control:focus{
+    outline:none;border-color:var(--fm-accent);
+    box-shadow:0 0 0 3px color-mix(in srgb,var(--fm-accent) 22%,transparent);
+}
+#content .forms-skin .fm-control::placeholder{color:var(--fm-muted)}
+#content .forms-skin .fm-control:disabled{opacity:.55;cursor:not-allowed}
+#content .forms-skin textarea.fm-control{min-height:var(--space-20);resize:vertical}
+#content .forms-skin textarea.fm-control.fm-mono{font-family:var(--font-mono,ui-monospace,SFMono-Regular,Menlo,Consolas,monospace)}
+/* native <select> caret (re-add under the skin; theme-aware stroke) */
+#content .forms-skin select.fm-control{
+    appearance:none;-webkit-appearance:none;-moz-appearance:none;
+    padding-right:var(--space-10);cursor:pointer;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23808a99' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+    background-repeat:no-repeat;background-position:right var(--space-3) center;
+}
+
+/* error state */
+#content .forms-skin .fm-field.is-error .fm-control{border-color:var(--fm-danger)}
+#content .forms-skin .fm-field.is-error .fm-control:focus{
+    box-shadow:0 0 0 3px color-mix(in srgb,var(--fm-danger) 22%,transparent);
+}
+#content .forms-skin .fm-field.is-error .fm-affix{border-color:var(--fm-danger)}
+
+/* ───────────────────────────── affixes ───────────────────────────── */
+/* prefix/suffix fused inside one border; the control goes border-less, the wrapper
+   carries the border + focus-within ring (the Filament fused-affix look). */
+#content .forms-skin .fm-affix{
+    display:flex;align-items:stretch;
+    background-color:var(--fm-card);
+    border:1px solid var(--fm-border);border-radius:var(--radius-lg);overflow:hidden;
+    transition:border-color .14s ease,box-shadow .14s ease;
+}
+#content .forms-skin .fm-affix:focus-within{
+    border-color:var(--fm-accent);
+    box-shadow:0 0 0 3px color-mix(in srgb,var(--fm-accent) 22%,transparent);
+}
+#content .forms-skin .fm-affix .fm-control{
+    border:0;border-radius:0;background-color:transparent;flex:1;min-width:0;
+}
+#content .forms-skin .fm-affix .fm-control:focus{box-shadow:none}
+#content .forms-skin .fm-affix-text{
+    display:flex;align-items:center;padding:0 var(--space-3);
+    background-color:var(--fm-strip);color:var(--fm-muted);
+    font-size:.875rem;white-space:nowrap;
+}
+/* forward-declared affix button (password eye-toggle / color swatch — Phase 2/4) */
+#content .forms-skin .fm-affix-btn{
+    display:inline-flex;align-items:center;justify-content:center;
+    padding:0 var(--space-3);border:0;background:var(--fm-strip);color:var(--fm-muted);
+    cursor:pointer;border-inline-start:1px solid var(--fm-border);
+}
+#content .forms-skin .fm-affix-btn:hover{color:var(--fm-text)}
+#content .forms-skin .fm-color-swatch{
+    width:1.375rem;height:1.375rem;border-radius:var(--radius-full);align-self:center;
+    margin-inline-end:var(--space-2);border:1px solid var(--fm-border);flex:none;
+}
+
+/* ───────────────────────────── checkbox / radio ───────────────────────────── */
+#content .forms-skin .fm-check{
+    display:flex;align-items:flex-start;gap:var(--space-2);cursor:pointer;
+    font-weight:400;margin:0;opacity:1;
+}
+#content .forms-skin .fm-check-input{
+    width:1.125rem;height:1.125rem;margin:.125rem 0 0;flex:none;cursor:pointer;
+    accent-color:var(--fm-accent);
+}
+#content .forms-skin .fm-check-body{display:flex;flex-direction:column;gap:var(--space-1);min-width:0}
+#content .forms-skin .fm-check-label{font-size:.875rem;font-weight:600;line-height:1.3;color:var(--fm-text)}
+#content .forms-skin .fm-check-desc{font-size:.75rem;line-height:1.4;color:var(--fm-muted)}
+#content .forms-skin .fm-radio-group{display:flex;flex-direction:column;gap:var(--space-2)}
+#content .forms-skin .fm-radio-item{align-items:center}
+
+/* toggle = a pill switch (hide native, render track + thumb; accent track when on) */
+#content .forms-skin .fm-toggle .fm-check-input{
+    appearance:none;-webkit-appearance:none;-moz-appearance:none;
+    width:2.5rem;height:1.375rem;border-radius:var(--radius-full);flex:none;
+    background:var(--fm-border-strong);border:0;cursor:pointer;position:relative;
+    margin-top:1px;transition:background .15s ease;
+}
+#content .forms-skin .fm-toggle .fm-check-input::after{
+    content:"";position:absolute;top:.125rem;left:.125rem;
+    width:1.125rem;height:1.125rem;border-radius:var(--radius-full);background:var(--accent-fg);
+    box-shadow:var(--shadow-sm);transition:transform .15s ease;
+}
+#content .forms-skin .fm-toggle .fm-check-input:checked{background:var(--fm-accent)}
+#content .forms-skin .fm-toggle .fm-check-input:checked::after{transform:translateX(1.125rem)}
+
+/* forward-declared segmented toggle-buttons (Phase 4) */
+#content .forms-skin .fm-segment{display:inline-flex;border:1px solid var(--fm-border);border-radius:var(--radius-md);overflow:hidden}
+#content .forms-skin .fm-segment-item{
+    display:inline-flex;align-items:center;gap:var(--space-1);padding:var(--space-2) var(--space-3);
+    background:var(--fm-card);color:var(--fm-text);cursor:pointer;font-size:.875rem;font-weight:600;
+    border-inline-start:1px solid var(--fm-border);
+}
+#content .forms-skin .fm-segment-item:first-child{border-inline-start:0}
+#content .forms-skin .fm-segment-item.is-active{background:var(--fm-accent);color:var(--fm-accent-fg)}
+
+/* ───────────────────────────── actions ───────────────────────────── */
+#content .forms-skin .fm-actions{
+    display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap;
+    margin-top:var(--space-6);
+}
+#content .forms-skin .fm-actions-meta{margin-inline-start:auto;color:var(--fm-muted);font-size:.875rem}
+
+/* Buttons: forms use the site-wide unified `.btn` / `.btn-<variant>` system
+   (defined once near the top of this file). No forms-specific button recipe. */
+
+/* ─────────────────────── fm_form layout (canvas == modal) ─────────────────────── */
+/* The field stack — identical wrapper in both contexts, spaced by the shared row-gap. */
+#content .forms-skin .fm-stack{display:flex;flex-direction:column;gap:var(--fm-row-gap,var(--space-3))}
+/* Top bar: the back affordance sits at the RIGHT, styled as a .btn btn-primary (same as the
+   action buttons). On canvas it's a navigating <a>; in a modal it's a data-modal-close
+   <button> — same look, context behaviour. (.fm-backlink is now just a marker class.) */
+#content .forms-skin .fm-topbar{display:flex;justify-content:flex-end;align-items:center}
+#content .fm-canvas .fm-topbar{margin-bottom:var(--space-3)}
+/* Action row: Delete LEFT, View+Save pushed RIGHT (margin-left:auto). width:100% so the
+   right-push works whether the row is a flat block (canvas) or sits in the md-foot (modal). */
+#content .forms-skin .fm-form-actions{display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap;width:100%}
+#content .fm-canvas .fm-form-actions{margin-top:var(--space-5)}
+#content .forms-skin .fm-form-actions-right{display:flex;align-items:center;gap:var(--space-2);margin-left:auto}
+/* optional muted caption on the action row's LEFT (fm_form `meta`, e.g. mail "from X"); the
+   right cluster's margin-left:auto keeps the buttons right, so this stays left. */
+#content .forms-skin .fm-form-meta{color:var(--fm-muted);font-size:.75rem;align-self:center}
+
+/* ───────────────────────────── flash banners ───────────────────────────── */
+#content .forms-skin .fm-flash{
+    border:1px solid transparent;border-radius:var(--radius-lg);
+    padding:var(--space-3) var(--space-4);margin-bottom:var(--space-4);font-size:.875rem;line-height:1.45;
+}
+#content .forms-skin .fm-flash-error{background:color-mix(in srgb,var(--fm-danger) 13%,transparent);border-color:color-mix(in srgb,var(--fm-danger) 32%,transparent);color:var(--fm-danger)}
+#content .forms-skin .fm-flash-success{background:color-mix(in srgb,var(--fm-success) 14%,transparent);border-color:color-mix(in srgb,var(--fm-success) 32%,transparent);color:var(--fm-success)}
+#content .forms-skin .fm-flash-warning{background:color-mix(in srgb,var(--fm-warning) 16%,transparent);border-color:color-mix(in srgb,var(--fm-warning) 36%,transparent);color:var(--fm-warning)}
+#content .forms-skin .fm-flash-info{background:color-mix(in srgb,var(--fm-info) 13%,transparent);border-color:color-mix(in srgb,var(--fm-info) 32%,transparent);color:var(--fm-info)}
+
+/* delete form: sits inline (the actions/detail context owns spacing) */
+#content .forms-skin.fm-delete-form{display:inline-block;margin:0}
+
+/* ═══════════════════════════ reader widget (rd_*) ═══════════════════════════
+   The shared READ/VIEW surface — the read-twin of fm_form. A header card (action bar + a
+   right-aligned back affordance, mirroring .fm-topbar) → title + status badges + meta rows →
+   a clutter-free prose body (.post) → optional footer. Scoped under .rd-view; component colours
+   stay UNLAYERED (only a catch-all a{} would belong in @layer app-fallback). */
+#content .rd-view{display:flex;flex-direction:column}
+#content .rd-topbar{display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap;margin-bottom:var(--space-4)}
+#content .rd-actions{display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap}
+#content .rd-topbar-right{display:flex;align-items:center;gap:var(--space-2);margin-left:auto}
+#content .rd-head h1{margin:0}
+#content .rd-badges{display:inline-flex;flex-wrap:wrap;gap:var(--space-1);margin-top:var(--space-2)}
+#content .rd-meta{display:flex;flex-direction:column;gap:var(--space-1);margin-top:var(--space-2)}
+#content .rd-meta-label{font-weight:600}
+#content .rd-foot{margin-top:var(--space-4)}
+/* a POST action in the reader's action bar (Delete/Archive): the inline <form> sits flush in the
+   flex row like a button, no default block margin. */
+#content .rd-actions .rd-action-form{display:inline-flex;margin:0}
+
+
+/* ===================================================================
+   modals.css
+   =================================================================== */
+/* modals.css — the Filament 5 "skin" for the shared SSR modal shell (modals.mix).
+ *
+ * Plan of record: _plan/2026-06-17-modals-widget.md (§6).
+ * Visual target: Filament 5 Modals (filamentphp.com/docs; screenshots deleted 2026-07-23, git history — ANATOMY only, never its
+ * palette: Filament amber → the DCS --accent / --danger / --warning tokens).
+ *
+ * SCOPING — unlike forms.css/datatable.css (which scope under `#content .X-skin`), this
+ * sheet self-scopes on the dialog's own class `.md-modal`. A <dialog> opened with
+ * showModal() is a TOP-LAYER element whose ::backdrop may not inherit custom properties,
+ * so the --md-* aliases live on `.md-modal` (reading the :root globals, available
+ * document-wide) and the ::backdrop uses a LITERAL scrim. This is inherently opt-in:
+ * `.md-modal` only exists when a handler calls md_modal(). (Mirrors the datatable's
+ * dual-selector + hex-fallback defence for `.dt-modal`.) Inner fm_* fields are skinned by
+ * forms.css because the dialog carries `forms-skin` AND stays a #content DOM descendant.
+ */
+
+/* ───────────────────────────── tokens ───────────────────────────── */
+.md-modal{
+    --md-card:   var(--bg-primary, #ffffff);
+    --md-text:   var(--fg-primary, #11181c);
+    --md-muted:  var(--fg-muted, #5b6b79);
+    --md-border: var(--border-muted, #e6e8eb);
+    --md-accent: var(--accent, #2f6feb);
+    --md-accent-fg: var(--accent-fg, #ffffff);
+    --md-danger: var(--danger, #e5484d);
+    --md-warning:var(--warning, #d9a000);
+    --md-success:var(--success, #30a46c);
+    --md-info:   var(--info, #2f6feb);
+    --md-r:      var(--radius-xl, 1rem);
+    --md-rm:     var(--radius-lg, .75rem);
+}
+
+/* ───────────────────────────── dialog + backdrop ───────────────────────────── */
+/* Centered EXPLICITLY (fixed + translate) rather than via the UA dialog margin:auto,
+   which is unreliable for a fixed-width / auto-height panel across engines. The open
+   animation lives on .md-panel so it never fights this centering transform. */
+.md-modal{
+    position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+    margin:0;padding:0;border:0;background:transparent;color:var(--md-text);
+    width:min(92vw,32rem);max-width:none;max-height:90vh;overflow:visible;
+}
+.md-modal::backdrop{ background:var(--overlay); }
+@supports (backdrop-filter:blur(2px)){ .md-modal::backdrop{ backdrop-filter:blur(2px); } }
+
+.md-modal .md-panel{
+    display:flex;flex-direction:column;max-height:90vh;overflow:hidden;position:relative;
+    background:var(--md-card);color:var(--md-text);
+    border:1px solid var(--md-border);border-radius:calc(var(--md-r) + .25rem);
+    box-shadow:var(--shadow-modal);
+}
+.md-modal .md-form{display:flex;flex-direction:column;min-height:0;max-height:90vh}
+
+/* sizes — explicit WIDTH (content fills) so the panel is a fixed width, not shrink-to-fit */
+.md-modal.md-sz-sm{width:min(92vw,22rem)}
+.md-modal.md-sz-md{width:min(92vw,32rem)}
+.md-modal.md-sz-lg{width:min(93vw,44rem)}
+.md-modal.md-sz-xl{width:min(94vw,56rem)}
+.md-modal.md-sz-2xl{width:min(95vw,70rem)}
+/* the site-wide form confirm dialog (shell.html shim): compact, danger Confirm */
+.md-modal.cms-confirm{width:min(92vw,24rem)}
+
+/* ───────────────────────────── header ───────────────────────────── */
+.md-modal .md-head{position:relative;padding:var(--space-5) var(--space-5);flex:none}
+.md-modal .md-title{margin:0;font-size:1.125rem;font-weight:700;letter-spacing:-.01em;color:var(--md-text)}
+.md-modal .md-sub{margin:var(--space-1) 0 0;font-size:.875rem;line-height:1.45;color:var(--md-muted)}
+.md-modal .md-head-text{padding-right:var(--space-8)}  /* room for the close X */
+
+.md-modal .md-close{
+    position:absolute;top:var(--space-3);right:var(--space-4);display:inline-flex;align-items:center;justify-content:center;
+    width:var(--space-8);height:var(--space-8);padding:0;border:0;background:transparent;color:var(--md-muted);
+    cursor:pointer;border-radius:var(--radius-full);transition:background .14s ease,color .14s ease;
+}
+.md-modal .md-close:hover{color:var(--md-text);background:var(--md-border)}
+.md-modal .md-close svg{width:var(--space-5);height:var(--space-5);flex:none}
+
+/* confirm header — centered icon-circle + heading + description */
+.md-modal.md-confirm .md-head{text-align:center;padding-top:var(--space-7)}
+.md-modal .md-icon{
+    display:inline-flex;align-items:center;justify-content:center;
+    width:3rem;height:3rem;border-radius:var(--radius-full);margin:0 auto var(--space-3);
+}
+.md-modal .md-icon svg{width:1.5rem;height:1.5rem;flex:none}
+.md-modal .md-icon-danger{background:color-mix(in srgb,var(--md-danger) 14%,transparent);color:var(--md-danger)}
+.md-modal .md-icon-warning{background:color-mix(in srgb,var(--md-warning) 18%,transparent);color:var(--md-warning)}
+.md-modal .md-icon-success{background:color-mix(in srgb,var(--md-success) 16%,transparent);color:var(--md-success)}
+.md-modal .md-icon-info{background:color-mix(in srgb,var(--md-info) 14%,transparent);color:var(--md-info)}
+.md-modal .md-icon-primary{background:color-mix(in srgb,var(--md-accent) 14%,transparent);color:var(--md-accent)}
+.md-modal.md-confirm .md-title{font-size:1.25rem}
+
+/* ───────────────────────────── body ───────────────────────────── */
+/* The body is a flex COLUMN with a gap, so EVERY top-level item — bare fm_* fields AND
+   fm_grid rows alike — is spaced uniformly. Replaces the old `.fm-field + .fm-field
+   {margin-top}` rule, which only spaced adjacent FIELDS (not grid rows) and leaked into
+   grid columns (the row-misalignment bug). Hidden inputs are display:none → not flex items
+   → no phantom gap; a single-field body (media upload) has nothing to gap. Reads the SAME
+   --fm-row-gap as the canvas form's fm_grid, so modal and full-page field spacing are one
+   value (the dialog carries .forms-skin, where the var is defined; the fallback covers a
+   non-forms-skin modal). */
+.md-modal .md-body{padding:0 var(--space-5) var(--space-5);overflow:auto;flex:1 1 auto;min-height:0;display:flex;flex-direction:column;gap:var(--fm-row-gap,var(--space-3))}
+.md-modal.md-confirm .md-body:empty{display:none}
+/* a confirm modal's heading/desc live in the header, so its body is usually empty;
+   when present, center it to match. */
+.md-modal.md-confirm .md-body{text-align:center}
+
+/* ───────────────────────────── footer ───────────────────────────── */
+.md-modal .md-foot{display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap;padding:var(--space-4) var(--space-5);flex:none}
+/* A lone [Done] footer button (Title/Type/Media dialogs): push it to the bottom-RIGHT. */
+.md-modal .md-foot .md-done{margin-left:auto}
+.md-modal .md-foot-split{display:grid;grid-template-columns:1fr 1fr;gap:var(--space-3)}
+#content .md-modal .md-foot-split .btn{width:100%;padding-top:var(--space-3);padding-bottom:var(--space-3)}
+
+/* sticky variant — header/footer get separator lines, body scrolls between them
+   (the flex column already keeps header/footer fixed; this just adds the dividers). */
+.md-modal.md-sticky .md-head{border-bottom:1px solid var(--md-border)}
+.md-modal.md-sticky .md-foot{border-top:1px solid var(--md-border)}
+
+/* Buttons: modals use the site-wide unified `.btn` / `.btn-<variant>` system
+   (defined once near the top of this file; every dialog renders inside #content so
+   the #content-scoped rules reach it). No modal-specific button recipe. */
+
+/* ───────────────────────────── slide-over (forward-declared) ───────────────────────────── */
+/* re-anchor to the right edge, overriding the centered fixed+translate above */
+.md-modal.md-slideover{top:0;left:auto;right:0;transform:none;width:min(96vw,30rem);max-height:100vh;height:100vh;margin:0}
+.md-modal.md-slideover .md-panel{height:100vh;max-height:100vh;border-radius:0;border-top:0;border-bottom:0;border-right:0}
+
+/* ───────────────────────────── open animation ───────────────────────────── */
+/* animate the PANEL (not the dialog) so it never fights the centering transform. */
+@media (prefers-reduced-motion:no-preference){
+    .md-modal[open] .md-panel{animation:md-in .16s cubic-bezier(.2,.7,.3,1)}
+    .md-modal[open]::backdrop{animation:md-fade .16s ease}
+    .md-modal.md-slideover[open] .md-panel{animation:md-slide .2s cubic-bezier(.2,.7,.3,1)}
+}
+@keyframes md-in{from{opacity:0;transform:translateY(10px) scale(.985)}to{opacity:1;transform:none}}
+@keyframes md-fade{from{opacity:0}to{opacity:1}}
+@keyframes md-slide{from{transform:translateX(100%)}to{transform:none}}
+
+/* ── blog index cards (h_home blog-card feed) ───────────────────────────────
+   Horizontal post cards (cover left · title/date/excerpt right) rendered inside
+   the datatable shell (.blog-index .dt-card): the dt compact header (search) +
+   footer (pager) are reused; only the body is this bespoke card stack. Theme-aware
+   surfaces/accent so it sits in any dcs.spa scheme; the layout mirrors a classic
+   horizontal-card blog index. */
+/* Only VERTICAL padding here — .cms-wrap already owns the 1rem side gutter, so
+   horizontal padding would double it (2rem). Side gutter = the cms-wrap 1rem,
+   matching the 1rem between-card gap. */
+.blog-cards{display:flex;flex-direction:column;gap:var(--space-4);padding:var(--space-4) 0}
+.blog-card{display:flex;gap:0;align-items:stretch;background:var(--bg-secondary);border:1px solid var(--border-muted);border-radius:var(--radius-xl);overflow:hidden;text-decoration:none;color:inherit;transition:border-color .15s,transform .15s,box-shadow .15s}
+.blog-card:hover{border-color:var(--accent);transform:translateY(-2px);box-shadow:0 6px 24px var(--overlay)}
+.blog-card-media{flex:0 0 38%;max-width:20rem;min-height:11.25rem;background:var(--bg-tertiary)}
+.blog-card-media img{display:block;width:100%;height:100%;object-fit:cover}
+.blog-card-body{flex:1 1 auto;min-width:0;padding:var(--space-5) var(--space-6);display:flex;flex-direction:column;gap:var(--space-2)}
+.blog-card-title{margin:0;font-size:1.625rem;line-height:1.2;font-weight:700;color:var(--accent)}
+.blog-card-date{font-size:.875rem;color:var(--fg-muted)}
+.blog-card-excerpt{margin:0;color:var(--fg-muted);line-height:1.55;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
+@media (max-width:720px){
+    .blog-card{flex-direction:column}
+    .blog-card-media{flex-basis:auto;max-width:none;width:100%;height:12.5rem;min-height:0}
+}
+
+/* ── post-editor cover field + media-library picker (h_admin_posts) ───────── */
+.pp-cover{display:flex;align-items:flex-start;gap:var(--space-4)}
+.pp-cover-thumb{width:10rem;height:6.25rem;object-fit:cover;border-radius:var(--radius-md);background:var(--bg-tertiary);border:1px solid var(--border-muted)}
+.pp-cover-actions{display:flex;flex-direction:column;gap:var(--space-2)}
+.pp-cover-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(7.5rem,1fr));gap:var(--space-3);max-height:60vh;overflow:auto;padding:var(--space-1)}
+.pp-cover-pick{padding:0;border:2px solid transparent;border-radius:var(--radius-md);background:var(--bg-tertiary);cursor:pointer;overflow:hidden;aspect-ratio:4 / 3}
+/* Markdown live-preview split (post/page editor): markdown textarea | live preview pane.
+   flex-wrap so it's side-by-side when there's room and stacks cleanly in a narrow modal. The
+   preview (.md-preview, also .post for prose styling) re-renders via /admin/preview as you type. */
+#content .md-split{display:flex;flex-direction:column;gap:var(--space-4)}
+#content .md-split-edit,#content .md-split-preview{min-width:0}
+/* Preview pane: HIDDEN by default — the body is the whole canvas and [View] shows the
+   rendered article. It returns ONLY in Wide width-mode, where Body | Preview go 50/50
+   (the html.wide .md-split → row rule below). */
+#content .md-split-preview{display:none}
+html.wide #content .pp-editor .md-split-preview{display:block}
+/* Width-mode responsive: STACKED by default (preview BELOW, normally hidden); in the canvas
+   editor's Wide mode (html.wide → --content-max:none) Body | Preview go 50/50 side-by-side
+   as EQUAL-HEIGHT panels that fill the viewport. Scoped to .pp-editor. */
+html.wide #content .pp-editor .md-split{flex-direction:row;align-items:stretch;height:calc(100vh - 13rem)}
+html.wide #content .pp-editor .md-split-edit,html.wide #content .pp-editor .md-split-preview{flex:1 1 0;min-height:0;display:flex;flex-direction:column}
+/* Both panels grow to fill their column's full height; the "Preview" label is dropped in
+   Wide (the two side-by-side panels are self-evident). */
+html.wide #content .pp-editor .md-split-edit .fm-control{flex:1 1 auto;min-height:0;height:auto}
+html.wide #content .pp-editor .md-split-preview .fm-label{display:none}
+html.wide #content .pp-editor .md-preview{flex:1 1 auto;min-height:0;max-height:none}
+/* Small screen with Wide still selected: collapse the 50/50 back to a stacked column. */
+@media (max-width:640px){
+    html.wide #content .pp-editor .md-split{flex-direction:column;height:auto}
+}
+#content .md-split-edit textarea{min-height:24rem}
+/* Edit canvas fills down to the content footer in Narrow/Normal too (Wide already fills via the
+   .md-split row rule above): the body textarea grows to ~the viewport minus the chrome, so there's
+   no dead space below it. ~13rem ≈ topnav + the .pp-bar toolbar + footer + .pp-ed gaps (matches the
+   Wide calc); the user can still grow it further. */
+html:not(.wide) #content .pp-editor .md-split-edit textarea{min-height:calc(100vh - 13rem)}
+/* Editor body textarea: roomier space-4 padding to match the preview pane (symmetric
+   Edit/Preview panels). Scoped to the editor body — NOT the global .fm-control (which is
+   every input in every form); the 3-class selector outranks `.forms-skin .fm-control`. */
+#content .pp-editor .md-split-edit .fm-control{padding:var(--space-4)}
+#content .md-split-preview .fm-label{margin-bottom:var(--space-1)}
+#content .md-preview{border:1px solid var(--border-muted);border-radius:var(--radius-lg);padding:var(--space-4);min-height:24rem;max-height:32rem;overflow:auto;background:var(--bg-secondary)}
+#content .md-preview:empty::before{content:"Nothing to preview yet.";color:var(--fg-muted)}
+.pp-cover-pick:hover{border-color:var(--accent)}
+.pp-cover-pick img{display:block;width:100%;height:100%;object-fit:cover}
+
+/* ── toolbar post editor (pp-bar / pp-canvas / pp-view) — h_admin_posts, 2026-06-26 ──
+   The full-page editor is a top toolbar + a body-only canvas + four metadata DIALOGS;
+   [View]/[Edit] toggle .is-viewing on .pp-ed to swap the canvas for the rendered article.
+   The metadata fields live in md-* modals, so the only canvas-level rule is the body split
+   (still .pp-editor → the Wide 50/50 md-split rule above keeps applying). */
+#content .pp-ed{display:flex;flex-direction:column;gap:var(--space-4)}
+/* The hidden delete form (#pp-edit-delete — only hidden inputs, submitted by the modal's Delete
+   button via form=) is a flex child of .pp-ed, so the column `gap` lands a stray 1rem BELOW the
+   editor (on top of the .cms-wrap 1rem padding → a doubled 2rem under the textarea). Take it out
+   of the flex flow so the spacing under the textarea is an even 1rem, matching the sides. It still
+   submits (a position:absolute form with hidden inputs is fully functional). */
+#content .pp-ed > .fm-delete-form{position:absolute}
+/* Buttons stay STANDARD size — only the gap between them is tightened so all seven hold one
+   row in Narrow width-mode (50vw). The seven buttons are ~671px wide; with the default
+   var(--space-2) gaps they tip a ~709px Narrow toolbar onto a 2nd row by a hair, so the gap
+   drops to var(--space-1). NB this fits because the buttons (671px) clear the Narrow column —
+   on a much narrower window (column < ~680px) standard buttons can't fit at any gap and will
+   wrap; the body's flex-wrap handles that gracefully. */
+#content .pp-bar{display:flex;align-items:center;justify-content:space-between;gap:var(--space-2) var(--space-1);flex-wrap:wrap}
+#content .pp-bar-left,#content .pp-bar-right{display:flex;align-items:center;gap:var(--space-1);flex-wrap:wrap}
+/* view/edit toggle: edit-only chrome hidden while viewing, view-only chrome hidden while editing. */
+#content .pp-ed .pp-view{display:none}
+#content .pp-ed:not(.is-viewing) .pp-view-only{display:none}
+#content .pp-ed.is-viewing .pp-edit-only{display:none}
+/* Posts [View]: hide the whole canvas, show the separate .pp-view. NOT for mail — the mail
+   composer's preview lives INSIDE the wb_canvas, so hiding .pp-canvas would hide it too; mail
+   toggles the wb-edit/wb-read panes instead (below). */
+#content .pp-ed:not(.mc-ed).is-viewing .pp-canvas{display:none}
+#content .pp-ed.is-viewing .pp-view{display:block}
+/* Mail composer [View]/[Edit] — narrow/normal ONLY (Wide always shows both panes 50/50): swap the
+   edit textarea for the live rd_view preview, both inside the wb_canvas. Scoped to :not(.wide) so
+   it can't hide a pane in Wide (where the toggle buttons are hidden — the toggle is a no-op there). */
+html:not(.wide) #content .mc-ed.is-viewing .wb-edit{display:none}
+html:not(.wide) #content .mc-ed.is-viewing .wb-read{display:block}
+html.wide #content .mc-ed .pp-bar [data-mc-view],html.wide #content .mc-ed .pp-bar [data-mc-edit]{display:none}
+/* No "Preview" label on the mail composer's preview pane (the rendered message is self-evident),
+   and in View mode the preview pane fills down to the footer like the editor / the Wide preview. */
+#content .mc-ed .md-split-preview .fm-label{display:none}
+html:not(.wide) #content .mc-ed.is-viewing .md-preview{min-height:calc(100vh - 13rem);max-height:none}
+/* The posts [View] preview fills the width-mode content column (like the public /post reader) —
+   no inner reading cap on top of the width mode, so it isn't over-padded. */
+#content .pp-view{max-width:none;margin-inline:auto;width:100%}
+#content .pp-view-title{margin:var(--space-2) 0 var(--space-3)}
+/* Type modal: the .pp-typed container's state class picks which group shows (pp_type_toggle_script
+   flips it on a #f-kind change) — replaces the per-element inline display:none. */
+#content .pp-typed-post .pp-when-page{display:none}
+#content .pp-typed-page .pp-when-post{display:none}
+/* media modal: the current cover thumb + actions sit in a row above the library grid. The
+   preview thumb + Remove button show only when .pp-has-cover is set (toggled by the picker
+   JS) — replaces the per-element inline display:none. */
+#content .pp-media-current{display:flex;align-items:flex-start;gap:var(--space-4)}
+#content .pp-media-current .pp-cover-thumb{display:none}
+#content .pp-media-current.pp-has-cover .pp-cover-thumb{display:block}
+#content .pp-media-current .pp-cover-clear{display:none}
+#content .pp-media-current.pp-has-cover .pp-cover-clear{display:inline-flex}
+#content .pp-cover-pick.is-selected{border-color:var(--accent)}
+
+/* ── mail composer (m_compose, /pim/mail?compose=1) — the SAME wb_canvas Workbench as the posts
+   editor (mail bodies are markdown): a markdown textarea | live rd_view preview. The .pp-editor
+   canvas + .pp-bar toolbar + the [View]/[Edit] toggle are shared; the body-fill + the wide 50/50
+   split come from the .pp-editor rules above. */
+/* Recipients modal: the read-only From caption above the fields. */
+#content .mc-from-line{margin:0 0 var(--space-1)}
+
+/* ═══════════════════ context menu (contextmenu.mix cm_*) — body-level floating ═══════════════════
+   NOT #content-scoped: the floating .cm-menu is appended to document.body (so it escapes
+   the sidebar's / panel's overflow clipping), and the right-click targets are SIDEBAR
+   clones that live outside #content. Uses ROOT theme tokens only (--bg-secondary /
+   --border / --shadow-popover / --accent / --danger / --fg-primary / --space-* /
+   --radius-*), all defined in base.css + site.css at :root. */
+.cm-template{display:none}
+.cm-menu{
+    position:fixed;z-index:9000;min-width:11rem;max-width:18rem;
+    background:var(--bg-secondary);border:1px solid var(--border);
+    border-radius:var(--radius-lg);box-shadow:var(--shadow-popover);
+    padding:var(--space-1);margin:0;
+    font-size:.875rem;line-height:1.2;color:var(--fg-primary);
+    -webkit-user-select:none;user-select:none;
+}
+.cm-menu ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:1px}
+.cm-menu .cm-li{position:relative}
+.cm-menu .cm-item{
+    display:flex;align-items:center;gap:var(--space-2);
+    padding:1px var(--space-3);border-radius:var(--radius-md);   /* §4.6 compact */
+    color:inherit;text-decoration:none;cursor:pointer;white-space:nowrap;outline:none;
+}
+.cm-menu .cm-item:hover,.cm-menu .cm-item:focus{background:color-mix(in srgb,var(--accent) 14%,transparent)}
+.cm-menu .cm-item:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.cm-menu .cm-ic{width:1rem;height:1rem;flex:none;opacity:.75}
+.cm-menu .cm-label{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis}
+.cm-menu .cm-caret{width:.85rem;height:.85rem;flex:none;opacity:.55;margin-left:var(--space-2)}
+.cm-menu .cm-danger{color:var(--danger)}
+.cm-menu .cm-danger:hover,.cm-menu .cm-danger:focus{background:color-mix(in srgb,var(--danger) 14%,transparent)}
+.cm-menu .cm-disabled{opacity:.4;cursor:default;pointer-events:none}
+.cm-menu .cm-sep{height:1px;margin:var(--space-1);background:var(--border)}
+/* submenu flyout: hidden until hover / keyboard focus-within on its .cm-li */
+.cm-menu .cm-submenu{
+    position:absolute;left:100%;top:calc(-1 * var(--space-1));min-width:10rem;max-width:16rem;
+    background:var(--bg-secondary);border:1px solid var(--border);
+    border-radius:var(--radius-lg);box-shadow:var(--shadow-popover);
+    padding:var(--space-1);display:none;
+}
+.cm-menu .cm-li:hover>.cm-submenu,
+.cm-menu .cm-li:focus-within>.cm-submenu{display:flex;flex-direction:column;gap:1px}
+/* near the right edge JS flips .cm-flip-left on the menu so flyouts open leftward */
+.cm-menu.cm-flip-left .cm-submenu{left:auto;right:100%}
+/* icon toolbar (cm_menu opts.toolbar): a horizontal row of icon-only buttons that REPLACES
+   the text rows when it fits — site.js adds .cm-has-toolbar (hide rows) and, as a secondary
+   overflow fallback, .cm-toolbar-off (restore rows). The @media breakpoint is the PRIMARY
+   responsive path: on a narrow viewport the toolbar is dropped for the (touch-friendly) rows.
+   Buttons are <a class="cm-item cm-tbtn"> so they inherit the item hover/focus/danger styles. */
+.cm-menu .cm-toolbar{display:flex;align-items:center;gap:var(--space-1);padding:var(--space-1);border-bottom:1px solid var(--border);margin-bottom:var(--space-1)}
+.cm-menu .cm-tbtn{flex:none;padding:var(--space-2)}
+.cm-menu .cm-tbtn .cm-ic{opacity:.85}
+.cm-menu.cm-has-toolbar .cm-menu-list{display:none}
+.cm-menu.cm-toolbar-off .cm-toolbar{display:none}
+.cm-menu.cm-toolbar-off .cm-menu-list{display:flex}
+@media (max-width:600px){
+    .cm-menu.cm-has-toolbar .cm-toolbar{display:none}
+    .cm-menu.cm-has-toolbar .cm-menu-list{display:flex}
+}
+
+/* folder Properties read-only definition list (contextmenu.mix → m_folder_props_body) */
+#content .cms-props{display:grid;grid-template-columns:auto 1fr;gap:var(--space-2) var(--space-4);margin:0;font-size:.875rem;align-items:baseline}
+#content .cms-props dt{font-weight:600;opacity:.6;white-space:nowrap}
+#content .cms-props dd{margin:0;color:inherit;word-break:break-word}
+
+/* ── threaded replies: forum discussion AND blog comments (thread.mix / rd_thread) ──── */
+/* ONE substrate, ONE skin. _plan/2026-06-28-unified-message-surfaces.md §5. */
+#content .th-thread{margin-top:var(--space-8);border-top:1px solid var(--border-muted);padding-top:var(--space-6)}
+#content .th-heading{font-size:1.125rem;margin:0 0 var(--space-4)}
+#content .th-heading .th-count{color:var(--fg-muted);font-weight:400}
+#content .th-list{display:flex;flex-direction:column;gap:var(--space-4)}
+#content .th-node{border:1px solid var(--border-muted);border-radius:var(--radius-lg);padding:var(--space-3) var(--space-4);background:var(--bg-secondary)}
+#content .th-meta{display:flex;align-items:baseline;gap:var(--space-2);font-size:.8125rem;margin-bottom:var(--space-2)}
+#content .th-author{font-weight:600}
+#content .th-date{color:var(--fg-muted)}
+#content .th-body{font-size:.9375rem}
+#content .th-actions{margin-top:var(--space-2)}
+#content .th-reply-link{font-size:.8125rem;color:var(--accent)}
+/* nested replies indent one step, with a quiet rail */
+#content .th-children{margin:var(--space-3) 0 0 var(--space-4);padding-left:var(--space-4);border-left:2px solid var(--border-muted);display:flex;flex-direction:column;gap:var(--space-3)}
+#content .th-form{margin-top:var(--space-6);display:flex;flex-direction:column;gap:var(--space-2)}
+#content .th-form-actions{display:flex;justify-content:flex-end}
+#content .th-replying{font-size:.8125rem;margin:0}
+#content .th-login,#content .th-empty{font-size:.875rem}
+
+/* ── forum board index + topic (h_forum.mix) ──────────────────────────────────────── */
+#content .forum-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--space-4)}
+#content .forum-new{margin-bottom:var(--space-6)}
+#content .forum-list{list-style:none;margin:var(--space-4) 0 0;padding:0;display:flex;flex-direction:column;gap:var(--space-1)}
+#content .forum-row{display:flex;flex-wrap:wrap;align-items:baseline;gap:var(--space-2);padding:var(--space-3) var(--space-4);border:1px solid var(--border-muted);border-radius:var(--radius-lg);background:var(--bg-secondary)}
+#content .forum-topic-link{font-weight:600}
+#content .forum-row-meta{color:var(--fg-muted);font-size:.8125rem;margin-left:auto}
+#content .forum-topic-head{display:flex;align-items:center;gap:var(--space-2);margin-bottom:var(--space-3)}
+
+
+
+/* ── Dolphin-style dual-pane file manager (/files, h_files.mix) ─────────────────────
+   Breeze-Dark skin scoped under .fm-app. base.css is blind-copied (never edited);
+   this is additive #content-scoped app CSS, like .datatable-skin / .forms-skin.
+   A vivid selection blue (Dolphin ~#3daee9) is the one new token, FM-local. */
+#content .fm-app{
+  --fm-selection: oklch(60% 0.15 240);
+  --fm-selection-fg: oklch(98% 0.01 240);
+  --fm-rail: var(--bg-secondary);
+  --fm-body: var(--bg-tertiary);
+  --fm-line: var(--border);
+  display:flex;flex-direction:column;gap:var(--space-2);
+  min-height:calc(100vh - var(--topnav-height) - 4rem);
+}
+/* Full-bleed: the FM ignores the .cms-wrap reading width and fills the content. */
+#content .cms-wrap:has(.fm-app){max-width:none;padding:var(--space-2)}
+
+/* Toolbar */
+#content .fm-toolbar{display:flex;align-items:center;gap:var(--space-1);padding:var(--space-1) var(--space-2);background:var(--fm-rail);border:1px solid var(--fm-line);border-radius:var(--radius-md)}
+#content .fm-tb{display:inline-flex;align-items:center;justify-content:center;width:var(--ctl-h);height:var(--ctl-h);border-radius:var(--radius-sm);color:var(--fg-secondary);border:1px solid transparent}
+#content .fm-tb:hover{background:var(--row-hover);color:var(--fg-primary)}
+#content .fm-tb i{width:1.1rem;height:1.1rem}
+#content .fm-tb-disabled{opacity:.35;pointer-events:none}
+#content .fm-tb-spacer{flex:1}
+#content .fm-active-label{font-size:.8125rem;color:var(--fg-muted);max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* Columns: panes (+ optional info rail) */
+#content .fm-cols{display:grid;grid-template-columns:1fr;gap:var(--space-2);flex:1;min-height:0}
+#content .fm-app.show-info .fm-cols{grid-template-columns:1fr 20rem}
+#content .fm-split{display:grid;grid-template-columns:1fr 1fr;gap:var(--space-2);min-height:0}
+
+/* A pane */
+#content .fm-pane{display:flex;flex-direction:column;min-height:0;background:var(--fm-body);border:1px solid var(--fm-line);border-radius:var(--radius-md);overflow:hidden}
+#content .fm-pane.fm-active{border-color:var(--fm-selection)}
+#content .fm-location{display:flex;align-items:center;flex-wrap:wrap;gap:.15rem;padding:var(--space-1) var(--space-2);background:var(--fm-rail);border-bottom:1px solid var(--fm-line);font-size:.8125rem;min-height:var(--ctl-h)}
+#content .fm-crumb{color:var(--accent);padding:.05rem .25rem;border-radius:var(--radius-sm)}
+#content .fm-crumb:hover{background:var(--row-hover);text-decoration:underline}
+#content .fm-crumb-sep{color:var(--fg-muted)}
+
+/* The detail list */
+#content .fm-list-wrap{flex:1;overflow:auto;min-height:0}
+#content table.fm-list{width:100%;border-collapse:collapse;font-size:.8125rem;table-layout:fixed}
+#content table.fm-list thead th{position:sticky;top:0;z-index:1;text-align:left;font-weight:600;color:var(--fg-secondary);background:var(--fm-rail);border-bottom:1px solid var(--fm-line);padding:.3rem var(--space-2);white-space:nowrap}
+#content .fm-col-size{width:7rem}
+#content .fm-col-mod{width:11rem}
+#content .fm-sort{display:inline-flex;align-items:center;gap:.2rem;color:inherit}
+#content .fm-sort:hover{color:var(--fg-primary)}
+#content .fm-arrow{width:.85rem;height:.85rem;color:var(--accent)}
+#content table.fm-list tbody tr{cursor:default}
+#content table.fm-list tbody td{padding:1px var(--space-2);border-bottom:1px solid color-mix(in oklch, var(--fm-line) 45%, transparent);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}   /* §4.6 compact */
+#content .fm-row:hover td{background:var(--row-hover)}
+#content .fm-row.selected td{background:var(--fm-selection);color:var(--fm-selection-fg)}
+#content .fm-row.selected .fm-namelink,#content .fm-row.selected .fm-items,#content .fm-row.selected .fm-bytes,#content .fm-row.selected .fm-time{color:var(--fm-selection-fg)}
+/* name cell = [indent][twist][namelink]. --fm-d (inline, per row depth) drives the
+   nested-folder indent; the twist is an expand button (dir) or a same-width spacer
+   (file) so names align under folders. */
+#content .fm-namewrap{display:flex;align-items:center;gap:.35rem;min-width:0;padding-inline-start:calc(var(--fm-d,0) * 1.05rem)}
+#content .fm-twist{flex:none;width:1.05rem;height:1.05rem;display:inline-flex;align-items:center;justify-content:center;padding:0;margin:0;border:0;background:none;color:var(--fg-muted);cursor:pointer;border-radius:var(--radius-sm)}
+#content .fm-twist:hover{background:var(--row-hover);color:var(--fg-primary)}
+#content .fm-twist svg{width:.8rem;height:.8rem;transition:transform var(--transition-fast,.15s ease)}
+#content .fm-twist[aria-expanded="true"] svg{transform:rotate(90deg)}
+#content .fm-twist-empty{cursor:default;pointer-events:none}
+#content .fm-namelink{display:flex;align-items:center;gap:.35rem;min-width:0;flex:1;color:var(--fg-primary)}
+#content .fm-namelink i{width:1rem;height:1rem;flex:none;color:var(--accent)}
+#content .fm-row.selected .fm-namelink i,#content .fm-row.selected .fm-twist{color:var(--fm-selection-fg)}
+#content .fm-rowchev{opacity:.7}
+#content .fm-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#content .fm-cell-size,#content .fm-cell-mod{color:var(--fg-muted)}
+#content .fm-items,#content .fm-bytes,#content .fm-time{font-variant-numeric:tabular-nums}
+#content .fm-muted{color:var(--fg-muted)}
+#content .fm-cap-note,#content .fm-pane-err{padding:var(--space-2);color:var(--fg-muted);font-size:.8125rem}
+
+/* Status + filter bars */
+#content .fm-status{display:flex;align-items:center;gap:.4rem;padding:.2rem var(--space-2);background:var(--fm-rail);border-top:1px solid var(--fm-line);color:var(--fg-muted);font-size:.78rem}
+#content .fm-filterbar{display:flex;align-items:center;gap:.4rem;padding:.2rem var(--space-2);background:var(--fm-rail);border-top:1px solid var(--fm-line)}
+#content .fm-lock{width:.9rem;height:.9rem;color:var(--fg-muted);flex:none}
+#content .fm-filter{flex:1;background:transparent;border:none;color:var(--fg-primary);font-size:.8125rem;padding:.15rem 0}
+#content .fm-filter:focus{outline:none}
+
+/* Information panel */
+#content .fm-info{background:var(--fm-rail);border:1px solid var(--fm-line);border-radius:var(--radius-md);padding:var(--space-3);overflow:auto;min-height:0}
+#content .fm-info-preview{display:flex;justify-content:center;padding:var(--space-4) 0}
+#content .fm-info-icon{width:4rem;height:4rem;color:var(--accent)}
+#content .fm-info-name{text-align:center;font-weight:600;word-break:break-word;margin-bottom:var(--space-3)}
+#content .fm-info-meta{display:grid;grid-template-columns:auto 1fr;gap:.25rem var(--space-3);font-size:.8125rem;margin:0}
+#content .fm-info-meta dt{color:var(--fg-muted)}
+#content .fm-info-meta dd{margin:0;color:var(--fg-primary);overflow-wrap:anywhere}
+#content .fm-info-text{margin-top:var(--space-3);padding:var(--space-2);background:var(--fm-body);border:1px solid var(--fm-line);border-radius:var(--radius-sm);font-size:.75rem;max-height:20rem;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
+#content .fm-info-note,#content .fm-info-empty{margin-top:var(--space-3);color:var(--fg-muted);font-size:.8125rem}
+
+/* Places sidebar marker (read-only place → the lock dot, reusing nav-lock styling) */
+#content .fm-unavailable{padding:var(--space-8) var(--space-4);text-align:center}
+
+/* Narrow screens: stack the panes */
+@media (max-width:60rem){
+  #content .fm-split{grid-template-columns:1fr}
+  #content .fm-app.show-info .fm-cols{grid-template-columns:1fr}
+}
+
+/* FM write-op toolbar additions (S3) */
+#content .fm-tb-sep{width:1px;align-self:stretch;margin:.25rem .35rem;background:var(--fm-line)}
+#content .fm-tb-danger:hover{background:color-mix(in oklch, var(--danger) 18%, transparent);color:var(--danger)}
+#content .fm-op-form{display:none}
+#content table.fm-list tbody tr{user-select:none}
+
+/* FM Trash place (S4) */
+#content .fm-inline-form{display:inline}
+#content .fm-trash-app{padding:0}
+#content .fm-trash-list{flex:1;overflow:auto;background:var(--fm-body);border:1px solid var(--fm-line);border-radius:var(--radius-md)}
+#content .fm-trash-list table.fm-list thead th{padding:.4rem var(--space-3)}
+#content .fm-trash-list td{padding:1px var(--space-3)}   /* §4.6 compact */
+#content .fm-trash-act{text-align:right}
+
+/* FM drag-and-drop between panes (+ Dolphin-style drop menu) */
+#content table.fm-list tbody tr.fm-dragging{opacity:.45}
+#content .fm-pane.fm-drop-active{outline:2px dashed var(--fm-selection);outline-offset:-2px}
+#content table.fm-list tbody tr.fm-drop-into td{background:color-mix(in oklch, var(--fm-selection) 28%, transparent)}
+.fm-dropmenu{position:fixed;z-index:1000;min-width:9rem;display:flex;flex-direction:column;padding:.25rem;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius-md);box-shadow:var(--shadow-popover)}
+.fm-dropmenu button{display:flex;align-items:center;gap:.45rem;width:100%;text-align:left;padding:.35rem .55rem;background:transparent;border:none;border-radius:var(--radius-sm);color:var(--fg-primary);font-size:.8125rem;cursor:pointer}
+.fm-dropmenu button:hover{background:var(--fm-selection);color:var(--fm-selection-fg)}
+.fm-dropmenu button i{width:1rem;height:1rem}
+.fm-dropmenu button[data-act=cancel]{color:var(--fg-muted);border-top:1px solid var(--border);margin-top:.15rem;padding-top:.4rem}
+#content .fm-dropmenu button.fm-menu-danger{color:var(--danger)}
+.fm-dropmenu button.fm-menu-danger:hover{background:var(--danger);color:#fff}
+
+/* FM Information panel — now in the RHS sidebar (outside #content, so its own rules) */
+#content .fm-app > .fm-split{flex:1}
+.fm-info-side{font-size:.8125rem;line-height:1.5;padding:var(--space-3) var(--space-4)}
+.fm-info-side .fm-info-preview{display:flex;justify-content:center;padding:var(--space-3) 0}
+.fm-info-side .fm-info-icon{width:3.5rem;height:3.5rem;color:var(--accent)}
+.fm-info-side .fm-info-name{text-align:center;font-weight:600;word-break:break-word;margin-bottom:var(--space-3)}
+.fm-info-side .fm-info-meta{display:grid;grid-template-columns:auto 1fr;gap:.2rem var(--space-2);margin:0}
+.fm-info-side .fm-info-meta dt{color:var(--fg-muted)}
+.fm-info-side .fm-info-meta dd{margin:0;overflow-wrap:anywhere}
+.fm-info-side .fm-info-text{margin-top:var(--space-3);padding:var(--space-2);background:var(--bg-tertiary);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:.72rem;max-height:16rem;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
+.fm-info-side .fm-info-empty,.fm-info-side .fm-info-note{color:var(--fg-muted);padding:var(--space-2) 0}
+.fm-info-side .fm-bytes,.fm-info-side .fm-time{font-variant-numeric:tabular-nums}
+
+/* A canvas page that ships its own .footer-main (the marketing footer) suppresses
+   the shell's one-line .cms-footer — otherwise the front page renders two footers.
+   Lives HERE (unlayered, after the .cms-footer{display:flex} rule above) because a
+   layered display:none in site.css loses to that unlayered display:flex. */
+.cms-wrap:has(.footer-main) + .cms-footer { display: none; }
+
+/* Canvas-layout component link colours (cascade contract §4.4: a component's OWN
+   colour must be UNLAYERED to beat the @layer app-fallback `#content a` accent —
+   the site-components copies of these rules lose to that later-declared layer).
+   Without these the hero title, CTA text and icon-list links all render accent. */
+/* Hero titles must also escape the generic `#content h1{font-size:2rem}` cap near
+   the top of this file — the layered site.css sizes (.hero-bg clamp / .hero-card
+   --text-6xl) silently lose to it, rendering the wordmark smaller than its own h2.
+   Unlayered here for the same reason as the colour rules below. */
+#content .hero-bg h1{font-size:clamp(3rem,2rem + 6vw,7rem);font-weight:800;line-height:1.05}
+#content .hero-card h1{font-size:var(--text-6xl);font-weight:800}
+#content .hero-card h1 a{color:var(--fg-primary)}
+#content .hero-card h1 a:hover{text-decoration:none}
+#content .hero-bg h1 a{color:#fff}
+#content .hero-bg h1 a:hover{text-decoration:none}
+#content .cta-btn.primary{color:var(--accent-fg)}
+/* Two grounds, two colours — mirroring the site.css split. The OPAQUE-ground arm has
+   to be unlayered as well: a single unconditional `color:#fff` here defeated the
+   layered site.css `--fg-primary` no matter its specificity, so a secondary CTA on a
+   .content-section stayed white on a 96%-L ground (invisible, and invisible on hover
+   at 92% too). The image-ground arm keeps #fff and wins on specificity within this
+   same unlayered tier. */
+#content .cta-btn.secondary{color:var(--fg-primary)}
+#content .hero-bg .cta-btn.secondary,#content .bg-image-section .cta-btn.secondary,#content .hero-canvas .cta-btn.secondary{color:#fff}
+#content .cta-btn:hover{text-decoration:none}
+#content .icon-list li > a{color:var(--fg-secondary);text-decoration:none}
+#content .icon-list a:hover{color:var(--accent);text-decoration:none}
+#content .footer-col .contact-line a{color:var(--fg-secondary)}
+#content .footer-col .contact-line a:hover{color:var(--accent);text-decoration:none}
+
+/* ── Synergy Wholesale ops page (/biz/sw) ─────────────────────────── */
+#content .sw-lookup-form{display:flex;gap:var(--space-2);align-items:center;margin:0}
+#content .sw-lookup-input{flex:1;min-width:0}
+#content .sw-lookup-form .btn{white-space:nowrap}
+#content .sw-lookup-result:empty{display:none}
+#content .sw-lookup-result{margin-top:var(--space-4)}
+#content .sw-card{margin-top:var(--space-4)}
+#content .sw-card:first-child{margin-top:0}
+#content .sw-card h3{margin:0 0 var(--space-3)}
+#content .sw-whois{width:100%;border-collapse:collapse}
+#content .sw-whois th{text-align:left;white-space:nowrap;padding:var(--space-1) var(--space-4) var(--space-1) 0;font-weight:600;opacity:.7;vertical-align:top}
+#content .sw-whois td{padding:var(--space-1) 0;vertical-align:top}
+#content .sw-balance-big{font-size:2rem;font-weight:700;margin:0 0 .2em}
+#content .sw-badge{display:inline-block;margin-left:.5em;padding:.08em .55em;border-radius:var(--radius-lg);font-size:.6em;font-weight:600;vertical-align:middle;letter-spacing:.01em;text-transform:uppercase}
+#content .sw-badge.ok,#content .sw-badge.avail{background:color-mix(in srgb,var(--accent) 15%,transparent);color:var(--accent)}
+#content .sw-badge.taken{background:color-mix(in srgb,var(--danger) 15%,transparent);color:var(--danger)}
+
+/* ── detail-page Foundation (dv_*) — _doc/2026-07-12-webd-foundations.md (§ Detail pages).
+   The kit OWNS these neutral classes (never rides biz-* semantics). 1px
+   vertical padding per the compact-density rule (per-rule, no globals). */
+#content .dv-kv{width:100%;border-collapse:collapse}
+#content .dv-kv th{text-align:left;color:var(--fg-muted);font-weight:500;white-space:nowrap;padding:1px var(--space-4) 1px 0;width:1%;vertical-align:top}
+#content .dv-kv td{padding:1px 0;vertical-align:top}
+#content .dv-head{display:flex;align-items:center;justify-content:space-between;gap:var(--space-4);flex-wrap:wrap}
+/* one-button inline action form (fm_mini_form) — sits inline in a cell/row */
+#content .fm-mini-form{display:inline-block;margin:0}
+
+/* ── /tools — the toolsd run modal (Shwho/whois/dig) ────────────────────────────
+   The output is RAW CLI text: monospace, preserved whitespace, its own scroll
+   container so a long whois never widens the dialog. It is written with
+   textContent (never innerHTML), so it is escaped exactly once and is never
+   reinterpreted as HTML/ANSI/Markdown. */
+.md-modal .md-head-row{display:flex;align-items:center;justify-content:space-between;gap:var(--space-4);padding-right:var(--space-8)}
+.tools-status{display:flex;align-items:center;gap:var(--space-2);font-size:.875rem;color:var(--md-muted);margin-bottom:var(--space-3)}
+.tools-status.tools-ok{color:var(--ok,#16a34a)}
+.tools-status.tools-err{color:var(--danger,#dc2626)}
+.tools-spinner{
+    display:inline-block;width:.85em;height:.85em;flex:none;
+    border:2px solid currentColor;border-right-color:transparent;border-radius:var(--radius-full);
+    animation:tools-spin .7s linear infinite;
+}
+/* the run is finished — the spinner is meaningless, so it goes */
+.tools-status.tools-ok .tools-spinner,.tools-status.tools-err .tools-spinner{display:none}
+@keyframes tools-spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.tools-spinner{animation:none}}
+.tools-output{
+    margin:0;padding:var(--space-3);min-height:6rem;max-height:60vh;overflow:auto;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.8125rem;line-height:1.5;
+    white-space:pre;tab-size:4;
+    background:var(--surface-2,#0b0b0c0a);color:var(--md-text);
+    border:1px solid var(--border,#8883);border-radius:var(--radius-md,6px);
+}
+.tools-output:empty::before{content:"…";color:var(--md-muted)}
+
+/* Landing wordmark — the site_title setting rendered as markup, same as the header brand
+   ({{BRAND}}). The <span> takes the accent colour exactly as `.topnav .brand span` does,
+   so the landing card and the top nav read as one wordmark. */
+#content .site-brand{margin-top:0;font-family:var(--font-heading);font-weight:800;color:var(--fg-primary)}
+#content .site-brand span{color:var(--accent)}

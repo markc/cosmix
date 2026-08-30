@@ -1,0 +1,73 @@
+# CosMix — one workspace for the whole substrate.
+#
+# Dependency direction inside this workspace is bus ← mix ← cos, enforced by
+# the crate graph itself (cargo refuses cycles); the crates are flat under
+# crates/ and reach each other with `path = "../<crate>"`.
+#
+#   cosmix-lib-bus, -client, -buildinfo, -log, -props-core   the Bus family (was markc/bus)
+#   cosmix-lib-mix, cosmix-mix, mix-bench                    the Mix language (was markc/mix)
+#   everything else                                           substrate libs + daemons (was markc/cos)
+#
+# The desktop (Bevy compositor, ctk, apps) is its OWN workspace at desktop/ —
+# it pins a different toolchain and carries a [patch.crates-io] section, both
+# of which are workspace-global, so it cannot be a member here. Build it with
+# `cargo build --manifest-path desktop/Cargo.toml` or `mix setup.mix --desktop`.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+# cosmix-foreman: development halted 2026-08-30 (see docs/cos/foreman.md); it is
+# excluded from the workspace rather than maintained — its tests are not a gate.
+exclude = ["desktop", "crates/cosmix-foreman"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/markc/cosmix"
+
+[workspace.metadata.cosmix]
+display-crates = []
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+metrics = "0.24"
+metrics-util = "0.18"
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
+clap = { version = "4", features = ["derive"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "http2", "charset", "rustls-tls"] }
+base64 = "0.22"
+bcrypt = "0.16"
+blake3 = "1"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+mimalloc = { version = "0.1", default-features = false }
+libc = "0.2"
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+wireguard-control = "1.7"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+mail-builder = "0.4"
+directories = "6"
+toml_cfg = { package = "toml", version = "0.8" }
+toml_edit = "0.22"
+indexmap = "2"
+rusqlite = { version = "0.38", features = ["bundled"] }
+notify = { version = "7", default-features = false, features = ["macos_fsevent"] }
+hickory-proto = { version = "0.25", default-features = false }
+arc-swap = "1"
+rustc-hash = "2"
+
+[profile.release]
+strip = true
+lto = "thin"

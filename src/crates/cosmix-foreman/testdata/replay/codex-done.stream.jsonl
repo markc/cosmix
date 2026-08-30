@@ -1,0 +1,6 @@
+{"record":"meta","version":1,"lane":"codex"}
+{"record":"line","after_ms":4,"stdout":"{\"type\":\"thread.started\",\"thread_id\":\"fixture-codex-done\"}"}
+{"record":"line","after_ms":2,"stdout":"{\"type\":\"turn.started\"}"}
+{"record":"line","after_ms":6,"stdout":"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"fixture answer\"}}"}
+{"record":"line","after_ms":8,"stdout":"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"cached_input_tokens\":5,\"output_tokens\":7}}"}
+{"record":"exit","code":0,"signal":null}

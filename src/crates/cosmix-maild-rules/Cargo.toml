@@ -1,0 +1,51 @@
+[package]
+name = "cosmix-maild-rules"
+version = "0.2.2"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic rule engine — second stage of cosmix-maild's inbound DATA filter pipeline"
+
+[lib]
+name = "cosmix_maild_rules"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cosmix-maild-rules-smoke"
+path = "src/bin/cosmix-maild-rules-smoke.rs"
+
+[features]
+default = ["core"]
+core = []
+# Production DNSBL lookup (hickory-resolver). Off under
+# --no-default-features so the rules crate stays standalone-clean.
+# The umbrella cosmix-citizen build pulls this in via `cosmix`.
+dnsbl = ["dep:hickory-resolver"]
+cosmix = ["dep:cosmix-lib-bus", "dep:cosmix-lib-client", "dnsbl"]
+
+[dependencies]
+cosmix-maild-auth = { path = "../cosmix-maild-auth" }
+mail-parser = "0.11"
+regex = "1"
+linkify = "0.10"
+glob = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Pure-interpreter dep for the `.conf.mix` serde bridge
+# (`from_conf_mix_str`). cosmix-lib-mix has no mesh/cos deps, so
+# maild-rules stays a core crate. See
+# `_doc/planned/2026-05-29-conf-mix-config-migration.md`.
+cosmix-lib-mix = { path = "../cosmix-lib-mix", features = ["serde"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"
+futures-util = { workspace = true }
+thiserror = "2"
+cosmix-lib-bus = { path = "../cosmix-lib-bus", optional = true }
+cosmix-lib-client = { path = "../cosmix-lib-client", features = ["native"], optional = true }
+# Matches the version pin already in cosmix-maild / cosmix-webd so the
+# workspace graph keeps a single hickory-resolver 0.25.x.
+hickory-resolver = { version = "0.25", features = ["tokio", "system-config"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

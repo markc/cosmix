@@ -1,0 +1,61 @@
+-- Expected output:
+-- expansion of ~/.ns/foo matches env(HOME) concat: true
+-- expansion of ~/ matches env(HOME) concat: true
+-- expansion of bare ~ matches env(HOME): true
+-- mid-string ~example.net stays literal: true
+-- mid-string a~b stays literal: true
+-- leading ~ followed by interpolation (not by /) stays literal: true
+-- escape via backslash keeps leading tilde literal: true
+-- concat after expansion preserves literal tail: true
+
+-- Note: label strings deliberately do NOT start with the bare characters
+-- "~/" because that would itself trigger expansion. The labels below are
+-- plain prose ("expansion of ...") to keep them literal. The actual
+-- expansion behaviour is exercised by $a / $c / $e / $f etc.
+
+$home = env("HOME")
+
+$a = "~/.ns/foo"
+$b = $home .. "/.ns/foo"
+print "expansion of ~/.ns/foo matches env(HOME) concat: " .. ($a == $b)
+
+$c = "~/"
+$d = $home .. "/"
+print "expansion of ~/ matches env(HOME) concat: " .. ($c == $d)
+
+-- Bare `~` (no trailing /) also expands.
+$e = "~"
+print "expansion of bare ~ matches env(HOME): " .. ($e == $home)
+
+-- Mid-string tilde stays literal. These existed in the codebase before the
+-- change (DNS zone tokens like "~example.com", "~bus", "~.") and MUST remain
+-- byte-identical to avoid silently changing meaning.
+$f = "~example.net"
+print "mid-string ~example.net stays literal: " .. ($f == "\~example.net")
+
+$g = "a~b"
+print "mid-string a~b stays literal: " .. ($g == "a~b")
+
+-- Interaction with ${var} interpolation after the tilde: the rule is
+-- narrow on purpose — only `~/` or bare `~` expand. `~${var}` stays
+-- literal so future scripts don't get surprise expansion in template
+-- strings that happen to start with `~${something}`.
+$sub = "/.config"
+$h = "~${sub}"
+print "leading ~ followed by interpolation (not by /) stays literal: " .. ($h == "\~/.config")
+
+-- Backslash escape gives a literal leading tilde (escape hatch for the
+-- rare case where a script genuinely wants "~/foo" as a literal string).
+-- The expected value is built from an independently-sourced literal `~`
+-- (left("~example.net", 1) plucks the leading `~` from a mid-string source
+-- that has never been touched by the escape mechanism) so the assertion
+-- catches a bug where the escape silently no-ops.
+$j = "\~/foo"
+$expected = left("~example.net", 1) .. "/foo"
+print "escape via backslash keeps leading tilde literal: " .. ($j == $expected)
+
+-- Concat after expansion: literal piece carries through.
+$tail = ".ns"
+$k = "~/" .. $tail
+$l = $home .. "/" .. $tail
+print "concat after expansion preserves literal tail: " .. ($k == $l)

@@ -1,0 +1,203 @@
+-- h_biz_dash.mix — billing dashboard (GET /biz). Admin-only, read-only.
+-- Stat tiles (outstanding / overdue / active services / domains / credit) over
+-- attention tables: overdue + due-soon invoices, domains expiring 60d, services
+-- with a lapsed next_due (unpaid renewals), failed/pending jobs, recent payments.
+-- All money INTEGER cents via fmt_aud; all date math via biz_today/biz_date_add
+-- (ISO strings compare safely). One bound query per number; customer names are
+-- prefetched once into a map.
+--   GET /biz → dashboard (no POST actions; everything links into /biz/* pages)
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+include "/opt/cosmix/vhosts/shared/apps/biz.mix"
+
+-- Customer display name from the prefetched id→name map ("#id" if unknown).
+function bd_name($names, $cid)
+  $k = "" .. $cid
+  if has_key($names, $k) then
+    return esc($names[$k])
+  end
+  return "#" .. esc($k)
+end
+
+-- Invoice-number link into the invoices page.
+function bd_inv_link($id)
+  return '<a href="/biz/invoices?view=' .. url_encode("" .. $id) .. '">INV-' .. esc("" .. $id) .. '</a>'
+end
+
+-- One stat tile. $value is trusted pre-built HTML (fmt_aud/count); $valcls adds
+-- e.g. " text-danger"; $sub ("" = none) is a trusted small line under the value.
+function bd_tile($label, $value, $sub, $valcls)
+  $h = '<div class="card"><div class="muted small">' .. esc($label) .. '</div>'
+  $h = $h .. '<div class="text-2xl' .. $valcls .. '"><strong>' .. $value .. '</strong></div>'
+  if $sub != "" then
+    $h = $h .. '<div class="muted small">' .. $sub .. '</div>'
+  end
+  return $h .. '</div>'
+end
+
+-- Card wrapper for a dashboard table section. $inner is trusted handler HTML.
+function bd_card($title, $inner)
+  return '<div class="card"><h2>' .. esc($title) .. '</h2>' .. $inner .. '</div>'
+end
+
+-- Shared invoice-table shape for the overdue and due-soon sections. Each row
+-- carries a SQL-computed integer `days` column; $dayshdr labels it.
+function bd_inv_table($rows, $names, $dayshdr, $dayscls)
+  if length($rows) == 0 then
+    return '<p class="muted small">None.</p>'
+  end
+  $h = '<table><tr><th>Invoice</th><th>Customer</th><th>Due</th><th class="text-right">' .. esc($dayshdr) .. '</th><th class="text-right">Total</th></tr>'
+  for each $r in $rows
+    $h = $h .. '<tr><td>' .. bd_inv_link($r.id) .. '</td><td>' .. bd_name($names, $r.customer_id) .. '</td>'
+    $h = $h .. '<td class="muted small">' .. esc("" .. $r.due) .. '</td>'
+    $h = $h .. '<td class="text-right' .. $dayscls .. '">' .. esc("" .. $r.days) .. '</td>'
+    $h = $h .. '<td class="text-right">' .. fmt_aud($r.total_cents) .. '</td></tr>'
+  end
+  return $h .. '</table>'
+end
+
+function biz_dash_main()
+cms_init()
+biz_init()
+$user = current_user($HEADERS)
+if md_is_modal_request() and $user == nil then
+  return md_session_expired("/biz")
+end
+$deny = require_role($user, "admin")
+if $deny != nil then
+  return $deny
+end
+
+$today = biz_today()
+$soon = biz_date_add($today, "+14 days")
+$exp60 = biz_date_add($today, "+60 days")
+
+-- ── stat numbers (one bound query each) ──
+$out = db_query("SELECT COUNT(*) AS c, COALESCE(SUM(total_cents), 0) AS s FROM invoices WHERE status = 'open'", [])
+$ovr = db_query("SELECT COUNT(*) AS c, COALESCE(SUM(total_cents), 0) AS s FROM invoices WHERE status = 'open' AND due < ?1", [$today])
+$svc = db_query("SELECT COUNT(*) AS c, COALESCE(SUM(price_cents), 0) AS s FROM services WHERE status = 'active'", [])
+$dom = db_query("SELECT COUNT(*) AS c FROM domains WHERE status = 'active' AND category != 'dead'", [])
+$cred = db_query("SELECT COALESCE(SUM(delta_cents), 0) AS s FROM credit_ledger", [])
+
+-- ── attention lists ──
+$ovr_rows = db_query("SELECT id, customer_id, due, total_cents,
+                      CAST(julianday(?1) - julianday(due) AS INTEGER) AS days
+                      FROM invoices WHERE status = 'open' AND due < ?1
+                      ORDER BY due LIMIT 20", [$today])
+$soon_rows = db_query("SELECT id, customer_id, due, total_cents,
+                       CAST(julianday(due) - julianday(?1) AS INTEGER) AS days
+                       FROM invoices WHERE status = 'open' AND due >= ?1 AND due <= ?2
+                       ORDER BY due LIMIT 20", [$today, $soon])
+$dom_rows = db_query("SELECT id, customer_id, domain, expiry, auto_renew
+                      FROM domains WHERE status = 'active' AND category != 'dead' AND expiry IS NOT NULL AND expiry <= ?1
+                      ORDER BY expiry LIMIT 20", [$exp60])
+$flag_rows = db_query("SELECT id, customer_id, label, next_due
+                       FROM services WHERE status = 'active' AND next_due IS NOT NULL AND next_due < ?1
+                       ORDER BY next_due LIMIT 20", [$today])
+$job_rows = db_query("SELECT id, kind, service_id, domain_id, status, error, updated
+                      FROM jobs WHERE status IN ('failed', 'pending', 'running')
+                      ORDER BY updated DESC LIMIT 20", [])
+$txn_rows = db_query("SELECT id, invoice_id, customer_id, gateway, kind, amount_cents, at
+                      FROM transactions ORDER BY at DESC, id DESC LIMIT 15", [])
+
+-- customer names, once (small table; keyed by string id)
+$names = {}
+$crows = db_query("SELECT id, name FROM customers", [])
+for each $c in $crows
+  $names["" .. $c.id] = "" .. $c.name
+end
+
+-- ── tiles row ──
+$ovr_cls = ""
+if to_number($ovr[0].c) > 0 then
+  $ovr_cls = " text-danger"
+end
+$b = '<div class="cms-head"><h1>Billing</h1><a class="navlink" href="/biz/invoices">Invoices →</a></div>'
+$b = $b .. '<div class="grid grid-auto">'
+$b = $b .. bd_tile("Outstanding", fmt_aud($out[0].s), esc("" .. $out[0].c) .. " open invoices", "")
+$b = $b .. bd_tile("Overdue", fmt_aud($ovr[0].s), esc("" .. $ovr[0].c) .. " past due", $ovr_cls)
+$b = $b .. bd_tile("Active services", esc("" .. $svc[0].c), fmt_aud($svc[0].s) .. "/yr run-rate", "")
+$b = $b .. bd_tile("Active domains", esc("" .. $dom[0].c), "", "")
+if to_number($cred[0].s) != 0 then
+  $b = $b .. bd_tile("Credit held", fmt_aud($cred[0].s), "", "")
+end
+$b = $b .. '</div>'
+
+-- ── overdue / due-soon invoices ──
+$b = $b .. bd_card("Overdue invoices", bd_inv_table($ovr_rows, $names, "Days over", " text-danger"))
+$b = $b .. bd_card("Due within 14 days", bd_inv_table($soon_rows, $names, "Days left", ""))
+
+-- ── domains expiring within 60 days ──
+$t = '<p class="muted small">None.</p>'
+if length($dom_rows) > 0 then
+  $t = '<table><tr><th>Domain</th><th>Customer</th><th>Expiry</th><th>Auto-renew</th></tr>'
+  for each $d in $dom_rows
+    $ar = '<span class="tag">off</span>'
+    if to_number($d.auto_renew) == 1 then
+      $ar = '<span class="tag">on</span>'
+    end
+    $t = $t .. '<tr><td><a href="/biz/domains?view=' .. url_encode("" .. $d.id) .. '">' .. esc($d.domain) .. '</a></td>'
+    $t = $t .. '<td>' .. bd_name($names, $d.customer_id) .. '</td><td class="muted small">' .. esc("" .. $d.expiry) .. '</td><td>' .. $ar .. '</td></tr>'
+  end
+  $t = $t .. '</table>'
+end
+$b = $b .. bd_card("Domains expiring within 60 days", $t)
+
+-- ── services with a lapsed next_due (renewal unpaid) ──
+$t = '<p class="muted small">None.</p>'
+if length($flag_rows) > 0 then
+  $t = '<table><tr><th>Service</th><th>Customer</th><th>Next due</th></tr>'
+  for each $s in $flag_rows
+    $t = $t .. '<tr><td><a href="/biz/services?view=' .. url_encode("" .. $s.id) .. '">' .. esc($s.label) .. '</a></td>'
+    $t = $t .. '<td>' .. bd_name($names, $s.customer_id) .. '</td><td class="text-danger">' .. esc("" .. $s.next_due) .. '</td></tr>'
+  end
+  $t = $t .. '</table>'
+end
+$b = $b .. bd_card("Services flagged (renewal overdue)", $t)
+
+-- ── jobs needing attention (section only when any exist) ──
+if length($job_rows) > 0 then
+  $t = '<table><tr><th>Id</th><th>Kind</th><th>Target</th><th>Status</th><th>Error</th><th>Updated</th></tr>'
+  for each $j in $job_rows
+    $target = "—"
+    if $j.service_id != nil then
+      $target = "service #" .. $j.service_id
+    end
+    if $j.domain_id != nil then
+      $target = "domain #" .. $j.domain_id
+    end
+    $st = '<span class="tag">' .. esc($j.status) .. '</span>'
+    if ("" .. $j.status) == "failed" then
+      $st = '<span class="tag tag-danger">failed</span>'
+    end
+    $t = $t .. '<tr><td>' .. esc("" .. $j.id) .. '</td><td>' .. esc($j.kind) .. '</td><td>' .. esc($target) .. '</td>'
+    $t = $t .. '<td>' .. $st .. '</td><td class="muted small">' .. esc("" .. $j.error) .. '</td><td class="muted small">' .. esc("" .. $j.updated) .. '</td></tr>'
+  end
+  $t = $t .. '</table>'
+  $b = $b .. bd_card("Jobs (failed / pending)", $t)
+end
+
+-- ── recent transactions ──
+$t = '<p class="muted small">None yet.</p>'
+if length($txn_rows) > 0 then
+  $t = '<table><tr><th>At</th><th>Gateway</th><th>Customer</th><th class="text-right">Amount</th><th>Invoice</th></tr>'
+  for each $x in $txn_rows
+    $amt = fmt_aud($x.amount_cents)
+    if ("" .. $x.kind) == "refund" then
+      $amt = '<span class="text-danger">-' .. $amt .. '</span>'
+    end
+    $inv = "—"
+    if $x.invoice_id != nil then
+      $inv = bd_inv_link($x.invoice_id)
+    end
+    $t = $t .. '<tr><td class="muted small">' .. esc("" .. $x.at) .. '</td><td>' .. esc($x.gateway) .. '</td>'
+    $t = $t .. '<td>' .. bd_name($names, $x.customer_id) .. '</td><td class="text-right">' .. $amt .. '</td><td>' .. $inv .. '</td></tr>'
+  end
+  $t = $t .. '</table>'
+end
+$b = $b .. bd_card("Recent transactions", $t)
+
+return doc(200, "Billing", $user, $b)
+
+end

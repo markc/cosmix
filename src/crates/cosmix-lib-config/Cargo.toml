@@ -1,0 +1,53 @@
+[package]
+name = "cosmix-lib-config"
+version = "0.7.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared settings library — typed config structs + TOML load/save for all cosmix apps"
+
+[lib]
+name = "cosmix_config"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Opt-in helper module that wraps `cosmix-lib-client`'s explicit-URL
+# primitives with auto-resolving convenience fns
+# (`resolve_noded_url`, `connect_default`, `connect_anonymous_default`).
+# These live here in cos (not bus) so `cosmix-lib-client` (in bus)
+# stays free of any `cosmix-lib-config` (cos) dep — the cross-repo
+# edge is one-way `cos → bus`, never the reverse. Off by default so
+# consumers that don't need the auto-resolve helpers (e.g. lib-daemon
+# under its `tls` feature) don't transitively pull
+# `cosmix-lib-client` into their
+# dep graphs.
+client-helpers = ["dep:cosmix-lib-client", "dep:cosmix_bus"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+directories.workspace = true
+anyhow.workspace = true
+libc.workspace = true
+tracing.workspace = true
+# `acme_policy::AcmeTosGateError` is `#[derive(thiserror::Error)]` —
+# typed-error machinery for the LE Subscriber-Agreement gate that
+# only cosmix-lib-config can mint a proof for.
+thiserror = "2"
+cosmix-lib-mix = { path = "../cosmix-lib-mix", features = ["serde"] }
+
+# Native-only optional dep — `cosmix-lib-client`'s native stack
+# (tokio-tungstenite, futures-util) is not useful on wasm; the web
+# variant of lib-client has its own self-contained
+# `noded_url_from_origin()` resolver. Gating here AND on the
+# `client_helpers` module (`cfg(not(target_arch = "wasm32"))`)
+# keeps wasm builds from pulling tokio-tungstenite when the
+# `client-helpers` feature happens to be enabled.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cosmix-lib-client = { path = "../cosmix-lib-client", optional = true }
+# RegisterProvenance wire type for connect_default_with_provenance.
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

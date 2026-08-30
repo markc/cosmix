@@ -1,0 +1,46 @@
+[package]
+name = "cosmix-wgd"
+version = "0.4.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "cosmix-wgd — WireGuard mesh control plane (SPEC-13 D0). P2: derives the intended WG peer set from the node's signed inventory and runs a DRY-RUN reconciler (drift detection only; NO kernel mutation)."
+
+[[bin]]
+name = "cosmix-wgd"
+path = "src/main.rs"
+
+[dependencies]
+# Core WG logic — pure value types, `wg show dump` parser, IPAM, and the
+# netlink MESSAGE-construction API. P2 uses ONLY the pure types + the dump
+# parser + the diff inputs; the netlink SET path (`wg_set_device_message`) is
+# deliberately NOT imported (SPEC-13 §12a / plan §8: P2 is derive + dry-run,
+# apply lands in P3). See `reconcile.rs` for the hard no-mutation boundary.
+cosmix_wg = { package = "cosmix-lib-wg", path = "../cosmix-lib-wg" }
+# Signed-inventory verify + the `kind:"wg"` credential selector. Only the
+# always-compiled CORE half (inventory + admission) is needed, so the `cosmix`
+# feature (cross-mesh authz substrate glue) is off — keeps the dep lean.
+cosmix_mesh_trust = { package = "cosmix-lib-mesh-trust", path = "../cosmix-lib-mesh-trust", default-features = false }
+
+# Citizen ecosystem deps. wgd has NO isolated/bare mode (unlike dnsd's
+# goal-(c) standalone server), so the dnsd P1/P2 `cosmix` feature seam is
+# deliberately COLLAPSED — these are unconditional, not optional/gated.
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", features = ["client-helpers"] }
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus" }
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client", features = ["native"] }
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
+cosmix_log = { package = "cosmix-lib-log", path = "../cosmix-lib-log" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tracing = { workspace = true }
+
+[build-dependencies]
+# Captures cos HEAD sha + build time (the version-discovery contract).
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }

@@ -1,0 +1,158 @@
+-- h_login.mix — the unified maild login UI, Mix-rendered (P1 of the login revamp).
+--
+-- webd still OWNS the auth logic: POST /auth/login (the form action) exchanges
+-- email+password for a maild bearer and seals the cosmix_session cookie; this
+-- handler only RENDERS the form. CSRF stays Rust-owned too — webd mints the
+-- double-submit token and injects it as $CSRF (matching the readable cosmix_csrf
+-- cookie it set); we just embed it in a hidden field.
+--
+-- Two render modes off ONE form:
+--   • modal fragment  (md_is_modal_request → X-Modal-Fetch) — the chrome "Sign in"
+--     button lazy-fetches /login?modal=1 into the persistent md_shell("login")
+--     dialog (see lib.mix page()).
+--   • full page       (no-JS / direct visit / the PRG error-landing target) — a
+--     centred .cms-card-narrow form; webd's /auth/login error branches 303 here
+--     with ?err=<code> so a failed sign-in shows an inline banner, never the old
+--     hardcoded "sad page" (retired).
+--
+-- include order: lib.mix (esc/doc/current_user/cookie_get) is loaded by the stub;
+-- this handler pulls in forms.mix (fm_*) + modals.mix (md_*) itself, as every
+-- fm_*/md_* handler does. NO mix-0.20 syntax (?? / ?:) — webd embeds its own
+-- cosmix-lib-mix (match forms.mix/modals.mix discipline).
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+
+-- Read one key from a raw query string ($QUERY), percent-decoded; "" if absent.
+-- Minimal split on & then the FIRST = (login params carry no = in their values).
+function login_q($key)
+  $q = "" .. $QUERY
+  if $q == "" then
+    return ""
+  end
+  for each $pair in split($q, "&")
+    $eq = pos("=", $pair)
+    if $eq > 0 then
+      $k = substr($pair, 0, $eq - 1)
+      if $k == $key then
+        return url_decode(substr($pair, $eq, length($pair) - $eq))
+      end
+    end
+  end
+  return ""
+end
+
+-- Map a webd error code (?err=) to a human banner message. Unknown/empty → "".
+function login_err_msg($code)
+  if $code == "invalid" then
+    return "Invalid email or password."
+  end
+  if $code == "expired" then
+    return "Your session expired — please try again."
+  end
+  if $code == "locked" then
+    return "Too many failed attempts. Please wait a few minutes and try again."
+  end
+  if $code == "unavailable" then
+    return "Sign-in is temporarily unavailable. Please try again."
+  end
+  if $code == "code" then
+    return "That code didn't match. Check your email and try again."
+  end
+  return ""
+end
+
+-- The shared field set (everything INSIDE the <form>): error banner, hidden
+-- csrf+next, email, password. $csrf/$next/$err are RAW (fm_* esc() once).
+function login_fields($csrf, $next, $err)
+  $f = ""
+  if $err != "" then
+    $f = fm_flash_error($err)
+  end
+  $f = $f .. fm_hidden("csrf", $csrf)
+  $f = $f .. fm_hidden("next", $next)
+  $f = $f .. fm_email("email", "Email", { required: true, autofocus: true, autocomplete: "email", placeholder: "you@example.com" })
+  $f = $f .. fm_password("password", "Password", { required: true, autocomplete: "current-password" })
+  return $f
+end
+
+-- Email-2FA step 2 (P3): the code-entry field set. A single numeric code input
+-- (autocomplete one-time-code so a mailed code autofills) + hidden csrf+next.
+-- $csrf/$next/$err are RAW (fm_* esc() once). Posts to /auth/login/verify.
+function verify_fields($csrf, $next, $err)
+  $f = ""
+  if $err != "" then
+    $f = fm_flash_error($err)
+  end
+  $f = $f .. fm_hidden("csrf", $csrf)
+  $f = $f .. fm_hidden("next", $next)
+  $f = $f .. fm_text("code", "Verification code", { required: true, autofocus: true, autocomplete: "one-time-code", inputmode: "numeric", maxlength: 6, placeholder: "123456" })
+  return $f
+end
+
+-- Render the code-entry step (both modal fragment + full page), mirroring the
+-- credentials render below. The LIVE flow lands here as a full page (the step-1
+-- POST is a full-nav, so the chrome modal has already closed); the modal branch
+-- stays for symmetry/correctness if /login?step=verify is ever fetched as a modal.
+function login_verify_render($csrf, $next, $err)
+  $intro = '<p class="fm-help">We emailed a sign-in code to your address. Enter it below to finish signing in.</p>'
+  $fields = verify_fields($csrf, $next, $err)
+  if md_is_modal_request() then
+    $panel = md_panel({
+      title: "Enter your code",
+      form: { action: "/auth/login/verify", method: "post" },
+      submit: "Verify",
+      cancel: false
+    }, $intro .. $fields)
+    return md_fragment($panel)
+  end
+  $form = fm_open("/auth/login/verify", { skin: true })
+  $form = $form .. $intro .. $fields
+  $form = $form .. fm_actions({ submit: "Verify" })
+  $form = $form .. fm_close()
+  $body = '<div class="cms-card-narrow"><h1>Enter your code</h1>' .. $form .. '</div>'
+  return doc(200, "Enter your code", current_user($HEADERS), $body)
+end
+
+function login_main()
+  -- Already signed in? Nothing to do here — bounce home (covers a stale /login
+  -- bookmark hit while authenticated).
+  if $SESSION["authenticated"] then
+    return redirect("/")
+  end
+
+  $next = login_q("next")
+  if $next == "" then
+    $next = "/"
+  end
+  $err = login_err_msg(login_q("err"))
+  $csrf = "" .. $CSRF
+
+  -- Email-2FA step 2 (P3): webd's begin_mfa_challenge 303s here with ?step=verify
+  -- after emailing a code. Render the code-entry form instead of credentials.
+  if login_q("step") == "verify" then
+    return login_verify_render($csrf, $next, $err)
+  end
+
+  $fields = login_fields($csrf, $next, $err)
+
+  -- Modal fragment: the md_panel (own <form action=/auth/login>) injected into the
+  -- chrome's persistent md_shell("login") dialog. Submit button comes from md_foot.
+  if md_is_modal_request() then
+    $panel = md_panel({
+      title: "Sign in",
+      form: { action: "/auth/login", method: "post" },
+      submit: "Sign in",
+      cancel: false
+    }, $fields)
+    return md_fragment($panel)
+  end
+
+  -- Full page (no-JS / direct / PRG error landing): a centred card with the same
+  -- fields, built the manual fm_open..fm_close way (mirrors h_admin_settings.mix).
+  $form = fm_open("/auth/login", { skin: true })
+  $form = $form .. $fields
+  $form = $form .. fm_actions({ submit: "Sign in" })
+  $form = $form .. fm_close()
+  $body = '<div class="cms-card-narrow"><h1>Sign in</h1>' .. $form .. '</div>'
+  return doc(200, "Sign in", current_user($HEADERS), $body)
+end

@@ -1,0 +1,24908 @@
+use super::*;
+// The input traits the Rung E-1 fake backend implements. Deliberately imported
+// from smithay rather than re-exported through `protocol::input`: the fake has
+// to satisfy the real trait, or it proves nothing about the real router.
+use smithay::backend::input::{
+    AbsolutePositionEvent, Device, DeviceCapability, Event, InputBackend, InputEvent,
+    KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionAbsoluteEvent,
+    PointerMotionEvent, TouchCancelEvent, TouchDownEvent, TouchEvent as SmithayTouchEvent,
+    TouchFrameEvent, TouchMotionEvent, TouchSlot, TouchUpEvent, UnusedEvent,
+};
+// The calloop halves of the fake backend. It has to be a real `EventSource`
+// registered on the real event loop, or the stall oracle would be measuring a
+// test harness instead of the protocol thread.
+use smithay::reexports::calloop::{EventSource, Poll, PostAction, Readiness, Token, TokenFactory};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    ffi::CString,
+    fs::File,
+    io::{Read, Write},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd},
+    os::unix::fs::FileExt,
+    os::unix::net::UnixStream,
+    sync::OnceLock,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+const PROTOCOL_ACK_DEADLINE: Duration = Duration::from_secs(30);
+const EVENT_LOOP_PUMP_TIMEOUT: Duration = Duration::from_millis(10);
+const EVENT_LOOP_PUMP_LIMIT: usize = 200;
+
+fn test_atomic_selection(
+    connector_id: u32,
+    mode: crate::backend::kms::ConnectorMode,
+) -> crate::backend::kms::AtomicOutputSelection {
+    crate::backend::kms::AtomicOutputSelection {
+        connector_id,
+        crtc_id: connector_id.saturating_add(100),
+        primary_plane_id: connector_id.saturating_add(200),
+        mode,
+        format: u32::from_le_bytes(*b"XR24"),
+        modifier: 0,
+    }
+}
+
+fn scene(layout: SurfaceLayout) -> SurfaceSceneSnapshot {
+    SurfaceSceneSnapshot {
+        layout,
+        kind: if layout.toplevel.is_some() {
+            SceneSurfaceKind::Toplevel
+        } else {
+            SceneSurfaceKind::Subsurface
+        },
+        title: None,
+    }
+}
+
+struct SuccessfulRetirementAdapter;
+
+impl WaitForSubmittedWork for SuccessfulRetirementAdapter {
+    fn wait_for_submitted_work(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), cosmix_wgpu_dmabuf::RetirementWaitError> {
+        assert_eq!(timeout, cosmix_wgpu_dmabuf::RETIREMENT_WAIT_TIMEOUT);
+        Ok(())
+    }
+}
+
+fn test_retirement_adapter() -> Option<Box<dyn WaitForSubmittedWork>> {
+    Some(Box::new(SuccessfulRetirementAdapter))
+}
+
+struct FailingRetirementAdapter(cosmix_wgpu_dmabuf::RetirementWaitError);
+
+impl WaitForSubmittedWork for FailingRetirementAdapter {
+    fn wait_for_submitted_work(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), cosmix_wgpu_dmabuf::RetirementWaitError> {
+        assert_eq!(timeout, cosmix_wgpu_dmabuf::RETIREMENT_WAIT_TIMEOUT);
+        Err(self.0.clone())
+    }
+}
+
+struct FirstWaitGatedRetirementAdapter {
+    calls: Arc<AtomicUsize>,
+    first_wait_entered: SyncSender<()>,
+    release_first_wait: Receiver<()>,
+}
+
+impl WaitForSubmittedWork for FirstWaitGatedRetirementAdapter {
+    fn wait_for_submitted_work(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), cosmix_wgpu_dmabuf::RetirementWaitError> {
+        assert_eq!(timeout, cosmix_wgpu_dmabuf::RETIREMENT_WAIT_TIMEOUT);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == 1 {
+            self.first_wait_entered
+                .send(())
+                .expect("observe first retirement wait");
+            self.release_first_wait
+                .recv()
+                .expect("release first retirement wait");
+        }
+        Ok(())
+    }
+}
+
+struct FirstWaitRelease(Option<SyncSender<()>>);
+
+impl FirstWaitRelease {
+    fn release(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+impl Drop for FirstWaitRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn first_wait_gated_retirement_adapter() -> (
+    Box<dyn WaitForSubmittedWork>,
+    Receiver<()>,
+    FirstWaitRelease,
+    Arc<AtomicUsize>,
+) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+    let (release_sender, release_receiver) = mpsc::sync_channel(1);
+    (
+        Box::new(FirstWaitGatedRetirementAdapter {
+            calls: Arc::clone(&calls),
+            first_wait_entered: entered_sender,
+            release_first_wait: release_receiver,
+        }),
+        entered_receiver,
+        FirstWaitRelease(Some(release_sender)),
+        calls,
+    )
+}
+
+fn pump_protocol_event_loop_until(
+    server: &mut ProtocolServer,
+    awaited: &str,
+    condition: impl FnMut(&WaylandState) -> bool,
+) {
+    pump_protocol_event_loop_until_with_budget(
+        server,
+        awaited,
+        EVENT_LOOP_PUMP_TIMEOUT,
+        EVENT_LOOP_PUMP_LIMIT,
+        condition,
+    );
+}
+
+fn pump_protocol_event_loop_until_with_budget(
+    server: &mut ProtocolServer,
+    awaited: &str,
+    dispatch_timeout: Duration,
+    dispatch_limit: usize,
+    mut condition: impl FnMut(&WaylandState) -> bool,
+) {
+    for dispatch in 1..=dispatch_limit {
+        server.dispatch_cycle(Some(dispatch_timeout)).unwrap_or_else(|error| {
+            panic!("protocol dispatch cycle {dispatch}/{dispatch_limit} failed while awaiting {awaited}: {error}")
+        });
+        if condition(&server.state) {
+            return;
+        }
+    }
+    panic!(
+        "protocol condition not reached after {dispatch_limit} dispatch cycles of {} ms while awaiting {awaited}",
+        dispatch_timeout.as_millis()
+    );
+}
+
+fn synthetic_drm_adapter(name: &str) -> cosmix_wgpu_dmabuf::VulkanDrmAdapter {
+    cosmix_wgpu_dmabuf::VulkanDrmAdapter {
+        name: name.into(),
+        device_type: "TEST".into(),
+        primary_device: None,
+        render_device: None,
+    }
+}
+
+#[test]
+fn disabled_explicit_sync_exposure_skips_import_device_preparation() {
+    assert!(!ExplicitSyncExposureMode::Disabled.prepares_import_device());
+}
+
+#[test]
+fn production_explicit_sync_exposure_prepares_an_import_device() {
+    assert!(ExplicitSyncExposureMode::Production.prepares_import_device());
+}
+
+/// A prepared identity whose every field is distinguishable from every other.
+///
+/// Every value here is one production never produces, and that is the point.
+/// The two device numbers differ, which preparation refuses before it could
+/// report it, and the node type is `Primary`, which preparation also refuses.
+/// The fields are carried across a struct boundary by name, so a value equal to
+/// the one the code would wrongly hardcode is not an oracle at all: an identity
+/// reporting `Render` because it forwards what it was given and one reporting
+/// `Render` because it was written there are indistinguishable when the fake
+/// supplies `Render`. A fake need not obey an invariant it is not testing, and
+/// this one is testing only that each field arrives where it was sent.
+fn synthetic_prepared_identity() -> PreparedImportDeviceIdentity {
+    PreparedImportDeviceIdentity {
+        expected_render_dev_t: 0x0102_0304,
+        observed_render_dev_t: 0x0506_0708,
+        resolved_path: std::path::PathBuf::from("/synthetic/renderD128"),
+        observed_node_type: smithay::backend::drm::NodeType::Primary,
+    }
+}
+
+/// The mode that skips preparation must not *reach* preparation.
+///
+/// `prepares_import_device` already says the mode intends to skip, and the
+/// startup report already says it did — but both are satisfied by a build that
+/// prepares a device and throws the answer away, which on a real machine means
+/// opening a DRM node the operator asked it not to open. Only a preparation
+/// source that records being called can tell those apart, so the fake counts
+/// invocations and the assertion is on the count, not on the outcome.
+#[test]
+fn a_skipping_exposure_mode_never_reaches_the_preparation_it_skips() {
+    let calls = std::cell::Cell::new(0_usize);
+    let (device, preparation) =
+        prepare_explicit_sync_import_device(ExplicitSyncExposureMode::Disabled, || {
+            calls.set(calls.get() + 1);
+            ImportDeviceDecision::Prepared(PreparedImportDevice {
+                device: (),
+                expected_render_dev_t: 1,
+                observed_render_dev_t: 1,
+                resolved_path: std::path::PathBuf::from("/synthetic/never-opened"),
+                observed_node_type: smithay::backend::drm::NodeType::Render,
+            })
+        });
+
+    assert_eq!(
+        calls.get(),
+        0,
+        "a skipping mode that still calls preparation opens a device it was told not to"
+    );
+    assert!(device.is_none());
+    assert_eq!(preparation, ExplicitSyncPreparation::SkippedByPolicy);
+}
+
+/// A preparing mode reports the identity preparation established, field for
+/// field, and hands back the device it prepared.
+#[test]
+fn a_preparing_exposure_mode_reports_the_identity_preparation_established() {
+    let identity = synthetic_prepared_identity();
+    let (device, preparation) =
+        prepare_explicit_sync_import_device(ExplicitSyncExposureMode::Production, || {
+            ImportDeviceDecision::Prepared(PreparedImportDevice {
+                device: "the prepared device",
+                expected_render_dev_t: identity.expected_render_dev_t,
+                observed_render_dev_t: identity.observed_render_dev_t,
+                resolved_path: identity.resolved_path.clone(),
+                observed_node_type: identity.observed_node_type,
+            })
+        });
+
+    assert_eq!(
+        device,
+        Some("the prepared device"),
+        "the device must reach the caller; a report is not a substitute for it"
+    );
+    assert_eq!(preparation, ExplicitSyncPreparation::Prepared(identity));
+}
+
+/// A refusal reaches the report as the reason preparation gave, not as an
+/// absence.
+///
+/// The reason is what distinguishes "this machine has no render node" from
+/// "the node it has is the wrong one", and folding either into `None` is the
+/// loss that made callers re-probe the device afterwards to guess.
+#[test]
+fn a_refused_preparation_reports_the_reason_it_refused_for() {
+    let (device, preparation) =
+        prepare_explicit_sync_import_device(ExplicitSyncExposureMode::Production, || {
+            ImportDeviceDecision::<()>::Unavailable(ImportDeviceUnavailable::RenderDeviceMismatch {
+                expected: 7,
+                observed: 9,
+            })
+        });
+
+    assert!(device.is_none());
+    assert_eq!(
+        preparation,
+        ExplicitSyncPreparation::Unavailable(ImportDeviceUnavailable::RenderDeviceMismatch {
+            expected: 7,
+            observed: 9
+        }),
+        "the refusal must arrive intact; a reason reduced to \"unavailable\" sends the reader \
+         back to the device to ask again"
+    );
+}
+
+/// Every reachable and unreachable pairing of the report's two halves, judged.
+///
+/// The verdict is the only place the relationship between them is stated, so
+/// this is where a build that starts advertising without preparing — or
+/// preparing without advertising — stops being indistinguishable from an
+/// ordinary run.
+#[test]
+fn the_startup_verdict_follows_the_rule_that_decides_advertising() {
+    let judge = |preparation, global_advertised| {
+        judge_explicit_sync_startup(&ExplicitSyncStartupReport {
+            preparation,
+            global_advertised,
+        })
+    };
+
+    assert_eq!(
+        judge(ExplicitSyncPreparation::SkippedByPolicy, false),
+        ExplicitSyncStartupVerdict::DisabledAsConfigured
+    );
+    assert_eq!(
+        judge(
+            ExplicitSyncPreparation::Prepared(synthetic_prepared_identity()),
+            true
+        ),
+        ExplicitSyncStartupVerdict::Advertised
+    );
+    assert_eq!(
+        judge(
+            ExplicitSyncPreparation::Unavailable(ImportDeviceUnavailable::MissingRenderNode),
+            false
+        ),
+        ExplicitSyncStartupVerdict::Degraded,
+        "a refusal with no global is a degraded run, not a configured one; an operator who \
+         asked for explicit sync and did not get it must be told"
+    );
+
+    // The three the rule forbids: a prepared device with no global, and either
+    // way of advertising one without having prepared anything. Each is one half
+    // of the report disagreeing with the other, and none may be reported as any
+    // of the three ordinary outcomes.
+    assert_eq!(
+        judge(
+            ExplicitSyncPreparation::Prepared(synthetic_prepared_identity()),
+            false
+        ),
+        ExplicitSyncStartupVerdict::Inconsistent
+    );
+    assert_eq!(
+        judge(ExplicitSyncPreparation::SkippedByPolicy, true),
+        ExplicitSyncStartupVerdict::Inconsistent
+    );
+    assert_eq!(
+        judge(
+            ExplicitSyncPreparation::Unavailable(ImportDeviceUnavailable::MissingRenderNode),
+            true
+        ),
+        ExplicitSyncStartupVerdict::Inconsistent
+    );
+}
+
+/// The verdict must agree with the tripwire that actually gates construction.
+///
+/// `judge_explicit_sync_startup` re-states the advertising rule in terms of the
+/// report; `should_advertise_explicit_sync_global` is the rule the seal
+/// consults before minting an activation. Two statements of one rule drift
+/// silently, so this drives both from the same inputs and requires them to
+/// agree on every one.
+#[test]
+fn the_startup_verdict_and_the_activation_tripwire_state_one_rule() {
+    for exposure_mode in [
+        ExplicitSyncExposureMode::Disabled,
+        ExplicitSyncExposureMode::Production,
+    ] {
+        for prepared in [false, true] {
+            let advertised = should_advertise_explicit_sync_global(exposure_mode, prepared);
+            let (_, preparation) = prepare_explicit_sync_import_device(exposure_mode, || {
+                if prepared {
+                    ImportDeviceDecision::Prepared(PreparedImportDevice {
+                        device: (),
+                        expected_render_dev_t: 0,
+                        observed_render_dev_t: 0,
+                        resolved_path: std::path::PathBuf::from("/synthetic/renderD128"),
+                        observed_node_type: smithay::backend::drm::NodeType::Render,
+                    })
+                } else {
+                    ImportDeviceDecision::Unavailable(ImportDeviceUnavailable::MissingRenderNode)
+                }
+            });
+            let verdict = judge_explicit_sync_startup(&ExplicitSyncStartupReport {
+                preparation,
+                global_advertised: advertised,
+            });
+            assert_ne!(
+                verdict,
+                ExplicitSyncStartupVerdict::Inconsistent,
+                "the tripwire's own answer for {exposure_mode:?} with prepared={prepared} was \
+                 judged a contradiction, so the two now disagree about one rule"
+            );
+            assert_eq!(
+                verdict == ExplicitSyncStartupVerdict::Advertised,
+                advertised,
+                "only the pairings the tripwire advertises for may be judged advertised"
+            );
+        }
+    }
+}
+
+/// A real protocol thread reports its own preparation outcome, and the outcome
+/// is the one this machine's synthetic adapter forces.
+///
+/// This is the whole point of the report: the answer comes back from the thread
+/// that decided, at the moment it decided, rather than from a second probe of a
+/// device that may have changed since. The adapter names no render device, so
+/// preparation can only refuse for one reason, and the test can name it.
+#[test]
+fn a_started_runtime_reports_the_preparation_outcome_its_own_thread_reached() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let runtime = WaylandRuntime::new(
+        &format!(
+            "cosmix-explicit-sync-report-{}-{unique}",
+            std::process::id()
+        ),
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "explicit-sync-report-test".into(),
+            drm_adapter: synthetic_drm_adapter("explicit-sync-report-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: true,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Production,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("explicit-sync report protocol thread starts");
+
+    let report = runtime
+        .explicit_sync_startup()
+        .expect("a runtime that started a protocol thread carries that thread's report");
+    assert_eq!(
+        report.preparation,
+        ExplicitSyncPreparation::Unavailable(ImportDeviceUnavailable::MissingRenderNode),
+        "a Production run against an adapter naming no render device must report why it could \
+         not prepare one"
+    );
+    assert!(
+        !report.global_advertised,
+        "nothing was prepared, so nothing may have been advertised"
+    );
+    assert_eq!(
+        judge_explicit_sync_startup(report),
+        ExplicitSyncStartupVerdict::Degraded
+    );
+    drop(runtime);
+}
+
+/// The same thread, told not to prepare, reports that it did not — and reports
+/// it as policy rather than as a failure.
+///
+/// Paired with the test above deliberately: the two differ only in the exposure
+/// mode, so a report that collapsed `SkippedByPolicy` into `Unavailable` would
+/// pass one and fail the other.
+#[test]
+fn a_started_runtime_distinguishes_a_skipped_preparation_from_a_refused_one() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let runtime = WaylandRuntime::new(
+        &format!(
+            "cosmix-explicit-sync-skip-report-{}-{unique}",
+            std::process::id()
+        ),
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "explicit-sync-skip-report-test".into(),
+            drm_adapter: synthetic_drm_adapter("explicit-sync-skip-report-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: true,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("explicit-sync skip-report protocol thread starts");
+
+    let report = runtime
+        .explicit_sync_startup()
+        .expect("a runtime that started a protocol thread carries that thread's report");
+    assert_eq!(report.preparation, ExplicitSyncPreparation::SkippedByPolicy);
+    assert!(!report.global_advertised);
+    assert_eq!(
+        judge_explicit_sync_startup(report),
+        ExplicitSyncStartupVerdict::DisabledAsConfigured
+    );
+    drop(runtime);
+}
+
+#[test]
+fn incomplete_protocol_thread_is_detached_at_the_shutdown_deadline() {
+    let (release_sender, release_receiver) = mpsc::sync_channel(1);
+    let (completion_sender, completion_receiver) = mpsc::sync_channel(1);
+    let (exited_sender, exited_receiver) = mpsc::sync_channel(1);
+    let thread = thread::spawn(move || {
+        let _ = release_receiver.recv();
+        let _ = exited_sender.send(());
+    });
+
+    assert_eq!(
+        join_protocol_thread_after_completion(thread, &completion_receiver, Duration::ZERO),
+        ProtocolThreadJoinOutcome::TimedOut
+    );
+    release_sender
+        .send(())
+        .expect("detached test thread can be released");
+    exited_receiver
+        .recv_timeout(PROTOCOL_ACK_DEADLINE)
+        .expect("detached test thread exits independently");
+    drop(completion_sender);
+}
+
+#[test]
+fn protocol_failure_notification_distinguishes_orderly_runtime_and_dispatch_exits() {
+    assert!(!protocol_exit_failed(
+        &Ok(()),
+        Some(ProtocolShutdownCause::Orderly)
+    ));
+    assert!(protocol_exit_failed(
+        &Ok(()),
+        Some(ProtocolShutdownCause::RuntimeFailure)
+    ));
+    assert!(protocol_exit_failed(&Err("dispatch failed".into()), None));
+
+    let (notified, notification) = mpsc::sync_channel(1);
+    drop(ProtocolThreadFailure(Some(Box::new(move || {
+        let _ = notified.send(());
+    }))));
+    notification
+        .recv_timeout(PROTOCOL_ACK_DEADLINE)
+        .expect("an armed failure guard publishes exactly when it is dropped");
+
+    let (notified, notification) = mpsc::sync_channel(1);
+    let mut guard = ProtocolThreadFailure(Some(Box::new(move || {
+        let _ = notified.send(());
+    })));
+    guard.disarm();
+    drop(guard);
+    assert!(matches!(
+        notification.try_recv(),
+        Err(mpsc::TryRecvError::Disconnected)
+    ));
+}
+
+/// Build a spawned runtime whose protocol-failed callback sends on a channel.
+///
+/// The construction is the production one — the private constructor every
+/// caller funnels through — so the arming and disarming under test are the
+/// thread body's, not a replica's.
+fn runtime_with_failure_probe(
+    label: &str,
+) -> (FakeInputInjector, WaylandRuntime, Receiver<()>, String) {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-{label}-{}-{unique}", std::process::id());
+    let (injector, input_source) = fake_input_source();
+    let (fired, notification) = mpsc::sync_channel(1);
+    let runtime = WaylandRuntime::with_input_source(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        WaylandGpuWiring {
+            dmabuf_capabilities: Some(DmabufCapabilities {
+                main_device: 0,
+                formats: Vec::new(),
+                adapter_name: "failure-probe-test".into(),
+                drm_adapter: synthetic_drm_adapter("failure-probe-test"),
+            }),
+            dmabuf_validator: None,
+            retirement_adapter: test_retirement_adapter(),
+        },
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+        Some(input_source),
+        Some(Box::new(move || {
+            let _ = fired.send(());
+        })),
+    )
+    .expect("protocol thread starts with a failure probe installed");
+    (injector, runtime, notification, socket_name)
+}
+
+#[test]
+fn a_runtime_failure_in_the_spawned_thread_fires_the_protocol_failed_callback() {
+    let (injector, runtime, notification, _socket) = runtime_with_failure_probe("failure-fires");
+    // A KMS render reply is invalid for the nested backend; the established
+    // consequence is a RuntimeFailure shutdown after a successful dispatch.
+    runtime
+        .submit_kms_render_reply(KmsRenderReply::Suspended { generation: 1 })
+        .expect("the protocol thread accepts the command before judging it");
+    notification
+        .recv_timeout(PROTOCOL_ACK_DEADLINE)
+        .expect("a runtime failure publishes through the protocol-failed callback");
+    // The callback fired once and its sender lives in the guard; after the
+    // thread is gone the channel must be disconnected, not carrying a second
+    // publication.
+    drop(runtime);
+    assert!(matches!(
+        notification.try_recv(),
+        Err(mpsc::TryRecvError::Disconnected)
+    ));
+    drop(injector);
+}
+
+#[test]
+fn an_orderly_runtime_drop_does_not_fire_the_protocol_failed_callback() {
+    let (injector, runtime, notification, _socket) = runtime_with_failure_probe("orderly-silent");
+    // Drop sends the orderly shutdown and joins the thread, so by the time it
+    // returns the guard has been disarmed and dropped. Disconnected-without-a-
+    // message is the whole claim: an orderly exit publishes nothing.
+    drop(runtime);
+    assert!(matches!(
+        notification.try_recv(),
+        Err(mpsc::TryRecvError::Disconnected)
+    ));
+    drop(injector);
+}
+
+#[test]
+fn joined_shutdown_with_saturated_client_commits_stays_graceful() {
+    let (injector, mut runtime, notification, socket_name) =
+        runtime_with_failure_probe("saturated-orderly");
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the joined-shutdown oracle");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(socket_name))
+        .expect("connect shutdown client");
+    let pool = bring_up_shm_toplevel(&mut client, 4, "cosmix-saturated-orderly");
+    send_request(
+        &mut client,
+        11,
+        0,
+        &words(&[12, 0, 1, 1, 4, wl_shm::Format::Xrgb8888 as u32]),
+    );
+
+    for commit in 0..PROTOCOL_EVENT_BATCH_CAPACITY + 2 {
+        pool.write_at(&[u8::try_from(commit).expect("small commit"), 0, 0, 0], 0)
+            .expect("rewrite shutdown client's pool");
+        send_request(&mut client, 7, 1, &words(&[12, 0, 0]));
+        send_request(&mut client, 7, 9, &words(&[0, 0, 1, 1]));
+        send_request(&mut client, 7, 6, &[]);
+        let fence = 13 + u32::try_from(commit).expect("small commit count");
+        send_display_request(&mut client, 0, fence);
+        events_until_callback(&mut client, fence);
+    }
+    runtime
+        .kms_topology_client()
+        .flush_events(PROTOCOL_ACK_DEADLINE)
+        .expect("settle the newest commit behind the saturated renderer channel");
+
+    // This is the joined-pump ordering: the App and its receiver go first,
+    // while the protocol thread still has a compacted client batch to offer.
+    drop(
+        runtime
+            .take_client_scene_feed()
+            .expect("the joined App owns the scene receiver"),
+    );
+    drop(runtime);
+    assert!(
+        matches!(
+            notification.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ),
+        "intentional scene-consumer teardown does not publish protocol death"
+    );
+    drop(client);
+    drop(injector);
+}
+
+#[test]
+fn a_factory_error_reports_synchronously_and_does_not_fire_the_callback() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-factory-error-{}-{unique}", std::process::id());
+    let (fired, notification) = mpsc::sync_channel(1);
+    // The factory's ordinary failure path: an `Err` reaches the caller on the
+    // readiness channel, so the asynchronous callback publishing the same
+    // event a second time would be a double report. This is the counterpart of
+    // the panic fixture — together they pin exactly where the disarm sits.
+    let failing = input::InputSourceFactory(
+        || -> Result<FakeInput, Box<dyn std::error::Error + Send + Sync>> {
+            Err("registration factory refused deliberately".into())
+        },
+    );
+    let result = WaylandRuntime::with_input_source(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        WaylandGpuWiring {
+            dmabuf_capabilities: Some(DmabufCapabilities {
+                main_device: 0,
+                formats: Vec::new(),
+                adapter_name: "factory-error-test".into(),
+                drm_adapter: synthetic_drm_adapter("factory-error-test"),
+            }),
+            dmabuf_validator: None,
+            retirement_adapter: test_retirement_adapter(),
+        },
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+        Some(Box::new(failing)),
+        Some(Box::new(move || {
+            let _ = fired.send(());
+        })),
+    );
+    let error = match result {
+        Ok(_) => panic!("a refusing factory fails construction synchronously"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("refused deliberately"),
+        "the synchronous reply carries the factory's own reason: {error}"
+    );
+    assert!(
+        matches!(
+            notification.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ),
+        "an explicit startup refusal is reported once, on the readiness channel only"
+    );
+}
+
+#[test]
+fn a_panicking_registration_factory_fires_the_callback_and_fails_construction() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-factory-panic-{}-{unique}", std::process::id());
+    let (fired, notification) = mpsc::sync_channel(1);
+    // A panic is not the factory's error path — that one returns `Err`, is
+    // reported synchronously on the readiness channel, and deliberately
+    // disarms the guard. An unwind never reaches the disarm, which is what
+    // pins the guard being armed before `ProtocolServer::new` runs.
+    let panicking = input::InputSourceFactory(
+        || -> Result<FakeInput, Box<dyn std::error::Error + Send + Sync>> {
+            panic!("registration factory panicked deliberately")
+        },
+    );
+    let result = WaylandRuntime::with_input_source(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        WaylandGpuWiring {
+            dmabuf_capabilities: Some(DmabufCapabilities {
+                main_device: 0,
+                formats: Vec::new(),
+                adapter_name: "factory-panic-test".into(),
+                drm_adapter: synthetic_drm_adapter("factory-panic-test"),
+            }),
+            dmabuf_validator: None,
+            retirement_adapter: test_retirement_adapter(),
+        },
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+        Some(Box::new(panicking)),
+        Some(Box::new(move || {
+            let _ = fired.send(());
+        })),
+    );
+    assert!(
+        result.is_err(),
+        "a pre-readiness unwind must fail construction, not hand back a runtime"
+    );
+    notification
+        .recv_timeout(PROTOCOL_ACK_DEADLINE)
+        .expect("a pre-readiness unwind publishes through the still-armed callback");
+}
+
+#[test]
+fn binding_dispositions_map_to_smithay_filter_results() {
+    assert!(matches!(
+        binding_filter_result(KeyDisposition::Forward),
+        FilterResult::Forward
+    ));
+    assert!(matches!(
+        binding_filter_result(KeyDisposition::Act(BindingAction::RequestCloseFocused)),
+        FilterResult::Intercept(Some(BindingAction::RequestCloseFocused))
+    ));
+    assert!(matches!(
+        binding_filter_result(KeyDisposition::SwallowRelease),
+        FilterResult::Intercept(None)
+    ));
+}
+
+fn send_display_request(client: &mut UnixStream, opcode: u16, new_id: u32) {
+    send_request(client, 1, opcode, &new_id.to_ne_bytes());
+}
+
+fn request_bytes(object_id: u32, opcode: u16, body: &[u8]) -> Vec<u8> {
+    let size = 8 + body.len();
+    assert_eq!(size % 4, 0, "Wayland request must be word-aligned");
+    let mut request = Vec::with_capacity(size);
+    request.extend_from_slice(&object_id.to_ne_bytes());
+    request.extend_from_slice(&(((size as u32) << 16) | u32::from(opcode)).to_ne_bytes());
+    request.extend_from_slice(body);
+    request
+}
+
+// Flake watch, CLOSED 2026-08-10: the BrokenPipe seen at this boundary on four
+// otherwise-green full-suite runs since 2026-08-06 was a bug in one test, not a
+// dispatcher failure. The 2026-08-06 hypothesis was right — the compositor
+// dispatched a fatal request between two `write_all` calls, closed the client,
+// and the next request observed EPIPE — and it stayed unproven only because 20
+// stress runs never reproduced it. What settled it was decoding the failure
+// rather than chasing a repro: `object=6 opcode=6 bytes=8` is a `wl_surface`
+// (from `create_surface`), opcode 6 is `commit`, and 8 bytes is header-only, so
+// it names one line. That line followed
+// `xdg_toplevel.set_max_size(u32::MAX, 100)` — `-1` as i32 — and
+// `constraints_after_toplevel_request` + `validate_toplevel_constraints` reject
+// a negative maximum when the REQUEST arrives, so `handlers.rs` posts
+// InvalidSize and returns without ever reaching a commit. The trailing commit
+// could not contribute coverage and was pure race; it is gone.
+//
+// The rule it leaves behind: after a request that provokes a protocol error, a
+// socket-backed test must not write again — read for the error instead, as
+// `unknown_decoration_mode_posts_invalid_mode` and
+// `non_positive_window_geometry_posts_invalid_size` already do. No other site
+// in this file has that shape; the explicit-sync sequences are not instances,
+// because there the fatal validation happens when the following parent commit
+// applies the synchronised child state, and that parent commit is the final
+// write. Keep this write strict: accepting a dead compositor socket would hide
+// both this class of test bug and a real dispatcher failure.
+#[track_caller]
+fn send_request(client: &mut UnixStream, object_id: u32, opcode: u16, body: &[u8]) {
+    let request = request_bytes(object_id, opcode, body);
+    client.write_all(&request).unwrap_or_else(|error| {
+        panic!(
+            "send Wayland request object={object_id} opcode={opcode} bytes={}: {error}",
+            request.len()
+        )
+    });
+}
+
+/// Write several requests as a single `write_all`, so the compositor sees them
+/// all in one `dispatch_clients` rather than possibly one per cycle.
+///
+/// Some compositor work is deliberately deferred to the end of a dispatch cycle
+/// — `reconcile_subsurface_roles` is the one that matters here — so "the client
+/// sent these in the same dispatch" is a distinct state from "the client sent
+/// these one after another", and separate `write_all`s can produce either
+/// depending on when the protocol thread happens to wake.
+fn send_requests_atomically(client: &mut UnixStream, requests: &[(u32, u16, Vec<u8>)]) {
+    let mut batch = Vec::new();
+    for (object_id, opcode, body) in requests {
+        batch.extend_from_slice(&request_bytes(*object_id, *opcode, body));
+    }
+    client
+        .write_all(&batch)
+        .expect("send batched Wayland requests");
+}
+
+fn send_request_with_fd(
+    client: &mut UnixStream,
+    object_id: u32,
+    opcode: u16,
+    body: &[u8],
+    fd: BorrowedFd<'_>,
+) {
+    let size = 8 + body.len();
+    assert_eq!(size % 4, 0, "Wayland request must be word-aligned");
+    let mut request = Vec::with_capacity(size);
+    request.extend_from_slice(&object_id.to_ne_bytes());
+    request.extend_from_slice(&(((size as u32) << 16) | u32::from(opcode)).to_ne_bytes());
+    request.extend_from_slice(body);
+    let mut io = libc::iovec {
+        iov_base: request.as_mut_ptr().cast(),
+        iov_len: request.len(),
+    };
+    let control_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as _) } as usize;
+    let mut control = vec![0_u8; control_len];
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut io;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = control.len();
+    // SAFETY: message owns valid iovec/control storage for the duration of
+    // sendmsg. The first control header has CMSG_SPACE for exactly one fd.
+    let sent = unsafe {
+        let header = libc::CMSG_FIRSTHDR(&message);
+        assert!(!header.is_null(), "SCM_RIGHTS control header is available");
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) as usize;
+        std::ptr::write(
+            libc::CMSG_DATA(header).cast::<libc::c_int>(),
+            fd.as_raw_fd(),
+        );
+        libc::sendmsg(client.as_raw_fd(), &message, libc::MSG_NOSIGNAL)
+    };
+    assert_eq!(
+        sent,
+        isize::try_from(request.len()).expect("Wayland request length fits isize"),
+        "send complete Wayland request with one fd: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+fn read_exact_until(client: &mut UnixStream, bytes: &mut [u8], deadline: Instant, awaited: &str) {
+    let mut received = 0;
+    while received < bytes.len() {
+        let now = Instant::now();
+        assert!(
+            now < deadline,
+            // Not `PROTOCOL_ACK_DEADLINE`: callers pass their own deadline, and
+            // reporting the default one made a two-second timeout read as a
+            // thirty-second one.
+            "timed out awaiting {awaited}; received {received}/{} message bytes",
+            bytes.len()
+        );
+        let remaining = deadline.saturating_duration_since(now);
+        let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+        let mut descriptor = libc::pollfd {
+            fd: client.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
+            revents: 0,
+        };
+        // SAFETY: descriptor is valid writable storage for one pollfd and the
+        // borrowed stream remains open for the duration of the call.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if ready == 0 {
+            continue;
+        }
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            panic!("poll failed while awaiting {awaited}: {error}");
+        }
+        match client.read(&mut bytes[received..]) {
+            Ok(0) => panic!("Wayland peer disconnected while awaiting {awaited}"),
+            Ok(count) => received += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("failed reading Wayland event while awaiting {awaited}: {error}"),
+        }
+    }
+}
+
+fn read_event(client: &mut UnixStream, deadline: Instant, awaited: &str) -> (u32, u16, Vec<u8>) {
+    let mut header = [0_u8; 8];
+    read_exact_until(client, &mut header, deadline, awaited);
+    let object_id = u32::from_ne_bytes(header[0..4].try_into().expect("object id"));
+    let size_opcode = u32::from_ne_bytes(header[4..8].try_into().expect("message header"));
+    let size = (size_opcode >> 16) as usize;
+    let opcode = (size_opcode & 0xffff) as u16;
+    assert!(size >= 8, "invalid Wayland message size {size}");
+    let mut body = vec![0_u8; size - 8];
+    read_exact_until(client, &mut body, deadline, awaited);
+    (object_id, opcode, body)
+}
+
+#[cfg(feature = "explicit-sync-live-test")]
+fn drain_buffered_events(client: &mut UnixStream) -> Vec<(u32, u16, Vec<u8>)> {
+    client
+        .set_nonblocking(true)
+        .expect("put in-process Wayland client stream into non-blocking mode");
+
+    let mut buffered = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match client.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => buffered.extend_from_slice(&chunk[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("failed draining buffered Wayland events: {error}"),
+        }
+    }
+
+    let mut events = Vec::new();
+    let mut offset = 0;
+    while offset < buffered.len() {
+        assert!(
+            buffered.len() - offset >= 8,
+            "buffered Wayland response ended with an incomplete message header: {} bytes remain",
+            buffered.len() - offset
+        );
+        let object_id = u32::from_ne_bytes(
+            buffered[offset..offset + 4]
+                .try_into()
+                .expect("buffered event object id"),
+        );
+        let size_opcode = u32::from_ne_bytes(
+            buffered[offset + 4..offset + 8]
+                .try_into()
+                .expect("buffered event message header"),
+        );
+        let size = (size_opcode >> 16) as usize;
+        let opcode = (size_opcode & 0xffff) as u16;
+        assert!(size >= 8, "invalid buffered Wayland message size {size}");
+        assert!(
+            offset + size <= buffered.len(),
+            "buffered Wayland response ended partway through a {size}-byte message: {} bytes available",
+            buffered.len() - offset
+        );
+        events.push((
+            object_id,
+            opcode,
+            buffered[offset + 8..offset + size].to_vec(),
+        ));
+        offset += size;
+    }
+    events
+}
+
+fn wait_for_callback(client: &mut UnixStream, callback_id: u32) {
+    wait_for_callback_with_timeout(client, callback_id, PROTOCOL_ACK_DEADLINE);
+}
+
+fn wait_for_callback_with_timeout(client: &mut UnixStream, callback_id: u32, timeout: Duration) {
+    let awaited = format!("wl_display.sync callback {callback_id}");
+    let deadline = Instant::now() + timeout;
+    for _ in 0..64 {
+        let (object_id, opcode, _) = read_event(client, deadline, &awaited);
+        if object_id == callback_id && opcode == 0 {
+            return;
+        }
+    }
+    panic!("wl_display.sync callback {callback_id} did not complete");
+}
+
+fn events_until_callback(client: &mut UnixStream, callback_id: u32) -> Vec<(u32, u16, Vec<u8>)> {
+    let awaited = format!("wl_display.sync callback {callback_id}");
+    let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    let mut events = Vec::new();
+    for _ in 0..64 {
+        let event = read_event(client, deadline, &awaited);
+        if event.0 == callback_id && event.1 == 0 {
+            return events;
+        }
+        events.push(event);
+    }
+    panic!("wl_display.sync callback {callback_id} did not complete");
+}
+
+/// Read events until the fatal `wl_display.error`, returning what it names.
+///
+/// A sync fence is no use for a sequence that kills the client: the compositor
+/// posts the error and tears the connection down, so the callback never
+/// arrives and `events_until_callback` panics on the disconnect instead of
+/// reporting what went wrong. `wl_display` is object 1 and `error` is its
+/// opcode 0; the body is the offending object's id, the interface-specific
+/// code, and a message.
+fn read_protocol_error(client: &mut UnixStream) -> (u32, u32, String) {
+    let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    for _ in 0..64 {
+        let (object_id, opcode, body) = read_event(client, deadline, "wl_display.error");
+        if object_id != 1 || opcode != 0 {
+            continue;
+        }
+        assert!(
+            body.len() >= 12,
+            "wl_display.error body is too short to carry object, code and message: {body:?}"
+        );
+        let offending = u32::from_ne_bytes(body[0..4].try_into().expect("offending object id"));
+        let code = u32::from_ne_bytes(body[4..8].try_into().expect("protocol error code"));
+        let length = u32::from_ne_bytes(body[8..12].try_into().expect("message length")) as usize;
+        let end = 12 + length.saturating_sub(1);
+        let message = String::from_utf8_lossy(&body[12..end.min(body.len())]).into_owned();
+        return (offending, code, message);
+    }
+    panic!("no wl_display.error arrived before the event budget ran out");
+}
+
+fn words(values: &[u32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_ne_bytes())
+        .collect()
+}
+
+fn wire_string_argument(value: &str) -> Vec<u8> {
+    let mut body = Vec::with_capacity(4 + value.len() + 4);
+    body.extend_from_slice(&u32::try_from(value.len() + 1).unwrap().to_ne_bytes());
+    body.extend_from_slice(value.as_bytes());
+    body.push(0);
+    while body.len() % 4 != 0 {
+        body.push(0);
+    }
+    body
+}
+
+fn registry_globals(client: &mut UnixStream, callback_id: u32) -> HashMap<String, (u32, u32)> {
+    registry_globals_for(client, 2, callback_id)
+}
+
+fn registry_globals_for(
+    client: &mut UnixStream,
+    registry_id: u32,
+    callback_id: u32,
+) -> HashMap<String, (u32, u32)> {
+    let awaited = format!("registry globals before sync callback {callback_id}");
+    let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    let mut globals = HashMap::new();
+    for _ in 0..64 {
+        let (object_id, opcode, body) = read_event(client, deadline, &awaited);
+        if object_id == callback_id && opcode == 0 {
+            return globals;
+        }
+        if object_id != registry_id || opcode != 0 || body.len() < 12 {
+            continue;
+        }
+        let name = u32::from_ne_bytes(body[0..4].try_into().expect("global name"));
+        let string_len =
+            u32::from_ne_bytes(body[4..8].try_into().expect("interface length")) as usize;
+        assert!(string_len > 0, "Wayland string includes a terminating NUL");
+        let padded_len = string_len.div_ceil(4) * 4;
+        assert!(body.len() >= 8 + padded_len + 4, "complete global event");
+        let interface = std::str::from_utf8(&body[8..8 + string_len - 1])
+            .expect("interface is UTF-8")
+            .to_owned();
+        let version = u32::from_ne_bytes(
+            body[8 + padded_len..12 + padded_len]
+                .try_into()
+                .expect("global version"),
+        );
+        globals.insert(interface, (name, version));
+    }
+    panic!("registry callback {callback_id} did not complete");
+}
+
+fn registry_global_from_events(
+    events: &[(u32, u16, Vec<u8>)],
+    registry_id: u32,
+    interface: &str,
+) -> Option<(u32, u32)> {
+    events.iter().find_map(|(object, opcode, body)| {
+        if *object != registry_id || *opcode != 0 || body.len() < 12 {
+            return None;
+        }
+        let name = word(body, 0);
+        let string_len = word(body, 1) as usize;
+        if string_len == 0 {
+            return None;
+        }
+        let padded_len = string_len.div_ceil(4) * 4;
+        if body.len() < 8 + padded_len + 4 {
+            return None;
+        }
+        let announced = std::str::from_utf8(&body[8..8 + string_len - 1]).ok()?;
+        (announced == interface).then(|| (name, word(body, (8 + padded_len) / 4)))
+    })
+}
+
+fn wire_string(body: &[u8], offset: &mut usize) -> String {
+    assert!(body.len() >= *offset + 4, "wire string has a length");
+    let length = u32::from_ne_bytes(
+        body[*offset..*offset + 4]
+            .try_into()
+            .expect("wire string length"),
+    ) as usize;
+    assert!(length > 0, "Wayland string includes a terminating NUL");
+    let start = *offset + 4;
+    let padded = length.div_ceil(4) * 4;
+    assert!(body.len() >= start + padded, "wire string is complete");
+    let value = std::str::from_utf8(&body[start..start + length - 1])
+        .expect("wire string is UTF-8")
+        .to_owned();
+    *offset = start + padded;
+    value
+}
+
+fn bind_global(
+    client: &mut UnixStream,
+    global_name: u32,
+    interface: &str,
+    version: u32,
+    new_id: u32,
+) {
+    let string_len = interface.len() + 1;
+    let padded_len = string_len.div_ceil(4) * 4;
+    let mut body = Vec::with_capacity(12 + padded_len);
+    body.extend_from_slice(&global_name.to_ne_bytes());
+    body.extend_from_slice(&(string_len as u32).to_ne_bytes());
+    body.extend_from_slice(interface.as_bytes());
+    body.resize(8 + padded_len, 0);
+    body.extend_from_slice(&version.to_ne_bytes());
+    body.extend_from_slice(&new_id.to_ne_bytes());
+    send_request(client, 2, 0, &body);
+}
+
+const TEST_COMPOSITOR_ID: u32 = 4;
+const TEST_XDG_WM_BASE_ID: u32 = 5;
+const TEST_SEAT_ID: u32 = 6;
+const TEST_SUBCOMPOSITOR_ID: u32 = 7;
+const TEST_KEYBOARD_ID: u32 = 8;
+const TEST_TOPLEVEL_SURFACE_ID: u32 = 9;
+const TEST_XDG_SURFACE_ID: u32 = 10;
+const TEST_TOPLEVEL_ID: u32 = 11;
+const TEST_SUBSURFACE_SURFACE_ID: u32 = 12;
+const TEST_SUBSURFACE_ID: u32 = 13;
+const TEST_LINUX_DMABUF_ID: u32 = 14;
+
+struct KeybindingHarness {
+    server: ProtocolServer,
+    client: UnixStream,
+    registry_globals: HashMap<String, (u32, u32)>,
+    ecs_actions: Receiver<EcsAction>,
+    commands: CommandSender<ProtocolCommand>,
+    renderer_events: Receiver<Vec<ProtocolEvent>>,
+    _kms_commands: Receiver<KmsRenderCommand>,
+    client_state: Arc<WaylandClientState>,
+    next_callback_id: u32,
+    /// The injector half of the registered fake input source.
+    ///
+    /// Every harness routes through this rather than calling
+    /// [`input::route_input_event`] directly, so the registered calloop callback
+    /// is on the path of all of them and not only of the stall oracle. A
+    /// callback that forwarded some `InputEvent` variants and dropped others
+    /// would otherwise be invisible: the direct call it replaced skipped the one
+    /// piece of production wiring that could do the dropping.
+    input: FakeInputInjector,
+}
+
+impl KeybindingHarness {
+    fn new(keybindings_enabled: bool) -> Self {
+        Self::new_with_backend(keybindings_enabled, BackendKind::Winit)
+    }
+
+    fn new_with_backend(keybindings_enabled: bool, backend_kind: BackendKind) -> Self {
+        Self::new_with_backend_and_retirement_adapter(
+            keybindings_enabled,
+            backend_kind,
+            test_retirement_adapter(),
+        )
+    }
+
+    fn admit_kms_4k_at_250_percent(&mut self) {
+        use crate::backend::kms::{
+            ConnectorDescription, ConnectorMode, KmsTopologyLifecycleEvent, KmsTopologySnapshot,
+            OutputKey, OutputScale120, PreselectedAtomicOutput,
+        };
+
+        let key = OutputKey {
+            device: 226,
+            connector_name: "Fractional-1".into(),
+        };
+        let mode = ConnectorMode {
+            width: 3840,
+            height: 2160,
+            refresh_millihz: 60_000,
+            preferred: true,
+            clock_khz: 533_250,
+            hsync: (3840, 3888, 3920),
+            vsync: (2160, 2163, 2168),
+            hskew: 0,
+            vscan: 0,
+            flags: 0,
+        };
+        self.server
+            .state
+            .backend
+            .apply_kms_topology_lifecycle(KmsTopologyLifecycleEvent::Initial(KmsTopologySnapshot {
+                connectors: vec![ConnectorDescription {
+                    key: key.clone(),
+                    connector_id: 91,
+                    modes: vec![mode],
+                }],
+                selections: vec![PreselectedAtomicOutput {
+                    key,
+                    connector_mode: mode,
+                    selection: Ok(test_atomic_selection(91, mode)),
+                }],
+                output_scale: OutputScale120::new(300).expect("250 percent"),
+            }))
+            .expect("fractional KMS topology is admitted");
+    }
+
+    fn new_with_retirement_adapter(
+        keybindings_enabled: bool,
+        retirement_adapter: Option<Box<dyn WaitForSubmittedWork>>,
+    ) -> Self {
+        Self::new_with_backend_and_retirement_adapter(
+            keybindings_enabled,
+            BackendKind::Winit,
+            retirement_adapter,
+        )
+    }
+
+    fn new_with_backend_and_retirement_adapter(
+        keybindings_enabled: bool,
+        backend_kind: BackendKind,
+        retirement_adapter: Option<Box<dyn WaitForSubmittedWork>>,
+    ) -> Self {
+        Self::new_with_protocol_capabilities(
+            keybindings_enabled,
+            backend_kind,
+            retirement_adapter,
+            DmabufCapabilities {
+                main_device: 0,
+                formats: vec![cosmix_wgpu_dmabuf::DmabufFormat {
+                    fourcc: smithay::backend::allocator::Fourcc::Argb8888 as u32,
+                    modifier: u64::from(smithay::backend::allocator::Modifier::Linear),
+                    plane_count: 1,
+                }],
+                adapter_name: "keybinding-test".into(),
+                drm_adapter: synthetic_drm_adapter("keybinding-test"),
+            },
+            ExplicitSyncExposureMode::Disabled,
+        )
+    }
+
+    #[cfg(feature = "explicit-sync-live-test")]
+    fn new_with_live_explicit_sync(
+        render_dev_t: u64,
+        drm_adapter: cosmix_wgpu_dmabuf::VulkanDrmAdapter,
+    ) -> Self {
+        Self::new_with_live_explicit_sync_and_retirement_adapter(
+            render_dev_t,
+            drm_adapter,
+            test_retirement_adapter(),
+        )
+    }
+
+    #[cfg(feature = "explicit-sync-live-test")]
+    fn new_with_live_explicit_sync_and_retirement_adapter(
+        render_dev_t: u64,
+        drm_adapter: cosmix_wgpu_dmabuf::VulkanDrmAdapter,
+        retirement_adapter: Option<Box<dyn WaitForSubmittedWork>>,
+    ) -> Self {
+        let adapter_name = drm_adapter.name.clone();
+        Self::new_with_protocol_capabilities(
+            true,
+            BackendKind::Winit,
+            retirement_adapter,
+            DmabufCapabilities {
+                main_device: render_dev_t,
+                formats: vec![cosmix_wgpu_dmabuf::DmabufFormat {
+                    fourcc: smithay::backend::allocator::Fourcc::Argb8888 as u32,
+                    modifier: u64::from(smithay::backend::allocator::Modifier::Linear),
+                    plane_count: 1,
+                }],
+                adapter_name,
+                drm_adapter,
+            },
+            ExplicitSyncExposureMode::Production,
+        )
+    }
+
+    fn new_with_protocol_capabilities(
+        keybindings_enabled: bool,
+        backend_kind: BackendKind,
+        retirement_adapter: Option<Box<dyn WaitForSubmittedWork>>,
+        dmabuf_capabilities: DmabufCapabilities,
+        explicit_sync_exposure_mode: ExplicitSyncExposureMode,
+    ) -> Self {
+        Self::new_with_protocol_capabilities_and_bindings(
+            keybindings_enabled,
+            backend_kind,
+            retirement_adapter,
+            dmabuf_capabilities,
+            explicit_sync_exposure_mode,
+            BindingProfile::Nested,
+            None,
+        )
+    }
+
+    fn new_with_kms_live_bindings(vt_requests: Sender<u8>) -> Self {
+        Self::new_with_protocol_capabilities_and_bindings(
+            true,
+            BackendKind::Kms,
+            test_retirement_adapter(),
+            DmabufCapabilities {
+                main_device: 0,
+                formats: vec![cosmix_wgpu_dmabuf::DmabufFormat {
+                    fourcc: smithay::backend::allocator::Fourcc::Argb8888 as u32,
+                    modifier: u64::from(smithay::backend::allocator::Modifier::Linear),
+                    plane_count: 1,
+                }],
+                adapter_name: "kms-live-binding-test".into(),
+                drm_adapter: synthetic_drm_adapter("kms-live-binding-test"),
+            },
+            ExplicitSyncExposureMode::Disabled,
+            BindingProfile::KmsLive,
+            Some(Box::new(move |vt| {
+                let _ = vt_requests.send(vt);
+            })),
+        )
+    }
+
+    fn new_with_protocol_capabilities_and_bindings(
+        keybindings_enabled: bool,
+        backend_kind: BackendKind,
+        retirement_adapter: Option<Box<dyn WaitForSubmittedWork>>,
+        dmabuf_capabilities: DmabufCapabilities,
+        explicit_sync_exposure_mode: ExplicitSyncExposureMode,
+        binding_profile: BindingProfile,
+        vt_switch_requested: Option<Box<dyn Fn(u8) + Send>>,
+    ) -> Self {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after Unix epoch")
+            .as_nanos();
+        let socket_name = format!("cosmix-keybinding-test-{}-{unique}", std::process::id());
+        let (commands, command_source) = channel::channel();
+        let (event_sender, renderer_events) = mpsc::sync_channel(PROTOCOL_EVENT_BATCH_CAPACITY);
+        let (ecs_action_sender, ecs_actions) = mpsc::sync_channel(ECS_ACTION_QUEUE_CAPACITY);
+        let (kms_render_command_sender, kms_commands) = mpsc::channel();
+        let (input, input_source) = fake_input_source();
+        let server = ProtocolServer::new(
+            &socket_name,
+            BackendKind::Winit,
+            (320, 240),
+            WaylandGpuWiring {
+                dmabuf_capabilities: Some(dmabuf_capabilities),
+                dmabuf_validator: None,
+                retirement_adapter,
+            },
+            ProtocolServerBootstrap {
+                command_source,
+                event_sender,
+                ecs_action_sender,
+                kms_render_command_sender,
+                keybindings_enabled,
+                binding_profile,
+                vt_switch_requested,
+                explicit_sync_exposure_mode,
+                decoration: DecorationStartup::default(),
+                input_source: Some(input_source),
+                cursor_position: Arc::new(Mutex::new(CursorPositionSnapshot::default())),
+            },
+        )
+        .expect("construct in-process compositor state");
+        // This harness drives the server directly rather than through a runtime,
+        // so there is no readiness channel for the startup report to travel on.
+        // The report is exercised where it is consumed, in the tests that start
+        // a real `WaylandRuntime`.
+        let (mut server, _explicit_sync_startup) = server;
+        if backend_kind == BackendKind::Kms {
+            server.state.backend = BackendData::Kms(KmsBackendData::new((320, 240)));
+        }
+
+        let (client, server_stream) = UnixStream::pair().expect("Wayland test socket pair");
+        let client_state = Arc::new(WaylandClientState::new(
+            server.state.client_disconnect_sender.clone(),
+        ));
+        server
+            .state
+            .display_handle
+            .insert_client(server_stream, client_state.clone())
+            .expect("register in-process Wayland client");
+
+        let mut harness = Self {
+            server,
+            client,
+            registry_globals: HashMap::new(),
+            ecs_actions,
+            commands,
+            renderer_events,
+            _kms_commands: kms_commands,
+            client_state,
+            next_callback_id: 15,
+            input,
+        };
+        harness.create_focused_subsurface_client();
+        harness
+    }
+
+    fn dispatch_client(&mut self) {
+        self.server
+            .display
+            .dispatch_clients(&mut self.server.state)
+            .expect("dispatch in-process Wayland client");
+        self.server.state.reconcile_subsurface_roles();
+        self.server.state.popup_manager.cleanup();
+        self.server
+            .display
+            .flush_clients()
+            .expect("flush in-process Wayland client");
+    }
+
+    fn sync(&mut self) -> Vec<(u32, u16, Vec<u8>)> {
+        let callback_id = self.next_callback_id;
+        self.next_callback_id += 1;
+        send_display_request(&mut self.client, 0, callback_id);
+        self.dispatch_client();
+        self.assert_client_connected(&format!("before sync callback {callback_id}"));
+        events_until_callback(&mut self.client, callback_id)
+    }
+
+    fn arm_explicit_sync_withdrawal_probe(&mut self) -> GlobalId {
+        assert!(self.server.state.drm_syncobj_state.is_none());
+        let output = Output::new(
+            "explicit-sync-withdrawal-probe".into(),
+            PhysicalProperties {
+                size: (1, 1).into(),
+                subpixel: Subpixel::Unknown,
+                make: "CosMix".into(),
+                model: "Explicit Sync Withdrawal Probe".into(),
+            },
+        );
+        let global = output.create_global::<WaylandState>(&self.server.state.display_handle);
+        assert!(
+            !self
+                .server
+                .state
+                .display_handle
+                .backend_handle()
+                .global_info(global.clone())
+                .expect("withdrawal probe global exists")
+                .disabled
+        );
+        self.server.state.explicit_sync_global_advertised = true;
+        self.server.state.drm_syncobj_state = Some(ExplicitSyncGlobal::Probe(global.clone()));
+        global
+    }
+
+    fn assert_explicit_sync_global_withdrawn(&self, global: &GlobalId) {
+        assert!(self.server.state.drm_syncobj_state.is_none());
+        assert!(!self.server.state.explicit_sync_global_advertised);
+        assert!(
+            self.server
+                .state
+                .display_handle
+                .backend_handle()
+                .global_info(global.clone())
+                .expect("disabled withdrawal probe global remains allocated")
+                .disabled,
+            "the fault must disable the global, not merely change its reporting bool"
+        );
+    }
+
+    fn assert_client_connected(&self, context: &str) {
+        assert_eq!(
+            *self
+                .client_state
+                .disconnect_reason
+                .lock()
+                .expect("test disconnect-reason mutex poisoned"),
+            None,
+            "Wayland client disconnected {context}"
+        );
+    }
+
+    fn create_focused_subsurface_client(&mut self) {
+        send_display_request(&mut self.client, 1, 2);
+        send_display_request(&mut self.client, 0, 3);
+        self.dispatch_client();
+        let globals = registry_globals(&mut self.client, 3);
+        let (compositor, compositor_version) = globals["wl_compositor"];
+        let (xdg_wm_base, xdg_version) = globals["xdg_wm_base"];
+        let (seat, seat_version) = globals["wl_seat"];
+        let (subcompositor, subcompositor_version) = globals["wl_subcompositor"];
+        let (linux_dmabuf, linux_dmabuf_version) = globals["zwp_linux_dmabuf_v1"];
+        bind_global(
+            &mut self.client,
+            compositor,
+            "wl_compositor",
+            compositor_version.min(5),
+            TEST_COMPOSITOR_ID,
+        );
+        bind_global(
+            &mut self.client,
+            xdg_wm_base,
+            "xdg_wm_base",
+            xdg_version.min(6),
+            TEST_XDG_WM_BASE_ID,
+        );
+        bind_global(
+            &mut self.client,
+            seat,
+            "wl_seat",
+            seat_version.min(9),
+            TEST_SEAT_ID,
+        );
+        bind_global(
+            &mut self.client,
+            subcompositor,
+            "wl_subcompositor",
+            subcompositor_version,
+            TEST_SUBCOMPOSITOR_ID,
+        );
+        send_request(
+            &mut self.client,
+            TEST_SEAT_ID,
+            1,
+            &words(&[TEST_KEYBOARD_ID]),
+        );
+        send_request(
+            &mut self.client,
+            TEST_COMPOSITOR_ID,
+            0,
+            &words(&[TEST_TOPLEVEL_SURFACE_ID]),
+        );
+        send_request(
+            &mut self.client,
+            TEST_XDG_WM_BASE_ID,
+            2,
+            &words(&[TEST_XDG_SURFACE_ID, TEST_TOPLEVEL_SURFACE_ID]),
+        );
+        send_request(
+            &mut self.client,
+            TEST_XDG_SURFACE_ID,
+            1,
+            &words(&[TEST_TOPLEVEL_ID]),
+        );
+        send_request(
+            &mut self.client,
+            TEST_COMPOSITOR_ID,
+            0,
+            &words(&[TEST_SUBSURFACE_SURFACE_ID]),
+        );
+        send_request(
+            &mut self.client,
+            TEST_SUBCOMPOSITOR_ID,
+            1,
+            &words(&[
+                TEST_SUBSURFACE_ID,
+                TEST_SUBSURFACE_SURFACE_ID,
+                TEST_TOPLEVEL_SURFACE_ID,
+            ]),
+        );
+        bind_global(
+            &mut self.client,
+            linux_dmabuf,
+            "zwp_linux_dmabuf_v1",
+            linux_dmabuf_version.min(4),
+            TEST_LINUX_DMABUF_ID,
+        );
+        self.registry_globals = globals;
+        send_request(&mut self.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+        let _ = self.sync();
+
+        let focused = self
+            .server
+            .state
+            .surfaces
+            .values()
+            .map(|record| record.role.wl_surface())
+            .find(|surface| surface.id().protocol_id() == TEST_SUBSURFACE_SURFACE_ID)
+            .expect("real subsurface exists")
+            .clone();
+        let keyboard = self.server.state.keyboard.clone();
+        keyboard.set_focus(
+            &mut self.server.state,
+            Some(focused),
+            SERIAL_COUNTER.next_serial(),
+        );
+        let _ = self.sync();
+    }
+
+    /// Press or release one key by its evdev code, through the same seat entry
+    /// point both transports use. Deliberately not a direct `keyboard_keycode`
+    /// call: that would skip `HostInput::key_from_evdev`, and skipping it is how
+    /// a keycode-offset regression gets to pass its own test.
+    fn key(&mut self, evdev_code: u32, state: HostButtonState) {
+        let time = super::monotonic_millis();
+        self.server
+            .state
+            .handle_host_input(HostInput::key_from_evdev(evdev_code, state, time));
+    }
+
+    /// Create a `wl_pointer` and give the toplevel a known extent, so pointer
+    /// traffic has both an object to arrive on and a surface to arrive at.
+    ///
+    /// Opt-in rather than part of `new`, because a seat that suddenly grows a
+    /// pointer adds enter/leave/frame traffic to the wire stream every existing
+    /// test reads.
+    fn bind_pointer(&mut self) -> u32 {
+        let pointer = self.allocate_object_id();
+        send_request(&mut self.client, TEST_SEAT_ID, 0, &words(&[pointer]));
+        let (width, height) = self.server.state.backend.seat_extent();
+        let toplevel = self
+            .server
+            .state
+            .surfaces
+            .values_mut()
+            .find(|record| record.role.wl_surface().id().protocol_id() == TEST_TOPLEVEL_SURFACE_ID)
+            .expect("real toplevel exists");
+        toplevel.layout.x = 0.0;
+        toplevel.layout.y = 0.0;
+        toplevel.layout.width = width as f32;
+        toplevel.layout.height = height as f32;
+        toplevel.layout.visible = true;
+        let _ = self.sync();
+        pointer
+    }
+
+    /// Move the pointer onto the toplevel and consume the resulting `enter`.
+    ///
+    /// Smithay reports a focus change as leave/enter and a move within the same
+    /// surface as `motion`, so a test that wants to read `wl_pointer.motion` has
+    /// to already be over the surface. Without this, the first motion of every
+    /// pointer test would be swallowed as an enter and the test would be
+    /// asserting on the second one by accident.
+    fn prime_pointer_focus(&mut self) {
+        self.route(InputEvent::PointerMotionAbsolute {
+            event: FakeAbsoluteEvent {
+                normalised_x: 0.1,
+                normalised_y: 0.1,
+            },
+        });
+        let _ = self.sync();
+    }
+
+    /// Route one fake backend event through the production ingress.
+    ///
+    /// `route_input_event` is the whole bare-metal path; calling anything
+    /// narrower here would test the test rather than the compositor.
+    fn route(&mut self, event: InputEvent<FakeInput>) {
+        let acknowledgement = self.input.inject(event);
+        for dispatch in 1..=EVENT_LOOP_PUMP_LIMIT {
+            self.server
+                .event_loop
+                .dispatch(Some(EVENT_LOOP_PUMP_TIMEOUT), &mut self.server.state)
+                .unwrap_or_else(|error| {
+                    panic!("event loop dispatch {dispatch} failed while routing an injected input event: {error}")
+                });
+            if acknowledgement.try_recv().is_ok() {
+                return;
+            }
+        }
+        panic!(
+            "the registered input source did not route an injected event in \
+             {EVENT_LOOP_PUMP_LIMIT} dispatch cycles"
+        );
+    }
+
+    fn allocate_object_id(&mut self) -> u32 {
+        let id = self.next_callback_id;
+        self.next_callback_id += 1;
+        id
+    }
+
+    #[cfg(feature = "explicit-sync-live-test")]
+    fn bind_live_syncobj_surface(&mut self) -> (u32, u32) {
+        assert!(
+            self.server.state.explicit_sync_global_advertised,
+            "live-test compositor state must record the explicit-sync global as advertised"
+        );
+        let &(global_name, version) = self
+            .registry_globals
+            .get(LIVE_SYNCOBJ_MANAGER_INTERFACE)
+            .unwrap_or_else(|| {
+                panic!("in-process registry must advertise {LIVE_SYNCOBJ_MANAGER_INTERFACE}")
+            });
+        assert_ne!(global_name, 0, "explicit-sync global must have a real name");
+        assert_eq!(
+            version, LIVE_SYNCOBJ_MANAGER_VERSION,
+            "explicit-sync manager version"
+        );
+
+        let manager_id = self.allocate_object_id();
+        bind_global(
+            &mut self.client,
+            global_name,
+            LIVE_SYNCOBJ_MANAGER_INTERFACE,
+            LIVE_SYNCOBJ_MANAGER_VERSION,
+            manager_id,
+        );
+        let _ = self.sync();
+        self.assert_client_connected("after binding the explicit-sync manager");
+
+        let syncobj_surface_id = self.allocate_object_id();
+        send_request(
+            &mut self.client,
+            manager_id,
+            1,
+            &words(&[syncobj_surface_id, TEST_SUBSURFACE_SURFACE_ID]),
+        );
+        let _ = self.sync();
+        self.assert_client_connected("after creating the syncobj surface");
+
+        (manager_id, syncobj_surface_id)
+    }
+
+    #[cfg(feature = "explicit-sync-live-test")]
+    fn import_live_syncobj_timeline(
+        &mut self,
+        manager_id: u32,
+        timeline_fd: BorrowedFd<'_>,
+    ) -> u32 {
+        let timeline_id = self.allocate_object_id();
+        send_request_with_fd(
+            &mut self.client,
+            manager_id,
+            2,
+            &words(&[timeline_id]),
+            timeline_fd,
+        );
+        let _ = self.sync();
+        self.assert_client_connected("after importing the syncobj timeline");
+
+        timeline_id
+    }
+
+    fn create_dmabuf_buffer(&mut self) -> u32 {
+        self.create_dmabuf_buffer_sized(64, 32)
+    }
+
+    /// `create_dmabuf_buffer` with the extent spelled out, for the one test that
+    /// needs two *distinguishable* content generations on the same surface. With
+    /// a single generation, a replay of stale content is indistinguishable from
+    /// a replay of current content — they are the same bytes.
+    fn create_dmabuf_buffer_sized(&mut self, width: u32, height: u32) -> u32 {
+        let stride = width * 4;
+        let params_id = self.allocate_object_id();
+        let buffer_id = self.allocate_object_id();
+        send_request(
+            &mut self.client,
+            TEST_LINUX_DMABUF_ID,
+            1,
+            &words(&[params_id]),
+        );
+        let name =
+            std::ffi::CString::new("cosmix-dmabuf-protocol-test").expect("static memfd name");
+        // SAFETY: name is a live NUL-terminated C string and ownership of the
+        // returned descriptor is transferred immediately into File.
+        let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(
+            raw_fd >= 0,
+            "create anonymous test plane: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: memfd_create returned a new owned descriptor on success.
+        let plane = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+        plane
+            .set_len(u64::from(stride) * u64::from(height))
+            .expect("size anonymous test plane for Smithay bounds validation");
+        let modifier = u64::from(smithay::backend::allocator::Modifier::Linear);
+        send_request_with_fd(
+            &mut self.client,
+            params_id,
+            1,
+            &words(&[0, 0, stride, (modifier >> 32) as u32, modifier as u32]),
+            plane.as_fd(),
+        );
+        send_request(
+            &mut self.client,
+            params_id,
+            3,
+            &words(&[
+                buffer_id,
+                width,
+                height,
+                smithay::backend::allocator::Fourcc::Argb8888 as u32,
+                0,
+            ]),
+        );
+        self.dispatch_client();
+        assert_eq!(
+            *self
+                .client_state
+                .disconnect_reason
+                .lock()
+                .expect("test disconnect-reason mutex poisoned"),
+            None,
+            "ordinary DMA-BUF creation must keep the client connected"
+        );
+        buffer_id
+    }
+
+    fn install_committed_point(&mut self, id: u64) -> TestCommittedPointHandle {
+        let (point, handle) = TestCommittedPoint::pair(id);
+        assert!(
+            self.server
+                .state
+                .committed_release_point_override
+                .replace(point)
+                .is_none(),
+            "only one committed-point override may be armed"
+        );
+        handle
+    }
+
+    fn commit_dmabuf(&mut self, buffer_id: u32) {
+        send_request(
+            &mut self.client,
+            TEST_SUBSURFACE_SURFACE_ID,
+            1,
+            &words(&[buffer_id, 0, 0]),
+        );
+        send_request(&mut self.client, TEST_SUBSURFACE_SURFACE_ID, 6, &[]);
+        send_request(&mut self.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+        self.dispatch_client();
+    }
+
+    fn renderer_releases(&mut self, token: u64) {
+        self.commands
+            .send(ProtocolCommand::ReleaseDmabuf { token })
+            .expect("send renderer release command");
+        pump_protocol_event_loop_until(
+            &mut self.server,
+            "renderer DMA-BUF release command",
+            |state| !state.retained_buffers.tokens.contains_key(&token),
+        );
+    }
+
+    /// A second real subsurface of the same toplevel, mapped with its own
+    /// DMA-BUF, so a test can lose one surface and still have one whose
+    /// survival means something.
+    ///
+    /// Returns the surface and its protocol object id, because a test that
+    /// removes it needs an object to send `destroy` or a null `attach` to.
+    fn extra_mapped_subsurface(&mut self) -> (WlSurface, u32) {
+        let (surface, surface_object, _) = self.extra_mapped_subsurface_with_role();
+        (surface, surface_object)
+    }
+
+    /// As [`Self::extra_mapped_subsurface`], but also yields the
+    /// `wl_subsurface` object id — destroying that alone is what leaves the
+    /// `wl_surface` behind in the dormant role.
+    fn extra_mapped_subsurface_with_role(&mut self) -> (WlSurface, u32, u32) {
+        let surface_object = self.allocate_object_id();
+        let subsurface_object = self.allocate_object_id();
+        send_request(
+            &mut self.client,
+            TEST_COMPOSITOR_ID,
+            0,
+            &words(&[surface_object]),
+        );
+        send_request(
+            &mut self.client,
+            TEST_SUBCOMPOSITOR_ID,
+            1,
+            &words(&[subsurface_object, surface_object, TEST_TOPLEVEL_SURFACE_ID]),
+        );
+        let buffer_id = self.create_dmabuf_buffer();
+        send_request(
+            &mut self.client,
+            surface_object,
+            1,
+            &words(&[buffer_id, 0, 0]),
+        );
+        send_request(&mut self.client, surface_object, 6, &[]);
+        send_request(&mut self.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+        self.dispatch_client();
+        self.assert_client_connected("after mapping the extra subsurface");
+        let surface = self
+            .server
+            .state
+            .surfaces
+            .values()
+            .map(|record| record.role.wl_surface())
+            .find(|surface| surface.id().protocol_id() == surface_object)
+            .expect("extra subsurface exists")
+            .clone();
+        assert!(
+            self.server.state.surfaces[&surface.id()].mapped,
+            "the extra subsurface must be mapped, or it is absent from every \
+             roster for the wrong reason"
+        );
+        (surface, surface_object, subsurface_object)
+    }
+
+    fn subsurface(&self) -> WlSurface {
+        self.server
+            .state
+            .surfaces
+            .values()
+            .map(|record| record.role.wl_surface())
+            .find(|surface| surface.id().protocol_id() == TEST_SUBSURFACE_SURFACE_ID)
+            .expect("real subsurface exists")
+            .clone()
+    }
+
+    fn frame(&mut self, inputs: Vec<HostInput>) {
+        self.server.state.handle_frame(inputs);
+    }
+
+    fn chord(&mut self, keys: &[u32]) {
+        for key in keys {
+            self.key(*key, HostButtonState::Pressed);
+        }
+        for key in keys.iter().rev() {
+            self.key(*key, HostButtonState::Released);
+        }
+    }
+
+    fn interception_enabled(&self) -> bool {
+        self.server
+            .state
+            .bindings
+            .to_strict_data()
+            .contains("\"interception_enabled\": true")
+    }
+}
+
+#[test]
+fn cursor_position_lane_coalesces_a_thousand_moves_without_channel_occupancy() {
+    let mut harness = KeybindingHarness::new(false);
+    let _pointer = harness.bind_pointer();
+    harness.prime_pointer_focus();
+    harness.server.state.events.clear();
+    harness
+        .server
+        .publish_events()
+        .expect("primed cursor state publishes");
+    while harness.renderer_events.try_recv().is_ok() {}
+
+    let before = *harness
+        .server
+        .state
+        .cursor_position_snapshot
+        .lock()
+        .expect("cursor snapshot mutex");
+    let mut previous = before;
+    for move_number in 0..1_000_u32 {
+        let requested = if move_number == 999 {
+            (10_000.0, 10_000.0)
+        } else {
+            (f64::from(move_number % 319), f64::from(move_number % 239))
+        };
+        harness
+            .server
+            .state
+            .pointer_moved(requested.0, requested.1, move_number);
+        let sampled = *harness
+            .server
+            .state
+            .cursor_position_snapshot
+            .lock()
+            .expect("cursor snapshot mutex");
+        let expected = clamp_point_to_seat(requested, &harness.server.state.backend.seat_regions());
+        assert_eq!((sampled.x, sampled.y), expected, "move {move_number}");
+        assert!(
+            sampled.revision > previous.revision,
+            "revision did not advance at move {move_number}"
+        );
+        previous = sampled;
+        assert_eq!(
+            harness
+                .server
+                .publish_events()
+                .expect("motion-only publish"),
+            EventPublication::Complete
+        );
+        assert!(
+            harness.renderer_events.try_recv().is_err(),
+            "motion {move_number} allocated a protocol-event batch"
+        );
+    }
+
+    assert_eq!(previous.revision, before.revision + 1_000);
+    assert_eq!(
+        (previous.x, previous.y),
+        clamp_point_to_seat(
+            (10_000.0, 10_000.0),
+            &harness.server.state.backend.seat_regions()
+        )
+    );
+}
+
+#[test]
+fn cursor_selection_lifecycle_retains_inactive_state_and_defaults_on_active_destroy() {
+    let mut harness = KeybindingHarness::new(false);
+    assert!(matches!(
+        harness.server.state.latest_cursor_update(),
+        Some(ProtocolEvent::CursorUpdated {
+            image: CursorImage::Default
+        })
+    ));
+
+    let pointer = harness.bind_pointer();
+    harness.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: 0.25,
+            normalised_y: 0.25,
+        },
+    });
+    let enter = harness.sync();
+    let serial = enter
+        .iter()
+        .find_map(|(object, opcode, body)| {
+            (*object == pointer && *opcode == 0).then(|| word(body, 0))
+        })
+        .expect("pointer enter supplies a cursor serial");
+
+    let cursor_surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[cursor_surface]),
+    );
+    let _ = harness.sync();
+    harness.server.state.events.clear();
+    send_request(
+        &mut harness.client,
+        pointer,
+        0,
+        &words(&[serial, cursor_surface, 7, 9]),
+    );
+    let _ = harness.sync();
+
+    let cursor_object = harness
+        .server
+        .state
+        .cursor_surfaces
+        .keys()
+        .find(|id| id.protocol_id() == cursor_surface)
+        .expect("set_cursor tracks a separate cursor-surface record")
+        .clone();
+    assert_eq!(
+        harness.server.state.cursor_selection,
+        CursorSelection::Surface(cursor_object.clone())
+    );
+    assert!(matches!(
+        harness.server.state.events.last(),
+        Some(ProtocolEvent::CursorUpdated {
+            image: CursorImage::Hidden
+        })
+    ));
+    assert_eq!(
+        harness.server.state.cursor_surfaces[&cursor_object].hotspot,
+        (7, 9)
+    );
+
+    let cursor_buffer = harness.create_dmabuf_buffer();
+    harness.server.state.events.clear();
+    send_request(
+        &mut harness.client,
+        cursor_surface,
+        1,
+        &words(&[cursor_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, cursor_surface, 6, &[]);
+    let _ = harness.sync();
+    assert!(matches!(
+        harness.server.state.events.last(),
+        Some(ProtocolEvent::CursorUpdated {
+            image: CursorImage::Surface {
+                hotspot: (7, 9),
+                frame: Some(SurfaceFrame::Dmabuf(_)),
+                ..
+            }
+        })
+    ));
+
+    harness.server.state.events.clear();
+    send_request(&mut harness.client, cursor_surface, 1, &words(&[0, 0, 0]));
+    send_request(&mut harness.client, cursor_surface, 6, &[]);
+    let _ = harness.sync();
+    assert_eq!(
+        harness.server.state.cursor_selection,
+        CursorSelection::Surface(cursor_object.clone()),
+        "buffer removal hides without deselecting"
+    );
+    assert!(matches!(
+        harness.server.state.events.last(),
+        Some(ProtocolEvent::CursorUpdated {
+            image: CursorImage::Hidden
+        })
+    ));
+
+    harness.server.state.events.clear();
+    send_request(
+        &mut harness.client,
+        cursor_surface,
+        1,
+        &words(&[cursor_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, cursor_surface, 6, &[]);
+    let _ = harness.sync();
+    assert!(matches!(
+        harness.server.state.events.last(),
+        Some(ProtocolEvent::CursorUpdated {
+            image: CursorImage::Surface {
+                frame: Some(SurfaceFrame::Dmabuf(_)),
+                ..
+            }
+        })
+    ));
+
+    send_request(&mut harness.client, pointer, 0, &words(&[serial, 0, 0, 0]));
+    let _ = harness.sync();
+    assert_eq!(
+        harness.server.state.cursor_selection,
+        CursorSelection::Hidden
+    );
+    harness.server.state.events.clear();
+    send_request(&mut harness.client, cursor_surface, 1, &words(&[0, 0, 0]));
+    send_request(&mut harness.client, cursor_surface, 6, &[]);
+    let _ = harness.sync();
+    send_request(
+        &mut harness.client,
+        cursor_surface,
+        1,
+        &words(&[cursor_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, cursor_surface, 6, &[]);
+    let _ = harness.sync();
+    assert!(
+        harness.server.state.events.is_empty(),
+        "inactive cursor commits are retained without projection"
+    );
+    assert!(
+        harness.server.state.cursor_surfaces[&cursor_object]
+            .buffer_dimensions
+            .is_some()
+    );
+
+    harness
+        .server
+        .state
+        .set_cursor_image(CursorImageStatus::Named(
+            smithay::input::pointer::CursorIcon::Default,
+        ));
+    assert_eq!(
+        harness.server.state.cursor_selection,
+        CursorSelection::Default
+    );
+
+    send_request(
+        &mut harness.client,
+        pointer,
+        0,
+        &words(&[serial, cursor_surface, 7, 9]),
+    );
+    let _ = harness.sync();
+    assert_eq!(
+        harness.server.state.cursor_selection,
+        CursorSelection::Surface(cursor_object.clone())
+    );
+    harness.server.state.events.clear();
+    send_request(&mut harness.client, cursor_surface, 0, &[]);
+    let _ = harness.sync();
+    assert_eq!(
+        harness.server.state.cursor_selection,
+        CursorSelection::Default
+    );
+    assert!(matches!(
+        harness.server.state.events.last(),
+        Some(ProtocolEvent::CursorUpdated {
+            image: CursorImage::Default
+        })
+    ));
+}
+
+fn select_test_cursor(harness: &mut KeybindingHarness) -> (u32, ObjectId) {
+    let pointer = harness.bind_pointer();
+    harness.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: 0.25,
+            normalised_y: 0.25,
+        },
+    });
+    let enter = harness.sync();
+    let serial = enter
+        .iter()
+        .find_map(|(object, opcode, body)| {
+            (*object == pointer && *opcode == 0).then(|| word(body, 0))
+        })
+        .expect("pointer enter supplies a cursor serial");
+    let cursor_surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[cursor_surface]),
+    );
+    let _ = harness.sync();
+    send_request(
+        &mut harness.client,
+        pointer,
+        0,
+        &words(&[serial, cursor_surface, 3, 4]),
+    );
+    let _ = harness.sync();
+    let object = harness
+        .server
+        .state
+        .cursor_surfaces
+        .keys()
+        .find(|id| id.protocol_id() == cursor_surface)
+        .expect("selected cursor has a protocol-side record")
+        .clone();
+    harness.server.state.events.clear();
+    (cursor_surface, object)
+}
+
+fn commit_test_cursor_dmabuf(harness: &mut KeybindingHarness, cursor_surface: u32, buffer: u32) {
+    send_request(
+        &mut harness.client,
+        cursor_surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, cursor_surface, 6, &[]);
+    let _ = harness.sync();
+}
+
+#[test]
+fn explicit_cursor_dmabuf_retires_after_renderer_and_backing_each_release_once() {
+    let mut harness = KeybindingHarness::new(true);
+    let (cursor_surface, cursor_object) = select_test_cursor(&mut harness);
+    let buffer = harness.create_dmabuf_buffer();
+    let point = harness.install_committed_point(1601);
+    commit_test_cursor_dmabuf(&mut harness, cursor_surface, buffer);
+
+    let event = harness
+        .server
+        .state
+        .events
+        .pop()
+        .expect("active cursor commit publishes a renderer owner");
+    let (renderer_token, use_id) = match event {
+        ProtocolEvent::CursorUpdated {
+            image:
+                CursorImage::Surface {
+                    frame: Some(SurfaceFrame::Dmabuf(frame)),
+                    ..
+                },
+        } => (
+            frame.token,
+            frame.use_id.expect("cursor commit has explicit use"),
+        ),
+        other => panic!("explicit cursor commit publishes DMA-BUF: {other:?}"),
+    };
+    let backing_token = harness.server.state.cursor_surfaces[&cursor_object]
+        .dmabuf_backing
+        .as_ref()
+        .expect("cursor retains its DMA-BUF backing")
+        .retention_token;
+    let client = harness.server.state.cursor_surfaces[&cursor_object]
+        .surface
+        .client()
+        .expect("cursor belongs to the live client")
+        .id();
+    assert_eq!(
+        harness.server.state.release_uses.accounting_counts(&client),
+        (1, 1),
+        "one cursor use consumes one client and one global use slot"
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .release_uses
+            .owner_kind_name(renderer_token),
+        Some("renderer")
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .release_uses
+            .owner_kind_name(backing_token),
+        Some("backing")
+    );
+
+    harness.server.state.release_buffer_token(renderer_token);
+    assert_eq!(
+        harness.server.state.release_uses.accounting_counts(&client),
+        (1, 1),
+        "renderer replacement releases its owner without retiring the backed cursor use"
+    );
+    send_request(&mut harness.client, cursor_surface, 1, &words(&[0, 0, 0]));
+    send_request(&mut harness.client, cursor_surface, 6, &[]);
+    let removed = harness.sync();
+    assert_eq!(
+        removed
+            .iter()
+            .filter(|(object, opcode, _)| *object == buffer && *opcode == 0)
+            .count(),
+        1,
+        "explicit ownership returns wl_buffer once both compositor owners leave"
+    );
+    assert_eq!(
+        harness.server.state.release_uses.accounting_counts(&client),
+        (1, 1),
+        "retirement keeps both accounting slots until the GPU report"
+    );
+    pump_protocol_event_loop_until(
+        &mut harness.server,
+        "cursor explicit use retires after both owners leave",
+        |_| point.is_terminal(),
+    );
+    assert_eq!(point.signal_count(), 1);
+    assert!(!point.was_abandoned());
+    assert_eq!(
+        harness
+            .server
+            .state
+            .release_use_test_probe
+            .observations()
+            .retirements
+            .iter()
+            .filter(|retirement| retirement.use_id == use_id)
+            .count(),
+        1,
+        "the cursor use crosses the retirement seam exactly once"
+    );
+    let after_retirement = harness.sync();
+    assert_eq!(
+        after_retirement
+            .iter()
+            .filter(|(object, opcode, _)| *object == buffer && *opcode == 0)
+            .count(),
+        0,
+        "retirement signals the point without releasing the cursor wl_buffer twice"
+    );
+    assert_ne!(backing_token, renderer_token);
+}
+
+#[test]
+fn saturated_dirty_cursor_resume_flush_publishes_only_the_newest_dmabuf() {
+    let mut harness = KeybindingHarness::new(true);
+    let (cursor_surface, _) = select_test_cursor(&mut harness);
+    let first = harness.create_dmabuf_buffer_sized(64, 32);
+    commit_test_cursor_dmabuf(&mut harness, cursor_surface, first);
+    let first_event = harness
+        .server
+        .state
+        .events
+        .pop()
+        .expect("first active cursor commit publishes");
+
+    harness
+        .server
+        .event_sender
+        .try_send(vec![ProtocolEvent::OutputResized {
+            width: 301,
+            height: 201,
+        }])
+        .expect("first stale batch fills the renderer channel");
+    harness
+        .server
+        .event_sender
+        .try_send(vec![ProtocolEvent::OutputResized {
+            width: 302,
+            height: 202,
+        }])
+        .expect("second stale batch saturates the two-batch channel");
+    harness
+        .server
+        .queue_renderer_event_with_test_limit(first_event, 0);
+    assert!(harness.server.dirty_cursor);
+
+    assert_eq!(
+        harness
+            .server
+            .publish_events()
+            .expect("dirty recovery compacts"),
+        EventPublication::Pending,
+        "the dirty cursor is rebuilt but cannot enter a saturated channel"
+    );
+    let second = harness.create_dmabuf_buffer_sized(32, 16);
+    commit_test_cursor_dmabuf(&mut harness, cursor_surface, second);
+    assert_eq!(
+        harness
+            .server
+            .publish_events()
+            .expect("second cursor compacts"),
+        EventPublication::Pending
+    );
+    let newest = harness.create_dmabuf_buffer_sized(16, 8);
+    commit_test_cursor_dmabuf(&mut harness, cursor_surface, newest);
+    assert_eq!(
+        harness
+            .server
+            .publish_events()
+            .expect("newest cursor compacts"),
+        EventPublication::Pending
+    );
+
+    let stale = [
+        harness.renderer_events.try_recv().expect("stale batch one"),
+        harness.renderer_events.try_recv().expect("stale batch two"),
+    ];
+    assert!(
+        stale
+            .iter()
+            .flatten()
+            .all(|event| !matches!(event, ProtocolEvent::CursorUpdated { .. }))
+    );
+    assert_eq!(
+        harness
+            .server
+            .publish_events()
+            .expect("resume flush publishes current cursor"),
+        EventPublication::Complete
+    );
+    let resumed = harness
+        .renderer_events
+        .try_recv()
+        .expect("first resumed drain has the cursor");
+    let sizes = resumed
+        .iter()
+        .filter_map(|event| match event {
+            ProtocolEvent::CursorUpdated {
+                image:
+                    CursorImage::Surface {
+                        frame: Some(SurfaceFrame::Dmabuf(frame)),
+                        ..
+                    },
+            } => Some((frame.descriptor.width, frame.descriptor.height)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sizes,
+        [(16, 8)],
+        "the first resumed batch contains current cursor C, never stale A or B"
+    );
+}
+
+#[test]
+fn bounded_event_loop_pump_retries_until_a_later_command_is_ready() {
+    let mut harness = KeybindingHarness::new(true);
+    let commands = harness.commands.clone();
+    let (acknowledgement, acknowledgement_receiver) = mpsc::sync_channel(1);
+    let mut command_queued = false;
+
+    pump_protocol_event_loop_until(
+        &mut harness.server,
+        "command queued after the first dispatch",
+        |_| {
+            if !command_queued {
+                commands
+                    .send(ProtocolCommand::Barrier {
+                        acknowledgement: acknowledgement.clone(),
+                    })
+                    .expect("queue command after first event-loop dispatch");
+                command_queued = true;
+                return false;
+            }
+            acknowledgement_receiver.try_recv().is_ok()
+        },
+    );
+}
+
+#[test]
+#[should_panic(expected = "protocol condition not reached after 1 dispatch cycles")]
+fn bounded_event_loop_pump_panics_when_its_dispatch_bound_is_exhausted() {
+    let mut harness = KeybindingHarness::new(true);
+
+    pump_protocol_event_loop_until_with_budget(
+        &mut harness.server,
+        "an intentionally unreachable condition",
+        Duration::ZERO,
+        1,
+        |_| false,
+    );
+}
+
+fn take_dmabuf_upsert(state: &mut WaylandState) -> (SurfaceId, DmabufFrame) {
+    let mut found = None;
+    for event in mem::take(&mut state.events) {
+        if let ProtocolEvent::SurfaceUpserted {
+            id,
+            frame: SurfaceFrame::Dmabuf(frame),
+            ..
+        } = event
+        {
+            assert!(found.replace((id, frame)).is_none(), "one DMA-BUF upsert");
+        }
+    }
+    found.expect("real DMA-BUF commit emits an upsert")
+}
+
+/// Assert two layouts agree on **every** field.
+///
+/// `SurfaceLayout` is deliberately not `PartialEq` in production, so an oracle
+/// that wants "the layout it was queued with" has to name the fields itself —
+/// and naming a subset is exactly how a layout mutation walks past the
+/// assertion. Asserting `width`/`height` alone leaves `x`, `y`, `z`, the source
+/// rect, the parent, the transform and the visibility free to change.
+fn assert_layout_unchanged(kept: &SurfaceLayout, queued: &SurfaceLayout, what: &str) {
+    assert_eq!((kept.x, kept.y), (queued.x, queued.y), "{what}: position");
+    assert_eq!(
+        (kept.width, kept.height, kept.z),
+        (queued.width, queued.height, queued.z),
+        "{what}: extent"
+    );
+    assert_eq!(kept.source, queued.source, "{what}: source rect");
+    assert_eq!(kept.parent, queued.parent, "{what}: parent");
+    assert_eq!(kept.transform, queued.transform, "{what}: transform");
+    assert_eq!(kept.visible, queued.visible, "{what}: visibility");
+}
+
+/// Assert a `DmabufFrame` built by [`synthetic_dmabuf_event`] came through
+/// unchanged — **all** of it.
+///
+/// The token is the field a lost frame strands, so it is the one an oracle
+/// reaches for first; but `use_id`, `fourcc`, `modifier` and the plane geometry
+/// are equally part of "the frame that was queued", and an assertion that names
+/// only the token and the extent is satisfied by a frame whose format or plane
+/// stride has been rewritten. `use_id` in particular must be asserted against a
+/// **non-`None`** expectation, or clearing it is invisible.
+fn assert_synthetic_dmabuf_unchanged(
+    kept: &DmabufFrame,
+    token: u64,
+    use_id: Option<DmabufUseId>,
+    what: &str,
+) {
+    assert_eq!(kept.token, token, "{what}: renderer token");
+    assert_eq!(kept.use_id, use_id, "{what}: use id");
+    assert_eq!(
+        (kept.descriptor.width, kept.descriptor.height),
+        (64, 32),
+        "{what}: extent"
+    );
+    assert_eq!(
+        (kept.descriptor.fourcc, kept.descriptor.modifier),
+        (0, 0),
+        "{what}: format"
+    );
+    assert_eq!(kept.descriptor.planes.len(), 1, "{what}: plane count");
+    assert_eq!(
+        (
+            kept.descriptor.planes[0].offset,
+            kept.descriptor.planes[0].stride
+        ),
+        (0, 256),
+        "{what}: plane geometry"
+    );
+}
+
+fn committed_dmabuf_backing(
+    state: &WaylandState,
+    surface: &WlSurface,
+) -> (u64, Option<DmabufUseId>, ObjectId) {
+    let backing = state.surfaces[&surface.id()]
+        .dmabuf_backing
+        .as_ref()
+        .expect("real DMA-BUF commit stores backing");
+    (backing.retention_token, backing.use_id, backing.buffer.id())
+}
+
+fn assert_waiting_at_retirement_seam(point: &TestCommittedPointHandle) {
+    assert!(point.reached_retirement_seam());
+    assert_eq!(point.signal_count(), 0);
+    assert!(
+        !point.is_terminal(),
+        "the dormant H3b seam is not a terminal release-point disposition"
+    );
+}
+
+fn assert_signalled_after_retirement(
+    harness: &mut KeybindingHarness,
+    point: &TestCommittedPointHandle,
+) {
+    assert_waiting_at_retirement_seam(point);
+    pump_protocol_event_loop_until(
+        &mut harness.server,
+        "successful explicit-sync GPU retirement",
+        |_| point.signal_count() == 1,
+    );
+    assert_eq!(point.signal_count(), 1);
+    assert!(point.is_terminal());
+    assert!(!point.was_abandoned());
+}
+
+fn commit_and_retire_explicit_use(
+    harness: &mut KeybindingHarness,
+    buffer_id: u32,
+    point_id: u64,
+) -> TestCommittedPointHandle {
+    let surface = harness.subsurface();
+    let point = harness.install_committed_point(point_id);
+    harness.commit_dmabuf(buffer_id);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (backing_token, _, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+    harness.server.state.release_buffer_token(frame.token);
+    harness.server.state.release_buffer_token(backing_token);
+    point
+}
+
+#[test]
+fn destroying_a_dmabuf_buffer_publishes_its_renderer_cache_invalidation() {
+    let mut harness = KeybindingHarness::new(true);
+    let surface = harness.subsurface();
+    let surface_id = harness.server.state.surfaces[&surface.id()].id;
+    let buffer = harness.create_dmabuf_buffer();
+    harness.commit_dmabuf(buffer);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let buffer_id = frame.buffer_id;
+    harness.server.state.release_buffer_token(frame.token);
+
+    send_request(&mut harness.client, buffer, 0, &[]);
+    harness.dispatch_client();
+
+    assert!(
+        harness.server.state.events.iter().any(|event| matches!(
+            event,
+            ProtocolEvent::DmabufBufferDestroyed {
+                buffer_id: destroyed
+            } if *destroyed == buffer_id
+        )),
+        "wl_buffer destruction must invalidate the exact renderer cache identity"
+    );
+
+    let LatestSurfaceUpsert::Ready(event) = harness.server.state.latest_surface_upsert(surface_id)
+    else {
+        panic!("destroyed attached buffer remains available for dirty recovery");
+    };
+    let ProtocolEvent::SurfaceUpserted {
+        frame: SurfaceFrame::Dmabuf(replay),
+        ..
+    } = *event
+    else {
+        panic!("dirty recovery stays DMA-BUF");
+    };
+    assert_eq!(replay.buffer_id, buffer_id);
+    assert!(
+        !replay.cacheable,
+        "a replay after wl_buffer.destroy must not resurrect its cache entry"
+    );
+    harness.server.state.release_buffer_token(replay.token);
+}
+
+#[test]
+fn live_dmabuf_identity_table_stays_bounded_and_overflow_frames_are_uncached() {
+    let mut harness = KeybindingHarness::new(true);
+    let mut last_cacheable = true;
+
+    for _ in 0..=MAX_DMABUF_CACHE_IDENTITIES {
+        let buffer = harness.create_dmabuf_buffer();
+        harness.commit_dmabuf(buffer);
+        let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+        last_cacheable = frame.cacheable;
+        harness.server.state.release_buffer_token(frame.token);
+    }
+
+    assert_eq!(
+        harness.server.state.dmabuf_buffer_ids.len(),
+        MAX_DMABUF_CACHE_IDENTITIES
+    );
+    assert!(
+        !last_cacheable,
+        "a live wl_buffer beyond the identity budget remains renderable but bypasses the cache"
+    );
+}
+
+#[test]
+fn pause_time_dmabuf_destroy_storm_folds_to_one_bounded_epoch_invalidation() {
+    let mut pending = PendingProtocolEvents::default();
+    for identity in 0..=MAX_PENDING_DMABUF_INVALIDATIONS {
+        pending
+            .push(ProtocolEvent::DmabufBufferDestroyed {
+                buffer_id: DmabufBufferId(identity as u64),
+            })
+            .expect("invalidation tombstones are always admitted");
+    }
+
+    assert!(pending.invalidate_all_dmabufs);
+    assert!(pending.dmabuf_invalidations.is_empty());
+    assert_eq!(pending.bytes, 0);
+    let folded = pending.take();
+    assert!(matches!(
+        folded.as_slice(),
+        [ProtocolEvent::DmabufCacheInvalidated]
+    ));
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn new_surface_installs_acquire_gate_pre_commit_hook() {
+    let harness = KeybindingHarness::new(true);
+
+    assert!(harness.server.state.acquire_gate_pre_commit_count > 0);
+}
+
+#[test]
+fn surface_destruction_reaches_acquire_gate_cleanup_hook() {
+    let mut harness = KeybindingHarness::new(true);
+    let surface_id = harness.next_callback_id;
+    harness.next_callback_id += 1;
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface_id]),
+    );
+    harness.dispatch_client();
+
+    let live_surfaces = harness.server.state.surface_count;
+    assert!(
+        live_surfaces > 0,
+        "the surface exists before it is destroyed"
+    );
+
+    send_request(&mut harness.client, surface_id, 0, &[]);
+    harness.dispatch_client();
+
+    assert_eq!(harness.server.state.acquire_gate_surface_destroyed_count, 1);
+    // Gate retirement must run LAST in `destroyed`, after this surface's record,
+    // shm bytes and dmabuf token are refunded — otherwise a released gate can wake
+    // a fused sibling into budgets that still count the dying surface. Witnessed
+    // through `surface_count`, which `destroyed` decrements immediately after
+    // `destroy_surface_record`.
+    assert_eq!(
+        harness
+            .server
+            .state
+            .acquire_gate_destroy_observed_surface_count,
+        Some(live_surfaces - 1)
+    );
+}
+
+/// Every `.rs` file under the crate's `src/`, as `(path, lines)`.
+///
+/// The walk follows *file* symlinks, because rustc does: a symlinked
+/// `src/rogue.rs` reached by an ordinary `mod rogue;` is compiled like any
+/// other module, so a scan that skipped it would be blind to source that ships.
+/// A *directory* symlink resolving under the root is followed — enough for a
+/// `src/loop -> .`, which identity-keyed visiting then enters once rather than
+/// for ever. One resolving outside the root is a hard failure rather than a
+/// silent skip: rustc would compile modules there, so skipping is blindness,
+/// and following is an unbounded walk of someone else's files. Neither is an
+/// answer this scan is entitled to give.
+fn crate_sources() -> Vec<(std::path::PathBuf, Vec<String>)> {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let sources = crate_sources_at(&src);
+
+    // A walk that found nothing makes every count built on it vacuously
+    // satisfied, so the real crate's scan refuses to be that quiet.
+    assert!(
+        sources.len() >= 5,
+        "source walk of {} found only {} .rs files; the counts that depend on it \
+         would be vacuous",
+        src.display(),
+        sources.len()
+    );
+
+    sources
+}
+
+/// [`crate_sources`] against an arbitrary root, so the walk's own behaviour is
+/// testable without a rogue file in the crate.
+fn crate_sources_at(src: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<String>)> {
+    let root = std::fs::canonicalize(src).expect("source root resolves");
+    let mut pending = vec![root.clone()];
+    let mut visited = std::collections::HashSet::new();
+    let mut paths = Vec::new();
+    while let Some(dir) = pending.pop() {
+        // Canonical identity is what makes following symlinks safe: a link back
+        // to an ancestor resolves to a directory already walked.
+        let identity = std::fs::canonicalize(&dir).expect("source directory resolves");
+        if !visited.insert(identity) {
+            continue;
+        }
+        for entry in std::fs::read_dir(&dir).expect("crate sources are readable") {
+            let entry = entry.expect("directory entry");
+            let path = entry.path();
+            // `Path::is_dir`/`is_file` traverse symlinks — deliberately, per the
+            // doc comment above. A dangling link is neither, and is ignored: it
+            // would not compile either.
+            if path.is_dir() {
+                // A directory link resolving under the root — `src/loop -> .`
+                // — is walked, and identity-keyed visiting then enters it once.
+                // One resolving *outside* the root is refused, not skipped:
+                // `src/rogue -> ../rogue-module` is compiled by rustc via an
+                // ordinary `mod rogue;`, so skipping it would leave the scans
+                // blind to shipping source, while walking it would drag an
+                // arbitrary tree into every run. Neither is an answer, so the
+                // walk declines to give one.
+                let target = std::fs::canonicalize(&path).expect("directory resolves");
+                assert!(
+                    target.starts_with(&root),
+                    "{} resolves to {}, outside the scanned root {}; rustc would \
+                     compile modules there but this walk will not follow an \
+                     arbitrary tree, so it refuses rather than report a count it \
+                     cannot stand behind",
+                    path.display(),
+                    target.display(),
+                    root.display()
+                );
+                pending.push(target);
+            } else if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+                paths.push(path);
+            }
+        }
+    }
+
+    paths
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(&path).expect("source file is readable");
+            let lines = text.lines().map(str::to_owned).collect();
+            (path, lines)
+        })
+        .collect()
+}
+
+/// Refuse any `type` item mentioning `name`, however the right-hand side is
+/// spelled and however it is laid out. `= DrmSyncobjState` alone misses the
+/// path-qualified
+/// `pub type Alias = smithay::wayland::drm_syncobj::DrmSyncobjState;`, and a
+/// call through `Alias` names neither the type nor its constructor.
+///
+/// The scan is over *items*, not lines. Keying on the `type` keyword covers
+/// every spelling of the path and every visibility, but a keyword test applied
+/// one line at a time is blind to the two layouts rustc accepts just as
+/// happily: the alias wrapped after the `=`, and a block comment sitting
+/// between the keyword and the name. Both compile; both were invisible before.
+/// So the file is reduced to code — comments and literal *contents* gone,
+/// newlines flattened to spaces — and every span from a `type` keyword to its
+/// terminating `;` is checked as one string.
+fn assert_no_type_alias_of(lines: &[String], path: &std::path::Path, name: &str) {
+    let code = code_bytes(lines);
+    let text = String::from_utf8(code.iter().map(|(byte, _)| *byte).collect())
+        .expect("stripping whole bytes preserves UTF-8");
+    for (start, end) in type_item_spans(&text) {
+        assert!(
+            !text[start..end].contains(name),
+            "{}:{} aliases {name} in a `type` item; a call through the alias \
+             names neither the type nor its constructor",
+            path.display(),
+            code[start].1 + 1
+        );
+    }
+}
+
+/// Byte ranges of every `type … ;` item in `text`, keyed on the keyword as a
+/// whole token so `subtype` and `r#type` are not mistaken for one.
+fn type_item_spans(text: &str) -> Vec<(usize, usize)> {
+    const KEYWORD: &str = "type";
+    let bytes = text.as_bytes();
+    let boundary = |byte: u8| !(byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'#');
+    let mut spans = Vec::new();
+    let mut at = 0usize;
+    while let Some(offset) = text[at..].find(KEYWORD) {
+        let start = at + offset;
+        at = start + KEYWORD.len();
+        if start > 0 && !boundary(bytes[start - 1]) {
+            continue;
+        }
+        if bytes.get(at).is_some_and(|byte| !boundary(*byte)) {
+            continue;
+        }
+        spans.push((start, item_end(bytes, at)));
+    }
+    spans
+}
+
+/// Index of the `;` ending the item that begins at `at`.
+///
+/// The first *textual* semicolon is not it. A const block or an array length in
+/// the right-hand side carries its own — `type A = <() as P<{ let _ = (); 0 },
+/// Hidden>>::Out;` ends its apparent span before ever naming `Hidden` — so the
+/// terminator is the first semicolon at delimiter depth zero. Running to the
+/// end of the text when there is none keeps an unterminated tail inside the
+/// scan rather than silently outside it.
+fn item_end(bytes: &[u8], at: usize) -> usize {
+    let mut depth = 0usize;
+    for (offset, byte) in bytes[at..].iter().enumerate() {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            // Saturating, not checked: a closer with no opener means the text
+            // is not the balanced code this scan assumed, and clamping keeps
+            // the search going to the item's real end rather than panicking
+            // over punctuation.
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b';' if depth == 0 => return at + offset,
+            _ => {}
+        }
+    }
+    bytes.len()
+}
+
+/// The file's code bytes — comments and literal contents removed, newlines
+/// flattened to spaces — each paired with the line it came from.
+///
+/// Dropping literal contents is what keeps the item scan honest in both
+/// directions: `let s = "type Alias = DrmSyncobjState;";` is data, not an
+/// alias, and this file's own fixtures would otherwise indict it. Carrying the
+/// state across the newline is what makes it an item scan at all — string and
+/// raw-string literals may span lines, so a line-oriented reset would resume
+/// mid-literal and read its contents as code.
+fn code_bytes(lines: &[String]) -> Vec<(u8, usize)> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Code,
+        LineComment,
+        // Rust's block comments nest, so this is a depth, not a flag.
+        BlockComment(usize),
+        Str,
+        RawStr(usize),
+    }
+    let mut state = State::Code;
+    let mut code = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let bytes = line.as_bytes();
+        let mut at = 0usize;
+        while at < bytes.len() {
+            match state {
+                State::LineComment => break,
+                State::BlockComment(depth) => {
+                    if bytes[at] == b'/' && bytes.get(at + 1) == Some(&b'*') {
+                        state = State::BlockComment(depth + 1);
+                        at += 2;
+                    } else if bytes[at] == b'*' && bytes.get(at + 1) == Some(&b'/') {
+                        state = if depth == 1 {
+                            State::Code
+                        } else {
+                            State::BlockComment(depth - 1)
+                        };
+                        at += 2;
+                    } else {
+                        at += 1;
+                    }
+                }
+                State::Str => match bytes[at] {
+                    b'\\' => at += 2,
+                    b'"' => {
+                        state = State::Code;
+                        at += 1;
+                    }
+                    _ => at += 1,
+                },
+                State::RawStr(hashes) => {
+                    let terminator: Vec<u8> = std::iter::once(b'"')
+                        .chain(std::iter::repeat_n(b'#', hashes))
+                        .collect();
+                    if bytes[at..].starts_with(&terminator) {
+                        state = State::Code;
+                        at += terminator.len();
+                    } else {
+                        at += 1;
+                    }
+                }
+                State::Code => match bytes[at] {
+                    // A comment is whitespace to rustc, so it leaves whitespace
+                    // here too. Deleting it outright would splice the tokens on
+                    // either side together: `pub type/**/Alias` reduces to
+                    // `typeAlias`, and a scan keyed on the keyword stops seeing
+                    // an item at all.
+                    b'/' if bytes.get(at + 1) == Some(&b'/') => {
+                        code.push((b' ', index));
+                        state = State::LineComment;
+                    }
+                    b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                        code.push((b' ', index));
+                        state = State::BlockComment(1);
+                        at += 2;
+                    }
+                    b'"' => {
+                        state = State::Str;
+                        code.push((b' ', index));
+                        at += 1;
+                    }
+                    b'r' | b'b' | b'c' if raw_string_prefix_at(bytes, at).is_some() => {
+                        let quote = raw_string_prefix_at(bytes, at).expect("just matched");
+                        let prefix = if bytes[at] == b'r' { 1 } else { 2 };
+                        state = State::RawStr(quote - at - prefix);
+                        code.push((b' ', index));
+                        at = quote + 1;
+                    }
+                    b'\'' => {
+                        let next = past_char_literal_or_lifetime(bytes, at);
+                        // A lifetime is code and its tick starts a token; a
+                        // character literal is data, and `'{'` must not survive
+                        // as a brace.
+                        code.push((if next == at + 1 { b'\'' } else { b' ' }, index));
+                        at = next;
+                    }
+                    byte => {
+                        code.push((byte, index));
+                        at += 1;
+                    }
+                },
+            }
+        }
+        if matches!(state, State::LineComment) {
+            state = State::Code;
+        }
+        code.push((b' ', index));
+    }
+    code
+}
+
+/// The file's code with whitespace reduced to what rustc actually needs, each
+/// byte paired with the line it came from.
+///
+/// Rust's rule is narrow: whitespace separates two tokens only when they would
+/// otherwise run together as one identifier. Everywhere else it is decoration,
+/// and `DrmSyncobjState :: new`, `DrmSyncobjState/**/::new` and
+/// `< DrmSyncobjState >::` are the same tokens as the spellings the needles
+/// below use. Matching raw lines makes each of those a separate bypass, and
+/// that list is not one anybody finishes writing — so apply the rule instead of
+/// chasing the spellings. Between two identifier characters a single space
+/// survives, so `{TYPE} as ` still means the `as` keyword and not an identifier
+/// that merely starts with those letters.
+fn separated_code(lines: &[String]) -> (String, Vec<usize>) {
+    // Bytes above ASCII are treated as identifier characters: they can only be
+    // a non-ASCII identifier here, and keeping the separator is the answer that
+    // fails towards a match rather than away from one.
+    let joins = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut map: Vec<usize> = Vec::new();
+    let mut gap: Option<usize> = None;
+    for (byte, line) in code_bytes(lines) {
+        if byte.is_ascii_whitespace() {
+            // Leading whitespace is not between anything, so it never survives.
+            if !bytes.is_empty() {
+                gap = Some(line);
+            }
+            continue;
+        }
+        if let Some(at) = gap.take()
+            && joins(*bytes.last().expect("a gap is only recorded after a byte"))
+            && joins(byte)
+        {
+            bytes.push(b' ');
+            map.push(at);
+        }
+        bytes.push(byte);
+        map.push(line);
+    }
+    (
+        String::from_utf8(bytes).expect("stripping whole bytes preserves UTF-8"),
+        map,
+    )
+}
+
+/// Lines on which `needle` occurs in the file's code, comments and literal
+/// contents gone and whitespace reduced to rustc's own token separation.
+fn source_occurrences(lines: &[String], needle: &str) -> Vec<usize> {
+    let (text, map) = separated_code(lines);
+    let mut hits = Vec::new();
+    let mut at = 0usize;
+    while let Some(offset) = text[at..].find(needle) {
+        let start = at + offset;
+        hits.push(map[start]);
+        // Advance past the match, not one byte into it: needles are ASCII, so
+        // this lands on a character boundary and cannot split a multi-byte
+        // identifier in the next `find`.
+        at = start + needle.len();
+    }
+    hits
+}
+
+/// The `ExplicitSyncActivation` token proves the exposure policy was consulted,
+/// but Rust cannot stop a future module from importing Smithay's public
+/// `DrmSyncobjState::new` and advertising `linux-drm-syncobj-v1` behind the
+/// policy's back — every dormancy test here would stay green while production
+/// served the forbidden global. The seal is only as good as its being the sole
+/// call site, so assert exactly that against the crate's own sources.
+///
+/// This is a tripwire, not a proof, and the boundary is worth stating exactly
+/// because it stopped moving here. What it does cover is naming: the scan reads
+/// the crate's sources as code — comments and literal contents gone, whitespace
+/// reduced to rustc's own token separation — so no layout, comment or spacing
+/// hides a path, and the three ways to reach the type under a different name (a
+/// `use … as`, a `type` item, a plain binding) are each rejected outright.
+///
+/// What it cannot cover is text it never sees, text it never recognises as a
+/// path, and code that never needs the type in the first place: a call
+/// assembled by a macro; a module emitted into `OUT_DIR`; a `#[path]` module
+/// the walk misses, whether by sitting outside `src/` or by not ending in
+/// `.rs` at all — `#[path = "rogue.inc"] mod rogue;` compiles a file this walk
+/// never collects; a route reaching the constructor without naming the type,
+/// such as a generic parameter bound to it elsewhere; and, widest of all, code
+/// that skips the constructor entirely and registers the syncobj manager global
+/// itself through Wayland's lower-level global-dispatch API, which no scan
+/// keyed on this type could see even in principle.
+///
+/// Closing those needs a different kind of check, not a better scanner — see
+/// the behavioural one owed below.
+///
+/// Closing the remaining gap needs a behavioural check — a real client asking
+/// what the registry actually advertises — and that check is only worth having
+/// where a device is genuinely prepared. Offline it is vacuous: with the
+/// synthetic adapter no render node resolves, so no device is prepared, so no
+/// global appears no matter what the policy says. It therefore belongs to the
+/// live-test harness, against a real render node, and is owed by H4a stage 2.
+#[test]
+fn only_the_sealed_module_constructs_the_drm_syncobj_state() {
+    // Split so this test's own source does not read as a call site.
+    const TYPE: &str = concat!("DrmSyncobj", "State");
+    const SEAL_OPEN: &str = "mod explicit_sync_activation {";
+    // Every associated function reachable on the type by a path that names it:
+    // `DrmSyncobjState::new`, the `new_with_filter` constructor Smithay also
+    // exposes, and the qualified `<DrmSyncobjState>::new` that carries no bare
+    // `Type::` at all. `Option<DrmSyncobjState>` is a use, not a call, and the
+    // trailing `::` is what tells them apart. Layout is not a way past these —
+    // the scan reduces whitespace to rustc's own token separation first — but a
+    // path that never names the type is, which is what the alias and rename
+    // rejections below are for.
+    let associated = format!("{TYPE}::");
+    let qualified = format!("<{TYPE}>::");
+    let rename = format!("{TYPE} as ");
+    let alias = format!("={TYPE}");
+
+    let sources = crate_sources();
+    let mut call_sites = Vec::new();
+    let mut seal: Option<(std::path::PathBuf, usize, usize)> = None;
+    for (path, lines) in &sources {
+        assert!(
+            source_occurrences(lines, &rename).is_empty(),
+            "{} renames {TYPE} at import; the call-site scan below matches text \
+             and a renamed constructor would slip past it",
+            path.display()
+        );
+        assert!(
+            source_occurrences(lines, &qualified).is_empty(),
+            "{} calls an associated function through the qualified `<{TYPE}>::` \
+             form, which carries no bare `{TYPE}::` for the scan to find",
+            path.display()
+        );
+        // Two ways to give the type a second name: a `type` item, whatever its
+        // visibility and however the right-hand path is spelled, and a plain
+        // binding. Nothing in the crate legitimately does either.
+        assert_no_type_alias_of(lines, path, TYPE);
+        assert!(
+            source_occurrences(lines, &alias).is_empty(),
+            "{} binds {TYPE} to a second name; a call through that name spells \
+             neither the type nor its constructor",
+            path.display()
+        );
+
+        if let Some(open) = lines.iter().position(|line| line.trim() == SEAL_OPEN) {
+            assert!(seal.is_none(), "more than one sealed module declaration");
+            seal = Some((path.clone(), open, sealed_module_end(lines, open)));
+        }
+
+        for index in source_occurrences(lines, &associated) {
+            call_sites.push((path.clone(), index));
+        }
+    }
+
+    let (seal_path, seal_open, seal_close) = seal.expect("sealed module still exists");
+    assert_eq!(
+        call_sites.len(),
+        1,
+        "expected exactly one {associated} call site, found {call_sites:?}"
+    );
+    let (call_path, call_line) = &call_sites[0];
+    assert_eq!(
+        call_path, &seal_path,
+        "the only {associated} call site left the sealed module's file"
+    );
+    assert!(
+        (seal_open..seal_close).contains(call_line),
+        "{associated} at line {} is outside the sealed module (lines \
+         {seal_open}..{seal_close})",
+        call_line + 1
+    );
+    // The one call site must be the constructor the seal exists to own, not
+    // some other associated function that happens to live in the right place.
+    assert!(
+        sources
+            .iter()
+            .find(|(path, _)| path == call_path)
+            .map(|(_, lines)| {
+                // Through the same reduced view as the count above, so a
+                // constructor wrapped across lines or split by a comment still
+                // reads as one; the single counted call site is the only place
+                // it can be.
+                source_occurrences(lines, &format!("{TYPE}::new::<")).contains(call_line)
+            })
+            .expect("the call site's file was just walked"),
+        "the sealed call site is not the `{TYPE}::new::<…>` constructor"
+    );
+}
+
+#[test]
+fn only_the_sealed_module_withdraws_the_drm_syncobj_state() {
+    const SEAL_OPEN: &str = "mod explicit_sync_activation {";
+    const METHOD: &str = concat!("into_", "global");
+    let call = format!("{METHOD}(");
+    let sources = crate_sources();
+    let mut call_sites = Vec::new();
+    let mut seal: Option<(std::path::PathBuf, usize, usize)> = None;
+
+    for (path, lines) in &sources {
+        if let Some(open) = lines.iter().position(|line| line.trim() == SEAL_OPEN) {
+            assert!(seal.is_none(), "more than one sealed module declaration");
+            seal = Some((path.clone(), open, sealed_module_end(lines, open)));
+        }
+        for index in source_occurrences(lines, &call) {
+            call_sites.push((path.clone(), index));
+        }
+    }
+
+    let (seal_path, seal_open, seal_close) = seal.expect("sealed module still exists");
+    assert_eq!(
+        call_sites.len(),
+        1,
+        "expected exactly one {METHOD} call site, found {call_sites:?}"
+    );
+    let (call_path, call_line) = &call_sites[0];
+    assert_eq!(
+        call_path, &seal_path,
+        "the only {METHOD} call site left the sealed module's file"
+    );
+    assert!(
+        (seal_open..seal_close).contains(call_line),
+        "{METHOD} at line {} is outside the sealed module (lines \
+         {seal_open}..{seal_close})",
+        call_line + 1
+    );
+}
+
+/// Index of the line closing the module opened at `open`, found by brace depth
+/// rather than by looking for a column-zero `}` — indentation is not a boundary
+/// anyone should be able to move.
+fn sealed_module_end(lines: &[String], open: usize) -> usize {
+    let mut depth = 0usize;
+    // Rust's block comments nest, so this is a depth, not a flag: with a
+    // boolean, `/* outer /* inner */ { */` ends the comment early and the brace
+    // after it is counted as structure.
+    let mut block_comment_depth = 0usize;
+    for (index, line) in lines.iter().enumerate().skip(open) {
+        let bytes = line.as_bytes();
+        let mut at = 0usize;
+        while at < bytes.len() {
+            if block_comment_depth > 0 {
+                if bytes[at] == b'/' && bytes.get(at + 1) == Some(&b'*') {
+                    block_comment_depth += 1;
+                    at += 2;
+                } else if bytes[at] == b'*' && bytes.get(at + 1) == Some(&b'/') {
+                    block_comment_depth -= 1;
+                    at += 2;
+                } else {
+                    at += 1;
+                }
+                continue;
+            }
+            match bytes[at] {
+                b'/' if bytes.get(at + 1) == Some(&b'/') => break,
+                b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                    block_comment_depth = 1;
+                    at += 2;
+                }
+                // Braces inside literals are data. Counting them lets
+                // `const OPEN: &str = "{";` inside the seal stretch its apparent
+                // end over whatever follows, which is exactly how a relocated
+                // constructor would read as sealed.
+                b'"' => at = end_of_string_literal(line, at, index),
+                // `r"…"`, and the byte/C-string variants `br"…"` and `cr"…"`.
+                // The unprefixed `b"…"`/`c"…"` forms need no arm: their `"` is
+                // reached as an ordinary string a byte later.
+                b'r' | b'b' | b'c' if raw_string_prefix_at(bytes, at).is_some() => {
+                    let quote = raw_string_prefix_at(bytes, at).expect("just matched");
+                    at = end_of_raw_string_literal(line, quote, index);
+                }
+                b'\'' => at = past_char_literal_or_lifetime(bytes, at),
+                b'{' => {
+                    depth += 1;
+                    at += 1;
+                }
+                b'}' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .expect("sealed module braces are balanced");
+                    if depth == 0 {
+                        return index;
+                    }
+                    at += 1;
+                }
+                _ => at += 1,
+            }
+        }
+    }
+    panic!("sealed module opened at line {} is never closed", open + 1);
+}
+
+/// Index just past the `"`-delimited literal starting at `at`, honouring
+/// backslash escapes. A literal that does not close on its own line is refused
+/// rather than guessed at — the scanner is line-oriented, and answering anyway
+/// is how it would be steered.
+fn end_of_string_literal(line: &str, at: usize, index: usize) -> usize {
+    let bytes = line.as_bytes();
+    let mut cursor = at + 1;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' => cursor += 2,
+            b'"' => return cursor + 1,
+            _ => cursor += 1,
+        }
+    }
+    panic!(
+        "line {} of the sealed module opens a string literal it does not close; \
+         the brace scanner is line-oriented and will not guess where it ends",
+        index + 1
+    );
+}
+
+/// If a raw-string literal begins at `at`, the index of its opening `"`.
+///
+/// Accepts `r`, `br` and `cr` prefixes followed by any number of hashes. The
+/// prefix must start a token, or `for` and `char` would look like raw strings.
+fn raw_string_prefix_at(bytes: &[u8], at: usize) -> Option<usize> {
+    if at > 0 {
+        let previous = bytes[at - 1];
+        if previous.is_ascii_alphanumeric() || previous == b'_' {
+            return None;
+        }
+    }
+    let mut cursor = match bytes[at] {
+        b'r' => at + 1,
+        b'b' | b'c' if bytes.get(at + 1) == Some(&b'r') => at + 2,
+        _ => return None,
+    };
+    while bytes.get(cursor) == Some(&b'#') {
+        cursor += 1;
+    }
+    (bytes.get(cursor) == Some(&b'"')).then_some(cursor)
+}
+
+/// Index just past the raw-string literal whose opening `"` is at `quote`,
+/// matching the hash count so `r#"…"#` is not ended by a bare `"` inside it.
+fn end_of_raw_string_literal(line: &str, quote: usize, index: usize) -> usize {
+    let bytes = line.as_bytes();
+    let mut hashes = 0usize;
+    while quote > hashes && bytes[quote - 1 - hashes] == b'#' {
+        hashes += 1;
+    }
+    let terminator: Vec<u8> = std::iter::once(b'"')
+        .chain(std::iter::repeat_n(b'#', hashes))
+        .collect();
+    for cursor in quote + 1..bytes.len() {
+        if bytes[cursor..].starts_with(&terminator) {
+            return cursor + terminator.len();
+        }
+    }
+    panic!(
+        "line {} of the sealed module opens a raw string it does not close; \
+         the brace scanner is line-oriented and will not guess where it ends",
+        index + 1
+    );
+}
+
+/// Index just past a character literal starting at `at`, or just past the `'`
+/// itself when it opens a lifetime. `'{'` is a literal and must not be counted;
+/// `&'a str` is a lifetime and must not swallow the rest of the line.
+fn past_char_literal_or_lifetime(bytes: &[u8], at: usize) -> usize {
+    if bytes.get(at + 1) == Some(&b'\\') {
+        // Escaped: the closing quote is the next one, however long the escape.
+        if let Some(offset) = bytes[at + 2..].iter().position(|byte| *byte == b'\'') {
+            return at + 3 + offset;
+        }
+    } else if bytes.get(at + 2) == Some(&b'\'') {
+        return at + 3;
+    }
+    at + 1
+}
+
+/// The seal's boundary must not be movable by whitespace. An earlier version of
+/// [`sealed_module_end`] took the next column-zero `}`, so mis-indenting the
+/// module's closing brace extended the apparent module over whatever followed —
+/// and a relocated constructor would have read as sealed.
+#[test]
+fn sealed_module_end_is_found_by_brace_depth_not_indentation() {
+    let lines: Vec<String> = [
+        "mod explicit_sync_activation {",
+        "    fn inner() {",
+        "    }",
+        "  }", // mis-indented module close; the column-zero rule missed this
+        "",
+        "fn outside_the_seal() {",
+        "}",
+    ]
+    .iter()
+    .map(|line| (*line).to_owned())
+    .collect();
+
+    assert_eq!(sealed_module_end(&lines, 0), 3);
+}
+
+/// Braces inside comments are prose, not structure.
+#[test]
+fn sealed_module_end_ignores_braces_in_comments() {
+    let lines: Vec<String> = [
+        "mod explicit_sync_activation {",
+        "    // a closing brace } in prose",
+        "    fn inner() {} // and an inline pair {}",
+        "}",
+    ]
+    .iter()
+    .map(|line| (*line).to_owned())
+    .collect();
+
+    assert_eq!(sealed_module_end(&lines, 0), 3);
+}
+
+/// Block comments span lines, so a `}` inside one is prose too — and a `{`
+/// inside one would push the boundary past the module's real end.
+#[test]
+fn sealed_module_end_ignores_braces_in_block_comments() {
+    let lines: Vec<String> = [
+        "mod explicit_sync_activation {",
+        "    /* a closing brace }",
+        "       still inside the comment, and another } */",
+        "}",
+    ]
+    .iter()
+    .map(|line| (*line).to_owned())
+    .collect();
+
+    assert_eq!(sealed_module_end(&lines, 0), 3);
+}
+
+/// Rust block comments nest. A scanner tracking a boolean ends the comment at
+/// the inner `*/`, so `/* outer /* inner */ { */` reads as an opening brace and
+/// stretches the seal over a constructor relocated after its real end.
+#[test]
+fn sealed_module_end_handles_nested_block_comments() {
+    let lines: Vec<String> = [
+        "mod explicit_sync_activation {",
+        "    /* outer /* inner */ { */",
+        "}",
+        "/* outer /* inner */ } */",
+        "fn outside_the_seal() {}",
+    ]
+    .iter()
+    .map(|line| (*line).to_owned())
+    .collect();
+
+    assert_eq!(sealed_module_end(&lines, 0), 2);
+}
+
+/// Braces inside string, raw-string and character literals are data. Counting
+/// them is the forgery review found: `const OPEN: &str = "{";` inside the seal
+/// stretches its apparent end over a constructor relocated after the real one.
+#[test]
+fn sealed_module_end_ignores_braces_in_literals() {
+    let lines: Vec<String> = [
+        "mod explicit_sync_activation {",
+        "    const OPEN: &str = \"{\";",
+        "    const RAW: &str = r#\"{ \" }\"#;",
+        "    const BYTES: &[u8] = br#\"{ \" }\"#;",
+        "    const CSTR: &std::ffi::CStr = cr#\"{ \" }\"#;",
+        "    const CHAR: char = '{';",
+        "    fn borrow<'a>(text: &'a str) -> &'a str { text }",
+        "}",
+        "const CLOSE: &str = \"}\";",
+    ]
+    .iter()
+    .map(|line| (*line).to_owned())
+    .collect();
+
+    assert_eq!(sealed_module_end(&lines, 0), 7);
+}
+
+/// A directory symlinked back to an ancestor must be entered once, not for
+/// ever, and a symlinked `.rs` file must still be read — rustc compiles it.
+#[test]
+fn crate_sources_follows_symlinked_files_and_survives_directory_cycles() {
+    let scratch =
+        std::env::temp_dir().join(format!("cosmix-comp-source-walk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let root = scratch.join("src");
+    let nested = root.join("nested");
+    std::fs::create_dir_all(&nested).expect("scratch tree is creatable");
+    std::fs::write(root.join("plain.rs"), "// plain\n").expect("plain module is writable");
+    std::fs::write(root.join("target.rs"), "// target\n").expect("target module is writable");
+    std::os::unix::fs::symlink(root.join("target.rs"), root.join("rogue.rs"))
+        .expect("file symlink is creatable");
+    std::os::unix::fs::symlink(&root, nested.join("loop")).expect("directory symlink is creatable");
+
+    let walked = crate_sources_at(&root);
+    std::fs::remove_dir_all(&scratch).expect("scratch tree is removable");
+
+    let mut names: Vec<String> = walked
+        .iter()
+        .map(|(path, _)| {
+            path.file_name()
+                .expect("source file name")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "plain.rs".to_owned(),
+            "rogue.rs".to_owned(),
+            "target.rs".to_owned()
+        ],
+        "the symlinked module must be scanned exactly once alongside the real ones"
+    );
+}
+
+/// A directory symlink out of the tree is the one case with no right answer:
+/// `src/rogue -> ../rogue-module` declared by an ordinary `mod rogue;` is
+/// compiled by rustc, so skipping it hides shipping source from every scan
+/// built on this walk, and following it walks an arbitrary tree. The walk says
+/// so instead of picking one — the `#[should_panic]` here pins intended
+/// behaviour, not a defect worked around.
+#[test]
+#[should_panic(expected = "outside the scanned root")]
+fn crate_sources_refuses_a_directory_symlink_out_of_the_tree() {
+    let scratch =
+        std::env::temp_dir().join(format!("cosmix-comp-escaping-walk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let root = scratch.join("src");
+    let outside = scratch.join("rogue-module");
+    std::fs::create_dir_all(&root).expect("scratch tree is creatable");
+    std::fs::create_dir_all(&outside).expect("outside tree is creatable");
+    std::fs::write(root.join("plain.rs"), "// plain\n").expect("plain module is writable");
+    std::fs::write(outside.join("mod.rs"), "// rogue\n").expect("rogue module is writable");
+    std::os::unix::fs::symlink(&outside, root.join("rogue")).expect("symlink is creatable");
+
+    // The call panics, which is the point — so cleanup cannot simply follow it,
+    // and it cannot be left to the next run either: the scratch name carries
+    // this process's id, and the next run has a different one, so every run
+    // would strand a tree in the temporary directory for ever. Catch, clean up,
+    // then re-raise the original payload so `#[should_panic]` still sees it.
+    let escaped = std::panic::catch_unwind(|| crate_sources_at(&root))
+        .expect_err("an out-of-tree directory symlink must be refused");
+    std::fs::remove_dir_all(&scratch).expect("scratch tree is removable");
+    std::panic::resume_unwind(escaped);
+}
+
+/// The alias scan reads items, not lines. Wrapping after the `=` is ordinary
+/// rustfmt output for a long path, so a line-local keyword test would have been
+/// bypassed by the formatter alone, with no intent required.
+#[test]
+#[should_panic(expected = "in a `type` item")]
+fn type_alias_scan_spans_lines() {
+    let name = concat!("DrmSyncobj", "State");
+    let lines = vec![
+        "pub type ForgedAlias =".to_owned(),
+        format!("    smithay::wayland::drm_syncobj::{name};"),
+    ];
+    assert_no_type_alias_of(&lines, std::path::Path::new("forged.rs"), name);
+}
+
+/// A block comment between the keyword and the name compiles, and separates
+/// them on the line as surely as a newline does.
+#[test]
+#[should_panic(expected = "in a `type` item")]
+fn type_alias_scan_sees_through_block_comments() {
+    let name = concat!("DrmSyncobj", "State");
+    let lines = vec![
+        "type ForgedAlias = /* an innocent".to_owned(),
+        format!("   remark */ {name};"),
+    ];
+    assert_no_type_alias_of(&lines, std::path::Path::new("forged.rs"), name);
+}
+
+/// The other direction: an item scan that read literal contents would indict
+/// this very file, whose fixtures above spell out the alias it forbids. Text
+/// inside a comment or a string is data, and the scan must say so.
+#[test]
+fn type_alias_scan_ignores_comments_and_literals() {
+    let name = concat!("DrmSyncobj", "State");
+    let lines = vec![
+        format!("// type Alias = {name};"),
+        format!("let quoted = \"type Alias = {name};\";"),
+        format!("let raw = r#\"type Alias = {name};\"#;"),
+        format!("/* type Alias = {name}; */"),
+    ];
+    assert_no_type_alias_of(&lines, std::path::Path::new("innocent.rs"), name);
+}
+
+/// Dropping a comment is not the same as replacing it with whitespace, and
+/// rustc does the latter. `pub type/**/ForgedAlias` is one token pair to the
+/// compiler and would reduce to the single word `typeForgedAlias` under a scan
+/// that simply deleted comment text — so the keyword, and with it the whole
+/// item, would disappear from view.
+#[test]
+#[should_panic(expected = "in a `type` item")]
+fn type_alias_scan_treats_comments_as_separators() {
+    let name = concat!("DrmSyncobj", "State");
+    let lines = vec![
+        "pub type/**/ForgedAlias =".to_owned(),
+        format!("    smithay::wayland::drm_syncobj::{name};"),
+    ];
+    assert_no_type_alias_of(&lines, std::path::Path::new("forged.rs"), name);
+}
+
+/// An item does not end at the first semicolon it contains. A const block on
+/// the right-hand side carries one of its own, and everything after it —
+/// including the name being aliased — would fall outside a span that stopped
+/// there. The form below compiles, and `ForgedAlias::new(…)` through it names
+/// neither the type nor its constructor.
+#[test]
+#[should_panic(expected = "in a `type` item")]
+fn type_alias_scan_ends_items_at_delimiter_depth() {
+    let name = concat!("DrmSyncobj", "State");
+    let lines = vec![
+        "trait Pick<const N: usize, T> { type Out; }".to_owned(),
+        "impl<const N: usize, T> Pick<N, T> for () { type Out = T; }".to_owned(),
+        "type ForgedAlias =".to_owned(),
+        format!("    <() as Pick<{{ let _ = (); 0 }}, {name}>>::Out;"),
+    ];
+    assert_no_type_alias_of(&lines, std::path::Path::new("forged.rs"), name);
+}
+
+/// `DrmSyncobjState/**/::new::<…>` is the same three tokens rustc sees in the
+/// spelling the call-site needle uses, and it compiles anywhere — so while the
+/// scan matched raw lines this counted as *no* call site at all, and a forged
+/// constructor outside the seal left the tripwire green. Reducing the code to
+/// rustc's own token separation is what closes it; without that reduction this
+/// fixture finds nothing.
+#[test]
+fn call_site_scan_sees_comment_separated_paths() {
+    let name = concat!("DrmSyncobj", "State");
+    let lines = vec![
+        "fn forge(display: &DisplayHandle, device: DrmDeviceFd) -> Forged {".to_owned(),
+        format!("    {name}/**/::new::<WaylandState>(display, device)"),
+        "}".to_owned(),
+    ];
+    assert_eq!(source_occurrences(&lines, &format!("{name}::")), vec![1]);
+}
+
+/// The same hole with spaces instead of a comment, and wrapped across lines the
+/// way rustfmt would leave a long qualified path. The reported line is the one
+/// the path *starts* on, which is where a reader looking for the call site
+/// would want to be sent.
+#[test]
+fn call_site_scan_sees_spaced_and_wrapped_paths() {
+    let name = concat!("DrmSyncobj", "State");
+    let lines = vec![
+        "    let state = <".to_owned(),
+        format!("        {name}"),
+        "    >   ::new(display, device);".to_owned(),
+    ];
+    assert_eq!(source_occurrences(&lines, &format!("<{name}>::")), vec![0]);
+}
+
+/// Whitespace is only dropped where rustc does not need it, which is what keeps
+/// the rename needle honest in both directions: `{name}askew` is one identifier
+/// and must not read as the `as` keyword, while a comment-separated rename must.
+#[test]
+fn rename_needle_keeps_the_keyword_boundary() {
+    let name = concat!("DrmSyncobj", "State");
+    let needle = format!("{name} as ");
+    let run_together = vec![format!("struct {name}askew;")];
+    assert!(source_occurrences(&run_together, &needle).is_empty());
+    let renamed = vec![format!("use smithay::wayland::{name}/**/as/**/Alias;")];
+    assert_eq!(source_occurrences(&renamed, &needle), vec![0]);
+}
+
+/// `WaylandRuntimePolicy` is chosen by each caller and nothing type-checks that
+/// choice, so a new call site could pick any mode anywhere while every
+/// policy-behaviour test stayed green. Pin the files allowed to name *any*
+/// exposure mode to the ones that were reviewed: `main.rs` (the real winit
+/// path), `backend/kms_live.rs` (the live KMS path), `protocol/mod.rs` (the
+/// enum and the policy's own match arm), and this file.
+///
+/// Widened from `Production` alone after review: the mode that matters is not
+/// only the one that would advertise. A new production caller passing
+/// `Disabled` silently stops import-device preparation and regresses H3a, and
+/// a `Production`-only scan is green through exactly that.
+///
+/// This is audit protection, not enforcement — it sees a *new* file choosing a
+/// mode, not an existing reviewed file changing which one it passes.
+#[test]
+fn exposure_mode_is_named_only_in_the_reviewed_files() {
+    const ENUM: &str = concat!("ExplicitSync", "ExposureMode");
+    let needle = format!("{ENUM}::");
+    let rename = format!("{ENUM} as ");
+    let sources = crate_sources();
+
+    // `use …::ExplicitSyncExposureMode as Mode;` followed by `Mode::Disabled`
+    // contains the needle nowhere, and neither does the `type Mode = …::
+    // ExplicitSyncExposureMode;` spelling of the same move. Reject both, so the
+    // file scan below cannot be stepped around by renaming the enum.
+    for (path, lines) in &sources {
+        assert!(
+            source_occurrences(lines, &rename).is_empty(),
+            "{} renames {ENUM} at import; the file scan below matches text and a \
+             renamed mode selection would slip past it",
+            path.display()
+        );
+        assert_no_type_alias_of(lines, path, ENUM);
+    }
+
+    let sites: Vec<String> = sources
+        .iter()
+        .filter(|(_, lines)| !source_occurrences(lines, &needle).is_empty())
+        .map(|(path, _)| {
+            path.file_name()
+                .expect("source file name")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+
+    let mut sites = sites;
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![
+            "kms_live.rs".to_owned(),
+            "main.rs".to_owned(),
+            "mod.rs".to_owned(),
+            "tests.rs".to_owned()
+        ],
+        "a new file selects {needle}; review it against the offline constraint \
+         before adding it here"
+    );
+}
+
+#[test]
+fn production_explicit_sync_advertisement_requires_a_prepared_device() {
+    assert!(!should_advertise_explicit_sync_global(
+        ExplicitSyncExposureMode::Production,
+        false
+    ));
+    assert!(should_advertise_explicit_sync_global(
+        ExplicitSyncExposureMode::Production,
+        true
+    ));
+}
+
+#[test]
+fn disabled_exposure_cannot_issue_an_activation_token() {
+    assert!(!should_advertise_explicit_sync_global(
+        ExplicitSyncExposureMode::Disabled,
+        false
+    ));
+    assert!(!should_advertise_explicit_sync_global(
+        ExplicitSyncExposureMode::Disabled,
+        true
+    ));
+    assert!(decide_explicit_sync_activation(ExplicitSyncExposureMode::Disabled, true).is_none());
+}
+
+#[test]
+fn production_activation_token_requires_a_prepared_device() {
+    assert!(decide_explicit_sync_activation(ExplicitSyncExposureMode::Production, false).is_none());
+    assert!(decide_explicit_sync_activation(ExplicitSyncExposureMode::Production, true).is_some());
+}
+
+#[test]
+fn production_with_a_prepared_device_calls_the_syncobj_factory_once() {
+    let mut factory_calls = 0;
+    let constructed = construct_explicit_sync_state(
+        ExplicitSyncExposureMode::Production,
+        Some("prepared-device"),
+        |_, device| {
+            factory_calls += 1;
+            device
+        },
+    );
+
+    assert_eq!(factory_calls, 1);
+    assert_eq!(constructed, Some("prepared-device"));
+}
+
+#[test]
+fn disabled_with_a_prepared_device_does_not_call_the_syncobj_factory() {
+    let mut factory_calls = 0;
+    let constructed = construct_explicit_sync_state(
+        ExplicitSyncExposureMode::Disabled,
+        Some("prepared-device"),
+        |_, device| {
+            factory_calls += 1;
+            device
+        },
+    );
+
+    assert_eq!(factory_calls, 0);
+    assert_eq!(constructed, None);
+}
+
+#[cfg(feature = "explicit-sync-live-test")]
+const LIVE_SYNCOBJ_MANAGER_INTERFACE: &str = "wp_linux_drm_syncobj_manager_v1";
+#[cfg(feature = "explicit-sync-live-test")]
+const LIVE_SYNCOBJ_MANAGER_VERSION: u32 = 1;
+
+#[cfg(feature = "explicit-sync-live-test")]
+struct LiveSyncobjTestDevice {
+    render_dev_t: u64,
+    adapter_name: String,
+    drm_adapter: cosmix_wgpu_dmabuf::VulkanDrmAdapter,
+    device: smithay::backend::drm::DrmDeviceFd,
+}
+
+#[cfg(feature = "explicit-sync-live-test")]
+impl LiveSyncobjTestDevice {
+    fn from_required_render_node() -> Self {
+        const RENDER_NODE_ENV: &str = "COSMIX_TEST_RENDER_NODE";
+
+        let supplied_path = std::path::PathBuf::from(
+            env::var_os(RENDER_NODE_ENV)
+                .unwrap_or_else(|| panic!("{RENDER_NODE_ENV} must name a DRM render node")),
+        );
+        let supplied_node = smithay::backend::drm::DrmNode::from_path(&supplied_path)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{} must identify a DRM render node: {error}",
+                    supplied_path.display()
+                )
+            });
+        assert_eq!(
+            supplied_node.ty(),
+            smithay::backend::drm::NodeType::Render,
+            "refusing to run against non-render DRM node {}",
+            supplied_path.display()
+        );
+
+        let render_dev_t = supplied_node.dev_id() as u64;
+        let adapter_name = format!("live syncobj test ({})", supplied_path.display());
+        let drm_adapter = cosmix_wgpu_dmabuf::VulkanDrmAdapter {
+            name: adapter_name.clone(),
+            device_type: "TEST-HARDWARE".into(),
+            primary_device: None,
+            render_device: Some(render_dev_t),
+        };
+        let prepared = match prepare_linux_import_device(&drm_adapter) {
+            ImportDeviceDecision::Prepared(prepared) => prepared,
+            ImportDeviceDecision::Unavailable(reason) => {
+                panic!("real render-node preparation was unavailable: {reason:?}")
+            }
+        };
+        assert_eq!(prepared.expected_render_dev_t, render_dev_t);
+        assert_eq!(prepared.observed_render_dev_t, render_dev_t);
+        assert_eq!(
+            prepared.observed_node_type,
+            smithay::backend::drm::NodeType::Render
+        );
+        let resolved_node = smithay::backend::drm::DrmNode::from_path(&prepared.resolved_path)
+            .expect("prepared path must still identify a DRM node");
+        assert_eq!(
+            resolved_node, supplied_node,
+            "resolved path must identify the explicitly supplied render node"
+        );
+
+        Self {
+            render_dev_t,
+            adapter_name,
+            drm_adapter,
+            device: prepared.device,
+        }
+    }
+}
+
+#[cfg(feature = "explicit-sync-live-test")]
+struct LiveClientTimeline {
+    device: smithay::backend::drm::DrmDeviceFd,
+    handle: Option<smithay::reexports::drm::control::syncobj::Handle>,
+}
+
+#[cfg(feature = "explicit-sync-live-test")]
+impl LiveClientTimeline {
+    fn new(device: &smithay::backend::drm::DrmDeviceFd) -> Self {
+        use smithay::reexports::drm::control::Device as _;
+
+        let handle = device
+            .create_syncobj(false)
+            .expect("create client DRM timeline syncobj");
+        Self {
+            device: device.clone(),
+            handle: Some(handle),
+        }
+    }
+
+    fn handle(&self) -> smithay::reexports::drm::control::syncobj::Handle {
+        self.handle.expect("client DRM timeline syncobj is live")
+    }
+
+    fn export_fd(&self) -> std::os::fd::OwnedFd {
+        use smithay::reexports::drm::control::Device as _;
+
+        self.device
+            .syncobj_to_fd(self.handle(), false)
+            .expect("export client DRM timeline syncobj fd")
+    }
+
+    fn signal(&self, point: u64) {
+        use smithay::reexports::drm::control::Device as _;
+
+        self.device
+            .syncobj_timeline_signal(&[self.handle()], &[point])
+            .unwrap_or_else(|error| panic!("signal client DRM timeline point {point}: {error}"));
+    }
+
+    fn signalled_point(&self) -> u64 {
+        use smithay::reexports::drm::control::Device as _;
+
+        let mut points = [0];
+        self.device
+            .syncobj_timeline_query(&[self.handle()], &mut points, false)
+            .expect("query client DRM timeline syncobj");
+        points[0]
+    }
+
+    fn destroy(&mut self) {
+        use smithay::reexports::drm::control::Device as _;
+
+        if let Some(handle) = self.handle.take() {
+            self.device
+                .destroy_syncobj(handle)
+                .expect("destroy client DRM timeline syncobj");
+        }
+    }
+}
+
+#[cfg(feature = "explicit-sync-live-test")]
+impl Drop for LiveClientTimeline {
+    fn drop(&mut self) {
+        use smithay::reexports::drm::control::Device as _;
+
+        if let Some(handle) = self.handle.take() {
+            let _ = self.device.destroy_syncobj(handle);
+        }
+    }
+}
+
+#[cfg(feature = "explicit-sync-live-test")]
+fn live_syncobj_registry(
+    exposure_mode: ExplicitSyncExposureMode,
+    render_dev_t: u64,
+    adapter_name: &str,
+    drm_adapter: &cosmix_wgpu_dmabuf::VulkanDrmAdapter,
+) -> (HashMap<String, (u32, u32)>, ExplicitSyncStartupReport) {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the live syncobj registry test");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!(
+        "cosmix-live-syncobj-registry-{}-{unique}",
+        std::process::id()
+    );
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: render_dev_t,
+            formats: vec![cosmix_wgpu_dmabuf::DmabufFormat {
+                fourcc: smithay::backend::allocator::Fourcc::Argb8888 as u32,
+                modifier: u64::from(smithay::backend::allocator::Modifier::Linear),
+                plane_count: 1,
+            }],
+            adapter_name: adapter_name.to_owned(),
+            drm_adapter: drm_adapter.clone(),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: true,
+            explicit_sync_exposure_mode: exposure_mode,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("live syncobj compositor starts");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to live syncobj compositor socket");
+
+    send_display_request(&mut client, 1, 2);
+    send_display_request(&mut client, 0, 3);
+    let globals = registry_globals(&mut client, 3);
+    for required in [
+        "wl_compositor",
+        "wl_subcompositor",
+        "xdg_wm_base",
+        "wp_viewporter",
+    ] {
+        let &(name, version) = globals
+            .get(required)
+            .unwrap_or_else(|| panic!("live registry must advertise {required}"));
+        assert_ne!(name, 0, "{required} must have a real global name");
+        assert_ne!(version, 0, "{required} must have a nonzero version");
+    }
+
+    // Taken from the runtime rather than probed afterwards: this is the answer
+    // the thread that built this registry reached, about the device it built it
+    // from, at the moment it built it.
+    let report = runtime
+        .explicit_sync_startup()
+        .expect("a runtime that started a protocol thread carries that thread's report")
+        .clone();
+
+    (globals, report)
+}
+
+/// Requires a live enumeration to carry the global, and says which of the two
+/// causes it was when it does not.
+///
+/// A miss here has two very different meanings — the global stopped being
+/// constructed, or the device could not be prepared — and this used to
+/// re-probe the device afterwards to tell them apart, because the runtime kept
+/// nothing but a log line and an `Option`. That probe sampled a later world
+/// than the one that decided, and could describe a device that had changed
+/// since. The runtime now reports its own preparation outcome, so the cause is
+/// read out of the run that failed rather than reconstructed from a second
+/// look at the machine.
+///
+/// The report is also checked against the enumeration, not merely quoted with
+/// it: a run whose report says one thing and whose registry says another is a
+/// third failure, distinct from both, and one no re-probe could ever have seen.
+#[cfg(feature = "explicit-sync-live-test")]
+fn assert_production_exposure_advertises(
+    globals: &HashMap<String, (u32, u32)>,
+    report: &ExplicitSyncStartupReport,
+    when: &str,
+) {
+    assert_ne!(
+        judge_explicit_sync_startup(report),
+        ExplicitSyncStartupVerdict::Inconsistent,
+        "{when} the runtime's own startup report contradicts itself: {report:?}"
+    );
+    let &(_, version) = globals
+        .get(LIVE_SYNCOBJ_MANAGER_INTERFACE)
+        .unwrap_or_else(|| {
+            let cause = match &report.preparation {
+                ExplicitSyncPreparation::Prepared(identity) => format!(
+                    "the runtime prepared {} and still did not advertise, so global construction \
+                     is broken",
+                    identity.resolved_path.display()
+                ),
+                ExplicitSyncPreparation::Unavailable(reason) => {
+                    format!("the runtime could not prepare an import device: {reason:?}")
+                }
+                ExplicitSyncPreparation::SkippedByPolicy => {
+                    "the runtime skipped preparation, so it was not started in production \
+                     exposure at all"
+                        .to_owned()
+                }
+            };
+            panic!(
+                "{when} production exposure must advertise {LIVE_SYNCOBJ_MANAGER_INTERFACE}; the \
+                 run that failed reports: {cause}"
+            )
+        });
+    assert_eq!(
+        version, LIVE_SYNCOBJ_MANAGER_VERSION,
+        "{when} production exposure advertised the wrong \
+         {LIVE_SYNCOBJ_MANAGER_INTERFACE} version"
+    );
+    assert!(
+        report.global_advertised,
+        "{when} the registry carries {LIVE_SYNCOBJ_MANAGER_INTERFACE} but the runtime reports it \
+         was never advertised"
+    );
+}
+
+/// Discriminates production and disabled exposure on one render device, with
+/// the absence bracketed by two presences.
+///
+/// The presence assertions prove the interface spelling and that this device
+/// can carry the global; the absence between them then proves the mode gates
+/// it. Both halves of that comparison run in one unfilterable test against one
+/// device, so neither can be selected away from the other, and the bracket is
+/// what makes the absence mean "the mode withheld it" rather than "by then the
+/// device could no longer have carried it anyway".
+#[cfg(feature = "explicit-sync-live-test")]
+#[test]
+#[ignore = "requires XDG_RUNTIME_DIR and opens the DRM render node named by COSMIX_TEST_RENDER_NODE"]
+fn production_and_disabled_exposure_discriminate_syncobj_global_across_a_bracketed_run() {
+    let live_device = LiveSyncobjTestDevice::from_required_render_node();
+
+    // Production, then Disabled, then Production again, each judged the moment
+    // it is produced. The absence in the middle is only evidence about the
+    // exposure mode if this device could have carried the global on either side of it,
+    // and the preflight above cannot say that: it is a witness no compositor
+    // consumes, so it speaks only for the instant before the first runtime
+    // started. The trailing enumeration is what closes the window — a device
+    // that loses capability partway through takes it down too, which fails the
+    // test instead of quietly turning the Disabled absence into a pass for the
+    // wrong reason.
+    //
+    // The window the bracket alone could not close, now closed: capability
+    // could fail and recover entirely inside the Disabled run, and a leaking
+    // Disabled path would then withhold the global for the wrong reason and
+    // still sit between two passes. The Disabled run now reports why it
+    // withheld — and `SkippedByPolicy` is reachable only from the mode, never
+    // from a device that faltered — so a withholding for the wrong reason names
+    // itself instead of hiding inside the bracket.
+    let (live_before, before_report) = live_syncobj_registry(
+        ExplicitSyncExposureMode::Production,
+        live_device.render_dev_t,
+        &live_device.adapter_name,
+        &live_device.drm_adapter,
+    );
+    assert_production_exposure_advertises(&live_before, &before_report, "leading");
+
+    let (disabled, disabled_report) = live_syncobj_registry(
+        ExplicitSyncExposureMode::Disabled,
+        live_device.render_dev_t,
+        &live_device.adapter_name,
+        &live_device.drm_adapter,
+    );
+    assert!(
+        !disabled.contains_key(LIVE_SYNCOBJ_MANAGER_INTERFACE),
+        "disabled exposure must withhold {LIVE_SYNCOBJ_MANAGER_INTERFACE}"
+    );
+    assert_eq!(
+        disabled_report.preparation,
+        ExplicitSyncPreparation::SkippedByPolicy,
+        "the disabled run must withhold because the mode said so; withholding because the device \
+         could not be prepared would pass the absence assertion above for the wrong reason"
+    );
+    assert_eq!(
+        judge_explicit_sync_startup(&disabled_report),
+        ExplicitSyncStartupVerdict::DisabledAsConfigured
+    );
+
+    let (live_after, after_report) = live_syncobj_registry(
+        ExplicitSyncExposureMode::Production,
+        live_device.render_dev_t,
+        &live_device.adapter_name,
+        &live_device.drm_adapter,
+    );
+    assert_production_exposure_advertises(&live_after, &after_report, "trailing");
+}
+
+/// The only test that **withdraws** a real `DrmSyncobjState`. Four live tests
+/// below already build one and drive the protocol over it; none of them faults
+/// it, which is the gap this closes.
+///
+/// Every other withdrawal test installs `ExplicitSyncGlobal::Probe`, so all of
+/// them travel the seal's `#[cfg(test)]` arm and none reaches the production
+/// `Live(DrmSyncobjState) -> into_global() -> disable_global` path. Measured,
+/// not assumed: replacing the `Live` arm of `take_drm_syncobj_global` with one
+/// that consumes `into_global()`, drops the `GlobalId` and returns `None`
+/// leaves the whole offline suite green at 449 passed, 0 failed — a compositor
+/// that keeps advertising the syncobj global after a permanent fault, shipping
+/// behind a clean gate. That arm cannot be covered offline, because building a
+/// `DrmSyncobjState` needs a `DrmDeviceFd` and the default run is kept free of
+/// device contact. So the coverage lives here, ignored by default alongside
+/// the other hardware tests, and the same mutation turns this one red.
+///
+/// Stated rather than papered over: "kept free of device contact" is a measured
+/// discipline, not an enforced one. Nothing in this repository fails a build
+/// when a test binary opens `/dev/dri`; the `dev_dri=0 drm_ioctl=0` claim the
+/// comments here and in `vendor/README.md` make is re-measured by hand under
+/// `strace`, and it was re-measured for this test. A future binary could
+/// contact DRM without anything going red.
+///
+/// The oracle is deliberately a *second, fresh* client rather than any internal
+/// field. `drm_syncobj_state.is_none()` and `explicit_sync_global_advertised`
+/// are exactly what that mutation already leaves correct — it takes the state
+/// and clears the bool, it just never disables the global. Only a registry
+/// enumeration by a client that connected after the fault can tell the two
+/// apart, because `disable_global` keeps the name allocated and merely stops
+/// handing it out. The internal assertions below it are supporting evidence,
+/// never the proof; do not promote them and delete the client.
+///
+/// The fault is driven through `FailingRetirementAdapter` and a real event-loop
+/// pump rather than by calling a fault handler directly, so the path from
+/// "GPU work never retires" to "global gone" is the production one end to end.
+#[cfg(feature = "explicit-sync-live-test")]
+#[test]
+#[ignore = "requires XDG_RUNTIME_DIR and opens the DRM render node named by COSMIX_TEST_RENDER_NODE"]
+fn permanent_retirement_fault_withdraws_live_syncobj_global_from_client_registry() {
+    let live_device = LiveSyncobjTestDevice::from_required_render_node();
+    let mut harness = KeybindingHarness::new_with_live_explicit_sync_and_retirement_adapter(
+        live_device.render_dev_t,
+        live_device.drm_adapter,
+        Some(Box::new(FailingRetirementAdapter(
+            cosmix_wgpu_dmabuf::RetirementWaitError::Timeout,
+        ))),
+    );
+    assert!(
+        matches!(
+            harness.server.state.drm_syncobj_state.as_ref(),
+            Some(ExplicitSyncGlobal::Live(_))
+        ),
+        "the withdrawal test must own Smithay's real live syncobj global"
+    );
+    let &(global_name, version) = harness
+        .registry_globals
+        .get(LIVE_SYNCOBJ_MANAGER_INTERFACE)
+        .unwrap_or_else(|| {
+            panic!("pre-fault client registry must advertise {LIVE_SYNCOBJ_MANAGER_INTERFACE}")
+        });
+    assert_ne!(global_name, 0, "live syncobj global must have a real name");
+    assert_eq!(version, LIVE_SYNCOBJ_MANAGER_VERSION);
+
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let point = harness.install_committed_point(117);
+    harness.commit_dmabuf(buffer_id);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (backing_token, _, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+    harness.server.state.release_buffer_token(frame.token);
+    harness.server.state.release_buffer_token(backing_token);
+    pump_protocol_event_loop_until(
+        &mut harness.server,
+        "permanent explicit-sync timeout fault with a live protocol global",
+        |state| {
+            !state
+                .release_use_test_probe
+                .observations()
+                .faults
+                .is_empty()
+        },
+    );
+
+    assert!(point.was_abandoned());
+    assert!(point.is_terminal());
+    assert!(!harness.server.state.release_uses.explicit_sync_healthy());
+    assert!(harness.server.state.drm_syncobj_state.is_none());
+    assert!(!harness.server.state.explicit_sync_global_advertised);
+
+    let (mut observer_client, observer_server) =
+        UnixStream::pair().expect("post-fault registry observer socket pair");
+    let observer_state = Arc::new(WaylandClientState::new(
+        harness.server.state.client_disconnect_sender.clone(),
+    ));
+    harness
+        .server
+        .state
+        .display_handle
+        .insert_client(observer_server, observer_state.clone())
+        .expect("register post-fault registry observer");
+    const OBSERVER_REGISTRY_ID: u32 = 2;
+    const OBSERVER_CALLBACK_ID: u32 = 3;
+    send_display_request(&mut observer_client, 1, OBSERVER_REGISTRY_ID);
+    send_display_request(&mut observer_client, 0, OBSERVER_CALLBACK_ID);
+    harness.dispatch_client();
+    let post_fault_globals = registry_globals_for(
+        &mut observer_client,
+        OBSERVER_REGISTRY_ID,
+        OBSERVER_CALLBACK_ID,
+    );
+    assert!(
+        post_fault_globals.contains_key("wl_compositor"),
+        "post-fault registry enumeration must have completed"
+    );
+    assert!(
+        !post_fault_globals.contains_key(LIVE_SYNCOBJ_MANAGER_INTERFACE),
+        "post-fault client registry must no longer advertise \
+         {LIVE_SYNCOBJ_MANAGER_INTERFACE}; the real GlobalId was not disabled"
+    );
+    assert_eq!(harness.server.state.explicit_sync_global_withdrawals, 1);
+    assert_eq!(
+        *observer_state
+            .disconnect_reason
+            .lock()
+            .expect("post-fault observer disconnect mutex poisoned"),
+        None,
+        "implicit post-fault registry observer must remain connected"
+    );
+}
+
+#[cfg(feature = "explicit-sync-live-test")]
+#[test]
+#[ignore = "requires XDG_RUNTIME_DIR and opens the DRM render node named by COSMIX_TEST_RENDER_NODE"]
+fn explicit_sync_buffer_without_points_reports_no_acquire_point() {
+    // The `#[ignore]` above carried two reasons through H4a and now carries
+    // one. The retired reason was "known defect": this test was red on purpose.
+    // The remaining reason is the same one the bracketed exposure test above
+    // has — it opens a real render node, so leaving it in the default run would
+    // put device contact in every suite and break the offline gate that asserts
+    // dev_dri=0 drm_ioctl=0 for all five test binaries. What changed at H4b is
+    // the expected result, not the attribute: running it explicitly must now
+    // pass, where through H4a it had to fail.
+    //
+    // Was red on purpose through H4a, carrying the assertion H4b had to
+    // satisfy rather than the behaviour stock Smithay had. `commit_hook`
+    // (stock smithay 0.7.0, src/wayland/drm_syncobj/mod.rs) chained
+    // acquire-without-buffer, acquire-without-release and
+    // release-without-acquire, then fell through to the both-set arm. Nothing
+    // matched a buffer with *neither* point set, so the hook returned silently
+    // and the client was never told. H4b added that arm in the vendored crate.
+    // The test stayed `#[ignore]`d for the hardware reason above and became a
+    // live regression test for the vendored fix: run explicitly on a DRM host
+    // it now passes, and it goes red again if a version bump drops the arm.
+    //
+    // The protocol is normative that this is an error — "Clients must set both
+    // acquire and release points if and only if a non-null buffer is attached
+    // in the same surface commit" (linux-drm-syncobj-v1.xml:145-147) — but
+    // leaves the *code* under-determined, naming no_buffer, no_acquire_point
+    // and no_release_point together with no precedence. Pinning 4 is this
+    // project's choice, made because the acquire point is what gates sampling
+    // and so is the first thing a conforming client is missing. The vendored
+    // arm carries the same reasoning at its own site.
+    //
+    // The oracle is a drain, not a wait: dispatch is synchronous over a
+    // socketpair, so anything the compositor was going to post is already
+    // buffered when `dispatch_client()` returns. On the failure path it names
+    // which nothing it saw — a committed DMA-BUF upsert proves the commit
+    // reached compositor state end-to-end, and a live client proves no
+    // protocol error was posted, so a reader is not left guessing between a
+    // missing branch and a test that never reached the code under test.
+    let live_device = LiveSyncobjTestDevice::from_required_render_node();
+    let mut harness = KeybindingHarness::new_with_live_explicit_sync(
+        live_device.render_dev_t,
+        live_device.drm_adapter.clone(),
+    );
+    let buffer_id = harness.create_dmabuf_buffer();
+    assert_ne!(
+        buffer_id, 0,
+        "DMA-BUF creation must return a real object id"
+    );
+    let (manager_id, syncobj_surface_id) = harness.bind_live_syncobj_surface();
+    assert_ne!(
+        manager_id, syncobj_surface_id,
+        "explicit-sync manager and surface must be distinct objects"
+    );
+    harness.assert_client_connected("before committing a DMA-BUF without sync points");
+
+    send_request(
+        &mut harness.client,
+        TEST_SUBSURFACE_SURFACE_ID,
+        1,
+        &words(&[buffer_id, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_SUBSURFACE_SURFACE_ID, 6, &[]);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+
+    let buffered_events = drain_buffered_events(&mut harness.client);
+    for (object_id, opcode, body) in &buffered_events {
+        if object_id == &1 && opcode == &1 {
+            assert_eq!(body.len(), 4, "wl_display.delete_id body size");
+        }
+    }
+    if let Some((object_id, opcode, body)) = buffered_events
+        .iter()
+        .find(|(object_id, opcode, _)| *object_id == 1 && *opcode == 0)
+    {
+        assert_eq!(*object_id, 1, "protocol error must be a wl_display event");
+        assert_eq!(*opcode, 0, "protocol error must be wl_display.error");
+        assert!(body.len() >= 8, "wl_display.error contains object and code");
+        assert_eq!(
+            u32::from_ne_bytes(body[0..4].try_into().expect("error object id")),
+            syncobj_surface_id,
+            "no_acquire_point must be posted on the syncobj-surface object"
+        );
+        assert_eq!(
+            u32::from_ne_bytes(body[4..8].try_into().expect("error code")),
+            4,
+            "DMA-BUF without sync points must report no_acquire_point"
+        );
+        return;
+    }
+
+    let disconnect_reason = harness
+        .client_state
+        .disconnect_reason
+        .lock()
+        .expect("test disconnect-reason mutex poisoned")
+        .clone();
+    let (committed_surface_id, committed_frame) = take_dmabuf_upsert(&mut harness.server.state);
+    panic!(
+        "wl_display.error no_acquire_point was absent from the fully drained response even though \
+         the commit was processed end-to-end: DMA-BUF upsert {committed_surface_id:?} with token \
+         {}; client disconnect_reason is {disconnect_reason:?} (None means Smithay kept the client \
+         connected and posted no protocol error); drained {} buffered event(s)",
+        committed_frame.token,
+        buffered_events.len()
+    );
+}
+
+#[cfg(feature = "explicit-sync-live-test")]
+#[test]
+#[ignore = "requires XDG_RUNTIME_DIR and opens the DRM render node named by COSMIX_TEST_RENDER_NODE"]
+fn synchronized_subsurface_destruction_signals_committed_release_point() {
+    // As with the reproducer above, the `#[ignore]` carried two reasons through
+    // H4a and now carries one; the retired reason was "known defect". What
+    // changed at H4b is the expected result, not the attribute — this opens a
+    // real render node, so it stays out of the default run to keep the offline
+    // gate's dev_dri=0 drm_ioctl=0 true of all five test binaries.
+    //
+    // The second half of the defect pair. A synchronized subsurface's commit
+    // lands in the serial-keyed `VecDeque` between pending and current
+    // (`CachedState` in vendor/smithay compositor/cache.rs), and stock 0.7.0's
+    // `destruction_hook` signalled only `pending().release_point` and
+    // `current().release_point`. Tearing the child down before its transaction
+    // applied therefore stranded the cached release point forever, and a client
+    // waiting on that timeline never woke. The fix adds a crate-private
+    // `CachedState::cached()`, which yields `&mut` to each queued state
+    // without touching serials or queue order, and signals every one of them
+    // in `destruction_hook` (drm_syncobj/mod.rs). Cited by symbol, not line:
+    // these comments have already gone stale twice from edits to the file they
+    // point at, and a bump renumbers everything anyway.
+    //
+    // Two things that made the red trustworthy still earn their keep now that
+    // it is green. The state assertions around the child's commit show the
+    // points really were recorded and really moved out of pending without
+    // becoming current — otherwise "queried 1" would read the same whether the
+    // cached states went unsignalled or the points were never taken at all,
+    // which is the difference this test exists to see. And the
+    // wp_linux_drm_syncobj_surface_v1 object is deliberately left alive, which
+    // is what makes this test measure the destruction hook's *body*: the hook
+    // is unambiguously installed, so a pass can only mean it reached the
+    // cached states.
+    //
+    // Whether the hook is installed at all is a separate question, and was a
+    // separate defect: stock 0.7.0's extension destroy handler removed it, so
+    // destroying the extension before the surface left nothing to run. That is
+    // fixed too — the `Request::Destroy` arm in drm_syncobj/mod.rs now removes
+    // only the pre-commit hook — and its own reproducer,
+    // `syncobj_extension_destroy_then_surface_destroy_signals_cached_release_point`,
+    // destroys the extension first precisely so it measures the hook's
+    // *presence* where this one measures its body. Keep them distinct: collapse
+    // either into the other and one of the two failure modes stops being
+    // covered.
+    const ACQUIRE_POINT: u64 = 1;
+    const RELEASE_POINT: u64 = 2;
+
+    let live_device = LiveSyncobjTestDevice::from_required_render_node();
+    let mut timeline = LiveClientTimeline::new(&live_device.device);
+    timeline.signal(ACQUIRE_POINT);
+    assert_eq!(
+        timeline.signalled_point(),
+        ACQUIRE_POINT,
+        "client acquire point must really be signalled before protocol setup"
+    );
+    let timeline_fd = timeline.export_fd();
+    let mut harness = KeybindingHarness::new_with_live_explicit_sync(
+        live_device.render_dev_t,
+        live_device.drm_adapter.clone(),
+    );
+    let buffer_id = harness.create_dmabuf_buffer();
+    assert_ne!(
+        buffer_id, 0,
+        "DMA-BUF creation must return a real object id"
+    );
+    let (manager_id, syncobj_surface_id) = harness.bind_live_syncobj_surface();
+    let timeline_id = harness.import_live_syncobj_timeline(manager_id, timeline_fd.as_fd());
+    drop(timeline_fd);
+    assert_ne!(
+        syncobj_surface_id, timeline_id,
+        "syncobj surface and timeline must be distinct objects"
+    );
+    assert_eq!(
+        timeline.signalled_point(),
+        ACQUIRE_POINT,
+        "importing the timeline must retain the signalled acquire point"
+    );
+    let subsurface = harness.subsurface();
+    assert!(
+        compositor::is_sync_subsurface(&subsurface),
+        "test child must remain a synchronized subsurface"
+    );
+    assert_eq!(
+        compositor::get_parent(&subsurface)
+            .expect("test child retains its parent")
+            .id()
+            .protocol_id(),
+        TEST_TOPLEVEL_SURFACE_ID,
+        "test child must still be parented before its cached commit"
+    );
+    harness.assert_client_connected("before committing synchronized explicit-sync state");
+
+    send_request(
+        &mut harness.client,
+        syncobj_surface_id,
+        1,
+        &words(&[timeline_id, 0, ACQUIRE_POINT as u32]),
+    );
+    send_request(
+        &mut harness.client,
+        syncobj_surface_id,
+        2,
+        &words(&[timeline_id, 0, RELEASE_POINT as u32]),
+    );
+    harness.dispatch_client();
+    harness.assert_client_connected("after recording explicit-sync points");
+    compositor::with_states(&subsurface, |states| {
+        let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+        let pending = cached.pending();
+        assert!(
+            pending.acquire_point.is_some(),
+            "set_acquire_point must populate the child surface's pending state"
+        );
+        assert!(
+            pending.release_point.is_some(),
+            "set_release_point must populate the child surface's pending state"
+        );
+    });
+
+    send_request(
+        &mut harness.client,
+        TEST_SUBSURFACE_SURFACE_ID,
+        1,
+        &words(&[buffer_id, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_SUBSURFACE_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after caching the synchronized child transaction");
+    compositor::with_states(&subsurface, |states| {
+        let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+        let pending = cached.pending();
+        assert!(
+            pending.acquire_point.is_none() && pending.release_point.is_none(),
+            "synchronized child commit must move both points out of pending state"
+        );
+        let current = cached.current();
+        assert!(
+            current.acquire_point.is_none() && current.release_point.is_none(),
+            "synchronized child commit must cache both points under its transaction serial, not make them current"
+        );
+    });
+    assert_eq!(
+        timeline.signalled_point(),
+        ACQUIRE_POINT,
+        "release point must not be reached before the cached transaction is destroyed"
+    );
+
+    send_request(&mut harness.client, TEST_SUBSURFACE_ID, 0, &[]);
+    send_request(&mut harness.client, TEST_SUBSURFACE_SURFACE_ID, 0, &[]);
+    let _ = harness.sync();
+    harness.assert_client_connected("after destroying the subsurface role and child surface");
+    assert!(
+        !harness
+            .server
+            .state
+            .surfaces
+            .keys()
+            .any(|id| id.protocol_id() == TEST_SUBSURFACE_SURFACE_ID),
+        "destroyed child surface record must be removed"
+    );
+
+    let signalled_point = timeline.signalled_point();
+    timeline.destroy();
+    assert!(
+        signalled_point >= RELEASE_POINT,
+        "destroying a synchronized child with a cached release point must signal point {RELEASE_POINT}; queried {signalled_point}"
+    );
+}
+
+#[cfg(feature = "explicit-sync-live-test")]
+#[test]
+#[ignore = "requires XDG_RUNTIME_DIR and opens the DRM render node named by COSMIX_TEST_RENDER_NODE"]
+fn syncobj_extension_destroy_then_surface_destroy_signals_cached_release_point() {
+    // The third defect on this arc, and the one the test above deliberately
+    // does not cover: it keeps the wp_linux_drm_syncobj_surface_v1 object alive
+    // so the destruction hook is still installed and the fix is what it
+    // measures. This takes the other order — destroy the extension object
+    // first, then the wl_surface — which is an ordinary thing for a client
+    // tearing down a subsurface to do, and nothing in the protocol makes it
+    // wrong.
+    //
+    // Stock 0.7.0's extension destroy handler removed the destruction hook and
+    // signalled only `pending()`, which the child's commit had already emptied.
+    // With the hook gone, destroying the wl_surface afterwards signalled
+    // nothing at all, so every release point in the serial-keyed cache was
+    // stranded and the client waited on the timeline forever. Fixing the hook's
+    // *body*, as the previous commit did, could not reach this: the hook was
+    // not there to run. At HEAD the `Request::Destroy` arm removes only the
+    // pre-commit hook, so the destruction hook survives the extension and this
+    // test measures its *presence*.
+    //
+    // The same standard as the other two reproducers — red for the one reason
+    // it names. The state assertions after the child's commit prove the points
+    // reached the cache rather than never having been recorded, and the
+    // assertion after the extension destroy proves the release point is still
+    // unreached at that moment, so a pass cannot come from the destroy handler
+    // having signalled it early.
+    const ACQUIRE_POINT: u64 = 1;
+    const RELEASE_POINT: u64 = 2;
+
+    let live_device = LiveSyncobjTestDevice::from_required_render_node();
+    let mut timeline = LiveClientTimeline::new(&live_device.device);
+    timeline.signal(ACQUIRE_POINT);
+    assert_eq!(
+        timeline.signalled_point(),
+        ACQUIRE_POINT,
+        "client acquire point must really be signalled before protocol setup"
+    );
+    let timeline_fd = timeline.export_fd();
+    let mut harness = KeybindingHarness::new_with_live_explicit_sync(
+        live_device.render_dev_t,
+        live_device.drm_adapter.clone(),
+    );
+    let buffer_id = harness.create_dmabuf_buffer();
+    let (manager_id, syncobj_surface_id) = harness.bind_live_syncobj_surface();
+    let timeline_id = harness.import_live_syncobj_timeline(manager_id, timeline_fd.as_fd());
+    drop(timeline_fd);
+    let subsurface = harness.subsurface();
+    assert!(
+        compositor::is_sync_subsurface(&subsurface),
+        "test child must remain a synchronized subsurface"
+    );
+    harness.assert_client_connected("before committing synchronized explicit-sync state");
+
+    send_request(
+        &mut harness.client,
+        syncobj_surface_id,
+        1,
+        &words(&[timeline_id, 0, ACQUIRE_POINT as u32]),
+    );
+    send_request(
+        &mut harness.client,
+        syncobj_surface_id,
+        2,
+        &words(&[timeline_id, 0, RELEASE_POINT as u32]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_SUBSURFACE_SURFACE_ID,
+        1,
+        &words(&[buffer_id, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_SUBSURFACE_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after caching the synchronized child transaction");
+    compositor::with_states(&subsurface, |states| {
+        let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+        let pending = cached.pending();
+        assert!(
+            pending.acquire_point.is_none() && pending.release_point.is_none(),
+            "synchronized child commit must move both points out of pending state"
+        );
+        let current = cached.current();
+        assert!(
+            current.acquire_point.is_none() && current.release_point.is_none(),
+            "synchronized child commit must cache both points under its transaction serial, not make them current"
+        );
+    });
+
+    // The step this test exists for: the extension object goes first.
+    send_request(&mut harness.client, syncobj_surface_id, 0, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after destroying the syncobj surface object");
+    assert_eq!(
+        timeline.signalled_point(),
+        ACQUIRE_POINT,
+        "destroying the extension object must not by itself reach the cached release point — \
+         otherwise this test would pass without the wl_surface destruction doing anything"
+    );
+
+    send_request(&mut harness.client, TEST_SUBSURFACE_ID, 0, &[]);
+    send_request(&mut harness.client, TEST_SUBSURFACE_SURFACE_ID, 0, &[]);
+    let _ = harness.sync();
+    harness.assert_client_connected("after destroying the subsurface role and child surface");
+    assert!(
+        !harness
+            .server
+            .state
+            .surfaces
+            .keys()
+            .any(|id| id.protocol_id() == TEST_SUBSURFACE_SURFACE_ID),
+        "destroyed child surface record must be removed"
+    );
+
+    let signalled_point = timeline.signalled_point();
+    timeline.destroy();
+    assert!(
+        signalled_point >= RELEASE_POINT,
+        "destroying the syncobj extension object before the surface must not strand the cached \
+         release point: point {RELEASE_POINT} must still be signalled; queried {signalled_point}"
+    );
+}
+
+#[cfg(feature = "explicit-sync-live-test")]
+#[test]
+#[ignore = "requires XDG_RUNTIME_DIR and opens the DRM render node named by COSMIX_TEST_RENDER_NODE"]
+fn recreated_syncobj_surface_still_validates_commits() {
+    // The fourth defect, found next door to the third and with a different
+    // symptom: not a stranded release point, but validation silently switching
+    // itself off.
+    //
+    // GetSurface records the new wp_linux_drm_syncobj_surface_v1 in the
+    // wl_surface's user data with `insert_if_missing`, while the extension's
+    // destroy handler sets the stored value to None and leaves the entry in
+    // place. So on a surface that has had an extension before, the entry is
+    // present-but-None, `insert_if_missing` declines, and the recreated object
+    // is never recorded. `commit_hook` then finds no object to post errors on
+    // and every commit on that surface goes unvalidated — including the case
+    // the first reproducer exists for. The same stale entry also defeats the
+    // `already_exists` guard, so a third GetSurface is not caught by
+    // surface_exists either.
+    //
+    // Recreating a surface's syncobj extension is normal client behaviour and
+    // the protocol nowhere says the second one is weaker than the first, so
+    // this asserts the recreated object behaves exactly like a fresh one:
+    // attach a buffer with neither sync point and the error must arrive, on
+    // the *second* object id. Asserting the id is what stops a pass being
+    // read off the first object somehow still being live.
+    let live_device = LiveSyncobjTestDevice::from_required_render_node();
+    let mut harness = KeybindingHarness::new_with_live_explicit_sync(
+        live_device.render_dev_t,
+        live_device.drm_adapter.clone(),
+    );
+    let buffer_id = harness.create_dmabuf_buffer();
+    let (manager_id, first_syncobj_surface_id) = harness.bind_live_syncobj_surface();
+
+    send_request(&mut harness.client, first_syncobj_surface_id, 0, &[]);
+    let _ = harness.sync();
+    harness.assert_client_connected("after destroying the first syncobj surface object");
+
+    let second_syncobj_surface_id = harness.allocate_object_id();
+    assert_ne!(
+        first_syncobj_surface_id, second_syncobj_surface_id,
+        "the recreated syncobj surface must be a distinct object"
+    );
+    send_request(
+        &mut harness.client,
+        manager_id,
+        1,
+        &words(&[second_syncobj_surface_id, TEST_SUBSURFACE_SURFACE_ID]),
+    );
+    let _ = harness.sync();
+    harness.assert_client_connected("after recreating the syncobj surface on the same wl_surface");
+
+    send_request(
+        &mut harness.client,
+        TEST_SUBSURFACE_SURFACE_ID,
+        1,
+        &words(&[buffer_id, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_SUBSURFACE_SURFACE_ID, 6, &[]);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+
+    let buffered_events = drain_buffered_events(&mut harness.client);
+    if let Some((_, _, body)) = buffered_events
+        .iter()
+        .find(|(object_id, opcode, _)| *object_id == 1 && *opcode == 0)
+    {
+        assert!(body.len() >= 8, "wl_display.error contains object and code");
+        assert_eq!(
+            u32::from_ne_bytes(body[0..4].try_into().expect("error object id")),
+            second_syncobj_surface_id,
+            "the error must be posted on the recreated syncobj surface object"
+        );
+        assert_eq!(
+            u32::from_ne_bytes(body[4..8].try_into().expect("error code")),
+            4,
+            "a recreated syncobj surface must validate commits exactly like a fresh one"
+        );
+        return;
+    }
+
+    let disconnect_reason = harness
+        .client_state
+        .disconnect_reason
+        .lock()
+        .expect("test disconnect-reason mutex poisoned")
+        .clone();
+    let (committed_surface_id, committed_frame) = take_dmabuf_upsert(&mut harness.server.state);
+    panic!(
+        "a recreated syncobj surface stopped validating commits: the buffer-without-points commit \
+         was processed end-to-end (DMA-BUF upsert {committed_surface_id:?} with token {}) and no \
+         wl_display.error was posted; client disconnect_reason is {disconnect_reason:?} (None \
+         means the client is still connected); drained {} buffered event(s)",
+        committed_frame.token,
+        buffered_events.len()
+    );
+}
+
+#[test]
+fn committed_release_point_selects_smithay_current_cache_slot() {
+    let harness = KeybindingHarness::new(true);
+    let surface = harness.subsurface();
+
+    compositor::with_states(&surface, |states| {
+        let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+        let current = cached.current() as *const DrmSyncobjCachedState;
+        let pending = cached.pending() as *const DrmSyncobjCachedState;
+        let selected = committed_syncobj_state(&mut cached) as *const DrmSyncobjCachedState;
+
+        assert!(std::ptr::eq(selected, current));
+        assert!(!std::ptr::eq(selected, pending));
+    });
+}
+
+#[test]
+fn real_dmabuf_commit_without_release_point_stays_implicit() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+
+    harness.commit_dmabuf(buffer_id);
+
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (backing_token, backing_use, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+    assert_eq!(frame.use_id, None);
+    assert_eq!(backing_use, None);
+    assert_ne!(frame.token, backing_token);
+    assert!(
+        harness
+            .server
+            .state
+            .committed_release_point_override
+            .is_none()
+    );
+    assert!(
+        harness
+            .server
+            .state
+            .release_use_test_probe
+            .observations()
+            .retirements
+            .is_empty()
+    );
+}
+
+use smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_buffer_params_v1;
+
+/// What driving one single-plane `create_immed` over the real wire produced.
+#[derive(Debug)]
+enum SinglePlaneOutcome {
+    /// The compositor accepted the buffer and published a frame. `delivered`
+    /// is the true size of the plane the renderer would import from;
+    /// `claimed` is `stride * height`, the extent the descriptor asserts.
+    Accepted { delivered: u64, claimed: u64 },
+    /// `wl_display.error` refused the request with this protocol error `code`.
+    /// Which object it named is asserted where it is read, in
+    /// `drive_single_plane_dmabuf`, so it is not carried out here.
+    Refused { code: u32, message: String },
+}
+
+/// Drive `create_params` → `add` → `create_immed` with the only plane declared
+/// at `plane_idx`, backed by a memfd holding exactly `plane_rows` rows.
+///
+/// A fresh harness per call on purpose: three of the four cases this feeds are
+/// fatal, and a client killed by the first would make every later case pass
+/// without proving anything.
+fn drive_single_plane_dmabuf(plane_idx: u32, plane_rows: u32) -> SinglePlaneOutcome {
+    const WIDTH: u32 = 64;
+    const HEIGHT: u32 = 32;
+    const STRIDE: u32 = WIDTH * 4;
+
+    let mut harness = KeybindingHarness::new(true);
+    let surface = harness.subsurface();
+    let params_id = harness.allocate_object_id();
+    let buffer_id = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_LINUX_DMABUF_ID,
+        1,
+        &words(&[params_id]),
+    );
+
+    let plane = anonymous_plane(
+        "cosmix-dmabuf-plane-index",
+        u64::from(STRIDE) * u64::from(plane_rows),
+    );
+    let modifier = u64::from(smithay::backend::allocator::Modifier::Linear);
+    send_request_with_fd(
+        &mut harness.client,
+        params_id,
+        1,
+        &words(&[
+            plane_idx,
+            0,
+            STRIDE,
+            (modifier >> 32) as u32,
+            modifier as u32,
+        ]),
+        plane.as_fd(),
+    );
+    send_request(
+        &mut harness.client,
+        params_id,
+        3,
+        &words(&[
+            buffer_id,
+            WIDTH,
+            HEIGHT,
+            smithay::backend::allocator::Fourcc::Argb8888 as u32,
+            0,
+        ]),
+    );
+    harness.dispatch_client();
+
+    let disconnected = harness
+        .client_state
+        .disconnect_reason
+        .lock()
+        .expect("test disconnect-reason mutex poisoned")
+        .is_some();
+    if disconnected {
+        // The reason string only decides the branch; the oracle is the wire.
+        let (offending, code, message) = read_protocol_error(&mut harness.client);
+        assert_eq!(
+            offending, params_id,
+            "the error must name the params object that was asked to create: {message}"
+        );
+        return SinglePlaneOutcome::Refused { code, message };
+    }
+
+    harness.commit_dmabuf(buffer_id);
+    let (upserted, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    assert_eq!(
+        upserted,
+        harness
+            .server
+            .state
+            .surfaces
+            .get(&surface.id())
+            .expect("the committing surface is live")
+            .id,
+        "the frame was published against the committing surface"
+    );
+    assert_eq!(
+        (frame.descriptor.width, frame.descriptor.height),
+        (WIDTH, HEIGHT),
+        "the renderer is told the buffer covers the full extent"
+    );
+    assert_eq!(frame.descriptor.planes.len(), 1, "one plane reached import");
+    let delivered_plane = &frame.descriptor.planes[0];
+    assert_eq!(delivered_plane.stride, STRIDE, "stride survived unchanged");
+    // `fstat`, not a seek to the end: this descriptor arrived over `SCM_RIGHTS`
+    // and was then duplicated, so it shares one open file description with the
+    // client's own memfd. Seeking it would move the offset the client still
+    // reads through.
+    let delivered = File::from(
+        delivered_plane
+            .fd
+            .try_clone()
+            .expect("duplicate the delivered plane for measurement"),
+    )
+    .metadata()
+    .expect("measure the delivered plane")
+    .len();
+    SinglePlaneOutcome::Accepted {
+        delivered,
+        claimed: u64::from(STRIDE) * u64::from(HEIGHT),
+    }
+}
+
+/// A plane set whose declared indices are not exactly `0..n` must be refused,
+/// because Smithay's extent check and Smithay's plane numbering used to
+/// disagree about which plane was plane zero.
+///
+/// `create_dmabuf` validates each plane at
+/// `vendor/smithay/src/wayland/dmabuf/mod.rs` with
+/// `if plane.plane_idx == 0 && end as u64 > size`, `end` being
+/// `stride * height + offset` — the whole extent the buffer claims. Planes above
+/// zero are exempt, because a subsampled plane is legitimately smaller. The
+/// plane list was then drained in client **arrival order** and relabelled by
+/// `enumerate()`, so a lone plane added as index 1 was exempted as a subsampled
+/// plane and handed to the compositor as plane 0. Nothing downstream recovered
+/// the check: `validate_dmabuf_metadata` does arithmetic on the declared stride,
+/// and never asks the descriptor how large the plane actually is.
+///
+/// Before the vendored fix the third case below was **accepted**, and the
+/// renderer received a 256-byte plane described as an 8192-byte buffer. The
+/// gapped set at the end is not that defect; it is the rest of the rule the fix
+/// states, kept honest so "index zero is present" cannot pass for "the indices
+/// are exactly `0..n`".
+#[test]
+fn a_plane_set_that_is_not_exactly_zero_to_n_is_refused_as_incomplete() {
+    const FULL_ROWS: u32 = 32;
+    const SHORT_ROWS: u32 = 1;
+
+    // The ordinary path, which must stay open — without this the three
+    // refusals below could all be produced by a compositor that refuses
+    // everything.
+    match drive_single_plane_dmabuf(0, FULL_ROWS) {
+        SinglePlaneOutcome::Accepted { delivered, claimed } => assert_eq!(
+            delivered, claimed,
+            "an accepted plane covers exactly the extent it claims"
+        ),
+        refused => panic!("a well-formed single-plane DMA-BUF must be accepted: {refused:?}"),
+    }
+
+    // The extent check itself, reached the ordinary way. This is the check the
+    // defect walked past, so a fixture that did not prove it fires would not
+    // know whether the third case was refused for the right reason.
+    match drive_single_plane_dmabuf(0, SHORT_ROWS) {
+        SinglePlaneOutcome::Refused { code, message } => assert_eq!(
+            code,
+            zwp_linux_buffer_params_v1::Error::OutOfBounds as u32,
+            "a short plane at index zero is out_of_bounds: {message}"
+        ),
+        accepted => panic!("a plane a row long cannot back a 32-row buffer: {accepted:?}"),
+    }
+
+    // The defect: the same short plane, declared at index 1.
+    match drive_single_plane_dmabuf(1, SHORT_ROWS) {
+        SinglePlaneOutcome::Refused { code, message } => assert_eq!(
+            code,
+            zwp_linux_buffer_params_v1::Error::Incomplete as u32,
+            "a lone plane above index zero is incomplete: {message}"
+        ),
+        accepted => panic!(
+            "REGRESSION: a plane exempted from the extent check was renumbered \
+             into plane zero and reached the renderer: {accepted:?}"
+        ),
+    }
+
+    // ...and it is the index that decides, not the size. A full-size plane at
+    // index 1 is still an incomplete plane set, so the guard cannot be
+    // satisfied by anything the extent check would have caught anyway.
+    match drive_single_plane_dmabuf(1, FULL_ROWS) {
+        SinglePlaneOutcome::Refused { code, message } => assert_eq!(
+            code,
+            zwp_linux_buffer_params_v1::Error::Incomplete as u32,
+            "plane indices must be consecutive from zero whatever the size: {message}"
+        ),
+        accepted => panic!("a plane set that starts at index 1 is not complete: {accepted:?}"),
+    }
+
+    // The rule is the whole set, not just its first member. A guard that only
+    // demanded index zero be present would satisfy every case above and still
+    // let a gapped set through, where the same renumbering lands plane 2's
+    // description on plane 1. Both cases below are two-plane sets this
+    // compositor refuses for its own single-plane rule, so the anchor is what
+    // separates them: a dense set has to get *past* Smithay and be refused
+    // here, and only the gapped one may die on the wire.
+    let mut dense = DmabufParamsSpec::valid();
+    dense.planes = vec![(0, FULL_ROWS), (1, FULL_ROWS)];
+    assert!(
+        matches!(drive_dmabuf_params(&dense), ParamsOutcome::Failed),
+        "a dense two-plane set is complete, and must reach this compositor's own rules"
+    );
+
+    let mut gapped = dense.clone();
+    gapped.planes = vec![(0, FULL_ROWS), (2, FULL_ROWS)];
+    match drive_dmabuf_params(&gapped) {
+        ParamsOutcome::Fatal { code, message } => assert_eq!(
+            code,
+            zwp_linux_buffer_params_v1::Error::Incomplete as u32,
+            "a plane set with a hole in it is incomplete: {message}"
+        ),
+        survived => panic!("a plane set missing index 1 is not complete: {survived:?}"),
+    }
+}
+
+/// One `zwp_linux_buffer_params_v1` exchange, described as the client sends it.
+///
+/// The fields exist so a fixture can vary exactly one thing away from
+/// [`DmabufParamsSpec::valid`]: a rejection fixture that also changed something
+/// else could not say which change the compositor refused.
+#[derive(Clone)]
+struct DmabufParamsSpec {
+    width: u32,
+    height: u32,
+    /// `None` sends the packed `width * 4`.
+    stride: Option<u32>,
+    fourcc: u32,
+    modifier: u64,
+    /// One entry per plane: the index the client declares it at, and the rows
+    /// its memfd actually holds. Sent in this order, which is not required to
+    /// be sorted — a client may `add` its planes in any order it likes.
+    planes: Vec<(u32, u32)>,
+    /// `create_immed` (opcode 3) rather than `create` (opcode 2).
+    immediate: bool,
+}
+
+impl DmabufParamsSpec {
+    /// The buffer the rest of this suite creates: single ARGB8888/Linear plane,
+    /// packed, exactly as large as it claims.
+    fn valid() -> Self {
+        Self {
+            width: 64,
+            height: 32,
+            stride: None,
+            fourcc: smithay::backend::allocator::Fourcc::Argb8888 as u32,
+            modifier: u64::from(smithay::backend::allocator::Modifier::Linear),
+            planes: vec![(0, 32)],
+            immediate: false,
+        }
+    }
+
+    fn stride(&self) -> u32 {
+        self.stride.unwrap_or(self.width * 4)
+    }
+}
+
+/// What the client observed after one params exchange.
+#[derive(Debug)]
+enum ParamsOutcome {
+    /// Async `create` succeeded: `created` arrived naming this server-allocated
+    /// `wl_buffer`.
+    Created { buffer: u32 },
+    /// Async `create` was refused non-fatally: `failed` arrived and the client
+    /// is still connected.
+    Failed,
+    /// `create_immed` succeeded. This path sends no params event at all, so the
+    /// evidence is the absence of an error across a completed sync fence.
+    CreatedImmediately,
+    /// The client was killed with this `zwp_linux_buffer_params_v1` error code.
+    Fatal { code: u32, message: String },
+}
+
+/// Drive one params exchange over the real socket and report what came back.
+///
+/// A fresh harness per call: several callers are fatal, and a client killed by
+/// an earlier case would make every later one pass without proving anything.
+fn drive_dmabuf_params(spec: &DmabufParamsSpec) -> ParamsOutcome {
+    let mut harness = KeybindingHarness::new(true);
+    let params_id = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_LINUX_DMABUF_ID,
+        1,
+        &words(&[params_id]),
+    );
+
+    let stride = spec.stride();
+    // The planes must outlive every `send_request_with_fd` below, so they are
+    // held here rather than dropped at the end of each iteration.
+    let mut held_planes = Vec::with_capacity(spec.planes.len());
+    for (plane_idx, rows) in spec.planes.iter().copied() {
+        let name = std::ffi::CString::new("cosmix-dmabuf-params-spec").expect("static memfd name");
+        // SAFETY: name is a live NUL-terminated C string and ownership of the
+        // returned descriptor is transferred immediately into File.
+        let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(
+            raw_fd >= 0,
+            "create anonymous test plane: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: memfd_create returned a new owned descriptor on success.
+        let plane = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+        plane
+            .set_len(u64::from(stride) * u64::from(rows))
+            .expect("size the anonymous test plane");
+        send_request_with_fd(
+            &mut harness.client,
+            params_id,
+            1,
+            &words(&[
+                plane_idx,
+                0,
+                stride,
+                (spec.modifier >> 32) as u32,
+                spec.modifier as u32,
+            ]),
+            plane.as_fd(),
+        );
+        held_planes.push(plane);
+    }
+
+    if spec.immediate {
+        // Allocated only on this path. Client object ids must be created in a
+        // dense sequence, so reserving an id the asynchronous request never
+        // creates would leave a hole and the next new_id would be refused.
+        let buffer_id = harness.allocate_object_id();
+        send_request(
+            &mut harness.client,
+            params_id,
+            3,
+            &words(&[buffer_id, spec.width, spec.height, spec.fourcc, 0]),
+        );
+    } else {
+        send_request(
+            &mut harness.client,
+            params_id,
+            2,
+            &words(&[spec.width, spec.height, spec.fourcc, 0]),
+        );
+    }
+    harness.dispatch_client();
+
+    let disconnected = harness
+        .client_state
+        .disconnect_reason
+        .lock()
+        .expect("test disconnect-reason mutex poisoned")
+        .is_some();
+    if disconnected {
+        // The reason string only decides the branch; the wire is the oracle.
+        let (offending, code, message) = read_protocol_error(&mut harness.client);
+        assert_eq!(
+            offending, params_id,
+            "the error must name the params object that was asked to create: {message}"
+        );
+        return ParamsOutcome::Fatal { code, message };
+    }
+
+    // A sync fence is safe now the client is known to be alive, and it is what
+    // makes "no `failed` arrived" mean something: every event the compositor
+    // owed for the create is behind the callback.
+    let events = harness.sync();
+    let mut outcome = None;
+    for (object, opcode, body) in &events {
+        if *object != params_id {
+            continue;
+        }
+        let observed = match opcode {
+            0 => {
+                assert!(
+                    body.len() >= 4,
+                    "zwp_linux_buffer_params_v1.created carries a new_id: {body:?}"
+                );
+                ParamsOutcome::Created {
+                    buffer: u32::from_ne_bytes(body[0..4].try_into().expect("created new_id")),
+                }
+            }
+            1 => ParamsOutcome::Failed,
+            other => panic!("unexpected zwp_linux_buffer_params_v1 event opcode {other}"),
+        };
+        assert!(
+            outcome.replace(observed).is_none(),
+            "the params object must report its result exactly once: {events:?}"
+        );
+    }
+    outcome.unwrap_or_else(|| {
+        assert!(
+            spec.immediate,
+            "async create must report either created or failed: {events:?}"
+        );
+        ParamsOutcome::CreatedImmediately
+    })
+}
+
+/// Metadata this compositor rejects — as opposed to metadata Smithay rejects
+/// first — must reach the client as a refusal, in whichever form the create
+/// request it came from calls for.
+///
+/// Every input below is chosen to pass Smithay's own validation and fail
+/// `validate_dmabuf_metadata`, so each one actually exercises the
+/// `notifier.failed()` call in this compositor's `dmabuf_imported`. That call is
+/// otherwise untested over the wire: `validate_dmabuf_metadata` has a direct
+/// unit test, but nothing proved its verdict was ever delivered to a client.
+#[test]
+fn metadata_this_compositor_rejects_refuses_the_client_over_the_wire() {
+    // Anchor. Without it the refusals below could all come from a compositor
+    // that refuses every DMA-BUF.
+    match drive_dmabuf_params(&DmabufParamsSpec::valid()) {
+        ParamsOutcome::Created { buffer } => assert!(
+            buffer >= 0xff00_0000,
+            "the async create path returns a server-allocated id, not the \
+             client's next id: {buffer:#x}"
+        ),
+        refused => panic!("a well-formed DMA-BUF must be accepted: {refused:?}"),
+    }
+
+    // Stride below the packed row. Smithay only checks the plane against the
+    // memfd, which is sized to this stride, so this reaches us.
+    let mut short_stride = DmabufParamsSpec::valid();
+    short_stride.stride = Some(128);
+    assert!(
+        matches!(drive_dmabuf_params(&short_stride), ParamsOutcome::Failed),
+        "a stride below the packed row must be refused"
+    );
+
+    // Advertised fourcc, unadvertised modifier. Smithay keys its format table
+    // on the fourcc alone, so only this compositor checks the pair.
+    let mut wrong_modifier = DmabufParamsSpec::valid();
+    wrong_modifier.modifier = 1;
+    assert!(
+        matches!(drive_dmabuf_params(&wrong_modifier), ParamsOutcome::Failed),
+        "an unadvertised modifier on an advertised fourcc must be refused"
+    );
+
+    // Two planes for a format advertised as single-plane. The indices are
+    // consecutive, so this clears the plane-set guard and reaches us.
+    let mut two_planes = DmabufParamsSpec::valid();
+    two_planes.planes = vec![(0, 32), (1, 32)];
+    assert!(
+        matches!(drive_dmabuf_params(&two_planes), ParamsOutcome::Failed),
+        "a second plane for a single-plane format must be refused"
+    );
+
+    // The same two planes, added in the other order. `add` carries the index,
+    // so arrival order is the client's business and a complete plane set is
+    // still complete — this must reach us and be refused for its plane count,
+    // exactly as the sorted case was, and not be turned away as `incomplete`
+    // by the plane-set guard.
+    let mut reversed_planes = DmabufParamsSpec::valid();
+    reversed_planes.planes = vec![(1, 32), (0, 32)];
+    assert!(
+        matches!(drive_dmabuf_params(&reversed_planes), ParamsOutcome::Failed),
+        "planes added out of order still form a complete plane set"
+    );
+
+    // One axis past MAX_SURFACE_DIMENSION. Smithay only requires it to be
+    // positive; the height keeps the memfd small.
+    let mut too_wide = DmabufParamsSpec::valid();
+    too_wide.width = 8193;
+    too_wide.height = 1;
+    too_wide.planes = vec![(0, 1)];
+    assert!(
+        matches!(drive_dmabuf_params(&too_wide), ParamsOutcome::Failed),
+        "a buffer wider than MAX_SURFACE_DIMENSION must be refused"
+    );
+}
+
+/// The same rejection is fatal or not depending on which create request asked,
+/// and this compositor does not choose — Smithay does, from the notifier it
+/// handed over.
+///
+/// `create` gets a fallible notifier and a `failed` event; `create_immed` has
+/// already handed the client a `wl_buffer` id, so the only remedy left is
+/// `invalid_wl_buffer` and a dead client. One rejection reaching a client two
+/// different ways is the property here, so both halves use the *same*
+/// malformed input.
+#[test]
+fn one_rejected_buffer_is_fatal_only_through_create_immed() {
+    let mut asynchronous = DmabufParamsSpec::valid();
+    asynchronous.stride = Some(128);
+    let mut immediate = asynchronous.clone();
+    immediate.immediate = true;
+
+    assert!(
+        matches!(drive_dmabuf_params(&asynchronous), ParamsOutcome::Failed),
+        "async create reports failure without killing the client"
+    );
+
+    match drive_dmabuf_params(&immediate) {
+        ParamsOutcome::Fatal { code, message } => assert_eq!(
+            code,
+            zwp_linux_buffer_params_v1::Error::InvalidWlBuffer as u32,
+            "create_immed cannot un-issue the wl_buffer id, so refusal is \
+             invalid_wl_buffer: {message}"
+        ),
+        survived => panic!(
+            "a buffer id already handed to the client cannot be left \
+             unbacked: {survived:?}"
+        ),
+    }
+}
+
+/// The asynchronous `create` request, which no other fixture in this suite
+/// sends: every existing DMA-BUF test goes through `create_immed`.
+///
+/// A client that wants to fall back gracefully rather than die uses this path,
+/// so "the compositor accepts DMA-BUFs" being proven only through `create_immed`
+/// left the whole request untested — including the part where the *server*
+/// allocates the buffer id.
+#[test]
+fn an_asynchronous_create_returns_a_server_allocated_buffer() {
+    let spec = DmabufParamsSpec::valid();
+    let ParamsOutcome::Created { buffer } = drive_dmabuf_params(&spec) else {
+        panic!("a well-formed asynchronous create must report created");
+    };
+
+    // The id is the server's to choose. Asserting only "some id arrived" would
+    // pass on an echo of a client id, which is what a broken new_id would look
+    // like.
+    assert!(
+        buffer >= 0xff00_0000,
+        "created names an id from the server range: {buffer:#x}"
+    );
+
+    // And the same request through create_immed keeps working, with the client
+    // naming the id — the two paths differ in who allocates, not in whether the
+    // buffer is usable.
+    let mut immediate = spec;
+    immediate.immediate = true;
+    assert!(
+        matches!(
+            drive_dmabuf_params(&immediate),
+            ParamsOutcome::CreatedImmediately
+        ),
+        "create_immed accepts the same buffer without any params event"
+    );
+}
+
+#[test]
+fn real_dmabuf_commit_carries_one_minted_use_through_backing_and_initial_event() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let point = harness.install_committed_point(101);
+
+    harness.commit_dmabuf(buffer_id);
+
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (backing_token, backing_use, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+    let use_id = frame.use_id.expect("release point begins an explicit use");
+    assert_eq!(backing_use, Some(use_id));
+    assert_ne!(frame.token, backing_token);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .release_uses
+            .owner_kind_name(backing_token),
+        Some("backing")
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .release_uses
+            .owner_kind_name(frame.token),
+        Some("renderer")
+    );
+    assert!(
+        harness
+            .server
+            .state
+            .committed_release_point_override
+            .is_none()
+    );
+    assert_eq!(point.signal_count(), 0);
+    assert!(!point.reached_retirement_seam());
+    harness.renderer_releases(frame.token);
+    harness.server.state.release_buffer_token(backing_token);
+    assert_signalled_after_retirement(&mut harness, &point);
+}
+
+#[test]
+fn successful_retirement_signals_once_and_refunds_only_after_the_report() {
+    let (adapter, wait_entered, mut release_wait, calls) = first_wait_gated_retirement_adapter();
+    let mut harness = KeybindingHarness::new_with_retirement_adapter(true, Some(adapter));
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let client_id = surface.client().expect("live client").id();
+    let point = harness.install_committed_point(102);
+    harness.commit_dmabuf(buffer_id);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (backing_token, backing_use, buffer) =
+        committed_dmabuf_backing(&harness.server.state, &surface);
+    let use_id = frame.use_id.expect("explicit use");
+    assert_eq!(backing_use, Some(use_id));
+    assert_eq!(
+        harness
+            .server
+            .state
+            .release_uses
+            .accounting_counts(&client_id),
+        (1, 1),
+        "the live explicit use consumes both client and global accounting"
+    );
+
+    harness.server.state.release_buffer_token(frame.token);
+    assert!(
+        harness
+            .server
+            .state
+            .release_use_test_probe
+            .observations()
+            .retirements
+            .is_empty()
+    );
+    assert!(!point.reached_retirement_seam());
+    harness.server.state.release_buffer_token(backing_token);
+    wait_entered
+        .recv_timeout(PROTOCOL_ACK_DEADLINE)
+        .expect("retirement worker reaches its one GPU wait");
+
+    let observations = harness.server.state.release_use_test_probe.observations();
+    assert_eq!(
+        observations.retirements,
+        [TestReleaseUseRetirement {
+            use_id,
+            client: client_id.clone(),
+            buffer,
+            point_id: 102,
+        }]
+    );
+    assert!(observations.rejections.is_empty());
+    drop(observations);
+    assert_waiting_at_retirement_seam(&point);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .release_uses
+            .accounting_counts(&client_id),
+        (1, 1),
+        "retire_use must retain both budgets until the GPU wait reports"
+    );
+
+    release_wait.release();
+    pump_protocol_event_loop_until(
+        &mut harness.server,
+        "successful explicit-sync GPU retirement report",
+        |_| point.is_terminal(),
+    );
+
+    assert!(point.is_terminal());
+    assert!(!point.was_abandoned());
+    assert_eq!(point.signal_count(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .release_uses
+            .accounting_counts(&client_id),
+        (0, 0),
+        "the successful report refunds both client and global accounting"
+    );
+    assert!(
+        harness
+            .server
+            .state
+            .display_handle
+            .backend_handle()
+            .get_client_data(client_id)
+            .is_ok(),
+        "normal retirement must not terminate the client"
+    );
+}
+
+#[test]
+fn backing_then_renderer_release_retires_only_after_renderer_owner() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let point = harness.install_committed_point(103);
+    harness.commit_dmabuf(buffer_id);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (backing_token, backing_use, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+    let use_id = frame.use_id.expect("explicit use");
+    assert_eq!(backing_use, Some(use_id));
+
+    harness.server.state.release_buffer_token(backing_token);
+    assert!(
+        harness
+            .server
+            .state
+            .release_use_test_probe
+            .observations()
+            .retirements
+            .is_empty()
+    );
+    assert!(!point.reached_retirement_seam());
+    harness.server.state.release_buffer_token(frame.token);
+
+    let observations = harness.server.state.release_use_test_probe.observations();
+    assert_eq!(observations.retirements.len(), 1);
+    assert_eq!(observations.retirements[0].use_id, use_id);
+    assert_eq!(observations.retirements[0].point_id, 103);
+    drop(observations);
+    assert_signalled_after_retirement(&mut harness, &point);
+}
+
+#[test]
+fn retirement_timeout_faults_disconnects_and_abandons_without_stopping_protocol() {
+    let mut harness = KeybindingHarness::new_with_retirement_adapter(
+        true,
+        Some(Box::new(FailingRetirementAdapter(
+            cosmix_wgpu_dmabuf::RetirementWaitError::Timeout,
+        ))),
+    );
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let client = surface.client().expect("live client").id();
+    let point = harness.install_committed_point(104);
+    let (_implicit_peer, implicit_stream) = UnixStream::pair().expect("implicit client socket");
+    let implicit_state = Arc::new(WaylandClientState::new(
+        harness.server.state.client_disconnect_sender.clone(),
+    ));
+    harness
+        .server
+        .state
+        .display_handle
+        .insert_client(implicit_stream, implicit_state.clone())
+        .expect("register implicit-only client");
+    harness.commit_dmabuf(buffer_id);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (backing_token, _, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+    let withdrawal_global = harness.arm_explicit_sync_withdrawal_probe();
+
+    harness.server.state.release_buffer_token(frame.token);
+    harness.server.state.release_buffer_token(backing_token);
+    let live_point = harness.install_committed_point(115);
+    harness.commit_dmabuf(buffer_id);
+    let (_, live_frame) = take_dmabuf_upsert(&mut harness.server.state);
+    assert!(live_frame.use_id.is_some());
+    assert!(!live_point.reached_retirement_seam());
+    assert_eq!(
+        harness.server.state.release_uses.accounting_counts(&client),
+        (2, 2),
+        "the failed batch and a still-live use both remain accounted before fault dispatch"
+    );
+    pump_protocol_event_loop_until(
+        &mut harness.server,
+        "permanent explicit-sync timeout fault",
+        |state| {
+            !state
+                .release_use_test_probe
+                .observations()
+                .faults
+                .is_empty()
+        },
+    );
+
+    assert!(point.was_abandoned());
+    assert!(point.is_terminal());
+    assert_eq!(point.signal_count(), 0);
+    assert!(live_point.was_abandoned());
+    assert!(live_point.is_terminal());
+    assert_eq!(live_point.signal_count(), 0);
+    assert!(!harness.server.state.release_uses.explicit_sync_healthy());
+    harness.assert_explicit_sync_global_withdrawn(&withdrawal_global);
+    assert_eq!(harness.server.state.shutdown_cause, None);
+    assert_eq!(
+        harness.server.state.release_uses.accounting_counts(&client),
+        (0, 0)
+    );
+    let disconnect_reason = harness
+        .client_state
+        .disconnect_reason
+        .lock()
+        .expect("test disconnect-reason mutex poisoned")
+        .clone();
+    assert!(
+        disconnect_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("explicit-sync retirement permanently faulted")),
+        "affected explicit-sync client was not disconnected: {disconnect_reason:?}, {client:?}"
+    );
+    assert_eq!(
+        *implicit_state
+            .disconnect_reason
+            .lock()
+            .expect("implicit-client disconnect mutex poisoned"),
+        None,
+        "implicit-only client remains connected after explicit-sync fault"
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .release_use_test_probe
+            .observations()
+            .faults,
+        [ExplicitSyncFault::Worker(RetirementWorkerError::Wait(
+            cosmix_wgpu_dmabuf::RetirementWaitError::Timeout
+        ))]
+    );
+}
+
+#[test]
+fn release_point_signal_failure_after_gpu_retirement_faults_and_abandons() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let point = harness.install_committed_point(105);
+    point.fail_signal();
+    harness.commit_dmabuf(buffer_id);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (backing_token, _, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+    let withdrawal_global = harness.arm_explicit_sync_withdrawal_probe();
+
+    harness.server.state.release_buffer_token(frame.token);
+    harness.server.state.release_buffer_token(backing_token);
+    pump_protocol_event_loop_until(
+        &mut harness.server,
+        "release-point signal failure",
+        |state| {
+            state
+                .release_use_test_probe
+                .observations()
+                .faults
+                .iter()
+                .any(|fault| matches!(fault, ExplicitSyncFault::PointSignalFailed(_)))
+        },
+    );
+
+    assert_eq!(point.signal_count(), 1);
+    assert!(point.was_abandoned());
+    assert!(point.is_terminal());
+    assert!(!harness.server.state.release_uses.explicit_sync_healthy());
+    harness.assert_explicit_sync_global_withdrawn(&withdrawal_global);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .release_use_test_probe
+            .observations()
+            .faults,
+        [ExplicitSyncFault::PointSignalFailed(
+            "injected release-point signal failure".into()
+        )]
+    );
+}
+
+#[test]
+fn retirement_sequence_exhaustion_faults_before_requesting_a_wait() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let client = surface.client().expect("live client").id();
+    let point = harness.install_committed_point(116);
+    harness.commit_dmabuf(buffer_id);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (backing_token, _, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+    harness
+        .server
+        .state
+        .release_uses
+        .platform_mut()
+        .next_retirement_sequence = None;
+    let withdrawal_global = harness.arm_explicit_sync_withdrawal_probe();
+
+    harness.server.state.release_buffer_token(frame.token);
+    harness.server.state.release_buffer_token(backing_token);
+
+    assert!(point.reached_retirement_seam());
+    assert!(point.was_abandoned());
+    assert!(point.is_terminal());
+    assert_eq!(point.signal_count(), 0);
+    assert!(!harness.server.state.release_uses.explicit_sync_healthy());
+    harness.assert_explicit_sync_global_withdrawn(&withdrawal_global);
+    assert_eq!(
+        harness.server.state.release_uses.accounting_counts(&client),
+        (0, 0)
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .release_use_test_probe
+            .observations()
+            .faults,
+        [ExplicitSyncFault::RetirementSequenceExhausted]
+    );
+}
+
+#[test]
+fn retirement_worker_channel_close_faults_a_live_use_without_polling() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let client = surface.client().expect("live client").id();
+    let point = harness.install_committed_point(106);
+    harness.commit_dmabuf(buffer_id);
+    let _ = take_dmabuf_upsert(&mut harness.server.state);
+    let withdrawal_global = harness.arm_explicit_sync_withdrawal_probe();
+
+    harness.server.state.release_uses.stop_retirement_worker();
+    pump_protocol_event_loop_until(
+        &mut harness.server,
+        "retirement report channel closure",
+        |state| {
+            !state
+                .release_use_test_probe
+                .observations()
+                .faults
+                .is_empty()
+        },
+    );
+
+    assert!(point.was_abandoned());
+    assert!(point.is_terminal());
+    assert_eq!(point.signal_count(), 0);
+    assert!(!point.reached_retirement_seam());
+    assert!(!harness.server.state.release_uses.explicit_sync_healthy());
+    harness.assert_explicit_sync_global_withdrawn(&withdrawal_global);
+    harness
+        .server
+        .state
+        .withdraw_explicit_sync_global("second permanent fault");
+    harness.assert_explicit_sync_global_withdrawn(&withdrawal_global);
+    assert_eq!(harness.server.state.explicit_sync_global_withdrawals, 1);
+    let disconnect_reason = harness
+        .client_state
+        .disconnect_reason
+        .lock()
+        .expect("test disconnect-reason mutex poisoned")
+        .clone();
+    assert!(
+        disconnect_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("explicit-sync retirement permanently faulted")),
+        "the client owning the live explicit use is disconnected: {client:?} {disconnect_reason:?}"
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .release_use_test_probe
+            .observations()
+            .faults,
+        [ExplicitSyncFault::WorkerUnavailable]
+    );
+}
+
+fn assert_invalid_retirement_report_fault(
+    batch_id: RetirementBatchId,
+    high_water: RetirementSequence,
+    point_id: u64,
+) {
+    let (adapter, wait_entered, mut release_wait, _) = first_wait_gated_retirement_adapter();
+    let mut harness = KeybindingHarness::new_with_retirement_adapter(true, Some(adapter));
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let point = harness.install_committed_point(point_id);
+    harness.commit_dmabuf(buffer_id);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (backing_token, _, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+    harness.server.state.release_buffer_token(frame.token);
+    harness.server.state.release_buffer_token(backing_token);
+    wait_entered
+        .recv_timeout(PROTOCOL_ACK_DEADLINE)
+        .expect("invalid-report test retirement reaches the gated wait");
+    assert_waiting_at_retirement_seam(&point);
+
+    harness
+        .server
+        .state
+        .handle_retirement_report(RetirementWorkerReport {
+            batch_id,
+            high_water,
+            result: Ok(()),
+        });
+
+    assert_eq!(point.signal_count(), 0);
+    assert!(point.was_abandoned());
+    assert!(point.is_terminal());
+    assert!(!harness.server.state.release_uses.explicit_sync_healthy());
+    assert_eq!(
+        harness
+            .server
+            .state
+            .release_use_test_probe
+            .observations()
+            .faults,
+        [ExplicitSyncFault::InvalidReport {
+            expected_batch_id: RetirementBatchId(1),
+            batch_id,
+            high_water,
+        }]
+    );
+    release_wait.release();
+}
+
+#[test]
+fn unknown_high_water_and_wrong_batch_id_each_fault() {
+    for (batch_id, high_water, point_id) in [
+        (RetirementBatchId(1), RetirementSequence(99), 107),
+        (RetirementBatchId(92), RetirementSequence(1), 108),
+    ] {
+        assert_invalid_retirement_report_fault(batch_id, high_water, point_id);
+    }
+}
+
+#[test]
+fn faulted_state_allows_implicit_commit_but_rejects_and_disposes_explicit_commit() {
+    let mut harness = KeybindingHarness::new(true);
+    let withdrawal_global = harness.arm_explicit_sync_withdrawal_probe();
+    harness.server.state.release_uses.stop_retirement_worker();
+    pump_protocol_event_loop_until(
+        &mut harness.server,
+        "idle retirement worker channel closure",
+        |state| !state.release_uses.explicit_sync_healthy(),
+    );
+    harness.assert_explicit_sync_global_withdrawn(&withdrawal_global);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .release_use_test_probe
+            .observations()
+            .faults,
+        [ExplicitSyncFault::WorkerUnavailable]
+    );
+
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let client = surface.client().expect("live client").id();
+    harness.commit_dmabuf(buffer_id);
+    let (_, implicit_frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (_, implicit_backing_use, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+    assert_eq!(implicit_frame.use_id, None);
+    assert_eq!(implicit_backing_use, None);
+    assert_eq!(
+        harness.server.state.release_uses.accounting_counts(&client),
+        (0, 0),
+        "implicit commit bypasses explicit-sync health and accounting"
+    );
+
+    let point = harness.install_committed_point(111);
+    harness.commit_dmabuf(buffer_id);
+
+    assert!(point.is_terminal());
+    assert!(!point.was_abandoned());
+    assert_eq!(point.signal_count(), 1);
+    assert!(
+        harness.server.state.events.iter().all(|event| !matches!(
+            event,
+            ProtocolEvent::SurfaceUpserted {
+                frame: SurfaceFrame::Dmabuf(_),
+                ..
+            }
+        )),
+        "faulted explicit commit is not published"
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .release_use_test_probe
+            .observations()
+            .rejections,
+        [TestReleaseUseRejection {
+            client,
+            point_id: 111,
+            failure: ReleaseUseFailure::ExplicitSyncFaulted,
+        }]
+    );
+}
+
+#[test]
+fn two_retirements_queued_during_a_real_wait_complete_in_one_following_batch() {
+    let (adapter, first_wait_entered, mut release_first_wait, calls) =
+        first_wait_gated_retirement_adapter();
+    let mut harness = KeybindingHarness::new_with_retirement_adapter(true, Some(adapter));
+    let buffer_id = harness.create_dmabuf_buffer();
+    let client = harness.subsurface().client().expect("live client").id();
+
+    let priming = commit_and_retire_explicit_use(&mut harness, buffer_id, 112);
+    first_wait_entered
+        .recv_timeout(PROTOCOL_ACK_DEADLINE)
+        .expect("priming retirement enters its GPU wait");
+    let first_batched = commit_and_retire_explicit_use(&mut harness, buffer_id, 113);
+    let second_batched = commit_and_retire_explicit_use(&mut harness, buffer_id, 114);
+
+    assert_waiting_at_retirement_seam(&priming);
+    assert_waiting_at_retirement_seam(&first_batched);
+    assert_waiting_at_retirement_seam(&second_batched);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        harness.server.state.release_uses.accounting_counts(&client),
+        (3, 3)
+    );
+
+    release_first_wait.release();
+    pump_protocol_event_loop_until(
+        &mut harness.server,
+        "priming report and one following two-use batch report",
+        |_| priming.is_terminal() && first_batched.is_terminal() && second_batched.is_terminal(),
+    );
+
+    for point in [&priming, &first_batched, &second_batched] {
+        assert!(point.is_terminal());
+        assert!(!point.was_abandoned());
+        assert_eq!(point.signal_count(), 1);
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the two requests already queued behind the priming wait share one wait and report"
+    );
+    assert_eq!(
+        harness.server.state.release_uses.accounting_counts(&client),
+        (0, 0)
+    );
+}
+
+#[test]
+fn normal_protocol_run_exit_abandons_a_live_release_use_unsignalled() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let client = surface.client().expect("live client").id();
+    let point = harness.install_committed_point(130);
+    harness.commit_dmabuf(buffer_id);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (backing_token, _, buffer) = committed_dmabuf_backing(&harness.server.state, &surface);
+    let use_id = frame.use_id.expect("explicit use");
+    harness.server.state.shutdown_cause = Some(ProtocolShutdownCause::Orderly);
+
+    harness.server.run().expect("clean protocol shutdown");
+
+    assert!(point.was_abandoned());
+    assert!(point.is_terminal());
+    assert_eq!(point.signal_count(), 0);
+    assert!(!point.reached_retirement_seam());
+    assert_eq!(
+        harness
+            .server
+            .state
+            .release_uses
+            .owner_kind_name(backing_token),
+        None
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .release_uses
+            .owner_kind_name(frame.token),
+        None
+    );
+    let observations = harness.server.state.release_use_test_probe.observations();
+    assert_eq!(
+        observations.abandonments,
+        [TestReleaseUseAbandonment {
+            use_id,
+            client,
+            buffer,
+            point_id: 130,
+            reason: ReleaseUseAbandonReason::OrderlyShutdown,
+        }]
+    );
+}
+
+#[test]
+fn renderer_disconnect_during_joined_shutdown_is_not_protocol_death() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let point = harness.install_committed_point(131);
+    harness.commit_dmabuf(buffer_id);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let use_id = frame.use_id.expect("explicit use");
+    let (disconnected_sender, disconnected_receiver) = mpsc::sync_channel(1);
+    drop(disconnected_receiver);
+    harness.server.event_sender = disconnected_sender;
+    harness
+        .server
+        .state
+        .events
+        .push(ProtocolEvent::OutputResized {
+            width: 320,
+            height: 240,
+        });
+    harness
+        .commands
+        .send(ProtocolCommand::Frame { inputs: Vec::new() })
+        .expect("wake protocol run loop");
+    harness
+        .commands
+        .send(ProtocolCommand::Shutdown)
+        .expect("queue the coordinator's orderly stop");
+
+    harness
+        .server
+        .run()
+        .expect("a gone renderer consumer does not turn orderly shutdown into protocol death");
+
+    assert!(point.was_abandoned());
+    assert!(point.is_terminal());
+    assert_eq!(point.signal_count(), 0);
+    assert!(!point.reached_retirement_seam());
+    let observations = harness.server.state.release_use_test_probe.observations();
+    assert_eq!(observations.abandonments.len(), 1);
+    assert_eq!(observations.abandonments[0].use_id, use_id);
+    assert_eq!(
+        observations.abandonments[0].reason,
+        ReleaseUseAbandonReason::OrderlyShutdown
+    );
+}
+
+#[test]
+fn runtime_failure_protocol_run_exit_is_not_labelled_orderly() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let point = harness.install_committed_point(133);
+    harness.commit_dmabuf(buffer_id);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let use_id = frame.use_id.expect("explicit use");
+    harness
+        .commands
+        .send(ProtocolCommand::KmsRenderReply {
+            reply: KmsRenderReply::Suspended { generation: 1 },
+        })
+        .expect("send invalid KMS reply to nested backend");
+
+    harness
+        .server
+        .run()
+        .expect("runtime failure requests shutdown after a successful dispatch");
+
+    assert!(point.was_abandoned());
+    assert_eq!(point.signal_count(), 0);
+    let observations = harness.server.state.release_use_test_probe.observations();
+    assert_eq!(observations.abandonments.len(), 1);
+    assert_eq!(observations.abandonments[0].use_id, use_id);
+    assert_eq!(
+        observations.abandonments[0].reason,
+        ReleaseUseAbandonReason::DispatchFailure
+    );
+}
+
+#[test]
+fn runtime_failure_dominates_a_shutdown_queued_behind_it() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let point = harness.install_committed_point(136);
+    harness.commit_dmabuf(buffer_id);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let use_id = frame.use_id.expect("explicit use");
+
+    // The calloop channel drains both of these in one dispatch, so the orderly
+    // request is handled after the failure has already been recorded. A failure
+    // that has happened is not undone by someone then asking us to stop, and
+    // the points abandoned on the way out must not be recorded as orderly.
+    harness
+        .commands
+        .send(ProtocolCommand::KmsRenderReply {
+            reply: KmsRenderReply::Suspended { generation: 1 },
+        })
+        .expect("send invalid KMS reply to nested backend");
+    harness
+        .commands
+        .send(ProtocolCommand::Shutdown)
+        .expect("queue an orderly shutdown behind the runtime failure");
+
+    harness
+        .server
+        .run()
+        .expect("runtime failure requests shutdown after a successful dispatch");
+
+    assert!(point.was_abandoned());
+    assert_eq!(point.signal_count(), 0);
+    let observations = harness.server.state.release_use_test_probe.observations();
+    assert_eq!(observations.abandonments.len(), 1);
+    assert_eq!(observations.abandonments[0].use_id, use_id);
+    assert_eq!(
+        observations.abandonments[0].reason,
+        ReleaseUseAbandonReason::DispatchFailure
+    );
+}
+
+#[test]
+fn closed_command_channel_protocol_run_exit_is_not_labelled_orderly() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let point = harness.install_committed_point(134);
+    harness.commit_dmabuf(buffer_id);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let use_id = frame.use_id.expect("explicit use");
+
+    // The harness holds the only command sender, so dropping it closes the
+    // calloop channel — which is how the Bevy side disappearing actually
+    // reaches the protocol thread. Losing our peer is a runtime failure, not
+    // somebody asking us to shut down.
+    drop(harness.commands);
+
+    harness
+        .server
+        .run()
+        .expect("a closed command channel ends the run without a dispatch error");
+
+    assert!(point.was_abandoned());
+    assert_eq!(point.signal_count(), 0);
+    let observations = harness.server.state.release_use_test_probe.observations();
+    assert_eq!(observations.abandonments.len(), 1);
+    assert_eq!(observations.abandonments[0].use_id, use_id);
+    assert_eq!(
+        observations.abandonments[0].reason,
+        ReleaseUseAbandonReason::DispatchFailure
+    );
+}
+
+#[test]
+fn shutdown_command_protocol_run_exit_is_labelled_orderly() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let point = harness.install_committed_point(135);
+    harness.commit_dmabuf(buffer_id);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let use_id = frame.use_id.expect("explicit use");
+    harness
+        .commands
+        .send(ProtocolCommand::Shutdown)
+        .expect("send shutdown to the protocol thread");
+
+    harness.server.run().expect("clean protocol shutdown");
+
+    assert!(point.was_abandoned());
+    assert_eq!(point.signal_count(), 0);
+    let observations = harness.server.state.release_use_test_probe.observations();
+    assert_eq!(observations.abandonments.len(), 1);
+    assert_eq!(observations.abandonments[0].use_id, use_id);
+    assert_eq!(
+        observations.abandonments[0].reason,
+        ReleaseUseAbandonReason::OrderlyShutdown
+    );
+}
+
+#[test]
+fn protocol_server_drop_backstop_abandons_a_point_waiting_at_the_h3b_seam() {
+    let (point, probe) = {
+        let mut harness = KeybindingHarness::new(true);
+        let buffer_id = harness.create_dmabuf_buffer();
+        let surface = harness.subsurface();
+        let point = harness.install_committed_point(132);
+        let probe = harness.server.state.release_use_test_probe.clone();
+        harness.commit_dmabuf(buffer_id);
+        let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+        let (backing_token, _, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+        harness.server.state.release_buffer_token(backing_token);
+        harness.server.state.release_buffer_token(frame.token);
+        assert_waiting_at_retirement_seam(&point);
+        (point, probe)
+    };
+
+    assert!(point.reached_retirement_seam());
+    assert!(point.was_abandoned());
+    assert!(point.is_terminal());
+    assert_eq!(point.signal_count(), 0);
+    let observations = probe.observations();
+    assert_eq!(observations.abandonments.len(), 1);
+    assert_eq!(observations.abandonments[0].point_id, 132);
+    assert_eq!(
+        observations.abandonments[0].reason,
+        ReleaseUseAbandonReason::ServerDrop
+    );
+}
+
+#[test]
+fn protocol_server_drop_does_not_wait_for_an_inflight_retirement_wait() {
+    let (adapter, wait_entered, mut release_wait, _) = first_wait_gated_retirement_adapter();
+    let mut harness = KeybindingHarness::new_with_retirement_adapter(true, Some(adapter));
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let point = harness.install_committed_point(137);
+    let probe = harness.server.state.release_use_test_probe.clone();
+    harness.commit_dmabuf(buffer_id);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (backing_token, _, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+    harness.server.state.release_buffer_token(backing_token);
+    harness.server.state.release_buffer_token(frame.token);
+    wait_entered
+        .recv_timeout(PROTOCOL_ACK_DEADLINE)
+        .expect("drop test retirement reaches the gated GPU wait");
+
+    let (drop_completed, observe_drop_completed) = mpsc::sync_channel(1);
+    let watchdog = std::thread::spawn(move || {
+        let drop_blocked = observe_drop_completed
+            .recv_timeout(Duration::from_secs(2))
+            .is_err();
+        release_wait.release();
+        drop_blocked
+    });
+
+    drop(harness);
+    let completion_was_observed = drop_completed.send(()).is_ok();
+    let drop_blocked = watchdog.join().expect("drop watchdog exits");
+
+    assert!(completion_was_observed);
+    assert!(!drop_blocked, "protocol drop waited for the GPU worker");
+    assert!(point.reached_retirement_seam());
+    assert!(point.was_abandoned());
+    assert_eq!(point.signal_count(), 0);
+    let observations = probe.observations();
+    assert_eq!(observations.abandonments.len(), 1);
+    assert_eq!(observations.abandonments[0].point_id, 137);
+    assert_eq!(
+        observations.abandonments[0].reason,
+        ReleaseUseAbandonReason::ServerDrop
+    );
+}
+
+#[test]
+fn poisoned_release_probe_during_unwind_preserves_the_original_panic() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let point = harness.install_committed_point(134);
+    let probe = harness.server.state.release_use_test_probe.clone();
+    harness.commit_dmabuf(buffer_id);
+    let _ = take_dmabuf_upsert(&mut harness.server.state);
+    let probe_during_unwind = probe.clone();
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _harness = harness;
+        let _observations = probe_during_unwind.observations();
+        panic!("original release-use assertion");
+    }))
+    .expect_err("synthetic assertion must panic");
+
+    assert_eq!(
+        panic.downcast_ref::<&str>().copied(),
+        Some("original release-use assertion")
+    );
+    assert!(point.was_abandoned());
+    assert_eq!(point.signal_count(), 0);
+    let observations = probe.observations();
+    assert_eq!(observations.abandonments.len(), 1);
+    assert_eq!(
+        observations.abandonments[0].reason,
+        ReleaseUseAbandonReason::ServerDrop
+    );
+}
+
+#[test]
+#[should_panic(expected = "taken release point was dropped without signalling or abandonment")]
+fn pending_test_release_point_drop_still_panics_without_an_existing_unwind() {
+    let (point, _) = TestCommittedPoint::pair(135);
+    drop(point);
+}
+
+#[test]
+fn pending_test_release_point_drop_does_not_replace_an_existing_panic() {
+    let (point, handle) = TestCommittedPoint::pair(136);
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _point = point;
+        panic!("unrelated assertion");
+    }))
+    .expect_err("synthetic assertion must panic");
+
+    assert_eq!(
+        panic.downcast_ref::<&str>().copied(),
+        Some("unrelated assertion")
+    );
+    assert!(!handle.is_terminal());
+}
+
+#[test]
+fn surface_destruction_releases_backing_but_keeps_explicit_renderer_owner() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let point = harness.install_committed_point(113);
+    harness.commit_dmabuf(buffer_id);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    assert!(frame.use_id.is_some());
+
+    send_request(&mut harness.client, TEST_SUBSURFACE_SURFACE_ID, 0, &[]);
+    harness.dispatch_client();
+
+    assert!(
+        !harness
+            .server
+            .state
+            .surfaces
+            .keys()
+            .any(|id| id.protocol_id() == TEST_SUBSURFACE_SURFACE_ID),
+        "destroyed surface record is removed"
+    );
+    assert!(!point.reached_retirement_seam());
+    harness.renderer_releases(frame.token);
+    assert_signalled_after_retirement(&mut harness, &point);
+}
+
+#[test]
+fn implicit_surface_destruction_preserves_final_wl_buffer_release() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    harness.commit_dmabuf(buffer_id);
+    let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    assert_eq!(frame.use_id, None);
+
+    send_request(&mut harness.client, TEST_SUBSURFACE_SURFACE_ID, 0, &[]);
+    harness.dispatch_client();
+    harness.renderer_releases(frame.token);
+    let events = harness.sync();
+
+    assert!(
+        events
+            .iter()
+            .any(|(object, opcode, _)| *object == buffer_id && *opcode == 0),
+        "final implicit owner still produces wl_buffer.release"
+    );
+}
+
+#[test]
+fn cached_alternating_dmabuf_uses_emit_one_real_release_per_replacement() {
+    let mut harness = KeybindingHarness::new(true);
+    let first_buffer = harness.create_dmabuf_buffer();
+    let second_buffer = harness.create_dmabuf_buffer();
+    let (_unused_events, event_receiver) = mpsc::sync_channel(1);
+    let feed = ClientSceneFeed {
+        events: Mutex::new(event_receiver),
+        commands: harness.commands.clone(),
+        cursor_position: Arc::new(Mutex::new(CursorPositionSnapshot::default())),
+        _test_command_source: None,
+    };
+    let mut releases = HashMap::<u32, usize>::new();
+    let mut identities = HashMap::<u32, DmabufBufferId>::new();
+
+    for use_index in 0..8 {
+        let buffer = if use_index % 2 == 0 {
+            first_buffer
+        } else {
+            second_buffer
+        };
+        harness.commit_dmabuf(buffer);
+        let (_, frame) = take_dmabuf_upsert(&mut harness.server.state);
+        assert!(frame.cacheable);
+        if let Some(previous) = identities.insert(buffer, frame.buffer_id) {
+            assert_eq!(
+                frame.buffer_id, previous,
+                "reusing one live wl_buffer must take the renderer cache-hit identity"
+            );
+        }
+
+        (feed.dmabuf_release_callback(frame.token))();
+        pump_protocol_event_loop_until(
+            &mut harness.server,
+            "ClientSceneFeed cached DMA-BUF release",
+            |state| !state.retained_buffers.tokens.contains_key(&frame.token),
+        );
+        for (object, opcode, _) in harness.sync() {
+            if opcode == 0 && (object == first_buffer || object == second_buffer) {
+                *releases.entry(object).or_default() += 1;
+            }
+        }
+    }
+
+    send_request(&mut harness.client, TEST_SUBSURFACE_SURFACE_ID, 0, &[]);
+    harness.dispatch_client();
+    for (object, opcode, _) in harness.sync() {
+        if opcode == 0 && (object == first_buffer || object == second_buffer) {
+            *releases.entry(object).or_default() += 1;
+        }
+    }
+
+    assert_eq!(releases.get(&first_buffer), Some(&4));
+    assert_eq!(releases.get(&second_buffer), Some(&4));
+    assert_eq!(releases.values().sum::<usize>(), 8);
+}
+
+fn assert_real_commit_budget_rejection(failure: ReleaseUseFailure, point_id: u64) {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let client_id = surface.client().expect("live client").id();
+    let retained_before = harness.server.state.retained_buffers.tokens.len();
+    let budgeted_before = harness.server.state.budgeted_dmabuf_tokens.len();
+    harness
+        .server
+        .state
+        .release_uses
+        .force_next_failure(failure);
+    let point = harness.install_committed_point(point_id);
+
+    harness.commit_dmabuf(buffer_id);
+
+    assert!(
+        harness
+            .server
+            .state
+            .committed_release_point_override
+            .is_none()
+    );
+    assert_eq!(point.signal_count(), 1);
+    assert!(!point.reached_retirement_seam());
+    assert_eq!(
+        harness.server.state.retained_buffers.tokens.len(),
+        retained_before,
+        "renderer and backing tokens are both refunded"
+    );
+    assert_eq!(
+        harness.server.state.budgeted_dmabuf_tokens.len(),
+        budgeted_before,
+        "the renderer retention budget is rolled back"
+    );
+    assert!(
+        !harness.server.state.events.iter().any(|event| matches!(
+            event,
+            ProtocolEvent::SurfaceUpserted {
+                frame: SurfaceFrame::Dmabuf(_),
+                ..
+            }
+        )),
+        "a rejected commit is not published"
+    );
+    let observations = harness.server.state.release_use_test_probe.observations();
+    assert_eq!(
+        observations.rejections,
+        [TestReleaseUseRejection {
+            client: client_id.clone(),
+            point_id,
+            failure,
+        }]
+    );
+    assert!(observations.retirements.is_empty());
+    drop(observations);
+    assert!(
+        harness
+            .server
+            .state
+            .display_handle
+            .backend_handle()
+            .get_client_data(client_id)
+            .is_err(),
+        "budget rejection terminates the affected client"
+    );
+}
+
+#[test]
+fn real_dmabuf_client_use_budget_rejection_signals_terminates_and_refunds() {
+    assert_real_commit_budget_rejection(
+        ReleaseUseFailure::ClientBudget {
+            count: release_use::MAX_CLIENT_DMABUF_USES,
+            limit: release_use::MAX_CLIENT_DMABUF_USES,
+        },
+        104,
+    );
+}
+
+#[test]
+fn real_dmabuf_global_use_budget_rejection_signals_terminates_and_refunds() {
+    assert_real_commit_budget_rejection(
+        ReleaseUseFailure::GlobalBudget {
+            count: release_use::MAX_GLOBAL_DMABUF_USES,
+            limit: release_use::MAX_GLOBAL_DMABUF_USES,
+        },
+        105,
+    );
+}
+
+#[test]
+fn client_missing_race_refunds_both_real_dmabuf_tokens() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let retained_before = harness.server.state.retained_buffers.tokens.len();
+    harness.server.state.release_use_force_client_missing = true;
+
+    harness.commit_dmabuf(buffer_id);
+
+    assert_eq!(harness.server.state.release_use_client_missing_count, 1);
+    assert_eq!(
+        harness.server.state.retained_buffers.tokens.len(),
+        retained_before
+    );
+    assert!(harness.server.state.budgeted_dmabuf_tokens.is_empty());
+}
+
+#[test]
+fn record_missing_race_retires_taken_point_after_both_token_refunds() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let point = harness.install_committed_point(106);
+    harness.server.state.release_use_remove_record_after_prepare = true;
+
+    harness.commit_dmabuf(buffer_id);
+
+    assert_eq!(harness.server.state.release_use_record_missing_count, 1);
+    assert!(harness.server.state.retained_buffers.tokens.is_empty());
+    assert!(harness.server.state.budgeted_dmabuf_tokens.is_empty());
+    assert_waiting_at_retirement_seam(&point);
+    let observations = harness.server.state.release_use_test_probe.observations();
+    assert_eq!(observations.retirements.len(), 1);
+    assert_eq!(observations.retirements[0].point_id, 106);
+    drop(observations);
+    assert_signalled_after_retirement(&mut harness, &point);
+}
+
+#[test]
+fn retained_buffer_tokens_skip_live_values_across_u64_wrap() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let client = surface.client().expect("live client");
+    let buffer = client
+        .object_from_protocol_id::<wl_buffer::WlBuffer>(
+            &harness.server.state.display_handle,
+            buffer_id,
+        )
+        .expect("real DMA-BUF wl_buffer exists");
+    harness.server.state.next_buffer_token = 0;
+    let occupied = harness.server.state.retain_buffer(buffer.clone());
+    assert_eq!(occupied, 0);
+    harness.server.state.next_buffer_token = u64::MAX - 1;
+
+    let first = harness.server.state.retain_buffer(buffer.clone());
+    let second = harness.server.state.retain_buffer(buffer.clone());
+    let third = harness.server.state.retain_buffer(buffer);
+
+    assert_eq!([first, second, third], [u64::MAX - 1, u64::MAX, 1]);
+    assert_eq!(
+        HashSet::from([occupied, first, second, third]).len(),
+        4,
+        "each live retention owner has a distinct token"
+    );
+}
+
+#[test]
+fn same_real_wl_buffer_committed_twice_mints_independent_uses() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let first_point = harness.install_committed_point(107);
+    harness.commit_dmabuf(buffer_id);
+    let (_, first_frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let first_use = first_frame.use_id.expect("first explicit use");
+
+    let second_point = harness.install_committed_point(108);
+    harness.commit_dmabuf(buffer_id);
+    let (_, second_frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (second_backing, second_backing_use, _) =
+        committed_dmabuf_backing(&harness.server.state, &surface);
+    let second_use = second_frame.use_id.expect("second explicit use");
+
+    assert_ne!(first_use, second_use);
+    assert_eq!(second_backing_use, Some(second_use));
+    assert!(!first_point.reached_retirement_seam());
+    assert!(!second_point.reached_retirement_seam());
+    harness.server.state.release_buffer_token(first_frame.token);
+    assert_signalled_after_retirement(&mut harness, &first_point);
+    assert!(!second_point.reached_retirement_seam());
+    harness
+        .server
+        .state
+        .release_buffer_token(second_frame.token);
+    assert!(!second_point.reached_retirement_seam());
+    harness.server.state.release_buffer_token(second_backing);
+    assert_signalled_after_retirement(&mut harness, &second_point);
+}
+
+#[test]
+fn second_renderer_token_joins_the_existing_real_commit_use() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let point = harness.install_committed_point(109);
+    harness.commit_dmabuf(buffer_id);
+    let (surface_id, first_frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (backing_token, backing_use, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+    let use_id = first_frame.use_id.expect("explicit use");
+
+    let LatestSurfaceUpsert::Ready(second_event) =
+        harness.server.state.latest_surface_upsert(surface_id)
+    else {
+        panic!("mapped DMA-BUF state can be replayed");
+    };
+    let ProtocolEvent::SurfaceUpserted {
+        frame: SurfaceFrame::Dmabuf(second_frame),
+        ..
+    } = *second_event
+    else {
+        panic!("dirty replay stays DMA-BUF");
+    };
+    assert_eq!(backing_use, Some(use_id));
+    assert_eq!(second_frame.use_id, Some(use_id));
+    assert_ne!(first_frame.token, second_frame.token);
+
+    harness.server.state.release_buffer_token(backing_token);
+    harness.server.state.release_buffer_token(first_frame.token);
+    assert!(!point.reached_retirement_seam());
+    harness
+        .server
+        .state
+        .release_buffer_token(second_frame.token);
+    assert_signalled_after_retirement(&mut harness, &point);
+}
+
+#[test]
+fn real_outbox_eviction_dirty_recovery_remints_renderer_owner_on_same_use() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let point = harness.install_committed_point(110);
+    harness.commit_dmabuf(buffer_id);
+    let (surface_id, first_frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (backing_token, backing_use, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+    let use_id = first_frame.use_id.expect("explicit use");
+    let first_token = first_frame.token;
+    let first_event = ProtocolEvent::SurfaceUpserted {
+        id: surface_id,
+        scene: harness.server.state.surfaces[&surface.id()].scene_snapshot(),
+        frame: SurfaceFrame::Dmabuf(first_frame),
+    };
+    let limit = protocol_event_retained_bytes(&first_event);
+    harness
+        .server
+        .queue_renderer_event_with_test_limit(first_event, limit);
+    harness
+        .server
+        .queue_renderer_event_with_test_limit(synthetic_dmabuf_event(999, 999, None), limit);
+
+    assert!(harness.server.dirty_surfaces.contains(&surface_id));
+    assert!(
+        !harness
+            .server
+            .state
+            .retained_buffers
+            .tokens
+            .contains_key(&first_token)
+    );
+    drop(harness.server.pending_events.take());
+    harness
+        .server
+        .publish_events()
+        .expect("dirty replay publishes");
+    let batch = harness
+        .renderer_events
+        .recv_timeout(PROTOCOL_ACK_DEADLINE)
+        .expect("renderer receives recovered state");
+    let recovered = batch
+        .into_iter()
+        .find_map(|event| match event {
+            ProtocolEvent::SurfaceUpserted {
+                id,
+                frame: SurfaceFrame::Dmabuf(frame),
+                ..
+            } if id == surface_id => Some(frame),
+            _ => None,
+        })
+        .expect("dirty recovery emits a DMA-BUF upsert");
+    assert_eq!(backing_use, Some(use_id));
+    assert_eq!(recovered.use_id, Some(use_id));
+    assert_ne!(recovered.token, first_token);
+    assert!(!harness.server.dirty_surfaces.contains(&surface_id));
+
+    harness.server.state.release_buffer_token(backing_token);
+    assert!(!point.reached_retirement_seam());
+    harness.server.state.release_buffer_token(recovered.token);
+    assert_signalled_after_retirement(&mut harness, &point);
+}
+
+#[test]
+fn real_failed_admission_after_eviction_leaves_the_displaced_dmabuf_owned() {
+    let mut harness = KeybindingHarness::new(true);
+    // The crowding event below names this surface. It has to be one the
+    // compositor still calls presentable: a rejected event for a surface that
+    // is not takes the membership route instead, and a recovery mark for one
+    // would be dropped as `Gone` on the next pass — the assertion that the
+    // caller marked it would be testing a mark with no effect.
+    let (crowding_surface, _) = harness.extra_mapped_subsurface();
+    let crowding_id = harness.server.state.surfaces[&crowding_surface.id()].id;
+    for event in mem::take(&mut harness.server.state.events) {
+        if let Some(token) = protocol_event_dmabuf_token(&event) {
+            harness.server.state.release_buffer_token(token);
+        }
+    }
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let point = harness.install_committed_point(121);
+    harness.commit_dmabuf(buffer_id);
+    let (surface_id, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (backing_token, backing_use, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+    let use_id = frame.use_id.expect("explicit use");
+    let displaced_token = frame.token;
+    let layout = harness.server.state.surfaces[&surface.id()].layout;
+    let displaced = ProtocolEvent::SurfaceUpserted {
+        id: surface_id,
+        scene: scene(layout),
+        frame: SurfaceFrame::Dmabuf(frame),
+    };
+    let event_bytes = protocol_event_retained_bytes(&displaced);
+    let limit = event_bytes * 2;
+
+    // A lifecycle entry is *not* an eviction candidate — only queued upserts and
+    // relayouts are. It is what makes the outbox unable to shrink far enough:
+    // the DMA-BUF frame below is the only thing eviction may take, and taking it
+    // still leaves no room for the frame arriving after it. That is the one
+    // shape that reaches the eviction-then-reject path; every limit that can be
+    // satisfied by evicting, or that rejects before evicting anything, goes
+    // somewhere else.
+    harness.server.queue_renderer_event_with_test_limit(
+        ProtocolEvent::SurfaceDestroyed {
+            id: SurfaceId(9_001),
+        },
+        limit,
+    );
+    harness
+        .server
+        .queue_renderer_event_with_test_limit(displaced, limit);
+    let crowding = ProtocolEvent::SurfaceUpserted {
+        id: crowding_id,
+        scene: scene(layout),
+        frame: SurfaceFrame::Shm(ShmFrame {
+            width: 1,
+            height: 1,
+            opaque: true,
+            // One byte under the limit, not exactly on it. At exactly the limit
+            // the fixture would survive the guard at `new_bytes > limit`
+            // becoming `>=`: the incoming event would be rejected outright,
+            // eviction would never run, and every assertion in this test —
+            // preconditions included — would still be green while the path it
+            // is named for went uncovered.
+            rgba: Arc::new(vec![0; limit - 1]),
+        }),
+    };
+
+    // Pin the branch, not only its outcome. Every postcondition below is also
+    // satisfied by a push that never evicted anything, so without these the
+    // test would still pass if the incoming event were rejected outright at
+    // `new_bytes > limit` — it would just be an oversized-event oracle wearing
+    // this one's name. The strict `<` below is doing two jobs: with the frame
+    // charged a byte under the limit it pins the guard's comparator, and it is
+    // also what would catch a later change that charges SHM frames any
+    // per-event overhead, which would push the incoming event over and make
+    // that substitution silent.
+    let crowding_bytes = protocol_event_retained_bytes(&crowding);
+    let charged = harness.server.pending_events.bytes;
+    assert!(
+        crowding_bytes < limit,
+        "the incoming frame must be admissible on its own, with room to spare \
+         so the guard's comparator is pinned too, or eviction is never \
+         reached: {crowding_bytes} vs {limit}"
+    );
+    assert_eq!(
+        charged, limit,
+        "the outbox must already be full: one lifecycle entry and one \
+         evictable frame"
+    );
+    assert!(
+        charged + crowding_bytes > limit,
+        "and admission must fail before eviction, or nothing is evicted"
+    );
+    assert!(
+        charged - event_bytes + crowding_bytes > limit,
+        "and still fail after taking the only candidate, or the push succeeds"
+    );
+
+    harness
+        .server
+        .queue_renderer_event_with_test_limit(crowding, limit);
+
+    // The rejected frame is marked for recovery rather than simply forgotten,
+    // and the mark is one a later publish can act on: this surface is still
+    // mapped, so `latest_surface_upsert` will rebuild its newest state rather
+    // than answering `Gone`. What is pinned here is that the caller
+    // distinguishes the event it was handed from the state it displaced.
+    assert!(
+        harness.server.state.surface_is_recoverable(crowding_id),
+        "precondition: the rejected event names a surface `dirty_surfaces` can \
+         actually recover, or the assertion below is about a doomed mark"
+    );
+    assert!(harness.server.dirty_surfaces.contains(&crowding_id));
+    // The *displaced* frame has no such route. `push_with_limit` reports
+    // evictions through its `Ok` arm alone, so a removal performed on the way to
+    // a rejection is invisible to the caller: nothing re-dirties the surface and
+    // nothing releases its renderer token, and a DMA-BUF whose token is neither
+    // queued nor released can never be handed back to its client. It must
+    // therefore still be queued, exactly as it was before the rejected push.
+    assert!(!harness.server.dirty_surfaces.contains(&surface_id));
+
+    // Read before `take()`, which resets both. A rollback that restored the map
+    // but not the byte charge would leave every assertion below green while the
+    // outbox went on admitting past its limit for the rest of its life, and one
+    // that warned about a frame it did not actually drop would put a spurious
+    // pressure warning in the log on a path where nothing was dropped.
+    assert_eq!(
+        harness.server.pending_events.bytes, limit,
+        "a rejected push leaves the charge exactly as it found it"
+    );
+    assert!(
+        !harness.server.pending_events.pressure_warned,
+        "nothing was dropped, so nothing may be reported as dropped"
+    );
+    let queued = harness.server.pending_events.take();
+    assert!(
+        queued
+            .iter()
+            .any(|event| protocol_event_dmabuf_token(event) == Some(displaced_token)),
+        "a push that cannot be admitted may not consume the frames it tried to \
+         evict for: {queued:?}"
+    );
+    assert!(
+        queued.iter().any(|event| matches!(
+            event,
+            ProtocolEvent::SurfaceDestroyed {
+                id: SurfaceId(9_001)
+            }
+        )),
+        "and the entry eviction was never allowed to take is untouched: {queued:?}"
+    );
+    // And still owned, not released out from under the batch that holds it —
+    // the other way to lose this invariant is to hand the token back while the
+    // event carrying it is still on its way to the renderer.
+    assert!(
+        harness
+            .server
+            .state
+            .retained_buffers
+            .tokens
+            .contains_key(&displaced_token)
+    );
+
+    // The chain still terminates: the surviving owners are the backing and the
+    // queued frame, and retiring both signals.
+    assert_eq!(backing_use, Some(use_id));
+    harness.server.state.release_buffer_token(backing_token);
+    assert!(!point.reached_retirement_seam());
+    harness.server.state.release_buffer_token(displaced_token);
+    assert_signalled_after_retirement(&mut harness, &point);
+}
+
+/// A removal the bounded outbox cannot admit still reaches the renderer,
+/// because the compositor stops sending a delta and states membership instead.
+///
+/// Every other renderer event has a recovery route through `dirty_surfaces`:
+/// the mark is re-set, and the next `publish_events` rebuilds the newest state
+/// from the compositor's own records. A removal has none. `latest_surface_upsert`
+/// answers `Gone` for a surface that no longer exists — and equally for one
+/// whose record survives with `mapped == false` — so re-marking a lost tombstone
+/// only drops the mark again on the next pass, and the renderer is left holding
+/// an entity that no later state can ever remove. Reachable by create/destroy
+/// churn: a destroyed surface's id is never reused, so a stalled renderer can
+/// watch an unbounded number of tombstones queue up, and a tombstone is not an
+/// eviction candidate.
+///
+/// The fix converges on membership rather than replaying the lost delta. Both
+/// removal kinds are driven as real client requests, because the two reach the
+/// same branch through different state: a destroyed surface has no record at
+/// all, an unmapped one has a record that says `mapped == false`, and a roster
+/// built from `surface_objects` alone would list the second and leave its
+/// entity standing.
+#[test]
+fn rejected_lifecycle_converges_renderer_membership_to_the_authoritative_roster() {
+    for destroy in [true, false] {
+        let mut harness = KeybindingHarness::new(true);
+        let survivor_buffer = harness.create_dmabuf_buffer();
+        harness.commit_dmabuf(survivor_buffer);
+        let survivor = harness.subsurface();
+        let survivor_id = harness.server.state.surfaces[&survivor.id()].id;
+        let (victim, victim_object) = harness.extra_mapped_subsurface();
+        let victim_id = harness.server.state.surfaces[&victim.id()].id;
+        let (remapped, remapped_object) = harness.extra_mapped_subsurface();
+        let remapped_id = harness.server.state.surfaces[&remapped.id()].id;
+
+        // The renderer learns about both surfaces first, and hands both buffers
+        // back, so the outbox is empty and owns nothing when the fixture starts.
+        // Without this the queued DMA-BUF upserts would be eviction candidates,
+        // and a rejected tombstone would never be reached — see the saturation
+        // arithmetic below.
+        for event in mem::take(&mut harness.server.state.events) {
+            harness.server.queue_renderer_event(event);
+        }
+        let known = harness.server.pending_events.take();
+        for id in [survivor_id, victim_id, remapped_id] {
+            assert!(
+                known.iter().any(
+                    |event| matches!(event, ProtocolEvent::SurfaceUpserted { id: queued, .. } if *queued == id)
+                ),
+                "the renderer must already know surface {} before it can be \
+                 asked to forget one: {known:?}",
+                id.0
+            );
+        }
+        for token in known.iter().filter_map(protocol_event_dmabuf_token) {
+            harness.server.state.release_buffer_token(token);
+        }
+        assert!(harness.server.pending_events.is_empty());
+        assert_eq!(harness.server.pending_events.bytes, 0);
+
+        // A surface id outlives an unmap, so under backpressure a *listed*
+        // surface can have a tombstone queued for it: unmapped, queued, then
+        // mapped again before the batch goes out. Driven as real requests,
+        // because the point is that the compositor's records say `mapped` while
+        // the outbox still says otherwise.
+        send_request(&mut harness.client, remapped_object, 1, &words(&[0, 0, 0]));
+        send_request(&mut harness.client, remapped_object, 6, &[]);
+        send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+        harness.dispatch_client();
+        harness.assert_client_connected("after unmapping the remapped surface");
+        let mut unmapped = mem::take(&mut harness.server.state.events);
+        let stale_index = unmapped
+            .iter()
+            .position(
+                |event| matches!(event, ProtocolEvent::SurfaceUnmapped { id } if *id == remapped_id),
+            )
+            .unwrap_or_else(|| panic!("the unmap is published: {unmapped:?}"));
+        let stale = unmapped.remove(stale_index);
+        for token in unmapped.iter().filter_map(protocol_event_dmabuf_token) {
+            harness.server.state.release_buffer_token(token);
+        }
+
+        let remapped_buffer = harness.create_dmabuf_buffer();
+        send_request(
+            &mut harness.client,
+            remapped_object,
+            1,
+            &words(&[remapped_buffer, 0, 0]),
+        );
+        send_request(&mut harness.client, remapped_object, 6, &[]);
+        send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+        harness.dispatch_client();
+        harness.assert_client_connected("after mapping the remapped surface again");
+        assert!(
+            harness.server.state.surfaces[&remapped.id()].mapped,
+            "the remapped surface must be live again, or its queued tombstone is \
+             not stale and there is nothing here to get wrong"
+        );
+        // The renderer never learns about the remap: this is the window where
+        // its upsert was rejected and deferred, which is what leaves the
+        // tombstone as the newest thing the outbox holds for that id.
+        for event in mem::take(&mut harness.server.state.events) {
+            if let Some(token) = protocol_event_dmabuf_token(&event) {
+                harness.server.state.release_buffer_token(token);
+            }
+        }
+
+        if destroy {
+            send_request(&mut harness.client, victim_object, 0, &[]);
+        } else {
+            send_request(&mut harness.client, victim_object, 1, &words(&[0, 0, 0]));
+            send_request(&mut harness.client, victim_object, 6, &[]);
+            send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+        }
+        harness.dispatch_client();
+        harness.assert_client_connected("after removing the victim surface");
+
+        // The two removal kinds must arrive at the branch through genuinely
+        // different state, or the second case is the first one wearing a
+        // different name.
+        if destroy {
+            assert!(
+                !harness
+                    .server
+                    .state
+                    .surface_objects
+                    .contains_key(&victim_id),
+                "a destroyed surface has no object record left"
+            );
+        } else {
+            assert!(
+                !harness.server.state.surfaces[&victim.id()].mapped,
+                "an unmapped surface keeps its record and reports itself unmapped"
+            );
+        }
+
+        let mut published = mem::take(&mut harness.server.state.events);
+        let removal_index = published
+            .iter()
+            .position(|event| match event {
+                ProtocolEvent::SurfaceDestroyed { id } => destroy && *id == victim_id,
+                ProtocolEvent::SurfaceUnmapped { id } => !destroy && *id == victim_id,
+                _ => false,
+            })
+            .unwrap_or_else(|| panic!("the removal is published: {published:?}"));
+        let removal = published.remove(removal_index);
+        assert!(
+            published
+                .iter()
+                .all(|event| protocol_event_dmabuf_token(event).is_none()),
+            "the rest of this dispatch's events are outside the fixture and may \
+             not be carrying buffers it would leak: {published:?}"
+        );
+
+        // Saturate with entries eviction is not allowed to take. The arithmetic
+        // is what forces the branch: with `E` the charge for a tombstone, `C`
+        // the total bytes of every eviction candidate, `A` the bytes already
+        // queued under the incoming id, `B` the bytes charged and `L` the
+        // limit, a rejection needs `E > A + C + (L - B)` — here `B == L`, so
+        // `E > A + C`. Anything evictable worth `E` or more rescues the
+        // tombstone instead, which is why the DMA-BUF upserts above had to be
+        // drained: each is charged exactly `E`.
+        let event_bytes = protocol_event_retained_bytes(&removal);
+        assert_eq!(
+            protocol_event_retained_bytes(&stale),
+            event_bytes,
+            "the fixture sizes the outbox in whole tombstones"
+        );
+        let limit = event_bytes * 3;
+        let filler = [SurfaceId(9_101), SurfaceId(9_102)];
+        harness
+            .server
+            .queue_renderer_event_with_test_limit(stale, limit);
+        for id in filler {
+            harness.server.queue_renderer_event_with_test_limit(
+                ProtocolEvent::SurfaceDestroyed { id },
+                limit,
+            );
+        }
+
+        // Pin the branch, not only its outcome. A roster that appeared because
+        // the push simply succeeded, or because the event was refused outright
+        // as oversized, would satisfy the membership postconditions below just
+        // as well.
+        assert!(
+            event_bytes <= limit,
+            "the removal must be admissible on its own, or it is refused before \
+             eviction is ever considered: {event_bytes} vs {limit}"
+        );
+        assert_eq!(
+            harness.server.pending_events.bytes, limit,
+            "the outbox must already be full"
+        );
+        assert!(
+            harness
+                .server
+                .pending_events
+                .surfaces
+                .values()
+                .all(|queued| matches!(
+                    queued,
+                    ProtocolEvent::SurfaceDestroyed { .. } | ProtocolEvent::SurfaceUnmapped { .. }
+                )),
+            "and full of entries eviction may not take, or there is room to make"
+        );
+        assert!(
+            matches!(
+                harness.server.pending_events.surfaces.get(&remapped_id),
+                Some(ProtocolEvent::SurfaceUnmapped { .. })
+            ),
+            "one of which is a tombstone for a surface that is mapped again, or \
+             the ordering hazard this fixture is built around is not present: {:?}",
+            harness.server.pending_events.surfaces
+        );
+        assert!(
+            harness.server.pending_events.roster.is_none(),
+            "and no roster yet, or the postconditions below test nothing new"
+        );
+        assert!(
+            !harness
+                .server
+                .pending_events
+                .surfaces
+                .contains_key(&victim_id),
+            "and nothing already queued under the incoming id, which would let \
+             the tombstone replace it in place"
+        );
+        let evictable = harness
+            .server
+            .pending_events
+            .surfaces
+            .values()
+            .filter(|queued| {
+                matches!(
+                    queued,
+                    ProtocolEvent::SurfaceUpserted { .. } | ProtocolEvent::SurfaceRelayout { .. }
+                )
+            })
+            .map(protocol_event_retained_bytes)
+            .sum::<usize>();
+        assert!(
+            event_bytes > evictable,
+            "and taking every candidate must still not make room, or the push \
+             succeeds and no roster is ever built: {event_bytes} vs {evictable}"
+        );
+
+        // Marks for surfaces other than the incoming one, because the caller
+        // already clears the incoming id up front for any lifecycle event — a
+        // postcondition on `victim_id` alone would be green without the
+        // convergence this test is named for. The survivor's mark is here to
+        // catch the other wrong fix: clearing the lot.
+        harness.server.dirty_surfaces.insert(filler[0]);
+        harness.server.dirty_surfaces.insert(survivor_id);
+
+        harness
+            .server
+            .queue_renderer_event_with_test_limit(removal, limit);
+
+        // Membership, stated once, says everything the lost delta would have
+        // said and everything the filler tombstones would have said.
+        let ProtocolEvent::SurfaceRoster { mapped } = harness
+            .server
+            .pending_events
+            .roster
+            .as_ref()
+            .expect("a rejected removal installs a roster")
+        else {
+            panic!("the roster slot holds a roster");
+        };
+        assert!(
+            mapped.contains(&survivor_id),
+            "a surface that is still mapped must survive the roster: {mapped:?}"
+        );
+        assert!(
+            !mapped.contains(&victim_id),
+            "and the surface the client removed must not: {mapped:?}"
+        );
+        assert!(
+            filler.iter().all(|id| !mapped.contains(id)),
+            "nor the surfaces the filler tombstones named: {mapped:?}"
+        );
+        assert!(
+            mapped.contains(&remapped_id),
+            "and a surface mapped again since its tombstone was queued is live: \
+             {mapped:?}"
+        );
+
+        // The queued tombstones are subsumed rather than queued behind. For the
+        // filler the roster already says those surfaces are gone; for the
+        // remapped one it says the opposite, and emitting that tombstone behind
+        // the roster would remove an entity the roster had just called live
+        // with nothing after it to say otherwise.
+        assert!(
+            harness.server.pending_events.surfaces.is_empty(),
+            "a roster subsumes every queued tombstone — the ones it contradicts \
+             as much as the ones it agrees with: {:?}",
+            harness.server.pending_events.surfaces
+        );
+        assert_eq!(
+            harness.server.pending_events.bytes, 0,
+            "and their bytes come back"
+        );
+        assert!(
+            !harness.server.dirty_surfaces.contains(&filler[0]),
+            "a departed surface keeps no recovery mark: `latest_surface_upsert` \
+             answers `Gone` for it, so the mark would only be dropped again"
+        );
+        assert!(
+            harness.server.dirty_surfaces.contains(&survivor_id),
+            "and a surface that is still there keeps the mark it was given"
+        );
+        assert!(
+            harness.server.dirty_surfaces.contains(&remapped_id),
+            "and one whose stale tombstone was discarded gains one it was never \
+             given: a roster removes but never creates, so only an upsert can \
+             put that entity back"
+        );
+        assert!(!harness.server.dirty_surfaces.contains(&victim_id));
+
+        // A surface created after the snapshot, whose upsert joins the same
+        // batch. Reachable whenever a batch cannot be sent and is handed back:
+        // the next dispatch's events queue behind a roster built from an
+        // earlier moment. It is also what makes the ordering assertion below
+        // mean anything — with the outbox emptied by compaction, a batch
+        // holding only the roster puts it first however `take` is written.
+        let newcomer = SurfaceId(9_201);
+        harness
+            .server
+            .queue_renderer_event(ProtocolEvent::SurfaceUpserted {
+                id: newcomer,
+                scene: harness.server.state.surfaces[&survivor.id()].scene_snapshot(),
+                frame: SurfaceFrame::Shm(ShmFrame {
+                    width: 1,
+                    height: 1,
+                    opaque: true,
+                    rgba: Arc::new(vec![0; 4]),
+                }),
+            });
+        assert!(
+            !matches!(
+                harness.server.pending_events.roster.as_ref(),
+                Some(ProtocolEvent::SurfaceRoster { mapped }) if mapped.contains(&newcomer)
+            ),
+            "the newcomer must be one the roster does not list, or the order \
+             below carries no risk to detect"
+        );
+
+        let batch = harness.server.pending_events.take();
+        assert!(
+            matches!(batch.first(), Some(ProtocolEvent::SurfaceRoster { .. })),
+            "the roster leads the batch — applied after a queued upsert for a \
+             surface it does not list, it would remove an entity that upsert \
+             had just recreated: {batch:?}"
+        );
+        assert!(
+            batch.iter().any(
+                |event| matches!(event, ProtocolEvent::SurfaceUpserted { id, .. } if *id == newcomer)
+            ),
+            "and the newcomer is behind it, not dropped: {batch:?}"
+        );
+        assert!(
+            batch
+                .iter()
+                .filter(|event| matches!(event, ProtocolEvent::SurfaceRoster { .. }))
+                .count()
+                == 1,
+            "and it is a singleton: {batch:?}"
+        );
+        assert!(
+            batch.iter().all(|event| !matches!(
+                event,
+                ProtocolEvent::SurfaceDestroyed { .. } | ProtocolEvent::SurfaceUnmapped { .. }
+            )),
+            "no tombstone survives the roster that replaced it: {batch:?}"
+        );
+    }
+}
+
+/// Installing a roster refunds the bytes and hands back the renderer tokens of
+/// everything it discards, and discards a *listed* surface's stale tombstone
+/// while keeping its newer frame.
+///
+/// The caller-side half of the token return — actually releasing it — is not
+/// reachable through `queue_renderer_event_with_limit` today, for the
+/// arithmetic reason recorded on `install_surface_roster` itself: a queued
+/// DMA-BUF upsert is charged exactly what a tombstone is, so its presence
+/// always rescues the tombstone instead of rejecting it. What is available is
+/// the unit's own contract, and it is what a change to DMA-BUF charging would
+/// need to still hold before that path went live. The tombstone half is not in
+/// that position — see
+/// `a_roster_discards_a_stale_tombstone_for_a_surface_it_still_lists`.
+#[test]
+fn installing_a_roster_refunds_the_bytes_and_tokens_of_every_departed_surface() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    harness.commit_dmabuf(buffer_id);
+    let (departing, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let token = frame.token;
+    let layout = harness.server.state.surfaces[&harness.subsurface().id()].layout;
+    let staying = SurfaceId(7_001);
+    let remapped = SurfaceId(7_002);
+    let kept_dmabuf = SurfaceId(7_003);
+    let kept_relayout = SurfaceId(7_004);
+    const KEPT_TOKEN: u64 = 0x9001;
+    let kept_use_id = Some(DmabufUseId::for_test(0x9002));
+    let staying_bytes = 64;
+    // Distinctive content, not a run of zeroes: a payload of the right length
+    // says nothing about whether it is the payload that was queued.
+    let staying_rgba = (0..staying_bytes).map(|i| i as u8).collect::<Vec<_>>();
+
+    let mut pending = PendingProtocolEvents::default();
+    pending
+        .push(ProtocolEvent::SurfaceUpserted {
+            id: departing,
+            scene: scene(layout),
+            frame: SurfaceFrame::Dmabuf(frame),
+        })
+        .expect("the departing frame is admitted");
+    pending
+        .push(ProtocolEvent::SurfaceUpserted {
+            id: staying,
+            scene: scene(layout),
+            frame: SurfaceFrame::Shm(ShmFrame {
+                width: 1,
+                height: 1,
+                opaque: true,
+                rgba: Arc::new(staying_rgba.clone()),
+            }),
+        })
+        .expect("the staying frame is admitted");
+    // A *listed* DMA-BUF upsert, so the token half of "a kept event keeps
+    // everything" is testable at all. Without it every survivor here is SHM,
+    // and compaction could lose a listed DMA-BUF frame — stranding its
+    // `wl_buffer.release` forever, because a token that never reaches
+    // `retired_tokens` is never handed back to anyone — with both fixtures
+    // still green.
+    let kept_event = synthetic_dmabuf_event(kept_dmabuf.0, KEPT_TOKEN, kept_use_id);
+    let kept_bytes = protocol_event_retained_bytes(&kept_event);
+    let ProtocolEvent::SurfaceUpserted {
+        scene: kept_scene, ..
+    } = &kept_event
+    else {
+        panic!("the helper builds an upsert");
+    };
+    let kept_layout = kept_scene.layout;
+    pending
+        .push(kept_event)
+        .expect("the listed DMA-BUF frame is admitted");
+    // A *listed relayout*, which the rule keeps for the same reason it keeps an
+    // upsert: it is newer state that agrees with the snapshot, and only a
+    // tombstone contradicts it. With upserts as the only listed survivors,
+    // narrowing the retain test to `SurfaceUpserted` discards every listed
+    // relayout and nothing here notices.
+    let relayout_layout = SurfaceLayout {
+        x: 12.0,
+        y: 34.0,
+        z: 5.5,
+        visible: false,
+        ..layout
+    };
+    let relayout_event = ProtocolEvent::SurfaceRelayout {
+        id: kept_relayout,
+        scene: scene(relayout_layout),
+    };
+    let relayout_bytes = protocol_event_retained_bytes(&relayout_event);
+    pending
+        .push(relayout_event)
+        .expect("the listed relayout is admitted");
+    // Queued before the snapshot, for a surface the snapshot calls live: the
+    // shape a remap under backpressure leaves behind.
+    pending
+        .push(ProtocolEvent::SurfaceUnmapped { id: remapped })
+        .expect("the stale tombstone is admitted");
+    let charged = pending.bytes;
+    assert!(charged > staying_bytes, "all five entries are charged");
+
+    let compaction = pending.install_surface_roster(&HashSet::from([
+        staying,
+        remapped,
+        kept_dmabuf,
+        kept_relayout,
+    ]));
+
+    assert_eq!(
+        compaction.retired_tokens,
+        vec![token],
+        "a discarded upsert's renderer token goes back to the caller and a kept \
+         one's does not: dropped, a `wl_buffer.release` is withheld for the \
+         lifetime of the compositor; returned for an event that is still \
+         queued, the buffer is released while the renderer is still to be \
+         handed it"
+    );
+    assert_eq!(
+        compaction.resurrected,
+        vec![remapped],
+        "and a listed surface whose stale tombstone was discarded is named, \
+         because a roster removes but never creates: only an upsert can put \
+         that entity back"
+    );
+    assert_eq!(
+        pending.bytes,
+        staying_bytes + kept_bytes + relayout_bytes,
+        "and only the surviving frames are still charged"
+    );
+    // Membership is not the property. A listed id keeps its queued *content*,
+    // and only the content says whether the frame survived: substitute a
+    // relayout for the upsert under this id, leaving the charge alone, and
+    // every key, byte and token assertion here stays green while the frame the
+    // renderer was going to be handed is gone.
+    match pending.surfaces.get(&staying) {
+        Some(ProtocolEvent::SurfaceUpserted {
+            id,
+            scene: kept,
+            frame: SurfaceFrame::Shm(shm),
+        }) => {
+            assert_eq!(*id, staying);
+            assert_layout_unchanged(&kept.layout, &layout, "the SHM survivor's layout");
+            assert_eq!(
+                (shm.width, shm.height, shm.opaque),
+                (1, 1, true),
+                "with the frame geometry it was queued with"
+            );
+            assert_eq!(
+                shm.rgba.as_slice(),
+                staying_rgba.as_slice(),
+                "and the pixels it was queued with, not different pixels of the \
+                 same length"
+            );
+        }
+        other => panic!("the listed surface keeps its complete upsert: {other:?}"),
+    }
+    // The same, for the listed DMA-BUF frame — the case where losing the
+    // content also loses a token.
+    match pending.surfaces.get(&kept_dmabuf) {
+        Some(ProtocolEvent::SurfaceUpserted {
+            id,
+            scene: kept,
+            frame: SurfaceFrame::Dmabuf(frame),
+        }) => {
+            assert_eq!(*id, kept_dmabuf);
+            assert_synthetic_dmabuf_unchanged(
+                frame,
+                KEPT_TOKEN,
+                kept_use_id,
+                "the DMA-BUF survivor's frame",
+            );
+            assert_layout_unchanged(&kept.layout, &kept_layout, "the DMA-BUF survivor's layout");
+        }
+        other => panic!("the listed DMA-BUF surface keeps its complete upsert: {other:?}"),
+    }
+    // And the listed *relayout*. The rule is about the tombstone, not about the
+    // variant: narrow it to "keep listed upserts" and this is the only thing
+    // that says so.
+    match pending.surfaces.get(&kept_relayout) {
+        Some(ProtocolEvent::SurfaceRelayout { id, scene: kept }) => {
+            assert_eq!(*id, kept_relayout);
+            assert_layout_unchanged(
+                &kept.layout,
+                &relayout_layout,
+                "the relayout survivor's layout",
+            );
+        }
+        other => panic!("a listed surface keeps its queued relayout: {other:?}"),
+    }
+    assert!(!pending.surfaces.contains_key(&departing));
+    assert!(
+        !pending.surfaces.contains_key(&remapped),
+        "the tombstone would otherwise be emitted behind the roster that just \
+         called its surface live"
+    );
+
+    harness.server.state.release_buffer_token(token);
+}
+
+/// A dormant surface stays out of the roster even after a fresh commit marks
+/// it mapped again.
+///
+/// `mapped_surface_ids` must be exactly `latest_surface_upsert`'s presence
+/// predicate, and that predicate is two conditions, not one. Destroying an
+/// `xdg_toplevel` while its `wl_surface` lives on suspends the role without
+/// destroying the record; the surface is no longer a subsurface and no longer
+/// has an xdg role, so its very next buffer commit is applied immediately and
+/// sets `mapped = true` with the role still dormant. That is the state where
+/// the two halves disagree, and it is the only one: dropping the
+/// `record.mapped` half instead is caught by the unmap arm of
+/// `rejected_lifecycle_converges_renderer_membership_to_the_authoritative_roster`.
+///
+/// Not reachable through `wl_subsurface.destroy`, the other route into
+/// `deactivate_surface_role`: smithay's subsurface destructor unsets the parent
+/// but leaves `SubsurfaceState.sync` true, so `is_effectively_sync` stays true
+/// with no parent left to ever apply the cached commit. Such a surface can
+/// never be mapped again, which is why this oracle uses the xdg route.
+#[test]
+fn a_dormant_surface_is_absent_from_the_roster_even_once_mapped_again() {
+    let mut harness = KeybindingHarness::new(true);
+    // A mapped control, so the closing assertion cannot pass because
+    // `mapped_surface_ids` returned nothing at all.
+    let (control, _, _) = harness.extra_mapped_subsurface_with_role();
+    let control_id = harness.server.state.surfaces[&control.id()].id;
+    let surface = harness
+        .server
+        .state
+        .surfaces
+        .values()
+        .map(|record| record.role.wl_surface())
+        .find(|surface| surface.id().protocol_id() == TEST_TOPLEVEL_SURFACE_ID)
+        .expect("real toplevel exists")
+        .clone();
+    let id = harness.server.state.surfaces[&surface.id()].id;
+    assert!(
+        harness
+            .server
+            .state
+            .mapped_surface_ids()
+            .contains(&control_id),
+        "precondition: an ordinary mapped surface is listed"
+    );
+    for event in mem::take(&mut harness.server.state.events) {
+        if let Some(token) = protocol_event_dmabuf_token(&event) {
+            harness.server.state.release_buffer_token(token);
+        }
+    }
+
+    send_request(&mut harness.client, TEST_TOPLEVEL_ID, 0, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after destroying the xdg_toplevel role");
+    let record = &harness.server.state.surfaces[&surface.id()];
+    assert!(
+        matches!(record.role, SurfaceRole::Dormant(_)) && !record.mapped,
+        "precondition: the record survives its role, unmapped"
+    );
+
+    let budgeted_before = harness.server.state.budgeted_dmabuf_tokens.len();
+    let buffer_id = harness.create_dmabuf_buffer();
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[buffer_id, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after committing to the dormant surface");
+    let record = &harness.server.state.surfaces[&surface.id()];
+    assert!(
+        record.mapped,
+        "precondition: the commit marks it mapped again — without that this \
+         test is the `record.mapped` check wearing a different name"
+    );
+    assert!(
+        matches!(record.role, SurfaceRole::Dormant(_)),
+        "precondition: and it is still dormant"
+    );
+
+    let mapped = harness.server.state.mapped_surface_ids();
+    assert!(
+        mapped.contains(&control_id),
+        "the control is still listed, so the next assertion is about dormancy \
+         and not about an empty roster"
+    );
+    assert!(
+        !mapped.contains(&id),
+        "a dormant surface is not part of what the renderer should be showing"
+    );
+    assert!(
+        matches!(
+            harness.server.state.latest_surface_upsert(id),
+            LatestSurfaceUpsert::Gone
+        ),
+        "and the roster's predicate agrees with the recovery route's, which is \
+         the invariant that keeps a roster removal from being undone by dirty \
+         recovery on the very next pass"
+    );
+    // The producer must obey the same predicate. A roster removes this surface;
+    // an upsert emitted by the very commit that remapped it would put the
+    // entity straight back, for a surface both predicates call `Gone`, and
+    // nothing downstream could remove it again.
+    assert!(
+        !harness.server.state.events.iter().any(|event| matches!(
+            event,
+            ProtocolEvent::SurfaceUpserted { id: upserted, .. } if *upserted == id
+        )),
+        "a dormant surface's commit publishes no upsert: {:?}",
+        harness.server.state.events
+    );
+    assert_eq!(
+        harness.server.state.budgeted_dmabuf_tokens.len(),
+        budgeted_before,
+        "and the renderer token of the suppressed frame is retired, not leaked \
+         — no event will ever carry it. `budgeted_dmabuf_tokens` holds only \
+         renderer-facing tokens, so the record's own backing retention does \
+         not move this count"
+    );
+
+    for event in mem::take(&mut harness.server.state.events) {
+        if let Some(token) = protocol_event_dmabuf_token(&event) {
+            harness.server.state.release_buffer_token(token);
+        }
+    }
+}
+
+/// Re-creating a `wl_subsurface` on a retained `wl_surface` does not claim the
+/// surface is present until a commit publishes it.
+///
+/// Vendored smithay allows this: `set_parent` rejects a surface that already
+/// has a *different* role, and the destructor unset the parent, so the same
+/// `wl_surface` can take the subsurface role again. The record survives with
+/// its old `buffer_dimensions`, and re-roling used to mark it mapped from
+/// exactly that — which listed it in every roster while `new_subsurface` emits
+/// only a relayout, and a relayout for an id the renderer does not hold is a
+/// no-op. A roster having removed the entity in the meantime, the surface would
+/// be listed, `Ready` to dirty recovery, and permanently invisible.
+#[test]
+fn recreating_a_subsurface_role_leaves_the_surface_unmapped_until_it_commits() {
+    let mut harness = KeybindingHarness::new(true);
+    let (surface, surface_object, subsurface_object) = harness.extra_mapped_subsurface_with_role();
+    let id = harness.server.state.surfaces[&surface.id()].id;
+    assert!(
+        harness.server.state.mapped_surface_ids().contains(&id),
+        "precondition: it starts out listed"
+    );
+    for event in mem::take(&mut harness.server.state.events) {
+        if let Some(token) = protocol_event_dmabuf_token(&event) {
+            harness.server.state.release_buffer_token(token);
+        }
+    }
+
+    send_request(&mut harness.client, subsurface_object, 0, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after destroying the wl_subsurface");
+    assert!(
+        matches!(
+            harness.server.state.surfaces[&surface.id()].role,
+            SurfaceRole::Dormant(_)
+        ),
+        "precondition: the record survives its role"
+    );
+
+    let replacement_object = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_SUBCOMPOSITOR_ID,
+        1,
+        &words(&[replacement_object, surface_object, TEST_TOPLEVEL_SURFACE_ID]),
+    );
+    harness.dispatch_client();
+    harness.assert_client_connected("after re-creating the wl_subsurface role");
+    let record = &harness.server.state.surfaces[&surface.id()];
+    assert!(
+        matches!(record.role, SurfaceRole::Subsurface { .. }),
+        "precondition: smithay allowed the role back, so this is the reachable \
+         state and not a rejected request"
+    );
+    assert!(
+        record.buffer_dimensions.is_some(),
+        "precondition: and the old backing is still on the record — without it \
+         the old `mapped = buffer_dimensions.is_some()` would have said false \
+         anyway and this test would prove nothing"
+    );
+    assert!(
+        !record.mapped,
+        "a re-roled surface is not mapped on the strength of a buffer the \
+         renderer may no longer hold an entity for"
+    );
+    assert!(
+        !harness.server.state.mapped_surface_ids().contains(&id),
+        "so no roster lists it"
+    );
+    assert!(
+        matches!(
+            harness.server.state.latest_surface_upsert(id),
+            LatestSurfaceUpsert::Gone
+        ),
+        "and dirty recovery agrees"
+    );
+
+    let buffer_id = harness.create_dmabuf_buffer();
+    send_request(
+        &mut harness.client,
+        surface_object,
+        1,
+        &words(&[buffer_id, 0, 0]),
+    );
+    send_request(&mut harness.client, surface_object, 6, &[]);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after committing to the re-roled subsurface");
+    assert!(
+        harness.server.state.surfaces[&surface.id()].mapped,
+        "the next buffer commit maps it again"
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                ProtocolEvent::SurfaceUpserted { id: upserted, .. } if *upserted == id
+            ))
+            .count(),
+        1,
+        "and publishes the complete upsert that rebuilds the entity, exactly \
+         once. The parent commit in the same dispatch also finds this surface \
+         unmapped-and-then-mapped, and a second upsert from there would describe \
+         the buffer the client just replaced: {:?}",
+        harness.server.state.events
+    );
+    assert!(
+        harness.server.state.pending_full_upserts.is_empty(),
+        "nor is one queued for dirty recovery — the retained-content republish \
+         is for the client that sends *no* new buffer, and this one did"
+    );
+    assert!(
+        harness.server.state.mapped_surface_ids().contains(&id),
+        "only now is it listed"
+    );
+
+    for event in mem::take(&mut harness.server.state.events) {
+        if let Some(token) = protocol_event_dmabuf_token(&event) {
+            harness.server.state.release_buffer_token(token);
+        }
+    }
+}
+
+/// A subsurface re-created on a `wl_surface` that still holds its buffer comes
+/// back on the parent commit, from the content it already has.
+///
+/// The sibling above covers the client that sends a new buffer. Nothing obliges
+/// it to: `wl_subcompositor.get_subsurface` is double-buffered on the parent, so
+/// the association becoming current is the event that makes the child
+/// presentable again, and a compliant client can leave the buffer exactly where
+/// it was. Before this, such a surface stayed missing indefinitely —
+/// `new_subsurface` had correctly unmapped it and published the removal, and no
+/// commit was ever going to arrive to undo that.
+///
+/// The republication deliberately does not go out from `commit_subsurface_stack`
+/// as a `SurfaceUpserted`. `latest_surface_upsert` can answer `Retry` when a
+/// DMA-BUF cannot be retained at that moment, and this is the one producer with
+/// no later commit to try again on, so the mark goes to `dirty_surfaces` —
+/// whose whole job is retrying until the state is published, and which drops the
+/// mark if the surface goes away first. Both halves are asserted below.
+#[test]
+fn recreating_a_subsurface_role_remaps_retained_content_on_the_parent_commit() {
+    let mut harness = KeybindingHarness::new(true);
+    // Armed before the commit that creates the backing, so the buffer carries a
+    // real release use and the replay's join can be checked against something
+    // rather than against `None`.
+    let point = harness.install_committed_point(138);
+    let (surface, surface_object, subsurface_object) = harness.extra_mapped_subsurface_with_role();
+    let id = harness.server.state.surfaces[&surface.id()].id;
+    let (retention_token, backing_use, _) =
+        committed_dmabuf_backing(&harness.server.state, &surface);
+    let backing_use = backing_use.expect("a real DMA-BUF commit carries an explicit use");
+    for event in mem::take(&mut harness.server.state.events) {
+        if let Some(token) = protocol_event_dmabuf_token(&event) {
+            harness.server.state.release_buffer_token(token);
+        }
+    }
+
+    send_request(&mut harness.client, subsurface_object, 0, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after destroying the wl_subsurface");
+
+    let replacement_object = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_SUBCOMPOSITOR_ID,
+        1,
+        &words(&[replacement_object, surface_object, TEST_TOPLEVEL_SURFACE_ID]),
+    );
+    harness.dispatch_client();
+    harness.assert_client_connected("after re-creating the wl_subsurface role");
+    let record = &harness.server.state.surfaces[&surface.id()];
+    assert!(
+        record.dmabuf_backing.is_some(),
+        "precondition: the buffer is still on the record. Without it there is no \
+         retained content to come back from and the fixture proves nothing"
+    );
+    assert!(
+        !record.mapped && !record.parent_association_committed,
+        "precondition: it is unmapped and waiting, because the association is \
+         not current until the parent commits"
+    );
+    assert!(
+        harness.server.state.pending_full_upserts.is_empty(),
+        "and nothing is queued for republication yet — that would be claiming \
+         presence a commit has not established"
+    );
+
+    // Only the parent commits. The child sends nothing, which is the whole
+    // point: a client that has already given the compositor this buffer owes it
+    // nothing further.
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after the parent commit");
+
+    let record = &harness.server.state.surfaces[&surface.id()];
+    assert!(
+        record.parent_association_committed,
+        "the parent commit makes the association current"
+    );
+    assert!(
+        record.mapped,
+        "and that is what remaps the child, on content it already had"
+    );
+    // Presence, not visibility. This harness's toplevel never attaches a buffer
+    // of its own, so nothing beneath it is *effectively* visible and the
+    // remapped child is no exception. That the two axes stay independent is the
+    // assertion: a remap that reasoned "it is presentable again, therefore show
+    // it" would light up a subtree under an unmapped ancestor.
+    let ancestor_mapped = harness
+        .server
+        .state
+        .surfaces
+        .values()
+        .find(|candidate| candidate.layout.parent.is_none())
+        .map(|root| root.mapped)
+        .expect("the subsurface tree has a root");
+    assert!(
+        !ancestor_mapped,
+        "precondition: the ancestor is unmapped, so this is the invisible case"
+    );
+    assert!(
+        !record.layout.visible,
+        "the remap restores presence and leaves effective visibility to \
+         `recompute_effective_visibility`, which answers from the ancestor"
+    );
+    assert!(
+        harness.server.state.mapped_surface_ids().contains(&id),
+        "so every roster lists it again"
+    );
+    // The recovery route must agree there is complete state to publish: a roster
+    // that lists an id dirty recovery calls `Gone` is the permanently invisible
+    // surface this whole path exists to avoid.
+    //
+    // Asking mints a renderer token — `latest_surface_upsert` builds a real
+    // upsert, it does not merely classify — so the probe releases its own, or
+    // the use below never closes and the retirement assertion fails for a reason
+    // that has nothing to do with the remap.
+    match harness.server.state.latest_surface_upsert(id) {
+        LatestSurfaceUpsert::Ready(probe) => {
+            let token = protocol_event_dmabuf_token(&probe)
+                .expect("the replayable state is the DMA-BUF the record retained");
+            harness.server.state.release_buffer_token(token);
+        }
+        LatestSurfaceUpsert::Retry => {
+            panic!("a remapped subsurface has complete state to replay, not a retry")
+        }
+        LatestSurfaceUpsert::Gone => {
+            panic!("a remapped subsurface has complete state to replay, not `Gone`")
+        }
+    }
+    assert!(
+        !harness.server.state.events.iter().any(|event| matches!(
+            event,
+            ProtocolEvent::SurfaceUpserted { id: upserted, .. } if *upserted == id
+        )),
+        "the remap is not published from the commit itself: {:?}",
+        harness.server.state.events
+    );
+    assert!(
+        harness.server.state.pending_full_upserts.contains(&id),
+        "it is queued for `publish_events` to hand to dirty recovery instead, \
+         which is the only producer here that can retry a DMA-BUF that could \
+         not be retained on the first attempt"
+    );
+
+    drop(harness.server.pending_events.take());
+    harness
+        .server
+        .publish_events()
+        .expect("the queued remap publishes");
+    assert!(
+        harness.server.state.pending_full_upserts.is_empty(),
+        "and the queue is drained rather than accumulating a mark per commit"
+    );
+
+    let batch = harness
+        .renderer_events
+        .recv_timeout(PROTOCOL_ACK_DEADLINE)
+        .expect("renderer receives the remap");
+    let replay = batch
+        .into_iter()
+        .find_map(|event| match event {
+            ProtocolEvent::SurfaceUpserted {
+                id: upserted,
+                frame: SurfaceFrame::Dmabuf(frame),
+                ..
+            } if upserted == id => Some(frame),
+            _ => None,
+        })
+        .expect(
+            "a complete DMA-BUF upsert, not a relayout — a relayout for an id \
+                 the renderer does not hold is a no-op, which is exactly the \
+                 no-op the old code emitted",
+        );
+
+    assert_ne!(
+        replay.token, retention_token,
+        "the replay mints its own renderer token. Handing out the backing's own \
+         `retention_token` would have the renderer and the record releasing one \
+         token twice"
+    );
+    assert_eq!(
+        replay.use_id,
+        Some(backing_use),
+        "and joins the backing's existing use rather than opening a second one \
+         over the same buffer"
+    );
+
+    harness.server.state.release_buffer_token(replay.token);
+    assert!(
+        harness
+            .server
+            .state
+            .retained_buffers
+            .tokens
+            .contains_key(&retention_token),
+        "so releasing the renderer's token leaves the record's own retention \
+         alone — joined owners are distinct tokens on one use, and the buffer is \
+         still the client's"
+    );
+    assert!(
+        !point.reached_retirement_seam(),
+        "and the use stays open while the record still owns the buffer"
+    );
+
+    harness.server.state.release_buffer_token(retention_token);
+    assert_signalled_after_retirement(&mut harness, &point);
+}
+
+/// A surface that both remaps from retained content and commits a fresh buffer
+/// in one dispatch is published once, describing the newer frame.
+///
+/// This is the ordering inside `publish_events` and nothing else. The queued
+/// remaps are drained into `dirty_surfaces` *before* `state.events`, so that
+/// `queue_renderer_event` — which clears the dirty mark, because a complete
+/// upsert is the state dirty recovery would have replayed — sees the mark and
+/// takes it away. Drained the other way round the mark outlives the fresh
+/// upsert, and the next recovery pass republishes the frame the client has
+/// already replaced.
+///
+/// The request order is what makes the case reachable: the parent commits while
+/// the child is still unmapped, so `commit_subsurface_stack` queues the remap,
+/// and only then does the child attach. A client that attaches first never gets
+/// here — `commit_subsurface_stack` finds it already mapped and queues nothing,
+/// which the sibling above pins.
+#[test]
+fn a_remap_queued_behind_a_fresh_commit_publishes_only_the_fresh_frame() {
+    let mut harness = KeybindingHarness::new(true);
+    let (surface, surface_object, subsurface_object) = harness.extra_mapped_subsurface_with_role();
+    let id = harness.server.state.surfaces[&surface.id()].id;
+    for event in mem::take(&mut harness.server.state.events) {
+        if let Some(token) = protocol_event_dmabuf_token(&event) {
+            harness.server.state.release_buffer_token(token);
+        }
+    }
+
+    send_request(&mut harness.client, subsurface_object, 0, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after destroying the wl_subsurface");
+
+    // The buffer first: `create_dmabuf_buffer` sends its own requests as it
+    // allocates, and wayland-rs requires client object ids to arrive in dense
+    // creation order — an id allocated earlier but sent later is "Invalid
+    // new_id" and an immediate disconnect.
+    let buffer_id = harness.create_dmabuf_buffer();
+    let replacement_object = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_SUBCOMPOSITOR_ID,
+        1,
+        &words(&[replacement_object, surface_object, TEST_TOPLEVEL_SURFACE_ID]),
+    );
+    // Desynchronized, or the child's own commit below would be cached under the
+    // parent instead of applied, `commit` would never run for it, and there
+    // would be no fresh upsert to race the queued remap.
+    send_request(&mut harness.client, replacement_object, 5, &[]);
+    // Parent first, child second. The remap is queued by the parent commit and
+    // the fresh upsert arrives after it, within the same dispatch.
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    send_request(
+        &mut harness.client,
+        surface_object,
+        1,
+        &words(&[buffer_id, 0, 0]),
+    );
+    send_request(&mut harness.client, surface_object, 6, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after the parent commit and the child's fresh buffer");
+
+    assert!(
+        harness.server.state.pending_full_upserts.contains(&id),
+        "precondition: the parent commit did queue a remap, or the ordering \
+         this fixture is about never comes up"
+    );
+    let fresh: Vec<_> = harness
+        .server
+        .state
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ProtocolEvent::SurfaceUpserted { id: upserted, .. } if *upserted == id
+            )
+        })
+        .collect();
+    assert_eq!(
+        fresh.len(),
+        1,
+        "precondition: and the fresh commit published its own upsert: {:?}",
+        harness.server.state.events
+    );
+    let fresh_token = protocol_event_dmabuf_token(fresh[0])
+        .expect("the fresh commit attached a DMA-BUF, so its upsert carries that buffer");
+
+    drop(harness.server.pending_events.take());
+    harness
+        .server
+        .publish_events()
+        .expect("the dispatch publishes");
+    assert!(
+        !harness.server.dirty_surfaces.contains(&id),
+        "the fresh upsert consumed the queued mark. A surviving mark is a \
+         republication of the retained frame on top of the newer one, on the \
+         next recovery pass"
+    );
+
+    let batch = harness
+        .renderer_events
+        .recv_timeout(PROTOCOL_ACK_DEADLINE)
+        .expect("renderer receives the dispatch");
+    let mut upserts = 0;
+    let mut delivered_token = None;
+    for event in batch {
+        if matches!(
+            &event,
+            ProtocolEvent::SurfaceUpserted { id: upserted, .. } if *upserted == id
+        ) {
+            upserts += 1;
+            delivered_token = protocol_event_dmabuf_token(&event);
+        }
+        if let Some(token) = protocol_event_dmabuf_token(&event) {
+            harness.server.state.release_buffer_token(token);
+        }
+    }
+    assert_eq!(
+        upserts, 1,
+        "and the renderer is told about this surface exactly once"
+    );
+    // The count alone is not the oracle. `push_with_limit` coalesces upserts
+    // per surface, so a remap drained *after* `state.events` overwrites the
+    // fresh upsert in place and retires its buffer — one event still, carrying
+    // the frame the client has already replaced. Only the identity says which
+    // frame survived.
+    assert_eq!(
+        delivered_token,
+        Some(fresh_token),
+        "and it is the frame the client just committed, not the retained one \
+         the remap would have replayed over the top of it"
+    );
+}
+
+/// A newer roster replaces the pending one outright rather than merging with
+/// it, and a listed surface's newer frame survives the replacement.
+#[test]
+fn installing_a_roster_replaces_the_pending_one_with_the_newer_snapshot() {
+    let departed = SurfaceId(7_101);
+    let survivor = SurfaceId(7_102);
+    const SURVIVOR_TOKEN: u64 = 0x5a5a_0001;
+    // Non-`None`, so that clearing it is something the assertion can see.
+    let survivor_use_id = Some(DmabufUseId::for_test(0x5a5a_0002));
+
+    let mut pending = PendingProtocolEvents::default();
+    pending.install_surface_roster(&HashSet::from([departed, survivor]));
+    // A DMA-BUF frame, not an SHM one. The token is the half of "not
+    // collateral" that can strand a `wl_buffer.release`, and an assertion that
+    // `retired_tokens` is empty says nothing whatever when the surviving event
+    // never had a token to retire in the first place.
+    let queued = synthetic_dmabuf_event(survivor.0, SURVIVOR_TOKEN, survivor_use_id);
+    let ProtocolEvent::SurfaceUpserted {
+        scene: queued_scene,
+        ..
+    } = &queued
+    else {
+        panic!("the helper builds an upsert");
+    };
+    let queued_layout = queued_scene.layout;
+    pending
+        .push(queued)
+        .expect("the survivor's frame is admitted");
+
+    let compaction = pending.install_surface_roster(&HashSet::from([survivor]));
+
+    let Some(ProtocolEvent::SurfaceRoster { mapped }) = pending.roster.as_ref() else {
+        panic!("a roster is pending: {:?}", pending.roster);
+    };
+    assert_eq!(
+        mapped,
+        &vec![survivor],
+        "the newer snapshot wins; keeping the older one would state a surface \
+         is live that the compositor has since dropped"
+    );
+    // "Not collateral" is a statement about the frame, not about the key. The
+    // second snapshot re-runs compaction over a map that already survived the
+    // first, so the listed id's queued upsert has to come through both passes
+    // byte for byte — a substitution under the same id keeps the key and the
+    // charge and loses the frame.
+    match pending.surfaces.get(&survivor) {
+        Some(ProtocolEvent::SurfaceUpserted {
+            id,
+            scene: kept,
+            frame: SurfaceFrame::Dmabuf(frame),
+        }) => {
+            assert_eq!(*id, survivor);
+            assert_synthetic_dmabuf_unchanged(
+                frame,
+                SURVIVOR_TOKEN,
+                survivor_use_id,
+                "the survivor's frame",
+            );
+            assert_layout_unchanged(&kept.layout, &queued_layout, "the survivor's layout");
+        }
+        other => panic!("a listed surface's newer frame is not collateral: {other:?}"),
+    }
+    assert!(
+        compaction.retired_tokens.is_empty(),
+        "and its renderer token was not taken off it — retiring a token for an \
+         event that is still queued releases the buffer while the renderer has \
+         yet to be handed it"
+    );
+}
+
+/// A batch handed back by a full renderer channel keeps its roster, and keeps
+/// it in front.
+///
+/// `publish_events` reconstructs the outbox from the unsent batch on
+/// `TrySendError::Full`, so `from_events` is the one route into the outbox that
+/// does not go through `queue_renderer_event`. A roster dropped there is a
+/// removal lost exactly when the renderer is already behind.
+///
+/// This one calls `from_events` directly: it proves reconstruction and
+/// ordering, and nothing about the caller that reaches it. The round trip
+/// through a genuinely saturated channel is
+/// `a_full_channel_hands_a_real_roster_back_to_the_outbox_in_front`.
+#[test]
+fn a_bounced_batch_keeps_its_roster_in_front() {
+    let layout = SurfaceLayout {
+        x: 0.0,
+        y: 0.0,
+        width: 4.0,
+        height: 4.0,
+        z: 1.0,
+        source: None,
+        parent: None,
+        transform: SurfaceTransform::Normal,
+        visible: true,
+        toplevel: None,
+    };
+    let survivor = SurfaceId(7_201);
+    let newcomer = SurfaceId(7_202);
+
+    let mut pending = PendingProtocolEvents::default();
+    pending.install_surface_roster(&HashSet::from([survivor]));
+    pending
+        .push(ProtocolEvent::SurfaceUpserted {
+            id: newcomer,
+            scene: scene(layout),
+            frame: SurfaceFrame::Shm(ShmFrame {
+                width: 1,
+                height: 1,
+                opaque: true,
+                rgba: Arc::new(vec![0; 4]),
+            }),
+        })
+        .expect("the newcomer's frame is admitted");
+    let batch = pending.take();
+    assert!(
+        matches!(batch.first(), Some(ProtocolEvent::SurfaceRoster { .. })),
+        "precondition: the batch under test leads with a roster: {batch:?}"
+    );
+    assert_eq!(batch.len(), 2, "and carries a per-surface event behind it");
+
+    let mut bounced =
+        PendingProtocolEvents::from_events(batch).expect("the batch fits the outbox it came from");
+
+    let rebuilt = bounced.take();
+    assert!(
+        matches!(rebuilt.first(), Some(ProtocolEvent::SurfaceRoster { .. })),
+        "the round trip keeps the roster, and keeps it ahead of the upsert \
+         that would otherwise recreate what it removes: {rebuilt:?}"
+    );
+    assert!(
+        rebuilt.iter().any(
+            |event| matches!(event, ProtocolEvent::SurfaceUpserted { id, .. } if *id == newcomer)
+        ),
+        "and the upsert is still behind it: {rebuilt:?}"
+    );
+}
+
+/// The same round trip, but every part of it real: a roster the compositor
+/// installed because a client's removal did not fit, handed back by a renderer
+/// channel that is actually full, through `publish_events` itself.
+///
+/// `a_bounced_batch_keeps_its_roster_in_front` calls `from_events` on a batch
+/// it built by hand. That pins the reconstruction, but the hazard is in the
+/// caller: `publish_events` is where `take()` and `try_send` and the `Full` arm
+/// meet, and a roster could be lost by a change to any of them — dropped before
+/// the send, sent while the outbox keeps a stale copy, or reconstructed behind
+/// the per-surface events the next dispatch adds. Backpressure is also exactly
+/// when this matters: the renderer is behind, so the removal it is owed will
+/// sit in the outbox across dispatches rather than going out immediately.
+#[test]
+fn a_full_channel_hands_a_real_roster_back_to_the_outbox_in_front() {
+    let mut harness = KeybindingHarness::new(true);
+    let survivor_buffer = harness.create_dmabuf_buffer();
+    harness.commit_dmabuf(survivor_buffer);
+    let survivor = harness.subsurface();
+    let survivor_id = harness.server.state.surfaces[&survivor.id()].id;
+    let (victim, victim_object) = harness.extra_mapped_subsurface();
+    let victim_id = harness.server.state.surfaces[&victim.id()].id;
+
+    // Drain what mapping the surfaces published, so the outbox owns nothing and
+    // holds no eviction candidate — a queued DMA-BUF upsert is charged exactly
+    // what a tombstone is, and its presence would rescue the removal below
+    // instead of letting it be rejected.
+    for event in mem::take(&mut harness.server.state.events) {
+        harness.server.queue_renderer_event(event);
+    }
+    for token in harness
+        .server
+        .pending_events
+        .take()
+        .iter()
+        .filter_map(protocol_event_dmabuf_token)
+    {
+        harness.server.state.release_buffer_token(token);
+    }
+    assert!(harness.server.pending_events.is_empty());
+
+    send_request(&mut harness.client, victim_object, 0, &[]); // wl_surface.destroy
+    harness.dispatch_client();
+    harness.assert_client_connected("after destroying the victim surface");
+    let mut published = mem::take(&mut harness.server.state.events);
+    let removal_index = published
+        .iter()
+        .position(
+            |event| matches!(event, ProtocolEvent::SurfaceDestroyed { id } if *id == victim_id),
+        )
+        .unwrap_or_else(|| panic!("the removal is published: {published:?}"));
+    let removal = published.remove(removal_index);
+    for token in published.iter().filter_map(protocol_event_dmabuf_token) {
+        harness.server.state.release_buffer_token(token);
+    }
+
+    // Reject it: the outbox is full of tombstones, which eviction may not take.
+    let event_bytes = protocol_event_retained_bytes(&removal);
+    let limit = event_bytes * 2;
+    harness.server.queue_renderer_event_with_test_limit(
+        ProtocolEvent::SurfaceDestroyed {
+            id: SurfaceId(9_401),
+        },
+        limit,
+    );
+    harness.server.queue_renderer_event_with_test_limit(
+        ProtocolEvent::SurfaceDestroyed {
+            id: SurfaceId(9_402),
+        },
+        limit,
+    );
+    assert_eq!(
+        harness.server.pending_events.bytes, limit,
+        "the outbox must be full, or the removal is admitted and no roster is \
+         ever built"
+    );
+    harness
+        .server
+        .queue_renderer_event_with_test_limit(removal, limit);
+    assert!(
+        harness.server.pending_events.roster.is_some(),
+        "precondition: the compositor installed a roster"
+    );
+
+    // Saturate the renderer channel for real. `PROTOCOL_EVENT_BATCH_CAPACITY`
+    // sends with no drain, so the send below returns `Full` rather than the
+    // fixture asserting that it does.
+    for marker in 0..PROTOCOL_EVENT_BATCH_CAPACITY {
+        harness
+            .server
+            .event_sender
+            .try_send(vec![ProtocolEvent::RuntimeFailed(format!(
+                "occupant {marker}"
+            ))])
+            .expect("fill the bounded renderer channel");
+    }
+
+    // A surface the roster's snapshot predates, whose upsert joins the same
+    // batch — without it the batch holds only the roster and leads with it
+    // however `take` is written.
+    let newcomer = SurfaceId(9_501);
+    harness
+        .server
+        .state
+        .events
+        .push(ProtocolEvent::SurfaceUpserted {
+            id: newcomer,
+            scene: harness.server.state.surfaces[&survivor.id()].scene_snapshot(),
+            frame: SurfaceFrame::Shm(ShmFrame {
+                width: 1,
+                height: 1,
+                opaque: true,
+                rgba: Arc::new(vec![0; 4]),
+            }),
+        });
+    // Dirty recovery is not part of this fixture, and its DMA-BUF replays would
+    // put tokens in the batch that nothing here hands back.
+    harness.server.dirty_surfaces.clear();
+
+    harness
+        .server
+        .publish_events()
+        .expect("a full renderer channel is non-fatal");
+
+    assert!(
+        harness.server.pending_events.roster.is_some(),
+        "the bounced batch put the roster back in the outbox — dropped here, \
+         the renderer keeps the destroyed surface's entity with nothing left to \
+         remove it"
+    );
+    let ProtocolEvent::SurfaceRoster { mapped } = harness
+        .server
+        .pending_events
+        .roster
+        .as_ref()
+        .expect("the roster survived the round trip")
+    else {
+        panic!("the roster slot holds a roster");
+    };
+    assert!(
+        mapped.contains(&survivor_id) && !mapped.contains(&victim_id),
+        "and it is still the compositor's membership, not a reconstructed \
+         shell: {mapped:?}"
+    );
+
+    let batch = harness.server.pending_events.take();
+    assert!(
+        matches!(batch.first(), Some(ProtocolEvent::SurfaceRoster { .. })),
+        "and it leads the retry, ahead of the newcomer's upsert: {batch:?}"
+    );
+    assert!(
+        batch.iter().any(
+            |event| matches!(event, ProtocolEvent::SurfaceUpserted { id, .. } if *id == newcomer)
+        ),
+        "which is behind it, not dropped: {batch:?}"
+    );
+    assert!(
+        batch
+            .iter()
+            .filter(|event| matches!(event, ProtocolEvent::SurfaceRoster { .. }))
+            .count()
+            == 1,
+        "and there is exactly one: {batch:?}"
+    );
+}
+
+#[test]
+fn real_oversized_drop_refunds_renderer_token_for_implicit_and_explicit_frames() {
+    for explicit in [false, true] {
+        let mut harness = KeybindingHarness::new(true);
+        let buffer_id = harness.create_dmabuf_buffer();
+        let surface = harness.subsurface();
+        let point = explicit.then(|| harness.install_committed_point(120));
+        harness.commit_dmabuf(buffer_id);
+        let (surface_id, frame) = take_dmabuf_upsert(&mut harness.server.state);
+        let (backing_token, backing_use, _) =
+            committed_dmabuf_backing(&harness.server.state, &surface);
+        assert_eq!(frame.use_id.is_some(), explicit);
+        assert_eq!(backing_use.is_some(), explicit);
+        let renderer_token = frame.token;
+        let event = ProtocolEvent::SurfaceUpserted {
+            id: surface_id,
+            scene: harness.server.state.surfaces[&surface.id()].scene_snapshot(),
+            frame: SurfaceFrame::Dmabuf(frame),
+        };
+        let limit = protocol_event_retained_bytes(&event) - 1;
+
+        harness
+            .server
+            .queue_renderer_event_with_test_limit(event, limit);
+
+        assert!(harness.server.pending_events.is_empty());
+        assert!(harness.server.dirty_surfaces.contains(&surface_id));
+        assert!(
+            !harness
+                .server
+                .state
+                .retained_buffers
+                .tokens
+                .contains_key(&renderer_token),
+            "oversized-drop path releases the renderer owner"
+        );
+        harness.server.state.release_buffer_token(backing_token);
+        if let Some(point) = point {
+            assert_signalled_after_retirement(&mut harness, &point);
+        }
+    }
+}
+
+#[test]
+fn dirty_recovery_unknown_use_rolls_back_the_whole_new_retention() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let point = harness.install_committed_point(111);
+    harness.commit_dmabuf(buffer_id);
+    let (surface_id, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (backing_token, original_use, _) =
+        committed_dmabuf_backing(&harness.server.state, &surface);
+    let original_use = original_use.expect("explicit use");
+    harness.server.state.release_buffer_token(frame.token);
+    harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&surface.id())
+        .unwrap()
+        .dmabuf_backing
+        .as_mut()
+        .unwrap()
+        .use_id = Some(DmabufUseId::for_test(u64::MAX));
+    let retained_before = harness.server.state.retained_buffers.tokens.len();
+    let budgeted_before = harness.server.state.budgeted_dmabuf_tokens.len();
+
+    assert!(matches!(
+        harness.server.state.latest_surface_upsert(surface_id),
+        LatestSurfaceUpsert::Retry
+    ));
+    assert_eq!(
+        harness.server.state.retained_buffers.tokens.len(),
+        retained_before
+    );
+    assert_eq!(
+        harness.server.state.budgeted_dmabuf_tokens.len(),
+        budgeted_before
+    );
+
+    harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&surface.id())
+        .unwrap()
+        .dmabuf_backing
+        .as_mut()
+        .unwrap()
+        .use_id = Some(original_use);
+    harness.server.state.release_buffer_token(backing_token);
+    assert_signalled_after_retirement(&mut harness, &point);
+}
+
+#[test]
+fn dirty_recovery_duplicate_token_rolls_back_the_whole_new_retention() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer_id = harness.create_dmabuf_buffer();
+    let surface = harness.subsurface();
+    let point = harness.install_committed_point(112);
+    harness.commit_dmabuf(buffer_id);
+    let (surface_id, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (backing_token, _, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+    assert_eq!(
+        harness.server.state.retained_buffers.release(frame.token),
+        None
+    );
+    assert!(
+        harness
+            .server
+            .state
+            .budgeted_dmabuf_tokens
+            .remove(&frame.token)
+    );
+    let client = surface.client().expect("live client");
+    let client_state = client
+        .get_data::<WaylandClientState>()
+        .expect("live client state");
+    assert_eq!(
+        client_state
+            .retained_dmabufs
+            .fetch_sub(1, Ordering::Relaxed),
+        1
+    );
+    harness.server.state.next_buffer_token = frame.token;
+    let retained_before = harness.server.state.retained_buffers.tokens.len();
+    let budgeted_before = harness.server.state.budgeted_dmabuf_tokens.len();
+
+    assert!(matches!(
+        harness.server.state.latest_surface_upsert(surface_id),
+        LatestSurfaceUpsert::Retry
+    ));
+    assert_eq!(
+        harness.server.state.retained_buffers.tokens.len(),
+        retained_before
+    );
+    assert_eq!(
+        harness.server.state.budgeted_dmabuf_tokens.len(),
+        budgeted_before
+    );
+    harness.server.state.release_buffer_token(backing_token);
+    assert_signalled_after_retirement(&mut harness, &point);
+}
+
+#[test]
+fn resource_limit_termination_notifies_client_gate_cleanup_and_stale_wake_is_safe() {
+    let KeybindingHarness {
+        mut server,
+        client: wire_client,
+        renderer_events: _renderer_events,
+        ..
+    } = KeybindingHarness::new(true);
+    let dead_surface = server
+        .state
+        .surfaces
+        .values()
+        .next()
+        .map(|record| record.role.wl_surface().clone())
+        .expect("real test surface exists");
+    let client = dead_surface
+        .client()
+        .expect("real test surface belongs to a live client");
+    let client_id = client.id();
+    let display_handle = server.state.display_handle.clone();
+    terminate_resource_exhausting_client(&display_handle, &client, "synthetic acquire-gate limit");
+    drop(wire_client);
+    pump_protocol_event_loop_until(
+        &mut server,
+        "client acquire-gate cleanup and Wayland client removal",
+        |state| {
+            state.acquire_gate_client_destroyed_count == 1
+                && display_handle
+                    .backend_handle()
+                    .get_client_data(client_id.clone())
+                    .is_err()
+                && dead_surface.client().is_none()
+        },
+    );
+    assert_eq!(server.state.acquire_gate_client_destroyed_count, 1);
+    assert!(
+        display_handle
+            .backend_handle()
+            .get_client_data(client_id.clone())
+            .is_err()
+    );
+    assert!(dead_surface.client().is_none());
+
+    server.state.wake_acquire_gate_client(client_id);
+    server.state.prepare_acquire_gate(&dead_surface);
+}
+
+#[test]
+fn real_surface_commit_and_output_transitions_are_safe_on_kms_backend() {
+    let mut harness = KeybindingHarness::new_with_backend(true, BackendKind::Kms);
+    let object = harness
+        .server
+        .state
+        .surfaces
+        .iter()
+        .find_map(|(object, record)| {
+            (record.role.wl_surface().id().protocol_id() == TEST_TOPLEVEL_SURFACE_ID)
+                .then(|| object.clone())
+        })
+        .expect("real client created its toplevel wl_surface");
+
+    harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&object)
+        .expect("tracked surface")
+        .mapped = true;
+    harness.server.state.recompute_effective_visibility();
+    harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&object)
+        .expect("tracked surface")
+        .mapped = false;
+    harness.server.state.recompute_effective_visibility();
+
+    assert_eq!(
+        harness.server.state.backend.kms_output_transitions(),
+        Some((1, 1)),
+        "real protocol visibility changes take the KMS enter and leave arms"
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    let _ = harness.sync();
+}
+
+#[test]
+fn production_protocol_dispatch_owns_initial_kms_topology_reduction() {
+    use crate::backend::kms::{
+        ConnectorDescription, ConnectorMode, KmsTopologyLifecycleEvent, KmsTopologySnapshot,
+        OutputKey, PreselectedAtomicOutput,
+    };
+
+    let mut harness = KeybindingHarness::new_with_backend(false, BackendKind::Kms);
+    let key = OutputKey {
+        device: 226,
+        connector_name: "Offline-1".into(),
+    };
+    let mode = ConnectorMode {
+        width: 1920,
+        height: 1080,
+        refresh_millihz: 60_000,
+        preferred: true,
+        clock_khz: 148_500,
+        hsync: (1920, 2008, 2200),
+        vsync: (1080, 1084, 1125),
+        hskew: 0,
+        vscan: 0,
+        flags: 0,
+    };
+    let snapshot = KmsTopologySnapshot {
+        connectors: vec![ConnectorDescription {
+            key: key.clone(),
+            connector_id: 41,
+            modes: vec![mode],
+        }],
+        selections: vec![PreselectedAtomicOutput {
+            key: key.clone(),
+            connector_mode: mode,
+            selection: Ok(test_atomic_selection(41, mode)),
+        }],
+        output_scale: crate::backend::kms::OutputScale120::ONE,
+    };
+    let (acknowledgement, acknowledged) = mpsc::sync_channel(1);
+    harness
+        .commands
+        .send(ProtocolCommand::KmsTopologyLifecycle {
+            event: KmsTopologyLifecycleEvent::Initial(snapshot),
+            acknowledgement,
+        })
+        .expect("queue topology event through the production command path");
+    harness
+        .commands
+        .send(ProtocolCommand::Shutdown)
+        .expect("stop after topology dispatch");
+    harness
+        .server
+        .run()
+        .expect("topology dispatch remains healthy");
+
+    acknowledged
+        .recv_timeout(PROTOCOL_ACK_DEADLINE)
+        .expect("protocol topology acknowledgement arrives")
+        .expect("protocol topology reducer accepts supplied Vulkan data");
+    assert!(matches!(
+        harness
+            ._kms_commands
+            .recv_timeout(PROTOCOL_ACK_DEADLINE)
+            .expect("protocol emits a render command"),
+        KmsRenderCommand::AddOutput {
+            generation: 1,
+            output
+        } if output.key == key
+    ));
+}
+
+#[test]
+fn kms_wl_output_is_real_late_bound_and_stable_across_pause_resume() {
+    use crate::backend::kms::{
+        ConnectorDescription, ConnectorMode, KmsTopologyLifecycleEvent, KmsTopologySnapshot,
+        OutputKey, OutputScale120, PreselectedAtomicOutput,
+    };
+
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the KMS wl_output oracle");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-kms-output-{}-{unique}", std::process::id());
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Kms,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "kms-output-test".into(),
+            drm_adapter: synthetic_drm_adapter("kms-output-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("KMS protocol runtime starts without DRM access");
+    let topology = runtime.kms_topology_client();
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("client connects before KMS topology admission");
+
+    const WIDTH: u32 = 64;
+    const HEIGHT: u32 = 32;
+    const STRIDE: u32 = WIDTH * 4;
+    const FRAME_BYTES: u32 = STRIDE * HEIGHT;
+    let pool = bring_up_shm_toplevel(&mut client, FRAME_BYTES * 2, "cosmix-kms-output-race");
+    send_request(
+        &mut client,
+        11,
+        0,
+        &words(&[
+            12,
+            0,
+            WIDTH,
+            HEIGHT,
+            STRIDE,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    ); // wl_shm_pool.create_buffer
+    send_request(&mut client, 7, 1, &words(&[12, 0, 0])); // wl_surface.attach
+    send_request(&mut client, 7, 6, &[]); // map before output admission
+    send_display_request(&mut client, 0, 13);
+    let mapped_before_admission = events_until_callback(&mut client, 13);
+    assert!(
+        mapped_before_admission
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 7 && matches!(*opcode, 0 | 1))),
+        "there is no output to enter or leave before admission: {mapped_before_admission:?}"
+    );
+
+    let key = OutputKey {
+        device: 226,
+        connector_name: "Offline-1".into(),
+    };
+    let mode = ConnectorMode {
+        width: 3840,
+        height: 2160,
+        refresh_millihz: 59_940,
+        preferred: true,
+        clock_khz: 533_250,
+        hsync: (3840, 3888, 3920),
+        vsync: (2160, 2163, 2168),
+        hskew: 0,
+        vscan: 0,
+        flags: 0,
+    };
+    let snapshot = KmsTopologySnapshot {
+        connectors: vec![ConnectorDescription {
+            key: key.clone(),
+            connector_id: 41,
+            modes: vec![mode],
+        }],
+        selections: vec![PreselectedAtomicOutput {
+            key: key.clone(),
+            connector_mode: mode,
+            selection: Ok(test_atomic_selection(41, mode)),
+        }],
+        output_scale: OutputScale120::new(300).expect("250 percent"),
+    };
+    topology
+        .submit_lifecycle(
+            KmsTopologyLifecycleEvent::Initial(snapshot.clone()),
+            PROTOCOL_ACK_DEADLINE,
+        )
+        .expect("initial logical output is admitted");
+    assert!(matches!(
+        topology
+            .drain_render_commands()
+            .expect("initial output command")
+            .as_slice(),
+        [KmsRenderCommand::AddOutput { generation: 1, output }] if output.key == key
+    ));
+
+    send_display_request(&mut client, 0, 14);
+    let admitted = events_until_callback(&mut client, 14);
+    let (global_name, output_version) = registry_global_from_events(&admitted, 2, "wl_output")
+        .expect("the existing real registry receives the admitted KMS output");
+    bind_global(
+        &mut client,
+        global_name,
+        "wl_output",
+        output_version.min(4),
+        15,
+    );
+    send_display_request(&mut client, 0, 16);
+    let bound = events_until_callback(&mut client, 16);
+
+    let geometry = bound
+        .iter()
+        .find_map(|(object, opcode, body)| (*object == 15 && *opcode == 0).then_some(body))
+        .expect("bound KMS output sends geometry");
+    assert_eq!(
+        (word(geometry, 0) as i32, word(geometry, 1) as i32),
+        (0, 0),
+        "logical location comes from the admitted topology"
+    );
+    assert_eq!(
+        word(geometry, 4),
+        wl_output_protocol::Subpixel::Unknown as u32
+    );
+    let mut geometry_offset = 20;
+    assert_eq!(wire_string(geometry, &mut geometry_offset), "CosMix");
+    assert_eq!(wire_string(geometry, &mut geometry_offset), "Offline-1");
+    assert_eq!(
+        word(geometry, geometry_offset / 4),
+        wl_output_protocol::Transform::Normal as u32,
+        "the KMS logical output uses the atomic scanout identity transform"
+    );
+    let advertised_mode = bound
+        .iter()
+        .find_map(|(object, opcode, body)| (*object == 15 && *opcode == 1).then_some(body))
+        .expect("bound KMS output sends its exact mode");
+    assert_eq!(word(advertised_mode, 0), 3, "mode is current and preferred");
+    assert_eq!(
+        (
+            word(advertised_mode, 1),
+            word(advertised_mode, 2),
+            word(advertised_mode, 3),
+        ),
+        (mode.width, mode.height, mode.refresh_millihz),
+        "wl_output reports the selected connector tuple without rounding"
+    );
+    assert!(
+        bound
+            .iter()
+            .any(|(object, opcode, body)| { *object == 15 && *opcode == 3 && word(body, 0) == 3 }),
+        "wl_output rounds the fractional scale up to three: {bound:?}"
+    );
+    assert!(
+        bound.iter().any(|(object, opcode, body)| {
+            *object == 15 && *opcode == 4 && {
+                let mut offset = 0;
+                wire_string(body, &mut offset) == "Offline-1"
+            }
+        }),
+        "the KMS connector identity is the wl_output name: {bound:?}"
+    );
+    assert!(
+        bound
+            .iter()
+            .any(|(object, opcode, body)| { *object == 7 && *opcode == 0 && word(body, 0) == 15 }),
+        "the surface mapped before admission enters when the late output is bound: {bound:?}"
+    );
+
+    topology
+        .submit_lifecycle(KmsTopologyLifecycleEvent::Pause, PROTOCOL_ACK_DEADLINE)
+        .expect("logical client output survives the session pause");
+    assert_eq!(
+        topology.drain_render_commands().expect("pause command"),
+        [KmsRenderCommand::Suspend { generation: 2 }]
+    );
+    send_display_request(&mut client, 0, 17);
+    let paused = events_until_callback(&mut client, 17);
+    assert!(
+        paused.iter().all(|(object, opcode, body)| {
+            !(*object == 2 && *opcode == 1 && word(body, 0) == global_name
+                || *object == 7 && matches!(*opcode, 0 | 1) && word(body, 0) == 15)
+        }),
+        "pause emits neither global removal nor surface enter/leave: {paused:?}"
+    );
+
+    topology
+        .submit_lifecycle(
+            KmsTopologyLifecycleEvent::Resume(snapshot),
+            PROTOCOL_ACK_DEADLINE,
+        )
+        .expect("the same connector and exact timing resume");
+    assert!(matches!(
+        topology
+            .drain_render_commands()
+            .expect("resume output commands")
+            .as_slice(),
+        [
+            KmsRenderCommand::Resume { generation: 3 },
+            KmsRenderCommand::AddOutput { generation: 4, output }
+        ] if output.key == key && output.connector_mode == mode
+    ));
+    send_display_request(&mut client, 0, 18);
+    let resumed = events_until_callback(&mut client, 18);
+    assert!(
+        resumed.iter().all(|(object, opcode, body)| {
+            !(*object == 2
+                && matches!(*opcode, 0 | 1)
+                && (*opcode == 0 || word(body, 0) == global_name)
+                || *object == 7 && matches!(*opcode, 0 | 1) && word(body, 0) == 15)
+        }),
+        "resume retains the same global and emits no enter/leave churn: {resumed:?}"
+    );
+
+    send_request(&mut client, 4, 0, &words(&[19])); // second wl_surface
+    send_request(&mut client, 5, 2, &words(&[20, 19])); // second xdg_surface
+    send_request(&mut client, 20, 1, &words(&[21])); // second toplevel
+    send_request(&mut client, 19, 6, &[]); // initial empty commit
+    send_display_request(&mut client, 0, 22);
+    let configured = events_until_callback(&mut client, 22);
+    let serial = configured
+        .iter()
+        .find_map(|(object, opcode, body)| (*object == 20 && *opcode == 0).then(|| word(body, 0)))
+        .expect("second toplevel receives its initial configure");
+    send_request(&mut client, 20, 4, &words(&[serial]));
+    send_request(
+        &mut client,
+        11,
+        0,
+        &words(&[
+            23,
+            FRAME_BYTES,
+            WIDTH,
+            HEIGHT,
+            STRIDE,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    );
+    send_request(&mut client, 19, 1, &words(&[23, 0, 0]));
+    send_request(&mut client, 19, 6, &[]);
+    send_display_request(&mut client, 0, 24);
+    let mapped_after_admission = events_until_callback(&mut client, 24);
+    assert!(
+        mapped_after_admission
+            .iter()
+            .any(|(object, opcode, body)| { *object == 19 && *opcode == 0 && word(body, 0) == 15 }),
+        "a surface mapped after admission enters the retained KMS output: {mapped_after_admission:?}"
+    );
+
+    send_display_request(&mut client, 1, 25); // fresh registry view
+    send_display_request(&mut client, 0, 26);
+    let globals = registry_globals_for(&mut client, 25, 26);
+    let (xdg_output_manager, xdg_output_version) = globals["zxdg_output_manager_v1"];
+    let (fractional_manager, fractional_version) = globals["wp_fractional_scale_manager_v1"];
+    let (viewporter, viewporter_version) = globals["wp_viewporter"];
+    bind_global(
+        &mut client,
+        xdg_output_manager,
+        "zxdg_output_manager_v1",
+        xdg_output_version.min(3),
+        27,
+    );
+    bind_global(
+        &mut client,
+        fractional_manager,
+        "wp_fractional_scale_manager_v1",
+        fractional_version.min(1),
+        28,
+    );
+    bind_global(
+        &mut client,
+        viewporter,
+        "wp_viewporter",
+        viewporter_version.min(1),
+        29,
+    );
+    send_request(&mut client, 27, 1, &words(&[30, 15])); // get_xdg_output
+    send_request(&mut client, 28, 1, &words(&[31, 7])); // get_fractional_scale
+    send_request(&mut client, 29, 1, &words(&[32, 7])); // get_viewport
+    send_display_request(&mut client, 0, 33);
+    let advertised = events_until_callback(&mut client, 33);
+    assert!(
+        advertised.iter().any(|(object, opcode, body)| {
+            *object == 30 && *opcode == 1 && (word(body, 0), word(body, 1)) == (1536, 864)
+        }),
+        "xdg-output reports the exact logical 4K-at-250-percent size: {advertised:?}"
+    );
+    assert!(
+        advertised.iter().any(|(object, opcode, body)| {
+            *object == 31 && *opcode == 0 && word(body, 0) == 300
+        }),
+        "fractional-scale reports the admitted 120ths value: {advertised:?}"
+    );
+
+    const PHYSICAL_WIDTH: u32 = 3840;
+    const PHYSICAL_HEIGHT: u32 = 2160;
+    const PHYSICAL_STRIDE: u32 = PHYSICAL_WIDTH * 4;
+    const PHYSICAL_BYTES: u32 = PHYSICAL_STRIDE * PHYSICAL_HEIGHT;
+    pool.set_len(u64::from(PHYSICAL_BYTES))
+        .expect("grow sparse 4K SHM pool");
+    send_request(&mut client, 11, 2, &words(&[PHYSICAL_BYTES])); // wl_shm_pool.resize
+    send_request(
+        &mut client,
+        11,
+        0,
+        &words(&[
+            34,
+            0,
+            PHYSICAL_WIDTH,
+            PHYSICAL_HEIGHT,
+            PHYSICAL_STRIDE,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    );
+
+    runtime.drain_events().expect("clear prior scene traffic");
+    send_request(&mut client, 7, 8, &words(&[1])); // wl_surface.set_buffer_scale
+    send_request(&mut client, 32, 2, &words(&[1536, 864])); // viewport destination
+    send_request(&mut client, 7, 1, &words(&[34, 0, 0]));
+    send_request(
+        &mut client,
+        7,
+        9,
+        &words(&[0, 0, PHYSICAL_WIDTH, PHYSICAL_HEIGHT]),
+    );
+    send_request(&mut client, 7, 6, &[]);
+    send_display_request(&mut client, 0, 35);
+    events_until_callback(&mut client, 35);
+    let fractional_layout = wait_for_shm_layout(&runtime, (PHYSICAL_WIDTH, PHYSICAL_HEIGHT));
+    assert_eq!(
+        (fractional_layout.width, fractional_layout.height),
+        (1536.0, 864.0),
+        "buffer-scale one plus viewport destination is the crisp fractional path"
+    );
+
+    for (callback, buffer_scale, logical_size) in [
+        (36, 1, (3840.0, 2160.0)),
+        (37, 2, (1920.0, 1080.0)),
+        (38, 3, (1280.0, 720.0)),
+    ] {
+        runtime.drain_events().expect("clear prior presentation");
+        send_request(&mut client, 32, 2, &words(&[u32::MAX, u32::MAX]));
+        send_request(&mut client, 7, 8, &words(&[buffer_scale]));
+        send_request(&mut client, 7, 1, &words(&[34, 0, 0]));
+        send_request(&mut client, 7, 6, &[]);
+        send_display_request(&mut client, 0, callback);
+        events_until_callback(&mut client, callback);
+        let layout = wait_for_shm_layout(&runtime, (PHYSICAL_WIDTH, PHYSICAL_HEIGHT));
+        assert_eq!(
+            (layout.width, layout.height),
+            logical_size,
+            "legacy buffer scale {buffer_scale} has its honest logical presentation"
+        );
+    }
+}
+
+fn keyboard_key_events(events: &[(u32, u16, Vec<u8>)]) -> Vec<(u32, u32)> {
+    events
+        .iter()
+        .filter(|(object, opcode, body)| {
+            *object == TEST_KEYBOARD_ID && *opcode == 3 && body.len() >= 16
+        })
+        .map(|(_, _, body)| {
+            (
+                u32::from_ne_bytes(body[8..12].try_into().expect("keyboard keycode")),
+                u32::from_ne_bytes(body[12..16].try_into().expect("keyboard key state")),
+            )
+        })
+        .collect()
+}
+
+#[derive(Clone)]
+struct ToggleInfoSubscriber {
+    active: Arc<AtomicBool>,
+    events: Arc<AtomicUsize>,
+}
+
+impl tracing::Subscriber for ToggleInfoSubscriber {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let metadata = event.metadata();
+        if self.active.load(Ordering::Acquire)
+            && thread::current().name() == Some("cosmix-wayland")
+            && *metadata.level() == tracing::Level::INFO
+            && metadata.fields().field("enabled").is_some()
+            && metadata.fields().field("message").is_some()
+        {
+            self.events.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+struct ToggleLogCapture {
+    active: Arc<AtomicBool>,
+    events: Arc<AtomicUsize>,
+}
+
+static TOGGLE_LOG_CAPTURE: OnceLock<ToggleLogCapture> = OnceLock::new();
+static TOGGLE_LOG_OBSERVATION: Mutex<()> = Mutex::new(());
+
+fn toggle_log_capture() -> &'static ToggleLogCapture {
+    TOGGLE_LOG_CAPTURE.get_or_init(|| {
+        let capture = ToggleLogCapture {
+            active: Arc::new(AtomicBool::new(false)),
+            events: Arc::new(AtomicUsize::new(0)),
+        };
+        tracing::subscriber::set_global_default(ToggleInfoSubscriber {
+            active: Arc::clone(&capture.active),
+            events: Arc::clone(&capture.events),
+        })
+        .expect("install process-wide protocol-thread log subscriber");
+        capture
+    })
+}
+
+/// Press the given evdev keys in order, then release them in reverse — one
+/// chord, as a host would report it.
+fn protocol_chord(keys: &[u32]) -> Vec<HostInput> {
+    let time = super::monotonic_millis();
+    keys.iter()
+        .map(|key| HostInput::key_from_evdev(*key, HostButtonState::Pressed, time))
+        .chain(
+            keys.iter()
+                .rev()
+                .map(|key| HostInput::key_from_evdev(*key, HostButtonState::Released, time)),
+        )
+        .collect()
+}
+
+#[test]
+fn real_keyboard_path_closes_the_toplevel_focused_through_a_subsurface() {
+    let mut harness = KeybindingHarness::new(true);
+
+    harness.key(125, HostButtonState::Pressed);
+    harness.key(16, HostButtonState::Pressed);
+    harness.key(125, HostButtonState::Released);
+    harness.key(16, HostButtonState::Released);
+    let events = harness.sync();
+
+    assert!(
+        events
+            .iter()
+            .any(|(object, opcode, _)| *object == TEST_TOPLEVEL_ID && *opcode == 1),
+        "Super+Q reaches ToplevelSurface::send_close and emits xdg_toplevel.close"
+    );
+    assert_eq!(
+        keyboard_key_events(&events),
+        [(125, 1), (125, 0)],
+        "Q press and release stay intercepted even when Super is released first"
+    );
+}
+
+#[test]
+fn real_focus_reset_unstrands_an_intercepted_press_before_later_plain_q() {
+    let mut harness = KeybindingHarness::new(true);
+    let time = super::monotonic_millis();
+    harness.frame(vec![
+        HostInput::key_from_evdev(125, HostButtonState::Pressed, time),
+        HostInput::key_from_evdev(16, HostButtonState::Pressed, time),
+        HostInput::KeyboardFocusLost,
+    ]);
+    assert_eq!(
+        keyboard_key_events(&harness.sync()),
+        [(125, 1), (125, 0)],
+        "the real Smithay path forwards Super's reset release and keeps the intercepted Q hidden"
+    );
+
+    harness.frame(vec![
+        HostInput::key_from_evdev(16, HostButtonState::Pressed, time),
+        HostInput::key_from_evdev(16, HostButtonState::Released, time),
+    ]);
+    assert_eq!(
+        keyboard_key_events(&harness.sync()),
+        [(16, 1), (16, 0)],
+        "a later plain-Q press and release both reach the real wl_keyboard client"
+    );
+}
+
+#[test]
+fn real_keyboard_path_delivers_exit_action_to_the_bounded_ecs_channel() {
+    let mut harness = KeybindingHarness::new(true);
+    harness.chord(&[125, 42, 1]);
+
+    assert_eq!(
+        harness
+            .ecs_actions
+            .recv_timeout(PROTOCOL_ACK_DEADLINE)
+            .expect("timed out after 30 seconds awaiting exit action from protocol handling"),
+        EcsAction::ExitNestedCompositor
+    );
+}
+
+#[test]
+fn live_input_dispatch_publishes_the_kms_vt_switch_request() {
+    let (vt_requests, requested_vt) = mpsc::channel();
+    let mut harness = KeybindingHarness::new_with_kms_live_bindings(vt_requests);
+    for (keycode, state) in [
+        (37, KeyState::Pressed),
+        (64, KeyState::Pressed),
+        (69, KeyState::Pressed),
+        (69, KeyState::Released),
+        (64, KeyState::Released),
+        (37, KeyState::Released),
+    ] {
+        harness.route(InputEvent::Keyboard {
+            event: FakeKeyEvent {
+                device: FakeDevice::KeyboardAndPointer,
+                keycode: Keycode::new(keycode),
+                state,
+            },
+        });
+    }
+
+    assert_eq!(
+        requested_vt
+            .recv_timeout(PROTOCOL_ACK_DEADLINE)
+            .expect("production input dispatch publishes Ctrl+Alt+F3"),
+        3
+    );
+    assert!(matches!(requested_vt.try_recv(), Err(TryRecvError::Empty)));
+}
+
+#[test]
+fn live_input_lifecycle_reconciles_the_intercepted_chord_before_suspend_and_resumes() {
+    use crate::backend::kms::{
+        ConnectorDescription, ConnectorMode, KmsRenderCommand, KmsTopologyLifecycleEvent,
+        KmsTopologySnapshot, OutputKey, PreselectedAtomicOutput,
+    };
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-input-lifecycle-{}-{unique}", std::process::id());
+    let (injector, source, lifecycle, observed) = fake_lifecycle_input_source();
+    let (vt_requests, requested_vt) = mpsc::channel();
+    let runtime = WaylandRuntime::with_input_source_and_bindings(
+        &socket_name,
+        BackendKind::Kms,
+        (1920, 1080),
+        WaylandGpuWiring {
+            dmabuf_capabilities: Some(DmabufCapabilities {
+                main_device: 0,
+                formats: Vec::new(),
+                adapter_name: "input-lifecycle-test".into(),
+                drm_adapter: synthetic_drm_adapter("input-lifecycle-test"),
+            }),
+            dmabuf_validator: None,
+            retirement_adapter: test_retirement_adapter(),
+        },
+        WaylandRuntimePolicy {
+            keybindings_enabled: true,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+        WaylandInputWiring {
+            source: Some(source),
+            lifecycle: Some(lifecycle),
+            binding_profile: BindingProfile::KmsLive,
+            vt_switch_requested: Some(Box::new(move |vt| {
+                let _ = vt_requests.send(vt);
+            })),
+        },
+        None,
+    )
+    .expect("lifecycle-backed protocol runtime starts");
+    let topology = runtime.kms_topology_client();
+    let frame_clock = runtime.client_frame_clock();
+    let key = OutputKey {
+        device: 226,
+        connector_name: "Offline-1".into(),
+    };
+    let mode = ConnectorMode {
+        width: 1920,
+        height: 1080,
+        refresh_millihz: 60_000,
+        preferred: true,
+        clock_khz: 148_500,
+        hsync: (1920, 2008, 2200),
+        vsync: (1080, 1084, 1125),
+        hskew: 0,
+        vscan: 0,
+        flags: 0,
+    };
+    topology
+        .submit_lifecycle(
+            KmsTopologyLifecycleEvent::Initial(KmsTopologySnapshot {
+                connectors: vec![ConnectorDescription {
+                    key: key.clone(),
+                    connector_id: 41,
+                    modes: vec![mode],
+                }],
+                selections: vec![PreselectedAtomicOutput {
+                    key,
+                    connector_mode: mode,
+                    selection: Ok(test_atomic_selection(41, mode)),
+                }],
+                output_scale: crate::backend::kms::OutputScale120::ONE,
+            }),
+            PROTOCOL_ACK_DEADLINE,
+        )
+        .expect("initial topology is reduced on the protocol thread");
+    assert!(matches!(
+        topology
+            .drain_render_commands()
+            .expect("initial render command"),
+        commands if matches!(commands.as_slice(), [KmsRenderCommand::AddOutput { generation: 1, .. }])
+    ));
+
+    for keycode in [37, 64, 69] {
+        injector.route(InputEvent::Keyboard {
+            event: FakeKeyEvent {
+                device: FakeDevice::KeyboardAndPointer,
+                keycode: Keycode::new(keycode),
+                state: KeyState::Pressed,
+            },
+        });
+    }
+    assert_eq!(
+        requested_vt
+            .recv_timeout(PROTOCOL_ACK_DEADLINE)
+            .expect("Ctrl+Alt+F3 reaches the coordinator"),
+        3
+    );
+    topology
+        .reconcile_and_suspend_input(PROTOCOL_ACK_DEADLINE)
+        .expect("all held input is reconciled before fake suspend");
+    assert_eq!(
+        observed.lock().expect("fake lifecycle probe").as_slice(),
+        ["suspend"]
+    );
+    topology
+        .submit_lifecycle(KmsTopologyLifecycleEvent::Pause, PROTOCOL_ACK_DEADLINE)
+        .expect("paused protocol remains dispatchable");
+    assert_eq!(
+        topology
+            .drain_render_commands()
+            .expect("pause render command"),
+        [KmsRenderCommand::Suspend { generation: 2 }]
+    );
+    frame_clock
+        .pulse()
+        .expect("empty post-resume frame pulse command remains available");
+    topology
+        .resume_input(PROTOCOL_ACK_DEADLINE)
+        .expect("fake input resumes on the protocol calloop");
+    assert_eq!(
+        observed.lock().expect("fake lifecycle probe").as_slice(),
+        ["suspend", "resume"]
+    );
+
+    for keycode in [37, 64, 69] {
+        injector.route(InputEvent::Keyboard {
+            event: FakeKeyEvent {
+                device: FakeDevice::KeyboardAndPointer,
+                keycode: Keycode::new(keycode),
+                state: KeyState::Pressed,
+            },
+        });
+    }
+    assert_eq!(
+        requested_vt
+            .recv_timeout(PROTOCOL_ACK_DEADLINE)
+            .expect("the reconciled chord can be pressed again after resume"),
+        3
+    );
+}
+
+#[test]
+fn kms_client_syncs_while_paused_and_its_frame_waits_for_resumed_submission() {
+    use crate::backend::kms::{
+        ConnectorDescription, ConnectorMode, KmsRenderCommand, KmsTopologyLifecycleEvent,
+        KmsTopologySnapshot, OutputKey, PreselectedAtomicOutput,
+    };
+
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the paused-client oracle");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-pause-client-{}-{unique}", std::process::id());
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Kms,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "paused-client-test".into(),
+            drm_adapter: synthetic_drm_adapter("paused-client-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("KMS protocol thread starts for the paused-client oracle");
+    let topology = runtime.kms_topology_client();
+    let frame_clock = runtime.client_frame_clock();
+    let key = OutputKey {
+        device: 226,
+        connector_name: "Offline-1".into(),
+    };
+    let mode = ConnectorMode {
+        width: 320,
+        height: 240,
+        refresh_millihz: 60_000,
+        preferred: true,
+        clock_khz: 12_000,
+        hsync: (320, 328, 400),
+        vsync: (240, 244, 260),
+        hskew: 0,
+        vscan: 0,
+        flags: 0,
+    };
+    let snapshot = KmsTopologySnapshot {
+        connectors: vec![ConnectorDescription {
+            key: key.clone(),
+            connector_id: 41,
+            modes: vec![mode],
+        }],
+        selections: vec![PreselectedAtomicOutput {
+            key,
+            connector_mode: mode,
+            selection: Ok(test_atomic_selection(41, mode)),
+        }],
+        output_scale: crate::backend::kms::OutputScale120::ONE,
+    };
+    topology
+        .submit_lifecycle(
+            KmsTopologyLifecycleEvent::Initial(snapshot.clone()),
+            PROTOCOL_ACK_DEADLINE,
+        )
+        .expect("initial topology is installed");
+    assert!(matches!(
+        topology
+            .drain_render_commands()
+            .expect("initial command")
+            .as_slice(),
+        [KmsRenderCommand::AddOutput { generation: 1, .. }]
+    ));
+
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("client connects before the pause");
+    send_display_request(&mut client, 1, 2); // wl_display.get_registry
+    send_display_request(&mut client, 0, 3); // wl_display.sync
+    let globals = registry_globals(&mut client, 3);
+    let (compositor, compositor_version) = globals["wl_compositor"];
+    let (xdg, xdg_version) = globals["xdg_wm_base"];
+    bind_global(
+        &mut client,
+        compositor,
+        "wl_compositor",
+        compositor_version.min(5),
+        4,
+    );
+    bind_global(&mut client, xdg, "xdg_wm_base", xdg_version.min(6), 5);
+    send_request(&mut client, 4, 0, &words(&[6])); // create wl_surface
+    send_request(&mut client, 5, 2, &words(&[7, 6])); // get_xdg_surface
+    send_request(&mut client, 7, 1, &words(&[8])); // get_toplevel
+    send_request(&mut client, 6, 6, &[]); // initial empty commit
+    send_display_request(&mut client, 0, 9);
+    let initial = events_until_callback(&mut client, 9);
+    let serial = initial
+        .iter()
+        .find_map(|(object, opcode, body)| (*object == 7 && *opcode == 0).then(|| word(body, 0)))
+        .expect("initial xdg configure arrives before pause");
+    send_request(&mut client, 7, 4, &words(&[serial])); // ack_configure
+    send_request(&mut client, 6, 3, &words(&[10])); // wl_surface.frame
+    send_request(&mut client, 6, 6, &[]); // commit callback
+    send_display_request(&mut client, 0, 11);
+    let armed = events_until_callback(&mut client, 11);
+    assert!(
+        armed
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 10 && *opcode == 0)),
+        "the callback is outstanding before pause"
+    );
+
+    topology
+        .submit_lifecycle(KmsTopologyLifecycleEvent::Pause, PROTOCOL_ACK_DEADLINE)
+        .expect("protocol enters Paused");
+    assert_eq!(
+        topology.drain_render_commands().expect("suspend command"),
+        [KmsRenderCommand::Suspend { generation: 2 }]
+    );
+    send_display_request(&mut client, 0, 12);
+    let while_paused = events_until_callback(&mut client, 12);
+    assert!(
+        while_paused
+            .iter()
+            .all(|(object, opcode, _)| { !((*object == 10 || *object == 7) && *opcode == 0) }),
+        "sync completes while paused without a frame callback or xdg configure: {while_paused:?}"
+    );
+
+    topology
+        .submit_lifecycle(
+            KmsTopologyLifecycleEvent::Resume(snapshot),
+            PROTOCOL_ACK_DEADLINE,
+        )
+        .expect("same-mode topology resumes");
+    assert!(matches!(
+        topology
+            .drain_render_commands()
+            .expect("resume commands")
+            .as_slice(),
+        [
+            KmsRenderCommand::Resume { generation: 3 },
+            KmsRenderCommand::AddOutput { generation: 4, .. }
+        ]
+    ));
+    send_display_request(&mut client, 0, 13);
+    let output_ready = events_until_callback(&mut client, 13);
+    assert!(
+        output_ready
+            .iter()
+            .all(|(object, opcode, _)| { !((*object == 10 || *object == 7) && *opcode == 0) }),
+        "output-ready alone emits neither the held callback nor a same-mode configure: {output_ready:?}"
+    );
+
+    frame_clock
+        .pulse()
+        .expect("the first resumed submission emits its empty frame pulse");
+    let delivered = wait_for_all_callbacks(&mut client, &[10], 14);
+    assert_eq!(
+        delivered
+            .iter()
+            .filter(|(object, opcode, _)| *object == 10 && *opcode == 0)
+            .count(),
+        1,
+        "the client survives and receives its held callback exactly once"
+    );
+}
+
+#[test]
+fn real_reserved_toggle_round_trips_logs_and_changes_forwarding() {
+    let _runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for protocol-thread toggle log coverage");
+    let _observation = TOGGLE_LOG_OBSERVATION
+        .lock()
+        .expect("toggle log observation lock");
+    let capture = toggle_log_capture();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let runtime = WaylandRuntime::new(
+        &format!("cosmix-toggle-log-test-{}-{unique}", std::process::id()),
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "toggle-log-test".into(),
+            drm_adapter: synthetic_drm_adapter("toggle-log-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: true,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("toggle-log protocol thread starts");
+    capture.events.store(0, Ordering::Release);
+    capture.active.store(true, Ordering::Release);
+    runtime
+        .finish_frame(protocol_chord(&[125, 29, 42, 88]))
+        .expect("send reserved toggle chord to protocol thread");
+    runtime.wait_until_protocol_thread_processed("reserved toggle chord and its info log");
+    capture.active.store(false, Ordering::Release);
+    assert_eq!(capture.events.load(Ordering::Acquire), 1);
+    drop(runtime);
+
+    let mut harness = KeybindingHarness::new(true);
+    harness.chord(&[125, 29, 42, 88]);
+    assert!(!harness.interception_enabled());
+    assert_eq!(
+        keyboard_key_events(&harness.sync()),
+        [(125, 1), (29, 1), (42, 1), (42, 0), (29, 0), (125, 0)],
+        "the reserved F12 press and release are intercepted"
+    );
+
+    harness.chord(&[125, 16]);
+    let forwarded = keyboard_key_events(&harness.sync());
+    assert_eq!(
+        forwarded,
+        [(125, 1), (16, 1), (16, 0), (125, 0)],
+        "normal binding chord forwards in full after the reserved toggle disables interception"
+    );
+
+    harness.chord(&[125, 29, 42, 88]);
+    assert!(
+        harness.interception_enabled(),
+        "the reserved chord remains reachable while interception is disabled"
+    );
+}
+
+#[test]
+fn real_keyboard_path_forwards_a_full_chord_when_started_disabled() {
+    let mut harness = KeybindingHarness::new(false);
+    harness.chord(&[125, 16]);
+
+    assert_eq!(
+        keyboard_key_events(&harness.sync()),
+        [(125, 1), (16, 1), (16, 0), (125, 0)]
+    );
+
+    harness.chord(&[125, 29, 42, 88]);
+    assert!(
+        harness.interception_enabled(),
+        "the reserved toggle can arm interception from --no-keybindings state"
+    );
+}
+
+#[test]
+fn xrgb_is_converted_from_bgrx_to_opaque_rgba() {
+    let frame = convert_shm_pixels(
+        wl_shm::Format::Xrgb8888,
+        2,
+        1,
+        vec![3, 2, 1, 99, 30, 20, 10, 0],
+    )
+    .expect("supported format");
+    assert_eq!(frame.rgba.as_slice(), &[1, 2, 3, 255, 10, 20, 30, 255]);
+    assert!(frame.opaque);
+}
+
+#[test]
+fn argb_premultiplication_is_preserved_for_client_surface_shader_blending() {
+    let frame = convert_shm_pixels(wl_shm::Format::Argb8888, 1, 1, vec![25, 50, 100, 128])
+        .expect("supported format");
+    assert_eq!(frame.rgba.as_slice(), &[100, 50, 25, 128]);
+    assert!(!frame.opaque);
+}
+
+// `shm_rows_honour_offset_stride_and_padding` used to sit here. It called
+// `copy_shm_rows`, a `#[cfg(test)]` duplicate of the production walk, so it was
+// green against a copy of the code and blind to the original. Deleted with that
+// helper; the padded, offset pool it described is now driven through the real
+// `wl_shm` import by
+// `shm_commit_reaches_the_renderer_pixel_exact_and_releases_the_buffer`.
+
+#[test]
+fn oversized_shm_is_rejected_before_allocation() {
+    // Real clients legitimately commit buffers larger than the nested
+    // output (browser hidpi first frames) — only absolute caps apply.
+    assert!(validate_surface_buffer_size(2190, 1569, (960, 640)).is_ok());
+    assert!(validate_surface_buffer_size(4096, 4096, (960, 640)).is_ok());
+    assert!(validate_surface_buffer_size(8193, 1280, (960, 640)).is_err());
+    assert!(validate_surface_buffer_size(1920, 8193, (960, 640)).is_err());
+    // 8192x8192x4 bytes = 256 MiB > MAX_SURFACE_BYTES.
+    assert!(validate_surface_buffer_size(8192, 8192, (960, 640)).is_err());
+    assert!(validate_surface_buffer_size(0, 100, (960, 640)).is_err());
+}
+
+#[test]
+fn scale_three_legacy_fullscreen_buffer_stays_below_the_64_mib_surface_cap() {
+    const WIDTH: usize = 1536 * 3;
+    const HEIGHT: usize = 864 * 3;
+    const BYTES: usize = WIDTH * HEIGHT * 4;
+    const { assert!(BYTES < MAX_SURFACE_BYTES) };
+    assert_eq!(BYTES, 47_775_744);
+    assert_eq!(
+        validate_surface_buffer_size(WIDTH, HEIGHT, (1536, 864)),
+        Ok(BYTES)
+    );
+    assert_eq!(
+        validate_surface_buffer_size(4096, 4096, (1536, 864)),
+        Ok(MAX_SURFACE_BYTES),
+        "the cap itself remains inclusive"
+    );
+    assert!(validate_surface_buffer_size(4096, 4097, (1536, 864)).is_err());
+}
+
+#[test]
+fn buffer_scale_controls_untransformed_logical_geometry() {
+    assert_eq!(
+        logical_surface_size(1280, 840, 2).expect("scale two buffer"),
+        (640.0, 420.0)
+    );
+    assert_eq!(
+        logical_surface_size(840, 1280, 2).expect("untransformed helper preserves axis order"),
+        (420.0, 640.0)
+    );
+    assert!(logical_surface_size(1279, 840, 2).is_err());
+}
+
+#[test]
+fn buffer_transform_maps_viewport_source_back_to_raw_pixels() {
+    assert!(SurfaceTransform::Rotate90.swaps_axes());
+    assert!(!SurfaceTransform::Rotate180.swaps_axes());
+    assert_eq!(
+        transformed_source_rect(10.0, 20.0, 30.0, 40.0, 200, 100, SurfaceTransform::Rotate90,),
+        TextureSourceRect {
+            x: 20.0,
+            y: 60.0,
+            width: 40.0,
+            height: 30.0,
+        }
+    );
+    assert_eq!(
+        transformed_source_rect(10.0, 20.0, 30.0, 40.0, 200, 100, SurfaceTransform::Flipped,),
+        TextureSourceRect {
+            x: 160.0,
+            y: 20.0,
+            width: 30.0,
+            height: 40.0,
+        }
+    );
+}
+
+#[test]
+fn transformed_surface_damage_conservatively_refreshes_all_rows() {
+    let damage = [Damage::Surface(Rectangle::new(
+        (10, 10).into(),
+        (20, 20).into(),
+    ))];
+    let ranges = damage_row_ranges(
+        &damage,
+        200,
+        100,
+        1,
+        wl_output_protocol::Transform::_90,
+        ViewportCachedState::default(),
+    );
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0], 0..100);
+}
+
+#[test]
+fn viewport_scaled_surface_damage_maps_to_source_buffer_rows() {
+    let viewport = ViewportCachedState {
+        src: Some(Rectangle::new((0.0, 5.0).into(), (100.0, 20.0).into())),
+        dst: Some((200, 40).into()),
+    };
+    let damage = [Damage::Surface(Rectangle::new(
+        (0, 10).into(),
+        (200, 10).into(),
+    ))];
+    let ranges = damage_row_ranges(
+        &damage,
+        200,
+        100,
+        2,
+        wl_output_protocol::Transform::Normal,
+        viewport,
+    );
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0], 20..30);
+    assert!(
+        damage_row_ranges(
+            &[],
+            200,
+            100,
+            2,
+            wl_output_protocol::Transform::Normal,
+            viewport
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn removed_surface_is_recognised_as_stale_focus() {
+    assert!(focus_is_surface(Some(&7_u32), &7));
+    assert!(!focus_is_surface(Some(&8_u32), &7));
+    assert!(!focus_is_surface::<u32>(None, &7));
+}
+
+#[test]
+fn popup_grab_rejects_an_invented_serial_without_live_input_provenance() {
+    assert!(!popup_grab_has_live_action(false, false, false));
+    assert!(popup_grab_has_live_action(true, false, false));
+    assert!(popup_grab_has_live_action(false, true, false));
+    assert!(popup_grab_has_live_action(false, false, true));
+}
+
+#[test]
+fn nested_popup_keyboard_action_accepts_its_canonical_toplevel_root() {
+    let serial = Serial::from(41);
+    // 4 is a wl_subsurface child of popup 3; popup 3 belongs to nested
+    // popup chain rooted at toplevel 1.
+    let toplevel_root = canonical_root_with(
+        &4_u8,
+        |surface| (*surface == 4).then_some(3),
+        |surface| (*surface == 3).then_some(1),
+    );
+    assert_eq!(toplevel_root, 1);
+    assert!(keyboard_action_matches_root(
+        Some((serial, toplevel_root)),
+        serial,
+        toplevel_root,
+    ));
+}
+
+#[test]
+fn keyboard_focus_change_invalidates_a_stale_popup_serial() {
+    let serial = Serial::from(41);
+    let mut action = Some((serial, SurfaceId(7)));
+    invalidate_keyboard_action(&mut action);
+    assert!(!keyboard_action_matches_root(action, serial, SurfaceId(7),));
+}
+
+#[test]
+fn remap_requires_an_ack_from_the_current_configure_sequence() {
+    let old = Serial::from(10);
+    let required = Serial::from(20);
+    let newer = Serial::from(21);
+
+    assert!(!configure_sequence_is_acked(None, Some(old)));
+    assert!(!configure_sequence_is_acked(Some(required), Some(old)));
+    assert!(configure_sequence_is_acked(Some(required), Some(required)));
+    assert!(configure_sequence_is_acked(Some(required), Some(newer)));
+}
+
+#[test]
+fn popup_reposition_waits_for_its_own_acknowledged_serial() {
+    let initial = Serial::from(10);
+    let reposition = Serial::from(20);
+    assert!(!configure_sequence_is_acked(
+        Some(reposition),
+        Some(initial)
+    ));
+    assert!(configure_sequence_is_acked(
+        Some(reposition),
+        Some(reposition)
+    ));
+}
+
+#[test]
+fn descendant_visibility_requires_own_content_and_a_visible_committed_parent() {
+    assert!(effectively_visible(true, true, true));
+    assert!(!effectively_visible(false, true, true));
+    assert!(!effectively_visible(true, false, true));
+    assert!(!effectively_visible(true, true, false));
+}
+
+#[test]
+fn xdg_toplevel_constraints_reject_negative_and_contradictory_sizes() {
+    assert!(validate_toplevel_constraints(((0, 0), (0, 0))).is_ok());
+    assert!(validate_toplevel_constraints(((-1, 0), (0, 0))).is_err());
+    assert!(validate_toplevel_constraints(((0, 0), (-1, 100))).is_err());
+    assert!(validate_toplevel_constraints(((1000, 10), (500, 0))).is_err());
+    assert!(validate_toplevel_constraints(((10, 1000), (0, 500))).is_err());
+
+    assert_eq!(
+        clamped_toplevel_constraints(((i32::MAX, 0), (0, i32::MAX))),
+        (
+            (MAX_SURFACE_DIMENSION as i32, 1),
+            (MAX_SURFACE_DIMENSION as i32, MAX_SURFACE_DIMENSION as i32)
+        )
+    );
+
+    let pending = ((1000, 1000), (0, 0));
+    let contradiction = constraints_after_toplevel_request(
+        pending,
+        &xdg_toplevel::Request::SetMaxSize {
+            width: 500,
+            height: 500,
+        },
+    )
+    .expect("size request");
+    assert!(validate_toplevel_constraints(contradiction).is_err());
+
+    let pending = ((0, 0), (500, 500));
+    let contradiction = constraints_after_toplevel_request(
+        pending,
+        &xdg_toplevel::Request::SetMinSize {
+            width: 1000,
+            height: 1000,
+        },
+    )
+    .expect("size request");
+    assert!(validate_toplevel_constraints(contradiction).is_err());
+}
+
+#[test]
+fn live_surface_and_subsurface_limits_are_hard_boundaries() {
+    assert!(!surface_budget_exhausted(
+        MAX_CLIENT_SURFACES - 1,
+        MAX_GLOBAL_SURFACES - 1,
+    ));
+    assert!(surface_budget_exhausted(
+        MAX_CLIENT_SURFACES,
+        MAX_GLOBAL_SURFACES - 1,
+    ));
+    assert!(surface_budget_exhausted(0, MAX_GLOBAL_SURFACES));
+    assert_eq!(
+        proposed_subsurface_depth(MAX_SUBSURFACE_DEPTH - 1, 0),
+        Some(MAX_SUBSURFACE_DEPTH),
+    );
+    assert_eq!(
+        proposed_subsurface_depth(MAX_SUBSURFACE_DEPTH - 1, 1),
+        Some(MAX_SUBSURFACE_DEPTH + 1),
+    );
+    assert_eq!(proposed_subsurface_depth(usize::MAX, 0), None);
+}
+
+#[test]
+fn outbox_byte_accounting_replaces_in_place_and_rejects_growth() {
+    assert_eq!(bounded_replacement_bytes(90, 40, 30, 100), Some(80));
+    assert_eq!(bounded_replacement_bytes(90, 10, 30, 100), None);
+    assert_eq!(bounded_replacement_bytes(usize::MAX, 0, 1, 100), None);
+}
+
+fn synthetic_dmabuf_event(id: u64, token: u64, use_id: Option<DmabufUseId>) -> ProtocolEvent {
+    let fd = std::fs::File::open("/dev/null")
+        .expect("/dev/null is available")
+        .into();
+    ProtocolEvent::SurfaceUpserted {
+        id: SurfaceId(id),
+        scene: scene(SurfaceLayout {
+            x: 0.0,
+            y: 0.0,
+            width: 64.0,
+            height: 32.0,
+            z: 1.0,
+            source: None,
+            parent: None,
+            transform: SurfaceTransform::Normal,
+            visible: true,
+            toplevel: None,
+        }),
+        frame: SurfaceFrame::Dmabuf(DmabufFrame {
+            buffer_id: DmabufBufferId(id),
+            cacheable: true,
+            token,
+            descriptor: DmabufDescriptor {
+                width: 64,
+                height: 32,
+                fourcc: 0,
+                modifier: 0,
+                planes: vec![DmabufPlane {
+                    fd,
+                    offset: 0,
+                    stride: 256,
+                }],
+            },
+            use_id,
+        }),
+    }
+}
+
+fn synthetic_cursor_dmabuf_event(id: ObjectId, token: u64) -> ProtocolEvent {
+    let ProtocolEvent::SurfaceUpserted {
+        frame: SurfaceFrame::Dmabuf(frame),
+        ..
+    } = synthetic_dmabuf_event(1, token, Some(DmabufUseId::for_test(token)))
+    else {
+        unreachable!("synthetic DMA-BUF helper always returns an upsert")
+    };
+    ProtocolEvent::CursorUpdated {
+        image: CursorImage::Surface {
+            id,
+            hotspot: (3, 4),
+            presentation: CursorPresentation {
+                width: 64.0,
+                height: 32.0,
+                source: None,
+                transform: SurfaceTransform::Normal,
+            },
+            frame: Some(SurfaceFrame::Dmabuf(frame)),
+        },
+    }
+}
+
+#[test]
+fn cursor_outbox_is_a_singleton_and_returns_replaced_or_rejected_dmabuf_owners() {
+    let harness = KeybindingHarness::new(true);
+    let object = harness
+        .server
+        .state
+        .surfaces
+        .keys()
+        .next()
+        .expect("harness has a real surface object")
+        .clone();
+    let first = synthetic_cursor_dmabuf_event(object.clone(), 801);
+    let limit = protocol_event_retained_bytes(&first);
+    let mut pending = PendingProtocolEvents::default();
+    pending
+        .push_with_limit(first, limit)
+        .expect("first cursor DMA-BUF fits");
+
+    let replacement = pending
+        .push_with_limit(synthetic_cursor_dmabuf_event(object.clone(), 802), limit)
+        .expect("cursor singleton replaces in place");
+    assert_eq!(replacement.retired_tokens, [801]);
+    assert!(replacement.evicted_surfaces.is_empty());
+    assert_eq!(
+        pending
+            .cursor
+            .as_ref()
+            .and_then(protocol_event_dmabuf_token),
+        Some(802)
+    );
+
+    let Err(rejected) = PendingProtocolEvents::default()
+        .push_with_limit(synthetic_cursor_dmabuf_event(object, 803), limit - 1)
+    else {
+        panic!("oversized cursor DMA-BUF must be returned to its owner")
+    };
+    assert_eq!(protocol_event_dmabuf_token(&rejected), Some(803));
+}
+
+#[test]
+fn cursor_outbox_retains_the_newest_chrome_override() {
+    let mut pending = PendingProtocolEvents::default();
+    pending
+        .push(ProtocolEvent::CursorUpdated {
+            image: CursorImage::Chrome(ChromeCursorIcon::Move),
+        })
+        .expect("move cursor fits the bounded outbox");
+    pending
+        .push(ProtocolEvent::CursorUpdated {
+            image: CursorImage::Chrome(ChromeCursorIcon::SeResize),
+        })
+        .expect("resize cursor replaces the singleton");
+
+    assert!(matches!(
+        pending.cursor,
+        Some(ProtocolEvent::CursorUpdated {
+            image: CursorImage::Chrome(ChromeCursorIcon::SeResize)
+        })
+    ));
+}
+
+#[test]
+fn rejected_cursor_update_recovers_from_the_latest_selection() {
+    let mut harness = KeybindingHarness::new(true);
+    harness.server.state.events.clear();
+    harness.server.state.cursor_selection = CursorSelection::Default;
+    harness.server.queue_renderer_event_with_test_limit(
+        ProtocolEvent::CursorUpdated {
+            image: CursorImage::Hidden,
+        },
+        0,
+    );
+    assert!(harness.server.dirty_cursor);
+
+    harness
+        .server
+        .publish_events()
+        .expect("dirty cursor recovery publishes");
+    assert!(!harness.server.dirty_cursor);
+    let events = harness
+        .renderer_events
+        .try_recv()
+        .expect("recovered cursor reaches renderer");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ProtocolEvent::CursorUpdated {
+            image: CursorImage::Default
+        }
+    )));
+}
+
+#[test]
+fn chrome_cursor_override_leaves_the_client_selection_untouched() {
+    let mut harness = KeybindingHarness::new(true);
+    harness.server.state.cursor_selection = CursorSelection::Hidden;
+    harness.server.state.chrome_cursor_override = Some(ChromeCursorIcon::NeResize);
+    assert!(matches!(
+        harness.server.state.latest_cursor_update(),
+        Some(ProtocolEvent::CursorUpdated {
+            image: CursorImage::Chrome(ChromeCursorIcon::NeResize)
+        })
+    ));
+    assert_eq!(
+        harness.server.state.cursor_selection,
+        CursorSelection::Hidden
+    );
+    harness
+        .server
+        .state
+        .set_cursor_image(CursorImageStatus::Named(
+            smithay::input::pointer::CursorIcon::Default,
+        ));
+    assert_eq!(
+        harness.server.state.cursor_selection,
+        CursorSelection::Hidden,
+        "Smithay's focus-leave default cannot overwrite the saved client selection"
+    );
+
+    harness.server.state.chrome_cursor_override = None;
+    assert!(matches!(
+        harness.server.state.latest_cursor_update(),
+        Some(ProtocolEvent::CursorUpdated {
+            image: CursorImage::Hidden
+        })
+    ));
+}
+
+#[test]
+fn oversized_dmabuf_event_is_returned_with_its_renderer_token() {
+    for use_id in [None, Some(DmabufUseId::for_test(71))] {
+        let event = synthetic_dmabuf_event(1, 91, use_id);
+        let retained_bytes = protocol_event_retained_bytes(&event);
+        let mut pending = PendingProtocolEvents::default();
+
+        let Err(rejected) = pending.push_with_limit(event, retained_bytes - 1) else {
+            panic!("oversized DMA-BUF event must be returned to its caller");
+        };
+
+        assert_eq!(protocol_event_dmabuf_token(&rejected), Some(91));
+        assert!(pending.is_empty());
+    }
+}
+
+#[test]
+fn full_renderer_channel_returns_the_whole_dmabuf_batch_for_retention() {
+    for use_id in [None, Some(DmabufUseId::for_test(72))] {
+        let mut harness = KeybindingHarness::new(true);
+        for marker in ["first", "second"] {
+            harness
+                .server
+                .event_sender
+                .try_send(vec![ProtocolEvent::RuntimeFailed(marker.into())])
+                .expect("fill the bounded renderer channel");
+        }
+        harness
+            .server
+            .state
+            .events
+            .push(synthetic_dmabuf_event(1, 92, use_id));
+
+        harness
+            .server
+            .publish_events()
+            .expect("a full renderer channel is non-fatal");
+
+        let restored = harness.server.pending_events.take();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(protocol_event_dmabuf_token(&restored[0]), Some(92));
+        let ProtocolEvent::SurfaceUpserted {
+            frame: SurfaceFrame::Dmabuf(frame),
+            ..
+        } = &restored[0]
+        else {
+            panic!("restored event stays DMA-BUF");
+        };
+        assert_eq!(frame.use_id, use_id);
+    }
+}
+
+#[test]
+fn outbox_eviction_reports_only_the_displaced_dmabuf_renderer_token() {
+    for use_id in [None, Some(DmabufUseId::for_test(73))] {
+        let first = synthetic_dmabuf_event(1, 93, use_id);
+        let limit = protocol_event_retained_bytes(&first);
+        let mut pending = PendingProtocolEvents::default();
+        pending
+            .push_with_limit(first, limit)
+            .expect("first DMA-BUF fills the synthetic outbox");
+
+        let result = pending
+            .push_with_limit(synthetic_dmabuf_event(2, 94, use_id), limit)
+            .expect("second DMA-BUF evicts the first");
+
+        assert_eq!(result.retired_tokens, [93]);
+        assert_eq!(result.evicted_surfaces, [SurfaceId(1)]);
+        let queued = pending.take();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(protocol_event_dmabuf_token(&queued[0]), Some(94));
+    }
+}
+
+#[test]
+fn renderer_pressure_evicts_stale_frames_without_rejecting_lifecycle() {
+    let layout = SurfaceLayout {
+        x: 0.0,
+        y: 0.0,
+        width: 16.0,
+        height: 1.0,
+        z: 1.0,
+        source: None,
+        parent: None,
+        transform: SurfaceTransform::Normal,
+        visible: true,
+        toplevel: None,
+    };
+    let mut pending = PendingProtocolEvents::default();
+    let frame_bytes = 64;
+    pending
+        .push_with_limit(
+            ProtocolEvent::SurfaceUpserted {
+                id: SurfaceId(1),
+                scene: scene(layout),
+                frame: SurfaceFrame::Shm(ShmFrame {
+                    width: 16,
+                    height: 1,
+                    opaque: true,
+                    rgba: Arc::new(vec![0; frame_bytes]),
+                }),
+            },
+            frame_bytes + mem::size_of::<ProtocolEvent>() - 1,
+        )
+        .expect("first frame fits");
+    pending
+        .push_with_limit(
+            ProtocolEvent::SurfaceDestroyed { id: SurfaceId(2) },
+            frame_bytes + mem::size_of::<ProtocolEvent>() - 1,
+        )
+        .expect("lifecycle update evicts a stale render frame");
+
+    assert!(matches!(
+        pending.take().as_slice(),
+        [ProtocolEvent::SurfaceDestroyed { id: SurfaceId(2) }]
+    ));
+}
+
+#[test]
+fn evicted_renderer_state_is_replayed_after_the_outbox_drains() {
+    let layout = SurfaceLayout {
+        x: 0.0,
+        y: 0.0,
+        width: 16.0,
+        height: 1.0,
+        z: 1.0,
+        source: None,
+        parent: None,
+        transform: SurfaceTransform::Normal,
+        visible: true,
+        toplevel: None,
+    };
+    let upsert = |id, byte| ProtocolEvent::SurfaceUpserted {
+        id: SurfaceId(id),
+        scene: scene(layout),
+        frame: SurfaceFrame::Shm(ShmFrame {
+            width: 16,
+            height: 1,
+            opaque: true,
+            rgba: Arc::new(vec![byte; 64]),
+        }),
+    };
+    let mut pending = PendingProtocolEvents::default();
+    pending
+        .push_with_limit(upsert(1, 1), 64)
+        .expect("first surface fills the outbox");
+    let result = pending
+        .push_with_limit(upsert(2, 2), 64)
+        .expect("second surface evicts the first");
+    assert_eq!(result.evicted_surfaces, vec![SurfaceId(1)]);
+    assert!(matches!(
+        pending.take().as_slice(),
+        [ProtocolEvent::SurfaceUpserted {
+            id: SurfaceId(2),
+            ..
+        }]
+    ));
+
+    pending
+        .push_with_limit(upsert(1, 9), 64)
+        .expect("authoritative state is replayed after capacity returns");
+    let replayed = pending.take();
+    let [
+        ProtocolEvent::SurfaceUpserted {
+            id: SurfaceId(1),
+            frame: SurfaceFrame::Shm(frame),
+            ..
+        },
+    ] = replayed.as_slice()
+    else {
+        panic!("evicted surface was not replayed");
+    };
+    assert_eq!(frame.rgba.as_slice(), &[9; 64]);
+}
+
+#[test]
+fn dirty_recovery_rotates_past_a_permanent_retry_prefix() {
+    let ready = SurfaceId(DIRTY_SURFACE_RECOVERY_BATCH as u64 + 1);
+    let mut dirty_surfaces = DirtySurfaces::default();
+    dirty_surfaces.extend((1..=ready.0).map(SurfaceId));
+    let mut replayed_on_iteration = None;
+
+    for iteration in 1..=2 {
+        let batch = dirty_surfaces.take_recovery_batch();
+        assert!(batch.len() <= DIRTY_SURFACE_RECOVERY_BATCH);
+        for id in batch {
+            if id == ready {
+                replayed_on_iteration = Some(iteration);
+                dirty_surfaces.remove(&id);
+            } else {
+                assert!(
+                    id.0 <= DIRTY_SURFACE_RECOVERY_BATCH as u64,
+                    "only the low-ID prefix is held in permanent Retry"
+                );
+            }
+        }
+    }
+
+    assert_eq!(replayed_on_iteration, Some(2));
+    assert!(
+        (1..=DIRTY_SURFACE_RECOVERY_BATCH as u64)
+            .map(SurfaceId)
+            .all(|id| dirty_surfaces.contains(&id)),
+        "permanent Retry surfaces remain dirty"
+    );
+}
+
+/// Every surface waiting gets its turn, at the same rate, even when none of
+/// them can be served.
+///
+/// A batch is a fixed slice of a worklist with no such bound, so "was it
+/// attempted" is the only fairness question worth asking, and permanent
+/// `Retry` is the case that asks it most sharply: nothing leaves the worklist,
+/// so the only thing that can move a surface up is the order itself.
+#[test]
+fn every_waiting_surface_is_attempted_once_before_any_is_attempted_twice() {
+    let waiting = DIRTY_SURFACE_RECOVERY_BATCH * 4;
+    let mut dirty_surfaces = DirtySurfaces::default();
+    dirty_surfaces.extend((1..=waiting as u64).map(SurfaceId));
+
+    let mut attempts = HashMap::new();
+    for _ in 0..4 {
+        let batch = dirty_surfaces.take_recovery_batch();
+        assert_eq!(
+            batch.len(),
+            DIRTY_SURFACE_RECOVERY_BATCH,
+            "a full worklist fills the batch"
+        );
+        for id in batch {
+            *attempts.entry(id).or_insert(0usize) += 1;
+        }
+    }
+
+    let unattempted = (1..=waiting as u64)
+        .map(SurfaceId)
+        .filter(|id| !attempts.contains_key(id))
+        .collect::<Vec<_>>();
+    assert!(
+        unattempted.is_empty(),
+        "four batches over four batches' worth of surfaces must reach all of \
+         them; these waited the whole time: {unattempted:?}"
+    );
+    assert!(
+        attempts.values().all(|count| *count == 1),
+        "and none of them twice: {attempts:?}"
+    );
+}
+
+/// Re-marking a surface that is already waiting must not move it.
+///
+/// The mark at the eviction site names whichever surfaces the outbox had to
+/// drop, which is decided by *other* clients' traffic. If a re-mark reset the
+/// wait, a busy client could hold a quiet client's surface at the tail of the
+/// worklist indefinitely without ever naming it — the starvation this ordering
+/// exists to stop, arriving by the one route the ordering does not control.
+#[test]
+fn re_marking_a_waiting_surface_does_not_send_it_back_to_the_tail() {
+    let victim = SurfaceId(1);
+    let mut dirty_surfaces = DirtySurfaces::default();
+    dirty_surfaces.insert(victim);
+    let mut place = dirty_surfaces
+        .ticket_of(&victim)
+        .expect("the victim is waiting");
+
+    let mut attempted_on = Vec::new();
+    let mut deepest_worklist = 0usize;
+    let mut next_churn = 1_000u64;
+    for round in 1..=64usize {
+        // The shape the outbox-eviction and roster-resurrection marks make: a
+        // fresh batch of surfaces every dispatch, and the victim named again
+        // each time. The victim is held in permanent `Retry`, so nothing but
+        // the ordering ever moves it.
+        dirty_surfaces.extend((next_churn..next_churn + 16).map(SurfaceId));
+        next_churn += 16;
+        dirty_surfaces.insert(victim);
+        assert_eq!(
+            dirty_surfaces.ticket_of(&victim),
+            Some(place),
+            "re-marking left the victim where it was in round {round}"
+        );
+
+        let batch = dirty_surfaces.take_recovery_batch();
+        if batch.contains(&victim) {
+            attempted_on.push(round);
+            // Being *attempted* is the one thing that may move it, and does.
+            place = dirty_surfaces
+                .ticket_of(&victim)
+                .expect("an attempt does not clear a retrying surface");
+        }
+        for id in batch {
+            if id != victim {
+                dirty_surfaces.remove(&id);
+            }
+        }
+        deepest_worklist = deepest_worklist.max(dirty_surfaces.len());
+    }
+
+    // The victim never leaves the worklist, so the backlog grows by the one
+    // surface each round that recovery could not also fit — and the victim's
+    // share of the batch falls as it does. Fairness is therefore a bound on
+    // the wait, not a turn every round: with `worklist` surfaces waiting and
+    // `BATCH` served per round, nobody waits longer than it takes to serve
+    // everyone ahead of them.
+    let longest_wait = attempted_on
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .chain(attempted_on.first().copied())
+        .max()
+        .expect("the victim is attempted at all");
+    assert!(
+        longest_wait <= deepest_worklist.div_ceil(DIRTY_SURFACE_RECOVERY_BATCH) + 1,
+        "the victim went {longest_wait} rounds unattempted with at most \
+         {deepest_worklist} surfaces waiting; ordering by surface id instead \
+         left it unattempted for every round after the first"
+    );
+    assert!(
+        attempted_on.last().is_some_and(|round| *round > 60),
+        "and it is still being served at the end of the run, not merely at \
+         the start: {attempted_on:?}"
+    );
+}
+
+/// Ticket exhaustion renumbers the worklist instead of collapsing it.
+#[test]
+fn exhausting_the_ticket_range_rebases_the_worklist_in_place() {
+    let mut dirty_surfaces = DirtySurfaces::default();
+    let ordered = [SurfaceId(70), SurfaceId(40), SurfaceId(90)];
+    dirty_surfaces.extend(ordered);
+    dirty_surfaces.exhaust_tickets_for_test();
+
+    let latecomer = SurfaceId(10);
+    dirty_surfaces.insert(latecomer);
+
+    let batch = dirty_surfaces.take_recovery_batch();
+    assert_eq!(
+        batch,
+        [ordered[0], ordered[1], ordered[2], latecomer],
+        "the rebase kept the waiting order and put the new arrival last — \
+         saturating instead would tie every later ticket and hand the order \
+         back to surface id, which is what starves"
+    );
+    assert!(
+        dirty_surfaces
+            .ticket_of(&latecomer)
+            .is_some_and(|ticket| ticket < DirtyTicket::MAX),
+        "and allocation has room to keep going"
+    );
+}
+
+/// The defect this ordering replaced, driven through `publish_events` rather
+/// than through the worklist directly.
+///
+/// Surface ids are minted from a counter that never recycles, so a client that
+/// keeps creating surfaces keeps producing recovery marks above every mark
+/// already waiting. Selecting by id served exactly those and never came back:
+/// a surface re-marked once — an outbox eviction is enough, and a client
+/// cannot tell it happened — stayed dirty for the life of the compositor while
+/// the renderer showed its stale content.
+#[test]
+fn a_surface_re_marked_under_churn_is_recovered_rather_than_starved() {
+    let mut harness = KeybindingHarness::new(true);
+    harness.server.dirty_surfaces.clear();
+
+    let victim = SurfaceId(1);
+    let mut next_churn = 1_000u64;
+    let mut recovered_on_dispatch = None;
+    let mut deepest_worklist = 0usize;
+
+    for dispatch in 1..=32u64 {
+        if dispatch == 5 {
+            // Re-marked mid-flight, the way an evicted surface is: by then the
+            // churn has already carried an id-ordered cursor far past it.
+            harness.server.dirty_surfaces.insert(victim);
+        }
+        // Ascending, like the id counter these stand in for.
+        harness
+            .server
+            .state
+            .pending_full_upserts
+            .extend((next_churn..next_churn + 16).map(SurfaceId));
+        next_churn += 16;
+
+        harness
+            .server
+            .publish_events()
+            .expect("recovering surfaces the compositor no longer holds is fine");
+
+        deepest_worklist = deepest_worklist.max(harness.server.dirty_surfaces.len());
+        if dispatch >= 5
+            && recovered_on_dispatch.is_none()
+            && !harness.server.dirty_surfaces.contains(&victim)
+        {
+            recovered_on_dispatch = Some(dispatch);
+        }
+    }
+
+    // None of these surfaces has a live record, so every attempt answers
+    // `Gone` and clears the mark — a mark that is still set is one that was
+    // never reached.
+    assert_eq!(
+        recovered_on_dispatch,
+        Some(5),
+        "the re-marked surface had waited longer than that dispatch's churn, \
+         so it is attempted in the same dispatch it was marked"
+    );
+    // One dispatch marked seventeen surfaces and recovery attempts sixteen, so
+    // from then on a single surface is carried forward. That it is *one*, and
+    // not one more per dispatch, is the whole claim: work arriving faster than
+    // recovery drains it queues, it does not strand anyone.
+    assert!(
+        deepest_worklist <= DIRTY_SURFACE_RECOVERY_BATCH + 1,
+        "the worklist stayed bounded under churn, reaching {deepest_worklist}"
+    );
+    // And *which* surface is carried forward is the part worth naming. It is
+    // one of the final dispatch's arrivals — the marks drain from a `HashSet`,
+    // so which one of the sixteen is not determined, but that it came from the
+    // newest batch is. A count alone would read exactly the same if the victim
+    // were the one left behind, which is the outcome under test.
+    let carried = (0..next_churn)
+        .map(SurfaceId)
+        .filter(|id| harness.server.dirty_surfaces.contains(id))
+        .collect::<Vec<_>>();
+    let newest_arrivals = (next_churn - 16..next_churn)
+        .map(SurfaceId)
+        .collect::<Vec<_>>();
+    assert_eq!(carried.len(), 1, "carried forward: {carried:?}");
+    assert!(
+        newest_arrivals.contains(&carried[0]),
+        "the surface left waiting came from the last dispatch's churn, not \
+         from anything that had been waiting longer: {carried:?}"
+    );
+    assert_ne!(
+        carried[0], victim,
+        "and it is certainly not the victim, which is the whole point"
+    );
+}
+
+/// The same starvation, with a victim that has real content to recover — so
+/// "recovered" means the renderer was actually sent the surface's state, not
+/// merely that the worklist stopped naming it.
+#[test]
+fn a_live_surface_re_marked_under_churn_has_its_content_replayed() {
+    let mut harness = KeybindingHarness::new(true);
+    let surface = harness.subsurface();
+
+    // Two content generations, deliberately different extents. With one
+    // generation a stale replay and a current replay carry the same bytes, so
+    // the oracle could not tell them apart; the recovered frame must describe
+    // the *second*.
+    let stale_buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    harness.commit_dmabuf(stale_buffer);
+    let (victim, stale_frame) = take_dmabuf_upsert(&mut harness.server.state);
+    let (stale_backing, _, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+
+    let current_buffer = harness.create_dmabuf_buffer_sized(32, 16);
+    harness.commit_dmabuf(current_buffer);
+    let (recommitted, current_frame) = take_dmabuf_upsert(&mut harness.server.state);
+    assert_eq!(
+        recommitted, victim,
+        "both generations belong to the same surface"
+    );
+    assert_ne!(
+        (stale_frame.descriptor.width, stale_frame.descriptor.height),
+        (
+            current_frame.descriptor.width,
+            current_frame.descriptor.height
+        ),
+        "the two generations must be distinguishable, or this test proves nothing"
+    );
+    let (backing_token, _, _) = committed_dmabuf_backing(&harness.server.state, &surface);
+    assert_ne!(
+        backing_token, stale_backing,
+        "the second commit replaced the surface's backing rather than reusing it"
+    );
+
+    let layout = harness.server.state.surfaces[&surface.id()].layout;
+    drop(harness.server.pending_events.take());
+    harness.server.dirty_surfaces.clear();
+
+    let mut next_churn = 1_000u64;
+    let mut replayed = None;
+    let mut spent_tokens = vec![stale_frame.token, current_frame.token];
+
+    for dispatch in 1..=12u64 {
+        if dispatch == 5 {
+            // What an outbox eviction leaves behind for a surface the client
+            // has no reason to redraw.
+            harness.server.dirty_surfaces.insert(victim);
+        }
+        harness
+            .server
+            .state
+            .pending_full_upserts
+            .extend((next_churn..next_churn + 16).map(SurfaceId));
+        next_churn += 16;
+
+        harness
+            .server
+            .publish_events()
+            .expect("recovery publishes to the renderer");
+
+        while let Ok(batch) = harness.renderer_events.try_recv() {
+            for event in batch {
+                let ProtocolEvent::SurfaceUpserted {
+                    id,
+                    scene: replayed_scene,
+                    frame: SurfaceFrame::Dmabuf(frame),
+                } = event
+                else {
+                    continue;
+                };
+                spent_tokens.push(frame.token);
+                assert_eq!(id, victim, "only the victim has content to replay");
+                assert!(
+                    replayed
+                        .replace((dispatch, replayed_scene.layout, frame))
+                        .is_none(),
+                    "and it is replayed once, not once per dispatch"
+                );
+            }
+        }
+    }
+
+    let (dispatch, replayed_layout, frame) =
+        replayed.expect("the re-marked surface reached the renderer");
+    assert_eq!(
+        dispatch, 5,
+        "it had waited longer than that dispatch's churn, so it goes first"
+    );
+    assert_layout_unchanged(&replayed_layout, &layout, "replayed layout");
+    // The replay re-imports the same backing, so it mints a *new* renderer
+    // token — everything describing the content must still match the commit.
+    assert_ne!(
+        frame.token, current_frame.token,
+        "the replay is a fresh renderer retention, not the original event"
+    );
+    assert_eq!(
+        (frame.descriptor.width, frame.descriptor.height),
+        (
+            current_frame.descriptor.width,
+            current_frame.descriptor.height
+        ),
+        "replayed frame: extent — the current generation, not the stale one"
+    );
+    assert_ne!(
+        (frame.descriptor.width, frame.descriptor.height),
+        (stale_frame.descriptor.width, stale_frame.descriptor.height),
+        "a replay of the superseded generation is the failure this pair catches"
+    );
+    assert_eq!(
+        (frame.descriptor.fourcc, frame.descriptor.modifier),
+        (
+            current_frame.descriptor.fourcc,
+            current_frame.descriptor.modifier
+        ),
+        "replayed frame: format"
+    );
+    assert_eq!(
+        frame
+            .descriptor
+            .planes
+            .iter()
+            .map(|plane| (plane.offset, plane.stride))
+            .collect::<Vec<_>>(),
+        current_frame
+            .descriptor
+            .planes
+            .iter()
+            .map(|plane| (plane.offset, plane.stride))
+            .collect::<Vec<_>>(),
+        "replayed frame: plane geometry"
+    );
+    assert!(
+        !harness.server.dirty_surfaces.contains(&victim),
+        "a surface whose content the renderer now has is no longer dirty"
+    );
+
+    harness.server.state.release_buffer_token(backing_token);
+    for token in spent_tokens {
+        harness.server.state.release_buffer_token(token);
+    }
+}
+
+#[test]
+fn synchronized_damage_saturates_across_commits_until_application() {
+    assert_eq!(damage_cap_action(0, 0), DamageCapAction::Accept);
+    let mut cached_requests = 0;
+    for _commit in 0..4 {
+        for _request in 0..64 {
+            assert_eq!(
+                damage_cap_action(cached_requests, 1),
+                DamageCapAction::Accept
+            );
+            cached_requests += 1;
+        }
+    }
+    assert_eq!(cached_requests, MAX_DAMAGE_RECTS);
+    assert_eq!(
+        damage_cap_action(cached_requests, 1),
+        DamageCapAction::Saturate
+    );
+    cached_requests += 1;
+    assert_eq!(damage_cap_action(cached_requests, 1), DamageCapAction::Drop);
+    assert_eq!(
+        damage_cap_action(usize::MAX, usize::MAX),
+        DamageCapAction::Drop
+    );
+}
+
+#[test]
+fn roleless_commits_do_not_accumulate_retained_damage() {
+    let mut harness = KeybindingHarness::new(false);
+    let surface_id = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface_id]),
+    );
+    harness.dispatch_client();
+
+    let client = harness
+        .subsurface()
+        .client()
+        .expect("the in-process client remains live");
+    let surface = client
+        .object_from_protocol_id::<WlSurface>(&harness.server.state.display_handle, surface_id)
+        .expect("roleless wl_surface exists");
+
+    for cycle in 0..32 {
+        for request in 0..=MAX_DAMAGE_RECTS {
+            send_request(
+                &mut harness.client,
+                surface_id,
+                9,
+                &words(&[request as u32, cycle, 1, 1]),
+            );
+        }
+        send_request(&mut harness.client, surface_id, 6, &[]);
+        harness.dispatch_client();
+    }
+
+    compositor::with_states(&surface, |states| {
+        let retained = states
+            .cached_state
+            .get::<SurfaceAttributes>()
+            .current()
+            .damage
+            .len();
+        assert_eq!(
+            retained, 0,
+            "damage without a role has no consumer and must not survive its commit"
+        );
+    });
+}
+
+#[test]
+fn first_frame_probe_samples_at_most_4096_pixels() {
+    assert_eq!(diagnostic_sample_stride(0), 1);
+    assert_eq!(diagnostic_sample_stride(4096), 1);
+    assert_eq!(diagnostic_sample_stride(16_777_216), 4096);
+}
+
+#[test]
+fn rejected_attachment_does_not_release_sampled_shared_buffer() {
+    let mut retained = RetentionTable::<u32, &'static str>::default();
+    retained.retain(10, 7, "sampled buffer");
+    retained.retain(11, 7, "rejected attachment");
+
+    assert_eq!(retained.release(11), None);
+    assert_eq!(retained.release(10), Some("sampled buffer"));
+    assert_eq!(retained.release(11), None);
+}
+
+#[test]
+fn dmabuf_metadata_accepts_advertised_xrgb_and_rejects_bad_stride() {
+    use smithay::backend::allocator::{
+        Fourcc, Modifier,
+        dmabuf::{Dmabuf, DmabufFlags},
+    };
+
+    fn buffer(fourcc: Fourcc, stride: u32) -> Dmabuf {
+        let fd = std::fs::File::open("/dev/null")
+            .expect("/dev/null is available")
+            .into();
+        let mut builder = Dmabuf::builder((64, 32), fourcc, Modifier::Linear, DmabufFlags::empty());
+        assert!(builder.add_plane(fd, 0, 0, stride));
+        builder.build().expect("one-plane DMA-BUF")
+    }
+
+    let supported = [
+        Format {
+            code: Fourcc::Argb8888,
+            modifier: Modifier::Linear,
+        },
+        Format {
+            code: Fourcc::Xrgb8888,
+            modifier: Modifier::Linear,
+        },
+    ];
+    assert!(
+        validate_dmabuf_metadata(&buffer(Fourcc::Argb8888, 256), &supported, (960, 640)).is_ok()
+    );
+    assert!(
+        validate_dmabuf_metadata(&buffer(Fourcc::Argb8888, 4), &supported, (960, 640)).is_err()
+    );
+    assert!(
+        validate_dmabuf_metadata(&buffer(Fourcc::Xrgb8888, 256), &supported, (960, 640)).is_ok()
+    );
+    assert!(
+        validate_dmabuf_metadata(&buffer(Fourcc::Abgr8888, 256), &supported, (960, 640)).is_err()
+    );
+}
+
+#[test]
+fn vulkan_validation_guard_rejects_the_protocol_thread() {
+    let worker = thread::Builder::new()
+        .name("cosmix-dmabuf-validate-test".into())
+        .spawn(assert_dmabuf_validation_off_protocol_thread)
+        .expect("test validation worker starts");
+    assert!(worker.join().is_ok());
+
+    let protocol = thread::Builder::new()
+        .name("cosmix-wayland".into())
+        .spawn(assert_dmabuf_validation_off_protocol_thread)
+        .expect("test protocol thread starts");
+    assert!(protocol.join().is_err());
+}
+
+#[test]
+fn sensible_size_fits_inside_nested_output() {
+    assert_eq!(
+        sensible_toplevel_size((1920, 1080), 36.0, 36.0),
+        (1382, 777)
+    );
+    assert_eq!(sensible_toplevel_size((960, 640), 36.0, 36.0), (691, 460));
+    // Small outputs fall back to the fixed floor, then clamp to the output.
+    assert_eq!(sensible_toplevel_size((320, 240), 36.0, 36.0), (260, 180));
+}
+
+#[test]
+fn blocked_renderer_outbox_keeps_only_latest_surface_state() {
+    let id = SurfaceId(7);
+    let first_layout = SurfaceLayout {
+        x: 10.0,
+        y: 20.0,
+        width: 2.0,
+        height: 1.0,
+        z: 1.0,
+        source: None,
+        parent: None,
+        transform: SurfaceTransform::Normal,
+        visible: true,
+        toplevel: None,
+    };
+    let latest_layout = SurfaceLayout {
+        x: 40.0,
+        z: 2.0,
+        ..first_layout
+    };
+    let mut pending = PendingProtocolEvents::default();
+
+    pending
+        .push(ProtocolEvent::SurfaceUpserted {
+            id,
+            scene: scene(first_layout),
+            frame: SurfaceFrame::Shm(ShmFrame {
+                width: 2,
+                height: 1,
+                opaque: true,
+                rgba: Arc::new(vec![1; 8]),
+            }),
+        })
+        .expect("first event fits");
+    pending
+        .push(ProtocolEvent::SurfaceRelayout {
+            id,
+            scene: scene(latest_layout),
+        })
+        .expect("relayout fits");
+    pending
+        .push(ProtocolEvent::SurfaceUpserted {
+            id,
+            scene: scene(latest_layout),
+            frame: SurfaceFrame::Shm(ShmFrame {
+                width: 2,
+                height: 1,
+                opaque: true,
+                rgba: Arc::new(vec![2; 8]),
+            }),
+        })
+        .expect("replacement fits");
+
+    let events = pending.take();
+    assert_eq!(events.len(), 1);
+    let ProtocolEvent::SurfaceUpserted { scene, frame, .. } = &events[0] else {
+        panic!("latest surface state should be an upsert");
+    };
+    assert_eq!(scene.layout.x, 40.0);
+    let SurfaceFrame::Shm(frame) = frame else {
+        panic!("latest surface state should retain SHM content");
+    };
+    assert_eq!(frame.rgba.as_slice(), &[2; 8]);
+
+    pending
+        .push(ProtocolEvent::SurfaceDestroyed { id })
+        .expect("destroy fits");
+    let events = pending.take();
+    assert!(matches!(
+        events.as_slice(),
+        [ProtocolEvent::SurfaceDestroyed { id: SurfaceId(7) }]
+    ));
+}
+
+#[test]
+fn pending_title_relayout_folds_into_queued_upsert() {
+    let id = SurfaceId(70);
+    let first_snapshot = ToplevelSceneState {
+        decoration: SceneDecorationMode::ClientSide,
+        focused: false,
+        committed_maximized: false,
+        chrome_pointer: ChromePointerSceneState::default(),
+        window_geometry: SceneWindowGeometry {
+            x: 3.0,
+            y: 4.0,
+            width: 600.0,
+            height: 400.0,
+        },
+    };
+    let newest_snapshot = ToplevelSceneState {
+        decoration: SceneDecorationMode::ServerSide,
+        focused: true,
+        committed_maximized: true,
+        chrome_pointer: ChromePointerSceneState {
+            hovered_button: Some(CaptionButton::Close),
+            cluster_hovered: true,
+            pressed_button: Some(CaptionButton::Close),
+        },
+        window_geometry: SceneWindowGeometry {
+            x: 7.0,
+            y: 9.0,
+            width: 640.0,
+            height: 420.0,
+        },
+    };
+    let first_layout = SurfaceLayout {
+        x: 10.0,
+        y: 20.0,
+        width: 600.0,
+        height: 400.0,
+        z: 1.0,
+        source: None,
+        parent: None,
+        transform: SurfaceTransform::Normal,
+        visible: true,
+        toplevel: Some(first_snapshot),
+    };
+    let newest_layout = SurfaceLayout {
+        x: 40.0,
+        width: 640.0,
+        height: 420.0,
+        toplevel: Some(newest_snapshot),
+        ..first_layout
+    };
+    let mut pending = PendingProtocolEvents::default();
+
+    pending
+        .push(ProtocolEvent::SurfaceUpserted {
+            id,
+            scene: SurfaceSceneSnapshot {
+                layout: first_layout,
+                kind: SceneSurfaceKind::Toplevel,
+                title: Some(Arc::from("First title")),
+            },
+            frame: SurfaceFrame::Shm(ShmFrame {
+                width: 2,
+                height: 1,
+                opaque: true,
+                rgba: Arc::new(vec![1; 8]),
+            }),
+        })
+        .expect("upsert fits");
+    assert_eq!(pending.bytes, 8 + "First title".len());
+    pending
+        .push(ProtocolEvent::SurfaceRelayout {
+            id,
+            scene: SurfaceSceneSnapshot {
+                layout: newest_layout,
+                kind: SceneSurfaceKind::Toplevel,
+                title: Some(Arc::from("Newest title")),
+            },
+        })
+        .expect("relayout fits");
+    assert_eq!(pending.bytes, 8 + "Newest title".len());
+
+    let events = pending.take();
+    let [ProtocolEvent::SurfaceUpserted { scene, .. }] = events.as_slice() else {
+        panic!("relayout merges into the queued upsert: {events:?}");
+    };
+    assert_eq!(scene.layout, newest_layout);
+    assert_eq!(scene.layout.toplevel, Some(newest_snapshot));
+    assert_eq!(scene.title.as_deref(), Some("Newest title"));
+}
+
+#[test]
+fn standalone_decorated_relayout_is_overtaken_by_either_tombstone() {
+    let id = SurfaceId(71);
+    let layout = SurfaceLayout {
+        x: 40.0,
+        y: 30.0,
+        width: 640.0,
+        height: 420.0,
+        z: 2.0,
+        source: None,
+        parent: None,
+        transform: SurfaceTransform::Normal,
+        visible: true,
+        toplevel: Some(ToplevelSceneState {
+            decoration: SceneDecorationMode::ServerSide,
+            focused: true,
+            committed_maximized: false,
+            chrome_pointer: ChromePointerSceneState::default(),
+            window_geometry: SceneWindowGeometry {
+                x: 7.0,
+                y: 9.0,
+                width: 620.0,
+                height: 400.0,
+            },
+        }),
+    };
+
+    for tombstone in [
+        ProtocolEvent::SurfaceUnmapped { id },
+        ProtocolEvent::SurfaceDestroyed { id },
+    ] {
+        let mut pending = PendingProtocolEvents::default();
+        pending
+            .push(ProtocolEvent::SurfaceRelayout {
+                id,
+                scene: scene(layout),
+            })
+            .expect("standalone decorated relayout fits");
+        pending.push(tombstone).expect("newer tombstone fits");
+
+        let events = pending.take();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            ProtocolEvent::SurfaceUnmapped { id: SurfaceId(71) }
+                | ProtocolEvent::SurfaceDestroyed { id: SurfaceId(71) }
+        ));
+    }
+}
+
+#[test]
+fn dirty_recovery_upsert_preserves_latest_title() {
+    let mut harness = KeybindingHarness::new(true);
+    let buffer = harness.create_dmabuf_buffer();
+    harness.commit_dmabuf(buffer);
+    let surface = harness.subsurface();
+    let (id, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    harness.server.state.release_buffer_token(frame.token);
+    let newest_snapshot = ToplevelSceneState {
+        decoration: SceneDecorationMode::ServerSide,
+        focused: true,
+        committed_maximized: true,
+        chrome_pointer: ChromePointerSceneState {
+            hovered_button: Some(CaptionButton::Minimize),
+            cluster_hovered: true,
+            pressed_button: Some(CaptionButton::Minimize),
+        },
+        window_geometry: SceneWindowGeometry {
+            x: 5.0,
+            y: 6.0,
+            width: 700.0,
+            height: 500.0,
+        },
+    };
+    let record = harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&surface.id())
+        .expect("mapped surface remains tracked");
+    record.layout.toplevel = Some(newest_snapshot);
+    record.title = Some(Arc::from("Recovered title"));
+
+    let LatestSurfaceUpsert::Ready(event) = harness.server.state.latest_surface_upsert(id) else {
+        panic!("dirty recovery rebuilds the mapped surface");
+    };
+    let ProtocolEvent::SurfaceUpserted { scene, frame, .. } = *event else {
+        panic!("dirty recovery rebuilds an upsert");
+    };
+    assert_eq!(scene.layout.toplevel, Some(newest_snapshot));
+    assert_eq!(scene.title.as_deref(), Some("Recovered title"));
+    let SurfaceFrame::Dmabuf(frame) = frame else {
+        panic!("dirty recovery preserves the DMA-BUF backing");
+    };
+    harness.server.state.release_buffer_token(frame.token);
+}
+
+#[test]
+fn roster_and_dirty_recovery_publish_a_complete_decorated_toplevel_snapshot() {
+    let mut harness = KeybindingHarness::new(true);
+    enable_test_ssd(&mut harness);
+    let (_, traffic) = bind_test_toplevel_decoration(&mut harness);
+    ack_and_map_test_toplevel(&mut harness, configured_toplevel_serial(&traffic));
+    let surface = harness
+        .server
+        .state
+        .surfaces
+        .values()
+        .find_map(|record| record.role.toplevel().map(|role| role.wl_surface().clone()))
+        .expect("mapped decorated toplevel remains tracked");
+    let (id, frame) = take_dmabuf_upsert(&mut harness.server.state);
+    harness.server.state.release_buffer_token(frame.token);
+    let snapshot = ToplevelSceneState {
+        decoration: SceneDecorationMode::ServerSide,
+        focused: true,
+        committed_maximized: false,
+        chrome_pointer: ChromePointerSceneState {
+            hovered_button: Some(CaptionButton::Maximize),
+            cluster_hovered: true,
+            pressed_button: None,
+        },
+        window_geometry: SceneWindowGeometry {
+            x: 13.0,
+            y: 17.0,
+            width: 701.0,
+            height: 503.0,
+        },
+    };
+    let expected_layout = {
+        let record = harness
+            .server
+            .state
+            .surfaces
+            .get_mut(&surface.id())
+            .expect("mapped surface remains tracked");
+        record.layout.x = 91.0;
+        record.layout.y = 73.0;
+        record.layout.width = 720.0;
+        record.layout.height = 540.0;
+        record.layout.z = 8.0;
+        record.layout.toplevel = Some(snapshot);
+        record.layout
+    };
+    let mapped = harness.server.state.mapped_surface_ids();
+    harness
+        .server
+        .pending_events
+        .install_surface_roster(&mapped);
+    harness.server.dirty_surfaces.insert(id);
+
+    assert_eq!(
+        harness
+            .server
+            .publish_events()
+            .expect("roster and dirty recovery publish"),
+        EventPublication::Complete
+    );
+    let published = harness
+        .renderer_events
+        .recv_timeout(PROTOCOL_ACK_DEADLINE)
+        .expect("renderer receives the recovery snapshot");
+    assert!(matches!(
+        published.first(),
+        Some(ProtocolEvent::SurfaceRoster { .. })
+    ));
+    let ProtocolEvent::SurfaceUpserted { scene, frame, .. } = published
+        .iter()
+        .find(|event| matches!(event, ProtocolEvent::SurfaceUpserted { id: event_id, .. } if *event_id == id))
+        .expect("dirty recovery follows the roster with a complete upsert")
+    else {
+        unreachable!("matching event is an upsert");
+    };
+    assert_layout_unchanged(
+        &scene.layout,
+        &expected_layout,
+        "recovered decorated toplevel",
+    );
+    assert_eq!(scene.layout.toplevel, Some(snapshot));
+    let SurfaceFrame::Dmabuf(frame) = frame else {
+        panic!("dirty recovery retains the mapped DMA-BUF backing");
+    };
+    harness.server.state.release_buffer_token(frame.token);
+}
+
+fn enable_test_ssd(harness: &mut KeybindingHarness) {
+    enable_test_ssd_style(harness, cosmix_deco::ChromeStyle::Mac);
+}
+
+fn disable_test_ssd(harness: &mut KeybindingHarness) {
+    harness.server.state.decoration =
+        DecorationStartup::resolve(false, cosmix_deco::ChromeStyle::Mac);
+}
+
+fn enable_test_ssd_style(harness: &mut KeybindingHarness, style: cosmix_deco::ChromeStyle) {
+    harness.server.state.decoration = DecorationStartup::resolve(true, style);
+}
+
+fn bind_test_toplevel_decoration(
+    harness: &mut KeybindingHarness,
+) -> (u32, Vec<(u32, u16, Vec<u8>)>) {
+    let (manager, version) = harness.registry_globals["zxdg_decoration_manager_v1"];
+    let manager_id = harness.allocate_object_id();
+    let decoration_id = harness.allocate_object_id();
+    bind_global(
+        &mut harness.client,
+        manager,
+        "zxdg_decoration_manager_v1",
+        version,
+        manager_id,
+    );
+    send_request(
+        &mut harness.client,
+        manager_id,
+        1,
+        &words(&[decoration_id, TEST_TOPLEVEL_ID]),
+    );
+    (decoration_id, harness.sync())
+}
+
+fn configured_decoration_mode(
+    traffic: &[(u32, u16, Vec<u8>)],
+    decoration_id: u32,
+) -> DecorationMode {
+    let raw = traffic
+        .iter()
+        .rev()
+        .find_map(|(object, opcode, body)| {
+            (*object == decoration_id && *opcode == 0)
+                .then(|| u32::from_ne_bytes(body[0..4].try_into().expect("decoration mode")))
+        })
+        .expect("decoration configure is emitted");
+    match raw {
+        value if value == DecorationMode::ClientSide as u32 => DecorationMode::ClientSide,
+        value if value == DecorationMode::ServerSide as u32 => DecorationMode::ServerSide,
+        value => panic!("unexpected decoration mode {value}"),
+    }
+}
+
+fn configured_toplevel_serial(traffic: &[(u32, u16, Vec<u8>)]) -> u32 {
+    traffic
+        .iter()
+        .rev()
+        .find_map(|(object, opcode, body)| {
+            (*object == TEST_XDG_SURFACE_ID && *opcode == 0)
+                .then(|| u32::from_ne_bytes(body[0..4].try_into().expect("configure serial")))
+        })
+        .expect("xdg_surface configure is emitted")
+}
+
+fn configured_toplevel_size(traffic: &[(u32, u16, Vec<u8>)]) -> (i32, i32) {
+    traffic
+        .iter()
+        .rev()
+        .find_map(|(object, opcode, body)| {
+            (*object == TEST_TOPLEVEL_ID && *opcode == 0).then(|| {
+                (
+                    i32::from_ne_bytes(body[0..4].try_into().expect("configure width")),
+                    i32::from_ne_bytes(body[4..8].try_into().expect("configure height")),
+                )
+            })
+        })
+        .expect("xdg_toplevel configure is emitted")
+}
+
+fn ack_and_map_test_toplevel(harness: &mut KeybindingHarness, serial: u32) {
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        4,
+        &words(&[serial]),
+    );
+    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+}
+
+fn commit_test_toplevel_state(harness: &mut KeybindingHarness, serial: u32) {
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        4,
+        &words(&[serial]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+}
+
+fn test_toplevel_record(harness: &KeybindingHarness) -> &SurfaceRecord {
+    harness
+        .server
+        .state
+        .surfaces
+        .values()
+        .find(|record| matches!(record.role, SurfaceRole::Toplevel(_)))
+        .expect("toplevel remains tracked")
+}
+
+fn positioned_test_ssd_harness(
+    style: cosmix_deco::ChromeStyle,
+) -> (KeybindingHarness, u32, ObjectId, u32) {
+    let mut harness = KeybindingHarness::new(true);
+    enable_test_ssd_style(&mut harness, style);
+    let pointer = harness.bind_pointer();
+    let (decoration, traffic) = bind_test_toplevel_decoration(&mut harness);
+    ack_and_map_test_toplevel(&mut harness, configured_toplevel_serial(&traffic));
+    let object = {
+        let record = harness
+            .server
+            .state
+            .surfaces
+            .values_mut()
+            .find(|record| matches!(record.role, SurfaceRole::Toplevel(_)))
+            .expect("mapped toplevel remains tracked");
+        record.layout.x = 40.0;
+        record.layout.y = 60.0;
+        record.layout.width = 240.0;
+        record.layout.height = 120.0;
+        record.layout.z = 4.0;
+        record.layout.visible = true;
+        record.window_origin = (40.0, 60.0);
+        record.committed_window_geometry = Some(SceneWindowGeometry {
+            x: 0.0,
+            y: 0.0,
+            width: 240.0,
+            height: 120.0,
+        });
+        sync_toplevel_scene_state(record);
+        record.role.wl_surface().id()
+    };
+    harness.server.state.events.clear();
+    let _ = harness.sync();
+    (harness, pointer, object, decoration)
+}
+
+fn test_chrome_layout(harness: &KeybindingHarness) -> (ChromeLayout, (f32, f32)) {
+    let record = test_toplevel_record(harness);
+    let geometry = record
+        .committed_window_geometry
+        .expect("test toplevel has committed geometry");
+    let chrome = ChromeLayout::compute(
+        &harness.server.state.decoration.theme,
+        vec2(geometry.width, geometry.height),
+    );
+    let offset = chrome.content_offset();
+    let outer_origin = (
+        record.layout.x + geometry.x - offset.x,
+        record.layout.y + geometry.y - offset.y,
+    );
+    (chrome, outer_origin)
+}
+
+fn assert_chrome_target(target: Option<PointerTarget>, object: &ObjectId, expected: ChromePart) {
+    match target {
+        Some(PointerTarget::Chrome {
+            object: actual,
+            part,
+            ..
+        }) => {
+            assert_eq!(&actual, object);
+            assert_eq!(part, expected);
+        }
+        Some(PointerTarget::Client { .. }) => panic!("expected chrome target {expected:?}"),
+        None => panic!("expected chrome target {expected:?}, got no target"),
+    }
+}
+
+fn route_pointer_to(harness: &mut KeybindingHarness, x: f64, y: f64) {
+    let (width, height) = harness.server.state.backend.seat_extent();
+    harness.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: x / f64::from(width),
+            normalised_y: y / f64::from(height),
+        },
+    });
+}
+
+fn route_pointer_button(harness: &mut KeybindingHarness, button: u32, state: ButtonState) {
+    harness.route(InputEvent::PointerButton {
+        event: FakeButtonEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            button,
+            state,
+        },
+    });
+}
+
+fn pointer_button_at_time(
+    harness: &mut KeybindingHarness,
+    button: u32,
+    state: HostButtonState,
+    time: u32,
+) {
+    harness
+        .server
+        .state
+        .handle_host_input(HostInput::PointerButton {
+            button,
+            state,
+            time,
+        });
+}
+
+fn request_test_maximized(
+    harness: &mut KeybindingHarness,
+    maximized: bool,
+) -> Vec<(u32, u16, Vec<u8>)> {
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_ID,
+        if maximized { 9 } else { 10 },
+        &[],
+    );
+    harness.sync()
+}
+
+fn chrome_button_point(harness: &KeybindingHarness, wanted: CaptionButton) -> (f64, f64) {
+    let (chrome, outer) = test_chrome_layout(harness);
+    let rect = chrome
+        .buttons
+        .into_iter()
+        .find_map(|(button, rect)| (button == wanted).then_some(rect))
+        .expect("caption button exists");
+    (
+        f64::from(outer.0 + rect.x + rect.w / 2.0),
+        f64::from(outer.1 + rect.y + rect.h / 2.0),
+    )
+}
+
+fn chrome_titlebar_point(harness: &KeybindingHarness) -> (f64, f64) {
+    let (chrome, outer) = test_chrome_layout(harness);
+    (
+        f64::from(outer.0 + chrome.title_slot.x + chrome.title_slot.w / 2.0),
+        f64::from(outer.1 + chrome.title_slot.y + chrome.title_slot.h / 2.0),
+    )
+}
+
+fn chrome_resize_point(harness: &KeybindingHarness, edge: cosmix_deco::ResizeEdge) -> (f64, f64) {
+    use cosmix_deco::ResizeEdge;
+
+    let (chrome, outer) = test_chrome_layout(harness);
+    let left = chrome.window.x;
+    let right = chrome.window.x + chrome.window.w;
+    let top = chrome.window.y;
+    let bottom = chrome.window.y + chrome.window.h;
+    let middle_x = (left + right) / 2.0;
+    let middle_y = (top + bottom) / 2.0;
+    let local = match edge {
+        ResizeEdge::Top => (middle_x, top - 1.0),
+        ResizeEdge::Bottom => (middle_x, bottom + 1.0),
+        ResizeEdge::Left => (left - 1.0, middle_y),
+        ResizeEdge::Right => (right + 1.0, middle_y),
+        ResizeEdge::TopLeft => (left - 1.0, top - 1.0),
+        ResizeEdge::TopRight => (right + 1.0, top - 1.0),
+        ResizeEdge::BottomLeft => (left - 1.0, bottom + 1.0),
+        ResizeEdge::BottomRight => (right + 1.0, bottom + 1.0),
+    };
+    (f64::from(outer.0 + local.0), f64::from(outer.1 + local.1))
+}
+
+fn map_test_popup(harness: &mut KeybindingHarness, grab_serial: Option<u32>) -> (ObjectId, u32) {
+    let positioner = harness.allocate_object_id();
+    let surface = harness.allocate_object_id();
+    let xdg_surface = harness.allocate_object_id();
+    let popup = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        1,
+        &words(&[positioner]),
+    );
+    send_request(&mut harness.client, positioner, 1, &words(&[32, 24]));
+    send_request(&mut harness.client, positioner, 2, &words(&[0, 0, 16, 16]));
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        2,
+        &words(&[xdg_surface, surface]),
+    );
+    send_request(
+        &mut harness.client,
+        xdg_surface,
+        2,
+        &words(&[popup, TEST_XDG_SURFACE_ID, positioner]),
+    );
+    if let Some(serial) = grab_serial {
+        send_request(
+            &mut harness.client,
+            popup,
+            1,
+            &words(&[TEST_SEAT_ID, serial]),
+        );
+    }
+    send_request(&mut harness.client, surface, 6, &[]);
+    let traffic = harness.sync();
+    let serial = traffic
+        .iter()
+        .rev()
+        .find_map(|(object, opcode, body)| {
+            (*object == xdg_surface && *opcode == 0)
+                .then(|| u32::from_ne_bytes(body[0..4].try_into().expect("popup serial")))
+        })
+        .expect("popup receives an initial configure");
+    send_request(&mut harness.client, xdg_surface, 4, &words(&[serial]));
+    let buffer = harness.create_dmabuf_buffer_sized(32, 24);
+    send_request(&mut harness.client, surface, 1, &words(&[buffer, 0, 0]));
+    send_request(&mut harness.client, surface, 6, &[]);
+    harness.dispatch_client();
+    let object = harness
+        .server
+        .state
+        .surfaces
+        .keys()
+        .find(|object| object.protocol_id() == surface)
+        .cloned()
+        .expect("mapped popup remains tracked");
+    (object, popup)
+}
+
+fn map_test_undecorated_toplevel(harness: &mut KeybindingHarness) -> ObjectId {
+    let surface = harness.allocate_object_id();
+    let xdg_surface = harness.allocate_object_id();
+    let toplevel = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        2,
+        &words(&[xdg_surface, surface]),
+    );
+    send_request(&mut harness.client, xdg_surface, 1, &words(&[toplevel]));
+    send_request(&mut harness.client, surface, 6, &[]);
+    let traffic = harness.sync();
+    let serial = traffic
+        .iter()
+        .rev()
+        .find_map(|(object, opcode, body)| {
+            (*object == xdg_surface && *opcode == 0)
+                .then(|| u32::from_ne_bytes(body[0..4].try_into().expect("toplevel serial")))
+        })
+        .expect("second toplevel receives an initial configure");
+    send_request(&mut harness.client, xdg_surface, 4, &words(&[serial]));
+    let buffer = harness.create_dmabuf_buffer_sized(32, 24);
+    send_request(&mut harness.client, surface, 1, &words(&[buffer, 0, 0]));
+    send_request(&mut harness.client, surface, 6, &[]);
+    harness.dispatch_client();
+    harness
+        .server
+        .state
+        .surfaces
+        .keys()
+        .find(|object| object.protocol_id() == surface)
+        .cloned()
+        .expect("mapped second toplevel remains tracked")
+}
+
+#[test]
+fn pointer_target_classifies_every_chrome_region_at_one_and_two_point_five_scale() {
+    use cosmix_deco::ResizeEdge;
+
+    for scale in [1.0, 2.5] {
+        let (mut harness, _, object, _) =
+            positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+        if scale != 1.0 {
+            assert!(harness.server.state.backend.change_host_output_scale(scale));
+        }
+        assert_eq!(harness.server.state.backend.output_scale(), scale);
+        let (chrome, outer) = test_chrome_layout(&harness);
+        let global = |x: f32, y: f32| (f64::from(outer.0 + x), f64::from(outer.1 + y));
+        let centre = |rect: cosmix_deco::Rect| global(rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
+
+        for (button, rect) in chrome.buttons {
+            let (x, y) = centre(rect);
+            assert_chrome_target(
+                harness.server.state.pointer_target_at(x, y),
+                &object,
+                ChromePart::Button(button),
+            );
+        }
+        let (x, y) = centre(chrome.title_slot);
+        assert_chrome_target(
+            harness.server.state.pointer_target_at(x, y),
+            &object,
+            ChromePart::TitlebarDrag,
+        );
+
+        let left = chrome.window.x;
+        let right = chrome.window.x + chrome.window.w;
+        let top = chrome.window.y;
+        let bottom = chrome.window.y + chrome.window.h;
+        let middle_x = (left + right) / 2.0;
+        let middle_y = (top + bottom) / 2.0;
+        for (point, edge) in [
+            ((left - 1.0, middle_y), ResizeEdge::Left),
+            ((right + 1.0, middle_y), ResizeEdge::Right),
+            ((middle_x, top - 1.0), ResizeEdge::Top),
+            ((middle_x, bottom + 1.0), ResizeEdge::Bottom),
+            ((left - 1.0, top - 1.0), ResizeEdge::TopLeft),
+            ((right + 1.0, top - 1.0), ResizeEdge::TopRight),
+            ((left - 1.0, bottom + 1.0), ResizeEdge::BottomLeft),
+            ((right + 1.0, bottom + 1.0), ResizeEdge::BottomRight),
+        ] {
+            let (x, y) = global(point.0, point.1);
+            assert_chrome_target(
+                harness.server.state.pointer_target_at(x, y),
+                &object,
+                ChromePart::Resize(edge),
+            );
+        }
+
+        let (x, y) = centre(chrome.content);
+        match harness.server.state.pointer_target_at(x, y) {
+            Some(PointerTarget::Client { surface, .. }) => assert_eq!(surface.id(), object),
+            _ => panic!("content must remain a client target"),
+        }
+        let (x, y) = global(-100.0, -100.0);
+        assert!(harness.server.state.pointer_target_at(x, y).is_none());
+    }
+}
+
+#[test]
+fn chrome_pointer_projects_move_and_all_eight_resize_cursors() {
+    use cosmix_deco::ResizeEdge;
+
+    let (mut harness, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+    let titlebar = chrome_titlebar_point(&harness);
+    route_pointer_to(&mut harness, titlebar.0, titlebar.1);
+    assert_eq!(
+        harness.server.state.chrome_cursor_override,
+        Some(ChromeCursorIcon::Move)
+    );
+
+    for (edge, expected) in [
+        (ResizeEdge::Top, ChromeCursorIcon::NResize),
+        (ResizeEdge::TopRight, ChromeCursorIcon::NeResize),
+        (ResizeEdge::Right, ChromeCursorIcon::EResize),
+        (ResizeEdge::BottomRight, ChromeCursorIcon::SeResize),
+        (ResizeEdge::Bottom, ChromeCursorIcon::SResize),
+        (ResizeEdge::BottomLeft, ChromeCursorIcon::SwResize),
+        (ResizeEdge::Left, ChromeCursorIcon::WResize),
+        (ResizeEdge::TopLeft, ChromeCursorIcon::NwResize),
+    ] {
+        let point = chrome_resize_point(&harness, edge);
+        route_pointer_to(&mut harness, point.0, point.1);
+        assert_eq!(
+            harness.server.state.chrome_cursor_override,
+            Some(expected),
+            "{edge:?} publishes its directional cursor"
+        );
+    }
+
+    let (chrome, outer) = test_chrome_layout(&harness);
+    route_pointer_to(
+        &mut harness,
+        f64::from(outer.0 + chrome.content.x + chrome.content.w / 2.0),
+        f64::from(outer.1 + chrome.content.y + chrome.content.h / 2.0),
+    );
+    assert_eq!(harness.server.state.chrome_cursor_override, None);
+}
+
+#[test]
+fn active_resize_pins_the_initiating_edge_cursor_until_release() {
+    use cosmix_deco::ResizeEdge;
+
+    let (mut harness, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+    let start = chrome_resize_point(&harness, ResizeEdge::Left);
+    route_pointer_to(&mut harness, start.0, start.1);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    assert_eq!(
+        harness.server.state.chrome_cursor_override,
+        Some(ChromeCursorIcon::WResize)
+    );
+
+    let opposite = chrome_resize_point(&harness, ResizeEdge::Right);
+    route_pointer_to(&mut harness, opposite.0 + 40.0, opposite.1);
+    assert_eq!(
+        harness.server.state.chrome_cursor_override,
+        Some(ChromeCursorIcon::WResize),
+        "crossing the opposite edge does not flip an active resize cursor"
+    );
+
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    assert_ne!(
+        harness.server.state.chrome_cursor_override,
+        Some(ChromeCursorIcon::WResize)
+    );
+}
+
+#[test]
+fn unbound_and_client_side_toplevels_are_ignored_by_chrome_targeting() {
+    let (mut harness, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let (chrome, outer) = test_chrome_layout(&harness);
+    let point = (
+        f64::from(outer.0 + chrome.title_slot.x + chrome.title_slot.w / 2.0),
+        f64::from(outer.1 + chrome.title_slot.y + chrome.title_slot.h / 2.0),
+    );
+
+    for mode in [
+        SceneDecorationMode::Unbound,
+        SceneDecorationMode::ClientSide,
+    ] {
+        let record = harness
+            .server
+            .state
+            .surfaces
+            .values_mut()
+            .find(|record| matches!(record.role, SurfaceRole::Toplevel(_)))
+            .expect("toplevel remains tracked");
+        record.committed_decoration = mode;
+        sync_toplevel_scene_state(record);
+        assert!(
+            harness
+                .server
+                .state
+                .pointer_target_at(point.0, point.1)
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn content_pointer_coordinates_are_unchanged_with_ssd_targeting() {
+    let (mut harness, pointer, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let (chrome, outer) = test_chrome_layout(&harness);
+    let title = (
+        f64::from(outer.0 + chrome.title_slot.x + chrome.title_slot.w / 2.0),
+        f64::from(outer.1 + chrome.title_slot.y + chrome.title_slot.h / 2.0),
+    );
+    route_pointer_to(&mut harness, title.0, title.1);
+    let _ = harness.sync();
+
+    route_pointer_to(&mut harness, 47.0, 69.0);
+    let traffic = harness.sync();
+    let enter = pointer_body(&traffic, pointer, 0);
+    assert_eq!((fixed(&enter, 2), fixed(&enter, 3)), (7.0, 9.0));
+}
+
+#[test]
+fn chrome_clicks_are_consumed_without_client_button_traffic() {
+    let (mut harness, pointer, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let (chrome, outer) = test_chrome_layout(&harness);
+    let close = chrome
+        .buttons
+        .into_iter()
+        .find_map(|(button, rect)| (button == CaptionButton::Close).then_some(rect))
+        .expect("close button exists");
+    let point = (
+        f64::from(outer.0 + close.x + close.w / 2.0),
+        f64::from(outer.1 + close.y + close.h / 2.0),
+    );
+    route_pointer_to(&mut harness, point.0, point.1);
+    let _ = harness.sync();
+    harness.route(InputEvent::PointerButton {
+        event: FakeButtonEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            button: PRIMARY_POINTER_BUTTON,
+            state: ButtonState::Pressed,
+        },
+    });
+    assert_eq!(
+        test_toplevel_record(&harness).chrome_pointer,
+        ChromePointerSceneState {
+            hovered_button: Some(CaptionButton::Close),
+            cluster_hovered: true,
+            pressed_button: Some(CaptionButton::Close),
+        }
+    );
+    harness.route(InputEvent::PointerButton {
+        event: FakeButtonEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            button: PRIMARY_POINTER_BUTTON,
+            state: ButtonState::Released,
+        },
+    });
+    let traffic = harness.sync();
+    assert!(pointer_bodies(&traffic, pointer, 3).is_empty());
+    assert!(harness.server.state.suppressed_chrome_buttons.is_empty());
+    assert_eq!(
+        test_toplevel_record(&harness).chrome_pointer,
+        ChromePointerSceneState {
+            hovered_button: Some(CaptionButton::Close),
+            cluster_hovered: true,
+            pressed_button: None,
+        }
+    );
+}
+
+#[test]
+fn hover_publication_occurs_only_when_the_chrome_region_changes() {
+    let (mut harness, _, object, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+    let (chrome, outer) = test_chrome_layout(&harness);
+    let close = chrome
+        .buttons
+        .into_iter()
+        .find_map(|(button, rect)| (button == CaptionButton::Close).then_some(rect))
+        .expect("close button exists");
+    let first = (
+        f64::from(outer.0 + close.x + 2.0),
+        f64::from(outer.1 + close.y + 2.0),
+    );
+    let second = (first.0 + 2.0, first.1 + 2.0);
+
+    harness.server.state.events.clear();
+    harness.server.state.pointer_moved(first.0, first.1, 1);
+    harness.server.state.pointer_moved(second.0, second.1, 2);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .events
+            .iter()
+            .filter(|event| matches!(event, ProtocolEvent::SurfaceRelayout { .. }))
+            .count(),
+        1
+    );
+    let record = &harness.server.state.surfaces[&object];
+    assert_eq!(
+        record.chrome_pointer.hovered_button,
+        Some(CaptionButton::Close)
+    );
+    assert_eq!(
+        record
+            .layout
+            .toplevel
+            .expect("scene snapshot")
+            .chrome_pointer,
+        record.chrome_pointer
+    );
+}
+
+#[test]
+fn mac_button_cluster_gap_keeps_cluster_hover_without_hovering_a_button() {
+    let (mut harness, _, object, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let (chrome, outer) = test_chrome_layout(&harness);
+    let left = chrome.buttons[0].1;
+    let right = chrome.buttons[1].1;
+    let point = (
+        f64::from(outer.0 + (left.x + left.w + right.x) / 2.0),
+        f64::from(outer.1 + chrome.button_cluster.center().y),
+    );
+
+    match harness.server.state.pointer_target_at(point.0, point.1) {
+        Some(PointerTarget::Chrome {
+            object: target,
+            part: ChromePart::TitlebarDrag,
+            button_cluster_hovered: true,
+        }) => assert_eq!(target, object),
+        _ => panic!("inter-button gap must remain a titlebar target inside the cluster"),
+    }
+    harness.server.state.pointer_moved(point.0, point.1, 1);
+    assert_eq!(
+        harness.server.state.surfaces[&object].chrome_pointer,
+        ChromePointerSceneState {
+            hovered_button: None,
+            cluster_hovered: true,
+            pressed_button: None,
+        }
+    );
+}
+
+#[test]
+fn equal_z_surface_hit_testing_uses_surface_id_as_the_tie_breaker() {
+    let mut harness = KeybindingHarness::new(true);
+    let mut candidates = harness
+        .server
+        .state
+        .surfaces
+        .values_mut()
+        .collect::<Vec<_>>();
+    assert_eq!(candidates.len(), 2);
+    for record in &mut candidates {
+        record.layout.x = 20.0;
+        record.layout.y = 20.0;
+        record.layout.width = 80.0;
+        record.layout.height = 80.0;
+        record.layout.z = 5.0;
+        record.layout.visible = true;
+    }
+    let expected = candidates
+        .iter()
+        .max_by_key(|record| record.id.0)
+        .expect("two candidates")
+        .id;
+    drop(candidates);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .surface_at(40.0, 40.0)
+            .expect("overlapping surface")
+            .id,
+        expected
+    );
+}
+
+#[test]
+fn higher_popup_and_undecorated_window_each_beat_lower_chrome() {
+    let (mut harness, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+    let (chrome, outer) = test_chrome_layout(&harness);
+    let point = (
+        outer.0 + chrome.title_slot.x + chrome.title_slot.w / 2.0,
+        outer.1 + chrome.title_slot.y + chrome.title_slot.h / 2.0,
+    );
+    let (popup, _) = map_test_popup(&mut harness, None);
+    let window = map_test_undecorated_toplevel(&mut harness);
+
+    {
+        let record = harness
+            .server
+            .state
+            .surfaces
+            .get_mut(&popup)
+            .expect("popup remains tracked");
+        record.layout.x = point.0 - 8.0;
+        record.layout.y = point.1 - 8.0;
+        record.layout.width = 16.0;
+        record.layout.height = 16.0;
+        record.layout.z = 5.0;
+        record.layout.visible = true;
+    }
+    {
+        let record = harness
+            .server
+            .state
+            .surfaces
+            .get_mut(&window)
+            .expect("second toplevel remains tracked");
+        record.layout.x = point.0 + 40.0;
+        record.layout.y = point.1 + 40.0;
+        record.layout.width = 16.0;
+        record.layout.height = 16.0;
+        record.layout.z = 6.0;
+        record.layout.visible = true;
+    }
+    match harness
+        .server
+        .state
+        .pointer_target_at(f64::from(point.0), f64::from(point.1))
+    {
+        Some(PointerTarget::Client { surface, .. }) => assert_eq!(surface.id(), popup),
+        _ => panic!("higher popup must beat lower chrome"),
+    }
+
+    harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&popup)
+        .unwrap()
+        .layout
+        .x += 80.0;
+    {
+        let record = harness.server.state.surfaces.get_mut(&window).unwrap();
+        record.layout.x = point.0 - 8.0;
+        record.layout.y = point.1 - 8.0;
+    }
+    match harness
+        .server
+        .state
+        .pointer_target_at(f64::from(point.0), f64::from(point.1))
+    {
+        Some(PointerTarget::Client { surface, .. }) => assert_eq!(surface.id(), window),
+        _ => panic!("higher undecorated window must beat lower chrome"),
+    }
+}
+
+#[test]
+fn touch_on_an_ssd_titlebar_does_not_enter_chrome_or_move_the_window() {
+    let (mut harness, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let (chrome, outer) = test_chrome_layout(&harness);
+    let point = (
+        f64::from(outer.0 + chrome.title_slot.x + chrome.title_slot.w / 2.0),
+        f64::from(outer.1 + chrome.title_slot.y + chrome.title_slot.h / 2.0),
+    );
+    assert!(
+        harness
+            .server
+            .state
+            .touch_focus_at(point.0, point.1)
+            .is_none()
+    );
+    let before = test_toplevel_record(&harness).layout;
+    harness.route(InputEvent::DeviceAdded {
+        device: FakeDevice::Touchscreen,
+    });
+    let (width, height) = harness.server.state.backend.seat_extent();
+    harness.route(InputEvent::TouchDown {
+        event: FakeTouchPositionEvent {
+            slot: TouchSlot::from(None),
+            normalised_x: point.0 / f64::from(width),
+            normalised_y: point.1 / f64::from(height),
+            time_us: FAKE_EVENT_TIME_US,
+        },
+    });
+    let after = test_toplevel_record(&harness);
+    assert_eq!((after.layout.x, after.layout.y), (before.x, before.y));
+    assert_eq!(after.chrome_pointer, ChromePointerSceneState::default());
+    assert!(harness.server.state.interactive_pointer.is_none());
+}
+
+#[test]
+fn chrome_titlebar_drag_moves_the_toplevel_and_its_popup_together() {
+    let (mut harness, _, object, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let (popup, _) = map_test_popup(&mut harness, None);
+    let start = chrome_titlebar_point(&harness);
+    let root_before = harness.server.state.surfaces[&object].layout;
+    let popup_before = harness.server.state.surfaces[&popup].layout;
+    let retargets_before = harness.server.state.chrome_geometry_retarget_count;
+
+    route_pointer_to(&mut harness, start.0, start.1);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    assert!(matches!(
+        harness
+            .server
+            .state
+            .chrome_pointer_grab
+            .as_ref()
+            .map(|grab| grab.kind),
+        Some(ChromePointerGrabKind::Move)
+    ));
+    route_pointer_to(&mut harness, start.0 + 23.0, start.1 + 17.0);
+
+    let root_after = harness.server.state.surfaces[&object].layout;
+    let popup_after = harness.server.state.surfaces[&popup].layout;
+    assert_eq!(
+        (root_after.x - root_before.x, root_after.y - root_before.y),
+        (23.0, 17.0)
+    );
+    assert_eq!(
+        (
+            popup_after.x - popup_before.x,
+            popup_after.y - popup_before.y
+        ),
+        (23.0, 17.0)
+    );
+    assert_eq!(
+        harness.server.state.chrome_geometry_retarget_count,
+        retargets_before + 1,
+        "the moved frame is explicitly retargeted under the current cursor"
+    );
+
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    assert!(harness.server.state.chrome_pointer_grab.is_none());
+    assert!(harness.server.state.interactive_pointer.is_none());
+}
+
+#[test]
+fn chrome_resize_all_edges_honours_client_minimum_and_maximum_constraints() {
+    use cosmix_deco::ResizeEdge;
+
+    for edge in [
+        ResizeEdge::Top,
+        ResizeEdge::Bottom,
+        ResizeEdge::Left,
+        ResizeEdge::Right,
+        ResizeEdge::TopLeft,
+        ResizeEdge::TopRight,
+        ResizeEdge::BottomLeft,
+        ResizeEdge::BottomRight,
+    ] {
+        let (mut harness, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+        send_request(
+            &mut harness.client,
+            TEST_TOPLEVEL_ID,
+            8,
+            &words(&[200, 100]),
+        );
+        send_request(
+            &mut harness.client,
+            TEST_TOPLEVEL_ID,
+            7,
+            &words(&[260, 140]),
+        );
+        send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+        harness.dispatch_client();
+        {
+            let record = harness
+                .server
+                .state
+                .surfaces
+                .values_mut()
+                .find(|record| matches!(record.role, SurfaceRole::Toplevel(_)))
+                .expect("constrained toplevel remains tracked");
+            record.layout.x = 40.0;
+            record.layout.y = 60.0;
+            record.layout.width = 240.0;
+            record.layout.height = 120.0;
+            record.window_origin = (40.0, 60.0);
+            record.committed_window_geometry = Some(SceneWindowGeometry {
+                x: 0.0,
+                y: 0.0,
+                width: 240.0,
+                height: 120.0,
+            });
+            sync_toplevel_scene_state(record);
+        }
+
+        let start = chrome_resize_point(&harness, edge);
+        route_pointer_to(&mut harness, start.0, start.1);
+        route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+        assert!(matches!(
+            harness
+                .server
+                .state
+                .chrome_pointer_grab
+                .as_ref()
+                .map(|grab| grab.kind),
+            Some(ChromePointerGrabKind::Resize(actual)) if actual == edge
+        ));
+        let started = harness.sync();
+        assert!(
+            toplevel_configure_states(&started, TEST_TOPLEVEL_ID)
+                .last()
+                .is_some_and(|states| states.contains(&(xdg_toplevel::State::Resizing as u32)))
+        );
+
+        let horizontal = matches!(
+            edge,
+            ResizeEdge::Left
+                | ResizeEdge::Right
+                | ResizeEdge::TopLeft
+                | ResizeEdge::TopRight
+                | ResizeEdge::BottomLeft
+                | ResizeEdge::BottomRight
+        );
+        let vertical = matches!(
+            edge,
+            ResizeEdge::Top
+                | ResizeEdge::Bottom
+                | ResizeEdge::TopLeft
+                | ResizeEdge::TopRight
+                | ResizeEdge::BottomLeft
+                | ResizeEdge::BottomRight
+        );
+        let outward = (
+            if matches!(
+                edge,
+                ResizeEdge::Left | ResizeEdge::TopLeft | ResizeEdge::BottomLeft
+            ) {
+                -100.0
+            } else if horizontal {
+                100.0
+            } else {
+                0.0
+            },
+            if matches!(
+                edge,
+                ResizeEdge::Top | ResizeEdge::TopLeft | ResizeEdge::TopRight
+            ) {
+                -100.0
+            } else if vertical {
+                100.0
+            } else {
+                0.0
+            },
+        );
+        route_pointer_to(&mut harness, start.0 + outward.0, start.1 + outward.1);
+        assert_eq!(
+            test_toplevel_record(&harness).configured_size,
+            (
+                if horizontal { 260 } else { 240 },
+                if vertical { 140 } else { 120 }
+            ),
+            "{edge:?} clamps outward at the client maximum"
+        );
+
+        route_pointer_to(&mut harness, start.0 - outward.0, start.1 - outward.1);
+        assert_eq!(
+            test_toplevel_record(&harness).configured_size,
+            (
+                if horizontal { 200 } else { 240 },
+                if vertical { 100 } else { 120 }
+            ),
+            "{edge:?} clamps inward at the client minimum"
+        );
+
+        route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+        let finished = harness.sync();
+        assert!(
+            toplevel_configure_states(&finished, TEST_TOPLEVEL_ID)
+                .last()
+                .is_some_and(|states| !states.contains(&(xdg_toplevel::State::Resizing as u32)))
+        );
+        assert!(harness.server.state.chrome_pointer_grab.is_none());
+        assert!(harness.server.state.interactive_pointer.is_none());
+    }
+}
+
+#[test]
+fn chrome_close_fires_only_when_released_inside_the_original_button() {
+    let (mut harness, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+    let close = chrome_button_point(&harness, CaptionButton::Close);
+    route_pointer_to(&mut harness, close.0, close.1);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    assert!(
+        harness
+            .sync()
+            .iter()
+            .any(|(object, opcode, _)| { *object == TEST_TOPLEVEL_ID && *opcode == 1 })
+    );
+
+    let (mut harness, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+    let close = chrome_button_point(&harness, CaptionButton::Close);
+    let titlebar = chrome_titlebar_point(&harness);
+    route_pointer_to(&mut harness, close.0, close.1);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_to(&mut harness, titlebar.0, titlebar.1);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    assert!(
+        harness
+            .sync()
+            .iter()
+            .all(|(object, opcode, _)| { *object != TEST_TOPLEVEL_ID || *opcode != 1 })
+    );
+    assert_eq!(
+        test_toplevel_record(&harness).chrome_pointer.pressed_button,
+        None
+    );
+}
+
+#[test]
+fn unrelated_button_release_does_not_finish_chrome_capture() {
+    const SECONDARY_BUTTON: u32 = 0x111;
+
+    let (mut harness, pointer, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+    let close = chrome_button_point(&harness, CaptionButton::Close);
+    route_pointer_to(&mut harness, close.0, close.1);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut harness, SECONDARY_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut harness, SECONDARY_BUTTON, ButtonState::Released);
+    assert!(harness.server.state.chrome_pointer_grab.is_some());
+    assert_eq!(
+        test_toplevel_record(&harness).chrome_pointer.pressed_button,
+        Some(CaptionButton::Close)
+    );
+    assert!(pointer_bodies(&harness.sync(), pointer, 3).is_empty());
+
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    assert!(harness.server.state.chrome_pointer_grab.is_none());
+}
+
+#[test]
+fn buttons_pressed_during_chrome_capture_stay_suppressed_after_it_ends() {
+    const SECONDARY_BUTTON: u32 = 0x111;
+
+    let (mut harness, pointer, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let titlebar = chrome_titlebar_point(&harness);
+    route_pointer_to(&mut harness, titlebar.0, titlebar.1);
+    let _ = harness.sync();
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut harness, SECONDARY_BUTTON, ButtonState::Pressed);
+    assert!(
+        harness
+            .server
+            .state
+            .suppressed_chrome_buttons
+            .contains(&SECONDARY_BUTTON)
+    );
+
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    assert!(harness.server.state.chrome_pointer_grab.is_none());
+    assert!(harness.server.state.interactive_pointer.is_none());
+    route_pointer_to(&mut harness, 60.0, 80.0);
+    route_pointer_button(&mut harness, SECONDARY_BUTTON, ButtonState::Released);
+    let traffic = harness.sync();
+    assert!(
+        pointer_bodies(&traffic, pointer, 3)
+            .iter()
+            .all(|body| word(body, 2) != SECONDARY_BUTTON),
+        "a client never receives the release for a press captured by chrome"
+    );
+    assert!(
+        !harness
+            .server
+            .state
+            .suppressed_chrome_buttons
+            .contains(&SECONDARY_BUTTON)
+    );
+}
+
+#[test]
+fn live_popup_pointer_grab_bypasses_chrome_and_receives_the_outside_click() {
+    let (mut harness, pointer, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    route_pointer_to(&mut harness, 60.0, 80.0);
+    let _ = harness.sync();
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let press = pointer_body(&harness.sync(), pointer, 3);
+    let serial = word(&press, 0);
+    let (_, popup_role) = map_test_popup(&mut harness, Some(serial));
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let _ = harness.sync();
+    assert!(harness.server.state.pointer.is_grabbed());
+
+    let titlebar = chrome_titlebar_point(&harness);
+    route_pointer_to(&mut harness, titlebar.0, titlebar.1);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let traffic = harness.sync();
+    assert!(harness.server.state.chrome_pointer_grab.is_none());
+    assert!(
+        traffic
+            .iter()
+            .any(|(object, opcode, _)| *object == popup_role && *opcode == 1)
+    );
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+}
+
+#[test]
+fn popup_keyboard_grab_cancels_an_active_caption_capture_without_firing_it() {
+    let (mut harness, pointer, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+    let close = chrome_button_point(&harness, CaptionButton::Close);
+    route_pointer_to(&mut harness, close.0, close.1);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    assert!(matches!(
+        harness
+            .server
+            .state
+            .chrome_pointer_grab
+            .as_ref()
+            .map(|grab| grab.kind),
+        Some(ChromePointerGrabKind::Button(CaptionButton::Close))
+    ));
+    let _ = harness.sync();
+
+    harness.key(24, HostButtonState::Pressed);
+    let key = harness
+        .sync()
+        .into_iter()
+        .find_map(|(object, opcode, body)| {
+            (object == TEST_KEYBOARD_ID && opcode == 3 && body.len() >= 16).then_some(body)
+        })
+        .expect("focused toplevel receives the popup-grab key");
+    let (_, popup_role) = map_test_popup(&mut harness, Some(word(&key, 0)));
+    assert!(harness.server.state.chrome_pointer_grab.is_none());
+    assert!(harness.server.state.interactive_pointer.is_none());
+    assert_eq!(harness.server.state.chrome_cursor_override, None);
+    assert_eq!(
+        test_toplevel_record(&harness).chrome_pointer,
+        ChromePointerSceneState::default()
+    );
+    assert!(
+        harness
+            .server
+            .state
+            .suppressed_chrome_buttons
+            .contains(&PRIMARY_POINTER_BUTTON)
+    );
+    assert!(harness.server.state.pointer.is_grabbed());
+
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let release = harness.sync();
+    assert!(
+        release
+            .iter()
+            .all(|(object, opcode, _)| *object != TEST_TOPLEVEL_ID || *opcode != 1),
+        "cancelling the capture cannot fire the held close button"
+    );
+    assert!(pointer_bodies(&release, pointer, 3).is_empty());
+
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let popup_traffic = harness.sync();
+    assert!(
+        popup_traffic
+            .iter()
+            .any(|(object, opcode, _)| *object == popup_role && *opcode == 1),
+        "the installed popup grab still receives and dismisses on its next outside click"
+    );
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+}
+
+#[test]
+fn popup_grab_blocks_stationary_scene_retarget_from_relighting_chrome() {
+    let (mut harness, pointer, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+    route_pointer_to(&mut harness, 60.0, 80.0);
+    let _ = harness.sync();
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let press = pointer_body(&harness.sync(), pointer, 3);
+    let _ = map_test_popup(&mut harness, Some(word(&press, 0)));
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let _ = harness.sync();
+    assert!(harness.server.state.pointer.is_grabbed());
+
+    let close = chrome_button_point(&harness, CaptionButton::Close);
+    route_pointer_to(&mut harness, close.0, close.1);
+    assert!(harness.server.state.chrome_hover.is_none());
+    assert_eq!(harness.server.state.chrome_cursor_override, None);
+    harness.server.state.resize_output(800, 600);
+    let _ = harness.sync();
+    assert!(harness.server.state.chrome_hover.is_none());
+    assert!(harness.server.state.chrome_pressed.is_none());
+    assert_eq!(
+        test_toplevel_record(&harness).chrome_pointer,
+        ChromePointerSceneState::default()
+    );
+    assert_eq!(harness.server.state.chrome_cursor_override, None);
+}
+
+#[test]
+fn caption_capture_reconstructs_pressed_visual_after_scene_retarget_and_reentry() {
+    let (mut harness, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+    let close = chrome_button_point(&harness, CaptionButton::Close);
+    let titlebar = chrome_titlebar_point(&harness);
+    route_pointer_to(&mut harness, close.0, close.1);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    assert_eq!(
+        test_toplevel_record(&harness).chrome_pointer.pressed_button,
+        Some(CaptionButton::Close)
+    );
+
+    route_pointer_to(&mut harness, titlebar.0, titlebar.1);
+    assert_eq!(
+        test_toplevel_record(&harness).chrome_pointer.pressed_button,
+        None
+    );
+    harness.server.state.resize_output(900, 700);
+    let _ = harness.sync();
+    assert!(harness.server.state.chrome_pointer_grab.is_some());
+    assert!(harness.server.state.chrome_pressed.is_none());
+
+    route_pointer_to(&mut harness, close.0, close.1);
+    assert_eq!(
+        test_toplevel_record(&harness).chrome_pointer.pressed_button,
+        Some(CaptionButton::Close)
+    );
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let traffic = harness.sync();
+    assert_eq!(
+        traffic
+            .iter()
+            .filter(|(object, opcode, _)| *object == TEST_TOPLEVEL_ID && *opcode == 1)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn chrome_capture_cancels_on_unmap_destruction_reversion_and_authority_loss() {
+    let start_capture = |harness: &mut KeybindingHarness| {
+        let point = chrome_titlebar_point(harness);
+        route_pointer_to(harness, point.0, point.1);
+        route_pointer_button(harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+        assert!(harness.server.state.chrome_pointer_grab.is_some());
+    };
+    let assert_cancelled = |harness: &KeybindingHarness| {
+        assert!(harness.server.state.chrome_pointer_grab.is_none());
+        assert!(harness.server.state.interactive_pointer.is_none());
+        assert_eq!(harness.server.state.chrome_cursor_override, None);
+        assert_eq!(
+            test_toplevel_record(harness).chrome_pointer,
+            ChromePointerSceneState::default()
+        );
+    };
+
+    let (mut unmapped, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    start_capture(&mut unmapped);
+    send_request(
+        &mut unmapped.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[0, 0, 0]),
+    );
+    send_request(&mut unmapped.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    unmapped.dispatch_client();
+    assert_cancelled(&unmapped);
+
+    let (mut destroyed, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    start_capture(&mut destroyed);
+    send_request(&mut destroyed.client, TEST_TOPLEVEL_ID, 0, &[]);
+    destroyed.dispatch_client();
+    assert!(destroyed.server.state.chrome_pointer_grab.is_none());
+    assert!(destroyed.server.state.interactive_pointer.is_none());
+
+    let (mut reverted, _, _, decoration) =
+        positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    start_capture(&mut reverted);
+    send_request(
+        &mut reverted.client,
+        decoration,
+        1,
+        &words(&[DecorationMode::ClientSide as u32]),
+    );
+    let traffic = reverted.sync();
+    commit_test_toplevel_state(&mut reverted, configured_toplevel_serial(&traffic));
+    assert_cancelled(&reverted);
+
+    let (mut authority, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    start_capture(&mut authority);
+    authority
+        .server
+        .state
+        .handle_host_input(HostInput::KeyboardFocusLost);
+    assert_cancelled(&authority);
+
+    let (mut kms_authority, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    start_capture(&mut kms_authority);
+    kms_authority
+        .server
+        .state
+        .reconcile_all_input_authority_loss();
+    assert_cancelled(&kms_authority);
+}
+
+#[test]
+fn client_and_chrome_maximize_share_one_state_machine_and_client_space_sizes() {
+    let (mut client, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let output = client.server.state.logical_output_rect();
+    let extents = DecoExtents::of(&client.server.state.decoration.theme);
+    let expected = extents.content_size_for_window(vec2(output.width, output.height));
+    let client_traffic = request_test_maximized(&mut client, true);
+    assert_eq!(
+        configured_toplevel_size(&client_traffic),
+        (expected.x as i32, expected.y as i32)
+    );
+    assert!(
+        toplevel_configure_states(&client_traffic, TEST_TOPLEVEL_ID)
+            .last()
+            .is_some_and(|states| states.contains(&(xdg_toplevel::State::Maximized as u32)))
+    );
+
+    let (mut chrome, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let button = chrome_button_point(&chrome, CaptionButton::Maximize);
+    route_pointer_to(&mut chrome, button.0, button.1);
+    route_pointer_button(&mut chrome, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut chrome, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let chrome_traffic = chrome.sync();
+    assert_eq!(
+        configured_toplevel_size(&chrome_traffic),
+        configured_toplevel_size(&client_traffic)
+    );
+    assert_eq!(
+        test_toplevel_record(&chrome).pending_window_state,
+        test_toplevel_record(&client).pending_window_state
+    );
+
+    let mut csd = KeybindingHarness::new(true);
+    let output = csd.server.state.logical_output_rect();
+    let csd_traffic = request_test_maximized(&mut csd, true);
+    assert_eq!(
+        configured_toplevel_size(&csd_traffic),
+        (output.width as i32, output.height as i32)
+    );
+
+    let mut pending_ssd = KeybindingHarness::new(true);
+    enable_test_ssd(&mut pending_ssd);
+    let _ = bind_test_toplevel_decoration(&mut pending_ssd);
+    let output = pending_ssd.server.state.logical_output_rect();
+    let extents = DecoExtents::of(&pending_ssd.server.state.decoration.theme);
+    let expected = extents.content_size_for_window(vec2(output.width, output.height));
+    let pending_traffic = request_test_maximized(&mut pending_ssd, true);
+    assert_eq!(
+        configured_toplevel_size(&pending_traffic),
+        (expected.x as i32, expected.y as i32),
+        "the configure uses its negotiated SSD mode before that mode is committed"
+    );
+}
+
+#[test]
+fn chrome_minimize_button_enters_compositor_owned_minimized_state() {
+    let (mut harness, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+    let button = chrome_button_point(&harness, CaptionButton::Minimize);
+    route_pointer_to(&mut harness, button.0, button.1);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    assert!(matches!(
+        harness
+            .server
+            .state
+            .chrome_pointer_grab
+            .as_ref()
+            .map(|grab| grab.kind),
+        Some(ChromePointerGrabKind::Button(CaptionButton::Minimize))
+    ));
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    assert!(test_toplevel_record(&harness).minimized);
+}
+
+#[test]
+fn maximize_placement_is_adopted_only_by_the_exact_acked_commit() {
+    let (mut harness, _, object, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let original = harness.server.state.surfaces[&object].window_origin;
+    let maximize = request_test_maximized(&mut harness, true);
+    let maximize_serial = configured_toplevel_serial(&maximize);
+    assert_eq!(
+        harness.server.state.surfaces[&object].window_origin,
+        original
+    );
+    assert!(!harness.server.state.surfaces[&object].committed_maximized);
+
+    let surface = harness.server.state.surfaces[&object]
+        .role
+        .wl_surface()
+        .clone();
+    let keyboard = harness.server.state.keyboard.clone();
+    keyboard.set_focus(
+        &mut harness.server.state,
+        None,
+        SERIAL_COUNTER.next_serial(),
+    );
+    let _ = harness.sync();
+    keyboard.set_focus(
+        &mut harness.server.state,
+        Some(surface),
+        SERIAL_COUNTER.next_serial(),
+    );
+    let focus = harness.sync();
+    assert_ne!(configured_toplevel_serial(&focus), maximize_serial);
+
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        4,
+        &words(&[maximize_serial]),
+    );
+    harness.dispatch_client();
+    assert_eq!(
+        harness.server.state.surfaces[&object].window_origin,
+        original
+    );
+    assert!(!harness.server.state.surfaces[&object].committed_maximized);
+
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let output = harness.server.state.logical_output_rect();
+    let extents = DecoExtents::of(&harness.server.state.decoration.theme);
+    let record = &harness.server.state.surfaces[&object];
+    assert!(record.committed_maximized);
+    assert_eq!(
+        record.window_origin,
+        (output.x + extents.left, output.y + extents.top)
+    );
+}
+
+#[test]
+fn queued_maximize_and_restore_commits_adopt_each_serial_snapshot_in_order() {
+    let (mut harness, _, object, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let original = harness.server.state.surfaces[&object].window_origin;
+    let surface = harness.server.state.surfaces[&object]
+        .role
+        .wl_surface()
+        .clone();
+    let barrier = block_surface_commit(&surface);
+
+    let maximize = request_test_maximized(&mut harness, true);
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&maximize));
+    let restore = request_test_maximized(&mut harness, false);
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&restore));
+    assert!(
+        harness
+            .server
+            .state
+            .committed_window_state_transitions
+            .is_empty()
+    );
+
+    release_surface_commit(&mut harness, barrier);
+    assert_eq!(
+        harness.server.state.committed_window_state_transitions,
+        [true, false]
+    );
+    let record = &harness.server.state.surfaces[&object];
+    assert!(!record.committed_maximized);
+    assert_eq!(record.window_origin, original);
+}
+
+#[test]
+fn repeated_client_set_and_unset_maximized_always_force_configures() {
+    let (mut harness, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    for maximized in [true, true, false, false] {
+        let traffic = request_test_maximized(&mut harness, maximized);
+        let _ = configured_toplevel_serial(&traffic);
+        let states = toplevel_configure_states(&traffic, TEST_TOPLEVEL_ID);
+        assert!(states.last().is_some_and(|states| {
+            states.contains(&(xdg_toplevel::State::Maximized as u32)) == maximized
+        }));
+    }
+}
+
+#[test]
+fn maximize_restore_returns_exact_origin_and_size_and_shifts_popup_both_ways() {
+    let (mut harness, _, object, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let (popup, _) = map_test_popup(&mut harness, None);
+    let subsurface_buffer = harness.create_dmabuf_buffer_sized(16, 16);
+    send_request(
+        &mut harness.client,
+        TEST_SUBSURFACE_SURFACE_ID,
+        1,
+        &words(&[subsurface_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_SUBSURFACE_SURFACE_ID, 6, &[]);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let subsurface = harness
+        .server
+        .state
+        .surfaces
+        .keys()
+        .find(|object| object.protocol_id() == TEST_SUBSURFACE_SURFACE_ID)
+        .cloned()
+        .expect("mapped subsurface remains tracked");
+    let original_origin = harness.server.state.surfaces[&object].window_origin;
+    let original_size = harness.server.state.surfaces[&object]
+        .committed_window_geometry
+        .map(|geometry| (geometry.width as i32, geometry.height as i32))
+        .expect("normal geometry exists");
+    let original_popup = harness.server.state.surfaces[&popup].layout;
+    let original_subsurface = harness.server.state.surfaces[&subsurface].layout;
+
+    let maximize = request_test_maximized(&mut harness, true);
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&maximize));
+    let maximized_popup = harness.server.state.surfaces[&popup].layout;
+    let maximized_subsurface = harness.server.state.surfaces[&subsurface].layout;
+    assert_ne!(
+        (maximized_popup.x, maximized_popup.y),
+        (original_popup.x, original_popup.y)
+    );
+    assert_ne!(
+        (maximized_subsurface.x, maximized_subsurface.y),
+        (original_subsurface.x, original_subsurface.y)
+    );
+
+    let restore = request_test_maximized(&mut harness, false);
+    assert_eq!(configured_toplevel_size(&restore), original_size);
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&restore));
+    let record = &harness.server.state.surfaces[&object];
+    assert!(!record.committed_maximized);
+    assert_eq!(record.window_origin, original_origin);
+    let restored_popup = harness.server.state.surfaces[&popup].layout;
+    let restored_subsurface = harness.server.state.surfaces[&subsurface].layout;
+    assert_eq!(
+        (restored_popup.x, restored_popup.y),
+        (original_popup.x, original_popup.y)
+    );
+    assert_eq!(
+        (restored_subsurface.x, restored_subsurface.y),
+        (original_subsurface.x, original_subsurface.y)
+    );
+}
+
+#[test]
+fn maximized_ssd_outer_frame_exactly_matches_output_at_both_scales() {
+    for scale120 in [120_u32, 300_u32] {
+        let (mut harness, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+        assert!(
+            harness
+                .server
+                .state
+                .backend
+                .change_host_output_scale(scale120 as f64 / 120.0)
+                || scale120 == 120
+        );
+        let traffic = request_test_maximized(&mut harness, true);
+        let configured = configured_toplevel_size(&traffic);
+        send_request(
+            &mut harness.client,
+            TEST_XDG_SURFACE_ID,
+            4,
+            &words(&[configured_toplevel_serial(&traffic)]),
+        );
+        let buffer = harness.create_dmabuf_buffer_sized(configured.0 as u32, configured.1 as u32);
+        send_request(
+            &mut harness.client,
+            TEST_TOPLEVEL_SURFACE_ID,
+            1,
+            &words(&[buffer, 0, 0]),
+        );
+        send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+        harness.dispatch_client();
+
+        let (chrome, outer) = test_chrome_layout(&harness);
+        let output = harness.server.state.logical_output_rect();
+        assert_eq!(outer, (output.x, output.y));
+        assert_eq!(
+            (chrome.window.w, chrome.window.h),
+            (output.width, output.height)
+        );
+        assert_eq!(
+            crate::compositor_scene::projected_renderer_physical_edges(
+                outer.0,
+                outer.1,
+                chrome.window.w,
+                chrome.window.h,
+                scale120,
+            ),
+            (
+                (output.x * scale120 as f32 / 120.0) as i64,
+                (output.y * scale120 as f32 / 120.0) as i64,
+                ((output.x + output.width) * scale120 as f32 / 120.0) as i64,
+                ((output.y + output.height) * scale120 as f32 / 120.0) as i64,
+            )
+        );
+    }
+}
+
+#[test]
+fn titlebar_double_click_uses_event_time_slop_and_wrapping_arithmetic() {
+    let click = |harness: &mut KeybindingHarness, time: u32| {
+        pointer_button_at_time(
+            harness,
+            PRIMARY_POINTER_BUTTON,
+            HostButtonState::Pressed,
+            time,
+        );
+        pointer_button_at_time(
+            harness,
+            PRIMARY_POINTER_BUTTON,
+            HostButtonState::Released,
+            time,
+        );
+    };
+
+    let (mut within, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let point = chrome_titlebar_point(&within);
+    route_pointer_to(&mut within, point.0, point.1);
+    click(&mut within, 100);
+    click(&mut within, 500);
+    assert!(test_toplevel_record(&within).requested_maximized);
+
+    let (mut timeout, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let point = chrome_titlebar_point(&timeout);
+    route_pointer_to(&mut timeout, point.0, point.1);
+    click(&mut timeout, 100);
+    click(&mut timeout, 501);
+    assert!(!test_toplevel_record(&timeout).requested_maximized);
+
+    let (mut slop, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let point = chrome_titlebar_point(&slop);
+    route_pointer_to(&mut slop, point.0, point.1);
+    click(&mut slop, 100);
+    slop.server
+        .state
+        .pointer_moved(point.0 + TITLEBAR_DOUBLE_CLICK_SLOP + 1.0, point.1, 150);
+    click(&mut slop, 200);
+    assert!(!test_toplevel_record(&slop).requested_maximized);
+
+    let (mut wrapped, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let point = chrome_titlebar_point(&wrapped);
+    route_pointer_to(&mut wrapped, point.0, point.1);
+    click(&mut wrapped, u32::MAX - 100);
+    click(&mut wrapped, 100);
+    assert!(test_toplevel_record(&wrapped).requested_maximized);
+}
+
+#[test]
+fn maximized_chrome_disables_edges_and_titlebar_motion() {
+    let (mut harness, _, object, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+    let maximize = request_test_maximized(&mut harness, true);
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&maximize));
+    let original = harness.server.state.surfaces[&object].layout;
+
+    let edge = chrome_resize_point(&harness, cosmix_deco::ResizeEdge::Right);
+    route_pointer_to(&mut harness, edge.0, edge.1);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    assert!(harness.server.state.chrome_pointer_grab.is_none());
+    assert!(harness.server.state.interactive_pointer.is_none());
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+
+    let title = chrome_titlebar_point(&harness);
+    route_pointer_to(&mut harness, title.0, title.1);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    assert!(harness.server.state.chrome_pointer_grab.is_some());
+    assert!(harness.server.state.interactive_pointer.is_none());
+    route_pointer_to(&mut harness, title.0 + 40.0, title.1 + 30.0);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let current = harness.server.state.surfaces[&object].layout;
+    assert_eq!((current.x, current.y), (original.x, original.y));
+}
+
+#[test]
+fn minimize_hides_the_tree_transfers_focus_withholds_frames_and_retargets_pointer() {
+    let (mut harness, pointer, object, _) =
+        positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+    let (popup, _) = map_test_popup(&mut harness, None);
+    let replacement = map_test_undecorated_toplevel(&mut harness);
+    {
+        let z = harness.server.state.surfaces[&object].layout.z - 1.0;
+        let record = harness.server.state.surfaces.get_mut(&replacement).unwrap();
+        record.layout.x = 0.0;
+        record.layout.y = 0.0;
+        record.layout.width = 1024.0;
+        record.layout.height = 768.0;
+        record.layout.z = z;
+        record.layout.visible = true;
+    }
+    let root = harness.server.state.surfaces[&object]
+        .role
+        .wl_surface()
+        .clone();
+    let keyboard = harness.server.state.keyboard.clone();
+    keyboard.set_focus(
+        &mut harness.server.state,
+        Some(root.clone()),
+        SERIAL_COUNTER.next_serial(),
+    );
+    let callback = harness.allocate_object_id();
+    let popup_callback = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        3,
+        &words(&[callback]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    send_request(
+        &mut harness.client,
+        popup.protocol_id(),
+        3,
+        &words(&[popup_callback]),
+    );
+    send_request(&mut harness.client, popup.protocol_id(), 6, &[]);
+    harness.dispatch_client();
+
+    route_pointer_to(&mut harness, 50.0, 70.0);
+    harness.server.state.minimize_toplevel(&root);
+    assert!(harness.server.state.surfaces[&object].minimized);
+    assert!(!harness.server.state.surfaces[&object].layout.visible);
+    assert!(!harness.server.state.surfaces[&popup].layout.visible);
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(
+            harness.server.state.surfaces[&replacement]
+                .role
+                .wl_surface()
+                .clone()
+        )
+    );
+    assert_eq!(
+        harness.server.state.pointer.current_focus(),
+        Some(
+            harness.server.state.surfaces[&replacement]
+                .role
+                .wl_surface()
+                .clone()
+        )
+    );
+    let pointer_enters = pointer_bodies(&harness.sync(), pointer, 0);
+    assert_eq!(
+        pointer_enters.last().map(|body| word(body, 1)),
+        Some(replacement.protocol_id())
+    );
+    harness.server.state.handle_frame(Vec::new());
+    assert!(harness.sync().iter().all(|(object, opcode, _)| {
+        (*object != callback && *object != popup_callback) || *opcode != 0
+    }));
+
+    harness.chord(&[125, 42, 50]);
+    assert!(!harness.server.state.surfaces[&object].minimized);
+    assert!(harness.server.state.surfaces[&object].layout.visible);
+    assert!(harness.server.state.surfaces[&popup].layout.visible);
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(
+            harness.server.state.surfaces[&object]
+                .role
+                .wl_surface()
+                .clone()
+        )
+    );
+    assert!(
+        harness.server.state.surfaces[&object].layout.z
+            > harness.server.state.surfaces[&replacement].layout.z
+    );
+    harness.server.state.handle_frame(Vec::new());
+    assert!(
+        harness
+            .sync()
+            .iter()
+            .filter(|(object, opcode, _)| {
+                (*object == callback || *object == popup_callback) && *opcode == 0
+            })
+            .count()
+            == 2
+    );
+}
+
+#[test]
+fn both_binding_profiles_restore_the_most_recently_minimized_toplevel() {
+    let assert_profile = |harness: &mut KeybindingHarness| {
+        let configure = test_toplevel_record(harness)
+            .required_configure
+            .expect("initial configure exists");
+        ack_and_map_test_toplevel(harness, u32::from(configure));
+        let first = test_toplevel_record(harness).role.wl_surface().clone();
+        let second_object = map_test_undecorated_toplevel(harness);
+        let second = harness.server.state.surfaces[&second_object]
+            .role
+            .wl_surface()
+            .clone();
+        harness.server.state.minimize_toplevel(&first);
+        harness.server.state.minimize_toplevel(&second);
+        assert!(harness.server.state.surfaces[&first.id()].minimized);
+        assert!(harness.server.state.surfaces[&second.id()].minimized);
+        assert_eq!(
+            harness.server.state.minimized_toplevels,
+            [first.id(), second.id()]
+        );
+        harness.chord(&[125, 42, 50]);
+        assert!(
+            harness.server.state.surfaces[&first.id()].minimized,
+            "the older minimized toplevel remains hidden"
+        );
+        assert!(!harness.server.state.surfaces[&second.id()].minimized);
+        assert_eq!(
+            harness.server.state.keyboard.current_focus(),
+            Some(second.clone())
+        );
+        assert!(
+            harness.server.state.surfaces[&second.id()].layout.z
+                > harness.server.state.surfaces[&first.id()].layout.z
+        );
+    };
+
+    let mut nested = KeybindingHarness::new(true);
+    assert_profile(&mut nested);
+    let (vt_requests, _) = mpsc::channel();
+    let mut kms_live = KeybindingHarness::new_with_kms_live_bindings(vt_requests);
+    assert_profile(&mut kms_live);
+}
+
+#[test]
+fn output_resize_reconfigures_a_maximized_window_to_the_new_outer_rectangle() {
+    let (mut harness, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let maximize = request_test_maximized(&mut harness, true);
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&maximize));
+    let _ = harness.sync();
+    harness.server.state.resize_output(800, 600);
+    let traffic = harness.sync();
+    let extents = DecoExtents::of(&harness.server.state.decoration.theme);
+    let expected = extents.content_size_for_window(vec2(800.0, 600.0));
+    assert_eq!(
+        configured_toplevel_size(&traffic),
+        (expected.x as i32, expected.y as i32)
+    );
+}
+
+#[test]
+fn output_resize_preserves_and_reclamps_an_in_flight_restore() {
+    let (mut harness, _, object, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let maximize = request_test_maximized(&mut harness, true);
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&maximize));
+    assert!(harness.server.state.surfaces[&object].committed_maximized);
+
+    let restore = request_test_maximized(&mut harness, false);
+    assert!(
+        toplevel_configure_states(&restore, TEST_TOPLEVEL_ID)
+            .last()
+            .is_some_and(|states| !states.contains(&(xdg_toplevel::State::Maximized as u32)))
+    );
+    assert!(!harness.server.state.surfaces[&object].requested_maximized);
+
+    harness.server.state.resize_output(260, 180);
+    let resized = harness.sync();
+    let resized_restore_serial = configured_toplevel_serial(&resized);
+    assert!(
+        toplevel_configure_states(&resized, TEST_TOPLEVEL_ID)
+            .last()
+            .is_some_and(|states| !states.contains(&(xdg_toplevel::State::Maximized as u32))),
+        "output resize must replace the pending restore with another restore"
+    );
+    let pending = harness.server.state.surfaces[&object]
+        .pending_window_state
+        .expect("resized output publishes a replacement restore placement");
+    assert!(!pending.maximized);
+    assert_eq!(pending.client_size, (240, 120));
+
+    commit_test_toplevel_state(&mut harness, resized_restore_serial);
+    let record = &harness.server.state.surfaces[&object];
+    assert!(!record.committed_maximized);
+    assert!(!record.requested_maximized);
+    assert_eq!(record.window_origin, pending.window_origin);
+    assert_eq!(record.configured_size, pending.client_size);
+    let (chrome, outer) = test_chrome_layout(&harness);
+    assert!(outer.0 >= 0.0 && outer.1 >= 0.0);
+    assert!(outer.0 + chrome.window.w <= 260.0);
+    assert!(outer.1 + chrome.window.h <= 180.0);
+}
+
+#[test]
+fn queued_replacement_restore_is_reclamped_after_a_second_output_resize() {
+    let (mut harness, _, object, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let surface = harness.server.state.surfaces[&object]
+        .role
+        .wl_surface()
+        .clone();
+    let maximize = request_test_maximized(&mut harness, true);
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&maximize));
+
+    let r1_barrier = block_surface_commit(&surface);
+    let r1 = request_test_maximized(&mut harness, false);
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&r1));
+    assert!(harness.server.state.surfaces[&object].committed_maximized);
+
+    harness.server.state.resize_output(260, 180);
+    let r2 = harness.sync();
+    let r2_serial = configured_toplevel_serial(&r2);
+    let r2_state = harness.server.state.surfaces[&object]
+        .pending_window_state
+        .expect("O2 publishes replacement restore R2");
+    assert!(!r2_state.maximized);
+    release_surface_commit(&mut harness, r1_barrier);
+    assert!(!harness.server.state.surfaces[&object].committed_maximized);
+    assert_eq!(
+        harness.server.state.surfaces[&object].pending_window_state,
+        Some(r2_state)
+    );
+
+    let r2_barrier = block_surface_commit(&surface);
+    commit_test_toplevel_state(&mut harness, r2_serial);
+    harness.server.state.resize_output(250, 165);
+    let r3 = harness.sync();
+    let r3_serial = configured_toplevel_serial(&r3);
+    let r3_state = harness.server.state.surfaces[&object]
+        .pending_window_state
+        .expect("O3 replaces the queued O2 restore with R3");
+    assert!(!r3_state.maximized);
+    assert_ne!(r3_state.window_origin, r2_state.window_origin);
+
+    release_surface_commit(&mut harness, r2_barrier);
+    assert_eq!(
+        harness.server.state.surfaces[&object].window_origin,
+        r2_state.window_origin
+    );
+    assert_eq!(
+        harness.server.state.surfaces[&object].pending_window_state,
+        Some(r3_state)
+    );
+    commit_test_toplevel_state(&mut harness, r3_serial);
+    let record = &harness.server.state.surfaces[&object];
+    assert_eq!(record.window_origin, r3_state.window_origin);
+    assert!(!record.committed_maximized);
+    assert!(record.pending_window_state.is_none());
+    let (chrome, outer) = test_chrome_layout(&harness);
+    assert!(outer.0 >= 0.0 && outer.1 >= 0.0);
+    assert!(outer.0 + chrome.window.w <= 250.0);
+    assert!(outer.1 + chrome.window.h <= 165.0);
+}
+
+#[test]
+fn pending_restore_output_shrink_emits_only_its_fresh_reclamped_configure() {
+    let (mut harness, _, object, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    {
+        let record = harness.server.state.surfaces.get_mut(&object).unwrap();
+        record.layout.width = 500.0;
+        record.layout.height = 400.0;
+        record.configured_size = (500, 400);
+        record.committed_window_geometry = Some(SceneWindowGeometry {
+            x: 0.0,
+            y: 0.0,
+            width: 500.0,
+            height: 400.0,
+        });
+        sync_toplevel_scene_state(record);
+    }
+    let surface = harness.server.state.surfaces[&object]
+        .role
+        .wl_surface()
+        .clone();
+    let maximize = request_test_maximized(&mut harness, true);
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&maximize));
+
+    let r1_barrier = block_surface_commit(&surface);
+    let r1 = request_test_maximized(&mut harness, false);
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&r1));
+    harness.server.state.resize_output(700, 500);
+    let r2 = harness.sync();
+    let _r2_serial = configured_toplevel_serial(&r2);
+    let r2_state = harness.server.state.surfaces[&object]
+        .pending_window_state
+        .expect("O2 publishes replacement restore R2");
+    assert_eq!(r2_state.client_size, (500, 400));
+    release_surface_commit(&mut harness, r1_barrier);
+    assert!(!harness.server.state.surfaces[&object].committed_maximized);
+    assert_eq!(
+        harness.server.state.surfaces[&object].pending_window_state,
+        Some(r2_state)
+    );
+    let configured_before_o3 = harness.server.state.surfaces[&object]
+        .configured_window_states
+        .len();
+
+    harness.server.state.resize_output(320, 240);
+    let r3 = harness.sync();
+    assert_eq!(
+        r3.iter()
+            .filter(|(object, opcode, _)| *object == TEST_TOPLEVEL_ID && *opcode == 0)
+            .count(),
+        1,
+        "O3 emits no generic configure associated with stale R2"
+    );
+    assert_eq!(
+        r3.iter()
+            .filter(|(object, opcode, _)| *object == TEST_XDG_SURFACE_ID && *opcode == 0)
+            .count(),
+        1
+    );
+    let r3_serial = configured_toplevel_serial(&r3);
+    let r3_state = harness.server.state.surfaces[&object]
+        .pending_window_state
+        .expect("O3 publishes fresh reclamped restore R3");
+    assert_eq!(configured_toplevel_size(&r3), r3_state.client_size);
+    assert!(r3_state.client_size.0 < r2_state.client_size.0);
+    assert!(r3_state.client_size.1 < r2_state.client_size.1);
+    assert_eq!(
+        harness.server.state.surfaces[&object]
+            .configured_window_states
+            .len(),
+        configured_before_o3 + 1
+    );
+    assert!(
+        harness.server.state.surfaces[&object]
+            .configured_window_states
+            .iter()
+            .any(|snapshot| snapshot.serial == r3_serial.into() && snapshot.state == r3_state)
+    );
+
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        4,
+        &words(&[r3_serial]),
+    );
+    let buffer = harness
+        .create_dmabuf_buffer_sized(r3_state.client_size.0 as u32, r3_state.client_size.1 as u32);
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let record = &harness.server.state.surfaces[&object];
+    assert_eq!(record.window_origin, r3_state.window_origin);
+    assert_eq!(record.configured_size, r3_state.client_size);
+    assert!(record.pending_window_state.is_none());
+    let (chrome, outer) = test_chrome_layout(&harness);
+    assert!(outer.0 >= 0.0 && outer.1 >= 0.0);
+    assert!(outer.0 + chrome.window.w <= 320.0);
+    assert!(outer.1 + chrome.window.h <= 240.0);
+}
+
+#[test]
+fn non_motion_scene_changes_retarget_stationary_chrome_hover_and_cursor() {
+    let (mut maximized, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+    let button = chrome_button_point(&maximized, CaptionButton::Maximize);
+    route_pointer_to(&mut maximized, button.0, button.1);
+    route_pointer_button(&mut maximized, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(
+        &mut maximized,
+        PRIMARY_POINTER_BUTTON,
+        ButtonState::Released,
+    );
+    let configure = maximized.sync();
+    assert_eq!(
+        test_toplevel_record(&maximized)
+            .chrome_pointer
+            .hovered_button,
+        Some(CaptionButton::Maximize)
+    );
+    let configured = configured_toplevel_size(&configure);
+    send_request(
+        &mut maximized.client,
+        TEST_XDG_SURFACE_ID,
+        4,
+        &words(&[configured_toplevel_serial(&configure)]),
+    );
+    let buffer = maximized.create_dmabuf_buffer_sized(configured.0 as u32, configured.1 as u32);
+    send_request(
+        &mut maximized.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut maximized.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    maximized.dispatch_client();
+    assert!(matches!(
+        maximized.server.state.pointer_target_at(button.0, button.1),
+        Some(PointerTarget::Client { .. })
+    ));
+    assert_eq!(
+        test_toplevel_record(&maximized).chrome_pointer,
+        ChromePointerSceneState::default()
+    );
+    assert_eq!(maximized.server.state.chrome_cursor_override, None);
+
+    let (mut unmapped, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+    let edge = chrome_resize_point(&unmapped, cosmix_deco::ResizeEdge::Right);
+    route_pointer_to(&mut unmapped, edge.0, edge.1);
+    assert_eq!(
+        unmapped.server.state.chrome_cursor_override,
+        Some(ChromeCursorIcon::EResize)
+    );
+    send_request(
+        &mut unmapped.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[0, 0, 0]),
+    );
+    send_request(&mut unmapped.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    unmapped.dispatch_client();
+    assert_eq!(unmapped.server.state.chrome_cursor_override, None);
+    assert!(unmapped.server.state.chrome_hover.is_none());
+    assert!(unmapped.server.state.chrome_pressed.is_none());
+}
+
+fn test_surface_layout(harness: &KeybindingHarness, protocol_id: u32) -> SurfaceLayout {
+    harness
+        .server
+        .state
+        .surfaces
+        .values()
+        .find(|record| record.role.wl_surface().id().protocol_id() == protocol_id)
+        .unwrap_or_else(|| panic!("surface object {protocol_id} remains tracked"))
+        .layout
+}
+
+fn block_surface_commit(surface: &WlSurface) -> compositor::Barrier {
+    let barrier = compositor::Barrier::new(false);
+    compositor::add_blocker(surface, barrier.clone());
+    barrier
+}
+
+fn release_surface_commit(harness: &mut KeybindingHarness, barrier: compositor::Barrier) {
+    barrier.signal();
+    let client_state = Arc::clone(&harness.client_state);
+    let display_handle = harness.server.state.display_handle.clone();
+    client_state
+        .compositor_state
+        .blocker_cleared(&mut harness.server.state, &display_handle);
+}
+
+#[test]
+fn ssd_off_wire_and_committed_scene_state_remain_client_side() {
+    let mut harness = KeybindingHarness::new(true);
+    disable_test_ssd(&mut harness);
+    let (manager, version) = harness.registry_globals["zxdg_decoration_manager_v1"];
+    let manager_id = harness.allocate_object_id();
+    let decoration_id = harness.allocate_object_id();
+    bind_global(
+        &mut harness.client,
+        manager,
+        "zxdg_decoration_manager_v1",
+        version,
+        manager_id,
+    );
+    send_request(
+        &mut harness.client,
+        manager_id,
+        1,
+        &words(&[decoration_id, TEST_TOPLEVEL_ID]),
+    );
+    let traffic = harness.sync();
+    let configured_mode = traffic
+        .iter()
+        .find_map(|(object, opcode, body)| {
+            (*object == decoration_id && *opcode == 0)
+                .then(|| u32::from_ne_bytes(body[0..4].try_into().expect("decoration mode")))
+        })
+        .expect("decoration configure is emitted");
+    assert_eq!(configured_mode, DecorationMode::ClientSide as u32);
+    let serial = traffic
+        .iter()
+        .rev()
+        .find_map(|(object, opcode, body)| {
+            (*object == TEST_XDG_SURFACE_ID && *opcode == 0)
+                .then(|| u32::from_ne_bytes(body[0..4].try_into().expect("configure serial")))
+        })
+        .expect("client-side decoration configure has an xdg_surface serial");
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        4,
+        &words(&[serial]),
+    );
+    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+
+    let toplevel = harness
+        .server
+        .state
+        .surfaces
+        .values()
+        .find(|record| matches!(record.role, SurfaceRole::Toplevel(_)))
+        .expect("toplevel remains tracked");
+    assert_eq!(
+        toplevel.committed_decoration,
+        SceneDecorationMode::ClientSide
+    );
+    assert!(toplevel.focused);
+    assert_eq!(
+        toplevel.committed_window_geometry,
+        Some(SceneWindowGeometry {
+            x: 0.0,
+            y: 0.0,
+            width: 64.0,
+            height: 32.0,
+        })
+    );
+    assert_eq!(
+        toplevel.layout.toplevel,
+        Some(ToplevelSceneState {
+            decoration: SceneDecorationMode::ClientSide,
+            focused: true,
+            committed_maximized: false,
+            chrome_pointer: ChromePointerSceneState::default(),
+            window_geometry: SceneWindowGeometry {
+                x: 0.0,
+                y: 0.0,
+                width: 64.0,
+                height: 32.0,
+            },
+        })
+    );
+
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        3,
+        &words(&[2, 3, 60, 28]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let toplevel = harness
+        .server
+        .state
+        .surfaces
+        .values()
+        .find(|record| matches!(record.role, SurfaceRole::Toplevel(_)))
+        .expect("toplevel remains tracked");
+    assert_eq!(
+        toplevel.committed_window_geometry,
+        Some(SceneWindowGeometry {
+            x: 2.0,
+            y: 3.0,
+            width: 60.0,
+            height: 28.0,
+        })
+    );
+    assert_eq!(
+        toplevel
+            .layout
+            .toplevel
+            .expect("mapped toplevel carries scene state")
+            .window_geometry,
+        SceneWindowGeometry {
+            x: 2.0,
+            y: 3.0,
+            width: 60.0,
+            height: 28.0,
+        }
+    );
+}
+
+#[test]
+fn ssd_off_explicit_server_preference_does_not_change_the_wire_sequence() {
+    let mut harness = KeybindingHarness::new(true);
+    disable_test_ssd(&mut harness);
+    let (decoration, traffic) = bind_test_toplevel_decoration(&mut harness);
+    assert_eq!(
+        configured_decoration_mode(&traffic, decoration),
+        DecorationMode::ClientSide
+    );
+
+    send_request(
+        &mut harness.client,
+        decoration,
+        1,
+        &words(&[DecorationMode::ServerSide as u32]),
+    );
+    let traffic = harness.sync();
+    assert!(traffic.iter().all(|(object, opcode, _)| {
+        *opcode != 0 || (*object != TEST_XDG_SURFACE_ID && *object != decoration)
+    }));
+}
+
+#[test]
+fn ssd_on_negotiates_new_unset_and_explicit_modes() {
+    let mut harness = KeybindingHarness::new(true);
+    enable_test_ssd(&mut harness);
+    let (decoration, traffic) = bind_test_toplevel_decoration(&mut harness);
+    assert_eq!(
+        configured_decoration_mode(&traffic, decoration),
+        DecorationMode::ServerSide
+    );
+
+    send_request(
+        &mut harness.client,
+        decoration,
+        1,
+        &words(&[DecorationMode::ClientSide as u32]),
+    );
+    assert_eq!(
+        configured_decoration_mode(&harness.sync(), decoration),
+        DecorationMode::ClientSide
+    );
+
+    send_request(
+        &mut harness.client,
+        decoration,
+        1,
+        &words(&[DecorationMode::ServerSide as u32]),
+    );
+    assert_eq!(
+        configured_decoration_mode(&harness.sync(), decoration),
+        DecorationMode::ServerSide
+    );
+
+    send_request(
+        &mut harness.client,
+        decoration,
+        1,
+        &words(&[DecorationMode::ClientSide as u32]),
+    );
+    let _ = harness.sync();
+    send_request(&mut harness.client, decoration, 2, &[]);
+    assert_eq!(
+        configured_decoration_mode(&harness.sync(), decoration),
+        DecorationMode::ServerSide
+    );
+}
+
+#[test]
+fn default_on_client_that_never_binds_decoration_stays_unbound() {
+    let mut harness = KeybindingHarness::new(true);
+    assert!(harness.server.state.decoration.enabled);
+    let configure = test_toplevel_record(&harness)
+        .required_configure
+        .expect("initial configure exists");
+    ack_and_map_test_toplevel(&mut harness, u32::from(configure));
+
+    let record = test_toplevel_record(&harness);
+    assert_eq!(record.committed_decoration, SceneDecorationMode::Unbound);
+    assert_eq!(
+        record.layout.toplevel.expect("mapped toplevel").decoration,
+        SceneDecorationMode::Unbound
+    );
+}
+
+#[test]
+fn xdg_title_change_is_published_in_complete_surface_snapshot() {
+    let mut harness = KeybindingHarness::new(true);
+    let configure = test_toplevel_record(&harness)
+        .required_configure
+        .expect("initial configure exists");
+    ack_and_map_test_toplevel(&mut harness, u32::from(configure));
+    harness.server.state.events.clear();
+
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_ID,
+        2,
+        &wire_string_argument("Protocol title"),
+    );
+    harness.dispatch_client();
+
+    let record = test_toplevel_record(&harness);
+    assert_eq!(record.title.as_deref(), Some("Protocol title"));
+    let scene = harness
+        .server
+        .state
+        .events
+        .iter()
+        .find_map(|event| match event {
+            ProtocolEvent::SurfaceRelayout { scene, .. } => Some(scene),
+            _ => None,
+        })
+        .expect("mapped title change publishes a scene relayout");
+    assert_eq!(scene.layout, record.layout);
+    assert_eq!(scene.title.as_deref(), Some("Protocol title"));
+}
+
+#[test]
+fn xdg_title_is_capped_by_unicode_scalar_count_before_unmapped_retention() {
+    let mut harness = KeybindingHarness::new(true);
+    let oversized = format!("{}z", "é".repeat(MAX_TITLE_SCALARS));
+    let expected = "é".repeat(MAX_TITLE_SCALARS);
+
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_ID,
+        2,
+        &wire_string_argument(&oversized),
+    );
+    harness.dispatch_client();
+
+    let retained = test_toplevel_record(&harness)
+        .title
+        .as_deref()
+        .expect("unmapped toplevel retains its capped title");
+    assert_eq!(retained, expected);
+    assert_eq!(retained.chars().count(), MAX_TITLE_SCALARS);
+    assert!(retained.is_char_boundary(retained.len()));
+    assert!(harness.server.state.events.is_empty());
+}
+
+#[test]
+fn default_on_honours_explicit_client_side_and_never_targets_chrome() {
+    let mut harness = KeybindingHarness::new(true);
+    assert!(harness.server.state.decoration.enabled);
+    let (decoration, _) = bind_test_toplevel_decoration(&mut harness);
+    send_request(
+        &mut harness.client,
+        decoration,
+        1,
+        &words(&[DecorationMode::ClientSide as u32]),
+    );
+    let traffic = harness.sync();
+    assert_eq!(
+        configured_decoration_mode(&traffic, decoration),
+        DecorationMode::ClientSide
+    );
+    ack_and_map_test_toplevel(&mut harness, configured_toplevel_serial(&traffic));
+    assert_eq!(
+        test_toplevel_record(&harness).committed_decoration,
+        SceneDecorationMode::ClientSide
+    );
+
+    let record = test_toplevel_record(&harness);
+    assert!(matches!(
+        harness.server.state.pointer_target_at(
+            f64::from(record.layout.x) - 1.0,
+            f64::from(record.layout.y) - 1.0,
+        ),
+        None | Some(PointerTarget::Client { .. })
+    ));
+}
+
+#[test]
+fn mapped_decoration_request_reaches_renderer_only_after_ack_and_commit() {
+    let mut harness = KeybindingHarness::new(true);
+    enable_test_ssd(&mut harness);
+    let (decoration, traffic) = bind_test_toplevel_decoration(&mut harness);
+    let serial = configured_toplevel_serial(&traffic);
+    ack_and_map_test_toplevel(&mut harness, serial);
+    assert_eq!(
+        test_toplevel_record(&harness).committed_decoration,
+        SceneDecorationMode::ServerSide
+    );
+    harness.server.state.events.clear();
+
+    send_request(
+        &mut harness.client,
+        decoration,
+        1,
+        &words(&[DecorationMode::ClientSide as u32]),
+    );
+    let traffic = harness.sync();
+    assert_eq!(
+        configured_decoration_mode(&traffic, decoration),
+        DecorationMode::ClientSide
+    );
+    assert_eq!(
+        test_toplevel_record(&harness).committed_decoration,
+        SceneDecorationMode::ServerSide
+    );
+    assert!(harness.server.state.events.iter().all(|event| {
+        !matches!(
+            event,
+            ProtocolEvent::SurfaceRelayout {
+                scene: SurfaceSceneSnapshot {
+                    layout: SurfaceLayout {
+                        toplevel: Some(ToplevelSceneState {
+                            decoration: SceneDecorationMode::ClientSide,
+                            ..
+                        }),
+                        ..
+                    },
+                    ..
+                },
+                ..
+            }
+        )
+    }));
+
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&traffic));
+    assert_eq!(
+        test_toplevel_record(&harness).committed_decoration,
+        SceneDecorationMode::ClientSide
+    );
+    assert!(harness.server.state.events.iter().any(|event| {
+        matches!(
+            event,
+            ProtocolEvent::SurfaceRelayout {
+                scene: SurfaceSceneSnapshot {
+                    layout: SurfaceLayout {
+                        toplevel: Some(ToplevelSceneState {
+                            decoration: SceneDecorationMode::ClientSide,
+                            ..
+                        }),
+                        ..
+                    },
+                    ..
+                },
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn queued_decoration_commits_adopt_each_acked_mode_at_its_own_commit() {
+    let mut harness = KeybindingHarness::new(true);
+    enable_test_ssd(&mut harness);
+    let (decoration, traffic) = bind_test_toplevel_decoration(&mut harness);
+    ack_and_map_test_toplevel(&mut harness, configured_toplevel_serial(&traffic));
+    harness.server.state.events.clear();
+
+    send_request(
+        &mut harness.client,
+        decoration,
+        1,
+        &words(&[DecorationMode::ClientSide as u32]),
+    );
+    let client_side = harness.sync();
+    let surface = test_toplevel_record(&harness).role.wl_surface().clone();
+    let barrier = block_surface_commit(&surface);
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        4,
+        &words(&[configured_toplevel_serial(&client_side)]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+
+    send_request(
+        &mut harness.client,
+        decoration,
+        1,
+        &words(&[DecorationMode::ServerSide as u32]),
+    );
+    let server_side = harness.sync();
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        4,
+        &words(&[configured_toplevel_serial(&server_side)]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+
+    release_surface_commit(&mut harness, barrier);
+    let modes = harness
+        .server
+        .state
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ProtocolEvent::SurfaceRelayout {
+                scene:
+                    SurfaceSceneSnapshot {
+                        layout:
+                            SurfaceLayout {
+                                toplevel: Some(toplevel),
+                                ..
+                            },
+                        ..
+                    },
+                ..
+            } => Some(toplevel.decoration),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        modes,
+        [
+            SceneDecorationMode::ClientSide,
+            SceneDecorationMode::ServerSide
+        ]
+    );
+    assert_eq!(
+        test_toplevel_record(&harness).committed_decoration,
+        SceneDecorationMode::ServerSide
+    );
+}
+
+#[test]
+fn decoration_destroy_reverts_to_csd_on_the_next_commit_without_configure() {
+    let mut harness = KeybindingHarness::new(true);
+    enable_test_ssd(&mut harness);
+    let (decoration, traffic) = bind_test_toplevel_decoration(&mut harness);
+    ack_and_map_test_toplevel(&mut harness, configured_toplevel_serial(&traffic));
+
+    send_request(&mut harness.client, decoration, 0, &[]);
+    let traffic = harness.sync();
+    assert!(traffic.iter().all(|(object, opcode, _)| {
+        *opcode != 0 || (*object != TEST_XDG_SURFACE_ID && *object != decoration)
+    }));
+    assert_eq!(
+        test_toplevel_record(&harness).committed_decoration,
+        SceneDecorationMode::ServerSide
+    );
+
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        test_toplevel_record(&harness).committed_decoration,
+        SceneDecorationMode::ClientSide
+    );
+
+    send_request(&mut harness.client, TEST_TOPLEVEL_ID, 9, &[]);
+    let ordinary_configure = harness.sync();
+    assert!(
+        ordinary_configure
+            .iter()
+            .all(|(object, _, _)| { *object != decoration })
+    );
+    commit_test_toplevel_state(
+        &mut harness,
+        configured_toplevel_serial(&ordinary_configure),
+    );
+    assert_eq!(
+        test_toplevel_record(&harness).committed_decoration,
+        SceneDecorationMode::ClientSide
+    );
+}
+
+#[test]
+fn premapped_replacement_decoration_is_configured_and_commits_server_side() {
+    let mut harness = KeybindingHarness::new(true);
+    enable_test_ssd(&mut harness);
+    let (decoration_a, traffic) = bind_test_toplevel_decoration(&mut harness);
+    assert_eq!(
+        configured_decoration_mode(&traffic, decoration_a),
+        DecorationMode::ServerSide
+    );
+    assert!(!test_toplevel_record(&harness).mapped);
+
+    send_request(&mut harness.client, decoration_a, 0, &[]);
+    let (decoration_b, traffic) = bind_test_toplevel_decoration(&mut harness);
+    assert_eq!(
+        configured_decoration_mode(&traffic, decoration_b),
+        DecorationMode::ServerSide
+    );
+    assert_eq!(
+        traffic
+            .iter()
+            .filter(|(object, opcode, _)| *object == decoration_b && *opcode == 0)
+            .count(),
+        1
+    );
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&traffic));
+
+    let record = test_toplevel_record(&harness);
+    assert_eq!(record.committed_decoration, SceneDecorationMode::ServerSide);
+    assert!(record.decoration_object_bound);
+}
+
+#[test]
+fn unknown_decoration_mode_posts_invalid_mode() {
+    let mut harness = KeybindingHarness::new(true);
+    enable_test_ssd(&mut harness);
+    let (decoration, _) = bind_test_toplevel_decoration(&mut harness);
+
+    send_request(&mut harness.client, decoration, 1, &words(&[99]));
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(offending, decoration, "wrong error object: {message}");
+    assert_eq!(code, zxdg_toplevel_decoration_v1::Error::InvalidMode as u32);
+}
+
+#[test]
+fn non_positive_window_geometry_posts_invalid_size() {
+    let mut harness = KeybindingHarness::new(true);
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        3,
+        &words(&[0, 0, 0, 24]),
+    );
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(
+        offending, TEST_XDG_SURFACE_ID,
+        "wrong error object: {message}"
+    );
+    assert_eq!(code, xdg_surface::Error::InvalidSize as u32);
+}
+
+#[test]
+fn roleless_non_positive_window_geometry_posts_not_constructed_first() {
+    let (runtime, mut client) = role_guard_runtime("zero-geometry");
+    send_request(&mut client, 4, 0, &words(&[6]));
+    send_request(&mut client, 5, 2, &words(&[7, 6]));
+    send_request(&mut client, 7, 3, &words(&[0, 0, 0, 24]));
+
+    let (offending, code, message) = read_protocol_error(&mut client);
+    assert_eq!(offending, 7, "wrong error object: {message}");
+    assert_eq!(code, xdg_surface::Error::NotConstructed as u32);
+
+    drop(client);
+    drop(runtime);
+}
+
+#[test]
+fn unset_window_geometry_tracks_the_committed_subsurface_tree_bounds() {
+    let mut harness = KeybindingHarness::new(true);
+    let serial = u32::from(
+        test_toplevel_record(&harness)
+            .required_configure
+            .expect("initial configure"),
+    );
+    ack_and_map_test_toplevel(&mut harness, serial);
+
+    let child_surface = harness.allocate_object_id();
+    let subsurface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[child_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_SUBCOMPOSITOR_ID,
+        1,
+        &words(&[subsurface, child_surface, TEST_TOPLEVEL_SURFACE_ID]),
+    );
+    send_request(&mut harness.client, subsurface, 1, &words(&[50, 4]));
+    let buffer = harness.create_dmabuf_buffer_sized(400, 20);
+    send_request(
+        &mut harness.client,
+        child_surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, child_surface, 6, &[]);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+
+    let geometry = test_toplevel_record(&harness)
+        .committed_window_geometry
+        .expect("toplevel has effective geometry");
+    assert_eq!(
+        geometry,
+        SceneWindowGeometry {
+            x: 0.0,
+            y: 0.0,
+            width: 450.0,
+            height: 32.0,
+        }
+    );
+}
+
+#[test]
+fn unmapped_subsurface_no_longer_contributes_stale_implicit_bounds() {
+    let mut harness = KeybindingHarness::new(true);
+    let serial = u32::from(
+        test_toplevel_record(&harness)
+            .required_configure
+            .expect("initial configure"),
+    );
+    ack_and_map_test_toplevel(&mut harness, serial);
+
+    let child_surface = harness.allocate_object_id();
+    let subsurface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[child_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_SUBCOMPOSITOR_ID,
+        1,
+        &words(&[subsurface, child_surface, TEST_TOPLEVEL_SURFACE_ID]),
+    );
+    send_request(&mut harness.client, subsurface, 1, &words(&[100, 0]));
+    let buffer = harness.create_dmabuf_buffer_sized(50, 20);
+    send_request(
+        &mut harness.client,
+        child_surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, child_surface, 6, &[]);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        test_toplevel_record(&harness)
+            .committed_window_geometry
+            .expect("implicit geometry")
+            .width,
+        150.0
+    );
+
+    send_request(&mut harness.client, child_surface, 1, &words(&[0, 0, 0]));
+    send_request(&mut harness.client, child_surface, 6, &[]);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        test_toplevel_record(&harness).committed_window_geometry,
+        Some(SceneWindowGeometry {
+            x: 0.0,
+            y: 0.0,
+            width: 64.0,
+            height: 32.0,
+        })
+    );
+}
+
+#[test]
+fn destroying_subsurface_role_refreshes_former_implicit_toplevel_bounds() {
+    let mut harness = KeybindingHarness::new(true);
+    let serial = u32::from(
+        test_toplevel_record(&harness)
+            .required_configure
+            .expect("initial configure"),
+    );
+    ack_and_map_test_toplevel(&mut harness, serial);
+    let (_, _, subsurface) = harness.extra_mapped_subsurface_with_role();
+    send_request(&mut harness.client, subsurface, 1, &words(&[100, 0]));
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        test_toplevel_record(&harness)
+            .committed_window_geometry
+            .expect("expanded implicit geometry")
+            .width,
+        164.0
+    );
+    harness.server.state.events.clear();
+
+    send_request(&mut harness.client, subsurface, 0, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        test_toplevel_record(&harness).committed_window_geometry,
+        Some(SceneWindowGeometry {
+            x: 0.0,
+            y: 0.0,
+            width: 64.0,
+            height: 32.0,
+        })
+    );
+    assert!(harness.server.state.events.iter().any(|event| {
+        matches!(
+            event,
+            ProtocolEvent::SurfaceRelayout {
+                scene: SurfaceSceneSnapshot {
+                    layout: SurfaceLayout {
+                        toplevel: Some(ToplevelSceneState {
+                            window_geometry: SceneWindowGeometry { width: 64.0, .. },
+                            ..
+                        }),
+                        ..
+                    },
+                    ..
+                },
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn explicit_window_geometry_is_clamped_to_the_surface_tree_bounds() {
+    let mut harness = KeybindingHarness::new(true);
+    let serial = u32::from(
+        test_toplevel_record(&harness)
+            .required_configure
+            .expect("initial configure"),
+    );
+    ack_and_map_test_toplevel(&mut harness, serial);
+
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        3,
+        &words(&[(-10_i32) as u32, (-8_i32) as u32, 100, 80]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+
+    assert_eq!(
+        test_toplevel_record(&harness).committed_window_geometry,
+        Some(SceneWindowGeometry {
+            x: 0.0,
+            y: 0.0,
+            width: 64.0,
+            height: 32.0,
+        })
+    );
+}
+
+#[test]
+fn explicit_window_geometry_clamp_persists_until_an_identical_request_commits() {
+    let mut harness = KeybindingHarness::new(true);
+    let serial = u32::from(
+        test_toplevel_record(&harness)
+            .required_configure
+            .expect("initial configure"),
+    );
+    ack_and_map_test_toplevel(&mut harness, serial);
+
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        3,
+        &words(&[(-20_i32) as u32, 0, 60, 20]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let initially_clamped = SceneWindowGeometry {
+        x: 0.0,
+        y: 0.0,
+        width: 40.0,
+        height: 20.0,
+    };
+    assert_eq!(
+        test_toplevel_record(&harness).committed_window_geometry,
+        Some(initially_clamped)
+    );
+
+    let child_surface = harness.allocate_object_id();
+    let subsurface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[child_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_SUBCOMPOSITOR_ID,
+        1,
+        &words(&[subsurface, child_surface, TEST_TOPLEVEL_SURFACE_ID]),
+    );
+    send_request(
+        &mut harness.client,
+        subsurface,
+        1,
+        &words(&[(-30_i32) as u32, 0]),
+    );
+    let buffer = harness.create_dmabuf_buffer_sized(16, 16);
+    send_request(
+        &mut harness.client,
+        child_surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, child_surface, 6, &[]);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        test_toplevel_record(&harness).committed_window_geometry,
+        Some(initially_clamped)
+    );
+
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        3,
+        &words(&[(-20_i32) as u32, 0, 60, 20]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        test_toplevel_record(&harness).committed_window_geometry,
+        Some(SceneWindowGeometry {
+            x: -20.0,
+            y: 0.0,
+            width: 60.0,
+            height: 20.0,
+        })
+    );
+}
+
+#[test]
+fn blocked_window_geometry_commits_keep_each_request_commit_scoped() {
+    let mut harness = KeybindingHarness::new(true);
+    let serial = u32::from(
+        test_toplevel_record(&harness)
+            .required_configure
+            .expect("initial configure"),
+    );
+    ack_and_map_test_toplevel(&mut harness, serial);
+    let surface = test_toplevel_record(&harness).role.wl_surface().clone();
+    let barrier = block_surface_commit(&surface);
+
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        3,
+        &words(&[1, 2, 50, 20]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        3,
+        &words(&[3, 4, 40, 16]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+
+    release_surface_commit(&mut harness, barrier);
+    assert_eq!(
+        test_toplevel_record(&harness).committed_window_geometry,
+        Some(SceneWindowGeometry {
+            x: 3.0,
+            y: 4.0,
+            width: 40.0,
+            height: 16.0,
+        })
+    );
+}
+
+#[test]
+fn toplevel_window_geometry_origin_shift_moves_existing_subsurfaces() {
+    let mut harness = KeybindingHarness::new(true);
+    let serial = u32::from(
+        test_toplevel_record(&harness)
+            .required_configure
+            .expect("initial configure"),
+    );
+    ack_and_map_test_toplevel(&mut harness, serial);
+    let (child, child_surface) = harness.extra_mapped_subsurface();
+    let root_before = test_surface_layout(&harness, TEST_TOPLEVEL_SURFACE_ID);
+    let child_before = harness.server.state.surfaces[&child.id()].layout;
+
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        3,
+        &words(&[10, 10, 40, 20]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+
+    let root_after = test_surface_layout(&harness, TEST_TOPLEVEL_SURFACE_ID);
+    let child_after = test_surface_layout(&harness, child_surface);
+    assert_eq!(
+        (root_after.x, root_after.y),
+        (root_before.x - 10.0, root_before.y - 10.0)
+    );
+    assert_eq!(
+        (child_after.x, child_after.y),
+        (child_before.x - 10.0, child_before.y - 10.0)
+    );
+    assert_eq!(
+        (child_after.x - root_after.x, child_after.y - root_after.y),
+        (
+            child_before.x - root_before.x,
+            child_before.y - root_before.y
+        )
+    );
+}
+
+#[test]
+fn subsurface_buffer_commit_never_applies_xdg_window_geometry() {
+    let mut harness = KeybindingHarness::new(true);
+    let serial = u32::from(
+        test_toplevel_record(&harness)
+            .required_configure
+            .expect("initial configure"),
+    );
+    ack_and_map_test_toplevel(&mut harness, serial);
+
+    let child_surface = harness.allocate_object_id();
+    let child_role = harness.allocate_object_id();
+    let grandchild_surface = harness.allocate_object_id();
+    let grandchild_role = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[child_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_SUBCOMPOSITOR_ID,
+        1,
+        &words(&[child_role, child_surface, TEST_TOPLEVEL_SURFACE_ID]),
+    );
+    send_request(&mut harness.client, child_role, 1, &words(&[10, 10]));
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[grandchild_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_SUBCOMPOSITOR_ID,
+        1,
+        &words(&[grandchild_role, grandchild_surface, child_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        grandchild_role,
+        1,
+        &words(&[(-5_i32) as u32, (-7_i32) as u32]),
+    );
+    let grandchild_buffer = harness.create_dmabuf_buffer_sized(8, 8);
+    send_request(
+        &mut harness.client,
+        grandchild_surface,
+        1,
+        &words(&[grandchild_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, grandchild_surface, 6, &[]);
+    let child_buffer = harness.create_dmabuf_buffer_sized(16, 16);
+    send_request(
+        &mut harness.client,
+        child_surface,
+        1,
+        &words(&[child_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, child_surface, 6, &[]);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let geometry_calls_before = harness.server.state.effective_window_geometry_calls;
+
+    let replacement = harness.create_dmabuf_buffer_sized(20, 20);
+    send_request(
+        &mut harness.client,
+        child_surface,
+        1,
+        &words(&[replacement, 0, 0]),
+    );
+    send_request(&mut harness.client, child_surface, 6, &[]);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let child_after = test_surface_layout(&harness, child_surface);
+    let grandchild_after = test_surface_layout(&harness, grandchild_surface);
+    let root_after = test_surface_layout(&harness, TEST_TOPLEVEL_SURFACE_ID);
+    assert_eq!(
+        harness.server.state.effective_window_geometry_calls - geometry_calls_before,
+        1,
+        "the applying toplevel commit recalculates geometry once for the synchronized tree"
+    );
+    assert_eq!(
+        (child_after.x - root_after.x, child_after.y - root_after.y),
+        (10.0, 10.0)
+    );
+    assert_eq!(
+        (
+            grandchild_after.x - child_after.x,
+            grandchild_after.y - child_after.y
+        ),
+        (-5.0, -7.0)
+    );
+}
+
+#[test]
+fn blocked_desync_subsurface_commit_refreshes_geometry_after_set_sync() {
+    let mut harness = KeybindingHarness::new(true);
+    let serial = u32::from(
+        test_toplevel_record(&harness)
+            .required_configure
+            .expect("initial configure"),
+    );
+    ack_and_map_test_toplevel(&mut harness, serial);
+    let (child, child_surface, child_role) = harness.extra_mapped_subsurface_with_role();
+    send_request(&mut harness.client, child_role, 5, &[]);
+    harness.dispatch_client();
+
+    let replacement = harness.create_dmabuf_buffer_sized(200, 40);
+    let geometry_calls_before = harness.server.state.effective_window_geometry_calls;
+    let barrier = block_surface_commit(&child);
+    send_request(
+        &mut harness.client,
+        child_surface,
+        1,
+        &words(&[replacement, 0, 0]),
+    );
+    send_request(&mut harness.client, child_surface, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        test_toplevel_record(&harness)
+            .committed_window_geometry
+            .expect("pre-release implicit geometry")
+            .width,
+        64.0
+    );
+
+    send_request(&mut harness.client, child_role, 4, &[]);
+    harness.dispatch_client();
+    release_surface_commit(&mut harness, barrier);
+    assert_eq!(
+        test_toplevel_record(&harness).committed_window_geometry,
+        Some(SceneWindowGeometry {
+            x: 0.0,
+            y: 0.0,
+            width: 200.0,
+            height: 40.0,
+        })
+    );
+    assert_eq!(
+        harness.server.state.effective_window_geometry_calls - geometry_calls_before,
+        1,
+        "the desynchronised child refreshes its root once when its transaction applies"
+    );
+}
+
+#[test]
+fn ssd_configure_sizes_remain_identical_client_space_values() {
+    let mut off = KeybindingHarness::new(true);
+    disable_test_ssd(&mut off);
+    let (off_decoration, off_traffic) = bind_test_toplevel_decoration(&mut off);
+    assert_eq!(
+        configured_decoration_mode(&off_traffic, off_decoration),
+        DecorationMode::ClientSide
+    );
+
+    let mut on = KeybindingHarness::new(true);
+    enable_test_ssd(&mut on);
+    let (on_decoration, on_traffic) = bind_test_toplevel_decoration(&mut on);
+    assert_eq!(
+        configured_decoration_mode(&on_traffic, on_decoration),
+        DecorationMode::ServerSide
+    );
+    assert_eq!(
+        configured_toplevel_size(&off_traffic),
+        configured_toplevel_size(&on_traffic)
+    );
+}
+
+#[test]
+fn committed_csd_ssd_round_trip_preserves_the_managed_outer_origin() {
+    let mut harness = KeybindingHarness::new(true);
+    enable_test_ssd(&mut harness);
+    let (decoration, _) = bind_test_toplevel_decoration(&mut harness);
+    send_request(
+        &mut harness.client,
+        decoration,
+        1,
+        &words(&[DecorationMode::ClientSide as u32]),
+    );
+    let client_traffic = harness.sync();
+    ack_and_map_test_toplevel(&mut harness, configured_toplevel_serial(&client_traffic));
+    let original_origin = test_toplevel_record(&harness).window_origin;
+
+    send_request(
+        &mut harness.client,
+        decoration,
+        1,
+        &words(&[DecorationMode::ServerSide as u32]),
+    );
+    let server_traffic = harness.sync();
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&server_traffic));
+    let extents = DecoExtents::of(&harness.server.state.decoration.theme);
+    let ssd_origin = test_toplevel_record(&harness).window_origin;
+    assert_eq!(
+        (ssd_origin.0 - extents.left, ssd_origin.1 - extents.top),
+        original_origin
+    );
+
+    send_request(
+        &mut harness.client,
+        decoration,
+        1,
+        &words(&[DecorationMode::ClientSide as u32]),
+    );
+    let client_traffic = harness.sync();
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&client_traffic));
+    assert_eq!(
+        test_toplevel_record(&harness).window_origin,
+        original_origin
+    );
+}
+
+#[test]
+fn committed_csd_ssd_round_trip_shifts_a_mapped_popup_both_directions() {
+    let mut harness = KeybindingHarness::new(true);
+    enable_test_ssd(&mut harness);
+    let (decoration, _) = bind_test_toplevel_decoration(&mut harness);
+    send_request(
+        &mut harness.client,
+        decoration,
+        1,
+        &words(&[DecorationMode::ClientSide as u32]),
+    );
+    let client_traffic = harness.sync();
+    ack_and_map_test_toplevel(&mut harness, configured_toplevel_serial(&client_traffic));
+
+    let positioner = harness.allocate_object_id();
+    let popup_surface = harness.allocate_object_id();
+    let popup_xdg_surface = harness.allocate_object_id();
+    let popup_role = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        1,
+        &words(&[positioner]),
+    );
+    send_request(&mut harness.client, positioner, 1, &words(&[48, 32]));
+    send_request(
+        &mut harness.client,
+        positioner,
+        2,
+        &words(&[20, 18, 12, 10]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[popup_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        2,
+        &words(&[popup_xdg_surface, popup_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        popup_xdg_surface,
+        2,
+        &words(&[popup_role, TEST_XDG_SURFACE_ID, positioner]),
+    );
+    send_request(&mut harness.client, popup_surface, 6, &[]);
+    let popup_traffic = harness.sync();
+    let popup_serial = popup_traffic
+        .iter()
+        .rev()
+        .find_map(|(object, opcode, body)| {
+            (*object == popup_xdg_surface && *opcode == 0)
+                .then(|| u32::from_ne_bytes(body[0..4].try_into().expect("popup serial")))
+        })
+        .expect("popup receives its initial xdg_surface configure");
+    send_request(
+        &mut harness.client,
+        popup_xdg_surface,
+        4,
+        &words(&[popup_serial]),
+    );
+    let popup_buffer = harness.create_dmabuf_buffer_sized(48, 32);
+    send_request(
+        &mut harness.client,
+        popup_surface,
+        1,
+        &words(&[popup_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, popup_surface, 6, &[]);
+    harness.dispatch_client();
+    let popup_object = harness
+        .server
+        .state
+        .surfaces
+        .keys()
+        .find(|object| object.protocol_id() == popup_surface)
+        .cloned()
+        .expect("mapped popup remains tracked");
+    let original_popup = harness.server.state.surfaces[&popup_object].layout;
+    assert!(harness.server.state.surfaces[&popup_object].mapped);
+
+    send_request(
+        &mut harness.client,
+        decoration,
+        1,
+        &words(&[DecorationMode::ServerSide as u32]),
+    );
+    let server_traffic = harness.sync();
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&server_traffic));
+    let extents = DecoExtents::of(&harness.server.state.decoration.theme);
+    let server_popup = harness.server.state.surfaces[&popup_object].layout;
+    assert_eq!(server_popup.x, original_popup.x + extents.left);
+    assert_eq!(server_popup.y, original_popup.y + extents.top);
+
+    send_request(
+        &mut harness.client,
+        decoration,
+        1,
+        &words(&[DecorationMode::ClientSide as u32]),
+    );
+    let client_traffic = harness.sync();
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&client_traffic));
+    let restored_popup = harness.server.state.surfaces[&popup_object].layout;
+    assert_eq!(
+        (restored_popup.x, restored_popup.y),
+        (original_popup.x, original_popup.y)
+    );
+    assert_eq!(restored_popup.parent, original_popup.parent);
+}
+
+#[test]
+fn ssd_output_resize_converts_outer_availability_to_client_space() {
+    let mut harness = KeybindingHarness::new(true);
+    enable_test_ssd(&mut harness);
+    let (_, traffic) = bind_test_toplevel_decoration(&mut harness);
+    ack_and_map_test_toplevel(&mut harness, configured_toplevel_serial(&traffic));
+    let extents = DecoExtents::of(&harness.server.state.decoration.theme);
+    {
+        let record = harness
+            .server
+            .state
+            .surfaces
+            .values_mut()
+            .find(|record| matches!(record.role, SurfaceRole::Toplevel(_)))
+            .expect("toplevel remains tracked");
+        record.window_origin = (10.0 + extents.left, 20.0 + extents.top);
+        record.layout.x = record.window_origin.0;
+        record.layout.y = record.window_origin.1;
+        record.configured_size = (500, 400);
+    }
+
+    harness.server.state.resize_output(400, 300);
+    let available = extents.content_size_for_window(vec2(
+        400.0 - 10.0 - OUTPUT_MARGIN,
+        300.0 - 20.0 - OUTPUT_MARGIN,
+    ));
+    assert_eq!(
+        test_toplevel_record(&harness).configured_size,
+        (available.x.max(240.0) as i32, available.y.max(160.0) as i32)
+    );
+}
+
+#[test]
+fn ssd_output_resize_clamps_an_undersized_commit_by_its_minimum_outer_frame() {
+    let mut harness = KeybindingHarness::new(true);
+    enable_test_ssd(&mut harness);
+    let (_, traffic) = bind_test_toplevel_decoration(&mut harness);
+    ack_and_map_test_toplevel(&mut harness, configured_toplevel_serial(&traffic));
+    let theme = harness.server.state.decoration.theme.clone();
+    let extents = DecoExtents::of(&theme);
+    let chrome = ChromeLayout::compute(&theme, vec2(10.0, 5.0));
+    let requested_outer = (180.0, 130.0);
+    {
+        let record = harness
+            .server
+            .state
+            .surfaces
+            .values_mut()
+            .find(|record| matches!(record.role, SurfaceRole::Toplevel(_)))
+            .expect("toplevel remains tracked");
+        record.window_origin = (
+            requested_outer.0 + extents.left,
+            requested_outer.1 + extents.top,
+        );
+        record.layout.x = record.window_origin.0;
+        record.layout.y = record.window_origin.1;
+        record.layout.width = 10.0;
+        record.layout.height = 5.0;
+        record.configured_size = (10, 5);
+        record.committed_window_geometry = Some(SceneWindowGeometry {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 5.0,
+        });
+        sync_toplevel_scene_state(record);
+    }
+
+    let output = (200_u32, 160_u32);
+    harness.server.state.resize_output(output.0, output.1);
+    let record = test_toplevel_record(&harness);
+    let outer = (
+        record.window_origin.0 - extents.left,
+        record.window_origin.1 - extents.top,
+    );
+    assert_eq!(
+        outer,
+        (
+            (output.0 as f32 - chrome.window.w - OUTPUT_MARGIN).max(0.0),
+            (output.1 as f32 - chrome.window.h - OUTPUT_MARGIN).max(0.0),
+        )
+    );
+    assert!(outer.0 + chrome.window.w + OUTPUT_MARGIN <= output.0 as f32);
+    assert!(outer.1 + chrome.window.h + OUTPUT_MARGIN <= output.1 as f32);
+    assert_eq!(record.configured_size, (10, 5));
+}
+
+#[test]
+fn xdg_configures_are_staged_and_popup_requires_a_mapped_parent() {
+    // Hard-required, not skipped. A socket-backed test that returns early when
+    // the environment is thin reports success without having proved anything,
+    // and the four other socket tests here already `expect` it — an
+    // inconsistency that means the suite's green is only as strong as its
+    // weakest site.
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the xdg staging test");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-xdg-stage-test-{}-{unique}", std::process::id());
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: vec![cosmix_wgpu_dmabuf::DmabufFormat {
+                fourcc: smithay::backend::allocator::Fourcc::Argb8888 as u32,
+                modifier: u64::from(smithay::backend::allocator::Modifier::Linear),
+                plane_count: 1,
+            }],
+            adapter_name: "test".into(),
+            drm_adapter: synthetic_drm_adapter("protocol-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: true,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+
+    send_display_request(&mut client, 1, 2);
+    send_display_request(&mut client, 0, 3);
+    let globals = registry_globals(&mut client, 3);
+    let (compositor, compositor_version) = globals["wl_compositor"];
+    let (xdg_wm_base, xdg_version) = globals["xdg_wm_base"];
+    bind_global(
+        &mut client,
+        compositor,
+        "wl_compositor",
+        compositor_version.min(5),
+        4,
+    );
+    bind_global(
+        &mut client,
+        xdg_wm_base,
+        "xdg_wm_base",
+        xdg_version.min(6),
+        5,
+    );
+
+    send_request(&mut client, 4, 0, &words(&[6])); // wl_compositor.create_surface
+    send_request(&mut client, 5, 2, &words(&[7, 6])); // xdg_wm_base.get_xdg_surface
+    send_request(&mut client, 7, 1, &words(&[8])); // xdg_surface.get_toplevel
+    send_request(&mut client, 8, 9, &[]); // set_maximized before initial commit
+    send_request(&mut client, 8, 11, &words(&[0])); // set_fullscreen(NULL)
+    send_display_request(&mut client, 0, 9);
+    let before_toplevel_commit = events_until_callback(&mut client, 9);
+    assert!(
+        before_toplevel_commit
+            .iter()
+            .all(|(object, _, _)| *object != 7 && *object != 8),
+        "no xdg configure is legal before the initial empty commit"
+    );
+
+    send_request(&mut client, 6, 6, &[]); // wl_surface.commit, no buffer
+    send_display_request(&mut client, 0, 10);
+    let toplevel_configure = events_until_callback(&mut client, 10);
+    assert!(
+        toplevel_configure
+            .iter()
+            .any(|(object, opcode, _)| *object == 8 && *opcode == 0)
+    );
+    let serial = toplevel_configure
+        .iter()
+        .find_map(|(object, opcode, body)| {
+            (*object == 7 && *opcode == 0)
+                .then(|| u32::from_ne_bytes(body[0..4].try_into().expect("configure serial")))
+        })
+        .expect("xdg_surface.configure follows xdg_toplevel.configure");
+    send_request(&mut client, 7, 4, &words(&[serial])); // xdg_surface.ack_configure
+
+    send_request(&mut client, 5, 1, &words(&[11])); // create_positioner
+    send_request(&mut client, 11, 1, &words(&[32, 24])); // set_size
+    send_request(&mut client, 11, 2, &words(&[0, 0, 1, 1])); // set_anchor_rect
+    send_request(&mut client, 4, 0, &words(&[12])); // popup wl_surface
+    send_request(&mut client, 5, 2, &words(&[13, 12])); // popup xdg_surface
+    send_request(&mut client, 13, 2, &words(&[14, 7, 11])); // get_popup
+    send_display_request(&mut client, 0, 15);
+    let before_popup_commit = events_until_callback(&mut client, 15);
+    assert!(
+        before_popup_commit
+            .iter()
+            .any(|(object, opcode, _)| *object == 14 && *opcode == 1),
+        "popup_done dismisses a popup whose parent has no mapped buffer"
+    );
+    assert!(
+        before_popup_commit
+            .iter()
+            .all(|(object, opcode, _)| { !((*object == 13 || *object == 14) && *opcode == 0) }),
+        "an invalid popup parent must not receive a configure"
+    );
+
+    send_request(&mut client, 14, 0, &[]); // xdg_popup.destroy
+    send_request(&mut client, 13, 0, &[]); // popup xdg_surface.destroy
+    send_request(&mut client, 8, 0, &[]); // xdg_toplevel.destroy
+    send_request(&mut client, 7, 1, &words(&[16])); // recreate role on same xdg_surface
+    send_display_request(&mut client, 0, 17);
+    let before_replacement_commit = events_until_callback(&mut client, 17);
+    assert!(
+        before_replacement_commit
+            .iter()
+            .all(|(object, _, _)| *object != 7 && *object != 16),
+        "replacement role reuses the wl_surface but still waits for an empty commit"
+    );
+    send_request(&mut client, 6, 6, &[]); // replacement initial empty commit
+    send_display_request(&mut client, 0, 18);
+    let replacement_configure = events_until_callback(&mut client, 18);
+    assert!(
+        replacement_configure
+            .iter()
+            .any(|(object, opcode, _)| *object == 16 && *opcode == 0)
+    );
+    assert!(
+        replacement_configure
+            .iter()
+            .any(|(object, opcode, _)| *object == 7 && *opcode == 0)
+    );
+    let replacement_serial = replacement_configure
+        .iter()
+        .find_map(|(object, opcode, body)| {
+            (*object == 7 && *opcode == 0)
+                .then(|| u32::from_ne_bytes(body[0..4].try_into().expect("configure serial")))
+        })
+        .expect("replacement xdg_surface configure");
+    send_request(&mut client, 7, 4, &words(&[replacement_serial]));
+    // Fatal, and fatal *on this request* — `handlers.rs` validates toplevel
+    // constraints when the request arrives and posts InvalidSize there, so the
+    // negative maximum never reaches pending state or a commit. Nothing may be
+    // written after this line; read for the error instead. See the flake-watch
+    // note above `send_request`.
+    send_request(&mut client, 16, 7, &words(&[u32::MAX, 100])); // invalid max size
+    let display_error_deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    let display_error = (0..64)
+        .find_map(|_| {
+            let (object, opcode, body) = read_event(
+                &mut client,
+                display_error_deadline,
+                "wl_display.error for invalid toplevel size",
+            );
+            (object == 1 && opcode == 0).then_some(body)
+        })
+        .expect("wl_display.error reports invalid xdg_toplevel size");
+    assert_eq!(
+        u32::from_ne_bytes(display_error[0..4].try_into().expect("error object")),
+        16,
+        "invalid_size is posted on xdg_toplevel"
+    );
+    assert_eq!(
+        u32::from_ne_bytes(display_error[4..8].try_into().expect("error code")),
+        xdg_toplevel::Error::InvalidSize as u32
+    );
+
+    drop(runtime);
+}
+
+#[test]
+fn registry_round_trip_does_not_require_a_bevy_frame() {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the protocol round-trip test");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-thread-test-{}-{unique}", std::process::id());
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: vec![cosmix_wgpu_dmabuf::DmabufFormat {
+                fourcc: smithay::backend::allocator::Fourcc::Argb8888 as u32,
+                modifier: u64::from(smithay::backend::allocator::Modifier::Linear),
+                plane_count: 1,
+            }],
+            adapter_name: "test".into(),
+            drm_adapter: synthetic_drm_adapter("protocol-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: true,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+
+    // Wayland wire integers use native byte order. The second sync is sent
+    // only after the first reply, when the protocol thread has returned to
+    // calloop and must be woken by the display poll fd rather than a Bevy
+    // frame command.
+    send_display_request(&mut client, 1, 2); // wl_display.get_registry
+    send_display_request(&mut client, 0, 3); // wl_display.sync
+    wait_for_callback(&mut client, 3);
+    send_display_request(&mut client, 0, 4); // wl_display.sync again
+    wait_for_callback(&mut client, 4);
+
+    drop(client);
+    drop(runtime);
+}
+
+#[test]
+fn blocking_fake_acquire_does_not_stall_the_protocol_calloop() {
+    assert_blocked_kms_path_keeps_protocol_live("acquire", |runtime, probe| {
+        crate::backend::render::tests::while_real_app_acquire_is_blocked(runtime, probe);
+    });
+}
+
+#[test]
+fn blocking_fake_present_does_not_stall_the_protocol_calloop() {
+    assert_blocked_kms_path_keeps_protocol_live("present", |runtime, probe| {
+        crate::backend::render::tests::while_real_app_present_is_blocked(runtime, probe);
+    });
+}
+
+#[test]
+fn blocking_fake_driver_teardown_does_not_stall_the_protocol_calloop() {
+    assert_blocked_kms_path_keeps_protocol_live("teardown", |runtime, probe| {
+        crate::backend::render::tests::while_worker_teardown_is_blocked(runtime, probe);
+    });
+}
+
+fn assert_blocked_kms_path_keeps_protocol_live(
+    label: &str,
+    exercise: impl FnOnce(WaylandRuntime, Box<dyn FnOnce() + Send + 'static>),
+) {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for blocked KMS-path liveness coverage");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!(
+        "cosmix-blocked-{label}-test-{}-{unique}",
+        std::process::id()
+    );
+
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: format!("blocked-{label}-test"),
+            drm_adapter: synthetic_drm_adapter("blocked-path-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: true,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts before acquire is blocked");
+    exercise(
+        runtime,
+        Box::new(move || {
+            let mut client =
+                UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+                    .expect("connect to protocol thread while acquire is blocked");
+
+            send_display_request(&mut client, 1, 2);
+            send_display_request(&mut client, 0, 3);
+            wait_for_callback_with_timeout(&mut client, 3, Duration::from_secs(2));
+            send_display_request(&mut client, 0, 4);
+            wait_for_callback_with_timeout(&mut client, 4, Duration::from_secs(2));
+
+            drop(client);
+        }),
+    );
+}
+
+#[test]
+fn frame_callback_is_sent_before_first_buffer_commit() {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the pre-map frame callback test");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-frame-test-{}-{unique}", std::process::id());
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "test".into(),
+            drm_adapter: synthetic_drm_adapter("protocol-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: true,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+
+    send_display_request(&mut client, 1, 2); // wl_display.get_registry
+    send_display_request(&mut client, 0, 3); // wl_display.sync
+    let globals = registry_globals(&mut client, 3);
+    for required in [
+        "wl_subcompositor",
+        "wl_data_device_manager",
+        "zxdg_decoration_manager_v1",
+        "wp_fractional_scale_manager_v1",
+        "wp_viewporter",
+    ] {
+        assert!(
+            globals.contains_key(required),
+            "{required} is required for Phase 1 client compatibility"
+        );
+    }
+    let &(compositor_name, compositor_version) =
+        globals.get("wl_compositor").expect("compositor global");
+    let &(xdg_name, xdg_version) = globals.get("xdg_wm_base").expect("xdg-shell global");
+    bind_global(
+        &mut client,
+        compositor_name,
+        "wl_compositor",
+        compositor_version.min(5),
+        4,
+    );
+    bind_global(&mut client, xdg_name, "xdg_wm_base", xdg_version.min(6), 5);
+
+    send_request(&mut client, 4, 0, &6_u32.to_ne_bytes()); // create wl_surface
+    let mut get_xdg_surface = Vec::with_capacity(8);
+    get_xdg_surface.extend_from_slice(&7_u32.to_ne_bytes());
+    get_xdg_surface.extend_from_slice(&6_u32.to_ne_bytes());
+    send_request(&mut client, 5, 2, &get_xdg_surface);
+    send_request(&mut client, 7, 1, &8_u32.to_ne_bytes()); // get_toplevel
+    send_display_request(&mut client, 0, 9);
+    let precommit_deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    for _ in 0..64 {
+        let (object_id, opcode, _) = read_event(
+            &mut client,
+            precommit_deadline,
+            "pre-commit wl_display.sync callback without xdg configure",
+        );
+        assert!(
+            object_id != 7 || opcode != 0,
+            "initial xdg configure must wait for the empty surface commit"
+        );
+        if object_id == 9 && opcode == 0 {
+            break;
+        }
+    }
+
+    send_request(&mut client, 6, 6, &[]); // initial empty commit
+    send_display_request(&mut client, 0, 10);
+
+    let mut configure_serial = None;
+    let configure_deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    for _ in 0..64 {
+        let (object_id, opcode, body) = read_event(
+            &mut client,
+            configure_deadline,
+            "initial xdg configure and wl_display.sync callback",
+        );
+        if object_id == 7 && opcode == 0 {
+            configure_serial = Some(u32::from_ne_bytes(
+                body[0..4].try_into().expect("configure serial"),
+            ));
+        }
+        if object_id == 10 && opcode == 0 {
+            break;
+        }
+    }
+    let configure_serial = configure_serial.expect("xdg_surface configure");
+    send_request(&mut client, 7, 4, &configure_serial.to_ne_bytes());
+    send_request(&mut client, 6, 3, &11_u32.to_ne_bytes()); // wl_surface.frame
+    send_request(&mut client, 6, 6, &[]); // commit callback, still no buffer
+    send_display_request(&mut client, 0, 12);
+    wait_for_callback(&mut client, 12);
+
+    runtime
+        .finish_frame(Vec::new())
+        .expect("send compositor frame");
+    wait_for_callback(&mut client, 11);
+
+    drop(client);
+    drop(runtime);
+}
+
+// ---------------------------------------------------------------------------
+// Rung E-1: the one seat-input core, driven by a fake `InputBackend`.
+//
+// These tests exist to prove that the *generic* conversion and dispatch in
+// `protocol::input` — the exact functions the libinput source will call — turn
+// backend events into correct `wl_pointer` and `wl_keyboard` wire traffic.
+// Deliberately not a hand-rolled `HostInput` literal: constructing the
+// `HostInput` directly would skip `host_input_from_event`, which is where the
+// keycode offset, the axis-unit choice and the absolute-coordinate transform
+// all live, and skipping them is how each of those defects passes its own test.
+// ---------------------------------------------------------------------------
+
+/// A minimal [`InputBackend`] whose events are built by hand.
+///
+/// Every event class this rung does not claim is smithay's uninhabited
+/// [`UnusedEvent`], so an unclaimed class cannot be constructed here at all —
+/// a stronger statement than "we did not write a test for it", because it
+/// means the fake cannot quietly grow a second, test-only interpretation of an
+/// event the production path handles differently.
+///
+/// It is also its own calloop [`EventSource`], because `LibinputInputBackend`
+/// is one (`vendor/smithay/src/backend/libinput/mod.rs`) and
+/// [`input::InputSourceFactory`]'s bound demands exactly that shape. A fake
+/// needing an adapter to be registered would be exercising the adapter; this
+/// one goes through the same `insert_source` call the libinput backend will.
+struct FakeInput {
+    /// Injected events, carried to the protocol thread the source is polled on.
+    ///
+    /// The channel is device emulation — it stands in for the libinput fd
+    /// becoming readable — and it stops at the calloop callback. Nothing past
+    /// that point differs from the production path.
+    events: channel::Channel<FakeInputEnvelope>,
+    lifecycle: Option<FakeInputLifecycle>,
+}
+
+#[derive(Clone, Default)]
+struct FakeInputLifecycle {
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl input::InputLifecycleControl for FakeInputLifecycle {
+    fn suspend(&mut self) {
+        self.events
+            .lock()
+            .expect("fake lifecycle probe")
+            .push("suspend");
+    }
+
+    fn resume(&mut self) -> Result<(), String> {
+        self.events
+            .lock()
+            .expect("fake lifecycle probe")
+            .push("resume");
+        Ok(())
+    }
+}
+
+impl input::LifecycleInputBackend for FakeInput {
+    type Control = FakeInputLifecycle;
+
+    fn lifecycle_control(&self) -> Self::Control {
+        self.lifecycle.clone().unwrap_or_default()
+    }
+}
+
+/// One injected event and the acknowledgement its injector waits on.
+///
+/// The acknowledgement is sent *after* the calloop callback returns, which
+/// gives a test the boundary "the protocol thread has finished routing this
+/// event" without a frame, a command or a `wl_display.sync` — each of which is
+/// a path the stall oracle below must not depend on, because each is exactly
+/// what a frame-bounded input queue would still satisfy.
+struct FakeInputEnvelope {
+    event: InputEvent<FakeInput>,
+    routed: SyncSender<()>,
+}
+
+impl EventSource for FakeInput {
+    type Event = InputEvent<FakeInput>;
+    type Metadata = ();
+    type Ret = ();
+    type Error = channel::ChannelError;
+
+    fn process_events<C>(
+        &mut self,
+        readiness: Readiness,
+        token: Token,
+        mut callback: C,
+    ) -> Result<PostAction, Self::Error>
+    where
+        C: FnMut(Self::Event, &mut Self::Metadata) -> Self::Ret,
+    {
+        self.events.process_events(readiness, token, |event, ()| {
+            if let channel::Event::Msg(envelope) = event {
+                callback(envelope.event, &mut ());
+                // Only now. An acknowledgement sent before the callback
+                // returned would time the channel rather than the router, and
+                // would still be prompt if routing were deferred to a frame.
+                let _ = envelope.routed.send(());
+            }
+        })
+    }
+
+    fn register(
+        &mut self,
+        poll: &mut Poll,
+        token_factory: &mut TokenFactory,
+    ) -> smithay::reexports::calloop::Result<()> {
+        self.events.register(poll, token_factory)
+    }
+
+    fn reregister(
+        &mut self,
+        poll: &mut Poll,
+        token_factory: &mut TokenFactory,
+    ) -> smithay::reexports::calloop::Result<()> {
+        self.events.reregister(poll, token_factory)
+    }
+
+    fn unregister(&mut self, poll: &mut Poll) -> smithay::reexports::calloop::Result<()> {
+        self.events.unregister(poll)
+    }
+}
+
+/// The test-thread half of [`FakeInput`]: it injects and it waits.
+struct FakeInputInjector {
+    events: channel::Sender<FakeInputEnvelope>,
+}
+
+impl FakeInputInjector {
+    /// Inject one event and return once the protocol thread has routed it.
+    ///
+    /// Blocking on the acknowledgement is what makes a later read a real
+    /// oracle: a read that timed out could otherwise mean the event had not
+    /// been injected yet, which is a different failure from the one under test.
+    fn route(&self, event: InputEvent<FakeInput>) {
+        self.inject(event)
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the protocol thread routes an injected input event");
+    }
+
+    /// Hand one event to the source and return the acknowledgement to wait on.
+    ///
+    /// Separate from [`FakeInputInjector::route`] because a caller that owns the
+    /// event loop rather than sharing a thread with it must dispatch the loop
+    /// itself before the acknowledgement can arrive — blocking on it first would
+    /// deadlock against the very dispatch that produces it.
+    fn inject(&self, event: InputEvent<FakeInput>) -> Receiver<()> {
+        let (routed, acknowledgement) = mpsc::sync_channel(1);
+        self.events
+            .send(FakeInputEnvelope { event, routed })
+            .expect("the protocol thread still owns the injected input source");
+        acknowledgement
+    }
+}
+
+/// Build an injector and the registration the protocol thread will perform.
+///
+/// The registration is the production [`input::InputSourceFactory`], not a
+/// test-only path beside it: what E-5 hands `WaylandRuntime::with_input_source`
+/// differs from this only in which backend the closure builds.
+fn fake_input_source() -> (FakeInputInjector, Box<dyn input::InputSourceRegistration>) {
+    let (events, channel) = channel::channel();
+    (
+        FakeInputInjector { events },
+        Box::new(input::InputSourceFactory(
+            move || -> Result<FakeInput, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(FakeInput {
+                    events: channel,
+                    lifecycle: None,
+                })
+            },
+        )),
+    )
+}
+
+type FakeLifecycleInputSource = (
+    FakeInputInjector,
+    Box<dyn input::InputSourceRegistration>,
+    input::InputLifecycleClient,
+    Arc<Mutex<Vec<&'static str>>>,
+);
+
+fn fake_lifecycle_input_source() -> FakeLifecycleInputSource {
+    let (events, channel) = channel::channel();
+    let lifecycle = FakeInputLifecycle::default();
+    let observed = Arc::clone(&lifecycle.events);
+    let (source, client) = input::lifecycle_input_source(
+        move || -> Result<FakeInput, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(FakeInput {
+                events: channel,
+                lifecycle: Some(lifecycle),
+            })
+        },
+    );
+    (
+        FakeInputInjector { events },
+        Box::new(source),
+        client,
+        observed,
+    )
+}
+
+impl InputBackend for FakeInput {
+    type Device = FakeDevice;
+    type KeyboardKeyEvent = FakeKeyEvent;
+    type PointerAxisEvent = FakeAxisEvent;
+    type PointerButtonEvent = FakeButtonEvent;
+    type PointerMotionEvent = FakeMotionEvent;
+    type PointerMotionAbsoluteEvent = FakeAbsoluteEvent;
+    type GestureSwipeBeginEvent = UnusedEvent;
+    type GestureSwipeUpdateEvent = UnusedEvent;
+    type GestureSwipeEndEvent = UnusedEvent;
+    type GesturePinchBeginEvent = UnusedEvent;
+    type GesturePinchUpdateEvent = UnusedEvent;
+    type GesturePinchEndEvent = UnusedEvent;
+    type GestureHoldBeginEvent = UnusedEvent;
+    type GestureHoldEndEvent = UnusedEvent;
+    type TouchDownEvent = FakeTouchPositionEvent;
+    type TouchUpEvent = FakeTouchSlotEvent;
+    type TouchMotionEvent = FakeTouchPositionEvent;
+    type TouchCancelEvent = FakeTouchSlotEvent;
+    type TouchFrameEvent = FakeTouchFrameEvent;
+    type TabletToolAxisEvent = UnusedEvent;
+    type TabletToolProximityEvent = UnusedEvent;
+    type TabletToolTipEvent = UnusedEvent;
+    type TabletToolButtonEvent = UnusedEvent;
+    type SwitchToggleEvent = UnusedEvent;
+    type SpecialEvent = UnusedEvent;
+}
+
+/// The devices the fake backend can claim to have attached.
+///
+/// Two of them rather than one because the seat treats their capabilities
+/// differently: the keyboard and the pointer exist unconditionally, while touch
+/// is advertised only while a touch device is present. A single device claiming
+/// everything would make it impossible to test that distinction — the capability
+/// transition would be indistinguishable from a capability that was always
+/// there.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum FakeDevice {
+    KeyboardAndPointer,
+    SecondKeyboardAndPointer,
+    Touchscreen,
+    /// A second, distinct touchscreen.
+    ///
+    /// Two touch devices on one seat is not a contrived arrangement — a laptop
+    /// with a touchscreen and an attached drawing tablet is one — and it is the
+    /// only way to reach the states where the touch capability must *survive* a
+    /// removal.
+    SecondTouchscreen,
+}
+
+impl Device for FakeDevice {
+    fn id(&self) -> String {
+        match self {
+            Self::KeyboardAndPointer => "fake-input-device".into(),
+            Self::SecondKeyboardAndPointer => "fake-input-device-2".into(),
+            Self::Touchscreen => "fake-touchscreen".into(),
+            Self::SecondTouchscreen => "fake-touchscreen-2".into(),
+        }
+    }
+
+    fn name(&self) -> String {
+        match self {
+            Self::KeyboardAndPointer => "fake input device".into(),
+            Self::SecondKeyboardAndPointer => "second fake input device".into(),
+            Self::Touchscreen => "fake touchscreen".into(),
+            Self::SecondTouchscreen => "second fake touchscreen".into(),
+        }
+    }
+
+    fn has_capability(&self, capability: DeviceCapability) -> bool {
+        match self {
+            Self::KeyboardAndPointer | Self::SecondKeyboardAndPointer => matches!(
+                capability,
+                DeviceCapability::Keyboard | DeviceCapability::Pointer
+            ),
+            Self::Touchscreen | Self::SecondTouchscreen => {
+                matches!(capability, DeviceCapability::Touch)
+            }
+        }
+    }
+
+    fn usb_id(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    fn syspath(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
+/// The timestamp every fake event reports, in microseconds.
+///
+/// `Event::time_msec` divides by 1000, so this is the millisecond value the
+/// seat should carry all the way to the wire — which is the point: a dispatch
+/// path that sampled its own clock instead of the device's would report
+/// something else, and every timestamp assertion below would go red.
+const FAKE_EVENT_TIME_US: u64 = 4_321_000;
+const FAKE_EVENT_TIME_MS: u32 = 4_321;
+
+struct FakeKeyEvent {
+    device: FakeDevice,
+    /// An XKB keycode, because that is what a real [`KeyboardKeyEvent`] yields:
+    /// smithay's libinput backend has already added the evdev offset by the
+    /// time the compositor sees the event.
+    keycode: Keycode,
+    state: KeyState,
+}
+
+impl Event<FakeInput> for FakeKeyEvent {
+    fn time(&self) -> u64 {
+        FAKE_EVENT_TIME_US
+    }
+
+    fn device(&self) -> FakeDevice {
+        self.device
+    }
+}
+
+impl KeyboardKeyEvent<FakeInput> for FakeKeyEvent {
+    fn key_code(&self) -> Keycode {
+        self.keycode
+    }
+
+    fn state(&self) -> KeyState {
+        self.state
+    }
+
+    fn count(&self) -> u32 {
+        1
+    }
+}
+
+struct FakeMotionEvent {
+    dx: f64,
+    dy: f64,
+}
+
+impl Event<FakeInput> for FakeMotionEvent {
+    fn time(&self) -> u64 {
+        FAKE_EVENT_TIME_US
+    }
+
+    fn device(&self) -> FakeDevice {
+        FakeDevice::KeyboardAndPointer
+    }
+}
+
+impl PointerMotionEvent<FakeInput> for FakeMotionEvent {
+    fn delta_x(&self) -> f64 {
+        self.dx
+    }
+
+    fn delta_y(&self) -> f64 {
+        self.dy
+    }
+
+    fn delta_x_unaccel(&self) -> f64 {
+        self.dx
+    }
+
+    fn delta_y_unaccel(&self) -> f64 {
+        self.dy
+    }
+}
+
+/// An absolute device reporting a position in its own normalised space, the way
+/// a touchscreen or a tablet does.
+struct FakeAbsoluteEvent {
+    normalised_x: f64,
+    normalised_y: f64,
+}
+
+impl Event<FakeInput> for FakeAbsoluteEvent {
+    fn time(&self) -> u64 {
+        FAKE_EVENT_TIME_US
+    }
+
+    fn device(&self) -> FakeDevice {
+        FakeDevice::KeyboardAndPointer
+    }
+}
+
+impl AbsolutePositionEvent<FakeInput> for FakeAbsoluteEvent {
+    fn x(&self) -> f64 {
+        self.normalised_x
+    }
+
+    fn y(&self) -> f64 {
+        self.normalised_y
+    }
+
+    fn x_transformed(&self, width: i32) -> f64 {
+        self.normalised_x * f64::from(width)
+    }
+
+    fn y_transformed(&self, height: i32) -> f64 {
+        self.normalised_y * f64::from(height)
+    }
+}
+
+impl PointerMotionAbsoluteEvent<FakeInput> for FakeAbsoluteEvent {}
+
+/// A contact reporting a position, the way a touchscreen's down and motion do.
+///
+/// Normalised like [`FakeAbsoluteEvent`], because that is what a touch device
+/// actually reports: the transform into compositor coordinates is the
+/// compositor's job and is exactly what the conversion under test performs.
+///
+/// The timestamp is per-event rather than the shared [`FAKE_EVENT_TIME_US`]
+/// constant every other fake uses. Touch is the one family where several events
+/// of *different* classes are asserted together on one wire, so a conversion
+/// that hard-coded a time, or read the neighbouring event's, would be invisible
+/// against a single constant shared by all of them.
+struct FakeTouchPositionEvent {
+    slot: TouchSlot,
+    normalised_x: f64,
+    normalised_y: f64,
+    time_us: u64,
+}
+
+impl Event<FakeInput> for FakeTouchPositionEvent {
+    fn time(&self) -> u64 {
+        self.time_us
+    }
+
+    fn device(&self) -> FakeDevice {
+        FakeDevice::Touchscreen
+    }
+}
+
+impl SmithayTouchEvent<FakeInput> for FakeTouchPositionEvent {
+    fn slot(&self) -> TouchSlot {
+        self.slot
+    }
+}
+
+impl AbsolutePositionEvent<FakeInput> for FakeTouchPositionEvent {
+    fn x(&self) -> f64 {
+        self.normalised_x
+    }
+
+    fn y(&self) -> f64 {
+        self.normalised_y
+    }
+
+    fn x_transformed(&self, width: i32) -> f64 {
+        self.normalised_x * f64::from(width)
+    }
+
+    fn y_transformed(&self, height: i32) -> f64 {
+        self.normalised_y * f64::from(height)
+    }
+}
+
+impl TouchDownEvent<FakeInput> for FakeTouchPositionEvent {}
+impl TouchMotionEvent<FakeInput> for FakeTouchPositionEvent {}
+
+/// A contact ending, carrying a slot and deliberately no position.
+///
+/// Separate from [`FakeTouchPositionEvent`] rather than reusing it with the
+/// coordinates ignored: `wl_touch.up` has no coordinates and neither does
+/// Smithay's `UpEvent`, so a conversion that read a position on the up path
+/// should not compile rather than read a plausible-looking lie.
+struct FakeTouchSlotEvent {
+    slot: TouchSlot,
+    time_us: u64,
+}
+
+impl Event<FakeInput> for FakeTouchSlotEvent {
+    fn time(&self) -> u64 {
+        self.time_us
+    }
+
+    fn device(&self) -> FakeDevice {
+        FakeDevice::Touchscreen
+    }
+}
+
+impl SmithayTouchEvent<FakeInput> for FakeTouchSlotEvent {
+    fn slot(&self) -> TouchSlot {
+        self.slot
+    }
+}
+
+impl TouchUpEvent<FakeInput> for FakeTouchSlotEvent {}
+impl TouchCancelEvent<FakeInput> for FakeTouchSlotEvent {}
+
+/// The end of one batch of simultaneous touch changes.
+///
+/// Carries nothing at all, matching `wl_touch.frame`, which has no arguments.
+struct FakeTouchFrameEvent;
+
+impl Event<FakeInput> for FakeTouchFrameEvent {
+    fn time(&self) -> u64 {
+        FAKE_EVENT_TIME_US
+    }
+
+    fn device(&self) -> FakeDevice {
+        FakeDevice::Touchscreen
+    }
+}
+
+impl TouchFrameEvent<FakeInput> for FakeTouchFrameEvent {}
+
+struct FakeButtonEvent {
+    device: FakeDevice,
+    button: u32,
+    state: ButtonState,
+}
+
+impl Event<FakeInput> for FakeButtonEvent {
+    fn time(&self) -> u64 {
+        FAKE_EVENT_TIME_US
+    }
+
+    fn device(&self) -> FakeDevice {
+        self.device
+    }
+}
+
+impl PointerButtonEvent<FakeInput> for FakeButtonEvent {
+    fn button_code(&self) -> u32 {
+        self.button
+    }
+
+    fn state(&self) -> ButtonState {
+        self.state
+    }
+}
+
+/// What one axis of a fake scroll event reports.
+///
+/// Both unit families are `Option` because both are `Option` in the trait, and
+/// the three constructors below cover three different devices rather than three
+/// spellings of one.
+#[derive(Clone, Copy, Default)]
+struct FakeAxis {
+    amount: Option<f64>,
+    v120: Option<f64>,
+}
+
+impl FakeAxis {
+    /// A touchpad or continuous device: an amount and no detent count.
+    fn pixels(amount: f64) -> Self {
+        Self {
+            amount: Some(amount),
+            v120: None,
+        }
+    }
+
+    /// A wheel as `LibinputInputBackend` actually reports one.
+    ///
+    /// Both are present: `amount` returns `Some(scroll_value)` for *any* axis
+    /// the device reported, wheel included, and `amount_v120` adds the detent
+    /// count on top (`vendor/smithay/src/backend/libinput/mod.rs:197-220`). This
+    /// is the shape the nominated production backend produces, so it is the one
+    /// a claim about production has to be made against.
+    fn wheel(amount: f64, v120: f64) -> Self {
+        Self {
+            amount: Some(amount),
+            v120: Some(v120),
+        }
+    }
+
+    /// A wheel that reports detents and no amount.
+    ///
+    /// `LibinputInputBackend` never produces this — see `FakeAxis::wheel`. It
+    /// exists because `host_axis` is generic over `InputBackend` and the trait
+    /// permits it, so the v120 fallback is reachable by some other backend and
+    /// must not silently drop the scroll. Tests using it are evidence about that
+    /// fallback, not about libinput.
+    fn detents(v120: f64) -> Self {
+        Self {
+            amount: None,
+            v120: Some(v120),
+        }
+    }
+}
+
+/// A scroll event whose two axes are set independently.
+///
+/// Per-axis rather than a pair, because that is what libinput reports: an
+/// ordinary vertical wheel event has no horizontal axis at all, and both
+/// `amount` and `amount_v120` return `None` for it
+/// (`vendor/smithay/src/backend/libinput/mod.rs:170-219`). A fake that could
+/// only make both axes present together could not express the commonest scroll
+/// event there is, and every test written against it would be evidence about a
+/// device that does not exist.
+struct FakeAxisEvent {
+    device: FakeDevice,
+    horizontal: Option<FakeAxis>,
+    vertical: Option<FakeAxis>,
+    source: AxisSource,
+    relative_direction: AxisRelativeDirection,
+}
+
+impl FakeAxisEvent {
+    fn axis(&self, axis: Axis) -> Option<FakeAxis> {
+        match axis {
+            Axis::Horizontal => self.horizontal,
+            Axis::Vertical => self.vertical,
+        }
+    }
+}
+
+impl Event<FakeInput> for FakeAxisEvent {
+    fn time(&self) -> u64 {
+        FAKE_EVENT_TIME_US
+    }
+
+    fn device(&self) -> FakeDevice {
+        self.device
+    }
+}
+
+impl PointerAxisEvent<FakeInput> for FakeAxisEvent {
+    fn amount(&self, axis: Axis) -> Option<f64> {
+        self.axis(axis)?.amount
+    }
+
+    fn amount_v120(&self, axis: Axis) -> Option<f64> {
+        self.axis(axis)?.v120
+    }
+
+    fn source(&self) -> AxisSource {
+        self.source
+    }
+
+    fn relative_direction(&self, _axis: Axis) -> AxisRelativeDirection {
+        self.relative_direction
+    }
+}
+
+/// Collect the `(object, opcode)` pairs a pointer object received, in order.
+fn pointer_opcodes(events: &[(u32, u16, Vec<u8>)], pointer: u32) -> Vec<u16> {
+    events
+        .iter()
+        .filter(|(object, _, _)| *object == pointer)
+        .map(|(_, opcode, _)| *opcode)
+        .collect()
+}
+
+/// Every body with this opcode on the pointer object, in wire order.
+fn pointer_bodies(events: &[(u32, u16, Vec<u8>)], pointer: u32, opcode: u16) -> Vec<Vec<u8>> {
+    events
+        .iter()
+        .filter(|(object, event_opcode, _)| *object == pointer && *event_opcode == opcode)
+        .map(|(_, _, body)| body.clone())
+        .collect()
+}
+
+/// The body of the one event with this opcode on the pointer object.
+///
+/// Insisting on exactly one is the point: a caller that expected a single event
+/// and silently got the first of several would be reading stale state and
+/// calling it a pass.
+fn pointer_body(events: &[(u32, u16, Vec<u8>)], pointer: u32, opcode: u16) -> Vec<u8> {
+    let mut bodies = pointer_bodies(events, pointer, opcode);
+    assert_eq!(
+        bodies.len(),
+        1,
+        "expected exactly one pointer event with opcode {opcode}"
+    );
+    bodies.remove(0)
+}
+
+/// `wl_pointer.axis` enum values.
+const AXIS_VERTICAL: u32 = 0;
+const AXIS_HORIZONTAL: u32 = 1;
+
+/// The axes that reported `wl_pointer.axis_stop`, in wire order.
+fn axis_stops(events: &[(u32, u16, Vec<u8>)], pointer: u32) -> Vec<u32> {
+    events
+        .iter()
+        .filter(|(object, opcode, _)| *object == pointer && *opcode == 7)
+        .map(|(_, _, body)| word(body, 1))
+        .collect()
+}
+
+fn word(body: &[u8], index: usize) -> u32 {
+    u32::from_ne_bytes(
+        body[index * 4..index * 4 + 4]
+            .try_into()
+            .expect("event word"),
+    )
+}
+
+/// `wl_fixed_t` is a 24.8 signed fixed-point number.
+fn fixed(body: &[u8], index: usize) -> f64 {
+    f64::from(word(body, index) as i32) / 256.0
+}
+
+#[test]
+fn fake_backend_key_reaches_the_client_without_a_second_evdev_offset() {
+    let mut harness = KeybindingHarness::new(false);
+
+    // 24 is the XKB keycode for Q; smithay's libinput backend has already added
+    // the constant 8 to evdev's 16 by the time a real event carries it. The
+    // wire must therefore show 16 again, because `wl_keyboard.key` carries the
+    // evdev code. A path that added 8 a second time would send 24 here, and a
+    // path that subtracted twice would send 8.
+    harness.route(InputEvent::Keyboard {
+        event: FakeKeyEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            keycode: Keycode::new(24),
+            state: KeyState::Pressed,
+        },
+    });
+    harness.route(InputEvent::Keyboard {
+        event: FakeKeyEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            keycode: Keycode::new(24),
+            state: KeyState::Released,
+        },
+    });
+
+    assert_eq!(
+        keyboard_key_events(&harness.sync()),
+        [(16, 1), (16, 0)],
+        "the generic router delivers the backend's own keycode, offset exactly once"
+    );
+}
+
+#[test]
+fn fake_backend_key_carries_the_device_timestamp_not_the_dispatch_clock() {
+    let mut harness = KeybindingHarness::new(false);
+
+    harness.route(InputEvent::Keyboard {
+        event: FakeKeyEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            keycode: Keycode::new(24),
+            state: KeyState::Pressed,
+        },
+    });
+
+    let events = harness.sync();
+    let key = events
+        .iter()
+        .find(|(object, opcode, body)| {
+            *object == TEST_KEYBOARD_ID && *opcode == 3 && body.len() >= 16
+        })
+        .map(|(_, _, body)| body.clone())
+        .expect("wl_keyboard.key");
+    assert_eq!(
+        word(&key, 1),
+        FAKE_EVENT_TIME_MS,
+        "the time the device reported survives to the wire; sampling a clock at \
+         dispatch would report something else entirely"
+    );
+}
+
+#[test]
+fn fake_backend_relative_motion_accumulates_into_one_cursor_position() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+    harness.server.state.cursor_position = (0.0, 0.0);
+    harness.prime_pointer_focus();
+    let origin = harness.server.state.cursor_position;
+
+    harness.route(InputEvent::PointerMotion {
+        event: FakeMotionEvent { dx: 30.0, dy: 20.0 },
+    });
+    harness.route(InputEvent::PointerMotion {
+        event: FakeMotionEvent { dx: 12.0, dy: 5.0 },
+    });
+    let events = harness.sync();
+
+    let expected = (origin.0 + 42.0, origin.1 + 25.0);
+    assert_eq!(
+        harness.server.state.cursor_position, expected,
+        "relative deltas accumulate in the compositor, which is the only holder \
+         of the cursor position"
+    );
+    let motions = pointer_bodies(&events, pointer, 2);
+    assert_eq!(motions.len(), 2, "each delta is its own motion event");
+    let motion = motions.last().expect("final motion");
+    assert_eq!(
+        (fixed(motion, 1), fixed(motion, 2)),
+        expected,
+        "the accumulated position, not the delta, is what wl_pointer.motion carries"
+    );
+    assert_eq!(
+        word(motion, 0),
+        FAKE_EVENT_TIME_MS,
+        "motion carries the device timestamp"
+    );
+}
+
+#[test]
+fn fake_backend_relative_motion_clamps_to_the_output_instead_of_losing_focus() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+    let (width, height) = harness.server.state.backend.seat_extent();
+    harness.prime_pointer_focus();
+
+    harness.route(InputEvent::PointerMotion {
+        event: FakeMotionEvent {
+            dx: f64::from(width) * 4.0,
+            dy: f64::from(height) * 4.0,
+        },
+    });
+    let far_corner = harness.sync();
+
+    // Deliberately not `(width, height)`. The hit test in `surface_at` is
+    // half-open — `x < right` — so a cursor clamped to exactly the output width
+    // is outside every surface that reaches the edge. Asserting the position
+    // alone would let that pass, which is why the wire assertions below matter
+    // more than this one.
+    assert_eq!(
+        harness.server.state.cursor_position,
+        (f64::from(width).next_down(), f64::from(height).next_down()),
+        "a bare-metal pointer has no host window to confine it, so the output \
+         extent does the confining — on the same half-open bounds the hit test \
+         uses"
+    );
+    assert!(
+        !pointer_opcodes(&far_corner, pointer).contains(&1),
+        "pushing the pointer hard into the bottom-right corner must not send \
+         wl_pointer.leave: a cursor that falls out of the hit test at the edge \
+         leaves the next click with nowhere to go"
+    );
+    assert!(
+        harness
+            .server
+            .state
+            .surface_at(
+                harness.server.state.cursor_position.0,
+                harness.server.state.cursor_position.1
+            )
+            .is_some(),
+        "the clamped corner is still inside the toplevel by the compositor's \
+         own hit test, which is the only definition of 'inside' that counts"
+    );
+
+    harness.route(InputEvent::PointerMotion {
+        event: FakeMotionEvent {
+            dx: f64::from(width) * -8.0,
+            dy: f64::from(height) * -8.0,
+        },
+    });
+    let origin = harness.sync();
+    assert_eq!(
+        harness.server.state.cursor_position,
+        (0.0, 0.0),
+        "the lower bound clamps too; a negative cursor coordinate is not a position"
+    );
+    assert!(
+        !pointer_opcodes(&origin, pointer).contains(&1),
+        "and the top-left corner keeps focus as well — the closed lower bound is \
+         inside the half-open rectangle, so both edges are covered"
+    );
+}
+
+#[test]
+fn fake_backend_absolute_motion_is_scaled_by_the_output_extent() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+    let (width, height) = harness.server.state.backend.seat_extent();
+    harness.prime_pointer_focus();
+
+    harness.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: 0.25,
+            normalised_y: 0.5,
+        },
+    });
+    let events = harness.sync();
+
+    let expected = (f64::from(width) * 0.25, f64::from(height) * 0.5);
+    assert_eq!(
+        harness.server.state.cursor_position, expected,
+        "an absolute device reports a normalised position, which is meaningless \
+         until the output it is bonded to scales it"
+    );
+    let motion = pointer_body(&events, pointer, 2);
+    assert_eq!((fixed(&motion, 1), fixed(&motion, 2)), expected);
+}
+
+#[test]
+fn nested_fractional_preference_does_not_divide_its_logical_host_window() {
+    let mut harness = KeybindingHarness::new(false);
+    assert!(harness.server.state.backend.change_host_output_scale(2.5));
+    assert_eq!(harness.server.state.backend.output_size(), (320, 240));
+    assert_eq!(
+        harness.server.state.backend.logical_output_size(),
+        (320, 240)
+    );
+    assert_eq!(harness.server.state.backend.seat_extent(), (320, 240));
+}
+
+#[test]
+fn fractional_kms_geometry_input_and_renderer_projection_are_atomic() {
+    use bevy::camera::{CameraProjection, Projection};
+
+    let mut harness = KeybindingHarness::new_with_backend(false, BackendKind::Kms);
+    harness.admit_kms_4k_at_250_percent();
+    assert_eq!(
+        harness.server.state.backend.logical_output_size(),
+        (1536, 864)
+    );
+    assert_eq!(harness.server.state.backend.seat_extent(), (1536, 864));
+
+    let pointer = harness.bind_pointer();
+    harness.prime_pointer_focus();
+    harness.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: 777.25 / 1536.0,
+            normalised_y: 333.5 / 864.0,
+        },
+    });
+    let motion = harness.sync();
+    assert_eq!(harness.server.state.cursor_position, (777.25, 333.5));
+    assert!(
+        harness.server.state.surface_at(777.25, 333.5).is_some(),
+        "the logical coordinate displayed inside the fullscreen surface is hit-testable"
+    );
+    let body = pointer_body(&motion, pointer, 2);
+    assert_eq!((fixed(&body, 1), fixed(&body, 2)), (777.25, 333.5));
+
+    harness.route(InputEvent::PointerButton {
+        event: FakeButtonEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            button: 0x110,
+            state: ButtonState::Pressed,
+        },
+    });
+    assert_eq!(
+        pointer_bodies(&harness.sync(), pointer, 3).len(),
+        1,
+        "a click at the logical coordinate reaches the surface rendered there"
+    );
+
+    assert_eq!(
+        crate::compositor_scene::projected_renderer_physical_edges(0.0, 0.0, 1536.0, 864.0, 300),
+        (0, 0, 3840, 2160),
+        "the same fullscreen logical layout fills the physical target corner-to-corner"
+    );
+
+    let Projection::Orthographic(mut projection) =
+        crate::backend::render::logical_output_projection((1536, 864))
+    else {
+        panic!("the admitted output uses a logical orthographic projection");
+    };
+    projection.update(3840.0, 2160.0);
+    let logical_view = bevy::math::Vec3::new(777.25 - 768.0, 432.0 - 333.5, 0.0);
+    let clip = projection.get_clip_from_view().project_point3(logical_view);
+    let displayed_physical = (
+        f64::from((clip.x + 1.0) * 0.5 * 3840.0),
+        f64::from((1.0 - clip.y) * 0.5 * 2160.0),
+    );
+    let expected_physical = (777.25 * 2.5, 333.5 * 2.5);
+    assert!(
+        (displayed_physical.0 - expected_physical.0).abs() < 0.001
+            && (displayed_physical.1 - expected_physical.1).abs() < 0.001,
+        "the click maps through the installed camera to {displayed_physical:?}, not the displayed point {expected_physical:?}"
+    );
+}
+
+#[test]
+fn fractional_kms_absolute_pointer_and_touch_extremes_clamp_to_logical_edges() {
+    let mut harness = KeybindingHarness::new_with_backend(false, BackendKind::Kms);
+    harness.admit_kms_4k_at_250_percent();
+    let pointer = harness.bind_pointer();
+    harness.prime_pointer_focus();
+
+    harness.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: 1.0,
+            normalised_y: 1.0,
+        },
+    });
+    let edge = harness.sync();
+    assert_eq!(
+        harness.server.state.cursor_position,
+        (1536.0_f64.next_down(), 864.0_f64.next_down())
+    );
+    assert!(!pointer_opcodes(&edge, pointer).contains(&1));
+    assert!(
+        harness
+            .server
+            .state
+            .surface_at(1536.0_f64.next_down(), 864.0_f64.next_down())
+            .is_some()
+    );
+
+    let touch = InputEvent::<FakeInput>::TouchDown {
+        event: FakeTouchPositionEvent {
+            slot: TouchSlot::from(None),
+            normalised_x: 1.0,
+            normalised_y: 1.0,
+            time_us: 1_000,
+        },
+    };
+    let mut ingress = super::input::InputIngressState::default();
+    let super::input::InputRouting::Deliver(inputs) = super::input::host_input_from_event(
+        &mut ingress,
+        &touch,
+        harness.server.state.backend.seat_extent(),
+        || super::input::SeatHeldState {
+            keys: HashSet::new(),
+            buttons: Vec::new(),
+        },
+    ) else {
+        panic!("touch down produces a seat input");
+    };
+    let [HostInput::TouchDown { x, y, .. }] = inputs.as_slice() else {
+        panic!("one transformed touch down: {inputs:?}");
+    };
+    assert_eq!((*x, *y), (1536.0, 864.0));
+    assert_eq!(
+        clamp_point_to_seat((*x, *y), &harness.server.state.backend.seat_regions()),
+        (1536.0_f64.next_down(), 864.0_f64.next_down()),
+        "touch and pointer use the same logical half-open confinement"
+    );
+}
+
+#[test]
+fn fractional_kms_configures_popups_and_interactive_deltas_stay_logical() {
+    let mut harness = KeybindingHarness::new_with_backend(false, BackendKind::Kms);
+    harness.admit_kms_4k_at_250_percent();
+    let logical = harness.server.state.backend.logical_output_size();
+    for cascade in 0..6 {
+        let x = CASCADE_ORIGIN + cascade as f32 * CASCADE_STEP;
+        let y = CASCADE_ORIGIN + cascade as f32 * CASCADE_STEP;
+        let size = sensible_toplevel_size(logical, x, y);
+        assert!(x + size.0 as f32 + OUTPUT_MARGIN <= logical.0 as f32);
+        assert!(y + size.1 as f32 + OUTPUT_MARGIN <= logical.1 as f32);
+    }
+
+    let surface = harness
+        .server
+        .state
+        .surfaces
+        .values()
+        .find_map(|record| record.role.toplevel().map(|role| role.wl_surface().clone()))
+        .expect("focused harness has a toplevel");
+    let start_origin = {
+        let record = harness
+            .server
+            .state
+            .surfaces
+            .get_mut(&surface.id())
+            .expect("toplevel record");
+        record.window_origin = (200.0, 180.0);
+        record.layout.x = 200.0;
+        record.layout.y = 180.0;
+        record.configured_size = (400, 300);
+        record.layout.width = 400.0;
+        record.layout.height = 300.0;
+        record.window_origin
+    };
+    harness.server.state.interactive_pointer = Some(InteractivePointer::Move {
+        surface: surface.clone(),
+        start_pointer: (100.0, 100.0),
+        start_origin,
+    });
+    harness
+        .server
+        .state
+        .update_interactive_pointer(117.25, 89.5);
+    let moved_origin = harness.server.state.surfaces[&surface.id()].window_origin;
+    assert_eq!(moved_origin, (217.25, 169.5));
+
+    harness.server.state.interactive_pointer = Some(InteractivePointer::Resize {
+        surface: surface.clone(),
+        edges: xdg_toplevel::ResizeEdge::BottomRight,
+        start_pointer: (117.25, 89.5),
+        start_origin: moved_origin,
+        start_size: (400, 300),
+    });
+    harness
+        .server
+        .state
+        .update_interactive_pointer(140.25, 106.5);
+    assert_eq!(
+        harness.server.state.surfaces[&surface.id()].configured_size,
+        (423, 317),
+        "interactive resize consumes logical pointer deltas without a 2.5x conversion"
+    );
+
+    {
+        let record = harness
+            .server
+            .state
+            .surfaces
+            .get_mut(&surface.id())
+            .expect("toplevel record");
+        record.window_origin = (1400.0, 760.0);
+        record.layout.x = 1400.0;
+        record.layout.y = 760.0;
+    }
+    let positioner = PositionerState {
+        rect_size: (200, 120).into(),
+        anchor_rect: Rectangle::new((120, 90).into(), (16, 14).into()),
+        anchor_edges: xdg_positioner::Anchor::BottomRight,
+        gravity: xdg_positioner::Gravity::BottomRight,
+        constraint_adjustment: xdg_positioner::ConstraintAdjustment::SlideX
+            | xdg_positioner::ConstraintAdjustment::SlideY,
+        ..PositionerState::default()
+    };
+    let popup = harness
+        .server
+        .state
+        .resolve_popup_geometry(&surface, positioner)
+        .expect("known mapped parent resolves popup geometry");
+    assert_eq!(popup.layout.x + popup.layout.width, 1536.0);
+    assert_eq!(popup.layout.y + popup.layout.height, 864.0);
+}
+
+#[test]
+fn fake_backend_button_press_reaches_the_client_with_the_raw_button_code() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+
+    harness.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: 0.25,
+            normalised_y: 0.25,
+        },
+    });
+    let _ = harness.sync();
+
+    // 0x110 is BTN_LEFT. The raw evdev code is what `wl_pointer.button` carries;
+    // `MouseButton` is a convenience that loses every non-standard button.
+    harness.route(InputEvent::PointerButton {
+        event: FakeButtonEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            button: 0x110,
+            state: ButtonState::Pressed,
+        },
+    });
+    let events = harness.sync();
+
+    let button = pointer_body(&events, pointer, 3);
+    assert_eq!(
+        word(&button, 1),
+        FAKE_EVENT_TIME_MS,
+        "button carries the device time"
+    );
+    assert_eq!(
+        word(&button, 2),
+        0x110,
+        "the raw evdev button code reaches the client"
+    );
+    assert_eq!(word(&button, 3), 1, "pressed");
+}
+
+#[test]
+fn fake_backend_wheel_without_a_pixel_amount_still_scrolls() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+
+    harness.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: 0.25,
+            normalised_y: 0.25,
+        },
+    });
+    let _ = harness.sync();
+
+    // One detent of a wheel that reports detents and no amount. This is the
+    // trait's shape, not `LibinputInputBackend`'s — that backend supplies an
+    // amount for every present axis, and
+    // `fake_backend_libinput_shaped_wheel_forwards_the_reported_amount` covers
+    // it. What this test pins is the v120 fallback, which any other backend can
+    // land on: two ways to lose the scroll, both silent and both once real
+    // here — read `amount` alone and treat the `None` as zero, or read the two
+    // axes as a pair and require both, so the absent horizontal axis discards
+    // the valid vertical v120 with it.
+    harness.route(InputEvent::PointerAxis {
+        event: FakeAxisEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            horizontal: None,
+            vertical: Some(FakeAxis::detents(120.0)),
+            source: AxisSource::Wheel,
+            relative_direction: AxisRelativeDirection::Identical,
+        },
+    });
+    let events = harness.sync();
+
+    let axis = pointer_body(&events, pointer, 4);
+    assert_eq!(word(&axis, 0), FAKE_EVENT_TIME_MS);
+    assert_eq!(word(&axis, 1), 0, "vertical scroll");
+    assert_eq!(
+        fixed(&axis, 2),
+        15.0,
+        "one detent converts to the same line-sized amount the nested backend \
+         already sends, so a client cannot tell the two transports apart"
+    );
+    let value120 = pointer_body(&events, pointer, 9);
+    assert_eq!(word(&value120, 0), 0, "vertical");
+    assert_eq!(
+        word(&value120, 1) as i32,
+        120,
+        "the discrete step is forwarded intact"
+    );
+}
+
+#[test]
+fn fake_backend_libinput_shaped_wheel_forwards_the_reported_amount() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+
+    harness.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: 0.25,
+            normalised_y: 0.25,
+        },
+    });
+    let _ = harness.sync();
+
+    // The shape `LibinputInputBackend` really produces: an amount *and* a
+    // detent count on the axis the device reported, nothing on the axis it did
+    // not. The amount here is deliberately not the 15.0 the fallback would
+    // synthesise from 120 v120 units, so a regression that ignored `amount` and
+    // always converted the detents would land here rather than pass unnoticed.
+    harness.route(InputEvent::PointerAxis {
+        event: FakeAxisEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            horizontal: None,
+            vertical: Some(FakeAxis::wheel(10.0, 120.0)),
+            source: AxisSource::Wheel,
+            relative_direction: AxisRelativeDirection::Identical,
+        },
+    });
+    let events = harness.sync();
+
+    let axis = pointer_body(&events, pointer, 4);
+    assert_eq!(word(&axis, 1), 0, "vertical scroll");
+    assert_eq!(
+        fixed(&axis, 2),
+        10.0,
+        "the device's own amount is forwarded, not one recomputed from the detents"
+    );
+    let value120 = pointer_body(&events, pointer, 9);
+    assert_eq!(word(&value120, 0), 0, "vertical");
+    assert_eq!(
+        word(&value120, 1) as i32,
+        120,
+        "the detent count rides alongside the amount rather than replacing it"
+    );
+}
+
+#[test]
+fn fake_backend_finger_scroll_ending_at_zero_emits_axis_stop() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+
+    harness.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: 0.25,
+            normalised_y: 0.25,
+        },
+    });
+    let _ = harness.sync();
+
+    // A one-finger vertical drag reports the vertical axis and omits the
+    // horizontal one. The omission is the assertion: an unreported axis must
+    // stay silent, because on a finger source a zero is a stop, so inventing
+    // one tells the client a horizontal fling ended that never began.
+    harness.route(InputEvent::PointerAxis {
+        event: FakeAxisEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            horizontal: None,
+            vertical: Some(FakeAxis::pixels(8.0)),
+            source: AxisSource::Finger,
+            relative_direction: AxisRelativeDirection::Identical,
+        },
+    });
+    let scrolling = harness.sync();
+    assert_eq!(
+        axis_stops(&scrolling, pointer),
+        Vec::<u32>::new(),
+        "an axis the device did not report is not an axis that stopped"
+    );
+
+    // A finger lift is reported as a zero-amount event on the axis that was
+    // moving, and it is the only way a client learns to end its kinetic
+    // scrolling. Dropping it as "no movement" leaves the client scrolling
+    // forever.
+    harness.route(InputEvent::PointerAxis {
+        event: FakeAxisEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            horizontal: None,
+            vertical: Some(FakeAxis::pixels(0.0)),
+            source: AxisSource::Finger,
+            relative_direction: AxisRelativeDirection::Identical,
+        },
+    });
+    let stopped = harness.sync();
+
+    assert_eq!(
+        axis_stops(&stopped, pointer),
+        [AXIS_VERTICAL],
+        "the finger lift stops exactly the axis that was scrolling, and still \
+         says nothing about the one the device never reported"
+    );
+}
+
+#[test]
+fn fake_backend_two_axis_finger_scroll_stops_only_the_axis_that_reported_zero() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+
+    harness.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: 0.25,
+            normalised_y: 0.25,
+        },
+    });
+    let _ = harness.sync();
+
+    // A diagonal drag that has come to rest vertically while still moving
+    // horizontally: both axes are reported, and only one of them is zero. The
+    // discrimination has to be per axis, not per event — a rule keyed on the
+    // event would either stop both or neither.
+    harness.route(InputEvent::PointerAxis {
+        event: FakeAxisEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            horizontal: Some(FakeAxis::pixels(6.0)),
+            vertical: Some(FakeAxis::pixels(0.0)),
+            source: AxisSource::Finger,
+            relative_direction: AxisRelativeDirection::Identical,
+        },
+    });
+    let events = harness.sync();
+
+    assert_eq!(
+        axis_stops(&events, pointer),
+        [AXIS_VERTICAL],
+        "the moving axis keeps moving and the rested one stops"
+    );
+    let axis = pointer_body(&events, pointer, 4);
+    assert_eq!(word(&axis, 1), AXIS_HORIZONTAL, "horizontal scroll");
+    assert_eq!(
+        fixed(&axis, 2),
+        6.0,
+        "the axis that is still moving carries its amount in the same frame as \
+         the other axis's stop"
+    );
+}
+
+#[test]
+fn fake_backend_reported_continuous_zero_stops_the_axis() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+
+    harness.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: 0.25,
+            normalised_y: 0.25,
+        },
+    });
+    let _ = harness.sync();
+
+    // A continuous source has a defined end of sequence just as a finger does,
+    // so a zero it actually reported is a stop and not an absence. Clients are
+    // told not to depend on it, which is not the same as the compositor being
+    // entitled to withhold it.
+    harness.route(InputEvent::PointerAxis {
+        event: FakeAxisEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            horizontal: None,
+            vertical: Some(FakeAxis::pixels(0.0)),
+            source: AxisSource::Continuous,
+            relative_direction: AxisRelativeDirection::Identical,
+        },
+    });
+    let events = harness.sync();
+
+    assert_eq!(
+        axis_stops(&events, pointer),
+        [AXIS_VERTICAL],
+        "a reported zero is the device saying the sequence ended"
+    );
+}
+
+#[test]
+fn fake_backend_idle_wheel_axis_sends_nothing() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+
+    harness.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: 0.25,
+            normalised_y: 0.25,
+        },
+    });
+    let _ = harness.sync();
+
+    // A wheel never promises a terminating event — there is no such thing as
+    // letting go of a wheel — so a zero from one carries no information and must
+    // not become an `axis_stop`. This is the other half of the rule the finger
+    // and continuous tests cover: which sources a zero means something for.
+    harness.route(InputEvent::PointerAxis {
+        event: FakeAxisEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            horizontal: None,
+            vertical: Some(FakeAxis {
+                amount: Some(0.0),
+                v120: Some(0.0),
+            }),
+            source: AxisSource::Wheel,
+            relative_direction: AxisRelativeDirection::Identical,
+        },
+    });
+    let events = harness.sync();
+
+    assert_eq!(
+        pointer_opcodes(&events, pointer),
+        Vec::<u16>::new(),
+        "no axis, no axis_stop and no frame for a wheel that did not turn"
+    );
+}
+
+#[test]
+fn fake_backend_scroll_with_no_reported_axis_sends_nothing() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+
+    harness.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: 0.25,
+            normalised_y: 0.25,
+        },
+    });
+    let _ = harness.sync();
+
+    // An event that reports neither axis says nothing about either, whatever
+    // its source. If this ever produced a frame it would mean an absent axis
+    // had been given a value somewhere on the way through.
+    harness.route(InputEvent::PointerAxis {
+        event: FakeAxisEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            horizontal: None,
+            vertical: None,
+            source: AxisSource::Finger,
+            relative_direction: AxisRelativeDirection::Identical,
+        },
+    });
+    let events = harness.sync();
+
+    assert_eq!(
+        pointer_opcodes(&events, pointer),
+        Vec::<u16>::new(),
+        "an event describing no axis cannot describe a stop either"
+    );
+}
+
+#[test]
+fn fake_backend_inverted_scroll_direction_reaches_the_client() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+
+    harness.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: 0.25,
+            normalised_y: 0.25,
+        },
+    });
+    let _ = harness.sync();
+
+    // Natural scrolling is a libinput device setting, so only the bare-metal
+    // transport can observe it. Losing it would leave a client unable to
+    // distinguish "content moved down" from "the surface moved up".
+    harness.route(InputEvent::PointerAxis {
+        event: FakeAxisEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            horizontal: None,
+            vertical: Some(FakeAxis::pixels(8.0)),
+            source: AxisSource::Finger,
+            relative_direction: AxisRelativeDirection::Inverted,
+        },
+    });
+    let events = harness.sync();
+
+    let direction = pointer_body(&events, pointer, 10);
+    assert_eq!(word(&direction, 0), 0, "vertical");
+    assert_eq!(word(&direction, 1), 1, "inverted");
+}
+
+#[test]
+fn removing_the_sole_key_and_button_holder_emits_one_release_each() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+    harness.route(InputEvent::DeviceAdded {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    harness.prime_pointer_focus();
+
+    harness.route(InputEvent::Keyboard {
+        event: FakeKeyEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            keycode: Keycode::new(24),
+            state: KeyState::Pressed,
+        },
+    });
+    harness.route(InputEvent::PointerButton {
+        event: FakeButtonEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            button: 0x110,
+            state: ButtonState::Pressed,
+        },
+    });
+    let _ = harness.sync();
+
+    harness.route(InputEvent::DeviceRemoved {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    let removed = harness.sync();
+
+    assert_eq!(
+        keyboard_key_events(&removed),
+        [(16, 0)],
+        "the sole physical holder contributes exactly one client-visible key release"
+    );
+    let buttons = pointer_bodies(&removed, pointer, 3);
+    assert_eq!(buttons.len(), 1, "exactly one wl_pointer.button release");
+    assert_eq!(word(&buttons[0], 2), 0x110);
+    assert_eq!(word(&buttons[0], 3), 0, "released");
+}
+
+#[test]
+fn shared_key_and_button_are_released_only_when_the_last_holder_leaves() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+    harness.route(InputEvent::DeviceAdded {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    harness.route(InputEvent::DeviceAdded {
+        device: FakeDevice::SecondKeyboardAndPointer,
+    });
+    harness.prime_pointer_focus();
+
+    for device in [
+        FakeDevice::KeyboardAndPointer,
+        FakeDevice::SecondKeyboardAndPointer,
+    ] {
+        harness.route(InputEvent::Keyboard {
+            event: FakeKeyEvent {
+                device,
+                keycode: Keycode::new(24),
+                state: KeyState::Pressed,
+            },
+        });
+        harness.route(InputEvent::PointerButton {
+            event: FakeButtonEvent {
+                device,
+                button: 0x110,
+                state: ButtonState::Pressed,
+            },
+        });
+    }
+    let _ = harness.sync();
+
+    harness.route(InputEvent::DeviceRemoved {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    let first_removed = harness.sync();
+    assert!(
+        keyboard_key_events(&first_removed).is_empty(),
+        "a surviving holder suppresses the key release"
+    );
+    assert!(
+        pointer_bodies(&first_removed, pointer, 3).is_empty(),
+        "a surviving holder suppresses the button release"
+    );
+
+    harness.route(InputEvent::DeviceRemoved {
+        device: FakeDevice::SecondKeyboardAndPointer,
+    });
+    let last_removed = harness.sync();
+    assert_eq!(keyboard_key_events(&last_removed), [(16, 0)]);
+    let buttons = pointer_bodies(&last_removed, pointer, 3);
+    assert_eq!(buttons.len(), 1);
+    assert_eq!((word(&buttons[0], 2), word(&buttons[0], 3)), (0x110, 0));
+
+    let key_position = last_removed
+        .iter()
+        .position(|(object, opcode, _)| *object == TEST_KEYBOARD_ID && *opcode == 3)
+        .expect("synthetic key release");
+    let button_position = last_removed
+        .iter()
+        .position(|(object, opcode, _)| *object == pointer && *opcode == 3)
+        .expect("synthetic button release");
+    assert!(
+        key_position < button_position,
+        "the removal batch reconciles keys before buttons"
+    );
+}
+
+#[test]
+fn removal_does_not_repeat_a_release_the_seat_already_received() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+    for device in [
+        FakeDevice::KeyboardAndPointer,
+        FakeDevice::SecondKeyboardAndPointer,
+    ] {
+        harness.route(InputEvent::DeviceAdded { device });
+    }
+    harness.prime_pointer_focus();
+    for device in [
+        FakeDevice::KeyboardAndPointer,
+        FakeDevice::SecondKeyboardAndPointer,
+    ] {
+        harness.route(InputEvent::Keyboard {
+            event: FakeKeyEvent {
+                device,
+                keycode: Keycode::new(24),
+                state: KeyState::Pressed,
+            },
+        });
+        harness.route(InputEvent::PointerButton {
+            event: FakeButtonEvent {
+                device,
+                button: 0x110,
+                state: ButtonState::Pressed,
+            },
+        });
+    }
+    let _ = harness.sync();
+
+    // Preserve Smithay's existing cross-device early release: these real
+    // releases empty the seat's pressed sets even though B's ingress record
+    // still holds both the key and the button.
+    harness.route(InputEvent::Keyboard {
+        event: FakeKeyEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            keycode: Keycode::new(24),
+            state: KeyState::Released,
+        },
+    });
+    harness.route(InputEvent::PointerButton {
+        event: FakeButtonEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            button: 0x110,
+            state: ButtonState::Released,
+        },
+    });
+    let early = harness.sync();
+    assert_eq!(keyboard_key_events(&early), [(16, 0)]);
+    assert_eq!(
+        pointer_bodies(&early, pointer, 3).len(),
+        1,
+        "the cross-device early button release still reaches the client"
+    );
+
+    harness.route(InputEvent::DeviceRemoved {
+        device: FakeDevice::SecondKeyboardAndPointer,
+    });
+    let removed = harness.sync();
+    assert!(
+        keyboard_key_events(&removed).is_empty(),
+        "the seat-state intersection rejects a second key release the client never owed"
+    );
+    // The button half of the rule is pinned separately: dropping only the
+    // button intersection leaves every key oracle green.
+    assert!(
+        pointer_bodies(&removed, pointer, 3).is_empty(),
+        "the seat-state intersection rejects a second button release the client never owed"
+    );
+}
+
+#[test]
+fn removing_an_active_finger_axis_stops_only_that_axis_in_one_frame() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+    harness.route(InputEvent::DeviceAdded {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    harness.prime_pointer_focus();
+    harness.route(InputEvent::PointerAxis {
+        event: FakeAxisEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            horizontal: None,
+            vertical: Some(FakeAxis::pixels(8.0)),
+            source: AxisSource::Finger,
+            relative_direction: AxisRelativeDirection::Identical,
+        },
+    });
+    let _ = harness.sync();
+
+    harness.route(InputEvent::DeviceRemoved {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    let removed = harness.sync();
+    assert_eq!(
+        axis_stops(&removed, pointer),
+        [AXIS_VERTICAL],
+        "removal stops the active vertical sequence and manufactures no horizontal stop"
+    );
+    assert_eq!(
+        pointer_bodies(&removed, pointer, 5).len(),
+        1,
+        "the synthetic stop is closed by exactly one wl_pointer.frame"
+    );
+}
+
+#[test]
+fn removing_one_of_two_active_finger_axes_does_not_stop_the_survivor() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+    for device in [
+        FakeDevice::KeyboardAndPointer,
+        FakeDevice::SecondKeyboardAndPointer,
+    ] {
+        harness.route(InputEvent::DeviceAdded { device });
+    }
+    harness.prime_pointer_focus();
+    for device in [
+        FakeDevice::KeyboardAndPointer,
+        FakeDevice::SecondKeyboardAndPointer,
+    ] {
+        harness.route(InputEvent::PointerAxis {
+            event: FakeAxisEvent {
+                device,
+                horizontal: None,
+                vertical: Some(FakeAxis::pixels(8.0)),
+                source: AxisSource::Finger,
+                relative_direction: AxisRelativeDirection::Identical,
+            },
+        });
+    }
+    let _ = harness.sync();
+
+    harness.route(InputEvent::DeviceRemoved {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    let removed = harness.sync();
+    assert!(
+        axis_stops(&removed, pointer).is_empty(),
+        "the indistinguishable surviving finger sequence suppresses a stop"
+    );
+    assert!(
+        pointer_opcodes(&removed, pointer).is_empty(),
+        "a suppressed stop produces no empty pointer frame"
+    );
+}
+
+#[test]
+fn removing_a_wheel_after_scrolling_does_not_manufacture_a_stop() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+    harness.route(InputEvent::DeviceAdded {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    harness.prime_pointer_focus();
+    harness.route(InputEvent::PointerAxis {
+        event: FakeAxisEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            horizontal: None,
+            vertical: Some(FakeAxis::wheel(15.0, 120.0)),
+            source: AxisSource::Wheel,
+            relative_direction: AxisRelativeDirection::Identical,
+        },
+    });
+    let _ = harness.sync();
+
+    harness.route(InputEvent::DeviceRemoved {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    let removed = harness.sync();
+    assert!(axis_stops(&removed, pointer).is_empty());
+    assert!(
+        pointer_opcodes(&removed, pointer).is_empty(),
+        "a wheel has no active sequence for removal to terminate"
+    );
+}
+
+#[test]
+fn a_duplicate_device_add_keeps_the_held_state_of_the_current_lifetime() {
+    let mut harness = KeybindingHarness::new(false);
+    let _pointer = harness.bind_pointer();
+    harness.route(InputEvent::DeviceAdded {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    harness.prime_pointer_focus();
+    harness.route(InputEvent::Keyboard {
+        event: FakeKeyEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            keycode: Keycode::new(24),
+            state: KeyState::Pressed,
+        },
+    });
+    let _ = harness.sync();
+
+    // A second add for a live id is a duplicate announcement of the same
+    // lifetime — device ids are unique among live devices. Replacing the
+    // record here would forget the held key, and the removal below would then
+    // reconcile nothing: exactly the stuck-modifier defect this rung closes.
+    harness.route(InputEvent::DeviceAdded {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    harness.route(InputEvent::DeviceRemoved {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    let removed = harness.sync();
+    assert_eq!(
+        keyboard_key_events(&removed),
+        [(16, 0)],
+        "the held key survives a duplicate device-add and is released on removal"
+    );
+}
+
+#[test]
+fn synthetic_releases_carry_the_device_stream_timestamp() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+    harness.route(InputEvent::DeviceAdded {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    harness.prime_pointer_focus();
+    harness.route(InputEvent::Keyboard {
+        event: FakeKeyEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            keycode: Keycode::new(24),
+            state: KeyState::Pressed,
+        },
+    });
+    harness.route(InputEvent::PointerButton {
+        event: FakeButtonEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            button: 0x110,
+            state: ButtonState::Pressed,
+        },
+    });
+    harness.route(InputEvent::PointerAxis {
+        event: FakeAxisEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            horizontal: None,
+            vertical: Some(FakeAxis::pixels(8.0)),
+            source: AxisSource::Finger,
+            relative_direction: AxisRelativeDirection::Identical,
+        },
+    });
+    let _ = harness.sync();
+
+    harness.route(InputEvent::DeviceRemoved {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    let removed = harness.sync();
+
+    // Every fake event carries `FAKE_EVENT_TIME_MS` on the backend's own
+    // base. A synthetic release stamped from the compositor's process-local
+    // clock instead would hand the client a timestamp from a different base —
+    // `wl_pointer.axis_stop` explicitly requires the same base as the axis
+    // events before it, and key/button times feed click-duration arithmetic.
+    let key_times: Vec<u32> = removed
+        .iter()
+        .filter(|(object, opcode, body)| {
+            *object == TEST_KEYBOARD_ID && *opcode == 3 && body.len() >= 16
+        })
+        .map(|(_, _, body)| word(body, 1))
+        .collect();
+    assert_eq!(
+        key_times,
+        [FAKE_EVENT_TIME_MS],
+        "the synthetic key release rides the device's timestamp base"
+    );
+    let buttons = pointer_bodies(&removed, pointer, 3);
+    assert_eq!(buttons.len(), 1);
+    assert_eq!(
+        word(&buttons[0], 1),
+        FAKE_EVENT_TIME_MS,
+        "the synthetic button release rides the device's timestamp base"
+    );
+    let stops = pointer_bodies(&removed, pointer, 7);
+    assert_eq!(stops.len(), 1);
+    assert_eq!(
+        word(&stops[0], 0),
+        FAKE_EVENT_TIME_MS,
+        "the synthetic axis stop rides the device's timestamp base"
+    );
+}
+
+#[test]
+fn removal_owes_no_stop_for_an_axis_the_client_was_already_told_stopped() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+    for device in [
+        FakeDevice::KeyboardAndPointer,
+        FakeDevice::SecondKeyboardAndPointer,
+    ] {
+        harness.route(InputEvent::DeviceAdded { device });
+    }
+    harness.prime_pointer_focus();
+    for device in [
+        FakeDevice::KeyboardAndPointer,
+        FakeDevice::SecondKeyboardAndPointer,
+    ] {
+        harness.route(InputEvent::PointerAxis {
+            event: FakeAxisEvent {
+                device,
+                horizontal: None,
+                vertical: Some(FakeAxis::pixels(8.0)),
+                source: AxisSource::Finger,
+                relative_direction: AxisRelativeDirection::Identical,
+            },
+        });
+    }
+    // The first device reports the ordinary zero stop. The client has now
+    // been told the axis stopped — that word came from a different device
+    // than the one about to depart, which is the point.
+    harness.route(InputEvent::PointerAxis {
+        event: FakeAxisEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            horizontal: None,
+            vertical: Some(FakeAxis::pixels(0.0)),
+            source: AxisSource::Finger,
+            relative_direction: AxisRelativeDirection::Identical,
+        },
+    });
+    let _ = harness.sync();
+
+    harness.route(InputEvent::DeviceRemoved {
+        device: FakeDevice::SecondKeyboardAndPointer,
+    });
+    let removed = harness.sync();
+    assert!(
+        axis_stops(&removed, pointer).is_empty(),
+        "a stop the client already received is not repeated on removal"
+    );
+    assert!(
+        pointer_opcodes(&removed, pointer).is_empty(),
+        "a suppressed duplicate stop produces no empty pointer frame"
+    );
+}
+
+#[test]
+fn removing_a_two_axis_scroll_stops_both_in_one_frame_after_the_button_release() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+    harness.route(InputEvent::DeviceAdded {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    harness.prime_pointer_focus();
+    harness.route(InputEvent::PointerButton {
+        event: FakeButtonEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            button: 0x110,
+            state: ButtonState::Pressed,
+        },
+    });
+    harness.route(InputEvent::PointerAxis {
+        event: FakeAxisEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            horizontal: Some(FakeAxis::pixels(6.0)),
+            vertical: Some(FakeAxis::pixels(8.0)),
+            source: AxisSource::Finger,
+            relative_direction: AxisRelativeDirection::Identical,
+        },
+    });
+    let _ = harness.sync();
+
+    harness.route(InputEvent::DeviceRemoved {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    let removed = harness.sync();
+
+    let stops = axis_stops(&removed, pointer);
+    assert_eq!(stops.len(), 2, "both active axes stop on removal");
+    assert!(stops.contains(&AXIS_HORIZONTAL) && stops.contains(&AXIS_VERTICAL));
+    // Two frames total: one closing the button release, one closing both axis
+    // stops (announced by a single `axis_source`, opcode 6). Separate frames
+    // for the two stops would tell the client one axis stopped while the
+    // other was still moving; sharing the button's frame would fold a
+    // logically distinct pointer event into the scroll's.
+    assert_eq!(
+        pointer_opcodes(&removed, pointer),
+        [3, 5, 6, 7, 7, 5],
+        "button release in its own frame, then both stops in one shared frame"
+    );
+}
+
+#[test]
+fn a_released_then_reclaimed_press_is_still_reconciled_on_removal() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+    for device in [
+        FakeDevice::KeyboardAndPointer,
+        FakeDevice::SecondKeyboardAndPointer,
+    ] {
+        harness.route(InputEvent::DeviceAdded { device });
+    }
+    harness.prime_pointer_focus();
+    // The first device presses and cleanly releases: its record must end
+    // empty. An ingress that forgets to unrecord a release keeps a stale
+    // claim on the key and button, and the cross-device filter would then
+    // read that claim as a surviving holder.
+    for state in [KeyState::Pressed, KeyState::Released] {
+        harness.route(InputEvent::Keyboard {
+            event: FakeKeyEvent {
+                device: FakeDevice::KeyboardAndPointer,
+                keycode: Keycode::new(24),
+                state,
+            },
+        });
+    }
+    for state in [ButtonState::Pressed, ButtonState::Released] {
+        harness.route(InputEvent::PointerButton {
+            event: FakeButtonEvent {
+                device: FakeDevice::KeyboardAndPointer,
+                button: 0x110,
+                state,
+            },
+        });
+    }
+    // The second device then presses the same key and button and departs as
+    // their sole live holder.
+    harness.route(InputEvent::Keyboard {
+        event: FakeKeyEvent {
+            device: FakeDevice::SecondKeyboardAndPointer,
+            keycode: Keycode::new(24),
+            state: KeyState::Pressed,
+        },
+    });
+    harness.route(InputEvent::PointerButton {
+        event: FakeButtonEvent {
+            device: FakeDevice::SecondKeyboardAndPointer,
+            button: 0x110,
+            state: ButtonState::Pressed,
+        },
+    });
+    let _ = harness.sync();
+
+    harness.route(InputEvent::DeviceRemoved {
+        device: FakeDevice::SecondKeyboardAndPointer,
+    });
+    let removed = harness.sync();
+    assert_eq!(
+        keyboard_key_events(&removed),
+        [(16, 0)],
+        "a stale record from an earlier clean release must not suppress the owed key release"
+    );
+    // The button half pins the button arm separately: forgetting only button
+    // releases leaves every key oracle green.
+    let buttons = pointer_bodies(&removed, pointer, 3);
+    assert_eq!(
+        buttons.len(),
+        1,
+        "a stale record from an earlier clean release must not suppress the owed button release"
+    );
+    assert_eq!((word(&buttons[0], 2), word(&buttons[0], 3)), (0x110, 0));
+}
+
+#[test]
+fn an_axis_stopped_by_its_own_device_does_not_suppress_anothers_owed_stop() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+    for device in [
+        FakeDevice::KeyboardAndPointer,
+        FakeDevice::SecondKeyboardAndPointer,
+    ] {
+        harness.route(InputEvent::DeviceAdded { device });
+    }
+    harness.prime_pointer_focus();
+    // The first device scrolls and reports its own ordinary zero stop: its
+    // record must end empty. An ingress that keeps the entry past the zero
+    // would read as a surviving holder when the second device departs.
+    for amount in [8.0, 0.0] {
+        harness.route(InputEvent::PointerAxis {
+            event: FakeAxisEvent {
+                device: FakeDevice::KeyboardAndPointer,
+                horizontal: None,
+                vertical: Some(FakeAxis::pixels(amount)),
+                source: AxisSource::Finger,
+                relative_direction: AxisRelativeDirection::Identical,
+            },
+        });
+    }
+    // The second device re-arms the axis and departs as its sole live holder.
+    harness.route(InputEvent::PointerAxis {
+        event: FakeAxisEvent {
+            device: FakeDevice::SecondKeyboardAndPointer,
+            horizontal: None,
+            vertical: Some(FakeAxis::pixels(8.0)),
+            source: AxisSource::Finger,
+            relative_direction: AxisRelativeDirection::Identical,
+        },
+    });
+    let _ = harness.sync();
+
+    harness.route(InputEvent::DeviceRemoved {
+        device: FakeDevice::SecondKeyboardAndPointer,
+    });
+    let removed = harness.sync();
+    assert_eq!(
+        axis_stops(&removed, pointer),
+        [AXIS_VERTICAL],
+        "a stale axis entry from an earlier ordinary stop must not suppress the owed stop"
+    );
+}
+
+#[test]
+fn removing_an_active_continuous_axis_stops_it() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+    harness.route(InputEvent::DeviceAdded {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    harness.prime_pointer_focus();
+    // Continuous is the other source whose stream promises a stop; a removal
+    // loop that quietly reconciled only Finger would pass every other fixture
+    // in this file.
+    harness.route(InputEvent::PointerAxis {
+        event: FakeAxisEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            horizontal: None,
+            vertical: Some(FakeAxis::pixels(8.0)),
+            source: AxisSource::Continuous,
+            relative_direction: AxisRelativeDirection::Identical,
+        },
+    });
+    let _ = harness.sync();
+
+    harness.route(InputEvent::DeviceRemoved {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    let removed = harness.sync();
+    assert_eq!(
+        axis_stops(&removed, pointer),
+        [AXIS_VERTICAL],
+        "an active continuous sequence is stopped on removal"
+    );
+}
+
+#[test]
+fn unclaimed_event_classes_are_reported_by_name_rather_than_dropped() {
+    let harness = KeybindingHarness::new(false);
+    let extent = harness.server.state.backend.seat_extent();
+
+    // Arrival of a keyboard or a pointer changes no seat state — both are
+    // created with the compositor and are not conditional on a device existing —
+    // but "ignored" must still be a named outcome, so a log can tell "no devices"
+    // apart from "devices were never enumerated". A *touch* device is not in
+    // this case, and must not be: its arrival and departure carry the seat
+    // capability, and `touch_reaches_a_real_client_and_the_capability_tracks_the_device`
+    // is where that is proved.
+    //
+    let mut ingress = super::input::InputIngressState::default();
+    // Counting the samples is the oracle for the other half of this seam: the
+    // seat's held state is cloned out from behind two locks, so only the one
+    // event class that reconciles held state may ask for it. Sampling it
+    // unconditionally — the shape this was written to reject — moves the first
+    // count off zero.
+    let sampled = std::cell::Cell::new(0_u32);
+    let seat_held = || {
+        sampled.set(sampled.get() + 1);
+        super::input::SeatHeldState {
+            keys: HashSet::new(),
+            buttons: Vec::new(),
+        }
+    };
+
+    let added = InputEvent::<FakeInput>::DeviceAdded {
+        device: FakeDevice::KeyboardAndPointer,
+    };
+    let routing = super::input::host_input_from_event(&mut ingress, &added, extent, seat_held);
+    let super::input::InputRouting::Ignored(reason) = routing else {
+        panic!("a non-touch device arrival has no seat operation");
+    };
+    assert_eq!(reason, "input device added");
+    assert_eq!(sampled.get(), 0, "device arrival must not sample the seat");
+
+    // Removal consumes the device lifetime record whatever it was holding, so
+    // an idle device leaving is still a *named* outcome rather than silence —
+    // it just has no seat operation to dispatch.
+    let removed = InputEvent::<FakeInput>::DeviceRemoved {
+        device: FakeDevice::KeyboardAndPointer,
+    };
+    let routing = super::input::host_input_from_event(&mut ingress, &removed, extent, seat_held);
+    let super::input::InputRouting::Ignored(reason) = routing else {
+        panic!("an idle device removal has nothing to dispatch");
+    };
+    assert_eq!(reason, "input device removed; nothing held to reconcile");
+    assert_eq!(
+        sampled.get(),
+        1,
+        "removal is the only class that samples the seat"
+    );
+}
+
+#[test]
+fn all_device_authority_loss_reuses_reconciliation_for_every_held_input_class() {
+    let mut ingress = super::input::InputIngressState::default();
+    let extent = (320, 240);
+    let key = Keycode::new(24);
+    {
+        let mut route = |event: InputEvent<FakeInput>| {
+            super::input::host_input_from_event(&mut ingress, &event, extent, || {
+                panic!("ordinary input must not sample held seat state")
+            })
+        };
+        let _ = route(InputEvent::DeviceAdded {
+            device: FakeDevice::KeyboardAndPointer,
+        });
+        let _ = route(InputEvent::DeviceAdded {
+            device: FakeDevice::Touchscreen,
+        });
+        let _ = route(InputEvent::Keyboard {
+            event: FakeKeyEvent {
+                device: FakeDevice::KeyboardAndPointer,
+                keycode: key,
+                state: KeyState::Pressed,
+            },
+        });
+        let _ = route(InputEvent::PointerButton {
+            event: FakeButtonEvent {
+                device: FakeDevice::KeyboardAndPointer,
+                button: 0x110,
+                state: ButtonState::Pressed,
+            },
+        });
+        let _ = route(InputEvent::PointerAxis {
+            event: FakeAxisEvent {
+                device: FakeDevice::KeyboardAndPointer,
+                horizontal: None,
+                vertical: Some(FakeAxis::pixels(8.0)),
+                source: AxisSource::Finger,
+                relative_direction: AxisRelativeDirection::Identical,
+            },
+        });
+    }
+
+    let reconciled = ingress.all_devices_lost_authority(&super::input::SeatHeldState {
+        keys: HashSet::from([key]),
+        buttons: vec![0x110],
+    });
+    assert!(matches!(
+        reconciled.as_slice(),
+        [
+            HostInput::Key {
+                keycode,
+                state: HostButtonState::Released,
+                ..
+            },
+            HostInput::PointerButton {
+                button: 0x110,
+                state: HostButtonState::Released,
+                ..
+            },
+            HostInput::PointerAxis {
+                horizontal: None,
+                vertical: Some(HostAxis { amount: 0.0, .. }),
+                source: AxisSource::Finger,
+                ..
+            },
+            HostInput::TouchDeviceRemoved,
+        ] if *keycode == key
+    ));
+    assert!(
+        ingress
+            .all_devices_lost_authority(&super::input::SeatHeldState {
+                keys: HashSet::new(),
+                buttons: Vec::new(),
+            })
+            .is_empty(),
+        "the operation consumes every device lifetime exactly once"
+    );
+}
+
+#[test]
+fn touch_event_before_device_added_still_cancels_on_authority_loss() {
+    let mut ingress = super::input::InputIngressState::default();
+    let extent = (320, 240);
+    let down = InputEvent::<FakeInput>::TouchDown {
+        event: FakeTouchPositionEvent {
+            slot: TouchSlot::from(Some(0)),
+            normalised_x: 0.25,
+            normalised_y: 0.5,
+            time_us: 10_000,
+        },
+    };
+    assert!(matches!(
+        super::input::host_input_from_event(&mut ingress, &down, extent, || {
+            panic!("touch ingress does not sample held keyboard or pointer state")
+        }),
+        super::input::InputRouting::Deliver(inputs)
+            if matches!(inputs.as_slice(), [HostInput::TouchDown { .. }])
+    ));
+    let added = InputEvent::<FakeInput>::DeviceAdded {
+        device: FakeDevice::Touchscreen,
+    };
+    let _ = super::input::host_input_from_event(&mut ingress, &added, extent, || {
+        panic!("touch device addition does not sample held state")
+    });
+
+    assert!(matches!(
+        ingress
+            .all_devices_lost_authority(&super::input::SeatHeldState {
+                keys: HashSet::new(),
+                buttons: Vec::new(),
+            })
+            .as_slice(),
+        [HostInput::TouchDeviceRemoved]
+    ));
+}
+
+#[test]
+fn seat_confinement_keeps_the_cursor_out_of_a_mixed_height_layout_s_dead_space() {
+    // 1920x1080 beside 1280x1024 bounds to 3200x1080, and the 1280x56 strip
+    // under the shorter output belongs to no display at all. Confining to the
+    // bounding box would park the cursor somewhere nothing can draw it, and
+    // `surface_at` would find nothing there either.
+    let regions = [
+        SeatRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        },
+        SeatRegion {
+            x: 1920.0,
+            y: 0.0,
+            width: 1280.0,
+            height: 1024.0,
+        },
+    ];
+
+    assert_eq!(
+        clamp_point_to_seat((2500.0, 1050.0), &regions),
+        (2500.0, 1024_f64.next_down()),
+        "a point in the dead strip moves up onto the shorter output, not sideways"
+    );
+    assert_eq!(
+        clamp_point_to_seat((2500.0, 500.0), &regions),
+        (2500.0, 500.0),
+        "a point inside the second output is already where it belongs"
+    );
+    assert_eq!(
+        clamp_point_to_seat((1000.0, 1050.0), &regions),
+        (1000.0, 1050.0),
+        "the same height is perfectly legal over the taller output"
+    );
+}
+
+#[test]
+fn seat_confinement_picks_the_nearest_region_rather_than_the_first() {
+    let regions = [
+        SeatRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        },
+        SeatRegion {
+            x: 1000.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        },
+    ];
+
+    // A gap between outputs is not reachable, so the cursor has to land on one
+    // side of it. Which side is not arbitrary: taking the first region would
+    // drag the cursor back to the left-hand output from anywhere in the gap,
+    // including from a hair short of the right-hand one.
+    assert_eq!(
+        clamp_point_to_seat((990.0, 50.0), &regions),
+        (1000.0, 50.0),
+        "just short of the right-hand output snaps onto it"
+    );
+    assert_eq!(
+        clamp_point_to_seat((110.0, 50.0), &regions),
+        (100_f64.next_down(), 50.0),
+        "just past the left-hand output snaps back onto it"
+    );
+    // A diagonal overshoot past a corner must land on the corner. Clamping each
+    // axis independently against the bounding box would slide it along one axis
+    // into space no output covers.
+    assert_eq!(
+        clamp_point_to_seat((2000.0, 5000.0), &regions),
+        (1100_f64.next_down(), 100_f64.next_down()),
+        "the far corner of the nearest region, on the same half-open bound"
+    );
+    // And the honest limit of a stateless projection, asserted rather than left
+    // for someone to discover: nearest-region minimises the correction, it does
+    // not keep the cursor on the side of the gap it started. One delta big
+    // enough to clear the midpoint lands on the far output. Preventing that
+    // needs the previous position, which this deliberately does not take.
+    assert_eq!(
+        clamp_point_to_seat((600.0, 50.0), &regions),
+        (1000.0, 50.0),
+        "past the midpoint the nearer region is the far one, and it wins"
+    );
+}
+
+#[test]
+fn seat_confinement_survives_a_degenerate_region_and_a_non_finite_position() {
+    let regions = [SeatRegion {
+        x: 0.0,
+        y: 0.0,
+        width: 0.0,
+        height: 0.0,
+    }];
+
+    // `next_down` on a zero-extent output would fall below the origin and
+    // invert the clamp range, which panics.
+    assert_eq!(clamp_point_to_seat((5.0, 5.0), &regions), (0.0, 0.0));
+    assert_eq!(
+        clamp_point_to_seat((f64::NAN, f64::INFINITY), &regions),
+        (0.0, 0.0),
+        "a non-finite coordinate is not a position; it resolves to the origin \
+         rather than propagating into the hit test"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rung E-2: the immediate-ingress stall oracle.
+//
+// `route_input_event` dispatches from the calloop callback with no queue and no
+// frame boundary, and until now that was a structural claim with nothing to
+// falsify it: E-1's tests call the router directly, and the existing
+// blocked-acquire tests round-trip `wl_display.sync`, which the display fd
+// answers whether or not any input path exists.
+//
+// The test below is the falsifier. Its witness is one exact `wl_keyboard.key`
+// on the wire, read while the render path is blocked inside a real Bevy
+// `Render` schedule — no `finish_frame` and no `wl_display.sync`, because a
+// frame-bounded input queue would satisfy both.
+// ---------------------------------------------------------------------------
+
+/// Read until the named key arrives on `keyboard`.
+///
+/// Returns its state and everything read before it, so a caller can assert
+/// against the surrounding traffic without a second sync round-trip — which
+/// matters here, because a sync is one of the things the stalled read must not
+/// depend on.
+///
+/// Keyed on the evdev code rather than on "the next key event", so a test names
+/// the event it is waiting for and cannot be satisfied by an earlier one still
+/// sitting in the socket.
+fn read_keyboard_key(
+    client: &mut UnixStream,
+    keyboard: u32,
+    keycode: u32,
+    deadline: Instant,
+    awaited: &str,
+) -> (u32, Vec<(u32, u16, Vec<u8>)>) {
+    let mut preceding = Vec::new();
+    for _ in 0..64 {
+        let event = read_event(client, deadline, awaited);
+        let (object, opcode, body) = &event;
+        if *object == keyboard && *opcode == 3 && body.len() >= 16 && word(body, 2) == keycode {
+            return (word(body, 3), preceding);
+        }
+        preceding.push(event);
+    }
+    panic!("{awaited}: no wl_keyboard.key carrying evdev code {keycode} in 64 events");
+}
+
+/// XKB keycode for Q; the wire carries evdev's 16.
+const STALL_ORACLE_CONTROL_KEY: u32 = 24;
+/// XKB keycode for W; the wire carries evdev's 17.
+const STALL_ORACLE_STALLED_KEY: u32 = 25;
+
+#[test]
+fn injected_key_reaches_a_focused_client_while_acquire_is_blocked() {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the immediate-ingress stall oracle");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-input-stall-test-{}-{unique}", std::process::id());
+
+    let (injector, input_source) = fake_input_source();
+    // Keybindings off: a key the compositor swallowed as a binding would never
+    // reach the wire, and this test must fail for exactly one reason.
+    let runtime = WaylandRuntime::with_input_source(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        WaylandGpuWiring {
+            dmabuf_capabilities: Some(DmabufCapabilities {
+                main_device: 0,
+                formats: Vec::new(),
+                adapter_name: "input-stall-test".into(),
+                drm_adapter: synthetic_drm_adapter("input-stall-test"),
+            }),
+            dmabuf_validator: None,
+            retirement_adapter: test_retirement_adapter(),
+        },
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+        Some(input_source),
+        None,
+    )
+    .expect("protocol thread starts with an input source registered on it");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+
+    send_display_request(&mut client, 1, 2); // wl_display.get_registry
+    send_display_request(&mut client, 0, 3); // wl_display.sync
+    let globals = registry_globals(&mut client, 3);
+    let (compositor, compositor_version) = globals["wl_compositor"];
+    let (xdg_wm_base, xdg_version) = globals["xdg_wm_base"];
+    let (shm, shm_version) = globals["wl_shm"];
+    let (seat, seat_version) = globals["wl_seat"];
+    bind_global(
+        &mut client,
+        compositor,
+        "wl_compositor",
+        compositor_version.min(5),
+        4,
+    );
+    bind_global(
+        &mut client,
+        xdg_wm_base,
+        "xdg_wm_base",
+        xdg_version.min(6),
+        5,
+    );
+    bind_global(&mut client, shm, "wl_shm", shm_version.min(1), 6);
+    bind_global(&mut client, seat, "wl_seat", seat_version.min(7), 7);
+    send_request(&mut client, 7, 1, &words(&[8])); // wl_seat.get_keyboard
+    send_request(&mut client, 7, 0, &words(&[9])); // wl_seat.get_pointer
+
+    // A real toplevel, brought up through the ordinary xdg handshake. The
+    // harness elsewhere in this file sets focus and layout by mutating the
+    // server's own state, which cannot be done across the runtime thread and
+    // would in any case decide by hand the thing this test is asking about.
+    send_request(&mut client, 4, 0, &words(&[10])); // wl_compositor.create_surface
+    send_request(&mut client, 5, 2, &words(&[11, 10])); // xdg_wm_base.get_xdg_surface
+    send_request(&mut client, 11, 1, &words(&[12])); // xdg_surface.get_toplevel
+    send_request(&mut client, 10, 6, &[]); // initial empty commit
+    send_display_request(&mut client, 0, 13);
+    let serial = events_until_callback(&mut client, 13)
+        .iter()
+        .find_map(|(object, opcode, body)| (*object == 11 && *opcode == 0).then(|| word(body, 0)))
+        .expect("xdg_surface.configure follows the initial empty commit");
+    send_request(&mut client, 11, 4, &words(&[serial])); // xdg_surface.ack_configure
+
+    // A real SHM buffer, because committing one is what gives the surface a
+    // size and maps it — and a surface with no size is not hit-testable, so the
+    // click below would focus nothing.
+    let name = std::ffi::CString::new("cosmix-input-stall-test").expect("static memfd name");
+    // SAFETY: name is a live NUL-terminated C string and the returned
+    // descriptor is transferred immediately into File.
+    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(
+        raw_fd >= 0,
+        "create anonymous test pool: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: memfd_create returned a new owned descriptor on success.
+    let pool = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+    pool.set_len(64 * 32 * 4).expect("size anonymous test pool");
+    send_request_with_fd(&mut client, 6, 0, &words(&[14, 64 * 32 * 4]), pool.as_fd()); // create_pool
+    send_request(
+        &mut client,
+        14,
+        0,
+        &words(&[15, 0, 64, 32, 64 * 4, wl_shm::Format::Xrgb8888 as u32]),
+    ); // wl_shm_pool.create_buffer
+    send_request(&mut client, 10, 1, &words(&[15, 0, 0])); // wl_surface.attach
+    send_request(&mut client, 10, 6, &[]); // commit the buffer: the surface maps
+    send_display_request(&mut client, 0, 16);
+    let mapped = events_until_callback(&mut client, 16);
+    assert!(
+        mapped
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "the compositor accepted the SHM buffer without a protocol error: {mapped:?}"
+    );
+
+    // Click-to-focus, injected through the registered source rather than set by
+    // hand: the pointer position, the hit test and the focus change are all
+    // production code, so a click that focused nothing would fail here rather
+    // than silently make the later read unfalsifiable.
+    // The first toplevel is placed at the head of the cascade, so the point to
+    // aim at is derived from the same constant the placement uses rather than
+    // guessed — a hard-coded origin would silently start missing the surface if
+    // the cascade moved, and the failure would look like a routing defect.
+    let click = f64::from(CASCADE_ORIGIN) + 8.0;
+    injector.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: click / 320.0,
+            normalised_y: click / 240.0,
+        },
+    });
+    injector.route(InputEvent::PointerButton {
+        event: FakeButtonEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            button: 0x110, // BTN_LEFT
+            state: ButtonState::Pressed,
+        },
+    });
+    injector.route(InputEvent::PointerButton {
+        event: FakeButtonEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            button: 0x110,
+            state: ButtonState::Released,
+        },
+    });
+
+    // The control, read while frames are still flowing, and deliberately after
+    // one explicit frame. Everything up to this point — including the focus
+    // above — is therefore satisfiable by a router that queued its events for
+    // `handle_frame`, which is the point: the setup must not be what fails
+    // under that defect, or the test would go red for the wrong reason and
+    // stop being evidence about latency.
+    injector.route(InputEvent::Keyboard {
+        event: FakeKeyEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            keycode: Keycode::new(STALL_ORACLE_CONTROL_KEY),
+            state: KeyState::Pressed,
+        },
+    });
+    runtime
+        .finish_frame(Vec::new())
+        .expect("send one compositor frame before the render path is blocked");
+    let (control_state, before_control) = read_keyboard_key(
+        &mut client,
+        8,
+        STALL_ORACLE_CONTROL_KEY - 8,
+        Instant::now() + PROTOCOL_ACK_DEADLINE,
+        "the control key while frames are still flowing",
+    );
+    assert_eq!(control_state, 1, "the control key is pressed");
+    assert!(
+        before_control
+            .iter()
+            .any(|(object, opcode, _)| *object == 8 && *opcode == 1),
+        "the injected click must focus the mapped toplevel, or the key below \
+         would have nowhere to be delivered and the oracle would pass \
+         vacuously: {before_control:?}"
+    );
+
+    crate::backend::render::tests::while_real_app_acquire_is_blocked(
+        runtime,
+        Box::new(move || {
+            // Nothing here issues a frame or a sync. The render path is parked
+            // inside `acquire_output_frames`, which is what a stalled
+            // `get_current_texture()` looks like from the protocol thread's
+            // side: no `ProtocolCommand::Frame` will arrive until it returns.
+            // A router that queued this event for `handle_frame` would
+            // acknowledge the injection and then deliver nothing.
+            injector.route(InputEvent::Keyboard {
+                event: FakeKeyEvent {
+                    device: FakeDevice::KeyboardAndPointer,
+                    keycode: Keycode::new(STALL_ORACLE_STALLED_KEY),
+                    state: KeyState::Pressed,
+                },
+            });
+            assert_eq!(
+                read_keyboard_key(
+                    &mut client,
+                    8,
+                    STALL_ORACLE_STALLED_KEY - 8,
+                    Instant::now() + Duration::from_secs(2),
+                    "a key injected while the render path is blocked",
+                )
+                .0,
+                1,
+                "input reaches the client from the calloop callback, without \
+                 waiting for a frame that is not coming"
+            );
+        }),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rung E-2b: touch delivery.
+//
+// Two oracles, both on a real client socket, because everything touch does is
+// only visible there: the seat capability, every `wl_touch` message, the surface
+// each contact is attributed to, and the absence of a frame after a cancel. A
+// state-level test could assert that `TouchHandle::down` was called and still
+// ship a compositor no touch client can use.
+//
+// The first covers delivery on one device; the second covers the multi-device
+// lifecycle — a removal that must cancel without withdrawing the capability —
+// which the first cannot reach at all.
+//
+// The mutation the first exists to reject is the arm this rung deleted:
+// restoring the combined `InputEvent::TouchDown | TouchMotion | TouchUp |
+// TouchCancel | TouchFrame => Ignored("touch is not supported yet")`
+// conversion. Under it the capability transition below still happens — device
+// arrival is a separate arm — and not one of the twelve messages does.
+// ---------------------------------------------------------------------------
+
+/// `wl_seat.capabilities`: pointer | keyboard.
+const SEAT_CAPS_WITHOUT_TOUCH: u32 = 3;
+/// `wl_seat.capabilities`: pointer | keyboard | touch.
+const SEAT_CAPS_WITH_TOUCH: u32 = 7;
+
+/// One `wl_touch` message, reduced to what this oracle asserts about it.
+///
+/// Down and motion keep their surface-local coordinates, because those are what
+/// an off-by-a-window-origin bug would corrupt while every other field stayed
+/// right. Every message that carries a timestamp keeps it, and the caller gives
+/// each injected event a *distinct* one, so a conversion reading the wrong
+/// event's time — or hard-coding one — shows up as a mismatch rather than as
+/// three identical numbers that agree by construction.
+///
+/// Serials are dropped: including them would make the expected list depend on
+/// how many serials the setup happened to consume. `frame` and `cancel` carry
+/// neither, matching the protocol.
+#[derive(Debug, PartialEq)]
+enum TouchWire {
+    Down {
+        surface: u32,
+        id: i32,
+        x: f64,
+        y: f64,
+        time: u32,
+    },
+    Up {
+        id: i32,
+        time: u32,
+    },
+    Motion {
+        id: i32,
+        x: f64,
+        y: f64,
+        time: u32,
+    },
+    Frame,
+    Cancel,
+}
+
+/// Reduce a client's traffic to just its `wl_touch` messages, in order.
+///
+/// The caller reads the traffic with one `wl_display.sync` round-trip rather
+/// than by counting messages, so a message the compositor should *not* have
+/// sent — a frame after a cancel — is caught by the comparison rather than left
+/// unread in the socket.
+fn touch_messages(traffic: &[(u32, u16, Vec<u8>)], touch: u32) -> Vec<TouchWire> {
+    traffic
+        .iter()
+        .filter(|(object, _, _)| *object == touch)
+        .map(|(_, opcode, body)| match opcode {
+            0 => TouchWire::Down {
+                surface: word(body, 2),
+                id: word(body, 3) as i32,
+                x: fixed(body, 4),
+                y: fixed(body, 5),
+                time: word(body, 1),
+            },
+            1 => TouchWire::Up {
+                id: word(body, 2) as i32,
+                time: word(body, 1),
+            },
+            2 => TouchWire::Motion {
+                id: word(body, 1) as i32,
+                x: fixed(body, 2),
+                y: fixed(body, 3),
+                time: word(body, 0),
+            },
+            3 => TouchWire::Frame,
+            4 => TouchWire::Cancel,
+            other => panic!("unexpected wl_touch opcode {other}: {body:?}"),
+        })
+        .collect()
+}
+
+/// The `wl_seat.capabilities` values in a client's traffic, in order.
+///
+/// Every announcement, not the last one: the hotplug oracle's whole point is
+/// that a device leaving must produce *no* announcement at all, which a
+/// last-value read cannot distinguish from an announcement of the same value.
+fn seat_capabilities(traffic: &[(u32, u16, Vec<u8>)], seat: u32) -> Vec<u32> {
+    traffic
+        .iter()
+        .filter(|(object, opcode, _)| *object == seat && *opcode == 0)
+        .map(|(_, _, body)| word(body, 0))
+        .collect()
+}
+
+/// Start a compositor with an input source and connect one client to it.
+///
+/// Shared by both touch oracles. `label` only distinguishes the socket names, so
+/// the two can run concurrently under a parallel test runner.
+fn touch_oracle_runtime(label: &str) -> (FakeInputInjector, WaylandRuntime, UnixStream) {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the touch delivery oracles");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-touch-{label}-{}-{unique}", std::process::id());
+
+    let (injector, input_source) = fake_input_source();
+    // The runtime is returned rather than dropped: the protocol thread lives as
+    // long as that handle, and nothing in either oracle needs to drive a frame —
+    // touch delivery is not frame-bounded, which is what rung E-2a established.
+    let runtime = WaylandRuntime::with_input_source(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        WaylandGpuWiring {
+            dmabuf_capabilities: Some(DmabufCapabilities {
+                main_device: 0,
+                formats: Vec::new(),
+                adapter_name: "touch-test".into(),
+                drm_adapter: synthetic_drm_adapter("touch-test"),
+            }),
+            dmabuf_validator: None,
+            retirement_adapter: test_retirement_adapter(),
+        },
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+        Some(input_source),
+        None,
+    )
+    .expect("protocol thread starts with an input source registered on it");
+    let client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+    (injector, runtime, client)
+}
+
+/// Bind a seat and a keyboard, map a real toplevel, and pin the pre-touch
+/// capability.
+///
+/// Object ids 2 through 16 are allocated here, so both oracles continue from 17
+/// with the same layout. Centralising them is not tidiness: wayland-rs's server
+/// backend requires client object ids to be allocated in dense sequence, and
+/// skipping one earns a `wl_display.error` "Invalid new_id: N" and an immediate
+/// disconnect — which reads, from the test's side, as the compositor silently
+/// dropping everything.
+///
+/// The capability assertion belongs here rather than in either caller because it
+/// is about the *transition*: a compositor that called `add_touch` at
+/// construction would advertise touch at this point, and every touch assertion
+/// in both oracles would still pass.
+fn map_toplevel_without_touch_capability(client: &mut UnixStream) {
+    send_display_request(client, 1, 2); // wl_display.get_registry
+    send_display_request(client, 0, 3); // wl_display.sync
+    let globals = registry_globals(client, 3);
+    let (compositor, compositor_version) = globals["wl_compositor"];
+    let (xdg_wm_base, xdg_version) = globals["xdg_wm_base"];
+    let (shm, shm_version) = globals["wl_shm"];
+    let (seat, seat_version) = globals["wl_seat"];
+    bind_global(
+        client,
+        compositor,
+        "wl_compositor",
+        compositor_version.min(5),
+        4,
+    );
+    bind_global(client, xdg_wm_base, "xdg_wm_base", xdg_version.min(6), 5);
+    bind_global(client, shm, "wl_shm", shm_version.min(1), 6);
+    bind_global(client, seat, "wl_seat", seat_version.min(7), 7);
+    send_request(client, 7, 1, &words(&[8])); // wl_seat.get_keyboard
+
+    // The capability before any touch device exists. A compositor that called
+    // `add_touch` at construction would already read 7 here, and every touch
+    // assertion below would still pass — which is exactly why the transition,
+    // not the final value, is what this test pins.
+    send_display_request(client, 0, 9);
+    let caps_before = seat_capabilities(&events_until_callback(client, 9), 7);
+    assert_eq!(
+        caps_before.last(),
+        Some(&SEAT_CAPS_WITHOUT_TOUCH),
+        "a seat with no touch device must not advertise touch: {caps_before:?}"
+    );
+
+    // A real toplevel, through the ordinary xdg handshake, mapped with a real
+    // SHM buffer — an unmapped surface has no size and is not hit-testable, so
+    // every contact below would land on nothing and the oracle would pass while
+    // proving less than it claims.
+    send_request(client, 4, 0, &words(&[10])); // wl_compositor.create_surface
+    send_request(client, 5, 2, &words(&[11, 10])); // xdg_wm_base.get_xdg_surface
+    send_request(client, 11, 1, &words(&[12])); // xdg_surface.get_toplevel
+    send_request(client, 10, 6, &[]); // initial empty commit
+    send_display_request(client, 0, 13);
+    let serial = events_until_callback(client, 13)
+        .iter()
+        .find_map(|(object, opcode, body)| (*object == 11 && *opcode == 0).then(|| word(body, 0)))
+        .expect("xdg_surface.configure follows the initial empty commit");
+    send_request(client, 11, 4, &words(&[serial])); // xdg_surface.ack_configure
+
+    let name = std::ffi::CString::new("cosmix-touch-test").expect("static memfd name");
+    // SAFETY: name is a live NUL-terminated C string and the returned
+    // descriptor is transferred immediately into File.
+    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(
+        raw_fd >= 0,
+        "create anonymous test pool: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: memfd_create returned a new owned descriptor on success.
+    let pool = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+    pool.set_len(64 * 32 * 4).expect("size anonymous test pool");
+    send_request_with_fd(client, 6, 0, &words(&[14, 64 * 32 * 4]), pool.as_fd()); // create_pool
+    send_request(
+        client,
+        14,
+        0,
+        &words(&[15, 0, 64, 32, 64 * 4, wl_shm::Format::Xrgb8888 as u32]),
+    ); // wl_shm_pool.create_buffer
+    send_request(client, 10, 1, &words(&[15, 0, 0])); // wl_surface.attach
+    send_request(client, 10, 6, &[]); // commit the buffer: the surface maps
+    send_display_request(client, 0, 16);
+    let mapped = events_until_callback(client, 16);
+    assert!(
+        mapped
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "the compositor accepted the SHM buffer without a protocol error: {mapped:?}"
+    );
+}
+
+#[test]
+fn touch_reaches_a_real_client_and_the_capability_tracks_the_device() {
+    let (injector, _runtime, mut client) = touch_oracle_runtime("delivery");
+    map_toplevel_without_touch_capability(&mut client);
+
+    // Attaching the touchscreen. Injected as a real `DeviceAdded` through the
+    // registered callback, not by calling `add_touch` on the seat: the arm that
+    // decides an arriving device is touch-capable is production code and is on
+    // the path here.
+    injector.route(InputEvent::DeviceAdded {
+        device: FakeDevice::Touchscreen,
+    });
+    send_display_request(&mut client, 0, 17);
+    let caps_after = seat_capabilities(&events_until_callback(&mut client, 17), 7);
+    assert_eq!(
+        caps_after.last(),
+        Some(&SEAT_CAPS_WITH_TOUCH),
+        "attaching a touch device adds the touch capability: {caps_after:?}"
+    );
+    send_request(&mut client, 7, 2, &words(&[18])); // wl_seat.get_touch
+    // Round-trip before the first contact, and not for tidiness: `route` blocks
+    // until the *input source* has dispatched, which says nothing about whether
+    // the compositor has yet read `get_touch` off this socket. The two arrive on
+    // different fds of the same loop, so without this the first down races the
+    // existence of object 18 and is dropped whenever the input dispatch wins —
+    // observed dropping it in two runs out of five.
+    send_display_request(&mut client, 0, 19);
+    events_until_callback(&mut client, 19);
+
+    // The first toplevel sits at the head of the cascade, so the contact points
+    // are derived from the same constant the placement uses. A hard-coded
+    // origin would start missing the surface if the cascade moved, and the
+    // failure would read as a routing defect.
+    let origin = f64::from(CASCADE_ORIGIN);
+    let contact = |x: f64, y: f64| (x / 320.0, y / 240.0);
+
+    let (first_x, first_y) = (origin + 8.0, origin + 9.0);
+    let (moved_x, moved_y) = (origin + 15.0, origin + 17.0);
+    // Deliberately outside every surface. If the compositor changed focus on
+    // each contact rather than only on the first, this would clear keyboard
+    // focus and the client would see a `wl_keyboard.leave` — asserted against
+    // below. It also exercises `TouchDownGrab`, which forces every subsequent
+    // contact onto the first contact's surface, so this down is still
+    // attributed to the toplevel with coordinates outside it.
+    let (second_x, second_y) = (240.0, 200.0);
+
+    let first = TouchSlot::from(None);
+    let second = TouchSlot::from(Some(7));
+    let third = TouchSlot::from(Some(9));
+
+    // Every event carries a different timestamp, and every one of them is
+    // asserted on the wire below. libinput reports microseconds and `wl_touch`
+    // carries milliseconds, so a conversion that forgot the division, or reached
+    // for a neighbouring event's clock, would still produce a plausible number —
+    // and against one shared constant it would look right.
+    const DOWN_FIRST_MS: u32 = 100;
+    const DOWN_SECOND_MS: u32 = 110;
+    const MOTION_MS: u32 = 120;
+    const UP_FIRST_MS: u32 = 130;
+    const UP_SECOND_MS: u32 = 140;
+    const DOWN_THIRD_MS: u32 = 150;
+    let micros = |ms: u32| u64::from(ms) * 1_000;
+
+    let down = |slot: TouchSlot, x: f64, y: f64, ms: u32| {
+        let (normalised_x, normalised_y) = contact(x, y);
+        InputEvent::TouchDown {
+            event: FakeTouchPositionEvent {
+                slot,
+                normalised_x,
+                normalised_y,
+                time_us: micros(ms),
+            },
+        }
+    };
+    let frame = || InputEvent::TouchFrame {
+        event: FakeTouchFrameEvent,
+    };
+    let up = |slot: TouchSlot, ms: u32| InputEvent::TouchUp {
+        event: FakeTouchSlotEvent {
+            slot,
+            time_us: micros(ms),
+        },
+    };
+
+    injector.route(down(first, first_x, first_y, DOWN_FIRST_MS));
+    injector.route(frame());
+    injector.route(down(second, second_x, second_y, DOWN_SECOND_MS));
+    injector.route(frame());
+    let (normalised_x, normalised_y) = contact(moved_x, moved_y);
+    injector.route(InputEvent::TouchMotion {
+        event: FakeTouchPositionEvent {
+            slot: first,
+            normalised_x,
+            normalised_y,
+            time_us: micros(MOTION_MS),
+        },
+    });
+    injector.route(frame());
+    injector.route(up(first, UP_FIRST_MS));
+    injector.route(up(second, UP_SECOND_MS));
+    injector.route(frame());
+    injector.route(down(third, first_x, first_y, DOWN_THIRD_MS));
+    injector.route(frame());
+    injector.route(InputEvent::TouchCancel {
+        event: FakeTouchSlotEvent {
+            slot: third,
+            time_us: micros(160),
+        },
+    });
+
+    send_display_request(&mut client, 0, 20);
+    let traffic = events_until_callback(&mut client, 20);
+
+    assert_eq!(
+        touch_messages(&traffic, 18),
+        vec![
+            TouchWire::Down {
+                surface: 10,
+                id: -1,
+                x: 8.0,
+                y: 9.0,
+                time: DOWN_FIRST_MS,
+            },
+            TouchWire::Frame,
+            TouchWire::Down {
+                surface: 10,
+                id: 7,
+                x: second_x - origin,
+                y: second_y - origin,
+                time: DOWN_SECOND_MS,
+            },
+            TouchWire::Frame,
+            TouchWire::Motion {
+                id: -1,
+                x: 15.0,
+                y: 17.0,
+                time: MOTION_MS,
+            },
+            TouchWire::Frame,
+            TouchWire::Up {
+                id: -1,
+                time: UP_FIRST_MS,
+            },
+            TouchWire::Up {
+                id: 7,
+                time: UP_SECOND_MS,
+            },
+            TouchWire::Frame,
+            TouchWire::Down {
+                surface: 10,
+                id: 9,
+                x: 8.0,
+                y: 9.0,
+                time: DOWN_THIRD_MS,
+            },
+            TouchWire::Frame,
+            TouchWire::Cancel,
+        ],
+        "the twelve messages the device's stream maps to, in order, with no \
+         frame after the cancel"
+    );
+
+    // Focus is taken on the first contact and only on the first contact.
+    //
+    // One `wl_keyboard.enter` and no `wl_keyboard.leave`: the first down
+    // focused the toplevel — which on a touch-only machine is the only way it
+    // ever could be focused — and the second contact, which landed on no
+    // surface at all, did not clear that focus. A compositor that ran the focus
+    // policy on every down would emit a `leave` there, and one that ran it on
+    // none would emit no `enter` at all.
+    let keyboard_focus: Vec<u16> = traffic
+        .iter()
+        .filter(|(object, opcode, _)| *object == 8 && matches!(opcode, 1 | 2))
+        .map(|(_, opcode, _)| *opcode)
+        .collect();
+    assert_eq!(
+        keyboard_focus,
+        vec![1],
+        "exactly one wl_keyboard.enter and no leave across the whole touch \
+         stream: {keyboard_focus:?}"
+    );
+}
+
+/// Unplugging one of two touchscreens mid-gesture.
+///
+/// A separate oracle because it is the only shape that reaches three states the
+/// single-device one cannot:
+///
+/// * The capability must **survive** a removal while another touch device is
+///   still attached, and be withdrawn only when the last one leaves.
+/// * A cancel must be delivered on **every** touch-device removal, not only the
+///   last. Cancelling only at zero strands the departed device's contacts —
+///   nothing can ever supply their `wl_touch.up` — and, worse, strands its
+///   `TouchDownGrab`, which `touch_down` reads through `is_grabbed()` to decide
+///   whether a contact is the first one.
+/// * Two contacts are live when the cancel fires, so this is also where the
+///   patched Smithay `cancel` has to *drain several slots* and where
+///   `for_each_focused_touch`'s per-`WlTouch` `last_seq` filter has to collapse
+///   them into exactly one client-visible `wl_touch.cancel`. The delivery oracle
+///   cancels with one live slot and proves neither.
+#[test]
+fn removing_one_of_two_touch_devices_cancels_without_withdrawing_the_capability() {
+    let (injector, _runtime, mut client) = touch_oracle_runtime("hotplug");
+    map_toplevel_without_touch_capability(&mut client);
+
+    injector.route(InputEvent::DeviceAdded {
+        device: FakeDevice::Touchscreen,
+    });
+    injector.route(InputEvent::DeviceAdded {
+        device: FakeDevice::SecondTouchscreen,
+    });
+    send_display_request(&mut client, 0, 17);
+    let caps_after_both = seat_capabilities(&events_until_callback(&mut client, 17), 7);
+    assert_eq!(
+        caps_after_both,
+        vec![SEAT_CAPS_WITH_TOUCH],
+        "two touch devices arriving announce the capability exactly once, on the \
+         0 -> 1 transition: {caps_after_both:?}"
+    );
+
+    send_request(&mut client, 7, 2, &words(&[18])); // wl_seat.get_touch
+    // Settle before injecting, for the reason the delivery oracle documents:
+    // `route` waits on the input source, not on this socket.
+    send_display_request(&mut client, 0, 19);
+    events_until_callback(&mut client, 19);
+
+    let origin = f64::from(CASCADE_ORIGIN);
+    let contact = |x: f64, y: f64| (x / 320.0, y / 240.0);
+    let down = |slot: TouchSlot, x: f64, y: f64, ms: u32| {
+        let (normalised_x, normalised_y) = contact(x, y);
+        InputEvent::TouchDown {
+            event: FakeTouchPositionEvent {
+                slot,
+                normalised_x,
+                normalised_y,
+                time_us: u64::from(ms) * 1_000,
+            },
+        }
+    };
+    let frame = || InputEvent::TouchFrame {
+        event: FakeTouchFrameEvent,
+    };
+
+    // Two contacts, both live, both on the toplevel.
+    const FIRST_MS: u32 = 200;
+    const SECOND_MS: u32 = 210;
+    injector.route(down(
+        TouchSlot::from(Some(0)),
+        origin + 4.0,
+        origin + 5.0,
+        FIRST_MS,
+    ));
+    injector.route(frame());
+    injector.route(down(
+        TouchSlot::from(Some(1)),
+        origin + 6.0,
+        origin + 7.0,
+        SECOND_MS,
+    ));
+    injector.route(frame());
+
+    // The first touchscreen is unplugged with both contacts still down.
+    injector.route(InputEvent::DeviceRemoved {
+        device: FakeDevice::Touchscreen,
+    });
+
+    // Address both cancelled slots again, and require silence.
+    //
+    // One cancel on the wire proves the client was told, but *not* that
+    // `TouchInternal::cancel` drained every slot: an implementation that
+    // cancelled one focused slot and left the other in `self.focus` would emit
+    // the same single message. `TouchInternal::motion` looks the slot up in that
+    // map and delivers only if it is still there, so a motion for each of the
+    // two cancelled slots is the cheapest way to make retained slot state
+    // observable — a surviving record answers with a `wl_touch.motion`, and the
+    // trailing frame with a `wl_touch.frame`.
+    let motion = |slot: TouchSlot, x: f64, y: f64, ms: u32| InputEvent::TouchMotion {
+        event: FakeTouchPositionEvent {
+            slot,
+            normalised_x: x / 320.0,
+            normalised_y: y / 240.0,
+            time_us: u64::from(ms) * 1_000,
+        },
+    };
+    injector.route(motion(
+        TouchSlot::from(Some(0)),
+        origin + 8.0,
+        origin + 9.0,
+        215,
+    ));
+    injector.route(motion(
+        TouchSlot::from(Some(1)),
+        origin + 10.0,
+        origin + 11.0,
+        216,
+    ));
+    injector.route(frame());
+
+    send_display_request(&mut client, 0, 20);
+    let through_removal = events_until_callback(&mut client, 20);
+    assert_eq!(
+        touch_messages(&through_removal, 18),
+        vec![
+            TouchWire::Down {
+                surface: 10,
+                id: 0,
+                x: 4.0,
+                y: 5.0,
+                time: FIRST_MS,
+            },
+            TouchWire::Frame,
+            TouchWire::Down {
+                surface: 10,
+                id: 1,
+                x: 6.0,
+                y: 7.0,
+                time: SECOND_MS,
+            },
+            TouchWire::Frame,
+            TouchWire::Cancel,
+        ],
+        "both contacts, then exactly one cancel for the two of them, then \
+         nothing at all for either cancelled slot"
+    );
+    assert!(
+        seat_capabilities(&through_removal, 7).is_empty(),
+        "one touchscreen leaving while another is attached must not change the \
+         advertised capability: {:?}",
+        seat_capabilities(&through_removal, 7)
+    );
+
+    // A fresh contact after the cancel, landing on nothing at all.
+    //
+    // Which *device* it came from is deliberately not claimed: `HostInput`
+    // carries no device identity, and `FakeTouchPositionEvent::device` always
+    // answers `Touchscreen`, so nothing here distinguishes the two screens.
+    // What is claimed is seat-wide: the cancel cleared the seat's grab, so the
+    // next contact anywhere on the seat is a first contact again. Per-device
+    // attribution is Rung E-5's.
+    //
+    // This is the wire-visible proof that the cancel cleared the grab. With the
+    // grab still installed, `TouchDownGrab::down` ignores the focus it is passed
+    // and re-uses the *first* contact's surface, so this would arrive as a
+    // `wl_touch.down` on surface 10 with coordinates outside it. With the grab
+    // gone it resolves to no surface and produces no message at all — and,
+    // because `touch_down` then treats it as a first contact again, it runs the
+    // focus policy and the client sees `wl_keyboard.leave`.
+    injector.route(down(TouchSlot::from(Some(4)), 240.0, 200.0, 220));
+    injector.route(frame());
+    send_display_request(&mut client, 0, 21);
+    let after_cancel = events_until_callback(&mut client, 21);
+    assert_eq!(
+        touch_messages(&after_cancel, 18),
+        vec![],
+        "a contact on nothing, on a seat whose grab was cleared by the cancel, \
+         reaches no surface"
+    );
+    let keyboard_focus: Vec<u16> = after_cancel
+        .iter()
+        .filter(|(object, opcode, _)| *object == 8 && matches!(opcode, 1 | 2))
+        .map(|(_, opcode, _)| *opcode)
+        .collect();
+    assert_eq!(
+        keyboard_focus,
+        vec![2],
+        "the post-cancel contact is a first contact again, so the focus policy \
+         runs and clears focus: {keyboard_focus:?}"
+    );
+
+    // The last touchscreen leaves.
+    injector.route(InputEvent::DeviceRemoved {
+        device: FakeDevice::SecondTouchscreen,
+    });
+    send_display_request(&mut client, 0, 22);
+    let after_last = events_until_callback(&mut client, 22);
+    assert_eq!(
+        seat_capabilities(&after_last, 7),
+        vec![SEAT_CAPS_WITHOUT_TOUCH],
+        "the last touch device leaving withdraws the capability"
+    );
+}
+
+// The SHM path, end to end on a real client socket.
+//
+// Everything below this point was previously proved only through `#[cfg(test)]`
+// helpers — `copy_shm_rows` reimplemented the production row walk and had no
+// production caller at all, so a defect in `update_shm_buffer`'s own offset and
+// stride arithmetic could not be seen by any test. The oracle here drives the
+// real `wl_shm` path: a real pool over a real fd, a real `wl_surface.commit`,
+// and the exact bytes that reach the renderer channel.
+
+/// The pool a real client hands the compositor for the pixel-exact oracle.
+///
+/// Deliberately awkward: a non-zero `offset`, and a `stride` eight bytes wider
+/// than the packed row. A converter that ignores the offset reads the prefix,
+/// and one that ignores the stride drags row padding into the next row.
+///
+/// The pool is `offset + stride * height`, not the tighter
+/// `offset + stride * (height - 1) + row` the production import checks against.
+/// That is not slack chosen for comfort — `wl_shm_pool.create_buffer` in
+/// `vendor/smithay/src/wayland/shm/handlers.rs:144` rejects
+/// `offset > size - stride * height` outright, so a pool trimmed to the last
+/// image byte never reaches the import at all. The trailing eight bytes are
+/// filled with the same sentinel as the other padding, so they are still
+/// visible if the walk over-reads.
+const SHM_ORACLE_WIDTH: usize = 3;
+const SHM_ORACLE_HEIGHT: usize = 2;
+const SHM_ORACLE_OFFSET: usize = 12;
+const SHM_ORACLE_STRIDE: usize = SHM_ORACLE_WIDTH * 4 + 8;
+const SHM_ORACLE_POOL_BYTES: usize = SHM_ORACLE_OFFSET + SHM_ORACLE_HEIGHT * SHM_ORACLE_STRIDE;
+
+/// The pool bytes a real client writes, and the exact RGBA the renderer must
+/// receive for them.
+///
+/// The expectation is a literal table rather than anything computed from the
+/// expression the production converter uses. A value derived from the code
+/// under test agrees with it by construction — including when both are wrong.
+fn shm_oracle_pool() -> (Vec<u8>, Vec<u8>) {
+    // `0xAA` everywhere the image is not: the prefix before `offset`, and the
+    // eight padding bytes at the end of each row. Any of it reaching the
+    // converted output is an offset or stride defect, and `0xAA` is chosen
+    // because it appears in none of the pixels below.
+    let mut pool = vec![0xAA_u8; SHM_ORACLE_POOL_BYTES];
+    // Memory order for both accepted `wl_shm` formats is B, G, R, A.
+    let rows: [[[u8; 4]; SHM_ORACLE_WIDTH]; SHM_ORACLE_HEIGHT] = [
+        [[10, 20, 30, 255], [40, 50, 60, 255], [64, 128, 32, 128]],
+        [[1, 2, 3, 0], [200, 100, 50, 255], [255, 255, 255, 255]],
+    ];
+    for (index, row) in rows.iter().enumerate() {
+        let start = SHM_ORACLE_OFFSET + index * SHM_ORACLE_STRIDE;
+        for (column, pixel) in row.iter().enumerate() {
+            pool[start + column * 4..start + column * 4 + 4].copy_from_slice(pixel);
+        }
+    }
+
+    // R, G, B, A. Client ARGB bytes remain premultiplied for the material
+    // shader; the alpha-128 pixel is deliberately asymmetric so a CPU
+    // unpremultiply or an incomplete channel swizzle cannot agree by accident.
+    let expected = vec![
+        30, 20, 10, 255, 60, 50, 40, 255, 32, 128, 64, 128, //
+        3, 2, 1, 0, 50, 100, 200, 255, 255, 255, 255, 255,
+    ];
+    (pool, expected)
+}
+
+#[test]
+fn shm_row_conversion_preserves_argb_premultiplication_and_forces_xrgb_alpha() {
+    let packed = [64, 128, 32, 128, 7, 11, 19, 23];
+    let mut argb = [0; 8];
+    convert_shm_row(wl_shm::Format::Argb8888, &packed, &mut argb);
+    assert_eq!(
+        argb,
+        [32, 128, 64, 128, 19, 11, 7, 23],
+        "ARGB conversion must only swizzle the premultiplied client bytes"
+    );
+
+    let mut xrgb = [0; 8];
+    convert_shm_row(wl_shm::Format::Xrgb8888, &packed, &mut xrgb);
+    assert_eq!(xrgb, [32, 128, 64, 255, 19, 11, 7, 255]);
+}
+
+/// The first `SurfaceUpserted` carrying an SHM frame, waited for.
+///
+/// `drain_events` is a `try_recv` loop over a channel the protocol thread
+/// batches into, so a single call straight after the client's round-trip can
+/// legitimately come back empty even though the commit was handled. Polling to
+/// a deadline is the difference between an oracle and a flake — the touch rung
+/// shipped a ~40 % one for exactly this class of assumption.
+fn wait_for_shm_upsert(runtime: &WaylandRuntime) -> ShmFrame {
+    let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    loop {
+        for event in runtime.drain_events().expect("protocol thread is alive") {
+            if let ProtocolEvent::SurfaceUpserted {
+                frame: SurfaceFrame::Shm(shm),
+                ..
+            } = event
+            {
+                return shm;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no SHM surface upsert reached the renderer channel before the deadline"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn wait_for_shm_layout(runtime: &WaylandRuntime, physical_size: (u32, u32)) -> SurfaceLayout {
+    let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    loop {
+        for event in runtime.drain_events().expect("protocol thread is alive") {
+            if let ProtocolEvent::SurfaceUpserted {
+                scene,
+                frame: SurfaceFrame::Shm(ShmFrame { width, height, .. }),
+                ..
+            } = event
+                && (width, height) == physical_size
+            {
+                return scene.layout;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no {physical_size:?} SHM presentation reached the renderer channel before the deadline"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Take a freshly connected client from `wl_display` to an acked, configured
+/// toplevel with an anonymous `wl_shm` pool of `pool_bytes` bytes attached to
+/// it, and hand the pool file back.
+///
+/// Object ids are fixed so both clients in a multi-client test number the same
+/// way: 2 registry, 3 sync, 4 `wl_compositor`, 5 `xdg_wm_base`, 6 `wl_shm`,
+/// 7 `wl_surface`, 8 `xdg_surface`, 9 `xdg_toplevel`, 10 sync, 11 pool. The
+/// caller's own objects start at 12. wayland-rs requires a client's ids to be
+/// dense and increasing, so the caller must keep allocating from there in
+/// creation order.
+fn bring_up_shm_toplevel(client: &mut UnixStream, pool_bytes: u32, memfd_name: &str) -> File {
+    send_display_request(client, 1, 2); // wl_display.get_registry
+    send_display_request(client, 0, 3); // wl_display.sync
+    let globals = registry_globals(client, 3);
+    let (compositor, compositor_version) = globals["wl_compositor"];
+    let (xdg_wm_base, xdg_version) = globals["xdg_wm_base"];
+    let (shm, shm_version) = globals["wl_shm"];
+    bind_global(
+        client,
+        compositor,
+        "wl_compositor",
+        compositor_version.min(5),
+        4,
+    );
+    bind_global(client, xdg_wm_base, "xdg_wm_base", xdg_version.min(6), 5);
+    bind_global(client, shm, "wl_shm", shm_version.min(1), 6);
+
+    send_request(client, 4, 0, &words(&[7])); // wl_compositor.create_surface
+    send_request(client, 5, 2, &words(&[8, 7])); // xdg_wm_base.get_xdg_surface
+    send_request(client, 8, 1, &words(&[9])); // xdg_surface.get_toplevel
+    send_request(client, 7, 6, &[]); // initial empty commit
+    send_display_request(client, 0, 10);
+    let serial = events_until_callback(client, 10)
+        .iter()
+        .find_map(|(object, opcode, body)| (*object == 8 && *opcode == 0).then(|| word(body, 0)))
+        .expect("xdg_surface.configure follows the initial empty commit");
+    send_request(client, 8, 4, &words(&[serial])); // xdg_surface.ack_configure
+
+    let name = CString::new(memfd_name).expect("memfd name has no interior NUL");
+    // SAFETY: name is a live NUL-terminated C string and the returned
+    // descriptor is transferred immediately into File.
+    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(
+        raw_fd >= 0,
+        "create anonymous test pool: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: memfd_create returned a new owned descriptor on success.
+    let pool = unsafe { File::from_raw_fd(raw_fd) };
+    pool.set_len(u64::from(pool_bytes))
+        .expect("size anonymous test pool");
+    send_request_with_fd(client, 6, 0, &words(&[11, pool_bytes]), pool.as_fd()); // wl_shm.create_pool
+    pool
+}
+
+/// Minimal real wire client used by the shared scene's live-shaped App tests.
+pub(crate) struct RealShmSceneClient {
+    client: UnixStream,
+    pool: File,
+    next_sync: u32,
+}
+
+pub(crate) struct RealCursorSceneClient {
+    client: UnixStream,
+    pool: File,
+    next_sync: u32,
+}
+
+pub(crate) fn real_shm_scene_runtime(socket_name: &str, output_size: (u32, u32)) -> WaylandRuntime {
+    real_shm_scene_runtime_with_decoration(socket_name, output_size, DecorationStartup::default())
+}
+
+pub(crate) fn real_shm_scene_runtime_with_decoration(
+    socket_name: &str,
+    output_size: (u32, u32),
+    decoration: DecorationStartup,
+) -> WaylandRuntime {
+    WaylandRuntime::new(
+        socket_name,
+        BackendKind::Winit,
+        output_size,
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "live-scene-test".into(),
+            drm_adapter: synthetic_drm_adapter("live-scene-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration,
+        },
+    )
+    .expect("real protocol thread starts for the live scene App")
+}
+
+const SSD_SCENE_PARENT_SURFACE: u32 = 10;
+const SSD_SCENE_CHILD_SURFACE: u32 = 11;
+const SSD_SCENE_SUBSURFACE: u32 = 12;
+const SSD_SCENE_XDG_SURFACE: u32 = 13;
+const SSD_SCENE_TOPLEVEL: u32 = 14;
+const SSD_SCENE_DECORATION: u32 = 15;
+const SSD_SCENE_POOL: u32 = 16;
+const SSD_SCENE_PARENT_BUFFER: u32 = 17;
+const SSD_SCENE_CHILD_BUFFER: u32 = 18;
+const SSD_SCENE_POINTER: u32 = 19;
+const SSD_SCENE_WIDTH: u32 = 200;
+const SSD_SCENE_HEIGHT: u32 = 140;
+const SSD_SCENE_CHILD_WIDTH: u32 = 120;
+const SSD_SCENE_CHILD_HEIGHT: u32 = 70;
+const SSD_SCENE_CHILD_X: i32 = 10;
+const SSD_SCENE_CHILD_Y: i32 = 35;
+const SSD_SCENE_PARENT_BYTES: u32 = SSD_SCENE_WIDTH * SSD_SCENE_HEIGHT * 4;
+const SSD_SCENE_CHILD_BYTES: u32 = SSD_SCENE_CHILD_WIDTH * SSD_SCENE_CHILD_HEIGHT * 4;
+const SSD_SCENE_POOL_BYTES: u32 = SSD_SCENE_PARENT_BYTES + SSD_SCENE_CHILD_BYTES;
+
+/// A separate real-wire client whose synchronized child is deliberately given
+/// its role before the parent becomes an xdg-toplevel.
+///
+/// This split setup lets the renderer regression allocate the future upper
+/// window's child `SurfaceId` before either window maps. It is a useful oracle
+/// for both the `new_subsurface` fallback z and the parent commit which must
+/// replace that provisional value from the committed stack.
+pub(crate) struct PendingSsdSubsurfaceSceneClient {
+    client: UnixStream,
+}
+
+pub(crate) struct RealSsdSubsurfaceSceneClient {
+    client: UnixStream,
+    _pool: File,
+    next_sync: u32,
+}
+
+fn connect_ssd_scene_client(socket_name: &str) -> UnixStream {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the SSD scene oracle");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(socket_name))
+        .expect("SSD scene client connects to the protocol thread");
+    send_display_request(&mut client, 1, 2);
+    send_display_request(&mut client, 0, 3);
+    let globals = registry_globals(&mut client, 3);
+    for (interface, id, maximum) in [
+        ("wl_compositor", 4, 5),
+        ("xdg_wm_base", 5, 6),
+        ("wl_shm", 6, 1),
+        ("wl_subcompositor", 7, 1),
+        ("zxdg_decoration_manager_v1", 8, 1),
+        ("wl_seat", 9, 7),
+    ] {
+        let (global, version) = globals[interface];
+        bind_global(&mut client, global, interface, version.min(maximum), id);
+    }
+    client
+}
+
+impl PendingSsdSubsurfaceSceneClient {
+    pub(crate) fn connect(socket_name: &str) -> Self {
+        let mut client = connect_ssd_scene_client(socket_name);
+        send_request(&mut client, 4, 0, &words(&[SSD_SCENE_PARENT_SURFACE]));
+        send_request(&mut client, 4, 0, &words(&[SSD_SCENE_CHILD_SURFACE]));
+        send_request(
+            &mut client,
+            7,
+            1,
+            &words(&[
+                SSD_SCENE_SUBSURFACE,
+                SSD_SCENE_CHILD_SURFACE,
+                SSD_SCENE_PARENT_SURFACE,
+            ]),
+        );
+        send_display_request(&mut client, 0, 13);
+        let ready = events_until_callback(&mut client, 13);
+        assert!(
+            ready
+                .iter()
+                .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+            "pre-role subsurface setup has no protocol error: {ready:?}"
+        );
+        let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+        loop {
+            let (object, opcode, body) =
+                read_event(&mut client, deadline, "pre-role callback delete_id");
+            if object == 1 && opcode == 1 && word(&body, 0) == 13 {
+                break;
+            }
+        }
+        Self { client }
+    }
+
+    pub(crate) fn finish(mut self, title: &str) -> RealSsdSubsurfaceSceneClient {
+        finish_ssd_scene_client(&mut self.client, title, 16);
+        let pool = create_ssd_scene_pool(&mut self.client, title);
+        RealSsdSubsurfaceSceneClient {
+            client: self.client,
+            _pool: pool,
+            next_sync: 20,
+        }
+    }
+}
+
+impl RealSsdSubsurfaceSceneClient {
+    pub(crate) fn map(&mut self, parent_rgb: [u8; 3], child_rgb: [u8; 3]) {
+        fill_ssd_scene_pool(&self._pool, parent_rgb, child_rgb);
+        send_request(
+            &mut self.client,
+            SSD_SCENE_CHILD_SURFACE,
+            1,
+            &words(&[SSD_SCENE_CHILD_BUFFER, 0, 0]),
+        );
+        send_request(
+            &mut self.client,
+            SSD_SCENE_CHILD_SURFACE,
+            9,
+            &words(&[0, 0, SSD_SCENE_CHILD_WIDTH, SSD_SCENE_CHILD_HEIGHT]),
+        );
+        send_request(&mut self.client, SSD_SCENE_CHILD_SURFACE, 6, &[]);
+        send_request(
+            &mut self.client,
+            SSD_SCENE_PARENT_SURFACE,
+            1,
+            &words(&[SSD_SCENE_PARENT_BUFFER, 0, 0]),
+        );
+        send_request(
+            &mut self.client,
+            SSD_SCENE_PARENT_SURFACE,
+            9,
+            &words(&[0, 0, SSD_SCENE_WIDTH, SSD_SCENE_HEIGHT]),
+        );
+        send_request(&mut self.client, SSD_SCENE_PARENT_SURFACE, 6, &[]);
+        self.round_trip("mapping SSD toplevel and synchronized child");
+    }
+
+    pub(crate) fn pointer_press_count(&mut self) -> usize {
+        let traffic = self.round_trip("reading pointer press target");
+        traffic
+            .iter()
+            .filter(|(object, opcode, body)| {
+                *object == SSD_SCENE_POINTER
+                    && *opcode == 3
+                    && word(body, 2) == PRIMARY_POINTER_BUTTON
+                    && word(body, 3) == 1 // wl_pointer.button_state.pressed
+            })
+            .count()
+    }
+
+    fn round_trip(&mut self, context: &str) -> Vec<(u32, u16, Vec<u8>)> {
+        let callback = self.next_sync;
+        self.next_sync = self.next_sync.saturating_add(1);
+        send_display_request(&mut self.client, 0, callback);
+        let traffic = events_until_callback(&mut self.client, callback);
+        assert!(
+            traffic
+                .iter()
+                .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+            "{context} has no protocol error: {traffic:?}"
+        );
+        traffic
+    }
+}
+
+fn finish_ssd_scene_client(client: &mut UnixStream, title: &str, configure_sync: u32) {
+    send_request(
+        client,
+        5,
+        2,
+        &words(&[SSD_SCENE_XDG_SURFACE, SSD_SCENE_PARENT_SURFACE]),
+    );
+    send_request(
+        client,
+        SSD_SCENE_XDG_SURFACE,
+        1,
+        &words(&[SSD_SCENE_TOPLEVEL]),
+    );
+    send_request(
+        client,
+        8,
+        1,
+        &words(&[SSD_SCENE_DECORATION, SSD_SCENE_TOPLEVEL]),
+    );
+    send_request(
+        client,
+        SSD_SCENE_DECORATION,
+        1,
+        &words(&[DecorationMode::ServerSide as u32]),
+    );
+    send_request(client, SSD_SCENE_TOPLEVEL, 2, &wire_string_argument(title));
+    send_request(
+        client,
+        SSD_SCENE_SUBSURFACE,
+        1,
+        &words(&[SSD_SCENE_CHILD_X as u32, SSD_SCENE_CHILD_Y as u32]),
+    );
+    send_request(client, SSD_SCENE_PARENT_SURFACE, 6, &[]);
+    send_display_request(client, 0, configure_sync);
+    let configured = events_until_callback(client, configure_sync);
+    let serial = configured
+        .iter()
+        .rev()
+        .find_map(|(object, opcode, body)| {
+            (*object == SSD_SCENE_XDG_SURFACE && *opcode == 0).then(|| word(body, 0))
+        })
+        .expect("SSD scene xdg_surface receives a configure");
+    assert!(
+        configured.iter().any(|(object, opcode, body)| {
+            *object == SSD_SCENE_DECORATION
+                && *opcode == 0
+                && word(body, 0) == DecorationMode::ServerSide as u32
+        }),
+        "SSD scene client receives server-side decoration configure: {configured:?}"
+    );
+    send_request(client, SSD_SCENE_XDG_SURFACE, 4, &words(&[serial]));
+    let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    loop {
+        let (object, opcode, body) =
+            read_event(client, deadline, "SSD configure callback delete_id");
+        if object == 1 && opcode == 1 && word(&body, 0) == configure_sync {
+            break;
+        }
+    }
+}
+
+fn create_ssd_scene_pool(client: &mut UnixStream, label: &str) -> File {
+    let name = CString::new(format!("{label}-ssd-scene")).expect("scene label has no NUL");
+    // SAFETY: name is live and the returned descriptor is immediately owned.
+    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(raw_fd >= 0, "create SSD scene SHM pool");
+    // SAFETY: memfd_create returned a new owned descriptor on success.
+    let pool = unsafe { File::from_raw_fd(raw_fd) };
+    pool.set_len(u64::from(SSD_SCENE_POOL_BYTES))
+        .expect("size SSD scene SHM pool");
+    send_request_with_fd(
+        client,
+        6,
+        0,
+        &words(&[SSD_SCENE_POOL, SSD_SCENE_POOL_BYTES]),
+        pool.as_fd(),
+    );
+    send_request(
+        client,
+        SSD_SCENE_POOL,
+        0,
+        &words(&[
+            SSD_SCENE_PARENT_BUFFER,
+            0,
+            SSD_SCENE_WIDTH,
+            SSD_SCENE_HEIGHT,
+            SSD_SCENE_WIDTH * 4,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    );
+    send_request(
+        client,
+        SSD_SCENE_POOL,
+        0,
+        &words(&[
+            SSD_SCENE_CHILD_BUFFER,
+            SSD_SCENE_PARENT_BYTES,
+            SSD_SCENE_CHILD_WIDTH,
+            SSD_SCENE_CHILD_HEIGHT,
+            SSD_SCENE_CHILD_WIDTH * 4,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    );
+    send_request(client, 9, 0, &words(&[SSD_SCENE_POINTER]));
+    pool
+}
+
+fn fill_ssd_scene_pool(pool: &File, parent_rgb: [u8; 3], child_rgb: [u8; 3]) {
+    let parent_pixel = [parent_rgb[2], parent_rgb[1], parent_rgb[0], 0];
+    let child_pixel = [child_rgb[2], child_rgb[1], child_rgb[0], 0];
+    let parent = parent_pixel
+        .into_iter()
+        .cycle()
+        .take(SSD_SCENE_PARENT_BYTES as usize)
+        .collect::<Vec<_>>();
+    let child = child_pixel
+        .into_iter()
+        .cycle()
+        .take(SSD_SCENE_CHILD_BYTES as usize)
+        .collect::<Vec<_>>();
+    pool.write_at(&parent, 0).expect("fill parent SHM pixels");
+    pool.write_at(&child, u64::from(SSD_SCENE_PARENT_BYTES))
+        .expect("fill child SHM pixels");
+}
+
+impl RealShmSceneClient {
+    pub(crate) fn connect(socket_name: &str, label: &str) -> Self {
+        let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+            .expect("XDG_RUNTIME_DIR is required for the live scene SHM oracle");
+        let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(socket_name))
+            .expect("real SHM scene client connects to the protocol thread");
+        let pool = bring_up_shm_toplevel(&mut client, 4, label);
+        send_request(
+            &mut client,
+            11,
+            0,
+            &words(&[12, 0, 1, 1, 4, wl_shm::Format::Xrgb8888 as u32]),
+        ); // wl_shm_pool.create_buffer
+        Self {
+            client,
+            pool,
+            next_sync: 13,
+        }
+    }
+
+    pub(crate) fn commit_rgb(&mut self, rgb: [u8; 3]) {
+        self.pool
+            .write_at(&[rgb[2], rgb[1], rgb[0], 0], 0)
+            .expect("rewrite the real SHM client's pixel");
+        send_request(&mut self.client, 7, 1, &words(&[12, 0, 0])); // wl_surface.attach
+        send_request(&mut self.client, 7, 9, &words(&[0, 0, 1, 1])); // damage_buffer
+        send_request(&mut self.client, 7, 6, &[]); // wl_surface.commit
+        send_display_request(&mut self.client, 0, self.next_sync);
+        let committed = events_until_callback(&mut self.client, self.next_sync);
+        assert!(
+            committed
+                .iter()
+                .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+            "real SHM scene commit has no protocol error: {committed:?}"
+        );
+        self.next_sync = self.next_sync.saturating_add(1);
+    }
+}
+
+impl RealCursorSceneClient {
+    pub(crate) fn connect(runtime: &WaylandRuntime, socket_name: &str, label: &str) -> Self {
+        let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+            .expect("XDG_RUNTIME_DIR is required for the live cursor scene oracle");
+        let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(socket_name))
+            .expect("real cursor scene client connects to the protocol thread");
+        let toplevel_pool = bring_up_shm_toplevel(&mut client, 4, label);
+        toplevel_pool
+            .write_at(&[0, 0, 0, 0], 0)
+            .expect("fill cursor oracle toplevel pixel");
+        send_request(
+            &mut client,
+            11,
+            0,
+            &words(&[12, 0, 1, 1, 4, wl_shm::Format::Xrgb8888 as u32]),
+        );
+        send_request(&mut client, 7, 1, &words(&[12, 0, 0]));
+        send_request(&mut client, 7, 6, &[]);
+
+        send_display_request(&mut client, 1, 13);
+        send_display_request(&mut client, 0, 14);
+        let globals = registry_globals_for(&mut client, 13, 14);
+        let (seat, seat_version) = globals["wl_seat"];
+        bind_global(&mut client, seat, "wl_seat", seat_version.min(7), 15);
+        send_request(&mut client, 15, 0, &words(&[16]));
+        send_display_request(&mut client, 0, 17);
+        events_until_callback(&mut client, 17);
+
+        runtime
+            .finish_frame(vec![HostInput::PointerMotionAbsolute {
+                x: f64::from(CASCADE_ORIGIN) + 0.5,
+                y: f64::from(CASCADE_ORIGIN) + 0.5,
+                time: 1,
+            }])
+            .expect("real cursor scene routes pointer focus");
+        send_display_request(&mut client, 0, 18);
+        let traffic = events_until_callback(&mut client, 18);
+        let mut serial = traffic.iter().find_map(|(object, opcode, body)| {
+            (*object == 16 && *opcode == 0).then(|| word(body, 0))
+        });
+        let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+        while serial.is_none() {
+            let (object, opcode, body) =
+                read_event(&mut client, deadline, "live cursor wl_pointer.enter");
+            if object == 16 && opcode == 0 {
+                serial = Some(word(&body, 0));
+            }
+        }
+        let serial = serial.expect("loop stops only after wl_pointer.enter");
+
+        let name = CString::new(format!("{label}-cursor")).expect("cursor label has no NUL");
+        // SAFETY: name is a live NUL-terminated C string and the returned
+        // descriptor is transferred immediately into File.
+        let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw_fd >= 0, "create live cursor pool");
+        // SAFETY: memfd_create returned a new owned descriptor on success.
+        let pool = unsafe { File::from_raw_fd(raw_fd) };
+        pool.set_len(4).expect("size live cursor pool");
+        send_request(&mut client, 4, 0, &words(&[19]));
+        send_request_with_fd(&mut client, 6, 0, &words(&[20, 4]), pool.as_fd());
+        send_request(
+            &mut client,
+            20,
+            0,
+            &words(&[21, 0, 1, 1, 4, wl_shm::Format::Xrgb8888 as u32]),
+        );
+        send_request(&mut client, 16, 0, &words(&[serial, 19, 0, 0]));
+        Self {
+            client,
+            pool,
+            next_sync: 22,
+        }
+    }
+
+    pub(crate) fn commit_rgb(&mut self, rgb: [u8; 3]) {
+        self.pool
+            .write_at(&[rgb[2], rgb[1], rgb[0], 0], 0)
+            .expect("rewrite the real cursor SHM pixel");
+        send_request(&mut self.client, 19, 1, &words(&[21, 0, 0]));
+        send_request(&mut self.client, 19, 9, &words(&[0, 0, 1, 1]));
+        send_request(&mut self.client, 19, 6, &[]);
+        send_display_request(&mut self.client, 0, self.next_sync);
+        let committed = events_until_callback(&mut self.client, self.next_sync);
+        assert!(
+            committed
+                .iter()
+                .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+            "real cursor scene commit has no protocol error: {committed:?}"
+        );
+        self.next_sync = self.next_sync.saturating_add(1);
+    }
+}
+
+/// As `bring_up_shm_toplevel`, but with `wl_subcompositor` and `wl_output`
+/// bound too.
+///
+/// `wl_output` is bound because `wl_surface.enter` and `wl_surface.leave` are
+/// only ever sent to a client that holds the output, so a subsurface oracle
+/// that does not bind it cannot see the compositor's own view of which surfaces
+/// are on screen — the enter/leave pair is the one visibility signal that
+/// survives per-surface event coalescing.
+///
+/// The extra binds shift every later id, so the ids are their own map:
+/// 2 registry, 3 sync, 4 `wl_compositor`, 5 `xdg_wm_base`, 6 `wl_shm`,
+/// 7 `wl_subcompositor`, 8 `wl_output`, 9 `wl_surface`, 10 `xdg_surface`,
+/// 11 `xdg_toplevel`, 12 sync, 13 pool. The caller's own objects start at 14
+/// and must keep allocating from there in creation order.
+fn bring_up_shm_toplevel_with_subcompositor(
+    client: &mut UnixStream,
+    pool_bytes: u32,
+    memfd_name: &str,
+) -> File {
+    send_display_request(client, 1, 2); // wl_display.get_registry
+    send_display_request(client, 0, 3); // wl_display.sync
+    let globals = registry_globals(client, 3);
+    let (compositor, compositor_version) = globals["wl_compositor"];
+    let (xdg_wm_base, xdg_version) = globals["xdg_wm_base"];
+    let (shm, shm_version) = globals["wl_shm"];
+    let (subcompositor, subcompositor_version) = globals["wl_subcompositor"];
+    let (output, output_version) = globals["wl_output"];
+    bind_global(
+        client,
+        compositor,
+        "wl_compositor",
+        compositor_version.min(5),
+        4,
+    );
+    bind_global(client, xdg_wm_base, "xdg_wm_base", xdg_version.min(6), 5);
+    bind_global(client, shm, "wl_shm", shm_version.min(1), 6);
+    bind_global(
+        client,
+        subcompositor,
+        "wl_subcompositor",
+        subcompositor_version.min(1),
+        7,
+    );
+    bind_global(client, output, "wl_output", output_version.min(4), 8);
+
+    send_request(client, 4, 0, &words(&[9])); // wl_compositor.create_surface
+    send_request(client, 5, 2, &words(&[10, 9])); // xdg_wm_base.get_xdg_surface
+    send_request(client, 10, 1, &words(&[11])); // xdg_surface.get_toplevel
+    send_request(client, 9, 6, &[]); // initial empty commit
+    send_display_request(client, 0, 12);
+    let serial = events_until_callback(client, 12)
+        .iter()
+        .find_map(|(object, opcode, body)| (*object == 10 && *opcode == 0).then(|| word(body, 0)))
+        .expect("xdg_surface.configure follows the initial empty commit");
+    send_request(client, 10, 4, &words(&[serial])); // xdg_surface.ack_configure
+
+    let name = CString::new(memfd_name).expect("memfd name has no interior NUL");
+    // SAFETY: name is a live NUL-terminated C string and the returned
+    // descriptor is transferred immediately into File.
+    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(
+        raw_fd >= 0,
+        "create anonymous test pool: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: memfd_create returned a new owned descriptor on success.
+    let pool = unsafe { File::from_raw_fd(raw_fd) };
+    pool.set_len(u64::from(pool_bytes))
+        .expect("size anonymous test pool");
+    send_request_with_fd(client, 6, 0, &words(&[13, pool_bytes]), pool.as_fd()); // wl_shm.create_pool
+    pool
+}
+
+// ---------------------------------------------------------------------------
+// Rung E-3: focus hand-off between two real clients.
+//
+// These oracles stay on the clients' sockets. Pointer and keyboard focus
+// messages bypass the renderer event channel entirely, so no per-surface
+// coalescing can turn a missing hand-off into a passing assertion.
+// ---------------------------------------------------------------------------
+
+const FOCUS_SURFACE_ID: u32 = 7;
+const FOCUS_TOPLEVEL_ID: u32 = 9;
+const FOCUS_POINTER_ID: u32 = 16;
+const FOCUS_KEYBOARD_ID: u32 = 17;
+const FOCUS_WIDTH: u32 = 160;
+const FOCUS_HEIGHT: u32 = 120;
+const FOCUS_POOL_BYTES: u32 = FOCUS_WIDTH * FOCUS_HEIGHT * 4;
+
+struct FocusClient {
+    socket: UnixStream,
+    _pool: File,
+}
+
+/// The focus messages asserted by the two-client fixtures.
+///
+/// Surface and input-object ids are deliberately interpreted only within the
+/// socket they came from. Both clients use the same dense sequence — legal and
+/// useful, because Wayland object ids are client-local — so putting traffic
+/// from both sockets into one object-id keyed table would make it ambiguous.
+#[derive(Debug, PartialEq)]
+enum FocusWire {
+    PointerEnter {
+        serial: u32,
+        surface: u32,
+        x: f64,
+        y: f64,
+    },
+    PointerLeave {
+        serial: u32,
+        surface: u32,
+    },
+    PointerMotion {
+        time: u32,
+        x: f64,
+        y: f64,
+    },
+    PointerButton {
+        serial: u32,
+        time: u32,
+        button: u32,
+        state: u32,
+    },
+    PointerFrame,
+    KeyboardEnter {
+        serial: u32,
+        surface: u32,
+        pressed_keys: Vec<u32>,
+    },
+    KeyboardLeave {
+        serial: u32,
+        surface: u32,
+    },
+    KeyboardKey {
+        serial: u32,
+        time: u32,
+        key: u32,
+        state: u32,
+    },
+    KeyboardModifiers {
+        serial: u32,
+        depressed: u32,
+        latched: u32,
+        locked: u32,
+        group: u32,
+    },
+}
+
+fn focus_messages(traffic: &[(u32, u16, Vec<u8>)]) -> Vec<FocusWire> {
+    traffic
+        .iter()
+        .filter_map(|(object, opcode, body)| match (*object, *opcode) {
+            (FOCUS_POINTER_ID, 0) => Some(FocusWire::PointerEnter {
+                serial: word(body, 0),
+                surface: word(body, 1),
+                x: fixed(body, 2),
+                y: fixed(body, 3),
+            }),
+            (FOCUS_POINTER_ID, 1) => Some(FocusWire::PointerLeave {
+                serial: word(body, 0),
+                surface: word(body, 1),
+            }),
+            (FOCUS_POINTER_ID, 2) => Some(FocusWire::PointerMotion {
+                time: word(body, 0),
+                x: fixed(body, 1),
+                y: fixed(body, 2),
+            }),
+            (FOCUS_POINTER_ID, 3) => Some(FocusWire::PointerButton {
+                serial: word(body, 0),
+                time: word(body, 1),
+                button: word(body, 2),
+                state: word(body, 3),
+            }),
+            (FOCUS_POINTER_ID, 5) => Some(FocusWire::PointerFrame),
+            (FOCUS_KEYBOARD_ID, 1) => {
+                let byte_len = word(body, 2) as usize;
+                assert_eq!(byte_len % 4, 0, "pressed-key array is word-aligned");
+                assert!(
+                    body.len() >= 12 + byte_len,
+                    "complete pressed-key array: {body:?}"
+                );
+                Some(FocusWire::KeyboardEnter {
+                    serial: word(body, 0),
+                    surface: word(body, 1),
+                    pressed_keys: (0..byte_len / 4)
+                        .map(|index| word(body, 3 + index))
+                        .collect(),
+                })
+            }
+            (FOCUS_KEYBOARD_ID, 2) => Some(FocusWire::KeyboardLeave {
+                serial: word(body, 0),
+                surface: word(body, 1),
+            }),
+            (FOCUS_KEYBOARD_ID, 3) => Some(FocusWire::KeyboardKey {
+                serial: word(body, 0),
+                time: word(body, 1),
+                key: word(body, 2),
+                state: word(body, 3),
+            }),
+            (FOCUS_KEYBOARD_ID, 4) => Some(FocusWire::KeyboardModifiers {
+                serial: word(body, 0),
+                depressed: word(body, 1),
+                latched: word(body, 2),
+                locked: word(body, 3),
+                group: word(body, 4),
+            }),
+            (FOCUS_POINTER_ID | FOCUS_KEYBOARD_ID, other) => {
+                panic!("unexpected focus-object opcode {other}: {body:?}")
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Connect one client, map its SHM toplevel, and bind its pointer and keyboard.
+///
+/// `bring_up_shm_toplevel` owns ids 2 through 11. This composes on top of that
+/// fixed map without changing it: buffer 12, registry 13, sync 14, seat 15,
+/// pointer 16, keyboard 17, ready sync 18. The final round-trip is required,
+/// not decorative: the input source's acknowledgement cannot prove the
+/// compositor has read either client's object-creation requests.
+fn map_focus_client(socket_path: &std::path::Path, memfd_name: &str) -> FocusClient {
+    let mut socket = UnixStream::connect(socket_path).expect("connect focus-test client");
+    let pool = bring_up_shm_toplevel(&mut socket, FOCUS_POOL_BYTES, memfd_name);
+    send_request(
+        &mut socket,
+        11,
+        0,
+        &words(&[
+            12,
+            0,
+            FOCUS_WIDTH,
+            FOCUS_HEIGHT,
+            FOCUS_WIDTH * 4,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    ); // wl_shm_pool.create_buffer
+    send_request(&mut socket, FOCUS_SURFACE_ID, 1, &words(&[12, 0, 0])); // wl_surface.attach
+    send_request(&mut socket, FOCUS_SURFACE_ID, 6, &[]); // map the surface
+
+    send_display_request(&mut socket, 1, 13); // second wl_registry
+    send_display_request(&mut socket, 0, 14);
+    let globals = registry_globals_for(&mut socket, 13, 14);
+    let (seat, seat_version) = globals["wl_seat"];
+    bind_global(&mut socket, seat, "wl_seat", seat_version.min(7), 15);
+    send_request(&mut socket, 15, 0, &words(&[FOCUS_POINTER_ID])); // wl_seat.get_pointer
+    send_request(&mut socket, 15, 1, &words(&[FOCUS_KEYBOARD_ID])); // wl_seat.get_keyboard
+    send_display_request(&mut socket, 0, 18);
+    let ready = events_until_callback(&mut socket, 18);
+    assert!(
+        ready
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "the mapped focus client completed setup without a protocol error: {ready:?}"
+    );
+    assert!(
+        ready
+            .iter()
+            .any(|(object, opcode, _)| *object == FOCUS_KEYBOARD_ID && *opcode == 0),
+        "the client's keyboard object received its keymap before input injection: {ready:?}"
+    );
+    assert_eq!(
+        seat_capabilities(&ready, 15),
+        vec![SEAT_CAPS_WITHOUT_TOUCH],
+        "the focus client's seat starts without touch before device injection: {ready:?}"
+    );
+
+    FocusClient {
+        socket,
+        _pool: pool,
+    }
+}
+
+/// Start one offline compositor and map one independently numbered client at
+/// each of the first two real cascade positions.
+fn two_client_focus_runtime(
+    label: &str,
+) -> (FakeInputInjector, WaylandRuntime, FocusClient, FocusClient) {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the two-client focus oracles");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-focus-{label}-{}-{unique}", std::process::id());
+
+    let (injector, input_source) = fake_input_source();
+    let runtime = WaylandRuntime::with_input_source(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        WaylandGpuWiring {
+            dmabuf_capabilities: Some(DmabufCapabilities {
+                main_device: 0,
+                formats: Vec::new(),
+                adapter_name: "focus-test".into(),
+                drm_adapter: synthetic_drm_adapter("focus-test"),
+            }),
+            dmabuf_validator: None,
+            retirement_adapter: test_retirement_adapter(),
+        },
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+        Some(input_source),
+        None,
+    )
+    .expect("protocol thread starts for two focus clients");
+    let socket_path = std::path::Path::new(&runtime_dir).join(&socket_name);
+    let a = map_focus_client(&socket_path, "cosmix-focus-a");
+    let b = map_focus_client(&socket_path, "cosmix-focus-b");
+    (injector, runtime, a, b)
+}
+
+fn route_focus_pointer(injector: &FakeInputInjector, x: f64, y: f64) {
+    injector.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: x / 320.0,
+            normalised_y: y / 240.0,
+        },
+    });
+}
+
+fn route_focus_button(injector: &FakeInputInjector, state: ButtonState) {
+    injector.route(InputEvent::PointerButton {
+        event: FakeButtonEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            button: 0x110,
+            state,
+        },
+    });
+}
+
+type FocusTraffic = Vec<(u32, u16, Vec<u8>)>;
+
+fn round_trip_focus_clients(
+    a: &mut FocusClient,
+    b: &mut FocusClient,
+    callback_id: u32,
+) -> (FocusTraffic, FocusTraffic) {
+    send_display_request(&mut a.socket, 0, callback_id);
+    send_display_request(&mut b.socket, 0, callback_id);
+    (
+        events_until_callback(&mut a.socket, callback_id),
+        events_until_callback(&mut b.socket, callback_id),
+    )
+}
+
+fn flush_cursor_events(runtime: &WaylandRuntime) -> Vec<CursorImage> {
+    let coordinator = runtime.kms_topology_client();
+    let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    let mut images = Vec::new();
+    loop {
+        let outcome = coordinator
+            .flush_events(PROTOCOL_ACK_DEADLINE)
+            .expect("cursor oracle flushes protocol events");
+        for event in runtime
+            .drain_events()
+            .expect("cursor oracle protocol thread remains alive")
+        {
+            if let ProtocolEvent::CursorUpdated { image } = event {
+                images.push(image);
+            }
+        }
+        if outcome == EventFlushOutcome::Complete {
+            return images;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cursor event publication stayed pending until the deadline"
+        );
+    }
+}
+
+fn create_focus_cursor(client: &mut FocusClient) -> (File, Vec<u8>) {
+    const CURSOR_SURFACE: u32 = 20;
+    const CURSOR_POOL: u32 = 21;
+    const CURSOR_BUFFER: u32 = 22;
+    let name = CString::new("cosmix-cursor-shm").expect("static memfd name");
+    // SAFETY: name is a live NUL-terminated C string and the returned
+    // descriptor is transferred immediately into File.
+    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(
+        raw_fd >= 0,
+        "create cursor SHM pool: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: memfd_create returned a new owned descriptor on success.
+    let mut pool = unsafe { File::from_raw_fd(raw_fd) };
+    let (pool_bytes, expected) = shm_oracle_pool();
+    pool.write_all(&pool_bytes).expect("fill cursor SHM pool");
+    send_request(&mut client.socket, 4, 0, &words(&[CURSOR_SURFACE]));
+    send_request_with_fd(
+        &mut client.socket,
+        6,
+        0,
+        &words(&[CURSOR_POOL, SHM_ORACLE_POOL_BYTES as u32]),
+        pool.as_fd(),
+    );
+    send_request(
+        &mut client.socket,
+        CURSOR_POOL,
+        0,
+        &words(&[
+            CURSOR_BUFFER,
+            SHM_ORACLE_OFFSET as u32,
+            SHM_ORACLE_WIDTH as u32,
+            SHM_ORACLE_HEIGHT as u32,
+            SHM_ORACLE_STRIDE as u32,
+            wl_shm::Format::Argb8888 as u32,
+        ]),
+    );
+    (pool, expected)
+}
+
+#[test]
+fn real_client_commit_before_set_cursor_adopts_image_and_pulses_frame_callback() {
+    const CURSOR_SURFACE: u32 = 20;
+    const CURSOR_BUFFER: u32 = 22;
+    const CURSOR_FRAME: u32 = 23;
+    let (injector, runtime, mut a, mut b) = two_client_focus_runtime("cursor-pre-role");
+
+    let a_only = f64::from(CASCADE_ORIGIN) + 8.0;
+    route_focus_pointer(&injector, a_only, a_only);
+    let (entered_a, _) = round_trip_focus_clients(&mut a, &mut b, 19);
+    let enter_serial = focus_messages(&entered_a)
+        .into_iter()
+        .find_map(|message| match message {
+            FocusWire::PointerEnter { serial, .. } => Some(serial),
+            _ => None,
+        })
+        .expect("real wl_pointer.enter supplies the authorised cursor serial");
+    assert!(flush_cursor_events(&runtime).is_empty());
+
+    let (_cursor_pool, expected_rgba) = create_focus_cursor(&mut a);
+    send_request(
+        &mut a.socket,
+        CURSOR_SURFACE,
+        1,
+        &words(&[CURSOR_BUFFER, 0, 0]),
+    );
+    send_request(
+        &mut a.socket,
+        CURSOR_SURFACE,
+        9,
+        &words(&[0, 0, SHM_ORACLE_WIDTH as u32, SHM_ORACLE_HEIGHT as u32]),
+    );
+    send_request(&mut a.socket, CURSOR_SURFACE, 3, &words(&[CURSOR_FRAME]));
+    send_request(&mut a.socket, CURSOR_SURFACE, 6, &[]);
+    send_display_request(&mut a.socket, 0, 24);
+    let roleless_commit = events_until_callback(&mut a.socket, 24);
+    assert!(
+        roleless_commit
+            .iter()
+            .all(|(object, opcode, _)| !(*object == CURSOR_BUFFER && *opcode == 0)),
+        "the compositor retains a roleless committed buffer until its role is known"
+    );
+    assert!(
+        roleless_commit
+            .iter()
+            .all(|(object, opcode, _)| !(*object == CURSOR_FRAME && *opcode == 0)),
+        "the roleless commit's frame callback remains pending"
+    );
+    assert!(flush_cursor_events(&runtime).is_empty());
+
+    send_request(
+        &mut a.socket,
+        FOCUS_POINTER_ID,
+        0,
+        &words(&[enter_serial, CURSOR_SURFACE, 5, 6]),
+    );
+    send_display_request(&mut a.socket, 0, 25);
+    let selected = events_until_callback(&mut a.socket, 25);
+    assert_eq!(
+        selected
+            .iter()
+            .filter(|(object, opcode, _)| *object == CURSOR_BUFFER && *opcode == 0)
+            .count(),
+        1,
+        "adopting the committed SHM image copies and releases its buffer once"
+    );
+    assert!(
+        selected
+            .iter()
+            .all(|(object, opcode, _)| !(*object == CURSOR_FRAME && *opcode == 0)),
+        "role assignment publishes the cursor but does not fake an output frame"
+    );
+    match flush_cursor_events(&runtime).into_iter().last() {
+        Some(CursorImage::Surface {
+            hotspot: (5, 6),
+            frame: Some(SurfaceFrame::Shm(frame)),
+            ..
+        }) => assert_eq!(frame.rgba.as_slice(), expected_rgba.as_slice()),
+        other => panic!("set_cursor adopts the roleless committed image: {other:?}"),
+    }
+
+    runtime
+        .finish_frame(Vec::new())
+        .expect("the first presented cursor frame completes its callback");
+    wait_for_callback(&mut a.socket, CURSOR_FRAME);
+}
+
+#[test]
+fn precommitted_drag_icon_buffer_is_released_when_the_role_is_assigned() {
+    let mut harness = KeybindingHarness::new(false);
+    let pointer = harness.bind_pointer();
+    harness.prime_pointer_focus();
+
+    let &(manager_name, manager_version) = harness
+        .registry_globals
+        .get("wl_data_device_manager")
+        .expect("data-device manager global");
+    let manager = harness.allocate_object_id();
+    bind_global(
+        &mut harness.client,
+        manager_name,
+        "wl_data_device_manager",
+        manager_version.min(3),
+        manager,
+    );
+    let data_device = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        manager,
+        1,
+        &words(&[data_device, TEST_SEAT_ID]),
+    );
+    let _ = harness.sync();
+
+    let icon_surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[icon_surface]),
+    );
+    let icon_buffer = harness.create_dmabuf_buffer();
+    send_request(
+        &mut harness.client,
+        icon_surface,
+        1,
+        &words(&[icon_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, icon_surface, 6, &[]);
+    let precommitted = harness.sync();
+    assert!(
+        precommitted
+            .iter()
+            .all(|(object, opcode, _)| !(*object == icon_buffer && *opcode == 0)),
+        "the roleless commit retains its buffer while cursor adoption remains possible"
+    );
+
+    harness.route(InputEvent::PointerButton {
+        event: FakeButtonEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            button: 0x110,
+            state: ButtonState::Pressed,
+        },
+    });
+    let pressed = harness.sync();
+    let serial = word(&pointer_body(&pressed, pointer, 3), 0);
+    send_request(
+        &mut harness.client,
+        data_device,
+        0,
+        &words(&[0, TEST_TOPLEVEL_SURFACE_ID, icon_surface, serial]),
+    );
+    let started = harness.sync();
+    assert_eq!(
+        started
+            .iter()
+            .filter(|(object, opcode, _)| *object == icon_buffer && *opcode == 0)
+            .count(),
+        1,
+        "assigning the non-cursor DND icon role promptly releases the cached buffer"
+    );
+}
+
+#[test]
+fn precommitted_child_maps_when_get_subsurface_precedes_the_parent_commit() {
+    const PARENT_WIDTH: u32 = 32;
+    const PARENT_HEIGHT: u32 = 24;
+    const PARENT_STRIDE: u32 = PARENT_WIDTH * 4;
+    const PARENT_BYTES: u32 = PARENT_STRIDE * PARENT_HEIGHT;
+    const CHILD_WIDTH: u32 = 13;
+    const CHILD_HEIGHT: u32 = 7;
+    const CHILD_STRIDE: u32 = CHILD_WIDTH * 4;
+    const CHILD_BYTES: u32 = CHILD_STRIDE * CHILD_HEIGHT;
+    const POOL_BYTES: u32 = PARENT_BYTES + CHILD_BYTES;
+
+    let mut harness = KeybindingHarness::new(false);
+
+    let parent_surface = harness.allocate_object_id();
+    let parent_xdg_surface = harness.allocate_object_id();
+    let parent_toplevel = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[parent_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        2,
+        &words(&[parent_xdg_surface, parent_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        parent_xdg_surface,
+        1,
+        &words(&[parent_toplevel]),
+    );
+    send_request(&mut harness.client, parent_surface, 6, &[]);
+    let configured = harness.sync();
+    let serial = configured
+        .iter()
+        .find_map(|(object, opcode, body)| {
+            (*object == parent_xdg_surface && *opcode == 0).then(|| word(body, 0))
+        })
+        .expect("the extra toplevel receives its initial configure");
+    send_request(
+        &mut harness.client,
+        parent_xdg_surface,
+        4,
+        &words(&[serial]),
+    );
+
+    let &(shm_name, shm_version) = harness
+        .registry_globals
+        .get("wl_shm")
+        .expect("wl_shm global");
+    let shm = harness.allocate_object_id();
+    bind_global(
+        &mut harness.client,
+        shm_name,
+        "wl_shm",
+        shm_version.min(1),
+        shm,
+    );
+    let pool_id = harness.allocate_object_id();
+    let name = CString::new("cosmix-pre-role-subsurface").expect("static memfd name");
+    // SAFETY: name is a live NUL-terminated C string and the returned
+    // descriptor is transferred immediately into File.
+    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(
+        raw_fd >= 0,
+        "create anonymous test pool: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: memfd_create returned a new owned descriptor on success.
+    let pool = unsafe { File::from_raw_fd(raw_fd) };
+    pool.set_len(u64::from(POOL_BYTES))
+        .expect("size anonymous test pool");
+    send_request_with_fd(
+        &mut harness.client,
+        shm,
+        0,
+        &words(&[pool_id, POOL_BYTES]),
+        pool.as_fd(),
+    );
+
+    let parent_buffer = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        pool_id,
+        0,
+        &words(&[
+            parent_buffer,
+            0,
+            PARENT_WIDTH,
+            PARENT_HEIGHT,
+            PARENT_STRIDE,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    );
+    send_request(
+        &mut harness.client,
+        parent_surface,
+        1,
+        &words(&[parent_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, parent_surface, 6, &[]);
+    let _ = harness.sync();
+
+    let child_surface = harness.allocate_object_id();
+    let child_buffer = harness.allocate_object_id();
+    let child_frame = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[child_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        pool_id,
+        0,
+        &words(&[
+            child_buffer,
+            PARENT_BYTES,
+            CHILD_WIDTH,
+            CHILD_HEIGHT,
+            CHILD_STRIDE,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    );
+    send_request(
+        &mut harness.client,
+        child_surface,
+        1,
+        &words(&[child_buffer, 0, 0]),
+    );
+    send_request(
+        &mut harness.client,
+        child_surface,
+        3,
+        &words(&[child_frame]),
+    );
+    send_request(&mut harness.client, child_surface, 6, &[]);
+    let roleless_commit = harness.sync();
+    assert!(
+        roleless_commit.iter().all(|(object, opcode, _)| {
+            !((*object == child_buffer || *object == child_frame) && *opcode == 0)
+        }),
+        "the roleless commit retains both the child buffer and frame callback"
+    );
+
+    let subsurface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_SUBCOMPOSITOR_ID,
+        1,
+        &words(&[subsurface, child_surface, parent_surface]),
+    );
+    let assigned = harness.sync();
+    assert!(
+        assigned.iter().all(|(object, opcode, _)| {
+            !((*object == child_buffer || *object == child_frame) && *opcode == 0)
+        }),
+        "role assignment adopts the precommitted state but waits for the parent commit"
+    );
+
+    send_request(&mut harness.client, parent_surface, 6, &[]);
+    let parent_committed = harness.sync();
+    assert_eq!(
+        parent_committed
+            .iter()
+            .filter(|(object, opcode, _)| *object == child_buffer && *opcode == 0)
+            .count(),
+        1,
+        "the parent commit imports and releases the child's precommitted SHM buffer once"
+    );
+    assert!(
+        parent_committed
+            .iter()
+            .all(|(object, opcode, _)| !(*object == child_frame && *opcode == 0)),
+        "adoption does not complete the child's frame callback before a compositor frame"
+    );
+
+    let child = harness
+        .server
+        .state
+        .surfaces
+        .values()
+        .find(|record| record.role.wl_surface().id().protocol_id() == child_surface)
+        .expect("the real-wire child has a subsurface record");
+    assert!(
+        child.mapped && child.parent_association_committed && child.layout.visible,
+        "the parent commit maps the adopted child under its mapped parent: \
+         mapped={}, association_committed={}, visible={}",
+        child.mapped,
+        child.parent_association_committed,
+        child.layout.visible
+    );
+    assert_eq!(
+        child.buffer_dimensions,
+        Some((CHILD_WIDTH, CHILD_HEIGHT)),
+        "the mapped child owns the buffer committed before get_subsurface"
+    );
+
+    harness.frame(Vec::new());
+    let presented = harness.sync();
+    assert_eq!(
+        presented
+            .iter()
+            .filter(|(object, opcode, _)| *object == child_frame && *opcode == 0)
+            .count(),
+        1,
+        "the adopted commit's frame callback pulses when the mapped child is presented"
+    );
+}
+
+#[test]
+fn real_client_cursor_offset_decrements_the_effective_hotspot_on_commit() {
+    const CURSOR_SURFACE: u32 = 20;
+    const CURSOR_BUFFER: u32 = 22;
+    let (injector, runtime, mut a, mut b) = two_client_focus_runtime("cursor-offset");
+
+    let a_only = f64::from(CASCADE_ORIGIN) + 8.0;
+    route_focus_pointer(&injector, a_only, a_only);
+    let (entered_a, _) = round_trip_focus_clients(&mut a, &mut b, 19);
+    let enter_serial = focus_messages(&entered_a)
+        .into_iter()
+        .find_map(|message| match message {
+            FocusWire::PointerEnter { serial, .. } => Some(serial),
+            _ => None,
+        })
+        .expect("real wl_pointer.enter supplies the authorised cursor serial");
+    assert!(flush_cursor_events(&runtime).is_empty());
+
+    let (_cursor_pool, _) = create_focus_cursor(&mut a);
+    send_request(
+        &mut a.socket,
+        FOCUS_POINTER_ID,
+        0,
+        &words(&[enter_serial, CURSOR_SURFACE, 11, 13]),
+    );
+    send_request(
+        &mut a.socket,
+        CURSOR_SURFACE,
+        1,
+        &words(&[CURSOR_BUFFER, 0, 0]),
+    );
+    send_request(&mut a.socket, CURSOR_SURFACE, 6, &[]);
+    send_display_request(&mut a.socket, 0, 23);
+    events_until_callback(&mut a.socket, 23);
+    assert!(matches!(
+        flush_cursor_events(&runtime).into_iter().last(),
+        Some(CursorImage::Surface {
+            hotspot: (11, 13),
+            ..
+        })
+    ));
+
+    send_request(&mut a.socket, CURSOR_SURFACE, 10, &words(&[4, 2]));
+    send_request(&mut a.socket, CURSOR_SURFACE, 6, &[]);
+    send_display_request(&mut a.socket, 0, 24);
+    events_until_callback(&mut a.socket, 24);
+    assert!(matches!(
+        flush_cursor_events(&runtime).into_iter().last(),
+        Some(CursorImage::Surface {
+            hotspot: (7, 11),
+            frame: Some(SurfaceFrame::Shm(_)),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn real_client_cursor_shm_pixels_serials_lifecycle_and_frame_pulse_are_exact() {
+    const CURSOR_SURFACE: u32 = 20;
+    const CURSOR_BUFFER: u32 = 22;
+    const CURSOR_FRAME: u32 = 24;
+    let (injector, runtime, mut a, mut b) = two_client_focus_runtime("cursor-wire");
+
+    let a_only = f64::from(CASCADE_ORIGIN) + 8.0;
+    route_focus_pointer(&injector, a_only, a_only);
+    let (entered_a, _) = round_trip_focus_clients(&mut a, &mut b, 19);
+    let enter_serial = focus_messages(&entered_a)
+        .into_iter()
+        .find_map(|message| match message {
+            FocusWire::PointerEnter { serial, .. } => Some(serial),
+            _ => None,
+        })
+        .expect("real wl_pointer.enter supplies the authorised cursor serial");
+    assert!(flush_cursor_events(&runtime).is_empty());
+
+    let (cursor_pool, expected_rgba) = create_focus_cursor(&mut a);
+    send_request(
+        &mut a.socket,
+        FOCUS_POINTER_ID,
+        0,
+        &words(&[enter_serial.wrapping_sub(1), CURSOR_SURFACE, 5, 6]),
+    );
+    send_display_request(&mut a.socket, 0, 23);
+    events_until_callback(&mut a.socket, 23);
+    assert!(
+        flush_cursor_events(&runtime).is_empty(),
+        "a stale enter serial does not select or publish a cursor surface"
+    );
+
+    send_request(
+        &mut a.socket,
+        FOCUS_POINTER_ID,
+        0,
+        &words(&[enter_serial, CURSOR_SURFACE, 5, 6]),
+    );
+    send_request(
+        &mut a.socket,
+        CURSOR_SURFACE,
+        1,
+        &words(&[CURSOR_BUFFER, 0, 0]),
+    );
+    send_request(
+        &mut a.socket,
+        CURSOR_SURFACE,
+        9,
+        &words(&[0, 0, SHM_ORACLE_WIDTH as u32, SHM_ORACLE_HEIGHT as u32]),
+    );
+    send_request(&mut a.socket, CURSOR_SURFACE, 3, &words(&[CURSOR_FRAME]));
+    send_request(&mut a.socket, CURSOR_SURFACE, 6, &[]);
+    send_display_request(&mut a.socket, 0, 25);
+    let committed = events_until_callback(&mut a.socket, 25);
+    assert_eq!(
+        committed
+            .iter()
+            .filter(|(object, opcode, _)| *object == CURSOR_BUFFER && *opcode == 0)
+            .count(),
+        1,
+        "cursor SHM is copied and released exactly once in its commit round-trip"
+    );
+    assert!(
+        committed
+            .iter()
+            .all(|(object, opcode, _)| !(*object == CURSOR_FRAME && *opcode == 0)),
+        "cursor animation callback waits for an output frame"
+    );
+    let image = flush_cursor_events(&runtime)
+        .into_iter()
+        .last()
+        .expect("valid set_cursor plus commit publishes the cursor image");
+    match image {
+        CursorImage::Surface {
+            hotspot,
+            presentation,
+            frame: Some(SurfaceFrame::Shm(frame)),
+            ..
+        } => {
+            assert_eq!(hotspot, (5, 6));
+            assert_eq!(
+                (presentation.width, presentation.height),
+                (SHM_ORACLE_WIDTH as f32, SHM_ORACLE_HEIGHT as f32)
+            );
+            assert_eq!(presentation.source, None);
+            assert_eq!(presentation.transform, SurfaceTransform::Normal);
+            assert_eq!(frame.rgba.as_slice(), expected_rgba.as_slice());
+        }
+        other => panic!("real SHM cursor reaches the renderer pixel-exact: {other:?}"),
+    }
+
+    send_request(
+        &mut a.socket,
+        FOCUS_POINTER_ID,
+        0,
+        &words(&[enter_serial, CURSOR_SURFACE, 11, 13]),
+    );
+    send_display_request(&mut a.socket, 0, 26);
+    events_until_callback(&mut a.socket, 26);
+    assert!(matches!(
+        flush_cursor_events(&runtime).into_iter().last(),
+        Some(CursorImage::Surface {
+            hotspot: (11, 13),
+            frame: Some(SurfaceFrame::Shm(_)),
+            ..
+        })
+    ));
+
+    cursor_pool
+        .write_at(&[9, 8, 7, 255], SHM_ORACLE_OFFSET as u64)
+        .expect("rewrite one damaged cursor pixel");
+    send_request(
+        &mut a.socket,
+        CURSOR_SURFACE,
+        1,
+        &words(&[CURSOR_BUFFER, 0, 0]),
+    );
+    send_request(&mut a.socket, CURSOR_SURFACE, 9, &words(&[0, 0, 1, 1]));
+    send_request(&mut a.socket, CURSOR_SURFACE, 6, &[]);
+    send_display_request(&mut a.socket, 0, 27);
+    events_until_callback(&mut a.socket, 27);
+    match flush_cursor_events(&runtime).into_iter().last() {
+        Some(CursorImage::Surface {
+            frame: Some(SurfaceFrame::Shm(frame)),
+            ..
+        }) => {
+            assert_eq!(&frame.rgba[..4], &[7, 8, 9, 255]);
+            assert_eq!(
+                &frame.rgba[4..],
+                &expected_rgba[4..],
+                "damage updates only the requested row while persistent backing preserves the rest"
+            );
+        }
+        other => panic!("damaged cursor commit republishes SHM backing: {other:?}"),
+    }
+
+    send_request(&mut a.socket, CURSOR_SURFACE, 7, &words(&[1]));
+    send_request(&mut a.socket, CURSOR_SURFACE, 6, &[]);
+    send_display_request(&mut a.socket, 0, 28);
+    events_until_callback(&mut a.socket, 28);
+    assert!(matches!(
+        flush_cursor_events(&runtime).into_iter().last(),
+        Some(CursorImage::Surface {
+            presentation: CursorPresentation {
+                width: 2.0,
+                height: 3.0,
+                transform: SurfaceTransform::Rotate90,
+                ..
+            },
+            frame: Some(SurfaceFrame::Shm(_)),
+            ..
+        })
+    ));
+
+    route_focus_pointer(&injector, a_only + 1.0, a_only + 1.0);
+    send_display_request(&mut a.socket, 0, 29);
+    let motion = events_until_callback(&mut a.socket, 29);
+    assert!(
+        motion
+            .iter()
+            .all(|(object, opcode, _)| !(*object == CURSOR_FRAME && *opcode == 0)),
+        "pointer motion alone is not an animation frame pulse"
+    );
+    runtime
+        .finish_frame(Vec::new())
+        .expect("submitted output frame pulses client callbacks");
+    wait_for_callback(&mut a.socket, CURSOR_FRAME);
+
+    send_request(&mut a.socket, CURSOR_SURFACE, 1, &words(&[0, 0, 0]));
+    send_request(&mut a.socket, CURSOR_SURFACE, 6, &[]);
+    send_display_request(&mut a.socket, 0, 30);
+    events_until_callback(&mut a.socket, 30);
+    assert!(matches!(
+        flush_cursor_events(&runtime).into_iter().last(),
+        Some(CursorImage::Hidden)
+    ));
+
+    send_request(
+        &mut a.socket,
+        CURSOR_SURFACE,
+        1,
+        &words(&[CURSOR_BUFFER, 0, 0]),
+    );
+    send_request(&mut a.socket, CURSOR_SURFACE, 6, &[]);
+    send_display_request(&mut a.socket, 0, 31);
+    events_until_callback(&mut a.socket, 31);
+    assert!(matches!(
+        flush_cursor_events(&runtime).into_iter().last(),
+        Some(CursorImage::Surface {
+            frame: Some(SurfaceFrame::Shm(_)),
+            ..
+        })
+    ));
+
+    send_request(
+        &mut a.socket,
+        FOCUS_POINTER_ID,
+        0,
+        &words(&[enter_serial, 0, 0, 0]),
+    );
+    send_display_request(&mut a.socket, 0, 32);
+    events_until_callback(&mut a.socket, 32);
+    assert!(matches!(
+        flush_cursor_events(&runtime).into_iter().last(),
+        Some(CursorImage::Hidden)
+    ));
+
+    send_request(
+        &mut a.socket,
+        FOCUS_POINTER_ID,
+        0,
+        &words(&[enter_serial, CURSOR_SURFACE, 11, 13]),
+    );
+    send_display_request(&mut a.socket, 0, 33);
+    events_until_callback(&mut a.socket, 33);
+    assert!(matches!(
+        flush_cursor_events(&runtime).into_iter().last(),
+        Some(CursorImage::Surface { .. })
+    ));
+
+    let b_only_x = f64::from(CASCADE_ORIGIN) + f64::from(FOCUS_WIDTH) + 8.0;
+    let b_only_y = f64::from(CASCADE_ORIGIN + CASCADE_STEP) + 8.0;
+    route_focus_pointer(&injector, b_only_x, b_only_y);
+    send_display_request(&mut a.socket, 0, 34);
+    send_display_request(&mut b.socket, 0, 20);
+    events_until_callback(&mut a.socket, 34);
+    events_until_callback(&mut b.socket, 20);
+    assert!(matches!(
+        flush_cursor_events(&runtime).into_iter().last(),
+        Some(CursorImage::Default)
+    ));
+
+    route_focus_pointer(&injector, a_only, a_only);
+    send_display_request(&mut a.socket, 0, 35);
+    send_display_request(&mut b.socket, 0, 21);
+    let reentered_a = events_until_callback(&mut a.socket, 35);
+    events_until_callback(&mut b.socket, 21);
+    let reenter_serial = focus_messages(&reentered_a)
+        .into_iter()
+        .find_map(|message| match message {
+            FocusWire::PointerEnter { serial, .. } => Some(serial),
+            _ => None,
+        })
+        .expect("returning focus supplies a fresh cursor serial");
+    send_request(
+        &mut a.socket,
+        FOCUS_POINTER_ID,
+        0,
+        &words(&[reenter_serial, CURSOR_SURFACE, 11, 13]),
+    );
+    send_display_request(&mut a.socket, 0, 36);
+    events_until_callback(&mut a.socket, 36);
+    assert!(matches!(
+        flush_cursor_events(&runtime).into_iter().last(),
+        Some(CursorImage::Surface { .. })
+    ));
+
+    send_request(&mut a.socket, CURSOR_SURFACE, 0, &[]);
+    send_display_request(&mut a.socket, 0, 37);
+    events_until_callback(&mut a.socket, 37);
+    assert!(matches!(
+        flush_cursor_events(&runtime).into_iter().last(),
+        Some(CursorImage::Default)
+    ));
+}
+
+/// Click A at a point only A covers, so A takes keyboard focus and is raised.
+///
+/// Returns the resulting traffic rather than discarding it. Callers that go on
+/// to observe A losing focus get the precondition for free — a `KeyboardLeave`
+/// on A can only follow A having had focus. A caller that *cannot* observe A
+/// afterwards, because A's socket is gone, has no such proof and must assert on
+/// what this returns; see
+/// `abruptly_disconnecting_focused_client_hands_pointer_but_not_keyboard_to_client_b`.
+fn click_a_and_drain(
+    injector: &FakeInputInjector,
+    a: &mut FocusClient,
+    b: &mut FocusClient,
+) -> (FocusTraffic, FocusTraffic) {
+    let a_only = f64::from(CASCADE_ORIGIN) + 8.0;
+    route_focus_pointer(injector, a_only, a_only);
+    route_focus_button(injector, ButtonState::Pressed);
+    route_focus_button(injector, ButtonState::Released);
+    round_trip_focus_clients(a, b, 19)
+}
+
+fn toplevel_configure_states(traffic: &[(u32, u16, Vec<u8>)], toplevel: u32) -> Vec<Vec<u32>> {
+    traffic
+        .iter()
+        .filter_map(|(object, opcode, body)| {
+            if *object != toplevel {
+                return None;
+            }
+            if *opcode == 2 {
+                assert_eq!(
+                    body.len(),
+                    8,
+                    "xdg_toplevel.configure_bounds carries width and height"
+                );
+                return None;
+            }
+            if *opcode == 3 {
+                assert!(
+                    body.len() >= 4,
+                    "xdg_toplevel.wm_capabilities carries an array"
+                );
+                let byte_len = word(body, 0) as usize;
+                assert_eq!(byte_len % 4, 0, "wm capability array is word-aligned");
+                assert_eq!(
+                    body.len(),
+                    4 + byte_len,
+                    "wm capability array occupies the complete event body"
+                );
+                return None;
+            }
+            assert_eq!(
+                *opcode, 0,
+                "unexpected xdg_toplevel opcode {opcode}: {body:?}"
+            );
+            assert!(body.len() >= 12, "complete xdg_toplevel.configure body");
+            let byte_len = word(body, 2) as usize;
+            assert_eq!(byte_len % 4, 0, "toplevel state array is word-aligned");
+            assert_eq!(
+                body.len(),
+                12 + byte_len,
+                "toplevel state array occupies the complete configure body"
+            );
+            Some(
+                (0..byte_len / 4)
+                    .map(|index| word(body, 3 + index))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// Positive control for
+/// [`clearing_keyboard_focus_invalidates_a_held_keys_popup_grab_serial`].
+///
+/// That fixture asserts `xdg_popup.popup_done`, which this compositor also sends
+/// for an unknown seat (`handlers.rs:742`) and a missing root (`handlers.rs:748`).
+/// On its own it therefore cannot tell "this serial lost its provenance" from
+/// "no popup grab is ever granted" — and it does not: making `grab` dismiss
+/// unconditionally leaves the whole suite green. This fixture is the other half.
+/// It replays the same live serial down the same path, one step *earlier*, while
+/// focus is still held, and requires the grab to be accepted.
+#[test]
+fn a_live_key_serial_is_accepted_for_a_popup_grab_while_focus_is_held() {
+    const HELD_XKB_KEY: u32 = 24;
+    const HELD_WIRE_KEY: u32 = HELD_XKB_KEY - 8;
+
+    let (injector, _runtime, mut a, mut b) = two_client_focus_runtime("focus-held-popup");
+    click_a_and_drain(&injector, &mut a, &mut b);
+
+    injector.route(InputEvent::Keyboard {
+        event: FakeKeyEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            keycode: Keycode::new(HELD_XKB_KEY),
+            state: KeyState::Pressed,
+        },
+    });
+    let (a_key, b_key) = round_trip_focus_clients(&mut a, &mut b, 20);
+    let a_key_wire = focus_messages(&a_key);
+    assert!(
+        focus_messages(&b_key).is_empty(),
+        "the held key is delivered only to focused client A: {b_key:?}"
+    );
+    let key_serial = match a_key_wire.as_slice() {
+        [
+            FocusWire::KeyboardKey {
+                serial,
+                time,
+                key,
+                state,
+            },
+        ] => {
+            assert_eq!(*time, FAKE_EVENT_TIME_MS);
+            assert_eq!(*key, HELD_WIRE_KEY);
+            assert_eq!(*state, 1, "the replayed serial belongs to a key press");
+            *serial
+        }
+        other => panic!("A receives exactly the held key press used below: {other:?}"),
+    };
+
+    // Same construction as the negative fixture, shifted down by the focus-clear
+    // callback it does not perform: positioner 21, popup surface 22, popup
+    // xdg_surface 23, xdg_popup 24, fence callback 25.
+    send_request(&mut a.socket, 5, 1, &words(&[21])); // xdg_wm_base.create_positioner
+    send_request(&mut a.socket, 21, 1, &words(&[16, 16])); // xdg_positioner.set_size
+    send_request(&mut a.socket, 21, 2, &words(&[0, 0, 16, 16])); // set_anchor_rect
+    send_request(&mut a.socket, 4, 0, &words(&[22])); // wl_compositor.create_surface
+    send_request(&mut a.socket, 5, 2, &words(&[23, 22])); // get_xdg_surface
+    send_request(&mut a.socket, 23, 2, &words(&[24, 8, 21])); // get_popup rooted at A
+    send_request(&mut a.socket, 24, 1, &words(&[15, key_serial])); // xdg_popup.grab
+    send_request(&mut a.socket, 22, 6, &[]); // wl_surface.commit
+    send_display_request(&mut a.socket, 0, 25);
+    let grab_wire = events_until_callback(&mut a.socket, 25);
+    assert!(
+        !grab_wire
+            .iter()
+            .any(|(object, opcode, _)| *object == 24 && *opcode == 1),
+        "a popup grab replaying a live, still-focused key serial is not dismissed\n\
+         key press delivered to A and replayed in xdg_popup.grab: {a_key_wire:?}\n\
+         replayed serial: {key_serial}\n\
+         popup-grab wire: {grab_wire:?}"
+    );
+
+    // The absence of `popup_done` only proves nothing was *dismissed*. A grab
+    // that is accepted and then silently dropped on the floor looks identical
+    // on the wire so far, and an `xdg_popup.configure` would not separate them
+    // either — the empty commit above produces one through the ordinary
+    // initial-configure path whatever `grab` did. What only an installed grab
+    // can produce is the next key event moving focus: `PopupKeyboardGrab::input`
+    // redirects to the popup on the following key, not when the grab is set.
+    //
+    // Round-tripping A alone on purpose. The two clients' id sequences have
+    // diverged: both finished the shared traffic at callback 20, then A alone
+    // consumed 21-26 above, so B's next dense id is still 21. Round-tripping B
+    // at 26 would skip five ids, and the server backend wants client-local ids
+    // allocated densely.
+    injector.route(InputEvent::Keyboard {
+        event: FakeKeyEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            keycode: Keycode::new(HELD_XKB_KEY + 1),
+            state: KeyState::Pressed,
+        },
+    });
+    send_display_request(&mut a.socket, 0, 26);
+    let grabbed = events_until_callback(&mut a.socket, 26);
+    let grabbed_wire = focus_messages(&grabbed);
+    assert!(
+        grabbed_wire.iter().any(|message| matches!(
+            message,
+            FocusWire::KeyboardLeave { surface, .. } if *surface == FOCUS_SURFACE_ID
+        )),
+        "the installed popup grab takes keyboard focus off the root surface\n\
+         popup-grab wire: {grab_wire:?}\n\
+         wire after the next key: {grabbed_wire:?}"
+    );
+    assert!(
+        grabbed_wire.iter().any(|message| matches!(
+            message,
+            FocusWire::KeyboardEnter { surface, .. } if *surface == 22
+        )),
+        "the installed popup grab gives keyboard focus to the popup surface\n\
+         popup-grab wire: {grab_wire:?}\n\
+         wire after the next key: {grabbed_wire:?}"
+    );
+}
+
+#[test]
+fn clearing_keyboard_focus_invalidates_a_held_keys_popup_grab_serial() {
+    const HELD_XKB_KEY: u32 = 24;
+    const HELD_WIRE_KEY: u32 = HELD_XKB_KEY - 8;
+
+    let (injector, _runtime, mut a, mut b) = two_client_focus_runtime("focus-clear-popup");
+    click_a_and_drain(&injector, &mut a, &mut b);
+
+    // Keep this key held. A release clears `last_keyboard_action` independently
+    // and would make the focus-clear path irrelevant to the result below.
+    injector.route(InputEvent::Keyboard {
+        event: FakeKeyEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            keycode: Keycode::new(HELD_XKB_KEY),
+            state: KeyState::Pressed,
+        },
+    });
+    let (a_key, b_key) = round_trip_focus_clients(&mut a, &mut b, 20);
+    let a_key_wire = focus_messages(&a_key);
+    assert!(
+        focus_messages(&b_key).is_empty(),
+        "the held key is delivered only to focused client A: {b_key:?}"
+    );
+    let key_serial = match a_key_wire.as_slice() {
+        [
+            FocusWire::KeyboardKey {
+                serial,
+                time,
+                key,
+                state,
+            },
+        ] => {
+            assert_eq!(*time, FAKE_EVENT_TIME_MS);
+            assert_eq!(*key, HELD_WIRE_KEY);
+            assert_eq!(*state, 1, "the replayed serial belongs to a key press");
+            *serial
+        }
+        other => panic!("A receives exactly the held key press used below: {other:?}"),
+    };
+
+    // Both mapped surfaces end well before the bottom-right output pixel.
+    // Moving there drops pointer focus; pressing there sets keyboard focus to
+    // None through the ordinary hit-test path.
+    route_focus_pointer(&injector, 319.0, 239.0);
+    route_focus_button(&injector, ButtonState::Pressed);
+    route_focus_button(&injector, ButtonState::Released);
+    let (a_clear, b_clear) = round_trip_focus_clients(&mut a, &mut b, 21);
+    let a_clear_wire = focus_messages(&a_clear);
+    let b_clear_wire = focus_messages(&b_clear);
+    let keyboard_leaves = a_clear_wire
+        .iter()
+        .filter_map(|message| match message {
+            FocusWire::KeyboardLeave { serial, surface } => Some((*serial, *surface)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keyboard_leaves.len(),
+        1,
+        "A receives exactly one keyboard leave when empty space clears focus: {a_clear_wire:?}"
+    );
+    assert_eq!(
+        keyboard_leaves[0].1, FOCUS_SURFACE_ID,
+        "the cleared keyboard focus belonged to A: {a_clear_wire:?}"
+    );
+    assert!(
+        b_clear_wire.is_empty(),
+        "empty space clears focus to None instead of transferring any input focus to B: {b_clear_wire:?}"
+    );
+
+    // Continue densely after callback 21: positioner 22, popup surface 23,
+    // popup xdg_surface 24, xdg_popup 25, and the fence callback 26.
+    send_request(&mut a.socket, 5, 1, &words(&[22])); // xdg_wm_base.create_positioner
+    send_request(&mut a.socket, 22, 1, &words(&[16, 16])); // xdg_positioner.set_size
+    send_request(&mut a.socket, 22, 2, &words(&[0, 0, 16, 16])); // set_anchor_rect
+    send_request(&mut a.socket, 4, 0, &words(&[23])); // wl_compositor.create_surface
+    send_request(&mut a.socket, 5, 2, &words(&[24, 23])); // get_xdg_surface
+    send_request(&mut a.socket, 24, 2, &words(&[25, 8, 22])); // get_popup rooted at A
+    send_request(&mut a.socket, 25, 1, &words(&[15, key_serial])); // xdg_popup.grab
+    send_display_request(&mut a.socket, 0, 26);
+    let grab_wire = events_until_callback(&mut a.socket, 26);
+    assert!(
+        grab_wire
+            .iter()
+            .any(|(object, opcode, _)| *object == 25 && *opcode == 1),
+        "a held key serial loses popup-grab provenance when its keyboard focus is cleared\n\
+         key press delivered to A and replayed in xdg_popup.grab: {a_key_wire:?}\n\
+         focus-clear wire from A: {a_clear_wire:?}\n\
+         focus-clear wire from B: {b_clear_wire:?}\n\
+         replayed serial: {key_serial}\n\
+         popup-grab wire: {grab_wire:?}"
+    );
+}
+
+#[test]
+fn clearing_keyboard_focus_on_unmap_drops_activation_from_the_next_initial_configure() {
+    let (injector, _runtime, mut a, mut b) = two_client_focus_runtime("focus-clear-activation");
+
+    let a_only = f64::from(CASCADE_ORIGIN) + 8.0;
+    route_focus_pointer(&injector, a_only, a_only);
+    route_focus_button(&injector, ButtonState::Pressed);
+    route_focus_button(&injector, ButtonState::Released);
+    let (focused_wire, _) = round_trip_focus_clients(&mut a, &mut b, 19);
+    let focused_states = toplevel_configure_states(&focused_wire, FOCUS_TOPLEVEL_ID);
+    assert_eq!(
+        focused_states.len(),
+        1,
+        "focusing A produces exactly one xdg_toplevel.configure: {focused_wire:?}"
+    );
+    let activated = xdg_toplevel::State::Activated as u32;
+    assert!(
+        focused_states[0].contains(&activated),
+        "A is confirmed Activated on the wire before it is unmapped: {focused_states:?}"
+    );
+
+    // A null-buffer commit unmaps A and clears its keyboard focus. There is no
+    // immediate deactivation-configure oracle here: unmap resets the configure
+    // sequence before the visibility/focus pass, closing the ordinary gate.
+    send_request(&mut a.socket, FOCUS_SURFACE_ID, 1, &words(&[0, 0, 0]));
+    send_request(&mut a.socket, FOCUS_SURFACE_ID, 6, &[]);
+    send_display_request(&mut a.socket, 0, 20);
+    let unmapped_wire = events_until_callback(&mut a.socket, 20);
+    let unmapped_focus = focus_messages(&unmapped_wire);
+    assert!(
+        unmapped_focus.iter().any(|message| matches!(
+            message,
+            FocusWire::KeyboardLeave {
+                surface: FOCUS_SURFACE_ID,
+                ..
+            }
+        )),
+        "unmapping A clears its keyboard focus on the wire: {unmapped_focus:?}"
+    );
+
+    // As with a brand-new xdg_surface, remap starts with an empty commit. The
+    // configure it produces is the next initial configure named by the oracle.
+    send_request(&mut a.socket, FOCUS_SURFACE_ID, 6, &[]);
+    send_display_request(&mut a.socket, 0, 21);
+    let remap_configure_wire = events_until_callback(&mut a.socket, 21);
+    let remap_states = toplevel_configure_states(&remap_configure_wire, FOCUS_TOPLEVEL_ID);
+    assert_eq!(
+        remap_states.len(),
+        1,
+        "remapping A produces exactly one next-initial xdg_toplevel.configure: {remap_configure_wire:?}"
+    );
+    let remap_serial = remap_configure_wire
+        .iter()
+        .find_map(|(object, opcode, body)| (*object == 8 && *opcode == 0).then(|| word(body, 0)))
+        .expect("xdg_surface.configure follows the next initial toplevel configure");
+
+    // Complete the remap after acknowledging that fresh sequence. Attaching
+    // before this handshake is a fatal xdg_surface.not_constructed error and
+    // would make the fixture red for the wrong reason.
+    send_request(&mut a.socket, 8, 4, &words(&[remap_serial]));
+    send_request(&mut a.socket, FOCUS_SURFACE_ID, 1, &words(&[12, 0, 0]));
+    send_request(&mut a.socket, FOCUS_SURFACE_ID, 6, &[]);
+    send_display_request(&mut a.socket, 0, 22);
+    let remapped_wire = events_until_callback(&mut a.socket, 22);
+    assert!(
+        remapped_wire
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "A accepts a real buffer after acknowledging the next initial configure: {remapped_wire:?}"
+    );
+    assert!(
+        !remap_states[0].contains(&activated),
+        "the next initial configure after focus-clearing unmap must omit Activated\n\
+         focused configure states: {focused_states:?}\n\
+         unmap focus wire: {unmapped_focus:?}\n\
+         remap initial configure states: {remap_states:?}\n\
+         remap initial configure wire: {remap_configure_wire:?}\n\
+         completed remap wire: {remapped_wire:?}"
+    );
+}
+
+#[test]
+fn pointer_move_and_click_hand_focus_between_two_clients() {
+    let (injector, _runtime, mut a, mut b) = two_client_focus_runtime("pointer-click");
+    click_a_and_drain(&injector, &mut a, &mut b);
+
+    // A is now raised over the overlap. Aim beyond A's right edge but inside B,
+    // so the real hit test — not a hand-written visibility override — selects B.
+    let b_origin = f64::from(CASCADE_ORIGIN + CASCADE_STEP);
+    let b_x = f64::from(CASCADE_ORIGIN) + f64::from(FOCUS_WIDTH) + 8.0;
+    let b_y = b_origin + 8.0;
+    route_focus_pointer(&injector, b_x, b_y);
+    let (a_move, b_move) = round_trip_focus_clients(&mut a, &mut b, 20);
+
+    let a_move = focus_messages(&a_move);
+    let b_move = focus_messages(&b_move);
+    let pointer_serial = match a_move.as_slice() {
+        [
+            FocusWire::PointerLeave { serial, surface },
+            FocusWire::PointerFrame,
+        ] => {
+            assert_eq!(*surface, FOCUS_SURFACE_ID, "pointer leaves A's surface");
+            *serial
+        }
+        other => panic!("A gets pointer leave plus frame, and no keyboard traffic: {other:?}"),
+    };
+    assert_eq!(
+        b_move,
+        vec![
+            FocusWire::PointerEnter {
+                serial: pointer_serial,
+                surface: FOCUS_SURFACE_ID,
+                x: b_x - b_origin,
+                y: b_y - b_origin,
+            },
+            FocusWire::PointerFrame,
+        ],
+        "B gets the matching pointer enter plus frame, with no keyboard traffic"
+    );
+
+    route_focus_button(&injector, ButtonState::Pressed);
+    let (a_click, b_click) = round_trip_focus_clients(&mut a, &mut b, 21);
+    let a_click = focus_messages(&a_click);
+    let b_click = focus_messages(&b_click);
+    let keyboard_serial = match a_click.as_slice() {
+        [FocusWire::KeyboardLeave { serial, surface }] => {
+            assert_eq!(*surface, FOCUS_SURFACE_ID, "keyboard leaves A's surface");
+            *serial
+        }
+        other => panic!("A gets exactly the keyboard leave from the click: {other:?}"),
+    };
+    match b_click.as_slice() {
+        [
+            FocusWire::KeyboardEnter {
+                serial: enter_serial,
+                surface,
+                pressed_keys,
+            },
+            FocusWire::KeyboardModifiers {
+                serial: modifiers_serial,
+                depressed,
+                latched,
+                locked,
+                group,
+            },
+            FocusWire::PointerButton {
+                serial: _,
+                time,
+                button,
+                state,
+            },
+            FocusWire::PointerFrame,
+        ] => {
+            assert_eq!(*enter_serial, keyboard_serial);
+            assert_eq!(*modifiers_serial, keyboard_serial);
+            assert_eq!(*surface, FOCUS_SURFACE_ID, "keyboard enters B's surface");
+            assert!(pressed_keys.is_empty(), "no keys are held during hand-off");
+            assert_eq!((*depressed, *latched, *locked, *group), (0, 0, 0, 0));
+            assert_eq!(*time, FAKE_EVENT_TIME_MS);
+            assert_eq!(*button, 0x110);
+            assert_eq!(*state, 1, "the delivered button is the press");
+        }
+        other => panic!(
+            "B gets keyboard enter/modifiers before pointer button/frame on its socket: {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn first_touch_moves_focus_from_a_to_b_and_only_that_contact_raises() {
+    const FOCUS_TOUCH_ID: u32 = 22;
+    const FIRST_DOWN_MS: u32 = 300;
+    const SECOND_DOWN_MS: u32 = 310;
+
+    let (injector, runtime, mut a, mut b) = two_client_focus_runtime("first-touch-focus");
+
+    // Keep both clients' dense, client-local id ledgers in lock-step throughout:
+    // click callback 19, geometry callback 20, capability callback 21, touch 22,
+    // bind callback 23, renderer-stream settle callbacks 24, 25 and 26, first
+    // contact 27, raise probe 28, second contact 29, reorder probe 30.
+    let (a_click_traffic, b_click_traffic) = click_a_and_drain(&injector, &mut a, &mut b);
+    let keyboard_transitions = |messages: &[FocusWire]| {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                FocusWire::KeyboardEnter { surface, .. } => Some(("enter", *surface)),
+                FocusWire::KeyboardLeave { surface, .. } => Some(("leave", *surface)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let a_click = focus_messages(&a_click_traffic);
+    let b_click = focus_messages(&b_click_traffic);
+    assert_eq!(
+        keyboard_transitions(&a_click),
+        vec![("enter", FOCUS_SURFACE_ID)],
+        "the preparatory click gives A keyboard focus exactly once: {a_click:?}"
+    );
+    assert_eq!(
+        keyboard_transitions(&b_click),
+        Vec::<(&str, u32)>::new(),
+        "the preparatory click gives B no keyboard focus: {b_click:?}"
+    );
+    // Every serial in the preparatory click is out of scope, not merely the
+    // enter one: the click's keyboard enter and modifiers serials, and its
+    // pointer enter and button serials, all have no partner on B's socket to
+    // cross-check against, and none of them carries into the touch claim. The
+    // reduction above drops them rather than assert a value back against the
+    // wire it came from.
+
+    let a_origin = f64::from(CASCADE_ORIGIN);
+    let b_origin = f64::from(CASCADE_ORIGIN + CASCADE_STEP);
+    let (a_only_x, a_only_y) = (a_origin + 8.0, a_origin + 9.0);
+    let (b_only_x, b_only_y) = (a_origin + f64::from(FOCUS_WIDTH) + 8.0, b_origin + 8.0);
+    let (overlap_x, overlap_y) = (b_origin + 8.0, b_origin + 9.0);
+
+    // Three real pointer hit tests pin the geometry before touch is involved:
+    // A-only stays on A, B-only crosses to B, and overlap crosses back to A.
+    // The last transition establishes the precondition the touch probes need —
+    // A is above B at the overlap *now* — without which a later z-order change
+    // could not be attributed to the first contact. It does not prove the
+    // preparatory click is what put A there; that would need a fourth probe at
+    // the overlap taken before the click, and nothing downstream needs it.
+    route_focus_pointer(&injector, a_only_x, a_only_y);
+    route_focus_pointer(&injector, b_only_x, b_only_y);
+    route_focus_pointer(&injector, overlap_x, overlap_y);
+    let (a_geometry_traffic, b_geometry_traffic) = round_trip_focus_clients(&mut a, &mut b, 20);
+    let a_geometry = focus_messages(&a_geometry_traffic);
+    let b_geometry = focus_messages(&b_geometry_traffic);
+    let (a_to_b_serial, b_to_a_serial) = match a_geometry.as_slice() {
+        [
+            FocusWire::PointerMotion { time, x, y },
+            FocusWire::PointerFrame,
+            FocusWire::PointerLeave {
+                serial: first,
+                surface,
+            },
+            FocusWire::PointerFrame,
+            FocusWire::PointerEnter {
+                serial: second,
+                surface: entered_surface,
+                x: entered_x,
+                y: entered_y,
+            },
+            FocusWire::PointerFrame,
+        ] => {
+            assert_eq!(*time, FAKE_EVENT_TIME_MS);
+            assert_eq!((*x, *y), (a_only_x - a_origin, a_only_y - a_origin));
+            assert_eq!(*surface, FOCUS_SURFACE_ID);
+            assert_eq!(*entered_surface, FOCUS_SURFACE_ID);
+            assert_eq!(
+                (*entered_x, *entered_y),
+                (overlap_x - a_origin, overlap_y - a_origin)
+            );
+            (*first, *second)
+        }
+        other => panic!(
+            "A sees its A-only motion, leaves at B-only, then re-enters at overlap: {other:?}"
+        ),
+    };
+    match b_geometry.as_slice() {
+        [
+            FocusWire::PointerEnter {
+                serial: first,
+                surface,
+                x,
+                y,
+            },
+            FocusWire::PointerFrame,
+            FocusWire::PointerLeave {
+                serial: second,
+                surface: left_surface,
+            },
+            FocusWire::PointerFrame,
+        ] => {
+            assert_eq!(*first, a_to_b_serial);
+            assert_eq!(*second, b_to_a_serial);
+            assert_eq!(*surface, FOCUS_SURFACE_ID);
+            assert_eq!(*left_surface, FOCUS_SURFACE_ID);
+            assert_eq!((*x, *y), (b_only_x - b_origin, b_only_y - b_origin));
+        }
+        other => panic!(
+            "B is entered only at B-only and left again when raised A wins overlap: {other:?}"
+        ),
+    }
+    // Matching serials genuinely cross-check the paired hand-offs across the
+    // two sockets. There is no meaningful total wire order between A and B's
+    // separate sockets, and none is claimed here.
+
+    injector.route(InputEvent::DeviceAdded {
+        device: FakeDevice::Touchscreen,
+    });
+    let (a_capability, b_capability) = round_trip_focus_clients(&mut a, &mut b, 21);
+    assert_eq!(
+        seat_capabilities(&a_capability, 15),
+        vec![SEAT_CAPS_WITH_TOUCH],
+        "A sees the absent-to-present touch capability transition"
+    );
+    assert_eq!(
+        seat_capabilities(&b_capability, 15),
+        vec![SEAT_CAPS_WITH_TOUCH],
+        "B sees the absent-to-present touch capability transition"
+    );
+
+    // Bind only after capability 7 is observed. Smithay initialises an
+    // early-bound wl_touch against the old TouchHandle permanently inert and
+    // silent, which would make A's expected silence look like correct routing.
+    send_request(&mut a.socket, 15, 2, &words(&[FOCUS_TOUCH_ID])); // wl_seat.get_touch
+    send_request(&mut b.socket, 15, 2, &words(&[FOCUS_TOUCH_ID])); // wl_seat.get_touch
+    let (a_touch_ready, b_touch_ready) = round_trip_focus_clients(&mut a, &mut b, 23);
+    for (client, ready) in [("A", &a_touch_ready), ("B", &b_touch_ready)] {
+        assert!(
+            ready
+                .iter()
+                .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+            "{client}'s post-capability wl_touch bind is accepted: {ready:?}"
+        );
+    }
+
+    // The pointer probes observe raising only indirectly, and only as a *net*
+    // result: raising emits no wl_ traffic of any kind, so a contact that raised
+    // A and then re-raised B before returning would leave every client-visible
+    // signal identical. Raising's actual output is the renderer event stream, so
+    // that is read directly as well, and the two readings are what make the
+    // claim about *which* contact raised B hold rather than merely where the
+    // stack ended up.
+    //
+    // The outbox coalesces at most one event per surface per dispatch cycle, so
+    // the stream is cleared here and then read once per contact. Everything
+    // queued by client mapping and by the preparatory click belongs to neither
+    // window and is discarded.
+    let relayout_origins = |events: &[ProtocolEvent]| {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ProtocolEvent::SurfaceRelayout { scene, .. } => Some(scene.layout.x),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    // The renderer channel is bounded and nothing has drained it, so by now it
+    // is full and each further batch has been merged back into the outbox,
+    // where it coalesces to one event per surface. Draining once only frees the
+    // channel: the merged backlog — which still holds the preparatory click's
+    // raise of A — is republished a cycle later, and arriving inside the first
+    // contact's window it would read there as that contact raising A. So drain,
+    // run cycles, and require the last drain to come back empty.
+    //
+    // Three cycles, and the count is a proof rather than a sample. A round trip
+    // returns when its `wl_display.sync` callback is *flushed*, which
+    // `dispatch_cycle` does before it publishes — so a drain taken right after
+    // one may run either side of its own cycle's publication, and a drain is
+    // never evidence about the cycle it directly follows. What it *is* evidence
+    // about is every earlier cycle: the protocol thread is single-threaded, so
+    // cycle k+1 cannot begin before cycle k has published. The backlog is
+    // therefore published no later than the first settle cycle; the second
+    // settle drain, which follows the second cycle's flush and so strictly
+    // follows the first cycle's publication, is guaranteed to take it; and the
+    // third drain is guaranteed to find nothing. Two cycles would leave the
+    // backlog landing in either the first or the second drain depending on
+    // scheduling, and asserting the second empty would be a race that merely
+    // happens to win.
+    //
+    // The same reasoning is what makes the two measurement windows below sound:
+    // each contact is routed a full round trip before the drain that reads it,
+    // so its cycle has provably published by then.
+    runtime
+        .drain_events()
+        .expect("the protocol thread is live before the first contact");
+    let mut settled = Vec::new();
+    for callback in [24, 25, 26] {
+        round_trip_focus_clients(&mut a, &mut b, callback);
+        settled = runtime
+            .drain_events()
+            .expect("the protocol thread is live before the first contact");
+    }
+    assert!(
+        settled.is_empty(),
+        "the renderer stream is quiescent before the first contact, or the \
+         windows below are not the contacts' own: {settled:?}"
+    );
+
+    let down = |slot: TouchSlot, x: f64, y: f64, time_ms: u32| InputEvent::TouchDown {
+        event: FakeTouchPositionEvent {
+            slot,
+            normalised_x: x / 320.0,
+            normalised_y: y / 240.0,
+            time_us: u64::from(time_ms) * 1_000,
+        },
+    };
+    let frame = || InputEvent::TouchFrame {
+        event: FakeTouchFrameEvent,
+    };
+
+    // The first contact lands on B-only, so it must transfer keyboard focus
+    // from A to B, install the touch grab and raise B.
+    injector.route(down(
+        TouchSlot::from(None),
+        b_only_x,
+        b_only_y,
+        FIRST_DOWN_MS,
+    ));
+    injector.route(frame());
+    let (a_first_traffic, b_first_traffic) = round_trip_focus_clients(&mut a, &mut b, 27);
+    assert_eq!(
+        touch_messages(&a_first_traffic, FOCUS_TOUCH_ID),
+        vec![],
+        "a B-only first contact sends no touch traffic to bound client A"
+    );
+    assert_eq!(
+        touch_messages(&b_first_traffic, FOCUS_TOUCH_ID),
+        vec![
+            TouchWire::Down {
+                surface: FOCUS_SURFACE_ID,
+                id: -1,
+                x: b_only_x - b_origin,
+                y: b_only_y - b_origin,
+                time: FIRST_DOWN_MS,
+            },
+            TouchWire::Frame,
+        ],
+        "the first contact reaches B with B-local coordinates"
+    );
+    let a_first_focus = focus_messages(&a_first_traffic);
+    let b_first_focus = focus_messages(&b_first_traffic);
+    let focus_serial = match a_first_focus.as_slice() {
+        [FocusWire::KeyboardLeave { serial, surface }] => {
+            assert_eq!(*surface, FOCUS_SURFACE_ID);
+            *serial
+        }
+        other => panic!("the first contact gives A exactly one keyboard leave: {other:?}"),
+    };
+    match b_first_focus.as_slice() {
+        [
+            FocusWire::KeyboardEnter {
+                serial: enter_serial,
+                surface,
+                pressed_keys,
+            },
+            FocusWire::KeyboardModifiers {
+                serial: modifiers_serial,
+                depressed,
+                latched,
+                locked,
+                group,
+            },
+        ] => {
+            assert_eq!(*enter_serial, focus_serial);
+            assert_eq!(*modifiers_serial, focus_serial);
+            assert_eq!(*surface, FOCUS_SURFACE_ID);
+            assert!(pressed_keys.is_empty());
+            assert_eq!((*depressed, *latched, *locked, *group), (0, 0, 0, 0));
+        }
+        other => {
+            panic!("the first contact gives B exactly keyboard enter and modifiers: {other:?}")
+        }
+    }
+    // A's leave serial and B's enter/modifiers serial are a cross-socket
+    // equality. No ordering between the two sockets is inferred from it.
+
+    // Within B's own connection order *is* guaranteed, and it is part of the
+    // policy rather than incidental: the focus change is applied before the
+    // contact is delivered, so a client is never touched on a surface it has
+    // not yet been told it holds. Decoding keyboard and touch into separate
+    // streams above throws this away, so it is asserted against the raw wire.
+    let b_first_index = |object: u32, opcode: u16| {
+        b_first_traffic
+            .iter()
+            .position(|(actual, actual_opcode, _)| *actual == object && *actual_opcode == opcode)
+            .unwrap_or_else(|| {
+                panic!("B's wire carries object {object} opcode {opcode}: {b_first_traffic:?}")
+            })
+    };
+    // All four, not just enter-before-down: `set_focus` emits enter *and*
+    // modifiers, so a run of enter, down, modifiers, frame would leave the focus
+    // change only half applied when the contact lands and still satisfy the
+    // weaker pair.
+    let b_first_order = [
+        ("keyboard enter", b_first_index(FOCUS_KEYBOARD_ID, 1)),
+        ("keyboard modifiers", b_first_index(FOCUS_KEYBOARD_ID, 4)),
+        ("touch down", b_first_index(FOCUS_TOUCH_ID, 0)),
+        ("touch frame", b_first_index(FOCUS_TOUCH_ID, 3)),
+    ];
+    for pair in b_first_order.windows(2) {
+        assert!(
+            pair[0].1 < pair[1].1,
+            "B sees {} before {}: {b_first_traffic:?}",
+            pair[0].0,
+            pair[1].0
+        );
+    }
+
+    // Raising is observed indirectly: move the pointer within the overlap and
+    // make the real hit test choose the top surface. This is not a direct
+    // z-order read. It is taken **here**, between the two contacts, so that the
+    // change it sees can only be attributed to the first contact — the second
+    // has not happened yet. Geometry above proved A was above B at the overlap,
+    // so B winning it now is the first contact's raise and nothing else.
+    let (raise_probe_x, raise_probe_y) = (b_origin + 9.0, b_origin + 10.0);
+    route_focus_pointer(&injector, raise_probe_x, raise_probe_y);
+    let (a_raise_traffic, b_raise_traffic) = round_trip_focus_clients(&mut a, &mut b, 28);
+    let a_raise = focus_messages(&a_raise_traffic);
+    let b_raise = focus_messages(&b_raise_traffic);
+    let raise_serial = match a_raise.as_slice() {
+        [
+            FocusWire::PointerLeave { serial, surface },
+            FocusWire::PointerFrame,
+        ] => {
+            assert_eq!(*surface, FOCUS_SURFACE_ID);
+            *serial
+        }
+        other => {
+            panic!("the overlap re-hit-test leaves A after the first contact raised B: {other:?}")
+        }
+    };
+    assert_eq!(
+        b_raise,
+        vec![
+            FocusWire::PointerEnter {
+                serial: raise_serial,
+                surface: FOCUS_SURFACE_ID,
+                x: raise_probe_x - b_origin,
+                y: raise_probe_y - b_origin,
+            },
+            FocusWire::PointerFrame,
+        ],
+        "B wins the overlap once the first contact has raised it"
+    );
+    let first_contact_events = runtime
+        .drain_events()
+        .expect("the protocol thread is live after the first contact");
+    assert_eq!(
+        relayout_origins(&first_contact_events),
+        vec![CASCADE_ORIGIN + CASCADE_STEP],
+        "the first contact relayouts B and nothing else — one raise, and A is \
+         not touched: {first_contact_events:?}"
+    );
+
+    // A later contact physically lands on A-only, but the first contact's grab
+    // keeps delivery on B and must suppress both keyboard policy and raising.
+    // Both contacts are on toplevel roots, so this does not cover
+    // `root_compositor_surface` normalisation.
+    injector.route(down(
+        TouchSlot::from(Some(7)),
+        a_only_x,
+        a_only_y,
+        SECOND_DOWN_MS,
+    ));
+    injector.route(frame());
+    let (a_second_traffic, b_second_traffic) = round_trip_focus_clients(&mut a, &mut b, 29);
+    assert_eq!(
+        touch_messages(&a_second_traffic, FOCUS_TOUCH_ID),
+        vec![],
+        "the grabbed A-only contact sends no touch traffic to bound client A"
+    );
+    assert_eq!(
+        touch_messages(&b_second_traffic, FOCUS_TOUCH_ID),
+        vec![
+            TouchWire::Down {
+                surface: FOCUS_SURFACE_ID,
+                id: 7,
+                x: a_only_x - b_origin,
+                y: a_only_y - b_origin,
+                time: SECOND_DOWN_MS,
+            },
+            TouchWire::Frame,
+        ],
+        "the grab keeps the A-only contact on B, including its negative B-local coordinates"
+    );
+    let a_second_focus = focus_messages(&a_second_traffic);
+    let b_second_focus = focus_messages(&b_second_traffic);
+    assert_eq!(
+        keyboard_transitions(&a_second_focus),
+        Vec::<(&str, u32)>::new(),
+        "the later contact does not re-enter keyboard focus on A: {a_second_focus:?}"
+    );
+    assert_eq!(
+        keyboard_transitions(&b_second_focus),
+        Vec::<(&str, u32)>::new(),
+        "the later contact does not remove keyboard focus from B: {b_second_focus:?}"
+    );
+
+    // The same indirect observation again, now after the second contact. B held
+    // the overlap going in, so a *net* re-raise of A would show as a leave on B
+    // and an enter on A. Staying on B is a plain motion, and A stays silent.
+    //
+    // The two probes together are what separate "the first contact raised B"
+    // from "B ended up on top": a single probe at the end cannot tell which
+    // contact did it, and an implementation that raised only on later contacts
+    // would satisfy that weaker reading while failing the earlier probe.
+    let (reorder_probe_x, reorder_probe_y) = (b_origin + 10.0, b_origin + 11.0);
+    route_focus_pointer(&injector, reorder_probe_x, reorder_probe_y);
+    let (a_reorder_traffic, b_reorder_traffic) = round_trip_focus_clients(&mut a, &mut b, 30);
+    let a_reorder = focus_messages(&a_reorder_traffic);
+    assert_eq!(
+        a_reorder,
+        Vec::<FocusWire>::new(),
+        "the grabbed A-only contact never brings the overlap back to A: {a_reorder:?}"
+    );
+    assert_eq!(
+        focus_messages(&b_reorder_traffic),
+        vec![
+            FocusWire::PointerMotion {
+                time: FAKE_EVENT_TIME_MS,
+                x: reorder_probe_x - b_origin,
+                y: reorder_probe_y - b_origin,
+            },
+            FocusWire::PointerFrame,
+        ],
+        "B keeps the overlap across the second contact, as motion rather than a re-enter"
+    );
+    // And the direct reading for the second window. The pointer probe above can
+    // only see the net stack, so on its own it admits a contact that raised A
+    // and put B back before returning; the renderer stream cannot be put back,
+    // because the spurious relayout has already been queued by then.
+    let second_contact_events = runtime
+        .drain_events()
+        .expect("the protocol thread is live after the second contact");
+    assert_eq!(
+        relayout_origins(&second_contact_events),
+        Vec::<f32>::new(),
+        "the grabbed later contact relayouts nothing at all — not A, not even \
+         transiently, and not B again: {second_contact_events:?}"
+    );
+}
+
+/// Destroying a `wl_surface` must not hand pointer focus to a descendant that
+/// is about to be hidden for having lost its parent.
+///
+/// `destroy_surface_record` removes the destroyed record, which stops
+/// `surface_at` selecting *that* surface — and does nothing for its surviving
+/// descendants. `remove_subsurface_topology` clears the `subsurface_topology`
+/// links but never touches `record.layout.parent` or `record.layout.visible`,
+/// so an orphan stays stale-visible until `recompute_effective_visibility`
+/// notices its parent is gone from `surface_objects`. `surface_at` gates on
+/// `layout.visible` alone, so a re-hit-test run before that pass selects the
+/// orphan and enters it, and the pass then hides it and leaves it again.
+///
+/// Three levels are the minimum that can show this. The *middle* surface is the
+/// one destroyed: a toplevel's `wl_surface` cannot be destroyed while it still
+/// holds its xdg role, and destroying the role first hides the whole subtree
+/// through the very pass whose absence is the defect — which would leave
+/// nothing stale to find.
+#[test]
+fn destroying_a_surface_does_not_enter_its_orphaned_descendant() {
+    const ORPHAN_WIDTH: u32 = 160;
+    const ORPHAN_HEIGHT: u32 = 120;
+    const ORPHAN_STRIDE: u32 = ORPHAN_WIDTH * 4;
+    const ORPHAN_BYTES: u32 = ORPHAN_STRIDE * ORPHAN_HEIGHT;
+    const ORPHAN_POINTER_ID: u32 = 25;
+    // The three surfaces, in the client's id space.
+    const TOPLEVEL: u32 = 9;
+    const CHILD: u32 = 15;
+    const GRANDCHILD: u32 = 18;
+
+    let runtime_dir =
+        env::var_os("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR is required for the orphan oracle");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-orphan-{}-{unique}", std::process::id());
+    let (injector, input_source) = fake_input_source();
+    let runtime = WaylandRuntime::with_input_source(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        WaylandGpuWiring {
+            dmabuf_capabilities: Some(DmabufCapabilities {
+                main_device: 0,
+                formats: Vec::new(),
+                adapter_name: "orphan-test".into(),
+                drm_adapter: synthetic_drm_adapter("orphan-test"),
+            }),
+            dmabuf_validator: None,
+            retirement_adapter: test_retirement_adapter(),
+        },
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+        Some(input_source),
+        None,
+    )
+    .expect("protocol thread starts for the orphan oracle");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+    let _pool =
+        bring_up_shm_toplevel_with_subcompositor(&mut client, ORPHAN_BYTES * 3, "cosmix-orphan");
+
+    // All three cover exactly the same rectangle, so one injected point is
+    // inside all of them and the z order alone decides who holds focus.
+    send_request(
+        &mut client,
+        13,
+        0,
+        &words(&[
+            14,
+            0,
+            ORPHAN_WIDTH,
+            ORPHAN_HEIGHT,
+            ORPHAN_STRIDE,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    ); // wl_shm_pool.create_buffer, the toplevel's
+    send_request(&mut client, TOPLEVEL, 1, &words(&[14, 0, 0])); // wl_surface.attach
+    send_request(&mut client, TOPLEVEL, 6, &[]); // commit: the toplevel maps
+
+    send_request(&mut client, 4, 0, &words(&[CHILD])); // wl_compositor.create_surface
+    send_request(&mut client, 7, 1, &words(&[16, CHILD, TOPLEVEL])); // get_subsurface
+    send_request(
+        &mut client,
+        13,
+        0,
+        &words(&[
+            17,
+            ORPHAN_BYTES,
+            ORPHAN_WIDTH,
+            ORPHAN_HEIGHT,
+            ORPHAN_STRIDE,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    ); // wl_shm_pool.create_buffer, the child's
+    send_request(&mut client, CHILD, 1, &words(&[17, 0, 0])); // child wl_surface.attach
+    send_request(&mut client, CHILD, 6, &[]); // commit the child
+
+    send_request(&mut client, 4, 0, &words(&[GRANDCHILD])); // wl_compositor.create_surface
+    send_request(&mut client, 7, 1, &words(&[19, GRANDCHILD, CHILD])); // get_subsurface
+    // Below its parent, so the *child* holds pointer focus before the destroy.
+    // A new subsurface is placed above its parent by default, which would put
+    // the grandchild on top and mean the destroy below never entered the code
+    // path this fixture exists to cover.
+    send_request(&mut client, 19, 3, &words(&[CHILD])); // wl_subsurface.place_below
+    send_request(
+        &mut client,
+        13,
+        0,
+        &words(&[
+            20,
+            ORPHAN_BYTES * 2,
+            ORPHAN_WIDTH,
+            ORPHAN_HEIGHT,
+            ORPHAN_STRIDE,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    ); // wl_shm_pool.create_buffer, the grandchild's
+    send_request(&mut client, GRANDCHILD, 1, &words(&[20, 0, 0])); // attach
+    send_request(&mut client, GRANDCHILD, 6, &[]); // commit the grandchild
+    send_request(&mut client, CHILD, 6, &[]); // commit the child, taking the grandchild
+    send_request(&mut client, TOPLEVEL, 6, &[]); // commit the parent, taking both
+
+    // Drain the mapping traffic before the registry round-trip below:
+    // `registry_globals_for` reads to its own callback and discards everything
+    // else, which would swallow the `wl_surface.enter`s this fixture needs as
+    // evidence that the subtree really is visible.
+    send_display_request(&mut client, 0, 21);
+    let mapped = events_until_callback(&mut client, 21);
+
+    // A pointer, from a second registry — the subcompositor bring-up binds no seat.
+    send_display_request(&mut client, 1, 22); // wl_display.get_registry
+    send_display_request(&mut client, 0, 23);
+    let globals = registry_globals_for(&mut client, 22, 23);
+    let (seat, seat_version) = globals["wl_seat"];
+    bind_global(&mut client, seat, "wl_seat", seat_version.min(7), 24);
+    send_request(&mut client, 24, 0, &words(&[ORPHAN_POINTER_ID])); // wl_seat.get_pointer
+    send_display_request(&mut client, 0, 26);
+    let ready = events_until_callback(&mut client, 26);
+    assert!(
+        ready
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "the three-level tree and the pointer are accepted: {ready:?}"
+    );
+
+    // Decode only this client's pointer enter/leave. Everything else on the
+    // socket is irrelevant to who owns focus.
+    fn enters_and_leaves(traffic: &[(u32, u16, Vec<u8>)]) -> (Vec<u32>, Vec<u32>) {
+        let mut enters = Vec::new();
+        let mut leaves = Vec::new();
+        for (object, opcode, body) in traffic {
+            if *object != ORPHAN_POINTER_ID {
+                continue;
+            }
+            match opcode {
+                0 => enters.push(word(body, 1)),
+                1 => leaves.push(word(body, 1)),
+                _ => {}
+            }
+        }
+        (enters, leaves)
+    }
+
+    // `wl_surface.enter`/`leave` are driven off the same `layout.visible` flag
+    // `surface_at` reads, and are the only wire evidence of effective
+    // visibility. Without them this fixture would pass unchanged for a
+    // grandchild that was never visible at all — and an invisible orphan is
+    // not stale, so the defect would be unreachable and the oracle vacuous.
+    fn output_transitions(traffic: &[(u32, u16, Vec<u8>)], surface: u32) -> (usize, usize) {
+        let mut entered = 0;
+        let mut left = 0;
+        for (object, opcode, _) in traffic {
+            if *object != surface {
+                continue;
+            }
+            match opcode {
+                0 => entered += 1,
+                1 => left += 1,
+                _ => {}
+            }
+        }
+        (entered, left)
+    }
+
+    // Inside all three surfaces. Round-tripped first: `injector.route` waits on
+    // the input source, which says nothing about the compositor having read the
+    // client's socket.
+    let point = f64::from(CASCADE_ORIGIN) + 20.0;
+    injector.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: point / 320.0,
+            normalised_y: point / 240.0,
+        },
+    });
+    send_display_request(&mut client, 0, 27);
+    let moved = events_until_callback(&mut client, 27);
+    let (entered, _) = enters_and_leaves(&moved);
+    assert_eq!(
+        entered,
+        vec![CHILD],
+        "the child must hold pointer focus before the destroy — if the \
+         grandchild or the toplevel does, `clear_focus_for_surface` is never \
+         asked to re-hit-test on the child's behalf and this fixture proves \
+         nothing: {moved:?}"
+    );
+    let before = [mapped.as_slice(), ready.as_slice(), moved.as_slice()].concat();
+    assert_eq!(
+        output_transitions(&before, GRANDCHILD),
+        (1, 0),
+        "the grandchild must be effectively visible going in — it is what the \
+         destroy below must not select, and an orphan that was never visible \
+         is never stale: {before:?}"
+    );
+
+    // Destroy the middle surface. Its `wl_subsurface` object stays alive and
+    // goes inert, which is legal, and the grandchild's record survives.
+    send_request(&mut client, CHILD, 0, &[]); // wl_surface.destroy
+    send_display_request(&mut client, 0, 28);
+    let destroyed = events_until_callback(&mut client, 28);
+    assert!(
+        destroyed
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "destroying a subsurface's wl_surface is not a protocol error: {destroyed:?}"
+    );
+    let (entered, left) = enters_and_leaves(&destroyed);
+    assert!(
+        !entered.contains(&GRANDCHILD),
+        "destroying the child must not enter its orphaned grandchild, which has \
+         no parent left and is about to be hidden: entered {entered:?}, left \
+         {left:?}"
+    );
+    assert_eq!(
+        left,
+        vec![CHILD],
+        "the pointer leaves the destroyed child exactly once: {destroyed:?}"
+    );
+    assert_eq!(
+        entered,
+        vec![TOPLEVEL],
+        "focus lands on the toplevel, which still covers the point: {destroyed:?}"
+    );
+    assert_eq!(
+        output_transitions(&destroyed, GRANDCHILD),
+        (0, 1),
+        "the orphaned grandchild is hidden by the visibility pass, exactly \
+         once and never re-entered: {destroyed:?}"
+    );
+
+    drop(client);
+    drop(runtime);
+}
+
+#[test]
+fn destroying_focused_toplevel_hands_pointer_but_not_keyboard_to_client_b() {
+    let (injector, _runtime, mut a, mut b) = two_client_focus_runtime("destroy-role");
+    click_a_and_drain(&injector, &mut a, &mut b);
+
+    // This point is inside both surfaces. Because the preceding click raised A,
+    // the motion remains focused on A while B is directly underneath it.
+    let b_origin = f64::from(CASCADE_ORIGIN + CASCADE_STEP);
+    let overlap_x = b_origin + 8.0;
+    let overlap_y = b_origin + 9.0;
+    route_focus_pointer(&injector, overlap_x, overlap_y);
+    let _ = round_trip_focus_clients(&mut a, &mut b, 20);
+
+    // Destroy only A's xdg_toplevel role. Its wl_surface and mapped SHM buffer
+    // remain alive, which is the path `deactivate_surface_role` handles.
+    send_request(&mut a.socket, FOCUS_TOPLEVEL_ID, 0, &[]);
+    send_display_request(&mut a.socket, 0, 21);
+    let a_destroy = events_until_callback(&mut a.socket, 21);
+    // Fence B only after A's callback proves the role destruction ran. A sync
+    // sent concurrently on B could complete before the compositor reads A's
+    // socket and leave B's pointer enter queued after the callback.
+    send_display_request(&mut b.socket, 0, 21);
+    let b_destroy = events_until_callback(&mut b.socket, 21);
+
+    let a_destroy = focus_messages(&a_destroy);
+    let b_destroy = focus_messages(&b_destroy);
+    assert!(
+        b_destroy
+            .iter()
+            .all(|message| !matches!(message, FocusWire::KeyboardEnter { .. })),
+        "destroying A's role clears keyboard focus to None instead of entering B: {b_destroy:?}"
+    );
+    let pointer_leaves = a_destroy
+        .iter()
+        .filter_map(|message| match message {
+            FocusWire::PointerLeave { serial, surface } => Some((*serial, *surface)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pointer_leaves.len(),
+        1,
+        "A gets exactly one pointer leave during role destruction: {a_destroy:?}"
+    );
+    let (pointer_serial, pointer_surface) = pointer_leaves[0];
+    assert_eq!(pointer_surface, FOCUS_SURFACE_ID);
+    assert_eq!(
+        b_destroy,
+        vec![
+            FocusWire::PointerEnter {
+                serial: pointer_serial,
+                surface: FOCUS_SURFACE_ID,
+                x: overlap_x - b_origin,
+                y: overlap_y - b_origin,
+            },
+            FocusWire::PointerFrame,
+        ],
+        "B gets pointer focus at the exposed point but no wl_keyboard.enter"
+    );
+
+    match a_destroy.as_slice() {
+        [
+            FocusWire::KeyboardLeave {
+                serial: _,
+                surface: keyboard_surface,
+            },
+            FocusWire::PointerLeave {
+                serial: leave_serial,
+                surface: pointer_surface,
+            },
+            FocusWire::PointerFrame,
+        ] => {
+            assert_eq!(*keyboard_surface, FOCUS_SURFACE_ID);
+            assert_eq!(*pointer_surface, FOCUS_SURFACE_ID);
+            assert_eq!(*leave_serial, pointer_serial);
+        }
+        other => panic!("A loses keyboard and pointer focus when its role is destroyed: {other:?}"),
+    }
+}
+
+#[test]
+fn abruptly_disconnecting_focused_client_hands_pointer_but_not_keyboard_to_client_b() {
+    let (injector, runtime, mut a, mut b) = two_client_focus_runtime("abrupt-disconnect");
+    let (a_click_wire, b_click_wire) = click_a_and_drain(&injector, &mut a, &mut b);
+
+    // The precondition, asserted rather than assumed. Both siblings get this
+    // free: they observe A's `KeyboardLeave`, which A can only receive if A held
+    // keyboard focus. A's socket is closed here before anything is read back,
+    // so this fixture has no such proof, and without this assertion it passes
+    // even if clicking stopped granting keyboard focus at all — the disconnect
+    // would then clear nothing, B would still get its pointer enter and still
+    // no keyboard enter, and "focus goes to None rather than falling through to
+    // B" would be pinning a state that never existed. Measured: with the
+    // `set_focus` call in `pointer_button` removed, this fixture passed.
+    let a_click = focus_messages(&a_click_wire);
+    let a_keyboard_enters = a_click
+        .iter()
+        .filter(|message| matches!(message, FocusWire::KeyboardEnter { surface, .. } if *surface == FOCUS_SURFACE_ID))
+        .count();
+    assert_eq!(
+        a_keyboard_enters, 1,
+        "clicking A gives A keyboard focus exactly once: {a_click:?}"
+    );
+    let b_click = focus_messages(&b_click_wire);
+    assert!(
+        b_click
+            .iter()
+            .all(|message| !matches!(message, FocusWire::KeyboardEnter { .. })),
+        "clicking A never gives B keyboard focus: {b_click:?}"
+    );
+
+    // A was raised by the click. This point is inside both surfaces, so A keeps
+    // both pointer and keyboard focus while B is genuinely underneath it at
+    // the stored pointer position used by the disconnect re-hit-test.
+    let b_origin = f64::from(CASCADE_ORIGIN + CASCADE_STEP);
+    let overlap_x = b_origin + 8.0;
+    let overlap_y = b_origin + 9.0;
+    route_focus_pointer(&injector, overlap_x, overlap_y);
+    let _ = round_trip_focus_clients(&mut a, &mut b, 20);
+
+    // Empty the bounded renderer channel before using SurfaceDestroyed as the
+    // disconnect fence. The first drain can race the end of callback 20's
+    // dispatch: if its try_send saw the channel full first, that batch remains
+    // pending until callback 21's dispatch. Callback 22 proves callback 21's
+    // dispatch finished publishing; sync itself produces no renderer event, so
+    // the second drain leaves no older batch that could be mistaken for A's
+    // destruction below.
+    runtime
+        .drain_events()
+        .expect("protocol thread is alive before disconnect");
+    let _ = round_trip_focus_clients(&mut a, &mut b, 21);
+    let _ = round_trip_focus_clients(&mut a, &mut b, 22);
+    runtime
+        .drain_events()
+        .expect("protocol thread is alive before the disconnect fence");
+
+    // Abrupt means the socket closes and nothing else: no role destruction,
+    // null-buffer unmap or final request from A.
+    drop(a.socket);
+
+    // The fence, and the only reason this fixture is deterministic. Both
+    // siblings fence on A's own callback; here A's socket is gone, so there is
+    // no such callback and B's sync can be answered in an *earlier* dispatch
+    // cycle than the one that notices A's EOF — leaving B's wire empty.
+    // Measured: with these lines removed and every assertion kept, this fixture
+    // fails 59 runs in 60.
+    //
+    // What is needed is only that the cycle which destroyed A has run.
+    // `destroy_surface_record` pushes SurfaceDestroyed during
+    // `dispatch_clients`, and `publish_events` sends it at the end of that same
+    // cycle, so receiving it proves exactly that. B's own sync below then
+    // orders B's wire by the ordinary guarantee that events queued before a
+    // `sync` precede its `done`.
+    //
+    // Deliberately not claiming more. `dispatch_cycle` does flush every client
+    // before publishing, but this fixture does not rest on that: swapping the
+    // push in `destroy_surface_record` to before `clear_focus_for_surface`
+    // leaves the whole suite green, because both happen inside
+    // `dispatch_clients` and neither is observable until the flush.
+    let disconnect_events = runtime
+        .client_scene_feed
+        .as_ref()
+        .expect("runtime still owns its client scene feed")
+        .events
+        .lock()
+        .expect("protocol event receiver mutex is not poisoned")
+        .recv_timeout(PROTOCOL_ACK_DEADLINE)
+        .expect("A's abrupt disconnect publishes its surface destruction");
+    assert!(
+        disconnect_events
+            .iter()
+            .any(|event| matches!(event, ProtocolEvent::SurfaceDestroyed { .. })),
+        "A's abrupt disconnect publishes SurfaceDestroyed after focus cleanup: {disconnect_events:?}"
+    );
+
+    // B alone allocates callback 23: A's sequence ended densely at 22 when its
+    // socket closed, and the shared round-trip helper is no longer applicable.
+    send_display_request(&mut b.socket, 0, 23);
+    let b_disconnect_wire = events_until_callback(&mut b.socket, 23);
+    let b_disconnect = focus_messages(&b_disconnect_wire);
+    // Matched rather than compared against a built vector. The siblings can
+    // assert B's enter serial because they take it from A's *leave* on A's
+    // still-open socket, which makes the equality a genuine cross-check. Here
+    // A's socket is gone, so the only serial available is the one in this very
+    // wire — asserting it against itself would prove nothing. Every other
+    // field, and the exact message count, is pinned.
+    match b_disconnect.as_slice() {
+        [
+            FocusWire::PointerEnter {
+                serial: _,
+                surface,
+                x,
+                y,
+            },
+            FocusWire::PointerFrame,
+        ] => {
+            assert_eq!(*surface, FOCUS_SURFACE_ID);
+            assert_eq!(*x, overlap_x - b_origin);
+            assert_eq!(*y, overlap_y - b_origin);
+        }
+        other => panic!(
+            "B gets exactly pointer enter plus frame, and no keyboard enter, \
+             after A disconnects: {other:?}\n\
+             B wire: {b_disconnect_wire:?}"
+        ),
+    }
+}
+
+#[test]
+fn unmapping_focused_toplevel_hands_pointer_but_not_keyboard_to_client_b() {
+    let (injector, _runtime, mut a, mut b) = two_client_focus_runtime("null-unmap-focus");
+
+    let a_only = f64::from(CASCADE_ORIGIN) + 8.0;
+    route_focus_pointer(&injector, a_only, a_only);
+    route_focus_button(&injector, ButtonState::Pressed);
+    route_focus_button(&injector, ButtonState::Released);
+    let (focused_wire, _) = round_trip_focus_clients(&mut a, &mut b, 19);
+    let focused_states = toplevel_configure_states(&focused_wire, FOCUS_TOPLEVEL_ID);
+    assert_eq!(
+        focused_states.len(),
+        1,
+        "focusing A produces exactly one xdg_toplevel.configure: {focused_wire:?}"
+    );
+    let activated = xdg_toplevel::State::Activated as u32;
+    assert!(
+        focused_states[0].contains(&activated),
+        "A is Activated before the null-buffer unmap: {focused_wire:?}"
+    );
+
+    // A was raised by the click. Move into the overlap so A still holds both
+    // kinds of focus while B is genuinely underneath at the stored pointer
+    // position used by the unmap re-hit-test.
+    let b_origin = f64::from(CASCADE_ORIGIN + CASCADE_STEP);
+    let overlap_x = b_origin + 8.0;
+    let overlap_y = b_origin + 9.0;
+    route_focus_pointer(&injector, overlap_x, overlap_y);
+    let _ = round_trip_focus_clients(&mut a, &mut b, 20);
+
+    // Keep each client's allocation dense through callback 21, but fence B
+    // only after A's callback proves the null-buffer commit was dispatched.
+    // A alone allocates callbacks 22 and 23 below, so the client sequences then
+    // diverge and `round_trip_focus_clients` is no longer valid.
+    send_request(&mut a.socket, FOCUS_SURFACE_ID, 1, &words(&[0, 0, 0]));
+    send_request(&mut a.socket, FOCUS_SURFACE_ID, 6, &[]);
+    send_display_request(&mut a.socket, 0, 21);
+    let a_unmap_wire = events_until_callback(&mut a.socket, 21);
+    send_display_request(&mut b.socket, 0, 21);
+    let b_unmap_wire = events_until_callback(&mut b.socket, 21);
+
+    let a_unmap = focus_messages(&a_unmap_wire);
+    let b_unmap = focus_messages(&b_unmap_wire);
+    let pointer_serial = match a_unmap.as_slice() {
+        [
+            FocusWire::KeyboardLeave {
+                serial: _,
+                surface: keyboard_surface,
+            },
+            FocusWire::PointerLeave {
+                serial,
+                surface: pointer_surface,
+            },
+            FocusWire::PointerFrame,
+        ] => {
+            assert_eq!(
+                *keyboard_surface, FOCUS_SURFACE_ID,
+                "keyboard leaves A on null-buffer unmap: {a_unmap_wire:?}"
+            );
+            assert_eq!(
+                *pointer_surface, FOCUS_SURFACE_ID,
+                "pointer leaves A on null-buffer unmap: {a_unmap_wire:?}"
+            );
+            *serial
+        }
+        other => panic!(
+            "A gets exactly keyboard leave, pointer leave and pointer frame on null-buffer unmap\n\
+             A wire: {a_unmap_wire:?}\n\
+             A focus wire: {other:?}\n\
+             B wire: {b_unmap_wire:?}"
+        ),
+    };
+    assert_eq!(
+        b_unmap,
+        vec![
+            FocusWire::PointerEnter {
+                serial: pointer_serial,
+                surface: FOCUS_SURFACE_ID,
+                x: overlap_x - b_origin,
+                y: overlap_y - b_origin,
+            },
+            FocusWire::PointerFrame,
+        ],
+        "B gets pointer enter plus frame, and no keyboard enter, from A's null-buffer unmap\n\
+         A wire: {a_unmap_wire:?}\n\
+         B wire: {b_unmap_wire:?}"
+    );
+
+    // A's role survives, but xdg-shell starts a fresh configure sequence. The
+    // next empty commit must produce an initial configure before buffer 12 can
+    // legally be attached again.
+    send_request(&mut a.socket, FOCUS_SURFACE_ID, 6, &[]);
+    send_display_request(&mut a.socket, 0, 22);
+    let remap_configure_wire = events_until_callback(&mut a.socket, 22);
+    let remap_states = toplevel_configure_states(&remap_configure_wire, FOCUS_TOPLEVEL_ID);
+    assert_eq!(
+        remap_states.len(),
+        1,
+        "A's fresh empty commit produces exactly one initial toplevel configure: {remap_configure_wire:?}"
+    );
+    assert!(
+        !remap_states[0].contains(&activated),
+        "A's next initial configure omits Activated after focus cleared to None\n\
+         focused wire: {focused_wire:?}\n\
+         unmap A wire: {a_unmap_wire:?}\n\
+         unmap B wire: {b_unmap_wire:?}\n\
+         remap initial wire: {remap_configure_wire:?}"
+    );
+    let remap_serials = remap_configure_wire
+        .iter()
+        .filter(|(object, opcode, _)| *object == 8 && *opcode == 0)
+        .map(|(_, _, body)| word(body, 0))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        remap_serials.len(),
+        1,
+        "the next initial toplevel configure has exactly one xdg_surface.configure serial: {remap_configure_wire:?}"
+    );
+
+    send_request(&mut a.socket, 8, 4, &words(&[remap_serials[0]]));
+    send_request(&mut a.socket, FOCUS_SURFACE_ID, 1, &words(&[12, 0, 0]));
+    send_request(&mut a.socket, FOCUS_SURFACE_ID, 6, &[]);
+    send_display_request(&mut a.socket, 0, 23);
+    let remapped_wire = events_until_callback(&mut a.socket, 23);
+
+    // Mapping deliberately does not re-hit-test pointer focus. Drive the
+    // production absolute-motion path at the unchanged overlap point instead.
+    // A retained the higher z from the click, so only a genuinely mapped and
+    // effectively visible A can take pointer focus back from B here.
+    //
+    // Not `wl_surface.enter`: these clients never bind `wl_output`, and that
+    // event only ever reaches a client holding the output, so asserting it here
+    // would be asserting an event that cannot arrive. Binding the output would
+    // make it arrive, but it would then prove only output membership; this
+    // proves the hit test, which is what unmap actually disturbed.
+    route_focus_pointer(&injector, overlap_x, overlap_y);
+    send_display_request(&mut a.socket, 0, 24);
+    let a_remap_focus_wire = events_until_callback(&mut a.socket, 24);
+    send_display_request(&mut b.socket, 0, 22);
+    let b_remap_focus_wire = events_until_callback(&mut b.socket, 22);
+
+    let a_remap_focus = focus_messages(&a_remap_focus_wire);
+    let b_remap_focus = focus_messages(&b_remap_focus_wire);
+    let pointer_serial = match b_remap_focus.as_slice() {
+        [
+            FocusWire::PointerLeave { serial, surface },
+            FocusWire::PointerFrame,
+        ] => {
+            assert_eq!(
+                *surface, FOCUS_SURFACE_ID,
+                "the remapped A displaces pointer focus from B's surface: {b_remap_focus_wire:?}"
+            );
+            *serial
+        }
+        other => panic!(
+            "moving at the overlap after A's remap gives B exactly pointer leave plus frame\n\
+             remap wire: {remapped_wire:?}\n\
+             A focus wire: {a_remap_focus_wire:?}\n\
+             B focus wire: {b_remap_focus_wire:?}\n\
+             B decoded focus wire: {other:?}"
+        ),
+    };
+    assert_eq!(
+        a_remap_focus,
+        vec![
+            FocusWire::PointerEnter {
+                serial: pointer_serial,
+                surface: FOCUS_SURFACE_ID,
+                x: overlap_x - f64::from(CASCADE_ORIGIN),
+                y: overlap_y - f64::from(CASCADE_ORIGIN),
+            },
+            FocusWire::PointerFrame,
+        ],
+        "moving at the overlap after A's remap enters A and proves it is live again\n\
+         remap wire: {remapped_wire:?}\n\
+         A focus wire: {a_remap_focus_wire:?}\n\
+         B focus wire: {b_remap_focus_wire:?}"
+    );
+}
+
+/// A/B fill the renderer channel while C/D compact protocol-side. After the
+/// transition update drains A/B, a busy client refills both slots with E/F and
+/// leaves the newer G pending before the resume flush is handled. The flush
+/// must report that publication is still pending, allowing supervision to
+/// drain E/F with another transition update and retry. Only after the retry
+/// reports complete may the first resumed render drain the feed, where it must
+/// observe G. None of these flushes acts like a frame pulse.
+#[test]
+fn resume_flush_refill_race_puts_newest_commit_in_the_first_render_drain() {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the resume-flush oracle");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-resume-flush-{}-{unique}", std::process::id());
+    let mut runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "resume-flush-test".into(),
+            drm_adapter: synthetic_drm_adapter("resume-flush-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts");
+    let coordinator = runtime.kms_topology_client();
+    let feed = runtime
+        .take_client_scene_feed()
+        .expect("the render feed is transferred once");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect paused client");
+    let pool = bring_up_shm_toplevel(&mut client, 4, "cosmix-resume-flush");
+    send_request(
+        &mut client,
+        11,
+        0,
+        &words(&[12, 0, 1, 1, 4, wl_shm::Format::Xrgb8888 as u32]),
+    );
+
+    // Empty all setup traffic so A and B, rather than registry/mapping batches,
+    // are what occupy the bounded channel below.
+    for _ in 0..3 {
+        coordinator
+            .flush_events(PROTOCOL_ACK_DEADLINE)
+            .expect("settle setup publisher");
+        feed.drain_events().expect("drain setup traffic");
+    }
+    coordinator
+        .flush_events(PROTOCOL_ACK_DEADLINE)
+        .expect("prove setup publisher is empty");
+    assert!(
+        feed.drain_events()
+            .expect("read settled setup publisher")
+            .is_empty()
+    );
+
+    const FRAME_CALLBACK: u32 = 13;
+    send_request(&mut client, 7, 3, &words(&[FRAME_CALLBACK]));
+    let commit = |client: &mut UnixStream, pool: &File, index: usize, marker: u8| {
+        pool.write_at(&[marker, 0, 0, 0], 0)
+            .expect("rewrite the paused client's pool");
+        send_request(client, 7, 1, &words(&[12, 0, 0]));
+        send_request(client, 7, 9, &words(&[0, 0, 1, 1]));
+        send_request(client, 7, 6, &[]);
+        let fence = 14 + u32::try_from(index).expect("four commits");
+        send_display_request(client, 0, fence);
+        let traffic = events_until_callback(client, fence);
+        assert!(
+            traffic
+                .iter()
+                .all(|(object, opcode, _)| !(*object == FRAME_CALLBACK && *opcode == 0)),
+            "paused commit {marker:#x} does not complete the frame callback: {traffic:?}"
+        );
+    };
+    for (index, marker) in [0x41_u8, 0x42, 0x43, 0x44].into_iter().enumerate() {
+        commit(&mut client, &pool, index, marker);
+    }
+
+    // Settle D into pending_events while the real two-slot channel remains
+    // full. This poke itself cannot make room and must say so.
+    assert_eq!(
+        coordinator
+            .flush_events(PROTOCOL_ACK_DEADLINE)
+            .expect("settle the fourth paused commit into the compacted outbox"),
+        EventFlushOutcome::Pending
+    );
+    let stale = feed
+        .drain_events()
+        .expect("the OutputReady transition update drains stale A/B batches");
+    let stale_markers = stale
+        .iter()
+        .filter_map(|event| match event {
+            ProtocolEvent::SurfaceUpserted {
+                frame: SurfaceFrame::Shm(frame),
+                ..
+            } if frame.width == 1 => Some(frame.rgba[2]),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !stale_markers.contains(&0x44),
+        "precondition: D is still compacted protocol-side, not in A/B's channel slots: {stale_markers:?}"
+    );
+
+    // Before the resume poke reaches the protocol thread, client traffic wins
+    // the race: E carries forward and supersedes D into the first freed slot,
+    // F takes the second, and G remains compacted behind both.
+    for (index, marker) in [0x45_u8, 0x46, 0x47].into_iter().enumerate() {
+        commit(&mut client, &pool, index + 4, marker);
+    }
+    assert_eq!(
+        coordinator
+            .flush_events(PROTOCOL_ACK_DEADLINE)
+            .expect("resume flush observes the refilled scene channel"),
+        EventFlushOutcome::Pending,
+        "a full flush may not acknowledge the newer compacted state as published"
+    );
+
+    let refilled = feed
+        .drain_events()
+        .expect("the retry transition update drains E/F");
+    let refilled_markers = refilled
+        .iter()
+        .filter_map(|event| match event {
+            ProtocolEvent::SurfaceUpserted {
+                frame: SurfaceFrame::Shm(frame),
+                ..
+            } if frame.width == 1 => Some(frame.rgba[2]),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !refilled_markers.contains(&0x47),
+        "precondition: G is newer than both refilled channel slots: {refilled_markers:?}"
+    );
+
+    assert_eq!(
+        coordinator
+            .flush_events(PROTOCOL_ACK_DEADLINE)
+            .expect("retry publishes the newest compacted batch"),
+        EventFlushOutcome::Complete
+    );
+    let first_resumed_drain = feed
+        .drain_events()
+        .expect("the first resumed render drains the flushed batch");
+    assert!(
+        first_resumed_drain.iter().any(|event| matches!(
+            event,
+            ProtocolEvent::SurfaceUpserted {
+                frame: SurfaceFrame::Shm(frame),
+                ..
+            } if frame.width == 1 && frame.rgba[2] == 0x47
+        )),
+        "the first resumed render sees newest refill-race commit G: {first_resumed_drain:?}"
+    );
+
+    send_display_request(&mut client, 0, 21);
+    let after_flush = events_until_callback(&mut client, 21);
+    assert!(
+        after_flush
+            .iter()
+            .all(|(object, opcode, _)| !(*object == FRAME_CALLBACK && *opcode == 0)),
+        "an event flush is not a frame pulse: {after_flush:?}"
+    );
+}
+
+/// A client's `wl_surface` commits keep being served, and its buffers keep
+/// being returned, while the renderer has stopped draining the protocol event
+/// channel entirely.
+///
+/// The channel is a `sync_channel` bounded at `PROTOCOL_EVENT_BATCH_CAPACITY`,
+/// and the protocol thread is the sender. Every path a client can reach runs on
+/// that thread, so a send that waits for the renderer is a compositor that
+/// stops answering *all* clients the moment Bevy stops calling `drain_events` —
+/// a stalled GPU, a long shader compile, a frame spent in a modeset. The
+/// compositor must instead keep the newest state per surface and let the stale
+/// state go.
+///
+/// The saturation is real, not asserted: the first client commits
+/// `PROTOCOL_EVENT_BATCH_CAPACITY + 2` times, each fenced by its own
+/// `wl_display.sync` so each is handled in a separate protocol dispatch and
+/// publishes its own batch, and nothing drains in between. Replacing
+/// `try_send` with a blocking `send` wedges the thread at the third of those
+/// and every assertion below then fails on the deadline, which is what proves
+/// the channel actually fills here rather than the test merely believing it.
+#[test]
+fn a_full_renderer_channel_does_not_stop_the_protocol_thread_serving_clients() {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the renderer-backpressure oracle");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-backpressure-{}-{unique}", std::process::id());
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "backpressure-test".into(),
+            drm_adapter: synthetic_drm_adapter("backpressure-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts");
+    let socket_path = std::path::Path::new(&runtime_dir).join(&socket_name);
+
+    // The first client saturates the channel. Its buffer is one XRGB pixel and
+    // the pool is rewritten between commits, so every commit carries a byte no
+    // other commit carries and the newest one is identifiable at the far end.
+    let mut saturating = UnixStream::connect(&socket_path).expect("first client connects");
+    let pool = bring_up_shm_toplevel(&mut saturating, 4, "cosmix-backpressure-a");
+    send_request(
+        &mut saturating,
+        11,
+        0,
+        &words(&[12, 0, 1, 1, 4, wl_shm::Format::Xrgb8888 as u32]),
+    ); // wl_shm_pool.create_buffer
+
+    const SATURATING_COMMITS: usize = PROTOCOL_EVENT_BATCH_CAPACITY + 2;
+    let mut newest_marker = 0u8;
+    for commit in 0..SATURATING_COMMITS {
+        newest_marker = 0x40 + u8::try_from(commit).expect("small commit count");
+        // Little-endian XRGB8888: the low byte is blue.
+        pool.write_at(&[newest_marker, 0, 0, 0], 0)
+            .expect("rewrite the anonymous test pool");
+        send_request(&mut saturating, 7, 1, &words(&[12, 0, 0])); // wl_surface.attach
+        // Damage is not optional here. Only the first commit of a buffer whose
+        // dimensions differ from the backing converts the whole image; after
+        // that the compositor converts the damaged rows and nothing else, so a
+        // re-attach with no damage would carry the *previous* pixels and every
+        // marker below would read as the first one.
+        send_request(&mut saturating, 7, 9, &words(&[0, 0, 1, 1])); // wl_surface.damage_buffer
+        send_request(&mut saturating, 7, 6, &[]); // wl_surface.commit
+        let fence = 13 + u32::try_from(commit).expect("small commit count");
+        send_display_request(&mut saturating, 0, fence);
+        events_until_callback(&mut saturating, fence);
+    }
+
+    // Now a client that has never been seen before. Everything it needs — the
+    // registry, three globals, a surface, the xdg handshake, a pool — is served
+    // by the same thread that cannot hand its events on.
+    let mut arriving = UnixStream::connect(&socket_path).expect("second client connects");
+    let arriving_pool = bring_up_shm_toplevel(&mut arriving, 8, "cosmix-backpressure-b");
+    arriving_pool
+        .write_at(&[0, 0, 0, 0, 0, 0, 0, 0], 0)
+        .expect("fill the second client's pool");
+    send_request(
+        &mut arriving,
+        11,
+        0,
+        &words(&[12, 0, 2, 1, 8, wl_shm::Format::Xrgb8888 as u32]),
+    ); // a 2x1 buffer, so this client's frames are distinguishable by width
+    send_request(&mut arriving, 7, 3, &words(&[13])); // wl_surface.frame
+    send_request(&mut arriving, 7, 1, &words(&[12, 0, 0])); // wl_surface.attach
+    send_request(&mut arriving, 7, 6, &[]); // wl_surface.commit
+    send_display_request(&mut arriving, 0, 14);
+    let committed = events_until_callback(&mut arriving, 14);
+
+    assert!(
+        committed
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "the second client was served without a protocol error: {committed:?}"
+    );
+    // The SHM copy happens on the protocol thread and owes nothing to the
+    // renderer, so this release is owed in the committing round-trip whatever
+    // the event channel is doing. A compositor that withheld it would strand
+    // every single-buffered client for as long as the renderer was busy.
+    let buffer_events: Vec<u16> = committed
+        .iter()
+        .filter(|(object, _, _)| *object == 12)
+        .map(|(_, opcode, _)| *opcode)
+        .collect();
+    assert_eq!(
+        buffer_events,
+        vec![0],
+        "the second client's buffer comes back once while the channel is full: \
+         {buffer_events:?}"
+    );
+    assert!(
+        committed
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 13 && *opcode == 0)),
+        "frame callbacks stay paced by the compositor's frame, not released \
+         early by backpressure: {committed:?}"
+    );
+    // A second fence before the frame command, because one is not enough to
+    // attribute the completion below. A callback completed *after*
+    // `flush_clients` in the committing dispatch would not reach the client
+    // until something else drove another dispatch — and the `finish_frame`
+    // below is exactly that. The absent-then-present pair would then read as
+    // "the frame completed it" when the commit had. This fence drives its own
+    // dispatch and flush, so anything owed from the commit has been delivered
+    // by the time it answers, and the only thing left that can complete
+    // callback 13 is the frame.
+    send_display_request(&mut arriving, 0, 15);
+    let fenced = events_until_callback(&mut arriving, 15);
+    assert!(
+        fenced
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 13 && *opcode == 0)),
+        "and still not completed a whole dispatch later: {fenced:?}"
+    );
+
+    // Frame pacing survives too: a `Frame` command is a different channel into
+    // the same thread, and it must still complete callbacks.
+    runtime
+        .finish_frame(Vec::new())
+        .expect("send compositor frame");
+    // Panics on the deadline if it never arrives: a frame must complete the
+    // second client's callback even though the renderer has not drained a
+    // single event.
+    wait_for_callback_with_timeout(&mut arriving, 13, PROTOCOL_ACK_DEADLINE);
+
+    // Finally, the renderer comes back. What it is owed is the *newest* state
+    // of every surface, not a replay of everything that happened while it was
+    // away. That is coalescing doing the work here, not byte-pressure eviction
+    // and not `dirty_surfaces` recovery: a batch that could not be sent is put
+    // back, and each later commit replaces the same surface's queued entry in
+    // it, so the intermediate markers are overwritten rather than dropped and
+    // rebuilt. Prodded with a frame each pass, because a restored batch is only
+    // republished on the next dispatch.
+    let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    let mut seen_arriving = false;
+    let mut newest_seen = None;
+    loop {
+        for event in runtime.drain_events().expect("protocol thread is alive") {
+            if let ProtocolEvent::SurfaceUpserted {
+                frame: SurfaceFrame::Shm(shm),
+                ..
+            } = event
+            {
+                match shm.width {
+                    1 => newest_seen = Some(shm.rgba[2]),
+                    2 => seen_arriving = true,
+                    other => panic!("unexpected surface width {other}"),
+                }
+            }
+        }
+        if seen_arriving && newest_seen == Some(newest_marker) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "after the renderer resumed it was handed the newest state of both \
+             surfaces: second client seen {seen_arriving}, newest first-client \
+             marker {newest_seen:?} (expected {newest_marker:#x})"
+        );
+        runtime
+            .finish_frame(Vec::new())
+            .expect("send compositor frame");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    drop(saturating);
+    drop(arriving);
+    drop(runtime);
+}
+
+#[test]
+fn shm_commit_reaches_the_renderer_pixel_exact_and_releases_the_buffer() {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the SHM pixel oracle");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-shm-pixels-{}-{unique}", std::process::id());
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "shm-pixel-test".into(),
+            drm_adapter: synthetic_drm_adapter("shm-pixel-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+
+    send_display_request(&mut client, 1, 2); // wl_display.get_registry
+    send_display_request(&mut client, 0, 3); // wl_display.sync
+    let globals = registry_globals(&mut client, 3);
+    let (compositor, compositor_version) = globals["wl_compositor"];
+    let (xdg_wm_base, xdg_version) = globals["xdg_wm_base"];
+    let (shm, shm_version) = globals["wl_shm"];
+    bind_global(
+        &mut client,
+        compositor,
+        "wl_compositor",
+        compositor_version.min(5),
+        4,
+    );
+    bind_global(
+        &mut client,
+        xdg_wm_base,
+        "xdg_wm_base",
+        xdg_version.min(6),
+        5,
+    );
+    bind_global(&mut client, shm, "wl_shm", shm_version.min(1), 6);
+
+    send_request(&mut client, 4, 0, &words(&[7])); // wl_compositor.create_surface
+    send_request(&mut client, 5, 2, &words(&[8, 7])); // xdg_wm_base.get_xdg_surface
+    send_request(&mut client, 8, 1, &words(&[9])); // xdg_surface.get_toplevel
+    send_request(&mut client, 7, 6, &[]); // initial empty commit
+    send_display_request(&mut client, 0, 10);
+    let serial = events_until_callback(&mut client, 10)
+        .iter()
+        .find_map(|(object, opcode, body)| (*object == 8 && *opcode == 0).then(|| word(body, 0)))
+        .expect("xdg_surface.configure follows the initial empty commit");
+    send_request(&mut client, 8, 4, &words(&[serial])); // xdg_surface.ack_configure
+
+    let name = std::ffi::CString::new("cosmix-shm-pixel-test").expect("static memfd name");
+    // SAFETY: name is a live NUL-terminated C string and the returned
+    // descriptor is transferred immediately into File.
+    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(
+        raw_fd >= 0,
+        "create anonymous test pool: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: memfd_create returned a new owned descriptor on success.
+    let mut pool = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+    let (pool_bytes, expected_rgba) = shm_oracle_pool();
+    pool.write_all(&pool_bytes)
+        .expect("fill the anonymous test pool");
+    send_request_with_fd(
+        &mut client,
+        6,
+        0,
+        &words(&[11, SHM_ORACLE_POOL_BYTES as u32]),
+        pool.as_fd(),
+    ); // wl_shm.create_pool
+    send_request(
+        &mut client,
+        11,
+        0,
+        &words(&[
+            12,
+            SHM_ORACLE_OFFSET as u32,
+            SHM_ORACLE_WIDTH as u32,
+            SHM_ORACLE_HEIGHT as u32,
+            SHM_ORACLE_STRIDE as u32,
+            wl_shm::Format::Argb8888 as u32,
+        ]),
+    ); // wl_shm_pool.create_buffer
+    send_request(&mut client, 7, 1, &words(&[12, 0, 0])); // wl_surface.attach
+    send_request(&mut client, 7, 6, &[]); // commit: the surface maps
+    send_display_request(&mut client, 0, 13);
+    let committed = events_until_callback(&mut client, 13);
+
+    assert!(
+        committed
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "the compositor accepted the offset, padded pool without a protocol error: {committed:?}"
+    );
+
+    // The SHM path copies out of the pool and is done with the buffer, so the
+    // release is owed in this same round-trip. Exactly one: a client that is
+    // told twice will reuse a buffer the compositor still thinks it holds, and
+    // one that is never told stalls forever on its own single buffer.
+    let buffer_events: Vec<u16> = committed
+        .iter()
+        .filter(|(object, _, _)| *object == 12)
+        .map(|(_, opcode, _)| *opcode)
+        .collect();
+    assert_eq!(
+        buffer_events,
+        vec![0],
+        "exactly one wl_buffer.release, in the round-trip that committed it: {buffer_events:?}"
+    );
+
+    let frame = wait_for_shm_upsert(&runtime);
+    assert_eq!(
+        (frame.width, frame.height),
+        (SHM_ORACLE_WIDTH as u32, SHM_ORACLE_HEIGHT as u32),
+        "the renderer is handed the buffer's own dimensions, not the pool's"
+    );
+    assert!(
+        !frame.opaque,
+        "an argb8888 buffer carries alpha, so it must not be marked opaque"
+    );
+    assert_eq!(
+        frame.rgba.as_slice(),
+        expected_rgba.as_slice(),
+        "every channel of every pixel, with the prefix and the row padding left \
+         behind and the premultiplied pixel preserved"
+    );
+
+    drop(client);
+}
+
+/// Read until every callback in `awaited` has completed *and* a following
+/// `wl_display.sync` on `fence` has answered, returning everything read on the
+/// way.
+///
+/// Not a loop of `wait_for_callback_with_timeout` per id: that helper discards
+/// what it passes over, so an id that completes *first* would be thrown away
+/// while waiting for one that completes second, and the second wait would then
+/// block until the deadline on an event that already went by.
+///
+/// The trailing fence is what makes "exactly once" mean anything on the reading
+/// side. Stopping the moment the last distinct id appears leaves anything queued
+/// behind it unread, so a caller counting what came back would count each id
+/// once whatever else had arrived. `fence` is round-tripped after the awaited
+/// set is complete, and everything up to its answer is counted too.
+///
+/// This is defensive rather than mutation-proved, and deliberately recorded as
+/// such: `wl_callback.done` is a destructor, and calling it twice compiles but
+/// changes nothing on the wire — wayland-rs drops sends on a resource its own
+/// destructor event has already killed, so the second completion never reaches
+/// the client. No production mutation here can currently produce the trailing
+/// duplicate this fence would catch. The fence closes the *reading* weakness
+/// anyway, because it costs one round-trip and the alternative is an assertion
+/// whose strength depends on when the reader happened to stop.
+fn wait_for_all_callbacks(
+    client: &mut UnixStream,
+    awaited: &[u32],
+    fence: u32,
+) -> Vec<(u32, u16, Vec<u8>)> {
+    let label = format!("wl_callback.done for {awaited:?}");
+    let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    let mut seen: Vec<u32> = Vec::new();
+    let mut events = Vec::new();
+    while seen.len() < awaited.len() {
+        let event = read_event(client, deadline, &label);
+        if awaited.contains(&event.0) && event.1 == 0 && !seen.contains(&event.0) {
+            seen.push(event.0);
+        }
+        events.push(event);
+    }
+    send_display_request(client, 0, fence);
+    let fence_label = format!("wl_display.sync fence {fence} after {awaited:?}");
+    loop {
+        let event = read_event(client, deadline, &fence_label);
+        let fenced = event.0 == fence && event.1 == 0;
+        events.push(event);
+        if fenced {
+            return events;
+        }
+    }
+}
+
+/// Frame callbacks are frame-paced, and they reach the whole surface tree.
+///
+/// Both halves are only visible from a client with a *subsurface*, which is why
+/// this is not folded into `frame_callback_is_sent_before_first_buffer_commit`:
+/// `handle_frame` iterates roots only — a record with a parent is filtered out —
+/// so a child's callback can only ever arrive through
+/// `send_frames_surface_tree`'s traversal. A toplevel-only test passes just as
+/// happily against a compositor that never descends, and every real client that
+/// composes with subsurfaces (a decorated GTK window, a video player's
+/// separately-scaled plane) would then stall on its child forever while its
+/// toplevel animated normally.
+#[test]
+fn frame_callbacks_are_frame_paced_and_reach_a_subsurface() {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the subsurface frame-callback oracle");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-frame-tree-{}-{unique}", std::process::id());
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "frame-tree-test".into(),
+            drm_adapter: synthetic_drm_adapter("frame-tree-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+
+    send_display_request(&mut client, 1, 2); // wl_display.get_registry
+    send_display_request(&mut client, 0, 3); // wl_display.sync
+    let globals = registry_globals(&mut client, 3);
+    let (compositor, compositor_version) = globals["wl_compositor"];
+    let (xdg_wm_base, xdg_version) = globals["xdg_wm_base"];
+    let (shm, shm_version) = globals["wl_shm"];
+    let (subcompositor, subcompositor_version) = globals["wl_subcompositor"];
+    bind_global(
+        &mut client,
+        compositor,
+        "wl_compositor",
+        compositor_version.min(5),
+        4,
+    );
+    bind_global(
+        &mut client,
+        xdg_wm_base,
+        "xdg_wm_base",
+        xdg_version.min(6),
+        5,
+    );
+    bind_global(&mut client, shm, "wl_shm", shm_version.min(1), 6);
+    bind_global(
+        &mut client,
+        subcompositor,
+        "wl_subcompositor",
+        subcompositor_version.min(1),
+        7,
+    );
+
+    send_request(&mut client, 4, 0, &words(&[8])); // wl_compositor.create_surface
+    send_request(&mut client, 5, 2, &words(&[9, 8])); // xdg_wm_base.get_xdg_surface
+    send_request(&mut client, 9, 1, &words(&[10])); // xdg_surface.get_toplevel
+    send_request(&mut client, 8, 6, &[]); // initial empty commit
+    send_display_request(&mut client, 0, 11);
+    let serial = events_until_callback(&mut client, 11)
+        .iter()
+        .find_map(|(object, opcode, body)| (*object == 9 && *opcode == 0).then(|| word(body, 0)))
+        .expect("xdg_surface.configure follows the initial empty commit");
+    send_request(&mut client, 9, 4, &words(&[serial])); // xdg_surface.ack_configure
+
+    let name = std::ffi::CString::new("cosmix-frame-tree-test").expect("static memfd name");
+    // SAFETY: name is a live NUL-terminated C string and the returned
+    // descriptor is transferred immediately into File.
+    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(
+        raw_fd >= 0,
+        "create anonymous test pool: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: memfd_create returned a new owned descriptor on success.
+    let pool = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+    // The parent's buffer fills the front of the pool and the child's sits
+    // immediately behind it, so neither can be satisfied by bytes belonging to
+    // the other. Sized exactly rather than generously: `wl_shm_pool.create_buffer`
+    // in `vendor/smithay/src/wayland/shm/handlers.rs:144` rejects
+    // `offset > size - stride * height`, so the child's offset may sit *on* that
+    // bound but not past it.
+    const PARENT_STRIDE: u32 = 64 * 4;
+    const PARENT_BYTES: u32 = PARENT_STRIDE * 32;
+    const CHILD_STRIDE: u32 = 16 * 4;
+    const CHILD_BYTES: u32 = CHILD_STRIDE * 16;
+    const POOL_BYTES: u32 = PARENT_BYTES + CHILD_BYTES;
+    pool.set_len(u64::from(POOL_BYTES))
+        .expect("size anonymous test pool");
+    send_request_with_fd(&mut client, 6, 0, &words(&[12, POOL_BYTES]), pool.as_fd()); // create_pool
+    send_request(
+        &mut client,
+        12,
+        0,
+        &words(&[
+            13,
+            0,
+            64,
+            32,
+            PARENT_STRIDE,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    ); // wl_shm_pool.create_buffer
+    send_request(&mut client, 8, 1, &words(&[13, 0, 0])); // wl_surface.attach
+    send_request(&mut client, 8, 6, &[]); // commit: the toplevel maps
+    send_display_request(&mut client, 0, 14);
+    events_until_callback(&mut client, 14);
+
+    // The child. A subsurface with a buffer of its own, so it is *mapped* — a
+    // subsurface that never attaches one is invisible, and the frame-callback
+    // request says a compositor should avoid completing callbacks for surfaces
+    // it is not drawing. Proving traversal against an invisible child would pin
+    // behaviour the protocol explicitly leaves a compositor free to drop, so the
+    // day this compositor learns to skip invisible surfaces the test would fail
+    // for being right. A mapped child is the case that must hold.
+    //
+    // It still never becomes a root record — `handle_frame` filters on
+    // `parent_surface().is_none()` — so the only path to its callback remains
+    // the tree walk from the toplevel.
+    send_request(&mut client, 4, 0, &words(&[15])); // wl_compositor.create_surface
+    send_request(&mut client, 7, 1, &words(&[16, 15, 8])); // wl_subcompositor.get_subsurface
+    send_request(
+        &mut client,
+        12,
+        0,
+        &words(&[
+            17,
+            PARENT_BYTES,
+            16,
+            16,
+            CHILD_STRIDE,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    ); // wl_shm_pool.create_buffer, for the child
+    send_request(&mut client, 15, 1, &words(&[17, 0, 0])); // child wl_surface.attach
+
+    send_request(&mut client, 8, 3, &words(&[18])); // parent wl_surface.frame
+    send_request(&mut client, 15, 3, &words(&[19])); // child wl_surface.frame
+    // A subsurface is synchronised by default, so the child's buffer and its
+    // frame request are cached here and applied by the parent's commit below.
+    send_request(&mut client, 15, 6, &[]); // commit the child
+
+    // Fenced, rather than run straight into the parent's commit. Back-to-back
+    // commits cannot tell "the child's state waited for its parent" from "the
+    // child's state was applied the moment it was committed" — both end with
+    // the same events on the wire, so a compositor that ignored synchronisation
+    // entirely would pass. The child's `wl_buffer.release` is generated while
+    // its commit is handled and flushed in the same dispatch as this sync's
+    // answer, so its *absence* here is the isolation.
+    send_display_request(&mut client, 0, 20);
+    let after_child_commit = events_until_callback(&mut client, 20);
+    let premature: Vec<(u32, u16)> = after_child_commit
+        .iter()
+        .filter(|(object, opcode, _)| *object == 17 && *opcode == 0)
+        .map(|(object, opcode, _)| (*object, *opcode))
+        .collect();
+    assert!(
+        premature.is_empty(),
+        "a synchronised subsurface's buffer may not be taken until its parent \
+         commits: {premature:?}"
+    );
+
+    send_request(&mut client, 8, 6, &[]); // commit the parent: both take effect
+
+    // Frame-paced, not commit-paced. A compositor that completed the callbacks
+    // while handling the commit would answer here, and every client would then
+    // render as fast as it could submit rather than once per compositor frame.
+    send_display_request(&mut client, 0, 21);
+    let before_frame = events_until_callback(&mut client, 21);
+    let early: Vec<(u32, u16)> = before_frame
+        .iter()
+        .filter(|(object, opcode, _)| matches!(*object, 18 | 19) && *opcode == 0)
+        .map(|(object, opcode, _)| (*object, *opcode))
+        .collect();
+    assert!(
+        early.is_empty(),
+        "no frame callback may complete before the compositor runs a frame: {early:?}"
+    );
+
+    // The parent's commit did take the child's cached buffer: exactly one
+    // `wl_buffer.release` for object 17, now that the fence above proved there
+    // were none before it.
+    let child_buffer_released = before_frame
+        .iter()
+        .filter(|(object, opcode, _)| *object == 17 && *opcode == 0)
+        .count();
+    assert_eq!(
+        child_buffer_released, 1,
+        "the parent's commit applies the subsurface's cached buffer and takes \
+         it, releasing it once"
+    );
+
+    // And the child really is *mapped*, which the release above does not prove:
+    // `retire_buffer_immediately` runs before the import's `Ok`/`Err` is even
+    // examined (`protocol/mod.rs`, in `commit_shm_buffer`), so a conversion that
+    // failed outright would release the buffer just the same and leave
+    // `record.mapped` false. Without this the fixture change is cosmetic — an
+    // attach that reached the compositor but was rejected would leave the child
+    // invisible again and nothing else here would notice. A `SurfaceUpserted`
+    // carrying the child's own dimensions is pushed only from the success arm,
+    // after `mapped` is set, so it is the renderer-visible statement that the
+    // child is on screen.
+    //
+    // The dimensions alone are not enough. `SurfaceLayout::visible` is the
+    // *effective* visibility — every ancestor's mapping state folded in — and
+    // `compositor_scene.rs` turns a false there straight into
+    // `Visibility::Hidden`, so a regression in the child's parent association
+    // or in the visibility recomputation could publish this very frame and
+    // still put nothing on screen. The frame-callback traversal does not filter
+    // on visibility, so the rest of this test would carry on passing. `parent`
+    // is required for the same reason in the other direction: it is what makes
+    // the 16x16 frame the *child's* rather than something else that happens to
+    // be that size.
+    //
+    // Polled to a deadline rather than read once: renderer events are published
+    // at the *end* of a protocol dispatch, after `flush_clients`, so the socket
+    // fence above says nothing about whether the batch has reached the channel
+    // yet.
+    let child_upsert_deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    let mut shm_upserts: Vec<(u32, u32, bool, bool)> = Vec::new();
+    let child_mapped = loop {
+        for event in runtime.drain_events().expect("protocol thread is alive") {
+            if let ProtocolEvent::SurfaceUpserted {
+                scene,
+                frame: SurfaceFrame::Shm(shm),
+                ..
+            } = event
+            {
+                shm_upserts.push((
+                    shm.width,
+                    shm.height,
+                    scene.layout.visible,
+                    scene.layout.parent.is_some(),
+                ));
+            }
+        }
+        if shm_upserts.contains(&(16, 16, true, true)) {
+            break true;
+        }
+        if Instant::now() >= child_upsert_deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        child_mapped,
+        "the subsurface's own buffer must reach the renderer as a visible 16x16 \
+         surface parented to the toplevel, not merely be released: saw \
+         (width, height, visible, has_parent) {shm_upserts:?}"
+    );
+
+    runtime
+        .finish_frame(Vec::new())
+        .expect("send compositor frame");
+
+    let delivered = wait_for_all_callbacks(&mut client, &[18, 19], 22);
+    let mut dones: Vec<u32> = delivered
+        .iter()
+        .filter(|(object, opcode, _)| matches!(*object, 18 | 19) && *opcode == 0)
+        .map(|(object, _, _)| *object)
+        .collect();
+    // Sorted, because the traversal order between a parent and its child is not
+    // something a client may rely on and not something this compositor should
+    // be pinned to — the observed order is in fact child-first. What *is*
+    // pinned is that both arrive, and that neither arrives twice.
+    dones.sort_unstable();
+    assert_eq!(
+        dones,
+        vec![18, 19],
+        "one frame completes the toplevel's callback and its subsurface's, once \
+         each — counted through a trailing fence, so a second completion of \
+         either would show up here: {dones:?}"
+    );
+
+    drop(client);
+    drop(runtime);
+}
+
+/// Destroying a role object publishes a removal, and publishes it *after* the
+/// frame that destruction invalidates.
+///
+/// `deactivate_surface_role` marks the record dormant and unmapped, and nothing
+/// else here says so to the renderer. `recompute_effective_visibility` emits a
+/// relayout only when the surface's *visibility* changes — which it does not for
+/// a surface that was already invisible, and a relayout is not a removal in any
+/// case. Without a removal the renderer holds an entity for a surface that
+/// `mapped_surface_ids` omits and `latest_surface_upsert` answers `Gone` for:
+/// nothing left can produce a delta about it, and a roster is installed only
+/// when some *other* event happens to be rejected.
+///
+/// Ordering is half the property. A client may commit a buffer and destroy the
+/// role in the same dispatch, and it is legal for it to do so — the commit is
+/// processed first, so a complete upsert for the surface is already queued when
+/// the role goes away. A removal published before it would be overwritten by
+/// that upsert in the outbox, which keys on the surface id and lets the newest
+/// event win. So the removal is driven here from exactly that sequence, and the
+/// assertion is on its position, not merely its presence.
+#[test]
+fn destroying_a_role_object_publishes_a_removal_after_the_frame_it_invalidates() {
+    let mut harness = KeybindingHarness::new(true);
+    let (victim, victim_object, victim_role) = harness.extra_mapped_subsurface_with_role();
+    let victim_id = harness.server.state.surfaces[&victim.id()].id;
+    assert!(
+        harness.server.state.surfaces[&victim.id()].mapped,
+        "the surface must start mapped, or there is no entity to strand"
+    );
+    for event in mem::take(&mut harness.server.state.events) {
+        if let Some(token) = protocol_event_dmabuf_token(&event) {
+            harness.server.state.release_buffer_token(token);
+        }
+    }
+
+    // One dispatch: a frame, then the role object's destruction.
+    let buffer_id = harness.create_dmabuf_buffer();
+    send_request(
+        &mut harness.client,
+        victim_object,
+        1,
+        &words(&[buffer_id, 0, 0]),
+    );
+    send_request(&mut harness.client, victim_object, 6, &[]);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    send_request(&mut harness.client, victim_role, 0, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after destroying the subsurface role");
+
+    let record = &harness.server.state.surfaces[&victim.id()];
+    assert!(
+        matches!(record.role, SurfaceRole::Dormant(_)) && !record.mapped,
+        "destroying the role leaves the record dormant and unmapped, which is \
+         the state the renderer has to be told about"
+    );
+    assert!(
+        !harness
+            .server
+            .state
+            .mapped_surface_ids()
+            .contains(&victim_id),
+        "and every membership statement from here on omits it"
+    );
+    assert!(
+        !harness.server.state.surface_is_recoverable(victim_id),
+        "and no per-surface recovery route can restore it"
+    );
+
+    let published = mem::take(&mut harness.server.state.events);
+    let upsert = published
+        .iter()
+        .position(
+            |event| matches!(event, ProtocolEvent::SurfaceUpserted { id, .. } if *id == victim_id),
+        )
+        .unwrap_or_else(|| {
+            panic!("the frame committed before the destroy is published: {published:?}")
+        });
+    let removal = published
+        .iter()
+        .position(|event| match event {
+            ProtocolEvent::SurfaceUnmapped { id } | ProtocolEvent::SurfaceDestroyed { id } => {
+                *id == victim_id
+            }
+            _ => false,
+        })
+        .unwrap_or_else(|| {
+            panic!("destroying the role publishes a removal for the surface: {published:?}")
+        });
+    assert!(
+        removal > upsert,
+        "and publishes it after the frame it invalidates, or the outbox keeps \
+         the upsert as the newest word about this id: {published:?}"
+    );
+
+    for event in published {
+        if let Some(token) = protocol_event_dmabuf_token(&event) {
+            harness.server.state.release_buffer_token(token);
+        }
+    }
+}
+
+/// A rejected *upsert* for a surface whose role the client has destroyed
+/// converges the renderer on membership, exactly as a rejected tombstone does.
+///
+/// Recovery is not a property of the event's variant. `dirty_surfaces` re-derives
+/// an upsert from the compositor's records, and `latest_surface_upsert` answers
+/// `Gone` for anything the compositor no longer calls presentable — so a mark
+/// set for such a surface is dropped again on the next pass, and the renderer
+/// keeps its entity forever. An upsert is a *complete state*, which is precisely
+/// why the variant looks recoverable; it is the surface that is not.
+///
+/// The state is reachable and needs no synthetic event: the commit-then-destroy
+/// sequence of the fixture above leaves a genuine, freshly-produced upsert in
+/// `state.events` for a record that is already dormant and unmapped. The
+/// producer gate cannot catch it — `push_surface_upsert` decides at production
+/// time, and the surface goes non-presentable afterwards, before the outbox is
+/// ever drained.
+///
+/// What this fixture *isolates* is the classifier, and deliberately. In
+/// production `publish_events` would queue the removal `deactivate_surface_role`
+/// publishes right behind this upsert, and that removal converges the renderer
+/// by a second route — it removes the entity if it is admitted, and installs a
+/// roster if it is rejected in turn. So the removal is dropped here rather than
+/// queued: with it present, a classifier that got this event wrong would still
+/// look correct, and the mutation that restores variant-based classification
+/// would survive. Every module that can make a surface non-presentable now owes
+/// the renderer a removal — `deactivate_surface_role` and the three re-role
+/// branches behind `publish_reroll_unmap` — so the classifier is the second
+/// line rather than the first, and it is tested as one.
+#[test]
+fn a_rejected_upsert_for_a_role_destroyed_surface_converges_on_membership() {
+    let mut harness = KeybindingHarness::new(true);
+    let survivor_buffer = harness.create_dmabuf_buffer();
+    harness.commit_dmabuf(survivor_buffer);
+    let survivor = harness.subsurface();
+    let survivor_id = harness.server.state.surfaces[&survivor.id()].id;
+    let (victim, victim_object, victim_role) = harness.extra_mapped_subsurface_with_role();
+    let victim_id = harness.server.state.surfaces[&victim.id()].id;
+    for event in mem::take(&mut harness.server.state.events) {
+        if let Some(token) = protocol_event_dmabuf_token(&event) {
+            harness.server.state.release_buffer_token(token);
+        }
+    }
+
+    let buffer_id = harness.create_dmabuf_buffer();
+    send_request(
+        &mut harness.client,
+        victim_object,
+        1,
+        &words(&[buffer_id, 0, 0]),
+    );
+    send_request(&mut harness.client, victim_object, 6, &[]);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    send_request(&mut harness.client, victim_role, 0, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after destroying the subsurface role");
+
+    let mut published = mem::take(&mut harness.server.state.events);
+    let stale_index = published
+        .iter()
+        .position(
+            |event| matches!(event, ProtocolEvent::SurfaceUpserted { id, .. } if *id == victim_id),
+        )
+        .unwrap_or_else(|| panic!("the invalidated frame is published: {published:?}"));
+    let stale = published.remove(stale_index);
+    for event in published {
+        if let Some(token) = protocol_event_dmabuf_token(&event) {
+            harness.server.state.release_buffer_token(token);
+        }
+    }
+    assert!(
+        !harness.server.state.surface_is_recoverable(victim_id),
+        "the rejected event must name a surface with no recovery route, or this \
+         fixture is the ordinary deferral case wearing a different name"
+    );
+
+    // Saturate with entries eviction may not take, so the arithmetic forces the
+    // rejection rather than an eviction making room. Same derivation as
+    // `rejected_lifecycle_converges_renderer_membership_to_the_authoritative_roster`.
+    let event_bytes = protocol_event_retained_bytes(&stale);
+    let limit = event_bytes * 3;
+    let filler = [SurfaceId(9_301), SurfaceId(9_302), SurfaceId(9_303)];
+    for id in filler {
+        harness
+            .server
+            .queue_renderer_event_with_test_limit(ProtocolEvent::SurfaceDestroyed { id }, limit);
+    }
+    assert!(
+        event_bytes <= limit,
+        "the upsert must be admissible on its own, or it is refused before \
+         eviction is ever considered: {event_bytes} vs {limit}"
+    );
+    assert_eq!(
+        harness.server.pending_events.bytes, limit,
+        "the outbox must already be full"
+    );
+    assert!(
+        !harness
+            .server
+            .pending_events
+            .surfaces
+            .contains_key(&victim_id),
+        "and hold nothing under the incoming id, which would let the upsert \
+         replace it in place"
+    );
+    let evictable = harness
+        .server
+        .pending_events
+        .surfaces
+        .values()
+        .filter(|queued| {
+            matches!(
+                queued,
+                ProtocolEvent::SurfaceUpserted { .. } | ProtocolEvent::SurfaceRelayout { .. }
+            )
+        })
+        .map(protocol_event_retained_bytes)
+        .sum::<usize>();
+    assert!(
+        event_bytes > evictable,
+        "and taking every candidate must still not make room: {event_bytes} vs \
+         {evictable}"
+    );
+    assert!(
+        harness.server.pending_events.roster.is_none(),
+        "and no roster yet, or the postconditions below test nothing new"
+    );
+    harness.server.dirty_surfaces.insert(survivor_id);
+
+    harness
+        .server
+        .queue_renderer_event_with_test_limit(stale, limit);
+
+    let ProtocolEvent::SurfaceRoster { mapped } = harness
+        .server
+        .pending_events
+        .roster
+        .as_ref()
+        .expect("a rejected upsert for an unrecoverable surface installs a roster")
+    else {
+        panic!("the roster slot holds a roster");
+    };
+    assert!(
+        !mapped.contains(&victim_id),
+        "the roster is what removes the stranded entity: {mapped:?}"
+    );
+    assert!(
+        mapped.contains(&survivor_id),
+        "and it must not remove anything else: {mapped:?}"
+    );
+    assert!(
+        !harness.server.dirty_surfaces.contains(&victim_id),
+        "and the caller must not defer instead: a recovery mark for this \
+         surface is dropped as `Gone` on the next pass, leaving the renderer \
+         holding it forever"
+    );
+    assert!(
+        harness.server.dirty_surfaces.contains(&survivor_id),
+        "while a mark for a surface recovery can still act on survives"
+    );
+
+    for token in harness
+        .server
+        .pending_events
+        .take()
+        .iter()
+        .filter_map(protocol_event_dmabuf_token)
+    {
+        harness.server.state.release_buffer_token(token);
+    }
+}
+
+/// A second `xdg_surface` for a `wl_surface` that already has a role is a fatal
+/// `xdg_wm_base.role` error, and it is refused **at `get_xdg_surface`**.
+///
+/// The refusal used to live in this compositor's `new_toplevel`, which is both
+/// late and incomplete: it can only see a duplicate that goes on to *ask for a
+/// role*. A duplicate `xdg_surface` that never does is still not inert. Its
+/// `set_window_geometry` and `ack_configure`
+/// (`vendor/smithay/src/wayland/shell/xdg/handlers/surface.rs`) used to check
+/// `compositor::get_role(wl_surface)` — which is `Some` precisely because the
+/// *original* live role set it — so both passed and wrote into state shared
+/// with the live role object: the geometry into `SurfaceCachedState.pending()`,
+/// and the live role's configure serials consumed out from under it.
+///
+/// So the sequence is refused at its first illegal request, before
+/// `data_init.init` gives the client an object at all. That the surface's role
+/// is *permanent* is what makes `get_role` the right predicate rather than a
+/// scan for a live role object; re-taking the same role through the **existing**
+/// `xdg_surface` stays legal and is covered separately.
+///
+/// This fixture deliberately never sends `get_toplevel`. If it did, it could
+/// not tell an early refusal from a late one.
+#[test]
+fn a_second_xdg_surface_for_a_role_bearing_wl_surface_is_a_fatal_protocol_error() {
+    const STRIDE: u32 = 16 * 4;
+    const HEIGHT: u32 = 16;
+    const POOL_BYTES: u32 = STRIDE * HEIGHT;
+
+    let runtime_dir =
+        env::var_os("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR is required for the re-role oracle");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-reroll-{}-{unique}", std::process::id());
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "reroll-test".into(),
+            drm_adapter: synthetic_drm_adapter("reroll-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+    let _pool = bring_up_shm_toplevel(&mut client, POOL_BYTES, "cosmix-reroll-test");
+
+    // Object 12 is the caller's first id after the helper's; ids must stay
+    // dense and increasing for wayland-rs.
+    send_request(
+        &mut client,
+        11,
+        0,
+        &words(&[12, 0, 16, HEIGHT, STRIDE, wl_shm::Format::Argb8888 as u32]),
+    ); // wl_shm_pool.create_buffer
+    send_request(&mut client, 7, 1, &words(&[12, 0, 0])); // wl_surface.attach
+    send_request(&mut client, 7, 6, &[]); // commit: the toplevel maps
+
+    // The id the renderer was given an entity for. Polled to a deadline:
+    // renderer events publish at the end of a protocol dispatch, after
+    // `flush_clients`, so a socket fence says nothing about the channel.
+    let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    let mapped_id = loop {
+        let found = runtime
+            .drain_events()
+            .expect("protocol thread is alive")
+            .into_iter()
+            .find_map(|event| match event {
+                ProtocolEvent::SurfaceUpserted { id, .. } => Some(id),
+                _ => None,
+            });
+        if let Some(id) = found {
+            break id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the mapped toplevel must reach the renderer first, or there is no \
+             entity here to strand"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    // A second `xdg_surface` for the same `wl_surface`, whose live
+    // `xdg_toplevel` already gave it a role. Nothing follows it: this one
+    // request is the whole violation, and the refusal must not wait for a
+    // `get_toplevel` that a hostile client need never send.
+    send_request(&mut client, 5, 2, &words(&[13, 7])); // xdg_wm_base.get_xdg_surface
+
+    // No sync fence here on purpose: the sequence is fatal, so the callback
+    // would never arrive and the wait would fail on the disconnect instead of
+    // reporting the error that caused it.
+    let (offending, code, message) = read_protocol_error(&mut client);
+    assert_eq!(
+        offending, 5,
+        "the error must name the xdg_wm_base that was asked for the offending \
+         xdg_surface, not the wl_surface and not the object it refused to \
+         create: {message}"
+    );
+    assert_eq!(
+        code,
+        xdg_wm_base::Error::Role as u32,
+        "get_xdg_surface for a role-bearing wl_surface is xdg_wm_base.role, the \
+         error the protocol names for it: {message}"
+    );
+
+    // And it must be fatal, not advisory. The whole reason for refusing is that
+    // there is no consistent state left once a second wrapper exists on the
+    // surface, so a client that ignores the error and carries on is exactly the
+    // case this must not permit.
+    client
+        .set_read_timeout(Some(PROTOCOL_ACK_DEADLINE))
+        .expect("read timeout on the client socket");
+    let mut scratch = [0u8; 256];
+    let disconnect_deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    loop {
+        match client.read(&mut scratch) {
+            Ok(0) => break,
+            Ok(_) => assert!(
+                Instant::now() < disconnect_deadline,
+                "the compositor must terminate the client that asked for a \
+                 second xdg_surface on surface {}, not merely warn it",
+                mapped_id.0
+            ),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("reading the dying connection failed: {error}"),
+        }
+    }
+
+    drop(client);
+    drop(runtime);
+}
+
+/// The other duplicate: a second role object on *one* `xdg_surface`.
+///
+/// [`a_second_xdg_surface_for_a_role_bearing_wl_surface_is_a_fatal_protocol_error`]
+/// covers the wrapper being duplicated. This is the wrapper being reused, which
+/// `get_xdg_surface` cannot see and which the protocol gives its own error for:
+/// `xdg_surface.already_constructed`, named on the `xdg_surface` rather than on
+/// the `xdg_wm_base`.
+///
+/// It has to be pinned separately because `give_role` cannot catch it either.
+/// `PrivateSurfaceData::set_role` (`vendor/smithay/src/wayland/compositor/
+/// tree.rs:170`) rejects only a *different* role, so a second `get_popup` on a
+/// surface that is already a popup passes straight through it. Without the
+/// explicit `has_active_role` check the second `xdg_popup` would be created and
+/// two live role objects would drive one surface.
+///
+/// Popup rather than toplevel on purpose: `GetToplevel` and `GetPopup` are
+/// separate arms and each carries its own copy of the check, so a fixture for
+/// one leaves the other free to accept a duplicate.
+#[test]
+fn a_second_role_object_on_one_xdg_surface_is_a_fatal_protocol_error() {
+    const STRIDE: u32 = 16 * 4;
+    const HEIGHT: u32 = 16;
+    const POOL_BYTES: u32 = STRIDE * HEIGHT;
+
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the duplicate-popup oracle");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-dup-popup-{}-{unique}", std::process::id());
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "dup-popup-test".into(),
+            drm_adapter: synthetic_drm_adapter("dup-popup-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+    let _pool = bring_up_shm_toplevel(&mut client, POOL_BYTES, "cosmix-dup-popup-test");
+
+    // Map the toplevel first: a popup on an unmapped parent is a different
+    // argument, and the case worth pinning is the one where the compositor is
+    // already presenting the tree the duplicate would corrupt.
+    send_request(
+        &mut client,
+        11,
+        0,
+        &words(&[12, 0, 16, HEIGHT, STRIDE, wl_shm::Format::Argb8888 as u32]),
+    ); // wl_shm_pool.create_buffer
+    send_request(&mut client, 7, 1, &words(&[12, 0, 0])); // wl_surface.attach
+    send_request(&mut client, 7, 6, &[]); // commit: the toplevel maps
+
+    send_request(&mut client, 5, 1, &words(&[13])); // xdg_wm_base.create_positioner
+    send_request(&mut client, 13, 1, &words(&[16, 16])); // xdg_positioner.set_size
+    send_request(&mut client, 13, 2, &words(&[0, 0, 16, 16])); // set_anchor_rect
+    send_request(&mut client, 4, 0, &words(&[14])); // wl_compositor.create_surface
+    send_request(&mut client, 5, 2, &words(&[15, 14])); // xdg_wm_base.get_xdg_surface
+    send_request(&mut client, 15, 2, &words(&[16, 8, 13])); // xdg_surface.get_popup
+    send_display_request(&mut client, 0, 17);
+    let after_popup = events_until_callback(&mut client, 17);
+    assert!(
+        after_popup
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "the first popup must be accepted, or the duplicate below is not the \
+         thing being refused: {after_popup:?}"
+    );
+
+    // A second role object through the *same* `xdg_surface`, with the first
+    // still alive. Object 15 is reused deliberately: asking for a second
+    // `xdg_surface` would be refused earlier, by a different check, and would
+    // not exercise this one.
+    send_request(&mut client, 15, 2, &words(&[18, 8, 13])); // xdg_surface.get_popup
+
+    let (offending, code, message) = read_protocol_error(&mut client);
+    assert_eq!(
+        offending, 15,
+        "the error must name the xdg_surface that was asked for a second role \
+         object, not the xdg_wm_base and not the object it refused to create: \
+         {message}"
+    );
+    assert_eq!(
+        code,
+        xdg_surface::Error::AlreadyConstructed as u32,
+        "reusing an xdg_surface that already has a role object is \
+         xdg_surface.already_constructed, not the xdg_wm_base.role code that \
+         belongs to a role conflict on the wl_surface: {message}"
+    );
+
+    drop(client);
+    drop(runtime);
+}
+
+/// A runtime and a client that has bound `wl_compositor` and `xdg_wm_base` and
+/// nothing else.
+///
+/// The role-guard oracles below need neither a buffer nor a mapped surface —
+/// every one of them is refused before any of that is read — so they bind the
+/// two globals they use and no more. Ids: 2 registry, 3 sync,
+/// 4 `wl_compositor`, 5 `xdg_wm_base`. The caller continues from 6.
+fn role_guard_runtime(label: &str) -> (WaylandRuntime, UnixStream) {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the role-guard oracles");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-role-{label}-{}-{unique}", std::process::id());
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "role-guard-test".into(),
+            drm_adapter: synthetic_drm_adapter("role-guard-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+
+    send_display_request(&mut client, 1, 2); // wl_display.get_registry
+    send_display_request(&mut client, 0, 3); // wl_display.sync
+    let globals = registry_globals(&mut client, 3);
+    let (compositor, compositor_version) = globals["wl_compositor"];
+    let (xdg_wm_base, xdg_version) = globals["xdg_wm_base"];
+    bind_global(
+        &mut client,
+        compositor,
+        "wl_compositor",
+        compositor_version.min(5),
+        4,
+    );
+    bind_global(
+        &mut client,
+        xdg_wm_base,
+        "xdg_wm_base",
+        xdg_version.min(6),
+        5,
+    );
+
+    (runtime, client)
+}
+
+/// Bring up the one shape `get_xdg_surface` structurally cannot refuse: two
+/// live wrappers on one `wl_surface`, the second created while the surface was
+/// still role-less, and only then a role taken through the first.
+///
+/// This sequence is legal — at the moment the second `get_xdg_surface` arrives,
+/// `get_role` answers `None` and there is nothing to object to — and it is the
+/// reason the guards downstream of it exist. Every oracle that follows drives
+/// wrapper 8, a live `xdg_surface` on a surface whose role belongs to somebody
+/// else, which is precisely the object the pre-round-6 code let through into
+/// `set_window_geometry` and `ack_configure`.
+///
+/// Ids: 6 `wl_surface`, 7 first wrapper, 8 second wrapper, 9 the first
+/// wrapper's `xdg_toplevel`, 10 sync. The caller continues from 11.
+fn two_wrappers_then_one_role(client: &mut UnixStream) {
+    send_request(client, 4, 0, &words(&[6])); // wl_compositor.create_surface
+    send_request(client, 5, 2, &words(&[7, 6])); // xdg_wm_base.get_xdg_surface
+    send_request(client, 5, 2, &words(&[8, 6])); // xdg_wm_base.get_xdg_surface, again
+    send_request(client, 7, 1, &words(&[9])); // xdg_surface.get_toplevel
+    send_request(client, 6, 6, &[]); // initial empty commit
+    send_display_request(client, 0, 10);
+
+    let events = events_until_callback(client, 10);
+    assert!(
+        events
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "two role-less wrappers on one wl_surface must be accepted, or the \
+         refusals below are about creating the second wrapper rather than about \
+         using it: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(object, opcode, _)| *object == 7 && *opcode == 0),
+        "the configure must arrive on wrapper 7, which owns the role — a fixture \
+         that could not tell the two wrappers apart would prove nothing about \
+         which one the later requests corrupt: {events:?}"
+    );
+}
+
+/// A wrapper that never constructed a role object cannot write the live role's
+/// window geometry.
+///
+/// This is the concrete corruption the round-6 review named. `set_window_geometry`
+/// used to gate on `compositor::get_role(wl_surface).is_some()`, which is `Some`
+/// here for a reason that has nothing to do with wrapper 8: the role is stamped
+/// on the `wl_surface` and belongs to wrapper 7's `xdg_toplevel`. The geometry
+/// then landed in `SurfaceCachedState.pending()` — shared per-`wl_surface`
+/// state — and silently became the live toplevel's.
+///
+/// The guard is `has_active_role`, which is per-wrapper, so the answer is
+/// `xdg_surface.not_constructed` on wrapper 8.
+#[test]
+fn a_role_less_wrapper_cannot_write_the_live_roles_window_geometry() {
+    let (runtime, mut client) = role_guard_runtime("geometry");
+    two_wrappers_then_one_role(&mut client);
+
+    send_request(&mut client, 8, 3, &words(&[0, 0, 32, 32])); // xdg_surface.set_window_geometry
+
+    let (offending, code, message) = read_protocol_error(&mut client);
+    assert_eq!(
+        offending, 8,
+        "the error must name the role-less wrapper that made the request, not \
+         the wrapper that holds the role: {message}"
+    );
+    assert_eq!(
+        code,
+        xdg_surface::Error::NotConstructed as u32,
+        "a wrapper with no role object of its own is not_constructed, however \
+         the wl_surface's permanent role reads: {message}"
+    );
+
+    drop(client);
+    drop(runtime);
+}
+
+/// The same wrapper cannot consume the live role's configure serials either.
+///
+/// A separate oracle from the geometry one because it is a separate arm of the
+/// same match, and a mutation that restores the old predicate on only one of
+/// them has to fail something. The damage differs too: this one desynchronises
+/// the live toplevel's configure handshake rather than its geometry.
+///
+/// The serial sent is arbitrary. The guard runs before the serial is looked up,
+/// which is the point — a role-less wrapper must be refused for being role-less,
+/// not for guessing wrong.
+#[test]
+fn a_role_less_wrapper_cannot_consume_the_live_roles_configure_serial() {
+    let (runtime, mut client) = role_guard_runtime("ack");
+    two_wrappers_then_one_role(&mut client);
+
+    send_request(&mut client, 8, 4, &words(&[1])); // xdg_surface.ack_configure
+
+    let (offending, code, message) = read_protocol_error(&mut client);
+    assert_eq!(
+        offending, 8,
+        "the error must name the role-less wrapper that acked: {message}"
+    );
+    assert_eq!(
+        code,
+        xdg_surface::Error::NotConstructed as u32,
+        "acking through a wrapper with no role object is not_constructed, not \
+         invalid_serial — the request never gets as far as the serial: {message}"
+    );
+
+    drop(client);
+    drop(runtime);
+}
+
+/// The role-less wrapper cannot obtain a second `xdg_toplevel` for the surface
+/// either, and `give_role` is not what stops it.
+///
+/// `PrivateSurfaceData::set_role` (`vendor/smithay/src/wayland/compositor/
+/// tree.rs:170`) rejects only a *different* role, so the second toplevel passes
+/// straight through it: same role string, no complaint, two live `xdg_toplevel`s
+/// driving one surface. `has_active_role` does not catch it either — wrapper 8
+/// has none, which is exactly why it is being asked.
+///
+/// The only authority left is `known_toplevels`, which the role destructors
+/// maintain synchronously, so the answer is `xdg_wm_base.role` on the shell.
+#[test]
+fn a_role_less_wrapper_cannot_duplicate_the_live_toplevel_role() {
+    let (runtime, mut client) = role_guard_runtime("dup-toplevel");
+    two_wrappers_then_one_role(&mut client);
+
+    send_request(&mut client, 8, 1, &words(&[11])); // xdg_surface.get_toplevel
+
+    let (offending, code, message) = read_protocol_error(&mut client);
+    assert_eq!(
+        offending, 5,
+        "a conflict over the wl_surface's role is posted on the xdg_wm_base, \
+         which is where the protocol puts the `role` code: {message}"
+    );
+    assert_eq!(
+        code,
+        xdg_wm_base::Error::Role as u32,
+        "a second live xdg_toplevel for one wl_surface is xdg_wm_base.role: \
+         {message}"
+    );
+
+    drop(client);
+    drop(runtime);
+}
+
+/// The popup half of the same scan, because `known_popups` is a separate list
+/// consulted by a separate handler arm.
+///
+/// Everything in [`a_role_less_wrapper_cannot_duplicate_the_live_toplevel_role`]
+/// applies unchanged — `set_role` compares role strings and waves the duplicate
+/// through, `has_active_role` is false on the wrapper being asked — so the two
+/// arms fail identically and independently. The parent is mapped first because
+/// `new_popup` dismisses a popup on an unmapped parent, and a fixture whose
+/// first popup was dismissed would not be pinning a duplicate of anything.
+#[test]
+fn a_role_less_wrapper_cannot_duplicate_the_live_popup_role() {
+    const STRIDE: u32 = 16 * 4;
+    const HEIGHT: u32 = 16;
+    const POOL_BYTES: u32 = STRIDE * HEIGHT;
+
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the duplicate-popup-role oracle");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-dup-popup-role-{}-{unique}", std::process::id());
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "dup-popup-role-test".into(),
+            drm_adapter: synthetic_drm_adapter("dup-popup-role-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+    let _pool = bring_up_shm_toplevel(&mut client, POOL_BYTES, "cosmix-dup-popup-role");
+
+    send_request(
+        &mut client,
+        11,
+        0,
+        &words(&[12, 0, 16, HEIGHT, STRIDE, wl_shm::Format::Argb8888 as u32]),
+    ); // wl_shm_pool.create_buffer
+    send_request(&mut client, 7, 1, &words(&[12, 0, 0])); // wl_surface.attach
+    send_request(&mut client, 7, 6, &[]); // commit: the toplevel maps
+
+    send_request(&mut client, 5, 1, &words(&[13])); // xdg_wm_base.create_positioner
+    send_request(&mut client, 13, 1, &words(&[16, 16])); // xdg_positioner.set_size
+    send_request(&mut client, 13, 2, &words(&[0, 0, 16, 16])); // set_anchor_rect
+
+    // Two wrappers again, both created while the popup surface is still
+    // role-less, so neither `get_xdg_surface` can object to the other.
+    send_request(&mut client, 4, 0, &words(&[14])); // wl_compositor.create_surface
+    send_request(&mut client, 5, 2, &words(&[15, 14])); // xdg_wm_base.get_xdg_surface
+    send_request(&mut client, 5, 2, &words(&[16, 14])); // xdg_wm_base.get_xdg_surface, again
+    send_request(&mut client, 15, 2, &words(&[17, 8, 13])); // xdg_surface.get_popup
+    send_display_request(&mut client, 0, 18);
+    let events = events_until_callback(&mut client, 18);
+    assert!(
+        events
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "two role-less wrappers and one popup between them must be accepted: \
+         {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 17 && *opcode == 1)),
+        "and the popup must not have been dismissed — xdg_popup.popup_done here \
+         means the parent was unmapped and there is no live popup to duplicate: \
+         {events:?}"
+    );
+
+    // The second popup, through the other wrapper.
+    send_request(&mut client, 16, 2, &words(&[19, 8, 13])); // xdg_surface.get_popup
+
+    let (offending, code, message) = read_protocol_error(&mut client);
+    assert_eq!(
+        offending, 5,
+        "a conflict over the wl_surface's role is posted on the xdg_wm_base: \
+         {message}"
+    );
+    assert_eq!(
+        code,
+        xdg_wm_base::Error::Role as u32,
+        "a second live xdg_popup for one wl_surface is xdg_wm_base.role: \
+         {message}"
+    );
+
+    drop(client);
+    drop(runtime);
+}
+
+/// A second `xdg_toplevel` on one `xdg_surface`, which is the other error
+/// entirely.
+///
+/// The wrapper is the same object, so this is not a role conflict on the
+/// `wl_surface` — it is `xdg_surface.already_constructed`, named on the
+/// `xdg_surface`. Pinned separately from the popup case because `GetToplevel`
+/// and `GetPopup` carry their own copies of the check.
+#[test]
+fn a_second_toplevel_on_one_xdg_surface_is_a_fatal_protocol_error() {
+    let (runtime, mut client) = role_guard_runtime("second-toplevel");
+
+    send_request(&mut client, 4, 0, &words(&[6])); // wl_compositor.create_surface
+    send_request(&mut client, 5, 2, &words(&[7, 6])); // xdg_wm_base.get_xdg_surface
+    send_request(&mut client, 7, 1, &words(&[8])); // xdg_surface.get_toplevel
+    send_request(&mut client, 6, 6, &[]); // initial empty commit
+    send_display_request(&mut client, 0, 9);
+    let events = events_until_callback(&mut client, 9);
+    assert!(
+        events
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "the first toplevel must be accepted: {events:?}"
+    );
+
+    // The same wrapper, asked a second time, with the first role object alive.
+    send_request(&mut client, 7, 1, &words(&[10])); // xdg_surface.get_toplevel
+
+    let (offending, code, message) = read_protocol_error(&mut client);
+    assert_eq!(
+        offending, 7,
+        "the error must name the xdg_surface that was asked twice: {message}"
+    );
+    assert_eq!(
+        code,
+        xdg_surface::Error::AlreadyConstructed as u32,
+        "reusing a wrapper that already has a role object is \
+         xdg_surface.already_constructed: {message}"
+    );
+
+    drop(client);
+    drop(runtime);
+}
+
+/// Destroying an `xdg_toplevel` frees the wrapper to take the role again, and
+/// does *not* free the `wl_surface` to be wrapped again.
+///
+/// Both halves matter and they pull in opposite directions, which is why they
+/// share a fixture. `get_xdg_surface` tests `get_role`, and a core role is
+/// permanent — `set_role` never clears `public_data.role` — so no scan for a
+/// *live* role object would refuse the second half here, and none should:
+/// re-wrapping a surface whose role is stamped forever is the violation.
+/// `has_active_role` is per-wrapper and *is* cleared by the role object's
+/// destructor, which is what keeps the first half legal.
+///
+/// A client recreating a window uses the first half. Get it wrong and the
+/// refusal is not a hardening measure, it is a regression that breaks ordinary
+/// clients — so it is asserted before the fatal half, which ends the connection.
+#[test]
+fn destroying_a_role_object_frees_the_wrapper_but_never_the_surface() {
+    let (runtime, mut client) = role_guard_runtime("re-role");
+
+    send_request(&mut client, 4, 0, &words(&[6])); // wl_compositor.create_surface
+    send_request(&mut client, 5, 2, &words(&[7, 6])); // xdg_wm_base.get_xdg_surface
+    send_request(&mut client, 7, 1, &words(&[8])); // xdg_surface.get_toplevel
+    send_request(&mut client, 6, 6, &[]); // initial empty commit
+    send_request(&mut client, 8, 0, &[]); // xdg_toplevel.destroy
+
+    // Re-taking the role through the *existing* wrapper, which is the whole
+    // reason `has_active_role` is a per-wrapper flag rather than a lookup on
+    // the surface.
+    send_request(&mut client, 7, 1, &words(&[9])); // xdg_surface.get_toplevel
+    send_request(&mut client, 6, 6, &[]);
+    send_display_request(&mut client, 0, 10);
+    let events = events_until_callback(&mut client, 10);
+    assert!(
+        events
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "recreating the role through the same xdg_surface must stay legal: \
+         {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(object, opcode, _)| *object == 7 && *opcode == 0),
+        "and it must be a working role, not merely an unrefused one — the \
+         replacement has to be configured: {events:?}"
+    );
+
+    // A fresh wrapper for the same surface, whose role is stamped for good.
+    send_request(&mut client, 5, 2, &words(&[11, 6])); // xdg_wm_base.get_xdg_surface
+
+    let (offending, code, message) = read_protocol_error(&mut client);
+    assert_eq!(
+        offending, 5,
+        "the error must name the xdg_wm_base that was asked for the wrapper: \
+         {message}"
+    );
+    assert_eq!(
+        code,
+        xdg_wm_base::Error::Role as u32,
+        "the wl_surface's role outlives its role object, so a fresh wrapper for \
+         it is still xdg_wm_base.role: {message}"
+    );
+
+    drop(client);
+    drop(runtime);
+}
+
+/// Destroying an `xdg_surface` before its role object is `defunct_role_object`,
+/// on the `xdg_surface`.
+///
+/// It used to be reported as `xdg_wm_base.role`, on the shell: the wrong code —
+/// `role` is for a role conflict on a `wl_surface`, which this is not — and the
+/// wrong object, so a client tracing the error learned nothing about which
+/// `xdg_surface` it destroyed out of order. xdg_shell names this case
+/// explicitly and this pins the name.
+#[test]
+fn destroying_an_xdg_surface_before_its_role_object_names_the_defunct_surface() {
+    let (runtime, mut client) = role_guard_runtime("defunct");
+
+    send_request(&mut client, 4, 0, &words(&[6])); // wl_compositor.create_surface
+    send_request(&mut client, 5, 2, &words(&[7, 6])); // xdg_wm_base.get_xdg_surface
+    send_request(&mut client, 7, 1, &words(&[8])); // xdg_surface.get_toplevel
+    send_request(&mut client, 6, 6, &[]); // initial empty commit
+    send_display_request(&mut client, 0, 9);
+    let events = events_until_callback(&mut client, 9);
+    assert!(
+        events
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "the toplevel must be accepted before its wrapper is destroyed out of \
+         order: {events:?}"
+    );
+
+    // The wrapper first, with its `xdg_toplevel` still alive.
+    send_request(&mut client, 7, 0, &[]); // xdg_surface.destroy
+
+    let (offending, code, message) = read_protocol_error(&mut client);
+    assert_eq!(
+        offending, 7,
+        "the error must name the xdg_surface that was destroyed early, not the \
+         xdg_wm_base: {message}"
+    );
+    assert_eq!(
+        code,
+        xdg_surface::Error::DefunctRoleObject as u32,
+        "xdg_shell names this defunct_role_object; xdg_wm_base.role is the code \
+         for a role conflict and means something else: {message}"
+    );
+
+    drop(client);
+    drop(runtime);
+}
+
+/// A duplicate `wl_subsurface` never reaches this compositor at all, and that
+/// is load-bearing rather than incidental.
+///
+/// `new_subsurface` has no duplicate guard of its own, and the reason is that
+/// smithay refuses first: `wl_subcompositor.get_subsurface` calls
+/// `PrivateSurfaceData::set_parent` (`vendor/smithay/src/wayland/compositor/
+/// tree.rs:374`), which returns `AlreadyHasRole` while the child still has a
+/// parent, and the handler then posts `wl_subcompositor.bad_surface` and
+/// returns *before* `data_init.init` — so the handler this compositor
+/// implements is never invoked. That is an assumption about vendored code we
+/// patch, which makes it exactly the kind of thing that must be pinned: if a
+/// future smithay bump softens that path, this fails instead of silently
+/// handing `new_subsurface` a case it does not check.
+#[test]
+fn a_second_subsurface_on_a_live_subsurface_is_refused_before_this_compositor_sees_it() {
+    const PARENT_STRIDE: u32 = 16 * 4;
+    const PARENT_BYTES: u32 = PARENT_STRIDE * 16;
+
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the duplicate-subsurface oracle");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-dup-subsurface-{}-{unique}", std::process::id());
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "dup-subsurface-test".into(),
+            drm_adapter: synthetic_drm_adapter("dup-subsurface-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+    let _pool = bring_up_shm_toplevel_with_subcompositor(
+        &mut client,
+        PARENT_BYTES,
+        "cosmix-dup-subsurface-test",
+    );
+
+    send_request(
+        &mut client,
+        13,
+        0,
+        &words(&[
+            14,
+            0,
+            16,
+            16,
+            PARENT_STRIDE,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    ); // wl_shm_pool.create_buffer
+    send_request(&mut client, 9, 1, &words(&[14, 0, 0])); // wl_surface.attach
+    send_request(&mut client, 9, 6, &[]); // commit: the toplevel maps
+
+    send_request(&mut client, 4, 0, &words(&[15])); // wl_compositor.create_surface
+    send_request(&mut client, 7, 1, &words(&[16, 15, 9])); // wl_subcompositor.get_subsurface
+    send_display_request(&mut client, 0, 17);
+    let after_subsurface = events_until_callback(&mut client, 17);
+    assert!(
+        after_subsurface
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "the first subsurface must be accepted: {after_subsurface:?}"
+    );
+
+    // A second `wl_subsurface` for the same child, with the first still alive.
+    send_request(&mut client, 7, 1, &words(&[18, 15, 9])); // wl_subcompositor.get_subsurface
+
+    let (offending, code, message) = read_protocol_error(&mut client);
+    assert_eq!(
+        offending, 7,
+        "smithay posts on the wl_subcompositor that was asked, not on either \
+         wl_surface: {message}"
+    );
+    assert_eq!(
+        code,
+        wl_subcompositor::Error::BadSurface as u32,
+        "the subsurface duplicate is wl_subcompositor.bad_surface, a different \
+         error from the xdg one and on a different interface: {message}"
+    );
+
+    drop(client);
+    drop(runtime);
+}
+
+/// A subsurface cannot be wrapped in an `xdg_surface` at all, which is what
+/// proves the `get_xdg_surface` guard is a role test rather than an xdg one.
+///
+/// `PrivateSurfaceData::set_parent` stamps `SUBSURFACE_ROLE` on the surface
+/// (`vendor/smithay/src/wayland/compositor/tree.rs:379`), so
+/// `compositor::get_role` answers `Some` for a reason that has nothing to do
+/// with xdg_shell. The guard is written against *that* — any role, from any
+/// protocol — and not against a scan of `known_toplevels`/`known_popups`, which
+/// would see nothing here and wave the wrapper through. Layer-shell,
+/// session-lock, Xwayland-override-redirect, cursor and drag-icon surfaces all
+/// depend on the same generality; the subsurface is simply the one this
+/// compositor can construct offline.
+///
+/// The message assertion is the load-bearing half. `give_role` would *also*
+/// refuse this sequence, one request later, with its own wording — so an
+/// assertion that merely finds an error cannot tell an early refusal from a
+/// late one, and the late one is the shape that lets an initialised duplicate
+/// wrapper reach `set_window_geometry` and `ack_configure`.
+#[test]
+fn a_live_subsurface_cannot_obtain_an_xdg_surface_wrapper() {
+    const PARENT_STRIDE: u32 = 16 * 4;
+    const PARENT_BYTES: u32 = PARENT_STRIDE * 16;
+
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the cross-role refusal oracle");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-cross-role-{}-{unique}", std::process::id());
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "cross-role-test".into(),
+            drm_adapter: synthetic_drm_adapter("cross-role-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+    let _pool =
+        bring_up_shm_toplevel_with_subcompositor(&mut client, PARENT_BYTES, "cosmix-cross-role");
+
+    send_request(
+        &mut client,
+        13,
+        0,
+        &words(&[
+            14,
+            0,
+            16,
+            16,
+            PARENT_STRIDE,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    ); // wl_shm_pool.create_buffer
+    send_request(&mut client, 9, 1, &words(&[14, 0, 0])); // wl_surface.attach
+    send_request(&mut client, 9, 6, &[]); // commit: the toplevel maps
+
+    send_request(&mut client, 4, 0, &words(&[15])); // wl_compositor.create_surface
+    send_request(&mut client, 7, 1, &words(&[16, 15, 9])); // wl_subcompositor.get_subsurface
+    send_display_request(&mut client, 0, 17);
+    let after_subsurface = events_until_callback(&mut client, 17);
+    assert!(
+        after_subsurface
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "the subsurface must be accepted first: {after_subsurface:?}"
+    );
+
+    // Ask only for the wrapper, on the surface that is already a subsurface.
+    // No `get_toplevel` follows, deliberately: the wrapper itself is the whole
+    // violation, and a fixture that sent one could not tell whether the
+    // refusal came from here or from `give_role` a request later.
+    send_request(&mut client, 5, 2, &words(&[18, 15])); // xdg_wm_base.get_xdg_surface
+
+    let (offending, code, message) = read_protocol_error(&mut client);
+    assert_eq!(
+        offending, 5,
+        "the error must name the xdg_wm_base that was asked for the wrapper: \
+         {message}"
+    );
+    assert_eq!(
+        code,
+        xdg_wm_base::Error::Role as u32,
+        "a role conflict is xdg_wm_base.role: {message}"
+    );
+    assert_eq!(
+        message, "wl_surface already has an assigned role",
+        "this must be `get_xdg_surface`'s own refusal, before `data_init.init`. \
+         The moment it is `give_role`'s \"Surface already has a role.\" instead, \
+         the wrapper was created first and the guard has moved back to being \
+         late enough for a duplicate to reach the shared per-wl_surface state"
+    );
+
+    drop(client);
+    drop(runtime);
+}
+
+/// Destroying a `wl_subsurface` and re-creating it is legitimate, is accepted,
+/// and publishes the removal it owes the renderer — end to end, over a real
+/// socket, against the real protocol thread.
+///
+/// The grandchild is the part that cannot be faked. Per-surface coalescing
+/// collapses the child's own relayout into the removal that follows it, so the
+/// child's transition is invisible on the renderer channel; the descendant's is
+/// not, and it only happens if `recompute_effective_visibility` runs. The
+/// `wl_surface.leave` pair covers the rest: the compositor's own view of what
+/// is on screen, which is what `clear_focus_for_surface` keys off.
+///
+/// What this fixture deliberately does **not** claim is the *same-dispatch*
+/// branch. It batches both requests into one `write_all`, but if they split the
+/// destroy dispatch reconciles the child and produces an identical removal,
+/// descendant relayout and `wl_surface.leave` — the two paths are
+/// indistinguishable on the socket, so this oracle passes either way. The
+/// branch itself is pinned by
+/// [`a_same_dispatch_subsurface_re_role_is_unmapped_before_reconciliation`],
+/// which reads the pre-reconciliation state a split write cannot produce.
+#[test]
+fn a_subsurface_destroyed_and_recreated_in_one_dispatch_publishes_its_removal() {
+    const PARENT_STRIDE: u32 = 16 * 4;
+    const PARENT_BYTES: u32 = PARENT_STRIDE * 16;
+    const CHILD_STRIDE: u32 = 8 * 4;
+    const CHILD_BYTES: u32 = CHILD_STRIDE * 8;
+    const GRANDCHILD_STRIDE: u32 = 4 * 4;
+    const GRANDCHILD_BYTES: u32 = GRANDCHILD_STRIDE * 4;
+    const POOL_BYTES: u32 = PARENT_BYTES + CHILD_BYTES + GRANDCHILD_BYTES;
+
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the same-dispatch recreate oracle");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-reroll-subsurface-{}-{unique}", std::process::id());
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "reroll-subsurface-test".into(),
+            drm_adapter: synthetic_drm_adapter("reroll-subsurface-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+    let _pool = bring_up_shm_toplevel_with_subcompositor(
+        &mut client,
+        POOL_BYTES,
+        "cosmix-reroll-subsurface-test",
+    );
+
+    send_request(
+        &mut client,
+        13,
+        0,
+        &words(&[
+            14,
+            0,
+            16,
+            16,
+            PARENT_STRIDE,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    ); // wl_shm_pool.create_buffer, the toplevel's
+    send_request(&mut client, 9, 1, &words(&[14, 0, 0])); // wl_surface.attach
+    send_request(&mut client, 9, 6, &[]); // commit: the toplevel maps
+
+    // The child, mapped, so the renderer really is holding an entity for it.
+    send_request(&mut client, 4, 0, &words(&[15])); // wl_compositor.create_surface
+    send_request(&mut client, 7, 1, &words(&[16, 15, 9])); // wl_subcompositor.get_subsurface
+    send_request(
+        &mut client,
+        13,
+        0,
+        &words(&[
+            17,
+            PARENT_BYTES,
+            8,
+            8,
+            CHILD_STRIDE,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    ); // wl_shm_pool.create_buffer, the child's
+    send_request(&mut client, 15, 1, &words(&[17, 0, 0])); // child wl_surface.attach
+    send_request(&mut client, 15, 6, &[]); // commit the child
+
+    // And a grandchild beneath it, also mapped. Its visibility is derived from
+    // the child's, and it is the only surface here whose transition the event
+    // coalescing cannot swallow.
+    send_request(&mut client, 4, 0, &words(&[18])); // wl_compositor.create_surface
+    send_request(&mut client, 7, 1, &words(&[19, 18, 15])); // wl_subcompositor.get_subsurface
+    send_request(
+        &mut client,
+        13,
+        0,
+        &words(&[
+            20,
+            PARENT_BYTES + CHILD_BYTES,
+            4,
+            4,
+            GRANDCHILD_STRIDE,
+            wl_shm::Format::Xrgb8888 as u32,
+        ]),
+    ); // wl_shm_pool.create_buffer, the grandchild's
+    send_request(&mut client, 18, 1, &words(&[20, 0, 0])); // grandchild wl_surface.attach
+    send_request(&mut client, 18, 6, &[]); // commit the grandchild
+    send_request(&mut client, 15, 6, &[]); // commit the child, taking the grandchild
+    send_request(&mut client, 9, 6, &[]); // commit the parent, taking both
+
+    send_display_request(&mut client, 0, 21);
+    let mapped = events_until_callback(&mut client, 21);
+    for surface in [15, 18] {
+        assert!(
+            mapped
+                .iter()
+                .any(|(object, opcode, _)| *object == surface && *opcode == 0),
+            "wl_surface {surface} must enter the output before the re-role, or \
+             there is no visibility here to lose: {mapped:?}"
+        );
+    }
+
+    // Ids are assigned in record-creation order and nothing else has been
+    // created, so the three upserts sort as toplevel, child, grandchild.
+    let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    let mut upserted = Vec::new();
+    loop {
+        for event in runtime.drain_events().expect("protocol thread is alive") {
+            if let ProtocolEvent::SurfaceUpserted { id, .. } = event
+                && !upserted.contains(&id)
+            {
+                upserted.push(id);
+            }
+        }
+        if upserted.len() == 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the toplevel, its subsurface and the grandchild must all reach the \
+             renderer first: {upserted:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    upserted.sort_by_key(|id| id.0);
+    let child_id = upserted[1];
+    let grandchild_id = upserted[2];
+
+    // The destroy and the re-create as one write, so the compositor cannot
+    // reconcile between them. Two separate `write_all`s would usually produce
+    // the same state and sometimes not, which is worse than either.
+    send_requests_atomically(
+        &mut client,
+        &[
+            (16, 0, Vec::new()),         // wl_subsurface.destroy
+            (7, 1, words(&[22, 15, 9])), // wl_subcompositor.get_subsurface
+        ],
+    );
+    send_display_request(&mut client, 0, 23);
+    let after_reroll = events_until_callback(&mut client, 23);
+    assert!(
+        after_reroll
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "re-creating a subsurface the client just destroyed is legitimate and \
+         must not be refused: {after_reroll:?}"
+    );
+    for surface in [15, 18] {
+        assert!(
+            after_reroll
+                .iter()
+                .any(|(object, opcode, _)| *object == surface && *opcode == 1),
+            "wl_surface {surface} is no longer being presented, so it must leave \
+             the output — that transition is what carries the focus cleanup \
+             with it: {after_reroll:?}"
+        );
+    }
+
+    let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    let mut child_removed = false;
+    let mut grandchild_hidden = false;
+    loop {
+        for event in runtime.drain_events().expect("protocol thread is alive") {
+            match event {
+                ProtocolEvent::SurfaceUnmapped { id } if id == child_id => child_removed = true,
+                ProtocolEvent::SurfaceDestroyed { id } => assert!(
+                    id != child_id && id != grandchild_id,
+                    "the surfaces are still alive — the client re-created the \
+                     role, it did not destroy anything"
+                ),
+                ProtocolEvent::SurfaceRelayout { id, scene } if id == grandchild_id => {
+                    grandchild_hidden = !scene.layout.visible;
+                }
+                _ => {}
+            }
+        }
+        if child_removed && grandchild_hidden {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the re-role unmapped the child, so the renderer must be told to drop \
+             it ({child_removed}) and to stop treating the grandchild as visible \
+             ({grandchild_hidden})"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    drop(client);
+    drop(runtime);
+}
+
+/// The same-dispatch re-role branch itself, read where it is still visible.
+///
+/// This is the one case `publish_reroll_unmap` exists for, and it survives only
+/// because the compositor learns a `wl_subsurface` died a whole dispatch late.
+/// Smithay unsets the parent synchronously in the destructor, but *this*
+/// compositor finds out through `reconcile_subsurface_roles`, which runs once
+/// per cycle *after* `dispatch_clients`. So both requests in a single write
+/// reach `new_subsurface`'s existing-record branch with a record that is still
+/// `Subsurface`, still `mapped`, and still being drawn — and `was_mapped` is
+/// true, which is what makes the removal get published at all.
+///
+/// So this drives `display.dispatch_clients` directly and **never**
+/// [`KeybindingHarness::dispatch_client`], which reconciles immediately on
+/// return and would erase the very state the branch is identified by. Every
+/// assertion below reads production state or production events; no test-only
+/// counter takes part, except the KMS backend's transition tally, which is a
+/// witness that the production visibility path ran and not the subject.
+///
+/// If only the destroy had been dispatched, `get_parent` would be `None`. If
+/// reconciliation had run between the two requests, the record would already be
+/// `Dormant`, `was_mapped` would be false, and no `SurfaceUnmapped` would be
+/// produced by this dispatch.
+#[test]
+fn a_same_dispatch_subsurface_re_role_is_unmapped_before_reconciliation() {
+    let mut harness = KeybindingHarness::new_with_backend(false, BackendKind::Kms);
+
+    // Map the root toplevel for real. Left unmapped — which is how the harness
+    // brings it up — every descendant is effectively invisible before anything
+    // here happens, and the descendant assertion below would hold for a reason
+    // that predates the re-role.
+    let toplevel_surface = harness
+        .server
+        .state
+        .surfaces
+        .values()
+        .find(|record| matches!(record.role, SurfaceRole::Toplevel(_)))
+        .map(|record| record.role.wl_surface().clone())
+        .expect("the harness brings up a toplevel");
+    let configure = harness.server.state.surfaces[&toplevel_surface.id()]
+        .required_configure
+        .expect("the bring-up commit sent the initial xdg configure");
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        4,
+        &words(&[u32::from(configure)]),
+    );
+    let root_buffer = harness.create_dmabuf_buffer();
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[root_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after mapping the root toplevel");
+    assert!(
+        harness.server.state.surfaces[&toplevel_surface.id()].mapped,
+        "precondition: the root is mapped, so its descendants can be visible"
+    );
+
+    let (child, child_object, child_subsurface) = harness.extra_mapped_subsurface_with_role();
+    let child_id = harness.server.state.surfaces[&child.id()].id;
+
+    // A grandchild beneath the child. Its transition is the only one the
+    // per-surface event coalescing cannot swallow, and it happens only if
+    // `recompute_effective_visibility` runs.
+    let grandchild_object = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[grandchild_object]),
+    );
+    let grandchild_subsurface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_SUBCOMPOSITOR_ID,
+        1,
+        &words(&[grandchild_subsurface, grandchild_object, child_object]),
+    );
+    let grandchild_buffer = harness.create_dmabuf_buffer();
+    send_request(
+        &mut harness.client,
+        grandchild_object,
+        1,
+        &words(&[grandchild_buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, grandchild_object, 6, &[]);
+    send_request(&mut harness.client, child_object, 6, &[]);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after mapping the grandchild");
+
+    let grandchild = harness
+        .server
+        .state
+        .surfaces
+        .values()
+        .map(|record| record.role.wl_surface())
+        .find(|surface| surface.id().protocol_id() == grandchild_object)
+        .expect("the grandchild is tracked")
+        .clone();
+    let grandchild_id = harness.server.state.surfaces[&grandchild.id()].id;
+    assert!(
+        harness.server.state.surfaces[&child.id()].layout.visible
+            && harness.server.state.surfaces[&grandchild.id()]
+                .layout
+                .visible,
+        "precondition: both are effectively visible, so there is a transition to lose"
+    );
+
+    // Clear the setup's events, so what is asserted below was produced by the
+    // one dispatch under test. Their buffer tokens are this test's to release.
+    for event in mem::take(&mut harness.server.state.events) {
+        if let Some(token) = protocol_event_dmabuf_token(&event) {
+            harness.server.state.release_buffer_token(token);
+        }
+    }
+    let leaves_before = harness
+        .server
+        .state
+        .backend
+        .kms_output_transitions()
+        .expect("the KMS test backend counts output transitions")
+        .1;
+
+    // One write, so the server cannot interpose a dispatch boundary.
+    let replacement_subsurface = harness.allocate_object_id();
+    send_requests_atomically(
+        &mut harness.client,
+        &[
+            (child_subsurface, 0, Vec::new()),
+            (
+                TEST_SUBCOMPOSITOR_ID,
+                1,
+                words(&[
+                    replacement_subsurface,
+                    child_object,
+                    TEST_TOPLEVEL_SURFACE_ID,
+                ]),
+            ),
+        ],
+    );
+    harness
+        .server
+        .display
+        .dispatch_clients(&mut harness.server.state)
+        .expect("one dispatch of both requests, and no reconciliation after it");
+    harness.assert_client_connected("after the same-dispatch re-role");
+
+    // Smithay's destructor unset the parent; only the replacement request can
+    // have put it back, so this is the proof both requests were dispatched.
+    assert_eq!(
+        compositor::get_parent(&child).map(|parent| parent.id()),
+        Some(toplevel_surface.id()),
+        "the replacement association exists, so the second request landed in \
+         this same dispatch"
+    );
+    let record = &harness.server.state.surfaces[&child.id()];
+    assert!(
+        matches!(record.role, SurfaceRole::Subsurface { .. }),
+        "and the record is already the replacement subsurface, not the dormant \
+         role reconciliation would have left behind"
+    );
+    assert!(
+        !record.mapped,
+        "which `new_subsurface` unmapped: the association is double-buffered on \
+         the parent and is not current until the parent commits"
+    );
+    assert!(
+        !record.parent_association_committed,
+        "and the parent has not committed it"
+    );
+    assert!(
+        harness
+            .server
+            .state
+            .events
+            .iter()
+            .any(|event| matches!(event, ProtocolEvent::SurfaceUnmapped { id } if *id == child_id)),
+        "the renderer holds an entity for a surface that is no longer presented, \
+         so the removal must be published — `publish_reroll_unmap` emits it only \
+         because the record was still `mapped` when `new_subsurface` ran, which \
+         is exactly the state a split write never reaches: {:?}",
+        harness.server.state.events
+    );
+    assert!(
+        !harness.server.state.surfaces[&grandchild.id()]
+            .layout
+            .visible,
+        "and the descendant stopped being visible, which only happens if \
+         `recompute_effective_visibility` ran"
+    );
+    assert!(
+        harness.server.state.events.iter().any(|event| matches!(
+            event,
+            ProtocolEvent::SurfaceRelayout { id, scene }
+                if *id == grandchild_id && !scene.layout.visible
+        )),
+        "and the renderer was told so: {:?}",
+        harness.server.state.events
+    );
+    let leaves_after = harness
+        .server
+        .state
+        .backend
+        .kms_output_transitions()
+        .expect("the KMS test backend counts output transitions")
+        .1;
+    assert!(
+        leaves_after > leaves_before,
+        "and the surfaces left the output — the same transition \
+         `clear_focus_for_surface` keys off: {leaves_before} -> {leaves_after}"
+    );
+
+    for event in mem::take(&mut harness.server.state.events) {
+        if let Some(token) = protocol_event_dmabuf_token(&event) {
+            harness.server.state.release_buffer_token(token);
+        }
+    }
+}
+
+/// An anonymous file of exactly `bytes` bytes, standing in for a DMA-BUF plane.
+///
+/// A memfd rather than a real GPU allocation: every DMA-BUF fixture in this file
+/// is about what the compositor does with the *descriptor*, and a descriptor the
+/// kernel will pass over `SCM_RIGHTS` is all of it that reaches the compositor.
+fn anonymous_plane(name: &str, bytes: u64) -> File {
+    let name = CString::new(name).expect("memfd name has no interior NUL");
+    // SAFETY: name is a live NUL-terminated C string and ownership of the
+    // returned descriptor is transferred immediately into File.
+    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(
+        raw_fd >= 0,
+        "create anonymous test plane: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: memfd_create returned a new owned descriptor on success.
+    let plane = unsafe { File::from_raw_fd(raw_fd) };
+    plane.set_len(bytes).expect("size the anonymous test plane");
+    plane
+}
+
+/// One buffer as the DMA-BUF validation probe received it.
+#[derive(Debug, Eq, PartialEq)]
+struct ProbedBuffer {
+    /// Name of the thread the probe ran on. Recorded from inside the seam
+    /// because that is the only place the isolation can be observed: everything
+    /// outside it sees the same result either way.
+    thread: String,
+    width: u32,
+    height: u32,
+    fourcc: u32,
+    modifier: u64,
+    stride: u32,
+    /// Size of the plane the probe was handed, measured through the probe's own
+    /// duplicated descriptor. Without it a seam that forwarded a descriptor with
+    /// an unusable plane would be indistinguishable from one that forwarded the
+    /// client's memory.
+    plane_bytes: u64,
+}
+
+/// A rendezvous the fixtures use to hold a probe inside `validate`.
+#[derive(Default)]
+struct ProbeGate {
+    state: std::sync::Mutex<ProbeGateState>,
+    signal: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct ProbeGateState {
+    entered: usize,
+    released: bool,
+}
+
+impl ProbeGate {
+    /// Called from the probe: record the entry and block until [`Self::release`].
+    fn hold(&self) {
+        let mut state = self.state.lock().expect("probe gate mutex poisoned");
+        state.entered += 1;
+        self.signal.notify_all();
+        while !state.released {
+            state = self.signal.wait(state).expect("probe gate mutex poisoned");
+        }
+    }
+
+    /// Called from the test: block until a probe is parked inside `validate`.
+    fn wait_for_entry(&self, deadline: Instant) {
+        let mut state = self.state.lock().expect("probe gate mutex poisoned");
+        while state.entered == 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the DMA-BUF validation probe was never entered"
+            );
+            let (next, _) = self
+                .signal
+                .wait_timeout(state, remaining)
+                .expect("probe gate mutex poisoned");
+            state = next;
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("probe gate mutex poisoned");
+        state.released = true;
+        self.signal.notify_all();
+    }
+}
+
+/// What the probe does on one call.
+#[derive(Clone, Copy, Debug)]
+enum ProbeStep {
+    Accept,
+    Reject,
+    Panic,
+}
+
+/// A [`ValidateDmabuf`] under the test's control.
+///
+/// The compositor owns it, so everything a fixture observes travels through the
+/// shared call log rather than through the value itself.
+struct ScriptedValidator {
+    /// Consumed front to back; the last entry repeats once exhausted, so a
+    /// fixture that drives more imports than it scripted still has defined
+    /// behaviour.
+    script: Vec<ProbeStep>,
+    calls: Arc<std::sync::Mutex<Vec<ProbedBuffer>>>,
+    /// Held on the first call only, when set.
+    gate: Option<Arc<ProbeGate>>,
+}
+
+impl ScriptedValidator {
+    fn new(script: Vec<ProbeStep>) -> (Self, Arc<std::sync::Mutex<Vec<ProbedBuffer>>>) {
+        assert!(!script.is_empty(), "a scripted probe needs a first step");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Self {
+                script,
+                calls: Arc::clone(&calls),
+                gate: None,
+            },
+            calls,
+        )
+    }
+
+    fn gated(
+        script: Vec<ProbeStep>,
+    ) -> (
+        Self,
+        Arc<std::sync::Mutex<Vec<ProbedBuffer>>>,
+        Arc<ProbeGate>,
+    ) {
+        let (mut validator, calls) = Self::new(script);
+        let gate = Arc::new(ProbeGate::default());
+        validator.gate = Some(Arc::clone(&gate));
+        (validator, calls, gate)
+    }
+}
+
+impl ValidateDmabuf for ScriptedValidator {
+    fn validate(&mut self, descriptor: DmabufDescriptor) -> Result<(), String> {
+        let (step, index) = {
+            let mut calls = self.calls.lock().expect("probe call log mutex poisoned");
+            let plane = descriptor
+                .planes
+                .first()
+                .expect("the seam forwards the client's plane");
+            // `fstat`, not a seek to the end: this descriptor arrived over
+            // `SCM_RIGHTS` and was then duplicated, so it shares one open file
+            // description with the client's own memfd. Seeking it would move
+            // the offset the client still reads through.
+            let plane_bytes = File::from(
+                plane
+                    .fd
+                    .try_clone()
+                    .expect("duplicate the probed plane for measurement"),
+            )
+            .metadata()
+            .expect("measure the probed plane")
+            .len();
+            let index = calls.len();
+            calls.push(ProbedBuffer {
+                thread: thread::current().name().unwrap_or("<unnamed>").to_string(),
+                width: descriptor.width,
+                height: descriptor.height,
+                fourcc: descriptor.fourcc,
+                modifier: descriptor.modifier,
+                stride: plane.stride,
+                plane_bytes,
+            });
+            (self.script[index.min(self.script.len() - 1)], index)
+        };
+        if index == 0
+            && let Some(gate) = &self.gate
+        {
+            gate.hold();
+        }
+        match step {
+            ProbeStep::Accept => Ok(()),
+            ProbeStep::Reject => Err("scripted probe rejection".into()),
+            ProbeStep::Panic => panic!("scripted probe panic"),
+        }
+    }
+}
+
+/// The buffer every DMA-BUF validation fixture drives: comfortably inside the
+/// 320x240 output's limits, so `validate_dmabuf_metadata` accepts it and the
+/// probe is actually reached.
+const VALIDATION_WIDTH: u32 = 64;
+const VALIDATION_HEIGHT: u32 = 32;
+const VALIDATION_STRIDE: u32 = VALIDATION_WIDTH * 4;
+/// Object id the DMA-BUF fixtures bind `zwp_linux_dmabuf_v1` to. wayland-rs's
+/// server backend requires client object ids to be allocated in dense sequence,
+/// so the bring-up ids are fixed here rather than chosen per fixture.
+const VALIDATION_DMABUF_ID: u32 = 4;
+
+/// Start a compositor whose DMA-BUF imports are probed by `validator`, and
+/// connect one client to it.
+///
+/// A real [`WaylandRuntime`] rather than [`KeybindingHarness`]: the harness
+/// dispatches the protocol in-process on the test thread, which is precisely the
+/// arrangement that cannot show whether an asynchronous validation outcome ever
+/// reaches a client that has stopped sending.
+fn dmabuf_validation_runtime(
+    label: &str,
+    validator: Box<dyn ValidateDmabuf>,
+) -> (WaylandRuntime, UnixStream) {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .expect("XDG_RUNTIME_DIR is required for the DMA-BUF validation oracles");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!(
+        "cosmix-dmabuf-validate-{label}-{}-{unique}",
+        std::process::id()
+    );
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: vec![cosmix_wgpu_dmabuf::DmabufFormat {
+                fourcc: smithay::backend::allocator::Fourcc::Argb8888 as u32,
+                modifier: u64::from(smithay::backend::allocator::Modifier::Linear),
+                plane_count: 1,
+            }],
+            adapter_name: "dmabuf-validation-test".into(),
+            drm_adapter: synthetic_drm_adapter("dmabuf-validation-test"),
+        }),
+        Some(validator),
+        test_retirement_adapter(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts with a DMA-BUF validation probe registered");
+    let client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+    (runtime, client)
+}
+
+/// Bind `zwp_linux_dmabuf_v1`, allocating object ids 2 through 4. Callers
+/// continue from 5.
+fn bind_dmabuf_global(client: &mut UnixStream) {
+    send_display_request(client, 1, 2); // wl_display.get_registry
+    send_display_request(client, 0, 3); // wl_display.sync
+    let globals = registry_globals(client, 3);
+    let (name, version) = globals["zwp_linux_dmabuf_v1"];
+    bind_global(
+        client,
+        name,
+        "zwp_linux_dmabuf_v1",
+        version.min(4),
+        VALIDATION_DMABUF_ID,
+    );
+}
+
+/// Send `create_params` → `add` → `create` for one single-plane ARGB8888 buffer.
+///
+/// `create` is the falliable form, opcode 2: it carries no client-allocated
+/// buffer id, and the compositor answers with `created` or `failed` whenever it
+/// is ready. That is the request an asynchronous validator exists to serve.
+fn request_async_dmabuf(client: &mut UnixStream, params_id: u32) {
+    send_request(client, VALIDATION_DMABUF_ID, 1, &words(&[params_id]));
+    let plane = anonymous_plane(
+        "cosmix-dmabuf-validation",
+        u64::from(VALIDATION_STRIDE) * u64::from(VALIDATION_HEIGHT),
+    );
+    let modifier = u64::from(smithay::backend::allocator::Modifier::Linear);
+    send_request_with_fd(
+        client,
+        params_id,
+        1,
+        &words(&[
+            0,
+            0,
+            VALIDATION_STRIDE,
+            (modifier >> 32) as u32,
+            modifier as u32,
+        ]),
+        plane.as_fd(),
+    );
+    send_request(
+        client,
+        params_id,
+        2,
+        &words(&[
+            VALIDATION_WIDTH,
+            VALIDATION_HEIGHT,
+            smithay::backend::allocator::Fourcc::Argb8888 as u32,
+            0,
+        ]),
+    );
+}
+
+/// Read events until one names `params_id`, and return its opcode and body.
+///
+/// `wl_display.delete_id` is skipped rather than asserted against: a client that
+/// has round-tripped a `wl_display.sync` has an unread `delete_id` for the
+/// callback sitting in its socket, and that is bookkeeping, not the outcome. A
+/// `wl_display.error` is fatal here, because these fixtures expect the client to
+/// survive.
+fn read_params_outcome(
+    client: &mut UnixStream,
+    params_id: u32,
+    deadline: Instant,
+    awaited: &str,
+) -> (u16, Vec<u8>) {
+    loop {
+        let (object, opcode, body) = read_event(client, deadline, awaited);
+        if object == params_id {
+            return (opcode, body);
+        }
+        assert_ne!(
+            (object, opcode),
+            (1, 0),
+            "the client was killed while awaiting {awaited}: {body:?}"
+        );
+        assert_eq!(
+            (object, opcode),
+            (1, 1),
+            "only wl_display.delete_id may precede {awaited}"
+        );
+    }
+}
+
+/// The buffer the fixtures drive, as the probe must see it.
+fn expected_probed_buffer(thread: String) -> ProbedBuffer {
+    ProbedBuffer {
+        thread,
+        width: VALIDATION_WIDTH,
+        height: VALIDATION_HEIGHT,
+        fourcc: smithay::backend::allocator::Fourcc::Argb8888 as u32,
+        modifier: u64::from(smithay::backend::allocator::Modifier::Linear),
+        stride: VALIDATION_STRIDE,
+        plane_bytes: u64::from(VALIDATION_STRIDE) * u64::from(VALIDATION_HEIGHT),
+    }
+}
+
+/// A probe that blocks must neither stall the protocol thread nor strand the
+/// client whose import it is holding.
+///
+/// Two claims, and both need the probe parked inside `validate`. The first is
+/// what the worker thread is for: a `wl_display.sync` issued while validation is
+/// in flight must still round-trip. The second is what the worker thread costs:
+/// `ImportNotifier::successful` only *queues* `created` onto the client's
+/// connection, and the protocol thread flushes only from inside a dispatch
+/// cycle. A client that sent the falliable `create` and is now waiting — the
+/// whole point of that request — produces no further traffic to wake it, so the
+/// worker has to.
+///
+/// The sync roundtrip before the release is not decoration: it makes the second
+/// claim deterministic. It proves a full dispatch cycle completed *after* the
+/// request reached the worker, so the outcome cannot be riding out on a flush
+/// that was going to happen anyway.
+#[test]
+fn blocked_dmabuf_validation_neither_stalls_the_protocol_thread_nor_strands_the_client() {
+    let (validator, calls, gate) = ScriptedValidator::gated(vec![ProbeStep::Accept]);
+    let (_runtime, mut client) = dmabuf_validation_runtime("blocked", Box::new(validator));
+    bind_dmabuf_global(&mut client);
+    request_async_dmabuf(&mut client, 5);
+
+    let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    gate.wait_for_entry(deadline);
+    send_display_request(&mut client, 0, 6); // wl_display.sync
+    let events = events_until_callback(&mut client, 6);
+    assert!(
+        events
+            .iter()
+            .all(|(object, opcode, _)| *object != 5 && (*object, *opcode) != (1, 0)),
+        "the import is still in flight, so neither an outcome on the params \
+         object nor a `wl_display.error` precedes the sync: {events:?}"
+    );
+
+    {
+        let calls = calls.lock().expect("probe call log mutex poisoned");
+        assert_eq!(calls.len(), 1, "exactly one probe call: {calls:?}");
+        assert_eq!(
+            calls[0],
+            expected_probed_buffer(calls[0].thread.clone()),
+            "the probe received the client's buffer, plane and all"
+        );
+        assert_ne!(
+            calls[0].thread, "cosmix-wayland",
+            "and it ran off the protocol thread"
+        );
+    }
+
+    gate.release();
+    let (opcode, body) = read_params_outcome(
+        &mut client,
+        5,
+        deadline,
+        "zwp_linux_buffer_params_v1.created after the probe was released",
+    );
+    assert_eq!(opcode, 0, "created, not failed: the probe accepted");
+    let buffer = word(&body, 0);
+    assert!(
+        buffer >= 0xff00_0000,
+        "the compositor allocated the wl_buffer id: {buffer}"
+    );
+}
+
+/// A probe that rejects a buffer must fail that import and leave the client's
+/// connection intact — and must not sour the client's next buffer.
+///
+/// The falliable `create` exists so a compositor can say no without killing
+/// anyone, and this compositor now says no from a worker thread. The second
+/// import is what keeps the fixture honest: a seam that refused everything after
+/// its first rejection would satisfy the first half on its own.
+#[test]
+fn a_rejected_dmabuf_fails_that_import_only() {
+    let (validator, calls) = ScriptedValidator::new(vec![ProbeStep::Reject, ProbeStep::Accept]);
+    let (_runtime, mut client) =
+        dmabuf_validation_runtime("reject-then-accept", Box::new(validator));
+    bind_dmabuf_global(&mut client);
+    let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+
+    request_async_dmabuf(&mut client, 5);
+    let (opcode, _) = read_params_outcome(
+        &mut client,
+        5,
+        deadline,
+        "the first zwp_linux_buffer_params_v1 outcome",
+    );
+    assert_eq!(opcode, 1, "failed: the probe rejected this buffer");
+
+    send_request(&mut client, 5, 0, &[]); // zwp_linux_buffer_params_v1.destroy
+    request_async_dmabuf(&mut client, 6);
+    let (opcode, body) = read_params_outcome(
+        &mut client,
+        6,
+        deadline,
+        "the second zwp_linux_buffer_params_v1 outcome",
+    );
+    assert_eq!(
+        opcode, 0,
+        "created: the same connection's next buffer is judged on its own"
+    );
+    let buffer = word(&body, 0);
+    assert!(
+        buffer >= 0xff00_0000,
+        "the compositor allocated the wl_buffer id: {buffer}"
+    );
+
+    let calls = calls.lock().expect("probe call log mutex poisoned");
+    assert_eq!(calls.len(), 2, "both buffers reached the probe: {calls:?}");
+    for call in calls.iter() {
+        assert_eq!(*call, expected_probed_buffer(call.thread.clone()));
+        assert_ne!(call.thread, "cosmix-wayland");
+    }
+}
+
+/// The same rejection reached through `create_immed` must kill the client.
+///
+/// `create_immed` promises the client a usable `wl_buffer` immediately, so there
+/// is no wire representation of "no". Smithay's `ImportNotifier` splits on
+/// exactly this, and the split is only observable from a client that used the
+/// infallible request: `zwp_linux_buffer_params_v1.error.invalid_wl_buffer` is 7.
+#[test]
+fn a_rejected_dmabuf_kills_a_client_that_demanded_it_immediately() {
+    let (validator, calls) = ScriptedValidator::new(vec![ProbeStep::Reject]);
+    let (_runtime, mut client) = dmabuf_validation_runtime("reject-immed", Box::new(validator));
+    bind_dmabuf_global(&mut client);
+
+    send_request(&mut client, VALIDATION_DMABUF_ID, 1, &words(&[5]));
+    let plane = anonymous_plane(
+        "cosmix-dmabuf-validation-immed",
+        u64::from(VALIDATION_STRIDE) * u64::from(VALIDATION_HEIGHT),
+    );
+    let modifier = u64::from(smithay::backend::allocator::Modifier::Linear);
+    send_request_with_fd(
+        &mut client,
+        5,
+        1,
+        &words(&[
+            0,
+            0,
+            VALIDATION_STRIDE,
+            (modifier >> 32) as u32,
+            modifier as u32,
+        ]),
+        plane.as_fd(),
+    );
+    send_request(
+        &mut client,
+        5,
+        3, // create_immed
+        &words(&[
+            6,
+            VALIDATION_WIDTH,
+            VALIDATION_HEIGHT,
+            smithay::backend::allocator::Fourcc::Argb8888 as u32,
+            0,
+        ]),
+    );
+
+    let (offending, code, message) = read_protocol_error(&mut client);
+    assert_eq!(
+        offending, 5,
+        "the error names the params object that was asked to create: {message}"
+    );
+    assert_eq!(
+        code,
+        zwp_linux_buffer_params_v1::Error::InvalidWlBuffer as u32,
+        "invalid_wl_buffer, the only answer available to create_immed: {message}"
+    );
+
+    let calls = calls.lock().expect("probe call log mutex poisoned");
+    assert_eq!(calls.len(), 1, "the buffer reached the probe: {calls:?}");
+    assert_eq!(calls[0], expected_probed_buffer(calls[0].thread.clone()));
+    assert_ne!(calls[0].thread, "cosmix-wayland");
+}
+
+/// A probe that panics is retired permanently, and every import it could have
+/// answered is refused instead of stranded.
+///
+/// Three imports, deliberately in three different states when the panic lands:
+/// the one inside the probe, one already queued behind it, and one submitted
+/// afterwards. What this fixture establishes is that each one is *answered* —
+/// dropping their `ImportNotifier`s would not do, because that destructor only
+/// logs and the client would wait forever. It deliberately does not assert
+/// *which* component refused: today the flag is worker-local so all three are
+/// the worker's, but a handler-side refusal of the third would be equally
+/// correct on the wire and this fixture would rightly stay green.
+///
+/// The call count is the other half: a compositor that kept calling a probe
+/// which had already unwound would still refuse all three.
+#[test]
+fn a_panicking_probe_is_retired_and_refuses_every_import() {
+    let (validator, calls, gate) = ScriptedValidator::gated(vec![ProbeStep::Panic]);
+    let (_runtime, mut client) = dmabuf_validation_runtime("panic", Box::new(validator));
+    bind_dmabuf_global(&mut client);
+    let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+
+    request_async_dmabuf(&mut client, 5);
+    gate.wait_for_entry(deadline);
+    request_async_dmabuf(&mut client, 6);
+    // Round-trip so the queued import has demonstrably reached the worker's
+    // channel before the probe unwinds. Without it this import could still be
+    // sitting in the handler when the panic lands, which is the third import's
+    // situation, not this one's — and the two would prove the same thing.
+    send_display_request(&mut client, 0, 7); // wl_display.sync
+    let _ = events_until_callback(&mut client, 7);
+
+    gate.release();
+    let (opcode, _) = read_params_outcome(&mut client, 5, deadline, "the panicking import");
+    assert_eq!(opcode, 1, "failed: the import the probe panicked on");
+    let (opcode, _) = read_params_outcome(&mut client, 6, deadline, "the queued import");
+    assert_eq!(
+        opcode, 1,
+        "failed: an import already queued behind the panic is answered, not dropped"
+    );
+
+    request_async_dmabuf(&mut client, 8);
+    let (opcode, _) = read_params_outcome(&mut client, 8, deadline, "the import after the panic");
+    assert_eq!(opcode, 1, "failed: the probe is retired for the session");
+
+    let calls = calls.lock().expect("probe call log mutex poisoned");
+    assert_eq!(
+        calls.len(),
+        1,
+        "a probe that unwound is never called again: {calls:?}"
+    );
+}
+
+/// The validation queue is bounded, and overflowing it refuses an import rather
+/// than blocking the protocol thread.
+///
+/// With one probe parked, the channel holds exactly
+/// [`DMABUF_VALIDATION_QUEUE_CAPACITY`] more, so the import after those is the
+/// first that cannot be queued. It is refused straight away — before the parked
+/// probe is released, which is what proves the protocol thread never waited on
+/// the queue. Everything that did fit is then answered normally, so the overflow
+/// path is not a session-wide failure.
+#[test]
+fn an_overflowing_validation_queue_refuses_without_blocking_the_protocol_thread() {
+    let (validator, calls, gate) = ScriptedValidator::gated(vec![ProbeStep::Accept]);
+    let (_runtime, mut client) = dmabuf_validation_runtime("overflow", Box::new(validator));
+    bind_dmabuf_global(&mut client);
+    let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+
+    const FIRST_PARAMS_ID: u32 = 5;
+    let queued = u32::try_from(DMABUF_VALIDATION_QUEUE_CAPACITY).expect("queue capacity fits u32");
+    let overflowing_params_id = FIRST_PARAMS_ID + queued + 1;
+
+    request_async_dmabuf(&mut client, FIRST_PARAMS_ID);
+    gate.wait_for_entry(deadline);
+    for params_id in (FIRST_PARAMS_ID + 1)..=overflowing_params_id {
+        request_async_dmabuf(&mut client, params_id);
+    }
+
+    let (opcode, _) = read_params_outcome(
+        &mut client,
+        overflowing_params_id,
+        deadline,
+        "the outcome of the import that did not fit",
+    );
+    assert_eq!(
+        opcode, 1,
+        "failed: refused while the probe is still parked, so nothing blocked"
+    );
+
+    gate.release();
+    for params_id in FIRST_PARAMS_ID..overflowing_params_id {
+        let (opcode, _) = read_params_outcome(
+            &mut client,
+            params_id,
+            deadline,
+            "an outcome for an import that fit in the queue",
+        );
+        assert_eq!(
+            opcode, 0,
+            "created: params {params_id} was inside the queue's capacity"
+        );
+    }
+
+    let calls = calls.lock().expect("probe call log mutex poisoned");
+    assert_eq!(
+        calls.len(),
+        DMABUF_VALIDATION_QUEUE_CAPACITY + 1,
+        "the parked import plus a full queue reached the probe, and the \
+         refused one did not: {}",
+        calls.len()
+    );
+    for call in calls.iter() {
+        assert_eq!(*call, expected_probed_buffer(call.thread.clone()));
+    }
+}

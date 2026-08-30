@@ -1,0 +1,138 @@
+[package]
+name = "cosmix-lib-mix"
+version = "0.61.1"
+edition = "2024"
+license = "MIT"
+
+[lib]
+name = "cosmix_mix"
+
+[features]
+default = []
+json = ["dep:serde_json", "dep:jaq-core", "dep:jaq-std", "dep:jaq-json"]
+regex = ["dep:regex"]
+# `markdown()` builtin — CommonMark + GFM (tables, strikethrough, task lists,
+# footnotes) → HTML via pulldown-cmark, with raw HTML escaped + dangerous URL
+# schemes neutralised (safe-by-default, like the JS `md()` renderer).
+markdown = ["dep:pulldown-cmark"]
+toml = ["dep:toml"]
+# `serde` feature — the serde `Deserializer`/`Serializer` bridge over
+# the `Value` tree (`serde_de` / `serde_ser`). Lets typed config structs
+# keep `#[derive(Deserialize)]` + serde attributes and hydrate from a
+# `.conf.mix` parse, instead of a hand-written `TryFrom<Value>`. See
+# `_doc/planned/2026-05-29-conf-mix-config-migration.md`. Off by default
+# so the bare interpreter stays lean.
+serde = ["dep:serde"]
+datetime = ["dep:chrono"]
+url = ["dep:url"]
+crypto = ["dep:blake3", "dep:sha2", "dep:base64", "dep:uuid"]
+http = ["dep:ureq", "dep:webpki-roots", "dep:rustls-pemfile"]
+sqlite = ["dep:rusqlite"]
+# `tokio-sleep` is an alias-only feature kept for backwards
+# compatibility with consumers that still list
+# `features = ["tokio-sleep"]`. tokio itself is now unconditional
+# (see the `[dependencies]` block) because the evaluator uses
+# `tokio::task::JoinHandle` directly with no cfg gate.
+tokio-sleep = []
+# `dkim_keygen()` builtin — RSA-2048 / Ed25519 keypair + DNS TXT
+# record snippet. Depends on `mail-auth` directly rather than going
+# through `cosmix-maild-auth` to avoid a cargo cycle (cosmix-maild-auth
+# pulls cosmix-lib-client → cosmix-lib-config → cosmix-lib-mix even
+# under `default-features = false`, because cargo's cycle check is
+# feature-blind across optional-dep edges). `cosmix-maild-auth::keygen`
+# keeps the in-process Rust API for daemons that already link it;
+# this builtin re-walks the same ~30-line mail-auth flow on its own.
+dkim = ["dep:mail-auth"]
+# `ds_*` builtins — Datastar SSE event construction/serialization
+# (`ds_patch_elements` / `ds_patch_signals` / `ds_sse`), the pure half of
+# the Datastar SDK that belongs in the language (CapabilityClass::Pure).
+# Depends on the `datastar` crate's framework-agnostic core
+# (default-features = false → no axum/rocket/warp pulled in; we use only
+# `PatchElements`/`PatchSignals` + the `DatastarEvent: Display` serializer,
+# so the wire protocol tracks upstream and never drifts). Pulls `json`
+# because signal patches are JSON objects encoded from a Mix map. See
+# `docs/mix/datastar.md` and `tests/datastar.rs`.
+datastar = ["dep:datastar", "json"]
+# `xml_parse()` builtin — strict XML → Value tree (quick-xml pull parser,
+# iterative build, no recursion on input depth). Simple mode is the
+# SOAP/RSS consumer shape; {mode:"tree"} is full fidelity. NOT an HTML
+# parser — tag-soup HTML needs an html5 parser (separate builtin if ever).
+xml = ["dep:quick-xml"]
+
+[dependencies]
+indexmap = "2"
+jaq-core = { version = "3", optional = true }
+jaq-std = { version = "3", optional = true }
+jaq-json = { version = "2", optional = true }
+libc = "0.2"
+rand = "0.9"
+signal-hook = "0.3"
+tracing = "0.1"
+# Core (always-on) — SPEC 18 §3.4 handler fault isolation needs
+# `FutureExt::catch_unwind` to put a panic boundary around each Mix
+# handler body in the serve-mode event pump (`run_handlers_for`). Not
+# feature-gated: the pump is unconditional core, and a panicking handler
+# must not abort a `mix --serve` citizen regardless of build features.
+# `--no-default-features` stays clean — futures-util is an external
+# crate (like indexmap/libc/rand), not a Cosmix-internal dependency.
+futures-util = { workspace = true }
+base64 = { version = "0.22", optional = true }
+blake3 = { version = "1", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
+regex = { version = "1", optional = true }
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"], optional = true }
+# `datastar` feature only — framework-agnostic SSE event serializer. We
+# pull NONE of its framework features (axum/rocket/warp), only the core
+# `patch_elements`/`patch_signals`/`consts` modules + `DatastarEvent`'s
+# `Display` impl that emits the exact `event:`/`data:` wire bytes.
+datastar = { version = "0.3", default-features = false, optional = true }
+# `serde` feature only — just the runtime traits (`serde::de`/`serde::ser`)
+# that the `Value` bridge implements. NOT `derive`: downstream config
+# crates bring their own `#[derive(Deserialize)]`, and this crate's own
+# test types get derive from the dev-dependency below, so the public
+# feature doesn't force `serde_derive` onto every consumer.
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
+toml = { version = "0.8", optional = true }
+# Unconditional — `evaluator::TaskTable` uses `tokio::task::JoinHandle`
+# (needs `rt`) and the async evaluator paths use `sync`, all with no cfg gate,
+# so the dep is mandatory. Declare the features this crate ACTUALLY uses rather
+# than relying on a workspace consumer to unify `rt`/`sync` in — otherwise a
+# standalone build (e.g. the `fuzz/` sub-crate, or `cargo build -p` alone) fails
+# to compile tokio's rt/sync items.
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+# Char-aware string ops (P0 of _doc/planned/2026-06-02-mix-char-aware-strings.md).
+# Unconditional external crates (like indexmap/libc/rand) — both no_std + zero
+# mandatory third-party deps, so `--no-default-features` stays clean. unicode-
+# segmentation = grapheme clusters (emoji/combining); unicode-width = terminal
+# display cells (UAX #11). std covers codepoints (`.chars()`), no crate needed.
+unicode-segmentation = "1"
+unicode-width = "0.2"
+ureq = { version = "2", optional = true }
+# http `ca_file`/`ca_pem` (0.29.0): private-CA trust ADDED to the default
+# webpki roots. Version lines match ureq 2's own transitive deps so cargo
+# unifies them (no second rustls/root-store in the tree).
+webpki-roots = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+rusqlite = { workspace = true, optional = true }
+url = { version = "2", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+# `dkim` feature only — keygen path. Pinned to the same 0.7 line as
+# cosmix-maild-auth so the workspace builds one mail-auth version.
+mail-auth = { version = "0.7", optional = true, default-features = false, features = ["ring", "generate"] }
+quick-xml = { version = "0.41.0", optional = true }
+
+[dev-dependencies]
+# `derive` lives here, not on the `serde` feature: the crate's own
+# `serde_de` unit tests use `#[derive(Deserialize)]` test types, but
+# downstream consumers of the bridge don't need this crate to pull in
+# `serde_derive`. Feature unification gives the test build both edges.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+cosmix-lib-mix = { path = ".", features = ["json", "regex", "toml", "datetime", "url", "crypto", "http", "sqlite", "tokio-sleep", "datastar", "xml"] }
+# Property-based testing for the lexer/parser (P1 of the mix tokenizer
+# fuzz/property corpus — _doc/planned/mix-tokenizer-fuzz-corpus.md in the cosmix
+# hub). Test-only; never linked into the shipped library.
+proptest = "1"

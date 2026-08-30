@@ -1,0 +1,19 @@
+-- Minimal public node.conf.mix example. Replace example values per node.
+node: "alpha"
+wg_ip: "192.0.2.10"
+mesh: "example.com"
+
+noded: {
+  port: 4200
+  admission: "off"
+}
+
+-- SPEC 02 §4.2 operator capability gate. Empty/absent fails closed.
+-- Observation client service names are process-scoped; patterns are anchored.
+observe: {
+  allowed_services: [
+    "tower-bevy-*"
+    "log-observe-*"
+    "trayd-observe-*"
+  ]
+}

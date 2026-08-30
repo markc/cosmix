@@ -1,0 +1,26 @@
+-- Expected output:
+-- gw = ssh gw
+-- mgo = ssh mgo
+-- motd = ssh motd
+-- ll = ls -la
+-- gw = ssh gw -A -v
+
+-- Loop-generated aliases: name and value both built from a variable.
+-- This is the bash-port repro from feedback_mix_alias_static_only that
+-- was rejected as "expected identifier, got Variable" before the
+-- parse_command_expr lift.
+for each $h in ["gw", "mgo", "motd"] do
+    alias $h = "ssh " .. $h
+end
+alias gw
+alias mgo
+alias motd
+
+-- Value-side is any expression (literal still works alongside dynamic).
+alias ll = "ls -la"
+alias ll
+
+-- Define with a variable-only value (no concat).
+$cmd = "ssh gw -A -v"
+alias gw = $cmd
+alias gw

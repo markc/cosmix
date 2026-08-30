@@ -1,0 +1,56 @@
+-- control.mix: test if/else and select
+-- Expected output:
+-- adult
+-- teen
+-- child
+-- OK
+-- not found
+-- unknown: 302
+
+-- Note: three if/else blocks test all branches
+
+-- if/else
+$age = 25
+if $age > 18 then
+    print "adult"
+end
+
+$age = 15
+if $age > 18 then
+    print "adult"
+else if $age > 12 then
+    print "teen"
+else
+    print "child"
+end
+
+$age = 5
+if $age > 18 then
+    print "adult"
+else if $age > 12 then
+    print "teen"
+else
+    print "child"
+end
+
+-- select
+$status = 200
+select $status
+    when 200 then print "OK"
+    when 404 then print "not found"
+    otherwise print "unknown: ${status}"
+end
+
+$status = 404
+select $status
+    when 200 then print "OK"
+    when 404 then print "not found"
+    otherwise print "unknown: ${status}"
+end
+
+$status = 302
+select $status
+    when 200 then print "OK"
+    when 404 then print "not found"
+    otherwise print "unknown: ${status}"
+end

@@ -1,0 +1,140 @@
+-- h_admin_forum.mix — forum topic management (GET/POST /admin/forum). Admin-only.
+-- A shared SSR datatable (widgets/datatable.mix) of forum topics — the cms_posts
+-- rows with kind='forum' — with live reply counts, View (→ the public topic) and
+-- Delete (the topic + its cms_threads replies). Topics are CREATED on the public
+-- /forum ("New topic"); THIS surface is for moderation/cleanup, mirroring
+-- /admin/posts. Scoped to kind='forum' via a derived table handed to dt_sql (a
+-- handler literal — never user input — so no injection).
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/admin_resource.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+
+-- The forum-topics scope as a derived table (dt_sql/dt_all_ids splice this into
+-- FROM; dt_where/dt_order_by reference the inner columns by name, unprefixed).
+function forum_admin_from()
+  return "(SELECT * FROM cms_posts WHERE kind = 'forum') AS ft"
+end
+
+-- The relationship projection: author display + visible-reply count (correlated,
+-- one row per topic — no N+1). ft.* is the topic row.
+function forum_admin_cols()
+  return "*, (SELECT display FROM users WHERE users.id = ft.author_id) AS author, (SELECT count(*) FROM cms_threads t WHERE t.root_kind = 'forum' AND t.root_id = ft.id AND t.status = 'visible') AS replies"
+end
+
+function forum_list_config()
+  $title_cell = fn($r) = '<strong>' .. esc($r["title"]) .. '</strong>' .. priv_dot($r["visibility"])
+  $title_tip = fn($r) = "" .. $r["title"]
+  -- Row actions: View the public topic, Delete the topic (+ its replies).
+  $act_view = dt_action("view", { "label": "View", icon: "eye", variant: "action", href: fn($r) = "/forum/" .. url_encode("" .. $r["slug"]) })
+  $act_del = dt_action("delete", { "label": "Delete", icon: "trash", variant: "action-danger", action: "delete", confirm: "Delete this topic and all its replies? This cannot be undone." })
+  $rowhref = fn($r) = "/forum/" .. url_encode("" .. $r["slug"])
+  $bulkid = fn($r) = "" .. $r["slug"]
+  $spec = [
+    dt_col("title", "Topic", "title", { sortable: true, searchable: true, render: $title_cell, tooltip: $title_tip, toggleable: true }),
+    dt_col("author", "Author", "author", { sortable: true, placeholder: "—", toggleable: true }),
+    dt_col("replies", "Replies", "replies", { sortable: true, align: "center", width: "6rem", toggleable: true }),
+    dt_col("updated", "Updated", "updated", { sortable: true, type: "datetime", toggleable: true }),
+    dt_col("created", "Created", "created", { sortable: true, type: "datetime", default_hidden: true }),
+    dt_col("status", "Status", "status", { sortable: true, toggleable: true, default_hidden: true, width: "7.5rem" }),
+    dt_col("slug", "Slug", "slug", { sortable: true, toggleable: true, default_hidden: true, prefix: "/forum/" }),
+    -- hidden + searchable so the search box matches the topic BODY too.
+    dt_col("body", "", "body", { searchable: true, hidden: true })
+  ]
+  $opts = dt_admin_opts({
+    base_route: "/admin/forum", caption: "Forum", noun: "topic",
+    subtitle: "Forum topics — moderate and remove.",
+    default_sort: "updated", default_dir: "desc", page_size: 12,
+    search_placeholder: "Search topics…", search_split: true, live_search: true,
+    row_href: $rowhref, row_action_specs: [$act_view, $act_del],
+    bulk_id: $bulkid,
+    header_actions: [ { "label": "New topic", "href": "/forum", "icon": "plus", "variant": "primary" } ]
+  })
+  return { spec: $spec, opts: $opts }
+end
+
+-- Delete a forum topic + its replies by slug (both bound, never spliced). No-op if
+-- the slug isn't a forum topic (so a stale/hostile slug can't touch a blog post).
+function forum_delete_by_slug($slug)
+  $rows = db_query("SELECT id FROM cms_posts WHERE slug = ?1 AND kind = 'forum'", [$slug])
+  if length($rows) == 0 then
+    return
+  end
+  $id = "" .. $rows[0]["id"]
+  db_exec("DELETE FROM cms_threads WHERE root_kind = 'forum' AND root_id = ?1", [$id])
+  db_exec("DELETE FROM cms_posts WHERE id = ?1 AND kind = 'forum'", [$id])
+end
+
+function forum_slug_ok($raw)
+  if $raw == nil then
+    return nil
+  end
+  $s = trim("" .. $raw)
+  if $s == "" or length($s) > 200 then
+    return nil
+  end
+  return $s
+end
+
+function forum_fetch_by_slug($slug)
+  $r = db_query("SELECT id, slug, title FROM cms_posts WHERE slug = ?1 AND kind = 'forum'", [$slug])
+  if length($r) == 1 then
+    return $r[0]
+  end
+  return nil
+end
+
+-- Foundation policy hooks: topic + replies removed in ONE tx (dt_try_delete_row);
+-- the kind='forum' fetch keeps a stale/hostile slug off blog posts.
+function forum_del_hooks()
+  return {
+    id_ok: fn($raw) = forum_slug_ok($raw),
+    fetch: fn($slug) = forum_fetch_by_slug($slug),
+    delete: fn($slug, $row) = forum_delete_by_slug($slug),
+    missing: "No such topic."
+  }
+end
+
+function admin_forum_main()
+cms_init()
+$user = current_user($HEADERS)
+$deny = require_role($user, "admin")
+if $deny != nil then
+  return $deny
+end
+
+if $METHOD == "POST" then
+  $f = parse_form($BODY)
+  -- declarative row action (datatable.mix): action="row:<verb>:<id>"; id = the slug
+  -- (bulk_id), untrusted → bound in forum_delete_by_slug, never spliced.
+  $ra = dt_row_action($f)
+  if $ra != nil then
+    if $ra["verb"] == "delete" then
+      $block = dt_try_delete_row(forum_slug_ok($ra["id"]), forum_del_hooks())
+      if $block != "" then
+        return redirect_flash("/admin/forum", $block, "danger")
+      end
+    end
+    return redirect_flash("/admin/forum", "Topic deleted", "success")
+  end
+  $action = "" .. fm_or($f["action"], "")
+  if $action == "bulk_delete" then
+    -- select-all-across-pages: resolve the FULL matching id set server-side over the
+    -- SAME scope/state (never trusting posted ids). Per-row tx, skip-and-report.
+    $delids = dt_selected_ids($f)
+    if dt_wants_all($f) then
+      $cfg = forum_list_config()
+      $delids = dt_all_ids(forum_admin_from(), $cfg["spec"], dt_state_from_map($f, $cfg["spec"], $cfg["opts"]), "slug")
+    end
+    $rep = dt_bulk_report(dt_bulk_try_delete($delids, forum_del_hooks()), "topics")
+    return redirect_flash("/admin/forum", $rep["msg"], $rep["kind"])
+  end
+  return redirect_flash("/admin/forum", "Unknown action", "warning")
+end
+
+-- list — the admin panel Foundation (dt_admin_list handles the live-search
+-- #dt-results slot + partial/doc tails). Mirrors /admin/posts.
+$cfg = forum_list_config()
+return dt_admin_list({ title: "Forum", user: $user, spec: $cfg["spec"], opts: $cfg["opts"],
+  table: forum_admin_from(), select: forum_admin_cols(), modal: false })
+
+end

@@ -1,0 +1,9 @@
+-- env(name, default) contract probe. Driven by tests/env_default.rs, which sets
+-- MIX_ENV_SET=real, MIX_ENV_EMPTY="" and leaves MIX_ENV_UNSET unset.
+-- Two-arg env() returns the default when the var is unset OR empty
+-- (shell ${VAR:-default} semantics); the one-arg form is unchanged ("").
+print("unset:" .. env("MIX_ENV_UNSET", "fallback"))
+print("empty:" .. env("MIX_ENV_EMPTY", "fallback"))
+print("set:" .. env("MIX_ENV_SET", "fallback"))
+print("onearg:[" .. env("MIX_ENV_UNSET") .. "]")
+print("num:" .. env("MIX_ENV_UNSET", 8080))

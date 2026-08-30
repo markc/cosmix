@@ -1,0 +1,76 @@
+-- ternary.mix: C-style `cond ? a : b` conditional expression
+-- Expected output:
+-- big
+-- false
+-- two
+-- even
+-- 20
+-- oeoeo
+-- both
+-- pos
+-- default
+-- wide
+-- on
+
+-- basic
+$x = 5
+print($x > 3 ? "big" : "small")
+
+-- footgun killed: a falsy MIDDLE operand is returned verbatim. The
+-- Lua-style `$ok and false or "wrong"` idiom would wrongly yield "wrong";
+-- the ternary yields false.
+$ok = true
+print($ok ? false : "wrong")
+
+-- right-associative chain: `a ? b : c ? d : e` == `a ? b : (c ? d : e)`
+$n = 2
+print($n == 1 ? "one" : $n == 2 ? "two" : "many")
+
+-- precedence: binds looser than arithmetic + comparison
+print(4 % 2 == 0 ? "even" : "odd")
+
+-- used as an assigned value (sync assignment path)
+$a = 10
+$b = $a > 5 ? $a * 2 : $a
+print($b)
+
+-- inside a for-loop body (sync fast path)
+$out = []
+for $i = 1 to 5
+  push($out, $i % 2 == 0 ? "e" : "o")
+end
+print(join($out, ""))
+
+-- nested ternary in the then-branch
+$p = 1
+$q = 1
+print($p == 1 ? $q == 1 ? "both" : "p-only" : "neither")
+
+-- sync-self capable inside a function body
+function classify($v)
+  return $v > 0 ? "pos" : $v < 0 ? "neg" : "zero"
+end
+print(classify(7))
+
+-- `??` (nil-coalesce) is a DISTINCT operator and still works
+$z = nil
+print($z ?? "default")
+
+-- a ternary may span newlines INSIDE grouping brackets (statement-level
+-- single-line rule does not apply here — same as `..` concat)
+$w = 10
+print(
+  $w > 5
+  ? "wide"
+  : "narrow"
+)
+
+-- a BARE variable-led ternary as a STATEMENT (not just in assignment/call
+-- position) — parses via parse_variable_stmt's ternary suffix; branches run
+-- for side-effect
+function say($s)
+  print($s)
+  return nil
+end
+$flag = true
+$flag ? say("on") : say("off")

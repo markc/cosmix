@@ -1,0 +1,412 @@
+-- admin_categories.mix — CATEGORY manager as a posts-standard DATATABLE (GET/POST /admin/categories).
+-- Admin-only. Categories are `terms` rows with taxonomy='category' + a nullable parent_id
+-- (Part C of _plan/2026-06-23-cms-reading-model-and-tree-nav.md). The MAIN PANE is now the
+-- shared SSR datatable (mirrors h_admin_posts / h_admin_users) over the category terms; the
+-- sidebar tree nav (lib.mix build_cat_children_map + treeview.mix) is UNTOUCHED. A single
+-- combined create+edit modal fm_form replaces the old recursive tree of New + Rename + Move
+-- forms. Slugs are STABLE — edit never re-slugs (it would break /category/<slug> URLs).
+--
+-- DB scope: `terms` also holds tags, so EVERY query here is scoped to taxonomy='category'.
+-- The datatable reads through a DERIVED TABLE "(SELECT * FROM terms WHERE taxonomy =
+-- 'category') AS t" — dt_sql / dt_all_ids splice that string verbatim before their own WHERE,
+-- so the scope composes (a plain "terms" would leak tag rows into the list + bulk set).
+--   GET  /admin/categories            → datatable
+--   GET  /admin/categories?new=1      → blank editor (full page; &modal=1 + X-Modal-Fetch → md fragment)
+--   GET  /admin/categories?edit=<id>  → editor for that category (full page; modal fetch → md fragment)
+--   POST action=save                  → create (no id; slug=slugify(name)) / update (id; slug stays)
+--   POST action=delete / bulk_delete  → reparent children to grandparent, clean relations, remove
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/admin_resource.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+
+-- The set of ids in the subtree rooted at $root_id (self + every descendant), as a map id→true
+-- (the cycle guard). MIRRORS h_admin_posts.pp_descendant_set: load the WHOLE category adjacency
+-- in ONE query, then BFS in memory guarded ONLY by a visited set (no frontier cap) — so it
+-- returns the COMPLETE descendant set and still terminates on a pre-existing data cycle. Used to
+-- reject a move whose new parent is self or a descendant, and to exclude self+descendants from
+-- the parent picker.
+function cat_descendant_set($root_id)
+  $seen = {}
+  $rid = to_number("" .. fm_or($root_id, 0))
+  if $rid == 0 then
+    return $seen
+  end
+  $rows = db_query("SELECT id, parent_id FROM terms WHERE taxonomy = 'category'", [])
+  $children = {}
+  for each $r in $rows
+    $pk = "0"
+    if $r["parent_id"] != nil and ("" .. $r["parent_id"]) != "" and ("" .. $r["parent_id"]) != "0" then
+      $pk = "" .. $r["parent_id"]
+    end
+    -- get → push → reassign: push($children[$pk], …) would mutate a COPY (Mix indexes maps by
+    -- value), leaving the map empty — pull the list out, append, write it back.
+    $lst = $children[$pk]
+    if $lst == nil then
+      $lst = []
+    end
+    push($lst, "" .. $r["id"])
+    $children[$pk] = $lst
+  end
+  $seen["" .. $rid] = true
+  $frontier = ["" .. $rid]
+  while length($frontier) > 0
+    $next = []
+    for each $fp in $frontier
+      $kids = $children[$fp]
+      if $kids != nil then
+        for each $cid in $kids
+          if $seen[$cid] != true then
+            $seen[$cid] = true
+            push($next, $cid)
+          end
+        end
+      end
+    end
+    $frontier = $next
+  end
+  return $seen
+end
+
+-- Parent <option> list for the editor's Parent picker: a leading "(none) — top-level" (value "")
+-- then EVERY category, EXCEPT the ids in $exclude (self + descendants on an edit; {} for new).
+-- $cur pre-selects the saved parent (selection is actually applied by fm_select's `value` opt;
+-- $cur is kept for signature compatibility). Names indented in the label by depth so the picker
+-- reads as a tree. One query (alpha by name); depth from an in-memory parent walk.
+function cat_parent_options($exclude, $cur)
+  $opts = [ { value: "", "label": "(none) — top-level" } ]
+  $rows = db_query("SELECT id, name, parent_id FROM terms WHERE taxonomy = 'category' ORDER BY name", [])
+  -- id → parent_id map for the depth walk (so the label can be indented).
+  $pmap = {}
+  for each $r in $rows
+    $pp = "0"
+    if $r["parent_id"] != nil and ("" .. $r["parent_id"]) != "" and ("" .. $r["parent_id"]) != "0" then
+      $pp = "" .. $r["parent_id"]
+    end
+    $pmap["" .. $r["id"]] = $pp
+  end
+  for each $r in $rows
+    $id = "" .. $r["id"]
+    if $exclude[$id] != true then
+      -- bounded depth walk (cap 64 against a pre-existing data cycle) → leading indent dashes.
+      $depth = 0
+      $cursor = $pmap[$id]
+      $guard = 0
+      while $cursor != nil and $cursor != "0" and $guard < 64
+        $depth = $depth + 1
+        $cursor = $pmap[$cursor]
+        $guard = $guard + 1
+      end
+      $pad = ""
+      $j = 0
+      while $j < $depth
+        $pad = $pad .. "— "
+        $j = $j + 1
+      end
+      push($opts, { value: $id, "label": $pad .. ("" .. $r["name"]) })
+    end
+  end
+  return $opts
+end
+
+-- Delete ONE category by id: its children reparent to the deleted node's OWN parent (the
+-- GRANDPARENT), NOT top-level, so they keep their place in the tree; then its term_relations
+-- rows are cleaned and the term itself removed. $id is UNTRUSTED → coerced + bound. A missing /
+-- 0 / non-category id is a no-op. Shared by the single-row delete and the bulk delete loop.
+function cat_fetch_one($id)
+  $r = db_query("SELECT id, name FROM terms WHERE id = ?1 AND taxonomy = 'category'", [$id])
+  if length($r) == 1 then
+    return $r[0]
+  end
+  return nil
+end
+
+-- Foundation policy hooks: the reparent+clean+remove cascade runs atomically
+-- inside dt_try_delete_row's tx (see admin_resource.mix). No guard, no audit
+-- table on CMS.
+function cat_del_hooks()
+  return {
+    fetch: fn($id) = cat_fetch_one($id),
+    delete: fn($id, $row) = cat_delete_one($id),
+    missing: "No such category."
+  }
+end
+
+function cat_delete_one($id)
+  $cid = to_number("" .. fm_or($id, 0))
+  if $cid == 0 then
+    return nil
+  end
+  $row = db_query("SELECT parent_id FROM terms WHERE id = ?1 AND taxonomy = 'category'", [$cid])
+  if length($row) == 0 then
+    return nil
+  end
+  $gp = $row[0]["parent_id"]
+  if $gp == nil or ("" .. $gp) == "0" then
+    db_exec("UPDATE terms SET parent_id = NULL WHERE parent_id = ?1 AND taxonomy = 'category'", [$cid])
+  else
+    db_exec("UPDATE terms SET parent_id = ?2 WHERE parent_id = ?1 AND taxonomy = 'category'", [$cid, $gp])
+  end
+  db_exec("DELETE FROM term_relations WHERE term_id = ?1", [$cid])
+  db_exec("DELETE FROM terms WHERE id = ?1 AND taxonomy = 'category'", [$cid])
+  return nil
+end
+
+-- The combined create+edit field set (the SAME name= keys the save branch reads: action=save +
+-- id + name + parent_id). On EDIT the slug is shown READ-ONLY (a stable /category/<slug> URL —
+-- the save never re-slugs); on NEW it is omitted entirely (the slug is derived from the name at
+-- create). The parent picker excludes self + descendants on edit (cycle guard); for new there is
+-- no self to exclude. Values RAW (fm_* esc()s once).
+function cat_editor_fields($id, $name, $slug, $parent_id, $isnew)
+  $h = fm_hidden("action", "save")
+  $h = $h .. fm_hidden("id", "" .. $id)
+  $h = $h .. fm_text("name", "Name", { value: $name, required: true })
+  if not $isnew then
+    $h = $h .. fm_text("slug", "Slug", { value: $slug, readonly: true, help: "Stable — backs the /category/<slug> URL.", help_tip: true })
+  end
+  $exclude = {}
+  if not $isnew then
+    $exclude = cat_descendant_set($id)
+  end
+  $popts = cat_parent_options($exclude, "" .. $parent_id)
+  $h = $h .. fm_select("parent_id", "Parent", $popts, { value: "" .. $parent_id, help: "Nest under another category, or leave top-level.", help_tip: true })
+  return $h
+end
+
+-- ONE fm_form spec, rendered IDENTICALLY on the canvas and in the modal (only `mode` differs).
+-- The handler adds the canvas cms-head; the modal heading rides `title`. Cancel returns to the
+-- category list. action=save + id + fields round-trip unchanged (in cat_editor_fields).
+function cat_editor_form($id, $name, $slug, $parent_id, $isnew, $heading, $err, $mode)
+  return { mode: $mode, action: "/admin/categories", id: "cat-edit", title: $heading,
+           fields: fm_grid({ cols: 2 }, cat_editor_fields($id, $name, $slug, $parent_id, $isnew)),
+           submit: { "label": "Save" }, cancel: { "label": "Cancel", href: "/admin/categories" }, error: $err }
+end
+
+-- Canvas editor (full page, no-JS fallback): the page cms-head + the shared fm_form (canvas).
+function cat_editor_canvas($id, $name, $slug, $parent_id, $isnew, $heading, $err)
+  $h = '<div class="cms-head"><h1>' .. esc($heading) .. '</h1><a class="navlink" href="/admin/categories">← All categories</a></div>'
+  return $h .. fm_form(cat_editor_form($id, $name, $slug, $parent_id, $isnew, $heading, $err, "canvas"))
+end
+
+-- Modal-panel editor (the SAME spec in modal mode) for the row-Edit / New modal fetch.
+function cat_editor_panel($id, $name, $slug, $parent_id, $isnew, $heading)
+  return fm_form(cat_editor_form($id, $name, $slug, $parent_id, $isnew, $heading, "", "modal"))
+end
+
+-- The list datatable config (spec + opts), built ONCE so the bulk select-all-across-pages path
+-- re-derives the SAME spec/filters server-side (mirrors h_admin_posts / h_admin_users). All
+-- lambdas are REAL (closed over esc/url_encode) — dt_opts rejects a nil bulk_id and indexes the
+-- row-action specs, while dt_where / dt_all_ids (the bulk re-derive) never invoke them.
+function cat_list_config()
+  $name_cell = fn($r) = '<strong>' .. esc("" .. $r["name"]) .. '</strong>'
+  -- Edit = a MODAL row action (lazy-fetch the &modal=1 editor into the datatable-owned dialog).
+  -- modal:true is the marker — in context-menu mode the widget owns the dialog id (dt-rowmenu-modal).
+  $act_edit = dt_action("edit", { "label": "Edit", icon: "pencil", modal: true, href: fn($r) = "/admin/categories?edit=" .. ("" .. $r["id"]) .. "&modal=1" })
+  $act_view = dt_action("view", { "label": "View", icon: "eye", variant: "action", href: fn($r) = "/category/" .. url_encode("" .. $r["slug"]) })
+  $act_del = dt_action("delete", { "label": "Delete", icon: "trash", variant: "action-danger", action: "delete", confirm: "Delete this category? Children move up to its parent." })
+  $bulkid = fn($r) = "" .. $r["id"]
+  -- parent_name + post_count are PROJECTION aliases from the $cols subqueries in dt_sql (a
+  -- correlated parent-name lookup + a term_relations COUNT); both sortable on the alias.
+  $spec = [
+    dt_col("name", "Name", "name", { sortable: true, searchable: true, render: $name_cell }),
+    dt_col("slug", "Slug", "slug", { sortable: true, searchable: true, default_hidden: true }),
+    dt_col("parent_name", "Parent", "parent_name", { sortable: true, placeholder: "—" }),
+    dt_col("post_count", "Posts", "post_count", { align: "center" })
+  ]
+  $opts = dt_admin_opts({
+    base_route: "/admin/categories", caption: "Categories", noun: "categories",
+    default_sort: "name", default_dir: "asc",
+    search_placeholder: "Search categories…",
+    row_action_specs: [$act_edit, $act_view, $act_del],
+    bulk_id: $bulkid,
+    header_actions: [ { "label": "New category", "href": "/admin/categories?new=1&modal=1", icon: "plus", variant: "primary" } ]
+  })
+  return { spec: $spec, opts: $opts }
+end
+
+function admin_categories_main()
+cms_init()
+$user = current_user($HEADERS)
+-- A modal fetch on an expired session must return a clean fragment, not a login redirect
+-- injected into the dialog (mirrors h_admin_posts / h_admin_users).
+if md_is_modal_request() and $user == nil then
+  return md_session_expired("/admin/categories")
+end
+$deny = require_role($user, "admin")
+if $deny != nil then
+  return $deny
+end
+
+$flash = ""
+if $METHOD == "POST" then
+  $f = parse_form($BODY)
+  $action = $f["action"]
+  if $action == nil then
+    $action = "save"
+  end
+
+  -- declarative row delete (datatable.mix): action="row:delete:<id>". id is UNTRUSTED →
+  -- bound. Deletes ride the Foundation policy helper: the whole reparent-children +
+  -- clean-relations + remove cascade (cat_delete_one) now runs in ONE tx.
+  $ra = dt_row_action($f)
+  if $ra != nil then
+    if $ra["verb"] == "delete" then
+      $block = dt_try_delete_row(to_number($ra["id"]), cat_del_hooks())
+      if $block != "" then
+        return redirect_flash("/admin/categories", $block, "danger")
+      end
+    end
+    return redirect_flash("/admin/categories", "Category deleted", "success")
+  end
+
+  if $action == "delete" then
+    $did = to_number($f["id"])
+    if $did != nil then
+      $block = dt_try_delete_row($did, cat_del_hooks())
+      if $block != "" then
+        return redirect_flash("/admin/categories", $block, "danger")
+      end
+    end
+    return redirect_flash("/admin/categories", "Category deleted", "success")
+  end
+
+  if $action == "bulk_delete" then
+    -- select-all-across-pages (S-5): when the flag is set, resolve the FULL matching id set by
+    -- re-running dt_where server-side over the SAME derived-table scope + spec/filters — NEVER
+    -- trusting the posted sel_* ids. Per-row guarded tx, skip-and-report.
+    $ids = dt_selected_ids($f)
+    if dt_wants_all($f) then
+      $cfg = cat_list_config()
+      $ids = dt_all_ids("(SELECT * FROM terms WHERE taxonomy = 'category') AS t", $cfg["spec"], dt_state_from_map($f, $cfg["spec"], $cfg["opts"]), "id")
+    end
+    $rep = dt_bulk_report(dt_bulk_try_delete($ids, cat_del_hooks()), "categories")
+    return redirect_flash("/admin/categories", $rep["msg"], $rep["kind"])
+  end
+
+  -- save (create or update). On a validation issue we set $flash and fall through to the list
+  -- render (mirrors h_admin_users); on success we redirect_flash.
+  $name = trim("" .. fm_or($f["name"], ""))
+  if $name == "" then
+    $flash = "A category name is required."
+  else
+    -- parent_id: "" / nil / "0" → 0 (top-level NULL); else the picked id.
+    $parent_id = 0
+    $praw = $f["parent_id"]
+    if $praw != nil and trim("" .. $praw) != "" and ("" .. $praw) != "0" then
+      $parent_id = to_number("" .. $praw)
+    end
+    $idraw = $f["id"]
+    if $idraw != nil and $idraw != "" then
+      -- UPDATE: name + parent only (the slug is NEVER re-slugged — a stable /category/<slug>
+      -- URL). Re-validate the chosen parent (don't trust the select): the cycle guard rejects
+      -- self / a descendant, and the parent must exist as a category; either failure → top-level.
+      $eid = to_number("" .. $idraw)
+      if $parent_id != 0 then
+        $banned = cat_descendant_set($eid)
+        if $banned["" .. $parent_id] == true then
+          $parent_id = 0
+        else
+          $pe = db_query("SELECT id FROM terms WHERE id = ?1 AND taxonomy = 'category'", [$parent_id])
+          if length($pe) == 0 then
+            $parent_id = 0
+          end
+        end
+      end
+      if $parent_id == 0 then
+        db_exec("UPDATE terms SET name = ?1, parent_id = NULL, updated = datetime('now') WHERE id = ?2 AND taxonomy = 'category'", [$name, $eid])
+      else
+        db_exec("UPDATE terms SET name = ?1, parent_id = ?2, updated = datetime('now') WHERE id = ?3 AND taxonomy = 'category'", [$name, $parent_id, $eid])
+      end
+      return redirect_flash("/admin/categories", "Category saved", "success")
+    else
+      -- CREATE: slug = slugify(name); the picked parent must exist (else top-level). Guard
+      -- UNIQUE(taxonomy, slug) BOTH ways — a best-effort SELECT-then-reuse AND a try/catch
+      -- around the INSERT (a concurrent create that wins the race, or any constraint hit, is
+      -- treated as reuse, never an unhandled 500).
+      $slug = slugify($name)
+      if $parent_id != 0 then
+        $pe = db_query("SELECT id FROM terms WHERE id = ?1 AND taxonomy = 'category'", [$parent_id])
+        if length($pe) == 0 then
+          $parent_id = 0
+        end
+      end
+      $existing = db_query("SELECT id FROM terms WHERE taxonomy = 'category' AND slug = ?1", [$slug])
+      if length($existing) > 0 then
+        $flash = "A category with slug “" .. $slug .. "” already exists; reusing it."
+      else
+        try
+          if $parent_id == 0 then
+            db_exec("INSERT INTO terms (taxonomy, slug, name, parent_id) VALUES ('category', ?1, ?2, NULL)", [$slug, $name])
+          else
+            db_exec("INSERT INTO terms (taxonomy, slug, name, parent_id) VALUES ('category', ?1, ?2, ?3)", [$slug, $name, $parent_id])
+          end
+          return redirect_flash("/admin/categories", "Category added", "success")
+        catch $cerr
+          $flash = "A category with slug “" .. $slug .. "” already exists; reusing it."
+        end
+      end
+    end
+  end
+end
+
+-- GET: decide datatable vs editor.
+$q = parse_query($QUERY)
+$editid = $q["edit"]
+$isnew = $q["new"]
+
+if $isnew != nil or $editid != nil then
+  $cat_modal = md_is_modal_request()
+  if $isnew != nil then
+    if $cat_modal then
+      return md_fragment(cat_editor_panel("", "", "", "", true, "New category"))
+    end
+    return doc(200, "New category", $user, cat_editor_canvas("", "", "", "", true, "New category", ""))
+  end
+  -- edit: load the row.
+  $rows = db_query("SELECT id, name, slug, parent_id FROM terms WHERE id = ?1 AND taxonomy = 'category'", [to_number("" .. $editid)])
+  if length($rows) == 0 then
+    -- a stale Edit link (the row was deleted): a clean not-found fragment in a modal, else a page.
+    if $cat_modal then
+      return md_not_found("category", "/admin/categories")
+    end
+    return doc(404, "Categories", $user, '<div class="card cms-card-narrow"><h1>Category not found</h1><p class="muted"><a href="/admin/categories">← All categories</a></p></div>')
+  end
+  $row = $rows[0]
+  $cur_parent = ""
+  if $row["parent_id"] != nil and ("" .. $row["parent_id"]) != "0" then
+    $cur_parent = "" .. $row["parent_id"]
+  end
+  if $cat_modal then
+    return md_fragment(cat_editor_panel("" .. $row["id"], "" .. $row["name"], "" .. $row["slug"], $cur_parent, false, "Edit category"))
+  end
+  return doc(200, "Edit category", $user, cat_editor_canvas("" .. $row["id"], "" .. $row["name"], "" .. $row["slug"], $cur_parent, false, "Edit category", ""))
+end
+
+-- list — shared SSR datatable over the category terms. The DERIVED-TABLE scope keeps tag rows
+-- out; the $cols projection adds parent_name (a correlated parent-name lookup) + post_count (a
+-- term_relations COUNT). Config built by cat_list_config() so the POST bulk handler re-runs
+-- dt_where over the SAME spec/filters (select-all-across-pages, S-5).
+$cfg = cat_list_config()
+$spec = $cfg["spec"]
+$opts = $cfg["opts"]
+$state = dt_state($QUERY, $spec, $opts)
+$res = dt_sql("(SELECT * FROM terms WHERE taxonomy = 'category') AS t", $spec, $state, "*, (SELECT p.name FROM terms p WHERE p.id = t.parent_id) AS parent_name, (SELECT COUNT(*) FROM term_relations r WHERE r.term_id = t.id) AS post_count")
+-- search results-only partial (only fires with live_search; harmless otherwise).
+if dt_wants_results() then
+  return dt_results_partial(dt_results_inner($spec, $opts, $state, $res["rows"], $res["total"], nil), "")
+end
+$dt = dt_render($spec, $opts, $state, $res["rows"], $res["total"], nil)
+-- sort/page/filter (in-region) → full region swap; a view-change / no-JS / full nav → doc().
+if dt_wants_partial() then
+  return dt_partial($dt)
+end
+-- A failed POST save falls through here (full render); show its flash above the table.
+$body = ""
+if $flash != "" then
+  $body = '<div class="forms-skin">' .. fm_flash_error($flash) .. '</div>'
+end
+-- Row actions render as the right-click menu (row_actions_contextmenu); dt_actions_chrome emits
+-- the generated menu template + the datatable-owned modal shell + shim after the region.
+return doc(200, "Categories", $user, $body .. dt_region($dt, "", true) .. dt_actions_chrome($opts))
+
+end

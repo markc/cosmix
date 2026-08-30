@@ -1,0 +1,30 @@
+{
+  "controls": [
+    {
+      "id": "mute",
+      "kind": "toggle",
+      "value_type": "bool",
+      "queryable": true,
+      "writable": true
+    },
+    {
+      "id": "trim",
+      "kind": "knob",
+      "value_type": "number",
+      "queryable": true,
+      "writable": true,
+      "min": -18.0,
+      "max": 18.0,
+      "step": 0.5,
+      "unit": "dB"
+    },
+    {
+      "id": "transport.toggle",
+      "kind": "button",
+      "value_type": "action",
+      "queryable": false,
+      "writable": true,
+      "action": "transport.toggle"
+    }
+  ]
+}

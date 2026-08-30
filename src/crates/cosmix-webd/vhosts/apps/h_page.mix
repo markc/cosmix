@@ -1,0 +1,71 @@
+-- page.mix — standalone CMS page view (GET /page/<slug>). Same data table as
+-- posts (cms_posts) but kind='page': no blog-feed listing, no author byline.
+--
+-- Reading model (Part A): when show_on_front=page AND this slug is the configured
+-- posts_page_slug, the page becomes the relocated BLOG INDEX — its own body renders as an
+-- intro ABOVE the post feed (Mark's choice, NOT WordPress's discard). The feed view lives
+-- in h_home.mix (blog_feed_view); include it (load-once, script-relative) like h_posts.mix.
+include "/opt/cosmix/vhosts/shared/apps/h_home.mix"
+-- The standalone /page/<slug> viewer renders through the shared rd_view reader widget.
+include "/opt/cosmix/vhosts/shared/widgets/reader.mix"
+-- Pages support comments too (same threaded substrate as posts/forum), per-page toggled.
+include "/opt/cosmix/vhosts/shared/widgets/thread.mix"
+
+function page_main()
+cms_init()
+$user = current_user($HEADERS)
+-- Pages (`notes`) surface gate: disabled → hidden nav + 404 on /page/*.
+if not feature("notes") then
+  return feature_off_doc($user, "Pages")
+end
+$slug = $PATH
+if pos("/page/", $slug) == 1 then
+  $slug = substr($slug, 6, length($slug) - 6)
+end
+-- Render via the shared helper (also used by the static-home branch in h_home).
+-- nil = the page doesn't exist, OR an anon viewer hit a draft/private page → 404.
+$rp = render_page_by_slug($slug, $user)
+if $rp == nil then
+  return doc(404, "Not found", $user, '<div class="card"><h1>404</h1><p class="muted">No such page.</p><a class="btn btn-ghost" href="/">← Home</a></div>')
+end
+-- Posts-page (Mode B blog index): if the reading switch is `page`, this slug is the
+-- configured posts_page_slug, AND the blog surface is on → render the page body as an
+-- intro, then the post feed below. The feed's dt links stay on THIS route (/page/<slug>).
+-- A boosted/in-region request returns just the feed partial. Every OTHER page (and any
+-- page when the switch is off / blog off) takes the normal single-page render unchanged.
+$pps = trim("" .. setting("posts_page_slug", ""))
+if ("" .. setting("show_on_front", "posts")) == "page" and $pps != "" and $slug == $pps and feature("blog") then
+  $view = blog_feed_view($user, "/page/" .. $slug)
+  if dt_wants_partial() then
+    return dt_partial($view)
+  end
+  $intro = $rp["html"]
+  return doc(200, $rp["title"], $user, $intro .. dt_region($view, "", true))
+end
+-- Standalone /page/<slug>: render through the shared rd_view reader via cms_read_spec (lib.mix) —
+-- the SAME spec the public /post view and the editor preview use (preview === view). For kind=page
+-- it yields a header card (badges + author-gated Edit + a Home back) above the clutter-free body,
+-- no byline/footer (timeless standalone content). The Mode-B intro branch above keeps the plain
+-- $rp["html"] (it sits ABOVE the feed, no chrome). body_html is already rendered by the helper.
+-- CANVAS pages skip the reader chrome entirely: the raw body owns the content region
+-- (its own headings/animations/scripts; the boost shim re-injects <script> on swap).
+$fmt = "" .. cms_or($rp["format"], "markdown")
+if $fmt == "canvas" or $fmt == "canvas-file" then
+  $body = $rp["html"]
+else
+  $row = { kind: "page", title: $rp["title"], body_html: $rp["body_html"], slug: $rp["slug"], status: $rp["status"], visibility: $rp["visibility"] }
+  $body = rd_view(cms_read_spec($row, $user, {}))
+end
+-- Comments on a standalone page (per-page toggle; same substrate as posts/forum). render_page_by_slug
+-- already validated existence/visibility — fetch the id + toggle for the thread root.
+$prow = db_query("SELECT id, comments_enabled FROM cms_posts WHERE slug = ?1 AND kind = 'page'", [$rp["slug"]])
+if length($prow) > 0 and ("" .. thread_or($prow[0]["comments_enabled"], "0")) == "1" then
+  $ppath = "/page/" .. ("" .. $rp["slug"])
+  $q = parse_query($QUERY)
+  $cancmt = ($user != nil) and ($rp["status"] == "published") and ($rp["visibility"] != "private")
+  $copts = { root_kind: "page", root_id: $prow[0]["id"], base: $ppath, "return": $ppath, post_to: "/reply", can_reply: $cancmt, see_pending: can_preview_unpublished($user), reply_to: $q["reply_to"], heading: "Comments" }
+  $body = $body .. rd_thread($copts)
+end
+return doc(200, $rp["title"], $user, $body)
+
+end

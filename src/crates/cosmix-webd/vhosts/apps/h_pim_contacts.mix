@@ -1,0 +1,380 @@
+-- h_pim_contacts.mix — SHARED SSR Contacts (full CRUD) for /pim/contacts.
+-- Defines pim_contacts_main(); the per-vhost stub includes site.conf.mix + lib.mix
+-- + this file, then `return pim_contacts_main()`. Helper functions stay at module
+-- level. Vhost-agnostic: identity is the maild session, data is the vhost's own
+-- maild address book via the jmap() builtin (server-side, sealed-cookie Bearer).
+--   GET  /pim/contacts                → list (?q= search, ?sort=name|email, ?page=)
+--   GET  /pim/contacts?view=<id>      → read-only detail card
+--   GET  /pim/contacts?edit=<id>      → edit form
+--   GET  /pim/contacts?new=1          → new-contact form
+--   POST /pim/contacts  action=save   → Contact/set create (no id) or update (id)
+--   POST /pim/contacts  action=delete → Contact/set destroy
+-- maild has NO JMAP back-references, so a listing is two calls: Contact/query →
+-- ids, then Contact/get(ids). Create needs an addressBookId (AddressBook/query);
+-- update is MERGE (named field overwrites, omitted kept) — the form posts plain
+-- fullName/email/company/phone. AUTH is checked via $SESSION.authenticated BEFORE
+-- any jmap() so a genuine service failure is shown as "unavailable", never as
+-- "sign in". CSRF: SameSite=Lax session cookie (house style).
+
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/admin_resource.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+include "/opt/cosmix/vhosts/shared/widgets/reader.mix"
+
+-- esc'd contact field, "" when absent.
+function ct_field($c, $k)
+  $v = $c[$k]
+  if $v == nil then
+    return ""
+  end
+  return esc("" .. $v)
+end
+
+-- (the old per-handler fval() is gone — folded onto forms.mix's fm_val, Phase 2.)
+
+-- The "sign in to mail" card — ONLY shown to a genuinely signed-out request.
+function ct_login($next)
+  $h = '<div class="card cms-card-narrow">'
+  $h = $h .. '<h1 style="margin-top:0">Contacts</h1>'
+  $h = $h .. '<p class="muted">Sign in to your mail account to view your contacts.</p>'
+  $h = $h .. '<div style="margin-top:var(--space-5)"><a class="btn btn-primary" href="/auth/login?next=' .. url_encode($next) .. '">Sign in to mail</a></div>'
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- A service-error card: the user IS signed in but a jmap() call failed (maild
+-- unreachable, or the session token expired/was revoked mid-request).
+function ct_error()
+  $h = '<div class="card cms-card-narrow">'
+  $h = $h .. '<h1 style="margin-top:0">Contacts unavailable</h1>'
+  $h = $h .. '<p class="muted">The mail service could not be reached. Your session may have expired — try signing in again, or retry shortly.</p>'
+  $h = $h .. '<div class="cms-actions center">'
+  $h = $h .. '<a class="btn btn-ghost" href="/pim/contacts">Retry</a>'
+  $h = $h .. '<a class="btn btn-primary" href="/auth/login?next=' .. url_encode("/pim/contacts") .. '">Sign in again</a>'
+  $h = $h .. '</div></div>'
+  return $h
+end
+
+-- "Contact not found" card (a bad/stale id).
+function ct_notfound()
+  return '<div class="card cms-card-narrow"><h1>Contact not found</h1><p class="muted">It may have been deleted. <a href="/pim/contacts">← All contacts</a></p></div>'
+end
+
+-- Name cell HTML for the list (display = fullName, "(no name)" fallback). The
+-- datatable supplies the row <a> to ?view=<id>, so this must NOT emit its own
+-- link (nested <a> is invalid HTML). ct_field already escapes.
+function ct_name_html($c)
+  $nm = ct_field($c, "fullName")
+  if $nm == "" then
+    return '<span class="muted">(no name)</span>'
+  end
+  return '<strong>' .. $nm .. '</strong>'
+end
+
+-- The rd_view read-spec for a contact (the shared reader, the read-twin of fm_form). A contact has
+-- no prose body — its fields ARE the meta rows (Email rendered as a mailto: link); Edit is a link,
+-- Delete a POST action (data-confirm gates it, exactly as the old inline form did). Values are RAW
+-- — rd_view esc()s each once (so NOT ct_field, which would double-escape).
+function ct_read_spec($c)
+  $cid = "" .. $c["id"]
+  $name = trim("" .. cms_or($c["fullName"], ""))
+  if $name == "" then
+    $name = "(no name)"
+  end
+  $meta = []
+  $email = trim("" .. cms_or($c["email"], ""))
+  if $email != "" then
+    push($meta, { "label": "Email", value: $email, href: "mailto:" .. $email })
+  end
+  $company = trim("" .. cms_or($c["company"], ""))
+  if $company != "" then
+    push($meta, { "label": "Company", value: $company })
+  end
+  $phone = trim("" .. cms_or($c["phone"], ""))
+  if $phone != "" then
+    push($meta, { "label": "Phone", value: $phone })
+  end
+  $actions = [
+    { "label": "Edit", icon: "pencil", variant: "primary", href: "/pim/contacts?edit=" .. url_encode($cid) },
+    { "label": "Delete", icon: "trash", variant: "danger", post: "/pim/contacts", confirm: "Delete this contact?", fields: [ { name: "action", value: "delete" }, { name: "id", value: $cid } ] }
+  ]
+  return { title: $name, meta: $meta, actions: $actions, back: { "label": "All contacts", href: "/pim/contacts" } }
+end
+
+-- Read-only detail → the shared rd_view reader.
+function ct_detail($c)
+  return rd_view(ct_read_spec($c))
+end
+
+-- The shared contact field set — the SAME name= keys the POST handler reads — used by
+-- BOTH the full-page form (ct_form) and the modal panel (ct_form_panel). Values are RAW
+-- (fm_* esc()s each once; passing the pre-esc'd ct_field would double-escape). The hidden
+-- action=save + id round-trip is preserved exactly.
+function ct_fields($c)
+  $h = fm_hidden("action", "save")
+  $h = $h .. fm_hidden("id", "" .. $c["id"])
+  $h = $h .. fm_text("fullName", "Full name", { value: fm_val($c, "fullName"), autofocus: true, span: 2 })
+  $h = $h .. fm_email("email", "Email", { value: fm_val($c, "email") })
+  $h = $h .. fm_text("company", "Company", { value: fm_val($c, "company") })
+  $h = $h .. fm_tel("phone", "Phone", { value: fm_val($c, "phone") })
+  return $h
+end
+
+-- The full-page create/edit form (skin on). $c = an existing contact map (edit) or a
+-- blank map (new). $err = a flash above the form ("" = none). Posts action=save + id +
+-- fullName/email/company/phone — round-trip unchanged.
+-- ONE fm_form spec rendered IDENTICALLY on the canvas and in the modal (only `mode` differs)
+-- — the same unification the post editor uses, so canvas/modal can't drift. The handler adds
+-- the canvas cms-head; the modal heading rides `title`. Cancel returns to the list (or the
+-- just-edited contact's view). action=save + id + fields round-trip unchanged (in ct_fields).
+function ct_form_spec($c, $heading, $err, $mode)
+  $cid = "" .. $c["id"]
+  $cancel = "/pim/contacts"
+  if $cid != "" then
+    $cancel = "/pim/contacts?view=" .. url_encode($cid)
+  end
+  return { mode: $mode, action: "/pim/contacts", id: "ct-edit", title: $heading,
+           fields: fm_grid({ cols: 2 }, ct_fields($c)),
+           submit: { "label": "Save" }, cancel: { "label": "Cancel", href: $cancel }, error: $err }
+end
+
+-- Canvas editor: the page cms-head (heading + back) + the shared fm_form (canvas mode).
+function ct_form($c, $heading, $err)
+  $h = '<div class="cms-head"><h1>' .. esc($heading) .. '</h1><a class="navlink" href="/pim/contacts">← All contacts</a></div>'
+  return $h .. fm_form(ct_form_spec($c, $heading, $err, "canvas"))
+end
+
+-- Modal-panel variant for modal-driven Edit (modals.mix): the SAME spec in modal mode →
+-- md_panel with the heading as its title; Save submits the POST, Cancel closes the dialog.
+-- Returned as the md_fragment body on a modal fetch; the persistent <dialog id="md-edit">
+-- shell on the list carries forms-skin so the fm_* are styled.
+function ct_form_panel($c, $heading)
+  return fm_form(ct_form_spec($c, $heading, "", "modal"))
+end
+
+-- Contact/get one id → the contact map, or nil if absent. Raises on transport
+-- error (the caller wraps in try/catch and renders ct_error()).
+function ct_get_one($id)
+  $gr = jmap("Contact/get", { ids: [$id] })
+  $list = $gr["list"]
+  if length($list) > 0 then
+    return $list[0]
+  end
+  return nil
+end
+
+-- ─────────────────────────── handler ───────────────────────────
+function pim_contacts_main()
+  cms_init()
+  $user = current_user($HEADERS)
+
+  -- Feature gate: a vhost may disable Contacts (nav link hidden; route 404s here).
+  if not feature("pim_contacts") then
+    return feature_off_doc($user, "Contacts")
+  end
+
+  -- Auth FIRST (so a real jmap() failure is never mis-shown as "sign in").
+  if not $SESSION["authenticated"] then
+    if $METHOD == "POST" then
+      return redirect("/auth/login?next=" .. url_encode("/pim/contacts"))
+    end
+    -- A modal-edit fetch (X-Modal-Fetch) on an expired session must NOT inject the full
+    -- login shell into the dialog — md_script would render a mangled page. Return a clean
+    -- sign-in fragment instead (the /auth/login link is a plain full nav, not boosted).
+    if md_is_modal_request() then
+      return md_session_expired("/pim/contacts")
+    end
+    return doc(200, "Contacts", $user, ct_login("/pim/contacts"))
+  end
+
+  -- ── POST: save (create/update) or delete ──
+  if $METHOD == "POST" then
+    $f = parse_form($BODY)
+    $action = $f["action"]
+    if $action == nil then
+      $action = "save"
+    end
+    $id = trim(fm_val($f,"id"))
+
+    if $action == "delete" then
+      if $id != "" then
+        try
+          jmap("Contact/set", { destroy: [$id] })
+        catch $e
+          return doc(502, "Contacts", $user, ct_error())
+        end
+      end
+      return redirect_flash("/pim/contacts", "Contact deleted", "success")
+    end
+
+    if $action == "bulk_delete" then
+      $sel = dt_selected_ids($f)
+      if length($sel) > 0 then
+        try
+          jmap("Contact/set", { destroy: $sel })
+        catch $e
+          return doc(502, "Contacts", $user, ct_error())
+        end
+      end
+      return redirect_flash("/pim/contacts", "Contacts deleted", "success")
+    end
+
+    -- save (create or update)
+    $fullName = trim(fm_val($f,"fullName"))
+    $email = trim(fm_val($f,"email"))
+    $company = trim(fm_val($f,"company"))
+    $phone = trim(fm_val($f,"phone"))
+    $fields = { fullName: $fullName, email: $email, company: $company, phone: $phone }
+    if $fullName == "" and $email == "" then
+      $back = $fields
+      $back["id"] = $id
+      $heading = "New contact"
+      if $id != "" then
+        $heading = "Edit contact"
+      end
+      return doc(200, $heading, $user, ct_form($back, $heading, "Enter at least a name or email."))
+    end
+
+    if $id != "" then
+      -- update (merge): { update: { <id>: $fields } }
+      $upd = {}
+      $upd[$id] = $fields
+      try
+        jmap("Contact/set", { update: $upd })
+      catch $e
+        return doc(502, "Contacts", $user, ct_error())
+      end
+      return redirect_flash("/pim/contacts?view=" .. url_encode($id), "Contact saved", "success")
+    end
+
+    -- create: discover an addressBookId, then Contact/set create.
+    $abid = ""
+    $newid = ""
+    try
+      $bq = jmap("AddressBook/query", {})
+      $bids = $bq["ids"]
+      if length($bids) > 0 then
+        $abid = "" .. $bids[0]
+      end
+      if $abid != "" then
+        $newobj = { addressBookId: $abid, fullName: $fullName, email: $email, company: $company, phone: $phone }
+        $r = jmap("Contact/set", { create: { "new": $newobj } })
+        $created = $r["created"]
+        if $created != nil then
+          $cnew = $created["new"]
+          if $cnew != nil then
+            $newid = "" .. $cnew["id"]
+          end
+        end
+      end
+    catch $e
+      return doc(502, "Contacts", $user, ct_error())
+    end
+    if $newid == "" then
+      $back = $fields
+      $back["id"] = ""
+      return doc(200, "New contact", $user, ct_form($back, "New contact", "The contact could not be saved. Please try again."))
+    end
+    return redirect_flash("/pim/contacts?view=" .. url_encode($newid), "Contact saved", "success")
+  end
+
+  -- ── GET: new / view / edit / list ──
+  $q = parse_query($QUERY)
+
+  if $q["new"] != nil then
+    $blank = { id: "", fullName: "", email: "", company: "", phone: "" }
+    return doc(200, "New contact", $user, ct_form($blank, "New contact", ""))
+  end
+
+  $viewid = $q["view"]
+  if $viewid != nil and $viewid != "" then
+    $c = nil
+    try
+      $c = ct_get_one($viewid)
+    catch $e
+      return doc(502, "Contacts", $user, ct_error())
+    end
+    if $c == nil then
+      return doc(404, "Contacts", $user, ct_notfound())
+    end
+    return doc(200, "Contact", $user, ct_detail($c))
+  end
+
+  $editid = $q["edit"]
+  if $editid != nil and $editid != "" then
+    -- ?edit=<id>&modal=1 fetched by md_script (X-Modal-Fetch) → return the bare md_panel
+    -- fragment for the persistent <dialog id="md-edit">; a no-JS full nav (no header)
+    -- gets the whole edit page. Errors return a fragment too so the dialog shows them
+    -- inline rather than swapping the page out from under the open modal.
+    $modal = md_is_modal_request()
+    $c = nil
+    try
+      $c = ct_get_one($editid)
+    catch $e
+      if $modal then
+        return md_fragment(md_panel({ title: "Contacts unavailable", submit: false, cancel: "Close" }, '<p class="fm-help">The mail service could not be reached. Close and retry shortly.</p>'))
+      end
+      return doc(502, "Contacts", $user, ct_error())
+    end
+    if $c == nil then
+      if $modal then
+        return md_not_found("contact", "/pim/contacts")
+      end
+      return doc(404, "Contacts", $user, ct_notfound())
+    end
+    if $modal then
+      return md_fragment(ct_form_panel($c, "Edit contact"))
+    end
+    return doc(200, "Edit contact", $user, ct_form($c, "Edit contact", ""))
+  end
+
+  -- list — shared SSR datatable over maild. Contact/query supports text search
+  -- (filter:{text}) + sort by name/email/company + paging, so this is the full
+  -- {text:true, sort:true} profile. dt_jmap does Contact/query → Contact/get.
+  $name_cell = fn($c) = ct_name_html($c)
+  $email_cell = fn($c) = ct_field($c, "email")
+  $company_cell = fn($c) = '<span class="muted small">' .. ct_field($c, "company") .. '</span>'
+  $phone_cell = fn($c) = '<span class="muted small">' .. ct_field($c, "phone") .. '</span>'
+  $rowhref = fn($c) = "/pim/contacts?view=" .. url_encode("" .. $c["id"])
+  $bulkid = fn($c) = "" .. $c["id"]
+  -- Modal-driven Edit (modals.mix): a per-row link whose href is BOTH the no-JS edit
+  -- page AND the data-modal-src. With JS, md_script lazy-fetches ?edit=<id>&modal=1 into
+  -- the persistent <dialog id="md-edit"> (rendered below, outside the swap region).
+  $act_edit = dt_action("edit", { "label": "Edit", icon: "pencil", variant: "action", modal: "md-edit", href: fn($c) = "/pim/contacts?edit=" .. url_encode("" .. $c["id"]) .. "&modal=1" })
+  $spec = [
+    dt_col("name", "Name", "name", { sortable: true, render: $name_cell }),
+    dt_col("email", "Email", "email", { sortable: true, render: $email_cell }),
+    dt_col("company", "Company", "company", { sortable: true, toggleable: true, render: $company_cell }),
+    dt_col("phone", "Phone", "phone", { toggleable: true, render: $phone_cell })
+  ]
+  $opts = dt_admin_opts({
+    base_route: "/pim/contacts", caption: "Contacts", noun: "contacts",
+    subtitle: "Your mail account address book.",
+    default_sort: "name", default_dir: "asc",
+    search_placeholder: "Search contacts…", live_search: true,
+    row_href: $rowhref, row_action_specs: [$act_edit],
+    bulk_id: $bulkid,
+    -- JMAP-backed: select-all-across-pages is SQL-only (dt_all_ids), and the
+    -- "all" page-size sentinel would issue an oversized query window.
+    select_all: false, page_sizes: [6, 12, 25, 50, 100],
+    header_actions: [ { "label": "New contact", "href": "/pim/contacts?new=1", "icon": "plus", "variant": "primary" } ]
+  })
+  $state = dt_state($QUERY, $spec, $opts)
+  $body = ""
+  try
+    $res = dt_jmap("Contact", $spec, $state, { text: true, sort: true }, nil)
+    $dt = dt_render($spec, $opts, $state, $res["rows"], $res["total"])
+    if dt_wants_partial() then
+      return dt_partial($dt)
+    end
+    -- The persistent (empty) Edit dialog + the once-per-page modal shim live OUTSIDE
+    -- #dt-region (a sort/page/search swap never disturbs them); md_script's fetch-open
+    -- handler fills + opens md-edit per row click. They are inside #content, so the
+    -- inner fm_* fields are skinned by forms.css.
+    $body = dt_region($dt, "", true) .. md_shell("md-edit", { size: "lg" }) .. md_script() .. dt_actions_chrome($opts)
+  catch $e
+    return doc(502, "Contacts", $user, ct_error())
+  end
+  return doc(200, "Contacts", $user, $body)
+end

@@ -1,0 +1,47 @@
+-- loops.mix: test loop constructs
+-- Expected output:
+-- 1
+-- 2
+-- 3
+-- 4
+-- 5
+-- 0
+-- 10
+-- 20
+-- 30
+-- apple
+-- banana
+-- cherry
+-- counted to 3
+-- loop broke at 3
+
+-- for/next counted
+for $i = 1 to 5
+    print $i
+next
+
+-- for/next with step
+for $i = 0 to 30 step 10
+    print $i
+next
+
+-- for each/next
+$fruits = ["apple", "banana", "cherry"]
+for each $fruit in $fruits
+    print $fruit
+next
+
+-- while/done
+$count = 0
+while $count < 3
+    $count = $count + 1
+done
+print "counted to ${count}"
+
+-- loop with break
+$n = 0
+loop
+    $n = $n + 1
+    break if $n == 3
+done
+print "loop broke at ${n}"

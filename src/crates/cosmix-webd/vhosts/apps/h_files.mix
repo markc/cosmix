@@ -1,0 +1,668 @@
+-- h_files.mix — Dolphin-style dual-pane FILE MANAGER (/files) over the delegated
+-- cosmix-filesd fs-mode bus_call seam (filesd-fs / fs.* verbs). S2 = read-only
+-- browse: two independent panes (each its own cwd/sort, l.* / r.* query state), a
+-- Places sidebar (swapped into the DCS left nav by lib.mix's page() /files branch),
+-- a toolbar, per-pane location/status/filter bars, and an Information panel.
+-- Mutations (mkdir/rename/copy/move/trash/delete) land in S3 (the POST route).
+--
+-- IMPORTANT (webd-embedded mix): NO mix-0.20 syntax (?? / ?:) — use if/else + fm_or.
+-- Reserved word `label` MUST be a string key ("label":). Concatenation is `..`.
+-- Maps are by-value; build an override map then `$m[$k] = v` (top-level assign is fine).
+-- Size + time are formatted CLIENT-SIDE (data-bytes / data-mtime + files_script) so
+-- they are timezone/locale-correct like Dolphin and need no webd-mix time/float math.
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/reader.mix"
+include "/opt/cosmix/vhosts/shared/widgets/treeview.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+
+-- The single wrapped filesd-fs seam: bus_call raises on any failure (gate denied,
+-- daemon down, verb error), so every call goes through here and degrades gracefully.
+function files_call($verb, $args)
+  try
+    $r = bus_call($verb, $args)
+    return { ok: true, result: $r }
+  catch $e
+    return { ok: false, err: ("" .. $e) }
+  end
+end
+
+-- fs.places → { ok, places, err }.
+function files_places()
+  $res = files_call("fs.places", {})
+  if not $res["ok"] then
+    return { ok: false, places: [], err: $res["err"] }
+  end
+  $pl = $res["result"]["places"]
+  if $pl == nil then $pl = [] end
+  return { ok: true, places: $pl, err: "" }
+end
+
+-- The first configured place id is the default cwd for an unset pane.
+function files_default_place($places)
+  if length($places) == 0 then return "" end
+  return "" .. fm_or($places[0]["id"], "")
+end
+
+-- Parent place-rel of a path (drop the last segment); "" at a place root.
+function files_parent($path)
+  $parts = split($path, "/")
+  if length($parts) <= 1 then return "" end
+  $out = ""
+  $i = 0
+  $last = length($parts) - 1
+  for each $p in $parts
+    if $i < $last then
+      if $out == "" then $out = $p else $out = $out .. "/" .. $p end
+    end
+    $i = $i + 1
+  end
+  return $out
+end
+
+-- Rebuild the /files query string, preserving both panes' state and overriding the
+-- given keys (a key explicitly set to "" in $overrides clears it).
+function files_query($q, $overrides)
+  $keys = ["l.path", "r.path", "l.sort", "l.dir", "l.hidden", "r.sort", "r.dir", "r.hidden", "active", "view", "trash"]
+  $out = ""
+  for each $k in $keys
+    $ov = $overrides[$k]
+    if $ov != nil then
+      $v = "" .. $ov
+    else
+      $v = "" .. fm_or($q[$k], "")
+    end
+    if $v != "" then
+      if $out == "" then $out = "?" else $out = $out .. "&" end
+      $out = $out .. $k .. "=" .. url_encode($v)
+    end
+  end
+  return $out
+end
+
+-- List one pane's directory via fs.list (the daemon sorts folders-first by the key).
+function files_list_pane($path, $q, $side)
+  $sort = "" .. fm_or($q[$side .. ".sort"], "name")
+  $dir = "" .. fm_or($q[$side .. ".dir"], "asc")
+  $hidden = ("" .. fm_or($q[$side .. ".hidden"], "")) == "1"
+  $res = files_call("fs.list", { path: $path, sort: $sort, dir: $dir, show_hidden: $hidden })
+  if not $res["ok"] then
+    return { ok: false, err: $res["err"], path: $path, sort: $sort, dir: $dir }
+  end
+  return { ok: true, listing: $res["result"], path: $path, sort: $sort, dir: $dir }
+end
+
+-- ext/mime → a lucide icon name (sanitised by tv_icon at emission).
+function files_icon($e)
+  if $e["is_dir"] == true then return "folder" end
+  $mime = "" .. fm_or($e["mime"], "")
+  if starts_with($mime, "image/") then return "image" end
+  if starts_with($mime, "audio/") then return "music" end
+  if starts_with($mime, "video/") then return "film" end
+  if $mime == "text/markdown" then return "file-text" end
+  if $mime == "application/pdf" then return "file-text" end
+  if $mime == "text/vcard" then return "contact" end
+  if $mime == "text/calendar" then return "calendar" end
+  if $mime == "application/json" then return "braces" end
+  if starts_with($mime, "text/x-") then return "file-code" end
+  if $mime == "text/html" then return "file-code" end
+  if $mime == "text/css" then return "file-code" end
+  if $mime == "text/javascript" then return "file-code" end
+  return "file"
+end
+
+-- Size cell: dir → "N items"; file → a client-formatted byte span.
+function files_size_html($e)
+  if $e["is_dir"] == true then
+    $ic = $e["item_count"]
+    if $ic == nil then return '<span class="fm-muted">—</span>' end
+    return '<span class="fm-items">' .. esc("" .. $ic) .. ' items</span>'
+  end
+  $b = "" .. fm_or($e["size"], "0")
+  return '<span class="fm-bytes" data-bytes="' .. esc($b) .. '"></span>'
+end
+
+-- Modified cell: a client-formatted relative/absolute local time.
+function files_time_html($e)
+  $m = $e["mtime"]
+  if $m == nil then return '<span class="fm-muted">—</span>' end
+  return '<time class="fm-time" data-mtime="' .. esc("" .. $m) .. '"></time>'
+end
+
+-- A sortable column header link (toggles dir when already the active sort).
+function files_sort_link($side, $col, $label, $q, $cur_sort, $cur_dir)
+  $newdir = "asc"
+  $arrow = ""
+  if $cur_sort == $col then
+    if $cur_dir == "asc" then
+      $newdir = "desc"
+      $arrow = ' <i class="fm-arrow" data-lucide="chevron-up"></i>'
+    else
+      $newdir = "asc"
+      $arrow = ' <i class="fm-arrow" data-lucide="chevron-down"></i>'
+    end
+  end
+  $ov = {}
+  $ov[$side .. ".sort"] = $col
+  $ov[$side .. ".dir"] = $newdir
+  $ov["active"] = $side
+  $href = "/files" .. files_query($q, $ov)
+  return '<a class="fm-sort" href="' .. esc($href) .. '">' .. esc($label) .. $arrow .. '</a>'
+end
+
+-- One detail row (folder → navigate the pane; file → select into the info panel).
+-- $depth: 0 for a top-level row; nested rows (inserted by inline expand) carry a
+-- higher depth for indentation. Every row gets a "twist" cell — a dir gets an
+-- expand button (Dolphin expandable-folders), a file gets a same-width spacer so
+-- names align under folder names.
+function files_row_html($side, $base, $e, $q, $view, $depth)
+  $name = "" .. fm_or($e["name"], "")
+  $isdir = ($e["is_dir"] == true)
+  $child = $base .. "/" .. $name
+  $ov = {}
+  $ov["active"] = $side
+  if $isdir then
+    $ov[$side .. ".path"] = $child
+    $ov["view"] = ""
+  else
+    $ov["view"] = $child
+  end
+  $href = "/files" .. files_query($q, $ov)
+  $cls = "fm-row"
+  if $isdir then $cls = $cls .. " fm-dir" else $cls = $cls .. " fm-file" end
+  if (not $isdir) and ($view == $child) then $cls = $cls .. " selected" end
+  $icon = '<i data-lucide="' .. tv_icon(files_icon($e)) .. '"></i>'
+  if $isdir then
+    $twist = '<button class="fm-twist" type="button" data-fm-twist aria-expanded="false" aria-label="Expand" draggable="false"><i class="fm-rowchev" data-lucide="chevron-right"></i></button>'
+  else
+    $twist = '<span class="fm-twist fm-twist-empty" aria-hidden="true"></span>'
+  end
+  $dd = "0"
+  if $isdir then $dd = "1" end
+  $h = '<tr class="' .. $cls .. '" data-fm-name="' .. esc($name) .. '" data-fm-path="' .. esc($child) .. '" data-fm-isdir="' .. $dd .. '" data-fm-depth="' .. ("" .. $depth) .. '">'
+  $h = $h .. '<td class="fm-cell-name"><span class="fm-namewrap" style="--fm-d:' .. ("" .. $depth) .. '">' .. $twist .. '<a class="fm-namelink" href="' .. esc($href) .. '">' .. $icon .. '<span class="fm-name">' .. esc($name) .. '</span></a></span></td>'
+  $h = $h .. '<td class="fm-cell-size">' .. files_size_html($e) .. '</td>'
+  $h = $h .. '<td class="fm-cell-mod">' .. files_time_html($e) .. '</td>'
+  $h = $h .. '</tr>'
+  return $h
+end
+
+-- The pane's column-header grid + rows (capped; the bottom filter is client-side).
+function files_table($side, $pane, $q, $view)
+  $L = $pane["listing"]
+  $sort = "" .. fm_or($pane["sort"], "name")
+  $dir = "" .. fm_or($pane["dir"], "asc")
+  $h = '<div class="fm-list-wrap"><table class="fm-list"><thead><tr>'
+  $h = $h .. '<th class="fm-col-name">' .. files_sort_link($side, "name", "Name", $q, $sort, $dir) .. '</th>'
+  $h = $h .. '<th class="fm-col-size">' .. files_sort_link($side, "size", "Size", $q, $sort, $dir) .. '</th>'
+  $h = $h .. '<th class="fm-col-mod">' .. files_sort_link($side, "modified", "Modified", $q, $sort, $dir) .. '</th>'
+  $h = $h .. '</tr></thead><tbody>'
+  $entries = $L["entries"]
+  if $entries == nil then $entries = [] end
+  $total = length($entries)
+  $limit = $total
+  $capped = false
+  if $total > 2000 then
+    $limit = 2000
+    $capped = true
+  end
+  $i = 0
+  while $i < $limit
+    $h = $h .. files_row_html($side, $pane["path"], $entries[$i], $q, $view, 0)
+    $i = $i + 1
+  end
+  $h = $h .. '</tbody></table>'
+  if $capped then
+    $h = $h .. '<div class="fm-cap-note">Showing the first 2000 entries.</div>'
+  end
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- Clickable breadcrumb of the pane's current path.
+function files_locationbar($path, $side, $q)
+  $segs = split($path, "/")
+  $h = '<div class="fm-location" data-fm-side="' .. esc($side) .. '">'
+  $acc = ""
+  $i = 0
+  for each $s in $segs
+    if $acc == "" then $acc = $s else $acc = $acc .. "/" .. $s end
+    $ov = {}
+    $ov[$side .. ".path"] = $acc
+    $ov["active"] = $side
+    $ov["view"] = ""
+    $href = "/files" .. files_query($q, $ov)
+    if $i > 0 then $h = $h .. '<span class="fm-crumb-sep" aria-hidden="true">/</span>' end
+    $h = $h .. '<a class="fm-crumb" href="' .. esc($href) .. '">' .. esc($s) .. '</a>'
+    $i = $i + 1
+  end
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- Per-pane status line ("N folders, M files (size)").
+function files_statusbar($L)
+  $fc = "" .. fm_or($L["folder_count"], "0")
+  $flc = "" .. fm_or($L["file_count"], "0")
+  $tb = "" .. fm_or($L["total_bytes"], "0")
+  $h = '<div class="fm-status">'
+  $h = $h .. '<span>' .. esc($fc) .. ' folders, ' .. esc($flc) .. ' files</span> '
+  $h = $h .. '<span class="fm-bytes" data-bytes="' .. esc($tb) .. '" data-paren="1"></span>'
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- Per-pane bottom filter (client-side row filter by name + a lock affordance).
+function files_filterbar($side, $writable)
+  $lock = "lock"
+  if $writable == true then $lock = "lock-open" end
+  return '<div class="fm-filterbar"><i class="fm-lock" data-lucide="' .. $lock .. '"></i><input class="fm-filter" type="text" placeholder="Filter…" data-fm-filter="' .. esc($side) .. '" autocomplete="off"></div>'
+end
+
+-- One whole pane.
+function files_pane_html($side, $pane, $q, $active, $view)
+  $cls = "fm-pane"
+  if $side == $active then $cls = $cls .. " fm-active" end
+  $wr = "0"
+  if $pane["ok"] and ($pane["listing"]["writable"] == true) then $wr = "1" end
+  $h = '<section class="' .. $cls .. '" data-fm-pane="' .. esc($side) .. '" data-fm-cwd="' .. esc($pane["path"]) .. '" data-fm-writable="' .. $wr .. '">'
+  $h = $h .. files_locationbar($pane["path"], $side, $q)
+  if not $pane["ok"] then
+    $h = $h .. '<div class="fm-pane-err">' .. esc("Cannot list this folder: " .. $pane["err"]) .. '</div>'
+    $h = $h .. '</section>'
+    return $h
+  end
+  $L = $pane["listing"]
+  $h = $h .. files_table($side, $pane, $q, $view)
+  $h = $h .. files_statusbar($L)
+  $h = $h .. files_filterbar($side, ($L["writable"] == true))
+  $h = $h .. '</section>'
+  return $h
+end
+
+-- The top toolbar (Home / Up / Reload, an active-pane indicator, an info toggle).
+function files_toolbar($q, $active, $dflt)
+  $ap = "" .. fm_or($q[$active .. ".path"], $dflt)
+  $up = files_parent($ap)
+  $h = '<div class="fm-toolbar">'
+  -- LEFT: folder-tree / places toggle — opens the LHS sidebar (mirror of the (i)
+  -- info toggle on the right). Between the two edge buttons the nav+write ops are
+  -- centered by the flex spacers.
+  $h = $h .. '<button class="fm-tb" type="button" title="Places" data-fm-tree-toggle><i data-lucide="compass"></i></button>'
+  $h = $h .. '<span class="fm-tb-spacer"></span>'
+  $hov = {}
+  $hov[$active .. ".path"] = $dflt
+  $hov["active"] = $active
+  $hov["view"] = ""
+  $h = $h .. '<a class="fm-tb" title="Home" href="/files' .. esc(files_query($q, $hov)) .. '"><i data-lucide="home"></i></a>'
+  if $up != "" then
+    $uov = {}
+    $uov[$active .. ".path"] = $up
+    $uov["active"] = $active
+    $uov["view"] = ""
+    $h = $h .. '<a class="fm-tb" title="Up" href="/files' .. esc(files_query($q, $uov)) .. '"><i data-lucide="arrow-up"></i></a>'
+  else
+    $h = $h .. '<span class="fm-tb fm-tb-disabled" aria-disabled="true"><i data-lucide="arrow-up"></i></span>'
+  end
+  $h = $h .. '<a class="fm-tb" title="Reload" href="/files' .. esc(files_query($q, {})) .. '"><i data-lucide="refresh-cw"></i></a>'
+  $h = $h .. '<span class="fm-tb-sep"></span>'
+  $h = $h .. '<button class="fm-tb" type="button" title="New folder" data-fm-op="mkdir"><i data-lucide="folder-plus"></i></button>'
+  $h = $h .. '<button class="fm-tb" type="button" title="New file" data-fm-op="newfile"><i data-lucide="file-plus"></i></button>'
+  $h = $h .. '<button class="fm-tb" type="button" title="Rename" data-fm-op="rename"><i data-lucide="pencil"></i></button>'
+  $h = $h .. '<button class="fm-tb" type="button" title="Copy to other pane" data-fm-op="copy"><i data-lucide="copy"></i></button>'
+  $h = $h .. '<button class="fm-tb" type="button" title="Move to other pane" data-fm-op="move"><i data-lucide="folder-input"></i></button>'
+  $h = $h .. '<button class="fm-tb" type="button" title="Move to Trash" data-fm-op="trash"><i data-lucide="trash-2"></i></button>'
+  $h = $h .. '<button class="fm-tb fm-tb-danger" type="button" title="Delete permanently" data-fm-op="delete"><i data-lucide="trash"></i></button>'
+  $h = $h .. '<span class="fm-tb-spacer"></span>'
+  -- RIGHT: information-panel toggle (opens the RHS sidebar).
+  $h = $h .. '<button class="fm-tb" type="button" title="Information" data-fm-info-toggle><i data-lucide="info"></i></button>'
+  $h = $h .. '</div>'
+  return $h
+end
+
+function files_type_label($s)
+  if $s["type"] == "dir" then return "Folder" end
+  $mime = "" .. fm_or($s["mime"], "")
+  if $mime == "" then return "File" end
+  return $mime
+end
+
+function files_time_val($epoch)
+  if $epoch == nil then return '<span class="fm-muted">—</span>' end
+  return '<time class="fm-time" data-mtime="' .. esc("" .. $epoch) .. '"></time>'
+end
+
+function files_meta_row($label, $valhtml)
+  return '<dt>' .. esc($label) .. '</dt><dd>' .. $valhtml .. '</dd>'
+end
+
+-- The Information panel (fs.stat metadata + a text preview for files).
+-- The Information panel BODY (icon + name + metadata + text preview). Rendered
+-- into the RHS-sidebar info slot (server-side on load, and re-fetched by files_script
+-- on selection via the ?frag=info endpoint). No <aside> wrapper — the slot is the
+-- container. "" $view → a placeholder.
+function files_info_body($view)
+  if $view == "" then
+    return '<div class="fm-info-empty">Select a file or folder to see its details.</div>'
+  end
+  $st = files_call("fs.stat", { path: $view })
+  if not $st["ok"] then
+    return '<div class="fm-info-empty">' .. esc("No information: " .. $st["err"]) .. '</div>'
+  end
+  $s = $st["result"]
+  $parts = split($view, "/")
+  $name = "" .. $parts[length($parts) - 1]
+  $isdir = ($s["type"] == "dir")
+  $bigicon = "file"
+  if $isdir then $bigicon = "folder" else $bigicon = files_icon({ is_dir: false, mime: fm_or($s["mime"], "") }) end
+  $h = '<div class="fm-info-preview"><i class="fm-info-icon" data-lucide="' .. tv_icon($bigicon) .. '"></i></div>'
+  $h = $h .. '<div class="fm-info-name">' .. esc($name) .. '</div>'
+  $h = $h .. '<dl class="fm-info-meta">'
+  $h = $h .. files_meta_row("Type", esc(files_type_label($s)))
+  if $isdir then
+    $h = $h .. files_meta_row("Items", esc("" .. fm_or($s["item_count"], "0")))
+    $h = $h .. files_meta_row("Hidden", esc("" .. fm_or($s["hidden_item_count"], "0")))
+  else
+    $h = $h .. files_meta_row("Size", '<span class="fm-bytes" data-bytes="' .. esc("" .. fm_or($s["size"], "0")) .. '"></span>')
+  end
+  $h = $h .. files_meta_row("Modified", files_time_val($s["modified"]))
+  $h = $h .. files_meta_row("Accessed", files_time_val($s["accessed"]))
+  $h = $h .. files_meta_row("Created", files_time_val($s["created"]))
+  $h = $h .. '</dl>'
+  if not $isdir then
+    $blob = files_call("fs.read_blob", { path: $view, max: 65536 })
+    if $blob["ok"] then
+      $b = $blob["result"]
+      if $b["binary"] == true then
+        $h = $h .. '<div class="fm-info-note">Binary file — no text preview.</div>'
+      else
+        $h = $h .. '<pre class="fm-info-text">' .. esc("" .. fm_or($b["text"], "")) .. '</pre>'
+      end
+    end
+  end
+  return $h
+end
+
+-- The slug (href query suffix) that navigates the active pane to a folder.
+function files_folder_slug($q, $active, $path)
+  $ov = {}
+  $ov[$active .. ".path"] = $path
+  $ov["active"] = $active
+  $ov["view"] = ""
+  $ov["trash"] = ""
+  return files_query($q, $ov)
+end
+
+-- A folder name → lucide icon (Dolphin's Places iconography). Falls back to a plain
+-- folder. tv_icon() sanitises at emission, so these are author literals.
+function files_place_icon($name)
+  if $name == "Desktop" then return "monitor" end
+  if $name == "Documents" then return "file-text" end
+  if $name == "Downloads" then return "download" end
+  if $name == "Music" then return "music" end
+  if $name == "Pictures" then return "image" end
+  if $name == "Photos" then return "image" end
+  if $name == "Videos" then return "film" end
+  if $name == "Media" then return "film" end
+  if $name == "Public" then return "users" end
+  if $name == "Projects" then return "folder-git-2" end
+  if $name == "Templates" then return "layout-template" end
+  if $name == "Nextcloud" then return "cloud" end
+  return "folder"
+end
+
+-- One Places entry: an icon + label link, aria-current when it's the active pane's
+-- folder. $href is the no-JS fallback (targets the render-time active pane);
+-- data-fm-place-path (or data-fm-place-trash) lets files_script retarget the click
+-- to whichever pane is currently active (Dolphin: a Place drives the active pane).
+-- Every value esc()'d once at emission.
+function files_nav_item($href, $path, $icon, $label, $iscur, $istrash)
+  $cur = ""
+  if $iscur then $cur = ' aria-current="page"' end
+  $data = ' data-fm-place-path="' .. esc($path) .. '"'
+  if $istrash then $data = ' data-fm-place-trash="1"' end
+  return '<li><a href="' .. esc($href) .. '"' .. $cur .. $data .. '><i data-lucide="' .. tv_icon($icon) .. '"></i><span class="nav-label">' .. esc($label) .. '</span></a></li>'
+end
+
+-- The Dolphin-style "Places" sidebar (rendered into the DCS left nav by lib.mix's
+-- /files branch): a flat quick-access list — each place plus its top-level folders,
+-- then Trash. A click navigates the ACTIVE pane (folders EXPAND inline in the panes
+-- themselves now). NOTE: a "Remote" section (network/SMB/SFTP mounts) needs fs-daemon
+-- remote-protocol support, which the fs-mode daemon does not have yet — deferred.
+function files_nav_tree($user)
+  $pl = files_places()
+  if not $pl["ok"] then
+    return '<ul class="cms-nav-list"><li class="cms-nav-empty">File service unavailable</li></ul>'
+  end
+  $q = parse_query($QUERY)
+  $active = "" .. fm_or($q["active"], "l")
+  if $active != "l" and $active != "r" then $active = "l" end
+  $istrash = ("" .. fm_or($q["trash"], "")) == "1"
+  $curpath = ""
+  if not $istrash then $curpath = "" .. fm_or($q[$active .. ".path"], files_default_place($pl["places"])) end
+  $h = '<div class="cms-nav-section fm-places"><ul class="cms-nav-list">'
+  for each $p in $pl["places"]
+    $pid = "" .. fm_or($p["id"], "")
+    $plabel = "" .. fm_or($p["label"], $pid)
+    $picon = "" .. fm_or($p["icon"], "home")
+    $h = $h .. files_nav_item("/files" .. files_folder_slug($q, $active, $pid), $pid, $picon, $plabel, ($curpath == $pid), false)
+    -- The place's top-level folders as quick-access bookmarks (Dolphin Places).
+    $tr = files_call("fs.tree", { path: $pid, max_depth: 1, max_nodes: 200 })
+    if $tr["ok"] then
+      $folders = $tr["result"]["folders"]
+      if $folders == nil then $folders = [] end
+      for each $folder in $folders
+        $parts = split($folder, "/")
+        $nm = "" .. $parts[length($parts) - 1]
+        $h = $h .. files_nav_item("/files" .. files_folder_slug($q, $active, $folder), $folder, files_place_icon($nm), $nm, ($curpath == $folder), false)
+      end
+    end
+  end
+  $h = $h .. files_nav_item("/files?trash=1", "", "trash-2", "Trash", $istrash, true)
+  $h = $h .. '</ul></div>'
+  return $h
+end
+
+-- The whole-page "service unavailable" body (no filesd-fs on this node).
+function files_unavailable($err)
+  return '<div class="fm-app"><div class="fm-unavailable"><h1>File manager</h1><p>The file service is not available on this host.</p><p class="fm-muted small">' .. esc($err) .. '</p></div></div>'
+end
+
+-- Client-side: byte/time formatting, the row filter, single-click select +
+-- double-click open (boosted), the toolbar write ops, drag-and-drop between panes
+-- with a Dolphin-style drop menu, info toggle, and the Delete-key shortcut. Writes
+-- go through fetch + an in-place cmsBoost.refresh() (no full reload); all listeners
+-- are re-armed after each boosted swap (cms:swapped).
+function files_script()
+  return '<script>(function(){function fmtBytes(n){n=+n||0;var u=["B","KiB","MiB","GiB","TiB"];var i=0;while(n>=1024&&i<u.length-1){n/=1024;i++;}var s=(i===0)?String(n):n.toFixed(1);return s+" "+u[i];}function fmtTime(sec){sec=+sec;if(!sec)return "—";var d=new Date(sec*1000);var now=new Date();var diff=(now-d)/1000;if(diff>=0&&diff<60)return "just now";if(diff>=0&&diff<3600){var m=Math.floor(diff/60);return m+(m===1?" minute ago":" minutes ago");}var t=d.toLocaleTimeString([],{hour:"numeric",minute:"2-digit"});if(d.toDateString()===now.toDateString())return "Today at "+t;var y=new Date(now);y.setDate(now.getDate()-1);if(d.toDateString()===y.toDateString())return "Yesterday at "+t;return d.toLocaleDateString()+" at "+t;}function fmtAll(root){root=root||document;root.querySelectorAll(".fm-bytes[data-bytes]").forEach(function(el){var v=fmtBytes(el.getAttribute("data-bytes"));el.textContent=el.hasAttribute("data-paren")?("("+v+")"):v;});root.querySelectorAll(".fm-time[data-mtime]").forEach(function(el){el.textContent=fmtTime(el.getAttribute("data-mtime"));});}function activePane(){return document.querySelector(".fm-pane.fm-active")||document.querySelector(".fm-pane");}function setActive(p){document.querySelectorAll(".fm-pane").forEach(function(x){x.classList.remove("fm-active");});if(p)p.classList.add("fm-active");}function selectRow(tr){var p=tr.closest(".fm-pane");if(!p)return;setActive(p);p.querySelectorAll("tbody tr.selected").forEach(function(x){if(x!==tr)x.classList.remove("selected");});tr.classList.add("selected");}function activeSel(){var p=activePane();if(!p)return null;var tr=p.querySelector("tbody tr.selected");if(!tr)return null;return {path:tr.getAttribute("data-fm-path"),name:tr.getAttribute("data-fm-name"),isdir:tr.getAttribute("data-fm-isdir")==="1"};}function activeCwd(){var p=activePane();return p?p.getAttribute("data-fm-cwd"):"";}function otherCwd(){var a=activePane();if(!a)return "";var side=a.getAttribute("data-fm-pane");var os=(side==="l")?"r":"l";var o=document.querySelector(".fm-pane[data-fm-pane="+os+"]");return o?o.getAttribute("data-fm-cwd"):"";}function parentOf(p){var i=p.lastIndexOf("/");return (i>0)?p.substring(0,i):p;}function refresh(){if(window.cmsBoost&&window.cmsBoost.refresh){window.cmsBoost.refresh();}else{location.reload();}}function rowDepth(tr){return +(tr.getAttribute("data-fm-depth")||0);}function collapseRow(tr){var d=rowDepth(tr);var n=tr.nextElementSibling;while(n&&rowDepth(n)>d){var nx=n.nextElementSibling;n.remove();n=nx;}var tw=tr.querySelector(".fm-twist[data-fm-twist]");if(tw)tw.setAttribute("aria-expanded","false");}function expandRow(tr){var tw=tr.querySelector(".fm-twist[data-fm-twist]");if(!tw)return;if(tw.getAttribute("aria-expanded")==="true"){collapseRow(tr);return;}var path=tr.getAttribute("data-fm-path");var pane=tr.closest(".fm-pane");if(!pane)return;var side=pane.getAttribute("data-fm-pane")||"l";var depth=rowDepth(tr)+1;tw.setAttribute("aria-expanded","true");var sp=new URLSearchParams(location.search);sp.set("frag","rows");sp.set("expand",path);sp.set("side",side);sp.set("depth",String(depth));var u="/files?"+sp.toString();fetch(u,{credentials:"same-origin"}).then(function(r){return r.text();}).then(function(html){if(tw.getAttribute("aria-expanded")!=="true")return;var tmp=document.createElement("tbody");tmp.innerHTML=html;var ref=tr.nextSibling;Array.prototype.slice.call(tmp.children).forEach(function(nr){tr.parentNode.insertBefore(nr,ref);});fmtAll(pane);if(window.lucide&&window.lucide.createIcons)window.lucide.createIcons();wire();}).catch(function(){tw.setAttribute("aria-expanded","false");});}function submitOp(map){var body=new URLSearchParams();["action","path","name","from","to","isdir","token"].forEach(function(k){body.append(k,(map[k]!=null)?map[k]:"");});body.append("ret",location.search);fetch("/files",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded;charset=UTF-8"},body:body.toString(),credentials:"same-origin",redirect:"manual"}).then(function(){refresh();},function(){refresh();});}function doOp(op){if(op==="mkdir"){var n=prompt("New folder name:");if(n)submitOp({action:"mkdir",path:activeCwd(),name:n});return;}if(op==="newfile"){var n2=prompt("New file name:");if(n2)submitOp({action:"newfile",path:activeCwd(),name:n2});return;}var s=activeSel();if(!s){alert("Select a file or folder first.");return;}if(op==="rename"){var nn=prompt("Rename to:",s.name);if(nn&&nn!==s.name)submitOp({action:"rename",from:s.path,to:parentOf(s.path)+"/"+nn});return;}if(op==="copy"){var d=otherCwd();if(!d){alert("No destination pane.");return;}submitOp({action:"copy",from:s.path,to:d+"/"+s.name});return;}if(op==="move"){var d2=otherCwd();if(!d2){alert("No destination pane.");return;}submitOp({action:"move",from:s.path,to:d2+"/"+s.name});return;}if(op==="trash"){submitOp({action:"trash",from:s.path});return;}if(op==="delete"){if(confirm("Permanently delete \\""+s.name+"\\"? This cannot be undone."))submitOp({action:"delete",from:s.path,isdir:s.isdir?"1":"0"});return;}}var fmDrag=null;function clearDrops(){document.querySelectorAll(".fm-drop-into").forEach(function(x){x.classList.remove("fm-drop-into");});document.querySelectorAll(".fm-drop-active").forEach(function(x){x.classList.remove("fm-drop-active");});}var menuEl=null;function closeMenu(){var g=document.getElementById("fm-menu");if(g)g.remove();menuEl=null;document.removeEventListener("keydown",menuEsc);document.removeEventListener("click",closeMenu);}function menuEsc(e){if(e.key==="Escape")closeMenu();}function fmMenu(x,y,items,pick){closeMenu();var m=document.createElement("div");m.id="fm-menu";m.className="fm-dropmenu";var h="";items.forEach(function(it){h+="<button type=button data-act="+it.act+" class=\\""+(it.danger?"fm-menu-danger":"")+"\\">"+(it.icon?("<i data-lucide="+it.icon+"></i> "):"")+it.label+"</button>";});m.innerHTML=h;document.body.appendChild(m);menuEl=m;var mw=m.offsetWidth,mh=m.offsetHeight;m.style.left=Math.max(2,Math.min(x,window.innerWidth-mw-4))+"px";m.style.top=Math.max(2,Math.min(y,window.innerHeight-mh-4))+"px";if(window.lucide&&window.lucide.createIcons)window.lucide.createIcons();m.querySelectorAll("button").forEach(function(b){b.onclick=function(ev){ev.stopPropagation();var act=b.getAttribute("data-act");closeMenu();pick(act);};});setTimeout(function(){document.addEventListener("keydown",menuEsc);document.addEventListener("click",closeMenu);},0);}function showDrop(x,y,src,destDir){var to=destDir+"/"+src.name;fmMenu(x,y,[{act:"move",label:"Move here",icon:"folder-input"},{act:"copy",label:"Copy here",icon:"copy"},{act:"cancel",label:"Cancel"}],function(act){if(act!=="cancel")submitOp({action:act,from:src.path,to:to});});}function showCtx(x,y,src){fmMenu(x,y,[{act:"open",label:"Open",icon:"corner-down-right"},{act:"rename",label:"Rename",icon:"pencil"},{act:"copy",label:"Copy to other pane",icon:"copy"},{act:"move",label:"Move to other pane",icon:"folder-input"},{act:"trash",label:"Move to Trash",icon:"trash-2"},{act:"delete",label:"Delete",icon:"trash",danger:true}],function(act){if(act==="open"){if(src.href){if(window.cmsBoost&&window.cmsBoost.navigate){window.cmsBoost.navigate(src.href);}else{window.location=src.href;}}}else{doOp(act);}});}function fetchInfo(path){var slot=document.getElementById("fm-info-slot");if(!slot||!path)return;slot.setAttribute("data-fm-view",path);fetch("/files?view="+encodeURIComponent(path)+"&frag=info",{credentials:"same-origin"}).then(function(r){return r.text();}).then(function(t){slot.innerHTML=t;fmtAll(slot);if(window.lucide&&window.lucide.createIcons)window.lucide.createIcons();}).catch(function(){});}function syncInfo(){var sr=document.querySelector(".sidebar-right");if(!sr)return;if(!document.querySelector(".fm-app")){var op=document.getElementById("fm-info-panel");if(op){var d0=sr.querySelector(".carousel-dot:not(#fm-info-dot)");if(d0)d0.click();op.remove();}var od=document.getElementById("fm-info-dot");if(od)od.remove();return;}if(document.getElementById("fm-info-panel"))return;var track=sr.querySelector(".panel-track");var dots=sr.querySelector(".carousel-dots");if(track){var pnl=document.createElement("div");pnl.className="panel";pnl.id="fm-info-panel";pnl.innerHTML="<div class=panel-title>Information</div><div class=panel-content><div id=fm-info-slot class=fm-info-side>Select a file or folder to see its details.</div></div>";track.appendChild(pnl);if(dots){var idx=track.querySelectorAll(".panel").length-1;var dt=document.createElement("button");dt.className="carousel-dot";dt.id="fm-info-dot";dt.setAttribute("data-sidebar","right");dt.setAttribute("data-panel",idx);dots.appendChild(dt);}}}function wire(){syncInfo();if(!document.querySelector(".fm-app"))return;fmtAll(document);document.querySelectorAll(".fm-filter").forEach(function(inp){inp.oninput=function(){var pane=inp.closest(".fm-pane");if(!pane)return;var qq=inp.value.toLowerCase();pane.querySelectorAll("tbody tr").forEach(function(tr){var nm=(tr.getAttribute("data-fm-name")||"").toLowerCase();tr.style.display=(nm.indexOf(qq)>=0)?"":"none";});};});document.querySelectorAll(".fm-pane tbody tr").forEach(function(tr){if(tr.__fmw)return;tr.__fmw=1;var lnk=tr.querySelector("a.fm-namelink");if(lnk)lnk.draggable=false;var tw=tr.querySelector(".fm-twist[data-fm-twist]");if(tw)tw.addEventListener("click",function(e){e.preventDefault();e.stopPropagation();expandRow(tr);});tr.addEventListener("click",function(e){var a=e.target.closest("a.fm-namelink");if(a)e.preventDefault();selectRow(tr);fetchInfo(tr.getAttribute("data-fm-path"));});tr.addEventListener("dblclick",function(){var a=tr.querySelector("a.fm-namelink");if(!a)return;var href=a.getAttribute("href");if(window.cmsBoost&&window.cmsBoost.navigate){window.cmsBoost.navigate(href);}else{window.location=href;}});tr.addEventListener("contextmenu",function(e){e.preventDefault();selectRow(tr);showCtx(e.clientX,e.clientY,{path:tr.getAttribute("data-fm-path"),name:tr.getAttribute("data-fm-name"),isdir:tr.getAttribute("data-fm-isdir")==="1",href:lnk?lnk.getAttribute("href"):null});});tr.setAttribute("draggable","true");tr.addEventListener("dragstart",function(e){fmDrag={path:tr.getAttribute("data-fm-path"),name:tr.getAttribute("data-fm-name"),isdir:tr.getAttribute("data-fm-isdir")==="1"};if(e.dataTransfer){e.dataTransfer.effectAllowed="copyMove";e.dataTransfer.setData("text/plain",fmDrag.path);}tr.classList.add("fm-dragging");});tr.addEventListener("dragend",function(){tr.classList.remove("fm-dragging");fmDrag=null;clearDrops();});});document.querySelectorAll(".fm-pane").forEach(function(p){if(p.__fmw)return;p.__fmw=1;p.addEventListener("mousedown",function(){setActive(p);});p.addEventListener("dragover",function(e){if(!fmDrag)return;e.preventDefault();if(e.dataTransfer)e.dataTransfer.dropEffect="move";clearDrops();var row=e.target.closest("tr.fm-dir");if(row&&row.getAttribute("data-fm-path")!==fmDrag.path){row.classList.add("fm-drop-into");}else{p.classList.add("fm-drop-active");}});p.addEventListener("dragleave",function(e){if(e.target===p)clearDrops();});p.addEventListener("drop",function(e){if(!fmDrag)return;e.preventDefault();var src=fmDrag;fmDrag=null;clearDrops();var row=e.target.closest("tr.fm-dir");var destDir=(row&&row.getAttribute("data-fm-path")!==src.path)?row.getAttribute("data-fm-path"):p.getAttribute("data-fm-cwd");if(destDir&&destDir!==src.path){showDrop(e.clientX,e.clientY,src,destDir);}});});document.querySelectorAll("[data-fm-op]").forEach(function(b){b.onclick=function(){doOp(b.getAttribute("data-fm-op"));};});document.querySelectorAll("form[data-fm-confirm]").forEach(function(fm){fm.onsubmit=function(){return confirm(fm.getAttribute("data-fm-confirm"));};});var it=document.querySelector("[data-fm-info-toggle]");if(it){it.onclick=function(){var sr=document.querySelector(".sidebar-right");if(sr&&!sr.classList.contains("open")&&window.Base&&window.Base.toggleSidebar)window.Base.toggleSidebar("right");var d=document.getElementById("fm-info-dot");if(d)d.click();};}var tt=document.querySelector("[data-fm-tree-toggle]");if(tt){tt.onclick=function(){var sl=document.querySelector(".sidebar-left");if(sl&&!sl.classList.contains("open")&&window.Base&&window.Base.toggleSidebar)window.Base.toggleSidebar("left");if(sl&&window.Site&&window.Site.surfacePanel){var ps=sl.querySelectorAll(".panel-track .panel");for(var i=0;i<ps.length;i++){if(ps[i].getAttribute("data-dcs-panel-id")==="fm-places"){window.Site.surfacePanel("left",i,false);break;}}}};}var _vp=new URLSearchParams(location.search).get("view");var _slot=document.getElementById("fm-info-slot");if(_vp&&_slot&&_slot.getAttribute("data-fm-view")!==_vp)fetchInfo(_vp);if(window.lucide&&window.lucide.createIcons)window.lucide.createIcons();}if(!window.__fmKeys){window.__fmKeys=true;document.addEventListener("keydown",function(e){if(!document.querySelector(".fm-app"))return;if(e.target&&/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName))return;if(e.key==="Delete"){var s=activeSel();if(s)submitOp({action:"trash",from:s.path});}});}if(!window.__fmPlaces){window.__fmPlaces=true;document.addEventListener("click",function(e){var a=e.target.closest("a[data-fm-place-path],a[data-fm-place-trash]");if(!a)return;if(!document.querySelector(".fm-app"))return;e.preventDefault();var ap=activePane();var side=(ap?ap.getAttribute("data-fm-pane"):"l")||"l";var sp=new URLSearchParams(location.search);sp.delete("view");if(a.getAttribute("data-fm-place-trash")==="1"){sp.set("trash","1");}else{sp.set(side+".path",a.getAttribute("data-fm-place-path"));sp.set("active",side);sp.delete("trash");}var u="/files?"+sp.toString();if(window.cmsBoost&&window.cmsBoost.navigate){window.cmsBoost.navigate(u);}else{window.location=u;}});}if(document.readyState!=="loading"){wire();}else{document.addEventListener("DOMContentLoaded",wire);}if(!window.__fmSwap){window.__fmSwap=1;document.addEventListener("cms:swapped",wire);}})();</script>'
+end
+
+-- A POST result → a PRG redirect back to the originating view (the `ret` field
+-- carries the query string so the same panes/selection survive the round-trip).
+function files_post_result($r, $back, $okmsg)
+  if $r["ok"] then
+    return redirect_flash($back, $okmsg, "success")
+  end
+  return redirect_flash($back, "" .. fm_or($r["err"], "operation failed"), "danger")
+end
+
+-- Mutations (S3). Every path is re-scoped + permission-checked by the daemon
+-- (fsops), so a client-built destination is safe; webd's admin gate + SameSite is
+-- the request-level auth (the bus POST is tokenless per the verb-aware CSRF rule).
+function files_handle_post($f)
+  $action = "" .. fm_or($f["action"], "")
+  $ret = "" .. fm_or($f["ret"], "")
+  if starts_with($ret, "?") then $ret = substr($ret, 1, length($ret) - 1) end
+  -- Rebuild the return query from the allowlist (url-encoded, unknown keys dropped) so
+  -- a crafted `ret` can't inject a CR/LF into the redirect Location header.
+  $back = "/files" .. files_query(parse_query($ret), {})
+  $from = "" .. fm_or($f["from"], "")
+  $to = "" .. fm_or($f["to"], "")
+  $path = "" .. fm_or($f["path"], "")
+  $name = "" .. fm_or($f["name"], "")
+  if $action == "mkdir" then
+    if $name == "" then return redirect_flash($back, "A folder name is required", "warning") end
+    $r = files_call("fs.mkdir", { path: ($path .. "/" .. $name), parents: false })
+    return files_post_result($r, $back, "Folder created")
+  end
+  if $action == "newfile" then
+    if $name == "" then return redirect_flash($back, "A file name is required", "warning") end
+    $r = files_call("fs.touch", { path: ($path .. "/" .. $name) })
+    return files_post_result($r, $back, "File created")
+  end
+  if $action == "rename" then
+    if $from == "" or $to == "" then return redirect_flash($back, "Rename needs a target", "warning") end
+    $r = files_call("fs.move", { from: $from, "to": $to })
+    return files_post_result($r, $back, "Renamed")
+  end
+  if $action == "copy" then
+    if $from == "" or $to == "" then return redirect_flash($back, "Copy needs a destination", "warning") end
+    $r = files_call("fs.copy", { from: $from, "to": $to })
+    return files_post_result($r, $back, "Copied")
+  end
+  if $action == "move" then
+    if $from == "" or $to == "" then return redirect_flash($back, "Move needs a destination", "warning") end
+    $r = files_call("fs.move", { from: $from, "to": $to })
+    return files_post_result($r, $back, "Moved")
+  end
+  if $action == "trash" then
+    if $from == "" then return redirect_flash($back, "Nothing selected", "warning") end
+    $r = files_call("fs.trash", { path: $from })
+    return files_post_result($r, $back, "Moved to Trash")
+  end
+  if $action == "delete" then
+    if $from == "" then return redirect_flash($back, "Nothing selected", "warning") end
+    $isdir = ("" .. fm_or($f["isdir"], "")) == "1"
+    $r = files_call("fs.delete", { path: $from, recursive: $isdir, confirm: true })
+    return files_post_result($r, $back, "Deleted")
+  end
+  if $action == "restore" then
+    $tok = "" .. fm_or($f["token"], "")
+    if $tok == "" then return redirect_flash($back, "Nothing to restore", "warning") end
+    $r = files_call("fs.trash.restore", { token: $tok })
+    return files_post_result($r, $back, "Restored")
+  end
+  if $action == "emptytrash" then
+    $r = files_call("fs.trash.empty", { confirm: true })
+    return files_post_result($r, $back, "Trash emptied")
+  end
+  return redirect_flash($back, "Unknown action", "warning")
+end
+
+-- The Trash place (S4): fs.trash.list with per-item Restore + Empty Trash. The
+-- backend (fs.trash.*) + POST handlers (restore/emptytrash) ship in S0/S3; this is
+-- the UI that closes the loop. Plain POST forms (no JS needed); the Empty button
+-- carries data-fm-confirm so files_script can guard it CSP-safely.
+function files_trash_view($user)
+  $tl = files_call("fs.trash.list", {})
+  if not $tl["ok"] then
+    return doc(200, "Trash", $user, files_unavailable($tl["err"]))
+  end
+  $items = $tl["result"]["items"]
+  if $items == nil then $items = [] end
+  $body = '<div class="fm-app fm-trash-app">'
+  $body = $body .. '<div class="fm-toolbar">'
+  $body = $body .. '<a class="fm-tb" title="Back to files" href="/files"><i data-lucide="arrow-left"></i></a>'
+  $body = $body .. '<span class="fm-active-label">Trash</span><span class="fm-tb-spacer"></span>'
+  $body = $body .. '<form method="post" action="/files" class="fm-inline-form" data-fm-confirm="Permanently empty the Trash? This cannot be undone."><input type="hidden" name="action" value="emptytrash"><input type="hidden" name="ret" value="?trash=1"><button class="fm-tb fm-tb-danger" type="submit" title="Empty Trash"><i data-lucide="trash"></i></button></form>'
+  $body = $body .. '</div>'
+  $body = $body .. '<div class="fm-trash-list">'
+  if length($items) == 0 then
+    $body = $body .. '<div class="fm-info-empty">Trash is empty.</div>'
+  else
+    $body = $body .. '<table class="fm-list"><thead><tr><th>Name</th><th>From</th><th>Deleted</th><th></th></tr></thead><tbody>'
+    for each $it in $items
+      $tok = "" .. fm_or($it["token"], "")
+      $nm = "" .. fm_or($it["name"], $tok)
+      $org = "" .. fm_or($it["origin"], "")
+      $del = "" .. fm_or($it["deleted_at"], "")
+      $body = $body .. '<tr><td>' .. esc($nm) .. '</td><td class="fm-muted">' .. esc($org) .. '</td><td class="fm-muted">' .. esc($del) .. '</td>'
+      $body = $body .. '<td class="fm-trash-act"><form method="post" action="/files" class="fm-inline-form"><input type="hidden" name="action" value="restore"><input type="hidden" name="token" value="' .. esc($tok) .. '"><input type="hidden" name="ret" value="?trash=1"><button class="btn btn-ghost btn-sm" type="submit"><i data-lucide="undo-2"></i> Restore</button></form></td></tr>'
+    end
+    $body = $body .. '</tbody></table>'
+  end
+  $body = $body .. '</div>'
+  $body = $body .. files_script()
+  $body = $body .. '</div>'
+  return doc(200, "Trash", $user, $body)
+end
+
+-- ── entry point ─────────────────────────────────────────────────────────────────
+function files_main()
+  cms_init()
+  $user = current_user($HEADERS)
+  $deny = require_role($user, "admin")
+  if $deny != nil then
+    return $deny
+  end
+  if $METHOD == "POST" then
+    return files_handle_post(parse_form($BODY))
+  end
+  $q = parse_query($QUERY)
+  -- The Information-panel fragment endpoint: files_script fetches this on selection
+  -- and injects it into the RHS-sidebar info slot (the sidebar isn't boost-patchable,
+  -- so it updates via this JS fetch). A bare text/html fragment, not the full page.
+  if ("" .. fm_or($q["frag"], "")) == "info" then
+    return md_fragment(files_info_body("" .. fm_or($q["view"], "")))
+  end
+  -- Inline expand fragment: files_script fetches this when a folder's twist is
+  -- clicked and splices the returned child <tr>s in below the row (Dolphin
+  -- expandable-folders). The daemon re-scopes/validates `expand`, so an arbitrary
+  -- path can't escape the place. Depth is clamped (visual indent only).
+  if ("" .. fm_or($q["frag"], "")) == "rows" then
+    $exp = "" .. fm_or($q["expand"], "")
+    $eside = "" .. fm_or($q["side"], "l")
+    if $eside != "l" and $eside != "r" then $eside = "l" end
+    $edepth = to_number("" .. fm_or($q["depth"], "1"))
+    if $edepth == nil then $edepth = 1 end
+    if $edepth < 1 then $edepth = 1 end
+    if $edepth > 24 then $edepth = 24 end
+    if $exp == "" then return md_fragment("") end
+    $ep = files_list_pane($exp, $q, $eside)
+    if not $ep["ok"] then return md_fragment("") end
+    $ents = $ep["listing"]["entries"]
+    if $ents == nil then $ents = [] end
+    $eview = "" .. fm_or($q["view"], "")
+    $rows = ""
+    $ei = 0
+    $elim = length($ents)
+    if $elim > 2000 then $elim = 2000 end
+    while $ei < $elim
+      $rows = $rows .. files_row_html($eside, $exp, $ents[$ei], $q, $eview, $edepth)
+      $ei = $ei + 1
+    end
+    return md_fragment($rows)
+  end
+  if ("" .. fm_or($q["trash"], "")) == "1" then
+    return files_trash_view($user)
+  end
+  $pl = files_places()
+  if not $pl["ok"] then
+    return doc(200, "Files", $user, files_unavailable($pl["err"]))
+  end
+  $places = $pl["places"]
+  $dflt = files_default_place($places)
+  $lpath = "" .. fm_or($q["l.path"], $dflt)
+  $rpath = "" .. fm_or($q["r.path"], $dflt)
+  $active = "" .. fm_or($q["active"], "l")
+  if $active != "l" and $active != "r" then $active = "l" end
+  $view = "" .. fm_or($q["view"], "")
+  $lp = files_list_pane($lpath, $q, "l")
+  $rp = files_list_pane($rpath, $q, "r")
+  -- The Information panel now lives in the RHS sidebar (injected + updated by
+  -- files_script), NOT an in-content column — so the panes get the full width.
+  $body = '<div class="fm-app">'
+  $body = $body .. files_toolbar($q, $active, $dflt)
+  $body = $body .. '<div class="fm-split">'
+  $body = $body .. files_pane_html("l", $lp, $q, $active, $view)
+  $body = $body .. files_pane_html("r", $rp, $q, $active, $view)
+  $body = $body .. '</div>'
+  -- The LHS "Places" panel as a DCS context-panel TEMPLATE — site.js
+  -- (syncContextPanels) mounts it into the left carousel on every /files view,
+  -- refreshes it when the folder changes, and tears it down on leave. Using the
+  -- shared mechanism (same as /pim/mail's Folders panel) means it never fights the
+  -- carousel the way a hand-rolled inject would (dot rebuild + surfacing handled).
+  $body = $body .. '<template data-dcs-panel="left" data-dcs-panel-id="fm-places" data-dcs-panel-title="Places"><div class="cms-nav">' .. files_nav_tree($user) .. '</div></template>'
+  $body = $body .. files_script()
+  $body = $body .. '</div>'
+  return doc(200, "Files", $user, $body)
+end

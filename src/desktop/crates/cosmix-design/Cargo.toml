@@ -1,0 +1,16 @@
+[package]
+name = "cosmix-design"
+version = "0.14.0"
+description = "Headless compiler and closed family-schema registry for the Cosmix Design System"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[features]
+default = ["compiler"]
+compiler = ["dep:cosmix-lib-mix", "dep:serde"]
+
+[dependencies]
+cosmix-lib-mix = { path = "../../../crates/cosmix-lib-mix", features = ["serde"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }

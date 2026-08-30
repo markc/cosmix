@@ -1,0 +1,24 @@
+-- h_ssh_jobs.mix — the sshm worker↔webd job seam (P2a).
+--
+-- POST-only, secret-gated (X-Sshm-Secret), NO session. The sshm worker (a
+-- systemd unit on the operator workstation, unprivileged user) calls these over the WG listener to
+-- claim/renew/apply leased jobs. Every state transition is a single-statement
+-- conditional-UPDATE CAS in ssh_lib.mix (no multi-statement tx). All three
+-- endpoints route here and dispatch by path (mirrors h_biz_provision.mix).
+
+include "/opt/cosmix/vhosts/shared/apps/ssh_lib.mix"
+
+function ssh_jobs_main()
+  -- Create + seed the sshm.* tables (incl. the secret) idempotently; needs the
+  -- db-schema:sshm cap the routes grant.
+  ssh_init()
+  if not ssh_job_authorized() then
+    return { status: 403, headers: {}, body: "forbidden" }
+  end
+  -- Exact routes only: an unknown path must never fall into a mutating apply.
+  if ends_with($PATH, "job-claim-next") and $METHOD == "POST" then return ssh_job_claim_next() end
+  if ends_with($PATH, "job-renew") and $METHOD == "POST" then return ssh_job_renew() end
+  if ends_with($PATH, "job-apply") and $METHOD == "POST" then return ssh_job_apply() end
+  if ends_with($PATH, "job-progress") and $METHOD == "POST" then return ssh_job_progress() end
+  return { status: 404, headers: {}, body: "unknown ssh job endpoint" }
+end

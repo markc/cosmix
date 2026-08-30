@@ -1,0 +1,48 @@
+-- strings.mix: test string operations
+-- Expected output:
+-- hello world
+-- hello Alex
+-- hello ${name}
+-- 11
+-- hello world and more
+-- HELLO
+-- hello
+-- true
+-- false
+-- host=localhost
+-- db=mydb
+-- timeout=30
+-- missing=nil
+
+$greeting = "hello"
+$name = "Alex"
+
+-- basic string concat
+print $greeting .. " world"
+
+-- string interpolation
+print "hello ${name}"
+
+-- single quotes: no interpolation
+print 'hello ${name}'
+
+-- length
+print length("hello world")
+
+-- explicit concat with ..
+print "hello" .. " " .. "world" .. " and more"
+
+-- upper / lower
+print upper("hello")
+print lower("HELLO")
+
+-- starts_with / ends_with
+print starts_with("hello world", "hello")
+print starts_with("hello world", "world")
+
+-- Phase 0 dot-walk regression: ${a.b.c} resolves identically to $a.b.c
+$cfg = {host: "localhost", db: {name: "mydb", opts: {timeout: 30}}}
+print "host=${cfg.host}"
+print "db=${cfg.db.name}"
+print "timeout=${cfg.db.opts.timeout}"
+print "missing=${cfg.db.nope}"

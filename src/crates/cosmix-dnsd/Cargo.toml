@@ -1,0 +1,112 @@
+[package]
+name = "cosmix-dnsd"
+version = "0.3.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "cosmix-dnsd — authoritative WG-mesh DNS daemon. P1: standalone server only (the spine's goal-(c) isolated-node self-resolution)."
+
+[[bin]]
+name = "cosmix-dnsd"
+path = "src/main.rs"
+
+# P1/P2 feature seam (prompt §2 — DO NOT invert this polarity):
+# `default = ["cosmix"]` is preserved (plan §1 polarity). In P1 the
+# `cosmix` feature was declared but EMPTY-BODIED so the default build
+# and the `--no-default-features` build were byte-identical standalone
+# servers. P2 fills the `cosmix` body + pulls its deps; the *default*
+# build then becomes the citizen with ZERO polarity change — the
+# `--no-default-features` build stays the exact P1 standalone server
+# (goal-(c) isolated-node self-resolution).
+#
+# Stage-by-stage consumption of the seam: P2-A landed the SPEC-10
+# daemon-identity legibility surface (no path/config/Bus I/O);
+# `cosmix_config` got its first real consumer in P2-B (citizen config
+# parse + the on-disk identity home / WG-IP bind posture); P2-C
+# (`cosmix_bus`/`cosmix_client` + `serde_json`/`hickory-proto`)
+# registers the `dnsd` service and the two read-only actions. The
+# empty-seam-then-fill shape mirrors the reviewed P1 precedent — see
+# the `src/citizen.rs` staging note. `--no-default-features` pulls none
+# of these *direct* optional deps; its serve path stays the committed
+# P1 source **verbatim** (the surviving invariant; serve behaviour
+# proven by the §8 functional prober). Binary-level identity was
+# abandoned across two reframes — byte-identity at P2-C (`.rodata`
+# relocated when the shared `cosmix-lib-dns` core gained the
+# `serve_*_observed` symbols), instruction-multiset at P2-D
+# (`lto = true` redistributes inlined serve code on benign core
+# growth) — see plan §1 "surviving `--no-default-features` invariant"
+# and `feedback_lto_inlining_redistribution`.
+[features]
+default = ["cosmix"]
+cosmix = [
+    "dep:cosmix_config",
+    "dep:cosmix_bus",
+    "dep:cosmix_buildinfo",
+    "dep:cosmix_client",
+    "dep:cosmix_log",
+    "dep:serde_json",
+    "dep:hickory-proto",
+    # P2-D: the citizen's bounded WG-up bind-retry (plan §6) needs
+    # `tokio::time::sleep`. Gating `tokio/time` here (NOT in the bare
+    # `[dependencies]` tokio feature list) keeps the
+    # `--no-default-features` standalone's tokio feature set EXACTLY
+    # the committed P1 set (net/rt-multi-thread/macros/signal/sync) —
+    # zero standalone perturbation, same polarity-preserving shape as
+    # the `dep:` entries above.
+    "tokio/time",
+]
+
+[dependencies]
+cosmix-lib-dns = { path = "../cosmix-lib-dns" }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "signal", "sync"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# cosmix-ecosystem deps — OPTIONAL, pulled only by the `cosmix` feature
+# (the P1/P2 seam). `--no-default-features` excludes all three, keeping
+# the standalone P1 server dependency-identical. Dep-table keys + alias
+# style mirror `cosmix-maild`'s Cargo.toml (cosmix_config/_bus/_client).
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", features = ["client-helpers"], optional = true }
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus", optional = true }
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client", features = ["native"], optional = true }
+# Optional + gated on `cosmix`: build_info!() is only used in the
+# feature-gated bus.rs, so the standalone P1 server keeps no cosmix
+# normal deps. (The build.rs build-dep stays unconditional — a separate
+# graph; it only sets COSMIX_* env, harmless when unused.)
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo", optional = true }
+# Logging core (bus repo). OPTIONAL + `cosmix`-gated, so
+# `--no-default-features` links none of it and keeps the P1 stderr-only
+# init verbatim (goal-(c) zero-cosmix-dep standalone). The citizen
+# branch calls `cosmix_log::init(...).daemon("cosmix-dnsd")` —
+# journald-primary, stats off (this arc is logging-only).
+cosmix_log = { package = "cosmix-lib-log", path = "../cosmix-lib-log", optional = true }
+
+# P2-C consumers of the seam. Both are OPTIONAL + `cosmix`-gated, so
+# `--no-default-features` omits these *direct* entries. Net effect on
+# the standalone build's dependency graph is ZERO: `serde_json` is not
+# linked at all (citizen-only), and `hickory-proto` is *already* a
+# transitive dep of every cosmix-dnsd build via `cosmix-lib-dns`'s
+# codec — naming it directly here only lets the citizen-only `stats`
+# module reference `hickory_proto::op`; it neither adds a new external
+# crate nor changes what the `--no-default-features` standalone links
+# (that graph is identical to the committed P1 standalone). `serde_json`
+# builds the two read-only Bus reply bodies (`dnsd.zone.snapshot` /
+# `dnsd.stats`).
+serde_json = { workspace = true, optional = true }
+hickory-proto = { workspace = true, optional = true }
+
+# Dev-only: the mandatory standalone integration prober (§9/§10) spawns
+# the built binary and drives the §8 query set over real loopback
+# sockets. hickory-proto is the SAME codec the daemon already uses
+# (transitively, via cosmix-lib-dns) — building query `Message`s with
+# it adds ZERO new external dependency to the acceptance path, so the
+# prober MUST NOT be `#[ignore]`-gated. `cosmix-lib-dns` is already a
+# normal dep (in scope for integration tests) — only the codec ctor +
+# tempdir helpers are dev-additional.
+[dev-dependencies]
+hickory-proto = { workspace = true }
+tempfile = "3"
+
+[build-dependencies]
+# Captures cos HEAD sha + build time (version-discovery contract).
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }

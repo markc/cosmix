@@ -1,0 +1,4 @@
+{"record":"meta","version":1,"lane":"claude"}
+{"record":"line","after_ms":1,"stdout":"{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fixture-claude-death\"}"}
+{"record":"line","after_ms":9,"stdout":"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"partial answer\"}],\"usage\":{\"input_tokens\":8,\"output_tokens\":3}}}"}
+{"record":"exit","code":17,"signal":null}

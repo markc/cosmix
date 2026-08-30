@@ -1,0 +1,38 @@
+-- interp_coalesce.mix — `${x ?? default}` / `${x ?: default}` interpolation
+-- defaults. `??` falls back on nil only (unbound name or nil value); `?:`
+-- falls back on any falsy value. The default is an arbitrary Mix expression,
+-- evaluated only when the fallback fires.
+--
+-- Expected output:
+-- unbound default: true
+-- nil-value default: true
+-- present ignores default: true
+-- nil-only keeps empty: true
+-- falsy replaces empty: true
+-- default is expression: true
+-- default is variable: true
+
+-- Unbound name → default (no error, unlike a bare `${unbound}`).
+print "unbound default: " .. ("${MIX_COALESCE_UNBOUND_XYZ ?? "fallback"}" == "fallback")
+
+-- Explicit nil value → default fires.
+$x = nil
+print "nil-value default: " .. ("${x ?? "dflt"}" == "dflt")
+
+-- Present, non-nil value → default ignored.
+$svc = "nginx"
+print "present ignores default: " .. ("${svc ?? "none"}" == "nginx")
+
+-- `??` is nil-only: an empty string is NOT missing, so it is kept as-is.
+$e = ""
+print "nil-only keeps empty: " .. ("${e ?? "X"}" == "")
+
+-- `?:` is falsy: an empty string IS replaced.
+print "falsy replaces empty: " .. ("${e ?: "X"}" == "X")
+
+-- The default is a full Mix expression.
+print "default is expression: " .. ("${MIX_COALESCE_UNBOUND_XYZ ?? upper("hi")}" == "HI")
+
+-- The default can reference another variable.
+$fb = "viavar"
+print "default is variable: " .. ("${MIX_COALESCE_UNBOUND_XYZ ?? $fb}" == "viavar")

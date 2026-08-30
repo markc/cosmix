@@ -1,0 +1,61 @@
+[package]
+name = "cosmix-mds"
+version = "0.2.2"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Metadata store: per-container-set SQLite metadata + content-addressable blob CAS"
+
+[lib]
+name = "cosmix_mds"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cosmix-mds"
+path = "src/bin/cosmix-mds.rs"
+
+# Internal test helper for crash-recovery stress
+# (`tests/recovery.rs`). Gated on `_stress-helper` so default
+# `cargo build` / `cargo install` never produce or ship it; the
+# recovery test enables the feature explicitly.
+[[bin]]
+name = "cosmix-mds-stress-writer"
+path = "src/bin/stress_writer.rs"
+required-features = ["_stress-helper"]
+test = false
+doc = false
+
+[features]
+default = ["core"]
+core = []
+cosmix = ["dep:cosmix-lib-bus", "dep:cosmix-lib-client"]
+mem-store = []
+# Internal — gates the cosmix-mds-stress-writer helper bin and its
+# recovery test. NOT a public feature; never add to default. Enable
+# only when running the crash-recovery stress test:
+#   cargo test -p cosmix-mds --features _stress-helper --test recovery
+_stress-helper = []
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+thiserror = "2"
+rusqlite = { workspace = true }
+blake3 = { workspace = true }
+parking_lot = { version = "0.12", features = ["arc_lock"] }
+tracing = { workspace = true }
+clap = { workspace = true }
+humantime = "2"
+tar = "0.4"
+chrono = { workspace = true }
+cosmix-lib-bus = { path = "../cosmix-lib-bus", optional = true }
+cosmix-lib-client = { path = "../cosmix-lib-client", features = ["native"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
+assert_cmd = "2"
+predicates = "3"
+libc = "0.2"

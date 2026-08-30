@@ -1,0 +1,34 @@
+[package]
+name = "cosmix-tower"
+version = "0.5.2"
+description = "CosMix Tower — the native CTK mesh node atlas"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+
+[package.metadata.cosmix]
+kind = "app"
+component = "tower"
+display = "CosMix Tower"
+engine = "bevy"
+
+[[bin]]
+name = "cosmix-tower"
+path = "src/main.rs"
+
+[build-dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+
+[dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+accesskit = "0.24"
+bevy = { version = "=0.19.0", default-features = false, features = [
+    "ui",
+    "bevy_feathers",
+    "accesskit_unix",
+] }
+ctk = { path = "../../ctk", features = ["bus", "icons", "theme"] }
+cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config" }
+flume = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,90 @@
+[package]
+name = "cosmix-lib-log"
+version = "0.3.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Unified logging surface (CLI, sinks, filter, reload handle, stats recorder) — the pure-core half, lives in bus"
+
+[lib]
+name = "cosmix_log"
+path = "src/lib.rs"
+
+[features]
+# Pure core: no cos-internal deps. `cargo test --no-default-features`
+# must pass — this is the gate that keeps the crate locally testable
+# without the mesh, per the cosmix core/citizen pattern. The reload
+# handle, the stats recorder, and the JSONL sink are all core now;
+# the cos-coupled property surface moved out of this crate entirely
+# (to a cos extension crate in a later phase).
+default = []
+# Exposes the `<svc>.stats.snapshot` Bus verb handler
+# (`stats::handle_snapshot_bus`). Pulls `cosmix-lib-client` for the
+# `IncomingCommand` wire frame — which lives in bus, so this stays a
+# pure-bus feature (NOT a cos dependency).
+bus-handlers = ["dep:cosmix-client"]
+# Per-daemon Prometheus `/metrics` endpoint. Dependency-pure
+# (`metrics-exporter-prometheus` + the 0.20 `metrics-util` alias +
+# `tokio` for the WG-only HTTP listener) — decoupled from any cos
+# surface, so a daemon can opt into `/metrics` without dragging in
+# the property store.
+prometheus = [
+    "dep:metrics-exporter-prometheus",
+    "dep:metrics-util-prometheus",
+    "dep:tokio",
+]
+
+[dependencies]
+tracing.workspace = true
+# `reload` is unconditionally enabled — the live-reloadable filter is
+# now a core capability (the `LogReloadHandle` wrapper hands runtime
+# filter swaps to consumers; the future cos props watcher drives it).
+# `tracing-log` is listed explicitly so the `log`-crate → tracing bridge
+# survives even if some future build flips `default-features = false`:
+# `try_init()` installs the `LogTracer` from this feature (we do NOT call
+# `LogTracer::init()` ourselves — doing so double-installs and makes
+# `try_init()` fail with SetLoggerError).
+tracing-subscriber = { workspace = true, features = ["env-filter", "json", "tracing-log"] }
+tracing-appender.workspace = true
+# journald sink is opt-in per `LogDefaults.journald` but always linked
+# so binaries can flip it via CLI without a recompile.
+tracing-journald = "0.3"
+clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = "2"
+
+# Stats subsystem. `metrics` is the facade every binary uses via the
+# `counter!`/`gauge!`/`histogram!` macros; `metrics-util` provides the
+# Registry + AtomicStorage primitives the substrate `StatsRecorder`
+# composes. Both are core. `metrics-exporter-prometheus` ships the
+# per-daemon `/metrics` endpoint and is gated behind `prometheus`.
+metrics = { workspace = true }
+metrics-util = { workspace = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+# `MetricKindMask` lives in `metrics_util`, but
+# `metrics-exporter-prometheus 0.18` depends on `metrics-util 0.20`
+# while the workspace's primary `metrics-util` pin is `0.18`. Pull a
+# 0.20 alias under a distinct package name for the prometheus attach
+# path only.
+metrics-util-prometheus = { package = "metrics-util", version = "0.20", optional = true }
+# `chrono` is core — the `Snapshot.captured_at` and JSONL `ts` fields
+# are on the core API surface.
+chrono = { workspace = true }
+# FxHash for labels_hash canonical encoding.
+rustc-hash = { workspace = true }
+
+# `cosmix-lib-client` is bus-handlers-only — `handle_snapshot_bus`
+# takes an `&IncomingCommand` (the Bus wire frame). It lives in bus
+# alongside this crate now, so the path is a plain sibling path-dep.
+cosmix-client = { package = "cosmix-lib-client", path = "../cosmix-lib-client", optional = true }
+# `tokio` is prometheus-only now — the `/metrics` listener spawns its
+# upkeep task and serves over a WG-only HTTP listener. `rt`/`sync`/
+# `macros` cover the spawn + Notify; `rt-multi-thread` for the
+# listener future.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "macros"], optional = true }
+
+[dev-dependencies]
+# init/opts tests run on the pure core (no async runtime needed); the
+# prometheus listener path is exercised through the optional normal dep.
+tempfile = "3"

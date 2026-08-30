@@ -1,0 +1,315 @@
+-- h_fleet.mix — read-only fleet status board (GET /admin/fleet). Admin-gated.
+--
+-- Renders a status snapshot published by an agent-fleet controller. The page
+-- does NOT talk to the fleet: it reads ONE file and formats it. That is a
+-- deliberate trust decision, not a limitation.
+--
+-- WHY A FILE AND NOT THE BUS. A webd handler could in principle reach a daemon
+-- through `bus_call`, but webd gates that on an allowlist whose entry condition
+-- is that the target daemon implements a delegated-envelope authorization spine
+-- interpreting `$cosmix_delegation`. A controller that authorizes by mesh-peer
+-- rules does not, so granting a web route one of its verbs would let any request
+-- reaching this route act with webd's mesh authority — a confused deputy. (The
+-- `send`/`emit` statement is not an alternative: it needs `set_bus_handler`,
+-- which webd never installs, so it is inert here regardless of capability.)
+--
+-- Reading a file needs only the DEFAULT capability set. This handler acquires no
+-- authority it did not already have, and cannot mutate fleet state even if this
+-- page were compromised: there is no write path to be abused.
+--
+-- CONFIGURATION. The snapshot path comes from `$SITE.fleet_status_path` and is
+-- NOT hardcoded, because this file lives in the public repo and the path is
+-- operator-specific. A vhost that does not set it gets an explanatory card
+-- rather than an error, so adding this handler to the shared tree cannot break
+-- any other vhost.
+
+function fleet_main()
+cms_init()
+$user = current_user($HEADERS)
+$deny = require_role($user, "admin")
+if $deny != nil then
+  return $deny
+end
+
+$path = get_or($SITE, "fleet_status_path", "")
+if $path == "" then
+  $b = '<div class="cms-head"><h1>Fleet</h1></div>'
+  $b = $b .. '<div class="card"><p class="muted">No <code>fleet_status_path</code> is set in this vhost&rsquo;s <code>site.conf.mix</code>, so there is no snapshot to read.</p></div>'
+  return doc(200, "Fleet", $user, $b)
+end
+
+-- A missing or unparseable snapshot is a REPORTED state, never a stack trace and
+-- never a blank page that reads as "nothing is happening".
+$snap = nil
+$readerr = ""
+try
+  $snap = data_parse(read_file($path))
+catch $msg
+  $readerr = $msg
+end
+
+if $snap == nil then
+  $b = '<div class="cms-head"><h1>Fleet</h1></div>'
+  $b = $b .. '<div class="card"><h2>Snapshot unavailable</h2>'
+  $b = $b .. '<p class="muted">Could not read <code>' .. esc($path) .. '</code>.</p>'
+  $b = $b .. '<p class="muted small">' .. esc($readerr) .. '</p>'
+  $b = $b .. '<p class="muted small">This means the status file is missing or malformed &mdash; it does <strong>not</strong> mean the fleet is idle.</p></div>'
+  return doc(200, "Fleet", $user, $b)
+end
+
+-- STALENESS IS THE FIRST THING RENDERED. A dashboard that shows old numbers as
+-- though they were current is worse than one that shows nothing, so the age of
+-- the snapshot leads and is called out loudly once it is clearly stale.
+$age_s = -1
+try
+  $age_s = time() - date_parse($snap["generated_at"])
+catch $ignored
+  $age_s = -1
+end
+
+$age_txt = "unknown age"
+$stale = 0
+if $age_s >= 0 then
+  $age_txt = duration_format($age_s) .. " ago"
+  if $age_s > 5400 then
+    $stale = 1
+  end
+end
+
+$b = '<div class="cms-head"><h1>Fleet</h1><span class="muted small">snapshot ' .. esc($age_txt) .. '</span></div>'
+
+if $stale == 1 then
+  $b = $b .. '<div class="card" style="border-color:var(--danger,#c33)"><strong>Snapshot is stale.</strong> <span class="muted">It was published ' .. esc($age_txt) .. '. The sweeps republish it when they finish, so a stale snapshot usually means nothing has run &mdash; treat every number below as historical.</span></div>'
+end
+
+if get_or($snap, "ledger_ok", false) != true then
+  $b = $b .. '<div class="card"><strong>The ledger could not be read</strong> <span class="muted">when this snapshot was taken, so task counts may be missing or incomplete.</span></div>'
+end
+
+-- Task counts.
+$tasks = get_or($snap, "tasks", {})
+-- ONE row, whatever the status count. `grid-auto-flow:column` sizes itself to
+-- however many statuses are present, and that number MOVES — `landing` exists
+-- only while something is landing, `failed`/`bounced` come and go. A fixed
+-- 4-column grid wrapped nine statuses onto three rows, which is a summary that
+-- takes more vertical space than the detail it summarises.
+--
+-- overflow-x on the wrapper rather than letting the cards squash: on a narrow
+-- viewport a scrollable row of readable numbers beats nine unreadable ones.
+-- ONE card, nine items across it. Nine separate cards made the summary taller
+-- than the detail it summarises; as a single strip it reads as one glance.
+-- Flex with flex:1 per item spreads them evenly however many statuses exist,
+-- and that count MOVES — `landing` exists only while something is landing,
+-- `failed`/`bounced` come and go — so nothing here may assume nine.
+$b = $b .. '<div class="card" style="margin:var(--space-6) 0;overflow-x:auto">'
+$b = $b .. '<div style="display:flex;align-items:flex-end;gap:var(--space-4)">'
+for each $k in keys($tasks)
+  $b = $b .. '<div style="flex:1;min-width:64px;text-align:center">'
+  $b = $b .. '<div style="font-size:1.6rem;font-weight:800;line-height:1.1;color:var(--fg-primary)">' .. esc("" .. $tasks[$k]) .. '</div>'
+  $b = $b .. '<div class="muted small">' .. esc($k) .. '</div></div>'
+end
+$b = $b .. '</div></div>'
+
+-- In flight.
+$running = get_or($snap, "running", [])
+$b = $b .. '<div class="card"><h2 style="margin:0 0 var(--space-2)">In flight</h2>'
+if len($running) == 0 then
+  $b = $b .. '<p class="muted">Nothing running or landing.</p>'
+else
+  -- State is its own column: `landing` (the refinery merging finished work) and
+  -- `running` (an agent spending tokens on an attempt) are opposite situations,
+  -- and a board that shows both as merely "in flight" makes a healthy landing
+  -- look like a task stuck re-implementing itself.
+  $b = $b .. '<table><tr><th>Task</th><th>State</th><th>Attempt</th><th>Age</th><th>Title</th></tr>'
+  for each $r in $running
+    $st = "" .. get_or($r, "state", "?")
+    $b = $b .. '<tr><td><strong>' .. esc("" .. $r["id"]) .. '</strong></td>'
+    $b = $b .. '<td><span class="tag small">' .. esc($st) .. '</span></td>'
+    $b = $b .. '<td>' .. esc("" .. $r["attempt"]) .. '</td>'
+    $b = $b .. '<td class="muted small">' .. esc("" .. $r["mins"]) .. 'm</td>'
+    $b = $b .. '<td>' .. esc($r["title"]) .. '</td></tr>'
+  end
+  $b = $b .. '</table>'
+end
+$b = $b .. '</div>'
+
+-- Units. Both timers AND services: a stopped timer whose service is still
+-- running is a real and previously costly confusion, so show them side by side
+-- rather than summarising to one "fleet is up" light.
+$units = get_or($snap, "units", {})
+$b = $b .. '<div class="card"><h2 style="margin:0 0 var(--space-2)">Units</h2><div class="row" style="flex-wrap:wrap;gap:var(--space-2)">'
+for each $u in keys($units)
+  $state = "" .. $units[$u]
+  -- THREE states, not two. `inactive` is the NORMAL resting state of a oneshot
+  -- sweep between runs, while `failed` means the last run exited non-zero and
+  -- wants a human. Rendering them identically (both merely 'not active') hid a
+  -- real failed dispatch in the first version of this page — the fleet was
+  -- blocked and the board showed it in the same grey as a healthy idle timer.
+  if $state == "active" then
+    $b = $b .. '<span class="tag small">' .. esc($u) .. ' &middot; active</span>'
+  elif $state == "failed" then
+    $b = $b .. '<span class="small" style="color:var(--danger,#c33);border:1px solid var(--danger,#c33);border-radius:var(--radius-1,4px);padding:0 .4em;font-weight:700">' .. esc($u) .. ' &middot; FAILED</span>'
+  else
+    $b = $b .. '<span class="muted small">' .. esc($u) .. ' &middot; ' .. esc($state) .. '</span>'
+  end
+end
+$b = $b .. '</div></div>'
+
+-- Findings: a count plus the most recent few. The snapshot deliberately carries
+-- only a handful; link-free by design, since this vhost has no findings browser.
+$fo = get_or($snap, "findings_open", -1)
+$recent = get_or($snap, "findings_recent", [])
+$b = $b .. '<div class="card"><h2 style="margin:0 0 var(--space-2)">Open findings'
+if $fo >= 0 then
+  $b = $b .. ' <span class="muted small">(' .. esc("" .. $fo) .. ')</span>'
+end
+$b = $b .. '</h2>'
+
+-- A single total hides its own shape: 834 open findings sounds uniform, but 149
+-- of them are BLOCKERS. Break it down before listing anything, worst first.
+$by_sev = get_or($snap, "findings_by_severity", {})
+if len(keys($by_sev)) > 0 then
+  $b = $b .. '<div class="row" style="flex-wrap:wrap;gap:var(--space-2);margin-bottom:var(--space-3)">'
+  for each $sv in ["blocker", "major", "high", "medium", "minor", "warn", "info"]
+    $n = get_or($by_sev, $sv, 0)
+    if $n > 0 then
+      $b = $b .. '<span class="small" style="' .. sev_style($sv) .. '">' .. esc($sv) .. ' ' .. esc("" .. $n) .. '</span>'
+    end
+  end
+  $b = $b .. '</div>'
+end
+
+if len($recent) == 0 then
+  $b = $b .. '<p class="muted">None recorded in this snapshot.</p>'
+else
+  -- Ordered by severity in the snapshot, not by recency: the newest findings on
+  -- this fleet are mostly repeated info-level notes, and listing by id buried
+  -- every blocker below them.
+  $b = $b .. '<table><tr><th>#</th><th>Task</th><th>Severity</th><th>Title</th></tr>'
+  for each $f in $recent
+    $b = $b .. '<tr><td>' .. esc("" .. $f["id"]) .. '</td>'
+    $b = $b .. '<td class="muted small">' .. esc("" .. $f["task"]) .. '</td>'
+    $b = $b .. '<td><span class="small" style="' .. sev_style("" .. $f["severity"]) .. '">' .. esc($f["severity"]) .. '</span></td>'
+    $b = $b .. '<td>' .. esc($f["title"]) .. '</td></tr>'
+  end
+  $b = $b .. '</table>'
+end
+$b = $b .. '</div>'
+
+-- LANES. A rung can fail every single run while every PER-TASK number stays
+-- blameless, because a lane failure dispositions as infra_refusal and is never
+-- charged to a task's ladder. That is correct accounting and terrible
+-- visibility: on 2026-08-29 a rung burned 19.4M tokens across 15 failures and 0
+-- successes, and nothing on this board would have shown it. Error RATE per lane
+-- is the number that makes it obvious.
+$lanes = get_or($snap, "lanes_24h", {})
+$thrash = get_or($snap, "autocompact_thrash_24h", nil)
+if len(keys($lanes)) > 0 then
+  $b = $b .. '<div class="card"><h2 style="margin:0 0 var(--space-2)">Lanes <span class="muted small">(24h)</span></h2>'
+  $b = $b .. '<table><tr><th>Lane</th><th>Runs</th><th>Errors</th><th>Input tokens</th></tr>'
+  for each $ln in keys($lanes)
+    $L = $lanes[$ln]
+    $runs = get_or($L, "runs", 0)
+    $errs = get_or($L, "errors", 0)
+    -- A lane erroring on EVERY run is the shape worth shouting about; a lane
+    -- erroring sometimes is ordinary.
+    $style = ""
+    if $runs > 0 and $errs == $runs then
+      $style = ' style="color:var(--danger,#c33);font-weight:700"'
+    end
+    $b = $b .. '<tr><td><strong>' .. esc($ln) .. '</strong></td>'
+    $b = $b .. '<td>' .. esc("" .. $runs) .. '</td>'
+    $b = $b .. '<td' .. $style .. '>' .. esc("" .. $errs) .. '</td>'
+    $b = $b .. '<td class="muted small">' .. esc(short_count(get_or($L, "tokens_in", 0))) .. '</td></tr>'
+  end
+  $b = $b .. '</table>'
+  if $thrash != nil and $thrash > 0 then
+    $b = $b .. '<p class="small" style="color:var(--danger,#c33);margin-top:var(--space-2)"><strong>autocompact thrashing: ' .. esc("" .. $thrash) .. ' in 24h.</strong> <span class="muted">The agent CLI refilled its context to the limit within 3 turns of compacting, repeatedly — the run does no useful work and is recorded only as an error. Invisible in the ledger; counted here from the dispatch journal.</span></p>'
+  end
+  $b = $b .. '</div>'
+end
+
+-- HOST. CPU | Memory | Disk, three across, at the bottom — these explain the
+-- numbers above rather than competing with them.
+$cpu = get_or($snap, "cpu", nil)
+$mem = get_or($snap, "mem", nil)
+$disk = get_or($snap, "disk", nil)
+$b = $b .. '<div class="grid" style="grid-template-columns:repeat(3,1fr);margin:var(--space-6) 0">'
+
+if $cpu != nil then
+  -- Load past core count is the point at which work is queueing rather than
+  -- running, so it earns the danger colour; below that it is just a busy box.
+  $tone = "var(--fg-primary)"
+  if $cpu["cores"] > 0 and $cpu["load1"] > $cpu["cores"] then
+    $tone = "var(--danger,#c33)"
+  end
+  $b = $b .. '<div class="card"><div class="muted small">CPU load</div>'
+  $b = $b .. '<div style="font-size:2rem;font-weight:800;color:' .. $tone .. '">' .. esc("" .. $cpu["load1"]) .. '</div>'
+  $b = $b .. '<div class="muted small">' .. esc("" .. $cpu["cores"]) .. ' cores &middot; 5m ' .. esc("" .. $cpu["load5"]) .. ' &middot; 15m ' .. esc("" .. $cpu["load15"]) .. '</div></div>'
+end
+
+if $mem != nil then
+  $b = $b .. '<div class="card"><div class="muted small">Memory</div>'
+  $b = $b .. '<div style="font-size:2rem;font-weight:800;color:var(--fg-primary)">' .. esc("" .. $mem["used_pct"]) .. '%</div>'
+  $b = $b .. '<div class="muted small">' .. esc(human_bytes($mem["available_bytes"])) .. ' available of ' .. esc(human_bytes($mem["total_bytes"])) .. '</div></div>'
+end
+
+if $disk != nil then
+  -- I/O pressure sits with disk, because capacity was never the symptom that
+  -- hurt: a full pool showed up as this box stalling on I/O with idle cores.
+  $io = get_or($snap, "io_full_avg60", nil)
+  $iotxt = ""
+  if $io != nil then
+    $iotxt = ' &middot; io ' .. esc("" .. $io) .. '%'
+  end
+  $b = $b .. '<div class="card"><div class="muted small">Disk</div>'
+  $b = $b .. '<div style="font-size:2rem;font-weight:800;color:var(--fg-primary)">' .. esc("" .. $disk["used_pct"]) .. '</div>'
+  $b = $b .. '<div class="muted small">' .. esc(human_bytes($disk["avail_bytes"])) .. ' free' .. $iotxt .. '</div></div>'
+end
+$b = $b .. '</div>'
+
+$b = $b .. '<p class="muted small">Read-only view of <code>' .. esc($path) .. '</code>. This page cannot change fleet state.</p>'
+
+return doc(200, "Fleet", $user, $b)
+
+end
+
+-- Bytes as a short human string. Local to this handler so it adds no surface to
+-- the shared lib.
+function human_bytes($n)
+  if $n >= 1099511627776 then
+    return "" .. round($n / 1099511627776.0, 1) .. "T"
+  end
+  if $n >= 1073741824 then
+    return "" .. round($n / 1073741824.0, 1) .. "G"
+  end
+  if $n >= 1048576 then
+    return "" .. round($n / 1048576.0, 1) .. "M"
+  end
+  return "" .. $n .. "B"
+end
+
+-- Severity chip styling. blocker and major are the two that should pull the eye;
+-- everything else stays quiet so the important ones are not lost in colour.
+function sev_style($sev)
+  $base = "border-radius:var(--radius-1,4px);padding:0 .4em;font-weight:700;border:1px solid "
+  if $sev == "blocker" then
+    return $base .. "var(--danger,#c33);color:#fff;background:var(--danger,#c33)"
+  end
+  if $sev == "major" then
+    return $base .. "var(--danger,#c33);color:var(--danger,#c33)"
+  end
+  return $base .. "currentColor;opacity:.65;font-weight:400"
+end
+
+-- Large counts as short strings (20643534 -> 20.6M). Token counts here run to
+-- hundreds of millions and are unreadable in full.
+function short_count($n)
+  if $n >= 1000000 then
+    return "" .. round($n / 1000000.0, 1) .. "M"
+  end
+  if $n >= 1000 then
+    return "" .. round($n / 1000.0, 1) .. "k"
+  end
+  return "" .. $n
+end

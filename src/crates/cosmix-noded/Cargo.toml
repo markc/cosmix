@@ -1,0 +1,74 @@
+[package]
+name = "cosmix-noded"
+version = "0.13.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Consolidated cosmix node daemon — broker + config + monitor + logger"
+
+[[bin]]
+name = "cosmix-noded"
+path = "src/main.rs"
+
+[dependencies]
+# Broker
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus" }
+cosmix_mesh = { package = "cosmix-lib-mesh", path = "../cosmix-lib-mesh" }
+axum.workspace = true
+futures-util.workspace = true
+
+# Config (node.toml only)
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config" }
+
+# SPEC 13 authority plane (1b-c): verify the signed inventory. Core only
+# (mesh-free inventory types + the shared canonicaliser + verify) — the
+# same crate the signer uses, so signer and verifier can't disagree (§6).
+cosmix_mesh_trust = { package = "cosmix-lib-mesh-trust", path = "../cosmix-lib-mesh-trust", default-features = false }
+base64.workspace = true
+blake3.workspace = true
+
+# Monitor
+sysinfo = "0.35"
+
+# Logger
+chrono.workspace = true
+
+# Shared — client modules connect to broker via WebSocket
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client" }
+cosmix_daemon = { package = "cosmix-lib-daemon", path = "../cosmix-lib-daemon" }
+cosmix_log = { package = "cosmix-lib-log", path = "../cosmix-lib-log" }
+cosmix_props = { package = "cosmix-lib-props-store", path = "../cosmix-lib-props-store" }
+
+# Build provenance (version/git_sha/build_time) embedded at compile time.
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
+
+# Common
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+mimalloc.workspace = true
+# SPEC 13 §7.7 authority hot-reload (2-c-0b): lock-free snapshot swap + an
+# inotify watch on the local `inventory.signed` cache.
+arc-swap.workspace = true
+notify.workspace = true
+# SPEC 13 §9a D2 admission (2-c-1b): CSPRNG for the per-session challenge nonce.
+rand.workspace = true
+
+[build-dependencies]
+# Captures THIS repo's (cos) git sha + build time into COSMIX_* env vars.
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+# SPEC 13 §9a D2 admission (2-c-1b): the round-trip transcript conformance test
+# generates a d2 keypair to sign a transcript the broker then reconstructs.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Raw WebSocket client for verb-level integration tests where the
+# response carries custom headers (e.g. `noded.props.subscribe_grant`)
+# and we need to inspect them — `cosmix-lib-client`'s `call()` returns
+# only the body, and `send_raw` has no response pathway because
+# responses route through a private `pending` map.
+tokio-tungstenite.workspace = true

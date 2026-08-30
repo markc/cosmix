@@ -1,0 +1,26 @@
+[package]
+name = "cosmix-claud"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Claude AI Bus port — exposes Claude CLI as a Cosmix service on claud.sock"
+
+[[bin]]
+name = "cosmix-claud"
+path = "src/main.rs"
+
+[dependencies]
+cosmix_daemon = { package = "cosmix-lib-daemon", path = "../cosmix-lib-daemon" }
+cosmix_log = { package = "cosmix-lib-log", path = "../cosmix-lib-log" }
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus" }
+cosmix_llm = { package = "cosmix-lib-llm", path = "../cosmix-lib-llm" }
+cosmix_skills = { package = "cosmix-lib-skills", path = "../cosmix-lib-skills" }
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config" }
+mimalloc.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+cosmix-lib-mix = { path = "../cosmix-lib-mix", features = ["json", "regex", "toml", "datetime", "url", "crypto"] }

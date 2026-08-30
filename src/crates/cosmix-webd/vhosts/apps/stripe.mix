@@ -1,0 +1,234 @@
+-- stripe.mix — Stripe API client + webhook signature verification for the
+-- the billing panel. Plan §3 P2. Included by h_biz_pay.mix and
+-- h_biz_tick.mix (auto-charge pass). Requires the route capability "net"
+-- (outbound HTTP) — webd 0.9.2+.
+-- Keys live in biz_settings (stripe_secret_key / stripe_webhook_secret /
+-- stripe_mode), entered via /biz/settings. NEVER logged.
+
+-- form-encode one k=v pair (Stripe is application/x-www-form-urlencoded
+-- with bracket notation, e.g. metadata[invoice_id]=42)
+function st_kv($k, $v)
+  return url_encode("" .. $k) .. "=" .. url_encode("" .. $v)
+end
+
+-- POST/GET against the Stripe API. $params = LIST of pre-encoded k=v pairs
+-- (bracket keys included), joined with &. Returns
+-- { ok, status, body (parsed json map | nil), error }.
+function st_api($method, $path, $params, $idempotency_key)
+  $key = biz_setting("stripe_secret_key")
+  if $key == "" then
+    return { ok: false, status: 0, body: nil, error: "stripe_secret_key not configured" }
+  end
+  $hdrs = {
+    "Authorization": "Bearer " .. $key,
+    "Content-Type": "application/x-www-form-urlencoded"
+  }
+  if ("" .. $idempotency_key) != "" then
+    $hdrs["Idempotency-Key"] = "" .. $idempotency_key
+  end
+  $body = join($params, "&")
+  try
+    $r = http_request($method, "https://api.stripe.com" .. $path, $body, $hdrs, { timeout: 4 })
+    $st = to_number($r["status"])
+    if $st == nil or $st == 0 then
+      return { ok: false, status: 0, body: nil, error: "" .. $r["error"] }
+    end
+    $parsed = nil
+    try
+      $parsed = json_parse("" .. $r["body"])
+    catch $e
+      -- non-JSON body on an error status is possible; leave nil
+    end
+    $ok = false
+    if $st >= 200 and $st < 300 then $ok = true end
+    $err = ""
+    if not $ok then
+      $err = "stripe http " .. $st
+      if $parsed != nil and $parsed["error"] != nil then
+        $err = $err .. ": " .. $parsed["error"]["message"]
+      end
+    end
+    return { ok: $ok, status: $st, body: $parsed, error: $err }
+  catch $e
+    return { ok: false, status: 0, body: nil, error: "stripe transport: " .. $e }
+  end
+end
+
+-- Verify a Stripe-Signature header against the raw payload (RFC-2104 HMAC,
+-- constant-time compare, 5-minute timestamp tolerance). Returns bool.
+-- Header shape: "t=1700000000,v1=abcdef...,v1=..." (multiple v1 possible
+-- during secret rotation — accept if ANY matches).
+function st_verify_sig($payload, $sig_header, $secret)
+  if ("" .. $secret) == "" or ("" .. $sig_header) == "" then
+    return false
+  end
+  $t = ""
+  $v1s = []
+  for each $part in split("" .. $sig_header, ",")
+    $p = trim($part)
+    if starts_with($p, "t=") then
+      $t = substr($p, 2, length($p) - 2)
+    end
+    if starts_with($p, "v1=") then
+      $v1s = concat($v1s, [substr($p, 3, length($p) - 3)])
+    end
+  end
+  $ts = to_number($t)
+  if $ts == nil or length($v1s) == 0 then
+    return false
+  end
+  $age = time() - $ts
+  if $age < 0 then $age = 0 - $age end
+  if $age > 300 then
+    return false
+  end
+  $expected = hmac_sha256($secret, $t .. "." .. $payload)
+  for each $v1 in $v1s
+    if constant_time_eq($expected, "" .. $v1) then
+      return true
+    end
+  end
+  return false
+end
+
+-- Create a Checkout Session for an open invoice. Records the payment_attempts
+-- row (idempotency_key BEFORE the call, external_id + redirect_url from the
+-- response) per the plan's webhook-trust-anchor discipline. Returns
+-- { ok, url, error }.
+function st_create_checkout($inv)
+  $mode = biz_setting("stripe_mode")
+  $ikey = biz_token()
+  $now = biz_now()
+  -- ATOMIC reservation (tx-level exclusion with biz_apply_payment's manual
+  -- fence): net-paid recheck + reuse check + attempt INSERT in ONE
+  -- BEGIN IMMEDIATE — either our 'created' row commits before a manual
+  -- payment's tx (which then sees it and refuses), or the manual payment
+  -- commits first (and the recheck here aborts). The gateway call itself
+  -- stays outside the tx (never hold a write lock across HTTP).
+  $reuse_url = ""
+  db_exec("BEGIN IMMEDIATE")
+  try
+    if biz_net_paid_cents($inv["id"]) != 0 then
+      db_exec("ROLLBACK")
+      return { ok: false, url: "", error: "partial payment ledgered — checkout refused" }
+    end
+    -- one live attempt per invoice/gateway/kind (partial unique index): reuse
+    $live = db_query("SELECT id, redirect_url, expires_at FROM payment_attempts
+                      WHERE invoice_id = ?1 AND gateway = 'stripe' AND kind = 'checkout'
+                      AND status = 'created'", [$inv["id"]])
+    if length($live) > 0 then
+      $a = $live[0]
+      if ("" .. $a.expires_at) > $now and ("" .. $a.redirect_url) != "" then
+        $reuse_url = "" .. $a.redirect_url
+      else
+        -- expired at the gateway: retire it and mint a fresh one
+        db_exec("UPDATE payment_attempts SET status = 'expired', updated = ?2 WHERE id = ?1",
+                [$a.id, $now])
+      end
+    end
+    if $reuse_url == "" then
+      db_exec("INSERT INTO payment_attempts (invoice_id, gateway, kind, idempotency_key,
+               amount_cents, currency, mode, status, created, updated)
+               VALUES (?1, 'stripe', 'checkout', ?2, ?3, 'aud', ?4, 'created', ?5, ?5)",
+              [$inv["id"], $ikey, $inv["total_cents"], $mode, $now])
+    end
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return { ok: false, url: "", error: "reservation failed: " .. $e }
+  end
+  if $reuse_url != "" then
+    return { ok: true, url: $reuse_url, error: "" }
+  end
+  $base = biz_invoice_url($inv["token"])
+  $params = [
+    st_kv("mode", "payment"),
+    st_kv("success_url", $base .. "?paid=1"),
+    st_kv("cancel_url", $base),
+    st_kv("line_items[0][price_data][currency]", "aud"),
+    st_kv("line_items[0][price_data][product_data][name]", biz_brand() .. " Invoice INV-" .. $inv["id"]),
+    st_kv("line_items[0][price_data][unit_amount]", $inv["total_cents"]),
+    st_kv("line_items[0][quantity]", 1),
+    st_kv("metadata[invoice_id]", $inv["id"]),
+    st_kv("metadata[attempt_key]", $ikey),
+    st_kv("payment_intent_data[metadata][invoice_id]", $inv["id"]),
+    st_kv("payment_intent_data[metadata][attempt_key]", $ikey)
+  ]
+  $r = st_api("POST", "/v1/checkout/sessions", $params, $ikey)
+  if not $r["ok"] then
+    db_exec("UPDATE payment_attempts SET status = 'failed', updated = ?2
+             WHERE idempotency_key = ?1", [$ikey, biz_now()])
+    return { ok: false, url: "", error: $r["error"] }
+  end
+  $s = $r["body"]
+  -- external_id + redirect_url recorded BEFORE the client is redirected
+  db_exec("UPDATE payment_attempts SET external_id = ?2, redirect_url = ?3,
+           expires_at = ?4, updated = ?5 WHERE idempotency_key = ?1",
+          [$ikey, "" .. $s["id"], "" .. $s["url"],
+           date_format(to_number($s["expires_at"]), "%Y-%m-%dT%H:%M:%S"), biz_now()])
+  return { ok: true, url: "" .. $s["url"], error: "" }
+end
+
+-- Off-session auto-charge for a due invoice (tick pass). Requires the
+-- customer to carry a verified default payment method. Same attempt
+-- discipline. Returns { ok, error, attempted }.
+function st_offsession_charge($inv, $cust, $attempt_no)
+  $mode = biz_setting("stripe_mode")
+  if ("" .. $cust["stripe_customer_id"]) == "" or ("" .. $cust["stripe_pm_status"]) != "verified" then
+    return { ok: false, error: "customer not auto-charge capable", attempted: false }
+  end
+  -- ATOMIC reservation (same shape as st_create_checkout): partial-payment
+  -- fence + in-flight check + attempt INSERT in one BEGIN IMMEDIATE, so a
+  -- manual payment can never slip between the check and the reservation.
+  -- The charge below is minted at the FULL invoice total, so any ledgered
+  -- money means auto-charging would overpay — leave that to dunning/manual.
+  $ikey = biz_token()
+  db_exec("BEGIN IMMEDIATE")
+  try
+    if biz_net_paid_cents($inv["id"]) != 0 then
+      db_exec("ROLLBACK")
+      return { ok: false, error: "partial payment ledgered — auto-charge skipped", attempted: false }
+    end
+    -- one live attempt per invoice/gateway/kind
+    $live = db_query("SELECT id FROM payment_attempts WHERE invoice_id = ?1
+                      AND gateway = 'stripe' AND kind = 'offsession' AND status = 'created'",
+                     [$inv["id"]])
+    if length($live) > 0 then
+      db_exec("ROLLBACK")
+      return { ok: true, error: "", attempted: false }  -- in flight; webhook resolves it
+    end
+    db_exec("INSERT INTO payment_attempts (invoice_id, gateway, kind, idempotency_key,
+             amount_cents, currency, mode, status, attempt_no, created, updated)
+             VALUES (?1, 'stripe', 'offsession', ?2, ?3, 'aud', ?4, 'created', ?5, ?6, ?6)",
+            [$inv["id"], $ikey, $inv["total_cents"], $mode, $attempt_no, biz_now()])
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return { ok: false, error: "reservation failed: " .. $e, attempted: false }
+  end
+  $params = [
+    st_kv("amount", $inv["total_cents"]),
+    st_kv("currency", "aud"),
+    st_kv("customer", $cust["stripe_customer_id"]),
+    st_kv("payment_method", $cust["stripe_pm_id"]),
+    st_kv("off_session", "true"),
+    st_kv("confirm", "true"),
+    st_kv("description", biz_brand() .. " Invoice INV-" .. $inv["id"]),
+    st_kv("metadata[invoice_id]", $inv["id"]),
+    st_kv("metadata[attempt_key]", $ikey)
+  ]
+  $r = st_api("POST", "/v1/payment_intents", $params, $ikey)
+  if $r["body"] != nil and $r["body"]["id"] != nil then
+    db_exec("UPDATE payment_attempts SET external_id = ?2, updated = ?3
+             WHERE idempotency_key = ?1", [$ikey, "" .. $r["body"]["id"], biz_now()])
+  end
+  if not $r["ok"] then
+    -- a card decline arrives as 402 with a PI in error.payment_intent; the
+    -- payment_failed webhook is the canonical failure recorder — this row
+    -- just stops same-day re-attempts
+    db_exec("UPDATE payment_attempts SET status = 'failed', updated = ?2
+             WHERE idempotency_key = ?1 AND external_id = ''", [$ikey, biz_now()])
+    return { ok: false, error: $r["error"], attempted: true }
+  end
+  return { ok: true, error: "", attempted: true }
+end

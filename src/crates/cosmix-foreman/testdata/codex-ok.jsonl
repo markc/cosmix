@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"thread-9"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","item_type":"command_execution","command":"ls","status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","item_type":"command_execution","command":"ls","aggregated_output":"Cargo.toml","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","item_type":"agent_message","text":"All good."}}
+{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":50}}

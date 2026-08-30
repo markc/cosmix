@@ -1,0 +1,4 @@
+-- Sourced by source_bareword.mix. Sets a marker var the parent
+-- script then prints, proving the source executed in the caller's
+-- scope.
+$sourced_marker = "fixture loaded"

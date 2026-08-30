@@ -1,0 +1,899 @@
+-- biz_provision.mix — DB-only CT provisioning handshake endpoints.
+-- D9 handshake: the standalone _bin/ct_provision_worker.mix performs PVE/gateway
+-- work and reports here; this handler owns all biz.db writes inside webd.
+--
+-- Routes:
+--   GET  /biz/provision-claim  (X-Tick-Secret) -> one provision_ct job or 204
+--   POST /biz/provision-apply  (X-Tick-Secret, JSON) -> progress/success/failure
+-- No anonymous writes: every request is tick-secret gated.
+include "/opt/cosmix/vhosts/shared/apps/biz.mix"
+
+function bp_authorized()
+  -- Brick 6: the provision/reconcile worker endpoints authenticate with the
+  -- dedicated provisiond_secret (X-Provision-Secret), NOT the broadly-distributed
+  -- tick_secret. No tick_secret fallback here — a leaked tick credential must not
+  -- reach the provision surface (Codex Brick-6 §D9).
+  $secret = biz_setting("provisiond_secret")
+  $hdr = ""
+  if $HEADERS != nil and $HEADERS["x-provision-secret"] != nil then
+    $hdr = "" .. $HEADERS["x-provision-secret"]
+  end
+  return $secret != "" and $hdr != "" and constant_time_eq($hdr, $secret)
+end
+
+function bp_requested($external_ref)
+  $raw = trim("" .. $external_ref)
+  if $raw == "" then return {} end
+  try
+    $j = json_parse($raw)
+    if $j != nil and type($j) == "map" then return $j end
+  catch $e
+  end
+  return { external_ref: $raw }
+end
+
+function bp_req_val($req, $k)
+  if $req != nil and $req[$k] != nil then return "" .. $req[$k] end
+  return ""
+end
+
+-- Brick 2: canonicalise + VALIDATE a worker-reported fqdn against the STORED job
+-- (never store arbitrary payload text). Returns "" (store nothing) unless it is a
+-- lowercase DNS name <=253, ends in the stored domain, has a valid single-label
+-- host part, and — for an explicit requested node — matches it exactly (Codex).
+function bp_reported_fqdn($p, $external_ref)
+  $raw = lower(trim("" .. $p["fqdn"]))
+  if $raw == "" or length($raw) > 253 then return "" end
+  if not biz_valid_domain($raw) then return "" end
+  $req = bp_requested($external_ref)
+  $domain = lower(trim("" .. $req["domain"]))
+  if $domain == "" or not ends_with($raw, "." .. $domain) then return "" end
+  $label = substr($raw, 0, length($raw) - length($domain) - 1)
+  if not biz_is_dns_label($label) then return "" end
+  $rn = lower(trim("" .. $req["node_name"]))
+  if $rn != "" and $label != $rn then return "" end
+  return $raw
+end
+
+-- Persist the validated worker fqdn on the job (best-effort, non-blank only). Called
+-- inside an open apply tx AFTER the fencing update, so the row already satisfies the
+-- lease/lane triggers.
+function bp_store_fqdn($p, $jid)
+  $jr = db_query("SELECT external_ref FROM jobs WHERE id = ?1", [$jid])
+  if length($jr) != 1 then return end
+  $fq = bp_reported_fqdn($p, $jr[0]["external_ref"])
+  if $fq != "" then db_exec("UPDATE jobs SET fqdn = ?2 WHERE id = ?1", [$jid, $fq]) end
+end
+
+-- LEASE TTL: a running worker must renew (via a progress apply) inside this window or
+-- its lease expires and the job drops to reconcile=1. PER-KIND, server-side ALLOWLIST —
+-- never a raw/operator SQLite datetime modifier (Codex Brick-7/8): a CT build is minutes,
+-- a DNS ensure is seconds, so they get different windows. Longer than any single op of
+-- that kind (every blocking op hard-timeouts well below this).
+function bp_worker_lease_ttl($kind)
+  if $kind == "provision_dns" then return "+5 minutes" end
+  return "+20 minutes"
+end
+-- The reconcile lease can run a disruptive re-verify (reboot test for CT), so it is at
+-- least as long as the worker lease.
+function bp_reconcile_lease_ttl($kind)
+  if $kind == "provision_dns" then return "+10 minutes" end
+  return "+20 minutes"
+end
+-- The set of kinds provisiond workers claim/lease (the server allowlist for claim-next).
+$BP_WORKER_KINDS = ["provision_ct", "provision_dns"]
+$BP_POISON_BOUND = 20
+
+function bp_claim()
+  -- Fail CLOSED while the active-target index is absent (a pre-existing duplicate
+  -- lane blocked its creation) — provisioning would run under an unenforced
+  -- one-lane-per-target invariant otherwise (Codex P1). Other billing is unaffected.
+  $blk = biz_provisioning_blocked()
+  if $blk != "" then
+    return { status: 503, headers: {}, body: "provisioning paused: " .. $blk }
+  end
+  $claimed = nil
+  $claim_req = {}
+  $skipped = 0
+  db_exec("BEGIN IMMEDIATE")
+  try
+    -- Stale recovery: an EXPIRED lease means the worker's ownership lapsed, NOT that
+    -- the external effect didn't happen. So the job goes abandoned+reconcile=1 (an
+    -- operator-visible blocked lane), the reservation is KEPT (a half-built CT may
+    -- hold the IP), and it is NEVER auto-reclaimed (Codex 019f4fdb).
+    $stale = db_query("SELECT id FROM jobs
+                       WHERE kind = 'provision_ct' AND status = 'running'
+                       AND lease_expires_at IS NOT NULL AND datetime(lease_expires_at) < datetime(?1)
+                       ORDER BY id LIMIT 10", [biz_now()])
+    for each $s in $stale
+      db_exec("UPDATE jobs SET status = 'abandoned', reconcile = 1, step = '',
+               error = 'lease expired; external outcome unknown — needs reconcile',
+               lease_token = NULL, lease_expires_at = NULL, updated = ?2
+               WHERE id = ?1 AND kind = 'provision_ct' AND status = 'running'", [$s.id, biz_now()])
+      biz_audit("ct-worker", "provision_lease_expired", "jobs", $s.id, "-> abandoned reconcile=1 (lane blocked)")
+    end
+
+    -- Poison-tolerant bounded single-select: an ineligible oldest job is failed +
+    -- audited and the scan continues, so a poison head can't masquerade as an empty
+    -- queue. reconcile=1 jobs are never claimable. A never-claimed poison job did no
+    -- external work, so its reservation is released.
+    while $claimed == nil and $skipped < $BP_POISON_BOUND
+      $rows = db_query("SELECT j.id AS job_id, j.kind AS job_kind, j.service_id,
+                               j.ip AS job_ip, j.external_ref, j.target_key AS job_target,
+                               j.attempt AS job_attempt,
+                               s.customer_id, s.plan_id, s.units, s.label AS service_label,
+                               p.units AS plan_units
+                        FROM jobs j
+                        JOIN services s ON s.id = j.service_id
+                        LEFT JOIN plans p ON p.id = s.plan_id
+                        WHERE j.kind = 'provision_ct' AND j.status = 'pending' AND j.reconcile = 0
+                        ORDER BY j.id LIMIT 1")
+      if length($rows) == 0 then break end
+      $r = $rows[0]
+      $claim_req = bp_requested($r.external_ref)
+      $pve_host_claim = bp_req_val($claim_req, "pve_host")
+      $poison = ""
+      if ("" .. $r.job_ip) == "" then $poison = "no operator-supplied ip" end
+      if $poison == "" and $pve_host_claim == "" then $poison = "missing external_ref.pve_host" end
+      if $poison != "" then
+        db_exec("UPDATE ip_pool SET status = 'free', service_id = NULL, node = '',
+                 vmid = NULL, reserved_at = NULL, reserved_by_job = NULL
+                 WHERE reserved_by_job = ?1", [$r.job_id])
+        db_exec("UPDATE jobs SET status = 'failed', error = ?2, updated = ?3
+                 WHERE id = ?1 AND kind = 'provision_ct' AND status = 'pending'",
+                [$r.job_id, $poison, biz_now()])
+        biz_audit("ct-worker", "provision_poison_failed", "jobs", $r.job_id, $poison)
+        $skipped = $skipped + 1
+        continue
+      end
+      -- Eligible: mint a fresh lease, flip to running (the invariant triggers require
+      -- lease_token + lease_expires_at on a running row). attempt is bumped only on a
+      -- successful lease acquisition.
+      $tok = uuid()
+      db_exec("UPDATE jobs SET status = 'running', attempt = attempt + 1, step = 'claimed',
+               node = ?2, lease_token = ?3, lease_expires_at = datetime(?4, ?5),
+               reconcile = 0, error = '', updated = ?4
+               WHERE id = ?1 AND status = 'pending'",
+              [$r.job_id, $pve_host_claim, $tok, biz_now(), bp_worker_lease_ttl("provision_ct")])
+      $ch = db_query("SELECT changes() AS n")
+      if to_number($ch[0].n) != 1 then break end
+      db_exec("UPDATE ip_pool SET status = 'reserved', service_id = ?2,
+               reserved_at = COALESCE(reserved_at, ?3), reserved_by_job = ?1
+               WHERE ip = ?4 AND (status = 'free' OR (status = 'reserved' AND reserved_by_job = ?1))",
+              [$r.job_id, $r.service_id, biz_now(), "" .. $r.job_ip])
+      $rch = db_query("SELECT changes() AS n")
+      if to_number($rch[0].n) != 1 then
+        -- Reservation lost the race (no external work has started) — fail cleanly,
+        -- drop the lease, keep scanning.
+        db_exec("UPDATE jobs SET status = 'failed', lease_token = NULL, lease_expires_at = NULL,
+                 error = ?2, updated = ?3 WHERE id = ?1 AND kind = 'provision_ct' AND status = 'running'",
+                [$r.job_id, "cannot reserve ip " .. ("" .. $r.job_ip) .. " (missing, used, or targeted by another job)", biz_now()])
+        biz_audit("ct-worker", "provision_reserve_failed", "jobs", $r.job_id, "" .. $r.job_ip)
+        $skipped = $skipped + 1
+        continue
+      end
+      $claimed = $r
+      $claim_token = $tok
+    end
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return { status: 500, headers: {}, body: "claim failed: " .. $e }
+  end
+  if $claimed == nil then
+    -- Distinguish a genuinely-empty queue (204) from "the poison bound was hit and
+    -- eligible work may remain behind it" (202, caller should claim again at once).
+    if $skipped >= $BP_POISON_BOUND then
+      return { status: 202, headers: { "Content-Type": "application/json" },
+               body: json_encode({ more: true, skipped: $skipped }) }
+    end
+    return { status: 204, headers: {}, body: "" }
+  end
+
+  -- Read the freshly-stamped lease fields back for the response (server is the clock).
+  $lr = db_query("SELECT lease_expires_at FROM jobs WHERE id = ?1", [$claimed.job_id])
+  $lease_expires = ""
+  if length($lr) == 1 then $lease_expires = "" .. $lr[0].lease_expires_at end
+
+  $req = $claim_req
+  $node_name = bp_req_val($req, "node_name")
+  $pve_host = bp_req_val($req, "pve_host")
+  $domain = bp_req_val($req, "domain")
+  if $domain == "" then $domain = "" .. $claimed.service_label end
+  $ip = "" .. $claimed.job_ip
+  $units = $claimed.units
+  if $units == nil then $units = $claimed.plan_units end
+
+  return { status: 200, headers: { "Content-Type": "application/json" },
+           body: json_encode({ job_id: $claimed.job_id, kind: "" .. $claimed.job_kind,
+             lease_token: $claim_token, lease_expires_at: $lease_expires,
+             target_key: "" .. $claimed.job_target, attempt: to_number($claimed.job_attempt) + 1,
+             service_id: $claimed.service_id,
+             customer_id: $claimed.customer_id, plan_id: $claimed.plan_id, units: $units,
+             domain: $domain, node_name: $node_name, pve_host: $pve_host,
+             ip: $ip, requested: $req }) }
+end
+
+-- Brick 8: the GENERIC claim — returns the oldest eligible job of ANY server-supported
+-- worker kind (the drain sends its supported_kinds; we intersect with $BP_WORKER_KINDS so
+-- version skew can't lease a kind the drain can't run). One common envelope
+-- {job_id, kind, lease_token, lease_expires_at, target_key, attempt, spec}; `spec` is
+-- built PER KIND from the stored job + service (never trusts the caller). Stale recovery,
+-- poison-skip, and per-kind leasing are the same contract as bp_claim.
+function bp_claim_next()
+  $blk = biz_provisioning_blocked()
+  if $blk != "" then
+    return { status: 503, headers: {}, body: "provisioning paused: " .. $blk }
+  end
+  -- Negotiate: supported_kinds (caller) INTERSECT the server allowlist. An unsupported
+  -- kind is never leased (stays pending) so a stale drain can't strand it.
+  $supported = []
+  try
+    $body = json_parse($BODY)
+    if $body != nil and $body["supported_kinds"] != nil then
+      for each $k in $body["supported_kinds"]
+        if contains($BP_WORKER_KINDS, "" .. $k) then push($supported, "" .. $k) end
+      end
+    end
+  catch $e
+  end
+  if length($supported) == 0 then return { status: 204, headers: {}, body: "" } end
+  $kind_in = "'" .. join($supported, "','") .. "'"
+
+  $claimed = nil
+  $envelope = {}
+  $skipped = 0
+  db_exec("BEGIN IMMEDIATE")
+  try
+    -- Stale recovery across ALL supported worker kinds (per-kind reservation note: only CT
+    -- owns an ip_pool reservation; DNS has none, so nothing to keep for it).
+    $stale = db_query("SELECT id, kind FROM jobs
+                       WHERE kind IN (" .. $kind_in .. ") AND status = 'running'
+                       AND lease_expires_at IS NOT NULL AND datetime(lease_expires_at) < datetime(?1)
+                       ORDER BY id LIMIT 10", [biz_now()])
+    for each $s in $stale
+      db_exec("UPDATE jobs SET status = 'abandoned', reconcile = 1, step = '',
+               error = 'lease expired; external outcome unknown — needs reconcile',
+               lease_token = NULL, lease_expires_at = NULL, updated = ?2
+               WHERE id = ?1 AND status = 'running'", [$s.id, biz_now()])
+      biz_audit("provisiond", "provision_lease_expired", "jobs", $s.id, ("" .. $s.kind) .. " -> abandoned reconcile=1")
+    end
+
+    while $claimed == nil and $skipped < $BP_POISON_BOUND
+      $rows = db_query("SELECT j.id AS job_id, j.kind AS job_kind, j.service_id,
+                               j.ip AS job_ip, j.external_ref, j.target_key AS job_target, j.attempt AS job_attempt,
+                               s.fqdn AS svc_fqdn, s.ip AS svc_ip, s.label AS service_label,
+                               s.customer_id, s.plan_id, s.units, p.units AS plan_units
+                        FROM jobs j JOIN services s ON s.id = j.service_id
+                        LEFT JOIN plans p ON p.id = s.plan_id
+                        WHERE j.kind IN (" .. $kind_in .. ") AND j.status = 'pending' AND j.reconcile = 0
+                        ORDER BY j.id LIMIT 1")
+      if length($rows) == 0 then break end
+      $r = $rows[0]
+      $kind = "" .. $r.job_kind
+      $tok = uuid()
+      if $kind == "provision_ct" then
+        $creq = bp_requested($r.external_ref)
+        $pve_host_claim = bp_req_val($creq, "pve_host")
+        $poison = ""
+        if ("" .. $r.job_ip) == "" then $poison = "no operator-supplied ip" end
+        if $poison == "" and $pve_host_claim == "" then $poison = "missing external_ref.pve_host" end
+        if $poison != "" then
+          db_exec("UPDATE ip_pool SET status = 'free', service_id = NULL, node = '', vmid = NULL, reserved_at = NULL, reserved_by_job = NULL WHERE reserved_by_job = ?1", [$r.job_id])
+          db_exec("UPDATE jobs SET status = 'failed', error = ?2, updated = ?3 WHERE id = ?1 AND status = 'pending'", [$r.job_id, $poison, biz_now()])
+          biz_audit("provisiond", "provision_poison_failed", "jobs", $r.job_id, $poison)
+          $skipped = $skipped + 1
+          continue
+        end
+        db_exec("UPDATE jobs SET status = 'running', attempt = attempt + 1, step = 'claimed', node = ?2,
+                 lease_token = ?3, lease_expires_at = datetime(?4, ?5), reconcile = 0, error = '', updated = ?4
+                 WHERE id = ?1 AND status = 'pending'",
+                [$r.job_id, $pve_host_claim, $tok, biz_now(), bp_worker_lease_ttl("provision_ct")])
+        if to_number(db_query("SELECT changes() AS n")[0].n) != 1 then break end
+        db_exec("UPDATE ip_pool SET status = 'reserved', service_id = ?2, reserved_at = COALESCE(reserved_at, ?3), reserved_by_job = ?1
+                 WHERE ip = ?4 AND (status = 'free' OR (status = 'reserved' AND reserved_by_job = ?1))",
+                [$r.job_id, $r.service_id, biz_now(), "" .. $r.job_ip])
+        if to_number(db_query("SELECT changes() AS n")[0].n) != 1 then
+          db_exec("UPDATE jobs SET status = 'failed', lease_token = NULL, lease_expires_at = NULL, error = ?2, updated = ?3 WHERE id = ?1 AND status = 'running'",
+                  [$r.job_id, "cannot reserve ip " .. ("" .. $r.job_ip), biz_now()])
+          biz_audit("provisiond", "provision_reserve_failed", "jobs", $r.job_id, "" .. $r.job_ip)
+          $skipped = $skipped + 1
+          continue
+        end
+        $domain = bp_req_val($creq, "domain")
+        if $domain == "" then $domain = "" .. $r.service_label end
+        $units = $r.units
+        if $units == nil then $units = $r.plan_units end
+        $envelope = { pve_host: $pve_host_claim, node_name: bp_req_val($creq, "node_name"),
+                      domain: $domain, ip: "" .. $r.job_ip, units: $units, requested: $creq }
+        $claimed = $r
+        $claim_token = $tok
+      else
+        if $kind == "provision_dns" then
+          -- provision_dns: ensure DNS for an already-provisioned service. The service row is
+          -- the durable target; poison if it lacks a canonical fqdn/ip (nothing to ensure).
+          $svc_fqdn = lower(trim("" .. $r.svc_fqdn))
+          $svc_ip = trim("" .. $r.svc_ip)
+          $dpoison = ""
+          if $svc_fqdn == "" then $dpoison = "service has no fqdn to ensure DNS for" end
+          if $dpoison == "" and $svc_ip == "" then $dpoison = "service has no ip to ensure DNS for" end
+          if $dpoison != "" then
+            db_exec("UPDATE jobs SET status = 'failed', error = ?2, updated = ?3 WHERE id = ?1 AND status = 'pending'", [$r.job_id, $dpoison, biz_now()])
+            biz_audit("provisiond", "provision_poison_failed", "jobs", $r.job_id, $dpoison)
+            $skipped = $skipped + 1
+            continue
+          end
+          db_exec("UPDATE jobs SET status = 'running', attempt = attempt + 1, step = 'claimed',
+                   lease_token = ?2, lease_expires_at = datetime(?3, ?4), reconcile = 0, error = '', fqdn = ?5, ip = ?6, updated = ?3
+                   WHERE id = ?1 AND status = 'pending'",
+                  [$r.job_id, $tok, biz_now(), bp_worker_lease_ttl("provision_dns"), $svc_fqdn, $svc_ip])
+          if to_number(db_query("SELECT changes() AS n")[0].n) != 1 then break end
+          $envelope = { service_id: $r.service_id, fqdn: $svc_fqdn, ip: $svc_ip }
+          $claimed = $r
+          $claim_token = $tok
+        else
+          -- FAIL CLOSED (Codex MINOR 7): never default an unknown kind to a handler. The
+          -- query filters to $supported ⊆ $BP_WORKER_KINDS, so this is unreachable today,
+          -- but an explicit poison-fail keeps it safe when a 3rd kind is added.
+          db_exec("UPDATE jobs SET status = 'failed', error = ?2, updated = ?3 WHERE id = ?1 AND status = 'pending'", [$r.job_id, "unsupported worker kind: " .. $kind, biz_now()])
+          biz_audit("provisiond", "provision_poison_failed", "jobs", $r.job_id, "unsupported kind " .. $kind)
+          $skipped = $skipped + 1
+          continue
+        end
+      end
+    end
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return { status: 500, headers: {}, body: "claim-next failed: " .. $e }
+  end
+  if $claimed == nil then
+    if $skipped >= $BP_POISON_BOUND then
+      return { status: 202, headers: { "Content-Type": "application/json" }, body: json_encode({ more: true, skipped: $skipped }) }
+    end
+    return { status: 204, headers: {}, body: "" }
+  end
+  $lr = db_query("SELECT lease_expires_at FROM jobs WHERE id = ?1", [$claimed.job_id])
+  $lease_expires = ""
+  if length($lr) == 1 then $lease_expires = "" .. $lr[0].lease_expires_at end
+  return { status: 200, headers: { "Content-Type": "application/json" },
+           body: json_encode({ job_id: $claimed.job_id, kind: "" .. $claimed.job_kind,
+             lease_token: $claim_token, lease_expires_at: $lease_expires,
+             target_key: "" .. $claimed.job_target, attempt: to_number($claimed.job_attempt) + 1,
+             service_id: $claimed.service_id, spec: $envelope }) }
+end
+
+-- Every apply is fenced on (job_id, lease_token): a stale worker whose lease was
+-- taken over (or expired -> reconcile) matches 0 rows and is rejected 409, never
+-- silently writing over the current owner's job. Returns "ok" | "fenced" | "error".
+-- Targets (service/ip) are ALWAYS server-derived from the stored job — the payload
+-- never names what to update (Codex 019f4fdb).
+function bp_apply_progress($p, $jid, $tok)
+  db_exec("BEGIN IMMEDIATE")
+  try
+    -- a progress apply also RENEWS the lease (the heartbeat)
+    db_exec("UPDATE jobs SET step = ?2, vmid = ?3, lease_expires_at = datetime(?4, ?6), updated = ?4
+             WHERE id = ?1 AND kind = 'provision_ct' AND status = 'running' AND lease_token = ?5",
+            [$jid, "" .. $p["step"], to_number($p["vmid"]), biz_now(), $tok, bp_worker_lease_ttl("provision_ct")])
+    $ch = db_query("SELECT changes() AS n")
+    if to_number($ch[0].n) != 1 then
+      db_exec("ROLLBACK")
+      return "fenced"
+    end
+    bp_store_fqdn($p, $jid)
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return "error"
+  end
+  return "ok"
+end
+
+function bp_apply_success($p, $jid, $tok)
+  db_exec("BEGIN IMMEDIATE")
+  try
+    db_exec("UPDATE jobs SET status = 'done', step = 'done', vmid = ?2,
+             lease_expires_at = NULL, updated = ?3, error = ''
+             WHERE id = ?1 AND kind = 'provision_ct' AND status = 'running' AND lease_token = ?4",
+            [$jid, to_number($p["vmid"]), biz_now(), $tok])
+    $ch = db_query("SELECT changes() AS n")
+    if to_number($ch[0].n) != 1 then
+      -- Idempotent retry: if THIS token already drove this job to done (a lost HTTP
+      -- response is being retried), answer 200 duplicate — not a misleading 409.
+      $dup = db_query("SELECT 1 AS ok FROM jobs WHERE id = ?1 AND status = 'done' AND lease_token = ?2", [$jid, $tok])
+      db_exec("ROLLBACK")
+      if length($dup) == 1 then return "ok" end
+      return "fenced"
+    end
+    bp_store_fqdn($p, $jid)
+    -- server-derived target: which service/ip to activate comes from the stored job,
+    -- never from the payload. vmid/fqdn are the worker's report of what it built.
+    $jr = db_query("SELECT service_id, node, ip, external_ref FROM jobs WHERE id = ?1", [$jid])
+    if length($jr) != 1 then
+      db_exec("ROLLBACK")
+      return "error"
+    end
+    $sid = to_number($jr[0].service_id)
+    $job_ip = "" .. $jr[0].ip
+    $pve_host = "" .. $jr[0].node
+    if $pve_host == "" then
+      $req = bp_requested($jr[0].external_ref)
+      $pve_host = bp_req_val($req, "pve_host")
+    end
+    -- a successful provision MUST report a valid fqdn (canonical, single label under
+    -- the stored domain); activate with the VALIDATED value, never raw payload (Codex P2).
+    $vf = bp_reported_fqdn($p, $jr[0]["external_ref"])
+    if $vf == "" then
+      db_exec("ROLLBACK")
+      return "error"
+    end
+    db_exec("UPDATE services SET kind = 'ct', node = ?2, vmid = ?3, ip = ?4,
+             fqdn = ?5, status = 'active', updated = ?6 WHERE id = ?1",
+            [$sid, $pve_host, to_number($p["vmid"]), $job_ip, $vf, biz_now()])
+    db_exec("UPDATE ip_pool SET status = 'used', service_id = ?2, node = ?3,
+             vmid = ?4, reserved_by_job = NULL
+             WHERE ip = ?1 AND reserved_by_job = ?5",
+            [$job_ip, $sid, $pve_host, to_number($p["vmid"]), $jid])
+    $ir = db_query("SELECT changes() AS n")
+    if to_number($ir[0].n) != 1 then
+      db_exec("ROLLBACK")
+      return "error"
+    end
+    biz_audit("ct-worker", "provision_done", "jobs", $jid,
+              "service " .. $sid .. " " .. ("" .. $p["fqdn"]) .. " " .. $job_ip)
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return "error"
+  end
+  return "ok"
+end
+
+function bp_apply_failure($p, $jid, $tok)
+  -- A worker-reported failure is only safe to FREE the IP when the worker proved it
+  -- cleaned up (CT destroyed AND no DNS/DHCP was committed). A DIRTY failure (destroy
+  -- failed, or the address was already committed on the gateway — the v0 stub doesn't unwind
+  -- it) goes to abandoned+reconcile=1 and KEEPS the reservation, so the address can't
+  -- be handed to another service while it's still live somewhere (Codex P1).
+  $clean = $p["cleanup_clean"] == true
+  db_exec("BEGIN IMMEDIATE")
+  try
+    if $clean then
+      db_exec("UPDATE jobs SET status = 'failed', reconcile = 0, step = ?2, error = ?3, vmid = ?4,
+               lease_expires_at = NULL, updated = ?5
+               WHERE id = ?1 AND kind = 'provision_ct' AND status = 'running' AND lease_token = ?6",
+              [$jid, "" .. $p["step"], "" .. $p["error"], to_number($p["vmid"]), biz_now(), $tok])
+    else
+      db_exec("UPDATE jobs SET status = 'abandoned', reconcile = 1, step = ?2, error = ?3, vmid = ?4,
+               lease_expires_at = NULL, updated = ?5
+               WHERE id = ?1 AND kind = 'provision_ct' AND status = 'running' AND lease_token = ?6",
+              [$jid, "" .. $p["step"], "dirty failure, needs reconcile: " .. ("" .. $p["error"]), to_number($p["vmid"]), biz_now(), $tok])
+    end
+    $ch = db_query("SELECT changes() AS n")
+    if to_number($ch[0].n) != 1 then
+      -- idempotent retry: this token already drove the job to its terminal failure state
+      $dup = db_query("SELECT 1 AS ok FROM jobs WHERE id = ?1 AND lease_token = ?2
+                       AND (status = 'failed' OR (status = 'abandoned' AND reconcile = 1))", [$jid, $tok])
+      db_exec("ROLLBACK")
+      if length($dup) == 1 then return "ok" end
+      return "fenced"
+    end
+    bp_store_fqdn($p, $jid)
+    if $clean then
+      $jr = db_query("SELECT ip FROM jobs WHERE id = ?1", [$jid])
+      $job_ip = ""
+      if length($jr) == 1 then $job_ip = "" .. $jr[0].ip end
+      db_exec("UPDATE ip_pool SET status = 'free', service_id = NULL, node = '',
+               vmid = NULL, reserved_at = NULL, reserved_by_job = NULL
+               WHERE ip = ?1 AND reserved_by_job = ?2",
+              [$job_ip, $jid])
+      biz_audit("ct-worker", "provision_failed", "jobs", $jid, "" .. $p["error"])
+    else
+      biz_audit("ct-worker", "provision_dirty_abandoned", "jobs", $jid, "reconcile=1: " .. ("" .. $p["error"]))
+    end
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return "error"
+  end
+  return "ok"
+end
+
+function bp_apply_result($res)
+  if $res == "ok" then
+    return { status: 200, headers: { "Content-Type": "application/json" }, body: json_encode({ ok: true }) }
+  end
+  if $res == "fenced" then
+    return { status: 409, headers: {}, body: "lease fenced: not the current worker for this job" }
+  end
+  return { status: 500, headers: {}, body: "apply failed" }
+end
+
+-- Brick 8: DNS apply. Fenced on (job_id, lease_token). Success -> job done (the service
+-- row is already the durable target and is NOT touched); audit the ensured fqdn/ip.
+-- Failure -> failed (clean: no gateway mutation committed) or abandoned+reconcile=1 (dirty:
+-- cleanup_clean=false, e.g. crash after the dnsmasq commit) — same clean/dirty rule as CT,
+-- but NO ip_pool reservation (DNS owns none). Server-derived targets only.
+function bp_apply_dns_success($p, $jid, $tok)
+  db_exec("BEGIN IMMEDIATE")
+  try
+    -- KEEP lease_token on the done row (only NULL the expiry) so a lost-response retry with
+    -- the same token answers 200, not a misleading 409 (Codex MAJOR 4, mirrors CT).
+    db_exec("UPDATE jobs SET status = 'done', step = 'done', reconcile = 0,
+             lease_expires_at = NULL, error = '', updated = ?2
+             WHERE id = ?1 AND kind = 'provision_dns' AND status = 'running' AND lease_token = ?3", [$jid, biz_now(), $tok])
+    if to_number(db_query("SELECT changes() AS n")[0].n) != 1 then
+      $dup = db_query("SELECT 1 AS ok FROM jobs WHERE id = ?1 AND status = 'done' AND lease_token = ?2", [$jid, $tok])
+      db_exec("ROLLBACK")
+      if length($dup) == 1 then return "ok" end
+      return "fenced"
+    end
+    $jr = db_query("SELECT fqdn, ip FROM jobs WHERE id = ?1", [$jid])
+    biz_audit("dns-worker", "provision_dns_ensured", "jobs", $jid, ("" .. $jr[0].fqdn) .. " -> " .. ("" .. $jr[0].ip))
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return "error"
+  end
+  return "ok"
+end
+
+function bp_apply_dns_failure($p, $jid, $tok)
+  $clean = ($p["cleanup_clean"] == true)
+  db_exec("BEGIN IMMEDIATE")
+  try
+    -- KEEP lease_token (only NULL the expiry) for idempotent terminal retry; on the dirty
+    -- (abandoned/reconcile=1) row the NULL expiry still lets rc_claim take the reconcile
+    -- lease despite the retained token (mirrors CT, Codex MAJOR 4).
+    if $clean then
+      db_exec("UPDATE jobs SET status = 'failed', step = '', reconcile = 0, lease_expires_at = NULL,
+               error = ?2, updated = ?3 WHERE id = ?1 AND kind = 'provision_dns' AND status = 'running' AND lease_token = ?4",
+              [$jid, "" .. $p["error"], biz_now(), $tok])
+    else
+      db_exec("UPDATE jobs SET status = 'abandoned', reconcile = 1, step = '', lease_expires_at = NULL,
+               error = ?2, updated = ?3 WHERE id = ?1 AND kind = 'provision_dns' AND status = 'running' AND lease_token = ?4",
+              [$jid, "dirty dns failure, needs reconcile: " .. ("" .. $p["error"]), biz_now(), $tok])
+    end
+    if to_number(db_query("SELECT changes() AS n")[0].n) != 1 then
+      $dup = db_query("SELECT 1 AS ok FROM jobs WHERE id = ?1 AND lease_token = ?2 AND (status = 'failed' OR (status = 'abandoned' AND reconcile = 1))", [$jid, $tok])
+      db_exec("ROLLBACK")
+      if length($dup) == 1 then return "ok" end
+      return "fenced"
+    end
+    $a = "provision_dns_failed"
+    if not $clean then $a = "provision_dns_dirty_abandoned" end
+    biz_audit("dns-worker", $a, "jobs", $jid, "" .. $p["error"])
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return "error"
+  end
+  return "ok"
+end
+
+function bp_apply()
+  $payload = nil
+  try
+    $payload = json_parse($BODY)
+  catch $e
+    return { status: 400, headers: {}, body: "bad json" }
+  end
+  $jid = to_number($payload["job_id"])
+  if $jid == nil then return { status: 400, headers: {}, body: "missing job_id" } end
+  $tok = "" .. $payload["lease_token"]
+  if $tok == "" then return { status: 400, headers: {}, body: "missing lease_token" } end
+
+  -- Dispatch by the STORED job kind (never a payload-supplied kind — Codex Brick-8).
+  $kr = db_query("SELECT kind FROM jobs WHERE id = ?1", [$jid])
+  if length($kr) != 1 then return { status: 404, headers: {}, body: "no such job" } end
+  $kind = "" .. $kr[0].kind
+
+  if $kind == "provision_dns" then
+    if $payload["ok"] == true then return bp_apply_result(bp_apply_dns_success($payload, $jid, $tok)) end
+    if $payload["ok"] == false then return bp_apply_result(bp_apply_dns_failure($payload, $jid, $tok)) end
+    -- a bare progress apply just renews the DNS lease (heartbeat); reuse the CT progress
+    -- fencing shape via a direct fenced touch.
+    db_exec("UPDATE jobs SET lease_expires_at = datetime(?2, ?3), updated = ?2
+             WHERE id = ?1 AND kind = 'provision_dns' AND status = 'running' AND lease_token = ?4",
+            [$jid, biz_now(), bp_worker_lease_ttl("provision_dns"), $tok])
+    if to_number(db_query("SELECT changes() AS n")[0].n) != 1 then return bp_apply_result("fenced") end
+    return bp_apply_result("ok")
+  end
+
+  if $payload["ok"] == true then
+    return bp_apply_result(bp_apply_success($payload, $jid, $tok))
+  end
+  if $payload["ok"] == false then
+    return bp_apply_result(bp_apply_failure($payload, $jid, $tok))
+  end
+  return bp_apply_result(bp_apply_progress($payload, $jid, $tok))
+end
+
+-- ===== Brick 2: reconciliation of reconcile=1 (blocked, ambiguous-outcome) jobs =====
+-- A reconcile=1 job (status='abandoned', lane blocked) is resolved out-of-band by the
+-- privileged _bin/ct_reconcile.mix, which probes the real CT state and posts a
+-- disposition here. webd owns the transition; every resolve is fenced on a reconcile
+-- LEASE (so two reconcilers can't both act). Destructive cleanup is the tool's job and
+-- must be ATTESTED — webd never destroys anything (Codex 019f4fdb).
+
+function rc_ok()
+  return { status: 200, headers: { "Content-Type": "application/json" }, body: json_encode({ ok: true }) }
+end
+function rc_err($m)
+  return { status: 400, headers: {}, body: $m }
+end
+
+function rc_list()
+  $rows = db_query("SELECT j.id AS job_id, j.kind, j.service_id, j.ip, j.fqdn, j.node, j.vmid,
+                           j.external_ref, j.error, j.updated, j.lease_token, j.lease_expires_at
+                    FROM jobs j WHERE j.kind IN ('provision_ct','provision_dns') AND j.reconcile = 1 ORDER BY j.id")
+  $out = []
+  for each $r in $rows
+    push($out, { job_id: $r.job_id, kind: "" .. $r.kind, service_id: $r.service_id, ip: "" .. $r.ip, fqdn: "" .. $r.fqdn,
+                 node: "" .. $r.node, vmid: $r.vmid, error: "" .. $r.error, updated: "" .. $r.updated,
+                 requested: bp_requested($r.external_ref), leased: (("" .. $r.lease_token) != "") })
+  end
+  return { status: 200, headers: { "Content-Type": "application/json" }, body: json_encode({ jobs: $out }) }
+end
+
+function rc_claim()
+  $payload = nil
+  try
+    $payload = json_parse($BODY)
+  catch $e
+    return { status: 400, headers: {}, body: "bad json" }
+  end
+  $jid = to_number($payload["job_id"])
+  if $jid == nil then return { status: 400, headers: {}, body: "missing job_id" } end
+  $tok = uuid()
+  -- Read the kind up front so the reconcile lease TTL is per-kind (Brick 8). A job that
+  -- isn't a reconcile=1 worker job is unclaimable.
+  $kr = db_query("SELECT kind FROM jobs WHERE id = ?1 AND status = 'abandoned' AND reconcile = 1 AND kind IN ('provision_ct','provision_dns')", [$jid])
+  if length($kr) != 1 then return { status: 409, headers: {}, body: "reconcile job unavailable (not reconcile=1, or not a worker kind)" } end
+  $rkind = "" .. $kr[0].kind
+  db_exec("BEGIN IMMEDIATE")
+  try
+    -- acquire the reconcile lease only if NO current (unexpired) lease is held. status
+    -- stays 'abandoned' so the running-lease trigger doesn't fire and bp_claim's
+    -- stale-recovery (running-only) never touches it. Lane stays blocked throughout.
+    db_exec("UPDATE jobs SET lease_token = ?2, lease_expires_at = datetime(?3, ?4), updated = ?3
+             WHERE id = ?1 AND kind IN ('provision_ct','provision_dns') AND status = 'abandoned' AND reconcile = 1
+               AND (lease_token IS NULL OR lease_token = '' OR lease_expires_at IS NULL OR datetime(lease_expires_at) < datetime(?3))",
+            [$jid, $tok, biz_now(), bp_reconcile_lease_ttl($rkind)])
+    $ch = db_query("SELECT changes() AS n")
+    if to_number($ch[0].n) != 1 then
+      db_exec("ROLLBACK")
+      return { status: 409, headers: {}, body: "reconcile job unavailable (not reconcile=1, or a live reconcile lease is held)" }
+    end
+    $jr = db_query("SELECT id, kind, service_id, ip, fqdn, node, vmid, external_ref, lease_expires_at FROM jobs WHERE id = ?1", [$jid])
+    db_exec("COMMIT")
+    $r = $jr[0]
+    return { status: 200, headers: { "Content-Type": "application/json" },
+             body: json_encode({ job_id: $r.id, kind: "" .. $r.kind, service_id: $r.service_id, ip: "" .. $r.ip, fqdn: "" .. $r.fqdn,
+               node: "" .. $r.node, vmid: $r.vmid, requested: bp_requested($r.external_ref),
+               lease_token: $tok, lease_expires_at: "" .. $r.lease_expires_at }) }
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return { status: 500, headers: {}, body: "reconcile claim failed: " .. $e }
+  end
+end
+
+function rc_resolve()
+  $payload = nil
+  try
+    $payload = json_parse($BODY)
+  catch $e
+    return { status: 400, headers: {}, body: "bad json" }
+  end
+  $jid = to_number($payload["job_id"])
+  $tok = "" .. $payload["lease_token"]
+  $disp = "" .. $payload["disposition"]
+  if $jid == nil or $tok == "" then return { status: 400, headers: {}, body: "missing job_id/lease_token" } end
+  db_exec("BEGIN IMMEDIATE")
+  try
+    -- fence on the current UNEXPIRED reconcile lease: an expired holder (whose lease
+    -- may already be taken over, its cleanup possibly interrupted) must NOT resolve —
+    -- an operator re-runs (Codex P1).
+    $jr = db_query("SELECT id, kind, service_id, ip, fqdn, node, external_ref FROM jobs
+                    WHERE id = ?1 AND kind IN ('provision_ct','provision_dns') AND status = 'abandoned' AND reconcile = 1
+                      AND lease_token = ?2 AND lease_expires_at IS NOT NULL AND datetime(lease_expires_at) >= datetime(?3)", [$jid, $tok, biz_now()])
+    if length($jr) != 1 then
+      db_exec("ROLLBACK")
+      return { status: 409, headers: {}, body: "reconcile fenced: not the current unexpired reconcile-lease holder" }
+    end
+    $j = $jr[0]
+    $sid = to_number($j.service_id)
+    $stored_ip = "" .. $j.ip
+
+    -- Brick 8: provision_dns dispositions — the durable target is the service row (not a
+    -- CT), so DNS resolve is simpler: NO vmid/pve/observed_ip attestation and NO ip_pool
+    -- reservation transition (DNS owns none). The tool attests the gateway record state.
+    if ("" .. $j.kind) == "provision_dns" then
+      if $disp == "hold" then
+        db_exec("UPDATE jobs SET lease_token = NULL, lease_expires_at = NULL, error = ?2, updated = ?3 WHERE id = ?1",
+                [$jid, "hold: " .. ("" .. $payload["evidence"]), biz_now()])
+        db_exec("COMMIT")
+        return rc_ok()
+      end
+      if $disp == "retry_clean" then
+        if $payload["attest_clean"] != true then
+          db_exec("ROLLBACK")
+          return rc_err("retry_clean requires attest_clean=true (gateway records removed AND verified absent)")
+        end
+        db_exec("UPDATE jobs SET status = 'pending', reconcile = 0, lease_token = NULL, lease_expires_at = NULL,
+                 step = '', error = 'reconciled: dns cleaned + verified absent, retrying', updated = ?2 WHERE id = ?1", [$jid, biz_now()])
+        biz_audit("dns-reconcile", "reconcile_dns_retry", "jobs", $jid, "records removed + verified absent -> pending")
+        db_exec("COMMIT")
+        return rc_ok()
+      end
+      if $disp == "cancel_clean" then
+        if $payload["attest_clean"] != true then
+          db_exec("ROLLBACK")
+          return rc_err("cancel_clean requires attest_clean=true")
+        end
+        db_exec("UPDATE jobs SET status = 'failed', reconcile = 0, lease_token = NULL, lease_expires_at = NULL,
+                 error = 'reconciled: dns cancelled + cleaned', updated = ?2 WHERE id = ?1", [$jid, biz_now()])
+        biz_audit("dns-reconcile", "reconcile_dns_cancel", "jobs", $jid, "records removed -> failed")
+        db_exec("COMMIT")
+        return rc_ok()
+      end
+      if $disp == "adopt" then
+        -- the tool verified the EXACT desired gateway records resolve for the stored fqdn/ip.
+        -- Require the attested observed identity to equal the stored job (never a payload
+        -- name for a different service).
+        $obs_fqdn = lower(trim("" .. $payload["fqdn"]))
+        $obs_ip = trim("" .. $payload["observed_ip"])
+        if $obs_fqdn != lower(trim("" .. $j.fqdn)) or $obs_ip != $stored_ip then
+          db_exec("ROLLBACK")
+          return rc_err("adopt: attested " .. $obs_fqdn .. "/" .. $obs_ip .. " != stored " .. ("" .. $j.fqdn) .. "/" .. $stored_ip)
+        end
+        db_exec("UPDATE jobs SET status = 'done', reconcile = 0, step = 'done', lease_token = NULL, lease_expires_at = NULL,
+                 error = 'reconciled: dns adopted', updated = ?2 WHERE id = ?1", [$jid, biz_now()])
+        biz_audit("dns-reconcile", "reconcile_dns_adopt", "jobs", $jid, ("" .. $j.fqdn) .. " -> " .. $stored_ip)
+        db_exec("COMMIT")
+        return rc_ok()
+      end
+      db_exec("ROLLBACK")
+      return rc_err("unknown dns disposition: " .. $disp)
+    end
+
+    if $disp == "hold" then
+      -- release the reconcile lease, keep the job blocked (reconcile=1)
+      db_exec("UPDATE jobs SET lease_token = NULL, lease_expires_at = NULL, error = ?2, updated = ?3 WHERE id = ?1",
+              [$jid, "hold: " .. ("" .. $payload["evidence"]), biz_now()])
+      db_exec("COMMIT")
+      return rc_ok()
+    end
+
+    if $disp == "retry_clean" then
+      if $payload["attest_clean"] != true then
+        db_exec("ROLLBACK")
+        return rc_err("retry_clean requires attest_clean=true (CT + DNS/DHCP residue removed AND verified absent)")
+      end
+      -- reservation RETAINED (same IP), vmid cleared, back to pending for a fresh claim
+      db_exec("UPDATE jobs SET status = 'pending', reconcile = 0, lease_token = NULL, lease_expires_at = NULL,
+               vmid = NULL, step = '', error = 'reconciled: cleaned + verified absent, retrying', updated = ?2 WHERE id = ?1", [$jid, biz_now()])
+      biz_audit("ct-reconcile", "reconcile_retry", "jobs", $jid, "cleaned + verified absent -> pending (IP kept)")
+      db_exec("COMMIT")
+      return rc_ok()
+    end
+
+    if $disp == "cancel_clean" then
+      if $payload["attest_clean"] != true then
+        db_exec("ROLLBACK")
+        return rc_err("cancel_clean requires attest_clean=true")
+      end
+      db_exec("UPDATE ip_pool SET status = 'free', service_id = NULL, node = '', vmid = NULL,
+               reserved_at = NULL, reserved_by_job = NULL WHERE reserved_by_job = ?1", [$jid])
+      db_exec("UPDATE jobs SET status = 'failed', reconcile = 0, lease_token = NULL, lease_expires_at = NULL,
+               error = 'reconciled: cancelled + cleaned', updated = ?2 WHERE id = ?1", [$jid, biz_now()])
+      biz_audit("ct-reconcile", "reconcile_cancel", "jobs", $jid, "cleaned + freed IP -> failed")
+      db_exec("COMMIT")
+      return rc_ok()
+    end
+
+    if $disp == "adopt" then
+      -- validate the reconciler's ATTESTATION against the stored job. webd stores the
+      -- job's IP (never a payload IP) and requires the observed IP to equal it.
+      $vmid = to_number($payload["vmid"])
+      $pve = "" .. $payload["pve_host"]
+      $obs_ip = "" .. $payload["observed_ip"]
+      if $vmid == nil or $vmid < 100 or $vmid > 999999999 then
+        db_exec("ROLLBACK")
+        return rc_err("adopt: bad vmid")
+      end
+      if not contains(biz_pve_hosts(), $pve) then
+        db_exec("ROLLBACK")
+        return rc_err("adopt: pve_host is not in provision_pve_hosts")
+      end
+      if $obs_ip != $stored_ip then
+        db_exec("ROLLBACK")
+        return rc_err("adopt: observed ip " .. $obs_ip .. " != stored job ip " .. $stored_ip)
+      end
+      $vf = bp_reported_fqdn({ fqdn: "" .. $payload["fqdn"] }, $j.external_ref)
+      if $vf == "" then
+        db_exec("ROLLBACK")
+        return rc_err("adopt: fqdn fails validation against the stored job")
+      end
+      db_exec("UPDATE jobs SET status = 'done', reconcile = 0, step = 'done', vmid = ?2, fqdn = ?3, node = ?4,
+               lease_token = NULL, lease_expires_at = NULL, error = 'reconciled: adopted', updated = ?5 WHERE id = ?1",
+              [$jid, $vmid, $vf, $pve, biz_now()])
+      -- the service + reservation MUST both transition; if the service vanished or the
+      -- reservation is no longer ours, roll back and keep the job blocked (Codex P1).
+      db_exec("UPDATE services SET kind = 'ct', node = ?2, vmid = ?3, ip = ?4, fqdn = ?5, status = 'active', updated = ?6 WHERE id = ?1",
+              [$sid, $pve, $vmid, $stored_ip, $vf, biz_now()])
+      $sc = db_query("SELECT changes() AS n")
+      if to_number($sc[0].n) != 1 then
+        db_exec("ROLLBACK")
+        return rc_err("adopt: service row missing")
+      end
+      db_exec("UPDATE ip_pool SET status = 'used', service_id = ?2, node = ?3, vmid = ?4, reserved_by_job = NULL
+               WHERE ip = ?5 AND reserved_by_job = ?1", [$jid, $sid, $pve, $vmid, $stored_ip])
+      $ic = db_query("SELECT changes() AS n")
+      if to_number($ic[0].n) != 1 then
+        db_exec("ROLLBACK")
+        return rc_err("adopt: reservation for " .. $stored_ip .. " not owned by this job")
+      end
+      biz_audit("ct-reconcile", "reconcile_adopt", "jobs", $jid, "vmid " .. $vmid .. " " .. $vf .. " " .. $stored_ip .. " on " .. $pve)
+      db_exec("COMMIT")
+      return rc_ok()
+    end
+
+    db_exec("ROLLBACK")
+    return rc_err("unknown disposition: " .. $disp)
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return { status: 500, headers: {}, body: "reconcile resolve failed: " .. $e }
+  end
+end
+
+function rc_renew()
+  $payload = nil
+  try
+    $payload = json_parse($BODY)
+  catch $e
+    return { status: 400, headers: {}, body: "bad json" }
+  end
+  $jid = to_number($payload["job_id"])
+  $tok = "" .. $payload["lease_token"]
+  if $jid == nil or $tok == "" then return { status: 400, headers: {}, body: "missing job_id/lease_token" } end
+  $rkr = db_query("SELECT kind FROM jobs WHERE id = ?1 AND kind IN ('provision_ct','provision_dns')", [$jid])
+  $rrkind = "provision_ct"
+  if length($rkr) == 1 then $rrkind = "" .. $rkr[0].kind end
+  db_exec("BEGIN IMMEDIATE")
+  try
+    -- extend an UNEXPIRED reconcile lease only (never resurrect an expired one — that
+    -- would let a dead reconciler take back over a job another may already hold).
+    db_exec("UPDATE jobs SET lease_expires_at = datetime(?3, ?4), updated = ?3
+             WHERE id = ?1 AND kind IN ('provision_ct','provision_dns') AND status = 'abandoned' AND reconcile = 1
+               AND lease_token = ?2 AND lease_expires_at IS NOT NULL AND datetime(lease_expires_at) >= datetime(?3)",
+            [$jid, $tok, biz_now(), bp_reconcile_lease_ttl($rrkind)])
+    $ch = db_query("SELECT changes() AS n")
+    if to_number($ch[0].n) != 1 then
+      db_exec("ROLLBACK")
+      return { status: 409, headers: {}, body: "reconcile renew: not the current unexpired lease holder" }
+    end
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return { status: 500, headers: {}, body: "reconcile renew failed: " .. $e }
+  end
+  return { status: 200, headers: { "Content-Type": "application/json" }, body: json_encode({ ok: true }) }
+end
+
+function biz_provision_main()
+  cms_init()
+  biz_init()
+  if not bp_authorized() then return { status: 403, headers: {}, body: "forbidden" } end
+  -- All provision + reconcile routes map to this handler; dispatch on the path.
+  if ends_with($PATH, "provision-claim-next") and $METHOD == "POST" then return bp_claim_next() end
+  if ends_with($PATH, "provision-claim") and $METHOD == "GET" then return bp_claim() end
+  if ends_with($PATH, "provision-apply") and $METHOD == "POST" then return bp_apply() end
+  if ends_with($PATH, "reconcile-list") and $METHOD == "GET" then return rc_list() end
+  if ends_with($PATH, "reconcile-claim") and $METHOD == "POST" then return rc_claim() end
+  if ends_with($PATH, "reconcile-renew") and $METHOD == "POST" then return rc_renew() end
+  if ends_with($PATH, "reconcile-resolve") and $METHOD == "POST" then return rc_resolve() end
+  -- exact routes only: an unknown path must NEVER fall through into a mutating
+  -- claim/apply (Codex P2). Each endpoint has its own registered route.
+  return { status: 404, headers: {}, body: "unknown provision endpoint" }
+end

@@ -1,0 +1,141 @@
+[package]
+name = "cosmix-webd"
+version = "0.10.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lightweight web server daemon — axum-based CMS API backed by SQLite"
+
+[[bin]]
+name = "cosmix-webd"
+path = "src/main.rs"
+
+[dependencies]
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", features = ["client-helpers"] }
+cosmix_daemon = { package = "cosmix-lib-daemon", path = "../cosmix-lib-daemon", features = ["tls"] }
+cosmix_log = { package = "cosmix-lib-log", path = "../cosmix-lib-log" }
+cosmix_log_props = { package = "cosmix-lib-log-props", path = "../cosmix-lib-log-props" }
+# Bus citizenship is unconditional for webd — it has no plausible
+# standalone-without-Bus use case, so the deps are not feature-gated.
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus" }
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client" }
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
+cosmix_props = { package = "cosmix-lib-props-store", path = "../cosmix-lib-props-store" }
+# Embedded (trusted) Mix HTTP handlers — slice #3 of the maild/webd
+# trust-split ADR. Generalises maild's inbound-filter embed to HTTP.
+# Same path as cosmix-maild so the graph keeps a single cosmix-lib-mix
+# build (cargo unifies features across the workspace). `crypto`
+# (hash_sha256/blake3, uuid, random_password, base64) + `url`
+# (url_decode/encode) are needed by the CMS handlers
+# for password hashing, session tokens, and image/form data. `datetime`
+# (date_format/time) lets the SSR mail handler stamp an RFC822 `Date:`
+# header when composing a message — chrono is already in the cos graph,
+# so the feature adds no new dependency. `datastar` adds the `ds_*` SSE
+# builtins (ds_patch_elements/ds_patch_signals/ds_sse) the CMS/PIM
+# handlers use to emit Datastar patches; default-features=false upstream,
+# so no axum/rocket is pulled into the Mix lib.
+cosmix_mix = { package = "cosmix-lib-mix", path = "../cosmix-lib-mix", features = ["json", "crypto", "url", "markdown", "datetime", "datastar", "xml", "http"] }
+axum.workspace = true
+# `http_body::Body::size_hint` — lets the public-response cache skip buffering a
+# body whose upper bound exceeds its collect ceiling (serve uncached rather than
+# turn a rendered response into a 500). Already in the graph via axum.
+http-body = "1"
+# Percent-decode the Datastar `datastar=<json>` GET query param when
+# parsing the inbound signal store into `$SIGNALS` (already in the cos
+# lock graph via url/reqwest — no new build).
+form_urlencoded = "1"
+tokio.workspace = true
+# `tower::ServiceExt::oneshot` powers the per-vhost static-file
+# dispatch: the per-vhost router cannot bake `www_dir` into a
+# `fallback_service(ServeDir::new(...))` at build time (each vhost
+# has its own `www_dir`), so the fallback handler constructs a
+# `ServeDir` per request from the `Arc<VhostState>` extension that
+# `host_router` injected and calls it via `.oneshot(req)`.
+tower = "0.5"
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+rusqlite = { workspace = true, features = ["bundled", "hooks"] }
+# SHA-256 for the email-2FA pending-login store (P3): the emitted login
+# code is hashed before it rides the in-memory pending map, so the plaintext
+# OTP never sits in the heap; verify constant-time-compares the hashes.
+sha2 = { workspace = true }
+clap.workspace = true
+mimalloc.workspace = true
+reqwest.workspace = true
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+# SSR PIM Phase 2 — AEAD-sealed stateless session cookies. XChaCha20-
+# Poly1305 (192-bit random nonce → no birthday bound on per-seal random
+# nonces) carries the maild bearer token in an HttpOnly cookie. Chosen
+# over reusing `ring`'s lower-level aead for the misuse-resistant
+# RustCrypto `aead` trait flow (Codex C1, plan §Phase2 Slice 2).
+chacha20poly1305 = "0.10"
+base64 = "0.22"
+rand = { workspace = true }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+pulldown-cmark.workspace = true
+regex-lite = "0.1"
+# Mail-client autoconfig MX resolution. Same version/features as
+# cosmix-maild (the sibling crate that already does MX lookups) so the
+# graph keeps a single hickory-resolver 0.25.x.
+hickory-resolver = { version = "0.25", features = ["tokio", "system-config"] }
+# Trust roots for the operator-policy implicit-TLS probe (verifies the
+# MX target terminates 993/465 with a valid cert). Same version as
+# cosmix-maild's delivery TLS path so the graph keeps one webpki-roots.
+webpki-roots = "0.26"
+# Timestamp arithmetic for the ACME provisioner's backoff scheduler
+# and `MetaV1` on-disk record. Same version as `cosmix-lib-daemon`
+# (the sibling crate that ships `WebdAcmeClient`) so the graph keeps
+# a single `time = "0.3.x"`.
+time = { version = "0.3", features = ["formatting", "macros"] }
+# Atomic file writes + parent-dir fsync for the per-vhost cert state
+# directory (C5b's stage_new_issuance / write_atomic_pem /
+# write_meta_json). Promoted from dev-dep when the on-disk state
+# machine landed; the test-side use in Bucket E continues to share
+# the same version. The version pin matches
+# `cosmix-lib-daemon`'s use of `tempfile::NamedTempFile` for the
+# account directory's atomic credential writes.
+tempfile = "3"
+# Typed `MetaReadError` variants (UnsupportedVersion vs Io/Parse) so
+# the provisioner can branch on the failure class — same shape and
+# version as `cosmix-lib-daemon::AcmeError`.
+thiserror = "2"
+# Wait-free hot-swap snapshots for the per-request `NodeState`
+# directories: `vhosts` (the host-router map) and `handlers` (the
+# compiled `webd.handlers` route table) are each `Arc<ArcSwap<_>>`,
+# republished atomically by the ACME provisioner / namespace reload
+# tasks while request handlers read through a `load()` guard.
+# (Per-listener TLS hot-swap moved to `cosmix_daemon::listen::ListenerTls`
+# in P2-C2, which owns its own arc-swap internally.)
+arc-swap.workspace = true
+# `Http01Solver` (in `cosmix-lib-daemon::acme`) is an `#[async_trait]`
+# trait; webd's `ProvisionerSolver` impl re-uses the macro to desugar
+# its `async fn provision` / `async fn cleanup`. Same version as
+# `cosmix-lib-daemon` so the workspace keeps a single async-trait
+# resolution.
+async-trait = "0.1"
+# Content-hash filenames for filesystem-backed CMS image uploads
+# (media.rs): `blake3(bytes)` → a collision-resistant, unguessable on-disk
+# name (a 128-bit prefix is stored). Already in the
+# workspace graph via cosmix-lib-mix's `crypto` feature, so no new build.
+blake3 = "1"
+argon2 = "0.5"
+
+[dev-dependencies]
+# Synthetic rejection-class chains for the LE-validator gauntlet on
+# the legacy and per-vhost configs (Bucket E). Same crates/versions
+# as cosmix-lib-daemon's own `le_validator.rs` tests.
+rcgen = "0.13"
+# Drive axum middleware (`host_router`, `plain_http_host_admit`) via
+# `ServiceExt::oneshot` for Bucket D's host-routing assertions.
+http-body-util = "0.1"
+
+[build-dependencies]
+# Captures cos HEAD sha + build time (version-discovery contract).
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }

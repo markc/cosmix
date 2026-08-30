@@ -1,0 +1,175 @@
+-- home.mix — public blog index (GET /, or wherever a per-vhost route override
+-- mounts it — e.g. a vhost can serve it at /blog so / can be a static landing
+-- page; links derive from $PATH so any mount works). Rendered as a stack of horizontal blog cards
+-- (cover image left; title / date / excerpt right) in the house blog-card style,
+-- but BACKED by the shared datatable widget for its state machinery — search + pagination
+-- + page-size — WITHOUT the table chrome (no column header, no sort controls). The same
+-- dt_state/dt_sql/dt_compact_header/footer the other lists use; only the row rendering is
+-- bespoke (the media gallery's card-view pattern). Each post's image comes from its `cover`
+-- field (a /img/… or /media/<id> reference into the media library — never re-embedded in the
+-- markdown). Gated by feature("blog"): off ⇒ a plain landing card, never a 404.
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+
+-- blog_date() (the "Jan 8, 2026" house date format) now lives in lib.mix so the
+-- single-post byline (h_post) shares the exact same formatting as these index cards.
+
+-- One horizontal blog card: the whole card links to the post; cover on the left (omitted
+-- if a post has no cover), title + date + excerpt on the right. priv lock for a private
+-- post (only ever shown to a signed-in viewer, who is the only one given private rows).
+function blog_card($p)
+  $slug = "" .. $p["slug"]
+  $cover = "" .. dt_or($p["cover"], "")
+  $h = '<a class="blog-card" href="/post/' .. url_encode($slug) .. '">'
+  if $cover != "" then
+    $h = $h .. '<div class="blog-card-media"><img src="' .. esc($cover) .. '" alt="" loading="lazy"></div>'
+  end
+  $h = $h .. '<div class="blog-card-body">'
+  $h = $h .. '<h2 class="blog-card-title">' .. esc($p["title"]) .. priv_dot($p["visibility"]) .. '</h2>'
+  $h = $h .. '<div class="blog-card-date">' .. esc(blog_date($p["created"])) .. '</div>'
+  $h = $h .. '<p class="blog-card-excerpt">' .. esc($p["excerpt"]) .. '</p>'
+  $h = $h .. '</div></a>'
+  return $h
+end
+
+-- The card list + footer, rendered inside the dt card shell with the compact header
+-- (search box only — no <thead>, no sort links). Mirrors media_card_view: reuse the
+-- datatable header/footer, swap the table body for the bespoke card stack.
+function blog_card_view($spec, $opts, $state, $rows, $total)
+  $h = '<div class="dt-card blog-index">'
+  $h = $h .. dt_compact_header($spec, $opts, $state, $total)
+  $h = $h .. '<div id="dt-results">'
+  if length($rows) == 0 then
+    $emsg = "No posts published yet."
+    if $state["q"] != "" then
+      $emsg = "No posts match “" .. esc($state["q"]) .. "”."
+    else
+      -- a beyond-range page (?page=99 with a real total) — offer a way back (mirrors
+      -- media_card_view) rather than a dead-end "No posts" with no pager.
+      if $total > 0 then
+        $emsg = 'Nothing on this page. <a href="' .. esc($opts["base_route"]) .. '">Back to the start</a>.'
+      end
+    end
+    $h = $h .. '<p class="muted" style="padding:var(--space-4) var(--space-5)">' .. $emsg .. '</p>'
+  else
+    $h = $h .. '<div class="blog-cards">'
+    for each $p in $rows
+      $h = $h .. blog_card($p)
+    end
+    $h = $h .. '</div>'
+    $h = $h .. '<div class="dt-footer">' .. dt_range_label($state, $total) .. dt_size_select($opts, $state) .. dt_pager_skin($opts, $state, $total) .. '</div>'
+  end
+  $h = $h .. '</div></div>'
+  $h = $h .. dt_skin_script()
+  return $h
+end
+
+-- The blog feed as just the dt view HTML (NOT wrapped in doc/dt_partial) — the
+-- card-list datatable over published posts. EXTRACTED so the home route (/), /posts AND
+-- the Mode-B posts-page (/page/<posts_page_slug>, which renders an intro ABOVE this feed)
+-- all reuse ONE feed implementation. $base_route drives the datatable's links
+-- (search/pager/size) so they stay on the calling route. The page size comes from the
+-- `posts_per_page` setting (Part A — was a hardcoded 10), clamped to >= 1.
+function blog_feed_view($user, $base_route)
+  -- Visibility scope lives in a derived table passed as dt_sql's $table (a fixed handler
+  -- literal, never client input): public sees public published posts, a signed-in user also
+  -- sees their private ones. Projects only the columns the cards need (incl. `cover`) — never
+  -- the heavy `body`. The `author` relationship column is a correlated subquery over alias p.
+  $vis = ""
+  if not can_preview_unpublished($user) then
+    $vis = " AND visibility = 'public'"
+  end
+  $src = "(SELECT slug, title, excerpt, created, updated, visibility, cover, author_id FROM cms_posts WHERE kind = 'post' AND status = 'published'" .. $vis .. ") AS p"
+
+  -- Minimal spec: title+excerpt searchable (the search box matches both), created sortable so
+  -- default_sort orders newest-first. NO column is rendered as a header — the card view never
+  -- calls dt_render's table — so these only drive search + the default ORDER BY, no sort UI.
+  $spec = [
+    dt_col("title", "Title", "title", { searchable: true }),
+    dt_col("created", "Date", "created", { sortable: true }),
+    dt_col("updated", "Updated", "updated", { sortable: true }),
+    dt_col("excerpt", "", "excerpt", { searchable: true, hidden: true })
+  ]
+  -- posts_per_page setting (db-override, default 10), clamped to a sane >= 1 so a bad
+  -- value can't yield a zero/negative page (which would break the pager).
+  $pp = to_number(setting("posts_per_page", 10))
+  if $pp < 1 then
+    $pp = 1
+  end
+  $opts = dt_opts({
+    base_route: $base_route, caption: "Blog", noun: "posts",
+    default_sort: "updated", default_dir: "desc", page_size: $pp,
+    page_sizes: [10, 25, 50, "all"],
+    search: true, search_placeholder: "Search posts…", search_split: true,
+    skin: true, compact: true
+  })
+  $state = dt_state($QUERY, $spec, $opts)
+  $res = dt_sql($src, $spec, $state, "*, (SELECT display FROM users WHERE users.id = p.author_id) AS author")
+  return blog_card_view($spec, $opts, $state, $res["rows"], $res["total"])
+end
+
+-- The blog feed as a full response — wraps blog_feed_view in the partial/doc envelope.
+-- Both `/` (the default home feed) and `/posts` (the stable blog URL once home becomes
+-- static) share this. It does NOT call cms_import_emailed_posts() — the caller decides
+-- whether to import first (home does, /posts doesn't). Returns a dt_partial on an
+-- in-region request, else the full shell via doc(). $caption is the page <title>.
+function blog_feed_doc($user, $base_route, $caption)
+  $view = blog_feed_view($user, $base_route)
+  -- search/page (in-region) → full region swap; a full nav → the whole shell via doc().
+  if dt_wants_partial() then
+    return dt_partial($view)
+  end
+  return doc(200, $caption, $user, dt_region($view, "", true))
+end
+
+function home_main()
+cms_init()
+$user = current_user($HEADERS)
+
+-- Email-to-content import is NOT run here: `/` is public_cache'd (webd 0.9.11), so
+-- its ANONYMOUS render must be a pure read — no jmap, no db writes. The import
+-- (jmap + writes) now runs ONLY on /admin/posts (h_admin_posts), i.e. when an admin
+-- manages posts, which is exactly where a freshly-emailed post is wanted. A future
+-- timer/delivery-hook could make it fully hands-off. See routes.mix (home: public_cache).
+
+-- Reading model (Part A): the static front page is gated on the show_on_front SWITCH,
+-- not "home_page_slug non-empty" — `page` = render home_page_slug at / (the blog moves to
+-- /posts and /page/<posts_page_slug>); `posts` (default) = / is the blog feed. The static
+-- branch runs only when the switch is `page`, Pages is enabled, AND the slug resolves to a
+-- viewable page; render_page_by_slug returns nil for a missing/draft/private-to-anon page,
+-- so we fall through to the landing/feed below in that case.
+$mode = "" .. setting("show_on_front", "posts")
+if $mode == "page" and feature("notes") then
+  $hps = trim("" .. setting("home_page_slug", ""))
+  if $hps != "" then
+    $rp = render_page_by_slug($hps, $user)
+    if $rp != nil then
+      return doc(200, $rp["title"], $user, $rp["html"])
+    end
+  end
+end
+
+-- With the blog surface disabled, home is a simple landing (no feed) — never a 404.
+if not feature("blog") then
+  -- site_title is TRUSTED admin-authored markup — the header already renders it raw as
+  -- {{BRAND}} (e.g. 'My Acme <span>ORGANISATION</span>', where the span takes the accent
+  -- colour). esc()ing it here printed the tags literally; render it the same way the header
+  -- does so the landing wordmark matches the top nav. Same trust, same source, same look.
+  $welcome = '<div class="card"><h1 class="site-brand">' .. ("" .. setting("site_title", $SITE["title"])) .. '</h1>'
+  $tag = setting("tagline", "")
+  if ("" .. $tag) != "" then
+    $welcome = $welcome .. '<p class="muted">' .. esc($tag) .. '</p>'
+  end
+  $welcome = $welcome .. '</div>'
+  return doc(200, "Home", $user, $welcome)
+end
+
+-- base_route = the ACTUAL request path (not a hardcoded "/"): the same handler
+-- serves / on most vhosts but /blog where a per-vhost route override mounts it, and
+-- the datatable's search/pager/size links must stay on whatever route served it.
+$base = "" .. $PATH
+if $base == "" then
+  $base = "/"
+end
+return blog_feed_doc($user, $base, "Blog")
+
+end

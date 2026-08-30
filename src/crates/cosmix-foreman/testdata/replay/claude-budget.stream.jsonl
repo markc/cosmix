@@ -1,0 +1,4 @@
+{"record":"meta","version":1,"lane":"claude"}
+{"record":"line","after_ms":2,"stdout":"{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fixture-claude-budget\"}"}
+{"record":"line","after_ms":4,"stdout":"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"over ceiling\"}],\"usage\":{\"input_tokens\":20,\"output_tokens\":200}}}"}
+{"record":"exit","code":0,"signal":null}

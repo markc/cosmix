@@ -1,0 +1,44 @@
+-- parse.mix: test PARSE instruction
+-- Expected output:
+-- Alex
+-- Doe
+-- 2026
+-- 03
+-- 29
+-- hello
+-- key=value world=true
+-- usr
+-- local
+-- bin
+-- first second third fourth
+
+-- word splitting (default)
+$fullname = "Alex Doe"
+parse $fullname with $first $last
+print $first
+print $last
+
+-- literal delimiter
+$datestr = "2026-03-29"
+parse $datestr with $year "-" $month "-" $day
+print $year
+print $month
+print $day
+
+-- literal delimiter with remainder capture
+$line = "hello key=value world=true"
+parse $line with $cmd " " $rest
+print $cmd
+print $rest
+
+-- multiple delimiters
+$path = "usr/local/bin"
+parse $path with $a "/" $b "/" $c
+print $a
+print $b
+print $c
+
+-- remainder captures rest of string
+$data = "first second third fourth"
+parse $data with $w1 " " $therest
+print $w1 .. " " .. $therest

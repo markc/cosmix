@@ -1,0 +1,24 @@
+# cosmix-lib-buildinfo — compile-time build provenance for the cosmix
+# daemon family. A leaf crate at the BOTTOM of `bus ← mix ← cos` so any
+# consumer (mix scripting, every cos daemon) can embed its own
+# version + git sha + build time without inverting the dependency order.
+#
+# Two faces, one crate:
+#  * library  — the `build_info!()` macro + `BuildInfo` struct that a
+#    daemon expands in its own crate (so `CARGO_PKG_VERSION` and the
+#    build.rs-set `COSMIX_*` env vars resolve to THAT crate / repo).
+#  * build script helper — `emit()`, called from a consumer's `build.rs`
+#    so the git sha is captured in the CONSUMER's repo, not bus's.
+#
+# No dependencies — `emit()` uses only std (Command/env/time); the
+# epoch→RFC3339 formatter is hand-rolled to stay dep-free and
+# SOURCE_DATE_EPOCH-reproducible.
+[package]
+name = "cosmix-lib-buildinfo"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Compile-time build provenance (version/git_sha/git_dirty/build_time) for cosmix daemons."
+
+[dependencies]

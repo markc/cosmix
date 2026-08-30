@@ -1,0 +1,1304 @@
+-- biz.mix — billing core: schema bootstrap + money-path helpers.
+-- Spec: the 2026-07-08 billing implementation plan (cmctl _plan/; §2 schema,
+-- money-path invariants; Codex-reviewed to convergence 2026-07-08).
+-- Conventions: money = INTEGER cents · dates = civil TEXT YYYY-MM-DD ·
+-- timestamps TEXT ISO. This file is included by every h_biz_*.mix handler;
+-- biz_init() is idempotent and runs on every request (cms_init discipline).
+
+-- ---------------------------------------------------------------- schema
+
+function biz_init()
+  db_exec("CREATE TABLE IF NOT EXISTS plans (
+    id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
+    units INTEGER NOT NULL, price_cents INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1)")
+
+  db_exec("CREATE TABLE IF NOT EXISTS customers (
+    id INTEGER PRIMARY KEY, legacy_id INTEGER UNIQUE,
+    name TEXT NOT NULL, company TEXT DEFAULT '', email TEXT NOT NULL, phone TEXT DEFAULT '',
+    address1 TEXT DEFAULT '', address2 TEXT DEFAULT '', city TEXT DEFAULT '',
+    state TEXT DEFAULT '', postcode TEXT DEFAULT '', country TEXT DEFAULT 'AU',
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','inactive','closed')),
+    stripe_customer_id TEXT DEFAULT '',
+    stripe_pm_id TEXT DEFAULT '',
+    stripe_pm_status TEXT NOT NULL DEFAULT 'none'
+      CHECK(stripe_pm_status IN ('none','unverified','verified','invalid')),
+    password_hash TEXT NOT NULL DEFAULT '',   -- argon2id PHC string (webd-set); '' = no portal password yet
+    password_set_at TEXT,
+    notes TEXT DEFAULT '', created TEXT, updated TEXT)")
+  -- ensure-cols for the LIVE db (created before portal auth): duplicate-column
+  -- ALTER is swallowed; DEFAULT must be constant.
+  try db_exec("ALTER TABLE customers ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''") catch $e end
+  try db_exec("ALTER TABLE customers ADD COLUMN password_set_at TEXT") catch $e end
+
+  -- single-use magic-link tokens for set-password (first login) + reset. The
+  -- token itself is only ever emailed; we store sha256(token) (Mix has sha256),
+  -- so a db leak can't mint a login. Codex: reissuing invalidates older unused
+  -- same-purpose tokens for that customer.
+  db_exec("CREATE TABLE IF NOT EXISTS customer_tokens (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER NOT NULL REFERENCES customers(id),
+    token_sha256 TEXT UNIQUE NOT NULL,
+    purpose TEXT NOT NULL CHECK(purpose IN ('set','reset')),
+    expires_at TEXT NOT NULL, used_at TEXT, created TEXT)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_ctok_cust ON customer_tokens(customer_id, purpose)")
+
+  db_exec("CREATE TABLE IF NOT EXISTS services (
+    id INTEGER PRIMARY KEY, legacy_id INTEGER UNIQUE,
+    customer_id INTEGER NOT NULL REFERENCES customers(id),
+    kind TEXT NOT NULL DEFAULT 'legacy' CHECK(kind IN ('ct','vm','byo','legacy')),
+    label TEXT NOT NULL,
+    plan_id INTEGER REFERENCES plans(id),
+    units INTEGER,
+    addon_bulk25 INTEGER NOT NULL DEFAULT 0, addon_ipv4 INTEGER NOT NULL DEFAULT 0,
+    price_cents INTEGER NOT NULL,
+    node TEXT DEFAULT '', vmid INTEGER, ip TEXT DEFAULT '', fqdn TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending'
+      CHECK(status IN ('pending','active','suspended','cancelled')),
+    next_due TEXT,
+    payment_pref TEXT NOT NULL DEFAULT 'stripe' CHECK(payment_pref IN ('stripe','paypal','bank')),
+    auto_charge INTEGER NOT NULL DEFAULT 0,
+    notes TEXT DEFAULT '', created TEXT, updated TEXT)")
+  try db_exec("ALTER TABLE services ADD COLUMN fqdn TEXT NOT NULL DEFAULT ''") catch $e end
+
+  db_exec("CREATE TABLE IF NOT EXISTS domains (
+    id INTEGER PRIMARY KEY, legacy_id INTEGER UNIQUE,
+    customer_id INTEGER NOT NULL REFERENCES customers(id),
+    domain TEXT UNIQUE NOT NULL, registrar TEXT NOT NULL DEFAULT 'synergy',
+    expiry TEXT, next_due TEXT, price_cents INTEGER NOT NULL DEFAULT 0,
+    auto_renew INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'active'
+      CHECK(status IN ('pending','active','expired','transferred_away','cancelled')),
+    sw_status TEXT DEFAULT '', sw_synced TEXT DEFAULT '',
+    category TEXT NOT NULL DEFAULT '',   -- freeform grouping/tag (e.g. personal/parked/client/unsorted)
+    cost_price_cents INTEGER NOT NULL DEFAULT 0,  -- SW wholesale renew price (admin-only); price_cents = cost + markup
+    notes TEXT DEFAULT '', created TEXT, updated TEXT)")
+  try db_exec("ALTER TABLE domains ADD COLUMN category TEXT NOT NULL DEFAULT ''") catch $e end
+  try db_exec("ALTER TABLE domains ADD COLUMN cost_price_cents INTEGER NOT NULL DEFAULT 0") catch $e end
+
+  db_exec("CREATE TABLE IF NOT EXISTS invoices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id INTEGER NOT NULL REFERENCES customers(id),
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','open','paid','cancelled')),
+    issued TEXT, due TEXT, paid_at TEXT,
+    subtotal_cents INTEGER NOT NULL DEFAULT 0,
+    tax_cents INTEGER NOT NULL DEFAULT 0, tax_rate_bps INTEGER NOT NULL DEFAULT 0,
+    tax_label TEXT DEFAULT '',
+    credit_cents INTEGER NOT NULL DEFAULT 0,
+    total_cents INTEGER NOT NULL DEFAULT 0,
+    bill_to TEXT DEFAULT '',
+    token TEXT UNIQUE,
+    legacy INTEGER NOT NULL DEFAULT 0,
+    notes TEXT DEFAULT '', created TEXT, updated TEXT,
+    CHECK (total_cents = subtotal_cents + tax_cents - credit_cents),
+    CHECK (total_cents >= 0 AND credit_cents >= 0 AND credit_cents <= subtotal_cents + tax_cents))")
+
+  db_exec("CREATE TABLE IF NOT EXISTS invoice_items (
+    id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL REFERENCES invoices(id),
+    service_id INTEGER REFERENCES services(id), domain_id INTEGER REFERENCES domains(id),
+    description TEXT NOT NULL, amount_cents INTEGER NOT NULL,
+    period_start TEXT, period_end TEXT)")
+
+  db_exec("CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY,
+    invoice_id INTEGER REFERENCES invoices(id),
+    customer_id INTEGER NOT NULL REFERENCES customers(id),
+    gateway TEXT NOT NULL,
+    txn_ref TEXT DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'payment' CHECK(kind IN ('payment','refund','attempt_failed')),
+    amount_cents INTEGER NOT NULL, fee_cents INTEGER NOT NULL DEFAULT 0,
+    at TEXT, detail TEXT DEFAULT '', legacy INTEGER NOT NULL DEFAULT 0)")
+  db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_txn_dedupe ON transactions(gateway, txn_ref)
+    WHERE txn_ref != ''")
+
+  db_exec("CREATE TABLE IF NOT EXISTS credit_ledger (
+    id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+    delta_cents INTEGER NOT NULL, reason TEXT NOT NULL,
+    invoice_id INTEGER REFERENCES invoices(id), at TEXT)")
+
+  db_exec("CREATE TABLE IF NOT EXISTS credentials (
+    id INTEGER PRIMARY KEY, service_id INTEGER NOT NULL REFERENCES services(id),
+    system TEXT NOT NULL, username TEXT DEFAULT '', secret TEXT DEFAULT '', updated TEXT)")
+
+  db_exec("CREATE TABLE IF NOT EXISTS audit (
+    id INTEGER PRIMARY KEY, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
+    table_ref TEXT DEFAULT '', row_id INTEGER, detail TEXT DEFAULT '')")
+
+  db_exec("CREATE TABLE IF NOT EXISTS ip_pool (
+    ip TEXT PRIMARY KEY, node TEXT DEFAULT '', vmid INTEGER,
+    service_id INTEGER UNIQUE REFERENCES services(id),
+    status TEXT NOT NULL DEFAULT 'free' CHECK(status IN ('free','used','reserved','infra')),
+    reserved_at TEXT, reserved_by_job INTEGER)")
+  db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_ip_vm ON ip_pool(node, vmid)
+    WHERE vmid IS NOT NULL")
+
+  -- biz_settings must exist BEFORE the jobs migration below so the migration can record a
+  -- durable failure gate on an old upgrade DB (Codex Brick-8 round-2 MAJOR 6).
+  db_exec("CREATE TABLE IF NOT EXISTS biz_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+
+  db_exec("CREATE TABLE IF NOT EXISTS jobs (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(kind IN ('provision_ct','provision_dns','suspend_ct','resume_ct','resize_ct',
+      'terminate_ct','renew_domain')),
+    service_id INTEGER REFERENCES services(id), domain_id INTEGER REFERENCES domains(id),
+    invoice_id INTEGER REFERENCES invoices(id),
+    status TEXT NOT NULL DEFAULT 'pending'
+      CHECK(status IN ('pending','running','done','failed','abandoned')),
+    step TEXT DEFAULT '',
+    node TEXT DEFAULT '', vmid INTEGER, ip TEXT DEFAULT '',
+    external_ref TEXT DEFAULT '',
+    attempt INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT,
+    error TEXT DEFAULT '', created TEXT, updated TEXT)")
+  -- Brick 8 (generalize to provision_dns): SQLite can't ALTER a CHECK, so an OLD-schema
+  -- jobs table (kind CHECK without provision_dns) is recreated in place — guarded on the
+  -- schema text so it runs at most once, and migrating the CT lane conflict_class
+  -- 'ct' -> 'service' so CT lifecycle AND DNS jobs share one service mutation lane. webd's
+  -- connection has foreign_keys OFF, so the transactional recreate is safe; the table's
+  -- indexes + triggers drop with it and are rebuilt (v3) just below. Fresh DBs already
+  -- carry provision_dns (above) and skip this.
+  $jr = db_query("SELECT sql FROM sqlite_master WHERE name = 'jobs' AND type = 'table'")
+  if length($jr) == 1 and pos("provision_dns", "" .. $jr[0].sql) == 0 then
+    db_exec("BEGIN IMMEDIATE")
+    try
+      db_exec("CREATE TABLE jobs_new (
+        id INTEGER PRIMARY KEY,
+        kind TEXT NOT NULL CHECK(kind IN ('provision_ct','provision_dns','suspend_ct','resume_ct','resize_ct','terminate_ct','renew_domain')),
+        service_id INTEGER REFERENCES services(id), domain_id INTEGER REFERENCES domains(id),
+        invoice_id INTEGER REFERENCES invoices(id),
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','done','failed','abandoned')),
+        step TEXT DEFAULT '',
+        node TEXT DEFAULT '', vmid INTEGER, ip TEXT DEFAULT '',
+        external_ref TEXT DEFAULT '',
+        attempt INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT,
+        error TEXT DEFAULT '', created TEXT, updated TEXT, reconcile INTEGER NOT NULL DEFAULT 0,
+        lease_token TEXT, lease_expires_at TEXT, target_key TEXT, conflict_class TEXT, fqdn TEXT)")
+      db_exec("INSERT INTO jobs_new SELECT
+        id, kind, service_id, domain_id, invoice_id, status, step, node, vmid, ip, external_ref,
+        attempt, next_attempt_at, error, created, updated, reconcile, lease_token, lease_expires_at,
+        target_key, CASE WHEN conflict_class = 'ct' THEN 'service' ELSE conflict_class END, fqdn
+        FROM jobs")
+      db_exec("DROP TABLE jobs")
+      db_exec("ALTER TABLE jobs_new RENAME TO jobs")
+      -- Recreate the lane index + v3 triggers INSIDE the migration tx (Codex MAJOR 6): the
+      -- recreated table has no indexes/triggers, so committing before restoring them would
+      -- open a window where another connection could write without lane-uniqueness/lease
+      -- enforcement. (biz_init's later CREATE ... IF NOT EXISTS then no-op.)
+      db_exec("CREATE UNIQUE INDEX idx_jobs_active_svc ON jobs(kind, service_id) WHERE status IN ('pending','running') AND service_id IS NOT NULL")
+      db_exec("CREATE UNIQUE INDEX idx_jobs_active_dom ON jobs(kind, domain_id) WHERE status IN ('pending','running') AND domain_id IS NOT NULL")
+      db_exec("CREATE INDEX idx_jobs_sched ON jobs(status, next_attempt_at)")
+      db_exec("CREATE UNIQUE INDEX idx_jobs_active_target ON jobs(conflict_class, target_key) WHERE conflict_class IS NOT NULL AND target_key IS NOT NULL AND (status IN ('pending','running') OR reconcile = 1)")
+      db_exec("CREATE TRIGGER trg_jobs_lease_ins_v3 BEFORE INSERT ON jobs WHEN NEW.kind IN ('provision_ct','provision_dns') AND NEW.status = 'running' AND (NEW.lease_token IS NULL OR NEW.lease_token = '' OR NEW.lease_expires_at IS NULL OR NEW.lease_expires_at = '') BEGIN SELECT RAISE(ABORT, 'running worker job requires lease_token + lease_expires_at'); END")
+      db_exec("CREATE TRIGGER trg_jobs_lease_upd_v3 BEFORE UPDATE ON jobs WHEN NEW.kind IN ('provision_ct','provision_dns') AND NEW.status = 'running' AND (NEW.lease_token IS NULL OR NEW.lease_token = '' OR NEW.lease_expires_at IS NULL OR NEW.lease_expires_at = '') BEGIN SELECT RAISE(ABORT, 'running worker job requires lease_token + lease_expires_at'); END")
+      db_exec("CREATE TRIGGER trg_jobs_lane_ins_v3 BEFORE INSERT ON jobs WHEN NEW.kind IN ('provision_ct','provision_dns','suspend_ct','resume_ct','resize_ct','terminate_ct') AND (NEW.status IN ('pending','running') OR NEW.reconcile = 1) AND (NEW.conflict_class IS NULL OR NEW.conflict_class = '' OR NEW.target_key IS NULL OR NEW.target_key = '') BEGIN SELECT RAISE(ABORT, 'active service job requires conflict_class + target_key'); END")
+      db_exec("CREATE TRIGGER trg_jobs_lane_upd_v3 BEFORE UPDATE ON jobs WHEN NEW.kind IN ('provision_ct','provision_dns','suspend_ct','resume_ct','resize_ct','terminate_ct') AND (NEW.status IN ('pending','running') OR NEW.reconcile = 1) AND (NEW.conflict_class IS NULL OR NEW.conflict_class = '' OR NEW.target_key IS NULL OR NEW.target_key = '') BEGIN SELECT RAISE(ABORT, 'active service job requires conflict_class + target_key'); END")
+      db_exec("CREATE TRIGGER trg_jobs_reconcile_ins_v3 BEFORE INSERT ON jobs WHEN NEW.reconcile NOT IN (0,1) BEGIN SELECT RAISE(ABORT, 'reconcile must be 0 or 1'); END")
+      db_exec("CREATE TRIGGER trg_jobs_reconcile_upd_v3 BEFORE UPDATE ON jobs WHEN NEW.reconcile NOT IN (0,1) BEGIN SELECT RAISE(ABORT, 'reconcile must be 0 or 1'); END")
+      db_exec("COMMIT")
+      -- clear any failure gate a prior failed attempt left (this retry succeeded).
+      db_exec("DELETE FROM biz_settings WHERE key = 'brick8_migration_failed'")
+      biz_audit("system", "brick8_jobs_dns_migration", "jobs", 0, "added provision_dns kind + migrated ct lane -> service")
+    catch $e
+      try db_exec("ROLLBACK") catch $e2 end
+      -- fail LOUD (Codex MAJOR 6): block provisioning under an unmigrated/partial schema. A
+      -- DISTINCT key (brick1_lane_conflict gets unconditionally cleared below); claim +
+      -- enqueue check it; only a SUCCESSFUL migration (above) clears it.
+      biz_setting_set("brick8_migration_failed", "1")
+      biz_audit("system", "brick8_jobs_dns_migration_failed", "jobs", 0, "" .. $e)
+    end
+  end
+  -- SQLite UNIQUE treats NULLs as distinct: one partial unique index per target type.
+  db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_svc ON jobs(kind, service_id)
+    WHERE status IN ('pending','running') AND service_id IS NOT NULL")
+  db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dom ON jobs(kind, domain_id)
+    WHERE status IN ('pending','running') AND domain_id IS NOT NULL")
+
+  -- Brick 1 (provisiond contract, _provisiond/README.md):
+  -- crash-safe lease fencing + per-target conflict lanes. Additive + idempotent
+  -- (safe every request). ORDER matters: add columns -> backfill lanes -> active-
+  -- target index -> invariant triggers (so backfilled rows satisfy the triggers).
+  -- Codex-ruled (thread 019f4fdb): reconcile=1 is an operator-visible blocked state
+  -- (an ambiguous external outcome), represented as status='abandoned', reconcile=1;
+  -- an EXPIRED lease means abandoned+reconcile=1, NEVER auto-reclaim. The old
+  -- idx_jobs_active_svc/dom stay as compatible extra protection during transition.
+  try db_exec("ALTER TABLE jobs ADD COLUMN reconcile INTEGER NOT NULL DEFAULT 0") catch $e end
+  try db_exec("ALTER TABLE jobs ADD COLUMN lease_token TEXT") catch $e end
+  try db_exec("ALTER TABLE jobs ADD COLUMN lease_expires_at TEXT") catch $e end
+  try db_exec("ALTER TABLE jobs ADD COLUMN target_key TEXT") catch $e end
+  try db_exec("ALTER TABLE jobs ADD COLUMN conflict_class TEXT") catch $e end
+  try db_exec("ALTER TABLE jobs ADD COLUMN fqdn TEXT") catch $e end   -- Brick 2: worker-derived FQDN
+  -- Backfill service lanes for pre-Brick-1 rows (idempotent: only where target_key IS
+  -- NULL). Brick 8: the lane is 'service' (shared by CT lifecycle + provision_dns), not
+  -- 'ct'. renew_domain is DELIBERATELY left outside the new contract until its worker is
+  -- migrated (Codex P0) — no lane, no lease trigger, unchanged behaviour.
+  db_exec("UPDATE jobs SET conflict_class = 'service', target_key = 'svc:' || service_id
+    WHERE target_key IS NULL AND service_id IS NOT NULL
+      AND kind IN ('provision_ct','provision_dns','suspend_ct','resume_ct','resize_ct','terminate_ct')")
+  -- A pre-Brick-1 RUNNING provision_ct with any missing/blank lease component can
+  -- never expire (the stale check needs a lease) — fence it into the operator-visible
+  -- blocked state once (idempotent thereafter). AFTER the lane backfill, BEFORE the
+  -- triggers (Codex P1/P2).
+  db_exec("UPDATE jobs SET status = 'abandoned', reconcile = 1, lease_token = NULL,
+    lease_expires_at = NULL, error = 'pre-Brick-1 running job, no lease — needs reconcile', updated = ?1
+    WHERE kind = 'provision_ct' AND status = 'running'
+      AND (lease_token IS NULL OR lease_token = '' OR lease_expires_at IS NULL OR lease_expires_at = '')", [biz_now()])
+  -- Active-target unique index + a fail-CLOSED marker. biz_init runs EVERY request,
+  -- so an unconditional CREATE would brick the vhost on a pre-existing duplicate
+  -- lane. Preflight; create when clean (and clear the marker); else set a SINGLE
+  -- marker row (INSERT OR IGNORE = no write churn) that bp_claim + the provision
+  -- enqueue read to pause PROVISIONING only, leaving the rest of billing working
+  -- (Codex P1). A clean db always creates + clears.
+  -- biz_settings is created further down, but the Brick 1 marker needs it NOW — a
+  -- fresh vhost db would otherwise fail its first biz_init with no-such-table (Codex
+  -- P1). Idempotent; the later CREATE is a no-op.
+  db_exec("CREATE TABLE IF NOT EXISTS biz_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+  $dup = db_query("SELECT conflict_class, target_key FROM jobs
+    WHERE conflict_class IS NOT NULL AND target_key IS NOT NULL
+      AND (status IN ('pending','running') OR reconcile = 1)
+    GROUP BY conflict_class, target_key HAVING COUNT(*) > 1 LIMIT 1")
+  if length($dup) == 0 then
+    db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_target ON jobs(conflict_class, target_key)
+      WHERE conflict_class IS NOT NULL AND target_key IS NOT NULL
+        AND (status IN ('pending','running') OR reconcile = 1)")
+    db_exec("DELETE FROM biz_settings WHERE key = 'brick1_lane_conflict'")
+  else
+    -- INSERT OR IGNORE: the marker's PRESENCE is the functional signal (bp_claim +
+    -- enqueue fail closed on it); avoid a write on every conflicted request (Codex P2).
+    db_exec("INSERT OR IGNORE INTO biz_settings (key, value) VALUES ('brick1_lane_conflict', ?1)",
+            [("" .. $dup[0]["conflict_class"]) .. "/" .. ("" .. $dup[0]["target_key"])])
+  end
+  -- Trigger definitions are MUTABLE but CREATE TRIGGER IF NOT EXISTS won't replace an
+  -- older same-named trigger a prior revision installed. Use _v2 names + DROP the v1
+  -- names, so an upgraded db actually gets the corrected definitions (Codex P1).
+  db_exec("DROP TRIGGER IF EXISTS trg_jobs_lease_ins")
+  db_exec("DROP TRIGGER IF EXISTS trg_jobs_lease_upd")
+  db_exec("DROP TRIGGER IF EXISTS trg_jobs_lane_ins")
+  db_exec("DROP TRIGGER IF EXISTS trg_jobs_lane_upd")
+  db_exec("DROP TRIGGER IF EXISTS trg_jobs_reconcile_ins")
+  db_exec("DROP TRIGGER IF EXISTS trg_jobs_reconcile_upd")
+  -- Brick 8: v3 supersedes v2 (adds provision_dns to the lease + lane contracts).
+  db_exec("DROP TRIGGER IF EXISTS trg_jobs_lease_ins_v2")
+  db_exec("DROP TRIGGER IF EXISTS trg_jobs_lease_upd_v2")
+  db_exec("DROP TRIGGER IF EXISTS trg_jobs_lane_ins_v2")
+  db_exec("DROP TRIGGER IF EXISTS trg_jobs_lane_upd_v2")
+  db_exec("DROP TRIGGER IF EXISTS trg_jobs_reconcile_ins_v2")
+  db_exec("DROP TRIGGER IF EXISTS trg_jobs_reconcile_upd_v2")
+  -- LEASE triggers: the leased worker kinds — provision_ct AND provision_dns (Brick 8).
+  db_exec("CREATE TRIGGER IF NOT EXISTS trg_jobs_lease_ins_v3 BEFORE INSERT ON jobs
+    WHEN NEW.kind IN ('provision_ct','provision_dns') AND NEW.status = 'running'
+      AND (NEW.lease_token IS NULL OR NEW.lease_token = '' OR NEW.lease_expires_at IS NULL OR NEW.lease_expires_at = '')
+    BEGIN SELECT RAISE(ABORT, 'running worker job requires lease_token + lease_expires_at'); END")
+  db_exec("CREATE TRIGGER IF NOT EXISTS trg_jobs_lease_upd_v3 BEFORE UPDATE ON jobs
+    WHEN NEW.kind IN ('provision_ct','provision_dns') AND NEW.status = 'running'
+      AND (NEW.lease_token IS NULL OR NEW.lease_token = '' OR NEW.lease_expires_at IS NULL OR NEW.lease_expires_at = '')
+    BEGIN SELECT RAISE(ABORT, 'running worker job requires lease_token + lease_expires_at'); END")
+  -- LANE triggers: every service-mutation kind (CT lifecycle + provision_dns) must carry
+  -- the service lane so idx_jobs_active_target serializes them per service. renew_domain
+  -- excluded (its own domain lane).
+  db_exec("CREATE TRIGGER IF NOT EXISTS trg_jobs_lane_ins_v3 BEFORE INSERT ON jobs
+    WHEN NEW.kind IN ('provision_ct','provision_dns','suspend_ct','resume_ct','resize_ct','terminate_ct')
+      AND (NEW.status IN ('pending','running') OR NEW.reconcile = 1)
+      AND (NEW.conflict_class IS NULL OR NEW.conflict_class = '' OR NEW.target_key IS NULL OR NEW.target_key = '')
+    BEGIN SELECT RAISE(ABORT, 'active service job requires conflict_class + target_key'); END")
+  db_exec("CREATE TRIGGER IF NOT EXISTS trg_jobs_lane_upd_v3 BEFORE UPDATE ON jobs
+    WHEN NEW.kind IN ('provision_ct','provision_dns','suspend_ct','resume_ct','resize_ct','terminate_ct')
+      AND (NEW.status IN ('pending','running') OR NEW.reconcile = 1)
+      AND (NEW.conflict_class IS NULL OR NEW.conflict_class = '' OR NEW.target_key IS NULL OR NEW.target_key = '')
+    BEGIN SELECT RAISE(ABORT, 'active service job requires conflict_class + target_key'); END")
+  db_exec("CREATE TRIGGER IF NOT EXISTS trg_jobs_reconcile_ins_v3 BEFORE INSERT ON jobs
+    WHEN NEW.reconcile NOT IN (0,1) BEGIN SELECT RAISE(ABORT, 'reconcile must be 0 or 1'); END")
+  db_exec("CREATE TRIGGER IF NOT EXISTS trg_jobs_reconcile_upd_v3 BEFORE UPDATE ON jobs
+    WHEN NEW.reconcile NOT IN (0,1) BEGIN SELECT RAISE(ABORT, 'reconcile must be 0 or 1'); END")
+  -- Brick 2: a pending provision_ct whose service row is gone can NEVER be claimed
+  -- (bp_claim's inner JOIN hides it forever). It was never claimed -> no external
+  -- work started: fail it, free its reservation, audit — atomically, one-shot (only
+  -- pending rows, so later biz_init calls do nothing). NOT IN would let NULL evade
+  -- it, so use IS NULL OR NOT EXISTS (Codex).
+  -- Brick 8: covers provision_dns too (Codex MAJOR 5) — a pending DNS job whose service
+  -- vanished is equally unclaimable (the claim inner-join hides it) and would hold its
+  -- lane forever. DNS owns no ip_pool reservation, so the pool free is a no-op for it.
+  $svcgone = db_query("SELECT id FROM jobs WHERE kind IN ('provision_ct','provision_dns') AND status = 'pending'
+    AND (service_id IS NULL OR NOT EXISTS (SELECT 1 FROM services s WHERE s.id = jobs.service_id))")
+  if length($svcgone) > 0 then
+    db_exec("BEGIN IMMEDIATE")
+    try
+      for each $o in $svcgone
+        db_exec("UPDATE jobs SET status = 'failed', error = 'pending worker job with no service row — unclaimable',
+                 updated = ?2 WHERE id = ?1 AND kind IN ('provision_ct','provision_dns') AND status = 'pending'", [$o.id, biz_now()])
+        $oc = db_query("SELECT changes() AS n")
+        if to_number($oc[0].n) == 1 then
+          db_exec("UPDATE ip_pool SET status = 'free', service_id = NULL, node = '', vmid = NULL,
+                   reserved_at = NULL, reserved_by_job = NULL WHERE reserved_by_job = ?1", [$o.id])
+          biz_audit("system", "brick2_orphan_failed", "jobs", $o.id, "missing service row")
+        end
+      end
+      db_exec("COMMIT")
+    catch $e
+      try db_exec("ROLLBACK") catch $e2 end
+    end
+  end
+
+  db_exec("CREATE TABLE IF NOT EXISTS payment_attempts (
+    id INTEGER PRIMARY KEY,
+    invoice_id INTEGER NOT NULL REFERENCES invoices(id),
+    gateway TEXT NOT NULL CHECK(gateway IN ('stripe','paypal')),
+    kind TEXT NOT NULL CHECK(kind IN ('checkout','offsession','paypal_order')),
+    idempotency_key TEXT UNIQUE NOT NULL,
+    external_id TEXT NOT NULL DEFAULT '',
+    redirect_url TEXT NOT NULL DEFAULT '',
+    expires_at TEXT,
+    amount_cents INTEGER NOT NULL, currency TEXT NOT NULL DEFAULT 'aud',
+    mode TEXT NOT NULL CHECK(mode IN ('test','live')),
+    status TEXT NOT NULL DEFAULT 'created'
+      CHECK(status IN ('created','succeeded','failed','expired','superseded')),
+    attempt_no INTEGER NOT NULL DEFAULT 1, next_attempt_at TEXT,
+    created TEXT, updated TEXT)")
+  db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_pa_external ON payment_attempts(gateway, external_id)
+    WHERE external_id != ''")
+  db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_pa_active ON payment_attempts(invoice_id, gateway, kind)
+    WHERE status = 'created'")
+
+  db_exec("CREATE TABLE IF NOT EXISTS renewal_keys (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(kind IN ('service','domain')),
+    ref_id INTEGER NOT NULL, period_start TEXT NOT NULL,
+    invoice_id INTEGER NOT NULL REFERENCES invoices(id))")
+  db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_renewal_once ON renewal_keys(kind, ref_id, period_start)")
+
+  db_exec("CREATE TABLE IF NOT EXISTS rate_limits (
+    bucket TEXT NOT NULL, window_start TEXT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, window_start))")
+
+  db_exec("CREATE TABLE IF NOT EXISTS notification_events (
+    id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL REFERENCES invoices(id),
+    template TEXT NOT NULL, scheduled_for TEXT NOT NULL, sent_at TEXT)")
+  db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_notif_once
+    ON notification_events(invoice_id, template, scheduled_for)")
+
+  db_exec("CREATE TABLE IF NOT EXISTS biz_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+
+  -- workload indexes
+  db_exec("CREATE INDEX IF NOT EXISTS idx_svc_cust ON services(customer_id)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_svc_due ON services(status, next_due)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_dom_cust ON domains(customer_id)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_dom_due ON domains(status, next_due)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_inv_cust ON invoices(customer_id)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_inv_due ON invoices(status, due)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_item_inv ON invoice_items(invoice_id)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_item_svc ON invoice_items(service_id)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_item_dom ON invoice_items(domain_id)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_txn_inv ON transactions(invoice_id)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_txn_cust ON transactions(customer_id, at)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_credit_cust ON credit_ledger(customer_id)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_audit_ref ON audit(table_ref, row_id)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_jobs_sched ON jobs(status, next_attempt_at)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_rl_window ON rate_limits(window_start)")
+  db_exec("CREATE INDEX IF NOT EXISTS idx_notif_sched ON notification_events(sent_at, scheduled_for)")
+
+  -- invoice number sequence: new invoices start at 10001 (legacy ids < 7,390 imported as-is).
+  -- sqlite_sequence has a row only after the first AUTOINCREMENT insert; seed defensively.
+  $seq = db_query("SELECT seq FROM sqlite_sequence WHERE name = 'invoices'")
+  if length($seq) == 0 then
+    try db_exec("INSERT INTO sqlite_sequence(name, seq) VALUES ('invoices', 10000)") catch $e end
+  else
+    if to_number($seq[0].seq) < 10000 then
+      db_exec("UPDATE sqlite_sequence SET seq = 10000 WHERE name = 'invoices'")
+    end
+  end
+
+  -- house customer — owns domains/services not yet assigned to a real
+  -- customer (e.g. the pre-WHMCS domains). Identity is PINNED by id in
+  -- biz_settings.house_customer_id (Codex review round 2: keying by a
+  -- mutable email re-mints a house row whenever support_email changes).
+  -- One-shot adoption for pre-pin dbs: the historical hardcoded house email
+  -- first (pre-parameterisation dbs), then the tenant support address; else
+  -- mint with the tenant identity. Presentation (name/email) of a pinned
+  -- row is free to change — nothing here rewrites it.
+  -- fast path outside any tx; the adopt/mint decision runs inside one
+  -- BEGIN IMMEDIATE. Concurrency reality (Codex review round 5): webd
+  -- shares ONE connection per vhost with a PER-STATEMENT mutex, so a
+  -- racing request's BEGIN errors out ("transaction within transaction")
+  -- rather than interleaving a second mint — but its AUTOCOMMIT statements
+  -- CAN interleave into an open tx, so the minted id is taken from
+  -- db_exec's own return (last_insert_id, captured while the statement's
+  -- lock is held), never a separate SELECT last_insert_rowid(). The
+  -- statement-vs-transaction mutex scope is a platform follow-up
+  -- (webd db seam needs a true tx primitive).
+  $hid = to_number(biz_setting("house_customer_id"))
+  $have_house = false
+  if $hid != nil then
+    $hr = db_query("SELECT id FROM customers WHERE id = ?1", [$hid])
+    $have_house = length($hr) == 1
+  end
+  if not $have_house then
+    db_exec("BEGIN IMMEDIATE")
+    try
+      $hid2 = to_number(biz_setting("house_customer_id"))
+      $pinned = false
+      if $hid2 != nil then
+        $hr = db_query("SELECT id FROM customers WHERE id = ?1", [$hid2])
+        $pinned = length($hr) == 1
+      end
+      if not $pinned then
+        -- Legacy adoption: house_bootstrap_email (privately seeded) names the
+        -- HISTORICAL house-account address, so a restored/legacy DB whose
+        -- house_customer_id pin is missing re-adopts its existing house row
+        -- instead of minting a duplicate. "" = support email only.
+        $hbe = biz_setting("house_bootstrap_email")
+        if $hbe == "" then $hbe = biz_support_email() end
+        $hr = db_query("SELECT id FROM customers WHERE email IN (?1, ?2)
+                        ORDER BY id LIMIT 1", [$hbe, biz_support_email()])
+        if length($hr) == 1 then
+          biz_setting_set("house_customer_id", "" .. $hr[0].id)
+        else
+          $ins = db_exec("INSERT INTO customers (name, company, email, status, notes, created, updated)
+                   VALUES (?2 || ' (house)', ?2, ?1, 'active',
+                           'House account — holds domains/services pending assignment to a real customer.',
+                           ?3, ?3)", [biz_support_email(), biz_brand(), biz_now()])
+          biz_setting_set("house_customer_id", "" .. $ins["last_insert_id"])
+        end
+      end
+      db_exec("COMMIT")
+    catch $e
+      try db_exec("ROLLBACK") catch $e2 end
+    end
+  end
+
+  -- plan catalogue seed (matches the live public pricing page: base + per-unit)
+  db_exec("INSERT OR IGNORE INTO plans (code, name, units, price_cents) VALUES
+    ('lite', 'Lite', 3, 7900), ('standard', 'Standard', 6, 13900),
+    ('plus', 'Plus', 11, 23900), ('max', 'Max', 20, 41900)")
+
+  -- engine settings defaults (admin-editable via /biz/settings later)
+  biz_set_default("invoice_lead_days", "14")
+  biz_set_default("remind_before_days", "3")
+  biz_set_default("overdue_days", "3,10,17")
+  biz_set_default("suspend_flag_days", "14")
+  biz_set_default("stripe_mode", "test")
+  biz_set_default("paypal_mode", "test")
+  biz_set_default("sw_mode", "off")
+  biz_set_default("sw_reseller_id", "")
+  biz_set_default("sw_api_key", "")
+  -- Deployment-specific provisioning config: EMPTY by default (fail closed — no
+  -- provisioning until an operator seeds them; real values live in the private
+  -- overlay, never in this shared tree). Formats:
+  --   provision_allowed_domains: comma/space/newline-separated apex domains
+  --   provision_ip_pool: comma-separated "A.B.C.D-N" last-octet ranges (or single IPs)
+  --   provision_pve_hosts: comma-separated PVE host names; FIRST entry = form default
+  biz_set_default("provision_allowed_domains", "")
+  biz_set_default("provision_ip_pool", "")
+  biz_set_default("provision_pve_hosts", "")
+  biz_set_default("house_bootstrap_email", "")
+  -- customer domain price = SW wholesale renew + this markup %. Mark's call: 20%.
+  biz_set_default("domain_markup_pct", "20")
+  biz_set_default("seller_gst_registered", "0")
+  -- tenant-specific (bank account, legal seller identity): EMPTY by default —
+  -- the invoice hides its bank-transfer block until an admin fills this in
+  -- (never ship one tenant's bank details to another's customers)
+  biz_set_default("bank_details", "")
+  -- tick auth + mail safety: secret minted once (INSERT OR IGNORE keeps the first);
+  -- mail_mode off = the tick logs sends without sending (test = redirect to admin)
+  biz_set_default("tick_secret", biz_token())
+  -- provisiond_secret (Brick 6): a SEPARATE, rotatable shared secret used ONLY by
+  -- the provision/reconcile worker endpoints (X-Provision-Secret). Kept distinct from
+  -- tick_secret so the broadly-distributed tick credential is never handed to the
+  -- provisiond identity — its blast radius is one namespace of endpoints, and it can
+  -- be rotated without touching the tick timer. Delivered to cosmix-provisiond as a
+  -- root-owned 0440 file / systemd credential, never via billing-DB read.
+  biz_set_default("provisiond_secret", biz_token())
+  biz_set_default("mail_mode", "off")
+  biz_set_default("tick_enabled", "0")
+end
+
+-- ---------------------------------------------------------------- settings
+
+function biz_set_default($k, $v)
+  db_exec("INSERT OR IGNORE INTO biz_settings (key, value) VALUES (?1, ?2)", [$k, $v])
+end
+
+function biz_setting($k)
+  $r = db_query("SELECT value FROM biz_settings WHERE key = ?1", [$k])
+  if length($r) == 0 then return "" end
+  return "" .. $r[0].value
+end
+
+function biz_setting_set($k, $v)
+  db_exec("INSERT INTO biz_settings (key, value) VALUES (?1, ?2)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value", [$k, $v])
+end
+
+-- Provisioning fail-closed gate: "" = ok, else a human reason. Blocks on a failed Brick-8
+-- schema migration (unmigrated/partial schema) OR the Brick-1 unresolved duplicate lane.
+-- claim (bp_claim/bp_claim_next) + enqueue all consult this (Codex Brick-8 round-2 MAJOR 6).
+function biz_provisioning_blocked()
+  if biz_setting("brick8_migration_failed") != "" then
+    return "schema migration failed — provisioning gated until repaired"
+  end
+  $lc = biz_setting("brick1_lane_conflict")
+  if $lc != "" then return "unresolved duplicate active lane " .. $lc end
+  return ""
+end
+
+-- Non-regex validators. webd's embedded Mix is a feature-gated SUBSET with NO regex
+-- feature — regex_match is undefined there and 500s the handler (surfaced by the Brick-6
+-- live panel enqueue, which was the first real POST through this path; earlier tests
+-- seeded jobs directly and never hit it). These string-scan equivalents run identically
+-- in the embedded handlers and standalone mix. See feedback_webd_embedded_mix_feature_gated.
+
+-- A single DNS label: 1-63 chars, [a-z0-9] plus internal hyphens (never first/last).
+-- Assumes lowercased input (every caller lower()s first, as the old regex did).
+function biz_is_dns_label($s)
+  $n = length($s)
+  if $n < 1 or $n > 63 then return false end
+  $i = 0
+  while $i < $n
+    $c = substr($s, $i, 1)
+    $alnum = ($c >= "a" and $c <= "z") or ($c >= "0" and $c <= "9")
+    if not ($alnum or $c == "-") then return false end
+    if $c == "-" and ($i == 0 or $i == $n - 1) then return false end
+    $i = $i + 1
+  end
+  return true
+end
+
+-- A dotted domain: >=2 labels, each a valid DNS label. Overall length caps are the
+-- caller's (245 for a service domain, 253 for a full fqdn) — matching the old regexes.
+function biz_valid_domain($d)
+  $d = lower(trim("" .. $d))
+  $parts = split($d, ".")
+  if length($parts) < 2 then return false end
+  for each $p in $parts
+    if not biz_is_dns_label($p) then return false end
+  end
+  return true
+end
+
+-- Provision-pool membership: $ip must fall inside one of the ranges declared in
+-- the provision_ip_pool setting — comma-separated entries of a full start IP
+-- with an optional "-N" end bound on the LAST octet ("198.51.100.100-130" or a
+-- single "198.51.100.7"). STRICT whole-spec parse: an empty/unset spec, or ANY
+-- malformed entry (bad octet, lo>hi, end bound >255, dangling "-"), poisons the
+-- WHOLE spec and denies everything — a typo'd pool fails loudly instead of
+-- half-working. One deliberate leniency: BLANK entries (doubled/leading/
+-- trailing separators, e.g. a newline-joined list's tail) are skipped, not
+-- treated as malformed. The ip_pool table availability check is the
+-- authoritative per-address gate; this is the format/range sanity check.
+function biz_valid_pool_ip($ip)
+  $ip = trim("" .. $ip)
+  $oct = split($ip, ".")
+  if length($oct) != 4 then return false end
+  for each $o in $oct
+    $v = to_number($o)
+    if $v == nil or $v < 0 or $v > 255 or ("" .. $v) != $o then return false end
+  end
+  $last = to_number($oct[3])
+  $spec = replace(replace(biz_setting("provision_ip_pool"), "\n", ","), ";", ",")
+  $ranges = []
+  for each $raw_ent in split($spec, ",")
+    $ent = trim($raw_ent)
+    if $ent != "" then
+      $parts = split($ent, "-")
+      if length($parts) > 2 then return false end
+      $lo = trim($parts[0])
+      $lp = split($lo, ".")
+      if length($lp) != 4 then return false end
+      for each $o in $lp
+        $v = to_number($o)
+        if $v == nil or $v < 0 or $v > 255 or ("" .. $v) != $o then return false end
+      end
+      $lov = to_number($lp[3])
+      $hi = $lov
+      if length($parts) == 2 then
+        $hs = trim($parts[1])
+        $hv = to_number($hs)
+        if $hv == nil or ("" .. $hv) != $hs then return false end
+        $hi = $hv
+      end
+      if $hi < $lov or $hi > 255 then return false end
+      push($ranges, [$lp[0] .. "." .. $lp[1] .. "." .. $lp[2] .. ".", $lov, $hi])
+    end
+  end
+  if length($ranges) == 0 then return false end
+  for each $r in $ranges
+    if starts_with($ip, $r[0]) and $last >= $r[1] and $last <= $r[2] then return true end
+  end
+  return false
+end
+
+-- The configured PVE hosts (provision_pve_hosts, comma-separated). First entry
+-- is the provision-form default. Empty = provisioning unconfigured (fail closed).
+function biz_pve_hosts()
+  $raw = lower(biz_setting("provision_pve_hosts"))
+  $raw = replace(replace(replace($raw, "\n", ","), " ", ","), ";", ",")
+  $out = []
+  for each $p in split($raw, ",")
+    $h = trim($p)
+    if $h != "" then push($out, $h) end
+  end
+  return $out
+end
+
+-- First address of the first configured pool range — UI placeholder text only.
+function biz_pool_hint()
+  $spec = replace(biz_setting("provision_ip_pool"), " ", "")
+  $ents = split($spec, ",")
+  if length($ents) == 0 then return "pool IP" end
+  $parts = split(trim($ents[0]), "-")
+  if length($parts) == 0 then return "pool IP" end
+  $first = trim($parts[0])
+  if $first == "" then return "pool IP" end
+  return $first
+end
+
+-- ---------------------------------------------------------------- money & dates
+
+-- cents -> "$1,234.56" (AUD display; invoices render "Invoice", never "Tax Invoice" — D1)
+function fmt_aud($cents)
+  $n = to_number($cents)
+  if $n == nil then $n = 0 end
+  $neg = ""
+  if $n < 0 then
+    $neg = "-"
+    $n = 0 - $n
+  end
+  $d = floor($n / 100)
+  $c = $n - $d * 100
+  $cs = "" .. $c
+  if $c < 10 then $cs = "0" .. $c end
+  return $neg .. "$" .. format_number($d) .. "." .. $cs
+end
+
+-- catalogue formula: $19/yr base + $20/yr per unit → cents
+function price_for_units($units)
+  $u = to_number($units)
+  if $u == nil then return nil end
+  return 1900 + 2000 * $u
+end
+
+function biz_now()
+  return date_format(time(), "%Y-%m-%dT%H:%M:%S")
+end
+
+-- biz_now() minus N seconds — the ONLY correct way to build an age bound
+-- for comparing against biz_now()-stamped columns in SQL. SQLite's
+-- datetime('now')/strftime('now') are UTC while biz_now() is LOCAL time:
+-- an SQL-side bound is ~10h skewed (AEST) and space-vs-'T' formatted, so a
+-- same-day string compare silently never matches. Compute the bound in Mix
+-- and BIND it.
+function biz_now_ago($seconds)
+  return date_format(time() - $seconds, "%Y-%m-%dT%H:%M:%S")
+end
+
+function biz_today()
+  return date_format(time(), "%Y-%m-%d")
+end
+
+-- civil-date arithmetic via SQLite (single source of date math)
+function biz_date_add($date, $modifier)
+  $r = db_query("SELECT date(?1, ?2) AS d", [$date, $modifier])
+  return "" .. $r[0].d
+end
+
+-- ---------------------------------------------------------------- audit & tokens
+
+function biz_audit($actor, $action, $table_ref, $row_id, $detail)
+  db_exec("INSERT INTO audit (at, actor, action, table_ref, row_id, detail)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+          [biz_now(), "" .. $actor, "" .. $action, "" .. $table_ref, $row_id, "" .. $detail])
+end
+
+-- Parent-row existence probe for dependent writers. Every INSERT/UPDATE that
+-- references a customers/services row must re-check the parent INSIDE its own
+-- BEGIN IMMEDIATE (webd runs SQLite with FKs off, and the delete paths hold their
+-- guard+delete in one tx — so a racing delete commits before or after the writer,
+-- never interleaved, and a vanished parent is caught here). Table is allowlisted:
+-- author-literal callers only, never request data.
+function biz_row_exists($table, $id)
+  if $table != "customers" and $table != "services" then
+    die("biz_row_exists: table not allowlisted: " .. $table)
+  end
+  $r = db_query("SELECT id FROM " .. $table .. " WHERE id = ?1", [$id])
+  return length($r) == 1
+end
+
+-- 32-hex public token (invoice view/pay links)
+function biz_token()
+  return replace(replace(replace(uuid() .. uuid(), "-", ""), "{", ""), "}", "")
+end
+
+-- ---------------------------------------------------------------- base URL
+
+-- The vhost's public origin for links we mint (gateway return URLs, portal
+-- magic links, order links). Deployment config, NEVER the request Host header:
+-- $SITE.origin when set, else https://<fqdn> (Codex ruling 2026-07-17 Q6).
+function biz_base_url()
+  if $SITE["origin"] != nil and ("" .. $SITE["origin"]) != "" then
+    return "" .. $SITE["origin"]
+  end
+  return "https://" .. ("" .. $SITE["fqdn"])
+end
+
+function biz_shop_enabled()
+  return $SITE["features"] != nil and $SITE["features"]["shop"] == true
+end
+
+-- ---------------------------------------------------------------- tenant identity
+
+-- The billing surfaces are MULTI-TENANT (several vhosts share this tree):
+-- seller/support/mail identity must NEVER be a
+-- code literal (Codex multi-tenant review — one tenant's customer must not
+-- see another tenant's name, ABN, or bank details). Overridable per-vhost via
+-- biz_settings (brand_name / support_email / seller_html /
+-- mail_test_redirect); defaults derive from $SITE.
+
+-- Brand for mail From-names, subjects, and body copy.
+function biz_brand()
+  $b = biz_setting("brand_name")
+  if $b != "" then return $b end
+  return "" .. $SITE["title"]
+end
+
+-- Human support address (invoice footer, portal error copy).
+function biz_support_email()
+  $e = biz_setting("support_email")
+  if $e != "" then return $e end
+  return "admin@" .. ("" .. $SITE["fqdn"])
+end
+
+-- The invoice "From" party block (HTML). Tenants with a legal identity
+-- (ABN, trading name) set seller_html in /biz/settings; default is the
+-- brand + support address.
+function biz_seller_html()
+  $s = biz_setting("seller_html")
+  if $s != "" then return $s end
+  return esc(biz_brand()) .. "<br>" .. esc(biz_support_email())
+end
+
+-- Where mail_mode=test redirects all outgoing mail.
+function biz_mail_redirect()
+  $r = biz_setting("mail_test_redirect")
+  if $r != "" then return $r end
+  return biz_support_email()
+end
+
+-- Where a customer VIEWS an invoice: the shop order page (/order/<t>) when
+-- the invoice actually IS a shop order (product items), else the formal
+-- invoice (/invoice/<t>) — a plain admin/service invoice on a shop vhost
+-- must not be sent to a page that would 404 it. Gateway success/cancel URLs
+-- and mail links all mint through here. product_id only exists where
+-- shop_init has run, hence the feature gate before the query.
+function biz_invoice_url($token)
+  if biz_shop_enabled() then
+    -- bootstrap-order guard: on a fresh shop db where no shop page has run
+    -- shop_init yet, invoice_items has no product_id column — such a db has
+    -- no orders either, so the invoice path is the correct answer, not a 500
+    $r = []
+    try
+      $r = db_query("SELECT 1 AS x FROM invoices i JOIN invoice_items ii
+                     ON ii.invoice_id = i.id AND ii.product_id IS NOT NULL
+                     WHERE i.token = ?1 LIMIT 1", ["" .. $token])
+    catch $e
+    end
+    if length($r) == 1 then
+      return biz_base_url() .. "/order/" .. ("" .. $token)
+    end
+  end
+  return biz_base_url() .. "/invoice/" .. ("" .. $token)
+end
+
+-- Issue a single-use magic-link token (set|reset). Invalidates any older UNUSED
+-- token of the same purpose for this customer (Codex), stores sha256(token) at
+-- rest, returns the RAW token for the caller to email. webd redeems it.
+function biz_issue_customer_token($customer_id, $purpose, $ttl_hours)
+  $raw = biz_token()
+  $hash = hash_sha256($raw)
+  db_exec("UPDATE customer_tokens SET used_at = ?3 WHERE customer_id = ?1
+           AND purpose = ?2 AND used_at IS NULL",
+          [$customer_id, "" .. $purpose, "invalidated:" .. biz_now()])
+  db_exec("INSERT INTO customer_tokens (customer_id, token_sha256, purpose, expires_at, created)
+           VALUES (?1, ?2, ?3, datetime('now', '+' || ?4 || ' hours'), ?5)",
+          [$customer_id, $hash, "" .. $purpose, "" .. $ttl_hours, biz_now()])
+  return $raw
+end
+
+-- ---------------------------------------------------------------- mail
+
+-- One-mailbox address check without regex (webd's Mix build has no regex): one
+-- '@', non-empty local part, a dotted domain, and no RFC822-smuggling char.
+function biz_is_plain_email($s)
+  $n = length($s)
+  if $n < 3 or $n > 254 then return false end
+  $at = pos("@", $s)
+  if $at <= 1 or $at == $n then return false end
+  $dom = substr($s, $at, $n - $at)
+  if pos("@", $dom) != 0 then return false end
+  $dot = pos(".", $dom)
+  if $dot <= 1 or $dot == length($dom) then return false end
+  $bad = " ,<>\";:\t"
+  $i = 0
+  while $i < $n
+    if pos(substr($s, $i, 1), $bad) != 0 then return false end
+    $i = $i + 1
+  end
+  return true
+end
+
+-- Session-less transactional send on the jmap seam. Returns {ok, error,
+-- skipped, indeterminate}. `indeterminate` is true when the submission
+-- OUTCOME IS UNKNOWN: a transport error at/after the EmailSubmission/set
+-- attempt, OR a post-attempt response that neither confirms (created.s)
+-- nor explicitly refuses (notCreated.s) — the message may have been
+-- accepted, so the caller must treat the mail as POSSIBLY DELIVERED
+-- (never invalidate a token/link it carried). Failures before the attempt,
+-- and an explicit notCreated.s refusal, are definite: nothing was sent.
+-- mail_mode gates: off → skipped (logged), test → redirect to
+-- biz_mail_redirect() (default: the tenant support address), live → real.
+-- The from-identity is whatever the jmap seam authenticates as (billing@ on
+-- an anon public_read route; the admin account on an admin route).
+function biz_mail($to, $subject, $body)
+  $mode = biz_setting("mail_mode")
+  if $mode == "" or $mode == "off" then
+    return { ok: true, error: "", skipped: true, indeterminate: false }
+  end
+  $rcpt = $to
+  if $mode == "test" then
+    $rcpt = biz_mail_redirect()
+    $subject = "[TEST->" .. $to .. "] " .. $subject
+  end
+  -- flips true immediately before the EmailSubmission/set attempt: a
+  -- transport error caught after that point is INDETERMINATE (the server
+  -- may have accepted the submission and only the response was lost)
+  $at_submission = false
+  try
+    $ir = jmap("Identity/get", {})
+    $il = $ir["list"]
+    if $il == nil or length($il) == 0 then
+      return { ok: false, error: "no send identity", skipped: false, indeterminate: false }
+    end
+    $identid = "" .. $il[0]["id"]
+    $from = "" .. $il[0]["email"]
+    $mr = jmap("Mailbox/get", {})
+    $sentid = ""
+    $inboxid = ""
+    for each $mb in $mr["list"]
+      if ("" .. $mb["role"]) == "sent" then $sentid = "" .. $mb["id"] end
+      if ("" .. $mb["role"]) == "inbox" then $inboxid = "" .. $mb["id"] end
+    end
+    if $sentid == "" then $sentid = $inboxid end
+    if $sentid == "" then
+      return { ok: false, error: "no mailbox for Email create", skipped: false, indeterminate: false }
+    end
+    $subj = replace(replace("" .. $subject, "\r", " "), "\n", " ")
+    $rc = trim(replace(replace("" .. $rcpt, "\r", ""), "\n", ""))
+    if not biz_is_plain_email($rc) then
+      return { ok: false, error: "invalid recipient address", skipped: false, indeterminate: false }
+    end
+    $msg = "From: " .. replace(replace(biz_brand(), "\r", ""), "\n", "") .. " Billing <" .. $from .. ">\r\n"
+    $msg = $msg .. "To: <" .. $rc .. ">\r\n"
+    $msg = $msg .. "Subject: " .. $subj .. "\r\n"
+    $msg = $msg .. "Date: " .. date_format(time(), "%a, %d %b %Y %H:%M:%S %z") .. "\r\n"
+    $msg = $msg .. "MIME-Version: 1.0\r\n"
+    $msg = $msg .. "Content-Type: text/plain; charset=utf-8\r\n"
+    $msg = $msg .. "Content-Transfer-Encoding: 8bit\r\n\r\n"
+    $msg = $msg .. replace($body, "\n", "\r\n")
+    $blob = jmap_upload($msg, "message/rfc822")
+    $mbids = {}
+    $mbids[$sentid] = true
+    $cr = jmap("Email/set", { create: { m: { mailboxIds: $mbids, keywords: { "$seen": true }, blobId: $blob } } })
+    if $cr["created"] == nil or $cr["created"]["m"] == nil then
+      return { ok: false, error: "Email/set notCreated", skipped: false, indeterminate: false }
+    end
+    $emailid = "" .. $cr["created"]["m"]["id"]
+    $at_submission = true
+    $sr = jmap("EmailSubmission/set", { create: { s: { emailId: $emailid, identityId: $identid } } })
+    if $sr["created"] != nil and $sr["created"]["s"] != nil then
+      return { ok: true, error: "", skipped: false, indeterminate: false }
+    end
+    -- post-attempt response without created.s: ONLY an explicit notCreated.s
+    -- is a definite server refusal; any other shape (semantically incomplete
+    -- response, missing maps) leaves the submission outcome UNKNOWN — the
+    -- mail may have gone. Callers must preserve anything the mail carried.
+    if $sr["notCreated"] != nil and $sr["notCreated"]["s"] != nil then
+      return { ok: false, error: "EmailSubmission notCreated", skipped: false, indeterminate: false }
+    end
+    return { ok: false, error: "EmailSubmission response incomplete — outcome unknown", skipped: false, indeterminate: true }
+  catch $e
+    return { ok: false, error: "" .. $e, skipped: false, indeterminate: $at_submission }
+  end
+end
+
+-- ---------------------------------------------------------------- rate limit
+
+-- Fixed-window rate limiter. Returns true while the count for this window is
+-- WITHIN $cap (so the call that hits $cap+1 returns false). $window_secs picks
+-- the window granularity; window_start is the ISO of the window's start so the
+-- tick's `< datetime(now,'-2 days')` sweep clears old rows across all windows.
+-- The counter increments on EVERY call (caller must invoke it for both the
+-- exists and not-exists paths, or the limiter itself becomes an oracle).
+function bp_rate_ok($bucket, $cap, $window_secs)
+  $wstart = floor(time() / $window_secs) * $window_secs
+  $ws = date_format($wstart, "%Y-%m-%dT%H:%M:%S")
+  db_exec("INSERT INTO rate_limits (bucket, window_start, count) VALUES (?1, ?2, 1)
+           ON CONFLICT(bucket, window_start) DO UPDATE SET count = count + 1",
+          [$bucket, $ws])
+  $r = db_query("SELECT count FROM rate_limits WHERE bucket = ?1 AND window_start = ?2",
+                [$bucket, $ws])
+  return to_number($r[0].count) <= $cap
+end
+
+-- ---------------------------------------------------------------- credit
+
+-- Net ledgered money on an invoice (payments − refunds). The shared truth
+-- for every "has anything been paid yet?" gate: the /pay partial fence, the
+-- off-session auto-charge guard, and the PayPal capture guard all read this.
+function biz_net_paid_cents($invoice_id)
+  $s = db_query("SELECT COALESCE(SUM(CASE kind WHEN 'payment' THEN amount_cents
+                 WHEN 'refund' THEN -amount_cents ELSE 0 END), 0) AS paid
+                 FROM transactions WHERE invoice_id = ?1", [$invoice_id])
+  return to_number($s[0].paid)
+end
+
+function credit_balance($customer_id)
+  $r = db_query("SELECT COALESCE(SUM(delta_cents), 0) AS bal FROM credit_ledger
+                 WHERE customer_id = ?1", [$customer_id])
+  return to_number($r[0].bal)
+end
+
+-- ---------------------------------------------------------------- the money path
+
+-- The paid-transition side effects, shared by biz_apply_payment and
+-- biz_settle_if_zero. MUST be called inside an open transaction, immediately
+-- after a changes()=1 guarded open->paid flip:
+--   services on the invoice advance next_due +1yr FROM PREVIOUS VALUE;
+--   domains only ENQUEUE a renew_domain job (registrar fulfillment advances
+--   domain dates — never payment).
+function biz_advance_renewals($invoice_id)
+  $svc_items = db_query("SELECT DISTINCT service_id FROM invoice_items
+                         WHERE invoice_id = ?1 AND service_id IS NOT NULL", [$invoice_id])
+  for each $it in $svc_items
+    db_exec("UPDATE services SET next_due = date(next_due, '+1 year'), updated = ?2
+             WHERE id = ?1 AND next_due IS NOT NULL", [$it.service_id, biz_now()])
+  end
+  $dom_items = db_query("SELECT DISTINCT domain_id FROM invoice_items
+                         WHERE invoice_id = ?1 AND domain_id IS NOT NULL", [$invoice_id])
+  for each $it in $dom_items
+    try
+      db_exec("INSERT INTO jobs (kind, domain_id, invoice_id, status, created, updated)
+               VALUES ('renew_domain', ?1, ?2, 'pending', ?3, ?3)",
+              [$it.domain_id, $invoice_id, biz_now()])
+    catch $e
+      -- active job already exists — fine
+    end
+  end
+end
+
+-- Settle a fully-credited OPEN invoice (total_cents = 0 after credit application):
+-- same guarded paid transition + renewal side effects as a payment, no transaction
+-- row (the money movement is the credit_ledger spend at issue). Owns its BEGIN.
+function biz_settle_if_zero($invoice_id, $actor)
+  $flipped = false
+  db_exec("BEGIN IMMEDIATE")
+  try
+    db_exec("UPDATE invoices SET status = 'paid', paid_at = ?2, updated = ?2
+             WHERE id = ?1 AND status = 'open' AND total_cents = 0", [$invoice_id, biz_now()])
+    $ch = db_query("SELECT changes() AS n")
+    if to_number($ch[0].n) == 1 then
+      $flipped = true
+      biz_advance_renewals($invoice_id)
+    end
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return { ok: false, error: "settle failed: " .. $e, flipped: false }
+  end
+  if $flipped then
+    biz_audit($actor, "credit_settled", "invoices", $invoice_id, "fully credited")
+  end
+  return { ok: true, error: "", flipped: $flipped }
+end
+
+-- Apply a payment to an OPEN invoice. THE ONLY code path that flips open->paid and
+-- advances renewals (plan §2 invariants):
+--   1. insert transaction (dedupe index absorbs gateway replays)
+--   2. paid_sum >= total  →  flip open->paid AT MOST ONCE (guarded UPDATE)
+--   3. on flip: SERVICE items advance next_due +1yr FROM PREVIOUS VALUE;
+--      DOMAIN items only ENQUEUE a renew_domain job (registrar fulfillment
+--      advances domain dates — never payment)
+--   4. side effects (receipt mail) belong to the CALLER, after this returns ok
+-- Returns { ok, error, flipped, duplicate }.
+function biz_apply_payment($invoice_id, $gateway, $txn_ref, $amount_cents, $fee_cents, $detail, $actor)
+  $amt = to_number($amount_cents)
+  if $amt == nil or $amt <= 0 then
+    return { ok: false, error: "bad amount", flipped: false, duplicate: false }
+  end
+  -- a blank reference would bypass the (gateway, txn_ref) dedupe index (it only
+  -- covers txn_ref != '') — refuse globally so no caller can double-apply blind.
+  if ("" .. $txn_ref) == "" then
+    return { ok: false, error: "payment reference required", flipped: false, duplicate: false }
+  end
+
+  -- ALL reads inside the write transaction: a concurrent apply on the same invoice
+  -- serializes on BEGIN IMMEDIATE and re-reads fresh state (Codex P0 review).
+  db_exec("BEGIN IMMEDIATE")
+  $flipped = false
+  try
+    $inv_rows = db_query("SELECT * FROM invoices WHERE id = ?1", [$invoice_id])
+    if length($inv_rows) == 0 then
+      db_exec("ROLLBACK")
+      return { ok: false, error: "no such invoice", flipped: false, duplicate: false }
+    end
+    $inv = $inv_rows[0]
+    if ("" .. $inv.status) != "open" then
+      db_exec("ROLLBACK")
+      return { ok: false, error: "invoice is " .. $inv.status .. ", not open", flipped: false, duplicate: false }
+    end
+
+    -- charge-reservation fence, INSIDE the write tx (transaction-level
+    -- mutual exclusion with the gateway paths, which BEGIN IMMEDIATE around
+    -- their own recheck+attempt-insert): a MANUAL recording must not commit
+    -- while a live gateway attempt exists — the customer may be mid-checkout
+    -- at the full total. Webhook applies are exempt: they exist precisely to
+    -- resolve those attempts. The route-level pre-check in inv_post_pay is
+    -- only the friendly-message layer; THIS is the gate.
+    if ("" .. $actor) != "webhook" then
+      $fence = db_query("SELECT id FROM payment_attempts WHERE invoice_id = ?1
+                         AND status = 'created' AND updated > ?2
+                         LIMIT 1", [$invoice_id, biz_now_ago(86400)])
+      if length($fence) > 0 then
+        db_exec("ROLLBACK")
+        return { ok: false, error: "live gateway attempt exists — record after it resolves or expires", flipped: false, duplicate: false }
+      end
+    end
+
+    -- 1. ledger row (unique (gateway, txn_ref) absorbs replays)
+    $dup = false
+    try
+      db_exec("INSERT INTO transactions (invoice_id, customer_id, gateway, txn_ref, kind,
+               amount_cents, fee_cents, at, detail)
+               VALUES (?1, ?2, ?3, ?4, 'payment', ?5, ?6, ?7, ?8)",
+              [$invoice_id, $inv.customer_id, "" .. $gateway, "" .. $txn_ref,
+               $amt, to_number($fee_cents), biz_now(), "" .. $detail])
+    catch $e
+      $dup = true
+    end
+    if $dup then
+      -- classify: a genuine SAME-invoice (gateway, txn_ref) collision is a
+      -- duplicate replay; the same reference on a DIFFERENT invoice means
+      -- THIS invoice's verified money is unledgered — audit loudly and
+      -- surface the error (the webhook caller acks it, retrying can't
+      -- resolve it; the manual caller shows it to the admin). Any other
+      -- insert failure surfaces as a plain error.
+      $seen = db_query("SELECT invoice_id FROM transactions WHERE gateway = ?1 AND txn_ref = ?2",
+                       ["" .. $gateway, "" .. $txn_ref])
+      db_exec("ROLLBACK")
+      if length($seen) > 0 then
+        if to_number($seen[0].invoice_id) == to_number($invoice_id) then
+          return { ok: true, error: "", flipped: false, duplicate: true }
+        end
+        biz_audit($actor, "payment_ref_collision", "invoices", $invoice_id,
+                  $gateway .. " " .. $txn_ref .. " " .. fmt_aud($amt) ..
+                  " already ledgered against INV-" .. $seen[0].invoice_id ..
+                  " — THIS invoice's payment is unledgered; manual reconciliation required")
+        return { ok: false, error: "reference already ledgered against INV-" .. $seen[0].invoice_id .. " — manual reconciliation required", flipped: false, duplicate: false }
+      end
+      return { ok: false, error: "transaction insert failed", flipped: false, duplicate: false }
+    end
+
+    -- 2. paid enough? (payments minus refunds; credit was applied at issue time)
+    $sums = db_query("SELECT COALESCE(SUM(CASE kind WHEN 'payment' THEN amount_cents
+                       WHEN 'refund' THEN -amount_cents ELSE 0 END), 0) AS paid
+                      FROM transactions WHERE invoice_id = ?1", [$invoice_id])
+    $paid = to_number($sums[0].paid)
+    -- an overpayment (e.g. a gateway session completed AFTER a partial bank
+    -- payment landed) is ledgered as reality — money moved — but flagged
+    -- LOUDLY for a manual refund; silently dropping the record would be worse
+    if $paid > to_number($inv.total_cents) then
+      biz_audit($actor, "overpayment_recorded", "invoices", $invoice_id,
+                "net " .. fmt_aud($paid) .. " exceeds total " .. fmt_aud($inv.total_cents) ..
+                " — refund of " .. fmt_aud($paid - to_number($inv.total_cents)) .. " due")
+    end
+    if $paid >= to_number($inv.total_cents) then
+      -- guarded flip: changes()=1 exactly once, ever
+      db_exec("UPDATE invoices SET status = 'paid', paid_at = ?2, updated = ?2
+               WHERE id = ?1 AND status = 'open'", [$invoice_id, biz_now()])
+      $ch = db_query("SELECT changes() AS n")
+      if to_number($ch[0].n) == 1 then
+        $flipped = true
+        biz_advance_renewals($invoice_id)
+      end
+    end
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return { ok: false, error: "payment tx failed: " .. $e, flipped: false, duplicate: false }
+  end
+
+  biz_audit($actor, "payment", "invoices", $invoice_id,
+            $gateway .. " " .. $txn_ref .. " " .. fmt_aud($amt) ..
+            " flipped=" .. $flipped)
+  return { ok: true, error: "", flipped: $flipped, duplicate: false }
+end
+
+-- Ledger a VERIFIED gateway payment against an invoice that is no longer
+-- open (raced with a manual mark-paid, or landed on a superseded/expired
+-- attempt): money moved at the gateway, so the ledger must record it — but
+-- WITHOUT the paid-transition side effects (the invoice already left 'open'
+-- through the one blessed path; renewals must not advance twice). The
+-- (gateway, txn_ref) dedupe index still absorbs replays. Audits loudly,
+-- including the overpayment figure. Returns { ok, duplicate }.
+function biz_ledger_late_gateway_payment($invoice_id, $gateway, $txn_ref, $amount_cents, $detail)
+  $amt = to_number($amount_cents)
+  if $amt == nil or $amt <= 0 or ("" .. $txn_ref) == "" then
+    return { ok: false, duplicate: false }
+  end
+  try
+    db_exec("INSERT INTO transactions (invoice_id, customer_id, gateway, txn_ref, kind,
+             amount_cents, at, detail)
+             SELECT ?1, i.customer_id, ?2, ?3, 'payment', ?4, ?5, ?6
+             FROM invoices i WHERE i.id = ?1",
+            [$invoice_id, "" .. $gateway, "" .. $txn_ref, $amt, biz_now(),
+             "LATE (invoice closed): " .. $detail])
+  catch $e
+    -- classify (never assume duplicate): only a genuine (gateway, txn_ref)
+    -- collision is handled here; a collision against a DIFFERENT invoice —
+    -- e.g. the same reference hand-recorded on the wrong invoice — means
+    -- THIS invoice's verified money is still unledgered: audit LOUDLY so an
+    -- operator reconciles; any other insert failure surfaces as not-ok so
+    -- the webhook 500s and the gateway retries.
+    $seen = db_query("SELECT invoice_id FROM transactions WHERE gateway = ?1 AND txn_ref = ?2",
+                     ["" .. $gateway, "" .. $txn_ref])
+    if length($seen) == 0 then
+      return { ok: false, duplicate: false }
+    end
+    if to_number($seen[0].invoice_id) == to_number($invoice_id) then
+      return { ok: true, duplicate: true }
+    end
+    biz_audit("webhook", "late_payment_ref_collision", "invoices", $invoice_id,
+              $gateway .. " " .. $txn_ref .. " " .. fmt_aud($amt) ..
+              " already ledgered against INV-" .. $seen[0].invoice_id ..
+              " — THIS invoice's payment is unledgered; manual reconciliation required")
+    return { ok: true, duplicate: false }
+  end
+  $inv = db_query("SELECT total_cents FROM invoices WHERE id = ?1", [$invoice_id])
+  $net = biz_net_paid_cents($invoice_id)
+  $over = ""
+  if length($inv) == 1 and $net > to_number($inv[0].total_cents) then
+    $over = " — OVERPAID: refund of " .. fmt_aud($net - to_number($inv[0].total_cents)) .. " due"
+  end
+  biz_audit("webhook", "late_gateway_payment", "invoices", $invoice_id,
+            $gateway .. " " .. $txn_ref .. " " .. fmt_aud($amt) .. $over)
+  return { ok: true, duplicate: false }
+end
+
+-- Cancel an OPEN/DRAFT invoice: frees its renewal keys so the tick can reissue,
+-- and RELEASES credit spent at issue (open invoices carry a negative ledger row
+-- from biz_issue_invoice; drafts never spent, so nothing to release).
+function biz_cancel_invoice($invoice_id, $actor, $reason)
+  db_exec("BEGIN IMMEDIATE")
+  try
+    -- charge-reservation fence (same rule as manual recording, INSIDE the
+    -- tx): a live gateway attempt means a customer may be mid-checkout —
+    -- cancelling now could still end in a charge against a cancelled
+    -- invoice (the gateway HTTP window is wide, not sub-millisecond).
+    -- Refuse; the attempt resolves or ages out within 24h.
+    $fence = db_query("SELECT id FROM payment_attempts WHERE invoice_id = ?1
+                       AND status = 'created' AND updated > ?2
+                       LIMIT 1", [$invoice_id, biz_now_ago(86400)])
+    if length($fence) > 0 then
+      db_exec("ROLLBACK")
+      return { ok: false, error: "live gateway attempt exists — cancel after it resolves or expires" }
+    end
+    $was = db_query("SELECT status, customer_id, credit_cents FROM invoices
+                     WHERE id = ?1", [$invoice_id])
+    db_exec("UPDATE invoices SET status = 'cancelled', updated = ?2
+             WHERE id = ?1 AND status IN ('open', 'draft')", [$invoice_id, biz_now()])
+    $ch = db_query("SELECT changes() AS n")
+    if to_number($ch[0].n) == 1 then
+      db_exec("DELETE FROM renewal_keys WHERE invoice_id = ?1", [$invoice_id])
+      $w = $was[0]
+      if ("" .. $w.status) == "open" then
+        -- release exactly what THIS invoice ledgered at issue (net of any prior
+        -- release) — an imported open invoice has credit_cents but no ledger spend,
+        -- and releasing invoices.credit_cents blindly would mint credit (Codex).
+        $spent = db_query("SELECT COALESCE(-SUM(delta_cents), 0) AS s FROM credit_ledger
+                           WHERE invoice_id = ?1", [$invoice_id])
+        $rel = to_number($spent[0].s)
+        if $rel > 0 then
+          db_exec("INSERT INTO credit_ledger (customer_id, delta_cents, reason, invoice_id, at)
+                   VALUES (?1, ?2, ?3, ?4, ?5)",
+                  [$w.customer_id, $rel,
+                   "released by cancellation of INV-" .. $invoice_id, $invoice_id, biz_now()])
+        end
+      end
+      db_exec("COMMIT")
+      biz_audit($actor, "cancel", "invoices", $invoice_id, "" .. $reason)
+      return { ok: true, error: "" }
+    end
+    db_exec("ROLLBACK")
+    return { ok: false, error: "invoice not open/draft" }
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return { ok: false, error: "" .. $e }
+  end
+end
+
+-- Issue a DRAFT invoice: bill_to snapshot, token, issued/due dates; flips to open;
+-- SPENDS any applied credit as a negative credit_ledger row in the same transaction
+-- (credit_cents on a draft is only intent — the ledger movement happens HERE, so a
+-- balance can never be promised to two drafts and issued twice; Codex P0 review).
+function biz_issue_invoice($invoice_id, $due, $actor)
+  db_exec("BEGIN IMMEDIATE")
+  try
+    $rows = db_query("SELECT i.*, c.name AS c_name, c.company AS c_company, c.email AS c_email,
+                      c.address1, c.address2, c.city, c.state, c.postcode, c.country
+                      FROM invoices i JOIN customers c ON c.id = i.customer_id
+                      WHERE i.id = ?1 AND i.status = 'draft'", [$invoice_id])
+    if length($rows) == 0 then
+      db_exec("ROLLBACK")
+      return { ok: false, error: "no draft invoice " .. $invoice_id }
+    end
+    $r = $rows[0]
+    $credit = to_number($r.credit_cents)
+    if $credit > 0 then
+      -- the balance must still cover the promise, counting nothing twice
+      if credit_balance($r.customer_id) < $credit then
+        db_exec("ROLLBACK")
+        return { ok: false, error: "credit balance no longer covers the applied " .. fmt_aud($credit) }
+      end
+      db_exec("INSERT INTO credit_ledger (customer_id, delta_cents, reason, invoice_id, at)
+               VALUES (?1, ?2, ?3, ?4, ?5)",
+              [$r.customer_id, 0 - $credit, "applied to INV-" .. $invoice_id, $invoice_id, biz_now()])
+    end
+    $bill = "" .. $r.c_name
+    if ("" .. $r.c_company) != "" then $bill = $bill .. "\n" .. $r.c_company end
+    if ("" .. $r.address1) != "" then $bill = $bill .. "\n" .. $r.address1 end
+    if ("" .. $r.address2) != "" then $bill = $bill .. "\n" .. $r.address2 end
+    $line3 = strip(("" .. $r.city) .. " " .. ("" .. $r.state) .. " " .. ("" .. $r.postcode))
+    if $line3 != "" then $bill = $bill .. "\n" .. $line3 end
+    if ("" .. $r.country) != "" then $bill = $bill .. "\n" .. $r.country end
+    db_exec("UPDATE invoices SET status = 'open', issued = ?2, due = ?3, bill_to = ?4,
+             token = ?5, updated = ?6 WHERE id = ?1 AND status = 'draft'",
+            [$invoice_id, biz_today(), "" .. $due, $bill, biz_token(), biz_now()])
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return { ok: false, error: "issue failed: " .. $e }
+  end
+  biz_audit($actor, "issue", "invoices", $invoice_id, "due " .. $due)
+  return { ok: true, error: "" }
+end
+
+-- Recompute a DRAFT invoice's totals from its items (+ optional credit application).
+-- The CHECK constraint enforces the identity; this is the one writer of totals.
+function biz_recompute_draft($invoice_id)
+  $s = db_query("SELECT COALESCE(SUM(amount_cents), 0) AS sub FROM invoice_items
+                 WHERE invoice_id = ?1", [$invoice_id])
+  $sub = to_number($s[0].sub)
+  $inv = db_query("SELECT credit_cents FROM invoices WHERE id = ?1 AND status = 'draft'", [$invoice_id])
+  if length($inv) == 0 then return { ok: false, error: "not a draft" } end
+  $credit = to_number($inv[0].credit_cents)
+  if $credit > $sub then $credit = $sub end
+  db_exec("UPDATE invoices SET subtotal_cents = ?2, credit_cents = ?3,
+           total_cents = ?2 - ?3, updated = ?4 WHERE id = ?1 AND status = 'draft'",
+          [$invoice_id, $sub, $credit, biz_now()])
+  return { ok: true, error: "" }
+end

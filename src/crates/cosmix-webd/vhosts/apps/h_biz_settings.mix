@@ -1,0 +1,273 @@
+-- h_biz_settings.mix — billing settings (GET/POST /biz/settings). Admin-only.
+-- One full-page form (fm_open/fm_section/fm_actions — the admin_settings shape, NOT the
+-- CRUD md_form) that edits the biz_settings key/value table via biz_setting/biz_setting_set.
+-- Four sections: Engine (tick cadence + mail mode), Stripe, PayPal, Bank & seller.
+--   GET  /biz/settings         → render the form seeded from biz_setting()
+--   POST action=save           → validate → write changed keys → audit → PRG redirect_flash
+-- Money-path safety: mail_mode=live sends REAL customer mail; the select help warns plainly.
+-- Secrets (stripe_secret_key / stripe_webhook_secret / paypal_client_secret) are NEVER echoed
+-- back into the form (rendered value ""; help shows currently-set / not-set) and are written
+-- ONLY when the posted value is non-empty (blank = keep current). The audit detail records the
+-- comma list of KEYS changed, never any value. Numeric fields reject junk (to_number nil).
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+include "/opt/cosmix/vhosts/shared/apps/biz.mix"
+
+-- ── validation helpers (POST) ──
+
+-- A non-negative integer field → its normalized string, or nil when the posted value is
+-- missing or not a number >= 0 (to_number is nil on junk). floor drops any fractional part.
+function bs_int_or_nil($f, $k)
+  $raw = $f[$k]
+  if $raw == nil then
+    return nil
+  end
+  $n = to_number(trim("" .. $raw))
+  if $n == nil or $n < 0 then
+    return nil
+  end
+  return "" .. floor($n)
+end
+
+-- overdue_days: a comma list of positive day counts → the trimmed/normalized list ("3,10,17"),
+-- or nil if any non-blank piece is not a number > 0, or the list is empty.
+function bs_norm_overdue($s)
+  $out = []
+  $count = 0
+  for each $p in split("" .. $s, ",")
+    $t = trim("" .. $p)
+    if $t != "" then
+      $n = to_number($t)
+      if $n == nil or $n <= 0 then
+        return nil
+      end
+      push($out, "" .. floor($n))
+      $count = $count + 1
+    end
+  end
+  if $count == 0 then
+    return nil
+  end
+  return join($out, ",")
+end
+
+-- A select field validated against an allowlist → the trimmed value, or nil (missing / forged
+-- off-list). Keeps a forged POST from writing e.g. mail_mode=anything into a money-path setting.
+function bs_pick($f, $k, $allow)
+  $v = $f[$k]
+  if $v == nil then
+    return nil
+  end
+  $s = trim("" .. $v)
+  for each $a in $allow
+    if $a == $s then
+      return $s
+    end
+  end
+  return nil
+end
+
+-- "currently set" / "not set" for a secret's help line — NEVER the value itself.
+function bs_secret_status($k)
+  if biz_setting($k) != "" then
+    return "currently set"
+  end
+  return "not set"
+end
+
+function biz_settings_main()
+cms_init()
+biz_init()
+$user = current_user($HEADERS)
+-- A modal fetch on an expired session returns a clean fragment, not a login redirect injected
+-- into a dialog (mirrors the other admin handlers; this page has no modals but stays uniform).
+if md_is_modal_request() and $user == nil then
+  return md_session_expired("/biz/settings")
+end
+$deny = require_role($user, "admin")
+if $deny != nil then
+  return $deny
+end
+
+if $METHOD == "POST" then
+  $f = parse_form($BODY)
+  $action = $f["action"]
+  if $action == nil then
+    $action = "save"
+  end
+
+  if $action == "save" then
+    -- 1. validate every non-secret field FIRST; a single bad value rejects the whole save
+    --    (nothing written) with a danger flash naming the offending field.
+    $lead = bs_int_or_nil($f, "invoice_lead_days")
+    if $lead == nil then
+      return redirect_flash("/biz/settings", "invoice_lead_days must be a whole number of days (0 or more).", "danger")
+    end
+    $remind = bs_int_or_nil($f, "remind_before_days")
+    if $remind == nil then
+      return redirect_flash("/biz/settings", "remind_before_days must be a whole number of days (0 or more).", "danger")
+    end
+    $suspend = bs_int_or_nil($f, "suspend_flag_days")
+    if $suspend == nil then
+      return redirect_flash("/biz/settings", "suspend_flag_days must be a whole number of days (0 or more).", "danger")
+    end
+    $ov_raw = $f["overdue_days"]
+    if $ov_raw == nil then
+      $ov_raw = ""
+    end
+    $overdue = bs_norm_overdue($ov_raw)
+    if $overdue == nil then
+      return redirect_flash("/biz/settings", "overdue_days must be a comma list of positive day counts (e.g. 3,10,17).", "danger")
+    end
+    $tick = bs_pick($f, "tick_enabled", ["0", "1"])
+    if $tick == nil then
+      return redirect_flash("/biz/settings", "tick_enabled must be Disabled or Enabled.", "danger")
+    end
+    $mail = bs_pick($f, "mail_mode", ["off", "test", "live"])
+    if $mail == nil then
+      return redirect_flash("/biz/settings", "mail_mode must be off, test, or live.", "danger")
+    end
+    $smode = bs_pick($f, "stripe_mode", ["test", "live"])
+    if $smode == nil then
+      return redirect_flash("/biz/settings", "stripe_mode must be test or live.", "danger")
+    end
+    $pmode = bs_pick($f, "paypal_mode", ["test", "live"])
+    if $pmode == nil then
+      return redirect_flash("/biz/settings", "paypal_mode must be test or live.", "danger")
+    end
+    $gst = bs_pick($f, "seller_gst_registered", ["0", "1"])
+    if $gst == nil then
+      return redirect_flash("/biz/settings", "seller_gst_registered must be 0 or 1.", "danger")
+    end
+    -- Synergy Wholesale registrar mode (plain allowlist — no regex; webd's Mix build has none).
+    $swmode = bs_pick($f, "sw_mode", ["off", "read", "live"])
+    if $swmode == nil then
+      return redirect_flash("/biz/settings", "sw_mode must be off, read, or live.", "danger")
+    end
+    -- free-text (non-secret): nil → "", stored verbatim.
+    $pp_id = fm_val($f, "paypal_client_id")
+    $pp_wh = fm_val($f, "paypal_webhook_id")
+    $bank = fm_val($f, "bank_details")
+    $sw_rid = fm_val($f, "sw_reseller_id")
+    -- tenant identity (2026-07-17 multi-tenant sweep): blank = $SITE-derived
+    -- defaults (brand = title, support = admin@<fqdn>, seller = brand+support,
+    -- redirect = support)
+    $t_brand = fm_val($f, "brand_name")
+    $t_support = fm_val($f, "support_email")
+    $t_seller = fm_val($f, "seller_html")
+    $t_redirect = fm_val($f, "mail_test_redirect")
+    if trim("" .. $t_support) != "" and not biz_is_plain_email(trim("" .. $t_support)) then
+      return redirect_flash("/biz/settings", "Support email is not a valid address.", "danger")
+    end
+    if trim("" .. $t_redirect) != "" and not biz_is_plain_email(trim("" .. $t_redirect)) then
+      return redirect_flash("/biz/settings", "Test-mail redirect is not a valid address.", "danger")
+    end
+
+    -- 2. write only the keys whose value actually changed; collect the changed KEY names.
+    $pairs = [
+      ["invoice_lead_days", $lead],
+      ["remind_before_days", $remind],
+      ["suspend_flag_days", $suspend],
+      ["overdue_days", $overdue],
+      ["tick_enabled", $tick],
+      ["mail_mode", $mail],
+      ["stripe_mode", $smode],
+      ["paypal_mode", $pmode],
+      ["seller_gst_registered", $gst],
+      ["paypal_client_id", $pp_id],
+      ["paypal_webhook_id", $pp_wh],
+      ["bank_details", $bank],
+      ["sw_mode", $swmode],
+      ["sw_reseller_id", $sw_rid],
+      ["brand_name", $t_brand],
+      ["support_email", trim("" .. $t_support)],
+      ["seller_html", $t_seller],
+      ["mail_test_redirect", trim("" .. $t_redirect)]
+    ]
+    $changed = []
+    for each $kv in $pairs
+      $k = $kv[0]
+      $v = "" .. $kv[1]
+      if biz_setting($k) != $v then
+        biz_setting_set($k, $v)
+        push($changed, $k)
+      end
+    end
+
+    -- 3. secrets: write ONLY when the posted value is non-empty (blank = keep current); the
+    --    value is trimmed (strips a stray copy-paste newline) and never compared/echoed.
+    for each $sk in ["stripe_secret_key", "stripe_webhook_secret", "paypal_client_secret", "sw_api_key"]
+      $raw = $f[$sk]
+      if $raw != nil and trim("" .. $raw) != "" then
+        biz_setting_set($sk, trim("" .. $raw))
+        push($changed, $sk)
+      end
+    end
+
+    -- 4. audit the KEYS changed only — never the values (secrets among them).
+    biz_audit($user["username"], "settings_save", "biz_settings", nil, join($changed, ","))
+    -- Success PRG → the /biz dashboard + toast (modal closes; no reopen loop). Validation
+    -- errors above return to /biz/settings, which re-opens the modal so the error can be fixed.
+    return redirect_flash("/biz", "Settings saved.", "success")
+  end
+end
+
+-- ── render: the billing-settings modal/page (fm_settings — flat 2-col grid, no section
+-- chrome). Field names match the POST parse_form keys above — do not rename. Per-field
+-- help_tip tooltips only (secret status flows through bs_secret_status into the help);
+-- no section headings, subtitles, or the old status card (Mark 2026-07-13). Billing has
+-- NO Reset button: there is no defaults baseline to restore, and a reset that wiped the
+-- live Stripe/PayPal/Synergy secrets would be dangerous — [Cancel][Save] only.
+
+$mode01 = [{ value: "0", "label": "Disabled" }, { value: "1", "label": "Enabled" }]
+$mail_opts = [
+  { value: "off",  "label": "Off — log only (no mail sent)" },
+  { value: "test", "label": "Test — redirect all mail to " .. biz_mail_redirect() },
+  { value: "live", "label": "Live — REAL customer mail" }
+]
+$modeTL = [{ value: "test", "label": "Test" }, { value: "live", "label": "Live" }]
+$sw_opts = [
+  { value: "off",  "label": "Off — no registrar calls" },
+  { value: "read", "label": "Read — sync/lookup only" },
+  { value: "live", "label": "Live — renew/register" }
+]
+$gst_opts = [{ value: "0", "label": "Not registered" }, { value: "1", "label": "GST registered" }]
+
+-- Engine.
+$fields = fm_number("invoice_lead_days", "Invoice lead days", { value: biz_setting("invoice_lead_days"), help: "Days before the due date to auto-issue the renewal invoice.", help_tip: true })
+$fields = $fields .. fm_number("remind_before_days", "Remind before days", { value: biz_setting("remind_before_days"), help: "Days before due to send the payment reminder.", help_tip: true })
+$fields = $fields .. fm_text("overdue_days", "Overdue notice days", { value: biz_setting("overdue_days"), help: "Comma list of days-past-due to send overdue notices, e.g. 3,10,17.", help_tip: true })
+$fields = $fields .. fm_number("suspend_flag_days", "Suspend flag days", { value: biz_setting("suspend_flag_days"), help: "Days past due before a service is flagged for suspension.", help_tip: true })
+$fields = $fields .. fm_select("tick_enabled", "Billing tick", $mode01, { value: biz_setting("tick_enabled"), help: "Master switch for the systemd billing timer. Disabled = nothing is issued, sent, or charged automatically.", help_tip: true })
+$fields = $fields .. fm_select("mail_mode", "Mail mode", $mail_opts, { value: biz_setting("mail_mode"), help: "off = log the send but send nothing. test = redirect ALL outgoing mail to " .. biz_mail_redirect() .. ". live = send REAL mail to REAL customers — use only in production.", help_tip: true })
+-- Stripe (secrets write-only; blank keeps current).
+$fields = $fields .. fm_select("stripe_mode", "Stripe mode", $modeTL, { value: biz_setting("stripe_mode"), help: "Which Stripe environment the keys below belong to.", help_tip: true })
+$fields = $fields .. fm_password("stripe_secret_key", "Stripe secret key", { value: "", help: "sk_test_… / sk_live_…; blank = keep current (" .. bs_secret_status("stripe_secret_key") .. ").", help_tip: true })
+$fields = $fields .. fm_password("stripe_webhook_secret", "Stripe webhook secret", { value: "", help: "whsec_…; blank = keep current (" .. bs_secret_status("stripe_webhook_secret") .. ").", help_tip: true })
+-- PayPal.
+$fields = $fields .. fm_select("paypal_mode", "PayPal mode", $modeTL, { value: biz_setting("paypal_mode"), help: "Which PayPal environment the credentials below belong to.", help_tip: true })
+$fields = $fields .. fm_text("paypal_client_id", "PayPal client ID", { value: biz_setting("paypal_client_id") })
+$fields = $fields .. fm_password("paypal_client_secret", "PayPal client secret", { value: "", help: "Blank = keep current (" .. bs_secret_status("paypal_client_secret") .. ").", help_tip: true })
+$fields = $fields .. fm_text("paypal_webhook_id", "PayPal webhook ID", { value: biz_setting("paypal_webhook_id") })
+-- Synergy Wholesale (registrar; API key write-only).
+$fields = $fields .. fm_select("sw_mode", "Synergy Wholesale mode", $sw_opts, { value: biz_setting("sw_mode"), help: "off = no SW calls; read = nightly expiry sync + lookups; live = also processes paid domain renewals.", help_tip: true })
+$fields = $fields .. fm_text("sw_reseller_id", "Reseller ID", { value: biz_setting("sw_reseller_id"), help: "Synergy Wholesale reseller ID.", help_tip: true })
+$fields = $fields .. fm_password("sw_api_key", "Synergy Wholesale API key", { value: "", help: "Blank = keep current (" .. bs_secret_status("sw_api_key") .. ").", help_tip: true })
+-- Bank & seller.
+$fields = $fields .. fm_select("seller_gst_registered", "GST registration", $gst_opts, { value: biz_setting("seller_gst_registered"), help: "Leave 0 until GST-registered — flips tax rendering system-wide.", help_tip: true })
+$fields = $fields .. fm_textarea("bank_details", "Bank details", { value: biz_setting("bank_details"), rows: 5, help: "Shown on every open invoice when set (hidden when blank); <number> is replaced with the invoice number.", help_tip: true })
+-- tenant identity (blank = derived from the vhost: brand from title, support
+-- from admin@<fqdn>, seller block from brand+support, redirect from support)
+$fields = $fields .. fm_text("brand_name", "Brand name", { value: biz_setting("brand_name"), help: "Used in mail From-names, subjects and body copy. Blank = the site title.", help_tip: true })
+$fields = $fields .. fm_text("support_email", "Support email", { value: biz_setting("support_email"), help: "Invoice footer + portal contact address. Blank = admin@<this vhost>. Must be a real mailbox.", help_tip: true })
+$fields = $fields .. fm_textarea("seller_html", "Invoice seller block (HTML)", { value: biz_setting("seller_html"), rows: 3, help: "The invoice From party — legal name / ABN / address, raw HTML. Blank = brand + support email.", help_tip: true })
+$fields = $fields .. fm_text("mail_test_redirect", "Test-mail redirect", { value: biz_setting("mail_test_redirect"), help: "Where mail_mode=test sends ALL outgoing mail. Blank = the support email.", help_tip: true })
+
+if md_is_modal_request() then
+  return md_fragment(fm_settings({ mode: "modal", title: "Billing Settings", action: "/biz/settings", id: "biz-settings", fields: $fields, submit: "Save" }))
+end
+-- Direct (non-modal) visit → /biz dashboard + auto-open the Billing Settings modal (no orphan page).
+return redirect("/biz?openmodal=biz-settings")
+
+end

@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<node name="/dev/cosmix/trayd">
+  <interface name="dev.cosmix.trayd">
+    <!-- Start one discovery pass or coalesce one follow-up and return immediately. -->
+    <method name="Refresh"/>
+    <!-- Clone one complete, revision-consistent state view under one lock. -->
+    <method name="GetSnapshot">
+      <!-- revision, noded checked/reachable, apps/error, daemons/error, refresh error -->
+      <arg name="snapshot" type="(tbba(sssb)sa(sss)ss)" direction="out"/>
+    </method>
+    <!-- Launch an application from the current snapshot by slug. -->
+    <method name="LaunchApp">
+      <arg name="slug" type="s" direction="in"/>
+    </method>
+    <!-- Start, stop, or restart a service from the current snapshot. -->
+    <method name="ControlDaemon">
+      <arg name="manager" type="s" direction="in"/>
+      <arg name="unit" type="s" direction="in"/>
+      <arg name="verb" type="s" direction="in"/>
+    </method>
+    <!-- Open live logs for a service from the current snapshot. -->
+    <method name="OpenLogs">
+      <arg name="manager" type="s" direction="in"/>
+      <arg name="unit" type="s" direction="in"/>
+    </method>
+    <!-- Acquire a sender-bound lease on the Bus bridge. -->
+    <method name="OpenBusSession">
+      <arg name="directions" type="as" direction="in"/>
+      <arg name="verb_glob" type="s" direction="in"/>
+      <arg name="body_mode" type="s" direction="in"/>
+      <arg name="session_id" type="s" direction="out"/>
+    </method>
+    <!-- Replace one owned lease's filter and renew its ten-minute expiry. -->
+    <method name="UpdateBusSession">
+      <arg name="session_id" type="s" direction="in"/>
+      <arg name="directions" type="as" direction="in"/>
+      <arg name="verb_glob" type="s" direction="in"/>
+      <arg name="body_mode" type="s" direction="in"/>
+    </method>
+    <method name="KeepBusSessionAlive">
+      <arg name="session_id" type="s" direction="in"/>
+    </method>
+    <method name="CloseBusSession">
+      <arg name="session_id" type="s" direction="in"/>
+    </method>
+    <!-- Request an immediate inventory refresh for an owned active lease. -->
+    <method name="RefreshBusRoster">
+      <arg name="session_id" type="s" direction="in"/>
+    </method>
+    <!-- Clone the bounded, revision-consistent Bus view under one lock. -->
+    <method name="GetBusSnapshot">
+      <!-- revision/state/error/observing/filter epoch/filter/posture/nodes/services/traffic/drop counts -->
+      <arg name="snapshot" type="(tssbtasasssa(ssbs)asa(tssssssssbxttss)tt)" direction="out"/>
+    </method>
+    <!-- Clone the bounded Mix catalogue, run history and output tails. -->
+    <method name="GetMixSnapshot">
+      <!-- revision/state/error/scripts/runs (including next output sequence)/active run count -->
+      <arg name="snapshot" type="(tssa(sssbtt)a(ssssttbissttt)u)" direction="out"/>
+    </method>
+    <!-- Create a private executable under ~/.local/mix with an embedded description. -->
+    <method name="CreateMixScript">
+      <arg name="name" type="s" direction="in"/>
+      <arg name="description" type="s" direction="in"/>
+      <arg name="script_id" type="s" direction="out"/>
+    </method>
+    <!-- Rename the executable and update its embedded description; script text remains outside D-Bus. -->
+    <method name="UpdateMixScript">
+      <arg name="script_id" type="s" direction="in"/>
+      <arg name="name" type="s" direction="in"/>
+      <arg name="description" type="s" direction="in"/>
+    </method>
+    <method name="TrashMixScript">
+      <arg name="script_id" type="s" direction="in"/>
+    </method>
+    <method name="RestoreMixScript">
+      <arg name="script_id" type="s" direction="in"/>
+    </method>
+    <method name="PurgeMixScript">
+      <arg name="script_id" type="s" direction="in"/>
+    </method>
+    <!-- Open the authority-resolved script path through /usr/bin/xdg-open. -->
+    <method name="EditMixScript">
+      <arg name="script_id" type="s" direction="in"/>
+    </method>
+    <!-- Start one bounded transient user unit by script identity. -->
+    <method name="RunMixScript">
+      <arg name="script_id" type="s" direction="in"/>
+      <arg name="run_id" type="s" direction="out"/>
+    </method>
+    <!-- Stop the authority-resolved transient unit by run identity. -->
+    <method name="StopMixRun">
+      <arg name="run_id" type="s" direction="in"/>
+    </method>
+    <!-- Clone the SSH host/key catalogue and current probe state under one lock. -->
+    <method name="GetSshSnapshot">
+      <!-- revision/state/error/hosts/keys/active probes -->
+      <arg name="snapshot" type="(tssa(ssssqssbsstt)a(sss)u)" direction="out"/>
+    </method>
+    <!-- Open one actionable host in Konsole using trayd's absolute ssh path. -->
+    <method name="ConnectSshHost">
+      <arg name="id" type="s" direction="in"/>
+    </method>
+    <!-- Queue bounded connect-predictive probes; an empty list means all actionable hosts. -->
+    <method name="ProbeSshHosts">
+      <arg name="ids" type="as" direction="in"/>
+    </method>
+    <!-- Exclusively create one private sshm-format host fragment. Port 0 selects 22. -->
+    <method name="CreateSshHost">
+      <arg name="name" type="s" direction="in"/>
+      <arg name="hostname" type="s" direction="in"/>
+      <arg name="port" type="u" direction="in"/>
+      <arg name="user" type="s" direction="in"/>
+      <arg name="key_id" type="s" direction="in"/>
+    </method>
+    <!-- Open one live host fragment through the fixed desktop opener. -->
+    <method name="EditSshHost">
+      <arg name="id" type="s" direction="in"/>
+    </method>
+    <method name="TrashSshHost">
+      <arg name="id" type="s" direction="in"/>
+    </method>
+    <method name="RestoreSshHost">
+      <arg name="id" type="s" direction="in"/>
+    </method>
+    <method name="PurgeSshHost">
+      <arg name="id" type="s" direction="in"/>
+    </method>
+    <!-- Emitted after a snapshot or refresh-observability field changes. -->
+    <signal name="Changed">
+      <arg name="revision" type="t"/>
+    </signal>
+    <!-- Emitted after Bus lifecycle, roster, error, or traffic state changes. -->
+    <signal name="BusChanged">
+      <arg name="revision" type="t"/>
+    </signal>
+    <!-- Coalesced traffic delivery, bounded to 64 events and 256 KiB, fenced by filter epoch. -->
+    <signal name="BusTrafficBatch">
+      <arg name="revision" type="t"/>
+      <arg name="filter_epoch" type="t"/>
+      <arg name="events" type="a(tssssssssbxttss)"/>
+      <arg name="server_dropped" type="t"/>
+      <arg name="bridge_dropped" type="t"/>
+    </signal>
+    <!-- Emitted for catalogue, watcher-state or recovery changes. -->
+    <signal name="MixChanged">
+      <arg name="revision" type="t"/>
+    </signal>
+    <!-- Emitted for run lifecycle changes. -->
+    <signal name="MixRunChanged">
+      <arg name="revision" type="t"/>
+      <arg name="run_id" type="s"/>
+    </signal>
+    <!-- Bounded to 16 chunks, 8 KiB each and 64 KiB per signal. -->
+    <signal name="MixRunOutput">
+      <arg name="revision" type="t"/>
+      <arg name="run_id" type="s"/>
+      <arg name="chunks" type="a(tss)"/>
+      <arg name="stdout_dropped" type="t"/>
+      <arg name="stderr_dropped" type="t"/>
+    </signal>
+    <!-- Emitted for SSH catalogue, watcher, and probe lifecycle changes. -->
+    <signal name="SshChanged">
+      <arg name="revision" type="t"/>
+    </signal>
+    <!-- Discovered applications as slug, label, resolvable icon name, and launchable flag. -->
+    <property name="Apps" type="a(sssb)" access="read"/>
+    <!-- Empty when Apps is authoritative, otherwise a concise discovery error. -->
+    <property name="AppsError" type="s" access="read"/>
+    <!-- Discovered units as manager, unit, and active/inactive/failed/changing status. -->
+    <property name="Daemons" type="a(sss)" access="read"/>
+    <!-- Empty when Daemons is authoritative, otherwise a concise discovery error. -->
+    <property name="DaemonsError" type="s" access="read"/>
+    <!-- False until the first discovery snapshot has landed. -->
+    <property name="NodedChecked" type="b" access="read"/>
+    <!-- The most recent local-noded TCP probe result. -->
+    <property name="NodedReachable" type="b" access="read"/>
+    <!-- Zero before the first snapshot, then increased by one for each installed snapshot. -->
+    <property name="Revision" type="t" access="read"/>
+    <!-- Empty normally; records an implausibly long in-flight refresh when observed. -->
+    <property name="RefreshError" type="s" access="read"/>
+    <!-- True while at least one unexpired sender-bound Bus lease exists. -->
+    <property name="BusActive" type="b" access="read"/>
+    <!-- idle, stopping, connecting, connected, or degraded. -->
+    <property name="BusState" type="s" access="read"/>
+    <!-- Monotonic revision for the Bus snapshot and signals. -->
+    <property name="BusRevision" type="t" access="read"/>
+    <!-- Monotonic revision for catalogue, run and output state. -->
+    <property name="MixRevision" type="t" access="read"/>
+    <!-- absent, watching, or degraded. -->
+    <property name="MixState" type="s" access="read"/>
+    <!-- Empty normally; contains a concise watcher/store recovery diagnostic. -->
+    <property name="MixError" type="s" access="read"/>
+    <!-- Number of starting, running or stopping transient Mix units. -->
+    <property name="MixActiveRuns" type="u" access="read"/>
+    <!-- Monotonic revision for the SSH catalogue and probes. -->
+    <property name="SshRevision" type="t" access="read"/>
+    <!-- absent, watching, or degraded. -->
+    <property name="SshState" type="s" access="read"/>
+    <!-- Empty normally; contains a concise config or watcher diagnostic. -->
+    <property name="SshError" type="s" access="read"/>
+    <!-- Number of queued or running SSH probes. -->
+    <property name="SshActiveProbes" type="u" access="read"/>
+  </interface>
+</node>

@@ -1,0 +1,116 @@
+[package]
+name = "cosmix-musicd"
+version = "0.25.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "cosmix music/audio daemon — MIDI-file → SoundFont (rustysynth) render/play, plus a live MIDI-keyboard sine synth; Bus citizen"
+
+[lib]
+name = "cosmix_musicd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cosmix-musicd"
+path = "src/main.rs"
+
+# Three-tier feature graph (the cosmix "core-first crate" pattern):
+#   default            → render + live-MIDI playback (cpal). Useful out of the box.
+#   --no-default-feats → the PURE render core only (rustysynth + hound): no cpal,
+#                        no midir, no Cosmix RUNTIME deps; the compiled artifact
+#                        links no C (the only Cosmix touch is the pure-Rust
+#                        cosmix-lib-buildinfo build-dependency below, a
+#                        build-time provenance stamp). `cargo test --lib
+#                        --no-default-features` is the FFI-free guarantee.
+#   --features cosmix  → the full Bus citizen daemon (`serve`): noded client,
+#                        SPEC-12 props, .conf.mix bootstrap, first-run sf2 fetch.
+[features]
+default = ["playback", "sf3", "sfz"]
+playback = ["dep:cpal", "dep:midir", "dep:rtrb"]
+# JACK output backend (pipewire-jack on this fleet, or jack2). Selected at
+# runtime by `mixer_audio_host()`; see MUSICD_AUDIO_HOST.
+jack = ["playback", "cpal/jack"]
+mixer-host = ["playback", "dep:cosmix_props_core", "dep:serde", "dep:serde_json", "dep:sha2", "dep:tracing", "dep:cosmix_song", "dep:cosmix_mix"]
+# SF3 SoundFont support: decode Ogg-Vorbis-compressed samples to PCM so
+# rustysynth (uncompressed-SF2 only) can load SF3 banks. `lewton` is pure
+# Rust (MIT/Apache-2.0), so the render core still links no C.
+sf3 = ["dep:lewton"]
+# SFZ support: a pure-Rust SFZ→SF2 converter (self-contained; no Polyphone
+# shell-out, no GPL, no C FFI). Decodes samples via hound (WAV) + claxon
+# (FLAC, Apache-2.0), assembles an uncompressed SF2 rustysynth loads.
+sfz = ["dep:claxon"]
+cosmix = [
+    "mixer-host",
+    "playback",
+    "dep:cosmix_daemon",
+    "dep:cosmix_log",
+    "dep:cosmix_config",
+    "dep:cosmix_client",
+    "dep:cosmix_bus",
+    "dep:cosmix_buildinfo",
+    "dep:cosmix_props",
+    "dep:cosmix_props_core",
+    "dep:tokio",
+    "dep:tracing",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:chrono",
+    "dep:ureq",
+    "dep:sha2",
+    "dep:base64",
+]
+
+[dependencies]
+# --- pure render core (always compiled; pure Rust, links no C) ---
+rustysynth = "1.3.6"   # pure-Rust SF2 SoundFont MIDI synthesizer (MIT, zero-dep)
+lewton = { version = "0.10", optional = true }  # pure-Rust Ogg-Vorbis decoder (MIT/Apache-2.0) — SF3 samples
+claxon = { version = "0.4", optional = true }   # pure-Rust FLAC decoder (Apache-2.0) — SFZ FLAC samples
+hound = "3.5"          # pure-Rust WAV writer + reader
+libc = { workspace = true }  # CLOCK_MONOTONIC anchor for frame0_mono (clock_gettime) — unconditional
+# Bake-off mixer domain contract (mixer.v1): the 465-byte A.6 meter frame codec,
+# frozen calibration consts, leaf schema. Pure Rust (serde + sha2) — keeps the
+# render core FFI-free. Renderer-independent keystone; NOT linked by any disp-*.
+cosmix_mixer_schema = { package = "cosmix-mixer-schema", path = "../cosmix-mixer-schema" }
+# song.v1 document model (tracks/notes/SMF/persistence) — feeds the mixer-host's
+# midi-synth.v1 source profile (song → frame-keyed TrackSchedules). Pure Rust.
+cosmix_song = { package = "cosmix-song", path = "../cosmix-song", optional = true }
+# Strict-data .mix session documents (stem-session.v2) — the substrate's ONE
+# data format, parsed/serialised via cosmix-lib-mix's serde bridge.
+cosmix_mix = { package = "cosmix-lib-mix", path = "../cosmix-lib-mix", features = ["serde"], optional = true }
+flacenc = { version = "0.5.1", default-features = false } # pure-Rust FLAC encoder for 24-bit render archives
+anyhow.workspace = true
+clap = { workspace = true }  # CLI parse — pure Rust, needed even for the core `render` subcommand
+
+# --- playback sink (FFI, isolated behind `playback`) ---
+# Cargo.lock currently holds cpal at 0.17.1. Do not raise it to 0.17.3 while
+# midir is 0.10.4: midir -> alsa 0.9 -> alsa-sys 0.3 collides with cpal 0.17.3
+# -> alsa 0.11 -> alsa-sys 0.4 because both alsa-sys crates use links="alsa".
+cpal = { version = "0.17", optional = true }   # audio output (ALSA by default; JACK/pipewire-jack via the `jack` feature)
+midir = { version = "0.10", optional = true }  # live MIDI input
+rtrb = { version = "0.3", optional = true }    # lock-free SPSC ring: MIDI/control thread → audio thread
+
+# --- Bus citizen daemon (behind `cosmix`; mirrors cosmix-indexd) ---
+cosmix_daemon = { package = "cosmix-lib-daemon", path = "../cosmix-lib-daemon", optional = true }
+cosmix_log = { package = "cosmix-lib-log", path = "../cosmix-lib-log", optional = true }
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", features = ["client-helpers"], optional = true }
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client", optional = true }
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus", optional = true }
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo", optional = true }
+cosmix_props = { package = "cosmix-lib-props-store", path = "../cosmix-lib-props-store", optional = true }
+# The opt-in revisioned write facility (Q8): RevWriteStore + generic wire types.
+# props-store re-exports the read-side props-core types but NOT `revwrite`, so
+# the mixer daemon depends on props-core directly (same crate instance — the
+# PropValue/PropPath types unify with the ones `cosmix_props` re-exports).
+cosmix_props_core = { package = "cosmix-lib-props-core", path = "../cosmix-lib-props-core", optional = true }
+base64 = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+ureq = { version = "2", optional = true }   # first-run sf2 fetch (rustls; version matches the workspace lock)
+sha2 = { version = "0.10", optional = true } # sf2 checksum verification
+
+[build-dependencies]
+# Captures cos HEAD sha + build time for the daemon's Bus provenance triple.
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }

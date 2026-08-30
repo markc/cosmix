@@ -1,0 +1,83 @@
+[package]
+name = "cosmix-maild"
+version = "0.8.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "JMAP (RFC 8620/8621) + SMTP mail server daemon"
+
+[lib]
+name = "cosmix_maild"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cosmix-maild"
+path = "src/main.rs"
+
+[dependencies]
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", features = ["client-helpers"] }
+cosmix_daemon = { package = "cosmix-lib-daemon", path = "../cosmix-lib-daemon", features = ["tls"] }
+cosmix_log = { package = "cosmix-lib-log", path = "../cosmix-lib-log" }
+cosmix_log_props = { package = "cosmix-lib-log-props", path = "../cosmix-lib-log-props" }
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus" }
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client", features = ["native"] }
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+uuid = { workspace = true, features = ["v5"] }
+chrono.workspace = true
+clap = { version = "4", features = ["derive"] }
+blake3 = "1"
+tower-http.workspace = true
+directories.workspace = true
+smtp-proto = "0.2"
+mail-parser = "0.11"
+mail-builder = "0.4"
+mail-auth = "0.7"
+mail-send = "0.5"
+hickory-resolver = { version = "0.25", features = ["tokio", "system-config"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+base64 = "0.22"
+bcrypt = "0.16"
+unicode-normalization = "0.1"
+sha2 = { workspace = true }
+hmac = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+mimalloc.workspace = true
+libc.workspace = true
+rusqlite.workspace = true
+webpki-roots = "0.26"
+x509-parser = "0.18"
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
+hyper = { version = "1", features = ["server"] }
+tokio-stream = "0.1"
+async-stream = "0.3"
+arc-swap.workspace = true
+cosmix-lib-mix = { path = "../cosmix-lib-mix", features = ["json"] }
+cosmix-maild-auth = { path = "../cosmix-maild-auth" }
+cosmix-maild-rules = { path = "../cosmix-maild-rules" }
+cosmix-maild-bayesian = { path = "../cosmix-maild-bayesian" }
+cosmix-mds = { path = "../cosmix-mds" }
+cosmix_props = { package = "cosmix-lib-props-store", path = "../cosmix-lib-props-store" }
+cosmix-lib-davproto = { path = "../cosmix-lib-davproto" }
+quick-xml = "0.37"
+rpassword = "7"
+
+[dev-dependencies]
+async-trait = "0.1"
+tempfile = "3"
+reqwest = { workspace = true }
+base64 = "0.22"
+rcgen = "0.13"
+
+[build-dependencies]
+# Captures cos HEAD sha + build time (version-discovery contract).
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }

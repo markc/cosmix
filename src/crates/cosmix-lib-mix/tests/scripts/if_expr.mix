@@ -1,0 +1,47 @@
+-- if_expr.mix: `if … then … else … end` used in EXPRESSION position
+-- Expected output:
+-- ex
+-- down
+-- not found
+-- middle
+-- 9
+-- 5
+-- 1-then-2
+
+-- assigned to a variable
+$g = "x"
+$label = if $g == "x" then "ex" else "why" end
+print($label)
+
+-- yielding a value directly into a call
+$ok = false
+print(if $ok then "up" else "down" end)
+
+-- else-if chain yields the matching branch's value
+$code = 404
+$msg = if $code == 200 then "ok" else if $code == 404 then "not found" else "other" end
+print($msg)
+
+-- multi-statement branch: the value is the LAST statement's value
+$n = 7
+$r = if $n > 10 then
+  "big"
+else
+  $tmp = "mid"
+  $tmp .. "dle"
+end
+print($r)
+
+-- postfix applies to an if-VALUE: index the list the if yields
+print(if true then [9] else [] end[0])
+
+-- a trailing operator binds to the if-value: (if-value) + 3
+$c = true
+print(if $c then 2 else 0 end + 3)
+
+-- a leading `if` at statement start is still a STATEMENT (StmtKind::If),
+-- unchanged — the expression form fires only when `if` is nested.
+$x = 1
+if $x == 1 then
+  print("1-then-2")
+end

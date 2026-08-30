@@ -1,0 +1,27 @@
+[package]
+name = "cosmix-lib-mesh"
+version = "0.6.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bus mesh networking — WireGuard overlay + WebSocket peer sync"
+
+[lib]
+name = "cosmix_mesh"
+path = "src/lib.rs"
+
+[dependencies]
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus" }
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+wireguard-control.workspace = true
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config" }
+base64.workspace = true
+# SPEC 13 §9a D2 admission prover (2-c-1c): sign the admission transcript.
+cosmix_mesh_trust = { package = "cosmix-lib-mesh-trust", path = "../cosmix-lib-mesh-trust", default-features = false }

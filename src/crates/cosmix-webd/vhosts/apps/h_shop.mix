@@ -1,0 +1,518 @@
+-- h_shop.mix — the PUBLIC digital-goods shop, one path-dispatched handler
+-- (shop_main): catalogue at /, /product/<slug>, /cart (view + mutate),
+-- POST /checkout, /order/<token> (the order page = gateway return target),
+-- GET /download/<token>/<item-id>. Design: the 2026-07-17 digital-eshop
+-- plan (cmctl _plan/, Codex-converged).
+--
+-- SECURITY: everything here is ANONYMOUS by design. Mutations are bounded by
+-- the unguessable cart cookie token (sha256-at-rest), the invoice token
+-- (possession = delivery authz, the /pay discipline), server-side re-pricing
+-- inside BEGIN IMMEDIATE (posted prices are never trusted), qty=1 by schema,
+-- rate limits, and the download claim counter. A logged-in portal customer's
+-- identity comes from the sealed session, never the form.
+--
+-- h_biz_pay.mix supplies bp_invoice_by_token/bp_outstanding (+ biz/stripe/
+-- paypal transitively) so token/outstanding logic is never duplicated.
+include "/opt/cosmix/vhosts/shared/apps/h_biz_pay.mix"
+include "/opt/cosmix/vhosts/shared/apps/shop.mix"
+
+-- ---------------------------------------------------------------- fragments
+
+-- Where the CATALOGUE lives on this vhost: "/" by default (a dedicated shop
+-- vhost — the whole site is the shop); a vhost with its own landing page sets
+-- $SITE.shop_base (e.g. "/shop") and mounts a route
+-- for it. Product/cart/checkout/order/download stay at their fixed paths.
+function shp_base()
+  if $SITE["shop_base"] != nil and ("" .. $SITE["shop_base"]) != "" then
+    return "" .. $SITE["shop_base"]
+  end
+  return "/"
+end
+
+function shp_price($cents)
+  return fmt_aud($cents)
+end
+
+function shp_card($p)
+  $h = '<div class="card shop-card">'
+  if ("" .. $p["image"]) != "" then
+    $h = $h .. '<a href="/product/' .. esc($p["slug"]) .. '"><img class="shop-card-img" src="' .. esc($p["image"]) .. '" alt=""></a>'
+  end
+  $h = $h .. '<h3><a href="/product/' .. esc($p["slug"]) .. '">' .. esc($p["name"]) .. '</a></h3>'
+  $h = $h .. '<p class="muted">' .. esc($p["summary"]) .. '</p>'
+  $h = $h .. '<div class="shop-card-foot"><strong>' .. shp_price($p["price_cents"]) .. '</strong> '
+  $h = $h .. '<form method="post" action="/cart" class="shop-inline-form">'
+  $h = $h .. '<input type="hidden" name="action" value="add">'
+  $h = $h .. '<input type="hidden" name="product_id" value="' .. $p["id"] .. '">'
+  $h = $h .. '<button class="btn btn-primary btn-sm" type="submit">Add to cart</button></form></div></div>'
+  return $h
+end
+
+-- paragraphs from escaped plain text (no markdown in webd's Mix subset)
+function shp_paras($s)
+  $out = ""
+  for each $para in split(replace("" .. $s, "\r", ""), "\n\n")
+    if trim($para) != "" then
+      $out = $out .. "<p>" .. replace(esc(trim($para)), "\n", "<br>") .. "</p>"
+    end
+  end
+  return $out
+end
+
+-- ---------------------------------------------------------------- pages
+
+function shp_catalog($user)
+  $cart = sh_cart_current()
+  $n = sh_cart_count($cart)
+  $title = esc("" .. $SITE["title"])
+  if shp_base() != "/" then $title = $title .. " Shop" end
+  $b = '<div class="cms-head"><h1>' .. $title .. '</h1><div>'
+  if $n > 0 then
+    $b = $b .. '<a class="btn btn-primary" href="/cart">Cart (' .. $n .. ')</a> '
+  end
+  if shp_base() != "/" then
+    $b = $b .. '<a class="btn" href="/">← Home</a>'
+  end
+  $b = $b .. '</div></div>'
+  $prods = sh_products_published()
+  if length($prods) == 0 then
+    $b = $b .. '<p class="muted">Nothing on the shelves yet — check back soon.</p>'
+  else
+    $b = $b .. '<div class="grid grid-auto">'
+    for each $p in $prods
+      $b = $b .. shp_card($p)
+    end
+    $b = $b .. '</div>'
+  end
+  return doc(200, "" .. $SITE["title"], $user, $b)
+end
+
+function shp_product($user, $slug)
+  $p = sh_product_by_slug($slug)
+  if $p == nil then
+    return doc(404, "Not found", $user, '<div class="card"><h1>No such product</h1><p class="muted"><a href="' .. shp_base() .. '">← Back to the shop</a></p></div>')
+  end
+  $b = '<div class="card shop-detail">'
+  if ("" .. $p["image"]) != "" then
+    $b = $b .. '<img class="shop-detail-img" src="' .. esc($p["image"]) .. '" alt="">'
+  end
+  $b = $b .. '<h1>' .. esc($p["name"]) .. '</h1>'
+  $b = $b .. '<p class="muted">' .. esc($p["summary"]) .. '</p>'
+  $b = $b .. shp_paras($p["description"])
+  $kind = "Instant download"
+  if ("" .. $p["delivery"]) == "text" then $kind = "License key — delivered instantly" end
+  $b = $b .. '<p class="muted small">' .. $kind .. ' · delivered after payment</p>'
+  $b = $b .. '<div class="shop-buy"><strong class="text-2xl">' .. shp_price($p["price_cents"]) .. '</strong> '
+  $b = $b .. '<form method="post" action="/cart" class="shop-inline-form">'
+  $b = $b .. '<input type="hidden" name="action" value="add">'
+  $b = $b .. '<input type="hidden" name="product_id" value="' .. $p["id"] .. '">'
+  $b = $b .. '<button class="btn btn-primary" type="submit">Add to cart</button></form>'
+  $b = $b .. ' <a class="btn" href="' .. shp_base() .. '">Keep browsing</a></div></div>'
+  return doc(200, "" .. $p["name"], $user, $b)
+end
+
+function shp_cart_view($user)
+  $cart = sh_cart_current()
+  $items = []
+  if $cart != nil then
+    $items = sh_cart_items($cart["id"])
+  end
+  $b = '<div class="cms-head"><h1>Your cart</h1></div><div class="card">'
+  if length($items) == 0 then
+    $b = $b .. '<p class="muted">Your cart is empty. <a href="' .. shp_base() .. '">Browse the shop</a>.</p></div>'
+    return doc(200, "Cart", $user, $b)
+  end
+  $total = 0
+  $b = $b .. '<table class="shop-cart-table"><thead><tr><th>Item</th><th class="text-right">Price</th><th></th></tr></thead><tbody>'
+  for each $it in $items
+    $total = $total + to_number($it["price_cents"])
+    $b = $b .. '<tr><td><a href="/product/' .. esc($it["slug"]) .. '">' .. esc($it["name"]) .. '</a></td>'
+    $b = $b .. '<td class="text-right">' .. shp_price($it["price_cents"]) .. '</td>'
+    $b = $b .. '<td class="text-right"><form method="post" action="/cart">'
+    $b = $b .. '<input type="hidden" name="action" value="remove">'
+    $b = $b .. '<input type="hidden" name="product_id" value="' .. $it["id"] .. '">'
+    $b = $b .. '<button class="btn btn-sm" type="submit">Remove</button></form></td></tr>'
+  end
+  $b = $b .. '</tbody></table><p class="text-right"><strong>Total: ' .. shp_price($total) .. '</strong></p></div>'
+
+  -- checkout: a signed-in portal customer checks out as themselves (identity
+  -- from the sealed session, form fields hidden); guests give name + email.
+  $b = $b .. '<div class="card"><h2>Checkout</h2>'
+  $b = $b .. '<form method="post" action="/checkout" class="shop-checkout-form">'
+  if $user != nil then
+    $b = $b .. '<p>Checking out as <strong>' .. esc("" .. $user["username"]) .. '</strong>.</p>'
+  else
+    $b = $b .. '<div class="fm-field"><label>Your name</label><input type="text" name="name" required maxlength="120"></div>'
+    $b = $b .. '<div class="fm-field"><label>Email (your order link is sent here)</label><input type="email" name="email" required maxlength="254"></div>'
+  end
+  $b = $b .. '<button class="btn btn-primary" type="submit">Continue to payment</button></form></div>'
+  return doc(200, "Cart", $user, $b)
+end
+
+-- POST /cart — action=add|remove, product_id. Creates the cart (+cookie) on
+-- first add. 303 back to the cart (add) or same page (remove).
+function shp_cart_post()
+  $f = parse_form($BODY)
+  $action = "" .. $f["action"]
+  $pid = to_number($f["product_id"])
+  if $pid == nil then
+    return redirect_flash(shp_base(), "Bad request", "danger")
+  end
+  $cart = sh_cart_current()
+  $setck = nil
+  if $action == "add" then
+    $p = db_query("SELECT id FROM products WHERE id = ?1 AND published = 1", [$pid])
+    if length($p) == 0 then
+      return redirect_flash(shp_base(), "That product is not available.", "danger")
+    end
+    if $cart == nil then
+      -- no per-client address is available to key on; a coarse global bucket
+      -- still stops runaway cart minting (WG-only today; revisit at the edge)
+      if not bp_rate_ok("shop:cartcreate", 120, 3600) then
+        return { status: 429, headers: {}, body: "slow down" }
+      end
+      $made = sh_cart_create()
+      $cart = $made["cart"]
+      $setck = $made["set_cookie"]
+    end
+    if not bp_rate_ok("shop:cartops:" .. $cart["id"], 60, 3600) then
+      return { status: 429, headers: {}, body: "slow down" }
+    end
+    try
+      db_exec("INSERT INTO cart_items (cart_id, product_id, created) VALUES (?1, ?2, ?3)",
+              [$cart["id"], $pid, biz_now()])
+    catch $e
+      -- UNIQUE(cart_id, product_id): already in the cart (qty is always 1)
+    end
+    db_exec("UPDATE carts SET updated = ?2 WHERE id = ?1", [$cart["id"], biz_now()])
+    $hdrs = { "Location": "/cart" }
+    if $setck != nil then $hdrs["Set-Cookie"] = $setck end
+    return { status: 303, headers: $hdrs, body: "" }
+  end
+  if $action == "remove" and $cart != nil then
+    db_exec("DELETE FROM cart_items WHERE cart_id = ?1 AND product_id = ?2",
+            [$cart["id"], $pid])
+    db_exec("UPDATE carts SET updated = ?2 WHERE id = ?1", [$cart["id"], biz_now()])
+  end
+  return { status: 303, headers: { "Location": "/cart" }, body: "" }
+end
+
+-- ---------------------------------------------------------------- checkout
+
+-- POST /checkout: server-side re-price inside ONE BEGIN IMMEDIATE, find-or-
+-- create the customer by canonical email (guests never overwrite an existing
+-- customer's name; signed-in identity comes from the session), invoice open
+-- with issued=due=today + token, items snapshot product name+price, cart →
+-- converted (guarded), 303 → /order/<token>. A converted cart re-POST just
+-- redirects to its order (idempotent).
+function shp_checkout($user)
+  if biz_setting("shop_email_conflict") != "" then
+    return redirect_flash("/cart", "Checkout is paused — please try again later.", "danger")
+  end
+  $cart = sh_cart_any()
+  if $cart == nil then
+    return redirect_flash("/cart", "Your cart is empty.", "danger")
+  end
+  -- double-submit / back-button on a converted cart: straight to its order
+  if ("" .. $cart["status"]) == "converted" then
+    $prev = db_query("SELECT token FROM invoices WHERE id = ?1", [$cart["converted_invoice_id"]])
+    if length($prev) == 1 then
+      return { status: 303, headers: { "Location": "/order/" .. $prev[0].token }, body: "" }
+    end
+    return redirect_flash(shp_base(), "That cart was already checked out.", "info")
+  end
+  -- expired status, or an open cart past shop_cart_days (the age filter the
+  -- cart view applies — never sell a cart the customer can no longer see)
+  if ("" .. $cart["status"]) != "open" or sh_cart_current() == nil then
+    return redirect_flash("/cart", "Your cart has expired — please add your items again.", "danger")
+  end
+  if not bp_rate_ok("shop:checkout", 60, 3600) then
+    return { status: 429, headers: {}, body: "slow down" }
+  end
+
+  $email = ""
+  $name = ""
+  if $user != nil then
+    $email = lower(trim("" .. $user["username"]))
+    $name = "" .. $user["username"]
+  else
+    $f = parse_form($BODY)
+    if $f["email"] != nil then $email = lower(trim("" .. $f["email"])) end
+    if $f["name"] != nil then $name = trim("" .. $f["name"]) end
+  end
+  if not biz_is_plain_email($email) then
+    return redirect_flash("/cart", "Please enter a valid email address.", "danger")
+  end
+  if $name == "" or length($name) > 120 then
+    if $user == nil then
+      return redirect_flash("/cart", "Please enter your name.", "danger")
+    end
+    $name = $email
+  end
+
+  $inv_id = nil
+  $token = ""
+  db_exec("BEGIN IMMEDIATE")
+  try
+    -- converted already? (double-submit / back-button re-POST)
+    $fresh = db_query("SELECT status, converted_invoice_id FROM carts WHERE id = ?1", [$cart["id"]])
+    if length($fresh) == 1 and ("" .. $fresh[0].status) == "converted" then
+      $prev = db_query("SELECT token FROM invoices WHERE id = ?1", [$fresh[0].converted_invoice_id])
+      db_exec("COMMIT")
+      if length($prev) == 1 then
+        return { status: 303, headers: { "Location": "/order/" .. $prev[0].token }, body: "" }
+      end
+      return redirect_flash(shp_base(), "That cart was already checked out.", "info")
+    end
+
+    -- re-price from the catalogue: only published products count; a product
+    -- unpublished since it was added aborts the checkout (never sold stale).
+    $items = db_query("SELECT ci.product_id, p.name, p.price_cents, p.published
+                       FROM cart_items ci JOIN products p ON p.id = ci.product_id
+                       WHERE ci.cart_id = ?1 ORDER BY ci.id", [$cart["id"]])
+    if length($items) == 0 then
+      db_exec("ROLLBACK")
+      return redirect_flash("/cart", "Your cart is empty.", "danger")
+    end
+    $subtotal = 0
+    for each $it in $items
+      if to_number($it["published"]) != 1 then
+        db_exec("ROLLBACK")
+        return redirect_flash("/cart", esc("" .. $it["name"]) .. " is no longer available — please remove it.", "danger")
+      end
+      $price = to_number($it["price_cents"])
+      -- whole cents only: a fractional value would poison fmt_aud and be
+      -- rejected by Stripe's integer unit_amount (defence in depth — the
+      -- panel validator refuses fractions at write time too)
+      if $price == nil or $price <= 0 or $price > 100000000 or $price != floor($price) then
+        db_exec("ROLLBACK")
+        return redirect_flash("/cart", "Pricing error — please try again later.", "danger")
+      end
+      $subtotal = $subtotal + $price
+    end
+
+    -- find-or-create customer by canonical email (unique index enforced).
+    -- A guest hitting an EXISTING customer's email attaches the order to that
+    -- row but never rewrites its identity; delivery authz rides the invoice
+    -- token, so squatting a stranger's email gains nothing (Codex ruling 3).
+    $c = db_query("SELECT id, name FROM customers WHERE lower(email) = ?1 AND status != 'closed'", [$email])
+    $cust_id = nil
+    if length($c) == 1 then
+      $cust_id = $c[0].id
+      $name = "" .. $c[0].name
+    else
+      db_exec("INSERT INTO customers (name, email, status, notes, created, updated)
+               VALUES (?1, ?2, 'active', 'shop signup', ?3, ?3)", [$name, $email, biz_now()])
+      $nc = db_query("SELECT last_insert_rowid() AS id")
+      $cust_id = $nc[0].id
+    end
+
+    $token = biz_token()
+    $today = biz_today()
+    db_exec("INSERT INTO invoices (customer_id, status, issued, due, subtotal_cents,
+             tax_cents, tax_rate_bps, credit_cents, total_cents, bill_to, token, created, updated)
+             VALUES (?1, 'open', ?2, ?2, ?3, 0, 0, 0, ?3, ?4, ?5, ?6, ?6)",
+            [$cust_id, $today, $subtotal, $name .. "\n" .. $email, $token, biz_now()])
+    $ni = db_query("SELECT last_insert_rowid() AS id")
+    $inv_id = $ni[0].id
+    for each $it in $items
+      db_exec("INSERT INTO invoice_items (invoice_id, product_id, description, amount_cents)
+               VALUES (?1, ?2, ?3, ?4)",
+              [$inv_id, $it["product_id"], "" .. $it["name"], to_number($it["price_cents"])])
+    end
+
+    -- convert the cart AT MOST ONCE (guarded — a raced parallel checkout
+    -- loses here and rolls its invoice back)
+    db_exec("UPDATE carts SET status = 'converted', converted_invoice_id = ?2, updated = ?3
+             WHERE id = ?1 AND status = 'open'", [$cart["id"], $inv_id, biz_now()])
+    $ch = db_query("SELECT changes() AS n")
+    if to_number($ch[0].n) != 1 then
+      db_exec("ROLLBACK")
+      return redirect_flash("/cart", "That cart was already checked out.", "info")
+    end
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    biz_audit("public", "shop_checkout_error", "carts", $cart["id"], sanitize("" .. $e))
+    return redirect_flash("/cart", "Checkout failed — please try again.", "danger")
+  end
+  biz_audit("public", "shop_checkout", "invoices", $inv_id, "cart " .. $cart["id"] .. " → INV-" .. $inv_id)
+  return { status: 303, headers: { "Location": "/order/" .. $token }, body: "" }
+end
+
+-- ---------------------------------------------------------------- order page
+
+-- GET /order/<token> — the customer-facing order page and the gateway
+-- success/cancel return target (biz_invoice_url points here on shop vhosts).
+-- Open → pay buttons (posting into the existing /pay surface); paid+entitled
+-- → download buttons / license keys; refunded or expired → explanatory state.
+function shp_order($user, $token)
+  $inv = bp_invoice_by_token($token)
+  if $inv == nil or not sh_is_order($inv["id"]) then
+    return doc(404, "Not found", $user, '<div class="card"><h1>Order not found</h1><p class="muted">This link is invalid or has been superseded.</p></div>')
+  end
+  if not bp_rate_ok("shop:order:" .. substr("" .. $token, 0, 16), 60, 60) then
+    return { status: 429, headers: {}, body: "slow down" }
+  end
+  $items = sh_order_items($inv["id"])
+  $status = "" .. $inv["status"]
+  $b = '<div class="cms-head"><h1>Order INV-' .. $inv["id"] .. '</h1></div><div class="card">'
+
+  if $status == "open" then
+    $b = $b .. '<p class="muted">Awaiting payment.</p>'
+    $b = $b .. '<table class="shop-cart-table"><tbody>'
+    for each $it in $items
+      $b = $b .. '<tr><td>' .. esc($it["description"]) .. '</td><td class="text-right">' .. shp_price($it["amount_cents"]) .. '</td></tr>'
+    end
+    $b = $b .. '</tbody></table>'
+    $b = $b .. '<p class="text-right"><strong>Total: ' .. shp_price($inv["total_cents"]) .. '</strong></p>'
+    $b = $b .. '<div class="shop-pay">'
+    if biz_setting("stripe_secret_key") != "" then
+      $b = $b .. '<form method="post" action="/pay/' .. $inv["token"] .. '/stripe" class="shop-inline-form">'
+      $b = $b .. '<button class="btn btn-primary" type="submit">Pay by card</button></form> '
+    end
+    if biz_setting("paypal_client_id") != "" then
+      $b = $b .. '<form method="post" action="/pay/' .. $inv["token"] .. '/paypal" class="shop-inline-form">'
+      $b = $b .. '<button class="btn" type="submit">Pay with PayPal</button></form>'
+    end
+    $b = $b .. '</div>'
+    $b = $b .. '<p class="muted small"><a href="/invoice/' .. $inv["token"] .. '">View the formal invoice</a> (bank-transfer details there).</p>'
+    $b = $b .. '</div>'
+    return doc(200, "Order INV-" .. $inv["id"], $user, $b)
+  end
+
+  if $status != "paid" then
+    $b = $b .. '<p class="muted">This order is ' .. esc($status) .. '.</p></div>'
+    return doc(200, "Order INV-" .. $inv["id"], $user, $b)
+  end
+
+  if not sh_entitled($inv) then
+    $b = $b .. '<p class="muted">This order has been refunded — downloads are disabled. Questions? Reply to your order email.</p></div>'
+    return doc(200, "Order INV-" .. $inv["id"], $user, $b)
+  end
+  if sh_expired($inv) then
+    $b = $b .. '<p class="muted">The download window for this order has closed. Reply to your order email if you need it reopened.</p></div>'
+    return doc(200, "Order INV-" .. $inv["id"], $user, $b)
+  end
+
+  $b = $b .. '<p>Paid — thank you! Your items:</p><div class="shop-goods">'
+  for each $it in $items
+    $b = $b .. '<div class="shop-good"><h3>' .. esc($it["name"]) .. '</h3>'
+    if ("" .. $it["delivery"]) == "text" then
+      $b = $b .. '<pre class="shop-key">' .. esc($it["text_payload"]) .. '</pre>'
+    else
+      $b = $b .. '<a class="btn btn-primary" href="/download/' .. $inv["token"] .. '/' .. $it["item_id"] .. '">Download</a>'
+    end
+    $b = $b .. '</div>'
+  end
+  $b = $b .. '</div><p class="muted small">Receipt: <a href="/invoice/' .. $inv["token"] .. '">INV-' .. $inv["id"] .. '</a>. Downloads are limited and time-boxed — save your files.</p></div>'
+  return doc(200, "Order INV-" .. $inv["id"], $user, $b)
+end
+
+-- ---------------------------------------------------------------- download
+
+-- GET /download/<token>/<item-id> — the entitlement gate + file stream.
+function shp_download($token, $item_id_raw)
+  $inv = bp_invoice_by_token($token)
+  if $inv == nil then
+    return { status: 404, headers: {}, body: "not found" }
+  end
+  if not bp_rate_ok("shop:dl:" .. substr("" .. $token, 0, 16), 30, 60) then
+    return { status: 429, headers: {}, body: "slow down" }
+  end
+  if not sh_entitled($inv) or sh_expired($inv) then
+    return { status: 403, headers: {}, body: "not entitled" }
+  end
+  $item_id = to_number($item_id_raw)
+  if $item_id == nil then
+    return { status: 404, headers: {}, body: "not found" }
+  end
+  $rows = db_query("SELECT ii.id AS item_id, p.id AS product_id, p.name, p.delivery,
+                    p.file_path, p.mime
+                    FROM invoice_items ii JOIN products p ON p.id = ii.product_id
+                    WHERE ii.id = ?1 AND ii.invoice_id = ?2", [$item_id, $inv["id"]])
+  if length($rows) == 0 then
+    return { status: 404, headers: {}, body: "not found" }
+  end
+  $item = $rows[0]
+  if ("" .. $item["delivery"]) != "file" then
+    return { status: 303, headers: { "Location": "/order/" .. $inv["token"] }, body: "" }
+  end
+  -- cheap non-consuming precheck: an exhausted token must not force the whole
+  -- artifact into memory just to be told 403 (the claim below stays the
+  -- authoritative, atomic gate)
+  if sh_download_exhausted($item["item_id"]) then
+    return { status: 403, headers: {}, body: "download limit reached" }
+  end
+  $path = sh_goods_path($item["file_path"])
+  if $path == nil then
+    biz_audit("public", "shop_download_missing", "invoice_items", $item["item_id"], "" .. $item["file_path"])
+    return { status: 503, headers: {}, body: "file unavailable — please contact support" }
+  end
+  -- read BEFORE claiming a download slot: a deploy-window miss or read error
+  -- must never burn one of the customer's capped claims
+  $data = nil
+  try
+    $data = read_file_bytes($path)
+  catch $e
+    biz_audit("public", "shop_download_read_error", "invoice_items", $item["item_id"], sanitize("" .. $e))
+    return { status: 503, headers: {}, body: "file unavailable — please contact support" }
+  end
+  $claim = sh_claim_download($inv, $item)
+  if not $claim["ok"] then
+    return { status: 403, headers: {}, body: "" .. $claim["error"] }
+  end
+  $fname = $item["file_path"]
+  $parts = split("" .. $fname, "/")
+  $fname = $parts[length($parts) - 1]
+  $fname = replace(replace("" .. $fname, "\"", ""), ";", "")
+  $mime = "" .. $item["mime"]
+  if $mime == "" then $mime = "application/octet-stream" end
+  return { status: 200, headers: {
+    "Content-Type": $mime,
+    "Content-Disposition": "attachment; filename=\"" .. $fname .. "\"",
+    "Cache-Control": "private, no-store"
+  }, body: $data }
+end
+
+-- ---------------------------------------------------------------- main
+
+function shop_main()
+  cms_init()
+  biz_init()
+  shop_init()
+  $user = current_user($HEADERS)
+  $parts = split($PATH, "/")
+
+  if $PATH == "/" or $PATH == "" then
+    return shp_catalog($user)
+  end
+  $seg = ""
+  if length($parts) >= 2 then $seg = "" .. $parts[1] end
+
+  -- catalogue mounted off-root: dispatch on the CONFIGURED base itself
+  -- ($SITE.shop_base — e.g. "/shop"), not a hardcoded segment, so any base
+  -- the vhost mounts a route for works (see shp_base)
+  if $METHOD == "GET" and shp_base() != "/" and $PATH == shp_base() then
+    return shp_catalog($user)
+  end
+  if $seg == "product" and $METHOD == "GET" and length($parts) >= 3 then
+    return shp_product($user, $parts[2])
+  end
+  if $seg == "cart" then
+    if $METHOD == "POST" then
+      return shp_cart_post()
+    end
+    return shp_cart_view($user)
+  end
+  if $seg == "checkout" and $METHOD == "POST" then
+    return shp_checkout($user)
+  end
+  if $seg == "order" and $METHOD == "GET" and length($parts) >= 3 then
+    return shp_order($user, $parts[2])
+  end
+  if $seg == "download" and $METHOD == "GET" and length($parts) >= 4 then
+    return shp_download($parts[2], $parts[3])
+  end
+  return { status: 404, headers: {}, body: "not found" }
+end

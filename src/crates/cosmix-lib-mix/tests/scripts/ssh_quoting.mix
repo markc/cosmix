@@ -1,0 +1,28 @@
+-- ssh_quoting.mix: cover shell_quote() + sql_quote() Mix builtins.
+-- Expected output:
+-- ''
+-- 'hello'
+-- 'it'\''s'
+-- '$x `id` \ "y"'
+-- it''''s
+-- a''b''c
+-- ok
+
+print shell_quote("")
+print shell_quote("hello")
+print shell_quote("it's")
+print shell_quote("$x `id` \\ \"y\"")
+
+print sql_quote("it''s")
+print sql_quote("a'b'c")
+
+-- shell_quote round-trip via run_rc — the quoted form, fed back
+-- through bash printf '%s', must reproduce the original.
+$pw = "p@ss'word with $vars"
+$cmd = "printf '%s' " .. shell_quote($pw)
+$res = run_rc($cmd)
+if $res.rc == 0 and $res.stdout == $pw then
+    print "ok"
+else
+    print "FAIL: rc=" .. $res.rc .. " stdout=" .. $res.stdout
+end

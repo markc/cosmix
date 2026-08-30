@@ -1,0 +1,340 @@
+-- portal.mix — the CUSTOMER self-serve portal (the billing vhost). One handler,
+-- path-dispatched (biz_portal_main): /portal, /portal/services, /portal/invoices,
+-- /portal/profile. WHMCS-style reduced surface: a customer sees ONLY their own
+-- services/invoices and can edit their own contact details.
+--
+-- SECURITY — row-scoping is the whole game here:
+--   * the customer is resolved ONLY from the sealed session email
+--     (current_user → username), NEVER from a request parameter;
+--   * EVERY query is WHERE customer_id = <resolved id>;
+--   * a signed-in user who is NOT a customer (no matching row) is refused —
+--     a random maild account can't see anyone's billing data.
+-- Customer LOGIN itself (email+password) is a separate webd auth change
+-- (Codex ruling A); these pages work the moment a customer session exists,
+-- and are previewable by an admin whose email matches a customer row.
+include "/opt/cosmix/vhosts/shared/apps/biz.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/lib/lib.mix"
+
+-- Resolve the signed-in user's customer row from the session email alone.
+-- Returns the row or nil.
+function pt_customer($user)
+  if $user == nil then return nil end
+  $email = "" .. $user["username"]
+  if $email == "" then return nil end
+  $r = db_query("SELECT * FROM customers WHERE email = ?1 AND status != 'closed' LIMIT 1", [$email])
+  if length($r) == 0 then return nil end
+  return $r[0]
+end
+
+-- status → Filament badge variant for a customer-facing invoice
+function pt_inv_badge($status, $due)
+  if $status == "paid" then return { text: "Paid", variant: "success" } end
+  if $status == "cancelled" then return { text: "Cancelled", variant: "gray" } end
+  if $status == "open" and ("" .. $due) < biz_today() then
+    return { text: "Overdue", variant: "danger" }
+  end
+  if $status == "open" then return { text: "Due", variant: "warning" } end
+  return { text: "" .. $status, variant: "gray" }
+end
+
+function pt_badge_html($b)
+  return '<span class="dt-badge dt-badge-' .. $b["variant"] .. '">' .. esc($b["text"]) .. '</span>'
+end
+
+-- ------------------------------------------------------------- views
+
+function pt_overview($cust)
+  $cid = $cust["id"]
+  $sv = db_query("SELECT COUNT(*) AS n, COALESCE(SUM(price_cents),0) AS t FROM services
+                  WHERE customer_id = ?1 AND status = 'active'", [$cid])
+  $open = db_query("SELECT COUNT(*) AS n, COALESCE(SUM(total_cents),0) AS t FROM invoices
+                    WHERE customer_id = ?1 AND status = 'open'", [$cid])
+  $bal = credit_balance($cid)
+  $h = '<div class="cms-head"><h1>Hi ' .. esc($cust["name"]) .. '</h1></div>'
+  $h = $h .. '<div class="grid grid-auto">'
+  $h = $h .. '<div class="card"><div class="muted small">Active services</div><div class="text-2xl">' .. $sv[0].n .. '</div></div>'
+  $h = $h .. '<div class="card"><div class="muted small">Outstanding</div><div class="text-2xl">' .. fmt_aud($open[0].t) .. '</div><div class="muted small">' .. $open[0].n .. ' open invoice(s)</div></div>'
+  if $bal != 0 then
+    $h = $h .. '<div class="card"><div class="muted small">Account credit</div><div class="text-2xl">' .. fmt_aud($bal) .. '</div></div>'
+  end
+  $h = $h .. '</div>'
+  -- open invoices front and centre (the thing a customer comes to do)
+  $inv = db_query("SELECT id, issued, due, total_cents, status, token FROM invoices
+                   WHERE customer_id = ?1 AND status = 'open' ORDER BY due LIMIT 10", [$cid])
+  if length($inv) > 0 then
+    $h = $h .. '<div class="card"><h3>Invoices to pay</h3><table class="dt-table"><thead><tr><th>Invoice</th><th>Due</th><th>Amount</th><th></th></tr></thead><tbody>'
+    for each $i in $inv
+      $pay = ""
+      if ("" .. $i.token) != "" then
+        $pay = '<a class="btn btn-primary btn-xs" href="/invoice/' .. esc("" .. $i.token) .. '">View &amp; pay</a>'
+      end
+      $h = $h .. '<tr><td>INV-' .. $i.id .. '</td><td>' .. esc("" .. $i.due) .. '</td><td>' .. fmt_aud($i.total_cents) .. '</td><td>' .. $pay .. '</td></tr>'
+    end
+    $h = $h .. '</tbody></table></div>'
+  end
+  return $h
+end
+
+function pt_services($cust)
+  $rows = db_query("SELECT s.*, p.name AS plan_name FROM services s
+                    LEFT JOIN plans p ON p.id = s.plan_id
+                    WHERE s.customer_id = ?1 ORDER BY s.status, s.label", [$cust["id"]])
+  $h = '<div class="cms-head"><h1>My services</h1></div>'
+  if length($rows) == 0 then
+    return $h .. '<div class="card muted">No services on your account.</div>'
+  end
+  $h = $h .. '<div class="card"><table class="dt-table"><thead><tr><th>Service</th><th>Plan</th><th>Price/yr</th><th>Renews</th><th>Status</th></tr></thead><tbody>'
+  for each $s in $rows
+    $plan = "" .. $s.plan_name
+    if $plan == "" then $plan = "custom" end
+    $st = "" .. $s.status
+    $sb = "gray"
+    if $st == "active" then $sb = "success" end
+    if $st == "suspended" then $sb = "warning" end
+    $h = $h .. '<tr><td>' .. esc("" .. $s.label) .. '</td><td>' .. esc($plan) .. '</td><td>' .. fmt_aud($s.price_cents) .. '</td><td>' .. esc("" .. $s.next_due) .. '</td><td><span class="dt-badge dt-badge-' .. $sb .. '">' .. esc($st) .. '</span></td></tr>'
+  end
+  $h = $h .. '</tbody></table></div>'
+  return $h
+end
+
+function pt_invoices($cust)
+  $rows = db_query("SELECT id, issued, due, total_cents, status, token FROM invoices
+                    WHERE customer_id = ?1 ORDER BY id DESC LIMIT 100", [$cust["id"]])
+  $h = '<div class="cms-head"><h1>My invoices</h1></div>'
+  if length($rows) == 0 then
+    return $h .. '<div class="card muted">No invoices yet.</div>'
+  end
+  $h = $h .. '<div class="card"><table class="dt-table"><thead><tr><th>Invoice</th><th>Issued</th><th>Due</th><th>Amount</th><th>Status</th><th></th></tr></thead><tbody>'
+  for each $i in $rows
+    $b = pt_inv_badge("" .. $i.status, "" .. $i.due)
+    $link = ""
+    if ("" .. $i.token) != "" then
+      $verb = "View"
+      if ("" .. $i.status) == "open" then $verb = "View &amp; pay" end
+      $link = '<a class="btn btn-xs" href="/invoice/' .. esc("" .. $i.token) .. '">' .. $verb .. '</a>'
+    end
+    $h = $h .. '<tr><td>INV-' .. $i.id .. '</td><td>' .. esc("" .. $i.issued) .. '</td><td>' .. esc("" .. $i.due) .. '</td><td>' .. fmt_aud($i.total_cents) .. '</td><td>' .. pt_badge_html($b) .. '</td><td>' .. $link .. '</td></tr>'
+  end
+  $h = $h .. '</tbody></table></div>'
+  return $h
+end
+
+-- profile: edit OWN contact details + change login password. email is the login
+-- identity → read-only. $q carries pwok/pwerr from the webd change-password POST.
+function pt_profile_form($cust, $flash, $q)
+  $h = '<div class="cms-head"><h1>My profile</h1></div>'
+  $h = $h .. $flash
+  $f = fm_hidden("action", "save")
+  $f = $f .. fm_text("email_ro", "Email (login)", { value: "" .. $cust["email"], disabled: true, help: "Your sign-in address — contact us to change it.", help_tip: true })
+  $f = $f .. fm_text("name", "Name", { value: "" .. $cust["name"], required: true })
+  $f = $f .. fm_text("company", "Company", { value: "" .. $cust["company"] })
+  $f = $f .. fm_text("phone", "Phone", { value: "" .. $cust["phone"] })
+  $f = $f .. fm_text("address1", "Address line 1", { value: "" .. $cust["address1"] })
+  $f = $f .. fm_text("address2", "Address line 2", { value: "" .. $cust["address2"] })
+  $f = $f .. fm_text("city", "City", { value: "" .. $cust["city"] })
+  $f = $f .. fm_text("state", "State", { value: "" .. $cust["state"] })
+  $f = $f .. fm_text("postcode", "Postcode", { value: "" .. $cust["postcode"] })
+  $f = $f .. fm_text("country", "Country", { value: "" .. $cust["country"] })
+  $h = $h .. fm_form({ mode: "canvas", action: "/portal/profile", id: "pt-profile",
+                       title: "Contact details", fields: fm_grid({ cols: 2 }, $f),
+                       submit: { label: "Save" } })
+
+  -- change-password card (posts to the webd endpoint; old + new + confirm)
+  $pwerr = "" .. fm_or($q["pwerr"], "")
+  $h = $h .. '<div class="card"><h3>Change password</h3>'
+  if ("" .. fm_or($q["pwok"], "")) == "1" then
+    $h = $h .. '<div class="card text-success">Password changed.</div>'
+  end
+  if $pwerr == "wrong" then
+    $h = $h .. '<div class="card text-danger">Your current password is incorrect.</div>'
+  else
+    $h = $h .. pt_err_banner($pwerr)
+  end
+  $h = $h .. '<form method="post" action="/portal/auth/change-password">'
+  $h = $h .. '<input type="hidden" name="csrf" value="' .. esc("" .. $CSRF) .. '">'
+  $h = $h .. fm_password("old_password", "Current password", { required: true })
+  $h = $h .. fm_password("password", "New password", { required: true, help: "At least 12 characters.", help_tip: true })
+  $h = $h .. fm_password("password_confirm", "Confirm new password", { required: true })
+  $h = $h .. '<div class="fm-actions"><button class="btn btn-primary" type="submit">Change password</button></div>'
+  $h = $h .. '</form></div>'
+  return $h
+end
+
+-- ------------------------------------------------------------- auth forms (anon)
+
+-- Map a webd error code → a friendly banner (or "" for none).
+function pt_err_banner($err)
+  $m = ""
+  if $err == "invalid" then $m = "Incorrect email or password." end
+  if $err == "locked" then $m = "Too many attempts — please wait a few minutes and try again." end
+  if $err == "expired" then $m = "Your session expired — please try again." end
+  if $err == "mismatch" then $m = "The two passwords don't match." end
+  if $err == "short" then $m = "Password must be at least 12 characters." end
+  if $err == "error" then $m = "Something went wrong — please try again." end
+  if $m == "" then return "" end
+  return '<div class="card text-danger">' .. esc($m) .. '</div>'
+end
+
+-- GET /portal/login — email+password form → POST /portal/auth/login (webd/argon2).
+function pt_login_page($q)
+  $err = "" .. fm_or($q["err"], "")
+  $next = "" .. fm_or($q["next"], "/portal")
+  -- Already signed in (staff/admin/maild session) → straight to the portal; the
+  -- customer-password form is only for identities with no session at all, so a
+  -- logged-in tester never faces the second login door. $next is query-controlled:
+  -- mirror webd's canonical safe_next (main.rs) — same-origin absolute path only;
+  -- reject //host, any backslash (browsers normalise \ → /, so /\evil escapes
+  -- origin), and control chars (CR/LF header injection); else collapse to /portal.
+  -- (webd's embedded Mix is a feature-gated SUBSET — no regex_* here, so the
+  -- control-char check is the explicit CR/LF/tab trio, the header-injection vectors.)
+  if current_user($HEADERS) != nil then
+    $ok = starts_with($next, "/") and starts_with($next, "//") == false
+    if contains($next, "\\") or contains($next, "\r") or contains($next, "\n") or contains($next, "\t") then
+      $ok = false
+    end
+    if $ok == false then
+      $next = "/portal"
+    end
+    return redirect($next)
+  end
+  $b = '<div class="cms-head"><h1>Customer sign in</h1></div>'
+  $b = $b .. pt_err_banner($err)
+  $b = $b .. '<div class="card"><form method="post" action="/portal/auth/login">'
+  $b = $b .. '<input type="hidden" name="csrf" value="' .. esc("" .. $CSRF) .. '">'
+  $b = $b .. '<input type="hidden" name="next" value="' .. esc($next) .. '">'
+  $b = $b .. fm_text("email", "Email", { required: true, autofocus: true })
+  $b = $b .. fm_password("password", "Password", { required: true })
+  $b = $b .. '<div class="fm-actions"><button class="btn btn-primary" type="submit">Sign in</button></div>'
+  $b = $b .. '</form><p class="muted small"><a href="/portal/forgot">Forgot your password?</a></p>'
+  $b = $b .. '<p class="muted small">Have a site login? <a href="/login?next=%2Fportal">Sign in here</a> — it works for the portal too.</p></div>'
+  return doc(200, "Customer sign in", nil, $b)
+end
+
+-- GET /portal/set-password?token=X — set/reset form → POST /portal/set-password.
+function pt_setpw_page($q)
+  $token = "" .. fm_or($q["token"], "")
+  $err = "" .. fm_or($q["err"], "")
+  if $token == "" then
+    return doc(200, "Set password", nil,
+      '<div class="cms-head"><h1>Set password</h1></div><div class="card text-danger">This link is missing its token. Please use the link from your email, or <a href="/portal/forgot">request a new one</a>.</div>')
+  end
+  $b = '<div class="cms-head"><h1>Set your password</h1></div>'
+  if $err == "invalid" then
+    $b = $b .. '<div class="card text-danger">This link is invalid or has expired. <a href="/portal/forgot">Request a new one</a>.</div>'
+  else
+    $b = $b .. pt_err_banner($err)
+  end
+  $b = $b .. '<div class="card"><form method="post" action="/portal/auth/set-password">'
+  $b = $b .. '<input type="hidden" name="csrf" value="' .. esc("" .. $CSRF) .. '">'
+  $b = $b .. '<input type="hidden" name="token" value="' .. esc($token) .. '">'
+  $b = $b .. fm_password("password", "New password", { required: true, help: "At least 12 characters.", help_tip: true })
+  $b = $b .. fm_password("password_confirm", "Confirm password", { required: true })
+  $b = $b .. '<div class="fm-actions"><button class="btn btn-primary" type="submit">Set password &amp; sign in</button></div>'
+  $b = $b .. '</form></div>'
+  return doc(200, "Set your password", nil, $b)
+end
+
+-- GET /portal/forgot — request a reset link. POST generates + emails it and
+-- ALWAYS shows the same "if that email exists…" response (no existence reveal).
+function pt_forgot_page($q)
+  $b = '<div class="cms-head"><h1>Reset your password</h1></div>'
+  if ("" .. fm_or($q["sent"], "")) == "1" then
+    return doc(200, "Reset password", nil, $b .. '<div class="card">If an account exists for that email, a reset link is on its way. Check your inbox (and spam).</div><p class="muted small"><a href="/portal/login">Back to sign in</a></p>')
+  end
+  $b = $b .. '<div class="card"><form method="post" action="/portal/forgot">'
+  $b = $b .. '<input type="hidden" name="csrf" value="' .. esc("" .. $CSRF) .. '">'
+  $b = $b .. fm_text("email", "Email", { required: true, autofocus: true, help: "We\'ll email a link to reset your password.", help_tip: true })
+  $b = $b .. '<div class="fm-actions"><button class="btn btn-primary" type="submit">Email me a reset link</button></div>'
+  $b = $b .. '</form><p class="muted small"><a href="/portal/login">Back to sign in</a></p></div>'
+  return doc(200, "Reset password", nil, $b)
+end
+
+-- POST /portal/forgot — never reveals whether the email exists. Response is
+-- byte-identical for found/not-found; the inline mail send leaves a residual
+-- TIMING channel (found = a JMAP send, not-found = none) which we accept for
+-- v1 (no async mail path; only a daily tick) behind hard rate limits (Codex A,
+-- thread 019f3edb). Limits fire for EVERY valid email (found or not) so the
+-- limiter can't itself become an existence oracle; a global cap bounds a sweep.
+function pt_forgot_post()
+  $fm = parse_form($BODY)
+  $email = lower(trim("" .. fm_or($fm["email"], "")))
+  if biz_is_plain_email($email) then
+    -- increment ALL buckets first (order matters: no short-circuit skipping a
+    -- bucket for a valid email). Global bounds a broad sweep; per-email bounds
+    -- probing one target.
+    $g = bp_rate_ok("pf:global", 100, 600)
+    $eh = bp_rate_ok("pf:e:" .. $email .. ":h", 3, 3600)
+    $ed = bp_rate_ok("pf:e:" .. $email .. ":d", 6, 86400)
+    if $g and $eh and $ed then
+      $cr = db_query("SELECT id, name FROM customers WHERE email = ?1 COLLATE NOCASE
+                      AND status != 'closed' LIMIT 1", [$email])
+      if length($cr) > 0 then
+        $raw = biz_issue_customer_token($cr[0].id, "reset", 2)
+        $link = biz_base_url() .. "/portal/set-password?token=" .. $raw
+        $body = "Hi " .. $cr[0].name .. ",\n\n"
+        $body = $body .. "Someone (hopefully you) asked to reset your " .. biz_brand() .. " portal password.\n\n"
+        $body = $body .. "Set a new password here (link valid 2 hours):\n" .. $link .. "\n\n"
+        $body = $body .. "If you didn't request this, you can ignore this email — your password is unchanged.\n\n— " .. biz_brand() .. " Billing\n"
+        biz_mail($email, "Reset your " .. biz_brand() .. " portal password", $body)
+      end
+    end
+  end
+  return redirect("/portal/forgot?sent=1")
+end
+
+-- ------------------------------------------------------------- main
+
+function portal_main()
+  cms_init()
+  biz_init()
+  $q = parse_query($QUERY)
+  $p = "" .. $PATH
+  -- anon-reachable auth surfaces (forms live in Mix; the crypto POSTs
+  -- /portal/login + /portal/set-password are webd Rust routes and never reach
+  -- here). These must work WITHOUT a session.
+  if $p == "/portal/login" then return pt_login_page($q) end
+  if $p == "/portal/set-password" then return pt_setpw_page($q) end
+  if $p == "/portal/forgot" then
+    if $METHOD == "POST" then return pt_forgot_post() end
+    return pt_forgot_page($q)
+  end
+
+  $user = current_user($HEADERS)
+  if $user == nil then
+    return redirect("/portal/login")
+  end
+  $cust = pt_customer($user)
+  if $cust == nil then
+    -- signed in, but not a billing customer (or an admin with no customer row).
+    -- Do NOT leak any data; a plain notice. Admins use /biz, not /portal.
+    return doc(200, "My account", $user,
+      '<div class="cms-head"><h1>No billing account</h1></div><div class="card muted">This sign-in isn\'t linked to a customer account. If you believe this is an error, email ' .. esc(biz_support_email()) .. '.</div>')
+  end
+
+  -- profile POST (the only mutation in the portal) — own row only
+  if $METHOD == "POST" and ("" .. $PATH) == "/portal/profile" then
+    $fm = parse_form($BODY)
+    if ("" .. fm_or($fm["action"], "")) == "save" then
+      $name = trim("" .. fm_or($fm["name"], ""))
+      if $name == "" then
+        return redirect_flash("/portal/profile", "Name is required.", "danger")
+      end
+      db_exec("UPDATE customers SET name = ?2, company = ?3, phone = ?4, address1 = ?5,
+               address2 = ?6, city = ?7, state = ?8, postcode = ?9, country = ?10, updated = ?11
+               WHERE id = ?1",
+              [$cust["id"], $name, "" .. fm_or($fm["company"], ""), "" .. fm_or($fm["phone"], ""),
+               "" .. fm_or($fm["address1"], ""), "" .. fm_or($fm["address2"], ""),
+               "" .. fm_or($fm["city"], ""), "" .. fm_or($fm["state"], ""),
+               "" .. fm_or($fm["postcode"], ""), "" .. fm_or($fm["country"], ""), biz_now()])
+      biz_audit($cust["email"], "profile_self_edit", "customers", $cust["id"], "portal")
+      return redirect_flash("/portal/profile", "Profile updated", "success")
+    end
+  end
+
+  $p = "" .. $PATH
+  if $p == "/portal/services" then return doc(200, "My services", $user, pt_services($cust)) end
+  if $p == "/portal/invoices" then return doc(200, "My invoices", $user, pt_invoices($cust)) end
+  if $p == "/portal/profile" then return doc(200, "My profile", $user, pt_profile_form($cust, "", $q)) end
+  return doc(200, "My account", $user, pt_overview($cust))
+end

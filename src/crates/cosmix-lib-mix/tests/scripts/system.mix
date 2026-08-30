@@ -1,0 +1,22 @@
+-- system.mix: test system builtins
+-- Expected output:
+-- string
+-- number
+-- true
+-- true
+
+-- env returns a string
+$home = env("HOME")
+print type($home)
+
+-- time returns a number
+$t = time()
+print type($t)
+
+-- pid returns a number > 0
+$p = pid()
+print $p > 0
+
+-- type of args is list
+$a = args()
+print type($a) == "list"

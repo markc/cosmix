@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="A Mix-rendered CMS in the dcs.spa shell, served by cosmix-webd.">
+    <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+    <title>{{TITLE}}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Quicksand:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Canonical pair: base.css (framework + scale tokens, declares the master @layer
+         order, defines zero colours) then site.css (the colour contract + per-site
+         chrome). See _decisions/2026-06-18-canonical-css-base-site-methodology.md -->
+    <link rel="stylesheet" href="/assets/base.css">
+    <link rel="stylesheet" href="/assets/site.css">
+    <!-- app.css: the merged CMS app layer (cms + datatable + forms + modals, P3).
+         Loaded AFTER base.css/site.css and intentionally UNLAYERED so its #content /
+         .datatable-skin / .forms-skin / .md-modal scoped rules still beat the dcs.spa
+         @layer cascade. The widget skins are inert until their wrapper class is present
+         (.datatable-skin / .forms-skin / .md-modal), so un-converted pages are
+         unaffected. See _plan/2026-06-17-css-consolidation-tokenization.md (P3). -->
+    <link rel="stylesheet" href="/assets/app.css">
+    <!-- Self-hosted (was an external unpkg.com CDN: render-blocking + network-gated).
+         `defer` so it no longer blocks first paint; the initial createIcons() call at
+         end-of-body runs on DOMContentLoaded (deferred scripts finish before that fires),
+         and the boost shim's post-swap createIcons is user-triggered (well after load). -->
+    <script defer src="/assets/lucide.min.js"></script>
+    <!-- DATASTAR adoption model = SSE patch TRANSPORT, not the client library.
+         Mix handlers emit the Datastar v1 SSE wire format via the ds_* builtins
+         (ds_patch_elements/ds_sse); the boost shim at end-of-body applies a
+         narrow, server-controlled patch subset to #content. We do NOT load
+         datastar.js: its data-* attributes evaluate via Function()/eval, which
+         needs CSP `'unsafe-eval'` — an XSS loss this admin/markdown shell won't
+         take (decision routed to Codex, 2026-06-15). Client reactivity stays in
+         base.js + small delegated vanilla JS. Revisit only with a deliberate
+         CSP-hardening pass (nonces, drop 'unsafe-inline'). -->
+    <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=s.scheme,h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
+    <style>
+    /* FOUC-critical only (the rest is in /assets/app.css; tokens in base.css). site.css
+       puts a FIXED background-image on <body>; during a content swap the solid
+       #content briefly dimmed and the fixed image flashed through, so use a
+       solid theme surface instead — flicker-free + theme-aware. */
+    body{background:var(--bg-primary);background-attachment:scroll;min-height:100dvh}
+    </style>
+</head>
+<body>
+<a class="skip-link" href="#content">Skip to content</a>
+<div id="nav-progress" aria-hidden="true"></div>
+<button class="menu-toggle" data-sidebar="left"><i data-lucide="menu"></i></button>
+<button class="menu-toggle" data-sidebar="right"><i data-lucide="menu"></i></button>
+
+<nav class="topnav">
+    <h1><a class="brand" href="/"{{BRAND_TITLE}}>{{BRAND}}</a></h1>
+</nav>
+
+<aside class="sidebar sidebar-left">
+    <div class="carousel-header">
+        <button class="pin-toggle" data-sidebar="left" title="Pin sidebar"><i data-lucide="pin"></i></button>
+        <div class="carousel-nav">
+            <button class="carousel-chevron" data-sidebar="left" data-dir="prev"><i data-lucide="chevron-left"></i></button>
+            <div class="carousel-dots">
+                <button class="carousel-dot active" data-sidebar="left" data-panel="0"></button>
+                <button class="carousel-dot" data-sidebar="left" data-panel="1"></button>
+                <button class="carousel-dot" data-sidebar="left" data-panel="2"></button>
+            </div>
+            <button class="carousel-chevron" data-sidebar="left" data-dir="next"><i data-lucide="chevron-right"></i></button>
+        </div>
+    </div>
+    <div class="panel-viewport">
+        <div class="panel-track">
+            <div class="panel">
+                <div class="panel-title">Navigation</div>
+                <div class="panel-content"><div class="cms-nav">{{NAV_PAGES}}</div></div>
+            </div>
+            <div class="panel">
+                <div class="panel-title">Posts</div>
+                <div class="panel-content"><div class="cms-nav">{{NAV_POSTS}}</div></div>
+            </div>
+            <div class="panel">
+                <div class="panel-title">Tour</div>
+                <div class="panel-content panel-content-flush">
+                    <div class="deck" tabindex="0" aria-label="DCS feature tour">
+                        <div class="deck-header">
+                            <button class="deck-btn" data-deck-dir="prev" aria-label="Previous slide">
+                                <i data-lucide="chevron-left"></i>
+                            </button>
+                            <div class="deck-counter" aria-live="polite">
+                                <span class="deck-current">01</span><span class="deck-sep">/</span><span class="deck-total">06</span>
+                            </div>
+                            <button class="deck-btn" data-deck-dir="next" aria-label="Next slide">
+                                <i data-lucide="chevron-right"></i>
+                            </button>
+                        </div>
+                        <div class="deck-progress"><div class="deck-progress-bar"></div></div>
+                        <div class="deck-viewport">
+                            <div class="deck-track">
+
+                                <article class="deck-slide active" data-deck-slide="0">
+                                    <div class="deck-num" aria-hidden="true">01</div>
+                                    <div class="deck-kicker">The Problem</div>
+                                    <h3 class="deck-title">Your content is narrow.<br>Your screen is wide.</h3>
+                                    <p class="deck-body">Traditional layouts waste the flanks or stuff every control into a single scrolling column. <strong>DCS</strong> turns ambient whitespace into two independent UI surfaces &mdash; navigation on the left, controls on the right &mdash; without stealing pixels from the story.</p>
+                                    <div class="deck-figure">
+                                        <div class="deck-figure-row">
+                                            <span class="deck-pill">wasted</span><span class="deck-pill deck-pill-solid">content</span><span class="deck-pill">wasted</span>
+                                        </div>
+                                        <div class="deck-figure-arrow" aria-hidden="true">&darr;</div>
+                                        <div class="deck-figure-row">
+                                            <span class="deck-pill deck-pill-accent">nav</span><span class="deck-pill deck-pill-solid">content</span><span class="deck-pill deck-pill-accent">controls</span>
+                                        </div>
+                                    </div>
+                                </article>
+
+                                <article class="deck-slide" data-deck-slide="1">
+                                    <div class="deck-num" aria-hidden="true">02</div>
+                                    <div class="deck-kicker">The Pattern</div>
+                                    <h3 class="deck-title">One sidebar.<br>Many panels.<br>Zero clutter.</h3>
+                                    <p class="deck-body">Each sidebar holds a horizontal carousel of panels. Chevrons and dots cycle through them without leaving the column. Unlimited surfaces, constant footprint &mdash; the one you are reading right now sits <em>inside</em> a panel that lives <em>inside</em> a carousel.</p>
+                                    <div class="deck-chiplist" aria-hidden="true">
+                                        <span class="deck-chip deck-chip-active">Tour</span>
+                                        <span class="deck-chip-arrow">&rsaquo;</span>
+                                        <span class="deck-chip">Nav</span>
+                                        <span class="deck-chip-arrow">&rsaquo;</span>
+                                        <span class="deck-chip">About</span>
+                                        <span class="deck-chip-arrow">&rsaquo;</span>
+                                        <span class="deck-chip">Docs</span>
+                                    </div>
+                                </article>
+
+                                <article class="deck-slide" data-deck-slide="2">
+                                    <div class="deck-num" aria-hidden="true">03</div>
+                                    <div class="deck-kicker">Mobile&#8209;First</div>
+                                    <h3 class="deck-title">100% viewport.<br>Transform&#8209;based.<br>Buttery smooth.</h3>
+                                    <p class="deck-body">Below 1280&thinsp;px, sidebars live off&#8209;screen at full width. A hamburger reveals them via <code>transform</code> &mdash; GPU&#8209;accelerated, no reflow, no drawer library. Tap outside to dismiss.</p>
+                                    <pre class="deck-code"><code><span class="tk-s">.sidebar</span> <span class="tk-p">{</span>
+  <span class="tk-k">transform</span>: <span class="tk-v">translateX(-100%)</span>;
+  <span class="tk-k">transition</span>: <span class="tk-v">transform 300ms</span>;
+<span class="tk-p">}</span>
+<span class="tk-s">.sidebar.open</span> <span class="tk-p">{</span>
+  <span class="tk-k">transform</span>: <span class="tk-v">translateX(0)</span>;
+<span class="tk-p">}</span></code></pre>
+                                </article>
+
+                                <article class="deck-slide" data-deck-slide="3">
+                                    <div class="deck-num" aria-hidden="true">04</div>
+                                    <div class="deck-kicker">Desktop</div>
+                                    <h3 class="deck-title">Pinned.<br>Persistent.<br>Asymmetric by default.</h3>
+                                    <p class="deck-body">At 1280&thinsp;px+, sidebars pin as columns. Content receives <code>margin&#8209;inline</code> &mdash; it reflows cleanly instead of being overlapped. Each side pins independently, so asymmetric layouts fall out for free.</p>
+                                    <div class="deck-stat">
+                                        <div class="deck-stat-value">10&ndash;100%</div>
+                                        <div class="deck-stat-label">user&#8209;adjustable width per side</div>
+                                    </div>
+                                </article>
+
+                                <article class="deck-slide" data-deck-slide="4">
+                                    <div class="deck-num" aria-hidden="true">05</div>
+                                    <div class="deck-kicker">Motion</div>
+                                    <h3 class="deck-title">Slide for space.<br>Fade for focus.</h3>
+                                    <p class="deck-body">Panels transition by sliding (physical &mdash; they move past you) or fading (semantic &mdash; they dissolve in place). Toggle live from the Appearance panel on the right and watch the difference between a spatial model and a content&#8209;parity one.</p>
+                                    <div class="deck-compare">
+                                        <div class="deck-compare-cell">
+                                            <div class="deck-compare-label">slide</div>
+                                            <div class="deck-compare-demo deck-compare-slide"><span></span><span></span><span></span></div>
+                                        </div>
+                                        <div class="deck-compare-cell">
+                                            <div class="deck-compare-label">fade</div>
+                                            <div class="deck-compare-demo deck-compare-fade"><span></span><span></span><span></span></div>
+                                        </div>
+                                    </div>
+                                </article>
+
+                                <article class="deck-slide" data-deck-slide="5">
+                                    <div class="deck-num" aria-hidden="true">06</div>
+                                    <div class="deck-kicker">Persistence</div>
+                                    <h3 class="deck-title">Pick it up<br>where you left it.</h3>
+                                    <p class="deck-body">Theme, scheme, pin state, active panel &mdash; all survive reloads via a single <code>localStorage</code> key. An inline pre&#8209;script paints the correct state before the first frame. Zero flash. Zero dependencies. Zero build step.</p>
+                                    <div class="deck-stack">
+                                        <div class="deck-stack-row"><span class="deck-stack-k">theme</span><span class="deck-stack-v">dark</span></div>
+                                        <div class="deck-stack-row"><span class="deck-stack-k">scheme</span><span class="deck-stack-v">ocean</span></div>
+                                        <div class="deck-stack-row"><span class="deck-stack-k">pinLeft</span><span class="deck-stack-v">true</span></div>
+                                        <div class="deck-stack-row"><span class="deck-stack-k">panelLeft</span><span class="deck-stack-v">0</span></div>
+                                        <div class="deck-stack-row"><span class="deck-stack-k">carousel</span><span class="deck-stack-v">slide</span></div>
+                                    </div>
+                                </article>
+
+                            </div>
+                        </div>
+                        <div class="deck-dots" role="tablist" aria-label="Slide indicators">
+                            <button class="deck-dot active" data-deck-goto="0" aria-label="Slide 1"></button>
+                            <button class="deck-dot" data-deck-goto="1" aria-label="Slide 2"></button>
+                            <button class="deck-dot" data-deck-goto="2" aria-label="Slide 3"></button>
+                            <button class="deck-dot" data-deck-goto="3" aria-label="Slide 4"></button>
+                            <button class="deck-dot" data-deck-goto="4" aria-label="Slide 5"></button>
+                            <button class="deck-dot" data-deck-goto="5" aria-label="Slide 6"></button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="profile">{{PROFILE}}</div>
+</aside>
+
+<aside class="sidebar sidebar-right">
+    <div class="carousel-header">
+        <div class="carousel-nav">
+            <button class="carousel-chevron" data-sidebar="right" data-dir="prev"><i data-lucide="chevron-left"></i></button>
+            <div class="carousel-dots">
+                <button class="carousel-dot active" data-sidebar="right" data-panel="0"></button>
+                <button class="carousel-dot" data-sidebar="right" data-panel="1"></button>
+            </div>
+            <button class="carousel-chevron" data-sidebar="right" data-dir="next"><i data-lucide="chevron-right"></i></button>
+        </div>
+        <button class="pin-toggle" data-sidebar="right" title="Pin sidebar"><i data-lucide="pin"></i></button>
+    </div>
+    <div class="panel-viewport">
+        <div class="panel-track">
+            <div class="panel">
+                <div class="panel-title">Posts</div>
+                <div class="panel-content"><div class="cms-nav">{{NAV_POSTS}}</div></div>
+            </div>
+            <div class="panel">
+                <div class="panel-title">Appearance</div>
+                <div class="panel-content">
+                    <div class="appearance-section">
+                        <div class="toggle-group">
+                            <button class="toggle-btn" data-theme="light">Light</button>
+                            <button class="toggle-btn" data-theme="dark">Dark</button>
+                        </div>
+                        <div class="toggle-group">
+                            <button class="toggle-btn" data-carousel="slide">Slide</button>
+                            <button class="toggle-btn" data-carousel="fade">Fade</button>
+                        </div>
+                        <div class="toggle-group">
+                            <button class="toggle-btn" data-width="narrow">Narrow</button>
+                            <button class="toggle-btn" data-width="normal">Normal</button>
+                            <button class="toggle-btn" data-width="wide">Wide</button>
+                        </div>
+                        <div class="sidebar-width-controls">
+                            <div class="sidebar-width-control">
+                                <label for="sidebar-width-left-input">Left Width %</label>
+                                <input id="sidebar-width-left-input" type="number" class="sidebar-width-spinner" data-side="left" min="10" max="100" value="20" step="5">
+                            </div>
+                            <div class="sidebar-width-control">
+                                <label for="sidebar-width-right-input">Right Width %</label>
+                                <input id="sidebar-width-right-input" type="number" class="sidebar-width-spinner" data-side="right" min="10" max="100" value="20" step="5">
+                            </div>
+                        </div>
+                        <div class="scheme-list">
+                            <button class="scheme-item" data-scheme="default">
+                                <span class="scheme-dot" style="background:oklch(50% 0.12 220)"></span>
+                                <span class="scheme-name">Ocean</span>
+                            </button>
+                            <button class="scheme-item" data-scheme="crimson">
+                                <span class="scheme-dot" style="background:oklch(47% 0.2 25)"></span>
+                                <span class="scheme-name">Crimson</span>
+                            </button>
+                            <button class="scheme-item" data-scheme="stone">
+                                <span class="scheme-dot" style="background:oklch(45% 0.05 60)"></span>
+                                <span class="scheme-name">Stone</span>
+                            </button>
+                            <button class="scheme-item" data-scheme="forest">
+                                <span class="scheme-dot" style="background:oklch(49% 0.12 150)"></span>
+                                <span class="scheme-name">Forest</span>
+                            </button>
+                            <button class="scheme-item" data-scheme="sunset">
+                                <span class="scheme-dot" style="background:oklch(52% 0.16 45)"></span>
+                                <span class="scheme-name">Sunset</span>
+                            </button>
+                            <button class="scheme-item" data-scheme="mono">
+                                <span class="scheme-dot" style="background:oklch(50% 0 0)"></span>
+                                <span class="scheme-name">Mono</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</aside>
+
+<main id="content" tabindex="-1"><div class="cms-wrap">{{CONTENT}}</div><footer class="cms-footer">{{FOOTER}}</footer></main>
+
+<script src="/assets/base.js"></script>
+<script src="/assets/site.js"></script>
+<script>
+/* Site-wide confirm gate (THE one owner — the per-render datatable shim and the old
+   md-modal fallback are both retired into this): ONE capture-phase submit listener; any
+   form whose SUBMITTER — or the form itself — carries data-confirm is intercepted and
+   gated by a styled <dialog class="dt-modal">. Degrades: no <dialog> support → browser
+   confirm(); no JS → plain submit. The destructive action is ALWAYS a real form submit;
+   the dialog only GATES it. Message set via textContent (never innerHTML) — no markup
+   injection. A fresh dialog is built per confirm and removed on close, so a boosted swap
+   can never leave a stale/detached dialog behind. */
+(function(){
+  if(window.__dtConfirmWired)return;window.__dtConfirmWired=1;window.__cmsConfirm=1;
+  document.addEventListener("submit",function(e){
+    var f=e.target,b=e.submitter;
+    var msg=(b&&b.dataset&&b.dataset.confirm)||(f.dataset&&f.dataset.confirm);
+    if(!msg)return;
+    // the programmatic re-submit after the user confirms: let it through once.
+    if(f.__dtok){f.__dtok=false;return;}
+    e.preventDefault();
+    // re-submit WITH the original submitter so its name/value (e.g. action=bulk_delete)
+    // is included; fall back to a hidden input + submit() when requestSubmit is absent.
+    // Clear __dtok AFTER requestSubmit so a validation-blocked re-submit (which never
+    // fires the submit event) can't leave the flag set and skip the NEXT gate.
+    function go(){if(f.requestSubmit){f.__dtok=true;if(b){f.requestSubmit(b);}else{f.requestSubmit();}f.__dtok=false;}else{if(b&&b.name){var hi=document.createElement("input");hi.type="hidden";hi.name=b.name;hi.value=b.value;f.appendChild(hi);}f.submit();}}
+    // feature-detect the actual method, not the constructor: a partial impl or
+    // polyfill exposing HTMLDialogElement without showModal must fall back too.
+    var d=document.createElement("dialog");
+    if(typeof d.showModal!=="function"){if(confirm(msg))go();return;}
+    // host: the nearest .datatable-skin token scope; on a plain page, a throwaway
+    // body-level .datatable-skin wrapper so the `.datatable-skin .dt-modal` CSS
+    // still applies (removed with the dialog on close).
+    var host=f.closest(".datatable-skin"),wrap=null;
+    if(!host){wrap=document.createElement("div");wrap.className="datatable-skin";document.body.appendChild(wrap);host=wrap;}
+    d.className="dt-modal";
+    d.innerHTML='<div class="dt-modal-icon" aria-hidden="true">!</div><h2 class="dt-modal-title">Please confirm</h2><p class="dt-modal-body"></p><div class="dt-modal-actions"><button type="button" class="btn btn-ghost" data-dt-cancel>Cancel</button><button type="button" class="btn btn-danger" data-dt-ok>Confirm</button></div>';
+    d.querySelector(".dt-modal-body").textContent=msg;
+    host.appendChild(d);
+    d.querySelector("[data-dt-ok]").onclick=function(){d.close();go();};
+    d.querySelector("[data-dt-cancel]").onclick=function(){d.close();};
+    d.addEventListener("close",function(){d.remove();if(wrap)wrap.remove();});
+    d.showModal();
+  },true);
+})();
+</script>
+<script>
+// Bottom-left profile popup: toggle on the button, close on any outside click.
+document.querySelectorAll('.profile-btn').forEach(function(b){
+  if(b.tagName!=='BUTTON')return;
+  b.addEventListener('click',function(e){e.stopPropagation();b.closest('.profile').classList.toggle('open');});
+});
+document.addEventListener('click',function(){
+  document.querySelectorAll('.profile.open').forEach(function(p){p.classList.remove('open');});
+});
+</script>
+<script>
+// Datastar-SSE boost shim (Part A.4) — replaces the hand-rolled full-page swap.
+// Eligible same-origin GET shell routes + content GET-forms are fetched with a
+// `Datastar-Request: true` header; the server (lib.mix doc()) answers with a
+// Datastar SSE stream that patches `.cms-wrap` (+ <title>) instead of the full
+// shell. The shim OWNS history and treats the Datastar path as an optimisation
+// only: it falls back to a full browser navigation on ANYTHING unexpected
+// (non-2xx, cross-origin redirect, non-SSE body, missing target, network
+// error), so no-JS and error paths always get a complete SSR page. The DCS
+// chrome (carousel/theme/pin) is base.js's job and is untouched by a swap.
+(function(){
+  var main = document.getElementById('content');
+  if(!main || !window.history || !window.fetch || !window.AbortController){ return; }
+  var cur = location.pathname + location.search;
+  var nav = 0;           // monotonic token — ignore a stale (superseded) response
+  var inflight = null;   // AbortController for the in-flight nav
+  var bar = document.getElementById('nav-progress');  // top loading indicator
+
+  // A GitHub/YouTube-style top progress bar so a boosted nav feels instant:
+  // ramp to ~75% on start, snap to 100% + fade on completion. The fade is a
+  // timeout; track + clear it so a completed nav's pending hide can't fire
+  // after a newer nav started (which would blank the bar mid-flight).
+  var doneTimer = null;
+  function navStart(){ if(!bar){ return; } if(doneTimer){ clearTimeout(doneTimer); doneTimer=null; } bar.classList.add('on'); bar.style.width='0%'; requestAnimationFrame(function(){ bar.style.width='75%'; }); }
+  function navDone(){ if(!bar){ return; } if(doneTimer){ clearTimeout(doneTimer); } bar.style.width='100%'; doneTimer=setTimeout(function(){ bar.classList.remove('on'); bar.style.width='0%'; doneTimer=null; }, 220); }
+
+  // Conservative allowlist: only same-origin GET *shell* routes are boosted.
+  // /pim (bare) 303-redirects to /pim/contacts; a redirect must be a full nav,
+  // so it stays excluded — only the /pim/* SSR pages are boosted.
+  function isContent(p){
+    return p==='/' || p.indexOf('/post/')===0 || p.indexOf('/page/')===0
+        || p==='/admin' || p.indexOf('/admin/')===0
+        || p.indexOf('/pim/')===0
+        || p==='/biz' || p.indexOf('/biz/')===0   // billing panel (all render doc(), no bare redirect) — datatable sort/search + billing nav boost
+        || p.indexOf('/ssh/')===0   // ssh manager panel (hosts/keys/scans render doc()) — boosted nav, no full reload
+        || p==='/portal' || p.indexOf('/portal/')===0   // customer portal (renders doc())
+        || p==='/blog' || p==='/posts'   // stable blog-index URLs (h_posts uses doc())
+        || p.indexOf('/category/')===0 || p.indexOf('/tag/')===0   // blog archives (h_archive uses doc())
+        || p.indexOf('/forum')===0   // forum board + topics (h_forum uses doc())
+        || p==='/files';   // the dual-pane file manager — boosted nav + in-place writes
+  }
+  function setActive(){
+    var path = location.pathname;
+    var links = document.querySelectorAll('.cms-nav-list a');
+    // A treeview LEAF whose href matches is the actual current page. In the SSH /
+    // Billing sections a BRANCH deliberately points at a child leaf's href (SSH->Hosts,
+    // Billing->Dashboard), so a naive pathname match lights up BOTH. Prefer the leaf:
+    // suppress a branch's own link when a same-href leaf is the page (page-tree branch
+    // PAGES have unique hrefs -> no leaf match -> they still highlight correctly).
+    var leafActive = false;
+    links.forEach(function(a){
+      if(a.getAttribute('href')===path && a.closest('.tv-leaf')) leafActive = true;
+    });
+    links.forEach(function(a){
+      var match = a.getAttribute('href')===path;
+      if(match && leafActive && !a.closest('.tv-leaf')) match = false;
+      a.classList.toggle('active', match);
+    });
+  }
+  // Minimal Datastar SSE applier: supports ONLY the subset doc()/dt_partial()
+  // emit — `datastar-patch-elements` with an explicit selector + `mode: inner`.
+  // Returns the ARRAY of patched elements (empty → caller full-reloads), so the
+  // caller can scope post-swap work (script re-run, scroll) to exactly what
+  // changed. We deliberately do NOT reimplement Datastar generally.
+  function applySSE(text){
+    var patched = [], blocks = text.split('\n\n');
+    for(var i=0;i<blocks.length;i++){
+      var lines = blocks[i].split('\n'), ev = '', selector = '', mode = 'outer', html = [];
+      for(var j=0;j<lines.length;j++){
+        var ln = lines[j];
+        if(ln.indexOf('event:')===0){ ev = ln.slice(6).trim(); }
+        else if(ln.indexOf('data:')===0){
+          var d = ln.slice(5).replace(/^ /,'');
+          var sp = d.indexOf(' '), key = sp<0?d:d.slice(0,sp), val = sp<0?'':d.slice(sp+1);
+          if(key==='selector'){ selector = val; }
+          else if(key==='mode'){ mode = val; }
+          else if(key==='elements'){ html.push(val); }
+        }
+      }
+      if(ev!=='datastar-patch-elements' || !selector){ continue; }
+      // The shim supports `mode: inner` ONLY. Every mode this nav path needs
+      // writes INSIDE its target (.cms-wrap/#region/<title> content); the
+      // sibling-inserting (before/after) and element-replacing/-removing
+      // (outer/replace/remove) modes could escape #content or destroy
+      // structural nodes even with a contained target, so fail closed on them
+      // (→ nothing applied → full reload). Extend deliberately if a partial
+      // ever needs append/prepend (Codex review).
+      if(mode!=='inner'){ continue; }
+      var el = document.querySelector(selector);
+      if(!el){ continue; }
+      // Containment guard: the response is same-origin, but narrow the write
+      // surface to what navigation needs — <title>, or #content / a descendant.
+      // Never the chrome, sidebars, <head>, or <script>.
+      if(el.tagName!=='TITLE' && el!==main && !main.contains(el)){ continue; }
+      el.innerHTML = html.join('\n');
+      patched.push(el);
+    }
+    return patched;
+  }
+  // Focus preservation across a region (inner) swap: applySSE replaces innerHTML, which
+  // destroys whatever the user was focused in (the live-search box, a per-page/group
+  // <select>). Capture the focused element's identity + (for a text field) its LIVE value
+  // and caret BEFORE the swap, then re-find it by id AFTER and restore — so typing in the
+  // search box survives a debounced re-query (and the value captured live wins over the
+  // server's echo, covering a keystroke landed during the fetch). Needs a stable id on the
+  // element; falls back to the historic #dt-heading focus on a full nav or when the focused
+  // element didn't survive (e.g. a sort-link click). Only id'd in-#content elements qualify.
+  function captureFocus(){
+    var ae = document.activeElement;
+    if(!ae || !ae.id || !main.contains(ae)){ return null; }
+    var field = ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA';
+    // `live` = a real-time search box (data-dt-live). Only such a field gets its LIVE value
+    // re-applied after the swap (to keep a keystroke typed during the fetch); every other
+    // field keeps the server-rendered value (so a server normalize/reject of e.g. a filter
+    // input isn't overwritten) and only gets focus + caret restored.
+    var s = { id: ae.id, field: field, live: !!(ae.matches && ae.matches('[data-dt-live]')), value: null, ss: 0, se: 0 };
+    if(field){ s.value = ae.value; try { s.ss = ae.selectionStart; s.se = ae.selectionEnd; } catch(e){ s.ss = s.se = (ae.value||'').length; } }
+    return s;
+  }
+  function restoreFocus(saved, fullSwap){
+    // A full content swap is a navigation → move focus to the new page heading (a11y),
+    // never restore the old page's field. A region partial → restore if it survived (and is
+    // still within #content — guard against an id collision elsewhere in the document).
+    if(saved && !fullSwap){
+      var el = document.getElementById(saved.id);
+      if(el && main.contains(el)){
+        if(saved.field){
+          if(saved.live){ try { el.value = saved.value; } catch(e){} }
+          el.focus();
+          try { if(el.setSelectionRange){ el.setSelectionRange(saved.ss, saved.se); } } catch(e){}
+        } else { el.focus(); }
+        return;
+      }
+    }
+    var hd = main.querySelector('#dt-heading'); if(hd){ hd.focus(); }
+  }
+  function afterSwap(patched, saved){
+    var fullSwap = false;
+    patched.forEach(function(el){
+      var isFull = el.matches && el.matches('.cms-wrap');
+      if(isFull){ fullSwap = true; }
+      // innerHTML never runs <script> — re-inject each WITHIN the patched
+      // region so inline scripts execute (the media uploader on a full swap;
+      // the datatable bulk select-all on a #dt-region partial). Scoped to the
+      // patched element so an unrelated region's scripts aren't re-run.
+      el.querySelectorAll('script').forEach(function(old){
+        var s = document.createElement('script');
+        for(var i=0;i<old.attributes.length;i++){ s.setAttribute(old.attributes[i].name, old.attributes[i].value); }
+        s.textContent = old.textContent;
+        old.replaceWith(s);
+      });
+      // Replay the page-transition fade ONLY on a FULL content swap (.cms-wrap).
+      // A #dt-region partial (datatable sort/page/search) updates IN PLACE with
+      // NO fade — React-like. Replaying cms-fade-in on every sort was the
+      // visible "flash"/FOUC; the region element persists so it never re-fades
+      // on its own, which is exactly what we want here.
+      if(isFull && el.style){ el.style.animation = 'none'; void el.offsetWidth; el.style.animation = ''; }
+    });
+    if(window.lucide && lucide.createIcons){ lucide.createIcons(); }
+    setActive();
+    // Let app-layer widgets re-reconcile after a boosted nav (the sidebar nav DOM
+    // persists across swaps, so e.g. the collapsible tree must re-open the new active
+    // path). site.js listens for this; nothing else depends on it.
+    document.dispatchEvent(new CustomEvent('cms:swapped'));
+    // Scroll to top only on a full content swap (.cms-wrap); a #dt-region
+    // partial (sort/page/search) keeps the user's scroll position.
+    if(fullSwap){ window.scrollTo(0,0); }
+    restoreFocus(saved, fullSwap);
+  }
+  // target is the region id (e.g. "dt-region" or "dt-region-<id>") the click/
+  // submit originated INSIDE — a datatable sort/page/search — or null for an
+  // ordinary nav. We send it as a `Datastar-Target` header so the handler for
+  // THAT table can return a narrow region patch (and, on a multi-table page,
+  // only the interacted table re-renders). The server still decides what to send
+  // (a list view returns a region patch; a view-change link like "+ New" falls
+  // through to a full .cms-wrap patch); the shim just applies whatever comes
+  // back, and afterSwap scopes its work to the patched region(s).
+  function go(url, push, target){
+    var token = ++nav;
+    if(inflight){ inflight.abort(); }
+    inflight = new AbortController();
+    navStart();
+    var hdrs = { 'Datastar-Request': 'true' };
+    if(target){ hdrs['Datastar-Target'] = target; }
+    fetch(url, {credentials:'same-origin', headers:hdrs, signal:inflight.signal})
+      .then(function(r){
+        var ct = r.headers.get('Content-Type') || '';
+        // Cross-origin redirect, non-2xx, or a non-SSE body → let the browser
+        // do it (covers expired-session → /login full pages, errors, etc.).
+        if(!r.ok || (r.redirected && new URL(r.url).origin !== location.origin) || ct.indexOf('text/event-stream') < 0){
+          throw 'fallback';
+        }
+        var finalUrl = r.redirected ? r.url : url;
+        return r.text().then(function(t){ return { t:t, finalUrl:finalUrl }; });
+      })
+      .then(function(res){
+        if(token !== nav){ return; }            // a newer nav superseded this one
+        var saved = captureFocus();              // before applySSE's innerHTML destroys it
+        var patched = applySSE(res.t);
+        if(!patched.length){ throw 'fallback'; } // nothing patched → full reload
+        if(push){ history.pushState({cms:1}, '', res.finalUrl); }
+        cur = location.pathname + location.search;
+        afterSwap(patched, saved);
+        navDone();
+      })
+      .catch(function(e){ if(e && e.name === 'AbortError'){ return; } location.href = url; });
+  }
+  // Public navigation hook for non-anchor UI: site.js whole-row datatable nav has
+  // no <a> for the click handler below to catch, so it calls this instead. Mirrors
+  // that handler's eligibility test, but FALLS BACK to a full browser navigation for
+  // an ineligible URL (off-site / non-content route) since there's no native anchor
+  // to defer to. `target` is an optional dt-region id; omit it for a view change (a
+  // row-open) so the server answers with a full .cms-wrap content swap. Defined only
+  // here, AFTER the capability guard above — so an unsupported browser (no fetch/
+  // history) leaves window.cmsBoost undefined and the caller full-navigates.
+  window.cmsBoost = {
+    navigate: function(href, target){
+      if(typeof href!=='string' || href.charAt(0)!=='/' || href.charAt(1)==='/'){ if(href){ location.href = href; } return; }
+      var path = href.split('#')[0].split('?')[0];
+      if(!isContent(path)){ location.href = href; return; }
+      var dest = href.split('#')[0];
+      if(dest===cur && href.indexOf('#')===-1){ return; }   // same view, no hash → no-op
+      go(href, true, target || null);
+    },
+    // Force an in-place re-render of the CURRENT view (no history push) — the hook a
+    // handler uses to refresh after a mutation done via fetch (e.g. the file
+    // manager's drag-drop / toolbar writes), since navigate() no-ops on same-URL.
+    refresh: function(){
+      if(!isContent(location.pathname)){ location.reload(); return; }
+      go(location.pathname + location.search, false, null);
+    }
+  };
+  document.addEventListener('click', function(e){
+    if(e.defaultPrevented || e.button!==0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey){ return; }
+    var a = e.target.closest('a[href]'); if(!a){ return; }
+    if(a.target==='_blank' || a.hasAttribute('download')){ return; }
+    // Skip links wired to a Datastar action (we don't annotate nav today; this
+    // future-proofs against a content-local @get link being double-handled).
+    for(var k=0;k<a.attributes.length;k++){ if(a.attributes[k].name.indexOf('data-on')===0){ return; } }
+    var href = a.getAttribute('href');
+    if(!href || href.charAt(0)!=='/' || href.charAt(1)==='/'){ return; }
+    var path = href.split('#')[0].split('?')[0];
+    if(!isContent(path)){ return; }
+    e.preventDefault();
+    var dest = href.split('#')[0];
+    // Same full view, no hash → a no-op (we've already prevented the default,
+    // so this stays a no-op instead of reloading — matches the old boost).
+    if(dest===cur && href.indexOf('#')===-1){ return; }
+    // A link inside a datatable region (sort/page/size) requests a narrow
+    // partial for THAT region (its own id); the server decides whether to honour
+    // it. closest([id^="dt-region"]) → "dt-region" for the single table, or
+    // "dt-region-<id>" for one table among several on the page.
+    var region = a.closest('[id^="dt-region"]');
+    go(href, true, region ? region.id : null);
+  });
+  // GET forms targeting a content route (e.g. the datatable search box) boost
+  // in place too: build the query string from the form and navigate.
+  document.addEventListener('submit', function(e){
+    if(e.defaultPrevented){ return; }
+    var f = e.target;
+    if(!f || (f.method||'get').toLowerCase()!=='get'){ return; }
+    var action = f.getAttribute('action') || location.pathname;
+    if(action.charAt(0)!=='/' || action.charAt(1)==='/'){ return; }
+    if(!isContent(action.split('?')[0])){ return; }
+    e.preventDefault();
+    // Drop empty fields so an empty search yields the bare canonical route
+    // (byte-identical to the widget's dt_href() links for the same view).
+    var fd = new FormData(f), usp = new URLSearchParams();
+    fd.forEach(function(v,k){
+      // trim the search term for any table — bare "q" or a namespaced "<id>.q".
+      if(k==='q' || k.slice(-2)==='.q'){ v = String(v).trim(); }
+      if(v!==''){ usp.append(k,v); }
+    });
+    var qs = usp.toString();
+    // The target the server should patch. A form may name an EXPLICIT sub-target via
+    // data-dt-target (the search form → its #dt-results slot, so only the table re-renders,
+    // not the whole region); otherwise the enclosing datatable region (full swap). The
+    // server decides what to actually send for that target.
+    var explicit = f.getAttribute('data-dt-target');
+    var region = f.closest('[id^="dt-region"]');
+    // A live (debounced) submit sets f.__boostReplace so each keystroke REPLACES the
+    // history entry instead of pushing one (no per-keystroke Back-button spam); a manual
+    // submit (Enter / the Search button) pushes as before. The flag is one-shot.
+    var replace = f.__boostReplace; f.__boostReplace = false;
+    go(action + (qs ? '?'+qs : ''), !replace, explicit || (region ? region.id : null));
+  });
+  window.addEventListener('popstate', function(){
+    if(location.pathname + location.search === cur){ return; } // ignore pure hash changes
+    // popstate always does a FULL nav (the whole content may change on back/
+    // forward); never a #dt-region partial.
+    go(location.href, false);                                  // restore view, no push
+  });
+  setActive();
+})();
+</script>
+<script>document.addEventListener('DOMContentLoaded',function(){window.lucide&&lucide.createIcons&&lucide.createIcons();});</script>
+</body>
+</html>

@@ -1,0 +1,432 @@
+-- modals.mix — shared SSR modal shell for the webd CMS/PIM tree.
+--
+-- Plan of record: _plan/2026-06-17-modals-widget.md.
+-- Visual target: Filament 5 Modals (filamentphp.com/docs; screenshots deleted 2026-07-23, git history — anatomy ONLY, never its
+-- palette). Sibling of widgets/datatable.mix + widgets/forms.mix; same conventions.
+--
+-- ONE copy at /opt/cosmix/vhosts/shared/widgets/modals.mix; `include`-d by a handler
+-- AFTER lib.mix (so esc() resolves at call-time). Self-contained — does NOT depend on
+-- forms.mix or datatable.mix (but composes with them: put fm_* fields in the body, and
+-- a datatable header/row action can open a modal via its `modal` field, see datatable's
+-- dt_action_link).
+--
+-- MECHANISM: a native <dialog> + showModal()/close() (Escape-close, ::backdrop and the
+-- top layer come free). One idempotent document-level shim (md_script(), emit once)
+-- handles open ([data-modal-open]), close ([data-modal-close] + backdrop click) and the
+-- static (non-dismissable) guard. The dialog must live OUTSIDE a Datastar-swapped region
+-- (so a swap never destroys an open modal or re-runs its <script>), but INSIDE #content
+-- (a top-layer <dialog> stays a DOM descendant, so inner fm_* fields are still skinned).
+--
+-- DISCIPLINE (mirrors forms.mix / datatable.mix): escape-once firewall (every value/
+-- label/title/subtitle through esc() once); author literals (size, button/icon variant)
+-- run through an ALLOWLIST; the modal id is VALIDATED (md_id_ok, die on bad) because it
+-- flows into a DOM id + data-modal-open + getElementById and MUST match on both sides.
+-- NO mix-0.20 syntax (?? / ?:) — webd embeds its own cosmix-lib-mix.
+
+-- ───────────────────────────── helpers ─────────────────────────────
+
+function md_or($v, $def)
+  if $v == nil then
+    return $def
+  end
+  return $v
+end
+
+-- Validate a modal id: lowercase [a-z0-9_-], non-empty (matches the datatable's
+-- dt_id_ok so a modal id is valid identically whether opened by a datatable action or
+-- a md_trigger). Author-set, flows into id + data-modal-open + getElementById, so a
+-- typo is a loud config error, not a silent mismatch. Returns bool. NB the nil guard
+-- is load-bearing: "" .. nil is the literal text "nil", which would otherwise pass the
+-- char check and accept a missing id as id="nil".
+function md_id_ok($s)
+  if $s == nil then
+    return false
+  end
+  $str = "" .. $s
+  if $str == "" then
+    return false
+  end
+  $i = 0
+  $n = length($str)
+  while $i < $n
+    $ch = substr($str, $i, 1)
+    if not (($ch >= "a" and $ch <= "z") or ($ch >= "0" and $ch <= "9") or $ch == "-" or $ch == "_") then
+      return false
+    end
+    $i = $i + 1
+  end
+  return true
+end
+
+-- Size allowlist → "md" fallback (firewall: flows into a .md-sz-<x> class).
+function md_size_ok($s)
+  $x = lower(trim("" .. md_or($s, "md")))
+  if $x == "sm" or $x == "md" or $x == "lg" or $x == "xl" or $x == "2xl" then
+    return $x
+  end
+  return "md"
+end
+
+-- Button-variant allowlist → "primary" fallback.
+function md_btn_variant_ok($v)
+  $x = lower(trim("" .. md_or($v, "primary")))
+  if $x == "primary" or $x == "ghost" or $x == "danger" or $x == "warning" or $x == "success" or $x == "info" then
+    return $x
+  end
+  return "primary"
+end
+
+-- Icon-circle variant allowlist → "danger" fallback (confirm default).
+function md_icon_variant_ok($v)
+  $x = lower(trim("" .. md_or($v, "danger")))
+  if $x == "danger" or $x == "warning" or $x == "success" or $x == "info" or $x == "primary" then
+    return $x
+  end
+  return "danger"
+end
+
+-- Inline-SVG icon registry (the dt_icon/fm_icon shape) — confirm/header glyphs. "" on miss.
+function md_icon($name)
+  $n = "" .. $name
+  if $n == "warning" or $n == "alert" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"></path><path d="M12 9v4"></path><path d="M12 17h.01"></path></svg>'
+  end
+  if $n == "trash" or $n == "delete" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"></path><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"></path></svg>'
+  end
+  if $n == "info" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 16v-4"></path><path d="M12 8h.01"></path></svg>'
+  end
+  if $n == "check" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg>'
+  end
+  if $n == "plus" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"></path><path d="M5 12h14"></path></svg>'
+  end
+  if $n == "x" or $n == "close" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>'
+  end
+  return ""
+end
+
+-- One footer button: {label, variant?, href?, modal?}. modal → opens a dialog;
+-- href → a link; else a plain inert button.
+function md_action_btn($b)
+  $var = md_btn_variant_ok(md_or($b["variant"], "ghost"))
+  $cls = "btn btn-" .. $var
+  $label = esc("" .. md_or($b["label"], ""))
+  if $b["modal"] != nil then
+    if not md_id_ok($b["modal"]) then
+      die("modals: invalid footer action modal id (allowed [a-z0-9_-]): " .. ("" .. $b["modal"]))
+    end
+    return '<button type="button" class="' .. $cls .. '" data-modal-open="' .. esc("" .. $b["modal"]) .. '">' .. $label .. '</button>'
+  end
+  if $b["href"] != nil then
+    return '<a class="' .. $cls .. '" href="' .. esc("" .. $b["href"]) .. '">' .. $label .. '</a>'
+  end
+  return '<button type="button" class="' .. $cls .. '">' .. $label .. '</button>'
+end
+
+-- ───────────────────────────── bands ─────────────────────────────
+
+-- The header band: form modal = heading left + close X; confirm = centered tinted
+-- icon-circle + heading + description, close X top-right.
+function md_head_band($o, $confirm, $close_button)
+  $title = "" .. md_or($o["title"], "")
+  $sub = $o["subtitle"]
+  $h = '<header class="md-head">'
+  if $confirm then
+    $ivar = md_icon_variant_ok(md_or($o["icon_variant"], "danger"))
+    $iname = "" .. md_or($o["icon"], "warning")
+    $h = $h .. '<div class="md-icon md-icon-' .. $ivar .. '">' .. md_icon($iname) .. '</div>'
+    if $title != "" then
+      $h = $h .. '<h2 class="md-title">' .. esc($title) .. '</h2>'
+    end
+    if $sub != nil and ("" .. $sub) != "" then
+      $h = $h .. '<p class="md-sub">' .. esc($sub) .. '</p>'
+    end
+  else
+    $h = $h .. '<div class="md-head-text">'
+    if $title != "" then
+      $h = $h .. '<h2 class="md-title">' .. esc($title) .. '</h2>'
+    end
+    if $sub != nil and ("" .. $sub) != "" then
+      $h = $h .. '<p class="md-sub">' .. esc($sub) .. '</p>'
+    end
+    $h = $h .. '</div>'
+  end
+  if $close_button then
+    $h = $h .. '<button type="button" class="md-close" data-modal-close aria-label="Close">' .. md_icon("x") .. '</button>'
+  end
+  $h = $h .. '</header>'
+  return $h
+end
+
+-- The footer band. A `footer` opt overrides the whole thing (raw HTML). Otherwise it
+-- builds Submit (default "Submit" / confirm "Confirm"; submit:false → none) + extras +
+-- Cancel (default "Cancel" / data-modal-close; cancel:false → none). Confirm uses the
+-- split layout (Cancel | Submit, equal width); the Submit colour follows icon_variant.
+function md_foot_band($o, $confirm)
+  if $o["footer"] != nil then
+    $fcls = "md-foot"
+    if $confirm then
+      $fcls = $fcls .. " md-foot-split"
+    end
+    return '<footer class="' .. $fcls .. '">' .. ("" .. $o["footer"]) .. '</footer>'
+  end
+
+  $submit = $o["submit"]
+  $show_submit = true
+  if $submit == false then
+    $show_submit = false
+  end
+  if $submit == nil then
+    if $confirm then
+      $submit = "Confirm"
+    else
+      $submit = "Submit"
+    end
+  end
+  $svdef = "primary"
+  if $confirm then
+    $svdef = md_icon_variant_ok(md_or($o["icon_variant"], "danger"))
+  end
+  $svar = md_btn_variant_ok(md_or($o["submit_variant"], $svdef))
+
+  $cancel = $o["cancel"]
+  $show_cancel = true
+  if $cancel == false then
+    $show_cancel = false
+  end
+  if $cancel == nil then
+    $cancel = "Cancel"
+  end
+
+  $submit_btn = ""
+  if $show_submit then
+    $submit_btn = '<button type="submit" class="btn btn-' .. $svar .. '">' .. esc($submit) .. '</button>'
+  end
+  $cancel_btn = ""
+  if $show_cancel then
+    $cancel_btn = '<button type="button" class="btn btn-ghost" data-modal-close>' .. esc($cancel) .. '</button>'
+  end
+
+  if $confirm then
+    return '<footer class="md-foot md-foot-split">' .. $cancel_btn .. $submit_btn .. '</footer>'
+  end
+
+  $extras = ""
+  if $o["extra"] != nil then
+    for each $b in $o["extra"]
+      $extras = $extras .. md_action_btn($b)
+    end
+  end
+  return '<footer class="md-foot">' .. $submit_btn .. $extras .. $cancel_btn .. '</footer>'
+end
+
+-- ───────────────────────── public API ─────────────────────────
+
+-- The opening <dialog …> tag carrying every dialog-level class/flag (size, confirm,
+-- sticky, slideover, forms-skin, data-md-static). Shared by md_modal (full modal) and
+-- md_shell (the empty persistent fetch target for modal-driven Edit). $id is VALIDATED
+-- (flows into a DOM id + getElementById + data-modal-open, MUST match on both sides).
+function md_dialog_tag($id, $opts)
+  if not md_id_ok($id) then
+    die("modals: invalid modal id (allowed [A-Za-z0-9_-], non-empty): " .. ("" .. $id))
+  end
+  $o = $opts
+  if $o == nil then
+    $o = {}
+  end
+  $size = md_size_ok($o["size"])
+  $confirm = ($o["confirm"] == true)
+  $sticky = ($o["sticky"] == true)
+  $slideover = ($o["slideover"] == true)
+  $dismissable = true
+  if $o["dismissable"] == false then
+    $dismissable = false
+  end
+  $skin = true
+  if $o["skin"] == false then
+    $skin = false
+  end
+
+  $dcls = "md-modal md-sz-" .. $size
+  if $confirm then
+    $dcls = $dcls .. " md-confirm"
+  end
+  if $sticky then
+    $dcls = $dcls .. " md-sticky"
+  end
+  if $slideover then
+    $dcls = $dcls .. " md-slideover"
+  end
+  if $skin then
+    $dcls = "forms-skin " .. $dcls
+  end
+
+  $h = '<dialog id="' .. esc("" .. $id) .. '" class="' .. $dcls .. '"'
+  if not $dismissable then
+    $h = $h .. ' data-md-static'
+  end
+  return $h .. '>'
+end
+
+-- The dialog's INNER panel: the optional <form> wrap + header + body + footer. Returned
+-- on its own as the fetch FRAGMENT for modal-driven Edit (md_script's fetch-open handler
+-- patches it into the persistent md_shell dialog), and wrapped by md_modal for the static
+-- case. $body = the inner content HTML (fm_* fields, or "" for a pure confirm).
+function md_panel($opts, $body)
+  $o = $opts
+  if $o == nil then
+    $o = {}
+  end
+  $confirm = ($o["confirm"] == true)
+  $close_button = true
+  if $o["close_button"] == false then
+    $close_button = false
+  end
+
+  $h = '<div class="md-panel">'
+  $hasform = ($o["form"] != nil)
+  if $hasform then
+    $fo = $o["form"]
+    $method = "post"
+    if $fo["method"] != nil then
+      $method = "" .. $fo["method"]
+    end
+    $h = $h .. '<form method="' .. esc($method) .. '" action="' .. esc("" .. md_or($fo["action"], "")) .. '" class="md-form"'
+    if $fo["id"] != nil then
+      $h = $h .. ' id="' .. esc("" .. $fo["id"]) .. '"'
+    end
+    if $fo["enctype"] != nil then
+      $h = $h .. ' enctype="' .. esc($fo["enctype"]) .. '"'
+    end
+    if $fo["onsubmit"] != nil then
+      $h = $h .. ' onsubmit="' .. esc($fo["onsubmit"]) .. '"'
+    end
+    $h = $h .. '>'
+  end
+
+  -- header slot: a `header` opt supplies raw HTML (e.g. fm_form's shared top bar), wrapped in
+  -- the .md-head band (so it gets the panel's padding) IN PLACE of the default
+  -- title/subtitle/close-X. Lets a modal match a canvas page's chrome.
+  if $o["header"] != nil then
+    $h = $h .. '<header class="md-head">' .. ("" .. $o["header"]) .. '</header>'
+  else
+    $h = $h .. md_head_band($o, $confirm, $close_button)
+  end
+  $h = $h .. '<div class="md-body">' .. md_or($body, "") .. '</div>'
+  $h = $h .. md_foot_band($o, $confirm)
+
+  if $hasform then
+    $h = $h .. '</form>'
+  end
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- The modal. $id = the dialog id (matched by a trigger's data-modal-open). $body = the
+-- inner content HTML (fm_* fields, or "" for a pure confirm). See the opts list in §4 of
+-- the plan. Place the returned <dialog> OUTSIDE any Datastar-swapped region but inside
+-- #content; emit md_script() once on the page.
+function md_modal($id, $opts, $body)
+  return md_dialog_tag($id, $opts) .. md_panel($opts, $body) .. '</dialog>'
+end
+
+-- An EMPTY persistent dialog shell — the fetch target for modal-driven Edit. Place it
+-- ONCE per page OUTSIDE any swapped region but inside #content (like a static md_modal).
+-- A row Edit action (datatable `modal:` field, or a [data-modal-src] link) makes
+-- md_script's fetch-open handler GET the per-row form fragment (md_fragment server-side,
+-- = an md_panel) into this dialog's innerHTML, then showModal(). One shell serves every
+-- row — the panel is lazy-loaded per click, so the page size never multiplies dialogs.
+-- $opts carries only dialog-level chrome (size, skin, sticky, dismissable); the panel's
+-- title/form/footer arrive with each fetched fragment.
+function md_shell($id, $opts)
+  return md_dialog_tag($id, $opts) .. '</dialog>'
+end
+
+-- True when this GET was issued by md_script's fetch-open handler (the `X-Modal-Fetch`
+-- request header) — i.e. the client wants a bare md_panel fragment to inject into an
+-- existing <dialog>, NOT a full page. ($HEADERS keys arrive lowercased, lib.mix.) A
+-- handler branches on this in its edit/new path to return md_fragment(md_panel(...))
+-- instead of doc(...); a no-JS full navigation (no header) still gets the whole page.
+function md_is_modal_request()
+  return has_key($HEADERS, "x-modal-fetch")
+end
+
+-- Wrap a TRUSTED HTML fragment (an md_panel) as a bare text/html response for the modal
+-- fetch — no shell, no CSP (it is injected into an already-rendered, already-CSP'd page).
+-- $html is the SAME trust as doc()'s $body (handler-built, fm_*/esc()'d at source).
+function md_fragment($html)
+  $hdrs = { "Content-Type": "text/html; charset=utf-8", "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store" }
+  return { status: 200, headers: $hdrs, body: "" .. $html }
+end
+
+-- ── the CANONICAL shared fragments (webd-modals Foundation) ──
+-- These are COMPLETE fragment responses — a handler returns them directly.
+-- Re-inlining their copy in a handler is drift (foundation_check §modals).
+
+-- The modal-fetch-on-expired-session guard body: every handler's modal-capable
+-- entry point returns this when md_is_modal_request() and no user — a login
+-- REDIRECT would otherwise be injected into the open dialog.
+--   if md_is_modal_request() and $user == nil then
+--     return md_session_expired("/biz/customers")
+--   end
+function md_session_expired($next)
+  return md_fragment(md_panel({ title: "Session expired", submit: false, cancel: "Close" },
+    '<p class="fm-help">Your session has expired. <a href="/auth/login?next=' .. url_encode("" .. $next) .. '">Sign in again</a> to continue.</p>'))
+end
+
+-- The modal-fetch row-vanished fragment (an Edit opened on a row a concurrent
+-- delete removed). $noun is lowercase ("customer"); $back is the list route.
+function md_not_found($noun, $back)
+  $n = trim("" .. fm_or($noun, ""))
+  if $n == "" then
+    $n = "item"
+  end
+  $t = upper(substr($n, 0, 1)) .. substr($n, 1, length($n) - 1) .. " not found"
+  return md_fragment(md_panel({ title: $t, submit: false, cancel: "Close" },
+    '<p class="fm-help">It may have been deleted. <a href="' .. esc("" .. $back) .. '">Back to the list</a>.</p>'))
+end
+
+-- A standalone trigger button (for non-datatable contexts; the datatable header/row
+-- actions open a modal via their own `modal` field). opts: variant, icon.
+function md_trigger($id, $label, $opts)
+  if not md_id_ok($id) then
+    die("modals: invalid modal id: " .. ("" .. $id))
+  end
+  $o = $opts
+  if $o == nil then
+    $o = {}
+  end
+  $var = md_btn_variant_ok(md_or($o["variant"], "primary"))
+  $ic = ""
+  if $o["icon"] != nil then
+    $ic = md_icon($o["icon"])
+  end
+  return '<button type="button" class="btn btn-' .. $var .. '" data-modal-open="' .. esc("" .. $id) .. '">' .. $ic .. esc("" .. $label) .. '</button>'
+end
+
+-- The once-per-page idempotent open/close/backdrop shim. Emit OUTSIDE the swapped
+-- region (it self-guards via window.__mdInit so a full-nav re-send is harmless).
+--
+-- The click listener is CAPTURE-phase, so its [data-modal-src] branch runs BEFORE the
+-- end-of-body Datastar boost shim's bubble-phase link handler (shell.html) and its
+-- preventDefault() makes that shim bail (it checks defaultPrevented). So a row Edit
+-- control is a real <a href="…?edit=ID&modal=1"> — with JS it is intercepted here and the
+-- fragment is lazy-fetched into the target dialog (data-modal-open=ID); with NO JS the
+-- same href navigates to the full edit page (the server returns the whole page when the
+-- X-Modal-Fetch header is absent). The [data-modal-src] branch is checked first and
+-- returns, so a fetch trigger never also fires the plain (already-populated) open branch.
+-- The auto-open block (tail of the IIFE) opens the persistent #md-settings shell on load when
+-- the URL carries ?openmodal=<token>, mapping a FIXED token to its fragment source (never a
+-- fetchable URL from the query — the fetched fragment's <script> tags are re-executed, so an
+-- attacker-supplied URL would be an HTML-injection sink). Used by the Settings surfaces: a
+-- direct /…/settings visit redirects to the dashboard with ?openmodal=… so Settings only ever
+-- presents as a popup, with no orphan full page. Auto-open passes noNav=true so a failed fetch
+-- does NOT navigate (which would loop back through the redirect). The param is stripped via
+-- replaceState so a refresh doesn't re-open.
+function md_script()
+  return '<script>(function(){if(window.__mdInit){return}window.__mdInit=1;function openSrc(sd,url,rf,noNav){fetch(url,{credentials:"same-origin",headers:{"X-Modal-Fetch":"1"}}).then(function(r){if(!r.ok){throw 0}return r.text()}).then(function(html){sd.innerHTML=html;sd.querySelectorAll("script").forEach(function(old){var s=document.createElement("script");for(var i=0;i<old.attributes.length;i++){s.setAttribute(old.attributes[i].name,old.attributes[i].value)}s.textContent=old.textContent;old.replaceWith(s)});if(window.lucide&&lucide.createIcons){lucide.createIcons()}if(sd.showModal&&!sd.open){sd.__rf=rf;sd.showModal()}}).catch(function(){if(!noNav){location.href=url}})}document.addEventListener("click",function(e){var src=e.target.closest("[data-modal-src]");if(src){e.preventDefault();var sid=src.getAttribute("data-modal-open"),url=src.getAttribute("data-modal-src"),sd=sid?document.getElementById(sid):null;if(!sd){location.href=url;return}openSrc(sd,url,src,false);return}var o=e.target.closest("[data-modal-open]");if(o){var d=document.getElementById(o.getAttribute("data-modal-open"));if(d&&d.showModal&&!d.open){d.__rf=o;d.showModal()}return}var c=e.target.closest("[data-modal-close]");if(c){var dd=c.closest("dialog");if(dd){dd.close()}return}var dlg=e.target;if(dlg&&dlg.tagName==="DIALOG"&&dlg.classList.contains("md-modal")&&!dlg.hasAttribute("data-md-static")){dlg.close()}},true);document.addEventListener("cancel",function(e){var d=e.target;if(d&&d.classList&&d.classList.contains("md-modal")&&d.hasAttribute("data-md-static")){e.preventDefault()}},true);document.addEventListener("close",function(e){var d=e.target;if(d&&d.classList&&d.classList.contains("md-modal")&&d.__rf&&d.__rf.focus){try{d.__rf.focus()}catch(_){}}},true);function autoOpen(){try{var qp=new URLSearchParams(location.search),om=qp.get("openmodal");if(om){var MAP={"admin-settings":"/admin/settings?modal=1","biz-settings":"/biz/settings?modal=1"},msrc=MAP[om],sd0=document.getElementById("md-settings");if(msrc&&sd0){openSrc(sd0,msrc,null,true)}qp.delete("openmodal");var qs=qp.toString();history.replaceState(null,"",location.pathname+(qs?"?"+qs:"")+location.hash)}}catch(_){}}autoOpen();document.addEventListener("cms:swapped",autoOpen)})();</script>'
+end

@@ -1,0 +1,23 @@
+[package]
+name = "cosmix-lib-agent"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent loop, session management, and tool registry for LLM-driven workflows"
+
+[lib]
+name = "cosmix_agent"
+path = "src/lib.rs"
+
+[dependencies]
+cosmix_llm = { package = "cosmix-lib-llm", path = "../cosmix-lib-llm" }
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+async-trait = "0.1"

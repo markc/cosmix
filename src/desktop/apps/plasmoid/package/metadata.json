@@ -1,0 +1,24 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Mark Constable"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "CosMix applications, daemons, Bus mesh, Mix scripts and SSH hosts",
+        "EnabledByDefault": true,
+        "FormFactors": [
+            "desktop"
+        ],
+        "Icon": "dev.cosmix.tray",
+        "Id": "dev.cosmix.plasmoid",
+        "License": "MIT",
+        "Name": "CosMix",
+        "Version": "0.5.0"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-NotificationArea": "true",
+    "X-Plasma-NotificationAreaCategory": "SystemServices"
+}

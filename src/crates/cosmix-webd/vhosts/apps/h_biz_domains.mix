@@ -1,0 +1,628 @@
+-- h_biz_domains.mix — billing domain list/detail/edit (ANY /biz/domains). Admin-only.
+-- Built on biz.mix (schema, audit, money/date helpers) + the shared datatable/forms/
+-- modals pattern (mirrors h_admin_users). Money = INTEGER cents, dates = civil TEXT.
+--   GET  /biz/domains                 → list (dt_sql over domains)
+--   GET  /biz/domains?view=<id>       → detail: info card + related invoices + pending jobs
+--   GET  /biz/domains?new=1           → blank add form (full page; &modal=1 → md fragment)
+--   GET  /biz/domains?edit=<id>       → edit form (full page; &modal=1 → md fragment)
+--   POST action=save                  → create (no id) / update (id; domain immutable)
+--   POST action=delete / row:delete   → remove (refused while invoice_items reference it)
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/admin_resource.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+include "/opt/cosmix/vhosts/shared/apps/biz.mix"
+
+-- Is the toolsd surface available on THIS vhost? Explicit opt-in, DEFAULT OFF —
+-- deliberately not feature()/features.tools, because feature() defaults a MISSING key to
+-- ON, which would put the Shwho item on every vhost that never opted in (the billing
+-- vhost has no /tools/* routes, so it would render a menu entry that 404s). The shared handler tree
+-- is shared with prod, so the gate has to fail closed.
+--
+-- A vhost enables it with `tools: true` in site.conf.mix, which it should only do once
+-- deploy_toolsd.mix has run against that node AND its routes.mix carries the /tools/*
+-- routes. See _toolsd/toolsd.mix and shared/apps/tools_registry.mix.
+function bd_tools_enabled()
+  return $SITE["tools"] == true
+end
+
+-- Domain status → Filament badge variant.
+function bd_status_variant($s)
+  $v = "" .. $s
+  if $v == "active" then
+    return "success"
+  end
+  if $v == "expired" then
+    return "danger"
+  end
+  if $v == "pending" then
+    return "info"
+  end
+  -- transferred_away / cancelled
+  return "gray"
+end
+
+-- Invoice status → badge variant (the related-invoices card).
+function bd_inv_variant($s)
+  $v = "" .. $s
+  if $v == "paid" then
+    return "success"
+  end
+  if $v == "open" then
+    return "warning"
+  end
+  if $v == "draft" then
+    return "info"
+  end
+  return "gray"
+end
+
+-- Posted status → the schema CHECK allowlist (default active), so a tampered
+-- value can never reach the CHECK constraint as a SQL error.
+function bd_status_norm($s)
+  $v = "" .. $s
+  if $v == "pending" or $v == "expired" or $v == "transferred_away" or $v == "cancelled" then
+    return $v
+  end
+  return "active"
+end
+
+function bd_yesno($v)
+  if ("" .. $v) == "1" then
+    return "✓"
+  end
+  return "—"
+end
+
+function bd_dash($v)
+  if $v == nil or ("" .. $v) == "" then
+    return "—"
+  end
+  return "" .. $v
+end
+
+-- " (+20%)" markup annotation for the detail card, derived from the stored
+-- cost→price pair (so it reflects the real numbers, not the setting). Empty
+-- when cost is 0/unknown (can't compute a percentage).
+function bd_markup_note($cost, $price)
+  $c = to_number($cost)
+  $p = to_number($price)
+  if $c == nil or $p == nil or $c <= 0 then
+    return ""
+  end
+  $pct = round(($p - $c) * 100 / $c)
+  return " (+" .. $pct .. "%)"
+end
+
+-- Customers, name-sorted — ONE query feeds both the edit-form select and the
+-- list's prefetched id→name cell map (no per-row lookups).
+function bd_customers()
+  return db_query("SELECT id, name, company FROM customers ORDER BY name", [])
+end
+
+function bd_customer_names($custs)
+  $m = {}
+  for each $c in $custs
+    $m["" .. $c.id] = "" .. $c.name
+  end
+  return $m
+end
+
+function bd_customer_options($custs)
+  $opts = []
+  for each $c in $custs
+    $lbl = "" .. $c.name
+    if ("" .. $c.company) != "" then
+      $lbl = $lbl .. " — " .. $c.company
+    end
+    push($opts, { value: "" .. $c.id, "label": $lbl })
+  end
+  return $opts
+end
+
+-- cents → a plain "d.cc" dollars string for the <input type=number> value
+-- (fmt_aud's $/commas would break the numeric input).
+function bd_cents_dollars($cents)
+  $n = to_number($cents)
+  if $n == nil then
+    $n = 0
+  end
+  $d = floor($n / 100)
+  $c = $n - $d * 100
+  $cs = "" .. $c
+  if $c < 10 then
+    $cs = "0" .. $c
+  end
+  return ("" .. $d) .. "." .. $cs
+end
+
+-- dollars input → integer cents; "" → 0; junk/negative → nil (a validation error).
+function bd_parse_cents($s)
+  $t = trim("" .. $s)
+  if $t == "" then
+    return 0
+  end
+  $t = replace(replace($t, "$", ""), ",", "")
+  $n = to_number($t)
+  if $n == nil then
+    return nil
+  end
+  if $n < 0 then
+    return nil
+  end
+  return floor($n * 100 + 0.5)
+end
+
+-- Load one domain by id → the row map, or nil.
+function bd_get_one($id)
+  $n = to_number($id)
+  if $n == nil then
+    return nil
+  end
+  $r = db_query("SELECT * FROM domains WHERE id = ?1", [$n])
+  if length($r) == 1 then
+    return $r[0]
+  end
+  return nil
+end
+
+-- Delete-guard: "" when deletable, else the reason. Invoice lines are the financial
+-- record — a referenced domain is cancelled, never deleted.
+function bd_del_block($id)
+  $r = db_query("SELECT count(*) AS c FROM invoice_items WHERE domain_id = ?1", [to_number($id)])
+  if to_number($r[0].c) > 0 then
+    return "This domain is referenced by " .. ("" .. $r[0].c) .. " invoice line(s) — set it to cancelled instead of deleting."
+  end
+  return ""
+end
+
+-- Delete one domain (guarded) + audit. "" on success, else the flash reason.
+-- Foundation policy hooks (guard + fetch + delete + audit under ONE
+-- BEGIN IMMEDIATE via dt_try_delete_row — see admin_resource.mix).
+function bd_del_hooks($user)
+  return {
+    guard: fn($id) = bd_del_block($id),
+    fetch: fn($id) = bd_get_one($id),
+    delete: fn($id, $row) = db_exec("DELETE FROM domains WHERE id = ?1", [to_number($row.id)]),
+    audit: fn($id, $row) = biz_audit($user["username"], "delete", "domains", to_number($row.id), "" .. $row.domain),
+    missing: "Domain not found."
+  }
+end
+
+function bd_delete($id, $user)
+  $did = to_number($id)
+  if $did == nil then
+    return "Domain not found."
+  end
+  return dt_try_delete_row($did, bd_del_hooks($user))
+end
+
+-- Create/update from the posted form. "" on success, else the flash error.
+-- The domain name is immutable on update (the users' username rule); blank dates
+-- store NULL via NULLIF — the renewal tick would read '' as overdue ('' < any date).
+function bd_save($f, $user)
+  $cid = to_number($f["customer_id"])
+  if $cid == nil then
+    return "Pick a customer."
+  end
+  $cust = db_query("SELECT id FROM customers WHERE id = ?1", [$cid])
+  if length($cust) == 0 then
+    return "No such customer."
+  end
+  $registrar = trim("" .. cms_or($f["registrar"], ""))
+  if $registrar == "" then
+    $registrar = "synergy"
+  end
+  $expiry = trim("" .. cms_or($f["expiry"], ""))
+  $next_due = trim("" .. cms_or($f["next_due"], ""))
+  $cents = bd_parse_cents($f["price"])
+  if $cents == nil then
+    return "Price must be a non-negative dollar amount."
+  end
+  $ar = 0
+  if $f["auto_renew"] != nil then
+    $ar = 1
+  end
+  $status = bd_status_norm($f["status"])
+  $category = trim("" .. cms_or($f["category"], ""))
+  $notes = "" .. cms_or($f["notes"], "")
+
+  $editid = $f["id"]
+  if $editid != nil and $editid != "" then
+    $d = bd_get_one($editid)
+    if $d == nil then
+      return "Domain not found."
+    end
+    -- write fence: the customer must still exist once we hold the write lock (a
+    -- racing customer delete + FKs off would otherwise dangle customer_id).
+    try
+      db_exec("BEGIN IMMEDIATE")
+      if not biz_row_exists("customers", $cid) then
+        db_exec("ROLLBACK")
+        return "No such customer."
+      end
+      db_exec("UPDATE domains SET customer_id = ?1, registrar = ?2, expiry = NULLIF(?3, ''),
+               next_due = NULLIF(?4, ''), price_cents = ?5, auto_renew = ?6, status = ?7,
+               category = ?8, notes = ?9, updated = ?10 WHERE id = ?11",
+              [$cid, $registrar, $expiry, $next_due, $cents, $ar, $status, $category, $notes, biz_now(), to_number($d.id)])
+      biz_audit($user["username"], "update", "domains", to_number($d.id),
+                ("" .. $d.domain) .. " " .. $status .. " " .. fmt_aud($cents))
+      db_exec("COMMIT")
+    catch $e
+      try db_exec("ROLLBACK") catch $e2 end
+      return "Save failed — try again."
+    end
+    return ""
+  end
+
+  $dom = lower(trim("" .. cms_or($f["domain"], "")))
+  if $dom == "" then
+    return "Domain is required."
+  end
+  $dupe = db_query("SELECT id FROM domains WHERE domain = ?1", [$dom])
+  if length($dupe) > 0 then
+    return "That domain already exists."
+  end
+  $ok = true
+  try
+    -- write fence: customer revalidated inside the tx (racing delete, FKs off).
+    db_exec("BEGIN IMMEDIATE")
+    if not biz_row_exists("customers", $cid) then
+      db_exec("ROLLBACK")
+      return "No such customer."
+    end
+    db_exec("INSERT INTO domains (customer_id, domain, registrar, expiry, next_due, price_cents,
+             auto_renew, status, category, notes, created, updated)
+             VALUES (?1, ?2, ?3, NULLIF(?4, ''), NULLIF(?5, ''), ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+            [$cid, $dom, $registrar, $expiry, $next_due, $cents, $ar, $status, $category, $notes, biz_now()])
+    db_exec("COMMIT")
+  catch $e
+    -- UNIQUE(domain) backstop for a create racing the pre-check above
+    try db_exec("ROLLBACK") catch $e2 end
+    $ok = false
+  end
+  if not $ok then
+    return "That domain already exists."
+  end
+  $newid = db_query("SELECT last_insert_rowid() AS id")
+  biz_audit($user["username"], "create", "domains", to_number($newid[0].id), $dom .. " " .. fmt_aud($cents))
+  return ""
+end
+
+-- The shared domain field set — the SAME name= keys bd_save reads (action=save + id +
+-- customer_id/domain/registrar/expiry/next_due/price/auto_renew/status/notes). On EDIT
+-- the domain is shown read-only (disabled → not submitted; the update never changes it).
+-- Values RAW (fm_* esc()s once); price rendered in dollars, stored in cents.
+function bd_fields($d, $isnew, $custs)
+  $h = fm_hidden("action", "save")
+  $h = $h .. fm_hidden("id", fm_val($d, "id"))
+  $h = $h .. fm_select("customer_id", "Customer", bd_customer_options($custs), { value: "" .. fm_val($d, "customer_id"), required: true, placeholder: "Select a customer" })
+  if $isnew then
+    $h = $h .. fm_text("domain", "Domain", { value: fm_val($d, "domain"), required: true, placeholder: "example.com.au" })
+  else
+    $h = $h .. fm_text("domain_display", "Domain", { value: fm_val($d, "domain"), disabled: true, help: "Registered name (cannot be changed).", help_tip: true })
+  end
+  $h = $h .. fm_text("registrar", "Registrar", { value: fm_val($d, "registrar"), placeholder: "synergy" })
+  $h = $h .. fm_text("cost_display", "Cost ($/yr wholesale)", { value: bd_cents_dollars(fm_val($d, "cost_price_cents")), disabled: true, help: "Synergy Wholesale renew price. Refreshed by biz_sw_pricing; not editable here.", help_tip: true })
+  $h = $h .. fm_number("price", "Price ($/yr)", { value: bd_cents_dollars(fm_val($d, "price_cents")), min: "0", step: "0.01", help: "Customer price (wholesale + markup). Auto-set on price refresh; a manual override is replaced on the next refresh.", help_tip: true })
+  $h = $h .. fm_date("expiry", "Expiry", { value: fm_val($d, "expiry") })
+  $h = $h .. fm_date("next_due", "Next due", { value: fm_val($d, "next_due"), help: "Next billing date (blank = not billed).", help_tip: true })
+  $h = $h .. fm_select("status", "Status", [
+    { value: "pending", "label": "pending" }, { value: "active", "label": "active" },
+    { value: "expired", "label": "expired" }, { value: "transferred_away", "label": "transferred_away" },
+    { value: "cancelled", "label": "cancelled" } ], { value: fm_val($d, "status") })
+  $h = $h .. fm_toggle("auto_renew", "Auto-renew", { checked: ("" .. fm_val($d, "auto_renew")) == "1", desc: "Invoice and renew at the registrar automatically." })
+  $h = $h .. fm_text("category", "Category", { value: fm_val($d, "category"), placeholder: "e.g. personal, parked, client, unsorted", help: "Freeform tag for grouping. Reassign a house domain to a customer via the Customer field above.", help_tip: true })
+  $h = $h .. fm_textarea("notes", "Notes", { value: fm_val($d, "notes"), rows: 3, span: 2 })
+  return $h
+end
+
+-- ONE fm_form spec rendered IDENTICALLY on the canvas and in the modal (only `mode`
+-- differs), so the two can't drift — the h_admin_users unification.
+function bd_form_spec($d, $isnew, $heading, $err, $mode, $custs)
+  return { mode: $mode, action: "/biz/domains", id: "bd-edit", title: $heading,
+           fields: fm_grid({ cols: 2 }, bd_fields($d, $isnew, $custs)),
+           submit: { "label": "Save" }, cancel: { "label": "Cancel", href: "/biz/domains" }, error: $err }
+end
+
+function bd_form($d, $isnew, $heading, $err, $custs)
+  $h = '<div class="cms-head"><h1>' .. esc($heading) .. '</h1><a class="navlink" href="/biz/domains">← All domains</a></div>'
+  return $h .. fm_form(bd_form_spec($d, $isnew, $heading, $err, "canvas", $custs))
+end
+
+function bd_form_panel($d, $isnew, $heading, $custs)
+  return fm_form(bd_form_spec($d, $isnew, $heading, "", "modal", $custs))
+end
+
+-- One label/value row of the detail card. $valhtml is TRUSTED builder output
+-- (already esc'd / badge markup).
+function bd_kv($label, $valhtml)
+  return '<tr><th>' .. esc($label) .. '</th><td>' .. $valhtml .. '</td></tr>'
+end
+
+-- Customer cell/link shared by the list and the detail card.
+function bd_cust_link($names, $cid)
+  $k = "" .. $cid
+  $n = $names[$k]
+  if $n == nil then
+    $n = "customer #" .. $k
+  end
+  return '<a href="/biz/customers?view=' .. url_encode($k) .. '">' .. esc($n) .. '</a>'
+end
+
+-- Expiry cell: a red badge when an ACTIVE domain expires inside 60 days (or already
+-- has) — civil YYYY-MM-DD strings compare lexicographically, so `<` IS date order.
+-- $soon = biz_date_add(biz_today(), "+60 days"), computed once per request.
+function bd_expiry_cell($d, $soon)
+  $e = "" .. cms_or($d["expiry"], "")
+  if $e == "" then
+    return '<span class="muted">—</span>'
+  end
+  if ("" .. $d["status"]) == "active" and $e < $soon then
+    return dt_badge($e, "danger", nil)
+  end
+  return esc($e)
+end
+
+-- Detail view (?view=<id>): info card + related invoices (last 10) + pending
+-- renew_domain jobs.
+function bd_detail($d, $names)
+  $id = to_number($d.id)
+  $eurl = "/biz/domains?edit=" .. url_encode("" .. $d.id)
+  $h = '<div class="cms-head"><h1>' .. esc($d.domain) .. '</h1><span><a class="btn btn-primary" href="' .. esc($eurl) .. '">Edit</a> <a class="navlink" href="/biz/domains">← All domains</a></span></div>'
+
+  $h = $h .. '<div class="card"><h2>Domain</h2><table>'
+  $h = $h .. bd_kv("Customer", bd_cust_link($names, $d.customer_id))
+  $h = $h .. bd_kv("Registrar", esc(bd_dash($d.registrar)))
+  $h = $h .. bd_kv("Expiry", esc(bd_dash($d.expiry)))
+  $h = $h .. bd_kv("Next due", esc(bd_dash($d.next_due)))
+  $h = $h .. bd_kv("Cost", esc(fmt_aud($d.cost_price_cents)) .. ' <span class="muted small">/yr wholesale (SW)</span>')
+  $h = $h .. bd_kv("Price", esc(fmt_aud($d.price_cents)) .. ' <span class="muted small">/yr customer' .. bd_markup_note($d.cost_price_cents, $d.price_cents) .. '</span>')
+  $h = $h .. bd_kv("Auto-renew", bd_yesno($d.auto_renew))
+  $h = $h .. bd_kv("Status", dt_badge($d.status, bd_status_variant($d.status), nil))
+  $h = $h .. bd_kv("Registrar sync", esc(bd_dash($d.sw_status)) .. ' <span class="muted small">last sync ' .. esc(bd_dash($d.sw_synced)) .. '</span>')
+  $h = $h .. bd_kv("Notes", esc(bd_dash($d.notes)))
+  $h = $h .. '</table>'
+  -- SW registrar actions (sync now / renew via the Synergy SOAP client) land in P3 —
+  -- rendered disabled so the surface is visible but inert until then.
+  $h = $h .. '<p><button class="btn btn-ghost" disabled>Sync now</button> <button class="btn btn-ghost" disabled>Renew</button></p>'
+  $h = $h .. '</div>'
+
+  $invs = db_query("SELECT id, status, total_cents, issued FROM invoices
+                    WHERE id IN (SELECT invoice_id FROM invoice_items WHERE domain_id = ?1)
+                    ORDER BY id DESC LIMIT 10", [$id])
+  $h = $h .. '<div class="card"><h2>Invoices</h2>'
+  if length($invs) == 0 then
+    $h = $h .. '<p class="muted small">No invoices reference this domain.</p>'
+  else
+    $h = $h .. '<table><tr><th>#</th><th>Status</th><th>Issued</th><th>Total</th></tr>'
+    for each $i in $invs
+      $h = $h .. '<tr><td><a href="/biz/invoices?view=' .. url_encode("" .. $i.id) .. '">INV-' .. ("" .. $i.id) .. '</a></td>'
+      $h = $h .. '<td>' .. dt_badge($i.status, bd_inv_variant($i.status), nil) .. '</td>'
+      $h = $h .. '<td>' .. esc(bd_dash($i.issued)) .. '</td><td>' .. esc(fmt_aud($i.total_cents)) .. '</td></tr>'
+    end
+    $h = $h .. '</table>'
+  end
+  $h = $h .. '</div>'
+
+  $jobs = db_query("SELECT id, status, error FROM jobs WHERE domain_id = ?1
+                    AND kind = 'renew_domain' AND status IN ('pending', 'running')
+                    ORDER BY id", [$id])
+  if length($jobs) > 0 then
+    $h = $h .. '<div class="card"><h2>Pending renewals</h2><table><tr><th>Job</th><th>Status</th><th>Error</th></tr>'
+    for each $j in $jobs
+      $h = $h .. '<tr><td>' .. ("" .. $j.id) .. '</td><td>' .. dt_badge($j.status, "info", nil) .. '</td><td>' .. esc(bd_dash($j.error)) .. '</td></tr>'
+    end
+    $h = $h .. '</table></div>'
+  end
+  return $h
+end
+
+function biz_domains_main()
+cms_init()
+biz_init()
+$user = current_user($HEADERS)
+-- A modal fetch on an expired session must return a clean fragment, not a login
+-- redirect injected into the dialog (mirrors h_admin_users).
+if md_is_modal_request() and $user == nil then
+  return md_session_expired("/biz/domains")
+end
+$deny = require_role($user, "admin")
+if $deny != nil then
+  return $deny
+end
+
+$flash = ""
+if $METHOD == "POST" then
+  $f = parse_form($BODY)
+  $action = $f["action"]
+  if $action == nil then
+    $action = "save"
+  end
+
+  -- bulk delete (Foundation: per-row guarded tx, skip-and-report). Select-all
+  -- re-runs dt_where SERVER-SIDE (dt_all_ids) — posted ids never trusted.
+  if $action == "bulk_delete" then
+    $ids = dt_selected_ids($f)
+    if dt_wants_all($f) then
+      -- config lambdas close over render-only data (names/soon) — never invoked
+      -- by dt_where/dt_all_ids, so nils are fine here. SAME dead-excluding
+      -- subquery table as the list render, or select-all would sweep dead rows.
+      $bcfg = bd_list_config(nil, nil)
+      $ids = dt_all_ids("(SELECT * FROM domains WHERE category != 'dead')", $bcfg["spec"], dt_state_from_map($f, $bcfg["spec"], $bcfg["opts"]), "id")
+    end
+    $rep = dt_bulk_report(dt_bulk_try_delete($ids, bd_del_hooks($user)), "domain(s)")
+    return redirect_flash("/biz/domains", $rep["msg"], $rep["kind"])
+  end
+
+  -- declarative row delete (datatable.mix): action="row:delete:<id>".
+  $ra = dt_row_action($f)
+  if $ra != nil then
+    if $ra["verb"] == "delete" then
+      $flash = bd_delete($ra["id"], $user)
+    end
+    if $flash == "" then
+      return redirect_flash("/biz/domains", "Domain deleted", "success")
+    end
+  else
+    if $action == "delete" then
+      $flash = bd_delete($f["id"], $user)
+      if $flash == "" then
+        return redirect_flash("/biz/domains", "Domain deleted", "success")
+      end
+    else
+      -- save (create or update)
+      $flash = bd_save($f, $user)
+      if $flash == "" then
+        return redirect_flash("/biz/domains", "Domain saved", "success")
+      end
+    end
+  end
+end
+
+-- GET: decide detail vs add/edit form vs list.
+$q = parse_query($QUERY)
+$editid = $q["edit"]
+$isnew = $q["new"]
+$viewid = $q["view"]
+
+if $isnew != nil or $editid != nil then
+  $custs = bd_customers()
+  $bd_modal = md_is_modal_request()
+  if $isnew != nil then
+    $blank = { id: "", customer_id: "", domain: lower(trim("" .. cms_or($q["domain"], ""))), registrar: "synergy", expiry: "", next_due: "", price_cents: 0, cost_price_cents: 0, auto_renew: 1, status: "active", notes: "" }
+    if $bd_modal then
+      return md_fragment(bd_form_panel($blank, true, "New domain", $custs))
+    end
+    return doc(200, "New domain", $user, bd_form($blank, true, "New domain", $flash, $custs))
+  end
+  -- edit
+  $d = bd_get_one($editid)
+  if $d == nil then
+    if $bd_modal then
+      return md_not_found("domain", "/biz/domains")
+    end
+    return doc(404, "Domains", $user, '<div class="card cms-card-narrow"><h1>Domain not found</h1><p class="muted"><a href="/biz/domains">← All domains</a></p></div>')
+  end
+  if $bd_modal then
+    return md_fragment(bd_form_panel($d, false, "Edit domain", $custs))
+  end
+  return doc(200, "Edit domain", $user, bd_form($d, false, "Edit domain", $flash, $custs))
+end
+
+if $viewid != nil then
+  $d = bd_get_one($viewid)
+  if $d == nil then
+    return doc(404, "Domains", $user, '<div class="card cms-card-narrow"><h1>Domain not found</h1><p class="muted"><a href="/biz/domains">← All domains</a></p></div>')
+  end
+  return doc(200, "" .. $d.domain, $user, bd_detail($d, bd_customer_names(bd_customers())))
+end
+
+-- DEAD domains view (?dead=1): the not-registered cruft (listDomains reports
+-- them but they don't exist in the registry). Plain read-only table so it stays
+-- OUT of the main datatable + all calculations. Rendered simply (no pager needed
+-- — the pile is small + static).
+$dcount = to_number(db_query("SELECT count(*) AS n FROM domains WHERE category = 'dead'")[0].n)
+if ("" .. fm_or($q["dead"], "")) == "1" then
+  $rows = db_query("SELECT domain, expiry, sw_status, sw_synced FROM domains
+                    WHERE category = 'dead' ORDER BY domain")
+  $b = '<div class="cms-head"><h1>Dead domains (' .. $dcount .. ')</h1><a class="navlink" href="/biz/domains">← Live domains</a></div>'
+  $b = $b .. '<p class="muted small">Domains SW\'s listDomains reports but domainInfo says don\'t exist (dropped / pending / .au-bundle variants). Kept for SW reconciliation but IGNORED everywhere else. Reassign a category to bring one back.</p>'
+  $b = $b .. '<div class="card"><table class="dt-table"><thead><tr><th>Domain</th><th>Expiry</th><th>SW status</th><th>Synced</th></tr></thead><tbody>'
+  for each $d in $rows
+    $b = $b .. '<tr><td>' .. esc("" .. $d.domain) .. '</td><td>' .. esc(bd_dash($d.expiry)) .. '</td><td>' .. esc(bd_dash($d.sw_status)) .. '</td><td class="muted small">' .. esc(substr("" .. bd_dash($d.sw_synced), 0, 16)) .. '</td></tr>'
+  end
+  $b = $b .. '</tbody></table></div>'
+  return doc(200, "Dead domains", $user, $b)
+end
+
+-- list — shared SSR datatable over the LIVE domains (dead excluded). Customer
+-- names prefetched once (no per-row queries); $soon = the 60-day expiry-warning
+-- threshold the expiry cell compares against.
+$names = bd_customer_names(bd_customers())
+$soon = biz_date_add(biz_today(), "+60 days")
+$cfg = bd_list_config($names, $soon)
+-- base table excludes dead (dt_href doesn't carry an arbitrary ?param, so this
+-- can't be a toggle filter — dead get their own view above).
+$pfx = ""
+if $flash != "" then
+  $pfx = '<div class="forms-skin">' .. fm_flash_error($flash) .. '</div>'
+end
+if $dcount > 0 then
+  $pfx = $pfx .. '<p class="muted small"><a href="/biz/domains?dead=1">' .. $dcount .. ' dead domains hidden →</a></p>'
+end
+if $pfx == "" then
+  $pfx = nil
+end
+return dt_admin_list({ title: "Domains", user: $user, spec: $cfg["spec"], opts: $cfg["opts"],
+  table: "(SELECT * FROM domains WHERE category != 'dead')",
+  select: "id, customer_id, domain, expiry, next_due, cost_price_cents, price_cents, auto_renew, status, sw_synced",
+  prefix_html: $pfx })
+
+end
+
+-- The list datatable config (spec + opts), built once per request over the prefetched
+-- $names map + the $soon expiry threshold (both closed over by the cell lambdas).
+-- bulk_id is required by the mutating Delete row action even without bulk selection.
+function bd_list_config($names, $soon)
+  $domain_cell = fn($d) = '<strong>' .. esc($d["domain"]) .. '</strong>'
+  $cust_cell = fn($d) = bd_cust_link($names, $d["customer_id"])
+  $expiry_cell = fn($d) = bd_expiry_cell($d, $soon)
+  $aud_fmt = fn($v) = fmt_aud($v)
+  $renew_fmt = fn($v) = bd_yesno($v)
+  $status_badge = fn($d) = { "text": $d["status"], "variant": bd_status_variant($d["status"]) }
+  $act_view = dt_action("view", { "label": "View", icon: "eye", variant: "action", href: fn($d) = "/biz/domains?view=" .. url_encode("" .. $d["id"]) })
+  $act_edit = dt_action("edit", { "label": "Edit", icon: "pencil", variant: "action", modal: "md-edit", href: fn($d) = "/biz/domains?edit=" .. url_encode("" .. $d["id"]) .. "&modal=1" })
+  $act_del = dt_action("delete", { "label": "Delete", icon: "trash", variant: "action-danger", action: "delete", confirm: "Delete this domain? This cannot be undone." })
+  -- Shwho: the registry tool (whois + dig) run by toolsd, streamed into the shared modal
+  -- shell as raw CLI text. webd cannot exec — /tools/view only opens the dialog; the run
+  -- is enqueued from there and the drain executes it. See _plan/2026-07-13-toolsd-*.
+  $act_shwho = dt_action("shwho", { "label": "Shwho", icon: "search", variant: "action", modal: "md-edit", href: fn($d) = "/tools/view?tool=shwho&domain=" .. url_encode("" .. $d["domain"]) .. "&modal=1" })
+  -- Trace: streaming traceroute to the domain's host — the T2 tool. Same modal shell; the
+  -- <pre> grows hop-by-hop as the drain reports each hop.
+  $act_trace = dt_action("trace", { "label": "Trace", icon: "route", variant: "action", modal: "md-edit", href: fn($d) = "/tools/view?tool=trace&domain=" .. url_encode("" .. $d["domain"]) .. "&modal=1" })
+  -- Tool actions only where toolsd exists (bd_tools_enabled — explicit per-vhost opt-in).
+  -- The shared tree is shared with prod, so ungated items would ship 404s to the billing vhost.
+  $acts = [$act_view, $act_edit, $act_del]
+  if bd_tools_enabled() then
+    $acts = [$act_view, $act_edit, $act_shwho, $act_trace, $act_del]
+  end
+  $rowhref = fn($d) = "/biz/domains?view=" .. url_encode("" .. $d["id"])
+  $bulkid = fn($d) = "" .. $d["id"]
+  $spec = [
+    dt_col("id", "Id", "id", { sortable: true, align: "right", width: "4rem", toggleable: true, default_hidden: true }),
+    dt_col("domain", "Domain", "domain", { sortable: true, searchable: true, render: $domain_cell, toggleable: true }),
+    dt_col("customer", "Customer", "customer_id", { render: $cust_cell, toggleable: true }),
+    dt_col("category", "Category", "category", { sortable: true, searchable: true, placeholder: "—", toggleable: true, default_hidden: true }),
+    dt_col("expiry", "Expiry", "expiry", { sortable: true, render: $expiry_cell, toggleable: true }),
+    dt_col("next_due", "Next due", "next_due", { sortable: true, placeholder: "—", toggleable: true }),
+    dt_col("cost", "Cost", "cost_price_cents", { sortable: true, align: "right", fmt: $aud_fmt, toggleable: true, default_hidden: true }),
+    dt_col("price", "Price", "price_cents", { sortable: true, align: "right", fmt: $aud_fmt, toggleable: true }),
+    dt_col("auto_renew", "Renew", "auto_renew", { sortable: true, align: "center", fmt: $renew_fmt, toggleable: true, default_hidden: true }),
+    dt_col("status", "Status", "status", { sortable: true, badge: $status_badge, toggleable: true, default_hidden: true }),
+    dt_col("sw_synced", "Synced", "sw_synced", { sortable: true, type: "datetime", toggleable: true, default_hidden: true })
+  ]
+  $opts = dt_admin_opts({
+    base_route: "/biz/domains", caption: "Domains", noun: "domains",
+    default_sort: "expiry", default_dir: "asc",
+    search_placeholder: "Search domains…",
+    row_href: $rowhref, row_action_specs: $acts,
+    bulk_id: $bulkid,
+    filters: [
+      dt_filter("status", "Status", { options: [
+        { value: "pending", "label": "Pending", col: "status", op: "=" },
+        { value: "active", "label": "Active", col: "status", op: "=" },
+        { value: "expired", "label": "Expired", col: "status", op: "=" },
+        { value: "transferred_away", "label": "Transferred away", col: "status", op: "=" },
+        { value: "cancelled", "label": "Cancelled", col: "status", op: "=" }
+      ] }),
+      dt_filter("renew", "Auto-renew", { kind: "ternary", when_true: { col: "auto_renew", bind: "1" }, when_false: { col: "auto_renew", bind: "0" }, true_label: "Auto-renew", false_label: "Manual" }),
+      dt_filter("category", "Category", { options: [
+        { value: "unsorted", "label": "Unsorted (house)", col: "category", op: "=" },
+        { value: "assigned", "label": "Assigned", col: "category", op: "!=", bind: "unsorted" }
+      ] })
+    ],
+    header_actions: [{ "label": "New domain", icon: "plus", variant: "primary", modal: "md-edit", modal_src: "/biz/domains?new=1&modal=1" }]
+  })
+  return { spec: $spec, opts: $opts }
+end

@@ -1,0 +1,23 @@
+[package]
+name = "cosmix-lib-bus"
+version = "0.3.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bus wire format + IPC library for cosmix apps"
+
+[lib]
+name = "cosmix_bus"
+path = "src/lib.rs"
+
+[features]
+default = ["native"]
+native = ["dep:tokio", "dep:libc"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }

@@ -1,0 +1,7 @@
+-- h_logout.mix — legacy /logout. Under the unified maild login the real sign-out
+-- is the profile widget's POST /auth/logout (webd built-in, clears the sealed
+-- cosmix_session + revokes the maild token). A GET can't clear an HttpOnly sealed
+-- cookie, so this vestigial endpoint just bounces home rather than 404 a bookmark.
+function logout_main()
+  return redirect("/")
+end

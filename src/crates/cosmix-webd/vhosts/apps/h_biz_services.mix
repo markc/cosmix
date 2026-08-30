@@ -1,0 +1,1118 @@
+-- h_biz_services.mix — billing service list/detail/edit + credentials (ANY /biz/services).
+-- Admin-only. Shared datatable + modal pattern (mirrors h_admin_users); billing core in biz.mix.
+-- Money = INTEGER cents (fmt_aud); dates = civil TEXT YYYY-MM-DD.
+--   GET  /biz/services                → list (search label; status/kind/payment filters;
+--                                       SUM(price_cents) footer = annual run-rate of the set)
+--   GET  /biz/services?view=<id>      → detail (info card + credentials w/ audited reveal)
+--   GET  /biz/services?new=1 / ?edit=<id> → editor (full page; &modal=1 → md fragment)
+--   POST action=save                  → create/update (auto_charge gated on verified card)
+--   POST action=delete                → remove (refused while invoice_items reference it)
+--   POST action=reveal      (id, cred_id) → biz_audit FIRST, then ONE render w/ the secret
+--   POST action=cred_save   (id, system/username/secret) → add credential (audited)
+--   POST action=cred_delete (id, cred_id) → remove credential (audited, confirm-guarded)
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/admin_resource.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+include "/opt/cosmix/vhosts/shared/widgets/detail.mix"
+include "/opt/cosmix/vhosts/shared/apps/biz.mix"
+
+-- Map a service status to a Filament badge variant.
+function svc_status_variant($s)
+  $v = "" .. $s
+  if $v == "active" then
+    return "success"
+  end
+  if $v == "pending" then
+    return "info"
+  end
+  if $v == "suspended" then
+    return "warning"
+  end
+  return "gray"
+end
+
+-- "1"/1 truthiness for the 0/1 INTEGER flag columns + checkbox round-trips.
+function svc_flag($v)
+  return ("" .. $v) == "1"
+end
+
+-- cents → a bare "139.00" dollars string for the price input (fmt_aud is display-only).
+function svc_cents_to_dollars($cents)
+  $n = to_number($cents)
+  if $n == nil then
+    return ""
+  end
+  $d = floor($n / 100)
+  $c = $n - $d * 100
+  $cs = "" .. $c
+  if $c < 10 then
+    $cs = "0" .. $c
+  end
+  return ("" .. $d) .. "." .. $cs
+end
+
+-- ONE query id→name map over all customers; the list cell lambdas close over it
+-- (dt_sql is single-table, so the JOIN is resolved handler-side).
+function svc_customer_map()
+  $m = {}
+  $rows = db_query("SELECT id, name FROM customers", [])
+  for each $r in $rows
+    $m["" .. $r["id"]] = "" .. $r["name"]
+  end
+  return $m
+end
+
+function svc_get_one($id)
+  $r = db_query("SELECT * FROM services WHERE id = ?1", [$id])
+  if length($r) == 1 then
+    return $r[0]
+  end
+  return nil
+end
+
+-- Delete-guard: "" when the service may be deleted, else the reason. Billing history
+-- is immutable — an invoiced service is cancelled, never deleted. And deleting the
+-- row must never orphan provisioned infrastructure (Bricks 1-8): an in-flight or
+-- unresolved job, a live CT footprint, or an IP reservation each refuse the delete —
+-- the operator resolves them first (reconcile --retry/--cancel/--adopt, or teardown).
+function svc_del_block($sid)
+  $n = db_query("SELECT COUNT(*) AS c FROM invoice_items WHERE service_id = ?1", [$sid])
+  if to_number($n[0]["c"]) > 0 then
+    return "Service is referenced by invoices — set it to cancelled instead of deleting."
+  end
+  -- any active (pending/running) or reconcile=1 job on the service lane, either kind.
+  $j = db_query("SELECT COUNT(*) AS c FROM jobs WHERE service_id = ?1
+                 AND (status IN ('pending','running') OR reconcile = 1)", [$sid])
+  if to_number($j[0]["c"]) > 0 then
+    return "A provisioning job is active or unresolved for this service — resolve it via reconcile first."
+  end
+  -- live CT footprint: any of node/vmid/ip/fqdn set means a CT (or its DNS) exists.
+  $s = svc_get_one($sid)
+  if $s != nil then
+    if svc_empty_nil($s["vmid"]) != "" or svc_empty_nil($s["ip"]) != "" or svc_empty_nil($s["fqdn"]) != "" or svc_empty_nil($s["node"]) != "" then
+      return "Service has a provisioned CT footprint (node/vmid/ip/fqdn) — tear it down first."
+    end
+  end
+  -- an ip_pool row still pointing here (reserved or used) would dangle.
+  $p = db_query("SELECT COUNT(*) AS c FROM ip_pool WHERE service_id = ?1", [$sid])
+  if to_number($p[0]["c"]) > 0 then
+    return "An ip_pool address still references this service — free it first."
+  end
+  return ""
+end
+
+-- Delete + audit (credentials cascade explicitly first — no PRAGMA foreign_keys reliance).
+function svc_delete($sid, $actor)
+  $s = svc_get_one($sid)
+  $lab = ""
+  if $s != nil then
+    $lab = "" .. $s["label"]
+  end
+  db_exec("DELETE FROM credentials WHERE service_id = ?1", [$sid])
+  db_exec("DELETE FROM services WHERE id = ?1", [$sid])
+  biz_audit($actor, "delete", "services", $sid, $lab)
+end
+
+-- Foundation policy hooks (dt_try_delete_row runs guard + fetch + delete under
+-- ONE BEGIN IMMEDIATE — see admin_resource.mix). svc_delete audits itself.
+function svc_del_hooks($actor)
+  return {
+    guard: fn($id) = svc_del_block($id),
+    fetch: fn($id) = svc_get_one($id),
+    delete: fn($id, $row) = svc_delete($id, $actor),
+    missing: "No such service."
+  }
+end
+
+function svc_try_delete($sid, $actor)
+  return dt_try_delete_row($sid, svc_del_hooks($actor))
+end
+
+-- ─────────────────────────────── editor ───────────────────────────────
+
+-- Customer select options: active customers by name, PLUS the service's current
+-- customer when it's no longer active (so an edit can't silently re-home the service).
+function svc_customer_options($cur)
+  $out = []
+  $rows = db_query("SELECT id, name FROM customers WHERE status = 'active' OR id = ?1 ORDER BY name", [$cur])
+  for each $r in $rows
+    push($out, { value: "" .. $r["id"], "label": "" .. $r["name"] })
+  end
+  return $out
+end
+
+-- Plan select: blank "custom" first, then the active catalogue.
+function svc_plan_options()
+  $out = [{ value: "", "label": "custom (no plan)" }]
+  $rows = db_query("SELECT id, name, units, price_cents FROM plans WHERE active = 1 ORDER BY units", [])
+  for each $r in $rows
+    push($out, { value: "" .. $r["id"], "label": ("" .. $r["name"]) .. " — " .. ("" .. $r["units"]) .. " units, " .. fmt_aud($r["price_cents"]) .. "/yr" })
+  end
+  return $out
+end
+
+-- The shared service field set — the SAME name= keys the POST save branch reads.
+-- $s = a services row on edit, or the echoed form map on a validation error (which
+-- carries price_display instead of price_cents). Values RAW (fm_* esc()s once).
+function svc_fields($s)
+  $h = fm_hidden("action", "save")
+  $h = $h .. fm_hidden("id", fm_val($s, "id"))
+  $h = $h .. fm_select("customer_id", "Customer", svc_customer_options(to_number(fm_val($s, "customer_id"))), { value: fm_val($s, "customer_id"), required: true, placeholder: "Select a customer" })
+  $h = $h .. fm_text("label", "Label", { value: fm_val($s, "label"), required: true, help: "e.g. the hostname or plan nickname", help_tip: true })
+  $h = $h .. fm_select("kind", "Kind", [{ value: "ct", "label": "ct" }, { value: "vm", "label": "vm" }, { value: "byo", "label": "byo" }, { value: "legacy", "label": "legacy" }], { value: fm_val($s, "kind") })
+  $h = $h .. fm_select("plan_id", "Plan", svc_plan_options(), { value: fm_val($s, "plan_id"), help: "catalogue plan, or custom", help_tip: true })
+  $h = $h .. fm_text("units", "Units", { value: fm_val($s, "units"), inputmode: "numeric", help: "resource units; drives the catalogue price", help_tip: true })
+  $pv = fm_val($s, "price_display")
+  if $pv == "" then
+    $pv = svc_cents_to_dollars($s["price_cents"])
+  end
+  $h = $h .. fm_text("price", "Price (AUD/yr)", { value: $pv, prefix: "$", inputmode: "numeric", help: "blank + units = catalogue price", help_tip: true })
+  $h = $h .. fm_select("status", "Status", [{ value: "pending", "label": "pending" }, { value: "active", "label": "active" }, { value: "suspended", "label": "suspended" }, { value: "cancelled", "label": "cancelled" }], { value: fm_val($s, "status") })
+  $h = $h .. fm_text("next_due", "Next due", { value: fm_val($s, "next_due"), placeholder: "YYYY-MM-DD", help: "anniversary the renewal tick bills from", help_tip: true })
+  $h = $h .. fm_select("payment_pref", "Payment", [{ value: "stripe", "label": "stripe" }, { value: "paypal", "label": "paypal" }, { value: "bank", "label": "bank" }], { value: fm_val($s, "payment_pref") })
+  $h = $h .. fm_checkbox("auto_charge", "Auto-charge", { checked: svc_flag($s["auto_charge"]), desc: "requires a verified card on the customer" })
+  $h = $h .. fm_checkbox("addon_bulk25", "Bulk-25 addon", { checked: svc_flag($s["addon_bulk25"]) })
+  $h = $h .. fm_checkbox("addon_ipv4", "IPv4 addon", { checked: svc_flag($s["addon_ipv4"]) })
+  $h = $h .. fm_textarea("notes", "Notes", { value: fm_val($s, "notes"), span: 2, rows: 3 })
+  return $h
+end
+
+-- ONE fm_form spec rendered identically on the canvas and in the modal (only `mode`
+-- differs) — mirrors uu_form_spec so the two surfaces can't drift.
+function svc_form_spec($s, $heading, $err, $mode)
+  return { mode: $mode, action: "/biz/services", id: "svc-edit", title: $heading,
+           fields: fm_grid({ cols: 2 }, svc_fields($s)),
+           submit: { "label": "Save" }, cancel: { "label": "Cancel", href: "/biz/services" }, error: $err }
+end
+
+function svc_form($s, $heading, $err)
+  $h = '<div class="cms-head"><h1>' .. esc($heading) .. '</h1><a class="navlink" href="/biz/services">← All services</a></div>'
+  return $h .. fm_form(svc_form_spec($s, $heading, $err, "canvas"))
+end
+
+function svc_form_panel($s, $heading)
+  return fm_form(svc_form_spec($s, $heading, "", "modal"))
+end
+
+-- The blank editor map (also the shape a failed save echoes back into).
+function svc_blank()
+  return { id: "", customer_id: "", "label": "", kind: "ct", plan_id: "", units: "",
+           price_display: "", addon_bulk25: 0, addon_ipv4: 0, status: "pending",
+           next_due: "", payment_pref: "stripe", auto_charge: 0, notes: "" }
+end
+
+-- ─────────────────────────────── detail ───────────────────────────────
+
+-- (svc_kv is gone — kv rows ride the dv_* detail-page Foundation: build a
+-- {label, html} rows list, render with dv_kv_table.)
+
+-- A dt_badge outside the list needs the .datatable-skin var scope (app.css scopes
+-- every .dt-* rule under it); the span-wrap keeps the skin off everything else.
+function svc_badge($text, $variant)
+  return '<span class="datatable-skin">' .. dt_badge($text, $variant, "") .. '</span>'
+end
+
+function svc_prov_label($status, $step)
+  $st = "" .. $status
+  $sp = "" .. $step
+  if $st == "pending" then return "queued" end
+  if $st == "done" then return "live" end
+  if $st == "failed" then return "failed" end
+  if $st == "abandoned" then return "abandoned" end
+  if $sp == "staging" then return "staging release" end
+  if $sp == "cloning" then return "cloning" end
+  if $sp == "preseeding" then return "preseeding" end
+  if $sp == "dns" then return "dns" end
+  if $sp == "starting" then return "starting" end
+  if $sp == "verifying" then return "verifying" end
+  if $sp == "claimed" then return "claimed" end
+  if $st == "running" then return "running" end
+  if $st == "" then return "not queued" end
+  return $st
+end
+
+function svc_prov_variant($status)
+  $st = "" .. $status
+  if $st == "done" then return "success" end
+  if $st == "failed" or $st == "abandoned" then return "danger" end
+  if $st == "pending" or $st == "running" then return "info" end
+  return "gray"
+end
+
+function svc_empty_nil($v)
+  if $v == nil then return "" end
+  return "" .. $v
+end
+
+function svc_latest_prov_job($sid)
+  $r = db_query("SELECT * FROM jobs WHERE kind = 'provision_ct' AND service_id = ?1
+                 ORDER BY id DESC LIMIT 1", [$sid])
+  if length($r) == 1 then return $r[0] end
+  return nil
+end
+
+function svc_active_prov_job($sid)
+  -- A reconcile=1 job (ambiguous outcome, lane blocked) also occupies the lane and
+  -- must block re-enqueue until an operator resolves it (Brick 1).
+  $r = db_query("SELECT id FROM jobs WHERE kind = 'provision_ct' AND service_id = ?1
+                 AND (status IN ('pending','running') OR reconcile = 1) ORDER BY id DESC LIMIT 1", [$sid])
+  return length($r) == 1
+end
+
+function svc_prov_map()
+  $m = {}
+  $rows = db_query("SELECT j.service_id, j.status, j.step FROM jobs j
+                    JOIN (SELECT service_id, MAX(id) AS max_id FROM jobs
+                          WHERE kind = 'provision_ct' AND service_id IS NOT NULL
+                          GROUP BY service_id) x ON x.max_id = j.id", [])
+  for each $r in $rows
+    $m["" .. $r["service_id"]] = { status: "" .. $r["status"], step: "" .. $r["step"] }
+  end
+  return $m
+end
+
+function svc_prov_req($job)
+  if $job == nil then return {} end
+  $raw = trim("" .. $job["external_ref"])
+  if $raw == "" then return {} end
+  try
+    $j = json_parse($raw)
+    if $j != nil and type($j) == "map" then return $j end
+  catch $e
+  end
+  return {}
+end
+
+function svc_allowed_domains()
+  -- Empty setting = no domains allowed (fail closed until an operator seeds it).
+  $raw = lower(biz_setting("provision_allowed_domains"))
+  $raw = replace(replace(replace($raw, "\n", ","), " ", ","), ";", ",")
+  $out = []
+  for each $p in split($raw, ",")
+    $d = trim($p)
+    if $d != "" then push($out, $d) end
+  end
+  return $out
+end
+
+function svc_domain_allowed($domain)
+  $d = lower(trim("" .. $domain))
+  for each $a in svc_allowed_domains()
+    if $d == $a then return true end
+  end
+  return false
+end
+
+function svc_valid_domain($domain)
+  $d = lower(trim("" .. $domain))
+  return biz_valid_domain($d) and length($d) <= 245
+end
+
+function svc_valid_node_name($node)
+  $n = lower(trim("" .. $node))
+  if $n == "" then return true end
+  return biz_is_dns_label($n)
+end
+
+function svc_reserved_node($node)
+  $n = lower(trim("" .. $node))
+  return $n == "mail" or $n == "www" or $n == "ns"
+end
+
+function svc_fqdn_busy($sid, $fqdn)
+  if $fqdn == "" then return false end
+  $live = db_query("SELECT id FROM services WHERE kind = 'ct' AND status != 'cancelled'
+                    AND fqdn = ?1 AND id != ?2 LIMIT 1", [$fqdn, $sid])
+  if length($live) > 0 then return true end
+  -- Brick 2: a persisted worker-derived jobs.fqdn on an active/reconcile job also
+  -- occupies the name — covers the MAC-derived path where external_ref.node_name is
+  -- blank (so the reconstruction loop below can't see it).
+  $pfq = db_query("SELECT id FROM jobs WHERE kind = 'provision_ct' AND fqdn = ?1 AND service_id != ?2
+                   AND (status IN ('pending','running') OR reconcile = 1) LIMIT 1", [$fqdn, $sid])
+  if length($pfq) > 0 then return true end
+  -- reconcile=1 jobs may correspond to a LIVE CT (ambiguous outcome), so their FQDN
+  -- is still taken — include them or another service could grab the same name (Codex P1).
+  $jobs = db_query("SELECT service_id, external_ref FROM jobs
+                    WHERE kind = 'provision_ct' AND (status IN ('pending','running') OR reconcile = 1)", [])
+  for each $j in $jobs
+    if to_number($j["service_id"]) != to_number($sid) then
+      $req = svc_prov_req($j)
+      $jn = lower(trim("" .. $req["node_name"]))
+      $jd = lower(trim("" .. $req["domain"]))
+      if $jn != "" and ($jn .. "." .. $jd) == $fqdn then return true end
+    end
+  end
+  return false
+end
+
+function svc_ip_available($ip)
+  $r = db_query("SELECT status FROM ip_pool WHERE ip = ?1", [$ip])
+  if length($r) != 1 then return false end
+  return ("" .. $r[0]["status"]) == "free"
+end
+
+function svc_prov_status_doc($sid)
+  $s = svc_get_one($sid)
+  $job = svc_latest_prov_job($sid)
+  $req = svc_prov_req($job)
+  $fqdn = ""
+  if $s != nil then $fqdn = "" .. $s["fqdn"] end
+  if $fqdn == "" and trim("" .. $req["node_name"]) != "" and trim("" .. $req["domain"]) != "" then
+    $fqdn = lower(trim("" .. $req["node_name"])) .. "." .. lower(trim("" .. $req["domain"]))
+  end
+  if $job == nil then
+    return { status: "", step: "", phase_label: "not queued", fqdn: $fqdn, ip: "", vmid: "", node: "", error: "", attempt: 0, updated: "" }
+  end
+  return { status: svc_empty_nil($job["status"]), step: svc_empty_nil($job["step"]),
+           phase_label: svc_prov_label($job["status"], $job["step"]),
+           fqdn: $fqdn, ip: svc_empty_nil($job["ip"]), vmid: svc_empty_nil($job["vmid"]),
+           node: svc_empty_nil($job["node"]), error: svc_empty_nil($job["error"]),
+           attempt: to_number($job["attempt"]), updated: svc_empty_nil($job["updated"]) }
+end
+
+function svc_prov_form($s, $job)
+  $req = svc_prov_req($job)
+  $sid = "" .. $s["id"]
+  $domain = "" .. $req["domain"]
+  if $domain == "" then
+    $alds = svc_allowed_domains()
+    if length($alds) > 0 then $domain = $alds[0] end
+  end
+  $node = svc_empty_nil($req["node_name"])
+  $ip = "" .. $req["ip"]
+  if $ip == "" then $ip = "" .. $s["ip"] end
+  $pves = biz_pve_hosts()
+  $pve = "" .. $req["pve_host"]
+  if $pve == "" and length($pves) > 0 then $pve = $pves[0] end
+  $pveopts = []
+  for each $ph in $pves
+    push($pveopts, { value: $ph, "label": $ph })
+  end
+  $label = "Provision"
+  if $job != nil and (("" .. $job["status"]) == "failed" or ("" .. $job["status"]) == "abandoned") then
+    $label = "Retry"
+  end
+  $h = fm_open("/biz/services", { skin: true })
+  $h = $h .. fm_hidden("action", "provision") .. fm_hidden("id", $sid)
+  $h = $h .. fm_grid({ cols: 2 },
+    fm_select("pve_host", "PVE host", $pveopts, { value: $pve, required: true }) ..
+    fm_text("ip", "Pool IP", { value: $ip, required: true, placeholder: biz_pool_hint(), inputmode: "numeric" }) ..
+    fm_text("domain", "Domain", { value: $domain, required: true }) ..
+    fm_text("node_name", "Node name", { value: $node, placeholder: "blank = MAC-derived" }))
+  $h = $h .. fm_actions({ submit: $label })
+  return $h .. fm_close()
+end
+
+function svc_prov_card($s)
+  if ("" .. $s["kind"]) != "ct" then return "" end
+  $sid = "" .. $s["id"]
+  $job = svc_latest_prov_job($s["id"])
+  $doc = svc_prov_status_doc($s["id"])
+  $active = $doc["status"] == "pending" or $doc["status"] == "running"
+  $rows = []
+  push($rows, { "label": "State", html: '<span data-prov-field="phase_label">' .. svc_badge($doc["phase_label"], svc_prov_variant($doc["status"])) .. '</span>' })
+  push($rows, { "label": "FQDN", html: '<span data-prov-field="fqdn">' .. esc($doc["fqdn"]) .. '</span>' })
+  push($rows, { "label": "Host", html: '<span data-prov-field="node">' .. esc($doc["node"]) .. '</span> <span class="muted">vmid</span> <span data-prov-field="vmid">' .. esc($doc["vmid"]) .. '</span> <span class="muted">ip</span> <span data-prov-field="ip">' .. esc($doc["ip"]) .. '</span>' })
+  push($rows, { "label": "Error", html: '<span data-prov-field="error">' .. esc($doc["error"]) .. '</span>' })
+  if $active then
+    push($rows, { "label": "Refresh", html: '<span class="muted" data-prov-spinner aria-live="polite">↻ Updating...</span>' })
+  end
+  $h = '<div class="card" id="prov-card-' .. esc($sid) .. '" data-prov-service="' .. esc($sid) .. '"><h2>Provision</h2>' .. dv_kv_table($rows)
+  -- TODO(brick-4/prod): reconcile/adopt an already-created CT if success apply rolls back after PVE work.
+  if ("" .. $s["status"]) != "active" and not $active then
+    $h = $h .. svc_prov_form($s, $job)
+  end
+  $h = $h .. '</div>'
+  if $active then $h = $h .. svc_prov_poll_script($sid) end
+  return $h
+end
+
+function svc_prov_poll_script($sid)
+  return '<script>(function(){var sid="' .. esc($sid) .. '";var root=document.getElementById("prov-card-"+sid);if(!root||root.__provPoll){return}root.__provPoll=1;function set(k,v){var e=root.querySelector("[data-prov-field="+k+"]");if(e){e.textContent=(v==null||v==="nil")?"":String(v)}}function tick(){fetch("/biz/provision-status?service="+encodeURIComponent(sid),{credentials:"same-origin"}).then(function(r){return r.ok?r.json():null}).then(function(j){if(!j){return}set("fqdn",j.fqdn);set("ip",j.ip);set("vmid",j.vmid);set("node",j.node);set("error",j.error);var ph=root.querySelector("[data-prov-field=phase_label]");if(ph){ph.textContent=j.phase_label||j.status||""}var sp=root.querySelector("[data-prov-spinner]");if(sp){sp.textContent=(j.status==="pending"||j.status==="running")?"↻ Updating...":"Updated"}if(j.status!=="pending"&&j.status!=="running"){clearInterval(root.__provTimer);root.__provTimer=null}}).catch(function(){})}root.__provTimer=setInterval(tick,3000);tick();})();</script>'
+end
+
+-- Detail page: cms-head + info card + credentials (mask/reveal + add/delete).
+-- $reveal_id: the ONE credential id to show in plaintext THIS render (0 = none) —
+-- the reveal is a POST re-render, never a persisted toggle.
+function svc_detail($s, $reveal_id)
+  $sid = "" .. $s["id"]
+  $today = biz_today()
+
+  $h = dv_head($s["label"], {
+    badge_html: svc_badge($s["status"], svc_status_variant($s["status"])),
+    actions_html: '<a class="btn btn-primary" href="/biz/services?edit=' .. url_encode($sid) .. '">Edit</a>',
+    back: { href: "/biz/services", "label": "All services" } })
+
+  -- info card (dv_* detail Foundation: {label, html} rows → dv_kv_table)
+  $c = db_query("SELECT id, name FROM customers WHERE id = ?1", [$s["customer_id"]])
+  $cust = '#' .. ("" .. $s["customer_id"])
+  if length($c) == 1 then
+    $cust = '<a href="/biz/customers?view=' .. url_encode("" .. $c[0]["id"]) .. '">' .. esc($c[0]["name"]) .. '</a>'
+  end
+  $rows = []
+  push($rows, { "label": "Customer", html: $cust })
+  push($rows, { "label": "Kind", value: "" .. $s["kind"] })
+  $plan = "custom"
+  if $s["plan_id"] != nil then
+    $p = db_query("SELECT name FROM plans WHERE id = ?1", [$s["plan_id"]])
+    if length($p) == 1 then
+      $plan = "" .. $p[0]["name"]
+    else
+      $plan = "#" .. ("" .. $s["plan_id"])
+    end
+  end
+  push($rows, { "label": "Plan", value: $plan })
+  $units = '<span class="muted">—</span>'
+  if $s["units"] != nil then
+    $units = esc("" .. $s["units"])
+  end
+  $addons = ""
+  if svc_flag($s["addon_bulk25"]) then
+    $addons = $addons .. " · bulk-25"
+  end
+  if svc_flag($s["addon_ipv4"]) then
+    $addons = $addons .. " · ipv4"
+  end
+  push($rows, { "label": "Units", html: $units .. esc($addons) })
+  $price = fmt_aud($s["price_cents"]) .. "/yr"
+  $cat = price_for_units($s["units"])
+  if $cat != nil and $cat != to_number($s["price_cents"]) then
+    $price = $price .. ' <span class="muted">(custom price — catalogue would be ' .. fmt_aud($cat) .. ')</span>'
+  end
+  push($rows, { "label": "Price", html: $price })
+  $due = '<span class="muted">—</span>'
+  if $s["next_due"] != nil and ("" .. $s["next_due"]) != "" then
+    $due = esc($s["next_due"])
+    if ("" .. $s["status"]) == "active" and ("" .. $s["next_due"]) < $today then
+      $due = svc_badge(("" .. $s["next_due"]) .. " — overdue", "danger")
+    end
+  end
+  push($rows, { "label": "Next due", html: $due })
+  $auto = "off"
+  if svc_flag($s["auto_charge"]) then
+    $auto = "on"
+  end
+  push($rows, { "label": "Payment", html: esc($s["payment_pref"]) .. ' <span class="muted">· auto-charge ' .. $auto .. '</span>' })
+  $host = ""
+  if ("" .. $s["node"]) != "" then
+    $host = $host .. esc($s["node"])
+  end
+  if $s["vmid"] != nil then
+    $host = $host .. ' <span class="muted">vmid</span> ' .. esc("" .. $s["vmid"])
+  end
+  if ("" .. $s["ip"]) != "" then
+    $host = $host .. ' <span class="muted">ip</span> ' .. esc($s["ip"])
+  end
+  if $host != "" then
+    push($rows, { "label": "Host", html: $host })
+  end
+  if ("" .. $s["fqdn"]) != "" then
+    push($rows, { "label": "FQDN", value: "" .. $s["fqdn"] })
+  end
+  if ("" .. $s["notes"]) != "" then
+    push($rows, { "label": "Notes", value: "" .. $s["notes"] })
+  end
+  $h = $h .. '<div class="card">' .. dv_kv_table($rows) .. '</div>'
+  $h = $h .. svc_prov_card($s)
+
+  -- credentials: masked always; Reveal = an audited POST that re-renders THIS page
+  -- with exactly one secret shown. Delete is confirm-guarded; both forms are tiny
+  -- sibling POSTs (a row can't nest forms inside the add-credential form).
+  $h = $h .. '<div class="card"><h2>Credentials</h2>'
+  $creds = db_query("SELECT * FROM credentials WHERE service_id = ?1 ORDER BY system, username", [$s["id"]])
+  if length($creds) == 0 then
+    $h = $h .. '<p class="muted">No credentials recorded.</p>'
+  else
+    $h = $h .. '<table class="biz-creds"><tr><th>System</th><th>Username</th><th>Secret</th><th></th></tr>'
+    for each $cr in $creds
+      $sec = '<span class="muted">••••••</span>'
+      if to_number($reveal_id) == to_number($cr["id"]) then
+        $sec = '<code>' .. esc($cr["secret"]) .. '</code>'
+      end
+      $acts = fm_mini_form("/biz/services", { action: "reveal", id: $sid, cred_id: "" .. $cr["id"] }, "Reveal", {})
+      $acts = $acts .. ' ' .. fm_mini_form("/biz/services", { action: "cred_delete", id: $sid, cred_id: "" .. $cr["id"] }, "Delete", { confirm: "Delete this credential? This cannot be undone." })
+      $h = $h .. '<tr><td>' .. esc($cr["system"]) .. '</td><td>' .. esc($cr["username"]) .. '</td><td>' .. $sec .. '</td><td>' .. $acts .. '</td></tr>'
+    end
+    $h = $h .. '</table>'
+  end
+  $h = $h .. fm_open("/biz/services", { skin: true })
+  $h = $h .. fm_hidden("action", "cred_save") .. fm_hidden("id", $sid)
+  $h = $h .. fm_grid({ cols: 3 }, fm_text("system", "System", { required: true, placeholder: "e.g. ssh, panel, db" }) .. fm_text("username", "Username", {}) .. fm_text("secret", "Secret", {}))
+  $h = $h .. fm_actions({ submit: "Add credential" })
+  $h = $h .. fm_close()
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- ─────────────────────────────── list config ───────────────────────────────
+
+-- Spec + opts built ONCE (mirrors uu_list_config). Cell lambdas close over the
+-- customer id→name map and today's date; every SQL fragment stays author-literal.
+function svc_list_config()
+  $cmap = svc_customer_map()
+  $pmap = svc_prov_map()
+  $today = biz_today()
+  $label_cell = fn($r) = '<a href="/biz/services?view=' .. url_encode("" .. $r["id"]) .. '">' .. esc($r["label"]) .. '</a>'
+  $cust_cell = fn($r) = svc_customer_cell($r, $cmap)
+  $status_badge = fn($r) = { "text": $r["status"], "variant": svc_status_variant($r["status"]) }
+  $prov_cell = fn($r) = svc_prov_cell($r, $pmap)
+  $due_cell = fn($r) = svc_due_cell($r, $today)
+  $auto_cell = fn($r) = svc_auto_cell($r)
+  $aud = fn($v) = fmt_aud($v)
+  $act_edit = dt_action("edit", { "label": "Edit", icon: "pencil", variant: "action", modal: "md-edit", href: fn($r) = "/biz/services?edit=" .. url_encode("" .. $r["id"]) .. "&modal=1" })
+  $act_del = dt_action("delete", { "label": "Delete", icon: "trash", variant: "action-danger", action: "delete", confirm: "Delete this service? Invoiced services are refused — cancel those instead." })
+  $rowhref = fn($r) = "/biz/services?view=" .. url_encode("" .. $r["id"])
+  $spec = [
+    dt_col("id", "ID", "id", { sortable: true, width: "4rem" }),
+    dt_col("label", "Service", "label", { sortable: true, searchable: true, render: $label_cell }),
+    dt_col("customer", "Customer", "customer_id", { sortable: true, render: $cust_cell, toggleable: true }),
+    dt_col("kind", "Kind", "kind", { sortable: true, toggleable: true }),
+    dt_col("units", "Units", "units", { sortable: true, align: "right", placeholder: "—", width: "5rem", toggleable: true }),
+    dt_col("price", "Price/yr", "price_cents", { sortable: true, align: "right", fmt: $aud, summarize: "sum", summary_fmt: $aud }),
+    dt_col("status", "Status", "status", { sortable: true, badge: $status_badge, toggleable: true }),
+    dt_col("provision", "Provision", "id", { render: $prov_cell, toggleable: true }),
+    dt_col("next_due", "Next due", "next_due", { sortable: true, render: $due_cell, toggleable: true }),
+    dt_col("auto", "Auto", "auto_charge", { align: "center", render: $auto_cell, width: "4rem", toggleable: true })
+  ]
+  $opts = dt_admin_opts({
+    base_route: "/biz/services", caption: "Services", noun: "services",
+    default_sort: "next_due", default_dir: "asc",
+    search_placeholder: "Search services…",
+    row_href: $rowhref, row_action_specs: [$act_edit, $act_del],
+    bulk_id: fn($r) = "" .. $r["id"],
+    filters: [
+      dt_filter("status", "Status", { options: [
+        { value: "active", "label": "Active", col: "status", op: "=" },
+        { value: "pending", "label": "Pending", col: "status", op: "=" },
+        { value: "suspended", "label": "Suspended", col: "status", op: "=" },
+        { value: "cancelled", "label": "Cancelled", col: "status", op: "=" }
+      ] }),
+      dt_filter("kind", "Kind", { options: [
+        { value: "ct", "label": "ct", col: "kind", op: "=" },
+        { value: "vm", "label": "vm", col: "kind", op: "=" },
+        { value: "byo", "label": "byo", col: "kind", op: "=" },
+        { value: "legacy", "label": "legacy", col: "kind", op: "=" }
+      ] }),
+      dt_filter("pay", "Payment", { options: [
+        { value: "stripe", "label": "Stripe", col: "payment_pref", op: "=" },
+        { value: "paypal", "label": "PayPal", col: "payment_pref", op: "=" },
+        { value: "bank", "label": "Bank", col: "payment_pref", op: "=" }
+      ] })
+    ],
+    groups: [
+      dt_group("status", "Status", "status", nil),
+      dt_group("kind", "Kind", "kind", nil)
+    ],
+    header_actions: [{ "label": "New service", icon: "plus", variant: "primary", modal: "md-edit", modal_src: "/biz/services?new=1&modal=1" }]
+  })
+  return { spec: $spec, opts: $opts }
+end
+
+function svc_prov_cell($r, $pmap)
+  if ("" .. $r["kind"]) != "ct" then return '<span class="muted">—</span>' end
+  $p = $pmap["" .. $r["id"]]
+  if $p == nil then return '<span class="muted">not queued</span>' end
+  return dt_badge(svc_prov_label($p["status"], $p["step"]), svc_prov_variant($p["status"]), "")
+end
+
+function svc_customer_cell($r, $cmap)
+  $name = $cmap["" .. $r["customer_id"]]
+  if $name == nil then
+    $name = "#" .. ("" .. $r["customer_id"])
+  end
+  return '<a href="/biz/customers?view=' .. url_encode("" .. $r["customer_id"]) .. '">' .. esc($name) .. '</a>'
+end
+
+function svc_due_cell($r, $today)
+  $d = $r["next_due"]
+  if $d == nil or ("" .. $d) == "" then
+    return '<span class="muted">—</span>'
+  end
+  if ("" .. $r["status"]) == "active" and ("" .. $d) < $today then
+    return dt_badge($d, "danger", "")
+  end
+  return esc("" .. $d)
+end
+
+function svc_auto_cell($r)
+  if svc_flag($r["auto_charge"]) then
+    return '✓'
+  end
+  return '<span class="muted">—</span>'
+end
+
+-- ─────────────────────────────── entry point ───────────────────────────────
+
+function biz_services_main()
+cms_init()
+biz_init()
+$user = current_user($HEADERS)
+-- A modal fetch on an expired session must return a clean fragment, not a login
+-- redirect injected into the dialog (mirrors h_admin_users).
+if md_is_modal_request() and $user == nil then
+  return md_session_expired("/biz/services")
+end
+$deny = require_role($user, "admin")
+if $deny != nil then
+  return $deny
+end
+$actor = "" .. $user["username"]
+
+if $METHOD == "POST" then
+  $f = parse_form($BODY)
+  $action = $f["action"]
+  if $action == nil then
+    $action = "save"
+  end
+
+  -- bulk delete (checkbox column / select-all-across-pages). Per-row guard,
+  -- skip-and-report: delete what passes svc_del_block, count the rest, surface the
+  -- first refusal reason. Select-all re-runs dt_where SERVER-SIDE (dt_all_ids) —
+  -- posted ids are never trusted for the "all" set.
+  if $action == "bulk_delete" then
+    $ids = dt_selected_ids($f)
+    if dt_wants_all($f) then
+      $cfg = svc_list_config()
+      $ids = dt_all_ids("services", $cfg["spec"], dt_state_from_map($f, $cfg["spec"], $cfg["opts"]), "id")
+    end
+    $rep = dt_bulk_report(dt_bulk_try_delete($ids, svc_del_hooks($actor)), "service(s)")
+    return redirect_flash("/biz/services", $rep["msg"], $rep["kind"])
+  end
+
+  -- declarative row delete (datatable.mix): action="row:delete:<id>".
+  $ra = dt_row_action($f)
+  if $ra != nil then
+    if $ra["verb"] == "delete" then
+      $did = to_number($ra["id"])
+      if $did == nil then
+        return redirect_flash("/biz/services", "No such service", "danger")
+      end
+      $block = svc_try_delete($did, $actor)
+      if $block != "" then
+        return redirect_flash("/biz/services", $block, "danger")
+      end
+    end
+    return redirect_flash("/biz/services", "Service deleted", "success")
+  end
+
+  if $action == "delete" then
+    $did = to_number(fm_val($f, "id"))
+    if $did == nil then
+      return redirect_flash("/biz/services", "No such service", "danger")
+    end
+    $block = svc_try_delete($did, $actor)
+    if $block != "" then
+      return redirect_flash("/biz/services?view=" .. $did, $block, "danger")
+    end
+    return redirect_flash("/biz/services", "Service deleted", "success")
+  end
+
+  if $action == "reveal" then
+    $sid = to_number(fm_val($f, "id"))
+    $s = svc_get_one($sid)
+    if $s == nil then
+      return redirect_flash("/biz/services", "No such service", "danger")
+    end
+    $cid = to_number(fm_val($f, "cred_id"))
+    $cr = db_query("SELECT * FROM credentials WHERE id = ?1 AND service_id = ?2", [$cid, $sid])
+    if length($cr) != 1 then
+      return redirect_flash("/biz/services?view=" .. $sid, "Credential not found", "danger")
+    end
+    -- audit BEFORE the secret leaves the database — the reveal is the event.
+    biz_audit($actor, "credential_reveal", "credentials", $cid, ("" .. $cr[0]["system"]) .. "/" .. ("" .. $cr[0]["username"]))
+    return doc(200, "" .. $s["label"], $user, svc_detail($s, $cid))
+  end
+
+  if $action == "cred_save" then
+    $sid = to_number(fm_val($f, "id"))
+    $s = svc_get_one($sid)
+    if $s == nil then
+      return redirect_flash("/biz/services", "No such service", "danger")
+    end
+    $sys = trim(fm_val($f, "system"))
+    if $sys == "" then
+      return redirect_flash("/biz/services?view=" .. $sid, "System is required", "danger")
+    end
+    $un = trim(fm_val($f, "username"))
+    -- write fence: revalidate the service inside the tx (racing delete, FKs off).
+    try
+      db_exec("BEGIN IMMEDIATE")
+      if not biz_row_exists("services", $sid) then
+        db_exec("ROLLBACK")
+        return redirect_flash("/biz/services", "No such service", "danger")
+      end
+      db_exec("INSERT INTO credentials (service_id, system, username, secret, updated) VALUES (?1, ?2, ?3, ?4, ?5)",
+              [$sid, $sys, $un, fm_val($f, "secret"), biz_now()])
+      $nid = db_query("SELECT last_insert_rowid() AS id")
+      biz_audit($actor, "credential_add", "credentials", to_number($nid[0]["id"]), $sys .. "/" .. $un)
+      db_exec("COMMIT")
+    catch $e
+      try db_exec("ROLLBACK") catch $e2 end
+      return redirect_flash("/biz/services?view=" .. $sid, "Could not add credential", "danger")
+    end
+    return redirect_flash("/biz/services?view=" .. $sid, "Credential added", "success")
+  end
+
+  if $action == "cred_delete" then
+    $sid = to_number(fm_val($f, "id"))
+    $cid = to_number(fm_val($f, "cred_id"))
+    $cr = db_query("SELECT * FROM credentials WHERE id = ?1 AND service_id = ?2", [$cid, $sid])
+    if length($cr) != 1 then
+      return redirect_flash("/biz/services?view=" .. $sid, "Credential not found", "danger")
+    end
+    db_exec("DELETE FROM credentials WHERE id = ?1", [$cid])
+    biz_audit($actor, "credential_delete", "credentials", $cid, ("" .. $cr[0]["system"]) .. "/" .. ("" .. $cr[0]["username"]))
+    return redirect_flash("/biz/services?view=" .. $sid, "Credential deleted", "success")
+  end
+
+  -- Brick 8: Ensure DNS for an ALREADY-provisioned service — enqueue a provision_dns job
+  -- on the SAME service lane (so it can't race a CT lifecycle op) and wake the drain. Uses
+  -- the service's STORED fqdn/ip; no operator-named records.
+  if $action == "ensure_dns" then
+    $sid = to_number(fm_val($f, "id"))
+    $s = svc_get_one($sid)
+    if $s == nil then
+      return redirect_flash("/biz/services", "No such service", "danger")
+    end
+    if ("" .. $s["status"]) != "active" then
+      return redirect_flash("/biz/services?view=" .. $sid, "Only active services can have DNS ensured", "warning")
+    end
+    $dfq = lower(trim("" .. $s["fqdn"]))
+    $dip = trim("" .. $s["ip"])
+    if $dfq == "" or $dip == "" then
+      return redirect_flash("/biz/services?view=" .. $sid, "Service has no fqdn/ip to ensure DNS for", "danger")
+    end
+    if biz_provisioning_blocked() != "" then
+      return redirect_flash("/biz/services?view=" .. $sid, "Provisioning is paused: resolve the duplicate lane first.", "danger")
+    end
+    try
+      db_exec("BEGIN IMMEDIATE")
+      -- revalidate INSIDE the tx: a concurrent (guard+delete)-in-tx can remove the
+      -- service between our pre-checks and this write lock; FKs are off, so an
+      -- unchecked insert would resurrect a job for a deleted row.
+      $still = db_query("SELECT id FROM services WHERE id = ?1", [$sid])
+      if length($still) == 0 then
+        db_exec("ROLLBACK")
+        return redirect_flash("/biz/services", "No such service", "danger")
+      end
+      -- the service-lane unique index refuses a 2nd active job for this service (CT or DNS).
+      db_exec("INSERT INTO jobs (kind, service_id, status, conflict_class, target_key, fqdn, ip, created, updated)
+               VALUES ('provision_dns', ?1, 'pending', 'service', ?2, ?3, ?4, ?5, ?5)",
+              [$sid, "svc:" .. $sid, $dfq, $dip, biz_now()])
+      biz_audit($actor, "ensure_dns_enqueue", "services", $sid, $dfq .. " -> " .. $dip)
+      db_exec("COMMIT")
+    catch $e
+      try db_exec("ROLLBACK") catch $e2 end
+      return redirect_flash("/biz/services?view=" .. $sid, "Could not queue DNS ensure (a job is already active for this service)", "warning")
+    end
+    $woke = false
+    try
+      $_ = bus_call("provisiond.wake", {})
+      $woke = true
+    catch $we
+      try biz_audit($actor, "provision_wake_failed", "services", $sid, "" .. $we) catch $we2 end
+    end
+    return redirect_flash("/biz/services?view=" .. $sid, "DNS ensure queued", "success")
+  end
+
+  if $action == "provision" then
+    $sid = to_number(fm_val($f, "id"))
+    $s = svc_get_one($sid)
+    if $s == nil then
+      return redirect_flash("/biz/services", "No such service", "danger")
+    end
+    if ("" .. $s["kind"]) != "ct" then
+      return redirect_flash("/biz/services?view=" .. $sid, "Only ct services can be provisioned", "danger")
+    end
+    if ("" .. $s["status"]) == "active" then
+      return redirect_flash("/biz/services?view=" .. $sid, "Service is already active", "warning")
+    end
+    if svc_active_prov_job($sid) then
+      return redirect_flash("/biz/services?view=" .. $sid, "Provision job is already queued or running", "warning")
+    end
+    $pve = trim(fm_val($f, "pve_host"))
+    $ip = trim(fm_val($f, "ip"))
+    $domain = lower(trim(fm_val($f, "domain")))
+    -- A blank optional form field is nil. Coerce it to the intended empty
+    -- string before trim/lower; stringifying nil produces the valid-but-wrong
+    -- DNS label "nil" and defeats the worker's MAC-derived fallback.
+    $node = lower(trim(svc_empty_nil(fm_val($f, "node_name"))))
+    $err = ""
+    if not contains(biz_pve_hosts(), $pve) then $err = "Pick a configured PVE host (provision_pve_hosts)." end
+    if $err == "" and not biz_valid_pool_ip($ip) then
+      $err = "IP is not inside the configured provision_ip_pool ranges."
+    end
+    if $err == "" and not svc_ip_available($ip) then
+      $err = "IP is not free in ip_pool."
+    end
+    if $err == "" and not svc_valid_domain($domain) then
+      $err = "Domain is not a valid DNS name."
+    end
+    if $err == "" and not svc_domain_allowed($domain) then
+      $err = "Domain is not in provision_allowed_domains."
+    end
+    if $err == "" and not svc_valid_node_name($node) then
+      $err = "Node name must be a single DNS label."
+    end
+    if $err == "" and svc_reserved_node($node) then
+      $err = "Node name is reserved on provisioned domains."
+    end
+    $fqdn = ""
+    if $node != "" then $fqdn = $node .. "." .. $domain end
+    if $err == "" and svc_fqdn_busy($sid, $fqdn) then
+      $err = "That node name is already live or queued."
+    end
+    -- Fail closed while the active-target lane index is absent (Brick 1, Codex P1).
+    if $err == "" and biz_provisioning_blocked() != "" then
+      $err = "Provisioning is paused: an unresolved duplicate lane exists in the queue — resolve it first."
+    end
+    if $err != "" then
+      return redirect_flash("/biz/services?view=" .. $sid, $err, "danger")
+    end
+    $external = json_encode({ pve_host: $pve, node_name: $node, domain: $domain, ip: $ip })
+    try
+      db_exec("BEGIN IMMEDIATE")
+      -- revalidate INSIDE the tx (mirrors ensure_dns): the service must still exist
+      -- once we hold the write lock — a racing delete commits before or after us,
+      -- never interleaved.
+      $still = db_query("SELECT id FROM services WHERE id = ?1", [$sid])
+      if length($still) == 0 then
+        db_exec("ROLLBACK")
+        return redirect_flash("/biz/services", "No such service", "danger")
+      end
+      -- conflict_class='service' + target_key='svc:<id>' put every service mutation
+      -- (CT lifecycle AND provision_dns) in ONE exclusive lane (Brick 1, generalized in
+      -- Brick 8); the invariant trigger REQUIRES them on a pending row, and the
+      -- partial-unique index enforces one active job/lane per service.
+      db_exec("INSERT INTO jobs (kind, service_id, status, ip, external_ref,
+               conflict_class, target_key, created, updated)
+               VALUES ('provision_ct', ?1, 'pending', ?2, ?3, 'service', ?5, ?4, ?4)",
+              [$sid, $ip, $external, biz_now(), "svc:" .. $sid])
+      $jid_row = db_query("SELECT last_insert_rowid() AS id")
+      $jid = to_number($jid_row[0]["id"])
+      db_exec("UPDATE ip_pool SET status = 'reserved', service_id = ?2,
+               reserved_at = ?3, reserved_by_job = ?4
+               WHERE ip = ?1 AND status = 'free'",
+              [$ip, $sid, biz_now(), $jid])
+      $rch = db_query("SELECT changes() AS n")
+      if to_number($rch[0].n) != 1 then
+        db_exec("ROLLBACK")
+        return redirect_flash("/biz/services?view=" .. $sid, "IP is no longer free or is already targeted", "danger")
+      end
+      biz_audit($actor, "provision_enqueue", "services", $sid, $external)
+      db_exec("COMMIT")
+    catch $e
+      try db_exec("ROLLBACK") catch $e2 end
+      return redirect_flash("/biz/services?view=" .. $sid, "Provision job is already queued or running", "warning")
+    end
+    -- Best-effort Bus wake AFTER the commit (never while holding the tx): nudge
+    -- provisiond to drain now. The job is durably queued regardless — a failed wake
+    -- is an audit note (the lazy timer backstop catches it), NEVER a rollback, and
+    -- the reply means only "systemd activation accepted", not "provisioning started".
+    -- The audit is itself wrapped so a log failure can't fail a committed enqueue.
+    $woke = false
+    try
+      $_ = bus_call("provisiond.wake", {})
+      $woke = true
+    catch $we
+      try biz_audit($actor, "provision_wake_failed", "services", $sid, "" .. $we) catch $we2 end
+    end
+    if $woke then
+      return redirect_flash("/biz/services?view=" .. $sid, "Provision job queued", "success")
+    end
+    return redirect_flash("/biz/services?view=" .. $sid, "Provision job queued (auto-wake unavailable — the backstop will pick it up)", "success")
+  end
+
+  -- save (create or update)
+  $editid = trim(fm_val($f, "id"))
+  $err = ""
+  $cust = nil
+  $custid = to_number(fm_val($f, "customer_id"))
+  if $custid == nil then
+    $err = "Pick a customer."
+  else
+    $crows = db_query("SELECT id, stripe_pm_status FROM customers WHERE id = ?1", [$custid])
+    if length($crows) == 0 then
+      $err = "No such customer."
+    else
+      $cust = $crows[0]
+    end
+  end
+  $label = trim(fm_val($f, "label"))
+  if $err == "" and $label == "" then
+    $err = "Label is required."
+  end
+  $kind = fm_val($f, "kind")
+  if not ($kind == "ct" or $kind == "vm" or $kind == "byo" or $kind == "legacy") then
+    $kind = "legacy"
+  end
+  $status = fm_val($f, "status")
+  if not ($status == "pending" or $status == "active" or $status == "suspended" or $status == "cancelled") then
+    $status = "pending"
+  end
+  $pref = fm_val($f, "payment_pref")
+  if not ($pref == "stripe" or $pref == "paypal" or $pref == "bank") then
+    $pref = "stripe"
+  end
+  $plan_id = nil
+  if trim(fm_val($f, "plan_id")) != "" then
+    $plan_id = to_number(fm_val($f, "plan_id"))
+  end
+  $units = nil
+  $uraw = trim(fm_val($f, "units"))
+  if $err == "" and $uraw != "" then
+    $units = to_number($uraw)
+    if $units == nil then
+      $err = "Units must be a number."
+    end
+  end
+  -- price: dollars → cents; blank + units → the catalogue formula.
+  $cents = nil
+  $draw = trim(fm_val($f, "price"))
+  if $err == "" then
+    if $draw == "" then
+      if $units != nil then
+        $cents = price_for_units($units)
+      else
+        $err = "Price is required (or set units for the catalogue price)."
+      end
+    else
+      $pn = to_number($draw)
+      if $pn == nil then
+        $err = "Price must be a number."
+      else
+        $cents = round($pn * 100)
+      end
+    end
+  end
+  if $err == "" and (to_number($cents) == nil or $cents <= 0) then
+    $err = "Price must be a positive number."
+  end
+  $due = trim(fm_val($f, "next_due"))
+  if $err == "" and $due != "" and not dt_is_isodate($due) then
+    $err = "Next due must be YYYY-MM-DD."
+  end
+  $b25 = 0
+  if fm_val($f, "addon_bulk25") == "1" then
+    $b25 = 1
+  end
+  $ip4 = 0
+  if fm_val($f, "addon_ipv4") == "1" then
+    $ip4 = 1
+  end
+  $auto = 0
+  if fm_val($f, "auto_charge") == "1" then
+    $auto = 1
+  end
+  -- auto-charge only rides a verified card; otherwise force it off + warn.
+  $warn = ""
+  if $err == "" and $auto == 1 then
+    if ("" .. $cust["stripe_pm_status"]) != "verified" then
+      $auto = 0
+      $warn = " — auto-charge left OFF: customer has no verified card"
+    end
+  end
+
+  if $err != "" then
+    -- re-render the canvas editor with the submitted values echoed back.
+    $heading = "Edit service"
+    if $editid == "" then
+      $heading = "New service"
+    end
+    $s = { id: $editid, customer_id: fm_val($f, "customer_id"), "label": fm_val($f, "label"),
+           kind: $kind, plan_id: fm_val($f, "plan_id"), units: $uraw, price_display: $draw,
+           addon_bulk25: $b25, addon_ipv4: $ip4, status: $status, next_due: $due,
+           payment_pref: $pref, auto_charge: $auto, notes: fm_val($f, "notes") }
+    return doc(200, $heading, $user, svc_form($s, $heading, $err))
+  end
+
+  $duebind = nil
+  if $due != "" then
+    $duebind = $due
+  end
+  -- write fence: the customer (and, on edit, the service) must still exist once we
+  -- hold the write lock — the pre-checks above raced any concurrent delete.
+  try
+    db_exec("BEGIN IMMEDIATE")
+    if not biz_row_exists("customers", $custid) then
+      db_exec("ROLLBACK")
+      return redirect_flash("/biz/services", "No such customer", "danger")
+    end
+    if $editid != "" then
+      $sid = to_number($editid)
+      if not biz_row_exists("services", $sid) then
+        db_exec("ROLLBACK")
+        return redirect_flash("/biz/services", "No such service", "danger")
+      end
+      -- node/vmid/ip/legacy_id are provisioning-owned — the editor never touches them.
+      db_exec("UPDATE services SET customer_id = ?1, kind = ?2, label = ?3, plan_id = ?4, units = ?5,
+               addon_bulk25 = ?6, addon_ipv4 = ?7, price_cents = ?8, status = ?9, next_due = ?10,
+               payment_pref = ?11, auto_charge = ?12, notes = ?13, updated = ?14 WHERE id = ?15",
+              [$custid, $kind, $label, $plan_id, $units, $b25, $ip4, $cents, $status, $duebind,
+               $pref, $auto, fm_val($f, "notes"), biz_now(), $sid])
+    else
+      db_exec("INSERT INTO services (customer_id, kind, label, plan_id, units, addon_bulk25, addon_ipv4,
+               price_cents, status, next_due, payment_pref, auto_charge, notes, created, updated)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+              [$custid, $kind, $label, $plan_id, $units, $b25, $ip4, $cents, $status, $duebind,
+               $pref, $auto, fm_val($f, "notes"), biz_now()])
+      $nid = db_query("SELECT last_insert_rowid() AS id")
+      $sid = to_number($nid[0]["id"])
+    end
+    biz_audit($actor, "save", "services", $sid, $label .. " " .. fmt_aud($cents) .. " status=" .. $status)
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return redirect_flash("/biz/services", "Save failed — try again", "danger")
+  end
+  $ftype = "success"
+  if $warn != "" then
+    $ftype = "warning"
+  end
+  return redirect_flash("/biz/services?view=" .. $sid, "Service saved" .. $warn, $ftype)
+end
+
+-- GET: detail / editor / list.
+$q = parse_query($QUERY)
+$viewid = $q["view"]
+$editid = $q["edit"]
+$isnew = $q["new"]
+
+if $isnew != nil or $editid != nil then
+  $svc_modal = md_is_modal_request()
+  if $isnew != nil then
+    if $svc_modal then
+      return md_fragment(svc_form_panel(svc_blank(), "New service"))
+    end
+    return doc(200, "New service", $user, svc_form(svc_blank(), "New service", ""))
+  end
+  $s = svc_get_one($editid)
+  if $s == nil then
+    if $svc_modal then
+      return md_not_found("service", "/biz/services")
+    end
+    return doc(404, "Services", $user, '<div class="card cms-card-narrow"><h1>Service not found</h1><p class="muted"><a href="/biz/services">← All services</a></p></div>')
+  end
+  if $svc_modal then
+    return md_fragment(svc_form_panel($s, "Edit service"))
+  end
+  return doc(200, "Edit service", $user, svc_form($s, "Edit service", ""))
+end
+
+if $viewid != nil then
+  $s = svc_get_one($viewid)
+  if $s == nil then
+    return doc(404, "Services", $user, '<div class="card cms-card-narrow"><h1>Service not found</h1><p class="muted"><a href="/biz/services">← All services</a></p></div>')
+  end
+  return doc(200, "" .. $s["label"], $user, svc_detail($s, 0))
+end
+
+-- list — the admin panel Foundation + SUM(price_cents) footer (annual run-rate
+-- of the filtered set; search/filters flow into the summary via dt_where).
+$cfg = svc_list_config()
+return dt_admin_list({ title: "Services", user: $user, spec: $cfg["spec"], opts: $cfg["opts"],
+  table: "services", select: "id, customer_id, kind, label, plan_id, units, price_cents, status, next_due, payment_pref, auto_charge",
+  summary: true })
+
+end

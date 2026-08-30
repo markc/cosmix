@@ -1,0 +1,984 @@
+-- forms.mix — shared SSR form-field widget for the webd CMS/PIM tree.
+--
+-- Plan of record: _plan/2026-06-17-forms-widget.md.
+-- Visual target: Filament 5 Forms (filamentphp.com/docs; screenshots deleted 2026-07-23, git history — anatomy ONLY, never
+-- its palette). Sibling of widgets/datatable.mix; same conventions.
+--
+-- ONE copy at /opt/cosmix/vhosts/shared/widgets/forms.mix; `include`-d by a
+-- handler AFTER lib.mix (so esc()/html_escape() resolve at call-time, exactly like
+-- datatable.mix). No stub change — pulled in by the handlers that use it.
+--
+-- DISCIPLINE (mirrors datatable.mix):
+--   * Escape-once firewall: every interpolated VALUE / label / placeholder / help /
+--     error goes through esc() exactly once at emission. Author literals (input type,
+--     button/flash variant) are run through an ALLOWLIST (fm_type_ok / fm_variant_ok),
+--     never escaped-as-text — the allowlist IS the firewall. A field `id` is derived
+--     from `name` and sanitised by fm_id.
+--   * "" .. nil is the literal text "nil" in Mix — every value is nil-guarded before
+--     concat (fm_or / explicit `if == nil`).
+--   * NO mix-0.20 syntax (?? / ?:): webd embeds its own cosmix-lib-mix; this matches
+--     datatable.mix (which runs in webd today) for embed-version safety.
+--
+-- OPT-IN / a11y: the improved semantic markup (label[for] + input[id] + required
+-- marker + .fm-field/.fm-grid structure) is emitted ALWAYS. The Filament VISUAL is
+-- gated by the `.forms-skin` scope class, which fm_open adds when opts.skin == true;
+-- without it a converted form renders through the existing cms.css #content styling.
+-- Per-form opt-in, default skin:false. (Plan §6.)
+
+-- ───────────────────────────── helpers ─────────────────────────────
+
+-- nil-coalesce: $def when $v is nil, else $v (the datatable dt_or shape).
+function fm_or($v, $def)
+  if $v == nil then
+    return $def
+  end
+  return $v
+end
+
+-- Derive a valid, stable DOM id from a field name. Keep [A-Za-z0-9_-]; map anything
+-- else to "-"; prefix "f-" so it never starts with a digit and namespaces our ids.
+-- So name="fullName" → "f-fullName", "site_title" → "f-site_title".
+function fm_id($name)
+  $s = "" .. $name
+  $out = ""
+  $i = 0
+  $n = length($s)
+  while $i < $n
+    $ch = substr($s, $i, 1)
+    if ($ch >= "a" and $ch <= "z") or ($ch >= "A" and $ch <= "Z") or ($ch >= "0" and $ch <= "9") or $ch == "-" or $ch == "_" then
+      $out = $out .. $ch
+    else
+      $out = $out .. "-"
+    end
+    $i = $i + 1
+  end
+  if $out == "" then
+    $out = "field"
+  end
+  return "f-" .. $out
+end
+
+-- Input-type allowlist (firewall: the value flows into <input type="…">). An
+-- off-list / nil type resolves to "text" — no arbitrary token can be injected.
+function fm_type_ok($t)
+  $s = lower(trim("" .. fm_or($t, "text")))
+  if $s == "text" or $s == "email" or $s == "password" or $s == "tel" or $s == "url" or $s == "number" or $s == "date" or $s == "datetime-local" or $s == "time" or $s == "color" or $s == "search" or $s == "hidden" then
+    return $s
+  end
+  return "text"
+end
+
+-- Button variant allowlist → "primary" fallback (mirrors dt_color_ok). Only these
+-- class suffixes exist in forms.css, so a variant can never inject a class fragment.
+function fm_variant_ok($v)
+  $s = lower(trim("" .. fm_or($v, "primary")))
+  if $s == "primary" or $s == "ghost" or $s == "danger" or $s == "success" or $s == "info" or $s == "secondary" then
+    return $s
+  end
+  return "primary"
+end
+
+-- Flash variant allowlist → "info" fallback. ("error" and "danger" both map to error.)
+function fm_flash_variant($v)
+  $s = lower(trim("" .. fm_or($v, "info")))
+  if $s == "error" or $s == "danger" then
+    return "error"
+  end
+  if $s == "success" then
+    return "success"
+  end
+  if $s == "warning" then
+    return "warning"
+  end
+  return "info"
+end
+
+-- Inline-SVG icon registry (the dt_icon shape) — self-contained so forms.mix works
+-- on a page that does NOT include datatable.mix. Author-literal names; "" on miss.
+function fm_icon($name)
+  $n = "" .. $name
+  if $n == "eye" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"></path><circle cx="12" cy="12" r="3"></circle></svg>'
+  end
+  if $n == "eye-off" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.9 4.2A9.1 9.1 0 0 1 12 4c6.5 0 10 7 10 7a13.2 13.2 0 0 1-2.2 2.9M6.6 6.6A13.2 13.2 0 0 0 2 11s3.5 7 10 7a9.1 9.1 0 0 0 4-.9"></path><path d="m2 2 20 20"></path></svg>'
+  end
+  if $n == "calendar" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="18" rx="2"></rect><path d="M16 2v4"></path><path d="M8 2v4"></path><path d="M3 10h18"></path></svg>'
+  end
+  if $n == "info" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 16v-4"></path><path d="M12 8h.01"></path></svg>'
+  end
+  if $n == "check" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg>'
+  end
+  if $n == "x" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>'
+  end
+  if $n == "trash" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"></path><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"></path></svg>'
+  end
+  if $n == "save" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><path d="M17 21v-8H7v8"></path><path d="M7 3v5h8"></path></svg>'
+  end
+  if $n == "arrow-left" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5"></path><path d="m12 19-7-7 7-7"></path></svg>'
+  end
+  if $n == "rotate-ccw" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path><path d="M3 3v5h5"></path></svg>'
+  end
+  return ""
+end
+
+-- A form VALUE reader: the value at key $k of a parsed-form map, "" on nil (replaces
+-- the three duplicated per-handler fval() helpers; PIM handlers fold onto this).
+function fm_val($f, $k)
+  if $f == nil then
+    return ""
+  end
+  $v = $f[$k]
+  if $v == nil then
+    return ""
+  end
+  return "" .. $v
+end
+
+-- ───────────────────────── field sub-bands ─────────────────────────
+
+-- opts.help_tip == true → render the help as a (?) tooltip on the label (this returns the
+-- help text for fm_label_band); otherwise nil (help stays below the field via fm_help_err).
+function fm_tip_of($o)
+  if $o["help_tip"] == true then
+    return $o["help"]
+  end
+  return nil
+end
+
+-- The bold label + optional red required marker (a <label for=> bound to the control), and
+-- an optional (?) help badge whose hover/focus tooltip carries $tip (the field's help text).
+function fm_label_band($id, $label, $required, $tip)
+  $r = ""
+  if $required then
+    $r = ' <span class="fm-req" aria-hidden="true">*</span>'
+  end
+  $lbl = '<label class="fm-label" for="' .. esc($id) .. '">' .. esc("" .. $label) .. $r .. '</label>'
+  -- ALWAYS wrap in .fm-label-row (even with no tip) so every field's label band shares the
+  -- same structure + min-height — a ?-tip field and a plain field then line up exactly when
+  -- they sit in the same grid row (the Title/Slug misalignment fix). The (?) badge is a
+  -- SIBLING of the <label> (not inside it) so a click on it doesn't focus the field via the
+  -- label's for=; the flex row keeps them on one line.
+  $tipspan = ""
+  if $tip != nil and ("" .. $tip) != "" then
+    $tipspan = '<span class="fm-tip" tabindex="0" role="note" aria-label="' .. esc("" .. $tip) .. '" data-tip="' .. esc("" .. $tip) .. '">?</span>'
+  end
+  return '<div class="fm-label-row">' .. $lbl .. $tipspan .. '</div>'
+end
+
+-- The common optional attributes shared by inputs/textarea (placeholder/required/
+-- disabled/readonly/autofocus/autocomplete). Returns "" or a leading-space fragment.
+function fm_attrs_common($o)
+  $a = ""
+  if $o["placeholder"] != nil then
+    $a = $a .. ' placeholder="' .. esc($o["placeholder"]) .. '"'
+  end
+  if $o["required"] == true then
+    $a = $a .. ' required'
+  end
+  if $o["disabled"] == true then
+    $a = $a .. ' disabled'
+  end
+  if $o["readonly"] == true then
+    $a = $a .. ' readonly'
+  end
+  if $o["autofocus"] == true then
+    $a = $a .. ' autofocus'
+  end
+  if $o["autocomplete"] != nil then
+    $a = $a .. ' autocomplete="' .. esc($o["autocomplete"]) .. '"'
+  end
+  -- inputmode (mobile keypad hint, e.g. "numeric") + maxlength (hard cap). Both
+  -- additive passthroughs; callers that omit them render byte-identically.
+  if $o["inputmode"] != nil then
+    $a = $a .. ' inputmode="' .. esc($o["inputmode"]) .. '"'
+  end
+  if $o["maxlength"] != nil then
+    $a = $a .. ' maxlength="' .. esc($o["maxlength"]) .. '"'
+  end
+  return $a
+end
+
+-- Open the .fm-field wrapper: span (full-width), error state, and an author class.
+function fm_field_open($o)
+  $fcls = "fm-field"
+  if $o["span"] == 2 then
+    $fcls = $fcls .. " fm-span-2"
+  end
+  $err = $o["error"]
+  if $err != nil and ("" .. $err) != "" then
+    $fcls = $fcls .. " is-error"
+  end
+  -- author-supplied extra class: esc() so a data-derived value can't break out of
+  -- the attribute (spaces survive esc(), so a multi-class string still works).
+  if $o["class"] != nil then
+    $fcls = $fcls .. " " .. esc("" .. $o["class"])
+  end
+  return '<div class="' .. $fcls .. '">'
+end
+
+-- Helper text + per-field error message (both below the control).
+function fm_help_err($o)
+  $h = ""
+  $help = $o["help"]
+  -- help_tip moves the help into a (?) label tooltip (fm_label_band), so skip it below.
+  if $help != nil and ("" .. $help) != "" and $o["help_tip"] != true then
+    $h = $h .. '<p class="fm-help">' .. esc($help) .. '</p>'
+  end
+  $err = $o["error"]
+  if $err != nil and ("" .. $err) != "" then
+    $h = $h .. '<p class="fm-error">' .. esc($err) .. '</p>'
+  end
+  return $h
+end
+
+-- Wrap a control in a prefix/suffix affix (text fused inside the control border).
+function fm_affix_wrap($ctrl, $o)
+  $pre = $o["prefix"]
+  $suf = $o["suffix"]
+  if $pre == nil and $suf == nil then
+    return $ctrl
+  end
+  $h = '<div class="fm-affix">'
+  if $pre != nil then
+    $h = $h .. '<span class="fm-affix-text">' .. esc($pre) .. '</span>'
+  end
+  $h = $h .. $ctrl
+  if $suf != nil then
+    $h = $h .. '<span class="fm-affix-text">' .. esc($suf) .. '</span>'
+  end
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- ───────────────────────── field constructors ─────────────────────────
+
+-- The labelled <input> field (text/email/password/tel/url/number/date/...). Typed
+-- wrappers below delegate here. opts: value, required, placeholder, help, error,
+-- autofocus, disabled, readonly, autocomplete, span, prefix, suffix, class, id,
+-- and (type=number) min/max/step.
+function fm_input($name, $label, $type, $opts)
+  $o = $opts
+  if $o == nil then
+    $o = {}
+  end
+  $t = fm_type_ok($type)
+  $id = $o["id"]
+  if $id == nil then
+    $id = fm_id($name)
+  end
+  $val = $o["value"]
+  if $val == nil then
+    $val = ""
+  end
+  $req = ($o["required"] == true)
+
+  $ctrl = '<input class="fm-control" type="' .. $t .. '" id="' .. esc($id) .. '" name="' .. esc("" .. $name) .. '" value="' .. esc($val) .. '"' .. fm_attrs_common($o)
+  if $t == "number" then
+    if $o["min"] != nil then
+      $ctrl = $ctrl .. ' min="' .. esc($o["min"]) .. '"'
+    end
+    if $o["max"] != nil then
+      $ctrl = $ctrl .. ' max="' .. esc($o["max"]) .. '"'
+    end
+    if $o["step"] != nil then
+      $ctrl = $ctrl .. ' step="' .. esc($o["step"]) .. '"'
+    end
+  end
+  $ctrl = $ctrl .. '>'
+  $ctrl = fm_affix_wrap($ctrl, $o)
+
+  $h = fm_field_open($o)
+  $h = $h .. fm_label_band($id, $label, $req, fm_tip_of($o))
+  $h = $h .. $ctrl
+  $h = $h .. fm_help_err($o)
+  $h = $h .. '</div>'
+  return $h
+end
+
+function fm_text($name, $label, $opts)
+  return fm_input($name, $label, "text", $opts)
+end
+function fm_email($name, $label, $opts)
+  return fm_input($name, $label, "email", $opts)
+end
+function fm_password($name, $label, $opts)
+  return fm_input($name, $label, "password", $opts)
+end
+function fm_tel($name, $label, $opts)
+  return fm_input($name, $label, "tel", $opts)
+end
+function fm_url($name, $label, $opts)
+  return fm_input($name, $label, "url", $opts)
+end
+function fm_number($name, $label, $opts)
+  return fm_input($name, $label, "number", $opts)
+end
+function fm_date($name, $label, $opts)
+  return fm_input($name, $label, "date", $opts)
+end
+function fm_datetime($name, $label, $opts)
+  return fm_input($name, $label, "datetime-local", $opts)
+end
+function fm_time($name, $label, $opts)
+  return fm_input($name, $label, "time", $opts)
+end
+function fm_color($name, $label, $opts)
+  return fm_input($name, $label, "color", $opts)
+end
+
+-- Labelled <textarea>. opts: rows (default 4), mono (bool) + the common opts.
+function fm_textarea($name, $label, $opts)
+  $o = $opts
+  if $o == nil then
+    $o = {}
+  end
+  $id = $o["id"]
+  if $id == nil then
+    $id = fm_id($name)
+  end
+  $val = $o["value"]
+  if $val == nil then
+    $val = ""
+  end
+  $rows = $o["rows"]
+  if $rows == nil then
+    $rows = 4
+  end
+  $req = ($o["required"] == true)
+  $cls = "fm-control"
+  if $o["mono"] == true then
+    $cls = $cls .. " fm-mono"
+  end
+  $ctrl = '<textarea class="' .. $cls .. '" id="' .. esc($id) .. '" name="' .. esc("" .. $name) .. '" rows="' .. esc("" .. $rows) .. '"' .. fm_attrs_common($o) .. '>' .. esc($val) .. '</textarea>'
+  $h = fm_field_open($o)
+  $h = $h .. fm_label_band($id, $label, $req, fm_tip_of($o))
+  $h = $h .. $ctrl
+  $h = $h .. fm_help_err($o)
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- Build the <option> list for a select/radio with the selected state computed here
+-- (replaces the precomputed per-handler "selected"-token strings). $options = list of
+-- maps { value, "label": } ("label" is a Mix reserved word → string key); a missing
+-- "label" falls back to the value. $current = the currently-selected value.
+function fm_options($options, $current)
+  $cur = "" .. fm_or($current, "")
+  $h = ""
+  if $options == nil then
+    return ""
+  end
+  for each $opt in $options
+    $val = $opt["value"]
+    $lab = $opt["label"]
+    if $lab == nil then
+      $lab = $val
+    end
+    $vs = "" .. fm_or($val, "")
+    $sel = ""
+    if $vs == $cur then
+      $sel = " selected"
+    end
+    $h = $h .. '<option value="' .. esc($vs) .. '"' .. $sel .. '>' .. esc("" .. $lab) .. '</option>'
+  end
+  return $h
+end
+
+-- Labelled <select>. opts.value = current selected value; opts.placeholder adds a
+-- leading disabled "Select an option" row (selected when no value). + common opts.
+function fm_select($name, $label, $options, $opts)
+  $o = $opts
+  if $o == nil then
+    $o = {}
+  end
+  $id = $o["id"]
+  if $id == nil then
+    $id = fm_id($name)
+  end
+  $cur = $o["value"]
+  if $cur == nil then
+    $cur = ""
+  end
+  $req = ($o["required"] == true)
+  $inner = ""
+  $ph = $o["placeholder"]
+  if $ph != nil then
+    $psel = ""
+    if ("" .. $cur) == "" then
+      $psel = " selected"
+    end
+    $inner = $inner .. '<option value=""' .. $psel .. ' disabled hidden>' .. esc($ph) .. '</option>'
+  end
+  $inner = $inner .. fm_options($options, $cur)
+
+  $ctrl = '<select class="fm-control" id="' .. esc($id) .. '" name="' .. esc("" .. $name) .. '"'
+  if $req then
+    $ctrl = $ctrl .. ' required'
+  end
+  if $o["disabled"] == true then
+    $ctrl = $ctrl .. ' disabled'
+  end
+  if $o["autofocus"] == true then
+    $ctrl = $ctrl .. ' autofocus'
+  end
+  $ctrl = $ctrl .. '>' .. $inner .. '</select>'
+
+  $h = fm_field_open($o)
+  $h = $h .. fm_label_band($id, $label, $req, fm_tip_of($o))
+  $h = $h .. $ctrl
+  $h = $h .. fm_help_err($o)
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- Shared render for a single checkbox / toggle (label beside the control). $is_toggle
+-- switches the pill-switch skin. opts: checked, value (default "1"), desc, disabled.
+function fm_check_render($name, $label, $o, $is_toggle)
+  $id = $o["id"]
+  if $id == nil then
+    $id = fm_id($name)
+  end
+  $val = $o["value"]
+  if $val == nil then
+    $val = "1"
+  end
+  $box = '<input class="fm-check-input" type="checkbox" id="' .. esc($id) .. '" name="' .. esc("" .. $name) .. '" value="' .. esc($val) .. '"'
+  if $o["checked"] == true then
+    $box = $box .. ' checked'
+  end
+  if $o["disabled"] == true then
+    $box = $box .. ' disabled'
+  end
+  $box = $box .. '>'
+  $desc = ""
+  if $o["desc"] != nil then
+    $desc = '<span class="fm-check-desc">' .. esc($o["desc"]) .. '</span>'
+  end
+  $rowcls = "fm-check"
+  if $is_toggle then
+    $rowcls = "fm-check fm-toggle"
+  end
+  $h = fm_field_open($o)
+  $h = $h .. '<label class="' .. $rowcls .. '" for="' .. esc($id) .. '">'
+  $h = $h .. $box
+  $h = $h .. '<span class="fm-check-body"><span class="fm-check-label">' .. esc("" .. $label) .. '</span>' .. $desc .. '</span>'
+  $h = $h .. '</label>'
+  $h = $h .. fm_help_err($o)
+  $h = $h .. '</div>'
+  return $h
+end
+
+function fm_checkbox($name, $label, $opts)
+  $o = $opts
+  if $o == nil then
+    $o = {}
+  end
+  return fm_check_render($name, $label, $o, false)
+end
+
+function fm_toggle($name, $label, $opts)
+  $o = $opts
+  if $o == nil then
+    $o = {}
+  end
+  return fm_check_render($name, $label, $o, true)
+end
+
+-- A radio group. $options = list of { value, "label": }; opts.value = selected.
+function fm_radio($name, $label, $options, $opts)
+  $o = $opts
+  if $o == nil then
+    $o = {}
+  end
+  $cur = "" .. fm_or($o["value"], "")
+  $req = ($o["required"] == true)
+  $base = $o["id"]
+  if $base == nil then
+    $base = fm_id($name)
+  end
+  $items = ""
+  $idx = 0
+  if $options != nil then
+    for each $opt in $options
+      $oval = "" .. fm_or($opt["value"], "")
+      $olab = $opt["label"]
+      if $olab == nil then
+        $olab = $oval
+      end
+      $rid = $base .. "-" .. ("" .. $idx)
+      $chk = ""
+      if $oval == $cur then
+        $chk = " checked"
+      end
+      $items = $items .. '<label class="fm-check fm-radio-item" for="' .. esc($rid) .. '"><input class="fm-check-input" type="radio" id="' .. esc($rid) .. '" name="' .. esc("" .. $name) .. '" value="' .. esc($oval) .. '"' .. $chk .. '><span class="fm-check-label">' .. esc("" .. $olab) .. '</span></label>'
+      $idx = $idx + 1
+    end
+  end
+  $rl = ""
+  if $req then
+    $rl = ' <span class="fm-req" aria-hidden="true">*</span>'
+  end
+  $h = fm_field_open($o)
+  $h = $h .. '<span class="fm-label">' .. esc("" .. $label) .. $rl .. '</span>'
+  $h = $h .. '<div class="fm-radio-group" role="radiogroup">' .. $items .. '</div>'
+  $h = $h .. fm_help_err($o)
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- A bare hidden input (no wrapper, no label).
+function fm_hidden($name, $value)
+  $v = $value
+  if $v == nil then
+    $v = ""
+  end
+  return '<input type="hidden" name="' .. esc("" .. $name) .. '" value="' .. esc($v) .. '">'
+end
+
+-- ───────────────────────── layout / structure ─────────────────────────
+
+-- Open a <form>. opts: method (default "post"), skin (bool → adds the .forms-skin
+-- visual scope), class (extra), id, enctype, onsubmit (confirm passthrough).
+function fm_open($action, $opts)
+  $o = $opts
+  if $o == nil then
+    $o = {}
+  end
+  $method = $o["method"]
+  if $method == nil then
+    $method = "post"
+  end
+  $cls = "fm-form"
+  if $o["skin"] == true then
+    $cls = "forms-skin " .. $cls
+  end
+  if $o["class"] != nil then
+    $cls = $cls .. " " .. esc("" .. $o["class"])
+  end
+  $h = '<form method="' .. esc($method) .. '" action="' .. esc("" .. $action) .. '" class="' .. $cls .. '"'
+  if $o["id"] != nil then
+    $h = $h .. ' id="' .. esc($o["id"]) .. '"'
+  end
+  if $o["enctype"] != nil then
+    $h = $h .. ' enctype="' .. esc($o["enctype"]) .. '"'
+  end
+  if $o["onsubmit"] != nil then
+    $h = $h .. ' onsubmit="' .. esc($o["onsubmit"]) .. '"'
+  end
+  -- confirm: gate the submit behind the shared <dialog> modal (shell.html capture
+  -- listener on data-confirm) — use this instead of onsubmit:"return confirm(…)".
+  if $o["confirm"] != nil then
+    $h = $h .. ' data-confirm="' .. esc("" .. $o["confirm"]) .. '"'
+  end
+  $h = $h .. '>'
+  return $h
+end
+
+function fm_close()
+  return '</form>'
+end
+
+-- A ONE-BUTTON inline action form (hidden fields + a single submit): the
+-- credential Reveal/Delete class (webd-forms Foundation). Confirm rides the
+-- shell data-confirm dialog gate; variant is allowlisted. $hidden: name→value.
+function fm_mini_form($action, $hidden, $label, $opts)
+  $o = $opts
+  if $o == nil then
+    $o = {}
+  end
+  $cattr = ""
+  if $o["confirm"] != nil then
+    $cattr = ' data-confirm="' .. esc("" .. $o["confirm"]) .. '"'
+  end
+  $variant = fm_variant_ok(fm_or($o["variant"], "ghost"))
+  $cls = "fm-mini-form"
+  if $o["class"] != nil then
+    $cls = $cls .. " " .. esc("" .. $o["class"])
+  end
+  $h = '<form method="post" action="' .. esc("" .. $action) .. '" class="' .. $cls .. '"' .. $cattr .. '>'
+  for each $k in keys($hidden)
+    $h = $h .. fm_hidden($k, $hidden[$k])
+  end
+  $h = $h .. '<button type="submit" class="btn btn-' .. $variant .. '">' .. esc("" .. $label) .. '</button></form>'
+  return $h
+end
+
+-- A responsive field grid. opts.cols (1..4, default 2). Fields with span:2 go full-width.
+function fm_grid($opts, $inner)
+  $o = $opts
+  if $o == nil then
+    $o = {}
+  end
+  $cols = $o["cols"]
+  if $cols == nil then
+    $cols = 2
+  end
+  $c = "" .. $cols
+  if not ($c == "1" or $c == "2" or $c == "3" or $c == "4") then
+    $c = "2"
+  end
+  return '<div class="fm-grid fm-cols-' .. $c .. '">' .. fm_or($inner, "") .. '</div>'
+end
+
+-- ───────────────────────── fm_form — the unified form component ─────────────────────────
+-- ONE component that renders a complete editor form with IDENTICAL inner markup whether it
+-- sits flat on the content canvas or inside a modal dialog — the only thing that branches on
+-- `mode` is the OUTER wrapper (flat .forms-skin block vs an md_panel). The top bar, the field
+-- stack, and the action-button row are byte-identical across both modes, so canvas and modal
+-- forms can't drift. Spec ($o):
+--   mode    "canvas" | "modal"          (default "canvas")
+--   action  POST url (the form + the delete form submit here)
+--   id      form id; the delete form is "<id>-delete". Buttons target both via form=.
+--   fields  the rendered fm_* field HTML (e.g. pp_fields(...))
+--   back    { label, href } → the top-RIGHT link. canvas: <a href> navigates; modal:
+--           <button data-modal-close> closes — same .fm-backlink look, context behaviour.
+--   submit  { label }                   the primary Save button (always shown)
+--   view    { label, href }             optional secondary link-button (omit to hide)
+--   delete  { label, value, confirm }   optional; renders a sibling delete <form> +
+--                                        a button. value = the slug/id; id_name defaults "slug".
+--   cancel  { label, href }             optional ghost Cancel (canvas: <a href>; modal:
+--                                        data-modal-close). Use instead of `back` for the
+--                                        simpler editors that keep a Save+Cancel row.
+--   meta    "text"                       optional muted caption on the action row's LEFT
+--                                        (e.g. mail's "from X").
+--   error   "msg"                        optional; renders an fm_flash_error banner INSIDE
+--                                        the form above the fields ("" / nil = none).
+--   title   "text"                       optional MODAL heading (→ md_panel title + close-X).
+--                                        Ignored on canvas (the handler renders its own
+--                                        cms-head there). Used by an editor that has a
+--                                        `cancel` instead of a `back`.
+
+-- The top bar: a single right-aligned back affordance, same class in both modes.
+function fm_form_topbar($o)
+  $back = $o["back"]
+  if $back == nil then
+    return ""
+  end
+  -- Same .btn btn-primary as the action buttons (size/colour/hover) + an arrow-left
+  -- icon, so the back affordance is visually consistent with Delete/View/Save. Canvas =
+  -- navigating <a>; modal = data-modal-close <button>.
+  $body = fm_icon("arrow-left") .. esc("" .. $back["label"])
+  $inner = ""
+  if ("" .. fm_or($o["mode"], "canvas")) == "modal" then
+    $inner = '<button type="button" class="btn btn-primary fm-backlink" data-modal-close>' .. $body .. '</button>'
+  else
+    $inner = '<a class="btn btn-primary fm-backlink" href="' .. esc("" .. $back["href"]) .. '">' .. $body .. '</a>'
+  end
+  return '<div class="fm-topbar">' .. $inner .. '</div>'
+end
+
+-- The action row: an optional muted [meta] caption on the LEFT (e.g. a mail "from X"), an
+-- optional [Delete] on the LEFT, then the right cluster [View][Save][Cancel] pushed RIGHT.
+-- Buttons target the field form / delete form via the form= attribute, so this markup is
+-- identical in both modes (canvas: buttons sit outside the form; modal: inside the md-form —
+-- form= works either way). Save/View/Delete are btn btn-primary (the trash icon, not colour,
+-- signals destructiveness; the confirm dialog guards it); the optional Cancel is a btn-ghost
+-- (canvas: navigates to cancel.href; modal: data-modal-close — closes the dialog).
+function fm_form_actions($o)
+  $id = "" .. $o["id"]
+  $modal = (("" .. fm_or($o["mode"], "canvas")) == "modal")
+  $h = '<div class="fm-form-actions">'
+  -- optional muted caption (mail "from X"); left, before the buttons (fm-form-actions-right
+  -- carries margin-left:auto so the buttons stay right and the meta stays left).
+  if $o["meta"] != nil and ("" .. $o["meta"]) != "" then
+    $h = $h .. '<span class="fm-form-meta">' .. esc("" .. $o["meta"]) .. '</span>'
+  end
+  $del = $o["delete"]
+  if $del != nil then
+    $h = $h .. '<button type="submit" form="' .. esc($id) .. '-delete" class="btn btn-primary">' .. fm_icon("trash") .. esc("" .. $del["label"]) .. '</button>'
+  end
+  -- optional Reset (left cluster, beside delete): a non-destructive "restore defaults" submit
+  -- targeting the sibling <id>-reset form (action=reset). btn-ghost + rotate-ccw so it reads as
+  -- secondary; the sibling form's data-confirm gate guards the wipe. Used by fm_settings.
+  $rst = $o["reset"]
+  if $rst != nil then
+    $h = $h .. '<button type="submit" form="' .. esc($id) .. '-reset" class="btn btn-ghost fm-reset-btn">' .. fm_icon("rotate-ccw") .. esc("" .. $rst["label"]) .. '</button>'
+  end
+  $h = $h .. '<div class="fm-form-actions-right">'
+  $view = $o["view"]
+  if $view != nil then
+    $h = $h .. '<a class="btn btn-primary" href="' .. esc("" .. $view["href"]) .. '">' .. fm_icon("eye") .. esc("" .. $view["label"]) .. '</a>'
+  end
+  $savebtn = '<button type="submit" form="' .. esc($id) .. '" class="btn btn-primary">' .. fm_icon("save") .. esc("" .. $o["submit"]["label"]) .. '</button>'
+  -- optional Cancel (ghost): canvas navigates to cancel.href; modal = data-modal-close.
+  $cancelbtn = ""
+  $cancel = $o["cancel"]
+  if $cancel != nil then
+    $clab = esc("" .. fm_or($cancel["label"], "Cancel"))
+    if $modal then
+      $cancelbtn = '<button type="button" class="btn btn-ghost" data-modal-close>' .. $clab .. '</button>'
+    else
+      $cancelbtn = '<a class="btn btn-ghost" href="' .. esc("" .. fm_or($cancel["href"], "#")) .. '">' .. $clab .. '</a>'
+    end
+  end
+  -- Order: default [Save][Cancel] (Cancel rightmost — the established editor row). cancel_first
+  -- flips to [Cancel][Save] (Save rightmost — the settings-modal convention).
+  if $o["cancel_first"] == true then
+    $h = $h .. $cancelbtn .. $savebtn
+  else
+    $h = $h .. $savebtn .. $cancelbtn
+  end
+  $h = $h .. '</div></div>'
+  return $h
+end
+
+-- The sibling delete <form> (hidden fields only; the visible button lives in fm_actions and
+-- targets it via form=). A <form> can't nest, so this is rendered as a SIBLING of the field
+-- form / md-panel, never inside it. "" when no delete.
+function fm_form_delete_sibling($o)
+  $del = $o["delete"]
+  if $del == nil then
+    return ""
+  end
+  $idn = "" .. fm_or($del["id_name"], "slug")
+  $msg = "" .. fm_or($del["confirm"], "Delete this entry? This cannot be undone.")
+  -- data-confirm rides the shared <dialog> gate in shell.html (real modal, not the
+  -- browser confirm()); esc() is the only escaping an HTML attribute needs.
+  return '<form method="post" action="' .. esc("" .. $o["action"]) .. '" id="' .. esc("" .. $o["id"]) .. '-delete" class="fm-delete-form" data-confirm="' .. esc($msg) .. '">' .. fm_hidden("action", "delete") .. fm_hidden($idn, "" .. $del["value"]) .. '</form>'
+end
+
+-- The sibling reset <form> (hidden action=reset only; the visible button lives in fm_actions and
+-- targets it via form=). Sibling of the field form (forms can't nest), same data-confirm gate as
+-- delete. "" when no reset. Used by fm_settings for the [Reset] left button.
+function fm_form_reset_sibling($o)
+  $rst = $o["reset"]
+  if $rst == nil then
+    return ""
+  end
+  $msg = "" .. fm_or($rst["confirm"], "Reset to the defaults? Your changes here will be lost.")
+  return '<form method="post" action="' .. esc("" .. $o["action"]) .. '" id="' .. esc("" .. $o["id"]) .. '-reset" class="fm-reset-form" data-confirm="' .. esc($msg) .. '">' .. fm_hidden("action", "reset") .. '</form>'
+end
+
+-- The component itself.
+function fm_form($o)
+  $mode = "" .. fm_or($o["mode"], "canvas")
+  $id = "" .. $o["id"]
+  $topbar = fm_form_topbar($o)
+  $actions = fm_form_actions($o)
+  $delform = fm_form_delete_sibling($o)
+  $rstform = fm_form_reset_sibling($o)
+  -- optional error: a TOAST (the shell's .toast pill, top-right) rather than an inline banner —
+  -- fm_toast_trigger emits the showToast <script> (fires on full load AND boosted swap) + a
+  -- <noscript> inline fm_flash fallback for JS-off. Placed inside the form, in the swapped
+  -- region, so the shim re-injects + runs it. (`error` is danger; a save failure re-renders the
+  -- canvas editor with it, so the toast lands on the reloaded page — see _doc/2026-06-24-web-styleguide.md.)
+  $flash = ""
+  if $o["error"] != nil and ("" .. $o["error"]) != "" then
+    $flash = fm_toast_trigger("" .. $o["error"], "danger")
+  end
+  -- The field stack — the SAME wrapper class in both modes, spaced by --fm-row-gap.
+  $stack = '<div class="fm-stack">' .. ("" .. fm_or($o["fields"], "")) .. '</div>'
+  if $mode == "modal" then
+    -- md_panel supplies the dialog card + scroll body; the form carries our id so the buttons'
+    -- form= resolves. Header: a `back` editor (posts) puts its top bar in the header slot; a
+    -- `cancel` editor (no back) uses md_panel's default title + close-X via the `title` opt.
+    $mp = { footer: $actions, form: { action: $o["action"], id: $id } }
+    if $o["back"] != nil then
+      $mp["header"] = $topbar
+    else
+      if $o["title"] != nil then
+        $mp["title"] = $o["title"]
+      end
+    end
+    return md_panel($mp, $flash .. $stack) .. $delform .. $rstform
+  end
+  -- canvas: flat on the content surface. .forms-skin scopes the fm-* visual; the field form
+  -- carries the id; the action row + delete form are SIBLINGS (buttons reach them via form=).
+  -- A `title` is NOT rendered here — the handler supplies its own cms-head on the canvas.
+  $h = '<div class="forms-skin fm-canvas">'
+  $h = $h .. $topbar
+  $h = $h .. '<form method="post" action="' .. esc("" .. $o["action"]) .. '" id="' .. esc($id) .. '" class="forms-skin fm-form">' .. $flash .. $stack .. '</form>'
+  $h = $h .. $delform
+  $h = $h .. $rstform
+  $h = $h .. $actions
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- ───────────────────────── fm_settings — the settings-surface renderer ─────────────────────────
+-- The ONE component behind both settings surfaces (admin /admin/settings + billing /biz/settings).
+-- Renders the settings fields as a flat 2-column grid (NO fm_section headings/subtitles) inside
+-- fm_form, with the settings footer: [Reset] on the bottom-LEFT · [Cancel][Save] on the bottom-
+-- RIGHT (Save rightmost). Modal or canvas by $o.mode. The main form posts action=save; an
+-- optional reset posts action=reset via the sibling form. $o:
+--   mode    "modal" | "canvas"            (default "canvas")
+--   title   modal heading (ignored on canvas — the handler renders its own cms-head there)
+--   action  POST url (save + reset both post here)
+--   id      form id (the reset sibling is "<id>-reset")
+--   fields  rendered fm_* field HTML (built by the handler)
+--   hidden  extra hidden inputs inlined before the grid (optional)
+--   submit  Save button label (default "Save")
+--   reset   optional { label, confirm } → the left Reset button + its sibling form
+--   cols    grid columns (default 2)
+function fm_settings($o)
+  $cols = fm_or($o["cols"], 2)
+  -- action=save is intrinsic to the main form; extra hidden inputs (if any) sit before the grid.
+  $body = fm_hidden("action", "save") .. ("" .. fm_or($o["hidden"], "")) .. fm_grid({ cols: $cols }, "" .. fm_or($o["fields"], ""))
+  $spec = {
+    mode: "" .. fm_or($o["mode"], "canvas"),
+    id: "" .. $o["id"],
+    action: "" .. $o["action"],
+    fields: $body,
+    submit: { label: "" .. fm_or($o["submit"], "Save") },
+    cancel_first: true
+  }
+  -- Cancel: modal closes the dialog (data-modal-close); canvas navigates to cancel_href (the
+  -- parent surface) — so a no-JS / direct visit's Cancel actually goes back, not to "#".
+  $cancel = { label: "Cancel" }
+  if $o["cancel_href"] != nil then
+    $cancel["href"] = "" .. $o["cancel_href"]
+  end
+  $spec["cancel"] = $cancel
+  if $o["title"] != nil then
+    $spec["title"] = "" .. $o["title"]
+  end
+  if $o["reset"] != nil then
+    $spec["reset"] = $o["reset"]
+  end
+  return fm_form($spec)
+end
+
+-- A section card: optional header (title + subtitle), then a .fm-grid body wrapping
+-- $inner (the rendered fields). opts: subtitle, cols (default 1), id. Title "" / nil
+-- omits the header band.
+function fm_section($title, $opts, $inner)
+  $o = $opts
+  if $o == nil then
+    $o = {}
+  end
+  $cols = $o["cols"]
+  if $cols == nil then
+    $cols = 1
+  end
+  $h = '<section class="fm-section"'
+  if $o["id"] != nil then
+    $h = $h .. ' id="' .. esc($o["id"]) .. '"'
+  end
+  $h = $h .. '>'
+  $tt = "" .. fm_or($title, "")
+  if $tt != "" then
+    $h = $h .. '<div class="fm-section-head"><div class="fm-section-heading"><h2 class="fm-section-title">' .. esc($tt) .. '</h2>'
+    if $o["subtitle"] != nil then
+      $h = $h .. '<p class="fm-section-sub">' .. esc($o["subtitle"]) .. '</p>'
+    end
+    $h = $h .. '</div></div>'
+  end
+  $h = $h .. '<div class="fm-section-body">'
+  $h = $h .. fm_grid({cols: $cols}, $inner)
+  $h = $h .. '</div></section>'
+  return $h
+end
+
+-- A full-width muted note (e.g. an informational line inside a section grid).
+function fm_note($html)
+  return '<p class="fm-note">' .. esc("" .. $html) .. '</p>'
+end
+
+-- The footer action bar. opts: submit (label, default "Save"), submit_variant
+-- (default "primary"), cancel_href + cancel_label ("Cancel"), extra (list of
+-- {label, href, variant} link-buttons), meta (right-aligned muted caption).
+function fm_actions($opts)
+  $o = $opts
+  if $o == nil then
+    $o = {}
+  end
+  $submit = $o["submit"]
+  if $submit == nil then
+    $submit = "Save"
+  end
+  $svar = fm_variant_ok($o["submit_variant"])
+  $h = '<div class="fm-actions">'
+  $h = $h .. '<button type="submit" class="btn btn-' .. $svar .. '">' .. esc($submit) .. '</button>'
+  $extra = $o["extra"]
+  if $extra != nil then
+    for each $b in $extra
+      $bvar = fm_variant_ok($b["variant"])
+      $blab = "" .. fm_or($b["label"], "")
+      $bhref = "" .. fm_or($b["href"], "#")
+      $h = $h .. '<a class="btn btn-' .. $bvar .. '" href="' .. esc($bhref) .. '">' .. esc($blab) .. '</a>'
+    end
+  end
+  if $o["cancel_href"] != nil then
+    $clab = $o["cancel_label"]
+    if $clab == nil then
+      $clab = "Cancel"
+    end
+    $h = $h .. '<a class="btn btn-ghost" href="' .. esc("" .. $o["cancel_href"]) .. '">' .. esc($clab) .. '</a>'
+  end
+  if $o["meta"] != nil then
+    $h = $h .. '<span class="fm-actions-meta">' .. esc($o["meta"]) .. '</span>'
+  end
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- A flash banner. $variant ∈ {error, success, warning, info} (allowlisted).
+function fm_flash($msg, $variant)
+  $v = fm_flash_variant($variant)
+  return '<div class="fm-flash fm-flash-' .. $v .. '">' .. esc("" .. $msg) .. '</div>'
+end
+function fm_flash_error($msg)
+  return fm_flash($msg, "error")
+end
+
+-- A TOAST trigger for fm_form's `error`: the shell toast (via the shared toast_script in
+-- lib.mix — which owns the JS-string + `<`→`\x3c` script-data escaping and the danger-6s /
+-- success-3s timing) PLUS a <noscript> inline fm_flash fallback so a JS-OFF visitor still sees
+-- the message. fm_form passes type "danger"; fm_flash maps danger→its "error" banner style.
+function fm_toast_trigger($msg, $type)
+  return '<noscript>' .. fm_flash($msg, $type) .. '</noscript>' .. toast_script($msg, $type)
+end
+
+-- A standalone confirm-guarded delete form (hidden action=delete + id + danger
+-- button). opts: id, id_name (default "id"), confirm (msg), label ("Delete"),
+-- skin (bool), extra (map of extra hidden fields). The confirm text is JS-string-
+-- escaped (\\ and ') before being spliced into the inline onsubmit, then the whole
+-- attribute is esc()'d — so an apostrophe survives both layers safely.
+function fm_delete_form($action, $opts)
+  $o = $opts
+  if $o == nil then
+    $o = {}
+  end
+  $id_name = $o["id_name"]
+  if $id_name == nil then
+    $id_name = "id"
+  end
+  $id = $o["id"]
+  if $id == nil then
+    $id = ""
+  end
+  $label = $o["label"]
+  if $label == nil then
+    $label = "Delete"
+  end
+  $confirm = $o["confirm"]
+  if $confirm == nil then
+    $confirm = "Are you sure?"
+  end
+  -- data-confirm rides the shared <dialog> gate in shell.html (real modal); esc()
+  -- is the only escaping an HTML attribute needs (newlines fine in textContent).
+  $cls = "fm-form fm-delete-form"
+  if $o["skin"] == true then
+    $cls = "forms-skin " .. $cls
+  end
+  $h = '<form method="post" action="' .. esc("" .. $action) .. '" class="' .. $cls .. '" data-confirm="' .. esc("" .. $confirm) .. '">'
+  $h = $h .. fm_hidden("action", "delete")
+  $h = $h .. fm_hidden($id_name, $id)
+  if $o["extra"] != nil then
+    for each $k in keys($o["extra"])
+      $h = $h .. fm_hidden($k, $o["extra"][$k])
+    end
+  end
+  $h = $h .. '<button type="submit" class="btn btn-danger">' .. esc($label) .. '</button>'
+  $h = $h .. '</form>'
+  return $h
+end

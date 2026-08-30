@@ -1,0 +1,18 @@
+[
+  {
+    "name": "musicd",
+    "binary": "cosmix-musicd",
+    "version": "0.8.0",
+    "git_sha": "abc123",
+    "git_dirty": false,
+    "pid": 77
+  },
+  {
+    "name": "indexd",
+    "binary": "cosmix-indexd",
+    "version": "0.4.0",
+    "git_sha": "def456",
+    "git_dirty": false,
+    "pid": 88
+  }
+]

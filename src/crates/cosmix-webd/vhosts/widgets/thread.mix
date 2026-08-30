@@ -1,0 +1,215 @@
+-- thread.mix — SHARED threaded-reply substrate: forum discussion AND blog comments.
+-- ONE table (cms_threads, created in cms_init), ONE renderer (rd_thread), ONE composer
+-- (thread_reply_form), ONE insert (thread_add). A reply hangs off a ROOT cms_posts row:
+--   root_kind = 'forum'  → a forum topic's discussion
+--   root_kind = 'post'   → a blog post's comments
+-- The tree builds exactly like the page tree (build_thread_children_map → get/push/reassign,
+-- visited-guarded recursion). Replies post to ONE uniform /reply endpoint (h_reply.mix), so
+-- forum and comments share the submit path too. Plan: _plan/2026-06-28-unified-message-surfaces.md §5.
+--
+-- CONVENTIONS (mirror treeview.mix / forms.mix): escape-once at emission (esc() every VALUE;
+-- render_body() output is trusted markdown, NOT re-escaped); nil-guard every value before
+-- concat ("" .. nil is the text "nil"); NO mix-0.20 syntax (?? / ?:) — webd embeds its own
+-- cosmix-lib-mix; Mix maps are BY-VALUE so the recursion threads `visited` through the return.
+-- Included by a handler AFTER lib.mix (esc/render_body/blog_date resolve at call-time).
+
+-- nil-coalesce: $def when $v is nil (the tv_or / fm_or shape).
+function thread_or($v, $def)
+  if $v == nil then
+    return $def
+  end
+  return $v
+end
+
+-- Display name for a reply: users.display (logged-in author) → author_name (guest) → Anonymous.
+function thread_author($r)
+  $disp = $r["author_display"]
+  if $disp != nil and trim("" .. $disp) != "" then
+    return "" .. $disp
+  end
+  $nm = $r["author_name"]
+  if $nm != nil and trim("" .. $nm) != "" then
+    return "" .. $nm
+  end
+  return "Anonymous"
+end
+
+-- Build a parent_id → [reply rows] adjacency map for ONE root in a SINGLE query (no N+1).
+-- Top-level replies (parent_id NULL/0) live under key "0". A non-moderator sees only
+-- 'visible'; a moderator ($see_pending) also sees 'pending'. Mirrors build_page_children_map.
+function build_thread_children_map($root_kind, $root_id, $see_pending)
+  $stat = " AND t.status = 'visible'"
+  if $see_pending then
+    $stat = " AND t.status IN ('visible', 'pending')"
+  end
+  $rows = db_query("SELECT t.id AS id, t.parent_id AS parent_id, t.author_id AS author_id, t.author_name AS author_name, t.body AS body, t.status AS status, t.created AS created, u.display AS author_display FROM cms_threads t LEFT JOIN users u ON u.id = t.author_id WHERE t.root_kind = ?1 AND t.root_id = ?2" .. $stat .. " ORDER BY t.created", [$root_kind, "" .. $root_id])
+  $map = {}
+  for each $r in $rows
+    $pk = "0"
+    if $r["parent_id"] != nil and ("" .. $r["parent_id"]) != "" and ("" .. $r["parent_id"]) != "0" then
+      $pk = "" .. $r["parent_id"]
+    end
+    -- get → push → reassign: push($map[$pk], …) mutates a COPY (Mix indexes maps by value).
+    $lst = $map[$pk]
+    if $lst == nil then
+      $lst = []
+    end
+    push($lst, $r)
+    $map[$pk] = $lst
+  end
+  return $map
+end
+
+-- Visible (+pending for a moderator) reply count for ONE root.
+function thread_count($root_kind, $root_id, $see_pending)
+  $stat = " AND status = 'visible'"
+  if $see_pending then
+    $stat = " AND status IN ('visible', 'pending')"
+  end
+  $r = db_query("SELECT count(*) AS c FROM cms_threads WHERE root_kind = ?1 AND root_id = ?2" .. $stat, [$root_kind, "" .. $root_id])
+  if length($r) == 0 then
+    return 0
+  end
+  return $r[0]["c"]
+end
+
+-- One reply node: meta (author · date · pending badge), markdown body, Reply link, nested kids.
+-- render_body() output is trusted (markdown() escapes raw HTML — safe for untrusted public
+-- content); every other interpolated value is esc()'d once here.
+function thread_node_html($r, $cfg, $kidhtml)
+  $id = "" .. thread_or($r["id"], "")
+  $author = thread_author($r)
+  $date = blog_date("" .. thread_or($r["created"], ""))
+  $body = render_body("" .. thread_or($r["body"], ""))
+  $pend = ""
+  if ("" .. thread_or($r["status"], "")) == "pending" then
+    $pend = ' <span class="tag draft">pending</span>'
+  end
+  $reply = ""
+  if $cfg["can_reply"] == true then
+    $reply = '<a class="th-reply-link" href="' .. esc(thread_or($cfg["base"], "") .. "?reply_to=" .. $id .. "#th-reply") .. '">Reply</a>'
+  end
+  $kids = ""
+  if $kidhtml != "" then
+    $kids = '<div class="th-children">' .. $kidhtml .. '</div>'
+  end
+  $h = '<article class="th-node" id="th-' .. esc($id) .. '">'
+  $h = $h .. '<div class="th-meta"><span class="th-author">' .. esc($author) .. '</span><span class="th-date">' .. esc($date) .. '</span>' .. $pend .. '</div>'
+  $h = $h .. '<div class="th-body post">' .. $body .. '</div>'
+  $h = $h .. '<div class="th-actions">' .. $reply .. '</div>'
+  $h = $h .. $kids .. '</article>'
+  return $h
+end
+
+-- Recursive render of the subtree under $parent_key (visited threaded through the return —
+-- maps are by-value — so a pre-existing data cycle can't loop forever; no depth cap).
+function thread_render_nodes($map, $parent_key, $cfg, $visited)
+  $kids = $map[$parent_key]
+  if $kids == nil then
+    return { html: "", visited: $visited }
+  end
+  $h = ""
+  for each $r in $kids
+    $id = "" .. $r["id"]
+    if $visited[$id] != true then
+      $visited[$id] = true
+      $res = thread_render_nodes($map, $id, $cfg, $visited)
+      $visited = $res["visited"]
+      $h = $h .. thread_node_html($r, $cfg, $res["html"])
+    end
+  end
+  return { html: $h, visited: $visited }
+end
+
+-- The reply composer. Posts to the uniform /reply endpoint with the root coordinates +
+-- optional parent (reply-to). Self-contained markup (no forms.mix dependency) reusing the
+-- shared .fm-control / .btn classes. $reply_to (from ?reply_to=) nests under that reply.
+function thread_reply_form($opts)
+  $post_to = thread_or($opts["post_to"], "/reply")
+  $base = thread_or($opts["base"], "")
+  $ret = thread_or($opts["return"], $base)
+  $rk = thread_or($opts["root_kind"], "")
+  $rid = "" .. thread_or($opts["root_id"], "")
+  $rt = ""
+  $ctx = ""
+  if $opts["reply_to"] != nil and ("" .. $opts["reply_to"]) != "" then
+    $rt = "" .. $opts["reply_to"]
+    $ctx = '<p class="muted th-replying">Replying to #' .. esc($rt) .. ' · <a href="' .. esc($base) .. '#th-reply">cancel</a></p>'
+  end
+  $h = '<form class="th-form" id="th-reply" method="post" action="' .. esc($post_to) .. '">'
+  $h = $h .. '<input type="hidden" name="action" value="reply">'
+  $h = $h .. '<input type="hidden" name="root_kind" value="' .. esc($rk) .. '">'
+  $h = $h .. '<input type="hidden" name="root_id" value="' .. esc($rid) .. '">'
+  $h = $h .. '<input type="hidden" name="parent_id" value="' .. esc($rt) .. '">'
+  $h = $h .. '<input type="hidden" name="return" value="' .. esc($ret) .. '">'
+  $h = $h .. $ctx
+  $h = $h .. '<textarea class="fm-control fm-mono" name="body" rows="4" placeholder="Write a reply… (markdown)" required></textarea>'
+  $h = $h .. '<div class="th-form-actions"><button class="btn btn-primary" type="submit">Post reply</button></div>'
+  $h = $h .. '</form>'
+  return $h
+end
+
+-- The public entry: render a whole discussion (heading + count + nested replies + composer).
+-- $opts: { root_kind, root_id, base, post_to, return, can_reply, see_pending, reply_to, heading }
+function rd_thread($opts)
+  $rk = thread_or($opts["root_kind"], "")
+  $rid = thread_or($opts["root_id"], 0)
+  $see = false
+  if $opts["see_pending"] == true then
+    $see = true
+  end
+  $map = build_thread_children_map($rk, $rid, $see)
+  $cfg = { can_reply: ($opts["can_reply"] == true), base: thread_or($opts["base"], "") }
+  $res = thread_render_nodes($map, "0", $cfg, {})
+  $list = $res["html"]
+  $count = thread_count($rk, $rid, $see)
+  $heading = thread_or($opts["heading"], "Discussion")
+  $h = '<section class="th-thread">'
+  $h = $h .. '<h2 class="th-heading">' .. esc($heading) .. ' <span class="th-count">' .. esc("" .. $count) .. '</span></h2>'
+  if $list == "" then
+    $h = $h .. '<p class="muted th-empty">No replies yet.</p>'
+  else
+    $h = $h .. '<div class="th-list">' .. $list .. '</div>'
+  end
+  if $opts["can_reply"] == true then
+    $h = $h .. thread_reply_form($opts)
+  else
+    $h = $h .. '<p class="muted th-login"><a href="/login">Sign in</a> to reply.</p>'
+  end
+  $h = $h .. '</section>'
+  return $h
+end
+
+-- Insert a reply. parent_id is validated to belong to the SAME root (no cross-root graft);
+-- an invalid/absent parent falls back to 0 (top-level). $status is the moderation state the
+-- caller decides ('visible' for a logged-in author, 'pending' for an untrusted guest).
+-- Returns the new reply id (or 0 on a blank body). Bumps the root's `updated` for activity sort.
+function thread_add($root_kind, $root_id, $parent_id, $user, $body, $status)
+  $b = "" .. thread_or($body, "")
+  if trim($b) == "" then
+    return 0
+  end
+  $pid = 0
+  if $parent_id != nil and ("" .. $parent_id) != "" and ("" .. $parent_id) != "0" then
+    -- the parent must belong to the SAME root AND be renderable ('visible') — nesting under
+    -- a pending/spam/deleted parent would orphan the reply (it counts but never renders under
+    -- the visible tree). An invalid/hidden parent falls back to a top-level reply (pid 0).
+    $chk = db_query("SELECT id FROM cms_threads WHERE id = ?1 AND root_kind = ?2 AND root_id = ?3 AND status = 'visible'", ["" .. $parent_id, $root_kind, "" .. $root_id])
+    if length($chk) > 0 then
+      $pid = "" .. $parent_id
+    end
+  end
+  $aid = 0
+  $aname = ""
+  if $user != nil then
+    $aid = $user["id"]
+  end
+  db_exec("INSERT INTO cms_threads (root_kind, root_id, parent_id, author_id, author_name, body, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", [$root_kind, "" .. $root_id, "" .. $pid, "" .. $aid, $aname, $b, $status])
+  -- bump the root's updated so the forum index can sort by latest activity.
+  db_exec("UPDATE cms_posts SET updated = datetime('now') WHERE id = ?1", ["" .. $root_id])
+  $r = db_query("SELECT last_insert_rowid() AS id", [])
+  if length($r) == 0 then
+    return 0
+  end
+  return $r[0]["id"]
+end

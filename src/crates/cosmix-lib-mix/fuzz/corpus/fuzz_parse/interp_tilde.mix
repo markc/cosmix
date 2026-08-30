@@ -1,0 +1,3 @@
+$name = "world"
+print("hi ${name} from ~/home and $literal and $(cmd)")
+$s = "a" .. $name .. "b"

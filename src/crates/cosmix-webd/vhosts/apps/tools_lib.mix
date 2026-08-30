@@ -1,0 +1,573 @@
+-- tools_lib.mix — the webd side of the toolsd seam: the `tools.` aux schema, the run
+-- queue, the secret-gated claim/report endpoints the drain calls, and the poll surface
+-- the modal reads.
+--
+-- WHY THIS EXISTS: webd CANNOT exec. Its embedded-Mix sandbox denies CapabilityClass
+-- Process/Env/FsWrite unconditionally (mix_handler.rs). So a panel action that must run
+-- a CLI tool (whois, dig, shwho) enqueues a row here; the unprivileged `toolsd` drain
+-- claims it over an authenticated endpoint, runs it, and reports the output back.
+--
+-- Design ratified by Codex, thread 019f5bc3. The load-bearing decisions:
+--   * OWN queue, OWN schema, OWN secret. NOTHING here touches the biz `jobs` table or
+--     bp_claim_next. A second holder of provisiond_secret could otherwise have leased a
+--     CT-PROVISIONING job (that claim path intersects caller-supplied supported_kinds
+--     with a GLOBAL allowlist and does not bind the credential to a kind). Separation is
+--     the fix: the tools credential can only ever reach tool runs.
+--   * requested_by is SERVER-DERIVED from the session. It is never read from the payload.
+--   * Single-statement CAS everywhere (the ssh_lib pattern) — a multi-statement tx would
+--     poison webd's shared connection.
+--
+-- Tables live in the `tools.` ATTACHed schema, so they survive a cms.db re-clone (the
+-- staging rig is periodically re-cloned from production) — same reasoning as sshm.
+
+include "/opt/cosmix/vhosts/shared/apps/tools_registry.mix"
+
+-- Fixed lease. A tool run is bounded by its registry timeout (max 40s today), so a
+-- 5-minute lease is generous; it exists to reclaim runs from a drain that died mid-exec,
+-- not to fence a long job.
+$TOOLS_LEASE = "+5 minutes"
+
+-- How many times a RETRYABLE run may be re-queued after a dead lease before it is given
+-- up as abandoned. Bounds a poison run that kills the drain on every attempt.
+$TOOLS_MAX_ATTEMPTS = 3
+
+-- Server-side output cap (bytes). toolsd already caps per-tool, but the endpoint that
+-- PERSISTS the output must not trust the reporter — this is the backstop.
+$TOOLS_MAX_OUTPUT = 262144
+
+-- Streaming bounds (Codex): a progress append may advance the sequence at most this many
+-- times, and progress may keep the run alive at most this long past the claim — together
+-- they cap how long a streamed run can hold the (globally-single) claim slot.
+$TOOLS_STREAM_MAX_SEQ = 40
+$TOOLS_STREAM_WALL = "+120 seconds"
+
+function tools_or($v, $d)
+  if $v == nil then
+    return $d
+  end
+  return $v
+end
+
+-- Add a column to tools.tool_runs if it lacks it (idempotent retrofit, single statement).
+--
+-- PROBE FIRST, then ALTER — and let a REAL ALTER failure propagate. A blanket try/catch
+-- around the ALTER would swallow a genuine error (denied DDL, malformed decl) and leave
+-- the table missing a column that /tools/run needs, while /tools/ping still reported
+-- healthy (Codex). The probe is a zero-row SELECT, which the db-schema authorizer allows
+-- (PRAGMA / pragma_table_info would be denied).
+function tools_ensure_col($col, $decl)
+  $have = true
+  try
+    $_ = db_query("SELECT " .. $col .. " FROM tools.tool_runs LIMIT 0", [])
+  catch $e
+    $have = false
+  end
+  if $have then
+    return
+  end
+  db_exec("ALTER TABLE tools.tool_runs ADD COLUMN " .. $col .. " " .. $decl, [])
+end
+
+-- ── schema (idempotent; single statements only) ────────────────────────────────
+function tools_init()
+  db_exec("CREATE TABLE IF NOT EXISTS tools.tool_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tool TEXT NOT NULL,
+    params TEXT NOT NULL DEFAULT '{}',
+    idempotency_key TEXT,
+    status TEXT NOT NULL DEFAULT 'queued'
+      CHECK(status IN ('queued','claimed','done','error','abandoned')),
+    -- Both SERVER-DERIVED from the session at enqueue. requested_role travels to the
+    -- drain in the claim envelope so toolsd can re-check authz at EXEC without a DB:
+    -- Codex requires an attested principal/role, never a role read from the payload.
+    requested_by TEXT NOT NULL,
+    requested_role TEXT NOT NULL DEFAULT '',
+    -- Unguessable per-run handle, returned ONLY to the caller that enqueued the run and
+    -- REQUIRED to poll it. requested_by alone is not an authorization on a dev_session
+    -- vhost, where every caller shares one ambient identity — run ids are sequential, so
+    -- without this any WG caller could enumerate another operator's tool output (Codex).
+    poll_token TEXT NOT NULL DEFAULT '',
+    lease_token TEXT, lease_expires TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    exit_code INTEGER,
+    output TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    truncated INTEGER NOT NULL DEFAULT 0,
+    claimed_at TEXT, finished_at TEXT,
+    created TEXT NOT NULL DEFAULT (datetime('now')))", [])
+  db_exec("CREATE INDEX IF NOT EXISTS tools.idx_tool_runs_claim ON tool_runs (status, id)", [])
+  -- Idempotency across ALL statuses (Codex): scoping it to queued|claimed (as sshm does)
+  -- would let an HTTP retry re-run a fast tool that had already COMPLETED.
+  db_exec("CREATE UNIQUE INDEX IF NOT EXISTS tools.idx_tool_runs_idem ON tool_runs (idempotency_key) WHERE idempotency_key IS NOT NULL", [])
+  -- Per-identity concurrency = 1 active run, enforced by the DB rather than a
+  -- check-then-insert (which races). A second concurrent enqueue hits this index and is
+  -- answered 429, not queued.
+  db_exec("CREATE UNIQUE INDEX IF NOT EXISTS tools.idx_tool_runs_active_identity ON tool_runs (requested_by) WHERE status IN ('queued','claimed')", [])
+  -- A claimed run MUST carry a lease — the DB backstop that no CAS can bypass.
+  db_exec("CREATE TRIGGER IF NOT EXISTS tools.trg_tool_runs_lease_ins BEFORE INSERT ON tool_runs WHEN NEW.status='claimed' AND (NEW.lease_token IS NULL OR NEW.lease_token='' OR NEW.lease_expires IS NULL OR NEW.lease_expires='') BEGIN SELECT RAISE(ABORT, 'claimed run requires lease_token + lease_expires'); END", [])
+  db_exec("CREATE TRIGGER IF NOT EXISTS tools.trg_tool_runs_lease_upd BEFORE UPDATE ON tool_runs WHEN NEW.status='claimed' AND (NEW.lease_token IS NULL OR NEW.lease_token='' OR NEW.lease_expires IS NULL OR NEW.lease_expires='') BEGIN SELECT RAISE(ABORT, 'claimed run requires lease_token + lease_expires'); END", [])
+  -- Retrofit for a tools.db created before a column existed. CREATE TABLE IF NOT EXISTS
+  -- does nothing to an existing table, so a new column must be ALTERed in. try-ALTER
+  -- rather than pragma_table_info: the db-schema authorizer denies PRAGMA (incl. the
+  -- pragma_* table-valued functions), so a duplicate-column error is the introspection.
+  tools_ensure_col("poll_token", "TEXT NOT NULL DEFAULT ''")
+  -- The run's retry policy is SNAPSHOTTED at enqueue, not read from the live registry at
+  -- lease-expiry time: a tool that ran as retryable:false and was later flipped to true in
+  -- a deploy could otherwise be executed a SECOND time after its lease expired (Codex).
+  -- The policy that governs a run is the one in force when it was accepted.
+  tools_ensure_col("retryable", "INTEGER NOT NULL DEFAULT 0")
+  -- T2 streaming state, ALL snapshotted on the row (Codex): the progress/preserve paths
+  -- gate on `streaming` (a non-stream tool can never enter them); `output_cap` is the
+  -- TOOL's declared cap (not the webd const), enforced on the streaming append; `last_seq`
+  -- is the highest applied sequence (append requires seq = last_seq+1, so no gaps/reorder
+  -- lose data and a replay is idempotent); `max_seq` + `stream_deadline` bound the append
+  -- count and wall time so a buggy/compromised reporter cannot renew the lease forever and
+  -- block the global queue.
+  tools_ensure_col("last_seq", "INTEGER NOT NULL DEFAULT 0")
+  tools_ensure_col("streaming", "INTEGER NOT NULL DEFAULT 0")
+  tools_ensure_col("output_cap", "INTEGER NOT NULL DEFAULT 0")
+  tools_ensure_col("max_seq", "INTEGER NOT NULL DEFAULT 0")
+  tools_ensure_col("stream_deadline", "TEXT")
+
+  db_exec("CREATE TABLE IF NOT EXISTS tools.tools_settings (key TEXT PRIMARY KEY, value TEXT)", [])
+  -- The drain's credential. Seeded once; INSERT OR IGNORE keeps it stable across boots.
+  -- Lives in the aux db (NOT cms.db) so a rig re-clone doesn't rotate it out from under
+  -- a deployed drain.
+  db_exec("INSERT OR IGNORE INTO tools.tools_settings (key, value) VALUES ('tools_secret', ?1)", [random_password(48)])
+end
+
+-- ── the drain's credential ─────────────────────────────────────────────────────
+function tools_secret()
+  $r = db_query("SELECT value FROM tools.tools_settings WHERE key='tools_secret'", [])
+  if length($r) == 0 then
+    return ""
+  end
+  return "" .. tools_or($r[0]["value"], "")
+end
+
+-- Timing-safe check of the drain's secret. Header names arrive lowercased.
+-- NO session here — the secret IS the authz for the machine seam (the sshm pattern).
+function tools_drain_authorized()
+  $secret = tools_secret()
+  $hdr = ""
+  if $HEADERS != nil and $HEADERS["x-tools-secret"] != nil then
+    $hdr = "" .. $HEADERS["x-tools-secret"]
+  end
+  if $secret == "" or $hdr == "" then
+    return false
+  end
+  return constant_time_eq($hdr, $secret)
+end
+
+-- no-store: a tool run carries an operator's poll token and its output — neither belongs
+-- in a shared cache or an intermediary's disk (Codex).
+function tools_reply($status, $obj)
+  return { status: $status,
+           headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+           body: json_encode($obj) }
+end
+
+-- ── idempotency ────────────────────────────────────────────────────────────────
+--
+-- Codex's formula. The invocation_uuid is minted by the CLIENT when the action is
+-- instantiated, so an accidental double-click (or an HTTP retry) reuses it and collapses
+-- to ONE run, while an explicit Refresh mints a new uuid and is allowed to re-run. There
+-- is deliberately NO time-bucketing and NO automatic result caching — caching would
+-- violate what Refresh means.
+--
+-- LENGTH-PREFIXED encoding, not a separator. An earlier version joined the fields with a
+-- literal "\x00" (Mix does not process \x escapes, so it was really the 4 chars \,x,0,0)
+-- and argued no field could contain a backslash — which was FALSE for `requested_by`, a
+-- free-form account string (Codex). Length-prefixing is unambiguous for ANY field content,
+-- so the key stays sound if a future tool takes free-form params.
+function tools_lp($s)
+  $v = "" .. $s
+  return ("" .. byte_length($v)) .. ":" .. $v
+end
+
+function tools_idem_key($vhost, $who, $tool, $canon_params, $invocation)
+  $buf = "tools:v2"
+  $buf = $buf .. tools_lp($vhost)
+  $buf = $buf .. tools_lp($who)
+  $buf = $buf .. tools_lp($tool)
+  $buf = $buf .. tools_lp($canon_params)
+  $buf = $buf .. tools_lp($invocation)
+  return hash_sha256($buf)
+end
+
+-- The client-minted invocation id. Constrained to uuid shape (hex + dashes, bounded) so
+-- it can neither smuggle the key separator nor grow unbounded.
+$TOOLS_UUID_CHARS = "0123456789abcdef-"
+
+function tools_valid_invocation($raw)
+  $s = lower(trim("" .. $raw))
+  if length($s) < 8 or length($s) > 64 then
+    return nil
+  end
+  if not tools_chars_ok($s, $TOOLS_UUID_CHARS) then
+    return nil
+  end
+  return $s
+end
+
+-- ── enqueue (called by an AUTHENTICATED webd route) ────────────────────────────
+--
+-- $who MUST be server-derived (the session's username) — never a payload field.
+-- $role is that identity's role, checked against the registry's min_role.
+-- Returns { ok, id, status } | { ok:false, code, error }.
+function tools_enqueue($tool, $raw_params, $who, $role, $vhost, $invocation)
+  if trim("" .. $who) == "" then
+    return { ok: false, code: 401, error: "no identity" }
+  end
+  $spec = tools_spec($tool)
+  if $spec == nil then
+    return { ok: false, code: 404, error: "unknown tool" }
+  end
+  -- Authz gate #1 (the second is in toolsd, at exec). Uses the shared role LADDER, not a
+  -- literal `== "admin"` test: the latter would silently admit every role the moment a
+  -- tool declared min_role:"author" (Codex). Unknown role or unknown min_role → denied.
+  if not tools_role_ok($spec, $role) then
+    return { ok: false, code: 403, error: "forbidden" }
+  end
+  $v = tools_validate($tool, $raw_params)
+  if $v["ok"] != true then
+    return { ok: false, code: 400, error: "" .. $v["error"] }
+  end
+  $canon = tools_canonical_params($tool, $v["params"])
+  $inv = tools_valid_invocation(tools_or($invocation, ""))
+  if $inv == nil then
+    return { ok: false, code: 400, error: "missing or malformed invocation id" }
+  end
+  $key = tools_idem_key("" .. $vhost, "" .. $who, "" .. $tool, $canon, $inv)
+
+  -- Same invocation replayed → hand back the SAME run (and its poll token), whatever its
+  -- status. This is the double-click / retry path: it must not charge the rate limit, and
+  -- must not start a second run.
+  $ex = db_query("SELECT id, status, poll_token FROM tools.tool_runs WHERE idempotency_key=?1", [$key])
+  if length($ex) > 0 then
+    return { ok: true, id: to_number("" .. $ex[0]["id"]), status: "" .. $ex[0]["status"],
+             token: "" .. tools_or($ex[0]["poll_token"], ""), duplicate: true }
+  end
+
+  -- Rate limit: 6 accepted runs/minute per identity (Codex). The 1-active-run limit is
+  -- enforced by the partial unique index below, not here — that one has to be race-free.
+  $rc = db_query("SELECT count(*) AS c FROM tools.tool_runs WHERE requested_by=?1 AND datetime(created) > datetime('now','-60 seconds')", ["" .. $who])
+  if length($rc) > 0 and to_number("" .. $rc[0]["c"]) >= 6 then
+    return { ok: false, code: 429, error: "rate limit: 6 tool runs per minute" }
+  end
+
+  -- Insert-and-catch. TWO partial unique indexes can reject this row (idempotency_key =
+  -- a concurrent duplicate of this invocation; requested_by = this identity already has an
+  -- active run). SQLite names the COLUMN, not the index — and when a row violates BOTH,
+  -- WHICH one it names depends on index check order, so branching on the error text is
+  -- unreliable (Codex: a genuine duplicate replay could be misreported 429).
+  --
+  -- So do not read the text at all: on ANY unique violation, re-select the exact key. Found
+  -- ⇒ it was a duplicate of THIS invocation (the key is a SHA-256 over the invocation, so it
+  -- can only ever be our own row — never someone else's). Not found ⇒ the conflict was the
+  -- active-run index ⇒ 429.
+  $token = random_password(32)
+  $retry = 0
+  if $spec["retryable"] == true then
+    $retry = 1
+  end
+  -- Snapshot the streaming flag + the TOOL's output cap on the row, so the progress path
+  -- enforces the tool's own cap (not the webd const) and can never be entered by a
+  -- non-stream tool (Codex).
+  $streaming = 0
+  if $spec["stream"] == true then
+    $streaming = 1
+  end
+  $ocap = to_number("" .. tools_or($spec["max_output"], "0"))
+  if $ocap == nil or $ocap <= 0 then
+    $ocap = $TOOLS_MAX_OUTPUT
+  end
+  try
+    $rows = db_query("INSERT INTO tools.tool_runs (tool, params, idempotency_key, requested_by, requested_role, poll_token, retryable, streaming, output_cap, status)
+                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'queued') RETURNING id",
+                     ["" .. $tool, $canon, $key, "" .. $who, "" .. $role, $token, $retry, $streaming, $ocap])
+    if length($rows) > 0 then
+      return { ok: true, id: to_number("" .. $rows[0]["id"]), status: "queued", token: $token }
+    end
+  catch $e
+    if not contains(lower("" .. $e), "unique") then
+      raise("TOOLS_ENQUEUE_ERR", "" .. $e)
+    end
+    $ex2 = db_query("SELECT id, status, poll_token FROM tools.tool_runs WHERE idempotency_key=?1", [$key])
+    if length($ex2) > 0 then
+      return { ok: true, id: to_number("" .. $ex2[0]["id"]), status: "" .. $ex2[0]["status"],
+               token: "" .. tools_or($ex2[0]["poll_token"], ""), duplicate: true }
+    end
+    return { ok: false, code: 429, error: "a tool run is already in progress" }
+  end
+  return { ok: false, code: 500, error: "enqueue failed" }
+end
+
+-- ── claim (drain; secret-gated) ────────────────────────────────────────────────
+--
+-- Sweep dead leases, then CAS-claim the oldest queued run. GLOBAL concurrency is 1
+-- (Codex): if any live claimed run exists, answer 204 rather than hand out a second.
+function tools_claim_next()
+  -- Dead-lease sweep. A drain that executed the tool but died before reporting (or whose
+  -- report timed out) leaves a claimed row behind. Marking that TERMINAL would silently
+  -- LOSE the run: the output is gone and the tool is never retried (Codex MAJOR). So a
+  -- retryable tool goes back to QUEUED for another attempt; only a non-retryable tool, or
+  -- one that has burnt its attempts, becomes terminal.
+  --
+  -- The retry policy comes from the ROW (snapshotted at enqueue), not from the live
+  -- registry. That is both safer — a deploy that flips a tool's `retryable` cannot change
+  -- the semantics of a run already in flight (Codex) — and simpler: no tool names are
+  -- interpolated into SQL at all, so a future registry key containing a quote cannot
+  -- produce malformed SQL and brick every claim.
+  -- Requeue also RESETS the streaming accumulator (output, last_seq, truncated,
+  -- stream_deadline). Attempt B restarts at seq 1, so keeping attempt A's output+last_seq
+  -- would discard B's early hops as "stale" and splice B's later hops onto A's partial
+  -- trace — a hybrid, or a "success" showing only A's stale output (Codex MAJOR). A
+  -- side-effect-free stream simply re-runs from scratch.
+  db_exec("UPDATE tools.tool_runs SET status='queued', lease_token=NULL, lease_expires=NULL, claimed_at=NULL,
+           output = CASE WHEN streaming = 1 THEN '' ELSE output END,
+           last_seq = 0, truncated = 0, stream_deadline = NULL
+           WHERE status='claimed' AND lease_expires IS NOT NULL AND datetime(lease_expires) < datetime('now')
+           AND attempts < ?1 AND retryable = 1", [$TOOLS_MAX_ATTEMPTS])
+  db_exec("UPDATE tools.tool_runs SET status='abandoned', error='lease expired', lease_token=NULL, lease_expires=NULL, finished_at=datetime('now')
+           WHERE status='claimed' AND lease_expires IS NOT NULL AND datetime(lease_expires) < datetime('now')", [])
+
+  $tok = uuid()
+  -- ONE statement: the global-concurrency guard (no other run is claimed) lives INSIDE the
+  -- claim UPDATE as a NOT EXISTS, not in a preceding SELECT. Two claimants that both read
+  -- "nothing is claimed" and then both claimed a row would otherwise run concurrently —
+  -- the local flock hides that, but the deploy preflight, a second node, or any other
+  -- holder of the secret would not be covered (Codex MAJOR). The subquery pins exactly one
+  -- row; the lease trigger is the DB backstop.
+  -- Streaming runs also get a bounded max_seq + a hard stream_deadline set AT CLAIM, so
+  -- progress appends are bounded in both count and wall time regardless of what the
+  -- reporter sends.
+  $rows = db_query("UPDATE tools.tool_runs SET status='claimed', lease_token=?1,
+                    lease_expires=datetime('now', '" .. $TOOLS_LEASE .. "'),
+                    attempts=attempts+1, claimed_at=datetime('now'),
+                    max_seq = CASE WHEN streaming = 1 THEN " .. ("" .. $TOOLS_STREAM_MAX_SEQ) .. " ELSE 0 END,
+                    stream_deadline = CASE WHEN streaming = 1 THEN datetime('now', '" .. $TOOLS_STREAM_WALL .. "') ELSE NULL END
+                    WHERE id=(SELECT id FROM tools.tool_runs WHERE status='queued' ORDER BY id LIMIT 1)
+                    AND NOT EXISTS (SELECT 1 FROM tools.tool_runs WHERE status='claimed')
+                    RETURNING id, tool, params, attempts, lease_expires, requested_by, requested_role, streaming", [$tok])
+  if length($rows) == 0 then
+    return tools_reply(204, {})
+  end
+  $j = $rows[0]
+  return tools_reply(200, {
+    run_id: to_number("" .. $j["id"]),
+    tool: "" .. $j["tool"],
+    params: "" .. tools_or($j["params"], "{}"),
+    -- SERVER-ATTESTED principal + role (both derived from the session at enqueue, never
+    -- from the payload). The drain re-checks the role against the registry's min_role
+    -- before it execs — authz enforced at BOTH ends (Codex).
+    requested_by: "" .. tools_or($j["requested_by"], ""),
+    requested_role: "" .. tools_or($j["requested_role"], ""),
+    streaming: to_number("" .. tools_or($j["streaming"], "0")),
+    lease_token: $tok,
+    lease_expires: "" .. $j["lease_expires"],
+    attempts: to_number("" .. $j["attempts"])
+  })
+end
+
+-- ── report (drain; secret-gated) ───────────────────────────────────────────────
+--
+-- Fenced terminal CAS on a LIVE lease. Output is capped HERE too (never trust the
+-- reporter) and stored as plain text — it is escaped exactly once when rendered, and is
+-- never reinterpreted as HTML/ANSI/Markdown.
+-- PROGRESS report (T2 streaming): `ok` absent, carries {seq, chunk}. Appends the chunk
+-- under the output cap and RENEWS THE LEASE, in ONE fenced statement, leaving the run
+-- 'claimed'. Idempotent on seq (a replayed report with seq <= last_seq is a no-op that
+-- still answers 200). This is what makes a long trace's <pre> grow hop-by-hop while the
+-- lease stays alive (Codex: sequence-numbered, lease-renewed, bounded append).
+function tools_report_progress($rid, $tok, $body)
+  $seq = to_number("" .. tools_or($body["seq"], ""))
+  $chunk = "" .. tools_or($body["chunk"], "")
+  if $seq == nil or $seq < 1 or $seq > $TOOLS_STREAM_MAX_SEQ then
+    return tools_reply(400, { error: "bad seq" })
+  end
+  -- REJECT an oversized chunk rather than codepoint-truncate it: substr counts codepoints,
+  -- so truncating a 4-byte-per-char chunk could still store 4x the byte budget (Codex).
+  $cbytes = byte_length($chunk)
+  if $cbytes > 8192 then
+    return tools_reply(400, { error: "chunk too large" })
+  end
+  -- Append EXACTLY the next sequence, and ONLY while: streaming; the claim is live
+  -- (token + unexpired lease); seq within max_seq; before the hard deadline; and the
+  -- resulting output stays within the TOOL's BYTE cap — the guard is
+  -- `output_bytes + chunk_bytes <= output_cap` (length(CAST(… AS BLOB)) is bytes), so it
+  -- is exact for multibyte content, and the append is a plain concat (no substr). The
+  -- lease is renewed in the SAME statement, never past stream_deadline.
+  $rows = db_query("UPDATE tools.tool_runs
+                    SET output = output || ?3, last_seq = ?4,
+                        lease_expires = datetime('now', '" .. $TOOLS_LEASE .. "')
+                    WHERE id=?1 AND status='claimed' AND lease_token=?2 AND streaming = 1
+                    AND lease_expires IS NOT NULL AND datetime(lease_expires) >= datetime('now')
+                    AND ?4 = last_seq + 1 AND ?4 <= max_seq
+                    AND stream_deadline IS NOT NULL AND datetime('now') < datetime(stream_deadline)
+                    AND length(CAST(output AS BLOB)) + ?5 <= output_cap
+                    RETURNING id", [$rid, $tok, $chunk, $seq, $cbytes])
+  if length($rows) == 1 then
+    return tools_reply(200, { ok: true })
+  end
+  -- 0 rows. Read the row's streaming state (still a live claim we own?) to disposition:
+  $live = db_query("SELECT last_seq FROM tools.tool_runs WHERE id=?1 AND status='claimed' AND lease_token=?2 AND streaming = 1
+                    AND lease_expires IS NOT NULL AND datetime(lease_expires) >= datetime('now')
+                    AND stream_deadline IS NOT NULL AND datetime('now') < datetime(stream_deadline)", [$rid, $tok])
+  if length($live) == 1 then
+    $ls = to_number("" .. tools_or($live[0]["last_seq"], "0"))
+    -- A duplicate (already applied) is an idempotent 200 so a lost-response retry is safe;
+    -- a genuine GAP (seq skipped ahead) is a 409 so the drain does not silently lose data.
+    if $seq <= $ls then
+      return tools_reply(200, { ok: true })
+    end
+    return tools_reply(409, { error: "sequence gap" })
+  end
+  -- Not a live streaming claim we own (dead lease, over cap, past deadline, or not a
+  -- stream) → 409 so the drain stops streaming into it.
+  return tools_reply(409, { error: "fenced" })
+end
+
+function tools_report()
+  $body = json_parse($BODY)
+  $rid = to_number("" .. tools_or($body["run_id"], ""))
+  $tok = "" .. tools_or($body["lease_token"], "")
+  if $rid == nil or $tok == "" then
+    return tools_reply(400, { error: "bad request" })
+  end
+  -- A report with a `seq` and NO `ok` is a streaming PROGRESS append, not a terminal.
+  if $body["ok"] == nil and $body["seq"] != nil then
+    return tools_report_progress($rid, $tok, $body)
+  end
+  -- A terminal report MUST carry an explicit boolean `ok` — so field-absence can never
+  -- accidentally route a terminal into the progress/preserve paths (Codex).
+  if $body["ok"] != true and $body["ok"] != false then
+    return tools_reply(400, { error: "terminal report needs ok:true|false" })
+  end
+  -- Combined BYTE cap. run_argv caps stdout and stderr independently, so a tool at its
+  -- per-stream limit can still return ~2x that once merged; and `length()` counts
+  -- CODEPOINTS, so a multibyte-heavy output would sail past a byte budget (Codex).
+  -- byte_length is the honest measure, and this is the backstop that does not trust the
+  -- reporter at all.
+  -- A STREAMED run finalizes with NO `output` key: its output was already accumulated by
+  -- the progress reports, and overwriting it here would erase the whole trace (Codex:
+  -- finalization must preserve accumulated progress). Preserve ONLY when the ROW is a
+  -- streaming run AND no output was sent — a non-stream tool can never preserve, so a
+  -- missing-output bug there overwrites (visible) rather than silently keeping stale data.
+  $srow = db_query("SELECT streaming FROM tools.tool_runs WHERE id=?1", [$rid])
+  $is_stream = length($srow) == 1 and to_number("" .. tools_or($srow[0]["streaming"], "0")) == 1
+  $preserve = $is_stream and $body["output"] == nil
+  $out = "" .. tools_or($body["output"], "")
+  -- The drain already enforced the tool's COMBINED cap; it also reports whether it had to
+  -- truncate, so the stored flag reflects reality rather than only this backstop firing.
+  $trunc = 0
+  if $body["truncated"] == true then
+    $trunc = 1
+  end
+  if byte_length($out) > $TOOLS_MAX_OUTPUT then
+    -- Backstop against a buggy or compromised reporter. Reserve the marker's bytes and
+    -- BINARY-SEARCH the cut point: substr is codepoint-based, so a fixed step both
+    -- over-truncates and rescans (Codex).
+    $marker = "\n… [truncated]"
+    $budget = $TOOLS_MAX_OUTPUT - byte_length($marker)
+    if $budget < 0 then
+      $budget = 0
+    end
+    $lo = 0
+    $hi = length($out)
+    while $lo < $hi
+      $mid = floor(($lo + $hi + 1) / 2)
+      if byte_length(substr($out, 0, $mid)) <= $budget then
+        $lo = $mid
+      else
+        $hi = $mid - 1
+      end
+    end
+    $out = substr($out, 0, $lo) .. $marker
+    $trunc = 1
+  end
+  $err = "" .. tools_or($body["error"], "")
+  if length($err) > 4096 then
+    $err = substr($err, 0, 4096)
+  end
+  $ec = to_number("" .. tools_or($body["exit_code"], ""))
+  $ok = $body["ok"]
+  $status = "error"
+  if $ok == true then
+    $status = "done"
+  end
+  -- `?8 = preserve`: when 1, keep the existing (streamed) output; else overwrite with ?3.
+  $pflag = 0
+  if $preserve then
+    $pflag = 1
+  end
+  $rows = db_query("UPDATE tools.tool_runs
+                    SET status=?4, exit_code=?5,
+                        output = CASE WHEN ?8 = 1 THEN output ELSE ?3 END,
+                        error=?6, truncated=?7,
+                    finished_at=datetime('now'), lease_expires=NULL
+                    WHERE id=?1 AND status='claimed' AND lease_token=?2
+                    AND lease_expires IS NOT NULL AND datetime(lease_expires) >= datetime('now')
+                    RETURNING id", [$rid, $tok, $out, $status, $ec, $err, $trunc, $pflag])
+  if length($rows) == 1 then
+    return tools_reply(200, { ok: true })
+  end
+  -- Idempotent terminal retry: a lost HTTP response replayed on an already-terminal row
+  -- with the SAME token answers 200, not 409. (lease_token is kept on the row for exactly
+  -- this recognition.)
+  $r2 = db_query("SELECT id FROM tools.tool_runs WHERE id=?1 AND lease_token=?2 AND status IN ('done','error','abandoned')", [$rid, $tok])
+  if length($r2) == 1 then
+    return tools_reply(200, { ok: true })
+  end
+  return tools_reply(409, { error: "fenced" })
+end
+
+-- ── poll (the modal) ───────────────────────────────────────────────────────────
+--
+-- A run is readable ONLY by presenting its unguessable poll_token (plus the requesting
+-- identity). requested_by alone is NOT an authorization: on a dev_session vhost every
+-- caller shares one ambient identity, and run ids are sequential — so an id-only check
+-- would let any WG caller enumerate another operator's tool output (Codex MAJOR). The
+-- token is returned solely to whoever enqueued the run.
+--
+-- constant_time_eq: the token is a secret, so compare it without a timing oracle. (SQL
+-- can't do that, hence the fetch-then-compare rather than a WHERE on the token.)
+function tools_status($rid, $who, $token)
+  $n = to_number("" .. $rid)
+  $t = "" .. tools_or($token, "")
+  if $n == nil or $t == "" then
+    return nil
+  end
+  -- Fetch the TOKEN ONLY and verify it BEFORE reading the row. Selecting the (up to
+  -- 256 KiB) output first and then rejecting turns the endpoint into a valid-id
+  -- resource/timing oracle (Codex).
+  $g = db_query("SELECT poll_token FROM tools.tool_runs WHERE id=?1 AND requested_by=?2", [$n, "" .. $who])
+  if length($g) == 0 then
+    return nil
+  end
+  $stored = "" .. tools_or($g[0]["poll_token"], "")
+  if $stored == "" or not constant_time_eq($stored, $t) then
+    return nil
+  end
+  $r = db_query("SELECT id, tool, params, status, exit_code, output, error, truncated, created, finished_at
+                 FROM tools.tool_runs WHERE id=?1", [$n])
+  if length($r) == 0 then
+    return nil
+  end
+  return $r[0]
+end
+
+-- A NON-MUTATING, secret-gated liveness probe. The deploy uses this to prove the drain's
+-- credential is the one webd accepts, WITHOUT claiming a run — the previous preflight hit
+-- claim-next, which LEASED any queued run and then dropped it on the floor, stranding a
+-- real user's run until its lease expired (and expired leases were terminal, so it was
+-- lost outright — Codex BLOCKER).
+function tools_ping()
+  return tools_reply(200, { ok: true, service: "toolsd" })
+end
+
+-- Terminal = the poller can stop.
+function tools_is_terminal($status)
+  $s = "" .. $status
+  return $s == "done" or $s == "error" or $s == "abandoned"
+end

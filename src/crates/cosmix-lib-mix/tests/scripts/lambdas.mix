@@ -1,0 +1,64 @@
+-- lambdas.mix: Phase 1 anonymous functions + HOF dispatch
+-- Expected output:
+-- 10
+-- function
+-- true
+-- true
+-- 5
+-- 107
+-- 42
+-- 1
+-- 81
+-- 41
+
+-- 1. expression-body lambda, stored in scope, invoked via $f(...)
+$double = function($x) = $x * 2
+print $double(5)
+
+-- 2. type of a lambda
+print type($double)
+
+-- 3. top-level closure: lambda sees globals live
+$t = 5
+$gt = function($x) = $x > $t
+print $gt(6)
+
+-- 4. top-level lambda sees LATER global updates (live binding)
+$t = 100
+print $gt(6 + 200)
+
+-- 5. block-body lambda
+$inc = function($x)
+    return $x + 1
+end
+print $inc(4)
+
+-- 6. HOF dispatch smoke: __hof_smoke($fn, $x) returns $fn($x)
+print __hof_smoke(function($x) = $x + 100, 7)
+
+-- 7. Inner-frame capture-by-value: lambda inside a named function
+--    snapshots the caller's frame so $t is still visible after return
+function make_gt($t)
+    return function($x) = $x + $t
+end
+$plus40 = make_gt(40)
+print $plus40(2)
+
+-- 8. Capture is by VALUE: mutating the outer name doesn't affect the
+--    captured snapshot (important regression — named functions see
+--    globals live, so this confirms lambdas diverge intentionally)
+function make_counter($start)
+    $n = $start
+    return function() = $n
+end
+$c = make_counter(1)
+print $c()
+
+-- 9. `fn` is a short alias for the `function` keyword (Rust heritage).
+--    Both the `= expr` short form and the `... end` block form accept it.
+$fnsq = fn($x) = $x * $x
+print $fnsq(9)
+$fnblk = fn($x)
+    return $x + 1
+end
+print $fnblk(40)

@@ -1,0 +1,54 @@
+trained=true floor=0 case=spammy label=Spam score=0.999232 cold_start=false threshold=0.5000 contribs=5
+    tok=b:discount spam=40 ham=0 p=0.993827
+    tok=b:free spam=40 ham=0 p=0.993827
+    tok=b:viagra spam=40 ham=0 p=0.993827
+    tok=h:subject:buy spam=40 ham=0 p=0.993827
+    tok=h:subject:now spam=40 ham=0 p=0.993827
+trained=true floor=0 case=hammy label=Ham score=0.000744 cold_start=false threshold=0.5000 contribs=5
+    tok=b:agenda spam=0 ham=60 p=0.004132
+    tok=b:discuss spam=0 ham=60 p=0.004132
+    tok=b:project spam=0 ham=60 p=0.004132
+    tok=h:subject:meeting spam=0 ham=60 p=0.004132
+    tok=h:subject:tomorrow spam=0 ham=60 p=0.004132
+trained=true floor=0 case=mixed label=Spam score=0.506601 cold_start=false threshold=0.5000 contribs=5
+    tok=b:agenda spam=0 ham=60 p=0.004132
+    tok=h:subject:tomorrow spam=0 ham=60 p=0.004132
+    tok=b:viagra spam=40 ham=0 p=0.993827
+    tok=h:subject:buy spam=40 ham=0 p=0.993827
+    tok=b:offer spam=20 ham=5 p=0.806373
+trained=true floor=0 case=skewed_shared label=Spam score=0.655354 cold_start=false threshold=0.5000 contribs=1
+    tok=b:offer spam=20 ham=5 p=0.806373
+trained=true floor=0 case=all_unknown label=Spam score=0.500000 cold_start=false threshold=0.5000 contribs=0
+trained=true floor=0 case=empty_body label=Ham score=0.098373 cold_start=false threshold=0.5000 contribs=1
+    tok=h:subject:meeting spam=0 ham=60 p=0.004132
+trained=true floor=1000 case=spammy label=Spam score=0.999232 cold_start=true threshold=0.8500 contribs=5
+    tok=b:discount spam=40 ham=0 p=0.993827
+    tok=b:free spam=40 ham=0 p=0.993827
+    tok=b:viagra spam=40 ham=0 p=0.993827
+    tok=h:subject:buy spam=40 ham=0 p=0.993827
+    tok=h:subject:now spam=40 ham=0 p=0.993827
+trained=true floor=1000 case=hammy label=Ham score=0.000744 cold_start=true threshold=0.8500 contribs=5
+    tok=b:agenda spam=0 ham=60 p=0.004132
+    tok=b:discuss spam=0 ham=60 p=0.004132
+    tok=b:project spam=0 ham=60 p=0.004132
+    tok=h:subject:meeting spam=0 ham=60 p=0.004132
+    tok=h:subject:tomorrow spam=0 ham=60 p=0.004132
+trained=true floor=1000 case=mixed label=Ham score=0.506601 cold_start=true threshold=0.8500 contribs=5
+    tok=b:agenda spam=0 ham=60 p=0.004132
+    tok=h:subject:tomorrow spam=0 ham=60 p=0.004132
+    tok=b:viagra spam=40 ham=0 p=0.993827
+    tok=h:subject:buy spam=40 ham=0 p=0.993827
+    tok=b:offer spam=20 ham=5 p=0.806373
+trained=true floor=1000 case=skewed_shared label=Ham score=0.655354 cold_start=true threshold=0.8500 contribs=1
+    tok=b:offer spam=20 ham=5 p=0.806373
+trained=true floor=1000 case=all_unknown label=Ham score=0.500000 cold_start=true threshold=0.8500 contribs=0
+trained=true floor=1000 case=empty_body label=Ham score=0.098373 cold_start=true threshold=0.8500 contribs=1
+    tok=h:subject:meeting spam=0 ham=60 p=0.004132
+trained=false floor=100 case=spammy label=Ham score=0.500000 cold_start=true threshold=0.8500 contribs=0
+trained=false floor=100 case=hammy label=Ham score=0.500000 cold_start=true threshold=0.8500 contribs=0
+trained=false floor=100 case=mixed label=Ham score=0.500000 cold_start=true threshold=0.8500 contribs=0
+trained=false floor=100 case=skewed_shared label=Ham score=0.500000 cold_start=true threshold=0.8500 contribs=0
+trained=false floor=100 case=all_unknown label=Ham score=0.500000 cold_start=true threshold=0.8500 contribs=0
+trained=false floor=100 case=empty_body label=Ham score=0.500000 cold_start=true threshold=0.8500 contribs=0
+trained=true floor=0 markup_spam=30 case=html_only_markup_trained label=Spam score=0.500000 cold_start=false threshold=0.5000 contribs=0
+    markup_tokens_in_contributions=0

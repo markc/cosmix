@@ -1,0 +1,34 @@
+[package]
+name = "cosmix-interactd"
+version = "0.5.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless ctkd interaction daemon — registers the Bus `interact` service and serves notify.v1 with queued asynchronous freedesktop delivery, owned update/dismiss, action dispatch, and watchable interact.props.* state. Renderless — no Bevy."
+
+[[bin]]
+name = "cosmix-interactd"
+path = "src/main.rs"
+
+[dependencies]
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client" }
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus" }
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", features = ["client-helpers"] }
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
+cosmix_props_core = { package = "cosmix-lib-props-core", path = "../cosmix-lib-props-core", features = ["bus"] }
+cosmix_interaction_schema = { package = "cosmix-interaction-schema", path = "../cosmix-interaction-schema" }
+cosmix_interaction_broker = { package = "cosmix-interaction-broker", path = "../cosmix-interaction-broker" }
+cosmix_mesh_trust = { package = "cosmix-lib-mesh-trust", path = "../cosmix-lib-mesh-trust", default-features = false }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+getrandom = "0.3"
+notify-rust = "4.18.0"
+subtle = "2.6"
+async-trait = "0.1"
+
+[build-dependencies]
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }

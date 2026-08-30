@@ -1,0 +1,45 @@
+# desktop/apps/mail — CosMix Mail, the frontend reader/composer.
+#
+# `maild` is the backend mail server and keeps that name; this is the client.
+# The `mail`/`maild` pair is APPS.md's one standing collision exception
+# (2026-07-31). See desktop/APPS.md.
+#
+# This crate is currently the vertical slice that composes ctk's virtual_list,
+# body_view and text_area under one real consumer. It carries no JMAP client
+# and no Bus dependency yet: the store is a trait with a fixture implementation
+# so the widget composition can be exercised before the transport exists.
+[package]
+name = "cosmix-mail"
+version = "0.1.0"
+description = "CosMix Mail — a native CTK mail reader and composer"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+
+[package.metadata.cosmix]
+kind = "app"
+component = "mail"
+display = "CosMix Mail"
+engine = "bevy"
+
+[[bin]]
+name = "cosmix-mail"
+path = "src/main.rs"
+
+[dependencies]
+bevy = { version = "=0.19.0", default-features = false, features = [
+    "ui",
+    "bevy_feathers",
+    "accesskit_unix",
+] }
+# `body-view` and `virtual-list` are the two default-off widget features this
+# slice exists to exercise. `system-clipboard` is deliberately NOT enabled:
+# it binds a host clipboard backend, and compose keeps Bevy's in-process
+# clipboard for now (documented in compose.rs).
+ctk = { path = "../../ctk", features = ["body-view", "virtual-list"] }
+# One constant and one syscall: `ECHILD`, to tell "this launch cannot be waited
+# on" apart from "something else already reaped it" (app.rs), and `waitpid`, so
+# the test for that distinction can produce a real `ECHILD` rather than assert
+# against a hand-set flag. Cheaper than an errno literal that has to be right on
+# every target this app is ever built for.
+libc = "0.2"

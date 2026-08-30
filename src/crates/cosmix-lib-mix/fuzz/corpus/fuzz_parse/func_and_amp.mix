@@ -1,0 +1,6 @@
+function add($a, $b)
+  return $a + $b
+end
+print(add(1, 2))
+send noded noded.ping
+$r = run_rc("echo hi")

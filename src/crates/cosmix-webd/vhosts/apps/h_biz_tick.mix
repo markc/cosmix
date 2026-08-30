@@ -1,0 +1,387 @@
+-- biz_tick.mix — the billing engine tick (POST /biz/tick). Plan §3 P1.
+-- Runs daily from a systemd timer on the node (curl with X-Tick-Secret), or
+-- manually by a rank-3 admin session. Idempotent by construction:
+--   * renewal generation is guarded by renewal_keys (unique kind/ref/period)
+--   * notifications are guarded by notification_events (unique invoice/template/date)
+--   * a rerun on the same day is a no-op; a missed day catches up (<= today selects)
+-- Money-path note (Codex P1 contract): biz_issue_invoice/biz_apply_payment own
+-- their BEGIN IMMEDIATE — this file NEVER wraps them in an outer transaction.
+-- Mail: session-less send via the vhost's public_read credential on the jmap
+-- seam (the vhost's billing sender; route caps ["db","jmap","public_read"]).
+-- SAFETY: biz_settings.mail_mode gates every send — "off" (default) = log
+-- only, "test" = redirect every mail to biz_mail_redirect() (default: the
+-- tenant support address), "live" = real recipients.
+-- Dunning scope: only invoices issued by THIS system (id >= 10001) get reminder/
+-- overdue mail; imported open invoices surface on the dash instead (no surprise
+-- dunning blast at migration).
+include "/opt/cosmix/vhosts/shared/apps/biz.mix"
+include "/opt/cosmix/vhosts/shared/apps/stripe.mix"
+-- shop outbox + cart sweep (only ever ACTS on features.shop vhosts — see
+-- the biz_shop_enabled() gates in biz_tick_main; harmless include elsewhere)
+include "/opt/cosmix/vhosts/shared/apps/shop.mix"
+
+$BIZ_NEW_INVOICE_FLOOR = 10001
+
+-- ---------------------------------------------------------------- auth
+
+function bt_authorized()
+  $secret = biz_setting("tick_secret")
+  $hdr = ""
+  if $HEADERS != nil and $HEADERS["x-tick-secret"] != nil then
+    $hdr = "" .. $HEADERS["x-tick-secret"]
+  end
+  if $secret != "" and $hdr != "" and $hdr == $secret then
+    return true
+  end
+  -- fall back to an authed admin (manual "run now")
+  $user = current_user($HEADERS)
+  if $user != nil and role_rank($user["role"]) >= 3 then
+    return true
+  end
+  return false
+end
+
+-- ---------------------------------------------------------------- mail
+
+-- template bodies (plain text; pay links land in P2)
+function bt_body_invoice($inv, $cust, $lines)
+  $b = "Hi " .. $cust["name"] .. ",\n\n"
+  $b = $b .. "Invoice INV-" .. $inv["id"] .. " has been issued for your " .. biz_brand() .. " services.\n\n"
+  $b = $b .. $lines .. "\n"
+  $b = $b .. "Total: " .. fmt_aud($inv["total_cents"]) .. "  ·  Due: " .. $inv["due"] .. "\n\n"
+  $b = $b .. replace(biz_setting("bank_details"), "<number>", "" .. $inv["id"]) .. "\n\n"
+  $b = $b .. "Questions? Just reply to this email.\n\n— " .. biz_brand() .. " Billing\n"
+  return $b
+end
+
+function bt_body_dunning($inv, $cust, $stage)
+  $lead = "This is a reminder that invoice INV-" .. $inv["id"] .. " (" .. fmt_aud($inv["total_cents"]) .. ") is due on " .. $inv["due"] .. "."
+  if $stage == "overdue1" then
+    $lead = "Invoice INV-" .. $inv["id"] .. " (" .. fmt_aud($inv["total_cents"]) .. ") was due on " .. $inv["due"] .. " and is now overdue."
+  end
+  if $stage == "overdue2" then
+    $lead = "Second notice: invoice INV-" .. $inv["id"] .. " (" .. fmt_aud($inv["total_cents"]) .. ") remains unpaid (due " .. $inv["due"] .. ")."
+  end
+  if $stage == "overdue3" then
+    $lead = "Final notice: invoice INV-" .. $inv["id"] .. " (" .. fmt_aud($inv["total_cents"]) .. ") remains unpaid (due " .. $inv["due"] .. "). Services may be suspended if it stays unpaid."
+  end
+  $b = "Hi " .. $cust["name"] .. ",\n\n" .. $lead .. "\n\n"
+  $b = $b .. replace(biz_setting("bank_details"), "<number>", "" .. $inv["id"]) .. "\n\n"
+  $b = $b .. "Already paid? Please disregard — payments can take a day to reconcile.\n\n— " .. biz_brand() .. " Billing\n"
+  return $b
+end
+
+-- ---------------------------------------------------------------- generation
+
+-- One renewal → one issued invoice. Atomic guard: draft + item + renewal_key in
+-- ONE transaction (the unique key makes a concurrent/rerun duplicate impossible),
+-- then recompute + issue (which owns its own transaction). Returns invoice id or nil.
+function bt_generate_one($kind, $ref, $today)
+  $period_start = "" .. $ref["next_due"]
+  $period_end = biz_date_add($period_start, "+1 year")
+  $cust_id = to_number($ref["customer_id"])
+  $amount = to_number($ref["price_cents"])
+  if $amount == nil or $amount <= 0 then
+    return nil  -- zero-priced: renew silently is P-later; skip and surface on dash
+  end
+  $desc = "Annual hosting renewal — " .. $ref["label"] .. " (" .. $period_start .. " to " .. $period_end .. ")"
+  if $kind == "domain" then
+    $desc = "Domain renewal — " .. $ref["label"] .. " (" .. $period_start .. " to " .. $period_end .. ")"
+  end
+
+  $inv_id = nil
+  db_exec("BEGIN IMMEDIATE")
+  try
+    -- write fence: the worklist row was read BEFORE this tx — a first-cycle service
+    -- (no invoice reference yet) can be admin-deleted in between, and FKs are off,
+    -- so an unchecked insert would bill a deleted parent. Revalidate, skip if gone.
+    $bt_ptab = "services"
+    if $kind == "domain" then
+      $bt_ptab = "domains"
+    end
+    $bt_p = db_query("SELECT id FROM " .. $bt_ptab .. " WHERE id = ?1", [$ref["id"]])
+    if length($bt_p) == 0 then
+      db_exec("ROLLBACK")
+      return nil
+    end
+    -- draft FIRST, then the key with the REAL invoice id (FK-clean); a unique-key
+    -- collision rolls back both, so no orphan draft is ever left behind
+    db_exec("INSERT INTO invoices (customer_id, status, created, updated)
+             VALUES (?1, 'draft', ?2, ?2)", [$cust_id, biz_now()])
+    $r = db_query("SELECT last_insert_rowid() AS id")
+    $inv_id = to_number($r[0].id)
+    $dup = false
+    try
+      db_exec("INSERT INTO renewal_keys (kind, ref_id, period_start, invoice_id)
+               VALUES (?1, ?2, ?3, ?4)", [$kind, $ref["id"], $period_start, $inv_id])
+    catch $e
+      $dup = true
+    end
+    if $dup then
+      db_exec("ROLLBACK")
+      -- RESUME PATH: this period already has a keyed invoice from an earlier
+      -- (possibly crashed) run — repair it forward instead of abandoning it.
+      $k = db_query("SELECT rk.invoice_id, i.status, i.total_cents FROM renewal_keys rk
+                     JOIN invoices i ON i.id = rk.invoice_id
+                     WHERE rk.kind = ?1 AND rk.ref_id = ?2 AND rk.period_start = ?3",
+                    [$kind, $ref["id"], $period_start])
+      if length($k) == 0 then return nil end
+      $kid = to_number($k[0].invoice_id)
+      $kst = "" .. $k[0].status
+      if $kst == "draft" then
+        $inv_id = $kid  -- fall through to the credit/issue path below
+      else
+        if $kst == "open" then
+          -- crash-between-issue-and-settle repair: a fully-credited open
+          -- invoice still owes its paid transition (Codex P1 round 3)
+          if to_number($k[0].total_cents) == 0 then
+            biz_settle_if_zero($kid, "tick")
+          end
+          bt_ensure_created_event($kid, $today)
+          return nil     -- NOT new: no stats bump, no fresh notification date
+        end
+        return nil       -- paid/cancelled: fully handled
+      end
+    end
+    if not $dup then
+      $svc_col = nil
+      $dom_col = nil
+      if $kind == "service" then $svc_col = $ref["id"] else $dom_col = $ref["id"] end
+      db_exec("INSERT INTO invoice_items (invoice_id, service_id, domain_id, description,
+               amount_cents, period_start, period_end) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+              [$inv_id, $svc_col, $dom_col, $desc, $amount, $period_start, $period_end])
+      db_exec("COMMIT")
+    end
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return nil
+  end
+
+  -- totals first (subtotal from items), THEN credit as a paired credit+total
+  -- update — the invoices CHECK identity is enforced per-statement, so credit
+  -- can never move without total moving with it
+  biz_recompute_draft($inv_id)
+  $bal = credit_balance($cust_id)
+  if $bal >= $amount then
+    db_exec("UPDATE invoices SET credit_cents = ?2,
+             total_cents = subtotal_cents + tax_cents - ?2
+             WHERE id = ?1 AND status = 'draft'
+             AND ?2 <= subtotal_cents + tax_cents", [$inv_id, $amount])
+  end
+  -- due = the renewal date itself (research consensus); never before today+7
+  $due = $period_start
+  $floor = biz_date_add($today, "+7 days")
+  if $due < $today then $due = $floor end
+  $ir = biz_issue_invoice($inv_id, $due, "tick")
+  if not $ir["ok"] then
+    return nil  -- draft + key remain; NEXT run's resume path repairs forward
+  end
+  -- fully-credited invoice: settle now (paid transition + renewal side effects)
+  biz_settle_if_zero($inv_id, "tick")
+  bt_ensure_created_event($inv_id, $today)
+  return $inv_id
+end
+
+-- Ensure exactly ONE invoice_created event ever exists for an invoice — the
+-- NOT-EXISTS guard spans ALL scheduled_for dates, so a renewal that stays in
+-- the generation window across many daily runs can never re-schedule its
+-- creation mail on a fresh date (Codex P1 round 3).
+function bt_ensure_created_event($invoice_id, $today)
+  db_exec("INSERT INTO notification_events (invoice_id, template, scheduled_for)
+           SELECT ?1, 'invoice_created', ?2
+           WHERE NOT EXISTS (SELECT 1 FROM notification_events
+                             WHERE invoice_id = ?1 AND template = 'invoice_created')",
+          [$invoice_id, $today])
+end
+
+-- ---------------------------------------------------------------- main
+
+function biz_tick_main()
+  cms_init()
+  biz_init()
+  if $METHOD != "POST" then
+    return { status: 405, headers: {}, body: "POST only" }
+  end
+  if not bt_authorized() then
+    return { status: 403, headers: {}, body: "forbidden" }
+  end
+  if biz_setting("tick_enabled") != "1" then
+    return { status: 200, headers: { "Content-Type": "application/json" },
+             body: json_encode({ disabled: true }) }
+  end
+
+  $today = biz_today()
+  $lead = to_number(biz_setting("invoice_lead_days"))
+  if $lead == nil then $lead = 14 end
+  $horizon = biz_date_add($today, "+" .. $lead .. " days")
+  $stats = { generated: 0, gen_errors: 0, mails_sent: 0, mails_skipped: 0, mail_errors: 0 }
+
+  -- 1. generate service renewals (window: due within lead; includes lapsed)
+  $svcs = db_query("SELECT id, customer_id, label, price_cents, next_due FROM services
+                    WHERE status = 'active' AND next_due IS NOT NULL AND next_due <= ?1
+                    ORDER BY next_due", [$horizon])
+  for each $s in $svcs
+    $iid = bt_generate_one("service", $s, $today)
+    if $iid != nil then
+      $stats["generated"] = $stats["generated"] + 1
+    end
+  end
+  -- 1b. domain renewals (auto_renew only; never dead domains)
+  $doms = db_query("SELECT id, customer_id, domain AS label, price_cents, next_due FROM domains
+                    WHERE status = 'active' AND auto_renew = 1 AND category != 'dead'
+                    AND next_due IS NOT NULL AND next_due <= ?1 ORDER BY next_due", [$horizon])
+  for each $d in $doms
+    $iid = bt_generate_one("domain", $d, $today)
+    if $iid != nil then
+      $stats["generated"] = $stats["generated"] + 1
+    end
+  end
+
+  -- 2. schedule dunning for OUR open invoices (imported opens dash-only).
+  -- Shop ORDERS (invoice_items.product_id set) are excluded on shop vhosts:
+  -- an unpaid order is an abandoned checkout, not an obligation — dunning it
+  -- would mean an instant "reminder" (issued=due=today) plus overdue notices.
+  -- The exclusion is gated on features.shop because the product_id column
+  -- only exists where shop_init has run (a plain-billing db has no column).
+  $remind = to_number(biz_setting("remind_before_days"))
+  if $remind == nil then $remind = 3 end
+  $odays = split(biz_setting("overdue_days"), ",")
+  $dunning_sql = "SELECT id, due FROM invoices
+                  WHERE status = 'open' AND legacy = 0 AND id >= ?1 AND due IS NOT NULL"
+  if biz_shop_enabled() then
+    shop_init()
+    $dunning_sql = $dunning_sql .. " AND NOT EXISTS (SELECT 1 FROM invoice_items ii
+                    WHERE ii.invoice_id = invoices.id AND ii.product_id IS NOT NULL)"
+  end
+  $open = db_query($dunning_sql, [$BIZ_NEW_INVOICE_FLOOR])
+  for each $o in $open
+    db_exec("INSERT OR IGNORE INTO notification_events (invoice_id, template, scheduled_for)
+             VALUES (?1, 'reminder', date(?2, '-' || ?3 || ' days'))",
+            [$o.id, $o.due, $remind])
+    $n = 0
+    for each $od in $odays
+      $n = $n + 1
+      db_exec("INSERT OR IGNORE INTO notification_events (invoice_id, template, scheduled_for)
+               VALUES (?1, 'overdue' || ?3, date(?2, '+' || ?4 || ' days'))",
+              [$o.id, $o.due, $n, trim($od)])
+    end
+  end
+
+  -- 2b. Stripe off-session auto-charge: for auto_charge services' OWN open
+  --     invoices that are due today (or overdue) and not yet being charged.
+  --     The webhook (payment_intent.succeeded/failed) is the resolver; this
+  --     only INITIATES + records the attempt. Retry rides next_attempt_at.
+  $stats["charges_tried"] = 0
+  if biz_setting("stripe_secret_key") != "" then
+    $due_auto = db_query("SELECT DISTINCT i.id, i.total_cents, i.token, i.customer_id
+                          FROM invoices i
+                          JOIN invoice_items ii ON ii.invoice_id = i.id
+                          JOIN services s ON s.id = ii.service_id
+                          WHERE i.status = 'open' AND i.legacy = 0 AND i.id >= ?1
+                          AND i.due <= ?2 AND s.auto_charge = 1
+                          AND NOT EXISTS (SELECT 1 FROM payment_attempts pa
+                            WHERE pa.invoice_id = i.id AND pa.gateway = 'stripe'
+                            AND pa.kind = 'offsession'
+                            AND (pa.status = 'created'
+                                 OR (pa.status = 'failed' AND pa.next_attempt_at > ?2)))",
+                         [$BIZ_NEW_INVOICE_FLOOR, $today])
+    for each $ai in $due_auto
+      $cr = db_query("SELECT id, stripe_customer_id, stripe_pm_id, stripe_pm_status
+                      FROM customers WHERE id = ?1", [$ai.customer_id])
+      if length($cr) > 0 then
+        $prev = db_query("SELECT COALESCE(MAX(attempt_no), 0) AS n FROM payment_attempts
+                          WHERE invoice_id = ?1 AND gateway = 'stripe' AND kind = 'offsession'",
+                         [$ai.id])
+        $an = to_number($prev[0].n) + 1
+        $inv = { id: $ai.id, total_cents: $ai.total_cents, token: $ai.token }
+        $ch = st_offsession_charge($inv, $cr[0], $an)
+        if $ch["attempted"] then $stats["charges_tried"] = $stats["charges_tried"] + 1 end
+      end
+    end
+  end
+
+  -- 3. send everything due (catch-up safe; sent_at stamped only on success so a
+  --    failed send retries next tick; the unique index means no duplicates ever)
+  -- shop_receipt events are OWNED by shop_tick's own sweep (3b): they target
+  -- PAID invoices, so this sweep's not-open void rule would eat them, and the
+  -- dunning bodies below are wrong for them. Excluded by template literal
+  -- (safe on non-shop dbs — the value simply never occurs there).
+  $pending = db_query("SELECT n.id AS nid, n.template, i.id, i.due, i.total_cents, i.status,
+                       c.name, c.email
+                       FROM notification_events n
+                       JOIN invoices i ON i.id = n.invoice_id
+                       JOIN customers c ON c.id = i.customer_id
+                       WHERE n.sent_at IS NULL AND n.scheduled_for <= ?1
+                       AND n.template != 'shop_receipt'
+                       ORDER BY n.id", [$today])
+  for each $p in $pending
+    -- an invoice paid/cancelled since scheduling: void the event, send nothing
+    if ("" .. $p.status) != "open" then
+      db_exec("UPDATE notification_events SET sent_at = ?2 WHERE id = ?1",
+              [$p.nid, "voided:" .. biz_now()])
+    else
+      $inv = { id: $p.id, due: "" .. $p.due, total_cents: $p.total_cents }
+      $cust = { name: "" .. $p.name, email: "" .. $p.email }
+      $tpl = "" .. $p.template
+      $subject = biz_brand() .. " invoice INV-" .. $p.id
+      $body = ""
+      if $tpl == "invoice_created" then
+        $items = db_query("SELECT description, amount_cents FROM invoice_items
+                           WHERE invoice_id = ?1", [$p.id])
+        $lines = ""
+        for each $it in $items
+          $lines = $lines .. "  " .. $it.description .. "  " .. fmt_aud($it.amount_cents) .. "\n"
+        end
+        $body = bt_body_invoice($inv, $cust, $lines)
+      else
+        $subject = biz_brand() .. " invoice INV-" .. $p.id .. " — payment reminder"
+        if $tpl != "reminder" then
+          $subject = biz_brand() .. " invoice INV-" .. $p.id .. " — overdue notice"
+        end
+        $body = bt_body_dunning($inv, $cust, $tpl)
+      end
+      $mr = biz_mail($cust["email"], $subject, $body)
+      if $mr["skipped"] then
+        -- mail_mode=off: stamp the event as explicitly skipped so a later flip
+        -- to test/live can NEVER blast the accumulated backlog (Codex P1)
+        db_exec("UPDATE notification_events SET sent_at = ?2 WHERE id = ?1",
+                [$p.nid, "skipped-off:" .. biz_now()])
+        $stats["mails_skipped"] = $stats["mails_skipped"] + 1
+      else
+        if $mr["ok"] then
+          $stats["mails_sent"] = $stats["mails_sent"] + 1
+          db_exec("UPDATE notification_events SET sent_at = ?2 WHERE id = ?1",
+                  [$p.nid, biz_now()])
+        else
+          $stats["mail_errors"] = $stats["mail_errors"] + 1
+        end
+      end
+    end
+  end
+
+  -- NOTE: SOAP-heavy SW work (nightly domainInfo sync, renewDomain fulfillment)
+  -- does NOT run here — up to 4s/call × many domains cannot fit webd's 5s
+  -- handler deadline. It lives in the standalone worker _bin/biz_sw_sync.mix
+  -- (full mix binary: xml+net, no deadline) which reads biz.db read-only, makes
+  -- the SOAP calls, and POSTs results to the fast DB-only /biz/sw-apply endpoint
+  -- (h_biz_sw_apply.mix). This keeps every biz.db WRITE inside webd (D9) while
+  -- keeping slow I/O off the request path.
+
+  -- 3b. shop vhosts: paid-order receipt/delivery/signup mail (durable outbox
+  --     via notification_events 'shop_receipt') + expired-cart sweep.
+  if biz_shop_enabled() then
+    $stats["shop_receipts"] = shop_tick($today)
+  end
+
+  -- 4. housekeeping: old rate-limit windows + stale ip reservations
+  db_exec("DELETE FROM rate_limits WHERE window_start < datetime(?1, '-2 days')", [biz_now()])
+  db_exec("UPDATE ip_pool SET status = 'free', service_id = NULL, reserved_at = NULL,
+           reserved_by_job = NULL WHERE status = 'reserved'
+           AND reserved_at < datetime(?1, '-1 hour')
+           AND reserved_by_job NOT IN (SELECT id FROM jobs WHERE status IN ('pending','running'))",
+          [biz_now()])
+
+  biz_audit("tick", "tick_run", "", nil, json_encode($stats))
+  return { status: 200, headers: { "Content-Type": "application/json" },
+           body: json_encode($stats) }
+end

@@ -1,0 +1,38 @@
+[package]
+name = "cosmix-maild-auth"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SPF / DKIM / DMARC / ARC / iprev verification + DKIM signing + ARC sealing for cosmix-maild"
+
+[lib]
+name = "cosmix_maild_auth"
+path = "src/lib.rs"
+
+[features]
+default = ["core"]
+core = []
+cosmix = ["dep:cosmix-lib-bus", "dep:cosmix-lib-client"]
+
+[dependencies]
+# Pin mail-auth deliberately. R2 risk: API churn — upgrade explicitly.
+# Pin mail-auth deliberately. R2 risk: API churn — upgrade explicitly.
+# We use `mail_auth::hickory_resolver` rather than depending on
+# hickory-resolver directly: mail-auth 0.7.5 re-exports the exact
+# version it links against (0.26-alpha as of writing), so going through
+# the re-export avoids the "two hickory_resolver versions in the graph"
+# trap and keeps us moving in lockstep when we bump mail-auth.
+mail-auth = { version = "0.7", default-features = false, features = ["ring", "generate"] }
+# DKIM signer key loading — PEM → PrivateKeyDer. mail-auth links the
+# same version (1.13.1); going through this dep keeps the two in lockstep.
+rustls-pki-types = "1.13"
+tokio = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+thiserror = "2"
+cosmix-lib-bus = { path = "../cosmix-lib-bus", optional = true }
+cosmix-lib-client = { path = "../cosmix-lib-client", features = ["native"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

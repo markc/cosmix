@@ -1,0 +1,57 @@
+-- cms.mix — a minimal, self-contained mix-scripted CMS handler for webd.
+--
+-- One `db`-capable handler bound to GET+POST on a path (register it with
+-- method=ANY). GET renders the post list + a create form; POST inserts a
+-- post then redirects (POST-redirect-GET). Demonstrates the slice #3.5
+-- DB-from-Mix surface end to end:
+--   db_exec(sql, params)  → { affected, last_insert_id }   (DDL/INSERT/UPDATE/DELETE)
+--   db_query(sql, params) → list of { column: value } rows  (SELECT)
+--   url_decode(s)         → percent/'+' decode (form + query)
+-- and the response contract: return an HTML string, or a typed
+--   { status, headers, body } map.
+--
+-- The webd embed injects request globals: $METHOD $PATH $QUERY $HOST
+-- $BODY (strings) and $HEADERS (map). Capability profile for a `db`
+-- route: Pure + FsRead + Db (no raw fs-write / network / process / shell).
+--
+-- `html_escape` and `parse_form` are builtins (cosmix-lib-mix ≥ 0.15.2):
+-- ALWAYS `html_escape` request/DB values before placing them in HTML;
+-- `parse_form($BODY)` / `parse_query($QUERY)` give you a map.
+
+-- Shared page chrome via a sibling lib (cosmix-lib-mix ≥ 0.15.3 resolves
+-- `include` relative to this handler, under www_dir). Defines `page()`.
+include "layout.mix"
+
+-- Schema is created on demand (idempotent), so the route works against a
+-- fresh per-vhost db with no separate migration step.
+db_exec("CREATE TABLE IF NOT EXISTS posts (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', created TEXT NOT NULL DEFAULT (datetime('now')))", [])
+
+if $METHOD == "POST" then
+  $form = parse_form($BODY)
+  $title = $form["title"]
+  if $title != "" then
+    db_exec("INSERT INTO posts (title, body) VALUES (?1, ?2)", [$title, $form["body"]])
+  end
+  -- POST-redirect-GET back to this same path.
+  return { status: 303, headers: { Location: $PATH }, body: "" }
+end
+
+-- GET: render the list + a create form, wrapped by the shared layout.
+$rows = db_query("SELECT id, title, body, created FROM posts ORDER BY id DESC", [])
+$body = "<h1>Posts</h1>\n<ul>\n"
+for each $r in $rows
+  $body = $body .. "<li><strong>" .. html_escape($r["title"]) .. "</strong>"
+  $body = $body .. " <small>#" .. ("" .. $r["id"]) .. " " .. html_escape($r["created"]) .. "</small>"
+  if $r["body"] != "" then
+    $body = $body .. "<br>" .. html_escape($r["body"])
+  end
+  $body = $body .. "</li>\n"
+end
+$body = $body .. "</ul>\n"
+$body = $body .. "<h2>New post</h2>\n"
+$body = $body .. "<form method=\"post\" action=\"" .. html_escape($PATH) .. "\">\n"
+$body = $body .. "  <p><input name=\"title\" placeholder=\"Title\" required></p>\n"
+$body = $body .. "  <p><textarea name=\"body\" placeholder=\"Body\"></textarea></p>\n"
+$body = $body .. "  <p><button type=\"submit\">Create</button></p>\n"
+$body = $body .. "</form>\n"
+return page("mix CMS", $body)

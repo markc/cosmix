@@ -1,0 +1,22 @@
+# build output
+target/
+src/desktop/apps/plasmoid/build-*/
+
+# per-install runtime tree under $COSMIX (created by bootstrap / setup.mix;
+# never source): stage-1 binaries, config, state, generated env file
+/bin/
+/etc/
+/var/
+/run/
+/log/
+/tmp/
+/env
+
+# per-machine agent notes
+CLAUDE.local.md
+.agents/
+.claude/
+
+# editors / OS
+*.swp
+.DS_Store

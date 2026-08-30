@@ -1,0 +1,157 @@
+-- h_ssh_tools.mix — the /ssh/host-tool surface: run an operator TOOL (uptime, ping) on a
+-- roster host and show the output in the toolsd-style modal.
+--
+--   GET  /ssh/host-tool?tool=&host=<id>&modal=1  → the modal (spinner + <pre> + poll JS)
+--   POST /ssh/host-tool/run                        → enqueue an sshm job; returns {job_id, token}
+--   GET  /ssh/host-tool/status?id=<job>&token=<t>  → poll JSON {status, output, terminal}
+--
+-- Execution + authority stay in SSHM (the worker holds the key, the queue is sshm.ssh_jobs)
+-- — this handler is only the operator-gated enqueue + the modal UI, reusing toolsd's modal
+-- shell (md_panel) + the tools-* CSS + the adaptive-poll pattern. The host is an OPAQUE id
+-- resolved server-side through sshm.ssh_hosts (ssh_tool_enqueue), never a caller hostname.
+
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+include "/opt/cosmix/vhosts/shared/apps/ssh_lib.mix"
+
+$SSHT_POLL_FIRST_MS = 200
+$SSHT_POLL_MAX_MS = 700
+$SSHT_POLL_GROW_X10 = 15
+
+-- Human label + heading for the two tools.
+function ssht_label($tool)
+  if ("" .. $tool) == "uptime_host" then
+    return "Uptime"
+  end
+  if ("" .. $tool) == "ping_host" then
+    return "Ping"
+  end
+  return "" .. $tool
+end
+
+-- The modal fragment: reuses the toolsd .tools-* markup + CSS. Output arrives via JS
+-- (POST run → poll status) and is written with textContent (escaped once, never HTML).
+function ssht_view($tool_raw, $host_id, $hostname)
+  $tool = "" .. ssh_or($tool_raw, "")
+  if ssh_tool_spec($tool) == nil then
+    return md_fragment(md_panel({ title: "Unknown tool", submit: false, cancel: "Close" },
+      '<p class="fm-help">No such tool.</p>'))
+  end
+  $hid = to_number("" .. $host_id)
+  if $hid == nil then
+    return md_fragment(md_panel({ title: ssht_label($tool), submit: false, cancel: "Close" },
+      '<p class="fm-help">Bad host id.</p>'))
+  end
+  $title = ssht_label($tool) .. " — " .. ("" .. ssh_or($hostname, ("host #" .. ("" .. $hid))))
+  $hdr = '<div class="md-head-row"><h2 class="md-title">' .. esc($title) .. '</h2>'
+  $hdr = $hdr .. '<button type="button" class="btn btn-ghost btn-sm" data-tools-refresh disabled>'
+  $hdr = $hdr .. '<i data-lucide="refresh-cw" aria-hidden="true"></i> Refresh</button></div>'
+  $body = '<div class="tools-run"><div class="tools-status" data-tools-status>'
+  $body = $body .. '<span class="tools-spinner" aria-hidden="true"></span> <span data-tools-msg>Running ' .. esc(ssht_label($tool)) .. '…</span></div>'
+  $body = $body .. '<pre class="tools-output" data-tools-output tabindex="0" aria-live="polite"></pre></div>'
+  $body = $body .. ssht_script($tool, $hid)
+  return md_fragment(md_panel({ header: $hdr, size: "xl", submit: false, cancel: "Close" }, $body))
+end
+
+-- The client — the toolsd adaptive-poll pattern (fast first, backing off), pointed at the
+-- /ssh/host-tool endpoints. Mix statements end at a newline (no line continuation).
+function ssht_script($tool, $host_id)
+  $s = '<script>(function(){'
+  $s = $s .. 'var root=document.currentScript.closest(".md-panel")||document;'
+  $s = $s .. 'var out=root.querySelector("[data-tools-output]");'
+  $s = $s .. 'var msg=root.querySelector("[data-tools-msg]");'
+  $s = $s .. 'var box=root.querySelector("[data-tools-status]");'
+  $s = $s .. 'var btn=root.querySelector("[data-tools-refresh]");'
+  $s = $s .. 'var tool=' .. json_encode("" .. $tool) .. ';'
+  $s = $s .. 'var host=' .. json_encode("" .. $host_id) .. ';'
+  $s = $s .. 'var timer=null;var delay=' .. ("" .. $SSHT_POLL_FIRST_MS) .. ';'
+  $s = $s .. 'function stop(){if(timer){clearTimeout(timer);timer=null;}}'
+  $s = $s .. 'function sched(id,tok){stop();timer=setTimeout(function(){poll(id,tok);},delay);'
+  $s = $s .. 'delay=Math.min(Math.round(delay*' .. ("" .. $SSHT_POLL_GROW_X10) .. '/10),' .. ("" .. $SSHT_POLL_MAX_MS) .. ');}'
+  $s = $s .. 'function fin(state,text){stop();box.className="tools-status tools-"+state;msg.textContent=text;if(btn)btn.disabled=false;}'
+  $s = $s .. 'function show(t){out.textContent=t||"";}'
+  $s = $s .. 'function poll(id,tok){fetch("/ssh/host-tool/status?id="+encodeURIComponent(id)+"&token="+encodeURIComponent(tok),{credentials:"same-origin"})'
+  $s = $s .. '.then(function(r){if(!r.ok){throw new Error(r.status===404?"run not readable":("HTTP "+r.status));}return r.json();})'
+  $s = $s .. '.then(function(j){if(j.output)show(j.output);'
+  $s = $s .. 'if(j.status==="done"){fin("ok","done");}'
+  $s = $s .. 'else if(j.status==="error"||j.status==="abandoned"){show(j.output||"");fin("err",j.status);}'
+  $s = $s .. 'else{sched(id,tok);}'
+  $s = $s .. '}).catch(function(e){fin("err",(e&&e.message)||"lost contact with the server");});}'
+  $s = $s .. 'function run(){stop();delay=' .. ("" .. $SSHT_POLL_FIRST_MS) .. ';if(btn)btn.disabled=true;show("");box.className="tools-status";msg.textContent="Running "+tool+"…";'
+  $s = $s .. 'var body=new URLSearchParams();body.set("tool",tool);body.set("host",host);'
+  $s = $s .. 'fetch("/ssh/host-tool/run",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:body.toString()})'
+  $s = $s .. '.then(function(r){return r.json().then(function(j){return {s:r.status,j:j};});})'
+  $s = $s .. '.then(function(res){if(res.s!==200||!res.j.job_id){fin("err",res.j.error||("HTTP "+res.s));return;}'
+  $s = $s .. 'var id=res.j.job_id;var tok=res.j.token||"";poll(id,tok);})'
+  $s = $s .. '.catch(function(){fin("err","request failed");});}'
+  $s = $s .. 'if(btn)btn.addEventListener("click",run);run();'
+  $s = $s .. '})();</script>'
+  return $s
+end
+
+-- POST /ssh/host-tool/run — operator-gated enqueue. host is an opaque id resolved through
+-- the roster (ssh_tool_enqueue). The enqueue fires sshm.wake best-effort; the 5-minute
+-- drain timer is only the missed-wake backstop.
+function ssht_run($user)
+  $f = parse_form($BODY)
+  $tool = "" .. ssh_or($f["tool"], "")
+  $host = "" .. ssh_or($f["host"], "")
+  $r = ssh_tool_enqueue($tool, $host)
+  if $r["ok"] != true then
+    return { status: to_number("" .. $r["code"]), headers: { "Content-Type": "application/json", "Cache-Control": "no-store" }, body: json_encode({ error: "" .. $r["error"] }) }
+  end
+  -- Audit which operator triggered which tool against which host (Codex): on a multi-
+  -- operator vhost a later investigation needs the actor, not just tool/target/time.
+  ssh_audit("" .. ssh_or($user["username"], "?"), "tool_" .. ssht_label($tool), "ssh_hosts", to_number("" .. $host), "" .. ssh_or($r["alias"], ""))
+  return { status: 200, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+           body: json_encode({ job_id: to_number("" .. $r["id"]), token: "" .. $r["token"] }) }
+end
+
+-- GET /ssh/host-tool/status?id=&token= — poll JSON, token-gated (requester-only).
+function ssht_status($id, $token)
+  $r = ssh_tool_status($id, $token)
+  if $r == nil then
+    return { status: 404, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" }, body: json_encode({ error: "no such run" }) }
+  end
+  return { status: 200, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" }, body: json_encode({
+    job_id: to_number("" .. $r["id"]),
+    status: "" .. $r["status"],
+    output: "" .. ssh_or($r["output"], ""),
+    terminal: ssh_tool_terminal($r["status"])
+  }) }
+end
+
+function ssh_tools_main()
+  cms_init()
+  ssh_init()
+  $user = current_user($HEADERS)
+  if md_is_modal_request() and $user == nil then
+    return md_session_expired("/ssh/hosts")
+  end
+  $deny = require_sshm_operator($user)
+  if $deny != nil then
+    return $deny
+  end
+  $q = parse_query($QUERY)
+  if ends_with($PATH, "/host-tool/status") then
+    return ssht_status(ssh_or($q["id"], ""), ssh_or($q["token"], ""))
+  end
+  if ends_with($PATH, "/host-tool/run") then
+    if $METHOD != "POST" then
+      return { status: 405, headers: {}, body: "POST only" }
+    end
+    return ssht_run($user)
+  end
+  if ends_with($PATH, "/host-tool") then
+    -- The hostname for the heading is looked up from the roster (display only).
+    $hid = to_number("" .. ssh_or($q["host"], ""))
+    $hn = ""
+    if $hid != nil then
+      $hr = db_query("SELECT name FROM sshm.ssh_hosts WHERE id=?1", [$hid])
+      if length($hr) == 1 then
+        $hn = "" .. ssh_or($hr[0]["name"], "")
+      end
+    end
+    return ssht_view(ssh_or($q["tool"], ""), ssh_or($q["host"], ""), $hn)
+  end
+  return { status: 404, headers: {}, body: "not found" }
+end

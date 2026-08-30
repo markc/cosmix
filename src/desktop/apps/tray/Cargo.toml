@@ -1,0 +1,30 @@
+# desktop/apps/tray — the windowless Plasma StatusNotifierItem for CosMix.
+# It deliberately does not depend on CTK: CTK's unconditional Bevy dependency
+# would pull a rendering engine into this engine-free tray process.
+[package]
+name = "cosmix-tray"
+version = "0.3.1"
+description = "CosMix Tray — thin StatusNotifierItem skin for cosmix-trayd"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+
+[package.metadata.cosmix]
+# kind was "tray" until 2026-08-04: the plasmoid now owns the systray surface,
+# so the standalone SNI icon no longer autostarts with the session. kind="app"
+# keeps the binary + menu launcher installed for manual/debug use; the deployer
+# carries the old /etc/xdg/autostart entry in its manifest (designed-for case).
+kind = "app"
+component = "tray"
+display = "CosMix Tray"
+engine = "none"
+
+[[bin]]
+name = "cosmix-tray"
+path = "src/main.rs"
+
+[dependencies]
+cosmix-app-identity = { path = "../../../crates/cosmix-app-identity" }
+ksni = { version = "0.3.6", default-features = false, features = ["async-io", "blocking"] }
+libc = "0.2"
+zbus = { version = "5.18.0", default-features = false, features = ["async-io", "blocking-api"] }

@@ -1,0 +1,301 @@
+-- admin_comments.mix — comment / forum-reply moderation (GET/POST /admin/comments). Admin-only.
+-- Posts-standard shared SSR datatable (widgets/datatable.mix) over the threaded-reply
+-- substrate (cms_threads — forum discussion AND blog comments), with per-row + bulk
+-- Approve / Unapprove / Spam / Delete. Status model: 'visible' (live) | 'pending' (held) |
+-- 'spam' | 'deleted'. Approve→visible, Unapprove→pending, Spam→spam, Delete→hard remove.
+-- Replies arrive via the public /reply path — there is NO admin compose/editor here.
+-- Plan: _plan/2026-06-28-unified-message-surfaces.md §5.
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/admin_resource.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+
+-- Link to the root a reply hangs off (forum topic or blog post); both are cms_posts rows.
+function acm_root_href($kind, $slug)
+  if $slug == nil or trim("" .. $slug) == "" then
+    return ""
+  end
+  if $kind == "forum" then
+    return "/forum/" .. ("" .. $slug)
+  end
+  if $kind == "page" then
+    return "/page/" .. ("" .. $slug)
+  end
+  return "/post/" .. ("" .. $slug)
+end
+
+-- Status pill (legacy custom-list renderer): 'visible' = accent tag, anything else =
+-- the warning (draft) tag. The datatable now renders status via the declarative `badge`
+-- opt (acm_status_variant); kept for the preserved acm_row renderer.
+function acm_status_badge($s)
+  $st = "" .. $s
+  if $st == "visible" then
+    return '<span class="tag">visible</span>'
+  end
+  return '<span class="tag draft">' .. esc($st) .. '</span>'
+end
+
+-- Map a reply status to a whitelisted Filament badge variant (dt_color_ok): visible →
+-- success (green), spam → danger (red), anything else (pending) → gray. if/else, no ?:.
+function acm_status_variant($s)
+  $st = "" .. $s
+  if $st == "visible" then
+    return "success"
+  end
+  if $st == "spam" then
+    return "danger"
+  end
+  return "gray"
+end
+
+-- One inline POST action form (Approve / Spam / Delete) on the moderation DETAIL
+-- page — now a thin wrapper over the webd-forms fm_mini_form extraction. $variant
+-- is the historic full btn-class ("btn-secondary"/"btn-danger"); strip the prefix
+-- to the variant name fm_mini_form expects.
+function acm_action_form($id, $action, $label, $variant, $confirm)
+  $vn = "" .. $variant
+  if starts_with($vn, "btn-") then
+    $vn = substr($vn, 4, length($vn) - 4)
+  end
+  $o = { variant: $vn, class: "cms-cat-form" }
+  if $confirm != "" then
+    $o["confirm"] = $confirm
+  end
+  return fm_mini_form("/admin/comments", { action: $action, id: "" .. $id }, $label, $o)
+end
+
+-- Reparent the direct children of $id up to $id's OWN parent (the grandparent) so hiding
+-- (spam) or deleting $id never orphans a still-visible reply — an orphaned child would count
+-- but vanish from build_thread_children_map (its parent no longer renders). NULL/0 grandparent
+-- → children become top-level. Mirrors h_admin_categories' delete-reparent. cms_threads ids are
+-- globally unique, so `parent_id = $id` matches only this row's children.
+function acm_reparent_children($id)
+  $row = db_query("SELECT parent_id FROM cms_threads WHERE id = ?1", [$id])
+  $gp = 0
+  if length($row) > 0 and $row[0]["parent_id"] != nil and ("" .. $row[0]["parent_id"]) != "" then
+    $gp = "" .. $row[0]["parent_id"]
+  end
+  db_exec("UPDATE cms_threads SET parent_id = ?1 WHERE parent_id = ?2", ["" .. $gp, "" .. $id])
+end
+
+function acm_fetch_one($id)
+  $r = db_query("SELECT id, status FROM cms_threads WHERE id = ?1", [$id])
+  if length($r) == 1 then
+    return $r[0]
+  end
+  return nil
+end
+
+function acm_delete_one($id)
+  -- reparent BEFORE the hard delete, or a child reply orphans.
+  acm_reparent_children($id)
+  db_exec("DELETE FROM cms_threads WHERE id = ?1", [$id])
+end
+
+-- Foundation policy hooks: reparent + delete run in ONE tx via dt_try_delete_row
+-- (see admin_resource.mix). No guard, no audit table on CMS.
+function acm_del_hooks()
+  return {
+    fetch: fn($id) = acm_fetch_one($id),
+    delete: fn($id, $row) = acm_delete_one($id),
+    missing: "No such reply."
+  }
+end
+
+function acm_author($r)
+  $disp = $r["author_display"]
+  if $disp != nil and trim("" .. $disp) != "" then
+    return "" .. $disp
+  end
+  $nm = $r["author_name"]
+  if $nm != nil and trim("" .. $nm) != "" then
+    return "" .. $nm
+  end
+  return "Anonymous"
+end
+
+-- Legacy custom-list row renderer (pre-datatable). Preserved but unused — the datatable
+-- replaces it. Kept so a fresh agent can see the original shape / for a no-JS fallback.
+function acm_row($r)
+  $id = "" .. $r["id"]
+  $excerpt = esc(substr("" .. fm_or($r["body"], ""), 0, 160))
+  $href = acm_root_href($r["root_kind"], $r["root_slug"])
+  $rootlbl = "" .. fm_or($r["root_title"], "#" .. ("" .. $r["root_id"]))
+  $rootlink = esc($rootlbl)
+  if $href != "" then
+    $rootlink = '<a href="' .. esc($href) .. '">' .. esc($rootlbl) .. '</a>'
+  end
+  $h = '<li class="cms-cat-node"><div class="cms-cat-row">'
+  $h = $h .. '<div class="cms-cat-head"><span class="cms-cat-name">' .. esc(acm_author($r)) .. '</span>'
+  $h = $h .. '<span class="cms-cat-meta">' .. acm_status_badge($r["status"]) .. ' · ' .. esc("" .. fm_or($r["root_kind"], "")) .. ' · ' .. $rootlink .. ' · ' .. esc(blog_date("" .. fm_or($r["created"], ""))) .. '</span></div>'
+  $h = $h .. '<p class="muted">' .. $excerpt .. '</p>'
+  $h = $h .. '<div class="cms-cat-actions forms-skin">'
+  if ("" .. $r["status"]) != "visible" then
+    $h = $h .. acm_action_form($id, "approve", "Approve", "btn-secondary", "")
+  end
+  if ("" .. $r["status"]) != "spam" then
+    $h = $h .. acm_action_form($id, "spam", "Spam", "btn-secondary", "")
+  end
+  $h = $h .. acm_action_form($id, "delete", "Delete", "btn-danger", "Delete this reply permanently?")
+  $h = $h .. '</div></div></li>'
+  return $h
+end
+
+-- The list datatable config (spec + opts), built ONCE so the POST bulk handler can re-run
+-- dt_where for select-all-across-pages (S-5) with the EXACT same spec/filters the GET list
+-- renders. Returns { spec, opts }. The status sub-filter (no pending-first sort) surfaces the
+-- moderation queue; default sort = newest reply first.
+function comments_list_config()
+  -- Render lambdas (single-expression bodies). Author/body/root are display-only HTML cells;
+  -- Status uses the declarative `badge` opt (acm_status_variant). esc() everywhere — author
+  -- name + body are user-submitted content.
+  $author_cell = fn($r) = esc(acm_author($r))
+  $body_cell = fn($r) = esc(substr("" .. fm_or($r["body"], ""), 0, 160))
+  $root_cell = fn($r) = '<a href="' .. esc(acm_root_href($r["root_kind"], $r["root_slug"])) .. '">' .. esc("" .. fm_or($r["root_title"], "#" .. ("" .. $r["root_id"]))) .. '</a>'
+  $status_badge = fn($r) = { "text": "" .. $r["status"], "variant": acm_status_variant($r["status"]) }
+  $bulkid = fn($r) = "" .. $r["id"]
+  -- Declarative row actions — ALL MUTATING (idempotent), shown on every row's RMB menu.
+  -- A row action posts action="row:<verb>:<id>" to base_route; dt_row_action parses it.
+  $act_approve = dt_action("approve", { "label": "Approve", icon: "check", variant: "action", action: "approve" })
+  $act_unapprove = dt_action("unapprove", { "label": "Unapprove", icon: "clock", variant: "action", action: "unapprove" })
+  $act_spam = dt_action("spam", { "label": "Spam", icon: "ban", variant: "action", action: "spam" })
+  $act_delete = dt_action("delete", { "label": "Delete", icon: "trash", variant: "action-danger", action: "delete", confirm: "Delete this reply permanently?" })
+  $spec = [
+    dt_col("author", "Author", "author_display", { render: $author_cell, placeholder: "—" }),
+    dt_col("body", "Comment", "body", { searchable: true, render: $body_cell }),
+    dt_col("root", "On", "root_title", { render: $root_cell }),
+    dt_col("status", "Status", "status", { sortable: true, badge: $status_badge }),
+    dt_col("created", "Date", "created", { sortable: true, type: "datetime" })
+  ]
+  -- Status sub-filter: the moderation funnel (Pending / Visible / Spam), URL-token validated
+  -- against the literal options (the dt_state firewall). Multiple → OR within the filter.
+  $filters = [
+    dt_filter("status", "Status", { multiple: true, options: [
+      { value: "pending", "label": "Pending", col: "status", op: "=" },
+      { value: "visible", "label": "Visible", col: "status", op: "=" },
+      { value: "spam", "label": "Spam", col: "status", op: "=" }
+    ] })
+  ]
+  $opts = dt_admin_opts({
+    base_route: "/admin/comments", caption: "Comments", noun: "comments",
+    default_sort: "created", default_dir: "desc",
+    search_placeholder: "Search comments…",
+    row_action_specs: [$act_approve, $act_unapprove, $act_spam, $act_delete],
+    bulk_id: $bulkid,
+    filters: $filters,
+    -- moderation bar replaces the default delete-only bulk action set.
+    bulk_actions: [
+      { "name": "approve", "label": "Approve selected" },
+      { "name": "unapprove", "label": "Unapprove selected" },
+      { "name": "spam", "label": "Mark spam", "class": "danger" },
+      { "name": "delete", "label": "Delete selected", "class": "danger", "confirm": "Delete the selected replies permanently?" }
+    ]
+  })
+  return { spec: $spec, opts: $opts }
+end
+
+function admin_comments_main()
+cms_init()
+$user = current_user($HEADERS)
+$deny = require_role($user, "admin")
+if $deny != nil then
+  return $deny
+end
+
+if $METHOD == "POST" then
+  $f = parse_form($BODY)
+  -- declarative row action (datatable.mix): action="row:<verb>:<id>". The id is the
+  -- cms_threads row id (bulk_id) — UNTRUSTED, treated as a string, bound never spliced.
+  $ra = dt_row_action($f)
+  if $ra != nil then
+    $id = $ra["id"]
+    $verb = $ra["verb"]
+    if $verb == "approve" then
+      db_exec("UPDATE cms_threads SET status = 'visible', updated = datetime('now') WHERE id = ?1", [$id])
+      return redirect_flash("/admin/comments", "Reply approved", "success")
+    end
+    if $verb == "unapprove" then
+      db_exec("UPDATE cms_threads SET status = 'pending', updated = datetime('now') WHERE id = ?1", [$id])
+      return redirect_flash("/admin/comments", "Reply unapproved", "success")
+    end
+    if $verb == "spam" then
+      -- reparent BEFORE hiding, or a still-visible child reply orphans.
+      acm_reparent_children($id)
+      db_exec("UPDATE cms_threads SET status = 'spam', updated = datetime('now') WHERE id = ?1", [$id])
+      return redirect_flash("/admin/comments", "Marked as spam", "success")
+    end
+    if $verb == "delete" then
+      $block = dt_try_delete_row(to_number($id), acm_del_hooks())
+      if $block != "" then
+        return redirect_flash("/admin/comments", $block, "danger")
+      end
+      return redirect_flash("/admin/comments", "Reply deleted", "success")
+    end
+    return redirect_flash("/admin/comments", "Unknown action", "warning")
+  end
+  -- bulk: Approve / Spam / Delete the page selection — OR the FULL filtered set when the
+  -- select-all-across-pages flag is set (S-5): re-run dt_where server-side over the POSTed
+  -- q+filters via the SAME config, NEVER trusting posted sel_* ids. Each id is a bind.
+  $ba = dt_bulk_action($f)
+  if $ba == "approve" or $ba == "unapprove" or $ba == "spam" or $ba == "delete" then
+    $ids = dt_selected_ids($f)
+    if dt_wants_all($f) then
+      $cfg = comments_list_config()
+      $ids = dt_all_ids("cms_threads", $cfg["spec"], dt_state_from_map($f, $cfg["spec"], $cfg["opts"]), "id")
+    end
+    -- hard deletes ride the Foundation policy helper (reparent + delete in ONE
+    -- tx per row, skip-and-report); moderation verbs stay imperative updates.
+    if $ba == "delete" then
+      $rep = dt_bulk_report(dt_bulk_try_delete($ids, acm_del_hooks()), "replies")
+      return redirect_flash("/admin/comments", $rep["msg"], $rep["kind"])
+    end
+    for each $cid in $ids
+      if $ba == "approve" then
+        db_exec("UPDATE cms_threads SET status = 'visible', updated = datetime('now') WHERE id = ?1", [$cid])
+      end
+      if $ba == "unapprove" then
+        db_exec("UPDATE cms_threads SET status = 'pending', updated = datetime('now') WHERE id = ?1", [$cid])
+      end
+      if $ba == "spam" then
+        -- reparent BEFORE hiding (per row), or a child reply orphans.
+        acm_reparent_children($cid)
+        db_exec("UPDATE cms_threads SET status = 'spam', updated = datetime('now') WHERE id = ?1", [$cid])
+      end
+    end
+    if $ba == "approve" then
+      return redirect_flash("/admin/comments", "Selected replies approved", "success")
+    end
+    if $ba == "unapprove" then
+      return redirect_flash("/admin/comments", "Selected replies set to pending", "success")
+    end
+    if $ba == "spam" then
+      return redirect_flash("/admin/comments", "Selected replies marked as spam", "success")
+    end
+    return redirect_flash("/admin/comments", "Selected replies updated", "success")
+  end
+  return redirect_flash("/admin/comments", "Unknown action", "warning")
+end
+
+-- GET: shared SSR datatable over cms_threads. Config built by comments_list_config() so the
+-- POST bulk handler re-runs dt_where over the SAME spec/filters (select-all, S-5). Author /
+-- root title / root slug are relationship columns — correlated $cols subqueries (one row per
+-- thread, no N+1) projected as author_display / root_title / root_slug (the backing names).
+$cfg = comments_list_config()
+$spec = $cfg["spec"]
+$opts = $cfg["opts"]
+$state = dt_state($QUERY, $spec, $opts)
+$cols = "*, (SELECT display FROM users WHERE users.id = cms_threads.author_id) AS author_display, (SELECT title FROM cms_posts WHERE cms_posts.id = cms_threads.root_id) AS root_title, (SELECT slug FROM cms_posts WHERE cms_posts.id = cms_threads.root_id) AS root_slug"
+$res = dt_sql("cms_threads", $spec, $state, $cols)
+-- search submit (live_search) → patch ONLY the #dt-results slot (filter bar + table + footer).
+if dt_wants_results() then
+  return dt_results_partial(dt_results_inner($spec, $opts, $state, $res["rows"], $res["total"], nil), "")
+end
+$dt = dt_render($spec, $opts, $state, $res["rows"], $res["total"], nil)
+-- sort/page/filter (in-region, non-search) → full region swap; a no-JS / full nav → doc().
+if dt_wants_partial() then
+  return dt_partial($dt)
+end
+-- Row actions render as the right-click menu (row_actions_contextmenu); dt_actions_chrome
+-- emits the generated menu template + shim after the region (full-page render only).
+return doc(200, "Comments", $user, dt_region($dt, "", true) .. dt_actions_chrome($opts))
+
+end

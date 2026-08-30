@@ -1,0 +1,27 @@
+<html>
+  <body>
+    <p>That matches what I saw. Merging once CI is green.</p>
+    <blockquote>
+      <p>On Tuesday, someone wrote:</p>
+      <blockquote>
+        <p>
+          The failure only reproduces when the queue drains while a wake is
+          already in flight, which is why the timer backstop hid it for so
+          long.
+        </p>
+      </blockquote>
+      <p>
+        Right — and the backstop is supposed to be lazy, so a five-minute
+        window was papering over a race that fires in milliseconds.
+      </p>
+    </blockquote>
+    <p>
+      Details: <a href="https://example.net/issues/418">issue 418</a>.
+    </p>
+    <pre>
+  thread 'worker' panicked at drain.rs:184:
+  assertion failed: pending.is_empty()
+    </pre>
+    <p>-- <br>sent from a machine that should know better</p>
+  </body>
+</html>

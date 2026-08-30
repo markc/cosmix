@@ -1,0 +1,9 @@
+[Unit]
+Description=CosMix Tray Daemon
+PartOf=graphical-session.target
+[Service]
+Type=dbus
+BusName=dev.cosmix.trayd
+ExecStart=/opt/cosmix/bin/cosmix-trayd
+Restart=on-failure
+Slice=app.slice

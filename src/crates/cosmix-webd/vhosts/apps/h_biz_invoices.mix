@@ -1,0 +1,715 @@
+-- h_biz_invoices.mix — invoice admin (GET/POST /biz/invoices). Admin-only. THE MONEY
+-- SURFACE: every status flip goes through biz.mix (biz_apply_payment / biz_cancel_invoice /
+-- biz_issue_invoice / biz_recompute_draft) — this file never hand-rolls one. Money is
+-- INTEGER cents (fmt_aud display); dates are civil TEXT YYYY-MM-DD.
+--   GET  /biz/invoices                → list (dt_sql; status/legacy filters; SUM footer)
+--   GET  /biz/invoices?view=<id>      → invoice document + status-dependent admin bar
+--   GET  /biz/invoices?new=1          → customer picker (creates a DRAFT)
+--   POST action=create                → INSERT draft → redirect ?view=<new id>
+--   POST action=item_add / item_del   → draft line insert/delete + biz_recompute_draft
+--   POST action=apply_credit          → set credit_cents (capped) + biz_recompute_draft
+--   POST action=issue                 → biz_issue_invoice (due defaults today+14d)
+--   POST action=cancel                → biz_cancel_invoice (draft or open)
+--   POST action=pay                   → biz_apply_payment (manual entry, fee 0)
+-- Guards: draft-only mutations re-check status='draft' in their SQL WHERE; legacy=1
+-- invoices refuse ALL mutations unless status='open' (the imported open ones ARE payable).
+-- Every mutation is biz_audit-ed. All POSTs answer redirect_flash (PRG).
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/admin_resource.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+include "/opt/cosmix/vhosts/shared/apps/biz.mix"
+
+-- ─────────────────────────────── shared helpers ───────────────────────────────
+
+-- Status → badge {text, variant}: paid=success · open past due=danger "overdue" ·
+-- open=warning · draft/cancelled=gray. Civil-date strings compare lexicographically.
+function inv_status_info($inv)
+  $s = "" .. $inv["status"]
+  if $s == "paid" then
+    return { "text": "paid", variant: "success" }
+  end
+  if $s == "open" then
+    $due = "" .. fm_or($inv["due"], "")
+    if $due != "" and $due < biz_today() then
+      return { "text": "overdue", variant: "danger" }
+    end
+    return { "text": "open", variant: "warning" }
+  end
+  return { "text": $s, variant: "gray" }
+end
+
+-- Dollars text ("12.34") → cents, nil on junk. Half-up rounding kills float dust.
+function inv_parse_dollars($s)
+  $n = to_number(trim("" .. fm_or($s, "")))
+  if $n == nil then
+    return nil
+  end
+  if $n < 0 then
+    return 0 - floor((0 - $n) * 100 + 0.5)
+  end
+  return floor($n * 100 + 0.5)
+end
+
+-- cents → a plain "12.34" input value (no $ / thousands — fmt_aud is for display).
+function inv_cents_to_dollars($cents)
+  $n = to_number($cents)
+  if $n == nil or $n < 0 then
+    $n = 0
+  end
+  $d = floor($n / 100)
+  $c = $n - $d * 100
+  $cs = "" .. $c
+  if $c < 10 then
+    $cs = "0" .. $c
+  end
+  return ("" .. $d) .. "." .. $cs
+end
+
+-- esc + newline→<br> for the multi-line address / bank-details blocks.
+function inv_nl2br($s)
+  return replace(esc("" .. fm_or($s, "")), "\n", "<br>")
+end
+
+-- "" → nil; else the SQLite-normalised civil date, nil on junk (single date oracle).
+function inv_date_or_nil($s)
+  $v = trim("" .. fm_or($s, ""))
+  if $v == "" then
+    return nil
+  end
+  $r = db_query("SELECT date(?1) AS d", [$v])
+  if $r[0].d == nil then
+    return nil
+  end
+  return "" .. $r[0].d
+end
+
+-- One invoice + its customer's live fields (c_* aliases) — the $inv shape every
+-- render below (incl. biz_invoice_doc_html) takes. nil when absent.
+function inv_get($id)
+  $r = db_query("SELECT i.*, c.name AS c_name, c.company AS c_company, c.email AS c_email,
+                 c.address1 AS c_address1, c.address2 AS c_address2, c.city AS c_city,
+                 c.state AS c_state, c.postcode AS c_postcode, c.country AS c_country
+                 FROM invoices i JOIN customers c ON c.id = i.customer_id
+                 WHERE i.id = ?1", [$id])
+  if length($r) == 1 then
+    return $r[0]
+  end
+  return nil
+end
+
+function inv_items($invoice_id)
+  return db_query("SELECT id, service_id, domain_id, description, amount_cents,
+                   period_start, period_end FROM invoice_items
+                   WHERE invoice_id = ?1 ORDER BY id", [$invoice_id])
+end
+
+-- payments minus refunds ledgered against this invoice (biz_apply_payment's own sum).
+function inv_paid_sum($invoice_id)
+  $r = db_query("SELECT COALESCE(SUM(CASE kind WHEN 'payment' THEN amount_cents
+                 WHEN 'refund' THEN -amount_cents ELSE 0 END), 0) AS paid
+                 FROM transactions WHERE invoice_id = ?1", [$invoice_id])
+  return to_number($r[0].paid)
+end
+
+function inv_outstanding($inv)
+  $o = to_number($inv["total_cents"]) - inv_paid_sum($inv["id"])
+  if $o < 0 then
+    return 0
+  end
+  return $o
+end
+
+-- Legacy mutation guard: nil = allowed, else the refusal reason. The 25 imported
+-- OPEN invoices stay payable; every other legacy row is a read-only archive.
+function inv_legacy_block($inv)
+  if to_number($inv["legacy"]) == 1 and ("" .. $inv["status"]) != "open" then
+    return "Imported from WHMCS — read-only."
+  end
+  return nil
+end
+
+-- ─────────────────────────────── the invoice document ───────────────────────────────
+
+-- Live bill-to preview for a DRAFT (same assembly as biz_issue_invoice's snapshot).
+function inv_bill_to_live($inv)
+  $bill = "" .. $inv["c_name"]
+  if ("" .. $inv["c_company"]) != "" then
+    $bill = $bill .. "\n" .. $inv["c_company"]
+  end
+  if ("" .. $inv["c_address1"]) != "" then
+    $bill = $bill .. "\n" .. $inv["c_address1"]
+  end
+  if ("" .. $inv["c_address2"]) != "" then
+    $bill = $bill .. "\n" .. $inv["c_address2"]
+  end
+  $line3 = strip(("" .. $inv["c_city"]) .. " " .. ("" .. $inv["c_state"]) .. " " .. ("" .. $inv["c_postcode"]))
+  if $line3 != "" then
+    $bill = $bill .. "\n" .. $line3
+  end
+  if ("" .. $inv["c_country"]) != "" then
+    $bill = $bill .. "\n" .. $inv["c_country"]
+  end
+  return $bill
+end
+
+-- The SSR invoice DOCUMENT — standalone so the P2 public token route reuses it verbatim.
+-- $inv = inv_get() shape (invoices.* + c_* customer columns); $items = inv_items() rows.
+-- Callers include datatable.mix (dt_badge) + biz.mix. No admin controls in here.
+-- D1: the title is "Invoice", never "Tax Invoice"; no tax line while
+-- seller_gst_registered == "0". Bank details render for OPEN invoices only.
+function biz_invoice_doc_html($inv, $items)
+  $id = "" .. $inv["id"]
+  $status = "" .. $inv["status"]
+  $si = inv_status_info($inv)
+  $h = '<div class="card inv-doc">'
+  $h = $h .. '<div class="inv-doc-head"><h2>Invoice INV-' .. esc($id) .. '</h2>' .. dt_badge($si["text"], $si["variant"], "") .. '</div>'
+
+  -- parties: fixed seller block + frozen bill_to snapshot (live preview for drafts)
+  $h = $h .. '<div class="inv-parties">'
+  $h = $h .. '<div class="inv-party"><h3>From</h3><p>' .. biz_seller_html() .. '</p></div>'
+  $bill = "" .. fm_or($inv["bill_to"], "")
+  $note = ""
+  if $status == "draft" or $bill == "" then
+    $bill = inv_bill_to_live($inv)
+    $note = ' <span class="muted">(preview)</span>'
+  end
+  $h = $h .. '<div class="inv-party"><h3>Bill to' .. $note .. '</h3><p>' .. inv_nl2br($bill) .. '</p></div>'
+  $h = $h .. '</div>'
+
+  -- dates (each shown only when set)
+  $h = $h .. '<div class="inv-dates">'
+  if ("" .. fm_or($inv["issued"], "")) != "" then
+    $h = $h .. '<span class="inv-date"><strong>Issued</strong> ' .. esc("" .. $inv["issued"]) .. '</span>'
+  end
+  if ("" .. fm_or($inv["due"], "")) != "" then
+    $h = $h .. '<span class="inv-date"><strong>Due</strong> ' .. esc("" .. $inv["due"]) .. '</span>'
+  end
+  if ("" .. fm_or($inv["paid_at"], "")) != "" then
+    $h = $h .. '<span class="inv-date"><strong>Paid</strong> ' .. esc("" .. $inv["paid_at"]) .. '</span>'
+  end
+  $h = $h .. '</div>'
+
+  -- items
+  $h = $h .. '<table class="inv-table inv-items"><thead><tr><th>Description</th><th>Period</th><th class="inv-amount">Amount</th></tr></thead><tbody>'
+  if length($items) == 0 then
+    $h = $h .. '<tr><td colspan="3" class="muted">No lines yet.</td></tr>'
+  end
+  for each $it in $items
+    $period = ""
+    $ps = "" .. fm_or($it["period_start"], "")
+    $pe = "" .. fm_or($it["period_end"], "")
+    if $ps != "" then
+      $period = esc($ps)
+      if $pe != "" then
+        $period = $period .. " → " .. esc($pe)
+      end
+    end
+    $h = $h .. '<tr><td>' .. esc("" .. $it["description"]) .. '</td><td>' .. $period .. '</td><td class="inv-amount">' .. fmt_aud($it["amount_cents"]) .. '</td></tr>'
+  end
+  $h = $h .. '</tbody></table>'
+
+  -- totals (D1: no tax line while unregistered)
+  $credit = to_number($inv["credit_cents"])
+  $h = $h .. '<table class="inv-totals"><tbody>'
+  $h = $h .. '<tr><td>Subtotal</td><td class="inv-amount">' .. fmt_aud($inv["subtotal_cents"]) .. '</td></tr>'
+  if biz_setting("seller_gst_registered") != "0" then
+    $taxlab = "" .. fm_or($inv["tax_label"], "")
+    if $taxlab == "" then
+      $taxlab = "GST"
+    end
+    $h = $h .. '<tr><td>' .. esc($taxlab) .. '</td><td class="inv-amount">' .. fmt_aud($inv["tax_cents"]) .. '</td></tr>'
+  end
+  if $credit > 0 then
+    $h = $h .. '<tr><td>Credit applied</td><td class="inv-amount">-' .. fmt_aud($credit) .. '</td></tr>'
+  end
+  $h = $h .. '<tr class="inv-total"><td><strong>TOTAL</strong></td><td class="inv-amount"><strong>' .. fmt_aud($inv["total_cents"]) .. '</strong></td></tr>'
+  $h = $h .. '</tbody></table>'
+
+  -- bank details (open only), "<number>" → this invoice's id — replaced BEFORE esc
+  if $status == "open" then
+    $bank = biz_setting("bank_details")
+    if $bank != "" then
+      $h = $h .. '<div class="inv-bank"><h3>Payment</h3><p>' .. inv_nl2br(replace($bank, "<number>", $id)) .. '</p></div>'
+    end
+  end
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- Transactions ledger under the document (admin view only, not part of the doc).
+function inv_txns_html($invoice_id)
+  $rows = db_query("SELECT at, gateway, txn_ref, kind, amount_cents FROM transactions
+                    WHERE invoice_id = ?1 ORDER BY at, id", [$invoice_id])
+  if length($rows) == 0 then
+    return ""
+  end
+  $h = '<div class="card inv-txns"><h3>Transactions</h3><table class="inv-table"><thead><tr><th>At</th><th>Gateway</th><th>Reference</th><th>Kind</th><th class="inv-amount">Amount</th></tr></thead><tbody>'
+  for each $t in $rows
+    $h = $h .. '<tr><td>' .. esc("" .. fm_or($t["at"], "")) .. '</td><td>' .. esc("" .. $t["gateway"]) .. '</td><td>' .. esc("" .. fm_or($t["txn_ref"], "")) .. '</td><td>' .. esc("" .. $t["kind"]) .. '</td><td class="inv-amount">' .. fmt_aud($t["amount_cents"]) .. '</td></tr>'
+  end
+  $h = $h .. '</tbody></table></div>'
+  return $h
+end
+
+-- ─────────────────────────────── admin action bars ───────────────────────────────
+
+-- Draft bar: line remove table, add-line form (service/domain selects scoped to the
+-- invoice's customer), apply-credit (when the customer has any), issue, cancel.
+function inv_draft_bar($inv, $items)
+  $id = "" .. $inv["id"]
+  $cid = $inv["customer_id"]
+  $h = '<div class="forms-skin inv-admin">'
+
+  -- existing lines with per-row Remove (the doc below is the customer-facing preview)
+  if length($items) > 0 then
+    $h = $h .. '<table class="inv-table inv-lines"><tbody>'
+    for each $it in $items
+      $h = $h .. '<tr><td>' .. esc("" .. $it["description"]) .. '</td><td class="inv-amount">' .. fmt_aud($it["amount_cents"]) .. '</td><td>' .. fm_mini_form("/biz/invoices", { action: "item_del", id: "" .. $id, item_id: "" .. $it["id"] }, "Remove", {}) .. '</td></tr>'
+    end
+    $h = $h .. '</tbody></table>'
+  end
+
+  -- add line
+  $svcopts = [{ value: "", "label": "— none —" }]
+  for each $s in db_query("SELECT id, label FROM services WHERE customer_id = ?1 ORDER BY id", [$cid])
+    push($svcopts, { value: "" .. $s["id"], "label": "#" .. $s["id"] .. " " .. $s["label"] })
+  end
+  $domopts = [{ value: "", "label": "— none —" }]
+  for each $d in db_query("SELECT id, domain FROM domains WHERE customer_id = ?1 ORDER BY domain", [$cid])
+    push($domopts, { value: "" .. $d["id"], "label": "" .. $d["domain"] })
+  end
+  $fields = fm_text("description", "Description", { required: true })
+  $fields = $fields .. fm_number("amount", "Amount (AUD)", { required: true, step: "0.01" })
+  $fields = $fields .. fm_select("service_id", "Service", $svcopts, {})
+  $fields = $fields .. fm_select("domain_id", "Domain", $domopts, {})
+  $fields = $fields .. fm_date("period_start", "Period start", {})
+  $fields = $fields .. fm_date("period_end", "Period end", {})
+  $h = $h .. fm_open("/biz/invoices", { id: "inv-item-add" })
+  $h = $h .. fm_hidden("action", "item_add") .. fm_hidden("id", $id)
+  $h = $h .. fm_section("Add line", { cols: 3 }, $fields)
+  $h = $h .. fm_actions({ submit: "Add line" })
+  $h = $h .. fm_close()
+
+  -- apply credit (capped server-side to the customer's balance, then to subtotal)
+  $avail = credit_balance($cid)
+  if $avail > 0 or to_number($inv["credit_cents"]) > 0 then
+    $pre = $avail
+    if to_number($inv["subtotal_cents"]) < $pre then
+      $pre = to_number($inv["subtotal_cents"])
+    end
+    $h = $h .. fm_open("/biz/invoices", { id: "inv-credit" })
+    $h = $h .. fm_hidden("action", "apply_credit") .. fm_hidden("id", $id)
+    $h = $h .. fm_section("Apply credit", { cols: 3 }, fm_number("credit", "Credit (AUD)", { value: inv_cents_to_dollars($pre), step: "0.01", required: true, help: "Available: " .. fmt_aud($avail) .. " — 0 clears" }))
+    $h = $h .. fm_actions({ submit: "Apply credit" })
+    $h = $h .. fm_close()
+  end
+
+  -- issue
+  $h = $h .. fm_open("/biz/invoices", { id: "inv-issue" })
+  $h = $h .. fm_hidden("action", "issue") .. fm_hidden("id", $id)
+  $h = $h .. fm_section("Issue", { cols: 3 }, fm_date("due", "Due date", { value: biz_date_add(biz_today(), "+14 days"), required: true }))
+  $h = $h .. fm_actions({ submit: "Issue invoice" })
+  $h = $h .. fm_close()
+
+  -- cancel draft
+  $h = $h .. fm_open("/biz/invoices", { confirm: "Cancel this draft? This cannot be undone." })
+  $h = $h .. fm_hidden("action", "cancel") .. fm_hidden("id", $id)
+  $h = $h .. '<button type="submit" class="btn btn-ghost">Cancel draft</button>'
+  $h = $h .. fm_close()
+
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- Open bar: record a manual payment (amount prefills the outstanding balance) + cancel.
+function inv_open_bar($inv)
+  $id = "" .. $inv["id"]
+  $out = inv_outstanding($inv)
+  $gws = [{ value: "bank", "label": "bank" }, { value: "manual", "label": "manual" }, { value: "stripe", "label": "stripe" }, { value: "paypal", "label": "paypal" }]
+  $fields = fm_select("gateway", "Gateway", $gws, { value: "bank" })
+  $fields = $fields .. fm_text("reference", "Reference", { required: true, help: "Bank/gateway reference — required; a reused reference is rejected as a duplicate.", help_tip: true })
+  $fields = $fields .. fm_number("amount", "Amount (AUD)", { value: inv_cents_to_dollars($out), step: "0.01", required: true, help: "Outstanding: " .. fmt_aud($out) })
+  $h = '<div class="forms-skin inv-admin">'
+  $h = $h .. fm_open("/biz/invoices", { id: "inv-pay" })
+  $h = $h .. fm_hidden("action", "pay") .. fm_hidden("id", $id)
+  $h = $h .. fm_section("Record payment", { cols: 3 }, $fields)
+  $h = $h .. fm_actions({ submit: "Record payment" })
+  $h = $h .. fm_close()
+  $h = $h .. fm_open("/biz/invoices", { confirm: "Cancel this invoice? This cannot be undone." })
+  $h = $h .. fm_hidden("action", "cancel") .. fm_hidden("id", $id)
+  $h = $h .. '<button type="submit" class="btn btn-ghost">Cancel invoice</button>'
+  $h = $h .. fm_close()
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- ─────────────────────────────── POST actions (all PRG) ───────────────────────────────
+
+function inv_post_create($f, $user)
+  $cid = to_number(fm_or($f["customer_id"], ""))
+  if $cid == nil then
+    return redirect_flash("/biz/invoices?new=1", "Pick a customer first.", "danger")
+  end
+  -- write fence: customer revalidated inside the tx (racing delete, FKs off).
+  try
+    db_exec("BEGIN IMMEDIATE")
+    if not biz_row_exists("customers", $cid) then
+      db_exec("ROLLBACK")
+      return redirect_flash("/biz/invoices?new=1", "No such customer.", "danger")
+    end
+    db_exec("INSERT INTO invoices (customer_id, status, created, updated) VALUES (?1, 'draft', ?2, ?2)", [$cid, biz_now()])
+    $r = db_query("SELECT last_insert_rowid() AS id")
+    $nid = to_number($r[0].id)
+    biz_audit($user["username"], "create_draft", "invoices", $nid, "customer " .. $cid)
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return redirect_flash("/biz/invoices?new=1", "Create failed — try again.", "danger")
+  end
+  return redirect_flash("/biz/invoices?view=" .. $nid, "Draft INV-" .. $nid .. " created", "success")
+end
+
+function inv_post_item_add($f, $inv, $user, $back)
+  $desc = trim("" .. fm_or($f["description"], ""))
+  if $desc == "" then
+    return redirect_flash($back, "A line description is required.", "danger")
+  end
+  $cents = inv_parse_dollars($f["amount"])
+  if $cents == nil or $cents == 0 then
+    return redirect_flash($back, "Bad line amount.", "danger")
+  end
+  -- optional service/domain, verified to belong to THIS invoice's customer
+  $svc = nil
+  if ("" .. fm_or($f["service_id"], "")) != "" then
+    $svc = to_number($f["service_id"])
+    $own = db_query("SELECT id FROM services WHERE id = ?1 AND customer_id = ?2", [$svc, $inv["customer_id"]])
+    if length($own) == 0 then
+      return redirect_flash($back, "That service does not belong to this customer.", "danger")
+    end
+  end
+  $dom = nil
+  if ("" .. fm_or($f["domain_id"], "")) != "" then
+    $dom = to_number($f["domain_id"])
+    $own = db_query("SELECT id FROM domains WHERE id = ?1 AND customer_id = ?2", [$dom, $inv["customer_id"]])
+    if length($own) == 0 then
+      return redirect_flash($back, "That domain does not belong to this customer.", "danger")
+    end
+  end
+  -- draft + parent re-checks live IN the statement (single-statement atomicity — no
+  -- tx needed): a raced issue/cancel OR a raced service/domain delete makes this a
+  -- no-op instead of an orphan invoice_items reference (FKs are off).
+  db_exec("INSERT INTO invoice_items (invoice_id, service_id, domain_id, description, amount_cents, period_start, period_end)
+           SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+           WHERE EXISTS (SELECT 1 FROM invoices WHERE id = ?1 AND status = 'draft')
+             AND (?2 IS NULL OR EXISTS (SELECT 1 FROM services WHERE id = ?2 AND customer_id = ?8))
+             AND (?3 IS NULL OR EXISTS (SELECT 1 FROM domains WHERE id = ?3 AND customer_id = ?8))",
+          [$inv["id"], $svc, $dom, $desc, $cents, inv_date_or_nil($f["period_start"]), inv_date_or_nil($f["period_end"]), $inv["customer_id"]])
+  $ch = db_query("SELECT changes() AS n")
+  if to_number($ch[0].n) == 0 then
+    return redirect_flash($back, "Line not added — the invoice is no longer a draft, or the service/domain was just deleted.", "danger")
+  end
+  biz_recompute_draft($inv["id"])
+  biz_audit($user["username"], "item_add", "invoices", $inv["id"], $desc .. " " .. fmt_aud($cents))
+  return redirect_flash($back, "Line added", "success")
+end
+
+function inv_post_item_del($f, $inv, $user, $back)
+  $iid = to_number(fm_or($f["item_id"], ""))
+  if $iid == nil then
+    return redirect_flash($back, "Missing line id.", "danger")
+  end
+  db_exec("DELETE FROM invoice_items WHERE id = ?1 AND invoice_id = ?2
+           AND EXISTS (SELECT 1 FROM invoices WHERE id = ?2 AND status = 'draft')", [$iid, $inv["id"]])
+  $ch = db_query("SELECT changes() AS n")
+  if to_number($ch[0].n) == 0 then
+    return redirect_flash($back, "Line not found (or not a draft).", "danger")
+  end
+  biz_recompute_draft($inv["id"])
+  biz_audit($user["username"], "item_del", "invoices", $inv["id"], "item " .. $iid)
+  return redirect_flash($back, "Line removed", "success")
+end
+
+function inv_post_apply_credit($f, $inv, $user, $back)
+  $cents = inv_parse_dollars($f["credit"])
+  if $cents == nil or $cents < 0 then
+    return redirect_flash($back, "Bad credit amount.", "danger")
+  end
+  $avail = credit_balance($inv["customer_id"])
+  if $cents > $avail then
+    $cents = $avail
+  end
+  -- one statement keeps the total CHECK identity intact; MIN caps against the
+  -- current subtotal, then biz_recompute_draft re-writes canonically.
+  db_exec("UPDATE invoices SET credit_cents = MIN(?2, subtotal_cents + tax_cents),
+           total_cents = subtotal_cents + tax_cents - MIN(?2, subtotal_cents + tax_cents),
+           updated = ?3 WHERE id = ?1 AND status = 'draft'", [$inv["id"], $cents, biz_now()])
+  $ch = db_query("SELECT changes() AS n")
+  if to_number($ch[0].n) == 0 then
+    return redirect_flash($back, "Not a draft — credit unchanged.", "danger")
+  end
+  biz_recompute_draft($inv["id"])
+  biz_audit($user["username"], "apply_credit", "invoices", $inv["id"], fmt_aud($cents))
+  return redirect_flash($back, "Credit applied", "success")
+end
+
+function inv_post_issue($f, $inv, $user, $back)
+  $due = inv_date_or_nil($f["due"])
+  if $due == nil then
+    $due = biz_date_add(biz_today(), "+14 days")
+  end
+  $r = biz_issue_invoice($inv["id"], $due, $user["username"])
+  if not $r["ok"] then
+    return redirect_flash($back, "Issue failed: " .. $r["error"], "danger")
+  end
+  return redirect_flash($back, "Invoice issued — due " .. $due, "success")
+end
+
+function inv_post_cancel($f, $inv, $user, $back)
+  $r = biz_cancel_invoice($inv["id"], $user["username"], "admin cancel via /biz/invoices")
+  if not $r["ok"] then
+    return redirect_flash($back, "Cancel failed: " .. $r["error"], "danger")
+  end
+  return redirect_flash($back, "Invoice cancelled", "success")
+end
+
+function inv_post_pay($f, $inv, $user, $back)
+  $gw = "" .. fm_or($f["gateway"], "")
+  if not ($gw == "bank" or $gw == "manual" or $gw == "stripe" or $gw == "paypal") then
+    return redirect_flash($back, "Bad gateway.", "danger")
+  end
+  -- charge-reservation fence: a live 'created' gateway attempt means the
+  -- customer may be mid-checkout at the FULL invoice total — recording a
+  -- manual payment now could end in a double charge (the gateway leg would
+  -- land as a loud late/overpayment, but prevention beats reconciliation).
+  -- Attempts older than 24h are stale (checkout sessions and PayPal orders
+  -- have long lapsed) and don't block.
+  $live = db_query("SELECT gateway FROM payment_attempts WHERE invoice_id = ?1
+                    AND status = 'created' AND updated > ?2 LIMIT 1",
+                   [$inv["id"], biz_now_ago(86400)])
+  if length($live) > 0 then
+    return redirect_flash($back, "A live " .. $live[0].gateway .. " payment attempt exists — the customer may be mid-checkout. Record this payment after it resolves or expires (within 24h).", "warning")
+  end
+  $ref = trim("" .. fm_or($f["reference"], ""))
+  -- blank references bypass the (gateway, txn_ref) dedupe index — biz_apply_payment
+  -- refuses them too; this is the friendly-message layer (Codex P0 review).
+  if $ref == "" then
+    return redirect_flash($back, "A payment reference is required (bank/gateway id — it is the double-entry guard).", "danger")
+  end
+  $cents = inv_parse_dollars($f["amount"])
+  if $cents == nil or $cents <= 0 then
+    return redirect_flash($back, "Bad payment amount.", "danger")
+  end
+  $r = biz_apply_payment($inv["id"], $gw, $ref, $cents, 0, "manual entry", $user["username"])
+  if $r["duplicate"] then
+    return redirect_flash($back, "Duplicate reference — that payment was already recorded.", "warning")
+  end
+  if not $r["ok"] then
+    return redirect_flash($back, "Payment failed: " .. $r["error"], "danger")
+  end
+  if $r["flipped"] then
+    return redirect_flash($back, "Payment recorded — invoice paid in full", "success")
+  end
+  $left = to_number($inv["total_cents"]) - inv_paid_sum($inv["id"])
+  if $left < 0 then
+    $left = 0
+  end
+  return redirect_flash($back, "Partial payment recorded — " .. fmt_aud($left) .. " outstanding", "success")
+end
+
+-- POST dispatcher: create needs no invoice; everything else loads it, then the
+-- legacy guard runs BEFORE any branch (draft-only guards also live in each SQL).
+function inv_post($user)
+  $f = parse_form($BODY)
+  $action = "" .. fm_or($f["action"], "")
+  if $action == "create" then
+    return inv_post_create($f, $user)
+  end
+  $id = to_number(fm_or($f["id"], ""))
+  if $id == nil then
+    return redirect_flash("/biz/invoices", "Missing invoice id.", "danger")
+  end
+  $inv = inv_get($id)
+  if $inv == nil then
+    return redirect_flash("/biz/invoices", "No such invoice.", "danger")
+  end
+  $back = "/biz/invoices?view=" .. $id
+  $block = inv_legacy_block($inv)
+  if $block != nil then
+    return redirect_flash($back, $block, "danger")
+  end
+  if $action == "item_add" then
+    return inv_post_item_add($f, $inv, $user, $back)
+  end
+  if $action == "item_del" then
+    return inv_post_item_del($f, $inv, $user, $back)
+  end
+  if $action == "apply_credit" then
+    return inv_post_apply_credit($f, $inv, $user, $back)
+  end
+  if $action == "issue" then
+    return inv_post_issue($f, $inv, $user, $back)
+  end
+  if $action == "cancel" then
+    return inv_post_cancel($f, $inv, $user, $back)
+  end
+  if $action == "pay" then
+    return inv_post_pay($f, $inv, $user, $back)
+  end
+  return redirect_flash($back, "Unknown action.", "danger")
+end
+
+-- ─────────────────────────────── GET views ───────────────────────────────
+
+-- ?new=1 — minimal customer picker; action=create makes the draft and lands on ?view=.
+function inv_new_page()
+  $opts = []
+  for each $c in db_query("SELECT id, name, company FROM customers WHERE status != 'closed' ORDER BY name")
+    $lab = "" .. $c["name"]
+    if ("" .. $c["company"]) != "" then
+      $lab = $lab .. " — " .. $c["company"]
+    end
+    push($opts, { value: "" .. $c["id"], "label": $lab })
+  end
+  $fields = fm_hidden("action", "create")
+  $fields = $fields .. fm_select("customer_id", "Customer", $opts, { required: true, placeholder: "Select a customer…" })
+  $h = '<div class="cms-head"><h1>New invoice</h1><a class="navlink" href="/biz/invoices">← All invoices</a></div>'
+  return $h .. fm_form({ mode: "canvas", action: "/biz/invoices", id: "inv-new",
+                         fields: fm_grid({ cols: 1 }, $fields),
+                         submit: { "label": "Create draft" },
+                         cancel: { "label": "Cancel", href: "/biz/invoices" }, error: "" })
+end
+
+-- ?view=<id> — legacy banner, status-matched admin bar, the document, the ledger.
+function inv_view_page($user, $rawid)
+  $id = to_number($rawid)
+  $inv = nil
+  if $id != nil then
+    $inv = inv_get($id)
+  end
+  if $inv == nil then
+    return doc(404, "Invoices", $user, '<div class="card cms-card-narrow"><h1>Invoice not found</h1><p class="muted"><a href="/biz/invoices">← All invoices</a></p></div>')
+  end
+  $items = inv_items($id)
+  $status = "" .. $inv["status"]
+  $head = '<div class="cms-head"><h1>Invoice INV-' .. esc("" .. $id) .. '</h1><a class="navlink" href="/biz/invoices">← All invoices</a></div>'
+  $banner = ""
+  if to_number($inv["legacy"]) == 1 then
+    $msg = "Imported from WHMCS — read-only."
+    if $status == "open" then
+      $msg = "Imported from WHMCS — payable; other edits are locked."
+    end
+    $banner = '<div class="forms-skin">' .. fm_flash($msg, "info") .. '</div>'
+  end
+  $bar = ""
+  if inv_legacy_block($inv) == nil then
+    if $status == "draft" then
+      $bar = inv_draft_bar($inv, $items)
+    end
+    if $status == "open" then
+      $bar = inv_open_bar($inv)
+    end
+  end
+  return doc(200, "Invoice INV-" .. $id, $user, $head .. $banner .. $bar .. biz_invoice_doc_html($inv, $items) .. inv_txns_html($id))
+end
+
+-- ─────────────────────────────── entry point ───────────────────────────────
+
+function biz_invoices_main()
+cms_init()
+biz_init()
+$user = current_user($HEADERS)
+-- a modal fetch on an expired session gets a clean fragment (mirrors h_admin_users)
+if md_is_modal_request() and $user == nil then
+  return md_session_expired("/biz/invoices")
+end
+$deny = require_role($user, "admin")
+if $deny != nil then
+  return $deny
+end
+
+if $METHOD == "POST" then
+  return inv_post($user)
+end
+
+$q = parse_query($QUERY)
+if $q["new"] != nil then
+  return doc(200, "New invoice", $user, inv_new_page())
+end
+if $q["view"] != nil then
+  return inv_view_page($user, $q["view"])
+end
+
+-- list — the admin panel Foundation + filtered SUM(total_cents) footer
+$cfg = inv_list_config()
+return dt_admin_list({ title: "Invoices", user: $user, spec: $cfg["spec"], opts: $cfg["opts"],
+  table: "invoices", select: "id, customer_id, status, issued, due, total_cents, legacy",
+  summary: true, modal: false })
+
+end
+
+-- helper cells (single-expression lambdas call these)
+function inv_cust_cell($names, $r)
+  $cid = "" .. $r["customer_id"]
+  $name = $names[$cid]
+  if $name == nil then
+    $name = "#" .. $cid
+  end
+  return '<a href="/biz/customers?view=' .. url_encode($cid) .. '">' .. esc("" .. $name) .. '</a>'
+end
+
+function inv_legacy_cell($r)
+  if to_number($r["legacy"]) == 1 then
+    return dt_badge("archive", "gray", "")
+  end
+  return ""
+end
+
+-- The list datatable config (spec + opts). Customer names are prefetched ONCE into a
+-- map the cell lambda closes over (dt_sql is single-table). Search is id-only ("INV-"
+-- prefix aside, the number IS the reference); the total column sums via dt_sql_summary.
+function inv_list_config()
+  $names = {}
+  for each $c in db_query("SELECT id, name FROM customers")
+    $names["" .. $c["id"]] = "" .. $c["name"]
+  end
+  $inv_cell = fn($r) = "INV-" .. esc("" .. $r["id"])
+  $cust_cell = fn($r) = inv_cust_cell($names, $r)
+  $status_badge = fn($r) = inv_status_info($r)
+  $aud = fn($v) = fmt_aud($v)
+  $legacy_cell = fn($r) = inv_legacy_cell($r)
+  $rowhref = fn($r) = "/biz/invoices?view=" .. url_encode("" .. $r["id"])
+  $act_view = dt_action("view", { "label": "View", icon: "eye", variant: "action", href: $rowhref })
+  $spec = [
+    dt_col("id", "Invoice", "id", { sortable: true, searchable: true, render: $inv_cell }),
+    dt_col("customer", "Customer", "customer_id", { render: $cust_cell }),
+    dt_col("status", "Status", "status", { sortable: true, badge: $status_badge }),
+    dt_col("issued", "Issued", "issued", { sortable: true }),
+    dt_col("due", "Due", "due", { sortable: true }),
+    dt_col("total", "Total", "total_cents", { sortable: true, fmt: $aud, align: "right", summarize: "sum", summary_fmt: $aud }),
+    dt_col("legacy", "", "legacy", { render: $legacy_cell })
+  ]
+  $opts = dt_admin_opts({
+    base_route: "/biz/invoices", caption: "Invoices", noun: "invoices",
+    default_sort: "id", default_dir: "desc",
+    search_placeholder: "Search invoice #…",
+    row_href: $rowhref, row_action_specs: [$act_view],
+    -- invoices are IMMUTABLE billing history: no bulk selection, no deletes
+    -- (select_all requires bulk, so both come off together).
+    bulk: false, select_all: false,
+    filters: [
+      dt_filter("status", "Status", { options: [
+        { value: "draft", "label": "Draft", col: "status", op: "=" },
+        { value: "open", "label": "Open", col: "status", op: "=" },
+        { value: "paid", "label": "Paid", col: "status", op: "=" },
+        { value: "cancelled", "label": "Cancelled", col: "status", op: "=" }
+      ] }),
+      dt_filter("legacy", "Legacy", { kind: "ternary",
+        when_true: { col: "legacy", op: "=", bind: "1" },
+        when_false: { col: "legacy", op: "=", bind: "0" },
+        true_label: "Archive", false_label: "Current" })
+    ],
+    header_actions: [{ "label": "New invoice", icon: "plus", variant: "primary", href: "/biz/invoices?new=1" }]
+  })
+  return { spec: $spec, opts: $opts }
+end

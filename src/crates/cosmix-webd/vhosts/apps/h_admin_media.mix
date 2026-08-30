@@ -1,0 +1,282 @@
+-- admin_media.mix — image library (GET /admin/media: gallery + upload UI).
+--
+-- New uploads are stored as REAL FILES on disk: the client FileReader turns
+-- the picked file into a base64 data URL, JS fills hidden data/mime/filename
+-- fields, and the form POSTs urlencoded to the native webd route
+-- `/admin/media/upload`, which validates by magic bytes and writes
+-- public/img/<YYYY>/<MM>/<hash>.<ext> (Mix handlers can't write files —
+-- FsWrite is denied — so webd does it). Delete posts to `/admin/media/delete`
+-- (webd unlinks the file + row). ServeDir serves the bytes from /img/…
+--
+-- The legacy INLINE path below (base64 stored in `media.data`, served by
+-- media.mix) is RETAINED for small/inline images and similar uses: it still
+-- works if something POSTs action=upload/delete to /admin/media directly,
+-- but the gallery's own forms now target the native disk routes.
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+
+-- ── media render helpers (shared by the list + card views) ──────────────────
+-- media_url($m) (a row's public /img/… or /media/<id> URL) moved to lib.mix so the
+-- post-editor cover picker (h_admin_posts) can share it.
+-- Human-readable size via the built-in format_bytes: 1-decimal, auto B/KB/MB
+-- (72388 → "70.7 KB" instead of "70.69140625 KB").
+function media_size_label($bytes)
+  return format_bytes(to_number("" .. dt_or($bytes, 0)))
+end
+-- "image/png" → "png" (subtype only). pos() is 1-based = the 0-based index of the
+-- char after "/", so substr from there gives the subtype.
+function media_type_label($mime)
+  $m = "" .. dt_or($mime, "")
+  $p = pos("/", $m)
+  if $p > 0 then
+    return substr($m, $p, length($m) - $p)
+  end
+  return $m
+end
+
+-- list ⇄ card view toggle. The view rides the datatable's preserved `box` param
+-- (box=card → cards; empty → the list datatable), so search/sort/page/size keep it
+-- automatically. dt_href preserves the rest of the view state. Seed of a generic
+-- file-manager view switcher.
+function media_view_toggle($opts, $state)
+  $route = $opts["base_route"]
+  $card = ("" .. dt_or($state["box"], "")) == "card"
+  $hl = dt_href($route, { sort: $state["sort"], dir: $state["dir"], q: $state["q"], size: $state["size"], box: "" }, $opts)
+  $hc = dt_href($route, { sort: $state["sort"], dir: $state["dir"], q: $state["q"], size: $state["size"], box: "card" }, $opts)
+  $lc = "dt-iconbtn"
+  $cc = "dt-iconbtn"
+  if $card then
+    $cc = "dt-iconbtn dt-view-active"
+  else
+    $lc = "dt-iconbtn dt-view-active"
+  end
+  $h = '<span class="dt-view-toggle" role="group" aria-label="View mode">'
+  $h = $h .. '<a class="' .. $lc .. '" href="' .. $hl .. '" title="List view" aria-label="List view">' .. dt_icon("list") .. '</a>'
+  $h = $h .. '<a class="' .. $cc .. '" href="' .. $hc .. '" title="Card view" aria-label="Card view">' .. dt_icon("grid") .. '</a>'
+  $h = $h .. '</span>'
+  return $h
+end
+
+-- CARD view: the shared compact header (title + search + view-toggle) over the image
+-- tile grid + the skinned footer — flat, like the list view (no .dt-surface box now).
+function media_card_view($spec, $opts, $state, $rows, $total)
+  $h = '<div class="dt-card">'
+  $h = $h .. dt_compact_header($spec, $opts, $state, $total)
+  $h = $h .. '<div id="dt-results">'
+  if length($rows) == 0 then
+    $emsg = "No images yet."
+    if $state["q"] != "" then
+      $emsg = "No images match “" .. esc($state["q"]) .. "”."
+    end
+    if $total > 0 then
+      $emsg = 'Nothing on this page. <a href="/admin/media?box=card">Back to the start</a>.'
+    end
+    $h = $h .. '<p class="muted media-empty">' .. $emsg .. '</p>'
+  else
+    -- the card grid. Each tile is a RIGHT-CLICK target carrying the SAME generated
+    -- row-action menu the list rows use (View / Delete) via dt_actions_cm_bind — so a
+    -- card and a list row behave identically; no per-card <form>.
+    $h = $h .. '<div class="media-grid">'
+    for each $m in $rows
+      $url = media_url($m)
+      $cm = dt_actions_cm_bind($opts, $m)
+      $h = $h .. '<div class="card media-tile"' .. $cm .. '>'
+      $h = $h .. '<a href="' .. esc($url) .. '" target="_blank" rel="noopener"><img class="media-tile-img" src="' .. esc($url) .. '" alt="' .. esc($m["filename"]) .. '" loading="lazy"></a>'
+      $h = $h .. '<div class="small media-tile-name">' .. esc($m["filename"]) .. '</div>'
+      $h = $h .. '<div class="muted small">' .. media_size_label($m["bytes"]) .. '</div>'
+      $h = $h .. '<input class="small media-tile-url" readonly value="' .. esc($url) .. '" onclick="this.select()">'
+      $h = $h .. '</div>'
+    end
+    $h = $h .. '</div>'
+  end
+  if length($rows) > 0 then
+    $h = $h .. '<div class="dt-footer">' .. dt_range_label($state, $total) .. dt_size_select($opts, $state) .. dt_pager_skin($opts, $state, $total) .. '</div>'
+  end
+  $h = $h .. '</div></div>'
+  $h = $h .. dt_skin_script()
+  return $h
+end
+
+function admin_media_main()
+cms_init()
+$user = current_user($HEADERS)
+$deny = require_role($user, "author")
+if $deny != nil then
+  return $deny
+end
+
+$flash = ""
+-- Errors from the native upload route come back as ?err=<code>.
+$q = parse_query($QUERY)
+$ec = $q["err"]
+if $ec != nil then
+  if $ec == "toobig" then
+    $flash = "Image too large (max 10 MB)."
+  else
+    if $ec == "badtype" then
+      $flash = "Unsupported image type (allowed: PNG, JPEG, GIF, WebP)."
+    else
+      if $ec == "baddata" then
+        $flash = "No valid image data received."
+      else
+        if $ec == "csrf" then
+          $flash = "Request blocked (cross-origin). Please retry from the site."
+        else
+          $flash = "Upload failed (" .. esc("" .. $ec) .. ")."
+        end
+      end
+    end
+  end
+end
+-- Legacy INLINE upload (dormant — see header). Kept so the base64→SQLite code path
+-- remains for similar uses. The legacy `action=delete` branch was REMOVED: it dropped only
+-- the DB row (Mix can't unlink), so a crafted/stale POST could ORPHAN a disk file. ALL deletes
+-- now go to the native /admin/media/delete route (single id + the datatable sel_<id> bulk),
+-- which unlinks files with a refcount check. (Codex review.)
+if $METHOD == "POST" then
+  $f = parse_form($BODY)
+  $action = $f["action"]
+  -- upload
+  $data = $f["data"]
+  $mime = $f["mime"]
+  $fname = $f["filename"]
+  -- Server-side MIME allowlist. media.mix serves the stored mime back
+  -- verbatim, so without this a signed-in author could upload
+  -- mime=text/html and get executable same-origin HTML at /media/<id>
+  -- (stored XSS). Restrict to raster image types only — SVG is excluded
+  -- because it can carry script. (Codex security review.)
+  $allowed = ["image/png", "image/jpeg", "image/gif", "image/webp"]
+  $ok_mime = false
+  for each $am in $allowed
+    if $am == $mime then
+      $ok_mime = true
+    end
+  end
+  if $data == nil or $data == "" then
+    $flash = "No file data received."
+  else
+    if not $ok_mime then
+      $flash = "Unsupported image type (allowed: PNG, JPEG, GIF, WebP)."
+    else
+      if $fname == nil or $fname == "" then
+        $fname = "upload"
+      end
+      -- approx decoded size from base64 length (length() on Bytes is a
+      -- known Mix gap; base64 is 4 chars per 3 bytes).
+      $blen = byte_length($data)
+      $bytes = $blen * 3 / 4
+      db_exec("INSERT INTO media (filename, mime, data, bytes) VALUES (?1, ?2, ?3, ?4)", [$fname, $mime, $data, $bytes])
+      return redirect_flash("/admin/media", "Image uploaded", "success")
+    end
+  end
+end
+
+-- The upload form now lives in a MODAL (modals.mix) opened by the "Upload" header
+-- action (see $mopts.header_actions). The <dialog> is appended AFTER dt_region so it
+-- sits OUTSIDE the swapped region — a search/sort/page swap never re-runs its
+-- FileReader <script> — while the trigger button rides inside the region's header and
+-- just re-renders on swap. The fm-* classes are skinned by forms.css (the dialog
+-- carries `forms-skin` and stays a #content DOM descendant).
+$up_body = '<input type="hidden" name="action" value="upload">'
+$up_body = $up_body .. '<input type="hidden" name="filename" id="m_fname"><input type="hidden" name="mime" id="m_mime"><input type="hidden" name="data" id="m_data">'
+$up_body = $up_body .. '<div class="fm-field"><label class="fm-label" for="m_file">Image file</label><input class="fm-control" type="file" id="m_file" accept="image/*"><p class="fm-help">PNG, JPEG, GIF or WebP, up to 10 MB.</p></div>'
+$up_foot = '<button class="btn btn-primary" type="submit" id="m_submit" disabled>Upload</button><span class="muted small" id="m_status">Choose an image…</span><button type="button" class="btn btn-ghost" data-modal-close>Cancel</button>'
+$upload_modal = md_modal("md-upload", { title: "Upload image", subtitle: "Add an image to the library.", size: "md", form: { action: "/admin/media/upload" }, footer: $up_foot }, $up_body)
+$upload_js = '<script>(function(){var fi=document.getElementById("m_file"),btn=document.getElementById("m_submit"),st=document.getElementById("m_status");if(!fi){return}fi.onchange=function(){var f=fi.files[0];if(!f){return}var r=new FileReader();r.onload=function(){var d=r.result,c=d.indexOf(","),semi=d.indexOf(";");document.getElementById("m_mime").value=d.substring(5,semi);document.getElementById("m_data").value=d.substring(c+1);document.getElementById("m_fname").value=f.name;btn.disabled=false;st.textContent=f.name+" ("+Math.round(f.size/1024)+" KB) ready"};r.readAsDataURL(f)}})();</script>'
+$b = ''
+
+-- List + card views share ONE spec/opts/state. List = a CRUD datatable
+-- (thumb · filename · type · size · uploaded · view/delete); card = the image-tile
+-- gallery. dt_sql projects explicit columns so the base64 `data` column is never
+-- pulled into the render. Delete targets the native /admin/media/delete route
+-- (file + row) — handlers can't unlink files, so this is NOT the datatable's own
+-- action:delete (which would post to base_route + leave the disk file orphaned).
+$thumb_cell = fn($m) = '<a href="' .. esc(media_url($m)) .. '" target="_blank" rel="noopener"><img class="media-thumb" src="' .. esc(media_url($m)) .. '" alt="" loading="lazy"></a>'
+$name_cell = fn($m) = '<strong>' .. esc($m["filename"]) .. '</strong><br><span class="dt-desc">' .. esc(media_url($m)) .. '</span>'
+$type_cell = fn($m) = esc(media_type_label($m["mime"]))
+$size_cell = fn($m) = media_size_label($m["bytes"])
+$storage_cell = fn($m) = '<span class="tag">' .. esc("" .. dt_or($m["storage"], "inline")) .. '</span>'
+
+-- Row actions = a right-click menu (like Content). View opens the image; Delete posts to
+-- the NATIVE /admin/media/delete route (post_route) — NOT the datatable's action:delete to
+-- base_route, because the Mix handler is sandboxed from unlinking the disk file. {id} resolves
+-- from the bound bulk_id. The same specs drive the card-view RMB (dt_actions_cm_bind).
+$act_view = dt_action("view", { "label": "View", icon: "eye", variant: "action", href: fn($m) = media_url($m) })
+$act_del = dt_action("delete", { "label": "Delete", icon: "trash", variant: "action-danger", action: "delete", post_route: "/admin/media/delete", post_fields: { id: "{id}" }, confirm: "Delete this image? This cannot be undone." })
+$mspec = [
+  dt_col("thumb", "", "id", { render: $thumb_cell, width: "3.5rem" }),
+  dt_col("filename", "Filename", "filename", { sortable: true, searchable: true, render: $name_cell }),
+  dt_col("mime", "Type", "mime", { sortable: true, toggleable: true, render: $type_cell }),
+  dt_col("bytes", "Size", "bytes", { sortable: true, align: "right", toggleable: true, render: $size_cell }),
+  dt_col("storage", "Storage", "storage", { sortable: true, default_hidden: true, render: $storage_cell }),
+  dt_col("created", "Uploaded", "created", { sortable: true, type: "datetime" }),
+  -- updated available in the Columns menu but default-hidden (media rows aren't edited, so
+  -- updated == created — it's here for uniform parity + the default sort).
+  dt_col("updated", "Updated", "updated", { sortable: true, type: "datetime", default_hidden: true })
+]
+-- Filter funnel: by storage (disk vs legacy inline) + by image type. Group-by mirrors them.
+$mfilters = [
+  dt_filter("storage", "Storage", { options: [
+    { value: "disk", "label": "Disk file", col: "storage", op: "=" },
+    { value: "inline", "label": "Inline (legacy)", col: "storage", op: "=" }
+  ] }),
+  dt_filter("type", "Type", { options: [
+    { value: "image/webp", "label": "WebP", col: "mime", op: "=" },
+    { value: "image/png", "label": "PNG", col: "mime", op: "=" },
+    { value: "image/jpeg", "label": "JPEG", col: "mime", op: "=" },
+    { value: "image/gif", "label": "GIF", col: "mime", op: "=" }
+  ] })
+]
+$mgroups = [
+  dt_group("storage", "Storage", "storage", {}),
+  dt_group("type", "Type", "mime", {})
+]
+$mopts = dt_opts({
+  base_route: "/admin/media", caption: "Media", noun: "images",
+  default_sort: "updated", default_dir: "desc", page_size: 25,
+  page_sizes: [25, 50, 100, "all"],
+  search: true, search_placeholder: "Search filenames…",
+  skin: true, compact: true, action_labels: false,
+  filters: $mfilters, groups: $mgroups,
+  row_action_specs: [$act_view, $act_del],
+  row_actions_contextmenu: true,
+  -- multi-select + bulk delete, posting the sel_<id> selection to the native delete route
+  -- (bulk_route) so the disk files are unlinked server-side. Page-scoped (no select_all) —
+  -- the native route deletes exactly the posted ids; cross-page would need it to know the
+  -- datatable filters.
+  bulk: true, bulk_id: fn($m) = ("" .. $m["id"]), bulk_label: "Delete selected",
+  bulk_route: "/admin/media/delete",
+  header_actions: [{ "label": "Upload", icon: "plus", variant: "primary", modal: "md-upload" }]
+})
+$mstate = dt_state($QUERY, $mspec, $mopts)
+-- inject the list/card toggle into the compact header (toolbar slot) once state is known
+$mopts["toolbar"] = media_view_toggle($mopts, $mstate)
+$mres = dt_sql("media", $mspec, $mstate, "id, filename, mime, bytes, created, updated, storage, url_path")
+$mrows = $mres["rows"]
+$mtotal = $mres["total"]
+
+-- The flash rides INSIDE the region so an in-region swap clears a stale POST-error.
+$dt = ""
+if $flash != "" then
+  $dt = '<div class="flash flash-error">' .. esc($flash) .. '</div>'
+end
+if ("" .. dt_or($mstate["box"], "")) == "card" then
+  $dt = $dt .. media_card_view($mspec, $mopts, $mstate, $mrows, $mtotal)
+else
+  $dt = $dt .. dt_render($mspec, $mopts, $mstate, $mrows, $mtotal, nil)
+end
+
+if dt_wants_partial() then
+  return dt_partial($dt)
+end
+$b = $b .. dt_region($dt, "", true)
+-- the upload dialog + the once-per-page modal shim + the FileReader binder + the generated
+-- row-action (right-click) menu template — all OUTSIDE the swapped region so a partial swap
+-- never disturbs them. dt_actions_chrome also emits md_script (idempotent with the one above).
+$b = $b .. $upload_modal
+$b = $b .. md_script()
+$b = $b .. $upload_js
+$b = $b .. dt_actions_chrome($mopts)
+return doc(200, "Media", $user, $b)
+
+end

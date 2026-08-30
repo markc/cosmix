@@ -1,0 +1,33 @@
+-- is_empty.mix: contract test for is_empty() builtin
+-- Expected output:
+-- true
+-- true
+-- true
+-- true
+-- false
+-- false
+-- false
+-- false
+-- false
+-- false
+
+-- empty container cases
+print is_empty("")
+print is_empty([])
+print is_empty({})
+print is_empty(nil)
+
+-- "0" must NOT be empty (the whole point of having this as a builtin
+-- separate from `not $x`, since truthiness treats "0" as false but
+-- emptiness should not — len("0") == 1)
+print is_empty("0")
+
+-- non-empty container cases (each container variant covered so a
+-- regression that collapses one branch can't pass silently)
+print is_empty("ok")
+print is_empty([1])
+print is_empty({"a": 1})
+
+-- scalars are never "empty" (use `== 0` for numeric zero, `not $x` for bool)
+print is_empty(0)
+print is_empty(false)

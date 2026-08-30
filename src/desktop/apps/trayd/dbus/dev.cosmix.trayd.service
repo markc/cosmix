@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=dev.cosmix.trayd
+Exec=/opt/cosmix/bin/cosmix-trayd
+SystemdService=cosmix-trayd.service

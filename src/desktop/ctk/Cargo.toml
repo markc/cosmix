@@ -1,0 +1,156 @@
+# desktop/ctk — the Cosmix Tool Kit: the single shared Bevy toolkit every
+# desktop/apps/* surface builds on. Hard-pins Bevy 0.19 + AccessKit and is
+# consumed by apps over a `../../ctk` path dependency. See desktop/APPS.md.
+[package]
+name = "ctk"
+version = "0.48.1"
+description = "Cosmix Tool Kit — reusable, Bus-citizen Bevy widgets for dense desktop surfaces"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+
+[package.metadata.cosmix]
+kind = "toolkit"
+engine = "bevy"
+
+[features]
+default = ["menus"]
+# Menu bars and context menus. This remains a default feature to preserve the
+# existing CTK surface; consumers can opt out with `default-features = false`.
+menus = []
+# `bus` carries every wire codec (JSON bodies via serde_json, base64 A.6
+# frames) — the codecs live inside the Bus transport, not the pipeline.
+bus = [
+    "dep:base64",
+    "dep:cosmix-bus",
+    "dep:cosmix-buildinfo",
+    "dep:cosmix-client",
+    "dep:cosmix-config",
+    "dep:flume",
+    "dep:serde_json",
+    "dep:tokio",
+]
+# The mixer pipeline + transport seam. Deliberately does NOT require `bus`
+# (and pulls NO codec deps): the D4 fused arm links the identical board +
+# pipeline over an in-process transport with zero broker/socket/codec code in
+# the binary. Enable BOTH `mixer` and `bus` for the split arm's `BusTransport`.
+mixer = [
+    "dep:cosmix-mixer-schema",
+    "dep:serde",
+]
+# The bundled Lucide icon system (Icon catalogue, IconSet, spawn_icon, the
+# file→icon heuristic, and atomic asset install). Pulls bevy_resvg for SVG
+# rasterisation; apps enable this and never depend on bevy_resvg directly.
+icons = ["dep:bevy_resvg"]
+# Engine-facing action/menu integration. The core action crate stays optional
+# so CTK's existing widgets and menus retain their Bevy-only dependency set.
+actions = ["menus", "dep:cosmix-actions", "dep:cosmix-lib-mesh-trust"]
+# Data-driven theming: overlay a strict-data `.mix` theme file (palette +
+# metrics) on the compiled-in built-in, via cosmix-lib-config's strict-data
+# loader (the mandated format — never TOML/JSON). Without this, ThemeSpec::
+# builtin is the only theme and the built-in path pulls no deps.
+theme = ["dep:serde", "dep:cosmix-config"]
+# Native desktop drag receive. Default-off because it binds the Wayland data
+# device and pulls the SCTK/raw-handle transport into consumers that opt in.
+os-dnd = ["dep:cosmix-wl-dnd", "dep:uuid"]
+# Windowed, fixed-height list behaviour. Dependency-free and default-off so
+# applications opt into the widget surface without changing CTK's base API.
+virtual-list = []
+# Sanitised HTML message bodies. Ammonia is the maintained, battle-tested
+# html5ever allow-list sanitizer: it gives CTK explicit control over tags,
+# attributes, URL schemes and relative URLs without importing a browser or a
+# network client. The matching html5ever/RcDom pair parses the raw DOM for
+# resource inventory before cleaning and parses Ammonia's output for
+# styled-text projection. cssparser tokenises the CSS values inventoried before
+# styles are discarded, so quoted text cannot masquerade as url() and
+# image-set() string candidates are still found. All four dependencies are
+# optional and reachable solely through this default-off feature.
+body-view = [
+    "dep:ammonia",
+    "dep:cssparser",
+    "dep:html5ever",
+    "dep:markup5ever_rcdom",
+    "dep:parley",
+]
+# Native OS clipboard access for editable text. Default-off because it binds a
+# host clipboard backend; without it Bevy retains its in-process text clipboard.
+system-clipboard = ["bevy/system_clipboard"]
+
+[dependencies]
+# CTK follows Feathers rather than copying it. Keep this exact: every Bevy
+# release is a deliberate compatibility pass because the widget APIs churn.
+bevy = { version = "=0.19.0", default-features = false, features = [
+    "ui",
+    "bevy_feathers",
+    "accesskit_unix",
+    "system_font_discovery",
+] }
+accesskit = "0.24"
+# Not called directly: `system_font_discovery` reaches fontconfig through
+# Parley, and without this feature the binary carries `NEEDED
+# libfontconfig.so.1` — a host missing that library is killed by the dynamic
+# loader before `main`, which no in-process typography fallback can survive.
+# `dlopen` moves the lookup to runtime, so a missing fontconfig degrades to no
+# system fonts instead of an app that cannot start. Cargo unifies features
+# across the graph, so declaring it here applies to Parley's copy.
+fontique = { version = "0.9", default-features = false, features = [
+    "fontconfig-dlopen",
+] }
+
+ammonia = { version = "4.1.4", optional = true }
+base64 = { version = "0.22", optional = true }
+bevy_resvg = { version = "=2.4.0", optional = true }
+cosmix-config = { package = "cosmix-lib-config", path = "../../crates/cosmix-lib-config", optional = true }
+cosmix-design = { path = "../crates/cosmix-design", default-features = false }
+cosmix-actions = { path = "../../crates/cosmix-actions", optional = true }
+cosmix-app-identity = { path = "../../crates/cosmix-app-identity" }
+cosmix-lib-mesh-trust = { path = "../../crates/cosmix-lib-mesh-trust", default-features = false, optional = true }
+cosmix-bus = { package = "cosmix-lib-bus", path = "../../crates/cosmix-lib-bus", optional = true }
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../crates/cosmix-lib-buildinfo", optional = true }
+cosmix-client = { package = "cosmix-lib-client", path = "../../crates/cosmix-lib-client", optional = true }
+cosmix-mixer-schema = { path = "../../crates/cosmix-mixer-schema", optional = true }
+cosmix-wl-dnd = { path = "../crates/cosmix-wl-dnd", optional = true }
+cssparser = { version = "0.37", default-features = false, optional = true }
+flume = { version = "0.11", optional = true }
+html5ever = { version = "0.39", optional = true }
+markup5ever_rcdom = { version = "0.39", optional = true }
+# Bevy exposes its shaped `ComputedTextBlock` layout publicly but does not
+# re-export Parley. Keep this exact so cursor hit-testing and selection geometry
+# name the same Parley types as bevy_text 0.19.
+parley = { version = "=0.9.0", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"], optional = true }
+uuid = { version = "1", optional = true }
+unicode-segmentation = "1"
+zeroize = "1"
+
+[build-dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../crates/cosmix-lib-buildinfo" }
+
+[dev-dependencies]
+cosmix-design = { path = "../crates/cosmix-design", features = ["compiler"] }
+futures-util = "0.3"
+tokio-tungstenite = "0.26"
+
+[[example]]
+name = "widget_gallery"
+
+[[example]]
+name = "dnd_demo"
+
+[[example]]
+name = "virtual_list_demo"
+required-features = ["virtual-list"]
+
+[[example]]
+name = "text_area_demo"
+required-features = ["system-clipboard"]
+
+[[example]]
+name = "body_view_demo"
+required-features = ["body-view", "system-clipboard"]
+
+[[example]]
+name = "mixer_strip"
+required-features = ["mixer", "bus"]

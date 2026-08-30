@@ -1,0 +1,186 @@
+-- h_shop_admin.mix — the shop PRODUCTS panel (/biz/products), a resource/1
+-- spec (Foundation P2) interpreted by resource_main. Orders need no panel of
+-- their own: an order IS an invoice, so /biz/invoices already lists and
+-- manages them (record-payment, refunds) — Codex ruling 7.
+-- Prices are entered in CENTS (integer) — resource/1 owns no money
+-- conversion by contract, and cents is the storage truth everywhere else.
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/admin_resource.mix"
+include "/opt/cosmix/vhosts/shared/lib/resource_engine.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+include "/opt/cosmix/vhosts/shared/apps/biz.mix"
+include "/opt/cosmix/vhosts/shared/apps/shop.mix"
+
+function sp_get_one($id)
+  $r = db_query("SELECT * FROM products WHERE id = ?1", [$id])
+  if length($r) == 0 then return nil end
+  return $r[0]
+end
+
+-- Deletion policy: sold products are HISTORY (invoice_items reference them
+-- for entitlements + receipts) — refuse; unsold products cascade their
+-- ephemeral cart_items rows. Unpublish is the "retire" path for sold goods.
+function sp_del_block($id)
+  $sold = db_query("SELECT 1 AS x FROM invoice_items WHERE product_id = ?1 LIMIT 1", [$id])
+  if length($sold) > 0 then
+    return "This product has been sold — unpublish it instead of deleting (orders reference it)."
+  end
+  return ""
+end
+
+function sp_delete_cascade($id)
+  db_exec("DELETE FROM cart_items WHERE product_id = ?1", [$id])
+  db_exec("DELETE FROM products WHERE id = ?1", [$id])
+end
+
+-- Domain validation past the engine's field checks: slug shape, per-delivery
+-- payload presence, and no publishing a file product whose goods file is
+-- missing on disk (the download would 503).
+function sp_validate($vals, $f, $editid)
+  $slug = lower(trim("" .. $vals["slug"]))
+  if $slug == "" or $slug != slugify($slug) then
+    return "Slug must be lowercase letters/digits/hyphens (e.g. mix-pocket-guide)."
+  end
+  $price = to_number($vals["price_cents"])
+  if $price == nil or $price <= 0 or $price > 100000000 or $price != floor($price) then
+    return "Price must be a positive WHOLE number of cents (500 = $5.00)."
+  end
+  $delivery = "" .. $vals["delivery"]
+  if $delivery == "file" and trim("" .. $vals["file_path"]) == "" then
+    return "File delivery needs a file path (relative to the app goods/ directory)."
+  end
+  if $delivery == "text" and trim("" .. $vals["text_payload"]) == "" then
+    return "Text delivery needs a payload (the license key / content to show)."
+  end
+  if ("" .. $vals["published"]) == "1" and $delivery == "file" then
+    -- sh_goods_path canonicalises AND requires existence (nil = bad shape,
+    -- escape attempt, or missing file)
+    if sh_goods_path($vals["file_path"]) == nil then
+      return "Cannot publish: goods file not found (or path invalid) at app/goods/" .. ("" .. $vals["file_path"]) .. " — deploy it first; the path must be relative with no '..'."
+    end
+  end
+  return ""
+end
+
+-- canonicalize slug + stamp file metadata (size + sha256) at save time so the
+-- catalogue and download paths never stat/hash at request time.
+function sp_save_transform($vals, $ctx)
+  $out = { slug: lower(trim("" .. $vals["slug"])) }
+  $der = { file_sha256: "", file_bytes: 0 }
+  if ("" .. $vals["delivery"]) == "file" then
+    $p = sh_goods_path($vals["file_path"])
+    if $p != nil then
+      $data = read_file_bytes($p)
+      -- bytes_len, NOT length(): length() rejects Value::Bytes
+      $der = { file_sha256: hash_sha256($data), file_bytes: bytes_len($data) }
+    end
+  end
+  return { values: $out, derived: $der }
+end
+
+function sp_pub_badge($p)
+  if to_number($p["published"]) == 1 then
+    return { "text": "Published", "variant": "success" }
+  end
+  return { "text": "Draft", "variant": "gray" }
+end
+
+function sp_delivery_badge($p)
+  if ("" .. $p["delivery"]) == "file" then
+    return { "text": "file", "variant": "info" }
+  end
+  return { "text": "text", "variant": "warning" }
+end
+
+function sp_list_config()
+  $name_cell = fn($p) = '<a href="/product/' .. esc($p["slug"]) .. '" target="_blank"><strong>' .. esc($p["name"]) .. '</strong></a>'
+  $price_cell = fn($p) = fmt_aud($p["price_cents"])
+  $pub_badge = fn($p) = sp_pub_badge($p)
+  $del_badge = fn($p) = sp_delivery_badge($p)
+  $act_edit = dt_action("edit", { "label": "Edit", icon: "pencil", variant: "action", modal: "md-edit", href: fn($p) = "/biz/products?edit=" .. url_encode("" .. $p["id"]) .. "&modal=1" })
+  $act_del = dt_action("delete", { "label": "Delete", icon: "trash", variant: "action-danger", action: "delete", confirm: "Delete this product? Refused once it has been sold." })
+  $spec = [
+    dt_col("id", "Id", "id", { sortable: true, width: "4rem", toggleable: true, default_hidden: true }),
+    dt_col("sku", "SKU", "sku", { sortable: true, searchable: true, toggleable: true, width: "8rem" }),
+    dt_col("name", "Name", "name", { sortable: true, searchable: true, render: $name_cell, toggleable: true }),
+    dt_col("price_cents", "Price", "price_cents", { sortable: true, render: $price_cell, toggleable: true, width: "6rem" }),
+    dt_col("delivery", "Delivery", "delivery", { sortable: true, badge: $del_badge, toggleable: true, width: "6rem" }),
+    dt_col("published", "Status", "published", { sortable: true, badge: $pub_badge, toggleable: true, width: "7rem" }),
+    dt_col("sort", "Sort", "sort", { sortable: true, toggleable: true, width: "4rem", default_hidden: true }),
+    dt_col("created", "Created", "created", { sortable: true, type: "datetime", toggleable: true })
+  ]
+  $opts = {
+    base_route: "/biz/products", caption: "Products", noun: "products",
+    default_sort: "sort", default_dir: "asc",
+    search_placeholder: "Search SKU, name…",
+    row_action_specs: [$act_edit, $act_del],
+    bulk_id: fn($p) = "" .. $p["id"],
+    filters: [ dt_filter("published", "Status", { options: [
+      { value: "1", "label": "Published", col: "published", op: "=" },
+      { value: "0", "label": "Draft", col: "published", op: "=" }
+    ] }) ],
+    header_actions: [{ "label": "New product", icon: "plus", variant: "primary", modal: "md-edit", modal_src: "/biz/products?new=1&modal=1" }]
+  }
+  return { spec: $spec, opts: $opts }
+end
+
+function products_resource()
+  $cfg = sp_list_config()
+  return {
+    entity: "products", noun: "product", base_route: "/biz/products",
+    now_fn: fn() = biz_now(),
+    list: { title: "Products", spec: $cfg["spec"], opts: $cfg["opts"],
+            select: "id, sku, name, price_cents, delivery, published, sort, created" },
+    form: {
+      cols: 2,
+      fields: [
+        { name: "sku", kind: "text", "label": "SKU", required: true, create_only: true, maxlen: 64, help: "Immutable product code", help_tip: true },
+        { name: "slug", kind: "text", "label": "Slug", required: true, maxlen: 128, help: "URL name: /product/<slug>", help_tip: true },
+        { name: "name", kind: "text", "label": "Name", required: true, maxlen: 200, span: 2 },
+        { name: "summary", kind: "text", "label": "Summary", maxlen: 300, span: 2, help: "One line under the name in the catalogue", help_tip: true },
+        { name: "description", kind: "textarea", "label": "Description", rows: 5, span: 2 },
+        { name: "price_cents", kind: "number", "label": "Price (cents, AUD)", required: true, help: "500 = $5.00", help_tip: true },
+        { name: "delivery", kind: "select", "label": "Delivery", default: "file", options: [
+          { value: "file", "label": "file — downloadable artifact" },
+          { value: "text", "label": "text — license key / shown inline" }
+        ] },
+        { name: "file_path", kind: "text", "label": "Goods file", maxlen: 200, help: "Relative to app/goods/, e.g. mix-guide/mix-pocket-guide.pdf", help_tip: true },
+        { name: "mime", kind: "text", "label": "MIME type", blank_default: "application/octet-stream", default: "application/octet-stream" },
+        { name: "text_payload", kind: "textarea", "label": "Text payload", rows: 3, span: 2, help: "Shown on the paid order page when delivery = text", help_tip: true },
+        { name: "image", kind: "text", "label": "Image URL", maxlen: 300, span: 2, help: "Catalogue image, e.g. /media/<file> uploaded via Media", help_tip: true },
+        { name: "published", kind: "checkbox", "label": "Published" },
+        { name: "sort", kind: "number", "label": "Sort order", blank_default: "0", default: "0" }
+      ],
+      derived: ["file_sha256", "file_bytes"],
+      stamps: { created: "created", updated: "updated" },
+      validate: fn($vals, $f, $editid) = sp_validate($vals, $f, $editid),
+      save_transform: fn($vals, $ctx) = sp_save_transform($vals, $ctx),
+      saved_flash: "Product saved"
+    },
+    policy: {
+      guard: fn($id) = sp_del_block($id),
+      fetch: fn($id) = sp_get_one($id),
+      del: fn($id, $row) = sp_delete_cascade($id),
+      missing: "No such product.",
+      audit: { table_ref: "products", create_action: "create", update_action: "update",
+               delete_action: "delete",
+               detail_fn: fn($v, $id) = ("" .. $v["sku"]) .. " " .. ("" .. $v["name"]) }
+    }
+  }
+end
+
+function shop_admin_main()
+  cms_init()
+  biz_init()
+  shop_init()
+  $user = current_user($HEADERS)
+  if md_is_modal_request() and $user == nil then
+    return md_session_expired("/biz/products")
+  end
+  $deny = require_role($user, "admin")
+  if $deny != nil then
+    return $deny
+  end
+  return resource_main(products_resource(), $user)
+end

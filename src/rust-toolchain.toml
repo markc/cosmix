@@ -1,0 +1,6 @@
+# Pinned so a fresh clone builds with the same compiler everywhere; rustup
+# honours this file automatically. desktop/ pins its own (older) toolchain.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

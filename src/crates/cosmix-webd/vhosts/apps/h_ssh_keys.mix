@@ -1,0 +1,245 @@
+-- h_ssh_keys.mix — /ssh/keys : SSH key inventory + CRUD (P1/P2b).
+--
+-- admin-list/1 over sshm.ssh_keys (public-key metadata only — private key bytes
+-- are never served by the path-scoped filesd place, never displayed). CREATE
+-- enqueues a key_create job (the P2 worker runs ssh-keygen; passphrase-less per
+-- D6); DELETE is a guarded imperative verb (refuse while any host references the
+-- key; trash the .pub; delete the mirror row + audit). Keys aren't editable
+-- (type/bits/fingerprint come from the worker). ?view= = detail (pub + used-by).
+
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/admin_resource.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/detail.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+include "/opt/cosmix/vhosts/shared/apps/ssh_lib.mix"
+
+function ssh_keys_spec()
+  return [
+    dt_col("name", "Name", "name", { sortable: true, searchable: true, render: fn($r) = ('<a href="/ssh/keys?view=' .. esc("" .. $r["name"]) .. '">' .. esc("" .. $r["name"]) .. '</a>') }),
+    dt_col("type", "Type", "type", { sortable: true, searchable: true, badge: fn($r) = ssh_keytype_badge($r) }),
+    dt_col("fingerprint", "Fingerprint", "fingerprint", { render: fn($r) = ssh_fp_cell($r) }),
+    dt_col("comment", "Comment", "comment", { sortable: true, searchable: true }),
+    dt_col("used_by", "Used by", "used_by", { sortable: true, render: fn($r) = ssh_usedby_cell($r) })
+  ]
+end
+
+function ssh_keytype_badge($r)
+  $t = "" .. ssh_or($r["type"], "")
+  if $t == "" then return { text: "?", variant: "muted" } end
+  return { text: $t, variant: "neutral" }
+end
+
+function ssh_fp_cell($r)
+  $fp = "" .. ssh_or($r["fingerprint"], "")
+  if $fp == "" then return '<span class="muted">—</span>' end
+  -- fingerprint stored as "256 SHA256:… comment (ED25519)"; show the SHA256 part
+  $p = pos("SHA256:", $fp)
+  if $p > 0 then $fp = substr($fp, $p - 1) end
+  $sp = pos(" ", $fp)
+  if $sp > 0 then $fp = substr($fp, 0, $sp - 1) end
+  return '<code class="muted">' .. esc($fp) .. '</code>'
+end
+
+function ssh_usedby_cell($r)
+  $n = to_number("" .. ssh_or($r["used_by"], 0))
+  if $n == nil then $n = 0 end
+  if $n == 0 then return '<span class="muted">unused</span>' end
+  return ("" .. $n) .. ' host'
+end
+
+function ssh_keys_opts()
+  $act_del = dt_action("delete", { "label": "Delete", icon: "trash", variant: "action-danger", action: "delete", confirm: "Delete this key? Refused while any host uses it. The .pub moves to ~/.ssh trash." })
+  return dt_admin_opts({
+    base_route: "/ssh/keys",
+    caption: "SSH keys",
+    noun: "keys",
+    default_sort: "name",
+    default_dir: "asc",
+    search_placeholder: "Search keys…",
+    row_action_specs: [$act_del],
+    bulk_id: fn($r) = ("" .. $r["name"]),
+    bulk_label: "Delete Selected",
+    header_actions: [
+      { "label": "New Key", icon: "plus", variant: "primary", modal: "md-edit", modal_src: "/ssh/keys?new=1&modal=1" },
+      { "label": "Fix Perms", icon: "shield-check", variant: "secondary", post: true, href: "/ssh/keys", action: "fixperms" },
+      { "label": "Reindex", icon: "refresh-cw", variant: "secondary", post: true, href: "/ssh/keys", action: "reindex" }
+    ]
+  })
+end
+
+-- New-key modal (name + comment; generation is a worker job — no passphrase, D6).
+function ssh_key_new_form($err, $mode)
+  $fields = fm_hidden("action", "save")
+  $fields = $fields .. fm_text("name", "Key name", { required: true, help: "ed25519 pair under ~/.ssh/keys/. Letters, digits, _ . - only; no .pub suffix.", help_tip: true })
+  $fields = $fields .. fm_text("comment", "Comment", { placeholder: "user@host or a label" })
+  return {
+    mode: $mode,
+    action: "/ssh/keys",
+    id: "ssh-key-new",
+    title: "New Key",
+    fields: fm_grid({ cols: 1 }, $fields),
+    submit: { "label": "Generate" },
+    cancel: { "label": "Cancel", href: "/ssh/keys" },
+    error: $err
+  }
+end
+
+function ssh_keys_main()
+  cms_init()
+  $user = current_user($HEADERS)
+  if md_is_modal_request() and $user == nil then
+    return md_session_expired("/ssh/keys")
+  end
+  $deny = require_sshm_operator($user)
+  if $deny != nil then return $deny end
+
+  ssh_init()
+  $actor = "" .. ssh_or($user["username"], "")
+
+  -- ── POST: create (enqueue keygen) / delete ──
+  if $METHOD == "POST" then
+    $f = parse_form($BODY)
+    $action = "" .. ssh_or($f["action"], "save")
+
+    if $action == "bulk_delete" then
+      -- Refresh the mirror from the FS FIRST so the per-key in-use guard sees
+      -- hand-added host references made since the last reindex (else a live host
+      -- could be left pointing at a deleted key). Fail CLOSED: if the reindex
+      -- couldn't confirm current usage, refuse rather than delete on stale data.
+      $ri = ssh_reindex()
+      if not $ri["ok"] then return redirect_flash("/ssh/keys", "Couldn't verify key usage — the FS reindex failed. Try again.", "danger") end
+      $ids = dt_selected_ids($f)
+      if dt_wants_all($f) then
+        $spec = ssh_keys_spec()
+        $ids = dt_all_ids("sshm.ssh_keys", $spec, dt_state_from_map($f, $spec, ssh_keys_opts()), "name")
+      end
+      $ndel = 0
+      $nskip = 0
+      $why = ""
+      for each $id in $ids
+        $block = ssh_key_delete("" .. $id, $actor)
+        if $block == "" then
+          $ndel = $ndel + 1
+        else
+          $nskip = $nskip + 1
+          if $why == "" then $why = $block end
+        end
+      end
+      $rep = dt_bulk_report({ deleted: $ndel, skipped: $nskip, why: $why }, "key(s)")
+      $msg = $rep["msg"]
+      -- D6: only the .pub halves were trashed — flag the stranded private keys.
+      if $ndel > 0 then $msg = $msg .. " Private halves remain on disk (see audit) — remove via the CLI." end
+      return redirect_flash("/ssh/keys", $msg, $rep["kind"])
+    end
+
+    -- Reindex is a POST header action (it does a delegated bus_call on this
+    -- mutating-verb route — a GET <a> can't carry the token the bus gate needs
+    -- off-POST; POST + same-origin passes it).
+    if $action == "reindex" then
+      $ri = ssh_reindex()
+      if $ri["ok"] then
+        return redirect_flash("/ssh/keys", ("Reindexed: " .. ("" .. $ri["hosts"]) .. " hosts, " .. ("" .. $ri["keys"]) .. " keys"), "success")
+      end
+      return redirect_flash("/ssh/keys", ("Reindex failed: " .. $ri["err"]), "error")
+    end
+
+    -- Fix perms: enqueue a fix_perms worker job (chmod the ~/.ssh tree) → progress.
+    if $action == "fixperms" then
+      $jid = ssh_job_enqueue("fix_perms", {}, nil)
+      ssh_audit($actor, "fixperms-queued", "ssh_keys", nil, "")
+      if $jid == nil then return redirect_flash("/ssh/keys", "Couldn't queue the permissions fix.", "error") end
+      return redirect_flash("/ssh/keys?job=" .. ("" .. $jid), "Fixing ~/.ssh permissions…", "success")
+    end
+
+    $ra = dt_row_action($f)
+    $delname = ""
+    if $ra != nil and $ra["verb"] == "delete" then $delname = "" .. $ra["id"] end
+    if $action == "delete" then $delname = "" .. ssh_or($f["name"], "") end
+    if $delname != "" then
+      -- reindex first so the in-use guard reflects the live FS (see bulk above);
+      -- fail CLOSED if it couldn't confirm.
+      $ri = ssh_reindex()
+      if not $ri["ok"] then return redirect_flash("/ssh/keys", "Couldn't verify key usage — the FS reindex failed. Try again.", "danger") end
+      $block = ssh_key_delete($delname, $actor)
+      if $block != "" then return redirect_flash("/ssh/keys", $block, "danger") end
+      -- D6: only the public half is trashed; the private key stays on disk (webd
+      -- can't reach it). Warn so the operator removes it.
+      return redirect_flash("/ssh/keys", ("Key '" .. $delname .. "' deleted (public half trashed; private half ~/.ssh/keys/" .. $delname .. " remains — remove it via the CLI)."), "success")
+    end
+
+    -- save = create: validate name, then enqueue a keygen job (the worker runs
+    -- ssh-keygen; the key appears after the worker completes + reindex).
+    $name = ssh_safe_name(ssh_or($f["name"], ""))
+    if $name == "" then
+      $err = "Invalid name — letters, digits, _ . - only; no leading dot/dash, no .pub."
+      if md_is_modal_request() then return md_fragment(fm_form(ssh_key_new_form($err, "modal"))) end
+      return doc(200, "New Key", $user, fm_form(ssh_key_new_form($err, "canvas")))
+    end
+    $ex = db_query("SELECT name FROM sshm.ssh_keys WHERE name=?1", [$name])
+    if length($ex) > 0 then
+      $err = "A key named '" .. $name .. "' already exists."
+      if md_is_modal_request() then return md_fragment(fm_form(ssh_key_new_form($err, "modal"))) end
+      return doc(200, "New Key", $user, fm_form(ssh_key_new_form($err, "canvas")))
+    end
+    $comment = "" .. ssh_or($f["comment"], "")
+    $jid = ssh_job_enqueue("key_create", { name: $name, comment: $comment }, ("key_create:" .. $name))
+    ssh_audit($actor, "keygen-queued", "ssh_keys", nil, $name)
+    if $jid == nil then return redirect_flash("/ssh/keys", ("A key job for '" .. $name .. "' is already queued."), "warning") end
+    return redirect_flash("/ssh/keys?job=" .. ("" .. $jid), ("Generating key '" .. $name .. "'…"), "success")
+  end
+
+  $q = parse_query($QUERY)
+
+  -- (Reindex moved to a POST header action above — a GET bus_call on this
+  -- mutating-verb route can't satisfy the bus gate's off-POST CSRF requirement.)
+
+  -- Job progress (keygen / fix-perms): poll /ssh/job-status, which reindexes on
+  -- completion, then redirect back to the list where the result now shows.
+  $jobid = "" .. ssh_or($q["job"], "")
+  if $jobid != "" then
+    return doc(200, "Working…", $user, ssh_job_progress_html($jobid, "Working…", "/ssh/keys"))
+  end
+
+  if ssh_or($q["new"], "") == "1" then
+    if md_is_modal_request() then return md_fragment(fm_form(ssh_key_new_form("", "modal"))) end
+    return doc(200, "New Key", $user, fm_form(ssh_key_new_form("", "canvas")))
+  end
+
+  $view = "" .. ssh_or($q["view"], "")
+  if $view != "" then
+    return ssh_keys_view($view, $user)
+  end
+
+  return dt_admin_list({
+    title: "SSH keys",
+    user: $user,
+    spec: ssh_keys_spec(),
+    opts: ssh_keys_opts(),
+    table: "sshm.ssh_keys",
+    select: "id, name, type, bits, fingerprint, comment, used_by, mtime"
+  })
+end
+
+function ssh_keys_view($name, $user)
+  $rows = db_query("SELECT * FROM sshm.ssh_keys WHERE name=?1", [$name])
+  if length($rows) == 0 then
+    return md_not_found("key", "/ssh/keys")
+  end
+  $r = $rows[0]
+  $kv = dv_kv_table([
+    { label: "Type", value: ("" .. ssh_or($r["type"], "")) },
+    { label: "Fingerprint", value: ("" .. ssh_or($r["fingerprint"], "—")) },
+    { label: "Comment", value: ("" .. ssh_or($r["comment"], "")) },
+    { label: "Used by", value: (("" .. ssh_or($r["used_by"], 0)) .. " host(s)") }
+  ])
+  $pub = '<div class="card"><h3>Public key</h3><pre class="code-block">' .. esc("" .. ssh_or($r["pub"], "")) .. '</pre></div>'
+  $hosts = db_query("SELECT name FROM sshm.ssh_hosts WHERE key_name=?1 ORDER BY name", [$name])
+  $links = ""
+  for each $h in $hosts
+    $links = $links .. '<a href="/ssh/hosts?view=' .. esc("" .. $h["name"]) .. '" class="badge">' .. esc("" .. $h["name"]) .. '</a> '
+  end
+  if $links == "" then $links = '<span class="muted">No hosts reference this key.</span>' end
+  $head = dv_head("Key: " .. ("" .. $r["name"]), { back: { href: "/ssh/keys", label: "SSH keys" } })
+  return doc(200, ("Key " .. ("" .. $r["name"])), $user, $head .. dv_card("Details", $kv) .. $pub .. dv_card("Used by hosts", $links))
+end

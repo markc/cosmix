@@ -1,0 +1,149 @@
+-- h_ssh_scans.mix — /ssh/scans : connectivity-scan history (P0 read-only stub).
+--
+-- admin-list/1 over sshm.ssh_scans. P0 has no scan runner (that is the P2
+-- worker), so the list is normally empty — it exists so the panel + registry are
+-- complete and the P2 wiring drops straight in. ?view=<id> → per-host results.
+
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/admin_resource.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/detail.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+include "/opt/cosmix/vhosts/shared/apps/ssh_lib.mix"
+
+function ssh_scans_spec()
+  return [
+    dt_col("started_at", "Started", "started_at", { sortable: true, render: fn($r) = ('<a href="/ssh/scans?view=' .. esc("" .. $r["id"]) .. '">' .. esc("" .. ssh_or($r["started_at"], "")) .. '</a>') }),
+    dt_col("status", "Status", "status", { sortable: true }),
+    dt_col("total", "Total", "total", { sortable: true }),
+    dt_col("ok", "OK", "ok", { sortable: true }),
+    dt_col("failed", "Failed", "failed", { sortable: true }),
+    dt_col("offline", "Offline", "offline", { sortable: true })
+  ]
+end
+
+function ssh_scans_opts()
+  return dt_admin_opts({
+    base_route: "/ssh/scans",
+    caption: "SSH scans",
+    noun: "scans",
+    default_sort: "started_at",
+    default_dir: "desc",
+    search: false,
+    bulk: false,
+    select_all: false
+  })
+end
+
+-- Per-host results table body (shared by the page + the poll partial).
+function ssh_scan_results_html($id)
+  $results = db_query("SELECT host_name, status, latency_ms FROM sshm.ssh_scan_results WHERE scan_id=?1 ORDER BY host_name", [$id])
+  if length($results) == 0 then
+    return '<p class="muted">No results yet…</p>'
+  end
+  $b = '<table class="dt-table"><thead><tr><th>Host</th><th>Status</th><th>Latency</th></tr></thead><tbody>'
+  for each $r in $results
+    $st = "" .. $r["status"]
+    $lat = "" .. ssh_or($r["latency_ms"], "")
+    if $lat != "" then $lat = $lat .. " ms" end
+    $b = $b .. '<tr><td>' .. esc("" .. $r["host_name"]) .. '</td><td>' .. ssh_scan_pill($st) .. '</td><td class="muted">' .. esc($lat) .. '</td></tr>'
+  end
+  return $b .. '</tbody></table>'
+end
+
+-- Status pill (full D7 vocabulary).
+function ssh_scan_pill($s)
+  $variant = "danger"
+  if $s == "ok" then $variant = "success" end
+  if $s == "git" then $variant = "info" end
+  if $s == "offline" then $variant = "warn" end
+  if $s == "authfail" then $variant = "warn" end
+  return '<span class="badge badge-' .. $variant .. '">' .. esc($s) .. '</span>'
+end
+
+-- Progress line "N/total · ok/failed/offline".
+function ssh_scan_counts_html($s)
+  $done = to_number("" .. ssh_or($s["ok"], "0")) + to_number("" .. ssh_or($s["failed"], "0")) + to_number("" .. ssh_or($s["offline"], "0"))
+  return '<span data-scan-field="done">' .. ("" .. $done) .. '</span>/<span data-scan-field="total">' .. ("" .. ssh_or($s["total"], "0")) .. '</span> tested · <span data-scan-field="ok">' .. ("" .. ssh_or($s["ok"], "0")) .. '</span> ok · <span data-scan-field="failed">' .. ("" .. ssh_or($s["failed"], "0")) .. '</span> failed · <span data-scan-field="offline">' .. ("" .. ssh_or($s["offline"], "0")) .. '</span> offline'
+end
+
+function ssh_scans_view($id, $user)
+  $rows = db_query("SELECT * FROM sshm.ssh_scans WHERE id=?1", [$id])
+  if length($rows) == 0 then
+    return md_not_found("scan", "/ssh/scans")
+  end
+  $s = $rows[0]
+  $running = ("" .. ssh_or($s["status"], "")) == "running"
+  $statusbadge = ssh_scan_pill("" .. ssh_or($s["status"], ""))
+  $summary = '<div class="card"><p><strong data-scan-field="status">' .. ("" .. ssh_or($s["status"], "")) .. '</strong> — ' .. ssh_scan_counts_html($s) .. '</p></div>'
+  $results = '<div id="scan-results-' .. ("" .. $id) .. '">' .. ssh_scan_results_html($id) .. '</div>'
+  $poll = ""
+  if $running then $poll = ssh_scan_poll_script($id) end
+  $head = dv_head("Scan " .. ("" .. $s["id"]), { back: { href: "/ssh/scans", label: "SSH scans" } })
+  return doc(200, ("Scan " .. ("" .. $s["id"])), $user, $head .. $summary .. dv_card("Results", $results) .. $poll)
+end
+
+-- Poll-partial script (plan D5 — no SSE): fetch /ssh/scan-status?scan=<id>
+-- every 2s, swap the results container + counts, stop when status leaves
+-- running. Mirrors svc_prov_poll_script.
+function ssh_scan_poll_script($id)
+  return '<script>(function(){var id=' .. ("" .. $id) .. ';var root=document;if(root.__sshScanPoll)return;root.__sshScanPoll=true;function set(k,v){var e=root.querySelector("[data-scan-field="+k+"]");if(e)e.textContent=v;}function tick(){fetch("/ssh/scan-status?scan="+id,{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(j){set("status",j.status);set("total",j.total);set("ok",j.ok);set("failed",j.failed);set("offline",j.offline);set("done",(j.ok|0)+(j.failed|0)+(j.offline|0));var c=root.getElementById("scan-results-"+id);if(c&&j.results_html!=null)c.innerHTML=j.results_html;if(window.lucide&&window.lucide.createIcons)window.lucide.createIcons();if(j.status!=="running"){clearInterval(root.__sshScanTimer);}}).catch(function(){});}root.__sshScanTimer=setInterval(tick,2000);tick();})();</script>'
+end
+
+-- GET /ssh/scan-status?scan=<id> → JSON {status,total,ok,failed,offline,results_html}.
+function ssh_scan_status_json($id)
+  $rows = db_query("SELECT status, total, ok, failed, offline FROM sshm.ssh_scans WHERE id=?1", [$id])
+  if length($rows) == 0 then
+    return { status: 404, headers: {}, body: "no such scan" }
+  end
+  $s = $rows[0]
+  return { status: 200, headers: { "Content-Type": "application/json" }, body: json_encode({
+    status: "" .. ssh_or($s["status"], ""),
+    total: to_number("" .. ssh_or($s["total"], "0")),
+    ok: to_number("" .. ssh_or($s["ok"], "0")),
+    failed: to_number("" .. ssh_or($s["failed"], "0")),
+    offline: to_number("" .. ssh_or($s["offline"], "0")),
+    results_html: ssh_scan_results_html($id)
+  }) }
+end
+
+function ssh_scans_main()
+  cms_init()
+  $user = current_user($HEADERS)
+  if md_is_modal_request() and $user == nil then
+    return md_session_expired("/ssh/scans")
+  end
+  $deny = require_sshm_operator($user)
+  if $deny != nil then return $deny end
+
+  ssh_init()
+
+  $q = parse_query($QUERY)
+  -- Poll endpoint for the running-scan view (read-only JSON).
+  if ends_with($PATH, "scan-status") then
+    $sid = ssh_or($q["scan"], "")
+    if $sid == "" then return { status: 400, headers: {}, body: "missing scan" } end
+    return ssh_scan_status_json($sid)
+  end
+  -- Poll endpoint for non-scan jobs (keygen/copy-key/fix-perms). Read-only bus
+  -- (fs.list/read) so a DONE FS-mutating job reindexes here without the bus gate's
+  -- off-POST CSRF requirement — the new key/perm shows before the poller redirects.
+  if ends_with($PATH, "job-status") then
+    $jid = ssh_or($q["job"], "")
+    if $jid == "" then return { status: 400, headers: {}, body: "missing job" } end
+    return ssh_job_status_json($jid)
+  end
+  $view = ssh_or($q["view"], "")
+  if $view != "" then
+    return ssh_scans_view($view, $user)
+  end
+
+  return dt_admin_list({
+    title: "SSH scans",
+    user: $user,
+    spec: ssh_scans_spec(),
+    opts: ssh_scans_opts(),
+    table: "sshm.ssh_scans",
+    select: "id, started_at, finished_at, status, total, ok, failed, offline"
+  })
+end

@@ -1,0 +1,17 @@
+{
+  "contract": "ctk-app-control.v0",
+  "app": "studio-bevy-4242",
+  "title": "CosMix Studio",
+  "view": "studio",
+  "engine": "bevy",
+  "controls": 2,
+  "verbs": [
+    "app.controls.get",
+    "app.controls.list",
+    "app.controls.set",
+    "app.describe",
+    "action.invoke",
+    "actions.describe",
+    "actions.list"
+  ]
+}

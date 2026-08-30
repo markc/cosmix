@@ -1,0 +1,249 @@
+-- reader.mix — rd_view($o): the shared READ/VIEW surface, the read-twin of fm_form (forms.mix).
+-- One header card (action bar + right-aligned back affordance) → title + status badges + meta
+-- rows → a clutter-free prose body (render_body output) → optional trailing footer. Schema-driven
+-- so every PIM type (post, page, mail, contact, …) renders its viewer through ONE component.
+--
+-- Spec ($o) keys — all optional unless noted:
+--   title       string  REQUIRED — the H1. esc()'d.
+--   badges      list    [{ text, kind }]; kind "draft" → .tag.draft, anything else → .tag. text esc()'d.
+--   meta        list    [{ "label", value, href, id }]; label "" → value only, else "Label: value".
+--                       value/label/href each esc()'d once; an href wraps the value in a link; an
+--                       id wraps the value in <span id=…> (a live editor can patch it via textContent).
+--   body_html   string  PRE-RENDERED trusted HTML (e.g. render_body($md)). NOT esc()'d — caller owns safety.
+--   body_class  string  body wrapper class (default "post" → the prose styling).
+--   body_id     string  optional id on the <article> (the Workbench live-preview patch target).
+--   body_src    string  optional data-md-src on the <article> (the POST url the live listener hits).
+--   body_input  string  optional data-md-input on the <article> (the textarea id that drives it).
+--   footer_html string  PRE-BUILT trusted HTML appended after the body (e.g. a taxonomy footer). NOT esc()'d.
+--   actions     list    the top action bar (left cluster). Each is EITHER a link
+--                       { "label", icon, href, variant } OR a POST action
+--                       { "label", icon, variant, post: <url>, fields: [{name,value}], confirm: <msg> }
+--                       (an inline form — for a destructive verb like Delete/Archive). label esc()'d.
+--   back        map     { "label", href }; the top-right back affordance (.btn.btn-primary, like fm_form).
+--   mode        string  reserved ("canvas"|"modal"); v1 renders the canvas form only.
+--
+-- Discipline (mirrors forms.mix exactly): esc() every dynamic VALUE once; icon names + button
+-- variants pass through an allowlist (the allowlist IS the firewall, never escape-as-text);
+-- nil-guard with rd_or before any "" .. concat; NO mix-0.20 syntax (?? / ?:) — webd embeds an
+-- older cosmix-lib-mix. body_html / footer_html are trusted pre-built HTML (render_body sanitises
+-- markdown); the caller is responsible for them, exactly as doc()/page() treat their body.
+
+-- nil-coalesce (forms.mix's fm_or is not in scope here; keep reader.mix self-contained).
+function rd_or($v, $def)
+  if $v == nil then
+    return $def
+  end
+  return $v
+end
+
+-- button-variant firewall for .btn-<variant> (mirrors fm_variant_ok; default "ghost" for a reader).
+function rd_variant_ok($v)
+  $s = lower(trim("" .. rd_or($v, "ghost")))
+  if $s == "primary" or $s == "ghost" or $s == "danger" or $s == "success" or $s == "info" then
+    return $s
+  end
+  return "ghost"
+end
+
+-- self-contained inline-SVG registry (same shape/strokes as fm_icon); raw output, NEVER esc()'d.
+function rd_icon($name)
+  $n = "" .. $name
+  if $n == "arrow-left" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5"></path><path d="m12 19-7-7 7-7"></path></svg>'
+  end
+  if $n == "pencil" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"></path><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>'
+  end
+  if $n == "eye" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"></path><circle cx="12" cy="12" r="3"></circle></svg>'
+  end
+  if $n == "trash" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"></path><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"></path></svg>'
+  end
+  return ""
+end
+
+-- badge-class firewall: only "draft" gets the warning skin; every other kind is a plain tag.
+function rd_badge_class($kind)
+  if ("" .. rd_or($kind, "")) == "draft" then
+    return "tag draft"
+  end
+  return "tag"
+end
+
+function rd_badges_html($badges)
+  if $badges == nil then
+    return ""
+  end
+  if length($badges) == 0 then
+    return ""
+  end
+  $h = '<span class="rd-badges">'
+  for each $b in $badges
+    $h = $h .. '<span class="' .. rd_badge_class($b["kind"]) .. '">' .. esc("" .. rd_or($b["text"], "")) .. '</span>'
+  end
+  $h = $h .. '</span>'
+  return $h
+end
+
+function rd_meta_html($meta)
+  if $meta == nil then
+    return ""
+  end
+  if length($meta) == 0 then
+    return ""
+  end
+  $h = '<div class="rd-meta muted small">'
+  for each $row in $meta
+    $label = "" .. rd_or($row["label"], "")
+    -- value esc()'d once; an optional href wraps it in a link (mailto:, tel:, a permalink — the
+    -- href is esc()'d too, so it can't break the attribute). An optional id wraps the value in a
+    -- <span id=…> so a live editor can patch it via textContent (the mail composer's From·To).
+    $value = esc("" .. rd_or($row["value"], ""))
+    $href = $row["href"]
+    if $href != nil and ("" .. $href) != "" then
+      $value = '<a href="' .. esc("" .. $href) .. '">' .. $value .. '</a>'
+    end
+    $mid = $row["id"]
+    if $mid != nil and ("" .. $mid) != "" then
+      $value = '<span id="' .. esc("" .. $mid) .. '">' .. $value .. '</span>'
+    end
+    if $label != "" then
+      $h = $h .. '<div class="rd-meta-row"><span class="rd-meta-label">' .. esc($label) .. ':</span> ' .. $value .. '</div>'
+    else
+      $h = $h .. '<div class="rd-meta-row">' .. $value .. '</div>'
+    end
+  end
+  $h = $h .. '</div>'
+  return $h
+end
+
+function rd_actions_html($actions)
+  if $actions == nil then
+    return ""
+  end
+  if length($actions) == 0 then
+    return ""
+  end
+  $h = '<div class="rd-actions">'
+  for each $a in $actions
+    $variant = rd_variant_ok($a["variant"])
+    $icon = rd_icon("" .. rd_or($a["icon"], ""))
+    $lbl = esc("" .. rd_or($a["label"], ""))
+    if $a["post"] != nil then
+      -- A POST action (Delete / Archive …): an inline form so a destructive verb isn't a GET link.
+      -- `fields` is a list of { name, value } hidden inputs (each esc()'d); `confirm` rides as a
+      -- data-confirm attribute (the house JS gate), matching the per-handler delete forms it replaces.
+      $form = '<form method="post" action="' .. esc("" .. $a["post"]) .. '" class="rd-action-form"'
+      if $a["confirm"] != nil then
+        $form = $form .. ' data-confirm="' .. esc("" .. $a["confirm"]) .. '"'
+      end
+      $form = $form .. '>'
+      $flds = $a["fields"]
+      if $flds != nil then
+        for each $f in $flds
+          $form = $form .. '<input type="hidden" name="' .. esc("" .. rd_or($f["name"], "")) .. '" value="' .. esc("" .. rd_or($f["value"], "")) .. '">'
+        end
+      end
+      $form = $form .. '<button type="submit" class="btn btn-' .. $variant .. '">' .. $icon .. $lbl .. '</button></form>'
+      $h = $h .. $form
+    else
+      $h = $h .. '<a class="btn btn-' .. $variant .. '" href="' .. esc("" .. rd_or($a["href"], "#")) .. '">' .. $icon .. $lbl .. '</a>'
+    end
+  end
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- the top bar: action cluster left, the back affordance pushed right (margin-left:auto in CSS).
+function rd_topbar_html($o)
+  $actions = rd_actions_html($o["actions"])
+  $back = $o["back"]
+  $backhtml = ""
+  if $back != nil then
+    $backhtml = '<div class="rd-topbar-right"><a class="btn btn-primary rd-backlink" href="' .. esc("" .. rd_or($back["href"], "/")) .. '">' .. rd_icon("arrow-left") .. esc("" .. rd_or($back["label"], "Back")) .. '</a></div>'
+  end
+  if $actions == "" and $backhtml == "" then
+    return ""
+  end
+  return '<div class="rd-topbar">' .. $actions .. $backhtml .. '</div>'
+end
+
+-- Optional attributes for the body <article>: an id + the live-preview data hooks
+-- (data-md-src / data-md-input) so the Workbench listener (wb_preview_script) can patch the
+-- rendered body IN PLACE — chrome preserved — as the author types. Each value esc()'d; an absent
+-- key adds nothing (so a plain reader emits a bare <article class="post">, unchanged).
+function rd_body_attrs($o)
+  $a = ""
+  if $o["body_id"] != nil then
+    $a = $a .. ' id="' .. esc("" .. $o["body_id"]) .. '"'
+  end
+  if $o["body_src"] != nil then
+    $a = $a .. ' data-md-src="' .. esc("" .. $o["body_src"]) .. '"'
+  end
+  if $o["body_input"] != nil then
+    $a = $a .. ' data-md-input="' .. esc("" .. $o["body_input"]) .. '"'
+  end
+  return $a
+end
+
+function rd_view($o)
+  $bodyclass = "" .. rd_or($o["body_class"], "post")
+  $body = "" .. rd_or($o["body_html"], "")
+  $foot = "" .. rd_or($o["footer_html"], "")
+  $h = '<div class="rd-view">'
+  $h = $h .. rd_topbar_html($o)
+  $h = $h .. '<header class="rd-head"><h1 class="rd-title">' .. esc("" .. rd_or($o["title"], "")) .. '</h1>' .. rd_badges_html($o["badges"]) .. rd_meta_html($o["meta"]) .. '</header>'
+  -- The body <article> is emitted when there's body content OR a live-preview hook (so the
+  -- Workbench preview always has a patch target); a bodyless reader (a contact / an event) skips
+  -- it, so the header card isn't trailed by an empty prose box.
+  $has_hooks = ($o["body_id"] != nil) or ($o["body_src"] != nil) or ($o["body_input"] != nil)
+  if $body != "" or $has_hooks then
+    $h = $h .. '<article class="' .. esc($bodyclass) .. '"' .. rd_body_attrs($o) .. '>' .. $body .. '</article>'
+  end
+  if $foot != "" then
+    $h = $h .. '<div class="rd-foot">' .. $foot .. '</div>'
+  end
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- ─────────────────────────── the Workbench (wb_canvas) ───────────────────────────
+-- wb_canvas($spec) — the responsive edit/read Workbench: an edit surface (a markdown textarea
+-- or an fm_form) on the LEFT and a pre-rendered rd_view read surface on the RIGHT. It does NOT
+-- introduce a breakpoint — it reuses the shipped .md-split / .pp-editor width-mode rules
+-- (stacked by default with the read pane hidden; html.wide → 50/50 side-by-side live preview).
+-- $spec keys:
+--   edit_html  string  the LEFT pane (the textarea / fm_form). REQUIRED.
+--   read_html  string  the RIGHT pane: a rendered rd_view (give its spec body_id/body_src/
+--                      body_input so wb_preview_script can patch the body article in place).
+--   label      string  the preview-pane label (default "Preview"); CSS drops it in wide.
+-- Mount the wb_canvas INSIDE a .pp-editor wrapper (the wide 50/50 rule is scoped there) and emit
+-- wb_preview_script() ONCE on the page to wire the live body + title updates.
+function wb_canvas($spec)
+  $edit = "" .. rd_or($spec["edit_html"], "")
+  $read = "" .. rd_or($spec["read_html"], "")
+  $label = "" .. rd_or($spec["label"], "Preview")
+  $h = '<div class="md-split wb-canvas">'
+  $h = $h .. '<div class="md-split-edit wb-edit">' .. $edit .. '</div>'
+  $h = $h .. '<div class="md-split-preview wb-read"><label class="fm-label">' .. esc($label) .. '</label><div class="md-preview">' .. $read .. '</div></div>'
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- The Workbench live-update wiring (emit ONCE per page; idempotent via window.__wbPrev). A
+-- delegated `input` listener with two jobs:
+--   • a TEXTAREA whose id matches a [data-md-input] body article → debounced POST of its value to
+--     that article's data-md-src (/admin/preview → markdown HTML) → patch the article's innerHTML.
+--     markdown() escapes raw HTML, so the response is safe to inject; the rd_view CHROME (header,
+--     actions) is untouched because only the inner <article> is replaced.
+--   • an input whose field carries the .wb-title marker → live-fill every .wb-read .rd-title with
+--     its value via textContent (NEVER innerHTML — so a title can't inject), blank → "Untitled".
+--     NB fm_text's `class:` opt lands on the .fm-field WRAPPER (not the <input>), so the listener
+--     matches via t.closest(".wb-title"), not classList on the input target.
+-- The data-md-input id is CSS.escape'd before it goes into the selector (a reusable wb_canvas may
+-- pass a textarea id with selector metacharacters). Generalises the old posts-only pp_preview_script:
+-- any wb_canvas (posts, and the Step-3 PIM types) gets a live preview with zero per-handler JS.
+function wb_preview_script()
+  return '<script>(function(){if(window.__wbPrev){return}window.__wbPrev=1;var T;function ce(s){return (window.CSS&&CSS.escape)?CSS.escape(s):s}document.addEventListener("input",function(e){var t=e.target;if(!t){return}if(t.tagName==="TEXTAREA"&&t.id){var a=document.querySelectorAll("[data-md-input=\\""+ce(t.id)+"\\"]");if(a.length){var src=a[0].getAttribute("data-md-src");if(src){clearTimeout(T);T=setTimeout(function(){fetch(src,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"body="+encodeURIComponent(t.value)}).then(function(r){return r.ok?r.text():null}).then(function(h){if(h!==null){for(var i=0;i<a.length;i++){a[i].innerHTML=h}}}).catch(function(){})},250)}}}if(t.closest&&t.closest(".wb-title")){var v=(t.value||"").trim()||"Untitled";var ts=document.querySelectorAll(".wb-read .rd-title");for(var j=0;j<ts.length;j++){ts[j].textContent=v}}},true)})();</script>'
+end

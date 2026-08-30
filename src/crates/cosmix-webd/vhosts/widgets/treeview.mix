@@ -1,0 +1,212 @@
+-- treeview.mix — shared SSR nested-tree widget for the webd CMS/PIM tree.
+--
+-- Plan of record: _plan/2026-06-23-treeview-widget.md (Codex-converged).
+-- Sibling of widgets/datatable.mix + forms.mix + modals.mix; same conventions.
+--
+-- ONE copy at /opt/cosmix/vhosts/shared/widgets/treeview.mix. UNLIKE the other
+-- widgets it is `include`-d by lib.mix itself (right after esc()/priv_dot() are
+-- defined, before the nav builders) — because lib.mix's build_nav_pages() is the
+-- primary consumer, not a leaf handler. A handler that calls tv_* directly adds its
+-- own include too (load-once makes the double-include a no-op).
+--
+-- WHAT IT DOES: renders an arbitrary-depth hierarchy as a collapsible tree. Each
+-- parent row carries a chevron toggle (▸ closed → ▾ open) that is a SEPARATE
+-- <button> beside a normal <a> link — so a parent page/category stays navigable
+-- (you can't put a working <a> inside a <details>/<summary>). Collapse is driven by
+-- a `.tv-open` class toggled by the delegated listener in assets/site.js, persisted
+-- to localStorage by a namespaced `data-tv-key="<tree>:<id>"`. The server renders
+-- every branch OPEN (progressive enhancement: no-JS keeps a fully expanded,
+-- navigable tree exactly like the old always-open nav); site.js then applies stored
+-- collapses, never collapsing the active path. Optional RHS count badge per node.
+--
+-- DISCIPLINE (mirrors datatable.mix / forms.mix):
+--   * Escape-once firewall: every interpolated VALUE (label text, slug, count, key,
+--     dom id) goes through esc() exactly once at emission. Author literals (icon
+--     names) run through an ALLOWLIST charset (tv_token), never escaped-as-text.
+--   * "" .. nil is the literal text "nil" — every value is nil-guarded (tv_or /
+--     explicit `if == nil`) before concat.
+--   * NO mix-0.20 syntax (?? / ?:): webd embeds its own cosmix-lib-mix.
+--   * Mix maps are BY-VALUE: the recursion threads its visited set through the
+--     RETURN ({html, visited}); reading $cfg["count_map"][$id] is a value read (fine).
+--
+-- PUBLIC API:
+--   tv_subtree($map, $parent_key, $cfg, $visited) -> {html, visited}
+--       The unified recursive renderer (replaces lib.mix's old, duplicated
+--       render_page_subtree + render_cat_subtree). $map is a parent_key→[rows]
+--       adjacency map ("0" = top level) as built by build_page_children_map /
+--       build_cat_children_map. $cfg keys:
+--         "tree"        : DOM/storage namespace, e.g. "nav-pages" / "nav-cats"
+--         "icon"        : lucide icon name for every node (allowlisted)
+--         "href_prefix" : link prefix, e.g. "/page/" / "/category/"
+--         "text_col"    : row column for the label, e.g. "title" / "name"
+--         "vis_col"     : (optional) row column for "public"/"private" → lock marker
+--         "count_map"   : (optional) id→count map for the RHS badge; when ABSENT the
+--                         badge is the node's direct-child count (length($map[id]))
+--   tv_tree($map, $cfg) -> HTML  — convenience: tv_subtree from "0" wrapped in a
+--       <ul class="cms-nav-list tv-tree">; "" when the tree is empty.
+--   tv_leaf($href, $icon, $text, $vis, $count) -> a single <li class="tv-leaf"> (for
+--       a standalone leaf like the Home link, prepended inside a caller-owned <ul>).
+--
+-- A node is a BRANCH iff its rendered subtree is non-empty; otherwise a LEAF. Branch
+-- count badges (child-count mode) therefore only show on parents; count_map badges
+-- (categories) show on every node with a positive count.
+
+-- ───────────────────────────── helpers ─────────────────────────────
+
+-- nil-coalesce: $def when $v is nil (the datatable dt_or / forms fm_or shape).
+function tv_or($v, $def)
+  if $v == nil then
+    return $def
+  end
+  return $v
+end
+
+-- Reduce a string to the DOM/lucide-safe token charset [a-z0-9-]; anything else is
+-- dropped. Used for icon names and the tree namespace so neither can break out of an
+-- attribute. Empty result → "circle" (a safe lucide fallback) for icons; callers that
+-- need a different fallback pass it pre-checked.
+function tv_token($s)
+  if $s == nil then
+    return ""
+  end
+  $in = lower("" .. $s)
+  $out = ""
+  $i = 0
+  $n = length($in)
+  while $i < $n
+    $ch = substr($in, $i, 1)
+    if ($ch >= "a" and $ch <= "z") or ($ch >= "0" and $ch <= "9") or $ch == "-" then
+      $out = $out .. $ch
+    end
+    $i = $i + 1
+  end
+  return $out
+end
+
+-- Sanitised lucide icon name; "circle" when missing/empty after tokenising.
+function tv_icon($name)
+  $t = tv_token($name)
+  if $t == "" then
+    return "circle"
+  end
+  return $t
+end
+
+-- RHS count pill. nil or 0 → nothing (keeps the sidebar quiet); otherwise a small
+-- accent-washed badge like the 642 / 12 in the Filament reference.
+function tv_count_badge($count)
+  if $count == nil then
+    return ""
+  end
+  $s = "" .. $count
+  if $s == "0" then
+    return ""
+  end
+  return '<span class="tv-count">' .. esc($s) .. '</span>'
+end
+
+-- A leaf row: SAME .tv-row shape as a branch, but a chevron-width spacer instead of
+-- the toggle button (so the icon aligns exactly under branch icons). $href is RAW —
+-- escaped here, at emission (escape-once firewall), so every caller passes a plain URL.
+-- $attrs (optional): raw extra attributes for the <a> (e.g. a modal trigger
+-- 'data-modal-open="md-settings" data-modal-src="/biz/settings?modal=1"' so the leaf
+-- opens a popup instead of navigating; the href stays as the no-JS fallback). Callers
+-- that omit it get nil → no extra attributes (Mix pads missing trailing args with nil).
+function tv_leaf($href, $icon, $text, $vis, $count, $attrs)
+  $extra = ""
+  if $attrs != nil and ("" .. $attrs) != "" then
+    $extra = " " .. ("" .. $attrs)
+  end
+  return '<li class="tv-leaf"><div class="tv-row"><span class="tv-chev-spacer" aria-hidden="true"></span><a class="tv-link" href="' .. esc($href) .. '"' .. $extra .. '><i data-lucide="' .. tv_icon($icon) .. '"></i><span class="nav-label">' .. esc($text) .. '</span>' .. tv_count_badge($count) .. priv_dot($vis) .. '</a></div></li>'
+end
+
+-- A branch row: chevron toggle <button> beside the link, then the collapse wrapper
+-- (<div.tv-sub> grid 1fr↔0fr / <div.tv-sub-inner> overflow:hidden / nested <ul>).
+-- $id is the numeric row id (DOM-safe); $tree is already tokenised by the caller.
+function tv_branch($tree, $id, $href, $icon, $text, $vis, $count, $kidhtml)
+  $key = $tree .. ":" .. $id
+  $subid = "tv-sub-" .. $tree .. "-" .. $id
+  $h = '<li class="tv-branch tv-open" data-tv-key="' .. esc($key) .. '">'
+  $h = $h .. '<div class="tv-row">'
+  $h = $h .. '<button class="tv-chev" type="button" aria-expanded="true" aria-controls="' .. esc($subid) .. '" data-tv-key="' .. esc($key) .. '" aria-label="Toggle"><i data-lucide="chevron-right"></i></button>'
+  $h = $h .. '<a class="tv-link" href="' .. esc($href) .. '"><i data-lucide="' .. tv_icon($icon) .. '"></i><span class="nav-label">' .. esc($text) .. '</span>' .. tv_count_badge($count) .. priv_dot($vis) .. '</a>'
+  $h = $h .. '</div>'
+  $h = $h .. '<div class="tv-sub" id="' .. esc($subid) .. '"><div class="tv-sub-inner"><ul class="cms-nav-list tv-sub-list">' .. $kidhtml .. '</ul></div></div>'
+  $h = $h .. '</li>'
+  return $h
+end
+
+-- ───────────────────────────── recursion ─────────────────────────────
+
+-- Recursively render the subtree under $parent_key from the preloaded adjacency
+-- $map. Mirrors the old render_page_subtree shape EXACTLY (returns {html, visited};
+-- $visited id→true is THREADED through the return because Mix maps are by-value, so
+-- a pre-existing data cycle can't loop forever — no depth cap). Recurse FIRST so a
+-- node knows whether it is a branch (non-empty child html) or a leaf.
+function tv_subtree($map, $parent_key, $cfg, $visited)
+  $kids = $map[$parent_key]
+  if $kids == nil then
+    return { html: "", visited: $visited }
+  end
+  $tree = tv_token($cfg["tree"])
+  if $tree == "" then
+    -- A non-empty, DOM-safe namespace is mandatory: it disambiguates data-tv-key /
+    -- DOM ids / localStorage across trees (page id 5 vs category id 5). Fail loud
+    -- (like dt_opts) rather than emit colliding ":<id>" keys.
+    die("tv_subtree: cfg.tree (a non-empty [a-z0-9-] namespace) is required")
+  end
+  $icon = $cfg["icon"]
+  $prefix = $cfg["href_prefix"]
+  $text_col = $cfg["text_col"]
+  $vis_col = $cfg["vis_col"]
+  $count_map = $cfg["count_map"]
+  $h = ""
+  for each $r in $kids
+    $id = "" .. $r["id"]
+    if $visited[$id] != true then
+      $visited[$id] = true
+      $res = tv_subtree($map, $id, $cfg, $visited)
+      $visited = $res["visited"]
+      $kidhtml = $res["html"]
+      -- count: explicit count_map (categories: post count) else direct-child count
+      -- (pages: number of child pages, shown only on branches).
+      $count = nil
+      if $count_map != nil then
+        $count = $count_map[$id]
+      else
+        $cl = $map[$id]
+        if $cl != nil then
+          $count = length($cl)
+        end
+      end
+      $text = $r[$text_col]
+      $href = $prefix .. tv_or($r["slug"], "")   -- RAW; tv_leaf/tv_branch esc() at emission
+      -- Per-row "icon" overrides cfg.icon (back-compatible: a row without "icon" keeps
+      -- the single cfg.icon, so page/category callers are unchanged). Lets a mixed tree
+      -- (e.g. folders vs files) pick a lucide name per node.
+      $nicon = $icon
+      if $r["icon"] != nil then
+        $nicon = $r["icon"]
+      end
+      $vis = ""
+      if $vis_col != nil then
+        $vis = $r[$vis_col]
+      end
+      if $kidhtml != "" then
+        $h = $h .. tv_branch($tree, $id, $href, $nicon, $text, $vis, $count, $kidhtml)
+      else
+        $h = $h .. tv_leaf($href, $nicon, $text, $vis, $count)
+      end
+    end
+  end
+  return { html: $h, visited: $visited }
+end
+
+-- Convenience wrapper: a whole tree in its own <ul>. "" when empty.
+function tv_tree($map, $cfg)
+  $res = tv_subtree($map, "0", $cfg, {})
+  if $res["html"] == "" then
+    return ""
+  end
+  return '<ul class="cms-nav-list tv-tree">' .. $res["html"] .. '</ul>'
+end

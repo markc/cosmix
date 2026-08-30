@@ -1,0 +1,177 @@
+-- admin_resource.mix — the webd ADMIN PANEL FOUNDATION (executable canon).
+-- Contract + extension points: _doc/2026-07-12-webd-foundations.md (§ Admin panel).
+-- Registry: lib/foundation_registry.mix · probe: _bin/foundation_check.mix.
+--
+-- Include AFTER datatable.mix (uses dt_* / md_* / doc; includes nothing itself,
+-- matching the shared-tree include style). Three exports:
+--   dt_admin_opts($overrides)  — THE standard list options. Presentation only.
+--   dt_admin_list($cfg)        — the standard SQL-list page tail.
+--   dt_try_delete_row / dt_bulk_try_delete — the guarded-delete POLICY helpers
+--     (deliberately separate from the presentation preset: the preset never
+--     owns mutations; handlers wire these explicitly).
+
+-- The standard admin list profile. Callers pass ONLY what is page-specific
+-- (base_route/caption/noun/default_sort, spec-coupled lambdas, filters/groups)
+-- plus NAMED overrides where the data source can't support the standard
+-- (e.g. JMAP lists: select_all:false — dt_all_ids is SQL-only; invoices:
+-- bulk:false — immutable history). Never copy these defaults into a handler.
+function dt_admin_opts($o)
+  -- LOCKED keys (Codex R2/P0-round-2): the parts that ARE the standard. A caller
+  -- passing one is drift-by-override — fail LOUD at config, never render off-standard.
+  -- The RMB context menu (row_actions_contextmenu, locked ON) is the UNIVERSAL
+  -- row-action affordance — Mark 2026-07-12(b) retired the visible actions column
+  -- as redundant (the earlier P0 discoverability default is SUPERSEDED). A page
+  -- that still wants the inline icon column opts IN with row_actions_column:true.
+  for each $lk in ["profile", "skin", "compact", "row_actions_contextmenu", "action_labels"]
+    if $o[$lk] != nil then
+      die("admin panel foundation: '" .. $lk .. "' is locked (admin-list/1) — remove the override or exempt the page in foundation_registry.mix")
+    end
+  end
+  $std = {
+    bulk: true, select_all: true, bulk_label: "Delete selected",
+    search: true,
+    row_actions_column: false,
+    page_size: 25, page_sizes: [6, 12, 25, 50, 100, "all"]
+  }
+  for each $k in keys($o)
+    $std[$k] = $o[$k]
+  end
+  -- locked values applied AFTER overrides; profile stamped last (the runtime
+  -- conformance mark for foundation_check + future golden fixtures).
+  $std["skin"] = true
+  $std["compact"] = true
+  $std["row_actions_contextmenu"] = true
+  $std["action_labels"] = false
+  $std["profile"] = "admin-list/1"
+  return dt_opts($std)
+end
+
+-- The standard SQL-backed list page: state → dt_sql → render → partial/doc
+-- tail (region + optional md-edit shell + contextmenu chrome). JMAP lists keep
+-- their own tails (try/catch + custom shells) and adopt dt_admin_opts only.
+-- $cfg: { title, user, spec, opts, table, select,
+--         summary: true|nil        — dt_sql_summary over the same dt_where,
+--         prefix_html: raw|nil     — e.g. an inline flash banner,
+--         modal: "md-edit"(default) | false | "<id>", modal_size: "lg" }
+function dt_admin_list($cfg)
+  $spec = $cfg["spec"]
+  $opts = $cfg["opts"]
+  $state = dt_state($QUERY, $spec, $opts)
+  $res = dt_sql($cfg["table"], $spec, $state, $cfg["select"])
+  $summary = nil
+  if $cfg["summary"] == true then
+    $summary = dt_sql_summary($cfg["table"], $spec, $opts, $state)
+  end
+  -- live_search pages: a search submit patches ONLY the #dt-results slot
+  -- (dt_wants_results is false everywhere else, so this is inert without it).
+  -- The instance id threads through every patch target (multi-table pages).
+  if dt_wants_results($opts["id"]) then
+    return dt_results_partial(dt_results_inner($spec, $opts, $state, $res["rows"], $res["total"], $summary), $opts["id"])
+  end
+  $dt = ""
+  if $cfg["prefix_html"] != nil then
+    $dt = "" .. $cfg["prefix_html"]
+  end
+  $dt = $dt .. dt_render($spec, $opts, $state, $res["rows"], $res["total"], $summary)
+  if dt_wants_partial($opts["id"]) then
+    return dt_partial($dt, $opts["id"])
+  end
+  $tail = dt_region($dt, $opts["id"], $opts["skin"])
+  $modal = $cfg["modal"]
+  if $modal == nil then
+    $modal = "md-edit"
+  end
+  if $modal != false then
+    $tail = $tail .. md_shell("" .. $modal, { size: "" .. dt_or($cfg["modal_size"], "lg") }) .. md_script()
+  end
+  return doc(200, "" .. $cfg["title"], $cfg["user"], $tail .. dt_actions_chrome($opts))
+end
+
+-- ─────────────────── guarded-delete policy helpers ───────────────────
+-- Guard + existence re-check + delete (+ audit) ATOMICALLY under ONE
+-- BEGIN IMMEDIATE: a concurrent dependent writer that revalidates its parent
+-- inside its own tx (biz_row_exists pattern) then commits before or after this
+-- delete, never interleaved — webd runs SQLite with FKs off, so this pair of
+-- disciplines is the ONLY orphan protection. Returns "" on delete, else the
+-- human-readable refusal reason.
+-- $h hooks: guard: fn($id)->""|reason (optional) · fetch: fn($id)->row|nil ·
+--           delete: fn($id,$row) · audit: fn($id,$row) (optional) ·
+--           missing: "No such X." (optional)
+function dt_try_delete_row($id, $h)
+  try
+    db_exec("BEGIN IMMEDIATE")
+  catch $e
+    return "Database is busy — try again."
+  end
+  try
+    $block = ""
+    if $h["guard"] != nil then
+      $block = "" .. $h["guard"]($id)
+    end
+    $row = nil
+    if $block == "" then
+      $row = $h["fetch"]($id)
+      if $row == nil then
+        $block = "" .. dt_or($h["missing"], "No such row.")
+      end
+    end
+    if $block == "" then
+      $h["delete"]($id, $row)
+      if $h["audit"] != nil then
+        $h["audit"]($id, $row)
+      end
+      db_exec("COMMIT")
+      return ""
+    end
+    db_exec("ROLLBACK")
+    return $block
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return "Delete failed: " .. $e
+  end
+end
+
+-- The skip-and-report bulk loop (Codex Q1a): per-row tx via dt_try_delete_row;
+-- invalid ids count as skips (never false success). Returns
+-- { deleted, skipped, why } — why = the FIRST refusal reason.
+-- $h.id_ok: fn($raw)->normalized|nil overrides the default numeric-id gate
+-- (slug-keyed lists like Content pass their own shape check).
+function dt_bulk_try_delete($ids, $h)
+  $ndel = 0
+  $nskip = 0
+  $why = ""
+  for each $bid in $ids
+    $did = nil
+    if $h["id_ok"] != nil then
+      $did = $h["id_ok"]($bid)
+    else
+      $did = to_number($bid)
+    end
+    $block = "Invalid selection id."
+    if $did != nil then
+      $block = dt_try_delete_row($did, $h)
+    end
+    if $block == "" then
+      $ndel = $ndel + 1
+    else
+      $nskip = $nskip + 1
+      if $why == "" then
+        $why = $block
+      end
+    end
+  end
+  return { deleted: $ndel, skipped: $nskip, why: $why }
+end
+
+-- The standard flash line for a bulk result ("Deleted N…" / "Deleted N,
+-- skipped M — reason" / "No rows selected") + its variant, so every panel
+-- reports identically. Returns { msg, kind }.
+function dt_bulk_report($r, $noun)
+  if $r["deleted"] == 0 and $r["skipped"] == 0 then
+    return { msg: "No rows selected", kind: "warning" }
+  end
+  if $r["skipped"] > 0 then
+    return { msg: "Deleted " .. $r["deleted"] .. ", skipped " .. $r["skipped"] .. " — " .. $r["why"], kind: "warning" }
+  end
+  return { msg: "Deleted " .. $r["deleted"] .. " " .. $noun, kind: "success" }
+end

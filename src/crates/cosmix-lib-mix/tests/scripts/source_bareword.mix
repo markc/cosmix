@@ -1,0 +1,24 @@
+-- Bareword `source` paths: `.`, `/`, `..`, no quoting needed.
+-- The integration test runner sets cwd to the crate root, so
+-- `./tests/scripts/source_fixture.mix` resolves correctly.
+
+source ./tests/scripts/source_fixture.mix
+print($sourced_marker)
+
+-- Regression: expression form (variable holding the path) still works.
+$p = "./tests/scripts/source_fixture.mix"
+$sourced_marker = "before"
+source $p
+print($sourced_marker)
+
+-- Regression: builtin() .. "/path" concat form still works.
+-- Uses cwd() rather than env("PWD") because cargo sets test cwd
+-- to the crate root but inherits the outer PWD env var unchanged.
+$sourced_marker = "before2"
+source cwd() .. "/tests/scripts/source_fixture.mix"
+print($sourced_marker)
+
+-- Expected output:
+-- fixture loaded
+-- fixture loaded
+-- fixture loaded

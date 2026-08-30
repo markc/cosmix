@@ -1,0 +1,126 @@
+-- h_forum.mix — threaded forum. GET /forum (board index), GET /forum/<slug> (a topic's
+-- opening post + threaded replies + composer), POST /forum (new topic). Replies post to the
+-- shared /reply endpoint (h_reply.mix), the SAME path blog comments use — one substrate
+-- (thread.mix / cms_threads). A forum topic is a cms_posts row kind='forum'; its discussion
+-- is cms_threads rooted at it (root_kind='forum'). Plan: _plan/2026-06-28-unified-message-surfaces.md.
+include "/opt/cosmix/vhosts/shared/widgets/thread.mix"
+
+-- Byline for a topic's opening post: author · date.
+function forum_byline($t)
+  $who = thread_or($t["author"], "")
+  if trim("" .. $who) == "" then
+    $who = "Anonymous"
+  end
+  return $who .. " · " .. blog_date("" .. thread_or($t["created"], ""))
+end
+
+-- New-topic composer (logged-in users only).
+function forum_new_form()
+  $h = '<form class="th-form forum-new" method="post" action="/forum">'
+  $h = $h .. '<input type="hidden" name="action" value="new_topic">'
+  $h = $h .. '<input class="fm-control" type="text" name="title" placeholder="Topic title" required>'
+  $h = $h .. '<textarea class="fm-control fm-mono" name="body" rows="4" placeholder="Say something… (markdown)" required></textarea>'
+  $h = $h .. '<div class="th-form-actions"><button class="btn btn-primary" type="submit">New topic</button></div>'
+  $h = $h .. '</form>'
+  return $h
+end
+
+-- GET /forum: published topics, latest activity first, with reply counts.
+function forum_index($user)
+  $vis = ""
+  if not can_preview_unpublished($user) then
+    $vis = " AND p.visibility = 'public'"
+  end
+  $rows = db_query("SELECT p.id AS id, p.slug AS slug, p.title AS title, p.created AS created, p.updated AS updated, u.display AS author, (SELECT count(*) FROM cms_threads t WHERE t.root_kind = 'forum' AND t.root_id = p.id AND t.status = 'visible') AS replies FROM cms_posts p LEFT JOIN users u ON u.id = p.author_id WHERE p.kind = 'forum' AND p.status = 'published'" .. $vis .. " ORDER BY p.updated DESC", [])
+  $h = '<div class="forum-index"><div class="forum-head"><h1>Forum</h1></div>'
+  if $user != nil then
+    $h = $h .. forum_new_form()
+  else
+    $h = $h .. '<p class="muted"><a href="/login">Sign in</a> to start a topic.</p>'
+  end
+  if length($rows) == 0 then
+    $h = $h .. '<p class="muted forum-empty">No topics yet.</p>'
+  else
+    $h = $h .. '<ul class="forum-list">'
+    for each $r in $rows
+      $h = $h .. '<li class="forum-row"><a class="forum-topic-link" href="/forum/' .. esc("" .. $r["slug"]) .. '">' .. esc("" .. $r["title"]) .. '</a><span class="forum-row-meta">' .. esc(forum_byline($r)) .. ' · ' .. esc("" .. $r["replies"]) .. ' replies</span></li>'
+    end
+    $h = $h .. '</ul>'
+  end
+  $h = $h .. '</div>'
+  return doc(200, "Forum", $user, $h)
+end
+
+-- POST /forum: create a topic (any logged-in user).
+function forum_post_index($user)
+  if $user == nil then
+    return redirect_flash("/login", "Sign in to post", "warning")
+  end
+  $f = parse_form($BODY)
+  if $f["action"] != "new_topic" then
+    return redirect_flash("/forum", "Unknown action", "warning")
+  end
+  $title = $f["title"]
+  if $title == nil or trim($title) == "" then
+    return redirect_flash("/forum", "A topic needs a title", "warning")
+  end
+  $body = $f["body"]
+  if $body == nil then
+    $body = ""
+  end
+  $slug = cms_unique_slug(slugify($title))
+  db_exec("INSERT INTO cms_posts (slug, title, body, status, visibility, kind, author_id) VALUES (?1, ?2, ?3, 'published', 'public', 'forum', ?4)", [$slug, $title, $body, "" .. $user["id"]])
+  return redirect_flash("/forum/" .. $slug, "Topic posted", "success")
+end
+
+-- GET /forum/<slug>: opening post + threaded replies + composer.
+function forum_topic($user, $slug)
+  $rows = db_query("SELECT p.id AS id, p.slug AS slug, p.title AS title, p.body AS body, p.created AS created, p.status AS status, p.visibility AS visibility, u.display AS author FROM cms_posts p LEFT JOIN users u ON u.id = p.author_id WHERE p.slug = ?1 AND p.kind = 'forum'", [$slug])
+  if length($rows) == 0 then
+    return doc(404, "Not found", $user, '<div class="card"><h1>404</h1><p class="muted">No such topic.</p><a class="btn btn-ghost" href="/forum">← Forum</a></div>')
+  end
+  $t = $rows[0]
+  if not can_preview_unpublished($user) and ($t["status"] != "published" or $t["visibility"] == "private") then
+    return doc(404, "Not found", $user, '<div class="card"><h1>404</h1></div>')
+  end
+  $q = parse_query($QUERY)
+  $edit = ""
+  if can_preview_unpublished($user) then
+    $edit = ' <a class="btn btn-ghost btn-sm" href="/admin/posts?edit=' .. esc("" .. $t["slug"]) .. '">Edit</a>'
+  end
+  $h = '<article class="post forum-topic">'
+  $h = $h .. '<div class="forum-topic-head"><a class="btn btn-ghost btn-sm" href="/forum">← Forum</a>' .. $edit .. '</div>'
+  $h = $h .. '<h1>' .. esc("" .. $t["title"]) .. '</h1>'
+  $h = $h .. '<p class="muted th-byline">' .. esc(forum_byline($t)) .. '</p>'
+  $h = $h .. '<div class="post">' .. render_body("" .. thread_or($t["body"], "")) .. '</div>'
+  $h = $h .. '</article>'
+  $tpath = "/forum/" .. ("" .. $t["slug"])
+  -- mirror h_reply's gate: replies accepted only on a published+public root (a draft topic
+  -- a moderator is previewing shows no composer).
+  $can = ($user != nil) and ($t["status"] == "published") and ($t["visibility"] != "private")
+  $topts = { root_kind: "forum", root_id: $t["id"], base: $tpath, "return": $tpath, post_to: "/reply", can_reply: $can, see_pending: can_preview_unpublished($user), reply_to: $q["reply_to"], heading: "Replies" }
+  $h = $h .. rd_thread($topts)
+  return doc(200, "" .. $t["title"], $user, $h)
+end
+
+function forum_main()
+cms_init()
+$user = current_user($HEADERS)
+-- Forum surface gate: a disabled forum hides the nav link and 404s /forum + topics.
+if not feature("forum") then
+  return feature_off_doc($user, "The forum")
+end
+$path = $PATH
+$slug = ""
+if pos("/forum/", $path) == 1 then
+  $slug = substr($path, 7, length($path) - 7)
+end
+if $slug == "" then
+  if $METHOD == "POST" then
+    return forum_post_index($user)
+  end
+  return forum_index($user)
+end
+-- topic page is GET-only (replies go to /reply); a stray POST just re-renders the topic.
+return forum_topic($user, $slug)
+end

@@ -1,0 +1,5 @@
+{"record":"meta","version":1,"lane":"codex"}
+{"record":"line","after_ms":1,"stdout":"{\"type\":\"thread.started\",\"thread_id\":\"fixture-codex-death\"}"}
+{"record":"line","after_ms":3,"stdout":"{\"type\":\"turn.started\"}"}
+{"record":"line","after_ms":7,"stdout":"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"partial answer\"}}"}
+{"record":"exit","code":17,"signal":null}

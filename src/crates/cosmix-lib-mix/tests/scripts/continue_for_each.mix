@@ -1,0 +1,35 @@
+-- continue_for_each.mix: Phase 6.6 regression test
+-- Behaviour is already correct in v0.2.2 (evaluator.rs ~897-929);
+-- this pins it so future refactors don't break the case.
+-- Expected output:
+-- 1
+-- 3
+-- 5
+-- 9
+-- 2
+-- 4
+-- 6
+-- 8
+-- 10
+
+-- continue inside for each: skip odd, print even (and vice versa)
+-- Note: `continue` in Mix means "skip to next iteration."
+
+-- Skip evens, print odds
+for each $x in [1, 2, 3, 4, 5]
+    if $x % 2 == 0 then
+        continue
+    end
+    print $x
+end
+
+-- 9 proves control leaves the loop body cleanly across iterations
+print 9
+
+-- Skip odds, print evens
+for each $x in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    if $x % 2 == 1 then
+        continue
+    end
+    print $x
+end

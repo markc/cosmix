@@ -1,0 +1,44 @@
+[package]
+name = "cosmix-lib-wg"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "cosmix_wg"
+
+# Pure-logic core crate per CLAUDE.md "Crate architecture (core-first,
+# citizen-on-feature)". No `cosmix-lib-bus` / `-client` / `-config` /
+# `-props` deps and no kernel / netlink-socket types referenced.
+# `cargo test --no-default-features` is the full test surface.
+#
+# The pure-wire-format scope here is the substrate layer; an authoritative
+# `cosmix-wgd` daemon would sit on top, adding orchestration.
+
+[features]
+default = []
+
+[dependencies]
+base64 = { workspace = true }
+thiserror = "1"
+zeroize = { version = "1", features = ["derive"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+x25519-dalek = { version = "2", default-features = false, features = [
+    "static_secrets",
+    "zeroize",
+] }
+# QR-code rendering for client peer configs (wg-admin UX parity).
+# default-features pulls in `image` + `pic`; we only need SVG output, so
+# strip them to keep the dep graph minimal.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# Pure-wire netlink message construction (P1-C7). No sockets — the
+# citizen-side reconciler owns the AF_NETLINK file descriptor; we
+# build/parse the typed messages here so the unit tests run anywhere.
+netlink-packet-core = "0.8"
+netlink-packet-generic = "0.4"
+netlink-packet-wireguard = "0.4"
+netlink-packet-route = "0.30"
+
+[dev-dependencies]
+hex = { workspace = true }

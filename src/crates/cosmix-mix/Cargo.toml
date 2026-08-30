@@ -1,0 +1,72 @@
+[package]
+name = "cosmix-mix"
+version = "0.61.1"
+edition = "2024"
+
+[[bin]]
+name = "mix"
+path = "src/main.rs"
+
+# The `mix` binary ships in one flavour. Bus client + citizen runtime
+# are unconditional deps (~1-3 MB size cost accepted for
+# one-binary-per-package simplicity); the bare-host vs mesh-host
+# distinction is made at runtime by the lazy-probe state machine in
+# `bus::MixBusHandler`, not at build time.
+
+[dependencies]
+# cosmix-lib-mix is a sibling crate within the mix repo — relative
+# path stays one level up.
+cosmix-lib-mix = { path = "../cosmix-lib-mix", features = ["json", "regex", "toml", "datetime", "url", "crypto", "http", "sqlite", "tokio-sleep", "dkim", "serde", "markdown", "datastar", "xml"] }
+# Bus-family deps live in the sibling bus repo at `~/.bus/`. Path is
+# FOUR `..` to climb out of `crates/cosmix-mix/` to `$HOME`, then
+# into `.bus/src/crates/<crate>`. These path-deps flip to
+# version-deps once bus publishes to crates.io.
+cosmix-lib-bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus" }
+cosmix-lib-client = { package = "cosmix-lib-client", path = "../cosmix-lib-client", features = ["native"] }
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
+# SPEC 07 §2 read surface so a Mix citizen's
+# `<svc>.props.{get,list,describe}` is byte-consistent with cos-side
+# daemons. The substrate-shaped `cosmix-lib-props-store` (storage,
+# audit, SPEC 12 mutation router) lives in cos and is NOT pulled
+# here. The `bus` feature on cosmix-lib-props-core pulls
+# cosmix-lib-bus + chrono (for SPEC 07 §3/§4 wire builders).
+cosmix_props = { package = "cosmix-lib-props-core", path = "../cosmix-lib-props-core", default-features = false, features = ["bus"] }
+# Shared logging core (bus). `mix --serve` initialises journald-primary
+# logging through `cosmix_log::init` (the serve preset). Pure core only
+# — no `cosmix-lib-props-store`, so no live SPEC-12 `<svc>.log` swap;
+# RUST_LOG + restart is the serve control surface.
+cosmix_log = { package = "cosmix-lib-log", path = "../cosmix-lib-log" }
+# Node-config + shutdown-signal helpers are inlined locally
+# (`src/cosmix_paths.rs`, `src/main.rs`, `src/node_config.rs`)
+# rather than depending on cos-side `cosmix-lib-config` /
+# `cosmix-lib-daemon` — mix has no cos dependency.
+rustyline = "15"
+dirs = "6"
+libc = "0.2"
+tokio = { version = "1", features = ["rt", "macros", "time", "signal"] }
+tokio-util = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+glob = "0.3"
+indexmap = "2"
+tracing = "0.1"
+# `mix man` resolves the canonical manual from cosmix.dev. This matches
+# cosmix-lib-mix's existing ureq 2 dependency, so Cargo unifies the HTTP/TLS
+# stack rather than adding another client.
+ureq = "2"
+# RFC3339 `lifecycle.started_at` (SPEC 18 WS4), matching the indexd
+# reference's chrono-formatted start timestamp.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rusqlite.workspace = true
+blake3 = "1"
+
+[dev-dependencies]
+# Property-based testing for the shell-dispatch tokenizer (P0 of the mix
+# tokenizer fuzz/property corpus — see _doc/planned/mix-tokenizer-fuzz-corpus.md
+# in the cosmix hub). Test-only; never linked into the shipped binary.
+proptest = "1"
+tempfile = "3"
+
+[build-dependencies]
+# Captures mix HEAD sha + build time for serve-citizen provenance.
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }

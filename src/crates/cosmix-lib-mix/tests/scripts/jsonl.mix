@@ -1,0 +1,44 @@
+-- jsonl.mix: Phase 6 — read_lines / read_json / read_jsonl
+-- Expected output:
+-- 3
+-- {"name": "alice", "score": 72}
+-- {"name": "bob", "score": 41}
+-- {"name": "eve", "score": 85}
+-- localhost
+-- 4200
+-- bus
+-- 3
+-- alice
+-- 72
+-- eve
+-- 85
+-- 2
+-- 1
+-- 2
+
+-- read_lines: list of lines, no trailing newline, no trailing empty line
+$lines = read_lines("tests/json_fixtures/data.jsonl")
+print length($lines)
+for each $line in $lines
+    print $line
+end
+
+-- read_json: single-record JSON file → map
+$cfg = read_json("tests/json_fixtures/config.json")
+print $cfg.host
+print $cfg.port
+print $cfg.features[0]
+
+-- read_jsonl: list of parsed records (strict by default)
+$users = read_jsonl("tests/json_fixtures/data.jsonl")
+print length($users)
+print $users[0].name
+print $users[0].score
+print $users[2].name
+print $users[2].score
+
+-- read_jsonl with skip_errors on a file containing a bad line
+$clean = read_jsonl("tests/json_fixtures/dirty.jsonl", {skip_errors: true})
+print length($clean)
+print $clean[0].ok
+print $clean[1].ok

@@ -1,0 +1,881 @@
+-- h_notes.mix — /notes markdown corpus surface (files-as-truth, filesd-backed).
+--
+-- A browse / read / edit web surface over a single cosmix-filesd corpus, reached
+-- through webd's DELEGATED bus_call seam (the route grants bus-svc:filesd-notes +
+-- the bus:filesd.* verbs; webd's Rust admin gate authorizes; filesd enforces the
+-- $cosmix_delegation envelope). One handler, four dispatches:
+--
+--   GET  /notes              → list (datatable over filesd.list / filesd.search)
+--   GET  /notes?view=<path>  → read  (rd_view over filesd.read)
+--   GET  /notes?edit=<path>  → twin-pane editor (wb_canvas + live preview)
+--   GET  /notes?new=1        → blank editor
+--   POST action=save         → create (filesd.save) or update (overlay-merge → save)
+--   POST action=delete       → filesd.delete
+--   POST action=rename       → filesd.move (identity-stable rename/relocate)
+--
+-- Notes are keyed on their corpus-relative PATH (filesd's verbs are path-addressed).
+-- The seam is admin-only (webd injects the bus capability only for rank>=3), so the
+-- whole surface gates on `admin`. bus_call RAISES on any failure — every call is
+-- wrapped in notes_call() try/catch and degrades to a friendly notice.
+--
+-- IMPORTANT (webd-embedded mix): NO mix-0.20 syntax (?? / ?:) — use if/else + fm_or.
+-- Reserved word `label` MUST be a string key ("label":). Concatenation is `..`.
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/reader.mix"
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/treeview.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+include "/opt/cosmix/vhosts/shared/widgets/contextmenu.mix"
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- filesd seam — one delegated bus_call, wrapped. Returns { ok, result } | { ok:false, err }.
+-- ─────────────────────────────────────────────────────────────────────────────
+function notes_call($verb, $args)
+  try
+    $r = bus_call($verb, $args)
+    return { ok: true, result: $r }
+  catch $e
+    return { ok: false, err: ("" .. $e) }
+  end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Frontmatter helpers — surgical, line-level, byte-preserving (never round-trips
+-- through a serializer). filesd writes `key: value` lines with `id:` last; an edit
+-- overlays only title/content_type/tags and leaves id/created/unmodeled lines exact.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Split a raw file into { front, body }: front = the lines between the leading
+-- `---` fences (no fences), body = everything after. No fence → { "", whole }.
+function notes_split($raw)
+  $r = "" .. $raw
+  if substr($r, 0, 4) != "---\n" then
+    return { front: "", body: $r }
+  end
+  $rest = substr($r, 4, length($r) - 4)
+  $idx = pos("\n---\n", $rest)
+  if $idx == 0 then
+    return { front: "", body: $r }
+  end
+  $front = substr($rest, 0, $idx - 1)
+  $bodystart = $idx + 4
+  $body = substr($rest, $bodystart, length($rest) - $bodystart)
+  return { front: $front, body: $body }
+end
+
+-- filesd.read omits `body` (and sets body_truncated:true) for files over 4 MiB.
+-- Editing such a note would rewrite it from an empty body → silent data loss, so
+-- every read/edit/save path must refuse when the body isn't fully present.
+function notes_body_usable($doc)
+  if $doc["body_truncated"] == true then
+    return false
+  end
+  if $doc["body"] == nil then
+    return false
+  end
+  return true
+end
+
+-- The key of a `key: value` line ("" if none).
+function notes_line_key($ln)
+  $i = pos(":", "" .. $ln)
+  if $i == 0 then
+    return ""
+  end
+  return trim(substr("" .. $ln, 0, $i - 1))
+end
+
+-- Replace the `$key:` line's value (or append the line if absent).
+function notes_overlay($front, $key, $value)
+  $lines = split("" .. $front, "\n")
+  $out = ""
+  $found = false
+  $first = true
+  for each $ln in $lines
+    $newln = $ln
+    if notes_line_key($ln) == $key then
+      $newln = $key .. ": " .. $value
+      $found = true
+    end
+    if $first then
+      $out = $newln
+      $first = false
+    else
+      $out = $out .. "\n" .. $newln
+    end
+  end
+  if not $found then
+    if $out == "" then
+      $out = $key .. ": " .. $value
+    else
+      $out = $out .. "\n" .. $key .. ": " .. $value
+    end
+  end
+  return $out
+end
+
+-- Drop the `$key:` line entirely (used when tags becomes empty).
+function notes_overlay_remove($front, $key)
+  $lines = split("" .. $front, "\n")
+  $out = ""
+  $first = true
+  for each $ln in $lines
+    if notes_line_key($ln) != $key then
+      if $first then
+        $out = $ln
+        $first = false
+      else
+        $out = $out .. "\n" .. $ln
+      end
+    end
+  end
+  return $out
+end
+
+-- A single-line frontmatter scalar: strip CR/LF so a crafted value (a pasted/posted
+-- newline in title or content_type) cannot inject or replace another frontmatter line
+-- (e.g. a fake `id:`/`created:`) or a `---` fence. Tags are safe via json_encode
+-- (which escapes newlines inside the JSON string); only bare scalars need this.
+function notes_scalar($s)
+  $t = "" .. $s
+  $t = replace($t, "\r", " ")
+  $t = replace($t, "\n", " ")
+  return trim($t)
+end
+
+-- "a, b, c" → '["a","b","c"]' (JSON array line), or "" when empty.
+function notes_tags_json($s)
+  $t = trim("" .. fm_or($s, ""))
+  if $t == "" then
+    return ""
+  end
+  $parts = split($t, ",")
+  $arr = []
+  for each $p in $parts
+    $one = trim($p)
+    if $one != "" then
+      push($arr, $one)
+    end
+  end
+  if length($arr) == 0 then
+    return ""
+  end
+  return json_encode($arr)
+end
+
+-- A parsed tags value (JSON array from a filesd row, or nil) → "a, b, c".
+function notes_tags_display($v)
+  if $v == nil then
+    return ""
+  end
+  return join($v, ", ")
+end
+
+-- title → "<slug>.md" (lowercase, [a-z0-9-], collapsed dashes).
+function notes_slug($title)
+  $s = lower(trim("" .. $title))
+  $out = ""
+  $prevdash = false
+  $i = 0
+  $n = length($s)
+  while $i < $n
+    $ch = substr($s, $i, 1)
+    if ($ch >= "a" and $ch <= "z") or ($ch >= "0" and $ch <= "9") then
+      $out = $out .. $ch
+      $prevdash = false
+    else
+      if not $prevdash and $out != "" then
+        $out = $out .. "-"
+        $prevdash = true
+      end
+    end
+    $i = $i + 1
+  end
+  if $out != "" and substr($out, length($out) - 1, 1) == "-" then
+    $out = substr($out, 0, length($out) - 1)
+  end
+  if $out == "" then
+    $out = "note"
+  end
+  return $out .. ".md"
+end
+
+-- True iff a live note already exists at $path.
+function notes_exists($path)
+  $rd = notes_call("filesd.read", { path: $path })
+  return $rd["ok"]
+end
+
+-- A slug that doesn't collide with an existing file (foo.md, foo-2.md, …).
+-- NOTE (deferred): this is a read-then-save check, so two concurrent NEW notes with
+-- the same title share a TOCTOU window where the second create could upsert onto the
+-- first's path. It is benign for this single-admin tool; the real fix is an atomic
+-- create-if-absent flag on filesd.save (a filesd daemon change), tracked as a Phase-1
+-- follow-up rather than papered over client-side.
+function notes_unique_path($name)
+  if not notes_exists($name) then
+    return $name
+  end
+  $base = substr($name, 0, length($name) - 3)
+  $k = 2
+  $try = $base .. "-" .. ("" .. $k) .. ".md"
+  while notes_exists($try)
+    $k = $k + 1
+    $try = $base .. "-" .. ("" .. $k) .. ".md"
+  end
+  return $try
+end
+
+-- Normalize a rename target: trim + ensure a .md extension.
+function notes_normalize_name($s)
+  $t = trim("" .. $s)
+  if $t == "" then
+    return ""
+  end
+  $n = length($t)
+  if $n < 3 or substr($t, $n - 3, 3) != ".md" then
+    $t = $t .. ".md"
+  end
+  return $t
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- List adapter — fetch the corpus, then sort/paginate in-memory (the dt_sql/dt_jmap
+-- contract: receive $state, return {rows, total}). filesd.list gives the full live
+-- set + count; filesd.search does server-side substring. Both fetch up to 1000 rows
+-- (a notes corpus is small); we own sort + pagination so the pager stays accurate.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Sort key for a column ("" if missing); numeric columns coerce to numbers.
+function notes_key($r, $col)
+  $v = $r[$col]
+  if $col == "mtime" or $col == "size_bytes" or $col == "word_count" then
+    return to_number("" .. fm_or($v, 0))
+  end
+  return "" .. fm_or($v, "")
+end
+
+-- Stable selection sort by $col (version-proof: only length/index/push/map/`<`/`>`).
+function notes_sorted($rows, $col, $asc)
+  $n = length($rows)
+  $used = {}
+  $out = []
+  $k = 0
+  while $k < $n
+    $best = -1
+    $i = 0
+    while $i < $n
+      if $used["" .. $i] == nil then
+        if $best == -1 then
+          $best = $i
+        else
+          $kb = notes_key($rows[$best], $col)
+          $ki = notes_key($rows[$i], $col)
+          $take = $ki < $kb
+          if not $asc then
+            $take = $ki > $kb
+          end
+          if $take then
+            $best = $i
+          end
+        end
+      end
+      $i = $i + 1
+    end
+    $used["" .. $best] = true
+    push($out, $rows[$best])
+    $k = $k + 1
+  end
+  return $out
+end
+
+-- Page slice [pos, pos+limit).
+function notes_slice($rows, $pos, $limit)
+  $out = []
+  $n = length($rows)
+  $end = $pos + $limit
+  if $end > $n then
+    $end = $n
+  end
+  $i = $pos
+  while $i < $end
+    push($out, $rows[$i])
+    $i = $i + 1
+  end
+  return $out
+end
+
+-- We sort + paginate in-memory, so we must hold the whole result set. filesd.list
+-- caps `limit` at 1000/call but exposes a real `total` + `offset`, so we PAGE through
+-- it (never trust a single capped read as the whole corpus) up to a hard ceiling
+-- (5000), and flag `truncated` so the UI can say so rather than silently hide notes.
+-- filesd.search has no offset and a capped count, so search is bounded to one page.
+
+-- Fetch the corpus for the current state. → { ok, rows, total, truncated, err }.
+function notes_fetch($state)
+  $q = "" .. fm_or($state["q"], "")
+  if $q != "" then
+    $res = notes_call("filesd.search", { q: $q, limit: 1000 })
+    if not $res["ok"] then
+      return { ok: false, rows: [], total: 0, truncated: false, err: $res["err"] }
+    end
+    $rows = $res["result"]["rows"]
+    if $rows == nil then
+      $rows = []
+    end
+    $trunc = false
+    if length($rows) >= 1000 then
+      $trunc = true
+    end
+    return { ok: true, rows: $rows, total: length($rows), truncated: $trunc, err: "" }
+  end
+  -- Full list: page through offsets, using filesd's real total, to the hard cap.
+  $all = []
+  $offset = 0
+  $reported = 0
+  $more = true
+  while $more
+    $res = notes_call("filesd.list", { limit: 1000, offset: $offset })
+    if not $res["ok"] then
+      if $offset == 0 then
+        return { ok: false, rows: [], total: 0, truncated: false, err: $res["err"] }
+      end
+      $more = false
+    else
+      $rows = $res["result"]["rows"]
+      if $rows == nil then
+        $rows = []
+      end
+      $reported = to_number("" .. fm_or($res["result"]["total"], 0))
+      for each $r in $rows
+        push($all, $r)
+      end
+      if length($rows) == 0 or length($all) >= $reported or length($all) >= 5000 then
+        $more = false
+      else
+        -- advance by what we actually got (robust to a short page), never a fixed 1000
+        $offset = length($all)
+      end
+    end
+  end
+  $trunc = false
+  $total = $reported
+  if length($all) < $reported then
+    -- hit the hard cap (or a short read): only the loaded set is browsable.
+    $trunc = true
+    $total = length($all)
+  end
+  return { ok: true, rows: $all, total: $total, truncated: $trunc, err: "" }
+end
+
+-- The {rows, total, truncated, err} adapter dt_render consumes.
+function notes_adapter($state)
+  $f = notes_fetch($state)
+  if not $f["ok"] then
+    return { rows: [], total: 0, truncated: false, err: $f["err"] }
+  end
+  $rows = $f["rows"]
+  $sc = "" .. fm_or($state["sort_col"], "")
+  if $sc != "" then
+    $rows = notes_sorted($rows, $sc, $state["asc"])
+  end
+  $page = notes_slice($rows, $state["pos"], $state["limit"])
+  return { rows: $page, total: $f["total"], truncated: $f["truncated"], err: "" }
+end
+
+-- List config, built once (spec + opts).
+function notes_list_config()
+  $title_cell = fn($r) = ('<strong>' .. esc("" .. $r["title"]) .. '</strong>')
+  $tags_cell = fn($r) = (esc(notes_tags_display($r["tags"])))
+  -- Row actions render as the auto-generated RMB menu (row_actions_contextmenu); View/Edit
+  -- are nav, Rename/Move open the shared modal (md-noteedit, fetched by note_action=…&modal=1),
+  -- Delete is a one-click POST. The datatable builds the cm_menu + binds each row + emits the
+  -- modal shell — no hand-written menu needed.
+  $act_view = dt_action("view", { "label": "View", icon: "eye", variant: "action", href: fn($r) = ("/notes?view=" .. url_encode("" .. $r["rel_path"])) })
+  $act_edit = dt_action("edit", { "label": "Edit", icon: "pencil", variant: "action", href: fn($r) = ("/notes?edit=" .. url_encode("" .. $r["rel_path"])) })
+  $act_rename = dt_action("rename", { "label": "Rename", icon: "pencil-line", modal: true, href: fn($r) = ("/notes?note_action=rename&path=" .. url_encode("" .. $r["rel_path"]) .. "&modal=1") })
+  $act_move = dt_action("move", { "label": "Move to…", icon: "folder-input", modal: true, href: fn($r) = ("/notes?note_action=move&path=" .. url_encode("" .. $r["rel_path"]) .. "&modal=1") })
+  $act_del = dt_action("delete", { "label": "Delete", icon: "trash", variant: "action-danger", action: "delete", confirm: "Delete this note? This cannot be undone." })
+  $spec = [
+    dt_col("title", "Title", "title", { sortable: true, render: $title_cell }),
+    dt_col("content_type", "Type", "content_type", { sortable: true, toggleable: true }),
+    dt_col("tags", "Tags", "tags", { render: $tags_cell, toggleable: true }),
+    dt_col("created", "Date", "created", { sortable: true, toggleable: true })
+  ]
+  $opts = dt_opts({
+    base_route: "/notes", caption: "Notes", noun: "notes",
+    default_sort: "created", default_dir: "desc",
+    page_size: 25, page_sizes: [25, 50, 100],
+    search: true, search_placeholder: "Search notes…", live_search: true,
+    row_href: fn($r) = ("/notes?view=" .. url_encode("" .. $r["rel_path"])),
+    row_action_specs: [$act_view, $act_edit, $act_rename, $act_move, $act_del],
+    row_actions_contextmenu: true,
+    bulk_id: fn($r) = ("" .. $r["rel_path"]),
+    bulk: true, select_all: true, bulk_label: "Delete selected",
+    action_labels: false,
+    skin: true, compact: true,
+    header_actions: [{ "label": "New note", "href": "/notes?new=1", icon: "plus", variant: "primary" }]
+  })
+  return { spec: $spec, opts: $opts }
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Sidebar folder tree — a directory adjacency map synthesized from rel_paths, then
+-- the shared tv_subtree widget. Folders link to a ?q=<dir>/ search-filter; notes to
+-- ?view=<rel_path>. Rendered into the dcs.spa LHS Navigation panel by page() (lib.mix),
+-- which branches to notes_nav_tree() only on the /notes route (filesd cap + full load).
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- rel_paths → a parent_key→[rows] adjacency map ("0" = root), synthesizing a folder
+-- node per path segment. Mirrors lib.mix build_cat_children_map's get→push→reassign
+-- (Mix maps are by-value: push($map[$k],..) would mutate a throwaway copy).
+function notes_tree_map($rows)
+  $map = {}
+  $folders = {}
+  for each $r in $rows
+    $rel = "" .. fm_or($r["rel_path"], "")
+    if $rel != "" then
+      $segs = split($rel, "/")
+      $nseg = length($segs)
+      $parent = "0"
+      $path = ""
+      $i = 0
+      while $i < $nseg - 1
+        $seg = $segs[$i]
+        if $path == "" then
+          $path = $seg
+        else
+          $path = $path .. "/" .. $seg
+        end
+        $fid = "d:" .. $path
+        if $folders[$fid] != true then
+          $folders[$fid] = true
+          $lst = $map[$parent]
+          if $lst == nil then
+            $lst = []
+          end
+          push($lst, { id: $fid, title: $seg, slug: ("q=" .. url_encode($path .. "/")), icon: "folder" })
+          $map[$parent] = $lst
+        end
+        $parent = $fid
+        $i = $i + 1
+      end
+      $fname = $segs[$nseg - 1]
+      $title = "" .. fm_or($r["title"], $fname)
+      $lst = $map[$parent]
+      if $lst == nil then
+        $lst = []
+      end
+      push($lst, { id: $rel, title: $title, slug: ("view=" .. url_encode($rel)), icon: "file-text" })
+      $map[$parent] = $lst
+    end
+  end
+  return $map
+end
+
+-- The LHS Navigation panel for /notes (called from page() in lib.mix). Reuses
+-- notes_fetch (paged + error-degrading) and the shared treeview. Degrades to a notice
+-- if the corpus is unreachable.
+function notes_nav_tree($user)
+  $f = notes_fetch({ q: "" })
+  if not $f["ok"] then
+    return '<ul class="cms-nav-list tv-tree"><li class="cms-nav-empty">Corpus unavailable</li></ul>'
+  end
+  $map = notes_tree_map($f["rows"])
+  $cfg = { "tree": "nav-notes", "icon": "file-text", "href_prefix": "/notes?", "text_col": "title" }
+  $sub = tv_subtree($map, "0", $cfg, {})
+  $h = '<ul class="cms-nav-list tv-tree">'
+  $h = $h .. tv_leaf("/notes", "folder-open", "All notes", "", nil)
+  $h = $h .. $sub["html"]
+  $h = $h .. '</ul>'
+  return $h
+end
+
+-- The full id set matching the current filters, for a select-all-across-pages bulk
+-- delete (dt_all_ids is SQL-only; filesd needs its own resolver). notes_fetch already
+-- loads the whole filtered corpus pre-pagination, so this just collects its rel_paths.
+function notes_all_ids($state)
+  $f = notes_fetch($state)
+  $ids = []
+  if $f["ok"] then
+    for each $r in $f["rows"]
+      push($ids, "" .. $r["rel_path"])
+    end
+  end
+  return $ids
+end
+
+-- Render a rename/move form either as a modal fragment (X-Modal-Fetch) or a full page
+-- (no-JS / direct URL). $spec nil → an error/empty notice.
+function notes_rmb_render($user, $m_modal, $title, $spec, $err)
+  if $spec == nil then
+    $body = '<div class="card"><p class="muted">' .. esc($err) .. '</p><a class="btn btn-ghost" href="/notes">← Notes</a></div>'
+    if $m_modal then
+      return md_fragment(md_panel({ title: $title }, $body))
+    end
+    $head = '<div class="cms-head"><h1>' .. esc($title) .. '</h1></div>'
+    return doc(200, $title, $user, $head .. $body)
+  end
+  if $m_modal then
+    $spec["mode"] = "modal"
+    return md_fragment(fm_form($spec))
+  end
+  $spec["mode"] = "canvas"
+  $head = '<div class="cms-head"><h1>' .. esc($title) .. '</h1><a class="navlink" href="/notes">← All notes</a></div>'
+  return doc(200, $title, $user, $head .. fm_form($spec))
+end
+
+-- GET /notes?note_action=rename|move&path=… — the modal/full-page rename & move forms.
+-- Both submit the existing POST action=rename branch (move == rename to a path with a
+-- folder prefix; notes_normalize_name keeps separators).
+function notes_rmb_form($user, $q)
+  $m_modal = md_is_modal_request()
+  $action = "" .. fm_or($q["note_action"], "")
+  $path = "" .. fm_or($q["path"], "")
+  if $path == "" then
+    return notes_rmb_render($user, $m_modal, "Notes", nil, "No note specified.")
+  end
+  if $action == "rename" or $action == "move" then
+    $label = "New filename"
+    $title = "Rename note"
+    $help = "A bare filename, e.g. my-note.md"
+    if $action == "move" then
+      $label = "New path"
+      $title = "Move note"
+      $help = "Include a folder prefix to relocate, e.g. archive/my-note.md"
+    end
+    $fields = fm_hidden("action", "rename") .. fm_hidden("path", $path)
+    $fields = $fields .. fm_text("to", $label, { value: $path, required: true, autofocus: true, help: $help })
+    $spec = {
+      action: "/notes", id: "note-rename", title: $title,
+      fields: fm_grid({ cols: 1 }, $fields),
+      submit: { "label": $title }, cancel: { "label": "Cancel", href: "/notes" }
+    }
+    return notes_rmb_render($user, $m_modal, $title, $spec, "")
+  end
+  return notes_rmb_render($user, $m_modal, "Notes", nil, "Unknown action.")
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Read surface — rd_view over a filesd doc. Pass RAW values (rd_view esc()s once);
+-- body_html is the ONE pre-rendered field. $hooks (editor preview) wires the live
+-- patch target + strips chrome.
+-- ─────────────────────────────────────────────────────────────────────────────
+function notes_read_spec($d, $body_md, $hooks)
+  $badges = []
+  $ct = "" .. fm_or($d["content_type"], "note")
+  if $ct != "note" and $ct != "" then
+    push($badges, { text: $ct, kind: "tag" })
+  end
+  $meta = []
+  $tags_disp = notes_tags_display($d["tags"])
+  if $tags_disp != "" then
+    push($meta, { "label": "Tags", value: $tags_disp })
+  end
+  $created = "" .. fm_or($d["created"], "")
+  if $created != "" then
+    push($meta, { "label": "Created", value: $created })
+  end
+  $spec = {
+    title: "" .. fm_or($d["title"], "Untitled"),
+    badges: $badges,
+    meta: $meta,
+    body_html: render_body("" .. fm_or($body_md, "")),
+    back: { "label": "All notes", href: "/notes" }
+  }
+  if $hooks != nil then
+    $spec["badges"] = []
+    $spec["meta"] = []
+    $spec["actions"] = []
+    $spec["back"] = nil
+    $spec["body_id"] = $hooks["body_id"]
+    $spec["body_src"] = $hooks["body_src"]
+    $spec["body_input"] = $hooks["body_input"]
+  end
+  return $spec
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Twin-pane editor — frontmatter form (fm_*) + body textarea | live rd_view preview
+-- (wb_canvas). The textarea id == the preview's body_input so wb_preview_script
+-- patches the <article> in place; the Title field (.wb-title) live-fills the H1.
+-- Live preview POSTs to the shipped /admin/preview endpoint (render_body fragment).
+-- ─────────────────────────────────────────────────────────────────────────────
+function notes_editor($note, $isnew)
+  $rel = "" .. fm_or($note["rel_path"], "")
+  $bid = fm_id("body")
+  $title_val = "" .. fm_or($note["title"], "")
+  $ct_val = "" .. fm_or($note["content_type"], "note")
+  $tags_val = notes_tags_display($note["tags"])
+  $body_val = "" .. fm_or($note["body_md"], "")
+
+  $heading = "Edit note"
+  if $isnew then
+    $heading = "New note"
+  end
+
+  $ct_opts = [
+    { value: "note", "label": "Note" },
+    { value: "doc", "label": "Doc" },
+    { value: "page", "label": "Page" },
+    { value: "post", "label": "Post" }
+  ]
+
+  $ff = fm_text("title", "Title", { value: $title_val, required: true, autofocus: true, maxlength: "200", class: "wb-title", span: 2 })
+  $ff = $ff .. fm_select("content_type", "Type", $ct_opts, { value: $ct_val })
+  $ff = $ff .. fm_text("tags", "Tags", { value: $tags_val, placeholder: "tag1, tag2", help: "Comma-separated" })
+
+  $ta = '<textarea class="fm-control fm-mono" id="' .. esc($bid) .. '" name="body" rows="18">' .. esc($body_val) .. '</textarea>'
+  $preview = notes_read_spec($note, $body_val, { body_id: "note-preview", body_src: "/admin/preview", body_input: $bid })
+  $canvas = wb_canvas({ edit_html: $ta, read_html: rd_view($preview) })
+
+  $h = '<div class="cms-head"><h1>' .. esc($heading) .. '</h1><a class="navlink" href="/notes">← All notes</a></div>'
+  $h = $h .. '<form method="post" action="/notes" id="note-edit" class="forms-skin fm-form">'
+  $h = $h .. fm_hidden("action", "save")
+  if not $isnew then
+    $h = $h .. fm_hidden("path", $rel)
+  end
+  $h = $h .. fm_grid({ cols: 2 }, $ff)
+  $h = $h .. '<div class="pp-canvas pp-editor">' .. $canvas .. '</div>'
+  $h = $h .. '<div class="fm-actions">'
+  if not $isnew then
+    $h = $h .. '<a class="btn btn-ghost" href="/notes?view=' .. url_encode($rel) .. '">View</a>'
+  end
+  $h = $h .. '<a class="btn btn-ghost" href="/notes">Cancel</a>'
+  $h = $h .. '<button type="submit" class="btn btn-primary">Save</button>'
+  $h = $h .. '</form>'
+
+  if not $isnew then
+    $h = $h .. '<div class="card"><h3 style="margin-top:0">Manage</h3>'
+    $h = $h .. '<form method="post" action="/notes" class="forms-skin fm-form" style="margin-bottom:var(--space-3)">'
+    $h = $h .. fm_hidden("action", "rename")
+    $h = $h .. fm_hidden("path", $rel)
+    $h = $h .. fm_text("to", "Filename", { value: $rel, help: "Rename or relocate (keeps the note's identity)" })
+    $h = $h .. '<button type="submit" class="btn btn-ghost">Rename</button>'
+    $h = $h .. '</form>'
+    $h = $h .. '<form method="post" action="/notes" data-confirm="Delete this note? This cannot be undone.">'
+    $h = $h .. fm_hidden("action", "delete")
+    $h = $h .. fm_hidden("path", $rel)
+    $h = $h .. '<button type="submit" class="btn btn-danger">Delete note</button>'
+    $h = $h .. '</form>'
+    $h = $h .. '</div>'
+  end
+
+  $h = $h .. wb_preview_script()
+  return $h
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Mutations (POST) — create / update / delete / rename, each a 303 PRG.
+-- ─────────────────────────────────────────────────────────────────────────────
+function notes_save($f)
+  $title = notes_scalar(fm_or($f["title"], ""))
+  if $title == "" then
+    $title = "Untitled"
+  end
+  $ct = notes_scalar(fm_or($f["content_type"], "note"))
+  if $ct == "" then
+    $ct = "note"
+  end
+  $tags_json = notes_tags_json($f["tags"])
+  $body = "" .. fm_or($f["body"], "")
+  $path = "" .. fm_or($f["path"], "")
+
+  if $path == "" then
+    -- CREATE: derive a unique slug; fresh frontmatter (filesd mints the id).
+    $path = notes_unique_path(notes_slug($title))
+    $front = "title: " .. $title .. "\ncontent_type: " .. $ct
+    if $tags_json != "" then
+      $front = $front .. "\ntags: " .. $tags_json
+    end
+  else
+    -- UPDATE: overlay onto the original frontmatter (preserve id/created/unmodeled).
+    $rd = notes_call("filesd.read", { path: $path })
+    if not $rd["ok"] then
+      return redirect_flash("/notes", "Could not load note to save: " .. $rd["err"], "danger")
+    end
+    $orig = $rd["result"]["doc"]
+    -- Refuse to overwrite a note whose body we couldn't fully read (>4 MiB) — saving
+    -- the empty editor body would destroy it.
+    if not notes_body_usable($orig) then
+      return redirect_flash("/notes", "Note is too large to edit here — not saved.", "danger")
+    end
+    $raw = "" .. fm_or($orig["body"], "")
+    $front = notes_split($raw)["front"]
+    $front = notes_overlay($front, "title", $title)
+    $front = notes_overlay($front, "content_type", $ct)
+    if $tags_json != "" then
+      $front = notes_overlay($front, "tags", $tags_json)
+    else
+      $front = notes_overlay_remove($front, "tags")
+    end
+  end
+
+  $content = "---\n" .. $front .. "\n---\n" .. $body
+  if $body == "" or substr($body, length($body) - 1, 1) != "\n" then
+    $content = $content .. "\n"
+  end
+  $sv = notes_call("filesd.save", { path: $path, content: $content })
+  if not $sv["ok"] then
+    return redirect_flash("/notes", "Save failed: " .. $sv["err"], "danger")
+  end
+  return redirect_flash("/notes?edit=" .. url_encode($path), "Saved", "success")
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Entry point.
+-- ─────────────────────────────────────────────────────────────────────────────
+function notes_main()
+  cms_init()
+  $user = current_user($HEADERS)
+  $deny = require_role($user, "admin")
+  if $deny != nil then
+    return $deny
+  end
+
+  if $METHOD == "POST" then
+    $f = parse_form($BODY)
+    $ra = dt_row_action($f)
+    if $ra != nil then
+      if $ra["verb"] == "delete" then
+        $d = notes_call("filesd.delete", { path: $ra["id"] })
+        if $d["ok"] then
+          return redirect_flash("/notes", "Note deleted", "success")
+        end
+        return redirect_flash("/notes", "Delete failed: " .. $d["err"], "danger")
+      end
+      return redirect_flash("/notes", "Unknown action", "warning")
+    end
+    -- Multi-select bulk delete (the datatable's bulk bar posts action=bulk_delete).
+    if dt_bulk_action($f) == "delete" then
+      $delids = dt_selected_ids($f)
+      if dt_wants_all($f) then
+        $cfg = notes_list_config()
+        $delids = notes_all_ids(dt_state_from_map($f, $cfg["spec"], $cfg["opts"]))
+      end
+      for each $bp in $delids
+        notes_call("filesd.delete", { path: $bp })
+      end
+      return redirect_flash("/notes", "Selected notes deleted", "success")
+    end
+    $action = "" .. fm_or($f["action"], "save")
+    if $action == "delete" then
+      $p = "" .. fm_or($f["path"], "")
+      if $p == "" then
+        return redirect_flash("/notes", "Nothing to delete", "warning")
+      end
+      $d = notes_call("filesd.delete", { path: $p })
+      if not $d["ok"] then
+        return redirect_flash("/notes", "Delete failed: " .. $d["err"], "danger")
+      end
+      return redirect_flash("/notes", "Note deleted", "success")
+    end
+    if $action == "rename" then
+      $from = "" .. fm_or($f["path"], "")
+      $to = notes_normalize_name(fm_or($f["to"], ""))
+      if $from == "" or $to == "" then
+        return redirect_flash("/notes", "Rename needs a current and new name", "warning")
+      end
+      if $from == $to then
+        return redirect_flash("/notes?edit=" .. url_encode($from), "Unchanged", "warning")
+      end
+      $mv = notes_call("filesd.move", { from: $from, "to": $to })
+      if not $mv["ok"] then
+        return redirect_flash("/notes?edit=" .. url_encode($from), "Rename failed: " .. $mv["err"], "danger")
+      end
+      return redirect_flash("/notes?edit=" .. url_encode($to), "Renamed", "success")
+    end
+    return notes_save($f)
+  end
+
+  $q = parse_query($QUERY)
+
+  -- RMB context-menu rename/move forms (modal fragment or full page)
+  if $q["note_action"] != nil and $q["note_action"] != "" then
+    return notes_rmb_form($user, $q)
+  end
+
+  -- READ
+  if $q["view"] != nil and $q["view"] != "" then
+    $path = "" .. $q["view"]
+    $rd = notes_call("filesd.read", { path: $path })
+    if not $rd["ok"] then
+      return doc(404, "Not found", $user, '<div class="card"><h1>404</h1><p class="muted">No such note.</p></div>')
+    end
+    $d = $rd["result"]["doc"]
+    $body_md = "_This note is too large to render inline (over 4 MiB)._"
+    if notes_body_usable($d) then
+      $body_md = notes_split("" .. fm_or($d["body"], ""))["body"]
+    end
+    $spec = notes_read_spec($d, $body_md, nil)
+    $spec["actions"] = [
+      { "label": "Edit", icon: "pencil", variant: "ghost", href: "/notes?edit=" .. url_encode($path) },
+      { "label": "Delete", icon: "trash", variant: "ghost", post: "/notes", fields: [{ name: "action", value: "delete" }, { name: "path", value: $path }], confirm: "Delete this note? This cannot be undone." }
+    ]
+    return doc(200, "" .. fm_or($d["title"], "Note"), $user, rd_view($spec))
+  end
+
+  -- EDIT / NEW
+  if $q["new"] != nil or $q["edit"] != nil then
+    $note = { rel_path: "", title: "", content_type: "note", tags: nil, body_md: "" }
+    $isnew = true
+    if $q["edit"] != nil and $q["edit"] != "" then
+      $rd = notes_call("filesd.read", { path: "" .. $q["edit"] })
+      if $rd["ok"] then
+        $d = $rd["result"]["doc"]
+        -- A truncated (>4 MiB) body would load empty and a Save would destroy the
+        -- note — refuse to open the editor rather than risk data loss.
+        if not notes_body_usable($d) then
+          return doc(200, "Too large", $user, '<div class="cms-head"><h1>Note too large to edit</h1></div><div class="card"><p class="muted">This note exceeds the 4 MiB inline-edit limit; edit it on disk.</p><a class="btn btn-ghost" href="/notes?view=' .. url_encode("" .. $q["edit"]) .. '">View</a> <a class="btn btn-ghost" href="/notes">← All notes</a></div>')
+        end
+        $note = {
+          rel_path: "" .. fm_or($d["rel_path"], "" .. $q["edit"]),
+          title: "" .. fm_or($d["title"], ""),
+          content_type: "" .. fm_or($d["content_type"], "note"),
+          tags: $d["tags"],
+          body_md: notes_split("" .. fm_or($d["body"], ""))["body"]
+        }
+        $isnew = false
+      end
+    end
+    $heading = "New note"
+    if not $isnew then
+      $heading = "Edit note"
+    end
+    return doc(200, $heading, $user, notes_editor($note, $isnew))
+  end
+
+  -- LIST (default) — three-branch datatable dispatch.
+  $cfg = notes_list_config()
+  $spec = $cfg["spec"]
+  $opts = $cfg["opts"]
+  $state = dt_state($QUERY, $spec, $opts)
+  $ares = notes_adapter($state)
+
+  -- A notice (corpus error and/or truncation) that rides EVERY render path so a
+  -- capped result is never silently complete. It lives INSIDE the region on the full
+  -- page and the region SSE swap, so a later non-truncated sort/page swap refreshes
+  -- and CLEARS it (no stale outer banner). The live-search results swap patches only
+  -- the inner results slot, so it carries its own copy; the only residual is the
+  -- impossible-for-notes ≥1000-match search where a region-level banner could linger
+  -- until the next full/region render — cosmetic.
+  $notice = ""
+  if $ares["err"] != "" then
+    $notice = '<div class="card"><strong>Corpus unavailable:</strong> ' .. esc($ares["err"]) .. '</div>'
+  end
+  if $ares["truncated"] then
+    $notice = $notice .. '<div class="card"><strong>Showing the first ' .. ("" .. $ares["total"]) .. ' notes.</strong> Narrow with search to reach the rest.</div>'
+  end
+
+  if dt_wants_results() then
+    return dt_results_partial($notice .. dt_results_inner($spec, $opts, $state, $ares["rows"], $ares["total"], nil), "")
+  end
+  $dt = dt_render($spec, $opts, $state, $ares["rows"], $ares["total"], nil)
+  if dt_wants_partial() then
+    return dt_partial($notice .. $dt)
+  end
+  -- The RMB menu template + modal dialog + shim ride the FULL-page render only (the two
+  -- partial-swap returns above leave them untouched; they persist outside the swapped
+  -- region while the per-row data-cm-* bindings re-emit on every swap via row_attrs).
+  return doc(200, "Notes", $user, dt_region($notice .. $dt, "", true) .. dt_actions_chrome($opts))
+end

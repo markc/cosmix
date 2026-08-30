@@ -1,0 +1,66 @@
+-- admin.mix — dashboard (GET /admin). Requires a signed-in user.
+function admin_main()
+cms_init()
+$user = current_user($HEADERS)
+$deny = require_role($user, "author")
+if $deny != nil then
+  return $deny
+end
+
+-- Blog-surface pieces (posts button, posts/media stats, recent-posts table,
+-- Categories/Media/Comments cards) gate on feature("blog"); Forum on
+-- feature("forum") — same convention as the profile-popup links in lib.mix,
+-- so a content-less vhost (e.g. a shop, blog:false) shows no dead links.
+$uc = db_query("SELECT count(*) AS c FROM users", [])
+$nusers = $uc[0]["c"]
+
+$head_act = ""
+if feature("blog") then
+  $head_act = '<a class="btn btn-primary" href="/admin/posts">+ Manage posts</a>'
+end
+$b = '<div class="cms-head"><h1>Dashboard</h1>' .. $head_act .. '</div>'
+$b = $b .. '<div class="grid" style="grid-template-columns:repeat(3,1fr);margin:var(--space-6) 0">'
+if feature("blog") then
+  $pc = db_query("SELECT count(*) AS c FROM cms_posts", [])
+  $mc = db_query("SELECT count(*) AS c FROM media", [])
+  $b = $b .. '<div class="card"><div class="muted small">Posts</div><div style="font-size:2rem;font-weight:800;color:var(--fg-primary)">' .. ("" .. $pc[0]["c"]) .. '</div></div>'
+  $b = $b .. '<div class="card"><div class="muted small">Users</div><div style="font-size:2rem;font-weight:800;color:var(--fg-primary)">' .. ("" .. $nusers) .. '</div></div>'
+  $b = $b .. '<div class="card"><div class="muted small">Media</div><div style="font-size:2rem;font-weight:800;color:var(--fg-primary)">' .. ("" .. $mc[0]["c"]) .. '</div></div>'
+else
+  $b = $b .. '<div class="card"><div class="muted small">Users</div><div style="font-size:2rem;font-weight:800;color:var(--fg-primary)">' .. ("" .. $nusers) .. '</div></div>'
+end
+$b = $b .. '</div>'
+
+if feature("blog") then
+$b = $b .. '<div class="card"><div class="row" style="justify-content:space-between;margin-bottom:var(--space-2)"><h2 style="margin:0">Recent posts</h2><a class="navlink" href="/admin/posts">View all →</a></div>'
+$rows = db_query("SELECT slug, title, status, updated FROM cms_posts ORDER BY id DESC LIMIT 8", [])
+if length($rows) == 0 then
+  $b = $b .. '<p class="muted">No posts yet. <a href="/admin/posts">Write the first one.</a></p>'
+else
+  $b = $b .. '<table><tr><th>Title</th><th>Status</th><th>Updated</th><th></th></tr>'
+  for each $p in $rows
+    $badge = '<span class="tag">' .. esc($p["status"]) .. '</span>'
+    $b = $b .. '<tr><td><strong>' .. esc($p["title"]) .. '</strong></td><td>' .. $badge .. '</td><td class="muted small">' .. esc($p["updated"]) .. '</td>'
+    $b = $b .. '<td class="row"><a class="navlink small" href="/admin/posts?edit=' .. esc($p["slug"]) .. '">Edit</a> <a class="navlink small" href="/post/' .. esc($p["slug"]) .. '">View</a></td></tr>'
+  end
+  $b = $b .. '</table>'
+end
+$b = $b .. '</div>'
+end
+
+$b = $b .. '<div class="grid" style="grid-template-columns:repeat(3,1fr);margin-top:var(--space-5)">'
+$b = $b .. '<a class="card" href="/admin/users"><h2 style="margin:0 0 var(--space-1)">Users</h2><span class="muted small">Add, edit, remove authors</span></a>'
+$b = $b .. '<a class="card" href="/admin/settings" data-modal-open="md-settings" data-modal-src="/admin/settings?modal=1"><h2 style="margin:0 0 var(--space-1)">Settings</h2><span class="muted small">Title, tagline, footer</span></a>'
+if feature("blog") then
+  $b = $b .. '<a class="card" href="/admin/categories"><h2 style="margin:0 0 var(--space-1)">Categories</h2><span class="muted small">Organise the category tree</span></a>'
+  $b = $b .. '<a class="card" href="/admin/media"><h2 style="margin:0 0 var(--space-1)">Media</h2><span class="muted small">Upload &amp; manage images</span></a>'
+  $b = $b .. '<a class="card" href="/admin/comments"><h2 style="margin:0 0 var(--space-1)">Comments</h2><span class="muted small">Moderate replies &amp; comments</span></a>'
+end
+if feature("forum") then
+  $b = $b .. '<a class="card" href="/admin/forum"><h2 style="margin:0 0 var(--space-1)">Forum</h2><span class="muted small">Manage forum topics</span></a>'
+end
+$b = $b .. '</div>'
+
+return doc(200, "Dashboard", $user, $b)
+
+end

@@ -1,0 +1,10 @@
+# Build output and crash artifacts — never committed.
+/target
+/artifacts
+/coverage
+
+# The committed SEED corpus is the readable `*.mix` files under corpus/<target>/
+# (they prime coverage-guided search). libFuzzer writes thousands of
+# hash-named inputs into the same dirs at runtime — ignore those, keep seeds.
+/corpus/*/*
+!/corpus/*/*.mix

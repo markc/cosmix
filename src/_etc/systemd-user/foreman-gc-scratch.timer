@@ -1,0 +1,14 @@
+# Install in ~/.config/systemd/user/ with foreman-gc-scratch.service.
+
+[Unit]
+Description=Run the Foreman Cargo scratch backstop daily
+Documentation=https://cosmix.dev/foreman.html
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30m
+Unit=foreman-gc-scratch.service
+
+[Install]
+WantedBy=timers.target

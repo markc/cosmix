@@ -1,0 +1,51 @@
+-- terminators.mix: Phase 5 — all block constructs accept `end`
+-- Expected output:
+-- 10
+-- 6
+-- apple
+-- banana
+-- cherry
+-- 3
+-- 5
+-- done-fn
+
+-- while loop closed with `end` instead of `done`
+$i = 0
+$sum = 0
+while $i < 5
+    $i = $i + 1
+    $sum = $sum + $i
+end
+print $sum - 5
+
+-- Classic `for N to M` closed with `end` instead of `next`
+$total = 0
+for $n = 1 to 3
+    $total = $total + $n
+end
+print $total
+
+-- `for each` closed with `end`
+$fruits = ["apple", "banana", "cherry"]
+for each $f in $fruits
+    print $f
+end
+print length($fruits)
+
+-- Nested constructs mixing both styles in the same script — the
+-- parser must distinguish terminators by nesting depth, not by a
+-- file-wide switch.
+function count_evens($xs)
+    $c = 0
+    for each $x in $xs
+        if $x % 2 == 0 then
+            $c = $c + 1
+        end
+    end
+    return $c
+end
+print count_evens([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+
+-- Function body (which already used `end`) unchanged
+function tag() = "done-fn"
+print tag()

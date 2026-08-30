@@ -1,0 +1,25 @@
+-- media.mix — serve a stored image as real binary (GET /media/<id>).
+-- The media row holds base64 in `data`; decode to raw bytes and let
+-- webd stream them verbatim (Value::Bytes body, no UTF-8 mangling).
+function media_main()
+cms_init()
+$id = $PATH
+if pos("/media/", $id) == 1 then
+  $id = substr($id, 7, length($id) - 7)
+end
+$rows = db_query("SELECT mime, data FROM media WHERE id = ?1", [to_number($id)])
+if length($rows) == 0 then
+  return { status: 404, headers: { "Content-Type": "text/plain" }, body: "not found" }
+end
+$m = $rows[0]
+$mime = $m["mime"]
+if $mime == nil or $mime == "" then
+  $mime = "application/octet-stream"
+end
+-- Defence-in-depth on top of the upload-time MIME allowlist (admin_media.mix):
+-- nosniff stops the browser second-guessing the declared image type, and a
+-- locked-down CSP + sandbox means even a hypothetically-active payload can't run
+-- script or reach any origin if served from here.
+return { status: 200, headers: { "Content-Type": $mime, "Cache-Control": "public, max-age=86400", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; sandbox" }, body: base64_decode($m["data"]) }
+
+end

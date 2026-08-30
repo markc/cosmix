@@ -1,0 +1,437 @@
+-- h_biz_customers.mix — billing customer CRUD + support-call detail (ANY /biz/customers).
+-- Admin-only. List = shared datatable + modal edit (mirrors h_admin_users); the DETAIL
+-- view (?view=<id>) is the phone-support screen: contact card (+ credit balance via
+-- credit_balance), then services / domains / recent invoices / recent transactions.
+-- Money = INTEGER cents via fmt_aud; dates civil TEXT (overdue computed IN SQL against
+-- a bound biz_today so no Mix string-date compares).
+--   GET  /biz/customers                  → list
+--   GET  /biz/customers?view=<id>        → customer detail
+--   GET  /biz/customers?new=1            → blank add form (full page; &modal=1 → md fragment)
+--   GET  /biz/customers?edit=<id>        → edit form (full page; &modal=1 → md fragment)
+--   POST action=save                     → create (no id) / update (id) → PRG to ?view=<id>
+--   POST action=delete / row:delete:<id> → remove — REFUSED while services/domains/invoices
+--                                          reference the customer (close it instead)
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/admin_resource.mix"
+include "/opt/cosmix/vhosts/shared/lib/resource_engine.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+include "/opt/cosmix/vhosts/shared/widgets/detail.mix"
+include "/opt/cosmix/vhosts/shared/apps/biz.mix"
+
+-- nil-safe stringify ("" for SQL NULL — `"" .. nil` would print the literal "nil").
+function bc_str($v)
+  if $v == nil then return "" end
+  return "" .. $v
+end
+
+-- nil-safe trimmed form-field read.
+function bc_fv($f, $k)
+  $v = $f[$k]
+  if $v == nil then return "" end
+  return trim("" .. $v)
+end
+
+-- escaped cell text with an em-dash placeholder for NULL/empty.
+function bc_dash($v)
+  $s = bc_str($v)
+  if $s == "" then return "—" end
+  return esc($s)
+end
+
+-- customer status → badge variant (whitelisted by dt_color_ok anyway).
+function bc_status_variant($s)
+  $t = "" .. $s
+  if $t == "active" then return "success" end
+  if $t == "inactive" then return "warning" end
+  return "gray"
+end
+
+-- service/domain status pill (danger tint for the bad states).
+function bc_tag($s)
+  $t = bc_str($s)
+  if $t == "suspended" or $t == "cancelled" or $t == "expired" then
+    return '<span class="tag tag-danger">' .. esc($t) .. '</span>'
+  end
+  return '<span class="tag">' .. esc($t) .. '</span>'
+end
+
+-- invoice status badge; $overdue is the SQL-computed flag (open AND due < today).
+function bc_inv_badge($status, $overdue)
+  $s = "" .. $status
+  if $s == "paid" then return dt_badge("paid", "success", "") end
+  if $s == "open" then
+    if to_number($overdue) == 1 then return dt_badge("overdue", "danger", "") end
+    return dt_badge("open", "warning", "")
+  end
+  return dt_badge($s, "gray", "")
+end
+
+-- (bc_card is gone — section cards ride the dv_* detail-page Foundation's dv_card.)
+
+-- load one customer by numeric id → row map, or nil.
+function bc_get_one($id)
+  $r = db_query("SELECT id, name, company, email, phone, address1, address2, city, state,
+                 postcode, country, status, stripe_customer_id, stripe_pm_id,
+                 stripe_pm_status, notes, created, updated
+                 FROM customers WHERE id = ?1", [$id])
+  if length($r) == 1 then
+    return $r[0]
+  end
+  return nil
+end
+
+-- Delete-guard: "" when deletable, else the refusal reason. A customer with ANY
+-- services/domains/invoices is history, not clutter — close it, never delete it.
+function bc_del_block($id)
+  $r = db_query("SELECT
+    (SELECT COUNT(*) FROM services WHERE customer_id = ?1) AS svcs,
+    (SELECT COUNT(*) FROM domains  WHERE customer_id = ?1) AS doms,
+    (SELECT COUNT(*) FROM invoices WHERE customer_id = ?1) AS invs", [$id])
+  $s = to_number($r[0].svcs)
+  $d = to_number($r[0].doms)
+  $i = to_number($r[0].invs)
+  if $s == 0 and $d == 0 and $i == 0 then
+    return ""
+  end
+  return "Can't delete: customer has " .. $s .. " service(s), " .. $d .. " domain(s), " .. $i .. " invoice(s). Set status to closed instead."
+end
+
+-- The editor (fields, modal + canvas rendering, save path, deletes) is DECLARED
+-- in customers_resource() and interpreted by resource_engine.mix (resource/1) —
+-- no hand-written form/save/delete code in this handler. Custom work stays as
+-- verb functions the spec ROUTES to (engine never orchestrates them):
+
+-- delete cascade: portal tokens are ephemeral, not history — remove them with
+-- the customer (guarded refs — services/domains/invoices — REFUSE instead).
+function bc_delete_cascade($id)
+  db_exec("DELETE FROM customer_tokens WHERE customer_id = ?1", [$id])
+  db_exec("DELETE FROM customers WHERE id = ?1", [$id])
+end
+
+-- admin: email the customer a set/reset password link (webd redeems it).
+function bc_send_setpw($f, $user)
+  $sid = to_number($f["id"])
+  if $sid == nil then
+    return redirect_flash("/biz/customers", "Bad customer id", "danger")
+  end
+  $cr = db_query("SELECT id, name, email, password_hash FROM customers
+                  WHERE id = ?1 AND status != 'closed'", [$sid])
+  if length($cr) == 0 then
+    return redirect_flash("/biz/customers", "No such customer", "danger")
+  end
+  $purpose = "set"
+  $verb = "set"
+  if bc_str($cr[0].password_hash) != "" then
+    $purpose = "reset"
+    $verb = "reset"
+  end
+  $raw = biz_issue_customer_token($sid, $purpose, 48)
+  $link = biz_base_url() .. "/portal/set-password?token=" .. $raw
+  $body = "Hi " .. $cr[0].name .. ",\n\n"
+  $body = $body .. "You can " .. $verb .. " your " .. biz_brand() .. " customer portal password here (valid 48 hours):\n"
+  $body = $body .. $link .. "\n\n"
+  $body = $body .. "The portal lets you view your invoices and services and update your details.\nSign in afterwards at " .. biz_base_url() .. "/portal/login\n\n— " .. biz_brand() .. " Billing\n"
+  -- PRE-STAMP delivered=1 (best-effort — the column exists only where
+  -- shop_init ran; catch = column-absent no-op): `delivered` means "entered
+  -- the send attempt, possibly in the customer's hands". A crash mid-send
+  -- then can never leave a held link looking undelivered.
+  try
+    db_exec("UPDATE customer_tokens SET delivered = 1 WHERE token_sha256 = ?1 AND used_at IS NULL",
+            [hash_sha256($raw)])
+  catch $e
+  end
+  $mr = biz_mail(bc_str($cr[0].email), "Your " .. biz_brand() .. " customer portal", $body)
+  biz_audit($user["username"], "send_setpw", "customers", $sid, $purpose)
+  $back = "/biz/customers?view=" .. url_encode("" .. $sid)
+  -- outcome: skipped / DEFINITE failure → RETIRE the token (used_at exists
+  -- on every db, no catch — a failed retire must surface) since a definitely
+  -- unsent token must never linger as a live-looking claim. An INDETERMINATE
+  -- outcome (biz_mail's flag: transport error at/after EmailSubmission/set,
+  -- or a response that neither confirms nor explicitly refuses — the mail
+  -- may have been delivered) PRESERVES the token, honestly flashed. A
+  -- delivered=0 token is therefore not proof of non-delivery — which is why
+  -- the shop outbox's orphan sweep retires ONLY source='shop_outbox' tokens.
+  if $mr["skipped"] then
+    db_exec("UPDATE customer_tokens SET used_at = ?2 WHERE token_sha256 = ?1 AND used_at IS NULL",
+            [hash_sha256($raw), "undelivered:" .. biz_now()])
+    return redirect_flash($back, "Mail is off — no email sent (the link was NOT activated; retry once mail_mode is set).", "warning")
+  end
+  if $mr["ok"] then
+    return redirect_flash($back, "Portal " .. $verb .. " link emailed to " .. bc_str($cr[0].email), "success")
+  end
+  if $mr["indeterminate"] == true then
+    return redirect_flash($back, "Mail outcome unknown (" .. $mr["error"] .. ") — the link MAY have been sent and stays valid; retry later if it doesn't arrive.", "warning")
+  end
+  db_exec("UPDATE customer_tokens SET used_at = ?2 WHERE token_sha256 = ?1 AND used_at IS NULL",
+          [hash_sha256($raw), "undelivered:" .. biz_now()])
+  return redirect_flash($back, "Email failed: " .. $mr["error"] .. " (the link was NOT activated; retry).", "danger")
+end
+
+-- ─────────────────────────── detail (?view=<id>) ───────────────────────────
+
+-- contact card: email/phone/address/stripe grid + prominent credit + notes.
+function bc_contact_card($c)
+  $t = ""
+  $bal = credit_balance($c.id)
+  if $bal != 0 then
+    $cls = ""
+    if $bal < 0 then $cls = " text-danger" end
+    $t = $t .. '<div class="text-2xl' .. $cls .. '"><strong>' .. fmt_aud($bal) .. '</strong> <span class="muted small">credit balance</span></div>'
+  end
+  $t = $t .. '<div class="grid grid-auto">'
+  $em = bc_str($c.email)
+  $t = $t .. '<div><div class="muted small">Email</div><a href="mailto:' .. esc($em) .. '">' .. esc($em) .. '</a></div>'
+  $t = $t .. '<div><div class="muted small">Phone</div>' .. bc_dash($c.phone) .. '</div>'
+  -- address block, blank lines skipped
+  $addr = ""
+  if bc_str($c.address1) != "" then $addr = $addr .. esc(bc_str($c.address1)) .. '<br>' end
+  if bc_str($c.address2) != "" then $addr = $addr .. esc(bc_str($c.address2)) .. '<br>' end
+  $line3 = strip(bc_str($c.city) .. " " .. bc_str($c["state"]) .. " " .. bc_str($c.postcode))
+  if $line3 != "" then $addr = $addr .. esc($line3) .. '<br>' end
+  if bc_str($c.country) != "" then $addr = $addr .. esc(bc_str($c.country)) end
+  if $addr == "" then $addr = "—" end
+  $t = $t .. '<div><div class="muted small">Address</div>' .. $addr .. '</div>'
+  $t = $t .. '<div><div class="muted small">Customer since</div>' .. bc_dash($c.created) .. '</div>'
+  $t = $t .. '</div>'
+  if bc_str($c.stripe_customer_id) != "" then
+    $pm = bc_str($c.stripe_pm_id)
+    if $pm != "" then
+      $pm = $pm .. " (" .. bc_str($c.stripe_pm_status) .. ")"
+    else
+      $pm = "none"
+    end
+    $t = $t .. '<p class="muted small">Stripe: ' .. esc(bc_str($c.stripe_customer_id)) .. ' · PM: ' .. esc($pm) .. '</p>'
+  end
+  if bc_str($c.notes) != "" then
+    $t = $t .. '<p class="muted small">' .. replace(esc(bc_str($c.notes)), "\n", "<br>") .. '</p>'
+  end
+  return dv_card("Contact", $t)
+end
+
+-- the support-call screen: head + contact + services + domains + invoices + transactions.
+function bc_detail($c)
+  $cid = to_number($c.id)
+  $today = biz_today()
+  $vq = url_encode("" .. $cid)
+
+  $b = dv_head(bc_str($c.name), {
+    badge_html: dt_badge(bc_str($c.status), bc_status_variant($c.status), ""),
+    actions_html: '<a class="btn btn-primary" href="/biz/customers?edit=' .. $vq .. '">Edit</a>',
+    back: { href: "/biz/customers", "label": "All customers" } })
+  if bc_str($c.company) != "" then
+    $b = $b .. '<p class="muted">' .. esc(bc_str($c.company)) .. '</p>'
+  end
+  $b = $b .. bc_contact_card($c)
+
+  -- portal access: show whether a portal password is set + a button to email
+  -- the customer a set/reset link (webd argon2 auth; link valid 48h).
+  $pwset = bc_str($c.password_hash) != ""
+  $pstate = "not set — the customer can't sign in yet"
+  $plabel = "Send set-password link"
+  if $pwset then
+    $pstate = "set (portal login active)"
+    $plabel = "Send password-reset link"
+  end
+  $b = $b .. dv_card("Portal access",
+    '<p class="muted small">Portal password: ' .. $pstate .. '</p>' ..
+    fm_mini_form("/biz/customers", { action: "send_setpw", id: "" .. $cid }, $plabel, { variant: "primary" }) ..
+    ' <span class="muted small">emails ' .. esc(bc_str($c.email)) .. '</span>')
+
+  -- services (lapsed = active with next_due in the past → unpaid renewal, flag it)
+  $svc = db_query("SELECT id, label, kind, units, price_cents, status, next_due,
+                   CASE WHEN status = 'active' AND next_due IS NOT NULL AND next_due < ?2
+                        THEN 1 ELSE 0 END AS lapsed
+                   FROM services WHERE customer_id = ?1 ORDER BY status, label", [$cid, $today])
+  $t = '<p class="muted small">None.</p>'
+  if length($svc) > 0 then
+    $t = '<table><tr><th>Service</th><th>Kind</th><th>Units</th><th class="text-right">Price /yr</th><th>Status</th><th>Next due</th></tr>'
+    for each $s in $svc
+      $duecls = ""
+      if to_number($s.lapsed) == 1 then $duecls = " text-danger" end
+      $t = $t .. '<tr><td><a href="/biz/services?view=' .. url_encode("" .. $s.id) .. '">' .. esc(bc_str($s.label)) .. '</a></td>'
+      $t = $t .. '<td>' .. bc_dash($s.kind) .. '</td><td>' .. bc_dash($s.units) .. '</td>'
+      $t = $t .. '<td class="text-right">' .. fmt_aud($s.price_cents) .. '</td>'
+      $t = $t .. '<td>' .. bc_tag($s.status) .. '</td><td class="muted small' .. $duecls .. '">' .. bc_dash($s.next_due) .. '</td></tr>'
+    end
+    $t = $t .. '</table>'
+  end
+  $b = $b .. dv_card("Services", $t)
+
+  -- domains (dead excluded — see /biz/domains?dead=1 for the not-registered pile)
+  $dom = db_query("SELECT id, domain, expiry, next_due, price_cents, status
+                   FROM domains WHERE customer_id = ?1 AND category != 'dead' ORDER BY domain", [$cid])
+  $t = '<p class="muted small">None.</p>'
+  if length($dom) > 0 then
+    $t = '<table><tr><th>Domain</th><th>Expiry</th><th>Next due</th><th class="text-right">Price /yr</th><th>Status</th></tr>'
+    for each $d in $dom
+      $t = $t .. '<tr><td><a href="/biz/domains?view=' .. url_encode("" .. $d.id) .. '">' .. esc(bc_str($d.domain)) .. '</a></td>'
+      $t = $t .. '<td class="muted small">' .. bc_dash($d.expiry) .. '</td><td class="muted small">' .. bc_dash($d.next_due) .. '</td>'
+      $t = $t .. '<td class="text-right">' .. fmt_aud($d.price_cents) .. '</td><td>' .. bc_tag($d.status) .. '</td></tr>'
+    end
+    $t = $t .. '</table>'
+  end
+  $b = $b .. dv_card("Domains", $t)
+
+  -- recent invoices (overdue computed in SQL against bound today)
+  $inv = db_query("SELECT id, issued, due, total_cents, status,
+                   CASE WHEN status = 'open' AND due IS NOT NULL AND due < ?2
+                        THEN 1 ELSE 0 END AS overdue
+                   FROM invoices WHERE customer_id = ?1 ORDER BY id DESC LIMIT 15", [$cid, $today])
+  $t = '<p class="muted small">None.</p>'
+  if length($inv) > 0 then
+    $t = '<table><tr><th>Invoice</th><th>Issued</th><th>Due</th><th class="text-right">Total</th><th>Status</th></tr>'
+    for each $i in $inv
+      $t = $t .. '<tr><td><a href="/biz/invoices?view=' .. url_encode("" .. $i.id) .. '">INV-' .. esc("" .. $i.id) .. '</a></td>'
+      $t = $t .. '<td class="muted small">' .. bc_dash($i.issued) .. '</td><td class="muted small">' .. bc_dash($i.due) .. '</td>'
+      $t = $t .. '<td class="text-right">' .. fmt_aud($i.total_cents) .. '</td><td>' .. bc_inv_badge($i.status, $i.overdue) .. '</td></tr>'
+    end
+    $t = $t .. '</table>'
+  end
+  $b = $b .. dv_card("Recent invoices", $t)
+
+  -- recent transactions
+  $txn = db_query("SELECT at, gateway, txn_ref, kind, amount_cents
+                   FROM transactions WHERE customer_id = ?1
+                   ORDER BY at DESC, id DESC LIMIT 10", [$cid])
+  $t = '<p class="muted small">None yet.</p>'
+  if length($txn) > 0 then
+    $t = '<table><tr><th>At</th><th>Gateway</th><th>Reference</th><th class="text-right">Amount</th></tr>'
+    for each $x in $txn
+      $amt = fmt_aud($x.amount_cents)
+      if ("" .. $x.kind) == "refund" then
+        $amt = '<span class="text-danger">-' .. $amt .. '</span>'
+      end
+      $t = $t .. '<tr><td class="muted small">' .. bc_dash($x.at) .. '</td><td>' .. bc_dash($x.gateway) .. '</td>'
+      $t = $t .. '<td class="muted small">' .. bc_dash($x.txn_ref) .. '</td><td class="text-right">' .. $amt .. '</td></tr>'
+    end
+    $t = $t .. '</table>'
+  end
+  $b = $b .. dv_card("Recent transactions", $t)
+
+  return $b
+end
+
+-- ─────────────────────────── list config ───────────────────────────
+
+-- Datatable spec + opts, built once. All lambdas REAL — dt_render_action /
+-- dt_actions_cm_bind call bulk_id for the mutating Delete even without bulk mode.
+function bc_list_config()
+  $name_cell = fn($c) = '<a href="/biz/customers?view=' .. url_encode("" .. $c["id"]) .. '"><strong>' .. esc($c["name"]) .. '</strong></a>'
+  $name_tip = fn($c) = "" .. $c["name"]
+  $status_badge = fn($c) = { "text": $c["status"], "variant": bc_status_variant($c["status"]) }
+  $act_view = dt_action("view", { "label": "View", icon: "eye", variant: "action", href: fn($c) = "/biz/customers?view=" .. url_encode("" .. $c["id"]) })
+  $act_edit = dt_action("edit", { "label": "Edit", icon: "pencil", variant: "action", modal: "md-edit", href: fn($c) = "/biz/customers?edit=" .. url_encode("" .. $c["id"]) .. "&modal=1" })
+  $act_del = dt_action("delete", { "label": "Delete", icon: "trash", variant: "action-danger", action: "delete", confirm: "Delete this customer? Refused while any services, domains or invoices exist." })
+  $rowhref = fn($c) = "/biz/customers?view=" .. url_encode("" .. $c["id"])
+  $bulkid = fn($c) = "" .. $c["id"]
+  -- EVERY column is toggleable (the Columns menu lists them all); Id is
+  -- default-hidden; Name cells carry a tooltip (full name on hover).
+  $spec = [
+    dt_col("id", "Id", "id", { sortable: true, width: "4rem", toggleable: true, default_hidden: true }),
+    dt_col("name", "Name", "name", { sortable: true, searchable: true, render: $name_cell, tooltip: $name_tip, toggleable: true }),
+    dt_col("company", "Company", "company", { sortable: true, searchable: true, toggleable: true }),
+    dt_col("email", "Email", "email", { sortable: true, searchable: true, toggleable: true }),
+    dt_col("status", "Status", "status", { sortable: true, badge: $status_badge, toggleable: true, width: "7rem" }),
+    dt_col("created", "Created", "created", { sortable: true, type: "datetime", toggleable: true })
+  ]
+  -- RAW dt_admin_opts overrides — the engine (rs_list_opts) applies the preset.
+  $opts = {
+    base_route: "/biz/customers", caption: "Customers", noun: "customers",
+    default_sort: "created", default_dir: "desc",
+    search_placeholder: "Search name, company, email…",
+    row_href: $rowhref, row_action_specs: [$act_view, $act_edit, $act_del],
+    bulk_id: $bulkid,
+    filters: [ dt_filter("status", "Status", { options: [
+      { value: "active", "label": "Active", col: "status", op: "=" },
+      { value: "inactive", "label": "Inactive", col: "status", op: "=" },
+      { value: "closed", "label": "Closed", col: "status", op: "=" }
+    ] }) ],
+    groups: [ dt_group("status", "Status", "status", nil) ],
+    header_actions: [{ "label": "New customer", icon: "plus", variant: "primary", modal: "md-edit", modal_src: "/biz/customers?new=1&modal=1" }]
+  }
+  return { spec: $spec, opts: $opts }
+end
+
+-- ─────────────────────── the resource spec (P2) ───────────────────────
+
+function customers_resource()
+  $cfg = bc_list_config()
+  return {
+    entity: "customers", noun: "customer", base_route: "/biz/customers",
+    now_fn: fn() = biz_now(),
+    list: { title: "Customers", spec: $cfg["spec"], opts: $cfg["opts"],
+            select: "id, name, company, email, status, created" },
+    form: {
+      cols: 2,
+      fields: [
+        { name: "name", kind: "text", "label": "Name", required: true },
+        { name: "company", kind: "text", "label": "Company" },
+        { name: "email", kind: "email", "label": "Email", required: true },
+        { name: "phone", kind: "tel", "label": "Phone" },
+        { name: "address1", kind: "text", "label": "Address line 1" },
+        { name: "address2", kind: "text", "label": "Address line 2" },
+        { name: "city", kind: "text", "label": "City" },
+        { name: "state", kind: "text", "label": "State" },
+        { name: "postcode", kind: "text", "label": "Postcode" },
+        { name: "country", kind: "text", "label": "Country", blank_default: "AU", default: "AU", help: "ISO code, default AU", help_tip: true },
+        { name: "status", kind: "select", "label": "Status", default: "active", options: [
+          { value: "active", "label": "active" },
+          { value: "inactive", "label": "inactive" },
+          { value: "closed", "label": "closed" }
+        ] },
+        { name: "notes", kind: "textarea", "label": "Notes", rows: 3, span: 2 }
+      ],
+      stamps: { created: "created", updated: "updated" },
+      redirect_fn: fn($id) = "/biz/customers?view=" .. $id,
+      saved_flash: "Customer saved"
+    },
+    policy: {
+      guard: fn($id) = bc_del_block($id),
+      fetch: fn($id) = bc_get_one($id),
+      -- ephemeral portal tokens cascade first (customer_tokens carries an
+      -- ENFORCED FK — a plain DELETE fails closed on any tokened customer);
+      -- both statements run inside dt_try_delete_row's single tx.
+      del: fn($id, $row) = bc_delete_cascade($id),
+      missing: "No such customer.",
+      audit: { table_ref: "customers", create_action: "create", update_action: "update",
+               delete_action: "delete",
+               detail_fn: fn($v, $id) = bc_str($v["name"]) .. " <" .. bc_str($v["email"]) .. ">" }
+    },
+    actions: { verbs: { "send_setpw": fn($f, $user) = bc_send_setpw($f, $user) } },
+    view_fn: fn($viewid, $user) = bc_view($viewid, $user)
+  }
+end
+
+-- ?view=<id> — the phone-support detail screen (custom surface, engine-routed).
+function bc_view($viewid, $user)
+  $vid = to_number($viewid)
+  if $vid == nil then
+    return redirect_flash("/biz/customers", "Bad customer id", "danger")
+  end
+  $c = bc_get_one($vid)
+  if $c == nil then
+    return doc(404, "Customers", $user, '<div class="card cms-card-narrow"><h1>Customer not found</h1><p class="muted"><a href="/biz/customers">← All customers</a></p></div>')
+  end
+  return doc(200, bc_str($c.name), $user, bc_detail($c))
+end
+
+-- ─────────────────────────── entry point ───────────────────────────
+
+function biz_customers_main()
+cms_init()
+biz_init()
+$user = current_user($HEADERS)
+-- a modal fetch on an expired session must return a clean fragment, not a login
+-- redirect injected into the dialog (mirrors h_admin_users).
+if md_is_modal_request() and $user == nil then
+  return md_session_expired("/biz/customers")
+end
+$deny = require_role($user, "admin")
+if $deny != nil then
+  return $deny
+end
+
+return resource_main(customers_resource(), $user)
+
+end

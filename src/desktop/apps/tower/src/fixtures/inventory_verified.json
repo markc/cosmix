@@ -1,0 +1,11 @@
+{
+  "posture": "verified",
+  "epoch": 42,
+  "mesh": "example",
+  "hash": "sha256:fixture",
+  "members": [
+    {"name": "alpha", "mesh_ip": "192.0.2.10", "bus": true, "status": "active"},
+    {"name": "delta", "mesh_ip": "192.0.2.11", "bus": true, "status": "active"},
+    {"name": "storage", "mesh_ip": "192.0.2.12", "bus": false, "status": "active"}
+  ]
+}

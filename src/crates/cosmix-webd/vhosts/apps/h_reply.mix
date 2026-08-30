@@ -1,0 +1,80 @@
+-- h_reply.mix — uniform reply submit for the shared threaded-reply substrate (thread.mix).
+-- POST /reply with: root_kind ('forum'|'post'), root_id, parent_id, body, return. Used by
+-- BOTH forum topics AND blog comments — one submit path for the whole substrate. Login-to-post;
+-- validates the root exists with the matching kind and is visible to the poster before insert;
+-- guards the return against open-redirect. Plan: _plan/2026-06-28-unified-message-surfaces.md §5.
+include "/opt/cosmix/vhosts/shared/widgets/thread.mix"
+
+-- A safe local return path: must start with a single "/" (not "//", no scheme, no CRLF).
+function reply_safe_return($ret)
+  if $ret == nil then
+    return "/"
+  end
+  $r = "" .. $ret
+  if pos("/", $r) != 1 or pos("//", $r) == 1 then
+    return "/"
+  end
+  -- reject backslashes (some clients normalize "/\evil" → "//evil" = scheme-relative)
+  -- and CR/LF (header-injection) — a safe local path has none of these.
+  if contains($r, "\n") or contains($r, "\r") or contains($r, "\\") then
+    return "/"
+  end
+  return $r
+end
+
+function reply_main()
+cms_init()
+$user = current_user($HEADERS)
+$f = parse_form($BODY)
+$ret = reply_safe_return($f["return"])
+if $user == nil then
+  return redirect_flash("/login", "Sign in to reply", "warning")
+end
+$rk = $f["root_kind"]
+if $rk != "forum" and $rk != "post" and $rk != "page" then
+  return redirect_flash($ret, "Invalid reply target", "warning")
+end
+-- Surface gate: a reply requires the ROOT's surface enabled on this vhost — forum→`forum`,
+-- post→`blog`, page→`notes` — mirroring the h_forum/h_post/h_page feature_off_doc gates so a
+-- crafted POST can't write to a surface that's disabled (and therefore invisible). (Auth is
+-- already enforced above — there is NO anonymous-write path on any surface.)
+if $rk == "forum" and not feature("forum") then
+  return redirect_flash($ret, "The forum is not enabled", "warning")
+end
+if $rk == "post" and not feature("blog") then
+  return redirect_flash($ret, "Comments are closed", "warning")
+end
+if $rk == "page" and not feature("notes") then
+  return redirect_flash($ret, "Comments are closed", "warning")
+end
+$rid = $f["root_id"]
+if $rid == nil or trim("" .. $rid) == "" then
+  return redirect_flash($ret, "Invalid reply target", "warning")
+end
+$root = db_query("SELECT id, status, visibility, comments_enabled FROM cms_posts WHERE id = ?1 AND kind = ?2", ["" .. $rid, $rk])
+if length($root) == 0 then
+  return redirect_flash($ret, "No such thread", "warning")
+end
+$r0 = $root[0]
+-- A thread accepts replies only on a PUBLISHED, PUBLIC root — for everyone, moderators
+-- included. A draft/private root is a work-in-progress, not a discussion surface; this
+-- mirrors the can_reply gate in the forum/post renderers (the form isn't shown either).
+if $r0["status"] != "published" or $r0["visibility"] == "private" then
+  return redirect_flash($ret, "No such thread", "warning")
+end
+-- Per-item comments toggle (post/page only) enforced SERVER-SIDE, not just by hiding the
+-- form: a closed post/page refuses comments even on a crafted POST. Forum topics ignore
+-- this column (the surface flag above gates them).
+if ($rk == "post" or $rk == "page") and ("" .. thread_or($r0["comments_enabled"], "0")) != "1" then
+  return redirect_flash($ret, "Comments are closed", "warning")
+end
+$body = $f["body"]
+if $body == nil or trim($body) == "" then
+  return redirect_flash($ret, "Write something first", "warning")
+end
+$nid = thread_add($rk, $rid, $f["parent_id"], $user, $body, "visible")
+if $nid == 0 then
+  return redirect_flash($ret, "Reply not saved", "warning")
+end
+return redirect_flash($ret .. "#th-" .. ("" .. $nid), "Reply posted", "success")
+end

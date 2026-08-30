@@ -1,0 +1,12 @@
+{
+  "action": {
+    "id": "transport.toggle",
+    "label": "Play / pause",
+    "category": "transport",
+    "icon_name": "play",
+    "description": "Toggle transport playback.",
+    "args_schema": {"fields": [], "allow_extra": false},
+    "allowed_sources": {"bus": true},
+    "enabled": true
+  }
+}

@@ -1,0 +1,1073 @@
+-- ssh_lib.mix — shared logic for the /ssh admin panel (the admin vhost).
+--
+-- The filesystem (~/.ssh via the filesd `sshm` place) is the SOLE source of
+-- truth; the sshm.* SQLite schema (an ATTACHed aux db, `db-schema:sshm`) is a
+-- REINDEXABLE CACHE for the datatable, never authoritative. Reads go through the
+-- delegated filesd-fs seam (fs.list/fs.read_blob/fs.stat), which is path-scoped
+-- server-side to expose only config, hosts/*, keys/*.pub — private keys are
+-- never reachable from here.
+--
+-- Embedded-Mix dialect rules (see h_admin_vtokens.mix): NO ?? / ?: (use if/else
+-- + fm_or/ssh_or); quote reserved words as map keys ("to":, "label":); concat is
+-- `..`; NO regex builtins in webd handlers (regex_* are unavailable — parse by
+-- hand). Every db_* touches sshm.* explicitly; single-statement upserts only
+-- (the tx-scoped db_tx primitive is a P1 item).
+
+-- nil-coalesce (lib-local; the engine forbids ?? / ?:).
+function ssh_or($v, $def)
+  if $v == nil then return $def end
+  return $v
+end
+
+-- ── filesd seam ─────────────────────────────────────────────────────────────
+
+-- The single wrapped filesd-fs seam: bus_call raises on any failure (gate
+-- denied, daemon down, verb error), so every call degrades gracefully.
+function ssh_call($verb, $args)
+  try
+    $r = bus_call($verb, $args)
+    return { ok: true, result: $r }
+  catch $e
+    return { ok: false, err: ("" .. $e) }
+  end
+end
+
+-- List a directory under the sshm place → { ok, entries, err }. `entries` is a
+-- list of { name, is_dir, is_symlink, ... } (the filesd list shape). Hidden
+-- files included (show_hidden:true) so hosts/.ephemeral is seen.
+function ssh_list($rel)
+  $res = ssh_call("fs.list", { path: ("sshm/" .. $rel), sort: "name", dir: "asc", show_hidden: true })
+  if not $res["ok"] then
+    return { ok: false, entries: [], err: $res["err"] }
+  end
+  $ents = $res["result"]["entries"]
+  if $ents == nil then $ents = [] end
+  return { ok: true, entries: $ents, err: "" }
+end
+
+-- Read a text file under the sshm place → { ok, text, err }.
+function ssh_read($rel)
+  $res = ssh_call("fs.read_blob", { path: ("sshm/" .. $rel), max: 65536 })
+  if not $res["ok"] then
+    return { ok: false, text: "", err: $res["err"] }
+  end
+  $r = $res["result"]
+  if ssh_or($r["binary"], false) then
+    return { ok: false, text: "", err: "binary file" }
+  end
+  return { ok: true, text: ssh_or($r["text"], ""), err: "" }
+end
+
+-- ── schema (idempotent) ─────────────────────────────────────────────────────
+
+-- Create the sshm.* mirror + scan tables. Runs on every /ssh request (cheap
+-- CREATE TABLE IF NOT EXISTS). All tables are `sshm.`-qualified → the aux db,
+-- which survives a cms.db rig re-clone. Single statements only.
+function ssh_init()
+  db_exec("CREATE TABLE IF NOT EXISTS sshm.ssh_hosts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, hostname TEXT, port INTEGER, user TEXT, key_name TEXT, ephemeral INTEGER NOT NULL DEFAULT 0, raw TEXT, file_hash TEXT, mtime INTEGER, last_status TEXT, last_latency_ms INTEGER, last_tested_at TEXT, created TEXT NOT NULL DEFAULT (datetime('now')), updated TEXT NOT NULL DEFAULT (datetime('now')))", [])
+  db_exec("CREATE TABLE IF NOT EXISTS sshm.ssh_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, type TEXT, bits INTEGER, comment TEXT, pub TEXT, used_by INTEGER NOT NULL DEFAULT 0, mtime INTEGER, created TEXT NOT NULL DEFAULT (datetime('now')), updated TEXT NOT NULL DEFAULT (datetime('now')))", [])
+  db_exec("CREATE TABLE IF NOT EXISTS sshm.ssh_scans (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT, finished_at TEXT, status TEXT, total INTEGER, ok INTEGER, failed INTEGER, offline INTEGER, note TEXT)", [])
+  db_exec("CREATE TABLE IF NOT EXISTS sshm.ssh_scan_results (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER, host_name TEXT, status TEXT, latency_ms INTEGER, message TEXT, at TEXT)", [])
+  -- One result row per (scan, host) — backs the idempotent upsert so a replayed
+  -- worker progress post can't double-count. Dedupe any pre-existing rows FIRST
+  -- (a legacy db could hold duplicates that would fail the unique index).
+  db_exec("DELETE FROM sshm.ssh_scan_results WHERE id NOT IN (SELECT MAX(id) FROM sshm.ssh_scan_results GROUP BY scan_id, host_name)", [])
+  db_exec("CREATE UNIQUE INDEX IF NOT EXISTS sshm.idx_ssh_scan_results_uniq ON ssh_scan_results (scan_id, host_name)", [])
+  -- P2a job substrate. status: queued|claimed|done|error|abandoned|unknown.
+  -- lease_token/lease_expires fence every worker apply (single-statement CAS —
+  -- NO multi-statement tx; the db_tx primitive doesn't exist). result is the
+  -- worker's SANITIZED terminal report (never raw ssh stderr — D5/C14).
+  db_exec("CREATE TABLE IF NOT EXISTS sshm.ssh_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, payload TEXT, idempotency_key TEXT, status TEXT NOT NULL DEFAULT 'queued', lease_token TEXT, lease_expires TEXT, attempts INTEGER NOT NULL DEFAULT 0, claimed_at TEXT, finished_at TEXT, result TEXT, created TEXT NOT NULL DEFAULT (datetime('now')))", [])
+  db_exec("CREATE INDEX IF NOT EXISTS sshm.idx_ssh_jobs_claim ON ssh_jobs (status, id)", [])
+  db_exec("CREATE UNIQUE INDEX IF NOT EXISTS sshm.idx_ssh_jobs_idem ON ssh_jobs (idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN ('queued','claimed')", [])
+  -- Streaming tool state (uptime/ping), mirroring toolsd's hardened progress path: `output`
+  -- accumulates the streamed text, `last_seq` gates idempotent in-order appends, `streaming`
+  -- + `output_cap` + `max_seq` + `stream_deadline` bound how much and how long a stream can
+  -- hold the (globally-single) claim. All snapshotted on the row.
+  ssh_ensure_col("sshm", "ssh_jobs", "output", "TEXT NOT NULL DEFAULT ''")
+  ssh_ensure_col("sshm", "ssh_jobs", "last_seq", "INTEGER NOT NULL DEFAULT 0")
+  ssh_ensure_col("sshm", "ssh_jobs", "streaming", "INTEGER NOT NULL DEFAULT 0")
+  ssh_ensure_col("sshm", "ssh_jobs", "output_cap", "INTEGER NOT NULL DEFAULT 0")
+  ssh_ensure_col("sshm", "ssh_jobs", "max_seq", "INTEGER NOT NULL DEFAULT 0")
+  ssh_ensure_col("sshm", "ssh_jobs", "stream_deadline", "TEXT")
+  -- Unguessable per-job handle for the tool modal's poll, returned only to the enqueuer
+  -- and required to read the job's output. /ssh is operator-gated, but on a dev_session
+  -- vhost every caller shares one ambient operator identity and job ids are sequential —
+  -- so the token is what keeps one operator's uptime/ping output from another's (toolsd
+  -- MAJOR, same reasoning).
+  ssh_ensure_col("sshm", "ssh_jobs", "poll_token", "TEXT")
+  -- DB-level backstop: a claimed job MUST carry a lease. RAISE(ABORT) aborts the
+  -- single offending statement (no tx needed) — the fence can't be bypassed.
+  db_exec("CREATE TRIGGER IF NOT EXISTS sshm.trg_ssh_jobs_lease_ins BEFORE INSERT ON ssh_jobs WHEN NEW.status='claimed' AND (NEW.lease_token IS NULL OR NEW.lease_token='' OR NEW.lease_expires IS NULL OR NEW.lease_expires='') BEGIN SELECT RAISE(ABORT, 'claimed job requires lease_token + lease_expires'); END", [])
+  db_exec("CREATE TRIGGER IF NOT EXISTS sshm.trg_ssh_jobs_lease_upd BEFORE UPDATE ON ssh_jobs WHEN NEW.status='claimed' AND (NEW.lease_token IS NULL OR NEW.lease_token='' OR NEW.lease_expires IS NULL OR NEW.lease_expires='') BEGIN SELECT RAISE(ABORT, 'claimed job requires lease_token + lease_expires'); END", [])
+  -- Settings (the worker secret lives HERE, in the aux db, so it survives a rig
+  -- cms.db re-clone together with the jobs — D8/D1a).
+  db_exec("CREATE TABLE IF NOT EXISTS sshm.sshm_settings (key TEXT PRIMARY KEY, value TEXT)", [])
+  -- Audit log (aux-db, survives a rig re-clone). Written as ONE statement after
+  -- each FS mutation (the FS write is the event of record; the mirror is a
+  -- projection, so DB↔FS atomicity is neither achievable nor required).
+  db_exec("CREATE TABLE IF NOT EXISTS sshm.ssh_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL DEFAULT (datetime('now')), actor TEXT NOT NULL, action TEXT NOT NULL, table_ref TEXT DEFAULT '', row_id INTEGER, detail TEXT DEFAULT '')", [])
+  -- Seed a random worker secret once (INSERT OR IGNORE keeps it stable).
+  db_exec("INSERT OR IGNORE INTO sshm.sshm_settings (key, value) VALUES ('sshm_secret', ?1)", [random_password(48)])
+  -- P2b: real SHA256 fingerprint column (populated by the worker's key_create /
+  -- a future fingerprint job — ssh-keygen -lf needs exec, not available in-handler).
+  ssh_ensure_col("sshm", "ssh_keys", "fingerprint", "TEXT")
+  -- A scan/test job carries the scan it belongs to as a COLUMN (not just in the
+  -- payload JSON) so a trigger can close the scan atomically with the job's
+  -- terminal transition — no second-statement race, and the host_result binds
+  -- to it.
+  ssh_ensure_col("sshm", "ssh_jobs", "scan_id", "INTEGER")
+  -- One-shot "the panel has reindexed after this job completed" marker, so the
+  -- job-status poll reindexes a done key_create EXACTLY once (a stale/refreshed/
+  -- scripted GET can't re-trigger a full FS scan).
+  ssh_ensure_col("sshm", "ssh_jobs", "reindexed", "INTEGER NOT NULL DEFAULT 0")
+  -- Backfill scan_id from the payload for any still-in-flight scan job that
+  -- predates the column, so the close trigger can fold its scan. One-time
+  -- (after backfill the WHERE matches nothing).
+  db_exec("UPDATE sshm.ssh_jobs SET scan_id = json_extract(payload, '$.scan_id') WHERE scan_id IS NULL AND kind IN ('scan_all','test_host') AND status IN ('queued','claimed') AND payload IS NOT NULL", [])
+  -- Atomic scan close: when a scan/test job goes terminal, fold the scan to
+  -- done/failed in the SAME statement as the job UPDATE (fires inside the
+  -- terminal CAS). A crash between two statements can no longer strand a scan
+  -- 'running'.
+  db_exec("CREATE TRIGGER IF NOT EXISTS sshm.trg_ssh_jobs_close_scan AFTER UPDATE OF status ON ssh_jobs WHEN NEW.status IN ('done','error','abandoned') AND OLD.status='claimed' AND NEW.scan_id IS NOT NULL BEGIN UPDATE ssh_scans SET status=CASE WHEN NEW.status='done' THEN 'done' ELSE 'failed' END, finished_at=datetime('now') WHERE id=NEW.scan_id AND status='running'; END", [])
+end
+
+-- Add a column to <schema>.<table> if it lacks it (idempotent retrofit; single
+-- statement). Uses try-ALTER rather than pragma_table_info — the db-schema
+-- authorizer denies PRAGMA (incl. the pragma_* table-valued functions), so
+-- introspection must go through a plain statement. A duplicate-column ALTER is
+-- a harmless no-op error we swallow.
+function ssh_ensure_col($schema, $table, $col, $decl)
+  -- Probe FIRST, then ALTER, and let a REAL ALTER failure propagate. A blanket try/catch
+  -- around the ALTER hid genuine failures (denied DDL, disk, lock) and let the request
+  -- proceed against a missing column (Codex). The probe is a zero-row SELECT (the
+  -- db-schema authorizer allows it; PRAGMA/pragma_* would be denied).
+  $have = true
+  try
+    $_ = db_query("SELECT " .. $col .. " FROM " .. $schema .. "." .. $table .. " LIMIT 0", [])
+  catch $e
+    $have = false
+  end
+  if $have then
+    return
+  end
+  db_exec("ALTER TABLE " .. $schema .. "." .. $table .. " ADD COLUMN " .. $col .. " " .. $decl, [])
+end
+
+-- ── job seam (worker ↔ webd; secret-gated, single-statement CAS) ────────────
+--
+-- POST-only endpoints the sshm worker calls over the WG listener with an
+-- X-Sshm-Secret header. NO session — the secret IS the authz. Every state
+-- transition is a single conditional-UPDATE CAS (no multi-statement tx; that
+-- would poison webd's shared connection). Leases fence every apply on
+-- (job_id, lease_token). Fixed 15-minute lease; the worker heartbeats to renew.
+
+function ssh_secret()
+  $r = db_query("SELECT value FROM sshm.sshm_settings WHERE key='sshm_secret'", [])
+  if length($r) == 0 then return "" end
+  return "" .. ssh_or($r[0]["value"], "")
+end
+
+-- Timing-safe secret check. The header name is lowercase in $HEADERS.
+function ssh_job_authorized()
+  $secret = ssh_secret()
+  $hdr = ""
+  if $HEADERS != nil and $HEADERS["x-sshm-secret"] != nil then
+    $hdr = "" .. $HEADERS["x-sshm-secret"]
+  end
+  return $secret != "" and $hdr != "" and constant_time_eq($hdr, $secret)
+end
+
+function ssh_job_reply($status, $obj)
+  return { status: $status, headers: { "Content-Type": "application/json" }, body: json_encode($obj) }
+end
+
+-- The server-side kind allowlist (∩ the worker's supported_kinds). Version skew
+-- can never lease a kind the worker can't run. (reindex is a webd-side bus
+-- action, NOT a worker job — the worker can't write the mirror.)
+function ssh_job_kinds()
+  return ["scan_all", "test_host", "key_create", "copy_key", "fix_perms", "uptime_host", "ping_host"]
+end
+
+-- The two OPERATOR TOOL kinds (uptime + ping) reuse the toolsd modal + streaming CODE, but
+-- execution/authority stay in sshm (Codex): they are STRICTLY WEAKER than sshm's existing
+-- keygen/copy-key jobs, on the same hosts, via the same already-web-triggered identity.
+--   streaming : ping streams one reply per progress append (like Trace); uptime is one-shot.
+--   output_cap: bytes; max_seq/wall bound how long a stream can hold the claim.
+function ssh_tool_spec($kind)
+  $k = "" .. $kind
+  if $k == "ping_host" then
+    return { streaming: true, output_cap: 8192, max_seq: 16 }
+  end
+  if $k == "uptime_host" then
+    return { streaming: false, output_cap: 8192, max_seq: 0 }
+  end
+  return nil
+end
+
+function ssh_kind_streams($kind)
+  $s = ssh_tool_spec($kind)
+  return $s != nil and $s["streaming"] == true
+end
+
+-- Streaming bounds — mirror the toolsd values (Codex): a progress append advances the seq
+-- at most max_seq times and keeps the claim alive at most this long past the claim.
+$SSH_STREAM_WALL = "+40 seconds"
+
+-- Record ONE host's scan result, IDEMPOTENTLY (a replayed progress post must
+-- not double-count). Upsert the (scan_id, host_name) row, then RECOMPUTE the
+-- parent scan's counters from the result rows (source of truth — no increment
+-- drift), then update the host's last-test columns (so /ssh/hosts pills
+-- reflect it). The status is a sanitized classifier code — never raw ssh
+-- stderr (D5/C14). The UNIQUE(scan_id,host_name) index (ssh_init) backs the
+-- upsert.
+function ssh_record_host_result($scan_id, $host, $status, $latency)
+  db_exec("INSERT INTO sshm.ssh_scan_results (scan_id, host_name, status, latency_ms, at) VALUES (?1,?2,?3,?4, datetime('now')) ON CONFLICT(scan_id, host_name) DO UPDATE SET status=?3, latency_ms=?4, at=datetime('now')", [$scan_id, $host, $status, $latency])
+  db_exec("UPDATE sshm.ssh_scans SET ok=(SELECT COUNT(*) FROM sshm.ssh_scan_results WHERE scan_id=?1 AND status IN ('ok','git')), offline=(SELECT COUNT(*) FROM sshm.ssh_scan_results WHERE scan_id=?1 AND status='offline'), failed=(SELECT COUNT(*) FROM sshm.ssh_scan_results WHERE scan_id=?1 AND status NOT IN ('ok','git','offline')) WHERE id=?1", [$scan_id])
+  db_exec("UPDATE sshm.ssh_hosts SET last_status=?2, last_latency_ms=?3, last_tested_at=datetime('now') WHERE name=?1", [$host, $status, $latency])
+end
+
+-- POST /ssh/job-claim-next — sweep expired leases, then CAS-claim the oldest
+-- queued job of a supported kind. 200 {job} | 204 empty.
+function ssh_job_claim_next()
+  -- Expired claimed leases → abandoned (unknown outcome; reconcilable). One stmt.
+  db_exec("UPDATE sshm.ssh_jobs SET status='abandoned', lease_token=NULL, lease_expires=NULL WHERE status='claimed' AND lease_expires IS NOT NULL AND datetime(lease_expires) < datetime('now')", [])
+  $supported = []
+  $body = json_parse($BODY)
+  $sk = []
+  if $body != nil and $body["supported_kinds"] != nil then $sk = $body["supported_kinds"] end
+  for each $k in $sk
+    if contains(ssh_job_kinds(), "" .. $k) then push($supported, "" .. $k) end
+  end
+  if length($supported) == 0 then return ssh_job_reply(204, {}) end
+  $in = "'" .. join($supported, "','") .. "'"
+  $tok = uuid()
+  -- Single-statement CAS: claim the oldest queued job in an allowed kind and
+  -- read it back in ONE statement (RETURNING) — no changes()-race on the
+  -- shared connection. The subquery pins exactly one row; the lease trigger is
+  -- the DB backstop that the claimed row carries token+expiry.
+  -- The streaming state for a tool kind is snapshotted ATOMICALLY at claim (CASE on kind),
+  -- and `output` is reset — so a requeued ping restarts from an empty accumulator rather
+  -- than splicing a new attempt onto a dead one's partial output (the toolsd requeue bug).
+  $rows = db_query("UPDATE sshm.ssh_jobs SET status='claimed', lease_token=?1, lease_expires=datetime('now','+15 minutes'), attempts=attempts+1, claimed_at=datetime('now'),
+                    streaming = CASE kind WHEN 'ping_host' THEN 1 ELSE 0 END,
+                    output_cap = CASE WHEN kind IN ('ping_host','uptime_host') THEN 8192 ELSE 0 END,
+                    max_seq = CASE kind WHEN 'ping_host' THEN 16 ELSE 0 END,
+                    stream_deadline = CASE kind WHEN 'ping_host' THEN datetime('now', '" .. $SSH_STREAM_WALL .. "') ELSE NULL END,
+                    output = CASE WHEN kind IN ('ping_host','uptime_host') THEN '' ELSE output END,
+                    last_seq = 0
+                    WHERE id=(SELECT id FROM sshm.ssh_jobs WHERE status='queued' AND kind IN (" .. $in .. ") ORDER BY id LIMIT 1) RETURNING id, kind, payload, attempts, lease_expires, streaming, CAST(strftime('%s', stream_deadline) AS INTEGER) AS sdl_epoch", [$tok])
+  if length($rows) == 0 then return ssh_job_reply(204, {}) end
+  $j = $rows[0]
+  return ssh_job_reply(200, {
+    job_id: to_number("" .. $j["id"]),
+    kind: "" .. $j["kind"],
+    payload: "" .. ssh_or($j["payload"], ""),
+    lease_token: $tok,
+    lease_expires: "" .. $j["lease_expires"],
+    attempts: to_number("" .. $j["attempts"]),
+    streaming: to_number("" .. ssh_or($j["streaming"], "0")),
+    -- The ABSOLUTE server deadline (unix epoch). webd + the worker share a clock (same
+    -- node), so the worker budgets every blocking call against this fixed instant rather
+    -- than a fragile entry-relative wall (Codex). nil for a non-streaming kind.
+    stream_deadline_epoch: to_number("" .. ssh_or($j["sdl_epoch"], "0"))
+  })
+end
+
+-- POST /ssh/job-progress — a streaming append {job_id, lease_token, seq, chunk}. Renews the
+-- lease. Byte-exact cap + in-order idempotent seq + deadline/max_seq bounds — the same
+-- hardened logic as toolsd's tools_report_progress (Codex-reviewed). 200 continue / 4xx stop.
+function ssh_job_progress()
+  $body = json_parse($BODY)
+  $jid = to_number("" .. ssh_or($body["job_id"], ""))
+  $tok = "" .. ssh_or($body["lease_token"], "")
+  $seq = to_number("" .. ssh_or($body["seq"], ""))
+  $chunk = "" .. ssh_or($body["chunk"], "")
+  if $jid == nil or $tok == "" or $seq == nil or $seq < 1 then
+    return ssh_job_reply(400, { error: "bad request" })
+  end
+  $cbytes = byte_length($chunk)
+  if $cbytes > 4096 then
+    return ssh_job_reply(400, { error: "chunk too large" })
+  end
+  -- Append EXACTLY the next seq, while: streaming; live claim (token + lease); seq within
+  -- max_seq; before the hard deadline; and output+chunk within the tool's BYTE cap. Plain
+  -- concat (no substr); lease renewed in the same statement.
+  $rows = db_query("UPDATE sshm.ssh_jobs
+                    SET output = output || ?3, last_seq = ?4, lease_expires = datetime('now','+15 minutes')
+                    WHERE id=?1 AND status='claimed' AND lease_token=?2 AND streaming = 1
+                    AND lease_expires IS NOT NULL AND datetime(lease_expires) >= datetime('now')
+                    AND ?4 = last_seq + 1 AND ?4 <= max_seq
+                    AND stream_deadline IS NOT NULL AND datetime('now') < datetime(stream_deadline)
+                    AND length(CAST(output AS BLOB)) + ?5 <= output_cap
+                    RETURNING id", [$jid, $tok, $chunk, $seq, $cbytes])
+  if length($rows) == 1 then return ssh_job_reply(200, { ok: true }) end
+  $live = db_query("SELECT last_seq FROM sshm.ssh_jobs WHERE id=?1 AND status='claimed' AND lease_token=?2 AND streaming = 1
+                    AND lease_expires IS NOT NULL AND datetime(lease_expires) >= datetime('now')", [$jid, $tok])
+  if length($live) == 1 then
+    if $seq <= to_number("" .. ssh_or($live[0]["last_seq"], "0")) then return ssh_job_reply(200, { ok: true }) end
+    return ssh_job_reply(409, { error: "sequence gap" })
+  end
+  return ssh_job_reply(409, { error: "fenced" })
+end
+
+-- POST /ssh/job-renew — extend an UNEXPIRED lease held by the same token.
+-- Never resurrects a dead lease (a zombie worker must not reclaim a job another
+-- may now hold). 200 | 409 fenced.
+function ssh_job_renew()
+  $body = json_parse($BODY)
+  $jid = to_number("" .. ssh_or($body["job_id"], ""))
+  $tok = "" .. ssh_or($body["lease_token"], "")
+  if $jid == nil or $tok == "" then return ssh_job_reply(400, { error: "bad request" }) end
+  $rows = db_query("UPDATE sshm.ssh_jobs SET lease_expires=datetime('now','+15 minutes') WHERE id=?1 AND status='claimed' AND lease_token=?2 AND lease_expires IS NOT NULL AND datetime(lease_expires) >= datetime('now') RETURNING id", [$jid, $tok])
+  if length($rows) == 0 then return ssh_job_reply(409, { error: "fenced" }) end
+  return ssh_job_reply(200, { ok: true })
+end
+
+-- POST /ssh/job-apply — fenced CAS terminal/progress write. Body carries
+-- job_id, lease_token, ok (true=success / false=failure / absent=progress-renew),
+-- and result (SANITIZED — no raw ssh stderr, D5). Idempotent terminal retry:
+-- a lost HTTP response replayed on an already-terminal row with the same token
+-- answers 200, not 409.
+function ssh_job_apply()
+  $body = json_parse($BODY)
+  $jid = to_number("" .. ssh_or($body["job_id"], ""))
+  $tok = "" .. ssh_or($body["lease_token"], "")
+  if $jid == nil or $tok == "" then return ssh_job_reply(400, { error: "bad request" }) end
+  $result = ""
+  if $body["result"] != nil then $result = json_encode($body["result"]) end
+  $ok = $body["ok"]
+  if $ok == nil then
+    -- progress/heartbeat → renew, fenced on a LIVE (unexpired) lease. The CAS
+    -- returns the job's OWN scan_id; a host_result is recorded ONLY if its
+    -- scan_id matches (a claimed worker can't write into an unrelated scan).
+    $rows = db_query("UPDATE sshm.ssh_jobs SET lease_expires=datetime('now','+15 minutes') WHERE id=?1 AND status='claimed' AND lease_token=?2 AND lease_expires IS NOT NULL AND datetime(lease_expires) >= datetime('now') RETURNING id, scan_id", [$jid, $tok])
+    if length($rows) == 0 then return ssh_job_reply(409, { error: "fenced" }) end
+    $job_scan = to_number("" .. ssh_or($rows[0]["scan_id"], ""))
+    $hr = $body["host_result"]
+    if $hr != nil and $job_scan != nil then
+      $sid = to_number("" .. ssh_or($hr["scan_id"], ""))
+      $hn = "" .. ssh_or($hr["host_name"], "")
+      if $sid == $job_scan and $hn != "" then
+        ssh_record_host_result($sid, $hn, "" .. ssh_or($hr["status"], "unreachable"), to_number("" .. ssh_or($hr["latency_ms"], "0")))
+      end
+    end
+    return ssh_job_reply(200, { ok: true })
+  end
+  $newstatus = "error"
+  if $ok == true then $newstatus = "done" end
+  -- `output` handling for the tool kinds: a ONE-SHOT tool (uptime) sends its text and we
+  -- write it; a STREAMED tool (ping) finalizes with NO `output` key and we PRESERVE the
+  -- accumulated stream (overwriting would erase it — the toolsd rule). A non-stream/legacy
+  -- job (no output key, not streaming) keeps output '' untouched. `?5` = preserve flag.
+  $has_out = $body["output"] != nil
+  $outtext = "" .. ssh_or($body["output"], "")
+  -- Byte-exact cap (Codex): substr counts codepoints, so a multibyte output could keep far
+  -- more than 8192 bytes. Binary-search the codepoint cut whose BYTE length fits.
+  if byte_length($outtext) > 8192 then
+    $lo = 0
+    $hi = length($outtext)
+    while $lo < $hi
+      $mid = floor(($lo + $hi + 1) / 2)
+      if byte_length(substr($outtext, 0, $mid)) <= 8192 then
+        $lo = $mid
+      else
+        $hi = $mid - 1
+      end
+    end
+    $outtext = substr($outtext, 0, $lo)
+  end
+  $pflag = 0
+  if not $has_out then $pflag = 1 end
+  -- Terminal CAS on a LIVE lease. The AFTER-UPDATE trigger (trg_ssh_jobs_close_scan)
+  -- folds the job's scan to done/failed ATOMICALLY in this same statement, so
+  -- there is no second-statement window that could strand a scan 'running'.
+  -- Keeps lease_token (only lease_expires NULLed) so an idempotent retry is
+  -- recognisable by the token.
+  $rows = db_query("UPDATE sshm.ssh_jobs SET status=?4, finished_at=datetime('now'), result=?3,
+                    output = CASE WHEN ?5 = 1 THEN output ELSE ?6 END,
+                    lease_expires=NULL WHERE id=?1 AND status='claimed' AND lease_token=?2 AND lease_expires IS NOT NULL AND datetime(lease_expires) >= datetime('now') RETURNING id", [$jid, $tok, $result, $newstatus, $pflag, $outtext])
+  if length($rows) == 1 then return ssh_job_reply(200, { ok: true }) end
+  $r2 = db_query("SELECT id FROM sshm.ssh_jobs WHERE id=?1 AND lease_token=?2 AND status IN ('done','error','abandoned')", [$jid, $tok])
+  if length($r2) == 1 then return ssh_job_reply(200, { ok: true }) end
+  return ssh_job_reply(409, { error: "fenced" })
+end
+
+-- Enqueue a job (single INSERT). Returns the new job id. idem = optional
+-- idempotency key (dedup a re-submit before it's claimed — the partial unique
+-- index enforces it; a duplicate enqueue silently no-ops and returns the
+-- existing queued/claimed job's id).
+function ssh_job_enqueue($kind, $payload_obj, $idem)
+  $pj = ""
+  $scan_id = nil
+  if $payload_obj != nil then
+    $pj = json_encode($payload_obj)
+    if $payload_obj["scan_id"] != nil then $scan_id = to_number("" .. $payload_obj["scan_id"]) end
+  end
+  if $idem != nil and $idem != "" then
+    -- Insert-and-catch (no check-then-insert race): if the partial unique index
+    -- on idempotency_key rejects it, an equivalent job is already queued/claimed
+    -- — re-select and return it. Re-raise any NON-uniqueness error.
+    try
+      $rows = db_query("INSERT INTO sshm.ssh_jobs (kind, payload, idempotency_key, scan_id, status) VALUES (?1,?2,?3,?4,'queued') RETURNING id", [$kind, $pj, $idem, $scan_id])
+      if length($rows) > 0 then return to_number("" .. $rows[0]["id"]) end
+    catch $e
+      if not contains(lower("" .. $e), "unique") then raise("SSHM_ENQUEUE_ERR", "" .. $e) end
+    end
+    $ex = db_query("SELECT id FROM sshm.ssh_jobs WHERE idempotency_key=?1 AND status IN ('queued','claimed') ORDER BY id DESC LIMIT 1", [$idem])
+    if length($ex) > 0 then return to_number("" .. $ex[0]["id"]) end
+    return nil
+  end
+  $rows = db_query("INSERT INTO sshm.ssh_jobs (kind, payload, idempotency_key, scan_id, status) VALUES (?1,?2,?3,?4,'queued') RETURNING id", [$kind, $pj, nil, $scan_id])
+  if length($rows) == 0 then return nil end
+  return to_number("" .. $rows[0]["id"])
+end
+
+-- ── operator tools (uptime/ping): roster resolution + enqueue + poll ─────────
+--
+-- The panel passes an opaque host_id (sshm.ssh_hosts.id). webd resolves it HERE, from the
+-- server-owned roster — the caller never supplies a hostname/IP (Codex). A missing/blank
+-- row fails closed. The worker gets {alias, address} both from the ROW.
+-- A roster target (alias or address) must be a bare hostname/IP token: [A-Za-z0-9_.-] only.
+-- This rejects OpenSSH destination syntax that a hand-edited ~/.ssh/config fragment name
+-- could smuggle in — `root@host`, `ssh://host:2222`, embedded spaces — so uptime can only
+-- ever connect to the plain host the row names (Codex). (IPv6-literal hosts, which have
+-- colons, are not in this fleet and would be refused cleanly rather than mis-parsed.)
+$SSH_TARGET_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
+
+function ssh_strict_target($s)
+  $t = "" .. $s
+  if $t == "" or length($t) > 255 or starts_with($t, "-") then
+    return false
+  end
+  $i = 0
+  $n = length($t)
+  while $i < $n
+    if pos(substr($t, $i, 1), $SSH_TARGET_CHARS) == 0 then
+      return false
+    end
+    $i = $i + 1
+  end
+  return true
+end
+
+function ssh_tool_enqueue($kind, $host_id)
+  if ssh_tool_spec($kind) == nil then
+    return { ok: false, code: 404, error: "unknown tool" }
+  end
+  $n = to_number("" .. $host_id)
+  if $n == nil then
+    return { ok: false, code: 400, error: "bad host id" }
+  end
+  $hr = db_query("SELECT name, hostname FROM sshm.ssh_hosts WHERE id=?1", [$n])
+  if length($hr) == 0 then
+    return { ok: false, code: 404, error: "no such host" }
+  end
+  $alias = "" .. ssh_or($hr[0]["name"], "")
+  $addr = "" .. ssh_or($hr[0]["hostname"], "")
+  if $addr == "" then
+    $addr = $alias
+  end
+  -- Both must be bare host tokens (defence against a hand-edited roster fragment name).
+  if not ssh_strict_target($alias) then
+    return { ok: false, code: 400, error: "host alias is not a bare hostname" }
+  end
+  if not ssh_strict_target($addr) then
+    return { ok: false, code: 400, error: "host address is not a bare hostname/IP" }
+  end
+  $token = random_password(32)
+  $payload = json_encode({ alias: $alias, address: $addr })
+  -- Admission cap in ONE statement (Codex): the count guard is a SELECT-WHERE inside the
+  -- INSERT, so two concurrent enqueues can't both read "<6" and both insert (a
+  -- check-then-insert race — the shared connection serializes single statements, not a
+  -- read+write pair). 0 rows ⇒ at/over the cap ⇒ 429. Bounds the shared queue so a burst
+  -- of modal opens can't starve scan/keygen/fix-perms.
+  $rows = db_query("INSERT INTO sshm.ssh_jobs (kind, payload, poll_token, status)
+                    SELECT ?1, ?2, ?3, 'queued'
+                    WHERE (SELECT count(*) FROM sshm.ssh_jobs WHERE status IN ('queued','claimed') AND kind IN ('uptime_host','ping_host')) < 6
+                    RETURNING id", ["" .. $kind, $payload, $token])
+  if length($rows) == 0 then
+    return { ok: false, code: 429, error: "too many tool runs in progress — try again shortly" }
+  end
+  return { ok: true, id: to_number("" .. $rows[0]["id"]), token: $token, alias: $alias }
+end
+
+-- Read a tool job's live state, gated by the poll token (constant-time). Returns the row
+-- map or nil (nil also for a wrong/absent token — same 404 as a nonexistent job).
+function ssh_tool_status($jid, $token)
+  $n = to_number("" .. $jid)
+  $t = "" .. ssh_or($token, "")
+  if $n == nil or $t == "" then
+    return nil
+  end
+  $g = db_query("SELECT poll_token FROM sshm.ssh_jobs WHERE id=?1", [$n])
+  if length($g) == 0 then
+    return nil
+  end
+  $stored = "" .. ssh_or($g[0]["poll_token"], "")
+  if $stored == "" or not constant_time_eq($stored, $t) then
+    return nil
+  end
+  $r = db_query("SELECT id, kind, status, output, result FROM sshm.ssh_jobs WHERE id=?1", [$n])
+  if length($r) == 0 then
+    return nil
+  end
+  return $r[0]
+end
+
+function ssh_tool_terminal($status)
+  $s = "" .. $status
+  return $s == "done" or $s == "error" or $s == "abandoned"
+end
+
+-- ── CRUD: mutation verbs (FS-first, single-statement, no tx — P1) ───────────
+--
+-- Every host/key mutation writes ~/.ssh via the filesd seam FIRST (the
+-- authoritative event), then projects into the sshm.* mirror + audit as SINGLE
+-- statements, then reindexes that object. No BEGIN/COMMIT (the db_tx primitive
+-- doesn't exist and an bus_call can't join a SQLite tx anyway). CLI sshm +
+-- hand-edits keep working because the FS is the source of truth and the parser
+-- round-trips unknown lines.
+
+-- Name hygiene (mirror sshm_worker.mix safe_name — these names become FS paths).
+-- Returns "" on reject. Rejects empty / leading dot / leading "-" / "/" / ".." /
+-- ".pub" suffix, and any char outside [A-Za-z0-9_.-].
+function ssh_safe_name($n)
+  $n = "" .. $n
+  if $n == "" then return "" end
+  if starts_with($n, ".") or starts_with($n, "-") then return "" end
+  if contains($n, "/") or contains($n, "..") then return "" end
+  if ends_with(lower($n), ".pub") then return "" end
+  -- charset [A-Za-z0-9_.-], indexed with substr (the webd handler sandbox has
+  -- no chars() builtin, unlike the standalone worker).
+  $i = 0
+  $len = length($n)
+  while $i < $len
+    $c = substr($n, $i, 1)
+    if not (ssh_is_alnum($c) or $c == "_" or $c == "-" or $c == ".") then return "" end
+    $i = $i + 1
+  end
+  return $n
+end
+
+function ssh_is_alnum($c)
+  return ($c >= "a" and $c <= "z") or ($c >= "A" and $c <= "Z") or ($c >= "0" and $c <= "9")
+end
+
+-- True if $s carries whitespace (space/tab) or a line break (CR/LF). hostname/user
+-- flow verbatim into an ssh_config fragment that is Include'd into the master
+-- config, so an embedded newline would inject arbitrary directives / terminate the
+-- Host block. These fields are single tokens by definition — reject any whitespace.
+function ssh_has_ws($s)
+  $s = "" .. $s
+  return contains($s, " ") or contains($s, "\t") or contains($s, "\n") or contains($s, "\r")
+end
+
+-- Audit: ONE INSERT, best-effort (a log hiccup must not fail an already-applied
+-- FS mutation). Actor = the operator's session email.
+function ssh_audit($actor, $action, $table_ref, $row_id, $detail)
+  try
+    db_exec("INSERT INTO sshm.ssh_audit (actor, action, table_ref, row_id, detail) VALUES (?1,?2,?3,?4,?5)", ["" .. $actor, "" .. $action, "" .. $table_ref, $row_id, "" .. $detail])
+  catch $e
+  end
+end
+
+-- Build a host fragment (round-trips a preserved `extra` block of unknown ssh
+-- options). Emits Host/Hostname/Port/User/IdentityFile, then any extra lines.
+-- $keyname is a bare key name (or ""); the IdentityFile is written with a
+-- LITERAL `~` (ssh expands it at the operator's runtime). NOTE: `~` must not begin a
+-- Mix string literal or Mix tilde-expands it to the webd process's home — so
+-- the whole "  IdentityFile ~/..." prefix is one literal with `~` mid-string.
+function ssh_build_fragment($name, $hostname, $port, $user, $keyname, $extra)
+  $t = "Host " .. $name .. "\n"
+  $t = $t .. "  Hostname " .. $hostname .. "\n"
+  $t = $t .. "  Port " .. ("" .. $port) .. "\n"
+  $t = $t .. "  User " .. $user .. "\n"
+  if $keyname != "" then
+    $t = $t .. "  IdentityFile ~/.ssh/keys/" .. $keyname .. "\n"
+  end
+  if $extra != nil and $extra != "" then
+    for each $ln in split($extra, "\n")
+      if trim($ln) != "" then $t = $t .. "  " .. trim($ln) .. "\n" end
+    end
+  end
+  return $t
+end
+
+-- The available identity keys, as fm_select options (public-key mirror).
+function ssh_key_options($cur)
+  $opts = [ { value: "", "label": "(none)" } ]
+  $rows = db_query("SELECT name FROM sshm.ssh_keys ORDER BY name", [])
+  for each $r in $rows
+    push($opts, { value: ("" .. $r["name"]), "label": ("" .. $r["name"]) })
+  end
+  return $opts
+end
+
+-- Save a host (create or edit). $f = parse_form($BODY). Returns
+-- { ok, err, err_field } — err non-empty ⇒ re-render the editor with the message.
+-- OCC: on edit, the posted file_hash must match the LIVE FS (not the mirror,
+-- which can lag) — a stale save is refused.
+function ssh_host_save($f, $actor)
+  $name = ssh_safe_name(ssh_or($f["name"], ""))
+  if $name == "" then return { ok: false, err: "Invalid name — letters, digits, _ . - only; no leading dot/dash, no .pub.", err_field: "name" } end
+  $orig = ssh_safe_name(ssh_or($f["orig_name"], ""))
+  $isnew = $orig == ""
+  $hostname = trim("" .. ssh_or($f["hostname"], ""))
+  if $hostname == "" then return { ok: false, err: "Host is required.", err_field: "hostname" } end
+  if starts_with($hostname, "-") then return { ok: false, err: "Host must not start with '-'.", err_field: "hostname" } end
+  if ssh_has_ws($hostname) then return { ok: false, err: "Host must be a single token — no spaces or line breaks.", err_field: "hostname" } end
+  $port = to_number("" .. ssh_or($f["port"], "22"))
+  if $port == nil or $port < 1 or $port > 65535 then return { ok: false, err: "Port must be 1–65535.", err_field: "port" } end
+  $user = trim("" .. ssh_or($f["user"], "root"))
+  if $user == "" then $user = "root" end
+  if ssh_has_ws($user) then return { ok: false, err: "User must be a single token — no spaces or line breaks.", err_field: "user" } end
+  $keyname = "" .. ssh_or($f["key_name"], "")
+  $keyclean = ""
+  if $keyname != "" then
+    $keyclean = ssh_safe_name($keyname)
+    if $keyclean == "" then return { ok: false, err: "Invalid key selection.", err_field: "key_name" } end
+  end
+
+  -- Rename is not supported (the name is the fragment filename; changing it is a
+  -- delete+create, out of scope for v1). The editor makes name readonly on edit.
+  if not $isnew and $name != $orig then
+    return { ok: false, err: "Renaming a host isn't supported — delete and recreate.", err_field: "name" }
+  end
+
+  $extra = ""
+  if not $isnew then
+    -- edit: OCC against the LIVE fragment, and preserve its unknown-line block
+    $cur = ssh_read("hosts/" .. $name)
+    if not $cur["ok"] then return { ok: false, err: "This host no longer exists on disk.", err_field: "" } end
+    $posted_hash = "" .. ssh_or($f["file_hash"], "")
+    if hash_sha256($cur["text"]) != $posted_hash then
+      return { ok: false, err: "This host changed on disk since you opened it — reload and re-apply.", err_field: "" }
+    end
+    $extra = ssh_parse_fragment($cur["text"])["extra"]
+  end
+
+  -- FS write FIRST (authoritative), atomic temp+rename inside filesd. A CREATE uses
+  -- overwrite:false — filesd refuses (exclusive-create) if the name is taken, so a
+  -- transient read error can never be mistaken for absence and clobber an existing
+  -- fragment (nor can two concurrent creates race). Edit overwrites (OCC-guarded).
+  $content = ssh_build_fragment($name, $hostname, $port, $user, $keyclean, $extra)
+  $w = ssh_call("fs.write", { path: ("sshm/hosts/" .. $name), content: $content, overwrite: not $isnew })
+  if not $w["ok"] then
+    if $isnew and contains(lower("" .. $w["err"]), "already exists") then
+      return { ok: false, err: ("A host named '" .. $name .. "' already exists."), err_field: "name" }
+    end
+    return { ok: false, err: ("Write failed: " .. $w["err"]), err_field: "" }
+  end
+
+  -- Mirror upsert (single statement) + audit. FS is already authoritative; a mirror
+  -- hiccup must NOT 500 an applied write — swallow it (cache_ok=false surfaces a
+  -- "reindex required" note; the next reindex self-heals). OCC may then refuse the
+  -- next edit until a reindex (safe — refuses, never false-accepts).
+  $fh = hash_sha256($content)
+  $cache_ok = true
+  try
+    db_exec("INSERT INTO sshm.ssh_hosts (name, hostname, port, user, key_name, raw, file_hash, updated) VALUES (?1,?2,?3,?4,?5,?6,?7, datetime('now')) ON CONFLICT(name) DO UPDATE SET hostname=?2, port=?3, user=?4, key_name=?5, raw=?6, file_hash=?7, updated=datetime('now')", [$name, $hostname, $port, $user, ("" .. ssh_or($keyname, "")), $content, $fh])
+    db_exec("UPDATE sshm.ssh_keys SET used_by = (SELECT COUNT(*) FROM sshm.ssh_hosts WHERE sshm.ssh_hosts.key_name = sshm.ssh_keys.name)", [])
+  catch $e
+    $cache_ok = false
+  end
+  $act = "update"
+  if $isnew then $act = "create" end
+  ssh_audit($actor, $act, "ssh_hosts", nil, $name)
+  return { ok: true, err: "", err_field: "", cache_ok: $cache_ok }
+end
+
+-- Delete a host: FS trash (reversible quarantine) → mirror delete → audit.
+-- Returns "" on success or a refusal/error string.
+function ssh_host_delete($name, $actor)
+  $name = ssh_safe_name($name)
+  if $name == "" then return "Invalid host name." end
+  $ex = db_query("SELECT name FROM sshm.ssh_hosts WHERE name=?1", [$name])
+  if length($ex) == 0 then return "No such host." end
+  $t = ssh_call("fs.trash", { path: ("sshm/hosts/" .. $name) })
+  if not $t["ok"] then return ("Delete failed: " .. $t["err"]) end
+  -- FS trash already succeeded (authoritative); a mirror hiccup here self-heals on
+  -- reindex, so it must not turn an applied delete into a 500.
+  try
+    db_exec("DELETE FROM sshm.ssh_hosts WHERE name=?1", [$name])
+    db_exec("UPDATE sshm.ssh_keys SET used_by = (SELECT COUNT(*) FROM sshm.ssh_hosts WHERE sshm.ssh_hosts.key_name = sshm.ssh_keys.name)", [])
+  catch $e
+  end
+  ssh_audit($actor, "delete", "ssh_hosts", nil, $name)
+  return ""
+end
+
+-- Delete a key pair: GUARD (refuse while any host references it) → FS trash the
+-- .pub (private half is unreachable via the policy-scoped place, so it can't be
+-- trashed here — the operator removes the private half via the CLI; flag it) →
+-- mirror delete → audit. Returns "" or a refusal string.
+function ssh_key_delete($name, $actor)
+  $name = ssh_safe_name($name)
+  if $name == "" then return "Invalid key name." end
+  $ref = db_query("SELECT COUNT(*) AS n FROM sshm.ssh_hosts WHERE key_name=?1", [$name])
+  if length($ref) > 0 and to_number("" .. $ref[0]["n"]) > 0 then
+    return ("In use by " .. ("" .. $ref[0]["n"]) .. " host(s) — reassign those first.")
+  end
+  $ex = db_query("SELECT name FROM sshm.ssh_keys WHERE name=?1", [$name])
+  if length($ex) == 0 then return "No such key." end
+  $t = ssh_call("fs.trash", { path: ("sshm/keys/" .. $name .. ".pub") })
+  if not $t["ok"] then return ("Delete failed: " .. $t["err"]) end
+  try
+    db_exec("DELETE FROM sshm.ssh_keys WHERE name=?1", [$name])
+  catch $e
+  end
+  -- D6: the private half (keys/<name>, no .pub) is unreachable via the policy-scoped
+  -- place, so webd can't trash it — it stays on disk and is invisible to reindex.
+  -- Record the orphan in the audit so it's traceable; the operator (or a future
+  -- worker key_delete job) removes the private half.
+  ssh_audit($actor, "delete", "ssh_keys", nil, ($name .. " (public half trashed; private half ~/.ssh/keys/" .. $name .. " remains)"))
+  return ""
+end
+
+-- ── scan orchestration (panel side: reindex + create scan + enqueue) ────────
+
+-- Is this hostname a git provider (refuses a shell, but a completed handshake
+-- proves reachability)?
+function ssh_is_git_host($hostname)
+  $h = lower("" .. ssh_or($hostname, ""))
+  return $h == "github.com" or $h == "gitlab.com" or $h == "bitbucket.org"
+end
+
+-- Start a full scan: reindex from FS (D2a — scan the current reality), create a
+-- 'running' scan row, and enqueue ONE scan_all job carrying every host with its
+-- git/ephemeral flags. Returns the scan id (or nil on empty estate).
+function ssh_start_scan_all()
+  -- Scan CURRENT reality (D2a): reindex first, and abort if it failed — never queue
+  -- a scan off a stale mirror.
+  $ri = ssh_reindex()
+  if not $ri["ok"] then return nil end
+  $rows = db_query("SELECT name, hostname, ephemeral FROM sshm.ssh_hosts ORDER BY name", [])
+  if length($rows) == 0 then return nil end
+  $hosts = []
+  for each $r in $rows
+    push($hosts, { alias: "" .. $r["name"], git: ssh_is_git_host($r["hostname"]), ephemeral: to_number("" .. ssh_or($r["ephemeral"], "0")) == 1 })
+  end
+  $total = length($hosts)
+  $sr = db_query("INSERT INTO sshm.ssh_scans (started_at, status, total, ok, failed, offline) VALUES (datetime('now'),'running',?1,0,0,0) RETURNING id", [$total])
+  if length($sr) == 0 then return nil end
+  $scan_id = to_number("" .. $sr[0]["id"])
+  $jid = ssh_job_enqueue("scan_all", { scan_id: $scan_id, hosts: $hosts }, ("scan_all:" .. ("" .. $scan_id)))
+  if $jid == nil then
+    db_exec("UPDATE sshm.ssh_scans SET status='failed', finished_at=datetime('now'), note='enqueue failed' WHERE id=?1", [$scan_id])
+    return nil
+  end
+  return $scan_id
+end
+
+-- Start a single-host test: 1-host scan + a test_host job. Returns scan id.
+function ssh_start_test_host($alias)
+  $rows = db_query("SELECT name, hostname FROM sshm.ssh_hosts WHERE name=?1", [$alias])
+  $git = false
+  if length($rows) > 0 then $git = ssh_is_git_host($rows[0]["hostname"]) end
+  $sr = db_query("INSERT INTO sshm.ssh_scans (started_at, status, total, ok, failed, offline) VALUES (datetime('now'),'running',1,0,0,0) RETURNING id", [])
+  if length($sr) == 0 then return nil end
+  $scan_id = to_number("" .. $sr[0]["id"])
+  $jid = ssh_job_enqueue("test_host", { scan_id: $scan_id, alias: "" .. $alias, git: $git }, nil)
+  if $jid == nil then
+    db_exec("UPDATE sshm.ssh_scans SET status='failed', finished_at=datetime('now'), note='enqueue failed' WHERE id=?1", [$scan_id])
+    return nil
+  end
+  return $scan_id
+end
+
+-- ── job-progress (non-scan jobs: keygen / copy-key / fix-perms) ──────────────
+
+-- Human one-liner for a finished (or failed) job's result JSON.
+function ssh_job_detail($kind, $status, $result_json)
+  if $result_json == "" then return "" end
+  $r = nil
+  try
+    $r = json_parse($result_json)
+  catch $e
+  end
+  if $r == nil then return "" end
+  if $r["error"] != nil then return ("Failed: " .. ("" .. $r["error"])) end
+  if $kind == "key_create" then return ("Fingerprint: " .. ("" .. ssh_or($r["fingerprint"], ""))) end
+  if $kind == "copy_key" then return ("Host " .. ("" .. ssh_or($r["host"], "")) .. ": " .. ("" .. ssh_or($r["outcome"], ""))) end
+  if $kind == "fix_perms" then return (("" .. ssh_or($r["fixed"], "0")) .. " key file(s) re-permed") end
+  return ""
+end
+
+-- GET /ssh/job-status?job=<id> → JSON {status,kind,terminal,detail}. On a DONE
+-- FS-mutating job it reindexes server-side (read-only bus verbs → this GET passes
+-- the bus CSRF gate) so the new key/perm shows the moment the poller redirects.
+-- Idempotent: reindex only fires on 'done', and the client stops polling after.
+function ssh_job_status_json($id)
+  $rows = db_query("SELECT status, kind, result FROM sshm.ssh_jobs WHERE id=?1", [$id])
+  if length($rows) == 0 then return { status: 404, headers: {}, body: "no such job" } end
+  $j = $rows[0]
+  $st = "" .. ssh_or($j["status"], "")
+  $kind = "" .. ssh_or($j["kind"], "")
+  $terminal = ($st == "done" or $st == "error" or $st == "abandoned")
+  -- Only key_create changes the LOCAL mirror (a new key row); fix_perms (remote-
+  -- inert perm chmod) and copy_key (appends to a REMOTE authorized_keys) leave the
+  -- mirror untouched, so neither needs a reindex. For key_create: win a one-shot
+  -- flag (single-statement CAS) so exactly ONE poll reindexes; if the reindex can't
+  -- surface the key (keys listing failed), release the flag AND keep polling
+  -- (terminal=false) so the client doesn't redirect to a list still missing the key.
+  if $st == "done" and $kind == "key_create" then
+    $won = db_query("UPDATE sshm.ssh_jobs SET reindexed=1 WHERE id=?1 AND status='done' AND coalesce(reindexed,0)=0 RETURNING id", [$id])
+    if length($won) > 0 then
+      $ri = ssh_reindex()
+      if not (ssh_or($ri["ok"], false) and ssh_or($ri["keys_ok"], false)) then
+        db_exec("UPDATE sshm.ssh_jobs SET reindexed=0 WHERE id=?1", [$id])
+        $terminal = false
+      end
+    end
+  end
+  return { status: 200, headers: { "Content-Type": "application/json" }, body: json_encode({
+    status: $st, kind: $kind, terminal: $terminal, detail: ssh_job_detail($kind, $st, "" .. ssh_or($j["result"], ""))
+  }) }
+end
+
+-- A "working…" card that polls /ssh/job-status and, on a terminal status,
+-- redirects to $done_route (where the reindexed result is already visible).
+-- $id is coerced to an integer here (it originates from a query param and is
+-- interpolated into the poll <script>) — a non-numeric id can never reach the
+-- inline JS (reflected-XSS guard), it renders a plain "invalid" card instead.
+function ssh_job_progress_html($id, $title, $done_route)
+  $idn = to_number("" .. $id)
+  if $idn == nil then return '<div class="card"><h1>Invalid job</h1><p class="muted"><a href="' .. esc($done_route) .. '">Back</a></p></div>' end
+  $id = $idn
+  $h = '<div class="card"><h1>' .. esc($title) .. '</h1>'
+  $h = $h .. '<p><span class="badge" data-job-field="status">queued</span> <span class="muted" data-job-field="detail">The worker runs within a minute…</span></p>'
+  $h = $h .. '<p class="muted small">This page refreshes itself when the job finishes.</p>'
+  $h = $h .. '<p><a href="' .. esc($done_route) .. '" class="btn btn-secondary">Back</a></p></div>'
+  return $h .. ssh_job_poll_script($id, $done_route)
+end
+
+function ssh_job_poll_script($id, $done_route)
+  return '<script>(function(){var id=' .. ("" .. $id) .. ';var dr=' .. json_encode("" .. $done_route) .. ';var root=document;if(root.__sshJobPoll)return;root.__sshJobPoll=true;function set(k,v){var e=root.querySelector("[data-job-field="+k+"]");if(e)e.textContent=v;}function tick(){fetch("/ssh/job-status?job="+id,{credentials:"same-origin"}).then(function(r){if(!r.ok){clearInterval(root.__sshJobTimer);set("status","not found");set("detail","No such job.");throw 0;}return r.json();}).then(function(j){set("status",j.status);if(j.detail)set("detail",j.detail);if(j.terminal){clearInterval(root.__sshJobTimer);setTimeout(function(){window.location.assign(dr);},700);}}).catch(function(){});}root.__sshJobTimer=setInterval(tick,2000);tick();})();</script>'
+end
+
+-- ── fragment parser (round-trips unknown lines) ─────────────────────────────
+
+-- Parse one ~/.ssh/hosts/<name> fragment into { hostname, port, user, key_name,
+-- extra }. Recognised keys map to columns; every OTHER non-blank line is kept
+-- verbatim in `extra` (newline-joined) so a P1 rewrite never drops hand-added
+-- ssh options. Case-insensitive keyword match (ssh_config is case-insensitive).
+function ssh_parse_fragment($text)
+  $hostname = ""
+  $port = 22
+  $user = "root"
+  $keyfile = ""
+  $extra = ""
+  $lines = split($text, "\n")
+  for each $ln in $lines
+    $t = trim($ln)
+    if $t == "" then
+      -- skip blank
+    else
+      $low = lower($t)
+      if starts_with($low, "host ") then
+        -- the alias line; the filename is authoritative, ignore
+      else
+        if starts_with($low, "hostname ") then
+          $hostname = trim(substr($t, 9))
+        else
+          if starts_with($low, "port ") then
+            $port = to_number(trim(substr($t, 5)))
+            if $port == nil then $port = 22 end
+          else
+            if starts_with($low, "user ") then
+              $user = trim(substr($t, 5))
+            else
+              if starts_with($low, "identityfile ") then
+                $keyfile = trim(substr($t, 13))
+              else
+                if $extra == "" then $extra = $t else $extra = $extra .. "\n" .. $t end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  -- Derive the short key name (basename without dir) from the IdentityFile.
+  $key_name = ""
+  if $keyfile != "" then
+    $kp = split($keyfile, "/")
+    $key_name = $kp[length($kp) - 1]
+  end
+  return { hostname: $hostname, port: $port, user: $user, key_name: $key_name, keyfile: $keyfile, extra: $extra }
+end
+
+-- Parse a keys/<name>.pub line "ssh-ed25519 AAAA... comment words" → {type,comment}.
+function ssh_parse_pub($text)
+  $t = trim($text)
+  $parts = split($t, " ")
+  $type = ""
+  $comment = ""
+  if length($parts) >= 1 then $type = $parts[0] end
+  if length($parts) >= 3 then
+    $i = 0
+    for each $p in $parts
+      if $i >= 2 then
+        if $comment == "" then $comment = $p else $comment = $comment .. " " .. $p end
+      end
+      $i = $i + 1
+    end
+  end
+  return { type: $type, comment: $comment }
+end
+
+-- Bits by key type (P0: ed25519 = 256; others unknown until the P2 worker runs
+-- ssh-keygen -lf). Returns nil when unknown.
+function ssh_key_bits($type)
+  if $type == "ssh-ed25519" then return 256 end
+  return nil
+end
+
+-- ── reindex (FS → mirror cache) ─────────────────────────────────────────────
+
+-- Rebuild the sshm.* mirror from the filesystem. Idempotent: upsert present
+-- files, delete mirror rows whose file vanished. Single-statement writes.
+-- Returns { ok, hosts, keys, err }.
+function ssh_reindex()
+  ssh_init()
+
+  -- Hosts: list hosts/, read+parse each regular file (skip dot-dirs the policy
+  -- would deny anyway; .ephemeral is a roster file, handled separately).
+  $hres = ssh_list("hosts")
+  if not $hres["ok"] then
+    return { ok: false, hosts: 0, keys: 0, err: ("hosts: " .. $hres["err"]) }
+  end
+  $seen_hosts = []
+  $ephemeral = {}
+  for each $ent in $hres["entries"]
+    $nm = "" .. $ent["name"]
+    if ssh_or($ent["is_dir"], false) then
+      -- skip subdirectories
+    else
+      if $nm == ".ephemeral" then
+        $er = ssh_read("hosts/.ephemeral")
+        if $er["ok"] then
+          for each $el in split($er["text"], "\n")
+            $et = trim($el)
+            if $et != "" and not starts_with($et, "#") then
+              $ephemeral[$et] = true
+            end
+          end
+        end
+      else
+        if starts_with($nm, ".") then
+          -- other dotfiles (.class NetServa roster, etc.) are not host fragments
+        else
+          -- $nm IS a present host fragment → protect it from the prune BEFORE the
+          -- read, so a transient read failure keeps the last-known-good mirror row
+          -- instead of deleting it (prune must reflect FS absence, not read errors).
+          push($seen_hosts, $nm)
+          $fr = ssh_read("hosts/" .. $nm)
+          if $fr["ok"] then
+            $p = ssh_parse_fragment($fr["text"])
+            $fh = hash_sha256($fr["text"])
+            db_exec("INSERT INTO sshm.ssh_hosts (name, hostname, port, user, key_name, raw, file_hash, updated) VALUES (?1,?2,?3,?4,?5,?6,?7, datetime('now')) ON CONFLICT(name) DO UPDATE SET hostname=?2, port=?3, user=?4, key_name=?5, raw=?6, file_hash=?7, updated=datetime('now')", [$nm, $p["hostname"], $p["port"], $p["user"], $p["key_name"], $fr["text"], $fh])
+          end
+        end
+      end
+    end
+  end
+  -- Mark ephemeral flags (reset all, then set the roster members).
+  db_exec("UPDATE sshm.ssh_hosts SET ephemeral=0", [])
+  for each $en in keys($ephemeral)
+    db_exec("UPDATE sshm.ssh_hosts SET ephemeral=1 WHERE name=?1", [$en])
+  end
+  -- Delete mirror rows whose fragment vanished.
+  ssh_prune("sshm.ssh_hosts", $seen_hosts)
+
+  -- Keys: list keys/, parse each *.pub (the policy hides private halves).
+  $kres = ssh_list("keys")
+  $keys_ok = $kres["ok"]
+  $seen_keys = []
+  if $keys_ok then
+    for each $ent in $kres["entries"]
+      $nm = "" .. $ent["name"]
+      if ssh_or($ent["is_dir"], false) then
+        -- skip
+      else
+        if ends_with($nm, ".pub") then
+          $base = substr($nm, 0, length($nm) - 4)
+          -- present .pub → protect from prune before the read (see hosts above).
+          push($seen_keys, $base)
+          $pr = ssh_read("keys/" .. $nm)
+          if $pr["ok"] then
+            $pp = ssh_parse_pub($pr["text"])
+            $bits = ssh_key_bits($pp["type"])
+            db_exec("INSERT INTO sshm.ssh_keys (name, type, bits, comment, pub, updated) VALUES (?1,?2,?3,?4,?5, datetime('now')) ON CONFLICT(name) DO UPDATE SET type=?2, bits=?3, comment=?4, pub=?5, updated=datetime('now')", [$base, $pp["type"], $bits, $pp["comment"], trim($pr["text"])])
+          end
+        end
+      end
+    end
+  end
+  -- Prune keys ONLY when the listing succeeded — a failed list yields an empty
+  -- seen set, which would otherwise wipe every key row (silent cache corruption).
+  if $keys_ok then
+    ssh_prune("sshm.ssh_keys", $seen_keys)
+  end
+
+  -- used_by counts: how many hosts reference each key by its short name.
+  db_exec("UPDATE sshm.ssh_keys SET used_by = (SELECT COUNT(*) FROM sshm.ssh_hosts WHERE sshm.ssh_hosts.key_name = sshm.ssh_keys.name)", [])
+
+  -- ok reflects the HOSTS pass (a hosts-list failure early-returns above). keys_ok
+  -- is separate: hosts can succeed while the keys listing failed — a caller that
+  -- needs a fresh KEY row (keygen reindex-on-completion) must check keys_ok.
+  return { ok: true, hosts: length($seen_hosts), keys: length($seen_keys), keys_ok: $keys_ok, err: "" }
+end
+
+-- Delete rows from $table whose `name` is not in the $keep list (present files).
+function ssh_prune($table, $keep)
+  $rows = db_query("SELECT name FROM " .. $table, [])
+  for each $row in $rows
+    $nm = "" .. $row["name"]
+    $found = false
+    for each $k in $keep
+      if $k == $nm then $found = true end
+    end
+    if not $found then
+      db_exec("DELETE FROM " .. $table .. " WHERE name=?1", [$nm])
+    end
+  end
+end
+
+-- Cheap suffix test (no regex).
+function ends_with($s, $suffix)
+  $sl = length($s)
+  $ql = length($suffix)
+  if $ql > $sl then return false end
+  return substr($s, $sl - $ql) == $suffix
+end
+
+-- ── drift check ─────────────────────────────────────────────────────────────
+
+-- Compare mirror row count to the live FS file count; returns a short banner
+-- html string when they differ, else "". Cheap: one fs.list per dir.
+function ssh_drift_banner()
+  $hres = ssh_list("hosts")
+  if not $hres["ok"] then
+    return '<div class="notice notice-warn">SSH filesystem unreachable: ' .. esc($hres["err"]) .. '</div>'
+  end
+  $fs_hosts = 0
+  for each $ent in $hres["entries"]
+    $nm = "" .. $ent["name"]
+    if not ssh_or($ent["is_dir"], false) then
+      -- Count only real host fragments — skip ALL dotfiles (.ephemeral roster,
+      -- .class NetServa roster, etc.), matching ssh_reindex's index set. Excluding
+      -- only .ephemeral over-counted every OTHER dotfile as a "host on disk", so the
+      -- drift banner could never clear (perpetual "N cached vs N+1 on disk").
+      if not starts_with($nm, ".") then $fs_hosts = $fs_hosts + 1 end
+    end
+  end
+  $mr = db_query("SELECT COUNT(*) AS n FROM sshm.ssh_hosts", [])
+  $mirror = 0
+  if length($mr) > 0 then $mirror = to_number("" .. $mr[0]["n"]) end
+  if $fs_hosts != $mirror then
+    return '<div class="notice notice-warn">Cache is stale (' .. ("" .. $mirror) .. ' cached vs ' .. ("" .. $fs_hosts) .. ' on disk). Use <strong>Reindex</strong> to refresh.</div>'
+  end
+  return ""
+end

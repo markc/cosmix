@@ -1,0 +1,12 @@
+[package]
+name = "mix-bench"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "mix-bench"
+path = "src/main.rs"
+
+[dependencies]
+cosmix-lib-mix = { path = "../cosmix-lib-mix", features = ["json", "regex", "toml", "datetime", "url", "crypto", "sqlite", "tokio-sleep"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }

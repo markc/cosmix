@@ -1,0 +1,65 @@
+[package]
+name = "cosmix-comp"
+version = "0.28.1"
+description = "Smithay protocol frontend with Bevy rendering for the CosMix desktop"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+
+[features]
+default = ["frame-capture"]
+explicit-sync-live-test = []
+frame-capture = ["dep:signal-hook"]
+kms-live = ["dep:signal-hook"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(cosmix_kms_live_release)'] }
+
+[[bin]]
+name = "cosmix-comp"
+path = "src/main.rs"
+
+[dependencies]
+bevy = { version = "=0.19.0", default-features = false, features = [
+    "2d_bevy_render",
+    "bevy_winit",
+    "default_app",
+    "default_font",
+    "multi_threaded",
+    "std",
+    "system_font_discovery",
+    "wayland",
+    "x11",
+] }
+cosmix-deco = { path = "../cosmix-deco" }
+cosmix-wgpu-dmabuf = { path = "../cosmix-wgpu-dmabuf" }
+getrandom = "0.4"
+# Not called directly: `system_font_discovery` reaches fontconfig through
+# Parley, and without this feature the binary carries `NEEDED
+# libfontconfig.so.1` — a host missing that library is killed by the dynamic
+# loader before `main`, which no in-process typography fallback can survive.
+# `dlopen` moves the lookup to runtime, so a missing fontconfig degrades to no
+# system fonts instead of an app that cannot start. Cargo unifies features
+# across the graph, so declaring it here applies to Parley's copy.
+fontique = { version = "0.9", default-features = false, features = [
+    "fontconfig-dlopen",
+] }
+libc = "0.2"
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+signal-hook = { version = "0.3", optional = true }
+smithay = { version = "=0.7.0", default-features = false, features = [
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_session_libseat",
+    "backend_udev",
+    "desktop",
+    "wayland_frontend",
+] }
+drm-fourcc = "=2.2.0"
+static_assertions = "1"
+tracing = "0.1"
+unicode-segmentation = "1"
+
+[dev-dependencies]
+wgpu = { version = "=29.0.4", features = ["noop"] }

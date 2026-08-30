@@ -1,0 +1,140 @@
+-- setup.mix — CosMix setup, stage 2. Runs under the `mix` that `bootstrap`
+-- just built; re-run it any time to rebuild and reinstall (idempotent).
+--
+--   mix $COSMIX/setup.mix [--desktop] [--system] [--skip-build]
+--
+--   (default)     build every crate in the workspace (release) and install
+--                 every binary into $COSMIX/bin — no root needed
+--   --desktop     also build src/desktop (the Bevy compositor + ctk + apps;
+--                 its own workspace and toolchain, slow, optional)
+--   --system      additionally copy the binaries to /opt/cosmix/bin with sudo,
+--                 the location the systemd units under src/_etc expect. The
+--                 units themselves are installed by the operator's deploy
+--                 tooling, not by this script — it says so at the end.
+--   --skip-build  install what target/release already holds
+--
+-- $COSMIX is the directory this file lives in unless the environment says
+-- otherwise; every path below derives from it.
+
+$root = env("COSMIX")
+if $root == "" then
+  $root = dirname(realpath($0))
+end
+$src = $root .. "/src"
+$bin = $root .. "/bin"
+if not is_file($src .. "/Cargo.toml") then
+  print("setup: " .. $root .. " is not a CosMix checkout (no src/Cargo.toml)")
+  exit(2)
+end
+
+$want_desktop = false
+$want_system = false
+$skip_build = false
+for each $a in args()
+  if $a == "--desktop" then
+    $want_desktop = true
+  elif $a == "--system" then
+    $want_system = true
+  elif $a == "--skip-build" then
+    $skip_build = true
+  else
+    print("setup: unknown flag " .. $a)
+    exit(2)
+  end
+end
+
+print(">> COSMIX = " .. $root)
+
+-- 1. fetch every crate the lockfile names (all platforms), then build. The
+--    fetch is what makes `cargo metadata --offline` — which some tests run —
+--    deterministic on a fresh machine; a build alone leaves platform-filtered
+--    entries undownloaded.
+if not $skip_build then
+  print(">> fetching crates named by src/Cargo.lock")
+  $rc = run_stream(["cargo", "fetch"], {cwd: $src})
+  if $rc != 0 then
+    print("setup: cargo fetch failed (exit " .. $rc .. ")")
+    exit(1)
+  end
+  print(">> building the workspace (release) in " .. $src)
+  $rc = run_stream(["cargo", "build", "--workspace", "--release"], {cwd: $src})
+  if $rc != 0 then
+    print("setup: cargo build failed (exit " .. $rc .. ")")
+    exit(1)
+  end
+end
+
+-- 2. install every bin target the workspace declares. The list comes from
+--    cargo itself, so a new daemon crate is picked up without editing this.
+$meta = json_parse(run_argv_must(["cargo", "metadata", "--no-deps", "--format-version", "1"], {cwd: $src}))
+$installed = []
+$missing = []
+mkdir($bin)
+for each $pkg in $meta.packages
+  for each $t in $pkg.targets
+    if contains($t.kind, "bin") then
+      $from = $src .. "/target/release/" .. $t.name
+      if is_file($from) then
+        copy($from, $bin .. "/" .. $t.name)
+        chmod($bin .. "/" .. $t.name, 0o755)
+        push($installed, $t.name)
+      else
+        push($missing, $t.name)
+      end
+    end
+  end
+end
+print(">> installed " .. len($installed) .. " binaries into " .. $bin)
+if len($missing) > 0 then
+  print(">> not built (skipped): " .. join($missing, " "))
+end
+
+-- 3. optional desktop workspace
+if $want_desktop then
+  print(">> building src/desktop (its own workspace + toolchain)")
+  $rc = run_stream(["cargo", "build", "--release"], {cwd: $src .. "/desktop"})
+  if $rc != 0 then
+    print("setup: desktop build failed (exit " .. $rc .. ")")
+    exit(1)
+  end
+  $dmeta = json_parse(run_argv_must(["cargo", "metadata", "--no-deps", "--format-version", "1"], {cwd: $src .. "/desktop"}))
+  $dn = 0
+  for each $pkg in $dmeta.packages
+    for each $t in $pkg.targets
+      if contains($t.kind, "bin") then
+        $from = $src .. "/desktop/target/release/" .. $t.name
+        if is_file($from) then
+          copy($from, $bin .. "/" .. $t.name)
+          chmod($bin .. "/" .. $t.name, 0o755)
+          $dn = $dn + 1
+        end
+      end
+    end
+  end
+  print(">> installed " .. $dn .. " desktop binaries into " .. $bin)
+end
+
+-- 4. optional system install (sudo). Binaries only — see the header.
+if $want_system then
+  print(">> system install: copying " .. len($installed) .. " binaries to /opt/cosmix/bin (sudo)")
+  $r = run_argv(["sudo", "install", "-d", "-m", "755", "/opt/cosmix/bin"], {timeout: 120})
+  if $r.exit_code != 0 then
+    print("setup: sudo install -d failed: " .. $r.stderr)
+    exit(1)
+  end
+  for each $name in $installed
+    $r = run_argv(["sudo", "install", "-m", "755", $bin .. "/" .. $name, "/opt/cosmix/bin/" .. $name], {timeout: 120})
+    if $r.exit_code != 0 then
+      print("setup: sudo install " .. $name .. " failed: " .. $r.stderr)
+      exit(1)
+    end
+  end
+  print(">> /opt/cosmix/bin updated. systemd units, polkit rules and sysusers live in")
+  print("   " .. $src .. "/_etc — install them with your deploy tooling; this script does not.")
+end
+
+print("")
+print("CosMix is set up in " .. $root)
+print("  . " .. $root .. "/env        # puts " .. $bin .. " on PATH and exports COSMIX")
+print("  mix man overview          # the manual (docs/mix, also https://cosmix.dev/mix/)")
+print("  mix " .. $root .. "/setup.mix   # re-run after `git pull` to rebuild + reinstall")

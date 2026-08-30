@@ -1,0 +1,6 @@
+{"record":"meta","version":1,"lane":"claude"}
+{"record":"line","after_ms":3,"stdout":"{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fixture-claude-done\"}"}
+{"record":"line","after_ms":7,"stdout":"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"fixture answer\"},{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"file_path\":\"fixture.txt\"}}],\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}}"}
+{"record":"line","after_ms":5,"stdout":"{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"fixture result\"}]}}"}
+{"record":"line","after_ms":11,"stdout":"{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"complete\",\"session_id\":\"fixture-claude-done\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4},\"total_cost_usd\":0.0123}"}
+{"record":"exit","code":0,"signal":null}

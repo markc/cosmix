@@ -1,0 +1,35 @@
+-- bytes builtins: round-trip + type discipline.
+--
+-- Covers Value::Bytes (added 2026-05-26 alongside the http_get binary
+-- corruption fix). The strict no-coercion contract is intentional —
+-- silent String/Bytes interop would re-open the U+FFFD corruption bug
+-- class the variant was added to escape.
+
+$s = "héllo"
+$b = string_to_bytes($s)
+print(type($b))
+print(bytes_len($b))
+print(bytes_to_string($b))
+
+-- High-bit bytes survive a round-trip through write_file/read_file_bytes.
+$path = "/tmp/cosmix-mix-bytes-script.bin"
+$payload = string_to_bytes("ABC")
+write_file($path, $payload)
+$got = read_file_bytes($path)
+print(type($got))
+print(bytes_len($got))
+print(bytes_to_string($got))
+
+-- Type discipline: bytes is its own type, not a String alias.
+print(type(string_to_bytes("x")))
+print(type("x"))
+
+-- Expected output:
+-- bytes
+-- 6
+-- héllo
+-- bytes
+-- 3
+-- ABC
+-- bytes
+-- string

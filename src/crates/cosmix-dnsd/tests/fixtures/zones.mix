@@ -1,0 +1,99 @@
+-- cosmix-dnsd test fixture zones.mix — example mesh.
+--
+-- Uses RFC 5737 (TEST-NET-1) addresses + `example.com`/`example.bus`
+-- placeholders + alpha/beta/gamma/delta/epsilon node names. Operators
+-- supply their real zones.mix at deploy time (`--zones <path>`); this
+-- file is loaded only by the standalone_prober test for hermetic
+-- coverage of the parser, candidate path, and serve-loop wiring.
+--
+-- PINNED strict-data schema (NOT plan §3's illustrative pseudo-syntax):
+-- a map/list tree parsed by `cosmix_mix::parse_data`. Inside `{ }`,
+-- entries are comma-separated (Mix strict-data suppresses newlines in
+-- braces); `[ ]` lists are comma-separated.
+--
+-- Example WG identity map (RFC 5737 TEST-NET-1):
+--   alpha   192.0.2.5    gamma 192.0.2.4    delta 192.0.2.210
+--   epsilon 192.0.2.9    beta  192.0.2.1
+--
+-- maild SRV set (RFC 6186/8314 implicit-TLS ONLY — example maild binds
+-- imap_imaps 993 / smtp_smtps 465; NO 143/587/STARTTLS):
+--   _imaps._tcp.<node>.<zone>      SRV 0 1 993 <node>.<zone>
+--   _submissions._tcp.<node>.<zone> SRV 0 1 465 <node>.<zone>
+--
+-- PTR (2.0.192.in-addr.arpa) -> <node>.example.com, NOT <node>.bus:
+-- example.com is the PRIMARY WG identity — cert SNI + maild HELO +
+-- forward-confirmed reverse DNS must all agree on ONE name. bus is the
+-- side-effect zone (future sub.app.zone.bus). FCrDNS closes because
+-- PTR(<wg-ip>) returns the example.com FQDN that forward-resolves back
+-- to <wg-ip> via this same daemon.
+--
+-- SOA primary=beta.bus mbox=hostmaster.bus ttl=300 minimum=60;
+-- ns=[beta.bus]; serial_floor=1. One bundle per node (beta is the hub
+-- and the authoritative SOA primary for all three zones). Byte-
+-- identical shape on all nodes.
+
+zones: {
+  "bus": {
+    soa: { primary: "beta.bus", mbox: "hostmaster.bus", ttl: 300, minimum: 60 },
+    ns: [ "beta.bus" ],
+    serial_floor: 1,
+    bundles: [
+      { owner: "alpha", serial: 1, records: [
+          { name: "alpha.bus", type: "A", ttl: 300, data: "192.0.2.5" },
+          { name: "alpha.bus", type: "MX", ttl: 300, data: "10 alpha.bus" },
+          { name: "_imaps._tcp.alpha.bus", type: "SRV", ttl: 300, data: "0 1 993 alpha.bus" },
+          { name: "_submissions._tcp.alpha.bus", type: "SRV", ttl: 300, data: "0 1 465 alpha.bus" }
+      ] },
+      { owner: "gamma", serial: 1, records: [
+          { name: "gamma.bus", type: "A", ttl: 300, data: "192.0.2.4" },
+          { name: "gamma.bus", type: "MX", ttl: 300, data: "10 gamma.bus" },
+          { name: "_imaps._tcp.gamma.bus", type: "SRV", ttl: 300, data: "0 1 993 gamma.bus" },
+          { name: "_submissions._tcp.gamma.bus", type: "SRV", ttl: 300, data: "0 1 465 gamma.bus" }
+      ] },
+      { owner: "delta", serial: 1, records: [
+          { name: "delta.bus", type: "A", ttl: 300, data: "192.0.2.210" },
+          { name: "delta.bus", type: "MX", ttl: 300, data: "10 delta.bus" },
+          { name: "_imaps._tcp.delta.bus", type: "SRV", ttl: 300, data: "0 1 993 delta.bus" },
+          { name: "_submissions._tcp.delta.bus", type: "SRV", ttl: 300, data: "0 1 465 delta.bus" }
+      ] },
+      { owner: "epsilon", serial: 1, records: [
+          { name: "epsilon.bus", type: "A", ttl: 300, data: "192.0.2.9" },
+          { name: "epsilon.bus", type: "MX", ttl: 300, data: "10 epsilon.bus" },
+          { name: "_imaps._tcp.epsilon.bus", type: "SRV", ttl: 300, data: "0 1 993 epsilon.bus" },
+          { name: "_submissions._tcp.epsilon.bus", type: "SRV", ttl: 300, data: "0 1 465 epsilon.bus" }
+      ] },
+      { owner: "beta", serial: 1, records: [
+          { name: "beta.bus", type: "A", ttl: 300, data: "192.0.2.1" },
+          { name: "beta.bus", type: "MX", ttl: 300, data: "10 beta.bus" },
+          { name: "_imaps._tcp.beta.bus", type: "SRV", ttl: 300, data: "0 1 993 beta.bus" },
+          { name: "_submissions._tcp.beta.bus", type: "SRV", ttl: 300, data: "0 1 465 beta.bus" }
+      ] }
+    ]
+  },
+
+  "example.com": {
+    soa: { primary: "beta.example.com", mbox: "hostmaster.example.com", ttl: 300, minimum: 60 },
+    ns: [ "beta.example.com" ],
+    serial_floor: 1,
+    bundles: [
+      { owner: "alpha",   serial: 1, records: [ { name: "alpha.example.com",   type: "A", ttl: 300, data: "192.0.2.5"   } ] },
+      { owner: "gamma",   serial: 1, records: [ { name: "gamma.example.com",   type: "A", ttl: 300, data: "192.0.2.4"   } ] },
+      { owner: "delta",   serial: 1, records: [ { name: "delta.example.com",   type: "A", ttl: 300, data: "192.0.2.210" } ] },
+      { owner: "epsilon", serial: 1, records: [ { name: "epsilon.example.com", type: "A", ttl: 300, data: "192.0.2.9"   } ] },
+      { owner: "beta",    serial: 1, records: [ { name: "beta.example.com",    type: "A", ttl: 300, data: "192.0.2.1"   } ] }
+    ]
+  },
+
+  "2.0.192.in-addr.arpa": {
+    soa: { primary: "beta.bus", mbox: "hostmaster.bus", ttl: 300, minimum: 60 },
+    ns: [ "beta.bus" ],
+    serial_floor: 1,
+    bundles: [
+      { owner: "alpha",   serial: 1, records: [ { name: "5.2.0.192.in-addr.arpa",   type: "PTR", ttl: 300, data: "alpha.example.com"   } ] },
+      { owner: "gamma",   serial: 1, records: [ { name: "4.2.0.192.in-addr.arpa",   type: "PTR", ttl: 300, data: "gamma.example.com"   } ] },
+      { owner: "delta",   serial: 1, records: [ { name: "210.2.0.192.in-addr.arpa", type: "PTR", ttl: 300, data: "delta.example.com"   } ] },
+      { owner: "epsilon", serial: 1, records: [ { name: "9.2.0.192.in-addr.arpa",   type: "PTR", ttl: 300, data: "epsilon.example.com" } ] },
+      { owner: "beta",    serial: 1, records: [ { name: "1.2.0.192.in-addr.arpa",   type: "PTR", ttl: 300, data: "beta.example.com"    } ] }
+    ]
+  }
+}

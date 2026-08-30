@@ -1,0 +1,4 @@
+-- args() must agree with $1, $2, … no matter what precedes the script on the
+-- command line. Printed as one line per source so a mismatch names itself.
+print("args:" .. join(args(), ","))
+print("positional:" .. $1 .. "," .. $2)

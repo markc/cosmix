@@ -1,0 +1,11 @@
+name: "sample"
+description: "minimal fixture for cosmix-lib-config strict-data loader"
+priority: 3
+draft: false
+tags: ["config", "loader", "smoke-test"]
+review: {
+  reviewer: "codex",
+  rounds: [
+    { round: 1, verdict: "approve" }
+  ]
+}

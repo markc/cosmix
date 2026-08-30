@@ -1,0 +1,14 @@
+-- Expected output:
+-- 15
+-- hello from rust
+-- [alpha, bravo, charlie]
+
+-- Test extension functions registered from Rust
+$sum = add_numbers(7, 8)
+print $sum
+
+$msg = greet("rust")
+print $msg
+
+$items = get_list()
+print $items

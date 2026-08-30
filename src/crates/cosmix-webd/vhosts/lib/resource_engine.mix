@@ -1,0 +1,649 @@
+-- resource_engine.mix — the webd DECLARATIVE RESOURCE ENGINE (Foundation P2).
+-- Contract: _doc/2026-07-12-webd-foundations.md (§ Resource engine) · registry profile
+-- "resource/1" in lib/foundation_registry.mix · probe: _bin/foundation_check.mix.
+--
+-- ONE resource spec (entity + list/form/policy/actions partitions) interpreted
+-- into the whole panel: list page (via the admin-list/1 Foundation), modal +
+-- canvas editor (ONE fm_form spec map), guarded atomic deletes, engine-generated
+-- single-table INSERT/UPDATE with parent fences + audit inside the SAME tx, PRG.
+--
+-- HARD SCOPE (Codex R10/R12): authenticated single-table CRUD, rendering,
+-- validation orchestration, parent fences, delete policy, audit, PRG — and
+-- NOTHING else. No join orchestration, money conversion, job control, daemon
+-- protocols, or arbitrary SQL hooks. Money/provisioning/multi-entity mutations
+-- stay imperative service functions reached via actions.verbs ROUTING only.
+--
+-- Include AFTER datatable.mix + admin_resource.mix + forms.mix + modals.mix
+-- (uses dt_/fm_/md_ + doc; includes nothing itself). Auth stays in the handler:
+--   $user = current_user(...); modal-expired guard; require_role(...)
+--   return resource_main(<entity>_resource(), $user)
+--
+-- Spec shape (author data — validated at load, request values always bound):
+-- { entity, noun, base_route, id_col?: "id", now_fn?: fn()=stamp,
+--   list: { spec: [dt_col...], select, opts: {dt_admin_opts overrides}, summary? },
+--   form: { cols?: 2, fields: [ {name, kind, "label", ...opts} ],
+--           derived?: ["pass_hash", ...],   -- ONLY these transform-written cols
+--           stamps?: { created?: "created", updated?: "updated" },
+--           validate?: fn($vals,$f,$editid)="""|err,
+--           save_transform?: fn($vals,$ctx)={values?,derived?},
+--           redirect_fn?: fn($id)=url, saved_flash?: "Saved" },
+--   policy: { guard?: fn($id)="", fetch?: fn($id)=row, del?: fn($id,$row),
+--             missing?: "No such X.", audit?: false|{table_ref, create_action,
+--             update_action, delete_action, detail_fn?: fn($vals,$id)=txt} },
+--   actions?: { verbs?: { "<action>": fn($f,$user)=response } },
+--   view_fn?: fn($viewid,$user)=response }   -- custom detail page (?view=)
+--
+-- Field kinds (v1): text email tel select checkbox textarea hidden date number
+-- password. Field options: required, "label", options|options_fn (select),
+-- default (new-form prefill), blank_default (blank coerces to this), maxlen,
+-- create_only (rendered readonly + excluded from UPDATE), span, rows, help,
+-- help_tip, placeholder, inputmode, desc. `password` is NON-PERSISTENT input:
+-- it never joins the write set — only declared derived columns (via
+-- save_transform) persist secrets; blank password on edit = preserved.
+
+-- ─────────────────────────── spec validation ───────────────────────────
+
+function rs_ident_ok($s)
+  $t = "" .. $s
+  if $t == "" or length($t) > 64 then
+    return false
+  end
+  $i = 0
+  while $i < length($t)
+    $ch = substr($t, $i, 1)
+    if not (($ch >= "a" and $ch <= "z") or ($ch >= "0" and $ch <= "9") or $ch == "_") then
+      return false
+    end
+    $i = $i + 1
+  end
+  return true
+end
+
+function rs_kind_ok($k)
+  for each $v in ["text", "email", "tel", "select", "checkbox", "textarea", "hidden", "date", "number", "password"]
+    if $v == ("" .. $k) then
+      return true
+    end
+  end
+  return false
+end
+
+-- Dies on any malformed spec — a panel must never render off a bad resource.
+function rs_validate($rs)
+  if not rs_ident_ok($rs["entity"]) then
+    die("resource: entity is not a valid identifier: " .. ("" .. $rs["entity"]))
+  end
+  if $rs["base_route"] == nil or $rs["noun"] == nil then
+    die("resource: base_route + noun are required")
+  end
+  if $rs["id_col"] == nil then
+    $rs["id_col"] = "id"
+  end
+  if not rs_ident_ok($rs["id_col"]) then
+    die("resource: id_col is not a valid identifier")
+  end
+  -- ONE DISJOINT write-column set: fields + derived + stamps must not collide
+  -- with each other or with id_col (a duplicate would double-bind the generated
+  -- SQL; id_col anywhere would bypass the never-write-id guarantee).
+  $wcols = {}
+  for each $fld in $rs["form"]["fields"]
+    $fn = "" .. $fld["name"]
+    if not rs_ident_ok($fn) then
+      die("resource " .. $rs["entity"] .. ": field name invalid: " .. $fn)
+    end
+    if $fn == ("" .. $rs["id_col"]) then
+      die("resource " .. $rs["entity"] .. ": fields must not write id_col")
+    end
+    if $wcols[$fn] == true then
+      die("resource " .. $rs["entity"] .. ": duplicate write column: " .. $fn)
+    end
+    $wcols[$fn] = true
+    if not rs_kind_ok($fld["kind"]) then
+      die("resource " .. $rs["entity"] .. ": unknown field kind: " .. ("" .. $fld["kind"]))
+    end
+    -- parent fences: only the biz_row_exists allowlist may be declared.
+    if $fld["parent"] != nil then
+      $p = "" .. $fld["parent"]
+      if $p != "customers" and $p != "services" then
+        die("resource " .. $rs["entity"] .. ": parent table not allowlisted: " .. $p)
+      end
+    end
+  end
+  if $rs["form"]["derived"] != nil then
+    for each $dc in $rs["form"]["derived"]
+      $dn = "" .. $dc
+      if not rs_ident_ok($dn) then
+        die("resource " .. $rs["entity"] .. ": derived column invalid: " .. $dn)
+      end
+      if $dn == ("" .. $rs["id_col"]) or $wcols[$dn] == true then
+        die("resource " .. $rs["entity"] .. ": derived column collides: " .. $dn)
+      end
+      $wcols[$dn] = true
+    end
+  end
+  if $rs["form"]["stamps"] != nil then
+    for each $sk in keys($rs["form"]["stamps"])
+      if ("" .. $sk) != "created" and ("" .. $sk) != "updated" then
+        die("resource " .. $rs["entity"] .. ": stamp key must be created|updated")
+      end
+      $sc = "" .. $rs["form"]["stamps"][$sk]
+      if not rs_ident_ok($sc) then
+        die("resource " .. $rs["entity"] .. ": stamp column invalid")
+      end
+      if $sc == ("" .. $rs["id_col"]) or $wcols[$sc] == true then
+        die("resource " .. $rs["entity"] .. ": stamp column collides: " .. $sc)
+      end
+      $wcols[$sc] = true
+    end
+  end
+  -- verbs are ROUTING ONLY and must never shadow the engine's own dispatch.
+  if $rs["actions"] != nil and $rs["actions"]["verbs"] != nil then
+    for each $vk in keys($rs["actions"]["verbs"])
+      $vn = "" .. $vk
+      if $vn == "save" or $vn == "delete" or $vn == "bulk_delete" or starts_with($vn, "row:") or starts_with($vn, "bulk_") then
+        die("resource " .. $rs["entity"] .. ": verb name is reserved: " .. $vn)
+      end
+    end
+  end
+  return $rs
+end
+
+-- ─────────────────────────── common helpers ───────────────────────────
+
+function rs_now($rs)
+  if $rs["now_fn"] != nil then
+    return "" .. $rs["now_fn"]()
+  end
+  $r = db_query("SELECT datetime('now') AS n")
+  return "" .. $r[0]["n"]
+end
+
+function rs_field_options($fld)
+  if $fld["options_fn"] != nil then
+    return $fld["options_fn"]()
+  end
+  if $fld["options"] != nil then
+    return $fld["options"]
+  end
+  return []
+end
+
+-- ───────────────────── parse + common validation ─────────────────────
+
+-- Parses the POSTed form against the declared fields. Returns
+-- { err, vals } — vals maps field name → typed value; password kinds land in
+-- vals ONLY when non-blank (edit preserves), and NEVER join the write set.
+function rs_parse($rs, $f, $editid)
+  $vals = {}
+  $err = ""
+  for each $fld in $rs["form"]["fields"]
+    if $err == "" then
+      $n = "" .. $fld["name"]
+      $kind = "" .. $fld["kind"]
+      $lab = "" .. fm_or($fld["label"], $n)
+      if $kind == "checkbox" then
+        $v = 0
+        if ("" .. fm_or($f[$n], "0")) == "1" then
+          $v = 1
+        end
+        $vals[$n] = $v
+      else
+        if $kind == "password" then
+          -- OPAQUE input — never trimmed/normalized (a leading/trailing space is
+          -- part of the secret); EXACTLY empty means preserve. Present in vals
+          -- only when supplied.
+          $pwraw = "" .. fm_or($f[$n], "")
+          if $pwraw != "" then
+            $vals[$n] = $pwraw
+          end
+        else
+        $raw = trim("" .. fm_or($f[$n], ""))
+        if $raw == "" and $fld["blank_default"] != nil then
+          $raw = "" .. $fld["blank_default"]
+        end
+          if $raw == "" and $fld["required"] == true then
+            -- create_only fields aren't posted on edit — not an error there.
+            if not ($fld["create_only"] == true and $editid != nil) then
+              $err = $lab .. " is required."
+            end
+          end
+          if $err == "" and $raw != "" and $fld["maxlen"] != nil and length($raw) > to_number($fld["maxlen"]) then
+            $err = $lab .. " is too long."
+          end
+          if $err == "" and $kind == "number" and $raw != "" then
+            if to_number($raw) == nil then
+              $err = $lab .. " must be a number."
+            else
+              $vals[$n] = to_number($raw)
+            end
+          end
+          if $err == "" and $kind == "date" and $raw != "" and not dt_is_isodate($raw) then
+            $err = $lab .. " must be YYYY-MM-DD."
+          end
+          if $err == "" and $kind == "select" and $raw != "" then
+            $okv = false
+            for each $o in rs_field_options($fld)
+              if ("" .. $o["value"]) == $raw then
+                $okv = true
+              end
+            end
+            if not $okv then
+              $err = $lab .. " has an invalid value."
+            end
+          end
+          if $err == "" and $vals[$n] == nil then
+            if $raw == "" and ($kind == "date" or $kind == "number") then
+              $vals[$n] = nil
+            else
+              $vals[$n] = $raw
+            end
+          end
+        end
+      end
+    end
+  end
+  return { err: $err, vals: $vals }
+end
+
+-- ───────────────────────── editor rendering ─────────────────────────
+
+function rs_field_html($rs, $fld, $src, $isnew)
+  $n = "" .. $fld["name"]
+  $lab = "" .. fm_or($fld["label"], $n)
+  $kind = "" .. $fld["kind"]
+  $v = fm_val($src, $n)
+  if $isnew and $v == "" and $fld["default"] != nil then
+    $v = "" .. $fld["default"]
+  end
+  $o = { value: $v }
+  for each $copy in ["required", "placeholder", "help", "help_tip", "inputmode", "span", "rows", "desc"]
+    if $fld[$copy] != nil then
+      $o[$copy] = $fld[$copy]
+    end
+  end
+  -- create-only (e.g. username): immutable after create — readonly on edit.
+  if $fld["create_only"] == true and not $isnew then
+    $o["readonly"] = true
+    $o["required"] = nil
+  end
+  if $kind == "hidden" then
+    return fm_hidden($n, $v)
+  end
+  if $kind == "select" then
+    return fm_select($n, $lab, rs_field_options($fld), $o)
+  end
+  if $kind == "checkbox" then
+    $o["checked"] = ("" .. fm_val($src, $n)) == "1"
+    return fm_checkbox($n, $lab, $o)
+  end
+  if $kind == "textarea" then
+    return fm_textarea($n, $lab, $o)
+  end
+  if $kind == "email" then
+    return fm_email($n, $lab, $o)
+  end
+  if $kind == "tel" then
+    return fm_tel($n, $lab, $o)
+  end
+  if $kind == "date" then
+    return fm_date($n, $lab, $o)
+  end
+  if $kind == "number" then
+    return fm_number($n, $lab, $o)
+  end
+  if $kind == "password" then
+    $o["value"] = ""
+    return fm_password($n, $lab, $o)
+  end
+  return fm_text($n, $lab, $o)
+end
+
+-- ONE fm_form spec map for both surfaces (mode canvas|modal) — the no-drift rule.
+function rs_form_spec($rs, $src, $isnew, $err, $mode)
+  -- the POST field is always name="id"; its VALUE comes from the resource's
+  -- id_col (a custom id_col row would otherwise render an empty id → re-create).
+  $h = fm_hidden("action", "save") .. fm_hidden("id", fm_val($src, "" .. $rs["id_col"]))
+  for each $fld in $rs["form"]["fields"]
+    $h = $h .. rs_field_html($rs, $fld, $src, $isnew)
+  end
+  $heading = "Edit " .. $rs["noun"]
+  if $isnew then
+    $heading = "New " .. $rs["noun"]
+  end
+  return { mode: $mode, action: $rs["base_route"], id: "rs-edit", title: $heading,
+           fields: fm_grid({ cols: to_number(fm_or($rs["form"]["cols"], 2)) }, $h),
+           submit: { "label": "Save" }, cancel: { "label": "Cancel", href: $rs["base_route"] }, error: $err }
+end
+
+function rs_editor_doc($rs, $user, $src, $isnew, $err)
+  $spec = rs_form_spec($rs, $src, $isnew, $err, "canvas")
+  $h = '<div class="cms-head"><h1>' .. esc($spec["title"]) .. '</h1><a class="navlink" href="' .. esc($rs["base_route"]) .. '">← Back</a></div>'
+  return doc(200, $spec["title"], $user, $h .. fm_form($spec))
+end
+
+function rs_fetch_row($rs, $id)
+  if $rs["policy"] != nil and $rs["policy"]["fetch"] != nil then
+    return $rs["policy"]["fetch"]($id)
+  end
+  $r = db_query("SELECT * FROM " .. $rs["entity"] .. " WHERE " .. $rs["id_col"] .. " = ?1", [$id])
+  if length($r) == 1 then
+    return $r[0]
+  end
+  return nil
+end
+
+-- ─────────────────────── delete policy wiring ───────────────────────
+
+function rs_del_hooks($rs, $user)
+  $aud = nil
+  if $rs["policy"] != nil then
+    $aud = $rs["policy"]["audit"]
+  end
+  $h = {
+    fetch: fn($id) = rs_fetch_row($rs, $id),
+    missing: "No such " .. $rs["noun"] .. "."
+  }
+  if $rs["policy"] != nil and $rs["policy"]["missing"] != nil then
+    $h["missing"] = $rs["policy"]["missing"]
+  end
+  if $rs["policy"] != nil and $rs["policy"]["guard"] != nil then
+    $h["guard"] = $rs["policy"]["guard"]
+  end
+  if $rs["policy"] != nil and $rs["policy"]["del"] != nil then
+    $h["delete"] = $rs["policy"]["del"]
+  else
+    $h["delete"] = fn($id, $row) = db_exec("DELETE FROM " .. $rs["entity"] .. " WHERE " .. $rs["id_col"] .. " = ?1", [$id])
+  end
+  if $aud != nil and $aud != false then
+    $h["audit"] = fn($id, $row) = biz_audit("" .. $user["username"], "" .. fm_or($aud["delete_action"], "delete"), "" .. $aud["table_ref"], $id, rs_audit_detail($aud, $row, $id))
+  end
+  return $h
+end
+
+function rs_audit_detail($aud, $vals, $id)
+  if $aud["detail_fn"] != nil then
+    return "" .. $aud["detail_fn"]($vals, $id)
+  end
+  return "id " .. $id
+end
+
+-- ───────────────────────────── save path ─────────────────────────────
+
+-- The write set = declared fields (minus password kinds, minus create_only on
+-- update) + transform-declared derived columns + stamps. Engine-generated SQL:
+-- every identifier spec-validated, every VALUE bound, id_col never written.
+function rs_save($rs, $f, $user)
+  $editraw = trim("" .. fm_or($f["id"], ""))
+  $editid = nil
+  if $editraw != "" then
+    $editid = to_number($editraw)
+    if $editid == nil then
+      return redirect_flash($rs["base_route"], "No such " .. $rs["noun"], "danger")
+    end
+  end
+  $p = rs_parse($rs, $f, $editid)
+  $err = $p["err"]
+  $vals = $p["vals"]
+  if $err == "" and $rs["form"]["validate"] != nil then
+    $err = "" .. $rs["form"]["validate"]($vals, $f, $editid)
+  end
+  $derived = {}
+  if $err == "" and $rs["form"]["save_transform"] != nil then
+    $t = $rs["form"]["save_transform"]($vals, { form: $f, edit_id: $editid, user: $user })
+    if $t != nil then
+      if $t["values"] != nil then
+        for each $tk in keys($t["values"])
+          -- only DECLARED field names may be adjusted (password fields excluded
+          -- from the write set regardless — secrets persist via derived only).
+          $tknown = false
+          for each $fld2 in $rs["form"]["fields"]
+            if ("" .. $fld2["name"]) == ("" .. $tk) then
+              $tknown = true
+            end
+          end
+          if not $tknown then
+            die("resource " .. $rs["entity"] .. ": save_transform returned unknown field: " .. $tk)
+          end
+          $vals[$tk] = $t["values"][$tk]
+        end
+      end
+      if $t["derived"] != nil then
+        $allow = fm_or($rs["form"]["derived"], [])
+        for each $dk in keys($t["derived"])
+          $dok = false
+          for each $da in $allow
+            if ("" .. $da) == ("" .. $dk) then
+              $dok = true
+            end
+          end
+          if not $dok then
+            die("resource " .. $rs["entity"] .. ": save_transform returned undeclared derived column: " .. $dk)
+          end
+          $derived[$dk] = $t["derived"][$dk]
+        end
+      end
+    end
+  end
+  if $err != "" then
+    -- echo the submitted values back into the canvas editor (mirrors the
+    -- historic handlers; modal saves land here as a full page).
+    return rs_editor_doc($rs, $user, $f, $editid == nil, $err)
+  end
+
+  -- build the ordered write set.
+  $cols = []
+  $binds = []
+  for each $fld in $rs["form"]["fields"]
+    $n = "" .. $fld["name"]
+    $skip = false
+    if ("" .. $fld["kind"]) == "password" then
+      $skip = true
+    end
+    if $fld["create_only"] == true and $editid != nil then
+      $skip = true
+    end
+    if not $skip then
+      push($cols, $n)
+      push($binds, $vals[$n])
+    end
+  end
+  for each $dk in keys($derived)
+    push($cols, "" .. $dk)
+    push($binds, $derived[$dk])
+  end
+  $stamps = fm_or($rs["form"]["stamps"], {})
+  $now = rs_now($rs)
+  if $stamps["updated"] != nil then
+    push($cols, "" .. $stamps["updated"])
+    push($binds, $now)
+  end
+  if $editid == nil and $stamps["created"] != nil then
+    push($cols, "" .. $stamps["created"])
+    push($binds, $now)
+  end
+
+  $aud = nil
+  if $rs["policy"] != nil then
+    $aud = $rs["policy"]["audit"]
+  end
+  $newid = $editid
+  try
+    db_exec("BEGIN IMMEDIATE")
+    -- parent fences: every declared FK must still exist under the write lock.
+    for each $fld in $rs["form"]["fields"]
+      if $fld["parent"] != nil and $vals["" .. $fld["name"]] != nil then
+        if not biz_row_exists("" .. $fld["parent"], $vals["" .. $fld["name"]]) then
+          db_exec("ROLLBACK")
+          return redirect_flash($rs["base_route"], "No such " .. $fld["parent"] .. " row", "danger")
+        end
+      end
+    end
+    if $editid != nil then
+      -- own-row fence, then the generated UPDATE.
+      $own = db_query("SELECT " .. $rs["id_col"] .. " FROM " .. $rs["entity"] .. " WHERE " .. $rs["id_col"] .. " = ?1", [$editid])
+      if length($own) == 0 then
+        db_exec("ROLLBACK")
+        return redirect_flash($rs["base_route"], "No such " .. $rs["noun"], "danger")
+      end
+      $set = ""
+      $i = 1
+      for each $c in $cols
+        if $set != "" then
+          $set = $set .. ", "
+        end
+        $set = $set .. $c .. " = ?" .. $i
+        $i = $i + 1
+      end
+      push($binds, $editid)
+      db_exec("UPDATE " .. $rs["entity"] .. " SET " .. $set .. " WHERE " .. $rs["id_col"] .. " = ?" .. $i, $binds)
+    else
+      $names = join($cols, ", ")
+      $qs = ""
+      $i = 1
+      while $i <= length($cols)
+        if $qs != "" then
+          $qs = $qs .. ", "
+        end
+        $qs = $qs .. "?" .. $i
+        $i = $i + 1
+      end
+      db_exec("INSERT INTO " .. $rs["entity"] .. " (" .. $names .. ") VALUES (" .. $qs .. ")", $binds)
+      $nr = db_query("SELECT last_insert_rowid() AS id")
+      $newid = to_number($nr[0]["id"])
+    end
+    if $aud != nil and $aud != false then
+      $act = "" .. fm_or($aud["create_action"], "create")
+      if $editid != nil then
+        $act = "" .. fm_or($aud["update_action"], "update")
+      end
+      biz_audit("" .. $user["username"], $act, "" .. $aud["table_ref"], $newid, rs_audit_detail($aud, $vals, $newid))
+    end
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return redirect_flash($rs["base_route"], "Save failed — try again", "danger")
+  end
+  $dest = $rs["base_route"]
+  if $rs["form"]["redirect_fn"] != nil then
+    $dest = "" .. $rs["form"]["redirect_fn"]($newid)
+  end
+  return redirect_flash($dest, "" .. fm_or($rs["form"]["saved_flash"], "Saved"), "success")
+end
+
+-- ───────────────────────────── entry point ─────────────────────────────
+
+-- Auth (current_user / modal-expired guard / require_role) happens in the
+-- HANDLER before this is called — the engine never owns authentication.
+function resource_main($rs0, $user)
+  $rs = rs_validate($rs0)
+
+  if $METHOD == "POST" then
+    $f = parse_form($BODY)
+    $action = "" .. fm_or($f["action"], "save")
+    -- custom verbs FIRST: pure routing — money/provisioning/multi-entity work
+    -- stays in handler-implemented functions (engine never orchestrates them).
+    if $rs["actions"] != nil and $rs["actions"]["verbs"] != nil and $rs["actions"]["verbs"][$action] != nil then
+      return $rs["actions"]["verbs"][$action]($f, $user)
+    end
+    $ra = dt_row_action($f)
+    if $ra != nil then
+      if $ra["verb"] == "delete" then
+        $did = to_number($ra["id"])
+        if $did == nil then
+          return redirect_flash($rs["base_route"], "No such " .. $rs["noun"], "danger")
+        end
+        $block = dt_try_delete_row($did, rs_del_hooks($rs, $user))
+        if $block != "" then
+          return redirect_flash($rs["base_route"], $block, "danger")
+        end
+      end
+      return redirect_flash($rs["base_route"], rs_cap($rs["noun"]) .. " deleted", "success")
+    end
+    if $action == "delete" then
+      $did = to_number(fm_or($f["id"], ""))
+      if $did == nil then
+        return redirect_flash($rs["base_route"], "No such " .. $rs["noun"], "danger")
+      end
+      $block = dt_try_delete_row($did, rs_del_hooks($rs, $user))
+      if $block != "" then
+        return redirect_flash($rs["base_route"], $block, "danger")
+      end
+      return redirect_flash($rs["base_route"], rs_cap($rs["noun"]) .. " deleted", "success")
+    end
+    if $action == "bulk_delete" then
+      $ids = dt_selected_ids($f)
+      if dt_wants_all($f) then
+        $ids = dt_all_ids(rs_list_table($rs), $rs["list"]["spec"], dt_state_from_map($f, $rs["list"]["spec"], rs_list_opts($rs)), $rs["id_col"])
+      end
+      $rep = dt_bulk_report(dt_bulk_try_delete($ids, rs_del_hooks($rs, $user)), $rs["noun"] .. "(s)")
+      return redirect_flash($rs["base_route"], $rep["msg"], $rep["kind"])
+    end
+    -- FAIL-CLOSED dispatch: only the explicit save action writes; anything
+    -- unrecognized refuses (never falls through to a write path).
+    if $action == "save" then
+      return rs_save($rs, $f, $user)
+    end
+    return redirect_flash($rs["base_route"], "Unknown action", "warning")
+  end
+
+  $q = parse_query($QUERY)
+  if $q["new"] != nil or $q["edit"] != nil then
+    $ismodal = md_is_modal_request()
+    if $q["new"] != nil then
+      $blank = { id: "" }
+      if $ismodal then
+        return md_fragment(fm_form(rs_form_spec($rs, $blank, true, "", "modal")))
+      end
+      return rs_editor_doc($rs, $user, $blank, true, "")
+    end
+    $row = nil
+    $eid = to_number($q["edit"])
+    if $eid != nil then
+      $row = rs_fetch_row($rs, $eid)
+    end
+    if $row == nil then
+      if $ismodal then
+        return md_not_found($rs["noun"], $rs["base_route"])
+      end
+      return doc(404, rs_cap($rs["noun"]), $user, '<div class="card cms-card-narrow"><h1>Not found</h1><p class="muted"><a href="' .. esc($rs["base_route"]) .. '">← Back</a></p></div>')
+    end
+    if $ismodal then
+      return md_fragment(fm_form(rs_form_spec($rs, $row, false, "", "modal")))
+    end
+    return rs_editor_doc($rs, $user, $row, false, "")
+  end
+  if $q["view"] != nil and $rs["view_fn"] != nil then
+    return $rs["view_fn"]($q["view"], $user)
+  end
+
+  $title = rs_cap($rs["noun"]) .. "s"
+  if $rs["list"]["title"] != nil then
+    $title = "" .. $rs["list"]["title"]
+  end
+  return dt_admin_list({ title: $title, user: $user,
+    spec: $rs["list"]["spec"], opts: rs_list_opts($rs),
+    table: rs_list_table($rs), select: $rs["list"]["select"],
+    summary: $rs["list"]["summary"] == true, prefix_html: nil, modal: fm_or($rs["list"]["modal"], "md-edit") })
+end
+
+function rs_list_opts($rs)
+  return dt_admin_opts($rs["list"]["opts"])
+end
+
+-- The table expression the list AND select-all both use (a page filtering its
+-- base table — e.g. a dead-excluding subquery — sets list.all_table so bulk
+-- select-all sweeps exactly what the list shows).
+function rs_list_table($rs)
+  if $rs["list"]["all_table"] != nil then
+    return "" .. $rs["list"]["all_table"]
+  end
+  return "" .. $rs["entity"]
+end
+
+function rs_cap($s)
+  $t = "" .. $s
+  if $t == "" then
+    return $t
+  end
+  return upper(substr($t, 0, 1)) .. substr($t, 1, length($t) - 1)
+end

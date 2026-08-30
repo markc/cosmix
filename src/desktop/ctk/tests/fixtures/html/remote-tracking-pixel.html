@@ -1,0 +1,8 @@
+<p>Remote images are suppressed:</p>
+<img width="1" height="1" alt="tracking pixel"
+     src="https://tracker.example/open.gif?id=42">
+<img alt="protocol-relative image" src="//cdn.example/newsletter/banner.jpg">
+<p>Explicitly embedded parts survive sanitisation for a future rendering arm:</p>
+<img alt="CID logo" src="cid:part-1">
+<img alt="inline dot" src="data:image/png;base64,iVBORw0KGgo=">
+<img alt="not an image" src="data:text/html,hello">

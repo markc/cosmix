@@ -1,0 +1,4 @@
+{"record":"meta","version":1,"lane":"codex"}
+{"record":"line","after_ms":2,"stdout":"{\"type\":\"thread.started\",\"thread_id\":\"fixture-codex-budget\"}"}
+{"record":"line","after_ms":5,"stdout":"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":20,\"cached_input_tokens\":0,\"output_tokens\":200}}"}
+{"record":"exit","code":0,"signal":null}

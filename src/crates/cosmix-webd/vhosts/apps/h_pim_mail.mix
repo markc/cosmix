@@ -1,0 +1,2291 @@
+-- h_pim_mail.mix — SHARED SSR webmail READ view for /pim/mail. Defines
+-- pim_mail_main(); the per-vhost stub includes site.conf.mix + lib.mix + this,
+-- then `return pim_mail_main()`. Vhost-agnostic: identity is the maild session,
+-- data is the vhost's own maild over the jmap() seam (server-side, sealed-cookie
+-- Bearer; accountId is auth-derived by maild — not passed).
+--   GET  /pim/mail                 → message list (?box=inbox|sent|trash, ?page=)
+--   GET  /pim/mail?id=<emailId>    → single message (server-side markdown body)
+--   GET  /pim/mail?compose=1       → compose form (?to= prefill, ?reply=<id> reply)
+--   POST /pim/mail   action=send   → build RFC822 → jmap_upload → Email/set create
+--                                    in Sent → EmailSubmission/set (send)
+-- SEND uses the jmap_upload() seam (mix 0.18.0 / webd 0.8.2): maild Email/set create
+-- is blob-only, so the raw RFC822 is uploaded first, then referenced by blobId. The
+-- To/Subject header values are CRLF-stripped before the build (no header injection);
+-- CSRF = the house SameSite=Lax session cookie + CSP form-action 'self'.
+-- maild projects `from` as a bare addr string and `to` as an array of bare
+-- strings (RFC 8621 [EmailAddress] objects are substrate-pending), so render
+-- them as text. Email/query returns a full `total`; Email/get does NOT preserve
+-- query order, so results are reordered to the query's id order (newest first).
+
+-- esc'd bare address string, "" when absent.
+include "/opt/cosmix/vhosts/shared/widgets/datatable.mix"
+include "/opt/cosmix/vhosts/shared/widgets/admin_resource.mix"
+include "/opt/cosmix/vhosts/shared/widgets/forms.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+include "/opt/cosmix/vhosts/shared/widgets/contextmenu.mix"
+include "/opt/cosmix/vhosts/shared/widgets/reader.mix"
+
+function m_addr($v)
+  if $v == nil then
+    return ""
+  end
+  return esc("" .. $v)
+end
+
+-- Datatable cell: sender (Inbox/Trash) or first recipient (Sent), bold when
+-- unread. $who pieces are already esc'd by m_addr/m_to_first.
+function m_who_html($e, $box)
+  $who = m_addr($e["from"])
+  if $box == "sent" then
+    $who = m_to_first($e)
+  end
+  if $who == "" then
+    $who = '<span class="muted">(unknown)</span>'
+  end
+  if m_unread($e) then
+    return '<strong>' .. $who .. '</strong>'
+  end
+  return $who
+end
+
+-- Plain (un-escaped) From/To text for the who-column tooltip (the widget esc()'s the
+-- title attr once). Mirrors m_who_html's box logic: sender, or first recipient for Sent.
+function m_who_text($e, $box)
+  if $box == "sent" then
+    $to = $e["to"]
+    if $to == nil or length($to) == 0 then
+      return ""
+    end
+    return "" .. $to[0]
+  end
+  return "" .. fm_or($e["from"], "")
+end
+
+-- Datatable cell: the subject text, bold when unread, "(no subject)" fallback. NO inline
+-- <a> — the whole row is the click target (the row carries data-dt-href; site.js initRowNav
+-- navigates on a left-click), so the subject cell is plain text.
+function m_subj_html($e)
+  $subj = esc("" .. $e["subject"])
+  if ("" .. $e["subject"]) == "" then
+    $subj = '<span class="muted">(no subject)</span>'
+  end
+  if m_unread($e) then
+    return '<strong>' .. $subj .. '</strong>'
+  end
+  return $subj
+end
+
+-- First recipient of a `to` array (bare strings), "" when absent.
+function m_to_first($e)
+  $to = $e["to"]
+  if $to == nil or length($to) == 0 then
+    return ""
+  end
+  return esc("" .. $to[0])
+end
+
+-- Join a `to` array (bare strings) for the detail header.
+function m_to_join($e)
+  $to = $e["to"]
+  if $to == nil or length($to) == 0 then
+    return ""
+  end
+  $out = ""
+  $first = true
+  for each $a in $to
+    if $first then
+      $out = esc("" .. $a)
+      $first = false
+    else
+      $out = $out .. ", " .. esc("" .. $a)
+    end
+  end
+  return $out
+end
+
+-- Trim a JMAP UTCDate ("2026-06-14T12:34:56Z") to "2026-06-14 12:34", "" if nil — RAW (not
+-- esc'd), for a caller that esc()s itself (rd_view's meta does, in m_read_spec).
+function m_date_raw($v)
+  if $v == nil then
+    return ""
+  end
+  $s = "" .. $v
+  if length($s) >= 16 then
+    return replace(substr($s, 0, 16), "T", " ")
+  end
+  return $s
+end
+
+-- Same, esc'd for direct HTML injection.
+function m_date($v)
+  return esc(m_date_raw($v))
+end
+
+-- Is the message unread? (no $seen keyword)
+function m_unread($e)
+  $kw = $e["keywords"]
+  if $kw == nil then
+    return true
+  end
+  if $kw["$seen"] == true then
+    return false
+  end
+  return true
+end
+
+-- Sign-in card (no maild session). Distinct from the service-error card.
+function m_login()
+  $h = '<div class="card cms-card-narrow">'
+  $h = $h .. '<h1 style="margin-top:0">Mail</h1>'
+  $h = $h .. '<p class="muted">Sign in to your mail account to read your mail.</p>'
+  $h = $h .. '<div style="margin-top:var(--space-5)"><a class="btn btn-primary" href="/auth/login?next=' .. url_encode("/pim/mail") .. '">Sign in to mail</a></div>'
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- Service-error card (signed in, but a jmap() call failed).
+function m_error()
+  $h = '<div class="card cms-card-narrow">'
+  $h = $h .. '<h1 style="margin-top:0">Mail unavailable</h1>'
+  $h = $h .. '<p class="muted">The mail service could not be reached. Your session may have expired — try signing in again, or retry shortly.</p>'
+  $h = $h .. '<div class="cms-actions center">'
+  $h = $h .. '<a class="btn btn-ghost" href="/pim/mail">Retry</a>'
+  $h = $h .. '<a class="btn btn-primary" href="/auth/login?next=' .. url_encode("/pim/mail") .. '">Sign in again</a>'
+  $h = $h .. '</div></div>'
+  return $h
+end
+
+-- ?box= value for a folder: the JMAP role for the six standard mailboxes (stable,
+-- readable URLs), else the mailbox id (unique — custom folders can share a name, e.g.
+-- two "Posts" under different parents). m_mailboxes() rows carry role "" when role-less.
+function m_folder_box_key($f)
+  if $f["role"] != "" then
+    return $f["role"]
+  end
+  return $f["id"]
+end
+
+-- lucide icon for a folder: the role's icon for the standard six, else a folder glyph.
+function m_role_icon($role)
+  $icons = { inbox: "inbox", drafts: "file-text", sent: "send", archive: "archive", junk: "flame", trash: "trash-2" }
+  $ic = $icons[$role]
+  if $ic == nil then
+    return "folder"
+  end
+  return $ic
+end
+
+-- Per-level sort key: the six roles first in IMAP order, then custom folders A→Z.
+function m_folder_sort_key($f)
+  $r = $f["role"]
+  if $r != "" then
+    $ord = { inbox: "1", drafts: "2", sent: "3", archive: "4", junk: "5", trash: "6" }
+    $o = $ord[$r]
+    if $o == nil then
+      $o = "9"
+    end
+    return "0" .. $o
+  end
+  return "1" .. lower("" .. $f["name"])
+end
+
+-- Recursively render the folder hierarchy as a COLLAPSIBLE .tv-* tree (Thunderbird-
+-- style), reusing the CMS treeview CSS + site.js chevron toggle + localStorage
+-- persistence (data-tv-key="mail-folders:<id>"). Returns {html, active} — `active` is
+-- true when $cur is in this subtree, so a parent renders OPEN (.tv-open) only on the
+-- active path; every other branch starts COLLAPSED (the cruft under Trash stays tucked
+-- away by default, like Thunderbird). aria-current marks the active folder link (it
+-- survives the boost shim's pathname-only setActive — see app.css). $depth caps runaway/
+-- cyclic data defensively. $kids = parentId→[rows] adjacency ("" = root).
+function m_folder_rows($kids, $parent, $cur, $depth, $collapse)
+  $rows = $kids[$parent]
+  if $rows == nil or $depth > 12 then
+    return { html: "", active: false }
+  end
+  $rows = sort_by($rows, fn($f) = m_folder_sort_key($f))
+  $h = ""
+  $any_active = false
+  for each $f in $rows
+    $key = m_folder_box_key($f)
+    $icon = "folder"
+    if $f["role"] != "" then
+      $icon = m_role_icon($f["role"])
+    end
+    $is_active = ($key == $cur)
+    $sub = m_folder_rows($kids, $f["id"], $cur, $depth + 1, $collapse)
+    $kidhtml = $sub["html"]
+    $contains = $is_active or $sub["active"]
+    if $contains then
+      $any_active = true
+    end
+    $ca = ""
+    if $is_active then
+      $ca = ' aria-current="page"'
+    end
+    $link = '<a class="tv-link" href="/pim/mail?box=' .. url_encode($key) .. '"' .. $ca .. '><i data-lucide="' .. $icon .. '"></i><span class="nav-label">' .. esc($f["name"]) .. '</span></a>'
+    -- Right-click target: bind each row's .tv-row to the shared folder context menu,
+    -- carrying the folder's id/key/name/role payload (the menu's item templates resolve
+    -- {id}/{name}/… from these at clone time). role="" → custom folder (rename/delete OK);
+    -- a standard role mailbox carries its role, so the menu greys Rename/Delete (disable_if).
+    $cm = cm_bind("folder-menu", { id: $f["id"], key: $key, name: $f["name"], role: $f["role"] })
+    if $kidhtml == "" then
+      -- Leaf: chevron-width spacer keeps icons aligned under branch icons.
+      $h = $h .. '<li class="tv-leaf"><div class="tv-row"' .. $cm .. '><span class="tv-chev-spacer" aria-hidden="true"></span>' .. $link .. '</div></li>'
+    else
+      -- Branch: in COLLAPSE mode (the JS panel) open only on the active path, else
+      -- collapsed; in NON-collapse mode (the no-JS inline fallback) ALWAYS open, so
+      -- every folder is reachable without the chevron JS.
+      $open = ""
+      $aria = "false"
+      if $contains or not $collapse then
+        $open = " tv-open"
+        $aria = "true"
+      end
+      $tk = "mail-folders:" .. $f["id"]
+      $subid = "tv-sub-mail-folders-" .. $f["id"]
+      $h = $h .. '<li class="tv-branch' .. $open .. '" data-tv-key="' .. esc($tk) .. '">'
+      $h = $h .. '<div class="tv-row"' .. $cm .. '><button class="tv-chev" type="button" aria-expanded="' .. $aria .. '" aria-controls="' .. esc($subid) .. '" data-tv-key="' .. esc($tk) .. '" aria-label="Toggle"><i data-lucide="chevron-right"></i></button>' .. $link .. '</div>'
+      $h = $h .. '<div class="tv-sub" id="' .. esc($subid) .. '"><div class="tv-sub-inner"><ul class="cms-nav-list tv-sub-list">' .. $kidhtml .. '</ul></div></div>'
+      $h = $h .. '</li>'
+    end
+  end
+  return { html: $h, active: $any_active }
+end
+
+-- The folder TREE: a nested <ul class="cms-nav-list tv-tree"> mirroring the JMAP mailbox
+-- hierarchy. $mboxes = m_mailboxes() (flat list w/ parentId). Builds the parentId→children
+-- adjacency, then recurses from root (""). NOTE the get→push→reassign idiom: push() into a
+-- MAP-held list is a silent no-op (the index returns a copy), so read out, push, write back.
+function m_folder_tree($cur, $mboxes, $collapse)
+  $kids = {}
+  for each $f in $mboxes
+    $p = $f["parentId"]
+    $cl = $kids[$p]
+    if $cl == nil then
+      $cl = []
+    end
+    push($cl, $f)
+    $kids[$p] = $cl
+  end
+  $res = m_folder_rows($kids, "", $cur, 0, $collapse)
+  return '<ul class="cms-nav-list tv-tree">' .. $res["html"] .. '</ul>'
+end
+
+-- Folder tree — the NO-JS fallback, rendered inline in #content. data-mail-tabs lets
+-- site.js hide it once it mounts the Folders context panel (the JS folder control);
+-- without JS it stays as the (fully expanded, navigable) switcher.
+function m_folder_nav($cur, $mboxes)
+  return '<div class="cms-nav" data-mail-tabs style="margin:0 0 var(--space-4)">' .. m_folder_tree($cur, $mboxes, false) .. '</div>'
+end
+
+-- Folders CONTEXT PANEL (the DCS "sidebar panel drives a content app" POC). Emits an
+-- inert <template> in the content; site.js (syncContextPanels) clones it into a real
+-- LHS carousel panel on every mail view and tears it down on leaving. SERVER-rendered
+-- so it carries the live folder tree + active folder, and degrades to m_folder_nav with
+-- no JS. Reuses .cms-nav/.cms-nav-list/.tv-sub-list, so the tightened sidebar nav
+-- styling applies for free. $mboxes = the full mailbox list (m_mailboxes).
+function m_folder_panel_tpl($cur, $mboxes)
+  return '<template data-dcs-panel="left" data-dcs-panel-id="mail-folders" data-dcs-panel-title="Folders" data-dcs-panel-hides="[data-mail-tabs]"><div class="cms-nav">' .. m_folder_tree($cur, $mboxes, true) .. '</div></template>'
+end
+
+-- The shared folder-menu item set: New Subfolder / Rename / Move To… / Properties / Delete
+-- (Mark Folder Read deferred — Codex D8, it needs a different batch-Email/set transport).
+-- Each item's {id} resolves to the right-clicked folder at clone
+-- time; `src` is the X-Modal-Fetch URL (a bare md_panel fragment into <dialog id="md-folder">),
+-- `href` the open-in-new-tab / direct-URL full-page fallback (the menu is a JS enhancement —
+-- with JS off it never opens, so folder management is reachable only by direct URL). Rename
+-- + Delete carry disable_if:"role" so
+-- the six standard role mailboxes (Inbox/Sent/…) grey those items; the POST handler ALSO
+-- re-validates (defence in depth — a client gate is never the authority).
+function m_folder_menu_items()
+  return [
+    { "label": "New Subfolder", icon: "folder-plus", modal: "md-folder", src: "/pim/mail?folder_action=newsub&fid={id}&modal=1", href: "/pim/mail?folder_action=newsub&fid={id}" },
+    { "label": "Rename", icon: "pencil", modal: "md-folder", disable_if: "role", src: "/pim/mail?folder_action=rename&fid={id}&modal=1", href: "/pim/mail?folder_action=rename&fid={id}" },
+    { "label": "Move To…", icon: "folder-input", modal: "md-folder", disable_if: "role", src: "/pim/mail?folder_action=move&fid={id}&modal=1", href: "/pim/mail?folder_action=move&fid={id}" },
+    { sep: true },
+    -- Mark Read: a ONE-CLICK POST (no modal/confirm — Codex D8). Own-folder-only (Codex D10:
+    -- NOT recursive; a future "Mark Subtree Read" would be a separate item). Works on any
+    -- folder incl. role mailboxes; harmless no-op when already read.
+    { "label": "Mark Read", icon: "mail-open", post: "/pim/mail", fields: { action: "folder_markread", fid: "{id}" } },
+    { "label": "Properties", icon: "info", modal: "md-folder", src: "/pim/mail?folder_action=props&fid={id}&modal=1", href: "/pim/mail?folder_action=props&fid={id}" },
+    { sep: true },
+    -- Empty Trash: Trash-only (show_if hides it elsewhere), a destructive confirm modal that
+    -- permanently deletes the messages DIRECTLY in Trash (not its subfolders — Codex D12).
+    { "label": "Empty Trash", icon: "trash-2", danger: true, modal: "md-folder", show_if: "role=trash", src: "/pim/mail?folder_action=emptytrash&fid={id}&modal=1", href: "/pim/mail?folder_action=emptytrash&fid={id}" },
+    { "label": "Delete Folder", icon: "trash-2", danger: true, modal: "md-folder", disable_if: "role", src: "/pim/mail?folder_action=delete&fid={id}&modal=1", href: "/pim/mail?folder_action=delete&fid={id}" }
+  ]
+end
+
+-- Per-view folder CHROME: the Folders sidebar panel template + the inert context-menu
+-- template + the persistent <dialog id="md-folder"> shell (folder-action forms lazy-fetch
+-- into it) + md_script (the modal open/close/fetch shim). Prepended to EVERY mail view (so
+-- right-click folder management works from the list, a message, or the empty state). The
+-- cm_menu template is emitted OUTSIDE the dcs-panel template (Codex D1) so syncContextPanels
+-- never clones the menu into the sidebar carousel.
+function m_folder_chrome($cur, $mboxes)
+  return m_folder_panel_tpl($cur, $mboxes) .. cm_menu("folder-menu", m_folder_menu_items()) .. md_shell("md-folder", { size: "sm" }) .. md_script()
+end
+
+-- ─────────────────────── folder management (RMB menu actions) ───────────────────────
+-- The context-menu items POST/GET to THIS route (Codex D3: same-route folder_action= +
+-- action=folder_*, the house pattern, reusing the handler's auth/session). The SameSite
+-- session cookie is NOT the authority — every mutation re-validates (folder exists; the
+-- six standard role mailboxes are never renamed/deleted) server-side.
+
+-- The flat mailbox map for $fid, or nil. ($mboxes = m_mailboxes().) fm_or guards the Mix
+-- "" .. nil = "nil" trap so a nil fid can't accidentally match a folder literally named "nil".
+function m_folder_find($mboxes, $fid)
+  $want = "" .. fm_or($fid, "")
+  for each $f in $mboxes
+    if ("" .. $f["id"]) == $want then
+      return $f
+    end
+  end
+  return nil
+end
+
+-- The set {id->true} of $fid PLUS all its descendants (BFS over the parentId adjacency).
+-- Move To excludes these as targets (you can't move a folder into itself or its own
+-- subtree — a cycle); the POST handler re-checks against this. Index-pointer BFS because
+-- Mix has no pop(); the visited set bounds it against any pre-existing data cycle.
+function m_folder_descendants($mboxes, $fid)
+  $kids = {}
+  for each $f in $mboxes
+    $p = $f["parentId"]
+    $cl = $kids[$p]
+    if $cl == nil then
+      $cl = []
+    end
+    push($cl, "" .. $f["id"])
+    $kids[$p] = $cl
+  end
+  $set = {}
+  $root = "" .. fm_or($fid, "")
+  $set[$root] = true
+  $queue = [$root]
+  $i = 0
+  while $i < length($queue)
+    $cur = $queue[$i]
+    $i = $i + 1
+    $children = $kids[$cur]
+    if $children != nil then
+      for each $c in $children
+        if $set[$c] != true then
+          $set[$c] = true
+          push($queue, $c)
+        end
+      end
+    end
+  end
+  return $set
+end
+
+-- "Grandparent / Parent / Name" by walking parentId up from $fid (depth-capped against a
+-- cyclic parent chain). Used as the Move To destination labels + the Properties path, so a
+-- duplicate folder name (two "Posts" under different parents) is unambiguous.
+function m_folder_path($mboxes, $fid)
+  $parts = []
+  $cur = "" .. fm_or($fid, "")
+  $depth = 0
+  while $cur != "" and $depth < 16
+    $f = m_folder_find($mboxes, $cur)
+    if $f == nil then
+      $cur = ""
+    else
+      $pfx = [ "" .. $f["name"] ]
+      for each $p in $parts
+        push($pfx, $p)
+      end
+      $parts = $pfx
+      $cur = "" .. $f["parentId"]
+    end
+    $depth = $depth + 1
+  end
+  return join($parts, " / ")
+end
+
+-- Depth of $fid (a root-level folder = 1; deeper = larger) by counting parentId hops. Used
+-- to order a subtree LEAVES-FIRST for destroy (maild refuses to destroy a folder that still
+-- has child mailboxes, so the deepest must go first).
+function m_folder_depth($mboxes, $fid)
+  $d = 0
+  $cur = "" .. fm_or($fid, "")
+  $guard = 0
+  while $cur != "" and $guard < 32
+    $f = m_folder_find($mboxes, $cur)
+    if $f == nil then
+      $cur = ""
+    else
+      $d = $d + 1
+      $cur = "" .. $f["parentId"]
+    end
+    $guard = $guard + 1
+  end
+  return $d
+end
+
+-- The whole subtree under (and including) $fid, ordered DEEPEST-FIRST — the order a
+-- Mailbox/set destroy must use so every parent is childless when its turn comes. sort_by is
+-- ascending, so the key is 0-depth (deepest → most negative → first).
+function m_folder_subtree_ordered($mboxes, $fid)
+  $set = m_folder_descendants($mboxes, $fid)
+  $rows = []
+  for each $id in keys($set)
+    push($rows, { id: ("" .. $id), depth: m_folder_depth($mboxes, $id) })
+  end
+  $rows = sort_by($rows, fn($r) = 0 - $r["depth"])
+  $ids = []
+  for each $r in $rows
+    push($ids, $r["id"])
+  end
+  return $ids
+end
+
+-- {folders, messages} for a Delete confirm: subfolder count (subtree size minus self) + the
+-- total message count across the whole subtree (ONE Mailbox/get over the subtree ids, summing
+-- totalEmails). Best-effort — a transport failure leaves messages at -1 (caller shows "?").
+function m_subtree_counts($mboxes, $fid)
+  $set = m_folder_descendants($mboxes, $fid)
+  $ids = keys($set)
+  $folders = length($ids) - 1
+  $messages = -1
+  try
+    $gr = jmap("Mailbox/get", { ids: $ids })
+    $gl = $gr["list"]
+    if $gl != nil then
+      $messages = 0
+      for each $m in $gl
+        $messages = $messages + fm_or($m["totalEmails"], 0)
+      end
+    end
+  catch $e
+    $messages = -1
+  end
+  return { folders: $folders, messages: $messages }
+end
+
+-- Interpret a Mailbox/set UPDATE response for a single id → {ok, err}. JMAP's `updated`
+-- map carries the id key with a NULL value on success (maild record_to_jmap → updated_map
+-- inserts Value::Null), so success MUST be tested by KEY PRESENCE (has_key) — an index read
+-- $updated[$fid] returns nil for both "absent" and "present-but-null", which would misread a
+-- successful update as a failure (the false "unknown error" flash this replaces).
+function m_update_result($ur, $fid)
+  $updated = $ur["updated"]
+  if $updated != nil and has_key($updated, $fid) then
+    return { ok: true, err: "" }
+  end
+  $err = ""
+  $nu = $ur["notUpdated"]
+  if $nu != nil and has_key($nu, $fid) then
+    $err = m_seterr($nu[$fid])
+  end
+  if $err == "" then
+    $err = "unknown error"
+  end
+  return { ok: false, err: $err }
+end
+
+-- A JMAP SetError ({type, description}) → a human reason, "" when empty.
+function m_seterr($e)
+  if $e == nil then
+    return ""
+  end
+  if $e["description"] != nil and ("" .. $e["description"]) != "" then
+    return "" .. $e["description"]
+  end
+  if $e["type"] != nil then
+    return "" .. $e["type"]
+  end
+  return ""
+end
+
+-- A small "can't do that" panel — modal fragment or full page.
+function m_folder_err($user, $m_modal, $msg)
+  if $m_modal then
+    return md_fragment(md_panel({ title: "Cannot do that", submit: false, cancel: "Close" }, '<p class="fm-help">' .. esc($msg) .. '</p>'))
+  end
+  return doc(200, "Mail", $user, '<div class="card cms-card-narrow"><h1>Cannot do that</h1><p class="muted">' .. esc($msg) .. '</p><p><a class="navlink" href="/pim/mail">← Mail</a></p></div>')
+end
+
+-- Render a folder form $spec (no mode) as a modal fragment (X-Modal-Fetch) or full page.
+function m_folder_render($user, $m_modal, $title, $spec)
+  if $m_modal then
+    $spec["mode"] = "modal"
+    return md_fragment(fm_form($spec))
+  end
+  $spec["mode"] = "canvas"
+  $head = '<div class="cms-head"><h1>' .. esc($title) .. '</h1><a class="navlink" href="/pim/mail">← Mail</a></div>'
+  return doc(200, $title, $user, $head .. fm_form($spec))
+end
+
+-- GET ?folder_action=<rename|newsub|delete>&fid=<id> — the form (or confirm) for a folder
+-- action. fid is the right-clicked folder (the PARENT for newsub). Rename/Delete refuse a
+-- standard role mailbox here too (the menu greys them; this is the no-JS / direct-URL guard).
+function m_folder_form($user, $q)
+  $m_modal = md_is_modal_request()
+  $action = "" .. $q["folder_action"]
+  $fid = "" .. fm_or($q["fid"], "")
+  $mboxes = []
+  try
+    $mboxes = m_mailboxes()
+  catch $e
+    if $m_modal then
+      return md_fragment(md_panel({ title: "Mail unavailable", submit: false, cancel: "Close" }, '<p class="fm-help">The mail service could not be reached. Close and retry shortly.</p>'))
+    end
+    return doc(502, "Mail", $user, m_error())
+  end
+  $folder = m_folder_find($mboxes, $fid)
+  if $folder == nil then
+    return m_folder_err($user, $m_modal, "That folder no longer exists.")
+  end
+  $fname = "" .. $folder["name"]
+  $frole = "" .. $folder["role"]
+
+  if $action == "newsub" then
+    $fields = fm_hidden("action", "folder_newsub") .. fm_hidden("parent", $fid)
+    $fields = $fields .. fm_note("New subfolder of " .. $fname)
+    $fields = $fields .. fm_text("name", "Folder name", { value: "", required: true, autofocus: true, placeholder: "Folder name" })
+    $spec = { action: "/pim/mail", id: "m-folder-newsub", title: "New subfolder", fields: fm_grid({ cols: 1 }, $fields), submit: { "label": "Create" }, cancel: { "label": "Cancel", href: "/pim/mail" } }
+    return m_folder_render($user, $m_modal, "New subfolder", $spec)
+  end
+
+  if $action == "rename" then
+    if $frole != "" then
+      return m_folder_err($user, $m_modal, "That is a standard mailbox and can't be renamed.")
+    end
+    $fields = fm_hidden("action", "folder_rename") .. fm_hidden("fid", $fid)
+    $fields = $fields .. fm_text("name", "Folder name", { value: $fname, required: true, autofocus: true })
+    $spec = { action: "/pim/mail", id: "m-folder-rename", title: "Rename folder", fields: fm_grid({ cols: 1 }, $fields), submit: { "label": "Rename" }, cancel: { "label": "Cancel", href: "/pim/mail" } }
+    return m_folder_render($user, $m_modal, "Rename folder", $spec)
+  end
+
+  -- Delete: a HARD delete (Codex D11) — the folder + its whole subtree + all their messages,
+  -- permanently. The confirm spells out the counts (subfolders + total messages across the
+  -- subtree, one cheap Mailbox/get) so a parent folder's reach is explicit before you commit.
+  if $action == "delete" then
+    if $frole != "" then
+      return m_folder_err($user, $m_modal, "That is a standard mailbox and can't be deleted.")
+    end
+    $cnt = m_subtree_counts($mboxes, $fid)
+    $warn = "Permanently delete the folder " .. $fname
+    if $cnt["folders"] == 1 then
+      $warn = $warn .. ", its 1 subfolder"
+    end
+    if $cnt["folders"] > 1 then
+      $warn = $warn .. ", its " .. ("" .. $cnt["folders"]) .. " subfolders"
+    end
+    if $cnt["messages"] == 1 then
+      $warn = $warn .. ", and its 1 message"
+    end
+    if $cnt["messages"] > 1 then
+      $warn = $warn .. ", and its " .. ("" .. $cnt["messages"]) .. " messages"
+    end
+    $warn = $warn .. "? This cannot be undone."
+    $fields = fm_hidden("action", "folder_delete") .. fm_hidden("fid", $fid)
+    $fields = $fields .. fm_note($warn)
+    $spec = { action: "/pim/mail", id: "m-folder-delete", title: "Delete folder", fields: fm_grid({ cols: 1 }, $fields), submit: { "label": "Delete folder" }, cancel: { "label": "Cancel", href: "/pim/mail" } }
+    return m_folder_render($user, $m_modal, "Delete folder", $spec)
+  end
+
+  -- Empty Trash: a destructive confirm scoped to the messages DIRECTLY in Trash (Codex D12 —
+  -- not its subfolders). Server-side role==trash check (the show_if is only a client gate).
+  -- An already-empty Trash gets a neutral closeable panel — no destructive submit.
+  if $action == "emptytrash" then
+    if $frole != "trash" then
+      return m_folder_err($user, $m_modal, "Empty Trash is only available on the Trash folder.")
+    end
+    $tcount = -1
+    try
+      $qr = jmap("Email/query", { filter: { inMailbox: $fid }, limit: 1 })
+      $tcount = fm_or($qr["total"], 0)
+    catch $e
+      $tcount = -1
+    end
+    if $tcount == 0 then
+      if $m_modal then
+        return md_fragment(md_panel({ title: "Trash is empty", submit: false, cancel: "Close" }, '<p class="fm-help">There are no messages in Trash to delete.</p>'))
+      end
+      return doc(200, "Empty Trash", $user, '<div class="card cms-card-narrow"><h1>Trash is empty</h1><p class="muted">There are no messages in Trash to delete.</p><p><a class="navlink" href="/pim/mail">← Mail</a></p></div>')
+    end
+    $warn = "Permanently delete all messages directly in Trash? This cannot be undone."
+    if $tcount == 1 then
+      $warn = "Permanently delete the 1 message in Trash? This cannot be undone."
+    end
+    if $tcount > 1 then
+      $warn = "Permanently delete all " .. ("" .. $tcount) .. " messages directly in Trash? This cannot be undone."
+    end
+    $fields = fm_hidden("action", "folder_emptytrash") .. fm_hidden("fid", $fid)
+    $fields = $fields .. fm_note($warn)
+    $spec = { action: "/pim/mail", id: "m-folder-emptytrash", title: "Empty Trash", fields: fm_grid({ cols: 1 }, $fields), submit: { "label": "Empty Trash" }, cancel: { "label": "Cancel", href: "/pim/mail" } }
+    return m_folder_render($user, $m_modal, "Empty Trash", $spec)
+  end
+
+  -- Move To: a parent <select> filtered SERVER-side (Codex D6: modal-with-select beats a
+  -- submenu — one shared template can't grey self/descendant/current-parent per row). The
+  -- options exclude $fid + its whole subtree (no cycle) + the current parent (no-op); "(top
+  -- level)" rides value="" when the folder isn't already at root. The select is NOT required
+  -- (the first option is pre-selected, and value="" legitimately means root).
+  if $action == "move" then
+    if $frole != "" then
+      return m_folder_err($user, $m_modal, "That is a standard mailbox and can't be moved.")
+    end
+    $desc = m_folder_descendants($mboxes, $fid)
+    $curparent = "" .. $folder["parentId"]
+    $targets = []
+    for each $tf in $mboxes
+      $tid = "" .. $tf["id"]
+      if $desc[$tid] != true and $tid != $curparent then
+        push($targets, { value: $tid, "label": m_folder_path($mboxes, $tid) })
+      end
+    end
+    $targets = sort_by($targets, fn($o) = $o["label"])
+    $opts = []
+    if $curparent != "" then
+      push($opts, { value: "", "label": "(top level)" })
+    end
+    for each $t in $targets
+      push($opts, $t)
+    end
+    if length($opts) == 0 then
+      return m_folder_err($user, $m_modal, "There is nowhere to move this folder.")
+    end
+    $fields = fm_hidden("action", "folder_move") .. fm_hidden("fid", $fid)
+    $fields = $fields .. fm_note("Move " .. $fname .. " to:")
+    $fields = $fields .. fm_select("parent", "Destination", $opts, { autofocus: true })
+    $spec = { action: "/pim/mail", id: "m-folder-move", title: "Move folder", fields: fm_grid({ cols: 1 }, $fields), submit: { "label": "Move" }, cancel: { "label": "Cancel", href: "/pim/mail" } }
+    return m_folder_render($user, $m_modal, "Move folder", $spec)
+  end
+
+  -- Properties: a READ-ONLY panel (no form). A targeted Mailbox/get pulls the live
+  -- totalEmails/unreadEmails (m_mailboxes only carries id/name/role/parentId); the rest is
+  -- already in $folder. Counts default to "—" if the per-folder get fails (non-fatal).
+  if $action == "props" then
+    $total = "—"
+    $unread = "—"
+    try
+      $gr = jmap("Mailbox/get", { ids: [$fid] })
+      $gl = $gr["list"]
+      if $gl != nil and length($gl) > 0 then
+        $total = "" .. fm_or($gl[0]["totalEmails"], 0)
+        $unread = "" .. fm_or($gl[0]["unreadEmails"], 0)
+      end
+    catch $e
+      -- leave the dashes; properties is best-effort, not worth a 502
+    end
+    $roletxt = "Custom folder"
+    if $frole != "" then
+      $roletxt = "Standard mailbox (" .. $frole .. ")"
+    end
+    $body = m_folder_props_body($fname, $roletxt, m_folder_path($mboxes, $fid), $total, $unread)
+    if $m_modal then
+      return md_fragment(md_panel({ title: "Folder properties", submit: false, cancel: "Close" }, $body))
+    end
+    return doc(200, "Folder properties", $user, '<div class="cms-head"><h1>Folder properties</h1><a class="navlink" href="/pim/mail">← Mail</a></div><div class="card cms-card-narrow">' .. $body .. '</div>')
+  end
+
+  return m_folder_err($user, $m_modal, "Unknown folder action.")
+end
+
+-- The read-only Properties body: a two-column definition list (.cms-props). All values
+-- esc()'d at emission (folder name + path are user data).
+function m_folder_props_body($name, $roletxt, $path, $total, $unread)
+  $h = '<dl class="cms-props">'
+  $h = $h .. '<dt>Name</dt><dd>' .. esc($name) .. '</dd>'
+  $h = $h .. '<dt>Type</dt><dd>' .. esc($roletxt) .. '</dd>'
+  $h = $h .. '<dt>Path</dt><dd>' .. esc($path) .. '</dd>'
+  $h = $h .. '<dt>Messages</dt><dd>' .. esc("" .. $total) .. '</dd>'
+  $h = $h .. '<dt>Unread</dt><dd>' .. esc("" .. $unread) .. '</dd>'
+  return $h .. '</dl>'
+end
+
+-- POST action=folder_<newsub|rename|delete|move|markread|emptytrash> — the mutation. Re-validates, runs the JMAP
+-- Mailbox/set, then 303-redirects with a flash so a full nav re-renders the folder tree
+-- (the dcsSig changes → syncContextPanels re-clones the sidebar panel). Generic flash text
+-- (no raw folder name → the toast_script JS sink stays user-input-free).
+function m_folder_post($user, $pf)
+  $action = "" .. fm_val($pf, "action")
+  $mboxes = []
+  try
+    $mboxes = m_mailboxes()
+  catch $e
+    return doc(502, "Mail", $user, m_error())
+  end
+
+  if $action == "folder_newsub" then
+    $parent = trim("" .. fm_val($pf, "parent"))
+    $name = trim("" .. fm_val($pf, "name"))
+    if $name == "" then
+      return redirect_flash("/pim/mail", "Folder name can't be empty.", "danger")
+    end
+    if m_folder_find($mboxes, $parent) == nil then
+      return redirect_flash("/pim/mail", "The parent folder no longer exists.", "danger")
+    end
+    $newid = ""
+    $err = ""
+    try
+      $cr = jmap("Mailbox/set", { create: { f: { name: $name, parentId: $parent } } })
+      $created = $cr["created"]
+      if $created != nil and $created["f"] != nil then
+        $newid = "" .. $created["f"]["id"]
+      else
+        $nc = $cr["notCreated"]
+        if $nc != nil and $nc["f"] != nil then
+          $err = m_seterr($nc["f"])
+        end
+      end
+    catch $e2
+      return doc(502, "Mail", $user, m_error())
+    end
+    if $newid == "" then
+      $msg = "The folder could not be created."
+      if $err != "" then
+        $msg = "The folder could not be created: " .. $err
+      end
+      return redirect_flash("/pim/mail", $msg, "danger")
+    end
+    return redirect_flash("/pim/mail?box=" .. url_encode($newid), "Folder created.", "success")
+  end
+
+  if $action == "folder_rename" then
+    $fid = trim("" .. fm_val($pf, "fid"))
+    $name = trim("" .. fm_val($pf, "name"))
+    if $name == "" then
+      return redirect_flash("/pim/mail", "Folder name can't be empty.", "danger")
+    end
+    $folder = m_folder_find($mboxes, $fid)
+    if $folder == nil then
+      return redirect_flash("/pim/mail", "That folder no longer exists.", "danger")
+    end
+    if ("" .. $folder["role"]) != "" then
+      return redirect_flash("/pim/mail", "A standard mailbox can't be renamed.", "danger")
+    end
+    $upd = {}
+    $upd[$fid] = { name: $name }
+    $err = ""
+    try
+      $ur = jmap("Mailbox/set", { update: $upd })
+      $err = m_update_result($ur, $fid)["err"]
+    catch $e2
+      return doc(502, "Mail", $user, m_error())
+    end
+    if $err != "" then
+      return redirect_flash("/pim/mail?box=" .. url_encode($fid), "Rename failed: " .. $err, "danger")
+    end
+    return redirect_flash("/pim/mail?box=" .. url_encode($fid), "Folder renamed.", "success")
+  end
+
+  if $action == "folder_delete" then
+    $fid = trim("" .. fm_val($pf, "fid"))
+    $folder = m_folder_find($mboxes, $fid)
+    if $folder == nil then
+      return redirect_flash("/pim/mail", "That folder no longer exists.", "danger")
+    end
+    if ("" .. $folder["role"]) != "" then
+      return redirect_flash("/pim/mail", "A standard mailbox can't be deleted.", "danger")
+    end
+    -- Hard delete (Codex D11): destroy the whole subtree LEAVES-FIRST (maild refuses a folder
+    -- that still has children) with onDestroyRemoveEmails (cascade each folder's messages).
+    -- maild processes the destroy array in order, so each parent is childless when reached;
+    -- if the TARGET id ends up destroyed, every descendant did too (they precede it).
+    $order = m_folder_subtree_ordered($mboxes, $fid)
+    $err = ""
+    try
+      $dr = jmap("Mailbox/set", { destroy: $order, onDestroyRemoveEmails: true })
+      $ok = false
+      $destroyed = $dr["destroyed"]
+      if $destroyed != nil then
+        for each $d in $destroyed
+          if ("" .. $d) == $fid then
+            $ok = true
+          end
+        end
+      end
+      if not $ok then
+        $nd = $dr["notDestroyed"]
+        if $nd != nil and $nd[$fid] != nil then
+          $err = m_seterr($nd[$fid])
+        end
+        if $err == "" then
+          $err = "unknown error"
+        end
+      end
+    catch $e2
+      return doc(502, "Mail", $user, m_error())
+    end
+    if $err != "" then
+      return redirect_flash("/pim/mail?box=" .. url_encode($fid), "Delete failed: " .. $err, "danger")
+    end
+    return redirect_flash("/pim/mail", "Folder deleted.", "success")
+  end
+
+  if $action == "folder_move" then
+    $fid = trim("" .. fm_val($pf, "fid"))
+    $to = trim("" .. fm_val($pf, "parent"))
+    $folder = m_folder_find($mboxes, $fid)
+    if $folder == nil then
+      return redirect_flash("/pim/mail", "That folder no longer exists.", "danger")
+    end
+    if ("" .. $folder["role"]) != "" then
+      return redirect_flash("/pim/mail", "A standard mailbox can't be moved.", "danger")
+    end
+    -- Re-validate the destination server-side (the select was filtered, but a crafted POST
+    -- must not move a folder into itself / its own subtree / a vanished target).
+    if $to != "" then
+      if m_folder_find($mboxes, $to) == nil then
+        return redirect_flash("/pim/mail?box=" .. url_encode($fid), "The destination folder no longer exists.", "danger")
+      end
+      $desc = m_folder_descendants($mboxes, $fid)
+      if $desc[$to] == true then
+        return redirect_flash("/pim/mail?box=" .. url_encode($fid), "A folder can't be moved into itself or one of its own subfolders.", "danger")
+      end
+    end
+    -- parentId: a real id moves under it; nil (→ JSON null) moves to the root. maild's update
+    -- branch treats null as "move to root" and absent as "leave alone", so root MUST send null.
+    $upd = {}
+    if $to == "" then
+      $upd[$fid] = { parentId: nil }
+    else
+      $upd[$fid] = { parentId: $to }
+    end
+    $err = ""
+    try
+      $ur = jmap("Mailbox/set", { update: $upd })
+      $err = m_update_result($ur, $fid)["err"]
+    catch $e2
+      return doc(502, "Mail", $user, m_error())
+    end
+    if $err != "" then
+      return redirect_flash("/pim/mail?box=" .. url_encode($fid), "Move failed: " .. $err, "danger")
+    end
+    return redirect_flash("/pim/mail?box=" .. url_encode($fid), "Folder moved.", "success")
+  end
+
+  -- Empty Trash (Codex D12): permanently delete the messages DIRECTLY in Trash (not its
+  -- subfolders). Server re-checks role=="trash" (the show_if is only a client gate). COLLECT-
+  -- then-DESTROY (mirrors mark-read): page all Trash message ids, then Email/set destroy in
+  -- chunks of 500. deleted/failed accumulate per chunk (destroyed is a LIST, notDestroyed a
+  -- map → disjoint chunks, no double-count). The 40-page cap reports "more may remain".
+  if $action == "folder_emptytrash" then
+    $fid = trim("" .. fm_val($pf, "fid"))
+    $folder = m_folder_find($mboxes, $fid)
+    if $folder == nil then
+      return redirect_flash("/pim/mail", "That folder no longer exists.", "danger")
+    end
+    if ("" .. $folder["role"]) != "trash" then
+      return redirect_flash("/pim/mail", "Empty Trash is only available on the Trash folder.", "danger")
+    end
+    $ids_all = []
+    $deleted = 0
+    $failed = 0
+    $truncated = false
+    try
+      $pos = 0
+      $pages = 0
+      $more = true
+      while $more and $pages < 40
+        $pages = $pages + 1
+        $qr = jmap("Email/query", { filter: { inMailbox: $fid }, position: $pos, limit: 500 })
+        $ids = $qr["ids"]
+        $n = 0
+        if $ids != nil then
+          $n = length($ids)
+          for each $id in $ids
+            push($ids_all, "" .. $id)
+          end
+        end
+        if $n < 500 then
+          $more = false
+        else
+          $pos = $pos + 500
+        end
+      end
+      $truncated = $more
+      $ntot = length($ids_all)
+      $i = 0
+      while $i < $ntot
+        $batch = []
+        $j = 0
+        while $j < 500 and $i < $ntot
+          push($batch, $ids_all[$i])
+          $i = $i + 1
+          $j = $j + 1
+        end
+        $sr = jmap("Email/set", { destroy: $batch })
+        $dl = $sr["destroyed"]
+        $nd = $sr["notDestroyed"]
+        if $dl != nil then
+          $deleted = $deleted + length($dl)
+        end
+        if $nd != nil then
+          $failed = $failed + length(keys($nd))
+        end
+      end
+    catch $e2
+      return doc(502, "Mail", $user, m_error())
+    end
+    $dest = "/pim/mail?box=trash"
+    if length($ids_all) == 0 then
+      return redirect_flash($dest, "Trash is already empty.", "success")
+    end
+    $msg = "Emptied Trash — deleted " .. ("" .. $deleted) .. " message"
+    if $deleted != 1 then
+      $msg = $msg .. "s"
+    end
+    $msg = $msg .. "."
+    if $truncated then
+      return redirect_flash($dest, $msg .. " More may remain — run Empty Trash again.", "warning")
+    end
+    if $failed > 0 then
+      return redirect_flash($dest, $msg .. " " .. ("" .. $failed) .. " could not be deleted.", "warning")
+    end
+    return redirect_flash($dest, $msg, "success")
+  end
+
+  -- Mark Folder Read (own folder only — Codex D10). COLLECT-then-MARK: first page through
+  -- ALL unread ids (the set is stable while we only read), THEN batch-mark in chunks. This
+  -- avoids the unsound "query page 0 / mark / repeat" shape, where >500 unread with multi-
+  -- mailbox rejects sorting to the top would stall before reaching markable messages further
+  -- down. The filter is a FLAT condition {inMailbox, notKeyword:"$seen"}; do NOT use
+  -- operator:AND (maild Phase A rejects the FilterOperator → 502, the trap a prior funnel
+  -- hit — see the list-view note). The mark patch is the pointer-delta {"keywords/$seen":
+  -- true} (preserves $flagged/$answered/$draft + user tags, no client read-modify-write).
+  -- maild REJECTS keyword updates on MULTI-MAILBOX emails → those land in notUpdated, so a
+  -- partial sweep is normal. marked/failed are counted per chunk from updated/notUpdated
+  -- (each id is in exactly one chunk → no double-count; a no-op already-read id is omitted
+  -- from both, an honest undercount). The page cap (~40×500 = 20k) reports "more may remain"
+  -- rather than silently truncating a runaway folder; a second click drains the rest.
+  if $action == "folder_markread" then
+    $fid = trim("" .. fm_val($pf, "fid"))
+    $folder = m_folder_find($mboxes, $fid)
+    if $folder == nil then
+      return redirect_flash("/pim/mail", "That folder no longer exists.", "danger")
+    end
+    $boxkey = m_folder_box_key($folder)
+    $ids_all = []
+    $marked = 0
+    $failed = 0
+    $truncated = false
+    try
+      -- Phase 1: collect every unread id (paged; set is stable, no writes yet).
+      $pos = 0
+      $pages = 0
+      $more = true
+      while $more and $pages < 40
+        $pages = $pages + 1
+        $qr = jmap("Email/query", { filter: { inMailbox: $fid, notKeyword: "$seen" }, position: $pos, limit: 500 })
+        $ids = $qr["ids"]
+        $n = 0
+        if $ids != nil then
+          $n = length($ids)
+          for each $id in $ids
+            push($ids_all, "" .. $id)
+          end
+        end
+        if $n < 500 then
+          $more = false
+        else
+          $pos = $pos + 500
+        end
+      end
+      $truncated = $more   -- cap hit with a still-full page → more unread may remain
+      -- Phase 2: mark the collected ids in chunks of 500.
+      $ntot = length($ids_all)
+      $i = 0
+      while $i < $ntot
+        $upd = {}
+        $j = 0
+        while $j < 500 and $i < $ntot
+          $upd[$ids_all[$i]] = { "keywords/$seen": true }
+          $i = $i + 1
+          $j = $j + 1
+        end
+        $sr = jmap("Email/set", { update: $upd })
+        $updated = $sr["updated"]
+        $notupd = $sr["notUpdated"]
+        if $updated != nil then
+          $marked = $marked + length(keys($updated))
+        end
+        if $notupd != nil then
+          $failed = $failed + length(keys($notupd))
+        end
+      end
+    catch $e2
+      return doc(502, "Mail", $user, m_error())
+    end
+    $dest = "/pim/mail?box=" .. url_encode($boxkey)
+    -- Nothing to do: a fully-read folder → neutral, never danger.
+    if length($ids_all) == 0 then
+      return redirect_flash($dest, "Folder already read.", "success")
+    end
+    $msg = "Marked " .. ("" .. $marked) .. " message"
+    if $marked != 1 then
+      $msg = $msg .. "s"
+    end
+    $msg = $msg .. " read."
+    -- Page cap reached → more unread may remain (no silent truncation).
+    if $truncated then
+      return redirect_flash($dest, $msg .. " More may remain — run Mark Read again.", "warning")
+    end
+    -- Partial: some messages (multi-mailbox) couldn't be marked.
+    if $failed > 0 then
+      $tail = "1 message could not be updated."
+      if $failed != 1 then
+        $tail = ("" .. $failed) .. " messages could not be updated."
+      end
+      return redirect_flash($dest, $msg .. " " .. $tail, "warning")
+    end
+    return redirect_flash($dest, $msg, "success")
+  end
+
+  return redirect("/pim/mail")
+end
+
+-- ── datatable row/bulk message actions (the auto-RMB + multi-select bulk) ──────────────
+-- The standard datatable verbs (row:<verb>:<id> and bulk_<name>) are dispatched here, sharing
+-- ONE per-verb JMAP applier so a row action and the bulk loop run identical code over an id-set.
+
+-- /pim/mail?box=<box> for a non-empty box, else the default mailbox.
+function m_dest($box)
+  if $box != "" then
+    return "/pim/mail?box=" .. url_encode($box)
+  end
+  return "/pim/mail"
+end
+
+-- The folder the user acted FROM, recovered from the Referer ?box= so a row/bulk action
+-- redirects back to the same folder (the RMB/bulk POST targets /pim/mail with no ?box).
+function m_post_box()
+  $ref = "" .. fm_or($HEADERS["referer"], "")
+  $qpos = pos("?", $ref)
+  if $qpos > 0 then
+    $qp = parse_query(substr($ref, $qpos, length($ref) - $qpos))
+    return "" .. fm_or($qp["box"], "")
+  end
+  return ""
+end
+
+-- Apply ONE Email/set update body ($patch) to a list of message ids (UNTRUSTED — used only as
+-- update-map keys, never spliced), in chunks of 500. → { ok, fail }. `updated` carries each id
+-- with a NULL value on success, so count via keys(), not an index read.
+function m_set_apply($ids, $patch)
+  $n = length($ids)
+  $ok = 0
+  $fail = 0
+  $i = 0
+  while $i < $n
+    $upd = {}
+    $j = 0
+    while $j < 500 and $i < $n
+      $upd["" .. $ids[$i]] = $patch
+      $i = $i + 1
+      $j = $j + 1
+    end
+    $sr = jmap("Email/set", { update: $upd })
+    $updated = $sr["updated"]
+    $notupd = $sr["notUpdated"]
+    if $updated != nil then
+      $ok = $ok + length(keys($updated))
+    end
+    if $notupd != nil then
+      $fail = $fail + length(keys($notupd))
+    end
+  end
+  return { ok: $ok, fail: $fail }
+end
+
+-- Build the per-message Email/set patch for $verb and apply it to $ids ($to = the destination
+-- folder id, move only). → { msg, level } for redirect_flash. trash/move resolve + re-validate
+-- the destination server-side (never trust the client). markread/unread patch the fixed
+-- keywords/$seen read bit; markunread REMOVES it (PatchObject null). A multi-mailbox message
+-- lands in notUpdated (maild rejects keyword/mailbox writes on it) → surfaced as a partial fail.
+function m_apply_verb($verb, $ids, $to)
+  if length($ids) == 0 then
+    return { msg: "No messages selected.", level: "danger" }
+  end
+  $patch = nil
+  $label = ""
+  if $verb == "markread" then
+    $patch = { "keywords/$seen": true }
+    $label = "marked read"
+  end
+  if $verb == "markunread" then
+    $patch = {}
+    $patch["keywords/$seen"] = nil
+    $label = "marked unread"
+  end
+  if $verb == "trash" then
+    $roles = m_roles()
+    $tid = $roles["trash"]
+    if $tid == nil or ("" .. $tid) == "" then
+      return { msg: "No Trash mailbox exists for this account.", level: "danger" }
+    end
+    $mids = {}
+    $mids["" .. $tid] = true
+    $patch = { mailboxIds: $mids }
+    $label = "moved to Trash"
+  end
+  if $verb == "move" then
+    $mb = m_mailboxes()
+    $destf = m_folder_find($mb, $to)
+    if $destf == nil then
+      return { msg: "Unknown destination folder.", level: "danger" }
+    end
+    $mids = {}
+    $mids["" .. $to] = true
+    $patch = { mailboxIds: $mids }
+    $label = "moved to " .. ("" .. $destf["name"])
+  end
+  if $patch == nil then
+    return { msg: "Unknown action.", level: "danger" }
+  end
+  $r = m_set_apply($ids, $patch)
+  if $r["ok"] == 0 then
+    return { msg: "Nothing " .. $label .. " — the message may live in multiple folders.", level: "danger" }
+  end
+  $word = "message"
+  if $r["ok"] != 1 then
+    $word = "messages"
+  end
+  if $r["fail"] > 0 then
+    return { msg: ("" .. $r["ok"]) .. " " .. $word .. " " .. $label .. "; " .. ("" .. $r["fail"]) .. " could not be updated.", level: "warning" }
+  end
+  return { msg: ("" .. $r["ok"]) .. " " .. $word .. " " .. $label .. ".", level: "success" }
+end
+
+-- Single row action (RMB): action="row:<verb>:<id>" → {verb,id}; move also reads the `to` field.
+function m_row_action($user, $f, $rowact)
+  $verb = "" .. $rowact["verb"]
+  $to = "" .. fm_val($f, "to")
+  $dest = m_dest(m_post_box())
+  $res = {}
+  try
+    $res = m_apply_verb($verb, [$rowact["id"]], $to)
+  catch $e
+    return doc(502, "Mail", $user, m_error())
+  end
+  return redirect_flash($dest, $res["msg"], $res["level"])
+end
+
+-- Bulk action (multi-select bar): action="bulk_<name>", name in {delete, markread}. delete →
+-- trash (move to Trash). Page-scoped (dt_selected_ids = the rendered selection only; JMAP can't
+-- dt_all_ids across pages).
+function m_bulk_action($user, $f, $bulkact)
+  $verb = $bulkact
+  if $bulkact == "delete" then
+    $verb = "trash"
+  end
+  $dest = m_dest(m_post_box())
+  $res = {}
+  try
+    $res = m_apply_verb($verb, dt_selected_ids($f), "")
+  catch $e
+    return doc(502, "Mail", $user, m_error())
+  end
+  return redirect_flash($dest, $res["msg"], $res["level"])
+end
+
+-- Extract the first text/plain body part's value from an Email/get message.
+function m_body_text($e)
+  $tb = $e["textBody"]
+  if $tb == nil or length($tb) == 0 then
+    return ""
+  end
+  $pid = $tb[0]["partId"]
+  if $pid == nil then
+    return ""
+  end
+  $bv = $e["bodyValues"]
+  if $bv == nil then
+    return ""
+  end
+  $part = $bv["" .. $pid]
+  if $part == nil then
+    return ""
+  end
+  $v = $part["value"]
+  if $v == nil then
+    return ""
+  end
+  return "" .. $v
+end
+
+-- The HTML body value (htmlBody[0].partId → bodyValues), "" if none. Mirrors m_body_text;
+-- needs the Email/get to set fetchHTMLBodyValues + the "htmlBody" property.
+function m_html_body($e)
+  $hb = $e["htmlBody"]
+  if $hb == nil or length($hb) == 0 then
+    return ""
+  end
+  $pid = $hb[0]["partId"]
+  if $pid == nil then
+    return ""
+  end
+  $bv = $e["bodyValues"]
+  if $bv == nil then
+    return ""
+  end
+  $part = $bv["" .. $pid]
+  if $part == nil then
+    return ""
+  end
+  $v = $part["value"]
+  if $v == nil then
+    return ""
+  end
+  return "" .. $v
+end
+
+-- Remove a <tag>…</close> span (content included), case-insensitively. lower() is
+-- length-preserving for ASCII, so we search positions in a lowercased copy and splice the
+-- original. Used to drop <style>/<script> blocks before stripping tags.
+function m_remove_block($s, $open, $close)
+  $out = "" .. $s
+  $go = true
+  while $go
+    $lo = lower($out)
+    $a = pos($open, $lo)
+    if $a == 0 then
+      $go = false
+    else
+      $tail_start = ($a - 1) + length($open)
+      $tail = substr($lo, $tail_start, length($lo) - $tail_start)
+      $b = pos($close, $tail)
+      if $b == 0 then
+        $out = substr($out, 0, $a - 1)
+        $go = false
+      else
+        $endpos = $tail_start + ($b - 1) + length($close)
+        $out = substr($out, 0, $a - 1) .. substr($out, $endpos, length($out) - $endpos)
+      end
+    end
+  end
+  return $out
+end
+
+-- Strip every <…> tag (pos/substr scan; no regex — webd's embedded mix may lack the feature).
+-- A malformed trailing '<' with no '>' drops the rest (safe). The result is rendered ESCAPED,
+-- so nothing in it is ever interpreted as markup.
+function m_strip_tags($s)
+  $out = ""
+  $rest = "" .. $s
+  $go = true
+  while $go
+    $lt = pos("<", $rest)
+    if $lt == 0 then
+      $out = $out .. $rest
+      $go = false
+    else
+      $out = $out .. substr($rest, 0, $lt - 1)
+      $afterlt = substr($rest, $lt, length($rest) - $lt)
+      $gt = pos(">", $afterlt)
+      if $gt == 0 then
+        $go = false
+      else
+        $rest = substr($afterlt, $gt, length($afterlt) - $gt)
+      end
+    end
+  end
+  return $out
+end
+
+-- HTML email → plain text, the SAFE render for an HTML-only message: drop style/script blocks,
+-- turn block boundaries into newlines, strip all tags, decode the common entities. No iframe,
+-- no resource loads, no navigation — so no tracking-pixel or meta-refresh beacon is possible.
+-- The caller renders the result ESCAPED.
+function m_html_to_text($html)
+  $s = "" .. $html
+  $s = m_remove_block($s, "<style", "</style>")
+  $s = m_remove_block($s, "<script", "</script>")
+  for each $br in ["<br>", "<br/>", "<br />", "</p>", "</div>", "</tr>", "</li>", "</h1>", "</h2>", "</h3>"]
+    $s = replace($s, $br, "\n")
+  end
+  $s = m_strip_tags($s)
+  for each $ent in [["&nbsp;", " "], ["&lt;", "<"], ["&gt;", ">"], ["&quot;", "\""], ["&#39;", "'"], ["&amp;", "&"]]
+    $s = replace($s, $ent[0], $ent[1])
+  end
+  return trim($s)
+end
+
+-- A compact integer-KB size label (no math builtin — truncate the float string at the dot,
+-- so it works on whatever cosmix-lib-mix webd embeds). "" when size is absent.
+function m_size_kb($n)
+  if $n == nil then
+    return ""
+  end
+  $kb = "" .. ($n / 1024)
+  $dot = pos(".", $kb)
+  if $dot > 0 then
+    $kb = substr($kb, 0, $dot - 1)
+  end
+  if $kb == "" or $kb == "0" then
+    $kb = "1"
+  end
+  return $kb .. " KB"
+end
+
+-- Attachment download rows. maild returns parts in the Email `attachments` property
+-- (EmailBodyPart, disposition=attachment): {blobId, name, type, size}. Each links the
+-- streamed JMAP blob (webd `/jmap/blob/<blobId>`, session-authed) with a download="<name>"
+-- hint so the browser saves it under its real filename. "" when there are none.
+function m_attachments_html($e)
+  $atts = $e["attachments"]
+  if $atts == nil or length($atts) == 0 then
+    return ""
+  end
+  $h = '<div class="card" style="margin-top:var(--space-4)"><div class="muted small" style="margin-bottom:var(--space-2)"><strong>Attachments</strong></div>'
+  for each $a in $atts
+    $bid = "" .. fm_or($a["blobId"], "")
+    if $bid != "" then
+      $nm = "" .. fm_or($a["name"], "attachment")
+      $sz = m_size_kb($a["size"])
+      $h = $h .. '<div class="cms-actions" style="justify-content:flex-start;gap:var(--space-2);margin-top:0">'
+      $h = $h .. '<a class="btn btn-ghost" href="/jmap/blob/' .. url_encode($bid) .. '" download="' .. esc($nm) .. '">' .. esc($nm) .. '</a>'
+      if $sz != "" then
+        $h = $h .. '<span class="muted small">' .. esc($sz) .. '</span>'
+      end
+      $h = $h .. '</div>'
+    end
+  end
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- Single-message view. $cur = the box KEY we came from (role or mailbox id), $curname =
+-- its human folder name (for the back-link text — a raw id would be an ugly UUID).
+-- The rd_view read-spec for a single message (the shared reader). Subject is the title; From / To
+-- (when present) / Date are the meta rows; the body is a plain-text part rendered via render_body
+-- (markdown, trusted) OR the HTML body shown as STRIPPED TEXT (m_html_to_text — no beacons, esc'd)
+-- OR a no-body notice; attachments ride the footer; Reply is the one action; back → the folder.
+-- Values are RAW — rd_view esc()s once (so NOT m_addr/m_to_join/m_date, which esc() — that would
+-- double-escape); body_html / footer_html are caller-trusted pre-built HTML, exactly as before.
+function m_read_spec($e, $cur, $curname)
+  $subj = trim("" .. cms_or($e["subject"], ""))
+  if $subj == "" then
+    $subj = "(no subject)"
+  end
+  $meta = []
+  push($meta, { "label": "From", value: "" .. cms_or($e["from"], "") })
+  $tolist = $e["to"]
+  if $tolist != nil and length($tolist) > 0 then
+    push($meta, { "label": "To", value: join($tolist, ", ") })
+  end
+  push($meta, { "label": "Date", value: "" .. m_date_raw($e["receivedAt"]) })
+  $bt = m_body_text($e)
+  if $bt != "" then
+    $bodyhtml = render_body($bt)
+  else
+    $txt = m_html_to_text(m_html_body($e))
+    if $txt != "" then
+      $bodyhtml = '<p class="muted small">HTML message — shown as text.</p><div class="m-html-text">' .. esc($txt) .. '</div>'
+    else
+      $bodyhtml = '<p class="muted">This message has no displayable body.</p>'
+    end
+  end
+  $actions = [ { "label": "Reply", variant: "primary", href: "/pim/mail?compose=1&reply=" .. url_encode("" .. $e["id"]) } ]
+  return {
+    title: $subj,
+    meta: $meta,
+    body_html: $bodyhtml,
+    footer_html: m_attachments_html($e),
+    actions: $actions,
+    back: { "label": "" .. cms_or($curname, "Back"), href: "/pim/mail?box=" .. url_encode("" .. cms_or($cur, "")) }
+  }
+end
+
+-- Single-message view → the shared rd_view reader.
+function m_view($e, $cur, $curname)
+  return rd_view(m_read_spec($e, $cur, $curname))
+end
+
+-- ─────────────────────────── compose / send ───────────────────────────
+
+-- (the old per-handler fval() is gone — folded onto forms.mix's fm_val, Phase 2.)
+
+-- Strip CR/LF from a header value so a crafted To/Subject can't smuggle extra
+-- headers into the RFC822 we build (header-injection defence).
+function m_hdr_clean($s)
+  $out = replace("" .. $s, "\r", "")
+  $out = replace($out, "\n", "")
+  return $out
+end
+
+-- Build a minimal RFC822 text/plain message. Header values are CRLF-stripped;
+-- the body's line endings are normalised to CRLF. $from is the account's own
+-- identity address (maild-provided, trusted — still cleaned for uniformity).
+function m_rfc822($from, $to, $cc, $subject, $body)
+  $crlf = "\r\n"
+  $b = replace("" .. $body, "\r\n", "\n")
+  $b = replace($b, "\r", "\n")
+  $b = replace($b, "\n", $crlf)
+  $h = "From: " .. m_hdr_clean($from) .. $crlf
+  $h = $h .. "To: " .. m_hdr_clean($to) .. $crlf
+  -- Cc rides a visible header (recipients see it). Bcc NEVER appears as a header — its
+  -- delivery is the EmailSubmission envelope's job (mail_send), so it can't leak.
+  if trim("" .. $cc) != "" then
+    $h = $h .. "Cc: " .. m_hdr_clean($cc) .. $crlf
+  end
+  $h = $h .. "Subject: " .. m_hdr_clean($subject) .. $crlf
+  $h = $h .. "Date: " .. date_format(time(), "%a, %d %b %Y %H:%M:%S %z") .. $crlf
+  $h = $h .. "MIME-Version: 1.0" .. $crlf
+  $h = $h .. "Content-Type: text/plain; charset=utf-8" .. $crlf
+  $h = $h .. "Content-Transfer-Encoding: 8bit"
+  return $h .. $crlf .. $crlf .. $b .. $crlf
+end
+
+-- Quote an original message body for a reply: an attribution line + each line prefixed "> ".
+function m_quote_body($orig, $who, $when)
+  if $orig == nil or ("" .. $orig) == "" then
+    return ""
+  end
+  $q = ""
+  for each $line in split("" .. $orig, "\n")
+    $l = replace("" .. $line, "\r", "")
+    if $l == "" then
+      $q = $q .. ">\n"
+    else
+      $q = $q .. "> " .. $l .. "\n"
+    end
+  end
+  $attr = "On " .. ("" .. $when) .. ", " .. ("" .. $who) .. " wrote:"
+  return "\n\n" .. $attr .. "\n" .. $q
+end
+
+-- Lowercased email key for dedupe / self-match. Extracts the <addr> of a "Name <addr>" form,
+-- else uses the whole trimmed string. COMPARISON-ONLY — the Cc value keeps the original
+-- address string. (pos is 1-based; substr is 0-based — the inner addr starts at offset $lt
+-- and runs $gt-$lt-1 codepoints.)
+function m_addr_key($s)
+  $t = trim("" .. $s)
+  $lt = pos("<", $t)
+  if $lt > 0 then
+    $gt = pos(">", $t)
+    if $gt > $lt then
+      $t = substr($t, $lt, $gt - $lt - 1)
+    end
+  end
+  return lower(trim($t))
+end
+
+-- Shared reply prefill from a fetched source → {to, subject, body}. To = sender, subject =
+-- "Re: …" (no double-prefix), body = the quoted original under an attribution line. Reply and
+-- Reply All both use this; Reply All adds Cc on top. ("to" is a reserved word → quoted key.)
+function m_reply_prefill($src)
+  $to = ""
+  if $src["from"] != nil then
+    $to = m_hdr_clean("" .. $src["from"])
+  end
+  $body = ""
+  $obody = m_body_text($src)
+  if $obody != "" then
+    $body = m_quote_body($obody, $to, m_date($src["receivedAt"]))
+  end
+  $subject = ""
+  $osubj = ""
+  if $src["subject"] != nil then
+    $osubj = m_hdr_clean("" .. $src["subject"])
+  end
+  if $osubj != "" then
+    if starts_with(lower($osubj), "re:") then
+      $subject = $osubj
+    else
+      $subject = "Re: " .. $osubj
+    end
+  end
+  return { "to": $to, subject: $subject, body: $body }
+end
+
+-- Reply-All recipient split → {to, cc}. Candidates = the sender, then the original To, then
+-- the original Cc — deduped case-insensitively on the email key, MINUS the user's own identity.
+-- The FIRST candidate is the reply target (To); the rest become Cc (a comma-joined string, the
+-- compose Cc field format). maild projects to/cc as arrays of bare address strings. When the
+-- sender IS the user (a Reply All from Sent), the sender drops out and the first original
+-- recipient becomes To — so the user never addresses themselves (Codex). {to:""} only when
+-- there is no other party at all (e.g. a self-only message); the caller then keeps the
+-- reply default To = sender.
+function m_replyall_recipients($src, $selfemail)
+  $seen = {}
+  if $selfemail != "" then
+    $seen[m_addr_key($selfemail)] = true
+  end
+  $all = []
+  if $src["from"] != nil then
+    push($all, m_hdr_clean("" .. $src["from"]))
+  end
+  for each $lst in [$src["to"], $src["cc"]]
+    if $lst != nil then
+      for each $a in $lst
+        push($all, m_hdr_clean("" .. $a))
+      end
+    end
+  end
+  $to = ""
+  $ccs = []
+  for each $addr in $all
+    $k = m_addr_key($addr)
+    if $k != "" and $seen[$k] != true then
+      $seen[$k] = true
+      if $to == "" then
+        $to = $addr
+      else
+        push($ccs, $addr)
+      end
+    end
+  end
+  return { "to": $to, cc: join($ccs, ", ") }
+end
+
+-- Plain (un-escaped) "YYYY-MM-DD HH:MM" for a textarea body — m_date is the HTML twin (esc'd)
+-- for header display; a forward body is raw text that fm_textarea esc's exactly once.
+function m_date_plain($v)
+  if $v == nil then
+    return ""
+  end
+  $s = "" .. $v
+  if length($s) >= 16 then
+    return replace(substr($s, 0, 16), "T", " ")
+  end
+  return $s
+end
+
+-- Plain comma-joined recipient list (CRLF-stripped, empties dropped) for a forward body.
+function m_addr_list_plain($lst)
+  if $lst == nil then
+    return ""
+  end
+  $parts = []
+  for each $a in $lst
+    $t = m_hdr_clean("" .. $a)
+    if $t != "" then
+      push($parts, $t)
+    end
+  end
+  return join($parts, ", ")
+end
+
+-- Plain-text attachment summary line for a forward body (NO blob carry in v1 — names + sizes
+-- only). "" when there are none.
+function m_attach_summary($e)
+  $atts = $e["attachments"]
+  if $atts == nil or length($atts) == 0 then
+    return ""
+  end
+  $parts = []
+  for each $a in $atts
+    $nm = m_hdr_clean("" .. fm_or($a["name"], "attachment"))
+    $sz = m_size_kb($a["size"])
+    $lbl = $nm
+    if $sz != "" then
+      $lbl = $nm .. " (" .. $sz .. ")"
+    end
+    push($parts, $lbl)
+  end
+  return "[Attachments: " .. join($parts, ", ") .. "]"
+end
+
+-- Forward prefill from a fetched source → {subject, body}. Subject = "Fwd: …" (no double-
+-- prefix; empty when the original has none, mirroring reply). Body = a forwarded-message block
+-- (From/Date/Subject/To + an attachment summary) above the original text. NO To prefill (the
+-- user picks recipients). All pieces are RAW — fm_textarea esc's the textarea value once.
+function m_forward_prefill($src)
+  $osubj = ""
+  if $src["subject"] != nil then
+    $osubj = m_hdr_clean("" .. $src["subject"])
+  end
+  $subject = ""
+  if $osubj != "" then
+    if starts_with(lower($osubj), "fwd:") then
+      $subject = $osubj
+    else
+      $subject = "Fwd: " .. $osubj
+    end
+  end
+  $from = ""
+  if $src["from"] != nil then
+    $from = m_hdr_clean("" .. $src["from"])
+  end
+  $hdr = "---------- Forwarded message ---------\n"
+  $hdr = $hdr .. "From: " .. $from .. "\n"
+  $hdr = $hdr .. "Date: " .. m_date_plain($src["receivedAt"]) .. "\n"
+  $hdr = $hdr .. "Subject: " .. $osubj .. "\n"
+  $tojoin = m_addr_list_plain($src["to"])
+  if $tojoin != "" then
+    $hdr = $hdr .. "To: " .. $tojoin .. "\n"
+  end
+  $att = m_attach_summary($src)
+  if $att != "" then
+    $hdr = $hdr .. $att .. "\n"
+  end
+  $body = "\n\n" .. $hdr .. "\n" .. m_body_text($src)
+  return { subject: $subject, body: $body }
+end
+
+-- Split a comma-separated address list into bare-address strings (CRLF-stripped, trimmed,
+-- empties dropped) → the EmailSubmission envelope rcptTo, so Bcc is DELIVERED without ever
+-- appearing as a header.
+function m_parse_addrs($s)
+  $out = []
+  for each $a in split("" .. $s, ",")
+    $t = trim(m_hdr_clean("" .. $a))
+    if $t != "" then
+      push($out, $t)
+    end
+  end
+  return $out
+end
+
+-- Identity/get → the first identity map {id, email, …}, or nil if the account
+-- has no sending identity. Raises on transport error (caller wraps in try/catch).
+function m_identity()
+  $ir = jmap("Identity/get", {})
+  $il = $ir["list"]
+  if $il == nil or length($il) == 0 then
+    return nil
+  end
+  return $il[0]
+end
+
+-- "No sending identity" card (the account can read but has no Identity to send as).
+function m_no_identity()
+  $h = '<div class="card cms-card-narrow">'
+  $h = $h .. '<h1 style="margin-top:0">No sending identity</h1>'
+  $h = $h .. '<p class="muted">This mail account has no configured identity, so it can’t send mail yet.</p>'
+  $h = $h .. '<div style="margin-top:var(--space-5)"><a class="btn btn-ghost" href="/pim/mail">← Mail</a></div></div>'
+  return $h
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- FULL-PAGE TOOLBAR COMPOSER (2026-06-26). Mirrors the CMS post editor
+-- (apps/h_admin_posts.mix): a top toolbar + a body-only canvas + a single
+-- "Recipients" <dialog> (To/Cc/Bcc/Subject live INSIDE the #m-compose form so
+-- they submit) + a client-side [View]/[Edit] toggle. Reuses the shared .pp-ed /
+-- .pp-bar / .pp-edit-only / .pp-view-only / .is-viewing / .pp-canvas / .pp-view
+-- structural classes + their CSS. The send contract (action=send + to/cc/bcc/
+-- subject/body → mail_send) is unchanged. No modal-compose path any more —
+-- Compose / Reply / Forward navigate here.
+-- ══════════════════════════════════════════════════════════════════════════
+
+-- Composer icon set: reuse fm_icon for shared glyphs, inline-SVG the rest.
+function mc_ic($n)
+  if $n == "eye" then
+    return fm_icon("eye")
+  end
+  if $n == "back" then
+    return fm_icon("arrow-left")
+  end
+  if $n == "edit" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"></path><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>'
+  end
+  if $n == "recipients" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M22 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>'
+  end
+  if $n == "send" then
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"></path><path d="M22 2 15 22l-4-9-9-4 20-7z"></path></svg>'
+  end
+  return ""
+end
+
+-- The recipients-modal footer: a primary [✓ Done] (bottom-right via .md-done), same as the
+-- CMS editor's metadata dialogs.
+function m_done_foot()
+  return '<button type="button" class="btn btn-primary md-done" data-modal-close>' .. fm_icon("check") .. 'Done</button>'
+end
+
+-- Top toolbar. LEFT = [Recipients] (opens md-recipients; always visible — edit OR view). RIGHT =
+-- the View/Edit toggle (narrow/normal; hidden in Wide) + [Send] (always — review-then-send) + [Mail]
+-- (back). Send submits #m-compose
+-- via form=; the recipients dialog's fields submit with it (a showModal()'d dialog stays a DOM
+-- descendant of the form).
+function m_compose_toolbar()
+  $h = '<div class="pp-bar">'
+  $h = $h .. '<div class="pp-bar-left">'
+  -- Recipients is available in BOTH edit and view (not pp-edit-only): you can review the rendered
+  -- message and still adjust who it goes to. (Also keeps it reachable if .is-viewing is set.)
+  $h = $h .. '<button type="button" class="btn btn-primary" data-modal-open="md-recipients">' .. mc_ic("recipients") .. 'Recipients</button>'
+  $h = $h .. '</div>'
+  $h = $h .. '<div class="pp-bar-right">'
+  $h = $h .. '<button type="button" class="btn btn-primary pp-edit-only" data-mc-view>' .. mc_ic("eye") .. 'View</button>'
+  $h = $h .. '<button type="button" class="btn btn-primary pp-view-only" data-mc-edit>' .. mc_ic("edit") .. 'Edit</button>'
+  $h = $h .. '<button type="submit" form="m-compose" class="btn btn-primary">' .. mc_ic("send") .. 'Send</button>'
+  $h = $h .. '<a class="btn btn-primary" href="/pim/mail">' .. mc_ic("back") .. 'Mail</a>'
+  $h = $h .. '</div>'
+  $h = $h .. '</div>'
+  return $h
+end
+
+-- md-recipients body: a read-only From caption + To, Cc/Bcc (side by side), Subject. The SAME
+-- name= keys mail_send() reads (raw values; fm_* esc() once). To is NOT HTML5-`required` — it
+-- lives in a closed dialog (a hidden required control can't be focused → the browser throws on
+-- submit); m_send_guard_script + mail_send's server check are the authority. Cc rides a Cc:
+-- header; Bcc rides the EmailSubmission envelope only (never a header — see m_rfc822).
+function m_recipients_body($from, $to, $cc, $bcc, $subject)
+  $h = '<p class="fm-help mc-from-line">From <strong>' .. esc("" .. $from) .. '</strong></p>'
+  $h = $h .. fm_email("to", "To", { value: $to, placeholder: "name@example.com", autofocus: true })
+  $ccbcc = fm_text("cc", "Cc", { value: $cc, placeholder: "comma-separated (optional)" })
+  $ccbcc = $ccbcc .. fm_text("bcc", "Bcc", { value: $bcc, placeholder: "comma-separated (optional)", help: "hidden from the other recipients", help_tip: true })
+  $h = $h .. fm_grid({ cols: 2 }, $ccbcc)
+  -- class:"wb-title" → wb_preview_script live-fills the preview's heading as you type the subject.
+  $h = $h .. fm_text("subject", "Subject", { value: $subject, class: "wb-title" })
+  return $h
+end
+
+-- The message body — a markdown textarea | live rd_view preview, via the SAME wb_canvas Workbench
+-- as the posts editor (mail IS markdown — the reader renders received textBody the same way). Wide
+-- → 50/50 side-by-side live preview; narrow/normal → the [View]/[Edit] toggle. wb_preview_script
+-- patches the preview <article> via the maild-gated /pim/mail?preview=1 endpoint as you type, and
+-- the subject field's .wb-title live-fills the heading. name="body", round-trip unchanged.
+function m_compose_body_field($body, $subject, $from, $to)
+  $bid = fm_id("body")
+  $ta = '<textarea class="fm-control fm-mono mc-body" id="' .. esc($bid) .. '" name="body" placeholder="Write your message…">' .. esc("" .. $body) .. '</textarea>'
+  -- From · To header (harmonised with the posts preview's author · date byline). The To value is
+  -- id'd so m_compose_toggle_script live-syncs it from the recipients field (#f-to); From is the
+  -- read-only identity. The subject is the title (live via .wb-title); the body renders as markdown.
+  $meta = [ { "label": "From", value: "" .. fm_or($from, "") }, { "label": "To", value: "" .. fm_or($to, ""), id: "mc-meta-to" } ]
+  $spec = { title: $subject, meta: $meta, body_html: render_body("" .. $body), body_id: "mc-preview-body", body_src: "/pim/mail?preview=1", body_input: $bid }
+  return wb_canvas({ edit_html: $ta, read_html: rd_view($spec) })
+end
+
+-- Send guard: on a #m-compose submit with an empty To, open the recipients dialog + focus To
+-- (server-side mail_send stays the authority; this just spares a round-trip). Idempotent.
+function m_send_guard_script()
+  return '<script>(function(){if(window.__mcSend){return}window.__mcSend=1;document.addEventListener("submit",function(e){var f=e.target;if(!f||f.id!=="m-compose"){return}var to=document.getElementById("f-to");if(to&&!to.value.trim()){e.preventDefault();var d=document.getElementById("md-recipients");if(d&&d.showModal&&!d.open){d.showModal()}if(to.focus){to.focus()}}})})();</script>'
+end
+
+-- [View]/[Edit] toggle (flips .is-viewing on .mc-ed; CSS does the show/hide) + live From·To sync:
+-- the recipients To field (#f-to) live-fills the preview's To meta row via textContent (safe — never
+-- innerHTML), mirroring how the subject live-fills the title. The body + subject are kept current by
+-- wb_preview_script, so [View] needs no fill logic. Idempotent (window.__mcTog).
+function m_compose_toggle_script()
+  return '<script>(function(){if(window.__mcTog){return}window.__mcTog=1;document.addEventListener("click",function(e){if(e.target.closest("[data-mc-view]")){e.preventDefault();var r=document.querySelector(".mc-ed");if(r){r.classList.add("is-viewing")}return}if(e.target.closest("[data-mc-edit]")){e.preventDefault();var r2=document.querySelector(".mc-ed");if(r2){r2.classList.remove("is-viewing")}return}});document.addEventListener("input",function(e){var t=e.target;if(t&&t.id==="f-to"){var m=document.getElementById("mc-meta-to");if(m){m.textContent=t.value}}})})();</script>'
+end
+
+-- The full-page composer. SAME 7-arg signature (mail_compose_form + mail_send's error re-render
+-- both call it). $from = identity address (read-only); $err = a flash ("" = none) → a toast.
+function m_compose($from, $to, $cc, $bcc, $subject, $body, $err)
+  $h = '<div class="pp-ed mc-ed" data-from="' .. esc("" .. $from) .. '">'
+  $h = $h .. m_compose_toolbar()
+  if $err != nil and ("" .. $err) != "" then
+    $h = $h .. fm_toast_trigger("" .. $err, "danger")
+  end
+  $h = $h .. '<form method="post" action="/pim/mail" id="m-compose" class="forms-skin fm-form mc-form">'
+  $h = $h .. fm_hidden("action", "send")
+  $h = $h .. '<div class="pp-canvas pp-editor mc-canvas">' .. m_compose_body_field($body, $subject, $from, $to) .. '</div>'
+  $h = $h .. md_modal("md-recipients", { title: "Recipients & subject", subtitle: "Who it goes to, plus the subject line.", size: "lg", footer: m_done_foot() }, m_recipients_body($from, $to, $cc, $bcc, $subject))
+  $h = $h .. '</form>'
+  $h = $h .. '</div>'
+  -- No-JS fallback: a <dialog> is display:none until showModal(), and the JS-only buttons
+  -- (Recipients/View open via JS) do nothing — so with JavaScript OFF, render the Recipients
+  -- dialog INLINE (a normal block in the form flow, fields editable + submitting) and hide the
+  -- inert open/toggle buttons. Send (a real submit) + ← Mail (a link) still work, so compose +
+  -- send works no-JS. (A <noscript><style> is a real cascade rule, not an inline style attr.)
+  $h = $h .. '<noscript><style>#content .mc-ed #md-recipients{display:block;position:static;transform:none;width:auto;max-width:none;max-height:none;margin:var(--space-4) 0}#content .mc-ed #md-recipients::backdrop{display:none}#content .mc-ed #md-recipients .md-done{display:none}#content .mc-ed .pp-bar [data-modal-open],#content .mc-ed .pp-bar [data-mc-view]{display:none}</style></noscript>'
+  $h = $h .. md_script()
+  $h = $h .. m_send_guard_script()
+  $h = $h .. wb_preview_script()
+  $h = $h .. m_compose_toggle_script()
+  return $h
+end
+
+-- GET ?compose=1 — render the compose form, prefilling To from ?to= and, for
+-- ?reply=<id>, the source message's From (→ To) and Subject (→ "Re: …").
+function mail_compose_form($user, $q)
+  -- GET ?compose=1 → the full-page composer (m_compose), blank or prefilled from
+  -- ?to= / ?reply= / ?replyall= / ?forward=. The old &modal=1 fragment path is retired.
+  $to = ""
+  $cc = ""
+  $bcc = ""
+  $subject = ""
+  $body = ""
+  -- Prefill values are CRLF-stripped at the entry point (not only at RFC822
+  -- build time) so the header-injection invariant is visible where the data
+  -- enters, never relying solely on the build-time strip in m_rfc822().
+  if $q["to"] != nil then
+    $to = m_hdr_clean("" .. $q["to"])
+  end
+  $ident = nil
+  try
+    $ident = m_identity()
+    -- Reply (?reply=), Reply All (?replyall=) and Forward (?forward=) each fetch ONE source
+    -- message and prefill the form. Reply / Reply All share m_reply_prefill (To = sender,
+    -- "Re: …", quoted body); Reply All adds Cc = original To+Cc minus the sender + self.
+    -- Forward sets "Fwd: …" + a forwarded-message block, no To prefill, attachments as a text
+    -- summary (no blob carry — v1). One ?…={id} is set per menu item, so the three are
+    -- mutually exclusive; a hand-crafted URL with several falls back to the last set below
+    -- (forward wins), which is harmless. The fetched fields are CRLF-stripped (m_hdr_clean) at
+    -- the entry point — the header-injection invariant lives where the data enters.
+    $rid = $q["reply"]
+    $raid = $q["replyall"]
+    $fwid = $q["forward"]
+    $srcid = ""
+    if $rid != nil and $rid != "" then
+      $srcid = "" .. $rid
+    end
+    if $raid != nil and $raid != "" then
+      $srcid = "" .. $raid
+    end
+    if $fwid != nil and $fwid != "" then
+      $srcid = "" .. $fwid
+    end
+    if $srcid != "" then
+      $gr = jmap("Email/get", { ids: [$srcid], properties: ["from", "to", "cc", "subject", "receivedAt", "textBody", "bodyValues", "attachments"], fetchTextBodyValues: true })
+      $gl = $gr["list"]
+      if $gl != nil and length($gl) > 0 then
+        $src = $gl[0]
+        if $fwid != nil and $fwid != "" then
+          $fp = m_forward_prefill($src)
+          $subject = $fp["subject"]
+          $body = $fp["body"]
+        else
+          $rp = m_reply_prefill($src)
+          $to = $rp["to"]
+          $subject = $rp["subject"]
+          $body = $rp["body"]
+          if $raid != nil and $raid != "" then
+            $selfemail = ""
+            if $ident != nil then
+              $selfemail = "" .. $ident["email"]
+            end
+            -- Reply All re-derives To+Cc together (sender + original recipients minus self);
+            -- a sent-message reply-all thus targets the recipients, not the user. Keep the
+            -- reply default To (sender) only when there's no other party.
+            $ra = m_replyall_recipients($src, $selfemail)
+            if $ra["to"] != "" then
+              $to = $ra["to"]
+            end
+            $cc = $ra["cc"]
+          end
+        end
+      end
+    end
+  catch $e
+    return doc(502, "Mail", $user, m_error())
+  end
+  if $ident == nil then
+    return doc(200, "Mail", $user, m_no_identity())
+  end
+  return doc(200, "New message", $user, m_compose("" .. $ident["email"], $to, $cc, $bcc, $subject, $body, ""))
+end
+
+-- Extract a human-readable reason from a JMAP set response's notCreated entry
+-- ($resp["notCreated"][$key] → {type, description}), "" when absent. Lets a
+-- create/submit failure surface maild's real cause (quota, policy, bad identity)
+-- instead of a bare "could not be created", matching the SPA's error display.
+function m_notcreated_detail($resp, $key)
+  $nc = $resp["notCreated"]
+  if $nc == nil then
+    return ""
+  end
+  $e = $nc[$key]
+  if $e == nil then
+    return ""
+  end
+  if $e["description"] != nil and ("" .. $e["description"]) != "" then
+    return "" .. $e["description"]
+  end
+  if $e["type"] != nil then
+    return "" .. $e["type"]
+  end
+  return ""
+end
+
+-- POST action=send — build the RFC822, upload it, create the Email in Sent, then
+-- EmailSubmission/set to send. On any field/create/submit problem the compose form
+-- is re-rendered with the typed values + a flash; a transport failure → m_error().
+function mail_send($user)
+  $f = parse_form($BODY)
+  -- House pattern: an explicit action field (only `send` today). Anything else
+  -- is an unknown POST — bounce to the list rather than silently sending.
+  $action = fm_val($f,"action")
+  if $action != "" and $action != "send" then
+    return redirect("/pim/mail")
+  end
+  $to = trim(fm_val($f,"to"))
+  $cc = trim(fm_val($f,"cc"))
+  $bcc = trim(fm_val($f,"bcc"))
+  $subject = trim(fm_val($f,"subject"))
+  $body = fm_val($f,"body")
+  $from = ""
+
+  if $to == "" then
+    try
+      $ident0 = m_identity()
+      if $ident0 == nil then
+        return doc(200, "Mail", $user, m_no_identity())
+      end
+      $from = "" .. $ident0["email"]
+    catch $e
+      return doc(502, "Mail", $user, m_error())
+    end
+    return doc(200, "New message", $user, m_compose($from, $to, $cc, $bcc, $subject, $body,"Enter a recipient address."))
+  end
+
+  $err = ""
+  try
+    $ident = m_identity()
+    if $ident == nil then
+      return doc(200, "Mail", $user, m_no_identity())
+    end
+    $identid = "" .. $ident["id"]
+    $from = "" .. $ident["email"]
+
+    -- Destination mailbox: Sent, falling back to Inbox.
+    $roles = m_roles()
+    $sentid = $roles["sent"]
+    if $sentid == nil or $sentid == "" then
+      $sentid = $roles["inbox"]
+    end
+    -- RFC 8621 requires ≥1 mailbox on create; without one maild would reject the
+    -- create with an opaque notCreated, so fail early with an actionable message.
+    if $sentid == nil or $sentid == "" then
+      return doc(200, "New message", $user, m_compose($from, $to, $cc, $bcc, $subject, $body,"No mailbox is available to store the sent message."))
+    end
+
+    -- Build the raw message and upload it as a blob (the compose seam).
+    $msg = m_rfc822($from, $to, $cc, $subject, $body)
+    $blob = jmap_upload($msg, "message/rfc822")
+
+    -- Create the Email in Sent, referencing the uploaded blob.
+    $mbids = {}
+    $mbids[$sentid] = true
+    $cr = jmap("Email/set", { create: { m: { mailboxIds: $mbids, keywords: { "$seen": true }, blobId: $blob } } })
+    $emailid = ""
+    $created = $cr["created"]
+    if $created != nil and $created["m"] != nil then
+      $emailid = "" .. $created["m"]["id"]
+    end
+    if $emailid == "" then
+      $err = "The message could not be created. Please try again."
+      $detail = m_notcreated_detail($cr, "m")
+      if $detail != "" then
+        $err = "The message could not be created: " .. $detail
+      end
+    else
+      -- Submit (send) it.
+      -- Bcc delivery: when a Bcc is present, set an explicit envelope so maild's rcptTo is
+      -- to+cc+bcc (the envelope OVERRIDES header-derivation, so it must list ALL recipients);
+      -- the stored/sent message carries only To+Cc headers, so Bcc never leaks. With no Bcc the
+      -- submit is byte-identical to before (maild derives rcptTo from the To+Cc headers).
+      $subobj = { emailId: $emailid, identityId: $identid }
+      if $bcc != "" then
+        $rcpts = []
+        for each $a in m_parse_addrs($to .. "," .. $cc .. "," .. $bcc)
+          push($rcpts, { email: $a })
+        end
+        $subobj["envelope"] = { mailFrom: { email: $from }, rcptTo: $rcpts }
+      end
+      $sr = jmap("EmailSubmission/set", { create: { s: $subobj } })
+      $screated = $sr["created"]
+      if $screated == nil or $screated["s"] == nil then
+        $err = "The message was saved to Sent but could not be submitted for delivery."
+        $detail = m_notcreated_detail($sr, "s")
+        if $detail != "" then
+          $err = "The message was saved to Sent but could not be sent: " .. $detail
+        end
+      end
+    end
+  catch $e
+    return doc(502, "Mail", $user, m_error())
+  end
+
+  if $err != "" then
+    return doc(200, "New message", $user, m_compose($from, $to, $cc, $bcc, $subject, $body,$err))
+  end
+  return redirect_flash("/pim/mail?box=sent", "Message sent", "success")
+end
+
+-- Mailbox/get → a role→id map (e.g. {"inbox": "…", "sent": "…"}). Raises on
+-- transport error (caller wraps in try/catch → m_error()). Used by the SEND path
+-- (it only needs the Sent id); the read views use m_mailboxes() below.
+function m_roles()
+  $roles = {}
+  $mr = jmap("Mailbox/get", {})
+  $mlist = $mr["list"]
+  if $mlist != nil then
+    for each $m in $mlist
+      $role = $m["role"]
+      if $role != nil and $role != "" then
+        $roles["" .. $role] = "" .. $m["id"]
+      end
+    end
+  end
+  return $roles
+end
+
+-- Mailbox/get → FLAT list of {id, name, role, parentId} for every mailbox (role "" and
+-- parentId "" when absent — so "" == root). The folder TREE (m_folder_tree) builds its
+-- own parentId adjacency from this; pim_mail_main resolves ?box= against it. Captures the
+-- real hierarchy (the dev box nests custom folders), unlike role-only m_roles(). Raises
+-- on transport error (caller wraps).
+function m_mailboxes()
+  $out = []
+  $mr = jmap("Mailbox/get", {})
+  $mlist = $mr["list"]
+  if $mlist != nil then
+    for each $m in $mlist
+      $role = ""
+      if $m["role"] != nil then
+        $role = "" .. $m["role"]
+      end
+      $pid = ""
+      if $m["parentId"] != nil then
+        $pid = "" .. $m["parentId"]
+      end
+      push($out, { id: ("" .. $m["id"]), name: ("" .. $m["name"]), role: $role, parentId: $pid })
+    end
+  end
+  return $out
+end
+
+-- ─────────────────────────── handler ───────────────────────────
+function pim_mail_main()
+  cms_init()
+  $user = current_user($HEADERS)
+
+  -- Feature gate: a vhost may disable Mail (nav link hidden; route 404s here).
+  if not feature("pim_mail") then
+    return feature_off_doc($user, "Mail")
+  end
+
+  -- Auth FIRST (a real jmap() failure must not look like "sign in").
+  if not $SESSION["authenticated"] then
+    if $METHOD == "POST" then
+      return redirect("/auth/login?next=" .. url_encode("/pim/mail"))
+    end
+    -- A compose-modal fetch on an expired session: clean sign-in fragment, not the full
+    -- login shell (which md_script would inject into the dialog). See contacts/calendar.
+    if md_is_modal_request() then
+      return md_session_expired("/pim/mail")
+    end
+    return doc(200, "Mail", $user, m_login())
+  end
+
+  -- POST: a folder action (RMB folder menu: rename / newsub / delete / …), a datatable row /
+  -- bulk message action (auto-RMB row:<verb>:<id> + the multi-select bulk_<name> bar), else
+  -- compose → send. The row:/bulk_ dispatch MUST precede the mail_send() fallthrough — every
+  -- non-folder_ action falls through to send, so an un-routed verb would hit the compose path.
+  if $METHOD == "POST" then
+    $pf0 = parse_form($BODY)
+    -- Live markdown preview for the composer Workbench (wb_preview_script POSTs body= to
+    -- ?preview=1). Pure render_body — no mutation — so it's gated only on the maild session
+    -- (checked above), giving a non-author maild user a preview the CMS-author-gated /admin/preview
+    -- would 403. Mail bodies are markdown (the reader renders textBody the same way).
+    if parse_query($QUERY)["preview"] != nil then
+      return { status: 200, headers: { "Content-Type": "text/html; charset=utf-8", "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store" }, body: render_body("" .. fm_val($pf0, "body")) }
+    end
+    if starts_with("" .. fm_val($pf0, "action"), "folder_") then
+      return m_folder_post($user, $pf0)
+    end
+    -- datatable auto-RMB + multi-select bulk: action="row:<verb>:<id>" or "bulk_<name>" (neither
+    -- has the folder_ prefix, so route them explicitly before the compose/send fallthrough).
+    $rowact = dt_row_action($pf0)
+    if $rowact != nil then
+      return m_row_action($user, $pf0, $rowact)
+    end
+    $bulkact = dt_bulk_action($pf0)
+    if $bulkact != "" then
+      return m_bulk_action($user, $pf0, $bulkact)
+    end
+    return mail_send($user)
+  end
+
+  $q = parse_query($QUERY)
+
+  -- GET ?folder_action= (RMB folder management form — rename / newsub / delete). A modal
+  -- fetch (X-Modal-Fetch) gets the bare md_panel into <dialog id="md-folder">; a no-JS nav
+  -- gets the full-page form.
+  if $q["folder_action"] != nil then
+    return m_folder_form($user, $q)
+  end
+
+  -- GET ?compose=1 (optionally ?to= / ?reply=<id>).
+  if $q["compose"] != nil then
+    return mail_compose_form($user, $q)
+  end
+
+  -- Discover ALL folders (the full mailbox tree: six standard IMAP/JMAP roles + any
+  -- custom folders, e.g. the mail-to-posts Pages/Posts, with their real nesting).
+  $mboxes = []
+  try
+    $mboxes = m_mailboxes()
+  catch $e
+    return doc(502, "Mail", $user, m_error())
+  end
+
+  -- Resolve the requested ?box= (a role key, or a mailbox id for custom folders)
+  -- against the discovered folders; default to Inbox, then the first folder.
+  $cur_folder = nil
+  for each $f in $mboxes
+    if m_folder_box_key($f) == $q["box"] then
+      $cur_folder = $f
+    end
+  end
+  if $cur_folder == nil then
+    for each $f in $mboxes
+      if $f["role"] == "inbox" then
+        $cur_folder = $f
+      end
+    end
+  end
+  if $cur_folder == nil and length($mboxes) > 0 then
+    $cur_folder = $mboxes[0]
+  end
+
+  -- The Folders context panel (sidebar) + folder context-menu chrome ride EVERY mail
+  -- view; site.js mounts the panel and the RMB menu (m_folder_chrome bundles the panel
+  -- template, the cm_menu template, the md-folder dialog shell, and md_script).
+  if $cur_folder == nil then
+    $ftpl = m_folder_chrome("", $mboxes)
+    return doc(200, "Mail", $user, $ftpl .. m_folder_nav("", $mboxes) .. '<div class="card"><p class="muted">No mail folders found.</p></div>')
+  end
+  $box = m_folder_box_key($cur_folder)
+  $boxid = $cur_folder["id"]
+  $boxname = $cur_folder["name"]
+  $ftpl = m_folder_chrome($box, $mboxes)
+
+  -- Single message view.
+  $id = $q["id"]
+  if $id != nil and $id != "" then
+    $e = nil
+    try
+      $gr = jmap("Email/get", { ids: [$id], properties: ["id", "from", "to", "subject", "receivedAt", "keywords", "textBody", "htmlBody", "bodyValues", "attachments"], fetchTextBodyValues: true, fetchHTMLBodyValues: true })
+      $glist = $gr["list"]
+      if $glist != nil and length($glist) > 0 then
+        $e = $glist[0]
+      end
+    catch $e2
+      return doc(502, "Mail", $user, m_error())
+    end
+    if $e == nil then
+      return doc(404, "Mail", $user, $ftpl .. '<div class="card cms-card-narrow"><h1>Message not found</h1><p class="muted"><a href="/pim/mail?box=' .. url_encode($box) .. '">← Back</a></p></div>')
+    end
+    return doc(200, "Mail", $user, $ftpl .. m_view($e, $box, $boxname))
+  end
+
+  -- Message list — shared SSR datatable over maild. Email/query is paginatable +
+  -- sortable by receivedAt, but has NO text search (Phase A) → {text:false,
+  -- sort:true}; the base filter pins the folder. Folder tabs stay handler-local;
+  -- the box is stored on $state so every sort/page link preserves the folder.
+  -- Email needs explicit /get properties (no bodyValues), and dt_jmap reorders
+  -- the /get list to query order (Email/get is unordered). Unread = bold sender
+  -- + subject (Gmail-style), via the cell render lambdas.
+  -- $boxname was resolved above from the folder descriptor. Sent shows recipients.
+  $whocol = "From"
+  if $box == "sent" then
+    $whocol = "To"
+  end
+  $who_cell = fn($e) = m_who_html($e, $box)
+  $subj_cell = fn($e) = m_subj_html($e)
+  $date_cell = fn($e) = '<span class="muted small">' .. m_date($e["receivedAt"]) .. '</span>'
+  -- tooltips reveal the full value of an elided (fixed-layout) cell on hover.
+  $subj_tip = fn($e) = "" .. fm_or($e["subject"], "")
+  $who_tip = fn($e) = m_who_text($e, $box)
+  -- Columns: Subject | From/To | Date — all user-hideable (Columns menu), all visible by
+  -- default, all sortable. Fixed widths (50/30/20, Date right-justified) under fixed_layout
+  -- keep the table from re-measuring on sort and elide overflow. Sort keys map to the JMAP
+  -- comparator (dt_jmap → {property: col}): subject→subject, from→from, receivedAt for Date.
+  -- REQUIRES maild >= 0.4.1 (Email/query subject/from comparators); on an older maild those
+  -- sorts 502, so the serving node's maild must be upgraded BEFORE this tree is deployed there.
+  -- The who column is sortable by `from` only when it shows From — in Sent it shows To, for
+  -- which maild has no comparator, so it stays non-sortable there.
+  $who_sortable = ($box != "sent")
+  -- the COUNTERPART address column (To in normal folders, From in Sent) rides the
+  -- Columns menu default-HIDDEN — so the manager carries every available column
+  -- while only Subject | From/To | Date show by default (Mark 2026-07-12).
+  $othercol = "To"
+  $otherbox = "sent"
+  if $box == "sent" then
+    $othercol = "From"
+    $otherbox = "inbox"
+  end
+  $other_cell = fn($e) = m_who_html($e, $otherbox)
+  $spec = [
+    dt_col("subject", "Subject", "subject", { sortable: true, render: $subj_cell, toggleable: true, width: "50%", tooltip: $subj_tip }),
+    dt_col("who", $whocol, "from", { sortable: $who_sortable, render: $who_cell, toggleable: true, width: "30%", tooltip: $who_tip }),
+    dt_col("other", $othercol, "to", { render: $other_cell, toggleable: true, default_hidden: true, width: "20%" }),
+    dt_col("date", "Date", "receivedAt", { sortable: true, toggleable: true, width: "20%", align: "right", render: $date_cell })
+  ]
+  -- NOTE: full-text SEARCH works (maild 0.4.6 Email/query `text` filter; enabled above). But a
+  -- read/unread filter FUNNEL (a different feature) was tried (JMAP hasKeyword/notKeyword on $seen
+  -- wrapped with the inMailbox base filter via operator:AND) and maild's Email/query returns 502
+  -- for THAT shape — it doesn't support a keyword condition and/or the AND FilterOperator over
+  -- this path. So Mail has search + toolbar + Columns + footer + Compose, but no read/unread
+  -- funnel until maild gains FilterOperator support (a maild/dt_jmap follow-up, not a shared-tree
+  -- change). See _plan/2026-06-20-datatable-universal-parity.md (§ feasibility gaps).
+  -- The standard auto-RMB action set (like every other DT list): View/Reply/Forward = nav;
+  -- Mark read/unread + Delete = one-click mutating POSTs (action=row:<verb>:<id>); Move to… =
+  -- a folder submenu. dt_actions_chrome generates the menu — no hand-built cm_menu. The mutating
+  -- verbs dispatch through m_row_action / m_bulk_action (the SAME JMAP applier for row + bulk).
+  -- Move submenu: one POST-per-folder, current box EXCLUDED (a no-op self-move). Each item posts
+  -- action=row:move:<id> + the dest folder id; m_row_action re-validates the dest server-side.
+  -- The folder id is baked raw into the &/=-split data-cm-fields template — SAFE because a maild
+  -- mailbox id is a ContainerId UUID (hex + hyphens, no &/=); and the dest is UNTRUSTED + re-
+  -- validated (m_folder_find) so even a corrupted id fails to a danger flash, never a wrong move.
+  $movefolders = []
+  for each $mb in $mboxes
+    if ("" .. $mb["id"]) != ("" .. $boxid) then
+      push($movefolders, { "label": m_folder_path($mboxes, $mb["id"]), icon: "folder", post: "/pim/mail", fields: { action: "row:move:{id}", "to": ("" .. $mb["id"]) } })
+    end
+  end
+  $a_view = dt_action("view", { "label": "View", icon: "eye", href: fn($r) = ("/pim/mail?box=" .. url_encode($box) .. "&id=" .. url_encode("" .. $r["id"])) })
+  $a_reply = dt_action("reply", { "label": "Reply", icon: "reply", href: fn($r) = ("/pim/mail?compose=1&reply=" .. url_encode("" .. $r["id"])) })
+  $a_fwd = dt_action("forward", { "label": "Forward", icon: "forward", href: fn($r) = ("/pim/mail?compose=1&forward=" .. url_encode("" .. $r["id"])) })
+  $a_markread = dt_action("markread", { "label": "Mark read", icon: "mail-open", action: "markread" })
+  $a_markunread = dt_action("markunread", { "label": "Mark unread", icon: "mail", action: "markunread" })
+  $a_trash = dt_action("trash", { "label": "Delete", icon: "trash", variant: "action-danger", action: "trash", confirm: "Move to Trash?" })
+  $row_specs = [$a_view, $a_reply, $a_fwd, $a_markread, $a_markunread]
+  -- Move-to-folder only when another folder exists (else the submenu is empty → a dead item).
+  if length($movefolders) > 0 then
+    push($row_specs, dt_action("move", { "label": "Move to…", icon: "folder", submenu: $movefolders }))
+  end
+  push($row_specs, $a_trash)
+  -- Per-row attributes (RAW via row_attrs): data-dt-href = the single-message URL so site.js
+  -- initRowNav makes the WHOLE row a left-click target to open it (the subject cell owns no <a>).
+  -- The RMB cm_bind is now appended automatically by dt_actions_cm_bind, so row_attrs carries
+  -- ONLY the nav href. Closes over $box.
+  $rmb = fn($r) = (' tabindex="0" data-dt-href="' .. esc("/pim/mail?box=" .. url_encode($box) .. "&id=" .. url_encode("" .. $r["id"])) .. '"')
+  $opts = dt_admin_opts({
+    base_route: "/pim/mail", caption: $boxname, noun: "messages",
+    -- page_size 12 (a ladder value) so a normal mailbox paginates (the numbered pager only
+    -- renders past one page). NO "all" sentinel — this list is JMAP-backed (dt_jmap), where size=all →
+    -- limit=1e9 would issue an oversized Email/query window; select-all-across-pages is
+    -- SQL-only for the same reason (JMAP bulk acts on the rendered dt_selected_ids).
+    default_sort: "date", default_dir: "desc", page_size: 12,
+    page_sizes: [6, 12, 25, 50, 100],
+    select_all: false,
+    -- Full-text search over the message list: maild's Email/query honours a `text` filter as of
+    -- maild 0.4.6 (the mail_search FTS5 projection), wired through dt_jmap's text cap.
+    search_placeholder: "Search messages…",
+    fixed_layout: true,
+    row_attrs: $rmb,
+    row_action_specs: $row_specs,
+    -- Rich action set (7 verbs) → RMB context menu ONLY; the visible actions
+    -- column would be noise (sanctioned override — Mark 2026-07-12).
+    row_actions_column: false,
+    -- Multi-select bulk: Delete (→ Trash) + Mark read (replaces the default
+    -- delete-only bar). Per-action icons — Mark read is NOT a trashcan.
+    bulk_id: fn($r) = ("" .. $r["id"]),
+    bulk_actions: [ { "name": "delete", "label": "Delete", icon: "trash", "class": "danger", "confirm": "Move the selected messages to Trash?" }, { "name": "markread", "label": "Mark read", icon: "mail-open" } ],
+    -- Compose navigates to the full-page composer (m_compose); no modal.
+    header_actions: [ { "label": "Compose", "icon": "pencil", "variant": "primary", "href": "/pim/mail?compose=1" } ]
+  })
+  $state = dt_state($QUERY, $spec, $opts)
+  $state["box"] = $box
+  $body = ""
+  try
+    $res = dt_jmap("Email", $spec, $state, { text: true, sort: true }, { inMailbox: $boxid }, ["id", "from", "to", "subject", "receivedAt", "keywords"])
+    $dt = dt_render($spec, $opts, $state, $res["rows"], $res["total"])
+    if dt_wants_partial() then
+      return dt_partial($dt)
+    end
+    -- Folder tabs stay OUTSIDE #dt-region: a sort/page within a folder patches
+    -- only the table; switching folders is a full nav that re-renders the tabs. md_script +
+    -- the md-folder shell ride in $ftpl (m_folder_chrome); compose is now a full-page nav, so
+    -- no md-compose shell on the list.
+    -- The auto-RMB menu template + its modal shell ride the full page (outside #dt-region) via
+    -- dt_actions_chrome; a sort/page partial-swap re-emits each row's data-cm-* binding while the
+    -- template persists. Identical to every other DT list — no bespoke cm_menu.
+    $body = $ftpl .. m_folder_nav($box, $mboxes) .. dt_region($dt, "", true) .. dt_actions_chrome($opts)
+  catch $e3
+    return doc(502, "Mail", $user, m_error())
+  end
+  return doc(200, "Mail", $user, $body)
+end

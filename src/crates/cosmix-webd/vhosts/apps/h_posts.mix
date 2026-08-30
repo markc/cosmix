@@ -1,0 +1,26 @@
+-- posts.mix (h_posts) — the stable blog index (GET /posts). The SAME card-list feed
+-- as the default home (/), but at a fixed URL so the blog survives when `/` is made a
+-- static page via the `home_page_slug` setting (P4). Unlike home it does NOT run
+-- cms_import_emailed_posts() (no jmap cap) — the email-to-post import is home's job;
+-- /posts just lists what's already in cms_posts. Feature-gated on `blog` like the home
+-- feed: off ⇒ the shared "not available" card (404), never a 500.
+--
+-- Reuses blog_feed_doc()/blog_card_view() from h_home.mix (which transitively includes
+-- datatable.mix), so the feed rendering lives in exactly one place.
+include "/opt/cosmix/vhosts/shared/apps/h_home.mix"
+
+function posts_main()
+cms_init()
+$user = current_user($HEADERS)
+if not feature("blog") then
+  return feature_off_doc($user, "Blog")
+end
+-- base_route from the actual request path (mirrors h_home): keeps the feed's
+-- search/pager links correct wherever this route is mounted.
+$base = "" .. $PATH
+if $base == "" then
+  $base = "/posts"
+end
+return blog_feed_doc($user, $base, "Blog")
+
+end

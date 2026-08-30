@@ -1,0 +1,42 @@
+[package]
+name = "cosmix-nspawnd"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Generation-fenced systemd-nspawn host executor"
+
+[[bin]]
+name = "cosmix-nspawnd"
+path = "src/main.rs"
+
+[dependencies]
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus" }
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client", features = ["native"] }
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", features = ["client-helpers"] }
+cosmix_daemon = { package = "cosmix-lib-daemon", path = "../cosmix-lib-daemon" }
+cosmix_log = { package = "cosmix-lib-log", path = "../cosmix-lib-log" }
+cosmix_props = { package = "cosmix-lib-props-store", path = "../cosmix-lib-props-store", features = ["sqlite"] }
+
+async-trait = "0.1"
+blake3.workspace = true
+chrono.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+subtle = "2"
+thiserror = "2"
+tokio.workspace = true
+tracing.workspace = true
+ulid = "1"
+zbus = { version = "5.18", default-features = false, features = ["tokio"] }
+
+[build-dependencies]
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
+
+[dev-dependencies]
+tempfile = "3"

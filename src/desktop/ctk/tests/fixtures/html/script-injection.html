@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+  <body>
+    <p>Before script.</p>
+    <script>SCRIPT_PAYLOAD_SENTINEL_8D4F alert("script element")</script>
+    <style>STYLE_PAYLOAD_SENTINEL_7A2C body { background: url("https://exfil.example/style-element.gif"); }</style>
+    <iframe src="https://hostile.example/frame"><script>alert("frame")</script></iframe>
+    <object data="https://hostile.example/object">object fallback</object>
+    <embed src="https://hostile.example/embed">
+    <form action="https://hostile.example/submit"><input name="secret"></form>
+    <p>After script.</p>
+  </body>
+</html>

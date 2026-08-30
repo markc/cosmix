@@ -1,0 +1,244 @@
+-- h_biz_sw.mix — admin Synergy Wholesale ops (ANY /biz/sw, entry biz_sw_main).
+-- Layout: "Check balance" is a header-RHS action opening a small modal (result)
+-- with any error routed to a toast; the top-of-page wide widget is a domain
+-- lookup (input + inline button) whose whois-like result renders inline below.
+-- A domain in biz.db shows its billing row; one that isn't falls through to a
+-- live Synergy lookup (registry detail if it's in our account, else an
+-- availability check → "available to register" + an add-domain link, or
+-- "registered elsewhere"). Both actions use a small page-local progressive-
+-- enhancement fetch (no full nav) and degrade to a plain GET when JS is off.
+-- Admin-gated (rank 3). Read-only verbs, bounded by sw_mode. Route caps: net + db.
+include "/opt/cosmix/vhosts/shared/apps/biz.mix"
+include "/opt/cosmix/vhosts/shared/apps/sw.mix"
+include "/opt/cosmix/vhosts/shared/lib/lib.mix"
+include "/opt/cosmix/vhosts/shared/widgets/modals.mix"
+
+-- A response header value can't carry CR/LF (header injection) and stays short;
+-- SW error strings are untrusted text.
+function bsw_hdr_safe($s)
+  $t = replace(replace("" .. $s, "\r", " "), "\n", " ")
+  if length($t) > 200 then
+    $t = substr($t, 0, 200)
+  end
+  return $t
+end
+
+-- One label/value row of a detail table. $val is TRUSTED builder html.
+function bsw_row($label, $val)
+  return '<tr><th>' .. html_escape($label) .. '</th><td>' .. $val .. '</td></tr>'
+end
+
+function bsw_dash($v)
+  if $v == nil or ("" .. $v) == "" then
+    return '<span class="muted">—</span>'
+  end
+  return html_escape("" .. $v)
+end
+
+-- lucide "search" glyph for the lookup button (SVG geometry attrs, not style=).
+function bsw_search_icon()
+  return '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m21 21-4.3-4.3"></path></svg>'
+end
+
+-- Registry card — the domain IS in our Synergy account (domainInfo succeeded).
+function bsw_registry_card($dom, $info)
+  $ns = ""
+  if length($info["nameservers"]) > 0 then
+    $ns = join($info["nameservers"], ", ")
+  end
+  $h = '<div class="card sw-card"><h3>' .. html_escape($dom) .. '<span class="sw-badge ok">in your account</span></h3><table class="sw-whois">'
+  $h = $h .. bsw_row("Registry status", bsw_dash($info["status"]))
+  $h = $h .. bsw_row("Expiry", bsw_dash($info["expiry"]))
+  $h = $h .. bsw_row("Nameservers", bsw_dash($ns))
+  $h = $h .. '</table></div>'
+  return $h
+end
+
+-- Available card — not in our account, SW checkDomain says AVAILABLE.
+function bsw_available_card($dom, $chk)
+  $price = ""
+  if ("" .. $chk["price"]) != "" then
+    $price = ' <span class="muted">(wholesale $' .. html_escape("" .. $chk["price"]) .. ')</span>'
+  end
+  $reg = "/biz/domains?new=1&domain=" .. url_encode($dom)
+  $h = '<div class="card sw-card"><h3>' .. html_escape($dom) .. '<span class="sw-badge avail">available</span></h3>'
+  $h = $h .. '<p>Not currently registered — available to register.' .. $price .. '</p>'
+  $h = $h .. '<p><a class="btn btn-primary" href="' .. esc($reg) .. '">Add / register domain</a></p></div>'
+  return $h
+end
+
+-- Taken card — not in our account, SW checkDomain says unavailable.
+function bsw_taken_card($dom)
+  return '<div class="card sw-card"><h3>' .. html_escape($dom) .. '<span class="sw-badge taken">registered elsewhere</span></h3><p class="muted">Registered, but not in your Synergy Wholesale account — no registry detail available here.</p></div>'
+end
+
+-- Billing card — the domain IS in biz.db.
+function bsw_db_card($d)
+  $cn = "customer #" .. ("" .. $d.customer_id)
+  $cust = db_query("SELECT name FROM customers WHERE id = ?1", [to_number($d.customer_id)])
+  if length($cust) > 0 then
+    $cn = "" .. $cust[0].name
+  end
+  $h = '<div class="card sw-card"><h3>In your billing database</h3><table class="sw-whois">'
+  $h = $h .. bsw_row("Customer", '<a href="/biz/customers?view=' .. url_encode("" .. $d.customer_id) .. '">' .. html_escape($cn) .. '</a>')
+  $h = $h .. bsw_row("Category", bsw_dash($d.category))
+  $h = $h .. bsw_row("Status", bsw_dash($d.status))
+  $h = $h .. bsw_row("Cost", html_escape(fmt_aud($d.cost_price_cents)) .. ' <span class="muted small">wholesale</span>')
+  $h = $h .. bsw_row("Price", html_escape(fmt_aud($d.price_cents)) .. ' <span class="muted small">customer</span>')
+  $h = $h .. bsw_row("Next due", bsw_dash($d.next_due))
+  $h = $h .. '</table><p><a class="navlink" href="/biz/domains?view=' .. url_encode("" .. $d.id) .. '">Open in domains →</a></p></div>'
+  return $h
+end
+
+-- Fragment response headers (match md_fragment / dt_partial hardening).
+function bsw_frag_hdrs()
+  return { "Content-Type": "text/html; charset=utf-8", "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store" }
+end
+
+-- Build the lookup result for $dom → { html, error }. DB-FIRST: a domain in
+-- biz.db ALWAYS renders its billing card and never fails the whole lookup on a
+-- SW hiccup — a SW error only becomes a toast (non-empty error) when there is
+-- no DB row to show. A clean "does not exist" is NOT an error — it becomes the
+-- availability card. domainInfo can report a does-not-exist status even on an
+-- ok response, so the status text is checked too, not just the ok flag.
+function bsw_lookup($dom)
+  $db = db_query("SELECT * FROM domains WHERE domain = ?1", [$dom])
+  $has_db = length($db) > 0
+  $info = sw_domain_info($dom)
+  $in_account = false
+  if $info["ok"] and pos("not exist", lower("" .. $info["status"])) == 0 then
+    $in_account = true
+  end
+
+  $h = ""
+  if $in_account then
+    $h = bsw_registry_card($dom, $info)
+  else
+    -- not (or no longer) in our account: does-not-exist (ok=false err, or an
+    -- ok response whose status says so) → availability check; any OTHER SW
+    -- failure is a hard error unless we already have a DB card to fall back on.
+    $notexist = false
+    if $info["ok"] then
+      $notexist = true
+    else
+      if pos("not exist", lower("" .. $info["error"])) > 0 then
+        $notexist = true
+      end
+    end
+    if $notexist then
+      $chk = sw_check_domain($dom, "create")
+      if not $chk["ok"] then
+        if not $has_db then
+          return { html: "", error: "Lookup failed: " .. $chk["error"] }
+        end
+      else
+        if $chk["available"] then
+          $h = bsw_available_card($dom, $chk)
+        else
+          $h = bsw_taken_card($dom)
+        end
+      end
+    else
+      if not $has_db then
+        return { html: "", error: "Lookup failed: " .. $info["error"] }
+      end
+    end
+  end
+  if $has_db then
+    $h = $h .. bsw_db_card($db[0])
+  end
+  return { html: $h, error: "" }
+end
+
+-- Balance → { ok, html (modal panel) } | { ok:false, error }.
+function bsw_balance_panel()
+  $r = sw_balance()
+  if not $r["ok"] then
+    return { ok: false, error: $r["error"] }
+  end
+  $body = '<p class="sw-balance-big">$' .. html_escape($r["balance"]) .. '</p><p class="muted small">Synergy Wholesale account balance.</p>'
+  return { ok: true, balance: $r["balance"], html: md_panel({ title: "Account balance", submit: false, cancel: "Close" }, $body) }
+end
+
+-- The page-local fetch shim: [data-sw-balance] → modal (error→toast); the lookup
+-- form → inline #sw-lookup patch (error→toast). CSP-safe (addEventListener, no
+-- eval). Runs alongside md_script (which owns modal open/close).
+function bsw_page_script()
+  return "<script>(function(){function t(m,k){if(window.Base&&Base.toast){Base.toast(m,k||'danger')}else{alert(m)}}function grab(u,cb){fetch(u,{credentials:'same-origin',headers:{'X-SW-Frag':'1'}}).then(function(r){return r.text().then(function(x){return{r:r,x:x}})}).then(function(o){var e=o.r.headers.get('X-SW-Error');if(e){t(e);return}cb(o.x)}).catch(function(){t('Request failed')})}document.addEventListener('click',function(ev){var b=ev.target.closest('[data-sw-balance]');if(!b){return}ev.preventDefault();grab('/biz/sw?balance=1',function(h){var d=document.getElementById('sw-bal');if(d){d.innerHTML=h;if(window.lucide&&lucide.createIcons){lucide.createIcons()}if(d.showModal&&!d.open){d.showModal()}}})});var f=document.getElementById('sw-lookup-form');if(f){f.addEventListener('submit',function(ev){ev.preventDefault();var i=f.querySelector('input[name=domain]');var dom=((i&&i.value)||'').trim();if(!dom){return}var g=document.getElementById('sw-lookup');if(g){g.textContent='Looking up '+dom+'\\u2026'}grab('/biz/sw?lookup=1&domain='+encodeURIComponent(dom),function(h){if(g){g.innerHTML=h}try{history.replaceState(null,'','/biz/sw?domain='+encodeURIComponent(dom))}catch(x){}})})}})();</script>"
+end
+
+-- The full SSR page. $dom pre-fills the input; $lookup_html seeds #sw-lookup (a
+-- no-JS lookup or a shared ?domain= link); $flash → a load-time toast (the no-JS
+-- balance path). All three empty for a bare GET.
+function biz_sw_page($user, $dom, $lookup_html, $flash)
+  $mode = biz_setting("sw_mode")
+  $bal = '<a class="btn btn-primary" href="/biz/sw?balance=1" data-sw-balance>Check balance</a>'
+  $b = '<div class="cms-head"><h1>Synergy Wholesale</h1><span>' .. $bal .. '</span></div>'
+  $b = $b .. '<p class="muted">Mode: <strong>' .. html_escape($mode) .. '</strong> — change in <a href="/biz/settings" data-modal-open="md-settings" data-modal-src="/biz/settings?modal=1">settings</a>.</p>'
+  if $mode == "off" then
+    $b = $b .. '<div class="card text-danger">SW is off — set a mode + credentials in <a href="/biz/settings" data-modal-open="md-settings" data-modal-src="/biz/settings?modal=1">settings</a>, and whitelist this node\'s IP at Synergy Wholesale, before using these tools.</div>'
+  end
+  $b = $b .. '<div class="card sw-lookup-card"><form id="sw-lookup-form" class="sw-lookup-form" method="get" action="/biz/sw">'
+  $b = $b .. '<input type="hidden" name="lookup" value="1">'
+  $b = $b .. '<input class="sw-lookup-input" type="text" name="domain" autocomplete="off" spellcheck="false" placeholder="example.com.au" value="' .. html_escape($dom) .. '">'
+  $b = $b .. '<button class="btn btn-primary" type="submit">' .. bsw_search_icon() .. ' Domain Lookup</button>'
+  $b = $b .. '</form><div id="sw-lookup" class="sw-lookup-result">' .. $lookup_html .. '</div></div>'
+  $b = $b .. md_shell("sw-bal", { size: "sm" }) .. md_script() .. bsw_page_script()
+  if $flash != "" then
+    $b = $b .. toast_script($flash, "info")
+  end
+  return doc(200, "Synergy Wholesale", $user, $b)
+end
+
+function biz_sw_main()
+  cms_init()
+  biz_init()
+  $user = current_user($HEADERS)
+  if md_is_modal_request() and $user == nil then
+    return md_session_expired("/biz/sw")
+  end
+  $deny = require_role($user, "admin")
+  if $deny != nil then
+    return $deny
+  end
+
+  $q = parse_query($QUERY)
+  $is_frag = has_key($HEADERS, "x-sw-frag")
+
+  -- balance (header button → modal; ?balance=1)
+  if ("" .. cms_or($q["balance"], "")) == "1" then
+    $bp = bsw_balance_panel()
+    if not $bp["ok"] then
+      if $is_frag then
+        $eh = bsw_frag_hdrs()
+        $eh["X-SW-Error"] = bsw_hdr_safe($bp["error"])
+        return { status: 200, headers: $eh, body: "" }
+      end
+      return biz_sw_page($user, "", "", "Balance check failed: " .. $bp["error"])
+    end
+    if $is_frag then
+      return { status: 200, headers: bsw_frag_hdrs(), body: $bp["html"] }
+    end
+    return biz_sw_page($user, "", "", "SW balance: $" .. $bp["balance"])
+  end
+
+  -- domain lookup (?domain=X)
+  $dom = lower(trim("" .. cms_or($q["domain"], "")))
+  if $dom != "" then
+    $res = bsw_lookup($dom)
+    if $res["error"] != "" then
+      if $is_frag then
+        $eh = bsw_frag_hdrs()
+        $eh["X-SW-Error"] = bsw_hdr_safe($res["error"])
+        return { status: 200, headers: $eh, body: "" }
+      end
+      return biz_sw_page($user, $dom, '<p class="text-danger">' .. html_escape($res["error"]) .. '</p>', "")
+    end
+    if $is_frag then
+      return { status: 200, headers: bsw_frag_hdrs(), body: $res["html"] }
+    end
+    return biz_sw_page($user, $dom, $res["html"], "")
+  end
+
+  return biz_sw_page($user, "", "", "")
+end

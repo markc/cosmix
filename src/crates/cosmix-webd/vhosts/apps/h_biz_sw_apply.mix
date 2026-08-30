@@ -1,0 +1,189 @@
+-- biz_sw_apply.mix — fast, DB-only endpoint that applies Synergy Wholesale
+-- SOAP results gathered by the standalone worker (_bin/biz_sw_sync.mix).
+-- POST /biz/sw-apply, X-Tick-Secret auth. NO network — all SOAP already
+-- happened in the worker; this only writes biz.db, so it fits webd's 5s
+-- handler deadline (D9: every biz.db write stays inside webd's connection).
+--
+-- Body (JSON):
+--   { syncs: [ {domain_id, expiry, status, ok} ... ],
+--     renewals: [ {job_id, domain_id, ok, registry_expiry, error} ... ] }
+-- Renewal application is idempotent + double-advance-safe: the job flips
+-- running → done via a guarded UPDATE (changes()=1, domain_id-bound), and the
+-- domain advances in the SAME transaction only on that winning flip. A worker that
+-- renewed at the registry but crashed before apply is reconciled by
+-- registry_expiry (the worker reports what domainInfo shows post-renew).
+include "/opt/cosmix/vhosts/shared/apps/biz.mix"
+
+function bsa_authorized()
+  $secret = biz_setting("tick_secret")
+  $hdr = ""
+  if $HEADERS != nil and $HEADERS["x-tick-secret"] != nil then
+    $hdr = "" .. $HEADERS["x-tick-secret"]
+  end
+  return $secret != "" and $hdr != "" and $hdr == $secret
+end
+
+-- GET /biz/sw-apply → the worklist: atomically CLAIMS pending renewal jobs
+-- (pending→running, so the worker's renewDomain call can't be duplicated by a
+-- second worker) and returns the domains due for a read-only expiry sync.
+-- Stale 'running' jobs (worker crashed mid-SOAP >10min ago) are surfaced as
+-- reconcile items — the worker re-checks domainInfo and the POST decides.
+function bsa_worklist()
+  $claim_limit = 10
+  $sync_limit = 40
+  $claimed = []
+  db_exec("BEGIN IMMEDIATE")
+  try
+    if biz_setting("sw_mode") == "live" then
+      $pend = db_query("SELECT j.id, j.domain_id, d.domain FROM jobs j
+                        JOIN domains d ON d.id = j.domain_id
+                        WHERE j.kind = 'renew_domain' AND j.status = 'pending'
+                        ORDER BY j.id LIMIT ?1", [$claim_limit])
+      for each $p in $pend
+        db_exec("UPDATE jobs SET status = 'running', updated = ?2
+                 WHERE id = ?1 AND status = 'pending'", [$p.id, biz_now()])
+        $ch = db_query("SELECT changes() AS n")
+        if to_number($ch[0].n) == 1 then
+          $claimed = concat($claimed, [{ job_id: $p.id, domain_id: $p.domain_id,
+                                         domain: "" .. $p.domain, reconcile: false }])
+        end
+      end
+      -- stale running (crashed worker) → reconcile, not reclaim-and-rerenew
+      $stale = db_query("SELECT j.id, j.domain_id, d.domain, d.expiry FROM jobs j
+                         JOIN domains d ON d.id = j.domain_id
+                         WHERE j.kind = 'renew_domain' AND j.status = 'running'
+                         AND datetime(j.updated) < datetime(?1, '-10 minutes')
+                         ORDER BY j.id LIMIT 5", [biz_now()])
+      for each $s in $stale
+        $claimed = concat($claimed, [{ job_id: $s.id, domain_id: $s.domain_id,
+                                       domain: "" .. $s.domain, reconcile: true,
+                                       prior_expiry: "" .. $s.expiry }])
+      end
+    end
+    db_exec("COMMIT")
+  catch $e
+    try db_exec("ROLLBACK") catch $e2 end
+    return { status: 500, headers: {}, body: "claim failed: " .. $e }
+  end
+  $syncs = []
+  if biz_setting("sw_mode") != "off" then
+    -- skip domains already known not-in-registry (permanent — domainInfo will
+    -- keep failing; the operator resolves them). Everything else rotates by
+    -- oldest sw_synced first.
+    $ds = db_query("SELECT id, domain FROM domains WHERE status = 'active'
+                    AND registrar = 'synergy' AND sw_status != 'not-registered'
+                    ORDER BY sw_synced ASC LIMIT ?1", [$sync_limit])
+    for each $d in $ds
+      $syncs = concat($syncs, [{ domain_id: $d.id, domain: "" .. $d.domain }])
+    end
+  end
+  return { status: 200, headers: { "Content-Type": "application/json" },
+           body: json_encode({ renewals: $claimed, syncs: $syncs }) }
+end
+
+function biz_sw_apply_main()
+  cms_init()
+  biz_init()
+  if not bsa_authorized() then return { status: 403, headers: {}, body: "forbidden" } end
+  if $METHOD == "GET" then return bsa_worklist() end
+  if $METHOD != "POST" then return { status: 405, headers: {}, body: "GET or POST" } end
+  $payload = nil
+  try
+    $payload = json_parse($BODY)
+  catch $e
+    return { status: 400, headers: {}, body: "bad json" }
+  end
+  $stats = { synced: 0, renewed: 0, renew_failed: 0 }
+
+  -- 1. expiry/status syncs (read-only registrar data → domain rows)
+  if $payload["syncs"] != nil then
+    for each $s in $payload["syncs"]
+      $did = to_number($s["domain_id"])
+      if $did != nil then
+        if $s["ok"] == true then
+          db_exec("UPDATE domains SET expiry = ?2, sw_status = ?3, sw_synced = ?4, updated = ?4
+                   WHERE id = ?1", [$did, "" .. $s["expiry"], "" .. $s["status"], biz_now()])
+          $stats["synced"] = $stats["synced"] + 1
+        else
+          -- 'not-registered' = permanent (listDomains reports it but domainInfo
+          -- says it doesn't exist — a dropped/pending/.au-variant); the worklist
+          -- skips these so the sync stops wasting calls. 'sync-error' = transient
+          -- (retried next cycle).
+          $st = "sync-error"
+          if $s["gone"] == true then $st = "not-registered" end
+          db_exec("UPDATE domains SET sw_status = ?3, sw_synced = ?2 WHERE id = ?1",
+                  [$did, biz_now(), $st])
+          -- a newly-dead domain (registry says gone) auto-moves to the 'dead'
+          -- category IF it hadn't been manually categorised (only 'unsorted'/''
+          -- are auto-managed; a hand-set category is preserved).
+          if $s["gone"] == true then
+            db_exec("UPDATE domains SET category = 'dead' WHERE id = ?1
+                     AND category IN ('unsorted', '')", [$did])
+          end
+        end
+      end
+    end
+  end
+
+  -- 2. renewal fulfillment outcomes. Each item carries an action the worker
+  --    determined: "done" (renewDomain OK, or a reconcile confirming the
+  --    registry already advanced), "requeue" (reconcile found NOT renewed →
+  --    back to pending for a fresh attempt), "failed" (renewDomain error).
+  --    Advance a domain ONLY on the guarded running→done flip (changes()=1),
+  --    so a replayed apply can never double-advance.
+  $stats["requeued"] = 0
+  if $payload["renewals"] != nil then
+    for each $rn in $payload["renewals"]
+      $jid = to_number($rn["job_id"])
+      $did = to_number($rn["domain_id"])
+      $act = "" .. $rn["action"]
+      if $jid != nil and $did != nil then
+        if $act == "done" then
+          db_exec("BEGIN IMMEDIATE")
+          try
+            -- only a job the worker actually CLAIMED (running) can complete —
+            -- an unclaimed 'pending' must never be marked done + advanced by a
+            -- stale/replayed apply (Codex P3 round 2)
+            -- bind domain_id too: a malformed apply can't complete a job while
+            -- advancing a DIFFERENT domain than the job actually targets
+            db_exec("UPDATE jobs SET status = 'done', updated = ?3
+                     WHERE id = ?1 AND domain_id = ?2 AND status = 'running'",
+                    [$jid, $did, biz_now()])
+            $ch = db_query("SELECT changes() AS n")
+            if to_number($ch[0].n) == 1 then
+              if ("" .. $rn["registry_expiry"]) != "" then
+                db_exec("UPDATE domains SET expiry = ?2,
+                         next_due = date(next_due, '+1 year'), updated = ?3 WHERE id = ?1",
+                        [$did, "" .. $rn["registry_expiry"], biz_now()])
+              else
+                db_exec("UPDATE domains SET expiry = date(expiry, '+1 year'),
+                         next_due = date(next_due, '+1 year'), updated = ?2 WHERE id = ?1",
+                        [$did, biz_now()])
+              end
+              biz_audit("sw-worker", "domain_renewed", "domains", $did, "job " .. $jid)
+              $stats["renewed"] = $stats["renewed"] + 1
+            end
+            db_exec("COMMIT")
+          catch $e
+            try db_exec("ROLLBACK") catch $e2 end
+          end
+        else
+          if $act == "requeue" then
+            db_exec("UPDATE jobs SET status = 'pending', updated = ?2
+                     WHERE id = ?1 AND status = 'running'", [$jid, biz_now()])
+            $stats["requeued"] = $stats["requeued"] + 1
+          else
+            -- 'failed' also only applies to a claimed (running) job
+            db_exec("UPDATE jobs SET status = 'failed', error = ?2, updated = ?3
+                     WHERE id = ?1 AND status = 'running'",
+                    [$jid, "" .. $rn["error"], biz_now()])
+            $stats["renew_failed"] = $stats["renew_failed"] + 1
+          end
+        end
+      end
+    end
+  end
+
+  return { status: 200, headers: { "Content-Type": "application/json" },
+           body: json_encode($stats) }
+end

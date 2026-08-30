@@ -1,0 +1,41 @@
+-- Regression: `$(...)` is NOT command substitution inside a double-quoted
+-- string — a removed footgun. It used to shell out and run at lex/build time
+-- on the orchestrator. It is now literal text, exactly like in a single-quoted
+-- 'raw' string. `${...}` interpolation is unaffected. The removal is scoped to
+-- double-quoted strings ONLY: the standalone `$(cmd)` expression form and
+-- heredoc `$(...)` still substitute — guarded below so they can't regress.
+
+-- double-quoted: literal, echo must NOT run
+print "dq: $(echo SHOULD_NOT_RUN)"
+
+-- single-quoted raw: literal (always was)
+print 'sq: $(echo SHOULD_NOT_RUN)'
+
+-- ${...} still interpolates a scope value
+$name = "bob"
+print "ip: ${name}"
+
+-- a literal `$` not followed by `{` stays literal, mid-string and trailing
+print "price is $5 and a trailing $"
+
+-- escaped `\$(` is literal too (escape path unchanged; same result as bare `$(`)
+print "esc: \$(echo SHOULD_NOT_RUN)"
+
+-- SCOPE GUARD: standalone `$(cmd)` EXPRESSION still substitutes (shells out)
+$z = $(echo STANDALONE)
+print "expr: " .. trim($z)
+
+-- SCOPE GUARD: heredoc `$(...)` still substitutes (shells out)
+$h = <<HD
+hd: $(echo HEREDOC)
+HD
+print trim($h)
+
+-- Expected output:
+-- dq: $(echo SHOULD_NOT_RUN)
+-- sq: $(echo SHOULD_NOT_RUN)
+-- ip: bob
+-- price is $5 and a trailing $
+-- esc: $(echo SHOULD_NOT_RUN)
+-- expr: STANDALONE
+-- hd: HEREDOC

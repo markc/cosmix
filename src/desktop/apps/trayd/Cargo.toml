@@ -1,0 +1,41 @@
+# desktop/apps/trayd — the session D-Bus authority behind CosMix tray skins.
+# It deliberately does not depend on CTK: this state daemon has no renderer.
+[package]
+name = "cosmix-trayd"
+version = "0.6.1"
+description = "CosMix Tray Daemon — session state and allowlisted actions for tray skins"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+
+[package.metadata.cosmix]
+kind = "daemon"
+component = "trayd"
+display = "CosMix Tray Daemon"
+engine = "none"
+
+[[bin]]
+name = "cosmix-trayd"
+path = "src/main.rs"
+
+[build-dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+
+[dependencies]
+blocking = "1"
+cosmix-bus = { package = "cosmix-lib-bus", path = "../../../crates/cosmix-lib-bus" }
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client" }
+cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config", features = ["client-helpers"] }
+cosmix-mix = { package = "cosmix-lib-mix", path = "../../../crates/cosmix-lib-mix" }
+freedesktop-icons = "0.4"
+inotify = "0.11"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+zbus = { version = "5.18.0", default-features = false, features = ["async-io", "blocking-api"] }
+
+[dev-dependencies]
+tempfile = "3"

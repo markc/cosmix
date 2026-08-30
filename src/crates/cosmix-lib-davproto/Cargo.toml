@@ -1,0 +1,14 @@
+[package]
+name = "cosmix-lib-davproto"
+version = "0.1.2"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CalDAV/CardDAV codecs: JSCalendar<->iCalendar, JSContact<->vCard, ETags (RFC 4791/6352/8984/9553)"
+
+[dependencies]
+serde_json.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+icalendar = "0.16"
+blake3 = "1"

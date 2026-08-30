@@ -1,0 +1,67 @@
+-- slicing.mix: Phase 2 slice/take/drop/zip + negative indexing
+-- Expected output:
+-- 5
+-- 1
+-- 3
+-- o
+-- h
+-- [2, 3, 4]
+-- [3, 4, 5]
+-- [4, 5]
+-- [1, 2, 3]
+-- [1, 2]
+-- [3, 4, 5]
+-- [4, 5]
+-- [1, 2, 3]
+-- hello
+-- hel
+-- llo
+-- [[1, a], [2, b], [3, c]]
+-- [[1, a], [2, b]]
+
+$xs = [1, 2, 3, 4, 5]
+$s = "hello"
+
+-- negative index on list
+print $xs[-1]
+print $xs[0]
+print $xs[-3]
+
+-- negative index on string
+print $s[-1]
+print $s[0]
+
+-- slice: two-arg form (start, end exclusive)
+print slice($xs, 1, 4)
+
+-- slice: negative start
+print slice($xs, -3, 5)
+
+-- slice: no end (through end of list)
+print slice($xs, 3, nil)
+
+-- slice: negative end
+print slice($xs, 0, -2)
+
+-- take (positive)
+print take($xs, 2)
+
+-- take (negative: from end)
+print take($xs, -3)
+
+-- drop (positive)
+print drop($xs, 3)
+
+-- drop (negative: from end)
+print drop($xs, -2)
+
+-- slice on string (returns string)
+print slice($s, 0, 5)
+print slice($s, 0, 3)
+print slice($s, -3, nil)
+
+-- zip
+print zip([1, 2, 3], ["a", "b", "c"])
+
+-- zip: shorter length wins
+print zip([1, 2, 3, 4], ["a", "b"])

@@ -1,0 +1,55 @@
+-- fs_ergo.mix: Phase 4 recursive glob / walk / path_parts
+-- Expected output:
+-- [tests/fs_fixtures/a.txt]
+-- [tests/fs_fixtures/b.md]
+-- [tests/fs_fixtures/a.txt, tests/fs_fixtures/sub1/c.txt, tests/fs_fixtures/sub1/sub2/d.txt]
+-- [tests/fs_fixtures/sub1/sub2/d.txt, tests/fs_fixtures/sub1/sub2/e.log]
+-- 5
+-- 2
+-- 7
+-- /home/user
+-- foo.tar.gz
+-- foo.tar
+-- gz
+-- dir=[]
+-- base=[hello]
+-- mix
+
+-- Single-component glob (existing behaviour, still works)
+print glob("tests/fs_fixtures/*.txt")
+
+-- Glob on different extension
+print glob("tests/fs_fixtures/*.md")
+
+-- Recursive glob: ** + file pattern. Returns a.txt + c.txt + d.txt
+-- (alphabetical). This is the digest two-level walk replacement.
+print glob("tests/fs_fixtures/**/*.txt")
+
+-- Glob with literal component followed by wildcard component
+print glob("tests/fs_fixtures/sub1/*/*")
+
+-- walk() returns all files under the tree
+$all = walk("tests/fs_fixtures")
+print length($all)
+
+-- walk() with max_depth: 0 = direct children only (a.txt + b.md only,
+-- sub1 is skipped entirely because it's a dir and include_dirs=false)
+$shallow = walk("tests/fs_fixtures", {max_depth: 0})
+print length($shallow)
+
+-- walk() with include_dirs: true adds sub1 and sub2 to the file list
+$with_dirs = walk("tests/fs_fixtures", {include_dirs: true})
+print length($with_dirs)
+
+-- path_parts on a multi-extension filename
+$p = path_parts("/home/user/foo.tar.gz")
+print $p.dir
+print $p.base
+print $p.stem
+print $p.ext
+
+-- path_parts on a bare filename (no dir, no extension)
+$p2 = path_parts("hello")
+print "dir=[${p2.dir}]"
+print "base=[${p2.base}]"
+print path_parts("mix").stem

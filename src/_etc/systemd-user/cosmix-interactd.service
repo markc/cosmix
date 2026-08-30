@@ -1,0 +1,24 @@
+# ~/.config/systemd/user/cosmix-interactd.service
+#
+# The freedesktop notification sink needs the logged-in user's session D-Bus.
+# Run this as a user service; the SPEC-10 cosmix-interactd POSIX row reserves
+# namespace/props ownership but is not the runtime identity of this desktop sink.
+#
+# Install:  cp this -> ~/.config/systemd/user/cosmix-interactd.service
+#           systemctl --user daemon-reload
+#           systemctl --user enable --now cosmix-interactd
+
+[Unit]
+Description=Cosmix desktop interaction broker (notify.v1)
+Documentation=https://cosmix.dev
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/opt/cosmix/bin/cosmix-interactd serve
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=graphical-session.target

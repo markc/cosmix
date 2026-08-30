@@ -1,0 +1,22 @@
+name: "phase-8d.4-fix"
+description: "create_blob_ref is upload-staging only"
+priority: 2
+draft: false
+deadline: nil
+allow_list: [
+  "src/crates/cosmix-mds/src/schema/v1_1.sql"
+]
+deny_list: ["mod.rs", "v1.sql", "import.rs", "tests/import.rs"]
+review: {
+  reviewer: "codex",
+  thread_id: "019df0de-096c-7721-9dc6-9511286b168b",
+  rounds: [
+    { round: 1, verdict: "partial" },
+    { round: 2, verdict: "approve" }
+  ]
+}
+metrics: {
+  loc_changed: 1,
+  test_count: 0,
+  partial_fix_risk: 0.05
+}

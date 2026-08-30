@@ -1,0 +1,16 @@
+[package]
+name = "cosmix-deco"
+version = "0.4.0"
+description = "Server-side decoration theme engine for the CosMix desktop: chrome styles, tokens, layout and hit-testing. Dependency-free by design."
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+# Deliberately no dependencies. This crate is pure data + math so it can be
+# used from cosmix-comp (Bevy world), tests, and future tooling (theme
+# preview app, docs generator) without dragging a renderer in. Conversion
+# into Bevy types happens at the call site in cosmix-comp:
+#   bevy::math::Rect  <- deco::Rect      (min/max corners)
+#   bevy::color::Color <- deco::Srgba    (Color::srgba)
+[dependencies]

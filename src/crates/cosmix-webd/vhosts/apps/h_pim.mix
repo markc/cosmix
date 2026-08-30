@@ -1,0 +1,19 @@
+-- h_pim.mix — GET /pim. The original client-side PIM SPA (pim.js + pim.css + the
+-- md.js webmail viewer) was RETIRED in favour of the server-rendered
+-- /pim/{contacts,calendar,mail} pages — there is now ONE PIM implementation (SSR).
+-- /pim lands on the first ENABLED PIM surface (Contacts → Calendar → Mail), so an
+-- old /pim bookmark still resolves even if a vhost disabled Contacts; if every PIM
+-- surface is off it falls back to home. (Capability: Db — feature() reads cms.db.)
+function pim_main()
+  cms_init()
+  if feature("pim_contacts") then
+    return redirect("/pim/contacts")
+  end
+  if feature("pim_calendar") then
+    return redirect("/pim/calendar")
+  end
+  if feature("pim_mail") then
+    return redirect("/pim/mail")
+  end
+  return redirect("/")
+end

@@ -1,0 +1,40 @@
+{
+  version: 1,
+  chord_timeout_ms: 1000,
+  defaults: [
+    { action: "file.open", chord: ["Enter"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "file.new-folder", chord: ["Ctrl+Shift+N"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "file.rename", chord: ["F2"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "file.copy-other-pane", chord: ["Ctrl+C"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "file.move-other-pane", chord: ["Ctrl+X"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "file.delete", chord: ["Delete"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "app.quit", chord: ["Ctrl+Q"], scope: "global", repeat: "ignore", allow_in_editable: false },
+
+    { action: "nav.back", chord: ["Alt+ArrowLeft"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "nav.forward", chord: ["Alt+ArrowRight"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "nav.parent", chord: ["Backspace"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "nav.home", chord: ["Alt+Home"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "nav.switch-pane", chord: ["F6"], scope: "global", repeat: "ignore", allow_in_editable: false },
+
+    { action: "view.refresh", chord: ["F5"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "view.toggle-hidden", chord: ["Ctrl+H"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "view.sort-name", chord: ["Ctrl+1"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "view.sort-size", chord: ["Ctrl+2"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "view.sort-modified", chord: ["Ctrl+3"], scope: "global", repeat: "ignore", allow_in_editable: false },
+
+    { action: "selection.next", chord: ["ArrowDown"], scope: "global", repeat: "allow", allow_in_editable: false },
+    { action: "selection.previous", chord: ["ArrowUp"], scope: "global", repeat: "allow", allow_in_editable: false },
+    { action: "selection.first", chord: ["Home"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "selection.last", chord: ["End"], scope: "global", repeat: "ignore", allow_in_editable: false },
+
+    { action: "theme.mode-toggle", chord: ["Ctrl+Alt+D"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "theme.scheme-ocean", chord: ["Ctrl+Alt+1"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "theme.scheme-crimson", chord: ["Ctrl+Alt+2"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "theme.scheme-stone", chord: ["Ctrl+Alt+3"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "theme.scheme-forest", chord: ["Ctrl+Alt+4"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "theme.scheme-sunset", chord: ["Ctrl+Alt+5"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "theme.scheme-mono", chord: ["Ctrl+Alt+6"], scope: "global", repeat: "ignore", allow_in_editable: false }
+  ],
+  custom: []
+}
+

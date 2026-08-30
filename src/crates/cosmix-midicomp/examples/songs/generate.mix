@@ -1,0 +1,657 @@
+-- cosmix-midicomp example-song generator (Mix).
+--
+-- Builds a dozen short (~30 s) pieces across musical styles, each as a
+-- canonical .asc/.mid pair that satisfies byte-in == byte-out:
+--   1. each build_* function returns {name, text} with the song as midicomp text
+--   2. finalize() compiles it to <name>.mid, decodes that back to the canonical
+--      <name>.asc (so decode(mid) == asc by construction), then re-compiles the
+--      canonical .asc and asserts the bytes equal <name>.mid (byte in == out).
+--
+-- Regenerate from the cos workspace `src/` directory (using the deployed
+-- converter by default):
+--
+--   mix crates/cosmix-midicomp/examples/songs/generate.mix
+--
+-- Optionally override the binary path and output dir as args 1 and 2.
+--
+-- Mix notes (dogfooding): lists are passed BY VALUE into functions, so helpers
+-- return event maps {t, s} and callers push them onto a local list; range(a, b)
+-- is inclusive of both ends; `emit` is a reserved keyword (hence finalize()).
+
+$BIN = "/opt/cosmix/bin/cosmix-midicomp"
+$DIR = "crates/cosmix-midicomp/examples/songs"
+$argv = args()
+if length($argv) > 0 then
+  $BIN = $argv[0]
+end
+if length($argv) > 1 then
+  $DIR = $argv[1]
+end
+
+fn ev($t, $s) = { t: $t, s: $s }
+fn non($t, $ch, $n, $v) = { t: $t, s: "On ch=" .. $ch .. " n=" .. $n .. " v=" .. $v }
+fn noff($t, $ch, $n) = { t: $t, s: "Off ch=" .. $ch .. " n=" .. $n .. " v=0" }
+fn prog($t, $ch, $p) = { t: $t, s: "PrCh ch=" .. $ch .. " p=" .. $p }
+fn cc($t, $ch, $c, $v) = { t: $t, s: "Par ch=" .. $ch .. " c=" .. $c .. " v=" .. $v }
+fn pb($t, $ch, $v) = { t: $t, s: "Pb ch=" .. $ch .. " v=" .. $v }
+fn chpr($t, $ch, $v) = { t: $t, s: "ChPr ch=" .. $ch .. " v=" .. $v }
+fn popr($t, $ch, $n, $v) = { t: $t, s: "PoPr ch=" .. $ch .. " n=" .. $n .. " v=" .. $v }
+
+function render($fmt, $div, $tracks)
+  $out = "MFile " .. $fmt .. " " .. length($tracks) .. " " .. $div .. "\n"
+  for each $trk in $tracks
+    $out = $out .. "MTrk\n"
+    $sorted = sort_by($trk, fn($e) = $e["t"])
+    for each $e in $sorted
+      $out = $out .. $e["t"] .. " " .. $e["s"] .. "\n"
+    end
+    $out = $out .. "TrkEnd\n"
+  end
+  return $out
+end
+
+function finalize($name, $text)
+  $asc = $DIR .. "/" .. $name .. ".asc"
+  $mid = $DIR .. "/" .. $name .. ".mid"
+  write_file($asc, $text)
+  $c = run_rc($BIN .. " -c " .. $asc .. " " .. $mid)
+  if $c.rc != 0 then
+    print("  COMPILE FAIL " .. $name .. ": " .. $c.stderr)
+    return false
+  end
+  -- Decode straight to the .asc via shell redirection: capturing stdout through
+  -- run_rc would strip the trailing newline, leaving a non-canonical file.
+  $d = run_rc($BIN .. " " .. $mid .. " > " .. $asc)
+  if $d.rc != 0 then
+    print("  DECODE FAIL " .. $name .. ": " .. $d.stderr)
+    return false
+  end
+  $c2 = run_rc($BIN .. " -c " .. $asc .. " /tmp/verify.mid")
+  $cmp = run_rc("cmp -s " .. $mid .. " /tmp/verify.mid")
+  if $cmp.rc != 0 then
+    print("  BYTE-IN != BYTE-OUT " .. $name)
+    return false
+  end
+  $sz = run_rc("stat -c%s " .. $mid)
+  print("  ok " .. $name .. " (" .. trim($sz.stdout) .. " bytes)")
+  return true
+end
+
+-- ===================== techno-pulse (format 0) =====================
+function build_techno()
+  $e = []
+  push($e, ev(0, "Meta SeqName \"Techno Pulse\""))
+  push($e, ev(0, "Tempo 468750"))
+  push($e, ev(0, "TimeSig 4/4 24 8"))
+  push($e, prog(0, 1, 38))
+  push($e, prog(0, 2, 81))
+  $bar = 0
+  while $bar < 16
+    $b = $bar * 1920
+    for each $beat in range(0, 3)
+      $t = $b + $beat * 480
+      push($e, non($t, 10, 36, 110))
+      push($e, noff($t + 60, 10, 36))
+      push($e, non($t + 240, 10, 42, 70))
+      push($e, noff($t + 270, 10, 42))
+      $bn = 36
+      if $beat == 2 then $bn = 39 end
+      push($e, non($t, 1, $bn, 100))
+      push($e, noff($t + 220, 1, $bn))
+    end
+    push($e, non($b, 10, 38, 90))
+    push($e, noff($b + 60, 10, 38))
+    push($e, non($b + 960, 10, 38, 90))
+    push($e, noff($b + 1020, 10, 38))
+    if $bar % 4 == 0 then
+      push($e, cc($b, 2, 74, ($bar * 4) % 128))
+      push($e, non($b + 480, 2, 60, 90))
+      push($e, pb($b + 600, 2, 9000))
+      push($e, pb($b + 720, 2, 8192))
+      push($e, noff($b + 900, 2, 60))
+    end
+    $bar = $bar + 1
+  end
+  return { name: "techno-pulse", text: render(0, 480, [$e]) }
+end
+
+-- ===================== vienna-waltz (3/4) =====================
+function build_waltz()
+  $cond = []
+  push($cond, ev(0, "Meta SeqName \"Vienna Waltz\""))
+  push($cond, ev(0, "Tempo 375000"))
+  push($cond, ev(0, "TimeSig 3/4 24 8"))
+  $strings = []
+  push($strings, ev(0, "Meta TrkName \"Strings\""))
+  push($strings, prog(0, 1, 48))
+  $mel = [67, 72, 71, 69, 67, 64, 65, 67, 69, 71, 72, 74]
+  $bar = 0
+  while $bar < 12
+    $b = $bar * 1440
+    $n = $mel[$bar]
+    push($strings, non($b, 1, $n, 88))
+    push($strings, noff($b + 1380, 1, $n))
+    $bar = $bar + 1
+  end
+  $oompah = []
+  push($oompah, ev(0, "Meta TrkName \"Oom-pah\""))
+  push($oompah, prog(0, 2, 0))
+  $bar = 0
+  while $bar < 12
+    $b = $bar * 1440
+    push($oompah, non($b, 2, 36, 80))
+    push($oompah, noff($b + 400, 2, 36))
+    for each $beat in range(1, 2)
+      $t = $b + $beat * 480
+      push($oompah, non($t, 2, 60, 70))
+      push($oompah, non($t, 2, 64, 70))
+      push($oompah, non($t, 2, 67, 70))
+      push($oompah, noff($t + 380, 2, 60))
+      push($oompah, noff($t + 380, 2, 64))
+      push($oompah, noff($t + 380, 2, 67))
+    end
+    $bar = $bar + 1
+  end
+  return { name: "vienna-waltz", text: render(1, 480, [$cond, $strings, $oompah]) }
+end
+
+-- ===================== ambient-drift (tempo changes, sustain) =====================
+function build_ambient()
+  $cond = []
+  push($cond, ev(0, "Meta SeqName \"Ambient Drift\""))
+  push($cond, ev(0, "Tempo 1000000"))
+  push($cond, ev(0, "TimeSig 4/4 24 8"))
+  push($cond, ev(0, "Meta Marker \"intro\""))
+  push($cond, ev(7680, "Tempo 1200000"))
+  push($cond, ev(7680, "Meta Marker \"swell\""))
+  push($cond, ev(15360, "Meta Lyric \"...drifting...\""))
+  push($cond, ev(30720, "Meta TrkEnd"))
+  $pad = []
+  push($pad, ev(0, "Meta TrkName \"Warm Pad\""))
+  push($pad, prog(0, 1, 89))
+  push($pad, cc(0, 1, 64, 127))
+  $roots = [48, 50, 53, 55, 52, 50, 48, 45]
+  $i = 0
+  while $i < 8
+    $t = $i * 3840
+    $r = $roots[$i]
+    push($pad, non($t, 1, $r, 60))
+    push($pad, non($t, 1, $r + 7, 55))
+    push($pad, non($t, 1, $r + 12, 50))
+    push($pad, noff($t + 3700, 1, $r))
+    push($pad, noff($t + 3700, 1, $r + 7))
+    push($pad, noff($t + 3700, 1, $r + 12))
+    $i = $i + 1
+  end
+  push($pad, cc(30720, 1, 64, 0))
+  return { name: "ambient-drift", text: render(1, 480, [$cond, $pad]) }
+end
+
+-- ===================== rock-anthem (SeqNr, KeySig, Text, drums+gtr+bass) =====================
+function build_rock()
+  $cond = []
+  push($cond, ev(0, "Meta SeqName \"Rock Anthem\""))
+  push($cond, ev(0, "SeqNr 1"))
+  push($cond, ev(0, "Tempo 500000"))
+  push($cond, ev(0, "TimeSig 4/4 24 8"))
+  push($cond, ev(0, "KeySig 0 major"))
+  push($cond, ev(0, "Meta Text \"riff in E\""))
+  $gtr = []
+  push($gtr, ev(0, "Meta TrkName \"Power Guitar\""))
+  push($gtr, prog(0, 1, 30))
+  $bass = []
+  push($bass, ev(0, "Meta TrkName \"Bass\""))
+  push($bass, prog(0, 2, 33))
+  $drums = []
+  push($drums, ev(0, "Meta TrkName \"Drums\""))
+  -- 12 bars; power chords (root+5th) on the 'and' of beats, four-on-floor-ish rock beat
+  $chords = [40, 40, 45, 45, 47, 47, 40, 40, 43, 45, 47, 40]
+  $bar = 0
+  while $bar < 12
+    $b = $bar * 1920
+    $root = $chords[$bar]
+    for each $beat in range(0, 3)
+      $t = $b + $beat * 480
+      -- guitar power chord stabs (eighths)
+      push($gtr, non($t, 1, $root, 100))
+      push($gtr, non($t, 1, $root + 7, 95))
+      push($gtr, noff($t + 220, 1, $root))
+      push($gtr, noff($t + 220, 1, $root + 7))
+      push($gtr, non($t + 240, 1, $root, 90))
+      push($gtr, non($t + 240, 1, $root + 7, 85))
+      push($gtr, noff($t + 460, 1, $root))
+      push($gtr, noff($t + 460, 1, $root + 7))
+      -- bass drives eighths on the root
+      push($bass, non($t, 2, $root - 12, 105))
+      push($bass, noff($t + 220, 2, $root - 12))
+      push($bass, non($t + 240, 2, $root - 12, 95))
+      push($bass, noff($t + 460, 2, $root - 12))
+      -- drums: kick on 1&3, snare on 2&4, hats every eighth
+      if $beat % 2 == 0 then
+        push($drums, non($t, 10, 36, 110))
+        push($drums, noff($t + 60, 10, 36))
+      else
+        push($drums, non($t, 10, 38, 105))
+        push($drums, noff($t + 60, 10, 38))
+      end
+      push($drums, non($t, 10, 42, 75))
+      push($drums, noff($t + 30, 10, 42))
+      push($drums, non($t + 240, 10, 42, 70))
+      push($drums, noff($t + 270, 10, 42))
+    end
+    push($drums, non($b + 1440, 10, 49, 90))
+    push($drums, noff($b + 1500, 10, 49))
+    $bar = $bar + 1
+  end
+  return { name: "rock-anthem", text: render(1, 480, [$cond, $gtr, $bass, $drums]) }
+end
+
+-- ===================== blues-shuffle (Pb bends, CC volume) =====================
+function build_blues()
+  $cond = []
+  push($cond, ev(0, "Meta SeqName \"Blues Shuffle\""))
+  push($cond, ev(0, "Tempo 600000"))
+  push($cond, ev(0, "TimeSig 4/4 24 8"))
+  $gtr = []
+  push($gtr, ev(0, "Meta TrkName \"Slide Guitar\""))
+  push($gtr, prog(0, 1, 27))
+  push($gtr, cc(0, 1, 7, 100))
+  $bass = []
+  push($bass, ev(0, "Meta TrkName \"Walking Bass\""))
+  push($bass, prog(0, 2, 32))
+  -- 12-bar blues in A (roots A=45, D=50, E=52). Shuffle = long-short eighths.
+  $prog12 = [45, 45, 45, 45, 50, 50, 45, 45, 52, 50, 45, 52]
+  $bar = 0
+  while $bar < 12
+    $b = $bar * 1920
+    $r = $prog12[$bar]
+    for each $beat in range(0, 3)
+      $t = $b + $beat * 480
+      -- walking bass shuffle (root, then 5th-ish) with swung second eighth
+      push($bass, non($t, 2, $r, 95))
+      push($bass, noff($t + 300, 2, $r))
+      push($bass, non($t + 320, 2, $r + 7, 80))
+      push($bass, noff($t + 460, 2, $r + 7))
+    end
+    -- guitar: a couple of bent licks per bar
+    push($gtr, non($b + 480, 1, $r + 12, 100))
+    push($gtr, pb($b + 540, 1, 8192))
+    push($gtr, pb($b + 620, 1, 9500))
+    push($gtr, pb($b + 700, 1, 10240))
+    push($gtr, noff($b + 900, 1, $r + 12))
+    push($gtr, pb($b + 920, 1, 8192))
+    push($gtr, non($b + 960, 1, $r + 15, 95))
+    push($gtr, cc($b + 1200, 1, 7, 80))
+    push($gtr, noff($b + 1380, 1, $r + 15))
+    push($gtr, cc($b + 1440, 1, 7, 100))
+    $bar = $bar + 1
+  end
+  return { name: "blues-shuffle", text: render(1, 480, [$cond, $gtr, $bass]) }
+end
+
+-- ===================== jazz-swing (ChPr, channel-prefix meta, Cue) =====================
+function build_jazz()
+  $cond = []
+  push($cond, ev(0, "Meta SeqName \"Jazz Swing\""))
+  push($cond, ev(0, "Tempo 410000"))
+  push($cond, ev(0, "TimeSig 4/4 24 8"))
+  push($cond, ev(0, "Meta Cue \"head\""))
+  $piano = []
+  push($piano, ev(0, "Meta TrkName \"Rhodes\""))
+  push($piano, ev(0, "Meta 0x20 00"))      -- channel-prefix meta
+  push($piano, prog(0, 1, 4))
+  $bass = []
+  push($bass, ev(0, "Meta TrkName \"Upright Bass\""))
+  push($bass, prog(0, 2, 32))
+  -- ii-V-I in C: Dm7 G7 Cmaj7 ... walking bass + comped chords with channel pressure swells
+  $walk = [38, 40, 41, 43, 43, 45, 47, 41, 36, 38, 40, 43, 36, 40, 43, 47]
+  $changes = [[38, 41, 45, 48], [43, 47, 50, 53], [36, 40, 43, 47], [36, 40, 43, 47]]
+  $bar = 0
+  while $bar < 8
+    $b = $bar * 1920
+    $idx = $bar % 4
+    $ch = $changes[$idx]
+    -- walking bass: a note per beat
+    for each $beat in range(0, 3)
+      $t = $b + $beat * 480
+      $wn = $walk[($bar * 4 + $beat) % 16]
+      push($bass, non($t, 2, $wn, 90))
+      push($bass, noff($t + 440, 2, $wn))
+    end
+    -- comp the chord on beats 2 and 4 (swing), with a pressure swell
+    push($piano, non($b + 480, 1, $ch[0], 70))
+    push($piano, non($b + 480, 1, $ch[1], 66))
+    push($piano, non($b + 480, 1, $ch[2], 66))
+    push($piano, non($b + 480, 1, $ch[3], 70))
+    push($piano, chpr($b + 560, 1, 40))
+    push($piano, chpr($b + 680, 1, 70))
+    push($piano, noff($b + 860, 1, $ch[0]))
+    push($piano, noff($b + 860, 1, $ch[1]))
+    push($piano, noff($b + 860, 1, $ch[2]))
+    push($piano, noff($b + 860, 1, $ch[3]))
+    push($piano, non($b + 1440, 1, $ch[0], 64))
+    push($piano, non($b + 1440, 1, $ch[2], 62))
+    push($piano, noff($b + 1820, 1, $ch[0]))
+    push($piano, noff($b + 1820, 1, $ch[2]))
+    $bar = $bar + 1
+  end
+  return { name: "jazz-swing", text: render(1, 480, [$cond, $piano, $bass]) }
+end
+
+-- ===================== bossa-nova (PoPr poly pressure, InstrName) =====================
+function build_bossa()
+  $cond = []
+  push($cond, ev(0, "Meta SeqName \"Bossa Nova\""))
+  push($cond, ev(0, "Tempo 480000"))
+  push($cond, ev(0, "TimeSig 4/4 24 8"))
+  $gtr = []
+  push($gtr, ev(0, "Meta TrkName \"Nylon Guitar\""))
+  push($gtr, ev(0, "Meta InstrName \"Nylon-string\""))
+  push($gtr, prog(0, 1, 24))
+  $drums = []
+  push($drums, ev(0, "Meta TrkName \"Brushes\""))
+  $voicings = [[40, 47, 52, 56], [38, 45, 50, 54], [43, 50, 54, 57], [36, 43, 47, 52]]
+  $bar = 0
+  while $bar < 8
+    $b = $bar * 1920
+    $v = $voicings[$bar % 4]
+    -- bossa guitar comp: chord on 1, syncopated stabs; add poly pressure on the held top note
+    push($gtr, non($b, 1, $v[0], 78))
+    push($gtr, non($b, 1, $v[1], 72))
+    push($gtr, non($b, 1, $v[2], 72))
+    push($gtr, non($b, 1, $v[3], 76))
+    push($gtr, popr($b + 200, 1, $v[3], 30))
+    push($gtr, popr($b + 400, 1, $v[3], 55))
+    push($gtr, noff($b + 700, 1, $v[0]))
+    push($gtr, noff($b + 700, 1, $v[1]))
+    push($gtr, noff($b + 700, 1, $v[2]))
+    push($gtr, noff($b + 700, 1, $v[3]))
+    push($gtr, non($b + 960, 1, $v[1], 70))
+    push($gtr, non($b + 960, 1, $v[2], 70))
+    push($gtr, noff($b + 1180, 1, $v[1]))
+    push($gtr, noff($b + 1180, 1, $v[2]))
+    push($gtr, non($b + 1440, 1, $v[0], 68))
+    push($gtr, noff($b + 1700, 1, $v[0]))
+    -- soft clave-ish rim on brushes
+    push($drums, non($b, 10, 37, 60))
+    push($drums, noff($b + 40, 10, 37))
+    push($drums, non($b + 720, 10, 37, 55))
+    push($drums, noff($b + 760, 10, 37))
+    push($drums, non($b + 1200, 10, 37, 58))
+    push($drums, noff($b + 1240, 10, 37))
+    $bar = $bar + 1
+  end
+  return { name: "bossa-nova", text: render(1, 480, [$cond, $gtr, $drums]) }
+end
+
+-- ===================== funk-groove (ghost notes, clavinet, slap bass) =====================
+function build_funk()
+  $cond = []
+  push($cond, ev(0, "Meta SeqName \"Funk Groove\""))
+  push($cond, ev(0, "Tempo 571000"))
+  push($cond, ev(0, "TimeSig 4/4 24 8"))
+  push($cond, ev(0, "Meta Text \"in the pocket\""))
+  $clav = []
+  push($clav, ev(0, "Meta TrkName \"Clavinet\""))
+  push($clav, prog(0, 1, 7))
+  $bass = []
+  push($bass, ev(0, "Meta TrkName \"Slap Bass\""))
+  push($bass, prog(0, 2, 36))
+  $drums = []
+  push($drums, ev(0, "Meta TrkName \"Drums\""))
+  $bar = 0
+  while $bar < 8
+    $b = $bar * 1920
+    -- sixteenth-note clav and bass with ghost (low-velocity) notes
+    for each $s in range(0, 15)
+      $t = $b + $s * 120
+      -- bass: accented root on downbeats, ghosts elsewhere
+      $bv = 38
+      if $s % 4 == 0 then $bv = 110 end
+      push($bass, non($t, 2, 33, $bv))
+      push($bass, noff($t + 90, 2, 33))
+      -- clav: stabs on the off-sixteenths, ghosts in between
+      $cv = 40
+      if $s % 2 == 1 then $cv = 95 end
+      push($clav, non($t, 1, 52, $cv))
+      push($clav, non($t, 1, 55, $cv - 4))
+      push($clav, noff($t + 80, 1, 52))
+      push($clav, noff($t + 80, 1, 55))
+    end
+    -- drums: kick + snare backbeat + 16th hats
+    push($drums, non($b, 10, 36, 110))
+    push($drums, noff($b + 60, 10, 36))
+    push($drums, non($b + 960, 10, 38, 108))
+    push($drums, noff($b + 1020, 10, 38))
+    push($drums, non($b + 1200, 10, 36, 90))
+    push($drums, noff($b + 1260, 10, 36))
+    for each $h in range(0, 7)
+      $t = $b + $h * 240
+      push($drums, non($t, 10, 42, 70))
+      push($drums, noff($t + 30, 10, 42))
+    end
+    $bar = $bar + 1
+  end
+  return { name: "funk-groove", text: render(1, 480, [$cond, $clav, $bass, $drums]) }
+end
+
+-- ===================== classical-minuet (KeySig major + minor, harpsichord, 3/4) =====================
+function build_minuet()
+  $cond = []
+  push($cond, ev(0, "Meta SeqName \"Minuet\""))
+  push($cond, ev(0, "Tempo 500000"))
+  push($cond, ev(0, "TimeSig 3/4 24 8"))
+  push($cond, ev(0, "KeySig 1 major"))     -- G major (1 sharp)
+  push($cond, ev(11520, "KeySig -3 minor")) -- modulate to C minor for the B section
+  $rh = []
+  push($rh, ev(0, "Meta TrkName \"Harpsichord RH\""))
+  push($rh, prog(0, 1, 6))
+  $lh = []
+  push($lh, ev(0, "Meta TrkName \"Harpsichord LH\""))
+  push($lh, prog(0, 2, 6))
+  -- A section (G major) melody, then B section (C minor) — quarter-note melody in 3/4
+  $melA = [67, 62, 64, 66, 67, 67, 69, 67, 66, 64, 62, 67]
+  $bassA = [55, 50, 55, 47, 55, 43]
+  $i = 0
+  while $i < 12
+    $b = $i * 480
+    $n = $melA[$i]
+    push($rh, non($b, 1, $n, 80))
+    push($rh, noff($b + 440, 1, $n))
+    $i = $i + 1
+  end
+  $i = 0
+  while $i < 6
+    $b = $i * 960
+    $n = $bassA[$i]
+    push($lh, non($b, 2, $n, 70))
+    push($lh, noff($b + 900, 2, $n))
+    $i = $i + 1
+  end
+  -- B section in C minor (starts at bar 8 = tick 11520)
+  $melB = [72, 70, 68, 67, 68, 70, 72, 75, 74, 72, 70, 68]
+  $bassB = [48, 43, 48, 44, 47, 48]
+  $i = 0
+  while $i < 12
+    $b = 11520 + $i * 480
+    $n = $melB[$i]
+    push($rh, non($b, 1, $n, 82))
+    push($rh, noff($b + 440, 1, $n))
+    $i = $i + 1
+  end
+  $i = 0
+  while $i < 6
+    $b = 11520 + $i * 960
+    $n = $bassB[$i]
+    push($lh, non($b, 2, $n, 72))
+    push($lh, noff($b + 900, 2, $n))
+    $i = $i + 1
+  end
+  return { name: "classical-minuet", text: render(1, 480, [$cond, $rh, $lh]) }
+end
+
+-- ===================== chiptune-8bit (SysEx, Tempo change, Pb vibrato, Meta 0x08) =====================
+function build_chiptune()
+  $e = []
+  push($e, ev(0, "Meta SeqName \"8-bit Hero\""))
+  push($e, ev(0, "SysEx f0 7e 7f 09 01 f7"))   -- GM System On
+  push($e, ev(0, "Meta 0x08 \"NES-2A03\""))      -- type-8 meta (round-trippable)
+  push($e, ev(0, "Tempo 400000"))               -- 150 BPM
+  push($e, ev(0, "TimeSig 4/4 24 8"))
+  push($e, prog(0, 1, 80))                       -- square lead
+  push($e, prog(0, 2, 80))                       -- square arp
+  push($e, prog(0, 3, 38))                       -- synth bass
+  push($e, ev(15360, "Tempo 360000"))           -- speed up halfway (~166 BPM)
+  -- lead melody (8 bars) + fast arpeggio + bass; vibrato via pitch bend
+  $lead = [72, 72, 79, 72, 71, 69, 67, 69, 71, 72, 74, 72, 67, 69, 71, 72]
+  $arp = [60, 64, 67, 72]
+  $bassline = [36, 36, 41, 43]
+  $bar = 0
+  while $bar < 8
+    $b = $bar * 1920
+    -- lead: two notes per bar (half notes) with a vibrato bend on the 2nd
+    $l1 = $lead[($bar * 2) % 16]
+    $l2 = $lead[($bar * 2 + 1) % 16]
+    push($e, non($b, 1, $l1, 100))
+    push($e, noff($b + 900, 1, $l1))
+    push($e, non($b + 960, 1, $l2, 100))
+    push($e, pb($b + 1100, 1, 8500))
+    push($e, pb($b + 1200, 1, 7900))
+    push($e, pb($b + 1300, 1, 8500))
+    push($e, pb($b + 1400, 1, 8192))
+    push($e, noff($b + 1860, 1, $l2))
+    -- arp: sixteenth-note arpeggio
+    for each $s in range(0, 15)
+      $t = $b + $s * 120
+      $an = $arp[$s % 4]
+      push($e, non($t, 2, $an, 70))
+      push($e, noff($t + 90, 2, $an))
+    end
+    -- bass: quarter notes
+    for each $beat in range(0, 3)
+      $t = $b + $beat * 480
+      $bn = $bassline[$beat]
+      push($e, non($t, 3, $bn, 95))
+      push($e, noff($t + 440, 3, $bn))
+    end
+    $bar = $bar + 1
+  end
+  return { name: "chiptune-8bit", text: render(0, 480, [$e]) }
+end
+
+-- ===================== military-march (2/4, SMPTE, Copyright, InstrName) =====================
+function build_march()
+  $cond = []
+  push($cond, ev(0, "Meta SeqName \"Military March\""))
+  push($cond, ev(0, "Meta Copyright \"Trad. arr. cosmix\""))
+  push($cond, ev(0, "SMPTE 0 0 0 0 0"))
+  push($cond, ev(0, "Tempo 500000"))           -- 120 BPM
+  push($cond, ev(0, "TimeSig 2/4 24 8"))
+  $brass = []
+  push($brass, ev(0, "Meta TrkName \"Brass\""))
+  push($brass, ev(0, "Meta InstrName \"Trumpet section\""))
+  push($brass, prog(0, 1, 56))
+  $snare = []
+  push($snare, ev(0, "Meta TrkName \"Snare\""))
+  -- 16 bars of 2/4 (bar = 960). Brass fanfare + snare rolls.
+  $tune = [60, 60, 67, 67, 64, 62, 60, 67, 72, 67, 64, 60, 62, 64, 67, 60]
+  $bar = 0
+  while $bar < 16
+    $b = $bar * 960
+    $n = $tune[$bar]
+    -- brass: dotted-quarter + eighth feel
+    push($brass, non($b, 1, $n, 100))
+    push($brass, non($b, 1, $n + 4, 92))
+    push($brass, noff($b + 440, 1, $n))
+    push($brass, noff($b + 440, 1, $n + 4))
+    push($brass, non($b + 480, 1, $n, 88))
+    push($brass, noff($b + 900, 1, $n))
+    -- snare: a roll of sixteenths in bar 1 of each 4, else backbeat
+    if $bar % 4 == 3 then
+      for each $s in range(0, 7)
+        $t = $b + $s * 120
+        push($snare, non($t, 10, 38, 70 + $s * 4))
+        push($snare, noff($t + 60, 10, 38))
+      end
+    else
+      push($snare, non($b, 10, 38, 95))
+      push($snare, noff($b + 60, 10, 38))
+      push($snare, non($b + 480, 10, 38, 85))
+      push($snare, noff($b + 540, 10, 38))
+    end
+    $bar = $bar + 1
+  end
+  return { name: "military-march", text: render(1, 480, [$cond, $brass, $snare]) }
+end
+
+-- ===================== reggae-skank (Arb, SeqSpec, MidiPort meta, Marker) =====================
+function build_reggae()
+  $cond = []
+  push($cond, ev(0, "Meta SeqName \"Reggae Skank\""))
+  push($cond, ev(0, "Tempo 800000"))           -- 75 BPM
+  push($cond, ev(0, "TimeSig 4/4 24 8"))
+  push($cond, ev(0, "Meta Marker \"riddim\""))
+  push($cond, ev(0, "SeqSpec 7d 01 02"))
+  $organ = []
+  push($organ, ev(0, "Meta TrkName \"Skank Organ\""))
+  push($organ, ev(0, "Meta 0x21 00"))           -- MIDI port meta
+  push($organ, prog(0, 1, 17))
+  push($organ, ev(0, "Arb 7a 01"))              -- F7 escape (arbitrary bytes)
+  $bass = []
+  push($bass, ev(0, "Meta TrkName \"Dub Bass\""))
+  push($bass, prog(0, 2, 33))
+  $drums = []
+  push($drums, ev(0, "Meta TrkName \"One Drop\""))
+  $chords = [[45, 52, 57], [50, 57, 62], [43, 50, 55], [45, 52, 57]]
+  $roots = [33, 38, 31, 33]
+  $bar = 0
+  while $bar < 8
+    $b = $bar * 1920
+    $c = $chords[$bar % 4]
+    $r = $roots[$bar % 4]
+    -- skank: organ chord on the offbeats (the 'and' of each beat)
+    for each $beat in range(0, 3)
+      $t = $b + $beat * 480 + 240
+      push($organ, non($t, 1, $c[0], 80))
+      push($organ, non($t, 1, $c[1], 76))
+      push($organ, non($t, 1, $c[2], 76))
+      push($organ, noff($t + 180, 1, $c[0]))
+      push($organ, noff($t + 180, 1, $c[1]))
+      push($organ, noff($t + 180, 1, $c[2]))
+    end
+    -- dub bass: sparse, root on beat 1 and the 'and' of 3
+    push($bass, non($b, 2, $r, 105))
+    push($bass, noff($b + 700, 2, $r))
+    push($bass, non($b + 1200, 2, $r, 95))
+    push($bass, noff($b + 1700, 2, $r))
+    -- one-drop drums: kick + snare together on beat 3, hats on offbeats
+    push($drums, non($b + 960, 10, 36, 105))
+    push($drums, noff($b + 1020, 10, 36))
+    push($drums, non($b + 960, 10, 38, 100))
+    push($drums, noff($b + 1020, 10, 38))
+    for each $beat in range(0, 3)
+      $t = $b + $beat * 480 + 240
+      push($drums, non($t, 10, 42, 65))
+      push($drums, noff($t + 40, 10, 42))
+    end
+    $bar = $bar + 1
+  end
+  return { name: "reggae-skank", text: render(1, 480, [$cond, $organ, $bass, $drums]) }
+end
+
+print("generating example songs...")
+$songs = [
+  build_techno(), build_rock(), build_blues(), build_jazz(),
+  build_bossa(), build_waltz(), build_funk(), build_minuet(),
+  build_chiptune(), build_ambient(), build_march(), build_reggae()
+]
+$pass = 0
+$fail = 0
+for each $s in $songs
+  if finalize($s["name"], $s["text"]) then
+    $pass = $pass + 1
+  else
+    $fail = $fail + 1
+  end
+end
+print("pass=" .. $pass .. " fail=" .. $fail .. " (of " .. length($songs) .. ")")

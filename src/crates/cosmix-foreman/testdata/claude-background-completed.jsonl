@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","session_id":"sess-background-completed","model":"claude-sonnet-4-6","cwd":"/tmp"}
+{"type":"system","subtype":"task_started","task_id":"bash-ok","task_type":"local_bash","is_backgrounded":false,"description":"cargo test --workspace"}
+{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bash-ok","task_type":"local_bash","description":"cargo test --workspace"}]}
+{"type":"system","subtype":"task_updated","task_id":"bash-ok","patch":{"is_backgrounded":true}}
+{"type":"system","subtype":"task_notification","task_id":"bash-ok","status":"completed"}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":100,"num_turns":1,"result":"Tests completed.","session_id":"sess-background-completed","total_cost_usd":0.01,"usage":{"input_tokens":20,"output_tokens":5}}
