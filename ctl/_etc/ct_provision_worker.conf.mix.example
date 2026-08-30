@@ -1,0 +1,52 @@
+-- ct_provision_worker.conf.mix.example — private container-provisioning facts.
+-- Copy to ct_provision_worker.conf.mix in the private hub and replace every
+-- placeholder. PVE nodes must be foreign entries in fleet-roster.conf.mix;
+-- dns_node may be foreign or a mesh member.
+{
+  ct_provision_worker: {
+    schema_version: 1,
+    default_base_url: "https://provision.example.org",
+    default_relid: "2026-01-01-001",
+    preseed_node_min_relid: "2026-01-01-001",
+
+    pve_hosts: ["alpha", "beta"],
+    template_cache_dir: "/var/lib/vz/template/cache",
+    release_root: "/srv/cosmix-factory/releases",
+    release_archive_name: "rootfs.tar.gz",
+    template_prefix: "cosmix-appliance-",
+    template_suffix: "-rootfs.tar.gz",
+    template_storage: "local",
+    rootfs_storage: "local-zfs",
+    network_bridge: "vmbr0",
+    pct_features: "nesting=1,keyctl=1",
+    disk_gib: 8,
+    memory_mib: 2048,
+    cores: 2,
+    ct_mount_root: "/var/lib/lxc",
+    uid_shift_root: 100000,
+    gid_shift_tls: 100510,
+    description_prefix: "example-provision-",
+
+    provision_ip_pool: [
+      {prefix: "192.0.2.", first: 100, last: 130},
+      {prefix: "192.0.2.", first: 224, last: 231}
+    ],
+    allowed_domains: ["services.example.org"],
+    certificate_root: "/etc/ssl",
+    certificate_fullchain_name: "fullchain.pem",
+    certificate_private_key_name: "privkey.pem",
+    credential_fullchain_name: "service_fullchain",
+    credential_private_key_name: "service_privkey",
+
+    dns_node: "gamma",
+    dns_server: "192.0.2.53",
+    preseed_nameserver: "192.0.2.53",
+    dnsmasq_dropin: "/etc/dnsmasq.d/provisioned-containers.conf",
+    dnsmasq_main_config: "/etc/dnsmasq.conf",
+    dnsmasq_conf_dir: "/etc/dnsmasq.d",
+    dnsmasq_lease_file: "/var/lib/misc/dnsmasq.leases",
+    dnsmasq_service: "dnsmasq",
+
+    fault_ready_path: "/var/lib/cosmix-provisiond/fault-ready"
+  }
+}

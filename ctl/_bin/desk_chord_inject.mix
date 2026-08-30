@@ -1,0 +1,133 @@
+#!/usr/bin/env mix
+-- desk_chord_inject.mix — inject one Ctrl+Alt+F<n> chord through ydotool.
+--
+-- This is a local workstation test tool. A uinput keyboard can reach whichever
+-- session owns the seat, so every guard below fails closed before injection:
+-- the caller is root, the configured VT is foreground, a compositor is active
+-- inside the configured local machine, and the configured ydotoold socket
+-- exists. ydotoold must start before the compositor so startup enumeration sees
+-- the virtual keyboard; hotplug visibility cannot be assumed across a machine
+-- boundary.
+--
+-- usage: mix _bin/desk_chord_inject.mix <f-key 1..12> [expected-vt] [unit]
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/desk_chord_inject.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no desk chord injector config at " .. $CONF_PATH ..
+    " — create it from desk_chord_inject.conf.mix.example")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  if type($loaded) != "map" or type($loaded["desk_chord_inject"]) != "map" then
+    print("  ERROR: " .. $CONF_PATH .. " must contain a desk_chord_inject strict-data map")
+    exit(2)
+  end
+  $CONF = validate($loaded["desk_chord_inject"], {
+    schema_version: {type: "integer", enum: [1]},
+    machine_name: {type: "string", nonblank: true},
+    default_vt: {type: "integer", min: 1},
+    ydotool_socket: {type: "string", nonblank: true}
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+if not starts_with($CONF["ydotool_socket"], "/") then
+  print("  ERROR: " .. $CONF_PATH .. ": ydotool_socket must be an absolute path")
+  exit(2)
+end
+
+fn usage($message)
+  print("desk_chord_inject: " .. $message)
+  print("usage: mix _bin/desk_chord_inject.mix <f-key 1..12> [expected-vt] [unit]")
+  exit(2)
+end
+
+$argv = args()
+if len($argv) < 1 or len($argv) > 3 then
+  usage("wrong argument count")
+end
+
+$fkey = to_number($argv[0])
+if $fkey == nil or $fkey < 1 or $fkey > 12 then
+  usage("f-key must be 1..12")
+end
+
+$expected_vt = to_string($CONF["default_vt"])
+if len($argv) > 1 then
+  $expected_vt = $argv[1]
+  if not regex_match("^[0-9]+$", $expected_vt) then
+    usage("expected-vt must be numeric")
+  end
+end
+
+$unit = ""
+if len($argv) > 2 then
+  $unit = $argv[2]
+end
+
+$machine = $CONF["machine_name"]
+$ydotool_socket = $CONF["ydotool_socket"]
+
+$identity = run_argv(["id", "-u"], {timeout: 5})
+$d.die_if($identity["exit_code"] != 0 or trim($identity["stdout"]) != "0",
+  "must run as root")
+
+-- Guard 1: the glass is on the intended VT, not another live session.
+$foreground = run_argv(["fgconsole"], {timeout: 5})
+$d.die_if($foreground["exit_code"] != 0,
+  "REFUSED: cannot read the foreground VT: " .. trim($foreground["stderr"]))
+$fg = trim($foreground["stdout"])
+$d.die_if($fg != $expected_vt,
+  "REFUSED: foreground VT is " .. $fg .. ", expected " .. $expected_vt ..
+  " — a chord now would reach the wrong session")
+
+-- Guard 2: a named unit, or otherwise any compositor process, is active in
+-- the configured local machine. systemd-run propagates pgrep's exit status;
+-- no shell is involved.
+if $unit != "" then
+  $active = run_argv(["systemctl", "-M", $machine, "is-active", $unit], {timeout: 15})
+  $d.die_if($active["exit_code"] != 0 or trim($active["stdout"]) != "active",
+    "REFUSED: unit " .. $unit .. " is not active inside " .. $machine ..
+    " (got '" .. trim($active["stdout"]) .. "')")
+else
+  $compositor = run_argv([
+    "systemd-run", "-M", $machine, "--pipe", "--wait", "--quiet", "--",
+    "pgrep", "-f", "cosmix-comp"
+  ], {timeout: 30})
+  $d.die_if($compositor["exit_code"] != 0,
+    "REFUSED: no cosmix-comp running inside " .. $machine ..
+    " — a chord would land on a bare VT")
+end
+
+-- Guard 3: only the configured ydotoold endpoint may receive the injection.
+$d.die_if(not exists($ydotool_socket),
+  "REFUSED: " .. $ydotool_socket ..
+  " is missing — start ydotoold before the compositor")
+
+-- Linux input keycodes: CTRL=29, ALT=56, F1..F10=59..68, F11=87, F12=88.
+$fcode = 58 + $fkey
+if $fkey == 11 then
+  $fcode = 87
+end
+if $fkey == 12 then
+  $fcode = 88
+end
+
+$press = [
+  "ydotool", "key", "29:1", "56:1", to_string($fcode) .. ":1",
+  to_string($fcode) .. ":0", "56:0", "29:0"
+]
+$injected = run_argv($press, {env: {YDOTOOL_SOCKET: $ydotool_socket}, timeout: 10})
+$d.die_if($injected["exit_code"] != 0,
+  "ydotool failed (exit " .. to_string($injected["exit_code"]) .. "): " ..
+  trim($injected["stderr"]))
+
+print("chord Ctrl+Alt+F" .. to_string($fkey) .. " injected (glass on tty" ..
+  $fg .. ", compositor alive)")

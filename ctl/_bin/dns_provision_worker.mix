@@ -1,0 +1,379 @@
+#!/usr/bin/env mix
+-- dns_provision_worker.mix — provision_dns worker for an already-provisioned
+-- service.
+--
+-- Ensures exactly one dnsmasq host-record (A+PTR) and matching priority-10 MX
+-- record. It never writes dhcp-host or accepts arbitrary record forms. Exact
+-- desired state is a no-op; conflicts fail without mutation. A change uses one
+-- remote Mix transaction: candidate test, atomic replace, full-config test,
+-- restart, then exact A/PTR/MX queries. Pre-restart failures restore the old
+-- bytes and are clean; uncertain transport or restart outcomes are dirty.
+--
+-- The provisiond drain passes a preclaimed envelope on stdin. In drain mode,
+-- terminal exits are 10 for success and 11 for a processed failure.
+
+$d = require("../_lib/deploy_lib.mix")
+$prov = require("../_lib/provisiond_worker_lib.mix")
+
+$argv = args()
+if len($argv) == 0 then
+  print("usage: mix dns_provision_worker.mix --drain-mode [--base-url URL] [--secret-file PATH] < envelope.json")
+  exit(2)
+end
+
+$options = getopt($argv, {
+  "base-url": {arg: true},
+  "secret-file": {arg: true},
+  "drain-mode": {arg: false},
+  preclaimed: {arg: false}
+})
+if len($options["errors"]) != 0 then
+  print("bad options: " .. join($options["errors"], "; "))
+  exit(2)
+end
+if len($options["rest"]) != 0 then
+  print("unexpected arguments: " .. join($options["rest"], " "))
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/dns_provision_worker.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no dns provision worker config at " .. $CONF_PATH)
+  print("         copy _etc/dns_provision_worker.conf.mix.example there and replace every placeholder")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["dns_provision_worker"], {
+    schema_version: {type: "integer", enum: [1]},
+    base_url: {type: "string", nonblank: true},
+    dns_target: {type: "string", nonblank: true},
+    dnsmasq_dropin: {type: "string", nonblank: true},
+    dns_server: {type: "string", nonblank: true}
+  })
+catch $config_error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $config_error)
+  exit(2)
+end
+
+fn conf_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn valid_ipv4($address)
+  $parts = split($address, ".")
+  if len($parts) != 4 then
+    return false
+  end
+  for each $part in $parts
+    if not regex_match("^[0-9]{1,3}$", $part) then
+      return false
+    end
+    $octet = to_number($part)
+    if $octet < 0 or $octet > 255 then
+      return false
+    end
+  end
+  return true
+end
+
+fn valid_fqdn($name)
+  if len($name) == 0 or len($name) > 253 or contains($name, "..") then
+    return false
+  end
+  for each $label in split($name, ".")
+    if len($label) == 0 or len($label) > 63 or
+        not regex_match("^[a-z0-9]([a-z0-9-]*[a-z0-9])?$", $label) then
+      return false
+    end
+  end
+  return true
+end
+
+fn validate_url($url)
+  if (not starts_with($url, "http://") and not starts_with($url, "https://")) or
+      contains($url, "\n") or contains($url, "\r") then
+    conf_error("base_url must be a one-line http:// or https:// URL")
+  end
+end
+
+validate_url($CONF["base_url"])
+if not regex_match("^/[-A-Za-z0-9_./]+[.]conf$", $CONF["dnsmasq_dropin"]) then
+  conf_error("dnsmasq_dropin must be a shell-safe absolute .conf path")
+end
+if not valid_ipv4($CONF["dns_server"]) then
+  conf_error("dns_server must be an IPv4 address")
+end
+
+$ROSTER = $d.roster()
+$DNS_TARGET = $CONF["dns_target"]
+$d.assert_node($ROSTER, $DNS_TARGET)
+$REMOTE = $DNS_TARGET
+if not $d.is_foreign($ROSTER, $DNS_TARGET) then
+  $REMOTE = "root@" .. $d.mesh_ip($DNS_TARGET)
+end
+
+$BASE = $CONF["base_url"]
+$base_override = env("CT_BASE_URL")
+if $base_override != "" then
+  $BASE = $base_override
+end
+if $options["opts"]["base-url"] != nil then
+  $BASE = "" .. $options["opts"]["base-url"]
+end
+validate_url($BASE)
+$DRAIN_MODE = $options["opts"]["drain-mode"] == true
+$SECRET = $prov.load_secret($options["opts"]["secret-file"])
+
+fn drain_exit($outcome)
+  $prov.drain_exit($outcome, $DRAIN_MODE)
+end
+
+$raw = read_stdin()
+$envelope = nil
+try
+  $envelope = json_parse($raw)
+catch $json_error
+  print("ERROR: bad envelope json: " .. $json_error)
+  exit(1)
+end
+try
+  validate($envelope, {
+    job_id: {type: "integer", min: 1},
+    lease_token: {type: "string", nonblank: true},
+    kind: {type: "string", nonblank: true},
+    spec: {type: "map"}
+  })
+catch $message, $validation_error
+  print("ERROR: bad envelope (" .. $validation_error["code"] .. " at " ..
+    $validation_error["details"]["path"] .. "): " .. $message)
+  exit(1)
+end
+if ("" .. $envelope["kind"]) != "provision_dns" then
+  print("ERROR: dns worker got kind " .. ("" .. $envelope["kind"]))
+  exit(1)
+end
+
+$spec = $envelope["spec"]
+try
+  validate($spec, {
+    service_id: {type: "integer", min: 1},
+    fqdn: {type: "string", nonblank: true},
+    ip: {type: "string", nonblank: true}
+  })
+catch $message, $validation_error
+  print("ERROR: bad dns spec (" .. $validation_error["code"] .. " at " ..
+    $validation_error["details"]["path"] .. "): " .. $message)
+  exit(1)
+end
+
+$JOB_ID = $envelope["job_id"]
+$LEASE_TOKEN = "" .. $envelope["lease_token"]
+$FQDN = lower(trim("" .. $spec["fqdn"]))
+$IP = trim("" .. $spec["ip"])
+if not valid_fqdn($FQDN) then
+  print("ERROR: bad dns spec: fqdn is not a valid DNS name")
+  exit(1)
+end
+if not valid_ipv4($IP) then
+  print("ERROR: bad dns spec: ip is not an IPv4 address")
+  exit(1)
+end
+
+fn post_apply($payload)
+  $prov.post_apply(
+    $BASE,
+    $SECRET,
+    $JOB_ID,
+    $LEASE_TOKEN,
+    $payload,
+    "provision_dns"
+  )
+end
+
+fn fail_dns($clean, $message)
+  post_apply({ok: false, cleanup_clean: $clean, error: $message})
+  print("provision_dns failed job " .. $JOB_ID .. ": " .. $message)
+  drain_exit("processed_failed")
+end
+
+-- Prove reachability before entering the transaction. A failure here is clean
+-- because no remote mutation source has been submitted yet.
+$reach_token = "dns-reach-" .. uuid()
+$reach = ssh_mix($REMOTE, 'print("DNS-REACH " .. $token)', {
+  bindings: {token: $reach_token},
+  connect_timeout: 8,
+  timeout: 15,
+  batch: true
+})
+if not $reach["ok"] or not contains($reach["stdout"], "DNS-REACH " .. $reach_token) then
+  fail_dns(true, $DNS_TARGET .. " unreachable or not running the system Mix interpreter: " ..
+    trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+end
+
+-- One remote Mix program owns the whole ENSURE transaction. Values cross the
+-- boundary only as strict-data bindings; the source is static and shell-free.
+$result = ssh_mix($REMOTE, '
+fn fail($message, $clean)
+  if $clean then
+    print("DNS-CLEAN-FAIL: " .. $message)
+  else
+    print("DNS-FAIL: " .. $message)
+  end
+  exit(2)
+end
+
+fn remove_if_file($path)
+  if is_file($path) then
+    remove($path)
+  end
+end
+
+fn restore_atomic($path, $bytes)
+  $restore = $path .. ".rollback-" .. uuid()
+  write_file($restore, $bytes)
+  chmod($restore, 0o644)
+  rename($restore, $path)
+end
+
+$host_record = "host-record=" .. $fqdn .. "," .. $ip
+$mx_record = "mx-host=" .. $fqdn .. "," .. $fqdn .. ",10"
+$original = ""
+if is_file($dropin) then
+  $original = read_file($dropin)
+end
+
+$has_host = false
+$has_mx = false
+for each $line in split($original, "\n")
+  $entry = trim($line)
+  if $entry == $host_record then
+    $has_host = true
+  end
+  if $entry == $mx_record then
+    $has_mx = true
+  end
+  if starts_with($entry, "host-record=" .. $fqdn .. ",") and
+      $entry != $host_record then
+    fail("CONFLICT " .. $fqdn .. " already bound to a different ip: " .. $entry, true)
+  end
+  if starts_with($entry, "host-record=") and ends_with($entry, "," .. $ip) and
+      $entry != $host_record then
+    fail("CONFLICT " .. $ip .. " already bound to a different fqdn: " .. $entry, true)
+  end
+  if starts_with($entry, "mx-host=" .. $fqdn .. ",") and $entry != $mx_record then
+    fail("CONFLICT " .. $fqdn .. " has a different mx-host: " .. $entry, true)
+  end
+end
+
+if $has_host and $has_mx then
+  print("ENSURED-NOOP")
+  exit(0)
+end
+
+$desired = $original
+if $desired != "" and not ends_with($desired, "\n") then
+  $desired = $desired .. "\n"
+end
+if not $has_host then
+  $desired = $desired .. $host_record .. "\n"
+end
+if not $has_mx then
+  $desired = $desired .. $mx_record .. "\n"
+end
+
+$candidate = $dropin .. ".candidate-" .. uuid()
+write_file($candidate, $desired)
+chmod($candidate, 0o644)
+try
+  run("dnsmasq --test --conf-file=" .. $candidate)
+catch $candidate_error
+  remove_if_file($candidate)
+  fail("candidate dnsmasq test failed: " .. $candidate_error, true)
+end
+
+rename($candidate, $dropin)
+try
+  run("dnsmasq --test -C /etc/dnsmasq.conf --conf-dir=/etc/dnsmasq.d")
+catch $full_error
+  try
+    restore_atomic($dropin, $original)
+  catch $restore_error
+    fail("full dnsmasq test failed and rollback failed: " .. $full_error ..
+      "; rollback: " .. $restore_error, false)
+  end
+  fail("full dnsmasq test failed; config rolled back, dnsmasq untouched", true)
+end
+
+try
+  run("systemctl restart dnsmasq")
+catch $restart_error
+  $rollback_error = ""
+  try
+    restore_atomic($dropin, $original)
+    run("systemctl restart dnsmasq")
+  catch $rollback_failure
+    $rollback_error = "" .. $rollback_failure
+  end
+  if $rollback_error != "" then
+    fail("dnsmasq restart failed and rollback also failed; state uncertain: " ..
+      $restart_error .. "; rollback: " .. $rollback_error, false)
+  end
+  fail("dnsmasq restart failed after commit; rollback succeeded but state is uncertain", false)
+end
+print("ENSURED-COMMIT")
+', {
+  bindings: {
+    dropin: $CONF["dnsmasq_dropin"],
+    ip: $IP,
+    fqdn: $FQDN
+  },
+  connect_timeout: 8,
+  timeout: 45,
+  batch: true
+})
+
+if not $result["ok"] then
+  -- A transport failure can arrive after commit. Only the explicit clean
+  -- marker proves the mutation did not land or was restored before restart.
+  $clean = contains($result["stdout"], "DNS-CLEAN-FAIL")
+  fail_dns($clean, $DNS_TARGET .. " dns ensure failed: " ..
+    trim($result["stderr"]) .. " " .. trim($result["stdout"]))
+end
+$outcome = trim($result["stdout"])
+
+fn dig($arguments, $label)
+  $query = run_argv(concat(["dig", "+short", "@" .. $CONF["dns_server"]], $arguments),
+    {timeout: 15})
+  if $query["exit_code"] != 0 then
+    fail_dns(false, "post-ensure DNS " .. $label .. " query failed: " ..
+      trim($query["stderr"]))
+  end
+  return trim($query["stdout"])
+end
+
+-- These exact comparisons prove A, PTR and MX state after either commit or
+-- no-op. Any mismatch is dirty because the remote state may already be live.
+$answer_a = dig([$FQDN], "A")
+if $answer_a != $IP then
+  fail_dns(false, "post-ensure DNS A wrong: " .. $FQDN .. " -> '" ..
+    $answer_a .. "' (want " .. $IP .. ")")
+end
+$answer_ptr = dig(["-x", $IP], "PTR")
+if $answer_ptr != $FQDN .. "." then
+  fail_dns(false, "post-ensure DNS PTR wrong: " .. $IP .. " -> '" ..
+    $answer_ptr .. "' (want " .. $FQDN .. ".)")
+end
+$answer_mx = dig(["MX", $FQDN], "MX")
+if $answer_mx != "10 " .. $FQDN .. "." then
+  fail_dns(false, "post-ensure DNS MX not exact for " .. $FQDN .. ": '" ..
+    $answer_mx .. "' (want '10 " .. $FQDN .. ".')")
+end
+
+post_apply({ok: true, step: "done", fqdn: $FQDN, ip: $IP})
+print("provision_dns job " .. $JOB_ID .. ": " .. $outcome .. " " ..
+  $FQDN .. " -> " .. $IP)
+drain_exit("processed_ok")

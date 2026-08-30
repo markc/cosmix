@@ -12,6 +12,29 @@
 
 $d = require("../_lib/deploy_lib.mix")
 
+$DO_BUILD = true
+$DO_DEPLOY = true
+$BUILD_ONLY = false
+$wanted = []
+for each $arg in args()
+  if $arg == "--report" then
+    $DO_DEPLOY = false
+  else if $arg == "--no-build" then
+    $DO_BUILD = false
+  else if $arg == "--build-only" then
+    $BUILD_ONLY = true
+  else if $arg == "--help" then
+    print("usage: mix build_deploy.mix [--report|--no-build|--build-only] [component...]")
+    print("  components: mix noded maild webd dnsd indexd mcp")
+    exit(0)
+  else if starts_with($arg, "--") then
+    print("  ERROR: unknown flag " .. $arg .. " (try --help)")
+    exit(2)
+  else
+    push($wanted, $arg)
+  end
+end
+
 $SCRIPT_DIR = dirname(realpath($0))
 $CONF_PATH = $d.hub_root() .. "/_etc/build_deploy.conf.mix"
 if not is_file($CONF_PATH) then
@@ -173,30 +196,7 @@ fn build_all()
   print("[build] workspace OK (" .. (time() - $started) .. "s)")
 end
 
--- Parse and validate the complete local selection before cargo or SSH.
-$DO_BUILD = true
-$DO_DEPLOY = true
-$BUILD_ONLY = false
-$wanted = []
-for each $arg in args()
-  if $arg == "--report" then
-    $DO_DEPLOY = false
-  else if $arg == "--no-build" then
-    $DO_BUILD = false
-  else if $arg == "--build-only" then
-    $BUILD_ONLY = true
-  else if $arg == "--help" then
-    print("usage: mix build_deploy.mix [--report|--no-build|--build-only] [component...]")
-    print("  components: mix noded maild webd dnsd indexd mcp")
-    exit(0)
-  else if starts_with($arg, "--") then
-    print("  ERROR: unknown flag " .. $arg .. " (try --help)")
-    exit(2)
-  else
-    push($wanted, $arg)
-  end
-end
-
+-- Validate the complete local selection before cargo or SSH.
 $ROSTER = $d.roster()
 $TARGETS = {}
 for each $component in $COMPONENTS

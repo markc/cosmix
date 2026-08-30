@@ -1,0 +1,17 @@
+-- desk_chord_inject.conf.mix.example — private local workstation settings.
+-- Copy this file to desk_chord_inject.conf.mix in the private control hub and
+-- replace every placeholder before using the injector.
+{
+  desk_chord_inject: {
+    schema_version: 1,
+
+    -- Local systemd machine containing the compositor under test.
+    machine_name: "alpha",
+
+    -- VT that must own the glass before an input chord can be injected.
+    default_vt: 7,
+
+    -- Host-side ydotoold socket created before the compositor starts.
+    ydotool_socket: "/run/ydotoold-example.sock"
+  }
+}

@@ -1,22 +1,27 @@
--- provisiond_worker_lib.mix — shared auth, drain and lease-fence runtime for
--- provisiond workers. Modules are isolated, so every export takes its inputs
--- explicitly and workers call them through the required module value.
+-- provisiond_worker_lib.mix — shared runtime for provisiond workers.
+--
+-- require() isolates this module from its caller, so every exported function
+-- takes its inputs explicitly. The worker-specific payload and remote mutation
+-- stay with the worker; this module owns secret loading, the drain exit-code
+-- contract, and the fenced terminal apply.
 
+-- Load the provisiond secret. Precedence is the explicit --secret-file,
+-- CT_SECRET_FILE, then CREDENTIALS_DIRECTORY/provisiond_secret.
 fn load_secret($explicit_file)
   $path = ""
   $credential_dir = env("CREDENTIALS_DIRECTORY")
   if $credential_dir != "" then
     $path = $credential_dir .. "/provisiond_secret"
   end
-  $configured_file = env("CT_SECRET_FILE")
-  if $configured_file != "" then
-    $path = $configured_file
+  $override = env("CT_SECRET_FILE")
+  if $override != "" then
+    $path = $override
   end
   if $explicit_file != nil and ("" .. $explicit_file) != "" then
     $path = "" .. $explicit_file
   end
   if $path == "" then
-    print("ERROR: no provisiond secret source (need --secret-file, CT_SECRET_FILE, or $CREDENTIALS_DIRECTORY/provisiond_secret)")
+    print("ERROR: no provisiond secret source (need --secret-file, CT_SECRET_FILE, or CREDENTIALS_DIRECTORY/provisiond_secret)")
     exit(1)
   end
   if not is_file($path) then
@@ -31,19 +36,30 @@ fn load_secret($explicit_file)
   return $secret
 end
 
+-- Drain mode reserves 0/10/11 for empty/processed-ok/processed-failed. Outside
+-- drain mode the historical human contract is 0 for success and 1 for failure.
 fn drain_exit($outcome, $drain_mode)
   if $drain_mode then
-    if $outcome == "empty" then exit(0) end
-    if $outcome == "processed_ok" then exit(10) end
-    if $outcome == "processed_failed" then exit(11) end
+    if $outcome == "empty" then
+      exit(0)
+    end
+    if $outcome == "processed_ok" then
+      exit(10)
+    end
+    if $outcome == "processed_failed" then
+      exit(11)
+    end
     exit(1)
   end
-  if $outcome == "processed_failed" then exit(1) end
+  if $outcome == "processed_failed" then
+    exit(1)
+  end
   exit(0)
 end
 
--- The lease token is injected here so no worker can accidentally post an
--- unfenced mutation. A lost lease is terminal and leaves the job to reconcile.
+-- POST a terminal result with the claim's lease fence. A 409 means the lease
+-- was lost or expired, so state is left for reconciliation and the worker
+-- aborts. Any non-200 response is infrastructure failure.
 fn post_apply($base_url, $secret, $job_id, $lease_token, $payload, $label)
   $payload["job_id"] = $job_id
   $payload["lease_token"] = $lease_token
@@ -51,8 +67,12 @@ fn post_apply($base_url, $secret, $job_id, $lease_token, $payload, $label)
     "X-Provision-Secret": $secret,
     "Content-Type": "application/json"
   }
-  $result = http_post($base_url .. "/biz/provision-apply",
-    json_encode($payload), $headers, {timeout: 15})
+  $result = http_post(
+    $base_url .. "/biz/provision-apply",
+    json_encode($payload),
+    $headers,
+    {timeout: 15}
+  )
   $status = to_number($result["status"])
   if $status == 409 then
     print($label .. " apply fenced (lease lost/expired) job " ..
@@ -60,8 +80,8 @@ fn post_apply($base_url, $secret, $job_id, $lease_token, $payload, $label)
     exit(1)
   end
   if $status != 200 then
-    print($label .. " apply failed: " .. ("" .. $result["status"]) ..
-      " " .. ("" .. $result["error"]) .. " " .. ("" .. $result["body"]))
+    print($label .. " apply failed: " .. ("" .. $result["status"]) .. " " ..
+      ("" .. $result["error"]) .. " " .. ("" .. $result["body"]))
     exit(1)
   end
 end

@@ -12,7 +12,9 @@
 
 $d = require("../_lib/deploy_lib.mix")
 
-$RECON = "/opt/cosmix/share/cosmix/ct_reconcile.mix"
+-- The deploy installs the launcher and reconciler as siblings. Locating that
+-- sibling keeps the source-tree and installed layouts on the same contract.
+$RECON = dirname(realpath($0)) .. "/ct_reconcile.mix"
 $LOCK = "/run/cosmix-provisiond/drain.lock"
 $ENV_FILE = "/etc/cosmix/provisiond/env"
 $SECRET_SRC = "/etc/cosmix/provisiond/secret"

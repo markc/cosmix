@@ -29,15 +29,11 @@
 -- root file permanently, so do not delete a probe because it looks obvious.
 --
 -- The functions under test are EXTRACTED VERBATIM from the shipped deployer
--- and sourced, rather than transcribed here: the suite has to fail when the
--- real file changes, and a copy would quietly stop tracking it. Running the
--- deployer itself is not an option — it installs to /usr/local. Destinations
--- are redirected into a per-run scratch tree, so nothing here touches /opt or
--- /usr/local.
---
--- `source()` at run time is why `mix lint` reports one MIX-W2401 on this file:
--- it disables undefined-name analysis. That is inherent to extract-and-source
--- and is the price of testing the shipped text.
+-- and inserted into a generated, single-process test runner rather than
+-- transcribed here: the suite has to fail when the real file changes, and a
+-- copy would quietly stop tracking it. Running the deployer itself is not an
+-- option — it installs to /usr/local. Destinations are redirected into a
+-- per-run scratch tree, so nothing here touches /opt or /usr/local.
 --
 -- Under test: _bin/deploy_desktop.mix
 
@@ -58,6 +54,7 @@ if $DEPLOYER != $DEFAULT_DEPLOYER then
   print "-- text is not testing what its name says."
   print ""
 end
+-- RUNNER-PRELUDE-BEGIN
 $BASE = "/tmp/dt-mtest-" .. pid()
 
 -- The deployer's own destination constants, redirected into the scratch tree.
@@ -71,6 +68,7 @@ $DBUS_DEST = $BASE .. "/dbus-1/services"
 $USER_UNIT_DEST = $BASE .. "/systemd/user"
 $ALL_SLUGS = ["studio", "filemgr", "tray", "trayd", "tower"]
 $REREAD = "\n  (rerun advice)"
+-- RUNNER-PRELUDE-END
 
 -- ------------------------------------------------------------------ extraction
 -- A function runs from its `function NAME(` header to the first line that is
@@ -79,9 +77,6 @@ $REREAD = "\n  (rerun advice)"
 $WANT = ["empty_manifest", "merge_manifest", "write_manifest", "manifest_refusal",
          "load_existing_manifest", "sweep_temps", "flush_ledger", "record_temps",
          "exec_parts", "activation_defects"]
-$FUNCS = $BASE .. "/funcs.mix"
-mkdir($BASE)
-
 $src = split(read_file($DEPLOYER), "\n")
 $out = []
 for each $want in $WANT
@@ -111,8 +106,8 @@ for each $want in $WANT
   end
   push($out, "")
 end
-write_file($FUNCS, join($out, "\n") .. "\n")
 
+-- RUNNER-HELPERS-BEGIN
 $pass = 0
 $failn = 0
 function fail($msg)
@@ -126,8 +121,32 @@ function check($label, $got, $want)
   print "  FAIL  " .. $label .. " (got " .. to_string($got) .. ", want " .. to_string($want) .. ")"
   return false
 end
-source($FUNCS)
+-- RUNNER-HELPERS-END
 
+-- Build one source unit so lint can still analyse this harness without the
+-- dynamic source/include barrier. The child contains only fixture globals,
+-- these local helpers, the deployer's extracted functions, and the probes.
+$self = read_file($0)
+$prelude_begin = "-- RUNNER-" .. "PRELUDE-BEGIN"
+$prelude_end = "-- RUNNER-" .. "PRELUDE-END"
+$helpers_begin = "-- RUNNER-" .. "HELPERS-BEGIN"
+$helpers_end = "-- RUNNER-" .. "HELPERS-END"
+$body_begin = "-- RUNNER-" .. "BODY-BEGIN"
+$prelude = split(split($self, $prelude_begin)[1], $prelude_end)[0]
+$helpers = split(split($self, $helpers_begin)[1], $helpers_end)[0]
+$body = split($self, $body_begin)[1]
+$runner = $prelude .. "\n" .. $helpers .. "\n" .. join($out, "\n") .. "\n" .. $body
+$run = run_argv([$d.mix_bin(), "-"], {stdin: $runner, timeout: 120})
+if $run["stdout"] != "" then
+  print($run["stdout"])
+end
+if $run["stderr"] != "" then
+  eprint($run["stderr"])
+end
+exit($run["exit_code"])
+
+-- RUNNER-BODY-BEGIN
+mkdir($BASE)
 mkdir($DT_DEST)
 mkdir($BIN_DEST)
 mkdir($AUTOSTART_DEST)

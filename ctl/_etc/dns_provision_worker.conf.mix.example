@@ -1,0 +1,11 @@
+-- dns_provision_worker.conf.mix.example — site facts for provision_dns.
+-- Copy this file to dns_provision_worker.conf.mix in the private control hub
+-- and replace every placeholder. dns_target must exist in the fleet roster;
+-- mesh nodes use their inventory address and foreign nodes use their SSH alias.
+dns_provision_worker: {
+  schema_version: 1,
+  base_url: "https://provision.example.org",
+  dns_target: "alpha",
+  dnsmasq_dropin: "/etc/dnsmasq.d/provision.example.org.conf",
+  dns_server: "192.0.2.53"
+}

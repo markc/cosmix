@@ -1,0 +1,191 @@
+#!/usr/bin/env mix
+-- desk_bin_refresh.mix — atomically refresh the compositor test binaries in
+-- the canonical system bin directory used by the local desktop.
+--
+-- The source set comes from the desktop workspace's release target under
+-- $COSMIX. Build both binaries in one cargo invocation so feature unification
+-- and the resulting observed set belong to the same build.
+--
+-- Content identity is the deploy gate because the compositor has no version
+-- flag. Each changed binary is copied to a dot-temp in the destination
+-- directory, verified, then renamed over the live path. Readers therefore see
+-- the old inode or the new inode, never a torn file.
+--
+-- Two complete source-hash passes before publication bound concurrent-build
+-- races. They prove a stable observed set, not a coherent cargo generation;
+-- a final source pass after publication refuses if that set is already stale.
+-- A crash during publication can leave a mixed set, repaired by the next run's
+-- start-of-run temp sweep and complete restage.
+--
+-- Usage: sudo mix _bin/desk_bin_refresh.mix
+
+$d = require("../_lib/deploy_lib.mix")
+
+if len(args()) != 0 then
+  print("  ERROR: desk_bin_refresh.mix takes no arguments")
+  exit(2)
+end
+
+$BUILD = $d.cosmix_root() .. "/src/desktop/target/release"
+$BIN = "/opt/cosmix/bin"
+$NAMES = ["cosmix-comp", "cosmix-quoin-demo"]
+
+$uid = run_argv(["id", "-u"])
+$d.die_if($uid["exit_code"] != 0 or trim($uid["stdout"]) != "0",
+  "must run as root (sudo mix _bin/desk_bin_refresh.mix) — " .. $BIN .. " is root-owned")
+$d.die_if(not flock("/run/cosmix-desk-bin-refresh.lock"),
+  "another desk_bin_refresh run holds the lock")
+
+-- The canonical system bin directory must already exist. Creating it here
+-- would disguise a workstation that has not had the system tier installed.
+$d.die_if(not exists($BIN),
+  $BIN .. " does not exist on this host — install the CosMix system tier first")
+
+-- Enforce one publisher per binary against deploy_desktop.mix's live ledger.
+-- An absent ledger means that deployer has not claimed anything here. A
+-- malformed ledger refuses because ownership cannot be established safely.
+$DD_MANIFEST = dirname($BIN) .. "/share/cosmix-desktop.manifest"
+if exists($DD_MANIFEST) then
+  $dd = load_data($DD_MANIFEST)
+  $d.die_if(type($dd) != "map" or type($dd["installed"]) != "list" or
+      type($dd["shared"]) != "list",
+    "ownership ledger " .. $DD_MANIFEST .. " parsed but lacks list-typed " ..
+    "installed + shared keys — restore it or rerun deploy_desktop.mix")
+
+  -- Shared entries must have the same absolute-path shape enforced by the
+  -- desktop deployer's loader. Otherwise a malformed claim could be skipped.
+  for each $sp in $dd["shared"]
+    $d.die_if(type($sp) != "string" or not starts_with($sp, "/"),
+      "ownership ledger " .. $DD_MANIFEST .. " has a shared entry that is not " ..
+      "an absolute-path string — restore it or rerun deploy_desktop.mix")
+  end
+
+  for each $entry in $dd["installed"]
+    if $entry["bin"] != nil and contains($NAMES, basename($entry["bin"])) then
+      die("ownership clash: " .. $entry["bin"] ..
+        " is claimed by deploy_desktop.mix's manifest — one deployer per name; " ..
+        "move ownership deliberately in both scripts and clear both ledger claim kinds")
+    end
+  end
+
+  -- deploy_desktop preclaims its atomic-install temp names in `shared`, even
+  -- before a binary has been installed. Its ledger is a never-pruned union, so
+  -- a deliberate ownership transfer must clear this claim as well.
+  for each $n in $NAMES
+    if contains($dd["shared"], $BIN .. "/." .. $n .. ".new") then
+      die("ownership clash: " .. $n ..
+        " is declared by deploy_desktop.mix's shared ledger — one deployer per " ..
+        "name; move ownership deliberately in both scripts and clear both ledger claim kinds")
+    end
+  end
+end
+
+-- Validate the complete source set before touching the installed set.
+for each $n in $NAMES
+  $d.die_if(not exists($BUILD .. "/" .. $n),
+    "source binary missing: " .. $BUILD .. "/" .. $n ..
+    " — build both desktop binaries first; installed set left untouched")
+end
+
+-- Sweep dot-temps left by a crashed prior run. Use lstat semantics so a stale
+-- symlink cannot survive as the next staging target.
+for each $n in $NAMES
+  $t = $BIN .. "/." .. $n .. ".new"
+  if exists($t, {follow_symlinks: false}) then
+    remove($t)
+  end
+end
+
+print("=== desk_bin_refresh: " .. $BUILD .. " -> " .. $BIN .. " ===\n")
+
+-- Any staging failure sweeps every temp before propagating the original error.
+$staged = []
+$recorded = {}
+$unchanged = 0
+try
+  -- Stage every changed binary and verify the staged bytes before publication.
+  -- An unchanged destination must also be a root-owned regular 0755 file;
+  -- matching bytes alone do not make mutable or malformed metadata safe.
+  for each $n in $NAMES
+    $src = $BUILD .. "/" .. $n
+    $dst = $BIN .. "/" .. $n
+    $src_sha = hash_file($src, "sha256")
+    $recorded[$n] = $src_sha
+    $dst_ok = false
+    if exists($dst, {follow_symlinks: false}) then
+      $st = stat($dst, {follow_symlinks: false})
+      if $st["is_file"] and $st["perm"] == 493 and $st["uid"] == 0 and
+          $st["gid"] == 0 and hash_file($dst, "sha256") == $src_sha then
+        $dst_ok = true
+      end
+    end
+    if $dst_ok then
+      print("  unchanged: " .. $n .. " (" .. substr($src_sha, 0, 12) .. ")\n")
+      $unchanged = $unchanged + 1
+    else
+      $tmp = $BIN .. "/." .. $n .. ".new"
+      copy($src, $tmp)
+      chmod($tmp, 0o755)
+      if hash_file($tmp, "sha256") != $src_sha then
+        die("staged copy of " .. $n ..
+          " does not match its recorded source hash — source changed mid-copy; " ..
+          "rerun after the build settles (installed set untouched)")
+      end
+      push($staged, {name: $n, tmp: $tmp, dst: $dst, sha: $src_sha})
+    end
+  end
+
+  -- Two full passes catch a source transition straddling the first sequential
+  -- pass. A later change is caught by the post-publication gate below.
+  for each $pass in range(1, 2)
+    for each $n in $NAMES
+      if hash_file($BUILD .. "/" .. $n, "sha256") != $recorded[$n] then
+        die("source " .. $n .. " changed while staging (stability pass " ..
+          to_string($pass) .. ") — aborting before publish; rerun after the build settles")
+      end
+    end
+  end
+catch $message, $error
+  -- Cleanup failure must not hide the error that triggered cleanup.
+  try
+    for each $cleanup_name in $NAMES
+      $cleanup_tmp = $BIN .. "/." .. $cleanup_name .. ".new"
+      if exists($cleanup_tmp, {follow_symlinks: false}) then
+        remove($cleanup_tmp)
+      end
+    end
+  catch $cleanup_message
+    die($message .. " (and the temp sweep failed: " .. $cleanup_message .. ")")
+  end
+  die($message)
+end
+
+-- Publish each file atomically, then verify installed bytes against the staged
+-- hash. A no-op deployment with stale destination bytes cannot pass this gate.
+for each $item in $staged
+  rename($item["tmp"], $item["dst"])
+end
+for each $item in $staged
+  $dst_sha = hash_file($item["dst"], "sha256")
+  if $dst_sha != $item["sha"] then
+    die("deploy gate failed for " .. $item["name"] .. ": installed sha " ..
+      $dst_sha .. " != staged sha " .. $item["sha"])
+  end
+  print("  refreshed: " .. $item["name"] .. " (" ..
+    substr($item["sha"], 0, 12) .. ")\n")
+end
+$refreshed = len($staged)
+
+-- Refuse success when the source moved after the stable observed set was
+-- published. The installed bytes remain valid but are already stale.
+for each $n in $NAMES
+  if hash_file($BUILD .. "/" .. $n, "sha256") != $recorded[$n] then
+    die("source " .. $n .. " changed after the pre-publish check — installed set " ..
+      "holds the stable pre-change bytes but is stale; rerun after the build settles")
+  end
+end
+
+print("=== bin refresh done: " .. to_string($refreshed) .. " refreshed, " ..
+  to_string($unchanged) .. " unchanged ===\n")
+print("Local desktop processes see these at " .. $BIN .. ".\n")
+print("A running compositor keeps its old inode until restarted.\n")
