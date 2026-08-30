@@ -1,0 +1,339 @@
+#!/usr/bin/env mix
+-- cbc-build.mix — run one watched build command on a configured foreign
+-- build-cluster worker.
+--
+--   mix _bin/cbc-build.mix [--worker alpha|beta|auto] [--commit <sha>] \
+--                          [--repo cosmix] -- <command...>
+--
+-- Auto selection chooses the reachable worker with the lowest one-minute load.
+-- The chosen worker checkout is fetched and detached at the exact local commit
+-- before the command runs. The job stays attached to this SSH channel; detached
+-- execution and reattachment are a separate mechanism.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/cbc-build.conf.mix"
+
+fn conf_error($msg)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $msg)
+  exit(2)
+end
+
+if not is_file($CONF_PATH) then
+  print("  ERROR: no build-cluster config at " .. $CONF_PATH ..
+    " — create it from cbc-build.conf.mix.example")
+  exit(2)
+end
+
+$CONF_DOC = nil
+try
+  $CONF_DOC = load_data($CONF_PATH)
+catch $msg
+  conf_error("invalid strict-data config: " .. $msg)
+end
+if type($CONF_DOC) != "map" then
+  conf_error("must contain a strict-data map")
+end
+
+$CONF = nil
+try
+  $CONF = validate($CONF_DOC["cbc_build"], {
+    schema_version: {type: "integer", enum: [1]},
+    worker_root: {type: "string", nonblank: true},
+    default_repo: {type: "string", nonblank: true},
+    workers: {
+      type: "list",
+      min_length: 1,
+      items: {type: "map", schema: {
+        name: {type: "string", nonblank: true},
+        ssh_host: {type: "string", nonblank: true}
+      }}
+    },
+    repositories: {
+      type: "list",
+      min_length: 1,
+      items: {type: "map", schema: {
+        name: {type: "string", nonblank: true},
+        worker_dir: {type: "string", nonblank: true}
+      }}
+    }
+  })
+catch $msg
+  conf_error("invalid cbc_build map: " .. $msg)
+end
+
+$WORKER_ROOT = $CONF["worker_root"]
+$WORKERS = $CONF["workers"]
+$REPOSITORIES = $CONF["repositories"]
+$DEFAULT_REPO = $CONF["default_repo"]
+
+if not starts_with($WORKER_ROOT, "/") then
+  conf_error("worker_root must be an absolute path")
+end
+
+fn duplicate_value($items, $key)
+  for each $item in $items
+    $seen = 0
+    for each $candidate in $items
+      if $candidate[$key] == $item[$key] then
+        $seen = $seen + 1
+      end
+    end
+    if $seen > 1 then
+      return $item[$key]
+    end
+  end
+  return nil
+end
+
+$dup_worker = duplicate_value($WORKERS, "name")
+if $dup_worker != nil then
+  conf_error("duplicate worker name '" .. $dup_worker .. "'")
+end
+$dup_repo = duplicate_value($REPOSITORIES, "name")
+if $dup_repo != nil then
+  conf_error("duplicate repository name '" .. $dup_repo .. "'")
+end
+for each $repository in $REPOSITORIES
+  if (starts_with($repository["worker_dir"], "/") or
+      contains(split($repository["worker_dir"], "/"), "..")) then
+    conf_error("repositories[].worker_dir must be a relative path without '..'")
+  end
+end
+
+fn find_named($items, $name)
+  for each $item in $items
+    if $item["name"] == $name then
+      return $item
+    end
+  end
+  return nil
+end
+
+if find_named($REPOSITORIES, $DEFAULT_REPO) == nil then
+  conf_error("default_repo '" .. $DEFAULT_REPO .. "' is not in repositories")
+end
+
+$g = getopt(args(), {
+  worker: {arg: true},
+  commit: {arg: true},
+  repo: {arg: true}
+})
+if len($g["errors"]) != 0 then
+  print("bad options: " .. join($g["errors"], "; "))
+  exit(2)
+end
+$cmd = $g["rest"]
+if len($cmd) == 0 then
+  print("usage: cbc-build.mix [--worker <name>|auto] [--commit <sha>] [--repo <name>] -- <command...>")
+  exit(2)
+end
+
+$repo_name = get_or($g["opts"], "repo", $DEFAULT_REPO)
+$repository = find_named($REPOSITORIES, $repo_name)
+if $repository == nil then
+  $valid_repos = []
+  for each $item in $REPOSITORIES
+    push($valid_repos, $item["name"])
+  end
+  conf_error("unknown repository '" .. $repo_name .. "' — valid: " .. join($valid_repos, " "))
+end
+
+-- Build workers are rostered foreign nodes. Their configured SSH host is the
+-- connection authority; mesh inventory addresses must never be consulted.
+$ROSTER = $d.roster()
+for each $worker_conf in $WORKERS
+  $d.assert_node($ROSTER, $worker_conf["name"])
+  if not $d.is_foreign($ROSTER, $worker_conf["name"]) then
+    conf_error("worker '" .. $worker_conf["name"] .. "' must be in fleet_roster.foreign")
+  end
+end
+
+fn worker_probe($worker_conf)
+  $token = uuid()
+  $r = ssh_mix($worker_conf["ssh_host"], '
+$parts = split(trim(read_file("/proc/loadavg")), " ")
+if len($parts) == 0 then
+  raise("empty /proc/loadavg")
+end
+$load1 = to_number($parts[0])
+if $load1 == nil then
+  raise("invalid one-minute load: " .. $parts[0])
+end
+print(data_encode({token: $token, load1: $load1}))
+', {bindings: {token: $token}, decode: "data", timeout: 20})
+  if (not $r["ok"] or type($r["value"]) != "map" or
+      $r["value"]["token"] != $token or $r["value"]["load1"] == nil) then
+    return nil
+  end
+  return $r["value"]["load1"]
+end
+
+fn pick_worker()
+  $best = nil
+  $best_load = 99999
+  for each $worker_conf in $WORKERS
+    $load1 = worker_probe($worker_conf)
+    if $load1 == nil then
+      print("  " .. $worker_conf["name"] .. " unreachable")
+    else
+      print("  " .. $worker_conf["name"] .. " load1=" .. $load1)
+      if $load1 < $best_load then
+        $best_load = $load1
+        $best = $worker_conf
+      end
+    end
+  end
+  if $best == nil then
+    print("  ERROR: no worker reachable")
+    exit(1)
+  end
+  return $best
+end
+
+$requested_worker = get_or($g["opts"], "worker", "auto")
+$worker = nil
+if $requested_worker == "auto" then
+  print("selecting worker by load:")
+  $worker = pick_worker()
+else
+  $worker = find_named($WORKERS, $requested_worker)
+  if $worker == nil then
+    $valid_workers = []
+    for each $item in $WORKERS
+      push($valid_workers, $item["name"])
+    end
+    conf_error("unknown worker '" .. $requested_worker .. "' — valid: auto " .. join($valid_workers, " "))
+  end
+  $load1 = worker_probe($worker)
+  $d.die_if($load1 == nil,
+    "worker '" .. $worker["name"] .. "' is unreachable or has invalid load data")
+end
+print("worker: " .. $worker["name"])
+
+-- Resolve every requested revision locally to a full commit object. This keeps
+-- option-like or ambiguous revision text out of the remote checkout and gives
+-- the byte-identity gate below one exact value to compare.
+$requested_commit = get_or($g["opts"], "commit", "HEAD")
+$LOCAL_ROOT = $d.cosmix_root()
+$resolved = run_argv([
+  "git", "-C", $LOCAL_ROOT, "rev-parse", "--verify", $requested_commit .. "^{commit}"
+], {timeout: 60})
+$d.die_if($resolved["exit_code"] != 0,
+  "cannot resolve commit '" .. $requested_commit .. "' in " .. $LOCAL_ROOT .. ": " .. trim($resolved["stderr"]))
+$commit = trim($resolved["stdout"])
+$d.die_if(not regex_match("^[0-9a-fA-F]{40,64}$", $commit),
+  "local git returned an invalid full commit id: " .. $commit)
+print("commit: " .. slice($commit, 0, 12) .. " (" .. $repo_name .. ")")
+
+$remote_repo = $WORKER_ROOT .. "/" .. $repository["worker_dir"]
+$checkout_token = uuid()
+$checkout_result = ssh_mix($worker["ssh_host"], '
+if not is_dir($repo_root) then
+  raise("worker checkout missing: " .. $repo_root)
+end
+$fetch = run_argv(["git", "-C", $repo_root, "fetch", "-q", "origin"], {timeout: 600})
+if $fetch["exit_code"] != 0 then
+  eprint(trim($fetch["stderr"]))
+  exit(1)
+end
+$checkout = run_argv(["git", "-C", $repo_root, "checkout", "-q", "--detach", $commit], {timeout: 120})
+if $checkout["exit_code"] != 0 then
+  eprint(trim($checkout["stderr"]))
+  exit(1)
+end
+$head = run_argv(["git", "-C", $repo_root, "rev-parse", "HEAD"], {timeout: 60})
+if $head["exit_code"] != 0 then
+  eprint(trim($head["stderr"]))
+  exit(1)
+end
+print(data_encode({token: $token, head: trim($head["stdout"])}))
+', {bindings: {
+  repo_root: $remote_repo,
+  commit: $commit,
+  token: $checkout_token
+}, decode: "data", timeout: 900})
+$d.die_if(not $checkout_result["ok"],
+  "checkout on " .. $worker["name"] .. " failed: " .. trim($checkout_result["stdout"]) ..
+  " " .. trim($checkout_result["stderr"]))
+$d.die_if(type($checkout_result["value"]) != "map" or
+    $checkout_result["value"]["token"] != $checkout_token,
+  "checkout on " .. $worker["name"] .. " returned an invalid result")
+$d.die_if($checkout_result["value"]["head"] != $commit,
+  "checkout identity mismatch on " .. $worker["name"] .. ": want " .. $commit ..
+  ", got " .. $checkout_result["value"]["head"])
+print("checked out: " .. slice($checkout_result["value"]["head"], 0, 12))
+
+-- Zeroing is best-effort, as in the original tool: cache availability must not
+-- turn a valid build into a harness failure. A warning makes the lost delta
+-- visible instead of silently attributing old statistics to this run.
+$zero_token = uuid()
+$zero = ssh_mix($worker["ssh_host"], '
+$r = run_argv(["sccache", "--zero-stats"], {timeout: 60})
+print(data_encode({token: $token, exit_code: $r["exit_code"], stderr: $r["stderr"]}))
+', {bindings: {token: $zero_token}, decode: "data", timeout: 90})
+if (not $zero["ok"] or type($zero["value"]) != "map" or
+    $zero["value"]["token"] != $zero_token or $zero["value"]["exit_code"] != 0) then
+  print("  warning: could not zero sccache statistics")
+end
+
+print("running: " .. join($cmd, " "))
+$t0 = time()
+$run_token = uuid()
+$run = ssh_mix($worker["ssh_host"], '
+$r = run_argv($cmd, {
+  cwd: $cwd,
+  timeout: 7200,
+  stderr: "stdout",
+  max_output: 67108864
+})
+print(data_encode({token: $token, exit_code: $r["exit_code"], output: $r["stdout"]}))
+', {bindings: {
+  cmd: $cmd,
+  cwd: $remote_repo .. "/src",
+  token: $run_token
+}, decode: "data", timeout: 7260, max_output: 134217728})
+$secs = round(time() - $t0, 1)
+$d.die_if(not $run["ok"],
+  "build transport failed on " .. $worker["name"] .. ": " .. trim($run["stdout"]) .. " " .. trim($run["stderr"]))
+$d.die_if((type($run["value"]) != "map" or $run["value"]["token"] != $run_token or
+    type($run["value"]["exit_code"]) != "integer" or type($run["value"]["output"]) != "string"),
+  "build on " .. $worker["name"] .. " returned an invalid result")
+
+$run_rc = $run["value"]["exit_code"]
+$lines = split(trim($run["value"]["output"]), "\n")
+print("--- rc=" .. $run_rc .. " in " .. $secs .. "s on " .. $worker["name"] .. " ---")
+if $run_rc == 0 then
+  print(join(take($lines, -8), "\n"))
+else
+  print("errors:")
+  for each $line in $lines
+    if starts_with($line, "error") then
+      print("  " .. $line)
+    end
+  end
+  print("tail:")
+  print(join(take($lines, -20), "\n"))
+end
+
+$stats_token = uuid()
+$stats = ssh_mix($worker["ssh_host"], '
+$r = run_argv(["sccache", "--show-stats"], {timeout: 60, stderr: "stdout"})
+$wanted = []
+for each $line in split($r["stdout"], "\n")
+  if (contains($line, "Cache hits (Rust)") or contains($line, "Cache misses (Rust)") or
+      contains($line, "Cache hits rate (Rust)") or contains($line, "Cache write errors")) then
+    push($wanted, $line)
+  end
+end
+print(data_encode({token: $token, exit_code: $r["exit_code"], lines: $wanted}))
+', {bindings: {token: $stats_token}, decode: "data", timeout: 90})
+print("--- sccache (this run) ---")
+if (not $stats["ok"] or type($stats["value"]) != "map" or
+    $stats["value"]["token"] != $stats_token or $stats["value"]["exit_code"] != 0) then
+  print("unavailable")
+else
+  print(join($stats["value"]["lines"], "\n"))
+end
+
+exit($run_rc)

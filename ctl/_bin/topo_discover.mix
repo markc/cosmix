@@ -1,0 +1,304 @@
+#!/usr/bin/env mix
+-- topo_discover.mix — build a network topology graph from authenticated mesh
+-- state, the hub's SSH host fragments, and the hub's live WireGuard peer dump.
+--
+-- Read-only except for atomically publishing _share/cosmix/topology.json in
+-- the control hub. The mesh writer lock and a second freshness-floor check bind
+-- that published projection to the verified inventory used to derive it.
+
+$d = require("../_lib/deploy_lib.mix")
+
+if len(args()) != 0 then
+  print("usage: mix _bin/topo_discover.mix")
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/topo_discover.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: missing topo_discover config: " .. $CONF_PATH)
+  print("         copy _etc/topo_discover.conf.mix.example there and set the private topology values")
+  exit(2)
+end
+
+$loaded = nil
+try
+  $loaded = load_data($CONF_PATH)
+catch $msg
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $msg)
+  exit(2)
+end
+if type($loaded) != "map" or type($loaded["topo_discover"]) != "map" then
+  print("  ERROR: " .. $CONF_PATH .. " must contain a topo_discover map")
+  exit(2)
+end
+$CONF = $loaded["topo_discover"]
+
+fn config_error($detail)
+  print("  ERROR: " .. $CONF_PATH .. " " .. $detail)
+  exit(2)
+end
+
+if $CONF["schema_version"] != 1 then
+  config_error("needs topo_discover.schema_version: 1")
+end
+for each $key in ["expected_mesh", "ssh_hosts_dir", "hub_wg_iface", "mesh_network_id"]
+  if type($CONF[$key]) != "string" or trim($CONF[$key]) == "" then
+    config_error("needs a non-empty topo_discover." .. $key)
+  end
+end
+if not starts_with($CONF["ssh_hosts_dir"], "/") then
+  config_error("needs an absolute topo_discover.ssh_hosts_dir")
+end
+for each $glob_char in ["*", "?", "["]
+  if contains($CONF["ssh_hosts_dir"], $glob_char) then
+    config_error("topo_discover.ssh_hosts_dir must not contain glob metacharacters")
+  end
+end
+if not regex_match("^[A-Za-z0-9][A-Za-z0-9_.-]*$", $CONF["hub_wg_iface"]) then
+  config_error("has an unsafe topo_discover.hub_wg_iface")
+end
+if type($CONF["networks"]) != "list" or len($CONF["networks"]) == 0 then
+  config_error("needs a non-empty topo_discover.networks list")
+end
+if type($CONF["live_summary_nodes"]) != "list" then
+  config_error("needs a topo_discover.live_summary_nodes list")
+end
+
+$network_ids = {}
+for each $network in $CONF["networks"]
+  if type($network) != "map" then
+    config_error("topo_discover.networks entries must be maps")
+  end
+  for each $key in ["id", "match", "kind", "subnet", "label"]
+    if type($network[$key]) != "string" or trim($network[$key]) == "" then
+      config_error("topo_discover.networks entries need non-empty id, match, kind, subnet, and label strings")
+    end
+  end
+  $id = $network["id"]
+  if $id == "remote" then
+    config_error("reserves network id 'remote' for unmatched hosts")
+  end
+  if $network_ids[$id] == true then
+    config_error("repeats topology network id '" .. $id .. "'")
+  end
+  $network_ids[$id] = true
+end
+if $network_ids[$CONF["mesh_network_id"]] != true then
+  config_error("topo_discover.mesh_network_id must name an entry in topo_discover.networks")
+end
+for each $node in $CONF["live_summary_nodes"]
+  if type($node) != "string" or trim($node) == "" then
+    config_error("topo_discover.live_summary_nodes entries must be non-empty strings")
+  end
+end
+
+$HOSTS_DIR = realpath($CONF["ssh_hosts_dir"])
+if $HOSTS_DIR == nil or not is_dir($HOSTS_DIR) then
+  config_error("ssh_hosts_dir is not a readable directory: " .. $CONF["ssh_hosts_dir"])
+end
+
+-- mesh_lib owns authenticated inventory ingress, the shared writer lock,
+-- freshness checks, and atomic leaf publication.
+$m = require("../_lib/mesh_lib.mix")
+
+$HUB_ROOT = $d.hub_root()
+$SIGNED = $HUB_ROOT .. "/_etc/mesh/inventory.signed"
+$AUTHORED = $HUB_ROOT .. "/_etc/mesh/inventory.mix"
+$BASELINE = $HUB_ROOT .. "/_etc/mesh/epoch.baseline.mix"
+$OUT = $HUB_ROOT .. "/_share/cosmix/topology.json"
+$NETS = $CONF["networks"]
+$MESH_NETWORK_ID = $CONF["mesh_network_id"]
+$WG_IFACE = $CONF["hub_wg_iface"]
+
+fn net_for_ip($ip)
+  for each $network in $NETS
+    if starts_with($ip, $network["match"]) then
+      return $network["id"]
+    end
+  end
+  return "remote"
+end
+
+fn parse_host_file($path)
+  $alias = ""
+  $ip = ""
+  $user = ""
+  $port = ""
+  $key = ""
+  for each $line in split(read_file($path), "\n")
+    $text = trim($line)
+    if starts_with($text, "Host ") then
+      $alias = trim(substr($text, 5, len($text) - 5))
+    end
+    if starts_with($text, "Hostname ") then
+      $ip = trim(substr($text, 9, len($text) - 9))
+    end
+    if starts_with($text, "User ") then
+      $user = trim(substr($text, 5, len($text) - 5))
+    end
+    if starts_with($text, "Port ") then
+      $port = trim(substr($text, 5, len($text) - 5))
+    end
+    if starts_with($text, "IdentityFile ") then
+      $key = basename(trim(substr($text, 13, len($text) - 13)))
+    end
+  end
+  return {alias: $alias, ip: $ip, user: $user, port: $port, key: $key}
+end
+
+-- 1. SSH host universe and IP-by-alias lookup. glob() replaces the old shell
+-- ls while retaining its deterministic lexical order.
+$ssh_hosts = []
+$ssh_ip_by_alias = {}
+for each $path in sort(glob($HOSTS_DIR .. "/*"))
+  if is_file($path) then
+    $host = parse_host_file($path)
+    if $host["alias"] != "" and $host["ip"] != "" then
+      push($ssh_hosts, $host)
+      $ssh_ip_by_alias[$host["alias"]] = $host["ip"]
+    end
+  end
+end
+
+-- 2. Authenticated mesh inventory. Keep the verified result: the freshness
+-- floor is re-asserted against these exact bytes immediately before publish.
+$vi = $m.verified_inventory($SIGNED, {
+  mesh: $CONF["expected_mesh"],
+  against_authored: $AUTHORED,
+  baseline: $BASELINE
+})
+$mesh = $vi["inventory"]
+if len($mesh["hub"]) == 0 then
+  print("  ERROR: verified mesh inventory declares no hub")
+  exit(1)
+end
+$hub = $mesh["hub"][0]
+$ROSTER = $d.roster()
+$d.assert_node($ROSTER, $hub)
+
+$pub2name = {}
+$is_mesh = {}
+for each $member in $mesh["members"]
+  $is_mesh[$member["name"]] = true
+  for each $credential in $member["credentials"]
+    if $credential["kind"] == "wg" then
+      $pub2name[$credential["pubkey"]] = $member["name"]
+    end
+  end
+end
+
+-- 3. Live WireGuard state from the authenticated hub. ssh_mix carries source,
+-- with the validated interface supplied as a strict-data binding.
+$now_run = run_argv(["date", "+%s"])
+$d.die_if($now_run["exit_code"] != 0, "date +%s failed: " .. trim($now_run["stderr"]))
+$now = to_number(trim($now_run["stdout"]))
+$dump = ssh_mix($hub, 'print(run("wg show " .. $iface .. " dump"))', {
+  bindings: {iface: $WG_IFACE}
+})
+$d.die_if(not $dump["ok"],
+  "live WireGuard dump from " .. $hub .. " failed: " .. trim($dump["stdout"]) .. " " .. trim($dump["stderr"]))
+
+$edges = []
+$wg_live = {}
+$first = true
+for each $row in split(trim($dump["stdout"]), "\n")
+  if $first then
+    $first = false
+  else
+    $fields = split($row, "\t")
+    if len($fields) >= 8 then
+      $name = $pub2name[$fields[0]]
+      if $name == nil then
+        $name = "?" .. substr($fields[0], 0, 8)
+      end
+      $handshake = to_number($fields[4])
+      $age = $now - $handshake
+      $up = $handshake > 0 and $age < 180
+      $live = {
+        endpoint: $fields[2], handshake_age_s: $age,
+        rx_bytes: to_number($fields[5]), tx_bytes: to_number($fields[6]), up: $up
+      }
+      $wg_live[$name] = $live
+      push($edges, {
+        src: $hub, dst: $name, kind: "wg-peer", network: $MESH_NETWORK_ID,
+        iface: $WG_IFACE, endpoint: $fields[2], handshake_age_s: $age,
+        rx_bytes: $live["rx_bytes"], tx_bytes: $live["tx_bytes"], up: $up
+      })
+    end
+  end
+end
+
+-- 4. Nodes and their network-membership edges.
+$node_list = []
+$present = {}
+for each $member in $mesh["members"]
+  $name = $member["name"]
+  $networks = [$MESH_NETWORK_ID]
+  $present[$MESH_NETWORK_ID] = true
+  $ssh_ip = $ssh_ip_by_alias[$name]
+  if $ssh_ip != nil then
+    $ssh_network = net_for_ip($ssh_ip)
+    push($networks, $ssh_network)
+    $present[$ssh_network] = true
+  end
+  $live = $wg_live[$name]
+  if $live == nil then
+    $live = {up: $name == $hub}
+  end
+  push($node_list, {
+    id: $name, label: $name, kind: $name == $hub ? "wg-hub" : "mesh-node",
+    mesh_ip: $member["mesh_ip"], status: $member["status"], ssh_ip: $ssh_ip,
+    networks: $networks, wg: $live
+  })
+  for each $network in $networks
+    push($edges, {src: $name, dst: "net:" .. $network, kind: "member", network: $network})
+  end
+end
+for each $host in $ssh_hosts
+  if $is_mesh[$host["alias"]] == nil then
+    $network = net_for_ip($host["ip"])
+    $present[$network] = true
+    push($node_list, {
+      id: $host["alias"], label: $host["alias"], kind: "host", ip: $host["ip"],
+      user: $host["user"], key: $host["key"], networks: [$network]
+    })
+    push($edges, {src: $host["alias"], dst: "net:" .. $network, kind: "member", network: $network})
+  end
+end
+
+-- 5. Only networks with members are emitted; unmatched addresses share the
+-- synthetic remote/public network.
+$net_list = []
+for each $network in $NETS
+  if $present[$network["id"]] == true then
+    push($net_list, $network)
+  end
+end
+if $present["remote"] == true then
+  push($net_list, {id: "remote", kind: "remote", subnet: "0.0.0.0/0", label: "remote / public"})
+end
+
+-- 6. Publish. The sweep stays outside the writer lock because the hub probe
+-- can block. Once the document is ready, take the shared lock, re-check the
+-- freshness floor, and atomically replace the output leaf.
+$generated = run_argv(["date", "-Is"])
+$d.die_if($generated["exit_code"] != 0, "date -Is failed: " .. trim($generated["stderr"]))
+$doc = {
+  generated_at: trim($generated["stdout"]), hub: $hub,
+  networks: $net_list, nodes: $node_list, edges: $edges
+}
+$_lock = $m.mesh_take_write_lock("topo_discover")
+$m.assert_freshness_floor($vi, $BASELINE)
+$m.write_leaf($OUT, json_encode($doc))
+
+print("topology: " .. ("" .. len($node_list)) .. " nodes, " .. ("" .. len($edges)) ..
+  " edges, " .. ("" .. len($net_list)) .. " networks -> " .. $OUT)
+print("mesh live (hub " .. $hub .. "):")
+for each $name in $CONF["live_summary_nodes"]
+  $live = $wg_live[$name]
+  if $live != nil then
+    print("  " .. rpad($name, 9) .. ($live["up"] ? "UP  " : "down") ..
+      " hs=" .. ("" .. $live["handshake_age_s"]) .. "s rx=" .. ("" .. $live["rx_bytes"]) ..
+      " tx=" .. ("" .. $live["tx_bytes"]) .. " ep=" .. $live["endpoint"])
+  end
+end

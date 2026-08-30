@@ -1,0 +1,9 @@
+-- mesh_d2_seed.conf.mix.example — private D2 seed distribution settings.
+-- Copy to mesh_d2_seed.conf.mix in the private control hub and edit it there.
+-- The public starter deliberately does not ship an active configuration.
+mesh_d2_seed: {
+  schema_version: 1,
+  expected_mesh: "example.org",
+  local_node: "alpha",
+  secrets_db: "/home/user/.secrets/secrets.db"
+}

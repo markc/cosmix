@@ -1,0 +1,10 @@
+-- Private build-worker checkout inputs. Copy this file to
+-- cbc-sync.conf.mix in the private control hub and replace the placeholders.
+-- Every worker must also be listed under foreign in fleet-roster.conf.mix;
+-- these are SSH aliases, not mesh inventory names or addresses.
+cbc_sync: {
+  schema_version: 1,
+  workers: ["alpha", "beta"],
+  worker_checkout: "/srv/build/cosmix",
+  repository_url: "https://github.com/example/cosmix.git"
+}

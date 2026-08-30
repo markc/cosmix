@@ -1,0 +1,16 @@
+-- topo_discover.conf.mix.example — private settings for topo_discover.mix.
+-- Copy to topo_discover.conf.mix in your private control hub and edit it there.
+-- The public starter deliberately does not ship an active configuration.
+topo_discover: {
+  schema_version: 1,
+  expected_mesh: "example.org",
+  ssh_hosts_dir: "/home/user/.ssh/hosts",
+  hub_wg_iface: "wg-example",
+  mesh_network_id: "mesh",
+  live_summary_nodes: ["alpha", "beta", "gamma"],
+  networks: [
+    {id: "mesh", match: "192.0.2.", kind: "wireguard", subnet: "192.0.2.0/24", label: "example mesh (WG)"},
+    {id: "lan", match: "198.51.100.", kind: "lan", subnet: "198.51.100.0/24", label: "example LAN"},
+    {id: "management", match: "203.0.113.", kind: "lan", subnet: "203.0.113.0/24", label: "example management LAN"}
+  ]
+}

@@ -1,0 +1,562 @@
+#!/usr/bin/env mix
+-- mesh_d2_seed.mix — stage each selected node's SPEC 13 §9a D2 private seed.
+--
+-- The signed inventory is verified before its current D2 public keys are used.
+-- Seeds come from the hub's private SQLite store through parameter bindings,
+-- travel only in mode-0600 files, and are atomically installed as
+-- /etc/cosmix/noded/d2.seed (root:cosmix-noded 0640). The daemon is NOT
+-- restarted: it loads the staged seed at the later admission-posture roll.
+--
+-- With no arguments, every rostered mesh member is handled in the canonical
+-- hubs-last rollout order. Named foreign roster nodes are valid SSH aliases;
+-- they are never looked up in the mesh inventory.
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/mesh_d2_seed.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no mesh D2 seed configuration at " .. $CONF_PATH)
+  print("         copy _etc/mesh_d2_seed.conf.mix.example there and set expected_mesh, local_node and secrets_db")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["mesh_d2_seed"], {
+    schema_version: {type: "integer", enum: [1]},
+    expected_mesh: {type: "string", nonblank: true},
+    local_node: {type: "string", nonblank: true},
+    secrets_db: {type: "string", nonblank: true}
+  })
+catch $config_error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $config_error)
+  exit(2)
+end
+if not starts_with($CONF["secrets_db"], "/") then
+  print("  ERROR: " .. $CONF_PATH .. " mesh_d2_seed.secrets_db must be an absolute path")
+  exit(2)
+end
+
+$SIGNED = $d.hub_root() .. "/_etc/mesh/inventory.signed"
+$AUTHORED = $d.hub_root() .. "/_etc/mesh/inventory.mix"
+$BASELINE = $d.hub_root() .. "/_etc/mesh/epoch.baseline.mix"
+$DEST = "/etc/cosmix/noded/d2.seed"
+$SIGN = $d.cosmix_bin("cosmix-mesh-sign")
+$EXPECTED_MESH = $CONF["expected_mesh"]
+$LOCAL = $CONF["local_node"]
+$DB = $CONF["secrets_db"]
+
+fn has_str($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn same_strings($left, $right)
+  if len($left) != len($right) then
+    return false
+  end
+  for each $item in $left
+    if not has_str($right, $item) then
+      return false
+    end
+  end
+  return true
+end
+
+-- mesh_lib exposes the equivalent WireGuard selector but no D2 selector.
+fn current_d2_pubkeys($member, $epoch)
+  $out = []
+  for each $credential in $member["credentials"]
+    if $credential["kind"] == "d2" then
+      if $credential["from_epoch"] <= $epoch and ($credential["until_epoch"] == nil or $epoch < $credential["until_epoch"]) then
+        push($out, $credential["pubkey"])
+      end
+    end
+  end
+  return $out
+end
+
+fn member_named($mesh, $node)
+  for each $member in $mesh["members"]
+    if $member["name"] == $node and $member["status"] == "active" then
+      return $member
+    end
+  end
+  return nil
+end
+
+-- One read-only statement gives a coherent SQLite snapshot for all targets.
+-- Full key fields and typed bindings avoid selecting another mesh's seed.
+fn read_seeds($path, $mesh_name, $nodes)
+  $db = nil
+  $rows = nil
+  try
+    $db = sqlopen($path)
+    $rows = sqlexec($db,
+      "SELECT vnode, password FROM secrets WHERE domain = ? AND service = ? AND username = ?",
+      [$mesh_name, "mesh-d2", "d2"])
+    sqlclose($db)
+    $db = nil
+  catch $db_error
+    if $db != nil then
+      try
+        sqlclose($db)
+      catch $close_error
+        nil
+      end
+    end
+    print("  ERROR: reading D2 seeds from " .. $path .. ": " .. $db_error)
+    exit(1)
+  end
+
+  $values = {}
+  $counts = {}
+  for each $row in $rows
+    $node = $row["vnode"]
+    if has_str($nodes, $node) then
+      $counts[$node] = ($counts[$node] == nil ? 0 : $counts[$node]) + 1
+      $values[$node] = trim("" .. $row["password"])
+    end
+  end
+  for each $node in $nodes
+    if $counts[$node] == nil or $counts[$node] == 0 then
+      print("  ERROR: no D2 seed in " .. $path .. " for node '" .. $node ..
+        "' (domain=" .. $mesh_name .. ", service=mesh-d2, username=d2)")
+      exit(1)
+    end
+    if $counts[$node] != 1 then
+      print("  ERROR: multiple D2 seed rows in " .. $path .. " for node '" .. $node .. "'")
+      exit(1)
+    end
+    if $values[$node] == "" then
+      print("  ERROR: blank D2 seed in " .. $path .. " for node '" .. $node .. "'")
+      exit(1)
+    end
+    $decoded = nil
+    try
+      $decoded = base64_decode($values[$node])
+    catch $decode_error
+      print("  ERROR: D2 seed for node '" .. $node .. "' is not valid base64")
+      exit(1)
+    end
+    if byte_length($decoded) != 32 then
+      print("  ERROR: D2 seed for node '" .. $node .. "' is not a 32-byte Ed25519 seed")
+      exit(1)
+    end
+  end
+  return $values
+end
+
+fn current_local_hash($path)
+  $symlink = run_argv(["sudo", "-n", "test", "-L", $path])
+  $d.die_if($symlink["exit_code"] == 0,
+    "local destination is a symlink; refusing: " .. $path)
+  $d.die_if($symlink["exit_code"] != 1,
+    "local symlink probe for " .. $path .. ": " .. trim($symlink["stderr"]))
+  $exists = run_argv(["sudo", "-n", "test", "-e", $path])
+  if $exists["exit_code"] == 1 then
+    return "__ABSENT__"
+  end
+  $d.die_if($exists["exit_code"] != 0,
+    "local existence probe for " .. $path .. ": " .. trim($exists["stderr"]))
+  $regular = run_argv(["sudo", "-n", "test", "-f", $path])
+  $d.die_if($regular["exit_code"] != 0,
+    "local destination exists but is not a regular file: " .. $path)
+  $hash = run_argv(["sudo", "-n", "sha256sum", $path])
+  $d.die_if($hash["exit_code"] != 0,
+    "local sha256 probe for " .. $path .. ": " .. trim($hash["stderr"]))
+  return word(trim($hash["stdout"]), 1)
+end
+
+fn cleanup_local_dir($path)
+  $cleanup = run_argv(["rm", "-rf", $path])
+  if $cleanup["exit_code"] != 0 then
+    print("  note: could not remove private staging directory " .. $path)
+  end
+end
+
+fn install_local($node, $source, $expected, $before)
+  if current_local_hash($DEST) != $before then
+    cleanup_local_dir(dirname($source))
+    $d.die_if(true,
+      $node .. " destination changed after preflight; refusing to overwrite a concurrent seed update")
+  end
+  $mkdir = run_argv(["sudo", "-n", "install", "-d", "-m", "0755",
+    "-o", "root", "-g", "root", dirname($DEST)])
+  if $mkdir["exit_code"] != 0 then
+    cleanup_local_dir(dirname($source))
+    $d.die_if(true,
+      $node .. " create " .. dirname($DEST) .. ": " .. trim($mkdir["stderr"]))
+  end
+  $temporary = dirname($DEST) .. "/.d2.seed.new." .. uuid()
+  $install = run_argv(["sudo", "-n", "install", "-m", "0640", "-o", "root",
+    "-g", "cosmix-noded", $source, $temporary])
+  if $install["exit_code"] != 0 then
+    $_remove_failed = run_argv(["sudo", "-n", "rm", "-f", $temporary])
+    cleanup_local_dir(dirname($source))
+    $d.die_if(true, $node .. " stage D2 seed: " .. trim($install["stderr"]))
+  end
+  $staged_hash = run_argv(["sudo", "-n", "sha256sum", $temporary])
+  if $staged_hash["exit_code"] != 0 or word(trim($staged_hash["stdout"]), 1) != $expected then
+    $_remove_bad = run_argv(["sudo", "-n", "rm", "-f", $temporary])
+    cleanup_local_dir(dirname($source))
+    $d.die_if(true, $node .. " staged D2 seed is not byte-identical to the secrets DB snapshot")
+  end
+  $publish = run_argv(["sudo", "-n", "mv", "-f", $temporary, $DEST])
+  if $publish["exit_code"] != 0 then
+    $_remove_unpublished = run_argv(["sudo", "-n", "rm", "-f", $temporary])
+    cleanup_local_dir(dirname($source))
+    $d.die_if(true, $node .. " atomic D2 seed publish: " .. trim($publish["stderr"]))
+  end
+end
+
+fn verify_local($node, $expected, $gid)
+  $got = current_local_hash($DEST)
+  $d.die_if($got != $expected,
+    $node .. " installed D2 seed hash mismatch: expected " .. substr($expected, 0, 12) ..
+    ", got " .. substr($got, 0, 12))
+  $meta = run_argv(["sudo", "-n", "stat", "-c", "%u:%g:%a", $DEST])
+  $d.die_if($meta["exit_code"] != 0 or trim($meta["stdout"]) != "0:" .. $gid .. ":640",
+    $node .. " installed D2 seed ownership/mode mismatch: " .. trim($meta["stdout"]) ..
+    " (expected 0:" .. $gid .. ":640)")
+end
+
+-- ── selection, signed authority, and rollout order ─────────────────────
+$ROSTER = $d.roster()
+$d.assert_node($ROSTER, $LOCAL)
+for each $node in $ROSTER["all"]
+  if not $m.is_valid_label($node) then
+    print("  ERROR: fleet roster node '" .. $node .. "' is not a safe mesh label")
+    exit(2)
+  end
+end
+
+$selection_args = args()
+if len($selection_args) == 0 then
+  $selection_args = $d.rollout_order($ROSTER)
+end
+$parsed = $d.parse_nodes($ROSTER, $selection_args, [])
+$selected = $parsed["nodes"]
+$seen_selected = []
+for each $node in $selected
+  if has_str($seen_selected, $node) then
+    print("  ERROR: duplicate target node '" .. $node .. "'")
+    exit(2)
+  end
+  push($seen_selected, $node)
+end
+
+$vi = $m.verified_inventory($SIGNED, {
+  mesh: $EXPECTED_MESH,
+  against_authored: $AUTHORED,
+  baseline: $BASELINE
+})
+$mesh = $vi["inventory"]
+$active = []
+for each $member in $mesh["members"]
+  if $member["status"] == "active" then
+    push($active, $member["name"])
+  end
+end
+$d.die_if(not same_strings($ROSTER["mesh"], $active),
+  "fleet roster mesh nodes must exactly match the verified active inventory")
+$hubs = $d.mesh_hubs()
+$d.die_if(not same_strings($hubs, $mesh["hub"]),
+  "authored and verified inventories disagree on hub membership")
+
+$canonical = $d.rollout_order($ROSTER)
+$seen_rollout = []
+$hub_tail = false
+for each $node in $canonical
+  $d.die_if(not has_str($ROSTER["mesh"], $node),
+    "rollout_order contains non-mesh node '" .. $node .. "'")
+  $d.die_if(has_str($seen_rollout, $node),
+    "rollout_order repeats node '" .. $node .. "'")
+  if has_str($hubs, $node) then
+    $hub_tail = true
+  else
+    $d.die_if($hub_tail,
+      "rollout_order is not hubs-last: spoke '" .. $node .. "' follows a hub")
+  end
+  push($seen_rollout, $node)
+end
+$d.die_if(not same_strings($seen_rollout, $ROSTER["mesh"]),
+  "rollout_order must contain every rostered mesh node exactly once")
+
+$nodes = []
+for each $candidate in $canonical
+  if has_str($selected, $candidate) and not has_str($hubs, $candidate) then
+    push($nodes, $candidate)
+  end
+end
+for each $node in $selected
+  if $d.is_foreign($ROSTER, $node) then
+    push($nodes, $node)
+  end
+end
+for each $candidate in $canonical
+  if has_str($selected, $candidate) and has_str($hubs, $candidate) then
+    push($nodes, $candidate)
+  end
+end
+$d.die_if(len($nodes) != len($selected),
+  "one or more selected mesh nodes are absent from rollout_order")
+
+if not is_file($DB) then
+  print("  ERROR: secrets database not found: " .. $DB)
+  exit(2)
+end
+$resolved_db = realpath($DB)
+if $resolved_db == nil or not is_file($resolved_db) then
+  print("  ERROR: cannot resolve secrets database: " .. $DB)
+  exit(2)
+end
+$DB = $resolved_db
+$DB_ID = stat($DB)
+$d.die_if(not is_file($SIGN),
+  "cosmix-mesh-sign release binary not found: " .. $SIGN)
+
+-- ── local secret and public-key preflight ──────────────────────────────
+$SEEDS = read_seeds($DB, $EXPECTED_MESH, $nodes)
+$HASHES = {}
+for each $node in $nodes
+  $HASHES[$node] = hash_sha256($SEEDS[$node])
+  $pub = run_argv([$SIGN, "--secrets-db", $DB, "--mesh", $EXPECTED_MESH,
+    "d2-pubkey", $node], {timeout: 30})
+  $d.die_if($pub["exit_code"] != 0,
+    "derive D2 public key for " .. $node .. ": " .. trim($pub["stderr"]))
+  $public_key = trim($pub["stdout"])
+  $d.die_if(not $m.is_valid_b64key($public_key),
+    "derived D2 public key for " .. $node .. " is not a 44-character base64 key")
+  if not $d.is_foreign($ROSTER, $node) then
+    $member = member_named($mesh, $node)
+    $d.die_if($member == nil,
+      "selected node '" .. $node .. "' is not active in the verified inventory")
+    $current_keys = current_d2_pubkeys($member, $vi["epoch"])
+    $d.die_if(not has_str($current_keys, $public_key),
+      "D2 seed for " .. $node .. " does not match a current D2 public key in the verified inventory")
+  end
+end
+$m.assert_same_file($DB, $DB_ID, "secrets db")
+$SEEDS_AGAIN = read_seeds($DB, $EXPECTED_MESH, $nodes)
+for each $node in $nodes
+  $d.die_if($SEEDS_AGAIN[$node] != $SEEDS[$node],
+    "D2 seed for " .. $node .. " changed during preflight; re-run from a stable secrets DB")
+end
+$m.assert_same_file($DB, $DB_ID, "secrets db")
+
+-- Read every target before taking the lock or changing the first one.
+$REMOTE = {}
+$BEFORE = {}
+$GIDS = {}
+$READY = {}
+$reach_token = uuid()
+for each $node in $nodes
+  if $node == $LOCAL then
+    $sudo = run_argv(["sudo", "-n", "true"])
+    $d.die_if($sudo["exit_code"] != 0,
+      $node .. " local sudo preflight failed: " .. trim($sudo["stderr"]))
+    $gid = run_argv(["getent", "group", "cosmix-noded"])
+    $d.die_if($gid["exit_code"] != 0,
+      $node .. " has no cosmix-noded group")
+    $fields = split(trim($gid["stdout"]), ":")
+    $d.die_if(len($fields) < 3 or not regex_match("^[0-9]+$", $fields[2]),
+      $node .. " returned an unparseable cosmix-noded group record")
+    $GIDS[$node] = $fields[2]
+    $BEFORE[$node] = current_local_hash($DEST)
+    $meta = ""
+    if $BEFORE[$node] != "__ABSENT__" then
+      $stat_result = run_argv(["sudo", "-n", "stat", "-c", "%u:%g:%a", $DEST])
+      $d.die_if($stat_result["exit_code"] != 0,
+        $node .. " local metadata probe failed: " .. trim($stat_result["stderr"]))
+      $meta = trim($stat_result["stdout"])
+    end
+    $READY[$node] = $BEFORE[$node] == $HASHES[$node] and $meta == "0:" .. $GIDS[$node] .. ":640"
+    print("[preflight " .. $node .. "] local, seed=" ..
+      ($READY[$node] ? "MATCH" : "update required"))
+  else
+    $remote = $d.is_foreign($ROSTER, $node) ? $node : "root@" .. $d.mesh_ip($node)
+    $REMOTE[$node] = $remote
+    $probe = ssh_mix($remote, '
+$gid_text = trim(run("id -g cosmix-noded"))
+if $rc != 0 or not regex_match("^[0-9]+$", $gid_text) then
+  eprint("cosmix-noded group is absent or unparseable")
+  exit(7)
+end
+$state = "__ABSENT__"
+$uid = nil
+$gid = nil
+$perm = nil
+if exists($dest, {follow_symlinks: false}) then
+  $info = stat($dest, {follow_symlinks: false})
+  if not $info["is_file"] or $info["is_symlink"] then
+    eprint("destination exists but is not a regular non-symlink file: " .. $dest)
+    exit(8)
+  end
+  $state = hash_file($dest, "sha256")
+  $uid = $info["uid"]
+  $gid = $info["gid"]
+  $perm = $info["perm"]
+end
+$ready = $state == $expected and $uid == 0 and $gid == to_number($gid_text) and $perm == 0o640
+print(json_encode({token: $token, gid: $gid_text, state: $state, ready: $ready}))
+', {bindings: {dest: $DEST, expected: $HASHES[$node], token: $reach_token}, decode: "json",
+        connect_timeout: 8, timeout: 15})
+    $d.die_if(not $probe["ok"] or $probe["value"]["token"] != $reach_token,
+      $node .. " preflight failed: " .. trim($probe["stdout"]) .. " " .. trim($probe["stderr"]))
+    $GIDS[$node] = $probe["value"]["gid"]
+    $BEFORE[$node] = $probe["value"]["state"]
+    $READY[$node] = $probe["value"]["ready"] == true
+    print("[preflight " .. $node .. "] remote, seed=" ..
+      ($READY[$node] ? "MATCH" : "update required"))
+  end
+end
+
+print("")
+print("mesh_d2_seed — stage D2 prover seeds on: " .. join($nodes, " "))
+print("  verified epoch " .. ("" .. $vi["epoch"]) .. ", hubs last, NO restart")
+
+$_lock = $m.mesh_take_write_lock("mesh_d2_seed")
+$m.mesh_baseline_ratchet_epoch($BASELINE, $vi)
+$deploy_token = uuid()
+
+-- ── distribute; stop at the first failed node ──────────────────────────
+for each $node in $nodes
+  $expected = $HASHES[$node]
+  print("")
+  if $READY[$node] then
+    print("[" .. $node .. "] unchanged: " .. $DEST .. " integrity=MATCH")
+  else
+    $mk = run_argv(["mktemp", "-d"])
+    $d.die_if($mk["exit_code"] != 0,
+      "mktemp -d for " .. $node .. " seed: " .. trim($mk["stderr"]))
+    $work = trim($mk["stdout"])
+    $d.die_if($work == "", "mktemp -d produced no path for " .. $node .. " seed")
+    $source = $work .. "/d2.seed"
+    try
+      write_new($source, $SEEDS[$node], 0o600)
+    catch $stage_error
+      cleanup_local_dir($work)
+      $d.die_if(true, $node .. " could not create private seed staging file: " .. $stage_error)
+    end
+    if hash_file($source, "sha256") != $expected then
+      cleanup_local_dir($work)
+      $d.die_if(true, $node .. " private staging file is not byte-identical to the secrets DB snapshot")
+    end
+
+    if $node == $LOCAL then
+      install_local($node, $source, $expected, $BEFORE[$node])
+      cleanup_local_dir($work)
+    else
+      $staged = "/tmp/cosmix-d2-seed-" .. $deploy_token .. ".new"
+      $scp = run_argv(["scp", "-q", "-p", "-o", "BatchMode=yes", "-o",
+        "ConnectTimeout=8", $source, $REMOTE[$node] .. ":" .. $staged], {timeout: 120})
+      cleanup_local_dir($work)
+      if $scp["exit_code"] != 0 then
+        $_wipe_partial = ssh_mix($REMOTE[$node], 'remove($staged)', {
+          bindings: {staged: $staged}, connect_timeout: 8, timeout: 10})
+        $d.die_if(true, "scp D2 seed to " .. $node .. ": " .. trim($scp["stderr"]))
+      end
+
+      $installed = ssh_mix($REMOTE[$node], '
+fn fail($message, $code)
+  try
+    remove($staged)
+  catch $stage_error
+    nil
+  end
+  try
+    remove($temporary)
+  catch $temporary_error
+    nil
+  end
+  eprint($message)
+  exit($code)
+end
+
+$temporary = dirname($dest) .. "/.d2.seed.new." .. uuid()
+$current = "__ABSENT__"
+if exists($dest, {follow_symlinks: false}) then
+  $existing = stat($dest, {follow_symlinks: false})
+  if not $existing["is_file"] or $existing["is_symlink"] then
+    fail("destination is no longer a regular non-symlink file", 7)
+  end
+  $current = hash_file($dest, "sha256")
+end
+if $current != $before then
+  fail("destination changed after preflight; refusing a concurrent seed update", 8)
+end
+if not is_file($staged) or hash_file($staged, "sha256") != $expected then
+  fail("transferred seed is not byte-identical to the secrets DB snapshot", 9)
+end
+$gid_text = trim(run("id -g cosmix-noded"))
+if $rc != 0 or not regex_match("^[0-9]+$", $gid_text) then
+  fail("cosmix-noded group disappeared after preflight", 10)
+end
+mkdir(dirname($dest), {parents: true})
+chmod(dirname($dest), 0o755)
+chown(dirname($dest), 0, 0)
+try
+  write_new($temporary, read_file($staged), 0o640)
+  chown($temporary, 0, to_number($gid_text))
+catch $stage_failure
+  fail("staging destination seed: " .. $stage_failure, 11)
+end
+if hash_file($temporary, "sha256") != $expected then
+  fail("destination staging file failed byte verification", 12)
+end
+try
+  rename($temporary, $dest)
+catch $publish_error
+  fail("atomic seed publish: " .. $publish_error, 13)
+end
+remove($staged)
+$info = stat($dest, {follow_symlinks: false})
+if hash_file($dest, "sha256") != $expected or $info["uid"] != 0 or
+    $info["gid"] != to_number($gid_text) or $info["perm"] != 0o640 then
+  fail("installed seed failed hash/ownership/mode verification", 14)
+end
+print(json_encode({token: $token, hash: hash_file($dest, "sha256"),
+  gid: $gid_text, perm: $info["perm"]}))
+', {bindings: {staged: $staged, dest: $DEST, expected: $expected,
+          before: $BEFORE[$node], token: $deploy_token}, decode: "json",
+          connect_timeout: 8, timeout: 30})
+      if not $installed["ok"] or $installed["value"]["token"] != $deploy_token then
+        $_wipe_failed = ssh_mix($REMOTE[$node], 'remove($staged)', {
+          bindings: {staged: $staged}, connect_timeout: 8, timeout: 10})
+        $d.die_if(true, $node .. " D2 seed install failed: " ..
+          trim($installed["stdout"]) .. " " .. trim($installed["stderr"]))
+      end
+    end
+  end
+
+  if $node == $LOCAL then
+    verify_local($node, $expected, $GIDS[$node])
+  else
+    $verified = ssh_mix($REMOTE[$node], '
+$info = stat($dest, {follow_symlinks: false})
+print(json_encode({hash: hash_file($dest, "sha256"), uid: $info["uid"],
+  gid: $info["gid"], perm: $info["perm"]}))
+', {bindings: {dest: $DEST}, decode: "json", connect_timeout: 8, timeout: 15})
+    $d.die_if(not $verified["ok"],
+      $node .. " post-install seed verification failed: " ..
+      trim($verified["stdout"]) .. " " .. trim($verified["stderr"]))
+    $d.die_if($verified["value"]["hash"] != $expected or
+        $verified["value"]["uid"] != 0 or
+        ("" .. $verified["value"]["gid"]) != $GIDS[$node] or
+        $verified["value"]["perm"] != 0o640,
+      $node .. " post-install seed hash/ownership/mode does not match the approved state")
+  end
+  print("[" .. $node .. "] placed: " .. $DEST ..
+    " (root:cosmix-noded 0640) integrity=MATCH sha256=" .. substr($expected, 0, 12))
+end
+
+print("")
+print("seed distribution complete: " .. join($nodes, " ") ..
+  " (NO restart — loads on the admission-posture roll)")

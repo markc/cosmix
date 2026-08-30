@@ -1,0 +1,229 @@
+#!/usr/bin/env mix
+-- cbc-fetch.mix — copy a built artefact back from a build-cluster worker.
+--
+--   mix _bin/cbc-fetch.mix --worker alpha --task 1000 \
+--     --path src/target/release/service --out /tmp/service
+--
+-- Workers are foreign roster nodes reached by their rostered SSH aliases; they
+-- are never resolved through the mesh inventory. The private hub config owns
+-- the worker allowlist and worker-side layout. Before copying, the worker must
+-- prove the artefact's SHA-256 and size. The fetched bytes are hashed locally,
+-- and a mismatch is removed and refused.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/cbc-fetch.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no build-cluster fetch config at " .. $CONF_PATH ..
+    " — create it from cbc-fetch.conf.mix.example before fetching")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["cbc_fetch"], {
+    schema_version: {type: "integer", enum: [1]},
+    workers: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}},
+    task_root: {type: "string", nonblank: true},
+    default_repo: {type: "string", nonblank: true}
+  })
+catch $e
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn contains_item($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn safe_component($value)
+  return type($value) == "string" and regex_match("^[A-Za-z0-9._-]+$", $value) and $value != "." and $value != ".."
+end
+
+fn safe_relative_path($value)
+  if type($value) != "string" or $value == "" or starts_with($value, "/") then
+    return false
+  end
+  for each $component in split($value, "/")
+    if not safe_component($component) then
+      return false
+    end
+  end
+  return true
+end
+
+fn safe_absolute_path($value)
+  if type($value) != "string" or not starts_with($value, "/") then
+    return false
+  end
+  $components = drop(split($value, "/"), 1)
+  if len($components) == 0 then
+    return false
+  end
+  for each $component in $components
+    if not safe_component($component) then
+      return false
+    end
+  end
+  return true
+end
+
+if not safe_absolute_path($CONF["task_root"]) then
+  config_error("task_root must be a safe absolute worker path")
+end
+if not safe_relative_path($CONF["default_repo"]) then
+  config_error("default_repo must be a safe relative path")
+end
+
+$ROSTER = $d.roster()
+$seen = []
+for each $configured_worker in $CONF["workers"]
+  if not safe_component($configured_worker) then
+    config_error("worker '" .. $configured_worker .. "' is not a safe SSH alias")
+  end
+  $d.assert_node($ROSTER, $configured_worker)
+  if not $d.is_foreign($ROSTER, $configured_worker) then
+    config_error("worker '" .. $configured_worker .. "' must be a foreign roster node")
+  end
+  if contains_item($seen, $configured_worker) then
+    config_error("worker '" .. $configured_worker .. "' is repeated")
+  end
+  push($seen, $configured_worker)
+end
+
+$options = getopt(args(), {
+  worker: {arg: true},
+  task: {arg: true},
+  path: {arg: true},
+  out: {arg: true},
+  repo: {arg: true}
+})
+if len($options["errors"]) > 0 then
+  print("  ERROR: " .. join($options["errors"], "; "))
+  exit(2)
+end
+if len($options["rest"]) > 0 then
+  print("  ERROR: unexpected arguments: " .. join($options["rest"], " "))
+  exit(2)
+end
+
+fn need($key)
+  $value = get_or($options["opts"], $key, "")
+  if $value == "" then
+    print("  ERROR: missing --" .. $key)
+    exit(2)
+  end
+  return $value
+end
+
+$worker = need("worker")
+$task = need("task")
+$path = need("path")
+$out = need("out")
+$repo = get_or($options["opts"], "repo", $CONF["default_repo"])
+
+$parsed = $d.parse_nodes($ROSTER, [$worker], [])
+$worker = $parsed["nodes"][0]
+if not $d.is_foreign($ROSTER, $worker) then
+  print("  ERROR: worker '" .. $worker .. "' is a mesh node; build workers must be foreign")
+  exit(2)
+end
+if not contains_item($CONF["workers"], $worker) then
+  print("  ERROR: worker '" .. $worker .. "' is not configured in " .. $CONF_PATH)
+  exit(2)
+end
+if not safe_component($task) then
+  print("  ERROR: invalid --task; use letters, digits, dot, underscore, or hyphen")
+  exit(2)
+end
+if not safe_relative_path($repo) then
+  print("  ERROR: invalid --repo; it must be a safe relative path")
+  exit(2)
+end
+if not safe_relative_path($path) then
+  print("  ERROR: invalid --path; it must be a safe relative path")
+  exit(2)
+end
+
+$remote = $CONF["task_root"] .. "/task-" .. $task .. "/" .. $repo .. "/" .. $path
+$metadata = ssh_mix($worker, '
+$sha_result = run_argv(["sha256sum", $artifact], {timeout: 120})
+if $sha_result["exit_code"] != 0 then
+  eprint("no such artefact on the worker: " .. $artifact .. " — " .. trim($sha_result["stderr"]))
+  exit(3)
+end
+$sha = split(trim($sha_result["stdout"]), " ")[0]
+if not regex_match("^[0-9a-f]{64}$", $sha) then
+  eprint("invalid sha256sum output for " .. $artifact)
+  exit(3)
+end
+$size_result = run_argv(["stat", "-c", "%s", $artifact], {timeout: 10})
+if $size_result["exit_code"] != 0 then
+  eprint("cannot stat artefact on the worker: " .. $artifact .. " — " .. trim($size_result["stderr"]))
+  exit(3)
+end
+$size = trim($size_result["stdout"])
+if not regex_match("^[0-9]+$", $size) then
+  eprint("invalid stat size for " .. $artifact)
+  exit(3)
+end
+print(data_encode({sha256: $sha, size: $size}))
+', {bindings: {artifact: $remote}, timeout: 180, decode: "data"})
+if not $metadata["ok"] then
+  print("  ERROR: " .. trim($metadata["stderr"] .. $metadata["stdout"]))
+  exit(3)
+end
+$remote_sha = $metadata["value"]["sha256"]
+$remote_size = $metadata["value"]["size"]
+print("worker artefact: " .. $remote_size .. " bytes, sha256 " .. $remote_sha)
+
+$copy_result = run_argv([
+  "scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+  $worker .. ":" .. $remote, $out
+], {timeout: 600})
+if $copy_result["exit_code"] != 0 then
+  print("  ERROR: scp failed: " .. trim($copy_result["stderr"]))
+  exit(4)
+end
+
+$local_hash_result = run_argv(["sha256sum", "--", $out], {timeout: 120})
+if $local_hash_result["exit_code"] != 0 then
+  print("  ERROR: local sha256sum failed: " .. trim($local_hash_result["stderr"]))
+  remove($out)
+  exit(5)
+end
+$local_sha = split(trim($local_hash_result["stdout"]), " ")[0]
+$local_size_result = run_argv(["stat", "-c", "%s", "--", $out], {timeout: 10})
+if $local_size_result["exit_code"] != 0 then
+  print("  ERROR: local stat failed: " .. trim($local_size_result["stderr"]))
+  remove($out)
+  exit(5)
+end
+$local_size = trim($local_size_result["stdout"])
+print("local artefact:  " .. $local_size .. " bytes, sha256 " .. $local_sha)
+if $local_sha != $remote_sha or $local_size != $remote_size then
+  print("  ERROR: byte identity mismatch: worker " .. $remote_size .. "/" .. $remote_sha ..
+    " local " .. $local_size .. "/" .. $local_sha .. " — refusing")
+  remove($out)
+  exit(5)
+end
+
+$mode_result = run_argv(["chmod", "0755", "--", $out], {timeout: 10})
+if $mode_result["exit_code"] != 0 then
+  print("  ERROR: chmod failed: " .. trim($mode_result["stderr"]))
+  exit(6)
+end
+print("fetched " .. $remote .. " -> " .. $out .. " (" .. $remote_size ..
+  " bytes, sha256 " .. substr($remote_sha, 0, 16) .. "…)")

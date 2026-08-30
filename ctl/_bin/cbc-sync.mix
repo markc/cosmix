@@ -1,0 +1,174 @@
+#!/usr/bin/env mix
+-- Pin the public CosMix monorepo checkout on named build workers.
+--
+--   mix _bin/cbc-sync.mix <worker> [<worker>...]
+--
+-- Workers are SSH aliases listed as foreign nodes in the private fleet roster.
+-- One local commit is resolved before any worker changes, so every successful
+-- checkout in an invocation is byte-identical at the Git object boundary.
+-- Cargo metadata then proves the monorepo workspace resolves on the worker;
+-- merely cloning and checking out a commit is not sufficient.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$argv = args()
+if len($argv) == 0 then
+  print("usage: mix cbc-sync.mix <worker> [<worker>...]")
+  print("  pin the CosMix checkout on named foreign build workers")
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/cbc-sync.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no build-worker checkout config at " .. $CONF_PATH ..
+    " — create it from cbc-sync.conf.mix.example")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["cbc_sync"], {
+    schema_version: {type: "integer", enum: [1]},
+    workers: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}},
+    worker_checkout: {type: "string", nonblank: true},
+    repository_url: {type: "string", nonblank: true}
+  })
+catch $e
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+  exit(2)
+end
+
+$WORKERS = $CONF["workers"]
+$CHECKOUT = $CONF["worker_checkout"]
+$REPOSITORY_URL = $CONF["repository_url"]
+
+-- These values are concatenated only inside remote run() calls. Restrict them
+-- to shell-inert absolute-path and credential-free HTTPS URL grammars before
+-- any SSH connection or remote filesystem mutation.
+if not regex_match("^/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+$", $CHECKOUT) or contains($CHECKOUT, "..") or contains($CHECKOUT, "/./") then
+  print("  ERROR: " .. $CONF_PATH ..
+    ": cbc_sync.worker_checkout must be an absolute shell-inert path without '..'")
+  exit(2)
+end
+if not regex_match("^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._-]+)+[.]git$", $REPOSITORY_URL) then
+  print("  ERROR: " .. $CONF_PATH ..
+    ": cbc_sync.repository_url must be a credential-free HTTPS .git URL")
+  exit(2)
+end
+
+$ROSTER = $d.roster()
+$seen_workers = []
+for each $worker in $WORKERS
+  $d.assert_node($ROSTER, $worker)
+  if not $d.is_foreign($ROSTER, $worker) then
+    print("  ERROR: " .. $CONF_PATH .. ": configured worker '" .. $worker ..
+      "' must be a foreign node in the fleet roster")
+    exit(2)
+  end
+  if contains($seen_workers, $worker) then
+    print("  ERROR: " .. $CONF_PATH .. ": duplicate worker '" .. $worker .. "'")
+    exit(2)
+  end
+  push($seen_workers, $worker)
+end
+
+$parsed = $d.parse_nodes($ROSTER, $argv, [])
+$workers = $parsed["nodes"]
+for each $worker in $workers
+  if not contains($WORKERS, $worker) then
+    print("  ERROR: node '" .. $worker .. "' is not a configured build worker; valid: " ..
+      join($WORKERS, " "))
+    exit(2)
+  end
+  if not $d.is_foreign($ROSTER, $worker) then
+    print("  ERROR: build worker '" .. $worker .. "' must be foreign in the fleet roster")
+    exit(2)
+  end
+end
+
+-- Reach every requested worker before changing any checkout. The invocation
+-- token prevents an unrelated or stale response from satisfying the gate.
+for each $worker in $workers
+  $token = "cbc-reach-" .. uuid()
+  $reach = ssh_mix($worker, 'print("CBC_REACH " .. $token)',
+    {bindings: {token: $token}, connect_timeout: 10, timeout: 30})
+  $d.die_if(not $reach["ok"] or trim($reach["stdout"]) != "CBC_REACH " .. $token,
+    $worker .. " unreachable or not running the system Mix interpreter: " ..
+    trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+end
+
+-- Resolve the pin once from the located public source tree. A branch name or
+-- moving remote ref is never sent to a worker.
+$SOURCE = $d.cosmix_root()
+$head = run_argv(["git", "-C", $SOURCE, "rev-parse", "HEAD"], {timeout: 60})
+$d.die_if($head["exit_code"] != 0,
+  "cannot read the CosMix HEAD at " .. $SOURCE .. ": " .. trim($head["stderr"]))
+$PIN = trim($head["stdout"])
+$d.die_if(not regex_match("^[0-9a-f]{40}([0-9a-f]{24})?$", $PIN),
+  "local Git HEAD is not a full 40- or 64-hex object id: " .. $PIN)
+print("pin cosmix = " .. slice($PIN, 0, 12))
+
+for each $worker in $workers
+  print("=== " .. $worker .. " ===")
+  $checkout_token = "cbc-checkout-" .. uuid()
+  $landed = ssh_mix($worker, '
+fn fail($message)
+  print("ERROR: " .. $message)
+  exit(1)
+end
+
+if is_dir($checkout) and not is_dir($checkout .. "/.git") then
+  fail("checkout path exists but is not a Git checkout: " .. $checkout)
+end
+if not is_dir($checkout) then
+  mkdir(dirname($checkout), {parents: true})
+  run("git clone -q " .. $repository_url .. " " .. $checkout)
+end
+
+$actual_url = trim(run("git -C " .. $checkout .. " remote get-url origin"))
+if $actual_url != $repository_url then
+  fail("origin mismatch: expected " .. $repository_url .. ", got " .. $actual_url)
+end
+run("git -C " .. $checkout .. " fetch -q origin", {timeout: 1200})
+run("git -C " .. $checkout .. " checkout -q --detach " .. $pin, {timeout: 120})
+$actual_pin = trim(run("git -C " .. $checkout .. " rev-parse HEAD"))
+if $actual_pin != $pin then
+  fail("checkout identity mismatch: expected " .. $pin .. ", got " .. $actual_pin)
+end
+$dirty = trim(run("git -C " .. $checkout .. " status --porcelain --untracked-files=all"))
+if $dirty != "" then
+  fail("checkout is not byte-clean at " .. $pin .. ": " .. $dirty)
+end
+print("CBC_CHECKOUT_OK " .. $token .. " " .. $actual_pin)
+', {bindings: {
+      checkout: $CHECKOUT,
+      repository_url: $REPOSITORY_URL,
+      pin: $PIN,
+      token: $checkout_token
+    }, connect_timeout: 10, timeout: 1800})
+  $d.die_if(not $landed["ok"] or
+    trim($landed["stdout"]) != "CBC_CHECKOUT_OK " .. $checkout_token .. " " .. $PIN,
+    $worker .. " checkout failed: " .. trim($landed["stdout"]) .. " " ..
+    trim($landed["stderr"]))
+  print("  checkout: " .. $PIN)
+
+  -- Run Cargo only on the worker. The per-invocation token makes this gate
+  -- prove that this metadata command ran after the exact checkout above.
+  $layout_token = "cbc-layout-" .. uuid()
+  $layout = ssh_mix($worker, '
+run("cargo metadata --format-version 1 --manifest-path " ..
+  $checkout .. "/src/Cargo.toml > /dev/null", {timeout: 1200})
+print("CBC_LAYOUT_OK " .. $token)
+', {bindings: {
+      checkout: $CHECKOUT,
+      token: $layout_token
+    }, connect_timeout: 10, timeout: 1800})
+  $d.die_if(not $layout["ok"] or trim($layout["stdout"]) != "CBC_LAYOUT_OK " .. $layout_token,
+    $worker .. " workspace layout check failed: " .. trim($layout["stdout"]) .. " " ..
+    trim($layout["stderr"]))
+  print("  workspace layout: RESOLVES")
+end
+
+print("checkout pinned on: " .. join($workers, ", "))

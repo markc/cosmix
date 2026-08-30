@@ -1,0 +1,31 @@
+-- cbc-provision.conf.mix.example — private build-worker site facts.
+-- Copy to cbc-provision.conf.mix in the private control hub and replace every
+-- placeholder. Worker names must be foreign nodes in fleet-roster.conf.mix;
+-- ssh_host is an SSH alias or address and is never resolved through mesh
+-- inventory.
+{
+  cbc_provision: {
+    schema_version: 1,
+
+    workers: [
+      {name: "alpha", ssh_host: "alpha-build"},
+      {name: "beta", ssh_host: "beta-build"}
+    ],
+
+    -- Pin all workers to the build coordinator's exact Rust release so their
+    -- compiler identity and sccache keys agree.
+    rust_version: "1.99.0",
+
+    -- These paths are site-owned mountpoints. Use private pool/dataset-backed
+    -- paths here; the provisioner creates the directories but does not mount
+    -- or format storage.
+    cache_dir: "/srv/build-cache/sccache",
+    cache_size_bytes: 322122547200,
+    build_dir: "/srv/build",
+
+    -- Test fixtures create temporary repositories and commits on the worker.
+    git_default_branch: "main",
+    git_user_name: "Example Builder",
+    git_user_email: "builder@example.org"
+  }
+}

@@ -1,0 +1,8 @@
+-- gen_mesh_registry.conf.mix.example — private mesh identity and namespace path.
+-- Copy to gen_mesh_registry.conf.mix in your private control hub and edit it there.
+-- The public starter deliberately does not ship an active configuration.
+gen_mesh_registry: {
+  schema_version: 1,
+  expected_mesh: "example.org",
+  namespace_root: "/home/user/.ns"
+}

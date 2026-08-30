@@ -1,0 +1,383 @@
+#!/usr/bin/env mix
+-- cbc-provision.mix — provision configured CosMix Build Cluster workers.
+--
+--   mix _bin/cbc-provision.mix <worker> [<worker>...]
+--
+-- Workers are foreign fleet-roster nodes reached through hub-private SSH
+-- aliases. A working system Mix must already be installed: every remote step
+-- is Mix source sent with ssh_mix. Provisioning is idempotent, preserves the
+-- phase order, and stops the current worker on its first hard failure.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/cbc-provision.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: missing cbc-provision config: " .. $CONF_PATH)
+  print("         copy _etc/cbc-provision.conf.mix.example there and replace every placeholder")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["cbc_provision"], {
+    schema_version: {type: "integer", enum: [1]},
+    workers: {type: "list", min_length: 1, items: {type: "map", schema: {
+      name: {type: "string", nonblank: true},
+      ssh_host: {type: "string", nonblank: true}
+    }}},
+    rust_version: {type: "string", nonblank: true},
+    cache_dir: {type: "string", nonblank: true},
+    cache_size_bytes: {type: "integer", min: 1},
+    build_dir: {type: "string", nonblank: true},
+    git_default_branch: {type: "string", nonblank: true},
+    git_user_name: {type: "string", nonblank: true},
+    git_user_email: {type: "string", nonblank: true}
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn contains_item($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn require_safe_path($key, $path)
+  if not starts_with($path, "/") or contains($path, "//") then
+    config_error("'" .. $key .. "' must be a normalised absolute path")
+  end
+  for each $part in split($path, "/")
+    if $part == "." or $part == ".." then
+      config_error("'" .. $key .. "' must not contain . or .. components")
+    end
+  end
+  if not regex_match("^/[A-Za-z0-9._/-]+$", $path) then
+    config_error("'" .. $key .. "' contains an unsafe path character")
+  end
+  return $path
+end
+
+$WORKERS = $CONF["workers"]
+fn worker_config($name)
+  $found = nil
+  for each $worker in $WORKERS
+    if $worker["name"] == $name then
+      if $found != nil then
+        config_error("duplicate worker name '" .. $name .. "'")
+      end
+      $found = $worker
+    end
+  end
+  return $found
+end
+
+for each $worker in $WORKERS
+  if not regex_match("^[A-Za-z0-9][A-Za-z0-9_.-]*$", $worker["name"]) then
+    config_error("worker name '" .. $worker["name"] .. "' is not safe")
+  end
+  if not regex_match("^[A-Za-z0-9][A-Za-z0-9._@:-]*$", $worker["ssh_host"]) then
+    config_error("workers." .. $worker["name"] .. ".ssh_host is not a safe SSH alias or address")
+  end
+  $_worker = worker_config($worker["name"])
+end
+
+$RUST_VERSION = $CONF["rust_version"]
+if not regex_match("^[0-9]+[.][0-9]+[.][0-9]+$", $RUST_VERSION) then
+  config_error("'rust_version' must be a three-part dotted version")
+end
+$CACHE_DIR = require_safe_path("cache_dir", $CONF["cache_dir"])
+$CACHE_SIZE = $CONF["cache_size_bytes"]
+$BUILD_DIR = require_safe_path("build_dir", $CONF["build_dir"])
+$GIT_BRANCH = $CONF["git_default_branch"]
+$GIT_NAME = $CONF["git_user_name"]
+$GIT_EMAIL = $CONF["git_user_email"]
+if not regex_match("^[A-Za-z0-9._/-]+$", $GIT_BRANCH) then
+  config_error("'git_default_branch' contains an unsafe character")
+end
+if not regex_match("^[A-Za-z0-9 ._-]+$", $GIT_NAME) then
+  config_error("'git_user_name' contains an unsafe character")
+end
+if not regex_match("^[A-Za-z0-9._+@-]+$", $GIT_EMAIL) then
+  config_error("'git_user_email' contains an unsafe character")
+end
+
+-- Arch packages required by the headless and desktop workspaces. These are
+-- build mechanics, not site inventory.
+$BASE_PKGS = [
+  "base-devel", "git", "curl", "openssl", "pkgconf", "cmake", "clang",
+  "mold", "sccache", "rustup", "python", "rsync", "jq", "file", "which",
+  "alsa-lib", "jack2", "sqlite", "zstd", "dbus", "libpulse"
+]
+$DESKTOP_PKGS = [
+  "pkgconf", "wayland", "libxkbcommon", "libinput", "systemd-libs",
+  "vulkan-icd-loader", "vulkan-headers", "alsa-lib", "fontconfig",
+  "freetype2", "libdrm", "mesa", "libglvnd", "libx11", "libxcb", "seatd"
+]
+$PACKAGES = concat($BASE_PKGS, $DESKTOP_PKGS)
+
+$argv = args()
+if len($argv) == 0 then
+  print("usage: cbc-provision.mix <worker> [<worker>...]")
+  exit(2)
+end
+
+$ROSTER = $d.roster()
+for each $worker in $WORKERS
+  $d.assert_node($ROSTER, $worker["name"])
+  if not $d.is_foreign($ROSTER, $worker["name"]) then
+    config_error("worker '" .. $worker["name"] .. "' is not foreign in the fleet roster")
+  end
+end
+$nodes = []
+$REMOTE = {}
+for each $node in $argv
+  $d.assert_node($ROSTER, $node)
+  if not $d.is_foreign($ROSTER, $node) then
+    config_error("worker '" .. $node .. "' is not foreign in the fleet roster")
+  end
+  $worker = worker_config($node)
+  if $worker == nil then
+    config_error("worker '" .. $node .. "' is not configured in 'workers'")
+  end
+  if contains_item($nodes, $node) then
+    config_error("worker '" .. $node .. "' was selected more than once")
+  end
+  push($nodes, $node)
+  $REMOTE[$node] = $worker["ssh_host"]
+end
+
+fn result_text($result)
+  $text = trim($result["stdout"])
+  if trim($result["stderr"]) != "" then
+    if $text != "" then
+      $text = $text .. "\n"
+    end
+    $text = $text .. trim($result["stderr"])
+  end
+  return $text
+end
+
+fn report_step($node, $label, $result)
+  if not $result["ok"] then
+    print("  [" .. $node .. "] " .. $label .. ": rc=" .. $result["exit_code"] .. " FAILED")
+    $text = result_text($result)
+    if $text != "" then
+      print("    " .. join(take(split($text, "\n"), -15), "\n    "))
+    end
+    return false
+  end
+  print("  [" .. $node .. "] " .. $label .. ": ok")
+  return true
+end
+
+-- Reach every selected worker before mutating the first one. These are SSH
+-- aliases for foreign nodes; mesh inventory is deliberately not consulted.
+for each $node in $nodes
+  $token = uuid()
+  $reach = ssh_mix($REMOTE[$node], 'print("CBC_REACH " .. $token)', {
+    bindings: {token: $token}, connect_timeout: 10, timeout: 15
+  })
+  $d.die_if(not $reach["ok"] or trim($reach["stdout"]) != "CBC_REACH " .. $token,
+    $node .. " unreachable or has no working system Mix: " .. result_text($reach))
+end
+
+fn provision($node)
+  $remote = $REMOTE[$node]
+  print("=== provisioning " .. $node .. " ===")
+
+  -- pacman 7's Landlock download sandbox cannot operate in an unprivileged
+  -- container. Make the required setting explicit before any pacman command,
+  -- then prove the active line exists.
+  $sandbox = ssh_mix($remote, '
+$path = "/etc/pacman.conf"
+$lines = []
+$found = false
+for each $line in split(read_file($path), "\n")
+  $clean = trim($line)
+  if $clean == "DisableSandbox" or $clean == "#DisableSandbox" then
+    if not $found then
+      push($lines, "DisableSandbox")
+      $found = true
+    end
+  else
+    push($lines, $line)
+  end
+end
+if not $found then
+  push($lines, "DisableSandbox")
+end
+write_file($path, join($lines, "\n"))
+$active = 0
+for each $line in split(read_file($path), "\n")
+  if trim($line) == "DisableSandbox" then
+    $active = $active + 1
+  end
+end
+if $active != 1 then
+  eprint("expected exactly one active DisableSandbox line")
+  exit(7)
+end
+print("done")
+', {connect_timeout: 10, timeout: 30})
+  if not report_step($node, "pacman sandbox off", $sandbox) then return false end
+
+  -- A stale template keyring makes every package transaction fail. Preserve
+  -- the old soft failure for the keyring refresh itself: init and populate are
+  -- hard gates, while the later full upgrade remains authoritative.
+  $keyring = ssh_mix($remote, '
+$output = run("pacman-key --init >/dev/null 2>&1")
+if $rc != 0 then eprint($output); exit($rc) end
+$output = run("pacman-key --populate archlinux >/dev/null 2>&1")
+if $rc != 0 then eprint($output); exit($rc) end
+$output = run("pacman -Sy --noconfirm archlinux-keyring >/dev/null 2>&1")
+if $rc != 0 then eprint("warning: archlinux-keyring refresh failed; full upgrade will decide readiness") end
+print("done")
+', {connect_timeout: 10, timeout: 600})
+  if not report_step($node, "keyring", $keyring) then return false end
+
+  $upgrade = ssh_mix($remote, '
+$output = run("pacman -Syu --noconfirm --needed")
+if $rc != 0 then eprint($output); exit($rc) end
+print("done")
+', {connect_timeout: 10, timeout: 3000})
+  if not report_step($node, "pacman -Syu", $upgrade) then return false end
+
+  $packages = ssh_mix($remote, '
+$output = run("pacman -S --noconfirm --needed " .. join($packages, " "))
+if $rc != 0 then eprint($output); exit($rc) end
+for each $package in $packages
+  $query = run("pacman -Q " .. $package)
+  if $rc != 0 then eprint("package verification failed: " .. $package .. " " .. $query); exit(7) end
+end
+print("done")
+', {bindings: {packages: $PACKAGES}, connect_timeout: 10, timeout: 3000})
+  if not report_step($node, "packages", $packages) then return false end
+
+  $toolchain = ssh_mix($remote, '
+$output = run("rustup toolchain install " .. $rust_version .. " --profile minimal -c clippy,rustfmt")
+if $rc != 0 then eprint($output); exit($rc) end
+$output = run("rustup default " .. $rust_version)
+if $rc != 0 then eprint($output); exit($rc) end
+$actual = run("rustc --version")
+if $rc != 0 or not starts_with(trim($actual), "rustc " .. $rust_version .. " ") then
+  eprint("rustc version mismatch: " .. trim($actual))
+  exit(7)
+end
+print(trim($actual))
+', {bindings: {rust_version: $RUST_VERSION}, connect_timeout: 10, timeout: 1800})
+  if not report_step($node, "toolchain pin " .. $RUST_VERSION, $toolchain) then return false end
+
+  $cargo_config = "[build]\nrustc-wrapper = '/usr/bin/sccache'\nincremental = false\n"
+  $sccache_config = "[cache.disk]\ndir = '" .. $CACHE_DIR .. "'\nsize = " .. $CACHE_SIZE .. "\n"
+  $cache = ssh_mix($remote, '
+$cargo_path = "/root/.cargo/config.toml"
+$cache_path = "/root/.config/sccache/config"
+mkdir(dirname($cargo_path), {parents: true})
+mkdir($cache_dir, {parents: true})
+mkdir(dirname($cache_path), {parents: true})
+write_file($cargo_path, $cargo_config)
+write_file($cache_path, $sccache_config)
+chmod($cargo_path, 0o644)
+chmod($cache_path, 0o644)
+if read_file($cargo_path) != $cargo_config or read_file($cache_path) != $sccache_config then
+  eprint("cargo or sccache config byte verification failed")
+  exit(7)
+end
+print("done")
+', {bindings: {
+    cargo_config: $cargo_config,
+    sccache_config: $sccache_config,
+    cache_dir: $CACHE_DIR
+  }, connect_timeout: 10, timeout: 30})
+  if not report_step($node, "cargo and cache config", $cache) then return false end
+
+  $build_dir = ssh_mix($remote, '
+mkdir($build_dir, {parents: true})
+chmod($build_dir, 0o755)
+$info = stat($build_dir)
+if not $info["is_dir"] or $info["perm"] != 0o755 then
+  eprint("build directory verification failed")
+  exit(7)
+end
+print("done")
+', {bindings: {build_dir: $BUILD_DIR}, connect_timeout: 10, timeout: 30})
+  if not report_step($node, "build dir", $build_dir) then return false end
+
+  -- Test fixtures create commits and assume the integration branch. Exact
+  -- identity and branch checks prevent a worker-specific false gate result.
+  $git = ssh_mix($remote, '
+$quote = chr(39)
+$output = run("git config --global init.defaultBranch " .. $quote .. $branch .. $quote)
+if $rc != 0 then eprint($output); exit($rc) end
+$output = run("git config --global user.name " .. $quote .. $name .. $quote)
+if $rc != 0 then eprint($output); exit($rc) end
+$output = run("git config --global user.email " .. $quote .. $email .. $quote)
+if $rc != 0 then eprint($output); exit($rc) end
+$actual_branch = run("git config --global --get init.defaultBranch")
+if $rc != 0 or trim($actual_branch) != $branch then eprint("default branch verification failed"); exit(7) end
+$actual_name = run("git config --global --get user.name")
+if $rc != 0 or trim($actual_name) != $name then eprint("git name verification failed"); exit(7) end
+$actual_email = run("git config --global --get user.email")
+if $rc != 0 or trim($actual_email) != $email then eprint("git email verification failed"); exit(7) end
+print(trim($actual_branch))
+', {bindings: {branch: $GIT_BRANCH, name: $GIT_NAME, email: $GIT_EMAIL},
+    connect_timeout: 10, timeout: 30})
+  if not report_step($node, "git identity", $git) then return false end
+
+  return true
+end
+
+fn verify($node)
+  print("--- verifying " .. $node .. " ---")
+  $probe = ssh_mix($REMOTE[$node], '
+fn probe($label, $command)
+  $output = run($command)
+  $code = $rc
+  print($label .. ": rc=" .. $code .. " " .. trim($output))
+end
+probe("os", "grep PRETTY /etc/os-release")
+probe("glibc", "ldd --version 2>/dev/null | head -1")
+probe("rustc", "rustc --version")
+probe("cargo", "cargo --version")
+probe("sccache", "sccache --version")
+probe("mold", "mold --version | head -1")
+probe("cache cap", "sccache --show-stats | grep Max")
+probe("cores", "nproc")
+probe("build pool", "df -h " .. $build_dir .. " " .. $cache_dir)
+', {bindings: {build_dir: $BUILD_DIR, cache_dir: $CACHE_DIR},
+    connect_timeout: 10, timeout: 300})
+  if not $probe["ok"] then
+    print("  [" .. $node .. "] verification transport: rc=" .. $probe["exit_code"] .. " " .. result_text($probe))
+    return nil
+  end
+  for each $line in split(trim($probe["stdout"]), "\n")
+    print("  [" .. $node .. "] " .. $line)
+  end
+end
+
+$failed = []
+for each $node in $nodes
+  if provision($node) then
+    verify($node)
+  else
+    push($failed, $node)
+    print("=== " .. $node .. " FAILED — not verified ===")
+  end
+end
+
+if len($failed) > 0 then
+  print("FAILED: " .. join($failed, ", "))
+  exit(1)
+end
+print("all workers provisioned")

@@ -1,0 +1,9 @@
+-- Private build-cluster layout for cbc-fetch.mix.
+-- Copy this file to cbc-fetch.conf.mix in the private control hub. Worker
+-- names are SSH aliases and must also be foreign nodes in the fleet roster.
+cbc_fetch: {
+  schema_version: 1,
+  workers: ["alpha", "beta"],
+  task_root: "/srv/build-pool/tasks",
+  default_repo: "cosmix"
+}

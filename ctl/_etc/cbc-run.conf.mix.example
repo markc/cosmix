@@ -1,0 +1,23 @@
+-- cbc-run.conf.mix.example — private build-worker runner settings.
+-- Copy this file to cbc-run.conf.mix in the private control hub.
+{
+  cbc_run: {
+    schema_version: 1,
+
+    -- Every worker must also be a foreign node in fleet-roster.conf.mix.
+    -- `node` is the SSH alias; slots are numbered from 1 through `slots`.
+    workers: [
+      {node: "alpha", slots: 4},
+      {node: "beta", slots: 4}
+    ],
+
+    -- Worker-local paths. slot_prefix has the slot number appended to it.
+    checkout_root: "/srv/build/cosmix",
+    slot_prefix: "/srv/build/slot",
+    worker_home: "/home/user",
+    worker_path: "/home/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin",
+
+    -- Directory below checkout_root, or below a mounted task worktree.
+    default_repo: "cosmix"
+  }
+}

@@ -1,0 +1,472 @@
+#!/usr/bin/env mix
+-- cbc-run.mix — detached, reattachable execution on a build worker.
+--
+--   mix _bin/cbc-run.mix start  --worker alpha --job 70 -- cargo test --workspace
+--   mix _bin/cbc-run.mix status --worker alpha --job 70
+--   mix _bin/cbc-run.mix logs   --worker alpha --job 70 [--from <line>]
+--   mix _bin/cbc-run.mix wait   --worker alpha --job 70
+--   mix _bin/cbc-run.mix clean  --worker alpha --job 70
+--
+-- The job belongs to a transient systemd unit on the worker, so losing the
+-- SSH connection loses only the view of the work. Result and ExecMainStatus
+-- distinguish a command exit from unit failures; SubState, rather than
+-- `systemctl is-active`, distinguishes running from a retained finished unit.
+-- Build workers are foreign roster nodes and are always reached by SSH alias,
+-- never through mesh inventory.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/cbc-run.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no build-cluster runner config at " .. $CONF_PATH ..
+    " — create it from cbc-run.conf.mix.example")
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  if type($loaded) != "map" or type($loaded["cbc_run"]) != "map" then
+    config_error("must contain a cbc_run strict-data map")
+  end
+  $CONF = validate($loaded["cbc_run"], {
+    schema_version: {type: "integer", enum: [1]},
+    workers: {
+      type: "list",
+      min_length: 1,
+      items: {
+        type: "map",
+        schema: {
+          node: {type: "string", nonblank: true},
+          slots: {type: "integer", min: 1}
+        }
+      }
+    },
+    checkout_root: {type: "string", nonblank: true},
+    slot_prefix: {type: "string", nonblank: true},
+    worker_home: {type: "string", nonblank: true},
+    worker_path: {type: "string", nonblank: true},
+    default_repo: {type: "string", nonblank: true}
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+fn find_worker($workers, $node)
+  $found = nil
+  for each $worker in $workers
+    if $worker["node"] == $node then
+      if $found != nil then
+        config_error("duplicate worker node '" .. $node .. "'")
+      end
+      $found = $worker
+    end
+  end
+  return $found
+end
+
+fn need_opt($opts, $key)
+  $value = get_or($opts, $key, "")
+  if $value == "" then
+    print("missing --" .. $key)
+    exit(2)
+  end
+  return $value
+end
+
+fn relay($result)
+  if trim($result["stdout"]) != "" then
+    print(trim($result["stdout"]))
+  end
+  if trim($result["stderr"]) != "" then
+    eprint(trim($result["stderr"]))
+  end
+end
+
+fn remote_failed($result, $context)
+  if not $result["ok"] then
+    relay($result)
+    print("  ERROR: " .. $context .. " failed on " .. $result["host"])
+    exit(1)
+  end
+end
+
+fn unit_name($job)
+  return "cbc-job-" .. $job
+end
+
+-- The detached unit runs this Mix program. Commands remain argv lists; the
+-- constant slot path preserves compiler-cache keys without a shell re-split.
+-- Cleanup is also invoked by ExecStopPost, so killing a unit cannot leave its
+-- worktree mounted over the next job's slot.
+$JOB_SOURCE = join([
+  '$runner_args = args()',
+  'if len($runner_args) == 0 then',
+  '  eprint("cbc runner: missing action")',
+  '  exit(64)',
+  'end',
+  '$runner_action = $runner_args[0]',
+  '$slot_dir = env("CBC_SLOT_DIR")',
+  'fn unmount_slot($path)',
+  '  if $path == "" then',
+  '    return',
+  '  end',
+  '  while true',
+  '    $mounted = run_argv(["mountpoint", "-q", $path], {timeout: 10})',
+  '    if $mounted["exit_code"] != 0 then',
+  '      return',
+  '    end',
+  '    $unmount = run_argv(["umount", $path], {timeout: 30})',
+  '    if $unmount["exit_code"] != 0 then',
+  '      eprint("cbc runner: cannot unmount " .. $path .. ": " .. trim($unmount["stderr"]))',
+  '      exit(74)',
+  '    end',
+  '  end',
+  'end',
+  'if $runner_action == "cleanup" then',
+  '  unmount_slot($slot_dir)',
+  '  exit(0)',
+  'end',
+  'if $runner_action != "run" then',
+  '  eprint("cbc runner: unknown action " .. $runner_action)',
+  '  exit(64)',
+  'end',
+  '$command = drop($runner_args, 1)',
+  'if len($command) == 0 then',
+  '  eprint("cbc runner: empty command")',
+  '  exit(64)',
+  'end',
+  '$worktree = env("CBC_WORKTREE")',
+  '$work_dir = env("CBC_WORK_DIR")',
+  'if $worktree != "" then',
+  '  mkdir($slot_dir, {parents: true})',
+  '  unmount_slot($slot_dir)',
+  '  $self_bind = run_argv(["mount", "--bind", $slot_dir, $slot_dir], {timeout: 30})',
+  '  if $self_bind["exit_code"] != 0 then',
+  '    eprint(trim($self_bind["stderr"]))',
+  '    exit(70)',
+  '  end',
+  '  $private = run_argv(["mount", "--make-private", $slot_dir], {timeout: 30})',
+  '  if $private["exit_code"] != 0 then',
+  '    eprint(trim($private["stderr"]))',
+  '    exit(70)',
+  '  end',
+  '  $bind = run_argv(["mount", "--bind", $worktree, $slot_dir], {timeout: 30})',
+  '  if $bind["exit_code"] != 0 then',
+  '    eprint(trim($bind["stderr"]))',
+  '    exit(71)',
+  '  end',
+  '  $private = run_argv(["mount", "--make-private", $slot_dir], {timeout: 30})',
+  '  if $private["exit_code"] != 0 then',
+  '    eprint(trim($private["stderr"]))',
+  '    exit(71)',
+  '  end',
+  '  $head = run_argv(["git", "rev-parse", "--short", "HEAD"], {cwd: $work_dir, timeout: 30})',
+  '  $mount = run_argv(["findmnt", "-n", "-o", "SOURCE", $slot_dir], {timeout: 30})',
+  '  if $head["exit_code"] != 0 or $mount["exit_code"] != 0 then',
+  '    eprint("cbc runner: mounted worktree identity preflight failed: " .. trim($head["stderr"]) .. " " .. trim($mount["stderr"]))',
+  '    exit(72)',
+  '  end',
+  '  print("CBC_TREE_HEAD=" .. trim($head["stdout"]) .. " CBC_MOUNT=" .. trim($mount["stdout"]))',
+  'end',
+  '$run = run_argv($command, {cwd: $work_dir, timeout: 0, stdout: "inherit", stderr: "inherit"})',
+  '$command_exit = $run["exit_code"]',
+  'if $worktree != "" then',
+  '  unmount_slot($slot_dir)',
+  'end',
+  'exit($command_exit)'
+], "\n")
+
+$g = getopt(args(), {
+  worker: {arg: true},
+  job: {arg: true},
+  repo: {arg: true},
+  from: {arg: true},
+  worktree: {arg: true},
+  slot: {arg: true}
+})
+if len($g["errors"]) != 0 then
+  print("bad options: " .. join($g["errors"], "; "))
+  exit(2)
+end
+$rest = $g["rest"]
+if len($rest) == 0 then
+  print("usage: cbc-run.mix start|status|logs|wait|clean --worker <node> --job <id> [-- <cmd>]")
+  exit(2)
+end
+
+$action = $rest[0]
+if not contains(["start", "status", "logs", "wait", "clean"], $action) then
+  print("unknown action: " .. $action)
+  exit(2)
+end
+$worker = need_opt($g["opts"], "worker")
+$job = need_opt($g["opts"], "job")
+if not regex_match("^[A-Za-z0-9][A-Za-z0-9_.-]*$", $job) then
+  print("invalid --job: use letters, digits, dot, underscore or hyphen")
+  exit(2)
+end
+$unit = unit_name($job)
+
+$ROSTER = $d.roster()
+$d.assert_node($ROSTER, $worker)
+if not $d.is_foreign($ROSTER, $worker) then
+  config_error("worker '" .. $worker .. "' must be a foreign roster node")
+end
+$worker_conf = find_worker($CONF["workers"], $worker)
+if $worker_conf == nil then
+  config_error("worker '" .. $worker .. "' is not listed in cbc_run.workers")
+end
+for each $configured in $CONF["workers"]
+  $d.assert_node($ROSTER, $configured["node"])
+  if not $d.is_foreign($ROSTER, $configured["node"]) then
+    config_error("configured worker '" .. $configured["node"] .. "' must be foreign")
+  end
+  $_unique = find_worker($CONF["workers"], $configured["node"])
+end
+
+-- Resolve and validate every local/config input before contacting the worker.
+$repo = get_or($g["opts"], "repo", $CONF["default_repo"])
+if not regex_match("^[A-Za-z0-9._-]+$", $repo) then
+  print("invalid --repo: use one relative directory name")
+  exit(2)
+end
+$worktree = get_or($g["opts"], "worktree", "")
+$slot_text = get_or($g["opts"], "slot", "1")
+$slot = to_number($slot_text)
+if $slot == nil or $slot < 1 or $slot > $worker_conf["slots"] or not regex_match("^[0-9]+$", $slot_text) then
+  print("invalid --slot: " .. $worker .. " has slots 1.." .. $worker_conf["slots"])
+  exit(2)
+end
+if $worktree != "" and not starts_with($worktree, "/") then
+  print("invalid --worktree: expected an absolute worker path")
+  exit(2)
+end
+$slot_dir = $CONF["slot_prefix"] .. $slot_text
+$work_dir = $CONF["checkout_root"] .. "/" .. $repo .. "/src"
+if $worktree != "" then
+  $work_dir = $slot_dir .. "/" .. $repo .. "/src"
+end
+$runner_path = "/run/" .. $unit .. ".mix"
+
+$command = []
+if $action == "start" then
+  $command = drop($rest, 1)
+  if len($command) == 0 then
+    print("start needs a command after --")
+    exit(2)
+  end
+  $runner_probe = run_argv([$d.mix_bin(), "-c", $JOB_SOURCE, "cleanup"], {
+    timeout: 10,
+    env: {CBC_SLOT_DIR: ""}
+  })
+  $d.die_if($runner_probe["exit_code"] != 0,
+    "detached Mix runner preflight failed: " .. trim($runner_probe["stderr"]))
+end
+$from = 0
+if $action == "logs" then
+  $from_text = get_or($g["opts"], "from", "0")
+  $from = to_number($from_text)
+  if $from == nil or $from < 0 or not regex_match("^[0-9]+$", $from_text) then
+    print("invalid --from: expected a non-negative line number")
+    exit(2)
+  end
+end
+
+-- A distinct challenge prevents cached or unrelated output from satisfying
+-- the reachability gate. This happens before every action and mutation.
+$token = $unit .. "-" .. uuid()
+$reach = ssh_mix($worker, 'print("CBC_REACH " .. $token)', {
+  bindings: {token: $token},
+  timeout: 30
+})
+remote_failed($reach, "reachability preflight")
+if not contains($reach["stdout"], "CBC_REACH " .. $token) then
+  print("  ERROR: reachability preflight returned the wrong challenge on " .. $worker)
+  exit(1)
+end
+
+if $action == "start" then
+  $argv = concat([
+    "systemd-run",
+    "--unit=" .. $unit,
+    "--property=RemainAfterExit=yes",
+    "--property=ExecStopPost=/opt/cosmix/bin/mix " .. $runner_path .. " cleanup",
+    "--setenv=HOME=" .. $CONF["worker_home"],
+    "--setenv=PATH=" .. $CONF["worker_path"],
+    "--setenv=CBC_WORKTREE=" .. $worktree,
+    "--setenv=CBC_SLOT_DIR=" .. $slot_dir,
+    "--setenv=CBC_WORK_DIR=" .. $work_dir,
+    "--working-directory=/",
+    "--description=cosmix build job " .. $job,
+    "/opt/cosmix/bin/mix",
+    $runner_path,
+    "run"
+  ], $command)
+
+  $start = ssh_mix($worker, '
+$show = run_argv(["systemctl", "show", "-p", "LoadState", "-p", "SubState", "--value", $unit], {timeout: 10})
+if $show["exit_code"] != 0 then
+  eprint(trim($show["stderr"]))
+  exit($show["exit_code"])
+end
+$state = split(trim($show["stdout"]), "\n")
+if len($state) == 2 and $state[0] == "loaded" then
+  if $state[1] == "running" or $state[1] == "start" then
+    eprint("start: " .. $unit .. " is already RUNNING — wait for it or release the job")
+    exit(4)
+  end
+  $stop = run_argv(["systemctl", "stop", $unit], {timeout: 30})
+  if $stop["exit_code"] != 0 then
+    eprint(trim($stop["stderr"]))
+    exit($stop["exit_code"])
+  end
+end
+$reset = run_argv(["systemctl", "reset-failed", $unit], {timeout: 10})
+if $reset["exit_code"] != 0 then
+  eprint(trim($reset["stderr"]))
+  exit($reset["exit_code"])
+end
+write_file($runner_path, $job_source)
+chmod($runner_path, 0o700)
+$scheduled = run_argv($argv, {timeout: 60})
+if trim($scheduled["stdout"]) != "" then
+  print(trim($scheduled["stdout"]))
+end
+if $scheduled["exit_code"] != 0 then
+  eprint(trim($scheduled["stderr"]))
+  remove($runner_path)
+  exit($scheduled["exit_code"])
+end
+', {bindings: {
+    unit: $unit,
+    runner_path: $runner_path,
+    job_source: $JOB_SOURCE,
+    argv: $argv
+  }, timeout: 120})
+  if contains($start["stderr"], "is already RUNNING") then
+    relay($start)
+    exit(4)
+  end
+  remote_failed($start, "start")
+  relay($start)
+  exit(0)
+end
+
+if $action == "status" then
+  $status = ssh_mix($worker, '
+$show = run_argv(["systemctl", "show", "-p", "LoadState", "-p", "ActiveState", "-p", "SubState", "-p", "Result", "-p", "ExecMainStatus", "--value", $unit], {timeout: 10})
+if $show["exit_code"] != 0 then
+  eprint(trim($show["stderr"]))
+  exit($show["exit_code"])
+end
+$values = split(trim($show["stdout"]), "\n")
+while len($values) < 5
+  push($values, "")
+end
+print("load=" .. $values[0] .. " active=" .. $values[1] .. " sub=" .. $values[2] .. " result=" .. $values[3] .. " exit=" .. $values[4])
+', {bindings: {unit: $unit}, timeout: 60})
+  remote_failed($status, "status")
+  relay($status)
+  $output = trim($status["stdout"])
+  if contains($output, "load=not-found") or contains($output, "active=inactive") then
+    print("  -> NO SUCH JOB — never started, or already released.")
+    print("     This is NOT a pass. Do not record a verdict from it.")
+    exit(3)
+  end
+  if contains($output, "sub=running") or contains($output, "sub=start") then
+    print("  -> RUNNING")
+  else
+    if contains($output, "result=success") then
+      print("  -> FINISHED, exit 0")
+    else
+      if contains($output, "result=exit-code") then
+        print("  -> FINISHED; the exit code above is the JOB's")
+      else
+        print("  -> HARNESS FAULT (not a job result) — exit code is meaningless")
+      end
+    end
+  end
+  exit(0)
+end
+
+if $action == "logs" then
+  $logs = ssh_mix($worker, '
+$journal = run_argv(["journalctl", "-u", $unit, "--no-pager", "-o", "cat"], {timeout: 120, max_output: 67108864})
+if $journal["exit_code"] != 0 then
+  eprint(trim($journal["stderr"]))
+  exit($journal["exit_code"])
+end
+$lines = split($journal["stdout"], "\n")
+print(join(drop($lines, $from), "\n"))
+', {bindings: {unit: $unit, from: $from}, timeout: 300})
+  remote_failed($logs, "logs")
+  relay($logs)
+  exit(0)
+end
+
+if $action == "wait" then
+  $wait = ssh_mix($worker, '
+fn read_state($unit)
+  $show = run_argv(["systemctl", "show", "-p", "LoadState", "-p", "ActiveState", "-p", "SubState", "-p", "Result", "-p", "ExecMainStatus", "--value", $unit], {timeout: 10})
+  if $show["exit_code"] != 0 then
+    eprint(trim($show["stderr"]))
+    exit($show["exit_code"])
+  end
+  $values = split(trim($show["stdout"]), "\n")
+  while len($values) < 5
+    push($values, "")
+  end
+  return $values
+end
+$values = read_state($unit)
+if $values[0] != "loaded" then
+  print("load=" .. $values[0])
+  exit(3)
+end
+while contains(["running", "start", "start-pre", "start-post", "activating"], $values[2])
+  sleep(3)
+  $values = read_state($unit)
+end
+print("result=" .. $values[3] .. " exit=" .. $values[4])
+', {bindings: {unit: $unit}, timeout: 7200})
+  if starts_with(trim($wait["stdout"]), "load=") then
+    relay($wait)
+    print("  -> NO SUCH JOB — never started, or already released. NOT a pass.")
+    exit(3)
+  end
+  remote_failed($wait, "wait")
+  relay($wait)
+  $output = trim($wait["stdout"])
+  if contains($output, "result=exit-code") or contains($output, "result=success") then
+    exit(0)
+  end
+  print("HARNESS FAULT — job result unknown")
+  exit(1)
+end
+
+if $action == "clean" then
+  $clean = ssh_mix($worker, '
+$stop = run_argv(["systemctl", "stop", $unit], {timeout: 60})
+if $stop["exit_code"] != 0 then
+  eprint(trim($stop["stderr"]))
+  exit($stop["exit_code"])
+end
+$reset = run_argv(["systemctl", "reset-failed", $unit], {timeout: 10})
+if $reset["exit_code"] != 0 then
+  eprint(trim($reset["stderr"]))
+  exit($reset["exit_code"])
+end
+remove($runner_path)
+print("cleaned")
+', {bindings: {unit: $unit, runner_path: $runner_path}, timeout: 90})
+  remote_failed($clean, "clean")
+  relay($clean)
+  exit(0)
+end

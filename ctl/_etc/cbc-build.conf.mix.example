@@ -1,0 +1,14 @@
+-- Site configuration for cbc-build.mix.
+-- Copy this file to cbc-build.conf.mix in the private control hub.
+cbc_build: {
+  schema_version: 1,
+  worker_root: "/srv/build",
+  default_repo: "cosmix",
+  workers: [
+    {name: "alpha", ssh_host: "192.0.2.10"},
+    {name: "beta", ssh_host: "192.0.2.11"}
+  ],
+  repositories: [
+    {name: "cosmix", worker_dir: "cosmix"}
+  ]
+}

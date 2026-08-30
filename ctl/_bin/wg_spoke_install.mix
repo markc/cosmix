@@ -1,0 +1,145 @@
+#!/usr/bin/env mix
+-- wg_spoke_install.mix — privileged WireGuard Address setter for one spoke.
+--
+-- Run this script on the spoke as root:
+--   mix wg_spoke_install.mix <iface> <new_ip> <backup_suffix>
+--
+-- Only the Interface Address changes. The existing prefix is preserved from
+-- the live device, falling back to the configuration and then /32. The node's
+-- private key and peer settings remain local and untouched.
+
+$argv = args()
+if len($argv) != 3 then
+  print("ERROR: usage: wg_spoke_install.mix <iface> <new_ip> <backup_suffix>")
+  exit(2)
+end
+$iface = $argv[0]
+$new_ip = $argv[1]
+$suffix = $argv[2]
+$conf = "/etc/wireguard/" .. $iface .. ".conf"
+$backup = $conf .. ".bak-" .. $suffix
+
+fn fail($message)
+  print("ERROR: " .. $message)
+  exit(1)
+end
+
+if not is_file($conf) then
+  fail("conf not found: " .. $conf)
+end
+
+-- First inet address on the device as ip/cidr, or "" when none is present.
+fn live_ipcidr($iface)
+  $result = run_argv(["ip", "-o", "-4", "addr", "show", "dev", $iface])
+  if $result["exit_code"] != 0 then
+    return ""
+  end
+  $seen = false
+  for each $part in split(trim($result["stdout"]), " ")
+    if $seen and $part != "" then
+      return $part
+    end
+    if $part == "inet" then
+      $seen = true
+    end
+  end
+  return ""
+end
+
+$live = live_ipcidr($iface)
+$live_ip = ""
+$live_prefix = ""
+if $live != "" then
+  $live_parts = split($live, "/")
+  $live_ip = trim($live_parts[0])
+  if len($live_parts) > 1 then
+    $live_prefix = trim($live_parts[1])
+  end
+end
+
+-- Locate the Interface Address line and retain its configured prefix as the
+-- fallback when the device has no live IPv4 address.
+$lines = split(read_file($conf), "\n")
+$address_index = -1
+$conf_ip = ""
+$conf_prefix = ""
+$i = 0
+while $i < len($lines)
+  if starts_with(trim($lines[$i]), "Address") then
+    $parts = split($lines[$i], "=")
+    if len($parts) < 2 then
+      fail("malformed Address line: " .. $lines[$i])
+    end
+    $address = split(trim($parts[1]), "/")
+    $conf_ip = trim($address[0])
+    if len($address) > 1 then
+      $conf_prefix = trim($address[1])
+    end
+    $address_index = $i
+    $i = len($lines)
+  else
+    $i = $i + 1
+  end
+end
+if $address_index < 0 then
+  fail("no Address line in " .. $conf)
+end
+
+$prefix = $live_prefix
+if $prefix == "" then
+  $prefix = $conf_prefix
+end
+if $prefix == "" then
+  $prefix = "32"
+end
+
+-- Refuse malformed prefixes before either the live device or its persistent
+-- configuration can be changed.
+$prefix_ok = len($prefix) > 0 and len($prefix) <= 2
+$prefix_index = 0
+while $prefix_ok and $prefix_index < len($prefix)
+  if not contains("0123456789", substr($prefix, $prefix_index, 1)) then
+    $prefix_ok = false
+  end
+  $prefix_index = $prefix_index + 1
+end
+if not $prefix_ok or to_number($prefix) > 32 then
+  fail("refusing invalid IPv4 prefix " .. $prefix)
+end
+if $live_ip != "" and $live_prefix == "" then
+  fail("live address has no IPv4 prefix: " .. $live)
+end
+
+if $live_ip == $new_ip and $conf_ip == $new_ip then
+  print("OK unchanged (" .. $new_ip .. "/" .. $prefix .. ") on " .. $iface)
+  exit(0)
+end
+
+-- Back up the persistent configuration before changing either live or stored
+-- state. A failed backup is a hard refusal.
+try
+  copy($conf, $backup)
+catch $backup_error
+  fail("backup " .. $conf .. " -> " .. $backup .. ": " .. $backup_error)
+end
+
+-- Replace is idempotent. Removing the stale address is best-effort because it
+-- may already have disappeared after the replacement.
+if $live_ip != $new_ip then
+  $replace = run_argv(["ip", "addr", "replace", $new_ip .. "/" .. $prefix, "dev", $iface])
+  if $replace["exit_code"] != 0 then
+    fail("ip addr replace " .. $new_ip .. "/" .. $prefix .. " dev " .. $iface ..
+      " failed: " .. trim($replace["stderr"]))
+  end
+  if $live_ip != "" then
+    $_delete = run_argv(["ip", "addr", "del", $live_ip .. "/" .. $live_prefix, "dev", $iface])
+  end
+end
+
+$lines[$address_index] = "Address = " .. $new_ip .. "/" .. $prefix
+write_file($conf, join($lines, "\n"))
+chmod($conf, 0o600)
+
+print("OK set " .. $iface .. " = " .. $new_ip .. "/" .. $prefix ..
+  " (was conf " .. $conf_ip .. "/" .. ($conf_prefix == "" ? "?" : $conf_prefix) ..
+  ", live " .. ($live == "" ? "(none)" : $live) .. "; backup " .. $backup .. ")")

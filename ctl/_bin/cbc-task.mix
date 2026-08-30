@@ -1,0 +1,357 @@
+#!/usr/bin/env mix
+-- cbc-task.mix — prepare and control one task on a configured build worker.
+--
+--   mix _bin/cbc-task.mix prepare --worker alpha --task 70 --commit <sha>
+--   mix _bin/cbc-task.mix gate --worker alpha --task 70 -- sh -c '<cargo gates>'
+--   mix _bin/cbc-task.mix wait --worker alpha --task 70
+--   mix _bin/cbc-task.mix result --worker alpha --task 70
+--   mix _bin/cbc-task.mix release --worker alpha --task 70
+--   mix _bin/cbc-task.mix slots --worker alpha
+--
+-- The worker uses a fixed bind-mount slot so rustc sees a stable source path
+-- and shared sccache keys remain useful. cbc-run.mix owns the detached systemd
+-- job and its verdict semantics; this script owns the task worktree lifecycle.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/cbc-task.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no build-cluster task config at " .. $CONF_PATH ..
+    " — create it from cbc-task.conf.mix.example")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["cbc_task"], {
+    schema_version: {type: "integer", enum: [1]},
+    workers: {type: "list", min_length: 1, items: {type: "map", schema: {
+      name: {type: "string", nonblank: true},
+      ssh_host: {type: "string", nonblank: true},
+      source_root: {type: "string", nonblank: true},
+      task_root: {type: "string", nonblank: true},
+      slot_root: {type: "string", nonblank: true},
+      slots: {type: "integer", min: 1, max: 128}
+    }}}
+  })
+catch $e
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn validate_absolute($key, $path)
+  if (not starts_with($path, "/") or $path == "/" or ends_with($path, "/") or
+      contains($path, "//") or contains($path, "\n") or contains($path, "\r")) then
+    config_error($key .. " must be a normalised, one-line, absolute non-root path")
+  end
+  for each $part in split($path, "/")
+    if $part == "." or $part == ".." then
+      config_error($key .. " must not contain . or .. components")
+    end
+  end
+end
+
+fn worker_config($name)
+  $found = nil
+  for each $worker in $CONF["workers"]
+    if $worker["name"] == $name then
+      if $found != nil then
+        config_error("duplicate worker name '" .. $name .. "'")
+      end
+      $found = $worker
+    end
+  end
+  if $found == nil then
+    config_error("worker '" .. $name .. "' is not configured")
+  end
+  return $found
+end
+
+for each $worker in $CONF["workers"]
+  if not regex_match("^[A-Za-z0-9][A-Za-z0-9_.@:-]*$", $worker["ssh_host"]) then
+    config_error("workers." .. $worker["name"] .. ".ssh_host is not a safe SSH host or alias")
+  end
+  validate_absolute("workers." .. $worker["name"] .. ".source_root", $worker["source_root"])
+  validate_absolute("workers." .. $worker["name"] .. ".task_root", $worker["task_root"])
+  validate_absolute("workers." .. $worker["name"] .. ".slot_root", $worker["slot_root"])
+  $_worker = worker_config($worker["name"])
+  for each $candidate in $CONF["workers"]
+    if ($candidate["name"] != $worker["name"] and
+        $candidate["ssh_host"] == $worker["ssh_host"]) then
+      config_error("workers '" .. $worker["name"] .. "' and '" ..
+        $candidate["name"] .. "' use the same ssh_host")
+    end
+  end
+end
+
+fn need_opt($opts, $key)
+  $value = get_or($opts, $key, "")
+  if $value == "" then
+    print("missing --" .. $key)
+    exit(2)
+  end
+  return $value
+end
+
+fn print_remote($result)
+  if trim($result["stdout"]) != "" then
+    print(trim($result["stdout"]))
+  end
+  if trim($result["stderr"]) != "" then
+    eprint(trim($result["stderr"]))
+  end
+end
+
+fn task_dir($worker, $task)
+  return $worker["task_root"] .. "/task-" .. $task
+end
+
+fn slot_of($worker, $task)
+  -- Stable task-to-slot mapping keeps cache locality reproducible. The caller
+  -- schedules around collisions because it owns all dispatched work.
+  return (to_number($task) % $worker["slots"]) + 1
+end
+
+$g = getopt(args(), {
+  worker: {arg: true},
+  task: {arg: true},
+  commit: {arg: true}
+})
+if len($g["errors"]) != 0 then
+  print("bad options: " .. join($g["errors"], "; "))
+  exit(2)
+end
+$rest = $g["rest"]
+if len($rest) == 0 then
+  print("usage: cbc-task.mix prepare|gate|wait|result|release|slots --worker <node> [--task <id>] ...")
+  exit(2)
+end
+
+$action = $rest[0]
+if not contains(["prepare", "gate", "wait", "result", "release", "slots"], $action) then
+  print("unknown action: " .. $action)
+  exit(2)
+end
+
+$worker_name = need_opt($g["opts"], "worker")
+$WORKER = worker_config($worker_name)
+$ROSTER = $d.roster()
+for each $configured_worker in $CONF["workers"]
+  $d.assert_node($ROSTER, $configured_worker["name"])
+  if not $d.is_foreign($ROSTER, $configured_worker["name"]) then
+    config_error("worker '" .. $configured_worker["name"] ..
+      "' must be in fleet_roster.foreign")
+  end
+end
+$d.assert_node($ROSTER, $worker_name)
+if not $d.is_foreign($ROSTER, $worker_name) then
+  config_error("worker '" .. $worker_name .. "' must be in fleet_roster.foreign")
+end
+$SSH_HOST = $WORKER["ssh_host"]
+if $WORKER["source_root"] == $WORKER["task_root"] then
+  config_error("worker '" .. $worker_name .. "' source_root and task_root must differ")
+end
+
+$task = ""
+$td = ""
+$slot = 0
+if $action != "slots" then
+  $task = need_opt($g["opts"], "task")
+  if not regex_match("^[0-9]+$", $task) then
+    print("task id must be a non-negative integer")
+    exit(2)
+  end
+  $td = task_dir($WORKER, $task)
+  $slot = slot_of($WORKER, $task)
+end
+
+$commit = ""
+if $action == "prepare" then
+  $commit = need_opt($g["opts"], "commit")
+  if not regex_match("^[0-9a-f]{40}([0-9a-f]{24})?$", $commit) then
+    print("commit must be a full 40- or 64-hex Git object id")
+    exit(2)
+  end
+end
+
+$cmd = []
+if $action == "gate" then
+  $cmd = drop($rest, 1)
+  if len($cmd) == 0 then
+    print("gate needs a command after --")
+    exit(2)
+  end
+end
+
+-- Reachability is asserted before any worker mutation or delegated job call.
+$reach_token = uuid()
+$reach = ssh_mix($SSH_HOST, 'print("CBC_REACH_OK " .. $token)', {
+  bindings: {token: $reach_token}, timeout: 30
+})
+$d.die_if(not $reach["ok"] or
+    trim($reach["stdout"]) != "CBC_REACH_OK " .. $reach_token,
+  $worker_name .. " unreachable or not running the system Mix interpreter: " ..
+  trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+
+if $action == "slots" then
+  -- Count only running units. RemainAfterExit keeps finished units active, so
+  -- ActiveState would overstate load.
+  $run = ssh_mix($SSH_HOST, '
+$n = 1
+while $n <= $slots
+  $slot_dir = $slot_root .. "/slot" .. to_string($n)
+  $mounted = run_argv(["mountpoint", "-q", $slot_dir], {timeout: 5})
+  if $mounted["exit_code"] == 0 then
+    $source = run_argv(["findmnt", "-n", "-o", "SOURCE", "--target", $slot_dir], {timeout: 5})
+    print("slot" .. to_string($n) .. " BUSY " .. trim(split(trim($source["stdout"]), "\n")[0]))
+  else
+    print("slot" .. to_string($n) .. " free")
+  end
+  $n = $n + 1
+end
+$units = run_argv(["systemctl", "list-units", "--state=running", "cbc-job-*", "--no-legend"], {timeout: 10})
+$count = 0
+for each $line in split(trim($units["stdout"]), "\n")
+  if trim($line) != "" then
+    $count = $count + 1
+  end
+end
+print("active jobs: " .. to_string($count))
+', {bindings: {slots: $WORKER["slots"], slot_root: $WORKER["slot_root"]}, timeout: 60})
+  print_remote($run)
+  $d.die_if(not $run["ok"], "slot query failed on " .. $worker_name)
+  exit(0)
+end
+
+if $action == "prepare" then
+  -- Worktrees share the worker clone's object store. Fetch failures are
+  -- deliberately non-fatal because the requested commit may already exist;
+  -- checkout and cargo metadata are the authoritative gates.
+  $prepare_token = uuid()
+  $run = ssh_mix($SSH_HOST, '
+mkdir($task_root, {parents: true})
+if not is_dir($td) then
+  $add = run_argv(["git", "-C", $source_root, "worktree", "add", "-f", "--detach", $td, "HEAD"], {timeout: 300})
+  if $add["exit_code"] != 0 then
+    $clone = run_argv(["git", "clone", "-q", "-s", $source_root, $td], {timeout: 600})
+    if $clone["exit_code"] != 0 then
+      eprint("prepare: cannot create " .. $td .. ": " .. trim($clone["stderr"]))
+      exit(1)
+    end
+  end
+end
+run_argv(["git", "-C", $source_root, "fetch", "-q", "origin"], {timeout: 300})
+run_argv(["git", "-C", $td, "fetch", "-q", "origin"], {timeout: 300})
+$checkout = run_argv(["git", "-C", $td, "checkout", "-q", "--detach", $commit], {timeout: 120})
+if $checkout["exit_code"] != 0 then
+  eprint("prepare: checkout of " .. $commit .. " failed: " .. trim($checkout["stderr"]))
+  exit(1)
+end
+$head = run_argv(["git", "-C", $td, "rev-parse", "HEAD"], {timeout: 20})
+if $head["exit_code"] != 0 then
+  eprint("prepare: cannot verify checked-out HEAD: " .. trim($head["stderr"]))
+  exit(1)
+end
+if trim($head["stdout"]) != $commit then
+  eprint("prepare: checked-out HEAD mismatch: expected " .. $commit ..
+    ", got " .. trim($head["stdout"]))
+  exit(1)
+end
+print("task " .. $task .. " prepared at " .. $td .. " on " .. substr(trim($head["stdout"]), 0, 12) .. ", slot " .. to_string($slot))
+$metadata = run_argv(["cargo", "metadata", "--format-version", "1"], {cwd: $td .. "/src", timeout: 300, max_output: 67108864})
+if $metadata["exit_code"] != 0 then
+  eprint("prepare: layout check failed: " .. trim($metadata["stderr"]))
+  exit(1)
+end
+print("LAYOUT_OK")
+print("CBC_PREPARE_OK " .. $token)
+', {bindings: {
+    task_root: $WORKER["task_root"],
+    source_root: $WORKER["source_root"],
+    td: $td,
+    commit: $commit,
+    task: $task,
+    slot: $slot,
+    token: $prepare_token
+  }, timeout: 1500})
+  print_remote($run)
+  $d.die_if(not $run["ok"] or
+      not contains($run["stdout"], "CBC_PREPARE_OK " .. $prepare_token),
+    "prepare failed on " .. $worker_name)
+  exit(0)
+end
+
+$RUNNER = dirname(realpath($0)) .. "/cbc-run.mix"
+
+if $action == "gate" then
+  -- Preserve the command as argv words all the way into cbc-run.
+  $argv = concat([
+    $d.mix_bin(), $RUNNER, "start", "--worker", $worker_name,
+    "--job", $task, "--worktree", $td, "--slot", to_string($slot), "--"
+  ], $cmd)
+  $run = run_argv($argv, {timeout: 300, stderr: "stdout"})
+  print(trim($run["stdout"]))
+  print("  (task " .. $task .. " -> " .. $worker_name .. " slot " .. to_string($slot) .. ")")
+  exit($run["exit_code"])
+end
+
+if $action == "wait" then
+  $run = run_argv([
+    $d.mix_bin(), $RUNNER, "wait", "--worker", $worker_name, "--job", $task
+  ], {timeout: 7200, stderr: "stdout"})
+  print(trim($run["stdout"]))
+  exit($run["exit_code"])
+end
+
+if $action == "result" then
+  $run = run_argv([
+    $d.mix_bin(), $RUNNER, "status", "--worker", $worker_name, "--job", $task
+  ], {timeout: 120, stderr: "stdout"})
+  print(trim($run["stdout"]))
+  -- cbc-run exits 3 for NO SUCH JOB; propagating it prevents a never-run gate
+  -- from being recorded as a pass.
+  exit($run["exit_code"])
+end
+
+if $action == "release" then
+  -- Stop the unit first, remove every leaked bind, then remove the worktree.
+  -- Reversing this order can leave a slot pointing at a removed tree.
+  $run = ssh_mix($SSH_HOST, '
+$unit = "cbc-job-" .. $task
+run_argv(["systemctl", "stop", $unit], {timeout: 60})
+run_argv(["systemctl", "reset-failed", $unit], {timeout: 10})
+$slot_dir = $slot_root .. "/slot" .. to_string($slot)
+$count = 0
+while run_argv(["mountpoint", "-q", $slot_dir], {timeout: 5})["exit_code"] == 0 and $count < 8
+  run_argv(["umount", $slot_dir], {timeout: 30})
+  $count = $count + 1
+end
+run_argv(["git", "-C", $source_root, "worktree", "remove", "--force", $td], {timeout: 120})
+remove_dir($td)
+$still_mounted = run_argv(["mountpoint", "-q", $slot_dir], {timeout: 5})["exit_code"] == 0
+if $still_mounted then
+  eprint("release: slot is still mounted after 8 unmount attempts: " .. $slot_dir)
+  exit(1)
+end
+if is_dir($td) then
+  eprint("release: task directory still exists after removal: " .. $td)
+  exit(1)
+end
+print("task " .. $task .. " released; slot " .. to_string($slot) .. " mounted=no")
+', {bindings: {
+    task: $task,
+    td: $td,
+    slot: $slot,
+    slot_root: $WORKER["slot_root"],
+    source_root: $WORKER["source_root"]
+  }, timeout: 600})
+  print_remote($run)
+  $d.die_if(not $run["ok"], "release failed on " .. $worker_name)
+  exit(0)
+end

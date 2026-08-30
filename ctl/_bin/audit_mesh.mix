@@ -1,0 +1,184 @@
+#!/usr/bin/env mix
+-- audit_mesh.mix — read-only audit of systemd daemon state across rostered
+-- mesh and foreign nodes.
+--
+--   mix _bin/audit_mesh.mix              -- configured default nodes
+--   mix _bin/audit_mesh.mix alpha beta   -- named roster nodes
+--
+-- The signed inventory is authenticated, matched to the authored inventory,
+-- and checked against the freshness floor before any node is contacted. Mesh
+-- nodes are reached at their inventory address; foreign nodes use their SSH
+-- aliases. The remote probe only observes systemd state.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/audit_mesh.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: missing audit_mesh config: " .. $CONF_PATH)
+  print("         copy _etc/audit_mesh.conf.mix.example there and set expected_mesh, default_nodes, and daemons")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["audit_mesh"], {
+    schema_version: {type: "integer", enum: [1]},
+    expected_mesh: {type: "string", nonblank: true},
+    default_nodes: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}},
+    daemons: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}}
+  })
+catch $config_error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $config_error)
+  exit(2)
+end
+
+for each $unit in $CONF["daemons"]
+  if not regex_match("^[A-Za-z0-9_.@-]+$", $unit) then
+    print("  ERROR: invalid systemd unit name in audit_mesh.daemons: '" .. $unit .. "'")
+    exit(2)
+  end
+end
+
+-- mesh_lib owns authenticated inventory ingress and the freshness floor.
+$m = require("../_lib/mesh_lib.mix")
+
+fn same_strings($left, $right)
+  if len($left) != len($right) then
+    return false
+  end
+  for each $item in $left
+    if not $m.contains_str($right, $item) then
+      return false
+    end
+  end
+  return true
+end
+
+-- Right-pad with spaces to at least width characters.
+fn pad($value, $width)
+  $out = $value
+  while length($out) < $width
+    $out = $out .. " "
+  end
+  return $out
+end
+
+-- Resolve only mesh members through the inventory. A foreign node is reached
+-- by the SSH alias declared in the private fleet roster.
+fn remote_for($roster, $node)
+  if $d.is_foreign($roster, $node) then
+    return $node
+  end
+  return "root@" .. $d.mesh_ip($node)
+end
+
+-- Return a unit -> state map, or {_error: text} when SSH itself fails.
+-- systemctl errors retain the old audit's fail-soft behaviour: absent or
+-- unreadable unit properties classify as missing while later nodes continue.
+fn probe_node($remote, $daemons)
+  $result = ssh_mix($remote, '
+$states = {}
+for each $unit in $daemons
+  $raw = run("/usr/bin/systemctl show -p LoadState -p ActiveState -p UnitFileState " ..
+    $unit .. " 2>/dev/null || true")
+  $load = ""
+  $active = ""
+  $enabled = ""
+  for each $line in split(trim($raw), "\n")
+    $kv = split($line, "=")
+    if len($kv) >= 2 then
+      if $kv[0] == "LoadState" then $load = $kv[1] end
+      if $kv[0] == "ActiveState" then $active = $kv[1] end
+      if $kv[0] == "UnitFileState" then $enabled = $kv[1] end
+    end
+  end
+  if $load == "not-found" or $load == "masked" or $load == "" then
+    $states[$unit] = "missing"
+  else
+    if $active == "active" then
+      $states[$unit] = "active"
+    else
+      $states[$unit] = "inactive(" .. $active .. "/" .. $enabled .. ")"
+    end
+  end
+end
+print(json_encode($states))
+', {bindings: {daemons: $daemons}, batch: true, connect_timeout: 8, decode: "json"})
+  if not $result["ok"] then
+    return {_error: trim($result["stderr"])}
+  end
+  return $result["value"]
+end
+
+$ROSTER = $d.roster()
+$node_args = args()
+if len($node_args) == 0 then
+  $node_args = $CONF["default_nodes"]
+end
+$nodes = $d.parse_nodes($ROSTER, $node_args, [])["nodes"]
+
+$HUB = $d.hub_root()
+$SIGNED = $HUB .. "/_etc/mesh/inventory.signed"
+$AUTHORED = $HUB .. "/_etc/mesh/inventory.mix"
+$BASELINE = $HUB .. "/_etc/mesh/epoch.baseline.mix"
+$vi = $m.verified_inventory($SIGNED, {
+  mesh: $CONF["expected_mesh"],
+  against_authored: $AUTHORED,
+  baseline: $BASELINE
+})
+
+$active = []
+for each $member in $vi["inventory"]["members"]
+  if $member["status"] == "active" then
+    push($active, $member["name"])
+  end
+end
+$d.die_if(not same_strings($ROSTER["mesh"], $active),
+  "fleet roster mesh nodes must exactly match the verified active inventory")
+
+$DAEMONS = $CONF["daemons"]
+$header = pad("daemon", 20)
+for each $node in $nodes
+  $header = $header .. " | " .. pad($node, 18)
+end
+print($header)
+print(repeat("-", length($header)))
+
+-- Probe each node up-front so the table renders row-major as one snapshot.
+$state = {}
+for each $node in $nodes
+  print("probing " .. $node .. " ...")
+  $state[$node] = probe_node(remote_for($ROSTER, $node), $DAEMONS)
+end
+print("")
+print($header)
+print(repeat("-", length($header)))
+
+for each $unit in $DAEMONS
+  $row = pad($unit, 20)
+  for each $node in $nodes
+    $cell = "?"
+    $node_state = $state[$node]
+    if $node_state["_error"] != nil then
+      $cell = "ssh-fail"
+    else
+      $value = $node_state[$unit]
+      if $value != nil then
+        $cell = $value
+      end
+    end
+    $row = $row .. " | " .. pad($cell, 18)
+  end
+  print($row)
+end
+
+print("")
+for each $node in $nodes
+  $node_state = $state[$node]
+  if $node_state["_error"] != nil then
+    print($node .. ": ssh-fail — " .. $node_state["_error"])
+  end
+end

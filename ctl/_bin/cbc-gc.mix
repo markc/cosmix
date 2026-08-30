@@ -1,0 +1,348 @@
+#!/usr/bin/env mix
+-- cbc-gc.mix — reclaim build scratch on configured build-cluster workers.
+--
+--   mix _bin/cbc-gc.mix --dry-run alpha
+--   mix _bin/cbc-gc.mix alpha beta
+--
+-- Workers are foreign roster nodes reached by SSH alias. Site layout and
+-- retention policy live in the private hub configuration; this public script
+-- carries only the reclaim mechanism. Every worker is handled to completion
+-- before the next starts, so the first failed gate stops the run.
+--
+-- The shared compiler cache is deliberately unreachable: candidates come only
+-- from the configured task directory and reference-target allow-list. A live
+-- task unit is checked again immediately before its worktree can be removed.
+-- The GC stays independent of task release so an interrupted task cannot make
+-- its own eventual cleanup depend on the process that was interrupted.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/cbc-gc.conf.mix"
+
+fn conf_error($msg)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $msg)
+  exit(2)
+end
+
+if not is_file($CONF_PATH) then
+  print("  ERROR: no build-cluster GC config at " .. $CONF_PATH ..
+    " — create it from cbc-gc.conf.mix.example")
+  exit(2)
+end
+
+$CONF_DOC = nil
+try
+  $CONF_DOC = load_data($CONF_PATH)
+catch $msg
+  conf_error("invalid strict-data config: " .. $msg)
+end
+if type($CONF_DOC) != "map" then
+  conf_error("must contain a strict-data map")
+end
+
+$CONF = nil
+try
+  $CONF = validate($CONF_DOC["cbc_gc"], {
+    schema_version: {type: "integer", enum: [1]},
+    workers: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}},
+    build_root: {type: "string", nonblank: true},
+    tasks_subdir: {type: "string", nonblank: true},
+    reference_target_dirs: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}},
+    keep_hours: {type: "integer", min: 1, max: 8760},
+    high_water_percent: {type: "integer", min: 1, max: 99}
+  })
+catch $msg
+  conf_error("invalid cbc_gc map: " .. $msg)
+end
+
+fn is_in($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn assert_relative_path($name, $path)
+  if starts_with($path, "/") then
+    conf_error($name .. " must be relative to build_root")
+  end
+  for each $part in split($path, "/")
+    if $part == "" or $part == "." or $part == ".." then
+      conf_error($name .. " contains an empty, current, or parent component: '" ..
+        $path .. "'")
+    end
+  end
+end
+
+$BUILD_ROOT = $CONF["build_root"]
+if (not starts_with($BUILD_ROOT, "/") or $BUILD_ROOT == "/" or
+    ends_with($BUILD_ROOT, "/")) then
+  conf_error("build_root must be an absolute non-root path without a trailing slash")
+end
+assert_relative_path("tasks_subdir", $CONF["tasks_subdir"])
+for each $target in $CONF["reference_target_dirs"]
+  assert_relative_path("reference_target_dirs entry", $target)
+end
+
+for each $worker in $CONF["workers"]
+  $seen = 0
+  for each $candidate in $CONF["workers"]
+    if $candidate == $worker then
+      $seen = $seen + 1
+    end
+  end
+  if $seen > 1 then
+    conf_error("duplicate worker '" .. $worker .. "'")
+  end
+end
+for each $target in $CONF["reference_target_dirs"]
+  $seen = 0
+  for each $candidate in $CONF["reference_target_dirs"]
+    if $candidate == $target then
+      $seen = $seen + 1
+    end
+  end
+  if $seen > 1 then
+    conf_error("duplicate reference target '" .. $target .. "'")
+  end
+end
+
+$ARGV = args()
+if length($ARGV) == 0 then
+  print("usage: cbc-gc.mix [--dry-run] <worker> [<worker>...]")
+  exit(2)
+end
+$has_worker = false
+for each $arg in $ARGV
+  if $arg != "--dry-run" then
+    $has_worker = true
+  end
+end
+if not $has_worker then
+  print("usage: cbc-gc.mix [--dry-run] <worker> [<worker>...]")
+  exit(2)
+end
+
+$ROSTER = $d.roster()
+for each $worker in $CONF["workers"]
+  $d.assert_node($ROSTER, $worker)
+  if not $d.is_foreign($ROSTER, $worker) then
+    conf_error("worker '" .. $worker .. "' must be in fleet_roster.foreign")
+  end
+end
+
+$PARSED = $d.parse_nodes($ROSTER, $ARGV, ["--dry-run"])
+$WORKERS = $PARSED["nodes"]
+$DRY_RUN = get_or($PARSED["flags"], "--dry-run", false)
+for each $worker in $WORKERS
+  if not is_in($CONF["workers"], $worker) then
+    conf_error("node '" .. $worker .. "' is not configured as a build worker")
+  end
+  if not $d.is_foreign($ROSTER, $worker) then
+    conf_error("worker '" .. $worker .. "' must be in fleet_roster.foreign")
+  end
+end
+
+fn gc_worker($worker)
+  print("")
+  print("[" .. $worker .. "] build scratch GC")
+
+  $reach_token = uuid()
+  $reach = ssh_mix($worker, 'print("CBC_GC_REACH " .. $token)', {
+    bindings: {token: $reach_token}, timeout: 30
+  })
+  $d.die_if(not $reach["ok"] or
+      not contains($reach["stdout"], "CBC_GC_REACH " .. $reach_token),
+    $worker .. " unreachable or not running the system Mix interpreter: " ..
+    trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+
+  $token = uuid()
+  $run = ssh_mix($worker, '
+fn fail($message)
+  eprint("cbc-gc: " .. $message)
+  exit(1)
+end
+
+fn used_pct($build_root)
+  $result = run_argv(["df", "--output=pcent", "--", $build_root], {timeout: 30})
+  if $result["exit_code"] != 0 then
+    fail("cannot read df for " .. $build_root .. ": " .. trim($result["stderr"]))
+  end
+  $lines = split(trim($result["stdout"]), "\n")
+  if length($lines) < 2 then
+    fail("cannot parse df output for " .. $build_root)
+  end
+  $raw = trim($lines[length($lines) - 1])
+  if not regex_match("^[0-9]+%$", $raw) then
+    fail("cannot parse df percentage for " .. $build_root .. ": " .. $raw)
+  end
+  $value = to_number(replace($raw, "%", ""))
+  if $value == nil then
+    fail("cannot convert df percentage for " .. $build_root .. ": " .. $raw)
+  end
+  return $value
+end
+
+fn first_field($line)
+  for each $field in split(trim($line), " ")
+    if $field != "" then
+      return $field
+    end
+  end
+  return ""
+end
+
+fn active_units()
+  $result = run_argv([
+    "systemctl", "list-units", "--state=active", "--no-legend", "cbc-job-*"
+  ], {timeout: 30})
+  if $result["exit_code"] != 0 then
+    fail("cannot list active build units: " .. trim($result["stderr"]))
+  end
+  $units = []
+  for each $line in split(trim($result["stdout"]), "\n")
+    $unit = first_field($line)
+    if $unit != "" then
+      push($units, $unit)
+    end
+  end
+  return $units
+end
+
+fn has_unit($units, $wanted)
+  for each $unit in $units
+    if $unit == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn unit_is_live($unit)
+  $result = run_argv(["systemctl", "is-active", "--quiet", $unit], {timeout: 30})
+  if $result["exit_code"] == 0 then
+    return true
+  end
+  if $result["exit_code"] != 3 and $result["exit_code"] != 4 then
+    fail("cannot determine whether " .. $unit .. " is live: " ..
+      trim($result["stderr"]))
+  end
+  return false
+end
+
+fn size_of($path)
+  $result = run_argv(["du", "-sh", "--", $path], {timeout: 120})
+  if $result["exit_code"] != 0 then
+    fail("cannot size " .. $path .. ": " .. trim($result["stderr"]))
+  end
+  return first_field($result["stdout"])
+end
+
+if not is_dir($build_root) then
+  fail("build root is missing: " .. $build_root)
+end
+if not is_dir($tasks) then
+  fail("task directory is missing: " .. $tasks)
+end
+
+$before = used_pct($build_root)
+print("cbc-gc: " .. $build_root .. " at " .. $before .. "% before")
+$live = active_units()
+$reclaimed = 0
+$now = time()
+
+-- A stale task is eligible only if its unit was absent from the initial
+-- active-unit snapshot and is still not live at the deletion boundary.
+for each $candidate in walk($tasks, {
+    max_depth: 1, include_dirs: true, follow_symlinks: false})
+  $item = stat($candidate, {follow_symlinks: false})
+  $age = $now - $item["mtime"]
+  if ($item["is_dir"] and not $item["is_symlink"] and
+      $age > ($keep_hours * 3600)) then
+    $id = replace(basename($candidate), "task-", "")
+    $unit = "cbc-job-" .. $id .. ".service"
+    if has_unit($live, $unit) or unit_is_live($unit) then
+      print("  keep " .. $candidate .. " — unit " .. $unit .. " is LIVE")
+    else
+      if not starts_with($candidate, $tasks .. "/") then
+        print("  REFUSE " .. $candidate .. " — outside " .. $tasks)
+      else
+        $size = size_of($candidate)
+        if $dry_run then
+          print("  would remove " .. $candidate .. " (" .. $size .. ")")
+        else
+          remove_dir($candidate)
+          if exists($candidate) then
+            fail("task removal did not remove " .. $candidate)
+          end
+          print("  removed " .. $candidate .. " (" .. $size .. ")")
+        end
+        $reclaimed = $reclaimed + 1
+      end
+    end
+  end
+end
+
+-- Above the configured watermark, reference target directories are safe to
+-- drop: they contain build output and the shared compiler cache repopulates
+-- them. The allow-list is relative to build_root and was validated locally.
+if $before >= $high_water then
+  print("  above high-water (" .. $high_water ..
+    "%): reclaiming reference target dirs")
+  for each $relative in $reference_targets
+    $target = $build_root .. "/" .. $relative
+    if not starts_with($target, $build_root .. "/") then
+      fail("reference target escaped build root: " .. $target)
+    end
+    if $dry_run then
+      print("  would remove " .. $target)
+    else
+      remove_dir($target)
+      if exists($target) then
+        fail("reference target removal did not remove " .. $target)
+      end
+      print("  removed " .. $target)
+    end
+  end
+else
+  print("  below high-water (" .. $high_water ..
+    "%): reference clone untouched")
+end
+
+$after = used_pct($build_root)
+print("cbc-gc: " .. $build_root .. " at " .. $after .. "% after; " ..
+  $reclaimed .. " task dir(s) considered")
+if $dry_run then
+  print("(dry run — nothing was removed)")
+end
+print("CBC_GC_OK " .. $token)
+', {bindings: {
+    build_root: $BUILD_ROOT,
+    tasks: $BUILD_ROOT .. "/" .. $CONF["tasks_subdir"],
+    keep_hours: $CONF["keep_hours"],
+    high_water: $CONF["high_water_percent"],
+    reference_targets: $CONF["reference_target_dirs"],
+    dry_run: $DRY_RUN,
+    token: $token
+  }, timeout: 1800})
+
+  $d.die_if(not $run["ok"] or
+      not contains($run["stdout"], "CBC_GC_OK " .. $token),
+    $worker .. " GC failed: " .. trim($run["stdout"]) .. " " ..
+    trim($run["stderr"]))
+  print(trim($run["stdout"]))
+end
+
+print("cbc-gc targets: " .. join($WORKERS, " "))
+if $DRY_RUN then
+  print("mode: dry-run")
+end
+for each $worker in $WORKERS
+  gc_worker($worker)
+end
+print("")
+print("cbc-gc complete on " .. join($WORKERS, " "))

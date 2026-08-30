@@ -1,0 +1,20 @@
+-- audit_mesh.conf.mix.example — private settings for audit_mesh.mix.
+-- Copy to audit_mesh.conf.mix in your private control hub and edit it there.
+-- The public starter deliberately does not ship an active configuration.
+{
+  audit_mesh: {
+    schema_version: 1,
+    expected_mesh: "example.org",
+
+    -- Used only when no node arguments are supplied. Every entry must exist
+    -- in the private fleet roster.
+    default_nodes: ["alpha", "beta", "gamma"],
+
+    -- Ordered systemd unit names shown as rows in the audit matrix.
+    daemons: [
+      "cosmix-noded",
+      "cosmix-dnsd",
+      "cosmix-maild"
+    ]
+  }
+}

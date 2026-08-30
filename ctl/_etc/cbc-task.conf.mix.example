@@ -1,0 +1,25 @@
+-- cbc-task.conf.mix.example — private build-worker addresses and storage.
+-- Copy this file to cbc-task.conf.mix in the private control hub. Every name
+-- must exist in fleet_roster.foreign; ssh_host is an SSH alias or address and
+-- is never resolved through the mesh inventory. Paths are on that worker.
+cbc_task: {
+  schema_version: 1,
+  workers: [
+    {
+      name: "alpha",
+      ssh_host: "192.0.2.10",
+      source_root: "/srv/build/cosmix",
+      task_root: "/srv/build/tasks",
+      slot_root: "/srv/build/slots",
+      slots: 4
+    },
+    {
+      name: "beta",
+      ssh_host: "192.0.2.20",
+      source_root: "/srv/build/cosmix",
+      task_root: "/srv/build/tasks",
+      slot_root: "/srv/build/slots",
+      slots: 4
+    }
+  ]
+}

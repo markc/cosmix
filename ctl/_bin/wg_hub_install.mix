@@ -1,0 +1,130 @@
+#!/opt/cosmix/bin/mix
+-- wg_hub_install.mix — privileged on-hub installer for deploy_wg.mix.
+--
+-- This helper is copied to a mesh hub and run there as root. It remains
+-- standalone because the hub is given only this script and the generated
+-- template, not the control tree or its shared libraries.
+--
+-- The generated template deliberately has no [Interface] PrivateKey. This
+-- helper reads that key from the live configuration, splices it into the
+-- template on-node, backs up and replaces the configuration, then applies the
+-- live diff with wg syncconf. The key never leaves the hub.
+--
+-- On a live-apply failure, both the file and live device are rolled back. wg
+-- syncconf changes only the diff, so an unchanged peer set remains a no-op.
+--
+-- args: <iface> <template_path> <backup_suffix>
+
+$WG = "/usr/bin/wg"
+$WGQUICK = "/usr/bin/wg-quick"
+
+fn bail($message)
+  print("ERROR: " .. $message)
+  exit(1)
+end
+
+$argv = args()
+if len($argv) != 3 then
+  print("ERROR: usage: wg_hub_install.mix <iface> <template_path> <backup_suffix>")
+  exit(2)
+end
+
+$iface = $argv[0]
+$template = $argv[1]
+$suffix = $argv[2]
+$conf = "/etc/wireguard/" .. $iface .. ".conf"
+$backup = $conf .. ".bak-" .. $suffix
+$stripped = "/run/wg-hub-" .. $suffix .. ".stripped"
+
+if not is_file($conf) then
+  bail("live conf not found: " .. $conf)
+end
+if not is_file($template) then
+  bail("pushed template not found: " .. $template)
+end
+
+-- Read the one secret from the live configuration. Rejoin everything after
+-- the first '=' so the base64 padding is retained.
+$private_key = nil
+for each $line in split(read_file($conf), "\n")
+  if starts_with(trim($line), "PrivateKey") then
+    $parts = split($line, "=")
+    $value = ""
+    $i = 1
+    while $i < len($parts)
+      if $i > 1 then
+        $value = $value .. "="
+      end
+      $value = $value .. $parts[$i]
+      $i = $i + 1
+    end
+    $private_key = trim($value)
+  end
+end
+if $private_key == nil or $private_key == "" then
+  bail("no PrivateKey line in " .. $conf .. " — refusing to install a keyless hub conf")
+end
+
+-- Splice the key immediately after the first [Interface] header.
+$lines = []
+$spliced = false
+for each $line in split(read_file($template), "\n")
+  push($lines, $line)
+  if trim($line) == "[Interface]" and not $spliced then
+    push($lines, "PrivateKey = " .. $private_key)
+    $spliced = true
+  end
+end
+if not $spliced then
+  bail("template has no [Interface] section: " .. $template)
+end
+$merged = join($lines, "\n")
+
+try
+  copy($conf, $backup)
+catch $backup_error
+  bail("backup " .. $conf .. " -> " .. $backup .. ": " .. $backup_error)
+end
+
+write_file($conf, $merged)
+chmod($conf, 0o600)
+
+-- Route wg-quick's stripped configuration directly to a private file. This is
+-- argv execution with structured stdout routing, not a shell redirection.
+$strip = run_argv([$WGQUICK, "strip", $iface], {
+  stdout: {file: $stripped, mode: 0o600}
+})
+if $strip["exit_code"] != 0 then
+  copy($backup, $conf)
+  remove($stripped)
+  bail("wg-quick strip " .. $iface .. " failed; conf restored: " .. trim($strip["stderr"]))
+end
+
+$apply = run_argv([$WG, "syncconf", $iface, $stripped])
+if $apply["exit_code"] != 0 then
+  -- Restore the file first, then derive and apply the old live configuration.
+  -- A rollback failure is distinct because the device may be mid-applied.
+  copy($backup, $conf)
+  $rollback_strip = run_argv([$WGQUICK, "strip", $iface], {
+    stdout: {file: $stripped, mode: 0o600}
+  })
+  $rollback_sync_code = -1
+  $rollback_sync_error = "skipped"
+  if $rollback_strip["exit_code"] == 0 then
+    $rollback_sync = run_argv([$WG, "syncconf", $iface, $stripped])
+    $rollback_sync_code = $rollback_sync["exit_code"]
+    $rollback_sync_error = trim($rollback_sync["stderr"])
+  end
+  remove($stripped)
+  if $rollback_strip["exit_code"] != 0 or $rollback_sync_code != 0 then
+    bail("wg syncconf " .. $iface .. " failed and rollback also failed; device may be mid-applied" ..
+      " (conf restored to " .. $backup .. "; strip exit=" .. $rollback_strip["exit_code"] ..
+      "; rollback apply exit=" .. $rollback_sync_code ..
+      "; strip error=" .. trim($rollback_strip["stderr"]) ..
+      "; rollback apply error=" .. $rollback_sync_error .. "): " .. trim($apply["stderr"]))
+  end
+  bail("wg syncconf " .. $iface .. " failed; rolled back cleanly: " .. trim($apply["stderr"]))
+end
+remove($stripped)
+
+print("OK installed " .. $conf .. " (backup " .. $backup .. ") and synced " .. $iface)

@@ -1,0 +1,12 @@
+-- Private build-worker selection, storage layout, and reclaim policy for
+-- cbc-gc.mix. Copy this file to cbc-gc.conf.mix in the private control hub.
+-- Every worker is an SSH alias listed in fleet_roster.foreign.
+cbc_gc: {
+  schema_version: 1,
+  workers: ["alpha", "beta"],
+  build_root: "/srv/build",
+  tasks_subdir: "tasks",
+  reference_target_dirs: ["cosmix/src/target"],
+  keep_hours: 6,
+  high_water_percent: 75
+}
