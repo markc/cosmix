@@ -93,7 +93,7 @@ end
 $ROOT = $d.cosmix_root()
 $CONFIG_SOURCE = $CONF["config_file"]
 $UNIT_NAME = "cosmix-loki.service"
-$UNIT_SOURCE = $ROOT .. "/src/_etc/systemd-system/" .. $UNIT_NAME
+$UNIT_SOURCE = $d.shipped("unit", $UNIT_NAME)
 $CONFIG_DEST = "/etc/cosmix/loki/loki.yml"
 $UNIT_DEST = "/etc/systemd/system/" .. $UNIT_NAME
 $VERSION_FILE = "/etc/cosmix/loki/deploy-version"

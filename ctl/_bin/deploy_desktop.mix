@@ -1,0 +1,2045 @@
+#!/usr/bin/env mix
+-- deploy_desktop.mix — build + install the CosMix Desktop apps on the target node.
+--
+-- Scheme: $COSMIX/src/desktop/APPS.md (slug-spine identity canon).
+-- Per-app identifiers all derive from the component slug recorded in
+-- [package.metadata.cosmix]: binary /opt/cosmix/bin/cosmix-<slug>, desktop
+-- entry /usr/local/share/applications/dev.cosmix.<slug>.desktop, app id /
+-- icon dev.cosmix.<slug>. Per-app hicolor assets are discovered below
+-- apps/<slug>/icons/hicolor and installed into /usr/local/share/icons/hicolor.
+-- Desktop entries are GENERATED from cargo metadata (display name, slug) —
+-- the manifest is the single source of identity.
+--
+-- Safety (per the codex review that shaped this): the build runs
+-- UNPRIVILEGED; artifact paths come from cargo --message-format=json
+-- compiler-artifact records (never guessed from target/release/<name>);
+-- everything stages to a temp tree and is validated before any root copy;
+-- root actions go via `ssh the target node` (passwordless root, mix login shell —
+-- local sudo would hang on a password). An install manifest is written to
+-- /opt/cosmix/share/cosmix-desktop.manifest with every installed path for a
+-- separately reviewed future uninstall; this deployer never removes root files.
+--
+-- Local-machine only (the target node): GUI apps aren't fleet-deployed.
+--
+-- usage: mix deploy_desktop.mix [--no-build] [--only <slug[,slug...]>]
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_desktop.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no desktop deploy config at " .. $CONF_PATH .. " — create it from deploy_desktop.conf.mix.example")
+  exit(2)
+end
+$CONF = load_data($CONF_PATH)
+validate($CONF, {
+  "deploy_desktop": {
+    "type": "map",
+    "required": true,
+    "schema": {
+      "target_node": {"type": "string", "nonblank": true}
+    }
+  }
+})
+$TARGET = $CONF["deploy_desktop"]["target_node"]
+$ROSTER = $d.roster()
+$d.assert_node($ROSTER, $TARGET)
+
+$DESKTOP = $d.cosmix_root() .. "/src/desktop"
+-- Cargo-built slugs. Every use of this list feeds cargo metadata, per-crate
+-- source trees, or release artifacts; the CMake-built plasmoid is deliberately
+-- not in it.
+$RUST_SLUGS = ["studio", "filemgr", "tray", "trayd", "tower"]
+-- Names OWNED BY _bin/desk_bin_refresh.mix ($NAMES there) — one deployer per
+-- name (option B ruling 2026-08-16). This is the symmetric half of the
+-- refresher's manifest preflight: that side reads this deployer's LIVE ledger,
+-- but a slug added HERE would overwrite the refresher's binaries before the
+-- ledger ever showed the claim, so the intersection is refused at parse time.
+-- A declared mirror, yes — but drift in either direction now dies loudly at
+-- whichever writer drifted, instead of shipping a mixed-generation binary.
+$REFRESHER_OWNED_SLUGS = ["comp", "quoin-demo"]
+for each $slug in $REFRESHER_OWNED_SLUGS
+  if contains($RUST_SLUGS, $slug) then
+    die("ownership clash: slug " .. $slug .. " is owned by _bin/desk_bin_refresh.mix — " ..
+        "one deployer per name (option B ruling 2026-08-16); remove it from $RUST_SLUGS " ..
+        "or move ownership deliberately in BOTH scripts")
+  end
+end
+-- CMake/ECM-built KDE package slugs. Each installs a file TREE under
+-- $PLASMOID_DEST/dev.cosmix.<slug>/ and is recorded in the manifest as
+-- kind="plasmoid" with an explicit per-file ledger, because unlike the Rust
+-- families its file set is not derivable from the slug alone. Contract:
+-- $COSMIX/src/desktop/apps/plasmoid/DEPLOY.md.
+$CMAKE_SLUGS = ["plasmoid"]
+-- Slugs RETIRED from the workspace whose installed files may still be ledgered
+-- (or worse, on disk with the manifest lost). They are never built and never
+-- selectable, but the lost-manifest orphan scan MUST keep searching their
+-- paths: this deployer never deletes, so a retired slug's binary, activation
+-- file and icons stay on the machine until an operator removes them, and a
+-- recovery scan that forgot the slug would rewrite the manifest without them,
+-- stranding root-owned files permanently. Retiring a slug moves it from
+-- $RUST_SLUGS/$CMAKE_SLUGS to here — never simply deletes it.
+$RETIRED_SLUGS = []
+-- What this deployer can build and install today ($ALL_SLUGS additionally
+-- carries the retired set, for the orphan scan alone).
+$DEPLOYABLE_SLUGS = concat($RUST_SLUGS, $CMAKE_SLUGS)
+$ALL_SLUGS = concat($DEPLOYABLE_SLUGS, $RETIRED_SLUGS)
+$PLASMOID_DEST = "/usr/local/share/plasma/plasmoids"
+-- The EXACT reviewed file set each plasmoid package installs, relative to its
+-- package root. The staged tree must equal this list -- not merely sit inside
+-- the package root -- so a stray CMake install (debug file, fixture, stale
+-- artefact) refuses the run instead of being silently installed and claimed
+-- root-owned forever (cold review 2026-07-28, #4). A legitimate package change
+-- updates this list in the same commit; the one-line cost is the review.
+$PLASMOID_LEDGER = {
+  "plasmoid": [
+    "contents/images/LUCIDE-LICENSE",
+    "contents/images/cosmix.svg",
+    "contents/ui/BusTab.qml",
+    "contents/ui/CompactRepresentation.qml",
+    "contents/ui/CosTab.qml",
+    "contents/ui/CosmixBackend/cosmixplasmoidbackend.qmltypes",
+    "contents/ui/CosmixBackend/kde-qmlmodule.version",
+    "contents/ui/CosmixBackend/libcosmixplasmoidbackend.so",
+    "contents/ui/CosmixBackend/libcosmixplasmoidbackendplugin.so",
+    "contents/ui/CosmixBackend/qmldir",
+    "contents/ui/FullRepresentation.qml",
+    "contents/ui/MixTab.qml",
+    "contents/ui/SshTab.qml",
+    "contents/ui/components/DaemonRow.qml",
+    "contents/ui/components/DaemonSection.qml",
+    "contents/ui/components/SectionHeading.qml",
+    "contents/ui/components/StatusDot.qml",
+    "contents/ui/main.qml",
+    "metadata.json"
+  ]
+}
+$BIN_DEST = "/opt/cosmix/bin"
+$DT_DEST = "/usr/local/share/applications"
+$ICON_DEST = "/usr/local/share/icons"
+-- The fourth destination, and the only one that was previously written as a
+-- bare literal at each of its four use sites. It is a constant for the same
+-- reason the others are: the orphan scan and the installer have to agree on it
+-- exactly, and a test cannot redirect a literal into a scratch tree.
+$AUTOSTART_DEST = "/etc/xdg/autostart"
+-- The two kind="daemon" destinations. A session daemon has no desktop entry and
+-- no icons; it has a D-Bus activation file and a systemd USER unit, and it is
+-- started by the first client that talks to it rather than by an autostart
+-- entry. Both live under a prefix the session already searches:
+-- /usr/local/share is in the default XDG_DATA_DIRS that dbus-daemon's
+-- <standard_session_servicedirs/> expands, and /usr/local/lib/systemd/user is
+-- in `systemd-analyze --user unit-paths` (both verified on this machine).
+$DBUS_DEST = "/usr/local/share/dbus-1/services"
+$USER_UNIT_DEST = "/usr/local/lib/systemd/user"
+$MANIFEST = "/opt/cosmix/share/cosmix-desktop.manifest"
+-- .desktop Categories per slug (freedesktop menu spec); extend as apps land.
+$CATEGORIES = { "studio": "AudioVideo;Audio;Sequencer;", "filemgr": "System;FileManager;", "tray": "Utility;", "tower": "System;Monitor;" }
+-- The system hicolor theme declares every directory a lookup will search. An
+-- icon installed into an undeclared directory is invisible no matter how
+-- correct its bytes are, and the old diagnostic misreported that as a broken
+-- search path -- so the declared set is checked at staging time instead.
+$HICOLOR_INDEX = "/usr/share/icons/hicolor/index.theme"
+-- Appended to every manifest refusal: a partial deploy cannot merge into state
+-- it could not read, and the operator's two ways out are both deliberate.
+$REREAD = "\n  A partial deploy rewrites this file from what it reads, so merging into\n  unreadable state would silently drop the apps it does not name.\n  Fix the manifest, or run a FULL deploy (no --only) to rebuild it from scratch."
+
+-- Set once the deploy lock is actually held, so fail() releases it promptly.
+-- Still nil for the preflight refusals, which all happen before the lock is
+-- taken. Releasing here is a courtesy, not a correctness requirement: the
+-- kernel drops the lock when this process exits however it exits, which is why
+-- an uncaught error needs no try/finally around the deploy body.
+$HELD_LOCK = nil
+
+function fail($msg)
+  if $HELD_LOCK != nil then
+    -- funlock, never remove: the lock lives on the inode, so deleting the file
+    -- out from under a future holder is how two runs end up both holding it.
+    funlock($HELD_LOCK)
+  end
+  print "ERROR: " .. $msg
+  exit(1)
+end
+
+function parse_options($argv, $valid_slugs)
+  $no_build = false
+  $only_raw = nil
+  $want_only_value = false
+
+  for each $arg in $argv
+    if $want_only_value then
+      if starts_with($arg, "--") then
+        fail("--only requires a comma-separated slug list")
+      end
+      $only_raw = $arg
+      $want_only_value = false
+    elif $arg == "--no-build" then
+      $no_build = true
+    elif $arg == "--only" then
+      if $only_raw != nil or $want_only_value then
+        fail("--only may be specified only once")
+      end
+      $want_only_value = true
+    else
+      fail("unknown argument " .. $arg .. "; expected --no-build or --only <slug[,slug...]>")
+    end
+  end
+
+  if $want_only_value then
+    fail("--only requires a comma-separated slug list")
+  end
+
+  $selected_slugs = $valid_slugs
+  if $only_raw != nil then
+    $requested = []
+    for each $part in split($only_raw, ",")
+      $slug = trim($part)
+      if $slug == "" or not contains($valid_slugs, $slug) then
+        $shown = $slug == "" ? "<empty>" : $slug
+        fail("unknown app slug " .. $shown .. "; valid slugs: " .. join($valid_slugs, ", "))
+      end
+      push($requested, $slug)
+    end
+    $requested = unique($requested)
+    $selected_slugs = []
+    for each $slug in $valid_slugs
+      if contains($requested, $slug) then
+        push($selected_slugs, $slug)
+      end
+    end
+  end
+
+  $selected_apps = []
+  for each $slug in $selected_slugs
+    push($selected_apps, "cosmix-" .. $slug)
+  end
+  return { "no_build": $no_build, "partial": $only_raw != nil, "slugs": $selected_slugs, "apps": $selected_apps }
+end
+
+-- Mix deadlines are SECONDS, not milliseconds (`mix man system`: "timeout
+-- (seconds, default 30)"). These were written as milliseconds, which asked for
+-- deadlines of 8h20m here and 41 days on the build -- a hung root command would
+-- have held the deploy flock for a third of a day instead of failing in 30s.
+function croot($cmd)
+  $r = ssh_run($TARGET, $cmd, { "timeout": 30 })
+  if not $r["ok"] then
+    fail("root step failed: " .. $cmd .. " :: " .. trim($r["stderr"]))
+  end
+  return $r
+end
+
+-- Verify a path chain is root-private BEFORE root creates or writes anything
+-- through it. "Root-private" is three separate properties, and the cold review
+-- of 2026-07-28 (#3) found each of them missing in turn:
+--
+--   1. every component is a real directory, not a symlink -- O_NOFOLLOW on the
+--      final open says nothing about the ancestors it walked to get there;
+--   2. every component is owned by uid 0;
+--   3. no component is writable by anyone but its owner -- root-owned 0777 is
+--      root-owned and still lets the invoking user swap the next component.
+--      Group/other bits are checked by find itself (-perm /022, no octal
+--      parsing to get wrong), and NAMED ACL entries granting write are checked
+--      separately because a mode of 0755 hides them completely.
+--
+-- Verification must come BEFORE repair, not after: GNU `install -d` follows an
+-- existing symlink-to-directory and mutates its target, so "create it root-owned
+-- then check it" checks the wrong inode. Components are therefore verified in
+-- order, parent first, and a missing component may only be created once its
+-- parent has passed.
+--
+-- Fail-closed throughout: an unclassifiable component, a missing getfacl, or
+-- any probe error refuses the run. This gate protects a privileged write path;
+-- "could not tell" is not "fine".
+-- Classify one component. Absence must be distinguishable from probe failure,
+-- and `find <missing>` cannot do that: it exits 1 for a missing starting point,
+-- which a fail-closed caller cannot tell from a broken probe. So every
+-- component below the root is classified by LISTING ITS ALREADY-VERIFIED
+-- PARENT -- that exits 0 whether or not the child exists, making empty output
+-- mean "absent" and nothing else. Returns "" for absent (cold review
+-- 2026-07-28, #3 round 7: the create-last branch was unreachable, so a first
+-- deploy on a machine with no /opt/cosmix/share aborted instead of bootstrapping).
+function classify_component($p, $parent)
+  if $parent == nil then
+    $probe = ssh_run($TARGET, "find -P " .. shell_quote($p) .. " -maxdepth 0 -printf '%y\t%U\n'", { "timeout": 30 })
+    if not get_or($probe, "ok", false) then
+      fail("privileged-path probe of " .. $p .. " failed: " .. trim(get_or($probe, "stderr", "")) .. "\n  refusing to write through an unaudited path.")
+    end
+    return trim(get_or($probe, "stdout", ""))
+  end
+  $base = basename($p)
+  -- -name takes a glob. These chains are fixed literals today, but a metachar
+  -- would silently turn an exact check into a pattern match, so refuse instead.
+  for each $meta in ["*", "?", "[", "]", "\\"]
+    if contains($base, $meta) then
+      fail("privileged path component " .. $p .. " contains the glob metacharacter '" .. $meta .. "';\n  this gate matches names exactly and will not pattern-match a privileged path. Refusing.")
+    end
+  end
+  $probe = ssh_run($TARGET, "find -P " .. shell_quote($parent) .. " -mindepth 1 -maxdepth 1 -name " .. shell_quote($base) .. " -printf '%y\t%U\n'", { "timeout": 30 })
+  if not get_or($probe, "ok", false) then
+    fail("privileged-path probe of " .. $p .. " (via its parent " .. $parent .. ") failed: " .. trim(get_or($probe, "stderr", "")) .. "\n  refusing to write through an unaudited path.")
+  end
+  return trim(get_or($probe, "stdout", ""))
+end
+
+function assert_root_private_chain($paths, $create_last)
+  $last = $paths[length($paths) - 1]
+  $parent = nil
+  for each $p in $paths
+    -- The parent-listing probe is only sound if the previous element really is
+    -- this one's parent, so that relationship is enforced, not assumed.
+    if $parent != nil and dirname($p) != $parent then
+      fail("privileged path chain is malformed: " .. $p .. " is not a child of " .. $parent .. ";\n  refusing to verify a chain whose parent relationships do not hold.")
+    end
+    $out = classify_component($p, $parent)
+    if $out == "" then
+      if $p == $last and $create_last then
+        -- The parent passed on this same pass, so creating the leaf here cannot
+        -- be steered through a symlinked ancestor.
+        croot("install -d -o 0 -g 0 -m 0755 " .. shell_quote($p))
+        $out = classify_component($p, $parent)
+        if $out == "" then
+          fail("created " .. $p .. " but it is still not classifiable; refusing.")
+        end
+      else
+        fail("privileged path component " .. $p .. " is missing;\n  refusing to write through a path this deployer cannot verify.")
+      end
+    end
+    $parts = split($out, "\t")
+    if length($parts) != 2 then
+      fail("privileged-path probe of " .. $p .. " returned '" .. $out .. "'; refusing.")
+    end
+    if $parts[0] != "d" then
+      fail("privileged path component " .. $p .. " is type '" .. $parts[0] .. "', not a real directory;\n  an unprivileged account can steer root through it. Refusing.")
+    end
+    if $parts[1] != "0" then
+      fail("privileged path component " .. $p .. " is owned by uid " .. $parts[1] .. ", not root;\n  its owner can replace the next component. Refusing.")
+    end
+    -- ACLs are checked BEFORE the mode bits, for the diagnostic rather than for
+    -- coverage: on POSIX ACLs a named entry with effective write forces the mask
+    -- up, and the mask is what the group mode bits display, so `-perm /022`
+    -- would catch it anyway -- but it would report "group-writable" for a
+    -- directory whose group is root, which sends the reader looking for the
+    -- wrong thing. Checking here names the actual grantee. It remains genuine
+    -- defence in depth for any ACL flavour whose grants do not reflect into the
+    -- mode bits at all.
+    --
+    -- What matters is the EFFECTIVE permission, not the raw one. A named entry
+    -- is capped by the mask, so `user:alice:rwx` under `mask::r-x` grants no
+    -- write at all and getfacl annotates it `#effective:r-x`. Reading the raw
+    -- field refused that safe configuration (cold review 2026-07-28, #3
+    -- round 7), so `-E` is deliberately NOT passed here: the annotation is the
+    -- answer, and where it is absent the raw perms already are the effective
+    -- ones.
+    $aprobe = ssh_run($TARGET, "getfacl -c -p -- " .. shell_quote($p), { "timeout": 30 })
+    if not get_or($aprobe, "ok", false) then
+      fail("ACL probe of " .. $p .. " failed (is acl installed?): " .. trim(get_or($aprobe, "stderr", "")) .. "\n  a named ACL entry can hide in the mode bits, so this cannot be skipped. Refusing.")
+    end
+    for each $line in split(trim(get_or($aprobe, "stdout", "")), "\n")
+      $l = trim($line)
+      -- Named entries only: "user:NAME:perms" / "group:NAME:perms". The owning
+      -- entries "user::" and "group::" have an empty name and are already
+      -- covered by the uid and -perm /022 checks.
+      if (starts_with($l, "user:") or starts_with($l, "group:")) and not starts_with($l, "user::") and not starts_with($l, "group::") then
+        $f = split($l, ":")
+        if length($f) >= 3 then
+          $perm = $f[2]
+          if contains($l, "#effective:") then
+            $eff = split($l, "#effective:")
+            $perm = trim($eff[1])
+          end
+          if contains($perm, "w") then
+            fail("privileged path component " .. $p .. " carries an ACL granting effective write to '" .. $f[1] .. "' (" .. $l .. ");\n  its holder can replace the next component. Refusing.")
+          end
+        end
+      end
+    end
+    $wprobe = ssh_run($TARGET, "find -P " .. shell_quote($p) .. " -maxdepth 0 -perm /022 -printf 'W\n'", { "timeout": 30 })
+    if not get_or($wprobe, "ok", false) then
+      fail("write-permission probe of " .. $p .. " failed: " .. trim(get_or($wprobe, "stderr", "")) .. "\n  refusing.")
+    end
+    if trim(get_or($wprobe, "stdout", "")) != "" then
+      fail("privileged path component " .. $p .. " is group- or world-writable;\n  root ownership does not stop a non-owner replacing the next component. Refusing.")
+    end
+    -- Only now is $p proven root-private, so only now may it serve as the
+    -- verified parent the next component is listed through.
+    $parent = $p
+  end
+end
+
+function empty_manifest()
+  return { "installed": [], "shared": [] }
+end
+
+-- Every directory the system hicolor theme declares. A lookup only searches
+-- declared directories, so an icon installed outside the set is unfindable no
+-- matter how correct its bytes are -- and the post-install check would then
+-- blame the search path for what is really a bad source path.
+-- Absence returns nil rather than failing here: a machine with no hicolor theme
+-- and no icons to install is fine, and this runs before we know which apps ship
+-- icons. The refusal lives in app_icon_relatives(), at the first icon that would
+-- actually need validating -- skipping validation was the old fail-open that let
+-- 17x17/apps/foo.svg install and be recorded as an icon no lookup can find.
+function hicolor_directories()
+  if not is_file($HICOLOR_INDEX) then
+    return nil
+  end
+  $declared = {}
+  for each $line in read_lines($HICOLOR_INDEX)
+    if starts_with($line, "Directories=") then
+      for each $dir in split(substr($line, length("Directories=")), ",")
+        $declared[trim($dir)] = true
+      end
+    end
+  end
+  return $declared
+end
+
+-- The validated relative hicolor paths one app provides. Shared by the ownership
+-- pre-pass -- which must see EVERY app, selected or not, so that `--only tray`
+-- cannot overwrite an icon belonging to an app this run was not asked to touch --
+-- and by the staging loop, which copies only the selected ones.
+-- $require_declared separates ENUMERATION from DESTINATION VALIDATION. The
+-- ownership pass has to enumerate every app's icons, including apps this run
+-- was not asked to deploy; it must not also demand that their destinations be
+-- validatable, or `--only tower` (which installs no icons at all) would be
+-- refused because some OTHER app ships icons and hicolor's index is missing.
+-- Validation is required only where it is load-bearing: the icons actually
+-- about to be written to a root-owned path.
+-- Whether an icon NAME belongs to $appid's namespace. A hicolor icon name is
+-- global, so this is what makes a cross-app collision impossible by
+-- construction rather than merely detected.
+--
+-- A bare starts_with() is a prefix test, not a namespace test, and the two
+-- differ exactly where one slug prefixes another: with slugs "tray" and
+-- "traymon", every traymon icon also starts with "dev.cosmix.tray", so each app
+-- passed the other's check and the guarantee quietly became nothing. The
+-- boundary is the "-suffix" the error message already documents, so the legal
+-- forms are the exact appid or the appid followed by "-".
+function icon_in_namespace($stem, $appid)
+  return $stem == $appid or starts_with($stem, $appid .. "-")
+end
+
+function app_icon_relatives($icon_root, $declared, $require_declared)
+  $relatives = []
+  if not exists($icon_root, { "follow_symlinks": false }) then
+    return $relatives
+  end
+  -- walk() and is_dir() both FOLLOW a symlinked root, which would pull an
+  -- arbitrary external tree into a root-owned destination. Leaf symlinks are
+  -- rejected below, but the root has to be judged before it is opened.
+  $root_info = stat($icon_root, { "follow_symlinks": false })
+  if $root_info["is_symlink"] then
+    fail("icon root must be a real directory, not a symlink: " .. $icon_root)
+  end
+  if not $root_info["is_dir"] then
+    return $relatives
+  end
+  for each $source in walk($icon_root, { "max_depth": 8, "follow_symlinks": false, "include_dirs": false })
+    $info = stat($source, { "follow_symlinks": false })
+    if not $info["is_file"] or $info["is_symlink"] then
+      fail("icon asset must be a regular file, not a symlink: " .. $source)
+    end
+    $relative = substr($source, length($icon_root) + 1)
+    if not regex_match("^(scalable|[0-9]+x[0-9]+)/(apps|status)/[A-Za-z0-9._-]+\\.(svg|png)$", $relative) then
+      fail("unsupported hicolor icon path: " .. $source)
+    end
+    -- Subsumes the old square-size check: a non-square size directory is never
+    -- declared, and neither is an off-scale square one such as 17x17.
+    if not $require_declared then
+      push($relatives, $relative)
+      continue
+    end
+    if $declared == nil then
+      fail("cannot validate icon destinations: " .. $HICOLOR_INDEX .. " is absent, so\n  the set of directories an icon lookup will search is unknown, and\n  " .. $source .. "\n  would be installed unverified. Install the hicolor-icon-theme package, or\n  remove the icons from " .. $icon_root)
+    end
+    if $declared[dirname($relative)] == nil then
+      fail("the hicolor theme does not declare " .. dirname($relative) .. ", so\n  " .. $source .. "\n  could never be found by an icon lookup. Use a directory listed in " .. $HICOLOR_INDEX)
+    end
+    push($relatives, $relative)
+  end
+  return $relatives
+end
+
+-- Load the manifest a PARTIAL deploy must merge into. A partial run rewrites the
+-- whole file from this value, so every corrupt-state branch here used to fail
+-- OPEN: it returned an empty manifest, the run installed one app, and the record
+-- of the other three -- still on disk, since this deployer never deletes --
+-- vanished from the only inventory a future uninstall has. Unreadable state is
+-- now a refusal. Nothing has been installed at the point this runs, so refusing
+-- costs the operator a rerun; failing open costs them the inventory.
+-- An ABSENT manifest is different in kind and stays tolerated: that is the
+-- first deploy on this machine, not a lost record.
+-- Corrupt manifest state. A PARTIAL deploy ($strict) merges into this value and
+-- cannot do that safely from unreadable input, so it refuses. A FULL deploy
+-- rewrites every app entry from source, so it warns and continues -- otherwise
+-- the recovery path $REREAD advertises ("run a FULL deploy to rebuild it from
+-- scratch") would itself be blocked by the corruption it exists to repair.
+-- The two kind="daemon" activation files are the only files this deployer
+-- installs whose CONTENT it does not generate: the unit's Type/BusName/Restart
+-- policy belongs to the daemon, not here. That makes them the one place the
+-- slug spine is not structurally guaranteed. Every other identifier is derived
+-- (`cosmix-<slug>`, `dev.cosmix.<slug>`) and a mismatch is impossible; here a
+-- crate can commit `Name=dev.cosmix.tray` into trayd's service file and the
+-- deployer would install it, report success, and leave a bus name that
+-- activates the wrong binary -- or nothing at all.
+--
+-- Splits an Exec-style value into the executable token and whatever follows it.
+-- A raw string prefix is NOT good enough here: `/opt/cosmix/bin/cosmix-trayd`
+-- is a prefix of `/opt/cosmix/bin/cosmix-trayd-old`, so a prefix test blesses a
+-- unit that runs an entirely different binary. The token has to end at a
+-- boundary.
+--
+-- Both formats accept the executable in double quotes, so the quoted form is a
+-- legal file this deployer must not reject -- a gate that refuses valid input
+-- gets switched off, which costs more than the check is worth. Returns nil for
+-- an unterminated quote, which is neither form and is genuinely malformed.
+function exec_parts($value)
+  if starts_with($value, "\"") then
+    $close = pos("\"", substr($value, 1))
+    if $close == 0 then
+      return nil
+    end
+    return { "token": substr($value, 1, $close - 1), "rest": substr($value, $close + 1) }
+  end
+  $space = pos(" ", $value)
+  if $space == 0 then
+    return { "token": $value, "rest": "" }
+  end
+  return { "token": substr($value, 0, $space - 1), "rest": substr($value, $space - 1) }
+end
+
+-- $section: the ONE section these directives are read from. Both formats are
+-- sectioned INI, and a directive in the wrong section is not a directive -- it
+-- is a comment with an equals sign in it. `Type=dbus` under `[Unit]` is the
+-- worst shape this file can be in, because it reads correctly to a human and
+-- systemd ignores it entirely, so the unit starts as the default Type=simple
+-- and is considered started the moment it forks rather than when the bus name
+-- is taken. A parser that ignored sections blessed exactly that.
+--
+-- $exact: directive -> the only accepted value.
+-- $exec:  directive -> the executable that must be the first TOKEN, for the two
+--         Exec forms that may legitimately carry arguments after it.
+--
+-- Returns a sorted list of complaints; empty means the file agrees with what
+-- this deployer is about to install.
+--
+-- A checked directive named more than once is a defect whatever the values are.
+-- Differing values are ambiguous (D-Bus and systemd disagree on which wins);
+-- IDENTICAL values are not harmless either, because systemd treats a second
+-- ExecStart= as an append and refuses a Type=dbus unit that has two.
+function activation_defects($text, $section, $exact, $exec)
+  $values = {}
+  $elsewhere = {}
+  $current = ""
+  for each $raw in split($text, "\n")
+    $line = trim($raw)
+    if $line != "" and not starts_with($line, "#") and not starts_with($line, ";") then
+      if starts_with($line, "[") and ends_with($line, "]") then
+        $current = substr($line, 1, length($line) - 2)
+      else
+        $eq = pos("=", $line)
+        if $eq > 1 then
+          $key = trim(substr($line, 0, $eq - 1))
+          $value = trim(substr($line, $eq))
+          if $current == $section then
+            $values[$key] = concat(get_or($values, $key, []), [$value])
+          else
+            -- Kept only so a misplaced directive can be named as misplaced
+            -- rather than reported as missing, which sends an operator looking
+            -- for a line that is right there in front of them.
+            $elsewhere[$key] = concat(get_or($elsewhere, $key, []), [$current == "" ? "no section" : "[" .. $current .. "]"])
+          end
+        end
+      end
+    end
+  end
+  $defects = []
+  for each $spec in [{ "want": $exact, "how": "exact" }, { "want": $exec, "how": "exec" }]
+    for each $key in keys($spec["want"])
+      $want = $spec["want"][$key]
+      $got = get_or($values, $key, [])
+      if length($got) == 0 then
+        $misplaced = get_or($elsewhere, $key, [])
+        if length($misplaced) > 0 then
+          push($defects, "no " .. $key .. "= under [" .. $section .. "]; it is set under " .. join(unique($misplaced), " and ") .. ", where it is ignored")
+        else
+          push($defects, "no " .. $key .. "= line under [" .. $section .. "]; expected " .. $key .. "=" .. $want)
+        end
+      elif length($got) > 1 then
+        push($defects, $key .. " is set " .. length($got) .. " times under [" .. $section .. "] (" .. join($got, ", ") .. "); it must appear exactly once")
+      elif $spec["how"] == "exact" and $got[0] != $want then
+        push($defects, $key .. "=" .. $got[0] .. " but this deployer installs " .. $want)
+      elif $spec["how"] == "exec" then
+        $parts = exec_parts($got[0])
+        if $parts == nil then
+          push($defects, $key .. "=" .. $got[0] .. " opens a quote it never closes")
+        elif $parts["token"] != $want then
+          push($defects, $key .. " runs " .. $parts["token"] .. " but this deployer installs " .. $want)
+        elif $parts["rest"] != "" and not starts_with($parts["rest"], " ") then
+          push($defects, $key .. "=" .. $got[0] .. " has no separator after the executable")
+        end
+      end
+    end
+  end
+  return sort($defects)
+end
+
+function manifest_refusal($why, $strict)
+  if $strict then
+    fail($why .. $REREAD)
+  end
+  print "WARNING: " .. $why
+  print "  Rebuilding the inventory from source. Any root file recorded ONLY in"
+  print "  the unreadable manifest is now unlisted, and no future uninstall will"
+  print "  find it. Check " .. $ICON_DEST .. " and " .. $BIN_DEST .. " by hand if that matters."
+end
+
+function load_existing_manifest($path, $strict)
+  if not exists($path, { "follow_symlinks": false }) then
+    -- Absent is normally the FIRST deploy on this machine, which is fine. But
+    -- absent while managed files are already installed is a LOST inventory, and
+    -- a partial run would then rewrite the manifest from its own one app and
+    -- forget the rest -- permanently, since this deployer never deletes. A full
+    -- deploy rebuilds every app from source, so it is the honest recovery and
+    -- is still allowed.
+    -- Every path family this deployer installs is scanned, not just the desktop
+    -- entry. All four are derived from the slug and so are knowable without a
+    -- manifest, and the desktop entry is the ONE an operator is most likely to
+    -- have already removed by hand -- it is the visible one, the launcher in the
+    -- menu. Scanning it alone answered "nothing installed" for a machine still
+    -- holding the binary, the autostart entry that keeps launching it, and the
+    -- icons, and then let a partial run write an inventory that omitted them
+    -- permanently.
+    $orphans = []
+    for each $known_slug in $ALL_SLUGS
+      $appid = "dev.cosmix." .. $known_slug
+      -- Every path family this deployer can install, for BOTH kinds. The scan
+      -- cannot know a slug's kind without the manifest it is standing in for,
+      -- so it probes the four identity families for every slug (and the two
+      -- bin-dir families conditionally, below): the two daemon families are as
+      -- slug-derived as the other two, and probing a path an app kind never
+      -- installs simply finds nothing.
+      $candidates = [
+        $DT_DEST .. "/" .. $appid .. ".desktop",
+        $AUTOSTART_DEST .. "/" .. $appid .. ".desktop",
+        $DBUS_DEST .. "/" .. $appid .. ".service",
+        $USER_UNIT_DEST .. "/cosmix-" .. $known_slug .. ".service"
+      ]
+      -- The two bin-dir families are probed only for slugs whose BINARY this
+      -- deployer owns. A slug transferred to _bin/desk_bin_refresh.mix stays
+      -- in $RETIRED_SLUGS for the families above (its desktop entry, icons and
+      -- units remain this deployer's residue), but the new owner publishes and
+      -- stages under the SAME bin-dir names — claiming its live binary, or a
+      -- crash-temp of its own, into `shared` here would permanently block the
+      -- completed handover (the ledger never prunes, and the refresher's guard
+      -- reads exactly those dot-tmp claims).
+      if not contains($REFRESHER_OWNED_SLUGS, $known_slug) then
+        push($candidates, $BIN_DEST .. "/cosmix-" .. $known_slug)
+        -- The atomic-install stage name. A deploy that crashed between staging
+        -- and rename leaves this root-owned file behind; the preclaim loop only
+        -- covers ACTIVE $RUST_SLUGS, so for a slug that was later retired this
+        -- probe is the ONLY way a lost-manifest rebuild rediscovers the claim.
+        push($candidates, $BIN_DEST .. "/.cosmix-" .. $known_slug .. ".new")
+      end
+      for each $candidate in $candidates
+        if exists($candidate, { "follow_symlinks": false }) then
+          push($orphans, $candidate)
+        end
+      end
+      -- Icon paths vary by size and category, but the NAME is pinned to the
+      -- app's namespace by the staging check below, so a glob is exact here
+      -- rather than a heuristic.
+      for each $icon in glob($ICON_DEST .. "/hicolor/**/" .. $appid .. "*")
+        push($orphans, $icon)
+      end
+      -- kind="plasmoid" installs a file TREE under one package root rather
+      -- than fixed slug-derived paths, so the scan globs the whole package.
+      -- Directories are skipped: the ledger records files, and the installer
+      -- recreates directories with install -d on demand.
+      for each $pfile in glob($PLASMOID_DEST .. "/" .. $appid .. "/**")
+        if stat($pfile, { "follow_symlinks": false })["is_file"] then
+          push($orphans, $pfile)
+        end
+      end
+    end
+    if $strict and length($orphans) > 0 then
+      fail("no manifest at " .. $path .. ", but managed files are already installed:\n    " .. join($orphans, "\n    ") .. "\n  The inventory has been lost. A partial deploy would rebuild it from the\n  selected app alone and forget the rest. Run a FULL deploy (no --only) to\n  rebuild it from source.")
+    end
+    -- The full deploy is the ADVERTISED recovery from a lost inventory, so it
+    -- has to actually recover. Returning a bare empty_manifest() here threw the
+    -- scan's findings away: a file this deployer installed under a name the
+    -- current source no longer produces -- a renamed icon, an autostart entry
+    -- left by an app that changed kind="tray" to kind="app" -- is found by the
+    -- scan above, then omitted from the manifest the run writes, and since this
+    -- deployer never deletes, it is stranded permanently by the very run that
+    -- was supposed to rebuild the record. They go into `shared` rather than any
+    -- app's entry because provenance is exactly what was lost; the ledger's
+    -- standing rule is that over-claiming is harmless and under-claiming is not.
+    if length($orphans) > 0 then
+      print "note: no manifest at " .. $path .. ", but " .. length($orphans) .. " managed file(s) are installed."
+      print "  Recording them so this rebuild does not strand them:"
+      for each $orphan in $orphans
+        print "    " .. $orphan
+      end
+      return { "installed": [], "shared": sort(unique($orphans)) }
+    end
+    print "note: no existing manifest at " .. $path .. "; merging with an empty manifest"
+    return empty_manifest()
+  end
+  -- exists() but not a regular file is corrupt state, not a first deploy. The
+  -- old is_file() test answered "absent" for a directory or a dangling symlink
+  -- here, and merged silently as empty -- the exact fail-open this guards.
+  -- lstat, not stat: is_file() follows symlinks, so a manifest replaced by a
+  -- symlink pointing at an attacker-chosen regular file would pass. The
+  -- authoritative inventory is a regular file at that path or it is corrupt.
+  --
+  -- This one refuses UNCONDITIONALLY -- it does not go through
+  -- manifest_refusal(), which downgrades to a warning for a full deploy. Every
+  -- other corruption here is recoverable by rebuilding the inventory from
+  -- source, because the run can still WRITE a correct manifest afterwards. A
+  -- non-regular path cannot: the run would install everything and then fail to
+  -- record any of it, which is the one outcome this file exists to prevent.
+  -- Continuing was not a warning, it was a guaranteed unrecorded install.
+  if not stat($path, { "follow_symlinks": false })["is_file"] then
+    fail("manifest path " .. $path .. " exists but is not a regular file.\n  This is not recoverable by rebuilding: the run would install root-owned\n  files and then be unable to record them. Move or remove whatever is at\n  that path -- inspect it first, it may be the only copy of the inventory --\n  and rerun.")
+  end
+
+  $manifest = nil
+  try
+    $manifest = load_data($path)
+  catch $msg, $err
+    manifest_refusal("existing manifest at " .. $path .. " could not be parsed (" .. $err["code"] .. ": " .. $msg .. ").", $strict)
+    return empty_manifest()
+  end
+
+  if type($manifest) != "map" or type($manifest["installed"]) != "list" then
+    manifest_refusal("existing manifest at " .. $path .. " has an invalid root shape.", $strict)
+    return empty_manifest()
+  end
+  if $manifest["shared"] == nil then
+    print "note: existing manifest has no shared list; preserving its app entries with an empty shared set"
+    $manifest["shared"] = []
+  elif type($manifest["shared"]) != "list" then
+    manifest_refusal("existing manifest at " .. $path .. " has an invalid shared list.", $strict)
+    return empty_manifest()
+  end
+
+  $seen_apps = {}
+  for each $entry in $manifest["installed"]
+    if type($entry) != "map" or type($entry["app"]) != "string" or trim($entry["app"]) == "" then
+      manifest_refusal("existing manifest at " .. $path .. " has an installed entry with no app name.", $strict)
+      return empty_manifest()
+    end
+    -- An entry naming an app but missing the paths it claims to have installed
+    -- is a lying inventory, not a merge base.
+    --
+    -- Which paths are REQUIRED depends on the kind, and the requirement runs in
+    -- BOTH directions: a kind names paths it must have, not merely paths it may
+    -- omit. A kind="daemon" installs no desktop entry -- a session daemon has no
+    -- launcher -- but it always installs an activation file and a user unit, so
+    -- an entry claiming to be a daemon while naming neither is exactly the lying
+    -- inventory this check exists to reject. Requiring only `bin` there let a
+    -- hand-edited entry drop `user_unit` while the unit was still installed, and
+    -- the next partial deploy would rewrite that entry as valid and strand it.
+    -- Same for a tray and its autostart entry.
+    --
+    -- An entry written before `kind` existed has no field, so a missing kind
+    -- reads as "app" -- which keeps every manifest already on disk validating
+    -- exactly as strictly as it did before, and means these tighter rules only
+    -- ever apply to entries this version wrote.
+    -- has_key, not get_or, for the nil case: get_or answers with its default
+    -- for a key that is PRESENT AND NIL as well as one that is absent, so the
+    -- two are indistinguishable through it. They are not the same thing. An
+    -- absent kind is a manifest written before the field existed, and reading
+    -- it as "app" is what keeps those validating. A kind explicitly written as
+    -- nil is a field this deployer wrote and got wrong; treating it as a legacy
+    -- app would apply the app rules to what may well be a daemon, requiring a
+    -- desktop entry it never had and not requiring the unit it did install.
+    if has_key($entry, "kind") and $entry["kind"] == nil then
+      manifest_refusal("existing manifest entry for " .. $entry["app"] .. " has a kind field set to nil.", $strict)
+      return empty_manifest()
+    end
+    $kind = get_or($entry, "kind", "app")
+    if not contains(["app", "tray", "daemon", "plasmoid"], $kind) then
+      manifest_refusal("existing manifest entry for " .. $entry["app"] .. " has kind " .. to_string($kind) .. ", which is not one of app, tray, daemon, plasmoid.", $strict)
+      return empty_manifest()
+    end
+    $required = ["bin", "desktop"]
+    if $kind == "daemon" then
+      $required = ["bin", "dbus_service", "user_unit"]
+    elif $kind == "tray" then
+      $required = ["bin", "desktop", "autostart"]
+    elif $kind == "plasmoid" then
+      -- A plasmoid installs no binary, launcher, or unit; its whole claim is
+      -- the files ledger, validated below in place of the path fields.
+      $required = []
+    end
+    for each $field in $required
+      if type($entry[$field]) != "string" or not starts_with($entry[$field], "/") then
+        manifest_refusal("existing manifest entry for " .. $entry["app"] .. " has no absolute " .. $field .. " path.", $strict)
+        return empty_manifest()
+      end
+    end
+    -- These are legitimately absent for apps that do not have them, so nil is
+    -- valid -- but a present value is a root path an uninstall would act on and
+    -- must be as absolute as the rest. A map or a relative string here is
+    -- corrupt state that would otherwise survive into the rewritten manifest.
+    -- `desktop` joins the optional list because it is required above only for
+    -- the app kinds; for a daemon it must still be absolute if it is there at
+    -- all, which is how an app that becomes a daemon keeps its old entry named.
+    for each $field in ["autostart", "desktop", "dbus_service", "user_unit"]
+      if $entry[$field] != nil then
+        if type($entry[$field]) != "string" or not starts_with($entry[$field], "/") then
+          manifest_refusal("existing manifest entry for " .. $entry["app"] .. " has a non-absolute " .. $field .. " path.", $strict)
+          return empty_manifest()
+        end
+      end
+    end
+    -- The icons list is a ledger of root-owned paths that later runs union and
+    -- an uninstall would act on. A non-string element is not merely untidy: it
+    -- propagates into the rewritten manifest and into ownership checks.
+    if $entry["icons"] != nil then
+      if type($entry["icons"]) != "list" then
+        manifest_refusal("existing manifest entry for " .. $entry["app"] .. " has an invalid icons list.", $strict)
+        return empty_manifest()
+      end
+      for each $icon_path in $entry["icons"]
+        if type($icon_path) != "string" or not starts_with($icon_path, "/") then
+          manifest_refusal("existing manifest entry for " .. $entry["app"] .. " has an icon path that is not an absolute path.", $strict)
+          return empty_manifest()
+        end
+      end
+    end
+    -- The files list is the ONLY record of what a plasmoid entry put on the
+    -- root filesystem, so an entry claiming the kind while naming no files is
+    -- the same lying inventory the kind-specific $required checks reject. And
+    -- because a future uninstall would act on these paths as root, absolute is
+    -- not enough: every entry must be CONFINED to the app's own package root,
+    -- with no ".." components -- a hand-edited "/etc/shadow" or a traversal
+    -- would otherwise survive every union into the file an uninstall trusts
+    -- (cold review 2026-07-28, #6).
+    if $kind == "plasmoid" then
+      if type($entry["files"]) != "list" or length($entry["files"]) == 0 then
+        manifest_refusal("existing manifest entry for " .. $entry["app"] .. " (kind plasmoid) has no files ledger.", $strict)
+        return empty_manifest()
+      end
+      if not starts_with($entry["app"], "cosmix-") then
+        manifest_refusal("existing manifest entry for " .. $entry["app"] .. " (kind plasmoid) does not follow the cosmix-<slug> app naming.", $strict)
+        return empty_manifest()
+      end
+      $entry_root = $PLASMOID_DEST .. "/dev.cosmix." .. substr($entry["app"], 7, length($entry["app"])) .. "/"
+      for each $pfile in $entry["files"]
+        if type($pfile) != "string" or not starts_with($pfile, $entry_root) or contains($pfile, "/../") or ends_with($pfile, "/..") then
+          manifest_refusal("existing manifest entry for " .. $entry["app"] .. " has a files entry outside " .. $entry_root .. ": " .. to_string($pfile), $strict)
+          return empty_manifest()
+        end
+      end
+    end
+    if $seen_apps[$entry["app"]] != nil then
+      manifest_refusal("existing manifest at " .. $path .. " has duplicate entries for " .. $entry["app"] .. ".", $strict)
+      return empty_manifest()
+    end
+    $seen_apps[$entry["app"]] = true
+  end
+  for each $path_entry in $manifest["shared"]
+    if type($path_entry) != "string" or not starts_with($path_entry, "/") then
+      manifest_refusal("existing manifest at " .. $path .. " has a shared entry that is not an absolute path.", $strict)
+      return empty_manifest()
+    end
+  end
+  return $manifest
+end
+
+function merge_manifest($existing, $current_installed, $selected_apps, $current_shared)
+  $current_by_app = {}
+  for each $entry in $current_installed
+    $current_by_app[$entry["app"]] = $entry
+  end
+
+  $merged_installed = []
+  $replaced = {}
+  for each $entry in $existing["installed"]
+    $app = $entry["app"]
+    if contains($selected_apps, $app) then
+      -- bin/desktop/autostart derive from the slug, so replacing them is right.
+      -- The icon list is a LEDGER of root files, and this deployer never
+      -- removes anything: dropping an asset from the source tree leaves the
+      -- installed copy on disk, so forgetting its path would strand a
+      -- root-owned file that no future uninstall could find. Union instead,
+      -- exactly as the shared list below is unioned.
+      $fresh = $current_by_app[$app]
+      $fresh["icons"] = sort(unique(concat(get_or($entry, "icons", []), get_or($fresh, "icons", []))))
+      -- The plasmoid files list is a ledger of root paths exactly like icons:
+      -- a file the new version stops shipping is still on disk, and this
+      -- deployer never deletes, so its name must survive the merge.
+      if get_or($fresh, "kind", "app") == "plasmoid" or get_or($entry, "kind", "app") == "plasmoid" then
+        $fresh["files"] = sort(unique(concat(get_or($entry, "files", []), get_or($fresh, "files", []))))
+      end
+      -- The kind-dependent scalars are carried forward for the same reason the
+      -- icon list is unioned, and they are easy to miss because each is a scalar
+      -- rather than a list. Only kind="tray" installs an autostart entry and
+      -- only kind="daemon" installs the D-Bus service file and the user unit;
+      -- change an app's metadata from one kind to another and redeploy it, and
+      -- the fresh entry's field is nil while the root file it named is still
+      -- sitting on disk -- and this deployer may not remove it. Replacing the
+      -- field would strand that file with nothing pointing at it, and an
+      -- autostart entry or an activatable bus name left behind keeps STARTING
+      -- something at every login with no record of why.
+      -- `desktop` is in this list too, now that a kind can stop producing one.
+      --
+      -- Carry-forward alone is not enough, because nil is not the only way a
+      -- recorded path gets dropped. When the fresh entry names a DIFFERENT path
+      -- -- a destination that moved between versions -- taking the fresh value
+      -- is right, but the old file is still on disk and this deployer may not
+      -- remove it, so simply overwriting the field strands it just as surely as
+      -- nilling it did. The displaced path goes into `shared`, where provenance
+      -- is not claimed but the name survives; that is the same over-claim the
+      -- ledger already makes everywhere else, and over-claiming is the harmless
+      -- direction.
+      $displaced = []
+      for each $carried in ["autostart", "desktop", "dbus_service", "user_unit"]
+        if $fresh[$carried] == nil and $entry[$carried] != nil then
+          $fresh[$carried] = $entry[$carried]
+        elif $entry[$carried] != nil and $fresh[$carried] != $entry[$carried] then
+          push($displaced, $entry[$carried])
+        end
+      end
+      if length($displaced) > 0 then
+        $current_shared = concat($current_shared, $displaced)
+      end
+      push($merged_installed, $fresh)
+      $replaced[$app] = true
+    else
+      -- Preserve an app outside this partial run as the exact loaded value.
+      push($merged_installed, $entry)
+    end
+  end
+  for each $entry in $current_installed
+    if $replaced[$entry["app"]] == nil then
+      push($merged_installed, $entry)
+    end
+  end
+
+  $merged_shared = []
+  for each $path in $existing["shared"]
+    push($merged_shared, $path)
+  end
+  for each $path in $current_shared
+    push($merged_shared, $path)
+  end
+  return { "installed": $merged_installed, "shared": sort(unique($merged_shared)) }
+end
+
+-- The manifest is the ONLY record of what this deployer put on the root
+-- filesystem, and this deployer never deletes -- so a half-written manifest is
+-- a permanently stranded set of root files. `install` writes in place and can
+-- be interrupted mid-write, leaving exactly that. Write a sibling temp file
+-- (same directory, therefore same filesystem, therefore rename(2) applies) and
+-- rename it over the target: the old manifest survives intact until the
+-- instant the complete new one replaces it.
+function write_manifest($manifest_data, $stage_dir)
+  $tmp = $MANIFEST .. ".new"
+  -- The manifest and its temp sibling are themselves root-owned files this
+  -- deployer creates under /opt, and neither was in any inventory -- the ledger
+  -- recorded everything except itself. The temp is the one that actually
+  -- stranded: a run killed between the install and the rename below leaves
+  -- $MANIFEST.new behind, and since this deployer never deletes anything under
+  -- /opt or /usr/local, it cannot be cleaned up by the next run either. Naming
+  -- both here is the only mechanism available for that -- an uninstall asked to
+  -- remove a temp that isn't there does nothing, which is the same harmless
+  -- over-claim the cache preclaim makes.
+  $manifest_data["shared"] = sort(unique(concat($manifest_data["shared"], [$MANIFEST, $tmp])))
+  $mf = "# cosmix-desktop install manifest — written by deploy_desktop.mix\n" .. data_encode($manifest_data, true) .. "\n"
+  write_file($stage_dir .. "/manifest.mix", $mf)
+  croot("install -T -o 0 -g 0 -m 0644 " .. shell_quote($stage_dir .. "/manifest.mix") .. " " .. shell_quote($tmp))
+  -- mv -fT across the same directory is rename(2): atomic, and it cannot leave
+  -- the target absent even for an instant.
+  --
+  -- -T (--no-target-directory) is load-bearing, not decoration. Plain `mv -f
+  -- FILE DIR` does NOT replace DIR -- it succeeds by moving FILE *inside* it
+  -- (verified). So with a directory at $MANIFEST the manifest was written to
+  -- $MANIFEST/cosmix-desktop.manifest.new, mv reported success, and the deploy
+  -- completed leaving no readable inventory at all. -T makes that case an
+  -- error instead of a silent misfile; load_existing_manifest refuses it
+  -- earlier, and this is the second line of defence.
+  croot("mv -fT " .. shell_quote($tmp) .. " " .. shell_quote($MANIFEST))
+end
+
+-- Two concurrent runs share one fixed stage path and read-modify-write one
+-- manifest: each would clear the other's stage mid-copy, and the later writer
+-- would revert the earlier one's newly recorded entries.
+--
+-- This is an ADVISORY FILE LOCK, and everything else about locking is now the
+-- kernel's problem. That is the whole point: the lock is attached to an open
+-- file description, so it is released when this process dies -- on SIGKILL, on
+-- an uncaught error, and even when the corpse lingers unreaped as a zombie,
+-- because exit closes the descriptors and only the task struct remains.
+--
+-- The three previous attempts are worth recording, because each looked correct:
+--
+--   1. A lock DIRECTORY plus mkdir({parents: false}) as atomic create-or-fail.
+--      Atomic, but a run killed between mkdir and writing its identity left a
+--      lock nobody could ever prove dead -- one crash blocked the deployer
+--      forever.
+--   2. The same, with the identity written into the directory BEFORE it became
+--      the lock (build under a private name, rename into place) and staleness
+--      decided by "<pid> <starttime>" from /proc. That closed the publication
+--      window and the pid-recycling hole, but not the real one.
+--   3. Reclaim by renaming the stale lock aside instead of deleting it in
+--      place, so only one of two racing reclaimers could win.
+--
+-- (3) is still WRONG, and it was reproduced deterministically rather than
+-- argued: A and B both classify lock S as stale; A quarantines S, drops it and
+-- installs its own lock; B -- delayed, still acting on its reading of S --
+-- renames whatever is now at the lock path aside. That is A's LIVE lock. B
+-- deletes it and installs its own, and both runs then believe they hold the
+-- lock and read-modify-write the manifest. A rename is atomic but it is not a
+-- compare-and-swap against the object that was classified, and no protocol
+-- built from rename can be, because there is no way to say "move this only if
+-- it is still the thing I looked at".
+--
+-- flock has no such gap: there is nothing to classify, because a lock only
+-- exists while its holder does. proc_identity(), lock_holder_is_alive(),
+-- candidate staging and quarantine reclaim are all deleted, along with the
+-- zombie and pid-namespace failure modes that came with reading /proc.
+--
+-- The lock FILE is never removed. Locks attach to the inode, so unlinking or
+-- replacing a file that another process may hold reintroduces dual ownership.
+-- An empty file left in the cache directory is the correct resting state.
+--
+-- Returns the lock path it now holds; the caller assigns it to $HELD_LOCK,
+-- because a Mix function cannot write a global.
+function acquire_lock($lock)
+  mkdir(dirname($lock))
+  -- Earlier versions made this path a DIRECTORY. flock() on a directory raises,
+  -- which would read as a broken deployer rather than as the leftover it is.
+  -- A directory here cannot be a live holder under any version that got this
+  -- far, because those versions are the ones that could not prove liveness.
+  if is_dir($lock) then
+    print "note: removing the pre-flock lock DIRECTORY at " .. $lock
+    remove_dir($lock)
+  end
+  if not flock($lock) then
+    fail("another deploy holds " .. $lock .. "\n  Wait for it to finish and rerun. Do NOT remove that file: the lock is\n  held by the kernel for the life of the holding process and is released\n  automatically when it exits, so a stale one cannot occur -- and deleting\n  the file while it is held would let two runs proceed at once.")
+  end
+  return $lock
+end
+
+$options = parse_options(args(), $DEPLOYABLE_SLUGS)
+$no_build = $options["no_build"]
+$partial = $options["partial"]
+$APPS = $options["apps"]
+
+-- Split the selection into the two build lanes. $APPS keeps its historical
+-- meaning everywhere below -- cargo package names -- and the CMake slugs ride
+-- a parallel lane that meets the Rust one only at the manifest and the root
+-- install. $SELECTED_APPS_ALL is what the manifest merge treats as "rewritten
+-- by this run"; using $APPS there would make a plasmoid deploy preserve the
+-- STALE plasmoid entry instead of replacing it.
+$PLASMOID_SELECTED = []
+$rust_only = []
+for each $name in $APPS
+  $is_cmake = false
+  for each $cslug in $CMAKE_SLUGS
+    if $name == "cosmix-" .. $cslug then
+      $is_cmake = true
+      push($PLASMOID_SELECTED, $cslug)
+    end
+  end
+  if not $is_cmake then
+    push($rust_only, $name)
+  end
+end
+$APPS = $rust_only
+$SELECTED_APPS_ALL = concat($APPS, [])
+for each $cslug in $PLASMOID_SELECTED
+  push($SELECTED_APPS_ALL, "cosmix-" .. $cslug)
+end
+
+-- 1. Read the workspace metadata; collect the [package.metadata.cosmix] apps.
+$md_raw = run_argv_must(["cargo", "metadata", "--no-deps", "--format-version", "1"], { "cwd": $DESKTOP, "timeout": 120 })
+$md = json_parse($md_raw)
+$apps = {}
+for each $pkg in $md["packages"]
+  if contains($APPS, $pkg["name"]) then
+    $cx = $pkg["metadata"]["cosmix"]
+    validate($cx, { "component": { "type": "string", "nonblank": true }, "display": { "type": "string", "nonblank": true } })
+    $slug = $cx["component"]
+    if $pkg["name"] != "cosmix-" .. $slug then
+      fail($pkg["name"] .. ": crate name != cosmix-" .. $slug .. " (slug-spine violation)")
+    end
+    -- An unrecognised kind is a refusal, not a default. Before kind="daemon"
+    -- existed an unknown value merely meant "not tray", which still produced
+    -- the desktop entry an app wants; now it silently decides which whole
+    -- FAMILY of files gets installed, so a typo -- kind = "demon" -- would
+    -- install a session daemon's binary with no activation file and nothing
+    -- able to start it, and report success. Absent still means "app", which is
+    -- what every crate predating the field means.
+    $kind = get_or($cx, "kind", "app")
+    if not contains(["app", "tray", "daemon"], $kind) then
+      fail($pkg["name"] .. ": [package.metadata.cosmix] kind = \"" .. $kind .. "\" is not one of app, tray, daemon.\n  The kind decides which files are installed, so an unrecognised value would\n  install some of them and silently skip the rest.")
+    end
+    $apps[$pkg["name"]] = { "slug": $slug, "display": $cx["display"], "kind": $kind }
+  end
+end
+for each $name in $APPS
+  if $apps[$name] == nil then
+    fail("package " .. $name .. " not found in " .. $DESKTOP .. " metadata")
+  end
+end
+
+-- $ALL_SLUGS is what the lost-manifest orphan scan searches, and NOTHING else
+-- keeps it in step with the workspace. That is the one assumption in this file
+-- with a permanent consequence: a slug this deployer installs but the scan does
+-- not know about is invisible when the inventory is lost, so the rebuild writes
+-- a manifest omitting it, and since this deployer never deletes, its binary,
+-- activation file and unit stay on the machine with nothing left that can name
+-- them. Adding an app and forgetting one constant is an ordinary mistake, and
+-- it fails silently years later, so it is checked here rather than trusted.
+$unscanned = []
+for each $name in keys($apps)
+  if not contains($ALL_SLUGS, $apps[$name]["slug"]) then
+    push($unscanned, $apps[$name]["slug"])
+  end
+end
+if length($unscanned) > 0 then
+  fail("slug(s) " .. join(sort($unscanned), ", ") .. " are deployed but missing from $ALL_SLUGS.\n  That list is what finds already-installed files when the manifest is lost.\n  A slug absent from it would be left on disk permanently, unrecorded and\n  unnameable, because this deployer never deletes. Add them to $RUST_SLUGS or\n  $CMAKE_SLUGS at the top of this file ($ALL_SLUGS is derived) and rerun.")
+end
+-- Converse direction: since the invocation-invariant build passes -p for EVERY
+-- $RUST_SLUGS entry, a slug that has left the workspace no longer breaks only
+-- its own --only run — it breaks every Rust-BUILDING deploy, and cargo's
+-- "package ID specification" error names nothing about this file. Refuse here
+-- with the actual fix named instead. Gated to runs that will actually invoke
+-- cargo: --no-build trusts existing artifacts and a plasmoid-only selection
+-- never builds Rust, so a stale entry cannot hurt either — blocking them
+-- would prevent an unrelated deploy without avoiding any error.
+-- ($apps holds only the SELECTED packages, so read the full metadata package
+-- list — the check must hold for slugs this run does not install.)
+if not $no_build and length($APPS) > 0 then
+  $workspace_pkgs = []
+  for each $pkg in $md["packages"]
+    push($workspace_pkgs, $pkg["name"])
+  end
+  for each $rslug in $RUST_SLUGS
+    if not contains($workspace_pkgs, "cosmix-" .. $rslug) then
+      fail("slug " .. $rslug .. " is in $RUST_SLUGS but has no matching package in " .. $DESKTOP .. ".\n  The build passes -p cosmix-" .. $rslug .. " on EVERY Rust-building run (invocation-\n  invariant feature unification), so this stale entry would fail those deploys at cargo\n  with an error that names nothing about this file. If the crate is gone for good, move\n  the slug from $RUST_SLUGS to $RETIRED_SLUGS (never delete it outright — the lost-\n  manifest orphan scan must keep searching its installed paths) and rerun.")
+    end
+  end
+end
+
+-- 1b. Preflight: everything that can refuse the run must refuse it HERE, while
+-- the only cost is a rerun. Past this point the script mutates root-owned
+-- state, and a refusal then leaves the disk changed and the manifest stale.
+
+-- The lock comes FIRST, before the manifest is read. Reading it outside the
+-- lock is a lost update: two partial runs both read state N, A installs and
+-- writes N+A, then B takes the released lock and writes N+B -- erasing A's
+-- entries from the inventory using state it read before A existed.
+$stage = env("HOME") .. "/.cache/cosmix-desktop-stage"
+$HELD_LOCK = acquire_lock($stage .. ".lock")
+
+-- The merge base has to be readable before anything is installed, not after.
+-- Loaded for FULL deploys too: a full run rewrites every app entry from source,
+-- but the icon ledger and the shared list still have to be carried forward, or
+-- an asset dropped from the source tree is forgotten while its installed copy
+-- stays on disk -- the same fail-open the partial path was fixed for.
+$existing_manifest = load_existing_manifest($MANIFEST, $partial)
+
+$hicolor_dirs = hicolor_directories()
+
+-- Icon ownership spans EVERY app, not just the selected ones: a partial deploy
+-- must not silently overwrite an icon that belongs to an app it was not asked
+-- to touch, and only a full scan can see that collision.
+$icon_owner = {}
+
+-- Seed from the RECORDED ledger before scanning source. An app that drops an
+-- icon from its source tree still owns the installed copy -- this deployer
+-- never deletes -- so source alone cannot see the collision where app A's
+-- retired icon path is claimed by app B, which would then overwrite a root file
+-- that A's manifest entry still points at.
+for each $entry in $existing_manifest["installed"]
+  for each $icon_path in get_or($entry, "icons", [])
+    -- Last-write-wins here would make ownership depend on the order entries
+    -- happen to sit in the file, and silently bless a ledger that already
+    -- records two apps owning one root path. That is corrupt state to report,
+    -- not to resolve by position.
+    if $icon_owner[$icon_path] != nil and $icon_owner[$icon_path] != $entry["app"] then
+      fail("the recorded manifest lists " .. $icon_path .. "\n  as owned by BOTH " .. $icon_owner[$icon_path] .. " and " .. $entry["app"] .. ". Ownership cannot be\n  resolved from the ledger; fix " .. $MANIFEST .. " and rerun.")
+    end
+    $icon_owner[$icon_path] = $entry["app"]
+  end
+end
+
+for each $slug in $DEPLOYABLE_SLUGS
+  $owner_app = "cosmix-" .. $slug
+  -- Enumerate only: see $require_declared on app_icon_relatives.
+  -- ($DEPLOYABLE_SLUGS, not $ALL_SLUGS: a retired slug has no source tree
+  -- left to enumerate icons from.)
+  for each $relative in app_icon_relatives($DESKTOP .. "/apps/" .. $slug .. "/icons/hicolor", $hicolor_dirs, false)
+    $destination = $ICON_DEST .. "/hicolor/" .. $relative
+    -- Ownership by full destination path is not enough on its own: two apps
+    -- shipping the same icon NAME at different sizes never collide on a path,
+    -- yet a lookup for that name picks whichever size it wants and can land on
+    -- the other app's artwork. Requiring the name to sit in the owning app's
+    -- namespace makes the collision impossible by construction rather than
+    -- merely detected.
+    $stem = path_parts($relative)["stem"]
+    if not icon_in_namespace($stem, "dev.cosmix." .. $slug) then
+      fail("icon " .. $relative .. " in app " .. $owner_app .. "\n  is named " .. $stem .. ", outside that app's namespace. A hicolor icon NAME is\n  global: name it dev.cosmix." .. $slug .. " (optionally with a -suffix).")
+    end
+    if $icon_owner[$destination] != nil and $icon_owner[$destination] != $owner_app then
+      fail("apps " .. $icon_owner[$destination] .. " and " .. $owner_app .. " both provide " .. $destination .. ";\n  hicolor icon paths must be app-owned (use dev.cosmix.<slug> names)")
+    end
+    $icon_owner[$destination] = $owner_app
+  end
+end
+
+-- kiconfinder6 verifies the install at the end. Probe it now so an absent tool
+-- degrades to a warning up front instead of a hard failure after the copy.
+$have_kiconfinder = is_file("/usr/sbin/kiconfinder6")
+if not $have_kiconfinder then
+  print "note: /usr/sbin/kiconfinder6 is absent; installed icons will not be verified"
+end
+
+-- 2. Unprivileged release build; artifact paths from compiler-artifact JSON.
+$bins = {}
+if length($APPS) == 0 then
+  -- A plasmoid-only run has nothing for cargo to do -- the else-branch below
+  -- would build the full Rust set for a run that installs none of it.
+  print "no Rust slugs selected; skipping cargo build"
+elif $no_build then
+  for each $name in $APPS
+    $p = $DESKTOP .. "/target/release/" .. $name
+    $t = run_rc("test -x " .. shell_quote($p))
+    if $t["rc"] != 0 then
+      fail("--no-build but no existing binary at " .. $p)
+    end
+    $bins[$name] = $p
+  end
+else
+  -- The -p set decides feature unification, so it must be INVOCATION-
+  -- INVARIANT: an `--only filemgr` run that built `-p cosmix-filemgr` alone
+  -- unified features differently from the full five-package deploy and
+  -- silently installed different bytes for the same source (cargo-tree
+  -- verified 2026-08-16: the shared CTK dep gains `mixer`, lib-config
+  -- gains client-helpers, zbus gains blocking-api in the full set). Every
+  -- build therefore compiles the FULL Rust set regardless of selection;
+  -- only the selected apps are installed. --no-build bypasses this and
+  -- trusts whatever sits in target/release -- an operator shortcut outside
+  -- the byte-determinism guarantee.
+  $args = ["cargo", "build", "--release", "--message-format=json-render-diagnostics"]
+  for each $bslug in $RUST_SLUGS
+    push($args, "-p")
+    push($args, "cosmix-" .. $bslug)
+  end
+  print "building the full Rust set (invocation-invariant -p unification); installing " .. join($APPS, " + ") .. "…"
+  $out = run_argv($args, { "cwd": $DESKTOP, "timeout": 3600, "max_output": 0 })
+  if not $out["ok"] then
+    fail("cargo build failed (exit " .. $out["exit_code"] .. "):\n" .. $out["stderr"])
+  end
+  for each $line in split($out["stdout"], "\n")
+    if starts_with($line, "{") then
+      $msg = json_parse($line)
+      if $msg["reason"] == "compiler-artifact" and $msg["executable"] != nil then
+        $tname = $msg["target"]["name"]
+        if contains($APPS, $tname) then
+          $bins[$tname] = $msg["executable"]
+        end
+      end
+    end
+  end
+  for each $name in $APPS
+    if $bins[$name] == nil then
+      fail("build produced no executable artifact for " .. $name)
+    end
+  end
+end
+
+-- 3. Stage: generated .desktop entries + hicolor icons; validate before install.
+-- $stage and the lock were established in the preflight, before the manifest
+-- was read.
+$rmres = run_rc("rm -rf " .. shell_quote($stage))
+if $rmres["rc"] != 0 then
+  fail("could not clear stage dir " .. $stage)
+end
+mkdir($stage)
+$installed = []
+$icon_installs = []
+$icon_names = []
+$staged_units = []
+for each $name in $APPS
+  $slug = $apps[$name]["slug"]
+  $appid = "dev.cosmix." .. $slug
+  $kind = $apps[$name]["kind"]
+  $is_daemon = $kind == "daemon"
+
+  -- A session daemon has no launcher and no artwork: it is started by the first
+  -- client that talks to its bus name, and it is never shown in a menu. Both of
+  -- the files it does install come from the crate's own source tree rather than
+  -- being generated here, because unlike a .desktop entry their content is not
+  -- derivable from cargo metadata -- the unit's Type/BusName/Restart policy is
+  -- a design decision belonging to the daemon, not to this deployer. Staging
+  -- copies them so the same validate-then-install-from-stage discipline that
+  -- covers every other file covers these too.
+  $dtpath = nil
+  if not $is_daemon then
+    $dt = "[Desktop Entry]\nType=Application\nName=" .. $apps[$name]["display"] .. "\nExec=" .. $BIN_DEST .. "/" .. $name .. "\nIcon=" .. $appid .. "\nStartupWMClass=" .. $appid .. "\nCategories=" .. get_or($CATEGORIES, $slug, "Utility;") .. "\nTerminal=false\n"
+    $dtpath = $stage .. "/" .. $appid .. ".desktop"
+    write_file($dtpath, $dt)
+    $v = run_rc("desktop-file-validate " .. shell_quote($dtpath))
+    if $v["rc"] != 0 then
+      if contains($v["stderr"], "not found") or contains($v["stderr"], "No such file") then
+        print "WARN: desktop-file-validate unavailable — skipping validation"
+      else
+        fail("desktop-file-validate " .. $appid .. ": " .. trim($v["stdout"]) .. trim($v["stderr"]))
+      end
+    end
+  end
+
+  $dbus_service = nil
+  $user_unit = nil
+  if $is_daemon then
+    $dbus_src = $DESKTOP .. "/apps/" .. $slug .. "/dbus/" .. $appid .. ".service"
+    $unit_src = $DESKTOP .. "/apps/" .. $slug .. "/systemd/" .. $name .. ".service"
+    -- Refuse a daemon whose activation files are missing or empty rather than
+    -- installing a binary nothing can ever start. Both names are slug-derived,
+    -- exactly like the binary and the desktop entry, so a crate that renames
+    -- either one is a slug-spine violation and is caught here.
+    for each $unit_source in [$dbus_src, $unit_src]
+      if not is_file($unit_source) then
+        fail($name .. " declares kind=\"daemon\" but " .. $unit_source .. "\n  is missing. A daemon installs a D-Bus activation file at dbus/" .. $appid .. ".service\n  and a systemd USER unit at systemd/" .. $name .. ".service, both named from the slug.")
+      end
+      if trim(read_file($unit_source)) == "" then
+        fail($unit_source .. " is empty; refusing to install an activation file that cannot start " .. $name)
+      end
+    end
+    -- Existence is not agreement. Both files name the bus name and the binary
+    -- in their own syntax, and neither is derived, so this is where the slug
+    -- spine is actually checked for them.
+    $binary = $BIN_DEST .. "/" .. $name
+    $checks = [
+      { "path": $dbus_src,
+        "section": "D-BUS Service",
+        "exact": { "Name": $appid, "SystemdService": $name .. ".service" },
+        "exec": { "Exec": $binary } },
+      { "path": $unit_src,
+        "section": "Service",
+        "exact": { "Type": "dbus", "BusName": $appid },
+        "exec": { "ExecStart": $binary } }
+    ]
+    for each $check in $checks
+      $defects = activation_defects(read_file($check["path"]), $check["section"], $check["exact"], $check["exec"])
+      if length($defects) > 0 then
+        fail($check["path"] .. " does not agree with what this deployer installs:\n    " .. join($defects, "\n    ") .. "\n  Every identifier for " .. $name .. " derives from the slug \"" .. $slug .. "\". Installing\n  this file would leave a bus name that activates the wrong thing, or nothing.")
+      end
+    end
+    $dbus_service = $DBUS_DEST .. "/" .. $appid .. ".service"
+    $user_unit = $USER_UNIT_DEST .. "/" .. $name .. ".service"
+    $dbus_staged = $stage .. "/dbus/" .. $appid .. ".service"
+    $unit_staged = $stage .. "/systemd/" .. $name .. ".service"
+    mkdir(dirname($dbus_staged))
+    mkdir(dirname($unit_staged))
+    copy($dbus_src, $dbus_staged)
+    copy($unit_src, $unit_staged)
+    push($staged_units, { "source": $dbus_staged, "destination": $dbus_service })
+    push($staged_units, { "source": $unit_staged, "destination": $user_unit })
+  end
+
+  $app_icons = []
+  $icon_root = $DESKTOP .. "/apps/" .. $slug .. "/icons/hicolor"
+  -- A session daemon has nothing to draw an icon on: no launcher, no window,
+  -- no menu entry. Artwork appearing under a daemon's crate is a sign the crate
+  -- was meant to be an app -- or that a skin's icons were filed against the
+  -- daemon by mistake -- and installing it would put a permanent root-owned
+  -- file under /usr/local/share/icons that nothing ever displays.
+  if $is_daemon and length(app_icon_relatives($icon_root, $hicolor_dirs, true)) > 0 then
+    fail($name .. " declares kind=\"daemon\" but ships icons under " .. $icon_root .. ".\n  A daemon installs no desktop entry and no icons -- nothing would ever display\n  them. Move the artwork to the app or skin that presents this daemon.")
+  end
+  -- Validate destinations here: these are the icons actually being written.
+  for each $relative in app_icon_relatives($icon_root, $hicolor_dirs, true)
+    $source = $icon_root .. "/" .. $relative
+    $destination = $ICON_DEST .. "/hicolor/" .. $relative
+    -- The preflight already resolved ownership across every app and the
+    -- recorded ledger; this only confirms the selected app is the owner it
+    -- registered.
+    if $icon_owner[$destination] != $name then
+      fail("icon " .. $destination .. " belongs to " .. $icon_owner[$destination] .. ", not " .. $name)
+    end
+    $stage_icon = $stage .. "/icons/hicolor/" .. $relative
+    mkdir(dirname($stage_icon))
+    copy($source, $stage_icon)
+    push($icon_installs, { "source": $stage_icon, "destination": $destination })
+    push($app_icons, $destination)
+    push($icon_names, path_parts($source)["stem"])
+  end
+
+  -- The .desktop generated above declares Icon=$appid unconditionally, and
+  -- nothing so far guarantees artwork by that name is ever installed. A themed
+  -- name with no file behind it does not fail anywhere: the launcher, the menu
+  -- and trayd's snapshot all fall back to a generic glyph, and trayd
+  -- deliberately publishes an EMPTY icon name in that case so its clients can
+  -- pick their own fallback. That silence is why filemgr, studio and tower
+  -- shipped for months looking like a rendering bug when they were really a
+  -- packaging gap. Warn rather than fail: a new app that predates its artwork
+  -- is legitimate, and this deployer should not refuse to install it -- the
+  -- point is only that the gap is named out loud at the moment it is created.
+  if not $is_daemon then
+    $has_own_icon = false
+    for each $icon_path in $app_icons
+      if path_parts($icon_path)["stem"] == $appid then
+        $has_own_icon = true
+      end
+    end
+    if not $has_own_icon then
+      print "WARN: " .. $name .. " declares Icon=" .. $appid .. " but ships no artwork by that name;"
+      print "  it will render with a generic fallback. Add"
+      print "  " .. $icon_root .. "/scalable/apps/" .. $appid .. ".svg"
+    end
+  end
+
+  $autostart = nil
+  if $kind == "tray" then
+    $autostart = $AUTOSTART_DEST .. "/" .. $appid .. ".desktop"
+  end
+  push($installed, {
+    "app": $name,
+    -- Recorded so a later run's validation knows which paths this entry is
+    -- REQUIRED to name. Without it, a daemon entry (no desktop key) reads as a
+    -- corrupt app entry and a strict partial deploy refuses to merge.
+    "kind": $kind,
+    "bin": $BIN_DEST .. "/" .. $name,
+    "desktop": $is_daemon ? nil : $DT_DEST .. "/" .. $appid .. ".desktop",
+    "autostart": $autostart,
+    "dbus_service": $dbus_service,
+    "user_unit": $user_unit,
+    "icons": sort($app_icons)
+  })
+end
+$icon_names = sort(unique($icon_names))
+
+-- 3b. Plasmoid lane: CMake build, test, stage, validate. The plasmoid is not a
+-- Cargo crate; its build/stage contract lives at apps/plasmoid/DEPLOY.md in the
+-- desktop tree. Same discipline as the Rust lane: build and test unprivileged,
+-- stage, validate the staged bytes, and only after the manifest claims them let
+-- croot() touch the root filesystem. --no-build is a cargo concern: the CMake
+-- lane always runs, because an incremental ninja rebuild is cheap and a stale
+-- plugin against a fresh QML tree is exactly the mismatch staging exists to
+-- prevent.
+$plasmoid_entries = []
+$plasmoid_installs = []
+$plasmoid_stale = []
+for each $pslug in $PLASMOID_SELECTED
+  $appid = "dev.cosmix." .. $pslug
+  $psrc = $DESKTOP .. "/apps/" .. $pslug
+  $pbuild = $psrc .. "/build-release"
+  print "building " .. $appid .. " (cmake/ECM release)…"
+  -- BUILD_TESTING=ON is load-bearing: it builds staged_backend_probe, the one
+  -- gate that catches a package whose private QML module cannot load (QML
+  -- errors render in the applet window, so no stderr/liveness check sees them).
+  $r = run_argv(["cmake", "-S", $psrc, "-B", $pbuild, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_TESTING=ON", "-DCMAKE_INSTALL_PREFIX=/usr/local"], { "timeout": 300, "max_output": 0 })
+  if not $r["ok"] then
+    fail("cmake configure failed for " .. $appid .. " (exit " .. $r["exit_code"] .. "):\n" .. $r["stderr"])
+  end
+  $r = run_argv(["cmake", "--build", $pbuild], { "timeout": 1800, "max_output": 0 })
+  if not $r["ok"] then
+    fail("cmake build failed for " .. $appid .. " (exit " .. $r["exit_code"] .. "):\n" .. $r["stderr"])
+  end
+  $r = run_argv(["ctest", "--test-dir", $pbuild, "--output-on-failure"], { "timeout": 600, "max_output": 0 })
+  if not $r["ok"] then
+    fail("ctest failed for " .. $appid .. ":\n" .. $r["stdout"] .. $r["stderr"])
+  end
+  -- Stage with DESTDIR, then validate the tree before anything root-owned
+  -- happens: every staged entry must be a regular file or directory inside
+  -- this one package root. A symlink, device, or stray path is a build defect
+  -- and refuses the run -- root install replays exactly this audited list.
+  $proot = $stage .. "/" .. $pslug .. "-root"
+  $prel = "usr/local/share/plasma/plasmoids/" .. $appid
+  $r = run_argv(["cmake", "--install", $pbuild], { "timeout": 120, "max_output": 0, "env": { "DESTDIR": $proot } })
+  if not $r["ok"] then
+    fail("cmake --install (staged) failed for " .. $appid .. ":\n" .. $r["stderr"])
+  end
+  $ftype_out = run_argv_must(["find", $proot, "-mindepth", "1", "-printf", "%y\t%P\n"], { "timeout": 30 })
+  $staged_rel = []
+  for each $line in split(trim($ftype_out), "\n")
+    $parts = split($line, "\t")
+    $ftype = $parts[0]
+    $fpath = $parts[1]
+    if $ftype == "d" then
+      -- Directories are not ledgered; install -d recreates them on demand.
+    elif $ftype == "f" then
+      if not starts_with($fpath, $prel .. "/") then
+        fail($appid .. " staged a file outside its package root: /" .. $fpath .. "\n  The deployer only manages " .. $PLASMOID_DEST .. "/" .. $appid .. "; a build that\n  installs elsewhere is out of contract (see apps/" .. $pslug .. "/DEPLOY.md).")
+      end
+      push($staged_rel, $fpath)
+    else
+      fail($appid .. " staged a non-regular entry (find type " .. $ftype .. "): /" .. $fpath)
+    end
+  end
+  if length($staged_rel) == 0 then
+    fail($appid .. ": staged install produced no files")
+  end
+  -- Exact-ledger equality, not mere containment (cold review 2026-07-28, #4).
+  $expected_rel = []
+  for each $lfile in $PLASMOID_LEDGER[$pslug]
+    push($expected_rel, $prel .. "/" .. $lfile)
+  end
+  $expected_rel = sort($expected_rel)
+  $got_rel = sort($staged_rel)
+  $ledger_diff = []
+  for each $f in $got_rel
+    if not contains($expected_rel, $f) then
+      push($ledger_diff, "unexpected: /" .. $f)
+    end
+  end
+  for each $f in $expected_rel
+    if not contains($got_rel, $f) then
+      push($ledger_diff, "missing:    /" .. $f)
+    end
+  end
+  if length($ledger_diff) > 0 then
+    fail($appid .. " staged tree does not equal the reviewed ledger:\n    " .. join($ledger_diff, "\n    ") .. "\n  If the package legitimately changed, update $PLASMOID_LEDGER in this file\n  in the same change and rerun.")
+  end
+  -- Refuse unresolvable shared-library deps while still in the stage: a plugin
+  -- that cannot load would otherwise be discovered by plasmashell at the next
+  -- login, as a broken applet.
+  for each $rel in $staged_rel
+    if ends_with($rel, ".so") then
+      $ldd_out = run_argv_must(["ldd", $proot .. "/" .. $rel], { "timeout": 30 })
+      if contains($ldd_out, "not found") then
+        fail($appid .. ": staged plugin /" .. $rel .. " has unresolved libraries:\n" .. $ldd_out)
+      end
+    end
+  end
+  -- The staged package must be discoverable as a Plasma applet before it may
+  -- claim the live package root. --show takes the package PATH: the
+  -- --packageroot+name form answers "Can't find plugin metadata" for a
+  -- perfectly valid staged package (probed 2026-07-28). And the tool's exit
+  -- code is not trusted either way: the check is the Plugin line in the
+  -- output, which names the applet id it actually parsed from metadata.json.
+  $r = run_argv(["kpackagetool6", "--type", "Plasma/Applet", "--show", $proot .. "/" .. $prel], { "timeout": 60 })
+  if not $r["ok"] or not contains($r["stdout"], "Plugin     : " .. $appid) then
+    fail("kpackagetool6 cannot resolve staged " .. $appid .. ":\n" .. $r["stdout"] .. $r["stderr"])
+  end
+  -- The staged package's private QML module must actually LOAD. This is the
+  -- gate that failed red on the import-form defect: a package whose module
+  -- cannot resolve renders the error inside the applet window, where neither
+  -- stderr nor process liveness sees it. Hard gate, per apps/plasmoid/DEPLOY.md.
+  $r = run_argv([$pbuild .. "/bin/staged_backend_probe", $proot .. "/" .. $prel], { "timeout": 60, "max_output": 0 })
+  if not $r["ok"] then
+    fail("staged backend probe failed for " .. $appid .. ":\n" .. $r["stdout"] .. $r["stderr"])
+  end
+  -- qmllint runs against the STAGED tree, not the source package: the
+  -- generated CosmixBackend module directory exists only after install, so
+  -- linting the source would miss exactly the import this probe guards.
+  $qml_list = run_argv_must(["find", $proot .. "/" .. $prel .. "/contents", "-name", "*.qml", "-type", "f"], { "timeout": 30 })
+  $qml_args = ["/usr/lib/qt6/bin/qmllint", "-I", $pbuild .. "/bin"]
+  for each $qml in sort(split(trim($qml_list), "\n"))
+    push($qml_args, $qml)
+  end
+  $r = run_argv($qml_args, { "timeout": 120, "max_output": 0 })
+  if not $r["ok"] then
+    fail("staged qmllint failed for " .. $appid .. ":\n" .. $r["stdout"] .. $r["stderr"])
+  end
+
+  -- Pack the audited stage into a tar for the privileged side. tar stores a
+  -- symlink AS a symlink and never follows one, so a source swapped between
+  -- this pack and the root install arrives as an inert link the root-side
+  -- audit refuses -- root never opens a path inside a user-writable tree, so
+  -- there is no window in which it can be steered into copying root-only
+  -- bytes into a user-readable file (cold review 2026-07-28, #3 round 2).
+  $ptar = $stage .. "/" .. $pslug .. ".tar"
+  $r = run_argv(["tar", "-C", $proot, "-cf", $ptar, "."], { "timeout": 60, "max_output": 0 })
+  if not $r["ok"] then
+    fail("tar pack failed for " .. $appid .. ":\n" .. $r["stderr"])
+  end
+
+  $pfiles = []
+  for each $rel in sort($staged_rel)
+    push($pfiles, "/" .. $rel)
+  end
+  push($plasmoid_installs, { "slug": $pslug, "appid": $appid, "tar": $ptar, "prel": $prel, "rel_files": sort($staged_rel) })
+  -- Files a previous deploy recorded that this build no longer ships stay on
+  -- disk (this deployer never deletes) and stay in the merged ledger; name
+  -- them so the operator knows the package root carries dead weight. Stale
+  -- QML is inert -- nothing imports it -- but it is root-owned residue.
+  for each $entry in $existing_manifest["installed"]
+    if $entry["app"] == "cosmix-" .. $pslug then
+      for each $old_file in get_or($entry, "files", [])
+        if not contains($pfiles, $old_file) then
+          push($plasmoid_stale, $old_file)
+        end
+      end
+    end
+  end
+  push($plasmoid_entries, {
+    "app": "cosmix-" .. $pslug,
+    "kind": "plasmoid",
+    "bin": nil,
+    "desktop": nil,
+    "autostart": nil,
+    "dbus_service": nil,
+    "user_unit": nil,
+    "icons": [],
+    "files": $pfiles
+  })
+end
+for each $pentry in $plasmoid_entries
+  push($installed, $pentry)
+end
+
+-- 4. Root install: binaries, desktop entries, icons, manifest; refresh caches.
+-- /opt/cosmix/share always: the manifest lands there on every run. The three
+-- Rust-family directories only when this run installs Rust apps -- a
+-- plasmoid-only run has no use for them, and a killed first deploy would
+-- leave them as unclaimed root directories this deployer never deletes
+-- (cold review 2026-07-28, #7).
+-- Verify the /opt/cosmix/share chain BEFORE the install -d below repairs it.
+-- Every run writes the manifest there and the plasmoid lane hands root an
+-- archive through it, and `install -d` would happily follow a symlinked
+-- component and mutate its target -- so the audit has to happen first, on the
+-- inodes as they actually are (cold review 2026-07-28, #3 round 6).
+assert_root_private_chain(["/", "/opt", "/opt/cosmix", "/opt/cosmix/share"], true)
+if length($APPS) > 0 then
+  croot("install -d -o 0 -g 0 -m 0755 " .. $BIN_DEST .. " " .. $DT_DEST .. " " .. $AUTOSTART_DEST .. " /opt/cosmix/share")
+else
+  croot("install -d -o 0 -g 0 -m 0755 /opt/cosmix/share")
+end
+-- The daemon destinations are created only when this run actually installs a
+-- daemon. They are root-owned directories under /usr/local that this deployer
+-- may never remove, so creating them for a run that has no use for them leaves
+-- two permanent empty directories behind on every machine.
+if length($staged_units) > 0 then
+  croot("install -d -o 0 -g 0 -m 0755 " .. $DBUS_DEST .. " " .. $USER_UNIT_DEST)
+end
+
+-- 4a. Write the ledger BEFORE the installs it describes. The install sequence
+-- below is a series of independent ssh commands and cannot be made atomic: a
+-- disk-full or a dropped connection halfway leaves some files installed and
+-- aborts the run. Recording afterwards meant those files existed with nothing
+-- pointing at them, and since this deployer never deletes, nothing would ever
+-- find them again.
+-- Claiming first inverts the error: an aborted run leaves the manifest naming
+-- paths that may not exist. That is the safe direction and the same trade the
+-- icon-ledger union makes -- an uninstall asked to remove a file that was never
+-- created does nothing, while a root file missing from the inventory is
+-- stranded permanently.
+-- The cache files are PRECLAIMED, not carried forward empty. Their paths are
+-- predictable, and both generators write their output before they can report
+-- failure -- so recording them only on success left a real root file unlisted
+-- whenever the generator half-succeeded or the run was killed before section 5.
+-- Over-claiming a cache that was never generated costs nothing, by the same
+-- argument as the ledger ordering above.
+--
+-- Both generators write a DOT-PREFIXED TEMPORARY first and rename it into place,
+-- verified here under strace: update-desktop-database opens
+-- `.mimeinfo.cache.XXXXXX` (mkstemp, random suffix) and gtk-update-icon-cache
+-- opens the fixed name `.icon-theme.cache`. Killed between the open and the
+-- rename, each leaves a root-owned file this ledger never named. The fixed name
+-- is preclaimable exactly, so it is claimed here; the random one cannot be
+-- named in advance and is swept below instead.
+$intent_shared = [$DT_DEST .. "/mimeinfo.cache"]
+if length($icon_installs) > 0 then
+  push($intent_shared, $ICON_DEST .. "/hicolor/icon-theme.cache")
+  push($intent_shared, $ICON_DEST .. "/hicolor/.icon-theme.cache")
+end
+-- The root-owned plasmoid extraction scratch is PRECLAIMED like the caches:
+-- its name is fixed, it is created below as a root 0700 directory, and a run
+-- killed mid-extract would otherwise leave an unnameable root tree behind.
+-- The archive handoff directory beside it is preclaimed for the same reason:
+-- root creates it under /opt/cosmix/share and chowns the leaf to the invoking
+-- user, so a run killed between creation and cleanup leaves a named remnant
+-- rather than an orphan the manifest has never heard of.
+for each $pinst in $plasmoid_installs
+  push($intent_shared, "/opt/cosmix/share/.plasmoid-extract-" .. $pinst["slug"])
+  push($intent_shared, "/opt/cosmix/share/.plasmoid-handoff-" .. $pinst["slug"])
+end
+-- The atomic BINARY installs in section 4b (stage to $BIN_DEST/.<name>.new,
+-- then mv -fT) are the same fixed-name root-temp class: a run killed between
+-- the two croot round-trips leaves a root-owned dot-tmp in the bound bin dir
+-- that nothing else names. Preclaim every name this deployer could ever
+-- stage -- ALL Rust apps, not just this run's selection -- so a tmp stranded
+-- by a crashed --only run stays ledgered across later runs regardless of
+-- what they select (over-claiming is harmless; under-claiming is the
+-- stranding defect, per the ledger rule above).
+for each $bslug in $RUST_SLUGS
+  push($intent_shared, $BIN_DEST .. "/.cosmix-" .. $bslug .. ".new")
+end
+write_manifest(merge_manifest($existing_manifest, $installed, $SELECTED_APPS_ALL, $intent_shared), $stage)
+
+-- -T (--no-target-directory) on every FILE install, for the same reason the
+-- manifest rename uses `mv -fT`: GNU install given an existing DIRECTORY as its
+-- destination does not replace it, it copies the source INSIDE it. A directory
+-- at /opt/cosmix/bin/cosmix-tray would therefore make this line create
+-- /opt/cosmix/bin/cosmix-tray/cosmix-tray -- a root-owned file at a path the
+-- manifest does not name, stranded forever, while the ledger claims the
+-- directory itself. -T makes that an error instead; it is transparent for the
+-- two cases that actually occur (overwrite a regular file, create a new one).
+-- The `install -d` calls below are unaffected: -T is meaningless for them.
+if length($icon_installs) > 0 then
+  croot("install -d -o 0 -g 0 -m 0755 " .. $ICON_DEST .. " " .. $ICON_DEST .. "/hicolor")
+  for each $icon in $icon_installs
+    croot("install -d -o 0 -g 0 -m 0755 " .. shell_quote(dirname($icon["destination"])))
+    croot("install -T -o 0 -g 0 -m 0644 " .. shell_quote($icon["source"]) .. " " .. shell_quote($icon["destination"]))
+  end
+end
+for each $name in $APPS
+  $slug = $apps[$name]["slug"]
+  $appid = "dev.cosmix." .. $slug
+  -- BINARIES publish atomically (the atomic-publish rule 2026-08-16, single-owner
+  -- option B rider; ADR 2026-08-16-opt-cosmix-bin-single-canonical-bin-dir):
+  -- desk CTs bind $BIN_DEST read-only, so a binary must never be torn
+  -- mid-write — and `install -T` writes the destination in place. Stage to
+  -- a dot-tmp in the SAME directory (install -T still errors on a
+  -- directory squatting the tmp path), then `mv -fT` = rename(2): a reader
+  -- sees old file or new file, never a torn one, and a running process
+  -- (host app or desk-CT client) can't ETXTBSY the deploy — rename
+  -- replaces the name, not the busy inode. A crash between the two steps
+  -- leaves only a hidden dot-tmp -- PRECLAIMED in the manifest's shared
+  -- ledger (section 4a) so even a stranded one stays named, and the next
+  -- deploy of the app overwrites it. Config/desktop/icon installs below
+  -- stay plain install -T: nothing exec()s those mid-write.
+  $btmp = $BIN_DEST .. "/." .. $name .. ".new"
+  croot("install -T -o 0 -g 0 -m 0755 " .. shell_quote($bins[$name]) .. " " .. shell_quote($btmp))
+  croot("mv -fT " .. shell_quote($btmp) .. " " .. shell_quote($BIN_DEST .. "/" .. $name))
+  if $apps[$name]["kind"] == "daemon" then
+    -- Both activation files were staged and non-emptiness-checked above.
+    croot("install -T -o 0 -g 0 -m 0644 " .. shell_quote($stage .. "/dbus/" .. $appid .. ".service") .. " " .. shell_quote($DBUS_DEST .. "/" .. $appid .. ".service"))
+    croot("install -T -o 0 -g 0 -m 0644 " .. shell_quote($stage .. "/systemd/" .. $name .. ".service") .. " " .. shell_quote($USER_UNIT_DEST .. "/" .. $name .. ".service"))
+    print "installed " .. $name .. " (" .. $apps[$name]["display"] .. ") + " .. $appid .. ".service (D-Bus activated user daemon)"
+  else
+    croot("install -T -o 0 -g 0 -m 0644 " .. shell_quote($stage .. "/" .. $appid .. ".desktop") .. " " .. shell_quote($DT_DEST .. "/" .. $appid .. ".desktop"))
+    -- kind="tray" surfaces also autostart with the session (SNI item, no window).
+    if $apps[$name]["kind"] == "tray" then
+      croot("install -T -o 0 -g 0 -m 0644 " .. shell_quote($stage .. "/" .. $appid .. ".desktop") .. " " .. shell_quote($AUTOSTART_DEST .. "/" .. $appid .. ".desktop"))
+      print "installed " .. $name .. " (" .. $apps[$name]["display"] .. ") + " .. $appid .. ".desktop (+ autostart)"
+    else
+      print "installed " .. $name .. " (" .. $apps[$name]["display"] .. ") + " .. $appid .. ".desktop"
+    end
+  end
+end
+
+-- 4b. Plasmoid root install.
+--
+-- Two audits guard it, both fail-closed (cold review 2026-07-28, #2 + #3
+-- round 2):
+--
+-- ANCESTRY. `install -d` follows a symlinked existing component, so a
+-- symlinked ancestor would teleport every root write outside the tree the
+-- ledger names. Each component from /usr/local down is lstat-classified
+-- root-side in one find call; /usr/local and /usr/local/share MUST report as
+-- real directories (their absence or a failed probe refuses the run -- empty
+-- output is never trusted), deeper components may be absent on a fresh
+-- machine but must be real directories when present.
+--
+-- SOURCE. Root never opens a path inside a user-writable tree: the audited
+-- stage travels as a tar (symlinks stored inert, never followed), root
+-- extracts it into a preclaimed 0700 root-owned scratch, re-audits the
+-- extracted BYTES against the reviewed ledger root-side, and installs only
+-- from that scratch. A source swapped after the user-side audit arrives as a
+-- symlink or a wrong file set and refuses the run.
+for each $pinst in $plasmoid_installs
+  $p_appid = $pinst["appid"]
+  $p_root = $PLASMOID_DEST .. "/" .. $p_appid
+  $ancestry = ["/usr/local", "/usr/local/share", "/usr/local/share/plasma", $PLASMOID_DEST, $p_root]
+  -- Re-verify the handoff chain immediately before use, not just once at
+  -- startup: the check above happened before the Rust apps installed, and this
+  -- narrows the window in which a component could have changed underneath us.
+  -- The full reasoning lives on assert_root_private_chain().
+  assert_root_private_chain(["/", "/opt", "/opt/cosmix", "/opt/cosmix/share"], false)
+  $probe_cmd = "find -P"
+  for each $anc in $ancestry
+    $probe_cmd = $probe_cmd .. " " .. shell_quote($anc)
+  end
+  $probe_cmd = $probe_cmd .. " -maxdepth 0 -printf '%y\t%p\n'"
+  $probe = ssh_run($TARGET, $probe_cmd, { "timeout": 30 })
+  $seen_types = {}
+  for each $line in split(trim(get_or($probe, "stdout", "")), "\n")
+    if $line != "" then
+      $parts = split($line, "\t")
+      $seen_types[$parts[1]] = $parts[0]
+    end
+  end
+  for each $anc in $ancestry
+    $atype = $seen_types[$anc]
+    if $atype == nil then
+      -- Absent is tolerable only below /usr/local/share, and only as genuine
+      -- absence -- which the probe cannot distinguish from its own failure
+      -- for the two roots that must exist on any machine this deploys to.
+      if $anc == "/usr/local" or $anc == "/usr/local/share" then
+        fail("ancestry probe could not classify " .. $anc .. " (probe error or missing);\n  refusing to install through an unaudited path.\n  stderr: " .. get_or($probe, "stderr", ""))
+      end
+    elif $atype != "d" then
+      fail("live path " .. $anc .. " is type '" .. $atype .. "', not a real directory;\n  refusing to install through it.")
+    end
+  end
+  $interior = ssh_run($TARGET, "find -P " .. shell_quote($p_root) .. " ! -type d ! -type f -printf '%y\t%p\n'", { "timeout": 30 })
+  if trim(get_or($interior, "stdout", "")) != "" then
+    fail("live package root " .. $p_root .. " contains non-regular entries:\n" .. $interior["stdout"])
+  end
+
+  -- Extract into the preclaimed root scratch. The rm -rf clears a PREVIOUS
+  -- killed run's scratch -- a re-creatable, ledgered (shared) staging remnant,
+  -- not an installed artifact, which is why it sits outside the never-delete
+  -- invariant that protects manifest-named installs.
+  $extract = "/opt/cosmix/share/.plasmoid-extract-" .. $pinst["slug"]
+  croot("rm -rf " .. shell_quote($extract))
+  croot("install -d -o 0 -g 0 -m 0700 " .. shell_quote($extract))
+  -- Copy the tar INTO the root scratch first and audit the root-owned copy:
+  -- extracting a user-writable archive as root is a root-WRITE oracle (a
+  -- swapped tar with symlink members can steer extraction outside the
+  -- scratch). The copy itself must never DEREFERENCE the user path either:
+  -- GNU install follows a source symlink, so a tar swapped for a link to
+  -- /dev/zero would have root fill the scratch filesystem, and a link to a
+  -- root-only file would pull its bytes (cold review 2026-07-28, #3 round 3).
+  -- dd opens the source exactly once with O_NOFOLLOW|O_NONBLOCK (iflag), so a
+  -- swapped symlink fails at open instead of being followed, a writerless FIFO
+  -- fails with EAGAIN instead of blocking, and a FIFO with a writer streaming
+  -- zeros is capped by count= at 65 MiB of root-scratch garbage that the size
+  -- check and tar audit below then refuse -- the unbounded-fill and
+  -- root-only-read oracles both die at this open (cold review 2026-07-28, #3
+  -- round 4). Mix's copy() has no nofollow/bound options yet; that gap is
+  -- recorded as a Mix bug, and dd is the correct external tool meanwhile.
+  --
+  -- O_NOFOLLOW only covers the LAST component, so root must not read the tar
+  -- out of the build stage at all: $HOME/.cache/... is user-owned end to end,
+  -- and swapping any ancestor for a symlink defeats the flag entirely (cold
+  -- review 2026-07-28, #3 round 5). The archive is handed over in a directory
+  -- root creates under the root-owned /opt/cosmix/share ancestry probed above:
+  -- the LEAF is chowned to the invoking user so the unprivileged side can write
+  -- the tar, but replacing the leaf itself needs write permission on
+  -- /opt/cosmix/share, which is root's. So every ancestor root walks is
+  -- root-controlled and the final component is O_NOFOLLOW -- the whole path is
+  -- closed, not just its tail.
+  $handoff = "/opt/cosmix/share/.plasmoid-handoff-" .. $pinst["slug"]
+  croot("rm -rf " .. shell_quote($handoff))
+  croot("install -d -o " .. to_string(uid()) .. " -g " .. to_string(gid()) .. " -m 0700 " .. shell_quote($handoff))
+  $hcopy = run_argv(["cp", "-f", $pinst["tar"], $handoff .. "/pkg.tar"], { "timeout": 60, "max_output": 0 })
+  if not $hcopy["ok"] then
+    croot("rm -rf " .. shell_quote($handoff))
+    fail("could not hand the " .. $p_appid .. " archive to the privileged side:\n" .. trim(get_or($hcopy, "stderr", "")))
+  end
+  croot("dd if=" .. shell_quote($handoff .. "/pkg.tar") .. " of=" .. shell_quote($extract .. "/pkg.tar") .. " bs=1M count=65 iflag=nofollow,nonblock,fullblock status=none")
+  croot("rm -rf " .. shell_quote($handoff))
+  $tclass = ssh_run($TARGET, "find -P " .. shell_quote($extract .. "/pkg.tar") .. " -maxdepth 0 -printf '%y\t%s\n'", { "timeout": 30 })
+  $tparts = split(trim(get_or($tclass, "stdout", "")), "\t")
+  if not get_or($tclass, "ok", false) or length($tparts) != 2 then
+    fail("root-side classification of the " .. $p_appid .. " archive copy failed: " .. get_or($tclass, "stderr", ""))
+  end
+  if $tparts[0] != "f" then
+    fail("the root-owned copy of the " .. $p_appid .. " archive is type '" .. $tparts[0] .. "', not a regular file;\n  the handed-over source (from " .. $pinst["tar"] .. ") changed between audit and install. Refusing.")
+  end
+  if to_number($tparts[1]) > 67108864 then
+    fail("the " .. $p_appid .. " archive copy is implausibly large (" .. $tparts[1] .. " bytes > 64 MiB);\n  refusing.")
+  end
+  $tlist = ssh_run($TARGET, "tar -tvf " .. shell_quote($extract .. "/pkg.tar"), { "timeout": 30 })
+  if not get_or($tlist, "ok", false) then
+    fail("root-side tar listing of " .. $p_appid .. " failed: " .. get_or($tlist, "stderr", ""))
+  end
+  for each $line in split(trim($tlist["stdout"]), "\n")
+    if $line != "" then
+      $tchar = substr($line, 0, 1)
+      if $tchar != "-" and $tchar != "d" then
+        fail("packed " .. $p_appid .. " archive contains a non-regular member:\n  " .. $line .. "\n  The staged source changed between audit and pack; refusing.")
+      end
+      if contains($line, "..") or contains($line, " /") then
+        fail("packed " .. $p_appid .. " archive member escapes the scratch:\n  " .. $line)
+      end
+    end
+  end
+  croot("install -d -o 0 -g 0 -m 0700 " .. shell_quote($extract .. "/tree"))
+  croot("tar --no-same-owner -xpf " .. shell_quote($extract .. "/pkg.tar") .. " -C " .. shell_quote($extract .. "/tree"))
+  $eaudit = ssh_run($TARGET, "find -P " .. shell_quote($extract .. "/tree") .. " -mindepth 1 -printf '%y\t%P\n'", { "timeout": 30 })
+  if not get_or($eaudit, "ok", false) then
+    fail("root-side audit of extracted " .. $p_appid .. " failed: " .. get_or($eaudit, "stderr", ""))
+  end
+  $extracted_rel = []
+  for each $line in split(trim($eaudit["stdout"]), "\n")
+    if $line != "" then
+      $parts = split($line, "\t")
+      if $parts[0] == "f" then
+        push($extracted_rel, $parts[1])
+      elif $parts[0] != "d" then
+        fail("extracted " .. $p_appid .. " contains a non-regular entry (type " .. $parts[0] .. "): " .. $parts[1] .. "\n  The staged source changed between audit and pack; refusing.")
+      end
+    end
+  end
+  $extracted_rel = sort($extracted_rel)
+  if join($extracted_rel, "\n") != join($pinst["rel_files"], "\n") then
+    fail("extracted " .. $p_appid .. " file set does not equal the audited stage;\n  the source changed between audit and pack. Refusing.\n  extracted:\n    " .. join($extracted_rel, "\n    "))
+  end
+
+  -- Install from the root-owned scratch only. Modes: 0644 content, 0755 for
+  -- the native plugin .so. The manifest already claims every one of these.
+  for each $rel in $pinst["rel_files"]
+    croot("install -d -o 0 -g 0 -m 0755 " .. shell_quote(dirname("/" .. $rel)))
+    $pmode = ends_with($rel, ".so") ? "0755" : "0644"
+    croot("install -T -o 0 -g 0 -m " .. $pmode .. " " .. shell_quote($extract .. "/tree/" .. $rel) .. " " .. shell_quote("/" .. $rel))
+  end
+  croot("rm -rf " .. shell_quote($extract))
+end
+for each $pentry in $plasmoid_entries
+  print "installed " .. $pentry["app"] .. " (KDE plasmoid, " .. length($pentry["files"]) .. " files)"
+end
+if length($plasmoid_stale) > 0 then
+  print "note: " .. length($plasmoid_stale) .. " previously recorded plasmoid file(s) are no longer shipped:"
+  for each $stale_file in sort(unique($plasmoid_stale))
+    print "    " .. $stale_file
+  end
+  print "  They stay on disk and in the ledger (this deployer never deletes)."
+end
+-- Discovery check against the LIVE package root, and the one operator fact a
+-- deploy cannot act on itself: plasmashell links the old plugin until restart.
+for each $pslug in $PLASMOID_SELECTED
+  $appid = "dev.cosmix." .. $pslug
+  -- Same path-form + Plugin-line discipline as the staged check above.
+  $r = run_argv(["kpackagetool6", "--type", "Plasma/Applet", "--show", $PLASMOID_DEST .. "/" .. $appid], { "timeout": 60 })
+  if not $r["ok"] or not contains($r["stdout"], "Plugin     : " .. $appid) then
+    fail("post-install: kpackagetool6 cannot resolve live " .. $appid .. ":\n" .. $r["stdout"] .. $r["stderr"])
+  end
+  print "note: an already-running plasmashell keeps the OLD " .. $appid .. " native plugin"
+  print "  until plasmashell restarts (systemctl --user restart plasma-plasmashell.service)."
+end
+
+-- A newly installed or changed user unit is invisible until the USER manager
+-- rereads its search path. This is the one root-install step whose follow-up is
+-- not a root action: the unit lives in the operator's own session manager, and
+-- `systemctl --user` from a root shell would reload root's manager, not theirs.
+-- Non-fatal: a machine with no running user manager (a headless deploy) has
+-- nothing to reload, and the unit is read at next login regardless.
+if length($staged_units) > 0 then
+  $reload = run_argv(["systemctl", "--user", "daemon-reload"], { "timeout": 30 })
+  if not $reload["ok"] then
+    print "note: systemctl --user daemon-reload failed (non-fatal): " .. trim($reload["stderr"])
+    print "  The user unit is installed; it is picked up at the next login or reload."
+  end
+end
+
+-- The other half of the temp-file problem the preclaim above could not solve.
+-- update-desktop-database's temp carries a random mkstemp suffix, so it cannot
+-- be named before the fact -- but it CAN be found after. Sweeping the
+-- destination for leftover dot-temps and recording whatever is there converts
+-- an unnameable path into a named one for every failure mode except the
+-- deployer itself being killed mid-generator, which no in-process ledger can
+-- cover. Both generators are swept: gtk-update-icon-cache's fixed-name temp is
+-- already preclaimed, but a sweep also catches it if the preclaim is ever
+-- skipped because this run installed no icons and a previous one did.
+function sweep_temps($dir, $prefix)
+  $found = []
+  for each $path in glob($dir .. "/" .. $prefix .. "*")
+    if exists($path, { "follow_symlinks": false }) then
+      push($found, $path)
+    end
+  end
+  return $found
+end
+
+-- Push a swept temp into the ledger ON DISK, not just into $shared.
+--
+-- The sweep found a path nothing else can name -- that is its whole purpose --
+-- and holding it in memory until section 5's write reopens the very window the
+-- sweep exists to close: a kill between the sweep and that write strands a
+-- root-owned file with nothing on disk naming it, and the deployer may never
+-- delete. So each sweep that finds something flushes immediately. The write is
+-- idempotent (it merges against $existing_manifest, the manifest as read at
+-- startup) and small, so paying for it twice on the rare run that finds residue
+-- is cheaper than the stranding it prevents.
+function flush_ledger($shared_now)
+  -- $SELECTED_APPS_ALL, not $APPS: the merge treats the selected list as "this
+  -- run rewrites these entries". Merging with the Rust-only list preserved the
+  -- EXISTING plasmoid entry and appended the fresh one -- a duplicate that the
+  -- validator refuses on the next partial run (cold review 2026-07-28, #1).
+  write_manifest(merge_manifest($existing_manifest, $installed, $SELECTED_APPS_ALL, concat($intent_shared, $shared_now)), $stage)
+end
+
+-- Record every leftover dot-temp in $dir, flushing the ledger if any turned up.
+function record_temps($dir, $prefix, $shared_now)
+  $swept = sweep_temps($dir, $prefix)
+  for each $residue in $swept
+    print "note: recording leftover generator temp " .. $residue
+    push($shared_now, $residue)
+  end
+  if length($swept) > 0 then
+    flush_ledger($shared_now)
+  end
+  return $shared_now
+end
+
+$shared = []
+$udd = ssh_run($TARGET, "/usr/bin/update-desktop-database " .. shell_quote($DT_DEST), { "timeout": 30 })
+if $udd["ok"] then
+  push($shared, $DT_DEST .. "/mimeinfo.cache")
+else
+  print "note: update-desktop-database unavailable or failed (non-fatal): " .. trim($udd["stderr"])
+end
+$shared = record_temps($DT_DEST, ".mimeinfo.cache", $shared)
+
+if length($icon_installs) > 0 then
+  -- A local index.theme here outranks the system one (XDG_DATA_DIRS order) and
+  -- truncates the hicolor theme for every application. This script never writes
+  -- one; if something else did, say so -- it explains icon breakage elsewhere.
+  if is_file($ICON_DEST .. "/hicolor/index.theme") then
+    print "WARNING: " .. $ICON_DEST .. "/hicolor/index.theme exists and shadows"
+    print "  /usr/share/icons/hicolor/index.theme; any directory it omits stops resolving"
+    print "  for every application. This script did not write it. Remove it by hand."
+  end
+
+  $cache = ssh_run($TARGET, "/usr/sbin/gtk-update-icon-cache -f -t " .. shell_quote($ICON_DEST .. "/hicolor"), { "timeout": 30 })
+  if $cache["ok"] then
+    push($shared, $ICON_DEST .. "/hicolor/icon-theme.cache")
+  else
+    print "note: gtk-update-icon-cache unavailable or failed (non-fatal): " .. trim($cache["stderr"])
+  end
+  $shared = record_temps($ICON_DEST .. "/hicolor", ".icon-theme.cache", $shared)
+end
+
+-- 5. Rewrite the ledger now that the cache files in $shared exist, and still
+-- BEFORE the post-install verification below: everything above has changed
+-- root-owned state, and writing the record after a check that can fail would
+-- leave the disk installed and the inventory stale -- the exact divergence this
+-- file exists to prevent. The verification still fails the run, just with a
+-- truthful manifest behind it.
+--
+-- $intent_shared is unioned back in, NOT dropped. Both writes merge against
+-- $existing_manifest, which is the manifest as it was read at startup and does
+-- not contain the preclaims -- so passing only $shared here would silently undo
+-- the preclaim written at section 4 for any generator that failed. That is
+-- exactly the case the preclaim exists for: gtk-update-icon-cache writes its
+-- output before it can report failure, so a failed run can leave a real
+-- root-owned cache file on disk, and this write would have been the thing that
+-- forgot it.
+-- $SELECTED_APPS_ALL for the same duplicate-entry reason as flush_ledger().
+write_manifest(merge_manifest($existing_manifest, $installed, $SELECTED_APPS_ALL, concat($intent_shared, $shared)), $stage)
+print "manifest: " .. $MANIFEST
+
+-- 6. Verify the installed icons actually resolve. Last, because it is the only
+-- step that cannot be preflighted: it needs the files to be on disk.
+if length($icon_installs) > 0 and $have_kiconfinder then
+  $missing = []
+  for each $icon_name in $icon_names
+    $found = run_argv(["/usr/sbin/kiconfinder6", $icon_name], { "timeout": 30 })
+    if not $found["ok"] then
+      push($missing, $icon_name)
+    end
+  end
+  if length($missing) > 0 then
+    -- Deliberately NO local index.theme fallback. Staging already refused any
+    -- directory the system hicolor theme does not declare, so the assets are
+    -- in searchable locations by construction and a local index.theme could
+    -- not add anything -- but because $ICON_DEST precedes /usr/share in the
+    -- default XDG_DATA_DIRS, the first index.theme found wins and a partial
+    -- Directories= list SHADOWS the system theme: every hicolor-only icon on
+    -- the machine (verified 2026-07-26 with btop, brave-desktop, carla) stops
+    -- resolving. Unresolvable icons are an environment fault to report, never
+    -- one to paper over.
+    print "unresolved icon names after install: " .. join($missing, ", ")
+    print "  installed under: " .. $ICON_DEST .. "/hicolor"
+    print "  staging verified these directories are declared by " .. $HICOLOR_INDEX .. ","
+    print "  so this is an icon search path fault: check that " .. $ICON_DEST
+    print "  is in XDG_DATA_DIRS (default /usr/local/share:/usr/share) for the"
+    print "  session that will render them. The manifest above is already correct."
+    fail("installed icons do not resolve through the icon theme")
+  end
+  print "hicolor union resolved installed icons"
+end
+
+funlock($HELD_LOCK)
+print "done."
+

@@ -1,0 +1,313 @@
+#!/usr/bin/env mix
+-- deploy_maild_filter.mix — install the private hub's inbound mail routing
+-- filter on the hub-configured mail nodes and ensure maild points at it.
+--
+--   mix _bin/deploy_maild_filter.mix deploy
+--   mix _bin/deploy_maild_filter.mix deploy alpha beta
+--
+-- The filter is re-read for each message, so an already-wired node needs no
+-- restart. A newly-wired node is restarted and rolled back to its saved config
+-- if the restart fails. Deploys are sequential, stop on the first error, and
+-- follow the fleet rollout order so broker hubs are touched last.
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+fn is_in($list, $value)
+  for each $item in $list
+    if $item == $value then
+      return true
+    end
+  end
+  return false
+end
+
+-- A daemon can be active while its output never reaches journald. Poll only
+-- the current systemd invocation so an old log line cannot satisfy the gate.
+fn verify_logging($host, $unit)
+  $n = 0
+  $try = 0
+  while $try < 4
+    $r = ssh_mix($host, '
+$iid = trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value"))
+if $iid == "" then
+  eprint("missing InvocationID")
+  exit(1)
+end
+$logs = trim(run("/usr/bin/journalctl _SYSTEMD_INVOCATION_ID=" .. $iid .. " -o cat --no-pager"))
+if $logs == "" then
+  eprint("no current-invocation log lines")
+  exit(1)
+end
+print(len(split($logs, "\n")))
+', {bindings: {unit: $unit}})
+    if $r["ok"] and trim($r["stdout"]) != "" then
+      $count = to_number(trim($r["stdout"]))
+      if $count != nil then
+        $n = $count
+      end
+    end
+    if $n >= 1 then
+      $try = 4
+    else
+      $try = $try + 1
+      if $try < 4 then
+        sleep(1)
+      end
+    end
+  end
+  $d.die_if($n < 1,
+    $host .. " " .. $unit .. ": active but zero journald lines for the current systemd invocation")
+  print("  logging verified (" .. ("" .. $n) .. " line/s, current invocation)")
+end
+
+-- The old hub carried this as a separate remote helper. Keep the format-aware
+-- edit here because the public starter has no shared config-edit primitive.
+fn ensure_filter_config($host)
+  return ssh_mix($host, '
+$cfg = read_file($cfg_path)
+$cfg = replace($cfg, "\u{FEFF}", "")
+if substr(trim($cfg), 0, 1) == "{" then
+  print("ERROR: brace/JSON config — normalize it first")
+else
+  if contains($cfg, "inbound_filter:") or contains($cfg, data_encode("inbound_filter") .. ":") then
+    $loaded = load_data($cfg_path)
+    if $loaded["inbound_filter"] == $filter_path then
+      print("ALREADY")
+    else
+      print("ERROR: existing inbound_filter does not name the canonical filter path")
+    end
+  else
+    write_file($backup_path, $cfg)
+    write_file($cfg_path, $cfg .. "\ninbound_filter: " .. data_encode($filter_path) .. "\n")
+    $loaded = load_data($cfg_path)
+    if $loaded["inbound_filter"] == $filter_path then
+      print("INSERTED")
+    else
+      print("ERROR: inserted inbound_filter did not parse back as the canonical filter path")
+    end
+  end
+end
+', {bindings: {
+    cfg_path: $REMOTE_CONFIG,
+    backup_path: $REMOTE_CONFIG_BACKUP,
+    filter_path: $REMOTE_FILTER
+  }})
+end
+
+fn rollback_config($host)
+  $rb = ssh_mix($host, '
+copy($backup_path, $cfg_path)
+$active = run("/usr/bin/systemctl restart cosmix-maild && /usr/bin/sleep 2 && /usr/bin/systemctl is-active cosmix-maild")
+print($active)
+', {bindings: {backup_path: $REMOTE_CONFIG_BACKUP, cfg_path: $REMOTE_CONFIG}})
+  $journal = ssh_mix($host,
+    'print(run("/usr/bin/journalctl -u cosmix-maild -n 30 --no-pager"))')
+  print($journal["stdout"])
+  print($journal["stderr"])
+  if $rb["ok"] and trim($rb["stdout"]) == "active" then
+    $d.die_if(true,
+      $host .. " maild failed with the new inbound_filter config — ROLLED BACK; maild is active on the previous config")
+  end
+  print("  !!! ROLLBACK ALSO FAILED — maild is DOWN on " .. $host ..
+    " (is-active: " .. trim($rb["stdout"]) .. ")")
+  $d.die_if(true, $host .. " maild DOWN and rollback FAILED — manual intervention required")
+end
+
+fn deploy($host)
+  print("")
+  print("[" .. $host .. "] deploy maild inbound filter")
+
+  -- ssh_mix invokes the node's installed Mix directly, so foreign roster
+  -- nodes with a non-Mix login shell remain valid targets.
+  $reach = ssh_mix($host, 'print("reach-ok")')
+  $d.die_if(not $reach["ok"] or not contains($reach["stdout"], "reach-ok"),
+    $host .. " unreachable or has no working /opt/cosmix/bin/mix: " ..
+    trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+
+  -- Write beside the destination and rename over it so readers see either
+  -- complete old bytes or complete new bytes. Then assert content and metadata.
+  $inst = ssh_mix($host, '
+mkdir($filter_dir, {parents: true})
+write_file($new_path, $filter_source)
+chown($new_path, 0, 0)
+chmod($new_path, 0o644)
+rename($new_path, $filter_path)
+if read_file($filter_path) != $filter_source then
+  eprint("installed filter content mismatch")
+  exit(1)
+end
+$st = stat($filter_path)
+if $st["uid"] != 0 or $st["gid"] != 0 or $st["perm"] != 0o644 then
+  eprint("installed filter ownership or mode mismatch")
+  exit(1)
+end
+print("FILTER_OK")
+', {bindings: {
+    filter_dir: $REMOTE_FILTER_DIR,
+    new_path: $REMOTE_FILTER .. ".new",
+    filter_path: $REMOTE_FILTER,
+    filter_source: $FILTER_SOURCE
+  }})
+  $d.die_if(not $inst["ok"] or trim($inst["stdout"]) != "FILTER_OK",
+    $host .. " filter install/assertion failed: " ..
+    trim($inst["stdout"]) .. " " .. trim($inst["stderr"]))
+  print("  filter installed; exact bytes and metadata verified")
+
+  -- Execute the installed remote file with maild-shaped globals. A transfer
+  -- that did nothing, truncated the file, or installed invalid source fails.
+  $smoke = ssh_mix($host, '
+write_file($smoke_path, $prefix .. read_file($filter_path))
+$out = run("/opt/cosmix/bin/mix /tmp/cosmix-maild-filter-smoke.mix")
+remove($smoke_path)
+print("FILTER_SMOKE_OK " .. $out)
+', {bindings: {
+    smoke_path: $REMOTE_SMOKE,
+    prefix: $PREFLIGHT_PREFIX,
+    filter_path: $REMOTE_FILTER
+  }})
+  $d.die_if(not $smoke["ok"] or not starts_with(trim($smoke["stdout"]), "FILTER_SMOKE_OK"),
+    $host .. " installed filter smoke failed: " ..
+    trim($smoke["stdout"]) .. " " .. trim($smoke["stderr"]))
+  print("  installed filter execution smoke: OK")
+
+  $ensured = ensure_filter_config($host)
+  $result = trim($ensured["stdout"])
+  $d.die_if(not $ensured["ok"],
+    $host .. " config ensure failed: " .. trim($ensured["stderr"]) .. " " .. $result)
+  $d.die_if(starts_with($result, "ERROR:"), $host .. " config ensure: " .. $result)
+  $d.die_if($result != "ALREADY" and $result != "INSERTED",
+    $host .. " config ensure returned an unexpected result: " .. $result)
+
+  if $result == "ALREADY" then
+    print("  config already wired — no restart (filter is re-read per message)")
+    print("  [" .. $host .. "] OK")
+    return nil
+  end
+
+  print("  config: inbound_filter inserted — restarting maild")
+  $restart = ssh_mix($host,
+    'print(run("/usr/bin/systemctl restart cosmix-maild && /usr/bin/sleep 2 && /usr/bin/systemctl is-active cosmix-maild"))')
+  if not $restart["ok"] or trim($restart["stdout"]) != "active" then
+    print("  RESTART FAILED with new config — restoring pre-edit config")
+    rollback_config($host)
+  end
+  print("  active: " .. trim($restart["stdout"]))
+  verify_logging($host, "cosmix-maild")
+  print("  [" .. $host .. "] OK (restarted)")
+end
+
+-- ── dispatch and purely-local pre-flight ───────────────────────────────
+$argv = args()
+if len($argv) == 0 then
+  print("usage: mix deploy_maild_filter.mix deploy [node...]")
+  exit(2)
+end
+if $argv[0] != "deploy" then
+  print("unknown stage: " .. $argv[0])
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_maild_filter.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no maild filter deploy config at " .. $CONF_PATH ..
+    " — copy deploy_maild_filter.conf.mix.example and set maild_filter_deploy.nodes")
+  exit(2)
+end
+$CONF_DOC = load_data($CONF_PATH)
+$d.die_if(type($CONF_DOC) != "map" or type($CONF_DOC["maild_filter_deploy"]) != "map",
+  "invalid " .. $CONF_PATH .. ": expected only a maild_filter_deploy map")
+for each $key in keys($CONF_DOC)
+  $d.die_if($key != "maild_filter_deploy",
+    "invalid " .. $CONF_PATH .. ": unexpected top-level key " .. $key)
+end
+$CONF = $CONF_DOC["maild_filter_deploy"]
+for each $key in keys($CONF)
+  $d.die_if($key != "schema_version" and $key != "nodes",
+    "invalid " .. $CONF_PATH .. ": unexpected maild_filter_deploy key " .. $key)
+end
+$d.die_if($CONF["schema_version"] != 1 or type($CONF["nodes"]) != "list" or len($CONF["nodes"]) == 0,
+  "invalid " .. $CONF_PATH .. ": expected schema_version 1 and a non-empty nodes list")
+
+$ROSTER = $d.roster()
+$configured = []
+for each $node in $CONF["nodes"]
+  $d.die_if(type($node) != "string" or trim($node) == "",
+    "invalid " .. $CONF_PATH .. ": every node must be a non-empty string")
+  $d.assert_node($ROSTER, $node)
+  $d.die_if(is_in($configured, $node),
+    "duplicate maild filter node in " .. $CONF_PATH .. ": " .. $node)
+  push($configured, $node)
+end
+
+$rest = []
+$first = true
+for each $arg in $argv
+  if $first then
+    $first = false
+  else
+    push($rest, $arg)
+  end
+end
+$FILTER_ROSTER = {mesh: $configured, foreign: [], all: $configured, order: nil}
+$parsed = $d.parse_nodes($FILTER_ROSTER, $rest, [])
+$requested = $parsed["nodes"]
+
+-- Honour the shared fleet order. A foreign target absent from a mesh-only
+-- fallback order goes first so the inventory's broker hubs still remain last.
+$fleet_order = $d.rollout_order($ROSTER)
+$prefix = []
+for each $node in $requested
+  if not is_in($fleet_order, $node) then
+    $d.die_if(not $d.is_foreign($ROSTER, $node),
+      "maild filter target is absent from the fleet rollout order: " .. $node)
+    push($prefix, $node)
+  end
+end
+$nodes = []
+for each $node in concat($prefix, $fleet_order)
+  if is_in($requested, $node) and not is_in($nodes, $node) then
+    push($nodes, $node)
+  end
+end
+$d.die_if(len($nodes) != len($requested),
+  "maild filter target list contains a duplicate or unordered node")
+
+$FILTER = $d.hub_root() .. "/_etc/cosmix/maild/inbound-filter.mix"
+$REMOTE_FILTER_DIR = "/etc/cosmix/maild"
+$REMOTE_FILTER = $REMOTE_FILTER_DIR .. "/inbound-filter.mix"
+$REMOTE_CONFIG = $REMOTE_FILTER_DIR .. "/config.conf.mix"
+$REMOTE_CONFIG_BACKUP = $REMOTE_CONFIG .. ".bak-filter"
+$REMOTE_SMOKE = "/tmp/cosmix-maild-filter-smoke.mix"
+$d.die_if(not is_file($FILTER), "local filter missing: " .. $FILTER)
+$FILTER_SOURCE = read_file($FILTER)
+
+-- Run the exact source locally with representative injected globals before
+-- taking the mesh write lock or contacting a node.
+$PREFLIGHT_PREFIX = '
+$FROM = "sender@example.org"
+$TO = "recipient@example.org"
+$SUBJECT = "preflight"
+$HEADER_FROM = "preflight"
+$SPAM_VERDICT = "HAM"
+$SPAM_SCORE = 0
+$VTOKEN_VALID = false
+$VTOKEN_USER = ""
+$VTOKEN_SERVICE = ""
+$ATTACHMENT_COUNT = 0
+$MESSAGE_SIZE = 0
+'
+$preflight = run_argv([$d.mix_bin(), "-"], {stdin: $PREFLIGHT_PREFIX .. $FILTER_SOURCE})
+$d.die_if($preflight["exit_code"] != 0,
+  "filter PREFLIGHT failed (nothing deployed) — fix " .. $FILTER .. ": " ..
+  trim($preflight["stderr"]) .. " " .. trim($preflight["stdout"]))
+print("filter preflight: OK")
+print("rollout order: " .. join($nodes, " "))
+
+$_lock = $m.mesh_take_write_lock("deploy_maild_filter deploy")
+for each $host in $nodes
+  deploy($host)
+end
+
+print("")
+print("filter deploy complete: exact remote bytes, execution smoke, config wiring, and required restart gates verified on " .. join($nodes, " "))

@@ -95,10 +95,10 @@ end
 
 $ROOT = $d.cosmix_root()
 $BIN_SOURCE = $d.hub_root() .. "/_bin/dist/alloy"
-$CONFIG = $ROOT .. "/src/_etc/cosmix/alloy/config.alloy"
-$UNIT_MESH = $ROOT .. "/src/_etc/systemd-system/cosmix-alloy.service"
-$UNIT_FOREIGN = $ROOT .. "/src/_etc/systemd-system/cosmix-alloy-foreign.service"
-$SYSUSERS_FOREIGN = $ROOT .. "/src/_etc/sysusers/cosmix-alloy-foreign.conf"
+$CONFIG = $d.shipped("cosmix", "alloy/config.alloy")
+$UNIT_MESH = $d.shipped("unit", "cosmix-alloy.service")
+$UNIT_FOREIGN = $d.shipped("unit", "cosmix-alloy-foreign.service")
+$SYSUSERS_FOREIGN = $d.shipped("sysusers", "cosmix-alloy-foreign.conf")
 
 for each $path in [$CONFIG, $UNIT_MESH, $UNIT_FOREIGN, $SYSUSERS_FOREIGN]
   $d.die_if(not is_file($path), "required deploy artefact missing: " .. $path)

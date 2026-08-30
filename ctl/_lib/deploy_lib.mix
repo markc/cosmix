@@ -159,8 +159,9 @@ end
 fn ver_tuple($s)
   $v = ""
   for each $tok in split(trim($s), " ")
-    if $v == "" and regex_match("^[0-9]+([.][0-9]+)+$", $tok) then
-      $v = $tok
+    -- a leading v ("alloy v1.2.3") is tolerated
+    if $v == "" and regex_match("^v?[0-9]+([.][0-9]+)+$", $tok) then
+      $v = regex_replace("^v", $tok, "")
     end
   end
   if $v == "" then
@@ -293,4 +294,36 @@ fn order_subset($roster, $nodes)
     end
   end
   return $out
+end
+
+-- ── shipped templates vs hub-private overrides ──────────────────────────
+-- A unit file, sysusers/tmpfiles fragment, polkit rule or config payload is
+-- normally the PUBLIC template under $COSMIX/src/_etc. When the hub carries
+-- its own copy — a unit whose environment names a mesh address, a config with
+-- site values — that copy is site CONFIG and wins. Kinds and the two roots:
+--   unit      $CMCTL/_etc/systemd/<name>          $COSMIX/src/_etc/systemd-system/<name>
+--   sysusers  $CMCTL/_etc/sysusers/<name>         $COSMIX/src/_etc/sysusers/<name>
+--   tmpfiles  $CMCTL/_etc/tmpfiles/<name>         $COSMIX/src/_etc/tmpfiles.d/<name>
+--   polkit    $CMCTL/_etc/polkit-1/rules.d/<name> $COSMIX/src/_etc/polkit-1/rules.d/<name>
+--   cosmix    $CMCTL/_etc/cosmix/<name>           $COSMIX/src/_etc/cosmix/<name>
+-- Returns the path that exists (private first); refuses when neither does.
+fn shipped($kind, $name)
+  $priv = {unit: "/_etc/systemd/", sysusers: "/_etc/sysusers/", tmpfiles: "/_etc/tmpfiles/",
+           polkit: "/_etc/polkit-1/rules.d/", cosmix: "/_etc/cosmix/"}
+  $pub = {unit: "/src/_etc/systemd-system/", sysusers: "/src/_etc/sysusers/", tmpfiles: "/src/_etc/tmpfiles.d/",
+          polkit: "/src/_etc/polkit-1/rules.d/", cosmix: "/src/_etc/cosmix/"}
+  if $priv[$kind] == nil then
+    print("  ERROR: shipped(): unknown kind '" .. $kind .. "'")
+    exit(2)
+  end
+  $p = hub_root() .. $priv[$kind] .. $name
+  if is_file($p) then
+    return $p
+  end
+  $q = cosmix_root() .. $pub[$kind] .. $name
+  if is_file($q) then
+    return $q
+  end
+  print("  ERROR: no " .. $kind .. " template '" .. $name .. "' — looked in " .. $p .. " and " .. $q)
+  exit(2)
 end

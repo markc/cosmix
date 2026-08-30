@@ -1,0 +1,275 @@
+#!/usr/bin/env mix
+-- deploy_dcs_site.mix — publish one configured static documentation site to
+-- its configured webd nodes.
+--
+--   mix _bin/deploy_dcs_site.mix              -- every configured target
+--   mix _bin/deploy_dcs_site.mix alpha beta   -- a configured subset
+--
+-- The source directory, vhost name, and target nodes are private operational
+-- state in _etc/deploy_dcs_site.conf.mix. The existing docroot owner is
+-- preserved and the group remains cosmix-webd. No build or daemon restart is
+-- needed: webd serves the files directly. Every failed gate stops the run.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_dcs_site.conf.mix"
+
+fn conf_error($msg)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $msg)
+  exit(2)
+end
+
+if not is_file($CONF_PATH) then
+  print("  ERROR: no static-site deploy config at " .. $CONF_PATH ..
+    " — create it from deploy_dcs_site.conf.mix.example")
+  exit(2)
+end
+
+$CONF_DOC = nil
+try
+  $CONF_DOC = load_data($CONF_PATH)
+catch $msg
+  conf_error("invalid strict-data config: " .. $msg)
+end
+if type($CONF_DOC) != "map" then
+  conf_error("must contain a strict-data map")
+end
+
+$CONF = nil
+try
+  $CONF = validate($CONF_DOC["deploy_dcs_site"], {
+    schema_version: {type: "integer", enum: [1]},
+    source_dir: {type: "string", nonblank: true},
+    fqdn: {type: "string", nonblank: true},
+    target_nodes: {type: "list", min_length: 1, items: {type: "string", nonblank: true}}
+  })
+catch $msg
+  conf_error("invalid deploy_dcs_site map: " .. $msg)
+end
+
+fn is_in($list, $value)
+  for each $item in $list
+    if $item == $value then
+      return true
+    end
+  end
+  return false
+end
+
+fn assert_fqdn($fqdn)
+  if length($fqdn) > 253 then
+    conf_error("fqdn is longer than 253 characters")
+  end
+  $labels = split($fqdn, ".")
+  if length($labels) < 2 then
+    conf_error("fqdn must contain at least two labels")
+  end
+  for each $label in $labels
+    $one = regex_match("^[a-z0-9]$", $label)
+    $many = regex_match("^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$", $label)
+    if not $one and not $many then
+      conf_error("fqdn contains an invalid DNS label: '" .. $label .. "'")
+    end
+  end
+end
+
+$SRC = $CONF["source_dir"]
+$FQDN = $CONF["fqdn"]
+assert_fqdn($FQDN)
+if not starts_with($SRC, "/") then
+  conf_error("source_dir must be an absolute path")
+end
+
+for each $node in $CONF["target_nodes"]
+  $seen = 0
+  for each $candidate in $CONF["target_nodes"]
+    if $candidate == $node then
+      $seen = $seen + 1
+    end
+  end
+  if $seen > 1 then
+    conf_error("duplicate target node '" .. $node .. "'")
+  end
+end
+
+$ROSTER = $d.roster()
+$requested = args()
+if length($requested) == 0 then
+  $requested = $CONF["target_nodes"]
+end
+$selected = $d.parse_nodes($ROSTER, $requested, [])["nodes"]
+for each $node in $selected
+  if not is_in($CONF["target_nodes"], $node) then
+    conf_error("node '" .. $node .. "' is not in target_nodes")
+  end
+end
+
+-- Foreign nodes have no mesh inventory address, so use their roster name.
+-- Mesh members use the authenticated inventory and retain hubs-last order.
+$nodes = []
+for each $node in $selected
+  if $d.is_foreign($ROSTER, $node) then
+    push($nodes, $node)
+  end
+end
+for each $node in $d.rollout_order($ROSTER)
+  if is_in($selected, $node) then
+    push($nodes, $node)
+  end
+end
+$d.die_if(length($nodes) != length($selected),
+  "one or more selected mesh nodes are absent from the roster rollout order")
+
+fn remote_address($node)
+  if $d.is_foreign($ROSTER, $node) then
+    return $node
+  end
+  return $d.mesh_ip($node)
+end
+
+-- All local assets are checked before the first network operation.
+$INDEX = $SRC .. "/index.html"
+$d.die_if(not is_dir($SRC), "source directory missing: " .. $SRC)
+$d.die_if(not is_file($INDEX), "source index.html missing: " .. $INDEX)
+$index_hash = hash_file($INDEX, "sha256")
+$ARCHIVE = "/tmp/cosmix-deploy-dcs-site-" .. uuid() .. ".tar.gz"
+$pack = run_argv([
+  "tar", "-C", $SRC, "--exclude=CNAME", "--exclude=.nojekyll", "-czf", $ARCHIVE, "."
+], {timeout: 120})
+$d.die_if($pack["exit_code"] != 0, "local tar failed: " .. trim($pack["stderr"]))
+$d.die_if(hash_file($INDEX, "sha256") != $index_hash,
+  "source index.html changed while the deployment archive was being packed")
+$packed_index = run_argv(["tar", "-tzf", $ARCHIVE, "./index.html"], {timeout: 30})
+$d.die_if($packed_index["exit_code"] != 0,
+  "deployment archive does not contain ./index.html: " .. trim($packed_index["stderr"]))
+$archive_hash = hash_file($ARCHIVE, "sha256")
+
+print("source: " .. $SRC)
+print("site: " .. $FQDN)
+print("targets: " .. join($nodes, " "))
+
+$m = require("../_lib/mesh_lib.mix")
+-- Static-site writes share the deployment plane with daemon and inventory
+-- writers. Take the common lock immediately before the first remote write.
+$_lock = $m.mesh_take_write_lock("deploy_dcs_site")
+
+fn deploy_node($node)
+  $addr = remote_address($node)
+  $docroot = "/srv/" .. $FQDN .. "/web/app/public"
+  $remote_archive = "/tmp/cosmix-deploy-dcs-site-" .. uuid() .. ".tar.gz"
+  print("")
+  print("[" .. $node .. "] deploy " .. $FQDN)
+
+  -- ssh_mix itself proves that the node's system Mix exists and runs. This
+  -- read-only preflight also binds the existing docroot owner and webd group.
+  $pre = ssh_mix($addr, 'if not is_dir($docroot) then
+  raise("docroot missing: " .. $docroot)
+end
+$root = stat($docroot)
+$group_line = trim(run("getent group cosmix-webd"))
+$group_parts = split($group_line, ":")
+if length($group_parts) != 4 or $group_parts[0] != "cosmix-webd" then
+  raise("group cosmix-webd is unavailable")
+end
+$gid_text = $group_parts[2]
+if not regex_match("^[0-9]+$", $gid_text) then
+  raise("group cosmix-webd returned a non-numeric gid")
+end
+print(data_encode({reach: "reach-ok", uid: $root["uid"], gid: to_number($gid_text)}))', {
+    bindings: {docroot: $docroot}, decode: "data", timeout: 60
+  })
+  $d.die_if(not $pre["ok"],
+    $node .. " unreachable, missing system Mix/docroot, or missing webd group: " ..
+    trim($pre["stdout"]) .. " " .. trim($pre["stderr"]))
+  $d.die_if(type($pre["value"]) != "map" or $pre["value"]["reach"] != "reach-ok",
+    $node .. " returned an invalid preflight result")
+  $uid = $pre["value"]["uid"]
+  $gid = $pre["value"]["gid"]
+  print("  reachability/docroot/ownership: OK")
+
+  $scp = run_argv([
+    "scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+    $ARCHIVE, $addr .. ":" .. $remote_archive
+  ], {timeout: 120})
+  $d.die_if($scp["exit_code"] != 0,
+    "archive scp -> " .. $node .. ": " .. trim($scp["stderr"]))
+
+  -- The archive hash proves this invocation's bytes landed. The unique token
+  -- is printed only after tar succeeds; installed content, ownership and modes
+  -- are then checked from the resulting docroot.
+  $token = uuid()
+  $apply = ssh_mix($addr, 'if not is_file($archive) then
+  raise("uploaded archive is missing")
+end
+if hash_file($archive, "sha256") != $archive_hash then
+  remove($archive)
+  raise("uploaded archive hash mismatch")
+end
+remove($docroot .. "/index.html")
+remove($docroot .. "/.htaccess")
+remove($docroot .. "/CNAME")
+remove($docroot .. "/.nojekyll")
+$unpack = run("tar -C $docroot -xzf $archive && printf unpack-ok")
+remove($archive)
+if $unpack != "unpack-ok" then
+  raise("tar extraction failed")
+end
+chown($docroot, $uid, $gid)
+chmod($docroot, 0o750)
+for each $path in walk($docroot, {include_dirs: true, follow_symlinks: false})
+  $item = stat($path, {follow_symlinks: false})
+  if $item["is_dir"] then
+    chown($path, $uid, $gid)
+    chmod($path, 0o750)
+  end
+  if $item["is_file"] then
+    chown($path, $uid, $gid)
+    chmod($path, 0o640)
+  end
+end
+$root = stat($docroot)
+if $root["uid"] != $uid or $root["gid"] != $gid or $root["perm"] != 0o750 then
+  raise("docroot ownership or mode mismatch")
+end
+$index = $docroot .. "/index.html"
+if not is_file($index) or hash_file($index, "sha256") != $index_hash then
+  raise("installed index.html hash mismatch")
+end
+$index_stat = stat($index)
+if $index_stat["uid"] != $uid or $index_stat["gid"] != $gid or $index_stat["perm"] != 0o640 then
+  raise("installed index.html ownership or mode mismatch")
+end
+print(data_encode({token: $token, archive_hash: $archive_hash, index_hash: $index_hash}))', {
+    bindings: {
+      archive: $remote_archive, archive_hash: $archive_hash, docroot: $docroot,
+      gid: $gid, index_hash: $index_hash, token: $token, uid: $uid
+    },
+    decode: "data", timeout: 120
+  })
+  $d.die_if(not $apply["ok"],
+    $node .. " extract/install verification failed: " .. trim($apply["stdout"]) ..
+    " " .. trim($apply["stderr"]))
+  $d.die_if(type($apply["value"]) != "map" or $apply["value"]["token"] != $token,
+    $node .. " did not return the current invocation's deployment token")
+  $d.die_if($apply["value"]["archive_hash"] != $archive_hash or
+    $apply["value"]["index_hash"] != $index_hash,
+    $node .. " post-install content hashes do not match the local archive")
+  print("  transfer/unpack/content/ownership/modes: OK")
+
+  $listing = ssh_mix($addr, 'print(run("ls -la $docroot"))', {
+    bindings: {docroot: $docroot}, timeout: 60
+  })
+  $d.die_if(not $listing["ok"] or trim($listing["stdout"]) == "",
+    $node .. " deployed docroot listing failed: " .. trim($listing["stderr"]))
+  print(trim($listing["stdout"]))
+  print("  [" .. $node .. "] DEPLOY OK")
+end
+
+for each $node in $nodes
+  deploy_node($node)
+end
+remove($ARCHIVE)
+
+print("")
+print("deploy complete: current-invocation unpack, content hashes, ownership and modes verified on " ..
+  join($nodes, " "))

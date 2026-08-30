@@ -156,6 +156,8 @@ $DEPLOY_VERSION = "1.0.0"
 $UPLOAD_CONF = "/etc/systemd/journal-upload.conf"
 $DROPIN = "/etc/systemd/system/systemd-journal-upload.service.d/10-cosmix.conf"
 $MARKER = "/etc/cosmix/journal-upload/deploy-version"
+-- A longer watchdog prevents a busy upload from being killed mid-stream;
+-- unlimited retries let a leaf survive receiver and network outages.
 $DROPIN_CONTENT = "[Unit]\nStartLimitIntervalSec=0\n[Service]\nWatchdogSec=600\nRestart=always\nRestartSec=15s\n"
 
 fn deploy_node($node)
@@ -251,6 +253,8 @@ end
 $_stop = command(
   "/usr/bin/systemctl stop systemd-journal-upload.service",
   "journal uploader stop", 11)
+-- Starting at the current cursor avoids replaying the complete retained
+-- journal on first installation.
 $cursor_output = command(
   "/usr/bin/journalctl --show-cursor -n 0 --no-pager",
   "journal cursor lookup", 12)

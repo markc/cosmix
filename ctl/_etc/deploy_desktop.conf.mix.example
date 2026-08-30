@@ -1,0 +1,6 @@
+-- deploy_desktop.conf.mix.example — private workstation target for the desktop deploy.
+{
+  deploy_desktop: {
+    target_node: "alpha"
+  }
+}

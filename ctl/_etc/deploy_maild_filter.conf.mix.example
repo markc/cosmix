@@ -1,0 +1,8 @@
+-- Private hub configuration for deploy_maild_filter.mix.
+-- Copy this file to `_etc/deploy_maild_filter.conf.mix` in the control hub and
+-- replace the placeholders with rostered nodes that run cosmix-maild. The
+-- private filter source remains `_etc/cosmix/maild/inbound-filter.mix`.
+maild_filter_deploy: {
+  schema_version: 1,
+  nodes: ["alpha", "beta", "gamma"]
+}

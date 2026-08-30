@@ -1,0 +1,8 @@
+-- Private source, vhost, and target selection for deploy_dcs_site.mix.
+-- Copy this file to deploy_dcs_site.conf.mix in the private control hub.
+deploy_dcs_site: {
+  schema_version: 1,
+  source_dir: "/home/user/Projects/site/docs",
+  fqdn: "docs.example.org",
+  target_nodes: ["alpha", "beta", "gamma"]
+}
