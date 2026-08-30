@@ -129,7 +129,7 @@ $HUB = $d.hub_root()
 $PAYLOADS = {
   sshm: $HUB .. "/_bin/sshm.mix",
   worker: $HUB .. "/_bin/sshm_worker.mix",
-  worker_lib: $HUB .. "/_bin/sshm_worker_lib.mix"
+  worker_lib: $HUB .. "/_lib/sshm_worker_lib.mix"
 }
 $TEMPLATES = {
   sysusers: $d.shipped("sysusers", "cosmix-sshm-wake.conf"),

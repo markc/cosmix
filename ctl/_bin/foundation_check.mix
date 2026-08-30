@@ -1,0 +1,239 @@
+#!/usr/bin/env mix
+-- foundation_check.mix — Foundations conformance probe.
+--
+-- Walk the resource registry (the source of truth, not filesystem grep) and
+-- verify that every declared admin list page uses the Foundation. Tree-wide
+-- sweeps catch forbidden raw patterns. Exit 0 means conformant; exit 1 means
+-- drift, with one line per finding.
+--
+-- Usage: mix _bin/foundation_check.mix
+
+$d = require("../_lib/deploy_lib.mix")
+
+if len(args()) != 0 then
+  print("  ERROR: foundation_check takes no arguments")
+  print("         usage: mix _bin/foundation_check.mix")
+  exit(2)
+end
+
+$ROOT = $d.cosmix_root() .. "/src/crates/cosmix-webd/vhosts"
+$HD = $ROOT .. "/apps"
+$ALLMIX = concat(
+  concat(glob($ROOT .. "/lib/*.mix"), glob($ROOT .. "/widgets/*.mix")),
+  glob($ROOT .. "/apps/*.mix")
+)
+$HANDLERS = glob($HD .. "/h_*.mix")
+$reg = load_data($ROOT .. "/lib/foundation_registry.mix")
+$fail = 0
+
+fn probe_fail($handler, $msg)
+  print("FAIL " .. $handler .. ": " .. $msg)
+end
+
+-- Nil-safe stringify for exemption fields. The probe stays independent of the
+-- application helper that normally provides this operation.
+fn fm_or_probe($value)
+  if $value == nil then
+    return ""
+  end
+  return $value
+end
+
+-- Per-registry-entry resource and admin-list checks.
+for each $resource in $reg["resources"]
+  $handler = "" .. $resource["handler"]
+  $path = $HD .. "/" .. $handler
+  if not exists($path) then
+    probe_fail($handler, "registered handler file missing")
+    $fail = $fail + 1
+  else
+    $src = read_file($path)
+    if ("" .. $resource["profile"]) == "resource/1" then
+      -- This is deliberately lexical. A resolved-config probe can later prove
+      -- that resource_main receives the registered factory.
+      $spec_missing = $resource["spec"] == nil
+      $spec_uncalled = not contains($src, ("" .. $resource["spec"]) .. "(")
+      if $spec_missing or $spec_uncalled then
+        probe_fail($handler,
+          "resource/1 but registered spec factory missing/uncalled")
+        $fail = $fail + 1
+      end
+      if not contains($src, "resource_main(") then
+        probe_fail($handler, "resource/1 but no resource_main( call")
+        $fail = $fail + 1
+      end
+      if contains($src, "== \"save\"") or contains($src, "bulk_delete") then
+        probe_fail($handler,
+          "resource/1 with handwritten save/bulk dispatch (engine owns these)")
+        $fail = $fail + 1
+      end
+    end
+    if ("" .. $resource["profile"]) == "admin-list/1" then
+      if not contains($src, "dt_admin_opts(") then
+        probe_fail($handler, "admin-list/1 but no dt_admin_opts( call")
+        $fail = $fail + 1
+      end
+      -- Catch both the ordinary and spaced direct-call forms.
+      if contains($src, "= dt_opts(") or contains($src, "= dt_opts (") then
+        probe_fail($handler, "direct dt_opts( call bypasses the preset")
+        $fail = $fail + 1
+      end
+      -- SQL bulk deletes must use the atomic policy helper. JMAP and filesd
+      -- entities contain ':' and delete through their own set calls.
+      $has_bulk_delete = contains($src, "bulk_delete")
+      if contains($src, "dt_bulk_action(") and contains($src, "\"delete\"") then
+        $has_bulk_delete = true
+      end
+      if $has_bulk_delete and not contains("" .. $resource["entity"], ":") then
+        if not contains($src, "dt_bulk_try_delete(") then
+          probe_fail($handler,
+            "bulk delete path without dt_bulk_try_delete (unguarded/non-atomic)")
+          $fail = $fail + 1
+        end
+      end
+    end
+  end
+end
+
+-- The registry must cover every handler that uses a datatable widget. An
+-- omitted page must never produce a clean probe.
+$known = {}
+for each $resource in $reg["resources"]
+  $known["" .. $resource["handler"]] = true
+end
+for each $path in $HANDLERS
+  $src = read_file($path)
+  $uses_datatable = contains($src, "dt_admin_opts(")
+  if len(regex_find("dt_opts *\\(", $src)) > 0 then
+    $uses_datatable = true
+  end
+  if len(regex_find("dt_render *\\(", $src)) > 0 then
+    $uses_datatable = true
+  end
+  $base = basename($path)
+  if $uses_datatable and $known[$base] != true then
+    probe_fail($base,
+      "datatable handler NOT in the resource registry " ..
+      "(register it or add an exempt/<why> row)")
+    $fail = $fail + 1
+  end
+end
+
+-- Tree-wide browser-confirm sweep, including unregistered handlers.
+for each $path in $ALLMIX
+  if len(regex_find("onsubmit=.return confirm", read_file($path))) > 0 then
+    probe_fail($path,
+      "raw browser confirm() — use data-confirm (shell dialog gate)")
+    $fail = $fail + 1
+  end
+end
+
+-- Exemptions are data. Missing reasons, duplicates and dangling handlers are
+-- themselves failures.
+$exemptions = $reg["exemptions"]
+$exemption_set = {forms: {}, modals: {}, details: {}}
+for each $partition in ["forms", "modals", "details"]
+  $seen = {}
+  if $exemptions != nil and $exemptions[$partition] != nil then
+    for each $entry in $exemptions[$partition]
+      $exempt_handler = trim("" .. fm_or_probe($entry["handler"]))
+      $reason = trim("" .. fm_or_probe($entry["reason"]))
+      if $exempt_handler == "" or $reason == "" then
+        probe_fail("exemptions." .. $partition,
+          "entry missing handler or reason")
+        $fail = $fail + 1
+      else
+        if $seen[$exempt_handler] == true then
+          probe_fail("exemptions." .. $partition,
+            "duplicate exemption: " .. $exempt_handler)
+          $fail = $fail + 1
+        end
+        if not exists($HD .. "/" .. $exempt_handler) then
+          probe_fail("exemptions." .. $partition,
+            "exempted handler missing: " .. $exempt_handler)
+          $fail = $fail + 1
+        end
+        $seen[$exempt_handler] = true
+      end
+    end
+  end
+  $exemption_set[$partition] = $seen
+end
+
+-- Visible form controls in handlers must use fm_* widgets. Hidden inputs do
+-- not count, and a reasoned forms exemption is explicit registry data.
+for each $path in $HANDLERS
+  $base = basename($path)
+  if $exemption_set["forms"][$base] != true then
+    $hit = false
+    for each $line in split(read_file($path), "\n")
+      if not starts_with(trim($line), "--") then
+        $is_input = contains($line, "<input ")
+        $is_hidden = contains($line, "type=\"hidden\"")
+        $is_quoted_type = contains($line, "type=&quot;")
+        if $is_input and not $is_hidden and not $is_quoted_type then
+          $hit = true
+        end
+        if contains($line, "<select ") or contains($line, "<textarea ") then
+          $hit = true
+        end
+      end
+    end
+    if $hit then
+      probe_fail($base,
+        "raw form control — use fm_* (webd-forms Foundation) or add a " ..
+        "reasoned forms exemption")
+      $fail = $fail + 1
+    end
+  end
+end
+
+-- Canonical modal fragments belong only in modals.mix. Raw dialog creation is
+-- allowed only in the datatable/forms widget layer.
+for each $path in $ALLMIX
+  $base = basename($path)
+  if $base != "modals.mix" and $exemption_set["modals"][$base] != true then
+    $is_modal_widget = $base == "datatable.mix" or $base == "forms.mix"
+    for each $line in split(read_file($path), "\n")
+      if not starts_with(trim($line), "--") then
+        $is_expired_fragment = contains($line, "title: \"Session expired\"")
+        $is_not_found_fragment = contains($line, "not found\", submit: false")
+        if $is_expired_fragment or $is_not_found_fragment then
+          probe_fail($base,
+            "re-inlined canonical modal fragment — use " ..
+            "md_session_expired/md_not_found")
+          $fail = $fail + 1
+        end
+        if not $is_modal_widget then
+          $creates_dialog = contains($line, "createElement(\"dialog\")")
+          $has_dialog_tag = contains($line, "<dialog ") or contains($line, "<dialog>")
+          if $creates_dialog or $has_dialog_tag then
+            probe_fail($base, "raw <dialog> construction outside the widget layer")
+            $fail = $fail + 1
+          end
+        end
+      end
+    end
+  end
+end
+
+-- Detail-page inventory is report-only until the dv_* migration becomes a
+-- hard rule.
+for each $path in $HANDLERS
+  $src = read_file($path)
+  $base = basename($path)
+  $has_detail_markup = contains($src, "biz-kv") or contains($src, "cms-head")
+  $details_exempt = $exemption_set["details"][$base] == true
+  if $has_detail_markup and not $details_exempt and not contains($src, "dv_") then
+    print("INFO " .. $base ..
+      ": hand-built detail markup (dv_* migration candidate)")
+  end
+end
+
+if $fail == 0 then
+  print("foundation_check: OK (" .. len($reg["resources"]) ..
+    " registered resources)")
+else
+  print("foundation_check: " .. $fail .. " finding(s)")
+  exit(1)
+end

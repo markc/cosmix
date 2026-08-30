@@ -1,0 +1,56 @@
+#!/usr/bin/env mix
+-- sshm.mix — the sshm BUS WAKE citizen.
+--
+-- Runs as `mix --serve sshm.mix --name sshm` under the low-privilege
+-- cosmix-sshm-wake user. It holds no credential (not even the sshm claim
+-- secret, which belongs to the drain alone) and does no work: its only
+-- authority is writing a single trigger file, /run/cosmix-sshm/wake.
+--
+-- A `cosmix-sshm-drain.path` unit watches that file and starts the
+-- operator-owned drain oneshot in systemd's fixed job mode. This deliberately
+-- avoids a polkit `systemctl start` grant: writing a file cannot smuggle a
+-- systemd job mode such as --job-mode=flush, which would cancel unrelated
+-- queued jobs. Even a fully compromised wake UID therefore gains no authority
+-- beyond causing the drain to run once.
+--
+-- `sshm.wake` is authority-free: it takes no args and names no target. It
+-- cannot say which job to run or for whom; it only nudges the drain to claim
+-- whatever webd has already authorised and queued through the separately
+-- authenticated seam. That is what makes it a delegated-safe verb.
+
+-- Supervised serve mode has no script argv. Refuse positional arguments before
+-- initialising the handler so an accidental command-style invocation is inert.
+if len(args()) != 0 then
+  print("usage: mix --serve sshm.mix --name sshm")
+  exit(2)
+end
+
+-- The drain's .path unit watches this trigger file. Environment= may override
+-- it for staged bring-up; tmpfiles owns the production path, so a tampered
+-- value cannot widen authority because the citizen can write only files its
+-- UID already owns.
+$WAKE_FILE = env("SSHM_WAKE_FILE")
+if $WAKE_FILE == "" then
+  $WAKE_FILE = "/run/cosmix-sshm/wake"
+end
+
+on sshm.wake
+  -- Write the trigger before replying: an actual write and close produces the
+  -- IN_CLOSE_WRITE event. Replying first could acknowledge a wake that did not
+  -- fire. The body carries no data and is ignored, so a wake selects no work.
+  --
+  -- Repeated wakes during one drain coalesce into a single run. The drain's
+  -- claim-until-empty loop and lazy timer cover the final-exit race.
+  try
+    write_file($WAKE_FILE, "wake\n")
+    reply(0, {accepted: true})
+  catch $error
+    -- rc >= 10 is a BUS application error rather than the rc 1–9
+    -- warning/success band. The caller therefore sees a failed trigger write
+    -- instead of a false acknowledgement.
+    reply(10, {
+      accepted: false,
+      error: "wake trigger write failed: " .. ("" .. $error)
+    })
+  end
+end

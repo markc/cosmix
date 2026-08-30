@@ -1,0 +1,245 @@
+#!/usr/bin/env mix
+-- dnd-drive.mix — gesture driver for the filemgr drag-and-drop test rig.
+--
+-- SAFETY. dotool injects into the physical seat. Every injection is bracketed
+-- by an active-window check against kdotool; the check is repeated immediately
+-- before button release because that release can commit a drop.
+--
+-- Coordinates are normalised 0..1 fractions of the logical screen, as consumed
+-- by `dotool mouseto`. Keep the rig-specific window title and coordinates in the
+-- private control hub config, not in this public script.
+--
+-- dotoold/dotoolc are used instead of bare dotool because a drag must hold the
+-- button across motion events; recreating the virtual device loses the grab.
+--
+-- usage: mix _bin/dnd-drive.mix CASE
+
+$d = require("../_lib/deploy_lib.mix")
+
+$STEPS = 12
+$CASES = [
+  "plain", "ctrl", "shift", "dirrow", "samedir", "esc", "esc-tight",
+  "esc-near", "dlg-cancel", "dlg-copy", "dlg-move"
+]
+
+fn has_str($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn usage($message)
+  print("dnd-drive: " .. $message)
+  print("usage: mix _bin/dnd-drive.mix plain|ctrl|shift|dirrow|samedir|esc|esc-tight|esc-near|dlg-cancel|dlg-copy|dlg-move")
+  exit(2)
+end
+
+$argv = args()
+if len($argv) != 1 then
+  usage("expected exactly one case")
+end
+$case = $argv[0]
+if not has_str($CASES, $case) then
+  usage("unknown case '" .. $case .. "'")
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/dnd-drive.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no dnd-drive configuration at " .. $CONF_PATH ..
+    " — create it from dnd-drive.conf.mix.example")
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn assert_only_keys($value, $allowed, $where)
+  if type($value) != "map" then
+    config_error($where .. " must be a map")
+  end
+  for each $key in keys($value)
+    if not has_str($allowed, $key) then
+      config_error($where .. " contains unknown key '" .. $key .. "'")
+    end
+  end
+end
+
+$point_rule = {
+  type: "list",
+  min_length: 2,
+  max_length: 2,
+  items: {type: "number", min: 0, max: 1}
+}
+$point_names = [
+  "alpha_row", "beta_row", "left_empty", "right_empty", "destination_row",
+  "escape_threshold", "dialog_cancel", "dialog_copy", "dialog_move"
+]
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  assert_only_keys($loaded, ["dnd_drive"], $CONF_PATH)
+  $CONF = validate($loaded["dnd_drive"], {
+    schema_version: {type: "integer", enum: [1]},
+    window_name: {type: "string", nonblank: true},
+    points: {type: "map", schema: {
+      alpha_row: $point_rule,
+      beta_row: $point_rule,
+      left_empty: $point_rule,
+      right_empty: $point_rule,
+      destination_row: $point_rule,
+      escape_threshold: $point_rule,
+      dialog_cancel: $point_rule,
+      dialog_copy: $point_rule,
+      dialog_move: $point_rule
+    }}
+  })
+  assert_only_keys($CONF, ["schema_version", "window_name", "points"], "dnd_drive")
+  assert_only_keys($CONF["points"], $point_names, "dnd_drive.points")
+catch $error
+  config_error("" .. $error)
+end
+
+$WINDOW_NAME = $CONF["window_name"]
+$POINTS = $CONF["points"]
+
+fn filemgr_win()
+  $result = run_argv(["kdotool", "search", "--name", $WINDOW_NAME])
+  if $result["exit_code"] != 0 then
+    raise("RIG_NO_WINDOW", "cannot find the configured filemgr window: " .. trim($result["stderr"]))
+  end
+  $win = trim($result["stdout"])
+  if $win == "" then
+    raise("RIG_NO_WINDOW", "no filemgr window matches '" .. $WINDOW_NAME .. "'")
+  end
+  return $win
+end
+
+fn active_win()
+  $result = run_argv(["kdotool", "getactivewindow"])
+  if $result["exit_code"] != 0 then
+    raise("RIG_FOCUS_UNKNOWN", "cannot determine the active window: " .. trim($result["stderr"]))
+  end
+  return trim($result["stdout"])
+end
+
+fn require_focus($win)
+  $active = active_win()
+  if $active != $win then
+    raise("RIG_FOCUS_LOST", "filemgr not active (active=" .. $active .. ") - refusing to inject")
+  end
+end
+
+fn dc($line)
+  -- One action per call through the long-running dotoold, except for the
+  -- deliberate back-to-back Escape/release race probe.
+  $result = run_argv(["dotoolc"], {stdin: $line .. "\n"})
+  if $result["exit_code"] != 0 then
+    raise("RIG_DOTOOL", "dotoolc failed: " .. trim($result["stderr"]))
+  end
+end
+
+fn click_at($point)
+  $win = filemgr_win()
+  require_focus($win)
+  dc("mouseto " .. $point[0] .. " " .. $point[1])
+  sleep(0.25)
+  dc("click left")
+  sleep(0.6)
+end
+
+fn drag($from, $to, $modifier, $escape)
+  $win = filemgr_win()
+  require_focus($win)
+
+  if $modifier != "" then
+    dc("keydown " .. $modifier)
+  end
+  dc("mouseto " .. $from[0] .. " " .. $from[1])
+  sleep(0.25)
+  dc("buttondown left")
+  sleep(0.15)
+
+  -- Intermediate motion is load-bearing: it crosses the drag threshold using
+  -- real movement. A single jump can be swallowed as a click.
+  for $i = 1 to $STEPS
+    $t = $i / $STEPS
+    $x = $from[0] + ($to[0] - $from[0]) * $t
+    $y = $from[1] + ($to[1] - $from[1]) * $t
+    dc("mouseto " .. $x .. " " .. $y)
+    sleep(0.05)
+  end
+  sleep(0.25)
+
+  if $escape then
+    dc("key esc")
+    sleep(0.4)
+  end
+
+  require_focus($win)
+  dc("buttonup left")
+  if $modifier != "" then
+    dc("keyup " .. $modifier)
+  end
+  sleep(0.8)
+end
+
+if $case == "plain" then
+  print("case plain: alpha.txt -> right pane, no modifier (expect Ask confirm)")
+  drag($POINTS["alpha_row"], $POINTS["right_empty"], "", false)
+elif $case == "ctrl" then
+  print("case ctrl: alpha.txt -> right pane, Ctrl (expect copy)")
+  drag($POINTS["alpha_row"], $POINTS["right_empty"], "leftctrl", false)
+elif $case == "shift" then
+  print("case shift: beta.txt -> right pane, Shift (expect move)")
+  drag($POINTS["beta_row"], $POINTS["right_empty"], "leftshift", false)
+elif $case == "dirrow" then
+  print("case dirrow: alpha.txt -> destination row, Ctrl (expect copy into destination)")
+  drag($POINTS["alpha_row"], $POINTS["destination_row"], "leftctrl", false)
+elif $case == "samedir" then
+  print("case samedir: alpha.txt -> its own pane, Ctrl (expect refusal, no-op)")
+  drag($POINTS["alpha_row"], $POINTS["left_empty"], "leftctrl", false)
+elif $case == "esc" then
+  print("case esc: alpha.txt -> right pane, Esc mid-drag (expect cancel, no-op)")
+  drag($POINTS["alpha_row"], $POINTS["right_empty"], "", true)
+elif $case == "esc-tight" then
+  -- Escape and release share one dotoold write so no process spawn widens the
+  -- click-suppression race window between them.
+  $win = filemgr_win()
+  require_focus($win)
+  print("case esc-tight: threshold on source row, Esc+release back-to-back")
+  dc("mouseto " .. $POINTS["alpha_row"][0] .. " " .. $POINTS["alpha_row"][1])
+  sleep(0.25)
+  dc("buttondown left")
+  sleep(0.15)
+  for $i = 1 to $STEPS
+    $t = $i / $STEPS
+    $x = $POINTS["alpha_row"][0] + ($POINTS["escape_threshold"][0] - $POINTS["alpha_row"][0]) * $t
+    $y = $POINTS["alpha_row"][1] + ($POINTS["escape_threshold"][1] - $POINTS["alpha_row"][1]) * $t
+    dc("mouseto " .. $x .. " " .. $y)
+    sleep(0.05)
+  end
+  sleep(0.2)
+  require_focus($win)
+  dc("key esc\nbuttonup left")
+  sleep(0.8)
+elif $case == "esc-near" then
+  -- Cross the drag threshold while staying over the source row, then cancel
+  -- before release to probe retained-press click suppression.
+  print("case esc-near: cross threshold on the source row, Esc, release")
+  drag($POINTS["alpha_row"], $POINTS["escape_threshold"], "", true)
+elif $case == "dlg-cancel" then
+  print("clicking confirm dialog: Cancel")
+  click_at($POINTS["dialog_cancel"])
+elif $case == "dlg-copy" then
+  print("clicking confirm dialog: Copy")
+  click_at($POINTS["dialog_copy"])
+elif $case == "dlg-move" then
+  print("clicking confirm dialog: Move")
+  click_at($POINTS["dialog_move"])
+end

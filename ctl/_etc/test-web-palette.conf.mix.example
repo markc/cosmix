@@ -1,0 +1,10 @@
+-- test-web-palette.conf.mix.example — private named vhost coverage for the
+-- web-palette regression suite. Copy this file to test-web-palette.conf.mix
+-- in the private control hub and replace the placeholders with two vhost names
+-- configured by the adjacent check-web-palette.mix.
+{
+  test_web_palette: {
+    schema_version: 1,
+    named_vhosts: ["alpha", "beta"]
+  }
+}

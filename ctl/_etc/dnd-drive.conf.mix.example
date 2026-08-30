@@ -1,0 +1,21 @@
+-- dnd-drive.conf.mix.example — private local drag-and-drop rig geometry.
+-- Copy this file to dnd-drive.conf.mix in the private control hub, then replace
+-- every example value with coordinates derived from that workstation's live
+-- window geometry. Coordinates are normalised logical-screen fractions 0..1.
+{
+  dnd_drive: {
+    schema_version: 1,
+    window_name: "Example File Manager",
+    points: {
+      alpha_row: [0.20, 0.25],
+      beta_row: [0.20, 0.30],
+      left_empty: [0.30, 0.55],
+      right_empty: [0.70, 0.55],
+      destination_row: [0.55, 0.20],
+      escape_threshold: [0.24, 0.25],
+      dialog_cancel: [0.55, 0.60],
+      dialog_copy: [0.62, 0.60],
+      dialog_move: [0.69, 0.60]
+    }
+  }
+}

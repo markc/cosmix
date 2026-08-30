@@ -1,0 +1,20 @@
+-- zcode.conf.mix.example — private local ZCode launcher paths and provider.
+-- Copy this file to zcode.conf.mix in the private control hub and replace the
+-- placeholders with paths from that workstation's ZCode installation.
+{
+  zcode: {
+    schema_version: 1,
+    zcode_bin: "/home/user/opt/ZCode/zcode",
+    zcode_cli_js: "/home/user/opt/ZCode/resources/glm/zcode.cjs",
+    cli_config_path: "/home/user/.zcode/cli/config.json",
+    default_provider: "example-provider",
+
+    -- Every directory where the bundle may resolve node_modules/@zcode/tui.
+    tui_search_roots: [
+      "/home/user/opt/ZCode/resources/glm",
+      "/home/user/opt/ZCode/resources",
+      "/home/user/opt/ZCode",
+      "/home/user/opt"
+    ]
+  }
+}

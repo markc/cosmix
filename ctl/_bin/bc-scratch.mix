@@ -1,0 +1,90 @@
+#!/usr/bin/env mix
+-- bc-scratch.mix — create scratch worktrees for build-cache measurements.
+--
+--   mix _bin/bc-scratch.mix make
+--   mix _bin/bc-scratch.mix clean
+--
+-- Each arm is a detached worktree of the same located CosMix checkout. Using
+-- distinct paths lets bc-measure.mix distinguish reusable compiler-cache
+-- entries from entries whose identity still depends on the source path.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$argv = args()
+if len($argv) != 1 or not contains(["make", "clean"], $argv[0]) then
+  print("usage: bc-scratch.mix make|clean")
+  exit(2)
+end
+$MODE = $argv[0]
+
+$CONF_PATH = $d.hub_root() .. "/_etc/bc-scratch.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no build-cache scratch config at " .. $CONF_PATH ..
+    " — create it from bc-scratch.conf.mix.example")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["bc_scratch"], {
+    schema_version: {type: "integer", enum: [1]},
+    scratch_root: {type: "string", nonblank: true}
+  })
+catch $e
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn validate_absolute($key, $path)
+  if (not starts_with($path, "/") or $path == "/" or ends_with($path, "/") or
+      contains($path, "//") or contains($path, "\n") or contains($path, "\r")) then
+    config_error($key .. " must be a normalised, one-line, absolute non-root path")
+  end
+  for each $part in split($path, "/")
+    if $part == "." or $part == ".." then
+      config_error($key .. " must not contain . or .. components")
+    end
+  end
+end
+
+$ROOT = $CONF["scratch_root"]
+validate_absolute("bc_scratch.scratch_root", $ROOT)
+
+$SOURCE = $d.cosmix_root()
+$ARMS = ["A", "B", "C", "D"]
+
+fn git($argv)
+  $result = run_argv(concat(["git"], $argv), {timeout: 300, stderr: "stdout"})
+  if $result["exit_code"] != 0 then
+    print("  git " .. join($argv, " ") .. " -> rc=" ..
+      to_string($result["exit_code"]))
+    print("  " .. trim($result["stdout"]))
+  end
+  return $result["exit_code"]
+end
+
+if $MODE == "clean" then
+  for each $arm in $ARMS
+    git(["-C", $SOURCE, "worktree", "remove", "--force",
+      $ROOT .. "/" .. $arm .. "/cosmix"])
+  end
+  print("cleaned (any 'not a working tree' above means the arm was already gone)")
+  exit(0)
+end
+
+for each $arm in $ARMS
+  $dest = $ROOT .. "/" .. $arm .. "/cosmix"
+  $rc = git(["-C", $SOURCE, "worktree", "add", "--detach", $dest])
+  if $rc != 0 then
+    print("FAILED to create " .. $dest)
+    exit(1)
+  end
+  print("arm " .. $arm .. ": CosMix worktree ready")
+end
+print("scratch roots ready under " .. $ROOT)

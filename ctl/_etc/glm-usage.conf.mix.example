@@ -1,0 +1,32 @@
+-- glm-usage.conf.mix.example — private GLM plan and credential sources.
+-- Copy this file to glm-usage.conf.mix in the private control hub and replace
+-- the placeholders. Keep a real api_key only in that private copy.
+glm_usage: {
+  schema_version: 1,
+
+  -- The environment pair is checked first. Both values must exist to win.
+  api_key_env: "GLM_PLAN_API_KEY",
+  base_url_env: "GLM_PLAN_BASE_URL",
+
+  -- Optional direct private credential. Leave both empty to use the environment
+  -- or the configured local client file; otherwise set both.
+  api_key: "",
+  base_url: "",
+
+  -- Local client configuration and its ordered provider IDs.
+  zcode_config_path: "/home/user/.zcode/v2/config.json",
+  provider_ids: [
+    "builtin:example-coding-plan"
+  ],
+
+  -- Exact HTTPS hosts accepted after the credential base URL is parsed.
+  monitor_hosts: [
+    "api.vendor.example.org"
+  ],
+
+  -- Upstream reset-unit codes whose meanings are known for this plan.
+  reset_units: {
+    "3": "hour",
+    "6": "week"
+  }
+}

@@ -1,0 +1,13 @@
+-- ctx-vs-grep.conf.mix.example — private local benchmark corpus paths.
+-- Copy this file to ctx-vs-grep.conf.mix in the private control hub and
+-- replace the placeholders with the directories to search.
+ctx_vs_grep: {
+  schema_version: 1,
+  corpus_dirs: [
+    "/home/user/.ctl/_doc",
+    "/home/user/.ctl/_journal",
+    "/home/user/.ctl/_spec",
+    "/home/user/.ctl/_decisions",
+    "/home/user/.ctl/_plan"
+  ]
+}

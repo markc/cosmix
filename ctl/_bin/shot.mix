@@ -1,0 +1,128 @@
+#!/usr/bin/env mix
+-- shot.mix — render a URL to a PNG with a local headless browser.
+--
+--   mix _bin/shot.mix <url> [out.png]
+--   mix _bin/shot.mix example.org
+--   mix _bin/shot.mix https://example.org --ff
+--   mix _bin/shot.mix <url> --size 1280x800
+--   mix _bin/shot.mix <url> --mobile
+--
+-- Chrome is the fast default. --ff selects Firefox for a second-engine
+-- cross-check. The render is anonymous; authenticated pages need a separately
+-- managed browser session.
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn usage_error($message)
+  if $message != "" then
+    print("  ERROR: " .. $message)
+  end
+  print("usage: mix _bin/shot.mix <url> [out.png] [--ff] [--size WxH] [--mobile]")
+  exit(2)
+end
+
+$argv = args()
+if len($argv) == 0 then
+  usage_error("")
+end
+
+$url = ""
+$out = "/tmp/shot.png"
+$engine = "chrome"
+$width = "1600"
+$height = "1000"
+$i = 0
+while $i < len($argv)
+  $token = $argv[$i]
+  if $token == "--ff" then
+    $engine = "firefox"
+  else
+    if $token == "--mobile" then
+      $width = "390"
+      $height = "844"
+    else
+      if $token == "--size" then
+        $i = $i + 1
+        if $i >= len($argv) then
+          usage_error("--size needs WxH")
+        end
+        $parts = split($argv[$i], "x")
+        if (len($parts) != 2 or not regex_match("^[0-9]+$", $parts[0]) or
+            not regex_match("^[0-9]+$", $parts[1])) then
+          usage_error("invalid --size '" .. $argv[$i] .. "' (expected WxH)")
+        end
+        $width = $parts[0]
+        $height = $parts[1]
+      else
+        if ends_with($token, ".png") then
+          $out = $token
+        else
+          if starts_with($token, "http://") or starts_with($token, "https://") then
+            $url = $token
+          else
+            if $url == "" then
+              $url = "https://" .. $token
+            else
+              usage_error("unexpected argument '" .. $token .. "'")
+            end
+          end
+        end
+      end
+    end
+  end
+  $i = $i + 1
+end
+
+if $url == "" then
+  usage_error("no URL supplied")
+end
+
+$browser = which("google-chrome-stable")
+if $engine == "firefox" then
+  $browser = which("firefox")
+end
+$d.die_if($browser == nil or $browser == "",
+  "browser not found on PATH for engine " .. $engine)
+
+remove($out)
+$size = $width .. "," .. $height
+if $engine == "chrome" then
+  $result = run_argv([
+    $browser,
+    "--headless=new",
+    "--disable-gpu",
+    "--hide-scrollbars",
+    "--no-sandbox",
+    "--ignore-certificate-errors",
+    "--user-data-dir=/tmp/shot-chrome",
+    "--virtual-time-budget=8000",
+    "--window-size=" .. $size,
+    "--screenshot=" .. $out,
+    $url
+  ], {timeout: 30})
+else
+  -- A dedicated profile and new instance prevent collision with an existing
+  -- interactive Firefox process.
+  mkdir("/tmp/shot-ff", {parents: true})
+  $result = run_argv([
+    $browser,
+    "--headless",
+    "--new-instance",
+    "--profile", "/tmp/shot-ff",
+    "--screenshot", $out,
+    "--window-size=" .. $size,
+    $url
+  ], {timeout: 30})
+end
+
+$bytes = 0
+if is_file($out) then
+  $bytes = bytes_len(read_file_bytes($out))
+end
+if $result["exit_code"] != 0 or $bytes == 0 then
+  print("FAILED to render " .. $url .. " [" .. $engine .. "]: " .. trim($result["stderr"]))
+  exit(1)
+end
+
+print("rendered " .. $url .. "  [" .. $engine .. " " .. $width .. "x" .. $height ..
+  "]  ->  " .. $out .. "  (" .. $bytes .. " bytes)")

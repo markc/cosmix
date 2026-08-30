@@ -1,0 +1,623 @@
+#!/usr/bin/env mix
+-- glm-usage.mix — GLM Coding Plan quota + usage from its monitor API.
+--
+--   glm-usage.mix                 quota + recent usage, human output
+--   glm-usage.mix --json          {base, source, plan, window, limits, model, tool}
+--   glm-usage.mix --hours 72      widen the usage window (default 24, max 2160)
+--   glm-usage.mix --quota         quota only (skips the two usage calls)
+--
+-- The usage endpoints are hourly-bucketed and the series lags a couple of hours:
+-- --hours N asks for exactly N buckets ending with the current one, and the API
+-- answers with the subset it has. The report therefore names the buckets it got
+-- back, not the ones asked for — a window under ~3h comes back empty, and on an
+-- empty window `modelSummaryList` still reports the LIFETIME token figure while
+-- `totalTokensUsage` reports 0. Per-model lines are summed from the window's own
+-- `modelDataList[].tokensUsage` series for that reason. `model` and `tool` in
+-- --json are the raw upstream payloads, modelSummaryList included: read them
+-- with the same caution.
+--
+-- Credential order (first hit wins):
+--   1. the configured API-key + base-URL environment variables, when both exist
+--   2. the optional API key + base URL held directly in the private config
+--   3. the configured local client file and ordered provider IDs (the first
+--      provider that carries BOTH an apiKey and a baseURL)
+--
+-- Exit contract:
+--   0 = answered
+--   1 = the API refused, failed in transport, answered a shape this cannot
+--       vouch for (wrong envelope, missing/mistyped field, series that does not
+--       line up with its buckets), contradicted itself, or — under --json only —
+--       echoed the plan key back into the payload (the human report redacts and
+--       carries on instead). No reported figure is defaulted to a quiet zero, in
+--       either output mode: every counter is a number the API sent, or the run
+--       exits 1. Bucket counts, per-model sums and reset durations are derived —
+--       arithmetic over the validated series and counters, not sent values.
+--   2 = cannot answer: bad arguments, bad/missing private config, no credential,
+--       unreadable/unshaped local client config, or a base URL that is not https
+--       on a known host
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/glm-usage.conf.mix"
+if not is_file($CONF_PATH) then
+    print("  ERROR: no glm-usage configuration at " .. $CONF_PATH)
+    print("         copy _etc/glm-usage.conf.mix.example there and replace its placeholders")
+    exit(2)
+end
+
+fn config_error($message)
+    print("  ERROR: " .. $message)
+    exit(2)
+end
+
+fn has_value($items, $wanted)
+    for each $item in $items
+        if $item == $wanted then
+            return true
+        end
+    end
+    return false
+end
+
+fn assert_only_keys($value, $allowed, $where)
+    if type($value) != "map" then
+        config_error($where .. " must be a strict-data map")
+    end
+    for each $key in keys($value)
+        if not has_value($allowed, $key) then
+            config_error($where .. " has unexpected key `" .. $key .. "`")
+        end
+    end
+end
+
+$CONF_DOC = nil
+try
+    $CONF_DOC = load_data($CONF_PATH)
+catch $_config_failure
+    -- The file may contain the plan key, so a parser diagnostic must not echo
+    -- source text before the central secret redactor has been initialised.
+    config_error("invalid strict-data config at " .. $CONF_PATH)
+end
+assert_only_keys($CONF_DOC, ["glm_usage"], $CONF_PATH)
+$CFG = $CONF_DOC.glm_usage
+assert_only_keys($CFG, ["schema_version", "api_key_env", "base_url_env", "api_key",
+    "base_url", "zcode_config_path", "provider_ids", "monitor_hosts", "reset_units"],
+    $CONF_PATH .. " glm_usage")
+if $CFG.schema_version != 1 then
+    config_error($CONF_PATH .. " needs glm_usage.schema_version: 1")
+end
+for each $key in ["api_key_env", "base_url_env", "zcode_config_path"]
+    if type($CFG[$key]) != "string" or trim($CFG[$key]) == "" then
+        config_error($CONF_PATH .. " needs a non-empty glm_usage." .. $key)
+    end
+end
+if not starts_with($CFG.zcode_config_path, "/") then
+    config_error($CONF_PATH .. " glm_usage.zcode_config_path must be absolute")
+end
+if type($CFG.api_key) != "string" or type($CFG.base_url) != "string" then
+    config_error($CONF_PATH .. " glm_usage.api_key and base_url must be strings")
+end
+if ($CFG.api_key == "") != ($CFG.base_url == "") then
+    config_error($CONF_PATH .. " glm_usage.api_key and base_url must both be set or both be empty")
+end
+for each $key in ["provider_ids", "monitor_hosts"]
+    $items = $CFG[$key]
+    if type($items) != "list" or len($items) == 0 then
+        config_error($CONF_PATH .. " needs a non-empty glm_usage." .. $key .. " list")
+    end
+    for each $item in $items
+        if type($item) != "string" or trim($item) == "" then
+            config_error($CONF_PATH .. " glm_usage." .. $key .. " entries must be non-empty strings")
+        end
+    end
+end
+if type($CFG.reset_units) != "map" or len(keys($CFG.reset_units)) == 0 then
+    config_error($CONF_PATH .. " needs a non-empty glm_usage.reset_units map")
+end
+for each $unit in keys($CFG.reset_units)
+    if not regex_match("^[0-9]+$", $unit) or type($CFG.reset_units[$unit]) != "string" or trim($CFG.reset_units[$unit]) == "" then
+        config_error($CONF_PATH .. " glm_usage.reset_units needs numeric-string keys and non-empty string values")
+    end
+end
+
+$ZCODE_CFG = $CFG.zcode_config_path
+$PROVIDERS = $CFG.provider_ids
+
+-- The unit enum is not documented. Configured values name known units; anything
+-- else prints its raw code, and JSON always carries the raw limit records.
+$UNITS = $CFG.reset_units
+
+-- Set once the credential is known, so a gateway that reflects request headers
+-- back into a response body cannot put the plan key on the terminal. Four
+-- different jobs, because the paths differ:
+--   safe()      — a string on its way to the report (every diagnostic included:
+--                 bail() redacts centrally). Matches the raw key and its
+--                 JSON-escaped spelling, since raw response TEXT carries the
+--                 escaped form when the key contains a quote or backslash.
+--   deep_safe() — redacts decoded strings and map keys throughout a structure
+--                 BEFORE json_encode, so encoding cannot add an escape layer the
+--                 literal match then slides off. safe_json() is that, encoded.
+--   nameof()    — a free-text field in a label position; anything that is not a
+--                 string goes through safe_json() first, because concatenating a
+--                 map would stringify it as JSON with a nested key intact.
+--   has_secret() — the --json gate; walks the decoded document (keys and values,
+--                 both spellings) and refuses to print rather than redact.
+-- All of it is literal matching, not proof: a mangled, partial or re-encoded echo
+-- gets out, and figures printed as numbers are never inspected for it.
+$SECRET = ""
+$SECRET_JSON = ""
+
+fn safe($s)
+    if $SECRET == "" or type($s) != "string" then
+        return $s
+    end
+    $out = replace($s, $SECRET, "<redacted>")
+    if $SECRET_JSON != $SECRET then
+        $out = replace($out, $SECRET_JSON, "<redacted>")
+    end
+    return $out
+end
+
+-- Redact the DECODED strings, then encode: encoding first would add an escape
+-- layer to any string already carrying an escaped spelling of the key, and the
+-- literal match would slide off it. Map keys are redacted too — a reflected
+-- header can land on either side of the colon.
+fn deep_safe($v)
+    if type($v) == "map" then
+        $m = {}
+        for each $k in keys($v)
+            $m[safe($k)] = deep_safe($v[$k])
+        end
+        return $m
+    end
+    if type($v) == "list" then
+        $l = []
+        for each $e in $v
+            push($l, deep_safe($e))
+        end
+        return $l
+    end
+    return safe($v)
+end
+
+fn safe_json($v)
+    return json_encode(deep_safe($v))
+end
+
+-- A name the report prints in a label position. Concatenating a map or list would
+-- stringify it as JSON with any nested value intact, so anything that is not a
+-- plain string is encoded and redacted rather than interpolated raw.
+fn nameof($v, $dflt)
+    if $v == nil then
+        return $dflt
+    end
+    if type($v) != "string" then
+        return safe_json($v)
+    end
+    return safe($v)
+end
+
+-- Does the credential survive anywhere in this value? Walks the decoded structure
+-- rather than its encoded text, so the escaping of a single encode cannot hide it
+-- (a value the server encoded twice is still outside the guarantee).
+fn has_secret($v)
+    if $SECRET == "" then
+        return false
+    end
+    if type($v) == "map" then
+        -- Keys as well as values: a reflected header can land on either side.
+        for each $k in keys($v)
+            if has_secret($k) or has_secret($v[$k]) then
+                return true
+            end
+        end
+        return false
+    end
+    if type($v) == "list" then
+        for each $e in $v
+            if has_secret($e) then
+                return true
+            end
+        end
+        return false
+    end
+    if type($v) != "string" then
+        return false
+    end
+    if pos($SECRET, $v) > 0 then
+        return true
+    end
+    return $SECRET_JSON != $SECRET and pos($SECRET_JSON, $v) > 0
+end
+
+-- Every diagnostic goes out through here, so redact centrally: a base URL or a
+-- parse error can carry the credential just as easily as a response body can.
+fn bail($code, $msg)
+    eprint("glm-usage: " .. safe($msg))
+    exit($code)
+end
+
+fn duration($secs)
+    if $secs <= 0 then
+        return "now"
+    end
+    $d = floor($secs / 86400)
+    $h = floor(($secs % 86400) / 3600)
+    $m = floor(($secs % 3600) / 60)
+    if $d > 0 then
+        return fmt("%dd %dh", $d, $h)
+    end
+    if $h > 0 then
+        return fmt("%dh %dm", $h, $m)
+    end
+    return fmt("%dm", $m)
+end
+
+fn window($lim)
+    $u = $UNITS[fmt("%d", $lim.unit)]
+    if $u == nil then
+        return fmt("%d x unit%d", $lim.number, $lim.unit)
+    end
+    return fmt("%d %s%s", $lim.number, $u, ($lim.number == 1 ? "" : "s"))
+end
+
+fn same_buckets($a, $b)
+    if len($a) != len($b) then
+        return false
+    end
+    -- `==` on two lists is always false in Mix, so compare element by element.
+    for each $i, $v in $a
+        if $v != $b[$i] then
+            return false
+        end
+    end
+    return true
+end
+
+fn bar($pct)
+    $filled = floor($pct / 10)
+    if $filled > 10 then
+        $filled = 10
+    end
+    if $filled < 0 then
+        $filled = 0
+    end
+    return repeat("#", $filled) .. repeat(".", 10 - $filled)
+end
+
+-- Credential + API base -------------------------------------------------------
+
+fn credential()
+    $tok = env($CFG.api_key_env)
+    $url = env($CFG.base_url_env)
+    if $tok != nil and $tok != "" and $url != nil and $url != "" then
+        return {key: $tok, base: $url, from: "env"}
+    end
+
+    if $CFG.api_key != "" then
+        return {key: $CFG.api_key, base: $CFG.base_url, from: "private config"}
+    end
+
+    if not is_file($ZCODE_CFG) then
+        bail(2, "no configured credential environment pair, no direct private credential, and no " .. $ZCODE_CFG)
+    end
+
+    $cfg = nil
+    try
+        $cfg = read_json($ZCODE_CFG)
+    catch $m
+        bail(2, $ZCODE_CFG .. " is unreadable or not JSON: " .. $m)
+    end
+    if type($cfg) != "map" or type($cfg.provider) != "map" then
+        bail(2, $ZCODE_CFG .. " has no `provider` map — local client config shape changed")
+    end
+
+    for each $name in $PROVIDERS
+        $p = $cfg.provider[$name]
+        if type($p) == "map" and type($p.options) == "map" then
+            $k = $p.options.apiKey
+            $b = $p.options.baseURL
+            if type($k) == "string" and $k != "" and type($b) == "string" and $b != "" then
+                return {key: $k, base: $b, from: $name}
+            end
+        end
+    end
+    bail(2, "no provider in " .. $ZCODE_CFG .. " carries an apiKey (looked at: " .. join($PROVIDERS, ", ") .. ")")
+end
+
+-- The monitor API lives on the provider host, not under its /api/anthropic path.
+fn monitor_base($url)
+    $u = nil
+    try
+        $u = url_parse($url)
+    catch $m
+        bail(2, "cannot parse base URL '" .. $url .. "': " .. $m)
+    end
+    $host = $u.host ?? ""
+    if not has_value($CFG.monitor_hosts, $host) then
+        bail(2, "unrecognised base URL host '" .. $host .. "' — not present in the private monitor_hosts allowlist")
+    end
+    -- The plan key travels in the Authorization header on every call, so refuse
+    -- any scheme that would put it on the wire in clear (a base URL of
+    -- an http URL on an allowed host otherwise passes the host check above).
+    if ($u.scheme ?? "https") != "https" then
+        bail(2, "base URL scheme is '" .. ($u.scheme ?? "") .. "' — refusing to send the plan key over anything but https")
+    end
+    return "https://" .. $host
+end
+
+fn get($base, $path, $needs, $hdr)
+    $r = http_get($base .. "/api/monitor/usage/" .. $path, $hdr)
+    if $r.status != 200 then
+        $why = safe($r.error) ?? safe(substr($r.body ?? "", 0, 300))
+        bail(1, fmt("GET /api/monitor/usage/%s -> %d %s", $path, $r.status, $why))
+    end
+    $j = nil
+    try
+        $j = json_parse($r.body)
+    catch $m
+        bail(1, "GET " .. $path .. " returned a non-JSON body: " .. safe($m))
+    end
+    -- The monitor API answers HTTP 200 for auth and argument failures alike and
+    -- carries the real status in the envelope: a bad token is
+    -- {"code":401,"msg":"token expired or incorrect","success":false} with a 200.
+    -- Trusting the HTTP status alone prints an all-zeros report and exits 0
+    -- All three endpoints must carry success:true + code:200, so demand both
+    -- rather than only rejecting an explicit failure.
+    if type($j) != "map" then
+        bail(1, $path .. " answered 200 with a non-map body: " .. safe(substr($r.body, 0, 200)))
+    end
+    if $j.success != true or $j.code != 200 then
+        bail(1, fmt("%s -> API code %s: %s", $path,
+            safe_json($j.code), safe_json($j.msg)))
+    end
+    if type($j.data) != "map" then
+        bail(1, $path .. " answered 200 with no `data` map: " .. safe(substr($r.body, 0, 200)))
+    end
+    -- A shape the report would render as a plausible all-zeros answer is an
+    -- error, not a quiet zero: say so rather than exit 0 on it.
+    for each $k in $needs
+        if $j.data[$k] == nil then
+            bail(1, fmt("%s answered 200 but its data has no `%s` — API shape changed", $path, $k))
+        end
+    end
+    return $j.data
+end
+
+-- Every counter the usage report prints must exist and be a number on arrival:
+-- an absent one defaulted to 0 is indistinguishable, on the page, from a genuine
+-- idle hour.
+fn series_shape($d, $what, $counters)
+    if type($d.x_time) != "list" then
+        bail(1, $what .. " has no `x_time` list — API shape changed")
+    end
+    -- Bucket labels are load-bearing: they name the window on the page and decide
+    -- whether the tool series is reported as covering different ground.
+    for each $i, $b in $d.x_time
+        if type($b) != "string" then
+            bail(1, fmt("%s x_time[%d] is not a string — API shape changed", $what, $i))
+        end
+    end
+    if type($d.totalUsage) != "map" then
+        bail(1, $what .. " has no `totalUsage` map — API shape changed")
+    end
+    for each $c in $counters
+        if type($d.totalUsage[$c]) != "number" then
+            bail(1, fmt("%s totalUsage has no numeric `%s` — API shape changed", $what, $c))
+        end
+    end
+end
+
+-- Main ------------------------------------------------------------------------
+
+$o = getopt(args(), {
+    json:  {},
+    quota: {},
+    hours: {arg: true},
+    help:  {short: "h"}
+})
+if len($o.errors) > 0 then
+    bail(2, join($o.errors, "; "))
+end
+if $o.opts.help then
+    print("usage: glm-usage.mix [--json] [--quota] [--hours N]")
+    exit(0)
+end
+if len($o.rest) > 0 then
+    bail(2, "unexpected argument: " .. join($o.rest, " ") .. " (see --help)")
+end
+
+$MAX_HOURS = 2160
+$hours = 24
+if $o.opts.hours != nil then
+    $hours = to_number($o.opts.hours)
+    if $hours == nil or $hours < 1 or $hours > $MAX_HOURS or $hours != floor($hours) then
+        bail(2, fmt("--hours must be a whole number from 1 to %d, got '%s'", $MAX_HOURS, $o.opts.hours))
+    end
+end
+
+$cred = credential()
+$SECRET = $cred.key
+-- json_encode wraps in quotes; strip them to get the escaped spelling alone.
+$enc = json_encode($SECRET)
+$SECRET_JSON = substr($enc, 1, len($enc) - 2)
+$base = monitor_base($cred.base)
+$hdr = {Authorization: $cred.key, "Accept-Language": "en-US,en"}
+
+$quota = get($base, "quota/limit", ["limits"], $hdr)
+if type($quota.limits) != "list" or len($quota.limits) == 0 then
+    bail(1, "quota/limit answered 200 with no limits — nothing to report")
+end
+-- Every field the quota table renders as a number must BE a number. Defaulting
+-- an absent one to 0 would draw a confident "0 / 0  0%" row out of a shape this
+-- script does not actually understand.
+for each $i, $l in $quota.limits
+    if type($l) != "map" then
+        bail(1, fmt("quota/limit item %d is not a map — API shape changed", $i))
+    end
+    -- `number`/`unit` are the cadence the row is labelled with ("5 hours"): an
+    -- absent one defaulted to 0 would label a real quota with a made-up window.
+    for each $f in ["currentValue", "usage", "percentage", "number", "unit"]
+        if type($l[$f]) != "number" then
+            bail(1, fmt("quota/limit item %d has no numeric `%s` — API shape changed", $i, $f))
+        end
+    end
+    -- The cadence is rendered with %d, which truncates: a `number` of 5.75 would
+    -- print as a confident "5 hours". Refuse anything that is not a whole count.
+    if $l.number != floor($l.number) or $l.number < 1 or $l.unit != floor($l.unit) or $l.unit < 0 then
+        bail(1, fmt("quota/limit item %d has a fractional or negative cadence (number=%s unit=%s) — API shape changed",
+            $i, fmt("%s", $l.number), fmt("%s", $l.unit)))
+    end
+    -- nextResetTime is the one optional field: absent, the row simply carries no
+    -- "resets in" — nothing is invented. Present and non-numeric is a shape error.
+    if $l.nextResetTime != nil and type($l.nextResetTime) != "number" then
+        bail(1, fmt("quota/limit item %d has a non-numeric `nextResetTime` — API shape changed", $i))
+    end
+end
+
+$model = nil
+$tool = nil
+$sums = []
+$summed = 0
+$now = time()
+-- The usage endpoints are hourly-bucketed, so the window is expressed in whole
+-- buckets: exactly $hours of them, the last being the current (partial) hour.
+-- Anchoring the start on `now - hours` instead would ask for hours+1 buckets and
+-- silently count usage up to 59m older than the label claims.
+$last_bucket = floor($now / 3600) * 3600
+$from = date_format($last_bucket - (($hours - 1) * 3600), "%Y-%m-%d %H:00:00")
+$to = date_format($last_bucket, "%Y-%m-%d %H:59:59")
+if not $o.opts.quota then
+    $q = "?startTime=" .. url_encode($from) .. "&endTime=" .. url_encode($to)
+    $model = get($base, "model-usage" .. $q, ["totalUsage", "x_time", "modelDataList"], $hdr)
+    $tool = get($base, "tool-usage" .. $q, ["totalUsage", "x_time"], $hdr)
+    series_shape($model, "model-usage", ["totalTokensUsage", "totalModelCallCount"])
+    series_shape($tool, "tool-usage", ["totalNetworkSearchCount", "totalWebReadMcpCount",
+        "totalZreadMcpCount", "totalSearchMcpCount"])
+    if type($model.modelDataList) != "list" then
+        bail(1, "model-usage `modelDataList` is not a list — API shape changed")
+    end
+    -- One reading per bucket, every reading a number, or the per-model line is
+    -- summing a series that does not line up with the window it is printed under.
+    -- sum_by() counts a `false` as 0 and coerces a numeric string, so a mistyped
+    -- series would otherwise total up to a plausible-looking figure.
+    for each $i, $m in $model.modelDataList
+        if type($m) != "map" or type($m.tokensUsage) != "list" then
+            bail(1, fmt("model-usage modelDataList[%d] has no `tokensUsage` list — API shape changed", $i))
+        end
+        if len($m.tokensUsage) != len($model.x_time) then
+            bail(1, fmt("model-usage modelDataList[%d] has %d readings for %d buckets — API shape changed",
+                $i, len($m.tokensUsage), len($model.x_time)))
+        end
+        for each $b, $v in $m.tokensUsage
+            if type($v) != "number" then
+                bail(1, fmt("model-usage modelDataList[%d].tokensUsage[%d] is not a number — API shape changed", $i, $b))
+            end
+        end
+        push($sums, sum_by($m.tokensUsage, fn($v) return $v end))
+        $summed = $summed + $sums[$i]
+    end
+    -- The per-model series and the API's own total must agree, in every output
+    -- mode and on an empty window too (an empty series sums to 0, so a non-zero
+    -- total is still a contradiction). If they disagree one of the two numbers is
+    -- wrong, and there is no honest report to print from either of them.
+    if $summed != $model.totalUsage.totalTokensUsage then
+        bail(1, fmt("model-usage per-model series sums to %s but totalTokensUsage says %s — the API contradicted itself",
+            format_number($summed), format_number($model.totalUsage.totalTokensUsage)))
+    end
+end
+
+if $o.opts.json then
+    -- --json is the one path that prints upstream payloads verbatim, so it cannot
+    -- redact field by field. Walk the decoded document instead and refuse rather
+    -- than hand the plan key to whatever is consuming this. Walking the values
+    -- rather than the encoded text is what makes the answer escaping-proof.
+    $doc = {
+        base: $base,
+        source: $cred.from,
+        plan: $quota.level,
+        window: {hours: $hours, from: $from, to: $to},
+        limits: $quota.limits,
+        model: $model,
+        tool: $tool
+    }
+    if has_secret($doc) then
+        bail(1, "the API echoed the plan key back inside a payload — refusing to print it")
+    end
+    print(json_encode($doc, true))
+    exit(0)
+end
+
+print("GLM Coding Plan — " .. $base .. "  (plan: " .. nameof($quota.level, "?") .. ", via " .. $cred.from .. ")")
+print("")
+print("Quota")
+for each $l in $quota.limits
+    $reset = ""
+    if $l.nextResetTime != nil then
+        $reset = "resets in " .. duration(floor($l.nextResetTime / 1000) - $now)
+    end
+    -- %s, not %d: a fractional percentage prints as 12.75, not a truncated 12.
+    print(fmt("  %-14s %-8s %12s / %-12s %3s%%  %s  %s",
+        nameof($l.type, "?"),
+        window($l),
+        format_number($l.currentValue),
+        format_number($l.usage),
+        fmt("%s", $l.percentage),
+        bar($l.percentage),
+        $reset))
+end
+
+if $model != nil then
+    print("")
+    -- Report the buckets the API actually returned, not the ones asked for: its
+    -- hourly series lags roughly two hours, so a request for 20:00 comes back
+    -- ending at 18:00, and a window under ~3h comes back empty. Printing the
+    -- requested range over an API-chosen one reads as "you used nothing".
+    $buckets = $model.x_time
+    $n = len($buckets)
+    if $n == 0 then
+        print(fmt("Usage — no %s buckets returned for %s .. %s", nameof($model.granularity, "?"), $from, $to))
+        print("  (the series lags a couple of hours; widen --hours)")
+    else
+        print(fmt("Usage — %d %s %s, %s .. %s (asked for %dh)",
+            $n, nameof($model.granularity, "?"), ($n == 1 ? "bucket" : "buckets"),
+            safe($buckets[0]), safe($buckets[$n - 1]), $hours))
+    end
+    $tot = $model.totalUsage
+    -- Per model, print the window's own series (summed and cross-checked against
+    -- totalTokensUsage above). `modelSummaryList[].totalTokens` is NOT
+    -- window-scoped — on an empty window it still reports the full lifetime
+    -- figure while totalTokensUsage reads 0.
+    if $n > 0 then
+        for each $mi, $m in $model.modelDataList
+            print(fmt("  %-14s %14s tokens", nameof($m.modelName, "?"), format_number($sums[$mi])))
+        end
+        print(fmt("  %-14s %14s tokens in %s calls", "total",
+            format_number($tot.totalTokensUsage), format_number($tot.totalModelCallCount)))
+    end
+
+    $tt = $tool.totalUsage
+    $tools = ($tt.totalNetworkSearchCount + $tt.totalWebReadMcpCount
+        + $tt.totalZreadMcpCount + $tt.totalSearchMcpCount)
+    -- The two endpoints are queried over the same range but answer with their own
+    -- series, so say which buckets the tool counts actually cover when they are
+    -- not the model line's.
+    $tn = len($tool.x_time)
+    $span = ""
+    if $tn == 0 then
+        $span = " (no buckets)"
+    elif not same_buckets($tool.x_time, $buckets) then
+        $span = fmt(" (%d %s, %s .. %s)", $tn, ($tn == 1 ? "bucket" : "buckets"),
+            safe($tool.x_time[0]), safe($tool.x_time[$tn - 1]))
+    end
+    if $tools == 0 then
+        print(fmt("  %-14s %14s%s", "tools", "none", $span))
+    else
+        print(fmt("  %-14s search %s · webread %s · zread %s · mcp %s%s", "tools",
+            format_number($tt.totalNetworkSearchCount),
+            format_number($tt.totalWebReadMcpCount),
+            format_number($tt.totalZreadMcpCount),
+            format_number($tt.totalSearchMcpCount),
+            $span))
+    end
+end

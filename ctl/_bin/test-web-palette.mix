@@ -1,0 +1,656 @@
+#!/usr/bin/env mix
+-- test-web-palette.mix — falsify check-web-palette.mix before trusting green.
+--
+-- Every mutation is made in /tmp. Helpers return verdicts; only top-level code
+-- tallies them because Mix functions cannot write an enclosing variable.
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn config_error($message)
+    print("  ERROR: " .. $message)
+    exit(2)
+end
+
+fn has_str($items, $wanted)
+    for each $item in $items
+        if $item == $wanted then return true end
+    end
+    return false
+end
+
+fn assert_only_keys($value, $allowed, $where)
+    if type($value) != "map" then
+        config_error($where .. " must be a map")
+    end
+    for each $key in keys($value)
+        if not has_str($allowed, $key) then
+            config_error($where .. " contains unknown key '" .. $key .. "'")
+        end
+    end
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/test-web-palette.conf.mix"
+if not is_file($CONF_PATH) then
+    print("  ERROR: no test-web-palette configuration at " .. $CONF_PATH)
+    print("         copy _etc/test-web-palette.conf.mix.example there and set the private vhost names")
+    exit(2)
+end
+
+$CONF = nil
+try
+    $loaded = load_data($CONF_PATH)
+    assert_only_keys($loaded, ["test_web_palette"], $CONF_PATH)
+    $CONF = validate($loaded["test_web_palette"], {
+        schema_version: {type: "integer", enum: [1]},
+        named_vhosts: {
+            type: "list", min_length: 2, max_length: 2,
+            items: {type: "string", nonblank: true}
+        }
+    })
+    assert_only_keys($CONF, ["schema_version", "named_vhosts"], "test_web_palette")
+catch $config_load_error
+    config_error("invalid strict-data config " .. $CONF_PATH .. ": " .. $config_load_error)
+end
+
+if $CONF["named_vhosts"][0] == $CONF["named_vhosts"][1] then
+    config_error($CONF_PATH .. " named_vhosts must contain two distinct names")
+end
+for each $vhost in $CONF["named_vhosts"]
+    if not regex_match("^[A-Za-z0-9][A-Za-z0-9._-]*$", $vhost) then
+        config_error($CONF_PATH .. " contains an unsafe vhost name '" .. $vhost .. "'")
+    end
+end
+
+-- Resolve the gate BESIDE THIS FILE, never by canonical path: a hardcoded path
+-- makes a copied-and-crippled pair test the pristine original and read green.
+$GATE = dirname(realpath($0)) .. "/check-web-palette.mix"
+$ROOT = $d.cosmix_root()
+$SRC = $ROOT .. "/src/crates/cosmix-webd/vhosts/assets/site.css"
+$HTML = $ROOT .. "/src/crates/cosmix-webd/vhosts/lib/shell.html"
+$ORACLE = $ROOT .. "/src/desktop/ctk/src/theme.rs"
+$MIX = $d.mix_bin()
+$TAG = "" .. pid()
+$TMP = "/tmp/test-web-palette-" .. $TAG .. ".css"
+$HTMP = "/tmp/test-web-palette-" .. $TAG .. ".html"
+$OTMP = "/tmp/test-web-palette-" .. $TAG .. ".rs"
+
+$EXPECTED_ROLES = ["bg1", "bg2", "bg3", "fg", "fg_muted", "accent", "accent_hover"]
+$EXPECTED_WEB_OK_CALLS = 84
+$EXPECTED_STATUS_OK_CALLS = 6
+$EXPECTED_ORACLE_ANCHORS = 135
+$EXPECTED_PINNED_ANCHORS = 126
+$EXPECTED_ANCHORS = 261
+$EXPECTED_INVARIANTS = 28
+$EXPECTED_CONSUMERS = 4
+$EXPECTED_BLOCKS = 14
+$EXPECTED_SERVICE_CARDS = 36
+$EXPECTED_SWATCHES = 6
+$EXPECTED_CASES = 58
+
+function run_gate($path, $json)
+    $argv = [$MIX, $GATE, "--file", $path, "--oracle", $OTMP]
+    if $json then push($argv, "--json") end
+    $run_result = run_argv($argv)
+    return {
+        code: $run_result["exit_code"],
+        out: $run_result["stdout"] .. $run_result["stderr"]
+    }
+end
+
+function run_named($name)
+    $run_result = run_argv([$MIX, $GATE, $name])
+    return {
+        code: $run_result["exit_code"],
+        out: $run_result["stdout"] .. $run_result["stderr"]
+    }
+end
+
+function expect_exit($label, $path, $code, $wants)
+    $probe_result = run_gate($path, false)
+    if $probe_result.code != $code then
+        print("  FAIL  " .. $label .. " — exit " .. ("" .. $probe_result.code) .. ", expected " .. ("" .. $code))
+        print("        " .. sanitize($probe_result.out))
+        return false
+    end
+    $missing = []
+    for each $wanted_text in $wants
+        if not contains($probe_result.out, $wanted_text) then
+            push($missing, $wanted_text)
+        end
+    end
+    if length($missing) > 0 then
+        print("  FAIL  " .. $label .. " — correct exit, wrong reason; missing: " .. join($missing, " | "))
+        print("        " .. sanitize($probe_result.out))
+        return false
+    end
+    print("  ok    " .. $label)
+    return true
+end
+
+function expect_clean($label, $path)
+    return expect_exit($label, $path, 0, [])
+end
+
+function expect_named_clean($label, $name)
+    $probe_result = run_named($name)
+    if $probe_result.code != 0 then
+        print("  FAIL  " .. $label .. " — exit " .. ("" .. $probe_result.code) .. ", expected 0")
+        print("        " .. sanitize($probe_result.out))
+        return false
+    end
+    print("  ok    " .. $label)
+    return true
+end
+
+function occurrence_count($text, $needle)
+    if $needle == "" then return 0 end
+    return length(split($text, $needle)) - 1
+end
+
+function mutate_text($label, $source_path, $target_path, $old, $new, $expected_count)
+    $source_text = read_file($source_path)
+    $actual_count = occurrence_count($source_text, $old)
+    if $actual_count != $expected_count then
+        print("  FAIL  " .. $label .. " fixture cardinality — found " .. ("" .. $actual_count) .. ", expected " .. ("" .. $expected_count) .. ": " .. sanitize($old))
+        return false
+    end
+    write_file($target_path, replace($source_text, $old, $new))
+    return true
+end
+
+function mutate_css($label, $old, $new, $expected_count)
+    return mutate_text($label, $SRC, $TMP, $old, $new, $expected_count)
+end
+
+function mutate_html($label, $old, $new, $expected_count)
+    return mutate_text($label, $HTML, $HTMP, $old, $new, $expected_count)
+end
+
+function mutate_oracle($label, $old, $new, $expected_count)
+    return mutate_text($label, $ORACLE, $OTMP, $old, $new, $expected_count)
+end
+
+function css_case($label, $old, $new, $expected_count, $code, $wants)
+    if not mutate_css($label, $old, $new, $expected_count) then return false end
+    return expect_exit($label, $TMP, $code, $wants)
+end
+
+function html_case($label, $old, $new, $expected_count, $code, $wants)
+    if not mutate_html($label, $old, $new, $expected_count) then return false end
+    return expect_exit($label, $HTMP, $code, $wants)
+end
+
+function oracle_case($label, $old, $new, $expected_count, $wants)
+    if not mutate_oracle($label, $old, $new, $expected_count) then return false end
+    write_file($TMP, read_file($SRC))
+    return expect_exit($label, $TMP, 2, $wants)
+end
+
+function oracle_two_case($label, $old_one, $new_one, $count_one, $old_two, $new_two, $count_two, $wants)
+    $oracle_text = read_file($ORACLE)
+    $actual_one = occurrence_count($oracle_text, $old_one)
+    $actual_two = occurrence_count($oracle_text, $old_two)
+    if $actual_one != $count_one or $actual_two != $count_two then
+        print("  FAIL  " .. $label .. " oracle fixture cardinality — first " .. ("" .. $actual_one) .. "/" .. ("" .. $count_one) .. ", second " .. ("" .. $actual_two) .. "/" .. ("" .. $count_two))
+        return false
+    end
+    write_file($OTMP, replace(replace($oracle_text, $old_one, $new_one), $old_two, $new_two))
+    write_file($TMP, read_file($SRC))
+    return expect_exit($label, $TMP, 2, $wants)
+end
+
+function append_css_case($label, $addition, $code, $wants)
+    $source_text = read_file($SRC)
+    $actual_count = occurrence_count($source_text, $addition)
+    if $actual_count != 0 then
+        print("  FAIL  " .. $label .. " append cardinality — addition already appears " .. ("" .. $actual_count) .. " time(s)")
+        return false
+    end
+    write_file($TMP, $source_text .. "\n" .. $addition .. "\n")
+    return expect_exit($label, $TMP, $code, $wants)
+end
+
+function remove_css_block($selector)
+    $text = read_file($SRC)
+    $selector_count = occurrence_count($text, $selector .. " {")
+    if $selector_count != 1 then
+        print("  FAIL  fixture cardinality: block " .. $selector .. " appears " .. ("" .. $selector_count) .. " times, expected 1")
+        return false
+    end
+    $opening = pos($selector .. " {", $text)
+    if $opening == 0 then
+        print("  FAIL  fixture drift: block " .. $selector .. " not found")
+        return false
+    end
+    $tail = substr($text, $opening - 1)
+    $closing = pos("\n    }", $tail)
+    if $closing == 0 then
+        print("  FAIL  fixture drift: closing brace for " .. $selector .. " not found")
+        return false
+    end
+    write_file($TMP, substr($text, 0, $opening - 1) .. substr($tail, $closing + 5))
+    return true
+end
+
+function exact_list($got, $want)
+    if length($got) != length($want) then return false end
+    for each $list_item in $want
+        if not contains($got, $list_item) then return false end
+    end
+    return true
+end
+
+function expect_css_contract()
+    write_file($TMP, read_file($SRC))
+    $result = run_gate($TMP, true)
+    if $result.code != 0 then
+        print("  FAIL  case 0  unperturbed CSS contract — gate exit " .. ("" .. $result.code))
+        print("        " .. sanitize($result.out))
+        return false
+    end
+    $doc = nil
+    try
+        $doc = json_parse(trim($result.out))
+    catch $json_error
+        print("  FAIL  case 0  unperturbed CSS contract — JSON output did not parse")
+        return false
+    end
+    $report = $doc.reports[0]
+    if not exact_list($doc.role_fields, $EXPECTED_ROLES) then
+        print("  FAIL  case 0  role set is not pinned: " .. json_encode($doc.role_fields))
+        return false
+    end
+    if $doc.expected_web_ok_calls != $EXPECTED_WEB_OK_CALLS or $doc.expected_status_ok_calls != $EXPECTED_STATUS_OK_CALLS then
+        print("  FAIL  case 0  oracle ok() call counts are not exactly 84 + 6")
+        return false
+    end
+    if $doc.expected_site_anchors != $EXPECTED_ANCHORS or $report.compared != $EXPECTED_ANCHORS then
+        print("  FAIL  case 0  anchor count is not exactly " .. ("" .. $EXPECTED_ANCHORS))
+        return false
+    end
+    if $doc.expected_oracle_anchors != $EXPECTED_ORACLE_ANCHORS or $doc.expected_pinned_anchors != $EXPECTED_PINNED_ANCHORS then
+        print("  FAIL  case 0  oracle/pinned split is not exactly 135 + 126")
+        return false
+    end
+    if $doc.expected_onimage_invariants != $EXPECTED_INVARIANTS or $report.invariants != $EXPECTED_INVARIANTS then
+        print("  FAIL  case 0  on-image invariant count is not exactly " .. ("" .. $EXPECTED_INVARIANTS))
+        return false
+    end
+    if $doc.expected_palette_blocks != $EXPECTED_BLOCKS or $report.blocks != $EXPECTED_BLOCKS then
+        print("  FAIL  case 0  palette delivery count is not exactly " .. ("" .. $EXPECTED_BLOCKS))
+        return false
+    end
+    if $doc.expected_onimage_consumers != $EXPECTED_CONSUMERS or $report.consumers != $EXPECTED_CONSUMERS then
+        print("  FAIL  case 0  on-image consumer count is not exactly " .. ("" .. $EXPECTED_CONSUMERS))
+        return false
+    end
+    if $doc.expected_service_card_anchors != $EXPECTED_SERVICE_CARDS or $report.service_cards != $EXPECTED_SERVICE_CARDS then
+        print("  FAIL  case 0  service-card count is not exactly " .. ("" .. $EXPECTED_SERVICE_CARDS))
+        return false
+    end
+    print("  ok    case 0  unperturbed CSS pins 261 anchors, 28 invariants, 4 consumers, 36 service-card values, and 14 deliveries")
+    return true
+end
+
+function expect_html_contract()
+    write_file($HTMP, read_file($HTML))
+    $result = run_gate($HTMP, true)
+    if $result.code != 0 then
+        print("  FAIL  case 26  unperturbed swatch contract — gate exit " .. ("" .. $result.code))
+        print("        " .. sanitize($result.out))
+        return false
+    end
+    $doc = json_parse(trim($result.out))
+    if $doc.expected_swatches != $EXPECTED_SWATCHES or $doc.reports[0].compared != $EXPECTED_SWATCHES then
+        print("  FAIL  case 26  swatch count is not exactly " .. ("" .. $EXPECTED_SWATCHES))
+        return false
+    end
+    if not exact_list($doc.swatch_exception_keys, ["mono"]) then
+        print("  FAIL  case 26 mono is not the sole swatch exception: " .. json_encode($doc.swatch_exception_keys))
+        return false
+    end
+    print("  ok    case 26 unperturbed HTML pins 6 swatches")
+    return true
+end
+
+print("gate:    " .. $GATE)
+print("fixture: " .. $SRC)
+print("oracle:  " .. $ORACLE)
+print("")
+
+write_file($OTMP, read_file($ORACLE))
+$passed = 0
+$failed = 0
+
+if expect_css_contract() then $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 1  pre-fix ocean/light accent pair is rejected",
+    "        --accent:       oklch(50% 0.12 220);\n        --accent-hover: oklch(45% 0.14 220);",
+    "        --accent:       oklch(55% 0.12 220);\n        --accent-hover: oklch(60% 0.14 220);",
+    2, 1, ["value-mismatch", "ocean/light", "--accent:", "L55", "--accent-hover:", "L60"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 2  pre-fix dark --fg-muted is rejected",
+    "--fg-muted:     oklch(61% 0.04 220);", "--fg-muted:     oklch(55% 0.04 220);",
+    2, 1, ["value-mismatch", "ocean/dark", "--fg-muted:", "L55"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 3  pre-fix light --danger is rejected",
+    "--danger:       oklch(52% 0.2 25);", "--danger:       oklch(55% 0.2 25);",
+    1, 1, ["value-mismatch", "--danger:", "L55"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 4  required light --danger cannot disappear",
+    "        --danger:       oklch(52% 0.2 25);\n", "",
+    1, 1, ["missing-token", "ocean/light", "--danger absent"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 5  one-degree hue drift is rejected",
+    "--accent:       oklch(47% 0.2 25);", "--accent:       oklch(47% 0.2 26);",
+    1, 1, ["value-mismatch", "crimson/light", "H26"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 6  missing --accent-on-image is rejected",
+    "        --accent-on-image:       oklch(63% 0.23 25);\n", "",
+    2, 1, ["missing-token", "crimson/light", "--accent-on-image absent"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 7  wrong on-image accent is rejected",
+    "        --accent-on-image:       oklch(63% 0.23 25);",
+    "        --accent-on-image:       oklch(75% 0.12 220);",
+    2, 1, ["onimage-invariant", "crimson/light", "--accent-on-image:"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 8  mono on-image fg L12 to L98 is rejected",
+    "        --accent-on-image-fg:    oklch(12% 0 0);",
+    "        --accent-on-image-fg:    oklch(98% 0 0);",
+    2, 1, ["onimage-invariant", "mono", "--accent-on-image-fg:", "L98", "L12"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 9  wrong on-image glow alpha is rejected",
+    "        --accent-on-image-glow:  oklch(63% 0.23 25 / 0.4);",
+    "        --accent-on-image-glow:  oklch(63% 0.23 25 / 0.2);",
+    2, 1, ["onimage-invariant", "crimson", "--accent-on-image-glow:", "A0.2", "A0.4"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 10 opaque role rejects alpha",
+    "        --accent:       oklch(50% 0.12 220);",
+    "        --accent:       oklch(50% 0.12 220 / 0.05);",
+    2, 1, ["unparseable", "ocean/light", "--accent is not exactly"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 11 opaque role rejects a fourth component",
+    "        --accent:       oklch(50% 0.12 220);",
+    "        --accent:       oklch(50% 0.12 220 0.05);",
+    2, 1, ["unparseable", "ocean/light", "--accent is not exactly"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 12 opaque role rejects trailing junk",
+    "        --accent:       oklch(50% 0.12 220);",
+    "        --accent:       oklch(50% 0.12 220) junk;",
+    2, 1, ["unparseable", "ocean/light", "--accent is not exactly"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 13 harmless one-line rule does not swallow the next block",
+    "    .scheme-crimson:not(.dark) {",
+    "    html.probe-oneline { --content-max: 50vw; }\n    .scheme-crimson:not(.dark) {",
+    1, 0, []) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if append_css_case("case 14 later one-line accent override is compared",
+    "html.light { --accent: oklch(99% 0 0); }", 1,
+    ["value-mismatch", "html.light", "--accent:", "L99"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 15 near-name selector is not substring-classified",
+    ".scheme-crimson:not(.dark) {", ".scheme-crimsonx:not(.dark) {",
+    1, 2, ["CANNOT ANSWER", "unrecognised palette-block selector", ".scheme-crimsonx:not(.dark)"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if remove_css_block("html.dark") and expect_exit("case 16 forced html.dark delivery cannot disappear", $TMP, 1,
+    ["uncovered-context", "ocean/dark", "ocean-dark-forced"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if remove_css_block(".scheme-sunset.dark") and expect_exit("case 17 a scheme delivery cannot disappear", $TMP, 1,
+    ["uncovered-context", "sunset/dark", "sunset-dark"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if oracle_case("case 18 new Roles field fails closed",
+    "    accent_hover: Oklch,\n}", "    accent_hover: Oklch,\n    focus_ring: Oklch,\n}",
+    1, ["Roles field 'focus_ring' is neither mapped nor explicitly excluded"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if oracle_case("case 19 new Scheme variant fails closed",
+    "    Sunset,\n    Mono,\n}\n\n/// Light or dark.",
+    "    Sunset,\n    Mono,\n    Aurora,\n}\n\n/// Light or dark.",
+    1, ["Scheme enum changed or is unparseable"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if oracle_case("case 20 new Mode variant fails closed",
+    "pub enum Mode {\n    Light,\n    Dark,\n}",
+    "pub enum Mode {\n    Light,\n    Dark,\n    Auto,\n}",
+    1, ["Mode enum changed or is unparseable"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if oracle_case("case 21 unknown web_roles scheme arm fails closed",
+    "        (Ocean, Dark) => Roles {", "        (Aurora, Dark) => Roles {",
+    1, ["web_roles contains unknown scheme arm 'Aurora'"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if oracle_case("case 22 unknown web_roles mode arm fails closed",
+    "        (Ocean, Dark) => Roles {", "        (Ocean, Auto) => Roles {",
+    1, ["web_roles contains unknown mode arm 'Auto'"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if oracle_case("case 23 eleven web_roles arms fail closed",
+    "        (Mono, Light) => Roles {\n            bg1: ok(98., 0., 0.),\n            bg2: ok(96., 0., 0.),\n            bg3: ok(92., 0., 0.),\n            fg: ok(20., 0., 0.),\n            fg_muted: ok(50., 0., 0.),\n            accent: ok(25., 0., 0.),\n            accent_hover: ok(35., 0., 0.),\n        },\n",
+    "", 1, ["expected exactly 12 web_roles arms, parsed 11"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if oracle_case("case 24 one status arm fails closed",
+    "        Mode::Light => (ok(45., 0.15, 145.), ok(70., 0.15, 85.), ok(52., 0.2, 25.)),\n",
+    "", 1, ["expected exactly 2 status() arms, parsed 1"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+-- Reset the oracle after schema mutations before testing selector/media failures.
+write_file($OTMP, read_file($ORACLE))
+if append_css_case("case 25 recognised selector in wrong media fails closed",
+    "@media (prefers-color-scheme: dark) {\n    html.light { --accent: oklch(50% 0.12 220); }\n}",
+    2, ["CANNOT ANSWER", "unrecognised palette-block selector 'html.light'"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+print("")
+print("fixture: " .. $HTML)
+
+if expect_html_contract() then $passed = $passed + 1 else $failed = $failed + 1 end
+
+if html_case("case 27 stale ocean swatch is rejected",
+    "background:oklch(50% 0.12 220)", "background:oklch(55% 0.12 220)",
+    1, 1, ["swatch-mismatch", "ocean", "L55"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if html_case("case 28 pinned mono exception still rejects a change",
+    "background:oklch(50% 0 0)", "background:oklch(45% 0 0)",
+    1, 1, ["swatch-mismatch", "mono", "L45"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if html_case("case 29 swatch trailing junk is rejected",
+    "background:oklch(49% 0.12 150)", "background:oklch(49% 0.12 150) junk",
+    1, 1, ["missing-swatch", "forest", "exact opaque"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+-- Root-only coverage: a gate which silently drops the :root delivery check must
+-- fail this case even if it continues checking the duplicate html.light values.
+if css_case("case 30 root-only palette drift is rejected",
+    "        /* H=220 (cyan-blue) */\n        --bg-primary:   oklch(98% 0.008 220);",
+    "        /* H=220 (cyan-blue) */\n        --bg-primary:   oklch(97% 0.008 220);",
+    1, 1, ["value-mismatch", ":root", "--bg-primary:", "L97"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 31 required on-image substitution block cannot disappear",
+    "    .hero-bg,\n    .bg-image-section {\n        --accent:       var(--accent-on-image);\n        --accent-hover: var(--accent-on-image-hover);\n        --accent-fg:    var(--accent-on-image-fg);\n        --accent-glow:  var(--accent-on-image-glow);\n    }",
+    "", 1, 1, ["onimage-consumer-count", "expected exactly one substitution block, found 0"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 32 every comma arm is independently classified",
+    "    .scheme-crimson:not(.dark) {",
+    "    html.light,\n    .scheme-crimson:not(.dark) {",
+    1, 1, ["value-mismatch", "ocean/light", "html.light", "--accent:", "L47"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 33 watched declaration inside a comment is ignored",
+    "        /* H=220 (cyan-blue) */",
+    "        /* --accent: oklch(99% 0 0); */",
+    1, 0, []) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 34 constrained auto-dark media cannot masquerade as delivery",
+    "    @media (prefers-color-scheme: dark) {",
+    "    @media (prefers-color-scheme: dark) and (min-width: 9999px) {",
+    1, 2, ["CANNOT ANSWER", "unrecognised media context", "min-width: 9999px"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+write_file($OTMP, read_file($ORACLE))
+if append_css_case("case 35 important palette override is always a finding",
+    ":root { --accent: oklch(99% 0 0) !important; }",
+    1, ["palette-important", "--accent must not use !important", "value-mismatch", "L99"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if append_css_case("case 36 one-line nested media and selector are parsed",
+    "@media (prefers-color-scheme: dark) { html.light { --accent: oklch(99% 0 0); } }",
+    2, ["CANNOT ANSWER", "unrecognised palette-block selector 'html.light'"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if oracle_case("case 37 guarded web_roles arm fails closed",
+    "        (Ocean, Dark) => Roles {",
+    "        (Ocean, Dark) if true => Roles {",
+    1, ["web_roles contains a guarded Roles arm"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if oracle_two_case("case 38 new Roles field with constructor initialiser fails closed",
+    "    accent_hover: Oklch,\n}",
+    "    accent_hover: Oklch,\n    pub focus_ring: Oklch,\n}", 1,
+    "            accent_hover: ok(85., 0.1, 220.),",
+    "            accent_hover: ok(85., 0.1, 220.),\n            focus_ring: Oklch::new(50., 0., 0.),", 1,
+    ["Roles field 'focus_ring' is neither mapped nor explicitly excluded"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if oracle_case("case 39 redefined ok helper fails closed",
+    "const fn ok(l: f32, c: f32, h: f32) -> Oklch {\n    Oklch::new(l, c, h)\n}",
+    "const fn ok(l: f32, c: f32, h: f32) -> Oklch {\n    Oklch::new(l + 1.0, c, h)\n}",
+    1, ["ok() helper changed or is unparseable"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+write_file($OTMP, read_file($ORACLE))
+if css_case("case 40 partial service-card surface is rejected",
+    "    .service-card[data-card-scheme=\"ocean\"]   { --sw-bg: oklch(98% 0.008 220); --sw-fg: oklch(25% 0.06 220); --sw-ac: oklch(50% 0.12 220); }\n",
+    "", 1, 1, ["service-card-missing", "ocean/light", "palette row is absent", "service-card-count"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 41 wrong service-card accent is rejected",
+    "--sw-ac: oklch(49% 0.12 150);",
+    "--sw-ac: oklch(48% 0.12 150);",
+    1, 1, ["service-card-mismatch", "forest/light", "--sw-ac:", "L48", "accent L49"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 42 pinned light accent foreground is numeric",
+    "        --accent-fg:    oklch(98% 0.01 25);",
+    "        --accent-fg:    oklch(97% 0.01 25);",
+    1, 1, ["pinned-mismatch", "crimson/light", "--accent-fg:", "L97", "L98"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 43 pinned light accent glow alpha is numeric",
+    "        --accent-glow:  oklch(47% 0.2 25 / 0.3);",
+    "        --accent-glow:  oklch(47% 0.2 25 / 0.2);",
+    1, 1, ["pinned-mismatch", "crimson/light", "--accent-glow:", "A0.2", "A0.3"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if html_case("case 44 swatch background must belong to scheme-dot",
+    "<span class=\"scheme-dot\" style=\"background:oklch(50% 0.12 220)\"></span>",
+    "<span class=\"not-scheme-dot\" style=\"background:oklch(50% 0.12 220)\"></span>",
+    1, 1, ["missing-swatch", "ocean", "exactly one .scheme-dot"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if append_css_case("case 45 watched declaration in supports fails closed",
+    "@supports (color: oklch(1% 0 0)) { :root { --accent: oklch(50% 0.12 220); } }",
+    2, ["CANNOT ANSWER", "unrecognised at-rule context carrying --accent"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if append_css_case("case 46 later var indirection is not certified",
+    ":root { --accent: var(--author-accent); }",
+    1, ["unparseable", "ocean/light", "--accent is not exactly"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if append_css_case("case 47 watched declaration outside a block fails closed",
+    "--accent:oklch(50% 0.12 220);",
+    2, ["CANNOT ANSWER", "watched declaration outside any CSS block"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 48 earlier unlayered declaration outranks later layer",
+    "/*\n * DCS Site Theme - Marketing Layer",
+    ":root { --accent: oklch(99% 0 0); }\n/*\n * DCS Site Theme - Marketing Layer",
+    1, 1, ["value-mismatch", "ocean/light", "--accent:", "L99"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 49 misspelled layer at-rule fails closed",
+    "@layer site-tokens {", "@layeroops site-tokens {",
+    1, 2, ["CANNOT ANSWER", "unrecognised at-rule context carrying"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if oracle_case("case 50 local ok helper shadow fails closed",
+    "fn web_roles(scheme: Scheme, mode: Mode) -> Roles {",
+    "fn web_roles(scheme: Scheme, mode: Mode) -> Roles {\n    fn ok(l: f32, c: f32, h: f32) -> Oklch { Oklch::new(l + 1.0, c, h) }",
+    1, ["ok() is shadowed or redefined"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+write_file($OTMP, read_file($ORACLE))
+if append_css_case("case 51 unknown service-card scheme is rejected",
+    ".service-card[data-card-scheme=\"aurora\"] { --sw-bg: oklch(1% 0 0); --sw-fg: oklch(2% 0 0); --sw-ac: oklch(3% 0 0); }",
+    1, ["service-card-selector", "unknown service-card scheme 'aurora'"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if html_case("case 52 data-scheme must belong to its button",
+    "<button class=\"scheme-item\" data-scheme=\"default\">\n                                <span class=\"scheme-dot\" style=\"background:oklch(50% 0.12 220)\"></span>\n                                <span class=\"scheme-name\">Ocean</span>\n                            </button>",
+    "<div data-scheme=\"default\"><button class=\"scheme-item\">\n                                <span class=\"scheme-dot\" style=\"background:oklch(50% 0.12 220)\"></span>\n                                <span class=\"scheme-name\">Ocean</span>\n                            </button></div>",
+    1, 1, ["swatch-binding", "not bound to a button", "missing-swatch", "ocean"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if expect_named_clean("case 53 first configured vhost branch is clean", $CONF["named_vhosts"][0]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if expect_named_clean("case 54 second configured vhost branch is clean", $CONF["named_vhosts"][1]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if css_case("case 55 ad-hoc three-arm shape is inferred unambiguously",
+    "    .hero-bg,\n    .bg-image-section {",
+    "    .hero-bg,\n    .bg-image-section,\n    .hero-canvas {",
+    1, 0, []) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+if html_case("case 56 spaced data-scheme outside a button is rejected",
+    "</body>", "<div data-scheme = 'aurora'></div>\n</body>",
+    1, 1, ["swatch-binding", "not bound to a button"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+
+-- An arm set matching NO pin is the one mutation only the arm-set check catches:
+-- deleting the block trips onimage-consumer-count and a non-selector arm trips the
+-- unrecognised-context path, so without this case the arm-set check can be deleted
+-- outright and the suite still reads green (verified by crippling a copy).
+if css_case("case 57 substitution arm set matching no clone pin is rejected",
+    "    .hero-bg,\n    .bg-image-section {",
+    "    .hero-bg,\n    .bg-image-section,\n    .sheet-section {",
+    1, 1, ["onimage-arm-set", ".sheet-section", "not the pinned clone shape"]) then
+    $passed = $passed + 1 else $failed = $failed + 1 end
+
+remove($TMP)
+remove($HTMP)
+remove($OTMP)
+
+print("")
+print(("" .. $passed) .. " passed, " .. ("" .. $failed) .. " failed")
+if $failed > 0 then exit(1) end
+if $passed != $EXPECTED_CASES then
+    print("expected " .. ("" .. $EXPECTED_CASES) .. " cases; only " .. ("" .. $passed) .. " passed — skipped is not pass")
+    exit(1)
+end

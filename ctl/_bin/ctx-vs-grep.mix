@@ -1,0 +1,171 @@
+#!/usr/bin/env mix
+-- ctx-vs-grep.mix — time a simple lexical search over a configured corpus.
+--
+--   mix _bin/ctx-vs-grep.mix "<query>"        -- search one query
+--   mix _bin/ctx-vs-grep.mix --queries FILE   -- one query per input line
+--
+-- Run the semantic retriever separately with the same queries, then compare
+-- relevance and timing. This prototype deliberately uses only Mix builtins so
+-- it measures the shape of a possible native lexical-search primitive.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/ctx-vs-grep.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no context-search benchmark configuration at " .. $CONF_PATH)
+  print("         copy _etc/ctx-vs-grep.conf.mix.example there and set corpus_dirs")
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  if type($loaded) != "map" or type($loaded["ctx_vs_grep"]) != "map" then
+    config_error("must contain a ctx_vs_grep strict-data map")
+  end
+  $CONF = validate($loaded["ctx_vs_grep"], {
+    schema_version: {type: "integer", enum: [1]},
+    corpus_dirs: {
+      type: "list",
+      min_length: 1,
+      items: {type: "string", nonblank: true}
+    }
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+for each $dir in $CONF["corpus_dirs"]
+  if not starts_with($dir, "/") then
+    config_error("corpus_dirs entries must be absolute paths: " .. $dir)
+  end
+end
+
+$TOP = 8
+$argv = args()
+$queries = []
+$i = 0
+while $i < len($argv)
+  if $argv[$i] == "--queries" then
+    $i = $i + 1
+    if $i >= len($argv) then
+      print("usage: mix _bin/ctx-vs-grep.mix \"<query>\" | --queries FILE")
+      exit(2)
+    end
+    for each $line in read_lines($argv[$i])
+      if trim($line) != "" then
+        push($queries, trim($line))
+      end
+    end
+  else
+    push($queries, $argv[$i])
+  end
+  $i = $i + 1
+end
+
+if len($queries) == 0 then
+  print("usage: mix _bin/ctx-vs-grep.mix \"<query>\" | --queries FILE")
+  exit(2)
+end
+
+-- Score term frequency and strongly favour matches in the filename.
+fn score_file($path, $terms)
+  $text = lower(read_file($path))
+  $name = lower(basename($path))
+  $score = 0
+  $matched = 0
+  for each $term in $terms
+    $count = 0
+    for each $piece in split($text, $term)
+      $count = $count + 1
+    end
+    $count = $count - 1
+    if $count > 0 then
+      $matched = $matched + 1
+      $score = $score + $count
+    end
+    if contains($name, $term) then
+      $score = $score + 25
+    end
+  end
+  -- Matching every term matters more than repeating only part of the query.
+  if $matched == len($terms) then
+    $score = $score * 3
+  end
+  return [$score, $matched]
+end
+
+fn collect_files($corpus_dirs)
+  $out = []
+  for each $dir in $corpus_dirs
+    if is_dir($dir) then
+      for each $entry in ls($dir)
+        if ends_with($entry, ".md") then
+          push($out, $dir .. "/" .. $entry)
+        end
+      end
+    end
+  end
+  return $out
+end
+
+$files = collect_files($CONF["corpus_dirs"])
+
+for each $query in $queries
+  print("")
+  print("QUERY: " .. $query)
+  $started = time()
+  -- Filter stopwords, not short words: short technical acronyms are often the
+  -- most discriminating terms in a development corpus.
+  $stopwords = ["the", "was", "and", "what", "why", "for", "with", "that", "this",
+                "from", "has", "have", "are", "can", "does", "did", "how", "its",
+                "our", "out", "any", "all", "not", "but", "you", "who", "when"]
+  $terms = []
+  for each $word in split(lower($query), " ")
+    $word = trim($word)
+    if length($word) >= 2 and not contains($stopwords, $word) then
+      push($terms, $word)
+    end
+  end
+
+  $hits = []
+  for each $file in $files
+    $result = score_file($file, $terms)
+    if $result[0] > 0 then
+      push($hits, [$result[0], $result[1], $file])
+    end
+  end
+
+  -- Repeated selection keeps the ranking transparent for this small corpus.
+  $shown = 0
+  while $shown < $TOP
+    $best = -1
+    $best_index = -1
+    $j = 0
+    while $j < len($hits)
+      if $hits[$j][0] > $best then
+        $best = $hits[$j][0]
+        $best_index = $j
+      end
+      $j = $j + 1
+    end
+    if $best_index < 0 then
+      $shown = $TOP
+    else
+      $hit = $hits[$best_index]
+      print("  " .. ("" .. $hit[0]) .. "\t" .. ("" .. $hit[1]) .. "/" ..
+        ("" .. len($terms)) .. " terms\t" .. basename($hit[2]))
+      $hits[$best_index][0] = -1
+      $shown = $shown + 1
+    end
+  end
+  $milliseconds = (time() - $started) * 1000
+  print("  -- lexical: " .. ("" .. len($files)) .. " files scanned in " ..
+    ("" .. trunc($milliseconds)) .. " ms")
+end

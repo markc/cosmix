@@ -1,0 +1,6 @@
+-- bc-scratch.conf.mix.example — private build-cache measurement scratch path.
+-- Copy this file to bc-scratch.conf.mix in the private control hub.
+bc_scratch: {
+  schema_version: 1,
+  scratch_root: "/home/user/.cache/bc-baseline"
+}

@@ -1,0 +1,293 @@
+#!/usr/bin/env mix
+-- Manage one canonical CSS base and its shared browser engine files across
+-- configured webd vhost source trees. This only edits the local checkout; it
+-- never deploys files or contacts a node.
+--
+--   mix _bin/css-sync.mix diff
+--   mix _bin/css-sync.mix check <file>
+--   mix _bin/css-sync.mix forward [clone] [--force]
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn usage($message)
+  if $message != "" then
+    print("  ERROR: " .. $message)
+  end
+  print("usage: mix _bin/css-sync.mix diff")
+  print("       mix _bin/css-sync.mix check <path-to-base.css>")
+  print("       mix _bin/css-sync.mix forward [clone] [--force]")
+  exit(2)
+end
+
+$ARGS = args()
+if len($ARGS) == 0 then
+  usage("missing command")
+end
+$COMMAND = $ARGS[0]
+if $COMMAND != "diff" and $COMMAND != "check" and $COMMAND != "forward" then
+  usage("unknown command '" .. $COMMAND .. "'")
+end
+if $COMMAND == "diff" and len($ARGS) != 1 then
+  usage("diff takes no arguments")
+end
+if $COMMAND == "check" and len($ARGS) != 2 then
+  usage("check requires exactly one file")
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/css-sync.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: missing CSS asset configuration: " .. $CONF_PATH)
+  print("         copy _etc/css-sync.conf.mix.example there and replace every placeholder")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["css_sync"], {
+    schema_version: {type: "integer", enum: [1]},
+    reference_dir: {type: "string", nonblank: true},
+    clones: {type: "list", min_length: 1, items: {type: "map", schema: {
+      name: {type: "string", nonblank: true},
+      directory: {type: "string", nonblank: true}
+    }}}
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn validate_relative_dir($key, $path)
+  if (starts_with($path, "/") or starts_with($path, "\\") or
+      contains($path, "//") or contains($path, "\n") or contains($path, "\r")) then
+    config_error($key .. " must be a normalised one-line path relative to the vhosts root")
+  end
+  for each $part in split($path, "/")
+    if $part == "" or $part == "." or $part == ".." then
+      config_error($key .. " must not contain empty, . or .. components")
+    end
+  end
+end
+
+fn count_sub($value, $part)
+  return len(split($value, $part)) - 1
+end
+
+$CANON = "base.css"
+$ENGINE = ["base.js", "site.js"]
+$MASTER = "@layer reset, tokens, base, components, utilities, animations, site-tokens, site-components, site-utilities"
+$VHOSTS = $d.cosmix_root() .. "/src/crates/cosmix-webd/vhosts"
+$d.die_if(not is_dir($VHOSTS), "webd vhosts source tree missing: " .. $VHOSTS)
+$VHOSTS_REAL = realpath($VHOSTS)
+
+fn located_dir($key, $relative)
+  validate_relative_dir($key, $relative)
+  $path = $VHOSTS .. "/" .. $relative
+  if not is_dir($path) then
+    config_error($key .. " directory does not exist: " .. $path)
+  end
+  $resolved = realpath($path)
+  if not starts_with($resolved, $VHOSTS_REAL .. "/") then
+    config_error($key .. " resolves outside the webd vhosts root: " .. $path)
+  end
+  return $resolved
+end
+
+$REF = located_dir("reference_dir", $CONF["reference_dir"])
+$CLONES = []
+$seen_names = {}
+$seen_dirs = {}
+for each $clone in $CONF["clones"]
+  $name = $clone["name"]
+  if contains($name, "\n") or contains($name, "\r") then
+    config_error("clone name must be one line")
+  end
+  if has_key($seen_names, $name) then
+    config_error("duplicate clone name '" .. $name .. "'")
+  end
+  $directory = located_dir("clone '" .. $name .. "'", $clone["directory"])
+  if $directory == $REF then
+    config_error("clone '" .. $name .. "' resolves to reference_dir")
+  end
+  if has_key($seen_dirs, $directory) then
+    config_error("clone '" .. $name .. "' repeats directory " .. $directory)
+  end
+  $seen_names[$name] = true
+  $seen_dirs[$directory] = true
+  push($CLONES, {name: $name, directory: $directory})
+end
+
+fn sanity($path)
+  $source = ""
+  try
+    $source = read_file($path)
+  catch $error
+    return {ok: false, msg: "MISSING/unreadable: " .. $path}
+  end
+  $open = count_sub($source, "{")
+  $close = count_sub($source, "}")
+  $balanced = $open == $close
+  $has_master = contains($source, $MASTER)
+  $non_ascii = byte_length($source) - len($source)
+  $ok = $balanced and $has_master
+  $msg = "braces " .. $open .. "/" .. $close ..
+    ($balanced ? " ok" : " MISMATCH") .. ", master @layer " ..
+    ($has_master ? "present" : "MISSING") .. ", non-ascii-bytes " .. $non_ascii
+  return {ok: $ok, msg: $msg}
+end
+
+fn selected_clones($name)
+  if $name == "" then
+    return $CLONES
+  end
+  $selected = []
+  for each $clone in $CLONES
+    if $clone["name"] == $name then
+      push($selected, $clone)
+    end
+  end
+  if len($selected) == 0 then
+    config_error("unknown clone '" .. $name .. "' — valid: " .. join(keys($seen_names), " "))
+  end
+  return $selected
+end
+
+fn compare($left, $right, $unified)
+  $argv = $unified ? ["diff", "-u", $left, $right] : ["diff", "-q", $left, $right]
+  return run_argv($argv)
+end
+
+fn do_diff()
+  $source = $REF .. "/" .. $CANON
+  for each $clone in $CLONES
+    $destination = $clone["directory"] .. "/" .. $CANON
+    $result = compare($source, $destination, true)
+    if $result["exit_code"] == 0 then
+      print("[identical] " .. $clone["name"] .. " (" .. $CANON .. ")")
+    else if $result["exit_code"] == 1 then
+      print("[DRIFT]     " .. $clone["name"] .. " " .. count_sub($result["stdout"], "\n") ..
+        " diff lines (reference < vs clone >):")
+      print($result["stdout"])
+    else
+      print("[ERROR]     " .. $clone["name"] .. " " .. $CANON .. ": " .. trim($result["stderr"]))
+    end
+    for each $engine in $ENGINE
+      $engine_result = compare($REF .. "/" .. $engine,
+        $clone["directory"] .. "/" .. $engine, false)
+      if $engine_result["exit_code"] == 0 then
+        print("[identical] " .. $clone["name"] .. " (" .. $engine .. " engine)")
+      else if $engine_result["exit_code"] == 1 then
+        print("[DRIFT]     " .. $clone["name"] .. " " .. $engine .. " (engine) differs")
+      else
+        print("[ERROR]     " .. $clone["name"] .. " " .. $engine .. ": " .. trim($engine_result["stderr"]))
+      end
+    end
+  end
+end
+
+-- Engine drift is an unreconciled implementation, so inspect every selected
+-- engine before writing anything. The force flag is the deliberate override;
+-- base.css remains the only unconditional canonical copy.
+fn do_forward($name, $force)
+  $selected = selected_clones($name)
+  $source = $REF .. "/" .. $CANON
+  $check = sanity($source)
+  if not $check["ok"] then
+    print("REFUSE: reference " .. $CANON .. " fails sanity (" .. $check["msg"] .. ") — fix the source first")
+    exit(1)
+  end
+
+  $drifted = []
+  for each $clone in $selected
+    for each $engine in $ENGINE
+      $engine_source = $REF .. "/" .. $engine
+      $engine_destination = $clone["directory"] .. "/" .. $engine
+      $result = compare($engine_source, $engine_destination, false)
+      if $result["exit_code"] > 1 then
+        print("  ERROR: cannot compare " .. $clone["name"] .. " " .. $engine .. ": " .. trim($result["stderr"]))
+        exit(1)
+      end
+      if $result["exit_code"] == 1 then
+        push($drifted, {clone: $clone, engine: $engine})
+      end
+    end
+  end
+  if len($drifted) != 0 and not $force then
+    for each $item in $drifted
+      print("[REFUSE]    " .. $item["clone"]["name"] .. " " .. $item["engine"] ..
+        " (engine) has drifted — not overwritten")
+      print("            reconcile: diff -u " .. $REF .. "/" .. $item["engine"] .. " " ..
+        $item["clone"]["directory"] .. "/" .. $item["engine"])
+    end
+    print("            back-port improvements to the reference, or pass --force")
+    exit(1)
+  end
+
+  for each $clone in $selected
+    $destination = $clone["directory"] .. "/" .. $CANON
+    write_file($destination, read_file($source))
+    $d.die_if(read_file($destination) != read_file($source),
+      "post-copy byte mismatch: " .. $destination)
+    print("[forward]   " .. $clone["name"] .. " <- reference " .. $CANON ..
+      " (" .. sanity($destination)["msg"] .. ")")
+    for each $item in $drifted
+      if $item["clone"]["name"] == $clone["name"] then
+        $engine_source = $REF .. "/" .. $item["engine"]
+        $engine_destination = $clone["directory"] .. "/" .. $item["engine"]
+        write_file($engine_destination, read_file($engine_source))
+        $d.die_if(read_file($engine_destination) != read_file($engine_source),
+          "post-copy byte mismatch: " .. $engine_destination)
+        print("[forward]   " .. $clone["name"] .. " <- reference " .. $item["engine"] ..
+          " (engine, --force over drift)")
+      end
+    end
+    for each $engine in $ENGINE
+      $result = compare($REF .. "/" .. $engine, $clone["directory"] .. "/" .. $engine, false)
+      $d.die_if($result["exit_code"] != 0,
+        "final engine byte-identity check failed for " .. $clone["name"] .. " " .. $engine)
+      print("[identical] " .. $clone["name"] .. " (" .. $engine .. " engine)")
+    end
+  end
+end
+
+if $COMMAND == "check" then
+  $result = sanity($ARGS[1])
+  print($result["msg"])
+  if not $result["ok"] then
+    exit(1)
+  end
+  exit(0)
+end
+
+if $COMMAND == "diff" then
+  do_diff()
+  exit(0)
+end
+
+$name = ""
+$force = false
+$index = 1
+while $index < len($ARGS)
+  $token = $ARGS[$index]
+  if $token == "--force" then
+    if $force then
+      usage("duplicate --force")
+    end
+    $force = true
+  else
+    if starts_with($token, "--") then
+      usage("unknown option '" .. $token .. "'")
+    end
+    if $name != "" then
+      usage("forward accepts at most one clone")
+    end
+    $name = $token
+  end
+  $index = $index + 1
+end
+do_forward($name, $force)

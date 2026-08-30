@@ -1,0 +1,15 @@
+-- css-sync.conf.mix.example — private local webd vhost source selection.
+-- Copy to css-sync.conf.mix in the private control hub and replace the
+-- placeholder directories. All directories are relative to the public
+-- monorepo's src/crates/cosmix-webd/vhosts tree.
+{
+  css_sync: {
+    schema_version: 1,
+    reference_dir: "example.org/assets",
+    clones: [
+      {name: "alpha", directory: "alpha.example.org/assets"},
+      {name: "beta", directory: "beta.example.org/assets"},
+      {name: "gamma", directory: "gamma.example.org/assets"}
+    ]
+  }
+}

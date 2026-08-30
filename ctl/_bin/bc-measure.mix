@@ -1,0 +1,96 @@
+#!/usr/bin/env mix
+-- bc-measure.mix — measure cross-worktree sccache reuse.
+--
+--   mix _bin/bc-measure.mix <label> <worktree-1> <worktree-2>
+--
+-- Builds the same commit cold in two different paths and reports, for each,
+-- wall time plus the sccache Rust hit/miss delta across that build.
+--
+-- Two paths are essential: build 1 populates the cache and build 2 measures
+-- whether cached Rust outputs are reusable across task worktrees. Similar
+-- results point to path-dependent hashing and the need for path remapping.
+--
+-- This deliberately measures the dev profile. Incremental compilation is
+-- already disabled in release builds, while task gates use dev-profile cargo
+-- commands such as clippy and test.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$TIMEOUT = 3000
+
+fn rust_stats()
+  -- Returns [hits, misses]; -1s if the server could not be read, which is
+  -- reported rather than silently folded into a delta of zero.
+  $r = run_argv(["sccache", "--show-stats"], {timeout: 60})
+  if $r["exit_code"] != 0 then
+    return [-1, -1]
+  end
+
+  -- sccache omits per-language lines while their counters are zero. An absent
+  -- line therefore means zero; only a failed command means unknown.
+  $hits = 0
+  $misses = 0
+  for each $line in split($r["stdout"], "\n")
+    $t = trim($line)
+    if starts_with($t, "Cache hits (Rust)") then
+      $hits = to_number(trim(replace($t, "Cache hits (Rust)", "")))
+    end
+    if starts_with($t, "Cache misses (Rust)") then
+      $misses = to_number(trim(replace($t, "Cache misses (Rust)", "")))
+    end
+  end
+  return [$hits, $misses]
+end
+
+fn build_once($label, $dir)
+  $before = rust_stats()
+  $t0 = time()
+  $r = run_argv(
+    ["cargo", "build", "--workspace"],
+    {cwd: $dir .. "/src", timeout: $TIMEOUT, stderr: "stdout"}
+  )
+  $secs = round(time() - $t0, 1)
+  $after = rust_stats()
+
+  $dh = $after[0] - $before[0]
+  $dm = $after[1] - $before[1]
+  $tot = $dh + $dm
+  $rate = 0
+  if $tot > 0 then
+    $rate = round(100.0 * $dh / $tot, 2)
+  end
+
+  print($label .. " | rc=" .. $r["exit_code"] .. " | " .. $secs ..
+    "s | rust hits +" .. $dh .. " misses +" .. $dm ..
+    " | hit-rate " .. $rate .. "%")
+  if $r["exit_code"] != 0 then
+    -- A failed build's timing is meaningless; say so loudly rather than
+    -- letting a fast failure read as a fast build.
+    print("  BUILD FAILED — timing above is NOT a measurement. Tail:")
+    print("  " .. join(take(split(trim($r["stdout"]), "\n"), -12), "\n  "))
+  end
+  return $secs
+end
+
+$argv = args()
+if len($argv) < 3 then
+  print("usage: bc-measure.mix <label> <worktree-1> <worktree-2>")
+  exit(2)
+end
+
+-- Loading the shared deploy library above gives this public control script
+-- the same located-hub contract as the other ports. The measurement itself
+-- needs no roster or site configuration: both worktrees are explicit inputs.
+$_hub = $d.hub_root()
+
+$label = $argv[0]
+$w1 = $argv[1]
+$w2 = $argv[2]
+
+print("=== " .. $label .. " ===")
+$g = rust_stats()
+print("sccache rust totals at start: hits=" .. $g[0] .. " misses=" .. $g[1])
+
+build_once($label .. " build-1 (populate) " .. $w1, $w1)
+build_once($label .. " build-2 (REUSE)    " .. $w2, $w2)
+print("=== " .. $label .. " done ===")

@@ -1,0 +1,143 @@
+#!/usr/bin/env mix
+-- dnd-rig.mix — live acceptance rig for file-manager drag-and-drop.
+--
+-- Builds a deterministic two-directory tree, points both file-manager panes
+-- at it through an isolated COSMIX_APPS_HOME, launches the app, and reports
+-- the resulting tree state. Gesture injection is deliberately separate.
+--
+-- This is a workstation-only tool. Setup and reset rebuild scratch
+-- directories destructively; lint it statically, but do not execute it merely
+-- to verify a port.
+--
+-- Usage:
+--   mix _bin/dnd-rig.mix setup
+--   mix _bin/dnd-rig.mix launch
+--   mix _bin/dnd-rig.mix state
+--   mix _bin/dnd-rig.mix reset
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn usage($message)
+  if $message != "" then
+    print("  ERROR: " .. $message)
+  end
+  print("usage: mix _bin/dnd-rig.mix setup|launch|state|reset")
+  exit(2)
+end
+
+$argv = args()
+if len($argv) != 1 then
+  usage("expected exactly one command")
+end
+$cmd = $argv[0]
+if $cmd != "setup" and $cmd != "launch" and $cmd != "state" and $cmd != "reset" then
+  usage("unknown command '" .. $cmd .. "'")
+end
+
+-- Override this only with a disposable path owned by the current user.
+$root = env("DND_RIG_ROOT", "/tmp/cosmix-dnd-rig")
+$apps = $root .. "/apps"
+$left = $root .. "/left"
+$right = $root .. "/right"
+
+-- deploy_lib.cosmix_bin() locates a main-workspace release target. Desktop is
+-- a separate workspace, and setup.mix installs its binaries into $COSMIX/bin.
+fn installed_desktop_bin($name)
+  return $d.cosmix_root() .. "/bin/" .. $name
+end
+
+$bin = installed_desktop_bin("cosmix-filemgr")
+
+fn require_filemgr()
+  if not is_file($bin) then
+    print("  ERROR: file manager binary not found at " .. $bin)
+    print("         build and install it with: mix " .. $d.cosmix_root() .. "/setup.mix --desktop")
+    exit(2)
+  end
+end
+
+fn build_tree()
+  -- Distinct sizes make copy versus move legible from the listing alone.
+  remove_dir($left)
+  remove_dir($right)
+  mkdir($left .. "/subdir")
+  mkdir($right .. "/dest")
+  write_file($left .. "/alpha.txt", "alpha\n")
+  write_file($left .. "/beta.txt", "beta beta\n")
+  write_file($left .. "/subdir/nested.txt", "nested\n")
+  write_file($right .. "/gamma.txt", "gamma gamma gamma\n")
+  print("tree rebuilt under " .. $root)
+end
+
+fn find_config()
+  -- Discover rather than hardcode the application-specific config directory.
+  -- A layout change must fail loudly instead of seeding an unread file.
+  $hits = glob($apps .. "/**/config.conf.mix")
+  if len($hits) == 0 then
+    return ""
+  end
+  return $hits[0]
+end
+
+fn seed_config()
+  -- Let the binary author its default, then rewrite only the pane paths.
+  if find_config() == "" then
+    print("no config yet - starting file manager briefly so it writes its default")
+    $seed = run_argv([$bin], {timeout: 8, env: {COSMIX_APPS_HOME: $apps}})
+    if not $seed["timed_out"] and $seed["exit_code"] != 0 then
+      raise("RIG_SEED_LAUNCH", "file manager failed while creating its default: " ..
+        trim($seed["stderr"]))
+    end
+  end
+  $cfg = find_config()
+  if $cfg == "" then
+    raise("RIG_NO_CONFIG", "file manager wrote no config under " .. $apps)
+  end
+
+  -- The file manager currently serialises JSON despite the .conf.mix suffix.
+  -- Structural parsing also survives a move to strict-data while these keys
+  -- retain their names.
+  $cfg_data = json_parse(read_file($cfg))
+  if $cfg_data["left"] == nil or $cfg_data["right"] == nil then
+    raise("RIG_PANE_PATHS", "no left/right pane keys in " .. $cfg)
+  end
+  $cfg_data["left"]["path"] = $left
+  $cfg_data["right"]["path"] = $right
+  $cfg_data["active_pane"] = "left"
+  write_file($cfg, json_encode($cfg_data))
+  print("seeded " .. $cfg)
+  print("  left  = " .. $left)
+  print("  right = " .. $right)
+end
+
+fn show($label, $dir)
+  print("--- " .. $label .. " (" .. $dir .. ") ---")
+  for each $entry in ls($dir)
+    $path = path_join($dir, $entry)
+    if is_dir($path) then
+      print("  " .. $entry .. "/")
+    else
+      print("  " .. $entry .. "  " .. stat($path)["size"] .. "b")
+    end
+  end
+end
+
+if $cmd == "setup" then
+  require_filemgr()
+  build_tree()
+  seed_config()
+elif $cmd == "reset" then
+  build_tree()
+elif $cmd == "launch" then
+  require_filemgr()
+  print("launching file manager (COSMIX_APPS_HOME=" .. $apps .. ")")
+  $launch = run_argv([$bin], {timeout: 900, env: {COSMIX_APPS_HOME: $apps}})
+  if $launch["timed_out"] then
+    print("file manager stopped at the 900-second rig limit")
+  elif $launch["exit_code"] != 0 then
+    raise("RIG_LAUNCH", "file manager failed: " .. trim($launch["stderr"]))
+  end
+else
+  show("left", $left)
+  show("right", $right)
+end

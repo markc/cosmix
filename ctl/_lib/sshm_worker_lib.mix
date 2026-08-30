@@ -1,0 +1,123 @@
+-- sshm_worker_lib.mix — shared runtime for the sshm job worker.
+--
+-- require() isolates this module from its caller, so every exported function
+-- takes its inputs explicitly. The worker owns job execution; this module owns
+-- secret loading and the fenced HTTP transport to the SSH-manager seam.
+
+-- Load the worker secret. Precedence is CREDENTIALS_DIRECTORY/sshm_secret,
+-- SSHM_SECRET_FILE, then the explicit --secret-file value. Refuse missing or
+-- empty material so a blank secret can never reach the authenticated seam.
+fn load_secret($explicit_file)
+  $path = ""
+  $credential_dir = env("CREDENTIALS_DIRECTORY")
+  if $credential_dir != "" then
+    $path = $credential_dir .. "/sshm_secret"
+  end
+  $override = env("SSHM_SECRET_FILE")
+  if $override != "" then
+    $path = $override
+  end
+  if $explicit_file != nil and $explicit_file != "" then
+    $path = $explicit_file
+  end
+  if $path == "" or not exists($path) then
+    print("ERROR: sshm worker secret not found (looked at: " .. $path .. ")")
+    exit(1)
+  end
+  $secret = trim(read_file($path))
+  if $secret == "" then
+    print("ERROR: sshm worker secret file is empty: " .. $path)
+    exit(1)
+  end
+  return $secret
+end
+
+-- POST a terminal result with the claim's job and lease fence. A 409 means
+-- the lease was lost, so state is left for reconciliation and the worker
+-- aborts. Any other non-200 response is infrastructure failure.
+fn post_apply($base_url, $secret, $job_id, $lease_token, $payload)
+  $payload["job_id"] = $job_id
+  $payload["lease_token"] = $lease_token
+  $headers = {
+    "X-Sshm-Secret": $secret,
+    "Content-Type": "application/json"
+  }
+  $result = http_post(
+    $base_url .. "/ssh/job-apply",
+    json_encode($payload),
+    $headers,
+    {timeout: 15}
+  )
+  $status = to_number("" .. $result["status"])
+  if $status == 409 then
+    print("apply FENCED (lease lost) job=" .. ("" .. $job_id) ..
+      " — leaving for reconcile")
+    exit(1)
+  end
+  if $status != 200 then
+    print("apply INFRA error status=" .. ("" .. $status) ..
+      " job=" .. ("" .. $job_id))
+    exit(1)
+  end
+  return true
+end
+
+-- Append one streaming progress chunk. A successful append continues the
+-- stream; any 4xx fences or rejects it. Transport and 5xx failures get two
+-- bounded attempts because the seam is idempotent on sequence number.
+fn post_progress($base_url, $secret, $job_id, $lease_token, $seq, $chunk)
+  $headers = {
+    "X-Sshm-Secret": $secret,
+    "Content-Type": "application/json"
+  }
+  $body = json_encode({
+    job_id: $job_id,
+    lease_token: $lease_token,
+    seq: $seq,
+    chunk: $chunk
+  })
+  $attempt = 0
+  while $attempt < 2
+    $result = http_post(
+      $base_url .. "/ssh/job-progress",
+      $body,
+      $headers,
+      {timeout: 6}
+    )
+    $status = to_number("" .. $result["status"])
+    if $status == 200 then
+      return true
+    end
+    if $status != nil and $status >= 400 and $status < 500 then
+      return false
+    end
+    $attempt = $attempt + 1
+    sleep(0.3)
+  end
+  return false
+end
+
+-- Renew a long-running job's lease. A 409 is a lost fence; any other non-200
+-- response is infrastructure failure. Both abort the worker.
+fn renew_lease($base_url, $secret, $job_id, $lease_token)
+  $headers = {
+    "X-Sshm-Secret": $secret,
+    "Content-Type": "application/json"
+  }
+  $result = http_post(
+    $base_url .. "/ssh/job-renew",
+    json_encode({job_id: $job_id, lease_token: $lease_token}),
+    $headers,
+    {timeout: 15}
+  )
+  $status = to_number("" .. $result["status"])
+  if $status == 409 then
+    print("renew FENCED (lease lost) job=" .. ("" .. $job_id))
+    exit(1)
+  end
+  if $status != 200 then
+    print("renew INFRA error status=" .. ("" .. $status))
+    exit(1)
+  end
+  return true
+end

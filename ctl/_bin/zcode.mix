@@ -1,0 +1,209 @@
+#!/usr/bin/env mix
+-- zcode.mix — headless ZCode launcher with a --model passthrough.
+--
+--   mix _bin/zcode.mix --prompt "..."
+--   mix _bin/zcode.mix -p "..."
+--   mix _bin/zcode.mix --model example-provider/example-model -p "..."
+--
+-- ZCode's bundled CLI has no reliable model flag, so a one-run override is
+-- supplied through its environment. The provider URL and key come from the
+-- configured ZCode CLI provider entry and never enter the child argv.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/zcode.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no ZCode launcher configuration at " .. $CONF_PATH)
+  print("         copy _etc/zcode.conf.mix.example there and set the local paths and provider")
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  if type($loaded) != "map" or type($loaded["zcode"]) != "map" then
+    config_error("must contain a zcode strict-data map")
+  end
+  $CONF = validate($loaded["zcode"], {
+    schema_version: {type: "integer", enum: [1]},
+    zcode_bin: {type: "string", nonblank: true},
+    zcode_cli_js: {type: "string", nonblank: true},
+    cli_config_path: {type: "string", nonblank: true},
+    default_provider: {type: "string", nonblank: true},
+    tui_search_roots: {
+      type: "list",
+      min_length: 1,
+      items: {type: "string", nonblank: true}
+    }
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+$ZBIN = $CONF["zcode_bin"]
+$ZCJS = $CONF["zcode_cli_js"]
+$CLI_CFG = $CONF["cli_config_path"]
+$DEF_PROVIDER = $CONF["default_provider"]
+$TUI_ROOTS = $CONF["tui_search_roots"]
+
+fn bail($message)
+  eprintf("zcode: %s\n", $message)
+  exit(2)
+end
+
+-- The wrapper is a headless route: output remains live, stdin is closed, and
+-- no deadline truncates a long model run. Secrets are scoped to this child.
+fn launch($envs, $rest)
+  $envs["ELECTRON_RUN_AS_NODE"] = "1"
+  $run = run_argv(concat([$ZBIN, $ZCJS], $rest), {
+    env: $envs,
+    timeout: 0,
+    stdout: "inherit",
+    stderr: "inherit"
+  })
+  if $run["exit_code"] != nil then
+    return $run["exit_code"]
+  end
+  if $run["interrupted"] then
+    return 130
+  end
+  if $run["signal"] != nil then
+    return 128 + $run["signal"]
+  end
+  eprint("zcode: launcher failed: " .. ("" .. $run["error"]))
+  return 1
+end
+
+-- --model is consumed here; everything else reaches ZCode untouched.
+$argv = args()
+$fwd = []
+$model = ""
+$i = 0
+while $i < len($argv)
+  $arg = $argv[$i]
+  if $arg == "--model" then
+    $i = $i + 1
+    if $i >= len($argv) then
+      bail("--model needs a model id (for example, --model example-model)")
+    end
+    $model = $argv[$i]
+  elif starts_with($arg, "--model=") then
+    $model = slice($arg, 8)
+  else
+    push($fwd, $arg)
+  end
+  $i = $i + 1
+end
+
+-- The desktop bundle may omit the terminal UI package. Detect that before
+-- launch so a bare invocation explains the packaging limit instead of showing
+-- a module-resolution failure. Help, version and prompt runs need no TUI.
+fn tui_present($roots)
+  for each $root in $roots
+    if exists($root .. "/node_modules/@zcode/tui") then
+      return true
+    end
+  end
+  return false
+end
+
+fn wants_tui($forwarded)
+  for each $arg in $forwarded
+    if ($arg == "--version" or $arg == "-v" or $arg == "-V" or
+        $arg == "--help" or $arg == "-h") then
+      return false
+    end
+    if $arg == "-p" or $arg == "--prompt" or starts_with($arg, "--prompt=") then
+      return false
+    end
+  end
+  return true
+end
+
+if wants_tui($fwd) and not tui_present($TUI_ROOTS) then
+  bail("this ZCode build has no terminal UI; use a headless prompt or the desktop app")
+end
+
+if $model == "" then
+  exit(launch({}, $fwd))
+end
+
+$provider = $DEF_PROVIDER
+$id = $model
+if contains($model, "/") then
+  $parts = split($model, "/")
+  if len($parts) != 2 then
+    bail("--model takes ID or PROVIDER/ID, got " .. $model)
+  end
+  $provider = $parts[0]
+  $id = $parts[1]
+end
+
+if not exists($CLI_CFG) then
+  bail("no CLI config at " .. $CLI_CFG)
+end
+$cfg = read_json($CLI_CFG)
+if (type($cfg) != "map" or not has_key($cfg, "provider") or
+    type($cfg["provider"]) != "map") then
+  bail($CLI_CFG .. " has no provider block")
+end
+if (not has_key($cfg["provider"], $provider) or
+    type($cfg["provider"][$provider]) != "map") then
+  bail("provider '" .. $provider .. "' is not configured in " .. $CLI_CFG)
+end
+
+$entry = $cfg["provider"][$provider]
+if not has_key($entry, "options") or type($entry["options"]) != "map" then
+  bail("provider '" .. $provider .. "' has no options block")
+end
+$opts = $entry["options"]
+if (not has_key($opts, "apiKey") or not has_key($opts, "baseURL") or
+    type($opts["apiKey"]) != "string" or type($opts["baseURL"]) != "string" or
+    trim($opts["apiKey"]) == "" or trim($opts["baseURL"]) == "") then
+  bail("provider '" .. $provider .. "' is missing apiKey or baseURL")
+end
+
+if (not has_key($entry, "models") or type($entry["models"]) != "map" or
+    not has_key($entry["models"], $id)) then
+  eprintf("zcode: %s is not declared in %s; ZCode's default context window applies\n", $id, $CLI_CFG)
+end
+
+-- Preserve the old interpreter floor: before 0.51.0 the launcher's scoped env
+-- contract was not available. The behavioural probe remains load-bearing: it
+-- proves the required env reaches a child and first falsifies inherited state.
+$MIX = $d.mix_bin()
+$mix_version = run_argv([$MIX, "--version"])
+if $mix_version["exit_code"] != 0 then
+  bail("cannot read the Mix version from " .. $MIX .. ": " .. trim($mix_version["stderr"]))
+end
+if $d.ver_lt($d.ver_tuple($mix_version["stdout"]), [0, 51, 0]) then
+  bail("--model needs mix 0.51.0+; found " .. trim($mix_version["stdout"]))
+end
+
+$probe_source = '
+if env("ZCODE_ENV_PROBE") == "1" then
+  exit(0)
+end
+exit(1)
+'
+$sentinel = [$MIX, "-c", $probe_source]
+$negative = run_argv($sentinel)
+if $negative["exit_code"] == 0 then
+  bail("ZCODE_ENV_PROBE is set in this environment; unset it because it defeats the env probe")
+end
+$positive = run_argv($sentinel, {env: {ZCODE_ENV_PROBE: "1"}})
+if $positive["exit_code"] != 0 then
+  bail("run_argv did not pass its env option; refusing the model override")
+end
+
+exit(launch({
+  ZCODE_MODEL: $provider .. "/" .. $id,
+  ZCODE_BASE_URL: $opts["baseURL"],
+  ANTHROPIC_API_KEY: $opts["apiKey"]
+}, $fwd))

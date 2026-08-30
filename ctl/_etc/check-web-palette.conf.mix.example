@@ -1,0 +1,28 @@
+-- check-web-palette.conf.mix.example — private web palette clone selection.
+-- Copy to check-web-palette.conf.mix in the private control hub and replace
+-- the placeholder vhosts. Paths are relative to the public $COSMIX checkout.
+{
+  check_web_palette: {
+    schema_version: 1,
+    clones: [
+      {
+        name: "alpha",
+        css_path: "src/crates/cosmix-webd/vhosts/alpha.example.org/assets/site.css",
+        html_path: "src/crates/cosmix-webd/vhosts/alpha.example.org/index.html",
+        onimage_arms: [".hero-bg", ".bg-image-section"]
+      },
+      {
+        name: "beta",
+        css_path: "src/crates/cosmix-webd/vhosts/beta.example.org/assets/site.css",
+        html_path: "src/crates/cosmix-webd/vhosts/beta.example.org/index.html",
+        onimage_arms: [".hero-bg", ".bg-image-section", ".site-footer"]
+      },
+      {
+        name: "gamma",
+        css_path: "src/crates/cosmix-webd/vhosts/gamma.example.org/assets/site.css",
+        html_path: "src/crates/cosmix-webd/vhosts/gamma.example.org/lib/shell.html",
+        onimage_arms: [".hero-bg", ".bg-image-section", ".hero-canvas"]
+      }
+    ]
+  }
+}
