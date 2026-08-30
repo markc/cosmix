@@ -1,0 +1,11 @@
+-- provision_mix.conf.mix.example — private Mix bootstrap server inputs.
+-- Copy this file to provision_mix.conf.mix in the private control hub and
+-- replace the placeholders. serve_node must be an active mesh inventory
+-- member and must name the machine running this script; its inventory address
+-- is used to bind the temporary server. The port must be reachable only on the
+-- operator's trusted bootstrap network.
+provision_mix: {
+  schema_version: 1,
+  serve_node: "alpha",
+  serve_port: 18087
+}

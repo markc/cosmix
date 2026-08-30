@@ -1,0 +1,45 @@
+{
+  deploy_filesd_fs: {
+    -- Bump only when this public template's data shape changes.
+    schema_version: 1,
+
+    -- Every name must exist in the private fleet roster. With no script
+    -- arguments these are the deploy targets; named arguments select a subset.
+    target_nodes: ["alpha", "beta", "gamma"],
+
+    -- The fs-mode citizen deliberately runs with an ordinary user's filesystem
+    -- authority. These values replace markers in the public systemd template.
+    service_user: "user",
+    service_group: "user",
+    service_home: "/home/user",
+    working_directory: "/home/user",
+
+    -- One strict-data source drives both the daemon config and systemd's
+    -- ReadWritePaths/ReadOnlyPaths sandbox.
+    fs_config: {
+      bus_service: "filesd-fs",
+      delegated_peers: ["webd"],
+      trash_root: "/home/user/.fm-trash",
+      places: [
+        {
+          id: "home",
+          label: "Home",
+          root: "/home/user",
+          group: "places",
+          icon: "home",
+          writable: true
+        },
+        {
+          id: "shared",
+          label: "Shared documents",
+          root: "/srv/shared",
+          group: "places",
+          icon: "folder",
+          writable: false,
+          allow: ["documents/*", "public/*.txt"],
+          deny: ["private/*"]
+        }
+      ]
+    }
+  }
+}

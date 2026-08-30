@@ -1,0 +1,249 @@
+#!/usr/bin/env mix
+-- provision_mix.mix — bootstrap the freshly-built release `mix` onto roster
+-- nodes which do not have /opt/cosmix/bin/mix yet.
+--
+--   mix _bin/provision_mix.mix alpha beta
+--   mix _bin/provision_mix.mix --allow-downgrade alpha
+--
+-- The target pulls a pinned binary snapshot from a throwaway HTTP server bound
+-- only to the configured mesh interface. This is the one deploy script allowed
+-- to use plain ssh_run before Mix lands: there is no remote Mix interpreter yet.
+-- After the atomic verified swap, every remote step uses ssh_mix.
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+$raw_args = args()
+$has_node = false
+for each $arg in $raw_args
+  if $arg != "--allow-downgrade" then
+    $has_node = true
+  end
+end
+if not $has_node then
+  print("usage: mix provision_mix.mix [--allow-downgrade] <node> [<node>...]")
+  print("  bootstrap /opt/cosmix/bin/mix onto named roster nodes")
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/provision_mix.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no Mix provision config at " .. $CONF_PATH ..
+    " — create it from provision_mix.conf.mix.example before provisioning")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["provision_mix"], {
+    schema_version: {type: "integer", enum: [1]},
+    serve_node: {type: "string", nonblank: true},
+    serve_port: {type: "integer", min: 1024, max: 65535}
+  })
+catch $e
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+  exit(2)
+end
+
+$ROSTER = $d.roster()
+$d.assert_node($ROSTER, $CONF["serve_node"])
+if $d.is_foreign($ROSTER, $CONF["serve_node"]) then
+  print("  ERROR: " .. $CONF_PATH .. ": serve_node must be an active mesh node")
+  exit(2)
+end
+
+$parsed = $d.parse_nodes($ROSTER, $raw_args, ["--allow-downgrade"])
+$nodes = $d.order_subset($ROSTER, $parsed["nodes"])
+$ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
+$SERVE_ADDR = $d.mesh_ip($CONF["serve_node"])
+$SERVE_PORT = $CONF["serve_port"]
+$REMOTE = {}
+for each $node in $nodes
+  if $d.is_foreign($ROSTER, $node) then
+    $REMOTE[$node] = $node
+  else
+    $REMOTE[$node] = "root@" .. $d.mesh_ip($node)
+  end
+end
+
+-- The local build must run Mix source on stdin, exactly as ssh_mix will use it
+-- after bootstrap. A merely present or version-printing binary is insufficient.
+$SOURCE_BIN = $d.cosmix_bin("mix")
+$probe = run_argv([$SOURCE_BIN, "-"], {stdin: "print(\"stdin-ok\")\n"})
+$d.die_if($probe["exit_code"] != 0 or not contains($probe["stdout"], "stdin-ok"),
+  "local release binary missing or lacks `mix -` (build it first: cd $COSMIX/src && cargo build --release -p cosmix-mix): " .. trim($probe["stderr"]))
+
+$bv = run_argv([$SOURCE_BIN, "--version"])
+$d.die_if($bv["exit_code"] != 0, "local --version failed: " .. trim($bv["stderr"]))
+$ver = trim($bv["stdout"])
+
+-- Keep the published version table in step with the binary being provisioned.
+$vgen = dirname(realpath($0)) .. "/gen-versions.mix"
+if is_file($vgen) then
+  $vc = run_argv([$d.mix_bin(), $vgen, "--check"])
+  if $vc["exit_code"] != 0 then
+    print("  ERROR: VERSIONS.md is stale — regenerate it before provisioning:")
+    print("    mix " .. $vgen)
+    print("  " .. trim($vc["stderr"]))
+    exit(1)
+  end
+end
+
+-- All reachability and downgrade checks happen before the writer lock and any
+-- transfer. Plain ssh_run is necessary here because the target may have no Mix.
+for each $node in $nodes
+  $remote = $REMOTE[$node]
+  $token = "provision-reach-" .. uuid()
+  $reach = ssh_run($remote, "echo " .. $token, {connect_timeout: 8, timeout: 15})
+  $d.die_if(not $reach["ok"] or not contains($reach["stdout"], $token),
+    $node .. " unreachable over bootstrap SSH: " .. trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+
+  $pre = ssh_run($remote, "/opt/cosmix/bin/mix --version", {connect_timeout: 8, timeout: 15})
+  if $pre["ok"] and trim($pre["stdout"]) != "" then
+    $d.assert_not_downgrade($node, $pre["stdout"], $ver, $ALLOW_DOWNGRADE)
+  end
+end
+
+-- Snapshot once so every node receives identical bytes even if another build
+-- completes during this run.
+$SNAP = $d.snapshot_bin($SOURCE_BIN)
+$SERVE_DIR = ""
+$HTTPD_PATTERN = ""
+$HTTP_PROBE = $SNAP .. ".http-probe"
+
+fn cleanup()
+  if $HTTPD_PATTERN != "" then
+    $_stop = run_argv(["pkill", "-f", "--", $HTTPD_PATTERN])
+  end
+  if $HTTP_PROBE != "" then
+    remove($HTTP_PROBE)
+  end
+  if $SERVE_DIR != "" then
+    remove_dir($SERVE_DIR)
+  end
+  if $SNAP != "" then
+    remove($SNAP)
+  end
+end
+
+fn fail($message)
+  print("  ERROR: " .. $message)
+  cleanup()
+  exit(1)
+end
+
+$snap_version = run_argv([$SNAP, "--version"])
+if $snap_version["exit_code"] != 0 or trim($snap_version["stdout"]) != $ver then
+  fail("binary changed while it was being snapshotted; rebuild and retry")
+end
+$hash = hash_file($SNAP, "sha256")
+if length($hash) != 64 then
+  fail("could not calculate a 64-character sha256 for the binary snapshot")
+end
+print("local build: " .. $ver .. "  sha256=" .. $hash)
+print("targets: " .. join($nodes, " ") .. " (roster rollout order; hubs last)")
+
+-- Serialise the shared deployment plane before the first local server or
+-- remote filesystem mutation.
+$_lock = $m.mesh_take_write_lock("provision_mix")
+
+$mktemp = run_argv(["mktemp", "-d", "/tmp/cosmix-provision-XXXXXX"])
+if $mktemp["exit_code"] != 0 or trim($mktemp["stdout"]) == "" then
+  fail("could not create the temporary serve directory: " .. trim($mktemp["stderr"]))
+end
+$SERVE_DIR = trim($mktemp["stdout"])
+$copy = run_argv(["cp", "-f", $SNAP, $SERVE_DIR .. "/mix"])
+if $copy["exit_code"] != 0 then
+  fail("could not stage the binary snapshot: " .. trim($copy["stderr"]))
+end
+
+$listen = $SERVE_ADDR .. ":" .. ("" .. $SERVE_PORT)
+$HTTPD_PATTERN = "busybox httpd -p " .. $listen .. " -h " .. $SERVE_DIR
+$httpd = run_argv(["busybox", "httpd", "-p", $listen, "-h", $SERVE_DIR])
+if $httpd["exit_code"] != 0 then
+  fail("could not start the temporary HTTP server on " .. $listen .. ": " .. trim($httpd["stderr"]))
+end
+$url = "http://" .. $listen .. "/mix"
+$http = run_argv(["curl", "-fsS", "--max-time", "10", "-o", $HTTP_PROBE, $url], {timeout: 15})
+if $http["exit_code"] != 0 or not is_file($HTTP_PROBE) or hash_file($HTTP_PROBE, "sha256") != $hash then
+  fail("temporary HTTP server did not return the pinned binary snapshot")
+end
+remove($HTTP_PROBE)
+print("serving pinned Mix snapshot on the configured mesh interface")
+
+for each $node in $nodes
+  $remote = $REMOTE[$node]
+  print("")
+  print("[" .. $node .. "] provision /opt/cosmix/bin/mix")
+
+  -- Bootstrap exception: mkdir and the first transfer are plain remote shell
+  -- commands because /opt/cosmix/bin/mix does not exist yet. All interpolated
+  -- values are inventory/config integers, an SHA-256, or a UUID.
+  $mkdir = ssh_run($remote, "install -d -o 0 -g 0 -m 0755 /opt/cosmix/bin",
+    {connect_timeout: 8, timeout: 30})
+  if not $mkdir["ok"] then
+    fail($node .. " could not create /opt/cosmix/bin: " .. trim($mkdir["stderr"]))
+  end
+
+  $tmp = "/opt/cosmix/bin/mix.provision.new"
+  $marker = "/opt/cosmix/bin/mix.provision.invocation"
+  $invocation = uuid()
+  $transfer = "rm -f " .. $tmp .. " " .. $marker ..
+    " && curl -fsS --max-time 120 -o " .. $tmp .. " " .. $url ..
+    " && echo " .. $hash .. "  " .. $tmp .. " | sha256sum -c -" ..
+    " && chmod 0755 " .. $tmp ..
+    " && mv -f " .. $tmp .. " /opt/cosmix/bin/mix" ..
+    " && echo " .. $invocation .. " > " .. $marker
+  $landed = ssh_run($remote, $transfer, {connect_timeout: 8, timeout: 180})
+  if not $landed["ok"] or not contains($landed["stdout"], "OK") then
+    fail($node .. " pull/hash/atomic-swap failed: " ..
+      trim($landed["stdout"]) .. " " .. trim($landed["stderr"]))
+  end
+
+  -- From here on, the installed artefact itself interprets every remote step.
+  -- Exact version, exact bytes and the per-run marker make this no-op proof.
+  $installed = ssh_mix($remote, '
+$actual_version = trim(run($bin .. " --version"))
+if $rc != 0 or $actual_version != $expected_version then
+  exit(7)
+end
+if hash_file($bin, "sha256") != $expected_hash then
+  exit(8)
+end
+if not is_file($marker) or trim(read_file($marker)) != $invocation then
+  exit(9)
+end
+remove($marker)
+print(data_encode({version: $actual_version, invocation: $invocation}))
+', {bindings: {
+      bin: "/opt/cosmix/bin/mix",
+      marker: $marker,
+      expected_version: $ver,
+      expected_hash: $hash,
+      invocation: $invocation
+    }, decode: "data", connect_timeout: 8, timeout: 30})
+  if not $installed["ok"] then
+    fail($node .. " installed version/hash/invocation assertion failed: " ..
+      trim($installed["stdout"]) .. " " .. trim($installed["stderr"]))
+  end
+  print("  installed: " .. $installed["value"]["version"] ..
+    "  invocation=" .. $installed["value"]["invocation"])
+
+  $smoke = ssh_mix($remote, 'print(1 + 1)', {connect_timeout: 8, timeout: 15})
+  if not $smoke["ok"] or trim($smoke["stdout"]) != "2" then
+    fail($node .. " post-install Mix smoke failed: " ..
+      trim($smoke["stdout"]) .. " " .. trim($smoke["stderr"]))
+  end
+  $which_smoke = ssh_mix($remote, 'print(which("sh"))', {connect_timeout: 8, timeout: 15})
+  if not $which_smoke["ok"] or not contains($which_smoke["stdout"], "/sh") then
+    fail($node .. " post-install which(\"sh\") smoke failed: " ..
+      trim($which_smoke["stdout"]) .. " " .. trim($which_smoke["stderr"]))
+  end
+  print("  mix -c and which(\"sh\") smokes: OK")
+end
+
+cleanup()
+print("")
+print("provision complete: exact version, bytes, invocation marker and Mix smokes verified on " ..
+  join($nodes, " "))

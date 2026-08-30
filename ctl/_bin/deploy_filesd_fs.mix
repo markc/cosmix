@@ -1,0 +1,531 @@
+#!/usr/bin/env mix
+-- deploy_filesd_fs.mix — install the file-manager fs-mode filesd citizen on
+-- configured fleet nodes, with its filesystem sandbox generated from the same
+-- private places data the daemon receives.
+--
+--   mix _bin/deploy_filesd_fs.mix                     -- configured targets
+--   mix _bin/deploy_filesd_fs.mix alpha beta          -- configured subset
+--   mix _bin/deploy_filesd_fs.mix --allow-downgrade … -- deliberate rollback
+--
+-- The hub-private _etc/deploy_filesd_fs.conf.mix owns target selection,
+-- service identity, place roots and delegated peers. Nodes are deployed in the
+-- roster's rollout order, with foreign nodes first and mesh hubs last. Every
+-- failed gate stops the run.
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_filesd_fs.conf.mix"
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+if not is_file($CONF_PATH) then
+  print("  ERROR: no filesd-fs deploy config at " .. $CONF_PATH ..
+    " — create it from deploy_filesd_fs.conf.mix.example before deploying")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["deploy_filesd_fs"], {
+    schema_version: {type: "integer", enum: [1]},
+    target_nodes: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}},
+    service_user: {type: "string", nonblank: true},
+    service_group: {type: "string", nonblank: true},
+    service_home: {type: "string", nonblank: true},
+    working_directory: {type: "string", nonblank: true},
+    fs_config: {type: "map", schema: {
+      bus_service: {type: "string", nonblank: true},
+      delegated_peers: {type: "list", min_length: 1,
+        items: {type: "string", nonblank: true}},
+      trash_root: {type: "string", nonblank: true},
+      places: {type: "list", min_length: 1, items: {type: "map", schema: {
+        id: {type: "string", nonblank: true},
+        label: {type: "string", nonblank: true},
+        root: {type: "string", nonblank: true},
+        group: {type: "string", nonblank: true},
+        icon: {type: "string", nonblank: true},
+        writable: {type: "boolean"},
+        allow: {required: false, type: "list", min_length: 1,
+          items: {type: "string", nonblank: true}},
+        deny: {required: false, type: "list", min_length: 1,
+          items: {type: "string", nonblank: true}}
+      }}}
+    }}
+  })
+catch $e
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+  exit(2)
+end
+
+fn contains_item($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+-- Paths become systemd sandbox entries. Keep their grammar narrower than both
+-- systemd and the daemon so whitespace cannot split entries and traversal or a
+-- metacharacter cannot become part of a remote system command.
+fn fs_path_ok($path)
+  if not starts_with($path, "/") or $path == "/" or contains($path, "..") then
+    return false
+  end
+  return regex_match("^/[A-Za-z0-9/_.-]+$", $path)
+end
+
+fn field_text_ok($value)
+  return not contains($value, "|") and not contains($value, "\n") and not contains($value, "\r")
+end
+
+fn pattern_ok($pattern)
+  if starts_with($pattern, "/") or contains($pattern, "//") then
+    return false
+  end
+  for each $segment in split($pattern, "/")
+    if $segment == "" or $segment == "." or $segment == ".." or not regex_match("^[A-Za-z0-9._*-]+$", $segment) then
+      return false
+    end
+  end
+  return true
+end
+
+if not regex_match("^[a-z_][a-z0-9_-]*$", $CONF["service_user"]) then
+  config_error("service_user is not a safe system account name")
+end
+if not regex_match("^[a-z_][a-z0-9_-]*$", $CONF["service_group"]) then
+  config_error("service_group is not a safe system group name")
+end
+if not fs_path_ok($CONF["service_home"]) then
+  config_error("service_home must be an absolute safe path other than /")
+end
+if not fs_path_ok($CONF["working_directory"]) then
+  config_error("working_directory must be an absolute safe path other than /")
+end
+
+$FS = $CONF["fs_config"]
+if not regex_match("^[a-z][a-z0-9-]{1,30}$", $FS["bus_service"]) then
+  config_error("fs_config.bus_service is not a valid Bus service name")
+end
+for each $peer in $FS["delegated_peers"]
+  if not regex_match("^[a-z][a-z0-9-]{1,30}$", $peer) then
+    config_error("invalid delegated peer: " .. $peer)
+  end
+end
+if not fs_path_ok($FS["trash_root"]) then
+  config_error("fs_config.trash_root must be an absolute safe path other than /")
+end
+
+$rw = []
+$ro = []
+$place_ids = []
+for each $place in $FS["places"]
+  if not regex_match("^[A-Za-z0-9_.-]+$", $place["id"]) then
+    config_error("invalid place id: " .. $place["id"])
+  end
+  if contains_item($place_ids, $place["id"]) then
+    config_error("duplicate place id: " .. $place["id"])
+  end
+  push($place_ids, $place["id"])
+  if not field_text_ok($place["label"]) then
+    config_error("place label contains a forbidden separator or newline: " .. $place["id"])
+  end
+  if not regex_match("^[A-Za-z0-9_.-]+$", $place["group"]) then
+    config_error("invalid place group: " .. $place["id"])
+  end
+  if not regex_match("^[A-Za-z0-9_.-]+$", $place["icon"]) then
+    config_error("invalid place icon: " .. $place["id"])
+  end
+  if not fs_path_ok($place["root"]) then
+    config_error("unsafe place root: " .. $place["root"])
+  end
+  for each $key in ["allow", "deny"]
+    $patterns = $place[$key]
+    if $patterns != nil then
+      for each $pattern in $patterns
+        if not pattern_ok($pattern) then
+          config_error("invalid " .. $key .. " pattern for place " .. $place["id"] .. ": " .. $pattern)
+        end
+      end
+    end
+  end
+  if $place["writable"] then
+    push($rw, $place["root"])
+  else
+    push($ro, $place["root"])
+  end
+end
+
+-- Trash cannot widen the writable surface beyond the configured writable
+-- places. This is checked before it becomes either config or a sandbox line.
+$trash_bounded = false
+for each $root in $rw
+  if starts_with($FS["trash_root"], $root .. "/") then
+    $trash_bounded = true
+  end
+end
+if not $trash_bounded then
+  config_error("fs_config.trash_root must be under a writable place root")
+end
+
+-- Render the daemon's flat repeated-place format from validated strict data.
+$FS_TEXT = "mode: fs\n"
+$FS_TEXT = $FS_TEXT .. "bus_service: " .. $FS["bus_service"] .. "\n"
+$FS_TEXT = $FS_TEXT .. "trash_root: " .. $FS["trash_root"] .. "\n"
+$FS_TEXT = $FS_TEXT .. "delegated_peers: " .. join($FS["delegated_peers"], ",") .. "\n"
+for each $place in $FS["places"]
+  $line = "place: " .. $place["id"] .. " | " .. $place["label"] .. " | " ..
+    $place["root"] .. " | group=" .. $place["group"] .. " | icon=" ..
+    $place["icon"] .. " | writable=" .. ("" .. $place["writable"])
+  if $place["allow"] != nil then
+    $line = $line .. " | allow=" .. join($place["allow"], ",")
+  end
+  if $place["deny"] != nil then
+    $line = $line .. " | deny=" .. join($place["deny"], ",")
+  end
+  $FS_TEXT = $FS_TEXT .. $line .. "\n"
+end
+
+-- Validate configured and requested targets before reading deploy artefacts or
+-- taking the mesh writer lock. A bad pre-flight cannot touch a node.
+$configured = []
+for each $node in $CONF["target_nodes"]
+  if contains_item($configured, $node) then
+    config_error("duplicate target node: " .. $node)
+  end
+  push($configured, $node)
+end
+
+$ROSTER = $d.roster()
+for each $node in $configured
+  $d.assert_node($ROSTER, $node)
+end
+
+$raw_args = args()
+$has_named_node = false
+for each $arg in $raw_args
+  if $arg != "--allow-downgrade" then
+    $has_named_node = true
+  end
+end
+$parse_args = $raw_args
+if not $has_named_node then
+  $parse_args = concat($configured, $raw_args)
+end
+$parsed = $d.parse_nodes($ROSTER, $parse_args, ["--allow-downgrade"])
+$selected = $parsed["nodes"]
+$ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
+
+$seen = []
+for each $node in $selected
+  if contains_item($seen, $node) then
+    config_error("duplicate selected node: " .. $node)
+  end
+  push($seen, $node)
+  if not contains_item($configured, $node) then
+    config_error("'" .. $node .. "' is not a configured filesd-fs target")
+  end
+end
+
+-- Foreign targets are valid ssh_mix hosts, but are placed before the mesh so
+-- the roster's hub tail remains last for every mixed-fleet rollout.
+$nodes = []
+for each $node in $selected
+  if $d.is_foreign($ROSTER, $node) then
+    push($nodes, $node)
+  end
+end
+$rollout = $d.rollout_order($ROSTER)
+for each $candidate in $rollout
+  if contains_item($selected, $candidate) and not $d.is_foreign($ROSTER, $candidate) then
+    if contains_item($nodes, $candidate) then
+      config_error("roster rollout_order repeats selected node '" .. $candidate .. "'")
+    end
+    push($nodes, $candidate)
+  end
+end
+if len($nodes) != len($selected) then
+  config_error("a selected mesh node is absent from the roster rollout_order")
+end
+
+$REMOTE = {}
+for each $node in $nodes
+  if $d.is_foreign($ROSTER, $node) then
+    $REMOTE[$node] = $node
+  else
+    $REMOTE[$node] = "root@" .. $d.mesh_ip($node)
+  end
+end
+
+-- The public source template must carry each substitution marker exactly once.
+-- Its sandbox block is regenerated from fs_config.places for every deploy.
+$BIN_SOURCE = $d.cosmix_bin("cosmix-filesd")
+$UNIT_NAME = "cosmix-filesd-fs.service"
+$UNIT_SOURCE = $d.shipped("unit", $UNIT_NAME)
+$d.die_if(not is_file($BIN_SOURCE), "local binary missing (build it first): " .. $BIN_SOURCE)
+$d.die_if(not is_file($UNIT_SOURCE), "systemd unit template missing: " .. $UNIT_SOURCE)
+
+$UNIT_TEXT = read_file($UNIT_SOURCE)
+-- Only the sandbox markers are mandatory (that is what the deploy regenerates
+-- from the places); the identity markers are substituted when a template
+-- carries them and left alone when a unit states User=/Group=/HOME directly.
+for each $marker in ["@FS_SANDBOX_BEGIN@", "@FS_SANDBOX_END@"]
+  if len(split($UNIT_TEXT, $marker)) != 2 then
+    $d.die_if(true, "unit template must contain exactly one " .. $marker .. " marker")
+  end
+end
+$UNIT_TEXT = replace($UNIT_TEXT, "@FS_USER@", $CONF["service_user"])
+$UNIT_TEXT = replace($UNIT_TEXT, "@FS_GROUP@", $CONF["service_group"])
+$UNIT_TEXT = replace($UNIT_TEXT, "@FS_HOME@", $CONF["service_home"])
+$UNIT_TEXT = replace($UNIT_TEXT, "@FS_WORKING_DIRECTORY@", $CONF["working_directory"])
+
+$sandbox = ""
+for each $root in $rw
+  $sandbox = $sandbox .. "ReadWritePaths=" .. $root .. "\n"
+end
+$sandbox = $sandbox .. "ReadWritePaths=" .. $FS["trash_root"] .. "\n"
+for each $root in $ro
+  $sandbox = $sandbox .. "ReadOnlyPaths=" .. $root .. "\n"
+end
+
+$rendered = ""
+$in_sandbox = false
+$spliced = false
+for each $line in split($UNIT_TEXT, "\n")
+  if contains($line, "@FS_SANDBOX_BEGIN@") then
+    $d.die_if($in_sandbox or $spliced, "invalid repeated sandbox begin marker")
+    $rendered = $rendered .. $line .. "\n" .. $sandbox
+    $in_sandbox = true
+    $spliced = true
+  else
+    if contains($line, "@FS_SANDBOX_END@") then
+      $d.die_if(not $in_sandbox, "sandbox end marker precedes begin marker")
+      $rendered = $rendered .. $line .. "\n"
+      $in_sandbox = false
+    else
+      if not $in_sandbox then
+        $rendered = $rendered .. $line .. "\n"
+      end
+    end
+  end
+end
+$d.die_if(not $spliced or $in_sandbox, "sandbox marker block is incomplete")
+$UNIT_TEXT = $rendered
+
+-- Snapshot once so every target receives identical binary bytes even if a
+-- concurrent build relinks the release path during the rollout.
+$BIN = $d.snapshot_bin($BIN_SOURCE)
+$bv = run_argv([$BIN, "--version"])
+$d.die_if($bv["exit_code"] != 0, "local binary --version failed: " .. trim($bv["stderr"]))
+$VERSION = trim($bv["stdout"])
+$d.die_if($VERSION == "", "local binary --version returned no version")
+$BIN_HASH = hash_file($BIN, "sha256")
+$UNIT_HASH = hash_sha256($UNIT_TEXT)
+$CONF_HASH = hash_sha256($FS_TEXT)
+
+print("local build: " .. $BIN .. " -> " .. $VERSION)
+print("targets: " .. join($nodes, " "))
+print("sandbox: " .. ("" .. len($rw)) .. " writable + " .. ("" .. len($ro)) .. " read-only place(s)")
+
+fn verify_logging($node, $remote, $previous_invocation)
+  $try = 0
+  while $try < 4
+    $probe = ssh_mix($remote, '
+$iid = trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value"))
+if $rc != 0 or $iid == "" or $iid == $before then
+  exit(7)
+end
+$logs = trim(run("/usr/bin/journalctl _SYSTEMD_INVOCATION_ID=" .. $iid .. " -o cat --no-pager"))
+if $rc != 0 or $logs == "" then
+  exit(8)
+end
+print(data_encode({invocation: $iid, logs: $logs}))
+', {bindings: {unit: $UNIT_NAME, before: $previous_invocation}, decode: "data",
+      connect_timeout: 8, timeout: 30})
+    if $probe["ok"] then
+      print("  current-invocation log: " .. $probe["value"]["logs"])
+      return nil
+    end
+    $try = $try + 1
+    if $try < 4 then
+      $_wait = ssh_mix($remote, 'sleep(1)', {connect_timeout: 8, timeout: 5})
+    end
+  end
+  $d.die_if(true, $node .. " has no journald entry for a new current invocation")
+end
+
+fn deploy_node($node)
+  $remote = $REMOTE[$node]
+  print("")
+  print("[" .. $node .. "] deploy " .. $UNIT_NAME)
+
+  $reach = ssh_mix($remote, 'print("reach-ok")', {connect_timeout: 8, timeout: 10})
+  $d.die_if(not $reach["ok"] or not contains($reach["stdout"], "reach-ok"),
+    $node .. " unreachable or not a working Mix node: " .. trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+
+  -- A present but broken installed binary is an error, not permission to skip
+  -- the downgrade gate.
+  $pre = ssh_mix($remote, '
+if is_file($bin) then
+  $version = trim(run($bin .. " --version"))
+  if $rc != 0 or $version == "" then
+    exit(7)
+  end
+  print($version)
+end
+', {bindings: {bin: "/opt/cosmix/bin/cosmix-filesd"}, connect_timeout: 8, timeout: 15})
+  $d.die_if(not $pre["ok"],
+    $node .. " installed --version probe failed: " .. trim($pre["stdout"]) .. " " .. trim($pre["stderr"]))
+  if trim($pre["stdout"]) != "" then
+    $d.assert_not_downgrade($node, $pre["stdout"], $VERSION, $ALLOW_DOWNGRADE)
+  end
+
+  -- Confirm the configured operator identity exists, then create only the
+  -- deploy-owned directories. The account itself remains host provisioning.
+  $bootstrap = ssh_mix($remote, '
+$passwd = run("/usr/bin/getent passwd " .. $user)
+if $rc != 0 or trim($passwd) == "" then
+  exit(7)
+end
+$uid = to_number(trim(run("/usr/bin/id -u " .. $user)))
+if $rc != 0 then
+  exit(8)
+end
+$gid_text = trim(run("/usr/bin/getent group " .. $group .. " | /usr/bin/cut -d: -f3"))
+if $rc != 0 or $gid_text == "" then
+  exit(9)
+end
+$gid = to_number($gid_text)
+if not is_dir($home) or not is_dir($working) then
+  exit(10)
+end
+mkdir("/opt/cosmix/bin", {parents: true})
+mkdir("/etc/cosmix/filesd", {parents: true})
+mkdir($trash, {parents: true})
+chown($trash, $uid, $gid)
+print("bootstrap-ok")
+', {bindings: {
+      user: $CONF["service_user"], group: $CONF["service_group"],
+      home: $CONF["service_home"], working: $CONF["working_directory"],
+      trash: $FS["trash_root"]
+    }, connect_timeout: 8, timeout: 30})
+  $d.die_if(not $bootstrap["ok"] or not contains($bootstrap["stdout"], "bootstrap-ok"),
+    $node .. " service identity/directory bootstrap failed: " .. trim($bootstrap["stdout"]) .. " " .. trim($bootstrap["stderr"]))
+
+  $scp = run_argv([
+    "scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+    $BIN, $remote .. ":/opt/cosmix/bin/cosmix-filesd.new"
+  ], {timeout: 120})
+  $d.die_if($scp["exit_code"] != 0,
+    "binary scp -> " .. $node .. ": " .. trim($scp["stderr"]))
+
+  $stage = ssh_mix($remote, '
+write_file("/usr/lib/systemd/system/cosmix-filesd-fs.service.new", $unit_text)
+chmod("/usr/lib/systemd/system/cosmix-filesd-fs.service.new", 0o644)
+write_file("/etc/cosmix/filesd/fs.conf.mix.new", $conf_text)
+chmod("/etc/cosmix/filesd/fs.conf.mix.new", 0o644)
+print("stage-ok")
+', {bindings: {unit_text: $UNIT_TEXT, conf_text: $FS_TEXT}, connect_timeout: 8, timeout: 30})
+  $d.die_if(not $stage["ok"] or not contains($stage["stdout"], "stage-ok"),
+    $node .. " unit/config stage failed: " .. trim($stage["stdout"]) .. " " .. trim($stage["stderr"]))
+
+  -- Atomic replacements plus exact version and content hashes ensure the
+  -- installed paths, not merely staged files, match this deployment.
+  $install = ssh_mix($remote, '
+chmod("/opt/cosmix/bin/cosmix-filesd.new", 0o755)
+rename("/opt/cosmix/bin/cosmix-filesd.new", "/opt/cosmix/bin/cosmix-filesd")
+rename("/usr/lib/systemd/system/cosmix-filesd-fs.service.new", "/usr/lib/systemd/system/cosmix-filesd-fs.service")
+rename("/etc/cosmix/filesd/fs.conf.mix.new", "/etc/cosmix/filesd/fs.conf.mix")
+$version = trim(run("/opt/cosmix/bin/cosmix-filesd --version"))
+if $rc != 0 or $version == "" then
+  exit(7)
+end
+print(data_encode({
+  version: $version,
+  binary_hash: hash_file("/opt/cosmix/bin/cosmix-filesd", "sha256"),
+  unit_hash: hash_file("/usr/lib/systemd/system/cosmix-filesd-fs.service", "sha256"),
+  config_hash: hash_file("/etc/cosmix/filesd/fs.conf.mix", "sha256")
+}))
+', {decode: "data", connect_timeout: 8, timeout: 30})
+  $d.die_if(not $install["ok"],
+    $node .. " install/version probe failed: " .. trim($install["stdout"]) .. " " .. trim($install["stderr"]))
+  $d.die_if($install["value"]["version"] != $VERSION,
+    $node .. " installed version mismatch (want " .. $VERSION .. ")")
+  $d.die_if($install["value"]["binary_hash"] != $BIN_HASH,
+    $node .. " installed binary hash mismatch")
+  $d.die_if($install["value"]["unit_hash"] != $UNIT_HASH,
+    $node .. " installed unit hash mismatch")
+  $d.die_if($install["value"]["config_hash"] != $CONF_HASH,
+    $node .. " installed config hash mismatch")
+  print("  installed: " .. $VERSION .. " (version and hashes OK)")
+
+  $before = ssh_mix($remote,
+    'print(trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value")))',
+    {bindings: {unit: $UNIT_NAME}, connect_timeout: 8, timeout: 15})
+  $d.die_if(not $before["ok"],
+    $node .. " could not read pre-restart invocation: " .. trim($before["stderr"]))
+
+  $restart = ssh_mix($remote,
+    'print(run("/usr/bin/systemctl daemon-reload && /usr/bin/systemctl enable --now " .. $unit .. " && /usr/bin/systemctl restart " .. $unit .. " && /usr/bin/sleep 4 && /usr/bin/systemctl is-active " .. $unit))',
+    {bindings: {unit: $UNIT_NAME}, connect_timeout: 8, timeout: 60})
+  if not $restart["ok"] or trim($restart["stdout"]) != "active" then
+    print("  ERROR: " .. $node .. " restart failed; last 40 log lines:")
+    $diag = ssh_mix($remote,
+      'print(run("/usr/bin/journalctl -u " .. $unit .. " -n 40 --no-pager"))',
+      {bindings: {unit: $UNIT_NAME}, connect_timeout: 8, timeout: 30})
+    print($diag["stdout"])
+    print($diag["stderr"])
+    exit(1)
+  end
+  print("  active: new restart requested")
+  verify_logging($node, $remote, trim($before["stdout"]))
+
+  -- The configured service must answer after the new invocation. Active state
+  -- alone can pass while registration or request handling is broken.
+  $bus = ssh_mix($remote, '
+$try = 0
+$passed = false
+$reply = nil
+while $try < 5 and not $passed
+  send $service filesd.props.list timeout=15
+  if $rc == 0 then
+    $passed = true
+    $reply = $result
+  else
+    $try = $try + 1
+    if $try < 5 then
+      sleep(1)
+    end
+  end
+end
+if not $passed then
+  print("send rc=" .. $rc .. " result=" .. ("" .. $result))
+  exit(7)
+end
+print("props-ok " .. ("" .. $reply))
+', {bindings: {service: $FS["bus_service"]}, connect_timeout: 8, timeout: 90})
+  $d.die_if(not $bus["ok"] or not contains($bus["stdout"], "props-ok"),
+    $node .. " " .. $FS["bus_service"] .. " filesd.props.list smoke failed: " ..
+      trim($bus["stdout"]) .. " " .. trim($bus["stderr"]))
+  print("  Bus: " .. $FS["bus_service"] .. " filesd.props.list OK")
+  print("  [" .. $node .. "] DEPLOY OK")
+end
+
+-- Serialise the binary/config/unit replacement and service restart with every
+-- other mesh writer. All local and selection pre-flight gates have passed.
+$_lock = $m.mesh_take_write_lock("deploy_filesd_fs")
+for each $node in $nodes
+  deploy_node($node)
+end
+$_remove = run_argv(["rm", "-f", $BIN])
+
+print("")
+print("deploy complete: filesd-fs version, hashes, active state, new-invocation logging and Bus liveness verified on " .. join($nodes, " "))

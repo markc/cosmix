@@ -1,0 +1,9 @@
+{
+  deploy_vhost: {
+    schema_version: 1,
+
+    -- Node used when deploy_vhost.mix is run without its optional node.
+    -- It must exist in the private fleet roster.
+    default_node: "alpha"
+  }
+}

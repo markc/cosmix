@@ -1,0 +1,516 @@
+#!/usr/bin/env mix
+-- deploy_version_discovery.mix — install the version-aware broker and client
+-- daemons, then enable the Prometheus version collector.
+--
+--   mix _bin/deploy_version_discovery.mix
+--   mix _bin/deploy_version_discovery.mix alpha beta
+--   mix _bin/deploy_version_discovery.mix --allow-downgrade alpha
+--
+-- Clients are restarted before noded so they tolerate the old broker, then
+-- reconnect and register provenance after the broker flips. Mesh addresses
+-- come from inventory; foreign roster nodes are reached through their SSH
+-- aliases. Every selected rollout keeps inventory hubs last.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_version_discovery.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no version-discovery deploy config at " .. $CONF_PATH ..
+    " — create it from deploy_version_discovery.conf.mix.example")
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $message)
+  exit(2)
+end
+
+$config_data = load_data($CONF_PATH)
+if type($config_data) != "map" then
+  config_error($CONF_PATH .. " must contain a strict-data map")
+end
+$CONF = $config_data["deploy_version_discovery"]
+if type($CONF) != "map" then
+  config_error($CONF_PATH .. " must contain a deploy_version_discovery map")
+end
+$CONF = validate($CONF, {
+  schema_version: {type: "integer", enum: [1]},
+  default_nodes: {type: "list", min_length: 1, items: {type: "string", nonblank: true}},
+  client_daemons: {
+    type: "list",
+    min_length: 1,
+    items: {
+      type: "map",
+      schema: {
+        binary: {type: "string", nonblank: true},
+        unit: {type: "string", nonblank: true},
+        service: {type: "string", nonblank: true}
+      }
+    }
+  }
+})
+
+$CLIENTS = $CONF["client_daemons"]
+$seen_binaries = {}
+$seen_units = {}
+$seen_services = {}
+for each $client in $CLIENTS
+  $binary = $client["binary"]
+  $unit = $client["unit"]
+  $service = $client["service"]
+  if not regex_match("^cosmix-[a-z0-9-]+$", $binary) then
+    config_error($CONF_PATH .. " has invalid client binary: " .. $binary)
+  end
+  if not regex_match("^cosmix-[a-z0-9-]+$", $unit) then
+    config_error($CONF_PATH .. " has invalid client unit: " .. $unit)
+  end
+  if not regex_match("^[a-z0-9-]+$", $service) then
+    config_error($CONF_PATH .. " has invalid registered service: " .. $service)
+  end
+  if $binary == "cosmix-noded" or $unit == "cosmix-noded" or $service == "noded" then
+    config_error($CONF_PATH .. " client_daemons must not contain the broker")
+  end
+  if $seen_binaries[$binary] == true or $seen_units[$unit] == true or $seen_services[$service] == true then
+    config_error($CONF_PATH .. " client_daemons contains a duplicate binary, unit, or service")
+  end
+  $seen_binaries[$binary] = true
+  $seen_units[$unit] = true
+  $seen_services[$service] = true
+end
+
+$ROSTER = $d.roster()
+$requested = args()
+$has_named_node = false
+for each $arg in $requested
+  if $arg != "--allow-downgrade" then
+    $has_named_node = true
+  end
+end
+if not $has_named_node then
+  $requested = concat($CONF["default_nodes"], $requested)
+end
+$parsed = $d.parse_nodes($ROSTER, $requested, ["--allow-downgrade"])
+$selected = $parsed["nodes"]
+$ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
+
+-- Resolve the whole target set before inspecting artefacts or contacting a
+-- node. Foreign nodes deliberately bypass mesh inventory address lookup.
+$REMOTE = {}
+for each $node in $selected
+  if $d.is_foreign($ROSTER, $node) then
+    $REMOTE[$node] = $node
+  else
+    $REMOTE[$node] = "root@" .. $d.mesh_ip($node)
+  end
+end
+
+-- Preserve the roster's relative order while moving any foreign nodes absent
+-- from it ahead of the hub tail. A selected mesh node missing from the rollout
+-- is configuration drift and must not be silently dropped.
+$rollout = $d.rollout_order($ROSTER)
+$hubs = $d.mesh_hubs()
+$head = []
+$tail = []
+$ordered_seen = {}
+for each $candidate in $rollout
+  if contains($selected, $candidate) then
+    if $ordered_seen[$candidate] == true then
+      config_error("roster rollout_order repeats selected node '" .. $candidate .. "'")
+    end
+    $ordered_seen[$candidate] = true
+    if contains($hubs, $candidate) then
+      push($tail, $candidate)
+    else
+      push($head, $candidate)
+    end
+  end
+end
+for each $node in $selected
+  if $ordered_seen[$node] != true then
+    if not $d.is_foreign($ROSTER, $node) then
+      config_error("selected mesh node '" .. $node .. "' is absent from the roster rollout_order")
+    end
+    $ordered_seen[$node] = true
+    push($head, $node)
+  end
+end
+$nodes = concat($head, $tail)
+
+-- ── local artefacts ────────────────────────────────────────────────────
+$DAEMONS = []
+for each $client in $CLIENTS
+  push($DAEMONS, {
+    binary: $client["binary"],
+    unit: $client["unit"],
+    service: $client["service"]
+  })
+end
+push($DAEMONS, {binary: "cosmix-noded", unit: "cosmix-noded", service: "noded"})
+
+$SNAPSHOTS = {}
+$VERSIONS = {}
+$HASHES = {}
+for each $daemon in $DAEMONS
+  $name = $daemon["binary"]
+  $source = $d.cosmix_bin($name)
+  $d.die_if(not is_file($source), "local release binary missing (build it first): " .. $source)
+  $snapshot = $d.snapshot_bin($source)
+  $version_result = run_argv([$snapshot, "--version"])
+  $d.die_if($version_result["exit_code"] != 0,
+    "local " .. $name .. " --version failed: " .. trim($version_result["stderr"]))
+  $version = trim($version_result["stdout"])
+  $d.die_if($version == "", "local " .. $name .. " --version returned no version")
+  $SNAPSHOTS[$name] = $snapshot
+  $VERSIONS[$name] = $version
+  $HASHES[$name] = hash_file($snapshot, "sha256")
+  print("local build: " .. $name .. " -> " .. $version)
+end
+
+$ROOT = $d.cosmix_root()
+$COLLECTOR = $d.hub_root() .. "/_share/cosmix/prom_version_collector.mix"
+$COLLECTOR_SERVICE = $ROOT .. "/src/_etc/systemd-system/cosmix-version-collector.service"
+$COLLECTOR_TIMER = $ROOT .. "/src/_etc/systemd-system/cosmix-version-collector.timer"
+$d.die_if(not is_file($COLLECTOR), "collector source missing: " .. $COLLECTOR)
+$d.die_if(not is_file($COLLECTOR_SERVICE), "collector service template missing: " .. $COLLECTOR_SERVICE)
+$d.die_if(not is_file($COLLECTOR_TIMER), "collector timer template missing: " .. $COLLECTOR_TIMER)
+
+$COLLECTOR_DATA = read_file($COLLECTOR)
+$COLLECTOR_SERVICE_DATA = read_file($COLLECTOR_SERVICE)
+$COLLECTOR_TIMER_DATA = read_file($COLLECTOR_TIMER)
+$COLLECTOR_HASH = hash_file($COLLECTOR, "sha256")
+$COLLECTOR_SERVICE_HASH = hash_file($COLLECTOR_SERVICE, "sha256")
+$COLLECTOR_TIMER_HASH = hash_file($COLLECTOR_TIMER, "sha256")
+
+$noded_tuple = $d.ver_tuple($VERSIONS["cosmix-noded"])
+$EXPECTED_NODED_VERSION = join($noded_tuple, ".")
+
+fn scp_binary($host, $remote, $local_path, $remote_path)
+  $copy_result = run_argv([
+    "scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+    $local_path, $remote .. ":" .. $remote_path
+  ], {timeout: 120})
+  $d.die_if($copy_result["exit_code"] != 0,
+    "scp " .. $local_path .. " -> " .. $host .. ":" .. $remote_path .. ": " .. trim($copy_result["stderr"]))
+end
+
+fn install_binary($host, $remote, $daemon)
+  $name = $daemon["binary"]
+  $final = "/opt/cosmix/bin/" .. $name
+  $stage = $final .. ".new"
+  scp_binary($host, $remote, $SNAPSHOTS[$name], $stage)
+  $installed = ssh_mix($remote, '
+$owner = run("/usr/bin/chown 0:0 " .. $stage)
+if $rc != 0 then
+  print($owner)
+  exit(7)
+end
+chmod($stage, 0o755)
+$staged_version = trim(run($stage .. " --version"))
+if $rc != 0 or $staged_version != $want then
+  print($staged_version)
+  exit(8)
+end
+rename($stage, $final)
+$final_version = trim(run($final .. " --version"))
+if $rc != 0 then
+  print($final_version)
+  exit(9)
+end
+print(data_encode({version: $final_version, hash: hash_file($final, "sha256")}))
+', {
+    bindings: {stage: $stage, final: $final, want: $VERSIONS[$name]},
+    decode: "data", connect_timeout: 8, timeout: 30
+  })
+  $d.die_if(not $installed["ok"],
+    $host .. " install/--version smoke failed for " .. $name .. ": " ..
+    trim($installed["stdout"]) .. " " .. trim($installed["stderr"]))
+  $d.die_if($installed["value"]["version"] != $VERSIONS[$name],
+    $host .. " installed version mismatch for " .. $name)
+  $d.die_if($installed["value"]["hash"] != $HASHES[$name],
+    $host .. " installed binary hash mismatch for " .. $name)
+  print("  installed " .. $name .. ": version/exec/hash OK")
+end
+
+fn install_text($host, $remote, $data, $expected_hash, $path, $mode)
+  $staged = $path .. ".new"
+  $result = ssh_mix($remote, '
+write_file($staged, $data)
+$owner = run("/usr/bin/chown 0:0 " .. $staged)
+if $rc != 0 then
+  print($owner)
+  exit(7)
+end
+chmod($staged, $mode)
+rename($staged, $path)
+print(hash_file($path, "sha256"))
+', {
+    bindings: {staged: $staged, data: $data, mode: $mode, path: $path},
+    connect_timeout: 8, timeout: 30
+  })
+  $d.die_if(not $result["ok"] or trim($result["stdout"]) != $expected_hash,
+    $host .. " install/hash assertion failed for " .. $path .. ": " ..
+    trim($result["stdout"]) .. " " .. trim($result["stderr"]))
+end
+
+fn read_invocation($host, $remote, $unit, $required)
+  $result = ssh_mix($remote, '
+$iid = trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value"))
+if $rc != 0 then
+  exit(7)
+end
+print($iid)
+', {bindings: {unit: $unit}, connect_timeout: 8, timeout: 15})
+  if $required then
+    $d.die_if(not $result["ok"] or trim($result["stdout"]) == "",
+      $host .. " could not read invocation ID for " .. $unit .. ": " .. trim($result["stderr"]))
+  end
+  if not $result["ok"] then
+    return ""
+  end
+  return trim($result["stdout"])
+end
+
+fn verify_logging($host, $remote, $unit, $previous_invocation)
+  $attempt = 0
+  while $attempt < 4
+    $probe = ssh_mix($remote, '
+$iid = trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value"))
+if $rc != 0 or $iid == "" then
+  exit(7)
+end
+$logs = trim(run("/usr/bin/journalctl _SYSTEMD_INVOCATION_ID=" .. $iid .. " -o cat --no-pager"))
+if $rc != 0 then
+  exit(8)
+end
+$lines = 0
+if $logs != "" then
+  $lines = len(split($logs, "\n"))
+end
+print(data_encode({invocation: $iid, lines: $lines}))
+', {bindings: {unit: $unit}, decode: "data", connect_timeout: 8, timeout: 15})
+    if $probe["ok"] then
+      $invocation = $probe["value"]["invocation"]
+      $lines = $probe["value"]["lines"]
+      if $invocation != $previous_invocation and $lines >= 1 then
+        print("  " .. $unit .. " logging verified (" .. $lines .. " line/s, current invocation)")
+        return nil
+      end
+    end
+    $attempt = $attempt + 1
+    if $attempt < 4 then
+      sleep(1)
+    end
+  end
+  $d.die_if(true, $host .. " " .. $unit ..
+    " did not produce journald output under a new current invocation")
+end
+
+fn restart_service($host, $remote, $unit)
+  $before = read_invocation($host, $remote, $unit, true)
+  $restart = ssh_mix($remote, '
+$out = run("/usr/bin/systemctl restart " .. $unit)
+if $rc != 0 then
+  print($out)
+  exit(7)
+end
+sleep(1)
+$active = trim(run("/usr/bin/systemctl is-active " .. $unit))
+if $rc != 0 or $active != "active" then
+  print($active)
+  exit(8)
+end
+print($active)
+', {bindings: {unit: $unit}, connect_timeout: 8, timeout: 60})
+  if not $restart["ok"] then
+    print("  restart failed; last 40 log lines:")
+    $journal = ssh_mix($remote,
+      'print(run("/usr/bin/journalctl -u " .. $unit .. " -n 40 --no-pager"))',
+      {bindings: {unit: $unit}, connect_timeout: 8, timeout: 15})
+    print($journal["stdout"])
+    print($journal["stderr"])
+  end
+  $d.die_if(not $restart["ok"] or trim($restart["stdout"]) != "active",
+    $host .. " restart/is-active failed for " .. $unit .. ": " ..
+    trim($restart["stdout"]) .. " " .. trim($restart["stderr"]))
+  print("  " .. $unit .. ": active")
+  verify_logging($host, $remote, $unit, $before)
+end
+
+fn verify_bus_provenance($host, $remote)
+  $required = []
+  for each $client in $CLIENTS
+    push($required, $client["service"])
+  end
+  $verify = ssh_mix($remote, '
+send noded noded.info
+if $rc != 0 then
+  print("noded.info rc=" .. $rc)
+  exit(7)
+end
+$noded_version = $result["noded"]["version"]
+if $noded_version != $want then
+  print("noded version=" .. $noded_version .. " want=" .. $want)
+  exit(8)
+end
+send noded noded.list
+if $rc != 0 then
+  print("noded.list rc=" .. $rc)
+  exit(9)
+end
+$missing = []
+for each $name in $required
+  $found = false
+  for each $service in $result
+    if type($service) == "map" then
+      if $service["name"] == $name and $service["version"] != nil then
+        $found = true
+      end
+    end
+  end
+  if not $found then
+    push($missing, $name)
+  end
+end
+if len($missing) > 0 then
+  print("missing provenance: " .. join($missing, ","))
+  exit(10)
+end
+print(data_encode({noded: $noded_version, clients: $required}))
+', {
+    bindings: {want: $EXPECTED_NODED_VERSION, required: $required},
+    decode: "data", connect_timeout: 8, timeout: 30
+  })
+  $d.die_if(not $verify["ok"],
+    $host .. " broker/client provenance smoke failed: " ..
+    trim($verify["stdout"]) .. " " .. trim($verify["stderr"]))
+  print("  VERIFY noded=" .. $verify["value"]["noded"] ..
+    " clients-with-provenance=[" .. join($verify["value"]["clients"], ",") .. "]")
+end
+
+fn deploy_node($host)
+  $remote = $REMOTE[$host]
+  print("")
+  print("[" .. $host .. "] deploy version discovery")
+
+  $reach = ssh_mix($remote, 'print("reach-ok")', {connect_timeout: 8, timeout: 10})
+  $d.die_if(not $reach["ok"] or trim($reach["stdout"]) != "reach-ok",
+    $host .. " unreachable or has no working system Mix: " ..
+    trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+  print("  reachable: Mix OK")
+
+  -- Refuse every backwards binary move before transferring anything.
+  for each $daemon in $DAEMONS
+    $name = $daemon["binary"]
+    $path = "/opt/cosmix/bin/" .. $name
+    $pre = ssh_mix($remote, '
+if is_file($path) then
+  $version = trim(run($path .. " --version"))
+  if $rc != 0 or $version == "" then
+    print($version)
+    exit(7)
+  end
+  print($version)
+end
+', {bindings: {path: $path}, connect_timeout: 8, timeout: 15})
+    $d.die_if(not $pre["ok"],
+      $host .. " could not inspect installed " .. $name .. " version: " .. trim($pre["stderr"]))
+    if trim($pre["stdout"]) != "" then
+      $d.assert_not_downgrade($host .. "/" .. $name, $pre["stdout"],
+        $VERSIONS[$name], $ALLOW_DOWNGRADE)
+    end
+  end
+
+  $mkdirs = ssh_mix($remote, '
+mkdir("/opt/cosmix/bin", {parents: true})
+mkdir("/opt/cosmix/share/cosmix", {parents: true})
+mkdir("/etc/systemd/system", {parents: true})
+print("dirs-ok")
+', {connect_timeout: 8, timeout: 15})
+  $d.die_if(not $mkdirs["ok"] or trim($mkdirs["stdout"]) != "dirs-ok",
+    $host .. " could not prepare install directories: " .. trim($mkdirs["stderr"]))
+
+  -- Install every client first, then the broker binary. Nothing is restarted
+  -- until all four installed artefacts have passed exact version and hash.
+  for each $daemon in $DAEMONS
+    install_binary($host, $remote, $daemon)
+  end
+  print("  binaries installed and verified")
+
+  install_text($host, $remote, $COLLECTOR_DATA, $COLLECTOR_HASH,
+    "/opt/cosmix/share/cosmix/prom_version_collector.mix", 0o755)
+  install_text($host, $remote, $COLLECTOR_SERVICE_DATA, $COLLECTOR_SERVICE_HASH,
+    "/etc/systemd/system/cosmix-version-collector.service", 0o644)
+  install_text($host, $remote, $COLLECTOR_TIMER_DATA, $COLLECTOR_TIMER_HASH,
+    "/etc/systemd/system/cosmix-version-collector.timer", 0o644)
+  print("  collector and units installed: hashes OK")
+
+  $reload = ssh_mix($remote, '
+$out = run("/usr/bin/systemctl daemon-reload")
+if $rc != 0 then
+  print($out)
+  exit(7)
+end
+print("reload-ok")
+', {connect_timeout: 8, timeout: 30})
+  $d.die_if(not $reload["ok"] or trim($reload["stdout"]) != "reload-ok",
+    $host .. " systemd daemon-reload failed: " .. trim($reload["stdout"]) .. " " .. trim($reload["stderr"]))
+
+  for each $client in $CLIENTS
+    restart_service($host, $remote, $client["unit"])
+  end
+  restart_service($host, $remote, "cosmix-noded")
+  print("  daemons restarted client-first, broker last")
+
+  $collector_before = read_invocation($host, $remote,
+    "cosmix-version-collector.service", false)
+  $collector_run = ssh_mix($remote, '
+$out = run("/usr/bin/systemctl enable --now cosmix-version-collector.timer")
+if $rc != 0 then
+  print($out)
+  exit(7)
+end
+$enabled = trim(run("/usr/bin/systemctl is-enabled cosmix-version-collector.timer"))
+if $rc != 0 or $enabled != "enabled" then
+  print($enabled)
+  exit(8)
+end
+$active = trim(run("/usr/bin/systemctl is-active cosmix-version-collector.timer"))
+if $rc != 0 or $active != "active" then
+  print($active)
+  exit(9)
+end
+$out = run("/usr/bin/systemctl start cosmix-version-collector.service")
+if $rc != 0 then
+  print($out)
+  exit(10)
+end
+$result = trim(run("/usr/bin/systemctl show cosmix-version-collector.service -p Result --value"))
+if $rc != 0 or $result != "success" then
+  print($result)
+  exit(11)
+end
+print(data_encode({enabled: $enabled, active: $active, result: $result}))
+', {decode: "data", connect_timeout: 8, timeout: 60})
+  $d.die_if(not $collector_run["ok"],
+    $host .. " collector timer/run failed: " ..
+    trim($collector_run["stdout"]) .. " " .. trim($collector_run["stderr"]))
+  print("  collector timer=" .. $collector_run["value"]["enabled"] ..
+    "/" .. $collector_run["value"]["active"] ..
+    "; run Result=" .. $collector_run["value"]["result"])
+  verify_logging($host, $remote, "cosmix-version-collector.service", $collector_before)
+
+  sleep(3)
+  verify_bus_provenance($host, $remote)
+  print("  [" .. $host .. "] DEPLOY OK")
+end
+
+for each $host in $nodes
+  deploy_node($host)
+end
+
+for each $daemon in $DAEMONS
+  $_remove = run_argv(["rm", "-f", $SNAPSHOTS[$daemon["binary"]]])
+end
+
+print("")
+print("deploy complete: exact versions/hashes, client-first restarts, current-invocation logging, collector and provenance verified on " .. join($nodes, " "))

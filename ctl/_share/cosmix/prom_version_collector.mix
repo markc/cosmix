@@ -1,0 +1,71 @@
+#!/opt/cosmix/bin/mix
+-- Prometheus textfile collector for the ABP version-discovery surface.
+-- Queries the local broker and atomically publishes build provenance for
+-- noded and every registered service.
+
+$TEXTFILE_DIR = env("COSMIX_TEXTFILE_DIR")
+if $TEXTFILE_DIR == nil or $TEXTFILE_DIR == "" then
+  $TEXTFILE_DIR = "/var/lib/cosmix/nodeexport/textfile"
+end
+$OUT = $TEXTFILE_DIR .. "/cosmix_versions.prom"
+
+fn esc($value)
+  if $value == nil then
+    return ""
+  end
+  $text = "" .. $value
+  $text = replace($text, "\\", "\\\\")
+  $text = replace($text, "\"", "\\\"")
+  return replace($text, "\n", "\\n")
+end
+
+fn service_line($node, $service)
+  if type($service) == "string" then
+    return "cosmix_service_build_info{node=\"" .. $node .. "\",service=\"" .. esc($service) .. "\",binary=\"\",version=\"\",git_sha=\"\",build_time=\"\"} 1\n"
+  end
+  $line = "cosmix_service_build_info{node=\"" .. $node .. "\""
+  $line = $line .. ",service=\"" .. esc($service["name"]) .. "\""
+  $line = $line .. ",binary=\"" .. esc($service["binary"]) .. "\""
+  $line = $line .. ",version=\"" .. esc($service["version"]) .. "\""
+  $line = $line .. ",git_sha=\"" .. esc($service["git_sha"]) .. "\""
+  $line = $line .. ",build_time=\"" .. esc($service["build_time"]) .. "\""
+  return $line .. "} 1\n"
+end
+
+send noded noded.info
+if $rc != 0 then
+  print("ERROR: noded.info rc=" .. $rc)
+  exit(1)
+end
+$info = $result
+$node = esc($info["node"])
+
+send noded noded.list
+if $rc != 0 then
+  print("ERROR: noded.list rc=" .. $rc)
+  exit(1)
+end
+$services = $result
+
+$out = "# HELP cosmix_service_build_info Build provenance of a registered cosmix service (value always 1).\n"
+$out = $out .. "# TYPE cosmix_service_build_info gauge\n"
+$noded = $info["noded"]
+if $noded != nil then
+  $out = $out .. service_line($node, $noded)
+end
+for each $service in $services
+  $out = $out .. service_line($node, $service)
+end
+
+$out = $out .. "# HELP cosmix_noded_uptime_seconds Local broker process uptime in seconds.\n"
+$out = $out .. "# TYPE cosmix_noded_uptime_seconds gauge\n"
+$uptime = $info["uptime_s"]
+if $uptime == nil then
+  $uptime = 0
+end
+$out = $out .. "cosmix_noded_uptime_seconds{node=\"" .. $node .. "\"} " .. $uptime .. "\n"
+
+$tmp = $OUT .. ".tmp"
+write_file($tmp, $out)
+rename($tmp, $OUT)
+print("wrote " .. $OUT)

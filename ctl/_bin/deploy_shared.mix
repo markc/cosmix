@@ -1,0 +1,494 @@
+#!/usr/bin/env mix
+-- deploy_shared.mix — publish the shared webd CMS/PIM tree to configured
+-- nodes, then restart webd so its cached handler ASTs cannot remain stale.
+--
+--   mix _bin/deploy_shared.mix                     -- configured defaults
+--   mix _bin/deploy_shared.mix alpha beta          -- configured subset
+--   mix _bin/deploy_shared.mix --allow-downgrade … -- deliberate rollback
+--
+-- The hub-private config owns the permitted/default targets and a monotonic
+-- deploy generation. Mesh addresses come from inventory; foreign roster nodes
+-- use their SSH aliases. The roster rollout order is filtered with hubs last.
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_shared.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no shared-tree deploy config at " .. $CONF_PATH ..
+    " — create it from deploy_shared.conf.mix.example before deploying")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["deploy_shared"], {
+    schema_version: {type: "integer", enum: [1]},
+    deploy_version: {type: "string", nonblank: true},
+    target_nodes: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}},
+    default_nodes: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}}
+  })
+catch $e
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn contains_item($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn assert_unique($items, $field)
+  for each $item in $items
+    $seen = 0
+    for each $candidate in $items
+      if $candidate == $item then
+        $seen = $seen + 1
+      end
+    end
+    if $seen != 1 then
+      config_error("duplicate " .. $field .. " node '" .. $item .. "'")
+    end
+  end
+end
+
+$DEPLOY_VERSION = $CONF["deploy_version"]
+if not regex_match("^[0-9]+([.][0-9]+)+$", $DEPLOY_VERSION) then
+  config_error("deploy_version must be dotted numeric, for example 1.0.0")
+end
+assert_unique($CONF["target_nodes"], "target")
+assert_unique($CONF["default_nodes"], "default")
+for each $node in $CONF["default_nodes"]
+  if not contains_item($CONF["target_nodes"], $node) then
+    config_error("default node '" .. $node .. "' is absent from target_nodes")
+  end
+end
+
+$ROSTER = $d.roster()
+for each $node in $CONF["target_nodes"]
+  $d.assert_node($ROSTER, $node)
+end
+
+$raw_args = args()
+$named = []
+for each $arg in $raw_args
+  if $arg != "--allow-downgrade" then
+    push($named, $arg)
+  end
+end
+$parse_args = $raw_args
+if len($named) == 0 then
+  $parse_args = concat($CONF["default_nodes"], $raw_args)
+end
+$parsed = $d.parse_nodes($ROSTER, $parse_args, ["--allow-downgrade"])
+$selected = $parsed["nodes"]
+$ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
+
+-- Resolve the complete selection before inspecting or packing local assets.
+-- A bad argument, roster, config or inventory cannot touch a node.
+$REMOTE = {}
+for each $node in $selected
+  if not contains_item($CONF["target_nodes"], $node) then
+    config_error("'" .. $node .. "' is not a configured shared-tree target")
+  end
+  if has_key($REMOTE, $node) then
+    config_error("duplicate selected node '" .. $node .. "'")
+  end
+  if $d.is_foreign($ROSTER, $node) then
+    $REMOTE[$node] = $node
+  else
+    $REMOTE[$node] = "root@" .. $d.mesh_ip($node)
+  end
+end
+
+-- rollout_order may omit foreign nodes when the roster has no authored order.
+-- Insert those aliases before the inventory hubs while preserving the library's
+-- canonical mesh order, so a shared web change still reaches hubs last.
+$canonical = $d.rollout_order($ROSTER)
+$hubs = $d.mesh_hubs()
+$nodes = []
+for each $candidate in $canonical
+  if contains_item($selected, $candidate) and not contains_item($hubs, $candidate) then
+    push($nodes, $candidate)
+  end
+end
+for each $node in $selected
+  if $d.is_foreign($ROSTER, $node) and not contains_item($nodes, $node) then
+    push($nodes, $node)
+  end
+end
+for each $candidate in $canonical
+  if contains_item($selected, $candidate) and contains_item($hubs, $candidate) then
+    push($nodes, $candidate)
+  end
+end
+for each $node in $selected
+  if not $d.is_foreign($ROSTER, $node) and not contains_item($nodes, $node) then
+    config_error("selected mesh node '" .. $node .. "' is absent from rollout_order")
+  end
+end
+
+$SRC = $d.cosmix_root() .. "/src/crates/cosmix-webd/vhosts"
+$DST = "/opt/cosmix/vhosts/shared"
+$ARCHIVE_REMOTE = "/tmp/cosmix-shared.tar.gz"
+$STAGE_REMOTE = "/opt/cosmix/vhosts/shared.new"
+$BACKUP_REMOTE = "/opt/cosmix/vhosts/shared.old"
+$MARKER_REMOTE = "/etc/cosmix/webd/shared-deploy-version"
+$UNIT = "cosmix-webd"
+$d.die_if(not is_dir($SRC), "shared webd source tree missing: " .. $SRC)
+
+-- Record every shipped file, its bytes and its normalised read/execute mode.
+-- Symlinks are refused because neither a followed-target hash nor an ignored
+-- link proves the archive tree that webd will include at runtime.
+$MANIFEST = {}
+$walked = walk($SRC, {include_dirs: true, follow_symlinks: false})
+for each $path in $walked
+  $st = stat($path, {follow_symlinks: false})
+  $d.die_if($st["is_symlink"], "shared source tree contains a symlink: " .. $path)
+  if $st["is_file"] then
+    $relative = substr($path, len($SRC) + 1, len($path) - len($SRC) - 1)
+    $mode = band($st["perm"], 0o111) == 0 ? 0o644 : 0o755
+    $MANIFEST[$relative] = {hash: hash_file($path, "sha256"), mode: $mode}
+  end
+end
+$d.die_if(len(keys($MANIFEST)) == 0, "shared webd source tree contains no files: " .. $SRC)
+
+-- Lint every Mix source before the tarball is made; a syntax-broken handler
+-- must not be installed and only discovered after webd restarts.
+for each $relative in keys($MANIFEST)
+  if ends_with($relative, ".mix") then
+    $lint = run_argv([$d.mix_bin(), "lint", "--deny-warnings", $SRC .. "/" .. $relative])
+    $d.die_if($lint["exit_code"] != 0,
+      "shared source lint failed for " .. $relative .. ": " .. trim($lint["stdout"]) .. " " .. trim($lint["stderr"]))
+  end
+end
+
+$mk = run_argv(["mktemp", "/tmp/cosmix-shared-XXXXXXXX.tar.gz"])
+$d.die_if($mk["exit_code"] != 0 or trim($mk["stdout"]) == "",
+  "mktemp failed for shared archive: " .. trim($mk["stderr"]))
+$ARCHIVE = trim($mk["stdout"])
+$pack = run_argv(["tar", "-C", $SRC, "-czf", $ARCHIVE, "."], {timeout: 120})
+$d.die_if($pack["exit_code"] != 0, "shared tree tar failed: " .. trim($pack["stderr"]))
+$ARCHIVE_HASH = hash_file($ARCHIVE, "sha256")
+print("shared tree: " .. len(keys($MANIFEST)) .. " files, lint OK, archive " .. $ARCHIVE_HASH)
+print("rollout order: " .. join($nodes, " "))
+
+fn scp_archive($node, $remote)
+  $args = [
+    "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+    $ARCHIVE, $remote .. ":" .. $ARCHIVE_REMOTE
+  ]
+  $copy_result = run_argv(concat(["scp"], $args), {timeout: 120})
+  if $copy_result["exit_code"] != 0 and $d.is_foreign($ROSTER, $node) then
+    print("  scp (sftp mode) failed, retrying with -O: " .. trim($copy_result["stderr"]))
+    $copy_result = run_argv(concat(["scp", "-O"], $args), {timeout: 120})
+  end
+  $d.die_if($copy_result["exit_code"] != 0,
+    "scp archive -> " .. $node .. ": " .. trim($copy_result["stderr"]))
+end
+
+fn verify_logging($node, $remote, $previous_invocation)
+  $attempt = 0
+  while $attempt < 4
+    $probe = ssh_mix($remote, '
+$iid = trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value"))
+if $rc != 0 or $iid == "" then
+  exit(7)
+end
+$logs = trim(run("/usr/bin/journalctl _SYSTEMD_INVOCATION_ID=" .. $iid .. " -o cat --no-pager"))
+if $rc != 0 then
+  exit(8)
+end
+$lines = 0
+if $logs != "" then
+  $lines = len(split($logs, "\n"))
+end
+print(data_encode({invocation_id: $iid, lines: $lines}))
+', {bindings: {unit: $UNIT}, decode: "data", connect_timeout: 8, timeout: 15})
+    if $probe["ok"] then
+      $current = $probe["value"]["invocation_id"]
+      $d.die_if($previous_invocation != "" and $current == $previous_invocation,
+        $node .. " webd invocation did not change after restart")
+      $lines = $probe["value"]["lines"]
+      if $lines >= 1 then
+        print("  logging verified (" .. $lines .. " line/s, current invocation)")
+        return nil
+      end
+    end
+    $attempt = $attempt + 1
+    if $attempt < 4 then
+      sleep(1)
+    end
+  end
+  $d.die_if(true,
+    $node .. " cosmix-webd is active but has zero journald lines for the current invocation")
+end
+
+fn deploy_node($node)
+  $remote = $REMOTE[$node]
+  print("")
+  print("[" .. $node .. "] deploy shared webd tree " .. $DEPLOY_VERSION)
+
+  $challenge = uuid()
+  $reach = ssh_mix($remote, 'print($challenge)',
+    {bindings: {challenge: $challenge}, connect_timeout: 8, timeout: 10})
+  $d.die_if(not $reach["ok"] or trim($reach["stdout"]) != $challenge,
+    $node .. " unreachable or /opt/cosmix/bin/mix is not working: " ..
+      trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+  print("  reachability challenge: OK")
+
+  $pre = ssh_mix($remote, '
+if is_file($marker) then
+  $lines = read_lines($marker)
+  if len($lines) < 2 or trim($lines[0]) == "" or
+      not regex_match("^[0-9]+([.][0-9]+)+$", trim($lines[0])) then
+    eprint("installed shared-tree marker is malformed")
+    exit(7)
+  end
+  print(trim($lines[0]))
+end
+', {bindings: {marker: $MARKER_REMOTE}, connect_timeout: 8, timeout: 10})
+  $d.die_if(not $pre["ok"],
+    $node .. " could not inspect installed shared-tree generation: " .. trim($pre["stderr"]))
+  if trim($pre["stdout"]) != "" then
+    $d.assert_not_downgrade($node, trim($pre["stdout"]), $DEPLOY_VERSION, $ALLOW_DOWNGRADE)
+  end
+
+  $prereq = ssh_mix($remote, '
+if not is_file("/opt/cosmix/bin/mix") then
+  eprint("installed mix is absent")
+  exit(7)
+end
+if not is_file("/usr/bin/tar") then
+  eprint("/usr/bin/tar is absent")
+  exit(8)
+end
+$group = trim(run("/usr/bin/getent group cosmix-webd"))
+if $rc != 0 or $group == "" then
+  eprint("cosmix-webd group is absent")
+  exit(9)
+end
+print($group)
+', {connect_timeout: 8, timeout: 10})
+  $d.die_if(not $prereq["ok"],
+    $node .. " prerequisite check failed: " .. trim($prereq["stdout"]) .. " " .. trim($prereq["stderr"]))
+  print("  prerequisites: mix + tar + webd group")
+
+  $before = ssh_mix($remote, '
+$iid = trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value"))
+if $rc == 0 then
+  print($iid)
+end
+', {bindings: {unit: $UNIT}, connect_timeout: 8, timeout: 10})
+  $d.die_if(not $before["ok"],
+    $node .. " could not read the pre-restart webd invocation: " .. trim($before["stderr"]))
+  $previous_invocation = $before["ok"] ? trim($before["stdout"]) : ""
+
+  $clean = ssh_mix($remote, '
+fn remove_any($path)
+  if exists($path, {follow_symlinks: false}) then
+    $st = stat($path, {follow_symlinks: false})
+    if $st["is_dir"] and not $st["is_symlink"] then
+      remove_dir($path)
+    else
+      remove($path)
+    end
+  end
+end
+mkdir("/opt/cosmix/vhosts", {parents: true})
+remove_any($archive)
+remove_any($stage)
+remove_any($backup)
+print("stage-ready")
+', {bindings: {archive: $ARCHIVE_REMOTE, stage: $STAGE_REMOTE, backup: $BACKUP_REMOTE},
+      connect_timeout: 8, timeout: 15})
+  $d.die_if(not $clean["ok"] or trim($clean["stdout"]) != "stage-ready",
+    $node .. " could not prepare remote staging paths: " .. trim($clean["stderr"]))
+
+  scp_archive($node, $remote)
+
+  -- Extract to a sibling directory, prove every file hash and mode, then swap
+  -- the complete tree. The old tree is restored if the final rename fails.
+  $install = ssh_mix($remote, '
+fn tree_manifest($root)
+  $result = {}
+  for each $path in walk($root, {follow_symlinks: false})
+    $st = stat($path, {follow_symlinks: false})
+    if not $st["is_file"] or $st["is_symlink"] then
+      eprint("unexpected non-file in shared tree: " .. $path)
+      exit(7)
+    end
+    $relative = substr($path, len($root) + 1, len($path) - len($root) - 1)
+    $result[$relative] = {hash: hash_file($path, "sha256"), mode: $st["perm"]}
+  end
+  return $result
+end
+
+if hash_file($archive, "sha256") != $archive_hash then
+  eprint("transferred archive hash mismatch")
+  exit(8)
+end
+mkdir($stage, {parents: false})
+$tar_out = run("/usr/bin/tar -C /opt/cosmix/vhosts/shared.new -xzf /tmp/cosmix-shared.tar.gz")
+if $rc != 0 then
+  print($tar_out)
+  exit(9)
+end
+$group = trim(run("/usr/bin/getent group cosmix-webd"))
+$parts = split($group, ":")
+if $rc != 0 or len($parts) < 3 or not regex_match("^[0-9]+$", $parts[2]) then
+  eprint("could not resolve cosmix-webd gid")
+  exit(10)
+end
+$gid = to_number($parts[2])
+chown($stage, 0, $gid)
+chmod($stage, 0o755)
+for each $path in walk($stage, {include_dirs: true, follow_symlinks: false})
+  $st = stat($path, {follow_symlinks: false})
+  if $st["is_symlink"] then
+    eprint("archive contains a symlink: " .. $path)
+    exit(11)
+  end
+  chown($path, 0, $gid)
+  if $st["is_dir"] then
+    chmod($path, 0o755)
+  else
+    $relative = substr($path, len($stage) + 1, len($path) - len($stage) - 1)
+    if not has_key($manifest, $relative) then
+      eprint("archive contains unexpected file: " .. $relative)
+      exit(12)
+    end
+    chmod($path, $manifest[$relative]["mode"])
+  end
+end
+if tree_manifest($stage) != $manifest then
+  eprint("staged shared-tree manifest mismatch")
+  exit(13)
+end
+if exists($dst, {follow_symlinks: false}) then
+  $dst_st = stat($dst, {follow_symlinks: false})
+  if not $dst_st["is_dir"] or $dst_st["is_symlink"] then
+    eprint("shared destination is not a real directory")
+    exit(14)
+  end
+  rename($dst, $backup)
+end
+try
+  rename($stage, $dst)
+catch $e
+  if is_dir($backup) then
+    rename($backup, $dst)
+  end
+  raise("SHARED_TREE_SWAP", "could not install shared tree: " .. $e)
+end
+if is_dir($backup) then
+  remove_dir($backup)
+end
+mkdir(dirname($marker), {parents: true})
+$marker_tmp = $marker .. ".new"
+write_file($marker_tmp, $version .. "\n" .. $archive_hash .. "\n")
+chmod($marker_tmp, 0o644)
+chown($marker_tmp, 0, 0)
+rename($marker_tmp, $marker)
+remove($archive)
+$installed_manifest = tree_manifest($dst)
+if $installed_manifest != $manifest then
+  eprint("installed shared-tree manifest mismatch")
+  exit(15)
+end
+$marker_lines = read_lines($marker)
+print(data_encode({
+  version: $marker_lines[0],
+  archive_hash: $marker_lines[1],
+  files: len(keys($installed_manifest))
+}))
+', {
+    bindings: {
+      archive: $ARCHIVE_REMOTE,
+      archive_hash: $ARCHIVE_HASH,
+      stage: $STAGE_REMOTE,
+      backup: $BACKUP_REMOTE,
+      dst: $DST,
+      marker: $MARKER_REMOTE,
+      version: $DEPLOY_VERSION,
+      manifest: $MANIFEST
+    },
+    decode: "data", connect_timeout: 8, timeout: 120
+  })
+  $d.die_if(not $install["ok"],
+    $node .. " shared-tree install failed: " .. trim($install["stdout"]) .. " " .. trim($install["stderr"]))
+  $d.die_if($install["value"]["version"] != $DEPLOY_VERSION,
+    $node .. " installed shared-tree generation mismatch")
+  $d.die_if($install["value"]["archive_hash"] != $ARCHIVE_HASH,
+    $node .. " installed shared-tree archive hash mismatch")
+  $d.die_if($install["value"]["files"] != len(keys($MANIFEST)),
+    $node .. " installed shared-tree file count mismatch")
+  print("  installed: generation, archive hash and " .. $install["value"]["files"] .. " file hashes OK")
+
+  $restart = ssh_mix($remote, '
+$out = run("/usr/bin/systemctl restart " .. $unit)
+if $rc != 0 then
+  print($out)
+  exit(7)
+end
+sleep(2)
+$out = trim(run("/usr/bin/systemctl is-active " .. $unit))
+if $rc != 0 or $out != "active" then
+  print($out)
+  exit(8)
+end
+print($out)
+', {bindings: {unit: $UNIT}, connect_timeout: 8, timeout: 30})
+  if not $restart["ok"] then
+    print("  restart failed; last 40 log lines:")
+    $journal = ssh_mix($remote,
+      'print(run("/usr/bin/journalctl -u " .. $unit .. " -n 40 --no-pager"))',
+      {bindings: {unit: $UNIT}, connect_timeout: 8, timeout: 15})
+    print($journal["stdout"])
+    print($journal["stderr"])
+  end
+  $d.die_if(not $restart["ok"],
+    $node .. " webd restart/is-active failed: " .. trim($restart["stdout"]) .. " " .. trim($restart["stderr"]))
+  print("  webd active: " .. trim($restart["stdout"]))
+
+  verify_logging($node, $remote, $previous_invocation)
+
+  $smoke = ssh_mix($remote, '
+send webd webd.stats
+if $rc != 0 then
+  print("send rc=" .. $rc)
+  exit(7)
+end
+print("" .. $result)
+', {connect_timeout: 8, timeout: 15})
+  $d.die_if(not $smoke["ok"],
+    $node .. " BUS webd.stats smoke failed: " .. trim($smoke["stdout"]) .. " " .. trim($smoke["stderr"]))
+  $body = trim($smoke["stdout"])
+  $d.die_if($body == "" or (not contains($body, "vhosts") and not contains($body, "count")),
+    $node .. " BUS webd.stats returned an unexpected body: " .. $body)
+  print("  BUS webd.stats: " .. $body)
+  print("  [" .. $node .. "] DEPLOY OK")
+end
+
+-- Serialize deployments that replace shared handlers and restart a mesh
+-- citizen. All config, inventory and local-asset gates run before the lock.
+$_lock = $m.mesh_take_write_lock("deploy_shared")
+for each $node in $nodes
+  deploy_node($node)
+end
+remove($ARCHIVE)
+
+print("")
+print("deploy complete: shared generation/archive/file hashes, new webd invocation, current-invocation logging and BUS smoke verified on " .. join($nodes, " "))

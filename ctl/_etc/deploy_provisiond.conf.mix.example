@@ -1,0 +1,26 @@
+-- deploy_provisiond.conf.mix.example — private provisiond target and trust seam.
+-- Copy this file to deploy_provisiond.conf.mix in the private control hub and
+-- replace every placeholder. target_node must exist in the fleet roster. It
+-- may be a mesh or foreign node; foreign nodes are reached by their SSH alias.
+deploy_provisiond: {
+  schema_version: 1,
+  target_node: "alpha",
+  base_url: "https://provision.example.org",
+  database: "/srv/provision.example.org/web/data/cms.db",
+  operator_known_hosts: "/home/user/.ssh/known_hosts",
+  authorised_keys_from: "192.0.2.10",
+  ssh_hosts: [
+    {
+      name: "beta",
+      aliases: ["beta", "beta.example.org"],
+      address: "192.0.2.20",
+      verify_address: "192.0.2.20"
+    },
+    {
+      name: "gamma",
+      aliases: ["gamma", "gamma.example.org"],
+      address: "192.0.2.30",
+      verify_address: "192.0.2.30"
+    }
+  ]
+}

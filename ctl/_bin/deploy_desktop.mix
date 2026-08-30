@@ -1,5 +1,5 @@
 #!/usr/bin/env mix
--- deploy_desktop.mix — build + install the CosMix Desktop apps on the target node.
+-- deploy_desktop.mix — build + install the CosMix Desktop apps on one configured workstation.
 --
 -- Scheme: $COSMIX/src/desktop/APPS.md (slug-spine identity canon).
 -- Per-app identifiers all derive from the component slug recorded in
@@ -10,16 +10,15 @@
 -- Desktop entries are GENERATED from cargo metadata (display name, slug) —
 -- the manifest is the single source of identity.
 --
--- Safety (per the codex review that shaped this): the build runs
+-- Safety: the build runs
 -- UNPRIVILEGED; artifact paths come from cargo --message-format=json
 -- compiler-artifact records (never guessed from target/release/<name>);
 -- everything stages to a temp tree and is validated before any root copy;
--- root actions go via `ssh the target node` (passwordless root, mix login shell —
--- local sudo would hang on a password). An install manifest is written to
+-- root actions go through ssh_mix to the configured roster node. An install manifest is written to
 -- /opt/cosmix/share/cosmix-desktop.manifest with every installed path for a
 -- separately reviewed future uninstall; this deployer never removes root files.
 --
--- Local-machine only (the target node): GUI apps aren't fleet-deployed.
+-- Workstation-only: GUI apps are not fleet-deployed.
 --
 -- usage: mix deploy_desktop.mix [--no-build] [--only <slug[,slug...]>]
 
@@ -30,17 +29,18 @@ if not is_file($CONF_PATH) then
   print("  ERROR: no desktop deploy config at " .. $CONF_PATH .. " — create it from deploy_desktop.conf.mix.example")
   exit(2)
 end
-$CONF = load_data($CONF_PATH)
-validate($CONF, {
-  "deploy_desktop": {
-    "type": "map",
-    "required": true,
-    "schema": {
-      "target_node": {"type": "string", "nonblank": true}
-    }
-  }
-})
-$TARGET = $CONF["deploy_desktop"]["target_node"]
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["deploy_desktop"], {
+    schema_version: {type: "integer", enum: [1]},
+    target_node: {type: "string", nonblank: true}
+  })
+catch $e
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+  exit(2)
+end
+$TARGET = $CONF["target_node"]
 $ROSTER = $d.roster()
 $d.assert_node($ROSTER, $TARGET)
 
@@ -214,29 +214,66 @@ function parse_options($argv, $valid_slugs)
   return { "no_build": $no_build, "partial": $only_raw != nil, "slugs": $selected_slugs, "apps": $selected_apps }
 end
 
--- Mix deadlines are SECONDS, not milliseconds (`mix man system`: "timeout
--- (seconds, default 30)"). These were written as milliseconds, which asked for
--- deadlines of 8h20m here and 41 days on the build -- a hung root command would
--- have held the deploy flock for a third of a day instead of failing in 30s.
-function croot($cmd)
-  $r = ssh_run($TARGET, $cmd, { "timeout": 30 })
-  if not $r["ok"] then
-    fail("root step failed: " .. $cmd .. " :: " .. trim($r["stderr"]))
+-- Remote file operations stay in Mix. Values cross the ssh boundary only as
+-- strict-data bindings; the source is always a single-quoted Mix literal.
+function root_mkdir($paths, $mode)
+  $r = ssh_mix($TARGET, '
+for each $path in $paths
+  mkdir($path, {parents: true})
+  chown($path, 0, 0)
+  chmod($path, $mode)
+end
+print("mkdir-ok")
+', {bindings: {paths: $paths, mode: $mode}, timeout: 30})
+  if not $r["ok"] or not contains($r["stdout"], "mkdir-ok") then
+    fail("root mkdir failed for " .. join($paths, ", ") .. ": " .. trim($r["stderr"]))
   end
-  return $r
+end
+
+function root_install($source, $destination, $mode)
+  $r = ssh_mix($TARGET, '
+copy($source, $destination)
+chown($destination, 0, 0)
+chmod($destination, $mode)
+print("install-ok")
+', {bindings: {source: $source, destination: $destination, mode: $mode}, timeout: 30})
+  if not $r["ok"] or not contains($r["stdout"], "install-ok") then
+    fail("root install failed: " .. $source .. " -> " .. $destination .. ": " .. trim($r["stderr"]))
+  end
+end
+
+function root_publish($source, $temporary, $destination, $mode)
+  $r = ssh_mix($TARGET, '
+copy($source, $temporary)
+chown($temporary, 0, 0)
+chmod($temporary, $mode)
+rename($temporary, $destination)
+print("publish-ok")
+', {bindings: {source: $source, temporary: $temporary, destination: $destination, mode: $mode}, timeout: 30})
+  if not $r["ok"] or not contains($r["stdout"], "publish-ok") then
+    fail("root atomic publish failed: " .. $source .. " -> " .. $destination .. ": " .. trim($r["stderr"]))
+  end
+end
+
+function root_remove_dir($path)
+  $r = ssh_mix($TARGET, '
+remove_dir($path)
+print("remove-ok")
+', {bindings: {path: $path}, timeout: 30})
+  if not $r["ok"] or not contains($r["stdout"], "remove-ok") then
+    fail("root scratch cleanup failed for " .. $path .. ": " .. trim($r["stderr"]))
+  end
 end
 
 -- Verify a path chain is root-private BEFORE root creates or writes anything
--- through it. "Root-private" is three separate properties, and the cold review
--- of 2026-07-28 (#3) found each of them missing in turn:
+-- through it. "Root-private" is three separate properties:
 --
 --   1. every component is a real directory, not a symlink -- O_NOFOLLOW on the
 --      final open says nothing about the ancestors it walked to get there;
 --   2. every component is owned by uid 0;
 --   3. no component is writable by anyone but its owner -- root-owned 0777 is
 --      root-owned and still lets the invoking user swap the next component.
---      Group/other bits are checked by find itself (-perm /022, no octal
---      parsing to get wrong), and NAMED ACL entries granting write are checked
+--      Group/other mode bits and NAMED ACL entries granting write are checked
 --      separately because a mode of 0755 hides them completely.
 --
 -- Verification must come BEFORE repair, not after: GNU `install -d` follows an
@@ -248,35 +285,23 @@ end
 -- Fail-closed throughout: an unclassifiable component, a missing getfacl, or
 -- any probe error refuses the run. This gate protects a privileged write path;
 -- "could not tell" is not "fine".
--- Classify one component. Absence must be distinguishable from probe failure,
--- and `find <missing>` cannot do that: it exits 1 for a missing starting point,
--- which a fail-closed caller cannot tell from a broken probe. So every
--- component below the root is classified by LISTING ITS ALREADY-VERIFIED
--- PARENT -- that exits 0 whether or not the child exists, making empty output
--- mean "absent" and nothing else. Returns "" for absent (cold review
--- 2026-07-28, #3 round 7: the create-last branch was unreachable, so a first
--- deploy on a machine with no /opt/cosmix/share aborted instead of bootstrapping).
-function classify_component($p, $parent)
-  if $parent == nil then
-    $probe = ssh_run($TARGET, "find -P " .. shell_quote($p) .. " -maxdepth 0 -printf '%y\t%U\n'", { "timeout": 30 })
-    if not get_or($probe, "ok", false) then
-      fail("privileged-path probe of " .. $p .. " failed: " .. trim(get_or($probe, "stderr", "")) .. "\n  refusing to write through an unaudited path.")
-    end
-    return trim(get_or($probe, "stdout", ""))
+-- Classify one component without opening it through a shell command.
+function classify_component($p)
+  $probe = ssh_mix($TARGET, '
+if not exists($path, {follow_symlinks: false}) then
+  print(data_encode({present: false}))
+else
+  $info = stat($path, {follow_symlinks: false})
+  $kind = $info["is_dir"] ? "d" : ($info["is_file"] ? "f" : ($info["is_symlink"] ? "l" : "other"))
+  $acl = run("getfacl -c -p -- " .. $path)
+  print(data_encode({present: true, kind: $kind, uid: $info["uid"], perm: $info["perm"], acl: $acl}))
+end
+', {bindings: {path: $p}, decode: "data", timeout: 30})
+  if not $probe["ok"] or $probe["value"] == nil then
+    fail("privileged-path probe of " .. $p .. " failed: " .. trim($probe["stderr"]) ..
+      "\n  refusing to write through an unaudited path.")
   end
-  $base = basename($p)
-  -- -name takes a glob. These chains are fixed literals today, but a metachar
-  -- would silently turn an exact check into a pattern match, so refuse instead.
-  for each $meta in ["*", "?", "[", "]", "\\"]
-    if contains($base, $meta) then
-      fail("privileged path component " .. $p .. " contains the glob metacharacter '" .. $meta .. "';\n  this gate matches names exactly and will not pattern-match a privileged path. Refusing.")
-    end
-  end
-  $probe = ssh_run($TARGET, "find -P " .. shell_quote($parent) .. " -mindepth 1 -maxdepth 1 -name " .. shell_quote($base) .. " -printf '%y\t%U\n'", { "timeout": 30 })
-  if not get_or($probe, "ok", false) then
-    fail("privileged-path probe of " .. $p .. " (via its parent " .. $parent .. ") failed: " .. trim(get_or($probe, "stderr", "")) .. "\n  refusing to write through an unaudited path.")
-  end
-  return trim(get_or($probe, "stdout", ""))
+  return $probe["value"]
 end
 
 function assert_root_private_chain($paths, $create_last)
@@ -288,29 +313,25 @@ function assert_root_private_chain($paths, $create_last)
     if $parent != nil and dirname($p) != $parent then
       fail("privileged path chain is malformed: " .. $p .. " is not a child of " .. $parent .. ";\n  refusing to verify a chain whose parent relationships do not hold.")
     end
-    $out = classify_component($p, $parent)
-    if $out == "" then
+    $out = classify_component($p)
+    if not $out["present"] then
       if $p == $last and $create_last then
         -- The parent passed on this same pass, so creating the leaf here cannot
         -- be steered through a symlinked ancestor.
-        croot("install -d -o 0 -g 0 -m 0755 " .. shell_quote($p))
-        $out = classify_component($p, $parent)
-        if $out == "" then
+        root_mkdir([$p], 0o755)
+        $out = classify_component($p)
+        if not $out["present"] then
           fail("created " .. $p .. " but it is still not classifiable; refusing.")
         end
       else
         fail("privileged path component " .. $p .. " is missing;\n  refusing to write through a path this deployer cannot verify.")
       end
     end
-    $parts = split($out, "\t")
-    if length($parts) != 2 then
-      fail("privileged-path probe of " .. $p .. " returned '" .. $out .. "'; refusing.")
+    if $out["kind"] != "d" then
+      fail("privileged path component " .. $p .. " is type '" .. $out["kind"] .. "', not a real directory;\n  an unprivileged account can steer root through it. Refusing.")
     end
-    if $parts[0] != "d" then
-      fail("privileged path component " .. $p .. " is type '" .. $parts[0] .. "', not a real directory;\n  an unprivileged account can steer root through it. Refusing.")
-    end
-    if $parts[1] != "0" then
-      fail("privileged path component " .. $p .. " is owned by uid " .. $parts[1] .. ", not root;\n  its owner can replace the next component. Refusing.")
+    if $out["uid"] != 0 then
+      fail("privileged path component " .. $p .. " is owned by uid " .. $out["uid"] .. ", not root;\n  its owner can replace the next component. Refusing.")
     end
     -- ACLs are checked BEFORE the mode bits, for the diagnostic rather than for
     -- coverage: on POSIX ACLs a named entry with effective write forces the mask
@@ -328,11 +349,7 @@ function assert_root_private_chain($paths, $create_last)
     -- round 7), so `-E` is deliberately NOT passed here: the annotation is the
     -- answer, and where it is absent the raw perms already are the effective
     -- ones.
-    $aprobe = ssh_run($TARGET, "getfacl -c -p -- " .. shell_quote($p), { "timeout": 30 })
-    if not get_or($aprobe, "ok", false) then
-      fail("ACL probe of " .. $p .. " failed (is acl installed?): " .. trim(get_or($aprobe, "stderr", "")) .. "\n  a named ACL entry can hide in the mode bits, so this cannot be skipped. Refusing.")
-    end
-    for each $line in split(trim(get_or($aprobe, "stdout", "")), "\n")
+    for each $line in split(trim($out["acl"]), "\n")
       $l = trim($line)
       -- Named entries only: "user:NAME:perms" / "group:NAME:perms". The owning
       -- entries "user::" and "group::" have an empty name and are already
@@ -351,11 +368,7 @@ function assert_root_private_chain($paths, $create_last)
         end
       end
     end
-    $wprobe = ssh_run($TARGET, "find -P " .. shell_quote($p) .. " -maxdepth 0 -perm /022 -printf 'W\n'", { "timeout": 30 })
-    if not get_or($wprobe, "ok", false) then
-      fail("write-permission probe of " .. $p .. " failed: " .. trim(get_or($wprobe, "stderr", "")) .. "\n  refusing.")
-    end
-    if trim(get_or($wprobe, "stdout", "")) != "" then
+    if band($out["perm"], 0o022) != 0 then
       fail("privileged path component " .. $p .. " is group- or world-writable;\n  root ownership does not stop a non-owner replacing the next component. Refusing.")
     end
     -- Only now is $p proven root-private, so only now may it serve as the
@@ -949,18 +962,9 @@ function write_manifest($manifest_data, $stage_dir)
   $manifest_data["shared"] = sort(unique(concat($manifest_data["shared"], [$MANIFEST, $tmp])))
   $mf = "# cosmix-desktop install manifest — written by deploy_desktop.mix\n" .. data_encode($manifest_data, true) .. "\n"
   write_file($stage_dir .. "/manifest.mix", $mf)
-  croot("install -T -o 0 -g 0 -m 0644 " .. shell_quote($stage_dir .. "/manifest.mix") .. " " .. shell_quote($tmp))
-  -- mv -fT across the same directory is rename(2): atomic, and it cannot leave
-  -- the target absent even for an instant.
-  --
-  -- -T (--no-target-directory) is load-bearing, not decoration. Plain `mv -f
-  -- FILE DIR` does NOT replace DIR -- it succeeds by moving FILE *inside* it
-  -- (verified). So with a directory at $MANIFEST the manifest was written to
-  -- $MANIFEST/cosmix-desktop.manifest.new, mv reported success, and the deploy
-  -- completed leaving no readable inventory at all. -T makes that case an
-  -- error instead of a silent misfile; load_existing_manifest refuses it
-  -- earlier, and this is the second line of defence.
-  croot("mv -fT " .. shell_quote($tmp) .. " " .. shell_quote($MANIFEST))
+  -- The sibling rename is atomic: the old manifest remains intact until the
+  -- complete new one replaces it. A directory at the destination is refused.
+  root_publish($stage_dir .. "/manifest.mix", $tmp, $MANIFEST, 0o644)
 end
 
 -- Two concurrent runs share one fixed stage path and read-modify-write one
@@ -1054,9 +1058,22 @@ for each $cslug in $PLASMOID_SELECTED
   push($SELECTED_APPS_ALL, "cosmix-" .. $cslug)
 end
 
+-- Reachability and privilege are checked after local argument/config parsing,
+-- but before metadata, builds, staging, locks, or privileged writes.
+$reach = ssh_mix($TARGET, '
+print(data_encode({reach: "reach-ok", uid: uid()}))
+', {bindings: {}, decode: "data", connect_timeout: 8, timeout: 10})
+$d.die_if(not $reach["ok"] or $reach["value"] == nil or $reach["value"]["reach"] != "reach-ok",
+  $TARGET .. " is unreachable through ssh_mix: " .. trim($reach["stderr"]))
+$d.die_if($reach["value"]["uid"] != 0,
+  $TARGET .. " ssh alias is not root; privileged desktop install requires uid 0")
+
 -- 1. Read the workspace metadata; collect the [package.metadata.cosmix] apps.
-$md_raw = run_argv_must(["cargo", "metadata", "--no-deps", "--format-version", "1"], { "cwd": $DESKTOP, "timeout": 120 })
-$md = json_parse($md_raw)
+$md_run = run_argv(["cargo", "metadata", "--no-deps", "--format-version", "1"], {cwd: $DESKTOP, timeout: 120})
+if $md_run["exit_code"] != 0 then
+  fail("cargo metadata failed: " .. trim($md_run["stderr"]))
+end
+$md = json_parse($md_run["stdout"])
 $apps = {}
 for each $pkg in $md["packages"]
   if contains($APPS, $pkg["name"]) then
@@ -1208,8 +1225,7 @@ if length($APPS) == 0 then
 elif $no_build then
   for each $name in $APPS
     $p = $DESKTOP .. "/target/release/" .. $name
-    $t = run_rc("test -x " .. shell_quote($p))
-    if $t["rc"] != 0 then
+    if not is_file($p) or not access($p, "x") then
       fail("--no-build but no existing binary at " .. $p)
     end
     $bins[$name] = $p
@@ -1232,7 +1248,7 @@ else
   end
   print "building the full Rust set (invocation-invariant -p unification); installing " .. join($APPS, " + ") .. "…"
   $out = run_argv($args, { "cwd": $DESKTOP, "timeout": 3600, "max_output": 0 })
-  if not $out["ok"] then
+  if $out["exit_code"] != 0 then
     fail("cargo build failed (exit " .. $out["exit_code"] .. "):\n" .. $out["stderr"])
   end
   for each $line in split($out["stdout"], "\n")
@@ -1256,10 +1272,7 @@ end
 -- 3. Stage: generated .desktop entries + hicolor icons; validate before install.
 -- $stage and the lock were established in the preflight, before the manifest
 -- was read.
-$rmres = run_rc("rm -rf " .. shell_quote($stage))
-if $rmres["rc"] != 0 then
-  fail("could not clear stage dir " .. $stage)
-end
+remove_dir($stage)
 mkdir($stage)
 $installed = []
 $icon_installs = []
@@ -1284,8 +1297,8 @@ for each $name in $APPS
     $dt = "[Desktop Entry]\nType=Application\nName=" .. $apps[$name]["display"] .. "\nExec=" .. $BIN_DEST .. "/" .. $name .. "\nIcon=" .. $appid .. "\nStartupWMClass=" .. $appid .. "\nCategories=" .. get_or($CATEGORIES, $slug, "Utility;") .. "\nTerminal=false\n"
     $dtpath = $stage .. "/" .. $appid .. ".desktop"
     write_file($dtpath, $dt)
-    $v = run_rc("desktop-file-validate " .. shell_quote($dtpath))
-    if $v["rc"] != 0 then
+    $v = run_argv(["desktop-file-validate", $dtpath], {timeout: 30})
+    if $v["exit_code"] != 0 then
       if contains($v["stderr"], "not found") or contains($v["stderr"], "No such file") then
         print "WARN: desktop-file-validate unavailable — skipping validation"
       else
@@ -1419,7 +1432,7 @@ $icon_names = sort(unique($icon_names))
 -- Cargo crate; its build/stage contract lives at apps/plasmoid/DEPLOY.md in the
 -- desktop tree. Same discipline as the Rust lane: build and test unprivileged,
 -- stage, validate the staged bytes, and only after the manifest claims them let
--- croot() touch the root filesystem. --no-build is a cargo concern: the CMake
+-- privileged Mix operations touch the root filesystem. --no-build is a cargo concern: the CMake
 -- lane always runs, because an incremental ninja rebuild is cheap and a stale
 -- plugin against a fresh QML tree is exactly the mismatch staging exists to
 -- prevent.
@@ -1435,15 +1448,15 @@ for each $pslug in $PLASMOID_SELECTED
   -- gate that catches a package whose private QML module cannot load (QML
   -- errors render in the applet window, so no stderr/liveness check sees them).
   $r = run_argv(["cmake", "-S", $psrc, "-B", $pbuild, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_TESTING=ON", "-DCMAKE_INSTALL_PREFIX=/usr/local"], { "timeout": 300, "max_output": 0 })
-  if not $r["ok"] then
+  if $r["exit_code"] != 0 then
     fail("cmake configure failed for " .. $appid .. " (exit " .. $r["exit_code"] .. "):\n" .. $r["stderr"])
   end
   $r = run_argv(["cmake", "--build", $pbuild], { "timeout": 1800, "max_output": 0 })
-  if not $r["ok"] then
+  if $r["exit_code"] != 0 then
     fail("cmake build failed for " .. $appid .. " (exit " .. $r["exit_code"] .. "):\n" .. $r["stderr"])
   end
   $r = run_argv(["ctest", "--test-dir", $pbuild, "--output-on-failure"], { "timeout": 600, "max_output": 0 })
-  if not $r["ok"] then
+  if $r["exit_code"] != 0 then
     fail("ctest failed for " .. $appid .. ":\n" .. $r["stdout"] .. $r["stderr"])
   end
   -- Stage with DESTDIR, then validate the tree before anything root-owned
@@ -1453,10 +1466,14 @@ for each $pslug in $PLASMOID_SELECTED
   $proot = $stage .. "/" .. $pslug .. "-root"
   $prel = "usr/local/share/plasma/plasmoids/" .. $appid
   $r = run_argv(["cmake", "--install", $pbuild], { "timeout": 120, "max_output": 0, "env": { "DESTDIR": $proot } })
-  if not $r["ok"] then
+  if $r["exit_code"] != 0 then
     fail("cmake --install (staged) failed for " .. $appid .. ":\n" .. $r["stderr"])
   end
-  $ftype_out = run_argv_must(["find", $proot, "-mindepth", "1", "-printf", "%y\t%P\n"], { "timeout": 30 })
+  $ftype_run = run_argv(["find", $proot, "-mindepth", "1", "-printf", "%y\t%P\n"], {timeout: 30})
+  if $ftype_run["exit_code"] != 0 then
+    fail("could not enumerate staged " .. $appid .. ": " .. trim($ftype_run["stderr"]))
+  end
+  $ftype_out = $ftype_run["stdout"]
   $staged_rel = []
   for each $line in split(trim($ftype_out), "\n")
     $parts = split($line, "\t")
@@ -1502,7 +1519,11 @@ for each $pslug in $PLASMOID_SELECTED
   -- login, as a broken applet.
   for each $rel in $staged_rel
     if ends_with($rel, ".so") then
-      $ldd_out = run_argv_must(["ldd", $proot .. "/" .. $rel], { "timeout": 30 })
+      $ldd_run = run_argv(["ldd", $proot .. "/" .. $rel], {timeout: 30})
+      if $ldd_run["exit_code"] != 0 then
+        fail($appid .. ": ldd failed for staged plugin /" .. $rel .. ":\n" .. $ldd_run["stderr"])
+      end
+      $ldd_out = $ldd_run["stdout"]
       if contains($ldd_out, "not found") then
         fail($appid .. ": staged plugin /" .. $rel .. " has unresolved libraries:\n" .. $ldd_out)
       end
@@ -1515,7 +1536,7 @@ for each $pslug in $PLASMOID_SELECTED
   -- code is not trusted either way: the check is the Plugin line in the
   -- output, which names the applet id it actually parsed from metadata.json.
   $r = run_argv(["kpackagetool6", "--type", "Plasma/Applet", "--show", $proot .. "/" .. $prel], { "timeout": 60 })
-  if not $r["ok"] or not contains($r["stdout"], "Plugin     : " .. $appid) then
+  if $r["exit_code"] != 0 or not contains($r["stdout"], "Plugin     : " .. $appid) then
     fail("kpackagetool6 cannot resolve staged " .. $appid .. ":\n" .. $r["stdout"] .. $r["stderr"])
   end
   -- The staged package's private QML module must actually LOAD. This is the
@@ -1523,19 +1544,23 @@ for each $pslug in $PLASMOID_SELECTED
   -- cannot resolve renders the error inside the applet window, where neither
   -- stderr nor process liveness sees it. Hard gate, per apps/plasmoid/DEPLOY.md.
   $r = run_argv([$pbuild .. "/bin/staged_backend_probe", $proot .. "/" .. $prel], { "timeout": 60, "max_output": 0 })
-  if not $r["ok"] then
+  if $r["exit_code"] != 0 then
     fail("staged backend probe failed for " .. $appid .. ":\n" .. $r["stdout"] .. $r["stderr"])
   end
   -- qmllint runs against the STAGED tree, not the source package: the
   -- generated CosmixBackend module directory exists only after install, so
   -- linting the source would miss exactly the import this probe guards.
-  $qml_list = run_argv_must(["find", $proot .. "/" .. $prel .. "/contents", "-name", "*.qml", "-type", "f"], { "timeout": 30 })
+  $qml_find = run_argv(["find", $proot .. "/" .. $prel .. "/contents", "-name", "*.qml", "-type", "f"], {timeout: 30})
+  if $qml_find["exit_code"] != 0 then
+    fail("could not enumerate staged QML for " .. $appid .. ": " .. trim($qml_find["stderr"]))
+  end
+  $qml_list = $qml_find["stdout"]
   $qml_args = ["/usr/lib/qt6/bin/qmllint", "-I", $pbuild .. "/bin"]
   for each $qml in sort(split(trim($qml_list), "\n"))
     push($qml_args, $qml)
   end
   $r = run_argv($qml_args, { "timeout": 120, "max_output": 0 })
-  if not $r["ok"] then
+  if $r["exit_code"] != 0 then
     fail("staged qmllint failed for " .. $appid .. ":\n" .. $r["stdout"] .. $r["stderr"])
   end
 
@@ -1547,7 +1572,7 @@ for each $pslug in $PLASMOID_SELECTED
   -- bytes into a user-readable file (cold review 2026-07-28, #3 round 2).
   $ptar = $stage .. "/" .. $pslug .. ".tar"
   $r = run_argv(["tar", "-C", $proot, "-cf", $ptar, "."], { "timeout": 60, "max_output": 0 })
-  if not $r["ok"] then
+  if $r["exit_code"] != 0 then
     fail("tar pack failed for " .. $appid .. ":\n" .. $r["stderr"])
   end
 
@@ -1598,16 +1623,16 @@ end
 -- inodes as they actually are (cold review 2026-07-28, #3 round 6).
 assert_root_private_chain(["/", "/opt", "/opt/cosmix", "/opt/cosmix/share"], true)
 if length($APPS) > 0 then
-  croot("install -d -o 0 -g 0 -m 0755 " .. $BIN_DEST .. " " .. $DT_DEST .. " " .. $AUTOSTART_DEST .. " /opt/cosmix/share")
+  root_mkdir([$BIN_DEST, $DT_DEST, $AUTOSTART_DEST, "/opt/cosmix/share"], 0o755)
 else
-  croot("install -d -o 0 -g 0 -m 0755 /opt/cosmix/share")
+  root_mkdir(["/opt/cosmix/share"], 0o755)
 end
 -- The daemon destinations are created only when this run actually installs a
 -- daemon. They are root-owned directories under /usr/local that this deployer
 -- may never remove, so creating them for a run that has no use for them leaves
 -- two permanent empty directories behind on every machine.
 if length($staged_units) > 0 then
-  croot("install -d -o 0 -g 0 -m 0755 " .. $DBUS_DEST .. " " .. $USER_UNIT_DEST)
+  root_mkdir([$DBUS_DEST, $USER_UNIT_DEST], 0o755)
 end
 
 -- 4a. Write the ledger BEFORE the installs it describes. The install sequence
@@ -1674,10 +1699,10 @@ write_manifest(merge_manifest($existing_manifest, $installed, $SELECTED_APPS_ALL
 -- two cases that actually occur (overwrite a regular file, create a new one).
 -- The `install -d` calls below are unaffected: -T is meaningless for them.
 if length($icon_installs) > 0 then
-  croot("install -d -o 0 -g 0 -m 0755 " .. $ICON_DEST .. " " .. $ICON_DEST .. "/hicolor")
+  root_mkdir([$ICON_DEST, $ICON_DEST .. "/hicolor"], 0o755)
   for each $icon in $icon_installs
-    croot("install -d -o 0 -g 0 -m 0755 " .. shell_quote(dirname($icon["destination"])))
-    croot("install -T -o 0 -g 0 -m 0644 " .. shell_quote($icon["source"]) .. " " .. shell_quote($icon["destination"]))
+    root_mkdir([dirname($icon["destination"])], 0o755)
+    root_install($icon["source"], $icon["destination"], 0o644)
   end
 end
 for each $name in $APPS
@@ -1697,18 +1722,17 @@ for each $name in $APPS
   -- deploy of the app overwrites it. Config/desktop/icon installs below
   -- stay plain install -T: nothing exec()s those mid-write.
   $btmp = $BIN_DEST .. "/." .. $name .. ".new"
-  croot("install -T -o 0 -g 0 -m 0755 " .. shell_quote($bins[$name]) .. " " .. shell_quote($btmp))
-  croot("mv -fT " .. shell_quote($btmp) .. " " .. shell_quote($BIN_DEST .. "/" .. $name))
+  root_publish($bins[$name], $btmp, $BIN_DEST .. "/" .. $name, 0o755)
   if $apps[$name]["kind"] == "daemon" then
     -- Both activation files were staged and non-emptiness-checked above.
-    croot("install -T -o 0 -g 0 -m 0644 " .. shell_quote($stage .. "/dbus/" .. $appid .. ".service") .. " " .. shell_quote($DBUS_DEST .. "/" .. $appid .. ".service"))
-    croot("install -T -o 0 -g 0 -m 0644 " .. shell_quote($stage .. "/systemd/" .. $name .. ".service") .. " " .. shell_quote($USER_UNIT_DEST .. "/" .. $name .. ".service"))
+    root_install($stage .. "/dbus/" .. $appid .. ".service", $DBUS_DEST .. "/" .. $appid .. ".service", 0o644)
+    root_install($stage .. "/systemd/" .. $name .. ".service", $USER_UNIT_DEST .. "/" .. $name .. ".service", 0o644)
     print "installed " .. $name .. " (" .. $apps[$name]["display"] .. ") + " .. $appid .. ".service (D-Bus activated user daemon)"
   else
-    croot("install -T -o 0 -g 0 -m 0644 " .. shell_quote($stage .. "/" .. $appid .. ".desktop") .. " " .. shell_quote($DT_DEST .. "/" .. $appid .. ".desktop"))
+    root_install($stage .. "/" .. $appid .. ".desktop", $DT_DEST .. "/" .. $appid .. ".desktop", 0o644)
     -- kind="tray" surfaces also autostart with the session (SNI item, no window).
     if $apps[$name]["kind"] == "tray" then
-      croot("install -T -o 0 -g 0 -m 0644 " .. shell_quote($stage .. "/" .. $appid .. ".desktop") .. " " .. shell_quote($AUTOSTART_DEST .. "/" .. $appid .. ".desktop"))
+      root_install($stage .. "/" .. $appid .. ".desktop", $AUTOSTART_DEST .. "/" .. $appid .. ".desktop", 0o644)
       print "installed " .. $name .. " (" .. $apps[$name]["display"] .. ") + " .. $appid .. ".desktop (+ autostart)"
     else
       print "installed " .. $name .. " (" .. $apps[$name]["display"] .. ") + " .. $appid .. ".desktop"
@@ -1738,41 +1762,30 @@ end
 for each $pinst in $plasmoid_installs
   $p_appid = $pinst["appid"]
   $p_root = $PLASMOID_DEST .. "/" .. $p_appid
-  $ancestry = ["/usr/local", "/usr/local/share", "/usr/local/share/plasma", $PLASMOID_DEST, $p_root]
   -- Re-verify the handoff chain immediately before use, not just once at
   -- startup: the check above happened before the Rust apps installed, and this
   -- narrows the window in which a component could have changed underneath us.
   -- The full reasoning lives on assert_root_private_chain().
   assert_root_private_chain(["/", "/opt", "/opt/cosmix", "/opt/cosmix/share"], false)
-  $probe_cmd = "find -P"
-  for each $anc in $ancestry
-    $probe_cmd = $probe_cmd .. " " .. shell_quote($anc)
+  assert_root_private_chain(["/", "/usr", "/usr/local", "/usr/local/share"], false)
+  assert_root_private_chain(["/", "/usr", "/usr/local", "/usr/local/share", "/usr/local/share/plasma"], true)
+  assert_root_private_chain(["/", "/usr", "/usr/local", "/usr/local/share", "/usr/local/share/plasma", $PLASMOID_DEST], true)
+  assert_root_private_chain(["/", "/usr", "/usr/local", "/usr/local/share", "/usr/local/share/plasma", $PLASMOID_DEST, $p_root], true)
+  $interior = ssh_mix($TARGET, '
+$bad = []
+for each $path in walk($root, {max_depth: 32, follow_symlinks: false, include_dirs: true})
+  $info = stat($path, {follow_symlinks: false})
+  if not $info["is_dir"] and not $info["is_file"] then
+    push($bad, $path)
   end
-  $probe_cmd = $probe_cmd .. " -maxdepth 0 -printf '%y\t%p\n'"
-  $probe = ssh_run($TARGET, $probe_cmd, { "timeout": 30 })
-  $seen_types = {}
-  for each $line in split(trim(get_or($probe, "stdout", "")), "\n")
-    if $line != "" then
-      $parts = split($line, "\t")
-      $seen_types[$parts[1]] = $parts[0]
-    end
+end
+print(data_encode($bad))
+', {bindings: {root: $p_root}, decode: "data", timeout: 30})
+  if not $interior["ok"] or $interior["value"] == nil then
+    fail("live package-root audit failed for " .. $p_root .. ": " .. trim($interior["stderr"]))
   end
-  for each $anc in $ancestry
-    $atype = $seen_types[$anc]
-    if $atype == nil then
-      -- Absent is tolerable only below /usr/local/share, and only as genuine
-      -- absence -- which the probe cannot distinguish from its own failure
-      -- for the two roots that must exist on any machine this deploys to.
-      if $anc == "/usr/local" or $anc == "/usr/local/share" then
-        fail("ancestry probe could not classify " .. $anc .. " (probe error or missing);\n  refusing to install through an unaudited path.\n  stderr: " .. get_or($probe, "stderr", ""))
-      end
-    elif $atype != "d" then
-      fail("live path " .. $anc .. " is type '" .. $atype .. "', not a real directory;\n  refusing to install through it.")
-    end
-  end
-  $interior = ssh_run($TARGET, "find -P " .. shell_quote($p_root) .. " ! -type d ! -type f -printf '%y\t%p\n'", { "timeout": 30 })
-  if trim(get_or($interior, "stdout", "")) != "" then
-    fail("live package root " .. $p_root .. " contains non-regular entries:\n" .. $interior["stdout"])
+  if length($interior["value"]) > 0 then
+    fail("live package root " .. $p_root .. " contains non-regular entries:\n" .. join($interior["value"], "\n"))
   end
 
   -- Extract into the preclaimed root scratch. The rm -rf clears a PREVIOUS
@@ -1780,8 +1793,8 @@ for each $pinst in $plasmoid_installs
   -- not an installed artifact, which is why it sits outside the never-delete
   -- invariant that protects manifest-named installs.
   $extract = "/opt/cosmix/share/.plasmoid-extract-" .. $pinst["slug"]
-  croot("rm -rf " .. shell_quote($extract))
-  croot("install -d -o 0 -g 0 -m 0700 " .. shell_quote($extract))
+  root_remove_dir($extract)
+  root_mkdir([$extract], 0o700)
   -- Copy the tar INTO the root scratch first and audit the root-owned copy:
   -- extracting a user-writable archive as root is a root-WRITE oracle (a
   -- swapped tar with symlink members can steer extraction outside the
@@ -1809,29 +1822,48 @@ for each $pinst in $plasmoid_installs
   -- root-controlled and the final component is O_NOFOLLOW -- the whole path is
   -- closed, not just its tail.
   $handoff = "/opt/cosmix/share/.plasmoid-handoff-" .. $pinst["slug"]
-  croot("rm -rf " .. shell_quote($handoff))
-  croot("install -d -o " .. to_string(uid()) .. " -g " .. to_string(gid()) .. " -m 0700 " .. shell_quote($handoff))
+  $handoff_mk = ssh_mix($TARGET, '
+remove_dir($path)
+mkdir($path, {parents: true})
+chown($path, $owner_uid, $owner_gid)
+chmod($path, 0o700)
+print("handoff-ok")
+', {bindings: {path: $handoff, owner_uid: uid(), owner_gid: gid()}, timeout: 30})
+  if not $handoff_mk["ok"] or not contains($handoff_mk["stdout"], "handoff-ok") then
+    fail("could not prepare the privileged archive handoff: " .. trim($handoff_mk["stderr"]))
+  end
   $hcopy = run_argv(["cp", "-f", $pinst["tar"], $handoff .. "/pkg.tar"], { "timeout": 60, "max_output": 0 })
-  if not $hcopy["ok"] then
-    croot("rm -rf " .. shell_quote($handoff))
+  if $hcopy["exit_code"] != 0 then
+    root_remove_dir($handoff)
     fail("could not hand the " .. $p_appid .. " archive to the privileged side:\n" .. trim(get_or($hcopy, "stderr", "")))
   end
-  croot("dd if=" .. shell_quote($handoff .. "/pkg.tar") .. " of=" .. shell_quote($extract .. "/pkg.tar") .. " bs=1M count=65 iflag=nofollow,nonblock,fullblock status=none")
-  croot("rm -rf " .. shell_quote($handoff))
-  $tclass = ssh_run($TARGET, "find -P " .. shell_quote($extract .. "/pkg.tar") .. " -maxdepth 0 -printf '%y\t%s\n'", { "timeout": 30 })
-  $tparts = split(trim(get_or($tclass, "stdout", "")), "\t")
-  if not get_or($tclass, "ok", false) or length($tparts) != 2 then
-    fail("root-side classification of the " .. $p_appid .. " archive copy failed: " .. get_or($tclass, "stderr", ""))
+  $dd = ssh_mix($TARGET, '
+print(run("dd if=" .. $source .. " of=" .. $destination .. " bs=1M count=65 iflag=nofollow,nonblock,fullblock status=none"))
+print("dd-ok")
+', {bindings: {source: $handoff .. "/pkg.tar", destination: $extract .. "/pkg.tar"}, timeout: 30})
+  if not $dd["ok"] or not contains($dd["stdout"], "dd-ok") then
+    root_remove_dir($handoff)
+    fail("root-side bounded archive copy failed for " .. $p_appid .. ": " .. trim($dd["stderr"]))
   end
-  if $tparts[0] != "f" then
-    fail("the root-owned copy of the " .. $p_appid .. " archive is type '" .. $tparts[0] .. "', not a regular file;\n  the handed-over source (from " .. $pinst["tar"] .. ") changed between audit and install. Refusing.")
+  root_remove_dir($handoff)
+  $tclass = ssh_mix($TARGET, '
+$info = stat($path, {follow_symlinks: false})
+print(data_encode({is_file: $info["is_file"], size: $info["size"]}))
+', {bindings: {path: $extract .. "/pkg.tar"}, decode: "data", timeout: 30})
+  if not $tclass["ok"] or $tclass["value"] == nil then
+    fail("root-side classification of the " .. $p_appid .. " archive copy failed: " .. trim($tclass["stderr"]))
   end
-  if to_number($tparts[1]) > 67108864 then
-    fail("the " .. $p_appid .. " archive copy is implausibly large (" .. $tparts[1] .. " bytes > 64 MiB);\n  refusing.")
+  if not $tclass["value"]["is_file"] then
+    fail("the root-owned copy of the " .. $p_appid .. " archive is not a regular file;\n  the handed-over source changed between audit and install. Refusing.")
   end
-  $tlist = ssh_run($TARGET, "tar -tvf " .. shell_quote($extract .. "/pkg.tar"), { "timeout": 30 })
-  if not get_or($tlist, "ok", false) then
-    fail("root-side tar listing of " .. $p_appid .. " failed: " .. get_or($tlist, "stderr", ""))
+  if $tclass["value"]["size"] > 67108864 then
+    fail("the " .. $p_appid .. " archive copy is implausibly large (" .. $tclass["value"]["size"] .. " bytes > 64 MiB);\n  refusing.")
+  end
+  $tlist = ssh_mix($TARGET, '
+print(run("tar -tvf " .. $archive))
+', {bindings: {archive: $extract .. "/pkg.tar"}, timeout: 30})
+  if not $tlist["ok"] then
+    fail("root-side tar listing of " .. $p_appid .. " failed: " .. trim($tlist["stderr"]))
   end
   for each $line in split(trim($tlist["stdout"]), "\n")
     if $line != "" then
@@ -1844,21 +1876,32 @@ for each $pinst in $plasmoid_installs
       end
     end
   end
-  croot("install -d -o 0 -g 0 -m 0700 " .. shell_quote($extract .. "/tree"))
-  croot("tar --no-same-owner -xpf " .. shell_quote($extract .. "/pkg.tar") .. " -C " .. shell_quote($extract .. "/tree"))
-  $eaudit = ssh_run($TARGET, "find -P " .. shell_quote($extract .. "/tree") .. " -mindepth 1 -printf '%y\t%P\n'", { "timeout": 30 })
-  if not get_or($eaudit, "ok", false) then
-    fail("root-side audit of extracted " .. $p_appid .. " failed: " .. get_or($eaudit, "stderr", ""))
+  root_mkdir([$extract .. "/tree"], 0o700)
+  $unpack = ssh_mix($TARGET, '
+print(run("tar --no-same-owner -xpf " .. $archive .. " -C " .. $tree))
+print("unpack-ok")
+', {bindings: {archive: $extract .. "/pkg.tar", tree: $extract .. "/tree"}, timeout: 30})
+  if not $unpack["ok"] or not contains($unpack["stdout"], "unpack-ok") then
+    fail("root-side extraction of " .. $p_appid .. " failed: " .. trim($unpack["stderr"]))
+  end
+  $eaudit = ssh_mix($TARGET, '
+$entries = []
+for each $path in walk($tree, {max_depth: 32, follow_symlinks: false, include_dirs: true})
+  $info = stat($path, {follow_symlinks: false})
+  $kind = $info["is_file"] ? "f" : ($info["is_dir"] ? "d" : "other")
+  push($entries, {kind: $kind, path: substr($path, length($tree) + 1)})
+end
+print(data_encode($entries))
+', {bindings: {tree: $extract .. "/tree"}, decode: "data", timeout: 30})
+  if not $eaudit["ok"] or $eaudit["value"] == nil then
+    fail("root-side audit of extracted " .. $p_appid .. " failed: " .. trim($eaudit["stderr"]))
   end
   $extracted_rel = []
-  for each $line in split(trim($eaudit["stdout"]), "\n")
-    if $line != "" then
-      $parts = split($line, "\t")
-      if $parts[0] == "f" then
-        push($extracted_rel, $parts[1])
-      elif $parts[0] != "d" then
-        fail("extracted " .. $p_appid .. " contains a non-regular entry (type " .. $parts[0] .. "): " .. $parts[1] .. "\n  The staged source changed between audit and pack; refusing.")
-      end
+  for each $entry in $eaudit["value"]
+    if $entry["kind"] == "f" then
+      push($extracted_rel, $entry["path"])
+    elif $entry["kind"] != "d" then
+      fail("extracted " .. $p_appid .. " contains a non-regular entry: " .. $entry["path"] .. "\n  The staged source changed between audit and pack; refusing.")
     end
   end
   $extracted_rel = sort($extracted_rel)
@@ -1869,11 +1912,11 @@ for each $pinst in $plasmoid_installs
   -- Install from the root-owned scratch only. Modes: 0644 content, 0755 for
   -- the native plugin .so. The manifest already claims every one of these.
   for each $rel in $pinst["rel_files"]
-    croot("install -d -o 0 -g 0 -m 0755 " .. shell_quote(dirname("/" .. $rel)))
-    $pmode = ends_with($rel, ".so") ? "0755" : "0644"
-    croot("install -T -o 0 -g 0 -m " .. $pmode .. " " .. shell_quote($extract .. "/tree/" .. $rel) .. " " .. shell_quote("/" .. $rel))
+    root_mkdir([dirname("/" .. $rel)], 0o755)
+    $pmode = ends_with($rel, ".so") ? 0o755 : 0o644
+    root_install($extract .. "/tree/" .. $rel, "/" .. $rel, $pmode)
   end
-  croot("rm -rf " .. shell_quote($extract))
+  root_remove_dir($extract)
 end
 for each $pentry in $plasmoid_entries
   print "installed " .. $pentry["app"] .. " (KDE plasmoid, " .. length($pentry["files"]) .. " files)"
@@ -1891,7 +1934,7 @@ for each $pslug in $PLASMOID_SELECTED
   $appid = "dev.cosmix." .. $pslug
   -- Same path-form + Plugin-line discipline as the staged check above.
   $r = run_argv(["kpackagetool6", "--type", "Plasma/Applet", "--show", $PLASMOID_DEST .. "/" .. $appid], { "timeout": 60 })
-  if not $r["ok"] or not contains($r["stdout"], "Plugin     : " .. $appid) then
+  if $r["exit_code"] != 0 or not contains($r["stdout"], "Plugin     : " .. $appid) then
     fail("post-install: kpackagetool6 cannot resolve live " .. $appid .. ":\n" .. $r["stdout"] .. $r["stderr"])
   end
   print "note: an already-running plasmashell keeps the OLD " .. $appid .. " native plugin"
@@ -1906,7 +1949,7 @@ end
 -- nothing to reload, and the unit is read at next login regardless.
 if length($staged_units) > 0 then
   $reload = run_argv(["systemctl", "--user", "daemon-reload"], { "timeout": 30 })
-  if not $reload["ok"] then
+  if $reload["exit_code"] != 0 then
     print "note: systemctl --user daemon-reload failed (non-fatal): " .. trim($reload["stderr"])
     print "  The user unit is installed; it is picked up at the next login or reload."
   end
@@ -1963,7 +2006,9 @@ function record_temps($dir, $prefix, $shared_now)
 end
 
 $shared = []
-$udd = ssh_run($TARGET, "/usr/bin/update-desktop-database " .. shell_quote($DT_DEST), { "timeout": 30 })
+$udd = ssh_mix($TARGET, '
+print(run("/usr/bin/update-desktop-database " .. $desktop_dir))
+', {bindings: {desktop_dir: $DT_DEST}, timeout: 30})
 if $udd["ok"] then
   push($shared, $DT_DEST .. "/mimeinfo.cache")
 else
@@ -1981,7 +2026,9 @@ if length($icon_installs) > 0 then
     print "  for every application. This script did not write it. Remove it by hand."
   end
 
-  $cache = ssh_run($TARGET, "/usr/sbin/gtk-update-icon-cache -f -t " .. shell_quote($ICON_DEST .. "/hicolor"), { "timeout": 30 })
+  $cache = ssh_mix($TARGET, '
+print(run("/usr/sbin/gtk-update-icon-cache -f -t " .. $icon_dir))
+', {bindings: {icon_dir: $ICON_DEST .. "/hicolor"}, timeout: 30})
   if $cache["ok"] then
     push($shared, $ICON_DEST .. "/hicolor/icon-theme.cache")
   else
@@ -2015,7 +2062,7 @@ if length($icon_installs) > 0 and $have_kiconfinder then
   $missing = []
   for each $icon_name in $icon_names
     $found = run_argv(["/usr/sbin/kiconfinder6", $icon_name], { "timeout": 30 })
-    if not $found["ok"] then
+    if $found["exit_code"] != 0 then
       push($missing, $icon_name)
     end
   end
@@ -2042,4 +2089,3 @@ end
 
 funlock($HELD_LOCK)
 print "done."
-

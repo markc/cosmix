@@ -1,0 +1,509 @@
+#!/usr/bin/env mix
+-- deploy_sshm.mix — install the sshm wake citizen, drain worker, and
+-- missed-wake backstop on the hub-configured SSH-manager node.
+--
+--   mix _bin/deploy_sshm.mix deploy
+--   mix _bin/deploy_sshm.mix deploy alpha
+--   mix _bin/deploy_sshm.mix deploy --allow-downgrade
+--
+-- The private hub config names the sole target and its operator-owned SSH
+-- directory, database, and authenticated web seam. The target may be a mesh
+-- or foreign roster node: ssh_mix always invokes its installed system Mix.
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+$argv = args()
+if len($argv) == 0 then
+  print("usage: mix deploy_sshm.mix deploy [--allow-downgrade] [node]")
+  exit(2)
+end
+if $argv[0] != "deploy" then
+  print("unknown stage: " .. $argv[0])
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_sshm.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no sshm deploy config at " .. $CONF_PATH ..
+    " — create it from deploy_sshm.conf.mix.example")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["deploy_sshm"], {
+    schema_version: {type: "integer", enum: [1]},
+    target_node: {type: "string", nonblank: true},
+    base_url: {type: "string", nonblank: true},
+    database_path: {type: "string", nonblank: true},
+    drain_user: {type: "string", nonblank: true},
+    drain_home: {type: "string", nonblank: true}
+  })
+catch $e
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+if not starts_with($CONF["base_url"], "http://") and not starts_with($CONF["base_url"], "https://") then
+  config_error("base_url must start with http:// or https://")
+end
+for each $field in ["base_url", "database_path", "drain_user", "drain_home"]
+  if contains($CONF[$field], "\n") or contains($CONF[$field], "\r") then
+    config_error($field .. " must be one line")
+  end
+end
+if not starts_with($CONF["database_path"], "/") then
+  config_error("database_path must be absolute")
+end
+if not starts_with($CONF["drain_home"], "/") then
+  config_error("drain_home must be absolute")
+end
+if not regex_match("^[a-z_][a-z0-9_-]*$", $CONF["drain_user"]) then
+  config_error("drain_user must be a local POSIX account name")
+end
+
+$ROSTER = $d.roster()
+$d.assert_node($ROSTER, $CONF["target_node"])
+
+$rest = []
+$first = true
+for each $arg in $argv
+  if $first then
+    $first = false
+  else
+    push($rest, $arg)
+  end
+end
+$TARGET_ROSTER = {
+  mesh: [$CONF["target_node"]],
+  foreign: [],
+  all: [$CONF["target_node"]],
+  order: nil
+}
+if $d.is_foreign($ROSTER, $CONF["target_node"]) then
+  $TARGET_ROSTER = {
+    mesh: [],
+    foreign: [$CONF["target_node"]],
+    all: [$CONF["target_node"]],
+    order: nil
+  }
+end
+$parsed = $d.parse_nodes($TARGET_ROSTER, $rest, ["--allow-downgrade"])
+$requested = $parsed["nodes"]
+$ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
+
+-- Apply the complete fleet order even though this mechanism has one configured
+-- target. That keeps the hub-last invariant if the config is later generalised.
+$nodes = []
+if $d.is_foreign($ROSTER, $CONF["target_node"]) then
+  $nodes = $requested
+else
+  for each $node in $d.rollout_order($ROSTER)
+    if $node == $CONF["target_node"] then
+      push($nodes, $node)
+    end
+  end
+end
+if len($nodes) != 1 then
+  config_error("target_node is absent from the fleet rollout_order")
+end
+
+$REMOTE = {}
+for each $node in $nodes
+  if $d.is_foreign($ROSTER, $node) then
+    $REMOTE[$node] = $node
+  else
+    $REMOTE[$node] = "root@" .. $d.mesh_ip($node)
+  end
+end
+
+$ROOT = $d.cosmix_root()
+$HUB = $d.hub_root()
+$PAYLOADS = {
+  sshm: $HUB .. "/_bin/sshm.mix",
+  worker: $HUB .. "/_bin/sshm_worker.mix",
+  worker_lib: $HUB .. "/_bin/sshm_worker_lib.mix"
+}
+$TEMPLATES = {
+  sysusers: $d.shipped("sysusers", "cosmix-sshm-wake.conf"),
+  tmpfiles: $d.shipped("tmpfiles", "cosmix-sshm.conf"),
+  wake_service: $d.shipped("unit", "cosmix-sshm-wake.service"),
+  drain_service: $d.shipped("unit", "cosmix-sshm-drain.service"),
+  drain_path: $d.shipped("unit", "cosmix-sshm-drain.path"),
+  drain_timer: $d.shipped("unit", "cosmix-sshm-drain.timer")
+}
+for each $path in [
+  $PAYLOADS["sshm"],
+  $PAYLOADS["worker"],
+  $PAYLOADS["worker_lib"],
+  $TEMPLATES["sysusers"],
+  $TEMPLATES["tmpfiles"],
+  $TEMPLATES["wake_service"],
+  $TEMPLATES["drain_service"],
+  $TEMPLATES["drain_path"],
+  $TEMPLATES["drain_timer"]
+]
+  $d.die_if(not is_file($path), "required deploy artifact missing: " .. $path)
+end
+
+fn render_operator_template($path)
+  $content = read_file($path)
+  $content = replace($content, "@SSHM_DRAIN_USER@", $CONF["drain_user"])
+  $content = replace($content, "@SSHM_DRAIN_HOME@", $CONF["drain_home"])
+  $d.die_if(contains($content, "@SSHM_DRAIN_"),
+    "unresolved sshm operator placeholder in " .. $path)
+  return $content
+end
+
+$CONTENTS = {
+  sshm: read_file($PAYLOADS["sshm"]),
+  worker: read_file($PAYLOADS["worker"]),
+  worker_lib: read_file($PAYLOADS["worker_lib"]),
+  sysusers: read_file($TEMPLATES["sysusers"]),
+  tmpfiles: render_operator_template($TEMPLATES["tmpfiles"]),
+  wake_service: read_file($TEMPLATES["wake_service"]),
+  drain_service: render_operator_template($TEMPLATES["drain_service"]),
+  drain_path: read_file($TEMPLATES["drain_path"]),
+  drain_timer: read_file($TEMPLATES["drain_timer"])
+}
+
+-- There is no component binary version for this script bundle. The marker is
+-- written only after all content and runtime gates pass, so it is both the
+-- downgrade source and the exact post-install version assertion.
+$DEPLOY_VERSION = "1.0.0"
+$MARKER = "/etc/cosmix/sshm/deploy-version"
+
+fn deploy_node($node)
+  $remote = $REMOTE[$node]
+  print("")
+  print("[" .. $node .. "] deploy sshm " .. $DEPLOY_VERSION)
+
+  $reach = ssh_mix($remote, '
+$hostname = trim(run("/usr/bin/hostname"))
+if $rc != 0 or $hostname == "" then
+  exit(7)
+end
+$uid = trim(run("/usr/bin/id -u"))
+if $rc != 0 or $uid != "0" then
+  eprint("remote deployment requires uid 0")
+  exit(8)
+end
+print($hostname)
+', {connect_timeout: 8, timeout: 10})
+  $d.die_if(not $reach["ok"],
+    $node .. " unreachable, not running system Mix, or not root: " ..
+      trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+  print("  connected: " .. trim($reach["stdout"]))
+
+  $pre = ssh_mix($remote, '
+if is_file($marker) then
+  print(trim(read_file($marker)))
+end
+', {bindings: {marker: $MARKER}, connect_timeout: 8, timeout: 10})
+  $d.die_if(not $pre["ok"],
+    $node .. " could not inspect installed deploy version: " .. trim($pre["stderr"]))
+  if trim($pre["stdout"]) != "" then
+    $d.assert_not_downgrade(
+      $node, trim($pre["stdout"]), $DEPLOY_VERSION, $ALLOW_DOWNGRADE)
+  end
+
+  $result = ssh_mix($remote, '
+fn fail($code, $message)
+  eprint("ERROR: " .. $message)
+  exit($code)
+end
+
+fn command($source, $label, $code)
+  $out = run($source)
+  if $rc != 0 then
+    fail($code, $label .. " failed: " .. trim($out))
+  end
+  return $out
+end
+
+fn atomic_install($path, $content, $mode, $uid, $gid)
+  $tmp = $path .. ".new"
+  write_file($tmp, $content)
+  chown($tmp, $uid, $gid)
+  chmod($tmp, $mode)
+  rename($tmp, $path)
+end
+
+fn assert_file($path, $content, $mode, $uid, $gid)
+  $st = stat($path, {follow_symlinks: false})
+  if $st["is_file"] != true or $st["is_symlink"] == true then
+    fail(30, $path .. " is not an installed regular file")
+  end
+  if $st["uid"] != $uid or $st["gid"] != $gid or $st["perm"] != $mode then
+    fail(31, $path .. " owner or mode mismatch")
+  end
+  if read_file($path) != $content then
+    fail(32, $path .. " content mismatch")
+  end
+end
+
+for each $bin in ["/usr/bin/systemctl", "/usr/bin/flock"]
+  if not is_file($bin) then
+    fail(9, $bin .. " is required")
+  end
+end
+if not is_file($database_path) then
+  fail(10, "sshm database is missing: " .. $database_path)
+end
+if not is_dir($drain_home) or not is_dir($drain_home .. "/.ssh") then
+  fail(11, "drain home or SSH directory is missing: " .. $drain_home)
+end
+$drain_uid = to_number(trim(run("/usr/bin/id -u " .. $drain_user)))
+if $rc != 0 or $drain_uid == nil then
+  fail(12, "drain user does not exist: " .. $drain_user)
+end
+$drain_gid = to_number(trim(run("/usr/bin/id -g " .. $drain_user)))
+if $rc != 0 or $drain_gid == nil then
+  fail(13, "drain group does not exist: " .. $drain_user)
+end
+
+-- Read the credential without returning it across SSH, then authenticate the
+-- seam before changing any deploy-owned file.
+$db = sqlopen($database_path)
+$rows = sqlexec($db,
+  "SELECT value FROM sshm_settings WHERE key = ?1", ["sshm_secret"])
+sqlclose($db)
+if len($rows) != 1 then
+  fail(14, "no unique sshm_secret in " .. $database_path)
+end
+$secret = trim("" .. $rows[0]["value"])
+if $secret == "" then
+  fail(14, "sshm_secret is empty in " .. $database_path)
+end
+$pf = http_post($base_url .. "/ssh/job-claim-next",
+  json_encode({supported_kinds: []}),
+  {"X-Sshm-Secret": $secret, "Content-Type": "application/json"},
+  {timeout: 10})
+$status = to_number("" .. $pf["status"])
+if $status != 200 and $status != 204 then
+  fail(15, "auth preflight returned HTTP " .. ("" .. $status))
+end
+
+$previous_invocation = trim(run(
+  "/usr/bin/systemctl show cosmix-sshm-wake.service -p InvocationID --value"))
+if $rc != 0 then
+  $previous_invocation = ""
+end
+
+for each $dir in [$sysusers_dir, $unit_dir, $tmpfiles_dir, $share_dir]
+  mkdir($dir, {parents: true})
+  chown($dir, 0, 0)
+end
+chmod($share_dir, 0o755)
+mkdir($etc_dir, {parents: true})
+chown($etc_dir, 0, 0)
+chmod($etc_dir, 0o700)
+
+atomic_install($sysusers_path, $contents["sysusers"], 0o644, 0, 0)
+$_sysusers = command(
+  "/usr/bin/systemd-sysusers " .. $sysusers_path,
+  "sysusers create", 16)
+
+atomic_install($etc_dir .. "/secret", $secret, 0o400, 0, 0)
+atomic_install($etc_dir .. "/env", "SSHM_BASE_URL=" .. $base_url .. "\n", 0o644, 0, 0)
+
+atomic_install($share_dir .. "/sshm.mix", $contents["sshm"], 0o444, 0, 0)
+atomic_install($share_dir .. "/sshm_worker.mix", $contents["worker"], 0o755, 0, 0)
+atomic_install($share_dir .. "/sshm_worker_lib.mix", $contents["worker_lib"], 0o755, 0, 0)
+
+atomic_install($tmpfiles_path, $contents["tmpfiles"], 0o644, 0, 0)
+$_tmpfiles = command(
+  "/usr/bin/systemd-tmpfiles --create " .. $tmpfiles_path,
+  "tmpfiles create", 17)
+
+atomic_install($unit_dir .. "/cosmix-sshm-wake.service", $contents["wake_service"], 0o644, 0, 0)
+atomic_install($unit_dir .. "/cosmix-sshm-drain.service", $contents["drain_service"], 0o644, 0, 0)
+atomic_install($unit_dir .. "/cosmix-sshm-drain.path", $contents["drain_path"], 0o644, 0, 0)
+atomic_install($unit_dir .. "/cosmix-sshm-drain.timer", $contents["drain_timer"], 0o644, 0, 0)
+
+-- Retire the old rapid poller without killing an in-flight worker service.
+$legacy_timer = $unit_dir .. "/cosmix-sshm-worker.timer"
+if exists($legacy_timer, {follow_symlinks: false}) then
+  $_stop_legacy = command(
+    "/usr/bin/systemctl stop cosmix-sshm-worker.timer",
+    "stop legacy poll timer", 18)
+  $_disable_legacy = command(
+    "/usr/bin/systemctl disable cosmix-sshm-worker.timer",
+    "disable legacy poll timer", 19)
+  remove($legacy_timer)
+end
+$legacy_service = $unit_dir .. "/cosmix-sshm-worker.service"
+if exists($legacy_service, {follow_symlinks: false}) then
+  $_disable_service = command(
+    "/usr/bin/systemctl disable cosmix-sshm-worker.service",
+    "disable legacy worker service", 20)
+  remove($legacy_service)
+end
+
+-- A stale v1 polkit grant would leave the wake identity able to choose a
+-- systemd job mode. The path trigger is the only supported mediator.
+remove("/etc/polkit-1/rules.d/49-cosmix-sshm-wake.rules")
+
+$_reload = command("/usr/bin/systemctl daemon-reload", "daemon-reload", 21)
+$_enable_wake = command(
+  "/usr/bin/systemctl enable cosmix-sshm-wake.service",
+  "enable wake citizen", 22)
+$_restart_wake = command(
+  "/usr/bin/systemctl restart cosmix-sshm-wake.service",
+  "start or refresh wake citizen", 23)
+$_enable_path = command(
+  "/usr/bin/systemctl enable --now cosmix-sshm-drain.path",
+  "enable drain trigger", 24)
+$_enable_timer = command(
+  "/usr/bin/systemctl enable --now cosmix-sshm-drain.timer",
+  "enable drain backstop", 25)
+sleep(2)
+
+$wake_active = trim(command(
+  "/usr/bin/systemctl is-active cosmix-sshm-wake.service",
+  "wake citizen active check", 26))
+$path_active = trim(command(
+  "/usr/bin/systemctl is-active cosmix-sshm-drain.path",
+  "drain path active check", 26))
+$timer_active = trim(command(
+  "/usr/bin/systemctl is-active cosmix-sshm-drain.timer",
+  "drain timer active check", 26))
+if $wake_active != "active" or $path_active != "active" or $timer_active != "active" then
+  fail(26, "wake/path/timer active-state mismatch")
+end
+for each $unit in [
+  "cosmix-sshm-wake.service",
+  "cosmix-sshm-drain.path",
+  "cosmix-sshm-drain.timer"
+]
+  $enabled = trim(command(
+    "/usr/bin/systemctl is-enabled " .. $unit,
+    $unit .. " enabled check", 27))
+  if $enabled != "enabled" then
+    fail(27, $unit .. " is not enabled: " .. $enabled)
+  end
+end
+
+$invocation = trim(command(
+  "/usr/bin/systemctl show cosmix-sshm-wake.service -p InvocationID --value",
+  "wake invocation lookup", 28))
+if $invocation == "" or
+    ($previous_invocation != "" and $invocation == $previous_invocation) then
+  fail(28, "wake service did not enter a new systemd invocation")
+end
+$lines = 0
+$attempt = 0
+while $attempt < 8 and $lines == 0
+  $logs = trim(run(
+    "/usr/bin/journalctl _SYSTEMD_INVOCATION_ID=" .. $invocation ..
+      " -o cat --no-pager"))
+  if $rc == 0 and $logs != "" then
+    $lines = len(split($logs, "\n"))
+  end
+  $attempt = $attempt + 1
+  if $lines == 0 and $attempt < 8 then
+    sleep(1)
+  end
+end
+if $lines == 0 then
+  fail(28, "wake service has no journald line for its current invocation")
+end
+
+-- Registration proves the newly restarted citizen reached the local Bus; it
+-- does not fire a wake or claim a queued job.
+send noded noded.list
+if $rc != 0 or not contains("" .. $result, "sshm") then
+  fail(29, "sshm citizen is not registered with local noded")
+end
+
+assert_file($sysusers_path, $contents["sysusers"], 0o644, 0, 0)
+assert_file($tmpfiles_path, $contents["tmpfiles"], 0o644, 0, 0)
+assert_file($etc_dir .. "/secret", $secret, 0o400, 0, 0)
+assert_file($etc_dir .. "/env", "SSHM_BASE_URL=" .. $base_url .. "\n", 0o644, 0, 0)
+assert_file($share_dir .. "/sshm.mix", $contents["sshm"], 0o444, 0, 0)
+assert_file($share_dir .. "/sshm_worker.mix", $contents["worker"], 0o755, 0, 0)
+assert_file($share_dir .. "/sshm_worker_lib.mix", $contents["worker_lib"], 0o755, 0, 0)
+assert_file($unit_dir .. "/cosmix-sshm-wake.service", $contents["wake_service"], 0o644, 0, 0)
+assert_file($unit_dir .. "/cosmix-sshm-drain.service", $contents["drain_service"], 0o644, 0, 0)
+assert_file($unit_dir .. "/cosmix-sshm-drain.path", $contents["drain_path"], 0o644, 0, 0)
+assert_file($unit_dir .. "/cosmix-sshm-drain.timer", $contents["drain_timer"], 0o644, 0, 0)
+
+atomic_install($marker, $deploy_version .. "\n", 0o644, 0, 0)
+assert_file($marker, $deploy_version .. "\n", 0o644, 0, 0)
+print(data_encode({
+  version: trim(read_file($marker)),
+  invocation_id: $invocation,
+  log_lines: $lines,
+  wake_active: $wake_active,
+  path_active: $path_active,
+  timer_active: $timer_active,
+  bus_registered: true
+}))
+', {
+    bindings: {
+      database_path: $CONF["database_path"],
+      base_url: $CONF["base_url"],
+      drain_user: $CONF["drain_user"],
+      drain_home: $CONF["drain_home"],
+      marker: $MARKER,
+      deploy_version: $DEPLOY_VERSION,
+      etc_dir: "/etc/cosmix/sshm",
+      share_dir: "/opt/cosmix/share/cosmix",
+      sysusers_dir: "/etc/sysusers.d",
+      sysusers_path: "/etc/sysusers.d/cosmix-sshm-wake.conf",
+      tmpfiles_dir: "/etc/tmpfiles.d",
+      tmpfiles_path: "/etc/tmpfiles.d/cosmix-sshm.conf",
+      unit_dir: "/etc/systemd/system",
+      contents: $CONTENTS
+    },
+    decode: "data", connect_timeout: 8, timeout: 180
+  })
+
+  if not $result["ok"] then
+    print("  remote install failed; last 40 sshm wake log lines:")
+    $journal = ssh_mix($remote,
+      'print(run("/usr/bin/journalctl -u cosmix-sshm-wake.service -n 40 --no-pager"))',
+      {connect_timeout: 8, timeout: 15})
+    print($journal["stdout"])
+    print($journal["stderr"])
+  end
+  $d.die_if(not $result["ok"],
+    $node .. " sshm install failed: " ..
+      trim($result["stdout"]) .. " " .. trim($result["stderr"]))
+
+  $value = $result["value"]
+  $d.die_if($value["version"] != $DEPLOY_VERSION,
+    $node .. " installed deploy version mismatch")
+  $d.die_if($value["wake_active"] != "active" or
+      $value["path_active"] != "active" or
+      $value["timer_active"] != "active",
+    $node .. " sshm runtime units are not all active")
+  $d.die_if($value["log_lines"] < 1,
+    $node .. " current wake invocation has no log lines")
+  $d.die_if($value["bus_registered"] != true,
+    $node .. " sshm citizen BUS registration was not verified")
+  print("  version/content/modes: " .. $value["version"] .. " OK")
+  print("  wake/path/timer: active + enabled")
+  print("  BUS: sshm registered with local noded")
+  print("  logging: " .. $value["log_lines"] ..
+    " line/s for current invocation " .. $value["invocation_id"])
+  print("  [" .. $node .. "] DEPLOY OK")
+end
+
+print("targets: " .. join($nodes, " "))
+$_lock = $m.mesh_take_write_lock("deploy_sshm deploy")
+for each $node in $nodes
+  deploy_node($node)
+end
+
+print("")
+print("deploy complete: sshm " .. $DEPLOY_VERSION ..
+  ", exact content/modes, active+enabled units, BUS registration, and " ..
+  "current-invocation logging verified on " .. join($nodes, " "))

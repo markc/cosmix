@@ -1,0 +1,716 @@
+#!/usr/bin/env mix
+-- deploy_provisiond.mix — install the provisiond wake citizen and credentialed
+-- drain stack on its configured controller node.
+--
+--   mix _bin/deploy_provisiond.mix deploy
+--   mix _bin/deploy_provisiond.mix deploy --spike
+--   mix _bin/deploy_provisiond.mix deploy --base-url URL --db PATH
+--   mix _bin/deploy_provisiond.mix deploy --allow-downgrade alpha
+--
+-- One provisiond instance drains one canonical vhost. The hub-private config
+-- keeps that vhost, its database, the controller, SSH targets and verified-key
+-- inputs together. The real drain refuses installation unless the database
+-- secret authenticates to that vhost. Deploys stop on the first failed gate.
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+$argv = args()
+if len($argv) == 0 then
+  print("usage: mix deploy_provisiond.mix deploy [--spike] [--base-url URL] [--db PATH] [--allow-downgrade] [node]")
+  exit(2)
+end
+if $argv[0] != "deploy" then
+  print("unknown stage: " .. $argv[0])
+  exit(2)
+end
+
+fn tail_args($items)
+  $out = []
+  $i = 1
+  while $i < len($items)
+    push($out, $items[$i])
+    $i = $i + 1
+  end
+  return $out
+end
+
+$g = getopt(tail_args($argv), {
+  "base-url": {arg: true},
+  db: {arg: true},
+  spike: {arg: false},
+  "allow-downgrade": {arg: false}
+})
+if len($g["errors"]) != 0 then
+  print("bad options: " .. join($g["errors"], "; "))
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_provisiond.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no provisiond deploy config at " .. $CONF_PATH ..
+    " — create it from deploy_provisiond.conf.mix.example before deploying")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["deploy_provisiond"], {
+    schema_version: {type: "integer", enum: [1]},
+    target_node: {type: "string", nonblank: true},
+    base_url: {type: "string", nonblank: true},
+    database: {type: "string", nonblank: true},
+    operator_known_hosts: {type: "string", nonblank: true},
+    authorised_keys_from: {type: "string", nonblank: true},
+    ssh_hosts: {type: "list", min_length: 1, items: {type: "map", schema: {
+      name: {type: "string", nonblank: true},
+      aliases: {type: "list", min_length: 1,
+        items: {type: "string", nonblank: true}},
+      address: {type: "string", nonblank: true},
+      verify_address: {type: "string", nonblank: true}
+    }}}
+  })
+catch $e
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn contains_item($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn valid_ipv4($address)
+  $parts = split($address, ".")
+  if len($parts) != 4 then
+    return false
+  end
+  for each $part in $parts
+    if not regex_match("^[0-9]{1,3}$", $part) then
+      return false
+    end
+    $octet = to_number($part)
+    if $octet < 0 or $octet > 255 then
+      return false
+    end
+  end
+  return true
+end
+
+fn validate_url($url)
+  if not starts_with($url, "http://") and not starts_with($url, "https://") then
+    config_error("base_url must start with http:// or https://")
+  end
+  if contains($url, "\n") or contains($url, "\r") then
+    config_error("base_url must be one line")
+  end
+end
+
+fn validate_absolute($key, $path)
+  if not starts_with($path, "/") or contains($path, "\n") or contains($path, "\r") then
+    config_error($key .. " must be a one-line absolute path")
+  end
+end
+
+validate_url($CONF["base_url"])
+validate_absolute("database", $CONF["database"])
+validate_absolute("operator_known_hosts", $CONF["operator_known_hosts"])
+if not valid_ipv4($CONF["authorised_keys_from"]) then
+  config_error("authorised_keys_from must be an IPv4 address")
+end
+
+$ssh_names = []
+for each $host in $CONF["ssh_hosts"]
+  if not regex_match("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", $host["name"]) then
+    config_error("ssh_hosts[].name is not a safe host label: " .. $host["name"])
+  end
+  if contains_item($ssh_names, $host["name"]) then
+    config_error("duplicate ssh_hosts[].name: " .. $host["name"])
+  end
+  push($ssh_names, $host["name"])
+  if not valid_ipv4($host["address"]) or not valid_ipv4($host["verify_address"]) then
+    config_error("ssh host " .. $host["name"] .. " address and verify_address must be IPv4 addresses")
+  end
+  for each $alias in $host["aliases"]
+    if not regex_match("^[A-Za-z0-9][A-Za-z0-9.-]*$", $alias) then
+      config_error("ssh host " .. $host["name"] .. " has an unsafe alias: " .. $alias)
+    end
+  end
+end
+
+$BASE = $CONF["base_url"]
+if $g["opts"]["base-url"] != nil then
+  $BASE = "" .. $g["opts"]["base-url"]
+end
+$DB = $CONF["database"]
+if $g["opts"]["db"] != nil then
+  $DB = "" .. $g["opts"]["db"]
+end
+validate_url($BASE)
+validate_absolute("database override", $DB)
+$SPIKE = $g["opts"]["spike"] == true
+$ALLOW_DOWNGRADE = $g["opts"]["allow-downgrade"] == true
+
+$ROSTER = $d.roster()
+$d.assert_node($ROSTER, $CONF["target_node"])
+$node_args = $g["rest"]
+if len($node_args) == 0 then
+  $node_args = [$CONF["target_node"]]
+end
+$parsed = $d.parse_nodes($ROSTER, $node_args, [])
+$selected = $parsed["nodes"]
+if len($selected) != 1 or $selected[0] != $CONF["target_node"] then
+  config_error("this provisiond instance may deploy only to '" ..
+    $CONF["target_node"] .. "'")
+end
+
+$nodes = []
+if $d.is_foreign($ROSTER, $CONF["target_node"]) then
+  push($nodes, $CONF["target_node"])
+else
+  $rollout = $d.rollout_order($ROSTER)
+  for each $candidate in $rollout
+    if $candidate == $CONF["target_node"] then
+      push($nodes, $candidate)
+    end
+  end
+  if len($nodes) != 1 then
+    config_error("target_node is absent from the fleet rollout_order")
+  end
+end
+
+$node = $nodes[0]
+$REMOTE = $node
+if not $d.is_foreign($ROSTER, $node) then
+  $REMOTE = "root@" .. $d.mesh_ip($node)
+end
+
+-- provisiond is an operational script bundle rather than a versioned binary.
+-- This marker makes downgrade refusal and the post-install version assertion
+-- meaningful even when the deployed script bytes happen to be unchanged.
+$DEPLOY_VERSION = "1.0.0"
+$MARKER = "/etc/cosmix/provisiond/deploy-version"
+
+$ROOT = $d.cosmix_root()
+$HUB = $d.hub_root()
+$PUBLIC = $ROOT .. "/src/_etc/cosmix/provisiond"
+$PRIVATE = $HUB .. "/_provisiond"
+$SOURCES = {
+  tmpfiles: $ROOT .. "/src/_etc/tmpfiles.d/cosmix-provisiond.conf",
+  wake_script: $PUBLIC .. "/provisiond.mix",
+  drain_script: $PUBLIC .. "/drain.mix",
+  spike_script: $PUBLIC .. "/drain-spike.mix",
+  worker_lib: $PUBLIC .. "/provisiond_worker_lib.mix",
+  ct_worker: $PUBLIC .. "/ct_provision_worker.mix",
+  dns_worker: $PUBLIC .. "/dns_provision_worker.mix",
+  reconcile: $PUBLIC .. "/ct_reconcile.mix",
+  reconcile_launcher: $PUBLIC .. "/provisiond_reconcile.mix",
+  wake_unit: $ROOT .. "/src/_etc/systemd-system/cosmix-provisiond-wake.service",
+  drain_unit: $ROOT .. "/src/_etc/systemd-system/cosmix-provisiond-drain.service",
+  drain_timer: $ROOT .. "/src/_etc/systemd-system/cosmix-provisiond-drain.timer",
+  spike_unit: $ROOT .. "/src/_etc/systemd-system/cosmix-provisiond-drain-spike.service",
+  polkit: $ROOT .. "/src/_etc/polkit-1/rules.d/49-cosmix-provisiond-wake.rules"
+}
+
+-- A private hub may override public templates that contain site-specific
+-- credential paths or keep operational workers that are not shipped publicly.
+$PRIVATE_SOURCES = {
+  tmpfiles: $PRIVATE .. "/cosmix-provisiond.conf",
+  wake_script: $PRIVATE .. "/provisiond.mix",
+  drain_script: $PRIVATE .. "/drain.mix",
+  spike_script: $PRIVATE .. "/drain-spike.mix",
+  worker_lib: $HUB .. "/_bin/provisiond_worker_lib.mix",
+  ct_worker: $HUB .. "/_bin/ct_provision_worker.mix",
+  dns_worker: $HUB .. "/_bin/dns_provision_worker.mix",
+  reconcile: $HUB .. "/_bin/ct_reconcile.mix",
+  reconcile_launcher: $HUB .. "/_bin/provisiond_reconcile.mix",
+  wake_unit: $PRIVATE .. "/cosmix-provisiond-wake.service",
+  drain_unit: $PRIVATE .. "/cosmix-provisiond-drain.service",
+  drain_timer: $PRIVATE .. "/cosmix-provisiond-drain.timer",
+  spike_unit: $PRIVATE .. "/cosmix-provisiond-drain-spike.service",
+  polkit: $PRIVATE .. "/49-cosmix-provisiond-wake.rules"
+}
+if $SPIKE then
+  $PRIVATE_SOURCES["polkit"] = $PRIVATE .. "/49-cosmix-provisiond-wake-spike.rules"
+  $SOURCES["polkit"] = $ROOT ..
+    "/src/_etc/polkit-1/rules.d/49-cosmix-provisiond-wake-spike.rules"
+end
+for each $name in keys($SOURCES)
+  if is_file($PRIVATE_SOURCES[$name]) then
+    $SOURCES[$name] = $PRIVATE_SOURCES[$name]
+  end
+end
+
+$ASSETS = {}
+for each $name in keys($SOURCES)
+  $path = $SOURCES[$name]
+  $d.die_if(not is_file($path), "provisiond source asset missing: " .. $path)
+  $ASSETS[$name] = read_file($path)
+end
+
+fn deploy_node($target)
+  print("")
+  print("[" .. $target .. "] deploy provisiond " .. $DEPLOY_VERSION ..
+    " (" .. (($SPIKE and "spike") or "real drain") .. ")")
+
+  $reach = ssh_mix($REMOTE, '
+$uid = trim(run("/usr/bin/id -u"))
+if $rc != 0 or $uid != "0" then
+  eprint("remote deploy requires uid 0")
+  exit(7)
+end
+$hostname = trim(run("/usr/bin/hostname"))
+if $rc != 0 or $hostname == "" then
+  exit(8)
+end
+print($hostname)
+', {connect_timeout: 8, timeout: 15})
+  $d.die_if(not $reach["ok"],
+    $target .. " unreachable, not root, or not a working Mix node: " ..
+    trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+  print("  connected: " .. trim($reach["stdout"]))
+
+  $pre = ssh_mix($REMOTE, '
+if is_file($marker) then
+  print(trim(read_file($marker)))
+end
+', {bindings: {marker: $MARKER}, connect_timeout: 8, timeout: 10})
+  $d.die_if(not $pre["ok"],
+    $target .. " could not read the installed deploy version: " .. trim($pre["stderr"]))
+  if trim($pre["stdout"]) != "" then
+    $d.assert_not_downgrade($target, $pre["stdout"],
+      $DEPLOY_VERSION, $ALLOW_DOWNGRADE)
+  end
+
+  $result = ssh_mix($REMOTE, '
+fn fail($code, $message)
+  print("ERROR: " .. $message)
+  exit($code)
+end
+
+fn command($source, $label, $code)
+  $out = run($source)
+  if $rc != 0 then
+    fail($code, $label .. " failed: " .. trim($out))
+  end
+  return trim($out)
+end
+
+fn command_argv($argv, $label, $code)
+  $result = run_argv($argv, {timeout: 60})
+  if $result["exit_code"] != 0 then
+    fail($code, $label .. " failed: " .. trim($result["stderr"]))
+  end
+  return trim($result["stdout"])
+end
+
+fn atomic_install($path, $content, $mode, $uid, $gid)
+  $tmp = $path .. ".new." .. uuid()
+  write_new($tmp, $content, $mode)
+  chown($tmp, $uid, $gid)
+  chmod($tmp, $mode)
+  rename($tmp, $path)
+end
+
+fn assert_file($path, $content, $mode, $uid, $gid)
+  $st = stat($path, {follow_symlinks: false})
+  if $st["is_file"] != true or $st["is_symlink"] == true then
+    fail(30, $path .. " is not an installed regular file")
+  end
+  if $st["uid"] != $uid or $st["gid"] != $gid or $st["perm"] != $mode then
+    fail(31, $path .. " owner or mode mismatch")
+  end
+  if read_file($path) != $content then
+    fail(32, $path .. " content mismatch")
+  end
+end
+
+-- The drain, workers and reconciler all hold this lock while touching shared
+-- external machinery. Holding the same inode across every replacement avoids
+-- mixing releases. On first installation the lock does not yet exist, so no
+-- older process can hold it; tmpfiles creates it later in this transaction.
+$lock_path = "/run/cosmix-provisiond/drain.lock"
+if is_file($lock_path) and not flock($lock_path) then
+  fail(9, "a drain, worker or reconciler holds the provisiond operation lock")
+end
+$active_probe = run("/usr/bin/systemctl is-active --quiet cosmix-provisiond-drain.service")
+if $rc == 0 then
+  fail(9, "cosmix-provisiond-drain.service is active despite the acquired operation lock")
+end
+
+for each $bin in [
+  "/usr/bin/systemctl", "/usr/bin/systemd-tmpfiles", "/usr/bin/getent",
+  "/usr/sbin/useradd", "/usr/sbin/usermod", "/usr/bin/id",
+  "/usr/bin/ssh-keygen", "/opt/cosmix/bin/mix"
+]
+  if not is_file($bin) then
+    fail(10, $bin .. " is required")
+  end
+end
+if not is_file($operator_known_hosts) then
+  fail(10, "verified operator known_hosts is missing: " .. $operator_known_hosts)
+end
+if not is_file($db_path) then
+  fail(10, "provision database is missing: " .. $db_path)
+end
+
+-- Separate low-authority wake and credentialed drain identities.
+$_wake_lookup = run("/usr/bin/getent passwd cosmix-provisiond-wake")
+if $rc != 0 then
+  $_wake_add = command(
+    "/usr/sbin/useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin cosmix-provisiond-wake",
+    "wake user creation", 11)
+end
+$_drain_lookup = run("/usr/bin/getent passwd cosmix-provisiond")
+if $rc != 0 then
+  $_drain_add = command(
+    "/usr/sbin/useradd --system --create-home --home-dir /var/lib/cosmix-provisiond --shell /usr/sbin/nologin cosmix-provisiond",
+    "drain user creation", 11)
+end
+$passwd = command("/usr/bin/getent passwd cosmix-provisiond", "drain passwd lookup", 11)
+$fields = split($passwd, ":")
+if len($fields) < 7 then
+  fail(11, "could not parse cosmix-provisiond passwd entry")
+end
+if $fields[5] != "/var/lib/cosmix-provisiond" then
+  $_home_fix = command(
+    "/usr/sbin/usermod -d /var/lib/cosmix-provisiond cosmix-provisiond",
+    "drain home correction", 11)
+end
+$uid_p = to_number(command("/usr/bin/id -u cosmix-provisiond", "drain uid lookup", 11))
+$gid_p = to_number(command("/usr/bin/id -g cosmix-provisiond", "drain gid lookup", 11))
+if $uid_p == nil or $gid_p == nil then
+  fail(11, "could not resolve the drain uid/gid")
+end
+
+$home_p = "/var/lib/cosmix-provisiond"
+$ssh_dir = $home_p .. "/.ssh"
+$key = $ssh_dir .. "/id_ed25519"
+$known = $ssh_dir .. "/known_hosts"
+mkdir($home_p, {parents: true})
+chown($home_p, $uid_p, $gid_p)
+chmod($home_p, 0o755)
+mkdir($ssh_dir, {parents: true})
+chown($ssh_dir, $uid_p, $gid_p)
+chmod($ssh_dir, 0o700)
+if not is_file($key) then
+  $_keygen = command_argv([
+    "/usr/bin/ssh-keygen", "-q", "-t", "ed25519", "-N", "",
+    "-C", "cosmix-provisiond", "-f", $key
+  ],
+    "dedicated SSH key generation", 12)
+end
+if not is_file($key) or not is_file($key .. ".pub") then
+  fail(12, "dedicated SSH keypair is incomplete")
+end
+chown($key, $uid_p, $gid_p)
+chmod($key, 0o600)
+chown($key .. ".pub", $uid_p, $gid_p)
+chmod($key .. ".pub", 0o644)
+
+-- Seed only from operator-verified entries; never obtain trust by scanning the
+-- network. verify_address may differ from address for a multi-homed host.
+$known_content = ""
+for each $host in $ssh_hosts
+  $found_result = run_argv([
+    "/usr/bin/ssh-keygen", "-F", $host["verify_address"],
+    "-f", $operator_known_hosts
+  ], {timeout: 15})
+  $found = $found_result["stdout"]
+  $lines = ""
+  for each $line in split($found, "\n")
+    $text = trim($line)
+    if $text != "" and not starts_with($text, "#") then
+      $parts = split($text, " ")
+      if len($parts) >= 3 then
+        $lines = $lines .. $host["address"] .. " " ..
+          $parts[1] .. " " .. $parts[2] .. "\n"
+      end
+    end
+  end
+  if $lines == "" then
+    fail(13, "no verified host key for " .. $host["name"] ..
+      " at " .. $host["verify_address"] .. " in " .. $operator_known_hosts)
+  end
+  $known_content = $known_content .. $lines
+end
+atomic_install($known, $known_content, 0o644, $uid_p, $gid_p)
+
+$ssh_config = "# generated by deploy_provisiond.mix\n"
+for each $host in $ssh_hosts
+  $ssh_config = $ssh_config .. "Host " .. join($host["aliases"], " ") .. "\n"
+  $ssh_config = $ssh_config .. "    HostName " .. $host["address"] .. "\n"
+  $ssh_config = $ssh_config .. "    User root\n"
+  $ssh_config = $ssh_config .. "    IdentityFile " .. $key .. "\n"
+  $ssh_config = $ssh_config .. "    IdentitiesOnly yes\n"
+  $ssh_config = $ssh_config .. "    UserKnownHostsFile " .. $known .. "\n"
+  $ssh_config = $ssh_config .. "    StrictHostKeyChecking yes\n"
+  $ssh_config = $ssh_config .. "    ForwardAgent no\n"
+  $ssh_config = $ssh_config .. "    BatchMode yes\n"
+end
+atomic_install($ssh_dir .. "/config", $ssh_config, 0o600, $uid_p, $gid_p)
+
+-- Authenticate the database secret to the configured endpoint before the live
+-- secret or environment is replaced. A spike cannot claim work, so it retains
+-- the old non-fatal authentication behaviour.
+$dbh = sqlopen($db_path)
+$rows = sqlexec($dbh,
+  "SELECT value FROM biz_settings WHERE key = ?", ["provisiond_secret"])
+sqlclose($dbh)
+if len($rows) != 1 then
+  fail(14, "provisiond_secret is missing or duplicated in " .. $db_path)
+end
+$secret = trim("" .. $rows[0]["value"])
+if $secret == "" then
+  fail(14, "provisiond_secret is blank in " .. $db_path)
+end
+$auth = http_get($base_url .. "/biz/reconcile-list",
+  {"X-Provision-Secret": $secret}, {timeout: 10})
+$auth_status = to_number("" .. $auth["status"])
+if not $spike and $auth_status != 200 then
+  fail(15, "auth preflight returned HTTP " .. ("" .. $auth_status) ..
+    " — refusing to replace the live secret or environment")
+end
+
+$previous_invocation = trim(run(
+  "/usr/bin/systemctl show cosmix-provisiond-wake.service -p InvocationID --value"))
+if $rc != 0 then
+  $previous_invocation = ""
+end
+
+for each $dir in [
+  "/etc/cosmix/provisiond", "/etc/systemd/system", "/etc/tmpfiles.d",
+  "/etc/polkit-1/rules.d", "/opt/cosmix/share/cosmix"
+]
+  mkdir($dir, {parents: true})
+end
+chown("/etc/cosmix/provisiond", 0, 0)
+chmod("/etc/cosmix/provisiond", 0o700)
+atomic_install("/etc/cosmix/provisiond/secret", $secret, 0o400, 0, 0)
+$env_content = "CT_BASE_URL=" .. $base_url .. "\n"
+atomic_install("/etc/cosmix/provisiond/env", $env_content, 0o644, 0, 0)
+
+atomic_install("/etc/tmpfiles.d/cosmix-provisiond.conf",
+  $assets["tmpfiles"], 0o644, 0, 0)
+$_tmpfiles = command(
+  "/usr/bin/systemd-tmpfiles --create /etc/tmpfiles.d/cosmix-provisiond.conf",
+  "runtime lock creation", 16)
+
+$share = "/opt/cosmix/share/cosmix"
+$installed_scripts = {
+  provisiond: $share .. "/provisiond.mix",
+  drain: $share .. "/drain.mix",
+  spike: $share .. "/drain-spike.mix",
+  worker_lib: $share .. "/provisiond_worker_lib.mix",
+  ct_worker: $share .. "/ct_provision_worker.mix",
+  dns_worker: $share .. "/dns_provision_worker.mix",
+  reconcile: $share .. "/ct_reconcile.mix",
+  reconcile_launcher: $share .. "/provisiond_reconcile.mix"
+}
+$script_assets = {
+  provisiond: "wake_script",
+  drain: "drain_script",
+  spike: "spike_script",
+  worker_lib: "worker_lib",
+  ct_worker: "ct_worker",
+  dns_worker: "dns_worker",
+  reconcile: "reconcile",
+  reconcile_launcher: "reconcile_launcher"
+}
+for each $name in keys($installed_scripts)
+  atomic_install($installed_scripts[$name], $assets[$script_assets[$name]],
+    0o755, 0, 0)
+end
+
+$wake_unit = $assets["wake_unit"]
+if $spike then
+  $wake_unit = replace($wake_unit, "[Service]\n",
+    "[Service]\nEnvironment=PROVISIOND_DRAIN_UNIT=cosmix-provisiond-drain-spike.service\n")
+end
+atomic_install("/etc/systemd/system/cosmix-provisiond-wake.service",
+  $wake_unit, 0o644, 0, 0)
+atomic_install("/etc/systemd/system/cosmix-provisiond-drain.service",
+  $assets["drain_unit"], 0o644, 0, 0)
+atomic_install("/etc/systemd/system/cosmix-provisiond-drain.timer",
+  $assets["drain_timer"], 0o644, 0, 0)
+atomic_install("/etc/systemd/system/cosmix-provisiond-drain-spike.service",
+  $assets["spike_unit"], 0o644, 0, 0)
+atomic_install("/etc/polkit-1/rules.d/49-cosmix-provisiond-wake.rules",
+  $assets["polkit"], 0o644, 0, 0)
+
+assert_file("/etc/cosmix/provisiond/secret", $secret, 0o400, 0, 0)
+assert_file("/etc/cosmix/provisiond/env", $env_content, 0o644, 0, 0)
+assert_file("/etc/tmpfiles.d/cosmix-provisiond.conf",
+  $assets["tmpfiles"], 0o644, 0, 0)
+assert_file("/etc/systemd/system/cosmix-provisiond-wake.service",
+  $wake_unit, 0o644, 0, 0)
+assert_file("/etc/systemd/system/cosmix-provisiond-drain.service",
+  $assets["drain_unit"], 0o644, 0, 0)
+assert_file("/etc/systemd/system/cosmix-provisiond-drain.timer",
+  $assets["drain_timer"], 0o644, 0, 0)
+assert_file("/etc/systemd/system/cosmix-provisiond-drain-spike.service",
+  $assets["spike_unit"], 0o644, 0, 0)
+assert_file("/etc/polkit-1/rules.d/49-cosmix-provisiond-wake.rules",
+  $assets["polkit"], 0o644, 0, 0)
+assert_file($known, $known_content, 0o644, $uid_p, $gid_p)
+assert_file($ssh_dir .. "/config", $ssh_config, 0o600, $uid_p, $gid_p)
+for each $name in keys($installed_scripts)
+  assert_file($installed_scripts[$name], $assets[$script_assets[$name]],
+    0o755, 0, 0)
+  $_lint = command("/opt/cosmix/bin/mix lint --deny-warnings " ..
+    $installed_scripts[$name], "installed " .. $name .. " script lint", 33)
+end
+
+$_reload = command("/usr/bin/systemctl daemon-reload", "systemd daemon reload", 17)
+$_enable = command("/usr/bin/systemctl enable cosmix-provisiond-wake.service",
+  "wake citizen enable", 18)
+$_timer = run("/usr/bin/systemctl disable --now cosmix-provisiond-drain.timer")
+$_restart = command("/usr/bin/systemctl restart cosmix-provisiond-wake.service",
+  "wake citizen restart", 18)
+sleep(2)
+
+$active = command("/usr/bin/systemctl is-active cosmix-provisiond-wake.service",
+  "wake citizen active check", 19)
+if $active != "active" then
+  fail(19, "wake citizen is not active: " .. $active)
+end
+$enabled = command("/usr/bin/systemctl is-enabled cosmix-provisiond-wake.service",
+  "wake citizen enabled check", 19)
+if $enabled != "enabled" then
+  fail(19, "wake citizen is not enabled: " .. $enabled)
+end
+$timer_enabled = trim(run(
+  "/usr/bin/systemctl is-enabled cosmix-provisiond-drain.timer"))
+if $timer_enabled != "disabled" then
+  fail(19, "drain timer must remain disabled, got: " .. $timer_enabled)
+end
+
+$invocation = command(
+  "/usr/bin/systemctl show cosmix-provisiond-wake.service -p InvocationID --value",
+  "wake invocation lookup", 20)
+if $invocation == "" or
+    ($previous_invocation != "" and $invocation == $previous_invocation) then
+  fail(20, "wake citizen did not enter a new systemd invocation")
+end
+$log_lines = 0
+$attempt = 0
+while $attempt < 6 and $log_lines == 0
+  $logs = trim(run("/usr/bin/journalctl _SYSTEMD_INVOCATION_ID=" ..
+    $invocation .. " -o cat --no-pager"))
+  if $rc == 0 and $logs != "" then
+    $log_lines = len(split($logs, "\n"))
+  end
+  $attempt = $attempt + 1
+  if $log_lines == 0 and $attempt < 6 then
+    sleep(1)
+  end
+end
+if $log_lines == 0 then
+  fail(20, "wake citizen has no journald line for its current invocation")
+end
+
+-- INFO is injected by the Mix serve runtime and does not start a drain.
+send provisiond INFO
+if $rc != 0 or type($result) != "map" or $result["name"] != "provisiond" then
+  fail(21, "provisiond INFO Bus smoke failed")
+end
+
+$post_auth = http_get($base_url .. "/biz/reconcile-list",
+  {"X-Provision-Secret": $secret}, {timeout: 10})
+$post_status = to_number("" .. $post_auth["status"])
+if not $spike and $post_status != 200 then
+  fail(22, "post-install auth smoke returned HTTP " .. ("" .. $post_status))
+end
+
+atomic_install($marker, $deploy_version .. "\n", 0o644, 0, 0)
+assert_file($marker, $deploy_version .. "\n", 0o644, 0, 0)
+if trim(read_file($marker)) != $deploy_version then
+  fail(23, "installed deploy version mismatch")
+end
+
+print(data_encode({
+  version: trim(read_file($marker)),
+  invocation_id: $invocation,
+  log_lines: $log_lines,
+  active: $active,
+  enabled: $enabled,
+  timer_enabled: $timer_enabled,
+  auth_status: $post_status,
+  pubkey: trim(read_file($key .. ".pub"))
+}))
+', {
+    bindings: {
+      assets: $ASSETS,
+      base_url: $BASE,
+      db_path: $DB,
+      operator_known_hosts: $CONF["operator_known_hosts"],
+      ssh_hosts: $CONF["ssh_hosts"],
+      spike: $SPIKE,
+      marker: $MARKER,
+      deploy_version: $DEPLOY_VERSION
+    },
+    decode: "data", connect_timeout: 8, timeout: 700
+  })
+
+  if not $result["ok"] then
+    print("  remote install failed; last 40 provisiond wake log lines:")
+    $journal = ssh_mix($REMOTE,
+      'print(run("/usr/bin/journalctl -u cosmix-provisiond-wake.service -n 40 --no-pager"))',
+      {connect_timeout: 8, timeout: 15})
+    print($journal["stdout"])
+    print($journal["stderr"])
+  end
+  $d.die_if(not $result["ok"],
+    $target .. " provisiond install failed: " ..
+    trim($result["stdout"]) .. " " .. trim($result["stderr"]))
+
+  $value = $result["value"]
+  $d.die_if($value["version"] != $DEPLOY_VERSION,
+    $target .. " installed deploy version mismatch")
+  $d.die_if($value["active"] != "active" or $value["enabled"] != "enabled",
+    $target .. " wake citizen is not active and enabled")
+  $d.die_if($value["timer_enabled"] != "disabled",
+    $target .. " drain timer is not disabled")
+  $d.die_if($value["log_lines"] < 1,
+    $target .. " current wake invocation has no log lines")
+  if not $SPIKE then
+    $d.die_if($value["auth_status"] != 200,
+      $target .. " post-install authentication smoke failed")
+  end
+  print("  version/content/modes + installed-script lint: " ..
+    $value["version"] .. " OK")
+  print("  wake citizen: active + enabled; drain timer disabled")
+  print("  logging: " .. $value["log_lines"] ..
+    " line/s for current invocation " .. $value["invocation_id"])
+  print("  provisiond INFO Bus smoke: OK")
+  if not $SPIKE then
+    print("  authenticated endpoint smoke: HTTP 200")
+  end
+  print("  [" .. $target .. "] DEPLOY OK")
+  print("")
+  print("Authorize this drain identity on " .. join($ssh_names, " ") ..
+    " with a source-address restriction:")
+  print("  " .. $value["pubkey"])
+  print("  restrict,from=\"" .. $CONF["authorised_keys_from"] .. "\" <pubkey>")
+end
+
+print("target: " .. join($nodes, " "))
+$_lock = $m.mesh_take_write_lock("deploy_provisiond")
+for each $target in $nodes
+  deploy_node($target)
+end
+
+print("")
+print("deploy complete: provisiond generation/content/modes, installed-script lint, " ..
+  "wake active/enabled state, disabled drain timer, new invocation, current-invocation " ..
+  "logging, INFO Bus smoke and endpoint authentication verified on " .. join($nodes, " "))

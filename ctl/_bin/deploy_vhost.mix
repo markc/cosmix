@@ -1,0 +1,428 @@
+#!/usr/bin/env mix
+-- deploy_vhost.mix — deploy one CMS/PIM vhost from the private hub: ship its
+-- site configuration and generated thin handlers, then register its routes on
+-- the selected node. The shared vhost tree must already be deployed.
+--
+--   mix _bin/deploy_vhost.mix <vhost-fqdn> [node] [route-prefix]
+--
+-- Vhost source lives under the hub's _etc/cosmix/vhosts directory. The public
+-- route table comes from the CosMix checkout. A private config supplies the
+-- default node used when the second argument is omitted.
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_vhost.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no vhost deploy config at " .. $CONF_PATH ..
+    " — create it from deploy_vhost.conf.mix.example before deploying")
+  exit(2)
+end
+$CONF_DOC = load_data($CONF_PATH)
+if type($CONF_DOC) != "map" or type($CONF_DOC["deploy_vhost"]) != "map" then
+  print("  ERROR: " .. $CONF_PATH .. " must contain a deploy_vhost strict-data map")
+  exit(2)
+end
+$CONF = $CONF_DOC["deploy_vhost"]
+if $CONF["schema_version"] != 1 or type($CONF["default_node"]) != "string" or trim($CONF["default_node"]) == "" then
+  print("  ERROR: " .. $CONF_PATH .. " needs schema_version: 1 and a non-empty default_node")
+  exit(2)
+end
+
+fn safe_name($value)
+  if type($value) != "string" or $value == "" then
+    return false
+  end
+  return regex_match("^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$", $value) and not contains($value, "..")
+end
+
+fn safe_prefix($value)
+  return type($value) == "string" and regex_match("^[a-z0-9][a-z0-9-]*$", $value)
+end
+
+fn safe_handler($value)
+  return type($value) == "string" and regex_match("^[a-z][a-z0-9_]*$", $value)
+end
+
+$argv = args()
+if len($argv) < 1 or len($argv) > 3 then
+  print("usage: mix _bin/deploy_vhost.mix <vhost-fqdn> [node] [route-prefix]")
+  exit(2)
+end
+
+$VHOST = $argv[0]
+$NODE = $CONF["default_node"]
+if len($argv) > 1 then
+  $NODE = $argv[1]
+end
+if not safe_name($VHOST) or not contains($VHOST, ".") or not safe_name($NODE) then
+  print("  ERROR: invalid vhost or node (allowed chars: a-z 0-9 . -): " .. $VHOST .. " / " .. $NODE)
+  exit(2)
+end
+
+-- Route keys are "<prefix>_<id>". The first vhost label is convenient, but
+-- sites sharing that label need distinct explicit prefixes to avoid replacing
+-- one another's property rows.
+$PREFIX = split($VHOST, ".")[0]
+if len($argv) > 2 then
+  $PREFIX = $argv[2]
+end
+if not safe_prefix($PREFIX) then
+  print("  ERROR: invalid route prefix (allowed chars: a-z 0-9 -): " .. $PREFIX)
+  exit(2)
+end
+
+$ROSTER = $d.roster()
+$parsed = $d.parse_nodes($ROSTER, [$NODE], [])
+$NODE = $parsed["nodes"][0]
+
+-- A single-node deployment is already in hubs-last order, but validate mesh
+-- targets against the canonical order so roster drift fails before any I/O.
+if not $d.is_foreign($ROSTER, $NODE) then
+  $ordered = $d.rollout_order($ROSTER)
+  $found = false
+  for each $candidate in $ordered
+    if $candidate == $NODE then
+      $found = true
+    end
+  end
+  if not $found then
+    print("  ERROR: selected node '" .. $NODE .. "' is absent from the roster rollout_order")
+    exit(2)
+  end
+end
+
+$REMOTE = $NODE
+if not $d.is_foreign($ROSTER, $NODE) then
+  $REMOTE = "root@" .. $d.mesh_ip($NODE)
+end
+
+$VHOSTS = $d.hub_root() .. "/_etc/cosmix/vhosts"
+$VHOST_SOURCE = $VHOSTS .. "/" .. $VHOST
+$SITE_CONF = $VHOST_SOURCE .. "/site.conf.mix"
+$ROUTES_FILE = $d.cosmix_root() .. "/src/crates/cosmix-webd/vhosts/routes.mix"
+if not is_file($SITE_CONF) then
+  print("  ERROR: vhost configuration missing: " .. $SITE_CONF)
+  exit(2)
+end
+if not is_file($ROUTES_FILE) then
+  print("  ERROR: shared route table missing: " .. $ROUTES_FILE)
+  exit(2)
+end
+
+$route_module = require($ROUTES_FILE)
+$ROUTES = $route_module["ROUTES"]
+$ROUTE_OVERRIDE = $VHOST_SOURCE .. "/routes.mix"
+if is_file($ROUTE_OVERRIDE) then
+  -- Overrides are executable because they may append to or replace the shared
+  -- list. Run them in a child scope seeded with the canonical table, then bring
+  -- back only the resulting strict JSON value.
+  $override_source = '$ROUTES = ' .. data_encode($ROUTES) .. "\n"
+  $override_source = $override_source .. '$override_path = ' .. data_encode($ROUTE_OVERRIDE) .. "\n"
+  $override_source = $override_source .. 'include $override_path' .. "\n"
+  $override_source = $override_source .. 'print(json_encode($ROUTES))' .. "\n"
+  $override_result = run_argv([$d.mix_bin(), "-"], {stdin: $override_source, timeout: 30})
+  if $override_result["exit_code"] != 0 then
+    print("  ERROR: route override failed: " .. trim($override_result["stderr"]))
+    exit(2)
+  end
+  $ROUTES = json_parse(trim($override_result["stdout"]))
+  print("applied per-vhost route overrides: " .. $ROUTE_OVERRIDE)
+end
+if type($ROUTES) != "list" or len($ROUTES) == 0 then
+  print("  ERROR: route table must define a non-empty $ROUTES list")
+  exit(2)
+end
+for each $route in $ROUTES
+  if (type($route) != "map" or not safe_prefix($route["id"]) or
+      type($route["m"]) != "string" or trim($route["m"]) == "" or
+      type($route["p"]) != "string" or not starts_with($route["p"], "/") or
+      not safe_handler($route["h"])) then
+    print("  ERROR: invalid route entry in " .. $ROUTES_FILE .. ": " .. data_encode($route))
+    exit(2)
+  end
+  if $route["c"] != nil and type($route["c"]) != "list" then
+    print("  ERROR: route capabilities must be a list for " .. $route["id"])
+    exit(2)
+  end
+end
+
+-- Stage one immutable archive. The remote side verifies this exact archive
+-- before extraction, and verifies every managed file after installation.
+$mk = run_argv(["mktemp", "-d", "/tmp/cosmix-vhost-XXXXXX"])
+$d.die_if($mk["exit_code"] != 0 or trim($mk["stdout"]) == "",
+  "mktemp failed for vhost staging: " .. trim($mk["stderr"]))
+$STAGE = trim($mk["stdout"])
+$ARCHIVE = $STAGE .. ".tar.gz"
+copy($SITE_CONF, $STAGE .. "/site.conf.mix")
+
+$seen_handlers = {}
+for each $route in $ROUTES
+  $handler = $route["h"]
+  if $seen_handlers[$handler] == nil then
+    $seen_handlers[$handler] = true
+    $stub = "-- generated stub — do not edit\n"
+    $stub = $stub .. "include \"site.conf.mix\"\n"
+    $stub = $stub .. "include \"/opt/cosmix/vhosts/shared/lib/lib.mix\"\n"
+    $stub = $stub .. "include \"/opt/cosmix/vhosts/shared/apps/h_" .. $handler .. ".mix\"\n"
+    $stub = $stub .. "return " .. $handler .. "_main()\n"
+    write_file($STAGE .. "/" .. $handler .. ".mix", $stub)
+  end
+end
+
+for each $private_dir in ["canvas", "goods"]
+  $source_dir = $VHOST_SOURCE .. "/" .. $private_dir
+  if is_dir($source_dir) then
+    copy_tree($source_dir, $STAGE .. "/" .. $private_dir)
+    print("staged " .. $private_dir .. ": " .. $source_dir)
+  end
+end
+
+fn file_manifest($root)
+  $manifest = {}
+  $patterns = [$root .. "/*.mix", $root .. "/canvas/**/*", $root .. "/goods/**/*"]
+  for each $pattern in $patterns
+    for each $path in glob($pattern)
+      if is_file($path) then
+        $relative = substr($path, len($root) + 1, len($path) - len($root) - 1)
+        $manifest[$relative] = hash_file($path, "sha256")
+      end
+    end
+  end
+  return $manifest
+end
+
+$EXPECTED_FILES = file_manifest($STAGE)
+$pack = run_argv(["tar", "-C", $STAGE, "-czf", $ARCHIVE, "."], {timeout: 120})
+$d.die_if($pack["exit_code"] != 0, "tar failed: " .. trim($pack["stderr"]))
+$ARCHIVE_HASH = hash_file($ARCHIVE, "sha256")
+$REMOTE_ARCHIVE = "/tmp/cosmix-vhost-" .. uuid() .. ".tar.gz"
+
+-- Serialize vhost mutations from this hub. In particular, two registrations
+-- must not race their optimistic-concurrency pre-reads.
+$_lock = $m.mesh_take_write_lock("deploy_vhost")
+
+$reach = ssh_mix($REMOTE, '
+$host_name = trim(run("/usr/bin/hostname"))
+if $rc != 0 or $host_name == "" then
+  exit(7)
+end
+$state = trim(run("/usr/bin/systemctl is-active cosmix-webd"))
+if $rc != 0 or $state != "active" then
+  exit(8)
+end
+print(data_encode({hostname: $host_name, webd: $state}))
+', {decode: "data", connect_timeout: 8, timeout: 12})
+$d.die_if(not $reach["ok"],
+  $NODE .. " unreachable, without working Mix, or webd inactive: " ..
+  trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+print("connected: " .. $reach["value"]["hostname"] .. " (webd active)")
+
+$scp = run_argv([
+  "scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+  $ARCHIVE, $REMOTE .. ":" .. $REMOTE_ARCHIVE
+], {timeout: 120})
+$d.die_if($scp["exit_code"] != 0,
+  "archive scp -> " .. $NODE .. ": " .. trim($scp["stderr"]))
+
+$APP = "/srv/" .. $VHOST .. "/web/app"
+$install = ssh_mix($REMOTE, '
+if not is_file($archive) or hash_file($archive, "sha256") != $archive_hash then
+  exit(7)
+end
+$unpack = $archive .. ".d"
+if is_dir($unpack) then
+  remove_dir($unpack)
+end
+mkdir($unpack, {parents: false})
+$_tar = run("/usr/bin/tar -C " .. $unpack .. " -xzf " .. $archive)
+if $rc != 0 or not is_file($unpack .. "/site.conf.mix") then
+  exit(8)
+end
+
+mkdir($app .. "/public/img", {parents: true})
+for each $old in glob($app .. "/*.mix")
+  remove($old)
+end
+if is_file($app .. "/shell.html") then
+  remove($app .. "/shell.html")
+end
+for each $managed_dir in ["canvas", "goods"]
+  if is_dir($app .. "/" .. $managed_dir) then
+    remove_dir($app .. "/" .. $managed_dir)
+  end
+end
+copy_tree($unpack, $app)
+
+$_owner = run("/usr/bin/chown cosmix-webd:cosmix-webd " .. $app .. " " .. $app .. "/public/img")
+if $rc != 0 then
+  exit(9)
+end
+for each $managed_file in glob($app .. "/*.mix")
+  $_file_owner = run("/usr/bin/chown cosmix-webd:cosmix-webd " .. $managed_file)
+  if $rc != 0 then
+    exit(10)
+  end
+  chmod($managed_file, 0o644)
+end
+for each $managed_dir in ["canvas", "goods"]
+  $managed_path = $app .. "/" .. $managed_dir
+  if is_dir($managed_path) then
+    $_tree_owner = run("/usr/bin/chown -R cosmix-webd:cosmix-webd " .. $managed_path)
+    if $rc != 0 then
+      exit(11)
+    end
+    $_tree_mode = run("/usr/bin/chmod -R a+rX " .. $managed_path)
+    if $rc != 0 then
+      exit(12)
+    end
+  end
+end
+
+$actual = {}
+for each $relative, $wanted_hash in $expected_files
+  $installed = $app .. "/" .. $relative
+  if not is_file($installed) then
+    exit(13)
+  end
+  $actual[$relative] = hash_file($installed, "sha256")
+end
+for each $pattern in [$app .. "/*.mix", $app .. "/canvas/**/*", $app .. "/goods/**/*"]
+  for each $installed in glob($pattern)
+    if is_file($installed) then
+      $relative = substr($installed, len($app) + 1, len($installed) - len($app) - 1)
+      if $expected_files[$relative] == nil then
+        exit(14)
+      end
+    end
+  end
+end
+remove($archive)
+remove_dir($unpack)
+print(data_encode({archive_hash: $archive_hash, files: $actual}))
+', {
+  bindings: {
+    archive: $REMOTE_ARCHIVE,
+    archive_hash: $ARCHIVE_HASH,
+    app: $APP,
+    expected_files: $EXPECTED_FILES
+  },
+  decode: "data", connect_timeout: 8, timeout: 120
+})
+$d.die_if(not $install["ok"],
+  $NODE .. " remote install failed: " .. trim($install["stdout"]) .. " " .. trim($install["stderr"]))
+$d.die_if($install["value"]["archive_hash"] != $ARCHIVE_HASH,
+  $NODE .. " installed from an unexpected archive")
+$d.die_if($install["value"]["files"] != $EXPECTED_FILES,
+  $NODE .. " installed file manifest mismatch")
+print("installed: archive and " .. len($EXPECTED_FILES) .. " managed file hash/es verified")
+
+fn logging_state($remote)
+  return ssh_mix($remote, '
+$iid = trim(run("/usr/bin/systemctl show cosmix-webd -p InvocationID --value"))
+if $rc != 0 or $iid == "" then
+  exit(7)
+end
+$logs = run("/usr/bin/journalctl _SYSTEMD_INVOCATION_ID=" .. $iid .. " -o cat --no-pager")
+if $rc != 0 then
+  exit(8)
+end
+$reloads = 0
+for each $line in split($logs, "\n")
+  if contains($line, "rebuilt webd.handlers route table") then
+    $reloads = $reloads + 1
+  end
+end
+print(data_encode({invocation_id: $iid, reloads: $reloads}))
+', {decode: "data", connect_timeout: 8, timeout: 20})
+end
+
+$log_before = logging_state($REMOTE)
+$d.die_if(not $log_before["ok"],
+  $NODE .. " could not read current webd invocation logs: " .. trim($log_before["stderr"]))
+
+$NONCE = uuid()
+$register = ssh_mix($REMOTE, '
+$registered = []
+for each $route in $routes
+  $caps = $route["c"]
+  if $caps == nil then
+    $caps = ["db"]
+  end
+  $route_id = $prefix .. "_" .. $route["id"]
+  $row = {
+    route_id: $route_id,
+    vhost_fqdn: $vhost,
+    method: $route["m"],
+    path_pattern: $route["p"],
+    handler_kind: "mix",
+    handler_ref: $route["h"] .. ".mix",
+    enabled: true,
+    capabilities: $caps
+  }
+  send webd webd.props.get namespace=handlers key="${route_id}" body=""
+  $version = 0
+  if $rc == 0 then
+    $version = $result["version"]
+  else
+    if type($result) != "map" or $result["error_code"] != "not_found" then
+      exit(7)
+    end
+  end
+  send webd webd.props.set namespace=handlers key="${route_id}" if_version="${version}" merge=replace body=json_encode($row)
+  if $rc != 0 then
+    exit(8)
+  end
+  send noded noded.ping
+  if $rc != 0 then
+    exit(9)
+  end
+  send webd webd.props.get namespace=handlers key="${route_id}" body=""
+  if $rc != 0 or $result["fields"] != $row then
+    exit(10)
+  end
+  push($registered, $route_id)
+end
+send noded noded.ping
+if $rc != 0 then
+  exit(11)
+end
+print(data_encode({nonce: $nonce, registered: $registered}))
+', {
+  bindings: {routes: $ROUTES, prefix: $PREFIX, vhost: $VHOST, nonce: $NONCE},
+  decode: "data", connect_timeout: 8, timeout: 120
+})
+$d.die_if(not $register["ok"],
+  $NODE .. " route registration or read-back smoke failed: " ..
+  trim($register["stdout"]) .. " " .. trim($register["stderr"]))
+$d.die_if($register["value"]["nonce"] != $NONCE or
+    len($register["value"]["registered"]) != len($ROUTES),
+  $NODE .. " route registration acknowledgement mismatch")
+print("routes: " .. len($ROUTES) .. " OCC writes and exact read-backs verified")
+
+$logged = false
+$tries = 0
+while $tries < 5 and not $logged
+  $log_after = logging_state($REMOTE)
+  if $log_after["ok"] then
+    $d.die_if($log_after["value"]["invocation_id"] != $log_before["value"]["invocation_id"],
+      $NODE .. " webd invocation changed during vhost deployment")
+    if $log_after["value"]["reloads"] > $log_before["value"]["reloads"] then
+      $logged = true
+    end
+  end
+  $tries = $tries + 1
+  if not $logged and $tries < 5 then
+    sleep(1)
+  end
+end
+$d.die_if(not $logged,
+  $NODE .. " route writes produced no route-table rebuild log in the current webd invocation")
+print("logging verified: route-table rebuild recorded in current webd invocation")
+
+remove_dir($STAGE)
+$_archive_remove = run_argv(["rm", "-f", $ARCHIVE])
+
+print("")
+print("deploy complete: " .. $VHOST .. " installed and " .. len($ROUTES) ..
+  " routes verified on " .. $NODE)

@@ -1,6 +1,7 @@
 -- deploy_desktop.conf.mix.example — private workstation target for the desktop deploy.
-{
-  deploy_desktop: {
-    target_node: "alpha"
-  }
+-- Copy this file to deploy_desktop.conf.mix in the private control hub. The
+-- node must exist in that hub's fleet roster and must accept root ssh_mix.
+deploy_desktop: {
+  schema_version: 1,
+  target_node: "alpha"
 }

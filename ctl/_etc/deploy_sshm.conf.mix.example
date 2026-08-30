@@ -1,0 +1,11 @@
+-- deploy_sshm.conf.mix.example — private SSH-manager deployment settings.
+-- Copy this file to deploy_sshm.conf.mix in the private control hub and
+-- replace every placeholder. target_node must exist in its fleet roster.
+deploy_sshm: {
+  schema_version: 1,
+  target_node: "alpha",
+  base_url: "https://sshm.example.org",
+  database_path: "/srv/sshm.example.org/web/data/sshm.db",
+  drain_user: "user",
+  drain_home: "/home/user"
+}

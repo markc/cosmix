@@ -1,0 +1,16 @@
+-- deploy_shared.conf.mix.example — private targets and monotonic generation
+-- for deploy_shared.mix. Copy to deploy_shared.conf.mix in your control hub.
+{
+  deploy_shared: {
+    schema_version: 1,
+
+    -- Increase this dotted-numeric generation whenever deliberately shipping
+    -- a newer shared tree. Lower generations require --allow-downgrade.
+    deploy_version: "1.0.0",
+
+    -- Explicit arguments must be in target_nodes; no arguments use defaults.
+    -- Names must exist in the private fleet roster. Foreign nodes are valid.
+    target_nodes: ["alpha", "beta", "gamma"],
+    default_nodes: ["alpha"]
+  }
+}
