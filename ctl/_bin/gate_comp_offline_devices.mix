@@ -1,0 +1,236 @@
+#!/usr/bin/env mix
+-- gate_comp_offline_devices.mix — prove the cosmix-comp test suite touches no
+-- real device.
+--
+-- This is a workstation-only gate. It builds and traces both compositor test
+-- binaries locally; it never reads the fleet roster or contacts the mesh.
+-- The explicit --run arm prevents discovery or an accidental bare invocation
+-- from starting a long build and trace run.
+--
+-- What this asserts for both the default and the kms-live test binary:
+--   dri_fd=0       no file descriptor resolves to a path under /dev/dri
+--   dri_contact=0  no non-metadata syscall names a path under /dev/dri
+--   drm_ioctl=0    no DRM ioctl is issued on any fd
+--   dev_input=0    no path under /dev/input is touched
+--   input_ioctl=0  no ioctl is issued on an fd under /dev/input
+--
+-- The deliberate dri_metadata exemption covers metadata-only inspection of a
+-- device node. It is narrow: a line carrying an fd annotation such as
+-- </dev/dri is rejected independently, and every exempt line is printed.
+--
+-- Usage:
+--   mix _bin/gate_comp_offline_devices.mix --run
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn usage($message)
+  print("gate_comp_offline_devices: " .. $message)
+  print("usage: mix _bin/gate_comp_offline_devices.mix --run")
+  exit(2)
+end
+
+$argv = args()
+if len($argv) != 1 or $argv[0] != "--run" then
+  usage("refusing to build or trace without the explicit --run arm")
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $message)
+  exit(2)
+end
+
+fn has_str($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn assert_only_keys($value, $allowed, $where)
+  if type($value) != "map" then
+    config_error($where .. " must be a map")
+  end
+  for each $key in keys($value)
+    if not has_str($allowed, $key) then
+      config_error($where .. " contains unknown key '" .. $key .. "'")
+    end
+  end
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/gate_comp_offline_devices.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no offline-device gate configuration at " .. $CONF_PATH)
+  print("         copy _etc/gate_comp_offline_devices.conf.mix.example there and set this workstation's evidence directory")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  assert_only_keys($loaded, ["gate_comp_offline_devices"], $CONF_PATH)
+  $CONF = validate($loaded["gate_comp_offline_devices"], {
+    schema_version: {type: "integer", enum: [1]},
+    evidence_dir: {type: "string", nonblank: true}
+  })
+  assert_only_keys($CONF, ["schema_version", "evidence_dir"],
+    "gate_comp_offline_devices")
+catch $error
+  config_error("invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+end
+
+$EVIDENCE_DIR = $CONF["evidence_dir"]
+if not starts_with($EVIDENCE_DIR, "/") then
+  config_error($CONF_PATH .. ": gate_comp_offline_devices.evidence_dir must be absolute")
+end
+
+$COMP = $d.cosmix_root() .. "/src/desktop"
+mkdir($EVIDENCE_DIR, {parents: true})
+
+-- -yy annotates every fd with the path it resolves to. %file covers the whole
+-- file-name-taking syscall class, so metadata access and alternate open paths
+-- cannot disappear from the measurement.
+$STRACE_EVENTS = "trace=%file,ioctl"
+
+fn trace_one($feature, $label)
+  $argv = ["memguard", "cargo", "test", "-p", "cosmix-comp", "--no-run"]
+  if $feature != "" then
+    $argv = concat($argv, ["--features", $feature])
+  end
+  $build = run_argv($argv, {timeout: 1800, cwd: $COMP, max_output: 0})
+  if $build["exit_code"] != 0 then
+    print("FAIL[" .. $label .. "]: build failed exit=" ..
+      to_string($build["exit_code"]))
+    print($build["stderr"])
+    return 1
+  end
+
+  -- Discover the binary from this build's output. A hardcoded target hash
+  -- could trace stale bytes and report a clean result about yesterday's tree.
+  $bins = []
+  for each $line in split($build["stderr"], "\n")
+    if contains($line, "Executable") then
+      $open = split($line, "(")
+      if len($open) >= 2 then
+        $close = split($open[len($open) - 1], ")")
+        push($bins, trim($close[0]))
+      end
+    end
+  end
+  if len($bins) != 1 then
+    print("FAIL[" .. $label .. "]: expected exactly one test executable, got " ..
+      to_string(len($bins)))
+    return 1
+  end
+  $bin = $bins[0]
+  if not starts_with($bin, "/") then
+    $bin = $COMP .. "/" .. $bin
+  end
+
+  $trace = $EVIDENCE_DIR .. "/" .. $label .. ".txt"
+  $run = run_argv([
+    "strace", "-f", "-yy", "-o", $trace, "-e", $STRACE_EVENTS,
+    $bin, "--test-threads", "1"
+  ], {timeout: 1800, cwd: $COMP, max_output: 0})
+
+  $lines = split(read_file($trace), "\n")
+  $bad = 0
+  print("--- " .. $label .. " (" .. basename($bin) .. ") ---")
+  print("exit=" .. to_string($run["exit_code"]) ..
+    " trace_lines=" .. to_string(len($lines)))
+
+  -- A zero is meaningful only if the suite ran and the tracer saw activity.
+  if $run["exit_code"] != 0 then
+    print("FAIL[" .. $label .. "]: test run exited non-zero")
+    print($run["stdout"])
+    $bad = $bad + 1
+  end
+  if not contains($run["stdout"], "test result: ok.") then
+    print("FAIL[" .. $label .. "]: no passing test-result line")
+    $bad = $bad + 1
+  end
+  -- Match libtest's wording: the loose substring "0 passed" also occurs in
+  -- counts such as "460 passed".
+  if contains($run["stdout"], "ok. 0 passed") then
+    print("FAIL[" .. $label .. "]: the binary ran no tests")
+    $bad = $bad + 1
+  end
+  $solibs = filter($lines, fn($line) = contains($line, ".so"))
+  if len($solibs) == 0 then
+    print("FAIL[" .. $label ..
+      "]: trace captured no shared-library access — the tracer saw nothing")
+    $bad = $bad + 1
+  end
+
+  $dri = filter($lines, fn($line) = contains($line, "/dev/dri"))
+  -- An fd annotation proves the process holds the device. Check it before and
+  -- independently of the metadata-only syscall exemption.
+  $dri_fd = filter($dri, fn($line) = contains($line, "</dev/dri"))
+  $dri_rest = filter($dri, fn($line) = not contains($line, "</dev/dri"))
+  $dri_metadata = filter($dri_rest, fn($line) = contains($line, "newfstatat(")
+    or contains($line, "statx(")
+    or contains($line, "stat(")
+    or contains($line, "lstat(")
+    or contains($line, "access(")
+    or contains($line, "faccessat(")
+    or contains($line, "faccessat2(")
+    or contains($line, "readlink(")
+    or contains($line, "readlinkat("))
+  $dri_contact = filter($dri_rest, fn($line) = not contains($line, "newfstatat(")
+    and not contains($line, "statx(")
+    and not contains($line, "stat(")
+    and not contains($line, "lstat(")
+    and not contains($line, "access(")
+    and not contains($line, "faccessat(")
+    and not contains($line, "faccessat2(")
+    and not contains($line, "readlink(")
+    and not contains($line, "readlinkat("))
+  $drm = filter($lines, fn($line) = contains($line, "DRM_IOCTL"))
+  -- Check the whole input directory, including alternate device spellings.
+  -- There is no exemption: the suite should never name any input node.
+  $input = filter($lines, fn($line) = contains($line, "/dev/input"))
+  $input_ioctl = filter($input, fn($line) = contains($line, "ioctl("))
+
+  print("dri_fd=" .. to_string(len($dri_fd)) ..
+    " dri_contact=" .. to_string(len($dri_contact)) ..
+    " drm_ioctl=" .. to_string(len($drm)) ..
+    " dev_input=" .. to_string(len($input)) ..
+    " input_ioctl=" .. to_string(len($input_ioctl)) ..
+    " (dri_metadata=" .. to_string(len($dri_metadata)) .. ", exempt)")
+  for each $line in $dri_metadata
+    print("    exempt: " .. $line)
+  end
+
+  for each $name in [
+    "dri_fd", "dri_contact", "drm_ioctl", "dev_input", "input_ioctl"
+  ]
+    $hits = []
+    if $name == "dri_fd" then $hits = $dri_fd end
+    if $name == "dri_contact" then $hits = $dri_contact end
+    if $name == "drm_ioctl" then $hits = $drm end
+    if $name == "dev_input" then $hits = $input end
+    if $name == "input_ioctl" then $hits = $input_ioctl end
+    if len($hits) > 0 then
+      print("FAIL[" .. $label .. "]: " .. $name .. " is not zero")
+      for each $line in $hits
+        print("    " .. $line)
+      end
+      $bad = $bad + 1
+    end
+  end
+
+  return $bad
+end
+
+$bad = 0
+$bad = $bad + trace_one("", "default")
+$bad = $bad + trace_one("kms-live", "kms-live")
+
+print("")
+if $bad == 0 then
+  print("PASS: both test binaries held no /dev/dri fd and never named /dev/input")
+  exit(0)
+end
+print("FAIL: " .. to_string($bad) .. " offline-discipline violations")
+exit(1)

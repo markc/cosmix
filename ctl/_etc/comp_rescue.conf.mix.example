@@ -1,0 +1,18 @@
+-- comp_rescue.conf.mix.example — private local compositor rescue settings.
+-- Copy this file to comp_rescue.conf.mix in the private control hub and set
+-- the VTs and evidence path for the developer workstation. The rescue script
+-- drives the live compositor and console; do not run it as a config test.
+{
+  comp_rescue: {
+    schema_version: 1,
+
+    -- Dedicated compositor VT used when no command-line override is supplied.
+    default_vt: 7,
+
+    -- Safe text-console VT selected after the compositor is terminated.
+    restore_vt: 1,
+
+    -- Parent holding timestamp-named compositor capture directories.
+    evidence_dir: "/home/user/.local/state/cosmix/comp-runs"
+  }
+}

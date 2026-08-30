@@ -1,0 +1,172 @@
+#!/usr/bin/env mix
+-- comp_rescue.mix [vt] — dead-man rescue for local cosmix-comp kms-live runs.
+--
+-- Run as root after arming it through a delayed transient unit before a live
+-- compositor test. It captures evidence from a wedged compositor, terminates
+-- it, and restores the console so the workstation does not need a hard reset.
+-- The compositor VT, restore VT and evidence directory are private workstation
+-- state supplied by comp_rescue.conf.mix.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/comp_rescue.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no compositor rescue config at " .. $CONF_PATH ..
+    " — create it from comp_rescue.conf.mix.example")
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn has_str($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn assert_only_keys($value, $allowed, $where)
+  if type($value) != "map" then
+    config_error($where .. " must be a map")
+  end
+  for each $key in keys($value)
+    if not has_str($allowed, $key) then
+      config_error($where .. " contains unknown key '" .. $key .. "'")
+    end
+  end
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  assert_only_keys($loaded, ["comp_rescue"], $CONF_PATH)
+  $CONF = validate($loaded["comp_rescue"], {
+    schema_version: {type: "integer", enum: [1]},
+    default_vt: {type: "integer", min: 1, max: 63},
+    restore_vt: {type: "integer", min: 1, max: 63},
+    evidence_dir: {type: "string", nonblank: true}
+  })
+  assert_only_keys($CONF,
+    ["schema_version", "default_vt", "restore_vt", "evidence_dir"],
+    "comp_rescue")
+catch $error
+  config_error("invalid strict-data config: " .. $error)
+end
+
+$EVIDENCE_DIR = $CONF["evidence_dir"]
+if not starts_with($EVIDENCE_DIR, "/") then
+  config_error("comp_rescue.evidence_dir must be absolute")
+end
+if not regex_match("^[A-Za-z0-9/._-]+$", $EVIDENCE_DIR) then
+  config_error("comp_rescue.evidence_dir must use only [A-Za-z0-9/._-]")
+end
+
+fn usage($message)
+  print("comp_rescue: " .. $message)
+  print("usage: mix _bin/comp_rescue.mix [vt]")
+  exit(2)
+end
+
+$argv = args()
+if len($argv) > 1 then
+  usage("expected at most one VT argument")
+end
+
+$vt = to_string($CONF["default_vt"])
+if len($argv) == 1 then
+  $vt = $argv[0]
+  if not regex_match("^[0-9]+$", $vt) then
+    usage("vt must contain decimal digits only")
+  end
+  $vt_number = to_number($vt)
+  if $vt_number == nil or $vt_number < 1 or $vt_number > 63 then
+    usage("vt must be in 1..63")
+  end
+end
+$RESTORE_VT = to_string($CONF["restore_vt"])
+
+-- Refuse before opening evidence or signalling a process. The commands below
+-- require root to inspect arbitrary processes, read dmesg and restore a VT.
+$uid = run_argv(["id", "-u"], {timeout: 5})
+$d.die_if($uid["exit_code"] != 0 or trim($uid["stdout"]) != "0",
+  "must run as root — compositor inspection, signalling and VT restore require it")
+$d.die_if(not exists($EVIDENCE_DIR),
+  "evidence directory does not exist: " .. $EVIDENCE_DIR)
+
+-- Evidence lands in the lexically newest timestamped capture directory, or
+-- in the configured parent when no run directory exists.
+$outdir = $EVIDENCE_DIR
+$dirs = sort(glob($EVIDENCE_DIR .. "/2*"))
+if len($dirs) > 0 then
+  $outdir = $dirs[len($dirs) - 1]
+end
+$log = $outdir .. "/rescue.log"
+
+fn note($line)
+  append_file($log, $line .. "\n")
+  print($line)
+  return nil
+end
+
+$stamp = run_argv(["date", "+%Y-%m-%d %H:%M:%S"])
+note("comp_rescue fired at " .. trim($stamp["stdout"]) .. " (vt " .. $vt .. ")")
+
+-- Capture every exact-name compositor before sending TERM. If it has already
+-- died, evidence collection and console restoration must still continue.
+$found = run_argv(["pgrep", "-x", "cosmix-comp"])
+if $found["exit_code"] != 0 then
+  note("cosmix-comp: NOT running — it died and left the VT unrestored")
+else
+  $pids = split(trim($found["stdout"]), "\n")
+  for each $pid in $pids
+    note("cosmix-comp alive, pid " .. $pid .. " — capturing state before killing")
+    $ps = run_argv(["ps", "-o", "pid,stat,wchan:32,etime,rss,cmd", "-p", $pid])
+    append_file($log, $ps["stdout"])
+    try
+      append_file($log, read_file("/proc/" .. $pid .. "/status"))
+    catch $message
+      note("proc status unreadable: " .. $message)
+    end
+    $stacks = run_argv(["eu-stack", "-p", $pid], {timeout: 20})
+    write_file($outdir .. "/rescue-stacks-" .. $pid .. ".txt",
+      $stacks["stdout"] .. $stacks["stderr"])
+    note("thread stacks -> rescue-stacks-" .. $pid .. ".txt")
+    $kill = run_argv(["kill", "-TERM", $pid])
+    if $kill["exit_code"] != 0 then
+      note("kill -TERM failed: " .. trim($kill["stderr"]))
+    end
+  end
+  sleep(3)
+  $still = run_argv(["pgrep", "-x", "cosmix-comp"])
+  if $still["exit_code"] == 0 then
+    note("still alive after TERM; sending KILL")
+    run_argv_must(["pkill", "-KILL", "-x", "cosmix-comp"])
+  else
+    note("compositor exited on TERM")
+  end
+end
+
+-- Preserve the kernel's GPU/DRM view even when the compositor could not log.
+$dmesg = run_argv(["dmesg", "--time-format", "iso"], {max_output: 0})
+write_file($outdir .. "/rescue-dmesg.txt", $dmesg["stdout"])
+
+-- Put the keyboard back in translated mode, leave graphics mode, then flush.
+$kbd = run_argv(["kbd_mode", "-s", "-C", "/dev/tty" .. $vt])
+if $kbd["exit_code"] != 0 then
+  note("kbd_mode failed: " .. trim($kbd["stderr"]))
+end
+$chvt = run_argv(["chvt", $RESTORE_VT])
+if $chvt["exit_code"] != 0 then
+  note("chvt " .. $RESTORE_VT .. " failed: " .. trim($chvt["stderr"]))
+end
+$sync = run_argv(["sync"])
+if $sync["exit_code"] != 0 then
+  note("sync failed: " .. trim($sync["stderr"]))
+end
+note("console restore attempted (kbd_mode -s on tty" .. $vt .. ", chvt " ..
+  $RESTORE_VT .. "); evidence in " .. $outdir)

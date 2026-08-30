@@ -1,0 +1,9 @@
+-- gate_comp_offline_devices.conf.mix.example — private local trace location.
+-- Copy this file to gate_comp_offline_devices.conf.mix in the private control
+-- hub and replace the placeholder for the developer workstation.
+{
+  gate_comp_offline_devices: {
+    schema_version: 1,
+    evidence_dir: "/home/user/.local/state/cosmix/offline-device-gate"
+  }
+}
