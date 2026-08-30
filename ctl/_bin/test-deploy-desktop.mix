@@ -1,0 +1,684 @@
+#!/usr/bin/env mix
+-- test-deploy-desktop.mix — the regression suite for deploy_desktop.mix's
+-- manifest and ledger functions.
+--
+--   mix _bin/test-deploy-desktop.mix           (exit 0 = every probe passed)
+--   mix _bin/test-deploy-desktop.mix OTHER.mix (run the suite against other text)
+--
+-- The second form is the DIAGONAL, and it is not a convenience — it is how a
+-- probe earns the right to stay. A suite that passes against the code it was
+-- written for proves nothing on its own; the question is whether it FAILS
+-- against the code that lacked the fix. Extract the previous deployer and run
+-- the suite against it:
+--
+--   git show HEAD:_bin/deploy_desktop.mix > /tmp/old.mix
+--   mix _bin/test-deploy-desktop.mix /tmp/old.mix
+--
+-- Every probe added alongside a fix must fail there. Two probes in this file
+-- passed against the old text for a reason other than the one they name — a
+-- daemon fixture that omitted its activation paths refused for a missing
+-- `dbus_service` while the probe was named for `user_unit` — which is a probe
+-- that reads as coverage and has none.
+--
+-- The deployer installs root-owned files into /usr/local and /opt and may
+-- NEVER delete anything, so its inventory is the only mechanism that can ever
+-- name a stray file again. Every probe below is one way that inventory has
+-- been wrong in review — a lost manifest read as a first deploy, a carried
+-- path replaced with nil and the root file it named stranded, a swept temp
+-- held in memory instead of flushed. A regression in any of them strands a
+-- root file permanently, so do not delete a probe because it looks obvious.
+--
+-- The functions under test are EXTRACTED VERBATIM from the shipped deployer
+-- and sourced, rather than transcribed here: the suite has to fail when the
+-- real file changes, and a copy would quietly stop tracking it. Running the
+-- deployer itself is not an option — it installs to /usr/local. Destinations
+-- are redirected into a per-run scratch tree, so nothing here touches /opt or
+-- /usr/local.
+--
+-- `source()` at run time is why `mix lint` reports one MIX-W2401 on this file:
+-- it disables undefined-name analysis. That is inherent to extract-and-source
+-- and is the price of testing the shipped text.
+--
+-- Under test: _bin/deploy_desktop.mix
+
+$d = require("../_lib/deploy_lib.mix")
+$DEFAULT_DEPLOYER = $d.hub_root() .. "/_bin/deploy_desktop.mix"
+$COSMIX = $d.cosmix_root()
+
+-- $1 rather than args(): args() has historically carried the interpreter's own
+-- argv, so a positional is the only reading that is right in every invocation.
+$DEPLOYER = $1 == nil ? $DEFAULT_DEPLOYER : $1
+if not exists($DEPLOYER, { "follow_symlinks": false }) then
+  print "ERROR: no file to test at " .. $DEPLOYER
+  exit(2)
+end
+if $DEPLOYER != $DEFAULT_DEPLOYER then
+  print "-- DIAGONAL RUN against " .. $DEPLOYER
+  print "-- Probes are EXPECTED to fail here; a probe that passes against older"
+  print "-- text is not testing what its name says."
+  print ""
+end
+$BASE = "/tmp/dt-mtest-" .. pid()
+
+-- The deployer's own destination constants, redirected into the scratch tree.
+-- The extracted functions close over these by name.
+$DT_DEST = $BASE .. "/applications"
+$BIN_DEST = $BASE .. "/bin"
+$ICON_DEST = $BASE .. "/icons"
+$MANIFEST = $BASE .. "/share/cosmix-desktop.manifest"
+$AUTOSTART_DEST = $BASE .. "/autostart"
+$DBUS_DEST = $BASE .. "/dbus-1/services"
+$USER_UNIT_DEST = $BASE .. "/systemd/user"
+$ALL_SLUGS = ["studio", "filemgr", "tray", "trayd", "tower"]
+$REREAD = "\n  (rerun advice)"
+
+-- ------------------------------------------------------------------ extraction
+-- A function runs from its `function NAME(` header to the first line that is
+-- exactly `end`. That is exact for this file because every nested block in the
+-- extracted functions is indented, which the deployer's own style guarantees.
+$WANT = ["empty_manifest", "merge_manifest", "write_manifest", "manifest_refusal",
+         "load_existing_manifest", "sweep_temps", "flush_ledger", "record_temps",
+         "exec_parts", "activation_defects"]
+$FUNCS = $BASE .. "/funcs.mix"
+mkdir($BASE)
+
+$src = split(read_file($DEPLOYER), "\n")
+$out = []
+for each $want in $WANT
+  $header = "function " .. $want .. "("
+  $start = nil
+  $i = 0
+  for each $line in $src
+    if $start == nil and starts_with($line, $header) then
+      $start = $i
+    end
+    $i = $i + 1
+  end
+  if $start == nil then
+    print "ERROR: " .. $DEPLOYER .. " has no function " .. $want
+    print "  Either it was renamed or removed. This suite cannot answer without"
+    print "  it, so it refuses rather than report a pass over nothing."
+    exit(2)
+  end
+  $j = $start
+  $done = false
+  while not $done
+    push($out, $src[$j])
+    if $src[$j] == "end" and $j > $start then
+      $done = true
+    end
+    $j = $j + 1
+  end
+  push($out, "")
+end
+write_file($FUNCS, join($out, "\n") .. "\n")
+
+$pass = 0
+$failn = 0
+function fail($msg)
+  raise("TEST_FAIL", $msg)
+end
+function check($label, $got, $want)
+  if $got == $want then
+    print "  PASS  " .. $label
+    return true
+  end
+  print "  FAIL  " .. $label .. " (got " .. to_string($got) .. ", want " .. to_string($want) .. ")"
+  return false
+end
+source($FUNCS)
+
+mkdir($DT_DEST)
+mkdir($BIN_DEST)
+mkdir($AUTOSTART_DEST)
+mkdir($DBUS_DEST)
+mkdir($USER_UNIT_DEST)
+mkdir($ICON_DEST .. "/hicolor/48x48/apps")
+mkdir(dirname($MANIFEST))
+
+-- ---------------------------------------------------------------- merge_manifest
+-- MAJOR #5: a kind="tray" app changed to kind="app" produces a fresh entry with
+-- no autostart, while the root file it named is still in /etc/xdg/autostart and
+-- this deployer may not remove it. Replacing the field strands that file.
+$existing = {
+  "installed": [
+    { "app": "cosmix-tray", "slug": "tray", "bin": $BIN_DEST .. "/cosmix-tray", "desktop": $DT_DEST .. "/dev.cosmix.tray.desktop", "autostart": "/etc/xdg/autostart/dev.cosmix.tray.desktop", "icons": [$ICON_DEST .. "/hicolor/48x48/apps/dev.cosmix.tray.png"] },
+    { "app": "cosmix-tower", "slug": "tower", "bin": $BIN_DEST .. "/cosmix-tower", "desktop": $DT_DEST .. "/dev.cosmix.tower.desktop", "autostart": nil, "icons": [] }
+  ],
+  "shared": [$DT_DEST .. "/mimeinfo.cache"]
+}
+$fresh_no_autostart = [
+  { "app": "cosmix-tray", "slug": "tray", "bin": $BIN_DEST .. "/cosmix-tray", "desktop": $DT_DEST .. "/dev.cosmix.tray.desktop", "autostart": nil, "icons": [$ICON_DEST .. "/hicolor/48x48/apps/dev.cosmix.tray-new.png"] }
+]
+$m = merge_manifest($existing, $fresh_no_autostart, ["cosmix-tray"], [])
+$tray = nil
+for each $e in $m["installed"]
+  if $e["app"] == "cosmix-tray" then
+    $tray = $e
+  end
+end
+if check("tray->app keeps the recorded autostart path", $tray["autostart"], "/etc/xdg/autostart/dev.cosmix.tray.desktop") then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and still unions the icon ledger", length($tray["icons"]), 2) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and leaves the unselected app untouched", length($m["installed"]), 2) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- A fresh autostart must WIN over a recorded one; carry-forward is only for nil.
+$fresh_with = [
+  { "app": "cosmix-tray", "slug": "tray", "bin": "", "desktop": "", "autostart": "/etc/xdg/autostart/dev.cosmix.tray.desktop.NEW", "icons": [] }
+]
+$m2 = merge_manifest($existing, $fresh_with, ["cosmix-tray"], [])
+$tray2 = nil
+for each $e in $m2["installed"]
+  if $e["app"] == "cosmix-tray" then
+    $tray2 = $e
+  end
+end
+if check("a fresh autostart still replaces the recorded one", $tray2["autostart"], "/etc/xdg/autostart/dev.cosmix.tray.desktop.NEW") then $pass = $pass + 1 else $failn = $failn + 1 end
+-- ...and the replaced one is a root-owned file this deployer will never delete,
+-- so dropping its name strands it forever. Same rule as the daemon paths below.
+if check("  and the displaced autostart is not lost", contains($m2["shared"], "/etc/xdg/autostart/dev.cosmix.tray.desktop"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- MAJOR #3: the shared list unions rather than replaces, so the section-4
+-- preclaim survives a section-5 write whose generator failed.
+$m3 = merge_manifest($existing, [], [], [$ICON_DEST .. "/hicolor/icon-theme.cache"])
+if check("shared unions the existing entries", contains($m3["shared"], $DT_DEST .. "/mimeinfo.cache"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and adds the new one", contains($m3["shared"], $ICON_DEST .. "/hicolor/icon-theme.cache"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- ---------------------------------------------------------- orphan scan (MAJOR #4)
+-- No manifest + managed files on disk = a LOST inventory, and a partial run
+-- must refuse. Every path family counts, not just the desktop entry -- that is
+-- the one an operator is most likely to have already removed by hand.
+
+-- A refusal that never fired leaves $why nil, and every "and names it" check
+-- would then abort the whole suite on the nil rather than record one failure.
+-- The diagonal run -- this suite against the PREVIOUS deployer, to prove a new
+-- check actually fails there -- needs the suite to survive its own failures.
+function names($why, $needle)
+  if $why == nil then
+    return false
+  end
+  return contains($why, $needle)
+end
+function refuses($label)
+  $why = nil
+  try
+    load_existing_manifest($MANIFEST, true)
+  catch $msg, $err
+    $why = $msg
+  end
+  return $why
+end
+
+if check("a clean tree with no manifest is a first deploy, not a refusal", refuses("clean") == nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+write_file($BIN_DEST .. "/cosmix-tray", "binary\n")
+$why = refuses("bin only")
+if check("an orphaned BINARY alone refuses a partial deploy", $why != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and names the file it found", names($why, $BIN_DEST .. "/cosmix-tray"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+remove($BIN_DEST .. "/cosmix-tray")
+
+-- The autostart entry is the one that keeps LAUNCHING a forgotten app at every
+-- login, and it survives an operator deleting the visible launcher by hand.
+write_file($AUTOSTART_DEST .. "/dev.cosmix.tray.desktop", "[Desktop Entry]\n")
+$why = refuses("autostart only")
+if check("an orphaned AUTOSTART entry alone refuses a partial deploy", $why != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and names it", names($why, $AUTOSTART_DEST .. "/dev.cosmix.tray.desktop"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+remove($AUTOSTART_DEST .. "/dev.cosmix.tray.desktop")
+
+write_file($ICON_DEST .. "/hicolor/48x48/apps/dev.cosmix.tray.png", "png\n")
+$why = refuses("icon only")
+if check("an orphaned ICON alone refuses a partial deploy", $why != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and names it", names($why, "dev.cosmix.tray.png"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+remove($ICON_DEST .. "/hicolor/48x48/apps/dev.cosmix.tray.png")
+
+write_file($DT_DEST .. "/dev.cosmix.studio.desktop", "[Desktop Entry]\n")
+$why = refuses("desktop only")
+if check("the desktop entry still refuses (unchanged behaviour)", $why != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+remove($DT_DEST .. "/dev.cosmix.studio.desktop")
+
+-- kind="daemon" adds two more root-owned families, and both are as slug-derived
+-- as the other three -- so a lost inventory has to find them too. The D-Bus
+-- service file is the one that keeps a forgotten daemon ACTIVATABLE by name
+-- with nothing recording why, which is the daemon-kind analogue of the
+-- autostart entry above.
+write_file($DBUS_DEST .. "/dev.cosmix.trayd.service", "[D-BUS Service]\n")
+$why = refuses("dbus service only")
+if check("an orphaned D-BUS SERVICE file alone refuses a partial deploy", $why != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and names it", names($why, $DBUS_DEST .. "/dev.cosmix.trayd.service"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+remove($DBUS_DEST .. "/dev.cosmix.trayd.service")
+
+write_file($USER_UNIT_DEST .. "/cosmix-trayd.service", "[Unit]\n")
+$why = refuses("user unit only")
+if check("an orphaned USER UNIT alone refuses a partial deploy", $why != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and names it", names($why, $USER_UNIT_DEST .. "/cosmix-trayd.service"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+remove($USER_UNIT_DEST .. "/cosmix-trayd.service")
+
+-- The daemon families are scanned for EVERY slug, not just the ones whose
+-- current metadata says kind="daemon" -- the scan stands in for the manifest,
+-- so it cannot know any slug's kind. An app that used to be a daemon must
+-- still be found.
+write_file($USER_UNIT_DEST .. "/cosmix-tray.service", "[Unit]\n")
+$why = refuses("user unit for an app-kind slug")
+if check("a daemon-family orphan is found under an APP-kind slug too", $why != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+remove($USER_UNIT_DEST .. "/cosmix-tray.service")
+
+-- ...and a foreign unit in the same directory is not ours.
+write_file($USER_UNIT_DEST .. "/pipewire.service", "[Unit]\n")
+if check("a foreign user unit is not treated as our orphan", refuses("foreign unit") == nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+remove($USER_UNIT_DEST .. "/pipewire.service")
+
+-- An icon belonging to no known slug is not ours and must not be reported.
+write_file($ICON_DEST .. "/hicolor/48x48/apps/org.kde.konsole.png", "png\n")
+if check("a foreign icon is not treated as our orphan", refuses("foreign") == nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+remove($ICON_DEST .. "/hicolor/48x48/apps/org.kde.konsole.png")
+
+-- A FULL deploy is the advertised recovery, so it must not be blocked by the
+-- same state.
+write_file($BIN_DEST .. "/cosmix-tray", "binary\n")
+$full = load_existing_manifest($MANIFEST, false)
+if check("a FULL deploy is still allowed with orphans present", length($full["installed"]), 0) then $pass = $pass + 1 else $failn = $failn + 1 end
+-- BLOCKER (round six): the full deploy is the ADVERTISED recovery, so it must
+-- carry the orphans it discovered into the manifest it rebuilds. Discarding
+-- them stranded a root file permanently -- by the very run meant to fix it.
+if check("  and RECORDS the orphan it found", contains($full["shared"], $BIN_DEST .. "/cosmix-tray"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+remove($BIN_DEST .. "/cosmix-tray")
+
+-- An icon whose name the current source no longer produces: found by the scan,
+-- absent from the fresh install list, and previously dropped on the floor.
+write_file($ICON_DEST .. "/hicolor/48x48/apps/dev.cosmix.tray-old.png", "png\n")
+$full2 = load_existing_manifest($MANIFEST, false)
+if check("a stale icon survives the rebuild", contains($full2["shared"], $ICON_DEST .. "/hicolor/48x48/apps/dev.cosmix.tray-old.png"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+remove($ICON_DEST .. "/hicolor/48x48/apps/dev.cosmix.tray-old.png")
+
+-- ...and a clean tree must NOT acquire a phantom shared list.
+$clean = load_existing_manifest($MANIFEST, false)
+if check("a clean tree records nothing", length($clean["shared"]), 0) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- ------------------------------- kind="daemon" entry validation (phase-1 trayd)
+-- A daemon installs no desktop entry, so requiring one would refuse every
+-- manifest the trayd deploy writes. But the requirement must relax ONLY for
+-- kind="daemon" -- an entry with no kind at all predates the field and has to
+-- keep validating exactly as strictly as it did before, or a corrupt legacy
+-- manifest starts merging silently.
+function loads($entry)
+  $why = nil
+  write_file($MANIFEST, data_encode({ "installed": [$entry], "shared": [] }, true) .. "\n")
+  try
+    load_existing_manifest($MANIFEST, true)
+  catch $msg, $err
+    $why = $msg
+  end
+  remove($MANIFEST)
+  return $why
+end
+
+$daemon = { "app": "cosmix-trayd", "kind": "daemon", "bin": $BIN_DEST .. "/cosmix-trayd", "dbus_service": $DBUS_DEST .. "/dev.cosmix.trayd.service", "user_unit": $USER_UNIT_DEST .. "/cosmix-trayd.service", "icons": [] }
+if check("a daemon entry with no desktop path validates", loads($daemon) == nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- The diagonal: the SAME entry without the kind field must still refuse, which
+-- is what proves the relaxation is keyed on kind and not simply absent.
+$legacy = { "app": "cosmix-trayd", "bin": $BIN_DEST .. "/cosmix-trayd", "icons": [] }
+$why = loads($legacy)
+if check("the same entry with NO kind still refuses (legacy stays strict)", $why != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and names the desktop field", names($why, "desktop"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- An explicit kind="app" is the other half of the diagonal.
+$explicit_app = { "app": "cosmix-tray", "kind": "app", "bin": $BIN_DEST .. "/cosmix-tray", "icons": [] }
+if check("an explicit kind=\"app\" with no desktop path refuses", loads($explicit_app) != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- bin is required for BOTH kinds -- the daemon relaxation drops the desktop
+-- entry only. An entry naming a daemon with no binary is a lying inventory.
+$no_bin = { "app": "cosmix-trayd", "kind": "daemon", "dbus_service": $DBUS_DEST .. "/dev.cosmix.trayd.service", "icons": [] }
+$why = loads($no_bin)
+if check("a daemon entry with no bin path still refuses", $why != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and names the bin field", names($why, "bin"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- Both activation fields are root paths an uninstall would act on, so a present
+-- value must be absolute exactly like autostart and desktop.
+--
+-- Each fixture below is a COMPLETE, valid daemon entry with exactly one field
+-- spoiled, so the only thing that can refuse it is the field under test. Get
+-- this wrong and the probe passes because some earlier required-path check
+-- fired instead -- which is what happened when these entries omitted the
+-- activation paths: cold review caught the probe named for `user_unit` being
+-- answered by the missing `dbus_service`, and both probes then passed against a
+-- deployer that had never heard of either field.
+-- The `desktop` path is here for the DIAGONAL, not because a daemon needs one.
+-- Without it, every negative probe below also refuses against the PREVIOUS
+-- deployer -- which required `desktop` unconditionally -- so each one passed on
+-- old text for a reason that had nothing to do with the field it names. Cold
+-- review caught eight of them. With a valid desktop path present, the old
+-- loader accepts the entry outright and only the field under test can refuse
+-- it, in either direction.
+function daemon_entry()
+  return { "app": "cosmix-trayd", "kind": "daemon",
+           "bin": $BIN_DEST .. "/cosmix-trayd",
+           "desktop": $DT_DEST .. "/dev.cosmix.trayd.desktop",
+           "dbus_service": $DBUS_DEST .. "/dev.cosmix.trayd.service",
+           "user_unit": $USER_UNIT_DEST .. "/cosmix-trayd.service",
+           "icons": [] }
+end
+
+for each $field in ["dbus_service", "user_unit"]
+  $bad = daemon_entry()
+  $bad[$field] = "relative/path.service"
+  $why = loads($bad)
+  if check("a relative " .. $field .. " refuses", $why != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+  if check("  and names " .. $field, names($why, $field), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+  $wrong = daemon_entry()
+  $wrong[$field] = { "path": "/x" }
+  $why = loads($wrong)
+  if check("a non-string " .. $field .. " refuses", $why != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+  if check("  and names " .. $field, names($why, $field), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+  -- A daemon that names neither is a lying inventory: the deployer always
+  -- installs both, so an entry claiming kind="daemon" without them would be
+  -- rewritten as valid by the next partial run and strand whichever file is
+  -- actually on disk.
+  $absent = daemon_entry()
+  $absent[$field] = nil
+  $why = loads($absent)
+  if check("a daemon entry MISSING " .. $field .. " refuses", $why != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+  if check("  and names " .. $field, names($why, $field), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+end
+
+-- kind="tray" gets the same treatment: it always installs an autostart entry,
+-- so an entry claiming to be one without naming it is equally a lying record.
+$tray_entry = { "app": "cosmix-tray", "kind": "tray", "bin": $BIN_DEST .. "/cosmix-tray", "desktop": $DT_DEST .. "/dev.cosmix.tray.desktop", "autostart": "/etc/xdg/autostart/dev.cosmix.tray.desktop", "icons": [] }
+if check("a complete tray entry validates", loads($tray_entry) == nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+$tray_no_autostart = { "app": "cosmix-tray", "kind": "tray", "bin": $BIN_DEST .. "/cosmix-tray", "desktop": $DT_DEST .. "/dev.cosmix.tray.desktop", "icons": [] }
+$why = loads($tray_no_autostart)
+if check("a tray entry missing autostart refuses", $why != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and names autostart", names($why, "autostart"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+-- ...but the SAME entry with no kind is a legacy record and must still pass,
+-- which is what keeps the tightening from rejecting every manifest on disk.
+$legacy_tray = { "app": "cosmix-tray", "bin": $BIN_DEST .. "/cosmix-tray", "desktop": $DT_DEST .. "/dev.cosmix.tray.desktop", "icons": [] }
+if check("  but the same entry with NO kind still validates (legacy)", loads($legacy_tray) == nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- An unrecognised kind decides which whole family of files gets installed, so
+-- it is a refusal rather than something to default through.
+$bad_kind = daemon_entry()
+$bad_kind["kind"] = "demon"
+$why = loads($bad_kind)
+if check("an unrecognised kind refuses", $why != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and names the value", names($why, "demon"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+-- A kind present but NIL is not the same as an absent kind, and `get_or` cannot
+-- tell them apart -- it answers with its default for both. Absent means the
+-- manifest predates the field, and reading it as "app" is what keeps every
+-- record already on disk validating. Present-and-nil is a field this deployer
+-- wrote and got wrong, and reading THAT as "app" would apply the app rules to
+-- what may well be a daemon: requiring a desktop entry it never had, and not
+-- requiring the unit it did install. Verified reachable -- data_encode writes
+-- `kind: nil` and load_data reads the key back present with a nil value, so
+-- this is a manifest that can genuinely exist on disk, not a synthetic map.
+$nil_kind = daemon_entry()
+$nil_kind["kind"] = nil
+$why = loads($nil_kind)
+if check("a kind present but NIL refuses", $why != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and says so rather than reading it as legacy", names($why, "kind field set to nil"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+$map_kind = daemon_entry()
+$map_kind["kind"] = { "k": "daemon" }
+$why = loads($map_kind)
+if check("a non-string kind refuses", $why != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+-- Named for the reason, not merely "something refused": a deployer with no kind
+-- check at all also refuses this entry, for want of a `desktop` path it never
+-- had. Asserting the membership wording is what separates the two.
+if check("  and names it as an unrecognised kind", names($why, "not one of app, tray, daemon"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- A daemon that CARRIES a desktop path -- because it used to be an app -- keeps
+-- it, and it is still held to being absolute. Required-for-apps, optional-but-
+-- checked for daemons is the whole point of listing it in both places.
+$carried_desktop = daemon_entry()
+$carried_desktop["desktop"] = $DT_DEST .. "/dev.cosmix.trayd.desktop"
+if check("a daemon entry MAY still carry an absolute desktop path", loads($carried_desktop) == nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+$carried_bad = daemon_entry()
+$carried_bad["desktop"] = "nope.desktop"
+$why = loads($carried_bad)
+if check("  but a relative one still refuses", $why != nil, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  naming the desktop field", names($why, "desktop"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- ------------------------- daemon carry-forward through merge_manifest (kind change)
+-- Same hazard as the tray->app autostart case above, one field family further
+-- on: a daemon redeployed as an app produces a fresh entry with no
+-- dbus_service and no user_unit, while both root files are still on disk and
+-- this deployer may not remove them. An activatable bus name left behind with
+-- nothing naming it keeps STARTING something on demand.
+$existing_d = {
+  "installed": [
+    { "app": "cosmix-trayd", "kind": "daemon", "bin": $BIN_DEST .. "/cosmix-trayd", "dbus_service": "/usr/local/share/dbus-1/services/dev.cosmix.trayd.service", "user_unit": "/usr/local/lib/systemd/user/cosmix-trayd.service", "icons": [] }
+  ],
+  "shared": []
+}
+$fresh_as_app = [
+  { "app": "cosmix-trayd", "kind": "app", "bin": $BIN_DEST .. "/cosmix-trayd", "desktop": $DT_DEST .. "/dev.cosmix.trayd.desktop", "icons": [] }
+]
+$md = merge_manifest($existing_d, $fresh_as_app, ["cosmix-trayd"], [])
+$td = nil
+for each $e in $md["installed"]
+  if $e["app"] == "cosmix-trayd" then
+    $td = $e
+  end
+end
+if check("daemon->app keeps the recorded dbus_service path", $td["dbus_service"], "/usr/local/share/dbus-1/services/dev.cosmix.trayd.service") then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and the recorded user_unit path", $td["user_unit"], "/usr/local/lib/systemd/user/cosmix-trayd.service") then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and takes the fresh kind", $td["kind"], "app") then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- The reverse direction is why `desktop` had to join the carried list: an app
+-- that becomes a daemon stops producing a desktop entry, and the launcher it
+-- installed is still in the menu.
+$existing_a = {
+  "installed": [
+    { "app": "cosmix-trayd", "kind": "app", "bin": $BIN_DEST .. "/cosmix-trayd", "desktop": "/usr/local/share/applications/dev.cosmix.trayd.desktop", "icons": [] }
+  ],
+  "shared": []
+}
+$fresh_as_daemon = [
+  { "app": "cosmix-trayd", "kind": "daemon", "bin": $BIN_DEST .. "/cosmix-trayd", "dbus_service": "/usr/local/share/dbus-1/services/dev.cosmix.trayd.service", "icons": [] }
+]
+$ma = merge_manifest($existing_a, $fresh_as_daemon, ["cosmix-trayd"], [])
+$ta = nil
+for each $e in $ma["installed"]
+  if $e["app"] == "cosmix-trayd" then
+    $ta = $e
+  end
+end
+if check("app->daemon keeps the recorded desktop entry", $ta["desktop"], "/usr/local/share/applications/dev.cosmix.trayd.desktop") then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and records the new dbus_service", $ta["dbus_service"], "/usr/local/share/dbus-1/services/dev.cosmix.trayd.service") then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- Carry-forward is for nil only, in every direction: a redeployed daemon whose
+-- destination moved must take the NEW path, not resurrect the old one.
+$fresh_moved = [
+  { "app": "cosmix-trayd", "kind": "daemon", "bin": $BIN_DEST .. "/cosmix-trayd", "dbus_service": "/usr/local/share/dbus-1/services/dev.cosmix.trayd.service.NEW", "user_unit": "/usr/local/lib/systemd/user/cosmix-trayd.service.NEW", "icons": [] }
+]
+$mm = merge_manifest($existing_d, $fresh_moved, ["cosmix-trayd"], [])
+$tm = nil
+for each $e in $mm["installed"]
+  if $e["app"] == "cosmix-trayd" then
+    $tm = $e
+  end
+end
+if check("a fresh dbus_service replaces the recorded one", $tm["dbus_service"], "/usr/local/share/dbus-1/services/dev.cosmix.trayd.service.NEW") then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("a fresh user_unit replaces the recorded one", $tm["user_unit"], "/usr/local/lib/systemd/user/cosmix-trayd.service.NEW") then $pass = $pass + 1 else $failn = $failn + 1 end
+-- ...and the path it replaced must not simply VANISH. This is the whole of
+-- cold-review BLOCKER #2, and it is the one failure mode this deployer can
+-- never recover from: it does not delete, so a root-owned file whose name is
+-- dropped from the manifest is stranded on the machine forever with nothing
+-- left that knows it exists. Recording it under `shared` rather than the app's
+-- entry is deliberate -- the run no longer knows the file belongs to this app,
+-- and the ledger's standing rule is that over-claiming is harmless while
+-- under-claiming is permanent.
+if check("  and the DISPLACED dbus_service is not lost", contains($mm["shared"], "/usr/local/share/dbus-1/services/dev.cosmix.trayd.service"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and the displaced user_unit is not lost", contains($mm["shared"], "/usr/local/lib/systemd/user/cosmix-trayd.service"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+-- The displaced path is carried into `shared` by a block that runs BEFORE the
+-- loop rebuilding `shared`, so this also pins that ordering: reverse the two
+-- and the displaced entries are appended to a list that is then overwritten.
+-- join()ed, because `check` compares with ==, and in Mix a List == List is
+-- ALWAYS false regardless of contents -- an equality probe written the obvious
+-- way here would fail forever and be "fixed" by deleting it.
+if check("  and shared is still sorted and unique", join($mm["shared"], "|"), join(sort(unique($mm["shared"])), "|")) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- An unselected daemon is preserved verbatim, fields and all.
+$mu = merge_manifest($existing_d, [], [], [])
+if check("an unselected daemon entry survives a partial run", $mu["installed"][0]["user_unit"], "/usr/local/lib/systemd/user/cosmix-trayd.service") then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- --------------------------------------- swept temps reach DISK (round-seven #1)
+-- The sweep exists to name a file nothing else can name. Holding that name in
+-- memory until section 5's write reopens the window it was added to close, so
+-- a sweep that finds something must flush the ledger there and then.
+$CROOT_CALLS = []
+function croot($cmd)
+  push($CROOT_CALLS, $cmd)
+  return { "ok": true, "stdout": "", "stderr": "" }
+end
+$existing_manifest = empty_manifest()
+$installed = []
+$APPS = []
+$intent_shared = []
+$stage = $BASE .. "/stage"
+mkdir($stage)
+
+$sweepdir = $BASE .. "/sweep"
+mkdir($sweepdir)
+$before = length($CROOT_CALLS)
+$swept_clean = record_temps($sweepdir, ".mimeinfo.cache", [])
+if check("a clean directory sweeps up nothing", length($swept_clean), 0) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and does NOT rewrite the ledger", length($CROOT_CALLS), $before) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+write_file($sweepdir .. "/.mimeinfo.cache.R7S0S3", "residue\n")
+$got = record_temps($sweepdir, ".mimeinfo.cache", [])
+if check("the random-suffix temp is swept up", contains($got, $sweepdir .. "/.mimeinfo.cache.R7S0S3"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+-- Returned, not just mutated in place: Mix lists are values, so a push inside
+-- the function would otherwise be lost at the call site.
+if check("  and the caller's list actually receives it", length($got), 1) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and the ledger is flushed to disk immediately", length($CROOT_CALLS) > $before, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+$flush_named_manifest = false
+for each $c in $CROOT_CALLS
+  if contains($c, $MANIFEST) then
+    $flush_named_manifest = true
+  end
+end
+if check("  and that flush writes the manifest", $flush_named_manifest, true) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- ------------------------------------------------- manifest self-record (MINOR #9)
+-- The ledger recorded everything except itself; a run killed between the
+-- install and the rename left $MANIFEST.new stranded with nothing naming it.
+$m4 = merge_manifest(empty_manifest(), [], [], [])
+$m4["shared"] = sort(unique(concat($m4["shared"], [$MANIFEST, $MANIFEST .. ".new"])))
+if check("the manifest names itself", contains($m4["shared"], $MANIFEST), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and its rename temp", contains($m4["shared"], $MANIFEST .. ".new"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- --------------------------------------------- activation file parser (MAJOR #3)
+-- The .service activation file and the .service unit are the ONLY files this
+-- deployer installs whose content it does not generate, so this parser is the
+-- only thing standing between a hand-edited crate file and a bus name that
+-- activates the wrong binary -- or nothing at all. Every case below is a shape
+-- that reads correctly to a human and is wrong to the machine.
+$UNIT_SECTION = "Service"
+$UNIT_EXACT = { "Type": "dbus", "BusName": "dev.cosmix.trayd" }
+$UNIT_EXEC = { "ExecStart": "/opt/cosmix/bin/cosmix-trayd" }
+function unit_defects($body)
+  return activation_defects($body, $UNIT_SECTION, $UNIT_EXACT, $UNIT_EXEC)
+end
+$GOOD_UNIT = "[Unit]\nDescription=CosMix Tray Daemon\n[Service]\nType=dbus\nBusName=dev.cosmix.trayd\nExecStart=/opt/cosmix/bin/cosmix-trayd\n"
+
+if check("the real unit shape has no defects", length(unit_defects($GOOD_UNIT)), 0) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- Comments, blank lines and leading whitespace are all legal and must not read
+-- as content.
+$decorated = "# a comment\n\n[Unit]\nDescription=x\n\n[Service]\n  Type=dbus\n; another comment\n  BusName=dev.cosmix.trayd\nExecStart=/opt/cosmix/bin/cosmix-trayd\n"
+if check("comments, blanks and indentation are ignored", length(unit_defects($decorated)), 0) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- THE section case. Type/BusName/ExecStart under [Unit] are ignored by systemd,
+-- so the unit silently starts as the default Type=simple and is considered
+-- started the moment it forks rather than when it owns the bus name -- every
+-- client that raced the daemon then talks to nothing.
+$wrong_section = "[Unit]\nType=dbus\nBusName=dev.cosmix.trayd\nExecStart=/opt/cosmix/bin/cosmix-trayd\n[Service]\nRestart=on-failure\n"
+$d = unit_defects($wrong_section)
+if check("directives in the WRONG section are defects", length($d), 3) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and are named as misplaced, not missing", contains(join($d, "|"), "it is set under [Unit], where it is ignored"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- A key before any section header belongs to no section at all.
+$no_section = "Type=dbus\nBusName=dev.cosmix.trayd\nExecStart=/opt/cosmix/bin/cosmix-trayd\n"
+if check("directives before any section header are defects", length(unit_defects($no_section)), 3) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- systemd treats a second ExecStart= as an APPEND and refuses a Type=dbus unit
+-- that has two, so identical duplicates are not harmless.
+$dup_same = "[Service]\nType=dbus\nBusName=dev.cosmix.trayd\nExecStart=/opt/cosmix/bin/cosmix-trayd\nExecStart=/opt/cosmix/bin/cosmix-trayd\n"
+$d = unit_defects($dup_same)
+if check("an IDENTICAL duplicate directive is a defect", length($d), 1) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and says it must appear exactly once", contains(join($d, "|"), "must appear exactly once"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+$dup_diff = "[Service]\nType=dbus\nBusName=dev.cosmix.trayd\nExecStart=/opt/cosmix/bin/cosmix-trayd\nExecStart=/opt/cosmix/bin/other\n"
+if check("a DIFFERING duplicate is a defect too", length(unit_defects($dup_diff)), 1) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- The token-boundary case: `cosmix-trayd` is a string prefix of
+-- `cosmix-trayd-old`, so a prefix test blesses a unit running another binary.
+$suffixed = "[Service]\nType=dbus\nBusName=dev.cosmix.trayd\nExecStart=/opt/cosmix/bin/cosmix-trayd-old\n"
+$d = unit_defects($suffixed)
+if check("a SUFFIXED executable is a defect", length($d), 1) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and names the binary it would actually run", contains(join($d, "|"), "runs /opt/cosmix/bin/cosmix-trayd-old"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- ...while arguments after the executable are legal and must NOT be rejected.
+$with_args = "[Service]\nType=dbus\nBusName=dev.cosmix.trayd\nExecStart=/opt/cosmix/bin/cosmix-trayd --foreground\n"
+if check("arguments after the executable are accepted", length(unit_defects($with_args)), 0) then $pass = $pass + 1 else $failn = $failn + 1 end
+-- ...and so is the quoted form. A gate that refuses valid input gets switched
+-- off, which costs more than the gate is worth.
+$quoted = "[Service]\nType=dbus\nBusName=dev.cosmix.trayd\nExecStart=\"/opt/cosmix/bin/cosmix-trayd\" --foreground\n"
+if check("a quoted executable is accepted", length(unit_defects($quoted)), 0) then $pass = $pass + 1 else $failn = $failn + 1 end
+$quoted_bare = "[Service]\nType=dbus\nBusName=dev.cosmix.trayd\nExecStart=\"/opt/cosmix/bin/cosmix-trayd\"\n"
+if check("  including with no arguments", length(unit_defects($quoted_bare)), 0) then $pass = $pass + 1 else $failn = $failn + 1 end
+$unterminated = "[Service]\nType=dbus\nBusName=dev.cosmix.trayd\nExecStart=\"/opt/cosmix/bin/cosmix-trayd --foreground\n"
+$d = unit_defects($unterminated)
+if check("an unterminated quote is a defect", length($d), 1) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  named as an unclosed quote", contains(join($d, "|"), "never closes"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+$no_separator = "[Service]\nType=dbus\nBusName=dev.cosmix.trayd\nExecStart=\"/opt/cosmix/bin/cosmix-trayd\"--foreground\n"
+if check("a quoted executable with no separator is a defect", length(unit_defects($no_separator)), 1) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- A missing directive must be reported as missing, with the value expected.
+$d = unit_defects("[Service]\nBusName=dev.cosmix.trayd\nExecStart=/opt/cosmix/bin/cosmix-trayd\n")
+if check("a missing directive is a defect", length($d), 1) then $pass = $pass + 1 else $failn = $failn + 1 end
+if check("  and names the expected value", contains(join($d, "|"), "expected Type=dbus"), true) then $pass = $pass + 1 else $failn = $failn + 1 end
+-- ...and the wrong bus name is the whole reason this function exists: it
+-- activates a DIFFERENT daemon, successfully, and nothing else would notice.
+if check("a wrong BusName is a defect", length(unit_defects("[Service]\nType=dbus\nBusName=dev.cosmix.tray\nExecStart=/opt/cosmix/bin/cosmix-trayd\n")), 1) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- A value containing '=' splits on the FIRST one only.
+$eq_value = "[Service]\nType=dbus\nBusName=dev.cosmix.trayd\nExecStart=/opt/cosmix/bin/cosmix-trayd --opt=a=b\n"
+if check("a value containing '=' is not mangled", length(unit_defects($eq_value)), 0) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- The D-Bus activation file uses a different section name and directive set,
+-- which is the only reason the section is a parameter rather than a constant.
+$GOOD_DBUS = "[D-BUS Service]\nName=dev.cosmix.trayd\nExec=/opt/cosmix/bin/cosmix-trayd\nSystemdService=cosmix-trayd.service\n"
+$dbus_exact = { "Name": "dev.cosmix.trayd", "SystemdService": "cosmix-trayd.service" }
+$dbus_exec = { "Exec": "/opt/cosmix/bin/cosmix-trayd" }
+if check("the real D-Bus activation shape has no defects", length(activation_defects($GOOD_DBUS, "D-BUS Service", $dbus_exact, $dbus_exec)), 0) then $pass = $pass + 1 else $failn = $failn + 1 end
+-- The section name has a hyphen and a space in it; a parser that tokenised it
+-- would silently find nothing and report all three directives missing.
+if check("  and the hyphenated section name is matched literally", length(activation_defects($GOOD_DBUS, "D-Bus Service", $dbus_exact, $dbus_exec)), 3) then $pass = $pass + 1 else $failn = $failn + 1 end
+-- Pointing SystemdService at the wrong unit is silent: D-Bus activation asks
+-- systemd for a unit that does not exist and the caller just sees a timeout.
+if check("a wrong SystemdService is a defect", length(activation_defects("[D-BUS Service]\nName=dev.cosmix.trayd\nExec=/opt/cosmix/bin/cosmix-trayd\nSystemdService=cosmix-tray.service\n", "D-BUS Service", $dbus_exact, $dbus_exec)), 1) then $pass = $pass + 1 else $failn = $failn + 1 end
+
+-- The files that ACTUALLY SHIP, read from the source tree, so a crate edited
+-- after this suite was written cannot pass by agreeing with a fixture.
+$TRAYD_SRC = $COSMIX .. "/src/desktop/apps/trayd"
+if is_dir($TRAYD_SRC) then
+  if check("the shipped D-Bus activation file agrees", length(activation_defects(read_file($TRAYD_SRC .. "/dbus/dev.cosmix.trayd.service"), "D-BUS Service", $dbus_exact, $dbus_exec)), 0) then $pass = $pass + 1 else $failn = $failn + 1 end
+  if check("the shipped systemd unit agrees", length(unit_defects(read_file($TRAYD_SRC .. "/systemd/cosmix-trayd.service"))), 0) then $pass = $pass + 1 else $failn = $failn + 1 end
+else
+  print "  SKIP  shipped trayd activation files (no " .. $TRAYD_SRC .. ")"
+end
+
+-- ---------------------------------------------------------------------- cleanup
+-- $BASE is this run's own pid-suffixed directory under /tmp and holds nothing
+-- but fixtures, so removing it is safe -- but only if it is still the directory
+-- this run made. run_argv rather than run(): no shell, so the path cannot be
+-- reinterpreted.
+if is_dir($BASE) and starts_with($BASE, "/tmp/dt-mtest-") then
+  run_argv(["rm", "-rf", $BASE], { "timeout": 60 })
+end
+print ""
+print "pass=" .. $pass .. " fail=" .. $failn
+if $failn > 0 then
+  exit(1)
+end

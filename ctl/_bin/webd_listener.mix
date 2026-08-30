@@ -1,0 +1,103 @@
+#!/usr/bin/env mix
+-- webd_listener.mix <node> <id> <on|off|status> — operate webd's
+-- per-interface listener kill switch.
+--
+-- This does not edit configuration or restart a daemon. It sends an
+-- ergonomic verb to webd through the target node's local broker. The
+-- `webd.listeners` namespace is the system of record; webd applies an
+-- `enabled` change later and writes the observed `bound` state
+-- back. Therefore on/off always follows the write with a status read-back.
+--
+-- on/off requires the `props.write:webd.listeners` capability. Status is
+-- available to authorised mesh peers. The daemon also refuses to disable a
+-- non-external listener: this kill switch governs external listeners only.
+--
+--   mix _bin/webd_listener.mix alpha lan off
+--   mix _bin/webd_listener.mix alpha lan on
+--   mix _bin/webd_listener.mix beta public status
+--   mix _bin/webd_listener.mix gamma "" status
+
+$d = require("../_lib/deploy_lib.mix")
+
+-- Empty is allowed for status-all. Keep the old closed character set even
+-- though ssh_mix bindings carry the ID as data rather than source.
+fn assert_id($id)
+  if $id == "" then
+    return
+  end
+  $i = 0
+  while $i < length($id)
+    $c = substr($id, $i, 1)
+    $ok = ($c >= "a" and $c <= "z") or ($c >= "A" and $c <= "Z") or \
+      ($c >= "0" and $c <= "9") or $c == "-" or $c == "_" or $c == "."
+    if not $ok then
+      print("ERROR: listener id '" .. $id .. "' has an invalid character " ..
+        ("" .. $c) .. " — allowed: [A-Za-z0-9._-]")
+      exit(2)
+    end
+    $i = $i + 1
+  end
+end
+
+-- Run the verb against the target's local broker. A non-zero Bus rc remains
+-- report data, matching the old operator command; an SSH/Mix failure is also
+-- returned as an ERR line for the caller to print.
+fn call_webd($node, $verb, $id)
+  $r = ssh_mix($node, '
+if $id == "" then
+  send webd $verb
+else
+  send webd $verb id="${id}"
+end
+if $rc != 0 then
+  print("ERR rc=" .. ("" .. $rc) .. " " .. ("" .. $result))
+else
+  print("" .. $result)
+end
+', {bindings: {verb: $verb, id: $id}})
+  if not $r["ok"] then
+    return "ERR ssh exit=" .. ("" .. $r["exit_code"]) .. " " .. trim($r["stderr"])
+  end
+  return trim($r["stdout"])
+end
+
+$argv = args()
+if length($argv) < 3 then
+  print("usage: mix _bin/webd_listener.mix <node> <id> <on|off|status>")
+  print("       node must be present in the hub fleet roster")
+  exit(2)
+end
+
+$ROSTER = $d.roster()
+$node = $argv[0]
+$id = $argv[1]
+$action = $argv[2]
+$d.assert_node($ROSTER, $node)
+assert_id($id)
+
+if $action == "status" then
+  print("[" .. $node .. "] webd.listener.status " .. $id)
+  print(call_webd($node, "webd.listener.status", $id))
+  exit(0)
+end
+
+if $action == "on" or $action == "off" then
+  if $id == "" then
+    print("ERROR: on|off require a listener id")
+    exit(2)
+  end
+  $verb = "webd.listener.disable"
+  if $action == "on" then
+    $verb = "webd.listener.enable"
+  end
+  print("[" .. $node .. "] " .. $verb .. " id=" .. $id)
+  print("  " .. call_webd($node, $verb, $id))
+
+  -- The reaction loop applies later, so report the observed bound state.
+  print("[" .. $node .. "] read-back webd.listener.status id=" .. $id)
+  print("  " .. call_webd($node, "webd.listener.status", $id))
+  exit(0)
+end
+
+print("ERROR: action must be on|off|status, got '" .. ("" .. $action) .. "'")
+exit(2)

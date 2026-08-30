@@ -1,0 +1,187 @@
+#!/usr/bin/env mix
+-- ct.mix — operator CLI for the nspawn placement controller (C2).
+-- Talks to the controller's nspawnd.ct.* verbs over the Bus from any rostered
+-- node.
+--
+--   mix _bin/ct.mix list
+--   mix _bin/ct.mix status <name>
+--   mix _bin/ct.mix start  <name>            (root: reads operator token)
+--   mix _bin/ct.mix stop   <name>            (root: reads operator token)
+--   mix _bin/ct.mix adopt  <name> <owner> <generation>
+--
+-- Options:
+--   --controller NODE   controller node; otherwise read the node-local setting
+--   --if-version N      CAS version override (default: read via ct.status;
+--                       adopt always uses 0)
+--   --request-id ID     reuse a request id — THE ambiguity-recovery path.
+--                       Never blind-retry with a fresh id: a rerun with the
+--                       same id replays the stored durable result.
+--
+-- Mutations require /etc/cosmix/nspawnd/operator-token (0400 root:root) on
+-- THIS node, and this node's bridge identity (bridge-<node>) must be in the
+-- controller's COSMIX_NSPAWND_OPERATORS allowlist. list/status are open reads.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$SCHEMA = "cosmix.nspawnd.ct-request.v1"
+$TOKEN_PATH = "/etc/cosmix/nspawnd/operator-token"
+$ENV_PATH = "/etc/cosmix/nspawnd.env"
+
+fn refuse($message)
+  print("ERROR: " .. $message)
+  exit(2)
+end
+
+$g = getopt(args(), {
+  controller: {arg: true},
+  "if-version": {arg: true},
+  "request-id": {arg: true}
+})
+if len($g["errors"]) != 0 then
+  refuse("bad options: " .. join($g["errors"], "; "))
+end
+$rest = $g["rest"]
+if len($rest) == 0 then
+  refuse("usage: ct.mix list|status|start|stop|adopt …")
+end
+$cmd = $rest[0]
+
+-- The explicit option wins; otherwise the node-local environment is the only
+-- statement of fact about where the controller lives. A guessed default could
+-- silently address the wrong node.
+fn env_controller()
+  if not is_file($ENV_PATH) then
+    return nil
+  end
+  for each $line in split(read_file($ENV_PATH), "\n")
+    $t = trim($line)
+    if starts_with($t, "COSMIX_NSPAWND_CONTROLLER_NODE=") then
+      $v = trim(substr($t, 31))
+      if $v != "" then
+        return $v
+      end
+    end
+  end
+  return nil
+end
+
+$controller = nil
+if $g["opts"]["controller"] != nil then
+  $controller = "" .. $g["opts"]["controller"]
+else
+  $controller = env_controller()
+end
+if $controller == nil then
+  refuse("no controller node — pass --controller NODE (or set " ..
+    "COSMIX_NSPAWND_CONTROLLER_NODE in " .. $ENV_PATH .. ")")
+end
+
+-- Controller names are hub-owned fleet facts. Foreign roster nodes remain
+-- valid because this CLI addresses the Bus name and does not query mesh IPs.
+$ROSTER = $d.roster()
+$d.assert_node($ROSTER, $controller)
+$target = "nspawnd." .. $controller .. ".bus"
+
+fn show($reply)
+  print(json_encode($reply, true))
+end
+
+-- rc bands (mix man amp): 0 ok · 1..9 warn-success · >=10 app error ·
+-- negative = local transport signal (send never confirmed delivered).
+fn finish($what, $req_id)
+  if $rc == 0 then
+    show($result)
+    return
+  end
+  if $rc > 0 and $rc < 10 then
+    print("warning (rc=" .. $rc .. ")")
+    show($result)
+    return
+  end
+  if $rc >= 10 then
+    eprint($what .. " refused (rc=" .. $rc .. "):")
+    eprint(json_encode($result, true))
+    exit(1)
+  end
+  -- Negative: transport failure / timeout / no broker. The controller may
+  -- still be executing — NEVER retry with a new request id.
+  eprint($what .. " UNRESOLVED (rc=" .. $rc .. "): " .. ("" .. $result))
+  if $req_id != nil then
+    eprint("outcome is ambiguous; resolve with:")
+    eprint("  mix _bin/ct.mix " .. $what .. " --request-id " .. $req_id ..
+      " …same args…")
+  end
+  exit(2)
+end
+
+fn operator_token()
+  if not is_file($TOKEN_PATH) then
+    refuse($TOKEN_PATH ..
+      " missing or unreadable — run as root on a node with the operator token installed")
+  end
+  return trim(read_file($TOKEN_PATH))
+end
+
+fn placement_version($name)
+  send $target nspawnd.ct.status name=$name
+  if $rc != 0 then
+    eprint("ct.status failed (rc=" .. $rc .. "): " .. ("" .. $result))
+    exit(2)
+  end
+  if not $result["found"] then
+    die("no placement for " .. $name .. " — adopt it first")
+  end
+  return $result["version"]
+end
+
+if $cmd == "list" then
+  send $target nspawnd.ct.list
+  finish("list", nil)
+elif $cmd == "status" then
+  if len($rest) < 2 then
+    refuse("usage: ct.mix status <name>")
+  end
+  $name = $rest[1]
+  send $target nspawnd.ct.status name=$name
+  finish("status", nil)
+elif $cmd == "start" or $cmd == "stop" then
+  if len($rest) < 2 then
+    refuse("usage: ct.mix " .. $cmd .. " <name>")
+  end
+  $name = $rest[1]
+  $tok = operator_token()
+  $ver = nil
+  if $g["opts"]["if-version"] != nil then
+    $ver = to_number($g["opts"]["if-version"])
+  else
+    $ver = placement_version($name)
+  end
+  $req = "ct-" .. uuid()
+  if $g["opts"]["request-id"] != nil then
+    $req = "" .. $g["opts"]["request-id"]
+  end
+  print($cmd .. " " .. $name .. " if_version=" .. $ver .. " request_id=" .. $req)
+  $verb = "nspawnd.ct." .. $cmd
+  send $target $verb schema=$SCHEMA name=$name if_version=$ver request_id=$req \
+    operation_token=$tok timeout=60
+  finish($cmd, $req)
+elif $cmd == "adopt" then
+  if len($rest) < 4 then
+    refuse("usage: ct.mix adopt <name> <owner> <generation>")
+  end
+  $name = $rest[1]
+  $owner = $rest[2]
+  $gen = to_number($rest[3])
+  $tok = operator_token()
+  $req = "ct-" .. uuid()
+  if $g["opts"]["request-id"] != nil then
+    $req = "" .. $g["opts"]["request-id"]
+  end
+  print("adopt " .. $name .. " owner=" .. $owner .. " generation=" .. $gen ..
+    " request_id=" .. $req)
+  send $target nspawnd.ct.adopt schema=$SCHEMA name=$name owner=$owner generation=$gen \
+    if_version=0 request_id=$req operation_token=$tok timeout=60
+  finish("adopt", $req)
+else
+  refuse("unknown subcommand " .. $cmd .. " — list|status|start|stop|adopt")
+end

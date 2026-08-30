@@ -1,0 +1,177 @@
+#!/usr/bin/env mix
+-- release_mix.mix — build x86_64 Mix release archives and attach them to an
+-- existing GitHub release.
+--
+--   mix _bin/release_mix.mix v0.62.0
+--   mix _bin/release_mix.mix v0.62.0 --no-musl
+--
+-- Each target archive contains the stripped mix binary, LICENSE, and README.
+-- The script builds every requested target before writing one checksum manifest
+-- and uploading all assets. Every external command uses argv execution so tags,
+-- repository names, and paths are never interpreted by a shell.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/release_mix.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no release_mix configuration at " .. $CONF_PATH)
+  print("         copy _etc/release_mix.conf.mix.example there and set github_repository")
+  exit(2)
+end
+$CONF = load_data($CONF_PATH)
+if type($CONF) != "map" or type($CONF["release_mix"]) != "map" then
+  print("  ERROR: " .. $CONF_PATH .. " must contain a release_mix map")
+  exit(2)
+end
+$RELEASE = $CONF["release_mix"]
+if $RELEASE["schema_version"] != 1 then
+  print("  ERROR: " .. $CONF_PATH .. " needs release_mix.schema_version: 1")
+  exit(2)
+end
+$REPOSITORY = $RELEASE["github_repository"]
+if type($REPOSITORY) != "string" or not regex_match("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", $REPOSITORY) then
+  print("  ERROR: " .. $CONF_PATH .. " needs release_mix.github_repository as owner/repository")
+  exit(2)
+end
+
+$argv = args()
+if len($argv) == 0 then
+  print("usage: mix _bin/release_mix.mix <tag> [--no-musl]")
+  exit(2)
+end
+$tag = $argv[0]
+$want_musl = true
+for each $arg in $argv
+  if $arg == "--no-musl" then
+    $want_musl = false
+  end
+end
+
+$version = $tag
+if starts_with($tag, "v") then
+  $version = substr($tag, 1)
+end
+print("release " .. $tag .. " (version " .. $version .. ", musl=" .. $want_musl .. ")")
+
+$ROOT = $d.cosmix_root()
+$SRC = $ROOT .. "/src"
+$GNU = "x86_64-unknown-linux-gnu"
+$MUSL = "x86_64-unknown-linux-musl"
+
+fn bail($message)
+  print("ERROR: " .. $message)
+  exit(1)
+end
+
+fn run_ok($command, $options, $what)
+  $result = run_argv($command, $options)
+  if $result["exit_code"] != 0 then
+    bail($what .. " failed (exit=" .. ("" .. $result["exit_code"]) .. "): " ..
+      trim($result["stderr"]) .. " " .. trim($result["stdout"]))
+  end
+  return $result
+end
+
+-- This script only attaches assets; release creation remains a separate,
+-- deliberate operation.
+run_ok(["gh", "-R", $REPOSITORY, "release", "view", $tag], {timeout: 60},
+  "release " .. $tag .. " not found — create it first")
+
+-- A requested static build must have its Rust target installed before any
+-- build or staging work starts.
+if $want_musl then
+  $installed = run_ok(["rustup", "target", "list", "--installed"], {timeout: 60},
+    "rustup target list --installed")
+  if not contains($installed["stdout"], $MUSL) then
+    bail("musl target not installed — `rustup target add " .. $MUSL .. "` or pass --no-musl")
+  end
+end
+
+$mktemp = run_ok(["mktemp", "-d", "/tmp/mix-release-XXXXXX"], {timeout: 30}, "mktemp -d")
+$STAGE = trim($mktemp["stdout"])
+if not starts_with($STAGE, "/tmp/mix-release-") or not is_dir($STAGE) then
+  bail("mktemp returned an unexpected release staging path: " .. $STAGE)
+end
+
+fn local_build_path($path)
+  if starts_with($path, "/") then
+    return $path
+  end
+  return $SRC .. "/" .. $path
+end
+
+-- Build one target, verify that its binary reports the tag version, then
+-- stage and archive it. Returns the archive filename relative to $STAGE.
+fn build_target($triple)
+  print("")
+  print("[" .. $triple .. "] cargo build --release")
+
+  $cargo = ["cargo", "build", "--release", "--bin", "mix"]
+  $binary = local_build_path($d.cosmix_bin("mix"))
+  if $triple != $GNU then
+    $cargo = concat($cargo, ["--target", $triple])
+    $target_root = dirname(dirname(local_build_path($d.cosmix_bin("mix"))))
+    $binary = $target_root .. "/" .. $triple .. "/release/mix"
+  end
+  run_ok($cargo, {cwd: $SRC, timeout: 3600}, "cargo build (" .. $triple .. ")")
+
+  -- Never package a stale binary whose reported version differs from the tag.
+  $built_version = run_ok([$binary, "--version"], {timeout: 30},
+    "version probe (" .. $triple .. ")")
+  if not contains($built_version["stdout"], $version) then
+    bail($triple .. " binary reports '" .. trim($built_version["stdout"]) ..
+      "', expected " .. $version)
+  end
+
+  $name = "mix-" .. $version .. "-" .. $triple
+  $package_dir = $STAGE .. "/" .. $name
+  try
+    mkdir($package_dir, {parents: true})
+    copy($binary, $package_dir .. "/mix")
+    chmod($package_dir .. "/mix", 0o755)
+    copy($ROOT .. "/LICENSE", $package_dir .. "/LICENSE")
+    copy($ROOT .. "/README.md", $package_dir .. "/README.md")
+  catch $stage_error
+    bail("stage " .. $name .. " failed: " .. ("" .. $stage_error))
+  end
+
+  run_ok(["strip", $package_dir .. "/mix"], {timeout: 60}, "strip (" .. $triple .. ")")
+  $archive = $name .. ".tar.gz"
+  run_ok(["tar", "czf", $archive, $name], {cwd: $STAGE, timeout: 300},
+    "tar (" .. $triple .. ")")
+  $size = run_ok(["du", "-h", $archive], {cwd: $STAGE, timeout: 30},
+    "du (" .. $triple .. ")")
+  print("  packaged: " .. $archive .. " (" .. word(trim($size["stdout"]), 1) .. ")")
+  return $archive
+end
+
+$assets = []
+push($assets, build_target($GNU))
+if $want_musl then
+  push($assets, build_target($MUSL))
+end
+
+-- sha256sum writes the exact manifest bytes; write_file replaces the old shell
+-- redirection without changing the manifest format.
+print("")
+$sums = run_ok(concat(["sha256sum"], $assets), {cwd: $STAGE, timeout: 60}, "sha256sum")
+write_file($STAGE .. "/sha256sums.txt", $sums["stdout"])
+print(trim(read_file($STAGE .. "/sha256sums.txt")))
+push($assets, "sha256sums.txt")
+
+$upload = ["gh", "-R", $REPOSITORY, "release", "upload", $tag]
+for each $asset in $assets
+  push($upload, $STAGE .. "/" .. $asset)
+end
+push($upload, "--clobber")
+print("")
+print("uploading " .. len($assets) .. " assets to " .. $tag .. " ...")
+run_ok($upload, {timeout: 600}, "gh release upload")
+
+-- The path is a checked mktemp result under the dedicated release prefix.
+$cleanup = run_argv(["rm", "-rf", "--", $STAGE], {timeout: 60})
+if $cleanup["exit_code"] != 0 then
+  print("  (note: temp dir left behind: " .. $STAGE .. ")")
+end
+print("")
+print("done: attached to " .. $tag .. " -> " .. join($assets, ", "))

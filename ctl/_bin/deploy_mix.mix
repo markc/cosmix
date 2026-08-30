@@ -128,13 +128,19 @@ fn deploy_foreign($host)
   -- a no-op: the gates below interrogate the binary that landed. Foreign-only —
   -- legacy scp runs a remote `scp -t` through the login shell, which on a mesh
   -- node is Mix.
-  $scp_args = ["-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", $BIN, $host .. ":/opt/cosmix/bin/mix"]
+  -- Land beside, then install OVER: a foreign host can be running mix (a build
+  -- worker's gate, a cron job), and scp onto a running executable is ETXTBSY.
+  -- coreutils install unlinks and recreates, so running processes keep their
+  -- inode and the directory entry flips atomically — same as the mesh path.
+  $scp_args = ["-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", $BIN, $host .. ":/opt/cosmix/bin/mix.new"]
   $scp = run_argv(concat(["scp"], $scp_args), {timeout: 120})
   if $scp["exit_code"] != 0 then
     print("  scp (sftp mode) failed, retrying with -O (legacy protocol): " .. trim($scp["stderr"]))
     $scp = run_argv(concat(["scp", "-O"], $scp_args), {timeout: 120})
   end
   $d.die_if($scp["exit_code"] != 0, "scp -> " .. $host .. ": " .. trim($scp["stderr"]))
+  $fi = ssh_mix($host, 'print(run("install -m 0755 /opt/cosmix/bin/mix.new /opt/cosmix/bin/mix && rm -f /opt/cosmix/bin/mix.new && echo install-ok"))')
+  $d.die_if(not $fi["ok"] or not contains($fi["stdout"], "install-ok"), $host .. " install over the live binary failed: " .. trim($fi["stdout"]) .. " " .. trim($fi["stderr"]))
 
   -- Same three assertions as the mesh path, over the bash channel. This path
   -- once stopped at the scp and reported "installed" — so a foreign node's

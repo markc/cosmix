@@ -1,0 +1,179 @@
+#!/usr/bin/env mix
+-- scan_fleet_mix_parse.mix — ask every rostered node whether a candidate Mix
+-- binary can parse the .mix files that node actually has before it is deployed.
+--
+--   mix _bin/scan_fleet_mix_parse.mix              -- the whole fleet
+--   mix _bin/scan_fleet_mix_parse.mix alpha beta   -- a named subset
+--
+-- Exit 0 means clean, 1 means at least one file failed to parse, and 2 means
+-- at least one node could not answer reliably. The candidate is staged under
+-- /tmp and removed after the scan; this script never installs it.
+--
+-- `--check` parses a file as a program. Strict-data files such as
+-- `*.conf.mix`, `zones.mix`, and bare map files therefore fail by design.
+-- Every FAIL line must be read: those data files are expected, anything else
+-- is a file the candidate would break.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$ROSTER = $d.roster()
+$parsed = $d.parse_nodes($ROSTER, args(), [])
+$nodes = $parsed["nodes"]
+
+-- This is the same release artefact deploy_mix.mix uses, including
+-- CARGO_TARGET_DIR when set. Snapshotting it once keeps every node on the same
+-- bytes if another build lands while the fleet scan is running.
+$BIN = $d.cosmix_bin("mix")
+$candidate = run_argv([$BIN, "--version"], {timeout: 20})
+if $candidate["exit_code"] != 0 then
+  print("  ERROR: candidate binary not runnable: " .. $BIN .. ": " .. trim($candidate["stderr"]))
+  exit(2)
+end
+$VERSION = trim($candidate["stdout"])
+print("candidate: " .. $BIN .. " -> " .. $VERSION)
+print("")
+
+$SNAPSHOT = $d.snapshot_bin($BIN)
+$PROBE = "/tmp/mix-parse-probe"
+$INPUT = "/tmp/mix-parse-input"
+
+-- Runs under the node's current Mix, but every parse verdict comes from the
+-- staged candidate. A fixed copied input path keeps run() free of file-name
+-- quoting while the FAIL report retains the original path.
+$SCANNER = '
+$files = []
+$raw = run("find /opt/cosmix /etc/cosmix /var/lib/cosmix /root /usr/local -xdev -name " .. $pattern .. " -type f")
+for each $line in split($raw, "\n")
+  if trim($line) != "" then
+    push($files, trim($line))
+  end
+end
+if is_file("/root/.mixrc") then
+  push($files, "/root/.mixrc")
+end
+
+$bad = 0
+for each $file in $files
+  copy($file, $input)
+  $failed = false
+  $detail = ""
+  try
+    $_checked = run($probe .. " --check " .. $input)
+  catch $err
+    $failed = true
+    $detail = trim(replace("" .. $err, "\n", " | "))
+  end
+  remove($input)
+  if $failed then
+    print("  FAIL " .. $file .. " :: " .. $detail)
+    $bad = $bad + 1
+  end
+end
+print("  SCANNED " .. ("" .. len($files)) .. " FAILING " .. ("" .. $bad))
+'
+
+-- Returns the number of failing files, or -1 when the node did not provide a
+-- trustworthy answer. An unknown answer is never treated as a clean scan.
+fn scan($host)
+  print($host .. ":")
+
+  $installed = ssh_mix($host, 'print(run("/opt/cosmix/bin/mix --version"))', {timeout: 20})
+  if not $installed["ok"] then
+    print("  ERROR version probe failed: " .. trim($installed["stderr"]))
+    return -1
+  end
+  print("  installed: " .. trim($installed["stdout"]))
+
+  $scp = run_argv([
+    "scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+    $SNAPSHOT, $host .. ":" .. $PROBE
+  ], {timeout: 300})
+  if $scp["exit_code"] != 0 then
+    print("  ERROR scp probe failed: " .. trim($scp["stderr"]))
+    return -1
+  end
+
+  $mode = ssh_mix($host, 'chmod($probe, 0o755); print("chmod-ok")', {
+    timeout: 20,
+    bindings: {probe: $PROBE}
+  })
+  if not $mode["ok"] or not contains($mode["stdout"], "chmod-ok") then
+    print("  ERROR chmod probe failed: " .. trim($mode["stderr"]))
+    return -1
+  end
+
+  -- This must be the candidate version, not merely some runnable stale file.
+  $probe_version = ssh_mix($host, 'print(run($probe .. " --version"))', {
+    timeout: 20,
+    bindings: {probe: $PROBE}
+  })
+  if not $probe_version["ok"] then
+    print("  ERROR probe not runnable: " .. trim($probe_version["stderr"]))
+    return -1
+  end
+  if trim($probe_version["stdout"]) != $VERSION then
+    print("  ERROR probe version mismatch: expected " .. $VERSION .. ", got " .. trim($probe_version["stdout"]))
+    return -1
+  end
+  print("  probe:     " .. trim($probe_version["stdout"]))
+
+  $result = ssh_mix($host, $SCANNER, {
+    timeout: 300,
+    bindings: {probe: $PROBE, input: $INPUT, pattern: "'*.mix'"}
+  })
+  if not $result["ok"] then
+    print("  ERROR scan failed: " .. trim($result["stderr"]))
+    return -1
+  end
+  print($result["stdout"])
+
+  -- Count received FAIL lines locally instead of trusting only the remote
+  -- summary. The trailing space prevents the FAILING summary from matching.
+  $count = 0
+  for each $line in split($result["stdout"], "\n")
+    if pos("FAIL ", $line) > 0 then
+      $count = $count + 1
+    end
+  end
+  return $count
+end
+
+fn unstage($host)
+  $removed = ssh_mix($host, '
+remove($probe)
+remove($input)
+print("unstage-ok")
+', {timeout: 20, bindings: {probe: $PROBE, input: $INPUT}})
+  if not $removed["ok"] or not contains($removed["stdout"], "unstage-ok") then
+    print("  ERROR probe cleanup failed: " .. trim($removed["stderr"]))
+    return false
+  end
+  return true
+end
+
+$errors = 0
+$failing = 0
+for each $host in $nodes
+  $count = scan($host)
+  $cleaned = unstage($host)
+  if $count < 0 or not $cleaned then
+    $errors = $errors + 1
+  else
+    $failing = $failing + $count
+  end
+end
+
+$_remove_snapshot = run_argv(["rm", "-f", $SNAPSHOT])
+
+print("")
+print("nodes that could not be probed: " .. ("" .. $errors))
+print("files failing --check under the candidate: " .. ("" .. $failing))
+if $errors > 0 then
+  exit(2)
+end
+if $failing > 0 then
+  print("READ EVERY FAIL LINE above before deploying — a strict-data config failing")
+  print("--check is expected; anything else is a file the candidate would break.")
+  exit(1)
+end
+print("fleet clean — safe to deploy")

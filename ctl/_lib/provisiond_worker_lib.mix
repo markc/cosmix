@@ -1,0 +1,67 @@
+-- provisiond_worker_lib.mix — shared auth, drain and lease-fence runtime for
+-- provisiond workers. Modules are isolated, so every export takes its inputs
+-- explicitly and workers call them through the required module value.
+
+fn load_secret($explicit_file)
+  $path = ""
+  $credential_dir = env("CREDENTIALS_DIRECTORY")
+  if $credential_dir != "" then
+    $path = $credential_dir .. "/provisiond_secret"
+  end
+  $configured_file = env("CT_SECRET_FILE")
+  if $configured_file != "" then
+    $path = $configured_file
+  end
+  if $explicit_file != nil and ("" .. $explicit_file) != "" then
+    $path = "" .. $explicit_file
+  end
+  if $path == "" then
+    print("ERROR: no provisiond secret source (need --secret-file, CT_SECRET_FILE, or $CREDENTIALS_DIRECTORY/provisiond_secret)")
+    exit(1)
+  end
+  if not is_file($path) then
+    print("ERROR: provisiond secret file not found: " .. $path)
+    exit(1)
+  end
+  $secret = trim(read_file($path))
+  if $secret == "" then
+    print("ERROR: provisiond secret file empty: " .. $path)
+    exit(1)
+  end
+  return $secret
+end
+
+fn drain_exit($outcome, $drain_mode)
+  if $drain_mode then
+    if $outcome == "empty" then exit(0) end
+    if $outcome == "processed_ok" then exit(10) end
+    if $outcome == "processed_failed" then exit(11) end
+    exit(1)
+  end
+  if $outcome == "processed_failed" then exit(1) end
+  exit(0)
+end
+
+-- The lease token is injected here so no worker can accidentally post an
+-- unfenced mutation. A lost lease is terminal and leaves the job to reconcile.
+fn post_apply($base_url, $secret, $job_id, $lease_token, $payload, $label)
+  $payload["job_id"] = $job_id
+  $payload["lease_token"] = $lease_token
+  $headers = {
+    "X-Provision-Secret": $secret,
+    "Content-Type": "application/json"
+  }
+  $result = http_post($base_url .. "/biz/provision-apply",
+    json_encode($payload), $headers, {timeout: 15})
+  $status = to_number($result["status"])
+  if $status == 409 then
+    print($label .. " apply fenced (lease lost/expired) job " ..
+      ("" .. $job_id) .. " — leaving state for reconcile, aborting")
+    exit(1)
+  end
+  if $status != 200 then
+    print($label .. " apply failed: " .. ("" .. $result["status"]) ..
+      " " .. ("" .. $result["error"]) .. " " .. ("" .. $result["body"]))
+    exit(1)
+  end
+end

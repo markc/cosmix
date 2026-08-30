@@ -1,0 +1,328 @@
+#!/usr/bin/env mix
+-- build_deploy.mix — build the monorepo, compare semantic versions, and invoke
+-- the existing deploy scripts only for configured nodes whose version differs.
+--
+-- Version is the change gate because release builds embed provenance and can
+-- differ byte-for-byte without a consumer-visible change. Each deploy script
+-- remains responsible for its own snapshot, content, downgrade, ordering, and
+-- health gates. This orchestrator stops at the first failed child deploy.
+--
+--   mix build_deploy.mix [--report|--no-build|--build-only] [component...]
+--   components: mix noded maild webd dnsd indexd mcp
+
+$d = require("../_lib/deploy_lib.mix")
+
+$SCRIPT_DIR = dirname(realpath($0))
+$CONF_PATH = $d.hub_root() .. "/_etc/build_deploy.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no build/deploy config at " .. $CONF_PATH ..
+    " — create it from build_deploy.conf.mix.example before running")
+  exit(2)
+end
+
+$CONF_DOC = load_data($CONF_PATH)
+if type($CONF_DOC) != "map" or type($CONF_DOC["build_deploy"]) != "map" then
+  print("  ERROR: " .. $CONF_PATH .. " must contain a build_deploy strict-data map")
+  exit(2)
+end
+$CONF = validate($CONF_DOC["build_deploy"], {
+  schema_version: {type: "integer", enum: [1]},
+  targets: {type: "map", schema: {
+    mix: {type: "list", min_length: 1, items: {type: "string", nonblank: true}},
+    noded: {type: "list", min_length: 1, items: {type: "string", nonblank: true}},
+    maild: {type: "list", min_length: 1, items: {type: "string", nonblank: true}},
+    webd: {type: "list", min_length: 1, items: {type: "string", nonblank: true}},
+    dnsd: {type: "list", min_length: 1, items: {type: "string", nonblank: true}},
+    indexd: {type: "list", min_length: 1, items: {type: "string", nonblank: true}},
+    mcp: {type: "list", min_length: 1, items: {type: "string", nonblank: true}}
+  }}
+})
+
+-- Fixed dependency order and child CLI shape. Per-node target sets are private
+-- operational data and come only from the hub config above.
+$COMPONENTS = [
+  {name: "mix", binary: "mix", installed: "/opt/cosmix/bin/mix",
+    script: "deploy_mix.mix", stage: ""},
+  {name: "noded", binary: "cosmix-noded", installed: "/opt/cosmix/bin/cosmix-noded",
+    script: "deploy_noded.mix", stage: "all"},
+  {name: "maild", binary: "cosmix-maild", installed: "/opt/cosmix/bin/cosmix-maild",
+    script: "deploy_maild.mix", stage: "deploy"},
+  {name: "webd", binary: "cosmix-webd", installed: "/opt/cosmix/bin/cosmix-webd",
+    script: "deploy_webd.mix", stage: ""},
+  {name: "dnsd", binary: "cosmix-dnsd", installed: "/opt/cosmix/bin/cosmix-dnsd",
+    script: "deploy_dnsd.mix", stage: "deploy"},
+  {name: "indexd", binary: "cosmix-indexd", installed: "/opt/cosmix/bin/cosmix-indexd",
+    script: "deploy_indexd.mix", stage: ""},
+  {name: "mcp", binary: "cosmix-mcp", installed: "/opt/cosmix/bin/cosmix-mcp",
+    script: "deploy_mcp.mix", stage: ""}
+]
+
+fn is_in($items, $value)
+  for each $item in $items
+    if $item == $value then
+      return true
+    end
+  end
+  return false
+end
+
+fn version_string($output)
+  $lines = split(trim($output), "\n")
+  if len($lines) == 0 or trim($lines[0]) == "" then
+    return ""
+  end
+  return join($d.ver_tuple($lines[0]), ".")
+end
+
+fn local_version($path)
+  $result = run_argv([$path, "--version"])
+  return version_string($result["stdout"])
+end
+
+fn remote_host($roster, $node)
+  if $d.is_foreign($roster, $node) then
+    return $node
+  end
+  return "root@" .. $d.mesh_ip($node)
+end
+
+-- Return {status: current|missing|unreachable, version}. A connected node with
+-- no runnable/versioned installed binary is stale, matching the old gate.
+fn remote_version($roster, $node, $path)
+  $host = remote_host($roster, $node)
+  $result = ssh_mix($host, '
+if not is_file($path) then
+  print("BUILD_DEPLOY_MISSING")
+  exit(0)
+end
+$output = trim(run($path .. " --version"))
+if $output == "" then
+  print("BUILD_DEPLOY_MISSING")
+else
+  print($output)
+end
+', {bindings: {path: $path}, connect_timeout: 8, timeout: 15})
+  if not $result["ok"] then
+    return {status: "unreachable", version: ""}
+  end
+  if trim($result["stdout"]) == "BUILD_DEPLOY_MISSING" then
+    return {status: "missing", version: ""}
+  end
+  return {status: "current", version: version_string($result["stdout"])}
+end
+
+-- Roster order governs mesh nodes. Foreign nodes are valid ssh_mix targets but
+-- are not inventory members, so retain their configured relative order after
+-- the ordered mesh subset.
+fn ordered_targets($roster, $targets)
+  $ordered = []
+  for each $candidate in $d.rollout_order($roster)
+    if is_in($targets, $candidate) then
+      push($ordered, $candidate)
+    end
+  end
+  for each $node in $targets
+    if not is_in($ordered, $node) then
+      if not $d.is_foreign($roster, $node) then
+        print("  ERROR: mesh target '" .. $node .. "' is absent from the roster rollout_order")
+        exit(2)
+      end
+      push($ordered, $node)
+    end
+  end
+  return $ordered
+end
+
+fn pick_components($wanted)
+  if len($wanted) == 0 then
+    return $COMPONENTS
+  end
+  for each $name in $wanted
+    $known = false
+    for each $component in $COMPONENTS
+      if $component["name"] == $name then
+        $known = true
+      end
+    end
+    if not $known then
+      print("  ERROR: unknown component '" .. $name ..
+        "' — valid: mix noded maild webd dnsd indexd mcp")
+      exit(2)
+    end
+  end
+  $picked = []
+  for each $component in $COMPONENTS
+    if is_in($wanted, $component["name"]) then
+      push($picked, $component)
+    end
+  end
+  return $picked
+end
+
+fn build_all()
+  $root = $d.cosmix_root()
+  print("[build] cargo build --workspace --release")
+  $started = time()
+  $result = run_argv(["cargo", "build", "--workspace", "--release"], {
+    cwd: $root .. "/src", stdout: "inherit", stderr: "inherit", timeout: 3600
+  })
+  if $result["exit_code"] != 0 then
+    print("[build] FAILED rc=" .. $result["exit_code"] .. " — NOT deploying")
+    exit(1)
+  end
+  print("[build] workspace OK (" .. (time() - $started) .. "s)")
+end
+
+-- Parse and validate the complete local selection before cargo or SSH.
+$DO_BUILD = true
+$DO_DEPLOY = true
+$BUILD_ONLY = false
+$wanted = []
+for each $arg in args()
+  if $arg == "--report" then
+    $DO_DEPLOY = false
+  else if $arg == "--no-build" then
+    $DO_BUILD = false
+  else if $arg == "--build-only" then
+    $BUILD_ONLY = true
+  else if $arg == "--help" then
+    print("usage: mix build_deploy.mix [--report|--no-build|--build-only] [component...]")
+    print("  components: mix noded maild webd dnsd indexd mcp")
+    exit(0)
+  else if starts_with($arg, "--") then
+    print("  ERROR: unknown flag " .. $arg .. " (try --help)")
+    exit(2)
+  else
+    push($wanted, $arg)
+  end
+end
+
+$ROSTER = $d.roster()
+$TARGETS = {}
+for each $component in $COMPONENTS
+  $name = $component["name"]
+  $seen = []
+  for each $node in $CONF["targets"][$name]
+    $d.assert_node($ROSTER, $node)
+    if is_in($seen, $node) then
+      print("  ERROR: duplicate " .. $name .. " target in " .. $CONF_PATH .. ": " .. $node)
+      exit(2)
+    end
+    push($seen, $node)
+  end
+  $TARGETS[$name] = ordered_targets($ROSTER, $seen)
+end
+$selected = pick_components($wanted)
+
+if $DO_BUILD then
+  build_all()
+else
+  print("[build] skipped (--no-build)")
+end
+
+if $BUILD_ONLY then
+  print("[build-only] done")
+  exit(0)
+end
+
+-- Refuse a release while the generated public version catalogue is stale.
+if $DO_DEPLOY then
+  $version_script = $SCRIPT_DIR .. "/gen-versions.mix"
+  $check = run_argv([$d.mix_bin(), $version_script, "--check"])
+  if $check["exit_code"] != 0 then
+    print("  ERROR: VERSIONS.md is stale — regenerate and commit it before releasing:")
+    print("    mix " .. $version_script)
+    print("    then commit $COSMIX/docs/VERSIONS.md and VERSIONS.html")
+    print(trim($check["stderr"]))
+    exit(1)
+  end
+  print("[gate] VERSIONS.md current")
+end
+
+$summary = []
+$mode = $DO_DEPLOY ? "BUILD+DEPLOY" : "REPORT (no deploy)"
+print("")
+print("=== change-gated " .. $mode .. " — built versus installed semantic version ===")
+
+for each $component in $selected
+  $name = $component["name"]
+  $local_path = $d.cosmix_bin($component["binary"])
+  $local = local_version($local_path)
+  if $local == "" then
+    print("== " .. $name .. " == no runnable local binary at " .. $local_path .. " — skipping")
+    push($summary, {name: $name, built: false, version: "", deployed: [], stale: [], unreachable: []})
+  else
+    print("== " .. $name .. " == built " .. $local .. " -> " .. $component["installed"])
+    $stale = []
+    $current = []
+    $unreachable = []
+    for each $node in $TARGETS[$name]
+      $remote = remote_version($ROSTER, $node, $component["installed"])
+      if $remote["status"] == "unreachable" then
+        push($unreachable, $node)
+      else if $remote["status"] == "missing" then
+        push($stale, $node)
+      else
+        if $DO_DEPLOY then
+          $d.assert_not_downgrade($node, $remote["version"], $local, false)
+        end
+        if $remote["version"] == $local then
+          push($current, $node)
+        else
+          push($stale, $node)
+        end
+      end
+    end
+
+    $current_text = len($current) > 0 ? join($current, " ") : "-"
+    $stale_text = len($stale) > 0 ? join($stale, " ") : "-"
+    $unreachable_text = len($unreachable) > 0 ? " unreachable: " .. join($unreachable, " ") : ""
+    print("   current: " .. $current_text .. " stale: " .. $stale_text .. $unreachable_text)
+
+    $deployed = []
+    if len($stale) == 0 then
+      print("   all reachable targets current (v" .. $local .. ") — nothing to deploy")
+    else if not $DO_DEPLOY then
+      print("   report: would deploy " .. $name .. " v" .. $local .. " to " .. join($stale, " "))
+    else
+      $child = $SCRIPT_DIR .. "/" .. $component["script"]
+      $argv = [$d.mix_bin(), $child]
+      if $component["stage"] != "" then
+        push($argv, $component["stage"])
+      end
+      for each $node in $stale
+        push($argv, $node)
+      end
+      print("   -> " .. join($argv, " "))
+      $deploy = run_argv($argv, {stdout: "inherit", stderr: "inherit", timeout: 3600})
+      if $deploy["exit_code"] != 0 then
+        print("   DEPLOY FAILED (" .. $name .. ") rc=" .. $deploy["exit_code"] ..
+          " — stopping; downstream components were not touched")
+        exit(1)
+      end
+      $deployed = $stale
+    end
+    push($summary, {name: $name, built: true, version: $local,
+      deployed: $deployed, stale: $stale, unreachable: $unreachable})
+  end
+end
+
+print("")
+print("=== summary (" .. $mode .. ") ===")
+for each $item in $summary
+  if not $item["built"] then
+    print("  " .. rpad($item["name"], 8) .. "not built")
+  else
+    if $DO_DEPLOY then
+      $action = "deployed=" .. (len($item["deployed"]) > 0 ? join($item["deployed"], " ") : "none")
+    else
+      $action = "would-deploy=" .. (len($item["stale"]) > 0 ? join($item["stale"], " ") : "none")
+    end
+    $unreachable = ""
+    if len($item["unreachable"]) > 0 then
+      $unreachable = " unreachable=" .. join($item["unreachable"], " ")
+    end
+    print("  " .. rpad($item["name"], 8) .. "v" .. rpad($item["version"], 9) ..
+      $action .. $unreachable)
+  end
+end

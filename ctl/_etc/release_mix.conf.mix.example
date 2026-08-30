@@ -1,0 +1,7 @@
+-- release_mix.conf.mix.example — GitHub destination for Mix release assets.
+-- Copy this file to release_mix.conf.mix in your private control hub and set
+-- the repository that owns the existing release tag.
+release_mix: {
+  schema_version: 1,
+  github_repository: "owner/cosmix"
+}

@@ -1,0 +1,116 @@
+#!/usr/bin/env mix
+-- provisiond_reconcile.mix — credentialed, operation-locked reconcile launcher.
+--
+-- Run this as root. The reconciler itself runs as the dedicated provisiond
+-- identity in a transient systemd unit. LoadCredential exposes the root-owned
+-- secret only to that unit, and flock serialises it with the drain and workers.
+--
+--   sudo mix _bin/provisiond_reconcile.mix --list
+--   sudo mix _bin/provisiond_reconcile.mix --adopt  <job_id>
+--   sudo mix _bin/provisiond_reconcile.mix --retry  <job_id>
+--   sudo mix _bin/provisiond_reconcile.mix --cancel <job_id>
+
+$d = require("../_lib/deploy_lib.mix")
+
+$RECON = "/opt/cosmix/share/cosmix/ct_reconcile.mix"
+$LOCK = "/run/cosmix-provisiond/drain.lock"
+$ENV_FILE = "/etc/cosmix/provisiond/env"
+$SECRET_SRC = "/etc/cosmix/provisiond/secret"
+$MIX = $d.mix_bin()
+$HOME_P = "/var/lib/cosmix-provisiond"
+
+fn usage_error($message)
+  print("  ERROR: " .. $message)
+  print("usage: mix provisiond_reconcile.mix --list | --adopt N | --retry N | --cancel N")
+  exit(2)
+end
+
+fn id_action($flag, $value)
+  $job = to_number($value)
+  if $job == nil or $job < 1 or $job != floor($job) then
+    usage_error($flag .. " needs a positive integer job id, got: " .. ("" .. $value))
+  end
+  return [$flag, "" .. floor($job)]
+end
+
+$g = getopt(args(), {
+  list: {arg: false},
+  adopt: {arg: true},
+  retry: {arg: true},
+  cancel: {arg: true}
+})
+if len($g["errors"]) != 0 then
+  usage_error("bad options: " .. join($g["errors"], "; "))
+end
+if len($g["rest"]) != 0 then
+  usage_error("unexpected arguments: " .. join($g["rest"], " "))
+end
+
+-- Exactly one action. Count before reading any installed state so malformed
+-- invocations are a side-effect-free exit-2 refusal.
+$count = 0
+if $g["opts"]["list"] then $count = $count + 1 end
+if $g["opts"]["adopt"] != nil then $count = $count + 1 end
+if $g["opts"]["retry"] != nil then $count = $count + 1 end
+if $g["opts"]["cancel"] != nil then $count = $count + 1 end
+if $count != 1 then
+  usage_error("give exactly one of --list / --adopt N / --retry N / --cancel N")
+end
+
+$action = ["--list"]
+if $g["opts"]["adopt"] != nil then
+  $action = id_action("--adopt", $g["opts"]["adopt"])
+end
+if $g["opts"]["retry"] != nil then
+  $action = id_action("--retry", $g["opts"]["retry"])
+end
+if $g["opts"]["cancel"] != nil then
+  $action = id_action("--cancel", $g["opts"]["cancel"])
+end
+
+$d.die_if(not is_file($SECRET_SRC),
+  "secret source missing: " .. $SECRET_SRC .. " — run deploy_provisiond.mix")
+$d.die_if(not is_file($RECON),
+  "reconciler missing: " .. $RECON .. " — run deploy_provisiond.mix")
+
+-- CT_BASE_URL comes from the installed environment, exactly as it does for
+-- the drain. Refuse before starting systemd when the installation is stale.
+$base = ""
+if is_file($ENV_FILE) then
+  for each $line in split(read_file($ENV_FILE), "\n")
+    $text = trim($line)
+    if starts_with($text, "CT_BASE_URL=") then
+      $base = trim(substr($text, 12, len($text) - 12))
+    end
+  end
+end
+$d.die_if($base == "",
+  "no CT_BASE_URL in " .. $ENV_FILE .. " — run deploy_provisiond.mix")
+
+-- --pipe/--wait makes systemd-run return the reconciler's output and status.
+-- The non-blocking lock refuses concurrent drain, worker, or reconcile work.
+$argv = ["systemd-run",
+  "--uid=cosmix-provisiond", "--gid=cosmix-provisiond",
+  "--property=LoadCredential=provisiond_secret:" .. $SECRET_SRC,
+  "--setenv=HOME=" .. $HOME_P,
+  "--setenv=CT_BASE_URL=" .. $base,
+  "--pipe", "--wait", "--collect",
+  "--unit=cosmix-provisiond-reconcile-oneshot",
+  "/usr/bin/flock", "-n", $LOCK, $MIX, $RECON]
+for each $arg in $action
+  push($argv, $arg)
+end
+
+print("reconcile via transient unit (dedicated identity, secret credential, operation lock): " ..
+  join($action, " "))
+$result = run_argv($argv, {timeout: 1200})
+if trim($result["stdout"]) != "" then
+  print(trim($result["stdout"]))
+end
+if trim($result["stderr"]) != "" then
+  print(trim($result["stderr"]))
+end
+if $result["exit_code"] != 0 then
+  print("reconcile launcher failed (exit " .. ("" .. $result["exit_code"]) .. ")")
+  exit(1)
+end

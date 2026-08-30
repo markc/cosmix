@@ -1,0 +1,179 @@
+#!/usr/bin/env mix
+-- journal_upload_install.mix — configure this node's systemd-journal-upload
+-- service to send its journal to one explicitly supplied receiver URL.
+--
+--   mix _bin/journal_upload_install.mix http://receiver.example.org:PORT
+--
+-- The receiver must expose one listener rather than separate listeners per
+-- address: journal-upload's stream can otherwise be corrupted for clients on
+-- another address. A longer watchdog avoids killing a busy upload mid-stream,
+-- and the initial cursor is seeded to the current tail so first installation
+-- does not replay the node's complete retained journal.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$argv = args()
+if len($argv) != 1 then
+  print("usage: mix journal_upload_install.mix <receiver-url>")
+  exit(2)
+end
+$URL = $argv[0]
+$BAD_URL = (
+  (not starts_with($URL, "http://") and not starts_with($URL, "https://")) or
+  contains($URL, "\n") or contains($URL, "\r")
+)
+if $BAD_URL then
+  print("  ERROR: receiver-url must be a one-line http:// or https:// URL")
+  exit(2)
+end
+if uid() != 0 then
+  print("  ERROR: journal_upload_install.mix must run as root")
+  exit(2)
+end
+
+fn required_bin($name)
+  $path = which($name)
+  if $path == nil or $path == "" then
+    print("  ERROR: required program not found: " .. $name)
+    exit(2)
+  end
+  return $path
+end
+
+fn run_required($argv, $label, $timeout)
+  $result = run_argv($argv, {timeout: $timeout})
+  $detail = trim($result["stdout"] .. " " .. $result["stderr"])
+  $d.die_if($result["exit_code"] != 0,
+    $label .. " failed (exit " .. $result["exit_code"] .. "): " .. $detail)
+  return $result
+end
+
+fn atomic_install($path, $content, $mode)
+  $temporary = $path .. ".new"
+  write_file($temporary, $content)
+  chmod($temporary, $mode)
+  chown($temporary, 0, 0)
+  rename($temporary, $path)
+end
+
+fn assert_file($path, $content, $mode)
+  $metadata = stat($path, {follow_symlinks: false})
+  $d.die_if($metadata["is_file"] != true or $metadata["is_symlink"] == true,
+    $path .. " is not an installed regular file")
+  $d.die_if($metadata["uid"] != 0 or $metadata["gid"] != 0 or
+      $metadata["perm"] != $mode,
+    $path .. " owner or mode mismatch")
+  $d.die_if(read_file($path) != $content, $path .. " content mismatch")
+end
+
+$SYSTEMCTL = required_bin("systemctl")
+$JOURNALCTL = required_bin("journalctl")
+
+-- Debian-family nodes obtain the uploader from systemd-journal-remote. Other
+-- systems must already provide the vendor unit.
+$APT = which("apt-get")
+if $APT != nil and $APT != "" then
+  $package = run_argv(
+    [$APT, "install", "-y", "systemd-journal-remote"],
+    {env: {DEBIAN_FRONTEND: "noninteractive"}, timeout: 180})
+  $d.die_if($package["exit_code"] != 0,
+    "systemd-journal-remote package install failed: " ..
+    trim($package["stdout"] .. " " .. $package["stderr"]))
+end
+
+$_unit = run_required(
+  [$SYSTEMCTL, "cat", "systemd-journal-upload.service"],
+  "journal uploader unit lookup", 15)
+
+$previous = run_argv(
+  [$SYSTEMCTL, "show", "systemd-journal-upload.service", "-p", "InvocationID", "--value"],
+  {timeout: 15})
+$PREVIOUS_INVOCATION = ""
+if $previous["exit_code"] == 0 then
+  $PREVIOUS_INVOCATION = trim($previous["stdout"])
+end
+
+$_stop = run_required(
+  [$SYSTEMCTL, "stop", "systemd-journal-upload.service"],
+  "journal uploader stop", 30)
+$cursor_result = run_required(
+  [$JOURNALCTL, "--show-cursor", "-n", "0", "--no-pager"],
+  "journal cursor lookup", 30)
+$CURSOR = ""
+for each $line in split($cursor_result["stdout"], "\n")
+  $line = trim($line)
+  if starts_with($line, "-- cursor:") then
+    $CURSOR = trim(substr($line, 10, length($line) - 10))
+  end
+end
+$d.die_if(not starts_with($CURSOR, "s="),
+  "journal cursor lookup returned no usable cursor")
+
+$UPLOAD_CONF = "/etc/systemd/journal-upload.conf"
+$DROPIN = "/etc/systemd/system/systemd-journal-upload.service.d/10-cosmix.conf"
+$STATE = "/var/lib/systemd/journal-upload/state"
+$UPLOAD_CONTENT = "[Upload]\nURL=" .. $URL .. "\n"
+$DROPIN_CONTENT = "[Unit]\nStartLimitIntervalSec=0\n[Service]\nWatchdogSec=600\nRestart=always\nRestartSec=15s\n"
+$STATE_CONTENT = "# This is private data. Do not parse.\nLAST_CURSOR=" .. $CURSOR .. "\n"
+
+mkdir(dirname($DROPIN), {parents: true})
+mkdir(dirname($STATE), {parents: true})
+atomic_install($UPLOAD_CONF, $UPLOAD_CONTENT, 0o644)
+atomic_install($DROPIN, $DROPIN_CONTENT, 0o644)
+-- DynamicUser=yes requires the runtime user to rewrite this non-secret cursor.
+atomic_install($STATE, $STATE_CONTENT, 0o666)
+
+assert_file($UPLOAD_CONF, $UPLOAD_CONTENT, 0o644)
+assert_file($DROPIN, $DROPIN_CONTENT, 0o644)
+assert_file($STATE, $STATE_CONTENT, 0o666)
+
+$_reload = run_required([$SYSTEMCTL, "daemon-reload"], "systemd daemon reload", 30)
+$_reset = run_required(
+  [$SYSTEMCTL, "reset-failed", "systemd-journal-upload.service"],
+  "journal uploader failure reset", 30)
+$_enable = run_required(
+  [$SYSTEMCTL, "enable", "systemd-journal-upload.service"],
+  "journal uploader enable", 30)
+$_restart = run_required(
+  [$SYSTEMCTL, "restart", "systemd-journal-upload.service"],
+  "journal uploader restart", 30)
+sleep(4)
+
+$active = run_required(
+  [$SYSTEMCTL, "is-active", "systemd-journal-upload.service"],
+  "journal uploader active check", 15)
+$d.die_if(trim($active["stdout"]) != "active",
+  "journal uploader is not active: " .. trim($active["stdout"]))
+$enabled = run_required(
+  [$SYSTEMCTL, "is-enabled", "systemd-journal-upload.service"],
+  "journal uploader enabled check", 15)
+$d.die_if(trim($enabled["stdout"]) != "enabled",
+  "journal uploader is not enabled: " .. trim($enabled["stdout"]))
+
+$invocation = run_required(
+  [$SYSTEMCTL, "show", "systemd-journal-upload.service", "-p", "InvocationID", "--value"],
+  "journal uploader invocation lookup", 15)
+$INVOCATION = trim($invocation["stdout"])
+$d.die_if($INVOCATION == "" or
+    ($PREVIOUS_INVOCATION != "" and $INVOCATION == $PREVIOUS_INVOCATION),
+  "journal uploader did not enter a new systemd invocation")
+
+$LOG_LINES = 0
+$attempt = 0
+while $attempt < 8 and $LOG_LINES == 0
+  $logs = run_argv(
+    [$JOURNALCTL, "_SYSTEMD_INVOCATION_ID=" .. $INVOCATION, "-o", "cat", "--no-pager"],
+    {timeout: 15})
+  if $logs["exit_code"] == 0 and trim($logs["stdout"]) != "" then
+    $LOG_LINES = len(split(trim($logs["stdout"]), "\n"))
+  end
+  $attempt = $attempt + 1
+  if $LOG_LINES == 0 and $attempt < 8 then
+    sleep(1)
+  end
+end
+$d.die_if($LOG_LINES == 0,
+  "journal uploader has no journald line for its current invocation")
+
+print("journal-upload install complete: config/state bytes and modes verified; " ..
+  "service active, enabled and running in a new logged invocation")

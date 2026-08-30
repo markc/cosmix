@@ -1,0 +1,17 @@
+-- Private target selection for build_deploy.mix.
+-- Copy this file to build_deploy.conf.mix in the private control hub. Replace
+-- every placeholder with node names from that hub's fleet roster.
+{
+  build_deploy: {
+    schema_version: 1,
+    targets: {
+      mix: ["alpha", "beta", "gamma"],
+      noded: ["alpha", "beta", "gamma"],
+      maild: ["alpha", "beta"],
+      webd: ["alpha", "beta"],
+      dnsd: ["alpha"],
+      indexd: ["beta"],
+      mcp: ["gamma"]
+    }
+  }
+}
