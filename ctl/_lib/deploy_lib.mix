@@ -1,0 +1,197 @@
+-- deploy_lib.mix — the shared half of every deploy/provision script.
+--
+--   $d = require("../_lib/deploy_lib.mix")      -- from any script under _bin/
+--
+-- Isolated module (require): nothing here touches the caller's scope, and every
+-- function takes what it needs as arguments. Names starting with `_` are private.
+--
+-- Roots. Two, and only two, and both are located, never hardcoded:
+--   hub_root()     the control hub this script lives in — $CMCTL — found from the
+--                  script's own path (the dir above _bin/ or _lib/ that holds
+--                  _etc/public-hygiene.conf.mix), else the CMCTL env var, else ~/.ctl.
+--   cosmix_root()  $COSMIX — the env var, else ~/Projects/cosmix; refuses a
+--                  directory without src/Cargo.toml.
+-- Everything else derives: cosmix_bin(name) is the release binary (honouring
+-- CARGO_TARGET_DIR), roster() is $CMCTL/_etc/fleet-roster.conf.mix.
+
+fn hub_root()
+  $here = dirname(dirname(realpath($0)))
+  if is_file($here .. "/_etc/public-hygiene.conf.mix") then
+    return $here
+  end
+  $e = env("CMCTL")
+  if $e != "" then
+    return $e
+  end
+  return env("HOME") .. "/.ctl"
+end
+
+fn cosmix_root()
+  $r = env("COSMIX", env("HOME") .. "/Projects/cosmix")
+  if not is_file($r .. "/src/Cargo.toml") then
+    print("  ERROR: $COSMIX=" .. $r .. " is not a CosMix checkout (no src/Cargo.toml)")
+    exit(2)
+  end
+  return $r
+end
+
+-- Release binary for a bin target. CARGO_TARGET_DIR wins when set, exactly as
+-- cargo itself would have placed it.
+fn cosmix_bin($name)
+  $ct = env("CARGO_TARGET_DIR")
+  if $ct != "" then
+    return $ct .. "/release/" .. $name
+  end
+  return cosmix_root() .. "/src/target/release/" .. $name
+end
+
+-- The interpreter to hand to child mix processes: the one on PATH, else the
+-- system tier. A deploy script never assumes either exists silently.
+fn mix_bin()
+  $w = which("mix")
+  if $w != nil and $w != "" then
+    return $w
+  end
+  if is_file("/opt/cosmix/bin/mix") then
+    return "/opt/cosmix/bin/mix"
+  end
+  print("  ERROR: no mix on PATH and no /opt/cosmix/bin/mix")
+  exit(2)
+end
+
+fn die_if($cond, $msg)
+  if $cond then
+    print("  ERROR: " .. $msg)
+    exit(1)
+  end
+end
+
+fn _is_in($list, $x)
+  for each $e in $list
+    if $e == $x then
+      return true
+    end
+  end
+  return false
+end
+
+-- {mesh: [...], foreign: [...], all: [...]} from the hub's fleet roster. The
+-- roster is the hub's private file; the starter ships none, and a hub without
+-- one cannot deploy — say so rather than deploy to an empty list.
+fn roster()
+  $p = hub_root() .. "/_etc/fleet-roster.conf.mix"
+  if not is_file($p) then
+    print("  ERROR: no fleet roster at " .. $p .. " — create it (mesh: [...], foreign: [...]) before deploying")
+    exit(2)
+  end
+  $r = load_data($p)["fleet_roster"]
+  $all = []
+  for each $n in $r["mesh"]
+    push($all, $n)
+  end
+  for each $n in $r["foreign"]
+    push($all, $n)
+  end
+  return {mesh: $r["mesh"], foreign: $r["foreign"], all: $all}
+end
+
+fn is_foreign($roster, $host)
+  return _is_in($roster["foreign"], $host)
+end
+
+fn assert_node($roster, $host)
+  if not _is_in($roster["all"], $host) then
+    print("  ERROR: unknown node '" .. $host .. "' — valid: " .. join($roster["all"], " "))
+    exit(2)
+  end
+end
+
+-- Node list from argv: no args = every node in the roster; each named node is
+-- asserted. Flags the caller handles are passed in `flags` and stripped.
+--   {nodes: [...], flags: {"--allow-downgrade": true, ...}}
+fn parse_nodes($roster, $argv, $known_flags)
+  $flags = {}
+  $rest = []
+  for each $a in $argv
+    if _is_in($known_flags, $a) then
+      $flags[$a] = true
+    else
+      push($rest, $a)
+    end
+  end
+  $nodes = []
+  if len($rest) == 0 then
+    for each $n in $roster["all"]
+      push($nodes, $n)
+    end
+  else
+    for each $a in $rest
+      assert_node($roster, $a)
+      push($nodes, $a)
+    end
+  end
+  return {nodes: $nodes, flags: $flags}
+end
+
+-- Copy a binary to a private temp path before the per-node loop, so a rebuild
+-- (nightly job, another session) landing mid-deploy cannot make node N+1
+-- receive different bytes from node N. Caller removes it when done.
+fn snapshot_bin($bin)
+  $mk = run_rc("mktemp /tmp/cosmix-deploy-XXXXXX")
+  $snap = trim($mk["stdout"])
+  if $mk["rc"] != 0 or $snap == "" then
+    print("  ERROR: mktemp failed for binary snapshot: " .. trim($mk["stderr"]))
+    exit(1)
+  end
+  $cp = run_rc("cp -f " .. shell_quote($bin) .. " " .. shell_quote($snap))
+  if $cp["rc"] != 0 then
+    $_rm = run_rc("rm -f " .. shell_quote($snap))
+    print("  ERROR: binary snapshot cp failed: " .. trim($cp["stderr"]))
+    exit(1)
+  end
+  chmod($snap, 0o755)
+  return $snap
+end
+
+-- "name 0.61.1" or "0.61.1" -> [0, 61, 1]
+fn ver_tuple($s)
+  $parts = split(trim($s), " ")
+  $v = $parts[len($parts) - 1]
+  $out = []
+  for each $p in split($v, ".")
+    push($out, to_number($p))
+  end
+  return $out
+end
+
+fn ver_lt($a, $b)
+  $i = 0
+  while $i < 3
+    $x = $i < len($a) ? $a[$i] : 0
+    $y = $i < len($b) ? $b[$i] : 0
+    if $x < $y then
+      return true
+    end
+    if $x > $y then
+      return false
+    end
+    $i = $i + 1
+  end
+  return false
+end
+
+-- Refuse to push an older build over a newer node unless the caller opted in.
+-- `current` is the node's --version output (may be blank: nothing installed).
+fn assert_not_downgrade($host, $current, $local_ver, $allow)
+  if trim($current) == "" then
+    return nil
+  end
+  if not ver_lt(ver_tuple($local_ver), ver_tuple($current)) then
+    return nil
+  end
+  die_if(not $allow,
+    $host .. " REFUSING DOWNGRADE: node runs " .. trim($current) ..
+    ", local build is " .. $local_ver .. " -- is $COSMIX behind origin/main?" ..
+    " Pass --allow-downgrade if a rollback is intended.")
+  print("  !! DOWNGRADE (--allow-downgrade): " .. trim($current) .. " -> " .. $local_ver)
+end
