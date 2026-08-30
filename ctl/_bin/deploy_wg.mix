@@ -1,0 +1,545 @@
+#!/usr/bin/env mix
+-- deploy_wg.mix — apply inventory-derived WireGuard state to a mesh.
+--
+--   mix _bin/deploy_wg.mix --dry-run       -- show and verify the plan
+--   mix _bin/deploy_wg.mix                 -- apply every rostered mesh node
+--   mix _bin/deploy_wg.mix alpha beta      -- apply named spokes + the hub
+--
+-- The signed inventory is the address and peer authority. The private overlay
+-- supplies interface names and non-secret WireGuard settings. Private keys
+-- never leave their nodes: the hub key is merged from its live configuration,
+-- while spoke configuration changes only the Interface Address line.
+--
+-- Fail-closed: the signed inventory must verify against the authored inventory;
+-- the committed hub configuration must equal a fresh derivation; deployment
+-- order must be complete and hubs-last; every node must answer a current
+-- reachability challenge; remote mutation must return this invocation's token;
+-- and the final live hub peer set and spoke addresses must exactly match intent.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_wg.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no deploy_wg configuration at " .. $CONF_PATH)
+  print("         copy _etc/deploy_wg.conf.mix.example there and set expected_mesh")
+  exit(2)
+end
+$CONF = load_data($CONF_PATH)
+if type($CONF) != "map" or type($CONF["deploy_wg"]) != "map" then
+  print("  ERROR: " .. $CONF_PATH .. " must contain a deploy_wg map")
+  exit(2)
+end
+$WGCONF = $CONF["deploy_wg"]
+if $WGCONF["schema_version"] != 1 then
+  print("  ERROR: " .. $CONF_PATH .. " needs deploy_wg.schema_version: 1")
+  exit(2)
+end
+if type($WGCONF["expected_mesh"]) != "string" or trim($WGCONF["expected_mesh"]) == "" then
+  print("  ERROR: " .. $CONF_PATH .. " needs a non-empty deploy_wg.expected_mesh")
+  exit(2)
+end
+
+-- mesh_lib owns signed-inventory verification, deterministic WG generation,
+-- the component-deploy epoch ratchet, write lock, and verified byte snapshot.
+-- Its hub-relative globals predate deploy_lib, so point those globals at the
+-- same located hub before calling them.
+include $d.hub_root() .. "/_bin/mesh_lib.mix"
+$MESH_EXPECTED = $WGCONF["expected_mesh"]
+$MESH_SIGN_BIN = $d.cosmix_bin("cosmix-mesh-sign")
+$MESH_BASELINE = $d.hub_root() .. "/_etc/mesh/epoch.baseline.mix"
+$MESH_WRITE_LOCK = $d.hub_root() .. "/_share/cosmix/.mesh-write.lock"
+
+$SIGNED = $d.hub_root() .. "/_etc/mesh/inventory.signed"
+$AUTHORED = $d.hub_root() .. "/_etc/mesh/inventory.mix"
+$WGOVERLAY = $d.hub_root() .. "/_etc/mesh/wg.overlay.mix"
+$WGDIR = $d.hub_root() .. "/_etc/cosmix/wgd"
+
+fn has_str($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn same_strings($left, $right)
+  if len($left) != len($right) then
+    return false
+  end
+  for each $item in $left
+    if not has_str($right, $item) then
+      return false
+    end
+  end
+  return true
+end
+
+-- First inet address on the device as ip/cidr, or "" when none is present.
+fn live_addr($node, $iface)
+  $r = ssh_mix($node, '
+$raw = ""
+try
+  $raw = run("ip -o -4 addr show dev " .. $iface)
+catch $err
+  print("")
+  exit(0)
+end
+$seen = false
+for each $part in split(trim($raw), " ")
+  if $seen and $part != "" then
+    print($part)
+    exit(0)
+  end
+  if $part == "inet" then
+    $seen = true
+  end
+end
+print("")
+', {bindings: {iface: $iface}})
+  if not $r["ok"] then
+    return ""
+  end
+  return trim($r["stdout"])
+end
+
+fn assert_reachable($node, $token)
+  $reach = ssh_mix($node, 'print("WG_REACH " .. $token)', {bindings: {token: $token}})
+  $d.die_if(not $reach["ok"] or not contains($reach["stdout"], "WG_REACH " .. $token),
+    $node .. " unreachable or not running the system Mix interpreter: " ..
+    trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+end
+
+fn apply_hub($node, $iface, $template_bytes, $suffix, $token)
+  print("[hub " .. $node .. "] " .. $iface)
+  $run = ssh_mix($node, '
+fn fail($message)
+  print("ERROR: " .. $message)
+  exit(1)
+end
+
+$conf = "/etc/wireguard/" .. $iface .. ".conf"
+$backup = $conf .. ".bak-" .. $suffix
+$stripped = "/run/wg-hub-" .. $suffix .. ".stripped"
+if not is_file($conf) then
+  fail("live conf not found: " .. $conf)
+end
+
+$private_key = nil
+for each $line in split(read_file($conf), "\n")
+  if starts_with(trim($line), "PrivateKey") then
+    $parts = split($line, "=")
+    $value = ""
+    $i = 1
+    while $i < len($parts)
+      if $i > 1 then
+        $value = $value .. "="
+      end
+      $value = $value .. $parts[$i]
+      $i = $i + 1
+    end
+    $private_key = trim($value)
+  end
+end
+if $private_key == nil or $private_key == "" then
+  fail("no PrivateKey line in " .. $conf .. " — refusing a keyless hub conf")
+end
+
+$lines = []
+$spliced = false
+for each $line in split($template_bytes, "\n")
+  push($lines, $line)
+  if trim($line) == "[Interface]" and not $spliced then
+    push($lines, "PrivateKey = " .. $private_key)
+    $spliced = true
+  end
+end
+if not $spliced then
+  fail("approved template has no [Interface] section")
+end
+$merged = join($lines, "\n")
+
+try
+  copy($conf, $backup)
+catch $backup_error
+  fail("backup " .. $conf .. " -> " .. $backup .. ": " .. $backup_error)
+end
+write_file($conf, $merged)
+chmod($conf, 0o600)
+
+try
+  run("/usr/bin/wg-quick strip " .. $iface .. " > " .. $stripped)
+catch $strip_error
+  copy($backup, $conf)
+  remove($stripped)
+  fail("wg-quick strip " .. $iface .. " failed; conf restored: " .. $strip_error)
+end
+
+try
+  run("/usr/bin/wg syncconf " .. $iface .. " " .. $stripped)
+catch $sync_error
+  copy($backup, $conf)
+  $rollback_error = ""
+  try
+    run("/usr/bin/wg-quick strip " .. $iface .. " > " .. $stripped)
+    run("/usr/bin/wg syncconf " .. $iface .. " " .. $stripped)
+  catch $rollback_failure
+    $rollback_error = "" .. $rollback_failure
+  end
+  remove($stripped)
+  if $rollback_error != "" then
+    fail("wg syncconf failed and rollback also failed; device may be mid-applied: " ..
+      $sync_error .. "; rollback: " .. $rollback_error)
+  end
+  fail("wg syncconf failed and rolled back cleanly: " .. $sync_error)
+end
+remove($stripped)
+print("WG_DEPLOY_OK " .. $token .. " hub " .. $iface .. " backup " .. $backup)
+', {bindings: {
+    iface: $iface,
+    template_bytes: $template_bytes,
+    suffix: $suffix,
+    token: $token
+  }})
+  $d.die_if(not $run["ok"] or not contains($run["stdout"], "WG_DEPLOY_OK " .. $token),
+    "hub install on " .. $node .. " failed: " .. trim($run["stdout"]) .. " " .. trim($run["stderr"]))
+  print("  " .. trim($run["stdout"]))
+end
+
+fn apply_spoke($node, $iface, $new_ip, $suffix, $token)
+  print("[spoke " .. $node .. "] " .. $iface)
+  $run = ssh_mix($node, '
+fn fail($message)
+  print("ERROR: " .. $message)
+  exit(1)
+end
+
+$conf = "/etc/wireguard/" .. $iface .. ".conf"
+$backup = $conf .. ".bak-" .. $suffix
+if not is_file($conf) then
+  fail("conf not found: " .. $conf)
+end
+
+$live = ""
+try
+  $raw = run("ip -o -4 addr show dev " .. $iface)
+  $seen = false
+  for each $part in split(trim($raw), " ")
+    if $seen and $part != "" then
+      $live = $part
+      $seen = false
+    end
+    if $part == "inet" and $live == "" then
+      $seen = true
+    end
+  end
+catch $live_error
+  $live = ""
+end
+
+$live_ip = ""
+$live_prefix = ""
+if $live != "" then
+  $live_parts = split($live, "/")
+  $live_ip = trim($live_parts[0])
+  if len($live_parts) > 1 then
+    $live_prefix = trim($live_parts[1])
+  end
+end
+
+$lines = split(read_file($conf), "\n")
+$address_index = -1
+$conf_ip = ""
+$conf_prefix = ""
+$i = 0
+while $i < len($lines)
+  if starts_with(trim($lines[$i]), "Address") then
+    $parts = split($lines[$i], "=")
+    if len($parts) < 2 then
+      fail("malformed Address line: " .. $lines[$i])
+    end
+    $address = split(trim($parts[1]), "/")
+    $conf_ip = trim($address[0])
+    if len($address) > 1 then
+      $conf_prefix = trim($address[1])
+    end
+    $address_index = $i
+    $i = len($lines)
+  else
+    $i = $i + 1
+  end
+end
+if $address_index < 0 then
+  fail("no Address line in " .. $conf)
+end
+
+$prefix = $live_prefix
+if $prefix == "" then
+  $prefix = $conf_prefix
+end
+if $prefix == "" then
+  $prefix = "32"
+end
+
+if $live_ip == $new_ip and $conf_ip == $new_ip then
+  print("WG_DEPLOY_OK " .. $token .. " unchanged " .. $new_ip .. "/" .. $prefix)
+  exit(0)
+end
+
+try
+  copy($conf, $backup)
+catch $backup_error
+  fail("backup " .. $conf .. " -> " .. $backup .. ": " .. $backup_error)
+end
+if $live_ip != $new_ip then
+  try
+    run("ip addr replace " .. $new_ip .. "/" .. $prefix .. " dev " .. $iface)
+  catch $replace_error
+    fail("ip addr replace failed: " .. $replace_error)
+  end
+  if $live_ip != "" then
+    try
+      run("ip addr del " .. $live_ip .. "/" .. $live_prefix .. " dev " .. $iface)
+    catch $delete_error
+      nil
+    end
+  end
+end
+$lines[$address_index] = "Address = " .. $new_ip .. "/" .. $prefix
+write_file($conf, join($lines, "\n"))
+chmod($conf, 0o600)
+print("WG_DEPLOY_OK " .. $token .. " set " .. $iface .. " = " .. $new_ip .. "/" .. $prefix ..
+  " backup " .. $backup)
+', {bindings: {
+    iface: $iface,
+    new_ip: $new_ip,
+    suffix: $suffix,
+    token: $token
+  }})
+  $d.die_if(not $run["ok"] or not contains($run["stdout"], "WG_DEPLOY_OK " .. $token),
+    "spoke install on " .. $node .. " failed: " .. trim($run["stdout"]) .. " " .. trim($run["stderr"]))
+  print("  " .. trim($run["stdout"]))
+end
+
+-- Parse only rostered mesh nodes. A named run selects spokes; the primary hub
+-- is always added because its peer set must move with any spoke address.
+$ROSTER = $d.roster()
+$WG_ROSTER = {
+  mesh: $ROSTER["mesh"],
+  foreign: [],
+  all: $ROSTER["mesh"],
+  order: $ROSTER["order"]
+}
+$parsed = $d.parse_nodes($WG_ROSTER, args(), ["--dry-run"])
+$dry = $parsed["flags"]["--dry-run"] == true
+$requested = []
+for each $arg in args()
+  if $arg != "--dry-run" then
+    push($requested, $arg)
+  end
+end
+
+$inventory_hubs = $d.mesh_hubs()
+$d.die_if(len($inventory_hubs) == 0, "mesh inventory declares no hubs")
+$hub = $inventory_hubs[0]
+if len($requested) > 0 then
+  for each $node in $parsed["nodes"]
+    $d.die_if(has_str($inventory_hubs, $node),
+      "requested node '" .. $node .. "' is a hub; name spokes only because the primary hub is always applied")
+  end
+end
+
+$selected = []
+for each $node in $parsed["nodes"]
+  push($selected, $node)
+end
+if not has_str($selected, $hub) then
+  push($selected, $hub)
+end
+
+-- The authenticated payload is the only input allowed to determine live
+-- routing. against_authored refuses an unsealed edit before any node is read.
+if not $dry then
+  mesh_take_write_lock("deploy_wg")
+end
+$vi = verified_inventory($SIGNED, {
+  mesh: $MESH_EXPECTED,
+  against_authored: $AUTHORED
+})
+$mesh = $vi["inventory"]
+$wgov = load_data($WGOVERLAY)["wg_overlay"]
+validate_wg_overlay($mesh, $wgov)
+$d.die_if(not same_strings($inventory_hubs, $mesh["hub"]),
+  "authored and verified inventories disagree on hub membership")
+
+$active = []
+for each $member in $mesh["members"]
+  if $member["status"] == "active" then
+    push($active, $member["name"])
+  end
+end
+$d.die_if(not same_strings($ROSTER["mesh"], $active),
+  "fleet roster mesh nodes must exactly match the verified active inventory")
+
+-- Validate the library-provided rollout before filtering it. A malformed
+-- private rollout must never silently omit a selected node or put a spoke
+-- after a hub.
+$rollout = $d.rollout_order($ROSTER)
+$seen = []
+$in_hub_tail = false
+for each $node in $rollout
+  $d.die_if(not has_str($ROSTER["mesh"], $node),
+    "rollout_order contains non-mesh node '" .. $node .. "'")
+  $d.die_if(has_str($seen, $node), "rollout_order repeats node '" .. $node .. "'")
+  if has_str($inventory_hubs, $node) then
+    $in_hub_tail = true
+  else
+    $d.die_if($in_hub_tail, "rollout_order is not hubs-last: spoke '" .. $node .. "' follows a hub")
+  end
+  push($seen, $node)
+end
+$d.die_if(not same_strings($seen, $ROSTER["mesh"]),
+  "rollout_order must contain every rostered mesh node exactly once")
+
+$nodes = []
+for each $node in $rollout
+  if has_str($selected, $node) then
+    push($nodes, $node)
+  end
+end
+$d.die_if(not has_str($nodes, $hub), "primary hub is missing from the filtered rollout")
+
+$hub_iface = wg_iface_of($wgov, $hub)
+$committed = $WGDIR .. "/" .. $hub_iface .. ".conf"
+$epoch = $mesh["epoch"]
+print("deploy_wg — WireGuard apply (epoch " .. ("" .. $epoch) .. ")")
+print("  source : VERIFIED " .. $SIGNED)
+print("  authoring blake3 " .. $vi["authoring_blake3"])
+print("  hub    : " .. $hub .. " (" .. $hub_iface .. ")")
+print("  order  : " .. join($nodes, " "))
+if $dry then
+  print("  DRY-RUN — remote state is read but not changed")
+end
+print("")
+
+-- Ship the exact bytes approved by this comparison, not a later re-read of
+-- the mutable committed path.
+$d.die_if(not is_file($committed),
+  "committed hub conf missing: " .. $committed .. " (seal the mesh inventory first)")
+$fresh = gen_hub_wg_from_verified($vi, $WGOVERLAY)
+$ondisk = read_file($committed)
+$d.die_if($fresh != $ondisk,
+  "committed " .. $committed .. " is stale versus a fresh verified derivation; seal and commit it before deploying")
+print("[preflight] committed hub conf is current (" .. ("" .. byte_length($ondisk)) .. " bytes)")
+$ship = $committed
+if not $dry then
+  $ship = verified_snapshot($ondisk, $hub_iface .. ".conf")
+end
+
+$date = run_argv(["date", "+%Y%m%d-%H%M%S"])
+$d.die_if($date["exit_code"] != 0, "date failed: " .. trim($date["stderr"]))
+$suffix = trim($date["stdout"])
+$d.die_if($suffix == "", "date produced an empty backup suffix")
+$token = uuid()
+
+if not $dry then
+  mesh_baseline_ratchet_epoch($MESH_BASELINE, $vi)
+end
+print("")
+
+for each $node in $nodes
+  $iface = wg_iface_of($wgov, $node)
+  assert_reachable($node, $token)
+  if $dry then
+    $live = live_addr($node, $iface)
+    if $node == $hub then
+      print("[hub " .. $node .. "] " .. $iface .. " live " .. ($live == "" ? "(none)" : $live))
+      print("  would merge the live PrivateKey, install the approved template, and syncconf")
+    else
+      print("[spoke " .. $node .. "] " .. $iface .. " intended " .. $d.mesh_ip($node) ..
+        " live " .. ($live == "" ? "(none)" : $live))
+    end
+  else
+    if $node == $hub then
+      apply_hub($node, $iface, read_file($ship), $suffix, $token)
+    else
+      apply_spoke($node, $iface, $d.mesh_ip($node), $suffix, $token)
+    end
+  end
+  print("")
+end
+
+if $dry then
+  print("dry-run complete")
+  exit(0)
+end
+
+print("[verify] hub peer set + spoke addresses")
+$dump = ssh_mix($hub, 'print(run("wg show " .. $iface .. " dump"))', {
+  bindings: {iface: $hub_iface}
+})
+$d.die_if(not $dump["ok"],
+  "wg show " .. $hub_iface .. " on " .. $hub .. ": " .. trim($dump["stderr"]))
+$actual = {}
+$actual_keys = []
+$row = 0
+for each $line in split(trim($dump["stdout"]), "\n")
+  if $row > 0 and trim($line) != "" then
+    $fields = split($line, "\t")
+    if len($fields) >= 4 then
+      $actual[$fields[0]] = trim($fields[3])
+      push($actual_keys, $fields[0])
+    end
+  end
+  $row = $row + 1
+end
+
+$expected = {}
+$bad = 0
+for each $member in $mesh["members"]
+  if $member["status"] == "active" and $member["name"] != $hub then
+    for each $public_key in wg_current_pubkeys($member, $epoch)
+      $expected[$public_key] = true
+      $wanted = $d.mesh_ip($member["name"]) .. "/32"
+      $got = $actual[$public_key]
+      if $got == nil then
+        print("  MISSING hub peer " .. $member["name"] .. " (" .. $public_key .. ")")
+        $bad = $bad + 1
+      else
+        if $got != $wanted then
+          print("  WRONG AllowedIPs for " .. $member["name"] .. ": live " .. $got .. " want " .. $wanted)
+          $bad = $bad + 1
+        end
+      end
+    end
+  end
+end
+for each $public_key in $actual_keys
+  if $expected[$public_key] != true then
+    print("  UNEXPECTED hub peer " .. $public_key .. " (allowed " .. ("" .. $actual[$public_key]) .. ")")
+    $bad = $bad + 1
+  end
+end
+$d.die_if($bad > 0,
+  "hub peer set does not match the verified inventory (" .. ("" .. $bad) .. " discrepancies)")
+print("  hub " .. $hub_iface .. ": exact peer set (" .. ("" .. len($actual_keys)) .. " peers)")
+
+for each $node in $nodes
+  if $node != $hub then
+    $iface = wg_iface_of($wgov, $node)
+    $wanted = $d.mesh_ip($node)
+    $live = live_addr($node, $iface)
+    $live_ip = $live
+    if contains($live, "/") then
+      $live_ip = split($live, "/")[0]
+    end
+    $d.die_if($live_ip != $wanted,
+      $node .. " " .. $iface .. " address is " .. ($live == "" ? "(none)" : $live) ..
+      ", expected " .. $wanted)
+    print("  " .. rpad($node, 8) .. " " .. $iface .. " = " .. $live)
+  end
+end
+snapshot_release($ship)
+print("")
+print("deploy_wg complete: verified live WireGuard state on " .. join($nodes, " ") ..
+  " at epoch " .. ("" .. $epoch))

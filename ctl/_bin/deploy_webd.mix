@@ -1,0 +1,305 @@
+#!/usr/bin/env mix
+-- deploy_webd.mix — install cosmix-webd and its systemd unit on configured
+-- mesh nodes, then prove the restarted daemon is healthy.
+--
+--   mix _bin/deploy_webd.mix                     -- configured default nodes
+--   mix _bin/deploy_webd.mix alpha beta          -- a named subset
+--   mix _bin/deploy_webd.mix --allow-downgrade … -- a deliberate rollback
+--
+-- The hub-owned _etc/deploy_webd.conf.mix supplies the private default target
+-- list. Addresses come from the mesh inventory, and the roster's rollout order
+-- is always applied so hub nodes are touched last. Every remote program is Mix
+-- source sent with ssh_mix; system commands run only inside that source.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_webd.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no deploy_webd config at " .. $CONF_PATH ..
+    " — create it from deploy_webd.conf.mix.example before deploying")
+  exit(2)
+end
+$config_data = load_data($CONF_PATH)
+$d.die_if(type($config_data) != "map", $CONF_PATH .. " must contain a strict-data map")
+$CONF = $config_data["deploy_webd"]
+$d.die_if(type($CONF) != "map", $CONF_PATH .. " must contain a deploy_webd map")
+$default_nodes = $CONF["default_nodes"]
+$d.die_if(type($default_nodes) != "list", $CONF_PATH .. " deploy_webd.default_nodes must be a list")
+$d.die_if(len($default_nodes) == 0, $CONF_PATH .. " deploy_webd.default_nodes must not be empty")
+for each $n in $default_nodes
+  $d.die_if(type($n) != "string" or trim($n) == "",
+    $CONF_PATH .. " deploy_webd.default_nodes entries must be non-empty strings")
+end
+
+$ROSTER = $d.roster()
+$requested = args()
+$has_named_node = false
+for each $a in $requested
+  if $a != "--allow-downgrade" then
+    $has_named_node = true
+  end
+end
+if not $has_named_node then
+  $requested = concat($default_nodes, $requested)
+end
+$parsed = $d.parse_nodes($ROSTER, $requested, ["--allow-downgrade"])
+$selected = $parsed["nodes"]
+$ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
+
+-- Validate the complete selection and resolve every address before inspecting
+-- or snapshotting an artefact. A bad pre-flight cannot touch a node.
+$REMOTE = {}
+for each $n in $selected
+  if $d.is_foreign($ROSTER, $n) then
+    print("  ERROR: " .. $n .. " is a foreign node; deploy_webd requires a mesh node with Mix as root login shell")
+    exit(2)
+  end
+  $REMOTE[$n] = "root@" .. $d.mesh_ip($n)
+end
+
+-- Intersect the requested set with the library's canonical rollout order.
+-- Also refuse an incomplete private rollout_order instead of silently dropping
+-- a requested node.
+$rollout = $d.rollout_order($ROSTER)
+for each $n in $selected
+  $found = false
+  for each $candidate in $rollout
+    if $candidate == $n then
+      $found = true
+    end
+  end
+  if not $found then
+    print("  ERROR: selected node '" .. $n .. "' is absent from the roster rollout_order")
+    exit(2)
+  end
+end
+$nodes = []
+for each $candidate in $rollout
+  for each $n in $selected
+    if $candidate == $n then
+      push($nodes, $n)
+    end
+  end
+end
+
+$SOURCE_BIN = $d.cosmix_bin("cosmix-webd")
+$UNIT = $d.cosmix_root() .. "/src/_etc/systemd-system/cosmix-webd.service"
+$d.die_if(not is_file($SOURCE_BIN),
+  "local release binary missing (build it first: cd $COSMIX/src && cargo build --release -p cosmix-webd): " .. $SOURCE_BIN)
+$d.die_if(not is_file($UNIT), "systemd unit template missing: " .. $UNIT)
+
+-- Snapshot once so every node receives identical bytes even if another build
+-- relinks the release binary during this rollout.
+$BIN = $d.snapshot_bin($SOURCE_BIN)
+$bv = run_argv([$BIN, "--version"])
+$d.die_if($bv["exit_code"] != 0, "local cosmix-webd --version failed: " .. trim($bv["stderr"]))
+$ver = trim($bv["stdout"])
+$d.die_if($ver == "", "local cosmix-webd --version returned no version")
+$BIN_HASH = hash_file($BIN, "sha256")
+$UNIT_HASH = hash_file($UNIT, "sha256")
+print("local build version: " .. $ver)
+
+-- assert_not_downgrade accepts a plain semantic version; Clap appends build
+-- provenance after that field, which remains part of the exact install check.
+fn semantic_version($line)
+  $parts = split(trim($line), " ")
+  if len($parts) > 1 then
+    return $parts[1]
+  end
+  return $parts[0]
+end
+
+$local_semver = semantic_version($ver)
+
+fn scp_file($host, $remote, $local_path, $remote_path)
+  $copy_result = run_argv([
+    "scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+    $local_path, $remote .. ":" .. $remote_path
+  ], {timeout: 120})
+  $d.die_if($copy_result["exit_code"] != 0,
+    "scp " .. $local_path .. " -> " .. $host .. ":" .. $remote_path .. ": " .. trim($copy_result["stderr"]))
+end
+
+-- Require at least one journal line from the invocation created by this
+-- rollout. The invocation-ID comparison makes the restart gate no-op resistant;
+-- old or rotated log lines cannot satisfy the logging gate.
+fn verify_logging($host, $remote, $unit, $previous_invocation)
+  $try = 0
+  while $try < 4
+    $probe = ssh_mix($remote, '
+$iid = trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value"))
+if $rc != 0 or $iid == "" then
+  exit(7)
+end
+$logs = trim(run("/usr/bin/journalctl _SYSTEMD_INVOCATION_ID=" .. $iid .. " -o cat --no-pager"))
+if $rc != 0 then
+  exit(8)
+end
+$lines = 0
+if $logs != "" then
+  $lines = len(split($logs, "\n"))
+end
+print(data_encode({invocation_id: $iid, lines: $lines}))
+', {bindings: {unit: $unit}, decode: "data", connect_timeout: 8, timeout: 15})
+    if $probe["ok"] then
+      $current = $probe["value"]["invocation_id"]
+      $d.die_if($previous_invocation != "" and $current == $previous_invocation,
+        $host .. " service invocation did not change after restart")
+      $lines = $probe["value"]["lines"]
+      if $lines >= 1 then
+        print("  logging verified (" .. $lines .. " line/s, current invocation)")
+        return nil
+      end
+    end
+    $try = $try + 1
+    if $try < 4 then
+      sleep(1)
+    end
+  end
+  $d.die_if(true, $host .. " cosmix-webd is active but has zero journald lines for the current systemd invocation")
+end
+
+fn deploy($host)
+  $remote = $REMOTE[$host]
+  print("")
+  print("[" .. $host .. "] deploy cosmix-webd")
+
+  $reach = ssh_mix($remote, '
+$out = trim(run("/usr/bin/hostname"))
+if $rc != 0 or $out == "" then
+  exit(7)
+end
+print($out)
+', {connect_timeout: 8, timeout: 10})
+  $d.die_if(not $reach["ok"],
+    $host .. " unreachable or not a working Mix node: " .. trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+  print("  connected: " .. trim($reach["stdout"]))
+
+  -- Refuse a backwards move before transferring anything.
+  $pre = ssh_mix($remote, '
+$out = trim(run($bin .. " --version"))
+if $rc == 0 then
+  print($out)
+end
+', {bindings: {bin: "/opt/cosmix/bin/cosmix-webd"}, connect_timeout: 8, timeout: 10})
+  if $pre["ok"] and trim($pre["stdout"]) != "" then
+    $d.assert_not_downgrade($host, semantic_version($pre["stdout"]), $local_semver, $ALLOW_DOWNGRADE)
+  end
+
+  $mk = ssh_mix($remote, 'mkdir("/opt/cosmix/bin", {parents: true}); print("mkdir-ok")',
+    {connect_timeout: 8, timeout: 10})
+  $d.die_if(not $mk["ok"] or not contains($mk["stdout"], "mkdir-ok"),
+    $host .. " could not create /opt/cosmix/bin: " .. trim($mk["stderr"]))
+
+  scp_file($host, $remote, $BIN, "/opt/cosmix/bin/cosmix-webd.new")
+  $install = ssh_mix($remote, '
+chmod($new_bin, 0o755)
+rename($new_bin, $bin)
+$installed_version = trim(run($bin .. " --version"))
+if $rc != 0 then
+  exit(7)
+end
+$_help = run($bin .. " --help")
+if $rc != 0 then
+  exit(8)
+end
+print(data_encode({version: $installed_version, hash: hash_file($bin, "sha256")}))
+', {
+    bindings: {
+      new_bin: "/opt/cosmix/bin/cosmix-webd.new",
+      bin: "/opt/cosmix/bin/cosmix-webd"
+    },
+    decode: "data", connect_timeout: 8, timeout: 20
+  })
+  $d.die_if(not $install["ok"],
+    $host .. " binary install or --help smoke failed: " .. trim($install["stdout"]) .. " " .. trim($install["stderr"]))
+  $d.die_if($install["value"]["version"] != $ver,
+    $host .. " installed version mismatch (want " .. $ver .. ", got " .. $install["value"]["version"] .. ")")
+  $d.die_if($install["value"]["hash"] != $BIN_HASH,
+    $host .. " installed binary hash mismatch")
+  print("  binary installed: " .. $install["value"]["version"] .. " (--help and hash OK)")
+
+  scp_file($host, $remote, $UNIT, "/usr/lib/systemd/system/cosmix-webd.service.new")
+  $unit_install = ssh_mix($remote, '
+chmod($new_unit, 0o644)
+rename($new_unit, $unit_path)
+print(hash_file($unit_path, "sha256"))
+', {
+    bindings: {
+      new_unit: "/usr/lib/systemd/system/cosmix-webd.service.new",
+      unit_path: "/usr/lib/systemd/system/cosmix-webd.service"
+    },
+    connect_timeout: 8, timeout: 10
+  })
+  $d.die_if(not $unit_install["ok"] or trim($unit_install["stdout"]) != $UNIT_HASH,
+    $host .. " unit install/hash assertion failed: " .. trim($unit_install["stdout"]) .. " " .. trim($unit_install["stderr"]))
+  print("  unit installed: hash OK")
+
+  $before = ssh_mix($remote, '
+$iid = trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value"))
+if $rc == 0 then
+  print($iid)
+end
+', {bindings: {unit: "cosmix-webd"}, connect_timeout: 8, timeout: 10})
+  $previous_invocation = $before["ok"] ? trim($before["stdout"]) : ""
+
+  $restart = ssh_mix($remote, '
+$out = run("/usr/bin/systemctl daemon-reload")
+if $rc != 0 then
+  print($out)
+  exit(7)
+end
+$out = run("/usr/bin/systemctl restart " .. $unit)
+if $rc != 0 then
+  print($out)
+  exit(8)
+end
+sleep(2)
+$out = trim(run("/usr/bin/systemctl is-active " .. $unit))
+if $rc != 0 or $out != "active" then
+  print($out)
+  exit(9)
+end
+print($out)
+', {bindings: {unit: "cosmix-webd"}, connect_timeout: 8, timeout: 30})
+  if not $restart["ok"] then
+    print("  restart failed; last 40 log lines:")
+    $journal = ssh_mix($remote,
+      'print(run("/usr/bin/journalctl -u " .. $unit .. " -n 40 --no-pager"))',
+      {bindings: {unit: "cosmix-webd"}, connect_timeout: 8, timeout: 15})
+    print($journal["stdout"])
+    print($journal["stderr"])
+  end
+  $d.die_if(not $restart["ok"],
+    $host .. " daemon-reload/restart/is-active failed: " .. trim($restart["stdout"]) .. " " .. trim($restart["stderr"]))
+  print("  active: " .. trim($restart["stdout"]))
+
+  verify_logging($host, $remote, "cosmix-webd", $previous_invocation)
+
+  -- Probe the target node's local broker. Status and reply shape are separate
+  -- gates so an error-shaped body cannot masquerade as a successful response.
+  $probe = ssh_mix($remote, '
+send webd webd.stats
+if $rc != 0 then
+  print("send rc=" .. $rc)
+  exit(7)
+end
+print("" .. $result)
+', {connect_timeout: 8, timeout: 15})
+  $d.die_if(not $probe["ok"],
+    $host .. " BUS webd.stats failed: " .. trim($probe["stdout"]) .. " " .. trim($probe["stderr"]))
+  $body = trim($probe["stdout"])
+  $d.die_if($body == "", $host .. " BUS webd.stats returned an empty body")
+  $d.die_if(not contains($body, "vhosts") and not contains($body, "count"),
+    $host .. " BUS webd.stats returned an unexpected body: " .. $body)
+  print("  BUS webd.stats: " .. $body)
+  print("  [" .. $host .. "] DEPLOY OK")
+end
+
+for each $host in $nodes
+  deploy($host)
+end
+$_rm = run_argv(["rm", "-f", $BIN])
+
+print("")
+print("deploy complete: cosmix-webd version/hash, unit hash, restart, current-invocation logging and BUS smoke verified on " .. join($nodes, " "))

@@ -153,10 +153,20 @@ fn snapshot_bin($bin)
   return $snap
 end
 
--- "name 0.61.1" or "0.61.1" -> [0, 61, 1]
+-- The FIRST dotted-numeric token of a --version line -> [major, minor, patch]:
+-- "mix 0.61.1" and "cosmix-maild 0.8.1 (abc123, built 2026-08-30)" both work.
+-- Daemons print build provenance after the version; the last token is not it.
 fn ver_tuple($s)
-  $parts = split(trim($s), " ")
-  $v = $parts[len($parts) - 1]
+  $v = ""
+  for each $tok in split(trim($s), " ")
+    if $v == "" and regex_match("^[0-9]+([.][0-9]+)+$", $tok) then
+      $v = $tok
+    end
+  end
+  if $v == "" then
+    print("  ERROR: no version number in: " .. trim($s))
+    exit(1)
+  end
   $out = []
   for each $p in split($v, ".")
     push($out, to_number($p))
@@ -265,4 +275,22 @@ fn rollout_order($roster)
     end
   end
   return concat($head, $tail)
+end
+
+-- The rollout order restricted to a given subset of nodes (still hubs last).
+-- Used when a deploy targets some mesh nodes, not all.
+fn order_subset($roster, $nodes)
+  $out = []
+  for each $n in rollout_order($roster)
+    if _is_in($nodes, $n) then
+      push($out, $n)
+    end
+  end
+  -- nodes absent from the rollout order (roster drift) go last, unordered
+  for each $n in $nodes
+    if not _is_in($out, $n) then
+      push($out, $n)
+    end
+  end
+  return $out
 end

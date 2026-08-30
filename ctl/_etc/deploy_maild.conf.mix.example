@@ -1,0 +1,7 @@
+-- Private hub configuration for deploy_maild.mix.
+-- Copy this file to `_etc/deploy_maild.conf.mix` in the control hub and replace
+-- the placeholder node names with rostered mesh nodes that run cosmix-maild.
+maild_deploy: {
+  schema_version: 1,
+  nodes: ["alpha", "beta", "gamma"]
+}

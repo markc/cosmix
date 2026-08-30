@@ -1,0 +1,7 @@
+-- deploy_indexd.conf.mix.example — private target selection for indexd deploys.
+-- Copy this file to deploy_indexd.conf.mix in the private control hub and
+-- replace the placeholder with mesh node names from its fleet roster.
+deploy_indexd: {
+  schema_version: 1,
+  target_nodes: ["alpha"]
+}

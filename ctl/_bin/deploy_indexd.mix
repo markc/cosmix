@@ -1,0 +1,188 @@
+#!/usr/bin/env mix
+-- deploy_indexd.mix — install cosmix-indexd and its systemd unit on the
+-- configured index nodes, or a named configured subset.
+--
+--   mix _bin/deploy_indexd.mix                     -- configured targets
+--   mix _bin/deploy_indexd.mix alpha               -- one configured target
+--   mix _bin/deploy_indexd.mix --allow-downgrade … -- deliberate rollback
+--
+-- The target set is private operational state in
+-- _etc/deploy_indexd.conf.mix. Nodes are checked against the fleet roster and
+-- deployed in its rollout order. Any reachability, transfer, install, restart,
+-- version, content, invocation, or logging failure stops the run.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_indexd.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no indexd deploy config at " .. $CONF_PATH .. " — create it from deploy_indexd.conf.mix.example")
+  exit(2)
+end
+$CONF = load_data($CONF_PATH)["deploy_indexd"]
+$CONF = validate($CONF, {
+  schema_version: {type: "integer", enum: [1]},
+  target_nodes: {type: "list", min_length: 1, items: {type: "string", nonblank: true}}
+})
+
+fn is_in($list, $value)
+  for each $item in $list
+    if $item == $value then
+      return true
+    end
+  end
+  return false
+end
+
+$ROSTER = $d.roster()
+$raw_args = args()
+$parsed = $d.parse_nodes($ROSTER, $raw_args, ["--allow-downgrade"])
+$ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
+
+$requested = []
+for each $arg in $raw_args
+  if $arg != "--allow-downgrade" then
+    push($requested, $arg)
+  end
+end
+if len($requested) == 0 then
+  $selected = $d.parse_nodes($ROSTER, $CONF["target_nodes"], [])["nodes"]
+else
+  $selected = $parsed["nodes"]
+end
+
+for each $node in $selected
+  if not is_in($CONF["target_nodes"], $node) then
+    print("  ERROR: '" .. $node .. "' is not an indexd target configured in " .. $CONF_PATH)
+    exit(2)
+  end
+end
+
+$fleet_order = $d.rollout_order($ROSTER)
+for each $node in $selected
+  if not is_in($fleet_order, $node) then
+    print("  ERROR: indexd target '" .. $node .. "' is not a mesh node in the rollout order")
+    exit(2)
+  end
+end
+$nodes = []
+for each $node in $fleet_order
+  if is_in($selected, $node) then
+    push($nodes, $node)
+  end
+end
+
+-- ── local build and shipped unit ───────────────────────────────────────
+$BIN = $d.cosmix_bin("cosmix-indexd")
+$UNIT = $d.cosmix_root() .. "/src/_etc/systemd-system/cosmix-indexd.service"
+$d.die_if(not is_file($BIN), "local binary missing (build it first): " .. $BIN)
+$d.die_if(not is_file($UNIT), "unit missing: " .. $UNIT)
+
+-- Snapshot once so every target receives the same bytes even if another build
+-- finishes during this deployment.
+$BIN = $d.snapshot_bin($BIN)
+$bv = run_argv([$BIN, "--version"])
+$d.die_if($bv["exit_code"] != 0, "local binary --version failed: " .. trim($bv["stderr"]))
+$ver = trim($bv["stdout"])
+$d.die_if($ver == "", "local binary --version returned no version")
+
+$bh = run_argv(["sha256sum", $BIN])
+$d.die_if($bh["exit_code"] != 0, "local binary hash failed: " .. trim($bh["stderr"]))
+$bin_hash = split(trim($bh["stdout"]), " ")[0]
+$uh = run_argv(["sha256sum", $UNIT])
+$d.die_if($uh["exit_code"] != 0, "local unit hash failed: " .. trim($uh["stderr"]))
+$unit_hash = split(trim($uh["stdout"]), " ")[0]
+$unit_data = read_file($UNIT)
+
+print("local build: " .. $BIN .. " -> " .. $ver)
+print("targets: " .. join($nodes, " "))
+
+fn deploy_node($node)
+  $addr = $d.mesh_ip($node)
+  print("")
+  print("[" .. $node .. "] deploy cosmix-indexd")
+
+  $reach = ssh_mix($addr, 'print("reach-ok")', {timeout: 60})
+  $d.die_if(not $reach["ok"] or not contains($reach["stdout"], "reach-ok"),
+    $node .. " unreachable or not a Mix host: " .. trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+
+  -- Refuse a rollback before transferring either artifact.
+  $pre = ssh_mix($addr, 'print(run("/opt/cosmix/bin/cosmix-indexd --version"))', {timeout: 60})
+  if $pre["ok"] and trim($pre["stdout"]) != "" then
+    $d.assert_not_downgrade($node, $pre["stdout"], $ver, $ALLOW_DOWNGRADE)
+  end
+
+  $scp = run_argv([
+    "scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+    $BIN, $addr .. ":/opt/cosmix/bin/cosmix-indexd.new"
+  ], {timeout: 120})
+  $d.die_if($scp["exit_code"] != 0, "binary scp -> " .. $node .. ": " .. trim($scp["stderr"]))
+
+  -- Stage the text unit through Mix data bindings, then install both files as
+  -- root-owned system artifacts. The daemon keeps its old inode until restart.
+  $stage = ssh_mix($addr,
+    'write_file("/tmp/cosmix-indexd.service.new", $unit); chmod("/tmp/cosmix-indexd.service.new", 0o644); print("unit-stage-ok")',
+    {bindings: {unit: $unit_data}, timeout: 60})
+  $d.die_if(not $stage["ok"] or not contains($stage["stdout"], "unit-stage-ok"),
+    $node .. " unit stage failed: " .. trim($stage["stdout"]) .. " " .. trim($stage["stderr"]))
+
+  $inst = ssh_mix($addr,
+    'print(run("install -o 0 -g 0 -m 0755 /opt/cosmix/bin/cosmix-indexd.new /opt/cosmix/bin/cosmix-indexd && install -o 0 -g 0 -m 0644 /tmp/cosmix-indexd.service.new /usr/lib/systemd/system/cosmix-indexd.service && rm -f /opt/cosmix/bin/cosmix-indexd.new /tmp/cosmix-indexd.service.new && /opt/cosmix/bin/cosmix-indexd --version"))',
+    {timeout: 60})
+  $d.die_if(not $inst["ok"] or trim($inst["stdout"]) != $ver,
+    $node .. " install/version mismatch (want " .. $ver .. "): " .. trim($inst["stdout"]) .. " " .. trim($inst["stderr"]))
+  print("  installed: " .. trim($inst["stdout"]))
+
+  $remote_bh = ssh_mix($addr, 'print(run("sha256sum /opt/cosmix/bin/cosmix-indexd"))', {timeout: 60})
+  $d.die_if(not $remote_bh["ok"] or not contains($remote_bh["stdout"], $bin_hash),
+    $node .. " installed binary hash mismatch: " .. trim($remote_bh["stdout"]) .. " " .. trim($remote_bh["stderr"]))
+  $remote_uh = ssh_mix($addr, 'print(run("sha256sum /usr/lib/systemd/system/cosmix-indexd.service"))', {timeout: 60})
+  $d.die_if(not $remote_uh["ok"] or not contains($remote_uh["stdout"], $unit_hash),
+    $node .. " installed unit hash mismatch: " .. trim($remote_uh["stdout"]) .. " " .. trim($remote_uh["stderr"]))
+  print("  content hashes: OK")
+
+  -- InvocationID changes only when systemd starts a new service invocation.
+  -- Logs filtered by the new ID therefore belong to this deploy, not merely a
+  -- recent earlier start.
+  $before = ssh_mix($addr,
+    'print(run("systemctl show -p InvocationID --value cosmix-indexd"))',
+    {timeout: 60})
+  $d.die_if(not $before["ok"], $node .. " could not read pre-restart invocation: " .. trim($before["stderr"]))
+
+  $restart = ssh_mix($addr,
+    'print(run("systemctl daemon-reload && systemctl restart cosmix-indexd && sleep 4 && systemctl is-active cosmix-indexd"))',
+    {timeout: 60})
+  if not $restart["ok"] or trim($restart["stdout"]) != "active" then
+    print("  ERROR: " .. $node .. " restart failed; last 40 log lines:")
+    $diag = ssh_mix($addr,
+      'print(run("journalctl -u cosmix-indexd -n 40 --no-pager"))',
+      {timeout: 60})
+    print($diag["stdout"])
+    print($diag["stderr"])
+    exit(1)
+  end
+
+  $after = ssh_mix($addr,
+    'print(run("systemctl show -p InvocationID --value cosmix-indexd"))',
+    {timeout: 60})
+  $invocation = trim($after["stdout"])
+  $d.die_if(not $after["ok"] or $invocation == "" or $invocation == trim($before["stdout"]),
+    $node .. " did not enter a new systemd invocation: " .. trim($after["stdout"]) .. " " .. trim($after["stderr"]))
+  print("  active: new invocation " .. $invocation)
+
+  $logs = ssh_mix($addr,
+    'print(run("journalctl -n 20 _SYSTEMD_INVOCATION_ID=" .. $invocation .. " -o cat --no-pager"))',
+    {bindings: {invocation: $invocation}, timeout: 60})
+  $logtail = trim($logs["stdout"])
+  $d.die_if(not $logs["ok"] or $logtail == "",
+    $node .. " has no journald entry for the new systemd invocation: " .. trim($logs["stderr"]))
+  print("  current-invocation log: " .. $logtail)
+  print("  [" .. $node .. "] DEPLOY OK")
+end
+
+for each $node in $nodes
+  deploy_node($node)
+end
+$_rm = run_argv(["rm", "-f", $BIN])
+
+print("")
+print("deploy complete: cosmix-indexd version, content, restart, active state, and current-invocation logging verified on " .. join($nodes, " "))

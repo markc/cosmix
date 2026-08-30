@@ -1,0 +1,7 @@
+{
+  deploy_webd: {
+    -- Nodes used when deploy_webd.mix is run without explicit node arguments.
+    -- Each name must exist in the private fleet roster and mesh inventory.
+    default_nodes: ["alpha", "beta", "gamma"]
+  }
+}

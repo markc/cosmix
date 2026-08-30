@@ -1,0 +1,253 @@
+#!/usr/bin/env mix
+-- deploy_maild.mix — install the freshly-built cosmix-maild binary and
+-- refreshed systemd unit on the hub-configured mail nodes.
+--
+--   mix _bin/deploy_maild.mix deploy
+--   mix _bin/deploy_maild.mix deploy alpha beta
+--   mix _bin/deploy_maild.mix deploy --allow-downgrade alpha
+--
+-- The private hub owns `_etc/deploy_maild.conf.mix`, which names the roster nodes
+-- that run maild. Deploys are sequential, stop on the first error, and follow
+-- the fleet rollout order so broker hubs are touched last.
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn is_in($list, $value)
+  for each $item in $list
+    if $item == $value then
+      return true
+    end
+  end
+  return false
+end
+
+fn maild_semver($version)
+  $parts = split(trim($version), " ")
+  if len($parts) < 2 then
+    return trim($version)
+  end
+  return $parts[1]
+end
+
+fn scp_to($host, $local, $remote)
+  $r = run_argv([
+    "scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+    $local, $host .. ":" .. $remote
+  ], {timeout: 120})
+  $d.die_if($r["exit_code"] != 0,
+    "scp " .. $local .. " -> " .. $host .. ":" .. $remote .. ": " .. trim($r["stderr"]))
+end
+
+-- A daemon can be active while its stdout/stderr never reaches journald.
+-- Poll only the CURRENT systemd invocation so old log lines cannot satisfy
+-- the gate.
+fn verify_logging($host, $unit)
+  $n = 0
+  $try = 0
+  while $try < 4
+    $r = ssh_mix($host, '
+$iid = trim(run("/usr/bin/systemctl show " .. $unit .. " -p InvocationID --value"))
+if $iid == "" then
+  eprint("missing InvocationID")
+  exit(1)
+end
+$logs = trim(run("/usr/bin/journalctl _SYSTEMD_INVOCATION_ID=" .. $iid .. " -o cat --no-pager"))
+if $logs == "" then
+  eprint("no current-invocation log lines")
+  exit(1)
+end
+print(len(split($logs, "\n")))
+', {bindings: {unit: $unit}})
+    if $r["ok"] and trim($r["stdout"]) != "" then
+      $count = to_number(trim($r["stdout"]))
+      if $count != nil then
+        $n = $count
+      end
+    end
+    if $n >= 1 then
+      $try = 4
+    else
+      $try = $try + 1
+      if $try < 4 then
+        sleep(1)
+      end
+    end
+  end
+  $d.die_if($n < 1,
+    $host .. " " .. $unit .. ": active but zero journald lines for the current systemd invocation")
+  print("  logging verified (" .. ("" .. $n) .. " line/s, current invocation)")
+end
+
+fn deploy($host)
+  print("")
+  print("[" .. $host .. "] deploy cosmix-maild")
+
+  $reach = ssh_mix($host, 'print("reach-ok")')
+  $d.die_if(not $reach["ok"] or not contains($reach["stdout"], "reach-ok"),
+    $host .. " unreachable or not a mix login shell: " .. trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+
+  -- Refuse a rollback before transferring anything. A present binary whose
+  -- version cannot be read is also a failed pre-flight, not an absent install.
+  $pre = ssh_mix($host, '
+if is_file("/opt/cosmix/bin/cosmix-maild") then
+  $v = trim(run("/opt/cosmix/bin/cosmix-maild --version"))
+  if $v == "" then
+    eprint("installed cosmix-maild returned no version")
+    exit(1)
+  end
+  print($v)
+else
+  print("ABSENT")
+end
+')
+  $d.die_if(not $pre["ok"],
+    $host .. " could not inspect installed cosmix-maild: " .. trim($pre["stderr"]))
+  if trim($pre["stdout"]) != "ABSENT" then
+    $d.assert_not_downgrade($host, maild_semver($pre["stdout"]), $LOCAL_SEMVER, $ALLOW_DOWNGRADE)
+  end
+
+  $mk = ssh_mix($host, '
+mkdir("/opt/cosmix/bin", {parents: true})
+chown("/opt/cosmix/bin", 0, 0)
+chmod("/opt/cosmix/bin", 0o755)
+print("mkdir-ok")
+')
+  $d.die_if(not $mk["ok"] or not contains($mk["stdout"], "mkdir-ok"),
+    $host .. " mkdir /opt/cosmix/bin failed: " .. trim($mk["stderr"]))
+
+  scp_to($host, $BIN, "/opt/cosmix/bin/cosmix-maild.new")
+  $inst = ssh_mix($host, '
+chown("/opt/cosmix/bin/cosmix-maild.new", 0, 0)
+chmod("/opt/cosmix/bin/cosmix-maild.new", 0o755)
+rename("/opt/cosmix/bin/cosmix-maild.new", "/opt/cosmix/bin/cosmix-maild")
+print(run("/opt/cosmix/bin/cosmix-maild --version"))
+')
+  $d.die_if(not $inst["ok"] or trim($inst["stdout"]) != $LOCAL_VERSION,
+    $host .. " install/version mismatch (want " .. $LOCAL_VERSION .. "): " .. trim($inst["stdout"]) .. " " .. trim($inst["stderr"]))
+  print("  bin: " .. trim($inst["stdout"]))
+
+  scp_to($host, $UNIT, "/usr/lib/systemd/system/cosmix-maild.service.new")
+  $unit_inst = ssh_mix($host, '
+chown("/usr/lib/systemd/system/cosmix-maild.service.new", 0, 0)
+chmod("/usr/lib/systemd/system/cosmix-maild.service.new", 0o644)
+rename("/usr/lib/systemd/system/cosmix-maild.service.new", "/usr/lib/systemd/system/cosmix-maild.service")
+print("UNIT_OK")
+')
+  $d.die_if(not $unit_inst["ok"] or not contains($unit_inst["stdout"], "UNIT_OK"),
+    $host .. " unit install failed: " .. trim($unit_inst["stdout"]) .. " " .. trim($unit_inst["stderr"]))
+  print("  unit installed")
+
+  $restart = ssh_mix($host,
+    'print(run("/usr/bin/systemctl daemon-reload && /usr/bin/systemctl restart cosmix-maild && /usr/bin/sleep 2 && /usr/bin/systemctl is-active cosmix-maild"))')
+  if not $restart["ok"] or trim($restart["stdout"]) != "active" then
+    print("  ERROR restart failed; last 40 log lines:")
+    $journal = ssh_mix($host,
+      'print(run("/usr/bin/journalctl -u cosmix-maild -n 40 --no-pager"))')
+    print($journal["stdout"])
+    print($journal["stderr"])
+    exit(1)
+  end
+  print("  active: " .. trim($restart["stdout"]))
+
+  verify_logging($host, "cosmix-maild")
+
+  -- is-active cannot prove that the restarted daemon re-registered with its
+  -- local broker. Query the broker registry for that separate liveness fact.
+  $bus = ssh_mix($host, '
+send noded noded.list
+if $rc != 0 then
+  eprint("send rc=" .. $rc)
+  exit(7)
+end
+print("" .. $result)
+')
+  $d.die_if(not $bus["ok"],
+    $host .. " BUS probe (noded.list) failed: " .. trim($bus["stdout"]) .. " " .. trim($bus["stderr"]))
+  $d.die_if(not contains(trim($bus["stdout"]), "maild"),
+    $host .. " maild not registered with local noded after restart: " .. trim($bus["stdout"]))
+  print("  BUS: maild registered with local noded")
+  print("  [" .. $host .. "] DEPLOY OK")
+end
+
+-- ── dispatch and purely-local pre-flight ───────────────────────────────
+$argv = args()
+if len($argv) == 0 then
+  print("usage: mix deploy_maild.mix deploy [--allow-downgrade] [node...]")
+  exit(2)
+end
+if $argv[0] != "deploy" then
+  print("unknown stage: " .. $argv[0])
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_maild.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no maild deploy config at " .. $CONF_PATH .. " — copy deploy_maild.conf.mix.example and set maild_deploy.nodes")
+  exit(2)
+end
+$CONF_DOC = load_data($CONF_PATH)
+$d.die_if(type($CONF_DOC) != "map" or type($CONF_DOC["maild_deploy"]) != "map",
+  "invalid " .. $CONF_PATH .. ": expected maild_deploy map")
+$CONF = $CONF_DOC["maild_deploy"]
+$d.die_if($CONF["schema_version"] != 1 or type($CONF["nodes"]) != "list" or len($CONF["nodes"]) == 0,
+  "invalid " .. $CONF_PATH .. ": expected schema_version 1 and a non-empty nodes list")
+
+$ROSTER = $d.roster()
+$configured = []
+for each $node in $CONF["nodes"]
+  $d.die_if(type($node) != "string" or trim($node) == "",
+    "invalid " .. $CONF_PATH .. ": every node must be a non-empty string")
+  $d.assert_node($ROSTER, $node)
+  $d.die_if($d.is_foreign($ROSTER, $node),
+    "maild target '" .. $node .. "' is foreign; maild deploy requires a Mix-login mesh node")
+  $d.die_if(is_in($configured, $node), "duplicate maild node in " .. $CONF_PATH .. ": " .. $node)
+  push($configured, $node)
+end
+
+$rest = []
+$first = true
+for each $arg in $argv
+  if $first then
+    $first = false
+  else
+    push($rest, $arg)
+  end
+end
+$MAIL_ROSTER = {mesh: $configured, foreign: [], all: $configured, order: nil}
+$parsed = $d.parse_nodes($MAIL_ROSTER, $rest, ["--allow-downgrade"])
+$requested = $parsed["nodes"]
+$ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
+
+-- Filter the shared whole-fleet order rather than trusting argument/config
+-- order. This preserves hubs-last for both default and subset deployments.
+$nodes = []
+for each $node in $d.rollout_order($ROSTER)
+  if is_in($requested, $node) then
+    push($nodes, $node)
+  end
+end
+$d.die_if(len($nodes) != len($requested),
+  "maild target list contains a duplicate or a node absent from the fleet rollout order")
+
+$BIN = $d.cosmix_bin("cosmix-maild")
+$UNIT = $d.cosmix_root() .. "/src/_etc/systemd-system/cosmix-maild.service"
+$d.die_if(not is_file($BIN), "local binary missing (build it first): " .. $BIN)
+$d.die_if(not is_file($UNIT), "unit missing: " .. $UNIT)
+
+$version = run_argv([$BIN, "--version"])
+$d.die_if($version["exit_code"] != 0 or trim($version["stdout"]) == "",
+  "local --version failed: " .. trim($version["stderr"]))
+$LOCAL_VERSION = trim($version["stdout"])
+$LOCAL_SEMVER = maild_semver($LOCAL_VERSION)
+print("local build version: " .. $LOCAL_VERSION)
+print("rollout order: " .. join($nodes, " "))
+
+-- Snapshot once so every node receives the exact bytes that passed pre-flight.
+$BIN = $d.snapshot_bin($BIN)
+for each $host in $nodes
+  deploy($host)
+end
+$_rm = run_argv(["rm", "-f", $BIN])
+
+print("")
+print("deploy complete: binary/version, active state, current-invocation logging and BUS registration verified on " .. join($nodes, " "))
