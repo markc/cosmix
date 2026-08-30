@@ -718,6 +718,9 @@ pub fn normalize_legacy_keyword(value: &str) -> &str {
     }
 }
 
+// Only the JSON (de)serialisers call this; without that feature it is dead
+// code and every dependant's clippy run printed the warning.
+#[cfg(feature = "json")]
 fn normalize_keyword_map(source: HashMap<String, u64>) -> HashMap<String, u64> {
     let mut result: HashMap<String, u64> = HashMap::new();
     for (name, count) in source {
