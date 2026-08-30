@@ -1,0 +1,11 @@
+-- deploy_nspawnd.conf.mix.example — private nspawnd role and allowlist data.
+-- Copy this file to deploy_nspawnd.conf.mix in the private control hub, then
+-- replace the placeholders with names and identities for that fleet.
+deploy_nspawnd: {
+  schema_version: 1,
+  build_user: "user",
+  controller_node: "alpha",
+  executor_nodes: ["beta", "gamma"],
+  operator_identities: ["operator:example"],
+  reporter_identities: ["bridge-beta", "bridge-gamma"]
+}

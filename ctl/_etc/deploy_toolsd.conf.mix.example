@@ -1,0 +1,20 @@
+-- deploy_toolsd.conf.mix.example — private toolsd targets and webd seam.
+-- Copy this file to deploy_toolsd.conf.mix in the private control hub and
+-- replace every placeholder. Node names must exist in its fleet roster and
+-- mesh inventory. Paths are absolute paths on the named target node.
+deploy_toolsd: {
+  schema_version: 1,
+  target_nodes: ["alpha", "beta"],
+  nodes: {
+    alpha: {
+      vhost: "tools.example.org",
+      ca_file: "/etc/ssl/example.org/fullchain.pem",
+      tools_db: "/srv/tools.example.org/web/data/tools.db"
+    },
+    beta: {
+      vhost: "admin.example.org",
+      ca_file: "/etc/ssl/example.org/fullchain.pem",
+      tools_db: "/srv/admin.example.org/web/data/tools.db"
+    }
+  }
+}

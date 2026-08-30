@@ -1,0 +1,564 @@
+#!/usr/bin/env mix
+-- deploy_dnsd.mix — staged cosmix-dnsd deployment to the configured mesh.
+--
+--   mix _bin/deploy_dnsd.mix sysusers [nodes...]
+--   mix _bin/deploy_dnsd.mix reclaim [nodes...]
+--   mix _bin/deploy_dnsd.mix deploy [--allow-downgrade] [nodes...]
+--
+-- The hub-private config names the DNS nodes, stage defaults, authenticated
+-- inventory inputs, generated zones, and DNS smoke queries. Deploys stop on
+-- the first failed gate and follow the roster rollout order, with hubs last.
+
+$d = require("../_lib/deploy_lib.mix")
+$m = require("../_lib/mesh_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_dnsd.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: missing deploy_dnsd config: " .. $CONF_PATH)
+  print("         copy _etc/deploy_dnsd.conf.mix.example there and replace every placeholder")
+  exit(2)
+end
+
+$loaded = nil
+try
+  $loaded = load_data($CONF_PATH)
+catch $msg
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $msg)
+  exit(2)
+end
+if type($loaded) != "map" then
+  print("  ERROR: " .. $CONF_PATH .. ": top level must be a strict-data map")
+  exit(2)
+end
+$CONF = $loaded["deploy_dnsd"]
+
+fn conf_error($msg)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $msg)
+  exit(2)
+end
+
+fn require_string($map, $key)
+  $v = $map[$key]
+  if type($v) != "string" or trim($v) == "" then
+    conf_error("'" .. $key .. "' must be a non-empty string")
+  end
+  return $v
+end
+
+fn require_list($map, $key)
+  $v = $map[$key]
+  if type($v) != "list" or len($v) == 0 then
+    conf_error("'" .. $key .. "' must be a non-empty list")
+  end
+  for each $item in $v
+    if type($item) != "string" or trim($item) == "" then
+      conf_error("'" .. $key .. "' entries must be non-empty strings")
+    end
+  end
+  return $v
+end
+
+fn has_item($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn validate_dns_name($name, $key)
+  $allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-"
+  if len($name) == 0 or len($name) > 253 or substr($name, 0, 1) == "-" then
+    conf_error("'" .. $key .. "' is not a safe DNS name")
+  end
+  $i = 0
+  while $i < len($name)
+    if not contains($allowed, substr($name, $i, 1)) then
+      conf_error("'" .. $key .. "' is not a safe DNS name")
+    end
+    $i = $i + 1
+  end
+end
+
+if type($CONF) != "map" then
+  conf_error("top-level 'deploy_dnsd' must be a map")
+end
+
+$DNS_NODES = require_list($CONF, "dns_nodes")
+$SYSUSERS_NODES = require_list($CONF, "sysusers_nodes")
+$DEFAULT_DEPLOY_NODES = require_list($CONF, "default_deploy_nodes")
+$DEFAULT_RECLAIM_NODES = require_list($CONF, "default_reclaim_nodes")
+$MESH_NAME = require_string($CONF, "mesh_name")
+$SIGNED_REL = require_string($CONF, "signed_inventory")
+$AUTHORED_REL = require_string($CONF, "authored_inventory")
+$BASELINE_REL = require_string($CONF, "freshness_baseline")
+$ZONES_REL = require_string($CONF, "zones_file")
+$ZOVERLAY_REL = require_string($CONF, "zones_overlay")
+$ZHEADER_REL = require_string($CONF, "zones_header")
+$GENESIS_PUB = require_string($CONF, "genesis_pub")
+$ANSWER_NODE = require_string($CONF, "answer_node")
+$ANSWER_NAME = require_string($CONF, "answer_name")
+$AUTHORITATIVE_ZONE = require_string($CONF, "authoritative_zone")
+$REFUSED_NAME = require_string($CONF, "refused_name")
+$NXDOMAIN_NAME = require_string($CONF, "nxdomain_name")
+
+validate_dns_name($ANSWER_NAME, "answer_name")
+validate_dns_name($AUTHORITATIVE_ZONE, "authoritative_zone")
+validate_dns_name($REFUSED_NAME, "refused_name")
+validate_dns_name($NXDOMAIN_NAME, "nxdomain_name")
+
+$argv = args()
+if len($argv) == 0 then
+  print("usage: mix deploy_dnsd.mix sysusers [node...]")
+  print("       mix deploy_dnsd.mix reclaim [node...]")
+  print("       mix deploy_dnsd.mix deploy [--allow-downgrade] [node...]")
+  exit(2)
+end
+$stage = $argv[0]
+if $stage != "sysusers" and $stage != "reclaim" and $stage != "deploy" then
+  print("unknown stage: " .. $stage)
+  exit(2)
+end
+
+$ROSTER = $d.roster()
+for each $n in $DNS_NODES
+  $d.assert_node($ROSTER, $n)
+end
+for each $n in $SYSUSERS_NODES
+  $d.assert_node($ROSTER, $n)
+end
+for each $n in $DEFAULT_DEPLOY_NODES
+  $d.assert_node($ROSTER, $n)
+  if not has_item($DNS_NODES, $n) then
+    conf_error("default_deploy_nodes contains '" .. $n .. "', which is not in dns_nodes")
+  end
+end
+for each $n in $DEFAULT_RECLAIM_NODES
+  $d.assert_node($ROSTER, $n)
+  if not has_item($DNS_NODES, $n) then
+    conf_error("default_reclaim_nodes contains '" .. $n .. "', which is not in dns_nodes")
+  end
+end
+$d.assert_node($ROSTER, $ANSWER_NODE)
+
+fn tail_args($items)
+  $out = []
+  $i = 1
+  while $i < len($items)
+    push($out, $items[$i])
+    $i = $i + 1
+  end
+  return $out
+end
+
+fn with_defaults($items, $defaults, $flag)
+  $has_node = false
+  for each $item in $items
+    if $item != $flag then
+      $has_node = true
+    end
+  end
+  if $has_node then
+    return $items
+  end
+  return concat($items, $defaults)
+end
+
+fn ordered_subset($requested)
+  $ordered = []
+  for each $candidate in $d.rollout_order($ROSTER)
+    if has_item($requested, $candidate) then
+      push($ordered, $candidate)
+    end
+  end
+  for each $node in $requested
+    if not has_item($ordered, $node) then
+      conf_error("node '" .. $node .. "' is absent from the roster rollout order")
+    end
+  end
+  return $ordered
+end
+
+
+$rest = tail_args($argv)
+$known_flags = []
+$defaults = $SYSUSERS_NODES
+if $stage == "deploy" then
+  $known_flags = ["--allow-downgrade"]
+  $defaults = $DEFAULT_DEPLOY_NODES
+else
+  if $stage == "reclaim" then
+    $defaults = $DEFAULT_RECLAIM_NODES
+  end
+end
+$parse_args = with_defaults($rest, $defaults, "--allow-downgrade")
+$parsed = $d.parse_nodes($ROSTER, $parse_args, $known_flags)
+$nodes = ordered_subset($parsed["nodes"])
+$ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
+for each $n in $nodes
+  if not has_item($DNS_NODES, $n) then
+    conf_error("node '" .. $n .. "' is not in dns_nodes")
+  end
+end
+
+$HUB = $d.hub_root()
+$ROOT = $d.cosmix_root()
+$BIN = $d.cosmix_bin("cosmix-dnsd")
+$SYSUSERS = $ROOT .. "/src/_etc/sysusers/cosmix.conf"
+$UNIT = $ROOT .. "/src/_etc/systemd-system/cosmix-dnsd.service"
+$SIGNED = $HUB .. "/" .. $SIGNED_REL
+$AUTHORED = $HUB .. "/" .. $AUTHORED_REL
+$BASELINE = $HUB .. "/" .. $BASELINE_REL
+$ZONES = $HUB .. "/" .. $ZONES_REL
+$ZOVERLAY = $HUB .. "/" .. $ZOVERLAY_REL
+$ZHEADER = $HUB .. "/" .. $ZHEADER_REL
+
+fn need($host, $result, $what)
+  if not $result["ok"] then
+    print("  ERROR (" .. $host .. ") " .. $what .. ": " .. trim($result["stderr"]))
+    exit(1)
+  end
+end
+
+fn scp_to($host, $local, $remote)
+  $r = run_argv(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+    $local, $host .. ":" .. $remote], {timeout: 120})
+  $d.die_if($r["exit_code"] != 0,
+    "scp " .. $local .. " -> " .. $host .. ":" .. $remote .. ": " .. trim($r["stderr"]))
+end
+
+fn reach($host)
+  $r = ssh_mix($host, 'print("reach-ok")')
+  $d.die_if(not $r["ok"] or trim($r["stdout"]) != "reach-ok",
+    $host .. " unreachable or has no working system Mix: " .. trim($r["stdout"]) .. " " .. trim($r["stderr"]))
+end
+
+fn install_staged($host, $local, $staged, $final, $mode, $uid, $gid)
+  scp_to($host, $local, $staged)
+  $r = ssh_mix($host, '
+chmod($staged, $mode)
+chown($staged, $uid, $gid)
+rename($staged, $final)
+print(hash_file($final, "blake3"))
+', {bindings: {staged: $staged, final: $final, mode: $mode, uid: $uid, gid: $gid}})
+  need($host, $r, "install " .. $final)
+  $want = hash_file($local, "blake3")
+  $d.die_if(trim($r["stdout"]) != $want,
+    $host .. " byte verification failed for " .. $final .. " (want " .. $want .. ", got " .. trim($r["stdout"]) .. ")")
+end
+
+fn assert_506($host)
+  $r = ssh_mix($host, '
+$pw = trim(run("getent passwd cosmix-dnsd"))
+$gr = trim(run("getent group cosmix-dnsd"))
+print(json_encode({passwd: $pw, group: $gr}))
+', {decode: "json"})
+  need($host, $r, "getent cosmix-dnsd passwd and group")
+  $pw = split($r["value"]["passwd"], ":")
+  $gr = split($r["value"]["group"], ":")
+  $d.die_if(len($pw) < 4 or len($gr) < 4,
+    $host .. " cosmix-dnsd passwd/group entry is malformed")
+  $d.die_if($pw[2] != "506" or $gr[2] != "506",
+    $host .. " cosmix-dnsd must be uid/gid 506/506; reclaim the slot before deploying")
+  print("  uid/gid: 506/506 OK")
+end
+
+fn install_sysusers($host)
+  install_staged($host, $SYSUSERS, "/usr/lib/sysusers.d/cosmix.conf.new",
+    "/usr/lib/sysusers.d/cosmix.conf", 0o644, 0, 0)
+  $r = ssh_mix($host, 'print(run("systemd-sysusers"))')
+  need($host, $r, "systemd-sysusers")
+  assert_506($host)
+end
+
+fn do_sysusers($host)
+  print("")
+  print("[" .. $host .. "] sysusers")
+  reach($host)
+  install_sysusers($host)
+end
+
+fn reclaim($host)
+  print("")
+  print("[" .. $host .. "] reclaim uid/gid 506")
+  reach($host)
+
+  -- Fail closed before deleting identities: no process or path on any real
+  -- filesystem may still be owned by uid or gid 506.
+  $scan = ssh_mix($host, '
+$count = 0
+for each $line in split(run("ps -eo uid=,gid="), "\n")
+  $fields = split(trim($line), " ")
+  $ids = []
+  for each $field in $fields
+    if $field != "" then push($ids, $field) end
+  end
+  if len($ids) >= 2 and ($ids[0] == "506" or $ids[1] == "506") then
+    $count = $count + 1
+  end
+end
+if $count != 0 then
+  eprint("running process count at uid/gid 506: " .. ("" .. $count))
+  exit(1)
+end
+
+$mounts = json_parse(run("findmnt --json --list --output TARGET,FSTYPE"))["filesystems"]
+if type($mounts) != "list" or len($mounts) == 0 then
+  eprint("could not enumerate real mountpoints")
+  exit(1)
+end
+$skip = ["proc", "sysfs", "devtmpfs", "devpts", "cgroup", "cgroup2", "mqueue",
+  "debugfs", "tracefs", "securityfs", "bpf", "pstore", "autofs", "fusectl",
+  "configfs", "binfmt_misc", "hugetlbfs", "nsfs", "overlay", "squashfs", "fuse.portal"]
+$safe = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-"
+for each $mount in $mounts
+  $target = $mount["target"]
+  $fstype = $mount["fstype"]
+  if not contains($skip, $fstype) then
+    $i = 0
+    while $i < len($target)
+      if not contains($safe, substr($target, $i, 1)) then
+        eprint("mountpoint cannot be represented safely in a run() command: " .. $target)
+        exit(1)
+      end
+      $i = $i + 1
+    end
+    $owned = run("timeout 60 find " .. $target .. " -xdev -uid 506 -print -quit")
+    if trim($owned) == "" then
+      $owned = run("timeout 60 find " .. $target .. " -xdev -gid 506 -print -quit")
+    end
+    if trim($owned) != "" then
+      eprint("uid/gid 506 owns a path under " .. $target .. ": " .. trim($owned))
+      exit(1)
+    end
+  end
+end
+print("reclaim-safety-ok")
+')
+  need($host, $scan, "uid/gid 506 process and filesystem safety scan")
+  $d.die_if(not contains($scan["stdout"], "reclaim-safety-ok"),
+    $host .. " reclaim safety scan did not reach its success marker")
+  print("  safety gate OK: no files or processes at uid/gid 506")
+
+  $del = ssh_mix($host, '
+$fail = ""
+for each $user in ["cosmix-cloudd", "cosmix-dnsd"]
+  $r = run_argv(["userdel", $user])
+  if $r["exit_code"] != 0 and $r["exit_code"] != 6 then
+    $fail = $fail .. "userdel " .. $user .. " exit " .. ("" .. $r["exit_code"]) .. "; "
+  end
+end
+for each $group in ["cosmix-cloudd", "cosmix-dnsd"]
+  $r = run_argv(["groupdel", $group])
+  if $r["exit_code"] != 0 and $r["exit_code"] != 6 then
+    $fail = $fail .. "groupdel " .. $group .. " exit " .. ("" .. $r["exit_code"]) .. "; "
+  end
+end
+if $fail != "" then
+  eprint($fail)
+  exit(1)
+end
+if run_argv(["getent", "passwd", "cosmix-cloudd"])["exit_code"] == 0 or run_argv(["getent", "group", "cosmix-cloudd"])["exit_code"] == 0 then
+  eprint("obsolete daemon identity remains")
+  exit(1)
+end
+print("obsolete-identity-gone")
+')
+  need($host, $del, "remove obsolete and wrongly allocated daemon identities")
+  $d.die_if(not contains($del["stdout"], "obsolete-identity-gone"),
+    $host .. " obsolete daemon identity removal was not verified")
+  install_sysusers($host)
+end
+
+fn digq($host, $server, $name, $qtype, $flag)
+  return ssh_mix($host,
+    'print(run("dig -p 53 @" .. $server .. " " .. $name .. " " .. $qtype .. " " .. $flag))',
+    {bindings: {server: $server, name: $name, qtype: $qtype, flag: $flag}})
+end
+
+fn verify_dns($host, $ip)
+  $dv = ssh_mix($host, 'print(run("dig -v"))')
+  if not $dv["ok"] then
+    print("  WARN (" .. $host .. ") dig is not installed; skipping the answer smoke")
+    return nil
+  end
+
+  $answer_ip = $d.mesh_ip($ANSWER_NODE)
+  $a = digq($host, $ip, $ANSWER_NAME, "A", "+short")
+  need($host, $a, "dig A " .. $ANSWER_NAME)
+  $d.die_if(not contains($a["stdout"], $answer_ip),
+    $host .. " A " .. $ANSWER_NAME .. " expected " .. $answer_ip .. ", got " .. trim($a["stdout"]))
+
+  $soa = digq($host, $ip, $AUTHORITATIVE_ZONE, "SOA", "+noall +comments")
+  need($host, $soa, "dig SOA " .. $AUTHORITATIVE_ZONE)
+  $d.die_if(not contains($soa["stdout"], "NOERROR"),
+    $host .. " authoritative SOA query did not return NOERROR: " .. trim($soa["stdout"]))
+
+  $refused = digq($host, $ip, $REFUSED_NAME, "A", "+noall +comments")
+  need($host, $refused, "dig refused-name A")
+  $d.die_if(not contains($refused["stdout"], "REFUSED"),
+    $host .. " out-of-zone query did not return REFUSED: " .. trim($refused["stdout"]))
+
+  $nx = digq($host, $ip, $NXDOMAIN_NAME, "A", "+noall +comments")
+  need($host, $nx, "dig NXDOMAIN-name A")
+  $d.die_if(not contains($nx["stdout"], "NXDOMAIN"),
+    $host .. " missing in-zone query did not return NXDOMAIN: " .. trim($nx["stdout"]))
+  print("  DNS answer smokes: OK")
+end
+
+fn verify_logging($host)
+  $r = ssh_mix($host, '
+$iid = trim(run("/usr/bin/systemctl show cosmix-dnsd -p InvocationID --value"))
+if $iid == "" then
+  eprint("systemd returned an empty InvocationID")
+  exit(1)
+end
+$count = 0
+$try = 0
+while $try < 4 and $count < 1
+  $out = trim(run("/usr/bin/journalctl _SYSTEMD_INVOCATION_ID=" .. $iid .. " -o cat --no-pager | /usr/bin/wc -l"))
+  if $out != "" then $count = to_number($out) end
+  if $count < 1 then
+    run("sleep 1")
+  end
+  $try = $try + 1
+end
+if $count < 1 then
+  eprint("zero journald lines for current invocation " .. $iid)
+  exit(1)
+end
+print("" .. $count)
+')
+  need($host, $r, "logging for current cosmix-dnsd invocation")
+  print("  logging verified (" .. trim($r["stdout"]) .. " line/s, current invocation)")
+end
+
+fn deploy($host, $local_ver, $local_hash, $zones_hash)
+  $ip = $d.mesh_ip($host)
+  $signed_ip = $m["mesh_ip_of"]($VI["inventory"], $host)
+  $d.die_if($signed_ip != $ip,
+    $host .. " authored inventory address differs from the authenticated inventory")
+  print("")
+  print("[" .. $host .. "] deploy mesh-ip=" .. $ip)
+  reach($host)
+
+  $pre = ssh_mix($host, '
+if is_file("/opt/cosmix/bin/cosmix-dnsd") then
+  print(run("/opt/cosmix/bin/cosmix-dnsd --version"))
+else
+  print("")
+end
+')
+  need($host, $pre, "read installed cosmix-dnsd version")
+  $d.assert_not_downgrade($host, $pre["stdout"], $local_ver, $ALLOW_DOWNGRADE)
+
+  $node_conf = ssh_mix($host,
+    'print("" .. json_parse(read_file("/etc/cosmix/node.conf.mix"))["wg_ip"])')
+  need($host, $node_conf, "read node config wg_ip")
+  $d.die_if(trim($node_conf["stdout"]) != $ip,
+    $host .. " node config wg_ip does not equal inventory address " .. $ip)
+
+  $dirs = ssh_mix($host, '
+mkdir("/opt/cosmix/bin", {parents: true})
+chmod("/opt/cosmix/bin", 0o755)
+mkdir("/etc/cosmix/dnsd", {parents: true})
+chmod("/etc/cosmix/dnsd", 0o755)
+print("dirs-ok")
+')
+  need($host, $dirs, "prepare deploy directories")
+
+  install_staged($host, $BIN, "/opt/cosmix/bin/cosmix-dnsd.new",
+    "/opt/cosmix/bin/cosmix-dnsd", 0o755, 0, 0)
+  $installed = ssh_mix($host, '
+$version = trim(run("/opt/cosmix/bin/cosmix-dnsd --version"))
+$digest = hash_file("/opt/cosmix/bin/cosmix-dnsd", "blake3")
+print(json_encode({version: $version, digest: $digest}))
+', {decode: "json"})
+  need($host, $installed, "post-install binary version/hash assertion")
+  $d.die_if($installed["value"]["version"] != $local_ver or $installed["value"]["digest"] != $local_hash,
+    $host .. " installed binary does not match local version and bytes")
+  print("  binary: " .. $local_ver .. " (byte-identical)")
+
+  install_sysusers($host)
+  install_staged($host, $UNIT, "/usr/lib/systemd/system/cosmix-dnsd.service.new",
+    "/usr/lib/systemd/system/cosmix-dnsd.service", 0o644, 0, 0)
+  install_staged($host, $ZONES_SHIP, "/etc/cosmix/dnsd/zones.mix.new",
+    "/etc/cosmix/dnsd/zones.mix", 0o640, 0, 506)
+  $d.die_if(hash_file($ZONES_SHIP, "blake3") != $zones_hash,
+    "verified zones snapshot changed after approval")
+
+  $env_file = ssh_mix($host, '
+$path = "/etc/cosmix/dnsd/service.env"
+write_file($path, "LISTEN=" .. $ip .. ":53\n")
+chmod($path, 0o644)
+chown($path, 0, 0)
+print(trim(read_file($path)))
+', {bindings: {ip: $ip}})
+  need($host, $env_file, "write service.env")
+  $d.die_if(trim($env_file["stdout"]) != "LISTEN=" .. $ip .. ":53",
+    $host .. " service.env readback mismatch")
+
+  $start = ssh_mix($host, '
+print(run("systemctl daemon-reload && systemctl enable cosmix-dnsd && systemctl restart cosmix-dnsd && sleep 2 && systemctl is-active cosmix-dnsd"))
+')
+  if not $start["ok"] or trim($start["stdout"]) != "active" then
+    print("  ERROR: " .. $host .. " cosmix-dnsd failed to become active")
+    $journal = ssh_mix($host, 'print(run("journalctl -u cosmix-dnsd -n 30 --no-pager"))')
+    print($journal["stdout"])
+    print($journal["stderr"])
+    exit(1)
+  end
+  print("  active: active")
+  verify_logging($host)
+  verify_dns($host, $ip)
+end
+
+if $stage == "sysusers" then
+  for each $host in $nodes
+    do_sysusers($host)
+  end
+  print("")
+  print("sysusers complete: uid/gid 506 verified on " .. join($nodes, " "))
+else
+  if $stage == "reclaim" then
+    for each $host in $nodes
+      reclaim($host)
+    end
+    print("")
+    print("reclaim complete: uid/gid 506 verified on " .. join($nodes, " "))
+  else
+    for each $path in [$BIN, $SYSUSERS, $UNIT, $SIGNED, $AUTHORED, $BASELINE, $ZONES, $ZOVERLAY, $ZHEADER, $GENESIS_PUB]
+      $d.die_if(not is_file($path), "required deploy input is missing: " .. $path)
+    end
+    $version_probe = run_argv([$BIN, "--version"])
+    $d.die_if($version_probe["exit_code"] != 0,
+      "local cosmix-dnsd --version failed: " .. trim($version_probe["stderr"]))
+    $LOCAL_VER = trim($version_probe["stdout"])
+    $LOCAL_HASH = hash_file($BIN, "blake3")
+    print("local build: " .. $BIN .. " -> " .. $LOCAL_VER)
+
+    -- mesh_lib owns the authenticated-inventory, generated-zone, snapshot,
+    -- and freshness-floor mechanisms shared with mesh tooling.
+    $_lock = $m.mesh_take_write_lock("deploy_dnsd deploy")
+    $VI = $m["verified_inventory"]($SIGNED, {mesh: $MESH_NAME, against_authored: $AUTHORED,
+      baseline: $BASELINE, genesis_pub: $GENESIS_PUB})
+    print("[preflight] zones freshness gate")
+    $fresh = $m["gen_zones_from_verified"]($VI, $ZOVERLAY, $ZHEADER)
+    $d.die_if($fresh != read_file($ZONES),
+      "zones file is stale or hand-edited; regenerate it from the authenticated inventory")
+    $ZONES_SHIP = $m["verified_snapshot"]($fresh, "zones.mix")
+    $ZONES_HASH = hash_file($ZONES_SHIP, "blake3")
+    $BIN = $d.snapshot_bin($BIN)
+    $LOCAL_HASH = hash_file($BIN, "blake3")
+    $m["mesh_baseline_ratchet_epoch"]($BASELINE, $VI)
+
+    for each $host in $nodes
+      deploy($host, $LOCAL_VER, $LOCAL_HASH, $ZONES_HASH)
+    end
+    $_bin_cleanup = run_argv(["rm", "-f", $BIN])
+    $m["snapshot_release"]($ZONES_SHIP)
+    print("")
+    print("deploy complete: version, bytes, active state, current-invocation logging, and DNS smokes verified on " .. join($nodes, " "))
+  end
+end

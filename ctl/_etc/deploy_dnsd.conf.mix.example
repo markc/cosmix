@@ -1,0 +1,24 @@
+-- Copy to deploy_dnsd.conf.mix in the private hub and replace every value.
+-- Paths other than genesis_pub are relative to the hub root.
+deploy_dnsd: {
+  dns_nodes: ["alpha", "beta", "gamma"],
+  sysusers_nodes: ["alpha", "beta", "gamma"],
+  default_deploy_nodes: ["beta", "alpha"],
+  default_reclaim_nodes: ["beta", "gamma"],
+
+  mesh_name: "example-mesh",
+  signed_inventory: "_etc/mesh/inventory.signed",
+  authored_inventory: "_etc/mesh/inventory.mix",
+  freshness_baseline: "_etc/mesh/epoch.baseline.mix",
+  genesis_pub: "/etc/cosmix/noded/genesis.pub",
+
+  zones_file: "_etc/cosmix/dnsd/zones.mix",
+  zones_overlay: "_etc/cosmix/dnsd/zones.overlay.mix",
+  zones_header: "_etc/cosmix/dnsd/zones.header",
+
+  answer_node: "alpha",
+  answer_name: "alpha.example.org",
+  authoritative_zone: "example.org",
+  refused_name: "outside.example.net",
+  nxdomain_name: "missing.example.org"
+}

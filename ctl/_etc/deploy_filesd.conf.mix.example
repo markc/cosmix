@@ -1,0 +1,9 @@
+-- Private target selection and default corpus for deploy_filesd.mix.
+-- Copy this file to deploy_filesd.conf.mix in the private control hub. Create
+-- each corpus's daemon config at _etc/cosmix/filesd/<corpus>.conf.mix; it must
+-- name the same corpus_id and use /srv/cosmix/corpus/<corpus> as its root.
+deploy_filesd: {
+  schema_version: 1,
+  target_nodes: ["alpha", "beta", "gamma"],
+  default_corpus: "documents"
+}

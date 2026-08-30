@@ -1,0 +1,470 @@
+#!/usr/bin/env mix
+-- deploy_toolsd.mix — install the toolsd wake citizen, drain and immutable
+-- tool assets on the configured mesh nodes, or a named configured subset.
+--
+--   mix _bin/deploy_toolsd.mix                     -- configured targets
+--   mix _bin/deploy_toolsd.mix alpha               -- one configured target
+--   mix _bin/deploy_toolsd.mix --allow-downgrade … -- deliberate rollback
+--
+-- The hub-private config maps each target to its webd vhost, CA file and
+-- tools database. Deploys stop on the first failed gate and follow the roster
+-- rollout order, with hubs last. Remote installation is one Mix program: it
+-- authenticates against the non-mutating tools ping before changing deploy
+-- files or services, then installs every asset atomically.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_toolsd.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no toolsd deploy config at " .. $CONF_PATH ..
+    " — create it from deploy_toolsd.conf.mix.example before deploying")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["deploy_toolsd"], {
+    schema_version: {type: "integer", enum: [1]},
+    target_nodes: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}},
+    nodes: {type: "map"}
+  })
+catch $e
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn contains_item($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn node_config($node)
+  $raw = $CONF["nodes"][$node]
+  if type($raw) != "map" then
+    config_error("nodes." .. $node .. " must be a map")
+  end
+  $cfg = nil
+  try
+    $cfg = validate($raw, {
+      vhost: {type: "string", nonblank: true},
+      ca_file: {type: "string", nonblank: true},
+      tools_db: {type: "string", nonblank: true}
+    })
+  catch $e
+    config_error("invalid nodes." .. $node .. ": " .. $e)
+  end
+  if not starts_with($cfg["ca_file"], "/") then
+    config_error("nodes." .. $node .. ".ca_file must be an absolute path")
+  end
+  if not starts_with($cfg["tools_db"], "/") then
+    config_error("nodes." .. $node .. ".tools_db must be an absolute path")
+  end
+  return $cfg
+end
+
+$ROSTER = $d.roster()
+for each $node in $CONF["target_nodes"]
+  $d.assert_node($ROSTER, $node)
+  $_cfg = node_config($node)
+end
+
+$raw_args = args()
+$requested = []
+for each $arg in $raw_args
+  if $arg != "--allow-downgrade" then
+    push($requested, $arg)
+  end
+end
+
+$parse_args = $raw_args
+if len($requested) == 0 then
+  $parse_args = concat($CONF["target_nodes"], $raw_args)
+end
+$parsed = $d.parse_nodes($ROSTER, $parse_args, ["--allow-downgrade"])
+$selected = $parsed["nodes"]
+$ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
+
+$REMOTE = {}
+$NODE_CONF = {}
+for each $node in $selected
+  if not contains_item($CONF["target_nodes"], $node) then
+    config_error("'" .. $node .. "' is not a configured toolsd target")
+  end
+  if $d.is_foreign($ROSTER, $node) then
+    config_error("'" .. $node .. "' is foreign; toolsd requires a mesh node with Mix as root login shell")
+  end
+  $REMOTE[$node] = "root@" .. $d.mesh_ip($node)
+  $NODE_CONF[$node] = node_config($node)
+end
+
+$rollout = $d.rollout_order($ROSTER)
+for each $node in $selected
+  if not contains_item($rollout, $node) then
+    config_error("selected node '" .. $node .. "' is absent from the roster rollout_order")
+  end
+end
+$nodes = []
+for each $candidate in $rollout
+  if contains_item($selected, $candidate) then
+    push($nodes, $candidate)
+  end
+end
+
+-- toolsd is a script bundle rather than a --version binary. This marker gives
+-- the bundle a monotonic deploy generation for downgrade refusal and an exact
+-- post-install version assertion.
+$DEPLOY_VERSION = "1.0.0"
+
+$ROOT = $d.cosmix_root()
+$SOURCES = {
+  sysusers: $ROOT .. "/src/_etc/sysusers/cosmix-toolsd.conf",
+  tmpfiles: $ROOT .. "/src/_etc/tmpfiles.d/cosmix-toolsd.conf",
+  polkit: $ROOT .. "/src/_etc/polkit-1/rules.d/49-cosmix-toolsd-wake.rules",
+  wake_unit: $ROOT .. "/src/_etc/systemd-system/cosmix-toolsd-wake.service",
+  drain_unit: $ROOT .. "/src/_etc/systemd-system/cosmix-toolsd-drain.service",
+  drain_timer: $ROOT .. "/src/_etc/systemd-system/cosmix-toolsd-drain.timer",
+  wake: $ROOT .. "/src/_etc/cosmix/toolsd/toolsd.mix",
+  drain: $ROOT .. "/src/_etc/cosmix/toolsd/toolsd_drain.mix",
+  exec: $ROOT .. "/src/_etc/cosmix/toolsd/tools_exec.mix",
+  shwho: $ROOT .. "/src/_etc/cosmix/toolsd/tools/shwho.mix",
+  registry: $ROOT .. "/src/crates/cosmix-webd/vhosts/apps/tools_registry.mix"
+}
+
+$ASSETS = {}
+for each $name in keys($SOURCES)
+  $path = $SOURCES[$name]
+  $d.die_if(not is_file($path), "toolsd source asset missing: " .. $path)
+  $ASSETS[$name] = read_file($path)
+end
+
+fn deploy_node($node)
+  $remote = $REMOTE[$node]
+  $cfg = $NODE_CONF[$node]
+  print("")
+  print("[" .. $node .. "] deploy toolsd " .. $DEPLOY_VERSION)
+
+  $reach = ssh_mix($remote, '
+$hostname = trim(run("/usr/bin/hostname"))
+if $rc != 0 or $hostname == "" then
+  exit(7)
+end
+print($hostname)
+', {connect_timeout: 8, timeout: 10})
+  $d.die_if(not $reach["ok"],
+    $node .. " unreachable or not a working Mix node: " .. trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+  print("  connected: " .. trim($reach["stdout"]))
+
+  -- Refuse a backwards bundle generation before transmitting any assets.
+  $pre = ssh_mix($remote, '
+if is_file($marker) then
+  print(trim(read_file($marker)))
+end
+', {bindings: {marker: "/etc/cosmix/toolsd/deploy-version"},
+    connect_timeout: 8, timeout: 10})
+  if $pre["ok"] and trim($pre["stdout"]) != "" then
+    $d.assert_not_downgrade($node, $pre["stdout"], $DEPLOY_VERSION, $ALLOW_DOWNGRADE)
+  end
+
+  $result = ssh_mix($remote, '
+fn fail($code, $message)
+  print("ERROR: " .. $message)
+  exit($code)
+end
+
+fn command($source, $label, $code)
+  $out = run($source)
+  if $rc != 0 then
+    fail($code, $label .. " failed: " .. trim($out))
+  end
+  return $out
+end
+
+fn atomic_install($dst, $content, $mode)
+  $tmp = $dst .. ".new"
+  write_file($tmp, $content)
+  chmod($tmp, $mode)
+  chown($tmp, 0, 0)
+  rename($tmp, $dst)
+end
+
+fn assert_file($path, $content, $mode)
+  $st = stat($path, {follow_symlinks: false})
+  if $st["is_file"] != true or $st["is_symlink"] == true then
+    fail(20, $path .. " is not an installed regular file")
+  end
+  if $st["uid"] != 0 or $st["gid"] != 0 or $st["perm"] != $mode then
+    fail(21, $path .. " owner or mode mismatch")
+  end
+  if read_file($path) != $content then
+    fail(22, $path .. " content mismatch")
+  end
+end
+
+-- Dependency and auth pre-flight. The unauthenticated ping is used only when
+-- webd has not created tools.db yet; it initialises that schema but cannot
+-- claim queued work. No deploy file or service is changed before the
+-- authenticated, non-mutating ping succeeds.
+for each $bin in [
+  "/usr/bin/whois", "/usr/bin/dig", "/usr/bin/traceroute",
+  "/usr/bin/systemctl", "/usr/bin/flock", "/opt/cosmix/bin/mix"
+]
+  if not is_file($bin) then
+    fail(7, $bin .. " not installed — toolsd needs it")
+  end
+end
+
+$base = "https://" .. $vhost
+if not is_file($db_path) then
+  print("tools.db absent — initialising through the non-mutating tools ping")
+  $_seed = http_post($base .. "/tools/ping", "{}",
+    {"Content-Type": "application/json"}, {timeout: 10, ca_file: $ca_file})
+end
+if not is_file($db_path) then
+  fail(8, "tools database absent after tools ping: " .. $db_path)
+end
+
+$dbh = sqlopen($db_path)
+$rows = sqlexec($dbh,
+  "SELECT value FROM tools_settings WHERE key = ?", ["tools_secret"])
+sqlclose($dbh)
+if len($rows) != 1 then
+  fail(9, "tools_secret missing from " .. $db_path)
+end
+$secret = trim("" .. $rows[0]["value"])
+if $secret == "" then
+  fail(9, "tools_secret is blank in " .. $db_path)
+end
+
+$auth = http_post($base .. "/tools/ping", "{}",
+  {"X-Tools-Secret": $secret, "Content-Type": "application/json"},
+  {timeout: 10, ca_file: $ca_file})
+if to_number("" .. $auth["status"]) != 200 then
+  fail(10, "auth preflight to " .. $base .. "/tools/ping returned " ..
+    ("" .. $auth["status"]) .. " — refusing to install")
+end
+
+$addresses = []
+try
+  $addresses = dns_lookup($vhost)
+catch $e
+end
+$webd_ip = ""
+for each $ip in $addresses
+  if contains("" .. $ip, ".") and not contains("" .. $ip, ":") then
+    $webd_ip = "" .. $ip
+  end
+end
+if $webd_ip == "" then
+  fail(11, "could not resolve an IPv4 webd address for " .. $vhost)
+end
+
+$group = trim(run("/usr/bin/getent group polkitd"))
+if $rc != 0 or $group == "" then
+  fail(12, "no polkitd group — cannot install a readable polkit rule")
+end
+$group_parts = split($group, ":")
+if len($group_parts) < 3 then
+  fail(12, "could not parse the polkitd group entry")
+end
+$polkit_gid = to_number($group_parts[2])
+if $polkit_gid == nil then
+  fail(12, "could not parse the polkitd gid")
+end
+
+$previous_invocation = trim(run(
+  "/usr/bin/systemctl show cosmix-toolsd-wake.service -p InvocationID --value"))
+if $rc != 0 then
+  $previous_invocation = ""
+end
+
+for each $dir in [
+  "/etc/sysusers.d", "/etc/systemd/system", "/etc/tmpfiles.d",
+  "/etc/cosmix", "/opt/cosmix/share/cosmix"
+]
+  mkdir($dir, {parents: true})
+  chown($dir, 0, 0)
+end
+mkdir("/etc/polkit-1/rules.d", {parents: true})
+chown("/etc/polkit-1/rules.d", 0, $polkit_gid)
+chmod("/etc/polkit-1/rules.d", 0o750)
+
+atomic_install("/etc/sysusers.d/cosmix-toolsd.conf", $assets["sysusers"], 0o644)
+$_ = command("/usr/bin/systemd-sysusers /etc/sysusers.d/cosmix-toolsd.conf",
+  "system users creation", 13)
+
+mkdir("/etc/cosmix/toolsd", {parents: true})
+chown("/etc/cosmix/toolsd", 0, 0)
+chmod("/etc/cosmix/toolsd", 0o700)
+atomic_install("/etc/cosmix/toolsd/secret", $secret, 0o400)
+$env_content = "TOOLS_BASE_URL=" .. $base .. "\nTOOLS_CA_FILE=" .. $ca_file .. "\n"
+atomic_install("/etc/cosmix/toolsd/env", $env_content, 0o644)
+
+mkdir("/opt/cosmix/share/cosmix/tools", {parents: true})
+chown("/opt/cosmix/share/cosmix", 0, 0)
+chmod("/opt/cosmix/share/cosmix", 0o755)
+chown("/opt/cosmix/share/cosmix/tools", 0, 0)
+chmod("/opt/cosmix/share/cosmix/tools", 0o755)
+atomic_install("/opt/cosmix/share/cosmix/toolsd.mix", $assets["wake"], 0o444)
+atomic_install("/opt/cosmix/share/cosmix/toolsd_drain.mix", $assets["drain"], 0o444)
+atomic_install("/opt/cosmix/share/cosmix/tools_exec.mix", $assets["exec"], 0o444)
+atomic_install("/opt/cosmix/share/cosmix/tools_registry.mix", $assets["registry"], 0o444)
+atomic_install("/opt/cosmix/share/cosmix/tools/shwho.mix", $assets["shwho"], 0o444)
+
+atomic_install("/etc/tmpfiles.d/cosmix-toolsd.conf", $assets["tmpfiles"], 0o644)
+$_ = command("/usr/bin/systemd-tmpfiles --create /etc/tmpfiles.d/cosmix-toolsd.conf",
+  "runtime files creation", 14)
+atomic_install("/etc/polkit-1/rules.d/49-cosmix-toolsd-wake.rules",
+  $assets["polkit"], 0o644)
+atomic_install("/etc/systemd/system/cosmix-toolsd-wake.service",
+  $assets["wake_unit"], 0o644)
+$drain_unit = replace($assets["drain_unit"], "__WEBD_ALLOW__", $webd_ip)
+atomic_install("/etc/systemd/system/cosmix-toolsd-drain.service", $drain_unit, 0o644)
+atomic_install("/etc/systemd/system/cosmix-toolsd-drain.timer",
+  $assets["drain_timer"], 0o644)
+
+assert_file("/etc/sysusers.d/cosmix-toolsd.conf", $assets["sysusers"], 0o644)
+assert_file("/etc/tmpfiles.d/cosmix-toolsd.conf", $assets["tmpfiles"], 0o644)
+assert_file("/etc/polkit-1/rules.d/49-cosmix-toolsd-wake.rules", $assets["polkit"], 0o644)
+assert_file("/etc/systemd/system/cosmix-toolsd-wake.service", $assets["wake_unit"], 0o644)
+assert_file("/etc/systemd/system/cosmix-toolsd-drain.service", $drain_unit, 0o644)
+assert_file("/etc/systemd/system/cosmix-toolsd-drain.timer", $assets["drain_timer"], 0o644)
+assert_file("/opt/cosmix/share/cosmix/toolsd.mix", $assets["wake"], 0o444)
+assert_file("/opt/cosmix/share/cosmix/toolsd_drain.mix", $assets["drain"], 0o444)
+assert_file("/opt/cosmix/share/cosmix/tools_exec.mix", $assets["exec"], 0o444)
+assert_file("/opt/cosmix/share/cosmix/tools_registry.mix", $assets["registry"], 0o444)
+assert_file("/opt/cosmix/share/cosmix/tools/shwho.mix", $assets["shwho"], 0o444)
+assert_file("/etc/cosmix/toolsd/secret", $secret, 0o400)
+assert_file("/etc/cosmix/toolsd/env", $env_content, 0o644)
+
+$_ = command("/opt/cosmix/bin/mix lint --deny-warnings /opt/cosmix/share/cosmix/toolsd.mix",
+  "installed wake script lint", 23)
+$_ = command("/opt/cosmix/bin/mix lint --deny-warnings /opt/cosmix/share/cosmix/toolsd_drain.mix",
+  "installed drain script lint", 23)
+$_ = command("/opt/cosmix/bin/mix lint --deny-warnings /opt/cosmix/share/cosmix/tools_exec.mix",
+  "installed exec library lint", 23)
+$_ = command("/opt/cosmix/bin/mix lint --deny-warnings /opt/cosmix/share/cosmix/tools/shwho.mix",
+  "installed shwho script lint", 23)
+
+$_ = command("/usr/bin/systemctl restart polkit", "polkit restart", 15)
+$_ = command("/usr/bin/systemctl daemon-reload", "systemd daemon reload", 16)
+$_ = command("/usr/bin/systemctl enable cosmix-toolsd-wake.service",
+  "wake citizen enable", 17)
+$_ = command("/usr/bin/systemctl restart cosmix-toolsd-wake.service",
+  "wake citizen restart", 17)
+$_ = command("/usr/bin/systemctl enable --now cosmix-toolsd-drain.timer",
+  "drain timer enable", 18)
+
+$wake_state = trim(command(
+  "/usr/bin/systemctl is-active cosmix-toolsd-wake.service", "wake citizen active check", 18))
+if $wake_state != "active" then
+  fail(18, "wake citizen is not active: " .. $wake_state)
+end
+$timer_state = trim(command(
+  "/usr/bin/systemctl is-active cosmix-toolsd-drain.timer", "drain timer active check", 18))
+if $timer_state != "active" then
+  fail(18, "drain timer is not active: " .. $timer_state)
+end
+
+$invocation = trim(command(
+  "/usr/bin/systemctl show cosmix-toolsd-wake.service -p InvocationID --value",
+  "wake invocation lookup", 19))
+if $invocation == "" or
+    ($previous_invocation != "" and $invocation == $previous_invocation) then
+  fail(19, "wake citizen did not enter a new systemd invocation")
+end
+
+$lines = 0
+$attempt = 0
+while $attempt < 4 and $lines == 0
+  $logs = trim(run("/usr/bin/journalctl _SYSTEMD_INVOCATION_ID=" .. $invocation ..
+    " -o cat --no-pager"))
+  if $rc == 0 and $logs != "" then
+    $lines = len(split($logs, "\n"))
+  end
+  $attempt = $attempt + 1
+  if $lines == 0 and $attempt < 4 then
+    sleep(1)
+  end
+end
+if $lines == 0 then
+  fail(19, "wake citizen has no journald line for its current invocation")
+end
+
+-- A second authenticated, non-mutating ping proves the installed endpoint
+-- inputs still work after the service and policy changes.
+$smoke = http_post($base .. "/tools/ping", "{}",
+  {"X-Tools-Secret": $secret, "Content-Type": "application/json"},
+  {timeout: 10, ca_file: $ca_file})
+if to_number("" .. $smoke["status"]) != 200 then
+  fail(24, "post-install authenticated tools ping returned " .. ("" .. $smoke["status"]))
+end
+
+atomic_install($marker, $deploy_version .. "\n", 0o644)
+assert_file($marker, $deploy_version .. "\n", 0o644)
+if trim(read_file($marker)) != $deploy_version then
+  fail(25, "installed deploy version mismatch")
+end
+
+print(data_encode({
+  version: trim(read_file($marker)),
+  webd_ip: $webd_ip,
+  invocation_id: $invocation,
+  log_lines: $lines,
+  wake_state: $wake_state,
+  timer_state: $timer_state
+}))
+', {
+    bindings: {
+      assets: $ASSETS,
+      vhost: $cfg["vhost"],
+      ca_file: $cfg["ca_file"],
+      db_path: $cfg["tools_db"],
+      marker: "/etc/cosmix/toolsd/deploy-version",
+      deploy_version: $DEPLOY_VERSION
+    },
+    decode: "data", connect_timeout: 8, timeout: 180
+  })
+
+  if not $result["ok"] then
+    print("  remote install failed; last 40 toolsd wake log lines:")
+    $journal = ssh_mix($remote,
+      'print(run("/usr/bin/journalctl -u cosmix-toolsd-wake.service -n 40 --no-pager"))',
+      {connect_timeout: 8, timeout: 15})
+    print($journal["stdout"])
+    print($journal["stderr"])
+  end
+  $d.die_if(not $result["ok"],
+    $node .. " toolsd install failed: " .. trim($result["stdout"]) .. " " .. trim($result["stderr"]))
+
+  $value = $result["value"]
+  $d.die_if($value["version"] != $DEPLOY_VERSION,
+    $node .. " installed deploy version mismatch")
+  $d.die_if($value["wake_state"] != "active" or $value["timer_state"] != "active",
+    $node .. " toolsd units are not active")
+  $d.die_if($value["log_lines"] < 1,
+    $node .. " current toolsd wake invocation has no log lines")
+  print("  version/content/modes: " .. $value["version"] .. " OK")
+  print("  services: wake + drain timer active")
+  print("  logging: " .. $value["log_lines"] .. " line/s for current invocation " ..
+    $value["invocation_id"])
+  print("  authenticated tools ping: OK (webd " .. $value["webd_ip"] .. ")")
+  print("  [" .. $node .. "] DEPLOY OK")
+end
+
+for each $node in $nodes
+  deploy_node($node)
+end
+
+print("")
+print("deploy complete: toolsd generation/content/modes, installed-script lint, wake/timer state, current-invocation logging and authenticated ping verified on " .. join($nodes, " "))

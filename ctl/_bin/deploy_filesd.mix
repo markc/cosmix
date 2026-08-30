@@ -1,0 +1,312 @@
+#!/usr/bin/env mix
+-- deploy_filesd.mix — install cosmix-filesd, its template unit, and one
+-- private per-corpus config on the configured mesh nodes.
+--
+--   mix _bin/deploy_filesd.mix                         -- default corpus/targets
+--   mix _bin/deploy_filesd.mix documents               -- named corpus
+--   mix _bin/deploy_filesd.mix documents alpha beta    -- configured subset
+--   mix _bin/deploy_filesd.mix --allow-downgrade ...   -- deliberate rollback
+--
+-- Target nodes and the default corpus are private operational state in
+-- _etc/deploy_filesd.conf.mix. Each corpus config remains private at
+-- _etc/cosmix/filesd/<corpus>.conf.mix. Nodes are deployed in the roster's
+-- rollout order, with hubs last. Every failed gate stops the run.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_filesd.conf.mix"
+
+fn conf_error($msg)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $msg)
+  exit(2)
+end
+
+if not is_file($CONF_PATH) then
+  print("  ERROR: no filesd deploy config at " .. $CONF_PATH .. " — create it from deploy_filesd.conf.mix.example")
+  exit(2)
+end
+
+$CONF_DOC = nil
+try
+  $CONF_DOC = load_data($CONF_PATH)
+catch $msg
+  conf_error("invalid strict-data config: " .. $msg)
+end
+if type($CONF_DOC) != "map" then
+  conf_error("must contain a strict-data map")
+end
+
+$CONF = nil
+try
+  $CONF = validate($CONF_DOC["deploy_filesd"], {
+    schema_version: {type: "integer", enum: [1]},
+    target_nodes: {type: "list", min_length: 1, items: {type: "string", nonblank: true}},
+    default_corpus: {type: "string", nonblank: true}
+  })
+catch $msg
+  conf_error("invalid deploy_filesd map: " .. $msg)
+end
+
+fn is_in($list, $value)
+  for each $item in $list
+    if $item == $value then
+      return true
+    end
+  end
+  return false
+end
+
+fn assert_safe_corpus($corpus)
+  if not regex_match("^[a-z][a-z0-9-]{0,47}$", $corpus) then
+    conf_error("corpus '" .. $corpus .. "' must match ^[a-z][a-z0-9-]{0,47}$")
+  end
+end
+
+for each $node in $CONF["target_nodes"]
+  $seen = 0
+  for each $candidate in $CONF["target_nodes"]
+    if $candidate == $node then
+      $seen = $seen + 1
+    end
+  end
+  if $seen > 1 then
+    conf_error("duplicate target node '" .. $node .. "'")
+  end
+end
+
+$raw_args = args()
+$ALLOW_DOWNGRADE = false
+$positionals = []
+for each $arg in $raw_args
+  if $arg == "--allow-downgrade" then
+    $ALLOW_DOWNGRADE = true
+  else
+    push($positionals, $arg)
+  end
+end
+
+$corpus = $CONF["default_corpus"]
+$node_args = []
+$first = true
+for each $arg in $positionals
+  if $first then
+    $corpus = $arg
+    $first = false
+  else
+    push($node_args, $arg)
+  end
+end
+assert_safe_corpus($corpus)
+
+$ROSTER = $d.roster()
+$selected = []
+if len($node_args) == 0 then
+  $selected = $d.parse_nodes($ROSTER, $CONF["target_nodes"], [])["nodes"]
+else
+  $selected = $d.parse_nodes($ROSTER, $node_args, [])["nodes"]
+end
+
+for each $node in $selected
+  if not is_in($CONF["target_nodes"], $node) then
+    conf_error("node '" .. $node .. "' is not in target_nodes")
+  end
+  if $d.is_foreign($ROSTER, $node) then
+    conf_error("node '" .. $node .. "' is foreign; filesd requires a mesh Mix host")
+  end
+end
+
+$fleet_order = $d.rollout_order($ROSTER)
+for each $node in $selected
+  if not is_in($fleet_order, $node) then
+    conf_error("target node '" .. $node .. "' is absent from the roster rollout order")
+  end
+end
+$nodes = []
+for each $node in $fleet_order
+  if is_in($selected, $node) then
+    push($nodes, $node)
+  end
+end
+
+-- Local artifacts and the private daemon config are all checked before the
+-- first network operation.
+$BIN = $d.cosmix_bin("cosmix-filesd")
+$UNIT = $d.cosmix_root() .. "/src/_etc/systemd-system/cosmix-filesd@.service"
+$CORPUS_CONF = $d.hub_root() .. "/_etc/cosmix/filesd/" .. $corpus .. ".conf.mix"
+$d.die_if(not is_file($BIN), "local binary missing (build it first): " .. $BIN)
+$d.die_if(not is_file($UNIT), "unit missing: " .. $UNIT)
+if not is_file($CORPUS_CONF) then
+  print("  ERROR: corpus config missing: " .. $CORPUS_CONF)
+  exit(2)
+end
+
+$CORPUS_DOC = nil
+try
+  $CORPUS_DOC = load_data($CORPUS_CONF)
+  $CORPUS_DOC = validate($CORPUS_DOC, {
+    root: {type: "string", nonblank: true},
+    corpus_id: {type: "string", nonblank: true},
+    db: {type: "string", nonblank: true},
+    bus_service: {required: false, type: "string", nonblank: true}
+  })
+catch $msg
+  print("  ERROR: invalid strict-data corpus config " .. $CORPUS_CONF .. ": " .. $msg)
+  exit(2)
+end
+
+$d.die_if($CORPUS_DOC["corpus_id"] != $corpus,
+  "corpus config corpus_id is '" .. $CORPUS_DOC["corpus_id"] .. "', expected '" .. $corpus .. "'")
+$corpus_root = "/srv/cosmix/corpus/" .. $corpus
+$d.die_if($CORPUS_DOC["root"] != $corpus_root,
+  "corpus config root must match the unit path " .. $corpus_root)
+$service = $CORPUS_DOC["bus_service"]
+if $service == nil then
+  $service = "filesd-" .. $corpus
+end
+$d.die_if(not regex_match("^[a-z][a-z0-9-]{1,30}$", $service),
+  "corpus config bus_service is not a valid Bus service name: " .. $service)
+
+-- Snapshot once so every target receives the same bytes even if another build
+-- finishes during this deployment.
+$BIN = $d.snapshot_bin($BIN)
+$bv = run_argv([$BIN, "--version"])
+$d.die_if($bv["exit_code"] != 0, "local binary --version failed: " .. trim($bv["stderr"]))
+$ver = trim($bv["stdout"])
+$d.die_if($ver == "", "local binary --version returned no version")
+
+$bh = run_argv(["sha256sum", $BIN])
+$d.die_if($bh["exit_code"] != 0, "local binary hash failed: " .. trim($bh["stderr"]))
+$bin_hash = split(trim($bh["stdout"]), " ")[0]
+$uh = run_argv(["sha256sum", $UNIT])
+$d.die_if($uh["exit_code"] != 0, "local unit hash failed: " .. trim($uh["stderr"]))
+$unit_hash = split(trim($uh["stdout"]), " ")[0]
+$ch = run_argv(["sha256sum", $CORPUS_CONF])
+$d.die_if($ch["exit_code"] != 0, "local corpus config hash failed: " .. trim($ch["stderr"]))
+$conf_hash = split(trim($ch["stdout"]), " ")[0]
+$unit_data = read_file($UNIT)
+$conf_data = read_file($CORPUS_CONF)
+
+print("local build: " .. $BIN .. " -> " .. $ver)
+print("corpus: " .. $corpus .. " (Bus service " .. $service .. ")")
+print("targets: " .. join($nodes, " "))
+
+fn deploy_node($node)
+  $addr = $d.mesh_ip($node)
+  $inst = "cosmix-filesd@" .. $corpus
+  print("")
+  print("[" .. $node .. "] deploy " .. $inst)
+
+  $reach = ssh_mix($addr, 'print("reach-ok")', {timeout: 60})
+  $d.die_if(not $reach["ok"] or not contains($reach["stdout"], "reach-ok"),
+    $node .. " unreachable or not a Mix host: " .. trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+
+  -- Refuse a rollback before transferring any artifact.
+  $pre = ssh_mix($addr, 'print(run("/opt/cosmix/bin/cosmix-filesd --version"))', {timeout: 60})
+  if $pre["ok"] and trim($pre["stdout"]) != "" then
+    $d.assert_not_downgrade($node, $pre["stdout"], $ver, $ALLOW_DOWNGRADE)
+  end
+
+  -- Bootstrap the dedicated user and per-corpus directories idempotently.
+  $boot = ssh_mix($addr, 'mkdir("/opt/cosmix/bin", {parents: true})
+mkdir($root, {parents: true})
+mkdir("/etc/cosmix/filesd", {parents: true})
+print(run("getent passwd cosmix-filesd >/dev/null || useradd --system --no-create-home --shell /usr/sbin/nologin cosmix-filesd"))
+print(run("chown cosmix-filesd:cosmix-filesd " .. $root))
+print("bootstrap-ok")', {bindings: {root: $corpus_root}, timeout: 60})
+  $d.die_if(not $boot["ok"] or not contains($boot["stdout"], "bootstrap-ok"),
+    $node .. " user/directory bootstrap failed: " .. trim($boot["stdout"]) .. " " .. trim($boot["stderr"]))
+  print("  bootstrap: user + " .. $corpus_root .. " + /etc/cosmix/filesd")
+
+  $scp = run_argv([
+    "scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+    $BIN, $addr .. ":/opt/cosmix/bin/cosmix-filesd.new"
+  ], {timeout: 120})
+  $d.die_if($scp["exit_code"] != 0, "binary scp -> " .. $node .. ": " .. trim($scp["stderr"]))
+
+  -- Stage text artifacts with Mix builtins. The system install below replaces
+  -- all three files before the service is restarted.
+  $stage = ssh_mix($addr, 'write_file("/tmp/cosmix-filesd@.service.new", $unit)
+chmod("/tmp/cosmix-filesd@.service.new", 0o644)
+write_file("/tmp/cosmix-filesd.conf.mix.new", $conf)
+chmod("/tmp/cosmix-filesd.conf.mix.new", 0o644)
+print("stage-ok")', {bindings: {unit: $unit_data, conf: $conf_data}, timeout: 60})
+  $d.die_if(not $stage["ok"] or not contains($stage["stdout"], "stage-ok"),
+    $node .. " unit/config stage failed: " .. trim($stage["stdout"]) .. " " .. trim($stage["stderr"]))
+
+  $inst_files = ssh_mix($addr,
+    'print(run("install -o 0 -g 0 -m 0755 /opt/cosmix/bin/cosmix-filesd.new /opt/cosmix/bin/cosmix-filesd && install -o 0 -g 0 -m 0644 /tmp/cosmix-filesd@.service.new /usr/lib/systemd/system/cosmix-filesd@.service && install -o 0 -g 0 -m 0644 /tmp/cosmix-filesd.conf.mix.new /etc/cosmix/filesd/" .. $corpus .. ".conf.mix && rm -f /opt/cosmix/bin/cosmix-filesd.new /tmp/cosmix-filesd@.service.new /tmp/cosmix-filesd.conf.mix.new && /opt/cosmix/bin/cosmix-filesd --version"))',
+    {bindings: {corpus: $corpus}, timeout: 60})
+  $d.die_if(not $inst_files["ok"] or trim($inst_files["stdout"]) != $ver,
+    $node .. " install/version mismatch (want " .. $ver .. "): " .. trim($inst_files["stdout"]) .. " " .. trim($inst_files["stderr"]))
+  print("  installed: " .. trim($inst_files["stdout"]))
+
+  $remote_bh = ssh_mix($addr, 'print(run("sha256sum /opt/cosmix/bin/cosmix-filesd"))', {timeout: 60})
+  $d.die_if(not $remote_bh["ok"] or not contains($remote_bh["stdout"], $bin_hash),
+    $node .. " installed binary hash mismatch: " .. trim($remote_bh["stdout"]) .. " " .. trim($remote_bh["stderr"]))
+  $remote_uh = ssh_mix($addr, 'print(run("sha256sum /usr/lib/systemd/system/cosmix-filesd@.service"))', {timeout: 60})
+  $d.die_if(not $remote_uh["ok"] or not contains($remote_uh["stdout"], $unit_hash),
+    $node .. " installed unit hash mismatch: " .. trim($remote_uh["stdout"]) .. " " .. trim($remote_uh["stderr"]))
+  $remote_ch = ssh_mix($addr,
+    'print(run("sha256sum /etc/cosmix/filesd/" .. $corpus .. ".conf.mix"))',
+    {bindings: {corpus: $corpus}, timeout: 60})
+  $d.die_if(not $remote_ch["ok"] or not contains($remote_ch["stdout"], $conf_hash),
+    $node .. " installed config hash mismatch: " .. trim($remote_ch["stdout"]) .. " " .. trim($remote_ch["stderr"]))
+  print("  content hashes: OK")
+
+  -- InvocationID must change, and journald must contain output attributed to
+  -- that exact new invocation.
+  $before = ssh_mix($addr,
+    'print(run("systemctl show -p InvocationID --value " .. $inst))',
+    {bindings: {inst: $inst}, timeout: 60})
+  $d.die_if(not $before["ok"], $node .. " could not read pre-restart invocation: " .. trim($before["stderr"]))
+
+  $restart = ssh_mix($addr,
+    'print(run("systemctl daemon-reload && systemctl enable --now " .. $inst .. " && systemctl restart " .. $inst .. " && sleep 4 && systemctl is-active " .. $inst))',
+    {bindings: {inst: $inst}, timeout: 60})
+  if not $restart["ok"] or trim($restart["stdout"]) != "active" then
+    print("  ERROR: " .. $node .. " restart failed; last 40 log lines:")
+    $diag = ssh_mix($addr,
+      'print(run("journalctl -u " .. $inst .. " -n 40 --no-pager"))',
+      {bindings: {inst: $inst}, timeout: 60})
+    print($diag["stdout"])
+    print($diag["stderr"])
+    exit(1)
+  end
+
+  $after = ssh_mix($addr,
+    'print(run("systemctl show -p InvocationID --value " .. $inst))',
+    {bindings: {inst: $inst}, timeout: 60})
+  $invocation = trim($after["stdout"])
+  $d.die_if(not $after["ok"] or $invocation == "" or $invocation == trim($before["stdout"]),
+    $node .. " did not enter a new systemd invocation: " .. trim($after["stdout"]) .. " " .. trim($after["stderr"]))
+  print("  active: new invocation " .. $invocation)
+
+  $logs = ssh_mix($addr,
+    'print(run("journalctl -n 20 _SYSTEMD_INVOCATION_ID=" .. $invocation .. " -o cat --no-pager"))',
+    {bindings: {invocation: $invocation}, timeout: 60})
+  $logtail = trim($logs["stdout"])
+  $d.die_if(not $logs["ok"] or $logtail == "",
+    $node .. " has no journald entry for the new systemd invocation: " .. trim($logs["stderr"]))
+  print("  current-invocation log: " .. $logtail)
+
+  -- A successful property round-trip proves the new process registered its
+  -- configured Bus service and is serving requests, not merely active.
+  $bus = ssh_mix($addr, 'send $service filesd.props.list timeout=15
+if $rc != 0 then
+  print("send rc=" .. $rc .. " result=" .. ("" .. $result))
+  exit(7)
+end
+print("props-ok " .. ("" .. $result))', {bindings: {service: $service}, timeout: 30})
+  $d.die_if(not $bus["ok"] or not contains($bus["stdout"], "props-ok"),
+    $node .. " " .. $service .. " filesd.props.list smoke failed: " .. trim($bus["stdout"]) .. " " .. trim($bus["stderr"]))
+  print("  bus: " .. $service .. " filesd.props.list OK")
+  print("  [" .. $node .. "] DEPLOY OK (" .. $inst .. ")")
+end
+
+for each $node in $nodes
+  deploy_node($node)
+end
+$_rm = run_argv(["rm", "-f", $BIN])
+
+print("")
+print("deploy complete: cosmix-filesd version, content, restart, active state, current-invocation logging, and Bus liveness verified on " .. join($nodes, " "))

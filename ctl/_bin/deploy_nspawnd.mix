@@ -1,0 +1,488 @@
+#!/usr/bin/env mix
+-- deploy_nspawnd.mix — install cosmix-nspawnd on its configured controller
+-- and executor nodes, then prove each restarted service is healthy.
+--
+--   mix _bin/deploy_nspawnd.mix deploy
+--   mix _bin/deploy_nspawnd.mix deploy alpha beta
+--   mix _bin/deploy_nspawnd.mix deploy --no-build --no-restart alpha
+--   mix _bin/deploy_nspawnd.mix deploy --allow-downgrade alpha
+--
+-- The private hub owns _etc/deploy_nspawnd.conf.mix: it assigns roles and
+-- supplies the controller allowlists and local build user. Named nodes select
+-- a configured subset. Deploys are sequential and follow the fleet rollout
+-- order so hubs are touched last.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$argv = args()
+if len($argv) == 0 then
+  print("usage: mix deploy_nspawnd.mix deploy [--no-build] [--no-restart] [--allow-downgrade] [node...]")
+  exit(2)
+end
+if $argv[0] != "deploy" then
+  print("unknown stage: " .. $argv[0])
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_nspawnd.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no nspawnd deploy config at " .. $CONF_PATH ..
+    " — create it from deploy_nspawnd.conf.mix.example")
+  exit(2)
+end
+$CONF_DOC = load_data($CONF_PATH)
+$d.die_if(type($CONF_DOC) != "map" or type($CONF_DOC["deploy_nspawnd"]) != "map",
+  "invalid " .. $CONF_PATH .. ": expected deploy_nspawnd strict-data map")
+$CONF = validate($CONF_DOC["deploy_nspawnd"], {
+  schema_version: {type: "integer", enum: [1]},
+  build_user: {type: "string", nonblank: true},
+  controller_node: {type: "string", nonblank: true},
+  executor_nodes: {type: "list", items: {type: "string", nonblank: true}},
+  operator_identities: {type: "list", min_length: 1, items: {type: "string", nonblank: true}},
+  reporter_identities: {type: "list", items: {type: "string", nonblank: true}}
+})
+
+fn is_in($list, $value)
+  for each $item in $list
+    if $item == $value then
+      return true
+    end
+  end
+  return false
+end
+
+$ROSTER = $d.roster()
+$configured = [$CONF["controller_node"]]
+for each $node in $CONF["executor_nodes"]
+  $d.die_if(is_in($configured, $node),
+    "duplicate nspawnd target in " .. $CONF_PATH .. ": " .. $node)
+  push($configured, $node)
+end
+for each $node in $configured
+  $d.assert_node($ROSTER, $node)
+  if $d.is_foreign($ROSTER, $node) then
+    print("  ERROR: " .. $node .. " is foreign; nspawnd requires a Mix-login mesh node")
+    exit(2)
+  end
+end
+
+$rest = []
+$first = true
+for each $arg in $argv
+  if $first then
+    $first = false
+  else
+    push($rest, $arg)
+  end
+end
+$TARGET_ROSTER = {mesh: $configured, foreign: [], all: $configured, order: nil}
+$parsed = $d.parse_nodes($TARGET_ROSTER, $rest,
+  ["--no-build", "--no-restart", "--allow-downgrade"])
+$requested = $parsed["nodes"]
+$NO_BUILD = $parsed["flags"]["--no-build"] == true
+$NO_RESTART = $parsed["flags"]["--no-restart"] == true
+$ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
+
+-- Resolve every address and canonicalise the complete order before building,
+-- minting credentials, or contacting a node. Bad pre-flight is side-effect free.
+$REMOTE = {}
+for each $node in $requested
+  $REMOTE[$node] = "root@" .. $d.mesh_ip($node)
+end
+$nodes = []
+for each $node in $d.rollout_order($ROSTER)
+  if is_in($requested, $node) then
+    push($nodes, $node)
+  end
+end
+if len($nodes) != len($requested) then
+  print("  ERROR: nspawnd target list has a duplicate or a node absent from the fleet rollout order")
+  exit(2)
+end
+
+$id = run_argv(["id", "-u"], {timeout: 15})
+if $id["exit_code"] != 0 or trim($id["stdout"]) != "0" then
+  print("  ERROR: run as root (sudo)")
+  exit(2)
+end
+
+$ROOT = $d.cosmix_root()
+$BIN_SRC = $d.cosmix_bin("cosmix-nspawnd")
+$BIN_DST = "/opt/cosmix/bin/cosmix-nspawnd"
+$UNIT_NAME = "cosmix-nspawnd.service"
+$UNIT = $ROOT .. "/src/_etc/systemd-system/" .. $UNIT_NAME
+$SYSUSERS = $ROOT .. "/src/_etc/sysusers/cosmix.conf"
+$POLKIT = $ROOT .. "/src/_etc/polkit-1/rules.d/60-cosmix-nspawnd.rules"
+$TMPFILES = $ROOT .. "/src/_etc/tmpfiles.d/cosmix-nspawnd.conf"
+$ETC = "/etc/cosmix/nspawnd"
+$TOKEN = $ETC .. "/operation-token"
+$OPTOKEN = $ETC .. "/operator-token"
+$ENV_DST = "/etc/cosmix/nspawnd.env"
+$DROPIN_D = "/etc/systemd/system/cosmix-nspawnd.service.d"
+$CDROPIN = $DROPIN_D .. "/20-controller.conf"
+$NSPAWND_UID = 518
+
+if not $NO_BUILD then
+  print("local build: cargo build --release -p cosmix-nspawnd")
+  $build = run_argv([
+    "sudo", "-u", $CONF["build_user"], "cargo", "build", "--release", "-p", "cosmix-nspawnd"
+  ], {cwd: $ROOT .. "/src", timeout: 600})
+  $d.die_if($build["exit_code"] != 0, "release build failed: " .. trim($build["stderr"]))
+end
+for each $path in [$BIN_SRC, $UNIT, $SYSUSERS, $POLKIT, $TMPFILES]
+  $d.die_if(not is_file($path), "required deploy artifact missing: " .. $path)
+end
+
+$BIN = $d.snapshot_bin($BIN_SRC)
+$version = run_argv([$BIN, "--version"], {timeout: 15})
+$d.die_if($version["exit_code"] != 0 or trim($version["stdout"]) == "",
+  "local --version failed: " .. trim($version["stderr"]))
+$LOCAL_VERSION = trim($version["stdout"])
+$BIN_HASH = hash_file($BIN, "sha256")
+print("local build version: " .. $LOCAL_VERSION)
+print("rollout order: " .. join($nodes, " "))
+
+fn atomic_local($path, $content, $mode)
+  $tmp = $path .. ".new." .. uuid()
+  write_new($tmp, $content, $mode)
+  chown($tmp, 0, 0)
+  chmod($tmp, $mode)
+  rename($tmp, $path)
+end
+
+fn ensure_local_token($path, $label)
+  mkdir($ETC, {parents: true})
+  chown($ETC, 0, 0)
+  chmod($ETC, 0o700)
+  if not is_file($path) then
+    $made = run_argv(["openssl", "rand", "-hex", "32"], {timeout: 30})
+    $d.die_if($made["exit_code"] != 0 or trim($made["stdout"]) == "",
+      $label .. " generation failed: " .. trim($made["stderr"]))
+    atomic_local($path, trim($made["stdout"]) .. "\n", 0o400)
+    print("  + " .. $path .. " (new, 0400 root:root)")
+  else
+    chown($path, 0, 0)
+    chmod($path, 0o400)
+    print("  = " .. $path .. " (kept, 0400 root:root)")
+  end
+end
+
+ensure_local_token($TOKEN, "operation token")
+ensure_local_token($OPTOKEN, "operator token")
+$TOKEN_HASH = hash_file($TOKEN, "sha256")
+$OPTOKEN_HASH = hash_file($OPTOKEN, "sha256")
+
+fn scp_file($node, $local_path, $remote_path)
+  $remote = $REMOTE[$node]
+  $r = run_argv([
+    "scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+    $local_path, $remote .. ":" .. $remote_path
+  ], {timeout: 120})
+  $d.die_if($r["exit_code"] != 0,
+    "scp " .. $local_path .. " -> " .. $node .. ":" .. $remote_path .. ": " .. trim($r["stderr"]))
+end
+
+fn install_text($node, $path, $content, $mode)
+  $r = ssh_mix($REMOTE[$node], '
+$tmp = $path .. ".new"
+write_file($tmp, $content)
+chown($tmp, 0, 0)
+chmod($tmp, $mode)
+rename($tmp, $path)
+print(hash_file($path, "sha256"))
+', {bindings: {path: $path, content: $content, mode: $mode}, timeout: 30})
+  $d.die_if(not $r["ok"] or trim($r["stdout"]) != hash_sha256($content),
+    $node .. " install/hash assertion failed for " .. $path .. ": " ..
+      trim($r["stdout"]) .. " " .. trim($r["stderr"]))
+end
+
+fn install_token($node, $path, $expected_hash)
+  scp_file($node, $path, $path .. ".new")
+  $r = ssh_mix($REMOTE[$node], '
+chown($tmp, 0, 0)
+chmod($tmp, 0o400)
+rename($tmp, $path)
+print(hash_file($path, "sha256"))
+', {bindings: {tmp: $path .. ".new", path: $path}, timeout: 30})
+  $d.die_if(not $r["ok"] or trim($r["stdout"]) != $expected_hash,
+    $node .. " credential install/hash assertion failed for " .. $path .. ": " .. trim($r["stderr"]))
+end
+
+fn configure_env($node, $role)
+  $role_env = ""
+  if $role == "controller" then
+    $role_env = "COSMIX_NSPAWND_MODE=controller\n" ..
+      "COSMIX_NSPAWND_OPERATORS=" .. join($CONF["operator_identities"], ",") .. "\n" ..
+      "COSMIX_NSPAWND_REPORTERS=" .. join($CONF["reporter_identities"], ",") .. "\n"
+  else
+    $role_env = "COSMIX_NSPAWND_MODE=executor\n" ..
+      "COSMIX_NSPAWND_CONTROLLER_NODE=" .. $CONF["controller_node"] .. "\n" ..
+      "COSMIX_NSPAWND_OPERATORS=bridge-" .. $CONF["controller_node"] .. "\n"
+  end
+  $r = ssh_mix($REMOTE[$node], '
+$keep = []
+if is_file($path) then
+  for each $line in split(read_file($path), "\n")
+    $t = trim($line)
+    if not (starts_with($t, "COSMIX_NSPAWND_MODE=")
+       or starts_with($t, "COSMIX_NSPAWND_CONTROLLER_NODE=")
+       or starts_with($t, "COSMIX_NSPAWND_OPERATORS=")
+       or starts_with($t, "COSMIX_NSPAWND_REPORTERS=")) then
+      push($keep, $line)
+    end
+  end
+end
+$out = trim(join($keep, "\n"))
+if $out != "" then
+  $out = $out .. "\n"
+end
+$out = $out .. $role_env
+$tmp = $path .. ".new"
+write_file($tmp, $out)
+chown($tmp, 0, 0)
+chmod($tmp, 0o644)
+rename($tmp, $path)
+print(hash_file($path, "sha256"))
+', {bindings: {path: $ENV_DST, role_env: $role_env}, timeout: 30})
+  $d.die_if(not $r["ok"],
+    $node .. " environment install failed: " .. trim($r["stdout"]) .. " " .. trim($r["stderr"]))
+  print("  environment: " .. $role)
+end
+
+fn verify_logging($node, $previous_invocation)
+  $try = 0
+  while $try < 4
+    $probe = ssh_mix($REMOTE[$node], '
+$iid = trim(run("/usr/bin/systemctl show cosmix-nspawnd.service -p InvocationID --value"))
+if $rc != 0 or $iid == "" then
+  exit(7)
+end
+$logs = trim(run("/usr/bin/journalctl _SYSTEMD_INVOCATION_ID=" .. $iid .. " -o cat --no-pager"))
+if $rc != 0 then
+  exit(8)
+end
+$lines = 0
+if $logs != "" then
+  $lines = len(split($logs, "\n"))
+end
+print(data_encode({invocation_id: $iid, lines: $lines}))
+', {decode: "data", timeout: 20})
+    if $probe["ok"] then
+      $current = $probe["value"]["invocation_id"]
+      $d.die_if($previous_invocation != "" and $current == $previous_invocation,
+        $node .. " service invocation did not change after restart")
+      if $probe["value"]["lines"] >= 1 then
+        print("  logging verified (" .. $probe["value"]["lines"] .. " line/s, current invocation)")
+        return nil
+      end
+    end
+    $try = $try + 1
+    if $try < 4 then
+      sleep(1)
+    end
+  end
+  $d.die_if(true,
+    $node .. " cosmix-nspawnd is active but has zero journald lines for the current invocation")
+end
+
+fn smoke_bus($node, $role)
+  $verb = $role == "controller" ? "nspawnd.ct.list" : "nspawnd.list"
+  $r = ssh_mix($REMOTE[$node], '
+send nspawnd $verb
+if $rc != 0 then
+  eprint("send rc=" .. $rc)
+  exit(7)
+end
+print("" .. $result)
+', {bindings: {verb: $verb}, timeout: 20})
+  $d.die_if(not $r["ok"] or not contains(trim($r["stdout"]), "cosmix.nspawnd"),
+    $node .. " BUS " .. $verb .. " smoke failed: " .. trim($r["stdout"]) .. " " .. trim($r["stderr"]))
+  print("  BUS " .. $verb .. ": OK")
+end
+
+fn deploy_node($node)
+  $remote = $REMOTE[$node]
+  $role = $node == $CONF["controller_node"] ? "controller" : "executor"
+  print("")
+  print("[" .. $node .. "] deploy cosmix-nspawnd (" .. $role .. ")")
+
+  $reach = ssh_mix($remote, 'print("reach-ok")', {timeout: 20})
+  $d.die_if(not $reach["ok"] or not contains($reach["stdout"], "reach-ok"),
+    $node .. " unreachable or not a working Mix node: " .. trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+
+  $pre = ssh_mix($remote, '
+if is_file($bin) then
+  $v = trim(run($bin .. " --version"))
+  if $rc != 0 or $v == "" then
+    eprint("installed cosmix-nspawnd returned no version")
+    exit(7)
+  end
+  print($v)
+else
+  print("ABSENT")
+end
+', {bindings: {bin: $BIN_DST}, timeout: 20})
+  $d.die_if(not $pre["ok"],
+    $node .. " could not inspect installed cosmix-nspawnd: " .. trim($pre["stderr"]))
+  if trim($pre["stdout"]) != "ABSENT" then
+    $d.assert_not_downgrade($node, $pre["stdout"], $LOCAL_VERSION, $ALLOW_DOWNGRADE)
+  end
+
+  $dirs = ssh_mix($remote, '
+mkdir("/opt/cosmix/bin", {parents: true})
+mkdir($etc, {parents: true})
+mkdir($dropin, {parents: true})
+chown("/opt/cosmix/bin", 0, 0)
+chmod("/opt/cosmix/bin", 0o755)
+chown($etc, 0, 0)
+chmod($etc, 0o700)
+chown($dropin, 0, 0)
+chmod($dropin, 0o755)
+print("dirs-ok")
+', {bindings: {etc: $ETC, dropin: $DROPIN_D}, timeout: 20})
+  $d.die_if(not $dirs["ok"] or not contains($dirs["stdout"], "dirs-ok"),
+    $node .. " directory setup failed: " .. trim($dirs["stderr"]))
+
+  install_text($node, "/etc/sysusers.d/cosmix.conf", read_file($SYSUSERS), 0o644)
+  $identity = ssh_mix($remote, '
+$out = run("/usr/bin/systemd-sysusers")
+if $rc != 0 then
+  print($out)
+  exit(7)
+end
+$uid = trim(run("/usr/bin/id -u cosmix-nspawnd"))
+if $rc != 0 then exit(8) end
+$gid = trim(run("/usr/bin/id -g cosmix-nspawnd"))
+if $rc != 0 then exit(9) end
+print(data_encode({uid: $uid, gid: $gid}))
+', {decode: "data", timeout: 30})
+  $d.die_if(not $identity["ok"] or $identity["value"]["uid"] != ("" .. $NSPAWND_UID)
+      or $identity["value"]["gid"] != ("" .. $NSPAWND_UID),
+    $node .. " cosmix-nspawnd UID/GID mismatch; expected " .. $NSPAWND_UID)
+  print("  identity: UID/GID " .. $NSPAWND_UID)
+
+  scp_file($node, $BIN, $BIN_DST .. ".new")
+  $binary = ssh_mix($remote, '
+chown($new_bin, 0, 0)
+chmod($new_bin, 0o755)
+rename($new_bin, $bin)
+$v = trim(run($bin .. " --version"))
+if $rc != 0 then exit(7) end
+$_help = run($bin .. " --help")
+if $rc != 0 then exit(8) end
+print(data_encode({version: $v, hash: hash_file($bin, "sha256")}))
+', {bindings: {new_bin: $BIN_DST .. ".new", bin: $BIN_DST}, decode: "data", timeout: 30})
+  $d.die_if(not $binary["ok"],
+    $node .. " binary install or --help smoke failed: " .. trim($binary["stderr"]))
+  $d.die_if($binary["value"]["version"] != $LOCAL_VERSION,
+    $node .. " installed version mismatch (want " .. $LOCAL_VERSION .. ")")
+  $d.die_if($binary["value"]["hash"] != $BIN_HASH,
+    $node .. " installed binary hash mismatch")
+  print("  binary: " .. $LOCAL_VERSION .. " (--help and hash OK)")
+
+  install_token($node, $TOKEN, $TOKEN_HASH)
+  if $role == "controller" then
+    install_token($node, $OPTOKEN, $OPTOKEN_HASH)
+  end
+  print("  credentials: installed and hash-verified")
+
+  configure_env($node, $role)
+
+  if $role == "executor" then
+    $group = ssh_mix($remote, '
+$entry = trim(run("/usr/bin/getent group polkitd"))
+if $rc != 0 or $entry == "" then exit(7) end
+$parts = split($entry, ":")
+if len($parts) < 3 then exit(8) end
+$gid = to_number($parts[2])
+if $gid == nil then exit(9) end
+chown("/etc/polkit-1/rules.d", 0, $gid)
+chmod("/etc/polkit-1/rules.d", 0o750)
+print($gid)
+', {timeout: 20})
+    $d.die_if(not $group["ok"],
+      $node .. " polkitd group/rules directory setup failed: " .. trim($group["stderr"]))
+    install_text($node, "/etc/polkit-1/rules.d/60-cosmix-nspawnd.rules", read_file($POLKIT), 0o644)
+    print("  polkit rule installed")
+  end
+
+  install_text($node, "/etc/tmpfiles.d/cosmix-nspawnd.conf", read_file($TMPFILES), 0o644)
+  $tmpfiles = ssh_mix($remote,
+    'print(run("/usr/bin/systemd-tmpfiles --create /etc/tmpfiles.d/cosmix-nspawnd.conf"))',
+    {timeout: 30})
+  $d.die_if(not $tmpfiles["ok"], $node .. " systemd-tmpfiles failed: " .. trim($tmpfiles["stderr"]))
+
+  install_text($node, "/etc/systemd/system/" .. $UNIT_NAME, read_file($UNIT), 0o644)
+  if $role == "controller" then
+    install_text($node, $CDROPIN,
+      "[Service]\nLoadCredential=operator-token:" .. $OPTOKEN .. "\n", 0o644)
+  else
+    $removed = ssh_mix($remote, 'remove($path); print("dropin-ok")',
+      {bindings: {path: $CDROPIN}, timeout: 20})
+    $d.die_if(not $removed["ok"], $node .. " stale controller drop-in removal failed: " .. trim($removed["stderr"]))
+  end
+
+  $enable = ssh_mix($remote,
+    'print(run("/usr/bin/systemctl daemon-reload && /usr/bin/systemctl enable cosmix-nspawnd.service"))',
+    {timeout: 30})
+  $d.die_if(not $enable["ok"], $node .. " daemon-reload/enable failed: " .. trim($enable["stderr"]))
+
+  if $NO_RESTART then
+    print("  installed (--no-restart: service not restarted)")
+    return nil
+  end
+
+  $before = ssh_mix($remote,
+    'print(trim(run("/usr/bin/systemctl show cosmix-nspawnd.service -p InvocationID --value")))',
+    {timeout: 20})
+  $previous_invocation = $before["ok"] ? trim($before["stdout"]) : ""
+
+  $restart = ssh_mix($remote, '
+$out = run("/usr/bin/systemctl restart cosmix-nspawnd.service")
+if $rc != 0 then print($out); exit(7) end
+sleep(4)
+$active = trim(run("/usr/bin/systemctl is-active cosmix-nspawnd.service"))
+if $rc != 0 or $active != "active" then exit(8) end
+$sub = trim(run("/usr/bin/systemctl show cosmix-nspawnd.service -p SubState --value"))
+if $rc != 0 or $sub != "running" then exit(9) end
+$iid = trim(run("/usr/bin/systemctl show cosmix-nspawnd.service -p InvocationID --value"))
+if $rc != 0 or $iid == "" then exit(10) end
+$pid = trim(run("/usr/bin/systemctl show cosmix-nspawnd.service -p MainPID --value"))
+if $rc != 0 or $pid == "" or $pid == "0" then exit(11) end
+$exe = trim(run("/usr/bin/readlink /proc/" .. $pid .. "/exe"))
+if $rc != 0 or $exe == "" then exit(12) end
+print(data_encode({active: $active, substate: $sub, invocation_id: $iid, pid: $pid, exe: $exe}))
+', {decode: "data", timeout: 40})
+  if not $restart["ok"] then
+    print("  restart failed; last 40 log lines:")
+    $journal = ssh_mix($remote,
+      'print(run("/usr/bin/journalctl -u cosmix-nspawnd.service -n 40 --no-pager"))',
+      {timeout: 20})
+    print($journal["stdout"])
+    print($journal["stderr"])
+  end
+  $d.die_if(not $restart["ok"],
+    $node .. " restart/active/running/process probe failed: " .. trim($restart["stderr"]))
+  $state = $restart["value"]
+  $d.die_if($previous_invocation != "" and $state["invocation_id"] == $previous_invocation,
+    $node .. " service did not enter a new invocation")
+  $d.die_if(not starts_with($state["exe"], $BIN_DST) or ends_with($state["exe"], "(deleted)"),
+    $node .. " running process is not the installed binary: " .. $state["exe"])
+  print("  active/running: pid " .. $state["pid"] .. ", new invocation " .. $state["invocation_id"])
+
+  verify_logging($node, $previous_invocation)
+  smoke_bus($node, $role)
+  print("  [" .. $node .. "] DEPLOY OK")
+end
+
+for each $node in $nodes
+  deploy_node($node)
+end
+$_rm = run_argv(["rm", "-f", $BIN])
+
+print("")
+if $NO_RESTART then
+  print("install complete: cosmix-nspawnd version/hash, artifacts and credentials verified; services NOT restarted on " .. join($nodes, " "))
+else
+  print("deploy complete: cosmix-nspawnd version/hash, restart, process, current-invocation logging and BUS smoke verified on " .. join($nodes, " "))
+end

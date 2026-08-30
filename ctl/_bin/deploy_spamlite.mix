@@ -1,0 +1,502 @@
+#!/usr/bin/env mix
+-- deploy_spamlite.mix — build and install the external spamlite engine on
+-- hub-configured mail nodes, then carry engine changes into cosmix-maild.
+--
+--   mix _bin/deploy_spamlite.mix deploy [--allow-downgrade]
+--        [--accept-parity SHA] [--skip-maild] [node...]
+--   mix _bin/deploy_spamlite.mix check
+--
+-- The private hub owns `_etc/deploy_spamlite.conf.mix`: the external source
+-- checkout, accepted parity hash, and target nodes are operational state.
+-- Deploys stop on the first error and follow the fleet rollout order so hubs
+-- are touched last.
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn is_in($list, $value)
+  for each $item in $list
+    if $item == $value then
+      return true
+    end
+  end
+  return false
+end
+
+fn git_in($repo, $argv)
+  return run_argv(concat(["git", "-C", $repo], $argv), {timeout: 300, max_output: 4000000})
+end
+
+fn git_must($repo, $argv, $what)
+  $r = git_in($repo, $argv)
+  $d.die_if($r["exit_code"] != 0,
+    $what .. ": git " .. join($argv, " ") .. ": " .. trim($r["stderr"]))
+  return trim($r["stdout"])
+end
+
+-- First package version in a Cargo manifest.
+fn toml_version($path)
+  $m = regex_find("(?m)^version = \"([0-9]+\\.[0-9]+\\.[0-9]+)\"", read_file($path))
+  $d.die_if(len($m) == 0, "no package version line in " .. $path)
+  return $m[0]["groups"][0]
+end
+
+fn bump_patch($version)
+  $parts = split($version, ".")
+  return $parts[0] .. "." .. $parts[1] .. "." .. (to_number($parts[2]) + 1)
+end
+
+fn set_toml_version($path, $new_version)
+  $source = read_file($path)
+  $updated = regex_replace("(?m)^version = \"[0-9]+\\.[0-9]+\\.[0-9]+\"",
+    $source, "version = \"" .. $new_version .. "\"")
+  $d.die_if($updated == $source, "version rewrite changed nothing in " .. $path)
+  write_file($path, $updated)
+end
+
+fn pinned_rev()
+  $m = regex_find("spamlite = \\{[^}]*rev = \"([0-9a-f]{7,40})\"", read_file($BAYES_TOML))
+  $d.die_if(len($m) == 0, "no spamlite git pin with a rev in " .. $BAYES_TOML)
+  return $m[0]["groups"][0]
+end
+
+fn set_pinned_rev($new_rev)
+  $source = read_file($BAYES_TOML)
+  $updated = regex_replace("rev = \"[0-9a-f]{7,40}\"", $source,
+    "rev = \"" .. $new_rev .. "\"")
+  $d.die_if($updated == $source, "revision rewrite changed nothing in " .. $BAYES_TOML)
+  write_file($BAYES_TOML, $updated)
+end
+
+fn scp_to($node, $address, $local, $remote)
+  $r = run_argv([
+    "scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+    $local, $address .. ":" .. $remote
+  ], {timeout: 120})
+  $d.die_if($r["exit_code"] != 0,
+    "scp " .. $local .. " -> " .. $node .. ":" .. $remote .. ": " .. trim($r["stderr"]))
+end
+
+-- The source revision must be clean and available from the public remote
+-- before the monorepo is allowed to pin it.
+fn preflight()
+  print("[spamlite] preflight " .. $SPAMLITE)
+  $dirty = git_must($SPAMLITE, ["status", "--porcelain"], "status")
+  $d.die_if($dirty != "",
+    "spamlite tree is not clean — commit first (the revision must also be pushed):\n" .. $dirty)
+  $fetch = git_in($SPAMLITE, ["fetch", "-q", "origin", "main"])
+  $d.die_if($fetch["exit_code"] != 0, "git fetch origin main: " .. trim($fetch["stderr"]))
+  $ahead = git_must($SPAMLITE,
+    ["rev-list", "--count", "origin/main..HEAD"], "rev-list")
+  $d.die_if($ahead != "0",
+    "spamlite HEAD is " .. $ahead .. " commit(s) ahead of origin/main — push first")
+  $head = git_must($SPAMLITE, ["rev-parse", "HEAD"], "rev-parse")
+  $version = toml_version($SPAMLITE .. "/Cargo.toml")
+  print("  HEAD " .. substr($head, 0, 12) .. " version " .. $version .. " (pushed)")
+  return {head: $head, version: $version}
+end
+
+fn cargo_must($argv, $cwd, $what)
+  $r = run_argv(concat(["cargo"], $argv),
+    {cwd: $cwd, timeout: 1800, max_output: 4000000})
+  $d.die_if($r["exit_code"] != 0,
+    $what .. " failed (exit " .. $r["exit_code"] .. "): " .. trim($r["stderr"]))
+end
+
+fn build_and_test()
+  print("[spamlite] cargo build --release")
+  cargo_must(["build", "--release"], $SPAMLITE, "cargo build --release")
+  print("[spamlite] cargo test")
+  cargo_must(["test"], $SPAMLITE, "cargo test")
+  $bin = $SPAMLITE .. "/target/release/spamlite"
+  $version = run_argv([$bin, "--version"], {timeout: 30})
+  $d.die_if($version["exit_code"] != 0 or trim($version["stdout"]) == "",
+    "built binary does not report a version: " .. trim($version["stderr"]))
+  return {bin: $bin, version_line: trim($version["stdout"])}
+end
+
+fn parity($bin, $expected)
+  print("[spamlite] parity harness " .. $PARITY)
+  $r = run_argv([$d.mix_bin(), $PARITY, $bin], {timeout: 1800, max_output: 4000000})
+  $d.die_if($r["exit_code"] != 0,
+    "parity harness failed (exit " .. $r["exit_code"] .. "): " .. trim($r["stderr"]))
+  $matches = regex_find("scores_sha256=([0-9a-f]{64})", $r["stdout"])
+  $d.die_if(len($matches) == 0,
+    "parity harness printed no scores_sha256 line:\n" .. $r["stdout"])
+  $actual = $matches[0]["groups"][0]
+  if $actual != $expected then
+    print("  ERROR: parity hash " .. $actual)
+    print("         expected    " .. $expected)
+    print("  If the score change is intended, re-run with --accept-parity " .. $actual)
+    print("  and record the accepted hash and reason before updating the private baseline.")
+    print("  Nothing was deployed.")
+    exit(1)
+  end
+  print("  parity OK " .. substr($actual, 0, 16) .. "…")
+end
+
+fn deploy_host($node, $bin, $version, $version_line, $hash, $stamp)
+  $address = $d.mesh_ip($node)
+  print("")
+  print("[" .. $node .. "] deploy spamlite " .. $version)
+
+  $reach = ssh_mix($address, 'print("reach-ok")')
+  $d.die_if(not $reach["ok"] or not contains($reach["stdout"], "reach-ok"),
+    $node .. " unreachable or not a Mix host: " .. trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+
+  -- Refuse a rollback before transferring anything. A present binary whose
+  -- version cannot be read is a failed pre-flight, not an absent install.
+  $pre = ssh_mix($address, '
+if is_file($bin) then
+  $v = trim(run($bin .. " --version"))
+  if $rc != 0 or $v == "" then
+    eprint("installed spamlite version probe failed")
+    exit(1)
+  end
+  print($v)
+else
+  print("ABSENT")
+end
+', {bindings: {bin: $REMOTE_BIN}})
+  $d.die_if(not $pre["ok"],
+    $node .. " could not inspect installed spamlite: " .. trim($pre["stderr"]))
+  if trim($pre["stdout"]) != "ABSENT" then
+    print("  was: " .. trim($pre["stdout"]))
+    $d.assert_not_downgrade($node, $pre["stdout"], $version_line, $ALLOW_DOWNGRADE)
+  else
+    print("  was: absent")
+  end
+
+  $staged = $REMOTE_BIN .. "-" .. $version
+  $incoming = $staged .. ".new"
+  $backup = $REMOTE_BIN .. ".bak-" .. $stamp .. "-pre-" .. $version
+  scp_to($node, $address, $bin, $incoming)
+  $install = ssh_mix($address, '
+chown($incoming, 0, 0)
+chmod($incoming, 0o755)
+rename($incoming, $staged)
+if is_file($live) then
+  copy($live, $backup)
+  chown($backup, 0, 0)
+end
+$live_new = $live .. ".new"
+copy($staged, $live_new)
+chown($live_new, 0, 0)
+chmod($live_new, 0o755)
+rename($live_new, $live)
+$now = trim(run($live .. " --version"))
+if $rc != 0 then
+  eprint("installed spamlite version probe failed")
+  exit(1)
+end
+print($now)
+', {bindings: {incoming: $incoming, staged: $staged, live: $REMOTE_BIN, backup: $backup}})
+  $d.die_if(not $install["ok"] or trim($install["stdout"]) != $version_line,
+    $node .. " install/version mismatch (want " .. $version_line .. "): " ..
+    trim($install["stdout"]) .. " " .. trim($install["stderr"]))
+
+  -- Exact content makes the install assertion independent of version bumps.
+  $remote_hash = ssh_mix($address, '
+$out = run("sha256sum " .. $bin)
+if $rc != 0 then
+  eprint("sha256sum failed")
+  exit(1)
+end
+print($out)
+', {bindings: {bin: $REMOTE_BIN}})
+  $d.die_if(not $remote_hash["ok"] or not contains($remote_hash["stdout"], $hash),
+    $node .. " installed binary hash mismatch: " .. trim($remote_hash["stdout"]) .. " " .. trim($remote_hash["stderr"]))
+  print("  now: " .. trim($install["stdout"]) .. " (backup " .. $backup .. ")")
+  print("  binary content hash: OK")
+
+  -- The reconciler travels with the engine it understands. Its remote lint is
+  -- a post-install execution smoke, not merely a transfer check.
+  $reconciler = $SPAMLITE .. "/deploy/spamlite-reconcile.mix"
+  if is_file($reconciler) then
+    $reconciler_new = $REMOTE_RECONCILE .. ".new"
+    $reconciler_backup = $REMOTE_RECONCILE .. ".bak-" .. $stamp .. "-pre-" .. $version
+    scp_to($node, $address, $reconciler, $reconciler_new)
+    $rec_install = ssh_mix($address, '
+if is_file($live) then
+  copy($live, $backup)
+  chown($backup, 0, 0)
+end
+chown($incoming, 0, 0)
+chmod($incoming, 0o755)
+rename($incoming, $live)
+$lint = run("/opt/cosmix/bin/mix lint " .. $live)
+if $rc != 0 then
+  eprint($lint)
+  exit(1)
+end
+print("RECONCILE_OK")
+', {bindings: {incoming: $reconciler_new, live: $REMOTE_RECONCILE,
+      backup: $reconciler_backup}})
+    $d.die_if(not $rec_install["ok"] or not contains($rec_install["stdout"], "RECONCILE_OK"),
+      $node .. " reconciler install/lint failed: " .. trim($rec_install["stdout"]) .. " " .. trim($rec_install["stderr"]))
+    print("  reconciler installed + lint-clean on host")
+  end
+  print("  [" .. $node .. "] DEPLOY OK")
+end
+
+-- Engine lag is commits between the monorepo pin and source HEAD that touch
+-- scoring implementation paths, plus dependency changes in Cargo.toml.
+fn engine_lag()
+  $pin = pinned_rev()
+  $head = git_must($SPAMLITE, ["rev-parse", "HEAD"], "rev-parse")
+  $reach = git_in($SPAMLITE, ["merge-base", "--is-ancestor", $pin, "HEAD"])
+  $reachable = $reach["exit_code"] == 0
+  print("[lag] monorepo pin " .. substr($pin, 0, 12) .. "  spamlite HEAD " ..
+    substr($head, 0, 12) .. "  pin reachable from HEAD: " .. $reachable)
+  $d.die_if(not $reachable,
+    "pinned revision is not an ancestor of spamlite HEAD — resolve the history by hand")
+
+  $subjects = []
+  $log_args = concat(["log", "--format=%h%x09%s", $pin .. "..HEAD", "--"], $ENGINE_PATHS)
+  $log = git_must($SPAMLITE, $log_args, "log engine paths")
+  if $log != "" then
+    for each $line in split($log, "\n")
+      push($subjects, $line)
+    end
+  end
+
+  -- A package version-only diff does not alter the engine; any other manifest
+  -- line does, including dependency changes.
+  $manifest_diff = git_must($SPAMLITE,
+    ["diff", $pin .. "..HEAD", "--", "Cargo.toml"], "diff Cargo.toml")
+  $dependency_change = false
+  for each $line in split($manifest_diff, "\n")
+    if (starts_with($line, "+") or starts_with($line, "-")) and not starts_with($line, "+++") and not starts_with($line, "---") then
+      if not regex_match("^[+-]version = ", $line) and trim(substr($line, 1, len($line) - 1)) != "" then
+        $dependency_change = true
+      end
+    end
+  end
+  if $dependency_change then
+    push($subjects, "(Cargo.toml changed outside its version line — dependency lag)")
+  end
+  return {pin: $pin, head: $head, subjects: $subjects}
+end
+
+fn carry_maild($lag)
+  $pin = $lag["pin"]
+  $head = $lag["head"]
+  print("[maild] engine lag: " .. len($lag["subjects"]) .. " change(s) between pin and HEAD")
+  for each $subject in $lag["subjects"]
+    print("  " .. $subject)
+  end
+
+  $dirty = git_must($COSMIX, [
+    "status", "--porcelain", "--",
+    "src/crates/cosmix-maild-bayesian", "src/crates/cosmix-maild", "src/Cargo.lock"
+  ], "monorepo status")
+  $d.die_if($dirty != "",
+    "maild crates are not clean — commit or stash first:\n" .. $dirty)
+
+  set_pinned_rev($head)
+  $bayes_version = bump_patch(toml_version($BAYES_TOML))
+  $maild_version = bump_patch(toml_version($MAILD_TOML))
+  set_toml_version($BAYES_TOML, $bayes_version)
+  set_toml_version($MAILD_TOML, $maild_version)
+  print("[maild] pin -> " .. substr($head, 0, 12) ..
+    "  cosmix-maild-bayesian " .. $bayes_version .. "  cosmix-maild " .. $maild_version)
+
+  cargo_must(["fetch"], $COSMIX_SRC,
+    "cargo fetch — pin and version bumps remain uncommitted")
+  print("[maild] cargo test -p cosmix-maild-bayesian -p cosmix-maild")
+  $tests = run_argv([
+    "cargo", "test", "-p", "cosmix-maild-bayesian", "-p", "cosmix-maild"
+  ], {cwd: $COSMIX_SRC, timeout: 1800, max_output: 4000000})
+  if $tests["exit_code"] != 0 then
+    print("  RED: maild tests failed on the new engine (exit " .. $tests["exit_code"] .. ").")
+    print("  The pin and version bumps remain uncommitted in " .. $COSMIX_SRC .. ".")
+    print("  If a golden moved, decide whether the score change is intended before updating it.")
+    exit(1)
+  end
+  cargo_must([
+    "clippy", "-p", "cosmix-maild-bayesian", "-p", "cosmix-maild",
+    "--all-targets", "--", "-D", "warnings"
+  ], $COSMIX_SRC, "clippy on the new engine — changes remain uncommitted")
+
+  -- Commit before the release build so build provenance identifies the commit
+  -- containing the pin. Push only after the build passes and before fan-out.
+  $subject = "maild-bayesian " .. $bayes_version .. " / maild " .. $maild_version ..
+    ": spamlite engine pin " .. substr($pin, 0, 7) .. " -> " .. substr($head, 0, 7)
+  $body = "Engine lag carried by ctl/_bin/deploy_spamlite.mix. Changes on engine paths:\n\n"
+  for each $change in $lag["subjects"]
+    $body = $body .. "  " .. $change .. "\n"
+  end
+  $body = $body .. "\nGoldens byte-identical; cargo test and clippy passed on the new engine."
+  git_must($COSMIX, [
+    "add", "--", "src/Cargo.lock",
+    "src/crates/cosmix-maild-bayesian/Cargo.toml",
+    "src/crates/cosmix-maild/Cargo.toml"
+  ], "add maild carry")
+  git_must($COSMIX, ["commit", "-q", "-m", $subject, "-m", $body], "commit maild carry")
+  print("[maild] committed: " .. $subject)
+  print("[maild] cargo build --release -p cosmix-maild")
+  cargo_must(["build", "--release", "-p", "cosmix-maild"], $COSMIX_SRC,
+    "maild release build — commit remains local and unpushed")
+  git_must($COSMIX, ["push", "-q", "origin", "HEAD:main"], "push maild carry")
+  print("[maild] pushed")
+
+  print("[maild] deploy_maild.mix deploy")
+  $deploy = run_argv([$d.mix_bin(), $MAILD_DEPLOY, "deploy"],
+    {cwd: $d.hub_root(), timeout: 1800, max_output: 4000000})
+  $d.die_if($deploy["exit_code"] != 0,
+    "deploy_maild.mix failed (exit " .. $deploy["exit_code"] .. ") — the monorepo commit is pushed: " .. trim($deploy["stderr"]))
+  print($deploy["stdout"])
+  print("[maild] carried: " .. $subject)
+end
+
+-- ── dispatch and purely-local pre-flight ───────────────────────────────
+$argv = args()
+if len($argv) == 0 then
+  print("usage: mix deploy_spamlite.mix deploy [--allow-downgrade] [--accept-parity SHA] [--skip-maild] [node...]")
+  print("       mix deploy_spamlite.mix check")
+  exit(2)
+end
+$stage = $argv[0]
+if $stage != "deploy" and $stage != "check" then
+  print("unknown stage: " .. $stage)
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_spamlite.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no spamlite deploy config at " .. $CONF_PATH ..
+    " — copy deploy_spamlite.conf.mix.example and replace every placeholder")
+  exit(2)
+end
+$CONF_DOC = load_data($CONF_PATH)
+$d.die_if(type($CONF_DOC) != "map" or type($CONF_DOC["deploy_spamlite"]) != "map",
+  "invalid " .. $CONF_PATH .. ": expected deploy_spamlite map")
+$CONF = validate($CONF_DOC["deploy_spamlite"], {
+  schema_version: {type: "integer", enum: [1]},
+  spamlite_root: {type: "string", nonblank: true},
+  target_nodes: {type: "list", min_length: 1, items: {type: "string", nonblank: true}},
+  parity_baseline_sha256: {type: "string", nonblank: true}
+})
+$d.die_if(not regex_match("^[0-9a-f]{64}$", $CONF["parity_baseline_sha256"]),
+  "invalid " .. $CONF_PATH .. ": parity_baseline_sha256 must be 64 lowercase hex characters")
+$d.die_if($CONF["parity_baseline_sha256"] == "0000000000000000000000000000000000000000000000000000000000000000",
+  "invalid " .. $CONF_PATH .. ": replace the parity_baseline_sha256 placeholder")
+
+$SPAMLITE = $CONF["spamlite_root"]
+$PARITY_BASELINE = $CONF["parity_baseline_sha256"]
+$COSMIX = $d.cosmix_root()
+$COSMIX_SRC = $COSMIX .. "/src"
+$PARITY = $d.hub_root() .. "/_bin/mail/spamlite-parity.mix"
+$MAILD_DEPLOY = $d.hub_root() .. "/_bin/deploy_maild.mix"
+$BAYES_TOML = $COSMIX_SRC .. "/crates/cosmix-maild-bayesian/Cargo.toml"
+$MAILD_TOML = $COSMIX_SRC .. "/crates/cosmix-maild/Cargo.toml"
+$REMOTE_BIN = "/usr/local/bin/spamlite"
+$REMOTE_RECONCILE = "/usr/local/bin/spamlite-reconcile.mix"
+$ENGINE_PATHS = ["src/lib.rs", "src/tokenizer.rs", "src/scoring.rs", "src/storage.rs"]
+
+for each $required in [$SPAMLITE .. "/Cargo.toml", $BAYES_TOML]
+  $d.die_if(not is_file($required), "required local file missing: " .. $required)
+end
+
+if $stage == "check" then
+  $d.die_if(len($argv) != 1, "check takes no further arguments")
+  $lag = engine_lag()
+  if len($lag["subjects"]) == 0 then
+    print("maild current: no engine change between the pin and spamlite HEAD")
+  else
+    print("maild STALE: " .. len($lag["subjects"]) .. " engine change(s) since the pin — run deploy to carry it")
+    for each $subject in $lag["subjects"]
+      print("  " .. $subject)
+    end
+    exit(3)
+  end
+  exit(0)
+end
+
+for each $required in [$PARITY, $MAILD_DEPLOY, $MAILD_TOML]
+  $d.die_if(not is_file($required), "required local file missing: " .. $required)
+end
+
+$ROSTER = $d.roster()
+$configured = []
+for each $node in $CONF["target_nodes"]
+  $d.assert_node($ROSTER, $node)
+  $d.die_if($d.is_foreign($ROSTER, $node),
+    "spamlite target '" .. $node .. "' is foreign; deploy requires a Mix-login mesh node")
+  $d.die_if(is_in($configured, $node),
+    "duplicate spamlite target in " .. $CONF_PATH .. ": " .. $node)
+  push($configured, $node)
+end
+
+$parse_args = []
+$expected = $PARITY_BASELINE
+$i = 1
+while $i < len($argv)
+  $arg = $argv[$i]
+  if $arg == "--accept-parity" then
+    if $i + 1 >= len($argv) then
+      print("  ERROR: --accept-parity needs a SHA")
+      exit(2)
+    end
+    $expected = $argv[$i + 1]
+    $d.die_if(not regex_match("^[0-9a-f]{64}$", $expected),
+      "--accept-parity must be 64 lowercase hex characters")
+    $i = $i + 1
+  else
+    push($parse_args, $arg)
+  end
+  $i = $i + 1
+end
+
+$TARGET_ROSTER = {mesh: $configured, foreign: [], all: $configured, order: nil}
+$parsed = $d.parse_nodes($TARGET_ROSTER, $parse_args,
+  ["--allow-downgrade", "--skip-maild"])
+$requested = $parsed["nodes"]
+$ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
+$SKIP_MAILD = $parsed["flags"]["--skip-maild"] == true
+
+$nodes = []
+for each $node in $d.rollout_order($ROSTER)
+  if is_in($requested, $node) then
+    push($nodes, $node)
+  end
+end
+$d.die_if(len($nodes) != len($requested),
+  "spamlite targets contain a duplicate or a node absent from the fleet rollout order")
+
+$preflight = preflight()
+$built = build_and_test()
+parity($built["bin"], $expected)
+
+-- Freeze and hash the bytes after all local gates, before any node is touched.
+$BIN = $d.snapshot_bin($built["bin"])
+$hash_result = run_argv(["sha256sum", $BIN])
+$d.die_if($hash_result["exit_code"] != 0,
+  "local binary hash failed: " .. trim($hash_result["stderr"]))
+$BIN_HASH = split(trim($hash_result["stdout"]), " ")[0]
+$date_result = run_argv(["date", "+%Y%m%d"])
+$d.die_if($date_result["exit_code"] != 0 or trim($date_result["stdout"]) == "",
+  "could not make backup date stamp: " .. trim($date_result["stderr"]))
+$stamp = trim($date_result["stdout"])
+
+print("rollout order: " .. join($nodes, " "))
+for each $node in $nodes
+  deploy_host($node, $BIN, $preflight["version"], $built["version_line"], $BIN_HASH, $stamp)
+end
+$_remove_snapshot = run_argv(["rm", "-f", $BIN])
+
+print("")
+print("spamlite " .. $preflight["version"] .. " deployed and asserted on " .. join($nodes, " "))
+$lag = engine_lag()
+if len($lag["subjects"]) == 0 then
+  print("maild current: no engine change between the pin and deployed revision")
+else
+  if $SKIP_MAILD then
+    print("maild STALE (--skip-maild): " .. len($lag["subjects"]) .. " engine change(s) not carried")
+    for each $subject in $lag["subjects"]
+      print("  " .. $subject)
+    end
+    exit(3)
+  else
+    carry_maild($lag)
+  end
+end

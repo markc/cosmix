@@ -40,19 +40,15 @@ if type($WGCONF["expected_mesh"]) != "string" or trim($WGCONF["expected_mesh"]) 
 end
 
 -- mesh_lib owns signed-inventory verification, deterministic WG generation,
--- the component-deploy epoch ratchet, write lock, and verified byte snapshot.
--- Its hub-relative globals predate deploy_lib, so point those globals at the
--- same located hub before calling them.
-include $d.hub_root() .. "/_bin/mesh_lib.mix"
-$MESH_EXPECTED = $WGCONF["expected_mesh"]
-$MESH_SIGN_BIN = $d.cosmix_bin("cosmix-mesh-sign")
-$MESH_BASELINE = $d.hub_root() .. "/_etc/mesh/epoch.baseline.mix"
-$MESH_WRITE_LOCK = $d.hub_root() .. "/_share/cosmix/.mesh-write.lock"
+-- the component-deploy epoch ratchet, and verified byte snapshots. It is a
+-- module so lint can still analyse this script's names.
+$m = require("../_lib/mesh_lib.mix")
 
 $SIGNED = $d.hub_root() .. "/_etc/mesh/inventory.signed"
 $AUTHORED = $d.hub_root() .. "/_etc/mesh/inventory.mix"
 $WGOVERLAY = $d.hub_root() .. "/_etc/mesh/wg.overlay.mix"
 $WGDIR = $d.hub_root() .. "/_etc/cosmix/wgd"
+$BASELINE = $d.hub_root() .. "/_etc/mesh/epoch.baseline.mix"
 
 fn has_str($items, $wanted)
   for each $item in $items
@@ -74,6 +70,10 @@ fn same_strings($left, $right)
   end
   return true
 end
+
+-- deploy_lib has no located write-lock helper, while mesh_lib's lock path is
+-- fixed when its isolated module loads. Keep the same single-writer contract
+-- against this script's located hub.
 
 -- First inet address on the device as ip/cidr, or "" when none is present.
 fn live_addr($node, $iface)
@@ -280,6 +280,20 @@ end
 if $prefix == "" then
   $prefix = "32"
 end
+$prefix_ok = len($prefix) > 0 and len($prefix) <= 2
+$prefix_i = 0
+while $prefix_ok and $prefix_i < len($prefix)
+  if not contains("0123456789", substr($prefix, $prefix_i, 1)) then
+    $prefix_ok = false
+  end
+  $prefix_i = $prefix_i + 1
+end
+if not $prefix_ok or to_number($prefix) > 32 then
+  fail("refusing invalid IPv4 prefix " .. $prefix)
+end
+if $live_ip != "" and $live_prefix == "" then
+  fail("live address has no IPv4 prefix: " .. $live)
+end
 
 if $live_ip == $new_ip and $conf_ip == $new_ip then
   print("WG_DEPLOY_OK " .. $token .. " unchanged " .. $new_ip .. "/" .. $prefix)
@@ -360,15 +374,16 @@ end
 -- The authenticated payload is the only input allowed to determine live
 -- routing. against_authored refuses an unsealed edit before any node is read.
 if not $dry then
-  mesh_take_write_lock("deploy_wg")
+  $_lock = $m.mesh_take_write_lock("deploy_wg")
 end
-$vi = verified_inventory($SIGNED, {
-  mesh: $MESH_EXPECTED,
-  against_authored: $AUTHORED
+$vi = $m.verified_inventory($SIGNED, {
+  mesh: $WGCONF["expected_mesh"],
+  against_authored: $AUTHORED,
+  baseline: $BASELINE
 })
 $mesh = $vi["inventory"]
 $wgov = load_data($WGOVERLAY)["wg_overlay"]
-validate_wg_overlay($mesh, $wgov)
+$m.validate_wg_overlay($mesh, $wgov)
 $d.die_if(not same_strings($inventory_hubs, $mesh["hub"]),
   "authored and verified inventories disagree on hub membership")
 
@@ -401,15 +416,26 @@ end
 $d.die_if(not same_strings($seen, $ROSTER["mesh"]),
   "rollout_order must contain every rostered mesh node exactly once")
 
+-- WireGuard is applied HUB FIRST, then the spokes in rollout order. The
+-- roster's rollout_order is validated above as hubs-last because that is the
+-- invariant for daemon restarts (everything talks through the hub, so it
+-- moves last); for a PEER TABLE the dependency runs the other way — a spoke's
+-- new config points at the hub, so the hub must already hold the new peer set
+-- or the spoke reconnects into a hub that does not know it.
 $nodes = []
 for each $node in $rollout
-  if has_str($selected, $node) then
+  if has_str($selected, $node) and has_str($inventory_hubs, $node) then
+    push($nodes, $node)
+  end
+end
+for each $node in $rollout
+  if has_str($selected, $node) and not has_str($inventory_hubs, $node) then
     push($nodes, $node)
   end
 end
 $d.die_if(not has_str($nodes, $hub), "primary hub is missing from the filtered rollout")
 
-$hub_iface = wg_iface_of($wgov, $hub)
+$hub_iface = $m.wg_iface_of($wgov, $hub)
 $committed = $WGDIR .. "/" .. $hub_iface .. ".conf"
 $epoch = $mesh["epoch"]
 print("deploy_wg — WireGuard apply (epoch " .. ("" .. $epoch) .. ")")
@@ -426,14 +452,16 @@ print("")
 -- the mutable committed path.
 $d.die_if(not is_file($committed),
   "committed hub conf missing: " .. $committed .. " (seal the mesh inventory first)")
-$fresh = gen_hub_wg_from_verified($vi, $WGOVERLAY)
+$fresh = $m.gen_hub_wg_from_verified($vi, $WGOVERLAY)
 $ondisk = read_file($committed)
 $d.die_if($fresh != $ondisk,
   "committed " .. $committed .. " is stale versus a fresh verified derivation; seal and commit it before deploying")
 print("[preflight] committed hub conf is current (" .. ("" .. byte_length($ondisk)) .. " bytes)")
 $ship = $committed
+$ship_bytes = $ondisk
 if not $dry then
-  $ship = verified_snapshot($ondisk, $hub_iface .. ".conf")
+  $ship = $m.verified_snapshot($ondisk, $hub_iface .. ".conf")
+  $ship_bytes = read_file($ship)
 end
 
 $date = run_argv(["date", "+%Y%m%d-%H%M%S"])
@@ -443,12 +471,12 @@ $d.die_if($suffix == "", "date produced an empty backup suffix")
 $token = uuid()
 
 if not $dry then
-  mesh_baseline_ratchet_epoch($MESH_BASELINE, $vi)
+  $m.mesh_baseline_ratchet_epoch($BASELINE, $vi)
 end
 print("")
 
 for each $node in $nodes
-  $iface = wg_iface_of($wgov, $node)
+  $iface = $m.wg_iface_of($wgov, $node)
   assert_reachable($node, $token)
   if $dry then
     $live = live_addr($node, $iface)
@@ -461,7 +489,7 @@ for each $node in $nodes
     end
   else
     if $node == $hub then
-      apply_hub($node, $iface, read_file($ship), $suffix, $token)
+      apply_hub($node, $iface, $ship_bytes, $suffix, $token)
     else
       apply_spoke($node, $iface, $d.mesh_ip($node), $suffix, $token)
     end
@@ -498,7 +526,7 @@ $expected = {}
 $bad = 0
 for each $member in $mesh["members"]
   if $member["status"] == "active" and $member["name"] != $hub then
-    for each $public_key in wg_current_pubkeys($member, $epoch)
+    for each $public_key in $m.wg_current_pubkeys($member, $epoch)
       $expected[$public_key] = true
       $wanted = $d.mesh_ip($member["name"]) .. "/32"
       $got = $actual[$public_key]
@@ -526,7 +554,7 @@ print("  hub " .. $hub_iface .. ": exact peer set (" .. ("" .. len($actual_keys)
 
 for each $node in $nodes
   if $node != $hub then
-    $iface = wg_iface_of($wgov, $node)
+    $iface = $m.wg_iface_of($wgov, $node)
     $wanted = $d.mesh_ip($node)
     $live = live_addr($node, $iface)
     $live_ip = $live
@@ -539,7 +567,7 @@ for each $node in $nodes
     print("  " .. rpad($node, 8) .. " " .. $iface .. " = " .. $live)
   end
 end
-snapshot_release($ship)
+$m.snapshot_release($ship)
 print("")
 print("deploy_wg complete: verified live WireGuard state on " .. join($nodes, " ") ..
   " at epoch " .. ("" .. $epoch))

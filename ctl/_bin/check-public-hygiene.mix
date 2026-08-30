@@ -130,7 +130,7 @@ $MESH       = "bus"
 -- the include, so it survives load order) makes those
 -- refusals land as this gate's 2 — "could not answer" — never its 1.
 $MESH_FATAL_EXIT = 2
-include $CMCTL .. "/_bin/mesh_lib.mix"
+include $CMCTL .. "/_lib/mesh_lib.mix"
 
 -- Exit 2 stops the whole run, not just the repo that hit it: the failures that
 -- produce it — a git that lies about its own output, an undecodable stream, a

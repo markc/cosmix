@@ -1,0 +1,9 @@
+-- Private hub configuration for deploy_spamlite.mix.
+-- Copy this file to `_etc/deploy_spamlite.conf.mix` in the control hub and
+-- replace every placeholder. The node names must be active mesh roster nodes.
+deploy_spamlite: {
+  schema_version: 1,
+  spamlite_root: "/home/user/Projects/spamlite",
+  target_nodes: ["alpha", "beta", "gamma"],
+  parity_baseline_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+}

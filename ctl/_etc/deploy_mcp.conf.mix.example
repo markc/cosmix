@@ -1,0 +1,10 @@
+{
+  deploy_mcp: {
+    -- Bump only when this public template's data shape changes.
+    schema_version: 1,
+
+    -- Nodes used when deploy_mcp.mix has no explicit node arguments. Each
+    -- name must exist in the private fleet roster and mesh inventory.
+    target_nodes: ["alpha"]
+  }
+}

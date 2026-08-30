@@ -1229,7 +1229,21 @@ end
 -- would resurrect an epoch a recovery retired). Stated because it is
 -- the assumption the whole file rests on: this floor is a tripwire, not an
 -- authority — but it is now a tripwire the stale checkout does not step over.
-$MESH_BASELINE = env("CMCTL", env("HOME") .. "/.ctl") .. "/_etc/mesh/epoch.baseline.mix"
+-- 2026-08-30: the hub is located, never assumed: the directory above the
+-- MAIN script (this file is included/required from a script in <hub>/_bin) if it
+-- holds the gate conf, else the CMCTL environment variable, else ~/.ctl.
+fn _mesh_hub_root()
+  $here = dirname(dirname(realpath($0)))
+  if is_file($here .. "/_etc/public-hygiene.conf.mix") then
+    return $here
+  end
+  $e = env("CMCTL")
+  if $e != "" then
+    return $e
+  end
+  return env("HOME") .. "/.ctl"
+end
+$MESH_BASELINE = _mesh_hub_root() .. "/_etc/mesh/epoch.baseline.mix"
 
 -- Mix numbers are f64; the wire type for epoch and recovery_generation is u64.
 -- The two agree only up to 2^53-1 — probed live, json_parse turns
@@ -1283,7 +1297,7 @@ $MESH_BASELINE_MIRROR = "/var/lib/cosmix/mesh/epoch.baseline.mix"
 -- the caller ($COSMIX is set by the scripts that include this file, not by
 -- this file) so the independence test below cannot be defeated by an includer
 -- that simply does not define it.
-$MESH_CHECKOUT_ROOT = env("CMCTL", env("HOME") .. "/.ctl")
+$MESH_CHECKOUT_ROOT = _mesh_hub_root()
 
 -- {present: bool, baseline: <map>|nil}. Absent is legitimate (a control host
 -- that has never completed a rollout); unreadable is not, and refuses rather
@@ -2553,7 +2567,7 @@ end
 -- own gate and still ship a mixture neither authored. An advisory lock is
 -- enough here because every writer is this toolkit; it turns a silent
 -- interleave into a refusal that names the other run.
-$MESH_WRITE_LOCK = env("CMCTL", env("HOME") .. "/.ctl") .. "/_share/cosmix/.mesh-write.lock"
+$MESH_WRITE_LOCK = _mesh_hub_root() .. "/_share/cosmix/.mesh-write.lock"
 
 
 -- Has this path stopped being the file we decided about?

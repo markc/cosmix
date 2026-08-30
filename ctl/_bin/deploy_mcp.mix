@@ -1,0 +1,196 @@
+#!/usr/bin/env mix
+-- deploy_mcp.mix — install cosmix-mcp on the configured workstation nodes,
+-- or a named configured subset.
+--
+--   mix _bin/deploy_mcp.mix                     -- configured targets
+--   mix _bin/deploy_mcp.mix alpha               -- one configured target
+--   mix _bin/deploy_mcp.mix --allow-downgrade … -- deliberate rollback
+--
+-- cosmix-mcp is a per-session stdio bridge, not a systemd service. An atomic
+-- rename leaves live sessions on their old inode; a reconnect or new session
+-- picks up the installed binary. The private target set lives in the hub's
+-- _etc/deploy_mcp.conf.mix. Addresses come from mesh inventory, and the
+-- roster's rollout order is always applied so hub nodes are touched last.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/deploy_mcp.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no MCP deploy config at " .. $CONF_PATH ..
+    " — create it from deploy_mcp.conf.mix.example before deploying")
+  exit(2)
+end
+$CONF_DOC = load_data($CONF_PATH)
+if type($CONF_DOC) != "map" or type($CONF_DOC["deploy_mcp"]) != "map" then
+  print("  ERROR: " .. $CONF_PATH .. " must contain a deploy_mcp strict-data map")
+  exit(2)
+end
+$CONF = $CONF_DOC["deploy_mcp"]
+if $CONF["schema_version"] != 1 or type($CONF["target_nodes"]) != "list" or len($CONF["target_nodes"]) == 0 then
+  print("  ERROR: " .. $CONF_PATH .. " needs schema_version: 1 and a non-empty target_nodes list")
+  exit(2)
+end
+
+fn is_in($list, $value)
+  for each $item in $list
+    if $item == $value then
+      return true
+    end
+  end
+  return false
+end
+
+$configured = []
+for each $node in $CONF["target_nodes"]
+  if type($node) != "string" or trim($node) == "" then
+    print("  ERROR: " .. $CONF_PATH .. " target_nodes entries must be non-empty strings")
+    exit(2)
+  end
+  if is_in($configured, $node) then
+    print("  ERROR: duplicate MCP target in " .. $CONF_PATH .. ": " .. $node)
+    exit(2)
+  end
+  push($configured, $node)
+end
+
+$ROSTER = $d.roster()
+$requested = args()
+$has_named_node = false
+for each $arg in $requested
+  if $arg != "--allow-downgrade" then
+    $has_named_node = true
+  end
+end
+if not $has_named_node then
+  $requested = concat($configured, $requested)
+end
+$parsed = $d.parse_nodes($ROSTER, $requested, ["--allow-downgrade"])
+$selected = $parsed["nodes"]
+$ALLOW_DOWNGRADE = $parsed["flags"]["--allow-downgrade"] == true
+
+-- Resolve and validate the full deployment before inspecting or snapshotting
+-- the artefact. A bad pre-flight cannot touch a node.
+$REMOTE = {}
+$seen = []
+for each $node in $selected
+  if is_in($seen, $node) then
+    print("  ERROR: duplicate requested MCP target: " .. $node)
+    exit(2)
+  end
+  push($seen, $node)
+  if not is_in($configured, $node) then
+    print("  ERROR: '" .. $node .. "' is not an MCP target configured in " .. $CONF_PATH)
+    exit(2)
+  end
+  if $d.is_foreign($ROSTER, $node) then
+    print("  ERROR: " .. $node .. " is a foreign node; deploy_mcp requires a mesh node with Mix as root login shell")
+    exit(2)
+  end
+  $REMOTE[$node] = "root@" .. $d.mesh_ip($node)
+end
+
+$rollout = $d.rollout_order($ROSTER)
+$nodes = []
+for each $candidate in $rollout
+  if is_in($selected, $candidate) then
+    if is_in($nodes, $candidate) then
+      print("  ERROR: roster rollout_order repeats selected node '" .. $candidate .. "'")
+      exit(2)
+    end
+    push($nodes, $candidate)
+  end
+end
+if len($nodes) != len($selected) then
+  print("  ERROR: a selected MCP target is absent from the roster rollout_order")
+  exit(2)
+end
+
+-- Snapshot once so every target receives identical bytes if another build
+-- relinks the release binary during this rollout.
+$SOURCE_BIN = $d.cosmix_bin("cosmix-mcp")
+$d.die_if(not is_file($SOURCE_BIN),
+  "local release binary missing (build it first: cd $COSMIX/src && cargo build --release -p cosmix-mcp): " .. $SOURCE_BIN)
+$BIN = $d.snapshot_bin($SOURCE_BIN)
+$bv = run_argv([$BIN, "--version"])
+$d.die_if($bv["exit_code"] != 0, "local cosmix-mcp --version failed: " .. trim($bv["stderr"]))
+$ver = trim($bv["stdout"])
+$d.die_if($ver == "", "local cosmix-mcp --version returned no version")
+$BIN_HASH = hash_file($BIN, "sha256")
+
+print("local build: " .. $BIN .. " -> " .. $ver)
+print("targets: " .. join($nodes, " "))
+
+fn deploy_node($node)
+  $remote = $REMOTE[$node]
+  print("")
+  print("[" .. $node .. "] deploy cosmix-mcp")
+
+  $reach = ssh_mix($remote, 'print("reach-ok")', {connect_timeout: 8, timeout: 10})
+  $d.die_if(not $reach["ok"] or not contains($reach["stdout"], "reach-ok"),
+    $node .. " unreachable or not a working Mix node: " .. trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+
+  -- Refuse a rollback before transferring anything. A present but broken
+  -- installed binary is an error, not permission to skip the version gate.
+  $pre = ssh_mix($remote, '
+if is_file($bin) then
+  $out = trim(run($bin .. " --version"))
+  if $rc != 0 or $out == "" then
+    exit(7)
+  end
+  print($out)
+end
+', {bindings: {bin: "/opt/cosmix/bin/cosmix-mcp"}, connect_timeout: 8, timeout: 10})
+  $d.die_if(not $pre["ok"],
+    $node .. " installed --version probe failed: " .. trim($pre["stdout"]) .. " " .. trim($pre["stderr"]))
+  if trim($pre["stdout"]) != "" then
+    $d.assert_not_downgrade($node, $pre["stdout"], $ver, $ALLOW_DOWNGRADE)
+  end
+
+  $mk = ssh_mix($remote, 'mkdir("/opt/cosmix/bin", {parents: true}); print("mkdir-ok")',
+    {connect_timeout: 8, timeout: 10})
+  $d.die_if(not $mk["ok"] or not contains($mk["stdout"], "mkdir-ok"),
+    $node .. " could not create /opt/cosmix/bin: " .. trim($mk["stderr"]))
+
+  $scp = run_argv([
+    "scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+    $BIN, $remote .. ":/opt/cosmix/bin/cosmix-mcp.new"
+  ], {timeout: 120})
+  $d.die_if($scp["exit_code"] != 0,
+    "binary scp -> " .. $node .. ": " .. trim($scp["stderr"]))
+
+  -- rename(2) makes the replacement atomic and preserves the old inode for
+  -- sessions already running. Exact version and content checks interrogate
+  -- the installed path, so a skipped or stale transfer cannot pass.
+  $install = ssh_mix($remote, '
+chmod($new_bin, 0o755)
+rename($new_bin, $bin)
+$installed_version = trim(run($bin .. " --version"))
+if $rc != 0 or $installed_version == "" then
+  exit(7)
+end
+print(data_encode({version: $installed_version, hash: hash_file($bin, "sha256")}))
+', {
+    bindings: {
+      new_bin: "/opt/cosmix/bin/cosmix-mcp.new",
+      bin: "/opt/cosmix/bin/cosmix-mcp"
+    },
+    decode: "data", connect_timeout: 8, timeout: 20
+  })
+  $d.die_if(not $install["ok"],
+    $node .. " install or --version smoke failed: " .. trim($install["stdout"]) .. " " .. trim($install["stderr"]))
+  $d.die_if($install["value"]["version"] != $ver,
+    $node .. " installed version mismatch (want " .. $ver .. ", got " .. $install["value"]["version"] .. ")")
+  $d.die_if($install["value"]["hash"] != $BIN_HASH,
+    $node .. " installed binary hash mismatch")
+  print("  installed: " .. $install["value"]["version"] .. " (--version and hash OK)")
+  print("  NOTE: live MCP sessions keep the old inode; reconnect or start a new session")
+  print("  [" .. $node .. "] DEPLOY OK")
+end
+
+for each $node in $nodes
+  deploy_node($node)
+end
+$_rm = run_argv(["rm", "-f", $BIN])
+
+print("")
+print("deploy complete: cosmix-mcp version and content verified on " .. join($nodes, " "))
