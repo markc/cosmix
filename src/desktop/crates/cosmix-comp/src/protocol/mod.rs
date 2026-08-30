@@ -119,9 +119,9 @@ use smithay::{
         buffer::BufferHandler,
         compositor::{
             self, BufferAssignment, Cacheable, CompositorClientState, CompositorHandler,
-            CompositorState, Damage, RegionUserData, SubsurfaceCachedState, SubsurfaceUserData,
-            SurfaceAttributes, SurfaceUserData, TraversalAction, with_surface_tree_downward,
-            with_surface_tree_upward,
+            CompositorState, Damage, RectangleKind, RegionUserData, SubsurfaceCachedState,
+            SubsurfaceUserData, SurfaceAttributes, SurfaceUserData, TraversalAction,
+            with_surface_tree_downward, with_surface_tree_upward,
         },
         dmabuf::{
             DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
@@ -139,9 +139,10 @@ use smithay::{
             },
         },
         shell::wlr_layer::{
-            Anchor, ExclusiveZone, Layer as WlrLayer, LayerSurface as WlrLayerSurface,
-            LayerSurfaceConfigure, LayerSurfaceData, WlrLayerShellGlobalData, WlrLayerShellHandler,
-            WlrLayerShellState, WlrLayerSurfaceUserData,
+            Anchor, ExclusiveZone, KeyboardInteractivity, Layer as WlrLayer,
+            LayerSurface as WlrLayerSurface, LayerSurfaceConfigure, LayerSurfaceData,
+            WlrLayerShellGlobalData, WlrLayerShellHandler, WlrLayerShellState,
+            WlrLayerSurfaceUserData,
         },
         shell::xdg::{
             Configure, PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface,
@@ -215,9 +216,65 @@ const TITLEBAR_DOUBLE_CLICK_SLOP: f64 = 5.0;
 const DMABUF_VALIDATION_QUEUE_CAPACITY: usize = 64;
 const ECS_ACTION_QUEUE_CAPACITY: usize = 8;
 const DIRTY_SURFACE_RECOVERY_BATCH: usize = 16;
+const MAX_COMMITTED_INPUT_REGION_RECTS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SurfaceId(pub(crate) u64);
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum StackBand {
+    Background,
+    Bottom,
+    #[default]
+    Normal,
+    Top,
+    Overlay,
+}
+
+impl StackBand {
+    const COUNT: usize = 5;
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Background => 0,
+            Self::Bottom => 1,
+            Self::Normal => 2,
+            Self::Top => 3,
+            Self::Overlay => 4,
+        }
+    }
+
+    const fn for_layer(layer: WlrLayer) -> Self {
+        match layer {
+            WlrLayer::Background => Self::Background,
+            WlrLayer::Bottom => Self::Bottom,
+            WlrLayer::Top => Self::Top,
+            WlrLayer::Overlay => Self::Overlay,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct SurfaceStackKey {
+    pub(crate) band: StackBand,
+    pub(crate) sequence: u64,
+    pub(crate) tree_index: u32,
+}
+
+impl SurfaceStackKey {
+    const fn root(band: StackBand, sequence: u64) -> Self {
+        Self {
+            band,
+            sequence,
+            tree_index: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn normal(sequence: u64) -> Self {
+        Self::root(StackBand::Normal, sequence)
+    }
+}
 
 /// Latest confined pointer coordinate shared with the renderer.
 ///
@@ -236,7 +293,7 @@ pub(crate) struct SurfaceLayout {
     pub(crate) y: f32,
     pub(crate) width: f32,
     pub(crate) height: f32,
-    pub(crate) z: f32,
+    pub(crate) z: SurfaceStackKey,
     pub(crate) source: Option<TextureSourceRect>,
     pub(crate) parent: Option<SurfaceId>,
     pub(crate) transform: SurfaceTransform,
@@ -341,6 +398,17 @@ struct LogicalOutputRect {
     y: f32,
     width: f32,
     height: f32,
+}
+
+impl From<(u32, u32)> for LogicalOutputRect {
+    fn from((width, height): (u32, u32)) -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            width: width as f32,
+            height: height as f32,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2132,7 +2200,15 @@ impl ProtocolServer {
             chrome_geometry_retarget_count: 0,
             #[cfg(test)]
             committed_window_state_transitions: Vec::new(),
+            pointer_hit_test_transaction_applying: false,
+            pointer_hit_test_dirty: false,
+            pointer_hit_test_batch_depth: 0,
+            pointer_grab_teardown_deferred: false,
+            pointer_focus_local_position: None,
+            #[cfg(test)]
+            pointer_hit_test_reconciliations: 0,
             interactive_pointer: None,
+            exclusive_keyboard_focus: None,
             minimized_toplevels: Vec::new(),
             surfaces: HashMap::new(),
             buffer_history_surfaces: HashSet::new(),
@@ -2148,7 +2224,7 @@ impl ProtocolServer {
             pending_cursor_update: false,
             next_surface_id: 1,
             next_layout_index: 0,
-            next_z: 10,
+            next_stack_sequences: [0; StackBand::COUNT],
             next_buffer_token: 1,
             next_dmabuf_buffer_id: 1,
             dmabuf_buffer_ids: HashMap::new(),
@@ -2275,12 +2351,14 @@ impl ProtocolServer {
                     let pause = matches!(&event, KmsTopologyLifecycleEvent::Pause);
                     let previous_scale = state.backend.output_scale();
                     let previous_output = state.logical_output_rect();
+                    let previous_usable = state.usable_output_rect();
                     let result = state
                         .backend
                         .apply_kms_topology_lifecycle(event)
                         .map_err(|error| error.to_string())
                         .and_then(|commands| {
                             if !pause {
+                                state.begin_pointer_hit_test_batch();
                                 let mapped_surfaces = state
                                     .surfaces
                                     .values()
@@ -2299,10 +2377,11 @@ impl ProtocolServer {
                                 if scale != previous_scale {
                                     state.publish_surface_preferred_scale(scale);
                                 }
-                                if state.logical_output_rect() != previous_output {
-                                    state.reconfigure_window_states_for_output();
-                                    state.arrange_all_layer_outputs();
-                                }
+                                state.reconcile_output_after_topology_change_if_needed(
+                                    previous_output,
+                                    previous_usable,
+                                );
+                                state.end_pointer_hit_test_batch();
                             }
                             for command in commands {
                                 state.kms_render_command_sender.send(command).map_err(|_| {
@@ -3385,6 +3464,7 @@ struct SurfaceRecord {
     pending_popup_reposition: Option<PendingPopupReposition>,
     /// Adding a subsurface is double-buffered on its parent.
     parent_association_committed: bool,
+    committed_input_region: Option<CommittedInputRegion>,
     pixel_probe_logged: bool,
     logged_diagnostics: HashSet<SurfaceDiagnostic>,
 }
@@ -3407,6 +3487,101 @@ enum SurfaceDiagnostic {
     InvalidViewport,
     DmabufDescription,
     BufferImport,
+    InputRegionBoundingBox,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CommittedInputRegion {
+    Empty,
+    Operations(Vec<CommittedInputRegionOperation>),
+    BoundingBox(CommittedInputRect),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CommittedInputRegionOperation {
+    add: bool,
+    rect: CommittedInputRect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CommittedInputRect {
+    left: i64,
+    top: i64,
+    right: i64,
+    bottom: i64,
+}
+
+impl CommittedInputRect {
+    fn from_smithay(rect: Rectangle<i32, Logical>) -> Self {
+        let left = i64::from(rect.loc.x);
+        let top = i64::from(rect.loc.y);
+        Self {
+            left,
+            top,
+            right: left + i64::from(rect.size.w),
+            bottom: top + i64::from(rect.size.h),
+        }
+    }
+
+    fn contains(self, point: (i32, i32)) -> bool {
+        let (x, y) = (i64::from(point.0), i64::from(point.1));
+        x >= self.left && y >= self.top && x < self.right && y < self.bottom
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            left: self.left.min(other.left),
+            top: self.top.min(other.top),
+            right: self.right.max(other.right),
+            bottom: self.bottom.max(other.bottom),
+        }
+    }
+}
+
+impl CommittedInputRegion {
+    fn from_surface_attributes(attributes: &SurfaceAttributes) -> (Option<Self>, Option<usize>) {
+        let Some(region) = attributes.input_region.as_ref() else {
+            return (None, None);
+        };
+        if region.rects.is_empty() {
+            return (Some(Self::Empty), None);
+        }
+        if region.rects.len() <= MAX_COMMITTED_INPUT_REGION_RECTS {
+            let operations = region
+                .rects
+                .iter()
+                .map(|(kind, rect)| CommittedInputRegionOperation {
+                    add: matches!(kind, RectangleKind::Add),
+                    rect: CommittedInputRect::from_smithay(*rect),
+                })
+                .collect();
+            return (Some(Self::Operations(operations)), None);
+        }
+        let bounds = region
+            .rects
+            .iter()
+            .filter(|(kind, _)| matches!(kind, RectangleKind::Add))
+            .map(|(_, rect)| CommittedInputRect::from_smithay(*rect))
+            .reduce(CommittedInputRect::union);
+        (
+            Some(bounds.map_or(Self::Empty, Self::BoundingBox)),
+            Some(region.rects.len()),
+        )
+    }
+
+    fn contains(&self, point: (i32, i32)) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::BoundingBox(rect) => rect.contains(point),
+            Self::Operations(operations) => operations.iter().fold(false, |contains, operation| {
+                if operation.rect.contains(point) {
+                    operation.add
+                } else {
+                    contains
+                }
+            }),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -3468,6 +3643,8 @@ struct LayerRole {
     surface: DesktopLayerSurface,
     output: LayerOutputBinding,
     initial_layer: WlrLayer,
+    committed_layer: WlrLayer,
+    committed_keyboard_interactivity: KeyboardInteractivity,
 }
 
 enum LayerOutputBinding {
@@ -3831,7 +4008,18 @@ struct WaylandState {
     chrome_geometry_retarget_count: usize,
     #[cfg(test)]
     committed_window_state_transitions: Vec<bool>,
+    /// An applied Smithay transaction changed scene state that participates in
+    /// pointer hit testing. Reconcile only from `transaction_applied`, after
+    /// every surface in the transaction has made its state current.
+    pointer_hit_test_transaction_applying: bool,
+    pointer_hit_test_dirty: bool,
+    pointer_hit_test_batch_depth: u32,
+    pointer_grab_teardown_deferred: bool,
+    pointer_focus_local_position: Option<(ObjectId, (f64, f64))>,
+    #[cfg(test)]
+    pointer_hit_test_reconciliations: usize,
     interactive_pointer: Option<InteractivePointer>,
+    exclusive_keyboard_focus: Option<ObjectId>,
     minimized_toplevels: Vec<ObjectId>,
     surfaces: HashMap<ObjectId, SurfaceRecord>,
     buffer_history_surfaces: HashSet<ObjectId>,
@@ -3863,7 +4051,7 @@ struct WaylandState {
     pending_cursor_update: bool,
     next_surface_id: u64,
     next_layout_index: u32,
-    next_z: u32,
+    next_stack_sequences: [u64; StackBand::COUNT],
     next_buffer_token: u64,
     next_dmabuf_buffer_id: u64,
     dmabuf_buffer_ids: HashMap<ObjectId, DmabufBufferId>,
@@ -4855,9 +5043,18 @@ impl WaylandState {
         update: impl FnOnce(&mut LayerMap) -> R,
     ) -> R {
         let output_origin = output.current_location();
-        let existing = {
+        let (existing, geometry_before) = {
             let layer_map = layer_map_for_output(output);
-            layer_map.layers().cloned().collect::<Vec<_>>()
+            let existing = layer_map.layers().cloned().collect::<Vec<_>>();
+            let geometry = existing
+                .iter()
+                .filter_map(|layer| {
+                    layer_map
+                        .layer_geometry(layer)
+                        .map(|geometry| (layer.wl_surface().id(), geometry))
+                })
+                .collect::<HashMap<_, _>>();
+            (existing, geometry)
         };
         let configured = existing
             .iter()
@@ -4886,17 +5083,16 @@ impl WaylandState {
                 .layers()
                 .filter_map(|layer| {
                     let geometry = layer_map.layer_geometry(layer)?;
-                    Some((
-                        layer.clone(),
-                        (
-                            output_origin.x + geometry.loc.x,
-                            output_origin.y + geometry.loc.y,
-                        ),
-                    ))
+                    Some((layer.clone(), geometry))
                 })
                 .collect::<Vec<_>>();
             (result, arranged)
         };
+        let geometry_after = arranged
+            .iter()
+            .map(|(layer, geometry)| (layer.wl_surface().id(), *geometry))
+            .collect::<HashMap<_, _>>();
+        let geometry_changed = geometry_before != geometry_after;
 
         for layer in &configured {
             compositor::with_states(layer.wl_surface(), |states| {
@@ -4923,14 +5119,17 @@ impl WaylandState {
         }
 
         let mut moved_roots = Vec::new();
-        for (layer, location) in arranged {
+        for (layer, geometry) in arranged {
             let Some(record) = self.surfaces.get_mut(&layer.wl_surface().id()) else {
                 continue;
             };
             if !matches!(record.role, SurfaceRole::Layer(_)) {
                 continue;
             }
-            let location = (location.0 as f32, location.1 as f32);
+            let location = (
+                (output_origin.x + geometry.loc.x) as f32,
+                (output_origin.y + geometry.loc.y) as f32,
+            );
             if (record.layout.x, record.layout.y) == location {
                 continue;
             }
@@ -4948,6 +5147,9 @@ impl WaylandState {
         }
         for (root, delta) in moved_roots {
             self.shift_surface_descendants(root, delta);
+        }
+        if geometry_changed {
+            self.invalidate_pointer_hit_test_geometry();
         }
         result
     }
@@ -5047,6 +5249,7 @@ impl WaylandState {
     }
 
     fn ensure_layer_mapped_and_arranged(&mut self, surface: &WlSurface) {
+        let usable_before = self.usable_output_rect();
         let role = self.surfaces.get(&surface.id()).and_then(|record| {
             let SurfaceRole::Layer(role) = &record.role else {
                 return None;
@@ -5057,9 +5260,13 @@ impl WaylandState {
             return;
         };
         let _ = self.map_layer_on_output(&output, &layer);
+        if self.usable_output_rect() != usable_before {
+            self.reconfigure_window_states_for_output();
+        }
     }
 
     fn unmap_layer_from_output(&mut self, surface: &WlSurface) {
+        let usable_before = self.usable_output_rect();
         let role = self.surfaces.get(&surface.id()).and_then(|record| {
             let SurfaceRole::Layer(role) = &record.role else {
                 return None;
@@ -5068,6 +5275,9 @@ impl WaylandState {
         });
         if let Some((layer, output)) = role {
             self.update_layer_map(&output, |layer_map| layer_map.unmap_layer(&layer));
+        }
+        if self.usable_output_rect() != usable_before {
+            self.reconfigure_window_states_for_output();
         }
     }
 
@@ -5185,6 +5395,68 @@ impl WaylandState {
                 })
             )
         })
+    }
+
+    fn sync_layer_stack_band(&mut self, surface: &WlSurface) {
+        let Some(band) = self.surfaces.get(&surface.id()).and_then(|record| {
+            let SurfaceRole::Layer(role) = &record.role else {
+                return None;
+            };
+            Some(StackBand::for_layer(role.surface.cached_state().layer))
+        }) else {
+            return;
+        };
+        if self.surfaces[&surface.id()].layout.z.band == band {
+            return;
+        }
+        self.restack_role_tree(surface, band);
+    }
+
+    fn restack_role_tree(&mut self, surface: &WlSurface, band: StackBand) {
+        let Some(root_id) = record_root_id(&self.surfaces, &self.surface_objects, surface.id())
+        else {
+            return;
+        };
+        let objects = self
+            .surfaces
+            .keys()
+            .filter(|object| {
+                record_root_id(&self.surfaces, &self.surface_objects, (*object).clone())
+                    == Some(root_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut groups = objects
+            .iter()
+            .map(|object| {
+                let record = &self.surfaces[object];
+                (record.layout.z, object.clone())
+            })
+            .collect::<Vec<_>>();
+        groups.sort_unstable_by_key(|(key, _)| *key);
+        let mut next_keys = HashMap::new();
+        for (key, _) in &groups {
+            next_keys
+                .entry((key.band, key.sequence))
+                .or_insert_with(|| self.allocate_stack_key(band));
+        }
+        for (old_key, object) in groups {
+            let new_root = next_keys[&(old_key.band, old_key.sequence)];
+            if let Some(record) = self.surfaces.get_mut(&object) {
+                record.layout.z = SurfaceStackKey {
+                    tree_index: old_key.tree_index,
+                    ..new_root
+                };
+                if record.mapped {
+                    self.events.push(ProtocolEvent::SurfaceRelayout {
+                        id: record.id,
+                        scene: record.scene_snapshot(),
+                    });
+                }
+            }
+        }
+        self.refresh_committed_surface_stack(surface);
+        self.invalidate_pointer_hit_test();
     }
 
     fn validate_layer_surface_state(&self, surface: &WlSurface) -> Result<(), String> {
@@ -5958,9 +6230,9 @@ impl WaylandState {
         }
     }
 
-    fn commit_subsurface_stack(&mut self, parent: &WlSurface) {
+    fn commit_subsurface_stack(&mut self, parent: &WlSurface) -> bool {
         if !self.surfaces.contains_key(&parent.id()) {
-            return;
+            return false;
         }
         let mut stack = Vec::new();
         with_surface_tree_upward(
@@ -5986,6 +6258,7 @@ impl WaylandState {
         self.committed_surface_stacks.insert(parent.id(), stack);
 
         let children = compositor::get_children(parent);
+        let mut any_remapped = false;
         for child in children {
             if let Some(record) = self.surfaces.get_mut(&child.id())
                 && matches!(record.role, SurfaceRole::Subsurface { .. })
@@ -6005,15 +6278,68 @@ impl WaylandState {
                 record.parent_association_committed = true;
                 if remapped {
                     record.mapped = true;
+                    any_remapped = true;
                     let id = record.id;
                     self.pending_full_upserts.insert(id);
                 }
             }
         }
-        self.refresh_committed_surface_z(parent);
+        self.refresh_committed_surface_stack(parent);
+        any_remapped
     }
 
-    fn refresh_committed_surface_z(&mut self, surface: &WlSurface) {
+    fn allocate_stack_key(&mut self, band: StackBand) -> SurfaceStackKey {
+        let index = band.index();
+        if self.next_stack_sequences[index].checked_add(1).is_none() {
+            self.renormalize_stack_band(band);
+        }
+        let sequence = self.next_stack_sequences[index]
+            .checked_add(1)
+            .expect("dense stack renormalisation leaves room for one sequence");
+        self.next_stack_sequences[index] = sequence;
+        SurfaceStackKey::root(band, sequence)
+    }
+
+    fn renormalize_stack_band(&mut self, band: StackBand) {
+        let mut sequences = self
+            .surfaces
+            .values()
+            .filter(|record| record.layout.z.band == band)
+            .map(|record| record.layout.z.sequence)
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        sequences.dedup();
+        let dense = sequences
+            .into_iter()
+            .enumerate()
+            .map(|(index, sequence)| {
+                (
+                    sequence,
+                    u64::try_from(index + 1).expect("surface bound fits u64"),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for record in self
+            .surfaces
+            .values_mut()
+            .filter(|record| record.layout.z.band == band)
+        {
+            let sequence = dense[&record.layout.z.sequence];
+            if record.layout.z.sequence != sequence {
+                record.layout.z.sequence = sequence;
+                if record.mapped {
+                    self.events.push(ProtocolEvent::SurfaceRelayout {
+                        id: record.id,
+                        scene: record.scene_snapshot(),
+                    });
+                }
+            }
+        }
+        self.next_stack_sequences[band.index()] =
+            u64::try_from(dense.len()).expect("surface bound fits u64");
+    }
+
+    fn refresh_committed_surface_stack(&mut self, surface: &WlSurface) {
         let Some(root_id) = record_root_id(&self.surfaces, &self.surface_objects, surface.id())
         else {
             return;
@@ -6024,7 +6350,7 @@ impl WaylandState {
         let Some(base) = self
             .surfaces
             .get(&root_object)
-            .map(|record| record.layout.z.floor())
+            .map(|record| record.layout.z)
         else {
             return;
         };
@@ -6055,12 +6381,17 @@ impl WaylandState {
                 }
             }
         }
+        let mut stack_changed = false;
         for (index, object) in ordered.into_iter().enumerate() {
             let Some(record) = self.surfaces.get_mut(&object) else {
                 continue;
             };
-            let z = base + index as f32 * 0.001;
+            let z = SurfaceStackKey {
+                tree_index: u32::try_from(index).expect("surface tree bound fits u32"),
+                ..base
+            };
             if record.layout.z != z {
+                stack_changed = true;
                 record.layout.z = z;
                 if record.mapped {
                     self.events.push(ProtocolEvent::SurfaceRelayout {
@@ -6070,12 +6401,16 @@ impl WaylandState {
                 }
             }
         }
+        if stack_changed {
+            self.invalidate_pointer_hit_test();
+        }
     }
 
     fn clear_focus_for_surface(&mut self, surface: &WlSurface) {
-        if focus_is_surface(self.keyboard.current_focus().as_ref(), surface) {
-            let keyboard = self.keyboard.clone();
-            keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+        let clears_keyboard = focus_is_surface(self.keyboard.current_focus().as_ref(), surface)
+            || self.exclusive_keyboard_focus.as_ref() == Some(&surface.id());
+        if clears_keyboard {
+            self.arbitrate_keyboard_focus(None, false, true);
         }
 
         let pointer_focus_matches =
@@ -6087,6 +6422,13 @@ impl WaylandState {
             .is_some_and(|(focus, _)| focus == *surface);
         if pointer_focus_matches || pointer_grab_matches {
             let pointer = self.pointer.clone();
+            if self.pointer_hit_test_reconciliation_deferred() {
+                if pointer_grab_matches {
+                    self.pointer_grab_teardown_deferred = true;
+                }
+                self.mark_pointer_hit_test_dirty();
+                return;
+            }
             if pointer_grab_matches {
                 pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), monotonic_millis());
                 tracing::debug!(
@@ -6104,7 +6446,7 @@ impl WaylandState {
             let pointer = self.pointer.clone();
             pointer.motion(
                 self,
-                replacement,
+                replacement.clone(),
                 &MotionEvent {
                     location: (x, y).into(),
                     serial: SERIAL_COUNTER.next_serial(),
@@ -6112,6 +6454,7 @@ impl WaylandState {
                 },
             );
             pointer.frame(self);
+            self.record_pointer_focus_local_position(replacement.as_ref(), (x, y));
         }
     }
 
@@ -6809,7 +7152,7 @@ impl WaylandState {
         let pointer = self.pointer.clone();
         pointer.motion(
             self,
-            focus,
+            focus.clone(),
             &MotionEvent {
                 location: (x, y).into(),
                 serial: SERIAL_COUNTER.next_serial(),
@@ -6817,6 +7160,7 @@ impl WaylandState {
             },
         );
         pointer.frame(self);
+        self.record_pointer_focus_local_position(focus.as_ref(), (x, y));
     }
 
     /// Apply accelerated relative motion to the compositor's own cursor.
@@ -6914,13 +7258,10 @@ impl WaylandState {
             let focused = self
                 .surface_at(self.cursor_position.0, self.cursor_position.1)
                 .map(|record| record.role.wl_surface().clone());
-            let keyboard_focus = focused.as_ref().map(root_compositor_surface);
-            let keyboard = self.keyboard.clone();
-            keyboard.set_focus(self, keyboard_focus.clone(), SERIAL_COUNTER.next_serial());
-            if let Some(surface) = focused {
-                let root = root_compositor_surface(&surface);
-                self.raise_surface(&root);
+            if let Some(surface) = focused.as_ref() {
+                self.raise_for_focus_interaction(surface);
             }
+            self.arbitrate_keyboard_focus(focused, false, true);
         }
 
         let pointer = self.pointer.clone();
@@ -7033,14 +7374,11 @@ impl WaylandState {
         let (x, y) = clamp_point_to_seat((x, y), &self.backend.seat_regions());
         let focus = self.touch_focus_at(x, y);
         if !touch.is_grabbed() {
-            let keyboard_focus = focus
-                .as_ref()
-                .map(|(surface, _)| root_compositor_surface(surface));
-            let keyboard = self.keyboard.clone();
-            keyboard.set_focus(self, keyboard_focus.clone(), SERIAL_COUNTER.next_serial());
-            if let Some(root) = keyboard_focus {
-                self.raise_surface(&root);
+            let requested = focus.as_ref().map(|(surface, _)| surface.clone());
+            if let Some(surface) = requested.as_ref() {
+                self.raise_for_focus_interaction(surface);
             }
+            self.arbitrate_keyboard_focus(requested, false, true);
         }
         touch.down(
             self,
@@ -7361,13 +7699,174 @@ impl WaylandState {
         self.surfaces
             .values()
             .filter(|record| {
-                record.layout.visible
-                    && x >= f64::from(record.layout.x)
-                    && y >= f64::from(record.layout.y)
-                    && x < f64::from(record.layout.x + record.layout.width)
-                    && y < f64::from(record.layout.y + record.layout.height)
+                if !record.layout.visible
+                    || x < f64::from(record.layout.x)
+                    || y < f64::from(record.layout.y)
+                    || x >= f64::from(record.layout.x + record.layout.width)
+                    || y >= f64::from(record.layout.y + record.layout.height)
+                {
+                    return false;
+                }
+                let local = (
+                    (x - f64::from(record.layout.x)).floor() as i32,
+                    (y - f64::from(record.layout.y)).floor() as i32,
+                );
+                record
+                    .committed_input_region
+                    .as_ref()
+                    .is_none_or(|region| region.contains(local))
             })
             .max_by(|left, right| surface_stack_cmp(left, right))
+    }
+
+    fn refresh_committed_input_region(&mut self, surface: &WlSurface) -> bool {
+        let (region, bounded_fallback) = compositor::with_states(surface, |states| {
+            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+            CommittedInputRegion::from_surface_attributes(attributes.current())
+        });
+        let Some(record) = self.surfaces.get_mut(&surface.id()) else {
+            return false;
+        };
+        let changed = record.committed_input_region != region;
+        record.committed_input_region = region;
+        let warn = bounded_fallback.is_some()
+            && record
+                .logged_diagnostics
+                .insert(SurfaceDiagnostic::InputRegionBoundingBox);
+        if warn {
+            tracing::warn!(
+                surface_id = record.id.0,
+                surface = ?surface.id(),
+                rectangles = bounded_fallback.expect("fallback count was present"),
+                limit = MAX_COMMITTED_INPUT_REGION_RECTS,
+                "collapsed excessive input-region operations to their bounding box"
+            );
+        }
+        changed
+    }
+
+    fn reconcile_pointer_target(&mut self) {
+        let (x, y) = self.cursor_position;
+        let target = if self.pointer.is_grabbed() {
+            self.client_pointer_target_at(x, y)
+        } else {
+            self.pointer_target_at(x, y)
+        };
+        let current = self.pointer.current_focus().map(|surface| surface.id());
+        let next = match target.as_ref() {
+            Some(PointerTarget::Client { surface, .. }) => Some(surface.id()),
+            Some(PointerTarget::Chrome { .. }) | None => None,
+        };
+        if current != next {
+            self.retarget_pointer_after_visibility_change();
+        } else {
+            self.update_chrome_pointer_from_target(target.clone());
+            if let Some(PointerTarget::Client { surface, origin }) = target {
+                let local = (x - origin.x, y - origin.y);
+                let local_changed = self
+                    .pointer_focus_local_position
+                    .as_ref()
+                    .is_none_or(|(object, previous)| *object != surface.id() || *previous != local);
+                if !local_changed {
+                    return;
+                }
+                let pointer = self.pointer.clone();
+                pointer.motion(
+                    self,
+                    Some((surface.clone(), origin)),
+                    &MotionEvent {
+                        location: (x, y).into(),
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time: monotonic_millis(),
+                    },
+                );
+                pointer.frame(self);
+                self.pointer_focus_local_position = Some((surface.id(), local));
+            }
+        }
+    }
+
+    fn record_pointer_focus_local_position(
+        &mut self,
+        requested: Option<&(WlSurface, Point<f64, Logical>)>,
+        global: (f64, f64),
+    ) {
+        let current = self.pointer.current_focus();
+        let previous = self.pointer_focus_local_position.take();
+        self.pointer_focus_local_position = current.and_then(|current| {
+            if let Some((surface, origin)) = requested
+                && *surface == current
+            {
+                return Some((current.id(), (global.0 - origin.x, global.1 - origin.y)));
+            }
+            previous.filter(|(object, _)| *object == current.id())
+        });
+    }
+
+    fn mark_pointer_hit_test_dirty(&mut self) {
+        self.pointer_hit_test_dirty = true;
+    }
+
+    fn pointer_hit_test_reconciliation_deferred(&self) -> bool {
+        self.pointer_hit_test_transaction_applying || self.pointer_hit_test_batch_depth > 0
+    }
+
+    fn invalidate_pointer_hit_test(&mut self) {
+        self.mark_pointer_hit_test_dirty();
+        if !self.pointer_hit_test_reconciliation_deferred() {
+            self.reconcile_deferred_pointer_hit_test();
+        }
+    }
+
+    fn invalidate_pointer_hit_test_geometry(&mut self) {
+        self.invalidate_pointer_hit_test();
+    }
+
+    fn begin_pointer_hit_test_batch(&mut self) {
+        self.pointer_hit_test_batch_depth = self.pointer_hit_test_batch_depth.saturating_add(1);
+    }
+
+    fn end_pointer_hit_test_batch(&mut self) {
+        self.pointer_hit_test_batch_depth = self.pointer_hit_test_batch_depth.saturating_sub(1);
+        if !self.pointer_hit_test_reconciliation_deferred() {
+            self.reconcile_deferred_pointer_hit_test();
+        }
+    }
+
+    fn defer_or_cancel_pointer_grab_for_focus_policy(&mut self) {
+        if self.pointer_hit_test_reconciliation_deferred() {
+            self.pointer_grab_teardown_deferred = true;
+            self.mark_pointer_hit_test_dirty();
+            return;
+        }
+        let pointer = self.pointer.clone();
+        pointer.unset_grab_without_focus_restore(
+            self,
+            SERIAL_COUNTER.next_serial(),
+            monotonic_millis(),
+        );
+        self.invalidate_pointer_hit_test();
+    }
+
+    fn reconcile_deferred_pointer_hit_test(&mut self) {
+        let teardown_grab = mem::take(&mut self.pointer_grab_teardown_deferred);
+        if teardown_grab {
+            let pointer = self.pointer.clone();
+            pointer.unset_grab_without_focus_restore(
+                self,
+                SERIAL_COUNTER.next_serial(),
+                monotonic_millis(),
+            );
+        }
+        if !mem::take(&mut self.pointer_hit_test_dirty) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.pointer_hit_test_reconciliations =
+                self.pointer_hit_test_reconciliations.saturating_add(1);
+        }
+        self.reconcile_pointer_target();
     }
 
     fn client_pointer_target_at(&self, x: f64, y: f64) -> Option<PointerTarget> {
@@ -7562,9 +8061,8 @@ impl WaylandState {
             return false;
         }
 
-        let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, Some(surface.clone()), SERIAL_COUNTER.next_serial());
         self.raise_surface(&surface);
+        self.arbitrate_keyboard_focus(Some(surface.clone()), false, false);
         self.chrome_pointer_grab = Some(ChromePointerGrab {
             surface: surface.clone(),
             button,
@@ -7839,29 +8337,196 @@ impl WaylandState {
     }
 
     fn raise_surface(&mut self, surface: &WlSurface) {
-        let Some(record) = self.surfaces.get_mut(&surface.id()) else {
+        let Some(band) = self
+            .surfaces
+            .get(&surface.id())
+            .map(|record| record.layout.z.band)
+        else {
             return;
         };
-        self.next_z = self.next_z.saturating_add(1);
-        record.layout.z = self.next_z as f32;
-        self.events.push(ProtocolEvent::SurfaceRelayout {
-            id: record.id,
-            scene: record.scene_snapshot(),
-        });
-        self.refresh_committed_surface_z(surface);
+        self.restack_role_tree(surface, band);
+    }
+
+    fn layer_root_object_for_surface(&self, surface: &WlSurface) -> Option<ObjectId> {
+        let mut object = surface.id();
+        let mut visited = HashSet::new();
+        while visited.insert(object.clone()) {
+            let record = self.surfaces.get(&object)?;
+            if matches!(record.role, SurfaceRole::Layer(_)) {
+                return Some(object);
+            }
+            let parent = record.layout.parent?;
+            object = self.surface_objects.get(&parent)?.clone();
+        }
+        None
+    }
+
+    fn layer_keyboard_interactivity_for_surface(
+        &self,
+        surface: &WlSurface,
+    ) -> Option<KeyboardInteractivity> {
+        let root = self.layer_root_object_for_surface(surface)?;
+        let SurfaceRole::Layer(role) = &self.surfaces.get(&root)?.role else {
+            return None;
+        };
+        Some(role.surface.cached_state().keyboard_interactivity)
+    }
+
+    fn sync_committed_layer_focus_policy(&mut self, surface: &WlSurface) -> bool {
+        let Some(record) = self.surfaces.get_mut(&surface.id()) else {
+            return false;
+        };
+        let SurfaceRole::Layer(role) = &mut record.role else {
+            return false;
+        };
+        let state = role.surface.cached_state();
+        let changed = role.committed_layer != state.layer
+            || role.committed_keyboard_interactivity != state.keyboard_interactivity;
+        role.committed_layer = state.layer;
+        role.committed_keyboard_interactivity = state.keyboard_interactivity;
+        changed
+    }
+
+    fn highest_exclusive_layer(&self) -> Option<(ObjectId, WlSurface)> {
+        self.surfaces
+            .iter()
+            .filter_map(|(object, record)| {
+                let SurfaceRole::Layer(role) = &record.role else {
+                    return None;
+                };
+                (record.mapped
+                    && record.layout.visible
+                    && role.surface.cached_state().keyboard_interactivity
+                        == KeyboardInteractivity::Exclusive)
+                    .then_some((object.clone(), role.surface.wl_surface().clone(), record))
+            })
+            .max_by(|(_, _, left), (_, _, right)| surface_stack_cmp(left, right))
+            .map(|(object, surface, _)| (object, surface))
+    }
+
+    fn highest_visible_toplevel_surface(&self) -> Option<WlSurface> {
+        self.surfaces
+            .values()
+            .filter(|record| {
+                record.mapped
+                    && record.layout.visible
+                    && matches!(record.role, SurfaceRole::Toplevel(_))
+            })
+            .max_by(|left, right| surface_stack_cmp(left, right))
+            .map(|record| record.role.wl_surface().clone())
+    }
+
+    fn interaction_focus_root(&self, surface: &WlSurface) -> Option<WlSurface> {
+        if let Some(layer_root) = self.layer_root_object_for_surface(surface) {
+            return self
+                .surfaces
+                .get(&layer_root)
+                .map(|record| record.role.wl_surface().clone());
+        }
+        Some(root_compositor_surface(surface))
+    }
+
+    fn raise_for_focus_interaction(&mut self, surface: &WlSurface) {
+        if self.layer_keyboard_interactivity_for_surface(surface)
+            == Some(KeyboardInteractivity::None)
+        {
+            return;
+        }
+        if let Some(root) = self.interaction_focus_root(surface) {
+            self.raise_surface(&root);
+        }
+    }
+
+    /// Resolve every keyboard-focus entry point through layer-shell policy.
+    /// `requested` is an interaction target; `fallback` asks for the highest
+    /// normal toplevel when no Exclusive layer is mapped.
+    fn arbitrate_keyboard_focus(
+        &mut self,
+        requested: Option<WlSurface>,
+        fallback: bool,
+        clear_if_unrequested: bool,
+    ) {
+        let previous_exclusive = self.exclusive_keyboard_focus.take();
+        let current_layer_became_none =
+            self.keyboard.current_focus().as_ref().is_some_and(|focus| {
+                self.layer_keyboard_interactivity_for_surface(focus)
+                    == Some(KeyboardInteractivity::None)
+            });
+        let target = if let Some((object, surface)) = self.highest_exclusive_layer() {
+            self.exclusive_keyboard_focus = Some(object);
+            Some(surface)
+        } else {
+            let requested = match requested {
+                Some(surface)
+                    if self.layer_keyboard_interactivity_for_surface(&surface)
+                        == Some(KeyboardInteractivity::None) =>
+                {
+                    // A non-interactive layer receives pointer/touch events but
+                    // must not disturb whichever surface owns the keyboard.
+                    return;
+                }
+                Some(surface) => self.interaction_focus_root(&surface),
+                None => None,
+            };
+            if requested.is_some() {
+                requested
+            } else if fallback || current_layer_became_none || previous_exclusive.is_some() {
+                self.highest_visible_toplevel_surface()
+            } else if clear_if_unrequested {
+                None
+            } else {
+                return;
+            }
+        };
+        if self.keyboard.current_focus() == target
+            || self.keyboard_focus_is_related_grabbing_popup(target.as_ref())
+        {
+            return;
+        }
+        if self.keyboard.is_grabbed() {
+            let popup_root = self
+                .keyboard
+                .grab_start_data()
+                .and_then(|start| start.focus);
+            let keyboard = self.keyboard.clone();
+            keyboard.unset_grab(self);
+            if let Some(root) = popup_root {
+                let pointer_grabs_root = self
+                    .pointer
+                    .grab_start_data()
+                    .and_then(|start| start.focus)
+                    .is_some_and(|(focus, _)| focus == root);
+                if pointer_grabs_root {
+                    self.defer_or_cancel_pointer_grab_for_focus_policy();
+                }
+                self.dismiss_popup_descendants(&root);
+            }
+        }
+        let keyboard = self.keyboard.clone();
+        keyboard.set_focus(self, target, SERIAL_COUNTER.next_serial());
+    }
+
+    fn keyboard_focus_is_related_grabbing_popup(&self, target: Option<&WlSurface>) -> bool {
+        let Some(target) = target else {
+            return false;
+        };
+        let Some(current) = self.keyboard.current_focus() else {
+            return false;
+        };
+        let Some(grab_root) = self
+            .keyboard
+            .grab_start_data()
+            .and_then(|start| start.focus)
+        else {
+            return false;
+        };
+        let target_root = canonical_root_surface(&self.popup_manager, target);
+        canonical_root_surface(&self.popup_manager, &grab_root) == target_root
+            && canonical_root_surface(&self.popup_manager, &current) == target_root
     }
 
     fn focus_highest_visible_toplevel(&mut self) {
-        let surface = self
-            .surfaces
-            .values()
-            .filter(|record| {
-                record.layout.visible && matches!(record.role, SurfaceRole::Toplevel(_))
-            })
-            .max_by(|left, right| surface_stack_cmp(left, right))
-            .map(|record| record.role.wl_surface().clone());
-        let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, surface, SERIAL_COUNTER.next_serial());
+        self.arbitrate_keyboard_focus(None, true, false);
     }
 
     fn retarget_pointer_after_visibility_change(&mut self) {
@@ -7879,7 +8544,7 @@ impl WaylandState {
         let pointer = self.pointer.clone();
         pointer.motion(
             self,
-            focus,
+            focus.clone(),
             &MotionEvent {
                 location: (x, y).into(),
                 serial: SERIAL_COUNTER.next_serial(),
@@ -7887,6 +8552,7 @@ impl WaylandState {
             },
         );
         pointer.frame(self);
+        self.record_pointer_focus_local_position(focus.as_ref(), (x, y));
     }
 
     fn minimize_toplevel(&mut self, surface: &WlSurface) {
@@ -7929,8 +8595,7 @@ impl WaylandState {
             };
             self.recompute_effective_visibility();
             self.raise_surface(&surface);
-            let keyboard = self.keyboard.clone();
-            keyboard.set_focus(self, Some(surface), SERIAL_COUNTER.next_serial());
+            self.arbitrate_keyboard_focus(Some(surface), false, false);
             self.retarget_pointer_after_visibility_change();
             return;
         }
@@ -7946,10 +8611,28 @@ impl WaylandState {
         }
     }
 
+    fn usable_output_rect(&self) -> LogicalOutputRect {
+        let Some(output) = self.backend.default_output() else {
+            return self.logical_output_rect();
+        };
+        let layer_map = layer_map_for_output(&output);
+        if layer_map.layers().next().is_none() {
+            return self.logical_output_rect();
+        }
+        let zone = layer_map.non_exclusive_zone();
+        let origin = output.current_location();
+        LogicalOutputRect {
+            x: (origin.x + zone.loc.x) as f32,
+            y: (origin.y + zone.loc.y) as f32,
+            width: zone.size.w.max(0) as f32,
+            height: zone.size.h.max(0) as f32,
+        }
+    }
+
     fn request_maximized_state(&mut self, surface: &WlSurface, maximized: bool) {
         self.cancel_chrome_pointer_grab_for_surface(surface, true);
         self.titlebar_click_candidate = None;
-        let output = self.logical_output_rect();
+        let output = self.usable_output_rect();
         let extents = DecoExtents::of(&self.decoration.theme);
         let theme = self.decoration.theme.clone();
         let configured_server_side = compositor::with_states(surface, |states| {
@@ -8070,13 +8753,37 @@ impl WaylandState {
         }
     }
 
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    fn reconcile_output_after_topology_change_if_needed(
+        &mut self,
+        previous_output: LogicalOutputRect,
+        previous_usable: LogicalOutputRect,
+    ) {
+        if self.logical_output_rect() != previous_output
+            || self.usable_output_rect() != previous_usable
+        {
+            self.reconcile_output_geometry_after_topology_change();
+        }
+    }
+
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    fn reconcile_output_geometry_after_topology_change(&mut self) {
+        self.begin_pointer_hit_test_batch();
+        self.arrange_all_layer_outputs();
+        self.reconfigure_window_states_for_output();
+        self.invalidate_pointer_hit_test_geometry();
+        self.end_pointer_hit_test_batch();
+    }
+
     fn resize_output(&mut self, width: u32, height: u32) {
         if !self.backend.resize_host_output((width, height)) {
             return;
         }
         self.events
             .push(ProtocolEvent::OutputResized { width, height });
+        self.begin_pointer_hit_test_batch();
         self.arrange_all_layer_outputs();
+        let usable = self.usable_output_rect();
 
         let mut shifted_roots = Vec::new();
         let mut configure_surfaces = Vec::new();
@@ -8106,13 +8813,11 @@ impl WaylandState {
                     record.window_origin.0 - extents.left,
                     record.window_origin.1 - extents.top,
                 );
+                let max_x = (usable.x + usable.width - window.w - OUTPUT_MARGIN).max(usable.x);
+                let max_y = (usable.y + usable.height - window.h - OUTPUT_MARGIN).max(usable.y);
                 let clamped = (
-                    outer_origin
-                        .0
-                        .min((width as f32 - window.w - OUTPUT_MARGIN).max(0.0)),
-                    outer_origin
-                        .1
-                        .min((height as f32 - window.h - OUTPUT_MARGIN).max(0.0)),
+                    outer_origin.0.clamp(usable.x, max_x),
+                    outer_origin.1.clamp(usable.y, max_y),
                 );
                 let delta = (clamped.0 - outer_origin.0, clamped.1 - outer_origin.1);
                 record.layout.x += delta.0;
@@ -8122,14 +8827,12 @@ impl WaylandState {
                 delta
             } else {
                 let previous_origin = (record.layout.x, record.layout.y);
-                record.layout.x = record
-                    .layout
-                    .x
-                    .min((width as f32 - record.layout.width - OUTPUT_MARGIN).max(0.0));
-                record.layout.y = record
-                    .layout
-                    .y
-                    .min((height as f32 - record.layout.height - OUTPUT_MARGIN).max(0.0));
+                let max_x =
+                    (usable.x + usable.width - record.layout.width - OUTPUT_MARGIN).max(usable.x);
+                let max_y =
+                    (usable.y + usable.height - record.layout.height - OUTPUT_MARGIN).max(usable.y);
+                record.layout.x = record.layout.x.clamp(usable.x, max_x);
+                record.layout.y = record.layout.y.clamp(usable.y, max_y);
                 record.window_origin.0 += record.layout.x - previous_origin.0;
                 record.window_origin.1 += record.layout.y - previous_origin.1;
                 (
@@ -8148,14 +8851,14 @@ impl WaylandState {
                     record.window_origin.1 - extents.top,
                 );
                 let available = extents.content_size_for_window(vec2(
-                    width as f32 - outer_origin.0 - OUTPUT_MARGIN,
-                    height as f32 - outer_origin.1 - OUTPUT_MARGIN,
+                    usable.x + usable.width - outer_origin.0 - OUTPUT_MARGIN,
+                    usable.y + usable.height - outer_origin.1 - OUTPUT_MARGIN,
                 ));
                 (available.x.max(240.0) as i32, available.y.max(160.0) as i32)
             } else {
                 (
-                    (width as f32 - record.layout.x - OUTPUT_MARGIN).max(240.0) as i32,
-                    (height as f32 - record.layout.y - OUTPUT_MARGIN).max(160.0) as i32,
+                    (usable.x + usable.width - record.layout.x - OUTPUT_MARGIN).max(240.0) as i32,
+                    (usable.y + usable.height - record.layout.y - OUTPUT_MARGIN).max(160.0) as i32,
                 )
             };
             let new_size = (
@@ -8186,7 +8889,8 @@ impl WaylandState {
             let _ = self.send_pending_toplevel_configure(&surface, true);
         }
         self.reconfigure_window_states_for_output();
-        self.refresh_chrome_pointer_after_scene_change();
+        self.invalidate_pointer_hit_test_geometry();
+        self.end_pointer_hit_test_batch();
     }
 
     fn change_output_scale(&mut self, scale: f64) {
@@ -8446,7 +9150,7 @@ impl WaylandState {
                 y: window_origin.1,
                 width: geometry.size.w as f32,
                 height: geometry.size.h as f32,
-                z: self.next_z as f32,
+                z: parent.layout.z,
                 source: None,
                 parent: Some(parent.id),
                 transform: SurfaceTransform::Normal,
@@ -9559,7 +10263,7 @@ fn focus_is_surface<T: PartialEq>(focus: Option<&T>, surface: &T) -> bool {
 fn surface_stack_cmp(left: &SurfaceRecord, right: &SurfaceRecord) -> std::cmp::Ordering {
     left.layout
         .z
-        .total_cmp(&right.layout.z)
+        .cmp(&right.layout.z)
         .then_with(|| left.id.0.cmp(&right.id.0))
 }
 
@@ -9569,9 +10273,6 @@ fn clamp_normal_restore(
     server_side: bool,
     theme: &DecoTheme,
 ) -> NormalRestore {
-    if restore.output == output {
-        return restore;
-    }
     let extents = DecoExtents::of(theme);
     let available_content = if server_side {
         extents.content_size_for_window(vec2(output.width, output.height))
@@ -9728,14 +10429,15 @@ fn set_toplevel_configuration(surface: &ToplevelSurface, size: (i32, i32)) {
     });
 }
 
-fn sensible_toplevel_size(output: (u32, u32), x: f32, y: f32) -> (i32, i32) {
-    let max_width = (output.0 as f32 - x - OUTPUT_MARGIN).max(240.0) as i32;
-    let max_height = (output.1 as f32 - y - OUTPUT_MARGIN).max(160.0) as i32;
+fn sensible_toplevel_size(output: impl Into<LogicalOutputRect>, x: f32, y: f32) -> (i32, i32) {
+    let output = output.into();
+    let max_width = (output.x + output.width - x - OUTPUT_MARGIN).max(240.0) as i32;
+    let max_height = (output.y + output.height - y - OUTPUT_MARGIN).max(160.0) as i32;
     // Clients honour this configure, so a fixed 640x420 gave a real browser a
     // 210-logical-pixel viewport on a 1080p nested output. Scale to the output
     // and keep the fixed size only as a floor for small outputs.
-    let share_width = (output.0 as f32 * DEFAULT_TOPLEVEL_OUTPUT_SHARE) as i32;
-    let share_height = (output.1 as f32 * DEFAULT_TOPLEVEL_OUTPUT_SHARE) as i32;
+    let share_width = (output.width * DEFAULT_TOPLEVEL_OUTPUT_SHARE) as i32;
+    let share_height = (output.height * DEFAULT_TOPLEVEL_OUTPUT_SHARE) as i32;
     (
         share_width.max(DEFAULT_TOPLEVEL_WIDTH).min(max_width),
         share_height.max(DEFAULT_TOPLEVEL_HEIGHT).min(max_height),

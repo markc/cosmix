@@ -5609,8 +5609,8 @@ pub(crate) mod tests {
         },
         backend::worker::KmsRenderWorkerExit,
         protocol::{
-            ProtocolEvent, ShmFrame, SurfaceFrame, SurfaceId, SurfaceLayout, SurfaceTransform,
-            WaylandRuntime,
+            ProtocolEvent, ShmFrame, SurfaceFrame, SurfaceId, SurfaceLayout, SurfaceStackKey,
+            SurfaceTransform, WaylandRuntime,
         },
     };
 
@@ -6060,7 +6060,7 @@ pub(crate) mod tests {
                     y: 18.0,
                     width: 64.0,
                     height: 48.0,
-                    z: 1.0,
+                    z: SurfaceStackKey::normal(1),
                     source: None,
                     parent: None,
                     transform: SurfaceTransform::Normal,

@@ -274,6 +274,7 @@ impl Transaction {
 
             state.commit(&surface);
         }
+        state.transaction_applied();
     }
 }
 

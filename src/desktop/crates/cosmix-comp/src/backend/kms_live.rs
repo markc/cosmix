@@ -10478,7 +10478,7 @@ mod tests {
             y: 0.0,
             width: 1.0,
             height: 1.0,
-            z: 0.0,
+            z: crate::protocol::SurfaceStackKey::normal(0),
             source: None,
             parent: None,
             transform: crate::protocol::SurfaceTransform::Normal,

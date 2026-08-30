@@ -17,6 +17,8 @@ use cosmix_deco::{
 use fontique::{FamilyId, GenericFamily};
 use unicode_segmentation::UnicodeSegmentation;
 
+#[cfg(test)]
+use crate::protocol::SurfaceStackKey;
 use crate::{
     chrome_frame_material::{ChromeFrameMaterial, ChromeFrameMaterialPlugin},
     compositor_scene::{
@@ -2154,7 +2156,7 @@ mod tests {
             y,
             width: 320.0,
             height: 200.0,
-            z,
+            z: SurfaceStackKey::normal(z as u64),
             source: None,
             parent: None,
             transform: SurfaceTransform::Normal,
@@ -2180,7 +2182,7 @@ mod tests {
             y: 130.0,
             width: 80.0,
             height: 50.0,
-            z,
+            z: SurfaceStackKey::normal(z as u64),
             source: None,
             parent: Some(parent),
             transform: SurfaceTransform::Normal,
@@ -2777,12 +2779,12 @@ mod tests {
         let nested_subsurface = SurfaceId(3);
         let popup = SurfaceId(4);
         let popup_child = SurfaceId(5);
-        let child_layout = |parent, x, y, z| SurfaceLayout {
+        let child_layout = |parent, x, y, z: f32| SurfaceLayout {
             x,
             y,
             width: 80.0,
             height: 50.0,
-            z,
+            z: SurfaceStackKey::normal(z as u64),
             source: None,
             parent: Some(parent),
             transform: SurfaceTransform::Normal,
@@ -2858,7 +2860,7 @@ mod tests {
                 y: 40.0,
                 width: 80.0,
                 height: 40.0,
-                z: 1.0,
+                z: SurfaceStackKey::normal(1),
                 source: None,
                 parent: None,
                 transform,

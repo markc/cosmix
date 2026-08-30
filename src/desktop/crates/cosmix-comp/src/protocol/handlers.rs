@@ -81,9 +81,20 @@ impl CompositorHandler for WaylandState {
 
         let parent_record = self.surfaces.get(&parent.id());
         let parent_id = parent_record.map(|record| record.id);
-        let (x, y, z) = parent_record
-            .map(|record| (record.layout.x, record.layout.y, record.layout.z + 0.001))
-            .unwrap_or((0.0, 0.0, self.next_z as f32));
+        let parent_layout = parent_record.map(|record| record.layout);
+        let (x, y, z) = parent_layout.map_or_else(
+            || (0.0, 0.0, self.allocate_stack_key(StackBand::Normal)),
+            |layout| {
+                (
+                    layout.x,
+                    layout.y,
+                    SurfaceStackKey {
+                        tree_index: layout.z.tree_index.saturating_add(1),
+                        ..layout.z
+                    },
+                )
+            },
+        );
         let layout = SurfaceLayout {
             x,
             y,
@@ -190,6 +201,7 @@ impl CompositorHandler for WaylandState {
                     committed_window_geometry_explicit: false,
                     pending_popup_reposition: None,
                     parent_association_committed: false,
+                    committed_input_region: None,
                     pixel_probe_logged: false,
                     logged_diagnostics: HashSet::new(),
                 },
@@ -217,11 +229,25 @@ impl CompositorHandler for WaylandState {
         // Smithay invokes this handler only when a transaction is applied.
         // Synchronized-child commits remain counted while cached under their
         // parent, then reset here when the parent makes them current.
+        self.pointer_hit_test_transaction_applying = true;
         self.damage_requests_since_apply.remove(&surface.id());
         self.popup_manager.commit(surface);
         let scene_commit = current_scene_commit_state(surface);
+        let mapped_before = self
+            .surfaces
+            .get(&surface.id())
+            .is_some_and(|record| record.mapped);
+        let hit_test_geometry_before = self.surfaces.get(&surface.id()).map(|record| {
+            (
+                record.layout.x.to_bits(),
+                record.layout.y.to_bits(),
+                record.layout.width.to_bits(),
+                record.layout.height.to_bits(),
+                record.layout.z,
+            )
+        });
         self.refresh_subsurface_position(surface);
-        self.commit_subsurface_stack(surface);
+        let subsurface_remapped = self.commit_subsurface_stack(surface);
         // A committed roleless surface may become a cursor later: Wayland
         // permits attach + commit before wl_pointer.set_cursor assigns the
         // cursor role. Keep its buffer and frame callbacks in Smithay's current
@@ -239,6 +265,13 @@ impl CompositorHandler for WaylandState {
                     .clear();
             });
             return;
+        }
+        let input_region_changed = self.refresh_committed_input_region(surface);
+        if subsurface_remapped {
+            self.recompute_effective_visibility();
+        }
+        if input_region_changed || subsurface_remapped {
+            self.mark_pointer_hit_test_dirty();
         }
         let (buffer, mut damage, buffer_scale, buffer_transform, buffer_delta) =
             compositor::with_states(surface, |states| {
@@ -341,6 +374,7 @@ impl CompositorHandler for WaylandState {
             self.unmap_layer_from_output(surface);
             self.reset_configure_sequence(surface);
         } else if self.layer_output_for_surface(surface).is_some() {
+            self.sync_layer_stack_band(surface);
             if let Err(error) = self.validate_layer_surface_state(surface) {
                 if let Some(BufferAssignment::NewBuffer(buffer)) = buffer {
                     self.retire_buffer_immediately(buffer);
@@ -541,6 +575,35 @@ impl CompositorHandler for WaylandState {
             self.refresh_ancestor_window_geometry(surface);
         }
         self.recompute_effective_visibility();
+        let mapped_after = self
+            .surfaces
+            .get(&surface.id())
+            .is_some_and(|record| record.mapped);
+        let hit_test_geometry_after = self.surfaces.get(&surface.id()).map(|record| {
+            (
+                record.layout.x.to_bits(),
+                record.layout.y.to_bits(),
+                record.layout.width.to_bits(),
+                record.layout.height.to_bits(),
+                record.layout.z,
+            )
+        });
+        if mapped_before != mapped_after || hit_test_geometry_before != hit_test_geometry_after {
+            self.mark_pointer_hit_test_dirty();
+        }
+        let is_layer = self
+            .surfaces
+            .get(&surface.id())
+            .is_some_and(|record| matches!(record.role, SurfaceRole::Layer(_)));
+        let layer_focus_policy_changed = self.sync_committed_layer_focus_policy(surface);
+        if is_layer && (mapped_before != mapped_after || layer_focus_policy_changed) {
+            self.arbitrate_keyboard_focus(None, false, false);
+        }
+    }
+
+    fn transaction_applied(&mut self) {
+        self.pointer_hit_test_transaction_applying = false;
+        self.reconcile_deferred_pointer_hit_test();
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
@@ -601,13 +664,13 @@ impl WlrLayerShellHandler for WaylandState {
             .map(Output::current_location)
             .unwrap_or_default();
 
-        self.next_z = self.next_z.saturating_add(1);
+        let z = self.allocate_stack_key(StackBand::for_layer(layer));
         let layout = SurfaceLayout {
             x: output_origin.x as f32,
             y: output_origin.y as f32,
             width: 1.0,
             height: 1.0,
-            z: self.next_z as f32,
+            z,
             source: None,
             parent: None,
             transform: SurfaceTransform::Normal,
@@ -618,6 +681,8 @@ impl WlrLayerShellHandler for WaylandState {
             surface: desktop_surface.clone(),
             output: output_binding,
             initial_layer: layer,
+            committed_layer: layer,
+            committed_keyboard_interactivity: KeyboardInteractivity::None,
         };
         let id = if let Some(record) = self.surfaces.get_mut(&surface_object) {
             let id = record.id;
@@ -678,6 +743,7 @@ impl WlrLayerShellHandler for WaylandState {
                     committed_window_geometry_explicit: false,
                     pending_popup_reposition: None,
                     parent_association_committed: true,
+                    committed_input_region: None,
                     pixel_probe_logged: false,
                     logged_diagnostics: HashSet::new(),
                 },
@@ -776,21 +842,7 @@ impl WlrLayerShellHandler for WaylandState {
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
-        let role = self
-            .surfaces
-            .get(&surface.wl_surface().id())
-            .and_then(|record| {
-                let SurfaceRole::Layer(role) = &record.role else {
-                    return None;
-                };
-                Some((role.surface.clone(), role.output.output().cloned()))
-            });
-        let Some((desktop_surface, output)) = role else {
-            return;
-        };
-        if let Some(output) = output.as_ref() {
-            self.update_layer_map(output, |layer_map| layer_map.unmap_layer(&desktop_surface));
-        }
+        self.unmap_layer_from_output(surface.wl_surface());
         self.deactivate_surface_role(surface.wl_surface());
     }
 }
@@ -810,18 +862,17 @@ impl XdgShellHandler for WaylandState {
 
         let cascade = self.next_layout_index % 6;
         self.next_layout_index = self.next_layout_index.saturating_add(1);
-        self.next_z = self.next_z.saturating_add(1);
-        let configured_size = sensible_toplevel_size(
-            self.backend.logical_output_size(),
-            CASCADE_ORIGIN + cascade as f32 * CASCADE_STEP,
-            CASCADE_ORIGIN + cascade as f32 * CASCADE_STEP,
-        );
+        let z = self.allocate_stack_key(StackBand::Normal);
+        let usable = self.usable_output_rect();
+        let x = usable.x + CASCADE_ORIGIN + cascade as f32 * CASCADE_STEP;
+        let y = usable.y + CASCADE_ORIGIN + cascade as f32 * CASCADE_STEP;
+        let configured_size = sensible_toplevel_size(usable, x, y);
         let layout = SurfaceLayout {
-            x: CASCADE_ORIGIN + cascade as f32 * CASCADE_STEP,
-            y: CASCADE_ORIGIN + cascade as f32 * CASCADE_STEP,
+            x,
+            y,
             width: configured_size.0 as f32,
             height: configured_size.1 as f32,
-            z: self.next_z as f32,
+            z,
             source: None,
             parent: None,
             transform: SurfaceTransform::Normal,
@@ -888,6 +939,7 @@ impl XdgShellHandler for WaylandState {
                     committed_window_geometry_explicit: false,
                     pending_popup_reposition: None,
                     parent_association_committed: true,
+                    committed_input_region: None,
                     pixel_probe_logged: false,
                     logged_diagnostics: HashSet::new(),
                 },
@@ -965,7 +1017,11 @@ impl XdgShellHandler for WaylandState {
             surface.send_popup_done();
             return;
         }
-        self.next_z = self.next_z.saturating_add(1);
+        let band = self
+            .surfaces
+            .get(&parent.id())
+            .map_or(StackBand::Normal, |record| record.layout.z.band);
+        let z = self.allocate_stack_key(band);
         let Some(ResolvedPopupGeometry {
             geometry,
             mut layout,
@@ -980,7 +1036,7 @@ impl XdgShellHandler for WaylandState {
             surface.send_popup_done();
             return;
         };
-        layout.z = self.next_z as f32;
+        layout.z = z;
         surface.with_pending_state(|state| {
             state.positioner = positioner;
             state.geometry = geometry;
@@ -1053,6 +1109,7 @@ impl XdgShellHandler for WaylandState {
                     committed_window_geometry_explicit: false,
                     pending_popup_reposition: None,
                     parent_association_committed: true,
+                    committed_input_region: None,
                     pixel_probe_logged: false,
                     logged_diagnostics: HashSet::new(),
                 },
@@ -1288,14 +1345,33 @@ impl XdgShellHandler for WaylandState {
             surface.send_popup_done();
             return;
         }
+        if let Some(exclusive) = self.exclusive_keyboard_focus.as_ref()
+            && self.layer_root_object_for_surface(&root).as_ref() != Some(exclusive)
+        {
+            // xdg_popup.grab requires the topmost grabbing popup to retain
+            // keyboard focus. An unrelated popup cannot satisfy that while an
+            // Exclusive layer owns the latch, so denying and dismissing the
+            // popup is protocol-correct; a pointer-only explicit grab is not.
+            tracing::debug!(
+                popup = ?surface.wl_surface().id(),
+                exclusive = ?exclusive,
+                "dismissed popup grab that cannot take keyboard focus from Exclusive layer"
+            );
+            surface.send_popup_done();
+            return;
+        }
         let seat = self.seat.clone();
         match self.popup_manager.grab_popup(root, popup, &seat, serial) {
             Ok(grab) => {
                 self.cancel_chrome_pointer_grab(true);
                 let pointer = self.pointer.clone();
                 pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
-                let keyboard = self.keyboard.clone();
-                keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+                if self.layer_keyboard_interactivity_for_surface(surface.wl_surface())
+                    != Some(KeyboardInteractivity::None)
+                {
+                    let keyboard = self.keyboard.clone();
+                    keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+                }
             }
             Err(error) => {
                 tracing::debug!(%error, "xdg popup grab was rejected");

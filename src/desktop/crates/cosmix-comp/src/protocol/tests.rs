@@ -7415,7 +7415,7 @@ fn installing_a_roster_refunds_the_bytes_and_tokens_of_every_departed_surface() 
     let relayout_layout = SurfaceLayout {
         x: 12.0,
         y: 34.0,
-        z: 5.5,
+        z: SurfaceStackKey::normal(5),
         visible: false,
         ..layout
     };
@@ -8214,7 +8214,7 @@ fn a_bounced_batch_keeps_its_roster_in_front() {
         y: 0.0,
         width: 4.0,
         height: 4.0,
-        z: 1.0,
+        z: SurfaceStackKey::normal(1),
         source: None,
         parent: None,
         transform: SurfaceTransform::Normal,
@@ -9977,7 +9977,7 @@ fn synthetic_dmabuf_event(id: u64, token: u64, use_id: Option<DmabufUseId>) -> P
             y: 0.0,
             width: 64.0,
             height: 32.0,
-            z: 1.0,
+            z: SurfaceStackKey::normal(1),
             source: None,
             parent: None,
             transform: SurfaceTransform::Normal,
@@ -10235,7 +10235,7 @@ fn renderer_pressure_evicts_stale_frames_without_rejecting_lifecycle() {
         y: 0.0,
         width: 16.0,
         height: 1.0,
-        z: 1.0,
+        z: SurfaceStackKey::normal(1),
         source: None,
         parent: None,
         transform: SurfaceTransform::Normal,
@@ -10279,7 +10279,7 @@ fn evicted_renderer_state_is_replayed_after_the_outbox_drains() {
         y: 0.0,
         width: 16.0,
         height: 1.0,
-        z: 1.0,
+        z: SurfaceStackKey::normal(1),
         source: None,
         parent: None,
         transform: SurfaceTransform::Normal,
@@ -10902,7 +10902,7 @@ fn blocked_renderer_outbox_keeps_only_latest_surface_state() {
         y: 20.0,
         width: 2.0,
         height: 1.0,
-        z: 1.0,
+        z: SurfaceStackKey::normal(1),
         source: None,
         parent: None,
         transform: SurfaceTransform::Normal,
@@ -10911,7 +10911,7 @@ fn blocked_renderer_outbox_keeps_only_latest_surface_state() {
     };
     let latest_layout = SurfaceLayout {
         x: 40.0,
-        z: 2.0,
+        z: SurfaceStackKey::normal(2),
         ..first_layout
     };
     let mut pending = PendingProtocolEvents::default();
@@ -11004,7 +11004,7 @@ fn pending_title_relayout_folds_into_queued_upsert() {
         y: 20.0,
         width: 600.0,
         height: 400.0,
-        z: 1.0,
+        z: SurfaceStackKey::normal(1),
         source: None,
         parent: None,
         transform: SurfaceTransform::Normal,
@@ -11066,7 +11066,7 @@ fn standalone_decorated_relayout_is_overtaken_by_either_tombstone() {
         y: 30.0,
         width: 640.0,
         height: 420.0,
-        z: 2.0,
+        z: SurfaceStackKey::normal(2),
         source: None,
         parent: None,
         transform: SurfaceTransform::Normal,
@@ -11197,7 +11197,7 @@ fn roster_and_dirty_recovery_publish_a_complete_decorated_toplevel_snapshot() {
         record.layout.y = 73.0;
         record.layout.width = 720.0;
         record.layout.height = 540.0;
-        record.layout.z = 8.0;
+        record.layout.z = SurfaceStackKey::normal(8);
         record.layout.toplevel = Some(snapshot);
         record.layout
     };
@@ -11340,6 +11340,14 @@ fn ack_and_map_test_toplevel(harness: &mut KeybindingHarness, serial: u32) {
     harness.dispatch_client();
 }
 
+fn map_initial_test_toplevel(harness: &mut KeybindingHarness) {
+    let serial = test_toplevel_record(harness)
+        .required_configure
+        .expect("initial toplevel configure")
+        .into();
+    ack_and_map_test_toplevel(harness, serial);
+}
+
 fn commit_test_toplevel_state(harness: &mut KeybindingHarness, serial: u32) {
     send_request(
         &mut harness.client,
@@ -11381,7 +11389,7 @@ fn positioned_test_ssd_harness(
         record.layout.y = 60.0;
         record.layout.width = 240.0;
         record.layout.height = 120.0;
-        record.layout.z = 4.0;
+        record.layout.z = SurfaceStackKey::normal(4);
         record.layout.visible = true;
         record.window_origin = (40.0, 60.0);
         record.committed_window_geometry = Some(SceneWindowGeometry {
@@ -11530,6 +11538,7 @@ struct TestLayerSpec {
     anchor: u32,
     exclusive_zone: i32,
     margin: (i32, i32, i32, i32),
+    keyboard_interactivity: u32,
 }
 
 impl Default for TestLayerSpec {
@@ -11540,6 +11549,7 @@ impl Default for TestLayerSpec {
             anchor: 0,
             exclusive_zone: -1,
             margin: (0, 0, 0, 0),
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::None as u32,
         }
     }
 }
@@ -11618,6 +11628,12 @@ fn set_test_layer_surface_state(
             spec.margin.2 as u32,
             spec.margin.3 as u32,
         ]),
+    );
+    send_request(
+        &mut harness.client,
+        layer_surface,
+        4,
+        &words(&[spec.keyboard_interactivity]),
     );
 }
 
@@ -11782,6 +11798,132 @@ fn map_test_layer_popup(
     send_request(&mut harness.client, popup.surface, 6, &[]);
     harness.dispatch_client();
     popup
+}
+
+fn map_test_grabbing_layer_popup(
+    harness: &mut KeybindingHarness,
+    layer: TestLayerSurface,
+    grab_serial: u32,
+) -> TestLayerPopup {
+    let popup = create_test_layer_popup(harness, layer);
+    send_request(
+        &mut harness.client,
+        popup.popup,
+        1,
+        &words(&[TEST_SEAT_ID, grab_serial]),
+    );
+    let (serial, _) = initial_configure_test_popup(harness, popup);
+    send_request(&mut harness.client, popup.xdg_surface, 4, &words(&[serial]));
+    let buffer = harness.create_dmabuf_buffer_sized(32, 24);
+    send_request(
+        &mut harness.client,
+        popup.surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, popup.surface, 6, &[]);
+    harness.dispatch_client();
+    popup
+}
+
+fn create_test_popup_child(
+    harness: &mut KeybindingHarness,
+    parent: TestLayerPopup,
+) -> TestLayerPopup {
+    let positioner = harness.allocate_object_id();
+    let surface = harness.allocate_object_id();
+    let xdg_surface = harness.allocate_object_id();
+    let popup = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        1,
+        &words(&[positioner]),
+    );
+    send_request(&mut harness.client, positioner, 1, &words(&[32, 24]));
+    send_request(&mut harness.client, positioner, 2, &words(&[0, 0, 16, 16]));
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        2,
+        &words(&[xdg_surface, surface]),
+    );
+    send_request(
+        &mut harness.client,
+        xdg_surface,
+        2,
+        &words(&[popup, parent.xdg_surface, positioner]),
+    );
+    harness.dispatch_client();
+    TestLayerPopup {
+        surface,
+        xdg_surface,
+        popup,
+    }
+}
+
+fn map_test_grabbing_popup_child(
+    harness: &mut KeybindingHarness,
+    parent: TestLayerPopup,
+    grab_serial: u32,
+) -> TestLayerPopup {
+    let popup = create_test_popup_child(harness, parent);
+    send_request(
+        &mut harness.client,
+        popup.popup,
+        1,
+        &words(&[TEST_SEAT_ID, grab_serial]),
+    );
+    let (serial, _) = initial_configure_test_popup(harness, popup);
+    send_request(&mut harness.client, popup.xdg_surface, 4, &words(&[serial]));
+    let buffer = harness.create_dmabuf_buffer_sized(32, 24);
+    send_request(
+        &mut harness.client,
+        popup.surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, popup.surface, 6, &[]);
+    harness.dispatch_client();
+    popup
+}
+
+fn press_test_key_and_serial(harness: &mut KeybindingHarness, keycode: u32) -> u32 {
+    harness.key(keycode, HostButtonState::Pressed);
+    harness
+        .sync()
+        .into_iter()
+        .find_map(|(object, opcode, body)| {
+            (object == TEST_KEYBOARD_ID && opcode == 3 && body.len() >= 16).then(|| word(&body, 0))
+        })
+        .expect("focused surface receives the popup-grab key")
+}
+
+fn stage_test_synchronized_subsurface(harness: &mut KeybindingHarness, parent: u32) -> (u32, u32) {
+    let surface = harness.allocate_object_id();
+    let subsurface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_SUBCOMPOSITOR_ID,
+        1,
+        &words(&[subsurface, surface, parent]),
+    );
+    let buffer = harness.create_dmabuf_buffer_sized(32, 24);
+    send_request(&mut harness.client, surface, 1, &words(&[buffer, 0, 0]));
+    send_request(&mut harness.client, surface, 6, &[]);
+    (surface, subsurface)
 }
 
 fn map_test_popup(harness: &mut KeybindingHarness, grab_serial: Option<u32>) -> (ObjectId, u32) {
@@ -12210,7 +12352,7 @@ fn equal_z_surface_hit_testing_uses_surface_id_as_the_tie_breaker() {
         record.layout.y = 20.0;
         record.layout.width = 80.0;
         record.layout.height = 80.0;
-        record.layout.z = 5.0;
+        record.layout.z = SurfaceStackKey::normal(5);
         record.layout.visible = true;
     }
     let expected = candidates
@@ -12252,7 +12394,7 @@ fn higher_popup_and_undecorated_window_each_beat_lower_chrome() {
         record.layout.y = point.1 - 8.0;
         record.layout.width = 16.0;
         record.layout.height = 16.0;
-        record.layout.z = 5.0;
+        record.layout.z = SurfaceStackKey::normal(5);
         record.layout.visible = true;
     }
     {
@@ -12266,7 +12408,7 @@ fn higher_popup_and_undecorated_window_each_beat_lower_chrome() {
         record.layout.y = point.1 + 40.0;
         record.layout.width = 16.0;
         record.layout.height = 16.0;
-        record.layout.z = 6.0;
+        record.layout.z = SurfaceStackKey::normal(6);
         record.layout.visible = true;
     }
     match harness
@@ -13208,7 +13350,8 @@ fn minimize_hides_the_tree_transfers_focus_withholds_frames_and_retargets_pointe
     let (popup, _) = map_test_popup(&mut harness, None);
     let replacement = map_test_undecorated_toplevel(&mut harness);
     {
-        let z = harness.server.state.surfaces[&object].layout.z - 1.0;
+        let mut z = harness.server.state.surfaces[&object].layout.z;
+        z.sequence = z.sequence.saturating_sub(1);
         let record = harness.server.state.surfaces.get_mut(&replacement).unwrap();
         record.layout.x = 0.0;
         record.layout.y = 0.0;
@@ -21184,14 +21327,32 @@ fn first_touch_moves_focus_from_a_to_b_and_only_that_contact_raises() {
     let a_first_focus = focus_messages(&a_first_traffic);
     let b_first_focus = focus_messages(&b_first_traffic);
     let focus_serial = match a_first_focus.as_slice() {
-        [FocusWire::KeyboardLeave { serial, surface }] => {
+        [
+            FocusWire::PointerLeave {
+                surface: pointer_surface,
+                ..
+            },
+            FocusWire::PointerFrame,
+            FocusWire::KeyboardLeave { serial, surface },
+        ] => {
+            assert_eq!(*pointer_surface, FOCUS_SURFACE_ID);
             assert_eq!(*surface, FOCUS_SURFACE_ID);
             *serial
         }
-        other => panic!("the first contact gives A exactly one keyboard leave: {other:?}"),
+        other => panic!(
+            "raising B retargets A's stationary pointer before giving A one keyboard leave: \
+             {other:?}"
+        ),
     };
     match b_first_focus.as_slice() {
         [
+            FocusWire::PointerEnter {
+                surface: pointer_surface,
+                x,
+                y,
+                ..
+            },
+            FocusWire::PointerFrame,
             FocusWire::KeyboardEnter {
                 serial: enter_serial,
                 surface,
@@ -21205,6 +21366,8 @@ fn first_touch_moves_focus_from_a_to_b_and_only_that_contact_raises() {
                 group,
             },
         ] => {
+            assert_eq!(*pointer_surface, FOCUS_SURFACE_ID);
+            assert_eq!((*x, *y), (overlap_x - b_origin, overlap_y - b_origin));
             assert_eq!(*enter_serial, focus_serial);
             assert_eq!(*modifiers_serial, focus_serial);
             assert_eq!(*surface, FOCUS_SURFACE_ID);
@@ -21212,7 +21375,10 @@ fn first_touch_moves_focus_from_a_to_b_and_only_that_contact_raises() {
             assert_eq!((*depressed, *latched, *locked, *group), (0, 0, 0, 0));
         }
         other => {
-            panic!("the first contact gives B exactly keyboard enter and modifiers: {other:?}")
+            panic!(
+                "the first contact retargets B's pointer then gives it keyboard enter and \
+                 modifiers: {other:?}"
+            )
         }
     }
     // A's leave serial and B's enter/modifiers serial are a cross-socket
@@ -21250,42 +21416,28 @@ fn first_touch_moves_focus_from_a_to_b_and_only_that_contact_raises() {
         );
     }
 
-    // Raising is observed indirectly: move the pointer within the overlap and
-    // make the real hit test choose the top surface. This is not a direct
-    // z-order read. It is taken **here**, between the two contacts, so that the
-    // change it sees can only be attributed to the first contact — the second
-    // has not happened yet. Geometry above proved A was above B at the overlap,
-    // so B winning it now is the first contact's raise and nothing else.
+    // The raise already retargeted the stationary pointer atomically. Moving
+    // within the overlap now stays on B, which is an independent wire witness
+    // that B won the stack change before the second contact exists.
     let (raise_probe_x, raise_probe_y) = (b_origin + 9.0, b_origin + 10.0);
     route_focus_pointer(&injector, raise_probe_x, raise_probe_y);
     let (a_raise_traffic, b_raise_traffic) = round_trip_focus_clients(&mut a, &mut b, 28);
     let a_raise = focus_messages(&a_raise_traffic);
     let b_raise = focus_messages(&b_raise_traffic);
-    let raise_serial = match a_raise.as_slice() {
-        [
-            FocusWire::PointerLeave { serial, surface },
-            FocusWire::PointerFrame,
-        ] => {
-            assert_eq!(*surface, FOCUS_SURFACE_ID);
-            *serial
-        }
-        other => {
-            panic!("the overlap re-hit-test leaves A after the first contact raised B: {other:?}")
-        }
-    };
-    assert_eq!(
-        b_raise,
-        vec![
-            FocusWire::PointerEnter {
-                serial: raise_serial,
-                surface: FOCUS_SURFACE_ID,
-                x: raise_probe_x - b_origin,
-                y: raise_probe_y - b_origin,
-            },
-            FocusWire::PointerFrame,
-        ],
-        "B wins the overlap once the first contact has raised it"
+    assert!(
+        a_raise.is_empty(),
+        "A was already left when the first contact raised B: {a_raise:?}"
     );
+    match b_raise.as_slice() {
+        [
+            FocusWire::PointerMotion { x, y, .. },
+            FocusWire::PointerFrame,
+        ] => assert_eq!(
+            (*x, *y),
+            (raise_probe_x - b_origin, raise_probe_y - b_origin)
+        ),
+        other => panic!("B keeps pointer focus throughout the overlap probe: {other:?}"),
+    }
     let first_contact_events = runtime
         .drain_events()
         .expect("the protocol thread is live after the first contact");
@@ -21974,10 +22126,10 @@ fn unmapping_focused_toplevel_hands_pointer_but_not_keyboard_to_client_b() {
     send_display_request(&mut a.socket, 0, 23);
     let remapped_wire = events_until_callback(&mut a.socket, 23);
 
-    // Mapping deliberately does not re-hit-test pointer focus. Drive the
-    // production absolute-motion path at the unchanged overlap point instead.
-    // A retained the higher z from the click, so only a genuinely mapped and
-    // effectively visible A can take pointer focus back from B here.
+    // Mapping immediately re-hit-tests the stationary pointer. A retained the
+    // higher stack key from the click, so only a genuinely mapped and
+    // effectively visible A can take pointer focus back from B here. A later
+    // absolute motion at the same point is consequently motion, not enter.
     //
     // Not `wl_surface.enter`: these clients never bind `wl_output`, and that
     // event only ever reaches a client holding the output, so asserting it here
@@ -21990,6 +22142,7 @@ fn unmapping_focused_toplevel_hands_pointer_but_not_keyboard_to_client_b() {
     send_display_request(&mut b.socket, 0, 22);
     let b_remap_focus_wire = events_until_callback(&mut b.socket, 22);
 
+    let remapped_focus = focus_messages(&remapped_wire);
     let a_remap_focus = focus_messages(&a_remap_focus_wire);
     let b_remap_focus = focus_messages(&b_remap_focus_wire);
     let pointer_serial = match b_remap_focus.as_slice() {
@@ -22004,7 +22157,7 @@ fn unmapping_focused_toplevel_hands_pointer_but_not_keyboard_to_client_b() {
             *serial
         }
         other => panic!(
-            "moving at the overlap after A's remap gives B exactly pointer leave plus frame\n\
+            "A's remap gives B exactly pointer leave plus frame\n\
              remap wire: {remapped_wire:?}\n\
              A focus wire: {a_remap_focus_wire:?}\n\
              B focus wire: {b_remap_focus_wire:?}\n\
@@ -22012,7 +22165,7 @@ fn unmapping_focused_toplevel_hands_pointer_but_not_keyboard_to_client_b() {
         ),
     };
     assert_eq!(
-        a_remap_focus,
+        remapped_focus,
         vec![
             FocusWire::PointerEnter {
                 serial: pointer_serial,
@@ -22022,10 +22175,19 @@ fn unmapping_focused_toplevel_hands_pointer_but_not_keyboard_to_client_b() {
             },
             FocusWire::PointerFrame,
         ],
-        "moving at the overlap after A's remap enters A and proves it is live again\n\
+        "A's remap immediately enters A and proves it is live again\n\
          remap wire: {remapped_wire:?}\n\
          A focus wire: {a_remap_focus_wire:?}\n\
          B focus wire: {b_remap_focus_wire:?}"
+    );
+    assert!(
+        matches!(
+            a_remap_focus.as_slice(),
+            [FocusWire::PointerMotion { x, y, .. }, FocusWire::PointerFrame]
+                if *x == overlap_x - f64::from(CASCADE_ORIGIN)
+                    && *y == overlap_y - f64::from(CASCADE_ORIGIN)
+        ),
+        "motion after the immediate remap retarget stays motion: {a_remap_focus_wire:?}"
     );
 }
 
@@ -25194,6 +25356,1948 @@ fn layer_shell_global_is_advertised_at_v4_and_bound_by_the_wire_harness() {
         test_layer_record(&harness, layer.surface).role,
         SurfaceRole::Layer(_)
     ));
+}
+
+#[test]
+fn layer_bands_order_independently_of_mapping_order_and_follow_committed_layer_changes() {
+    let mut harness = KeybindingHarness::new(true);
+    let (overlay, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            layer: WlrLayer::Overlay as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    let (top, _) = map_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let (bottom, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            layer: WlrLayer::Bottom as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    let (background, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            layer: WlrLayer::Background as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    let normal = test_toplevel_record(&harness).layout.z;
+    let keys = [
+        test_layer_record(&harness, background.surface).layout.z,
+        test_layer_record(&harness, bottom.surface).layout.z,
+        normal,
+        test_layer_record(&harness, top.surface).layout.z,
+        test_layer_record(&harness, overlay.surface).layout.z,
+    ];
+    assert_eq!(
+        keys.map(|key| key.band),
+        [
+            StackBand::Background,
+            StackBand::Bottom,
+            StackBand::Normal,
+            StackBand::Top,
+            StackBand::Overlay,
+        ]
+    );
+    assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+    let overlay_popup = map_test_layer_popup(&mut harness, overlay);
+    assert_eq!(
+        test_layer_record(&harness, overlay_popup.surface)
+            .layout
+            .z
+            .band,
+        StackBand::Overlay,
+        "a popup inherits its layer parent's stack band"
+    );
+
+    send_request(
+        &mut harness.client,
+        overlay.layer_surface,
+        8,
+        &words(&[WlrLayer::Background as u32]),
+    );
+    send_request(&mut harness.client, overlay.surface, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        test_layer_record(&harness, overlay.surface).layout.z.band,
+        StackBand::Background,
+        "a committed set_layer request moves the live stack key"
+    );
+    assert_eq!(
+        test_layer_record(&harness, overlay_popup.surface)
+            .layout
+            .z
+            .band,
+        StackBand::Background,
+        "a layer popup follows its parent's committed band change"
+    );
+}
+
+#[test]
+fn committed_layer_band_change_retargets_a_stationary_pointer_on_the_wire() {
+    let mut harness = KeybindingHarness::new(true);
+    let pointer = harness.bind_pointer();
+    let (a, _) = map_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let (b, _) = map_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let b_layout = test_layer_record(&harness, b.surface).layout;
+    route_pointer_to(
+        &mut harness,
+        f64::from(b_layout.x + 5.0),
+        f64::from(b_layout.y + 5.0),
+    );
+    let entered_b = harness.sync();
+    assert!(
+        pointer_bodies(&entered_b, pointer, 0)
+            .iter()
+            .any(|body| word(body, 1) == b.surface),
+        "the later Top layer B initially owns pointer focus: {entered_b:?}"
+    );
+
+    send_request(
+        &mut harness.client,
+        a.layer_surface,
+        8,
+        &words(&[WlrLayer::Overlay as u32]),
+    );
+    send_request(&mut harness.client, a.surface, 6, &[]);
+    let restacked = harness.sync();
+    let leaves = pointer_bodies(&restacked, pointer, 1);
+    let enters = pointer_bodies(&restacked, pointer, 0);
+    assert_eq!(leaves.len(), 1, "B receives one leave: {restacked:?}");
+    assert_eq!(word(&leaves[0], 1), b.surface);
+    assert_eq!(enters.len(), 1, "A receives one enter: {restacked:?}");
+    assert_eq!(word(&enters[0], 1), a.surface);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .pointer
+            .current_focus()
+            .map(|surface| surface.id().protocol_id()),
+        Some(a.surface)
+    );
+
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let button = harness.sync();
+    assert_eq!(
+        pointer_bodies(&button, pointer, 3).len(),
+        1,
+        "the next button follows the wire enter into A: {button:?}"
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .pointer
+            .current_focus()
+            .map(|surface| surface.id().protocol_id()),
+        Some(a.surface)
+    );
+}
+
+#[test]
+fn layer_rearrange_sends_new_local_coordinates_without_refocusing() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let mut harness = KeybindingHarness::new(true);
+    let pointer = harness.bind_pointer();
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT,
+            ..TestLayerSpec::default()
+        },
+    );
+    route_pointer_to(&mut harness, 10.0, 10.0);
+    let initial = harness.sync();
+    assert!(
+        pointer_bodies(&initial, pointer, 0)
+            .iter()
+            .any(|body| word(body, 1) == layer.surface),
+        "the pointer initially enters A at output-local 10,10: {initial:?}"
+    );
+
+    send_request(
+        &mut harness.client,
+        layer.layer_surface,
+        3,
+        &words(&[0, 0, 0, 5]),
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    let moved = harness.sync();
+    let motions = pointer_bodies(&moved, pointer, 2);
+    assert_eq!(motions.len(), 1, "one local-coordinate motion: {moved:?}");
+    assert_eq!((fixed(&motions[0], 1), fixed(&motions[0], 2)), (5.0, 10.0));
+    assert!(
+        pointer_bodies(&moved, pointer, 0).is_empty()
+            && pointer_bodies(&moved, pointer, 1).is_empty(),
+        "moving A beneath a stationary pointer neither leaves nor re-enters it: {moved:?}"
+    );
+}
+
+#[test]
+fn background_layer_mapped_last_and_clicked_never_crosses_normal_band() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let normal_key = test_toplevel_record(&harness).layout.z;
+    let (background, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            layer: WlrLayer::Background as u32,
+            anchor: TOP_LEFT,
+            ..TestLayerSpec::default()
+        },
+    );
+    let before = test_layer_record(&harness, background.surface).layout.z;
+    assert!(before < normal_key);
+    let focus_before = harness.server.state.keyboard.current_focus();
+
+    route_pointer_to(&mut harness, 5.0, 5.0);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    assert_eq!(
+        test_layer_record(&harness, background.surface).layout.z,
+        before
+    );
+    assert!(test_layer_record(&harness, background.surface).layout.z < normal_key);
+    assert_eq!(harness.server.state.keyboard.current_focus(), focus_before);
+    assert_ne!(
+        harness.server.state.keyboard.current_focus(),
+        Some(
+            test_layer_record(&harness, background.surface)
+                .role
+                .wl_surface()
+                .clone()
+        )
+    );
+}
+
+#[test]
+fn stack_sequence_renormalisation_is_dense_and_preserves_exact_order() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let first = test_toplevel_record(&harness).role.wl_surface().id();
+    let (child, _, _) = harness.extra_mapped_subsurface_with_role();
+    let (popup, _) = map_test_popup(&mut harness, None);
+    let second = map_test_undecorated_toplevel(&mut harness);
+    let mut sequences = harness
+        .server
+        .state
+        .surfaces
+        .values()
+        .filter(|record| record.layout.z.band == StackBand::Normal)
+        .map(|record| record.layout.z.sequence)
+        .collect::<Vec<_>>();
+    sequences.sort_unstable();
+    sequences.dedup();
+    assert!(sequences.len() >= 3, "root tree, popup and second toplevel");
+    let near_max = sequences
+        .iter()
+        .enumerate()
+        .map(|(index, sequence)| {
+            (
+                *sequence,
+                u64::MAX - u64::try_from(sequences.len() - index - 1).unwrap(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    for record in harness.server.state.surfaces.values_mut() {
+        if record.layout.z.band == StackBand::Normal {
+            record.layout.z.sequence = near_max[&record.layout.z.sequence];
+        }
+    }
+    let ordered_before = {
+        let mut records = harness.server.state.surfaces.values().collect::<Vec<_>>();
+        records.sort_unstable_by(|left, right| surface_stack_cmp(left, right));
+        records
+            .into_iter()
+            .map(|record| record.role.wl_surface().id())
+            .collect::<Vec<_>>()
+    };
+    harness.server.state.next_stack_sequences[StackBand::Normal.index()] = u64::MAX;
+
+    let allocated = harness.server.state.allocate_stack_key(StackBand::Normal);
+    let ordered_after = {
+        let mut records = harness.server.state.surfaces.values().collect::<Vec<_>>();
+        records.sort_unstable_by(|left, right| surface_stack_cmp(left, right));
+        records
+            .into_iter()
+            .map(|record| record.role.wl_surface().id())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ordered_after, ordered_before);
+    assert_eq!(
+        harness.server.state.surfaces[&child.id()].layout.z.sequence,
+        harness.server.state.surfaces[&first].layout.z.sequence,
+        "subsurface descendants retain their root sequence"
+    );
+    assert!(
+        harness.server.state.surfaces[&child.id()]
+            .layout
+            .z
+            .tree_index
+            > harness.server.state.surfaces[&first].layout.z.tree_index
+    );
+    assert!(
+        harness.server.state.surfaces[&popup].layout.z
+            > harness.server.state.surfaces[&first].layout.z
+    );
+    assert!(
+        harness.server.state.surfaces[&second].layout.z
+            > harness.server.state.surfaces[&popup].layout.z
+    );
+    assert_eq!(
+        allocated,
+        SurfaceStackKey::normal(u64::try_from(sequences.len() + 1).unwrap())
+    );
+}
+
+#[test]
+fn layer_keyboard_interactivity_none_and_on_demand_follow_click_policy() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let mut none = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut none);
+    let toplevel = test_toplevel_record(&none).role.wl_surface().clone();
+    let toplevel_layout = test_toplevel_record(&none).layout;
+    route_pointer_to(
+        &mut none,
+        f64::from(toplevel_layout.x + 5.0),
+        f64::from(toplevel_layout.y + 5.0),
+    );
+    route_pointer_button(&mut none, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut none, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    assert_eq!(
+        none.server.state.keyboard.current_focus(),
+        Some(toplevel.clone())
+    );
+    let (none_layer, _) = map_test_layer_surface(
+        &mut none,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT,
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::None as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    let none_key = test_layer_record(&none, none_layer.surface).layout.z;
+    route_pointer_to(&mut none, 5.0, 5.0);
+    route_pointer_button(&mut none, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut none, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    assert_eq!(none.server.state.keyboard.current_focus(), Some(toplevel));
+    assert_eq!(
+        test_layer_record(&none, none_layer.surface).layout.z,
+        none_key
+    );
+
+    let mut demand = KeybindingHarness::new(true);
+    let (demand_layer, _) = map_test_layer_surface(
+        &mut demand,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT,
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    route_pointer_to(&mut demand, 5.0, 5.0);
+    route_pointer_button(&mut demand, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut demand, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    assert_eq!(
+        demand.server.state.keyboard.current_focus(),
+        Some(
+            test_layer_record(&demand, demand_layer.surface)
+                .role
+                .wl_surface()
+                .clone()
+        )
+    );
+}
+
+#[test]
+fn focused_on_demand_layer_committing_none_falls_back_to_the_toplevel() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT,
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    route_pointer_to(&mut harness, 5.0, 5.0);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(
+            test_layer_record(&harness, layer.surface)
+                .role
+                .wl_surface()
+                .clone()
+        )
+    );
+
+    send_request(
+        &mut harness.client,
+        layer.layer_surface,
+        4,
+        &words(&[zwlr_layer_surface_v1::KeyboardInteractivity::None as u32]),
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(test_toplevel_record(&harness).role.wl_surface().clone())
+    );
+    assert!(test_toplevel_record(&harness).focused);
+}
+
+#[test]
+fn exclusive_layer_latch_survives_toplevel_click_then_releases_on_unmap() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let initial_layout = test_toplevel_record(&harness).layout;
+    route_pointer_to(
+        &mut harness,
+        f64::from(initial_layout.x + 5.0),
+        f64::from(initial_layout.y + 5.0),
+    );
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let _ = harness.sync();
+    assert!(test_toplevel_record(&harness).focused);
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT,
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    let exclusive_wire = harness.sync();
+    let layer_surface = test_layer_record(&harness, layer.surface)
+        .role
+        .wl_surface()
+        .clone();
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(layer_surface.clone())
+    );
+    assert!(!test_toplevel_record(&harness).focused);
+    let deactivated = toplevel_configure_states(&exclusive_wire, TEST_TOPLEVEL_ID);
+    assert!(
+        deactivated
+            .last()
+            .is_some_and(|states| !states.contains(&(xdg_toplevel::State::Activated as u32))),
+        "Exclusive layer focus removes Activated from every normal toplevel: {exclusive_wire:?}"
+    );
+    let normal_before = test_toplevel_record(&harness).layout.z;
+    let normal_layout = test_toplevel_record(&harness).layout;
+
+    route_pointer_to(
+        &mut harness,
+        f64::from(normal_layout.x + 5.0),
+        f64::from(normal_layout.y + 5.0),
+    );
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(layer_surface)
+    );
+    assert!(test_toplevel_record(&harness).layout.z > normal_before);
+    assert!(!test_toplevel_record(&harness).focused);
+
+    send_request(&mut harness.client, layer.surface, 1, &words(&[0, 0, 0]));
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(test_toplevel_record(&harness).role.wl_surface().clone())
+    );
+    assert!(test_toplevel_record(&harness).focused);
+    assert_eq!(harness.server.state.exclusive_keyboard_focus, None);
+}
+
+#[test]
+fn exclusive_layer_dismisses_an_existing_toplevel_popup_keyboard_grab() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let (mut harness, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    harness.key(24, HostButtonState::Pressed);
+    let key = harness
+        .sync()
+        .into_iter()
+        .find_map(|(object, opcode, body)| {
+            (object == TEST_KEYBOARD_ID && opcode == 3 && body.len() >= 16).then_some(body)
+        })
+        .expect("focused toplevel receives the popup-grab key");
+    let (popup_surface, popup_role) = map_test_popup(&mut harness, Some(word(&key, 0)));
+    assert!(harness.server.state.keyboard.is_grabbed());
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT,
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    let traffic = harness.sync();
+    assert!(
+        traffic
+            .iter()
+            .any(|(object, opcode, _)| *object == popup_role && *opcode == 1),
+        "transferring focus to Exclusive dismisses the old popup tree: {traffic:?}"
+    );
+    assert!(!harness.server.state.keyboard.is_grabbed());
+    assert!(!harness.server.state.surfaces[&popup_surface].mapped);
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(
+            test_layer_record(&harness, layer.surface)
+                .role
+                .wl_surface()
+                .clone()
+        )
+    );
+}
+
+#[test]
+fn on_demand_layer_popup_grab_is_dismissed_when_parent_commits_none() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT,
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    route_pointer_to(&mut harness, 5.0, 5.0);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let grab_serial = press_test_key_and_serial(&mut harness, 24);
+    let popup = map_test_grabbing_layer_popup(&mut harness, layer, grab_serial);
+    assert!(harness.server.state.keyboard.is_grabbed());
+
+    send_request(
+        &mut harness.client,
+        layer.layer_surface,
+        4,
+        &words(&[zwlr_layer_surface_v1::KeyboardInteractivity::None as u32]),
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    let traffic = harness.sync();
+
+    assert!(
+        traffic
+            .iter()
+            .any(|(object, opcode, _)| *object == popup.popup && *opcode == 1),
+        "OnDemand to None dismisses the active popup grab: {traffic:?}"
+    );
+    assert!(!harness.server.state.keyboard.is_grabbed());
+    assert!(!test_layer_record(&harness, popup.surface).mapped);
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(test_toplevel_record(&harness).role.wl_surface().clone())
+    );
+}
+
+#[test]
+fn exclusive_layer_popup_grab_is_dismissed_when_parent_commits_on_demand() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT,
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    let grab_serial = press_test_key_and_serial(&mut harness, 24);
+    let popup = map_test_grabbing_layer_popup(&mut harness, layer, grab_serial);
+    assert!(harness.server.state.keyboard.is_grabbed());
+
+    harness.key(25, HostButtonState::Pressed);
+    let popup_key = harness.sync();
+    let popup_surface = test_layer_record(&harness, popup.surface)
+        .role
+        .wl_surface()
+        .clone();
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(popup_surface.clone()),
+        "the popup grab moves keyboard focus into the Exclusive layer's popup: {popup_key:?}"
+    );
+
+    // Exercise the arbiter's identity rule directly as well as the commit
+    // filter below: the popup focus and the selected layer root are different
+    // wl_surfaces, but belong to the same active popup grab chain.
+    harness
+        .server
+        .state
+        .arbitrate_keyboard_focus(None, false, false);
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    let redraw = harness.sync();
+    assert!(
+        !redraw
+            .iter()
+            .any(|(object, opcode, _)| *object == popup.popup && *opcode == 1),
+        "an ordinary Exclusive-layer redraw leaves its own popup open: {redraw:?}"
+    );
+    assert!(harness.server.state.keyboard.is_grabbed());
+    assert!(test_layer_record(&harness, popup.surface).mapped);
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(popup_surface)
+    );
+
+    send_request(
+        &mut harness.client,
+        layer.layer_surface,
+        4,
+        &words(&[zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand as u32]),
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    let traffic = harness.sync();
+
+    assert!(
+        traffic
+            .iter()
+            .any(|(object, opcode, _)| *object == popup.popup && *opcode == 1),
+        "Exclusive to OnDemand dismisses the active popup grab: {traffic:?}"
+    );
+    assert!(!harness.server.state.keyboard.is_grabbed());
+    assert!(!test_layer_record(&harness, popup.surface).mapped);
+    assert_eq!(harness.server.state.exclusive_keyboard_focus, None);
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(test_toplevel_record(&harness).role.wl_surface().clone())
+    );
+}
+
+#[test]
+fn nested_popup_grab_of_an_exclusive_layer_survives_a_plain_layer_redraw() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT,
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    let parent_serial = press_test_key_and_serial(&mut harness, 24);
+    let parent = map_test_grabbing_layer_popup(&mut harness, layer, parent_serial);
+    let child_serial = press_test_key_and_serial(&mut harness, 25);
+    let child = map_test_grabbing_popup_child(&mut harness, parent, child_serial);
+    harness.key(26, HostButtonState::Pressed);
+    let child_key = harness.sync();
+    let child_surface = test_layer_record(&harness, child.surface)
+        .role
+        .wl_surface()
+        .clone();
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(child_surface.clone()),
+        "the nested related popup receives keyboard focus: {child_key:?}"
+    );
+
+    harness
+        .server
+        .state
+        .arbitrate_keyboard_focus(None, false, false);
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    let redraw = harness.sync();
+    assert!(
+        !redraw.iter().any(|(object, opcode, _)| {
+            (*object == parent.popup || *object == child.popup) && *opcode == 1
+        }),
+        "the layer redraw dismisses neither popup in its related chain: {redraw:?}"
+    );
+    assert!(harness.server.state.keyboard.is_grabbed());
+    assert!(test_layer_record(&harness, parent.surface).mapped);
+    assert!(test_layer_record(&harness, child.surface).mapped);
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(child_surface)
+    );
+}
+
+#[test]
+fn layer_policy_and_synchronized_region_commit_defer_popup_pointer_grab_teardown() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let mut harness = KeybindingHarness::new(true);
+    let pointer = harness.bind_pointer();
+    map_initial_test_toplevel(&mut harness);
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT,
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    let (child, _) = stage_test_synchronized_subsurface(&mut harness, layer.surface);
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    harness.dispatch_client();
+    route_pointer_to(&mut harness, 5.0, 5.0);
+    let _ = harness.sync();
+    let grab_serial = press_test_key_and_serial(&mut harness, 24);
+    let popup = map_test_grabbing_layer_popup(&mut harness, layer, grab_serial);
+    assert!(harness.server.state.pointer.is_grabbed());
+    let reconciliations_before = harness.server.state.pointer_hit_test_reconciliations;
+
+    let empty = harness.allocate_object_id();
+    send_request(&mut harness.client, TEST_COMPOSITOR_ID, 1, &words(&[empty]));
+    send_request(&mut harness.client, child, 5, &words(&[empty]));
+    send_request(&mut harness.client, child, 6, &[]);
+    send_request(
+        &mut harness.client,
+        layer.layer_surface,
+        4,
+        &words(&[zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand as u32]),
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    let applied = harness.sync();
+
+    assert!(
+        pointer_bodies(&applied, pointer, 2).is_empty(),
+        "the fused transaction never restores stale popup focus as motion: {applied:?}"
+    );
+    assert_eq!(
+        harness.server.state.pointer_hit_test_reconciliations - reconciliations_before,
+        1,
+        "policy, popup dismissal and synchronized region state reconcile once"
+    );
+    assert!(!harness.server.state.pointer.is_grabbed());
+    assert!(!test_layer_record(&harness, popup.surface).mapped);
+}
+
+#[test]
+fn exclusive_latch_denies_unrelated_toplevel_popup_keyboard_grab() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let (mut harness, pointer, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT,
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    let layer_surface = test_layer_record(&harness, layer.surface)
+        .role
+        .wl_surface()
+        .clone();
+    let normal = test_toplevel_record(&harness).layout;
+    route_pointer_to(
+        &mut harness,
+        f64::from(normal.x + normal.width - 5.0),
+        f64::from(normal.y + normal.height - 5.0),
+    );
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let pointer_press = pointer_body(&harness.sync(), pointer, 3);
+    let grab_serial = word(&pointer_press, 0);
+
+    let positioner = harness.allocate_object_id();
+    let popup_surface = harness.allocate_object_id();
+    let popup_xdg_surface = harness.allocate_object_id();
+    let popup = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        1,
+        &words(&[positioner]),
+    );
+    send_request(&mut harness.client, positioner, 1, &words(&[32, 24]));
+    send_request(&mut harness.client, positioner, 2, &words(&[0, 0, 16, 16]));
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[popup_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        2,
+        &words(&[popup_xdg_surface, popup_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        popup_xdg_surface,
+        2,
+        &words(&[popup, TEST_XDG_SURFACE_ID, positioner]),
+    );
+    send_request(
+        &mut harness.client,
+        popup,
+        1,
+        &words(&[TEST_SEAT_ID, grab_serial]),
+    );
+    send_request(&mut harness.client, popup_surface, 6, &[]);
+    let denied = harness.sync();
+    assert!(
+        denied
+            .iter()
+            .any(|(object, opcode, _)| *object == popup && *opcode == 1),
+        "a popup that cannot own keyboard focus is immediately dismissed: {denied:?}"
+    );
+    assert!(!harness.server.state.keyboard.is_grabbed());
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(layer_surface.clone())
+    );
+
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    harness.key(25, HostButtonState::Pressed);
+    let key = harness.sync();
+    assert!(
+        key.iter()
+            .any(|(object, opcode, _)| { *object == TEST_KEYBOARD_ID && *opcode == 3 })
+    );
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(layer_surface),
+        "the denied popup cannot divert the next key from the Exclusive layer"
+    );
+}
+
+#[test]
+fn clicking_lower_exclusive_layer_raises_within_band_and_transfers_latch() {
+    const TOP_LEFT: u32 = 1 | 4;
+    const TOP_RIGHT: u32 = 1 | 8;
+    let mut harness = KeybindingHarness::new(true);
+    let exclusive = zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32;
+    let (left, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT,
+            keyboard_interactivity: exclusive,
+            ..TestLayerSpec::default()
+        },
+    );
+    let (right, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: TOP_RIGHT,
+            keyboard_interactivity: exclusive,
+            ..TestLayerSpec::default()
+        },
+    );
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(
+            test_layer_record(&harness, right.surface)
+                .role
+                .wl_surface()
+                .clone()
+        )
+    );
+    let left_before = test_layer_record(&harness, left.surface).layout.z;
+    route_pointer_to(&mut harness, 5.0, 5.0);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let left_after = test_layer_record(&harness, left.surface).layout.z;
+    assert_eq!(left_after.band, left_before.band);
+    assert!(left_after > test_layer_record(&harness, right.surface).layout.z);
+    assert_eq!(
+        harness.server.state.keyboard.current_focus(),
+        Some(
+            test_layer_record(&harness, left.surface)
+                .role
+                .wl_surface()
+                .clone()
+        )
+    );
+}
+
+#[test]
+fn committed_input_regions_allow_layer_click_through_and_limit_toplevel_hits() {
+    const ALL_EDGES: u32 = 1 | 2 | 4 | 8;
+    let mut layer_harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut layer_harness);
+    let (layer, _) = map_test_layer_surface(
+        &mut layer_harness,
+        0,
+        TestLayerSpec {
+            size: (0, 0),
+            anchor: ALL_EDGES,
+            ..TestLayerSpec::default()
+        },
+    );
+    let empty_region = layer_harness.allocate_object_id();
+    send_request(
+        &mut layer_harness.client,
+        TEST_COMPOSITOR_ID,
+        1,
+        &words(&[empty_region]),
+    );
+    send_request(
+        &mut layer_harness.client,
+        layer.surface,
+        5,
+        &words(&[empty_region]),
+    );
+    send_request(&mut layer_harness.client, layer.surface, 6, &[]);
+    layer_harness.dispatch_client();
+    let under_layout = test_toplevel_record(&layer_harness).layout;
+    let under = layer_harness
+        .server
+        .state
+        .surface_at(
+            f64::from(under_layout.x + 5.0),
+            f64::from(under_layout.y + 5.0),
+        )
+        .expect("empty layer input region falls through");
+    assert!(matches!(under.role, SurfaceRole::Toplevel(_)));
+
+    let mut toplevel_harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut toplevel_harness);
+    let toplevel = test_toplevel_record(&toplevel_harness)
+        .role
+        .wl_surface()
+        .clone();
+    let region = toplevel_harness.allocate_object_id();
+    send_request(
+        &mut toplevel_harness.client,
+        TEST_COMPOSITOR_ID,
+        1,
+        &words(&[region]),
+    );
+    send_request(
+        &mut toplevel_harness.client,
+        region,
+        1,
+        &words(&[0, 0, 20, 20]),
+    );
+    send_request(
+        &mut toplevel_harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        5,
+        &words(&[region]),
+    );
+    send_request(
+        &mut toplevel_harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        6,
+        &[],
+    );
+    toplevel_harness.dispatch_client();
+    let layout = test_toplevel_record(&toplevel_harness).layout;
+    assert_eq!(
+        toplevel_harness
+            .server
+            .state
+            .surface_at(f64::from(layout.x + 5.0), f64::from(layout.y + 5.0))
+            .map(|record| record.role.wl_surface().id()),
+        Some(toplevel.id())
+    );
+    assert_ne!(
+        toplevel_harness
+            .server
+            .state
+            .surface_at(f64::from(layout.x + 30.0), f64::from(layout.y + 5.0))
+            .map(|record| record.role.wl_surface().id()),
+        Some(toplevel.id())
+    );
+}
+
+#[test]
+fn input_region_commit_retargets_stationary_pointer_and_nil_restores_layer() {
+    const ALL_EDGES: u32 = 1 | 2 | 4 | 8;
+    let (mut harness, pointer, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            size: (0, 0),
+            anchor: ALL_EDGES,
+            ..TestLayerSpec::default()
+        },
+    );
+    route_pointer_to(&mut harness, 100.0, 100.0);
+    let initial = harness.sync();
+    assert_eq!(
+        pointer_bodies(&initial, pointer, 0)
+            .last()
+            .map(|body| word(body, 1)),
+        Some(layer.surface),
+        "the full layer initially owns the stationary pointer: {initial:?}"
+    );
+
+    let empty = harness.allocate_object_id();
+    send_request(&mut harness.client, TEST_COMPOSITOR_ID, 1, &words(&[empty]));
+    send_request(&mut harness.client, layer.surface, 5, &words(&[empty]));
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    let click_through = harness.sync();
+    assert!(
+        pointer_bodies(&click_through, pointer, 1)
+            .iter()
+            .any(|body| word(body, 1) == layer.surface),
+        "empty committed region leaves the layer: {click_through:?}"
+    );
+    assert!(
+        pointer_bodies(&click_through, pointer, 0)
+            .iter()
+            .any(|body| word(body, 1) == TEST_TOPLEVEL_SURFACE_ID),
+        "stationary pointer enters the toplevel below: {click_through:?}"
+    );
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let button = harness.sync();
+    assert_eq!(pointer_bodies(&button, pointer, 3).len(), 1);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let _ = harness.sync();
+
+    send_request(&mut harness.client, layer.surface, 5, &words(&[0]));
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    let reset = harness.sync();
+    assert!(
+        pointer_bodies(&reset, pointer, 0)
+            .iter()
+            .any(|body| word(body, 1) == layer.surface),
+        "set_input_region(nil) restores whole-surface input and retargets: {reset:?}"
+    );
+}
+
+#[test]
+fn subsurface_input_region_retargets_pointer_to_its_parent() {
+    let (mut harness, pointer, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let (child, child_surface, _) = harness.extra_mapped_subsurface_with_role();
+    let child_layout = harness.server.state.surfaces[&child.id()].layout;
+    route_pointer_to(
+        &mut harness,
+        f64::from(child_layout.x + 5.0),
+        f64::from(child_layout.y + 5.0),
+    );
+    let initial = harness.sync();
+    assert!(
+        pointer_bodies(&initial, pointer, 0)
+            .iter()
+            .any(|body| word(body, 1) == child_surface),
+        "the child initially owns pointer focus: {initial:?}"
+    );
+    let empty = harness.allocate_object_id();
+    send_request(&mut harness.client, TEST_COMPOSITOR_ID, 1, &words(&[empty]));
+    send_request(&mut harness.client, child_surface, 5, &words(&[empty]));
+    send_request(&mut harness.client, child_surface, 6, &[]);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    let traffic = harness.sync();
+    assert!(
+        pointer_bodies(&traffic, pointer, 1)
+            .iter()
+            .any(|body| word(body, 1) == child_surface),
+        "the child's own empty region sends leave: {traffic:?}"
+    );
+    assert!(
+        pointer_bodies(&traffic, pointer, 0)
+            .iter()
+            .any(|body| word(body, 1) == TEST_TOPLEVEL_SURFACE_ID),
+        "the pointer enters the parent beneath the child: {traffic:?}"
+    );
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    assert_eq!(pointer_bodies(&harness.sync(), pointer, 3).len(), 1);
+}
+
+#[test]
+fn synchronized_sibling_region_swap_retargets_atomically_from_a_to_b() {
+    let mut harness = KeybindingHarness::new(true);
+    let pointer = harness.bind_pointer();
+    map_initial_test_toplevel(&mut harness);
+    let (a, _) = stage_test_synchronized_subsurface(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    let (b, _) = stage_test_synchronized_subsurface(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let a_object = harness
+        .server
+        .state
+        .surfaces
+        .keys()
+        .find(|object| object.protocol_id() == a)
+        .cloned()
+        .expect("synchronized sibling A is tracked");
+    let b_object = harness
+        .server
+        .state
+        .surfaces
+        .keys()
+        .find(|object| object.protocol_id() == b)
+        .cloned()
+        .expect("synchronized sibling B is tracked");
+    assert!(
+        harness.server.state.surfaces[&b_object].layout.z
+            > harness.server.state.surfaces[&a_object].layout.z,
+        "the later sibling B is above A before its region becomes empty"
+    );
+
+    let empty_b = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        1,
+        &words(&[empty_b]),
+    );
+    send_request(&mut harness.client, b, 5, &words(&[empty_b]));
+    send_request(&mut harness.client, b, 6, &[]);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+
+    let root = test_toplevel_record(&harness).layout;
+    route_pointer_to(
+        &mut harness,
+        f64::from(root.x + 5.0),
+        f64::from(root.y + 5.0),
+    );
+    let initial = harness.sync();
+    assert!(
+        pointer_bodies(&initial, pointer, 0)
+            .iter()
+            .any(|body| word(body, 1) == a),
+        "A owns the pointer while the higher B is click-through: {initial:?}"
+    );
+    let reconciliations_before = harness.server.state.pointer_hit_test_reconciliations;
+
+    let empty_a = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        1,
+        &words(&[empty_a]),
+    );
+    send_request(&mut harness.client, a, 5, &words(&[empty_a]));
+    send_request(&mut harness.client, a, 6, &[]);
+    send_request(&mut harness.client, b, 5, &words(&[0]));
+    send_request(&mut harness.client, b, 6, &[]);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    let swapped = harness.sync();
+
+    let leaves = pointer_bodies(&swapped, pointer, 1);
+    let enters = pointer_bodies(&swapped, pointer, 0);
+    assert_eq!(leaves.len(), 1, "one atomic leave is emitted: {swapped:?}");
+    assert_eq!(word(&leaves[0], 1), a);
+    assert_eq!(enters.len(), 1, "one atomic enter is emitted: {swapped:?}");
+    assert_eq!(word(&enters[0], 1), b);
+    assert!(
+        leaves
+            .iter()
+            .chain(enters.iter())
+            .all(|body| word(body, 1) != TEST_TOPLEVEL_SURFACE_ID),
+        "the transaction never exposes the parent as an intermediate target: {swapped:?}"
+    );
+    assert_eq!(
+        harness.server.state.pointer_hit_test_reconciliations - reconciliations_before,
+        1,
+        "both sibling callbacks reconcile one complete transaction"
+    );
+}
+
+#[test]
+fn synchronized_unmap_defers_pointer_grab_teardown_until_the_transaction_is_current() {
+    let mut harness = KeybindingHarness::new(true);
+    let pointer = harness.bind_pointer();
+    map_initial_test_toplevel(&mut harness);
+    let (b, _) = stage_test_synchronized_subsurface(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    let (a, _) = stage_test_synchronized_subsurface(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+
+    let root = test_toplevel_record(&harness).layout;
+    route_pointer_to(
+        &mut harness,
+        f64::from(root.x + 5.0),
+        f64::from(root.y + 5.0),
+    );
+    let entered_a = harness.sync();
+    assert!(
+        pointer_bodies(&entered_a, pointer, 0)
+            .iter()
+            .any(|body| word(body, 1) == a),
+        "the upper synchronized child A initially owns pointer focus: {entered_a:?}"
+    );
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let _ = harness.sync();
+    assert!(harness.server.state.pointer.is_grabbed());
+
+    let reconciliations_before = harness.server.state.pointer_hit_test_reconciliations;
+    send_request(&mut harness.client, a, 1, &words(&[0, 0, 0]));
+    send_request(&mut harness.client, a, 6, &[]);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    let transition = harness.sync();
+
+    let leaves = pointer_bodies(&transition, pointer, 1);
+    let enters = pointer_bodies(&transition, pointer, 0);
+    assert_eq!(
+        leaves.len(),
+        1,
+        "one final leave is emitted: {transition:?}"
+    );
+    assert_eq!(word(&leaves[0], 1), a);
+    assert_eq!(
+        enters.len(),
+        1,
+        "one final enter is emitted: {transition:?}"
+    );
+    assert_eq!(word(&enters[0], 1), b);
+    assert!(
+        !enters.iter().any(|body| word(body, 1) == a),
+        "the deferred teardown never restores pointer focus to unmapped A: {transition:?}"
+    );
+    assert!(
+        pointer_bodies(&transition, pointer, 2).is_empty(),
+        "the transaction sends no wl_pointer.motion through the stale grab: {transition:?}"
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .pointer
+            .current_focus()
+            .map(|surface| surface.id().protocol_id()),
+        Some(b)
+    );
+    assert!(!harness.server.state.pointer.is_grabbed());
+    assert_eq!(
+        harness.server.state.pointer_hit_test_reconciliations - reconciliations_before,
+        1,
+        "grab teardown and final hit test reconcile once after the transaction"
+    );
+}
+
+#[test]
+fn synchronized_subtree_region_changes_run_one_hit_test_per_transaction() {
+    const CHILDREN: usize = 32;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let children = (0..CHILDREN)
+        .map(|_| stage_test_synchronized_subsurface(&mut harness, TEST_TOPLEVEL_SURFACE_ID).0)
+        .collect::<Vec<_>>();
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let reconciliations_before = harness.server.state.pointer_hit_test_reconciliations;
+
+    for child in children {
+        let empty = harness.allocate_object_id();
+        send_request(&mut harness.client, TEST_COMPOSITOR_ID, 1, &words(&[empty]));
+        send_request(&mut harness.client, child, 5, &words(&[empty]));
+        send_request(&mut harness.client, child, 6, &[]);
+    }
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+
+    assert_eq!(
+        harness.server.state.pointer_hit_test_reconciliations - reconciliations_before,
+        1,
+        "{CHILDREN} synchronized child changes cause one post-transaction hit test"
+    );
+}
+
+#[test]
+fn scaled_transformed_surface_input_region_controls_wire_delivery() {
+    let mut harness = KeybindingHarness::new(true);
+    let pointer = harness.bind_pointer();
+    map_initial_test_toplevel(&mut harness);
+    let region = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        1,
+        &words(&[region]),
+    );
+    send_request(&mut harness.client, region, 1, &words(&[0, 0, 8, 8]));
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        5,
+        &words(&[region]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        7,
+        &words(&[wl_output_protocol::Transform::_90 as u32]),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        8,
+        &words(&[2]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let layout = test_toplevel_record(&harness).layout;
+    assert_eq!((layout.width, layout.height), (16.0, 32.0));
+    route_pointer_to(
+        &mut harness,
+        f64::from(layout.x + 4.0),
+        f64::from(layout.y + 4.0),
+    );
+    let inside = harness.sync();
+    assert!(
+        pointer_bodies(&inside, pointer, 0)
+            .iter()
+            .any(|body| word(body, 1) == TEST_TOPLEVEL_SURFACE_ID)
+    );
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    assert_eq!(pointer_bodies(&harness.sync(), pointer, 3).len(), 1);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let _ = harness.sync();
+    route_pointer_to(
+        &mut harness,
+        f64::from(layout.x + 12.0),
+        f64::from(layout.y + 4.0),
+    );
+    let outside = harness.sync();
+    assert!(
+        pointer_bodies(&outside, pointer, 1)
+            .iter()
+            .any(|body| word(body, 1) == TEST_TOPLEVEL_SURFACE_ID),
+        "surface-coordinate input region remains authoritative after scale+transform: {outside:?}"
+    );
+}
+
+#[test]
+fn excessive_input_region_uses_one_bounded_committed_rectangle() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let region = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        1,
+        &words(&[region]),
+    );
+    harness.dispatch_client();
+    for index in 0..10_000u32 {
+        send_request(
+            &mut harness.client,
+            region,
+            1,
+            &words(&[index % 64, index / 64, 1, 1]),
+        );
+        if index % 128 == 127 {
+            harness.dispatch_client();
+        }
+    }
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        5,
+        &words(&[region]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert!(matches!(
+        test_toplevel_record(&harness).committed_input_region,
+        Some(CommittedInputRegion::BoundingBox(_))
+    ));
+    assert!(
+        test_toplevel_record(&harness)
+            .logged_diagnostics
+            .contains(&SurfaceDiagnostic::InputRegionBoundingBox)
+    );
+    let layout = test_toplevel_record(&harness).layout;
+    assert_eq!(
+        harness
+            .server
+            .state
+            .surface_at(f64::from(layout.x + 5.0), f64::from(layout.y + 5.0))
+            .map(|record| record.role.wl_surface().id()),
+        Some(test_toplevel_record(&harness).role.wl_surface().id())
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        test_toplevel_record(&harness)
+            .logged_diagnostics
+            .iter()
+            .filter(|diagnostic| **diagnostic == SurfaceDiagnostic::InputRegionBoundingBox)
+            .count(),
+        1,
+        "bounding fallback is logged once per surface"
+    );
+}
+
+#[test]
+fn exclusive_layer_zone_offsets_cascade_maximize_and_restore_clamp() {
+    const TOP_LEFT_RIGHT: u32 = 1 | 4 | 8;
+    let mut harness = KeybindingHarness::new(true);
+    let (_layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            size: (0, 30),
+            anchor: TOP_LEFT_RIGHT,
+            exclusive_zone: 30,
+            ..TestLayerSpec::default()
+        },
+    );
+    harness.server.state.resize_output(400, 300);
+    let output_height = harness.server.state.backend.logical_output_size().1 as f32;
+    let usable = harness.server.state.usable_output_rect();
+    assert_eq!(usable.y, 30.0);
+    assert_eq!(usable.width, 400.0);
+    assert_eq!(usable.height, output_height - 30.0);
+
+    map_initial_test_toplevel(&mut harness);
+    let cascaded = test_toplevel_record(&harness).role.wl_surface().id();
+    assert!(harness.server.state.surfaces[&cascaded].layout.y >= 30.0);
+
+    let surface = test_toplevel_record(&harness).role.wl_surface().clone();
+    let server_side = {
+        let record = harness
+            .server
+            .state
+            .surfaces
+            .get_mut(&surface.id())
+            .unwrap();
+        record.window_origin.1 = 0.0;
+        record.layout.y = 0.0;
+        record.committed_decoration == SceneDecorationMode::ServerSide
+    };
+    harness.server.state.request_maximized_state(&surface, true);
+    let maximize_wire = harness.sync();
+    let extents = DecoExtents::of(&harness.server.state.decoration.theme);
+    let maximized_size = configured_toplevel_size(&maximize_wire);
+    let outer_height = maximized_size.1 as f32
+        + if server_side {
+            extents.top + extents.bottom
+        } else {
+            0.0
+        };
+    assert_eq!(outer_height, usable.height);
+    assert!(
+        toplevel_configure_states(&maximize_wire, TEST_TOPLEVEL_ID)
+            .last()
+            .is_some_and(|states| states.contains(&(xdg_toplevel::State::Maximized as u32))),
+        "usable-area maximise is asserted on the xdg wire: {maximize_wire:?}"
+    );
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&maximize_wire));
+
+    harness
+        .server
+        .state
+        .request_maximized_state(&surface, false);
+    let restore_wire = harness.sync();
+    assert!(
+        toplevel_configure_states(&restore_wire, TEST_TOPLEVEL_ID)
+            .last()
+            .is_some_and(|states| !states.contains(&(xdg_toplevel::State::Maximized as u32))),
+        "usable-area restore is asserted on the xdg wire: {restore_wire:?}"
+    );
+    let restored_size = configured_toplevel_size(&restore_wire);
+    assert!(restored_size.0 > 0 && restored_size.1 > 0);
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&restore_wire));
+    let restored = test_toplevel_record(&harness);
+    let outer_y = restored.window_origin.1 - if server_side { extents.top } else { 0.0 };
+    assert!(outer_y >= usable.y);
+}
+
+#[test]
+fn output_resize_reconciles_pointer_once_after_layers_and_toplevels_finish_moving() {
+    let mut harness = KeybindingHarness::new(true);
+    let pointer = harness.bind_pointer();
+    map_initial_test_toplevel(&mut harness);
+    let toplevel = test_toplevel_record(&harness).role.wl_surface().id();
+    {
+        let record = harness
+            .server
+            .state
+            .surfaces
+            .get_mut(&toplevel)
+            .expect("test toplevel is tracked");
+        record.layout.x = 120.0;
+        record.layout.y = 100.0;
+        record.layout.width = 40.0;
+        record.layout.height = 20.0;
+        record.window_origin = (120.0, 100.0);
+    }
+    let (layer, _) = map_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    route_pointer_to(&mut harness, 130.0, 106.0);
+    let initial = harness.sync();
+    assert!(
+        pointer_bodies(&initial, pointer, 0)
+            .iter()
+            .any(|body| word(body, 1) == layer.surface),
+        "the centred layer initially owns the pointer above the toplevel: {initial:?}"
+    );
+    let reconciliations_before = harness.server.state.pointer_hit_test_reconciliations;
+
+    harness.server.state.resize_output(140, 100);
+    let resized = harness.sync();
+    let leaves = pointer_bodies(&resized, pointer, 1);
+    assert_eq!(leaves.len(), 1, "one final leave is emitted: {resized:?}");
+    assert_eq!(word(&leaves[0], 1), layer.surface);
+    assert!(
+        pointer_bodies(&resized, pointer, 0).is_empty(),
+        "the transient toplevel position is never entered: {resized:?}"
+    );
+    assert_eq!(harness.server.state.pointer.current_focus(), None);
+    assert_eq!(
+        harness.server.state.pointer_hit_test_reconciliations - reconciliations_before,
+        1,
+        "layer arrangement and toplevel clamping share one resize reconciliation"
+    );
+}
+
+#[test]
+fn destroying_exclusive_layer_reconfigures_maximized_window_to_full_output() {
+    const TOP_LEFT_RIGHT: u32 = 1 | 4 | 8;
+    let (mut harness, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            size: (0, 30),
+            anchor: TOP_LEFT_RIGHT,
+            exclusive_zone: 30,
+            ..TestLayerSpec::default()
+        },
+    );
+    let maximize = request_test_maximized(&mut harness, true);
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&maximize));
+    let extents = DecoExtents::of(&harness.server.state.decoration.theme);
+    let constrained = configured_toplevel_size(&maximize);
+    assert_eq!(constrained.1 as f32 + extents.top + extents.bottom, 210.0);
+
+    send_request(&mut harness.client, layer.layer_surface, 7, &[]);
+    let destroyed = harness.sync();
+    let expanded = configured_toplevel_size(&destroyed);
+    assert_eq!(expanded.0 as f32 + extents.left + extents.right, 320.0);
+    assert_eq!(expanded.1 as f32 + extents.top + extents.bottom, 240.0);
+}
+
+#[test]
+fn kms_mode_change_arranges_layers_before_reconfiguring_maximized_windows() {
+    use crate::backend::kms::{
+        ConnectorDescription, ConnectorMode, KmsTopologyLifecycleEvent, KmsTopologySnapshot,
+        OutputKey, OutputScale120, PreselectedAtomicOutput,
+    };
+
+    fn snapshot(width: u32, height: u32) -> KmsTopologySnapshot {
+        let timing_width = u16::try_from(width).expect("test mode width fits u16");
+        let timing_height = u16::try_from(height).expect("test mode height fits u16");
+        let key = OutputKey {
+            device: 226,
+            connector_name: "Mode-change-1".into(),
+        };
+        let mode = ConnectorMode {
+            width,
+            height,
+            refresh_millihz: 60_000,
+            preferred: true,
+            clock_khz: 12_000,
+            hsync: (timing_width, timing_width, timing_width),
+            vsync: (timing_height, timing_height, timing_height),
+            hskew: 0,
+            vscan: 0,
+            flags: 0,
+        };
+        KmsTopologySnapshot {
+            connectors: vec![ConnectorDescription {
+                key: key.clone(),
+                connector_id: 41,
+                modes: vec![mode],
+            }],
+            selections: vec![PreselectedAtomicOutput {
+                key,
+                connector_mode: mode,
+                selection: Ok(test_atomic_selection(41, mode)),
+            }],
+            output_scale: OutputScale120::ONE,
+        }
+    }
+
+    let mut harness = KeybindingHarness::new_with_backend(false, BackendKind::Kms);
+    harness
+        .server
+        .state
+        .backend
+        .apply_kms_topology_lifecycle(KmsTopologyLifecycleEvent::Initial(snapshot(320, 240)))
+        .expect("initial KMS topology is accepted");
+    let display = harness.server.state.display_handle.clone();
+    harness
+        .server
+        .state
+        .backend
+        .reconcile_kms_client_output::<WaylandState>(&display, &[]);
+    harness.server.state.reconcile_layer_output_bindings();
+
+    map_initial_test_toplevel(&mut harness);
+    const TOP_LEFT_RIGHT: u32 = 1 | 4 | 8;
+    let (_layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            size: (0, 30),
+            anchor: TOP_LEFT_RIGHT,
+            exclusive_zone: 30,
+            ..TestLayerSpec::default()
+        },
+    );
+    let initial_maximize = request_test_maximized(&mut harness, true);
+    assert_eq!(configured_toplevel_size(&initial_maximize), (320, 210));
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&initial_maximize));
+
+    harness
+        .server
+        .state
+        .backend
+        .apply_kms_topology_lifecycle(KmsTopologyLifecycleEvent::Initial(snapshot(400, 300)))
+        .expect("changed KMS topology is accepted");
+    let display = harness.server.state.display_handle.clone();
+    harness
+        .server
+        .state
+        .backend
+        .reconcile_kms_client_output::<WaylandState>(&display, &[]);
+    harness.server.state.reconcile_layer_output_bindings();
+    harness
+        .server
+        .state
+        .reconcile_output_geometry_after_topology_change();
+    let changed = harness.sync();
+
+    assert_eq!(
+        configured_toplevel_size(&changed),
+        (400, 270),
+        "the wire configure uses the newly arranged exclusive zone: {changed:?}"
+    );
+}
+
+#[test]
+fn same_rect_kms_output_replacement_reconfigures_after_explicit_exclusive_layer_closes() {
+    use crate::backend::kms::{
+        ConnectorDescription, ConnectorMode, KmsTopologyLifecycleEvent, KmsTopologySnapshot,
+        OutputKey, OutputScale120, PreselectedAtomicOutput,
+    };
+
+    fn snapshot(connector_name: &str, connector_id: u32) -> KmsTopologySnapshot {
+        let mode = ConnectorMode {
+            width: 320,
+            height: 240,
+            refresh_millihz: 60_000,
+            preferred: true,
+            clock_khz: 12_000,
+            hsync: (320, 320, 320),
+            vsync: (240, 240, 240),
+            hskew: 0,
+            vscan: 0,
+            flags: 0,
+        };
+        let key = OutputKey {
+            device: 226,
+            connector_name: connector_name.into(),
+        };
+        KmsTopologySnapshot {
+            connectors: vec![ConnectorDescription {
+                key: key.clone(),
+                connector_id,
+                modes: vec![mode],
+            }],
+            selections: vec![PreselectedAtomicOutput {
+                key,
+                connector_mode: mode,
+                selection: Ok(test_atomic_selection(connector_id, mode)),
+            }],
+            output_scale: OutputScale120::ONE,
+        }
+    }
+
+    let mut harness = KeybindingHarness::new_with_backend(false, BackendKind::Kms);
+    harness
+        .server
+        .state
+        .backend
+        .apply_kms_topology_lifecycle(KmsTopologyLifecycleEvent::Initial(snapshot(
+            "Explicit-old-1",
+            41,
+        )))
+        .expect("initial KMS output is accepted");
+    let display = harness.server.state.display_handle.clone();
+    harness
+        .server
+        .state
+        .backend
+        .reconcile_kms_client_output::<WaylandState>(&display, &[]);
+    harness.server.state.reconcile_layer_output_bindings();
+
+    map_initial_test_toplevel(&mut harness);
+    const TOP_LEFT_RIGHT: u32 = 1 | 4 | 8;
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            size: (0, 30),
+            anchor: TOP_LEFT_RIGHT,
+            exclusive_zone: 30,
+            ..TestLayerSpec::default()
+        },
+    );
+    let old_output = harness
+        .server
+        .state
+        .backend
+        .default_output()
+        .expect("initial KMS output exists");
+    let layer_object = test_layer_record(&harness, layer.surface)
+        .role
+        .wl_surface()
+        .id();
+    let SurfaceRole::Layer(role) = &mut harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&layer_object)
+        .expect("layer remains tracked")
+        .role
+    else {
+        panic!("test surface remains a layer");
+    };
+    role.output = LayerOutputBinding::Explicit(old_output);
+
+    let maximize = request_test_maximized(&mut harness, true);
+    assert_eq!(configured_toplevel_size(&maximize), (320, 210));
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&maximize));
+    let previous_output = harness.server.state.logical_output_rect();
+    let previous_usable = harness.server.state.usable_output_rect();
+
+    harness
+        .server
+        .state
+        .backend
+        .apply_kms_topology_lifecycle(KmsTopologyLifecycleEvent::Initial(snapshot(
+            "Explicit-new-1",
+            42,
+        )))
+        .expect("same-sized replacement KMS output is accepted");
+    let display = harness.server.state.display_handle.clone();
+    harness
+        .server
+        .state
+        .backend
+        .reconcile_kms_client_output::<WaylandState>(&display, &[]);
+    harness.server.state.reconcile_layer_output_bindings();
+    assert_eq!(harness.server.state.logical_output_rect(), previous_output);
+    assert_ne!(harness.server.state.usable_output_rect(), previous_usable);
+    harness
+        .server
+        .state
+        .reconcile_output_after_topology_change_if_needed(previous_output, previous_usable);
+    let replaced = harness.sync();
+
+    assert!(matches!(
+        test_layer_record(&harness, layer.surface).role,
+        SurfaceRole::Layer(LayerRole {
+            output: LayerOutputBinding::Closed,
+            ..
+        })
+    ));
+    assert_eq!(
+        configured_toplevel_size(&replaced),
+        (320, 240),
+        "the maximised window expands when only the usable zone changed: {replaced:?}"
+    );
+}
+
+#[test]
+fn kms_output_replacement_defers_explicit_layer_pointer_teardown_until_batch_end() {
+    use crate::backend::kms::{
+        ConnectorDescription, ConnectorMode, KmsTopologyLifecycleEvent, KmsTopologySnapshot,
+        OutputKey, OutputScale120, PreselectedAtomicOutput,
+    };
+
+    fn snapshot(connector_name: &str, connector_id: u32) -> KmsTopologySnapshot {
+        let mode = ConnectorMode {
+            width: 320,
+            height: 240,
+            refresh_millihz: 60_000,
+            preferred: true,
+            clock_khz: 12_000,
+            hsync: (320, 320, 320),
+            vsync: (240, 240, 240),
+            hskew: 0,
+            vscan: 0,
+            flags: 0,
+        };
+        let key = OutputKey {
+            device: 226,
+            connector_name: connector_name.into(),
+        };
+        KmsTopologySnapshot {
+            connectors: vec![ConnectorDescription {
+                key: key.clone(),
+                connector_id,
+                modes: vec![mode],
+            }],
+            selections: vec![PreselectedAtomicOutput {
+                key,
+                connector_mode: mode,
+                selection: Ok(test_atomic_selection(connector_id, mode)),
+            }],
+            output_scale: OutputScale120::ONE,
+        }
+    }
+
+    fn run(with_popup_grab: bool) {
+        let mut harness = KeybindingHarness::new_with_backend(false, BackendKind::Kms);
+        let pointer = harness.bind_pointer();
+        harness
+            .server
+            .state
+            .backend
+            .apply_kms_topology_lifecycle(KmsTopologyLifecycleEvent::Initial(snapshot(
+                "Pointer-old-1",
+                51,
+            )))
+            .expect("initial KMS output is accepted");
+        let display = harness.server.state.display_handle.clone();
+        harness
+            .server
+            .state
+            .backend
+            .reconcile_kms_client_output::<WaylandState>(&display, &[]);
+        harness.server.state.reconcile_layer_output_bindings();
+
+        let (underlay, _) = map_test_layer_surface(
+            &mut harness,
+            0,
+            TestLayerSpec {
+                layer: WlrLayer::Background as u32,
+                ..TestLayerSpec::default()
+            },
+        );
+        let (layer, _) = map_test_layer_surface(
+            &mut harness,
+            0,
+            TestLayerSpec {
+                layer: WlrLayer::Overlay as u32,
+                keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive
+                    as u32,
+                ..TestLayerSpec::default()
+            },
+        );
+        let old_output = harness
+            .server
+            .state
+            .backend
+            .default_output()
+            .expect("initial KMS output exists");
+        let layer_object = test_layer_record(&harness, layer.surface)
+            .role
+            .wl_surface()
+            .id();
+        let SurfaceRole::Layer(role) = &mut harness
+            .server
+            .state
+            .surfaces
+            .get_mut(&layer_object)
+            .expect("layer remains tracked")
+            .role
+        else {
+            panic!("test surface remains a layer");
+        };
+        role.output = LayerOutputBinding::Explicit(old_output);
+
+        route_pointer_to(&mut harness, 160.0, 120.0);
+        let entered = harness.sync();
+        assert!(
+            pointer_bodies(&entered, pointer, 0)
+                .iter()
+                .any(|body| word(body, 1) == layer.surface),
+            "the explicit overlay owns pointer focus before replacement: {entered:?}"
+        );
+        if with_popup_grab {
+            let serial = press_test_key_and_serial(&mut harness, 24);
+            let _popup = map_test_grabbing_layer_popup(&mut harness, layer, serial);
+            assert!(harness.server.state.pointer.is_grabbed());
+            let _ = harness.sync();
+        }
+
+        let previous_output = harness.server.state.logical_output_rect();
+        let previous_usable = harness.server.state.usable_output_rect();
+        let reconciliations_before = harness.server.state.pointer_hit_test_reconciliations;
+        harness.server.state.begin_pointer_hit_test_batch();
+        harness
+            .server
+            .state
+            .backend
+            .apply_kms_topology_lifecycle(KmsTopologyLifecycleEvent::Initial(snapshot(
+                "Pointer-new-1",
+                52,
+            )))
+            .expect("replacement KMS output is accepted");
+        let display = harness.server.state.display_handle.clone();
+        harness
+            .server
+            .state
+            .backend
+            .reconcile_kms_client_output::<WaylandState>(&display, &[]);
+        harness.server.state.reconcile_layer_output_bindings();
+        harness
+            .server
+            .state
+            .reconcile_output_after_topology_change_if_needed(previous_output, previous_usable);
+
+        let during_batch = harness.sync();
+        assert!(
+            pointer_bodies(&during_batch, pointer, 0).is_empty()
+                && pointer_bodies(&during_batch, pointer, 1).is_empty()
+                && pointer_bodies(&during_batch, pointer, 2).is_empty(),
+            "binding closure emits no transient pointer transition while batched: {during_batch:?}"
+        );
+        assert_eq!(
+            harness.server.state.pointer_hit_test_reconciliations, reconciliations_before,
+            "the batch has not reconciled early"
+        );
+
+        harness.server.state.end_pointer_hit_test_batch();
+        let final_transition = harness.sync();
+        let leaves = pointer_bodies(&final_transition, pointer, 1);
+        let enters = pointer_bodies(&final_transition, pointer, 0);
+        assert_eq!(leaves.len(), 1, "one final leave: {final_transition:?}");
+        assert_eq!(word(&leaves[0], 1), layer.surface);
+        assert_eq!(enters.len(), 1, "one final enter: {final_transition:?}");
+        assert_eq!(word(&enters[0], 1), underlay.surface);
+        assert!(
+            pointer_bodies(&final_transition, pointer, 2).is_empty(),
+            "no stale restoring motion is emitted: {final_transition:?}"
+        );
+        assert_eq!(
+            harness.server.state.pointer_hit_test_reconciliations,
+            reconciliations_before + 1,
+            "the topology batch performs one final hit-test"
+        );
+        assert!(!harness.server.state.pointer.is_grabbed());
+    }
+
+    run(false);
+    run(true);
 }
 
 #[test]

@@ -18,6 +18,8 @@ use bevy::{
 use cosmix_wgpu_dmabuf::{DmabufRelease, ImportedDmabufImages, ReleaseCallback};
 use smithay::reexports::wayland_server::backend::ObjectId;
 
+#[cfg(test)]
+use crate::protocol::SurfaceStackKey;
 use crate::protocol::{
     ChromeCursorIcon, ClientSceneFeed, CursorImage, CursorPositionSnapshot, CursorPresentation,
     DmabufUseId, MAX_GLOBAL_SURFACES, ProtocolEvent, SceneSurfaceKind, ShmFrame, SurfaceFrame,
@@ -1984,9 +1986,7 @@ fn recompute_surface_z_ranks(world: &mut World) {
         .collect::<Vec<_>>();
     debug_assert!(ordered.len() <= MAX_GLOBAL_SURFACES);
     ordered.sort_unstable_by(|(left_id, left_z), (right_id, right_z)| {
-        left_z
-            .total_cmp(right_z)
-            .then_with(|| left_id.0.cmp(&right_id.0))
+        left_z.cmp(right_z).then_with(|| left_id.0.cmp(&right_id.0))
     });
     let changed = {
         let mut entities = world.resource_mut::<SurfaceEntities>();
@@ -2018,7 +2018,7 @@ fn recompute_surface_z_ranks(world: &mut World) {
             .filter_map(|(id, _)| entities.surfaces.get(id).map(|surface| (id, surface)))
             .map(|(id, surface)| {
                 format!(
-                    "{}(z={:.3} rz={:.1} parent={:?} {:?})",
+                    "{}(stack={:?} rz={:.1} parent={:?} {:?})",
                     id.0,
                     surface.layout.z,
                     surface.renderer_z,
@@ -2265,7 +2265,7 @@ mod tests {
             y: id as f32 * 5.0,
             width: 8.0,
             height: 8.0,
-            z: id as f32,
+            z: SurfaceStackKey::normal(id),
             source: None,
             parent: None,
             transform: SurfaceTransform::Normal,
@@ -2920,7 +2920,7 @@ mod tests {
             y: 13.0,
             width: 80.0,
             height: 40.0,
-            z: 1.0,
+            z: SurfaceStackKey::normal(1),
             source: Some(TextureSourceRect {
                 x: 17.0,
                 y: 23.0,
@@ -2984,7 +2984,7 @@ mod tests {
             y: 80.0,
             width: 320.0,
             height: 200.0,
-            z: 1.0,
+            z: SurfaceStackKey::normal(1),
             source: None,
             parent: None,
             transform: SurfaceTransform::Normal,
@@ -3296,9 +3296,9 @@ mod tests {
         world.insert_resource(SurfaceEntities::default());
         world.insert_resource(Assets::<Image>::default());
         insert_client_surface_render_resources(&mut world);
-        for (id, protocol_z) in [(1, -1.0e30), (2, 9.0e30), (3, 42.0)] {
+        for (id, sequence) in [(1, 0), (2, u64::MAX), (3, 42)] {
             let mut layout = layout(id);
-            layout.z = protocol_z;
+            layout.z = SurfaceStackKey::normal(sequence);
             upsert_surface(&mut world, SurfaceId(id), layout, frame(id as u8));
         }
         recompute_surface_z_ranks(&mut world);
@@ -3478,7 +3478,7 @@ mod tests {
         ordered.sort_unstable_by(|left, right| {
             left.layout
                 .z
-                .total_cmp(&right.layout.z)
+                .cmp(&right.layout.z)
                 .then_with(|| left.entity.index().cmp(&right.entity.index()))
         });
         assert!(
@@ -3510,7 +3510,7 @@ mod tests {
         );
         let writes_before = world.resource::<ZRankRecomputeProbe>().transform_writes;
         let mut same_rank = layout(2);
-        same_rank.z += 0.25;
+        same_rank.z.sequence += 1;
 
         apply_protocol_events(
             &mut world,
@@ -3538,7 +3538,7 @@ mod tests {
             y: 0.0,
             width: 64.0,
             height: 32.0,
-            z: 1.0,
+            z: SurfaceStackKey::normal(1),
             source: None,
             parent: None,
             transform: SurfaceTransform::Normal,
@@ -3614,7 +3614,7 @@ mod tests {
             y: 0.0,
             width: 8.0,
             height: 8.0,
-            z: 1.0,
+            z: SurfaceStackKey::normal(1),
             source: None,
             parent: None,
             transform: SurfaceTransform::Normal,
@@ -3719,7 +3719,7 @@ mod tests {
             y: 80.0,
             width: 300.0,
             height: 200.0,
-            z: 10.0,
+            z: SurfaceStackKey::normal(10),
             source: None,
             parent: None,
             transform: SurfaceTransform::Normal,
@@ -3731,7 +3731,7 @@ mod tests {
             y: 125.0,
             width: 40.0,
             height: 30.0,
-            z: 11.0,
+            z: SurfaceStackKey::normal(11),
             source: None,
             parent: Some(parent_id),
             transform: SurfaceTransform::Normal,
@@ -3935,19 +3935,16 @@ mod tests {
         let mut client = RealCursorSceneClient::connect(&runtime, &socket_name, "live-cursor");
         client.commit_rgb([0x80, 0x20, 0x10]);
 
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            app.update();
-            if app.world().resource::<CursorScene>().selection == ProjectedCursorSelection::Surface
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "real cursor did not reach the live-shaped scene App"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        runtime
+            .kms_topology_client()
+            .flush_events(Duration::from_secs(30))
+            .expect("cursor publication is complete before the scene update");
+        app.update();
+        assert_eq!(
+            app.world().resource::<CursorScene>().selection,
+            ProjectedCursorSelection::Surface,
+            "the first update after the publication barrier adopts the real cursor"
+        );
         let cursor = app.world().resource::<CursorScene>();
         let entity = cursor
             .entity
@@ -4108,7 +4105,7 @@ mod tests {
             y: 100.0,
             width: 60.0,
             height: 30.0,
-            z: 9.0,
+            z: SurfaceStackKey::normal(9),
             visible: false,
             ..layout(2)
         };
@@ -4223,7 +4220,7 @@ mod tests {
             y: 80.0,
             width: 300.0,
             height: 200.0,
-            z: 10.0,
+            z: SurfaceStackKey::normal(10),
             ..layout(1)
         };
         let child_layout = SurfaceLayout {
@@ -4231,7 +4228,7 @@ mod tests {
             y: 125.0,
             width: 40.0,
             height: 30.0,
-            z: 11.0,
+            z: SurfaceStackKey::normal(11),
             parent: Some(parent_id),
             ..layout(2)
         };
@@ -4340,17 +4337,23 @@ mod tests {
             "the fixture's SurfaceId order must contradict the desired content order"
         );
         let z = |id| surfaces[&id].layout.z;
-        assert!((z(a_id) - 11.0).abs() < 0.000_1, "A root z = {}", z(a_id));
-        assert!(
-            (z(a_child_id) - 11.001).abs() < 0.000_1,
-            "A child z = {}",
-            z(a_child_id)
+        let a_root = z(a_id);
+        let b_root = z(b_id);
+        assert!(a_root < b_root);
+        assert_eq!(
+            z(a_child_id),
+            SurfaceStackKey {
+                tree_index: 1,
+                ..a_root
+            }
         );
-        assert!((z(b_id) - 12.0).abs() < 0.000_1, "B root z = {}", z(b_id));
-        assert!(
-            (z(b_child_id) - 12.001).abs() < 0.000_1,
-            "B's parent map must replace its provisional child z: {}",
-            z(b_child_id)
+        assert_eq!(
+            z(b_child_id),
+            SurfaceStackKey {
+                tree_index: 1,
+                ..b_root
+            },
+            "B's parent map must replace its provisional child stack key"
         );
 
         let entity = |id| surfaces[&id].entity;

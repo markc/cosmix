@@ -183,6 +183,16 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
             .unset_grab(data, &seat, serial, time, true);
     }
 
+    /// Remove a grab without restoring the focus cached while it was active.
+    // cosmix addition: allow atomic post-transaction focus reconciliation.
+    pub fn unset_grab_without_focus_restore(&self, data: &mut D, serial: Serial, time: u32) {
+        let seat = self.get_seat(data);
+        self.inner
+            .lock()
+            .unwrap()
+            .unset_grab(data, &seat, serial, time, false);
+    }
+
     /// Check if this pointer is currently grabbed with this serial
     pub fn has_grab(&self, serial: Serial) -> bool {
         let guard = self.inner.lock().unwrap();

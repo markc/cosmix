@@ -596,6 +596,10 @@ pub trait CompositorHandler {
     /// using a pre-commit hook (see [`add_pre_commit_hook`]).
     fn commit(&mut self, surface: &WlSurface);
 
+    /// Called after every surface in one transaction has applied its current state.
+    // cosmix addition: reconcile state that must observe a complete applied transaction.
+    fn transaction_applied(&mut self) {}
+
     /// The surface was destroyed.
     ///
     /// This allows the compositor to clean up any uses of the surface.
