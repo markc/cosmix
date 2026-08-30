@@ -211,7 +211,9 @@ fn deploy_node($node)
 mkdir($root, {parents: true})
 mkdir("/etc/cosmix/filesd", {parents: true})
 print(run("getent passwd cosmix-filesd >/dev/null || useradd --system --no-create-home --shell /usr/sbin/nologin cosmix-filesd"))
-print(run("chown cosmix-filesd:cosmix-filesd " .. $root))
+$uid = to_number(run("id -u cosmix-filesd"))
+$gid = to_number(run("id -g cosmix-filesd"))
+chown($root, $uid, $gid)
 print("bootstrap-ok")', {bindings: {root: $corpus_root}, timeout: 60})
   $d.die_if(not $boot["ok"] or not contains($boot["stdout"], "bootstrap-ok"),
     $node .. " user/directory bootstrap failed: " .. trim($boot["stdout"]) .. " " .. trim($boot["stderr"]))
@@ -223,18 +225,22 @@ print("bootstrap-ok")', {bindings: {root: $corpus_root}, timeout: 60})
   ], {timeout: 120})
   $d.die_if($scp["exit_code"] != 0, "binary scp -> " .. $node .. ": " .. trim($scp["stderr"]))
 
-  -- Stage text artifacts with Mix builtins. The system install below replaces
-  -- all three files before the service is restarted.
-  $stage = ssh_mix($addr, 'write_file("/tmp/cosmix-filesd@.service.new", $unit)
-chmod("/tmp/cosmix-filesd@.service.new", 0o644)
-write_file("/tmp/cosmix-filesd.conf.mix.new", $conf)
-chmod("/tmp/cosmix-filesd.conf.mix.new", 0o644)
-print("stage-ok")', {bindings: {unit: $unit_data, conf: $conf_data}, timeout: 60})
+  -- Stage text artifacts beside their targets so Mix rename() can replace
+  -- each atomically before the service is restarted.
+  $stage = ssh_mix($addr, 'write_file("/usr/lib/systemd/system/cosmix-filesd@.service.new", $unit)
+chmod("/usr/lib/systemd/system/cosmix-filesd@.service.new", 0o644)
+write_file("/etc/cosmix/filesd/" .. $corpus .. ".conf.mix.new", $conf)
+chmod("/etc/cosmix/filesd/" .. $corpus .. ".conf.mix.new", 0o644)
+print("stage-ok")', {bindings: {unit: $unit_data, conf: $conf_data, corpus: $corpus}, timeout: 60})
   $d.die_if(not $stage["ok"] or not contains($stage["stdout"], "stage-ok"),
     $node .. " unit/config stage failed: " .. trim($stage["stdout"]) .. " " .. trim($stage["stderr"]))
 
   $inst_files = ssh_mix($addr,
-    'print(run("install -o 0 -g 0 -m 0755 /opt/cosmix/bin/cosmix-filesd.new /opt/cosmix/bin/cosmix-filesd && install -o 0 -g 0 -m 0644 /tmp/cosmix-filesd@.service.new /usr/lib/systemd/system/cosmix-filesd@.service && install -o 0 -g 0 -m 0644 /tmp/cosmix-filesd.conf.mix.new /etc/cosmix/filesd/" .. $corpus .. ".conf.mix && rm -f /opt/cosmix/bin/cosmix-filesd.new /tmp/cosmix-filesd@.service.new /tmp/cosmix-filesd.conf.mix.new && /opt/cosmix/bin/cosmix-filesd --version"))',
+    'chmod("/opt/cosmix/bin/cosmix-filesd.new", 0o755)
+rename("/opt/cosmix/bin/cosmix-filesd.new", "/opt/cosmix/bin/cosmix-filesd")
+rename("/usr/lib/systemd/system/cosmix-filesd@.service.new", "/usr/lib/systemd/system/cosmix-filesd@.service")
+rename("/etc/cosmix/filesd/" .. $corpus .. ".conf.mix.new", "/etc/cosmix/filesd/" .. $corpus .. ".conf.mix")
+print(run("/opt/cosmix/bin/cosmix-filesd --version"))',
     {bindings: {corpus: $corpus}, timeout: 60})
   $d.die_if(not $inst_files["ok"] or trim($inst_files["stdout"]) != $ver,
     $node .. " install/version mismatch (want " .. $ver .. "): " .. trim($inst_files["stdout"]) .. " " .. trim($inst_files["stderr"]))
@@ -256,7 +262,7 @@ print("stage-ok")', {bindings: {unit: $unit_data, conf: $conf_data}, timeout: 60
   -- InvocationID must change, and journald must contain output attributed to
   -- that exact new invocation.
   $before = ssh_mix($addr,
-    'print(run("systemctl show -p InvocationID --value " .. $inst))',
+    'print(run("systemctl daemon-reload && systemctl show -p InvocationID --value " .. $inst))',
     {bindings: {inst: $inst}, timeout: 60})
   $d.die_if(not $before["ok"], $node .. " could not read pre-restart invocation: " .. trim($before["stderr"]))
 
@@ -291,12 +297,26 @@ print("stage-ok")', {bindings: {unit: $unit_data, conf: $conf_data}, timeout: 60
 
   -- A successful property round-trip proves the new process registered its
   -- configured Bus service and is serving requests, not merely active.
-  $bus = ssh_mix($addr, 'send $service filesd.props.list timeout=15
-if $rc != 0 then
+  $bus = ssh_mix($addr, '$try = 0
+$passed = false
+$reply = nil
+while $try < 5 and not $passed
+  send $service filesd.props.list timeout=15
+  if $rc == 0 then
+    $passed = true
+    $reply = $result
+  else
+    $try = $try + 1
+    if $try < 5 then
+      sleep(1)
+    end
+  end
+end
+if not $passed then
   print("send rc=" .. $rc .. " result=" .. ("" .. $result))
   exit(7)
 end
-print("props-ok " .. ("" .. $result))', {bindings: {service: $service}, timeout: 30})
+print("props-ok " .. ("" .. $reply))', {bindings: {service: $service}, timeout: 90})
   $d.die_if(not $bus["ok"] or not contains($bus["stdout"], "props-ok"),
     $node .. " " .. $service .. " filesd.props.list smoke failed: " .. trim($bus["stdout"]) .. " " .. trim($bus["stderr"]))
   print("  bus: " .. $service .. " filesd.props.list OK")

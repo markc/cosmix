@@ -99,7 +99,8 @@ fn cargo_must($argv, $cwd, $what)
   $r = run_argv(concat(["cargo"], $argv),
     {cwd: $cwd, timeout: 1800, max_output: 4000000})
   $d.die_if($r["exit_code"] != 0,
-    $what .. " failed (exit " .. $r["exit_code"] .. "): " .. trim($r["stderr"]))
+    $what .. " failed (exit " .. $r["exit_code"] .. "): " ..
+    trim($r["stdout"]) .. " " .. trim($r["stderr"]))
 end
 
 fn build_and_test()
@@ -118,7 +119,8 @@ fn parity($bin, $expected)
   print("[spamlite] parity harness " .. $PARITY)
   $r = run_argv([$d.mix_bin(), $PARITY, $bin], {timeout: 1800, max_output: 4000000})
   $d.die_if($r["exit_code"] != 0,
-    "parity harness failed (exit " .. $r["exit_code"] .. "): " .. trim($r["stderr"]))
+    "parity harness failed (exit " .. $r["exit_code"] .. "): " ..
+    trim($r["stdout"]) .. " " .. trim($r["stderr"]))
   $matches = regex_find("scores_sha256=([0-9a-f]{64})", $r["stdout"])
   $d.die_if(len($matches) == 0,
     "parity harness printed no scores_sha256 line:\n" .. $r["stdout"])
@@ -308,6 +310,8 @@ fn carry_maild($lag)
   ], {cwd: $COSMIX_SRC, timeout: 1800, max_output: 4000000})
   if $tests["exit_code"] != 0 then
     print("  RED: maild tests failed on the new engine (exit " .. $tests["exit_code"] .. ").")
+    print($tests["stdout"])
+    print($tests["stderr"])
     print("  The pin and version bumps remain uncommitted in " .. $COSMIX_SRC .. ".")
     print("  If a golden moved, decide whether the score change is intended before updating it.")
     exit(1)
@@ -343,7 +347,8 @@ fn carry_maild($lag)
   $deploy = run_argv([$d.mix_bin(), $MAILD_DEPLOY, "deploy"],
     {cwd: $d.hub_root(), timeout: 1800, max_output: 4000000})
   $d.die_if($deploy["exit_code"] != 0,
-    "deploy_maild.mix failed (exit " .. $deploy["exit_code"] .. ") — the monorepo commit is pushed: " .. trim($deploy["stderr"]))
+    "deploy_maild.mix failed (exit " .. $deploy["exit_code"] ..
+    ") — the monorepo commit is pushed: " .. trim($deploy["stdout"]) .. " " .. trim($deploy["stderr"]))
   print($deploy["stdout"])
   print("[maild] carried: " .. $subject)
 end
@@ -422,6 +427,8 @@ for each $node in $CONF["target_nodes"]
   $d.assert_node($ROSTER, $node)
   $d.die_if($d.is_foreign($ROSTER, $node),
     "spamlite target '" .. $node .. "' is foreign; deploy requires a Mix-login mesh node")
+  $d.die_if(trim($d.mesh_ip($node)) == "",
+    "spamlite target '" .. $node .. "' has no mesh address")
   $d.die_if(is_in($configured, $node),
     "duplicate spamlite target in " .. $CONF_PATH .. ": " .. $node)
   push($configured, $node)
