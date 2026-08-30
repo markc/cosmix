@@ -1,0 +1,2969 @@
+#!/opt/cosmix/bin/mix
+-- check-public-hygiene.mix — refuse to publish mesh-private identity.
+--
+-- Enforces the "no hardwired mesh values in a public repo" mandate
+-- (_decisions/2026-07-25-no-hardwired-mesh-values.md). Prose alone already
+-- failed once: the 2026-05-29 sanitization regressed within five days and sat
+-- broken for seven weeks. This is the executable half.
+--
+-- USAGE
+--   mix _bin/check-public-hygiene.mix --all
+--   mix _bin/check-public-hygiene.mix --tree   <repo> [<rev>]
+--   mix _bin/check-public-hygiene.mix --index  <repo>
+--   mix _bin/check-public-hygiene.mix --range  <repo> <rev-list args…>
+--   mix _bin/check-public-hygiene.mix --object  <repo> <rev>
+--   mix _bin/check-public-hygiene.mix --object-chain <repo> <rev>
+--   mix _bin/check-public-hygiene.mix --message <repo> <file>
+--   ... [--print-fingerprints]
+--
+--   --tree   scan one revision's tracked content (default rev: HEAD)
+--   --index  scan the staged index                      (pre-commit hook)
+--   --range  scan EVERY COMMIT the args select          (pre-push hook)
+--            — not just the tip, so add-in-one-commit / remove-in-the-next
+--            still fails; that content would be published either way. Cost is
+--            one grep per rule per commit, so a huge range is slow by design.
+--            Scans each commit's TREE and its MESSAGE: `git grep` only ever
+--            searches trees, so a message is invisible to --tree/--index while
+--            being published verbatim.
+--            Everything after <repo> is handed to `git rev-list` verbatim, so
+--            a first push of a new branch can say
+--            `<sha> --stdin` with `^<remote-have>` lines on stdin (only the
+--            commits this push publishes) instead of `<sha>` (all of history).
+--   --object scan a git object's own content            (pre-push hook)
+--            An ANNOTATED TAG carries a message that no commit scan can see:
+--            re-tagging an already-published commit selects zero commits, so
+--            --range would report clean while the push publishes the message.
+--            Applies the same rules in-process via regex_match (no blob).
+--   --object-chain walk tags and scan their bodies plus a terminal blob or
+--            terminal commit tree; terminal trees are refused. Shared by
+--            --all and pre-push.
+--   --message scan a pending commit message file       (commit-msg hook)
+--            Catches a leak while it is still trivially editable. pre-push
+--            would catch it too, but only once fixing it means a rebase.
+--   --all    scan HEAD plus every local refs/heads and refs/tags TIP over every
+--            repo in the config — the AUDIT mode. Annotated-tag bodies are
+--            followed and scanned through to their terminal commit tree or
+--            blob. This does NOT scan unreachable history or every commit.
+--            It is the only mode that can see the whole allowlist, so the only
+--            mode that reports stale exceptions (see reconciliation below).
+--
+-- EXIT CONTRACT
+--   0  clean
+--   1  policy violation, or a duplicated / (in --all) stale exception
+--   2  infrastructure failure (bad invocation, git error, unreadable config,
+--      truncated scan, scanned-nothing) — never confuse "could not check"
+--      with "clean"
+--
+-- Rules come from three places on purpose. The mesh half is DERIVED from the
+-- roster, so it cannot drift when the mesh changes: from the SIGNED roster
+-- (_etc/mesh/inventory.signed — what the fleet actually runs, and the minimum)
+-- unioned with the AUTHORED one (_etc/mesh/inventory.mix — what it is about to
+-- run, equally private and not yet signed). Union, never intersection: an edit
+-- to the authored file must not be able to retire a rule for an identifier
+-- that is still live. The rest is static data in _etc/public-hygiene.conf.mix.
+-- None of the three lives in a public repo — a published list of forbidden
+-- strings is itself a disclosure.
+-- Text exceptions are exact rule/path/line/content fingerprints. Binary
+-- exceptions are separate and pin the sha256 of the COMPLETE git blob: any
+-- byte change re-arms the gate, unlike a path exclusion that would silently
+-- exempt future content nobody inspected. See the allowlist header and
+-- _decisions/2026-08-10-binary-pardon-by-content-hash.md.
+--
+-- Implementation note: scanning is `git grep` (one subprocess per rule per
+-- revision), not a read-every-blob loop. The loop was ~0.9s per blob, which on
+-- a repo this size is slow enough that people stop running the gate.
+-- Binary content is NOT excluded. `-I` is passed, but paired with a second
+-- `-l` pass whose paths minus the text pass's paths ARE the binary matches —
+-- so binary files are still surfaced as violations requiring manual
+-- inspection, without parsing git's ambiguous "Binary file … matches" prose.
+
+-- 2026-08-30: the hub locates ITSELF, in the same shape as the $COSMIX rule:
+-- the directory above this script IF it is a hub (holds the gate conf), else
+-- the CMCTL environment variable, else the documented default ~/.ctl. So a
+-- copy of the starter control folder ($COSMIX/ctl -> anywhere) works unchanged,
+-- and a patched copy of this script written elsewhere (the test suite does
+-- that) still finds the real hub.
+fn locate_hub()
+  $here = dirname(dirname(realpath($0)))
+  if is_file($here .. "/_etc/public-hygiene.conf.mix") then
+    return $here
+  end
+  $e = env("CMCTL")
+  if $e != "" then
+    return $e
+  end
+  return env("HOME") .. "/.ctl"
+end
+$CMCTL = locate_hub()
+$CONF = $CMCTL .. "/_etc/public-hygiene.conf.mix"
+$ALLOW = $CMCTL .. "/_etc/public-hygiene.allow.conf.mix"
+$INV = $CMCTL .. "/_etc/mesh/inventory.mix"
+
+-- The authored roster is a PROPOSAL; the signed one is what the fleet runs.
+-- Deriving rules from the authored file alone made the gate defeatable by
+-- editing it: delete a live node (or renumber the subnet) in inventory.mix,
+-- and its rule vanishes from this gate while the node keeps answering on the
+-- mesh — so the identifier is still live, still private, and now unguarded.
+-- The rule set is therefore the UNION of both. The signed roster is the
+-- minimum (it names what is deployed) and authored additions are unioned on
+-- top (they name what is about to be, which is equally private and not yet
+-- signed). Nothing is ever subtracted by an edit.
+$SIGNED     = $CMCTL .. "/_etc/mesh/inventory.signed"
+$GENESIS    = "/etc/cosmix/noded/genesis.pub"
+$MESH       = "bus"
+
+-- The mesh trust toolkit, verbatim. This gate used to carry its OWN copy of
+-- the signature check and the freshness floor, on the reasoning that
+-- verified_inventory() exits 1 and 1 means "scanned, found violations" here.
+-- The exit code was a real problem; a second implementation was the wrong
+-- answer to it. Round 14 found four divergences in the copy, every one in the
+-- direction that reports a leaking tree clean: it took the pair on its own
+-- (so a substituted payload at the same epoch passed), read a bare exists()
+-- (so an unreadable mirror read as an absent one), reduced recovery to a
+-- lexicographic compare (so a non-advancing recovery generation passed), and
+-- substituted 0 for an omitted generation (so after the first recovery every
+-- ordinary payload would have blocked commits in three repos). None of those
+-- are in mesh_lib. They were in the copy, because a copy is where they can be.
+--
+-- So: one implementation, and the exit code is the knob. mesh_lib routes every
+-- refusal through mesh_fatal(), and the $MESH_FATAL_EXIT set just below (BEFORE
+-- the include, so it survives load order) makes those
+-- refusals land as this gate's 2 — "could not answer" — never its 1.
+$MESH_FATAL_EXIT = 2
+include $CMCTL .. "/_bin/mesh_lib.mix"
+
+-- Exit 2 stops the whole run, not just the repo that hit it: the failures that
+-- produce it — a git that lies about its own output, an undecodable stream, a
+-- ref shape the gate cannot walk — are rarely repo-local, and accumulating the
+-- rest into a report that still prints "scanned N repo(s)" dresses a partial
+-- audit as coverage. Fail-fast is only honest if the message says what went
+-- unlooked-at, which is what this carries.
+$SCAN_CTX = ""
+
+-- The last line of a scan that reached its own end, and the whole of what makes
+-- an exit code readable. Round twenty: 0 and 1 are CLAIMS ABOUT THE TREE, but a
+-- Mix runtime error exits 1 too — a gate file that has been moved or made
+-- unreadable since install time, a raise nothing caught — and nothing
+-- downstream could tell "I scanned it and found mesh-private data" from "I died
+-- before scanning anything". The hook now refuses to read either verdict
+-- without this line, so the distinction is carried in-band rather than assumed.
+-- It is stripped before the hook echoes the gate's output, so operators never
+-- see it. Never printed on the bail(2) path: 2 already means "do not read this
+-- as a verdict".
+$COMPLETE = "hygiene-scan-complete:"
+
+fn bail($code, $msg)
+  print("check-public-hygiene: " .. $msg)
+  if $SCAN_CTX != "" then
+    print("  " .. $SCAN_CTX)
+  end
+  exit($code)
+end
+
+-- Length-prefixed field encoding for the allowlist fingerprint. See the long
+-- note above the fingerprint loop for why a separator byte is not enough.
+fn fp_field($s)
+  return "" .. len($s) .. ":" .. $s
+end
+
+-- load_data() RAISES on a missing or malformed file, and an uncaught Mix error
+-- exits 1 — which this tool's contract reserves for "policy violation". A
+-- config that cannot be read is infrastructure: it must exit 2, or a broken
+-- config is indistinguishable from a leak (and, worse, a leak from a broken
+-- config once someone starts trusting exit 1 to mean "sanitize something").
+fn load_conf($path, $key)
+  $d = nil
+  try
+    $d = load_data($path)
+  catch $m, $e
+    bail(2, "cannot read " .. $path .. ": " .. $m)
+  end
+  if $d == nil then
+    bail(2, "cannot read " .. $path)
+  end
+  -- Before the index, not after it (round fifteen, same class as the
+  -- installer's `public_hygiene: "not a map"`): indexing a string or a list
+  -- with a string key raises, and an uncaught raise here exits 1 — a malformed
+  -- config announced as a policy violation, which is precisely the confusion
+  -- this function exists to prevent.
+  if type($d) != "map" then
+    bail(2, $path .. " is a " .. type($d) .. ", not a config section map")
+  end
+  if $d[$key] == nil then
+    bail(2, $path .. " has no top-level `" .. $key .. "` block")
+  end
+  return $d[$key]
+end
+
+-- git speaks BYTES; Mix strings are UTF-8, and run_argv substitutes U+FFFD for
+-- anything that will not decode. That is not cosmetic here: two index entries
+-- whose raw names ended `\xfe` and `\xff` both arrived as `bad<U+FFFD>`, so
+-- they fingerprinted identically and one allowlist entry pardoned both. The
+-- length-prefixed encoding is injective over codepoints — the collision
+-- happens one step earlier, in the decode, and no hashing scheme downstream
+-- can undo it. Blob, tag and commit-message text can hit it the same way.
+--
+-- run_argv flags the substitution, so refuse rather than fingerprint a string
+-- that is not the bytes git had. Fixing it properly needs byte-level capture,
+-- which Mix does not offer today; until then this is the honest answer, and it
+-- fires on content nobody should be committing to a public repo anyway.
+fn check_decodable($r, $what)
+  if $r["utf8_lossy"] then
+    bail(2, "git output for " .. $what .. " is not valid UTF-8 and was decoded"
+      .. " lossily — distinct bytes can collapse to one fingerprint; refusing")
+  end
+end
+
+-- A SHA can be trimmed; a PATHNAME cannot. Trailing whitespace is legal in a
+-- directory name, so `trim()` on a path git printed silently names a DIFFERENT
+-- directory — the bug that shipped three times in this arc (pre-push `$2`, the
+-- installer's hooks dir, and here). Strip exactly the one terminator git adds.
+fn chomp_path($s)
+  if ends_with($s, "\n") then
+    return substr($s, 0, len($s) - 1)
+  end
+  return $s
+end
+
+-- Every git invocation the gate makes starts here. Two things are pinned:
+--
+-- `--no-replace-objects`, because an object id does NOT pin bytes while
+-- replacement refs are live. `git replace` is on by default for grep, ls-tree,
+-- cat-file and rev-list, so `refs/replace/<leaking-tree>` → a clean tree makes
+-- the whole scan read content that is not what gets pushed: a pack transfer
+-- sends the real object and leaves the replacement ref behind. Reproduced
+-- 2026-07-25 — the gate called a staged real WG address clean, exit 0.
+--
+-- `-C $repo` is NOT sufficient on its own: GIT_DIR in the environment beats it
+-- for object lookup (verified — `GIT_DIR=other git -C repo log` reads *other*),
+-- so an ambient GIT_DIR turns a three-repo `--all` into three scans of one
+-- foreign repo, reported under bus/cos/mix paths. Git does not set GIT_DIR for
+-- pre-commit/commit-msg/pre-push, so the hook path is unaffected and the
+-- refusal in require_clean_git_env() costs it nothing.
+fn git_argv($repo)
+  return ["git", "--no-replace-objects", "-C", $repo]
+end
+
+-- Pinned on every git this program runs, because it is the difference between
+-- a broken ref being reported and being silently dropped. Measured on git
+-- 2.55.0 with an empty .git/refs/heads/bogus: at the default, `for-each-ref`
+-- prints `warning: ignoring broken ref …` on stderr, exits 0, and omits it —
+-- which git_quiet() below turns into a refusal. Under GIT_REF_PARANOIA=0 the
+-- same command omits the ref and prints NOTHING, so the refusal never fires
+-- and the audit answers "clean" about a smaller ref set than the repository
+-- has. That variable is inherited from whoever invoked the hook, so leaving it
+-- unset makes the guard defeatable by the environment it is guarding against.
+-- It is an argument to run_argv rather than a `git -c`: GIT_REF_PARANOIA has no
+-- config equivalent. `env:` merges over the inherited environment rather than
+-- replacing it (measured), so PATH and HOME survive.
+--
+-- The two pathspec variables are the same class, found by round forty's third
+-- review and measured here: `rev-list HEAD -- '_bin/*.mix'` selects 200 commits
+-- in this repo, and with GIT_LITERAL_PATHSPECS=1 (or GIT_NOGLOB_PATHSPECS=1)
+-- inherited it selects ZERO — silently, exit 0. An empty --range is expressly
+-- accepted as legitimate ("pushing no new commits"), so the gate would answer
+-- clean about a range it never looked at. Unlike GIT_REF_PARANOIA these have a
+-- neutral value rather than only a hostile one, so they are PINNED OFF rather
+-- than refused: the gate then asks git the question git asks by default. The
+-- one place that genuinely wants literal matching passes `--literal-pathspecs`
+-- on the command line, and the flag beats the environment (measured: with
+-- GIT_LITERAL_PATHSPECS=0 the flag still selects zero).
+$GIT_ENV = {GIT_REF_PARANOIA: "1",
+            GIT_LITERAL_PATHSPECS: "0", GIT_NOGLOB_PATHSPECS: "0"}
+
+-- env() cannot tell set-to-empty from unset — both are "". That is not a
+-- distinction without a difference here: `GIT_INDEX_FILE=` makes git read an
+-- EMPTY index, so a gate that treated it as unset scanned nothing and said
+-- clean. /proc/self/environ is the only place the difference survives, and the
+-- NUL separator has to be built from bytes because Mix has no "\0" escape and
+-- no chr() (worth adding — see feedback_mix_no_chr_builtin).
+--
+-- Bytes, not read_file: the environment is not required to be UTF-8, and one
+-- raw 0x80 in an unrelated variable made read_file raise — uncaught, exit 1,
+-- which in this gate's contract means "found a leak". A lossy decode is exactly
+-- right here because every name being looked for is ASCII: a mangled value
+-- cannot turn one name into another.
+--
+-- Returns nil, not false, when the environment cannot be read at all. There is
+-- no honest third answer, and callers must fail closed rather than guess — an
+-- earlier version fell back to env() there, which reinstated the empty-index
+-- false clean on any host without /proc.
+--
+-- Present does not mean readable, and the read is inside the try for that
+-- reason: exists() passing and the open failing is one `chmod 000` apart, and
+-- an uncaught raise there exited 1 — infrastructure trouble reported as a
+-- violation, the exact confusion this contract forbids (round ten). Absent and
+-- unreadable are the same answer: unknowable, so fail closed.
+fn env_is_set($var)
+  if exists("/proc/self/environ") == false then
+    return nil
+  end
+  $nul = bytes_to_string(freeze(buffer([0])))
+  $raw = nil
+  try
+    $raw = bytes_to_string(read_file_bytes("/proc/self/environ"), {lossy: true})
+  catch $e
+    return nil
+  end
+  for each $kv in split($raw, $nul)
+    if starts_with($kv, $var .. "=") then
+      return true
+    end
+  end
+  return false
+end
+
+
+-- The vars that make `-C` a lie. Three classes, and the difference between them
+-- was learned the hard way in both directions — a blanket refusal is a false
+-- alarm and a blanket pass is a false clean.
+--
+-- ALWAYS refused: they redirect the gitdir, the object store, or the shape of
+-- history itself. GIT_SHALLOW_FILE and GIT_GRAFT_FILE earn their place — either
+-- one can name the clean tip as a traversal root, so `rev-list` never reaches
+-- the leaking ancestor and --range reports clean over published content
+-- (measured 2026-07-25: plain exit 1, grafted exit 0, same repo, same range).
+-- GIT_CONFIG_COUNT/GLOBAL/SYSTEM belong here too: process-local config is a
+-- general-purpose lever over git's behaviour, and git never sets them (it
+-- propagates `-c` through GIT_CONFIG_PARAMETERS instead — measured).
+--
+-- GIT_CONFIG_PARAMETERS is therefore NOT refusable: `git -c foo=bar commit`
+-- sets it and the hooks inherit it. The defence against config injection is
+-- that every behaviour this gate depends on is pinned on the command line
+-- (--no-replace-objects, explicit -E/-I/-z/--no-color), where config cannot
+-- reach it.
+--
+-- CONDITIONAL — GIT_DIR and GIT_INDEX_FILE. Neither can simply be banned: git
+-- SETS both for pre-commit in a linked worktree, and GIT_INDEX_FILE for every
+-- pre-commit (for a partial commit — `git commit -- path`, `git commit -a` — it
+-- names a temporary index that is the only correct thing to scan). Refusing
+-- them outright blocked every commit made from a `git worktree` checkout, which
+-- is how parallel sessions work here. Neither can simply be allowed either: an
+-- ambient GIT_DIR scans a foreign repo under this one's name, and an ambient
+-- GIT_INDEX_FILE reports clean over a staged leak.
+--
+-- So under --from-hook they are CHECKED rather than trusted: each must point
+-- into the gitdir this repo actually has, computed with the environment
+-- stripped so the answer cannot be supplied by the thing being verified. That
+-- is what keeps --from-hook from being a bypass flag — passing it does not
+-- disable the check, it swaps a refusal for a provenance test that git's own
+-- values pass and `/tmp/clean.index` does not.
+--
+-- GIT_REFERENCE_BACKEND joined the list in round forty's third review, and it
+-- is the worst of them: it overrides extensions.refStorage, so a files-format
+-- repository read as `reftable` has no refs at all. Measured on git 2.55.0 in a
+-- fresh repo with one branch and one tag — `GIT_REFERENCE_BACKEND=reftable git
+-- for-each-ref` printed NOTHING, wrote ZERO bytes to stderr, and exited 0. The
+-- broken-ref guard watches stderr, so it never fires; --all would enumerate an
+-- empty ref set and report clean over every ref the repository actually has.
+-- Unlike the pathspec variables in $GIT_ENV there is no neutral value to pin
+-- (the right backend is whatever the repo was created with), so this one is
+-- refused rather than overridden.
+$ALWAYS_CLEAN = ["GIT_COMMON_DIR", "GIT_WORK_TREE",
+  "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_SHALLOW_FILE", "GIT_GRAFT_FILE", "GIT_REFERENCE_BACKEND",
+  "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"]
+
+-- git run with the whole environment thrown away bar what it needs to function.
+-- The point is a gitdir answer that no ambient variable can influence — asking
+-- the contaminated environment where the repo is would be circular.
+fn git_uncontaminated($repo, $rest)
+  return run_argv(concat(["git", "--no-replace-objects", "-C", $repo], $rest),
+    {timeout: 600, clear_env: true,
+     env: {PATH: env("PATH"), HOME: env("HOME"), LC_ALL: "C",
+           GIT_REF_PARANOIA: "1"}})
+end
+
+-- Canonical absolute form of a path that may not exist yet — git names
+-- index.lock before creating it. realpath() requires existence, so a missing
+-- leaf is resolved through its parent. (Do NOT reach for dirname("$p/.") to
+-- canonicalise a directory: Mix normalises the trailing "/." away first and
+-- returns the GRANDparent.)
+fn resolve_maybe_missing($path)
+  $abs = $path
+  if starts_with($abs, "/") == false then
+    $abs = cwd() .. "/" .. $abs
+  end
+  $r = realpath($abs)
+  if $r != nil then
+    return $r
+  end
+  $p = realpath(dirname($abs))
+  if $p == nil then
+    return nil
+  end
+  return $p .. "/" .. basename($abs)
+end
+
+-- Does $path name $dir itself or something inside it? Both are canonicalised,
+-- because a symlinked TMPDIR or a /tmp that is really /private/tmp must not
+-- decide the answer.
+fn path_is_inside($path, $dir)
+  $a = resolve_maybe_missing($path)
+  $b = realpath($dir)
+  if $a == nil or $b == nil then
+    return false
+  end
+  return $a == $b or starts_with($a, $b .. "/")
+end
+
+fn env_set_or_bail($var)
+  $s = env_is_set($var)
+  if $s == nil then
+    bail(2, "cannot read /proc/self/environ, so whether " .. $var .. " is set in"
+      .. " the environment is unknowable — and set-to-empty is not the same as"
+      .. " unset here (`GIT_INDEX_FILE=` makes git read an EMPTY index, which"
+      .. " scans clean). Refusing rather than guessing")
+  end
+  return $s
+end
+
+fn require_clean_git_env($from_hook, $mode, $repo)
+  for each $var in $ALWAYS_CLEAN
+    if env_set_or_bail($var) then
+      bail(2, $var .. " is set in the environment — it overrides `git -C`, the"
+        .. " history this scan walks, or the config it runs under, and would"
+        .. " silently report on other bytes under this repo's name; unset it"
+        .. " and re-run (git does not set it for the hooks this gate runs"
+        .. " under)")
+    end
+  end
+
+  -- Like GIT_INDEX_FILE below, GIT_DIR is relevant only when this mode asks
+  -- Git a question. `--message` reads the named file and runs no git at all;
+  -- refusing an ambient selector there was a verdict about state the mode
+  -- never consulted, and --from-hook made that worse by launching
+  -- git_uncontaminated() solely to verify the irrelevant value. Keep the
+  -- always-clean config/object redirections above unconditional: unlike
+  -- GIT_DIR, they are refused as a hostile process environment, not merely as
+  -- selectors for one read.
+  $dir_set = false
+  if $mode != "--message" then
+    $dir_set = env_set_or_bail("GIT_DIR")
+  end
+  -- Only --index reads an index. Refusing an inherited GIT_INDEX_FILE for
+  -- --tree/--range/--object/--message was a false alarm about a variable those
+  -- modes never consult, and a linter that refuses to run over something
+  -- genuinely fine is a linter people learn to bypass.
+  $idx_set = false
+  if $mode == "--index" then
+    $idx_set = env_set_or_bail("GIT_INDEX_FILE")
+  end
+  if $dir_set == false and $idx_set == false then
+    return nil
+  end
+  -- --all has no single repo to check them against, and is never a hook mode.
+  if $from_hook == false or $repo == nil then
+    $which = "GIT_DIR"
+    if $dir_set == false then
+      $which = "GIT_INDEX_FILE"
+    end
+    bail(2, $which .. " is set in the environment — it names the repository or"
+      .. " the index this scan would read, and an inherited one means reporting"
+      .. " on bytes nobody is about to commit (an empty index, if it is set to"
+      .. " nothing at all); unset it and re-run. The installed hooks pass"
+      .. " --from-hook, where git sets these deliberately and they are checked"
+      .. " against the repo rather than refused")
+  end
+
+  -- --from-hook: verify, do not trust.
+  $g = git_uncontaminated($repo, ["rev-parse", "--absolute-git-dir"])
+  if ($g["ok"] != true or $g["stdout_truncated"]
+      or trim($g["stdout"]) == "") then
+    bail(2, "cannot determine the real gitdir of " .. $repo .. " with the"
+      .. " environment stripped, so an inherited GIT_DIR/GIT_INDEX_FILE cannot"
+      .. " be checked against it; refusing rather than trusting them")
+  end
+  check_decodable($g, "rev-parse --absolute-git-dir in " .. $repo)
+  -- chomp, not trim: this path is compared against GIT_DIR/GIT_INDEX_FILE, so a
+  -- gitdir whose name ends in a space (`git init --separate-git-dir "…/g "`)
+  -- was compared as its unspaced sibling and every commit in that repo was
+  -- refused with "GIT_DIR is not the gitdir of …". Reproduced round twelve.
+  $gitdir = chomp_path($g["stdout"])
+  if $dir_set and path_is_inside(env("GIT_DIR"), $gitdir) == false then
+    bail(2, "GIT_DIR is set to " .. sanitize(env("GIT_DIR")) .. ", which is not"
+      .. " the gitdir of " .. $repo .. " (" .. $gitdir .. ") — git sets GIT_DIR"
+      .. " for hooks in a linked worktree, but only ever to that worktree's own"
+      .. " gitdir, so this one did not come from the commit being made")
+  end
+  if $idx_set and path_is_inside(env("GIT_INDEX_FILE"), $gitdir) == false then
+    bail(2, "GIT_INDEX_FILE is set to " .. sanitize(env("GIT_INDEX_FILE"))
+      .. ", which is not inside the gitdir of " .. $repo .. " (" .. $gitdir
+      .. ") — every index git names for a pre-commit hook lives there"
+      .. " (.git/index, index.lock, next-index-<pid>.lock), so this one is not"
+      .. " the index about to be committed")
+  end
+  return nil
+end
+
+-- The must-succeed checks, shared by every git-that-must-succeed wrapper. Split
+-- out so a wrapper can vary how the child is LAUNCHED without varying how its
+-- result is judged — a second copy of these four tests is a second place for
+-- "truncated" to stop being a refusal.
+fn git_must($r, $repo, $rest)
+  if $r["timed_out"] then
+    bail(2, "git timed out: " .. join($rest, " "))
+  end
+  if $r["stdout_truncated"] then
+    bail(2, "git output truncated, scan would be incomplete: " .. join($rest, " "))
+  end
+  if $r["ok"] != true then
+    bail(2, "git failed (" .. $r["exit_code"] .. "): " .. join($rest, " ") .. "\n" .. $r["stderr"])
+  end
+  check_decodable($r, join($rest, " ") .. " in " .. $repo)
+  return $r["stdout"]
+end
+
+-- git that must succeed. Any failure is infrastructure, not a clean result.
+fn git_input($repo, $rest, $stdin)
+  $opts = {timeout: 600, max_output: 67108864, env: $GIT_ENV}
+  if $stdin != nil then
+    $opts["stdin"] = $stdin
+  end
+  return git_must(run_argv(concat(git_argv($repo), $rest), $opts), $repo, $rest)
+end
+
+fn git($repo, $rest)
+  return git_input($repo, $rest, nil)
+end
+
+-- git that must succeed AND must not have complained on the way.
+--
+-- git_must() reads the exit code, and for most commands that is the whole
+-- story. Ref ENUMERATION is the exception: `for-each-ref` reports a ref it
+-- cannot read as a warning on stderr, exits 0, and simply omits that ref from
+-- its output. Measured against git 2.55.0 — an empty .git/refs/heads/bogus
+-- yields "warning: ignoring broken ref refs/heads/bogus", exit 0, and a
+-- listing with the broken ref missing. Read through git_must() that is a
+-- shorter ref set presented as the complete one, and the audit goes on to
+-- report every tip it did see as clean: an answer about a smaller repository
+-- than the operator asked about.
+--
+-- A clean for-each-ref writes nothing to stderr (measured), so for this
+-- command any stderr at all is a cannot-answer. That is why this is a separate
+-- helper rather than a change to git_must: plenty of git commands write
+-- progress and advice to stderr while succeeding completely.
+fn git_quiet($repo, $rest)
+  $r = run_argv(concat(git_argv($repo), $rest),
+    {timeout: 600, max_output: 67108864, env: $GIT_ENV})
+  $out = git_must($r, $repo, $rest)
+  if trim($r["stderr"]) != "" then
+    bail(2, "git " .. join($rest, " ") .. " warned while enumerating refs in "
+      .. $repo .. " — refusing rather than audit a ref set git could not fully"
+      .. " read: " .. sanitize($r["stderr"]))
+  end
+  return $out
+end
+
+-- Same contract as git(), but with the one inherited variable this command
+-- unexpectedly reads removed.
+--
+-- Exactly one caller needs this, for a reason that is not obvious from the
+-- command line. `git diff-tree A B` reads the INDEX even when both arguments
+-- are immutable object ids and no worktree is involved — measured 2026-07-26
+-- against the installed git, with every subset of the flags this gate passes;
+-- `git ls-tree` does not. Under a pre-commit hook git sets GIT_INDEX_FILE, for
+-- a partial commit to a temporary index that may not be fully written yet, so
+-- an inherited one made diff-tree die with "index file smaller than expected"
+-- — exit 2, infrastructure refusal, on a repository that is entirely fine.
+--
+-- T42c pins the invariant this restores: a mode that reads no index is
+-- unaffected by GIT_INDEX_FILE. Round twenty-six used clear_env to remove it,
+-- but that also removed XDG_CONFIG_HOME and every other part of Git's config
+-- environment. Round twenty-seven measured the contradiction on a root-owned
+-- repository authorised only by safe.directory there: discovery and every
+-- ordinary read succeeded, then this cross-check alone refused dubious
+-- ownership. Launching through `env -u GIT_INDEX_FILE` preserves the exact
+-- inherited config stack the rest of the scan uses while removing only the
+-- index selector this object-only command must not consult. Emptying the
+-- variable is not equivalent — `GIT_INDEX_FILE=` names an empty index.
+-- Round thirty added the second caller the comment above did not anticipate:
+-- `check-attr --source=<tree>` is object-only in the same way diff-tree is, and
+-- reads GIT_INDEX_FILE just as unnecessarily. Measured against the installed
+-- git: with a half-written index in the environment it dies with the identical
+-- "index file smaller than expected", which under a pre-commit hook is an exit
+-- 2 on a repository that is entirely fine.
+fn git_indexless_input($repo, $rest, $stdin)
+  $opts = {timeout: 600, max_output: 67108864, env: $GIT_ENV}
+  if $stdin != nil then
+    $opts["stdin"] = $stdin
+  end
+  $r = run_argv(concat(["env", "-u", "GIT_INDEX_FILE"],
+      concat(git_argv($repo), $rest)), $opts)
+  return git_must($r, $repo, $rest)
+end
+
+fn git_indexless($repo, $rest)
+  return git_indexless_input($repo, $rest, nil)
+end
+
+-- Pin a name to the object it denotes RIGHT NOW, before anything reads it.
+--
+-- A scan is a sequence of git invocations — two greps per rule, plus ls-tree
+-- for the scope check and the symlink pass — and `HEAD`, a branch, or a tag is
+-- free to move between any two of them. The set-difference note in scan()
+-- spells out how that turns into a false clean. Resolving once, up front, is
+-- what makes every later invocation read the same bytes.
+--
+-- Plain `--verify`, no `^{commit}`/`^{object}` peel: --tree may legitimately be
+-- pointed at a tree-ish rather than a commit, and --object-chain exists
+-- precisely to walk an annotated tag, so peeling it to its target would skip
+-- the object the mode is about. (Checked against git 2.55: `^{object}` does not
+-- peel a tag either, but the peel that does — `^{}` — is one keystroke away,
+-- and this is not a place to leave that trap lying around.)
+fn resolve_object($repo, $rev)
+  $r = run_argv(concat(git_argv($repo), ["rev-parse", "--verify", "--quiet", $rev]),
+    {timeout: 60, env: $GIT_ENV})
+  if ($r["ok"] != true or $r["stdout_truncated"]
+      or trim($r["stdout"]) == "") then
+    bail(2, "cannot resolve " .. $rev .. " to an object in " .. $repo
+      .. " — refusing to scan a name that could move under the scan")
+  end
+  check_decodable($r, "rev-parse " .. $rev .. " in " .. $repo)
+  return trim($r["stdout"])
+end
+
+-- The index has no object id to pin, so give it one: `write-tree` freezes the
+-- staged content into a real tree, and the scan reads that instead of the live
+-- index. This is the same call `git commit` is about to make anyway, so it
+-- costs nothing a commit was not already paying, and it is proven to work from
+-- inside a pre-commit hook (git has not taken index.lock yet at that point).
+--
+-- It fails on an unmerged index — which `git commit` also refuses, so the hook
+-- path cannot reach it; only a hand-run `--index` audit during a conflict can,
+-- and it gets a clear refusal rather than a scan of something no one can
+-- commit. Intent-to-add entries (`git add -N`) are absent from the snapshot,
+-- exactly as they were absent from `git grep --cached` — same coverage, frozen.
+fn snapshot_index($repo)
+  $r = run_argv(concat(git_argv($repo), ["write-tree"]),
+    {timeout: 300, env: $GIT_ENV})
+  if ($r["ok"] != true or $r["stdout_truncated"]
+      or trim($r["stdout"]) == "") then
+    bail(2, "cannot snapshot the index of " .. $repo .. " — git write-tree failed: "
+      .. trim($r["stderr"]))
+  end
+  check_decodable($r, "write-tree in " .. $repo)
+  return trim($r["stdout"])
+end
+
+-- git grep: exit 0 = matches, 1 = none, >1 = real error.
+fn git_grep($repo, $rest)
+  $r = run_argv(concat(git_argv($repo), concat(["grep"], $rest)),
+    {timeout: 600, max_output: 67108864, env: $GIT_ENV})
+  if $r["timed_out"] then
+    bail(2, "git grep timed out in " .. $repo)
+  end
+  if $r["stdout_truncated"] then
+    bail(2, "git grep output truncated, scan would be incomplete in " .. $repo)
+  end
+  $code = $r["exit_code"]
+  if $code != 0 and $code != 1 then
+    bail(2, "git grep failed (" .. $code .. ") in " .. $repo .. ": " .. $r["stderr"])
+  end
+  -- Exit 0 is git ASSERTING a match exists, so an empty stream contradicts
+  -- itself. Real git cannot produce it; a wrapper or a shim on PATH can, and
+  -- read as "no matches" it turns every scan into a silent clean.
+  if $code == 0 and $r["stdout"] == "" then
+    bail(2, "git grep reported matches (exit 0) but produced no output in " .. $repo
+      .. " — refusing to report clean")
+  end
+  check_decodable($r, "grep in " .. $repo)
+  return $r["stdout"]
+end
+
+fn nonempty_lines($s)
+  $out = []
+  for each $l in split($s, "\n")
+    if trim($l) != "" then
+      push($out, $l)
+    end
+  end
+  return $out
+end
+
+fn strip_revision_prefix($path, $strip)
+  if $strip != "" and starts_with($path, $strip) then
+    return slice($path, len($strip))
+  end
+  return $path
+end
+
+fn binary_hit($rule, $path, $strip, $label, $repo, $object)
+  $path = strip_revision_prefix($path, $strip)
+  return {
+    rule: $rule["id"], note: $rule["note"] .. " (BINARY — inspect by hand)",
+    rel: $path, disp: $label .. $path, line_no: 0, line: "", binary: true,
+    pardonable: true, repo: $repo, object: $object
+  }
+end
+
+-- Hash the bytes git actually scanned, never the working file. run_argv()
+-- decodes captured stdout as UTF-8, so a binary blob cannot safely travel
+-- through its stdout field. The shell exists for REDIRECTION ONLY: every
+-- variable is an argv positional, `exec >"$1"` makes redirect failure the
+-- child's failure, and `exec "$@"` preserves git's exit status without ever
+-- interpolating repo/path/oid into shell source. Mix's direct argv runner has
+-- no byte-preserving capture or redirect surface; this is the narrow /bin/sh
+-- role documented by `mix man system`.
+--
+-- No bail occurs while the private directory is owed cleanup. Every failure is
+-- recorded, the blob file and directory are removed, and only THEN is exit 2
+-- allowed — exit() skips finally, so a bail inside the protected region would
+-- strand inspected content in TMPDIR.
+fn binary_blob_sha256($repo, $object, $path, $call_no)
+  $oid = trim(git($repo,
+    ["rev-parse", "--verify", "--quiet", $object .. ":" .. $path]))
+  if $oid == "" then
+    bail(2, "git resolved no blob id for " .. $object .. ":" .. $path
+      .. " in " .. $repo .. " — refusing rather than hash a working file")
+  end
+  $kind = trim(git($repo, ["cat-file", "-t", $oid]))
+  if $kind != "blob" then
+    bail(2, "git object " .. $oid .. " for " .. $object .. ":" .. $path
+      .. " in " .. $repo .. " is " .. $kind .. ", not a blob; refusing")
+  end
+  $size_text = trim(git($repo, ["cat-file", "-s", $oid]))
+  $expected = to_number($size_text)
+  -- stat() exposes size as Mix's exact-integer number type. Beyond 2^53 the
+  -- comparison could bless two rounded, DIFFERENT sizes, which would turn the
+  -- short-write check into theatre; refuse that unrepresentable answer.
+  if regex_match("^(0|[1-9][0-9]*)$", $size_text) == false or $expected == nil \
+      or $expected > 9007199254740991 then
+    bail(2, "git returned an unusable blob size `" .. sanitize($size_text)
+      .. "` for " .. $oid .. " in " .. $repo .. "; refusing")
+  end
+
+  $base = env("TMPDIR")
+  if $base == "" then
+    $base = "/tmp"
+  end
+  $dir = $base .. "/cosmix-public-hygiene-blob-" .. ("" .. pid()) \
+    .. "-" .. ("" .. $call_no)
+  $tmp = $dir .. "/blob"
+  $created = false
+  $failure = ""
+  $digest = ""
+  try
+    -- parents:false is the O_EXCL-shaped claim. An existing name is somebody
+    -- else's state, not a directory this process may silently reuse or clean.
+    mkdir($dir, {parents: false})
+    $created = true
+    chmod($dir, 0o700)
+    $dst = stat($dir, {follow_symlinks: false})
+    if $dst["is_dir"] == false or $dst["is_symlink"] \
+        or $dst["uid"] != uid() or $dst["perm"] != 0o700 then
+      $failure = "cannot prove private ownership of temporary directory " .. $dir
+    end
+    if $failure == "" then
+      $dump_argv = concat(
+        ["sh", "-c", "exec >\"$1\"; shift; exec \"$@\"", "sh", $tmp],
+        concat(git_argv($repo), ["cat-file", "blob", $oid]))
+      $dump = run_argv($dump_argv,
+        {env: $GIT_ENV, timeout: 600, max_output: 67108864})
+      if $dump["timed_out"] then
+        $failure = "git timed out while dumping blob " .. $oid
+      end
+      if $failure == "" \
+          and ($dump["stdout_truncated"] or $dump["stderr_truncated"]) then
+        $failure = "git output truncated while dumping blob " .. $oid
+      end
+      if $failure == "" and $dump["utf8_lossy"] then
+        $failure = "git diagnostic output was not valid UTF-8 while dumping blob " .. $oid
+      end
+      if $failure == "" and $dump["ok"] != true then
+        $failure = "git failed (" .. $dump["exit_code"] .. ") while dumping blob " \
+          .. $oid .. ": " .. sanitize($dump["stderr"])
+      end
+    end
+    if $failure == "" then
+      $actual = stat($tmp)["size"]
+      if $actual != $expected then
+        $failure = "git dumped " .. $actual .. " byte(s) for blob " .. $oid \
+          .. " but cat-file -s promised " .. $expected
+      end
+    end
+    if $failure == "" then
+      $digest = hash_file($tmp, "sha256")
+    end
+  catch $hm, $he
+    $failure = "cannot hash git blob " .. $oid .. " for " .. $path \
+      .. " in " .. $repo .. ": " .. $hm
+  end
+
+  $cleanup_failure = ""
+  if $created then
+    try
+      remove($tmp)
+    catch $rm, $re
+      $cleanup_failure = "cannot remove temporary blob " .. $tmp .. ": " .. $rm
+    end
+    try
+      remove_dir($dir)
+    catch $dm, $de
+      if $cleanup_failure != "" then
+        $cleanup_failure = $cleanup_failure .. "; "
+      end
+      $cleanup_failure = $cleanup_failure \
+        .. "cannot remove temporary directory " .. $dir .. ": " .. $dm
+    end
+  end
+  if $cleanup_failure != "" then
+    bail(2, $cleanup_failure)
+  end
+  if $failure != "" then
+    bail(2, $failure)
+  end
+  return $digest
+end
+
+-- git grep's default -z stream is NOT unambiguously parseable, and no parser
+-- can make it so. Text records are `path\0line\0text\n`, but a binary match is
+-- announced as a bare `Binary file <path> matches\n` line carrying no NUL
+-- fields — so a FILE actually named `Binary file decoy matches\nreal.txt` emits
+-- bytes identical to a diagnostic followed by a record. Two rounds of parser
+-- work handled every realistic shape and still fabricated hits against `decoy`
+-- and `real.txt`, and when the fabricated one landed on the binary branch —
+-- deliberately unpardonable — the gate refused forever with nothing to
+-- disposition. The path-existence check below is a net, not a proof: invent a
+-- path that happens to exist and it passes.
+--
+-- So the ambiguity is removed at the source instead, with two passes per rule:
+--
+--   `-I -z -n`  text matches only. `-I` suppresses binary diagnostics
+--               entirely, so the stream is strictly path\0line\0text\n and the
+--               parser needs no notion of a diagnostic to be confused by.
+--   `-l -z`     every matching path, NUL-separated, no line data, no
+--               diagnostics — unambiguous by construction.
+--
+-- Binary matches are then (`-l` paths) minus (`-I` paths): derived from a set
+-- difference rather than recovered from prose. Cost is one extra grep per rule
+-- (~12 ms each against cos), which buys a format that cannot lie about a path.
+--
+-- A path may still contain a newline — legal in git — so the text parser cuts
+-- text at the FIRST newline after the NUL fields and treats the rest as the
+-- next path.
+fn parse_grep_text($rule, $raw, $strip, $label)
+  $hits = []
+  $parts = split($raw, "\u{0}")
+  $pending = $parts[0]
+  $i = 1
+
+  while $i < len($parts)
+    if $i + 1 >= len($parts) then
+      bail(2, "unparseable git grep output for rule " .. $rule["id"]
+        .. " — refusing to report clean")
+    end
+    $line_no = $parts[$i]
+    $tail = $parts[$i + 1]
+    -- index_of returns -1, NOT nil, when the needle is absent — and Mix
+    -- slice() reads a negative index FROM THE END, so `== nil` here was dead
+    -- code that silently mangled the buffer instead of refusing, and invented
+    -- a path out of the leftover.
+    $newline = index_of($tail, "\n")
+    if $newline < 0 then
+      bail(2, "unparseable git grep output for rule " .. $rule["id"]
+        .. " — refusing to report clean")
+    end
+    $path = strip_revision_prefix($pending, $strip)
+    push($hits, {
+      rule: $rule["id"], note: $rule["note"],
+      rel: $path, disp: $label .. $path, line_no: $line_no,
+      line: slice($tail, 0, $newline), binary: false, pardonable: true
+    })
+    $pending = slice($tail, $newline + 1)
+    $i = $i + 2
+  end
+
+  if $pending != "" then
+    bail(2, "unparseable git grep output for rule " .. $rule["id"]
+      .. " — refusing to report clean")
+  end
+  return $hits
+end
+
+fn parse_grep_paths($raw, $strip)
+  $paths = []
+  for each $p in split($raw, "\u{0}")
+    if $p != "" then
+      push($paths, strip_revision_prefix($p, $strip))
+    end
+  end
+  return $paths
+end
+
+-- ── rule set ────────────────────────────────────────────────────────────
+
+-- Round twenty-four: both mesh rules are built by pasting inventory fields
+-- straight into an extended regular expression, and neither field was checked
+-- for being what the paste assumes. A member named `foo+bar` satisfies
+-- `nonblank` and then compiles to a pattern matching `foobar`, `foobbar`, …
+-- and NOT the literal node name — a file naming that node scans clean, at
+-- exit 0, which is the worst outcome this gate has. A subnet octet of `10a`
+-- does the same to the address rule. The inventory is the mesh authority and
+-- its members ARE DNS labels (SPEC 13 §7.1), so a name or octet that is not
+-- one is a malformed boundary: refuse at 2 rather than quietly build a
+-- different rule out of it. Nothing here escapes the value instead —
+-- escaping would let a malformed inventory keep working, and a mesh whose
+-- node is not a DNS label is a problem to fix in the inventory, not to route
+-- around in the gate.
+fn is_dns_label($s)
+  if $s == nil then
+    return false
+  end
+  $n = len($s)
+  if $n < 1 or $n > 63 then
+    return false
+  end
+  if substr($s, 0, 1) == "-" or substr($s, $n - 1, 1) == "-" then
+    return false
+  end
+  $alnum = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+  $i = 0
+  while $i < $n
+    $c = substr($s, $i, 1)
+    if $c != "-" and pos($c, $alnum) == 0 then
+      return false
+    end
+    $i = $i + 1
+  end
+  return true
+end
+
+fn is_ipv4_octet($s)
+  if $s == nil then
+    return false
+  end
+  if len($s) < 1 or len($s) > 3 then
+    return false
+  end
+  $i = 0
+  while $i < len($s)
+    if pos(substr($s, $i, 1), "0123456789") == 0 then
+      return false
+    end
+    $i = $i + 1
+  end
+  $v = to_number($s)
+  if $v == nil or $v < 0 or $v > 255 then
+    return false
+  end
+  -- In range is not enough: the octet is pasted into the regex VERBATIM, so it
+  -- has to be the same string an address is written with. `016` is a perfectly
+  -- good number and a perfectly useless rule — inventory subnet `10.016.2.0/24`
+  -- builds `10[.]016[.]2[.][0-9]{1,3}`, which never matches the `10.16.2.9`
+  -- that is actually in the file, and the repo is reported clean. Round
+  -- twenty-five. Round-tripping through to_number is the whole test: it accepts
+  -- `0` and rejects `00`, `016`, `001`.
+  if ("" .. $v) != $s then
+    return false
+  end
+  return true
+end
+
+-- Derive the mesh rules from the inventory authority (SPEC 13 §7.1) rather
+-- than restating them, so they cannot rot when the mesh changes.
+-- The signed roster, authenticated under the fleet's genesis anchor.
+--
+-- Every failure here is exit 2, never 1: this function answers "what must the
+-- gate look for", and a gate that cannot build its own rule set has not
+-- scanned anything. Reporting that as exit 1 would dress a missing rule set as
+-- a clean-tree-with-violations verdict, which is the exact inversion this
+-- file's exit-code contract exists to prevent.
+--
+-- It IS mesh_lib's verified_inventory(): the exit-code mismatch that once ruled
+-- it out is now a variable ($MESH_FATAL_EXIT, set to 2 at the include above),
+-- and a second implementation of a trust check is a place for the two to
+-- disagree — which, for four separate checks, is what it turned out to be.
+--
+-- It used to be skipped, on the reasoning that "an OLD signed roster still
+-- names identifiers that were live, and the union means it can only ever add
+-- rules". That is false relative to a fleet that has moved on. The union is
+-- over the signed roster and the AUTHORED file, and an operator edits the
+-- authored file: restore the signed roster to a commit predating a node and
+-- drop that node from the proposal, and the identifier is in NEITHER — so the
+-- mesh rule never looks for it and a public commit naming it reads clean. An
+-- old roster subtracts rules whenever the authored file was edited to match.
+-- That is precisely the replay the floor exists to refuse, on the one consumer
+-- that was allowed to skip it, and it contradicts D1's single-funnel rule.
+--
+-- Freshness is asserted by verified_inventory() below, which is the same funnel
+-- every generator and distributor goes through, so this gate cannot drift from
+-- what the fleet enforces.
+fn signed_roster()
+
+  if exists($SIGNED) == false then
+    bail(2, "the signed roster " .. $SIGNED .. " is missing. It is the minimum"
+      .. " rule set for the mesh half of this gate — without it the gate can"
+      .. " only see what the authored file currently admits to, which an edit"
+      .. " can shrink. It is git-tracked, so `git -C " .. $CMCTL .. " restore"
+      .. " _etc/mesh/inventory.signed` is the usual fix; re-minting it instead"
+      .. " needs the genesis secret (`mix " .. $CMCTL .. "/_bin/mesh_sync.mix`,"
+      .. " or mesh_push for a local-only host)")
+  end
+  if exists($GENESIS) == false then
+    bail(2, "the genesis trust anchor " .. $GENESIS .. " is missing, so the"
+      .. " signed roster cannot be authenticated. Refusing to build rules from"
+      .. " bytes nothing can vouch for")
+  end
+  -- THE funnel. Signature under the genesis anchor, structural validation of
+  -- the authenticated payload, the freshness floor with both witnesses, and the
+  -- equal-epoch content and trust-root bindings — one implementation, shared
+  -- with every generator and distributor. Any refusal inside prints its own
+  -- diagnosis and exits 2 (see $MESH_FATAL_EXIT): the gate has no rule set, so
+  -- it has not scanned anything, and saying so as 1 would dress that as clean.
+  $vi = verified_inventory($SIGNED, {mesh: $MESH, genesis_pub: $GENESIS})
+  $p = $vi["inventory"]
+  -- Narrower than validate_inventory()'s own check, and kept alongside it:
+  -- every field below is pasted into a regular expression by mesh_rules(), so
+  -- this asserts the shape THIS gate depends on, in this gate's own voice.
+  validate_conf_value($p, {
+    subnet: {type: "string", nonblank: true},
+    members: {type: "list", min_length: 1, items: {type: "map", schema: {
+      name: {type: "string", nonblank: true}
+    }}}
+  }, $SIGNED, "signed roster")
+  return $p
+end
+
+fn mesh_rules($inv, $suffix)
+  $subnet = $inv["subnet"]
+  $parts = split($subnet, "/")
+  if len($parts) != 2 then
+    bail(2, "inventory subnet is not CIDR: " .. $subnet)
+  end
+  $oct = split($parts[0], ".")
+  if len($oct) != 4 then
+    bail(2, "inventory subnet is not IPv4: " .. $subnet)
+  end
+  -- Only /24 has an unambiguous 3-octet prefix + reverse zone. Anything else
+  -- must be handled deliberately rather than guessed at.
+  if ("" .. $parts[1]) != "24" then
+    bail(2, "subnet " .. $subnet .. " is not a /24; extend mesh_rules() deliberately")
+  end
+  for each $o in $oct
+    if is_ipv4_octet($o) == false then
+      bail(2, "inventory subnet " .. $subnet .. " has the non-numeric octet "
+        .. sanitize("" .. $o) .. ". Both mesh rules are built by pasting these"
+        .. " octets into a regular expression, so an octet that is not a plain"
+        .. " 0-255 is a DIFFERENT rule — one that would not match this mesh's"
+        .. " own addresses and would report the repo clean")
+    end
+  end
+  $pre = $oct[0] .. "[.]" .. $oct[1] .. "[.]" .. $oct[2] .. "[.]"
+  $rev = $oct[2] .. "[.]" .. $oct[1] .. "[.]" .. $oct[0] .. "[.]in-addr[.]arpa"
+  return [
+    {
+      id: "mesh_ipv4" .. $suffix,
+      pattern: "(^|[^0-9.])" .. $pre .. "[0-9]{1,3}",
+      note: "live WG mesh address"
+    },
+    {
+      id: "mesh_reverse_dns" .. $suffix,
+      pattern: $rev,
+      note: "reverse form of the live WG /24 — same disclosure, different notation"
+    }
+  ]
+end
+
+-- `$members` is the UNION of the signed and authored member lists, so the same
+-- node appears twice whenever it is in both — which is the ordinary case.
+-- Dedupe, or the alternation carries every name twice: harmless to match, but
+-- it doubles the pattern length and makes the rule unreadable in a report.
+fn node_rule($members, $generic)
+  $names = []
+  for each $m in $members
+    if is_dns_label($m["name"]) == false then
+      bail(2, "inventory member name " .. sanitize("" .. $m["name"]) .. " is not"
+        .. " a DNS label. It is pasted unescaped into this gate's node-name"
+        .. " alternation, so a regex metacharacter in it silently builds a rule"
+        .. " that does not match the node it names — and the node then scans"
+        .. " clean. Fix the inventory (SPEC 13 §7.1)")
+    end
+    if contains($generic, $m["name"]) == false and contains($names, $m["name"]) == false then
+      push($names, $m["name"])
+    end
+  end
+  if len($names) == 0 then
+    bail(2, "every member of the signed and authored rosters alike is on the"
+      .. " generic-name exclusion list")
+  end
+  -- The boundary class excludes ONLY alphanumerics. `-` and `_` are boundaries,
+  -- not word characters: `noded-beta`, `beta_addr` and `WG_GAMMA` are exactly the
+  -- shapes a real leak takes, and treating them as one identifier is what let
+  -- them through. The residual is that `mkotest` (alnum-adjacent) is missed —
+  -- accepted, because widening further fires on `/dev/mmcblk0` and a gate that
+  -- fires on kernel device names gets bypassed.
+  return {
+    id: "mesh_node_name",
+    pattern: "(^|[^[:alnum:]])(" .. join($names, "|") .. ")([^[:alnum:]]|$)",
+    note: "real mesh node name"
+  }
+end
+
+-- ── scanning ────────────────────────────────────────────────────────────
+
+-- One `git grep` per rule. `where` is always [<immutable object id>] — a
+-- commit for --tree/--range, a write-tree snapshot for --index — and `strip`
+-- is the "<id>:" prefix git prepends to every path it reports. The index used
+-- to be scanned live, as `where = []` plus `--cached`; snapshotting it is what
+-- closed the race described in scan().
+--
+-- A hit carries TWO paths on purpose. `rel` is repo-relative and identical
+-- across --tree / --index / --range, so a fingerprint taken in one mode still
+-- matches in another; `disp` carries the mode's label (repo path, or short
+-- commit) and is for humans only. Hashing `disp` made every fingerprint
+-- mode-specific — an exception recorded from --tree could never be consumed by
+-- the pre-push --range scan, so the allowlist blocked pushes it had pardoned.
+-- Every path git grep names must exist in the scope that was scanned.
+--
+-- A backstop, kept after the two-pass rewrite removed the ambiguity that
+-- motivated it: a parser bug once built the next path out of leftover buffer,
+-- and a violation reported against a file nobody can open is worse than
+-- useless. It is explicitly NOT a proof — a fabricated path that happens to
+-- name a real file passes it — so it does not license a sloppy parser. It runs
+-- only when something matched, so a clean repo pays nothing.
+fn scope_paths($repo, $where)
+  -- `ls-files` (the live index) used to be the other branch here. It is gone
+  -- on purpose: every caller now passes a frozen object id, and a scope check
+  -- that reads the live index while the grep read a snapshot would compare two
+  -- different things.
+  if len($where) != 1 then
+    bail(2, "internal: scope_paths needs exactly one immutable object id")
+  end
+  $raw = git($repo, ["ls-tree", "-r", "-z", "--name-only", $where[0]])
+  $set = {}
+  for each $p in split($raw, "\u{0}")
+    if $p != "" then
+      $set[$p] = true
+    end
+  end
+  return $set
+end
+
+-- The same tree's path→mode map, read through git's DIFF machinery instead of
+-- its tree walker: every entry shows up as an addition against the empty tree,
+-- and the destination mode is the second field of each `:`-record.
+--
+-- Round twenty-four, and why paths were not enough. scope_paths compares two
+-- ls-tree passes that agree on WHICH paths exist; neither says anything about
+-- what KIND of entry each one is, and only mode 120000 makes this scan read a
+-- symlink's target. So relabelling one leaking symlink as `100644 blob` in the
+-- detailed pass — a perfectly legal mode/type pairing, invisible to the path
+-- cross-check — makes the gate skip the target while every count still
+-- matches, and `git grep` never reads a symlink either. The entry is unscanned
+-- and the answer is 0. Modes have to be cross-checked, not just names, and
+-- against a genuinely different code path in git rather than a second call to
+-- the same one.
+--
+-- The empty tree id is asked for rather than hardcoded: 4b825dc… is the SHA-1
+-- value and a sha256 repository has a different one. `hash-object` without
+-- `-w` computes it and writes nothing — this runs inside a pre-commit hook and
+-- has no business adding objects to the repository it is guarding.
+--
+-- Pinned flags, each one a config key that would otherwise change what comes
+-- back: `--no-renames` (diff.renames) keeps every record to one path, and
+-- `--ignore-submodules=none` (diff.ignoreSubmodules) keeps gitlinks visible
+-- rather than silently dropping a 160000 entry the other pass reports.
+--
+-- `diff-tree`, not `diff`: it is plumbing, it needs no worktree (this runs in
+-- pre-commit hooks and has to work in a bare clone), and it prints FULL object
+-- ids where porcelain `git diff --raw` abbreviates them.
+--
+-- git_indexless, not git: diff-tree DOES open the index, even between two
+-- object ids, so an inherited GIT_INDEX_FILE naming a half-written partial
+-- index aborted it. See git_indexless() for the measurement and for T42c.
+fn tree_modes($repo, $where)
+  if len($where) != 1 then
+    bail(2, "internal: tree_modes needs exactly one immutable object id")
+  end
+  $empty = trim(git_indexless($repo, ["hash-object", "-t", "tree", "/dev/null"]))
+  if is_object_id($empty) == false then
+    bail(2, "`git hash-object -t tree /dev/null` in " .. $repo .. " did not"
+      .. " return an object id (" .. sanitize($empty) .. "), so the modes of"
+      .. " this tree cannot be cross-checked and a mislabelled symlink would"
+      .. " go unread — refusing rather than scanning half of it")
+  end
+  $raw = git_indexless($repo, ["diff-tree", "-r", "-z", "--no-renames",
+    "--ignore-submodules=none", $empty, $where[0]])
+  $out = {}
+  $recs = split($raw, "\u{0}")
+  $i = 0
+  while $i < len($recs)
+    $meta = $recs[$i]
+    if $meta != "" then
+      if starts_with($meta, ":") == false then
+        bail(2, "`git diff-tree -r -z` in " .. $repo .. " returned the record "
+          .. sanitize($meta) .. ", which does not begin with ':'. This pass"
+          .. " cross-checks the ENTRY KIND of every path against the tree"
+          .. " walker, so a stream it cannot parse leaves that check unmade")
+      end
+      $f = split(substr($meta, 1), " ")
+      if len($f) < 5 then
+        bail(2, "`git diff-tree -r -z` in " .. $repo .. " returned the record "
+          .. sanitize($meta) .. ", which is not"
+          .. " \":<srcmode> <dstmode> <srcsha> <dstsha> <status>\"")
+      end
+      $path = $recs[$i + 1]
+      if $path == nil or $path == "" then
+        bail(2, "`git diff-tree -r -z` in " .. $repo .. " left the record "
+          .. sanitize($meta) .. " without a path — the stream ended mid-record,"
+          .. " so the entry kinds of this tree were only partly read")
+      end
+      $out[$path] = $f[1]
+      $i = $i + 1
+    end
+    $i = $i + 1
+  end
+  return $out
+end
+
+-- `git grep` searches regular-file blobs only — it never reads a SYMLINK, in
+-- any mode, with or without a revision. A symlink's target path IS published
+-- content (git stores it as the blob body), and a link into the operator's
+-- home or at a node-named path leaks exactly what the rules exist to catch.
+-- The guarded repos hold no symlinks today, which is precisely the kind of
+-- fact that stops being true without anyone noticing.
+--
+-- Targets are scanned in-process, like tag bodies and commit messages: the
+-- same "git grep only sees part of what is published" gap, one layer deeper.
+-- One `ls-tree` per scan (~3 ms against cos, versus ~60 ms for the grep pass
+-- it accompanies), and cat-file only if a symlink actually exists.
+-- Deliberately not regex_match: `regex` is an optional Mix feature, and a
+-- builtin that is absent RAISES — which exits 1, the code this whole arc
+-- reserves for "a violation was found". A validator that can itself produce a
+-- false leak report is not one. Lower case only, because that is what git
+-- prints; 40 is sha1 and 64 is sha256, and anything else is refused rather
+-- than guessed at.
+fn is_object_id($s)
+  if $s == nil then
+    return false
+  end
+  if len($s) != 40 and len($s) != 64 then
+    return false
+  end
+  $i = 0
+  while $i < len($s)
+    if pos(substr($s, $i, 1), "0123456789abcdef") == 0 then
+      return false
+    end
+    $i = $i + 1
+  end
+  return true
+end
+
+-- One ls-tree record, fully checked, or nil. Round twenty-three's cold review:
+-- round twenty-two validated the shape of the entries it had ALREADY DECIDED
+-- were symlinks, and decided that by `starts_with($ent, "120000 ")` — so every
+-- malformed record that did not happen to open with those seven bytes was not
+-- refused, it was SKIPPED, and skipped silently at exit 0. A -z stream whose
+-- NULs went missing (a wrapper git, a pager, a locale-mangling shim) collapses
+-- the whole tree into one record: the first entry may still start with a mode
+-- and be parsed, and every symlink after it disappears from the scan. The
+-- gate then certifies a tree it read one line of. So nothing is skipped now —
+-- every record is parsed and every unparseable one is a 2.
+--
+-- "<mode> <type> <object-id>\t<path>", exactly three metadata fields, no
+-- trimming (git emits no padding; a record that needs trimming is not git's).
+-- A path may itself contain a tab, so it is everything after the FIRST one.
+
+-- Git's tree modes are a closed set and each one NAMES its object type: a
+-- regular file, an executable file and a symlink are blobs, a subdirectory is
+-- a tree, a submodule is a commit. Round twenty-four: the parser checked the
+-- type against three names and the mode against nothing at all, so a shim
+-- could relabel a leaking symlink as `100644 blob` in the detailed pass and
+-- leave the `--name-only` pass untouched — the cross-check below compares
+-- PATHS, so it still agrees — and the symlink's target would never be read.
+-- The mode is only load-bearing if its pairing with the type is enforced, so
+-- it is. Six-digit octal, which is what git prints (`%06o`): a bare `40000`
+-- is not git's ls-tree.
+fn ls_tree_type_for_mode($mode)
+  if $mode == "100644" or $mode == "100755" or $mode == "120000" then
+    return "blob"
+  end
+  if $mode == "040000" then
+    return "tree"
+  end
+  if $mode == "160000" then
+    return "commit"
+  end
+  return nil
+end
+
+fn parse_ls_tree_entry($ent)
+  $split = split($ent, "\t")
+  if len($split) < 2 then
+    return nil
+  end
+  $meta = split($split[0], " ")
+  if len($meta) != 3 then
+    return nil
+  end
+  if $meta[1] != "blob" and $meta[1] != "tree" and $meta[1] != "commit" then
+    return nil
+  end
+  if ls_tree_type_for_mode($meta[0]) != $meta[1] then
+    return nil
+  end
+  if is_object_id($meta[2]) == false then
+    return nil
+  end
+  $path = join(slice($split, 1), "\t")
+  if $path == "" then
+    return nil
+  end
+  return {mode: $meta[0], type: $meta[1], sha: $meta[2], path: $path}
+end
+
+-- A clean/smudge filter breaks the byte identity this gate relies on: the
+-- object `git grep` reads can be only a pointer or another cleaned form, while
+-- checkout and publication tooling move different bytes. `--source` pins
+-- attribute lookup to the same immutable object as every content pass; asking
+-- the worktree or live index would answer for a different revision.
+--
+-- The output is checked as a bijection with the supplied path set. A
+-- successful check-attr that drops, duplicates or invents one record is still
+-- an incomplete answer, and therefore a refusal rather than an empty list.
+fn content_filters($repo, $where, $paths)
+  if len($where) != 1 then
+    bail(2, "internal: content_filters needs exactly one immutable object id")
+  end
+  $nul = "\u{0}"
+  $stdin = ""
+  for each $p in keys($paths)
+    $stdin = $stdin .. $p .. $nul
+  end
+  -- git_indexless, not git: --source pins the lookup to an immutable object,
+  -- so an inherited GIT_INDEX_FILE is not merely unnecessary here but actively
+  -- harmful (T42c pins the invariant; the same half-written pre-commit index
+  -- that broke diff-tree breaks this).
+  $raw = git_indexless_input($repo, ["--literal-pathspecs", "check-attr",
+    "--source=" .. $where[0], "--stdin", "-z", "filter"], $stdin)
+  if len($paths) > 0 and ends_with($raw, $nul) == false then
+    bail(2, "`git check-attr --stdin -z filter` in " .. $repo
+      .. " did not NUL-terminate its final record; its output may be truncated")
+  end
+  $fields = split($raw, $nul)
+  $answers = {}
+  $filtered = []
+  $i = 0
+  while $i < len($fields)
+    if $fields[$i] == "" then
+      if $i != len($fields) - 1 then
+        bail(2, "`git check-attr --stdin -z filter` in " .. $repo
+          .. " returned an empty field where a pathname was required; its"
+          .. " output cannot be parsed as pathname/attribute/value triples")
+      end
+      $i = $i + 1
+    else
+      $path = $fields[$i]
+      $attr = $fields[$i + 1]
+      $value = $fields[$i + 2]
+      if $attr == nil or $value == nil then
+        bail(2, "`git check-attr --stdin -z filter` in " .. $repo
+          .. " ended mid-record after " .. sanitize($path) .. "; its output"
+          .. " cannot prove whether every scanned path has a content filter")
+      end
+      if $attr != "filter" then
+        bail(2, "`git check-attr --stdin -z filter` in " .. $repo
+          .. " named attribute " .. sanitize($attr) .. " for "
+          .. sanitize($path) .. ", not filter; its output cannot be trusted")
+      end
+      if has_key($paths, $path) == false then
+        bail(2, "`git check-attr --stdin -z filter` in " .. $repo
+          .. " answered for " .. sanitize($path) .. ", which was not in the"
+          .. " scanned tree; attribute lookup and object scanning disagree")
+      end
+      if has_key($answers, $path) then
+        bail(2, "`git check-attr --stdin -z filter` in " .. $repo
+          .. " answered more than once for " .. sanitize($path)
+          .. "; its output cannot be matched unambiguously to the scanned tree")
+      end
+      $answers[$path] = true
+      if $value != "unspecified" and $value != "unset" then
+        push($filtered, {path: $path, filter: $value})
+      end
+      $i = $i + 3
+    end
+  end
+  if len($answers) != len($paths) then
+    bail(2, "`git check-attr --stdin -z filter` in " .. $repo .. " answered for "
+      .. len($answers) .. " path(s), but the scanned tree contains "
+      .. len($paths) .. "; refusing to treat missing attribute answers as"
+      .. " unspecified")
+  end
+  for each $p in keys($paths)
+    if has_key($answers, $p) == false then
+      bail(2, "`git check-attr --stdin -z filter` in " .. $repo
+        .. " did not answer for " .. sanitize($p) .. "; that path's published"
+        .. " bytes may differ from the object this gate scanned")
+    end
+  end
+  return $filtered
+end
+
+-- $known is scan()'s one scope_paths() read of this object; validating it here
+-- (against the full ls-tree stream and the diff-tree modes) is what licenses
+-- scan_pathnames to consume it without a git read of its own.
+fn scan_symlinks($repo, $rules, $where, $label, $known)
+  if len($where) != 1 then
+    bail(2, "internal: scan_symlinks needs exactly one immutable object id")
+  end
+  $raw = git($repo, ["ls-tree", "-r", "-z", $where[0]])
+  $hits = []
+  $seen = {}
+  $gitlinks = []
+  for each $ent in split($raw, "\u{0}")
+    if $ent != "" then
+      $e = parse_ls_tree_entry($ent)
+      if $e == nil then
+        bail(2, "cannot parse `git ls-tree -r -z " .. $where[0] .. "` output in "
+          .. $repo .. ": the entry " .. sanitize($ent) .. " is not"
+          .. " \"<mode> <type> <object-id>\\t<path>\". This scan reads symlink"
+          .. " TARGETS through that object id, so an entry it cannot parse is a"
+          .. " part of the tree that was not looked at — not a clean one")
+      end
+      -- path → mode, not path → true: the mode is what the diff-machinery
+      -- cross-check below compares against, and 120000 is the only value that
+      -- makes this scan read an entry's target.
+      $seen[$e["path"]] = $e["mode"]
+      if $e["mode"] == "160000" then
+        push($gitlinks, $e["path"])
+      end
+      if $e["mode"] == "120000" then
+        -- A symlink is stored as a blob whose body is the target. Anything
+        -- else under mode 120000 is a tree this parser does not understand,
+        -- and cat-file would read the wrong kind of object — or the right kind
+        -- of object with the wrong meaning — and call it clean.
+        if $e["type"] != "blob" then
+          bail(2, "`git ls-tree -r -z " .. $where[0] .. "` in " .. $repo
+            .. " reports the symlink " .. sanitize($e["path"]) .. " as a "
+            .. $e["type"] .. ", not a blob. A symlink's TARGET is its blob"
+            .. " body, so this scan cannot read that target — the entry is"
+            .. " unscanned, not clean")
+        end
+        -- Unit "" because the enclosing scan() stamps the unit onto every hit
+        -- it returns, symlink hits included: one place owns that answer so it
+        -- cannot be right here and missing from one of the other builders.
+        $hits = concat($hits, scan_text($rules,
+          git($repo, ["cat-file", "-p", $e["sha"]]),
+          $e["path"], $label .. $e["path"], true, ""))
+      end
+    end
+  end
+  -- The parse above can only refuse what it SEES, and the failure it most needs
+  -- to catch is a record that was never delimited into existence. So the path
+  -- set is cross-checked against an independent `--name-only` pass over the
+  -- same frozen object id: two different parses of the same tree that disagree
+  -- mean one of them read something that is not that tree. (~3 ms; it runs once
+  -- per scan, clean or not, because a clean answer is exactly the one this is
+  -- guarding.) The `--name-only` set is the caller's single read, shared with
+  -- scan_pathnames and the final scope check — one answer, validated once.
+  $names = $known
+  if len($names) != len($seen) then
+    bail(2, "`git ls-tree -r -z " .. $where[0] .. "` in " .. $repo .. " named "
+      .. ("" .. len($seen)) .. " path(s) while `--name-only` over the same"
+      .. " object named " .. ("" .. len($names)) .. ". The two passes disagree"
+      .. " about what is in the tree, so this scan cannot say which paths it"
+      .. " read — refusing rather than reporting on a tree it parsed one way"
+      .. " and counted another")
+  end
+  for each $p in keys($names)
+    if has_key($seen, $p) == false then
+      bail(2, "`git ls-tree -r -z " .. $where[0] .. "` in " .. $repo .. " did"
+        .. " not name " .. sanitize($p) .. ", which `--name-only` over the same"
+        .. " object did. That path's entry was never parsed, so if it is a"
+        .. " symlink its target went unread")
+    end
+  end
+  -- And the entry KINDS, from git's diff machinery — see tree_modes. The path
+  -- cross-check above cannot see a mode that was rewritten to another legal
+  -- one, and mode 120000 is the only thing that makes this scan read a target.
+  $modes = tree_modes($repo, $where)
+  for each $p in keys($modes)
+    if has_key($seen, $p) == false then
+      bail(2, "`git diff-tree -r -z` over " .. $where[0] .. " in " .. $repo
+        .. " names " .. sanitize($p) .. ", which the ls-tree pass did not."
+        .. " Two of git's own views of one frozen object disagree about what is"
+        .. " in it, so this scan cannot say what it read")
+    end
+    if $seen[$p] != $modes[$p] then
+      bail(2, "`git ls-tree -r -z " .. $where[0] .. "` in " .. $repo
+        .. " reports " .. sanitize($p) .. " as mode " .. $seen[$p]
+        .. " while `git diff-tree -r -z` over the same object reports "
+        .. $modes[$p] .. ". Mode 120000 is what makes this scan read an"
+        .. " entry's target, so a mode the two views disagree about is an entry"
+        .. " that may never have been read — refusing rather than certifying"
+        .. " it")
+    end
+  end
+  -- And the other direction. A shim that DROPS a record from the diff pass
+  -- leaves nothing above to compare, so the mode it was hiding would never be
+  -- checked; the counts have to close from both ends.
+  for each $p in keys($seen)
+    if has_key($modes, $p) == false then
+      bail(2, "`git ls-tree -r -z " .. $where[0] .. "` in " .. $repo .. " named "
+        .. sanitize($p) .. ", which `git diff-tree -r -z` over the same object"
+        .. " did not. That entry's kind could not be cross-checked, so if its"
+        .. " mode was rewritten this scan would not know")
+    end
+  end
+  $filters = content_filters($repo, $where, $seen)
+  if len($gitlinks) > 0 or len($filters) > 0 then
+    $reasons = []
+    if len($gitlinks) > 0 then
+      $paths = []
+      for each $p in $gitlinks
+        push($paths, sanitize($p))
+      end
+      push($reasons, "gitlink path(s): " .. join($paths, ", ")
+        .. ". A gitlink points at a submodule repository whose content is"
+        .. " outside this gate's coverage. Add each submodule's own repository"
+        .. " to _etc/public-hygiene.conf.mix and give it the hygiene hooks before"
+        .. " the parent can be scanned honestly")
+    end
+    if len($filters) > 0 then
+      $paths = []
+      for each $f in $filters
+        $value = $f["filter"]
+        if $value == "" then
+          $value = "<empty>"
+        end
+        push($paths, sanitize($f["path"]) .. " (filter=" .. sanitize($value) .. ")")
+      end
+      push($reasons, "content-filtered path(s): " .. join($paths, ", ")
+        .. ". The stored object is not the published content, so scanning it"
+        .. " clean would be a false assurance")
+    end
+    bail(2, join($reasons, "; "))
+  end
+  return $hits
+end
+
+-- ── path policy: no operational docs in a public tree ───────────────────
+--
+-- _doc/, _plan/, _journal/ and their kin are the control overlay; they live
+-- in the private hub and never in a guarded public repo
+-- (_decisions/2026-07-28-no-operational-docs-in-public-repos.md). Enforced
+-- 2026-07-28, the day six of them were found already published in cos —
+-- prose in CLAUDE.md had said so since the repo split, which is the same
+-- "prose alone already failed once" lesson this file's header opens with.
+-- The ONE sanctioned underscore-dir markdown is docs/_man/: the live
+-- reference manual that `mix man` reads is public documentation, not
+-- overlay.
+--
+-- A PATH rule, not a content rule, so it lives in the pathname pass and
+-- never goes through `git grep`: the ban is on where a file SITS, and a
+-- public README may legitimately MENTION `_doc/…` in prose.
+--
+-- Segments are judged one by one rather than with a single regex so the
+-- exception cannot be smuggled: `_plan/docs/_man/x.md` still violates,
+-- because `_plan` is judged on its own. Only a `_man` segment directly under
+-- a `docs` segment is exempt.
+-- \s* before the anchor, because `$` in the in-process engine is absolute
+-- end-of-text and trailing whitespace is LEGAL in a git filename —
+-- `_doc/plan.md\n` and `_doc/plan.md ` both scanned clean under a bare
+-- `[.]md$` (reproduced in cold review, 2026-07-28). \s rather than
+-- [[:space:]]: the POSIX class is ASCII-only in this engine, so a no-break
+-- space (U+00A0) still dodged it — \s is Unicode White_Space. A name that is
+-- ".md plus trailing whitespace" is an operational doc wearing a costume,
+-- not a different kind of file. Residual, accepted: trailing NON-whitespace
+-- junk (a zero-width char, a different extension) is genuinely a different
+-- name, and chasing it ends with the gate refusing kernel-device lookalikes.
+fn underscore_doc_violation($path)
+  if regex_match("(?i)[.]md\\s*$", $path) == false then
+    return false
+  end
+  $segs = split($path, "/")
+  -- 2026-08-30: `ctl/` at the repo root is the STARTER CONTROL FOLDER — the one
+  -- public home for operational-doc SHAPES (_spec, _decisions, _doc templates)
+  -- that a new user copies out to become their private hub. The location rule
+  -- yields there and only there; every CONTENT rule still applies to it, so a
+  -- real node name or domain inside ctl/ is still a violation. `ctl` must be
+  -- the FIRST segment: `_plan/ctl/x.md` is an overlay dir wearing a costume.
+  if len($segs) > 1 and $segs[0] == "ctl" then
+    return false
+  end
+  $i = 0
+  -- len - 1: the final segment is the filename, and the ban is on underscore
+  -- DIRECTORIES — a file merely named `_notes.md` at the top level is not one.
+  while $i < len($segs) - 1
+    if starts_with($segs[$i], "_") then
+      $exempt = false
+      if $segs[$i] == "_man" and $i > 0 then
+        if $segs[$i - 1] == "docs" then
+          $exempt = true
+        end
+      end
+      if $exempt == false then
+        return true
+      end
+    end
+    $i = $i + 1
+  end
+  return false
+end
+
+-- A tracked PATHNAME is published content too, and no grep pass reads one.
+-- `git grep` matches inside blob bodies; `-l` reports which paths matched, it
+-- does not match against them. So a file named `notes-home-user-cmctl.txt`, or
+-- anything under a directory named after a real domain, went through
+-- pre-commit, commit-msg, pre-push and the --all audit reporting clean — with
+-- an empty body it published a forbidden identifier and nothing looked at it
+-- (round ten; reproduced against `example.org/keep.txt` and confirmed pushed).
+--
+-- Same shape as the symlink and commit-message passes: git grep only ever sees
+-- part of what a commit publishes, and each part it cannot see needs its own
+-- in-process pass over the same frozen object.
+--
+-- The path is used as both `rel` and `line`, so the fingerprint pins THIS path
+-- rather than a rule-plus-nothing that would pardon every future path matching
+-- the same rule. Directories need no separate handling: `ls-tree -r` names
+-- every component in each full path, and git cannot track an empty one.
+--
+-- $known is the CALLER's path set, not a fresh git read. This pass used to run
+-- its own `ls-tree --name-only`, and a shim returning an empty-but-successful
+-- stream for exactly that second call silently emptied the whole pathname pass
+-- — no hits, so the scope check never ran either, and the gate exited 0
+-- (reproduced in cold review, 2026-07-28). scan() now reads the set once;
+-- scan_symlinks cross-validates that same set against the full ls-tree and
+-- diff-tree views, so by the time it reaches here a lying stream has already
+-- been refused at 2.
+fn scan_pathnames($rules, $known, $label)
+  $hits = []
+  for each $p in keys($known)
+    if $p != "" then
+      for each $rule in $rules
+        -- (?i) to match `git grep -E -i`, which is what scans the bodies.
+        if regex_match("(?i)" .. $rule["pattern"], $p) then
+          push($hits, {
+            rule: $rule["id"], note: $rule["note"] .. " — in the PATHNAME itself",
+            rel: $p, disp: $label .. $p, line_no: 0, line: $p,
+            binary: false, pardonable: true
+          })
+        end
+      end
+      -- The operational-docs path policy (see underscore_doc_violation above).
+      -- Same hit shape as a pathname leak — the path is the finding — so a
+      -- fingerprint pardon pins exactly one path under exactly this rule.
+      if underscore_doc_violation($p) then
+        push($hits, {
+          rule: "underscore_dir_doc",
+          note: "operational doc (.md under a _*/ directory) — these live in"
+            .. " the private control repo, never a public one; only the live"
+            .. " manual under docs/_man/ is published",
+          rel: $p, disp: $label .. $p, line_no: 0, line: $p,
+          binary: false, pardonable: true
+        })
+      end
+    end
+  end
+  return $hits
+end
+
+fn scan($repo, $rules, $text_flags, $list_flags, $where, $strip, $label)
+  -- ONE `--name-only` read of the frozen object, up front. scan_symlinks
+  -- validates it against two independent git views, scan_pathnames iterates
+  -- it, and the final scope check reads it — a second read here was the seam
+  -- a shim used to empty the pathname pass without tripping anything.
+  $known = scope_paths($repo, $where)
+  $hits = []
+  for each $rule in $rules
+    $text = parse_grep_text($rule, git_grep($repo,
+      concat(concat($text_flags, ["-e", $rule["pattern"]]), $where)), $strip, $label)
+    $seen = {}
+    for each $h in $text
+      $seen[$h["rel"]] = true
+    end
+    $hits = concat($hits, $text)
+    -- Whatever `-l` names that the text pass did not is a binary match: the
+    -- set difference replaces reading it out of git's prose. `-I` only ever
+    -- REMOVES files from what `-l` reports, so against a FIXED snapshot the
+    -- difference can over-report (a text hit called binary, which is loud and
+    -- unpardonable) but never hide one.
+    --
+    -- "Against a fixed snapshot" is load-bearing, and an earlier version of
+    -- this comment claimed the no-hide property unconditionally. It is false
+    -- for a moving one, in both directions: a binary leak present for the `-I`
+    -- pass produces no text record, and if the scanned content is swapped to a
+    -- non-matching version before the `-l` pass and swapped back afterwards,
+    -- both passes come back empty and the gate reports clean over a leak that
+    -- is there when the scan ends. So `$where` is always an immutable object
+    -- id by the time it reaches here — a commit sha for --tree/--range, a
+    -- `write-tree` snapshot for --index (see the mode dispatch below) — never
+    -- `HEAD`, a branch name, or the live index. The two greps still are not
+    -- atomic with each other; they no longer need to be, because they are
+    -- reading the same frozen object.
+    for each $p in parse_grep_paths(git_grep($repo,
+      concat(concat($list_flags, ["-e", $rule["pattern"]]), $where)), $strip)
+      if $seen[$p] != true then
+        $seen[$p] = true
+        push($hits, binary_hit($rule, $p, "", $label, $repo, $where[0]))
+      end
+    end
+  end
+  $hits = concat($hits, scan_symlinks($repo, $rules, $where, $label, $known))
+  $hits = concat($hits, scan_pathnames($rules, $known, $label))
+  for each $h in $hits
+    if $known[$h["rel"]] != true then
+      bail(2, "git grep named a path that does not exist in the scanned scope"
+        .. " (" .. $h["rel"] .. ") — its output could not be parsed"
+        .. " unambiguously; refusing to report either way")
+    end
+  end
+  -- Stamp the scan unit onto every hit, from the one place that is guaranteed
+  -- to see all four builders (text grep, binary set-difference, symlinks,
+  -- pathnames). `$where` is exactly one immutable object id by contract — both
+  -- scan_symlinks and scan_pathnames refuse anything else — so there is one
+  -- answer, and --all can turn it into the set of ref tips that reach it.
+  --
+  -- The unit is the TREE, not the selector. `git grep <commit>` searches that
+  -- commit's tree, so the bytes these hits came from are the tree's, and the
+  -- unit has to name what was read or it is not an identity. Two consequences,
+  -- both wanted: a commit's tree hits no longer share a key with its own
+  -- MESSAGE hits (scan_object keys those on the commit object, which is a
+  -- different set of bytes), and two commits with the same tree are one unit
+  -- rather than two names for identical content. `<tree>^{tree}` is the tree
+  -- itself, so the --all and --index callers — which already pass a tree — are
+  -- unchanged. Today only --all reads `unit`, so nothing observable moves; the
+  -- collision was a trap for the next mode that reads it, not a live fault.
+  $unit_obj = trim(git($repo, ["rev-parse", "--verify", $where[0] .. "^{tree}"]))
+  if $unit_obj == "" then
+    bail(2, "cannot resolve the tree of the scanned object " .. $where[0]
+      .. " in " .. $repo .. " — refusing rather than reporting hits this gate"
+      .. " cannot say the provenance of")
+  end
+  $i = 0
+  while $i < len($hits)
+    $hits[$i]["unit"] = unit_key($repo, $unit_obj)
+    $i = $i + 1
+  end
+  return $hits
+end
+
+-- The rules are written as POSIX ERE for `git grep -E`. Text scanning runs
+-- them through a different engine, so prove every rule compiles there ONCE, up
+-- front — a pattern that only fails on the day it would have matched is a
+-- silent bypass. Rules must therefore stay in the portable subset: no `\b`, no
+-- lookaround, no backreferences (the conf file says so too).
+fn validate_rules($rules)
+  for each $rule in $rules
+    try
+      regex_match("(?i)" .. $rule["pattern"], "")
+    catch $m, $e
+      bail(2, "rule " .. $rule["id"] .. " is not usable for text scanning: " .. $m)
+    end
+  end
+end
+
+-- Apply the rules to raw text, line by line, in-process.
+--
+-- This is the path for everything `git grep` cannot reach, and the list is
+-- longer than it looks: `git grep` searches TREES, so an annotated tag's body
+-- and a COMMIT MESSAGE are both invisible to it — and both are published. A
+-- tag that moves to an already-published commit selects zero commits, so a
+-- range scan reports clean while the push publishes the message.
+-- A hit's SCAN UNIT: the immutable object whose bytes were read to find it,
+-- qualified by the repository that holds it. Two repositories can hold the
+-- identical tree — the seen sets are per-repository for exactly that reason —
+-- so a bare sha is not a key. Refnames and repo paths cannot contain a NUL, so
+-- the join is unambiguous.
+fn unit_key($repo, $id)
+  return $repo .. "\u{0}" .. $id
+end
+
+-- What an object's own bytes are CALLED in a violation line. This used to be
+-- the constant "object-body" everywhere except --range, which passed
+-- "commit-message" for the same object type — so the audit and the push hook
+-- described the identical finding by two different names, and the audit's name
+-- did not say which of a tag, a commit or a blob it had read. The label is part
+-- of `rel`, hence part of the fingerprint, so it also has to be a function of
+-- the object rather than of the call site: the same object scanned through two
+-- code paths must hash the same. That invariant is about the BODY doors and
+-- nothing wider: `--tree` reads `ls-tree -r --name-only`, a different byte
+-- stream over a recursive expansion, so a forbidden path component found there
+-- is a different observation from the same component found in a tree's own
+-- entry listing, and the two fingerprint apart on purpose. Pardons have never
+-- been transitive across scan kinds.
+fn body_kind($type)
+  if $type == "tag" then
+    return "tag-body"
+  end
+  if $type == "commit" then
+    return "commit-message"
+  end
+  if $type == "blob" then
+    return "blob-body"
+  end
+  if $type == "tree" then
+    -- `cat-file -p` on a tree prints its entry names, which is a real policy
+    -- surface (a leak can live in a filename). Naming it honestly beats
+    -- refusing something the gate can in fact read.
+    return "tree-listing"
+  end
+  bail(2, "cannot scan the body of a " .. $type .. " object — refusing rather"
+    .. " than reporting on bytes this gate does not know how to name")
+end
+
+fn scan_text($rules, $text, $rel, $disp, $pardonable, $unit)
+  $hits = []
+  $n = 0
+  for each $l in split($text, "\n")
+    $n = $n + 1
+    for each $rule in $rules
+      if regex_match("(?i)" .. $rule["pattern"], $l) then
+        push($hits, {
+          rule: $rule["id"], note: $rule["note"] .. " — in " .. $rel,
+          rel: $rel, disp: $disp, line_no: $n, line: $l, binary: false,
+          pardonable: $pardonable, unit: $unit
+        })
+      end
+    end
+  end
+  return $hits
+end
+
+-- A git object's own bytes: a tag body, a commit's headers + message, a blob.
+--
+-- `rel` binds the object's OWN SHA, not a constant label. It used to be the
+-- literal "<object-body>" / "<commit-message>" for every object in every repo,
+-- so two tags carrying the same text on the same body line hashed identically
+-- and one exception pardoned an unbounded stream of future tags — the exact
+-- "glob by accident" the fingerprint design exists to prevent, and worse than
+-- the file case because the key carried no identity at all. Git objects are
+-- immutable, so their sha is the one thing that pins a pardon to the object it
+-- was granted for.
+-- $known_type is an optimisation, not an input: object type is immutable for a
+-- given sha, so a caller that has just classified this object may pass its
+-- answer, and "" makes this function ask git. Callers no longer NAME the kind —
+-- the chain walk passed "object-body" for a tag, a commit and a blob alike
+-- while --range passed "commit-message" for the very same commit object, so one
+-- finding had two names depending on which door it came through.
+fn scan_object($repo, $rules, $rev, $known_type)
+  -- Deliberately NOT `<rev>^{}`: peeling a tag ref yields the commit it points
+  -- at, and the tag's own body — the thing being scanned — would get the
+  -- commit's identity.
+  $sha = trim(git($repo, ["rev-parse", $rev]))
+  if $sha == "" then
+    bail(2, "cannot resolve " .. $rev .. " to an object sha in " .. $repo)
+  end
+  $type = $known_type
+  if $type == "" then
+    $type = trim(git($repo, ["cat-file", "-t", $sha]))
+  end
+  $kind = body_kind($type)
+  $rel = "<" .. $kind .. ">:" .. $sha
+  return scan_text($rules, git($repo, ["cat-file", "-p", $sha]), $rel,
+    slice($sha, 0, 8) .. " " .. $kind, true, unit_key($repo, $sha))
+end
+
+fn tag_target($repo, $rev)
+  for each $line in split(git($repo, ["cat-file", "-p", $rev]), "\n")
+    if starts_with($line, "object ") then
+      return trim(slice($line, 7))
+    end
+  end
+  bail(2, "cannot follow the tag chain from " .. $rev .. " — refusing")
+end
+
+-- Scan one immutable tree, once per repository. A commit is resolved to its
+-- TREE before dedupe, so HEAD, a branch and a tag all pointing at the same
+-- commit do not spend three revision-units scanning identical bytes. Distinct
+-- commits with the same tree are also one content unit: the audit promises ref
+-- TIP TREES, not one redundant scan per name.
+fn scan_tip_tree($repo, $rules, $text_flags, $list_flags, $obj, $known_type,
+    $seen_trees, $label)
+  -- Object type is immutable for a given sha. A caller that classified this
+  -- object a moment ago can pass that answer without changing the decision;
+  -- callers that have only a sha pass "" and this function asks git itself.
+  $type = $known_type
+  if $type == "" then
+    $type = trim(git($repo, ["cat-file", "-t", $obj]))
+  end
+  $tree = ""
+  if $type == "commit" then
+    $tree = trim(git($repo, ["rev-parse", "--verify", $obj .. "^{tree}"]))
+  elif $type == "tree" then
+    $tree = $obj
+  else
+    bail(2, "ref tip " .. slice($obj, 0, 8) .. " is a " .. $type
+      .. ", not a commit or tree, so it has no tip tree this gate can scan"
+      .. " — refusing rather than passing it unchecked")
+  end
+  if $tree == "" then
+    bail(2, "cannot resolve the tip tree of " .. slice($obj, 0, 8)
+      .. " in " .. $repo .. " — refusing")
+  end
+  -- `reached` is returned on BOTH paths, deduped or not. Dedupe is about not
+  -- scanning the same bytes twice; attribution is about who reaches them, and
+  -- the second ref to arrive at a tree reaches it just as much as the first.
+  -- Reporting only the first would name one branch as the carrier of content
+  -- that three refs publish.
+  if contains($seen_trees, $tree) then
+    return {hits: [], units: 0, seen_trees: $seen_trees, reached: [$tree]}
+  end
+  push($seen_trees, $tree)
+  return {
+    hits: scan($repo, $rules, $text_flags, $list_flags,
+      [$tree], $tree .. ":", $label),
+    units: 1,
+    seen_trees: $seen_trees,
+    reached: [$tree]
+  }
+end
+
+-- Tags can point at tags, blobs, trees or commits. Both the audit and the
+-- hook use this one walk: keeping separate copies is what let --all inspect
+-- only the outer tag while pre-push correctly followed the published chain.
+--
+-- Round forty closes the terminal-commit exception. The old walk classified
+-- that commit, counted it, then returned without scanning its tree, while a
+-- terminal tree or any unknown type was explicitly refused "rather than
+-- passing it unchecked". Measured on the live public repository: --all exited
+-- 0 over five published ref tips carrying 620 violations. Tag bodies were not
+-- enough; the commit tree they select is the published content.
+fn scan_object_chain($repo, $rules, $text_flags, $list_flags, $rev,
+    $seen_trees, $seen_bodies, $label)
+  $hits = []
+  $units = 0
+  $reached = []
+  $obj = $rev
+  $depth = 0
+  $type = ""
+
+  while $depth < 16
+    $type = trim(git($repo, ["cat-file", "-t", $obj]))
+    if $type != "tag" then
+      break
+    end
+    -- Outside the dedupe branch on purpose: see scan_tip_tree's `reached`.
+    push($reached, $obj)
+    if contains($seen_bodies, $obj) == false then
+      push($seen_bodies, $obj)
+      $hits = concat($hits, scan_object($repo, $rules, $obj, $type))
+      $units = $units + 1
+    end
+    $obj = tag_target($repo, $obj)
+    $depth = $depth + 1
+  end
+
+  if $type == "tag" then
+    -- A chain of exactly 16 tags has been scanned, but its target has not yet
+    -- been classified. Only another tag exceeds the bound.
+    $type = trim(git($repo, ["cat-file", "-t", $obj]))
+    if $type == "tag" then
+      bail(2, "tag chain deeper than 16 from " .. slice($rev, 0, 8) .. " — refusing")
+    end
+  end
+  if $type == "blob" then
+    push($reached, $obj)
+    if contains($seen_bodies, $obj) == false then
+      push($seen_bodies, $obj)
+      $hits = concat($hits, scan_object($repo, $rules, $obj, $type))
+      $units = $units + 1
+    end
+  end
+  if $type == "commit" then
+    -- The commit OBJECT, not just the tree it selects. `cat-file -p` on a
+    -- commit prints the author and committer identities and the full message,
+    -- all of which are published bytes — and the gate already treats a commit
+    -- message as a policy surface, since `--message` exists precisely to scan
+    -- one from a commit-msg hook. Scanning the tree alone meant a value the
+    -- commit-msg hook would have rejected sailed through the audit of the
+    -- same repository the moment it was already committed, with `--all`
+    -- printing "clean". Tag bodies were scanned above for this reason; commit
+    -- bodies were the omission.
+    push($reached, $obj)
+    if contains($seen_bodies, $obj) == false then
+      push($seen_bodies, $obj)
+      $hits = concat($hits, scan_object($repo, $rules, $obj, $type))
+      $units = $units + 1
+    end
+    $tree_scan = scan_tip_tree($repo, $rules, $text_flags, $list_flags, $obj,
+      $type, $seen_trees, $label)
+    $seen_trees = $tree_scan["seen_trees"]
+    $hits = concat($hits, $tree_scan["hits"])
+    $units = $units + $tree_scan["units"]
+    $reached = concat($reached, $tree_scan["reached"])
+  end
+  if $type == "tree" then
+    bail(2, "ref points at a tree object, which this gate cannot scan"
+      .. " — refusing rather than passing it unchecked")
+  end
+  if $type != "commit" and $type != "blob" then
+    bail(2, "ref points at a " .. $type .. " object, which this gate cannot scan"
+      .. " — refusing rather than passing it unchecked")
+  end
+  return {
+    hits: $hits, units: $units,
+    seen_trees: $seen_trees, seen_bodies: $seen_bodies,
+    reached: $reached
+  }
+end
+
+-- Record that $name reaches each of $reached. Returned rather than mutated:
+-- Mix maps are copy-on-write, so a map handed to a function is the caller's
+-- old value unless the new one comes back.
+fn note_refs($unit_refs, $repo, $reached, $name)
+  for each $u in $reached
+    $k = unit_key($repo, $u)
+    $lst = $unit_refs[$k]
+    if $lst == nil then
+      $lst = []
+    end
+    if contains($lst, $name) == false then
+      push($lst, $name)
+    end
+    $unit_refs[$k] = $lst
+  end
+  return $unit_refs
+end
+
+-- Git refnames cannot contain ASCII control bytes, so a TAB-delimited
+-- for-each-ref record is unambiguous. Keep both the refname and the direct
+-- object type: a lightweight tag names its commit/blob/tree directly, while an
+-- annotated tag names a tag object whose body must be scanned before its target.
+fn local_refs($repo)
+  $refs = []
+  $raw = git_quiet($repo, ["for-each-ref",
+    "--format=%(refname)%09%(objectname)%09%(objecttype)",
+    "refs/heads", "refs/tags"])
+  for each $line in nonempty_lines($raw)
+    $fields = split($line, "\t")
+    if len($fields) != 3 then
+      bail(2, "git for-each-ref returned an unparseable record in " .. $repo
+        .. " — refusing rather than omit a ref tip")
+    end
+    push($refs, {name: $fields[0], object: $fields[1], kind: $fields[2]})
+  end
+  return $refs
+end
+
+-- Lists and maps do not have structural `==` in Mix. Compare the ordered
+-- for-each-ref records field by field so a branch/tag created, deleted or moved
+-- during the multi-command audit cannot leave a result describing the old ref
+-- set while the summary claims the new one was covered.
+fn same_refs($before, $after)
+  if len($before) != len($after) then
+    return false
+  end
+  $i = 0
+  while $i < len($before)
+    if $before[$i]["name"] != $after[$i]["name"] \
+        or $before[$i]["object"] != $after[$i]["object"] \
+        or $before[$i]["kind"] != $after[$i]["kind"] then
+      return false
+    end
+    $i = $i + 1
+  end
+  return true
+end
+
+fn validate_conf_value($value, $spec, $path, $label)
+  try
+    validate($value, $spec)
+  catch $vm, $ve
+    bail(2, $path .. " is not a usable " .. $label .. ": " .. $vm)
+  end
+end
+
+-- ── main ────────────────────────────────────────────────────────────────
+
+$argv = args()
+if len($argv) == 0 then
+  bail(2, "no mode given; see the header for usage")
+end
+
+$mode = $argv[0]
+$MODES = ["--all", "--tree", "--index", "--range", "--object",
+  "--object-chain", "--message"]
+$KNOWN_FLAGS = ["--print-fingerprints", "--from-hook"]
+if contains($MODES, $mode) == false then
+  bail(2, "unknown mode: " .. $mode)
+end
+
+-- Round forty: every non-range mode has an exact argument shape. The old
+-- parser checked only minimum arity, so `--tree <repo> HEAD bogus --nonsense`
+-- scanned HEAD, ignored the rest, and exited 0 "clean" — an answer to a
+-- smaller question than the operator asked. Strip only this program's two
+-- explicit flags. `--range` is deliberately different: its tail belongs to
+-- git rev-list and arbitrary option/positional combinations are its contract.
+-- ...and `--range` stops interpreting flags after a bare `--`. Git defines
+-- everything past that separator as pathspecs, so a tracked file really can be
+-- named `--from-hook`; consuming it here would forward a rev-list selection
+-- narrower than the operator asked for and then report the smaller answer as
+-- clean. The separator itself is forwarded, because git needs it too.
+$mode_args = []
+$print_fp = false
+$from_hook = false
+$pathspec_tail = false
+for each $a in slice($argv, 1)
+  if $pathspec_tail == false and contains($KNOWN_FLAGS, $a) then
+    if $a == "--print-fingerprints" then
+      $print_fp = true
+    else
+      $from_hook = true
+    end
+  else
+    if $mode != "--range" and starts_with($a, "--") then
+      bail(2, "unrecognised flag for " .. $mode .. ": " .. $a)
+    end
+    if $mode == "--range" and $a == "--" then
+      $pathspec_tail = true
+    end
+    push($mode_args, $a)
+  end
+end
+
+if $mode == "--all" and len($mode_args) > 0 then
+  bail(2, "unexpected argument for --all: " .. $mode_args[0])
+end
+if $mode == "--index" and len($mode_args) > 1 then
+  bail(2, "unexpected argument for --index: " .. $mode_args[1])
+end
+if $mode == "--tree" and len($mode_args) > 2 then
+  bail(2, "unexpected argument for --tree: " .. $mode_args[2])
+end
+if ($mode == "--object" or $mode == "--object-chain" or $mode == "--message") \
+    and len($mode_args) > 2 then
+  bail(2, "unexpected argument for " .. $mode .. ": " .. $mode_args[2])
+end
+
+-- Every mode but --all names its repo in the first consumed mode argument;
+-- --all takes its list from the config and is never invoked by a hook.
+$env_repo = nil
+if $mode != "--all" and len($mode_args) >= 1 then
+  $env_repo = $mode_args[0]
+end
+require_clean_git_env($from_hook, $mode, $env_repo)
+
+$cfg = load_conf($CONF, "public_hygiene")
+
+-- The config is a boundary, so it gets validated like one. `load_conf` only
+-- proved the file parses and carries the top-level block; a parseable config
+-- with a mistyped field (repos a string, a rule missing `pattern`) blew up
+-- somewhere downstream with an uncaught error and exit 1 — indistinguishable,
+-- to a hook, from "found a violation". Every failure to CHECK must be exit 2.
+-- schema_version was recorded and never read; now a bump is a loud stop rather
+-- than a silent misread of unfamiliar fields.
+validate_conf_value($cfg, {
+    schema_version: {type: "integer", min: 1, max: 1},
+    repos: {type: "list", items: {type: "string", nonblank: true}},
+    static_rules: {type: "list", items: {type: "map", schema: {
+      id: {type: "string", nonblank: true},
+      pattern: {type: "string", nonblank: true},
+      note: {type: "string", nonblank: true}
+    }}},
+    generic_node_names: {type: "list", items: {type: "string"}},
+    guidance: {type: "map", schema: {
+      ipv4: {type: "string", nonblank: true},
+      domain: {type: "string", nonblank: true},
+      node: {type: "string", nonblank: true},
+      home: {type: "string", nonblank: true}
+    }}
+  }, $CONF, "rule set")
+
+-- 2026-08-30: a hub with NO mesh (a fresh user's copy of the starter control
+-- folder) has neither inventory file. Then the mesh-derived rules cannot exist
+-- and the gate runs the static rules only — LOUDLY, on every scan, so nobody
+-- mistakes that for the full gate. The refusals below are unchanged for a hub
+-- that HAS an authored inventory: authored-without-signed is still exit 2,
+-- because that is the shape an edit-to-shrink attack produces.
+$HAS_MESH = exists($INV) or exists($SIGNED)
+$inv = {subnet: "", members: []}
+$sinv = {subnet: "", members: []}
+if $HAS_MESH then
+  $inv = load_conf($INV, "inventory")
+  validate_conf_value($inv, {
+    schema_version: {type: "integer", min: 1, max: 1},
+    subnet: {type: "string", nonblank: true},
+    members: {type: "list", min_length: 1, items: {type: "map", schema: {
+      name: {type: "string", nonblank: true}
+    }}}
+  }, $INV, "inventory")
+  $sinv = signed_roster()
+else
+  eprint("no mesh inventory at " .. $INV .. " — mesh-derived rules (node names,"
+    .. " subnet) are NOT in effect; static rules from " .. $CONF .. " only")
+end
+
+-- The authored subnet keeps the unsuffixed rule ids. Fingerprints in the
+-- allowlist embed the rule id, so renaming `mesh_ipv4` would silently void
+-- every pardon recorded against it — the ids that exist today must keep
+-- meaning what they meant. A second pair appears only while the signed and
+-- authored subnets actually differ, i.e. during a renumber, and disappears
+-- again once the new subnet is signed.
+$RULES = []
+if $HAS_MESH then
+  $RULES = mesh_rules($inv, "")
+  if $sinv["subnet"] != $inv["subnet"] then
+    $RULES = concat($RULES, mesh_rules($sinv, "_signed"))
+  end
+  $RULES = concat($RULES, [node_rule(concat($inv["members"], $sinv["members"]),
+    $cfg["generic_node_names"])])
+end
+$RULES = concat($RULES, $cfg["static_rules"])
+validate_rules($RULES)
+
+-- The fingerprint's first field is the rule id, so two rules sharing one id
+-- make two DIFFERENT judgements hash identically — one allowlist entry then
+-- pardons both (reproduced in cold review, 2026-07-28: a configured rule
+-- named underscore_dir_doc collided with the built-in path policy and a
+-- single pardon covered two distinct hits). Config validation only requires
+-- ids to be nonblank, so uniqueness is enforced here, across the derived,
+-- configured and built-in sets alike; underscore_dir_doc is reserved because
+-- the path policy does not live in $RULES.
+$rule_ids = ["underscore_dir_doc"]
+for each $r in $RULES
+  if contains($rule_ids, $r["id"]) then
+    bail(2, "rule id " .. $r["id"] .. " is used twice (or collides with the"
+      .. " built-in underscore_dir_doc path policy). Fingerprints embed the"
+      .. " rule id, so a shared id lets one allowlist entry pardon violations"
+      .. " from two different rules — rename one of them")
+  end
+  push($rule_ids, $r["id"])
+end
+
+-- -n line numbers, -E extended regex, -i case-insensitive, -z NUL-terminated
+-- fields so the record cannot be misparsed by a colon in a path. `-I` skips
+-- binary content in the TEXT pass only — the `-l` pass still names it, and the
+-- difference between the two is how binary matches are found, so nothing is
+-- excluded from reporting; see the two-pass note above parse_grep_text.
+--
+-- The last three are not defaults being restated — each is a `grep.*` config
+-- key an operator can set that silently changes what the gate sees. A gate
+-- whose scanning semantics move with user config is not a gate, so every one
+-- of them is pinned on the command line, where the flag wins:
+--
+--   --no-recurse-submodules  with `submodule.recurse=true`, grep reports paths
+--                            from inside a submodule that the superproject's
+--                            index and tree do not contain — a legitimate hit
+--                            that then fails the scope check and exits 2,
+--                            hiding the violation behind an infrastructure
+--                            error.
+--   --no-column              `grep.column=true` inserts a fourth field, making
+--                            the -z record `path\0line\0col\0text\n`.
+--                            parse_grep_text refuses it (exit 2, safe) but a
+--                            real leak is then reported as an unparseable
+--                            stream instead of as the violation it is.
+--   --no-full-name           `grep.fullName=true` reports paths relative to the
+--                            repo root while `git ls-files` (the scope check's
+--                            authority) reports them relative to the cwd. Only
+--                            matters when $repo is a subdirectory, and it too
+--                            fails loud rather than quiet — but the two must
+--                            agree by construction, not by luck. `--no-full-name`
+--                            is the side that matches ls-files' default.
+--
+-- The remaining grep.* keys are harmless here: patternType/extendedRegexp are
+-- overridden by the explicit -E (verified against git 2.55), lineNumber by -n,
+-- threads is performance only, and fallbackToNoIndex cannot fire because every
+-- invocation is inside a repo.
+$TEXT_FLAGS = ["-n", "-E", "-i", "--no-color", "-z", "-I",
+  "--no-recurse-submodules", "--no-column", "--no-full-name"]
+$LIST_FLAGS = ["-l", "-E", "-i", "--no-color", "-z",
+  "--no-recurse-submodules", "--no-column", "--no-full-name"]
+
+-- Every object-reading mode takes a REPOSITORY, and a non-bare repository has
+-- to be scanned from its top level. Given a subdirectory instead, git's own
+-- commands stop agreeing about what "the repo" means: `ls-tree` and `git grep`
+-- (which this gate runs with --no-full-name) report only that subtree, relative
+-- to it, while `diff-tree` reports the whole tree relative to the root. Round
+-- twenty-five found that as an exit 2, but before the cross-check the same
+-- invocation scanned a subtree alone, said clean, and never read root files.
+--
+-- Round twenty-seven corrects two later conclusions about that
+-- canonicalisation. First, a top-level pathname is not a repository identity.
+-- A repository with core.worktree aimed at another repository's tree reports
+-- that tree as its top level while retaining its own gitdir and HEAD. Reproduced
+-- 2026-07-26: A and B both answered top=A, but B's absolute gitdir and leaking
+-- HEAD remained B's. Round twenty-five introduced the exit-0-over-unread-B
+-- failure by replacing both configured paths with A; round twenty-six's dedupe
+-- did NOT introduce it, it only changed the printed count from two identical
+-- scans of A to one. Identity is therefore (top level, absolute gitdir), and a
+-- non-bare entry is usable only when asking at its resolved top reaches the
+-- same gitdir as asking at the entry. Scanning the entry instead is deliberately
+-- rejected: it re-opens the split path vocabulary above, so an entry that
+-- cannot be widened without changing repositories is untrustworthy, not
+-- scannable-another-way. A bare repository has no top level; its identity is
+  -- its canonical absolute gitdir in both fields: that directory IS the bare
+  -- repository, and keeping a supplied alias or subdirectory as the top defeats
+  -- pair dedupe and makes diagnostics prefix paths with a directory they are
+  -- not under.
+--
+-- Second, round twenty-six used git_uncontaminated() for these questions to
+-- stop GIT_CONFIG_PARAMETERS redirecting discovery. That threat was real but
+-- the tool was wrong: every scan call inherits that same configuration, so a
+-- pristine answer describes a DIFFERENT Git environment from the one whose
+-- objects and paths are about to be read. Measured with XDG_CONFIG_HOME carrying
+-- safe.directory: ordinary Git could scan the root-owned repository while
+-- discovery stripped the authorisation and refused it. These probes use the
+-- ordinary git_argv() launcher and inherited environment, exactly as git()
+-- does; require_clean_git_env() separately rejects the ambient repository
+-- selectors that are not allowed on this mode. Consistency with the reader is
+-- the invariant, not cleanliness relative to a reader this gate never uses.
+fn discovery_git($repo, $rest)
+  return run_argv(concat(git_argv($repo), $rest),
+    {timeout: 600, max_output: 67108864, env: $GIT_ENV})
+end
+
+fn discovery_path($repo, $rest, $what)
+  $r = discovery_git($repo, $rest)
+  if $r["ok"] != true or $r["utf8_lossy"] or $r["stdout_truncated"] then
+    bail(2, "top-level discovery failed for " .. $repo .. ": git could not"
+      .. " name " .. $what .. " in the same environment the scan will use, so"
+      .. " the scan's paths cannot be trusted to mean what the rest of the gate"
+      .. " assumes")
+  end
+  $path = chomp_path($r["stdout"])
+  if $path == "" then
+    bail(2, "top-level discovery failed for " .. $repo .. ": git returned an"
+      .. " empty " .. $what .. ", so the scan's paths cannot be trusted to mean"
+      .. " what the rest of the gate assumes")
+  end
+  return $path
+end
+
+fn repo_identity($repo)
+  $bare_r = discovery_git($repo, ["rev-parse", "--is-bare-repository"])
+  if ($bare_r["ok"] != true or $bare_r["utf8_lossy"]
+      or $bare_r["stdout_truncated"]) then
+    bail(2, "top-level discovery failed for " .. $repo .. ": git could not"
+      .. " answer whether the repository is bare, so the scan's paths cannot be"
+      .. " trusted to mean what the rest of the gate assumes")
+  end
+  $bare = trim($bare_r["stdout"])
+  $gitdir = discovery_path($repo, ["rev-parse", "--absolute-git-dir"],
+    "its absolute gitdir")
+  if $bare == "true" then
+    return {top: $gitdir, gitdir: $gitdir}
+  end
+  if $bare != "false" then
+    bail(2, "top-level discovery failed for " .. $repo .. ": git answered "
+      .. sanitize($bare) .. " to --is-bare-repository, not true or false, so"
+      .. " the scan's paths cannot be trusted to mean what the rest of the gate"
+      .. " assumes")
+  end
+  $top = discovery_path($repo, ["rev-parse", "--show-toplevel"],
+    "its top level")
+  $top_gitdir = discovery_path($top, ["rev-parse", "--absolute-git-dir"],
+    "the top level's absolute gitdir")
+  if $top_gitdir != $gitdir then
+    bail(2, "the configured path " .. $repo .. " and its top level " .. $top
+      .. " resolve to different repositories (" .. $gitdir .. " versus "
+      .. $top_gitdir .. "). Scanning the top level would read objects from a"
+      .. " repository the operator did not name, while scanning the configured"
+      .. " path would make Git's path vocabularies disagree; refusing rather"
+      .. " than report on unread content")
+  end
+  return {top: $top, gitdir: $gitdir}
+end
+
+$repos = []
+$rev = "HEAD"
+$rev_args = []
+$kind = "tree"
+$object = ""
+$rev_input = nil
+
+if $mode == "--all" then
+  $repos = $cfg["repos"]
+else
+  if len($mode_args) < 1 then
+    bail(2, $mode .. " needs a repo path")
+  end
+  $repos = [$mode_args[0]]
+  if $mode == "--tree" then
+    if len($mode_args) > 1 then
+      $rev = $mode_args[1]
+    end
+  else
+    if $mode == "--index" then
+      $kind = "index"
+    else
+      if $mode == "--range" then
+        -- Everything after the repo goes to `git rev-list` untouched, minus
+        -- our own flag. Nothing is inferred: if the caller selects no commits,
+        -- the scan is empty and says so rather than silently widening.
+        for each $a in slice($mode_args, 1)
+          push($rev_args, $a)
+        end
+        if len($rev_args) == 0 then
+          bail(2, "--range needs rev-list arguments, e.g. <base>..<head>")
+        end
+        $kind = "range"
+      else
+        if $mode == "--object" or $mode == "--object-chain" then
+          if len($mode_args) < 2 then
+            bail(2, $mode .. " needs a revision, e.g. " .. $mode
+              .. " <repo> refs/tags/v1")
+          end
+          $object = $mode_args[1]
+          if $mode == "--object-chain" then
+            $kind = "object-chain"
+          else
+            $kind = "object"
+          end
+        else
+          if $mode == "--message" then
+            if len($mode_args) < 2 then
+              bail(2, "--message needs the path to a message file")
+            end
+            $object = $mode_args[1]
+            $kind = "message"
+          else
+            bail(2, "unknown mode: " .. $mode)
+          end
+        end
+      end
+    end
+  end
+end
+
+-- After the mode has been parsed, before any repository object is read:
+-- canonicalise only the modes that will read one. `--message` inspects the
+-- supplied file string and no Git object at all; round twenty-six routed it
+-- through top-level discovery anyway, so a commit-message check could refuse
+-- because an irrelevant repository question failed. Its repo argument remains
+-- for the common CLI shape and hook diagnostics, but it is not consulted here.
+--
+-- Round twenty-seven also corrects the dedupe key. Two configured names
+-- (`repo` and `repo/sub`) collapse only when BOTH their canonical top level and
+-- absolute gitdir match. Comparing the top string alone repeats round
+-- twenty-five's identity mistake and can fold a distinct repository out of the
+-- scan. First occurrence still wins; duplicates of one actual repository are
+-- harmless and wasteful, not a reason to refuse the fleet.
+if $kind != "message" then
+  $identities = []
+  for each $r in $repos
+    $identity = repo_identity($r)
+    $seen = false
+    for each $known in $identities
+      if $known["top"] == $identity["top"] \
+          and $known["gitdir"] == $identity["gitdir"] then
+        $seen = true
+      end
+    end
+    if $seen == false then
+      push($identities, $identity)
+    end
+  end
+  $tops = []
+  for each $identity in $identities
+    push($tops, $identity["top"])
+  end
+  $repos = $tops
+end
+
+$hits = []
+$units = 0
+$all_scope = []
+-- unit key -> the SCANNED TIPS that carry it, across every guarded repository.
+-- Only --all populates it: it is the one mode with a ref scope to attribute to.
+-- Without this, --all's violation count is one undifferentiated number and
+-- every finding reads the same whichever ref put it there.
+--
+-- Note what this deliberately is NOT. It is not reachability: --all scans ref
+-- TIPS, so a commit that is a tag's target and also an ancestor of a branch is
+-- attributed to the tag alone, because the branch's scanned bytes are its tip
+-- tree and do not contain it. And it is not publication: this gate never asks a
+-- remote anything, so it cannot know which of these refs has been pushed. Both
+-- limits are printed with the tally rather than left to be discovered.
+$unit_refs = {}
+
+$repo_no = 0
+
+for each $repo in $repos
+  $repo_no = $repo_no + 1
+  if len($repos) > 1 then
+    $SCAN_CTX = ("this happened while scanning " .. $repo .. " (repo " .. $repo_no
+      .. " of " .. len($repos) .. "); the audit is incomplete")
+    if $repo_no < len($repos) then
+      $SCAN_CTX = ($SCAN_CTX .. " — the remaining " .. (len($repos) - $repo_no)
+        .. " were NOT scanned")
+    end
+  end
+  if $kind == "index" then
+    $units = $units + 1
+    -- Scan a frozen snapshot of the index, never the live index — see
+    -- snapshot_index() and the two-pass note in scan().
+    --
+    -- Freezing alone only closes half the race. It stops a mid-scan edit from
+    -- making the two grep passes disagree, but it says nothing about the index
+    -- git is about to COMMIT: stage clean, let write-tree snapshot that, then
+    -- stage the leak while the scan runs, and every pass reads the stale clean
+    -- tree and the leaking commit lands. Reproduced 2026-07-25, exit 0 followed
+    -- by a successful commit. So bracket the scan: re-freeze afterwards and
+    -- refuse if the two ids differ. Not "re-scan the new one" — the index moved
+    -- under an audit, which is a state nobody should be committing from, and a
+    -- re-scan just re-opens the same window one turn later.
+    --
+    -- What this canNOT close: the gap between this hook exiting and git reading
+    -- the index to build the commit. That belongs to git, no pre-commit hook
+    -- can hold it, and pre-push — which scans the objects actually being
+    -- published — is the backstop that does.
+    $snap = snapshot_index($repo)
+    $hits = concat($hits, scan($repo, $RULES, $TEXT_FLAGS, $LIST_FLAGS,
+      [$snap], $snap .. ":", $repo .. "/"))
+    $snap_after = snapshot_index($repo)
+    if $snap_after != $snap then
+      bail(2, "the index of " .. $repo .. " changed while it was being scanned ("
+        .. $snap .. " -> " .. $snap_after .. ") — the result describes content"
+        .. " that is no longer staged; re-run the check")
+    end
+  end
+  if $kind == "tree" then
+    if $mode == "--all" then
+      -- HEAD stays in the audit even when detached or not named by a local ref.
+      -- Every local head/tag TIP is then added. The seen sets are per-repository:
+      -- one ref aliasing HEAD is not another content unit, while the same bytes
+      -- in a second configured repository are still a second guarded subject.
+      $seen_trees = []
+      $seen_bodies = []
+      $head_obj = resolve_object($repo, "HEAD")
+      $refs = local_refs($repo)
+      -- Through scan_object_chain, not scan_tip_tree. Round forty's re-review:
+      -- the commit-body scan had been added to the chain walk, but --all sent
+      -- HEAD and every branch tip STRAIGHT to the tree, so only commits reached
+      -- through an annotated tag had their message audited. A repository with
+      -- no tags, a clean main tree and a leak in the main tip's commit message
+      -- printed "clean" — the same false clean the body scan was added to kill,
+      -- surviving on the path almost every repository actually uses. The chain
+      -- walk classifies the object itself, so the kind argument goes away with
+      -- it rather than being carried and ignored.
+      $head_scan = scan_object_chain($repo, $RULES, $TEXT_FLAGS, $LIST_FLAGS,
+        $head_obj, $seen_trees, $seen_bodies, $repo .. "/")
+      $seen_trees = $head_scan["seen_trees"]
+      $seen_bodies = $head_scan["seen_bodies"]
+      $units = $units + $head_scan["units"]
+      $hits = concat($hits, $head_scan["hits"])
+      $unit_refs = note_refs($unit_refs, $repo, $head_scan["reached"], "HEAD")
+
+      $heads = 0
+      $tags = 0
+      for each $ref in $refs
+        if starts_with($ref["name"], "refs/heads/") then
+          $heads = $heads + 1
+          $tip = scan_object_chain($repo, $RULES, $TEXT_FLAGS, $LIST_FLAGS,
+            $ref["object"], $seen_trees, $seen_bodies, $repo .. "/")
+          $seen_trees = $tip["seen_trees"]
+          $seen_bodies = $tip["seen_bodies"]
+          $units = $units + $tip["units"]
+          $hits = concat($hits, $tip["hits"])
+          $unit_refs = note_refs($unit_refs, $repo, $tip["reached"],
+            $ref["name"])
+        else
+          $tags = $tags + 1
+          $walk = scan_object_chain($repo, $RULES, $TEXT_FLAGS, $LIST_FLAGS,
+            $ref["object"], $seen_trees, $seen_bodies, $repo .. "/")
+          $seen_trees = $walk["seen_trees"]
+          $seen_bodies = $walk["seen_bodies"]
+          $units = $units + $walk["units"]
+          $hits = concat($hits, $walk["hits"])
+          $unit_refs = note_refs($unit_refs, $repo, $walk["reached"],
+            $ref["name"])
+        end
+      end
+      $head_after = resolve_object($repo, "HEAD")
+      $refs_after = local_refs($repo)
+      if $head_after != $head_obj or same_refs($refs, $refs_after) == false then
+        bail(2, "HEAD or the local refs/heads and refs/tags set in " .. $repo
+          .. " changed while its tips were being scanned — the result describes"
+          .. " a ref scope that is no longer current; re-run the audit")
+      end
+      push($all_scope, {
+        repo: $repo, refs: len($refs), heads: $heads, tags: $tags,
+        trees: len($seen_trees), bodies: len($seen_bodies)
+      })
+    else
+      $units = $units + 1
+      $rev_id = resolve_object($repo, $rev)
+      $hits = concat($hits, scan($repo, $RULES, $TEXT_FLAGS, $LIST_FLAGS,
+        [$rev_id], $rev_id .. ":", $repo .. "/"))
+    end
+  end
+  if $kind == "range" then
+    if contains($rev_args, "--stdin") then
+      -- Same boundary as the hook's ref list, and the same reasoning: bytes
+      -- that will not decode are an infrastructure refusal (2), never the
+      -- uncaught raise's exit 1, which means "found a violation" here.
+      try
+        $rev_input = read_stdin()
+      catch $e
+        bail(2, "cannot read the revision list from stdin (" .. $e .. ")"
+          .. " — refusing to scan a truncated range")
+      end
+    end
+    $commits = nonempty_lines(git_input(
+      $repo, concat(["rev-list"], $rev_args), $rev_input))
+    print("scanning " .. len($commits) .. " commit(s) in " .. join($rev_args, " ") .. " …")
+    for each $c in $commits
+      $units = $units + 1
+      $hits = concat($hits, scan($repo, $RULES, $TEXT_FLAGS, $LIST_FLAGS, [$c], $c .. ":", slice($c, 0, 8) .. " "))
+      -- The MESSAGE too. `git grep` searches trees, so a commit message is
+      -- invisible to every tree scan — and it is published verbatim. This is
+      -- the same hole as the annotated-tag body, one object type over.
+      $hits = concat($hits, scan_object($repo, $RULES, $c, "commit"))
+    end
+  end
+  if $kind == "object" then
+    $units = $units + 1
+    -- "" — this mode is handed an arbitrary object and has not classified it,
+    -- so scan_object asks git rather than being told a kind that may be wrong.
+    $hits = concat($hits, scan_object($repo, $RULES,
+      resolve_object($repo, $object), ""))
+  end
+  if $kind == "object-chain" then
+    -- Only the ROOT of the chain can be a mutable name; every step after it is
+    -- an id read out of the previous object's bytes. Pinning the root pins the
+    -- whole walk.
+    $chain_trees = []
+    $chain_bodies = []
+    $walk = scan_object_chain($repo, $RULES, $TEXT_FLAGS, $LIST_FLAGS,
+      resolve_object($repo, $object), $chain_trees, $chain_bodies, $repo .. "/")
+    $units = $units + $walk["units"]
+    $hits = concat($hits, $walk["hits"])
+  end
+  if $kind == "message" then
+    $units = $units + 1
+    if exists($object) == false then
+      bail(2, "no such message file: " .. $object)
+    end
+    -- A PENDING message is not an object yet, so there is nothing immutable to
+    -- pin a pardon to — the same path holds a different message every commit.
+    -- Unpardonable, and no loss: the fix for a commit message is to edit it,
+    -- which is exactly what this hook still lets you do.
+    -- read_file RAISES on bytes that are not UTF-8, and an uncaught Mix error
+    -- exits 1 — the code this tool reserves for "found a violation". A commit
+    -- message the gate could not read would have blocked the commit with a
+    -- traceback and the wrong verdict. It is still a refusal; it just has to be
+    -- an honest one.
+    $msg_text = ""
+    try
+      $msg_text = read_file($object)
+    catch $e
+      bail(2, "cannot read message file " .. $object .. ": " .. $e)
+    end
+    -- Unit "" for the same reason it is unpardonable: a pending message is not
+    -- an object, so there is nothing immutable to attribute it to either.
+    $hits = concat($hits, scan_text($RULES, $msg_text, "<pending-commit-message>",
+      "commit message", false, ""))
+  end
+end
+
+-- Every repo was reached; anything that fails from here is about the run as a
+-- whole, not about one repo left half-scanned.
+$SCAN_CTX = ""
+
+-- A scan that examined nothing is not a clean scan. `repos: []`, a config that
+-- parsed to an empty list, a mode that fell through — all used to print
+-- "clean". An empty --range is the one legitimate zero: pushing no new commits
+-- publishes nothing.
+if $kind != "range" and $units == 0 then
+  bail(2, "scanned 0 revision-units — refusing to report clean")
+end
+
+-- ── allowlist reconciliation ────────────────────────────────────────────
+
+$allow = load_conf($ALLOW, "public_hygiene_allow")
+validate_conf_value($allow, {
+  schema_version: {type: "integer", min: 1, max: 1},
+  exceptions: {type: "list", items: {type: "map", schema: {
+    fingerprint: {type: "string", nonblank: true},
+    reason: {type: "string", nonblank: true}
+  }}},
+  binary_exceptions: {required: false, type: "list",
+    items: {type: "map", schema: {
+      sha256: {type: "string"},
+      reason: {type: "string", nonblank: true}
+  }}}
+}, $ALLOW, "allowlist")
+
+$by_fp = {}
+$dupes = []
+for each $e in $allow["exceptions"]
+  $fp = "" .. $e["fingerprint"]
+  if $by_fp[$fp] != nil then
+    push($dupes, $fp)
+  end
+  $by_fp[$fp] = {reason: $e["reason"], used: 0}
+end
+
+-- Binary pardons are a separate namespace by construction. A text
+-- fingerprint placed here cannot pardon text, and a binary content digest in
+-- `exceptions` cannot pardon binary. Validate the digest loudly before any
+-- matching: a malformed value that merely misses looks like an ignored pardon
+-- and pressures an operator to widen the gate instead of fixing the config.
+$by_binary_fp = {}
+$binary_dupes = []
+$binary_exceptions = get_or($allow, "binary_exceptions", [])
+for each $e in $binary_exceptions
+  $sha = "" .. $e["sha256"]
+  if regex_match("^[0-9a-f]{64}$", $sha) == false then
+    bail(2, $ALLOW .. " has invalid binary_exceptions sha256 `"
+      .. sanitize($sha) .. "` — expected exactly 64 lowercase hex characters")
+  end
+  if $by_binary_fp[$sha] != nil then
+    push($binary_dupes, $sha)
+  end
+  $by_binary_fp[$sha] = {reason: $e["reason"], used: 0}
+end
+
+-- fingerprint = rule + repo-relative path + LINE NUMBER + exact line text,
+-- each field LENGTH-PREFIXED so the encoding is injective.
+--
+-- A plain separator is not enough, whatever byte it is. Joining on U+001F
+-- collided `path "a<US>1", line 2, text T` with `path "a", line 1, text
+-- "2<US>T"` — both hash the same bytes, so ONE allowlist entry pardoned two
+-- unrelated violations and the gate exited clean. A path may contain any byte
+-- but NUL and `/`, and line text may contain any control character, so no
+-- separator is safe; length prefixes make the parse unambiguous by
+-- construction. (An earlier round found the identical bug with `:`.)
+--
+-- The line number is load-bearing: without it, one exception pardoned every
+-- byte-identical line in the file, so pardoning a known-safe line silently
+-- pardoned an unknown future copy of it — the "glob by accident" failure the
+-- allowlist design exists to prevent. It also makes the pardon brittle (an
+-- edit above the line invalidates it), which is the intended trade: an
+-- exception is a statement about one line of one file, and it should have to
+-- be re-made when that stops being true.
+--
+-- Nothing repo-identifying is hashed. A byte-identical line at the same path
+-- and line number in another guarded repo is the same content and the same
+-- judgement, so it gets the same pardon — deliberate, not an oversight.
+--
+-- BINARY hits use a different, deliberately narrower identity: sha256 of the
+-- COMPLETE blob git scanned. The raw bytes are extracted and hashed by
+-- binary_blob_sha256(); no path or working-file content participates, and any
+-- byte change therefore re-arms the gate. Content-only also means identical
+-- bytes at another path/repo share the judgement, matching the text scheme's
+-- deliberate omission of repo identity.
+$unpardoned = []
+$binary_hash_calls = 0
+for each $h in $hits
+  if $h["binary"] then
+    $binary_hash_calls = $binary_hash_calls + 1
+    $fp = binary_blob_sha256($h["repo"], $h["object"], $h["rel"],
+      $binary_hash_calls)
+    $h["fingerprint"] = $fp
+    $h["content_sha256"] = $fp
+    if $by_binary_fp[$fp] == nil then
+      push($unpardoned, $h)
+    else
+      $by_binary_fp[$fp]["used"] = $by_binary_fp[$fp]["used"] + 1
+    end
+  else
+    if $h["pardonable"] == false then
+      $h["fingerprint"] = "(cannot be pardoned; inspect and remove)"
+      push($unpardoned, $h)
+    else
+      $fp = hash_sha256(fp_field($h["rule"]) .. fp_field($h["rel"])
+        .. fp_field("" .. $h["line_no"]) .. fp_field($h["line"]))
+      $h["fingerprint"] = $fp
+      if $by_fp[$fp] == nil then
+        push($unpardoned, $h)
+      else
+        $by_fp[$fp]["used"] = $by_fp[$fp]["used"] + 1
+      end
+    end
+  end
+end
+
+-- Stale exceptions are only meaningful in --all, the one mode that scans every
+-- guarded repo. A scoped scan (one repo's index, one push range) legitimately
+-- sees none of the other repos' exceptions, so reconciling the whole allowlist
+-- against it reported them all stale and FAILED — every unrelated commit and
+-- push would have been blocked the moment the allowlist stopped being empty.
+$stale = []
+if $mode == "--all" then
+  for each $fp in keys($by_fp)
+    if $by_fp[$fp]["used"] == 0 then
+      push($stale, {list: "exceptions", fingerprint: $fp,
+        reason: $by_fp[$fp]["reason"]})
+    end
+  end
+  for each $fp in keys($by_binary_fp)
+    if $by_binary_fp[$fp]["used"] == 0 then
+      push($stale, {list: "binary_exceptions", fingerprint: $fp,
+        reason: $by_binary_fp[$fp]["reason"]})
+    end
+  end
+end
+
+-- ── report ──────────────────────────────────────────────────────────────
+
+print("scanned " .. $units .. " unique revision-unit(s) across " .. len($repos)
+  .. " repo(s), " .. len($RULES) .. " rules")
+if $mode == "--all" then
+  for each $scope in $all_scope
+    print("  " .. $scope["repo"] .. ": HEAD + " .. $scope["refs"]
+      .. " local ref tip(s) (" .. $scope["heads"] .. " head(s), "
+      .. $scope["tags"] .. " tag(s)); " .. $scope["trees"]
+      .. " unique tip tree(s), " .. $scope["bodies"]
+      .. " unique object body unit(s)")
+  end
+  -- Scope is explicit because "all" previously invited a history-wide reading
+  -- it never implemented. This is every LOCAL head/tag TIP plus HEAD and the
+  -- annotated-tag chain needed to reach each target — not unreachable objects
+  -- and not every commit behind those tips.
+  print("  (coverage: HEAD plus local refs/heads and refs/tags TIPS;"
+    .. " annotated-tag chains and target commit trees included;"
+    .. " unreachable history and non-tip commits NOT scanned)")
+end
+
+$fail = false
+
+if len($unpardoned) > 0 then
+  $fail = true
+  print("")
+  print("VIOLATIONS (" .. len($unpardoned) .. "):")
+  for each $h in $unpardoned
+    -- Deliberately does NOT echo the offending line: gate output lands in CI
+    -- logs and terminal scrollback, which is exactly where a leak goes next.
+    print("  [" .. $h["rule"] .. "] " .. $h["disp"] .. ":" .. $h["line_no"] .. "  — " .. $h["note"])
+    -- Which scanned tips carry this — not which refs publish it (see the
+    -- BY REF caveat below) and not whether any of them is pushed, which this
+    -- gate never asks. Absent outside --all (no ref scope) and
+    -- absent for the pending-message mode (not an object yet), so the line is
+    -- printed only when there is an answer rather than as an empty "via ".
+    $via = $unit_refs[$h["unit"]]
+    if $via != nil then
+      print("      via tip(s): " .. join($via, ", "))
+    end
+    if $print_fp then
+      print("      fingerprint: " .. $h["fingerprint"])
+      if $h["binary"] then
+        print("      sha256 of full contents (verify: sha256sum "
+          .. $h["repo"] .. "/" .. $h["rel"] .. ")")
+      end
+    end
+  end
+  -- The per-ref tally. The count above answers "how bad"; this answers "where",
+  -- which is what an operator has to know before they can act differently on
+  -- one finding than another.
+  --
+  -- Two caveats are printed with it, because both are ways a reader would
+  -- otherwise draw a conclusion the gate has not earned. A unit several tips
+  -- carry is counted under each, so the rows do not sum to the total. And the
+  -- attribution is TIP-scoped, exactly like the scan: an object also published
+  -- as history behind some other tip is neither scanned nor listed, so deleting
+  -- every ref named here is not the same as unpublishing the object. Round 41
+  -- reproduced that: tag v1 on a leaking commit, one clean commit on top on
+  -- main, and the finding reads `via tip(s): refs/tags/v1` while main publishes
+  -- the same commit as an ancestor.
+  if $mode == "--all" and len($unit_refs) > 0 then
+    $ref_counts = {}
+    $ref_order = []
+    for each $h in $unpardoned
+      $rs = $unit_refs[$h["unit"]]
+      if $rs == nil then
+        -- Unreachable by construction: under --all every hit is stamped with a
+        -- unit that one of the walks recorded reaching. Reaching here means the
+        -- stamp and the walk have drifted apart, which is a broken gate and not
+        -- a coverage case — so refuse rather than invent a bucket that reads
+        -- like a finding about the repository.
+        bail(2, "internal: violation in " .. $h["disp"] .. " carries a scan unit"
+          .. " no ref walk recorded reaching — refusing rather than attributing"
+          .. " it to a ref this gate cannot name")
+      end
+      for each $r in $rs
+        if $ref_counts[$r] == nil then
+          $ref_counts[$r] = 0
+          push($ref_order, $r)
+        end
+        $ref_counts[$r] = $ref_counts[$r] + 1
+      end
+    end
+    print("")
+    print("BY REF — which SCANNED TIP carries each violation ("
+      .. len($unpardoned) .. " total):")
+    for each $r in $ref_order
+      print("  " .. $r .. ": " .. $ref_counts[$r])
+    end
+    print("  (a unit several tips carry is counted under each, so these need"
+      .. " not sum to " .. len($unpardoned) .. ". Tip-scoped like the scan: an"
+      .. " object also published as history BEHIND another tip is neither"
+      .. " scanned nor listed here, so this says where the gate found it, not"
+      .. " the complete set of refs that publish it. And it says nothing about"
+      .. " whether any of these refs has been pushed — no remote is consulted.)")
+  end
+  $g = $cfg["guidance"]
+  print("")
+  print("  replace with: ipv4   -> " .. $g["ipv4"])
+  print("                domain -> " .. $g["domain"])
+  print("                node   -> " .. $g["node"])
+  print("                home   -> " .. $g["home"])
+end
+
+-- A pardon must not be silent. Until 2026-07-27 the allowlist was empty, so a
+-- pardoned hit was a hypothetical; the first entries are 19 real node names
+-- frozen in two published .mix tags, waived because rewriting published history
+-- was declined and not because they are false positives. Waiving them without
+-- saying so would turn a decision into an omission — the operator would read a
+-- smaller number and have no way to learn what it stopped counting. So the run
+-- prints what it waived, with the reason, and does NOT set $fail: a pardon is a
+-- recorded judgement, not a finding.
+$pardoned_n = 0
+$pardoned_fps = []
+for each $fp in keys($by_fp)
+  if $by_fp[$fp]["used"] > 0 then
+    $pardoned_n = $pardoned_n + $by_fp[$fp]["used"]
+    push($pardoned_fps, {list: "exceptions", fingerprint: $fp,
+      used: $by_fp[$fp]["used"], reason: $by_fp[$fp]["reason"]})
+  end
+end
+for each $fp in keys($by_binary_fp)
+  if $by_binary_fp[$fp]["used"] > 0 then
+    $pardoned_n = $pardoned_n + $by_binary_fp[$fp]["used"]
+    push($pardoned_fps, {list: "binary_exceptions", fingerprint: $fp,
+      used: $by_binary_fp[$fp]["used"], reason: $by_binary_fp[$fp]["reason"]})
+  end
+end
+if $pardoned_n > 0 then
+  print("")
+  print("PARDONED (" .. $pardoned_n .. " violation(s) by " .. len($pardoned_fps)
+    .. " standing exception(s)) — found, matched an allowlist entry, and NOT"
+    .. " counted above:")
+  for each $p in $pardoned_fps
+    print("  " .. $p["used"] .. "x  [" .. $p["list"] .. "] " .. $p["reason"])
+  end
+end
+
+if len($dupes) > 0 then
+  $fail = true
+  print("")
+  print("DUPLICATE allowlist fingerprints (" .. len($dupes) .. ") — each pardons exactly one violation:")
+  for each $d in $dupes
+    print("  " .. $d)
+  end
+end
+
+if len($binary_dupes) > 0 then
+  $fail = true
+  print("")
+  print("DUPLICATE binary allowlist sha256 values (" .. len($binary_dupes)
+    .. ") — each pardons exactly one binary content value:")
+  for each $d in $binary_dupes
+    print("  " .. $d)
+  end
+end
+
+if len($stale) > 0 then
+  $fail = true
+  print("")
+  print("STALE allowlist entries (" .. len($stale) .. ") — matched nothing in a full --all scan; delete them:")
+  for each $s in $stale
+    print("  [" .. $s["list"] .. "] " .. $s["fingerprint"]
+      .. "  (" .. $s["reason"] .. ")")
+  end
+end
+
+-- The only two exits that are verdicts, and the only two that are marked. See
+-- $COMPLETE above: the marker is what lets a caller tell either of these from a
+-- Mix runtime error, which also exits 1.
+if $fail then
+  print($COMPLETE .. " 1")
+  exit(1)
+end
+
+print("clean — no mesh-private identity found")
+print($COMPLETE .. " 0")
+exit(0)

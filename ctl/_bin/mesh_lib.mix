@@ -1,0 +1,2946 @@
+-- mesh_lib.mix — shared helpers for the SPEC 13 plane-C mesh tooling
+-- (mesh_gen.mix, mesh_reconcile.mix). Pure functions + a loud inventory
+-- validator. Tools load it either with `include` (shared caller scope) or
+-- `require` (isolated module exports); it is NOT standalone-runnable. Loading
+-- it only defines functions + constants — no I/O.
+
+-- How a mesh_lib refusal leaves the process. Default 1: mesh_lib's own callers
+-- are generators and distributors, where "1" means "this run did not happen".
+--
+-- It is a variable because one caller needs a DIFFERENT code for the same
+-- refusal. check-public-hygiene.mix owns an exit-code contract in which 1 means
+-- "scanned, found violations" and 2 means "could not answer" — so a mesh_lib
+-- exit(1) reaching it would dress an unbuildable rule set as a clean-tree
+-- verdict, the exact inversion that gate exists to prevent. That mismatch is
+-- why the gate previously carried its OWN floor implementation, and every one
+-- of round 14's gate findings was a divergence between the two copies. One
+-- implementation, one knob: an include-style loader may set $MESH_FATAL_EXIT
+-- before loading. A `require` loader cannot preset it because module scope is
+-- isolated, so required instances use the default. Default-if-unset, so an
+-- include caller must set it BEFORE the include; setting it afterwards leaves
+-- a window where a load-time refusal would take the default. Nothing refuses
+-- at load time today, but load order should not be the reason that is true.
+--
+-- try/catch, not `== nil`: reading a never-assigned global RAISES in Mix
+-- ("undefined variable"), it does not evaluate to nil — so the obvious
+-- conditional makes every consumer that does NOT set the knob die on the
+-- include. Caught here, in the one place that can be sure what the failure
+-- means.
+$mfe_preset = nil
+try
+  $mfe_preset = $MESH_FATAL_EXIT
+catch $mfe_unset
+  $mfe_preset = nil
+end
+if $mfe_preset == nil then
+  $MESH_FATAL_EXIT = 1
+end
+function mesh_fatal()
+  exit($MESH_FATAL_EXIT)
+end
+
+$LABEL_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789-"
+$DIGITS = "0123456789"
+
+-- §6.1/§9b node label grammar: ^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$ —
+-- validated AS a label (codepoint count, closed ASCII set), not by byte
+-- length or display width (§9b).
+function is_valid_label($name)
+  $n = length($name)
+  if $n < 1 or $n > 63 then
+    return false
+  end
+  $i = 0
+  while $i < $n
+    if pos(substr($name, $i, 1), $LABEL_CHARS) == 0 then
+      return false
+    end
+    $i = $i + 1
+  end
+  if substr($name, 0, 1) == "-" then
+    return false
+  end
+  if substr($name, $n - 1, 1) == "-" then
+    return false
+  end
+  return true
+end
+
+-- A dotted-quad IPv4 with each octet 0..255.
+function is_valid_ipv4($ip)
+  $parts = split($ip, ".")
+  if length($parts) != 4 then
+    return false
+  end
+  for each $p in $parts
+    if length($p) < 1 or length($p) > 3 then
+      return false
+    end
+    $i = 0
+    while $i < length($p)
+      if pos(substr($p, $i, 1), $DIGITS) == 0 then
+        return false
+      end
+      $i = $i + 1
+    end
+    if to_number($p) < 0 or to_number($p) > 255 then
+      return false
+    end
+  end
+  return true
+end
+
+-- Signed broker endpoint field (§6.1): JSON/Mix number, exact integer, and a
+-- usable TCP port. Presence is interpreted only for active Bus members; the
+-- shared Rust routing view likewise ignores route fields on route-free
+-- TransportOnly and Tombstoned records.
+function is_valid_noded_port($port)
+  if type($port) != "number" then
+    return false
+  end
+  return trunc($port) == $port and $port >= 1 and $port <= 65535
+end
+
+-- True only when the signed endpoint interpreter will consume a member-level
+-- noded_port. Route-free records deliberately do not trigger rollout gates.
+function inventory_carries_noded_port($mesh)
+  for each $m in $mesh["members"]
+    if $m["bus"] == true and $m["status"] == "active" and has_key($m, "noded_port") then
+      return true
+    end
+  end
+  return false
+end
+
+function is_decimal_text($value)
+  if type($value) != "string" or length($value) == 0 then
+    return false
+  end
+  $i = 0
+  while $i < length($value)
+    if pos(substr($value, $i, 1), $DIGITS) == 0 then
+      return false
+    end
+    $i = $i + 1
+  end
+  return true
+end
+
+-- Stable release comparison for the installed noded package version.
+-- Pre-release or otherwise decorated versions refuse: endpoint routing needs
+-- the released 0.12.0 semantics, not a string that merely starts with them.
+function noded_supports_signed_endpoint($version)
+  if type($version) != "string" then
+    return false
+  end
+  $parts = split($version, ".")
+  if length($parts) != 3 then
+    return false
+  end
+  for each $part in $parts
+    if not is_decimal_text($part) then
+      return false
+    end
+  end
+  $major = to_number($parts[0])
+  $minor = to_number($parts[1])
+  $patch = to_number($parts[2])
+  return $major > 0 or $minor > 12 or ($minor == 12 and $patch >= 0)
+end
+
+function endpoint_probe_failure($node, $what, $result)
+  if $result["timed_out"] == true then
+    return "node " .. $node .. " " .. $what .. " failed: probe timed out"
+  end
+  $why = trim($result["stderr"])
+  if is_empty($why) then
+    $why = $result["error_code"]
+  end
+  if $why == nil or is_empty("" .. $why) then
+    $why = "exit " .. ("" .. $result["exit_code"])
+  end
+  return "node " .. $node .. " " .. $what .. " failed: " .. ("" .. $why)
+end
+
+-- Query the binary that the distributor's subsequent restart will execute.
+-- SSH is uniform, join-safe, and avoids a running-vs-staged daemon race.
+function installed_noded_version($node)
+  $result = ssh_exec($node, ["/opt/cosmix/bin/cosmix-noded", "--version"], {timeout: 20})
+  if $result["exit_code"] != 0 then
+    return {ok: false, detail: endpoint_probe_failure($node, "installed noded version probe", $result)}
+  end
+  $output = trim($result["stdout"])
+  $binary = word($output, 1)
+  $version = word($output, 2)
+  if $binary != "cosmix-noded" or $version == nil or is_empty($version) then
+    return {ok: false, detail: "node " .. $node .. " returned unparseable cosmix-noded --version output"}
+  end
+  return {ok: true, version: $version}
+end
+
+function installed_noded_listens_on($node, $mesh_ip, $port)
+  $result = ssh_exec($node, ["ss", "-ltnpH"], {timeout: 20})
+  if $result["exit_code"] != 0 then
+    return {ok: false, detail: endpoint_probe_failure($node, "listener probe", $result)}
+  end
+  $port_text = "" .. $port
+  $mesh_endpoint = $mesh_ip .. ":" .. $port_text
+  -- IPv4 wildcard always serves the mesh IP; v6/star wildcards are excluded
+  -- because an IPV6_V6ONLY socket matches them while IPv4 peers cannot reach it
+  -- (and a config-derived noded bind always renders exactly <mesh_ip>:<port>).
+  $wildcard_v4 = "0.0.0.0:" .. $port_text
+  -- Exact ss process token: quote-and-comma delimited so a similarly named
+  -- process ("cosmix-noded-helper") cannot certify the endpoint.
+  $noded_token = "(\"cosmix-noded\","
+  for each $line in split($result["stdout"], "\n")
+    $local_address = word($line, 4)
+    $address_matches = $local_address == $mesh_endpoint
+    if $local_address == $wildcard_v4 then $address_matches = true end
+    if $address_matches and contains($line, $noded_token) then
+      return {ok: true}
+    end
+  end
+  return {ok: false, detail: "node " .. $node .. " has no cosmix-noded listener on " ..
+    $mesh_endpoint .. " (or an IPv4 wildcard bind)"}
+end
+
+-- Read-only binary/listener readiness checks for endpoint-bearing inventory.
+-- Return every finding so dry-run callers can print the complete rehearsal;
+-- real distributors decide whether and how to refuse.
+function signed_endpoint_preflight($mesh)
+  $offenders = []
+  if not inventory_carries_noded_port($mesh) then
+    return $offenders
+  end
+  for each $member in $mesh["members"]
+    if $member["bus"] == true and $member["status"] == "active" then
+      $node = $member["name"]
+      $version_probe = installed_noded_version($node)
+      if not $version_probe["ok"] then
+        push($offenders, $version_probe["detail"])
+      else
+        if not noded_supports_signed_endpoint($version_probe["version"]) then
+          push($offenders, "node " .. $node .. " has installed noded " .. $version_probe["version"] .. "; need >= 0.12.0")
+        end
+      end
+      if has_key($member, "noded_port") then
+        $listener_probe = installed_noded_listens_on($node, $member["mesh_ip"], $member["noded_port"])
+        if not $listener_probe["ok"] then
+          push($offenders, $listener_probe["detail"])
+        end
+      end
+    end
+  end
+  return $offenders
+end
+
+-- First 3 octets of a dotted IPv4 (its /24 prefix), e.g. "172.16.2".
+function prefix24($ip)
+  $p = split($ip, ".")
+  return $p[0] .. "." .. $p[1] .. "." .. $p[2]
+end
+
+-- Zero-pad a numeric string to width 3 (octet sort-key component).
+function pad3($s)
+  $out = "" .. $s
+  while length($out) < 3
+    $out = "0" .. $out
+  end
+  return $out
+end
+
+-- Full-IP lexical sort key (all four octets zero-padded) so a string sort is
+-- numerically correct even across /24s — never keys on the last octet alone.
+function ip_key($ip)
+  $parts = split($ip, ".")
+  $out = ""
+  for each $p in $parts
+    $out = $out .. pad3($p) .. "."
+  end
+  return $out
+end
+
+-- Fail-CLOSED signed check (§7.7): an inventory is trusted ONLY when it is
+-- explicitly unsigned:false AND carries signatures. A merely-absent marker
+-- (the transition-drift case §7.7 calls out) is treated as UNSIGNED.
+function inventory_is_signed($inv)
+  return ($inv["unsigned"] == false) and ($inv["signatures"] != nil)
+end
+
+-- Membership test by string value (List == List is always false in Mix).
+function contains_str($list, $val)
+  for each $x in $list
+    if $x == $val then
+      return true
+    end
+  end
+  return false
+end
+
+-- The declared mesh_ip for a member name — the single source of truth for a
+-- node's WG IP (deploy scripts read this instead of a hardcoded table, so a
+-- renumber needs only the inventory edit). Dies on an unknown name.
+function mesh_ip_of($inv, $name)
+  for each $m in $inv["members"]
+    if $m["name"] == $name then
+      return $m["mesh_ip"]
+    end
+  end
+  print("  ERROR: mesh_ip_of: '" .. ("" .. $name) .. "' is not a declared inventory member")
+  mesh_fatal()
+end
+
+-- ALL kind:"wg" pubkeys current at mesh epoch $epoch (§6.1 epoch windows:
+-- current iff from_epoch <= epoch < until_epoch, until_epoch nil = open).
+-- Returns a LIST because a rotation overlap (§6.1) makes two creds current
+-- at once — the caller accepts the live key if it matches ANY of them.
+function wg_current_pubkeys($m, $epoch)
+  $out = []
+  for each $c in $m["credentials"]
+    if $c["kind"] == "wg" then
+      if $c["from_epoch"] <= $epoch and ($c["until_epoch"] == nil or $epoch < $c["until_epoch"]) then
+        push($out, $c["pubkey"])
+      end
+    end
+  end
+  return $out
+end
+
+-- Validate the whole inventory; print a clear error + mesh_fatal() on the FIRST
+-- problem. Checks (§6.1/§9b): the subnet is a /24; per member — label grammar,
+-- IPv4 shape, mesh_ip in subnet, `bus` is a real bool, `status` is the
+-- active|tombstoned enum (a typo'd status silently diverges mesh_gen, which
+-- requires exact "active", from mesh_reconcile's tombstoned/else branch),
+-- credentials[] shape (kind ∈ wg|d2, non-empty pubkey), and uniqueness of
+-- both name and mesh_ip (names MUST be unique per mesh, §6.1; a duplicate
+-- would silently overwrite a map entry downstream).
+-- ASSUMES one /24 per inventory (INV-1: one subnet per signed inventory) —
+-- asserted, so the /24-prefix containment check below is exact, not a
+-- silent approximation for a narrower CIDR.
+function validate_inventory($inv)
+  -- SHAPE BEFORE FIELDS, on the container and on every member. Everything
+  -- below indexes $inv and $m; a payload whose `members` holds a scalar (or
+  -- whose root is not a map) makes Mix raise from inside the indexing itself.
+  -- A raise is not a refusal: it leaves the interpreter, so it exits 1 and
+  -- ignores $MESH_FATAL_EXIT entirely — which in check-public-hygiene.mix
+  -- means a malformed signed payload reports as "scanned, found violations"
+  -- rather than "could not answer". The validator must REFUSE, not raise.
+  if type($inv) != "map" then
+    print("ERROR: inventory is not a map (got " .. type($inv) .. ")")
+    mesh_fatal()
+  end
+  if type($inv["members"]) != "list" then
+    print("ERROR: inventory members must be a list (got " .. type($inv["members"]) .. ")")
+    mesh_fatal()
+  end
+  for each $mm in $inv["members"]
+    if type($mm) != "map" then
+      print("ERROR: inventory member is not a map (got " .. type($mm) .. ")")
+      mesh_fatal()
+    end
+  end
+  $sub = split($inv["subnet"], "/")
+  if length($sub) != 2 or $sub[1] != "24" then
+    print("ERROR: subnet must be a /24 (Phase 1a / INV-1 one-subnet assumption): '" .. ("" .. $inv["subnet"]) .. "'")
+    mesh_fatal()
+  end
+  if not is_valid_ipv4($sub[0]) then
+    print("ERROR: subnet network address is not a valid IPv4: '" .. ("" .. $sub[0]) .. "'")
+    mesh_fatal()
+  end
+  $net = prefix24($sub[0])
+  if type($inv["epoch"]) != "number" then
+    print("ERROR: inventory epoch must be a number (got " .. type($inv["epoch"]) .. ")")
+    mesh_fatal()
+  end
+  $seen_name = {}
+  $seen_ip = {}
+  $member_by_name = {}
+  for each $m in $inv["members"]
+    $name = $m["name"]
+    $ip = $m["mesh_ip"]
+    if not is_valid_label($name) then
+      print("ERROR: invalid node name (must match §6.1/§9b label grammar): '" .. ("" .. $name) .. "'")
+      mesh_fatal()
+    end
+    if not is_valid_ipv4($ip) then
+      print("ERROR: invalid mesh_ip for '" .. $name .. "': '" .. ("" .. $ip) .. "'")
+      mesh_fatal()
+    end
+    if prefix24($ip) != $net then
+      print("ERROR: mesh_ip out of subnet " .. $inv["subnet"] .. " for '" .. $name .. "': " .. $ip)
+      mesh_fatal()
+    end
+    if $m["bus"] != true and $m["bus"] != false then
+      print("ERROR: member '" .. $name .. "' has non-boolean bus (must be true or false)")
+      mesh_fatal()
+    end
+    if $m["status"] != "active" and $m["status"] != "tombstoned" then
+      print("ERROR: member '" .. $name .. "' has invalid status '" .. ("" .. $m["status"]) .. "' (must be active|tombstoned)")
+      mesh_fatal()
+    end
+    if $m["bus"] == true and $m["status"] == "active" and has_key($m, "noded_port") then
+      if not is_valid_noded_port($m["noded_port"]) then
+        print("ERROR: active bus member '" .. $name .. "' has invalid noded_port (must be an integer in 1..=65535)")
+        mesh_fatal()
+      end
+    end
+    $creds = $m["credentials"]
+    if $creds == nil then
+      print("ERROR: member '" .. $name .. "' has no credentials[]")
+      mesh_fatal()
+    end
+    for each $c in $creds
+      if $c["kind"] != "wg" and $c["kind"] != "d2" then
+        print("ERROR: member '" .. $name .. "' has a credential of unknown kind '" .. ("" .. $c["kind"]) .. "' (must be wg|d2)")
+        mesh_fatal()
+      end
+      if $c["pubkey"] == nil or $c["pubkey"] == "" then
+        print("ERROR: member '" .. $name .. "' has a " .. $c["kind"] .. " credential with an empty pubkey")
+        mesh_fatal()
+      end
+      -- epoch window must be usable: wg_current_pubkeys does <= / < on these,
+      -- so a non-numeric/missing from_epoch would crash there, not here.
+      if type($c["from_epoch"]) != "number" then
+        print("ERROR: member '" .. $name .. "' has a " .. $c["kind"] .. " credential with non-numeric from_epoch")
+        mesh_fatal()
+      end
+      if $c["until_epoch"] != nil and type($c["until_epoch"]) != "number" then
+        print("ERROR: member '" .. $name .. "' has a " .. $c["kind"] .. " credential with non-numeric until_epoch (must be a number or nil)")
+        mesh_fatal()
+      end
+      if $c["until_epoch"] != nil and $c["until_epoch"] <= $c["from_epoch"] then
+        print("ERROR: member '" .. $name .. "' has a " .. $c["kind"] .. " credential with an inverted/empty epoch window (until_epoch <= from_epoch)")
+        mesh_fatal()
+      end
+    end
+    -- an active bus member MUST have a kind:wg credential current at the mesh
+    -- epoch — else generation/routing would treat it as a member with no
+    -- usable key (§6.1 epoch windows / §9a). Catches it at the source.
+    if $m["bus"] == true and $m["status"] == "active" then
+      if length(wg_current_pubkeys($m, $inv["epoch"])) == 0 then
+        print("ERROR: active bus member '" .. $name .. "' has no kind:wg credential current at epoch " .. ("" .. $inv["epoch"]))
+        mesh_fatal()
+      end
+    end
+    if $seen_name[$name] == true then
+      print("ERROR: duplicate node name in inventory: '" .. $name .. "' (§6.1: names MUST be unique per mesh)")
+      mesh_fatal()
+    end
+    if $seen_ip[$ip] == true then
+      print("ERROR: duplicate mesh_ip in inventory: " .. $ip .. " (also '" .. $name .. "')")
+      mesh_fatal()
+    end
+    $seen_name[$name] = true
+    $seen_ip[$ip] = true
+    $member_by_name[$name] = $m
+  end
+
+  -- hub[] must name declared, active members (the reconcile WG full-view
+  -- target, §8). A hub need not be bus:true (it can be transport-only), but
+  -- it MUST exist and be active — a stale/typo'd hub name is a real drift.
+  $hubs = $inv["hub"]
+  if $hubs == nil or length($hubs) == 0 then
+    print("ERROR: inventory has no hub[] (need >=1 hub for the WG full view, §8)")
+    mesh_fatal()
+  end
+  for each $h in $hubs
+    if not is_valid_label($h) then
+      print("ERROR: hub name not a valid label: '" .. ("" .. $h) .. "'")
+      mesh_fatal()
+    end
+    $hm = $member_by_name[$h]
+    if $hm == nil then
+      print("ERROR: hub '" .. $h .. "' is not a declared member")
+      mesh_fatal()
+    end
+    if $hm["status"] != "active" then
+      print("ERROR: hub '" .. $h .. "' must be an active member (status=" .. ("" .. $hm["status"]) .. ")")
+      mesh_fatal()
+    end
+  end
+end
+
+-- ─── zones.mix generation (Tier 2, _plan/2026-06-06-mesh-ip-autodiscovery.md) ───
+-- Emit a cosmix-dnsd zones.mix from the signed inventory (IP-bearing mesh
+-- records) + the hand-authored overlay (zones.overlay.mix: soa/ns/serials/
+-- goldcoast/mail-auth). The emitter reproduces the live file's exact 2/4/6/10-
+-- space hand-format so a regenerate is BYTE-IDENTICAL until the inventory
+-- changes — drift is then a detectable diff, not a state.
+
+-- Wrap a string in double quotes (the record/field value form). `'"'` is a
+-- raw single-quoted literal double-quote, so no escaping dance.
+function dq($s)
+  return '"' .. $s .. '"'
+end
+
+-- Reversed-IP PTR owner name for a /24 IPv4 (192.0.2.5 -> 5.2.0.192.in-addr.arpa).
+-- ASSUMES a validated dotted-quad (validate_inventory guarantees it upstream).
+function reverse_ptr_name($ip)
+  $p = split($ip, ".")
+  return $p[3] .. "." .. $p[2] .. "." .. $p[1] .. "." .. $p[0] .. ".in-addr.arpa"
+end
+
+-- The four derived forward records for one published owner in a mesh zone:
+-- A (mesh_ip), MX, and the implicit-TLS _imaps/_submissions SRV pair
+-- (RFC 6186/8314: 993/465 only). name = "<owner>.<zone>", ttl 300 (dnsd conv).
+function gen_forward_records($owner, $zone, $ip)
+  $fqdn = $owner .. "." .. $zone
+  return [
+    { name: $fqdn, type: "A", ttl: 300, data: $ip },
+    { name: $fqdn, type: "MX", ttl: 300, data: "10 " .. $fqdn },
+    { name: "_imaps._tcp." .. $fqdn, type: "SRV", ttl: 300, data: "0 1 993 " .. $fqdn },
+    { name: "_submissions._tcp." .. $fqdn, type: "SRV", ttl: 300, data: "0 1 465 " .. $fqdn }
+  ]
+end
+
+-- The declared member record for a name, or nil if not a declared member.
+function member_record($mesh, $name)
+  for each $m in $mesh["members"]
+    if $m["name"] == $name then
+      return $m
+    end
+  end
+  return nil
+end
+
+-- Fail-CLOSED pre-flight for zone emission (run before any record is built):
+--   - every PUBLISHED owner must be a declared, ACTIVE, bus:true inventory
+--     member AND have a numeric serial. Active because a tombstoned/removed
+--     owner left in published[] would keep serving live A/MX/SRV/PTR for a
+--     decommissioned node; bus:true because the mesh_forward zones emit MX +
+--     _imaps/_submissions SRV, which are bogus for a transport-only node.
+--   - every VERBATIM bundle owner must have a numeric serial (it need NOT be a
+--     mesh member — example.net owners are serial-grouping labels for infra).
+-- A missing serial would otherwise emit `serial: nil` into a production zone.
+function validate_zone_emission($mesh, $overlay)
+  $serials = $overlay["serials"]
+  for each $owner in $overlay["published"]
+    $m = member_record($mesh, $owner)
+    if $m == nil then
+      print("ERROR: overlay.published owner '" .. ("" .. $owner) .. "' is not a declared inventory member")
+      mesh_fatal()
+    end
+    if $m["status"] != "active" then
+      print("ERROR: overlay.published owner '" .. $owner .. "' is " .. ("" .. $m["status"]) .. ", not active — remove it from published[] before generating (it would keep serving DNS for a decommissioned node)")
+      mesh_fatal()
+    end
+    if $m["bus"] != true then
+      print("ERROR: overlay.published owner '" .. $owner .. "' is transport-only (bus:false) — the mesh_forward zones emit MX/SRV that are bogus for it; remove it from published[]")
+      mesh_fatal()
+    end
+    if type($serials[$owner]) != "number" then
+      print("ERROR: overlay.published owner '" .. $owner .. "' has no numeric serial in overlay.serials")
+      mesh_fatal()
+    end
+  end
+  for each $zname in $overlay["zone_order"]
+    $z = $overlay["zones"][$zname]
+    if $z != nil and $z["kind"] == "verbatim" then
+      for each $b in $z["bundles"]
+        if type($serials[$b["owner"]]) != "number" then
+          print("ERROR: verbatim zone '" .. $zname .. "' bundle owner '" .. ("" .. $b["owner"]) .. "' has no numeric serial in overlay.serials")
+          mesh_fatal()
+        end
+      end
+    end
+  end
+end
+
+-- The single derived PTR for one published owner (data = "<owner>.<ptr_target>",
+-- the primary example.org identity for FCrDNS — never <owner>.bus).
+function gen_ptr_record($owner, $ip, $ptr_target)
+  return { name: reverse_ptr_name($ip), type: "PTR", ttl: 300, data: $owner .. "." .. $ptr_target }
+end
+
+-- One record map -> its 10-space line WITHOUT a trailing comma (caller joins).
+function emit_record_line($r)
+  return "          { name: " .. dq($r["name"]) .. ", type: " .. dq($r["type"]) .. ", ttl: " .. ("" .. $r["ttl"]) .. ", data: " .. dq($r["data"]) .. " }"
+end
+
+-- One bundle -> its 6-space block WITHOUT a trailing comma. The opening line
+-- carries `records: [`; records sit at 10 spaces; `      ] }` closes it.
+function emit_bundle($owner, $serial, $records)
+  $lines = []
+  for each $r in $records
+    push($lines, emit_record_line($r))
+  end
+  return "      { owner: " .. dq($owner) .. ", serial: " .. ("" .. $serial) .. ", records: [\n" .. join($lines, ",\n") .. "\n      ] }"
+end
+
+-- One zone -> its 2-space block WITHOUT a trailing comma. $bundles is a list of
+-- already-resolved { owner, records }; the serial comes from the per-owner map.
+function emit_zone($zname, $z, $bundles, $serials)
+  $blines = []
+  for each $b in $bundles
+    push($blines, emit_bundle($b["owner"], $serials[$b["owner"]], $b["records"]))
+  end
+  $soa = $z["soa"]
+  $soaline = "    soa: { primary: " .. dq($soa["primary"]) .. ", mbox: " .. dq($soa["mbox"]) .. ", ttl: " .. ("" .. $soa["ttl"]) .. ", minimum: " .. ("" .. $soa["minimum"]) .. " },"
+  $nsitems = []
+  for each $n in $z["ns"]
+    push($nsitems, dq($n))
+  end
+  $nsline = "    ns: [ " .. join($nsitems, ", ") .. " ],"
+  $sfline = "    serial_floor: " .. ("" .. $z["serial_floor"]) .. ","
+  return "  " .. dq($zname) .. ": {\n" .. $soaline .. "\n" .. $nsline .. "\n" .. $sfline .. "\n    bundles: [\n" .. join($blines, ",\n") .. "\n    ]\n  }"
+end
+
+-- Resolve one zone's bundles to a list of { owner, records } per its `kind`:
+--   mesh_forward  generated A/MX/SRV per published owner ++ extra[owner]
+--   mesh_reverse  one generated PTR per published owner
+--   verbatim      the authored bundles, as-is
+function resolve_zone_bundles($mesh, $overlay, $z)
+  $resolved = []
+  $kind = $z["kind"]
+  if $kind == "mesh_forward" then
+    for each $owner in $overlay["published"]
+      $recs = gen_forward_records($owner, $z["__name"], mesh_ip_of($mesh, $owner))
+      $ex = $z["extra"][$owner]
+      if $ex != nil then
+        for each $er in $ex
+          push($recs, $er)
+        end
+      end
+      push($resolved, { owner: $owner, records: $recs })
+    end
+  else
+    if $kind == "mesh_reverse" then
+      for each $owner in $overlay["published"]
+        $ptr = gen_ptr_record($owner, mesh_ip_of($mesh, $owner), $z["ptr_target"])
+        -- the reversed-IP name MUST fall under this reverse zone, else a
+        -- subnet change (or a wrong zone name) would file PTRs in the wrong zone.
+        if not ends_with($ptr["name"], "." .. $z["__name"]) then
+          print("ERROR: generated PTR '" .. $ptr["name"] .. "' for '" .. $owner .. "' is not under reverse zone '" .. $z["__name"] .. "' (subnet/overlay mismatch)")
+          mesh_fatal()
+        end
+        push($resolved, { owner: $owner, records: [ $ptr ] })
+      end
+    else
+      if $kind == "verbatim" then
+        for each $b in $z["bundles"]
+          push($resolved, { owner: $b["owner"], records: $b["records"] })
+        end
+      else
+        print("ERROR: zone '" .. $z["__name"] .. "' has unknown kind '" .. ("" .. $kind) .. "' (mesh_forward|mesh_reverse|verbatim)")
+        mesh_fatal()
+      end
+    end
+  end
+  return $resolved
+end
+
+-- Full zones.mix text: verbatim $header (the comment preamble, ending "\n\n")
+-- + the `zones: {...}` body. Reproduces the live byte format exactly.
+function gen_zones_text($mesh, $overlay, $header)
+  validate_zone_emission($mesh, $overlay)
+  $serials = $overlay["serials"]
+  $zones = $overlay["zones"]
+  $zblocks = []
+  for each $zname in $overlay["zone_order"]
+    $z = $zones[$zname]
+    if $z == nil then
+      print("ERROR: zone_order names '" .. $zname .. "' but overlay.zones has no such zone")
+      mesh_fatal()
+    end
+    $z["__name"] = $zname
+    $resolved = resolve_zone_bundles($mesh, $overlay, $z)
+    push($zblocks, emit_zone($zname, $z, $resolved, $serials))
+  end
+  return $header .. "zones: {\n" .. join($zblocks, ",\n") .. "\n}\n"
+end
+
+-- ─── hub WG config generation (Tier 3, _plan/2026-06-06-mesh-ip-autodiscovery.md) ───
+-- Emit the mesh HUB's wg.conf from the signed inventory (IP-bearing [Peer] set)
+-- + the node-local wg.overlay.mix (iface name, hub ListenPort/MTU, keepalive).
+-- The [Interface] PrivateKey is INTENTIONALLY ABSENT — it is the one secret,
+-- preserved live on the hub by wg_hub_install.mix and never written here or to
+-- the repo. SPEC 13 §7.3 names "WG peer stanzas (on the hub)" as the generator's
+-- WG output; the hub peers every active member (a renumber/add/remove edits the
+-- inventory, regenerates this, and re-applies — no hand-edited WG file).
+
+-- The mesh interface name for a node, from the overlay. Dies on a missing entry
+-- (a node with no declared iface cannot be safely targeted by deploy_wg).
+-- "Non-empty" was the whole test here, and this string is not only passed to
+-- `ip`/`wg`: deploy_wg builds `<iface>.conf` from it, both as the committed
+-- path under _etc and as the name of the private deploy snapshot. A `../` in
+-- an interface name therefore escaped the snapshot directory — which
+-- snapshot_release() later removes recursively. Hold it to the kernel's own
+-- grammar instead (IFNAMSIZ is 16, so 15 chars; no '/', no whitespace, no NUL,
+-- and not '.'/'..' — net/core/dev.c dev_valid_name), which is both the correct
+-- validation for an interface and a safe basename by construction.
+-- An ALLOWLIST, not a blocklist. Enumerating what the kernel rejects invites
+-- exactly the miss it did on the first attempt (':' — which ifconfig treats as
+-- an alias separator — plus \r, vertical tab and form feed, all of which
+-- dev_valid_name refuses as whitespace). Naming what is permitted cannot have
+-- that failure mode. [A-Za-z0-9._-], 15 chars (IFNAMSIZ is 16 including the
+-- NUL), and not '.'/'..' — stricter than the kernel, and every real interface
+-- name in this mesh fits it.
+$IFNAME_OK = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+
+function is_valid_ifname($s)
+  if type($s) != "string" then return false end
+  if is_empty($s) or length($s) > 15 then return false end
+  if $s == "." or $s == ".." then return false end
+  $i = 0
+  while $i < length($s)
+    if not contains($IFNAME_OK, substr($s, $i, 1)) then return false end
+    $i = $i + 1
+  end
+  return true
+end
+
+function wg_iface_of($overlay, $name)
+  $if = $overlay["mesh_iface"][$name]
+  if $if == nil or $if == "" then
+    print("  ERROR: wg.overlay mesh_iface has no interface for '" .. ("" .. $name) .. "'")
+    mesh_fatal()
+  end
+  if not is_valid_ifname($if) then
+    print("  ERROR: wg.overlay mesh_iface for '" .. ("" .. $name) .. "' is not a valid interface name: '" .. ("" .. $if) .. "'")
+    print("         (max 15 chars, no '/', no whitespace, not '.' or '..')")
+    mesh_fatal()
+  end
+  return $if
+end
+
+-- Fail-CLOSED pre-flight for hub WG emission: the hub fields must be numeric and
+-- mesh_iface MUST cover the hub + every active member (deploy_wg needs each
+-- node's iface to apply its Address; a missing one would silently skip a node).
+function validate_wg_overlay($mesh, $overlay)
+  if type($overlay["hub_listen_port"]) != "number" then
+    print("ERROR: wg.overlay hub_listen_port must be a number")
+    mesh_fatal()
+  end
+  if type($overlay["hub_mtu"]) != "number" then
+    print("ERROR: wg.overlay hub_mtu must be a number")
+    mesh_fatal()
+  end
+  if type($overlay["keepalive"]) != "number" then
+    print("ERROR: wg.overlay keepalive must be a number")
+    mesh_fatal()
+  end
+  for each $h in $mesh["hub"]
+    wg_iface_of($overlay, $h)
+  end
+  for each $m in $mesh["members"]
+    if $m["status"] == "active" then
+      wg_iface_of($overlay, $m["name"])
+    end
+  end
+end
+
+-- Full hub wg.conf text: header comment + [Interface] (Address/ListenPort/MTU,
+-- NO PrivateKey) + one [Peer] per active non-hub member, name-sorted, for every
+-- kind:wg pubkey current at the mesh epoch (a rotation overlap → two peers,
+-- which is exactly what the kernel needs while both keys are valid).
+function gen_hub_wg_text($mesh, $overlay, $vi)
+  validate_wg_overlay($mesh, $overlay)
+  $hub = $mesh["hub"][0]
+  $hub_m = member_record($mesh, $hub)
+  if $hub_m == nil then
+    print("ERROR: hub '" .. ("" .. $hub) .. "' is not a declared member")
+    mesh_fatal()
+  end
+  $iface = wg_iface_of($overlay, $hub)
+  $hub_ip = mesh_ip_of($mesh, $hub)
+  $hub_pubs = wg_current_pubkeys($hub_m, $mesh["epoch"])
+  if length($hub_pubs) == 0 then
+    print("ERROR: hub '" .. $hub .. "' has no kind:wg credential current at epoch " .. ("" .. $mesh["epoch"]))
+    mesh_fatal()
+  end
+
+  -- active members except the hub, name-sorted (deterministic peer order)
+  $names = []
+  $by_name = {}
+  for each $m in $mesh["members"]
+    if $m["status"] == "active" and $m["name"] != $hub then
+      push($names, $m["name"])
+      $by_name[$m["name"]] = $m
+    end
+  end
+  $names = sort($names)
+
+  $lines = []
+  push($lines, "# " .. $iface .. " — cosmix mesh hub (" .. $mesh["subnet"] .. ")")
+  push($lines, trim(provenance_stamp($vi, "# ")) .. ", + wg.overlay.mix")
+  push($lines, "# GENERATED by `mesh_gen.mix seal` — do not hand-edit.")
+  push($lines, "# PrivateKey is preserved live on the hub by deploy_wg.mix (never written here or to the repo).")
+  push($lines, "# Server pubkey: " .. $hub_pubs[0])
+  push($lines, "")
+  push($lines, "[Interface]")
+  push($lines, "Address = " .. $hub_ip .. "/24")
+  push($lines, "ListenPort = " .. ("" .. $overlay["hub_listen_port"]))
+  push($lines, "MTU = " .. ("" .. $overlay["hub_mtu"]))
+
+  for each $pname in $names
+    $m = $by_name[$pname]
+    $pubs = wg_current_pubkeys($m, $mesh["epoch"])
+    if length($pubs) == 0 then
+      print("ERROR: active member '" .. $pname .. "' has no kind:wg credential current at epoch " .. ("" .. $mesh["epoch"]))
+      mesh_fatal()
+    end
+    for each $pk in $pubs
+      push($lines, "")
+      push($lines, "[Peer]")
+      push($lines, "# " .. $pname)
+      push($lines, "PublicKey = " .. $pk)
+      push($lines, "AllowedIPs = " .. $m["mesh_ip"] .. "/32")
+      push($lines, "PersistentKeepalive = " .. ("" .. $overlay["keepalive"]))
+    end
+  end
+  return join($lines, "\n") .. "\n"
+end
+
+-- A 32-byte key in standard base64 = 44 chars ending in one "=" pad, over the
+-- [A-Za-z0-9+/] alphabet. Both the WG X25519 transport key and the Ed25519 d2
+-- admission key are 32 bytes, so this validates BOTH. Used to reject a malformed
+-- pubkey paste BEFORE it is interpolated into the authored strict-data inventory
+-- (a stray `"`/newline would otherwise corrupt the trust root).
+function is_valid_b64key($k)
+  if length($k) != 44 then return false end
+  if substr($k, 43, 1) != "=" then return false end
+  $i = 0
+  while $i < 43
+    if pos(substr($k, $i, 1), "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/") == 0 then
+      return false
+    end
+    $i = $i + 1
+  end
+  return true
+end
+
+-- next_free_ip_union($authored, $rolled_out) — the wg_ip allocator (SPEC 13
+-- §7.3). Coverage, not authority, is the reason it takes both inventories: a
+-- stale authored checkout must not reallocate an address that the rolled-out
+-- signed payload still reserves, while an unrolled authored addition must also
+-- reserve its proposed address. The LOWEST free host in the shared /24 wins;
+-- .0 (network), .1 (hub/gateway convention), .255 (broadcast), and EVERY
+-- declared mesh_ip remain reserved. Tombstones are deliberately included.
+--
+-- The subnets must agree EXACTLY. Combining coverage from different address
+-- spaces would manufacture a result neither inventory describes.
+function next_free_ip_union($authored, $rolled_out)
+  if $authored["subnet"] != $rolled_out["subnet"] then
+    print("  ERROR: next_free_ip_union: authored subnet " .. ("" .. $authored["subnet"]) ..
+      " != rolled-out subnet " .. ("" .. $rolled_out["subnet"]))
+    print("         Refusing to allocate across two different address spaces.")
+    mesh_fatal()
+  end
+  $prefix = prefix24(split($authored["subnet"], "/")[0])
+  $used = []
+  for each $m in $authored["members"]
+    push($used, $m["mesh_ip"])
+  end
+  for each $m in $rolled_out["members"]
+    push($used, $m["mesh_ip"])
+  end
+  $i = 2
+  while $i <= 254
+    $cand = $prefix .. "." .. ("" .. $i)
+    if not contains_str($used, $cand) then
+      return $cand
+    end
+    $i = $i + 1
+  end
+  print("  ERROR: next_free_ip_union: /24 " .. ("" .. $authored["subnet"]) .. " is exhausted (.2-.254 all allocated)")
+  mesh_fatal()
+end
+
+-- ─── authenticated inventory ingress (D1.2) ───────────────────────────────
+-- The ONLY sanctioned way for generation/deploy tooling to obtain mesh data.
+-- Everything downstream of this call is derived from bytes an Ed25519
+-- signature actually covers. The authored `inventory.mix` is an EDITING
+-- surface, never an authority: it is unsigned, so anything derived from it
+-- directly (a zone file, a WG peer set, a node roster) inherits no
+-- authenticity at all. Before D1.2 every generator read the authored file.
+--
+-- Trust anchor: this node's installed `genesis.pub` by default — the SAME
+-- anchor `noded` enforces with, so the tooling cannot accept an inventory the
+-- fleet would reject. `--secrets-db` is pinned at a path that cannot exist:
+-- verification is a PUBLIC-key operation, so if a future change ever made it
+-- consult the signing secret, this fails loudly here rather than silently
+-- re-coupling artifact generation to the private key.
+-- The mesh name every sealed derivation must find in the authenticated
+-- payload. PINNED here rather than read from the inventory being verified:
+-- a file cannot be allowed to nominate which mesh it claims to be, or
+-- swapping in a validly-signed inventory for a DIFFERENT mesh would pass.
+$MESH_EXPECTED      = "bus"
+$MESH_SIGN_BIN      = "/opt/cosmix/bin/cosmix-mesh-sign"
+$MESH_GENESIS_PUB   = "/etc/cosmix/noded/genesis.pub"
+$MESH_NO_SECRETS_DB = "/nonexistent/mesh_lib-verification-must-not-need-the-secret"
+
+-- verified_inventory(signed_path, opts) -> map
+--   opts.mesh              REQUIRED — the mesh name the payload must name.
+--   opts.genesis_pub       trust anchor path (default $MESH_GENESIS_PUB).
+--   opts.against_authored  authored .mix path; when given, the signed
+--                          payload's AUTHORING hash must equal the authored
+--                          file's — i.e. "the thing you edited is the thing
+--                          that got signed". Distinct from canonical_blake3,
+--                          which moves on every re-sign (signed_at lives
+--                          inside the payload) and so can never be used for
+--                          an authored-content comparison.
+-- Returns { inventory, epoch, mesh, authoring_blake3, canonical_blake3, source }.
+-- `.inventory` is the authenticated payload — the shape validate_inventory,
+-- gen_zones_text and gen_hub_wg_text already expect. Dies loudly on ANY
+-- failure; there is no degraded/unverified return.
+-- Does the authored file still describe the signed payload? A NON-FATAL
+-- question, deliberately separate from verified_inventory's `against_authored`
+-- (which exits, and should: a real run must not derive artifacts from a
+-- payload that does not match the plan). A dry run needs the same fact without
+-- the exit, because "the authored file has edits that are not signed yet" is
+-- the NORMAL state before a sync — it is the reason to run one — and dying on
+-- it would make the rehearsal useless exactly when it is most wanted.
+-- Returns {in_sync, detail}.
+function authored_drift($signed_path, $authored_path, $mesh_name)
+  $anchor = $MESH_GENESIS_PUB
+  if not exists($signed_path) or not exists($authored_path) or not exists($anchor) then
+    return {in_sync: false, detail: "cannot compare (missing signed, authored, or anchor file)"}
+  end
+  $r = run_argv([$MESH_SIGN_BIN, "--secrets-db", $MESH_NO_SECRETS_DB,
+                 "verify", $signed_path,
+                 "--genesis-pub", $anchor,
+                 "--expected-mesh", $mesh_name,
+                 "--json", "--against-authored", $authored_path])
+  if $r["exit_code"] == 0 then
+    return {in_sync: true, detail: ""}
+  end
+  if contains($r["stdout"] .. $r["stderr"], "authoring_mismatch") then
+    return {in_sync: false, detail: "the authored inventory has changes that are not in the signed payload"}
+  end
+  return {in_sync: false, detail: "verification failed: " .. trim($r["stderr"]) .. trim($r["stdout"])}
+end
+
+-- A stable fingerprint of the payload's TRUST ROOTS, computed here on the
+-- control host rather than taken from the verifier.
+--
+-- Why it is needed: the equal-epoch content check binds a rolled-out epoch to
+-- the payload's authoring_blake3, and `verify_keys` is in SIGNER_OWNED_FIELDS
+-- (cosmix-lib-mesh-trust inventory.rs) — so the authoring projection REMOVES
+-- it before hashing. Two payloads with the same roster and the same epoch but
+-- DIFFERENT verify_keys therefore share an authoring hash, and the check would
+-- wave through a swap of the future trust roots as "same content". That is the
+-- most security-semantic field in the payload; it is not something the binding
+-- may be blind to.
+--
+-- Why retain this beside canonical_blake3: the canonical hash binds the exact
+-- accepted artifact (including signed_at/valid_until), while this fingerprint
+-- names the security-semantic trust-root change directly and remains useful in
+-- migration witnesses that predate the canonical field. This is the narrow
+-- projection: authoring identity PLUS the trust roots, without signer metadata.
+--
+-- Canonicalised by sorting field-joined records, so neither key order in the
+-- list nor map iteration order can move the answer. Fields are named
+-- explicitly: a future key attribute this function does not know about would
+-- otherwise change the fingerprint on hosts that have it and not on hosts that
+-- do not, and a fingerprint that disagrees between witnesses is a refusal.
+--
+-- Each field is JSON-ENCODED before joining, not concatenated raw. A raw join
+-- on "|" is not injective: a key_id of "a|b" with key_type "c" produces the
+-- same record as key_id "a" with key_type "b|c", so two DIFFERENT key sets
+-- would share a fingerprint and the equal-epoch trust-root check would wave
+-- one through as the other. json_encode quotes every field and escapes any
+-- embedded quote or newline, so the joined form is uniquely decodable back to
+-- the field list. `key_id` is operator-chosen text, so this is not a
+-- hypothetical shape of value.
+--
+-- CHANGING THIS ENCODING IS A FLOOR-FORMAT BREAK. Every floor already on
+-- disk names a fingerprint under the old encoding, so the equal-epoch trust
+-- root check starts refusing the live payload on every host at once, with a
+-- message that says "different trust root" when nothing about the trust root
+-- moved. Re-seed both witnesses through mesh_baseline_write in the same
+-- change, and on a multi-host control plane expect to do it per host.
+function verify_keys_fingerprint($payload)
+  $vk = $payload["verify_keys"]
+  if type($vk) != "list" then
+    print("  ERROR: authenticated payload has no verify_keys list")
+    mesh_fatal()
+  end
+  $recs = []
+  for each $k in $vk
+    if type($k) != "map" then
+      print("  ERROR: authenticated payload has a non-map entry in verify_keys")
+      mesh_fatal()
+    end
+    push($recs, json_encode("" .. $k["key_id"]) .. "|" .. json_encode("" .. $k["key_type"]) .. "|" ..
+      json_encode("" .. $k["pubkey"]) .. "|" .. json_encode("" .. $k["status"]))
+  end
+  return hash_blake3(join(sort($recs), "\n"))
+end
+
+function verified_inventory($signed_path, $opts)
+  $mesh_name = $opts["mesh"]
+  if $mesh_name == nil or $mesh_name == "" then
+    print("  ERROR: verified_inventory requires opts.mesh (the expected mesh name)")
+    mesh_fatal()
+  end
+  $anchor = $opts["genesis_pub"]
+  if $anchor == nil or $anchor == "" then
+    $anchor = $MESH_GENESIS_PUB
+  end
+  if not exists($signed_path) then
+    print("  ERROR: signed inventory not found: " .. $signed_path)
+    mesh_fatal()
+  end
+  if not exists($anchor) then
+    print("  ERROR: genesis trust anchor not found: " .. $anchor)
+    print("         Refusing to derive artifacts from an inventory nothing can authenticate.")
+    mesh_fatal()
+  end
+
+  $argv = [$MESH_SIGN_BIN, "--secrets-db", $MESH_NO_SECRETS_DB,
+           "verify", $signed_path,
+           "--genesis-pub", $anchor,
+           "--expected-mesh", $mesh_name,
+           "--include-payload", "--json"]
+  $authored = $opts["against_authored"]
+  if $authored != nil and $authored != "" then
+    if not exists($authored) then
+      print("  ERROR: --against-authored file not found: " .. $authored)
+      mesh_fatal()
+    end
+    push($argv, "--against-authored")
+    push($argv, $authored)
+  end
+
+  -- Deadline + a built environment, not the ambient one. The verifier is the
+  -- single point every generator and gate trusts, so it must not be steerable
+  -- by whatever the calling shell happened to export, and it must not be able
+  -- to hang a pre-commit hook forever. LC_ALL=C keeps the --json numeric and
+  -- error text stable across locales; PATH and HOME are kept because the CLI
+  -- resolves nothing else. (Lifted here from check-public-hygiene.mix, which
+  -- had it on its own copy of this call — the copy round 14 deleted.)
+  $r = run_argv($argv, {timeout: 60, clear_env: true,
+    env: {PATH: env("PATH"), HOME: env("HOME"), LC_ALL: "C"}})
+  if $r["exit_code"] != 0 then
+    print("  ERROR: inventory verification FAILED for " .. $signed_path)
+    print("    anchor: " .. $anchor .. "  expected mesh: " .. $mesh_name)
+    if not is_empty(trim($r["stderr"])) then
+      print("    " .. trim($r["stderr"]))
+    end
+    if not is_empty(trim($r["stdout"])) then
+      print("    " .. trim($r["stdout"]))
+    end
+    mesh_fatal()
+  end
+
+  $v = json_parse($r["stdout"])
+  if type($v) != "map" or $v["ok"] != true then
+    print("  ERROR: verifier did not report ok for " .. $signed_path .. ": " .. trim($r["stdout"]))
+    mesh_fatal()
+  end
+  $payload = $v["payload"]
+  if type($payload) != "map" then
+    print("  ERROR: verifier returned no authenticated payload (--include-payload missing?)")
+    mesh_fatal()
+  end
+
+  -- Authenticity is not structural validity: the signature proves WHO wrote
+  -- these bytes, not that the topology they describe is coherent. A signer
+  -- can sign a malformed inventory, so the same validator the authoring path
+  -- runs is applied to the authenticated payload too.
+  validate_inventory($payload)
+
+  -- The freshness floor below compares these two; a verifier too old to
+  -- report them would silently make that comparison nil-vs-number. Refuse
+  -- rather than accept a payload whose freshness cannot be established.
+  if type($v["recovery_generation"]) != "number" or ($v["via_recovery"] != true and $v["via_recovery"] != false) then
+    print("  ERROR: verifier did not report recovery_generation/via_recovery for " .. $signed_path)
+    print("         cosmix-mesh-sign is too old to establish freshness on the recovery axis.")
+    mesh_fatal()
+  end
+  assert_exact_int($v["epoch"], "epoch", $signed_path)
+  assert_exact_int($v["recovery_generation"], "reported recovery_generation", $signed_path)
+
+  -- Whether the AUTHENTICATED payload actually carries recovery_generation is
+  -- a different question from what the verifier REPORTS, and only the first
+  -- one can be enforced here. The CLI builds its trust state with
+  -- last_recovery_generation = 0 every time (cosmix-mesh-sign/src/main.rs
+  -- trust_state()), and inventory.rs reads an OMITTED field as "inherit the
+  -- cached floor" — so the reported number is `payload_echo ?? 0`, never a
+  -- statement about the fleet. The payload field itself IS one: present means
+  -- the signer asserted a generation, absent means they asserted nothing.
+  $pgen = $payload["recovery_generation"]
+  if $pgen != nil and type($pgen) != "number" then
+    print("  ERROR: authenticated payload carries a non-numeric recovery_generation for " .. $signed_path)
+    mesh_fatal()
+  end
+  if $pgen != nil then
+    assert_exact_int($pgen, "payload recovery_generation", $signed_path)
+  end
+  if type($v["verified_by"]) != "list" then
+    print("  ERROR: verifier did not report verified_by for " .. $signed_path)
+    mesh_fatal()
+  end
+
+  $vi = {
+    inventory: $payload,
+    epoch: $v["epoch"],
+    mesh: $v["mesh"],
+    authoring_blake3: $v["authoring_blake3"],
+    verify_keys_blake3: verify_keys_fingerprint($payload),
+    canonical_blake3: $v["canonical_blake3"],
+    recovery_generation: $v["recovery_generation"],
+    via_recovery: $v["via_recovery"],
+    payload_generation: $pgen,
+    genesis_verified: contains($v["verified_by"], "genesis"),
+    source: $signed_path
+  }
+
+  -- Freshness is a SEPARATE question from authenticity, and the verifier
+  -- cannot answer it: it builds its trust state with last_epoch 0, so an old
+  -- but validly-signed payload passes everything above. Enforced here, at the
+  -- one place every generator and gate already funnels through, so no caller
+  -- can forget it.
+  $bl = $opts["baseline"]
+  if $bl == nil or $bl == "" then
+    $bl = $MESH_BASELINE
+  end
+  assert_freshness_floor($vi, $bl)
+
+  return $vi
+end
+
+-- The provenance stamp emitted into generated artifacts. Epoch + AUTHORING
+-- hash: both are stable across a re-sign of identical authored content, so a
+-- regenerate stays byte-identical and drift remains a real diff rather than
+-- noise that fires on every `mesh_sync` run. (canonical_blake3 is deliberately
+-- NOT used here — it changes every time the inventory is re-signed.)
+function provenance_stamp($vi, $prefix)
+  return $prefix .. "generated from the VERIFIED signed inventory — epoch " .. ("" .. $vi["epoch"]) .. ", authoring " .. $vi["authoring_blake3"] .. "\n"
+end
+
+-- One recipe for each derived artifact, shared by the generator AND every
+-- drift gate. mesh_gen writes these files; mesh_zones_check, deploy_dnsd and
+-- deploy_wg each re-derive them and assert byte-equality. If those callers
+-- built the input themselves, any divergence (a forgotten provenance stamp,
+-- a different overlay path) would read as DRIFT in a production gate — or,
+-- worse, as agreement reached two different ways. So the recipe lives here
+-- once and the gates call it.
+function gen_zones_from_verified($vi, $overlay_path, $header_path)
+  $ov = load_data($overlay_path)["overlay"]
+  $hdr = read_file($header_path) .. provenance_stamp($vi, "-- ") .. "\n"
+  return gen_zones_text($vi["inventory"], $ov, $hdr)
+end
+
+function gen_hub_wg_from_verified($vi, $wg_overlay_path)
+  $wgov = load_data($wg_overlay_path)["wg_overlay"]
+  return gen_hub_wg_text($vi["inventory"], $wgov, $vi)
+end
+
+-- ── per-node roster bundle ───────────────────────────────────────────────
+-- The noded membership roster + /etc/hosts snippet, derived from the
+-- AUTHENTICATED payload. Same reason as the recipes above, one step sharper:
+-- mesh_gen WRITES these into the staging tree and mesh_sync re-derives them
+-- to prove that what it is about to distribute is what the payload in its
+-- hand says — not whatever a previous (or unsigned) generation happened to
+-- leave on disk. Without a shared recipe "the staging tree came from this
+-- payload" is an assumption; with one it is a check.
+--
+-- Returns { <name>: {config: <json text>, hosts: <text>} } for every
+-- bus+active member. NOTE the config carries no provenance stamp: it is a
+-- wire artifact `noded` parses, so its bytes are fixed by that consumer.
+function gen_node_bundles_from_verified($vi)
+  $mesh = $vi["inventory"]
+  $bus = []
+  for each $m in $mesh["members"]
+    if $m["bus"] == true and $m["status"] == "active" then
+      push($bus, $m)
+    end
+  end
+
+  $names = []
+  $by_name = {}
+  for each $m in $bus
+    push($names, $m["name"])
+    $by_name[$m["name"]] = $m
+  end
+  $names = sort($names)
+
+  $ipkeys = []
+  $by_ipkey = {}
+  $maxw = 0
+  for each $m in $bus
+    $k = ip_key($m["mesh_ip"])
+    push($ipkeys, $k)
+    $by_ipkey[$k] = $m
+    if length($m["mesh_ip"]) > $maxw then
+      $maxw = length($m["mesh_ip"])
+    end
+  end
+  $ipkeys = sort($ipkeys)
+
+  $hlines = []
+  push($hlines, "# cosmix-bus BEGIN")
+  for each $k in $ipkeys
+    $m = $by_ipkey[$k]
+    push($hlines, rpad($m["mesh_ip"], $maxw) .. "  " .. $m["name"] .. ".bus")
+  end
+  push($hlines, "# cosmix-bus END")
+  $hosts = join($hlines, "\n") .. "\n"
+
+  $out = {}
+  for each $self_name in $names
+    $peers = []
+    for each $pname in $names
+      if $pname != $self_name then
+        $p = $by_name[$pname]
+        $peer = {mesh_ip: $p["mesh_ip"], name: $p["name"]}
+        if has_key($p, "noded_port") and $p["noded_port"] != 4200 then
+          $peer["noded_port"] = $p["noded_port"]
+        end
+        push($peers, $peer)
+      end
+    end
+    $out[$self_name] = {
+      config: json_encode({node_name: $self_name, peers: $peers}, true),
+      hosts: $hosts
+    }
+  end
+  return $out
+end
+
+-- ── epoch baseline (rollback / downgrade floor) ──────────────────────────
+-- A signature proves WHO wrote a payload, never that it is the CURRENT one.
+-- `cosmix-mesh-sign verify` builds its trust state with last_epoch: 0, so an
+-- OLD but still validly-signed inventory (plus its matching authored file)
+-- verifies cleanly — and the DNS/WG deploy paths, unlike noded, keep no
+-- persisted epoch of their own to compare against. Restoring an old pair
+-- would silently regenerate and apply an old topology.
+--
+-- So the control host keeps its own floor, git-tracked beside the inventory.
+-- Absent is REFUSED, not trusted: a missing floor would make every check
+-- vacuous exactly when it matters, which is the failure mode this exists to
+-- close. Bootstrap it deliberately with mesh_baseline_write().
+-- IT IS NOT A DEFENCE AGAINST THIS HOST. Anyone who can run these tools can
+-- also restore an older commit, edit the floor, or edit the scripts that read
+-- it. That is not a hole this layer can close: a control host with write
+-- access to its own authoring surface has already lost. What IS monotonic and
+-- independent is each node's own persisted (epoch, generation), which noded
+-- compares before accepting anything.
+--
+-- The floor's actual job is the ACCIDENTAL replay — a stale checkout, a
+-- reverted commit, an old worktree — caught at the operator rather than one
+-- node at a time. A git-tracked floor ALONE could not do even that, since the
+-- checkout that restores the old payload restores the old floor with it; that
+-- is why the pair is also mirrored outside the tree ($MESH_BASELINE_MIRROR,
+-- below) and the floor in force is the FRESHER of the two, folded
+-- generation-first (mesh_baseline_read — not the higher of each axis, which
+-- would resurrect an epoch a recovery retired). Stated because it is
+-- the assumption the whole file rests on: this floor is a tripwire, not an
+-- authority — but it is now a tripwire the stale checkout does not step over.
+$MESH_BASELINE = env("CMCTL", env("HOME") .. "/.ctl") .. "/_etc/mesh/epoch.baseline.mix"
+
+-- Mix numbers are f64; the wire type for epoch and recovery_generation is u64.
+-- The two agree only up to 2^53-1 — probed live, json_parse turns
+-- 9007199254740993 into ...992. A floor comparison that silently rounds reads
+-- EQUAL where the node reads BELOW, which is precisely the direction that
+-- accepts a rollback. Refuse rather than compare wrongly; no real mesh needs a
+-- value past 9 quadrillion, so this only fires on a corrupt or hostile one.
+$MESH_INT_MAX = 9007199254740991
+
+function assert_exact_int($n, $what, $where)
+  if type($n) != "number" then
+    print("  ERROR: " .. $what .. " is not a number (" .. $where .. ")")
+    mesh_fatal()
+  end
+  if $n != floor($n) then
+    print("  ERROR: " .. $what .. " is not an integer: " .. ("" .. $n) .. " (" .. $where .. ")")
+    mesh_fatal()
+  end
+  if $n < 0 or $n > $MESH_INT_MAX then
+    print("  ERROR: " .. $what .. " is " .. ("" .. $n) .. ", outside the range Mix can compare exactly (" .. $where .. ")")
+    print("         Mix numbers are f64 and the wire type is u64; past " .. ("" .. $MESH_INT_MAX))
+    print("         a comparison here rounds, and a rounded floor test is not a floor")
+    print("         test. Refusing rather than answering with a rounded number.")
+    mesh_fatal()
+  end
+end
+
+-- ── the floor also lives OUTSIDE the checkout ────────────────────────────
+-- The tracked floor alone does not survive the threat it was written for. Its
+-- stated case is the ACCIDENTAL stale checkout — an old worktree, a reverted
+-- commit, a clone at yesterday's tip — and a git-tracked file is rolled back
+-- by exactly that event, taking the floor down with the payload it was meant
+-- to refuse. Restoring epoch 13 everywhere restores a floor of 13, and the
+-- replay sails through.
+--
+-- So the same pair is mirrored to a path git has no opinion about, and the
+-- floor in force is the FRESHER of the two — folded generation-first, the way
+-- the verifier orders payloads, NOT the higher of each axis taken
+-- independently (mesh_baseline_read says why that would be wrong). A stale
+-- checkout now
+-- carries an old tracked floor and meets a machine-local one that still
+-- remembers 15. The tracked copy keeps its own job — a fresh clone on a new
+-- host inherits a floor instead of starting at zero — but it is no longer the
+-- only witness.
+--
+-- Neither copy is an authority in the cryptographic sense: root can edit both.
+-- This remains a tripwire against replay and rollback-by-accident, not a
+-- defence against this host. What it now survives is the case it claimed to.
+$MESH_BASELINE_MIRROR = "/var/lib/cosmix/mesh/epoch.baseline.mix"
+-- The checkout the tracked floor lives in. Named here rather than taken from
+-- the caller ($COSMIX is set by the scripts that include this file, not by
+-- this file) so the independence test below cannot be defeated by an includer
+-- that simply does not define it.
+$MESH_CHECKOUT_ROOT = env("CMCTL", env("HOME") .. "/.ctl")
+
+-- {present: bool, baseline: <map>|nil}. Absent is legitimate (a control host
+-- that has never completed a rollout); unreadable is not, and refuses rather
+-- than silently degrading to the tracked copy alone — "I could not read the
+-- second witness" must never be reported as "the second witness agrees".
+-- "Absent" and "I am not allowed to look" are the same answer from exists():
+-- it is Path::exists() underneath, which folds every metadata error into
+-- false, and access() collapses denial into false too (proven live: with the
+-- containing directory at 0700 root, a non-root run reads the mirror as
+-- absent while stat() raises EACCES). Since absence is LEGITIMATE here — a
+-- host that has never run a distributor has no mirror — a bare exists() turns
+-- an unreadable second witness into a silently missing one, which is exactly
+-- the rollback the mirror exists to refuse.
+--
+-- So absence is only believed when this process can prove it could have seen
+-- the file: the containing directory must be readable+searchable. If it is
+-- not, the discriminator moves up one level — a directory that is absent from
+-- a readable parent really is absent, and a directory that is present but
+-- unreadable is a refusal. Two levels, not a walk, because both paths are
+-- ours: mesh_baseline_mirror_write() creates the leaf directory itself, and
+-- its parent is cosmix's own state root.
+-- TWO witnesses only if they are two FILES. Everything the mirror buys rests on
+-- it being physically independent of the git checkout: a stale checkout rolls
+-- the tracked floor back and the mirror is supposed to survive that. Alias the
+-- two — a symlinked /var/lib/cosmix/mesh pointing into the tree, a bind mount,
+-- a hardlink — and the fold compares a file with itself, agrees with itself,
+-- and reports a healthy two-witness floor while having exactly one. That is the
+-- worst possible failure of this design because it is SILENT and it looks fine.
+--
+-- Two independent tests, because the two aliasing routes are visible to
+-- different things: a symlink or a path nested in the tree is caught by
+-- resolving both and comparing (realpath sees through links); a bind mount or
+-- a hardlink resolves to distinct-looking paths and is only caught by asking
+-- the kernel for (dev, ino).
+function mesh_baseline_mirror_is_independent()
+  $mroot = realpath(dirname($MESH_BASELINE_MIRROR))
+  $croot = realpath($MESH_CHECKOUT_ROOT)
+  if $mroot != nil and $croot != nil then
+    if $mroot == $croot or starts_with($mroot, $croot .. "/") then
+      print("  ERROR: the out-of-tree freshness floor is not out of tree —")
+      print("         " .. dirname($MESH_BASELINE_MIRROR) .. " resolves to " .. $mroot)
+      print("         which is inside the checkout at " .. $croot .. ". A stale")
+      print("         checkout would roll BOTH witnesses back together, which is")
+      print("         the single thing the second witness exists to prevent.")
+      mesh_fatal()
+    end
+  end
+  -- The DIRECTORY being out of tree does not put the FILE out of tree. A
+  -- symlink at the mirror's own name, pointing back into the checkout at some
+  -- OTHER tracked file, defeats both of the tests around it: the directory
+  -- resolves outside the checkout, and (dev, ino) differs from the tracked
+  -- floor because it is a different file. Both witnesses then live in the
+  -- checkout, and a `git checkout` of an old commit rolls the pair back
+  -- together — exactly the failure the second witness exists to refuse.
+  -- Resolve the leaf itself, not just the directory holding it.
+  if is_file($MESH_BASELINE_MIRROR) and $croot != nil then
+    $mfile = realpath($MESH_BASELINE_MIRROR)
+    if $mfile != nil and starts_with($mfile, $croot .. "/") then
+      print("  ERROR: the out-of-tree freshness floor resolves INTO the checkout —")
+      print("         " .. $MESH_BASELINE_MIRROR .. " -> " .. $mfile)
+      print("         The directory holding it is outside the tree but the file")
+      print("         itself is not, so both witnesses would roll back together")
+      print("         with a stale checkout. Replace the link with a real file.")
+      mesh_fatal()
+    end
+  end
+  if is_file($MESH_BASELINE_MIRROR) and is_file($MESH_BASELINE) then
+    $sm = stat($MESH_BASELINE_MIRROR)
+    $st = stat($MESH_BASELINE)
+    if $sm["ino"] == $st["ino"] and $sm["dev"] == $st["dev"] then
+      print("  ERROR: " .. $MESH_BASELINE_MIRROR .. " and " .. $MESH_BASELINE)
+      print("         are the SAME file (dev " .. ("" .. $sm["dev"]) .. ", inode " .. ("" .. $sm["ino"]) .. ") — a hardlink or a")
+      print("         bind mount, not a second witness. Two copies of one file")
+      print("         agree with each other by construction and prove nothing.")
+      mesh_fatal()
+    end
+  end
+  return true
+end
+
+function mesh_baseline_mirror_absence_is_provable()
+  $dir = dirname($MESH_BASELINE_MIRROR)
+  if access($dir, "rx") then
+    -- access() answers about permission BITS, not about kind. An executable
+    -- regular file sitting at the mirror's parent path passes "rx" cleanly,
+    -- and exists() on a child of it then fails with ENOTDIR — which arrives
+    -- here as plain false, i.e. as absence. "The thing that should hold the
+    -- second witness is not a directory" is a broken host, not a host that
+    -- has never run a distributor, and the two must not share an answer.
+    if not is_dir($dir) then
+      print("  ERROR: " .. $dir .. " exists and is readable but is NOT a")
+      print("         directory, so the out-of-tree freshness floor cannot live")
+      print("         there and cannot be consulted. A path that can never hold")
+      print("         the second witness is not the same as one that does not")
+      print("         hold it yet.")
+      mesh_fatal()
+    end
+    return true
+  end
+  $up = dirname($dir)
+  -- Same ENOTDIR trap, one level up: if $up is an executable REGULAR file,
+  -- access($up,"rx") passes and exists($dir) then returns false through
+  -- ENOTDIR, so the walk below concludes "provably absent" about a path that
+  -- can never hold anything. Assert the kind before trusting the answer.
+  if access($up, "rx") and not is_dir($up) then
+    print("  ERROR: " .. $up .. " is readable but is NOT a directory, so neither")
+    print("         " .. $dir .. " nor the out-of-tree freshness floor beneath it")
+    print("         can be consulted. That is a broken host, not an absent floor.")
+    mesh_fatal()
+  end
+  if not access($up, "rx") then
+    print("  ERROR: cannot determine whether the out-of-tree freshness floor")
+    print("         " .. $MESH_BASELINE_MIRROR .. " exists: neither " .. $dir)
+    print("         nor " .. $up .. " is readable by this process.")
+    print("         A floor that cannot be read is not a floor that is absent.")
+    mesh_fatal()
+  end
+  if exists($dir) then
+    print("  ERROR: " .. $dir .. " exists but is not readable by this process,")
+    print("         so the out-of-tree freshness floor cannot be consulted.")
+    print("         Refusing to treat an unreadable second witness as an absent")
+    print("         one — that is the downgrade it was added to refuse.")
+    mesh_fatal()
+  end
+  return true
+end
+
+-- A THIRD way to read as absent: the name is taken by something that does not
+-- resolve. exists() follows symlinks, so a mirror path that is a dangling link
+-- — or a link into a directory this process cannot search — answers false and
+-- is indistinguishable from a host that has simply never run a distributor.
+-- The lstat form (v0.39.0) sees the link itself, which is the difference
+-- between "there is nothing here" and "there is something here and it is
+-- broken". Only the first is legitimate; the second is a witness that has been
+-- destroyed rather than never created, and saying "absent" about it hands back
+-- the free pass the mirror exists to withhold.
+function mesh_baseline_mirror_name_is_free()
+  if not exists($MESH_BASELINE_MIRROR, {follow_symlinks: false}) then
+    return true
+  end
+  print("  ERROR: " .. $MESH_BASELINE_MIRROR .. " exists as a name but does not")
+  print("         resolve — a dangling symlink, or a link into a directory this")
+  print("         process cannot search. That is a DESTROYED second witness, not")
+  print("         an absent one, and it is not a licence to fall back to the")
+  print("         tracked floor alone.")
+  mesh_fatal()
+end
+
+function mesh_baseline_mirror_read()
+  mesh_baseline_mirror_is_independent()
+  if not exists($MESH_BASELINE_MIRROR) then
+    mesh_baseline_mirror_absence_is_provable()
+    mesh_baseline_mirror_name_is_free()
+    return {present: false, baseline: nil}
+  end
+  $raw = nil
+  try
+    $raw = load_data($MESH_BASELINE_MIRROR)
+  catch $m
+    print("  ERROR: the out-of-tree freshness floor " .. $MESH_BASELINE_MIRROR)
+    print("         exists but could not be read: " .. $m)
+    mesh_fatal()
+  end
+  $b = $raw["baseline"]
+  if type($b) != "map" or type($b["epoch"]) != "number" or type($b["recovery_generation"]) != "number" then
+    print("  ERROR: malformed out-of-tree freshness floor in " .. $MESH_BASELINE_MIRROR)
+    mesh_fatal()
+  end
+  if $b["authoring_blake3"] != nil and type($b["authoring_blake3"]) != "string" then
+    print("  ERROR: malformed authoring_blake3 in " .. $MESH_BASELINE_MIRROR)
+    mesh_fatal()
+  end
+  if $b["verify_keys_blake3"] != nil and type($b["verify_keys_blake3"]) != "string" then
+    print("  ERROR: malformed verify_keys_blake3 in " .. $MESH_BASELINE_MIRROR)
+    mesh_fatal()
+  end
+  if $b["canonical_blake3"] != nil and type($b["canonical_blake3"]) != "string" then
+    print("  ERROR: malformed canonical_blake3 in " .. $MESH_BASELINE_MIRROR)
+    mesh_fatal()
+  end
+  assert_exact_int($b["epoch"], "mirror epoch", $MESH_BASELINE_MIRROR)
+  assert_exact_int($b["recovery_generation"], "mirror recovery_generation", $MESH_BASELINE_MIRROR)
+  return {present: true, baseline: $b}
+end
+
+-- Install the same bytes outside the tree. FATAL on failure: a floor that
+-- silently stops being mirrored is a floor that silently loses the property
+-- above, and the run that noticed is the only one in a position to say so.
+-- Best-effort removal of a staged mirror temp on an abort path. Best-effort is
+-- the honest contract: we are already exiting non-zero, and a leftover
+-- .tmp.<uuid> beside the mirror is inert (nothing reads it) — but it is worth
+-- one line so the next operator is not left wondering what dropped it there.
+function mirror_tmp_discard($tmp)
+  $rm = run_argv(["sudo", "-n", "rm", "-f", $tmp])
+  if $rm["exit_code"] != 0 then
+    print("  note: could not remove the staged temp " .. $tmp .. " — remove it by hand")
+  end
+end
+function mesh_baseline_mirror_write($src)
+  mesh_baseline_mirror_is_independent()
+  $md = run_argv(["sudo", "-n", "install", "-d", "-o", "root", "-g", "root", "-m", "0755", dirname($MESH_BASELINE_MIRROR)])
+  if $md["exit_code"] != 0 then
+    print("  ERROR: could not create " .. dirname($MESH_BASELINE_MIRROR) .. ": " .. trim($md["stderr"]))
+    mesh_fatal()
+  end
+  -- That install -d may have CREATED the directory, and a new directory's own
+  -- NAME lives in its PARENT. Syncing the mirror's directory (at the end of
+  -- this function) makes the mirror file's name durable INSIDE a directory
+  -- whose own name is not yet on disk — so a bootstrap crash can take the
+  -- whole directory with it. The mirror is deliberately written BEFORE the
+  -- tracked floor precisely so that a crash between them leaves the mirror
+  -- ahead; losing the mirror to an unsynced parent inverts that ordering back
+  -- to the failure it was chosen to avoid. Unconditional: it is one fsync, and
+  -- asking "did I just create it?" first is one more race than it is worth.
+  $sp = run_argv(["sudo", "-n", "sync", dirname(dirname($MESH_BASELINE_MIRROR))])
+  if $sp["exit_code"] != 0 then
+    print("  ERROR: could not flush " .. dirname(dirname($MESH_BASELINE_MIRROR)) .. ": " .. trim($sp["stderr"]))
+    print("         The directory that is to hold the second witness may not survive a crash.")
+    mesh_fatal()
+  end
+  -- install(1) is not atomic: it unlinks the destination and creates a new file
+  -- in its place, so a crash mid-copy leaves a TRUNCATED mirror. That is worse
+  -- than no mirror at all — mesh_baseline_mirror_read refuses a malformed floor
+  -- outright, so every verified read on this host would fail until a human
+  -- repaired it by hand. The tracked floor solved this with temp+rename; the
+  -- mirror gets the same treatment. Order matters: sync the TEMP's data before
+  -- the rename, so the name only ever appears once its contents are durable,
+  -- then sync the directory to make the name itself durable.
+  $tmp = $MESH_BASELINE_MIRROR .. ".tmp." .. uuid()
+  $in = run_argv(["sudo", "-n", "install", "-o", "root", "-g", "root", "-m", "0644", $src, $tmp])
+  if $in["exit_code"] != 0 then
+    print("  ERROR: could not stage the mirrored freshness floor at " .. $tmp .. ": " .. trim($in["stderr"]))
+    print("         The tracked floor alone is rolled back by the stale checkout it exists to refuse.")
+    mesh_fatal()
+  end
+  $sy = run_argv(["sudo", "-n", "sync", $tmp])
+  if $sy["exit_code"] != 0 then
+    print("  ERROR: mirrored floor staged but not flushed: " .. trim($sy["stderr"]))
+    mirror_tmp_discard($tmp)
+    mesh_fatal()
+  end
+  -- mv -f within one directory is rename(2): a concurrent reader sees the old
+  -- floor or the new one, never a torn one.
+  $mv = run_argv(["sudo", "-n", "mv", "-f", $tmp, $MESH_BASELINE_MIRROR])
+  if $mv["exit_code"] != 0 then
+    print("  ERROR: could not mirror the freshness floor to " .. $MESH_BASELINE_MIRROR .. ": " .. trim($mv["stderr"]))
+    print("         The tracked floor alone is rolled back by the stale checkout it exists to refuse.")
+    mirror_tmp_discard($tmp)
+    mesh_fatal()
+  end
+  $sd = run_argv(["sudo", "-n", "sync", dirname($MESH_BASELINE_MIRROR)])
+  if $sd["exit_code"] != 0 then
+    print("  ERROR: mirrored floor installed but its directory entry could not be flushed: " .. trim($sd["stderr"]))
+    mesh_fatal()
+  end
+end
+
+-- REPAIR the second witness when it has fallen behind.
+--
+-- Without this the mirror can be permanently orphaned by a single failed
+-- install: the tracked floor advances first, so the retry finds nothing to
+-- raise, takes the no-change path, and never writes the mirror again. The
+-- effective floor stays correct for THIS host (max of the two, and the tracked
+-- copy is the higher one) — which is exactly why it goes unnoticed — but the
+-- property the mirror exists for is gone, and the next stale checkout walks
+-- straight through. A degradation nobody sees is the failure mode this whole
+-- file is written against.
+--
+-- Repairing is not raising: it copies a floor this host has ALREADY accepted
+-- to the second place it is meant to be recorded. Fatal on failure for the
+-- same reason the initial mirror write is — a floor that cannot be kept in two
+-- places has lost the property, and the run that noticed is the only one in a
+-- position to say so.
+function mesh_baseline_mirror_sync($path)
+  $b = nil
+  try
+    $b = load_data($path)["baseline"]
+  catch $m
+    print("  ERROR: could not read the tracked freshness floor " .. $path .. ": " .. $m)
+    mesh_fatal()
+  end
+  if type($b) != "map" or type($b["epoch"]) != "number" or type($b["recovery_generation"]) != "number" then
+    print("  ERROR: malformed tracked freshness floor in " .. $path)
+    mesh_fatal()
+  end
+  $m = mesh_baseline_mirror_read()
+  if $m["present"] then
+    $mb = $m["baseline"]
+    -- A mirror naming a DIFFERENT mesh is not a stale copy of this floor, it is
+    -- someone else's — overwriting it would be this host quietly taking over
+    -- another mesh's anti-rollback state. Refuse; a human decides.
+    if $mb["mesh"] != $b["mesh"] then
+      print("  ERROR: " .. $MESH_BASELINE_MIRROR .. " records mesh '" .. ("" .. $mb["mesh"]) ..
+        "' but the tracked floor is for '" .. ("" .. $b["mesh"]) .. "'.")
+      print("         Refusing to overwrite another mesh's freshness floor.")
+      mesh_fatal()
+    end
+    -- "Behind" is the same generation-first order mesh_baseline_read folds by,
+    -- not an axis-wise comparison: a mirror at (14,0) is BEHIND a tracked floor
+    -- at (9,3), because the recovery that produced generation 3 retired epoch
+    -- 14. Testing `epoch >= and generation >=` would call that mirror
+    -- "not behind", leave it, and let the fold resurrect epoch 14 forever.
+    $mirror_ahead = false
+    if $mb["recovery_generation"] > $b["recovery_generation"] then
+      $mirror_ahead = true
+    end
+    if $mb["recovery_generation"] == $b["recovery_generation"] and $mb["epoch"] > $b["epoch"] then
+      $mirror_ahead = true
+    end
+    if $mirror_ahead then
+      return false
+    end
+    -- Same pair on both witnesses, so neither is behind the other on
+    -- freshness — but the pair is no longer the whole floor. The authoring
+    -- hash is written at the pair it belongs to, and a mirror carrying a
+    -- DIFFERENT hash for the SAME pair disagrees about which payload was
+    -- rolled out. The fold in mesh_baseline_read keeps the tracked hash at an
+    -- equal pair, so the disagreement is invisible until the tracked floor is
+    -- the one that is lost — and then the surviving witness refuses the live
+    -- payload at its own epoch. Repair it now, while the tracked floor (which
+    -- is git-tracked, and is what the mirror is a copy of) is still here to
+    -- say which hash is right.
+    if $mb["epoch"] == $b["epoch"] and $mb["recovery_generation"] == $b["recovery_generation"] then
+      if $mb["authoring_blake3"] == $b["authoring_blake3"] and $mb["verify_keys_blake3"] == $b["verify_keys_blake3"] and $mb["canonical_blake3"] == $b["canonical_blake3"] then
+        return false
+      end
+      -- This function reads the RAW tracked file, not the folded floor, so it
+      -- cannot assume the tracked side is the better-informed one. If the
+      -- mirror carries a binding the tracked file lacks, writing the tracked
+      -- bytes outward would DESTROY the only copy of it — the exact fault
+      -- this branch was added to repair, in the other direction. Leave the
+      -- mirror alone; mesh_baseline_read folds the mirror's field in and
+      -- mesh_baseline_tracked_repair writes the completed floor back to the
+      -- tracked witness, after which this branch has something worth copying.
+      if $b["authoring_blake3"] == nil and $mb["authoring_blake3"] != nil then
+        return false
+      end
+      if $b["verify_keys_blake3"] == nil and $mb["verify_keys_blake3"] != nil then
+        return false
+      end
+      if $b["canonical_blake3"] == nil and $mb["canonical_blake3"] != nil then
+        return false
+      end
+      print("  floor    : out-of-tree witness is missing a payload binding the tracked floor has — repairing")
+      mesh_baseline_mirror_write($path)
+      return true
+    end
+    print("  floor    : out-of-tree witness at " .. $MESH_BASELINE_MIRROR .. " is behind the tracked floor — repairing")
+  else
+    print("  floor    : establishing the out-of-tree witness at " .. $MESH_BASELINE_MIRROR)
+  end
+  mesh_baseline_mirror_write($path)
+  return true
+end
+function mesh_baseline_read($path)
+  if not exists($path) then
+    print("  ERROR: freshness baseline missing: " .. $path)
+    print("         Refusing to accept a signed inventory with no downgrade floor")
+    print("         to compare it against — a valid signature is not freshness.")
+    mesh_fatal()
+  end
+  -- load_data RAISES on a witness that is not readable strict data, and a raise
+  -- leaves the interpreter with status 1 no matter what $MESH_FATAL_EXIT says.
+  -- In check-public-hygiene.mix that means a corrupt floor reports as "scanned,
+  -- found violations" instead of "could not answer" — the exact inversion the
+  -- knob exists to prevent. The two other witness readers already catch; this
+  -- one did not. Catch and refuse, naming the witness.
+  $bd = nil
+  try
+    $bd = load_data($path)
+  catch $lmsg
+    print("  ERROR: freshness baseline is not readable strict data: " .. $path)
+    print("         " .. $lmsg)
+    mesh_fatal()
+  end
+  $b = $bd["baseline"]
+  -- SHAPE FIRST. The field checks below index $b, so a file whose `baseline`
+  -- is a number (or absent) must be caught here or Mix raises "cannot index
+  -- number with string" from inside a builtin — a message that names neither
+  -- the witness nor what was wrong with it, on the one code path whose whole
+  -- job is to tell an operator which of two floors is broken.
+  if type($b) != "map" or type($b["epoch"]) != "number" or type($b["recovery_generation"]) != "number" then
+    print("  ERROR: malformed freshness baseline in " .. $path)
+    print("         want {baseline: {mesh, epoch, recovery_generation[, authoring_blake3, verify_keys_blake3, canonical_blake3]}}")
+    mesh_fatal()
+  end
+  if $b["authoring_blake3"] != nil and type($b["authoring_blake3"]) != "string" then
+    print("  ERROR: malformed freshness baseline in " .. $path)
+    print("         authoring_blake3, when present, must be a string")
+    mesh_fatal()
+  end
+  if $b["verify_keys_blake3"] != nil and type($b["verify_keys_blake3"]) != "string" then
+    print("  ERROR: malformed freshness baseline in " .. $path)
+    print("         verify_keys_blake3, when present, must be a string")
+    mesh_fatal()
+  end
+  if $b["canonical_blake3"] != nil and type($b["canonical_blake3"]) != "string" then
+    print("  ERROR: malformed freshness baseline in " .. $path)
+    print("         canonical_blake3, when present, must be a string")
+    mesh_fatal()
+  end
+  assert_exact_int($b["epoch"], "baseline epoch", $path)
+  assert_exact_int($b["recovery_generation"], "baseline recovery_generation", $path)
+  -- Fold in the out-of-tree witness. NOT per axis: the two witnesses are
+  -- compared the way the VERIFIER compares payloads, because a recovery
+  -- legitimately LOWERS the epoch while raising the generation (inventory.rs
+  -- skips the epoch test entirely on the recovery branch — `if p.epoch <
+  -- state.last_epoch` sits in the normal arm — and noded persists the accepted
+  -- PAIR, so the fleet's epoch floor really does drop). Taking the higher of
+  -- each axis independently would resurrect the epoch a recovery deliberately
+  -- retired: fold (14,0) with (9,3) and you get (14,3), a pair no signer ever
+  -- minted, which then refuses every epoch the post-recovery line will issue —
+  -- 10, 11, 12 — with no way to author around it. That skew is reachable
+  -- whenever one witness is written and the other is not (a crash between the
+  -- mirror install and the tracked rename — mesh_baseline_write does the
+  -- mirror first, deliberately — or a tracked file rolled back by git while
+  -- the mirror survives).
+  --
+  -- So the higher GENERATION wins outright, pair and all; only at an EQUAL
+  -- generation does the higher epoch decide. This can lower the epoch relative
+  -- to the tracked file, and that is the point: it only happens when the other
+  -- witness proves a strictly later recovery, which is exactly the event the
+  -- epoch axis is required to yield to.
+  $m = mesh_baseline_mirror_read()
+  if $m["present"] then
+    $mb = $m["baseline"]
+    if $mb["mesh"] != $b["mesh"] then
+      print("  ERROR: the tracked floor is for mesh '" .. ("" .. $b["mesh"]) .. "' but " .. $MESH_BASELINE_MIRROR)
+      print("         records mesh '" .. ("" .. $mb["mesh"]) .. "' — two meshes' floors cannot be compared.")
+      mesh_fatal()
+    end
+    if $mb["recovery_generation"] > $b["recovery_generation"] then
+      print("  floor    : out-of-tree witness is ahead on generation (" .. ("" .. $b["recovery_generation"]) .. " -> " .. ("" .. $mb["recovery_generation"]) .. ") — adopting its pair (epoch " .. ("" .. $b["epoch"]) .. " -> " .. ("" .. $mb["epoch"]) .. ")")
+      $b["epoch"] = $mb["epoch"]
+      $b["recovery_generation"] = $mb["recovery_generation"]
+      -- The content hash belongs to the PAIR, not to a file. Adopting one
+      -- witness's pair while keeping the other's hash would assert that the
+      -- adopted epoch carried content it never carried — and the equal-epoch
+      -- content check below would then refuse the very payload that is live.
+      $b["authoring_blake3"] = $mb["authoring_blake3"]
+      $b["verify_keys_blake3"] = $mb["verify_keys_blake3"]
+      $b["canonical_blake3"] = $mb["canonical_blake3"]
+    else
+      if $mb["recovery_generation"] == $b["recovery_generation"] and $mb["epoch"] > $b["epoch"] then
+        print("  floor    : out-of-tree witness is ahead on epoch at the same generation (" .. ("" .. $b["epoch"]) .. " -> " .. ("" .. $mb["epoch"]) .. ") — using the higher")
+        $b["epoch"] = $mb["epoch"]
+        $b["authoring_blake3"] = $mb["authoring_blake3"]
+        $b["verify_keys_blake3"] = $mb["verify_keys_blake3"]
+        $b["canonical_blake3"] = $mb["canonical_blake3"]
+      end
+      -- EQUAL PAIR, DIFFERENT PAYLOAD. Neither witness is fresher, so there is
+      -- no fold that can be justified — and picking one silently is worse than
+      -- it looks: the loser's hash is what the equal-epoch content check would
+      -- have used to refuse a superseded payload. Choosing the tracked file
+      -- because it is git-tracked is not evidence; a stale checkout is exactly
+      -- how it goes wrong (tracked (14,0,h_old) beside a mirror the rollout
+      -- left at (14,0,h_new) — adopt h_old and the retired payload passes).
+      --
+      -- This is a "cannot answer", not a "found a rollback", and it gets the
+      -- same treatment as every other one in this toolkit: refuse and name
+      -- both sides. A hash MISSING on one side is a different thing — an
+      -- older-format witness, not a conflicting claim — and is repaired from
+      -- the side that has one (mesh_baseline_mirror_sync), never refused.
+      if $mb["epoch"] == $b["epoch"] and $mb["recovery_generation"] == $b["recovery_generation"] then
+        $conflict = false
+        if $mb["authoring_blake3"] != nil and $b["authoring_blake3"] != nil and $mb["authoring_blake3"] != $b["authoring_blake3"] then
+          $conflict = true
+        end
+        if $mb["verify_keys_blake3"] != nil and $b["verify_keys_blake3"] != nil and $mb["verify_keys_blake3"] != $b["verify_keys_blake3"] then
+          $conflict = true
+        end
+        if $mb["canonical_blake3"] != nil and $b["canonical_blake3"] != nil and $mb["canonical_blake3"] != $b["canonical_blake3"] then
+          $conflict = true
+        end
+        if $conflict then
+          print("  ERROR: the two freshness witnesses agree on (epoch " .. ("" .. $b["epoch"]) ..
+            ", generation " .. ("" .. $b["recovery_generation"]) .. ") but name DIFFERENT payloads.")
+          print("    tracked : " .. $path)
+          print("              content " .. ("" .. $b["authoring_blake3"]))
+          print("              keys    " .. ("" .. $b["verify_keys_blake3"]))
+          print("              bytes   " .. ("" .. $b["canonical_blake3"]))
+          print("    mirror  : " .. $MESH_BASELINE_MIRROR)
+          print("              content " .. ("" .. $mb["authoring_blake3"]))
+          print("              keys    " .. ("" .. $mb["verify_keys_blake3"]))
+          print("              bytes   " .. ("" .. $mb["canonical_blake3"]))
+          print("    Neither is demonstrably fresher, so there is no safe fold —")
+          print("    and whichever were discarded is the hash that would refuse a")
+          print("    superseded payload at this epoch. Usually a stale checkout of")
+          print("    the tracked floor beside a mirror a rollout advanced.")
+          print("    Decide which payload this host actually rolled out (compare")
+          print("    against the signed cache), restore that witness, and re-run.")
+          mesh_fatal()
+        end
+        -- Not a conflict: one witness simply predates a field. The comment
+        -- above promised this is repaired from the side that HAS one, and
+        -- until now it was not — the fold returned the tracked map whether or
+        -- not the mirror knew more, so an older-format tracked floor beside a
+        -- fully-populated mirror produced a floor with NO content binding at
+        -- all, and mesh_baseline_mirror_sync then copied that hole outward
+        -- over the mirror that still had the answer. Both bindings gone, and
+        -- a differently-authored payload at the same epoch walks in.
+        --
+        -- A present value beats an absent one: absence is "this witness was
+        -- written before the field existed", never a claim that the payload
+        -- had no content. Two present values that differ were already refused
+        -- above, so adopting cannot overwrite a live claim.
+        --
+        -- But adopt the binding SET, not field by field. Per-field adoption
+        -- also fires when each witness holds a binding the other lacks —
+        -- tracked knowing only the roster of payload P1, the mirror only the
+        -- trust root of P2 — and unions them into (roster P1, keys P2), a
+        -- combination NEITHER witness attested and quite possibly a payload
+        -- that never existed. That floor then admits a hybrid nothing rolled
+        -- out, and mesh_baseline_tracked_repair persists the invention to both
+        -- witnesses, so the fabricated pair outlives the accident that made it.
+        --
+        -- Crossed partials mean neither witness saw a whole payload, so there
+        -- is nothing to fold. Same disposition as the conflict above: cannot
+        -- answer, name both sides, refuse. It is not reachable through this
+        -- code's own history — every mesh_baseline_write call site passes both
+        -- hashes or neither, and the roster binding predates the keys binding,
+        -- so no release ever wrote keys-without-roster — which is exactly why
+        -- it must be refused rather than trusted: a witness in that state was
+        -- not written by this toolkit.
+        $t_only = $b["authoring_blake3"] != nil and $mb["authoring_blake3"] == nil
+        $m_only = $mb["authoring_blake3"] != nil and $b["authoring_blake3"] == nil
+        $t_only_k = $b["verify_keys_blake3"] != nil and $mb["verify_keys_blake3"] == nil
+        $m_only_k = $mb["verify_keys_blake3"] != nil and $b["verify_keys_blake3"] == nil
+        $t_only_c = $b["canonical_blake3"] != nil and $mb["canonical_blake3"] == nil
+        $m_only_c = $mb["canonical_blake3"] != nil and $b["canonical_blake3"] == nil
+        if ($t_only or $t_only_k or $t_only_c) and ($m_only or $m_only_k or $m_only_c) then
+          print("  ERROR: at (epoch " .. ("" .. $b["epoch"]) .. ", generation " ..
+            ("" .. $b["recovery_generation"]) .. ") each freshness witness names")
+          print("         part of a payload the OTHER does not, so neither of them")
+          print("         saw a whole one.")
+          print("    tracked : " .. $path)
+          print("              content " .. ("" .. $b["authoring_blake3"]))
+          print("              keys    " .. ("" .. $b["verify_keys_blake3"]))
+          print("              bytes   " .. ("" .. $b["canonical_blake3"]))
+          print("    mirror  : " .. $MESH_BASELINE_MIRROR)
+          print("              content " .. ("" .. $mb["authoring_blake3"]))
+          print("              keys    " .. ("" .. $mb["verify_keys_blake3"]))
+          print("              bytes   " .. ("" .. $mb["canonical_blake3"]))
+          print("    Combining them would assert a payload with one witness's")
+          print("    roster and the other's trust root — a pair nothing signed.")
+          print("    No release of this toolkit writes a witness in this shape,")
+          print("    so one of them was not written by it. Decide which payload")
+          print("    this host rolled out, re-seed both witnesses from it, and")
+          print("    re-run.")
+          mesh_fatal()
+        end
+        if $b["authoring_blake3"] == nil and $mb["authoring_blake3"] != nil then
+          $b["authoring_blake3"] = $mb["authoring_blake3"]
+        end
+        if $b["verify_keys_blake3"] == nil and $mb["verify_keys_blake3"] != nil then
+          $b["verify_keys_blake3"] = $mb["verify_keys_blake3"]
+        end
+        if $b["canonical_blake3"] == nil and $mb["canonical_blake3"] != nil then
+          $b["canonical_blake3"] = $mb["canonical_blake3"]
+        end
+      end
+    end
+  end
+  return $b
+end
+
+-- Never written in place. A truncating write leaves a half-written floor on an
+-- interruption, and mesh_baseline_read refuses a malformed one — which would
+-- brick every verifier on this host until repaired by hand. Stage a sibling
+-- temp with write_new (which refuses an existing name, so a planted link stops
+-- the run rather than redirecting the floor) and rename: rename(2) within a
+-- directory is atomic, so a reader sees either the old floor or the new one,
+-- never a torn one.
+function mesh_baseline_write($path, $mesh_name, $epoch, $generation, $authoring, $vkeys, $canonical)
+  $tmp = $path .. ".new." .. ("" .. pid())
+  -- The authoring hash is what makes an equal epoch decidable: two payloads
+  -- sharing an epoch are otherwise interchangeable to every freshness check.
+  -- Omitted when the caller does not know it (a floor seeded by hand, or a
+  -- payload predating the field), which reads back as "no equal-epoch test"
+  -- rather than as a refusal no operator can clear.
+  $auth = ""
+  if type($authoring) == "string" and not is_empty($authoring) then
+    $auth = ",\n    authoring_blake3: " .. json_encode($authoring)
+  end
+  if type($vkeys) == "string" and not is_empty($vkeys) then
+    $auth = $auth .. ",\n    verify_keys_blake3: " .. json_encode($vkeys)
+  end
+  if type($canonical) == "string" and not is_empty($canonical) then
+    $auth = $auth .. ",\n    canonical_blake3: " .. json_encode($canonical)
+  end
+  $body = ("-- SPEC 13 freshness floor: the (epoch, recovery_generation) pair this\n" ..
+    "-- control host has COMMITTED to applying. Its writers use the agreed\n" ..
+    "-- ratchet points below:\n" ..
+    "--   deploy_wg, deploy_dnsd  BEFORE the fan-out — a run that has already\n" ..
+    "--     reloaded one node has already made the older payload a rollback, so a\n" ..
+    "--     floor recorded only on full success records nothing at all when the\n" ..
+    "--     fan-out dies partway.\n" ..
+    "--   mesh_push, mesh_sync   immediately after the FIRST target node verifies.\n" ..
+    "--     One accepted node makes the older payload a rollback, whether or not\n" ..
+    "--     the remainder of the fan-out succeeds. inventory.signed is published\n" ..
+    "--     only after the distributor's full target set accepts, so the canonical\n" ..
+    "--     cache means rolled out, not merely authorised. A partial mesh_sync may\n" ..
+    "--     therefore advance the floor while leaving the canonical cache alone.\n" ..
+    "--     Canonical readers refuse during this in-progress rollout window until\n" ..
+    "--     mesh_sync completes.\n" ..
+    "--     This first-accept rule is NORMAL-PATH ONLY. A future recovery\n" ..
+    "--     distributor must define separate resume semantics: retrying the same\n" ..
+    "--     recovery_generation is not a fresh recovery advance.\n" ..
+    "-- None of them is a claim that the rollout FINISHED. Every\n" ..
+    "-- verified_inventory() call refuses a payload below the floor. Both axes are\n" ..
+    "-- kept because recovery\n" ..
+    "-- SUPERSEDES the epoch axis (cosmix-lib-mesh-trust inventory.rs, the\n" ..
+    "-- rollback/recovery axis): a genesis recovery may carry a LOWER epoch and is\n" ..
+    "-- fresh anyway if its generation advances. An epoch-only floor would reject\n" ..
+    "-- exactly the payload recovery exists to deliver. Git-tracked so a fresh clone\n" ..
+    "-- inherits the floor rather than starting at zero, which is where a\n" ..
+    "-- replayed old inventory would get in.\n" ..
+    "{\n  baseline: {\n    mesh: " .. json_encode($mesh_name) .. ",\n" ..
+    "    epoch: " .. ("" .. $epoch) .. ",\n" ..
+    "    recovery_generation: " .. ("" .. $generation) .. $auth .. "\n  }\n}\n")
+  -- write_new, not write_file: write_file FOLLOWS a symlink at the staging
+  -- name, and the staging name is a predictable sibling (the floor's own path
+  -- plus this pid). A link planted there sends the new floor somewhere else
+  -- and then renames the LINK onto the floor's path, leaving the anti-rollback
+  -- state as a dangling or attacker-chosen pointer. write_new refuses any name
+  -- that already exists, so the run stops instead. A leftover temp from a
+  -- crashed run with the same pid is cleared first, which is a name this
+  -- function alone constructs.
+  try
+    remove($tmp)
+  catch $bmsg
+    print("  ERROR: could not clear the staging name for the freshness floor: " .. $bmsg)
+    print("         " .. $tmp .. " is in the way and is not an ordinary file.")
+    mesh_fatal()
+  end
+  try
+    write_new($tmp, $body, "0644")
+  catch $wmsg
+    print("  ERROR: could not stage the freshness floor at " .. $tmp .. ": " .. $wmsg)
+    mesh_fatal()
+  end
+  -- DURABILITY. This floor is anti-rollback state: a crash that loses it
+  -- silently lowers the bar an old payload has to clear, which is exactly the
+  -- attack it exists to stop. write_new + rename gives ATOMICITY (no torn
+  -- file) but not durability — the rename can reach the log before the data
+  -- reaches the platter, so a crash can leave the entry pointing at nothing.
+  -- Mix has no fsync builtin (a real gap in the binary, raised separately);
+  -- coreutils `sync FILE` IS fsync(2) on that file and `sync DIR` fsyncs the
+  -- directory, so the ordering below is the full barrier: data first, then
+  -- rename, then the directory entry that names it. Shelling out to a genuine
+  -- external tool is the sanctioned route; a shell-scripted workaround is not,
+  -- and this is a rare write (once per committed rollout), so the cost of
+  -- doing it properly is nothing.
+  $sy = run_argv(["sync", $tmp])
+  if $sy["exit_code"] != 0 then
+    $rm = run_argv(["rm", "-f", $tmp])
+    if $rm["exit_code"] != 0 then
+      print("  note: could not remove the unsynced baseline " .. $tmp)
+    end
+    print("  ERROR: could not flush the new freshness baseline to disk: " .. trim($sy["stderr"]))
+    mesh_fatal()
+  end
+  -- SECOND WITNESS FIRST. The two witnesses cannot be committed atomically, so
+  -- the ORDER decides which way a crash between them fails. Tracked-first fails
+  -- CLOSED-looking and open in fact: tracked (15,0) durable, mirror still
+  -- (14,0), then the checkout is rolled back to (14,0) — both witnesses now
+  -- agree on 14 and the fold has nothing to notice, so an epoch-14 replay walks
+  -- in. Mirror-first inverts it: a crash leaves the mirror at (15,0) and the
+  -- tracked file at (14,0), and the fold ADOPTS the higher witness, so the
+  -- floor is 15 either way. The failure mode becomes "a floor slightly ahead of
+  -- what was recorded in git", which costs a re-sign at worst; the other one
+  -- costs the property.
+  --
+  -- Installed from $tmp, not from $path: $path does not hold the new value yet,
+  -- and $tmp is already synced, so both copies are byte-identical by
+  -- construction rather than by two renderings that could drift.
+  mesh_baseline_mirror_write($tmp)
+  -- rename() returns nil and RAISES on failure (mix builtins rename) — a
+  -- `if not rename(...)` guard reads the nil as false and reports every
+  -- successful rename as a failure. Catch instead, and leave no temp behind.
+  try
+    rename($tmp, $path)
+  catch $rerr
+    $rm = run_argv(["rm", "-f", $tmp])
+    if $rm["exit_code"] != 0 then
+      print("  note: could not remove the partial baseline " .. $tmp)
+    end
+    print("  ERROR: could not install the new freshness baseline at " .. $path .. ": " .. $rerr)
+    mesh_fatal()
+  end
+  -- and the directory entry itself: without this the rename is durable only
+  -- as far as the page cache, and a crash can restore the OLD name.
+  $sd = run_argv(["sync", dirname($path)])
+  if $sd["exit_code"] != 0 then
+    print("  ERROR: the new freshness baseline was installed at " .. $path .. " but its directory entry could not be flushed: " .. trim($sd["stderr"]))
+    print("         A crash now could restore the OLD floor. Re-run once the disk is healthy.")
+    mesh_fatal()
+  end
+end
+
+-- Enforced inside verified_inventory (see opts.baseline). This MIRRORS the
+-- acceptance rule in cosmix-lib-mesh-trust (the rollback/recovery axis) rather
+-- than inventing a second one: the verifier has already applied the genesis
+-- authorisation rules and hands us the ACCEPTED pair, so all that is left is
+-- the rollback comparison the verifier structurally cannot make (it builds its
+-- trust state with last_epoch 0, so an old-but-validly-signed payload passes
+-- everything upstream of here).
+function assert_freshness_floor($vi, $path)
+  $b = mesh_baseline_read($path)
+  if $b["mesh"] != $vi["mesh"] then
+    print("  ERROR: freshness baseline is for mesh '" .. ("" .. $b["mesh"]) .. "' but the payload names '" .. $vi["mesh"] .. "'")
+    mesh_fatal()
+  end
+  if $vi["via_recovery"] then
+    -- Recovery supersedes the epoch axis: a genesis recovery may legitimately
+    -- carry a LOWER epoch. A NEW recovery must strictly advance generation,
+    -- but an exact-hash equal-generation re-read is the idempotent retry Rust
+    -- accepts. Mirror inventory.rs's recovery arm + baseline hash pin exactly.
+    if $vi["recovery_generation"] < $b["recovery_generation"] then
+      print("  ERROR: recovery generation " .. ("" .. $vi["recovery_generation"]) ..
+        " is below this host's floor " .. ("" .. $b["recovery_generation"]) .. ".")
+      print("    " .. $vi["source"])
+      print("    The genesis signature is valid — that is not the question. A")
+      print("    new recovery must STRICTLY advance the generation, else an old")
+      print("    recovery could be replayed to reinstate a superseded trust set.")
+      mesh_fatal()
+    end
+    if $vi["recovery_generation"] == $b["recovery_generation"] then
+      if $b["canonical_blake3"] == nil then
+        print("  ERROR: equal-generation recovery cannot be authenticated because the control witness has no canonical_blake3 pin.")
+        print("    " .. $vi["source"])
+        print("    Re-seed the witness canonical_blake3 from the rolled-out signed")
+        print("    artifact; without that exact-bytes pin this could be a different")
+        print("    recovery replayed at an already-accepted generation.")
+        mesh_fatal()
+      end
+      if $vi["canonical_blake3"] != $b["canonical_blake3"] then
+        print("  ERROR: equal-generation recovery carries different signed bytes from the accepted recovery.")
+        print("    rolled out  : " .. $b["canonical_blake3"])
+        print("    this payload: " .. $vi["canonical_blake3"])
+        print("    Reuse the exact rolled-out recovery artifact; a different payload")
+        print("    at this generation is a replay/conflict, not an idempotent retry.")
+        mesh_fatal()
+      end
+    end
+    return
+  end
+  if $vi["epoch"] < $b["epoch"] then
+    print("  ERROR: inventory epoch " .. ("" .. $vi["epoch"]) .. " is BELOW this host's floor " .. ("" .. $b["epoch"]) .. ".")
+    print("    " .. $vi["source"])
+    print("    The signature is valid — that is not the question. This payload is")
+    print("    older than one already rolled out, so applying it would roll the")
+    print("    mesh back. If the rollback is deliberate, sign a NEW epoch that")
+    print("    carries the old topology; do not lower the floor.")
+    print("    A partially completed mesh_sync leaves the canonical cache behind the floor too — resume it from the retained proposal before signing anything new.")
+    mesh_fatal()
+  end
+  -- Exact signed bytes at an already-accepted pair, matching noded's
+  -- last_canonical_hash pin. authoring_blake3 deliberately ignores signer-owned
+  -- metadata and verify_keys_blake3 covers the trust-root set, but neither can
+  -- prove that a re-sign at the same pair is the artifact a node accepted.
+  -- canonical_blake3 can. Older witnesses legitimately lack the field during
+  -- migration; absence therefore means no exact-bytes test, not refusal.
+  if $vi["epoch"] == $b["epoch"] and $vi["recovery_generation"] == $b["recovery_generation"] and $b["canonical_blake3"] != nil then
+    if $vi["canonical_blake3"] != $b["canonical_blake3"] then
+      print("  ERROR: this payload has DIFFERENT signed bytes from the payload rolled out at the accepted freshness pair.")
+      print("    " .. $vi["source"])
+      print("    rolled out  : " .. $b["canonical_blake3"])
+      print("    this payload: " .. $vi["canonical_blake3"])
+      print("    noded pins canonical_blake3 at an equal (epoch, recovery_generation)")
+      print("    pair and would refuse these bytes as BaselineHashMismatch. Reuse the")
+      print("    rolled-out artifact, or advance the authored epoch; do not re-sign")
+      print("    new bytes at a pair the fleet has already accepted.")
+      mesh_fatal()
+    end
+  end
+  -- Equal epoch, different content. The floor is a NUMBER, so on its own it
+  -- cannot tell two payloads apart that share an epoch — and `epoch <` is the
+  -- only rejection above, because an equal epoch has to pass or a re-run of
+  -- the same rollout would refuse itself.
+  --
+  -- SPEC 13 requires a new epoch for new content, but nothing enforced it. The
+  -- authored inventory's epoch is a hand-edited field; editing membership and
+  -- forgetting to bump it produces two validly-signed, mutually-substitutable
+  -- payloads at epoch N. Distribute the tombstoning one, then later sync from a
+  -- stale checkout holding the other: same epoch, so every floor accepts it and
+  -- noded accepts it too (it also rejects only a LOWER epoch), and the
+  -- tombstoned member is live again. `against_authored` does not catch it —
+  -- it only proves the payload matches whatever checkout produced it.
+  --
+  -- So bind the content to the pair: at an equal epoch the payload must be the
+  -- one this host actually rolled out. Absent hash = a floor written before
+  -- this field existed; no test, rather than a refusal nobody can clear.
+  --
+  -- A RECOVERY never reaches here — the via_recovery arm above returns. That is
+  -- deliberate, not an oversight: a genesis recovery may carry the SAME epoch
+  -- as the floor while changing membership (evicting the compromised node is
+  -- the whole point), and refusing it on a content mismatch would be a
+  -- permanent recovery lockout caused by this check. Recovery is governed by
+  -- the generation's strict advance; content identity is a normal-path rule.
+  --
+  -- The hash is the AUTHORING projection (SIGNER_OWNED_FIELDS removed —
+  -- inventory.rs authoring_blake3_for_value), so it is stable across a re-sign
+  -- of identical content: signing the same authored file twice is not a
+  -- mismatch. `epoch` is NOT signer-owned, so it is inside the hash.
+  --
+  -- But note precisely what it therefore does NOT cover. The stripped set is
+  -- signer-owned, and `verify_keys` is in it — so equal authoring hash means
+  -- "the same AUTHORED content", NOT "the same payload". Two genesis-signed
+  -- payloads at one epoch may carry the same roster and DIFFERENT verify_keys,
+  -- and the authoring hash cannot tell them apart. That is the payload's trust
+  -- root — the set of keys every future verification is judged against — so a
+  -- silent substitution there is the most security-semantic swap available at
+  -- an equal epoch, and precisely the one the roster hash is blind to.
+  --
+  -- Hence an independent binding over verify_keys (id|type|pubkey|status,
+  -- sorted — see verify_keys_fingerprint), plus canonical_blake3 over the exact
+  -- signed bytes. The canonical hash intentionally moves on every re-sign:
+  -- once a pair is accepted, that is exactly what makes replacement bytes at
+  -- the same pair detectable. Each binding is optional-absent for migration;
+  -- a witness written before the field existed gets no corresponding test,
+  -- rather than a refusal nobody can clear.
+  if $vi["epoch"] == $b["epoch"] and $b["authoring_blake3"] != nil then
+    if $vi["authoring_blake3"] != $b["authoring_blake3"] then
+      print("  ERROR: this payload has DIFFERENT content from the one rolled out at epoch " .. ("" .. $b["epoch"]) .. ".")
+      print("    " .. $vi["source"])
+      print("    rolled out  : " .. $b["authoring_blake3"])
+      print("    this payload: " .. $vi["authoring_blake3"])
+      print("    The signature is valid — that is not the question. Two payloads")
+      print("    sharing an epoch are interchangeable to every freshness check in")
+      print("    the mesh, so distributing this one silently reverts whatever the")
+      print("    other one changed. SPEC 13 requires new content to carry a new")
+      print("    epoch: bump `epoch` in the authored inventory and re-sign.")
+      print("    If instead this is a stale checkout, update it — do not re-sign.")
+      mesh_fatal()
+    end
+  end
+  if $vi["epoch"] == $b["epoch"] and $b["verify_keys_blake3"] != nil then
+    if $vi["verify_keys_blake3"] != $b["verify_keys_blake3"] then
+      print("  ERROR: this payload names a DIFFERENT TRUST ROOT from the one rolled out at epoch " .. ("" .. $b["epoch"]) .. ".")
+      print("    " .. $vi["source"])
+      print("    rolled out  : " .. $b["verify_keys_blake3"])
+      print("    this payload: " .. $vi["verify_keys_blake3"])
+      print("    The signature is valid — that is not the question. verify_keys is")
+      print("    the set of keys every FUTURE verification is judged against, and")
+      print("    it is signer-owned, so it sits outside the roster hash: the two")
+      print("    payloads are otherwise indistinguishable at this epoch. Changing")
+      print("    the trust root is a mesh-governance act and needs its own epoch.")
+      print("    If instead this is a stale checkout, update it — do not re-sign.")
+      mesh_fatal()
+    end
+  end
+
+  -- Normal path, generation axis. The test is on what the PAYLOAD says, not on
+  -- what the verifier reports: the CLI's trust state is (0, 0) every run, so a
+  -- reported 0 means "the payload was silent", not "the fleet is at 0". Two
+  -- distinct cases, and conflating them is a real fault in either direction:
+  --
+  --   ABSENT  -> accepted as generation 0 only while the floor is also 0. Once
+  --              recovery has advanced the floor, silence proves the payload
+  --              predates normal-generation carriage and it is refused. This
+  --              mirrors inventory.rs: legacy payloads survive the generation-0
+  --              migration window, but cannot replay across a recovery.
+  --
+  --   PRESENT -> test it, exactly as the node will. A signer that names a
+  --              generation is asserting one, and noded applies the same three
+  --              rules to it; passing here and failing there would ship a
+  --              payload the fleet then refuses, one node at a time.
+  if $vi["payload_generation"] == nil then
+    if $b["recovery_generation"] > 0 then
+      print("  ERROR: MESH_FRESHNESS_NORMAL_GENERATION_MISSING")
+      print("    " .. $vi["source"])
+      print("    This normal payload omits recovery_generation while this host's")
+      print("    floor is " .. ("" .. $b["recovery_generation"]) .. ". Generation-silent payloads are")
+      print("    accepted only at generation 0 for the migration window; after a")
+      print("    recovery they predate the recovery-era baseline and are refused.")
+      print("    Bump the authored epoch and run mesh_sync so a generation-carrying")
+      print("    proposal rolls out; do not re-sign the same epoch.")
+      mesh_fatal()
+    end
+  else
+    if $vi["payload_generation"] < $b["recovery_generation"] then
+      print("  ERROR: payload names recovery generation " .. ("" .. $vi["payload_generation"]) ..
+        ", below this host's floor " .. ("" .. $b["recovery_generation"]) .. ".")
+      print("    " .. $vi["source"])
+      print("    The signature is valid — that is not the question. noded refuses")
+      print("    this as RecoveryGenerationRollback (inventory.rs, the normal-path")
+      print("    match), so distributing it would fail node by node after the push.")
+      mesh_fatal()
+    end
+    if $vi["payload_generation"] > $b["recovery_generation"] and not $vi["genesis_verified"] then
+      print("  ERROR: payload raises the recovery generation to " .. ("" .. $vi["payload_generation"]) ..
+        " from " .. ("" .. $b["recovery_generation"]) .. " without a genesis signature.")
+      print("    " .. $vi["source"])
+      print("    Only genesis may raise the floor (RecoveryFloorRaiseRequiresGenesis).")
+      print("    A stolen ACTIVE key could otherwise pin the floor so high that no")
+      print("    later genesis recovery — which needs generation > floor — can ever")
+      print("    be issued: a permanent recovery lockout.")
+      mesh_fatal()
+    end
+  end
+end
+
+-- Re-flush a floor that is already at the wanted value. Not a formality: if a
+-- previous run's directory fsync failed, the new floor is VISIBLE but its
+-- directory entry is not durable, and the natural operator response — re-run —
+-- lands on the no-change path below. A no-change path that returns without
+-- completing the barrier makes the retry a no-op and leaves the crash window
+-- open indefinitely. Re-issue both syncs; they are free when already durable.
+-- Repair the TRACKED witness from a fresher mirror. The fold in
+-- mesh_baseline_read is bidirectional but the WRITES were not: every repair
+-- path pushed tracked -> mirror, and nothing ever pushed mirror -> tracked.
+-- That leaves a real hole, and it is the one mirror-first ordering creates:
+--
+--   mesh_baseline_write installs the mirror at N, then crashes before the
+--   tracked rename. On retry the fold reads (mirror N, tracked N-1), reports
+--   N, so mesh_baseline_raise finds nothing to do and reflushes;
+--   mesh_baseline_mirror_sync then sees the mirror ahead and returns. The
+--   tracked file stays at N-1 ON DISK for good, folded up to N on every read
+--   by a mirror nobody is obliged to keep. Lose /var/lib — reinstall, a fresh
+--   clone on another host, a wiped state dir — and the floor is N-1 again,
+--   which is precisely the replay the pair exists to refuse.
+--
+-- So the no-change path repairs the loser rather than only fsyncing it.
+-- Written through mesh_baseline_write, so the mirror-first ordering and the
+-- full fsync barrier still apply, and the values are the FOLDED ones — the
+-- same answer every reader on this host is already acting on.
+function mesh_baseline_tracked_repair($path)
+  $raw = nil
+  try
+    $raw = load_data($path)["baseline"]
+  catch $tmsg
+    print("  ERROR: could not re-read the tracked freshness floor " .. $path .. ": " .. $tmsg)
+    mesh_fatal()
+  end
+  if type($raw) != "map" then
+    print("  ERROR: malformed tracked freshness floor in " .. $path)
+    mesh_fatal()
+  end
+  -- The folded view. mesh_baseline_read refuses an equal-pair hash conflict, so
+  -- reaching here means the two witnesses are either equal or ordered.
+  $b = mesh_baseline_read($path)
+  if $raw["epoch"] == $b["epoch"] and $raw["recovery_generation"] == $b["recovery_generation"] and $raw["authoring_blake3"] == $b["authoring_blake3"] and $raw["verify_keys_blake3"] == $b["verify_keys_blake3"] and $raw["canonical_blake3"] == $b["canonical_blake3"] then
+    return false
+  end
+  print("  floor    : tracked witness at " .. $path .. " is behind the folded floor — repairing")
+  mesh_baseline_write($path, $b["mesh"], $b["epoch"], $b["recovery_generation"], $b["authoring_blake3"], $b["verify_keys_blake3"], $b["canonical_blake3"])
+  return true
+end
+
+function mesh_baseline_reflush($path)
+  if mesh_baseline_tracked_repair($path) then
+    -- mesh_baseline_write already completed the full barrier on both witnesses.
+    return
+  end
+  $sf = run_argv(["sync", $path])
+  if $sf["exit_code"] != 0 then
+    print("  ERROR: could not flush the existing freshness baseline " .. $path .. ": " .. trim($sf["stderr"]))
+    mesh_fatal()
+  end
+  $sd = run_argv(["sync", dirname($path)])
+  if $sd["exit_code"] != 0 then
+    print("  ERROR: could not flush the directory holding " .. $path .. ": " .. trim($sd["stderr"]))
+    print("         A crash now could restore an OLDER floor. Re-run once the disk is healthy.")
+    mesh_fatal()
+  end
+  -- The out-of-tree witness gets the same treatment when it is there, and is
+  -- ESTABLISHED or REPAIRED when it is not: a mirror lost to one failed install
+  -- would otherwise never be written again, because the tracked floor advanced
+  -- first and every later run takes this no-change path.
+  mesh_baseline_mirror_sync($path)
+  $sm = run_argv(["sync", $MESH_BASELINE_MIRROR])
+  if $sm["exit_code"] != 0 then
+    print("  ERROR: could not flush the out-of-tree freshness floor " .. $MESH_BASELINE_MIRROR .. ": " .. trim($sm["stderr"]))
+    mesh_fatal()
+  end
+  -- The mirror's DIRECTORY entry too, for the same reason the tracked floor's
+  -- is re-flushed here: the mirror is created by a rename, and a rename whose
+  -- parent directory was never made durable can vanish on a crash while the
+  -- tracked floor survives. That is precisely the one-witness skew the fold
+  -- above has to resolve, and this is the retry path that closes it.
+  $smd = run_argv(["sync", dirname($MESH_BASELINE_MIRROR)])
+  if $smd["exit_code"] != 0 then
+    print("  ERROR: could not flush the directory holding " .. $MESH_BASELINE_MIRROR .. ": " .. trim($smd["stderr"]))
+    print("         A crash now could lose the second witness entirely.")
+    mesh_fatal()
+  end
+end
+
+-- Record the floor immediately after an INVENTORY DISTRIBUTOR'S first target
+-- accepts — mesh_push (this node) or mesh_sync (the target set). Mirrors what noded persists
+-- (write_baseline(accepted.epoch, accepted.recovery_generation)): the pair is
+-- stored as accepted, which means a genesis recovery legitimately LOWERS the
+-- epoch axis while advancing the generation. Comparing "epoch >" alone would
+-- refuse to record that recovery and leave the generation floor behind,
+-- reopening the replay window the generation axis exists to close.
+--
+-- On the NORMAL path both axes are ratcheted, never assigned, because $vi is a
+-- payload authenticated at some earlier moment and the floor may have moved
+-- since. Two ways that bites, both real:
+--   * the generation: legacy generation-silent payloads are accepted only while
+--     the floor is 0 (see assert_freshness_floor), and must never erase a later
+--     floor if this function is reached from stale state.
+--   * the epoch: a run that authenticated epoch 14 before another run
+--     published 15 would write 14 over 15 — a "raise" that lowers the floor,
+--     which is the exact rollback this file exists to refuse. Only a verified
+--     recovery may move that axis down, and only while advancing the other.
+function mesh_baseline_raise($path, $vi)
+  $b = mesh_baseline_read($path)
+  $ep = $vi["epoch"]
+  $gen = $vi["recovery_generation"]
+  if not $vi["via_recovery"] then
+    if $b["epoch"] > $ep then
+      $ep = $b["epoch"]
+    end
+    if $b["recovery_generation"] > $gen then
+      $gen = $b["recovery_generation"]
+    end
+  end
+  if $ep == $b["epoch"] and $gen == $b["recovery_generation"] then
+    mesh_baseline_reflush($path)
+    return false
+  end
+  mesh_baseline_write($path, $vi["mesh"], $ep, $gen, $vi["authoring_blake3"], $vi["verify_keys_blake3"], $vi["canonical_blake3"])
+  print("  floor    : (epoch " .. ("" .. $b["epoch"]) .. ", gen " .. ("" .. $b["recovery_generation"]) ..
+    ") -> (epoch " .. ("" .. $ep) .. ", gen " .. ("" .. $gen) ..
+    ")  — commit " .. $path)
+  return true
+end
+
+-- Place $src at $dst with explicit owner/group/mode, ATOMICALLY.
+--
+-- `install` alone is not atomic on the destination: it opens the destination
+-- with O_CREAT|O_TRUNC and copies into it, so a crash, a full disk or a killed
+-- ssh partway through leaves the destination TRUNCATED — and the previous good
+-- copy is already gone. For /var/lib/cosmix/noded/inventory.signed that strands
+-- the node: noded refuses the mangled cache (it fails closed, which is right)
+-- and there is no earlier cache to fall back to, so the node sits Unverified
+-- until an operator republishes by hand. On a fleet fan-out that is one power
+-- cut away from several nodes at once.
+--
+-- So: install to a sibling temp IN THE DESTINATION'S OWN DIRECTORY, then
+-- rename over. rename(2) within one directory is atomic — every reader sees
+-- either the old file or the new one, never a partial one — and it is only
+-- atomic if source and destination share a filesystem, which a sibling does by
+-- construction. The temp is pid-tagged so two concurrent runs cannot collide
+-- on the staging name; `mv -f` because the temp is ours and nothing should
+-- prompt in a non-interactive fan-out.
+--
+-- Ownership and mode are set by `install` on the temp, before the rename, so
+-- the destination is never briefly readable by the wrong uid.
+--
+-- $run is the runner: a function taking an argv list and returning a
+-- run_argv-shaped map. That is what lets one implementation serve both the
+-- local sudo path and the remote ssh path without either growing its own
+-- half-atomic copy.
+-- A runner's failure text, tolerant of the shapes a runner can fail in. A
+-- transport failure (ssh_exec's SSH_TIMEOUT / SSH_TRANSPORT) never ran the
+-- command, so there is no exit_code and no stderr to read — and trim(nil)
+-- raises, which would replace a clear "the node was unreachable" with a
+-- traceback from the error reporter itself.
+function runner_err($r)
+  if type($r) != "map" then return "the runner returned no result map" end
+  if $r["error_code"] != nil then
+    return "transport failure " .. ("" .. $r["error_code"])
+  end
+  if type($r["stderr"]) == "string" and not is_empty(trim($r["stderr"])) then
+    return trim($r["stderr"])
+  end
+  return "exit " .. ("" .. $r["exit_code"]) .. " with no stderr"
+end
+
+-- NOT pid()-derived. This helper's REMOTE caller runs $run over ssh, so the
+-- staging name would carry the LOCAL controller's pid onto a shared node —
+-- and a pid is only unique within one kernel. Two control hosts installing
+-- different payloads to the same node while holding the same pid pick the same
+-- staging path; their local advisory locks coordinate nothing across hosts.
+-- The second `install` then O_TRUNCs the first's temp mid-write and one of the
+-- two renames a partially-written inode onto the canonical destination — the
+-- exact truncation this helper exists to prevent, reintroduced by the name.
+-- uuid() is per-call and collision-resistant across hosts, which is what the
+-- name has to be.
+function install_atomic_via($run, $src, $dst, $owner, $group, $mode)
+  $tmp = dirname($dst) .. "/." .. basename($dst) .. ".tmp." .. uuid()
+  $i = $run(["install", "-o", $owner, "-g", $group, "-m", $mode, $src, $tmp])
+  if $i["exit_code"] != 0 then
+    -- Best effort: we named this temp and nothing else knows it.
+    $run(["rm", "-f", $tmp])
+    return $i
+  end
+  $m = $run(["mv", "-f", $tmp, $dst])
+  if $m["exit_code"] != 0 then
+    $run(["rm", "-f", $tmp])
+    return $m
+  end
+  return $m
+end
+
+-- Local atomic install through sudo. Dies on failure — every caller treated a
+-- failed install as fatal anyway, and returning a map invited a caller to read
+-- the wrong key and call it green.
+function install_atomic($src, $dst, $owner, $group, $mode)
+  $run = fn($argv)
+    return run_argv(concat(["sudo", "-n"], $argv))
+  end
+  $r = install_atomic_via($run, $src, $dst, $owner, $group, $mode)
+  if $r["exit_code"] != 0 then
+    print("ERROR: install " .. $dst .. ": " .. runner_err($r))
+    mesh_fatal()
+  end
+  return $r
+end
+
+-- Shared refusal logic for real distributors and dry-run reporting. Returning
+-- data rather than printing here keeps the rehearsal and hard gate on the same
+-- predicates and remediation text.
+function distributor_generation_findings($vi, $floor)
+  $findings = []
+  if $vi["via_recovery"] then
+    push($findings, "a normal distributor received a recovery payload; recovery distribution needs its own ceremony and retry semantics and must not inherit the normal path's first-accept ratchet")
+    return $findings
+  end
+  if $vi["payload_generation"] == nil then
+    push($findings, "distributor payload omits recovery_generation; this canonical predates generation carriage — bump the authored epoch and run mesh_sync so a fresh proposal carrying the floor generation is rolled out; do not re-sign the same epoch")
+  end
+  if $vi["payload_generation"] != nil and $vi["payload_generation"] != $floor["recovery_generation"] then
+    push($findings, "distributor payload recovery_generation " .. ("" .. $vi["payload_generation"]) ..
+      " != the locked control floor " .. ("" .. $floor["recovery_generation"]) ..
+      "; refusing bytes signed from a different floor snapshot")
+  end
+  if not $vi["genesis_verified"] then
+    push($findings, "distributor payload was not verified by genesis; a normal payload that establishes recovery_generation on a fresh node must be genesis-authorised")
+  end
+  return $findings
+end
+
+-- A distributor signs NORMAL payloads only and must stamp the floor snapshot it
+-- read under the write lock. This is stricter than generic verification on
+-- purpose: a distributor may neither issue a recovery nor silently advance the
+-- generation axis. Genesis must be among the signatures that actually verified,
+-- because only genesis may establish this baseline on a wiped/cold node.
+function assert_distributor_generation($vi, $floor)
+  $findings = distributor_generation_findings($vi, $floor)
+  if length($findings) > 0 then
+    for each $finding in $findings
+      print("  ERROR: " .. $finding)
+    end
+    mesh_fatal()
+  end
+  return true
+end
+
+-- Record the floor after a COMPONENT deploy (WG interfaces, dnsd zones). These
+-- apply state DERIVED from a payload; they never push the inventory itself, so
+-- they have no evidence any node accepted it — and that difference is
+-- load-bearing on the recovery axis.
+--
+-- A recovery payload may carry a LOWER epoch and a HIGHER generation. Letting a
+-- zone deploy record that pair breaks the fleet two ways at once: the epoch
+-- floor drops below what the nodes actually hold (so a later ordinary payload
+-- passes here and is refused there as StaleEpoch), and the generation floor
+-- rises to a recovery nobody distributed — which then blocks distributing that
+-- very recovery, because mesh_sync requires a generation STRICTLY above the
+-- floor. A permanent recovery lockout, caused by deploying zones.
+--
+-- So a component deploy ratchets the EPOCH axis only, and records nothing at
+-- all from a recovery. The recovery pair is the inventory-distribution tools'
+-- to record, because they are the ones that can prove a node took it.
+function mesh_baseline_ratchet_epoch($path, $vi)
+  $b = mesh_baseline_read($path)
+  if $vi["via_recovery"] then
+    print("  floor    : unchanged — a recovery payload is recorded by mesh_push/mesh_sync,")
+    print("             which distribute the inventory; this deploy only applied state")
+    print("             derived from it and cannot attest the fleet accepted it.")
+    mesh_baseline_reflush($path)
+    return false
+  end
+  if $vi["epoch"] <= $b["epoch"] then
+    mesh_baseline_reflush($path)
+    return false
+  end
+  mesh_baseline_write($path, $vi["mesh"], $vi["epoch"], $b["recovery_generation"], $vi["authoring_blake3"], $vi["verify_keys_blake3"], $vi["canonical_blake3"])
+  print("  floor    : (epoch " .. ("" .. $b["epoch"]) .. ", gen " .. ("" .. $b["recovery_generation"]) ..
+    ") -> (epoch " .. ("" .. $vi["epoch"]) .. ", gen " .. ("" .. $b["recovery_generation"]) ..
+    ")  — commit " .. $path)
+  return true
+end
+
+-- ── genesis anchor, local ────────────────────────────────────────────────
+-- is_file() cannot answer this question. It returns false both when the file
+-- is absent and when the caller merely cannot stat it (unreadable parent) —
+-- verified live: root sees the file, Mix reports is_file=false. Since the
+-- anchor is then INSTALLED via sudo, "false" would mean an unprivileged run
+-- overwrites a trust root it simply could not see. So ask through the same
+-- privilege the write uses, and distinguish absent from unreadable.
+--   -> {ok: true, value: <contents>} | {ok: true, value: "__ABSENT__"}
+--    | {ok: false, value: <why>}
+function anchor_read_local($path)
+  $t = run_argv(["sudo", "-n", "test", "-e", $path])
+  if $t["exit_code"] == 1 then
+    return {ok: true, value: "__ABSENT__"}
+  end
+  if $t["exit_code"] != 0 then
+    return {ok: false, value: "sudo -n test -e " .. $path .. " failed (exit " .. ("" .. $t["exit_code"]) .. "): " .. trim($t["stderr"])}
+  end
+  $c = run_argv(["sudo", "-n", "cat", $path])
+  if $c["exit_code"] != 0 then
+    return {ok: false, value: "sudo -n cat " .. $path .. ": " .. trim($c["stderr"])}
+  end
+  $v = trim($c["stdout"])
+  if is_empty($v) then
+    return {ok: false, value: $path .. " is empty — refusing to treat a blank anchor as either present or absent"}
+  end
+  return {ok: true, value: $v}
+end
+
+-- Atomic create-only install. `install` would happily clobber, and a
+-- check-then-write leaves two concurrent first-provision runs both seeing
+-- absent. link(2) is the primitive that answers "create IF NOT EXISTS" in
+-- one step: it fails EEXIST rather than replacing, so the loser of a race
+-- is told, not silently overwritten. Staged in the destination directory
+-- because a hard link cannot cross filesystems.
+--   -> {ok: bool, value: <why on failure>}
+function anchor_install_local($path, $pub)
+  $dir = dirname($path)
+  $stage = $dir .. "/.genesis.pub.staged"
+  -- NOT a predictable /tmp path. write_file() here is UNPRIVILEGED and the
+  -- `install` below is not: a local process that pre-creates
+  -- /tmp/genesis.pub.stage.<pid> as a symlink, or simply swaps the file
+  -- between the two, chooses the bytes that become this host's trust anchor
+  -- — and `ln` then makes that choice permanent, because create-only refuses
+  -- to correct it later. mktemp -d gives a 0700 dir with an unguessable name,
+  -- so no other user can reach the file between writing it and installing it.
+  $mk = run_argv(["mktemp", "-d"])
+  if $mk["exit_code"] != 0 then
+    return {ok: false, value: "mktemp -d failed: " .. trim($mk["stderr"])}
+  end
+  $work = trim($mk["stdout"])
+  if is_empty($work) then
+    return {ok: false, value: "mktemp -d produced no path"}
+  end
+  $tmp = $work .. "/genesis.pub"
+  write_file($tmp, $pub .. "\n")
+  $in = run_argv(["sudo", "-n", "install", "-o", "root", "-g", "root", "-m", "0644", $tmp, $stage])
+  $cl = run_argv(["rm", "-rf", $work])
+  if $cl["exit_code"] != 0 then
+    print("  note: could not remove the staging dir " .. $work .. " — remove it by hand")
+  end
+  if $in["exit_code"] != 0 then
+    return {ok: false, value: "staging anchor at " .. $stage .. ": " .. trim($in["stderr"])}
+  end
+  $ln = run_argv(["sudo", "-n", "ln", $stage, $path])
+  $rm = run_argv(["sudo", "-n", "rm", "-f", $stage])
+  if $ln["exit_code"] != 0 then
+    return {ok: false, value: "creating " .. $path .. " (it may have appeared concurrently — link refuses to replace a trust root): " .. trim($ln["stderr"])}
+  end
+  if $rm["exit_code"] != 0 then
+    return {ok: false, value: "removing staged anchor " .. $stage .. ": " .. trim($rm["stderr"])}
+  end
+  return {ok: true, value: ""}
+end
+
+-- ── one writer at a time ─────────────────────────────────────────────────
+-- The staging tree and the committed artifacts are shared mutable state, and
+-- every check that they match a payload is a check on a moment. Two runs
+-- interleaving — one sealing while another distributes — can each pass their
+-- own gate and still ship a mixture neither authored. An advisory lock is
+-- enough here because every writer is this toolkit; it turns a silent
+-- interleave into a refusal that names the other run.
+$MESH_WRITE_LOCK = env("CMCTL", env("HOME") .. "/.ctl") .. "/_share/cosmix/.mesh-write.lock"
+
+
+-- Has this path stopped being the file we decided about?
+--
+-- Every classification in this toolkit — production vs lab, canonical vs
+-- copy — is a stat() at one instant, and every mutation that follows is a
+-- fresh open of a NAME. realpath() removes the symlink hop but cannot freeze
+-- the binding; only holding the file open could, and Mix has no open-by-fd.
+-- So the decision is re-checked against the same (dev, ino) at each point that
+-- matters. This narrows the window; it does not abolish it, and saying so is
+-- part of the check.
+function assert_same_file($path, $id, $what)
+  if type($id) != "map" then
+    print("  ERROR: no recorded identity for the " .. $what .. " at " .. $path)
+    mesh_fatal()
+  end
+  $now = nil
+  try
+    $now = stat($path)
+  catch $m
+    print("  ERROR: the " .. $what .. " at " .. $path .. " can no longer be stat'd: " .. $m)
+    mesh_fatal()
+  end
+  if type($now) != "map" then
+    print("  ERROR: stat of the " .. $what .. " at " .. $path .. " did not return a record")
+    mesh_fatal()
+  end
+  if $now["ino"] != $id["ino"] or $now["dev"] != $id["dev"] then
+    print("  ERROR: " .. $path .. " is no longer the " .. $what .. " this run classified.")
+    print("         It was (dev " .. ("" .. $id["dev"]) .. ", ino " .. ("" .. $id["ino"]) ..
+      "), it is now (dev " .. ("" .. $now["dev"]) .. ", ino " .. ("" .. $now["ino"]) .. ").")
+    print("         Refusing to author or sign a file the production gate never saw.")
+    mesh_fatal()
+  end
+end
+-- A per-acquisition nonce, minted when the lock is TAKEN and handed to any
+-- child that must run inside the same critical section. The pid alone cannot
+-- carry that: the lock file is metadata written AFTER flock() returns, so it
+-- is stale by construction in two reachable ways — a holder that took the
+-- flock and has not yet reached the write, and a foreign flock holder that
+-- never writes it at all. In both, the pid left behind belongs to a run that
+-- has exited, and a pid the kernel has since recycled into the caller's own
+-- ancestor chain makes the ancestry test answer "yes" for a lock somebody else
+-- holds. A nonce closes it: a stale file cannot carry a token minted this run,
+-- and the child is told the token out of band (--lock-token) rather than
+-- reading it from the file it is trying to validate.
+$MESH_LOCK_TOKEN = ""
+
+function mesh_take_write_lock($who)
+  if not flock($MESH_WRITE_LOCK) then
+    print("  ERROR: another mesh writer holds " .. $MESH_WRITE_LOCK)
+    print("         (" .. $who .. " will not interleave with a run already in flight)")
+    mesh_fatal()
+  end
+  -- Record WHO holds it. flock() answers "is it held", never "by whom", and a
+  -- child that must run inside its parent's critical section needs the second
+  -- question answered — see mesh_lock_held_by_ancestor(). Writing through the
+  -- locked path does not drop the lock (same inode, truncate-in-place; proven
+  -- live: a child's flock() still refuses afterwards).
+  $MESH_LOCK_TOKEN = uuid()
+  write_file($MESH_WRITE_LOCK, ("" .. pid()) .. " " .. $MESH_LOCK_TOKEN .. " " .. $who .. "\n")
+  return $MESH_LOCK_TOKEN
+end
+
+-- PPid straight from the kernel. /proc/<pid>/status is the readable form —
+-- /proc/<pid>/stat's second field is the comm, which may itself contain
+-- spaces and parentheses and turns positional parsing into guesswork.
+function ppid_of($p)
+  $path = "/proc/" .. ("" .. $p) .. "/status"
+  $s = nil
+  try
+    $s = read_file($path)
+  catch $m
+    return nil
+  end
+  for each $line in split($s, "\n")
+    if starts_with($line, "PPid:") then
+      return to_number(trim(substr($line, 5, length($line) - 5)))
+    end
+  end
+  return nil
+end
+
+-- Is the process holding the write lock one of OUR ancestors, AND is the lock
+-- the one our parent took?
+--
+-- This is the question `--inherit-lock` actually has to ask. flock() coming
+-- back false proves only that SOMEONE holds the lock — under any third-party
+-- holder, two unrelated `seal --inherit-lock` runs would both read that false
+-- as "my parent has it" and proceed together, which is the exact interleave
+-- the lock exists to prevent.
+--
+-- Ancestry alone is NOT enough, and an earlier revision of this comment was
+-- wrong to say pid reuse could not fool it. That argument assumed the pid in
+-- the file IS the current holder. It need not be: the file is written after
+-- flock() returns, so a holder paused before that write leaves the PREVIOUS
+-- run's pid in place, and a foreign flock holder never writes the file at all.
+-- Either way the pid on disk belongs to an exited process, and a pid the
+-- kernel has recycled into this run's own ancestor chain then answers "yes"
+-- for a lock held by someone else entirely.
+--
+-- So the caller must present the token its parent minted at acquisition, and
+-- both tests must pass: the token proves the file describes THIS acquisition,
+-- the ancestry proves the acquirer is above us. A stale file fails the first;
+-- a stranger's live lock fails the second.
+function mesh_lock_held_by_ancestor($token)
+  if type($token) != "string" or is_empty($token) then return false end
+  $c = nil
+  try
+    $c = read_file($MESH_WRITE_LOCK)
+  catch $m
+    return false
+  end
+  $f = split(trim($c), " ")
+  if length($f) < 2 then return false end
+  $holder = $f[0]
+  if is_empty($holder) then return false end
+  if $f[1] != $token then return false end
+  $p = ppid_of(pid())
+  $hops = 0
+  while $p != nil and $p > 1 and $hops < 64
+    if ("" .. $p) == $holder then return true end
+    $p = ppid_of($p)
+    $hops = $hops + 1
+  end
+  return false
+end
+
+-- ── ship the bytes the gate approved, not the path it read ───────────────
+-- Every deploy here follows the same shape: regenerate an artifact from the
+-- verified payload, compare it against the committed file, then scp that file
+-- to N nodes. The comparison and the scp are two different reads of one
+-- mutable path, seconds to minutes apart — a `mesh_gen seal`, a git checkout,
+-- an editor save or a concurrent deploy in between and the bytes that ship are
+-- not the bytes that passed. A gate on a moment is not a gate on what shipped.
+--
+-- So the gate's own bytes are snapshotted into a private 0700 directory and
+-- THAT is what every later scp reads. Same reasoning (and same fix) as
+-- deploy_dnsd's snapshot_bin, which exists because a concurrent `cargo build`
+-- evicted a binary mid-fanout on 2026-07-05 and stranded the deploy partway
+-- through a node. Caller removes the directory with snapshot_release().
+--
+-- $name is a BASENAME, and that is enforced rather than assumed. Callers build
+-- it from data (deploy_wg passes `<iface>.conf`, and validate_wg_overlay only
+-- required the interface to be non-empty), so a `../` in it would put the
+-- write outside the private directory — and snapshot_release() then hands
+-- `rm -rf` the parent of wherever it landed. A helper whose contract includes
+-- recursive deletion does not get to take an unchecked path fragment.
+function verified_snapshot($bytes, $name)
+  if is_empty($name) or contains($name, "/") or $name == "." or $name == ".." or substr($name, 0, 1) == "-" then
+    print("  ERROR: refusing an unsafe deploy-snapshot name '" .. ("" .. $name) .. "'")
+    print("         — it must be a plain basename (no '/', not '.'/'..', no leading '-').")
+    mesh_fatal()
+  end
+  $mk = run_argv(["mktemp", "-d"])
+  if $mk["exit_code"] != 0 then
+    print("  ERROR: mktemp -d for the deploy snapshot failed: " .. trim($mk["stderr"]))
+    mesh_fatal()
+  end
+  $dir = trim($mk["stdout"])
+  if is_empty($dir) then
+    print("  ERROR: mktemp -d produced no path for the deploy snapshot")
+    mesh_fatal()
+  end
+  $ch = run_argv(["chmod", "0700", $dir])
+  if $ch["exit_code"] != 0 then
+    print("  ERROR: could not restrict the deploy snapshot dir " .. $dir)
+    mesh_fatal()
+  end
+  $p = $dir .. "/" .. $name
+  write_file($p, $bytes)
+  -- read it back: a short write or a full filesystem would otherwise ship a
+  -- truncated artifact that no gate ever saw.
+  if read_file($p) != $bytes then
+    print("  ERROR: deploy snapshot " .. $p .. " does not read back as written")
+    mesh_fatal()
+  end
+  return $p
+end
+
+-- write_file() to a path whose leaf is a SYMLINK writes through it, to
+-- wherever the link points. For a generator that is the wrong default twice
+-- over: the destination directory is predictable, and the bytes may be
+-- unauthenticated (preview).
+--
+-- remove()-then-write closes the symlink, but leaves a window: between the
+-- unlink and the create, anything may plant a link at the name we are about
+-- to open. rename() cannot be raced that way — it REPLACES the destination
+-- name whatever it currently is, and never follows a symlink sitting there —
+-- so the durable form is: materialise the bytes under a private name in the
+-- same directory, verify them, then rename over the destination.
+--
+-- The temp name is a create-by-name too, and it is NOT merely scratch: a link
+-- planted there is followed by write_file, so the attacker picks the victim
+-- (proven live — a symlinked temp pointed at _etc/mesh/inventory.mix took the
+-- generated bytes, and the read-back then passed). write_new() is the closing
+-- primitive: "Atomically create a new file with mode … fails if path exists;
+-- mode applied at creation (no umask race)" — exclusive creation, so an
+-- existing name of ANY type, symlink included, is a refusal rather than a
+-- write-through. An earlier revision of this comment claimed Mix had no such
+-- builtin; it does, and the claim was wrong.
+--
+-- 0644 is what write_file produced under the standing umask, so the mode is
+-- now stated rather than inherited, with no change to the artifacts.
+--
+-- What this does NOT claim: that the staging name is unguessable. It is
+-- dirname + "." + basename + ".tmp." + pid, and a review round asked for a
+-- random one. Declined, on the boundary: to plant anything at that name an
+-- attacker must be able to CREATE names in the destination directory — and
+-- that directory is where the artifact itself lands, owned by the same uid,
+-- so anyone who can win the temp race can simply write the artifact. A random
+-- temp name would not remove a capability, it would only make the attacker
+-- take the shorter route. The property being bought here is not secrecy, it is
+-- that no sequence of events at that name can turn into a write THROUGH it:
+-- write_new refuses an existing name of any type, and rename replaces rather
+-- than follows. Both hold whether or not the name was guessed.
+function write_leaf($path, $bytes)
+  $tmp = dirname($path) .. "/." .. basename($path) .. ".tmp." .. ("" .. pid())
+  -- A leftover regular file from a crashed run is cleared here so the normal
+  -- case still works; anything remove() CANNOT clear (a directory, an
+  -- unwritable parent) is diagnosed rather than left to surface as a builtin
+  -- traceback from inside a generator loop.
+  try
+    remove($tmp)
+  catch $xmsg
+    print("  ERROR: could not clear the staging name for " .. $path .. ": " .. $xmsg)
+    print("         " .. $tmp .. " is in the way and is not an ordinary file.")
+    mesh_fatal()
+  end
+  try
+    write_new($tmp, $bytes, "0644")
+  catch $cmsg
+    print("  ERROR: could not stage " .. $path .. ": " .. $cmsg)
+    print("         write_new refuses a name that already exists, so a planted")
+    print("         symlink or a leftover temp stops the run instead of being")
+    print("         written through. Clear " .. $tmp .. " and re-run.")
+    mesh_fatal()
+  end
+  $back = nil
+  try
+    $back = read_file($tmp)
+  catch $rmsg
+    remove($tmp)
+    print("  ERROR: could not read back the staged " .. $path .. ": " .. $rmsg)
+    mesh_fatal()
+  end
+  if $back != $bytes then
+    remove($tmp)
+    print("  ERROR: generated artifact " .. $path .. " does not read back as written")
+    mesh_fatal()
+  end
+  $sf = run_argv(["sync", $tmp])
+  if $sf["exit_code"] != 0 then
+    try
+      remove($tmp)
+    catch $srm
+      print("  note: could not remove the unsynced staged artifact " .. $tmp .. ": " .. $srm)
+    end
+    print("  ERROR: staged artifact " .. $tmp .. " could not be flushed: " .. trim($sf["stderr"]))
+    print("         Refusing to publish a name whose bytes may not survive a crash.")
+    mesh_fatal()
+  end
+  try
+    rename($tmp, $path)
+  catch $msg
+    remove($tmp)
+    print("  ERROR: could not place generated artifact " .. $path .. ": " .. $msg)
+    mesh_fatal()
+  end
+  $sd = run_argv(["sync", dirname($path)])
+  if $sd["exit_code"] != 0 then
+    print("  ERROR: " .. $path .. " was installed but its directory entry could not be flushed: " .. trim($sd["stderr"]))
+    print("         A crash could restore the previous artifact. Re-run once the disk is healthy.")
+    mesh_fatal()
+  end
+end
+
+-- A missing canonical inventory.signed is BOOTSTRAP only while no rollout has
+-- ever been witnessed. The tracked witness outlives the canonical artifact, so
+-- an advanced witness beside a missing canonical is artifact LOSS, not a fresh
+-- world: allocating from authored-only coverage there can re-issue a wg_ip an
+-- old node still holds (the authored file may have dropped a member the last
+-- rolled-out payload still carries). Callers sit on the union/allocation path
+-- of mesh_join and mesh_alloc, right before their bootstrap note.
+-- exists()/is_file() are fail-OPEN: false covers genuine absence, a dangling
+-- symlink, and "could not answer" (unreadable parent) alike. Absence here
+-- authorises authored-only allocation, so it must be PROVEN: the directory
+-- entry itself is checked without following symlinks (a dangling witness link
+-- is still evidence of prior structure), and only an ENOENT-classified stat
+-- failure reads as absent — anything else refuses rather than guesses. Mix
+-- stat exposes no structured errno, so the substring match is forced (F3).
+function witness_entry_absent($p)
+  if exists($p, {follow_symlinks: false}) then return false end
+  try
+    stat($p)
+    return false
+  catch $msg
+    if ends_with($msg, "(os error 2)") then return true end
+    print("  ERROR: cannot determine whether the witness " .. $p .. " exists: " .. $msg)
+    print("         Refusing to classify this as a fresh world on an unanswerable probe.")
+    mesh_fatal()
+  end
+end
+
+function assert_canonical_absence_is_bootstrap()
+  if witness_entry_absent($MESH_BASELINE) then
+    -- The tracked witness can be lost alongside the canonical; the out-of-tree
+    -- mirror survives a checkout wipe, so its bare existence is still evidence
+    -- of a prior rollout. Only both absent reads as a genuinely fresh world.
+    if not witness_entry_absent($MESH_BASELINE_MIRROR) then
+      print("  ERROR: production inventory.signed and the tracked witness are both absent, but the")
+      print("         out-of-tree witness mirror " .. $MESH_BASELINE_MIRROR .. " exists.")
+      print("         This is artifact loss, not first bootstrap. Restore the checkout")
+      print("         (git restore _etc/mesh/) before allocating from authored-only coverage.")
+      mesh_fatal()
+    end
+    return
+  end
+  $b = mesh_baseline_read($MESH_BASELINE)
+  if $b["epoch"] > 0 or $b["recovery_generation"] > 0 or $b["canonical_blake3"] != nil then
+    print("  ERROR: production inventory.signed is absent but the control witness records a")
+    print("         rolled-out canonical (epoch " .. ("" .. $b["epoch"]) .. ", generation " .. ("" .. $b["recovery_generation"]) .. ").")
+    print("         This is artifact loss, not first bootstrap: authored-only allocation could")
+    print("         re-issue a wg_ip an old node still holds. Restore inventory.signed")
+    print("         (git restore _etc/mesh/inventory.signed) or resume mesh_sync first.")
+    mesh_fatal()
+  end
+end
+
+-- Persist resumable signed bytes before any node can accept them. Creation is
+-- exclusive and both the file data and directory entry are durable before the
+-- caller proceeds.
+function store_signed_proposal($src, $proposal)
+  $bytes = nil
+  try
+    $bytes = read_file($src)
+  catch $prmsg
+    print("  ERROR: could not read signed bytes for proposal storage: " .. $prmsg)
+    mesh_fatal()
+  end
+  try
+    write_new($proposal, $bytes, "0644")
+  catch $pwmsg
+    print("  ERROR: could not create signed proposal " .. $proposal .. ": " .. $pwmsg)
+    print("         An existing proposal is never overwritten; resume it or discard")
+    print("         it explicitly by full canonical_blake3.")
+    mesh_fatal()
+  end
+  if read_file($proposal) != $bytes then
+    print("  ERROR: stored proposal does not read back byte-identically: " .. $proposal)
+    mesh_fatal()
+  end
+  $ps = run_argv(["sync", $proposal])
+  if $ps["exit_code"] != 0 then
+    print("  ERROR: signed proposal could not be flushed: " .. trim($ps["stderr"]))
+    print("         No node has been touched; repair storage and resume or discard it.")
+    mesh_fatal()
+  end
+  $pds = run_argv(["sync", dirname($proposal)])
+  if $pds["exit_code"] != 0 then
+    print("  ERROR: signed proposal exists but its directory entry could not be flushed: " .. trim($pds["stderr"]))
+    print("         No node has been touched; repair storage before distribution.")
+    mesh_fatal()
+  end
+end
+
+-- Canonical publication is already durable when this is called. Failure to
+-- remove is fatal for this run but resumable; failure to flush the removal is
+-- only a note because a crash can at worst resurrect byte-identical proposal
+-- state that the next run safely verifies and removes again.
+function remove_published_proposal($proposal)
+  try
+    remove($proposal)
+  catch $rrmsg
+    print("  ERROR: canonical published but could not remove the byte-identical proposal " .. $proposal .. ": " .. $rrmsg)
+    mesh_fatal()
+  end
+  $rds = run_argv(["sync", dirname($proposal)])
+  if $rds["exit_code"] != 0 then
+    print("  note: proposal removal could not be made crash-durable: " .. trim($rds["stderr"]))
+    print("        Canonical bytes are durable; a crash may resurrect the same resumable proposal.")
+  end
+end
+
+function snapshot_release($path)
+  $rm = run_argv(["rm", "-rf", dirname($path)])
+  if $rm["exit_code"] != 0 then
+    print("  note: could not remove the deploy snapshot dir " .. dirname($path))
+  end
+end

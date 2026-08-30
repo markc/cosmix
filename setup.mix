@@ -1,7 +1,7 @@
 -- setup.mix — CosMix setup, stage 2. Runs under the `mix` that `bootstrap`
 -- just built; re-run it any time to rebuild and reinstall (idempotent).
 --
---   mix $COSMIX/setup.mix [--desktop] [--system] [--skip-build]
+--   mix $COSMIX/setup.mix [--desktop] [--system] [--skip-build] [--ctl DIR]
 --
 --   (default)     build every crate in the workspace (release) and install
 --                 every binary into $COSMIX/bin — no root needed
@@ -12,6 +12,10 @@
 --                 units themselves are installed by the operator's deploy
 --                 tooling, not by this script — it says so at the end.
 --   --skip-build  install what target/release already holds
+--   --ctl DIR     copy the starter control folder ($COSMIX/ctl) to DIR — a
+--                 private hub for specs, decisions, plans, deploy scripts and
+--                 the public-hygiene gate; see ctl/README.md. With --skip-build
+--                 and nothing else, only the copy happens.
 --
 -- $COSMIX is the directory this file lives in unless the environment says
 -- otherwise; every path below derives from it.
@@ -30,8 +34,15 @@ end
 $want_desktop = false
 $want_system = false
 $skip_build = false
+$ctl_dest = ""
+$expect_ctl = false
 for each $a in args()
-  if $a == "--desktop" then
+  if $expect_ctl then
+    $ctl_dest = $a
+    $expect_ctl = false
+  elif $a == "--ctl" then
+    $expect_ctl = true
+  elif $a == "--desktop" then
     $want_desktop = true
   elif $a == "--system" then
     $want_system = true
@@ -55,6 +66,28 @@ function install_bin($from, $to)
 end
 
 print(">> COSMIX = " .. $root)
+
+-- 0. --ctl DIR: copy the starter control folder out of the checkout. It is a
+--    COPY, not a link — the user's hub is theirs from that moment; upstream
+--    changes to ctl/ flow by diff. Refuses to touch an existing directory.
+--    Needs no git and no GitHub: `git init` there later is optional.
+if $ctl_dest != "" then
+  if $ctl_dest == "--desktop" or $ctl_dest == "--system" or $ctl_dest == "--skip-build" then
+    print("setup: --ctl needs a destination directory")
+    exit(2)
+  end
+  if is_dir($ctl_dest) or is_file($ctl_dest) then
+    print("setup: " .. $ctl_dest .. " already exists — refusing to merge into it")
+    exit(2)
+  end
+  copy_tree($root .. "/ctl", $ctl_dest)
+  print(">> starter control folder copied to " .. $ctl_dest)
+  print("   next: read " .. $ctl_dest .. "/README.md; edit _etc/public-hygiene.conf.mix;")
+  print("   optional: git -C " .. $ctl_dest .. " init  (no remote needed)")
+  if $skip_build and not $want_desktop and not $want_system then
+    exit(0)
+  end
+end
 
 -- 1. fetch every crate the lockfile names (all platforms), then build. The
 --    fetch is what makes `cargo metadata --offline` — which some tests run —

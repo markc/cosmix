@@ -1,0 +1,11 @@
+-- public-hygiene.allow.conf.mix — standing exceptions for the public-hygiene gate.
+--
+-- STARTER TEMPLATE: empty. An exception is a CONTENT FINGERPRINT (the gate
+-- prints it with every finding) plus the reason a human accepted it — never a
+-- path glob, because a glob exempts future unknown content, which is exactly
+-- how a sanitisation regresses. If the gate blocks you, sanitise; widen this
+-- file only for a violation you have inspected and accept forever.
+public_hygiene_allow: {
+  schema_version: 1,
+  exceptions: []
+}

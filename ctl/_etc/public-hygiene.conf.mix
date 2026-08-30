@@ -1,0 +1,43 @@
+-- public-hygiene.conf.mix — what the public-hygiene gate refuses to publish.
+--
+-- STARTER TEMPLATE. The gate (`_bin/check-public-hygiene.mix`) reads this file
+-- from the hub it lives in (`$CMCTL/_etc/`), so edit YOUR copy:
+--   1. `repos`: every git checkout whose commits must stay free of private
+--      identity — at least your `$COSMIX` clone. Absolute paths.
+--   2. `static_rules`: regexes for things no inventory can enumerate — your
+--      real domains, your operator home path (and its Claude-projects encoded
+--      form `-home-<user>-`). Leave the placeholders and the gate will refuse
+--      nothing real: it is only as strict as what you name here.
+--   3. `generic_node_names`: node names that are also ordinary words, so a
+--      match on them is not evidence by itself.
+-- Mesh-derived rules (node names, WG subnet) are added automatically from
+-- `_etc/mesh/inventory.mix` + `inventory.signed` WHEN those exist; a hub with
+-- no mesh runs the static rules only and says so on every scan.
+--
+-- Then `mix _bin/install-hygiene-hooks.mix` installs pre-commit / pre-push
+-- hooks in every listed repo. Changed this file? `mix _bin/check-public-hygiene.mix --all`.
+public_hygiene: {
+  schema_version: 1,
+  repos: [
+    -- "/home/CHANGEME/Projects/cosmix"
+  ],
+  static_rules: [
+    {
+      id: "private_domain",
+      pattern: "(your-private-domain[.]example)",
+      note: "your real domains — use example.com/.org/.net in anything public"
+    },
+    {
+      id: "operator_home",
+      pattern: "(/home/CHANGEME|-home-CHANGEME-)",
+      note: "your home path, incl. the Claude-projects encoded form -home-CHANGEME--<repo>"
+    }
+  ],
+  generic_node_names: [],
+  guidance: {
+    ipv4: "RFC 5737 — 192.0.2.0/24 TEST-NET-1, 198.51.100.0/24 TEST-NET-2, 203.0.113.0/24 for docs",
+    domain: "example.com / example.org / example.net",
+    node: "alpha beta gamma delta epsilon",
+    home: "/home/user or a repo-relative path"
+  }
+}

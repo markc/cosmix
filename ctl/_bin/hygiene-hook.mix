@@ -1,0 +1,912 @@
+#!/opt/cosmix/bin/mix
+-- hygiene-hook.mix — the body of the installed git hooks.
+--
+--   mix _bin/hygiene-hook.mix pre-commit
+--   mix _bin/hygiene-hook.mix commit-msg <message-file>
+--   mix _bin/hygiene-hook.mix pre-push <remote-name> <remote-url>
+--                                                    (ref lines on stdin)
+--
+-- Everything after the mode is git's own hook argv, forwarded verbatim by the
+-- stub. pre-push NEEDS it: the remote name is what scopes "which commits does
+-- this push actually publish" (see the range construction below), and a
+-- chained foreign pre-push hook is entitled to the same $1/$2 git would have
+-- given it.
+--
+-- The repo is resolved from the CURRENT WORKING TREE (`git rev-parse
+-- --show-toplevel`), never baked into the stub. Linked `git worktree`
+-- checkouts share `.git/hooks` with the main checkout, so a hardcoded path
+-- would make a commit in a worktree scan the main checkout's index — passing
+-- the gate while committing something else entirely.
+--
+-- The hooks that git actually runs are 4-line stubs written by
+-- _bin/install-hygiene-hooks.mix; all the logic lives here so it stays one
+-- lintable, editable, version-controlled file instead of a string emitted by a
+-- generator. Editing this file changes every installed hook immediately — no
+-- reinstall needed.
+--
+-- Mandate: _decisions/2026-07-25-no-hardwired-mesh-values.md.
+--
+-- FAILS CLOSED. A gate that could not run is not a gate that passed: a nil
+-- exit code (never spawned, binary missing, config unreadable) exits 2 and
+-- blocks, exactly like a violation.
+
+-- 2026-08-30: locate the hub like the gate does (script dir if it is a hub,
+-- else $CMCTL env, else ~/.ctl) so a copied starter control folder works.
+fn locate_hub()
+  $here = dirname(dirname(realpath($0)))
+  if is_file($here .. "/_etc/public-hygiene.conf.mix") then
+    return $here
+  end
+  $e = env("CMCTL")
+  if $e != "" then
+    return $e
+  end
+  return env("HOME") .. "/.ctl"
+end
+$CMCTL = locate_hub()
+$GATE = $CMCTL .. "/_bin/check-public-hygiene.mix"
+$MIX = "/opt/cosmix/bin/mix"
+$ALLOW = $CMCTL .. "/_etc/public-hygiene.allow.conf.mix"
+-- Must match check-public-hygiene.mix's $COMPLETE exactly; the long note lives
+-- there. Two copies of one string is the price of the gate staying a separate
+-- process, and the suite asserts they agree.
+$COMPLETE = "hygiene-scan-complete:"
+-- run_argv caps each captured stream (8 MiB by default) and TRUNCATES past it
+-- rather than failing, so the cap is part of this hook's contract, not a
+-- detail: the gate prints its completion marker LAST, which makes the marker
+-- precisely what a cut-off capture loses. Raised to 32 MiB because the default
+-- is reachable on a first scan of a large repo, and named once so the number in
+-- the diagnostic cannot drift from the number in force.
+$CAP = 33554432
+
+-- git's "no such ref" sentinel is an all-zero OID of the repo's hash length —
+-- 40 hex digits under SHA-1, 64 under SHA-256. Comparing against a hardcoded
+-- 40 read a SHA-256 deletion as a real published object and died in
+-- `rev-list` on a bad object; the same literal gated the unknown-destination
+-- fallback. Match the shape, not one hash function's width.
+fn is_null_oid($sha)
+  return $sha != "" and regex_match("^0+$", $sha)
+end
+
+fn refuse($code, $msg)
+  print("hygiene-hook: " .. $msg)
+  exit($code)
+end
+
+-- "Is there an ENTRY at this name?" — the lstat form of exists(), which stops
+-- at a symlink instead of following it (see run_prior()). The option landed in
+-- mix 0.39.0; on anything older the call raises ARITY_MISMATCH, and an uncaught
+-- raise exits 1 — the code this arc reserves for "a violation was found". A
+-- hook that cannot ask its question has not found a violation, it has failed to
+-- look, which is 2. So the raise is translated rather than left to escape.
+--
+-- This gets the same probe-the-behaviour treatment require_stdin_raises() gets,
+-- and for the same reason: Mix does not enforce builtin arity unless run with
+-- --strict-arity, so an older interpreter does not refuse the option, it
+-- DISCARDS it and answers the follow question anyway. Verified against a 0.38.0
+-- build: `exists(dangling, {follow_symlinks: false})` returns false there, which
+-- is the exact wrong answer this round exists to stop, delivered silently.
+--
+-- I wrote a `try` around the call first, on the assumption that a wrong-arity
+-- call raises. It does not, and a `try` that can never fire is not a guard —
+-- it is a comment that looks like one.
+--
+-- It takes TWO questions, because an old Mix fails in two different ways and a
+-- probe that conflates them is worse than none. Arity enforcement is optional
+-- (`--strict-arity`), so:
+--
+--   lenient old Mix  — accepts the call, DISCARDS the option, answers wrong
+--   strict old Mix   — raises ARITY_MISMATCH on the call
+--   0.39.0           — accepts the call, honours the option
+--
+-- A single "does a bad option raise?" probe reads the strict-arity raise as
+-- proof of support, then the real call raises uncaught and exits 1 — the code
+-- reserved for "a violation was found", from a hook that never got to look.
+-- That was the first draft, and it was caught in review and reproduced against
+-- a 0.38.0 build under --strict-arity.
+--
+-- So: the valid form must not raise (rules out strict old Mix), AND an invalid
+-- option must raise (rules out lenient old Mix, which ignores it and returns).
+-- Both land on the same refusal — either way this interpreter cannot be asked.
+--
+-- What the two prove together: this interpreter accepts the option and looks at
+-- it. That `follow_symlinks` is then honoured is covered by a unit test in
+-- cosmix-lib-mix and end to end by T67/T68/T69. Two builtin calls, nothing
+-- written to disk — cheap enough to sit in front of every call, unlike the
+-- subprocess require_stdin_raises() needs.
+-- The Mix RUNNING this, which is not necessarily $MIX and must not be described
+-- as it: require_stdin_raises() probes $MIX in a subprocess and can name its
+-- version, this probes the interpreter evaluating these lines and cannot (no
+-- version()/mix_version() builtin — feedback_mix_no_self_version). Normally
+-- they are the same binary, because the installed stub invokes $MIX; when they
+-- are not, printing $MIX's version as the culprit names the wrong one, and the
+-- first draft did exactly that — "mix 0.39.0 ignores the second argument",
+-- reported by a 0.38.0 build. So $MIX's version is given as context, labelled.
+fn no_lstat_option($why)
+  refuse(2, "the Mix running this hook " .. $why .. ", so it cannot be asked"
+    .. " whether a name is an ENTRY rather than a readable file. Mix >= 0.39.0"
+    .. " is required: without it a DANGLING <hook>.pre-hygiene reads as absent"
+    .. " and the chained hook's veto is dropped in silence. Refusing rather"
+    .. " than scanning past it. (The stub runs this hook with " .. $MIX
+    .. ", currently " .. mix_version() .. "; if that reads >= 0.39.0 then this"
+    .. " hook was started by some other Mix)")
+end
+
+fn require_lstat_option()
+  try
+    exists("/", {follow_symlinks: false})
+  catch $ae
+    no_lstat_option("rejects the second argument to exists() (" .. $ae .. ")")
+  end
+  try
+    exists("/", "not-a-map")
+  catch $pe
+    return true
+  end
+  no_lstat_option("ignores the second argument to exists()")
+  return false
+end
+
+fn entry_exists($p)
+  require_lstat_option()
+  return exists($p, {follow_symlinks: false})
+end
+
+-- The hook's own git calls, pinned the same way the gate pins its own
+-- (check-public-hygiene.mix `git_argv`). Only one of them reads objects —
+-- `cat-file --batch-check`, which asks whether this clone actually HAS what the
+-- destination advertises — but that one is enough for the two sides to disagree
+-- about what exists. `git update-ref refs/replace/<absent sha> <a blob>` makes
+-- `--batch-check` answer "blob 2" for an object the clone does not have
+-- (verified 2026-07-25); the sha is then handed to the gate as `^<sha>`, and the
+-- gate's rev-list — which DOES pass --no-replace-objects — cannot exclude an
+-- object it cannot see, so the scan aborts and a legitimate push is refused with
+-- an infrastructure error. Fails closed, so it was never a hole; it is fixed
+-- because a presence probe and the scan it bounds must not disagree about which
+-- objects exist.
+fn git_argv($repo)
+  return ["git", "--no-replace-objects", "-C", $repo]
+end
+
+-- A SHA can be trimmed; a PATHNAME cannot. Trailing whitespace is legal in a
+-- directory name, so `trim()` on a path git printed silently names a DIFFERENT
+-- directory. Three sites in this arc got that wrong (pre-push `$2`, the
+-- installer's hooks dir, and both callers below). Strip the one terminator.
+fn chomp_path($s)
+  if ends_with($s, "\n") then
+    return substr($s, 0, len($s) - 1)
+  end
+  return $s
+end
+
+-- pre-push's refusal of an undecodable ref list is not this script's alone: it
+-- needs a Mix whose read_stdin() RAISES on invalid UTF-8. Before 0.33.0 it
+-- returned "", which is indistinguishable from "nothing was pushed" — the catch
+-- below never fires, zero refs are iterated, and the hook exits 0 having
+-- scanned nothing. So the requirement is checked, not assumed: a downgrade of
+-- /opt/cosmix/bin/mix must break the hook loudly, not quietly disarm it.
+--
+-- The version below is documentation and an error message, NOT the check —
+-- require_stdin_raises() probes the behaviour itself. A version comparison here
+-- was the earlier design and it asserted the wrong thing twice over: it trusted
+-- a self-reported string as evidence of behaviour, and it refused a Mix built
+-- as 0.34.0-rc.1, which behaves correctly, because its parser wanted three
+-- clean integers.
+$MIN_MIX = [0, 33, 0]
+
+fn mix_version()
+  $r = run_argv([$MIX, "--version"], {timeout: 60})
+  if $r["ok"] != true then
+    return "unknown"
+  end
+  return trim($r["stdout"])
+end
+
+-- Ask the interpreter, not its version number.
+--
+-- A version string is a claim ABOUT behaviour; this feeds the running binary
+-- the exact input the hook's correctness depends on — a byte that is not valid
+-- UTF-8 — and keeps the answer only if read_stdin() actually raised. A future
+-- Mix that reports 0.99.0 and regresses to returning "" is caught; so is a Mix
+-- built with a prerelease suffix that a semver parser would have rejected while
+-- behaving perfectly. The version is read only to name the culprit in the
+-- refusal, never to decide it.
+--
+-- Both the installed hook's shebang and its body invoke $MIX, so probing that
+-- binary probes the interpreter actually running this — not a different one on
+-- PATH. (A script cannot read its own interpreter's version, or its behaviour,
+-- from inside Mix; there is no version()/mix_version() builtin. Worth adding —
+-- see feedback_mix_no_self_version.)
+fn require_stdin_raises()
+  $probe = join([
+    "try",
+    "  $s = read_stdin()",
+    "  print(\"RETURNED \" .. len($s))",
+    "catch $e",
+    "  print(\"RAISED\")",
+    "end"
+  ], "\n")
+  -- 0x80 is a continuation byte with nothing to continue: never valid UTF-8.
+  $r = run_argv([$MIX, "-c", $probe],
+    {timeout: 60, stdin: freeze(buffer([0x80]))})
+  if $r["ok"] != true then
+    refuse(2, "cannot probe " .. $MIX .. " (" .. mix_version() .. ") for its"
+      .. " undecodable-stdin behaviour — refusing rather than assuming it"
+      .. " raises")
+  end
+  if trim($r["stdout"]) != "RAISED" then
+    refuse(2, $MIX .. " (" .. mix_version() .. ") returns instead of raising on"
+      .. " stdin that is not UTF-8 (probe said: " .. sanitize(trim($r["stdout"]))
+      .. "). This hook needs the raise: without it a ref name containing one"
+      .. " such byte makes read_stdin() hand back \"\", which is"
+      .. " indistinguishable from \"nothing was pushed\" — zero refs are"
+      .. " iterated and pre-push exits 0 having scanned nothing. Mix >= "
+      .. join($MIN_MIX, ".") .. " raises")
+  end
+end
+
+-- Run the gate once. Returns its exit code; prints whatever it said.
+--
+-- --from-hook goes on EVERY call, centrally, because every call from this file
+-- is by definition from a hook. It is not a bypass: it swaps the gate's flat
+-- refusal of an ambient GIT_DIR/GIT_INDEX_FILE for a check that they point into
+-- this repo's own gitdir. Git sets both for hooks in a linked `git worktree`
+-- checkout — which is how parallel sessions work here — so a flat refusal
+-- blocked every commit made from one. It was on the --index call alone at
+-- first, and commit-msg then refused the very next moment.
+fn gate_input($mode_args, $stdin)
+  $opts = {timeout: 1800, max_output: $CAP}
+  if $stdin != nil then
+    $opts["stdin"] = $stdin
+  end
+  $r = run_argv(concat([$MIX, $GATE], concat($mode_args, ["--from-hook"])), $opts)
+  -- 0 and 1 are claims about the tree; a Mix runtime error is not, and it exits
+  -- 1 as well. The gate's own last line says it reached its end, so strip that
+  -- line (nobody needs to read it) and remember whether it was there. Round
+  -- twenty — before this, deleting the gate after installation made every
+  -- commit report a mesh-private violation that had never been looked for.
+  $out = trim($r["stdout"])
+  $done = false
+  if $r["exit_code"] != nil then
+    $mark = $COMPLETE .. " " .. ("" .. $r["exit_code"])
+    if ends_with($out, $mark) then
+      $done = true
+      $out = trim(substr($out, 0, len($out) - len($mark)))
+    end
+  end
+  if $out != "" then
+    print($out)
+  end
+  if trim($r["stderr"]) != "" then
+    print($r["stderr"])
+  end
+  if $r["exit_code"] == nil then
+    print("gate did not run: " .. ("" .. $r["error"]))
+    return 2
+  end
+  -- Round twenty-one's cold review. The marker is printed last, so a capture
+  -- that hit the cap loses it — and the branch below then diagnosed a gate that
+  -- had been "moved, made unreadable, or that raised", pointing the operator at
+  -- a file that is perfectly fine. The exit code cannot rescue it either: a Mix
+  -- runtime error exits 1 as well, which is the whole reason the marker exists.
+  -- So this stays a 2 — the code that means "no verdict was established" — and
+  -- says what actually happened.
+  if $r["stdout_truncated"] or $r["stderr_truncated"] then
+    -- Round twenty-two's cold review. This test used to sit BELOW the exit-2
+    -- return, so the one path that prints nothing but a diagnostic was the one
+    -- path that never said the diagnostic was cut off. The verdict is 2 either
+    -- way, which is exactly why the ordering looked harmless — but an operator
+    -- reading a truncated refusal has no way to tell it is truncated, and the
+    -- part that was cut is the part that names the file. Same class as the
+    -- finding that put this branch here: fail-closed is not the same as
+    -- honest.
+    if $r["exit_code"] == 2 then
+      print("hygiene-hook: the gate refused to give a verdict (exit 2) and its"
+        .. " explanation is longer than this hook captures ("
+        .. floor($CAP / 1048576) .. " MiB per stream), so what is above is CUT"
+        .. " OFF — including, most likely, the part naming what could not be"
+        .. " scanned. Re-run `" .. $MIX .. " " .. $GATE .. "` directly to read"
+        .. " all of it.")
+      return 2
+    end
+    print("hygiene-hook: the gate produced more output than this hook captures ("
+      .. floor($CAP / 1048576) .. " MiB per stream) and what is above is CUT"
+      .. " OFF. The gate prints its end-of-scan marker last, so a truncated"
+      .. " capture is exactly the case where a completed scan cannot be told"
+      .. " apart from a crashed one; this run will not claim a verdict either"
+      .. " way. Treating it as a scan that did not happen — re-run `" .. $MIX
+      .. " " .. $GATE .. "` directly to read the whole report. Output that large"
+      .. " is itself worth looking at.")
+    return 2
+  end
+  -- 2 is already "do not read this as a verdict", so it needs no marker and
+  -- saying anything more about it would be noise on a path that is behaving.
+  if $r["exit_code"] == 2 then
+    return 2
+  end
+  if $done == false then
+    print("hygiene-hook: the gate exited " .. $r["exit_code"] .. " without"
+      .. " reporting that it finished. A Mix runtime error — a gate that has"
+      .. " been moved, made unreadable, or that raised — exits 1 too, and 1 is"
+      .. " the code reserved for 'mesh-private data was found'. This run cannot"
+      .. " tell those apart, so it will not claim a verdict: treating it as a"
+      .. " scan that did not happen. Check " .. $GATE)
+    return 2
+  end
+  -- Round twenty-two's cold review. The marker is built from whatever the gate
+  -- exited with, so a gate that printed "hygiene-scan-complete: 3" and exited 3
+  -- was read as a completed scan and its 3 was passed straight out — through a
+  -- hook whose entire job is to speak the 0/1/2 contract. git only asks whether
+  -- the code is zero, so this was never unsafe; it was the contract quietly not
+  -- being true. A status outside the contract is a gate that is not the gate
+  -- this hook knows how to read, which is the definition of 2.
+  if $r["exit_code"] != 0 and $r["exit_code"] != 1 then
+    print("hygiene-hook: the gate reported that it finished and exited "
+      .. $r["exit_code"] .. ", which is not one of the three codes it is"
+      .. " allowed to end on (0 clean, 1 mesh-private data found, 2 the scan"
+      .. " could not be trusted). A gate that answers outside that contract"
+      .. " cannot be read as a verdict at all — treating it as a scan that did"
+      .. " not happen. Check " .. $GATE)
+    return 2
+  end
+  return $r["exit_code"]
+end
+
+fn gate($mode_args)
+  return gate_input($mode_args, nil)
+end
+
+fn blocked()
+  print("")
+  print("BLOCKED — public-repo hygiene gate.")
+  print("This content must not reach a public repo. Sanitize it:")
+  print("  ipv4 -> RFC 5737 (192.0.2.x)   domain -> example.com   node -> alpha/beta/gamma")
+  print("If a match is genuinely not a leak, add a fingerprinted exception to")
+  print("  " .. $ALLOW)
+  print("  (get the fingerprint with --print-fingerprints; never add a path glob)")
+end
+
+-- Where this working tree's hooks actually live. `--git-path hooks` is
+-- worktree-correct (a linked worktree's .git is a file, not a directory) and
+-- honours core.hooksPath if it is ever set.
+fn hooks_dir($repo)
+  $r = run_argv(concat(git_argv($repo), ["rev-parse", "--git-path", "hooks"]), {timeout: 60})
+  -- The fallback here used to be `$repo/.git/hooks`, and a guess is exactly the
+  -- wrong answer: the ONLY caller is run_prior(), so guessing wrong does not
+  -- fail — `exists()` says there is no chained hook and a foreign veto that
+  -- does exist is silently dropped. Under core.hooksPath the guess is wrong by
+  -- construction. Infrastructure failure must not become chain omission.
+  if $r["ok"] != true then
+    refuse(2, "cannot resolve this repo's hooks directory (" ..
+      sanitize(trim($r["stderr"])) .. ") — a chained hook there would be"
+      .. " skipped without anyone noticing, so refusing rather than guessing")
+  end
+  -- run_argv returns ok=true with the retained prefix when stdout crosses its
+  -- cap. Feeding that prefix to exists() silently looks in a different
+  -- directory and skips an existing chained veto — the same failure the
+  -- empty-output and lossy-decode guards below each close for their case.
+  if $r["stdout_truncated"] then
+    refuse(2, "this repo's hooks-directory lookup was truncated — a chained"
+      .. " hook would be looked for at an incomplete pathname and its veto could"
+      .. " be skipped, so refusing rather than using the retained prefix")
+  end
+  -- This directory is where the CHAINED foreign hook lives, so getting it wrong
+  -- does not fail loudly — `exists()` says no and the prior hook's veto is
+  -- silently skipped. With `core.hooksPath = "…/hooks "` the installer saved
+  -- the foreign hook into the spaced directory (correctly) while this function
+  -- looked in the unspaced sibling: a chained veto that never ran. Round twelve.
+  if $r["utf8_lossy"] then
+    refuse(2, "this repo's hooks path is not valid UTF-8, so a chained hook"
+      .. " there cannot be found without renaming it — refusing rather than"
+      .. " skipping a veto that may exist")
+  end
+  $p = chomp_path($r["stdout"])
+  -- exit 0 with nothing on stdout is not an answer, and it is the one failure
+  -- shape the ok-check above cannot see: an empty $p makes the relative branch
+  -- return "$repo/", `exists("$repo/pre-commit.pre-hygiene")` says false, and a
+  -- chained veto is dropped in silence — the same failure the guess used to
+  -- cause, arriving through a success. A shimmed, wrapped, or future git that
+  -- prints nothing gets the same refusal as one that errors. Round fourteen.
+  if $p == "" then
+    refuse(2, "this repo's hooks-directory lookup succeeded but returned"
+      .. " nothing — a chained hook would be looked for in the wrong place and"
+      .. " skipped without anyone noticing, so refusing rather than guessing")
+  end
+  if starts_with($p, "/") then
+    return $p
+  end
+  return $repo .. "/" .. $p
+end
+
+-- The preserved hooks currently running above this invocation, innermost last,
+-- one realpath per line. Empty (not one empty entry) when the mark is unset,
+-- and empty for round twenty-three's bare "1" as well — an ambient value that
+-- names no file is not evidence of a chain and is dropped rather than obeyed.
+$CHAIN_MAX = 8
+
+fn chain_stack()
+  $out = []
+  for each $p in split(env("COSMIX_HYGIENE_CHAIN", ""), "\n")
+    if starts_with($p, "/") then
+      push($out, $p)
+    end
+  end
+  return $out
+end
+
+-- A hook that was already installed when we arrived is preserved as
+-- <hook>.pre-hygiene and runs FIRST — its veto stands on its own.
+fn run_prior($repo, $name, $stdin, $hook_args)
+  $prior = hooks_dir($repo) .. "/" .. $name .. ".pre-hygiene"
+  -- lstat form, not the plain one (round sixteen). exists() follows the link,
+  -- so a DANGLING .pre-hygiene symlink read as "no chained hook" and this
+  -- returned 0 — the chained veto dropped in silence, which is the exact
+  -- failure round twelve went to such lengths to close on the directory lookup
+  -- one line above. With lstat the entry is seen, run_argv's spawn fails,
+  -- exit_code is nil, and the refusal below fires.
+  if entry_exists($prior) == false then
+    return 0
+  end
+  -- git's own hook arguments are forwarded: a chained pre-push hook that reads
+  -- $1/$2 to decide which remote it is guarding would otherwise see nothing
+  -- and either misfire or silently pass.
+  -- Same cap, and here it costs nothing beyond a clipped message: the chained
+  -- hook's verdict is its EXIT CODE, which truncation cannot touch.
+  -- The chain mark. run_argv's `env` MERGES into the inherited environment
+  -- rather than replacing it (verified against the binary — a replacing form
+  -- here would strip PATH, HOME and GIT_* out from under the chained hook and
+  -- break it in a far more confusing way), so this adds one variable and
+  -- changes nothing else.
+  --
+  -- The mark is the STACK of preserved hooks currently running, one realpath
+  -- per line, and the refusal is an exact membership test against it. Round
+  -- twenty-three's version was the bare string "1" and refused on any non-empty
+  -- value, which is a different, wrong question: `COSMIX_HYGIENE_CHAIN=1` in an
+  -- operator's or CI's ambient environment blocked every clean commit at exit
+  -- 2 before scanning anything, and a chained hook in repository A that commits
+  -- generated output into guarded repository B passed the mark into B, where B
+  -- reported itself chained below itself although the two chains are unrelated.
+  -- An identity says which file, so it can answer the question actually being
+  -- asked: is THIS preserved hook already running above me?
+  --
+  -- The depth cap is the backstop for the case identity alone cannot see: two
+  -- repositories whose chained hooks commit into each other cycle with a
+  -- different path at every step, and the list would grow forever. Eight is
+  -- past any real chain and far below anything that hurts.
+  --
+  -- What this still cannot do, stated plainly: a chained hook that UNSETS the
+  -- variable removes the backstop. Nothing in a child's environment survives a
+  -- child determined to clear it; the classification in is_our_stub is the
+  -- primary defence and this is the second one, not a guarantee.
+  $pr = realpath($prior)
+  if $pr == nil then
+    $pr = $prior
+  end
+  $seen = chain_stack()
+  if contains($seen, $pr) then
+    refuse(2, "this hook is chained below itself — " .. $pr .. " is already"
+      .. " running above this invocation and re-invokes hygiene-hook.mix, which"
+      .. " would chain to it again without end. That preserved file is a stub of"
+      .. " this gate that the installer did not recognise as its own; remove it"
+      .. " and re-run install-hygiene-hooks.mix. Nothing was scanned")
+  end
+  if len($seen) >= $CHAIN_MAX then
+    refuse(2, "the chained-hook stack is " .. len($seen) .. " deep (limit "
+      .. $CHAIN_MAX .. ") — no single hook repeats, so this is a cycle between"
+      .. " repositories whose chained hooks invoke git in one another rather"
+      .. " than one hook below itself. Refusing before it grows; nothing was"
+      .. " scanned")
+  end
+  $r = run_argv(concat([$prior], $hook_args),
+    {timeout: 1800, stdin: $stdin, max_output: $CAP,
+     env: {COSMIX_HYGIENE_CHAIN: join(concat($seen, [$pr]), "\n")}})
+  if trim($r["stdout"]) != "" then
+    print($r["stdout"])
+  end
+  if trim($r["stderr"]) != "" then
+    print($r["stderr"])
+  end
+  if $r["exit_code"] == nil then
+    print("hygiene-hook: pre-existing " .. $name .. " hook did not run — refusing")
+    return 2
+  end
+  -- A chained hook's veto STANDS — git needs a non-zero status and gets one —
+  -- but it does not get to wear this gate's exit code. 1 here means "a
+  -- mesh-private literal was found"; a chained hook exiting 1 because its own
+  -- dependency is missing means the scan never ran, which is exactly what 2 is
+  -- for. The previous round passed the foreign status through untouched and
+  -- annotated it in prose, and round eighteen's cold review was right that prose
+  -- does not reach a machine reading the status: git only distinguishes zero
+  -- from non-zero, so preserving the exact foreign code buys nothing and costs
+  -- the one distinction this arc is built on. An arbitrary foreign status (42)
+  -- escaped the 0/1/2 contract entirely for the same reason. So: veto honoured,
+  -- code normalised to 2, original code named in the annotation.
+  if $r["exit_code"] != 0 then
+    print("hygiene-hook: the chained " .. $name .. ".pre-hygiene hook exited "
+      .. $r["exit_code"] .. " — that refusal is ITS decision, not this gate's."
+      .. " The veto stands (this hook exits 2), but the mesh-private scan has"
+      .. " NOT run: this says nothing about whether the tree is clean")
+    return 2
+  end
+  return 0
+end
+
+-- Strip the credentials out of a URL before it is printed. sanitize() makes
+-- bytes safe to display; it does not make a password safe to display. Two
+-- places carry them, and round eighteen's cold review found the second one
+-- open: the userinfo before "@", and the QUERY STRING — `?access_token=…` has
+-- no "@" at all, so the first cut returned it unchanged and printed the token.
+-- The query is dropped wholesale rather than parsed, because which parameter is
+-- a secret is the remote's business, not this hook's.
+--
+-- The authority ends at the first of "/", "?" or "#", not at "/" alone; that
+-- too was wrong, and it mattered: in `https://host?next=user@example.org` the
+-- "@" is in the query, and treating it as userinfo replaced the real host with
+-- the one in the parameter — a diagnostic naming a machine nobody pushed to.
+-- A string with no "://" is a remote NAME (or scp-style git@host:path, which
+-- carries no password) and is returned untouched.
+fn first_pos($s, $needles)
+  $best = 0
+  for each $n in $needles
+    $i = pos($n, $s)
+    if $i != 0 and ($best == 0 or $i < $best) then
+      $best = $i
+    end
+  end
+  return $best
+end
+
+fn redact($s)
+  $i = pos("://", $s)
+  if $i == 0 then
+    return $s
+  end
+  -- pos() is 1-based and substr() is 0-based, so $i + 2 is the offset of the
+  -- first character after "://" as well as the length of everything up to it.
+  $scheme = substr($s, 0, $i + 2)
+  $rest = substr($s, $i + 2)
+  $end = first_pos($rest, ["/", "?", "#"])
+  $authority = $rest
+  $tail = ""
+  if $end != 0 then
+    $authority = substr($rest, 0, $end - 1)
+    $tail = substr($rest, $end - 1)
+  end
+  $at = pos("@", $authority)
+  if $at != 0 then
+    $authority = "***" .. substr($authority, $at - 1)
+  end
+  -- Everything from the first `?` or `#` goes, wholesale. Which parameter is a
+  -- secret is the remote's business, not this hook's, and round twenty found
+  -- the half-measure: `?` was dropped but `#` was not, so
+  -- `https://host/repo.git#access_token=…` printed the token verbatim. A tail
+  -- this code has not parsed is a tail it cannot vouch for.
+  $q = first_pos($tail, ["?", "#"])
+  if $q != 0 then
+    $tail = substr($tail, 0, $q - 1) .. substr($tail, $q - 1, 1) .. "<redacted>"
+  end
+  return $scheme .. $authority .. $tail
+end
+
+-- What the DESTINATION actually holds right now, as a list of sha strings.
+-- nil when it could not be determined.
+--
+-- This replaces reading `refs/remotes/<name>/*`, which answers a different
+-- question: local tracking refs describe wherever that name pointed the last
+-- time it was fetched. Repoint `origin` from a private repo to a fresh public
+-- one and the stale namespace still "proves" the violating commits are already
+-- published, so a new-branch push selected zero commits and reported clean.
+-- It also retires the name-vs-URL guess entirely — `ls-remote` resolves a
+-- configured name and a bare URL alike, so `git push archive.git main` no
+-- longer has to be classified before it can be bounded.
+--
+-- GIT_TERMINAL_PROMPT=0: git has already spoken to this remote to build the
+-- ref lines on stdin, so credentials are warm; if they are not, fail fast
+-- rather than hang a hook on a password prompt nobody can see.
+fn remote_haves($repo, $remote)
+  if $remote == "" then
+    return nil
+  end
+  $r = run_argv(concat(git_argv($repo), ["ls-remote", "--heads", "--tags", $remote]),
+    {timeout: 300, max_output: 67108864, env: {GIT_TERMINAL_PROMPT: "0"}})
+  if $r["ok"] != true or $r["timed_out"] or $r["stdout_truncated"] then
+    return nil
+  end
+  $unique = []
+  $seen = {}
+  for each $l in split($r["stdout"], "\n")
+    $sha = trim(split(trim($l), "\t")[0])
+    if $sha != "" and $seen[$sha] == nil then
+      $seen[$sha] = true
+      push($unique, $sha)
+    end
+  end
+  if len($unique) == 0 then
+    return []
+  end
+  -- A large remote can advertise tens of thousands of refs. One cat-file per
+  -- ref made hook time linear in process startups; duplicates made it worse.
+  $batch = run_argv(concat(git_argv($repo), ["cat-file", "--batch-check"]), {
+    timeout: 300,
+    max_output: 67108864,
+    stdin: join($unique, "\n") .. "\n"
+  })
+  if $batch["ok"] != true or $batch["timed_out"] or $batch["stdout_truncated"] then
+    return nil
+  end
+  $present = []
+  for each $line in split($batch["stdout"], "\n")
+    if trim($line) != "" then
+      $fields = split(trim($line), " ")
+      -- rev-list cannot exclude an object this clone does not have, and passing
+      -- one aborts the scan. Skipping it only WIDENS the range, which is safe.
+      if len($fields) >= 3 and $seen[$fields[0]] == true then
+        push($present, $fields[0])
+      end
+    end
+  end
+  return $present
+end
+
+$argv = args()
+if len($argv) < 1 then
+  refuse(2, "usage: hygiene-hook.mix <pre-commit|commit-msg|pre-push>")
+end
+-- args() and $1 are two views of one list, and until mix 0.40.0 they could
+-- disagree: args() re-derived the arguments from the process command line with
+-- a fixed skip, so any flag before the script shifted the whole list by one
+-- while the positionals stayed right. Here that is not cosmetic — pre-push
+-- reads the remote from $hook_args[0] and the ref pair from stdin's companion
+-- arguments, so a shift means guarding a remote git never named, silently.
+-- The positionals are the trustworthy view on every interpreter, so they are
+-- the ones that get to call it. (The installer does not need this: a shifted
+-- argument there lands on unknown-flag and it refuses to act anyway.)
+if $argv[0] != $1 then
+  refuse(2, "this Mix disagrees with itself about the arguments — args() says "
+    .. ("" .. $argv[0]) .. " and $1 says " .. ("" .. $1) .. ". Mix < 0.40.0"
+    .. " shifts args() when a flag precedes the script, and every argument"
+    .. " this hook reads would then be off by one. Refusing rather than"
+    .. " guarding a remote git did not name")
+end
+
+$mode = $argv[0]
+$hook_args = slice($argv, 1)
+
+-- The recursion backstop for a failure that was measured rather than imagined
+-- — a stub the installer does not RECOGNISE as its own is preserved as
+-- `<hook>.pre-hygiene` and chained, and since the preserved copy is a stub it
+-- re-invokes this file, which chains the same file again; one `git commit`
+-- reached ~5,400 processes and a load average of 604 — lives in run_prior,
+-- next to the spawn it guards. It was here in round twenty-three, refusing on
+-- any non-empty COSMIX_HYGIENE_CHAIN, which is a question this file cannot
+-- answer at this point: it does not yet know which preserved hook it is about
+-- to run, so an ambient value or a mark inherited from an unrelated repository
+-- read as "below myself" and killed clean commits at exit 2 before scanning.
+-- See run_prior for the identity-and-depth form that replaced it.
+
+-- git runs hooks with cwd at the top of the working tree being operated on,
+-- which is what makes this worktree-correct. Resolving it (rather than
+-- trusting cwd directly) also means the gate always gets an absolute path.
+$top = run_argv(["git", "--no-replace-objects", "rev-parse", "--show-toplevel"], {timeout: 60})
+if $top["ok"] != true then
+  refuse(2, "cannot resolve the working tree — refusing to guess what to scan")
+end
+-- A retained stdout prefix is not a pathname. Without this check the gate is
+-- handed a different repository name and can scan nothing relevant while the
+-- hook reports its verdict under the real working tree.
+if $top["stdout_truncated"] then
+  refuse(2, "the working-tree path output was truncated — refusing rather than"
+    .. " scan the retained pathname prefix")
+end
+-- chomp, not trim: this path is handed to the gate as `-C <repo>` and compared
+-- against the gitdir, so a working tree whose directory name ends in a space
+-- became its unspaced sibling and every clean commit there was refused.
+-- Reproduced round twelve.
+if $top["utf8_lossy"] then
+  refuse(2, "the working-tree path is not valid UTF-8, so it cannot be named"
+    .. " without changing it — refusing rather than scanning whatever the"
+    .. " replacement characters point at")
+end
+$repo = chomp_path($top["stdout"])
+if $repo == "" then
+  refuse(2, "empty working-tree path — refusing")
+end
+
+if $mode == "pre-commit" then
+  -- git gives pre-commit no stdin; do NOT read_stdin() here — on a terminal
+  -- that blocks forever and wedges every commit.
+  $rc = run_prior($repo, "pre-commit", nil, $hook_args)
+  if $rc != 0 then
+    exit($rc)
+  end
+  -- The whole staged index, not the diff: content staged by an earlier
+  -- `git add` is just as published as content staged now.
+  -- gate_input() adds --from-hook, which is what entitles this call to the
+  -- ambient GIT_INDEX_FILE: git sets it here on purpose, and for a partial
+  -- commit it names a temporary index that is the only correct thing to scan.
+  -- A hand-run --index gets no such entitlement. See require_clean_git_env().
+  $rc = gate(["--index", $repo])
+  if $rc != 0 then
+    if $rc == 1 then
+      blocked()
+    end
+    exit($rc)
+  end
+  exit(0)
+end
+
+if $mode == "commit-msg" then
+  -- git passes the path to the pending message file as $1. A leak in a commit
+  -- MESSAGE is published like any other content and no tree scan can see it;
+  -- pre-push catches it too, but by then fixing it costs a rebase.
+  $rc = run_prior($repo, "commit-msg", nil, $hook_args)
+  if $rc != 0 then
+    exit($rc)
+  end
+  if len($hook_args) < 1 then
+    refuse(2, "commit-msg hook got no message file — refusing")
+  end
+  $rc = gate(["--message", $repo, $hook_args[0]])
+  if $rc != 0 then
+    if $rc == 1 then
+      blocked()
+    end
+    exit($rc)
+  end
+  exit(0)
+end
+
+if $mode == "pre-push" then
+  -- One line per ref: <local ref> <local sha> <remote ref> <remote sha>
+  --
+  -- Git ref names are bytes, not text: everything outside a short forbidden
+  -- set is legal, including bytes that are not UTF-8. Mix's read_stdin() used
+  -- to swallow the decode error and hand back "" — indistinguishable from "git
+  -- pushed nothing" — so a ref named with a single 0x80 made this loop iterate
+  -- zero refs and exit 0 WITHOUT RUNNING THE GATE AT ALL. It is fixed in the
+  -- binary (mix 0.33.0 raises instead), and this catch is the half that belongs
+  -- here: an uncaught raise exits 1, the code reserved for "found a violation",
+  -- and a push blocked by an unreadable ref list is infrastructure, not a leak.
+  -- The raise is a property of the binary, so demonstrate it before relying on
+  -- it — the probe feeds this same binary a byte that cannot decode.
+  require_stdin_raises()
+  $stdin = ""
+  try
+    $stdin = read_stdin()
+  catch $e
+    refuse(2, "cannot read the pushed ref list from stdin (" .. $e .. ")"
+      .. " — refusing the push rather than scanning nothing")
+  end
+  $rc = run_prior($repo, "pre-push", $stdin, $hook_args)
+  if $rc != 0 then
+    exit($rc)
+  end
+
+  -- git passes the remote as $1 (a configured NAME, or a bare URL for an
+  -- anonymous push) and the LOCATION it is actually pushing to as $2. Which
+  -- refs the destination already holds is what bounds the scan, so asking the
+  -- wrong destination is a silent bypass, not a cosmetic slip.
+  --
+  -- $2 is the one to ask. `git ls-remote <name>` resolves the FETCH url, and
+  -- `remote.<name>.pushurl` is exactly the case where the two differ: the fetch
+  -- side already holding a leaking commit excluded it from the range, and the
+  -- push side — which had never seen it — received it with the hook printing
+  -- "scanning 0 commit(s)" and exiting 0. Reproduced end to end, round ten.
+  --
+  -- $1 is kept for the diagnostic, because "cannot read origin's refs" is what
+  -- an operator can act on; a URL is what the code has to use. It is only ever
+  -- printed through redact(): for a configured remote git passes the NAME, but
+  -- for `git push https://user:token@host/r …` it passes that URL verbatim, and
+  -- the "cannot read X's refs" line below is an ORDINARY path (an unreachable
+  -- destination reaches it), so a credential would land in terminal scrollback
+  -- and in anything capturing this hook's output.
+  $remote_name = ""
+  if len($hook_args) >= 1 then
+    $remote_name = trim($hook_args[0])
+  end
+  --
+  -- $2 is used EXACTLY as git gave it, and there is no fallback to $1.
+  -- Both of those were wrong in the first version of this fix:
+  --   * `trim($2)` — a git location is an opaque string, and a path may end in
+  --     a space. Measured: `git remote add origin "…/dest "` makes git pass
+  --     `…/dest ` as $2, trim asked the SIBLING repo `…/dest`, which already
+  --     held the leaking tip, and the push landed at exit 0 with "scanning 0
+  --     commit(s)". A normalisation that changes which repository is consulted
+  --     is a bypass, however cosmetic it looks.
+  --   * falling back to $1 when $2 is absent — that is precisely the
+  --     pre-round-ten bug, reinstated for the case nobody can observe. An
+  --     absent $2 means the destination is UNKNOWN, and unknown widens the
+  --     range to everything reachable (remote_haves("") → nil). Widening is
+  --     the fail-safe direction; asking the fetch url is not.
+  $remote_dest = ""
+  if len($hook_args) >= 2 then
+    $remote_dest = $hook_args[1]
+  end
+  -- Asked once per push, not per ref.
+  $haves = remote_haves($repo, $remote_dest)
+  if $haves == nil then
+    if $remote_dest == "" then
+      -- Not "everything reachable" unconditionally: for a ref the destination
+      -- already has, git's own stdin line still gives a remote sha and the
+      -- range stays `$remote..$local`. Only a NEW ref widens all the way.
+      print("hygiene-hook: git did not name a push destination"
+        .. " — bounding the scan by what git itself reported, or by everything"
+        .. " reachable, rather than trusting " .. redact($remote_name))
+    else
+      print("hygiene-hook: cannot read " .. redact($remote_name) .. "'s refs"
+        .. " — bounding the scan by what git itself reported, or by everything reachable")
+    end
+  end
+
+  for each $line in split($stdin, "\n")
+    $f = split(trim($line), " ")
+    -- A non-empty record that is not git's four fields is not a record to skip
+    -- past. Skipping was the old behaviour and it is the same failure shape as
+    -- the undecodable-stdin one: the ref goes unscanned and the hook still
+    -- exits 0. Whatever produced it — a truncated pipe, a future git, a
+    -- chained wrapper rewriting stdin — the honest answer is that this hook
+    -- cannot tell what is being published.
+    if trim($line) != "" and len($f) != 4 then
+      refuse(2, "cannot parse a pushed-ref record from git (" .. len($f)
+        .. " field(s), expected 4: " .. sanitize(trim($line)) .. ")"
+        .. " — refusing the push rather than skipping a ref unscanned")
+    end
+    if len($f) == 4 then
+      $local = $f[1]
+      $remote = $f[3]
+      -- All-zero LOCAL sha = branch deletion: nothing is published.
+      if is_null_oid($local) == false then
+        -- Bound the scan by what the DESTINATION was just observed to hold.
+        -- Not by `refs/remotes/*`: that is a cache of some past destination,
+        -- and a repointed remote turned it into a licence to skip commits.
+        --
+        -- If the destination could not be read, fall back to git's own datum
+        -- for THIS ref (the remote sha it put on stdin), and failing that scan
+        -- everything reachable. Slow, and on unsanitized history it will
+        -- refuse — correctly: publishing to a destination whose contents are
+        -- unknown publishes everything reachable.
+        $range = [$local]
+        $range_stdin = nil
+        if $haves != nil then
+          $exclusions = []
+          for each $s in $haves
+            push($exclusions, "^" .. $s)
+          end
+          -- Remote ref counts are unbounded. Feeding exclusions on stdin keeps
+          -- ARG_MAX out of the correctness path even for mirror-style remotes.
+          push($range, "--stdin")
+          $range_stdin = join($exclusions, "\n")
+          if len($exclusions) > 0 then
+            $range_stdin = $range_stdin .. "\n"
+          end
+        else
+          if is_null_oid($remote) == false then
+            $range = [$remote .. ".." .. $local]
+          else
+            print("hygiene-hook: destination contents unknown"
+              .. " — scanning everything reachable from " .. slice($local, 0, 8))
+          end
+        end
+        $rc = gate_input(concat(["--range", $repo], $range), $range_stdin)
+        if $rc != 0 then
+          if $rc == 1 then
+            blocked()
+          end
+          exit($rc)
+        end
+
+        -- The gate owns this walk so audit and hook coverage cannot drift.
+        $rc = gate(["--object-chain", $repo, $local])
+        if $rc != 0 then
+          if $rc == 1 then
+            blocked()
+          end
+          exit($rc)
+        end
+      end
+    end
+  end
+  exit(0)
+end
+
+refuse(2, "unknown mode: " .. $mode .. " (pre-commit|commit-msg|pre-push)")

@@ -1,0 +1,3802 @@
+#!/opt/cosmix/bin/mix
+-- install-hygiene-hooks.mix — wire the public-repo hygiene gate into git.
+--
+-- Installs `pre-commit`, `commit-msg` and `pre-push` into every repo listed in
+-- _etc/public-hygiene.conf.mix. Mandate:
+-- _decisions/2026-07-25-no-hardwired-mesh-values.md.
+--
+--   mix _bin/install-hygiene-hooks.mix            install / refresh
+--   mix _bin/install-hygiene-hooks.mix --status   report, change nothing
+--
+-- "change nothing" means no repository and no hooks directory is touched. The
+-- status run does still create and remove one temporary symlink under TMPDIR,
+-- because the report depends on how the interpreter answers a question about
+-- dangling links and this file measures rather than assumes. If it cannot even
+-- do that it reports every repository it still can, marks affected hook states
+-- UNVERIFIED, then exits 2: partial visibility is useful, but it is not a
+-- verified answer.
+--
+-- The installed hooks are 4-line STUBS that hand off to _bin/hygiene-hook.mix,
+-- where all the logic lives. So editing the logic takes effect immediately and
+-- the hook body stays a lintable file rather than a string emitted by a
+-- generator. Re-running this is only needed to add a repo or repair a stub.
+--
+-- WHY NOT SET core.hooksPath: all three public repos already carry a
+-- `.git/hooks/post-commit` (the indexd auto-indexer). Pointing hooksPath at a
+-- shared directory silently disables every hook not present there — the gate
+-- would install itself by breaking indexing. Per-repo stubs, chained, keep both.
+--
+-- But if a repo ALREADY has core.hooksPath set, git runs hooks from there and
+-- ignores .git/hooks entirely. Writing to .git/hooks in that case installs
+-- nothing while reporting success — a gate that reports "installed" and never
+-- runs is worse than no gate. So the target directory is resolved with
+-- `git rev-parse --git-path hooks`, which honours the setting, and the
+-- resolved path is printed so it is visible when it is not the default.
+--
+-- Chaining: a pre-existing foreign hook is preserved as `<hook>.pre-hygiene`
+-- and invoked FIRST by hygiene-hook.mix; its non-zero exit vetoes on its own.
+-- Idempotent — a stub carrying our marker is overwritten, never re-chained
+-- onto itself.
+
+-- 2026-08-30: the hub locates ITSELF, in the same shape as the $COSMIX rule:
+-- the directory above this script IF it is a hub (holds the gate conf), else
+-- the CMCTL environment variable, else the documented default ~/.ctl. So a
+-- copy of the starter control folder ($COSMIX/ctl -> anywhere) works unchanged,
+-- and a patched copy of this script written elsewhere (the test suite does
+-- that) still finds the real hub.
+fn locate_hub()
+  $here = dirname(dirname(realpath($0)))
+  if is_file($here .. "/_etc/public-hygiene.conf.mix") then
+    return $here
+  end
+  $e = env("CMCTL")
+  if $e != "" then
+    return $e
+  end
+  return env("HOME") .. "/.ctl"
+end
+$CMCTL = locate_hub()
+$CONF = $CMCTL .. "/_etc/public-hygiene.conf.mix"
+-- Named so the suite can point one build at a fixture switch file. Deliberately
+-- NOT an environment override: this path decides whether an incomplete passwd
+-- enumeration counts as proof that nobody else holds a gid, so anything able to
+-- redirect it could turn a refusal into a pass.
+$NSSWITCH = "/etc/nsswitch.conf"
+$GATE = $CMCTL .. "/_bin/check-public-hygiene.mix"
+$HOOK = $CMCTL .. "/_bin/hygiene-hook.mix"
+$MIX = "/opt/cosmix/bin/mix"
+$MARKER = "cosmix-hygiene-gate"
+-- A hook is "ours" — meaning this installer may overwrite it WITHOUT preserving
+-- a copy — only if the marker opens its SECOND line, which is where stub()
+-- writes it and nowhere else. Round twenty-two's cold review: the test was
+-- `contains($existing, $MARKER)` against the whole file, so an unrelated
+-- executable pre-commit hook that merely MENTIONED the gate in a comment or a
+-- diagnostic was classified as a stale stub of ours, skipped the .pre-hygiene
+-- preservation branch, and was atomically replaced — the installer deleting the
+-- very foreign veto it promises to chain, and exiting 0. Position is what
+-- separates a provenance CLAIM from ordinary prose; the body is checked against
+-- the finite templates this installer knows before the claim is trusted (see
+-- is_our_stub). A moved ~/.cmctl is still recognised because the claimed root,
+-- not this checkout's current path, parameterises those templates.
+$OURS_LINE = "-- " .. $MARKER .. " — installed by "
+$HOOK_NAMES = ["pre-commit", "commit-msg", "pre-push"]
+
+$RUN_UNVERIFIED = []
+$REPO_UNVERIFIED = {}
+$GROUP_MEMBERSHIP_CACHE = {}
+
+-- Status warnings are state, not decoration. Before round forty every
+-- interpreter/environment or hooks-path warning was printed and forgotten, so
+-- install() later saw only present+ours+current+executable and printed the bare
+-- state token `installed`. That was a false verified answer: an unreadable gate
+-- or a foreign-writable hooksPath ancestor had already proved the run could not
+-- establish that the hook would work or even remain the hook git found.
+--
+-- Lists are mutated rather than rebound because Mix function assignment is
+-- local. Run-level reasons qualify every repository; repository reasons qualify
+-- only the hooks whose lookup path raised them.
+fn mark_run_unverified($reason)
+  if contains($RUN_UNVERIFIED, $reason) == false then
+    push($RUN_UNVERIFIED, $reason)
+  end
+end
+
+fn mark_repo_unverified($repo, $reason)
+  $reasons = $REPO_UNVERIFIED[$repo]
+  if $reasons == nil then
+    $reasons = []
+  end
+  if contains($reasons, $reason) == false then
+    push($reasons, $reason)
+    $REPO_UNVERIFIED[$repo] = $reasons
+  end
+end
+
+fn warn_run($msg, $reason)
+  mark_run_unverified($reason)
+  print("  WARNING: " .. $msg)
+end
+
+fn warn_repo($repo, $msg, $reason)
+  mark_repo_unverified($repo, $reason)
+  print("  WARNING: " .. $msg)
+end
+
+fn status_unverified($repo)
+  $reasons = []
+  for each $r in $RUN_UNVERIFIED
+    push($reasons, $r)
+  end
+  if $REPO_UNVERIFIED[$repo] != nil then
+    for each $r in $REPO_UNVERIFIED[$repo]
+      push($reasons, $r)
+    end
+  end
+  return $reasons
+end
+
+fn bail($code, $msg)
+  print("install-hygiene-hooks: " .. $msg)
+  exit($code)
+end
+
+-- Deliberately identical to the gate's wrapper of the same name: a validate()
+-- failure is a config problem, never a policy finding, so it exits 2.
+fn validate_conf_value($value, $spec, $path, $label)
+  try
+    validate($value, $spec)
+  catch $vm, $ve
+    bail(2, $path .. " is not a usable " .. $label .. ": " .. $vm)
+  end
+end
+
+-- Best-effort removal of a staging temp on the failure path, returning a
+-- message fragment rather than raising. Called from inside a `catch` that is
+-- about to bail(2): a second raise there would escape as an uncaught error and
+-- exit 1 — the code reserved for "policy violation" — turning a disk problem
+-- into a reported leak, which is the exact confusion this whole arc keeps
+-- finding. Silence when the temp is gone; when it is not, say so, because a
+-- leftover `.tmp` is what makes the next run's picture confusing.
+--
+-- Unconditionally safe because every caller reaches it only after claim() has
+-- proved, via O_EXCL, that THIS run created the path. Deciding after the fact
+-- whether a temp was ours is not good enough: an `exists()` pre-check says
+-- false for a dangling symlink, and cleanup then deletes it.
+fn sweep($tmp)
+  try
+    remove($tmp)
+  catch $re
+    return join([" (a partial ", $tmp, " could not be cleaned up: ", $re,
+      " — remove it by hand)"], "")
+  end
+  return ""
+end
+
+-- Take exclusive ownership of a staging pathname, or refuse. write_new is
+-- O_CREAT|O_EXCL, which is the whole point: it fails on ANY existing entry,
+-- including a symlink, and it never follows one.
+--
+-- Round fifteen, and the reason this exists: staging into a fixed name that
+-- something else already occupies is a false-success path, not just an untidy
+-- one. With `pre-commit.hygiene-tmp` a symlink to `pre-commit`, the write went
+-- straight through it into the live hook and the rename then made the live
+-- hook a symlink to itself — installer exit 0, "hooks written: 3". With
+-- `pre-commit.pre-hygiene.tmp` symlinked the same way, the foreign hook being
+-- preserved was destroyed and `.pre-hygiene` ended up pointing at the new
+-- stub. Neither is reachable without someone crafting the staging entry, and
+-- anyone who can write `.git/hooks` can already defeat the gate — but a
+-- silently wrong install that REPORTS success is exactly the outcome this
+-- whole arc exists to make impossible.
+--
+-- Claiming first also makes the failure messages honest. The previous shape
+-- tried to work out afterwards whether a leftover temp had been ours; a
+-- partial `copy` over a pre-existing file (a source past RLIMIT_FSIZE, say)
+-- destroyed its first bytes while the message said it was left untouched.
+-- Nothing pre-existing is ever opened now, so there is nothing to misdescribe.
+-- $done is what THIS run has already changed by the time the claim is made.
+-- It used to say "nothing was changed" unconditionally, and by the second call
+-- site that is false: the foreign hook has been preserved as `.pre-hygiene`
+-- one step earlier, and the only diagnostic the operator gets said it had not
+-- been. Every message in this file is a statement about the state of someone's
+-- hooks directory, so it has to be true at the point it is printed.
+-- $cleanup is the staging names THIS run has already claimed and would
+-- otherwise abandon on the refusal path. Round thirty-nine: with the stub
+-- staged before the chain step (see install()), a refusal in the chain's claim
+-- left `.hygiene-tmp` behind, and the next run's claim of that same name then
+-- refused too — the wedge this reordering exists to remove, reintroduced one
+-- step along. sweep() is best-effort and returns "" when the name is gone, so
+-- the usual message is unchanged.
+fn claim($tmp, $what, $repo, $name, $done, $cleanup)
+  try
+    write_new($tmp, "", 0o755)
+  catch $xe
+    $extra = ""
+    for each $c in $cleanup
+      $extra = $extra .. sweep($c)
+    end
+    bail(2, "cannot stage " .. $what .. " for " .. $name .. " in " .. $repo
+      .. ": " .. $tmp .. " already exists (" .. $xe .. ") — refusing to write"
+      .. " through it, because it may be a symlink aimed at the very hook this"
+      .. " run is meant to protect; " .. $done .. ". Work out what it is"
+      .. " (a crashed run's leftover, or something else) and clear it by hand"
+      .. $extra)
+  end
+end
+
+-- exists() answers "can I open something here", which is a DIFFERENT question
+-- from "is this name free". It follows symlinks, so a dangling link reads as
+-- absent — and every guard that means "there is an entry here I must not
+-- destroy, and must not silently ignore" was asking the wrong one. Round
+-- sixteen. lstat is the right question: it stops at the link, and
+-- `exists($p, {follow_symlinks: false})` asks it (mix 0.39.0 — the round
+-- initially hand-rolled it over stat(), which is the workaround the mandate
+-- forbids; the primitive landed in the binary instead).
+--
+-- Both questions are asked in this file and both are legitimate; the rule is
+-- which one is being asked. "Is there a usable file I can read or run?" —
+-- is_executable() below, the $GATE/$HOOK preflight — keeps the plain form.
+-- "Is there an ENTRY at this name?" goes through entry_exists().
+--
+-- And the option has to be PROVEN present, not assumed, because Mix does not
+-- enforce builtin arity unless it is run with --strict-arity: on 0.38.0
+-- `exists($p, {follow_symlinks: false})` does not raise, it DISCARDS the second
+-- argument and answers the follow question anyway. So on any older interpreter
+-- this whole round silently un-fixes itself — no error, no message, exit 0, and
+-- the dangling link is back in the blind spot. That is worse than the bug it
+-- replaced, because the code now reads as if it were guarded.
+--
+-- Verified against a 0.38.0 build, which is why this is a probe and not a
+-- version comparison, and not a `try` around the call either. My first cut here
+-- was that `try`, on the assumption that a wrong-arity call raises. It does not.
+--
+-- It takes TWO questions, because an old Mix fails in two different ways and a
+-- probe that conflates them is worse than none. Arity enforcement is optional
+-- (`--strict-arity`), so:
+--
+--   lenient old Mix  — accepts the call, DISCARDS the option, answers wrong
+--   strict old Mix   — raises ARITY_MISMATCH on the call
+--   0.39.0           — accepts the call, honours the option
+--
+-- A single "does a bad option raise?" probe reads the strict-arity raise as
+-- proof of support, then the real call raises uncaught and exits 1 — the code
+-- reserved for "a violation was found". That was the first draft, and it was
+-- caught in review, reproduced against a 0.38.0 build under --strict-arity.
+--
+-- So: the valid form must not raise (rules out strict old Mix), AND an invalid
+-- option must raise (rules out lenient old Mix, which ignores it and returns).
+-- Both cases land on the same refusal, which is right — either way this
+-- interpreter cannot be asked the question.
+--
+-- What the two prove together: this interpreter accepts the option and looks at
+-- it. That `follow_symlinks` is then honoured is covered by a unit test in
+-- cosmix-lib-mix and, end to end, by T67/T68/T69 in test-public-hygiene.mix,
+-- all three of which fail if it is not. Two builtin calls, nothing written to
+-- disk, so this can sit in front of every call rather than needing to be
+-- remembered at each entry point.
+-- "this Mix" is the one RUNNING this installer, which is not necessarily the
+-- one at $MIX — run the installer with an older mix out of a build tree and the
+-- earlier draft refused while naming a /opt/cosmix/bin/mix that was already
+-- current, i.e. told the operator to change a binary that was not the problem.
+-- $MIX is vouched for separately, out of process, by require_lstat_option_in().
+-- Assignment inside a Mix function does not write through to a global, so a
+-- "warn once" flag cannot live in here. The probe is therefore run ONCE at
+-- startup and its answer kept in $LSTAT_OK, which entry_exists() reads; that
+-- also means this warning is printed exactly once, before any hook state.
+fn no_lstat_option($why, $status_only)
+  if $status_only then
+    warn_run("the Mix running this installer " .. $why .. ", so a"
+      .. " DANGLING symlink in a hooks directory reads as ABSENT below."
+      .. " Every state reported here is answered with the follow-the-link"
+      .. " question instead; installing needs Mix >= 0.39.0",
+      "installer lstat support")
+    return false
+  end
+  bail(2, "the Mix running this installer " .. $why .. ", so it cannot be asked"
+    .. " whether a name is an ENTRY rather than a readable file. Mix >= 0.39.0"
+    .. " is required: without it a DANGLING symlink in .git/hooks reads as an"
+    .. " empty slot and installing over it destroys the link, silently."
+    .. " Re-run this installer with a Mix >= 0.39.0 (the interpreter the hooks"
+    .. " themselves will use is checked separately); nothing was changed")
+end
+
+fn require_lstat_option($status_only)
+  try
+    exists("/", {follow_symlinks: false})
+  catch $ae
+    return no_lstat_option("rejects the second argument to exists() ("
+      .. $ae .. ")", $status_only)
+  end
+  try
+    exists("/", "not-a-map")
+  catch $pe
+    return true
+  end
+  return no_lstat_option("ignores the second argument to exists()", $status_only)
+end
+
+-- Round twenty-one: this is one of three helpers that hard-bailed even under
+-- --status, which undid round twenty's fix one indirection away — the probe
+-- softened, then the first hook state asked this question and the run exited 2
+-- with nothing reported. A query degrades: say what could not be asked, answer
+-- the weaker question, and let the caller's report carry the caveat.
+fn entry_exists($p)
+  if $LSTAT_OK == false then
+    return exists($p)
+  end
+  return exists($p, {follow_symlinks: false})
+end
+
+-- The two-step above proves the interpreter LOOKS at the option. It does not
+-- prove it HONOURS it — round eighteen's cold review: an interpreter that
+-- type-checks "argument two is a map" and then ignores the field passes both
+-- steps, and the dangling-link blind spot is back with the code reading as if
+-- it were guarded. So measure the property itself, once, at install time:
+-- create a dangling symlink and ask both questions about it. lstat must see it,
+-- the follow form must not. This writes, which is why it is here and not on the
+-- per-commit hook path (TMPDIR, one link, removed immediately).
+-- nil rather than a bail under --status. Round twenty: measuring the
+-- interpreter needs somewhere to write, and making that a hard refusal turned a
+-- read-only QUERY into something that could not answer at all — `TMPDIR=/proc
+-- install-hygiene-hooks.mix --status` exited 2 without reporting a single hook.
+-- A query that cannot be run is not safer than one that qualifies its answer.
+-- mkdir() is create_dir_all, so a TMPDIR that does not exist is CREATED here,
+-- parents and all, and never removed again — the cleanup below takes back only
+-- the probe directory itself. That also made "TMPDIR is unwritable" and "TMPDIR
+-- is missing" the same measurement, which is what made round twenty's first
+-- fixture prove nothing. So the temporary directory has to be there already;
+-- this installer borrows one, it does not build one. Round twenty-one.
+--
+-- Round twenty-four: `mkdir($d, {parents: false})` is only a guard if the
+-- interpreter running it HONOURS the option, and the interpreter that does not
+-- is precisely the one that cannot say so — Mix does not enforce builtin arity
+-- unless run with --strict-arity, so a pre-0.42.0 binary DISCARDS the unknown
+-- option and recursively creates the path anyway, quietly, reporting success.
+-- Every refusal built on the option then fails open: let TMPDIR pass the
+-- is_dir check and vanish before the mkdir, and the old interpreter rebuilds
+-- it, parents and all, finishes the probe and installs hooks — where the
+-- required answer is 2. The fleet is still on 0.33.0, so this is the live
+-- case, not a hypothetical.
+--
+-- A version string cannot answer it (a wrapper, a build tree, a backport), so
+-- measure the behaviour: ask for a leaf whose parent does not exist. Honoured
+-- means it raises; ignored means it succeeds — and in succeeding it has built
+-- the very thing it was told not to, which is why the debris is taken back
+-- here rather than left to a caller that does not know it is there.
+fn mkdir_option_honoured($under)
+  $absent = $under .. "/absent"
+  $leaf = $absent .. "/leaf"
+  $made = false
+  try
+    mkdir($leaf, {parents: false})
+    $made = true
+  catch $ignored
+  end
+  if $made == false then
+    return true
+  end
+  try
+    remove_dir($leaf)
+  catch $ignored_leaf
+  end
+  try
+    remove_dir($absent)
+  catch $ignored_absent
+  end
+  return false
+end
+
+fn probe_dir($what, $status_only)
+  $tmp = env("TMPDIR", "/tmp")
+  $d = $tmp .. "/cosmix-" .. $what .. "-" .. pid() .. "-" .. uuid()
+  if is_dir($tmp) == false then
+    if $status_only then
+      warn_run("TMPDIR " .. $tmp .. " is not a directory, so this run"
+        .. " could not check the interpreter — a hook that is a dangling"
+        .. " symlink may be reported below as ABSENT", "interpreter probe")
+      return nil
+    end
+    bail(2, "TMPDIR " .. $tmp .. " is not a directory — this installer needs an"
+      .. " existing writable temporary directory to measure the interpreter's"
+      .. " behaviour before it will install anything, and it will not create"
+      .. " one it would then leave behind; nothing was changed")
+  end
+  try
+    mkdir($d, {parents: false})
+  catch $me
+    if $status_only then
+      warn_run("cannot create " .. $d .. " (" .. $me .. "), so this run"
+        .. " could not check the interpreter — a hook that is a dangling"
+        .. " symlink may be reported below as ABSENT", "interpreter probe")
+      return nil
+    end
+    bail(2, "cannot create " .. $d .. " (" .. $me .. ") — this installer needs a"
+      .. " writable temporary directory to measure the interpreter's behaviour"
+      .. " before it will install anything; nothing was changed")
+  end
+  if mkdir_option_honoured($d) == false then
+    try
+      remove_dir($d)
+    catch $ignored_probe
+    end
+    if $status_only then
+      warn_run("the interpreter running this installer ignores"
+        .. " mkdir({parents: false}) — it created a directory whose parent was"
+        .. " missing — so the TMPDIR guards below cannot refuse, and a hook"
+        .. " that is a dangling symlink may be reported as ABSENT. Mix >="
+        .. " 0.42.0 is required here (deploy it with `mix _bin/deploy_mix.mix`)",
+        "interpreter probe")
+      return nil
+    end
+    bail(2, "the interpreter running this installer ignores"
+      .. " mkdir({parents: false}): asked for a leaf whose parent did not"
+      .. " exist, it built both. Every TMPDIR guard in this installer is that"
+      .. " one option, so on this binary they all fail OPEN — a TMPDIR that"
+      .. " vanishes mid-run is recreated, parents and all, and the run that"
+      .. " should have refused installs hooks instead. Mix >= 0.42.0 is"
+      .. " required here (deploy it with `mix _bin/deploy_mix.mix`); nothing"
+      .. " was changed")
+  end
+  return $d
+end
+
+fn require_lstat_behaviour($status_only)
+  $d = probe_dir("lstat-probe", $status_only)
+  if $d == nil then
+    return false
+  end
+  $l = $d .. "/link"
+  $seen = false
+  $followed = true
+  $failed = ""
+  -- finally, because the old shape cleaned up only on the paths it expected: if
+  -- symlink() raised, the catch's own remove() raised too — on a link that was
+  -- never created — and that second raise escaped as an uncaught error and exit
+  -- 1, the code reserved for "a violation was found". Round twenty.
+  try
+    symlink("dangling-" .. uuid(), $l)
+    $seen = exists($l, {follow_symlinks: false})
+    $followed = exists($l)
+  catch $pe
+    $failed = "" .. $pe
+  finally
+    try
+      remove($l)
+    catch $ignored
+    end
+    -- Swallowing this failure was how a run that left a directory behind in
+    -- TMPDIR still ended on "status only — nothing changed". Round twenty-one:
+    -- the cleanup is best-effort, so it may not remove it, but it may not be
+    -- quiet about not removing it either.
+    try
+      remove_dir($d)
+    catch $cleanup
+      warn_run("left " .. $d .. " behind (" .. $cleanup .. ") — this"
+        .. " run's own probe directory, safe to remove",
+        "interpreter probe cleanup")
+    end
+  end
+  if $failed != "" then
+    if $status_only then
+      warn_run("could not measure whether this Mix honours"
+        .. " {follow_symlinks: false} (" .. $failed .. ") — a hook that is a"
+        .. " dangling symlink may be reported below as ABSENT",
+        "installer lstat behaviour")
+      return false
+    end
+    bail(2, "cannot measure whether the Mix running this installer honours"
+      .. " {follow_symlinks: false} (" .. $failed .. ") — refusing rather than"
+      .. " assuming it does; nothing was changed")
+  end
+  if $seen and $followed == false then
+    return true
+  end
+  if $status_only then
+    warn_run("this Mix accepts {follow_symlinks: false} and does not"
+      .. " honour it, so a hook that is a dangling symlink is reported below as"
+      .. " ABSENT — Mix >= 0.41.0 is required for this status to be reliable",
+      "installer lstat behaviour")
+    return false
+  end
+  -- false, not $status_only: the --status branch returned two lines up, so this
+  -- is the installing path and this call must bail rather than warn.
+  no_lstat_option("accepts {follow_symlinks: false} and does not honour it (a"
+    .. " dangling symlink reads as absent either way)", false)
+  return false
+end
+
+-- Whether this interpreter can ask the kernel "may I execute this", which is
+-- the single question is_executable() is now built on.
+--
+-- Measured, not read off a version string, for the same reason every other
+-- probe in this file is: a wrapper, a build tree or a backport all make the
+-- string lie, and this one decides whether the installer will write a gate at
+-- all. Presence alone is not enough either — an access() that answered `true`
+-- unconditionally would pass a "does it raise" check and report every hook on
+-- the fleet as live. So the semantics are exercised: a file with no execute bit
+-- anywhere must be false and the same file at 0755 must be true. Both hold for
+-- root as well, which is why the negative half uses 0644 rather than a mode
+-- root would override — X_OK needs at least one execute bit even for uid 0.
+--
+-- Round thirty found that pair insufficient on its own, and the finding cut
+-- close to the bone: the exact implementation this probe exists to reject —
+-- mode-bit arithmetic wearing the name access() — passes it. `st_mode & 0111`
+-- on a caller-owned file answers false at 0644 and true at 0755, which is the
+-- whole test. So a third case is asked that only a real permission check can
+-- get right — and round thirty-one made it two, one per identity, because the
+-- first version of it was skipped exactly where this installer actually runs:
+--
+--   * unprivileged: a 0755 file inside a directory with no search bit. The
+--     kernel refuses during path resolution (EACCES) and answers false;
+--     anything reading the leaf's mode bits answers true.
+--   * root: `w` on a mode-0000 file. CAP_DAC_OVERRIDE grants it, so the kernel
+--     answers TRUE where mode arithmetic answers false — the same
+--     discrimination running the other way. Root was the hole: it searches any
+--     directory, so the unprivileged case degrades to nothing for uid 0, which
+--     is precisely how the hooks get installed on the mesh nodes.
+--
+-- Only an unavailable uid() skips the discriminator now, and that skip is
+-- stated rather than papered over.
+--
+-- What this probe can and cannot certify, said plainly: it rejects absence,
+-- raising, and gross reimplementation. It does NOT certify ACL semantics — an
+-- ACL cannot deny the file's own owner (a named-user entry never restricts
+-- ACL_USER_OBJ), so a single-uid probe has no way to construct the case. That
+-- remains an argument from the implementation. Since mix 0.46.0 that argument
+-- is enforced at the bottom: access() issues faccessat2(2) directly and RAISES
+-- on a kernel too old to have it, rather than falling through to the glibc
+-- wrapper's fstatat emulation, which the faccessat(2) man page records as not
+-- taking ACLs into account. Before 0.46.0 the emulation was reachable and
+-- silent, and this probe could not have detected it — path resolution fails
+-- inside the emulation too, so both discriminating cases above would still
+-- have passed while ACLs went unseen.
+fn require_access_builtin($status_only)
+  $d = probe_dir("access-probe", $status_only)
+  if $d == nil then
+    return false
+  end
+  -- Asked while the directory still exists, because the two environments that
+  -- fail this probe WITHOUT the interpreter being at fault are both properties
+  -- of where TMPDIR points, and both produce the same false/false a missing
+  -- builtin does. Blaming Mix for either sends the operator to build and deploy
+  -- a version that changes nothing (round thirty).
+  $d_noexec = path_is_noexec($d)
+  $f = $d .. "/probe"
+  $off = nil
+  $on = nil
+  $kernel_case = nil
+  $mode_honoured = nil
+  $failed = ""
+  $failed_code = ""
+  $failed_stage = ""
+  -- Which call is in flight, so a raise can be attributed to the thing that
+  -- raised. A probe that blames the interpreter for its own setup failing
+  -- sends the operator to build a Mix that changes nothing (round thirty-one).
+  $stage = "setup"
+  $euid = nil
+  try
+    $euid = uid()
+  catch $ue
+  end
+  try
+    write_file($f, "#!/bin/sh\nexit 0\n")
+    chmod($f, 0o644)
+    -- Whether the chmod landed at all, asked about SOME bits rather than by
+    -- comparing whole modes. A filesystem that forces a setgid or group bit of
+    -- its own still honoured the request, and an equality test would call that
+    -- a refusal and send the operator after the wrong fault. band() is mix
+    -- 0.46.0, added for exactly this: the language hands out stat()["perm"]
+    -- and had no primitive for asking about part of it.
+    $bits_at_644 = band(stat($f)["perm"], 0o111)
+    $stage = "access"
+    $off = access($f, "x")
+    $stage = "setup"
+    chmod($f, 0o755)
+    $bits_at_755 = band(stat($f)["perm"], 0o111)
+    $stage = "access"
+    $on = access($f, "x")
+    $stage = "setup"
+    -- Both directions, because a filesystem that ignores chmod entirely (every
+    -- file reads 0777) fails this probe with the OPPOSITE symptom — true at
+    -- 0644 — and would otherwise be diagnosed as a broken interpreter.
+    $mode_honoured = $bits_at_644 == 0 and $bits_at_755 != 0
+    -- The discriminating case: one question whose answer arithmetic over the
+    -- mode cannot reproduce. There is a different one per identity, because
+    -- the kernel rule that arithmetic misses is different for each.
+    if $euid != nil and $euid != 0 then
+      -- Unprivileged: mode 0007, where only the OTHER class carries execute.
+      -- The kernel consults exactly one class — and for the file's owner that
+      -- is the owner class — so it answers false, while anything OR-ing the
+      -- three classes together (`st_mode & 0111`, the implementation this
+      -- probe exists to reject) answers true.
+      --
+      -- Round thirty asked this as a 0755 file inside an unsearchable
+      -- directory instead. Round thirty-one measured that and found it nearly
+      -- worthless: any impostor built on stat() fails to resolve the path too,
+      -- so it returns false for the same reason the kernel does and passes. It
+      -- was replaced rather than supplemented — a case that discriminates
+      -- nothing is not defence in depth, and dropping it takes the nested
+      -- directory, and its restore-before-cleanup dance, out with it.
+      chmod($f, 0o007)
+      $stage = "access"
+      $kernel_case = access($f, "x") == false
+      $stage = "setup"
+    end
+    if $euid == 0 then
+      -- Root: `w` on a mode-0000 file. CAP_DAC_OVERRIDE grants it, so the
+      -- kernel answers TRUE where every mode-bit implementation answers false
+      -- — the same discrimination running the other way. Root needs its own
+      -- case because it is exempt from both rules the unprivileged case rests
+      -- on. Measured, not reasoned: `access(0000, "w")` is true for euid 0,
+      -- while `access(0000, "x")` stays false, because even with
+      -- CAP_DAC_OVERRIDE root needs at least one execute bit present.
+      chmod($f, 0o000)
+      $stage = "access"
+      $kernel_case = access($f, "w") == true
+      $stage = "setup"
+    end
+  catch $pe, $perr
+    $failed = "" .. $pe
+    $failed_code = "" .. $perr["code"]
+    $failed_stage = $stage
+  finally
+    -- Nothing to restore any more: every mode this probe sets is on a file
+    -- inside $d, and unlinking a file needs write+search on the DIRECTORY, not
+    -- any permission on the file itself. The nested unsearchable directory was
+    -- the only thing that could have blocked its own cleanup, and it is gone.
+    try
+      remove_dir($d)
+    catch $cleanup
+      warn_run("left " .. $d .. " behind (" .. $cleanup .. ") — this"
+        .. " run's own probe directory, safe to remove",
+        "access probe cleanup")
+    end
+  end
+  -- An unknown euid is now the only thing that skips the discriminating case:
+  -- there is one for root and one for everyone else.
+  $discriminated = true
+  if $euid != nil then
+    $discriminated = $kernel_case == true
+  end
+  if $off == false and $on == true and $discriminated then
+    return true
+  end
+  -- Three verdicts, not two, because there are three genuinely different causes
+  -- and each carries a different instruction:
+  --   "old"         — no access() builtin at all. Deploying a newer Mix is the
+  --                   fix, and this is the fleet's ordinary state today.
+  --   "environment" — the interpreter is fine and the PROBE cannot be run here.
+  --                   Telling that operator to deploy is a loop (round thirty).
+  --   "defect"      — access() exists and answered wrongly, or raised where it
+  --                   should have answered. Also not a version problem.
+  $verdict = "defect"
+  $detail = ("it answered " .. ("" .. $off) .. " for a mode-0644 file and "
+    .. ("" .. $on) .. " for the same file at 0755")
+  $remedy = ""
+  if $failed != "" then
+    if $failed_stage != "access" then
+      -- write_file, mkdir, chmod or stat raised. A full or read-only TMPDIR
+      -- does this, and no Mix version repairs either.
+      $verdict = "environment"
+      $detail = ("the probe's own setup raised before access() was ever"
+        .. " called (" .. $failed .. ")")
+      $remedy = ("point TMPDIR at a writable filesystem with free space on it"
+        .. " and re-run")
+    elif $failed_code == "FUNCTION_UNDEFINED" then
+      $verdict = "old"
+      $detail = "this Mix has no access() builtin at all"
+    else
+      $detail = ("access() raised instead of answering (" .. $failed .. ")."
+        .. " That is either a defect in this Mix's access() or a kernel that"
+        .. " cannot answer the question at all — a kernel older than 5.8 has"
+        .. " no faccessat2(2), and access() refuses to guess from mode bits"
+        .. " rather than quietly answer wrongly; the message above says which")
+    end
+  elif $mode_honoured == false then
+    -- First, because it explains BOTH failure shapes and the others explain
+    -- one: a filesystem that ignores chmod reads back 0777 (true at 0644) or
+    -- 0666 (false at 0755), and neither is a fact about the interpreter.
+    $verdict = "environment"
+    $detail = ("chmod does not take on the probe file under " .. $d
+      .. " — it read back with " .. ("" .. $bits_at_644) .. " execute bits at"
+      .. " mode 0644 and " .. ("" .. $bits_at_755) .. " at 0755, so this"
+      .. " filesystem does not carry per-class permission bits and the probe"
+      .. " has no stable case to make either way")
+    $remedy = "point TMPDIR at a filesystem that carries permission bits and re-run"
+  elif $off == false and $on == false and $d_noexec == true then
+    -- The modes landed and the kernel still refuses execute: that is the mount,
+    -- and the mount table said so rather than it being inferred.
+    $verdict = "environment"
+    $detail = ("TMPDIR is on a filesystem mounted noexec, where the kernel"
+      .. " correctly refuses execute on a 0755 file, so the probe's positive"
+      .. " case cannot hold there")
+    $remedy = "point TMPDIR at a mount without noexec and re-run"
+  elif $discriminated == false then
+    $detail = ("it got the one question wrong that separates the kernel's"
+      .. " decision from arithmetic over mode bits — which is precisely the"
+      .. " implementation it replaced")
+  end
+  if $verdict == "environment" then
+    if $status_only then
+      warn_run("access(path, \"x\") could not be verified in this"
+        .. " environment — " .. $detail .. " — so whether git can actually RUN"
+        .. " each hook is reported below as unknown rather than guessed. This is"
+        .. " the probe's surroundings, not the interpreter: " .. $remedy,
+        "hook executability probe")
+      return false
+    end
+    bail(2, "the access(path, \"x\") probe could not be run here: " .. $detail
+      .. ". Until it can, this installer cannot tell an installed gate from the"
+      .. " appearance of one, and it will not write hooks it could not verify."
+      .. " Fix: " .. $remedy .. ". Note this is NOT a Mix version problem —"
+      .. " building or deploying a newer Mix will not change it; nothing was"
+      .. " changed")
+    return false
+  end
+  -- One message for both shapes of interpreter failure. Distinguishing "no such
+  -- The remaining two verdicts are both "this run may not rely on the answer",
+  -- and they differ only in the instruction. "old" is the fleet's ordinary
+  -- state and has a deploy that fixes it; "defect" does not, and saying so is
+  -- the difference between a fix and a loop.
+  $fix = ("Mix >= 0.46.0 is required here (build it and run"
+    .. " `mix _bin/deploy_mix.mix`)")
+  if $verdict == "defect" then
+    $fix = ("A newer Mix may or may not repair this — the fault is in the"
+      .. " access() this interpreter already has, or beneath it, not in its"
+      .. " absence, so check the detail above before deploying anything")
+  end
+  if $status_only then
+    warn_run("this Mix cannot answer access(path, \"x\") — " .. $detail
+      .. " — so whether git can actually RUN each hook is reported below as"
+      .. " unknown rather than guessed. " .. $fix, "hook executability probe")
+    return false
+  end
+  bail(2, "the Mix running this installer cannot answer access(path, \"x\") — "
+    .. $detail .. ". That is the one question that separates an installed gate"
+    .. " from the appearance of one, and the mode-bit arithmetic that used to"
+    .. " stand in for it was wrong four rounds running, so there is no longer a"
+    .. " fallback to fall back to. " .. $fix .. "; nothing was changed")
+  return false
+end
+
+-- Our own uid: needed to tell "an ancestor directory someone else controls"
+-- from "one of mine", which is the difference between an enforced invariant and
+-- a hope.
+--
+-- This used to create a file and stat it, because Mix had no way to ask. Round
+-- twenty's cold review showed why that probe was a liability rather than a
+-- measurement: mkdir() takes no mode, so under a permissive umask the probe
+-- directory is world-writable, and another uid who wins the race and drops a
+-- symlink at `who` gets a file of THEIR choosing truncated as us — and then
+-- lstat answers with THEIR uid, so every ownership check below silently reads
+-- foreign directories as mine. A check that can be made to lie is worse than no
+-- check. The missing primitive was a Mix bug, so it was fixed in the binary
+-- (uid()/gid(), mix 0.41.0) rather than hardened around here.
+-- Round twenty-one: this bailed under --status too, so on a Mix without uid()
+-- the query that changes nothing exited 2 having reported nothing — the same
+-- shape the round-twenty fix removed from probe_dir, one helper away. Under
+-- --status it returns nil, meaning "ownership is unknown", and every caller
+-- that would compare against it says so instead of guessing.
+fn current_uid($status_only)
+  $me = nil
+  try
+    $me = uid()
+  catch $ue
+    if $status_only then
+      warn_run("the Mix running this installer cannot report its own uid"
+        .. " (" .. $ue .. "), so the OWNERSHIP of the hooks directory and its"
+        .. " ancestors is not checked below — a component owned by another uid,"
+        .. " who can swap it and with it the gate, is reported here as if it"
+        .. " were yours. Nor can it be said which execute bit git will be"
+        .. " subject to on a hook you do not own; that check needs Mix >= 0.41.0",
+        "installer uid/ownership checks")
+      return nil
+    end
+    bail(2, "the Mix running this installer cannot report its own uid (" .. $ue
+      .. ") — without it the hooks directory's ancestors cannot be checked for"
+      .. " foreign ownership, and this installer will not write a gate into a"
+      .. " path it could not verify. Mix >= 0.41.0 is required here (build it"
+      .. " and run `mix _bin/deploy_mix.mix`); nothing was changed")
+  end
+  return $me
+end
+
+-- Whether GIT will be able to run this hook — which is not the question this
+-- asked before round twenty-two's cold review. git runs hooks as the invoking
+-- user and skips a non-executable one in silence, so this is the difference
+-- between a gate and the appearance of one; WHICH permission bit decides it
+-- depends on who that user is, and this tested the owner bit unconditionally.
+-- A root-owned mode-0744 stub inside a root-owned hooks directory — a directory
+-- this installer TRUSTS, because root ownership is not foreign ownership — was
+-- therefore reported "installed" to a non-root operator who has no applicable
+-- execute bit at all: git skips it, every commit goes through unguarded, and
+-- the status line says the opposite.
+--
+-- Three answers, not two: yes, no, and "this run could not tell" — with the
+-- reason, because the unknowns below are not the same unknown and an operator
+-- told to "verify by hand" needs to know which question failed.
+--
+-- Rounds twenty-two through twenty-four spent themselves reimplementing the
+-- kernel's permission decision here in Mix, and round twenty-nine deleted the
+-- reimplementation. Kept as the reason it is not coming back, because every
+-- one of these was a real wrong answer shipped by a version that looked
+-- finished: the owner bit was tested unconditionally, so a root-owned 0744
+-- stub read as "installed" to a non-root operator git would silently skip;
+-- then `other` was tested BEFORE group membership, so mode 0701 on a hook
+-- whose group you are in read as executable when it is not; then deciding the
+-- group class turned out to need the supplementary set rather than the
+-- effective gid; then noexec mounts were found to bypass the mode bits
+-- entirely; and a named-user ACL denial defeated all of it regardless, since
+-- it appears in neither st_mode nor /proc/mounts.
+--
+-- Four rounds, four inversions, and the last one unfixable in this language.
+-- That is not a run of bad luck, it is what reimplementing a kernel decision
+-- costs. faccessat asks the kernel the question git will ask, so all five
+-- collapse into one call with nothing left to invert.
+
+-- Round twenty-four: mode bits are not git's execution decision, they are one
+-- input to it. A hooks directory on a filesystem mounted `noexec` holds
+-- perfectly-moded 0755 stubs that the kernel refuses to exec, so git skips
+-- every one of them in silence and the line below said "installed" — the same
+-- lie round twenty-two set out to remove, one layer further down the stack.
+-- (Real cases: /tmp and /var hardened with noexec, a `noexec` bind mount over
+-- a shared work tree, a USB or NFS mount with the default-noexec flag set.)
+-- So the mount is asked as well as the inode.
+--
+-- Round twenty-nine closed the residual this comment used to end on. It read:
+-- a named-user ACL denying execute appears in neither st_mode nor
+-- /proc/mounts, Mix cannot read ACLs, so an ACL-denied hook is reported as
+-- installed — "a known gap, not an oversight". A known gap in the one check
+-- that decides whether the gate runs is still a gate that lies, and the fix is
+-- the standing one: the missing primitive was a Mix bug, so it was fixed in the
+-- binary (access(), mix 0.45.0; 0.46.0 is the floor this installer requires,
+-- being the version that refuses a kernel it cannot ask rather than letting
+-- libc answer from mode bits) rather than guessed around here. is_executable
+-- below now asks the KERNEL — faccessat2(X_OK, AT_EACCESS) — rather than
+-- reimplementing its answer, and therefore accounts for ACLs, for the
+-- permission class, and (measured, not assumed: do_faccessat rejects MAY_EXEC
+-- on a noexec path) for the mount as well.
+--
+-- One honest qualifier, since round thirty asked for it: this is not literally
+-- the call git makes. git's find_hook() uses access(2), which POSIX defines in
+-- terms of the REAL ids, where AT_EACCESS asks about the EFFECTIVE ones. They
+-- differ only under a setuid or setgid binary; neither Mix, nor a shell, nor a
+-- sudo'ed command is one, so the two agree everywhere this installer runs. It
+-- is an assumption, not an enforcement — Mix's uid() is geteuid() and there is
+-- no real-uid builtin to compare it against.
+--
+-- What this paragraph used to end with was wrong, and round thirty-two
+-- measured it wrong. It said effective was "the right one to ask about anyway,
+-- because it is the identity under which THIS process just wrote the file" —
+-- which answers the wrong question with great precision. The identity that
+-- WROTE the hook is not the identity that will RUN it, and on the mesh they are
+-- never the same: root installs, markc commits. See git_runner_uid /
+-- access_x_as below; the question is now asked as the repository's owner, which
+-- is who git's own dubious-ownership rule permits to run git there.
+--
+-- path_is_noexec survives this for two reasons that are not the decision. It
+-- is what distinguishes "chmod will fix this" from "chmod will never fix
+-- this" once access() has already said no, and round twenty-four's lesson was
+-- that the wrong instruction there sends an operator round the loop believing
+-- the gate is live. And the hooks DIRECTORY preflight further down still needs
+-- it: execute-on-a-directory means search, not exec, so access() cannot answer
+-- that question at all.
+--
+-- /proc/mounts escapes space, tab, newline and backslash in the mount point as
+-- octal, so the field is unescaped before it is compared to a real path. The
+-- match is longest-mount-point-wins at a COMPONENT boundary: "/var" must not
+-- claim "/variable", and "/" matches everything, which is why it is only ever
+-- the fallback.
+fn unescape_mount_field($s)
+  $out = replace($s, "\\040", " ")
+  $out = replace($out, "\\011", "\t")
+  $out = replace($out, "\\012", "\n")
+  return replace($out, "\\134", "\\")
+end
+
+fn mount_covers($mp, $path)
+  if $mp == "/" then
+    return true
+  end
+  if $path == $mp then
+    return true
+  end
+  return starts_with($path, $mp .. "/")
+end
+
+-- true / false / nil, where nil is "this run could not tell" — /proc/mounts
+-- unreadable, or the path could not be canonicalised. Never guessed at: an
+-- unanswerable mount question becomes the caller's unknown branch, not a pass.
+fn path_is_noexec($path)
+  $real = realpath($path)
+  if $real == nil then
+    return nil
+  end
+  $raw = nil
+  try
+    $raw = read_file("/proc/mounts")
+  catch $pe
+  end
+  if $raw == nil then
+    return nil
+  end
+  $best = ""
+  $noexec = false
+  for each $line in split($raw, "\n")
+    $f = split($line, " ")
+    if len($f) >= 4 then
+      $mp = unescape_mount_field($f[1])
+      if mount_covers($mp, $real) and len($mp) >= len($best) then
+        $best = $mp
+        $noexec = contains(split($f[3], ","), "noexec")
+      end
+    end
+  end
+  if $best == "" then
+    return nil
+  end
+  return $noexec
+end
+
+-- Round thirty-two, and the sharpest inversion yet, because it survived every
+-- fix above it: the installer asks the kernel a question about ITSELF, and the
+-- identity that runs git is somebody else. Measured on alpha —
+--
+--   root-owned hook, chmod 0755, `setfacl -m u:markc:--- <hook>`
+--     stat()["perm"]          = 0o755        "installed"
+--     band(perm, 0o111)       = 73           "mode honoured"
+--     access() as root        = true         "the kernel agrees"
+--     git commit as markc     -> rc 0, "hook was ignored because it's not set
+--                                as executable", the commit sailing through
+--
+-- Three independent signals, all green, gate dead. Root's access() is close to
+-- vacuous: CAP_DAC_OVERRIDE answers true for essentially anything this
+-- installer just chmod'ed, and it cannot see a named-user ACL aimed at someone
+-- else at all. And root is exactly how the mesh installs these hooks, into
+-- repositories owned by markc.
+--
+-- So the question is asked AS the identity that will ask it for real. Who that
+-- is comes from git's own rule, not a guess, and the rule was measured rather
+-- than recalled: chown the .git directory to root under a markc-owned worktree
+-- and git refuses ("detected dubious ownership"); chown the worktree root to
+-- root under a markc-owned .git and git refuses too. It wants BOTH, so in the
+-- default configuration the owner is the only identity that can run git here.
+--
+-- Round thirty-three corrected what used to be written next. The residual was
+-- described as making the owner's answer "a lower bound" — true of the SET OF
+-- IDENTITIES a safe.directory entry admits, and worthless as stated, because
+-- executability is not monotonic over that set: a named-user ACL can permit the
+-- owner and deny the admitted identity, so knowing "at least the owner may run
+-- git" implies nothing about whether the hook runs. A lower bound on *who* is
+-- not a conservative answer about *can*. That gap is now detected rather than
+-- described — see identity_divergence below, which refuses to answer in exactly
+-- the configuration where the owner's answer stops generalising.
+--
+-- Round thirty-nine: the subject is repo_subject($repo), NOT $repo. See the
+-- note on that function — the configured path may be a subdirectory, and the
+-- owner of a subdirectory is not who git will run as. Asking the right
+-- authority on behalf of the wrong identity is the same class of wrong answer
+-- as asking the wrong authority, and it fails open.
+fn git_runner_uid($repo)
+  $subject = repo_subject($repo)
+  if $subject == nil then
+    return {uid: nil, why: join(["which directory git treats as this repository",
+      " could not be established, so who it will run hooks as cannot be named",
+      " either — `git -C ", $repo, " rev-parse --show-toplevel` (or",
+      " `--absolute-git-dir` for a bare repository) did not answer"], "")}
+  end
+  $st = nil
+  try
+    $st = stat($subject)
+  catch $se
+    return {uid: nil, why: "the repository could not be stat'ed (" .. $se .. ")"}
+  end
+  return {uid: $st["uid"], why: ""}
+end
+
+-- true / false / nil, nil being "could not be asked as that identity" — never
+-- the installer's own answer standing in for theirs, which is the whole defect.
+--
+-- runuser rather than setpriv: it runs initgroups, so the SUPPLEMENTARY groups
+-- come with the uid. Without them a hook granted execute through a secondary
+-- group reads as denied, which is the round-twenty-three inversion arriving by
+-- another door.
+--
+-- The sub-interpreter is this one (/proc/self/exe), not whatever is on PATH —
+-- an older mix without access() would answer this question by not answering it.
+-- If it cannot be resolved, /opt/cosmix/bin/mix is the canonical fallback; if
+-- the target uid cannot read or execute either, the run fails and that is a nil,
+-- not a pass.
+fn access_x_as($uid, $path)
+  $me = uid()
+  if $uid == $me then
+    -- The ordinary case: an operator installing into their own repository. No
+    -- privilege to drop, and the direct call is the same call.
+    try
+      return {ok: access($path, "x"), why: ""}
+    catch $ae
+      return {ok: nil, why: "the kernel could not be asked (" .. $ae .. ")"}
+    end
+  end
+  if $me != 0 then
+    return {ok: nil, why: "this hook will be run by uid " .. $uid .. ", not by"
+      .. " you (uid " .. $me .. "), and only root can ask a permission question"
+      .. " as another user — run this installer as root or as uid " .. $uid}
+  end
+  -- The path is passed as a POSITIONAL ARGUMENT and never embedded in the
+  -- source. Round thirty-three: the previous form built the text
+  -- `access("<path>", "x")` and guarded it by refusing a quote, a backslash or
+  -- a newline — and missed `${...}`, which mix expands inside a double-quoted
+  -- string. Measured: with SEG=live,
+  --   mix -c 'print("/hooks/${SEG}/pre-commit")'  ->  /hooks/live/pre-commit
+  -- so a hooks path containing `${SEG}` asked about a DIFFERENT file, and if
+  -- that file happened to be executable the answer was a confident `true` about
+  -- a hook git will skip — the exact failure this function exists to prevent,
+  -- reintroduced by the guard that was supposed to prevent it.
+  --
+  -- The guard is deleted rather than widened to `$`. Enumerating a language's
+  -- metacharacters is the losing half of this game; as an argument there is no
+  -- expansion and no quoting question at all, so paths that used to be refused
+  -- now simply work.
+  $ent = run_argv(["getent", "passwd", "" .. $uid])
+  if ($ent["exit_code"] != 0 or $ent["utf8_lossy"]
+      or $ent["stdout_truncated"] or trim($ent["stdout"]) == "") then
+    return {ok: nil, why: "uid " .. $uid .. " owns this repository but has no"
+      .. " passwd entry, so the question cannot be asked as them"}
+  end
+  $name = split(trim($ent["stdout"]), ":")[0]
+  if $name == "" then
+    return {ok: nil, why: "uid " .. $uid .. " has a passwd entry with no user"
+      .. " name, so the question cannot be asked as them"}
+  end
+  $interp = realpath("/proc/self/exe")
+  if $interp == nil then
+    $interp = "/opt/cosmix/bin/mix"
+  end
+  -- The child states the uid it actually became, alongside the answer. runuser
+  -- resolves the NAME, and a name is not a uid: an inconsistent passwd source, a
+  -- duplicate mapping, or a substituted getent/runuser could land on some other
+  -- identity whose `true` would then be accepted as the owner's. Asking the child
+  -- who it is turns that from an invisible substitution into a mismatch.
+  $r = run_argv(["runuser", "-u", $name, "--", $interp, "-c",
+    "print(uid() .. \" \" .. access($1, \"x\"))", $path])
+  if $r["utf8_lossy"] or $r["stdout_truncated"] then
+    return {ok: nil, why: "the permission question was asked as " .. $name
+      .. " (uid " .. $uid .. ") but its answer was truncated or not valid UTF-8"}
+  end
+  $out = trim($r["stdout"])
+  $rc = $r["exit_code"]
+  if $rc != 0 then
+    -- A missing runuser gives exit_code nil, not a number, and "exited nil" is
+    -- a poor way to tell an operator the tool is not installed.
+    $ran = "exited " .. $rc
+    if $rc == nil then
+      $ran = "could not be run at all (is runuser installed?)"
+    end
+    return {ok: nil, why: "the permission question could not be asked as "
+      .. $name .. " (uid " .. $uid .. "): runuser " .. $ran .. ", "
+      .. trim($r["stderr"] .. " " .. $out)}
+  end
+  $parts = split($out, " ")
+  if len($parts) != 2 or ($parts[1] != "true" and $parts[1] != "false") then
+    return {ok: nil, why: "the permission question was asked as " .. $name
+      .. " (uid " .. $uid .. ") but the answer was not readable: " .. sanitize($out)}
+  end
+  if $parts[0] != "" .. $uid then
+    return {ok: nil, why: "asked as " .. $name .. " for uid " .. $uid
+      .. ", but the child reported running as uid " .. $parts[0]
+      .. " — the passwd mapping is not consistent, so that answer is not the"
+      .. " runner's and will not be used"}
+  end
+  return {ok: $parts[1] == "true", why: ""}
+end
+
+-- Round thirty-three. git_runner_uid answers with the repository's owner, and
+-- the comment above it called that a "lower bound". It is a lower bound on the
+-- SET OF IDENTITIES — but executability is not monotonic over that set, so a
+-- lower bound on *who* yields no conservative answer at all about *can*. The
+-- concrete shape: a named-user ACL permits the owner and denies user B, and B
+-- has this repository in safe.directory, so git accepts B and then skips the
+-- hook B cannot execute — while this installer, having asked the owner, reports
+-- it installed. That is the round-thirty-two defect with a different pronoun.
+--
+-- Round thirty-three answered this with a CONJUNCTION: report unknown only when
+-- a safe.directory entry widens the identity set AND the hook carries an
+-- extended ACL, on the reasoning that an ACL is "the only mechanism that makes
+-- two identities differ while the mode bits look identical to both". Round
+-- thirty-four refuted that in one line: a hooks directory that is mode 0700 and
+-- owned by A denies B with no ACL anywhere in sight. The mode bits are indeed
+-- identical to both — they just do not MEAN the same thing to both, which is
+-- the whole nature of a permission bit. So ACL-absence never proved
+-- non-divergence, and the conjunct was unsound rather than merely incomplete.
+--
+-- The conjunct is therefore DELETED, not extended. Extending it would mean
+-- enumerating every mechanism by which two identities can differ — modes on
+-- each chain component, POSIX ACLs on each, NFSv4/CIFS ACLs, supplementary
+-- groups, mount namespaces, SELinux/AppArmor, capabilities — which is mode
+-- arithmetic again, and rounds twenty-two to thirty-one are a graveyard of it
+-- being wrong in the direction that reports a dead gate as live.
+--
+-- What is left is the one question that does not require that enumeration:
+-- **is there anyone besides the owner at all?** If the identity set is exactly
+-- {owner}, the owner's answer is the whole answer and no mechanism matters. If
+-- it is wider, this run cannot say, and says so. That is strictly weaker than
+-- the old conjunction claimed to be and strictly sounder than it was.
+--
+-- SCOPE, and a correction worth recording because two independent reviews and
+-- this author all made the same wrong turn. git honours safe.directory only in
+-- "protected configuration" — system, global and command scope (git-config(1):
+-- "This config setting is only respected in protected configuration"). Round
+-- thirty-four's second MAJOR observed that this function read the INSTALLER's
+-- global config while the runner is someone else, and the obvious repair looks
+-- like "read the runner's global config instead". It is the wrong target. A
+-- safe.directory entry in identity X's config admits **X** to repositories
+-- owned by someone else; it never admits anyone else to X's repository. The
+-- runner here IS the owner, so the runner's own global config cannot widen the
+-- set. The configs that could widen it belong to every OTHER identity on the
+-- host, and that is not enumerable in principle.
+--
+-- So only SYSTEM scope is read: /etc/gitconfig is the one file whose contents
+-- are the same for every identity. The irreducible residual is stated plainly
+-- rather than papered over — none of the following is knowable at install time,
+-- and no future round should pretend otherwise:
+--
+--   * another user's global/XDG config naming this repository;
+--   * `git -c safe.directory=…` on a command line, or GIT_CONFIG_GLOBAL /
+--     GIT_CONFIG_SYSTEM / GIT_CONFIG_COUNT in someone's environment (measured:
+--     `git -c safe.directory=<repo>` admits a non-owner outright);
+--   * a differently-built git later on someone's PATH, whose compiled-in system
+--     config path is not the file read here;
+--   * SUDO_UID: git running as root under sudo also trusts the invoking uid;
+--   * any of it being changed the minute after this install finishes;
+--   * permission systems the kernel exposes to no cheap query — NFSv4/CIFS
+--     ACLs, SELinux/AppArmor contexts, per-namespace mount options.
+--
+-- So read `false` from this function as "no STANDING system configuration
+-- widens the set", never as "the set is provably {owner}". The second claim is
+-- unattainable — the command-line form alone makes it so — and every round that
+-- has tried to strengthen the answer has instead widened the ways of getting it
+-- wrong. The gate this installs is a local convenience hook (`--no-verify`
+-- bypasses it outright); it is not, and cannot be, an authorisation boundary.
+
+-- One scope's values. {vals, ok}; ok false means the scope could not be read,
+-- which must become "unknown" and never "no entries".
+$NUL = bytes_to_string(freeze(buffer([0])))
+-- A literal "~" is not a tilde here: a LEADING tilde in a Mix string literal
+-- expands to $HOME. Taken from a non-leading position, where no expansion
+-- happens, so the needle is the byte and not this account's home directory.
+$TILDE = substr("x~", 1, 1)
+
+fn safe_dir_values($argv)
+  -- LC_ALL=C so any diagnostic git prints is the string this code was written
+  -- against, and GIT_CONFIG_PARAMETERS cleared for the same reason the
+  -- rev-parse call above clears it: an ambient value would answer for a
+  -- configuration nobody installed.
+  $c = run_argv($argv, {env: {LC_ALL: "C", LANGUAGE: "",
+    GIT_CONFIG_PARAMETERS: ""}})
+  $rc = $c["exit_code"]
+  -- Truncation is SILENT, and silence here is the fail-open direction. Measured
+  -- on this interpreter: `run_argv` caps each stream at 8 MiB by default,
+  -- discards the excess, and reports `ok: true` with `exit_code: 0` — the
+  -- truncation flag is the only evidence that anything was dropped, and until
+  -- round thirty-seven nothing in this file read it. A `safe.directory = *`
+  -- sitting past the cap would simply not be in `$vals`, and the entry list
+  -- would be parsed as if complete: a confident "no widening" over a config
+  -- that opts out entirely.
+  --
+  -- Refusing rather than raising the cap is deliberate. Any cap has a far side,
+  -- and "no answer" is the honest report for a config this run only partly
+  -- read; an operator with a genuinely enormous /etc/gitconfig gets a refusal
+  -- naming the cause instead of a wrong answer. stderr counts too: the rc-1 arm
+  -- below decides on stderr being EMPTY, and reasoning about a stream that was
+  -- cut short is the same mistake in a different place.
+  if $c["stdout_truncated"] == true or $c["stderr_truncated"] == true then
+    return {vals: [], ok: false}
+  end
+  -- `utf8_lossy` is the same signal wearing different clothes, and round
+  -- thirty-seven read one and not the other. A pathname is a byte string, not
+  -- text: git stores and emits whatever bytes it was given, and this
+  -- interpreter's captured stdout is a Mix string, so any byte sequence that is
+  -- not valid UTF-8 arrives as U+FFFD with `utf8_lossy: true` — ok, exit_code 0,
+  -- no truncation. Measured on git 2.55.0: a symlink to the repository whose
+  -- NAME contains the byte 0xff is honoured (rc 0 against a foreign-owned repo),
+  -- `git config -z --get-all` emits the raw 0xff, and `realpath()` of the
+  -- replaced form returns nil. nil is not "no match" here but it lands there:
+  -- the entry falls past every arm of safe_dir_admits to `return false`, which
+  -- is the fail-open direction over a config that widens.
+  --
+  -- Refusing is the whole fix and it is the honest one — this run cannot see the
+  -- bytes git matched on, so it cannot answer. Repairing it is not available: by
+  -- the time the value is a Mix string the original bytes are gone.
+  if $c["utf8_lossy"] == true then
+    return {vals: [], ok: false}
+  end
+  if $rc == 0 then
+    -- `-z`, not line-oriented output. A repository pathname may legally contain
+    -- a newline, and `--get-all` emits values raw: splitting its stdout on "\n"
+    -- would then invent two entries out of one and lose the value that actually
+    -- matches — fail-open. Measured on git 2.55.0, values `/a`, ``, `/b`:
+    -- plain output is "/a\n\n/b\n" (a real reset and a line break are the same
+    -- byte) and `-z` output is "/a\0\0/b\0" (they are not). Drop the ONE
+    -- trailing terminator and nothing else: an empty element is exactly how a
+    -- genuine `directory =` reset arrives, so trimming too little makes every
+    -- read look like it ends in a reset — measured before this was `-z`, a lone
+    -- `safe.directory = *` wiped its own accumulator and answered "no
+    -- widening", the fail-open direction.
+    $out = $c["stdout"]
+    if ends_with($out, $NUL) then
+      $out = substr($out, 0, len($out) - 1)
+    end
+    return {vals: split($out, $NUL), ok: true}
+  end
+  -- git exits 1 BOTH for "no such key" and for a config file it could not read;
+  -- a parse error is 128. Measured on git 2.55.0: absent file 1/silent, key
+  -- absent 1/silent, unreadable 1/"warning: unable to access", malformed
+  -- 128/"fatal: bad config line". Reading an unreadable or malformed config as
+  -- "no widening" would be the fail-open direction, so only a SILENT 1 counts
+  -- as a real absence.
+  --
+  -- The discriminator is "stderr is empty", not the English text. Round
+  -- thirty-five: git translates its diagnostics, so matching `unable to access`
+  -- classified an unreadable config as "no entries" under any non-English
+  -- catalogue. LC_ALL=C above makes that specific string reliable again, but
+  -- the substring test is still the wrong shape — it asks "is this the failure
+  -- I thought of?" where the safe question is "did git say anything at all?".
+  -- Anything it does say pushes this to unknown, which is the refusing side.
+  if $rc == 1 and trim($c["stderr"]) == "" then
+    return {vals: [], ok: true}
+  end
+  return {vals: [], ok: false}
+end
+
+-- Declined, round thirty-seven, and recorded here because the proposal will
+-- occur to the next reader of this function as naturally as it did to the
+-- reviewer who raised it: given eight fail-opens found in the three functions
+-- below, stop matching. If system scope holds ANY `safe.directory`, `include`
+-- or `includeIf` entry, refuse outright, and the repeatedly-wrong matcher
+-- leaves the trust decision entirely. The argument for it is real — the
+-- matcher's failure mode is under-detection, and a blanket refusal has no such
+-- mode.
+--
+-- It is declined on a measurement made the same round. The includeIf refusal
+-- shipped in round thirty-six was exactly this shape at smaller scale: a
+-- condition that does not depend on the repository, so every repository on the
+-- host reported UNVERIFIED, permanently, with no action the operator could take
+-- that changed the answer. It was deleted for costing more than it bought. An
+-- answer that is always "unknown" is one nobody reads, and the entire purpose
+-- of this file is that an operator can tell a live gate from a dead one.
+-- Trading a rare under-detection for a guaranteed unreadable report on every
+-- host that has a single narrow `safe.directory` moves the failure from
+-- "sometimes wrong" to "always useless".
+--
+-- What the proposal is right about is already the structure: this function
+-- returns true / false / nil, and every unresolvable or unrecognised form takes
+-- the nil arm. None of the eight defects was the matcher declining to guess;
+-- every one was the matcher CONFIDENTLY MISCLASSIFYING a shape git honours —
+-- `/*`, `//*`, a trailing slash, a symlink, `.`, a value split on the wrong
+-- byte, a subdirectory subject, a silently truncated read. The fix each time
+-- was to teach it the shape or make it refuse, never to widen a "no" it had not
+-- earned. So the residual is bounded, and stated plainly: `false` here means
+-- "no standing system configuration this run could read widens the set", never
+-- "the set is provably {owner}". A shape git honours that this code has not
+-- been taught remains possible.
+
+-- git's own matching semantics, from git-config(1): `*` opts out entirely, an
+-- entry with `/*` appended admits everything beneath it, `~/…` and
+-- `%(prefix)/…` are interpolated, and an EMPTY value resets the list
+-- accumulated so far. Round thirty-three implemented `*` and exact equality
+-- only, so every other form read as "no match" — under-detection, which is the
+-- fail-open direction. Returns true / false / nil.
+
+-- realpath() only for entries that are already absolute. git resolves a
+-- relative entry against the cwd of whoever invokes it, which this run cannot
+-- know, and resolving it against THIS process's cwd would invent an answer out
+-- of wherever the installer happened to be started. Callers send relative
+-- entries to the unanswerable arm before reaching here.
+-- nil for anything that does not resolve, which is also git's answer.
+fn abs_realpath($p)
+  if starts_with($p, "/") == false then
+    return nil
+  end
+  return realpath($p)
+end
+
+-- Round thirty-eight, and the nineteenth entry shape. Everything the matcher
+-- had learned so far names a fixed directory: resolve it once and the answer
+-- holds for every process on the host. `/proc/self/cwd` does not. It is a magic
+-- link the kernel materialises per reader, so it resolves to the cwd of
+-- WHOEVER CALLS realpath — this installer, from wherever it was started. git
+-- resolves it in git's own process, and `-C <repo>` chdirs before the ownership
+-- check runs, which is also exactly the state a hook runs in: cwd is the
+-- worktree root. Measured on git 2.55.0 against a foreign-owned repository,
+-- all rc 0 — ADMITTED:
+--
+--   safe.directory = /proc/self/cwd          (cwd inside the repo, and via -C)
+--   safe.directory = /proc/thread-self/cwd
+--   safe.directory = /proc/self/root/<repo>
+--   safe.directory = /proc/self/fd/9         (fd 9 opened on the repo)
+--   safe.directory = /dev/fd/9
+--
+-- and this installer, resolving the same string from ~/.cmctl, got its OWN
+-- checkout root back and answered "does not name ~/.amp" — a confident no over
+-- a config that admits every repository git is invoked in. (The literal path is
+-- deliberately not written here: T112c0 in the suite generates a fixture
+-- installer by rewriting the $CMCTL assignment, then refuses to run it if the
+-- live root survives anywhere in the source — a comment counts.)
+--
+-- Two tests, because neither covers the other. The lexical one catches the
+-- literal forms including the fd family, whose target depends on a file
+-- descriptor table this process does not share and so cannot resolve at all
+-- (our fd 9 is not git's; realpath returns nil and nil falls through to "no
+-- match", the fail-open direction). The cwd one catches an entry that reaches
+-- /proc through a SYMLINK, where the string carries no hint: resolve it from
+-- two different working directories and a magic link is the only thing that
+-- answers differently.
+--
+-- Residual, stated rather than hidden: a symlink chain into `/proc/self/fd/N`
+-- is caught by neither — it is not lexically under /proc and it does not vary
+-- with cwd. Closing it means re-implementing realpath component by component,
+-- and hand-rolled path arithmetic is what four consecutive rounds of this file
+-- got wrong; the honest trade is to leave it and say so.
+fn magic_path($t)
+  return (starts_with($t, "/proc/") or $t == "/proc"
+    or starts_with($t, "/dev/fd/") or $t == "/dev/fd")
+end
+
+-- true when the entry resolves to different directories from different working
+-- directories; nil when this run could not establish that either way.
+fn cwd_dependent($t, $repo)
+  -- Absolute entries only, and the guard is deliberate even though the sole
+  -- caller has already established that. A RELATIVE entry is cwd-dependent by
+  -- definition, so without this line this test silently answers for the arm
+  -- above it as well — and the suite measured exactly that: with the
+  -- relative-path refusal removed, `safe.directory = .` still refused, here,
+  -- and the row that exists to prove that refusal is real went green against a
+  -- build that had lost it. Two arms that can each cover for the other cannot
+  -- be tested apart, and an untestable arm is the state this file keeps having
+  -- to be dragged out of. Keeping each one's domain disjoint is what makes both
+  -- independently killable.
+  --
+  -- Spelled through a variable rather than as the same `starts_with(...) ==
+  -- false` line the arm above uses, and not for taste: the suite's mutants are
+  -- generated by substituting a line of this source, `replace` rewrites EVERY
+  -- occurrence, and two textually identical guards mean one row's mutant
+  -- silently deletes the other row's fix. That is exactly how this guard's
+  -- first draft failed — the mutant for `.` disabled this line too, so `.` was
+  -- still refused and the row stayed red for the wrong reason. must_replace
+  -- now refuses an anchor that matches more than one site; this keeps it from
+  -- having to.
+  $absolute = starts_with($t, "/")
+  if $absolute == false then
+    return false
+  end
+  $here = cwd()
+  $ok = true
+  $a = nil
+  $b = nil
+  try
+    chdir("/")
+    $a = realpath($t)
+    chdir($repo)
+    $b = realpath($t)
+  catch $e
+    $ok = false
+  finally
+    -- Restoring is not optional: every relative path this process touches after
+    -- here, and the meaning of `.` in any config it goes on to read, depend on
+    -- it. `finally` runs on the raise path too — but NOT on exit(), which is why
+    -- nothing in this function may bail.
+    chdir($here)
+  end
+  if $ok == false then
+    return nil
+  end
+  return $a != $b
+end
+
+fn safe_dir_admits($entries, $repo, $real)
+  -- No trim(). git has already parsed these: whitespace it considered
+  -- insignificant is gone, and whitespace still present was quoted and is part
+  -- of the pathname. Trimming here would edit a pathname git honours verbatim.
+  -- Only a genuinely EMPTY value is the documented reset.
+  $acc = []
+  for each $t in $entries
+    if $t == "" then
+      $acc = []
+    else
+      push($acc, $t)
+    end
+  end
+  for each $t in $acc
+    if $t == "*" then
+      return true
+    end
+    -- ANY entry that is not absolute names a different directory depending on
+    -- who or where git is invoked from, so no single answer exists and the
+    -- honest one is "cannot tell" — never "no". Three shapes, all real:
+    --
+    --   `~/…`, `~user/…`  git interpolates against the HOME of whoever runs it,
+    --                     and this scope is shared by every identity on the host
+    --   `%(prefix)/…`     the compiled-in prefix of whichever git runs
+    --   `.`, `sub/dir`    resolved against the invoker's cwd. Round thirty-five
+    --                     measured `safe.directory = .` HONOURED, and `.` is the
+    --                     worktree top for every hook git runs — close to `*` in
+    --                     effect while looking like a harmless typo.
+    --
+    -- One test covers all of them, because none of these is absolute (probed).
+    -- Round thirty-four had a separate arm matching `~` and `%(prefix)` by
+    -- prefix; it is gone, not because it was wrong but because it could no
+    -- longer decide anything this test does not already decide, and an arm that
+    -- cannot change an outcome still reads as though it can.
+    --
+    -- The needle for the tilde one was the arc's worst trap and is worth keeping
+    -- in writing: a leading `~` in a Mix string LITERAL expands to $HOME, so the
+    -- obvious `starts_with($t, "~")` compared against `/home/user` and was
+    -- wrong in both directions at once — a real `~/x` entry (file DATA, so not
+    -- expanded) failed to match and read as "no widening", the fail-open
+    -- direction, while any unrelated entry under $HOME matched and read as
+    -- unknown. The unit probe written to catch it PASSED, because a literal in
+    -- the probe expanded too and both sides moved together; only a smoke test
+    -- against a real /etc/gitconfig found it. git does not expand these itself —
+    -- measured, `--get-all` returns `~/x`, `~root/y` and `%(prefix)/z` verbatim.
+    if starts_with($t, "/") == false then
+      return nil
+    end
+    -- Absolute is not the same as fixed. See magic_path / cwd_dependent above:
+    -- both arms are "this names a different directory depending on who
+    -- resolves it", which is the same unanswerable shape as `~/…` and for the
+    -- same reason — so it takes the same nil arm, before any matching is
+    -- attempted on a string whose meaning this process cannot pin down.
+    if magic_path($t) then
+      return nil
+    end
+    -- $real, not $repo. Round thirty-nine: cwd_dependent chdir()s to the
+    -- directory it is given, and $repo is whatever the config file said —
+    -- `repos: [".cmctl"]` is a relative path this process may well not be
+    -- sitting next to, and after the chdir("/") inside that function it is
+    -- certainly not. The chdir then raises, the function returns nil, and every
+    -- absolute entry on the host reads as unknown: a whole-host UNVERIFIED
+    -- earned by nothing but a config style. $real is the canonicalised subject
+    -- and is absolute by construction, and it is also the directory whose cwd
+    -- actually matters, since it is the one git will be sitting in.
+    $cd = cwd_dependent($t, $real)
+    if $cd == nil or $cd == true then
+      return nil
+    end
+    if ends_with($t, "/*") then
+      $base = substr($t, 0, len($t) - 2)
+      -- The ROOT wildcard. `/*`, `//*` and `///*` are `*` by another spelling —
+      -- the base is the filesystem root, above every repository on the host —
+      -- and all three were measured on git 2.55.0 ADMITTING a root-owned
+      -- repository. Round thirty-six found this fail-open.
+      --
+      -- The defect was the `$base != ""` guard that used to gate the prefix
+      -- test. It was written to stop an empty base matching everything and did
+      -- the exact opposite: `/*` is the one entry that SHOULD match everything,
+      -- and skipping it answered "no widening". Removing the guard is the whole
+      -- fix for `/*`, because `$base .. "/"` is then "/" and every absolute
+      -- path begins with it — which is precisely the semantics git implements.
+      --
+      -- `//*` and `///*` do need the realpath: their bases are "/" and "//", so
+      -- the prefix becomes "//" or "///" and nothing begins with that. Both
+      -- resolve to "/". Written as its own test rather than folded into the
+      -- one below, because `starts_with($real, "/" .. "/")` is false for every
+      -- path and the fold would silently do nothing.
+      $rb = abs_realpath($base)
+      if $rb == "/" then
+        return true
+      end
+      if (starts_with($repo, $base .. "/")
+          or starts_with($real, $base .. "/")) then
+        return true
+      end
+      if $rb != nil and starts_with($real, $rb .. "/") then
+        return true
+      end
+    end
+    if $t == $repo or $t == $real then
+      return true
+    end
+    -- Round thirty-five. A raw string compare is not what git does, and the
+    -- gap is fail-open. Measured on git 2.55.0 against a root-owned repository
+    -- with the entry in a global-scope config: `<repo>/`, `<repo>//`,
+    -- `<parent>/./repo`, `<parent>/repo/../repo` and a SYMLINK to the
+    -- repository are all HONOURED — git canonicalises the entry — while
+    -- `<parent>/nonexistent/../repo` and a relative `repo` are ignored, so the
+    -- canonicalisation is a real resolve and not a lexical one. Exactly
+    -- realpath(2), which is what this asks for. Every one of those forms
+    -- returned "no widening" before, which is a confident answer git disagrees
+    -- with. Also measured, and NOT a match: `<repo>/*` names what is beneath
+    -- the repository, not the repository, and git ignores it there — the
+    -- suffix branch above is deliberately `$base .. "/"` for that reason.
+    $rt = abs_realpath($t)
+    if $rt != nil and $rt == $real then
+      return true
+    end
+  end
+  return false
+end
+
+-- The directory git treats AS the repository for this configured path, or nil
+-- when this run could not establish it.
+--
+-- Round thirty-nine hoisted this out of safe_directory_widens, where it had
+-- been since round thirty-six, because a SECOND caller needed the same answer
+-- and was asking a different question instead. git_runner_uid stat()ed the
+-- CONFIGURED path — and the gate accepts a subdirectory, so with
+-- `repos: ["<root>/sub"]` where sub belongs to B and the worktree root to A,
+-- the executability question was asked on behalf of B while git will only ever
+-- run here as A. A hook at mode 0700 owned by B then reads as executable and
+-- installs clean, and git skips it in silence for A: a dead gate reported live,
+-- which is the one outcome this file exists to prevent. Two callers asking the
+-- same question of two different subjects is how that happened, so there is now
+-- one function and no second subject to get wrong.
+fn repo_subject($repo)
+  -- The subject git compares is the WORKTREE ROOT, canonicalised — measured on
+  -- git 2.55.0: reaching the repository through a symlink still produced
+  -- "dubious ownership in repository at <realpath>", and an entry naming
+  -- `<repo>/.git` was ignored while one naming the worktree was honoured. The
+  -- configured path need not be that root (the gate accepts a subdirectory),
+  -- and comparing a subdirectory against an entry naming the root answers "no
+  -- widening" for a repository git will happily admit — fail-open. Ask git.
+  --
+  -- ...unless there is no worktree at all. Measured round thirty-six on a bare
+  -- repository: `--show-toplevel` fails with "this operation must be run in a
+  -- work tree" EVEN WHEN THE REPOSITORY IS ADMITTED, and the directory git
+  -- names in its own diagnostic is the gitdir — "dubious ownership in
+  -- repository at <…>/bare.git", which is exactly `--absolute-git-dir`. So the
+  -- subject is the worktree root when there is one and the gitdir when there is
+  -- not, and asking `--is-bare-repository` is how to tell which question was
+  -- just answered rather than guessing from the failure.
+  $env = {LC_ALL: "C", GIT_CONFIG_PARAMETERS: ""}
+  $tl = run_argv(["git", "-C", $repo, "rev-parse", "--show-toplevel"],
+    {timeout: 60, env: $env})
+  $real = nil
+  -- Same truncation rule as safe_dir_values, for the same reason: a subject
+  -- silently cut short is a subject compared wrong. No pathname approaches the
+  -- 8 MiB cap, which is exactly the kind of "cannot happen" this arc has spent
+  -- seven fail-opens learning not to trust — the clause costs nothing.
+  -- (`--is-bare-repository` needs no such clause: it is compared for exact
+  -- equality with "true", so a truncated read can only fail that test and land
+  -- on the refusing side by itself.)
+  if ($tl["exit_code"] == 0 and $tl["utf8_lossy"] != true
+      and $tl["stdout_truncated"] != true) then
+    $real = realpath(chomp_path($tl["stdout"]))
+  end
+  if $real == nil then
+    $b = run_argv(["git", "-C", $repo, "rev-parse", "--is-bare-repository"],
+      {timeout: 60, env: $env})
+    if $b["exit_code"] == 0 and trim($b["stdout"]) == "true" then
+      $gd = run_argv(["git", "-C", $repo, "rev-parse", "--absolute-git-dir"],
+        {timeout: 60, env: $env})
+      if ($gd["exit_code"] == 0 and $gd["utf8_lossy"] != true
+          and $gd["stdout_truncated"] != true) then
+        $real = realpath(chomp_path($gd["stdout"]))
+      end
+    end
+  end
+  -- No fallback. Round thirty-six: this used to try `realpath($repo)` and then
+  -- $repo itself, which reinstates the very bug the rev-parse call was added to
+  -- fix — $repo may be a SUBDIRECTORY, and comparing a subdirectory against an
+  -- entry naming the worktree root answers a confident "no widening" for a
+  -- repository git admits. Reachable: `GIT_CEILING_DIRECTORIES` set at or below
+  -- the root makes rev-parse fail from a subdirectory (measured), and it is
+  -- refused in the environment check for that reason, but the refusal is the
+  -- diagnostic and THIS is the correctness bound. "I could not determine the
+  -- subject" is not "the subject does not match"; it is unknown, and unknown is
+  -- the only answer that costs nothing but a re-run.
+  return $real
+end
+
+fn safe_directory_widens($repo)
+  $real = repo_subject($repo)
+  if $real == nil then
+    return nil
+  end
+  -- `trim()` is wrong on a pathname and right on a boolean: `--is-bare-
+  -- repository` prints a word, `--show-toplevel` prints a PATH, and trailing
+  -- whitespace is legal in a directory name. Round thirty-six found trim() on
+  -- the path here, contradicting this file's own chomp_path() rule four lines
+  -- of comment away from where it was written.
+  -- An include at system scope can be IDENTITY-DEPENDENT, and then there is no
+  -- single system configuration to answer about. Measured round thirty-six:
+  -- `/etc/gitconfig` carrying `include.path = ~/.gitconfig-shared` reads as a
+  -- silent rc 1 — "no entries, verified" — for the installer, while for an
+  -- identity that HAS that file the same scope yields `safe.directory = *`. The
+  -- premise the whole function rests on, that system scope is the one stack
+  -- shared by every identity on the host, is false for exactly this shape.
+  --
+  -- Two refusals, both cheap, both in the refusing direction:
+  --
+  --   identity-dependent   `~/…`, `~user/…` and `%(prefix)/…` name a different
+  --   value                file per invoker, same as the safe.directory arm
+  --                        above. Measured: `--get-all` returns these RAW even
+  --                        under `--includes`, and a nested include is visible
+  --                        too, so the whole reachable set can be tested and
+  --                        not just the top.
+  --
+  --                        Round thirty-eight narrowed this from "not
+  --                        absolute", which swept in ordinary RELATIVE include
+  --                        paths and refused them. git resolves a relative
+  --                        include against the directory of the file the
+  --                        directive is IN — not the invoker's cwd and not
+  --                        their HOME — so it names the same file for every
+  --                        identity. Measured on git 2.55.0: `/etc/gitconfig`
+  --                        carrying `path = gitconfig.d/shared` loaded
+  --                        `/etc/gitconfig.d/shared`, admitted the repository
+  --                        named there, and `--get-regexp` reported the value
+  --                        raw and relative. That is a config this run CAN
+  --                        answer for, and it was answering UNVERIFIED on every
+  --                        status and exiting 2 on every install — the
+  --                        unearned-refusal shape round thirty-seven deleted
+  --                        from the includeIf arm, one line over.
+  --
+  --                        The tilde test cannot be written as the obvious
+  --                        literal: a leading `~` in a Mix string LITERAL
+  --                        expands to $HOME, which is the trap that made round
+  --                        thirty-four's version compare against /home/user
+  --                        and match nothing. $TILDE is built from a
+  --                        non-leading position for that reason. Config values
+  --                        are file DATA and are never expanded, so the
+  --                        asymmetry is real and only bites the needle.
+  --   any `includeIf`      SKIPPED, not refused. Round thirty-six refused these,
+  --                        reasoning that a `gitdir:` condition is evaluated
+  --                        against the repository git is opening and this query
+  --                        is not inside one, so an absolute path under an
+  --                        unreproducible condition was "still unknown". Round
+  --                        thirty-seven measured it: right about the mechanism,
+  --                        wrong about which way it cuts. Same included file,
+  --                        same repo, reached two ways on git 2.55.0:
+  --
+  --                          via [include]                    -> ADMITTED
+  --                          via [includeIf "gitdir:<repo>/"] -> still REFUSED
+  --
+  --                        with a control proving the condition is well-formed
+  --                        (that same includeIf fires for an ordinary key on a
+  --                        repo git will open, and does not fire elsewhere).
+  --                        The ownership check runs BEFORE the repository is
+  --                        open, and every condition git has — gitdir, gitdir/i,
+  --                        onbranch, hasconfig — needs an open repository to
+  --                        evaluate. An includeIf therefore cannot widen the
+  --                        admitted set: not an unknown, a no.
+  --
+  --                        Refusing anyway was not free. The condition is
+  --                        whole-host, so one conditional include anywhere in
+  --                        /etc/gitconfig made EVERY repository report
+  --                        UNVERIFIED for ever, and an answer that is always
+  --                        unknown is one nobody reads.
+  --
+  -- `^include` rather than an anchored `include(if\..*)?\.path` because keys
+  -- are lowercased by git and nothing else in the config space begins with it;
+  -- a stray `includefoo.bar` would only push this to unknown. Records arrive
+  -- as `key\nvalue` per NUL under `-z` — measured, not assumed, since a parser
+  -- that assumed the `--get-all` shape here is the round-thirty-five bug again.
+  $inc = safe_dir_values(["git", "config", "-z", "--includes", "--system",
+    "--get-regexp", "^include"])
+  if $inc["ok"] == false then
+    return nil
+  end
+  for each $r in $inc["vals"]
+    $nl = pos("\n", $r)
+    if $nl == 0 then
+      return nil
+    end
+    if starts_with(substr($r, 0, $nl - 1), "includeif.") then
+      continue
+    end
+    $ip = substr($r, $nl)
+    if starts_with($ip, $TILDE) or starts_with($ip, "%(prefix)") then
+      return nil
+    end
+    -- Round thirty-nine, and the twentieth fail-open. The identity-dependent
+    -- shapes above are not the only include paths that mean different files to
+    -- different readers: the path can be PROCESS-dependent, and then this run
+    -- and git read two different configurations from the same system scope.
+    -- Measured on git 2.55.0, with `inc` holding `safe.directory = *` and
+    -- placed inside the repository:
+    --
+    --   /etc/gitconfig: [include] path = /proc/self/cwd/inc
+    --   git -C <repo> status, GIT_TEST_ASSUME_DIFFERENT_OWNER=1  -> ADMITTED
+    --   git config -z --includes --system --get-all safe.directory
+    --     (this installer, from its own cwd)                     -> rc 1, EMPTY
+    --
+    -- `git -C` chdirs into the repository before it reads config, so
+    -- /proc/self/cwd is the repository for git and something else entirely for
+    -- the process asking about it. The matcher never sees a value to
+    -- misclassify; it is handed an empty entry list and answers a confident
+    -- "no widening" over a config that widens to everything. Note that this is
+    -- the same magic-path family already refused on the VALUE side — the same
+    -- two tests, applied one level earlier, to the name of the file rather than
+    -- to what is in it. `/dev/stdin` is in that family and was the vector the
+    -- review proposed; it did not reproduce (rc 128 both ways, git having
+    -- closed or consumed stdin by then), which changes which example is worth
+    -- writing down and not whether the class is real.
+    --
+    -- A RELATIVE include path is not this: git resolves it against the
+    -- directory of the file that includes it, which is fixed. cwd_dependent's
+    -- absolute-only guard says so, and round thirty-eight deleted the refusal
+    -- that used to treat relative paths as unknown here.
+    if magic_path($ip) then
+      return nil
+    end
+    $icd = cwd_dependent($ip, $real)
+    if $icd == nil or $icd == true then
+      return nil
+    end
+  end
+  -- `--includes`. git-config(1): includes default OFF when a specific file is
+  -- named (--system counts) and ON when searching all files — but the config
+  -- git ACTUALLY loads at ownership-check time is the searching kind, so it
+  -- honours them. Measured: /etc/gitconfig carrying `include.path` to a file
+  -- holding `safe.directory = *` reads as clean rc 1 (no entries, "verified")
+  -- without this flag and returns the `*` with it.
+  $s = safe_dir_values(["git", "config", "-z", "--includes", "--system",
+    "--get-all", "safe.directory"])
+  if $s["ok"] == false then
+    return nil
+  end
+  -- A global-scope empty value can RESET entries inherited from system scope,
+  -- so a system `*` that some user has reset reads here as widened when for
+  -- that user it is not. That is over-detection: a false "unknown" on a gate
+  -- that would have been fine. It is left deliberately, because the error is in
+  -- the refusing direction and the alternative is reading per-user config,
+  -- which the scope note above explains cannot be done correctly at all.
+  return safe_dir_admits($s["vals"], $repo, $real)
+end
+
+-- "" when the owner's answer stands; otherwise the reason it does not.
+-- "" when the owner is demonstrably the only identity that can write here;
+-- otherwise the reason they are not; nil when this run could not establish it.
+--
+-- Round thirty-eight. safe_directory_widens answers a question about git's
+-- CONFIG, and the arm below returning "" then reads as "the owner's answer
+-- stands for everyone". It does not. Another identity's own global config can
+-- carry `safe.directory = <repo>`, and per-user config is unreadable from here
+-- by construction — the function says so itself, two arms down. So the honest
+-- version of "nobody else matters" is not about config at all: it is that
+-- nobody else can WRITE here. An identity that cannot write cannot commit, and
+-- cannot delete the hook or point core.hooksPath somewhere else either, so
+-- whatever their config says is irrelevant to this gate.
+--
+-- Mode bits are the right instrument, including under ACLs, and not by
+-- accident: POSIX.1e makes the group bits of a file with an ACL the MASK, and
+-- the mask bounds every named entry. A named user with effective write
+-- therefore forces the group bit on, so `perm & 0o022` sees ACL-granted write
+-- as well as ordinary group write. Which is why the group bit alone cannot be
+-- believed in EITHER direction, and why round thirty-nine had to look at the
+-- ACL after all: see group_write_is_foreign below.
+--
+-- Bounded, and the bound is stated rather than papered over: a writable
+-- ANCESTOR of either directory lets someone rename the whole thing, and this
+-- does not walk the path to the root. That is a different and much broader
+-- claim ("nobody else controls this location"), and one no check inside a
+-- repository can make.
+-- true when the group write bit on $path genuinely hands write to somebody
+-- other than $uid; false when it demonstrably does not; nil when this run could
+-- not establish either.
+--
+-- Round thirty-nine. The bit alone does not establish a foreign identity, and
+-- on this host it usually does not: a user-private group (markc:markc) at 0775
+-- grants write to a group whose only member is the owner, and round thirty-
+-- eight refused on it. A refusal nobody can act on — "chmod g-w" on a group
+-- that contains only you — is the permanent whole-host UNVERIFIED that rounds
+-- thirty-seven and thirty-eight each deleted one of.
+--
+-- Narrowed only where it can be PROVED harmless, and both halves have to hold:
+--
+--   no extended ACL   because with one the group bits are the MASK, not the
+--                     group's own permission, and a named user can hold write
+--                     underneath it. That is the very property the comment
+--                     above relies on to see ACL-granted write, so dropping
+--                     the refusal without checking would trade a false
+--                     UNVERIFIED for a fail-open. Measured: `setfacl -m
+--                     u:nobody:rwx` on a 0755 directory reports 0775, and
+--                     `getfacl -c` shows `user:nobody:rwx` and a `mask::` line
+--                     that a minimal ACL does not have. `default:` entries are
+--                     ignored on purpose — they govern files created later,
+--                     not who may write this directory now.
+--   no other member   secondary members come from the group entry; PRIMARY
+--                     members do not appear there at all and need the passwd
+--                     scan. Missing either half answers "single-member" for a
+--                     group that is not.
+--
+-- Anything unproven is nil, and nil keeps the refusal — including the case
+-- rounds up to forty only DOCUMENTED: a passwd source with enumeration
+-- disabled answers the primary-member scan with a short list rather than an
+-- error, so a primary member it declines to enumerate is invisible here. That
+-- residual used to be a comment sitting above a function that returned `false`
+-- anyway. `passwd_enumerable()` below turns it into a refusal.
+fn has_extended_acl($path)
+  $fa = run_argv(["getfacl", "-c", "--absolute-names", "--", $path],
+    {timeout: 60, env: {LC_ALL: "C"}})
+  if ($fa["exit_code"] != 0 or $fa["utf8_lossy"] == true
+      or $fa["stdout_truncated"] == true) then
+    return nil
+  end
+  for each $ln in split($fa["stdout"], "\n")
+    $l = trim($ln)
+    if $l == "" or starts_with($l, "#") or starts_with($l, "default:") then
+      continue
+    end
+    if starts_with($l, "mask::") then
+      return true
+    end
+    if starts_with($l, "user:") and starts_with($l, "user::") == false then
+      return true
+    end
+    if starts_with($l, "group:") and starts_with($l, "group::") == false then
+      return true
+    end
+  end
+  return false
+end
+
+-- The passwd sources whose NSS modules walk their whole database on
+-- setpwent/getpwent. Everything else may answer an enumeration with a SHORT
+-- LIST rather than an error: sss and winbind have enumeration off by default,
+-- ldap and nis have it configurable and commonly off, and `compat` delegates
+-- to a backend this cannot see from here.
+--
+-- `systemd` was on this list until round forty's third review and is not a
+-- member. nss-systemd does not hold a database of its own; it forwards to the
+-- userdb Varlink providers, and systemd's User/Group API makes ENUMERATION
+-- OPTIONAL for a provider while lookup stays mandatory — a provider may answer
+-- io.systemd.UserDatabase.NoRecordFound style enumeration with
+-- EnumerationNotSupported and still resolve the same account by uid. That is
+-- precisely the shape this predicate exists to refuse: `getent passwd` returns
+-- a short list, exit 0, and an account whose primary gid is the directory's is
+-- invisible. Empirically it holds on this host — `getent passwd` and
+-- `userdbctl user` agree on all 87 names in both directions — but "the
+-- providers installed here happen to enumerate" is a fact about one host at one
+-- moment, not a property of the source, and the list is documented as the
+-- latter. The cost is a cannot-answer on a systemd host whose hooks directory
+-- is group-writable with no extended ACL and no secondary member; the remedy
+-- printed there, `chmod g-w`, is one the operator can actually act on. All
+-- three guarded repositories are 0755, so nothing on this host reaches it.
+$PASSWD_ENUMERATING_SOURCES = ["files", "altfiles", "db"]
+
+-- Can `getent passwd` be trusted to list EVERY account?
+--
+-- This is what the primary-group scan in foreign_group_member() rests on, and
+-- the one thing that scan cannot observe from its own output. A source with
+-- enumeration disabled returns a short list, not an error, so an account it
+-- declines to enumerate is indistinguishable from an account that does not
+-- exist. The scan's own guard — an EMPTY enumeration is unknown — catches
+-- total failure and nothing else; a partial answer looks exactly like a
+-- complete one. Rounds up to forty named that residual in a comment and then
+-- returned `false` regardless, which is a confident "no other uid holds this
+-- gid" built on evidence never gathered: the precise class this gate exists to
+-- refuse, sitting inside the predicate that decides whether to refuse.
+--
+-- The switch configuration is the only honest signal available without
+-- interrogating each NSS module. true only when every source on the `passwd:`
+-- line is known to enumerate; nil for an unreadable, absent, sourceless or
+-- duplicated line, and nil for any source not on the list above — an unknown
+-- module is a cannot-answer, not a pass. A bracketed action qualifier
+-- ([SUCCESS=merge]) is one of the things not on that list, and is refused for
+-- the reason spelled out at the token loop below — it is switch syntax rather
+-- than a source, but it is syntax that can halt an enumeration.
+--
+-- Deliberately not memoised, for the same reason nil is not cached below: this
+-- is a property of a file that can be rewritten mid-run, and the 0o020 gate
+-- already bounds how often it is asked.
+fn passwd_enumerable()
+  $txt = ""
+  try
+    $txt = read_file($NSSWITCH)
+  catch $msg
+    return nil
+  end
+  $line = nil
+  for each $raw in split($txt, "\n")
+    $l = $raw
+    $h = pos("#", $l)
+    if $h > 0 then
+      $l = substr($l, 0, $h - 1)
+    end
+    $l = trim($l)
+    if starts_with($l, "passwd:") == false then
+      continue
+    end
+    if $line != nil then
+      -- glibc's precedence between two passwd lines is not something to guess
+      -- at from inside a security predicate.
+      return nil
+    end
+    $line = trim(substr($l, 7))
+  end
+  if $line == nil or $line == "" then
+    return nil
+  end
+  $i = 1
+  while $i <= words($line)
+    $w = word($line, $i)
+    -- An ACTION clause is a refusal, not a harmless decoration. Round forty's
+    -- re-review: `passwd: files [NOTFOUND=return] db` lists two enumerating
+    -- sources, but glibc consults the action when a source is exhausted during
+    -- enumeration too, so the walk stops at `files` and a `db` account holding
+    -- this gid never appears. Modelling which of NOTFOUND/UNAVAIL/SUCCESS/
+    -- TRYAGAIN × return/continue/merge can halt an enumeration is exactly the
+    -- guessing this function already declines to do two lines up, where a
+    -- second `passwd:` line refuses rather than assume glibc's precedence.
+    -- Refusing on any action clause costs a cannot-answer on a host that has
+    -- one; being wrong the other way costs a false clean.
+    if contains($PASSWD_ENUMERATING_SOURCES, $w) == false then
+      return nil
+    end
+    $i = $i + 1
+  end
+  return true
+end
+
+-- Only the identity-membership half is memoised. Its key is
+-- "<owner-uid>:<group-gid>" because the passwd/group answer is identical for
+-- every path with that owner/group pair during one installer run. Only true
+-- and false are answers and therefore cacheable. nil is not cached: NSS can be
+-- transiently unavailable while SSSD reconnects, LDAP/DNS recovers, or nscd
+-- restarts, and the final hooks component is deliberately asked twice. A
+-- later call must be allowed to recover instead of inheriting one earlier
+-- cannot-answer for the whole run. The cost is repeated getent subprocesses
+-- for every group-writable component during a sustained identity-source
+-- outage; the 0o020 gate bounds that cost to paths which need the answer.
+-- The ACL half is deliberately NOT cached either: whether an extended ACL
+-- widens write is a property of this path at this instant, not of the uid/gid
+-- pair.
+fn foreign_group_member($uid, $gid)
+  $key = ("" .. $uid) .. ":" .. ("" .. $gid)
+  if has_key($GROUP_MEMBERSHIP_CACHE, $key) then
+    return $GROUP_MEMBERSHIP_CACHE[$key]
+  end
+
+  $env = {LC_ALL: "C"}
+  $own = run_argv(["getent", "passwd", "" .. $uid], {timeout: 60, env: $env})
+  if ($own["exit_code"] != 0 or $own["utf8_lossy"] == true
+      or $own["stdout_truncated"] == true) then
+    return nil
+  end
+  $of = split(trim($own["stdout"]), ":")
+  if len($of) < 4 then
+    return nil
+  end
+  $owner_name = $of[0]
+  $gr = run_argv(["getent", "group", "" .. $gid], {timeout: 60, env: $env})
+  if ($gr["exit_code"] != 0 or $gr["utf8_lossy"] == true
+      or $gr["stdout_truncated"] == true) then
+    return nil
+  end
+  $gf = split(trim($gr["stdout"]), ":")
+  if len($gf) < 3 then
+    return nil
+  end
+  if len($gf) > 3 then
+    for each $m in split($gf[3], ",")
+      if trim($m) != "" and trim($m) != $owner_name then
+        $GROUP_MEMBERSHIP_CACHE[$key] = true
+        return true
+      end
+    end
+  end
+  $all = run_argv(["getent", "passwd"], {timeout: 60, env: $env})
+  if ($all["exit_code"] != 0 or $all["utf8_lossy"] == true
+      or $all["stdout_truncated"] == true) then
+    return nil
+  end
+  $seen = 0
+  for each $pl in split($all["stdout"], "\n")
+    if trim($pl) == "" then
+      continue
+    end
+    $seen = $seen + 1
+    $pf = split($pl, ":")
+    if len($pf) < 4 then
+      continue
+    end
+    if $pf[3] == "" .. $gid and $pf[2] != "" .. $uid then
+      $GROUP_MEMBERSHIP_CACHE[$key] = true
+      return true
+    end
+  end
+  if $seen == 0 then
+    return nil
+  end
+  -- The scan found nobody. That is only an ANSWER if the enumeration it
+  -- searched was complete; on a host whose passwd database does not fully
+  -- enumerate, "nobody in the list" and "the list is short" produce identical
+  -- output here, and only one of them means the directory is safe.
+  if passwd_enumerable() != true then
+    return nil
+  end
+  $GROUP_MEMBERSHIP_CACHE[$key] = false
+  return false
+end
+
+fn group_write_is_foreign($path, $uid, $gid)
+  $acl = has_extended_acl($path)
+  if $acl == nil then
+    return nil
+  end
+  if $acl == true then
+    return true
+  end
+  return foreign_group_member($uid, $gid)
+end
+
+fn foreign_writable($repo)
+  $paths = [$repo]
+  $g = run_argv(["git", "-C", $repo, "rev-parse", "--absolute-git-dir"],
+    {timeout: 60, env: {LC_ALL: "C", GIT_CONFIG_PARAMETERS: ""}})
+  if ($g["exit_code"] != 0 or $g["utf8_lossy"] == true
+      or $g["stdout_truncated"] == true) then
+    return nil
+  end
+  push($paths, chomp_path($g["stdout"]))
+  for each $p in $paths
+    if exists($p) == false then
+      return nil
+    end
+    $st = nil
+    try
+      $st = stat($p)
+    catch $pe
+      return nil
+    end
+    $why = ""
+    if band($st["perm"], 0o002) != 0 then
+      $why = "other"
+    else
+      if band($st["perm"], 0o020) != 0 then
+        $gw = group_write_is_foreign($p, $st["uid"], $st["gid"])
+        if $gw == nil then
+          return nil
+        end
+        if $gw == true then
+          $why = "group"
+        end
+      end
+    end
+    if $why != "" then
+      return join([$p, " is writable by ", $why, ", so identities other",
+        " than this repository's owner can commit here — and can also remove"
+        , " this hook or redirect core.hooksPath. Whether git will run it for",
+        " them depends on configuration this run cannot read for identities it",
+        " cannot name. Take group and other write off it (chmod g-w,o-w), or",
+        " verify by hand as the identity that actually commits"], "")
+    end
+  end
+  return ""
+end
+
+fn identity_divergence($repo)
+  $w = safe_directory_widens($repo)
+  if $w == false then
+    $fw = foreign_writable($repo)
+    if $fw == nil then
+      return join(["whether identities other than this repository's owner can",
+        " write here could not be determined — the repository's own directories",
+        " could not be stat'ed, or git could not name its git directory, or one",
+        " of them is group-writable and this run could not establish whether",
+        " that group has a member other than the owner (getfacl, or getent for",
+        " the group or the passwd map, did not answer) — so whether anyone else",
+        " can commit, or remove this hook, is unknown"], "")
+    end
+    return $fw
+  end
+  if $w == nil then
+    -- Every nil path this function has, named as a class. Round thirty-six
+    -- added three arms and left this message describing the two that predated
+    -- them, which is its own small version of the bug this file keeps finding:
+    -- an operator handed a cause that is not their cause goes and checks the
+    -- wrong thing. Kept as classes rather than a precise per-arm reason on
+    -- purpose — the arms share one remedy (look at the system git config, or
+    -- name the repository by a path git can resolve), and threading a reason
+    -- string back through three call layers would buy wording, not action.
+    return join(["whether identities other than this repository's owner can",
+      " run git here could not be determined — the system git config could not",
+      " be read, or was too large for this run to read to the end, or it names",
+      " a path this run cannot resolve to one answer (`~/…` and `%(prefix)/…`",
+      " mean a different directory for each identity), or which directory git",
+      " compares for this repository could not be established — so whether git",
+      " will execute this hook for whoever actually commits is unknown"], "")
+  end
+  return join(["a system-wide safe.directory entry lets identities other than",
+    " this repository's owner run git here. The owner can execute this hook;",
+    " whether git can execute it for one of THEM depends on permissions this",
+    " run cannot enumerate for identities it cannot name, so the answer is",
+    " unknown. Narrow safe.directory in /etc/gitconfig, or verify by hand as",
+    " the identity that actually commits"], "")
+end
+
+fn is_executable($path, $repo)
+  if exists($path) == false then
+    return {run: false, why: ""}
+  end
+  -- $ACCESS_OK is measured once at startup. false means this interpreter has no
+  -- access() builtin, or has one that answers wrongly, and there is deliberately
+  -- no fallback: the fallback WAS the four-round pile of mode arithmetic above,
+  -- and keeping it as a quiet second path would keep every wrong answer it ever
+  -- gave. Under --status this degrades to the honest unknown; the installing
+  -- path never reaches here, having already refused.
+  -- Terse on purpose. The full explanation is printed ONCE by
+  -- require_access_builtin at startup; repeating it here put nine identical
+  -- paragraphs on the screen for the three repositories this installer manages,
+  -- which is the same warn-once problem the uid and lstat probes were hoisted
+  -- out of their helpers to solve.
+  -- Deliberately does not name the cause. Since round thirty the startup probe
+  -- distinguishes a broken interpreter from an environment it cannot be run in
+  -- (a noexec TMPDIR, a filesystem that drops mode bits), and only the startup
+  -- warning knows which — repeating a guess here per hook would print the wrong
+  -- one nine times.
+  if $ACCESS_OK == false then
+    return {run: nil, why: "access(path, \"x\") could not be relied on in this"
+      .. " run (see the warning above)"}
+  end
+  -- The whole decision, asked of the authority that will actually make it —
+  -- and, since round thirty-two, ON BEHALF OF the identity that will actually
+  -- provoke it. Both halves are load-bearing; asking the right authority the
+  -- wrong subject's question is how three green signals covered a dead gate.
+  $who = git_runner_uid($repo)
+  if $who["uid"] == nil then
+    return {run: nil, why: "who git will run this hook as could not be"
+      .. " determined — " .. $who["why"]}
+  end
+  $a = access_x_as($who["uid"], $path)
+  if $a["ok"] == nil then
+    return {run: nil, why: $a["why"]}
+  end
+  if $a["ok"] == true then
+    -- The owner can execute it. That settles the question only if the owner is
+    -- the only identity git will run as here; see identity_divergence.
+    $div = identity_divergence($repo)
+    if $div != "" then
+      return {run: nil, why: $div}
+    end
+    return {run: true, why: ""}
+  end
+  -- Everything below narrows down WHY the answer was no, and it narrows it down
+  -- for the runner, not for this process. Where they differ, say so — "the
+  -- kernel will not execute it as you" sent an operator to check their own
+  -- permissions on a file whose problem was somebody else's.
+  $whose = "you"
+  if $who["uid"] != uid() then
+    $whose = join(["uid ", $who["uid"], ", who owns this repository and is",
+      " therefore who git will run it as (not you, uid ", uid(), ")"], "")
+  end
+  -- Only now, and only to choose the right instruction. "re-run without
+  -- --status" repairs a mode bit and is a wrong and expensive thing to tell an
+  -- operator whose hooks directory is mounted noexec (round twenty-four). The
+  -- mount lookup can no longer produce an unknown ANSWER, because the answer is
+  -- already in hand; nil here only costs the more specific wording.
+  $nx = path_is_noexec($path)
+  if $nx == true then
+    return {run: false, why: "it is on a filesystem mounted noexec, so the"
+      .. " kernel refuses to execute it whatever its mode bits say — move the"
+      .. " hooks directory (core.hooksPath) to a mount without noexec;"
+      .. " re-installing will not help"}
+  end
+  if $nx == nil then
+    return {run: false, why: "the kernel will not execute it as " .. $whose
+      .. ". Whether"
+      .. " that is its mode bits, an ACL, or a noexec mount could not be"
+      .. " narrowed down (/proc/mounts unreadable, or the path could not be"
+      .. " canonicalised) — re-running without --status fixes the mode-bit case"
+      .. " and will report the others unchanged"}
+  end
+  -- Not on a noexec mount, so it is the path itself: mode bits, which
+  -- re-installing fixes, or something chmod cannot reach, which it does not.
+  -- Both are named, because an empty why prints the bare "re-run without
+  -- --status" and that is the loop round twenty-four objected to — an operator
+  -- following it against an ACL denial re-runs forever, each time told the fix
+  -- is at hand.
+  --
+  -- "an ACL" was the only named candidate until round thirty pointed out it is
+  -- not the only one: a filesystem that ignores chmod (a mount option, a
+  -- filesystem with no mode bits of its own) and a directory in the path
+  -- lacking search permission produce exactly this line too. getfacl is still
+  -- the first thing to run, so it is still the first thing named — but as the
+  -- likeliest member of a class, not as the diagnosis.
+  return {run: false, why: "the kernel will not execute it as " .. $whose
+    .. ", and it is"
+    .. " not a noexec mount. Re-running without --status re-applies the mode"
+    .. " bits and fixes the ordinary case; if this line comes back afterwards"
+    .. " the denial is something the mode bits do not show — most often an ACL"
+    .. " (`getfacl " .. $path .. "`), otherwise a filesystem that ignores chmod"
+    .. " or a parent directory you cannot search (`namei -l " .. $path .. "`)"}
+end
+
+-- run_stream inherits stdio, so git's pre-push ref lines flow straight through
+-- to hygiene-hook.mix and gate output streams live instead of arriving in one
+-- lump at the end.
+-- The stub deliberately carries NO repo path: hygiene-hook.mix resolves the
+-- working tree it was invoked in. Linked `git worktree` checkouts share this
+-- hooks directory, so a baked-in path would scan the main checkout instead of
+-- the one being committed to.
+-- `args()` is forwarded so git's own hook arguments reach hygiene-hook.mix.
+-- pre-push needs BOTH of git's arguments: $2 is the location being pushed to,
+-- which is what bounds the scan, and $1 is the remote name for the diagnostic.
+-- Without them the range has to be guessed, and the guess was wrong.
+-- Round twenty-seven replaces round twenty-six's two-state guess with a
+-- three-state classifier. Round twenty-six said the claimed checkout must be a
+-- whitespace-free path; that grammar is unsound. Spaces, tabs and trailing
+-- whitespace are all legal inside an absolute POSIX pathname, and a checkout
+-- named `control plane/.cmctl` emitted a real stub that its own installer called
+-- foreign on the next run. Preserving it below itself made every hook refuse.
+--
+-- The old objection to a template set is now stale too, and is corrected
+-- explicitly rather than quietly deleted. An unrecognised historical stub was
+-- once preserved below itself and one commit produced about 5,400 processes
+-- and load average 604; that made a template miss catastrophic. Since then
+-- hygiene-hook.mix's round-twenty-six recursion check detects the same hook
+-- below itself and refuses at 2. A forgotten template is now a loud blocked
+-- commit, not an explosion. More importantly, this classifier refuses an
+-- unfamiliar valid claim BEFORE installation mutates anything, so the failure
+-- direction is safe even before a hook runs.
+--
+-- The states are deliberately asymmetric:
+--
+--   * no valid line-2 claim is FOREIGN and is preserved byte-for-byte;
+--   * a valid claim plus one exact known body is OURS and is replaced silently;
+--   * a valid claim plus an unknown body is UNKNOWN and installation refuses.
+--
+-- The third state must not be guessed. It is either a forgery or a version this
+-- installer does not know; replacing loses data and chaining risks recursion.
+-- The known set is the three distinct bodies recovered with
+-- `git log -p -- _bin/install-hygiene-hooks.mix`: current argv forwarding, the
+-- earlier no-argv form, and the original form with the configured repo baked
+-- in. The claimed checkout root parameterises every embedded path, so a genuine
+-- stub from a moved or different checkout remains ours without accepting an
+-- arbitrary body. If stub() changes, extending this set is load-bearing: a miss
+-- deliberately makes the next install refuse rather than silently self-chain.
+fn provenance_root($text)
+  $lines = split($text, "\n")
+  if len($lines) < 2 then
+    return nil
+  end
+  $line = $lines[1]
+  $suffix = "/_bin/install-hygiene-hooks.mix"
+  if starts_with($line, $OURS_LINE) == false or ends_with($line, $suffix) == false then
+    return nil
+  end
+  $middle_len = len($line) - len($OURS_LINE) - len($suffix)
+  if $middle_len < 1 then
+    return nil
+  end
+  $root = substr($line, len($OURS_LINE), $middle_len)
+  if starts_with($root, "/") == false then
+    return nil
+  end
+  return $root
+end
+
+fn stub_for($root, $name)
+  $hook = $root .. "/_bin/hygiene-hook.mix"
+  return join([
+    "#!" .. $MIX .. "\n",
+    $OURS_LINE .. $root .. "/_bin/install-hygiene-hooks.mix\n",
+    "-- Logic lives in " .. $hook .. " (edit there; no reinstall needed).\n",
+    "exit(run_stream(concat([\"" .. $MIX .. "\", \"" .. $hook .. "\", \""
+      .. $name .. "\"], args())))\n"
+  ], "")
+end
+
+fn known_stub_templates($root, $repo, $name)
+  $hook = $root .. "/_bin/hygiene-hook.mix"
+  return [
+    stub_for($root, $name),
+    join([
+      "#!" .. $MIX .. "\n",
+      $OURS_LINE .. $root .. "/_bin/install-hygiene-hooks.mix\n",
+      "-- Logic lives in " .. $hook .. " (edit there; no reinstall needed).\n",
+      "exit(run_stream([\"" .. $MIX .. "\", \"" .. $hook .. "\", \"" .. $name
+        .. "\"]))\n"
+    ], ""),
+    join([
+      "#!" .. $MIX .. "\n",
+      $OURS_LINE .. $root .. "/_bin/install-hygiene-hooks.mix\n",
+      "-- Logic lives in " .. $hook .. " (edit there; no reinstall needed).\n",
+      "exit(run_stream([\"" .. $MIX .. "\", \"" .. $hook .. "\", \"" .. $name
+        .. "\", \"" .. $repo .. "\"]))\n"
+    ], "")
+  ]
+end
+
+fn is_our_stub($text, $repo, $name)
+  $root = provenance_root($text)
+  if $root == nil then
+    return {kind: "foreign", root: ""}
+  end
+  for each $known in known_stub_templates($root, $repo, $name)
+    if $text == $known then
+      return {kind: "ours", root: $root}
+    end
+  end
+  return {kind: "unknown", root: $root}
+end
+
+fn stub($name)
+  return stub_for($CMCTL, $name)
+end
+
+-- The same environment refusal the gate makes, for the same reason and with
+-- worse consequences if it is skipped. `git -C $repo rev-parse --git-path
+-- hooks` is resolved against an ambient GIT_DIR, not against $repo: with one
+-- set, the installer writes every hook into that one directory, prints the
+-- public repos' names beside "installed pre-commit", exits 0 — and leaves all
+-- three repos with no hooks at all. Measured 2026-07-25: installer_rc=0,
+-- target_missing=true, decoy_written=true. A gate that reports itself installed
+-- when it is not is worse than one that is plainly absent.
+-- GIT_CONFIG_* is here for the same reason with a quieter symptom: the target
+-- directory comes from `rev-parse --git-path hooks`, which honours
+-- core.hooksPath, and process-local config can set that key without touching
+-- any config file. Measured 2026-07-25 with GIT_CONFIG_COUNT=1 /
+-- KEY_0=core.hooksPath: exit 0, "hooks written: 9", all nine written into one
+-- decoy directory, the three real repos left exactly as they were.
+-- GIT_CONFIG_PARAMETERS is deliberately absent — git sets it itself to
+-- propagate `git -c`, so refusing it would break a legitimate invocation.
+--
+-- env() is enough here, unlike in the gate: an empty value for any of these is
+-- inert (there is no equivalent of "read an EMPTY index"), so set-to-empty and
+-- unset genuinely are the same answer.
+fn require_clean_git_env()
+  for each $var in ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE",
+    "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"]
+    if env($var) != "" then
+      bail(2, $var .. " is set in the environment — it decides which repository"
+        .. " `git -C` reads or where core.hooksPath points, so this would"
+        .. " install every hook into one directory while reporting success for"
+        .. " the configured repos; unset it and re-run")
+    end
+  end
+  -- Not a hooks-path channel — a repository-DISCOVERY one, refused for the
+  -- identity check rather than the install. Measured round thirty-six: with
+  -- GIT_CEILING_DIRECTORIES set at the worktree root, `rev-parse
+  -- --show-toplevel` from a subdirectory fails rc 128, so the subject of the
+  -- safe.directory comparison cannot be determined. That now answers "unknown"
+  -- rather than guessing, which is the correctness bound; this refusal exists
+  -- so the operator gets a cause instead of an unexplained UNVERIFIED.
+  if env("GIT_CEILING_DIRECTORIES") != "" then
+    bail(2, "GIT_CEILING_DIRECTORIES is set in the environment — it stops git"
+      .. " discovering a repository from a subdirectory, so the ownership"
+      .. " question below cannot be answered for repos configured by"
+      .. " subdirectory; unset it and re-run")
+  end
+end
+
+-- Where git will ACTUALLY look. Honours core.hooksPath; worktree-correct.
+--
+-- GIT_CONFIG_PARAMETERS is blanked, and ONLY that. It is unrefusable (git sets
+-- it itself to propagate `git -c`) and it carries core.hooksPath perfectly
+-- well, so the refusal list above could not close it: reproduced round ten via
+-- a git alias — exit 0, "hooks written: 9", all nine into one decoy, the three
+-- real repos untouched. Blanking it neutralises the injection (verified: git
+-- parses an empty value as no parameters).
+--
+-- The first fix was `clear_env: true`, and that was wrong in the opposite
+-- direction. This question is not "what is the safe answer" — it is
+-- "**where will git look when it runs the hook**", and that answer depends on
+-- the environment the operator's git will actually have. Stripping the
+-- environment changes the config stack: with `XDG_CONFIG_HOME` pointing at a
+-- global config that sets core.hooksPath, ordinary git answers that directory
+-- while the stripped question answers `.git/hooks` — so the installer writes
+-- nine hooks somewhere git will never look and reports success. Measured
+-- 2026-07-26; it is the same false-success this function exists to prevent,
+-- reintroduced by the fix for it. So the environment is kept, minus the one
+-- process-local channel that cannot be refused.
+--
+-- A SHA can be trimmed; a PATHNAME cannot. Trailing whitespace is legal in a
+-- directory name, so `trim()` on a path git printed silently names a DIFFERENT
+-- directory. Four resolvers across the three scripts got that wrong; all four
+-- now strip exactly the one terminator git adds, through this.
+fn chomp_path($s)
+  if ends_with($s, "\n") then
+    return substr($s, 0, len($s) - 1)
+  end
+  return $s
+end
+
+-- Round twenty-three: the fifth and last helper on this path to be taught that
+-- a read-only query answers what it can and reports what it cannot. Every
+-- refusal below was a bail() regardless of mode, so ONE unreadable repository —
+-- moved, unmounted, its git dir mid-clone — took the whole multi-repo --status
+-- report down with it, and the repositories after it were never mentioned. The
+-- install path still refuses: writing a gate somewhere unverified is the thing
+-- this file exists to prevent.
+fn hooks_dir($repo, $status_only)
+  $r = run_argv(["git", "--no-replace-objects", "-C", $repo,
+    "rev-parse", "--git-path", "hooks"],
+    {timeout: 60, env: {GIT_CONFIG_PARAMETERS: "", LC_ALL: "C"}})
+  if $r["ok"] != true then
+    if $status_only then
+      mark_repo_unverified($repo, "hooks directory lookup")
+      print("  NOT REPORTED: not a git repo (or git failed) — " .. $repo)
+      return nil
+    end
+    bail(2, "not a git repo (or git failed): " .. $repo)
+  end
+  -- Same family as the empty-output and lossy-decode guards below. run_argv
+  -- caps stdout and returns the retained prefix with ok=true; using that prefix
+  -- as a hooks pathname can inspect a sibling directory and report its hooks as
+  -- this repository's.
+  if $r["stdout_truncated"] then
+    if $status_only then
+      mark_repo_unverified($repo, "hooks directory lookup")
+      print("  NOT REPORTED: git's hooks path output was truncated, so the path"
+        .. " cannot be named completely and nothing can be said about what is"
+        .. " installed in it")
+      return nil
+    end
+    bail(2, "git's hooks path output was truncated for " .. $repo
+      .. " — refusing rather than installing into a retained pathname prefix")
+  end
+  -- `core.hooksPath = "…/hooks "` is legal (git preserves the space in a quoted
+  -- config value — verified, git returns the 32-byte path and a newline), and
+  -- trimming installed nine hooks into the 31-byte SIBLING and reported
+  -- success: the repo left unguarded, the operator told it was guarded.
+  $p = chomp_path($r["stdout"])
+  -- ...and a path git can name is not necessarily a path Mix can hold. Bytes
+  -- outside UTF-8 are legal in a pathname; run_argv replaces them with U+FFFD,
+  -- which names a DIFFERENT directory that may well exist. Same false success,
+  -- one layer down, so it is the same refusal the gate makes on every git call.
+  if $r["utf8_lossy"] then
+    if $status_only then
+      mark_repo_unverified($repo, "hooks directory lookup")
+      print("  NOT REPORTED: git's hooks path is not valid UTF-8, so it cannot"
+        .. " be named here without changing it — nothing can be said about what"
+        .. " is installed in it")
+      return nil
+    end
+    bail(2, "git's hooks path for " .. $repo .. " is not valid UTF-8, so it"
+      .. " cannot be named without changing it — refusing rather than"
+      .. " installing into whatever the replacement characters point at")
+  end
+  if $p == "" then
+    if $status_only then
+      mark_repo_unverified($repo, "hooks directory lookup")
+      print("  NOT REPORTED: git returned an empty hooks path")
+      return nil
+    end
+    bail(2, "git returned an empty hooks path for " .. $repo)
+  end
+  if starts_with($p, "/") then
+    return $p
+  end
+  return $repo .. "/" .. $p
+end
+
+-- The two TOCTOU windows in this file — claim() is check-then-create, and the
+-- write that follows re-opens the name claim() proved free — are being tolerated
+-- rather than closed, because Mix has neither RENAME_NOREPLACE nor an
+-- O_NOFOLLOW/fd-based write to close them with. The argument for tolerating them
+-- is that whoever can create a name in .git/hooks can already replace the hook
+-- outright, so winning the race grants nothing new.
+--
+-- That argument holds for exactly one shape of directory: one only its owner can
+-- write. Make it group- or world-writable — `core.sharedRepository=group`, or a
+-- core.hooksPath pointing somewhere shared — and a DIFFERENT uid can replace the
+-- claimed staging name with a symlink between claim() and the write, and the
+-- installer then writes and chmods the link's target as the installer's user.
+-- That reaches files outside the hooks directory, which is strictly more than
+-- "could have edited the hook anyway". Cold review, round seventeen: the
+-- deferral is only sound with the owner-only property ENFORCED, so it is
+-- enforced here rather than assumed. (Root is out of scope: a hostile root needs
+-- no race.) --status only reads, so there it is said and not refused.
+-- The same argument applies one directory up, and round eighteen's cold review
+-- is where that landed: checking the hooks directory's own bits establishes
+-- nothing if an ANCESTOR is writable by another uid, because that uid can swap
+-- the ancestor — or the symlink through which the hooks directory is reached —
+-- for one they control, and the installer then writes a gate stub somewhere it
+-- never checked. `core.hooksPath = /shared/hooks-link` is the concrete shape.
+-- So the property is proved over the whole resolved path, not its last
+-- component: no foreign-owned component, and no writable-by-others component
+-- except a sticky one (sticky is what makes /tmp usable: entries there can only
+-- be removed or renamed by their own owner, so an existing component cannot be
+-- swapped). realpath() first, because the check must describe the directory
+-- that will actually be written to, not the name used to reach it.
+--
+-- ...and then the writes must GO through that resolved path, which is round
+-- twenty's finding and the reason this function returns it. Checking $real
+-- while install() still built its targets from the name git handed us proved
+-- nothing at all: the walk saw a private /home/me/.git/hooks, the writes still
+-- traversed /shared/hooks-link, and the uid who owns /shared could repoint the
+-- link in between. realpath()'s own contract says it plainly — canonicalise-
+-- then-use is not an authorisation primitive, so open the path it RETURNED,
+-- which has no symlinks left to re-traverse. The residual is honest and
+-- bounded: the resolved components are all owned by us or root and none is
+-- writable by anyone else, so nobody left can swap one.
+-- A structured result keeps the security decision separate from its prose:
+-- state is safe/unsafe/unknown, category says which check produced it, and
+-- reason is only for the diagnostic. In particular the caller can defer the
+-- final directory's writability check by category instead of substring-
+-- sniffing "-writable"; wording changes therefore cannot silently fail open.
+--
+-- Mix has no sum type enforcing those three state strings. Every consumer
+-- therefore passes a producer result through this one normaliser BEFORE it
+-- reads category or state. A missing map/state or a future fourth state is a
+-- cannot-answer, represented as the existing unknown state so the caller's
+-- status arm warns and its install arm bails(2). The original value is named
+-- in the reason so a producer typo is actionable rather than merely safe.
+fn component_decision($component)
+  if type($component) != "map" then
+    return {
+      state: "unknown",
+      category: "invalid-state",
+      reason: "the internal path-safety predicate returned a "
+        .. type($component) .. ", not a decision map"
+    }
+  end
+  $state = $component["state"]
+  if $state == "safe" or $state == "unsafe" or $state == "unknown" then
+    return $component
+  end
+  return {
+    state: "unknown",
+    category: "invalid-state",
+    reason: "the internal path-safety predicate returned unrecognised state `"
+      .. ("" .. $state) .. "`"
+  }
+end
+
+fn unsafe_component($p, $st, $is_final, $me)
+  if $st["is_symlink"] then
+    return {state: "unsafe", category: "symlink", reason: "is a symlink"}
+  end
+  -- $me is nil when this Mix cannot report its own uid and --status softened
+  -- that into a warning. Comparing against nil would call every component
+  -- foreign; the honest reading is "ownership was not checked", which the
+  -- warning current_uid() printed already says. The permission bits below are
+  -- still worth reading, so this skips the one question and keeps the rest.
+  if $me != nil and $st["uid"] != $me and $st["uid"] != 0 then
+    return {
+      state: "unsafe",
+      category: "ownership",
+      reason: "is owned by uid " .. $st["uid"] .. ", not by you or root"
+    }
+  end
+  $group_write = band($st["perm"], 0o020) != 0
+  $world_write = band($st["perm"], 0o002) != 0
+  if $group_write == false and $world_write == false then
+    return {state: "safe", category: "", reason: ""}
+  end
+  -- Sticky protects an existing non-final entry from rename by other writers.
+  -- Keep that exemption before the membership probe: a sticky ancestor is safe
+  -- under the existing rule and needs no getfacl/getent subprocesses.
+  if $is_final == false and band($st["perm"], 0o1000) != 0 then
+    return {state: "safe", category: "", reason: ""}
+  end
+  -- Other-write is sufficient by itself and needs no identity corroboration.
+  if $world_write then
+    return {
+      state: "unsafe",
+      category: "writability",
+      reason: "is world-writable"
+    }
+  end
+  -- The expensive question is asked only when 0o020 is present. With no
+  -- extended ACL, the cached uid/gid membership half avoids repeating getent;
+  -- has_extended_acl remains a fresh per-path question.
+  $component_group_foreign = group_write_is_foreign(
+    $p, $st["uid"], $st["gid"])
+  if $component_group_foreign == nil then
+    return {
+      state: "unknown",
+      category: "writability",
+      reason: join(["whether its group-write bit gives another uid write could",
+        " not be determined — getfacl, or getent for the owner, group, or",
+        " passwd map, did not answer"], "")
+    }
+  end
+  if $component_group_foreign == false then
+    return {state: "safe", category: "", reason: ""}
+  end
+  return {
+    state: "unsafe",
+    category: "writability",
+    reason: "is group-writable by another uid"
+  }
+end
+
+-- Canonicalising and then writing through $real protects THIS installer's
+-- writes. It does not protect git's, and git is the one that matters after the
+-- run ends: every hook invocation starts from the unresolved core.hooksPath and
+-- re-traverses it from scratch. Round twenty-one's cold review — the resolved
+-- walk can be spotless while `core.hooksPath = /shared/hooks-link` still passes
+-- through a world-writable /shared, and the uid who owns it repoints the link
+-- the moment the install finishes. So the ALIAS chain is walked too.
+--
+-- Different rules, because it is a different question. A symlink component is
+-- allowed here — being reached through a link is the shape, not the fault — and
+-- its own permission bits are meaningless on Linux (lrwxrwxrwx always), so what
+-- is asked of it is only who owns it. Directory components are asked the full
+-- question: a component another uid can write is a component they can swap, and
+-- the swap redirects every future hook lookup. Sticky is tolerated throughout,
+-- for the same reason it is in the resolved walk — an existing entry in a
+-- sticky directory can only be removed or renamed by its own owner.
+fn unsafe_alias_component($p, $st, $me)
+  if $st["is_symlink"] then
+    if $me != nil and $st["uid"] != $me and $st["uid"] != 0 then
+      return {
+        state: "unsafe",
+        category: "ownership",
+        reason: join(["is a symlink owned by uid ", $st["uid"],
+          ", not by you or root"], "")
+      }
+    end
+    return {state: "safe", category: "", reason: ""}
+  end
+  return unsafe_component($p, $st, false, $me)
+end
+
+fn path_chain($real)
+  $out = ["/"]
+  $acc = ""
+  for each $p in split($real, "/")
+    if $p != "" then
+      $acc = $acc .. "/" .. $p
+      push($out, $acc)
+    end
+  end
+  return $out
+end
+
+-- nil means "this run could not check this repository's hooks directory" and
+-- is only ever returned under --status; the install path still refuses. Round
+-- twenty-four: two of this function's failures were left unconditional after
+-- round twenty-three degraded the ones in hooks_dir, so the read-only report
+-- could still be killed outright by one repository — an ASCII core.hooksPath
+-- symlink to a directory whose resolved name is not UTF-8 makes realpath()
+-- return nil while is_dir() passes, and every repository AFTER that one goes
+-- unreported at exit 2. A query that stops answering is the failure mode this
+-- arc has now removed five times; the sixth is here.
+fn require_private_hooks_dir($repo, $dir, $status_only)
+  $real = realpath($dir)
+  if $real == nil then
+    if $status_only then
+      warn_repo($repo, "cannot resolve the hooks directory " .. $dir
+        .. " — it exists but its real path could not be named (a non-UTF-8"
+        .. " component, a symlink loop, a component removed mid-walk), so"
+        .. " nothing below it can be checked or reported",
+        "hooks directory resolution")
+      return nil
+    end
+    bail(2, "cannot resolve the hooks directory " .. $dir .. " — refusing"
+      .. " rather than installing into a path this run cannot even name;"
+      .. " nothing was changed")
+  end
+  $me = $ME
+  $resolved = path_chain($real)
+  for each $p in $resolved
+    $pst = nil
+    try
+      $pst = stat($p, {follow_symlinks: false})
+    catch $pe
+      if $status_only then
+        warn_repo($repo, "cannot stat " .. $p .. " (" .. $pe .. "), a component"
+          .. " of the hooks directory path " .. $real .. " — whether another"
+          .. " uid can replace it is unknown, so is whether the gate reported"
+          .. " below is the one that will run", "hooks path ownership")
+        continue
+      end
+      bail(2, "cannot stat " .. $p .. " (" .. $pe .. "), a component of the"
+        .. " hooks directory path " .. $real .. " — refusing rather than"
+        .. " installing below a directory whose permissions could not be read;"
+        .. " nothing was changed")
+    end
+    $component = component_decision(
+      unsafe_component($p, $pst, $p == $real, $me))
+    -- The hooks directory's OWN writability is refused below, in the wording
+    -- that names the fix for it; from the final component this loop takes only
+    -- foreign ownership and the symlink case. category is an explicit decision
+    -- field; never infer this security branch from prose in reason.
+    if $p == $real and $component["category"] == "writability" then
+      continue
+    end
+    $where = "an ancestor of the hooks directory " .. $real
+    if $p == $real then
+      $where = "the hooks directory itself"
+    end
+    if $component["state"] == "unknown" then
+      if $status_only then
+        warn_repo($repo, $p .. " " .. $component["reason"] .. " and it is "
+          .. $where .. " — whether another uid can replace it, and with it the"
+          .. " gate this status is reporting on, is unknown",
+          "hooks path group writability")
+      else
+        bail(2, $p .. " " .. $component["reason"] .. ", and it is " .. $where
+          .. " — refusing rather than installing below a component whose"
+          .. " foreign writability could not be established; nothing was"
+          .. " changed")
+      end
+    end
+    if $component["state"] == "unsafe" then
+      $why = $component["reason"]
+      if $status_only then
+        warn_repo($repo, $p .. " " .. $why .. " and it is " .. $where
+          .. " — another uid can replace it, and with it the gate this status"
+          .. " is reporting on", "hooks path ownership")
+      else
+        bail(2, $p .. " " .. $why .. ", and it is " .. $where
+          .. " — another uid can substitute a directory or symlink of their own"
+          .. " there and have this installer write a gate stub through it,"
+          .. " outside the directory that was checked. Mix has no O_NOFOLLOW"
+          .. " write to close that window, so the gate is not installed;"
+          .. " nothing was changed")
+      end
+    end
+  end
+  -- The walk above proves the directory this installer writes into is one
+  -- nobody else can swap. git does not use that path: it re-reads
+  -- core.hooksPath and re-traverses the ALIAS on every hook it runs, so the
+  -- unresolved chain is a second, independent way in — see
+  -- unsafe_alias_component. Components shared with the resolved chain are
+  -- skipped; they have just been checked, under stricter rules.
+  if $real != $dir then
+    for each $q in path_chain($dir)
+      if contains($resolved, $q) then
+        continue
+      end
+      $qst = nil
+      try
+        $qst = stat($q, {follow_symlinks: false})
+      catch $qe
+        if $status_only then
+          warn_repo($repo, "cannot stat " .. $q .. " (" .. $qe .. "), a"
+            .. " component of the path git will re-traverse to find these"
+            .. " hooks — whether another uid can repoint it is unknown",
+            "git hooks lookup path")
+          continue
+        end
+        bail(2, "cannot stat " .. $q .. " (" .. $qe .. "), a component of "
+          .. $dir .. " — that is the path git re-traverses on every hook it"
+          .. " runs, so a component whose permissions could not be read is one"
+          .. " this run cannot promise still leads here; nothing was changed")
+      end
+      $qcomponent = component_decision(
+        unsafe_alias_component($q, $qst, $me))
+      if $qcomponent["state"] == "unknown" then
+        if $status_only then
+          warn_repo($repo, $q .. " " .. $qcomponent["reason"] .. ", and it is a"
+            .. " component of " .. $dir .. ", the path git re-traverses on"
+            .. " every hook — whether another uid can repoint it away from "
+            .. $real .. " is unknown", "git hooks lookup group writability")
+        else
+          bail(2, $q .. " " .. $qcomponent["reason"] .. ", and it is a component"
+            .. " of " .. $dir .. " — refusing because this run cannot establish"
+            .. " that git's later path lookup remains under owner-only control;"
+            .. " nothing was changed")
+        end
+      end
+      if $qcomponent["state"] == "unsafe" then
+        $qwhy = $qcomponent["reason"]
+        if $status_only then
+          warn_repo($repo, $q .. " " .. $qwhy .. ", and it is a component"
+            .. " of " .. $dir .. ", the path git re-traverses on every hook —"
+            .. " another uid can repoint it away from " .. $real
+            .. " and the gate reported below stops running",
+            "git hooks lookup path")
+        else
+          bail(2, $q .. " " .. $qwhy .. ", and it is a component of " .. $dir
+            .. " — that is the path git re-reads and re-traverses on every hook"
+            .. " it runs, so another uid can repoint it at a directory of their"
+            .. " own after this install finishes and the gate silently stops"
+            .. " running. Canonicalising protects this installer's writes, not"
+            .. " git's later lookup; the gate is not installed, nothing was"
+            .. " changed")
+        end
+      end
+    end
+  end
+  $st = nil
+  try
+    $st = stat($real)
+  catch $se
+    -- Milder than the realpath failure above: the path is known and its
+    -- ancestry has just been walked, only its own mode could not be read (the
+    -- directory removed between the walk and here is the ordinary cause). So
+    -- status qualifies the writability claim and carries on reporting the
+    -- hooks; install still refuses, because it is about to write there.
+    if $status_only then
+      warn_repo($repo, "cannot stat the hooks directory " .. $real .. " ("
+        .. $se .. ") — whether another user can replace the gate stub in it is"
+        .. " unknown, so the hook lines below are not a guarantee of what runs",
+        "hooks directory permissions")
+      return $real
+    end
+    bail(2, "cannot stat the hooks directory " .. $real .. " (" .. $se .. ")"
+      .. " — refusing rather than installing into a directory whose"
+      .. " permissions could not be read")
+  end
+  $who = ""
+  -- Other-write is unconditional and needs no membership query.
+  $hooks_world_write = band($st["perm"], 0o002) != 0
+  if $hooks_world_write then
+    $who = "world"
+  else
+    -- Do not pay for getfacl/getent on the overwhelmingly common 0o020-clear
+    -- path. If it is set, ask the same ACL-aware identity question used by
+    -- foreign_writable and the component walks above.
+    if band($st["perm"], 0o020) != 0 then
+      $gw = group_write_is_foreign($real, $st["uid"], $st["gid"])
+      if $gw == nil then
+        $unknown = join(["whether the hooks directory's group-write bit gives",
+          " another uid write could not be determined — getfacl, or getent for",
+          " the owner, group, or passwd map, did not answer"], "")
+        if $status_only then
+          warn_repo($repo, $real .. ": " .. $unknown .. " — whether another"
+            .. " user can replace the gate stub is unknown, so the hook lines"
+            .. " below are not a guarantee of what runs",
+            "hooks directory group writability")
+          return $real
+        end
+        bail(2, $unknown .. ": " .. $real .. " — refusing rather than"
+          .. " installing into a directory whose foreign writability could not"
+          .. " be established; nothing was changed")
+      end
+      if $gw == true then
+        $who = "group"
+      end
+    end
+  end
+  if $who == "" then
+    return $real
+  end
+  if $status_only then
+    warn_repo($repo, $real .. " is " .. $who .. "-writable — another user"
+      .. " can replace the gate stub, so what this status reports is not what"
+      .. " is guaranteed to run", "hooks directory permissions")
+    return $real
+  end
+  bail(2, "the hooks directory is " .. $who .. "-writable: " .. $real
+    .. " — another uid can substitute a symlink for a staging name mid-install"
+    .. " and have this installer write through it as you, outside that"
+    .. " directory. Mix has no O_NOFOLLOW write to close that window, so the"
+    .. " gate is not installed. Make the directory writable only by its owner"
+    .. " (chmod go-w) and re-run; nothing was changed")
+  return false
+end
+
+fn hook_state($repo, $dir, $name)
+  $path = $dir .. "/" .. $name
+  -- lstat form, not the plain one: a hook that is a DANGLING symlink is an
+  -- entry that has to be chained (and will refuse, because it cannot be
+  -- copied), not an empty slot to write over. The following form called it
+  -- absent and the stub's rename then removed the link without a word.
+  $present = entry_exists($path)
+  $existing = ""
+  -- A git hook is an EXECUTABLE, not a text file: a compiled binary or a script
+  -- with a Latin-1 comment is perfectly legal there. `read_file` raises on
+  -- invalid UTF-8 and an uncaught Mix error exits 1 — the code this arc
+  -- reserves for "a policy violation was found" — so the installer answered a
+  -- foreign binary hook by claiming a leak. Reading is only ever needed to
+  -- decide whether the file is OURS; a file we cannot read as text certainly is
+  -- not, and chaining it is a byte copy, not a re-write. Round twelve.
+  $readable = true
+  if $present then
+    try
+      $existing = read_file($path)
+    catch $e
+      $readable = false
+    end
+  end
+  $claim = {kind: "foreign", root: ""}
+  if $readable then
+    $claim = is_our_stub($existing, $repo, $name)
+  end
+  return {
+    repo: $repo, dir: $dir, name: $name, path: $path,
+    present: $present, existing: $existing, readable: $readable,
+    claim: $claim
+  }
+end
+
+fn refuse_unknown_claim($state, $state_note)
+  bail(2, $state["path"] .. " carries a valid " .. $MARKER
+    .. " provenance claim for " .. $state["claim"]["root"] .. " but its body"
+    .. " matches no stub template known to this installer. It may be forged or"
+    .. " from an unknown version; replacing it would lose data and preserving"
+    .. " it below the new stub could self-chain. Inspect and remove that file"
+    .. " by hand, then re-run; " .. $state_note)
+end
+
+-- Round twenty-seven completes round twenty-six's fleet preflight. Resolving
+-- hooks_dir, ownership and noexec first did not cover the deterministic
+-- refusals still buried inside install(): repo B with a foreign pre-commit and
+-- an occupied pre-commit.pre-hygiene refused only after repo A had all three
+-- hooks written. The two fixed staging names had the same shape, and the new
+-- valid-claim/unknown-body state above is another refusal that must be found
+-- before repo A is touched.
+--
+-- Check the whole set read-only: the foreign SOURCE that must be preserved, its
+-- destination, both O_EXCL staging names, and the classifier's unsafe third
+-- state. `read_file` in hook_state is not this check: invalid UTF-8 makes a
+-- perfectly copyable binary hook unreadable as TEXT. A binary read attempt
+-- distinguishes that from a mode-000 file or dangling symlink without writing
+-- anything. It proves only that the source can be read NOW; install() repeats
+-- the checks as a race defence, because another process can change a hooks
+-- directory after this pass. A disk filling or permissions changing during the
+-- later copy/write cannot be preflighted into a transaction; the per-file
+-- claim+rename machinery keeps that failure atomic and honest. What this closes
+-- is every refusal already present and observable at the start of the run,
+-- without turning --status into a fleet-wide refusal.
+fn preflight_install($repo, $dir, $name)
+  $state = hook_state($repo, $dir, $name)
+  if $state["claim"]["kind"] == "unknown" then
+    refuse_unknown_claim($state, "fleet preflight found it before any"
+      .. " repository was changed")
+  end
+  if $state["present"] and $state["claim"]["kind"] == "foreign" then
+    $saved = $state["path"] .. ".pre-hygiene"
+    if entry_exists($saved) then
+      bail(2, $saved .. " already exists — resolve by hand before reinstalling;"
+        .. " fleet preflight found it before any repository was changed")
+    end
+    $ctmp = $saved .. ".tmp"
+    if entry_exists($ctmp) then
+      bail(2, $ctmp .. " already exists — it occupies the staging name for a"
+        .. " preserved hook and may be a symlink; inspect and remove it by hand."
+        .. " Fleet preflight found it before any repository was changed")
+    end
+    -- Preserve the older, more specific collision diagnosis when both the
+    -- source and its staging slot are already bad. Only after the destinations
+    -- are proved free do we ask whether the source can currently be copied.
+    try
+      $source_bytes = read_file_bytes($state["path"])
+    catch $se
+      bail(2, "cannot preserve the existing foreign " .. $name .. " in " .. $repo
+        .. " because its bytes cannot be read (" .. $se .. "). It may be an"
+        .. " unreadable file or a dangling symlink; fleet preflight found this"
+        .. " before any repository was changed")
+    end
+  end
+  $wtmp = $state["path"] .. ".hygiene-tmp"
+  if entry_exists($wtmp) then
+    bail(2, $wtmp .. " already exists — it occupies the gate-stub staging name"
+      .. " and may be a symlink; inspect and remove it by hand. Fleet preflight"
+      .. " found it before any repository was changed")
+  end
+  return nil
+end
+
+fn install($repo, $dir, $name, $status_only, $prior_writes)
+  $state = hook_state($repo, $dir, $name)
+  $path = $state["path"]
+  $present = $state["present"]
+  $existing = $state["existing"]
+  $readable = $state["readable"]
+  $kind = $state["claim"]["kind"]
+  -- Provenance plus a known body is ownership. A historical known stub is ours
+  -- but not current; "installed" would be a lie until it is refreshed.
+  -- Executability is checked too, on BOTH paths — the --status report below,
+  -- and (since round twenty-nine) immediately after the write at the end of
+  -- this function. git skips a hook it cannot execute, which is the quietest
+  -- possible way for the gate to die: a modern git prints a one-line
+  -- `advice.ignoredHook` hint on EACCES and nothing at all if that advice is
+  -- switched off, and either way the commit succeeds and looks guarded. This
+  -- is the only place the nuance is spelled out; elsewhere the shorthand
+  -- "skips it without warning" stands for "skips it, and you will not notice".
+  $ours = $kind == "ours"
+  $current = $readable and $existing == stub($name)
+
+  if $status_only then
+    $known_warnings = status_unverified($repo)
+    if $present == false then
+      if len($known_warnings) > 0 then
+        print("  " .. $name .. ": ABSENCE UNVERIFIED — this run could not verify "
+          .. join($known_warnings, ", ") .. "; see the WARNING line(s) above")
+      else
+        print("  " .. $name .. ": ABSENT")
+      end
+    else
+      if $kind == "unknown" then
+        print("  " .. $name .. ": UNKNOWN stub claim — install would refuse;"
+          .. " inspect and remove " .. $path .. " by hand")
+      else
+        if $ours == false then
+        print("  " .. $name .. ": FOREIGN hook present (would be chained)")
+        else
+          if $current == false then
+            print("  " .. $name .. ": STALE stub — re-run without --status")
+          else
+            $x = is_executable($path, $repo)
+            $runs = $x["run"]
+            if $runs == false then
+              -- "re-run without --status" is the fix for a mode-bit problem and
+              -- is a wrong instruction for anything else, so a stated reason
+              -- replaces it rather than joining it (round twenty-four: a noexec
+              -- mount is not repaired by chmod, and telling an operator it is
+              -- sends them round the loop believing the gate is now live).
+              if $x["why"] == "" then
+                print("  " .. $name .. ": NOT EXECUTABLE — git skips it, at most"
+                  .. " a one-line hint; re-run without --status")
+              else
+                print("  " .. $name .. ": NOT EXECUTABLE — git skips it, at most"
+                  .. " a one-line hint: " .. $x["why"])
+              end
+            else
+              if $runs == nil then
+                mark_repo_unverified($repo, "hook executability")
+                -- NOT the bare word "installed". Round thirty-three: the state
+                -- token is what an operator skims, and printing the same token
+                -- here as on the verified line meant the caveat had to be read
+                -- to learn that nothing had been verified. Nor "as you" — under
+                -- root the identity in question is the repository's owner, and
+                -- the reason string below is frequently busy explaining that it
+                -- is not you, directly under a sentence claiming it is.
+                print("  " .. $name .. ": PRESENT, executability UNVERIFIED —"
+                  .. " the file is written and current, but this run could not"
+                  .. " tell whether git can execute it as the identity that will"
+                  .. " run it: " .. $x["why"] .. ". git skips a hook it cannot"
+                  .. " execute in silence, so verify by hand before trusting"
+                  .. " this line")
+              else
+                if len($known_warnings) > 0 then
+                  -- A state token must carry the truth on its own. Appending a
+                  -- caveat to `installed` repeats the round-thirty-three defect:
+                  -- operators and agents skim the token and miss the prose.
+                  print("  " .. $name .. ": PRESENT, installation UNVERIFIED —"
+                    .. " the file is written, current and executable, but this"
+                    .. " run could not verify " .. join($known_warnings, ", ")
+                    .. "; see the WARNING line(s) above")
+                else
+                  print("  " .. $name .. ": installed")
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+    return 0
+  end
+
+  -- Defence after the fleet preflight: if the file changed between passes, an
+  -- unknown claim still refuses rather than being overwritten or chained.
+  if $kind == "unknown" then
+    refuse_unknown_claim($state, "this hook was not changed, but its claim"
+      .. " appeared after fleet preflight and earlier repositories in this run"
+      .. " may already have been installed")
+  end
+
+  -- Every filesystem call below can fail for ordinary reasons — a mode-000
+  -- hook, a read-only hooks directory, a full disk — and each one raises. An
+  -- uncaught Mix error exits 1, the code this arc reserves for "a policy
+  -- violation was found", so the installer answered a permission problem by
+  -- reporting a leak. Round thirteen: classifying an unreadable hook as foreign
+  -- was only half the fix; copying it was still unguarded.
+  --
+  -- The chain and the stub are two separate guarded steps, and each one builds
+  -- its result in a temp file beside the target and then rename()s it into
+  -- place. Guarding alone was not enough (round fourteen): neither `copy` nor
+  -- `write_file` is atomic, so a failure PART WAY THROUGH left a truncated file
+  -- under a message that described the untouched state. The stub half was the
+  -- dangerous one — a partial `write_file($path, …)` destroys the live hook
+  -- while the message says the original is still live and names `.pre-hygiene`
+  -- as the leftover to delete, i.e. tells the operator to remove the only
+  -- intact copy. rename(2) makes each step all-or-nothing, so the messages
+  -- below are now true statements rather than hopeful ones. (Mix had no atomic
+  -- replace at all until `rename` was added for this: 0.37.0.)
+  --
+  -- And atomic-into-place is only half of it: the staging name itself has to be
+  -- claimed with O_EXCL first (round fifteen — see claim() above), or the write
+  -- can be aimed somewhere else entirely by whatever already sits there.
+  --
+  -- ORDER, round thirty-nine, and the fourth time this arc has moved a refusal
+  -- earlier. Round thirty-eight added the staging-file executability probe so
+  -- that a repository which cannot pass it is refused before its live hook is
+  -- replaced — but left the probe AFTER the chain step, which had already
+  -- renamed the foreign hook to `.pre-hygiene`. The refusal then exits 2 with
+  -- `.pre-hygiene` on disk, and every retry hits the `already exists — resolve
+  -- by hand` guard above it and refuses earlier still. Deterministic causes (a
+  -- default ACL on the hooks directory denying execute to the repository's
+  -- owner is the realistic one) reproduce identically, so the operator cannot
+  -- complete an install, cannot retry cleanly, and the gate stays off in a
+  -- repository that now looks half-converted. Fixing the symptom the round
+  -- before and leaving the state-mutating step in front of it is exactly the
+  -- partial fix this arc's convergence rule exists to refuse.
+  --
+  -- So: stage and PROVE the stub first, chain second, rename last. Nothing
+  -- irreversible happens until the only question that can refuse has been
+  -- answered, and each earlier step's staging name is swept on the later
+  -- steps' failure paths.
+  $wtmp = $path .. ".hygiene-tmp"
+  $done = "nothing in this run was changed"
+  if $prior_writes > 0 then
+    $done = ("this hook was not changed, but earlier hooks or repositories in"
+      .. " this run may already have been installed")
+  end
+  claim($wtmp, "the gate stub", $repo, $name, $done, [])
+  try
+    write_file($wtmp, stub($name))
+    chmod($wtmp, 0o755)
+    -- Round thirty-eight, and the third time this arc has found a refusal that
+    -- arrives after something is on disk (round thirty-three: the preflight;
+    -- round thirty-seven: identity_divergence). The executability check at the
+    -- end of this function ran on $path — AFTER the rename — so a repository
+    -- that cannot pass it got its live hook replaced by a dead one and then a
+    -- bail(2).
+    --
+    -- The staging file answers the same question: same directory, so the same
+    -- inherited default ACL and the same searchability; same filesystem, so the
+    -- same noexec mount and the same treatment of mode bits; same chmod. The
+    -- realistic ACL case needs the installer NOT to own the file it writes —
+    -- root installing into another account's repository, which this installer
+    -- supports — because a named-user ACL entry never applies to a file's own
+    -- owner, and is_executable asks on behalf of the repository owner (round
+    -- thirty-two) rather than whoever is running.
+    --
+    -- The post-rename check stays. It costs one access(2) and it is the one
+    -- that speaks about the file git will actually execute; this one only makes
+    -- sure that by the time it can fail, failing is free.
+    $xt = is_executable($wtmp, $repo)
+    if $xt["run"] != true then
+      $wt = $xt["why"]
+      if $wt == "" then
+        $wt = "the kernel will not execute it as whoever git will run it as"
+      end
+      remove($wtmp)
+      bail(2, "the gate stub for " .. $name .. " in " .. $repo .. " was written"
+        .. " to a staging file and chmod'ed 0755, and the kernel still will not"
+        .. " run it for the identity git will use: " .. $wt
+        .. ". The staging file has been removed and " .. $path .. " is"
+        .. " untouched, so whatever was live there still is — nothing has been"
+        .. " chained or renamed. Installing anyway would have replaced a live"
+        .. " hook with one git SKIPS. Fix the reason above and re-run"
+        .. sweep($wtmp))
+    end
+  catch $we
+    bail(2, "cannot write the gate stub for " .. $name .. " in " .. $repo
+      .. " (" .. $we .. ") — the gate is NOT installed; " .. $path
+      .. " is untouched and whatever was live there still is, and nothing has"
+      .. " been chained" .. sweep($wtmp))
+  end
+
+  if $present and $ours == false then
+    $saved = $path .. ".pre-hygiene"
+    -- lstat form: this guard exists because an existing .pre-hygiene means an
+    -- earlier run already saved someone's hook there, and overwriting it
+    -- destroys the only copy. A dangling .pre-hygiene symlink is precisely
+    -- the case that most wants a human — and it is the one the following form
+    -- waved through, straight into a rename that removed the link.
+    if entry_exists($saved) then
+      bail(2, $saved .. " already exists — resolve by hand before reinstalling"
+        .. sweep($wtmp))
+    end
+    -- copy(), not read_file+write_file: preserving a foreign hook means
+    -- preserving its BYTES. A round-trip through a Mix string cannot carry a
+    -- compiled binary, and it is the same hook either way. The temp lives in
+    -- the same directory as the target so the rename can never be EXDEV.
+    $ctmp = $saved .. ".tmp"
+    -- The stub is already staged by the time this claim is made, so a refusal
+    -- here has a leftover to name — and one to remove, which is what the
+    -- $cleanup argument is for.
+    $before_claim = join(["this hook was not changed and the existing ", $name,
+      " is untouched and still live; the gate stub for it had been written to",
+      " a staging file, which this run has removed"], "")
+    if $prior_writes > 0 then
+      $before_claim = ($before_claim .. ", but earlier hooks or"
+        .. " repositories in this run may already have been installed")
+    end
+    claim($ctmp, "a copy of the existing hook", $repo, $name,
+      $before_claim, [$wtmp])
+    try
+      copy($path, $ctmp)
+      chmod($ctmp, 0o755)
+      rename($ctmp, $saved)
+    catch $ce
+      bail(2, "cannot preserve the existing " .. $name .. " as " .. $saved
+        .. " (" .. $ce .. ") — refusing to overwrite a hook this run cannot"
+        .. " put back; the original " .. $name .. " is untouched and still"
+        .. " live, and no " .. $name .. ".pre-hygiene was created"
+        .. sweep($ctmp) .. sweep($wtmp))
+    end
+    print("  chained existing " .. $name .. " -> " .. $name .. ".pre-hygiene")
+  end
+
+  -- The last irreversible step, and by now the only one that can still fail is
+  -- the rename itself. Its message has to account for a `.pre-hygiene` the
+  -- chain step may just have created: it is a byte-identical copy of a hook
+  -- that is STILL LIVE, so it is a leftover to remove and not a backup to
+  -- restore.
+  try
+    rename($wtmp, $path)
+  catch $we
+    bail(2, "cannot install " .. $path .. " (" .. $we .. ") — the gate is NOT"
+      .. " installed for " .. $name .. " in " .. $repo .. "; " .. $path
+      .. " is untouched and whatever was live there still is, so if a "
+      .. $name .. ".pre-hygiene was just created it is a byte-identical copy"
+      .. " of that still-live hook and is the leftover to remove before"
+      .. " re-running" .. sweep($wtmp))
+  end
+  -- The write succeeded, which is not the same as the gate being live, and this
+  -- line used to print "installed" on the strength of the write alone. The
+  -- comment at the top of this function has claimed since round twenty-two that
+  -- "executability is checked too" — it was, in the --status report, and never
+  -- on the path that actually writes the hook. So the operator most entitled to
+  -- the check, the one who just installed, was the one who never got it.
+  --
+  -- chmod(0o755) returning cleanly does not settle it: a named-user ACL denying
+  -- execute survives the chmod, and a filesystem that quietly ignores mode bits
+  -- (some FUSE, 9p and CIFS mounts) reports success and stores nothing. Both
+  -- end with git skipping the hook in silence over a repository whose operator
+  -- was told the gate is on.
+  --
+  -- The noexec mount, the third cause, is already refused before any repository
+  -- is touched, so reaching here with it is not expected — is_executable still
+  -- names it, because "not expected" is how the previous four wrong answers
+  -- described themselves.
+  $x = is_executable($path, $repo)
+  if $x["run"] != true then
+    $why = $x["why"]
+    if $why == "" then
+      $why = "the kernel will not execute it as whoever git will run it as"
+    end
+    bail(2, $path .. " was written and chmod'ed 0755, and the kernel still will"
+      .. " not run it for the identity git will use: " .. $why
+      .. ". The file IS there, so this is not"
+      .. " a leftover to delete — it is a hook git will SKIP (at most a"
+      .. " one-line advice.ignoredHook hint, none at all if that advice is"
+      .. " off), which means every commit in " .. $repo .. " goes through"
+      .. " unguarded"
+      .. " while looking guarded. Fix the reason above and re-run; earlier"
+      .. " hooks or repositories in this run may already be installed")
+  end
+  print("  installed " .. $name)
+  return 1
+end
+
+-- `contains($argv, "--status")` read the ONE argument it knew and ignored every
+-- other, so `install-hygiene-hooks.mix --stats` — the typo, one key away — was
+-- an install: the operator asked to look and the hooks were written. Round
+-- twenty-one's cold review. An unknown argument is a request this run cannot
+-- honour, so it is refused with the code for "could not be trusted", before
+-- anything is probed or written. Anything that changes the tree must be spelt
+-- exactly; nothing here is guessed.
+$argv = args()
+$status_only = false
+for each $a in $argv
+  if $a == "--status" then
+    $status_only = true
+  else
+    bail(2, "unknown argument " .. sanitize($a) .. " — this installer takes"
+      .. " --status (report what is there, change nothing) or no arguments at"
+      .. " all (install). A near miss like --stats used to be ignored, which"
+      .. " installed hooks in a run that had asked only to look; nothing was"
+      .. " changed")
+  end
+end
+
+-- The in-process lstat probe is run ONCE, here, and its answer kept: assignment
+-- inside a Mix function does not write through to a global (`mix man
+-- variables`), so a "warn once" flag cannot live in the helper, and running it
+-- per call would repeat the warning for every hook of every repo. entry_exists()
+-- reads this.
+$LSTAT_OK = require_lstat_option($status_only)
+-- Same once-only reason, and the same read-by-is_executable() relationship the
+-- uid probe below has. Under --status a false here degrades one line per hook
+-- to "could not tell"; on the installing path require_access_builtin has
+-- already bailed and this assignment is never reached with a false in it.
+$ACCESS_OK = require_access_builtin($status_only)
+-- Asked once, here, rather than per repo: assignment inside a Mix function does
+-- not write through to a global, so every caller that needed this was calling
+-- current_uid() again — and under --status that meant the same warning printed
+-- once per repository. Ancestor-ownership checking is what it is for; the
+-- permission-class arithmetic that used to be its second consumer is gone.
+$ME = current_uid($status_only)
+
+require_clean_git_env()
+
+-- is_file(), not exists(): the stub the installer writes hands these paths
+-- straight to Mix, and Mix exits 1 on a path it cannot run — so a $GATE that is
+-- a DIRECTORY passes an exists() preflight, installs "successfully", and then
+-- fails every commit thereafter with the code reserved for "a violation was
+-- found". Verified: `mix /tmp` exits 1. is_file() follows symlinks on purpose
+-- here; a symlink to a real script is a perfectly good gate, and this is the
+-- "can I run something here" question, not the "is this name free" one.
+--
+-- Readability is checked by reading, for the same reason the rest of this file
+-- probes rather than predicts: the mode bits are not the answer on a filesystem
+-- with ACLs, and a $GATE that cannot be read is one Mix cannot run.
+--
+-- Round twenty-one: this ran before the first hook state was reported and
+-- bailed under --status as well, so a broken $GATE turned the read-only query
+-- into an exit 2 that said nothing about the hooks — the third helper doing
+-- what round twenty removed from probe_dir. A --status run installs nothing, so
+-- a gate that cannot run is not a reason to refuse: it is the single most
+-- important thing that run has to say, because the hooks it is about to report
+-- as "installed" are the ones that would fail.
+fn not_runnable($what, $path, $why, $tail, $status_only)
+  if $status_only then
+    warn_run($what .. " " .. $why .. ": " .. $path .. " — any"
+      .. " hook reported as installed below runs THIS, so it would fail at exit"
+      .. " 1, the code that means a mesh-private literal was found. Nothing is"
+      .. " guarded until that is fixed", $what .. " runnable")
+    return false
+  end
+  bail(2, $what .. " " .. $why .. ": " .. $path .. " — " .. $tail)
+end
+
+fn require_runnable($path, $what, $status_only)
+  if is_file($path) == false then
+    return not_runnable($what, $path, "is not a regular file",
+      "the installed stub would hand this to Mix, which exits 1 on a path it"
+      .. " cannot run, and every commit would then report a violation that is"
+      .. " not there", $status_only)
+  end
+  try
+    read_file($path)
+  catch $rfe
+    return not_runnable($what, $path, "cannot be read (" .. $rfe .. ")",
+      "the installed stub would hand this to Mix and every commit would fail",
+      $status_only)
+  end
+  -- A readable regular file is not a runnable one. Round seventeen's cold
+  -- review: the directory case was closed and the file-that-is-not-Mix case was
+  -- not — a stray text file at $GATE passes both tests above, the install
+  -- reports success, and every commit thereafter dies on a PARSE ERROR at exit
+  -- 1, the code reserved for "a mesh-private literal was found". The question is
+  -- put to $MIX, not to whatever interpreter is running this installer, because
+  -- $MIX is what the stub's shebang names.
+  -- `--check` is a PARSE check, and round eighteen's cold review is where that
+  -- stopped being enough: a file that parses but calls a function defined
+  -- nowhere passes it, the install reports success, and every commit thereafter
+  -- dies on an uncaught runtime error at exit 1 — the same false violation the
+  -- parse check was added to prevent, one indirection later. `mix lint` resolves
+  -- names and arities, so it catches that class; it is run WITHOUT
+  -- --deny-warnings, because an error is a gate that cannot work and a warning
+  -- is a matter of taste in someone else's copy of the script.
+  --
+  -- What this still does not prove is that the gate RUNS — no static check can;
+  -- a path that only exists at runtime can still fail. That residual is
+  -- accepted and named here rather than papered over: lint moves the failure
+  -- from "every commit, silently mislabelled" to "this install, out loud".
+  $chk = run_argv([$MIX, "lint", $path], {timeout: 300})
+  if $chk["exit_code"] == nil then
+    return not_runnable($what, $path, "could not be checked, because " .. $MIX
+      .. " would not run", "that is the interpreter the installed stub names on"
+      .. " its shebang line, so a gate installed now would not run at all",
+      $status_only)
+  end
+  if $chk["exit_code"] != 0 then
+    return not_runnable($what, $path, "is not valid Mix ("
+      .. sanitize(trim($chk["stdout"] .. " " .. $chk["stderr"])) .. ")",
+      "the stub would hand it to " .. $MIX .. ", which exits 1 on a parse error"
+      .. " or an undefined name, and every commit would then report a violation"
+      .. " that is not there", $status_only)
+  end
+  return true
+end
+
+-- The in-process probe above (require_lstat_option) asks the interpreter running
+-- THIS installer. The interpreter that will run the gate is $MIX, named on the
+-- stub's shebang, and on a host where the two differ — an operator running an
+-- older mix out of a build tree, or a newer one — the wrong binary was the one
+-- being vouched for. Both have to be capable: this installer uses the option
+-- itself, and so does every hook invocation afterwards.
+--
+-- This asks $MIX to MEASURE the property and report what it saw, rather than
+-- inferring capability from an error. Round eighteen's cold review killed the
+-- inference twice over: any non-zero exit was being read as "it rejected the
+-- bad argument", so a spawn failure, a timeout or an unrelated crash all
+-- counted as proof, and an interpreter that type-checks the map while ignoring
+-- the field passed both steps outright. A dangling symlink answers the real
+-- question — lstat must see it, the follow form must not — and the ANSWER is
+-- required on stdout, so an interpreter that merely exits 0 (a stub, a wrapper
+-- that swallows its arguments) proves nothing and is refused.
+-- `finally`, not a pair of removes on the happy path: round twenty's review
+-- caught the child leaving its probe directory behind whenever symlink() raised
+-- — a filesystem without symlink support, a full disk — so the refusal that
+-- followed also littered TMPDIR once per attempt. The cleanup runs on the way
+-- out of every path, including the raise.
+-- The child gets the TMPDIR guard too, not just the parent that spawns it.
+-- Round twenty-two's cold review: round twenty-one put the requirement in
+-- probe_dir() and left this copy of the same mkdir() one indirection away, so
+-- under --status the in-process probe warned and returned, and then THIS one
+-- created the missing TMPDIR — parents and all — and took back only its own
+-- leaf. The parent checks before spawning, so this branch is the narrow window
+-- where TMPDIR stops being a directory in between; it answers rather than
+-- builds, and the parent below knows that answer by name.
+-- Round twenty-three: the guard above is still check-then-create, and the
+-- window between the two is exactly the state it exists to refuse. mkdir() was
+-- create_dir_all unconditionally, so a TMPDIR that vanished in that window was
+-- rebuilt, parents and all, by the probe that had just decided not to build it.
+-- The missing primitive was a Mix bug, so it was fixed in the binary rather
+-- than raced around here: mkdir($d, {parents: false}) is plain create_dir, and
+-- it fails rather than materialise a missing parent (mix 0.42.0). A failure is
+-- reported verbatim instead of classified — an interpreter too old for the
+-- option and a full disk both mean the same thing here, that the question was
+-- never answered, and the parent says so with the reason attached.
+$LSTAT_PROBE = join([
+  "if is_dir(env(\"TMPDIR\", \"/tmp\")) == false then\n",
+  "  print(\"no-tmpdir\")\n",
+  "  exit(0)\n",
+  "end\n",
+  "$d = env(\"TMPDIR\", \"/tmp\") .. \"/cosmix-lstat-probe-\" .. pid() .. \"-\" .. uuid()\n",
+  "try\n",
+  "  mkdir($d, {parents: false})\n",
+  "catch $me\n",
+  "  print(\"no-mkdir=\" .. $me)\n",
+  "  exit(0)\n",
+  "end\n",
+  "$made = false\n",
+  "try\n",
+  "  mkdir($d .. \"/absent/leaf\", {parents: false})\n",
+  "  $made = true\n",
+  "catch $ke\n",
+  "end\n",
+  "if $made then\n",
+  "  try\n",
+  "    remove_dir($d .. \"/absent/leaf\")\n",
+  "  catch $k1\n",
+  "  end\n",
+  "  try\n",
+  "    remove_dir($d .. \"/absent\")\n",
+  "  catch $k2\n",
+  "  end\n",
+  "  remove_dir($d)\n",
+  "  print(\"mkdir-recursive\")\n",
+  "  exit(0)\n",
+  "end\n",
+  "$l = $d .. \"/link\"\n",
+  "$a = \"no\"\n",
+  "$b = \"no\"\n",
+  "try\n",
+  "  symlink(\"dangling-\" .. uuid(), $l)\n",
+  "  if exists($l, {follow_symlinks: false}) then\n",
+  "    $a = \"yes\"\n",
+  "  end\n",
+  "  if exists($l) then\n",
+  "    $b = \"yes\"\n",
+  "  end\n",
+  "  print(\"lstat=\" .. $a .. \" follow=\" .. $b)\n",
+  "finally\n",
+  "  try\n",
+  "    remove($l)\n",
+  "  catch $ignored\n",
+  "  end\n",
+  "  remove_dir($d)\n",
+  "end\n"
+], "")
+
+fn require_lstat_option_in($mix, $status_only)
+  $tmp = env("TMPDIR", "/tmp")
+  if is_dir($tmp) == false then
+    if $status_only then
+      warn_run("TMPDIR " .. $tmp .. " is not a directory, so " .. $mix
+        .. " — the interpreter the installed stubs name on their shebang line —"
+        .. " could not be asked whether it honours {follow_symlinks: false};"
+        .. " what actually runs may not be what this status describes",
+        "installed interpreter lstat behaviour")
+      return false
+    end
+    bail(2, "TMPDIR " .. $tmp .. " is not a directory — the probe that asks "
+      .. $mix .. " whether it honours {follow_symlinks: false} writes a dangling"
+      .. " symlink there, and mkdir() is create_dir_all, so running it would"
+      .. " CREATE the missing path, parents and all, and leave it behind. This"
+      .. " installer borrows a temporary directory, it does not build one;"
+      .. " nothing was changed")
+  end
+  $r = run_argv([$mix, "-c", $LSTAT_PROBE], {timeout: 300})
+  -- Under --status this measurement is qualifying information, not a gate: the
+  -- run installs nothing, so the honest answer to "I could not check" is to say
+  -- so and carry on reporting. Same reasoning as probe_dir's.
+  if $status_only then
+    if trim($r["stdout"]) != "lstat=yes follow=no" or $r["exit_code"] != 0 then
+      warn_run($mix .. " did not answer that it honours"
+        .. " {follow_symlinks: false} — that is the interpreter the installed"
+        .. " stubs name, so what runs may not be what this status describes",
+        "installed interpreter lstat behaviour")
+    end
+    return false
+  end
+  if $r["exit_code"] == nil then
+    bail(2, "cannot run " .. $mix .. " — that is the interpreter the installed"
+      .. " stub names on its shebang line, so nothing was installed")
+  end
+  $said = trim($r["stdout"])
+  -- The status is required as well as the answer. Round twenty: the right
+  -- string on stdout was accepted no matter how the process ended, so an
+  -- interpreter that printed the answer and then died — or a wrapper echoing a
+  -- canned line — was read as a pass. A probe that did not complete has not
+  -- answered anything.
+  if $said == "lstat=yes follow=no" and $r["exit_code"] == 0 then
+    return true
+  end
+  if $said == "no-tmpdir" then
+    bail(2, "TMPDIR " .. $tmp .. " stopped being a directory between this run's"
+      .. " check and the probe it spawned, so " .. $mix .. " was never asked"
+      .. " whether it honours {follow_symlinks: false}. The probe refused to"
+      .. " create the path rather than leave one behind; nothing was changed")
+  end
+  if starts_with($said, "no-mkdir=") then
+    bail(2, "the probe could not create its own directory under TMPDIR " .. $tmp
+      .. " (" .. sanitize(substr($said, 9)) .. "), so " .. $mix
+      .. " was never asked whether it honours {follow_symlinks: false}. It"
+      .. " refuses to build a missing TMPDIR to ask — which needs"
+      .. " mkdir({parents: false}), Mix >= 0.42.0, so an older interpreter"
+      .. " reports here rather than recreating the path it was told not to."
+      .. " Nothing was changed")
+  end
+  if $said == "mkdir-recursive" then
+    bail(2, $mix .. " ignores mkdir({parents: false}) — asked for a leaf whose"
+      .. " parent did not exist, it built both. That is the interpreter every"
+      .. " hook invocation will use, and it is also the interpreter this"
+      .. " probe's own TMPDIR guard is written in, so on that binary the guard"
+      .. " cannot refuse: a TMPDIR that vanishes mid-probe is silently"
+      .. " recreated, parents and all, and a run that should answer 2 answers"
+      .. " 0. Accepting the option is not honouring it — Mix does not enforce"
+      .. " builtin arity without --strict-arity, so an older binary discards it"
+      .. " and succeeds. Mix >= 0.42.0 is required there (deploy it with"
+      .. " `mix _bin/deploy_mix.mix`); nothing was changed")
+  end
+  if $said == "lstat=no follow=no" then
+    bail(2, $mix .. " accepts {follow_symlinks: false} and does not honour it"
+      .. " — that is the interpreter every hook invocation will use, and it"
+      .. " answers the follow-the-symlink question whatever it is asked, so a"
+      .. " DANGLING symlink in .git/hooks reads as an empty slot and installing"
+      .. " over it destroys the link, silently. Mix >= 0.39.0 is required there"
+      .. " (deploy it with `mix _bin/deploy_mix.mix`); nothing was changed")
+  end
+  bail(2, $mix .. " could not be asked whether it honours"
+    .. " {follow_symlinks: false}: it exited " .. $r["exit_code"] .. " and said "
+    .. sanitize(trim(join(["\"", $said, "\" ", trim($r["stderr"])], "")))
+    .. " — that is the interpreter every hook invocation will use, and an"
+    .. " unanswered question is not a pass. Mix >= 0.39.0 is required there;"
+    .. " nothing was changed")
+  return false
+end
+
+require_lstat_behaviour($status_only)
+require_lstat_option_in($MIX, $status_only)
+require_runnable($GATE, "gate", $status_only)
+require_runnable($HOOK, "hook body", $status_only)
+
+-- Same contract as the gate's load_conf(): load_data() RAISES on a missing or
+-- malformed file, and an uncaught Mix error exits 1 — the code reserved for
+-- "policy violation". An unreadable config is infrastructure; it exits 2. The
+-- gate has had this since round one; the installer was left calling load_data
+-- bare and answered a one-line syntax error with exit 1 (round ten).
+$cfg = nil
+try
+  $cfg = load_data($CONF)["public_hygiene"]
+catch $e
+  bail(2, "cannot read " .. $CONF .. " (" .. $e .. ") — refusing to install"
+    .. " hooks from a config that could not be parsed")
+end
+-- The type test comes BEFORE the index, and that ordering is the whole fix
+-- (round fifteen). `$cfg["repos"]` on a `public_hygiene: "not a map"` raised
+-- "cannot index string with string" — uncaught, exit 1, a malformed config
+-- reported as a policy violation by the very check meant to prevent that. The
+-- same trap as round ten and round fourteen, one indirection earlier: the
+-- guard itself has to be reachable on the input it is guarding against.
+if $cfg != nil and type($cfg) != "map" then
+  bail(2, $CONF .. " has a public_hygiene that is a " .. type($cfg)
+    .. ", not a section — refusing to install hooks from a config this run"
+    .. " cannot read")
+end
+if $cfg == nil or $cfg["repos"] == nil then
+  bail(2, $CONF .. " has no public_hygiene.repos — refusing to install nothing")
+end
+
+-- The config is a boundary here exactly as it is in the gate, and it was only
+-- half-checked (round fourteen): presence was tested, shape was not. A parseable
+-- config with `repos` a string sailed past the nil test and then `len()` counted
+-- its CHARACTERS — a one-character repo name would have been "no repos", and a
+-- longer one would have been iterated a character at a time. A map, or a list
+-- holding a number, raised somewhere downstream and exited 1: a shape mistake
+-- reported as a policy violation. Same wrapper and same spec fields as the gate,
+-- because the two must agree on what a usable config is; the installer reads
+-- only these two fields, and validate() ignores the rest.
+validate_conf_value($cfg, {
+    schema_version: {type: "integer", min: 1, max: 1},
+    repos: {type: "list", items: {type: "string", nonblank: true}}
+  }, $CONF, "repo list")
+
+if len($cfg["repos"]) == 0 then
+  bail(2, "no repos configured in " .. $CONF .. " — nothing would be guarded")
+end
+
+fn resolve_hooks_repo($repo, $status_only)
+  -- Printed BEFORE the question is asked, so that a repository hooks_dir cannot
+  -- answer for is still named in the report rather than producing an orphan
+  -- "NOT REPORTED" line under the previous repository's heading.
+  print($repo)
+  $dir = hooks_dir($repo, $status_only)
+  if $dir == nil then
+    -- --status only: hooks_dir bails on the install path.
+    return nil
+  end
+  if $dir != $repo .. "/.git/hooks" then
+    -- Only surfaced when it is NOT the default: silence here is how a
+    -- core.hooksPath repo ends up "installed" with nothing running.
+    print("  hooks dir: " .. $dir .. "  (core.hooksPath or worktree)")
+  end
+  if is_dir($dir) == false then
+    -- Round twenty-two's cold review, and the same defect round twenty-one
+    -- fixed in three other helpers on this path: a query refusing to answer a
+    -- question it can answer perfectly well. "There is no hooks directory"
+    -- IS the answer — nothing is installed there — and bailing on it meant
+    -- every repository after this one went unreported too.
+    if $status_only then
+      print("  hooks directory does not exist: " .. $dir)
+      for each $h in $HOOK_NAMES
+        print("  " .. $h .. ": ABSENT (no hooks directory)")
+      end
+      return nil
+    end
+    bail(2, "hooks directory does not exist: " .. $dir)
+  end
+  -- The CHECKED path is the one everything below writes through, never the name
+  -- git handed back: see require_private_hooks_dir's note. If they differ, say
+  -- so — an operator reading "installed" is entitled to know which directory
+  -- that is a statement about.
+  $real = require_private_hooks_dir($repo, $dir, $status_only)
+  -- Only reachable under --status (the install path bails instead of
+  -- returning nil): the directory could not be resolved, so there is no path
+  -- to ask about. Name every hook as unknown and keep going — the repositories
+  -- after this one are the whole reason the check degrades.
+  if $real == nil then
+    for each $h in $HOOK_NAMES
+      print("  " .. $h .. ": UNKNOWN (hooks directory could not be resolved)")
+    end
+    return nil
+  end
+  if $real != $dir then
+    print("  resolves to: " .. $real .. "  (checked, and written through)")
+  end
+  -- Round twenty-five. Round twenty-four taught --status to SAY "noexec", and
+  -- stopped there: installing into a noexec hooks directory still wrote three
+  -- files, chmod'ed them, printed three `installed` lines and exited 0. Every
+  -- one of those steps succeeds on a noexec mount — the refusal comes from
+  -- execve, at commit time, from git, in silence. The operator is then told the
+  -- gate is live over a repository where no hook can ever run, which is worse
+  -- than not installing at all: it is a false clean bill for the whole
+  -- guarding mechanism.
+  --
+  -- nil refuses too. "Could not tell whether the hooks will be executable" is
+  -- not a state to install into and call done; it is exit 2, the code for a
+  -- check that could not be made. --status keeps degrading instead (it is
+  -- read-only, and one unanswerable mount must not silence the repositories
+  -- after it) — is_executable() reports the same nil there, in words.
+  if $status_only == false then
+    $dir_nx = path_is_noexec($real)
+    if $dir_nx == true then
+      bail(2, "hooks directory " .. $real .. " is on a filesystem mounted"
+        .. " noexec — writing and chmod both succeed there, and git then skips"
+        .. " every hook at commit and push time behind at most a one-line"
+        .. " advice.ignoredHook hint (nothing at all if that advice is off), so"
+        .. " installing would report a gate that cannot run. Move the hooks"
+        .. " directory"
+        .. " (core.hooksPath) to a mount without noexec and re-run")
+    end
+    if $dir_nx == nil then
+      bail(2, "cannot tell whether hooks directory " .. $real .. " is on a"
+        .. " noexec mount (/proc/mounts unreadable, or the path could not be"
+        .. " canonicalised). A hook git refuses to execute — behind at most a"
+        .. " one-line hint you will not be reading at the time — is"
+        .. " indistinguishable from no hook at all, so this run will not claim"
+        .. " to have installed one")
+    end
+    -- Round thirty-three. When this installer runs as root over a repository
+    -- owned by someone else, the permission question travels through getent,
+    -- runuser and this interpreter — and none of that was exercised until AFTER
+    -- the first hook had been written. On a host without runuser the sequence
+    -- was: write the hook, ask, get an unanswerable, exit 2, leave the
+    -- repository half-installed. This block already refuses to write when the
+    -- MOUNT cannot be vouched for; the machinery that answers the question
+    -- earns the same treatment.
+    --
+    -- Probing the hooks DIRECTORY rather than some throwaway path keeps it an
+    -- honest question as well as a rehearsal: a runner who cannot search this
+    -- directory cannot reach any hook inside it, whatever the hooks' own modes
+    -- say, and that is worth failing on in its own right.
+    --
+    -- Round thirty-four asked whether this now refuses installs that would have
+    -- worked — a repository owned by a uid with no passwd entry (a container
+    -- id-mapped tree is the realistic one) reaches the nil arm below and is
+    -- turned away. Kept deliberately. The refusal is loud, names the reason, and
+    -- is undone by fixing the passwd source or pointing core.hooksPath somewhere
+    -- answerable; the alternative is to write nine hooks and report a gate whose
+    -- executability nothing in this run could establish, which is the exact
+    -- outcome the file exists to prevent. A false refusal costs a re-run. A
+    -- false proceed costs the leak.
+    $who_pre = git_runner_uid($repo)
+    if $who_pre["uid"] == nil then
+      bail(2, "who git will run these hooks as could not be determined — "
+        .. $who_pre["why"] .. ". Nothing has been written")
+    end
+    $pre = access_x_as($who_pre["uid"], $real)
+    if $pre["ok"] == nil then
+      bail(2, "the permission question cannot be answered for " .. $real
+        .. ", so this run will not write hooks it would then be unable to"
+        .. " verify: " .. $pre["why"] .. ". Nothing has been written")
+    end
+    if $pre["ok"] == false then
+      bail(2, "the identity git will run hooks as cannot search the hooks"
+        .. " directory " .. $real .. ", so no hook placed there can be reached"
+        .. " and every commit would go through unguarded. Nothing has been"
+        .. " written")
+    end
+    -- Round thirty-seven, and the same treatment as the block above for the
+    -- same reason, one layer further out. is_executable() consults
+    -- identity_divergence only AFTER the hook has been rename()d into place, so
+    -- a purely CONFIGURATION-level refusal — a system-wide safe.directory that
+    -- widens who can run git here, or a system config this run cannot read to
+    -- one answer — was reached with a file already written, exited 2, and left
+    -- the repository part-installed. Being deterministic and whole-host, it then
+    -- did the same thing at the same point on every re-run: the operator could
+    -- never complete an install, and each attempt left more of one behind.
+    --
+    -- Nothing in this answer needs the hook to exist, so it is asked here, where
+    -- it costs a refusal instead of a mess. is_executable keeps its own call:
+    -- that one runs against the written file and can see an ACL this one cannot,
+    -- and the two questions only look alike.
+    $div_pre = identity_divergence($repo)
+    if $div_pre != "" then
+      bail(2, "for " .. $repo .. ", " .. $div_pre
+        .. ". Nothing has been written")
+    end
+  end
+  return {repo: $repo, real: $real}
+end
+
+$n = 0
+if $status_only then
+  -- Round twenty-six leaves --status deliberately single-pass. It is read-only,
+  -- and its nil returns are degradations that keep later repositories visible;
+  -- feeding it through the install preflight would turn UNKNOWN/ABSENT/noexec-
+  -- in-words back into a fleet-wide refusal, the regression T101/T106/T107 pin.
+  for each $repo in $cfg["repos"]
+    $ready = resolve_hooks_repo($repo, true)
+    if $ready == nil then
+      continue
+    end
+    for each $h in $HOOK_NAMES
+      $n = $n + install($repo, $ready["real"], $h, true, 0)
+    end
+  end
+else
+  -- Round twenty-six: validating and writing in one fleet loop left a partial
+  -- installation behind. With repo A ordinary and repo B noexec, A's three hooks
+  -- were already written and chmod'ed before B refused at 2; hooks_dir failure,
+  -- a missing directory and require_private_hooks_dir failure had the same
+  -- shape. Resolve and validate EVERY repository first, collecting only the
+  -- canonical path that was checked. No install() call is reachable until that
+  -- pass completes.
+  $ready_repos = []
+  for each $repo in $cfg["repos"]
+    push($ready_repos, resolve_hooks_repo($repo, false))
+  end
+  -- Round twenty-seven: resolving directories is only the outer preflight.
+  -- Classify every existing hook and reserve every already-occupied destination
+  -- or staging name as a refusal before install() becomes reachable for repo A.
+  -- This second read-only pass is separate from --status by design: status
+  -- reports UNKNOWN/FOREIGN per repository and continues.
+  for each $ready in $ready_repos
+    for each $h in $HOOK_NAMES
+      preflight_install($ready["repo"], $ready["real"], $h)
+    end
+  end
+  -- The preflight printed each repository before any diagnostics. Print it again
+  -- here so the familiar `installed ...` lines remain under their own repository
+  -- rather than appearing to belong to the last preflighted one.
+  for each $ready in $ready_repos
+    print($ready["repo"])
+    for each $h in $HOOK_NAMES
+      $n = $n + install($ready["repo"], $ready["real"], $h, false, $n)
+    end
+  end
+end
+
+print("")
+if $status_only then
+  -- Not "nothing changed": this run creates and removes a probe directory under
+  -- TMPDIR, and if the removal failed it said so above. What it promises is the
+  -- thing it is asked about — no hook was touched. Round twenty-one.
+  print("status only — no hook was written, chained or removed")
+  if len($RUN_UNVERIFIED) > 0 or len(keys($REPO_UNVERIFIED)) > 0 then
+    -- Keep the full multi-repository report, then carry its truth in the process
+    -- status too. A warning means at least one claimed installation could not be
+    -- verified; exit 0 would still be a machine-readable "yes".
+    bail(2, "status contains UNVERIFIED hook state; see the state tokens and"
+      .. " WARNING/NOT REPORTED lines above")
+  end
+else
+  print("hooks written: " .. $n)
+end
