@@ -1,0 +1,193 @@
+#!/usr/bin/env mix
+-- push_certs_sync.mix — push acme.sh-issued certificates from this host (the
+-- acme.sh source; runs as root) to the TLS-terminating nodes, set ownership,
+-- reload the consumers, and print what landed. Idempotent; safe to re-run.
+--
+-- Everything operator-specific is data in _etc/push_certs_sync.conf.mix:
+--   sources  — named local cert/key pairs (acme.sh output paths)
+--   targets  — host, shell kind ("mix" for a Mix-login node, "sh" for a
+--              plain-POSIX box), destinations per source, reload actions,
+--              and whether an unreachable host is fatal (optional: false).
+--
+-- Invoked directly for the initial push and from the acme.sh renew hook.
+-- rsync is broken to a Mix-login node (the login shell cannot host the rsync
+-- server) — scp over internal-sftp is used. Source paths are passed
+-- argv-inert, so a literal `*` in an acme.sh directory name stays literal.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/push_certs_sync.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no cert-push config at " .. $CONF_PATH ..
+    " — create it from push_certs_sync.conf.mix.example")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["push_certs_sync"], {
+    schema_version: {type: "integer", enum: [1]},
+    sources: {type: "map"},
+    targets: {type: "list"}
+  })
+catch $e
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $e)
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+-- A word that is safe to hand to a plain-sh host unquoted: no whitespace,
+-- no shell metacharacters. Everything that reaches an "sh" target passes it.
+fn plain_word($key, $s)
+  if not regex_match("^[A-Za-z0-9_./:@%+-]+$", $s) then
+    config_error($key .. " must be a plain word (got " .. $s .. ")")
+  end
+  return $s
+end
+
+fn abs_path($key, $p)
+  if (not starts_with($p, "/") or ends_with($p, "/") or contains($p, "//") or
+      contains($p, "\n")) then
+    config_error($key .. " must be a normalised absolute path")
+  end
+  return $p
+end
+
+for each $name in keys($CONF.sources)
+  $src = $CONF.sources[$name]
+  abs_path("sources." .. $name .. ".cert", $src.cert)
+  abs_path("sources." .. $name .. ".key", $src.key)
+  if not is_file($src.cert) then die_soft("source " .. $name .. ": missing " .. $src.cert) end
+  if not is_file($src.key) then die_soft("source " .. $name .. ": missing " .. $src.key) end
+end
+
+fn die_soft($msg)
+  eprint("  ERROR: " .. $msg)
+  exit(1)
+end
+
+fn scp_to($local, $host, $remote)
+  $r = run_argv(["scp", "-q", $local, $host .. ":" .. $remote], {timeout: 120})
+  if $r.exit_code != 0 then
+    return "scp " .. $local .. " -> " .. $host .. ":" .. $remote .. " failed: " .. trim($r.stderr)
+  end
+  return ""
+end
+
+-- Plain-sh host: one argv-inert ssh per step; the command text is built only
+-- from plain_word()-checked pieces.
+fn sh_on($host, $cmd)
+  return run_argv(["ssh", $host, $cmd], {timeout: 60})
+end
+
+$failed = 0
+for each $t in $CONF.targets
+  $host = plain_word("targets[].host", $t.host)
+  $shell = get_or($t, "shell", "mix")
+  $optional = get_or($t, "optional", false)
+  if $shell != "mix" and $shell != "sh" then config_error($host .. ": shell must be mix or sh") end
+  $certs = get_or($t, "certs", [])
+  $reloads = get_or($t, "reload", [])
+
+  -- reachability
+  if $shell == "mix" then
+    $probe = ssh_mix($host, 'print("reach-ok")')
+    $up = $probe.ok and contains($probe.stdout, "reach-ok")
+  else
+    $probe = sh_on($host, "true")
+    $up = $probe.exit_code == 0
+  end
+  if not $up then
+    if $optional then
+      eprint("  " .. $host .. ": unreachable, skipping (optional)")
+    else
+      eprint("  " .. $host .. ": unreachable")
+      $failed = $failed + 1
+    end
+  else
+    $ok = true
+    for each $c in $certs
+      $src = $CONF.sources[$c.source]
+      if $src == nil then config_error($host .. ": unknown source " .. $c.source) end
+      $dir = plain_word($host .. " dest_dir", abs_path($host .. " dest_dir", $c.dest_dir))
+      $group = plain_word($host .. " key_group", get_or($c, "key_group", "root"))
+      $mode = plain_word($host .. " key_mode", get_or($c, "key_mode", "0600"))
+      $cert_dest = $dir .. "/fullchain.pem"
+      $key_dest = $dir .. "/privkey.pem"
+
+      -- 1. destination directory
+      if $shell == "mix" then
+        $mk = ssh_mix($host, 'run_argv_must(["install", "-d", "-m", "0755", $dir]); print("dir-ok")', {bindings: {dir: $dir}})
+        if not ($mk.ok and contains($mk.stdout, "dir-ok")) then $ok = false; eprint("  " .. $host .. ": mkdir " .. $dir .. " failed: " .. trim($mk.stderr)) end
+      else
+        $mk = sh_on($host, "mkdir -p " .. $dir)
+        if $mk.exit_code != 0 then $ok = false; eprint("  " .. $host .. ": mkdir " .. $dir .. " failed: " .. trim($mk.stderr)) end
+      end
+
+      -- 2. the bytes
+      if $ok then
+        $e1 = scp_to($src.cert, $host, $cert_dest)
+        $e2 = scp_to($src.key, $host, $key_dest)
+        if $e1 != "" or $e2 != "" then $ok = false; eprint("  " .. $host .. ": " .. $e1 .. " " .. $e2) end
+      end
+
+      -- 3. ownership: fullchain root:root 0644, key root:<group> <mode>
+      if $ok then
+        if $shell == "mix" then
+          $own = ssh_mix($host, 'run_argv_must(["chown", "root:root", $cert]); run_argv_must(["chmod", "0644", $cert]); run_argv_must(["chown", "root:" .. $group, $key]); run_argv_must(["chmod", $mode, $key]); print(run_argv_must(["stat", "-c", "%n %U:%G %a", $cert, $key]))',
+            {bindings: {cert: $cert_dest, key: $key_dest, group: $group, mode: $mode}})
+          if $own.ok then print("  " .. $host .. ": " .. trim($own.stdout)) else $ok = false; eprint("  " .. $host .. ": perms failed: " .. trim($own.stderr)) end
+        else
+          $o1 = sh_on($host, "chmod 0644 " .. $cert_dest)
+          $o2 = sh_on($host, "chown root:" .. $group .. " " .. $key_dest)
+          $o3 = sh_on($host, "chmod " .. $mode .. " " .. $key_dest)
+          if $o1.exit_code != 0 or $o2.exit_code != 0 or $o3.exit_code != 0 then $ok = false; eprint("  " .. $host .. ": perms failed") end
+          if $ok then print("  " .. $host .. ": " .. $cert_dest .. " + " .. $key_dest .. " (" .. $group .. " " .. $mode .. ")") end
+        end
+      end
+    end
+
+    -- 4. reload consumers — only units that are actually active; raw argv as given
+    if $ok then
+      for each $r in $reloads
+        if has_key($r, "unit") then
+          $unit = plain_word($host .. " reload.unit", $r.unit)
+          $action = plain_word($host .. " reload.action", get_or($r, "action", "reload"))
+          if $shell == "mix" then
+            $rl = ssh_mix($host, 'if run_argv(["systemctl", "is-active", "--quiet", $unit]).exit_code == 0 then run_argv_must(["systemctl", $action, $unit]); print("did") else print("inactive") end',
+              {bindings: {unit: $unit, action: $action}})
+            $what = trim($rl.stdout)
+          else
+            $rl = sh_on($host, "systemctl is-active --quiet " .. $unit .. " && systemctl " .. $action .. " " .. $unit .. " && echo did || echo inactive")
+            $what = trim($rl.stdout)
+          end
+          if $what == "did" then print("  " .. $host .. ": " .. $action .. " " .. $unit) end
+          if $what != "did" and $what != "inactive" then $ok = false; eprint("  " .. $host .. ": " .. $action .. " " .. $unit .. " failed: " .. trim($rl.stderr)) end
+        else
+          $argv = get_or($r, "argv", [])
+          for each $w in $argv plain_word($host .. " reload.argv", $w) end
+          if $shell == "mix" then
+            $rl = ssh_mix($host, 'run_argv_must($argv); print("did")', {bindings: {argv: $argv}})
+            $good = $rl.ok and contains($rl.stdout, "did")
+          else
+            $rl = sh_on($host, join($argv, " "))
+            $good = $rl.exit_code == 0
+          end
+          if $good then print("  " .. $host .. ": " .. join($argv, " ")) else $ok = false; eprint("  " .. $host .. ": " .. join($argv, " ") .. " failed: " .. trim($rl.stderr)) end
+        end
+      end
+    end
+    if not $ok then $failed = $failed + 1 end
+  end
+end
+
+if $failed > 0 then
+  eprint("  cert push: " .. ("" .. $failed) .. " target(s) FAILED")
+  exit(1)
+end
+print("  cert push: OK")

@@ -1,0 +1,33 @@
+-- push_certs_sync.conf.mix — where acme.sh certificates go (copy to
+-- <hub>/_etc/push_certs_sync.conf.mix and fill in the real hosts/paths).
+-- sources: named local cert/key pairs. A `*` in a path is a LITERAL part of
+-- the acme.sh directory name (wildcard certs) — it is passed argv-inert.
+-- targets: shell "mix" = Mix-login node (ssh_mix); "sh" = plain POSIX box.
+-- reload entries are either {unit, action} (guarded by systemctl is-active)
+-- or {argv: [...]} run as given. optional: true → unreachable is a warning.
+push_certs_sync: {
+  schema_version: 1,
+  sources: {
+    wild: {cert: "/root/.acme.sh/*.example.org_ecc/fullchain.cer", key: "/root/.acme.sh/*.example.org_ecc/*.example.org.key"},
+    plain: {cert: "/root/.acme.sh/example.net_ecc/fullchain.cer", key: "/root/.acme.sh/example.net_ecc/example.net.key"}
+  },
+  targets: [
+    {
+      host: "beta", shell: "mix",
+      certs: [
+        {source: "wild", dest_dir: "/etc/ssl/example.org", key_group: "cosmix-tls", key_mode: "0640"},
+        {source: "plain", dest_dir: "/etc/ssl/example.net", key_group: "cosmix-tls", key_mode: "0640"}
+      ],
+      reload: [
+        {unit: "cosmix-maild", action: "restart"},
+        {unit: "cosmix-webd", action: "restart"},
+        {unit: "nginx", action: "reload"}
+      ]
+    },
+    {
+      host: "gamma", shell: "sh", optional: true,
+      certs: [{source: "wild", dest_dir: "/etc/ssl/example.org-wild", key_group: "root", key_mode: "0600"}],
+      reload: [{argv: ["nginx", "-s", "reload"]}]
+    }
+  ]
+}
