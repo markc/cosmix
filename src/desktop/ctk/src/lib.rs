@@ -38,6 +38,7 @@ pub mod virtual_list;
 pub mod wave;
 pub mod widgets;
 
+mod design;
 mod style;
 
 #[cfg(feature = "bus")]
@@ -113,6 +114,7 @@ pub mod prelude {
         spawn_dcs_app_shell, DcsAppShell, DcsAppShellEntities, DcsAppShellPlugin, DcsAppShellProps,
     };
 
+    pub use crate::design::{CtkDesign, CtkDesignStatus};
     pub use crate::dialog_shell::{
         spawn_dialog_shell, DialogShell, DialogShellEntities, DialogShellPanel, DialogShellRoot,
     };

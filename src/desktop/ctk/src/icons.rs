@@ -796,6 +796,28 @@ pub fn spawn_icon(
         .id()
 }
 
+/// Spawn an SVG whose colour is owned by its widget rather than a theme token.
+pub(crate) fn spawn_icon_coloured(
+    commands: &mut Commands,
+    icons: &IconSet,
+    icon: Icon,
+    size: f32,
+    colour: Color,
+) -> Entity {
+    commands
+        .spawn((
+            Node {
+                width: px(size),
+                min_width: px(size),
+                height: px(size),
+                ..default()
+            },
+            UiSvg(icons.handle(icon)),
+            SvgColor(colour),
+        ))
+        .id()
+}
+
 pub(crate) fn retint_added_icons(
     theme: Res<UiTheme>,
     mut icons: Query<(&ThemeSvgColor, &mut SvgColor), Added<ThemeSvgColor>>,
@@ -1174,7 +1196,7 @@ mod tests {
     fn interactd_packaged_catalogue_copy_stays_in_sync() {
         let ctk = include_str!("../assets/icons/catalogue.txt");
         let interactd =
-            include_str!("../../../src/crates/cosmix-interactd/src/lucide-catalogue.txt");
+            include_str!("../../../../src/crates/cosmix-interactd/src/lucide-catalogue.txt");
         assert_eq!(interactd, ctk);
     }
 

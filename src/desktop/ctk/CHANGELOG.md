@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.49.0 — 2026-08-30
+
+- Make the compiled `cosmix-design` button table the sole authority for every
+  `CtkButton` colour, focus ring and layout metric. The embedded revision-1
+  design compiles at plugin initialisation and re-syncs for scheme/mode
+  changes. Replacing the complete source in memory through
+  `CtkDesignStatus::replace_source` recompiles once and restyles existing
+  buttons; invalid source retains the last-known-good design. On-disk
+  `theme.conf.mix` `design` sections are not read yet.
+- Deprecate the public `CtkThemeMetrics::button_*` fields. They remain for
+  source compatibility but are inert for `CtkButton`; the design table now
+  owns height, minimum width, horizontal padding, border width and radius.
+- Enable `cosmix-design/compiler` in CTK's runtime dependency. This adds
+  `cosmix-lib-mix` and its Tokio, signal-hook and rand graph to every CTK
+  consumer, including `default-features = false`; that deliberate cost is
+  accepted because the shell is the Mix-UI target and will carry the
+  interpreter regardless.
+- Fix the icons-feature catalogue parity test to resolve the shared
+  `cosmix-interactd` catalogue at its monorepo path.
+
 ## 0.47.0 — 2026-07-30
 
 - Add the default-off `body-view` reading surface behind a mandatory type-state

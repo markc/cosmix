@@ -127,9 +127,13 @@ pub struct CtkThemeMetrics {
     pub control_gap: f32,
     pub corner_radius: f32,
     pub radius: RadiusScale,
+    #[deprecated(note = "CtkButton height is resolved from CtkDesign")]
     pub button_height: [f32; 3],
+    #[deprecated(note = "CtkButton minimum width is resolved from CtkDesign")]
     pub button_min_width: f32,
+    #[deprecated(note = "CtkButton horizontal padding is resolved from CtkDesign")]
     pub button_pad_h: f32,
+    #[deprecated(note = "CtkButton border width is resolved from CtkDesign")]
     pub button_border: f32,
     pub fader_width: f32,
     pub fader_height: f32,
@@ -137,6 +141,7 @@ pub struct CtkThemeMetrics {
     pub meter_width: f32,
 }
 
+#[allow(deprecated)]
 impl Default for CtkThemeMetrics {
     fn default() -> Self {
         Self {
@@ -976,10 +981,9 @@ impl Default for ThemeSpec {
     }
 }
 
-/// Paint a [`ThemeSpec`]'s palette onto a Feathers theme. Metrics are applied
-/// separately as the [`CtkThemeMetrics`] resource — they are baked into widget
-/// geometry at spawn, so (unlike colours) they cannot hot-swap on a live theme
-/// change; a metrics change needs a relaunch.
+/// Paint a [`ThemeSpec`]'s palette onto a Feathers theme. Legacy non-button
+/// metrics remain relaunch-only; `CtkButton` colour and geometry come from the
+/// live compiled design table instead.
 pub(crate) fn install_theme_spec(theme: &mut UiTheme, spec: &ThemeSpec) {
     let c = &spec.colors;
     theme.set_color("ctk.surface", c.surface);
@@ -1010,9 +1014,8 @@ pub fn ctk_color(theme: &UiTheme, token: &ThemeToken) -> Color {
 
 /// Live theme identity and invalidation revision.
 ///
-/// Runtime application updates colours and typography. [`CtkThemeMetrics`] are
-/// consumed while widget geometry is spawned and therefore remain
-/// relaunch-only.
+/// Runtime application updates colours, typography and the compiled button
+/// table. Legacy non-button [`CtkThemeMetrics`] remain relaunch-only.
 #[derive(Resource, Clone, Debug)]
 pub struct ThemeState {
     /// Currently applied shared colour scheme.
@@ -1352,7 +1355,7 @@ pub struct ThemeWriteCompleted {
 ///
 /// With the `theme` feature, `app_config_dir` participates in
 /// `built-in ← shared ← app` resolution whenever a window gains focus.
-/// Metrics from those reloads are ignored until relaunch.
+/// Legacy non-button metrics from those reloads are ignored until relaunch.
 pub struct CtkThemePlugin {
     app_config_dir: Option<std::path::PathBuf>,
 }
@@ -1372,6 +1375,7 @@ impl Default for CtkThemePlugin {
 
 impl Plugin for CtkThemePlugin {
     fn build(&self, app: &mut App) {
+        crate::design::init_design_resources(app);
         app.init_resource::<UiTheme>()
             .init_resource::<CtkThemeMetrics>()
             .init_resource::<CtkTypography>()
@@ -2927,7 +2931,7 @@ mod tests {
         let mut spec = ThemeSpec::builtin();
         let before = spec.colors.row_selected_text;
         let before_dim = spec.colors.row_selected_text_dim;
-        spec.overlay(&file("row_selected: \"#555555\"\n")).unwrap();
+        spec.overlay(&file("row_selected: \"#eeeeee\"\n")).unwrap();
         assert_ne!(spec.colors.row_selected_text, before, "not re-derived");
         assert_ne!(
             spec.colors.row_selected_text_dim, before_dim,

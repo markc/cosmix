@@ -983,6 +983,7 @@ pub struct CtkWidgetsPlugin;
 
 impl Plugin for CtkWidgetsPlugin {
     fn build(&self, app: &mut App) {
+        crate::design::init_design_resources(app);
         // UiTheme normally arrives via FeathersPlugins; init it here too so a
         // headless/test app can run the dynamic repaint systems (an empty
         // theme resolves missing tokens to feathers' loud error colour). Apps
@@ -990,6 +991,7 @@ impl Plugin for CtkWidgetsPlugin {
         app.init_resource::<UiTheme>()
             .init_resource::<crate::theme::CtkThemeMetrics>()
             .init_resource::<crate::theme::CtkTypography>()
+            .init_resource::<crate::theme::ThemeState>()
             .init_resource::<InputFocus>()
             .init_resource::<InputFocusVisible>()
             .init_resource::<crate::button::ButtonDiagnostics>()
@@ -1028,14 +1030,21 @@ impl Plugin for CtkWidgetsPlugin {
             )
             .add_systems(
                 Update,
+                crate::design::sync_ctk_design
+                    .after(crate::theme::apply_theme_requests)
+                    .in_set(crate::design::CtkDesignSystems::Sync),
+            )
+            .add_systems(
+                Update,
                 (
                     update_fader_visuals,
                     update_hfader_visuals,
                     update_knob_visuals,
                     update_meter_visuals,
                     update_toggle_style,
-                    crate::button::update_button_style,
-                    crate::button::update_button_metrics,
+                    crate::button::update_button_style.after(crate::design::CtkDesignSystems::Sync),
+                    crate::button::update_button_icon_metrics
+                        .after(crate::design::CtkDesignSystems::Sync),
                     update_numeric_accessibility,
                 ),
             );
@@ -1048,7 +1057,8 @@ impl Plugin for CtkWidgetsPlugin {
                     crate::button::spawn_pending_button_labels,
                     crate::button::update_button_icon_style,
                 )
-                    .chain(),
+                    .chain()
+                    .after(crate::design::CtkDesignSystems::Sync),
             );
     }
 }

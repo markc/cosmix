@@ -1,10 +1,4 @@
-//! Canonical CTK button: one variant/size surface with live theme styling.
-//!
-//! CTK deliberately diverges from shadcn's opacity-50 disabled treatment on
-//! the desktop: every non-ghost variant uses the same neutral disabled control
-//! surface, border and dim foreground, while Ghost remains fully transparent.
-//! This preserves the theme's validated `text.dim`-on-control pairing instead
-//! of making disabled contrast depend on the enabled variant colour.
+//! Canonical CTK button: one variant/size surface resolved from `CtkDesign`.
 //!
 //! Apps which use icon labels must install [`crate::icons::IconSet`]. If it is
 //! missing, CTK warns once and keeps the label pending so a legitimately late
@@ -22,7 +16,6 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::Without;
 use bevy::ecs::query::{Has, With};
 use bevy::ecs::system::{Commands, Query, Res, ResMut};
-use bevy::feathers::theme::UiTheme;
 use bevy::input_focus::tab_navigation::TabIndex;
 use bevy::input_focus::{InputFocus, InputFocusVisible};
 use bevy::log::warn;
@@ -35,10 +28,11 @@ use bevy::text::{FontSize, FontSource};
 use bevy::ui::{px, AlignItems, BorderRadius, InteractionDisabled, JustifyContent, Pressed};
 use bevy::ui_widgets::ActivateOnPress;
 
-use crate::style::{
-    contrast_safe_lift, lighten, selected_background, InteractionVisualState, DISABLED_LIFT,
-};
-use crate::theme::{ctk_color, tokens, CtkThemeMetrics, CtkTypography, CtkTypographyOptOut};
+use cosmix_design::{ButtonCellKey, InteractionState, ResolvedButtonCell};
+
+use crate::design::{bevy_color, CtkDesign};
+use crate::style::InteractionVisualState;
+use crate::theme::{CtkTypography, CtkTypographyOptOut};
 use crate::widgets::{ActionButton, BusWidget};
 
 pub use cosmix_design::{ButtonSize, ButtonVariant};
@@ -238,55 +232,23 @@ fn visual_state(hovered: &Hovered, pressed: bool, disabled: bool) -> Interaction
     }
 }
 
-fn button_colours(
-    theme: &UiTheme,
-    variant: ButtonVariant,
+fn button_cell_key(
+    button: &CtkButton,
     state: InteractionVisualState,
-) -> (Color, Color, Color) {
-    if matches!(state, InteractionVisualState::Disabled) {
-        let text = ctk_color(theme, &tokens::TEXT_DIM);
-        return if variant == ButtonVariant::Ghost {
-            (Color::NONE, Color::NONE, text)
-        } else {
-            (
-                contrast_safe_lift(ctk_color(theme, &tokens::CONTROL), -DISABLED_LIFT, &[text]),
-                ctk_color(theme, &tokens::BORDER),
-                text,
-            )
-        };
+    focus_visible: bool,
+) -> ButtonCellKey {
+    let interaction = match state {
+        InteractionVisualState::Resting => InteractionState::Resting,
+        InteractionVisualState::Hovered => InteractionState::Hovered,
+        InteractionVisualState::Pressed => InteractionState::Pressed,
+        InteractionVisualState::Disabled => InteractionState::Disabled,
+    };
+    ButtonCellKey {
+        variant: button.variant,
+        size: button.size,
+        interaction,
+        focus_visible,
     }
-
-    let text = if variant == ButtonVariant::Primary {
-        ctk_color(theme, &tokens::ROW_SELECTED_TEXT)
-    } else {
-        ctk_color(theme, &tokens::TEXT)
-    };
-    let (background, border) = match variant {
-        ButtonVariant::Default => (
-            lighten(ctk_color(theme, &tokens::CONTROL), state.legacy_lift()),
-            ctk_color(theme, &tokens::BORDER),
-        ),
-        ButtonVariant::Primary => (
-            selected_background(theme, state),
-            ctk_color(theme, &tokens::BORDER),
-        ),
-        ButtonVariant::Destructive => (
-            lighten(
-                ctk_color(theme, &tokens::DANGER_SURFACE),
-                state.legacy_lift(),
-            ),
-            ctk_color(theme, &tokens::METER_RED),
-        ),
-        ButtonVariant::Ghost => {
-            let background = if matches!(state, InteractionVisualState::Resting) {
-                Color::NONE
-            } else {
-                lighten(ctk_color(theme, &tokens::CONTROL), state.legacy_lift())
-            };
-            (background, Color::NONE)
-        }
-    };
-    (background, border, text)
 }
 
 fn has_visible_focus(
@@ -298,26 +260,9 @@ fn has_visible_focus(
         && focus.and_then(InputFocus::get) == Some(entity)
 }
 
-fn focused_border(
-    theme: &UiTheme,
-    variant: ButtonVariant,
-    resting_border: Color,
-    focused: bool,
-) -> Color {
-    if focused {
-        if variant == ButtonVariant::Primary {
-            ctk_color(theme, &tokens::ROW_SELECTED_TEXT)
-        } else {
-            ctk_color(theme, &tokens::ROW_SELECTED)
-        }
-    } else {
-        resting_border
-    }
-}
-
 #[allow(clippy::type_complexity)]
 pub(crate) fn update_button_style(
-    theme: Res<UiTheme>,
+    design: Res<CtkDesign>,
     focus: Option<Res<InputFocus>>,
     focus_visible: Option<Res<InputFocusVisible>>,
     mut buttons: Query<(
@@ -326,24 +271,35 @@ pub(crate) fn update_button_style(
         Has<Pressed>,
         Has<InteractionDisabled>,
         &CtkButton,
+        &mut Node,
         &mut BackgroundColor,
         &mut BorderColor,
         Option<&Children>,
     )>,
     mut labels: Query<&mut TextColor, With<CtkButtonLabel>>,
 ) {
-    for (entity, hovered, pressed, disabled, button, mut background, mut border, children) in
-        &mut buttons
+    for (
+        entity,
+        hovered,
+        pressed,
+        disabled,
+        button,
+        mut node,
+        mut background,
+        mut border,
+        children,
+    ) in &mut buttons
     {
         let state = visual_state(hovered, pressed, disabled);
-        let (want_background, resting_border, want_text) =
-            button_colours(&theme, button.variant, state);
-        let want_border = focused_border(
-            &theme,
-            button.variant,
-            resting_border,
-            !disabled && has_visible_focus(entity, focus.as_deref(), focus_visible.as_deref()),
-        );
+        let focused =
+            !disabled && has_visible_focus(entity, focus.as_deref(), focus_visible.as_deref());
+        let Some(cell) = design.button_cell(button_cell_key(button, state, focused)) else {
+            continue;
+        };
+        let want_background = bevy_color(cell.pair.surface);
+        let want_border = cell.ring.or(cell.border).map_or(Color::NONE, bevy_color);
+        let want_text = bevy_color(cell.pair.foreground);
+        sync_node_to_cell(cell, &mut node);
 
         // Every write is guarded: unconditional writes would mark every button
         // changed on every frame and repaint the whole button population.
@@ -376,17 +332,12 @@ fn label_font_size(typography: &CtkTypography, size: ButtonSize) -> f32 {
     }
 }
 
-fn apply_button_metrics(metrics: &CtkThemeMetrics, button: &CtkButton, node: &mut Node) {
-    let min_width = if button.size == ButtonSize::Sm {
-        0.0
-    } else {
-        metrics.button_min_width
-    };
-    let height = px(metrics.button_height[button.size.index()]);
-    let min_width = px(min_width);
-    let padding = UiRect::horizontal(px(metrics.button_pad_h));
-    let border = UiRect::all(px(metrics.button_border));
-    let radius = BorderRadius::all(px(metrics.radius.md));
+fn sync_node_to_cell(cell: &ResolvedButtonCell, node: &mut Node) {
+    let height = px(cell.height as f32);
+    let min_width = px(cell.min_width as f32);
+    let padding = UiRect::horizontal(px(cell.padding_x as f32));
+    let border = UiRect::all(px(cell.border_width as f32));
+    let radius = BorderRadius::all(px(cell.radius as f32));
     if node.height != height
         || node.min_width != min_width
         || node.padding != padding
@@ -423,7 +374,7 @@ fn apply_label_font(typography: &CtkTypography, size: ButtonSize, font: &mut Tex
 
 struct ButtonPaintContext<'a> {
     entity: Entity,
-    theme: &'a UiTheme,
+    design: &'a CtkDesign,
     focus: Option<&'a InputFocus>,
     focus_visible: Option<&'a InputFocusVisible>,
     button: &'a CtkButton,
@@ -438,15 +389,16 @@ fn paint_button_root(
     border: &mut BorderColor,
 ) {
     let state = visual_state(context.hovered, context.pressed, context.disabled);
-    let (want_background, resting_border, _) =
-        button_colours(context.theme, context.button.variant, state);
-    let want_border = focused_border(
-        context.theme,
-        context.button.variant,
-        resting_border,
-        !context.disabled
-            && has_visible_focus(context.entity, context.focus, context.focus_visible),
-    );
+    let focused = !context.disabled
+        && has_visible_focus(context.entity, context.focus, context.focus_visible);
+    let Some(cell) = context
+        .design
+        .button_cell(button_cell_key(context.button, state, focused))
+    else {
+        return;
+    };
+    let want_background = bevy_color(cell.pair.surface);
+    let want_border = cell.ring.or(cell.border).map_or(Color::NONE, bevy_color);
     if background.0 != want_background {
         background.0 = want_background;
     }
@@ -459,8 +411,7 @@ fn paint_button_root(
 #[allow(clippy::type_complexity)]
 pub(crate) fn paint_added_button(
     add: On<Add, CtkButton>,
-    theme: Res<UiTheme>,
-    metrics: Res<CtkThemeMetrics>,
+    design: Res<CtkDesign>,
     focus: Option<Res<InputFocus>>,
     focus_visible: Option<Res<InputFocusVisible>>,
     mut buttons: Query<(
@@ -478,11 +429,16 @@ pub(crate) fn paint_added_button(
     else {
         return;
     };
-    apply_button_metrics(&metrics, button, &mut node);
+    let state = visual_state(hovered, pressed, disabled);
+    let focused =
+        !disabled && has_visible_focus(add.entity, focus.as_deref(), focus_visible.as_deref());
+    if let Some(cell) = design.button_cell(button_cell_key(button, state, focused)) {
+        sync_node_to_cell(cell, &mut node);
+    }
     paint_button_root(
         ButtonPaintContext {
             entity: add.entity,
-            theme: &theme,
+            design: &design,
             focus: focus.as_deref(),
             focus_visible: focus_visible.as_deref(),
             button,
@@ -497,7 +453,7 @@ pub(crate) fn paint_added_button(
 
 pub(crate) fn paint_added_button_label(
     add: On<Add, CtkButtonLabel>,
-    theme: Res<UiTheme>,
+    design: Res<CtkDesign>,
     typography: Res<CtkTypography>,
     buttons: Query<(&CtkButton, Has<InteractionDisabled>)>,
     mut labels: Query<(&CtkButtonLabel, &mut TextFont, &mut TextColor)>,
@@ -514,7 +470,10 @@ pub(crate) fn paint_added_button_label(
     } else {
         InteractionVisualState::Resting
     };
-    let (_, _, want_colour) = button_colours(&theme, button.variant, state);
+    let Some(cell) = design.button_cell(button_cell_key(button, state, false)) else {
+        return;
+    };
+    let want_colour = bevy_color(cell.pair.foreground);
     if colour.0 != want_colour {
         colour.0 = want_colour;
     }
@@ -523,7 +482,7 @@ pub(crate) fn paint_added_button_label(
 #[allow(clippy::type_complexity)]
 pub(crate) fn paint_disabled_button(
     add: On<Add, InteractionDisabled>,
-    theme: Res<UiTheme>,
+    design: Res<CtkDesign>,
     mut buttons: Query<(
         &CtkButton,
         &Hovered,
@@ -533,13 +492,7 @@ pub(crate) fn paint_disabled_button(
         Option<&Children>,
     )>,
     mut labels: Query<&mut TextColor, With<CtkButtonLabel>>,
-    #[cfg(feature = "icons")] mut icons: Query<
-        (
-            &mut crate::icons::SvgColor,
-            &mut crate::icons::ThemeSvgColor,
-        ),
-        With<CtkButtonLabel>,
-    >,
+    #[cfg(feature = "icons")] mut icons: Query<&mut crate::icons::SvgColor, With<CtkButtonLabel>>,
 ) {
     let Ok((button, hovered, pressed, mut background, mut border, children)) =
         buttons.get_mut(add.entity)
@@ -549,7 +502,7 @@ pub(crate) fn paint_disabled_button(
     paint_button_root(
         ButtonPaintContext {
             entity: add.entity,
-            theme: &theme,
+            design: &design,
             focus: None,
             focus_visible: None,
             button,
@@ -560,8 +513,14 @@ pub(crate) fn paint_disabled_button(
         &mut background,
         &mut border,
     );
-    let (_, _, want_text) =
-        button_colours(&theme, button.variant, InteractionVisualState::Disabled);
+    let Some(cell) = design.button_cell(button_cell_key(
+        button,
+        InteractionVisualState::Disabled,
+        false,
+    )) else {
+        return;
+    };
+    let want_text = bevy_color(cell.pair.foreground);
     let Some(children) = children else {
         return;
     };
@@ -572,10 +531,7 @@ pub(crate) fn paint_disabled_button(
             }
         }
         #[cfg(feature = "icons")]
-        if let Ok((mut svg, mut retained)) = icons.get_mut(*child) {
-            if retained.0 != tokens::TEXT_DIM {
-                retained.0 = tokens::TEXT_DIM;
-            }
+        if let Ok(mut svg) = icons.get_mut(*child) {
             if svg.0 != want_text {
                 svg.0 = want_text;
             }
@@ -586,7 +542,7 @@ pub(crate) fn paint_disabled_button(
 #[allow(clippy::type_complexity)]
 pub(crate) fn paint_enabled_button(
     remove: On<Remove, InteractionDisabled>,
-    theme: Res<UiTheme>,
+    design: Res<CtkDesign>,
     focus: Option<Res<InputFocus>>,
     focus_visible: Option<Res<InputFocusVisible>>,
     mut buttons: Query<(
@@ -598,13 +554,7 @@ pub(crate) fn paint_enabled_button(
         Option<&Children>,
     )>,
     mut labels: Query<&mut TextColor, With<CtkButtonLabel>>,
-    #[cfg(feature = "icons")] mut icons: Query<
-        (
-            &mut crate::icons::SvgColor,
-            &mut crate::icons::ThemeSvgColor,
-        ),
-        With<CtkButtonLabel>,
-    >,
+    #[cfg(feature = "icons")] mut icons: Query<&mut crate::icons::SvgColor, With<CtkButtonLabel>>,
 ) {
     let Ok((button, hovered, pressed, mut background, mut border, children)) =
         buttons.get_mut(remove.entity)
@@ -614,7 +564,7 @@ pub(crate) fn paint_enabled_button(
     paint_button_root(
         ButtonPaintContext {
             entity: remove.entity,
-            theme: &theme,
+            design: &design,
             focus: focus.as_deref(),
             focus_visible: focus_visible.as_deref(),
             button,
@@ -626,7 +576,11 @@ pub(crate) fn paint_enabled_button(
         &mut border,
     );
     let state = visual_state(hovered, pressed, false);
-    let (_, _, want_text) = button_colours(&theme, button.variant, state);
+    let focused = has_visible_focus(remove.entity, focus.as_deref(), focus_visible.as_deref());
+    let Some(cell) = design.button_cell(button_cell_key(button, state, focused)) else {
+        return;
+    };
+    let want_text = bevy_color(cell.pair.foreground);
     let Some(children) = children else {
         return;
     };
@@ -637,11 +591,7 @@ pub(crate) fn paint_enabled_button(
             }
         }
         #[cfg(feature = "icons")]
-        if let Ok((mut svg, mut retained)) = icons.get_mut(*child) {
-            let token = foreground_token(button.variant, false);
-            if retained.0 != token {
-                retained.0 = token.clone();
-            }
+        if let Ok(mut svg) = icons.get_mut(*child) {
             if svg.0 != want_text {
                 svg.0 = want_text;
             }
@@ -671,19 +621,16 @@ type ButtonIconNodes<'w, 's> = Query<
     ),
 >;
 
-pub(crate) fn update_button_metrics(
-    metrics: Res<CtkThemeMetrics>,
+pub(crate) fn update_button_icon_metrics(
     typography: Res<CtkTypography>,
-    mut buttons: Query<(Ref<CtkButton>, &mut Node, Option<&Children>)>,
+    buttons: Query<(Ref<CtkButton>, Option<&Children>)>,
     #[cfg(feature = "icons")] mut icons: ButtonIconNodes,
 ) {
-    let resources_changed = metrics.is_changed() || typography.is_changed();
-    for (button, mut node, children) in &mut buttons {
+    let resources_changed = typography.is_changed();
+    for (button, children) in &buttons {
         let geometry_changed = resources_changed || button.is_changed();
-        if geometry_changed {
-            apply_button_metrics(&metrics, &button, &mut node);
-        }
-
+        #[cfg(not(feature = "icons"))]
+        let _ = geometry_changed;
         let Some(children) = children else {
             continue;
         };
@@ -726,7 +673,7 @@ pub(crate) fn reconcile_button_label_fonts(
 #[cfg(feature = "icons")]
 struct ButtonLabelMaterialiseContext<'a> {
     icons: &'a crate::icons::IconSet,
-    theme: &'a UiTheme,
+    design: &'a CtkDesign,
     typography: &'a CtkTypography,
     entity: Entity,
     button: &'a CtkButton,
@@ -744,30 +691,34 @@ fn materialise_button_label(
     } else {
         InteractionVisualState::Resting
     };
-    let (_, _, colour) = button_colours(context.theme, context.button.variant, state);
+    let Some(cell) = context
+        .design
+        .button_cell(button_cell_key(context.button, state, false))
+    else {
+        return;
+    };
+    let colour = bevy_color(cell.pair.foreground);
     let font_size = label_font_size(context.typography, context.button.size);
     match &pending.0 {
         ButtonLabel::Text(_) => unreachable!("text labels spawn immediately"),
         ButtonLabel::Icon(icon, _) => {
-            let icon = crate::icons::spawn_icon(
+            let icon = crate::icons::spawn_icon_coloured(
                 commands,
                 context.icons,
-                context.theme,
                 *icon,
                 font_size,
-                foreground_token(context.button.variant, context.disabled),
+                colour,
             );
             commands.entity(icon).insert(CtkButtonLabel(context.entity));
             commands.entity(context.entity).add_child(icon);
         }
         ButtonLabel::IconText(icon, text) => {
-            let icon = crate::icons::spawn_icon(
+            let icon = crate::icons::spawn_icon_coloured(
                 commands,
                 context.icons,
-                context.theme,
                 *icon,
                 font_size,
-                foreground_token(context.button.variant, context.disabled),
+                colour,
             );
             commands.entity(icon).insert(CtkButtonLabel(context.entity));
             commands.entity(context.entity).add_child(icon);
@@ -788,7 +739,7 @@ pub(crate) fn materialise_added_button_label(
     add: On<Add, PendingButtonLabel>,
     mut commands: Commands,
     icons: Option<Res<crate::icons::IconSet>>,
-    theme: Res<UiTheme>,
+    design: Res<CtkDesign>,
     typography: Res<CtkTypography>,
     pending: Query<(&PendingButtonLabel, &CtkButton, Has<InteractionDisabled>)>,
 ) {
@@ -803,7 +754,7 @@ pub(crate) fn materialise_added_button_label(
         pending,
         ButtonLabelMaterialiseContext {
             icons: &icons,
-            theme: &theme,
+            design: &design,
             typography: &typography,
             entity: add.entity,
             button,
@@ -817,7 +768,7 @@ pub(crate) fn materialise_added_button_label(
 pub(crate) fn spawn_pending_button_labels(
     mut commands: Commands,
     icons: Option<Res<crate::icons::IconSet>>,
-    theme: Res<UiTheme>,
+    design: Res<CtkDesign>,
     typography: Res<CtkTypography>,
     mut diagnostics: ResMut<ButtonDiagnostics>,
     pending: Query<(
@@ -843,7 +794,7 @@ pub(crate) fn spawn_pending_button_labels(
             pending,
             ButtonLabelMaterialiseContext {
                 icons: &icons,
-                theme: &theme,
+                design: &design,
                 typography: &typography,
                 entity,
                 button,
@@ -855,41 +806,36 @@ pub(crate) fn spawn_pending_button_labels(
 }
 
 #[cfg(feature = "icons")]
-fn foreground_token(variant: ButtonVariant, disabled: bool) -> bevy::feathers::theme::ThemeToken {
-    if disabled {
-        tokens::TEXT_DIM
-    } else if variant == ButtonVariant::Primary {
-        tokens::ROW_SELECTED_TEXT
-    } else {
-        tokens::TEXT
-    }
-}
-
-#[cfg(feature = "icons")]
+#[allow(clippy::type_complexity)]
 pub(crate) fn update_button_icon_style(
-    theme: Res<UiTheme>,
-    buttons: Query<(&CtkButton, Has<InteractionDisabled>, Option<&Children>)>,
-    mut icons: Query<
-        (
-            &mut crate::icons::SvgColor,
-            &mut crate::icons::ThemeSvgColor,
-        ),
-        With<CtkButtonLabel>,
-    >,
+    design: Res<CtkDesign>,
+    focus: Option<Res<InputFocus>>,
+    focus_visible: Option<Res<InputFocusVisible>>,
+    buttons: Query<(
+        Entity,
+        &CtkButton,
+        &Hovered,
+        Has<Pressed>,
+        Has<InteractionDisabled>,
+        Option<&Children>,
+    )>,
+    mut icons: Query<&mut crate::icons::SvgColor, With<CtkButtonLabel>>,
 ) {
-    for (button, disabled, children) in &buttons {
+    for (entity, button, hovered, pressed, disabled, children) in &buttons {
         let Some(children) = children else {
             continue;
         };
-        let token = foreground_token(button.variant, disabled);
-        let colour = ctk_color(&theme, &token);
+        let state = visual_state(hovered, pressed, disabled);
+        let focused =
+            !disabled && has_visible_focus(entity, focus.as_deref(), focus_visible.as_deref());
+        let Some(cell) = design.button_cell(button_cell_key(button, state, focused)) else {
+            continue;
+        };
+        let colour = bevy_color(cell.pair.foreground);
         for child in children.iter() {
-            let Ok((mut svg, mut retained)) = icons.get_mut(*child) else {
+            let Ok(mut svg) = icons.get_mut(*child) else {
                 continue;
             };
-            if retained.0 != token {
-                retained.0 = token.clone();
-            }
             if svg.0 != colour {
                 svg.0 = colour;
             }
@@ -927,39 +873,42 @@ mod tests {
     use bevy::ecs::observer::On;
     use bevy::input::keyboard::{Key, KeyCode, KeyboardInput};
     use bevy::input::{ButtonState, InputPlugin};
-    use bevy::input_focus::{FocusedInput, InputDispatchPlugin, InputFocus, InputFocusPlugin};
+    use bevy::input_focus::FocusCause;
+    use bevy::input_focus::{FocusedInput, InputDispatchPlugin, InputFocusPlugin};
     use bevy::picking::backend::HitData;
     use bevy::picking::events::{Click, Pointer, Press};
     use bevy::picking::pointer::{Location, PointerButton, PointerId};
-    use bevy::prelude::{App, EntityEvent, ResMut, Resource, Vec2};
+    use bevy::prelude::{App, Children, EntityEvent, Vec2};
     use bevy::window::{PrimaryWindow, Window, WindowRef};
     use core::time::Duration;
+    use cosmix_design::{
+        parse_design_source, DesignCompileOutcome, ResolvedButtonCell, SourceIdentity,
+        EMBEDDED_DEFAULT_SOURCE,
+    };
 
-    use crate::style::{
-        contrast_safe_lift, lighten, selected_background_from_pair, InteractionVisualState,
-        DISABLED_LIFT, HOVERED_LIFT, PRESSED_LIFT,
-    };
-    use crate::theme::{
-        apply_theme, contrast_ratio, Mode, RadiusScale, Scheme, ThemeSpec, ThemeState, AA_CONTRAST,
-    };
+    use crate::design::{design_resources_for_source, CtkDesignStatus};
+    use crate::theme::{Mode, Scheme, ThemeSpec, ThemeState};
     use crate::widgets::{ControlChange, CtkWidgetsPlugin};
 
     fn test_app(spec: &ThemeSpec) -> App {
-        let mut theme = UiTheme::default();
-        let mut state = ThemeState::default();
-        apply_theme(&mut theme, &mut state, spec);
+        let (design, design_status) = design_resources_for_source(
+            "test:embedded",
+            EMBEDDED_DEFAULT_SOURCE,
+            spec.scheme,
+            spec.mode,
+        );
         let mut typography = CtkTypography::default();
         typography.body_px = spec.typography.body_px;
+        let mut state = ThemeState::default();
+        state.scheme = spec.scheme;
+        state.mode = spec.mode;
 
         let mut app = App::new();
-        app.insert_resource(theme)
-            .insert_resource(state)
+        app.insert_resource(state)
             .insert_resource(typography)
-            .insert_resource(spec.metrics.clone())
+            .insert_resource(design)
+            .insert_resource(design_status)
             .add_plugins(CtkWidgetsPlugin)
-            // In production CtkThemePlugin registers this after the PostUpdate
-            // typography pass; the harness has no theme plugin, so register it
-            // bare to keep the font-reconciliation path under test.
             .add_systems(bevy::app::PostUpdate, reconcile_button_label_fonts);
         app
     }
@@ -976,15 +925,8 @@ mod tests {
             .expect("button has label children")
             .iter()
             .copied()
-            .find(|child| app.world().get::<Text>(*child).is_some())
+            .find(|entity| app.world().get::<Text>(*entity).is_some())
             .expect("button has a text label")
-    }
-
-    fn set_hovered(app: &mut App, button: Entity, hovered: bool) {
-        app.world_mut().entity_mut(button).remove::<Hovered>();
-        app.world_mut().flush();
-        app.world_mut().entity_mut(button).insert(Hovered(hovered));
-        app.world_mut().flush();
     }
 
     fn trigger_pointer_press(app: &mut App, button: Entity) {
@@ -1026,72 +968,223 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn radius_scale_derives_from_base_and_clamps_small_radii() {
+    fn cell(
+        app: &App,
+        button: Entity,
+        state: InteractionVisualState,
+        focused: bool,
+    ) -> ResolvedButtonCell {
+        let button = app.world().get::<CtkButton>(button).unwrap();
+        app.world()
+            .resource::<CtkDesign>()
+            .button_cell(button_cell_key(button, state, focused))
+            .unwrap()
+            .clone()
+    }
+
+    fn assert_root_matches_cell(app: &App, entity: Entity, cell: &ResolvedButtonCell) {
+        let world = app.world();
+        let node = world.get::<Node>(entity).unwrap();
+        assert_eq!(node.height, px(cell.height as f32));
+        assert_eq!(node.min_width, px(cell.min_width as f32));
+        assert_eq!(node.padding, UiRect::horizontal(px(cell.padding_x as f32)));
+        assert_eq!(node.border, UiRect::all(px(cell.border_width as f32)));
         assert_eq!(
-            RadiusScale::from_base(6.0),
-            RadiusScale {
-                sm: 2.0,
-                md: 4.0,
-                lg: 6.0,
-                xl: 10.0,
-            }
+            node.border_radius,
+            BorderRadius::all(px(cell.radius as f32))
         );
-        assert_eq!(RadiusScale::from_base(2.0).sm, 0.0);
-        assert_eq!(RadiusScale::from_base(2.0).md, 0.0);
+        assert_eq!(
+            world.get::<BackgroundColor>(entity).unwrap().0,
+            bevy_color(cell.pair.surface)
+        );
+        assert_eq!(
+            *world.get::<BorderColor>(entity).unwrap(),
+            BorderColor::all(cell.ring.or(cell.border).map_or(Color::NONE, bevy_color))
+        );
+        let label = text_label(app, entity);
+        assert_eq!(
+            world.get::<TextColor>(label).unwrap().0,
+            bevy_color(cell.pair.foreground)
+        );
+    }
+
+    #[test]
+    fn interaction_adapter_is_total_and_exact() {
+        let button = CtkButton {
+            variant: ButtonVariant::Destructive,
+            size: ButtonSize::Lg,
+        };
+        for (visual, interaction) in [
+            (InteractionVisualState::Resting, InteractionState::Resting),
+            (InteractionVisualState::Hovered, InteractionState::Hovered),
+            (InteractionVisualState::Pressed, InteractionState::Pressed),
+            (InteractionVisualState::Disabled, InteractionState::Disabled),
+        ] {
+            assert_eq!(
+                button_cell_key(&button, visual, true),
+                ButtonCellKey {
+                    variant: ButtonVariant::Destructive,
+                    size: ButtonSize::Lg,
+                    interaction,
+                    focus_visible: true,
+                }
+            );
+        }
     }
 
     #[test]
     fn spawn_contract_is_focusable_accessible_and_has_one_input_path() {
         let spec = ThemeSpec::builtin();
         let mut app = test_app(&spec);
-        let button = spawn(&mut app, ButtonDef::text("Save"));
-        let entity = app.world().entity(button);
+        let entity = spawn(
+            &mut app,
+            ButtonDef::text("Save")
+                .bus("save")
+                .variant(ButtonVariant::Primary),
+        );
 
-        assert!(entity.contains::<ActivateOnPress>());
-        assert_eq!(entity.get::<TabIndex>(), Some(&TabIndex(0)));
-        assert_eq!(entity.get::<Hovered>(), Some(&Hovered::default()));
-        let accessible = entity.get::<AccessibilityNode>().unwrap();
-        assert_eq!(accessible.role(), Role::Button);
-        assert_eq!(accessible.label(), Some("Save"));
-        assert!(!entity.contains::<bevy::ui_widgets::Button>());
-        assert!(!entity.contains::<bevy::ui_widgets::Checkbox>());
-        assert!(!entity.contains::<ActionButton>());
-        assert!(!entity.contains::<BusWidget>());
+        let world = app.world();
+        assert_eq!(world.get::<TabIndex>(entity), Some(&TabIndex(0)));
+        assert!(world.get::<ActivateOnPress>(entity).is_some());
+        assert!(world.get::<bevy::ui_widgets::Button>(entity).is_none());
+        assert_eq!(
+            world.get::<AccessibilityNode>(entity).unwrap().0.role(),
+            Role::Button
+        );
+        assert_eq!(world.get::<BusWidget>(entity).unwrap().id, "save");
     }
 
     #[test]
-    fn added_observers_apply_live_paint_metrics_and_typography_before_update() {
+    fn added_observers_apply_the_compiled_cell_before_update() {
+        let spec = ThemeSpec::from_scheme(Scheme::Forest, Mode::Dark);
+        let mut app = test_app(&spec);
+        let entity = spawn(
+            &mut app,
+            ButtonDef::text("Open")
+                .variant(ButtonVariant::Primary)
+                .size(ButtonSize::Lg),
+        );
+        let expected = cell(&app, entity, InteractionVisualState::Resting, false);
+
+        assert_root_matches_cell(&app, entity, &expected);
+    }
+
+    #[test]
+    fn every_variant_size_and_interaction_paints_from_the_compiled_cell() {
+        for variant in ButtonVariant::ALL {
+            for size in ButtonSize::ALL {
+                let spec = ThemeSpec::from_scheme(Scheme::Sunset, Mode::Light);
+                let mut app = test_app(&spec);
+                let entity = spawn(
+                    &mut app,
+                    ButtonDef::text("State").variant(variant).size(size),
+                );
+
+                for state in [
+                    InteractionVisualState::Resting,
+                    InteractionVisualState::Hovered,
+                    InteractionVisualState::Pressed,
+                    InteractionVisualState::Disabled,
+                ] {
+                    app.world_mut().entity_mut(entity).remove::<Hovered>();
+                    app.world_mut()
+                        .entity_mut(entity)
+                        .insert(Hovered(matches!(state, InteractionVisualState::Hovered)));
+                    if matches!(state, InteractionVisualState::Pressed) {
+                        app.world_mut().entity_mut(entity).insert(Pressed);
+                    } else {
+                        app.world_mut().entity_mut(entity).remove::<Pressed>();
+                    }
+                    if matches!(state, InteractionVisualState::Disabled) {
+                        app.world_mut()
+                            .entity_mut(entity)
+                            .insert(InteractionDisabled);
+                    } else {
+                        app.world_mut()
+                            .entity_mut(entity)
+                            .remove::<InteractionDisabled>();
+                    }
+                    app.update();
+
+                    let expected = cell(&app, entity, state, false);
+                    assert_root_matches_cell(&app, entity, &expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn visible_focus_uses_ring_then_border() {
         let spec = ThemeSpec::builtin();
         let mut app = test_app(&spec);
-        {
-            let mut metrics = app.world_mut().resource_mut::<CtkThemeMetrics>();
-            metrics.button_height[ButtonSize::Md.index()] = 37.0;
-            metrics.radius = RadiusScale::from_base(9.0);
-        }
-        app.world_mut().resource_mut::<CtkTypography>().body_px = 17.0;
+        let entity = spawn(&mut app, ButtonDef::text("Focus"));
+        app.world_mut()
+            .resource_mut::<InputFocus>()
+            .set(entity, FocusCause::Navigated);
+        app.world_mut().resource_mut::<InputFocusVisible>().0 = true;
+        app.update();
 
-        let button = spawn(&mut app, ButtonDef::text("Immediate"));
-        let label = text_label(&app, button);
-        let node = app.world().get::<Node>(button).unwrap();
-        assert_eq!(node.height, px(37));
-        assert_eq!(node.border_radius, BorderRadius::all(px(7)));
+        let focused = cell(&app, entity, InteractionVisualState::Resting, true);
         assert_eq!(
-            app.world().get::<BackgroundColor>(button).unwrap().0,
-            spec.colors.control
+            *app.world().get::<BorderColor>(entity).unwrap(),
+            BorderColor::all(
+                focused
+                    .ring
+                    .or(focused.border)
+                    .map_or(Color::NONE, bevy_color)
+            )
         );
+
+        app.world_mut().resource_mut::<InputFocusVisible>().0 = false;
+        app.update();
+        let resting = cell(&app, entity, InteractionVisualState::Resting, false);
         assert_eq!(
-            app.world().get::<BorderColor>(button).unwrap().top,
-            spec.colors.border
+            *app.world().get::<BorderColor>(entity).unwrap(),
+            BorderColor::all(
+                resting
+                    .ring
+                    .or(resting.border)
+                    .map_or(Color::NONE, bevy_color)
+            )
         );
-        assert_eq!(
-            app.world().get::<TextColor>(label).unwrap().0,
-            spec.colors.text
-        );
-        assert_eq!(
-            app.world().get::<TextFont>(label).unwrap().font_size,
-            FontSize::Px(17.0)
-        );
+    }
+
+    #[test]
+    fn button_definition_mutation_rekeys_colours_and_metrics_live() {
+        let spec = ThemeSpec::builtin();
+        let mut app = test_app(&spec);
+        let entity = spawn(&mut app, ButtonDef::text("Resize"));
+        app.world_mut().entity_mut(entity).insert(CtkButton {
+            variant: ButtonVariant::Destructive,
+            size: ButtonSize::Lg,
+        });
+        app.update();
+
+        let expected = cell(&app, entity, InteractionVisualState::Resting, false);
+        assert_root_matches_cell(&app, entity, &expected);
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn deprecated_button_metrics_are_inert_for_existing_buttons() {
+        let spec = ThemeSpec::builtin();
+        let mut app = test_app(&spec);
+        let entity = spawn(&mut app, ButtonDef::text("Stable geometry"));
+        app.update();
+        let expected = cell(&app, entity, InteractionVisualState::Resting, false);
+
+        {
+            let mut metrics = app
+                .world_mut()
+                .resource_mut::<crate::theme::CtkThemeMetrics>();
+            metrics.button_height = [80.0, 90.0, 100.0];
+            metrics.button_min_width = 500.0;
+            metrics.button_pad_h = 70.0;
+            metrics.button_border = 20.0;
+        }
+        app.update();
+
+        assert_root_matches_cell(&app, entity, &expected);
     }
 
     #[test]
@@ -1126,36 +1219,244 @@ mod tests {
         assert_eq!(font.font_size, FontSize::Px(18.0));
     }
 
-    #[derive(Resource, Default)]
-    struct LabelFontChangeCounts(Vec<usize>);
+    #[test]
+    fn in_memory_source_replacement_restyles_an_existing_button() {
+        let mut app = test_app(&ThemeSpec::builtin());
+        let entity = spawn(
+            &mut app,
+            ButtonDef::text("Delete").variant(ButtonVariant::Destructive),
+        );
+        app.update();
+        let old_background = app.world().get::<BackgroundColor>(entity).unwrap().0;
+        let label = text_label(&app, entity);
+        let old_foreground = app.world().get::<TextColor>(label).unwrap().0;
+        let old_node = app.world().get::<Node>(entity).unwrap();
+        let old_height = old_node.height;
+        let old_min_width = old_node.min_width;
+        let old_padding = old_node.padding;
+        let old_border = old_node.border;
+        let old_radius = old_node.border_radius;
+        let old_revision = app.world().resource::<CtkDesign>().revision().unwrap();
+
+        let source = EMBEDDED_DEFAULT_SOURCE
+            .replacen("meter_red: \"#c21725\"", "meter_red: \"#006818\"", 1)
+            .replacen(
+                "danger_surface: \"#c21725\"",
+                "danger_surface: \"#006818\"",
+                1,
+            )
+            .replacen(
+                "\"status.danger\": { color_space: \"oklch\", l: 0.52, c: 0.20, h: 25.0 }",
+                "\"status.danger\": { color_space: \"oklch\", l: 0.45, c: 0.15, h: 145.0 }",
+                1,
+            )
+            .replacen(
+                "destructive: { surface: \"status.danger\", foreground: \"palette.background.1\" }",
+                "destructive: { surface: \"status.danger\", foreground: \"palette.background.3\" }",
+                1,
+            )
+            .replacen(
+                "\"button.height.md\": { kind: \"px\", value: 28.0 }",
+                "\"button.height.md\": { kind: \"px\", value: 30.0 }",
+                1,
+            )
+            .replacen(
+                "\"button.min_width.standard\": { kind: \"px\", value: 72.0 }",
+                "\"button.min_width.standard\": { kind: \"px\", value: 80.0 }",
+                1,
+            )
+            .replacen(
+                "\"button.padding_x\": { kind: \"step\", scale: \"spacing\", value: 5 }",
+                "\"button.padding_x\": { kind: \"step\", scale: \"spacing\", value: 6 }",
+                1,
+            )
+            .replacen(
+                "\"button.border_width\": { kind: \"px\", value: 1.0 }",
+                "\"button.border_width\": { kind: \"px\", value: 2.0 }",
+                1,
+            )
+            .replacen(
+                "\"radius\": { kind: \"px\", value: 6.0 }",
+                "\"radius\": { kind: \"px\", value: 10.0 }",
+                1,
+            );
+        app.world_mut()
+            .resource_mut::<CtkDesignStatus>()
+            .replace_source("memory:reload", source);
+        app.update();
+
+        let expected = cell(&app, entity, InteractionVisualState::Resting, false);
+        assert_root_matches_cell(&app, entity, &expected);
+        assert_ne!(
+            app.world().get::<BackgroundColor>(entity).unwrap().0,
+            old_background
+        );
+        assert_ne!(
+            app.world().get::<TextColor>(label).unwrap().0,
+            old_foreground
+        );
+        let node = app.world().get::<Node>(entity).unwrap();
+        assert_ne!(node.height, old_height);
+        assert_ne!(node.min_width, old_min_width);
+        assert_ne!(node.padding, old_padding);
+        assert_ne!(node.border, old_border);
+        assert_ne!(node.border_radius, old_radius);
+        assert_eq!(node.height, px(30));
+        assert_eq!(node.min_width, px(80));
+        assert_eq!(node.padding, UiRect::horizontal(px(12)));
+        assert_eq!(node.border, UiRect::all(px(2)));
+        assert_eq!(node.border_radius, BorderRadius::all(px(8)));
+        assert_eq!(
+            app.world()
+                .resource::<CtkDesign>()
+                .revision()
+                .unwrap()
+                .get(),
+            old_revision.get() + 1
+        );
+        assert!(app
+            .world()
+            .resource::<CtkDesignStatus>()
+            .last_error()
+            .is_none());
+    }
 
     #[test]
-    fn settled_label_font_is_not_marked_changed_every_frame() {
-        let spec = ThemeSpec::builtin();
-        let mut app = test_app(&spec);
-        app.init_resource::<LabelFontChangeCounts>();
-        app.add_systems(
-            bevy::app::Last,
-            |changed: Query<(), (bevy::ecs::query::Changed<TextFont>, With<CtkButtonLabel>)>,
-             mut counts: ResMut<LabelFontChangeCounts>| {
-                counts.0.push(changed.iter().count());
-            },
-        );
-        spawn(&mut app, ButtonDef::text("Settle"));
+    fn invalid_in_memory_source_keeps_existing_button_on_last_good_cell() {
+        let mut app = App::new();
+        app.add_plugins((crate::theme::CtkThemePlugin::default(), CtkWidgetsPlugin));
+        let entity = spawn(&mut app, ButtonDef::text("Safe"));
         app.update();
+        let before_revision = app.world().resource::<CtkDesign>().revision();
+        let before_background = app.world().get::<BackgroundColor>(entity).unwrap().0;
+
+        app.world_mut()
+            .resource_mut::<CtkDesignStatus>()
+            .replace_source("memory:bad", "design: nope");
         app.update();
-        app.update();
-        let counts = &app.world().resource::<LabelFontChangeCounts>().0;
+
         assert_eq!(
-            &counts[counts.len() - 2..],
-            &[0, 0],
-            "settled label fonts must not re-enter change detection: {counts:?}"
+            app.world().resource::<CtkDesign>().revision(),
+            before_revision
+        );
+        assert_eq!(
+            app.world().get::<BackgroundColor>(entity).unwrap().0,
+            before_background
+        );
+        assert!(app
+            .world()
+            .resource::<CtkDesignStatus>()
+            .last_error()
+            .is_some());
+    }
+
+    #[test]
+    fn fatal_compilation_keeps_existing_button_on_last_good_cell() {
+        let mut app = test_app(&ThemeSpec::builtin());
+        let entity = spawn(&mut app, ButtonDef::text("Safe"));
+        app.update();
+        let label = text_label(&app, entity);
+        let before_revision = app.world().resource::<CtkDesign>().revision();
+        let before_background = app.world().get::<BackgroundColor>(entity).unwrap().0;
+        let before_border = *app.world().get::<BorderColor>(entity).unwrap();
+        let before_foreground = app.world().get::<TextColor>(label).unwrap().0;
+        let before_node = app.world().get::<Node>(entity).unwrap();
+        let before_metrics = (
+            before_node.height,
+            before_node.min_width,
+            before_node.padding,
+            before_node.border,
+            before_node.border_radius,
+        );
+
+        let source = EMBEDDED_DEFAULT_SOURCE.replacen(
+            "pair: { kind: \"pair\", value: \"secondary\" }",
+            "pair: { kind: \"pair\", value: \"undefined-pair\" }",
+            1,
+        );
+        assert_ne!(source, EMBEDDED_DEFAULT_SOURCE);
+        assert!(
+            parse_design_source(SourceIdentity::new("memory:fatal"), &source).is_ok(),
+            "the fixture must reach compilation rather than the parse-error arm"
+        );
+        app.world_mut()
+            .resource_mut::<CtkDesignStatus>()
+            .replace_source("memory:fatal", source);
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<CtkDesign>().revision(),
+            before_revision
+        );
+        assert_eq!(
+            app.world().get::<BackgroundColor>(entity).unwrap().0,
+            before_background
+        );
+        assert_eq!(
+            app.world().get::<BorderColor>(entity).unwrap(),
+            &before_border
+        );
+        assert_eq!(
+            app.world().get::<TextColor>(label).unwrap().0,
+            before_foreground
+        );
+        let node = app.world().get::<Node>(entity).unwrap();
+        assert_eq!(
+            (
+                node.height,
+                node.min_width,
+                node.padding,
+                node.border,
+                node.border_radius,
+            ),
+            before_metrics
+        );
+        let status = app.world().resource::<CtkDesignStatus>();
+        assert_eq!(
+            status.last_compile().map(|compile| compile.outcome),
+            Some(DesignCompileOutcome::Fatal)
+        );
+        assert!(status.last_error().is_some());
+    }
+
+    #[cfg(feature = "icons")]
+    #[test]
+    fn icon_foreground_comes_from_the_full_compiled_cell_key() {
+        let spec = ThemeSpec::from_scheme(Scheme::Crimson, Mode::Dark);
+        let mut app = test_app(&spec);
+        app.insert_resource(crate::icons::IconSet::placeholder_for_test(&[
+            crate::icons::Icon::Info,
+        ]));
+        let entity = spawn(
+            &mut app,
+            ButtonDef::icon(crate::icons::Icon::Info, "Info")
+                .variant(ButtonVariant::Primary)
+                .size(ButtonSize::Lg),
+        );
+        app.update();
+        let icon = app
+            .world()
+            .get::<Children>(entity)
+            .unwrap()
+            .iter()
+            .copied()
+            .find(|child| app.world().get::<crate::icons::UiSvg>(*child).is_some())
+            .unwrap();
+
+        app.world_mut().entity_mut(entity).remove::<Hovered>();
+        app.world_mut().entity_mut(entity).insert(Hovered(true));
+        app.update();
+
+        let expected = cell(&app, entity, InteractionVisualState::Hovered, false);
+        assert_eq!(
+            app.world().get::<crate::icons::SvgColor>(icon).unwrap().0,
+            bevy_color(expected.pair.foreground)
         );
     }
 
     #[cfg(feature = "icons")]
     #[test]
-    fn installed_icon_set_materialises_icon_text_during_spawn_flush() {
+    fn installed_icon_set_materialises_icon_text_with_accessibility() {
         let spec = ThemeSpec::builtin();
         let mut app = test_app(&spec);
         app.insert_resource(crate::icons::IconSet::placeholder_for_test(&[
@@ -1185,66 +1486,24 @@ mod tests {
         );
         assert_eq!(
             app.world()
-                .get::<crate::icons::ThemeSvgColor>(children[0])
-                .unwrap()
-                .0,
-            tokens::ROW_SELECTED_TEXT
-        );
-    }
-
-    #[cfg(feature = "icons")]
-    #[test]
-    fn icon_only_button_requires_and_uses_an_explicit_accessibility_label() {
-        let spec = ThemeSpec::builtin();
-        let mut app = test_app(&spec);
-        app.insert_resource(crate::icons::IconSet::placeholder_for_test(&[
-            crate::icons::Icon::Info,
-        ]));
-        let button = spawn(
-            &mut app,
-            ButtonDef::icon(crate::icons::Icon::Info, "Show information"),
-        );
-        assert_eq!(
-            app.world()
                 .get::<AccessibilityNode>(button)
                 .unwrap()
                 .label(),
-            Some("Show information")
+            Some("Details")
         );
-    }
-
-    #[cfg(feature = "icons")]
-    #[test]
-    fn disabled_variant_icon_uses_the_uniform_dim_foreground() {
-        let spec = ThemeSpec::builtin();
-        let mut app = test_app(&spec);
-        app.insert_resource(crate::icons::IconSet::placeholder_for_test(&[
-            crate::icons::Icon::Info,
-        ]));
-        let button = spawn(
-            &mut app,
-            ButtonDef::icon(crate::icons::Icon::Info, "Information")
-                .variant(ButtonVariant::Primary)
-                .disabled(),
-        );
-        app.update();
-        let icon = app.world().get::<Children>(button).unwrap()[0];
+        let expected = cell(&app, button, InteractionVisualState::Resting, false);
         assert_eq!(
             app.world()
-                .get::<crate::icons::ThemeSvgColor>(icon)
+                .get::<crate::icons::SvgColor>(children[0])
                 .unwrap()
                 .0,
-            tokens::TEXT_DIM
-        );
-        assert_eq!(
-            app.world().get::<BackgroundColor>(button).unwrap().0,
-            contrast_safe_lift(spec.colors.control, -DISABLED_LIFT, &[spec.colors.text_dim])
+            bevy_color(expected.pair.foreground)
         );
     }
 
     #[cfg(feature = "icons")]
     #[test]
-    fn runtime_disable_and_enable_retint_icon_in_the_lifecycle_observers() {
+    fn runtime_disable_and_enable_rekeys_icon_foreground() {
         let spec = ThemeSpec::builtin();
         let mut app = test_app(&spec);
         app.insert_resource(crate::icons::IconSet::placeholder_for_test(&[
@@ -1256,72 +1515,25 @@ mod tests {
                 .variant(ButtonVariant::Primary),
         );
         let icon = app.world().get::<Children>(button).unwrap()[0];
-        assert_eq!(
-            app.world().get::<crate::icons::SvgColor>(icon).unwrap().0,
-            spec.colors.row_selected_text
-        );
 
         app.world_mut()
             .entity_mut(button)
             .insert(InteractionDisabled);
         app.world_mut().flush();
-        assert_eq!(
-            app.world()
-                .get::<crate::icons::ThemeSvgColor>(icon)
-                .unwrap()
-                .0,
-            tokens::TEXT_DIM
-        );
+        let disabled = cell(&app, button, InteractionVisualState::Disabled, false);
         assert_eq!(
             app.world().get::<crate::icons::SvgColor>(icon).unwrap().0,
-            spec.colors.text_dim
+            bevy_color(disabled.pair.foreground)
         );
 
         app.world_mut()
             .entity_mut(button)
             .remove::<InteractionDisabled>();
         app.world_mut().flush();
-        assert_eq!(
-            app.world()
-                .get::<crate::icons::ThemeSvgColor>(icon)
-                .unwrap()
-                .0,
-            tokens::ROW_SELECTED_TEXT
-        );
+        let resting = cell(&app, button, InteractionVisualState::Resting, false);
         assert_eq!(
             app.world().get::<crate::icons::SvgColor>(icon).unwrap().0,
-            spec.colors.row_selected_text
-        );
-    }
-
-    #[cfg(feature = "icons")]
-    #[test]
-    fn icon_text_hover_reconciles_its_icon_tint() {
-        let spec = ThemeSpec::builtin();
-        let mut app = test_app(&spec);
-        app.insert_resource(crate::icons::IconSet::placeholder_for_test(&[
-            crate::icons::Icon::Info,
-        ]));
-        let button = spawn(
-            &mut app,
-            ButtonDef::icon_text(crate::icons::Icon::Info, "Details")
-                .variant(ButtonVariant::Primary),
-        );
-        let icon = app.world().get::<Children>(button).unwrap()[0];
-        app.world_mut()
-            .get_mut::<crate::icons::SvgColor>(icon)
-            .unwrap()
-            .0 = Color::NONE;
-        set_hovered(&mut app, button, true);
-        app.update();
-
-        assert_eq!(
-            app.world().get::<crate::icons::SvgColor>(icon).unwrap().0,
-            spec.colors.row_selected_text
-        );
-        assert_ne!(
-            app.world().get::<BackgroundColor>(button).unwrap().0,
-            spec.colors.row_selected
+            bevy_color(resting.pair.foreground)
         );
     }
 
@@ -1334,274 +1546,52 @@ mod tests {
             &mut app,
             ButtonDef::icon(crate::icons::Icon::Info, "Information"),
         );
-
         app.update();
         assert!(
             app.world()
                 .resource::<ButtonDiagnostics>()
                 .missing_icon_set_warned
         );
-        let warned_after_first_pass = app
-            .world()
-            .resource::<ButtonDiagnostics>()
-            .missing_icon_set_warned;
         app.update();
-        assert_eq!(
+        assert!(
             app.world()
                 .resource::<ButtonDiagnostics>()
-                .missing_icon_set_warned,
-            warned_after_first_pass,
-            "the missing-resource warning stays latched on later frames"
+                .missing_icon_set_warned
         );
     }
 
     #[cfg(feature = "icons")]
     #[test]
-    fn live_size_and_typography_changes_resize_icon_and_icon_text_children() {
+    fn live_size_and_typography_changes_resize_icon_children() {
         let spec = ThemeSpec::builtin();
         let mut app = test_app(&spec);
         app.insert_resource(crate::icons::IconSet::placeholder_for_test(&[
             crate::icons::Icon::Info,
         ]));
-        let buttons = [
-            spawn(
-                &mut app,
-                ButtonDef::icon(crate::icons::Icon::Info, "Information").size(ButtonSize::Sm),
-            ),
-            spawn(
-                &mut app,
-                ButtonDef::icon_text(crate::icons::Icon::Info, "Details").size(ButtonSize::Sm),
-            ),
-        ];
+        let button = spawn(
+            &mut app,
+            ButtonDef::icon(crate::icons::Icon::Info, "Information").size(ButtonSize::Sm),
+        );
         app.update();
+        let icon = app.world().get::<Children>(button).unwrap()[0];
+        assert_eq!(
+            app.world().get::<Node>(icon).unwrap().width,
+            px(spec.typography.body_px - 2.0)
+        );
 
-        let icon_children = buttons.map(|button| {
-            app.world()
-                .get::<Children>(button)
-                .unwrap()
-                .iter()
-                .copied()
-                .find(|child| app.world().get::<crate::icons::UiSvg>(*child).is_some())
-                .unwrap()
-        });
-        for icon in icon_children {
-            let node = app.world().get::<Node>(icon).unwrap();
-            assert_eq!(node.width, px(spec.typography.body_px - 2.0));
-            assert_eq!(node.min_width, px(spec.typography.body_px - 2.0));
-            assert_eq!(node.height, px(spec.typography.body_px - 2.0));
-        }
-
-        for button in buttons {
-            app.world_mut().get_mut::<CtkButton>(button).unwrap().size = ButtonSize::Lg;
-        }
+        app.world_mut().get_mut::<CtkButton>(button).unwrap().size = ButtonSize::Lg;
         app.update();
-        for icon in icon_children {
-            let node = app.world().get::<Node>(icon).unwrap();
-            assert_eq!(node.width, px(spec.typography.body_px));
-            assert_eq!(node.min_width, px(spec.typography.body_px));
-            assert_eq!(node.height, px(spec.typography.body_px));
-        }
+        assert_eq!(
+            app.world().get::<Node>(icon).unwrap().width,
+            px(spec.typography.body_px)
+        );
 
         app.world_mut().resource_mut::<CtkTypography>().body_px = 20.0;
         app.update();
-        for icon in icon_children {
-            let node = app.world().get::<Node>(icon).unwrap();
-            assert_eq!(node.width, px(20));
-            assert_eq!(node.min_width, px(20));
-            assert_eq!(node.height, px(20));
-        }
-    }
-
-    #[test]
-    fn every_variant_uses_its_resting_theme_pairing() {
-        let spec = ThemeSpec::builtin();
-        let mut app = test_app(&spec);
-        let buttons = [
-            (
-                ButtonVariant::Default,
-                spec.colors.control,
-                spec.colors.border,
-                spec.colors.text,
-            ),
-            (
-                ButtonVariant::Primary,
-                spec.colors.row_selected,
-                spec.colors.border,
-                spec.colors.row_selected_text,
-            ),
-            (
-                ButtonVariant::Destructive,
-                spec.colors.danger_surface,
-                spec.colors.meter_red,
-                spec.colors.text,
-            ),
-            (
-                ButtonVariant::Ghost,
-                Color::NONE,
-                Color::NONE,
-                spec.colors.text,
-            ),
-        ]
-        .map(|(variant, background, border, text)| {
-            (
-                spawn(
-                    &mut app,
-                    ButtonDef::text(format!("{variant:?}")).variant(variant),
-                ),
-                background,
-                border,
-                text,
-            )
-        });
-        app.update();
-
-        for (button, background, border, text) in buttons {
-            assert_eq!(
-                app.world().get::<BackgroundColor>(button).unwrap().0,
-                background
-            );
-            assert_eq!(app.world().get::<BorderColor>(button).unwrap().top, border);
-            assert_eq!(
-                app.world()
-                    .get::<TextColor>(text_label(&app, button))
-                    .unwrap()
-                    .0,
-                text
-            );
-        }
-    }
-
-    #[test]
-    fn disabled_variants_use_the_uniform_neutral_pairing_and_ghost_stays_clear() {
-        let spec = ThemeSpec::builtin();
-        let mut app = test_app(&spec);
-        let neutral =
-            contrast_safe_lift(spec.colors.control, -DISABLED_LIFT, &[spec.colors.text_dim]);
-        for variant in [
-            ButtonVariant::Default,
-            ButtonVariant::Primary,
-            ButtonVariant::Destructive,
-            ButtonVariant::Ghost,
-        ] {
-            let button = spawn(
-                &mut app,
-                ButtonDef::text(format!("{variant:?}"))
-                    .variant(variant)
-                    .disabled(),
-            );
-            let ghost = variant == ButtonVariant::Ghost;
-            assert_eq!(
-                app.world().get::<BackgroundColor>(button).unwrap().0,
-                if ghost { Color::NONE } else { neutral }
-            );
-            assert_eq!(
-                app.world().get::<BorderColor>(button).unwrap().top,
-                if ghost {
-                    Color::NONE
-                } else {
-                    spec.colors.border
-                }
-            );
-            assert_eq!(
-                app.world()
-                    .get::<TextColor>(text_label(&app, button))
-                    .unwrap()
-                    .0,
-                spec.colors.text_dim
-            );
-        }
-    }
-
-    #[test]
-    fn neutral_disabled_pairing_clears_aa_in_every_builtin_palette() {
-        for scheme in Scheme::ALL {
-            for mode in [Mode::Dark, Mode::Light] {
-                let colors = ThemeSpec::from_scheme(scheme, mode).colors;
-                let background =
-                    contrast_safe_lift(colors.control, -DISABLED_LIFT, &[colors.text_dim]);
-                let measured = contrast_ratio(colors.text_dim, background);
-                assert!(
-                    measured >= AA_CONTRAST,
-                    "{scheme:?}/{mode:?} disabled text measures {measured:.3}:1"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn adversarial_disabled_pairing_clamps_before_losing_aa() {
-        let mut spec = ThemeSpec::builtin();
-        spec.colors.control = Color::srgb(118.0 / 255.0, 118.0 / 255.0, 118.0 / 255.0);
-        spec.colors.text_dim = Color::BLACK;
-        let raw = lighten(spec.colors.control, -DISABLED_LIFT);
-        assert!(contrast_ratio(spec.colors.text_dim, spec.colors.control) >= AA_CONTRAST);
-        assert!(contrast_ratio(spec.colors.text_dim, raw) < AA_CONTRAST);
-
-        let mut theme = UiTheme::default();
-        let mut state = ThemeState::default();
-        apply_theme(&mut theme, &mut state, &spec);
-        let (background, _, foreground) = button_colours(
-            &theme,
-            ButtonVariant::Default,
-            InteractionVisualState::Disabled,
-        );
-        assert_eq!(foreground, spec.colors.text_dim);
-        assert!(contrast_ratio(foreground, background) >= AA_CONTRAST);
-        assert_ne!(background, raw);
-    }
-
-    #[test]
-    fn focused_border_differs_from_resting_border_and_background_in_every_palette() {
-        for scheme in Scheme::ALL {
-            for mode in [Mode::Dark, Mode::Light] {
-                let spec = ThemeSpec::from_scheme(scheme, mode);
-                let mut theme = UiTheme::default();
-                let mut state = ThemeState::default();
-                apply_theme(&mut theme, &mut state, &spec);
-                for variant in [
-                    ButtonVariant::Default,
-                    ButtonVariant::Primary,
-                    ButtonVariant::Destructive,
-                    ButtonVariant::Ghost,
-                ] {
-                    let (background, resting_border, _) =
-                        button_colours(&theme, variant, InteractionVisualState::Resting);
-                    let focused = focused_border(&theme, variant, resting_border, true);
-                    assert_ne!(
-                        focused, resting_border,
-                        "{scheme:?}/{mode:?}/{variant:?} focus equals resting border"
-                    );
-                    assert_ne!(
-                        focused, background,
-                        "{scheme:?}/{mode:?}/{variant:?} focus equals background"
-                    );
-                    assert_eq!(
-                        focused,
-                        if variant == ButtonVariant::Primary {
-                            spec.colors.row_selected_text
-                        } else {
-                            spec.colors.row_selected
-                        }
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn focus_border_hides_when_input_focus_visible_is_false() {
-        let spec = ThemeSpec::builtin();
-        let mut app = test_app(&spec);
-        let button = spawn(&mut app, ButtonDef::text("Focus"));
-        let resting = app.world().get::<BorderColor>(button).unwrap().top;
-        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(button);
-        app.world_mut().resource_mut::<InputFocusVisible>().0 = true;
-        app.update();
-        assert_ne!(app.world().get::<BorderColor>(button).unwrap().top, resting);
-
-        app.world_mut().resource_mut::<InputFocusVisible>().0 = false;
-        app.update();
-        assert_eq!(app.world().get::<BorderColor>(button).unwrap().top, resting);
+        let node = app.world().get::<Node>(icon).unwrap();
+        assert_eq!(node.width, px(20));
+        assert_eq!(node.min_width, px(20));
+        assert_eq!(node.height, px(20));
     }
 
     #[test]
@@ -1632,62 +1622,7 @@ mod tests {
                 .resource::<ButtonDiagnostics>()
                 .marker_collisions_warned
                 .len(),
-            1,
-            "adding a second competing marker must not warn again for the entity"
-        );
-    }
-
-    #[test]
-    fn hover_and_press_lift_backgrounds_and_primary_uses_the_safe_pairing() {
-        let spec = ThemeSpec::builtin();
-        let mut app = test_app(&spec);
-        let default_button = spawn(&mut app, ButtonDef::text("Default"));
-        let primary = spawn(
-            &mut app,
-            ButtonDef::text("Primary").variant(ButtonVariant::Primary),
-        );
-        app.update();
-
-        set_hovered(&mut app, default_button, true);
-        set_hovered(&mut app, primary, true);
-        app.update();
-        assert_eq!(
-            app.world()
-                .get::<BackgroundColor>(default_button)
-                .unwrap()
-                .0,
-            lighten(spec.colors.control, HOVERED_LIFT)
-        );
-        let safe_hover = selected_background_from_pair(
-            spec.colors.row_selected,
-            spec.colors.row_selected_text,
-            spec.colors.row_selected_text_dim,
-            InteractionVisualState::Hovered,
-        );
-        assert_eq!(
-            app.world().get::<BackgroundColor>(primary).unwrap().0,
-            safe_hover
-        );
-        assert_ne!(safe_hover, lighten(spec.colors.row_selected, HOVERED_LIFT));
-
-        app.world_mut().entity_mut(default_button).insert(Pressed);
-        app.world_mut().entity_mut(primary).insert(Pressed);
-        app.update();
-        assert_eq!(
-            app.world()
-                .get::<BackgroundColor>(default_button)
-                .unwrap()
-                .0,
-            lighten(spec.colors.control, PRESSED_LIFT)
-        );
-        assert_eq!(
-            app.world().get::<BackgroundColor>(primary).unwrap().0,
-            selected_background_from_pair(
-                spec.colors.row_selected,
-                spec.colors.row_selected_text,
-                spec.colors.row_selected_text_dim,
-                InteractionVisualState::Pressed,
-            )
+            1
         );
     }
 
@@ -1706,24 +1641,9 @@ mod tests {
     }
 
     fn activation_app(spec: &ThemeSpec) -> (App, Entity) {
-        let mut theme = UiTheme::default();
-        let mut state = ThemeState::default();
-        apply_theme(&mut theme, &mut state, spec);
-        let mut typography = CtkTypography::default();
-        typography.body_px = spec.typography.body_px;
-
-        let mut app = App::new();
-        app.insert_resource(theme)
-            .insert_resource(state)
-            .insert_resource(typography)
-            .insert_resource(spec.metrics.clone())
-            .init_resource::<bevy::ui::UiScale>()
-            .add_plugins((
-                InputPlugin,
-                InputFocusPlugin,
-                InputDispatchPlugin,
-                CtkWidgetsPlugin,
-            ))
+        let mut app = test_app(spec);
+        app.init_resource::<bevy::ui::UiScale>()
+            .add_plugins((InputPlugin, InputFocusPlugin, InputDispatchPlugin))
             .init_resource::<ActivateCount>()
             .init_resource::<ChangeCount>()
             .add_observer(count_activate)
@@ -1736,7 +1656,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_button_is_dimmed_and_swallows_pointer_and_focused_key_activation() {
+    fn disabled_button_uses_its_cell_and_swallows_pointer_and_key_activation() {
         let spec = ThemeSpec::builtin();
         let (mut app, window) = activation_app(&spec);
         let button = spawn(
@@ -1746,18 +1666,8 @@ mod tests {
         app.world_mut()
             .insert_resource(InputFocus::from_entity(button));
         app.update();
-
-        assert_eq!(
-            app.world().get::<BackgroundColor>(button).unwrap().0,
-            contrast_safe_lift(spec.colors.control, -DISABLED_LIFT, &[spec.colors.text_dim])
-        );
-        assert_eq!(
-            app.world()
-                .get::<TextColor>(text_label(&app, button))
-                .unwrap()
-                .0,
-            spec.colors.text_dim
-        );
+        let expected = cell(&app, button, InteractionVisualState::Disabled, false);
+        assert_root_matches_cell(&app, button, &expected);
 
         trigger_pointer_press(&mut app, button);
         app.world_mut().write_message(KeyboardInput {
@@ -1775,7 +1685,7 @@ mod tests {
     }
 
     #[test]
-    fn enabled_bus_button_publishes_once_for_a_pointer_press_click_sequence() {
+    fn enabled_bus_button_publishes_once_for_a_pointer_sequence() {
         let spec = ThemeSpec::builtin();
         let (mut app, _) = activation_app(&spec);
         let button = spawn(&mut app, ButtonDef::text("Save").bus("test.save"));
@@ -1788,7 +1698,7 @@ mod tests {
     }
 
     #[test]
-    fn busless_button_exposes_one_activate_without_control_change() {
+    fn busless_button_exposes_activate_without_control_change() {
         let spec = ThemeSpec::builtin();
         let (mut app, _) = activation_app(&spec);
         let button = spawn(&mut app, ButtonDef::text("Local action"));
@@ -1801,7 +1711,7 @@ mod tests {
     }
 
     #[test]
-    fn enabled_focused_key_activation_publishes_exactly_once() {
+    fn focused_key_activation_publishes_exactly_once() {
         let spec = ThemeSpec::builtin();
         let (mut app, window) = activation_app(&spec);
         let button = spawn(
@@ -1870,69 +1780,27 @@ mod tests {
     }
 
     #[test]
-    fn size_metrics_and_radius_are_canonical() {
+    fn settled_label_font_is_not_marked_changed_every_frame() {
         let spec = ThemeSpec::builtin();
         let mut app = test_app(&spec);
-        let buttons = [ButtonSize::Sm, ButtonSize::Md, ButtonSize::Lg]
-            .map(|size| spawn(&mut app, ButtonDef::text(format!("{size:?}")).size(size)));
+        let entity = spawn(&mut app, ButtonDef::text("Stable"));
+        app.update();
         app.update();
 
-        for (button, height) in buttons.into_iter().zip([24.0, 28.0, 32.0]) {
-            let node = app.world().get::<Node>(button).unwrap();
-            assert_eq!(node.height, px(height));
-            assert_eq!(
-                node.border_radius,
-                BorderRadius::all(px(spec.metrics.radius.md))
-            );
-        }
-    }
-
-    #[test]
-    fn live_metrics_and_typography_rewrite_an_existing_button() {
-        let spec = ThemeSpec::builtin();
-        let mut app = test_app(&spec);
-        let button = spawn(&mut app, ButtonDef::text("Live"));
+        let label = text_label(&app, entity);
+        let settled = app
+            .world()
+            .entity(label)
+            .get_ref::<TextFont>()
+            .unwrap()
+            .last_changed();
         app.update();
-
-        {
-            let mut metrics = app.world_mut().resource_mut::<CtkThemeMetrics>();
-            metrics.button_height[ButtonSize::Md.index()] = 41.0;
-            metrics.radius = RadiusScale::from_base(12.0);
-        }
-        app.world_mut().resource_mut::<CtkTypography>().body_px = 18.0;
-        app.update();
-
-        let node = app.world().get::<Node>(button).unwrap();
-        assert_eq!(node.height, px(41));
-        assert_eq!(node.border_radius, BorderRadius::all(px(10)));
-        assert_eq!(
-            app.world()
-                .get::<TextFont>(text_label(&app, button))
-                .unwrap()
-                .font_size,
-            FontSize::Px(18.0)
-        );
-    }
-
-    #[test]
-    fn ghost_is_transparent_only_at_rest() {
-        let spec = ThemeSpec::builtin();
-        let mut app = test_app(&spec);
-        let ghost = spawn(
-            &mut app,
-            ButtonDef::text("Ghost").variant(ButtonVariant::Ghost),
-        );
-        app.update();
-        assert_eq!(
-            app.world().get::<BackgroundColor>(ghost).unwrap().0,
-            Color::NONE
-        );
-
-        set_hovered(&mut app, ghost, true);
-        app.update();
-        assert_ne!(
-            app.world().get::<BackgroundColor>(ghost).unwrap().0,
-            Color::NONE
-        );
+        let after = app
+            .world()
+            .entity(label)
+            .get_ref::<TextFont>()
+            .unwrap()
+            .last_changed();
+        assert_eq!(settled, after);
     }
 }

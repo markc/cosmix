@@ -65,6 +65,16 @@ Application identity and slug allocation are defined in
 [`desktop/APPS.md`](desktop/APPS.md). Desktop builds share
 `desktop/target/`:
 
+CTK compiles its embedded revision-1 design at plugin initialisation and
+re-syncs it when scheme or mode changes. The resolved button table is
+authoritative for colours, focus rings, height, minimum width, horizontal
+padding, border width and radius. Replacing the complete source in memory via
+`CtkDesignStatus::replace_source` recompiles once and restyles existing
+buttons; invalid source keeps the last-known-good table. On-disk
+`theme.conf.mix` `design` sections are not read yet; that is the next slice.
+The legacy public `CtkThemeMetrics::button_*` fields are deprecated and inert
+for `CtkButton`; other CTK metric fields retain their existing behaviour.
+
 ```sh
 cd $COSMIX/src/desktop
 cargo build --workspace

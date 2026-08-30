@@ -28,11 +28,11 @@ use cosmix_actions::{ActionArgs, ActionMeta, ActionRegistry, ActionSource, Regis
 use cosmix_mesh_trust::ctk_caps::CTK_ACTIONS;
 use serde_json::{json, Map, Value};
 
-use crate::bus::InboundRequest;
 use crate::app_control::{
     app_verb_registered, AppPortAppExt, AppPortPlugin, AppPortReply, AppPortRequest,
     LocalCallerError,
 };
+use crate::bus::InboundRequest;
 use crate::menu::{ActionRegistryResource, ActionRequest, Source};
 use crate::modal_capture::ModalCapture;
 

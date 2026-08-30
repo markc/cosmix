@@ -2,7 +2,7 @@
 --   ~/.config/cosmix/theme.conf.mix        (desktop-wide: every cosmix app)
 --   <app config dir>/theme.conf.mix        (per-app override of the above)
 --
--- Resolution cascade: built-in Ocean-dark  ←  shared  ←  per-app.
+-- Resolution cascade: built-in Ocean-light  ←  shared  ←  per-app.
 -- A missing or malformed file is skipped, never fatal.
 --
 -- The palette model is shared verbatim with the web design system
@@ -18,8 +18,10 @@ mode: "dark"
 
 -- Optional per-token #rrggbb hex overrides, applied ON TOP of the scheme.
 -- Uncomment to tweak individual console tokens; unset tokens keep the scheme.
--- Colours hot-swap on reload; the *metrics below are baked into widget
--- geometry at spawn, so a metrics change needs an app relaunch.
+-- These colours hot-swap for legacy UiTheme-token consumers. CtkButton does
+-- not read these token overrides: its colours and metrics come from the
+-- embedded revision-1 compiled design (or an in-memory complete-source
+-- replacement). On-disk design sections are not read yet.
 --
 -- surface:        "#0b0d17"   -- window background
 -- panel:          "#141726"   -- strip panel
@@ -34,7 +36,8 @@ mode: "dark"
 -- text:           "#e6e8f0"   -- primary text
 -- text_dim:       "#8b90a6"   -- captions / readouts / footers
 
--- Layout metrics (pixels). Uncomment to override; relaunch to apply.
+-- Legacy non-button layout metrics (pixels). Uncomment to override; relaunch
+-- to apply. CtkButton metrics do not come from these fields.
 -- control_gap:    8.0
 -- corner_radius:  5.0
 -- fader_width:    42.0
