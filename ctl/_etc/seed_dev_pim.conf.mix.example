@@ -5,7 +5,7 @@ seed_dev_pim: {
   schema_version: 1,
   node: "alpha",
   account_email: "admin@example.org",
-  jmap_port: 8443,
+  jmap_port: 443,
   smtp_port: 25,
   ssl_verify: false,
   contacts: [
@@ -13,13 +13,13 @@ seed_dev_pim: {
       full_name: "Alice Example",
       email: "alice@example.org",
       company: "Example Company",
-      phone: "+61 400 111 222"
+      phone: "+61 400 000 001"
     },
     {
       full_name: "Bob Example",
       email: "bob@example.net",
       company: "Example Studio",
-      phone: "+61 400 333 444"
+      phone: "+61 400 000 002"
     }
   ],
   events: [

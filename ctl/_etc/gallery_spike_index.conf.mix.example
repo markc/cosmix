@@ -1,0 +1,8 @@
+-- Private site paths for gallery_spike_index.mix.
+-- Copy this file to `_etc/gallery_spike_index.conf.mix` in the control hub and
+-- replace both placeholders with paths on the indexing host.
+gallery_spike_index: {
+  schema_version: 1,
+  media_root: "/home/user/Pictures",
+  database_dir: "/home/user/.local/state/cosmix/gallery-spike"
+}

@@ -1,0 +1,25 @@
+-- Private hub configuration for seed_dev_posts.mix.
+-- Copy this file to `_etc/seed_dev_posts.conf.mix` in the control hub and
+-- replace the placeholders with one rostered development site and its posts.
+seed_dev_posts: {
+  schema_version: 1,
+  node: "alpha",
+  database_path: "/srv/blog.example.org/web/data/cms.db",
+  service_user: "web-user",
+  posts: [
+    {
+      slug: "welcome-to-the-dev-site",
+      title: "Welcome to the development site",
+      created: "2026-01-15 09:00:00",
+      excerpt: "A sample post used to exercise the blog listing.",
+      body: "## Welcome\n\nThis is placeholder development content for example.org."
+    },
+    {
+      slug: "pagination-check",
+      title: "Checking blog pagination",
+      created: "2026-01-14 09:00:00",
+      excerpt: "Another sample post for list and pagination testing.",
+      body: "This placeholder post gives the development blog another row."
+    }
+  ]
+}

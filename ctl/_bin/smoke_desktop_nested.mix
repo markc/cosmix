@@ -206,11 +206,14 @@ fn launch_service($name, $binary, $binary_argv, $environment)
   $command = concat($command, $binary_argv)
   $started = run_argv($command, {timeout: 30})
   if $started["exit_code"] != 0 then
-    raise("SMOKE_LAUNCH_FAILED", name .. " launch failed: " ..
+    raise("SMOKE_LAUNCH_FAILED", $name .. " launch failed: " ..
       trim($started["stdout"]) .. " " .. trim($started["stderr"]))
   end
   $pid = wait_main_pid($unit)
   if $pid == "" or not pid_matches($pid, $binary) then
+    $_bad_launch_stop = run_argv([
+      "systemctl", "--user", "stop", $unit
+    ], {timeout: 30})
     raise("SMOKE_LAUNCH_IDENTITY", $name .. " launch did not expose the expected timeout process")
   end
   write_file($log .. ".pid", $pid .. "\n")
@@ -266,8 +269,9 @@ for each $binary in [$comp, $filemgr, $quoin, $foot]
     config_error("SMOKE_NO_BINARY: missing " .. $binary)
   end
 end
-for each $tool in ["pgrep", "pkill", "ss", "systemctl", "systemd-run", "timeout"]
-  if which($tool) == nil then
+for each $tool in ["pgrep", "pkill", "rm", "ss", "systemctl", "systemd-run", "timeout"]
+  $tool_path = which($tool)
+  if $tool_path == nil or $tool_path == "" then
     config_error("SMOKE_NO_TOOL: missing required local command " .. $tool)
   end
 end
@@ -336,9 +340,7 @@ if $sock_busy then
   config_error("SMOKE_SOCKET_BUSY: a live listener holds " .. $sock_path ..
     " but the stale sweep did not match it — stop it or choose another socket")
 end
-if exists($sock_path, {follow_symlinks: false}) then
-  remove($sock_path)
-end
+$_stale_socket = run_argv(["rm", "-f", $sock_path])
 
 print("=== nested desktop composition smoke ===")
 print("comp:    " .. $comp)
@@ -461,9 +463,7 @@ finally
   gate(not has("failed to process shader", $final_text), "no shader failure (final log)")
   gate(not has("ERROR", $final_text), "no compositor ERROR (final log)")
 
-  if exists($sock_path, {follow_symlinks: false}) then
-    remove($sock_path)
-  end
+  $_socket_cleanup = run_argv(["rm", "-f", $sock_path])
   for each $unit in [$foot_unit, $filemgr_unit, $quoin_unit, $comp_unit]
     $_unit_reset = run_argv(["systemctl", "--user", "reset-failed", $unit], {timeout: 10})
   end

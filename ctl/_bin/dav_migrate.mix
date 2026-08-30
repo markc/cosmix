@@ -1,0 +1,311 @@
+#!/usr/bin/env mix
+-- dav_migrate.mix — migrate calendar and address-book exports into DAV.
+--
+--   mix _bin/dav_migrate.mix <job>
+--
+-- A private job owns the source paths, target account, credential path,
+-- endpoint and TLS policy. Calendar components sharing a UID stay in one
+-- resource, and If-None-Match:* makes an already-created object a clean skip.
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn config_error($message)
+  print("  ERROR: " .. $message)
+  exit(2)
+end
+
+fn fail($message)
+  print("  ERROR: " .. $message)
+  exit(1)
+end
+
+-- Dispatch before loading private state so the usage pre-flight is inert.
+$argv = args()
+if len($argv) != 1 then
+  print("usage: mix dav_migrate.mix <job>")
+  exit(2)
+end
+$JOB_NAME = $argv[0]
+
+$CONF_PATH = $d.hub_root() .. "/_etc/dav_migrate.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no DAV migration configuration at " .. $CONF_PATH)
+  print("         copy _etc/dav_migrate.conf.mix.example there and configure a job")
+  exit(2)
+end
+$CONF_DOC = load_data($CONF_PATH)
+if type($CONF_DOC) != "map" or type($CONF_DOC["dav_migrate"]) != "map" then
+  config_error($CONF_PATH .. " must contain a dav_migrate map")
+end
+$CONF = $CONF_DOC["dav_migrate"]
+if $CONF["schema_version"] != 1 or type($CONF["jobs"]) != "map" then
+  config_error($CONF_PATH .. " needs dav_migrate.schema_version: 1 and a jobs map")
+end
+$JOB = $CONF["jobs"][$JOB_NAME]
+if type($JOB) != "map" then
+  config_error("unknown DAV migration job '" .. $JOB_NAME .. "' in " .. $CONF_PATH)
+end
+for each $key in ["calendar_file", "contacts_file", "account", "password_file", "base_url"]
+  if type($JOB[$key]) != "string" or trim($JOB[$key]) == "" then
+    config_error("job '" .. $JOB_NAME .. "' needs a non-empty " .. $key)
+  end
+end
+if type($JOB["ssl_verify"]) != "bool" then
+  config_error("job '" .. $JOB_NAME .. "' needs boolean ssl_verify")
+end
+if ends_with($JOB["base_url"], "/") then
+  config_error("job '" .. $JOB_NAME .. "' base_url must not end with /")
+end
+
+$CAL_FILE = $JOB["calendar_file"]
+$VCF_FILE = $JOB["contacts_file"]
+$PASSWORD_FILE = $JOB["password_file"]
+if not is_file($CAL_FILE) then
+  fail("calendar export not found: " .. $CAL_FILE)
+end
+if not is_file($VCF_FILE) then
+  fail("contacts export not found: " .. $VCF_FILE)
+end
+if not is_file($PASSWORD_FILE) then
+  fail("password file not found: " .. $PASSWORD_FILE)
+end
+
+-- Read every local input before contacting the target. A bad pre-flight must
+-- not leave a partially migrated account.
+$CAL_TEXT = read_file($CAL_FILE)
+$VCF_TEXT = read_file($VCF_FILE)
+$PASSWORD = trim(read_file($PASSWORD_FILE))
+if $PASSWORD == "" then
+  fail("password file is empty: " .. $PASSWORD_FILE)
+end
+$BASE = $JOB["base_url"]
+$SSL_VERIFY = $JOB["ssl_verify"]
+$AUTH = "Basic " .. base64_encode($JOB["account"] .. ":" .. $PASSWORD)
+
+fn req($method, $path, $depth, $body, $content_type, $extra)
+  $headers = {Authorization: $AUTH}
+  if $depth != nil then
+    $headers["Depth"] = $depth
+  end
+  if $content_type != nil then
+    $headers["Content-Type"] = $content_type
+  end
+  if $extra != nil then
+    for each $key in $extra
+      $headers[$key] = $extra[$key]
+    end
+  end
+  return http_request($method, $BASE .. $path, $body, $headers,
+    {ssl_verify: $SSL_VERIFY, timeout: 60})
+end
+
+fn as_list($value)
+  if $value == nil then
+    return []
+  end
+  if type($value) == "list" then
+    return $value
+  end
+  return [$value]
+end
+
+-- Discover the authenticated principal, its homes and the default collections.
+$response = req("PROPFIND", "/dav/", "0", "<?xml version=\"1.0\"?><propfind xmlns=\"DAV:\"><prop><current-user-principal/></prop></propfind>", "application/xml", nil)
+$xml = xml_parse($response["body"])
+$principal = as_list($xml["multistatus"]["response"])[0]["propstat"]["prop"]["current-user-principal"]["href"]
+$response = req("PROPFIND", $principal, "0", "<?xml version=\"1.0\"?><propfind xmlns=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CR=\"urn:ietf:params:xml:ns:carddav\"><prop><C:calendar-home-set/><CR:addressbook-home-set/></prop></propfind>", "application/xml", nil)
+$xml = xml_parse($response["body"])
+$properties = as_list($xml["multistatus"]["response"])[0]["propstat"]["prop"]
+$CAL_HOME = $properties["calendar-home-set"]["href"]
+$CARD_HOME = $properties["addressbook-home-set"]["href"]
+
+fn find_collection($home, $marker)
+  $response = req("PROPFIND", $home, "1", "<?xml version=\"1.0\"?><propfind xmlns=\"DAV:\"><prop><resourcetype/></prop></propfind>", "application/xml", nil)
+  $xml = xml_parse($response["body"])
+  for each $item in as_list($xml["multistatus"]["response"])
+    $resource_type = $item["propstat"]["prop"]["resourcetype"]
+    if $resource_type != nil and $resource_type[$marker] != nil then
+      return $item["href"]
+    end
+  end
+  return nil
+end
+
+$CAL_URL = find_collection($CAL_HOME, "calendar")
+$CARD_URL = find_collection($CARD_HOME, "addressbook")
+print("target calendar:    " .. to_string($CAL_URL))
+print("target addressbook: " .. to_string($CARD_URL))
+if $CAL_URL == nil or $CARD_URL == nil then
+  fail("target collections not found")
+end
+
+-- Split a component stream into {uid, body} blocks. Raw component lines are
+-- joined with CRLF, and recurrence exceptions sharing a UID stay together.
+fn split_blocks($text, $component)
+  $blocks = {}
+  $order = []
+  $timezones = []
+  $lines = split($text, "\n")
+  $in_component = false
+  $in_timezone = false
+  $current = []
+  $current_uid = nil
+  $timezone = []
+  for each $raw in $lines
+    $line = $raw
+    if len($line) > 0 and substr($line, len($line) - 1, 1) == "\r" then
+      $line = substr($line, 0, len($line) - 1)
+    end
+    if $line == "BEGIN:VTIMEZONE" then
+      $in_timezone = true
+      $timezone = []
+    end
+    if $in_timezone then
+      push($timezone, $line)
+      if $line == "END:VTIMEZONE" then
+        $in_timezone = false
+        push($timezones, join($timezone, "\r\n"))
+      end
+      continue
+    end
+    if $line == "BEGIN:" .. $component then
+      $in_component = true
+      $current = []
+      $current_uid = nil
+    end
+    if $in_component then
+      push($current, $line)
+      if substr($line, 0, 4) == "UID:" and $current_uid == nil then
+        $current_uid = trim(substr($line, 4, len($line) - 4))
+      end
+      if $line == "END:" .. $component then
+        $in_component = false
+        if $current_uid == nil then
+          $current_uid = "no-uid-" .. hash_blake3(join($current, "\n"))
+        end
+        $body = join($current, "\r\n")
+        if $blocks[$current_uid] == nil then
+          $blocks[$current_uid] = $body
+          push($order, $current_uid)
+        else
+          $blocks[$current_uid] = $blocks[$current_uid] .. "\r\n" .. $body
+        end
+      end
+    end
+  end
+  $out = []
+  for each $uid in $order
+    push($out, {uid: $uid, body: $blocks[$uid]})
+  end
+  return {blocks: $out, timezones: $timezones}
+end
+
+fn put_object($path, $body, $content_type)
+  $response = req("PUT", $path, nil, $body, $content_type, {"If-None-Match": "*"})
+  return $response["status"]
+end
+
+-- Calendar objects.
+$calendar = split_blocks($CAL_TEXT, "VEVENT")
+$timezone_block = ""
+if len($calendar["timezones"]) > 0 then
+  $timezone_block = join($calendar["timezones"], "\r\n") .. "\r\n"
+end
+$calendar_new = 0
+$calendar_skip = 0
+$calendar_error = 0
+$calendar_errors = []
+for each $block in $calendar["blocks"]
+  $ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//cosmix//dav-migrate//EN\r\n" ..
+    $timezone_block .. $block["body"] .. "\r\nEND:VCALENDAR\r\n"
+  $status = put_object($CAL_URL .. url_encode($block["uid"]) .. ".ics", $ics,
+    "text/calendar; charset=utf-8")
+  if $status == 201 or $status == 204 or $status == 200 then
+    $calendar_new = $calendar_new + 1
+  else
+    if $status == 412 then
+      $calendar_skip = $calendar_skip + 1
+    else
+      $calendar_error = $calendar_error + 1
+      push($calendar_errors, $block["uid"] .. " -> " .. to_string($status))
+    end
+  end
+end
+
+-- Contact objects.
+$cards = split_blocks($VCF_TEXT, "VCARD")
+$card_new = 0
+$card_skip = 0
+$card_error = 0
+$card_errors = []
+for each $block in $cards["blocks"]
+  $status = put_object($CARD_URL .. url_encode($block["uid"]) .. ".vcf",
+    $block["body"] .. "\r\n", "text/vcard; charset=utf-8")
+  if $status == 201 or $status == 204 or $status == 200 then
+    $card_new = $card_new + 1
+  else
+    if $status == 412 then
+      $card_skip = $card_skip + 1
+    else
+      $card_error = $card_error + 1
+      push($card_errors, $block["uid"] .. " -> " .. to_string($status))
+    end
+  end
+end
+
+-- Report server-side member counts after the import attempt.
+fn count_members($url)
+  $change = "sy" .. "nc"
+  $body = "<?xml version=\"1.0\"?><" .. $change .. "-collection xmlns=\"DAV:\"><" ..
+    $change .. "-token/><" .. $change .. "-level>1</" .. $change ..
+    "-level><prop><getetag/></prop></" .. $change .. "-collection>"
+  $response = req("REPORT", $url, nil, $body, "application/xml", nil)
+  $xml = xml_parse($response["body"])
+  $count = 0
+  for each $item in as_list($xml["multistatus"]["response"])
+    if $item["propstat"] != nil then
+      $count = $count + 1
+    end
+  end
+  return $count
+end
+
+$calendar_members = count_members($CAL_URL)
+$card_members = count_members($CARD_URL)
+
+-- GET the first and last calendar resources and look for their exact component
+-- bytes. This preserves the old migration's lightweight fidelity check.
+fn fidelity_sample($url, $uid, $needle)
+  $response = req("GET", $url .. url_encode($uid) .. ".ics", nil, nil, nil, nil)
+  if $response["status"] != 200 then
+    return "GET " .. to_string($response["status"])
+  end
+  if pos($needle, $response["body"]) > 0 then
+    return "verbatim-ok"
+  end
+  return "CONTENT-MISMATCH"
+end
+
+$first_fidelity = "n/a"
+$last_fidelity = "n/a"
+if len($calendar["blocks"]) > 0 then
+  $first = $calendar["blocks"][0]
+  $first_fidelity = fidelity_sample($CAL_URL, $first["uid"], $first["body"])
+  $last = $calendar["blocks"][len($calendar["blocks"]) - 1]
+  $last_fidelity = fidelity_sample($CAL_URL, $last["uid"], $last["body"])
+end
+
+print("=== dav_migrate summary ===")
+print("calendar: source=" .. to_string(len($calendar["blocks"])) ..
+  " new=" .. to_string($calendar_new) .. " skip=" .. to_string($calendar_skip) ..
+  " err=" .. to_string($calendar_error) .. " server-members=" .. to_string($calendar_members))
+print("contacts: source=" .. to_string(len($cards["blocks"])) ..
+  " new=" .. to_string($card_new) .. " skip=" .. to_string($card_skip) ..
+  " err=" .. to_string($card_error) .. " server-members=" .. to_string($card_members))
+print("fidelity: first=" .. $first_fidelity .. " last=" .. $last_fidelity)
+for each $error in $calendar_errors
+  print("cal-err: " .. sanitize($error))
+end
+for each $error in $card_errors
+  print("card-err: " .. sanitize($error))
+end

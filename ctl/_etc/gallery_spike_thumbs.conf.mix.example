@@ -1,0 +1,17 @@
+-- gallery_spike_thumbs.conf.mix.example — private gallery thumbnail settings.
+-- Copy this file to gallery_spike_thumbs.conf.mix in the private control hub
+-- and replace every path with the local site's values.
+gallery_spike_thumbs: {
+  schema_version: 1,
+
+  -- Mutable gallery index and generated output cache.
+  database_path: "/var/lib/cosmix/gallery-spike/index.db",
+  cache_dir: "/var/lib/cosmix/gallery-spike/cache",
+
+  -- Read-only source tree. Keep cache_dir outside this tree.
+  media_root: "/srv/example.org/media/user/photos",
+
+  -- Explicit executables make unattended runs deterministic.
+  magick_bin: "/usr/bin/magick",
+  ffmpeg_bin: "/usr/bin/ffmpeg"
+}

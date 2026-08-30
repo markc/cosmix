@@ -1,0 +1,17 @@
+-- Private hub configuration for dav_migrate.mix.
+-- Copy this file to `_etc/dav_migrate.conf.mix` in the control hub and replace
+-- every placeholder with site values. Store the password itself only in the
+-- named file.
+dav_migrate: {
+  schema_version: 1,
+  jobs: {
+    legacy_dav: {
+      calendar_file: "/home/user/exports/calendar.ics",
+      contacts_file: "/home/user/exports/contacts.vcf",
+      account: "user@example.org",
+      password_file: "/home/user/.config/cosmix/dav-migrate.password",
+      base_url: "https://dav.example.org",
+      ssl_verify: true
+    }
+  }
+}

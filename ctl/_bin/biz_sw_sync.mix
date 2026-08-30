@@ -1,0 +1,282 @@
+#!/usr/bin/env mix
+-- biz_sw_sync.mix — run one Synergy Wholesale renewal/expiry update batch on
+-- a configured webd site.
+--
+-- The slow SOAP calls run outside webd's handler deadline. The worker first
+-- asks webd to claim a worklist, reconciles or renews each domain through the
+-- site's shared SW app, then returns fenced results for webd to write. Direct
+-- database access is read-only and is used only for the worker credentials.
+--
+--   mix _bin/biz_sw_sync.mix <node> [--base-url URL] [--db PATH]
+
+$d = require("../_lib/deploy_lib.mix")
+
+$g = getopt(args(), {
+  "base-url": {arg: true},
+  db: {arg: true}
+})
+if len($g["errors"]) != 0 then
+  print("bad options: " .. join($g["errors"], "; "))
+  exit(2)
+end
+if len($g["rest"]) != 1 then
+  print("usage: mix _bin/biz_sw_sync.mix <node> [--base-url URL] [--db PATH]")
+  print("       node must be enabled in the private biz_sw_sync configuration")
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/biz_sw_sync.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: missing biz_sw_sync config: " .. $CONF_PATH)
+  print("         copy _etc/biz_sw_sync.conf.mix.example there and replace every placeholder")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["biz_sw_sync"], {
+    schema_version: {type: "integer", enum: [1]},
+    nodes: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}},
+    default_base_url: {type: "string", nonblank: true},
+    default_db_path: {type: "string", nonblank: true},
+    sw_app_path: {type: "string", nonblank: true}
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn validate_url($url)
+  if not starts_with($url, "http://") and not starts_with($url, "https://") then
+    config_error("base URL must start with http:// or https://")
+  end
+  if contains($url, "\n") or contains($url, "\r") then
+    config_error("base URL must be one line")
+  end
+end
+
+fn validate_absolute_path($key, $path)
+  $bad = not starts_with($path, "/")
+  $bad = $bad or contains($path, "//")
+  $bad = $bad or contains($path, "\n") or contains($path, "\r")
+  if $bad then
+    config_error($key .. " must be a normalised one-line absolute path")
+  end
+  for each $part in split($path, "/")
+    if $part == "." or $part == ".." then
+      config_error($key .. " must not contain . or .. components")
+    end
+  end
+end
+
+validate_url($CONF["default_base_url"])
+validate_absolute_path("default_db_path", $CONF["default_db_path"])
+validate_absolute_path("sw_app_path", $CONF["sw_app_path"])
+
+$ROSTER = $d.roster()
+$seen = []
+for each $configured_node in $CONF["nodes"]
+  $d.assert_node($ROSTER, $configured_node)
+  for each $prior in $seen
+    if $prior == $configured_node then
+      config_error("duplicate nodes entry: " .. $configured_node)
+    end
+  end
+  push($seen, $configured_node)
+end
+
+$node = $g["rest"][0]
+$SITE_ROSTER = {mesh: [], foreign: [], all: $CONF["nodes"], order: nil}
+$d.assert_node($SITE_ROSTER, $node)
+
+$BASE = $CONF["default_base_url"]
+if env("CT_BASE_URL") != "" then
+  $BASE = env("CT_BASE_URL")
+end
+if $g["opts"]["base-url"] != nil then
+  $BASE = "" .. $g["opts"]["base-url"]
+end
+validate_url($BASE)
+
+$DB = $CONF["default_db_path"]
+if env("CT_DB") != "" then
+  $DB = env("CT_DB")
+end
+if $g["opts"]["db"] != nil then
+  $DB = "" .. $g["opts"]["db"]
+end
+validate_absolute_path("database path", $DB)
+
+$REMOTE = $node
+if not $d.is_foreign($ROSTER, $node) then
+  $REMOTE = "root@" .. $d.mesh_ip($node)
+end
+
+-- Reachability is proved before the GET that claims work. The
+-- invocation-specific challenge cannot be satisfied by stale output.
+$token = uuid()
+$reach = ssh_mix($REMOTE, 'print("BIZ_SW_REACH " .. $token)', {
+  bindings: {token: $token}, connect_timeout: 8, timeout: 15, batch: true
+})
+$d.die_if(not $reach["ok"] or
+    trim($reach["stdout"]) != "BIZ_SW_REACH " .. $token,
+  $node .. " unreachable or not running the system Mix interpreter: " ..
+  trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+
+$result = ssh_mix($REMOTE, '
+if not is_file($db_path) then
+  print("ERROR: site database not found: " .. $db_path)
+  exit(1)
+end
+if not is_file($sw_app_path) then
+  print("ERROR: shared SW app not found: " .. $sw_app_path)
+  exit(1)
+end
+
+$DB_HANDLE = sqlopen($db_path)
+
+-- The shared app resolves these settings at call time. Parameter bindings
+-- keep setting names data-only and the handle remains read-only.
+function biz_setting($key)
+  $rows = sqlexec($DB_HANDLE,
+    "SELECT value FROM biz_settings WHERE key = ?", [$key])
+  if len($rows) == 0 then
+    return ""
+  end
+  return trim("" .. $rows[0]["value"])
+end
+
+include $sw_app_path
+
+$secret = biz_setting("tick_secret")
+if $secret == "" then
+  print("ERROR: no tick_secret in " .. $db_path)
+  exit(1)
+end
+$headers = {"X-Tick-Secret": $secret}
+
+-- Fetching the worklist also claims pending renewal jobs. No SOAP or apply
+-- work begins unless webd confirms that claim with HTTP 200.
+$work_response = http_get($base_url .. "/biz/sw-apply", $headers,
+  {timeout: 10})
+if to_number($work_response["status"]) != 200 then
+  print("worklist fetch failed: " .. ("" .. $work_response["status"]) ..
+    " " .. ("" .. $work_response["error"]))
+  exit(1)
+end
+$work = json_parse($work_response["body"])
+$renewals = $work["renewals"]
+$syncs = $work["syncs"]
+print("worklist: " .. len($renewals) .. " renewals, " ..
+  len($syncs) .. " syncs")
+
+$renewal_results = []
+for each $renewal in $renewals
+  $domain = "" .. $renewal["domain"]
+  if $renewal["reconcile"] == true then
+    -- Never repeat an ambiguous renewal. Requeue only after a successful
+    -- registry lookup proves that expiry did not advance; lookup failure
+    -- leaves the job running for a later reconciliation.
+    $info = sw_domain_info($domain)
+    if $info["ok"] then
+      if $info["expiry"] > ("" .. $renewal["prior_expiry"]) then
+        push($renewal_results, {
+          job_id: $renewal["job_id"],
+          domain_id: $renewal["domain_id"],
+          action: "done",
+          registry_expiry: $info["expiry"]
+        })
+      else
+        push($renewal_results, {
+          job_id: $renewal["job_id"],
+          domain_id: $renewal["domain_id"],
+          action: "requeue"
+        })
+      end
+    else
+      print("reconcile lookup failed for " .. $domain ..
+        " — leaving job running")
+    end
+  else
+    $renewed = sw_renew_domain($domain, 1)
+    if $renewed["ok"] then
+      -- Apply the registry expiry when it is available; an empty value keeps
+      -- the old successful-renewal contract when the follow-up lookup fails.
+      $registry_expiry = ""
+      $info = sw_domain_info($domain)
+      if $info["ok"] then
+        $registry_expiry = $info["expiry"]
+      end
+      push($renewal_results, {
+        job_id: $renewal["job_id"],
+        domain_id: $renewal["domain_id"],
+        action: "done",
+        registry_expiry: $registry_expiry
+      })
+    else
+      push($renewal_results, {
+        job_id: $renewal["job_id"],
+        domain_id: $renewal["domain_id"],
+        action: "failed",
+        error: $renewed["error"]
+      })
+    end
+  end
+end
+
+$sync_results = []
+for each $item in $syncs
+  $info = sw_domain_info("" .. $item["domain"])
+  if $info["ok"] then
+    push($sync_results, {
+      domain_id: $item["domain_id"],
+      ok: true,
+      expiry: $info["expiry"],
+      status: $info["status"]
+    })
+  else
+    -- A permanent missing-domain result is labelled so webd can stop
+    -- retrying it; all other failures remain transient.
+    $gone = pos("Does Not Exist", $info["error"]) != 0
+    push($sync_results, {
+      domain_id: $item["domain_id"], ok: false, gone: $gone
+    })
+  end
+  -- The registry throttles bursty domainInfo batches.
+  sleep(0.4)
+end
+
+$body = json_encode({
+  renewals: $renewal_results,
+  syncs: $sync_results
+})
+$apply_headers = {
+  "X-Tick-Secret": $secret,
+  "Content-Type": "application/json"
+}
+$apply_response = http_post($base_url .. "/biz/sw-apply", $body,
+  $apply_headers, {timeout: 15})
+if to_number($apply_response["status"]) != 200 then
+  print("apply failed: " .. ("" .. $apply_response["status"]) .. " " ..
+    ("" .. $apply_response["error"]))
+  exit(1)
+end
+print("applied: " .. $apply_response["body"])
+', {bindings: {
+    db_path: $DB,
+    base_url: $BASE,
+    sw_app_path: $CONF["sw_app_path"]
+  }, connect_timeout: 8, timeout: 3600, batch: true})
+
+if trim($result["stdout"]) != "" then
+  print(trim($result["stdout"]))
+end
+$d.die_if(not $result["ok"],
+  "biz_sw_sync failed on " .. $node .. ": " .. trim($result["stderr"]))

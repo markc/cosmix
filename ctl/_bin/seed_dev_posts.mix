@@ -1,0 +1,296 @@
+#!/usr/bin/env mix
+-- seed_dev_posts.mix — seed configured published development posts into one
+-- webd CMS database on a rostered node.
+--
+--   mix _bin/seed_dev_posts.mix <node>
+--
+-- The private hub configuration owns the target node, database path, service
+-- account and post corpus. The database worker runs as that service account so
+-- SQLite journals keep the same ownership as webd. Slugs are idempotent:
+-- INSERT OR IGNORE is followed by an exact read-back of every configured post.
+
+fn worker_fail($token, $message)
+  print(data_encode({token: $token, status: "error", message: $message}))
+  exit(1)
+end
+
+-- This branch runs only from the root ssh_mix wrapper after it stages this
+-- script and a private payload for the configured service account.
+fn remote_worker($payload_path)
+  $payload = load_data($payload_path)
+  $token = $payload["token"]
+  if type($payload) != "map" or type($token) != "string" or $token == "" then
+    worker_fail("", "staged payload is missing or belongs to another invocation")
+  end
+  if uid() != $payload["service_uid"] then
+    worker_fail($token, "database worker did not enter the configured service account")
+  end
+  $database_path = $payload["database_path"]
+  $posts = $payload["posts"]
+  if not is_file($database_path) then
+    worker_fail($token,
+      $database_path .. " does not exist — warm the site once to create the schema, then re-run")
+  end
+
+  $db = sqlopen($database_path, "rw")
+  $columns = sqlexec($db, "PRAGMA table_info(cms_posts)", [])
+  $have_kind = false
+  for each $column in $columns
+    if ("" .. $column["name"]) == "kind" then
+      $have_kind = true
+    end
+  end
+  if not $have_kind then
+    sqlclose($db)
+    worker_fail($token, "cms_posts not migrated (no `kind` column) — warm the site once, then re-run")
+  end
+
+  $authors = sqlexec($db, "SELECT id FROM users ORDER BY id LIMIT 1", [])
+  if len($authors) == 0 then
+    sqlclose($db)
+    worker_fail($token, "no users row — seed an admin first, then re-run")
+  end
+  $author = $authors[0]["id"]
+
+  $_begin = sqlexec($db, "BEGIN IMMEDIATE", [])
+  $inserted = 0
+  $verified = 0
+  for each $post in $posts
+    $_insert = sqlexec($db, "INSERT OR IGNORE INTO cms_posts (slug, title, excerpt, body, status, author_id, kind, visibility, created, updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)", [$post["slug"], $post["title"], $post["excerpt"], $post["body"], "published", $author, "post", "public", $post["created"]])
+    $change_rows = sqlexec($db, "SELECT changes() AS c", [])
+    $inserted = $inserted + to_number("" .. $change_rows[0]["c"])
+
+    $rows = sqlexec($db, "SELECT title, excerpt, body, author_id, created, updated FROM cms_posts WHERE slug=?1 AND status=?2 AND kind=?3 AND visibility=?4 LIMIT 1", [$post["slug"], "published", "post", "public"])
+    $matches = len($rows) == 1
+    if $matches then
+      $row = $rows[0]
+      $matches = (("" .. $row["title"]) == $post["title"] and
+        ("" .. $row["excerpt"]) == $post["excerpt"] and
+        ("" .. $row["body"]) == $post["body"] and
+        ("" .. $row["author_id"]) == ("" .. $author) and
+        ("" .. $row["created"]) == $post["created"] and
+        ("" .. $row["updated"]) == $post["created"])
+    end
+    if not $matches then
+      $_rollback = sqlexec($db, "ROLLBACK", [])
+      sqlclose($db)
+      worker_fail($token,
+        "post read-back mismatch for slug " .. $post["slug"] .. " — transaction rolled back")
+    end
+    $verified = $verified + 1
+  end
+  $totals = sqlexec($db,
+    "SELECT count(*) AS c FROM cms_posts WHERE kind=?1 AND status=?2", ["post", "published"])
+  $_commit = sqlexec($db, "COMMIT", [])
+  sqlclose($db)
+  print(data_encode({
+    token: $token,
+    status: "ok",
+    inserted: $inserted,
+    verified: $verified,
+    published_total: to_number("" .. $totals[0]["c"])
+  }))
+end
+
+$argv = args()
+if len($argv) == 2 and $argv[0] == "--remote-worker" then
+  remote_worker($argv[1])
+  exit(0)
+end
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn config_error($message)
+  print("  ERROR: " .. $message)
+  exit(2)
+end
+
+fn has_item($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+-- Refuse before loading private state or contacting a node.
+if len($argv) != 1 then
+  print("usage: mix seed_dev_posts.mix <node>")
+  exit(2)
+end
+$NODE = $argv[0]
+
+$CONF_PATH = $d.hub_root() .. "/_etc/seed_dev_posts.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no seed_dev_posts configuration at " .. $CONF_PATH)
+  print("         copy _etc/seed_dev_posts.conf.mix.example there and set the site values")
+  exit(2)
+end
+
+$CONF_DOC = nil
+try
+  $CONF_DOC = load_data($CONF_PATH)
+catch $message
+  config_error($CONF_PATH .. " is not valid strict data: " .. $message)
+end
+if type($CONF_DOC) != "map" or type($CONF_DOC["seed_dev_posts"]) != "map" then
+  config_error($CONF_PATH .. " must contain a seed_dev_posts map")
+end
+$CONF = $CONF_DOC["seed_dev_posts"]
+if $CONF["schema_version"] != 1 then
+  config_error($CONF_PATH .. " needs seed_dev_posts.schema_version: 1")
+end
+for each $key in ["node", "database_path", "service_user"]
+  if type($CONF[$key]) != "string" or trim($CONF[$key]) == "" then
+    config_error($CONF_PATH .. " needs a non-empty seed_dev_posts." .. $key)
+  end
+end
+if $CONF["node"] != $NODE then
+  config_error("requested node '" .. $NODE .. "' does not match seed_dev_posts.node in " .. $CONF_PATH)
+end
+if not starts_with($CONF["database_path"], "/") then
+  config_error("seed_dev_posts.database_path must be absolute")
+end
+if not regex_match("^[a-z_][a-z0-9_-]*[$]?$", $CONF["service_user"]) then
+  config_error("seed_dev_posts.service_user is not a safe system account name")
+end
+
+$POSTS = $CONF["posts"]
+if type($POSTS) != "list" or len($POSTS) == 0 then
+  config_error($CONF_PATH .. " needs a non-empty seed_dev_posts.posts list")
+end
+$slugs = []
+for each $post in $POSTS
+  if type($post) != "map" then
+    config_error("seed_dev_posts.posts entries must be maps")
+  end
+  for each $key in ["slug", "title", "created", "excerpt", "body"]
+    if type($post[$key]) != "string" or trim($post[$key]) == "" then
+      config_error("every configured post needs a non-empty " .. $key)
+    end
+  end
+  if not regex_match("^[a-z0-9]+([a-z0-9-]*[a-z0-9])?$", $post["slug"]) then
+    config_error("post slug '" .. $post["slug"] .. "' is not URL-safe")
+  end
+  if not regex_match("^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$", $post["created"]) then
+    config_error("post '" .. $post["slug"] .. "' needs created as YYYY-MM-DD HH:MM:SS")
+  end
+  if has_item($slugs, $post["slug"]) then
+    config_error("duplicate configured post slug '" .. $post["slug"] .. "'")
+  end
+  push($slugs, $post["slug"])
+end
+
+$ROSTER = $d.roster()
+$d.assert_node($ROSTER, $NODE)
+$REMOTE = $NODE
+if not $d.is_foreign($ROSTER, $NODE) then
+  $REMOTE = $d.mesh_ip($NODE)
+end
+
+-- The root wrapper stages these exact linted script bytes, then invokes the
+-- guarded worker branch as the configured webd account. This keeps SQLite WAL
+-- ownership aligned without sending a shell command through ssh itself.
+$SCRIPT_BYTES = read_file(realpath($0))
+
+$TOKEN = uuid()
+$reach = ssh_mix($REMOTE, '
+print(data_encode({token: $token, uid: uid()}))
+', {bindings: {token: $TOKEN}, decode: "data", connect_timeout: 8, timeout: 15})
+$d.die_if(not $reach["ok"] or type($reach["value"]) != "map" or
+    $reach["value"]["token"] != $TOKEN,
+  $NODE .. " unreachable or not running the system Mix interpreter: " ..
+  trim($reach["stdout"]) .. " " .. trim($reach["stderr"]))
+$d.die_if($reach["value"]["uid"] != 0,
+  $NODE .. " ssh_mix endpoint is not root; it cannot enter the configured service account")
+
+$result = ssh_mix($REMOTE, '
+fn fail($message)
+  print(data_encode({token: $token, status: "error", message: $message}))
+  exit(1)
+end
+
+if uid() != 0 then
+  fail("remote seed wrapper requires uid 0")
+end
+if not regex_match("^[a-z_][a-z0-9_-]*[$]?$", $service_user) then
+  fail("unsafe service account name")
+end
+$sudo = which("sudo")
+if $sudo == nil or $sudo == "" then
+  fail("sudo is not installed")
+end
+$service_uid_text = trim(run("/usr/bin/id -u " .. $service_user))
+$uid_rc = $rc
+$service_gid_text = trim(run("/usr/bin/id -g " .. $service_user))
+$gid_rc = $rc
+if $uid_rc != 0 or $gid_rc != 0 or
+    not regex_match("^[0-9]+$", $service_uid_text) or
+    not regex_match("^[0-9]+$", $service_gid_text) then
+  fail("configured service account does not resolve: " .. $service_user)
+end
+$service_uid = to_number($service_uid_text)
+$service_gid = to_number($service_gid_text)
+$base = "/run/seed-dev-posts-" .. $token
+$script_path = $base .. ".mix"
+$payload_path = $base .. ".conf.mix"
+$payload_bytes = data_encode({
+  token: $token,
+  service_uid: $service_uid,
+  database_path: $database_path,
+  posts: $posts
+}, true)
+try
+  write_new($script_path, $script_bytes, 0o600)
+  write_new($payload_path, $payload_bytes, 0o600)
+  chown($script_path, $service_uid, $service_gid)
+  chown($payload_path, $service_uid, $service_gid)
+catch $stage_error
+  remove($script_path)
+  remove($payload_path)
+  fail("could not stage the database worker: " .. $stage_error)
+end
+if read_file($script_path) != $script_bytes or read_file($payload_path) != $payload_bytes then
+  remove($script_path)
+  remove($payload_path)
+  fail("staged database worker or payload failed byte-identity verification")
+end
+$output = run($sudo .. " -n -u " .. $service_user .. " /opt/cosmix/bin/mix " ..
+  $script_path .. " --remote-worker " .. $payload_path)
+$worker_rc = $rc
+remove($script_path)
+remove($payload_path)
+if $worker_rc != 0 then
+  print($output)
+  exit(1)
+end
+$decoded = nil
+try
+  $decoded = data_parse($output)
+catch $decode_error
+  fail("database worker returned invalid strict data: " .. $decode_error)
+end
+if type($decoded) != "map" or $decoded["token"] != $token or $decoded["status"] != "ok" then
+  fail("database worker returned an unverified result")
+end
+print(data_encode($decoded))
+', {bindings: {
+  token: $TOKEN,
+  service_user: $CONF["service_user"],
+  database_path: $CONF["database_path"],
+  posts: $POSTS,
+  script_bytes: $SCRIPT_BYTES
+}, decode: "data", connect_timeout: 8, timeout: 120})
+
+$d.die_if(not $result["ok"] or type($result["value"]) != "map" or
+    $result["value"]["token"] != $TOKEN or $result["value"]["status"] != "ok",
+  "seed on " .. $NODE .. " failed: " .. trim($result["stdout"]) .. " " .. trim($result["stderr"]))
+$d.die_if($result["value"]["verified"] != len($POSTS),
+  "seed on " .. $NODE .. " verified " .. ("" .. $result["value"]["verified"]) ..
+  " posts, expected " .. ("" .. len($POSTS)))
+
+print("seed_dev_posts complete on " .. $NODE .. ": " ..
+  ("" .. $result["value"]["inserted"]) .. " inserted, " ..
+  ("" .. $result["value"]["verified"]) .. " configured posts verified, " ..
+  ("" .. $result["value"]["published_total"]) .. " published posts total")

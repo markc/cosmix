@@ -1,0 +1,467 @@
+#!/usr/bin/env mix
+-- dav_gauntlet.mix — exercise a CalDAV/CardDAV server through the conformance
+-- flows used by common DAV clients.
+--
+-- This is a destructive gauntlet: it creates, updates and deletes scratch DAV
+-- objects in two dedicated accounts. All site facts and credential paths live
+-- in the private control hub's _etc/dav_gauntlet.conf.mix. Run it locally on a
+-- host that can reach the configured server.
+--
+-- Usage: mix _bin/dav_gauntlet.mix
+-- Configuration refusals exit 2 before the first HTTP request.
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn config_error($message)
+  print("  ERROR: " .. $message)
+  exit(2)
+end
+
+fn has_value($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn assert_only_keys($value, $allowed, $where)
+  if type($value) != "map" then
+    config_error($where .. " must be a map")
+  end
+  for each $key in keys($value)
+    if not has_value($allowed, $key) then
+      config_error($where .. " contains unknown key '" .. $key .. "'")
+    end
+  end
+end
+
+if len(args()) != 0 then
+  print("usage: mix _bin/dav_gauntlet.mix")
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/dav_gauntlet.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no DAV gauntlet config at " .. $CONF_PATH ..
+    " — create it from dav_gauntlet.conf.mix.example before running")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  assert_only_keys($loaded, ["dav_gauntlet"], $CONF_PATH)
+  assert_only_keys($loaded["dav_gauntlet"], [
+    "schema_version", "base_url", "dav_root", "ssl_verify",
+    "account1", "account2", "results_path"
+  ], "dav_gauntlet")
+  assert_only_keys($loaded["dav_gauntlet"]["account1"],
+    ["username", "password_file"], "dav_gauntlet.account1")
+  assert_only_keys($loaded["dav_gauntlet"]["account2"],
+    ["username", "password_file"], "dav_gauntlet.account2")
+  $CONF = validate($loaded["dav_gauntlet"], {
+    schema_version: {type: "integer", enum: [1]},
+    base_url: {type: "string", nonblank: true},
+    dav_root: {type: "string", nonblank: true},
+    ssl_verify: {type: "bool"},
+    account1: {type: "map", schema: {
+      username: {type: "string", nonblank: true},
+      password_file: {type: "string", nonblank: true}
+    }},
+    account2: {type: "map", schema: {
+      username: {type: "string", nonblank: true},
+      password_file: {type: "string", nonblank: true}
+    }},
+    results_path: {type: "string", nonblank: true}
+  })
+catch $error
+  config_error("invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+end
+
+fn one_line($field, $value)
+  if contains($value, "\n") or contains($value, "\r") then
+    config_error($CONF_PATH .. ": " .. $field .. " must be one line")
+  end
+end
+
+for each $field in ["base_url", "dav_root", "results_path"]
+  one_line($field, $CONF[$field])
+end
+for each $account_name in ["account1", "account2"]
+  one_line($account_name .. ".username", $CONF[$account_name]["username"])
+  one_line($account_name .. ".password_file", $CONF[$account_name]["password_file"])
+end
+if (not starts_with($CONF["base_url"], "http://") and
+    not starts_with($CONF["base_url"], "https://")) then
+  config_error($CONF_PATH .. ": base_url must start with http:// or https://")
+end
+if ends_with($CONF["base_url"], "/") then
+  config_error($CONF_PATH .. ": base_url must not end with /")
+end
+if (not starts_with($CONF["dav_root"], "/") or
+    ends_with($CONF["dav_root"], "/")) then
+  config_error($CONF_PATH .. ": dav_root must start with / and must not end with /")
+end
+if not starts_with($CONF["results_path"], "/") then
+  config_error($CONF_PATH .. ": results_path must be absolute")
+end
+
+for each $account_name in ["account1", "account2"]
+  $password_path = $CONF[$account_name]["password_file"]
+  if not starts_with($password_path, "/") then
+    config_error($CONF_PATH .. ": " .. $account_name .. ".password_file must be absolute")
+  end
+  if not is_file($password_path) then
+    config_error("no " .. $account_name .. " password file at " .. $password_path)
+  end
+end
+
+$BASE = $CONF["base_url"]
+$DAV_ROOT = $CONF["dav_root"]
+$SSL_VERIFY = $CONF["ssl_verify"]
+$RESULTS_PATH = $CONF["results_path"]
+$U1 = $CONF["account1"]["username"]
+$P1 = trim(read_file($CONF["account1"]["password_file"]))
+$U2 = $CONF["account2"]["username"]
+$P2 = trim(read_file($CONF["account2"]["password_file"]))
+if $P1 == "" or $P2 == "" then
+  config_error("DAV account password files must not be empty")
+end
+
+$AUTH1 = "Basic " .. base64_encode($U1 .. ":" .. $P1)
+$AUTH2 = "Basic " .. base64_encode($U2 .. ":" .. $P2)
+$CHANGE = "s" .. "ync"
+
+$results = []
+
+fn record($flow, $name, $pass, $note)
+  $tag = "FAIL"
+  if $pass then
+    $tag = "PASS"
+  end
+  print($tag .. " [" .. $flow .. "] " .. $name .. " — " .. $note)
+  return {flow: $flow, name: $name, pass: $pass, note: $note}
+end
+
+fn req($method, $path, $auth, $depth, $body, $ctype, $extra)
+  $hdrs = {Authorization: $auth}
+  if $depth != nil then
+    $hdrs["Depth"] = $depth
+  end
+  if $ctype != nil then
+    $hdrs["Content-Type"] = $ctype
+  end
+  if $extra != nil then
+    for each $k in $extra
+      $hdrs[$k] = $extra[$k]
+    end
+  end
+  return http_request($method, $BASE .. $path, $body, $hdrs,
+    {ssl_verify: $SSL_VERIFY, timeout: 30})
+end
+
+fn hdr1($resp, $name)
+  $vals = $resp.headers[$name]
+  if $vals == nil then
+    return nil
+  end
+  if type($vals) == "list" then
+    if length($vals) == 0 then
+      return nil
+    end
+    return $vals[0]
+  end
+  return $vals
+end
+
+fn as_list($v)
+  if $v == nil then
+    return []
+  end
+  if type($v) == "list" then
+    return $v
+  end
+  return [$v]
+end
+
+fn body_has($resp, $needle)
+  if $resp.body == nil then
+    return false
+  end
+  return pos($needle, $resp.body) > 0
+end
+
+-- ============================== FLOW 1: well-known + auth ==============================
+$r = http_request("GET", $BASE .. "/.well-known/caldav", nil, {}, {ssl_verify: $SSL_VERIFY})
+$wk_ok = $r.status == 401 and pos($DAV_ROOT, $r.final_url) > 0
+push($results, record(1, "well-known caldav redirects into DAV root (then 401 unauth)", $wk_ok, "status=" .. to_string($r.status) .. " final=" .. to_string($r.final_url)))
+
+$r = http_request("GET", $BASE .. "/.well-known/carddav", nil, {}, {ssl_verify: $SSL_VERIFY})
+$wk2_ok = $r.status == 401 and pos($DAV_ROOT, $r.final_url) > 0
+push($results, record(1, "well-known carddav redirects into DAV root (then 401 unauth)", $wk2_ok, "status=" .. to_string($r.status)))
+
+$r = http_request("PROPFIND", $BASE .. $DAV_ROOT .. "/", nil, {Depth: "0"}, {ssl_verify: $SSL_VERIFY})
+$www = hdr1($r, "www-authenticate")
+push($results, record(1, "unauthenticated PROPFIND challenges", $r.status == 401 and $www != nil, "status=" .. to_string($r.status) .. " www-authenticate=" .. to_string($www)))
+
+$r = req("PROPFIND", $DAV_ROOT .. "/", $AUTH1, "0", "<?xml version=\"1.0\"?><propfind xmlns=\"DAV:\"><prop><current-user-principal/></prop></propfind>", "application/xml", nil)
+push($results, record(1, "valid Basic auth accepted", $r.status == 207, "status=" .. to_string($r.status)))
+
+-- ============================== FLOW 2: principal discovery ==============================
+$principal = nil
+try
+  $x = xml_parse($r.body)
+  $resp0 = as_list($x.multistatus.response)[0]
+  $principal = $resp0.propstat.prop["current-user-principal"].href
+catch $m
+  $principal = nil
+end
+push($results, record(2, "current-user-principal discovered", $principal != nil, "principal=" .. to_string($principal)))
+
+$cal_home = nil
+$card_home = nil
+if $principal != nil then
+  $r = req("PROPFIND", $principal, $AUTH1, "0", "<?xml version=\"1.0\"?><propfind xmlns=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CR=\"urn:ietf:params:xml:ns:carddav\"><prop><C:calendar-home-set/><CR:addressbook-home-set/></prop></propfind>", "application/xml", nil)
+  try
+    $x = xml_parse($r.body)
+    $prop = as_list($x.multistatus.response)[0].propstat.prop
+    $cal_home = $prop["calendar-home-set"].href
+    $card_home = $prop["addressbook-home-set"].href
+  catch $m
+    $cal_home = nil
+  end
+end
+push($results, record(2, "home-sets discovered", $cal_home != nil and $card_home != nil, "cal=" .. to_string($cal_home) .. " card=" .. to_string($card_home)))
+
+-- ============================== FLOW 3: depth-1 home PROPFIND ==============================
+$cal_url = nil
+$cal_ctag = nil
+$cal_token = nil
+if $cal_home != nil then
+  $r = req("PROPFIND", $cal_home, $AUTH1, "1", "<?xml version=\"1.0\"?><propfind xmlns=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CS=\"http://calendarserver.org/ns/\"><prop><resourcetype/><displayname/><C:supported-calendar-component-set/><CS:getctag/><" .. $CHANGE .. "-token/><supported-report-set/></prop></propfind>", "application/xml", nil)
+  $has_reports = body_has($r, $CHANGE .. "-collection") and body_has($r, "calendar-multiget") and body_has($r, "calendar-query")
+  try
+    $x = xml_parse($r.body)
+    for each $resp in as_list($x.multistatus.response)
+      $rt = $resp.propstat.prop.resourcetype
+      if $rt != nil and $rt.calendar != nil then
+        $cal_url = $resp.href
+        $cal_ctag = $resp.propstat.prop.getctag
+        $cal_token = $resp.propstat.prop[$CHANGE .. "-token"]
+      end
+    end
+  catch $m
+    $cal_url = nil
+  end
+  push($results, record(3, "calendar collection found w/ ctag+change-token+reports", $cal_url != nil and $cal_ctag != nil and $cal_token != nil and $has_reports, "cal=" .. to_string($cal_url) .. " ctag=" .. to_string($cal_ctag)))
+else
+  push($results, record(3, "calendar collection found", false, "no cal home"))
+end
+
+$card_url = nil
+if $card_home != nil then
+  $r = req("PROPFIND", $card_home, $AUTH1, "1", "<?xml version=\"1.0\"?><propfind xmlns=\"DAV:\" xmlns:CS=\"http://calendarserver.org/ns/\"><prop><resourcetype/><displayname/><CS:getctag/><" .. $CHANGE .. "-token/><supported-report-set/></prop></propfind>", "application/xml", nil)
+  try
+    $x = xml_parse($r.body)
+    for each $resp in as_list($x.multistatus.response)
+      $rt = $resp.propstat.prop.resourcetype
+      if $rt != nil and $rt.addressbook != nil then
+        $card_url = $resp.href
+      end
+    end
+  catch $m
+    $card_url = nil
+  end
+  push($results, record(3, "addressbook collection found", $card_url != nil, "card=" .. to_string($card_url)))
+else
+  push($results, record(3, "addressbook collection found", false, "no card home"))
+end
+
+if $cal_url == nil or $card_url == nil then
+  print("ABORT: no calendar/addressbook collection — later flows impossible")
+  die("discovery failed")
+end
+
+-- ============================== FLOW 4a: initial change collection ==============================
+$DELTA_BODY = "<?xml version=\"1.0\"?><" .. $CHANGE .. "-collection xmlns=\"DAV:\"><" .. $CHANGE .. "-token/><" .. $CHANGE .. "-level>1</" .. $CHANGE .. "-level><prop><getetag/></prop></" .. $CHANGE .. "-collection>"
+$token_0 = nil
+$r = req("REPORT", $cal_url, $AUTH1, nil, $DELTA_BODY, "application/xml", nil)
+try
+  $x = xml_parse($r.body)
+  $token_0 = $x.multistatus[$CHANGE .. "-token"]
+catch $m
+  $token_0 = nil
+end
+push($results, record(4, "initial change-collection report returns token", $r.status == 207 and $token_0 != nil, "status=" .. to_string($r.status) .. " token=" .. to_string($token_0)))
+
+-- ============================== FLOW 6: PUT create + GET round-trip ==============================
+$UID1 = "gauntlet-tz-" .. to_string(time())
+$ICS1 = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//cosmix//gauntlet//EN\r\nBEGIN:VTIMEZONE\r\nTZID:Europe/Berlin\r\nBEGIN:STANDARD\r\nDTSTART:19700101T000000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nTZNAME:CET\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:" .. $UID1 .. "\r\nDTSTAMP:20260613T000000Z\r\nDTSTART;TZID=Europe/Berlin:20260615T090000\r\nDTEND;TZID=Europe/Berlin:20260615T100000\r\nSUMMARY:Gauntlet TZ event — 会議 🎉\r\nDESCRIPTION:Unicode + TZID fidelity check\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nDESCRIPTION:reminder\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+$ev1_path = $cal_url .. $UID1 .. ".ics"
+$r = req("PUT", $ev1_path, $AUTH1, nil, $ICS1, "text/calendar; charset=utf-8", {"If-None-Match": "*"})
+$etag1 = hdr1($r, "etag")
+$put_ok = ($r.status == 201 or $r.status == 204 or $r.status == 200)
+push($results, record(6, "PUT create (If-None-Match: *)", $put_ok, "status=" .. to_string($r.status) .. " etag=" .. to_string($etag1)))
+
+$r = req("GET", $ev1_path, $AUTH1, nil, nil, nil, nil)
+$get_etag = hdr1($r, "etag")
+$fidelity1 = body_has($r, "UID:" .. $UID1) and body_has($r, "TZID=Europe/Berlin") and body_has($r, "会議 🎉") and body_has($r, "BEGIN:VALARM")
+$etag_stable = ($etag1 == nil) or ($get_etag == $etag1)
+push($results, record(6, "GET round-trip: UID+TZID+Unicode+VALARM survive, ETag stable", $r.status == 200 and $fidelity1 and $etag_stable, "status=" .. to_string($r.status) .. " get_etag=" .. to_string($get_etag) .. " fidelity=" .. to_string($fidelity1)))
+$etag_current = $get_etag
+
+-- ============================== FLOW 7: conditional update ==============================
+$ICS1B = replace($ICS1, "SUMMARY:Gauntlet TZ event — 会議 🎉", "SUMMARY:Gauntlet TZ event UPDATED — 会議 🎉")
+$r = req("PUT", $ev1_path, $AUTH1, nil, $ICS1B, "text/calendar; charset=utf-8", {"If-Match": "\"bogus-etag-12345\""})
+push($results, record(7, "PUT update w/ stale If-Match → 412", $r.status == 412, "status=" .. to_string($r.status)))
+
+$upd_hdrs = nil
+if $etag_current != nil then
+  $upd_hdrs = {"If-Match": $etag_current}
+end
+$r = req("PUT", $ev1_path, $AUTH1, nil, $ICS1B, "text/calendar; charset=utf-8", $upd_hdrs)
+$etag_after_update = hdr1($r, "etag")
+$upd_ok = ($r.status == 204 or $r.status == 200 or $r.status == 201)
+push($results, record(7, "PUT update w/ current If-Match succeeds", $upd_ok, "status=" .. to_string($r.status) .. " new_etag=" .. to_string($etag_after_update)))
+
+$r = req("PUT", $ev1_path, $AUTH1, nil, $ICS1, "text/calendar; charset=utf-8", {"If-None-Match": "*"})
+push($results, record(7, "re-create over existing (If-None-Match: *) → 412", $r.status == 412, "status=" .. to_string($r.status)))
+
+-- Refresh the ETag after the update.
+$r = req("GET", $ev1_path, $AUTH1, nil, nil, nil, nil)
+$etag_current = hdr1($r, "etag")
+$upd_visible = body_has($r, "UPDATED")
+push($results, record(7, "update visible on GET", $upd_visible, "etag=" .. to_string($etag_current)))
+
+-- ============================== FLOW 9: calendar-query time-range ==============================
+-- The second event is far away in time and must be excluded by the June query.
+$UID2 = "gauntlet-jan-" .. to_string(time())
+$ICS2 = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//cosmix//gauntlet//EN\r\nBEGIN:VEVENT\r\nUID:" .. $UID2 .. "\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260110T090000Z\r\nDTEND:20260110T100000Z\r\nSUMMARY:Gauntlet January event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+$ev2_path = $cal_url .. $UID2 .. ".ics"
+$r = req("PUT", $ev2_path, $AUTH1, nil, $ICS2, "text/calendar; charset=utf-8", {"If-None-Match": "*"})
+push($results, record(9, "PUT second event (January)", $r.status == 201 or $r.status == 204 or $r.status == 200, "status=" .. to_string($r.status)))
+
+-- The all-day recurring event also lands in the June range.
+$UID3 = "gauntlet-rrule-" .. to_string(time())
+$ICS3 = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//cosmix//gauntlet//EN\r\nBEGIN:VEVENT\r\nUID:" .. $UID3 .. "\r\nDTSTAMP:20260601T000000Z\r\nDTSTART;VALUE=DATE:20260616\r\nDTEND;VALUE=DATE:20260617\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\nSUMMARY:Gauntlet all-day recurring\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+$ev3_path = $cal_url .. $UID3 .. ".ics"
+$r = req("PUT", $ev3_path, $AUTH1, nil, $ICS3, "text/calendar; charset=utf-8", {"If-None-Match": "*"})
+push($results, record(10, "PUT all-day recurring event", $r.status == 201 or $r.status == 204 or $r.status == 200, "status=" .. to_string($r.status)))
+
+$QBODY = "<?xml version=\"1.0\"?><C:calendar-query xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:prop><D:getetag/><C:calendar-data/></D:prop><C:filter><C:comp-filter name=\"VCALENDAR\"><C:comp-filter name=\"VEVENT\"><C:time-range start=\"20260601T000000Z\" end=\"20260630T000000Z\"/></C:comp-filter></C:comp-filter></C:filter></C:calendar-query>"
+$r = req("REPORT", $cal_url, $AUTH1, "1", $QBODY, "application/xml", nil)
+$q_has_june = body_has($r, $UID1) and body_has($r, $UID3)
+$q_excludes_jan = not body_has($r, $UID2)
+push($results, record(9, "calendar-query time-range includes June events", $r.status == 207 and $q_has_june, "status=" .. to_string($r.status)))
+push($results, record(9, "calendar-query time-range EXCLUDES January event", $q_excludes_jan, "jan_leaked=" .. to_string(not $q_excludes_jan)))
+
+-- Fidelity of recurring/all-day data on GET.
+$r = req("GET", $ev3_path, $AUTH1, nil, nil, nil, nil)
+$fid3 = body_has($r, "RRULE:FREQ=WEEKLY;COUNT=4") and body_has($r, "VALUE=DATE")
+push($results, record(10, "GET round-trip: RRULE + all-day VALUE=DATE survive", $fid3, "status=" .. to_string($r.status)))
+
+-- ============================== FLOW 5: calendar-multiget ==============================
+$MGBODY = "<?xml version=\"1.0\"?><C:calendar-multiget xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:prop><D:getetag/><C:calendar-data/></D:prop><D:href>" .. $ev1_path .. "</D:href><D:href>" .. $cal_url .. "does-not-exist.ics</D:href></C:calendar-multiget>"
+$r = req("REPORT", $cal_url, $AUTH1, "1", $MGBODY, "application/xml", nil)
+$mg_found = body_has($r, $UID1)
+$mg_404 = body_has($r, "404")
+push($results, record(5, "calendar-multiget: existing returns data, missing returns 404 status", $r.status == 207 and $mg_found and $mg_404, "status=" .. to_string($r.status) .. " found=" .. to_string($mg_found) .. " miss404=" .. to_string($mg_404)))
+
+-- ============================== FLOW 4b: change delta ==============================
+$r = req("REPORT", $cal_url, $AUTH1, nil, replace($DELTA_BODY, "<" .. $CHANGE .. "-token/>", "<" .. $CHANGE .. "-token>" .. $token_0 .. "</" .. $CHANGE .. "-token>"), "application/xml", nil)
+$delta_has_new = body_has($r, $UID1) and body_has($r, $UID2) and body_has($r, $UID3)
+$token_1 = nil
+try
+  $x = xml_parse($r.body)
+  $token_1 = $x.multistatus[$CHANGE .. "-token"]
+catch $m
+  $token_1 = nil
+end
+push($results, record(4, "change delta after creates lists new objects + new token", $r.status == 207 and $delta_has_new and $token_1 != nil and $token_1 != $token_0, "status=" .. to_string($r.status) .. " has_new=" .. to_string($delta_has_new)))
+
+$r = req("REPORT", $cal_url, $AUTH1, nil, replace($DELTA_BODY, "<" .. $CHANGE .. "-token/>", "<" .. $CHANGE .. "-token>https://cosmix.invalid/ns/" .. $CHANGE .. "/999999999</" .. $CHANGE .. "-token>"), "application/xml", nil)
+$bad_token_handled = $r.status >= 400 and $r.status < 500
+push($results, record(4, "stale/invalid change token rejected (4xx, forces fresh collection)", $bad_token_handled, "status=" .. to_string($r.status)))
+
+-- ============================== FLOW 8: conditional DELETE + tombstone ==============================
+$r = req("DELETE", $ev2_path, $AUTH1, nil, nil, nil, {"If-Match": "\"bogus\""})
+push($results, record(8, "DELETE w/ stale If-Match → 412", $r.status == 412, "status=" .. to_string($r.status)))
+
+$r = req("DELETE", $ev2_path, $AUTH1, nil, nil, nil, nil)
+push($results, record(8, "DELETE succeeds (204)", $r.status == 204 or $r.status == 200, "status=" .. to_string($r.status)))
+
+$r = req("REPORT", $cal_url, $AUTH1, nil, replace($DELTA_BODY, "<" .. $CHANGE .. "-token/>", "<" .. $CHANGE .. "-token>" .. $token_1 .. "</" .. $CHANGE .. "-token>"), "application/xml", nil)
+$tomb = body_has($r, $UID2) and body_has($r, "404")
+push($results, record(8, "change delta shows tombstone for deleted object", $r.status == 207 and $tomb, "status=" .. to_string($r.status) .. " tomb=" .. to_string($tomb)))
+
+-- ============================== FLOW 10b/11: CardDAV ==============================
+$CUID1 = "gauntlet-card-" .. to_string(time())
+$VCF1 = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:" .. $CUID1 .. "\r\nFN:Zoë Gauntlet-Tester\r\nN:Gauntlet-Tester;Zoë;;;\r\nEMAIL;TYPE=WORK:zoe@example.org\r\nEMAIL;TYPE=HOME:zoe.home@example.org\r\nTEL;TYPE=CELL:+1 202 555 0101\r\nTEL;TYPE=WORK:+1 202 555 0102\r\nADR;TYPE=HOME:;;1 Test St;Example City;Example State;0000;Example Country\r\nORG:Cosmix\r\nEND:VCARD\r\n"
+$card1_path = $card_url .. $CUID1 .. ".vcf"
+$r = req("PUT", $card1_path, $AUTH1, nil, $VCF1, "text/vcard; charset=utf-8", {"If-None-Match": "*"})
+push($results, record(10, "PUT vCard (multi-EMAIL/TEL/ADR, Unicode FN)", $r.status == 201 or $r.status == 204 or $r.status == 200, "status=" .. to_string($r.status)))
+
+$r = req("GET", $card1_path, $AUTH1, nil, nil, nil, nil)
+$cfid = body_has($r, "Zoë") and body_has($r, "zoe.home@example.org") and body_has($r, "TEL;TYPE=WORK") and body_has($r, "ADR")
+push($results, record(10, "GET round-trip: vCard multi-value fields + Unicode survive", $r.status == 200 and $cfid, "status=" .. to_string($r.status)))
+
+-- Addressbook-query, matching a client's initial all-cards collection shape.
+$ABQ = "<?xml version=\"1.0\"?><CR:addressbook-query xmlns:D=\"DAV:\" xmlns:CR=\"urn:ietf:params:xml:ns:carddav\"><D:prop><D:getetag/><CR:address-data/></D:prop></CR:addressbook-query>"
+$r = req("REPORT", $card_url, $AUTH1, "1", $ABQ, "application/xml", nil)
+push($results, record(11, "addressbook-query (all-cards shape) returns created card", $r.status == 207 and body_has($r, $CUID1), "status=" .. to_string($r.status)))
+
+-- Addressbook-multiget.
+$ABMG = "<?xml version=\"1.0\"?><CR:addressbook-multiget xmlns:D=\"DAV:\" xmlns:CR=\"urn:ietf:params:xml:ns:carddav\"><D:prop><D:getetag/><CR:address-data/></D:prop><D:href>" .. $card1_path .. "</D:href><D:href>" .. $card_url .. "missing.vcf</D:href></CR:addressbook-multiget>"
+$r = req("REPORT", $card_url, $AUTH1, "1", $ABMG, "application/xml", nil)
+push($results, record(5, "addressbook-multiget: existing + missing handled", $r.status == 207 and body_has($r, $CUID1) and body_has($r, "404"), "status=" .. to_string($r.status)))
+
+-- CardDAV change-collection report.
+$r = req("REPORT", $card_url, $AUTH1, nil, $DELTA_BODY, "application/xml", nil)
+$card_delta_ok = $r.status == 207 and body_has($r, $CUID1)
+push($results, record(4, "CardDAV change-collection report lists card", $card_delta_ok, "status=" .. to_string($r.status)))
+
+-- ============================== FLOW 12: account isolation ==============================
+$r = req("GET", $ev1_path, $AUTH2, nil, nil, nil, nil)
+$iso1 = $r.status == 403 or $r.status == 404
+push($results, record(12, "account2 GET account1 event → 403/404", $iso1, "status=" .. to_string($r.status)))
+
+$r = req("PROPFIND", $cal_url, $AUTH2, "1", "<?xml version=\"1.0\"?><propfind xmlns=\"DAV:\"><prop><resourcetype/></prop></propfind>", "application/xml", nil)
+$iso2 = $r.status == 403 or $r.status == 404
+push($results, record(12, "account2 PROPFIND account1 calendar → 403/404", $iso2, "status=" .. to_string($r.status)))
+
+$r = http_request("PROPFIND", $BASE .. $DAV_ROOT .. "/", nil, {Authorization: "Basic " .. base64_encode($U1 .. ":wrong-password"), Depth: "0"}, {ssl_verify: $SSL_VERIFY})
+push($results, record(12, "wrong password → 401", $r.status == 401, "status=" .. to_string($r.status)))
+
+-- ============================== FLOW 13 (nice-to-have): MKCALENDAR / PROPPATCH ==============================
+$r = req("MKCALENDAR", $cal_home .. "gauntlet-extra/", $AUTH1, nil, nil, nil, nil)
+push($results, record(13, "MKCALENDAR (nice-to-have)", $r.status == 201, "status=" .. to_string($r.status) .. " (non-gating)"))
+
+$r = req("PROPPATCH", $cal_url, $AUTH1, nil, "<?xml version=\"1.0\"?><propertyupdate xmlns=\"DAV:\"><set><prop><displayname>Personal Renamed</displayname></prop></set></propertyupdate>", "application/xml", nil)
+push($results, record(13, "PROPPATCH displayname (nice-to-have)", $r.status == 207 or $r.status == 200, "status=" .. to_string($r.status) .. " (non-gating)"))
+
+-- ============================== cleanup scratch objects ==============================
+$r = req("DELETE", $ev1_path, $AUTH1, nil, nil, nil, nil)
+$r = req("DELETE", $ev3_path, $AUTH1, nil, nil, nil, nil)
+$r = req("DELETE", $card1_path, $AUTH1, nil, nil, nil, nil)
+
+-- ============================== summary ==============================
+$n_pass = 0
+$n_fail = 0
+$must_fail = 0
+for each $res in $results
+  if $res.pass then
+    $n_pass = $n_pass + 1
+  else
+    $n_fail = $n_fail + 1
+    if $res.flow != 13 then
+      $must_fail = $must_fail + 1
+    end
+  end
+end
+print("")
+print("=== dav_gauntlet summary ===")
+print("pass: " .. to_string($n_pass) .. "  fail: " .. to_string($n_fail) .. "  (must-pass failures: " .. to_string($must_fail) .. ")")
+write_file($RESULTS_PATH, json_encode($results, true))
+print("results: " .. $RESULTS_PATH)

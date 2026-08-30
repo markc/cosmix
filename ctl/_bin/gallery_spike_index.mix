@@ -1,0 +1,243 @@
+#!/usr/bin/env mix
+-- gallery_spike_index.mix — build an incremental metadata-only media index.
+--
+-- The source tree is read-only. Existing rows are keyed by relative path,
+-- size and mtime; unchanged files are skipped and vanished files are
+-- tombstoned. Site paths come from the private control-hub configuration.
+--
+-- Usage: mix _bin/gallery_spike_index.mix [media-root [database-dir]]
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn config_error($message)
+  print("  ERROR: " .. $message)
+  exit(2)
+end
+
+$argv = args()
+if len($argv) > 2 then
+  print("usage: mix gallery_spike_index.mix [media-root [database-dir]]")
+  exit(2)
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/gallery_spike_index.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no gallery spike index configuration at " .. $CONF_PATH)
+  print("         copy _etc/gallery_spike_index.conf.mix.example there and set the site paths")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["gallery_spike_index"], {
+    schema_version: {type: "integer", enum: [1]},
+    media_root: {type: "string", nonblank: true},
+    database_dir: {type: "string", nonblank: true}
+  })
+catch $error
+  config_error("invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+end
+
+$ROOT = $CONF["media_root"]
+$DBDIR = $CONF["database_dir"]
+if len($argv) >= 1 then
+  $ROOT = $argv[0]
+end
+if len($argv) >= 2 then
+  $DBDIR = $argv[1]
+end
+
+if not starts_with($ROOT, "/") then
+  config_error("media root must be an absolute path: " .. $ROOT)
+end
+if not starts_with($DBDIR, "/") then
+  config_error("database directory must be an absolute path: " .. $DBDIR)
+end
+if not is_dir($ROOT) then
+  config_error("media root is not a directory: " .. $ROOT)
+end
+if exists($DBDIR) and not is_dir($DBDIR) then
+  config_error("database path exists but is not a directory: " .. $DBDIR)
+end
+
+$DB = $DBDIR .. "/index.db"
+$IMG_EXTS = {jpg: 1, jpeg: 1, png: 1, gif: 1, webp: 1}
+$VID_EXTS = {mp4: 1, mov: 1, "3gp": 1, mpg: 1, mkv: 1, avi: 1, webm: 1}
+
+fn file_ext($path)
+  -- lastpos is needle-first, 1-based, 0 = not found.
+  $p = lastpos(".", $path)
+  if $p == 0 then
+    return ""
+  end
+  return lower(substr($path, $p, length($path) - $p))
+end
+
+-- EXIF "YYYY:MM:DD HH:MM:SS" -> "YYYY-MM-DD HH:MM:SS"; bad input -> nil.
+fn exif_date_to_iso($value)
+  $value = trim($value)
+  if length($value) < 19 then
+    return nil
+  end
+  $date = replace(substr($value, 0, 10), ":", "-")
+  $clock = substr($value, 11, 8)
+  if substr($date, 0, 2) != "19" and substr($date, 0, 2) != "20" then
+    return nil
+  end
+  return $date .. " " .. $clock
+end
+
+mkdir($DBDIR)
+$h = sqlopen($DB, "rw")
+sqlexec($h, "CREATE TABLE IF NOT EXISTS media (id INTEGER PRIMARY KEY, relpath TEXT UNIQUE NOT NULL, size INTEGER NOT NULL, mtime REAL NOT NULL, kind TEXT NOT NULL, width INTEGER, height INTEGER, duration REAL, taken_at TEXT, date_source TEXT, orientation INTEGER, error TEXT, deleted INTEGER NOT NULL DEFAULT 0, indexed_at INTEGER NOT NULL)")
+sqlexec($h, "CREATE INDEX IF NOT EXISTS idx_media_taken ON media(taken_at) WHERE deleted = 0")
+
+-- Existing path -> size:mtime key for unchanged-file skips.
+$existing = {}
+$rows = sqlexec($h, "SELECT relpath, size, mtime FROM media WHERE deleted = 0")
+for each $row in $rows
+  $existing[$row["relpath"]] = to_string($row["size"]) .. ":" .. to_string($row["mtime"])
+end
+
+$files = walk($ROOT)
+$seen = {}
+$n_total = 0
+$n_skipped = 0
+$n_indexed = 0
+$n_errors = 0
+$n_other = 0
+$t0 = time()
+
+sqlexec($h, "BEGIN")
+for each $path in $files
+  $st = stat($path)
+  if not $st["is_file"] then
+    continue
+  end
+  $rel = substr($path, length($ROOT) + 1, length($path) - length($ROOT) - 1)
+  $seen[$rel] = 1
+  $n_total = $n_total + 1
+
+  $key = to_string($st["size"]) .. ":" .. to_string($st["mtime"])
+  if $existing[$rel] == $key then
+    $n_skipped = $n_skipped + 1
+    continue
+  end
+
+  $ext = file_ext($path)
+  $kind = "other"
+  if $IMG_EXTS[$ext] != nil then
+    $kind = "image"
+  end
+  if $VID_EXTS[$ext] != nil then
+    $kind = "video"
+  end
+
+  $width = nil
+  $height = nil
+  $duration = nil
+  $taken = nil
+  $source = nil
+  $orient = nil
+  $err = nil
+
+  if $kind == "image" then
+    $result = run_argv(["/usr/bin/magick", "identify", "-format", "%w|%h|%[EXIF:DateTimeOriginal]|%[EXIF:Orientation]", $path], {timeout: 60})
+    if $result["exit_code"] == 0 then
+      $parts = split($result["stdout"], "|")
+      if length($parts) >= 2 then
+        $width = to_number($parts[0])
+        $height = to_number($parts[1])
+      end
+      if length($parts) >= 3 then
+        $taken = exif_date_to_iso($parts[2])
+        if $taken != nil then
+          $source = "exif"
+        end
+      end
+      if length($parts) >= 4 then
+        $orient = to_number(trim($parts[3]))
+      end
+    else
+      $err = "identify: " .. sanitize(substr($result["stderr"], 0, 200))
+    end
+  end
+
+  if $kind == "video" then
+    $result = run_argv(["/usr/bin/ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", $path], {timeout: 60})
+    if $result["exit_code"] == 0 then
+      try
+        $probe = json_parse($result["stdout"])
+        for each $stream in $probe["streams"]
+          if $stream["codec_type"] == "video" then
+            $width = $stream["width"]
+            $height = $stream["height"]
+          end
+        end
+        $duration = to_number($probe["format"]["duration"])
+        $tags = $probe["format"]["tags"]
+        if $tags != nil and $tags["creation_time"] != nil then
+          $created = replace($tags["creation_time"], "T", " ")
+          $taken = substr($created, 0, 19)
+          $source = "video_meta"
+        end
+      catch $error
+        $err = "ffprobe-parse: " .. sanitize(substr($error, 0, 200))
+      end
+    else
+      $err = "ffprobe: " .. sanitize(substr($result["stderr"], 0, 200))
+    end
+  end
+
+  if $taken == nil then
+    $taken = date_format($st["mtime"], "%Y-%m-%d %H:%M:%S")
+    $source = "mtime"
+  end
+
+  if $err != nil then
+    $n_errors = $n_errors + 1
+  end
+  if $kind == "other" then
+    $n_other = $n_other + 1
+  end
+
+  sqlexec($h, "INSERT INTO media (relpath, size, mtime, kind, width, height, duration, taken_at, date_source, orientation, error, deleted, indexed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?) ON CONFLICT(relpath) DO UPDATE SET size=excluded.size, mtime=excluded.mtime, kind=excluded.kind, width=excluded.width, height=excluded.height, duration=excluded.duration, taken_at=excluded.taken_at, date_source=excluded.date_source, orientation=excluded.orientation, error=excluded.error, deleted=0, indexed_at=excluded.indexed_at", [$rel, $st["size"], $st["mtime"], $kind, $width, $height, $duration, $taken, $source, $orient, $err, time()])
+  $n_indexed = $n_indexed + 1
+
+  if $n_indexed % 200 == 0 then
+    sqlexec($h, "COMMIT")
+    sqlexec($h, "BEGIN")
+    print("indexed " .. to_string($n_indexed) .. " (" .. to_string(time() - $t0) .. "s)")
+  end
+end
+sqlexec($h, "COMMIT")
+
+-- Tombstone rows whose source files vanished.
+$n_tomb = 0
+$live = sqlexec($h, "SELECT relpath FROM media WHERE deleted = 0")
+sqlexec($h, "BEGIN")
+for each $row in $live
+  if $seen[$row["relpath"]] == nil then
+    sqlexec($h, "UPDATE media SET deleted = 1 WHERE relpath = ?", [$row["relpath"]])
+    $n_tomb = $n_tomb + 1
+  end
+end
+sqlexec($h, "COMMIT")
+
+$elapsed = time() - $t0
+print("=== gallery_spike_index summary ===")
+print("root:      " .. $ROOT)
+print("total:     " .. to_string($n_total))
+print("indexed:   " .. to_string($n_indexed))
+print("skipped:   " .. to_string($n_skipped))
+print("errors:    " .. to_string($n_errors))
+print("other:     " .. to_string($n_other))
+print("tombstone: " .. to_string($n_tomb))
+print("elapsed:   " .. to_string($elapsed) .. "s")
+
+$stats = sqlexec($h, "SELECT date_source, count(*) AS n FROM media WHERE deleted = 0 GROUP BY date_source")
+for each $row in $stats
+  print("date_source " .. to_string($row["date_source"]) .. ": " .. to_string($row["n"]))
+end
+sqlclose($h)

@@ -1,0 +1,740 @@
+#!/usr/bin/env mix
+-- smoke_chrome_close.mix — local Phase 3 SSD chrome close gate.
+--
+-- This workstation-only tool never reads the fleet roster or contacts the
+-- mesh. The nested arm launches a local compositor and client, asks the fixed
+-- visual checklist, tears both down, and checks the run log. The KMS arm stays
+-- a printed run book because taking the VT removes this terminal and requires
+-- the operator to type the compositor's confirmation nonce.
+--
+-- Usage:
+--   mix _bin/smoke_chrome_close.mix nested
+--   mix _bin/smoke_chrome_close.mix kms-plan
+--   mix _bin/smoke_chrome_close.mix kms-check
+--   mix _bin/smoke_chrome_close.mix machine-check
+--   mix _bin/smoke_chrome_close.mix report
+
+$d = require("../_lib/deploy_lib.mix")
+
+fn config_error($message)
+  print("  ERROR: " .. $message)
+  exit(2)
+end
+
+fn has_str($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then
+      return true
+    end
+  end
+  return false
+end
+
+fn assert_only_keys($value, $allowed, $where)
+  if type($value) != "map" then
+    config_error($where .. " must be a map")
+  end
+  for each $key in keys($value)
+    if not has_str($allowed, $key) then
+      config_error($where .. " contains unknown key '" .. $key .. "'")
+    end
+  end
+end
+
+fn assert_unique_strings($items, $where)
+  $seen = []
+  for each $item in $items
+    if has_str($seen, $item) then
+      config_error($where .. " repeats '" .. $item .. "'")
+    end
+    push($seen, $item)
+  end
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/smoke_chrome_close.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no smoke_chrome_close configuration at " .. $CONF_PATH)
+  print("         copy _etc/smoke_chrome_close.conf.mix.example there and set this workstation's values")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  assert_only_keys($loaded, ["smoke_chrome_close"], $CONF_PATH)
+  $CONF = validate($loaded["smoke_chrome_close"], {
+    schema_version: {type: "integer", enum: [1]},
+    log_dir: {type: "string", nonblank: true},
+    styles: {type: "list", min_length: 1, items: {type: "string", nonblank: true}},
+    scales: {type: "list", min_length: 1, items: {type: "string", nonblank: true}},
+    nested_client_argv: {type: "list", min_length: 1, items: {type: "string", nonblank: true}},
+    dmabuf_client_argv: {type: "list", min_length: 1, items: {type: "string", nonblank: true}},
+    rust_log: {type: "string", nonblank: true},
+    expected_family: {type: "string", nonblank: true},
+    expected_size_px: {type: "string", nonblank: true},
+    expected_weight: {type: "string", nonblank: true},
+    drm_device: {type: "string", nonblank: true},
+    drm_connector: {type: "string", nonblank: true},
+    kms_vt: {type: "integer", min: 1, max: 63},
+    wayland_socket: {type: "string", nonblank: true}
+  })
+  assert_only_keys($CONF, [
+    "schema_version", "log_dir", "styles", "scales",
+    "nested_client_argv", "dmabuf_client_argv", "rust_log",
+    "expected_family", "expected_size_px", "expected_weight",
+    "drm_device", "drm_connector", "kms_vt", "wayland_socket"
+  ], "smoke_chrome_close")
+catch $error
+  config_error("invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+end
+
+$LOG_DIR = $CONF["log_dir"]
+$STYLES = $CONF["styles"]
+$SCALES = $CONF["scales"]
+$NESTED_CLIENT_ARGV = $CONF["nested_client_argv"]
+$DMABUF_CLIENT_ARGV = $CONF["dmabuf_client_argv"]
+$LOG_FILTER = $CONF["rust_log"]
+$EXPECT_FAMILY = $CONF["expected_family"]
+$EXPECT_SIZE_PX = $CONF["expected_size_px"]
+$EXPECT_WEIGHT = $CONF["expected_weight"]
+$DEVICE = $CONF["drm_device"]
+$CONNECTOR = $CONF["drm_connector"]
+$KMS_VT = to_string($CONF["kms_vt"])
+$WAYLAND_SOCKET = $CONF["wayland_socket"]
+
+if not starts_with($LOG_DIR, "/") then
+  config_error("smoke_chrome_close.log_dir must be absolute")
+end
+for each $argv in [$NESTED_CLIENT_ARGV, $DMABUF_CLIENT_ARGV]
+  if not starts_with($argv[0], "/") then
+    config_error("client argv[0] paths must be absolute (got '" .. $argv[0] .. "')")
+  end
+end
+if not starts_with($DEVICE, "/dev/dri/") then
+  config_error("smoke_chrome_close.drm_device must be an absolute /dev/dri path")
+end
+if not regex_match("^[A-Za-z0-9_.-]+$", $CONNECTOR) then
+  config_error("smoke_chrome_close.drm_connector contains unsafe characters")
+end
+if not regex_match("^[A-Za-z0-9_.-]+$", $WAYLAND_SOCKET) then
+  config_error("smoke_chrome_close.wayland_socket contains unsafe characters")
+end
+assert_unique_strings($STYLES, "smoke_chrome_close.styles")
+assert_unique_strings($SCALES, "smoke_chrome_close.scales")
+for each $style in $STYLES
+  if not has_str(["mac", "win11", "cosmix"], $style) then
+    config_error("unsupported chrome style '" .. $style .. "'")
+  end
+end
+for each $scale in $SCALES
+  if not has_str(["1.0", "2.5"], $scale) then
+    config_error("unsupported output scale '" .. $scale .. "'")
+  end
+end
+
+-- deploy_lib locates the main workspace release directory. The desktop is a
+-- separate workspace, so derive its release output from the same CosMix root.
+fn desktop_bin($name)
+  $target = env("CARGO_TARGET_DIR")
+  if $target != "" then
+    return $target .. "/release/" .. $name
+  end
+  return $d.cosmix_root() .. "/src/desktop/target/release/" .. $name
+end
+
+$COMP = desktop_bin("cosmix-comp")
+
+-- Eyes-only questions are ordered for one pass around the window. The scaled
+-- question is omitted at 1x.
+fn eye_questions()
+  return [
+    {
+      id: "style_identity",
+      scaled: false,
+      ask: "Does the chrome match the style launched (mac = three round traffic lights; win11 = square caption buttons at the right; cosmix = pill buttons)?"
+    },
+    {
+      id: "title_face",
+      scaled: false,
+      ask: "Is the title text a LIGHT sans face at roughly 11pt — no tofu boxes, not bold, not the mono fallback?"
+    },
+    {
+      id: "offscreen",
+      scaled: false,
+      ask: "Drag the window until it is PARTLY OFF-SCREEN past each edge in turn, far enough that its CENTRE leaves the screen. Do chrome and client stay drawn the whole way (nothing blinks out)?"
+    },
+    {
+      id: "focus",
+      scaled: false,
+      ask: "Open a second client and switch focus between them. Does the unfocused titlebar visibly demote, and does refocusing restore it?"
+    },
+    {
+      id: "maximise",
+      scaled: false,
+      ask: "Maximise (double-click the titlebar) and restore. Does the window return to exactly its previous geometry with the chrome still correct?"
+    },
+    {
+      id: "crispness",
+      scaled: true,
+      ask: "At this scale, is the TITLE text as crisp as the client's own text — rasterised at the output scale rather than magnified from 1x?"
+    },
+    {
+      id: "corners",
+      scaled: false,
+      ask: "Are the rounded corners and the drop shadow clean — no hard stair-steps, dark halo or torn edge?"
+    }
+  ]
+end
+
+fn log_path($backend, $style, $scale)
+  return $LOG_DIR .. "/close-" .. $backend .. "-" .. $style .. "-" .. replace($scale, ".", "-") .. ".log"
+end
+
+fn dmabuf_log_path($scale)
+  return $LOG_DIR .. "/close-kms-dmabuf-" .. replace($scale, ".", "-") .. ".log"
+end
+
+-- Tracing colourises field names and equals signs, so strip ANSI before
+-- matching. Add a newline so a cleanly written final field can be anchored.
+fn log_text($path)
+  return regex_replace("\u{1b}\\[[0-9;]*m", read_file($path), "") .. "\n"
+end
+
+-- pos is needle-first. Keeping the wrapper prevents a reversed call from
+-- turning every positive check into a silent miss.
+fn has($needle, $haystack)
+  return pos($needle, $haystack) > 0
+end
+
+fn chrome_field($style)
+  if $style == "mac" then return "Mac" end
+  if $style == "win11" then return "Win11" end
+  if $style == "cosmix" then return "Cosmix" end
+  raise("SMOKE_UNKNOWN_STYLE", "no chrome field name for style " .. $style)
+end
+
+fn scale120($scale)
+  if $scale == "1.0" then return "120" end
+  if $scale == "2.5" then return "300" end
+  raise("SMOKE_UNKNOWN_SCALE", "no scale120 mapping for " .. $scale .. " — add one rather than guessing")
+end
+
+-- Return all machine-gate failures for one compositor log. Absence of errors
+-- is checked only after positive evidence proves that a decorated client ran.
+fn check_log($path, $style, $scale, $expect_scale_line)
+  if not exists($path) then
+    return ["no log at " .. $path .. " — this configuration was never run"]
+  end
+  $text = log_text($path)
+  $failures = []
+
+  if not has("resolved decoration startup ssd=true chrome=" .. chrome_field($style) .. " ", $text) then
+    push($failures, "startup did not resolve to SSD + chrome=" .. chrome_field($style))
+  end
+  if not has("resolved chrome title face ", $text) then
+    push($failures, "no chrome title face report — typography never resolved")
+  end
+  if not has("resolved_family=\"" .. $EXPECT_FAMILY .. "\" ", $text) then
+    push($failures, "title family is not " .. $EXPECT_FAMILY)
+  end
+  if not has("rung=Theme ", $text) then
+    push($failures, "the title face came from a RESCUE rung, not the theme — this host lacks the themed family")
+  end
+  if not has("title_size_px=" .. $EXPECT_SIZE_PX .. " ", $text) then
+    push($failures, "title size is not " .. $EXPECT_SIZE_PX .. " logical px")
+  end
+  if not has("title_font_weight=" .. $EXPECT_WEIGHT .. "\n", $text) then
+    push($failures, "title weight is not " .. $EXPECT_WEIGHT)
+  end
+
+  if $expect_scale_line and not has("scale120=" .. scale120($scale) .. "\n", $text) then
+    push($failures, "output scale is not " .. $scale .. " (scale120=" .. scale120($scale) .. ")")
+  end
+
+  if not has("client acknowledged xdg configure", $text) then
+    push($failures, "no xdg-configure ack line at all — this run lacked RUST_LOG=" ..
+      $LOG_FILTER .. ", so the SSD gate could not be evaluated")
+  else
+    if not has("acknowledged_decoration=Some(ServerSide)", $text) then
+      push($failures, "no client acked ServerSide decorations — chrome was never spawned")
+    end
+  end
+  if not has("first surface buffer committed", $text) then
+    push($failures, "no surface buffer committed — the client never mapped")
+  end
+  if has("failed to process shader", $text) then
+    push($failures, "SHADER COMPILATION FAILED")
+  end
+  if has("ERROR", $text) then
+    push($failures, "the compositor logged an ERROR")
+  end
+  return $failures
+end
+
+-- The DMA-BUF probes exist only in the KMS build. Presence is not enough: all
+-- three stages must sample client content, and content must not disappear
+-- after the first successful output sample before compositor teardown.
+fn check_dmabuf_log($path, $scale)
+  if not exists($path) then
+    return ["no log at " .. $path .. " — the DMA-BUF probe run never happened"]
+  end
+  $text = log_text($path)
+  $failures = []
+  if not has("kms-live DMA-BUF instrumentation enabled", $text) then
+    push($failures, "instrumentation never engaged — COSMIX_DMABUF_PROBE=1 was not set, or the binary lacks the kms-live feature")
+  end
+  if not has("probe=true", $text) then
+    push($failures, "instrumentation ran with probing OFF")
+  end
+  if not has("scale120=" .. scale120($scale) .. "\n", $text) then
+    push($failures, "output scale is not " .. $scale)
+  end
+  if not has("buffer_kind=\"dmabuf\"", $text) then
+    push($failures, "the client committed SHM, not a DMA-BUF — the probe path was never under test")
+  end
+  if not has("DMA-BUF GPU probe stage=\"import\"", $text) then
+    push($failures, "no import-stage GPU probe readback — the client buffer was never sampled at import")
+  end
+  if not has("DMA-BUF GPU probe stage=\"post-render\"", $text) then
+    push($failures, "no post-render-stage GPU probe readback")
+  end
+  if not has("DMA-BUF GPU probe stage=\"output\"", $text) then
+    push($failures, "the output probe never found a visible sprite rect — no client content reached the screen")
+  end
+
+  $saw_success = false
+  $torn_down = false
+  $vanished = false
+  for each $line in split($text, "\n")
+    if not $torn_down then
+      if has("kms-live-signal: received signal", $line) then
+        $torn_down = true
+      else
+        if has("DMA-BUF GPU probe stage=\"output\"", $line) then
+          $saw_success = true
+        end
+        if $saw_success and has("DMA-BUF GPU probe found no visible sprite rect", $line) then
+          $vanished = true
+        end
+      end
+    end
+  end
+  if $vanished then
+    push($failures, "the sprite VANISHED mid-run — a no-rect probe follows a successful output sample before teardown")
+  end
+  if has("ERROR", $text) then
+    push($failures, "the compositor logged an ERROR")
+  end
+  return $failures
+end
+
+-- Bounded because a non-terminal stdin returns an unusable answer forever.
+fn ask($question)
+  $tries = 0
+  while $tries < 5 do
+    $answer = lower(trim(readline($question .. " [y/n/s=skip] ")))
+    if $answer == "y" then return "pass" end
+    if $answer == "n" then return "fail" end
+    if $answer == "s" then return "skipped" end
+    print("  answer y, n or s")
+    $tries = $tries + 1
+  end
+  raise("SMOKE_NO_ANSWER", "no usable answer after 5 attempts — is stdin a terminal?")
+end
+
+fn ask_all($scale)
+  $verdicts = {}
+  for each $question in eye_questions()
+    $skip_unscaled = $question["scaled"] and $scale == "1.0"
+    if $skip_unscaled then
+      $verdicts[$question["id"]] = "n/a at 1.0"
+    else
+      $verdicts[$question["id"]] = ask($question["ask"])
+    end
+  end
+  return $verdicts
+end
+
+fn eyes_failed($verdicts)
+  $failed = 0
+  for each $key in keys($verdicts)
+    if $verdicts[$key] == "fail" then
+      $failed = $failed + 1
+    end
+  end
+  return $failed
+end
+
+fn write_report($arm, $runs)
+  $path = $LOG_DIR .. "/report-" .. $arm .. ".mix"
+  write_file($path, data_encode({
+    arm: $arm,
+    written: date_format(time(), "%Y-%m-%dT%H:%M:%S%z"),
+    comp: $COMP,
+    runs: $runs
+  }, true))
+  return $path
+end
+
+fn preflight()
+  if not exists($COMP) then
+    raise("SMOKE_NO_BINARY", "missing " .. $COMP .. " — build the desktop release compositor first")
+  end
+  mkdir($LOG_DIR, {parents: true})
+end
+
+-- Launch a local user service without a shell. systemd owns the long-lived
+-- process so the launching run_argv returns, RuntimeMaxSec bounds abandoned
+-- runs, and the finally block can stop the exact units it created.
+fn start_user_unit($unit, $argv, $environment, $log)
+  $command = [
+    "systemd-run", "--user", "--quiet", "--collect", "--unit=" .. $unit,
+    "--property=Type=simple", "--property=RuntimeMaxSec=1800s",
+    "--property=TimeoutStopSec=5s"
+  ]
+  if $log == "" then
+    push($command, "--property=StandardOutput=null")
+    push($command, "--property=StandardError=null")
+  else
+    push($command, "--property=StandardOutput=append:" .. $log)
+    push($command, "--property=StandardError=append:" .. $log)
+  end
+  for each $key in keys($environment)
+    push($command, "--setenv=" .. $key .. "=" .. $environment[$key])
+  end
+  push($command, "--")
+  $command = concat($command, $argv)
+  return run_argv($command, {timeout: 15})
+end
+
+fn stop_user_unit($unit)
+  if $unit == "" then return nil end
+  $stopped = run_argv(["systemctl", "--user", "stop", $unit], {timeout: 15})
+  if $stopped["exit_code"] != 0 then
+    print("  WARNING: could not stop " .. $unit .. ": " .. trim($stopped["stderr"]))
+  end
+end
+
+fn remove_socket($path)
+  if exists($path, {follow_symlinks: false}) then
+    try
+      remove($path)
+    catch $error
+      print("  WARNING: could not remove socket " .. $path .. ": " .. $error)
+    end
+  end
+end
+
+fn mix_call($argv, $opts)
+  return "run_argv(" .. data_encode($argv) .. ", " .. data_encode($opts) .. ")"
+end
+
+-- ---------------------------------------------------------------- nested arm
+
+fn nested_run($style)
+  $runtime = env("XDG_RUNTIME_DIR")
+  if $runtime == "" then
+    return {style: $style, scale: "1.0", up: false,
+      machine: ["XDG_RUNTIME_DIR is empty — refusing to guess a Wayland socket directory"], eyes: {}}
+  end
+  $token = substr(replace(uuid(), "-", ""), 0, 12)
+  $sock = "cosmix-close-" .. $style .. "-" .. $token
+  $sock_path = $runtime .. "/" .. $sock
+  $log = log_path("nested", $style, "1.0")
+  $comp_unit = "cosmix-close-comp-" .. $token .. ".service"
+  $client_unit = "cosmix-close-client-" .. $token .. ".service"
+  remove_socket($sock_path)
+  write_file($log, "")
+
+  $started = start_user_unit($comp_unit, [
+    $COMP, "--nested", "--chrome", $style, "--socket", $sock
+  ], {RUST_LOG: $LOG_FILTER}, $log)
+  if $started["exit_code"] != 0 then
+    return {style: $style, scale: "1.0", up: false,
+      machine: ["compositor launch failed: " .. trim($started["stdout"]) .. " " .. trim($started["stderr"])], eyes: {}}
+  end
+
+  $attempt = 0
+  while not exists($sock_path) and $attempt < 60 do
+    sleep(0.5)
+    $attempt = $attempt + 1
+  end
+  if not exists($sock_path) then
+    stop_user_unit($comp_unit)
+    remove_socket($sock_path)
+    return {style: $style, scale: "1.0", up: false,
+      machine: ["compositor never came up (no socket after 30 seconds)"], eyes: {}}
+  end
+
+  $client = start_user_unit($client_unit, $NESTED_CLIENT_ARGV, {WAYLAND_DISPLAY: $sock}, "")
+  if $client["exit_code"] != 0 then
+    stop_user_unit($comp_unit)
+    remove_socket($sock_path)
+    return {style: $style, scale: "1.0", up: false,
+      machine: ["client launch failed: " .. trim($client["stdout"]) .. " " .. trim($client["stderr"])], eyes: {}}
+  end
+
+  print("")
+  print("  nested compositor is up on WAYLAND_DISPLAY=" .. $sock .. " with one client.")
+  print("  for the focus question, open a second client from a Mix REPL:")
+  print("      " .. mix_call($NESTED_CLIENT_ARGV, {env: {WAYLAND_DISPLAY: $sock}}))
+  print("")
+
+  $verdicts = {}
+  try
+    $verdicts = ask_all("1.0")
+  finally
+    stop_user_unit($client_unit)
+    stop_user_unit($comp_unit)
+    sleep(1)
+    remove_socket($sock_path)
+  end
+
+  return {
+    style: $style,
+    scale: "1.0",
+    up: true,
+    machine: check_log($log, $style, "1.0", false),
+    eyes: $verdicts
+  }
+end
+
+fn nested_arm()
+  preflight()
+  print("Phase 3 close — NESTED arm (1.0 only; nested has no output-scale flag)")
+  $runs = []
+  for each $style in $STYLES
+    print("")
+    print("=== nested / " .. $style .. " ===")
+    push($runs, nested_run($style))
+  end
+  $path = write_report("nested", $runs)
+  print("")
+  print("nested arm recorded to " .. $path)
+  summarise($runs)
+end
+
+-- ------------------------------------------------------------------- KMS arm
+
+fn kms_plan()
+  preflight()
+  $desktop = $d.cosmix_root() .. "/src/desktop"
+  print("Phase 3 close — KMS run book")
+  print("")
+  print("This arm cannot be driven here: kms-live takes the configured VT and")
+  print("requires its typed confirmation nonce. Run each Mix expression below")
+  print("from tty" .. $KMS_VT .. ", then return here for kms-check.")
+  print("")
+  print("Configured device=" .. $DEVICE .. " connector=" .. $CONNECTOR .. " socket=" .. $WAYLAND_SOCKET)
+  print("")
+  print("0. Build the sealed live path once:")
+  print("       " .. mix_call(["cargo", "build", "--release", "-p", "cosmix-comp", "--features", "kms-live"], {cwd: $desktop}))
+  print("")
+  print("1. Switch to tty" .. $KMS_VT .. " and log in as the same user. Do not run this inside the graphical session.")
+  print("")
+  $step = 2
+  for each $scale in $SCALES
+    for each $style in $STYLES
+      $log = log_path("kms", $style, $scale)
+      $argv = [
+        "timeout", "-s", "TERM", "900", $COMP, "kms-live",
+        "--device", $DEVICE, "--connector", $CONNECTOR,
+        "--scale", $scale, "--chrome", $style
+      ]
+      $opts = {
+        timeout: 910,
+        env: {RUST_LOG: $LOG_FILTER},
+        stdout: {file: $log, append: false, mode: 0o600},
+        stderr: "stdout"
+      }
+      print(to_string($step) .. ". chrome " .. $style .. " at " .. $scale .. "x:")
+      print("       " .. mix_call($argv, $opts))
+      print("   Type the confirmation nonce. Once it is up, open a client from a second VT:")
+      print("       " .. mix_call($NESTED_CLIENT_ARGV, {timeout: 900, env: {WAYLAND_DISPLAY: $WAYLAND_SOCKET}}))
+      print("   Work through the checklist, then interrupt the compositor or wait for the bound.")
+      print("")
+      $step = $step + 1
+    end
+  end
+  for each $probe_scale in $SCALES
+    $probe_argv = [
+      "timeout", "-s", "TERM", "300", $COMP, "kms-live",
+      "--device", $DEVICE, "--connector", $CONNECTOR, "--scale", $probe_scale
+    ]
+    $probe_opts = {
+      timeout: 310,
+      env: {COSMIX_DMABUF_PROBE: "1"},
+      stdout: {file: dmabuf_log_path($probe_scale), append: false, mode: 0o600},
+      stderr: "stdout"
+    }
+    print(to_string($step) .. ". DMA-BUF probe at " .. $probe_scale .. "x (no chrome):")
+    print("       " .. mix_call($probe_argv, $probe_opts))
+    print("   Then from a second VT:")
+    print("       " .. mix_call($DMABUF_CLIENT_ARGV, {timeout: 300, env: {WAYLAND_DISPLAY: $WAYLAND_SOCKET}}))
+    print("")
+    $step = $step + 1
+  end
+  print("When every run has a log, return here and run this script with kms-check.")
+end
+
+fn kms_check()
+  preflight()
+  print("Phase 3 close — KMS arm check")
+  $runs = []
+  for each $scale in $SCALES
+    for each $style in $STYLES
+      $log = log_path("kms", $style, $scale)
+      print("")
+      print("=== kms / " .. $style .. " / " .. $scale .. "x ===")
+      $machine = check_log($log, $style, $scale, true)
+      $verdicts = {}
+      if length($machine) > 0 then
+        print("  machine half FAILED — not asking the eyes-only questions for this run:")
+        for each $failure in $machine
+          print("    - " .. $failure)
+        end
+      else
+        print("  machine half ok (" .. $log .. ")")
+        $verdicts = ask_all($scale)
+      end
+      push($runs, {
+        style: $style,
+        scale: $scale,
+        up: exists($log),
+        machine: $machine,
+        eyes: $verdicts
+      })
+    end
+  end
+  for each $probe_scale in $SCALES
+    print("")
+    print("=== kms / dmabuf probe / " .. $probe_scale .. "x ===")
+    $probe_failures = check_dmabuf_log(dmabuf_log_path($probe_scale), $probe_scale)
+    if length($probe_failures) == 0 then
+      print("  machine half ok (" .. dmabuf_log_path($probe_scale) .. ")")
+    else
+      for each $probe_failure in $probe_failures
+        print("    - " .. $probe_failure)
+      end
+    end
+    push($runs, {
+      style: "dmabuf-probe",
+      scale: $probe_scale,
+      up: exists(dmabuf_log_path($probe_scale)),
+      machine: $probe_failures,
+      eyes: {}
+    })
+  end
+  $path = write_report("kms", $runs)
+  print("")
+  print("kms arm recorded to " .. $path)
+  summarise($runs)
+end
+
+-- ------------------------------------------------------------------- verdict
+
+fn summarise($runs)
+  $bad = 0
+  for each $entry in $runs
+    $eyes_bad = eyes_failed($entry["eyes"])
+    $machine_bad = length($entry["machine"])
+    if $machine_bad + $eyes_bad > 0 then
+      $bad = $bad + 1
+      print("FAIL  " .. $entry["style"] .. " @" .. $entry["scale"] .. "x — " ..
+        to_string($machine_bad) .. " machine, " .. to_string($eyes_bad) .. " visual")
+    else
+      print("ok    " .. $entry["style"] .. " @" .. $entry["scale"] .. "x")
+    end
+  end
+  if $bad > 0 then
+    print("")
+    print(to_string($bad) .. " of " .. to_string(length($runs)) .. " configurations failed")
+    exit(1)
+  end
+end
+
+fn machine_check()
+  $failed = 0
+  $seen = 0
+  for each $scale in $SCALES
+    for each $style in $STYLES
+      for each $backend in ["nested", "kms"]
+        $log = log_path($backend, $style, $scale)
+        if exists($log) then
+          $seen = $seen + 1
+          $failures = check_log($log, $style, $scale, $backend == "kms")
+          if length($failures) == 0 then
+            print("ok    " .. $backend .. " / " .. $style .. " / " .. $scale .. "x")
+          else
+            $failed = $failed + 1
+            print("FAIL  " .. $backend .. " / " .. $style .. " / " .. $scale .. "x")
+            for each $failure in $failures
+              print("        - " .. $failure)
+            end
+          end
+        end
+      end
+    end
+    $probe_log = dmabuf_log_path($scale)
+    if exists($probe_log) then
+      $seen = $seen + 1
+      $probe_failures = check_dmabuf_log($probe_log, $scale)
+      if length($probe_failures) == 0 then
+        print("ok    kms / dmabuf probe / " .. $scale .. "x")
+      else
+        $failed = $failed + 1
+        print("FAIL  kms / dmabuf probe / " .. $scale .. "x")
+        for each $probe_failure in $probe_failures
+          print("        - " .. $probe_failure)
+        end
+      end
+    end
+  end
+  if $seen == 0 then
+    print("no logs under " .. $LOG_DIR .. " — nothing to check")
+    exit(1)
+  end
+  print("")
+  print(to_string($seen - $failed) .. "/" .. to_string($seen) .. " collected logs pass the machine half")
+  if $failed > 0 then exit(1) end
+end
+
+fn merged_report()
+  $runs = []
+  $missing = []
+  for each $arm in ["nested", "kms"]
+    $path = $LOG_DIR .. "/report-" .. $arm .. ".mix"
+    if exists($path) then
+      $runs = concat($runs, load_data($path)["runs"])
+    else
+      push($missing, $arm)
+    end
+  end
+  if length($missing) > 0 then
+    print("Phase 3 is NOT closed — no report for arm(s): " .. join($missing, ", "))
+    print("Both arms are required: nested proves the chrome; KMS proves it on real hardware at real output scales.")
+    exit(1)
+  end
+  print("Phase 3 close — merged verdict over " .. to_string(length($runs)) .. " configurations")
+  summarise($runs)
+  print("")
+  print("Phase 3 CLOSED: chrome verified nested and on real KMS at every configured scale and style, machine half and eyes-only half.")
+end
+
+-- ---------------------------------------------------------------------- main
+
+$mode = $1
+if $mode == "nested" then
+  nested_arm()
+elif $mode == "kms-plan" then
+  kms_plan()
+elif $mode == "kms-check" then
+  kms_check()
+elif $mode == "machine-check" then
+  machine_check()
+elif $mode == "report" then
+  merged_report()
+else
+  print("usage: mix _bin/smoke_chrome_close.mix <nested|kms-plan|kms-check|machine-check|report>")
+  exit(2)
+end

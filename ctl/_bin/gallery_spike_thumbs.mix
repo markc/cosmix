@@ -1,0 +1,284 @@
+#!/usr/bin/env mix
+-- gallery_spike_thumbs.mix — generate gallery grid and preview thumbnails.
+--
+-- Reads pending image/video rows from the configured metadata index and writes
+-- a 256px grid WebP plus a 1600px preview WebP to an atomic disk cache keyed by
+-- media row id. The media tree is read-only. Work is deliberately sequential;
+-- this is a bounded proof tool, not the eventual parallel daemon.
+--
+--   mix _bin/gallery_spike_thumbs.mix --run [limit]
+--
+-- With no arguments the script refuses before loading site configuration or
+-- touching the database. limit 0 means all pending rows.
+
+$d = require("../_lib/deploy_lib.mix")
+
+$cli = args()
+if len($cli) == 0 then
+  print("usage: gallery_spike_thumbs.mix --run [limit]")
+  print("  ERROR: --run is required; no database or cache was touched")
+  exit(2)
+end
+if $cli[0] != "--run" or len($cli) > 2 then
+  print("usage: gallery_spike_thumbs.mix --run [limit]")
+  print("  ERROR: expected --run followed by an optional non-negative limit")
+  exit(2)
+end
+
+$LIMIT = 0
+if len($cli) == 2 then
+  if not regex_match("^[0-9]+$", $cli[1]) then
+    print("  ERROR: limit must be a non-negative integer (0 means all)")
+    exit(2)
+  end
+  $LIMIT = to_number($cli[1])
+end
+
+$CONF_PATH = $d.hub_root() .. "/_etc/gallery_spike_thumbs.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no gallery thumbnail configuration at " .. $CONF_PATH ..
+    " — create it from gallery_spike_thumbs.conf.mix.example")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  if type($loaded) != "map" or type($loaded["gallery_spike_thumbs"]) != "map" then
+    print("  ERROR: " .. $CONF_PATH .. " must contain a gallery_spike_thumbs strict-data map")
+    exit(2)
+  end
+  $CONF = validate($loaded["gallery_spike_thumbs"], {
+    schema_version: {type: "integer", enum: [1]},
+    database_path: {type: "string", nonblank: true},
+    cache_dir: {type: "string", nonblank: true},
+    media_root: {type: "string", nonblank: true},
+    magick_bin: {type: "string", nonblank: true},
+    ffmpeg_bin: {type: "string", nonblank: true}
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+$DB = $CONF["database_path"]
+$CACHE = $CONF["cache_dir"]
+$ROOT = $CONF["media_root"]
+$MAGICK = $CONF["magick_bin"]
+$FFMPEG = $CONF["ffmpeg_bin"]
+
+for each $path in [$DB, $CACHE, $ROOT, $MAGICK, $FFMPEG]
+  if not starts_with($path, "/") then
+    print("  ERROR: all gallery_spike_thumbs paths must be absolute: " .. $path)
+    exit(2)
+  end
+end
+if not is_file($DB) then
+  print("  ERROR: gallery index database not found: " .. $DB)
+  exit(2)
+end
+if not is_dir($ROOT) then
+  print("  ERROR: media root not found: " .. $ROOT)
+  exit(2)
+end
+if not is_file($MAGICK) or not access($MAGICK, "x") then
+  print("  ERROR: configured magick_bin is not executable: " .. $MAGICK)
+  exit(2)
+end
+if not is_file($FFMPEG) or not access($FFMPEG, "x") then
+  print("  ERROR: configured ffmpeg_bin is not executable: " .. $FFMPEG)
+  exit(2)
+end
+if $CACHE == $ROOT or starts_with($CACHE, $ROOT .. "/") then
+  print("  ERROR: cache_dir must not be the media root or a directory beneath it")
+  exit(2)
+end
+
+-- Resource caps stop a hostile or damaged image from exhausting the host.
+$MLIMITS = [
+  "-limit", "memory", "256MiB",
+  "-limit", "map", "512MiB",
+  "-limit", "disk", "1GiB"
+]
+
+mkdir($CACHE, {parents: true})
+$h = sqlopen($DB, "rw")
+
+-- Add thumbnail status columns when upgrading an older spike index.
+try
+  sqlexec($h, "ALTER TABLE media ADD COLUMN thumb_status TEXT")
+catch $status_error
+  nil
+end
+try
+  sqlexec($h, "ALTER TABLE media ADD COLUMN thumb_ms INTEGER")
+catch $milliseconds_error
+  nil
+end
+
+$sql = "SELECT id, relpath, kind FROM media WHERE deleted = 0 AND kind IN ('image','video') AND (thumb_status IS NULL OR thumb_status = 'pending')"
+$params = []
+if $LIMIT > 0 then
+  $sql = $sql .. " LIMIT ?"
+  push($params, $LIMIT)
+end
+$rows = sqlexec($h, $sql, $params)
+
+$n_ok = 0
+$n_fail = 0
+$fails = []
+$grid_bytes = 0
+$prev_bytes = 0
+$t0 = time()
+
+fn atomic_write_thumb($src_argv, $final)
+  $tmp = $final .. ".tmp-" .. uuid()
+  $tool_argv = []
+  for each $arg in $src_argv
+    push($tool_argv, $arg)
+  end
+  -- The temporary suffix hides .webp, so select the encoder explicitly.
+  push($tool_argv, "webp:" .. $tmp)
+  $result = run_argv($tool_argv, {timeout: 90})
+  if $result["exit_code"] != 0 then
+    remove($tmp)
+    return {ok: false, err: sanitize(substr($result["stderr"], 0, 160))}
+  end
+  if not is_file($tmp) then
+    return {ok: false, err: "no output produced"}
+  end
+  $size = stat($tmp)["size"]
+  rename($tmp, $final)
+  return {ok: true, size: $size}
+end
+
+for each $row in $rows
+  $src = $ROOT .. "/" .. $row["relpath"]
+  $id = to_string($row["id"])
+  $grid = $CACHE .. "/" .. $id .. "_256.webp"
+  $preview = $CACHE .. "/" .. $id .. "_1600.webp"
+  $started = time()
+  $ok = true
+  $error = nil
+
+  if $row["kind"] == "image" then
+    $grid_argv = [$MAGICK, $src .. "[0]"]
+    for each $arg in $MLIMITS
+      push($grid_argv, $arg)
+    end
+    for each $arg in ["-auto-orient", "-thumbnail", "256x256>", "-strip", "-quality", "80"]
+      push($grid_argv, $arg)
+    end
+    $grid_result = atomic_write_thumb($grid_argv, $grid)
+    if not $grid_result["ok"] then
+      $ok = false
+      $error = "grid: " .. $grid_result["err"]
+    else
+      $grid_bytes = $grid_bytes + $grid_result["size"]
+    end
+
+    if $ok then
+      $preview_argv = [$MAGICK, $src .. "[0]"]
+      for each $arg in $MLIMITS
+        push($preview_argv, $arg)
+      end
+      for each $arg in ["-auto-orient", "-resize", "1600x1600>", "-strip", "-quality", "82"]
+        push($preview_argv, $arg)
+      end
+      $preview_result = atomic_write_thumb($preview_argv, $preview)
+      if not $preview_result["ok"] then
+        $ok = false
+        $error = "preview: " .. $preview_result["err"]
+      else
+        $prev_bytes = $prev_bytes + $preview_result["size"]
+      end
+    end
+  else
+    -- Seek three seconds for a cheap poster, then fall back to the first frame.
+    $poster = $CACHE .. "/" .. $id .. "_poster.png"
+    $ffmpeg_args = [
+      $FFMPEG, "-v", "error", "-y", "-ss", "3", "-i", $src,
+      "-frames:v", "1", "-vf",
+      "scale=1600:-2:force_original_aspect_ratio=decrease", $poster
+    ]
+    $poster_result = run_argv($ffmpeg_args, {timeout: 90})
+    if $poster_result["exit_code"] != 0 or not is_file($poster) then
+      $ffmpeg_args = [
+        $FFMPEG, "-v", "error", "-y", "-i", $src,
+        "-frames:v", "1", "-vf",
+        "scale=1600:-2:force_original_aspect_ratio=decrease", $poster
+      ]
+      $poster_result = run_argv($ffmpeg_args, {timeout: 90})
+    end
+    if $poster_result["exit_code"] != 0 or not is_file($poster) then
+      $ok = false
+      $error = "ffmpeg-poster: " .. sanitize(substr($poster_result["stderr"], 0, 140))
+      remove($poster)
+    else
+      $grid_argv = [$MAGICK, $poster]
+      for each $arg in $MLIMITS
+        push($grid_argv, $arg)
+      end
+      for each $arg in ["-thumbnail", "256x256>", "-strip", "-quality", "80"]
+        push($grid_argv, $arg)
+      end
+      $grid_result = atomic_write_thumb($grid_argv, $grid)
+      if not $grid_result["ok"] then
+        $ok = false
+        $error = "video grid: " .. $grid_result["err"]
+      else
+        $grid_bytes = $grid_bytes + $grid_result["size"]
+        $preview_argv = [$MAGICK, $poster]
+        for each $arg in $MLIMITS
+          push($preview_argv, $arg)
+        end
+        for each $arg in ["-resize", "1600x1600>", "-strip", "-quality", "82"]
+          push($preview_argv, $arg)
+        end
+        $preview_result = atomic_write_thumb($preview_argv, $preview)
+        if not $preview_result["ok"] then
+          $ok = false
+          $error = "video preview: " .. $preview_result["err"]
+        else
+          $prev_bytes = $prev_bytes + $preview_result["size"]
+        end
+      end
+      remove($poster)
+    end
+  end
+
+  $milliseconds = to_number(to_string((time() - $started) * 1000))
+  if $ok then
+    sqlexec($h, "UPDATE media SET thumb_status = 'ok', thumb_ms = ? WHERE id = ?", [$milliseconds, $row["id"]])
+    $n_ok = $n_ok + 1
+  else
+    sqlexec($h, "UPDATE media SET thumb_status = 'error', thumb_ms = ? WHERE id = ?", [$milliseconds, $row["id"]])
+    $n_fail = $n_fail + 1
+    push($fails, $row["relpath"] .. " -> " .. to_string($error))
+  end
+
+  if ($n_ok + $n_fail) % 100 == 0 then
+    print("thumbs " .. to_string($n_ok + $n_fail) .. " (" .. to_string(time() - $t0) .. "s)")
+  end
+end
+
+$elapsed = time() - $t0
+$total = $n_ok + $n_fail
+print("=== gallery_spike_thumbs summary ===")
+print("processed: " .. to_string($total))
+print("ok:        " .. to_string($n_ok))
+print("failed:    " .. to_string($n_fail))
+print("elapsed:   " .. to_string($elapsed) .. "s")
+if $n_ok > 0 then
+  print("avg grid:  " .. to_string($grid_bytes / $n_ok) .. " bytes")
+  print("avg prev:  " .. to_string($prev_bytes / $n_ok) .. " bytes")
+  print("cache tot: " .. to_string(($grid_bytes + $prev_bytes) / 1048576) .. " MiB for " .. to_string($n_ok))
+end
+$failure_index = 0
+for each $failure in $fails
+  if $failure_index < 15 then
+    print("fail: " .. sanitize($failure))
+  end
+  $failure_index = $failure_index + 1
+end
+sqlclose($h)

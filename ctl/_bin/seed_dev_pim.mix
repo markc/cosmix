@@ -258,7 +258,7 @@ end
 print("events: created " .. $event_count)
 
 -- SMTP is the one required capability without a Mix builtin. The command is
--- constant apart from a UUID path; all site values are written to curl's
+-- constant apart from a UUID path; all site values are written to a curl
 -- private config file, so none are interpreted by a shell.
 $smtp_origin = "smtp://" .. $mesh_ip .. ":" .. ("" .. $smtp_port)
 $message_count = 0
@@ -313,4 +313,3 @@ $d.die_if(not $result["ok"] or
   $NODE .. " PIM seed failed: " .. trim($result["stdout"]) .. " " ..
   trim($result["stderr"]))
 print(trim($result["stdout"]))
-

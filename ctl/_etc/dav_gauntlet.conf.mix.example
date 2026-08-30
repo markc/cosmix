@@ -1,0 +1,21 @@
+-- Private hub configuration for dav_gauntlet.mix.
+-- Copy this file to `_etc/dav_gauntlet.conf.mix` in the control hub and
+-- replace every placeholder. Use dedicated scratch accounts: the gauntlet
+-- creates, updates and deletes DAV objects.
+{
+  dav_gauntlet: {
+    schema_version: 1,
+    base_url: "https://dav.example.org",
+    dav_root: "/dav",
+    ssl_verify: true,
+    account1: {
+      username: "alpha@example.org",
+      password_file: "/home/user/.config/cosmix/dav-alpha.password"
+    },
+    account2: {
+      username: "beta@example.org",
+      password_file: "/home/user/.config/cosmix/dav-beta.password"
+    },
+    results_path: "/home/user/dav-gauntlet-results.json"
+  }
+}

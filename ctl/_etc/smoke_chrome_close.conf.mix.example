@@ -1,0 +1,19 @@
+-- smoke_chrome_close.conf.mix.example — private local chrome-gate bindings.
+-- Copy this file to smoke_chrome_close.conf.mix in the private control hub and
+-- replace the example values with the developer workstation's real values.
+smoke_chrome_close: {
+  schema_version: 1,
+  log_dir: "/home/user/.local/state/cosmix/chrome-close",
+  styles: ["mac", "win11", "cosmix"],
+  scales: ["1.0", "2.5"],
+  nested_client_argv: ["/usr/bin/foot"],
+  dmabuf_client_argv: ["/usr/bin/weston-simple-dmabuf-egl"],
+  rust_log: "info,cosmix_comp::protocol::handlers=debug",
+  expected_family: "Example Sans",
+  expected_size_px: "14.666666984558105",
+  expected_weight: "300",
+  drm_device: "/dev/dri/card0",
+  drm_connector: "DP-1",
+  kms_vt: 3,
+  wayland_socket: "cosmix-0"
+}

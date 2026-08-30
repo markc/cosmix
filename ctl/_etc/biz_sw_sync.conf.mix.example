@@ -1,0 +1,12 @@
+-- biz_sw_sync.conf.mix.example — private SW site targets and paths.
+-- Copy to biz_sw_sync.conf.mix in the private control hub and replace every
+-- placeholder. Each node must exist in fleet-roster.conf.mix.
+{
+  biz_sw_sync: {
+    schema_version: 1,
+    nodes: ["alpha"],
+    default_base_url: "https://shop.example.org",
+    default_db_path: "/home/user/sites/shop.example.org/data/cms.db",
+    sw_app_path: "/home/user/sites/shared/apps/sw.mix"
+  }
+}
