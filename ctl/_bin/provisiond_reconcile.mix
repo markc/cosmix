@@ -18,7 +18,6 @@ $RECON = dirname(realpath($0)) .. "/ct_reconcile.mix"
 $LOCK = "/run/cosmix-provisiond/drain.lock"
 $ENV_FILE = "/etc/cosmix/provisiond/env"
 $SECRET_SRC = "/etc/cosmix/provisiond/secret"
-$MIX = $d.mix_bin()
 $HOME_P = "/var/lib/cosmix-provisiond"
 
 fn usage_error($message)
@@ -88,6 +87,7 @@ if is_file($ENV_FILE) then
 end
 $d.die_if($base == "",
   "no CT_BASE_URL in " .. $ENV_FILE .. " — run deploy_provisiond.mix")
+$MIX = $d.mix_bin()
 
 -- --pipe/--wait makes systemd-run return the reconciler's output and status.
 -- The non-blocking lock refuses concurrent drain, worker, or reconcile work.

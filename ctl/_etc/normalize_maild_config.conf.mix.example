@@ -1,0 +1,9 @@
+-- Private hub configuration for normalize_maild_config.mix.
+-- Copy this file to `_etc/normalize_maild_config.conf.mix` in the control hub
+-- and replace the placeholder with the mail node's live maild config path.
+{
+  normalize_maild_config: {
+    schema_version: 1,
+    default_input_path: "/home/user/cosmix-maild/config.conf.mix"
+  }
+}

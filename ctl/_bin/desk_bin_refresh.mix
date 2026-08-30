@@ -114,8 +114,8 @@ try
     $dst_ok = false
     if exists($dst, {follow_symlinks: false}) then
       $st = stat($dst, {follow_symlinks: false})
-      if $st["is_file"] and $st["perm"] == 493 and $st["uid"] == 0 and
-          $st["gid"] == 0 and hash_file($dst, "sha256") == $src_sha then
+      $metadata_ok = $st["is_file"] and $st["perm"] == 493 and $st["uid"] == 0 and $st["gid"] == 0
+      if $metadata_ok and hash_file($dst, "sha256") == $src_sha then
         $dst_ok = true
       end
     end

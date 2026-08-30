@@ -39,7 +39,7 @@
 
 $d = require("../_lib/deploy_lib.mix")
 $DEFAULT_DEPLOYER = $d.hub_root() .. "/_bin/deploy_desktop.mix"
-$COSMIX = $d.cosmix_root()
+$COSMIX_ROOT = $d.cosmix_root()
 
 -- $1 rather than args(): args() has historically carried the interpreter's own
 -- argv, so a positional is the only reading that is right in every invocation.
@@ -55,6 +55,7 @@ if $DEPLOYER != $DEFAULT_DEPLOYER then
   print ""
 end
 -- RUNNER-PRELUDE-BEGIN
+$COSMIX = env("TEST_DEPLOY_DESKTOP_COSMIX")
 $BASE = "/tmp/dt-mtest-" .. pid()
 
 -- The deployer's own destination constants, redirected into the scratch tree.
@@ -123,6 +124,23 @@ function check($label, $got, $want)
 end
 -- RUNNER-HELPERS-END
 
+-- Lint-only signatures for functions supplied by the extracted deployer text.
+-- This section is deliberately excluded from the generated runner, where the
+-- verbatim definitions replace these signatures.
+function empty_manifest() return nil end
+function merge_manifest($existing_stub, $current_stub, $selected_stub, $shared_stub) return nil end
+function write_manifest($manifest_stub, $stage_stub) return nil end
+function manifest_refusal($why_stub, $strict_stub) return nil end
+function load_existing_manifest($path_stub, $strict_stub) return nil end
+function sweep_temps($dir_stub, $prefix_stub) return nil end
+function flush_ledger($shared_stub) return nil end
+function record_temps($dir_stub, $prefix_stub, $shared_stub) return nil end
+function exec_parts($value_stub) return nil end
+function activation_defects($text_stub, $section_stub, $exact_stub, $exec_stub) return nil end
+function finish($code)
+  exit($code)
+end
+
 -- Build one source unit so lint can still analyse this harness without the
 -- dynamic source/include barrier. The child contains only fixture globals,
 -- these local helpers, the deployer's extracted functions, and the probes.
@@ -136,14 +154,18 @@ $prelude = split(split($self, $prelude_begin)[1], $prelude_end)[0]
 $helpers = split(split($self, $helpers_begin)[1], $helpers_end)[0]
 $body = split($self, $body_begin)[1]
 $runner = $prelude .. "\n" .. $helpers .. "\n" .. join($out, "\n") .. "\n" .. $body
-$run = run_argv([$d.mix_bin(), "-"], {stdin: $runner, timeout: 120})
+$run = run_argv([$d.mix_bin(), "-"], {
+  stdin: $runner,
+  timeout: 120,
+  env: {TEST_DEPLOY_DESKTOP_COSMIX: $COSMIX_ROOT}
+})
 if $run["stdout"] != "" then
   print($run["stdout"])
 end
 if $run["stderr"] != "" then
   eprint($run["stderr"])
 end
-exit($run["exit_code"])
+finish($run["exit_code"])
 
 -- RUNNER-BODY-BEGIN
 mkdir($BASE)

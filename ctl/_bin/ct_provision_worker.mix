@@ -1,0 +1,540 @@
+#!/usr/bin/env mix
+-- ct_provision_worker.mix — claim one container job, provision it on a
+-- configured Proxmox host, commit its DNS identity, verify it through a
+-- reboot, then report the fenced terminal result.
+--
+-- The worker never opens the service database. It authenticates with the
+-- dedicated provisiond secret and every apply is fenced by the claimed lease.
+-- PVE nodes are foreign roster nodes reached by SSH alias; the DNS node may
+-- be foreign or a mesh member. Every remote action is Mix source via ssh_mix.
+
+$d = require("../_lib/deploy_lib.mix")
+$prov = require("../_lib/provisiond_worker_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/ct_provision_worker.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: missing ct_provision_worker config: " .. $CONF_PATH)
+  print("         copy _etc/ct_provision_worker.conf.mix.example there and replace every placeholder")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  $CONF = validate($loaded["ct_provision_worker"], {
+    schema_version: {type: "integer", enum: [1]},
+    default_base_url: {type: "string", nonblank: true},
+    default_relid: {type: "string", nonblank: true},
+    preseed_node_min_relid: {type: "string", nonblank: true},
+    pve_hosts: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}},
+    template_cache_dir: {type: "string", nonblank: true},
+    release_root: {type: "string", nonblank: true},
+    release_archive_name: {type: "string", nonblank: true},
+    template_prefix: {type: "string", nonblank: true},
+    template_suffix: {type: "string", nonblank: true},
+    template_storage: {type: "string", nonblank: true},
+    rootfs_storage: {type: "string", nonblank: true},
+    network_bridge: {type: "string", nonblank: true},
+    pct_features: {type: "string", nonblank: true},
+    disk_gib: {type: "integer", min: 1},
+    memory_mib: {type: "integer", min: 1},
+    cores: {type: "integer", min: 1},
+    ct_mount_root: {type: "string", nonblank: true},
+    uid_shift_root: {type: "integer", min: 0},
+    gid_shift_tls: {type: "integer", min: 0},
+    description_prefix: {type: "string", nonblank: true},
+    provision_ip_pool: {type: "list", min_length: 1, items: {
+      type: "map", schema: {
+        prefix: {type: "string", nonblank: true},
+        first: {type: "integer", min: 0, max: 255},
+        last: {type: "integer", min: 0, max: 255}
+      }
+    }},
+    allowed_domains: {type: "list", min_length: 1,
+      items: {type: "string", nonblank: true}},
+    certificate_root: {type: "string", nonblank: true},
+    certificate_fullchain_name: {type: "string", nonblank: true},
+    certificate_private_key_name: {type: "string", nonblank: true},
+    credential_fullchain_name: {type: "string", nonblank: true},
+    credential_private_key_name: {type: "string", nonblank: true},
+    dns_node: {type: "string", nonblank: true},
+    dns_server: {type: "string", nonblank: true},
+    preseed_nameserver: {type: "string", nonblank: true},
+    dnsmasq_dropin: {type: "string", nonblank: true},
+    dnsmasq_main_config: {type: "string", nonblank: true},
+    dnsmasq_conf_dir: {type: "string", nonblank: true},
+    dnsmasq_lease_file: {type: "string", nonblank: true},
+    dnsmasq_service: {type: "string", nonblank: true},
+    fault_ready_path: {type: "string", nonblank: true}
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+fn config_error($message)
+  print("  ERROR: " .. $CONF_PATH .. ": " .. $message)
+  exit(2)
+end
+
+fn has_item($items, $wanted)
+  for each $item in $items
+    if $item == $wanted then return true end
+  end
+  return false
+end
+
+fn safe_path($key, $path)
+  if not starts_with($path, "/") or contains($path, "//") or
+      contains($path, "\n") or contains($path, "\r") then
+    config_error($key .. " must be a normalised one-line absolute path")
+  end
+  for each $part in split($path, "/")
+    if $part == "." or $part == ".." then
+      config_error($key .. " must not contain . or .. components")
+    end
+  end
+  if not regex_match("^/[A-Za-z0-9._/-]+$", $path) then
+    config_error($key .. " contains an unsafe path character")
+  end
+  return $path
+end
+
+fn safe_token($key, $value)
+  if not regex_match("^[A-Za-z0-9_.,:=@%+/-]+$", $value) then
+    config_error($key .. " contains a character unsafe for a remote command token")
+  end
+  return $value
+end
+
+fn valid_ipv4($address)
+  $parts = split($address, ".")
+  if len($parts) != 4 then return false end
+  for each $part in $parts
+    if not regex_match("^[0-9]{1,3}$", $part) then return false end
+    $octet = to_number($part)
+    if $octet < 0 or $octet > 255 or ("" .. $octet) != $part then
+      return false
+    end
+  end
+  return true
+end
+
+fn valid_domain($domain)
+  return len($domain) <= 245 and regex_match(
+    "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$",
+    $domain)
+end
+
+if not starts_with($CONF["default_base_url"], "http://") and
+    not starts_with($CONF["default_base_url"], "https://") then
+  config_error("default_base_url must start with http:// or https://")
+end
+if contains($CONF["default_base_url"], "\n") or
+    contains($CONF["default_base_url"], "\r") then
+  config_error("default_base_url must be one line")
+end
+for each $key in ["default_relid", "preseed_node_min_relid"]
+  $value = $CONF[$key]
+  if not regex_match("^[A-Za-z0-9][A-Za-z0-9._-]*$", $value) or
+      contains($value, "..") then
+    config_error($key .. " must be a slug without '..'")
+  end
+end
+
+$PATH_KEYS = [
+  "template_cache_dir", "release_root", "ct_mount_root",
+  "certificate_root", "dnsmasq_dropin", "dnsmasq_main_config",
+  "dnsmasq_conf_dir", "dnsmasq_lease_file", "fault_ready_path"
+]
+for each $key in $PATH_KEYS
+  $_path = safe_path($key, $CONF[$key])
+end
+$TOKEN_KEYS = [
+  "release_archive_name", "template_prefix", "template_suffix",
+  "template_storage", "rootfs_storage", "network_bridge", "pct_features",
+  "description_prefix", "certificate_fullchain_name",
+  "certificate_private_key_name", "credential_fullchain_name",
+  "credential_private_key_name", "dnsmasq_service"
+]
+for each $key in $TOKEN_KEYS
+  $_token = safe_token($key, $CONF[$key])
+end
+if not valid_ipv4($CONF["dns_server"]) or
+    not valid_ipv4($CONF["preseed_nameserver"]) then
+  config_error("dns_server and preseed_nameserver must be canonical IPv4 addresses")
+end
+for each $domain in $CONF["allowed_domains"]
+  if not valid_domain($domain) then
+    config_error("allowed_domains contains an invalid DNS name: " .. $domain)
+  end
+end
+for each $range in $CONF["provision_ip_pool"]
+  if not regex_match("^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.$",
+      $range["prefix"]) or
+      not valid_ipv4($range["prefix"] .. "0") then
+    config_error("provision_ip_pool prefix must be a canonical IPv4 /24 prefix")
+  end
+  if $range["first"] > $range["last"] then
+    config_error("provision_ip_pool range first must not exceed last")
+  end
+end
+
+$ROSTER = $d.roster()
+for each $host in $CONF["pve_hosts"]
+  $d.assert_node($ROSTER, $host)
+  if not $d.is_foreign($ROSTER, $host) then
+    config_error("PVE host '" .. $host .. "' must be foreign in the fleet roster")
+  end
+end
+$d.assert_node($ROSTER, $CONF["dns_node"])
+$DNS_REMOTE = $CONF["dns_node"]
+if not $d.is_foreign($ROSTER, $CONF["dns_node"]) then
+  $DNS_REMOTE = "root@" .. $d.mesh_ip($CONF["dns_node"])
+end
+
+$g = getopt(args(), {
+  "base-url": {arg: true},
+  "secret-file": {arg: true},
+  "drain-mode": {arg: false},
+  preclaimed: {arg: false},
+  relid: {arg: true}
+})
+if len($g["errors"]) != 0 then
+  print("bad options: " .. join($g["errors"], "; "))
+  exit(2)
+end
+
+$BASE = env("CT_BASE_URL")
+if $BASE == "" then $BASE = $CONF["default_base_url"] end
+if $g["opts"]["base-url"] != nil then
+  $BASE = "" .. $g["opts"]["base-url"]
+end
+if (not starts_with($BASE, "http://") and not starts_with($BASE, "https://")) or
+    contains($BASE, "\n") or contains($BASE, "\r") then
+  print("--base-url/CT_BASE_URL must be a one-line HTTP(S) URL")
+  exit(2)
+end
+
+$RELID = env("CT_RELID")
+if $RELID == "" then $RELID = $CONF["default_relid"] end
+if $g["opts"]["relid"] != nil then $RELID = "" .. $g["opts"]["relid"] end
+if not regex_match("^[A-Za-z0-9][A-Za-z0-9._-]*$", $RELID) or
+    contains($RELID, "..") then
+  print("--relid/CT_RELID must be a slug without '..': '" .. $RELID .. "'")
+  exit(2)
+end
+
+$DRAIN_MODE = $g["opts"]["drain-mode"] == true
+$PRECLAIMED = $g["opts"]["preclaimed"] == true
+$SECRET = $prov.load_secret($g["opts"]["secret-file"])
+$HEADERS = {"X-Provision-Secret": $SECRET}
+
+fn drain_exit($outcome)
+  $prov.drain_exit($outcome, $DRAIN_MODE)
+end
+
+$job = nil
+if $PRECLAIMED then
+  try
+    $envelope = json_parse(read_stdin())
+    $spec = $envelope["spec"]
+    if $spec == nil then $spec = {} end
+    $job = {
+      job_id: $envelope["job_id"],
+      lease_token: $envelope["lease_token"],
+      service_id: $envelope["service_id"],
+      pve_host: $spec["pve_host"],
+      node_name: $spec["node_name"],
+      domain: $spec["domain"],
+      ip: $spec["ip"]
+    }
+  catch $error
+    print("bad preclaimed envelope json: " .. $error)
+    exit(1)
+  end
+else
+  $claim = nil
+  $claim_status = 0
+  $tries = 0
+  while $tries < 25
+    $claim = http_get($BASE .. "/biz/provision-claim", $HEADERS, {timeout: 10})
+    $claim_status = to_number($claim["status"])
+    if $claim_status != 202 then break end
+    $tries = $tries + 1
+  end
+  if $claim_status == 204 then drain_exit("empty") end
+  if $claim_status == 202 then
+    print("provision claim still hitting the poison bound (202) after 25 retries — aborting")
+    exit(1)
+  end
+  if $claim_status != 200 then
+    print("provision claim failed: " .. ("" .. $claim["status"]) ..
+      " " .. ("" .. $claim["error"]))
+    exit(1)
+  end
+  try
+    $job = json_parse($claim["body"])
+  catch $error
+    print("bad claim json: " .. $error)
+    exit(1)
+  end
+end
+
+try
+  validate($job, {
+    job_id: {type: "integer", min: 1},
+    service_id: {type: "integer", min: 1},
+    lease_token: {type: "string", nonblank: true},
+    pve_host: {type: "string", nonblank: true},
+    node_name: {type: "string"},
+    ip: {type: "string", nonblank: true},
+    domain: {type: "string", nonblank: true}
+  })
+catch $message, $error
+  print("bad claim job (" .. $error["code"] .. " at " ..
+    $error["details"]["path"] .. "): " .. $message)
+  exit(1)
+end
+
+$JOB_ID = $job["job_id"]
+$LEASE_TOKEN = "" .. $job["lease_token"]
+$SERVICE_ID = $job["service_id"]
+$PVE = $job["pve_host"]
+$PVE_REMOTE = $PVE
+$NODE_NAME = $job["node_name"]
+$IP = $job["ip"]
+$DOMAIN = $job["domain"]
+$VMID = ""
+$FQDN = ""
+
+-- Run one argv-shaped command through a literal remote Mix program. The
+-- allowlist preserves the old argv-inert boundary before joining tokens for
+-- run(), and bindings keep job/config values out of source construction.
+fn remote_exec($host, $argv, $timeout)
+  return ssh_mix($host, '
+for each $arg in $argv
+  if not regex_match("^[A-Za-z0-9_./,:=@%+~-]+$", $arg) then
+    eprint("unsafe remote command token refused")
+    exit(125)
+  end
+end
+$output = run(join($argv, " "), {timeout: $command_timeout})
+$code = $rc
+if $code != 0 then
+  eprint($output)
+  exit($code)
+end
+print($output)
+', {bindings: {argv: $argv, command_timeout: $timeout},
+    connect_timeout: 8, timeout: $timeout + 15, batch: true})
+end
+
+fn exec_err($result)
+  $text = trim($result["stderr"])
+  if trim($result["stdout"]) != "" then
+    if $text != "" then $text = $text .. " " end
+    $text = $text .. trim($result["stdout"])
+  end
+  if $result["exit_code"] != nil then
+    $text = $text .. " (exit " .. $result["exit_code"] .. ")"
+  end
+  return trim($text)
+end
+
+fn post_apply($payload)
+  $prov.post_apply($BASE, $SECRET, $JOB_ID, $LEASE_TOKEN, $payload,
+    "provision_ct")
+end
+
+fn progress($step)
+  post_apply({
+    job_id: $JOB_ID, step: $step, node: $NODE_NAME, vmid: $VMID,
+    ip: $IP, fqdn: $FQDN
+  })
+end
+
+$FAULT_POINT = env("PROVISIOND_FAULT_POINT")
+fn fault_hook($point)
+  if $FAULT_POINT == "" or $FAULT_POINT != $point then return end
+  write_file($CONF["fault_ready_path"], $point .. " job=" .. $JOB_ID ..
+    " vmid=" .. $VMID .. " fqdn=" .. $FQDN .. "\n")
+  print("FAULT HOOK armed at " .. $point .. " (job " .. $JOB_ID ..
+    ", vmid " .. $VMID .. ") — sleeping for SIGKILL")
+  sleep(900)
+end
+
+fn fail_job($step, $message)
+  $cleanup = ""
+  $clean = true
+  if $step == "dns" or $step == "starting" or $step == "verifying" then
+    $clean = false
+  end
+  if $VMID != "" then
+    $_unmount = remote_exec($PVE_REMOTE, ["pct", "unmount", $VMID], 60)
+    $destroy = remote_exec($PVE_REMOTE,
+      ["pct", "destroy", $VMID, "--force"], 120)
+    if not $destroy["ok"] then
+      $clean = false
+      $cleanup = " [CLEANUP INCOMPLETE: pct destroy " .. $VMID .. " on " ..
+        $PVE .. " failed: " .. exec_err($destroy) ..
+        " — CT may be orphaned, manual teardown required]"
+    end
+  end
+  post_apply({
+    job_id: $JOB_ID, ok: false, step: $step, cleanup_clean: $clean,
+    fqdn: $FQDN, error: $message .. $cleanup, vmid: $VMID, ip: $IP
+  })
+  print("provision failed job " .. $JOB_ID .. ": " .. $message .. $cleanup)
+  drain_exit("processed_failed")
+end
+
+fn fail_collision($message)
+  post_apply({
+    job_id: $JOB_ID, ok: false, step: "cloning", cleanup_clean: false,
+    fqdn: $FQDN, error: $message, ip: $IP
+  })
+  print("provision aborted job " .. $JOB_ID .. ": " .. $message)
+  drain_exit("processed_failed")
+end
+
+fn must_argv($argv, $step)
+  $result = run_argv($argv, {timeout: 180})
+  if $result["exit_code"] != 0 then
+    fail_job($step, "failed: " .. join($argv, " ") .. " :: " ..
+      exec_err($result))
+  end
+  return trim($result["stdout"])
+end
+
+fn remote_must($host, $argv, $step, $timeout)
+  $result = remote_exec($host, $argv, $timeout)
+  if not $result["ok"] then
+    fail_job($step, "remote " .. $host .. " failed: " .. join($argv, " ") ..
+      " :: " .. exec_err($result))
+  end
+  return trim($result["stdout"])
+end
+
+-- Create the destination with its final ownership/mode before writing secret
+-- bytes, then prove exact byte identity and mode in the same remote process.
+fn remote_write($host, $dest, $bytes, $mode_text, $mode_value, $owner, $group,
+    $step)
+  $result = ssh_mix($host, '
+for each $token in [$dest, $mode_text, $owner, $group]
+  if not regex_match("^[A-Za-z0-9_./:-]+$", $token) then
+    eprint("unsafe remote-write token refused")
+    exit(125)
+  end
+end
+$output = run("install -m " .. $mode_text .. " -o " .. $owner .. " -g " ..
+  $group .. " /dev/null " .. $dest, {timeout: 15})
+if $rc != 0 then eprint($output); exit($rc) end
+write_file($dest, $bytes)
+chmod($dest, $mode_value)
+$landed = read_file($dest)
+if byte_length($landed) != byte_length($bytes) or $landed != $bytes then
+  eprint("remote write byte-identity mismatch")
+  exit(7)
+end
+if stat($dest)["perm"] != $mode_value then
+  eprint("remote write mode mismatch")
+  exit(8)
+end
+print("write-ok")
+', {bindings: {
+      dest: $dest, bytes: $bytes, mode_text: $mode_text,
+      mode_value: $mode_value, owner: "" .. $owner, group: "" .. $group
+    }, connect_timeout: 8, timeout: 60, batch: true})
+  if not $result["ok"] then
+    fail_job($step, "remote write " .. $dest .. " on " .. $host ..
+      " failed: " .. exec_err($result))
+  end
+end
+
+fn shortname($mac)
+  if not regex_match("^[0-9A-Fa-f:]{17}$", $mac) then
+    fail_job("cloning", "bad MAC shape: '" .. $mac .. "'")
+  end
+  $hex = replace(lower($mac), ":", "")
+  return "n" .. substr($hex, len($hex) - 5, 5)
+end
+
+$READY_WAIT = 180
+$HEARTBEAT_SECS = 30
+
+fn wait_running($vmid)
+  $deadline = time() + $READY_WAIT
+  $next_heartbeat = time() + $HEARTBEAT_SECS
+  $last = "unknown"
+  while time() < $deadline
+    $result = remote_exec($PVE_REMOTE,
+      ["pct", "exec", $vmid, "--", "systemctl", "is-system-running"], 15)
+    $last = trim($result["stdout"])
+    if $last == "running" then return "running" end
+    sleep(1)
+    if time() >= $next_heartbeat then
+      progress("verifying")
+      $next_heartbeat = time() + $HEARTBEAT_SECS
+    end
+  end
+  return $last
+end
+
+fn count_failed($vmid)
+  $raw = remote_must($PVE_REMOTE,
+    ["pct", "exec", $vmid, "--", "systemctl", "--failed", "--no-legend"],
+    "verifying", 30)
+  $count = 0
+  for each $line in split($raw, "\n")
+    if trim($line) != "" then $count = $count + 1 end
+  end
+  return $count
+end
+
+fn probe($vmid, $fqdn)
+  $state = wait_running($vmid)
+  $failed = count_failed($vmid)
+  $code = "000"
+  $https_error = ""
+  $deadline = time() + $READY_WAIT
+  $next_heartbeat = time() + $HEARTBEAT_SECS
+  while time() < $deadline and $code != "200"
+    $result = http_get("https://" .. $fqdn .. "/", {}, {timeout: 10})
+    $code = "" .. $result["status"]
+    $https_error = ""
+    if $result["error"] != nil then $https_error = "" .. $result["error"] end
+    if $code != "200" then
+      sleep(1)
+      if time() >= $next_heartbeat then
+        progress("verifying")
+        $next_heartbeat = time() + $HEARTBEAT_SECS
+      end
+    end
+  end
+  return {
+    state: $state, failed: $failed, https: $code, https_error: $https_error
+  }
+end
+
+fn verify_probe($phase, $probe)
+  $bad = []
+  if $probe["state"] != "running" then
+    push($bad, "state=" .. $probe["state"] .. " (want running)")
+  end
+  if $probe["failed"] != 0 then
+    push($bad, $probe["failed"] .. " failed unit(s)")
+  end
+  if $probe["https"] != "200" then
+    $message = "HTTPS=" .. $probe["https"] .. " (want 200, validated chain)"
+    if $probe["https_error"] != "" then
+      $message = $message .. ": " .. $probe["https_error"]
+    end
+    push($bad, $message)
+  end
+  if len($bad) != 0 then
+    fail_job("verifying", "[" .. $phase .. "] VERIFY FAIL: " ..
+      join($bad, "; "))
+  end
+end

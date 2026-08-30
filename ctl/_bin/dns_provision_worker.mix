@@ -85,8 +85,8 @@ fn valid_fqdn($name)
     return false
   end
   for each $label in split($name, ".")
-    if len($label) == 0 or len($label) > 63 or
-        not regex_match("^[a-z0-9]([a-z0-9-]*[a-z0-9])?$", $label) then
+    if (len($label) == 0 or len($label) > 63 or
+        not regex_match("^[a-z0-9]([a-z0-9-]*[a-z0-9])?$", $label)) then
       return false
     end
   end
@@ -94,8 +94,8 @@ fn valid_fqdn($name)
 end
 
 fn validate_url($url)
-  if (not starts_with($url, "http://") and not starts_with($url, "https://")) or
-      contains($url, "\n") or contains($url, "\r") then
+  if ((not starts_with($url, "http://") and not starts_with($url, "https://")) or
+      contains($url, "\n") or contains($url, "\r")) then
     conf_error("base_url must be a one-line http:// or https:// URL")
   end
 end
@@ -256,12 +256,12 @@ for each $line in split($original, "\n")
   if $entry == $mx_record then
     $has_mx = true
   end
-  if starts_with($entry, "host-record=" .. $fqdn .. ",") and
-      $entry != $host_record then
+  if (starts_with($entry, "host-record=" .. $fqdn .. ",") and
+      $entry != $host_record) then
     fail("CONFLICT " .. $fqdn .. " already bound to a different ip: " .. $entry, true)
   end
-  if starts_with($entry, "host-record=") and ends_with($entry, "," .. $ip) and
-      $entry != $host_record then
+  if (starts_with($entry, "host-record=") and ends_with($entry, "," .. $ip) and
+      $entry != $host_record) then
     fail("CONFLICT " .. $ip .. " already bound to a different fqdn: " .. $entry, true)
   end
   if starts_with($entry, "mx-host=" .. $fqdn .. ",") and $entry != $mx_record then

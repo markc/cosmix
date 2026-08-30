@@ -1,0 +1,124 @@
+#!/usr/bin/env mix
+-- normalize_maild_config.mix [in_path] [out_path] — run on a mail node as
+-- root, or locally for testing. Renders a brace/JSON-style maild config into
+-- native conf.mix `key: value` form, value-identical through parse and render.
+--
+-- An already-native input (one whose first non-whitespace character is not
+-- `{`) is reported and not written. Otherwise the native form is written only
+-- to a staging file: out_path, or <in_path>.native-new. The orchestrator owns
+-- validation with the real maild parser and any live-config swap.
+--
+-- After configuration pre-flight, prints exactly one of:
+--   ALREADY-NATIVE | NORMALIZED <n> keys -> <out> | ERROR: ...
+
+$d = require("../_lib/deploy_lib.mix")
+
+$CONF_PATH = $d.hub_root() .. "/_etc/normalize_maild_config.conf.mix"
+if not is_file($CONF_PATH) then
+  print("  ERROR: no maild normalizer config at " .. $CONF_PATH ..
+    " — create it from normalize_maild_config.conf.mix.example")
+  exit(2)
+end
+
+$CONF = nil
+try
+  $loaded = load_data($CONF_PATH)
+  if type($loaded) != "map" or type($loaded["normalize_maild_config"]) != "map" then
+    print("  ERROR: invalid strict-data config " .. $CONF_PATH ..
+      ": expected normalize_maild_config map")
+    exit(2)
+  end
+  $CONF = validate($loaded["normalize_maild_config"], {
+    schema_version: {type: "integer", enum: [1]},
+    default_input_path: {type: "string", nonblank: true}
+  })
+catch $error
+  print("  ERROR: invalid strict-data config " .. $CONF_PATH .. ": " .. $error)
+  exit(2)
+end
+
+-- Escape a double-quoted Mix string. Only nested map keys use this form.
+fn esc_dq($s)
+  $s = replace($s, "\\", "\\\\")
+  $s = replace($s, "\"", "\\\"")
+  $s = replace($s, "\n", "\\n")
+  return $s
+end
+
+-- Values use single-quoted raw strings so `${...}` and a leading `~` remain
+-- literal instead of being expanded by Mix when maild later loads the file.
+fn esc_sq($s)
+  $s = replace($s, "\\", "\\\\")
+  $s = replace($s, "'", "\\'")
+  return $s
+end
+
+-- Render a value as a strict-data literal. Nested map keys are quoted so a
+-- field name that happens to be a Mix reserved word remains valid.
+fn render_val($value)
+  $kind = type($value)
+  if $kind == "string" then
+    return "'" .. esc_sq($value) .. "'"
+  end
+  if $kind == "bool" then
+    if $value then
+      return "true"
+    end
+    return "false"
+  end
+  if $kind == "number" then
+    return "" .. $value
+  end
+  if $kind == "nil" then
+    return "nil"
+  end
+  if $kind == "list" then
+    $parts = []
+    for each $item in $value
+      push($parts, render_val($item))
+    end
+    return "[ " .. join($parts, ", ") .. " ]"
+  end
+  if $kind == "map" then
+    $parts = []
+    for each $key in keys($value)
+      push($parts, "\"" .. esc_dq($key) .. "\": " .. render_val($value[$key]))
+    end
+    return "{ " .. join($parts, ", ") .. " }"
+  end
+  return "nil"
+end
+
+-- Top-level maild keys stay bare to match the native daemon configuration.
+fn render_native($config)
+  $lines = []
+  for each $key in keys($config)
+    push($lines, $key .. ": " .. render_val($config[$key]))
+  end
+  return join($lines, "\n") .. "\n"
+end
+
+$argv = args()
+$in = $CONF["default_input_path"]
+if len($argv) > 0 then
+  $in = $argv[0]
+end
+$out = $in .. ".native-new"
+if len($argv) > 1 then
+  $out = $argv[1]
+end
+
+try
+  $source = replace(read_file($in), "\u{FEFF}", "")
+  if substr(trim($source), 0, 1) != "{" then
+    print("ALREADY-NATIVE")
+  else
+    $config = json_parse($source)
+    $native = render_native($config)
+    write_file($out, $native)
+    print("NORMALIZED " .. ("" .. len(keys($config))) .. " keys -> " .. $out)
+  end
+catch $error
+  print("ERROR: " .. $error)
+  exit(1)
+end
