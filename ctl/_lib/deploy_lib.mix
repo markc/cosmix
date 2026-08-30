@@ -92,7 +92,7 @@ fn roster()
   for each $n in $r["foreign"]
     push($all, $n)
   end
-  return {mesh: $r["mesh"], foreign: $r["foreign"], all: $all}
+  return {mesh: $r["mesh"], foreign: $r["foreign"], all: $all, order: $r["rollout_order"]}
 end
 
 fn is_foreign($roster, $host)
@@ -194,4 +194,75 @@ fn assert_not_downgrade($host, $current, $local_ver, $allow)
     ", local build is " .. $local_ver .. " -- is $COSMIX behind origin/main?" ..
     " Pass --allow-downgrade if a rollback is intended.")
   print("  !! DOWNGRADE (--allow-downgrade): " .. trim($current) .. " -> " .. $local_ver)
+end
+
+-- ── mesh inventory ──────────────────────────────────────────────────────
+-- The authored inventory ($CMCTL/_etc/mesh/inventory.mix) is the roster's
+-- source of addresses. Deploy scripts used to carry their own `$ADDR = {…}`
+-- tables and hand-listed node arrays; every one of those drifted from the
+-- inventory at some point. These lookups read the inventory each call (it is
+-- small) and refuse loudly when a node is not an active member.
+
+fn _inventory()
+  $p = hub_root() .. "/_etc/mesh/inventory.mix"
+  if not is_file($p) then
+    print("  ERROR: no mesh inventory at " .. $p .. " — this deploy needs mesh addresses")
+    exit(2)
+  end
+  return load_data($p)["inventory"]
+end
+
+-- Active members only: [{name, mesh_ip, bus, status}, …]
+fn mesh_members()
+  $out = []
+  for each $m in _inventory()["members"]
+    if $m["status"] == "active" then
+      push($out, $m)
+    end
+  end
+  return $out
+end
+
+fn mesh_nodes()
+  $out = []
+  for each $m in mesh_members()
+    push($out, $m["name"])
+  end
+  return $out
+end
+
+fn mesh_ip($node)
+  for each $m in mesh_members()
+    if $m["name"] == $node then
+      return $m["mesh_ip"]
+    end
+  end
+  print("  ERROR: '" .. $node .. "' is not an active member of the mesh inventory")
+  exit(2)
+end
+
+-- The inventory's hub node(s) — the broker(s) every other node talks through;
+-- a rollout touches them LAST.
+fn mesh_hubs()
+  return _inventory()["hub"]
+end
+
+-- Rollout order for a mesh-wide change: the roster's `rollout_order` when the
+-- hub defines one, else the roster's mesh list with the inventory hubs moved
+-- to the end. Either way, hubs last.
+fn rollout_order($roster)
+  if $roster["order"] != nil then
+    return $roster["order"]
+  end
+  $hubs = mesh_hubs()
+  $head = []
+  $tail = []
+  for each $n in $roster["mesh"]
+    if _is_in($hubs, $n) then
+      push($tail, $n)
+    else
+      push($head, $n)
+    end
+  end
+  return concat($head, $tail)
 end
