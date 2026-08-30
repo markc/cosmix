@@ -106,7 +106,9 @@ $dirty = repo_dirty($root)
 if $dirty then
   eprint("gen-versions: working tree dirty at generation — these numbers may not be committed")
 end
-$body = $body .. "Repository `markc/cosmix` at commit `" .. $sha .. "`\n\n"
+-- No commit sha in the body: since the monorepo the file lives in the repo it
+-- would describe, so a sha would make every commit of the file stale on arrival.
+$_sha = $sha
 $crates = $root .. "/src/crates"
 $all = []
 for each $e in ls($crates)

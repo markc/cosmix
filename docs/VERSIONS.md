@@ -18,8 +18,6 @@ answered by the host, not by a document:
 ssh <node> 'print(run("/opt/cosmix/bin/mix --version"))'
 ```
 
-Repository `markc/cosmix` at commit `c6dc673b`
-
 ## bus
 
 CosMix Agent Bus — protocol family
