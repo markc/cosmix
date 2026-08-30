@@ -43,6 +43,17 @@ for each $a in args()
   end
 end
 
+-- Install a binary by writing beside the destination and renaming over it:
+-- a plain copy onto a RUNNING executable fails with ETXTBSY — and the mix
+-- running this script IS $COSMIX/bin/mix (found by the first fresh-clone test).
+-- rename() replaces the directory entry; the running process keeps its inode.
+function install_bin($from, $to)
+  $tmp = $to .. ".new"
+  copy($from, $tmp)
+  chmod($tmp, 0o755)
+  rename($tmp, $to)
+end
+
 print(">> COSMIX = " .. $root)
 
 -- 1. fetch every crate the lockfile names (all platforms), then build. The
@@ -75,8 +86,7 @@ for each $pkg in $meta.packages
     if contains($t.kind, "bin") then
       $from = $src .. "/target/release/" .. $t.name
       if is_file($from) then
-        copy($from, $bin .. "/" .. $t.name)
-        chmod($bin .. "/" .. $t.name, 0o755)
+        install_bin($from, $bin .. "/" .. $t.name)
         push($installed, $t.name)
       else
         push($missing, $t.name)
@@ -104,8 +114,7 @@ if $want_desktop then
       if contains($t.kind, "bin") then
         $from = $src .. "/desktop/target/release/" .. $t.name
         if is_file($from) then
-          copy($from, $bin .. "/" .. $t.name)
-          chmod($bin .. "/" .. $t.name, 0o755)
+          install_bin($from, $bin .. "/" .. $t.name)
           $dn = $dn + 1
         end
       end
