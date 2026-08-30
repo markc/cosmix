@@ -1254,7 +1254,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-config"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",
@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-mix"
-version = "0.61.1"
+version = "0.62.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1727,7 +1727,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-mix"
-version = "0.61.1"
+version = "0.62.0"
 dependencies = [
  "blake3",
  "chrono",

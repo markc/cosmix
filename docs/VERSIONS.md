@@ -18,7 +18,7 @@ answered by the host, not by a document:
 ssh <node> 'print(run("/opt/cosmix/bin/mix --version"))'
 ```
 
-Repository `markc/cosmix` at commit `e1a145ef` **(working tree dirty at generation — these numbers may not be committed)**
+Repository `markc/cosmix` at commit `589a0d3a` **(working tree dirty at generation — these numbers may not be committed)**
 
 ## bus
 
@@ -38,8 +38,8 @@ Mix — the language and shell
 
 | crate | version |
 |---|---|
-| `cosmix-lib-mix` | 0.61.1 |
-| `cosmix-mix` | 0.61.1 |
+| `cosmix-lib-mix` | 0.62.0 |
+| `cosmix-mix` | 0.62.0 |
 | `mix-bench` | 0.1.0 |
 
 ## cos
@@ -60,7 +60,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-interaction-broker` | 0.5.0 |
 | `cosmix-interaction-schema` | 0.6.0 |
 | `cosmix-lib-agent` | 0.1.0 |
-| `cosmix-lib-config` | 0.7.0 |
+| `cosmix-lib-config` | 0.8.0 |
 | `cosmix-lib-daemon` | 0.7.0 |
 | `cosmix-lib-davproto` | 0.1.2 |
 | `cosmix-lib-dns` | 0.3.0 |
