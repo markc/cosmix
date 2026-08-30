@@ -50,7 +50,7 @@ try
         root: {type: "string", nonblank: true},
         group: {type: "string", nonblank: true},
         icon: {type: "string", nonblank: true},
-        writable: {type: "boolean"},
+        writable: {type: "bool"},
         allow: {required: false, type: "list", min_length: 1,
           items: {type: "string", nonblank: true}},
         deny: {required: false, type: "list", min_length: 1,

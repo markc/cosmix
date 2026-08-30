@@ -50,7 +50,7 @@ $DESKTOP = $d.cosmix_root() .. "/src/desktop"
 -- not in it.
 $RUST_SLUGS = ["studio", "filemgr", "tray", "trayd", "tower"]
 -- Names OWNED BY _bin/desk_bin_refresh.mix ($NAMES there) — one deployer per
--- name (option B ruling 2026-08-16). This is the symmetric half of the
+-- name. This is the symmetric half of the
 -- refresher's manifest preflight: that side reads this deployer's LIVE ledger,
 -- but a slug added HERE would overwrite the refresher's binaries before the
 -- ledger ever showed the claim, so the intersection is refused at parse time.
@@ -60,7 +60,7 @@ $REFRESHER_OWNED_SLUGS = ["comp", "quoin-demo"]
 for each $slug in $REFRESHER_OWNED_SLUGS
   if contains($RUST_SLUGS, $slug) then
     die("ownership clash: slug " .. $slug .. " is owned by _bin/desk_bin_refresh.mix — " ..
-        "one deployer per name (option B ruling 2026-08-16); remove it from $RUST_SLUGS " ..
+        "one deployer per name; remove it from $RUST_SLUGS " ..
         "or move ownership deliberately in BOTH scripts")
   end
 end
@@ -88,7 +88,7 @@ $PLASMOID_DEST = "/usr/local/share/plasma/plasmoids"
 -- package root. The staged tree must equal this list -- not merely sit inside
 -- the package root -- so a stray CMake install (debug file, fixture, stale
 -- artefact) refuses the run instead of being silently installed and claimed
--- root-owned forever (cold review 2026-07-28, #4). A legitimate package change
+-- root-owned forever. A legitimate package change
 -- updates this list in the same commit; the one-line cost is the review.
 $PLASMOID_LEDGER = {
   "plasmoid": [
@@ -345,8 +345,8 @@ function assert_root_private_chain($paths, $create_last)
     -- What matters is the EFFECTIVE permission, not the raw one. A named entry
     -- is capped by the mask, so `user:alice:rwx` under `mask::r-x` grants no
     -- write at all and getfacl annotates it `#effective:r-x`. Reading the raw
-    -- field refused that safe configuration (cold review 2026-07-28, #3
-    -- round 7), so `-E` is deliberately NOT passed here: the annotation is the
+    -- field would refuse that safe configuration, so `-E` is deliberately NOT
+    -- passed here: the annotation is the
     -- answer, and where it is absent the raw perms already are the effective
     -- ones.
     for each $line in split(trim($out["acl"]), "\n")
@@ -828,7 +828,7 @@ function load_existing_manifest($path, $strict)
     -- not enough: every entry must be CONFINED to the app's own package root,
     -- with no ".." components -- a hand-edited "/etc/shadow" or a traversal
     -- would otherwise survive every union into the file an uninstall trusts
-    -- (cold review 2026-07-28, #6).
+    -- before it can be trusted.
     if $kind == "plasmoid" then
       if type($entry["files"]) != "list" or length($entry["files"]) == 0 then
         manifest_refusal("existing manifest entry for " .. $entry["app"] .. " (kind plasmoid) has no files ledger.", $strict)
@@ -1234,8 +1234,8 @@ else
   -- The -p set decides feature unification, so it must be INVOCATION-
   -- INVARIANT: an `--only filemgr` run that built `-p cosmix-filemgr` alone
   -- unified features differently from the full five-package deploy and
-  -- silently installed different bytes for the same source (cargo-tree
-  -- verified 2026-08-16: the shared CTK dep gains `mixer`, lib-config
+  -- silently installed different bytes for the same source: the shared CTK
+  -- dep gains `mixer`, lib-config
   -- gains client-helpers, zbus gains blocking-api in the full set). Every
   -- build therefore compiles the FULL Rust set regardless of selection;
   -- only the selected apps are installed. --no-build bypasses this and
@@ -1493,7 +1493,7 @@ for each $pslug in $PLASMOID_SELECTED
   if length($staged_rel) == 0 then
     fail($appid .. ": staged install produced no files")
   end
-  -- Exact-ledger equality, not mere containment (cold review 2026-07-28, #4).
+  -- Exact-ledger equality, not mere containment.
   $expected_rel = []
   for each $lfile in $PLASMOID_LEDGER[$pslug]
     push($expected_rel, $prel .. "/" .. $lfile)
@@ -1532,7 +1532,7 @@ for each $pslug in $PLASMOID_SELECTED
   -- The staged package must be discoverable as a Plasma applet before it may
   -- claim the live package root. --show takes the package PATH: the
   -- --packageroot+name form answers "Can't find plugin metadata" for a
-  -- perfectly valid staged package (probed 2026-07-28). And the tool's exit
+  -- perfectly valid staged package. The tool's exit
   -- code is not trusted either way: the check is the Plugin line in the
   -- output, which names the applet id it actually parsed from metadata.json.
   $r = run_argv(["kpackagetool6", "--type", "Plasma/Applet", "--show", $proot .. "/" .. $prel], { "timeout": 60 })
@@ -1569,7 +1569,7 @@ for each $pslug in $PLASMOID_SELECTED
   -- this pack and the root install arrives as an inert link the root-side
   -- audit refuses -- root never opens a path inside a user-writable tree, so
   -- there is no window in which it can be steered into copying root-only
-  -- bytes into a user-readable file (cold review 2026-07-28, #3 round 2).
+  -- bytes into a user-readable file.
   $ptar = $stage .. "/" .. $pslug .. ".tar"
   $r = run_argv(["tar", "-C", $proot, "-cf", $ptar, "."], { "timeout": 60, "max_output": 0 })
   if $r["exit_code"] != 0 then
@@ -1614,13 +1614,12 @@ end
 -- /opt/cosmix/share always: the manifest lands there on every run. The three
 -- Rust-family directories only when this run installs Rust apps -- a
 -- plasmoid-only run has no use for them, and a killed first deploy would
--- leave them as unclaimed root directories this deployer never deletes
--- (cold review 2026-07-28, #7).
+-- leave them as unclaimed root directories this deployer never deletes.
 -- Verify the /opt/cosmix/share chain BEFORE the install -d below repairs it.
 -- Every run writes the manifest there and the plasmoid lane hands root an
 -- archive through it, and `install -d` would happily follow a symlinked
 -- component and mutate its target -- so the audit has to happen first, on the
--- inodes as they actually are (cold review 2026-07-28, #3 round 6).
+-- inodes as they actually are.
 assert_root_private_chain(["/", "/opt", "/opt/cosmix", "/opt/cosmix/share"], true)
 if length($APPS) > 0 then
   root_mkdir([$BIN_DEST, $DT_DEST, $AUTOSTART_DEST, "/opt/cosmix/share"], 0o755)
@@ -1708,8 +1707,7 @@ end
 for each $name in $APPS
   $slug = $apps[$name]["slug"]
   $appid = "dev.cosmix." .. $slug
-  -- BINARIES publish atomically (the atomic-publish rule 2026-08-16, single-owner
-  -- option B rider; ADR 2026-08-16-opt-cosmix-bin-single-canonical-bin-dir):
+  -- BINARIES publish atomically under the single-owner binary rule:
   -- desk CTs bind $BIN_DEST read-only, so a binary must never be torn
   -- mid-write — and `install -T` writes the destination in place. Stage to
   -- a dot-tmp in the SAME directory (install -T still errors on a
@@ -1742,8 +1740,7 @@ end
 
 -- 4b. Plasmoid root install.
 --
--- Two audits guard it, both fail-closed (cold review 2026-07-28, #2 + #3
--- round 2):
+-- Two audits guard it, both fail-closed:
 --
 -- ANCESTRY. `install -d` follows a symlinked existing component, so a
 -- symlinked ancestor would teleport every root write outside the tree the
