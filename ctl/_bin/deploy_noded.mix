@@ -1,0 +1,181 @@
+#!/usr/bin/env mix
+-- deploy_noded.mix — install and/or restart the per-node Bus broker
+-- (cosmix-noded) across the mesh, hubs last.
+--
+--   mix _bin/deploy_noded.mix install [node…]   -- binary + unit only (NOT restarted)
+--   mix _bin/deploy_noded.mix restart [node…]   -- daemon-reload + restart + verify
+--   mix _bin/deploy_noded.mix all     [node…]   -- every install, then every restart
+--
+-- No nodes named = the hub's rollout order (roster `rollout_order`, else the
+-- roster's mesh list with the inventory hubs last). Mesh nodes only: the broker
+-- runs where mix is the login shell, so every remote step is Mix over ssh_mix.
+--
+-- Two stages on purpose: `install` lands the new binary and unit on every node
+-- without restarting anything, `restart` then rolls the broker over one node at
+-- a time — hubs last, because every other node talks through them. A restart
+-- is not done until (1) systemd reports active, (2) journald holds at least one
+-- line for the CURRENT invocation (an "active but mute" broker is the failure
+-- this catches), and (3) the freshly started broker answers noded.ping.
+
+$d = require("../_lib/deploy_lib.mix")
+$ROSTER = $d.roster()
+
+$UNIT_NAME = "cosmix-noded.service"
+$UNIT = $d.cosmix_root() .. "/src/_etc/systemd-system/" .. $UNIT_NAME
+$BIN = $d.cosmix_bin("cosmix-noded")
+
+fn need($host, $r, $what)
+  if not $r["ok"] then
+    print("  ERROR (" .. $host .. ") " .. $what .. ": " .. trim($r["stderr"]))
+    exit(1)
+  end
+end
+
+fn probe_local_build()
+  $p = run_argv([$BIN, "--help"])
+  $d.die_if($p["exit_code"] != 0, "local release binary missing or broken (build it first: cd $COSMIX/src && cargo build --release -p cosmix-noded): " .. trim($p["stderr"]))
+  $d.die_if(not is_file($UNIT), "unit template missing: " .. $UNIT)
+  print("local build: " .. $BIN .. " --help OK ; unit present")
+end
+
+-- ── install ─────────────────────────────────────────────────────────────
+fn install_remote($host)
+  $d.assert_node($ROSTER, $host)
+  print("[" .. $host .. "] install /opt/cosmix/bin/cosmix-noded")
+
+  $reach = ssh_mix($host, 'print("reach-ok")')
+  $d.die_if(not $reach["ok"] or not contains($reach["stdout"], "reach-ok"),
+    $host .. " unreachable or not a mix login shell: " .. trim($reach["stderr"]))
+
+  $mk = ssh_mix($host, 'print(run("install -d -o 0 -g 0 -m 0755 /opt/cosmix/bin")); print("dir-ok")')
+  need($host, $mk, "mkdir /opt/cosmix/bin")
+
+  -- Binary: scp beside, atomic install over, then the installed file must run.
+  $scp = run_argv(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", $BIN, $host .. ":/opt/cosmix/bin/cosmix-noded.new"], {timeout: 120})
+  $d.die_if($scp["exit_code"] != 0, "scp -> " .. $host .. ": " .. trim($scp["stderr"]))
+  $i = ssh_mix($host, 'print(run("install -o 0 -g 0 -m 0755 /opt/cosmix/bin/cosmix-noded.new /opt/cosmix/bin/cosmix-noded && rm -f /opt/cosmix/bin/cosmix-noded.new && /opt/cosmix/bin/cosmix-noded --help > /dev/null 2>&1 && echo BIN_OK"))')
+  need($host, $i, "install binary + --help smoke")
+  $d.die_if(not contains($i["stdout"], "BIN_OK"), $host .. " binary smoke failed; output: " .. trim($i["stdout"]))
+  print("  bin installed")
+
+  -- Unit: same shape. daemon-reload happens at restart, not here.
+  $scpu = run_argv(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", $UNIT, $host .. ":/usr/lib/systemd/system/" .. $UNIT_NAME .. ".new"], {timeout: 60})
+  $d.die_if($scpu["exit_code"] != 0, "scp unit -> " .. $host .. ": " .. trim($scpu["stderr"]))
+  $iu = ssh_mix($host, 'print(run("install -o 0 -g 0 -m 0644 /usr/lib/systemd/system/" .. $u .. ".new /usr/lib/systemd/system/" .. $u .. " && rm -f /usr/lib/systemd/system/" .. $u .. ".new && echo UNIT_OK"))', {bindings: {u: $UNIT_NAME}})
+  need($host, $iu, "install unit")
+  $d.die_if(not contains($iu["stdout"], "UNIT_OK"), $host .. " unit install failed; output: " .. trim($iu["stdout"]))
+  print("  unit installed (daemon-reload happens on restart)")
+end
+
+-- ── restart + verify ────────────────────────────────────────────────────
+-- journald must hold >= 1 line for the unit's CURRENT invocation. `active`
+-- alone has covered a broker whose log stream never reached journald.
+fn verify_logging_remote($host)
+  $n = 0
+  $try = 0
+  while $try < 4
+    $r = ssh_mix($host, '$iid = trim(run("/usr/bin/systemctl show " .. $u .. " -p InvocationID --value"))
+print(trim(run("/usr/bin/journalctl _SYSTEMD_INVOCATION_ID=" .. $iid .. " -o cat --no-pager | /usr/bin/wc -l")))', {bindings: {u: $UNIT_NAME}})
+    $out = ""
+    if $r["ok"] then
+      $out = trim($r["stdout"])
+    end
+    if not is_empty($out) then
+      $n = to_number($out)
+    end
+    if $n >= 1 then
+      $try = 4
+    else
+      $try = $try + 1
+      $_w = ssh_mix($host, 'sleep(1)')
+    end
+  end
+  $d.die_if($n < 1, $host .. " " .. $UNIT_NAME .. ": active but ZERO journald lines for the current invocation — the log stream is not reaching journald (active-but-mute). Re-run the restart, or check journald health on " .. $host .. ".")
+  print("  logging verified (" .. ("" .. $n) .. " line/s, current invocation)")
+end
+
+-- The restarted broker must answer on its own bus — sent as Mix, natively.
+fn smoke_remote($host)
+  $r = ssh_mix($host, 'send noded noded.ping
+if $rc != 0 then
+  print("send rc=" .. $rc)
+  exit(7)
+end
+print($result)')
+  if not $r["ok"] then
+    print("  ERROR " .. $host .. " noded.ping smoke failed (exit_code=" .. $r["exit_code"] .. ")")
+    print("    stdout: " .. trim($r["stdout"]))
+    print("    stderr: " .. trim($r["stderr"]))
+    exit(1)
+  end
+  $body = trim($r["stdout"])
+  $d.die_if(not contains($body, "pong"), $host .. " noded.ping smoke: missing \"pong\" in body: " .. $body)
+  print("  noded.ping OK: " .. $body)
+end
+
+fn restart_remote($host)
+  $d.assert_node($ROSTER, $host)
+  print("[" .. $host .. "] restart " .. $UNIT_NAME)
+  $r = ssh_mix($host, 'print(run("systemctl daemon-reload && systemctl restart " .. $u .. " && sleep 2 && systemctl is-active " .. $u))', {bindings: {u: $UNIT_NAME}})
+  if not $r["ok"] or not contains($r["stdout"], "active") then
+    print("  ERROR restart failed; last 40 log lines:")
+    $j = ssh_mix($host, 'print(run("journalctl -u " .. $u .. " -n 40 --no-pager"))', {bindings: {u: $UNIT_NAME}})
+    print($j["stdout"])
+    print($j["stderr"])
+    exit(1)
+  end
+  print("  active: " .. trim($r["stdout"]))
+  verify_logging_remote($host)
+  smoke_remote($host)
+end
+
+-- ── run ────────────────────────────────────────────────────────────────
+$argv = args()
+if len($argv) == 0 then
+  print("usage: mix deploy_noded.mix install|restart|all [node…]")
+  print("       default order: " .. join($d.rollout_order($ROSTER), " ") .. " (hubs LAST)")
+  exit(2)
+end
+$stage = $argv[0]
+$nodes = []
+$first = true
+for each $a in $argv
+  if $first then
+    $first = false
+  else
+    $d.assert_node($ROSTER, $a)
+    $d.die_if($d.is_foreign($ROSTER, $a), $a .. " is a foreign node — the broker runs on mesh nodes only")
+    push($nodes, $a)
+  end
+end
+if len($nodes) == 0 then
+  $nodes = $d.rollout_order($ROSTER)
+end
+
+if $stage == "install" or $stage == "all" then
+  probe_local_build()
+  $SNAP = $d.snapshot_bin($BIN)
+  $BIN = $SNAP
+  for each $h in $nodes
+    install_remote($h)
+  end
+  $_rm = run_argv(["rm", "-f", $SNAP])
+  print("")
+  if $stage == "install" then
+    print("install complete: " .. join($nodes, " ") .. " (NOT restarted)")
+  else
+    print("all bin installs complete; beginning sequential restart...")
+    print("")
+  end
+end
+if $stage == "restart" or $stage == "all" then
+  for each $h in $nodes
+    restart_remote($h)
+  end
+  print("")
+  print($stage .. " complete: " .. join($nodes, " "))
+end
+if $stage != "install" and $stage != "restart" and $stage != "all" then
+  print("unknown stage: " .. $stage)
+  exit(2)
+end
