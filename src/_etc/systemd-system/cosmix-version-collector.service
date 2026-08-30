@@ -1,0 +1,48 @@
+# Cosmix version-discovery → Prometheus textfile collector
+# (SPEC 02 §4.1; cosmix-lib-bus::service_info).
+#
+# Oneshot L2 Mix job: queries the LOCAL broker's noded.info + noded.list
+# and writes cosmix_service_build_info{node,service,binary,version,
+# git_sha,build_time}=1 gauges to node_exporter's textfile-collector
+# directory. Triggered by cosmix-version-collector.timer. node_exporter
+# (cosmix-nodeexport) scrapes the file; Grafana/Prometheus alert on
+# version/sha skew across the fleet (the stale-binary alarm).
+#
+# Runs as the cosmix-nodeexport user (UID 514, least-privilege, owns the
+# textfile dir) — it only reads /etc/cosmix/node.conf.mix to resolve the
+# broker, connects to the local broker, and writes one textfile that
+# node_exporter (same user) reads.
+[Unit]
+Description=Cosmix version-discovery Prometheus textfile collector
+# The broker must be up to answer noded.info/list; if it isn't, the job
+# exits non-zero this tick and the timer retries next interval.
+After=cosmix-noded.service
+Wants=cosmix-noded.service
+
+[Service]
+Type=oneshot
+User=cosmix-nodeexport
+Group=cosmix-nodeexport
+ExecStart=/opt/cosmix/bin/mix /opt/cosmix/share/cosmix/prom_version_collector.mix
+# StateDirectory creates + owns /var/lib/cosmix/nodeexport/textfile (UID
+# 514) — the same path node_exporter reads via
+# --collector.textfile.directory. Declaring it here (idempotent with the
+# nodeexport unit's parent StateDirectory) guarantees the dir exists
+# before ProtectSystem=strict locks the rest of the fs read-only, so the
+# atomic tmp+rename write succeeds (Codex P5 BLOCKER).
+StateDirectory=cosmix/nodeexport/textfile
+# Pin the broker config path explicitly — exactly as cosmix-noded/maild/
+# dnsd/webd/indexd/statecache do. Without this, Mix's resolver searches
+# HOME/XDG first and can miss the canonical /etc/cosmix/node.conf.mix
+# (the same broker-discovery trap behind the 2026-06-01 stale-binary
+# incident this whole feature exists to catch). Codex P5 MAJOR.
+Environment=COSMIX_NODE_CONFIG=/etc/cosmix/node.conf.mix
+# Give Mix a writable HOME under ProtectHome=true and suppress incidental
+# state writes from this oneshot collector.
+Environment=HOME=/var/lib/cosmix/nodeexport
+Environment=MIX_STATS=0
+# Hardening (oneshot, no network listen; needs broker TCP + /etc read).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true

@@ -18,7 +18,7 @@ answered by the host, not by a document:
 ssh <node> 'print(run("/opt/cosmix/bin/mix --version"))'
 ```
 
-Repository `markc/cosmix` at commit `589a0d3a` **(working tree dirty at generation — these numbers may not be committed)**
+Repository `markc/cosmix` at commit `c6dc673b`
 
 ## bus
 

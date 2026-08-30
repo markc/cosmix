@@ -1,0 +1,85 @@
+# /usr/lib/systemd/system/cosmix-noded.service
+# Cosmix per-node BUS broker. Registry UID 500, BUS service "noded".
+# Per SPEC 10 §5.4 broker-provider exception: this unit SHALL NOT declare
+# After=cosmix-noded.service or Requires=cosmix-noded.service against itself.
+#
+# Per-host values (LISTEN, NODE) come from /etc/cosmix/noded/service.env,
+# which the deployment process generates per node (see deployment doc
+# §2.1 for the staging contract). The mesh-peer table lives at
+# /etc/cosmix/noded/config.conf.mix — this is the §3.1 canonical config path
+# for the noded daemon.
+
+[Unit]
+Description=Cosmix per-node BUS broker (cosmix-noded)
+Documentation=https://cosmix.dev/spec/10
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cosmix-noded
+Group=cosmix-noded
+StateDirectory=cosmix/noded
+StateDirectoryMode=0750
+RuntimeDirectory=cosmix/noded
+RuntimeDirectoryMode=0750
+ConfigurationDirectory=cosmix/noded
+ConfigurationDirectoryMode=0755
+WorkingDirectory=%S/cosmix/noded
+EnvironmentFile=%E/cosmix/noded/service.env
+Environment=RUST_LOG=cosmix_noded=info
+# Logging is journald-native (the cosmix_log core: journald-primary, with
+# structured PRIORITY + fields). Belt-and-suspenders: route any stray
+# stdout/stderr to the journal too, tag entries, and rate-limit so a
+# crash-loop can't flood the journal. NO LogLevelMax — RUST_LOG above is
+# the source filter; bump with one `systemctl edit` (RUST_LOG=...=debug).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cosmix-noded
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=10000
+# HOME redirect retained but now LOGGING-IRRELEVANT: the cosmix_log daemon
+# preset sets log_file=None, so no rolling file is written under $HOME
+# anymore (journald is the sink). Left in place (harmless under
+# ProtectSystem=strict) rather than churn it in a logging-only change.
+Environment=HOME=%S/cosmix/noded
+# SPEC 10 §3.1 canonical node.conf.mix lives at /etc/cosmix/node.conf.mix.
+# The HOME override above makes CosmixDir::Etc resolve XDG-style under
+# StateDirectory, which would miss /etc/cosmix/node.conf.mix. Pin the path
+# explicitly via the documented env-var precedence so the resolver finds
+# the canonical file regardless of HOME.
+Environment=COSMIX_NODE_CONFIG=%E/cosmix/node.conf.mix
+ExecStart=/opt/cosmix/bin/cosmix-noded serve --listen ${LISTEN} --node ${NODE} --mesh-config %E/cosmix/noded/config.conf.mix
+Restart=on-failure
+RestartSec=5s
+
+# §5.1 required (Level 1)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# §5.2 mandatory hardening (Level 2)
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target

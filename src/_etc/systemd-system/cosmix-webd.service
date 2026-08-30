@@ -1,0 +1,126 @@
+# /usr/lib/systemd/system/cosmix-webd.service
+# Cosmix web daemon. Registry UID 502, registry service name "webd"
+# per SPEC 10 Appendix A. Webd registers with the local noded broker as
+# the BUS service "webd" (cosmix-webd-amp-citizenship.md, cb399aa); see
+# `webd.routes.list` / `webd.stats` / `webd.tls.status` /
+# `webd.autoconfig.served_domains` / `webd.props.*` for the verb surface.
+#
+# All per-host values (binds, paths, TLS material) live inside
+# /etc/cosmix/node.conf.mix's [webd] block — no per-host CLI overrides.
+#
+# Webd reads node.conf.mix at startup to derive its listen address, the
+# JMAP upstream URL, the noded WebSocket URL (used as the /ws WebSocket
+# proxy target for browser clients), and the TLS keypair paths. It
+# acts as an HTTPS reverse proxy + WASM/static asset host + browser→
+# noded WS bridge.
+
+[Unit]
+Description=Cosmix web daemon (cosmix-webd)
+Documentation=https://cosmix.dev/spec/10
+After=network-online.target cosmix-noded.service
+Wants=network-online.target cosmix-noded.service
+
+[Service]
+Type=simple
+User=cosmix-webd
+Group=cosmix-webd
+StateDirectory=cosmix/webd
+StateDirectoryMode=0750
+RuntimeDirectory=cosmix/webd
+RuntimeDirectoryMode=0750
+ConfigurationDirectory=cosmix/webd
+ConfigurationDirectoryMode=0755
+WorkingDirectory=%S/cosmix/webd
+# NS 4.0 (ns4-server-class-spec.md §3): per-vhost content + mutable state
+# lives under /srv/<domain>/ (docroot, cms.db, uploads, access logs,
+# worker sockets). ProtectSystem=strict makes everything outside the
+# StateDirectory read-only, so webd MUST be granted write access to the
+# /srv content root or every per-vhost cms.db write fails "readonly
+# database". Daemon-private state stays under %S/cosmix/webd (web.db etc).
+ReadWritePaths=/srv
+# `--db-path` is pinned because cosmix-webd's $COSMIX_VAR/web.db default
+# resolves to /var/lib/cosmix/web.db, which sits in the substrate-shared
+# parent (root:root 0755) and is unwritable by cosmix-webd. The SPEC 10
+# §3.1 owner-leaf is %S/cosmix/webd/, so place the DB there.
+ExecStart=/opt/cosmix/bin/cosmix-webd serve --db-path %S/cosmix/webd/web.db
+Restart=on-failure
+RestartSec=5s
+Environment=RUST_LOG=cosmix_webd=info
+# Logging is journald-native (the cosmix_log core: journald-primary, with
+# structured PRIORITY + fields). Belt-and-suspenders: route any stray
+# stdout/stderr to the journal too, tag entries, and rate-limit so a
+# crash-loop can't flood the journal. NO LogLevelMax — RUST_LOG above is
+# the source filter; bump with one `systemctl edit` (RUST_LOG=...=debug),
+# or flip it LIVE with no restart: `webd.props.set namespace=log level=debug`.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cosmix-webd
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=10000
+# HOME redirect retained but now LOGGING-IRRELEVANT: the cosmix_log daemon
+# preset sets log_file=None, so no rolling file is written under $HOME
+# anymore (journald is the sink). Left in place (harmless under
+# ProtectSystem=strict) rather than churn it in a logging-only change.
+Environment=HOME=%S/cosmix/webd
+# cosmix_config::node::load_node_config() (called from cosmix-webd's
+# Serve handler) and downstream NodeConfig::noded_url() fall back to
+# hardcoded values when node.conf.mix isn't found. Under the HOME redirect
+# above, cosmix_config::node's XDG resolver looks at
+# %S/cosmix/webd/.config/cosmix/node.conf.mix and misses the canonical
+# /etc/cosmix/node.conf.mix. Pin COSMIX_NODE_CONFIG so listen / TLS paths /
+# JMAP upstream / noded URL all derive from the right per-host config.
+# Mirrors the cosmix-noded.service and cosmix-maild.service fix for
+# the same root cause (different helper name, same hardcoded-fallback
+# class).
+Environment=COSMIX_NODE_CONFIG=%E/cosmix/node.conf.mix
+
+# Webd binds privileged HTTPS port (443). CAP_NET_BIND_SERVICE keeps
+# the unit non-root while allowing the privileged-port bind — the
+# named-alternative form of §5.2's CapabilityBoundingSet=/AmbientCapabilities=
+# rule. TLS material referenced from node.conf.mix MUST be readable by
+# cosmix-webd. SPEC 10 §3.3 (v1.1.0) pins the shared-keypair pattern:
+# `root:cosmix-tls 0640` on the private key, with cosmix-webd a member
+# of the cosmix-tls group via the canonical sysusers fragment. Per-host
+# `setfacl` workarounds are out of scope for this unit.
+#
+# OPERATOR REQUIREMENT: /etc/cosmix/node.conf.mix's [webd] block MUST set
+# both `tls_cert` and `tls_key` for the canonical unit. cosmix-webd
+# falls open to cleartext HTTP on the same port if either is missing
+# OR if both are missing (main.rs:923 the (Some, Some) branch is the
+# HTTPS path; any other shape, including absent both, falls through
+# to main.rs:949 serving plain HTTP). For port 443 this is silent
+# downgrade-to-cleartext, which is unacceptable on a substrate
+# canonical unit. A code-side fix to fail-closed unless BOTH are set
+# is tracked as a follow-up; until then the operator must ensure
+# both are configured.
+
+# §5.1 required (Level 1)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# §5.2 mandatory hardening (Level 2)
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+UMask=0027
+
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target

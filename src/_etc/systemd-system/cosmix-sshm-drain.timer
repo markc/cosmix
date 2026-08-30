@@ -1,0 +1,17 @@
+[Unit]
+Description=Cosmix sshm drain backstop (missed-wake recovery only)
+
+[Timer]
+# The BUS wake (webd bus_call -> citizen -> start drain) is the PRIMARY trigger; this
+# timer is ONLY the backstop for a missed/failed wake and for jobs queued while the
+# workstation was down. It must remain minutes-scale per the no-poll ADR — NEVER shorten
+# this into a seconds-scale queue poll.
+OnBootSec=2min
+OnUnitInactiveSec=5min
+# Tighten from the 1-min default so backstop recovery is ~5min, not up to ~6min —
+# still firmly minutes-scale per the no-poll ADR (this is a backstop, never a poll).
+AccuracySec=10s
+Unit=cosmix-sshm-drain.service
+
+[Install]
+WantedBy=timers.target

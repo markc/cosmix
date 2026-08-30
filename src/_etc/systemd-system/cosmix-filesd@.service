@@ -1,0 +1,87 @@
+# /usr/lib/systemd/system/cosmix-filesd@.service
+# Cosmix files-as-truth markdown corpus daemon — ONE instance PER corpus
+# (%i = corpus name, e.g. `systemctl start cosmix-filesd@notes`). Per-corpus
+# config at /etc/cosmix/filesd/<corpus>.conf.mix (root/corpus_id/db/
+# interval_secs/bus_service); the daemon registers BUS service
+# `filesd-<corpus>` so two instances never collide on the broker and webd's
+# future delegated bus_call has a stable per-corpus target.
+#
+# OWNERSHIP NOTE — the corpus tree is Syncthing-synced AND written by filesd
+# (in-file UUIDv7 id-mint + filesd.save, atomic temp+rename). The convention
+# below is corpus root = /srv/cosmix/corpus/%i, which must be read-write by
+# BOTH this service's user and the Syncthing user (share a group, or run
+# Syncthing as cosmix-filesd). If the corpus instead lives in a home dir
+# synced by a per-user Syncthing, run this as that user (drop ProtectHome,
+# adjust ReadWritePaths) via `systemctl edit cosmix-filesd@<corpus>`.
+# The index.db is a 100%-rebuildable projection under StateDirectory — `rm`
+# it and restart to rebuild from the corpus.
+
+[Unit]
+Description=Cosmix files-as-truth corpus daemon (%i)
+Documentation=https://cosmix.dev/spec/10
+After=network-online.target cosmix-noded.service
+Wants=network-online.target cosmix-noded.service
+# Wants=, not Requires=: cosmix-filesd is broker-optional (indexd-shaped
+# reconnect) — it reconciles the on-disk corpus and serves the moment the
+# broker appears. Requires= would needlessly block startup if noded is down.
+
+[Service]
+Type=simple
+User=cosmix-filesd
+Group=cosmix-filesd
+StateDirectory=cosmix/filesd/%i
+StateDirectoryMode=0750
+ConfigurationDirectory=cosmix/filesd
+ConfigurationDirectoryMode=0755
+WorkingDirectory=%S/cosmix/filesd/%i
+ExecStart=/opt/cosmix/bin/cosmix-filesd serve -c %E/cosmix/filesd/%i.conf.mix
+Restart=on-failure
+RestartSec=5s
+Environment=RUST_LOG=cosmix_filesd=info
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cosmix-filesd@%i
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=10000
+# Pin the broker config: under the sandbox the XDG resolver would miss the
+# canonical /etc/cosmix/node.conf.mix. Mirrors cosmix-indexd / cosmix-maild.
+Environment=COSMIX_NODE_CONFIG=%E/cosmix/node.conf.mix
+# HOME redirect at StateDirectory (mirrors maild). With ProtectHome=yes the
+# cosmix-filesd user's /home is inaccessible; without a valid HOME the BUS
+# client's node-address resolution falls back and fails to reach the broker.
+Environment=HOME=%S/cosmix/filesd/%i
+
+# §5.1 required (Level 1)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# filesd is the WRITER of the corpus tree (atomic temp+rename, in-file id
+# mint). StateDirectory is RW automatically; the corpus root must be added.
+# Per-instance so @notes can't touch @docs's tree. (Adjust if the corpus
+# lives elsewhere — see the OWNERSHIP NOTE above.)
+ReadWritePaths=/srv/cosmix/corpus/%i
+
+# §5.2 mandatory hardening (Level 2)
+# AF_UNIX: the local noded broker socket. AF_INET/AF_INET6: a TCP broker URL
+# (node.conf.mix) on a mesh node. No outbound HTTPS (unlike indexd).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+UMask=0027
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target

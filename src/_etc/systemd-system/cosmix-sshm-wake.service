@@ -1,0 +1,37 @@
+[Unit]
+Description=Cosmix sshm BUS wake citizen (credential-free; starts the SSH-manager drain)
+After=network.target cosmix-noded.service
+Wants=cosmix-noded.service
+
+[Service]
+Type=simple
+User=cosmix-sshm-wake
+Group=cosmix-sshm-wake
+ExecStart=/opt/cosmix/bin/mix --serve /opt/cosmix/share/cosmix/sshm.mix --name sshm
+Restart=on-failure
+RestartSec=2
+
+# This identity holds NO credential — the sshm worker secret belongs to the drain alone.
+# Its ONLY authority is writing the trigger file /run/cosmix-sshm/wake, which the
+# cosmix-sshm-drain.path unit watches to start the drain (in systemd's own fixed job
+# mode). No polkit grant, no system-bus access, no systemctl. It needs the BUS broker
+# (loopback) and write access to the trigger dir, and nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+# /run is read-only under ProtectSystem=strict; re-open ONLY the trigger dir for write.
+# tmpfiles owns the dir root:root 0755, so the citizen can rewrite the wake file it owns
+# but cannot unlink it or touch the drain's flock inode.
+ReadWritePaths=/run/cosmix-sshm
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

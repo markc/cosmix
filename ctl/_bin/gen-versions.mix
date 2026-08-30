@@ -100,11 +100,13 @@ end
 $wsv = ws_version($root)
 $sha = repo_sha($root)
 $dirty = repo_dirty($root)
-$body = $body .. "Repository `markc/cosmix` at commit `" .. $sha .. "`"
+-- 2026-08-30: the dirty flag goes to stderr, NOT into the file. Embedding it
+-- made the file unstable: generated dirty, then committed, `--check` on the
+-- now-clean tree reported it stale — and the deploy gate refused a good build.
 if $dirty then
-  $body = $body .. " **(working tree dirty at generation — these numbers may not be committed)**"
+  eprint("gen-versions: working tree dirty at generation — these numbers may not be committed")
 end
-$body = $body .. "\n\n"
+$body = $body .. "Repository `markc/cosmix` at commit `" .. $sha .. "`\n\n"
 $crates = $root .. "/src/crates"
 $all = []
 for each $e in ls($crates)

@@ -1,0 +1,129 @@
+# /usr/lib/systemd/system/cosmix-dnsd.service
+# Cosmix authoritative WG-mesh DNS daemon. SPEC 10 v1.3.0 daemon
+# identity: UID/GID 506 (the R2.a-reclaimed cosmix-cloudd slot — NOT
+# the next-sequential 508; the append-only frontier stays 508), BUS
+# service name "dnsd" (R6: daemon name minus the `cosmix-` prefix).
+#
+# This is the *citizen* unit (the default `cargo build`). The
+# `--no-default-features` standalone server (plan goal-(c) isolated-
+# node self-resolution) is NOT run from a unit — it binds loopback /
+# an explicit `--listen` for `dig` smoke and never depends on a live
+# WG interface.
+#
+# Per-host values: the node's WireGuard mesh IP comes via
+# %E/cosmix/dnsd/service.env (LISTEN=<wg-ip>:53), exactly the
+# cosmix-noded.service `${LISTEN}` pattern (the deployment process
+# generates service.env per node). The zone file and the receiver-
+# state file are fixed canonical paths under the SPEC 10 §3.1 owner
+# leaves (config / state). cosmix-dnsd has no config-file mode; the
+# binary always takes explicit --zones/--state/--listen.
+
+[Unit]
+Description=Cosmix authoritative WG-mesh DNS daemon (cosmix-dnsd)
+Documentation=https://cosmix.dev/spec/10
+After=network-online.target
+Wants=network-online.target
+# cosmix-dnsd BUS-registers the read-only `dnsd` service with the
+# local broker (dnsd.zone.snapshot / dnsd.stats). That registration is
+# NON-BLOCKING: if noded is down, `bus::run` logs and returns and DNS
+# serving continues — goal-(c) isolated-node self-resolution must work
+# with the broker absent. So noded is a SOFT ordering preference
+# (Wants=/After=), deliberately NOT Requires= (that would make DNS
+# resolution depend on the broker, defeating goal-(c)).
+After=cosmix-noded.service
+Wants=cosmix-noded.service
+# WG-up-before-bind ordering HINT (plan §6). The actual guarantee is
+# the daemon's own bounded bind-retry on AddrNotAvailable (citizen
+# `bind_retry`), which is deployment-unit-name-agnostic — the 4 mesh
+# nodes do not all bring WireGuard up the same way. If THIS node uses
+# wg-quick, uncommenting the matching line tightens startup ordering
+# (the retry then almost never spins); leaving it commented is safe
+# because the bounded retry covers the tunnel-still-settling window.
+# Do NOT BindsTo= a WG unit: a WG flap must not tear down DNS.
+#After=wg-quick@wg0.service
+#Wants=wg-quick@wg0.service
+
+[Service]
+Type=simple
+User=cosmix-dnsd
+Group=cosmix-dnsd
+StateDirectory=cosmix/dnsd
+StateDirectoryMode=0750
+RuntimeDirectory=cosmix/dnsd
+RuntimeDirectoryMode=0750
+ConfigurationDirectory=cosmix/dnsd
+ConfigurationDirectoryMode=0755
+WorkingDirectory=%S/cosmix/dnsd
+EnvironmentFile=%E/cosmix/dnsd/service.env
+# RUST_LOG target is the COMPILED CRATE TARGET `cosmix_dnsd`
+# (underscore), NOT the `cosmix-dnsd` package name — an EnvFilter
+# directive keyed on the hyphenated package name silently matches
+# nothing. Mirrors cosmix-maild.service's `RUST_LOG=cosmix_maild=info`.
+Environment=RUST_LOG=cosmix_dnsd=info
+# Logging is journald-native (the cosmix_log core: journald-primary, with
+# structured PRIORITY + fields). Belt-and-suspenders: route any stray
+# stdout/stderr to the journal too, tag entries, and rate-limit so a
+# crash-loop can't flood the journal. NO LogLevelMax — RUST_LOG above is
+# the source filter; bump with one `systemctl edit` (RUST_LOG=...=debug).
+# (This is the citizen build; the standalone --no-default-features dnsd
+# keeps its own stderr-only fmt and never links cosmix_log.)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cosmix-dnsd
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=10000
+# HOME redirect retained but now LOGGING-IRRELEVANT: the cosmix_log daemon
+# preset sets log_file=None, so no rolling file is written under $HOME
+# anymore (journald is the sink). Left in place (harmless under
+# ProtectSystem=strict) rather than churn it in a logging-only change.
+Environment=HOME=%S/cosmix/dnsd
+# citizen.rs::configured_wg_ip() calls cosmix_config::node::
+# load_node_config() to learn this node's WG mesh IP for the §6
+# WG-vs-LAN bind validation. Under the HOME override above the XDG
+# resolver looks at %S/cosmix/dnsd/.config/cosmix/node.conf.mix and misses
+# the canonical /etc/cosmix/node.conf.mix. Pin COSMIX_NODE_CONFIG so the
+# WG-vs-LAN check resolves against the right per-host config (without
+# it the citizen degrades to the P1 explicit-flag posture and would
+# reject the WG bind). Mirrors the cosmix-noded/maild/webd fix for the
+# same hardcoded-fallback / XDG-miss class.
+Environment=COSMIX_NODE_CONFIG=%E/cosmix/node.conf.mix
+ExecStart=/opt/cosmix/bin/cosmix-dnsd --zones %E/cosmix/dnsd/zones.mix --state %S/cosmix/dnsd/state --listen ${LISTEN}
+Restart=on-failure
+RestartSec=5s
+
+# cosmix-dnsd binds the privileged DNS port 53 (UDP+TCP) on the WG IP.
+# CAP_NET_BIND_SERVICE keeps the unit non-root while allowing the
+# privileged-port bind — the named-alternative form of §5.2's
+# CapabilityBoundingSet=/AmbientCapabilities= rule (same shape as
+# cosmix-maild's 25/465 and cosmix-webd's 443).
+
+# §5.1 required (Level 1)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# §5.2 mandatory hardening (Level 2)
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+UMask=0027
+
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target

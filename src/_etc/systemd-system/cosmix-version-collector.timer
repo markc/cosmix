@@ -1,0 +1,15 @@
+# Drives cosmix-version-collector.service. Versions change only on
+# deploy, so a slow cadence is plenty; node_exporter scrapes the textfile
+# on its own (fast) schedule independently. 2 min after boot, then every
+# 5 min.
+[Unit]
+Description=Periodic cosmix version-discovery Prometheus collector
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+# Don't stampede all nodes onto the same second.
+RandomizedDelaySec=20
+
+[Install]
+WantedBy=timers.target

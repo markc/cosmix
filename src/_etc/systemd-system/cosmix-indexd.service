@@ -1,0 +1,117 @@
+# /usr/lib/systemd/system/cosmix-indexd.service
+# Cosmix semantic indexing + vector storage daemon. Registry UID 503,
+# BUS service "indexd". All per-host values live inside the daemon's
+# config file at /etc/cosmix/indexd/config.conf.mix — no per-host CLI args.
+
+[Unit]
+Description=Cosmix semantic indexing daemon (cosmix-indexd)
+Documentation=https://cosmix.dev/spec/10
+After=network-online.target cosmix-noded.service
+Wants=network-online.target cosmix-noded.service
+# Deliberately Wants=, not Requires=, on cosmix-noded.service: indexd
+# main.rs explicitly supports a "broker not available, running socket-
+# only mode" fallback (see the registration arm around main.rs:1372–
+# 1388). Requires= would defeat that — if noded fails to start, indexd
+# would never start either. After= keeps the ordering so noded gets a
+# chance to come up first.
+# Bounded restart burst: with MemoryMax below, an OOM-kill loop restarts at
+# most 3 times per 10 min, then systemd gives up until manual start.
+StartLimitIntervalSec=10min
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=cosmix-indexd
+Group=cosmix-indexd
+# Memory blast-radius cap (2026-08-09 hardening, after indexd was the worst
+# offender in a host OOM crash). Measured peak this boot was 1.15G (cold f32→f16
+# model load + vindex), resting ~350M — 2G leaves headroom for corpus growth
+# while confining any pathological request to killing indexd, not the desktop.
+# Raise only when measured corpus growth requires it.
+MemoryHigh=1536M
+MemoryMax=2G
+MemorySwapMax=0
+TasksMax=128
+# Cap glibc malloc arenas: 38 threads × per-thread arenas otherwise strand
+# freed pages after bulk work. A/B baseline post-unload RSS 2026-08-09: ~355M.
+Environment=MALLOC_ARENA_MAX=2
+StateDirectory=cosmix/indexd
+StateDirectoryMode=0750
+RuntimeDirectory=cosmix/indexd
+# RuntimeDirectoryMode=0755 is a deliberate divergence from maild's 0750.
+# Maild's IPC routes through noded, so no external peer needs to traverse
+# /run/cosmix/maild/. Indexd's embed.sock IS the daemon's primary API
+# and is connected to directly by cosmix-mcp running as markc (out of
+# group cosmix-indexd). 0750 here would silently break the MCP path.
+# The socket itself is created at default 0666; tighten when the auth
+# model justifies it.
+RuntimeDirectoryMode=0755
+ConfigurationDirectory=cosmix/indexd
+ConfigurationDirectoryMode=0755
+WorkingDirectory=%S/cosmix/indexd
+ExecStart=/opt/cosmix/bin/cosmix-indexd -c %E/cosmix/indexd/config.conf.mix
+Restart=on-failure
+# 30s so an OOM-kill loop (MemoryMax above) can't thrash; burst cap in [Unit].
+RestartSec=30s
+Environment=RUST_LOG=cosmix_indexd=info
+# Logging is journald-native (the cosmix_log core: journald-primary, with
+# structured PRIORITY + fields). Belt-and-suspenders: route any stray
+# stdout/stderr to the journal too, tag entries, and rate-limit so a
+# crash-loop can't flood the journal. NO LogLevelMax — RUST_LOG above is
+# the source filter; bump with one `systemctl edit` (RUST_LOG=...=debug).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cosmix-indexd
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=10000
+# HOME redirect at StateDirectory — UNLIKE the other daemons, indexd
+# still needs this for a NON-logging reason:
+#   (1) (logging) cosmix_log now uses journald with log_file=None, so
+#       nothing writes under $HOME for logging anymore. This redirect is
+#       no longer about logs — but is still required for (2).
+#   (2) hf-hub::api::sync::Api::new() routes through Cache::default(),
+#       which reads dirs::home_dir() and does NOT honour HF_HOME or
+#       HUGGINGFACE_HUB_CACHE (only ApiBuilder::from_env() does). On
+#       Linux dirs::home_dir() honours $HOME, so the redirect lands the
+#       model cache at %S/cosmix/indexd/.cache/huggingface/hub/ — owned
+#       by cosmix-indexd and persistent across boots via StateDirectory.
+Environment=HOME=%S/cosmix/indexd
+# resolve_noded_url() falls back to a hardcoded broker IP when node.conf.mix
+# isn't found. Under the HOME redirect above, cosmix_config::node's XDG
+# resolver looks at %S/cosmix/indexd/.config/cosmix/node.conf.mix and misses
+# the canonical /etc/cosmix/node.conf.mix. Pin COSMIX_NODE_CONFIG so BUS
+# registration uses the local broker URL declared in node.conf.mix. Mirrors
+# cosmix-maild.service / cosmix-noded.service for the same root cause.
+Environment=COSMIX_NODE_CONFIG=%E/cosmix/node.conf.mix
+
+# §5.1 required (Level 1)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# §5.2 mandatory hardening (Level 2)
+# AF_UNIX: the embed.sock IPC surface.
+# AF_INET/AF_INET6: outbound HTTPS to huggingface.co for model download
+# on first run (subsequent runs hit the local cache).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+UMask=0027
+
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target

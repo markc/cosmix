@@ -1,0 +1,127 @@
+# /usr/lib/systemd/system/cosmix-statecache.service
+# Cosmix SPEC-18 Phase-1 reference citizen. SPEC 10 v1.2.0 Appendix A
+# citizen-identity row: UID/GID 600, POSIX user `cosmix-statecache`,
+# BUS service name `statecache` (the registry bus field is `-`, so the
+# name derives by stripping the `cosmix-` prefix — `mix --serve`'s
+# derive_serve_name does the same from the script stem, which is why
+# ExecStart carries no `--name`).
+#
+# This is not a daemon: it is the minimal BUS state-holder that proves
+# SPEC 18 §3.3 — a `cosmix-noded` bounce is a transient drop the
+# SupervisedClient reconnects/re-registers/replays through (WS1/WS2),
+# not a process death. statecache.mix subscribes to a harness-owned
+# probe topic, retains the last value, and answers `statecache.get`
+# via the WS-R reply() primitive.
+#
+# Deliberate divergences from the cosmix-{noded,maild,webd}.service
+# siblings, called out so a future agent does not "fix" them back:
+#   * Type=exec, not simple — DECIDED SPEC 18 §7-Q2: no sd_notify in
+#     Phase 1, so readiness is "binary exec'd", nothing more.
+#   * NO `Environment=HOME=` redirect. The siblings used to point HOME at
+#     their StateDirectory for a rolling-file appender; that's gone — both
+#     `mix --serve` and the migrated daemons now log via the cosmix_log
+#     core with log_file=None (journald is the sink), so no daemon writes
+#     logs under $HOME anymore. mix --serve never needed HOME at all; a
+#     SPEC-10 citizen has none and needs none. See init_serve_tracing()
+#     in cosmix-mix/src/main.rs.
+#   * Empty CapabilityBoundingSet=/AmbientCapabilities= (the
+#     cosmix-noded form, not maild/webd's CAP_NET_BIND_SERVICE) —
+#     statecache binds no privileged port; it is a BUS client only.
+#   * After= ONLY against cosmix-noded.service — deliberately NO
+#     Requires=/BindsTo=/PartOf= (unlike cosmix-maild.service's
+#     Requires=). DO NOT "harmonize" this back to the maild shape: a
+#     stop/crash-without-restart of cosmix-noded under Requires= would
+#     deactivate statecache too, and the WS8 §3.3 assertion ("the
+#     post-bounce value is still answerable") would then pass via
+#     systemd restarting statecache + a fresh subscribe rather than via
+#     the in-process SupervisedClient reconnect/resubscribe replay —
+#     a partial-truth false-positive that masks the exact thing this
+#     citizen exists to prove. The SupervisedClient is designed to wait
+#     out an absent or bounced broker (WS1 unbounded reconnect backoff),
+#     so a hard dependency is both unnecessary and proof-defeating.
+
+[Unit]
+Description=Cosmix SPEC-18 reference citizen (cosmix-statecache)
+Documentation=https://cosmix.dev/spec/18
+After=network-online.target cosmix-noded.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=cosmix-statecache
+Group=cosmix-statecache
+StateDirectory=cosmix/statecache
+StateDirectoryMode=0750
+RuntimeDirectory=cosmix/statecache
+RuntimeDirectoryMode=0750
+ConfigurationDirectory=cosmix/statecache
+ConfigurationDirectoryMode=0755
+WorkingDirectory=%S/cosmix/statecache
+ExecStart=/opt/cosmix/bin/mix --serve /opt/cosmix/share/cosmix/statecache.mix
+Restart=on-failure
+RestartSec=5s
+# Explicit = the init_serve_tracing() built-in default, pinned here so
+# the journald lines a future operator greps for are predictable and do
+# not silently change if that default is ever retuned. Directives are
+# matched against each crate's tracing *target* (compiled crate name),
+# NOT its package name: `mix` = the binary (§3.5 serve: markers),
+# `cosmix_mix` = cosmix-lib-mix (§3.4 panic + pump), `cosmix_client` =
+# cosmix-lib-client (§3.3 supervised_reconnect replay), `cosmix_bus` =
+# cosmix-lib-bus. Keep in lockstep with init_serve_tracing()'s default.
+Environment=RUST_LOG=mix=info,cosmix_mix=info,cosmix_client=info,cosmix_bus=info
+# Two log streams with DIFFERENT journald identifiers, both queryable:
+#   * tracing/log events (the §3.x serve markers) emit through the
+#     cosmix_log NATIVE journald layer, whose SYSLOG_IDENTIFIER is set
+#     in-code to `cosmix-mix` (the binary's serve("cosmix-mix") identity)
+#     → `journalctl -t cosmix-mix`.
+#   * the served script's own `print(...)` output (statecache.mix calls
+#     print) goes to the process stdout, which StandardOutput=journal
+#     captures under SyslogIdentifier below → `journalctl -t
+#     cosmix-statecache`.
+# `journalctl -u cosmix-statecache` shows BOTH (by unit) regardless.
+# Rate-limit guards a crash-loop / print-storm flood. NO LogLevelMax —
+# RUST_LOG above is the source filter (one `systemctl edit` to debug).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cosmix-statecache
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=10000
+# resolve_noded_url() -> cosmix_config::node::load_node_config() honours
+# COSMIX_NODE_CONFIG first, else searches XDG/system paths. Under the
+# nologin HOME (/nonexistent) + ProtectHome=yes the XDG arm is useless;
+# pin the canonical /etc/cosmix/node.conf.mix so BUS registration uses the
+# local broker URL deterministically. Mirrors the sibling units' fix
+# for the same hardcoded-fallback class (no HOME redirect needed here —
+# see the header note — but the node.conf.mix pin still is).
+Environment=COSMIX_NODE_CONFIG=%E/cosmix/node.conf.mix
+
+# §5.1 required (Level 1)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# §5.2 mandatory hardening (Level 2)
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target

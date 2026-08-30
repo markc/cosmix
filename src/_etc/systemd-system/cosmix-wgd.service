@@ -1,0 +1,133 @@
+# /usr/lib/systemd/system/cosmix-wgd.service
+# Cosmix WireGuard mesh control plane (SPEC 13 D0), phase P2. SPEC 10 v1.4.3
+# daemon identity: UID/GID 515 (the next free daemon-identity slot after the
+# obs-tier band), BUS service name "wgd" (R6: daemon name minus `cosmix-`).
+#
+# P2 is DERIVE + DRY-RUN: wgd reads this node's signed inventory (the one
+# authoritative membership source, SPEC 13 §7.1/§12a), derives the WG peer set
+# this node's kernel SHOULD hold, and reconciles against the live kernel in
+# dry-run — it reports drift and NEVER mutates the kernel or the inventory.
+# Apply-mode + write verbs are P3.
+#
+# Inventory source (read-only): noded's canonical plane-A cache
+#   /etc/cosmix/noded/genesis.pub          (trust anchor)
+#   /var/lib/cosmix/noded/inventory.signed (last-known-good, verified each tick)
+#   /var/lib/cosmix/noded/inventory.baseline (rollback floor; noded owns writes)
+# wgd re-verifies the signed inventory against the genesis anchor itself.
+#
+# Per-host overrides (e.g. a lab interface name) go in
+#   %E/cosmix/wgd/service.env  as  WGD_ARGS=--iface <name>
+# and default to empty (the interface derives from the mesh identity).
+
+[Unit]
+Description=Cosmix WireGuard mesh control plane (cosmix-wgd, P2 dry-run)
+Documentation=https://cosmix.dev/spec/13
+After=network-online.target
+Wants=network-online.target
+# wgd BUS-registers the read-only `wgd` service (wgd.iface.status /
+# wgd.peer.status / wgd.topology.snapshot / wgd.drift). That registration is
+# NON-BLOCKING: if noded is down, the reconcile loop keeps running and the BUS
+# surface keeps retrying. So noded is a SOFT ordering preference, deliberately
+# NOT Requires= (a broker outage must not stop drift detection).
+After=cosmix-noded.service
+Wants=cosmix-noded.service
+# WG-interface-up ordering is only a HINT: wgd's live read tolerates a missing
+# interface (it reports "live unavailable" and keeps serving the derived
+# intent), so a WG flap must not tear wgd down. Do NOT BindsTo= a WG unit.
+#After=wg-quick@wg0.service
+#Wants=wg-quick@wg0.service
+
+# ⚠️ DEPLOY PREREQUISITE (Codex 2026-07-06, review decision #1): wgd reads
+# noded's plane-A cache under /var/lib/cosmix/noded, which noded creates
+# StateDirectoryMode=0750 (owner cosmix-noded). genesis.pub (/etc/cosmix/noded,
+# 0644) is world-readable, but inventory.signed + inventory.baseline are NOT
+# traversable by cosmix-wgd. The trust-safe fix is the SPEC-10 §3.3 shared-read
+# group `cosmix-mesh` (GID 516): wgd is a member (SupplementaryGroups below),
+# and the signed inventory (public, non-secret — INV-1) is exposed to it via
+# that group. The d2 admission SECRET (/etc/cosmix/noded/d2.seed, group
+# cosmix-noded) is deliberately NOT reachable this way — cosmix-wgd is in
+# cosmix-mesh, never in cosmix-noded. **This unit MUST NOT be deployed live
+# until /var/lib/cosmix/noded is made group-readable/traversable by
+# cosmix-mesh** (noded StateDirectory group + provisioning — the deferred
+# noded-side of decision #1). Until then trust::load_and_verify fails closed
+# and the reconcile loop logs + retries (it does not silently succeed).
+[Service]
+Type=simple
+User=cosmix-wgd
+Group=cosmix-wgd
+# Read access to the signed inventory via the cosmix-mesh shared-read group
+# (SPEC-10 §3.3). NOT cosmix-noded — that would also expose the d2 seed.
+SupplementaryGroups=cosmix-mesh
+StateDirectory=cosmix/wgd
+StateDirectoryMode=0750
+RuntimeDirectory=cosmix/wgd
+RuntimeDirectoryMode=0750
+ConfigurationDirectory=cosmix/wgd
+ConfigurationDirectoryMode=0755
+WorkingDirectory=%S/cosmix/wgd
+EnvironmentFile=-%E/cosmix/wgd/service.env
+# RUST_LOG target is the COMPILED CRATE TARGET `cosmix_wgd` (underscore), NOT
+# the `cosmix-wgd` package name — an EnvFilter directive keyed on the
+# hyphenated package name silently matches nothing (the same trap dnsd/maild
+# document). Mirrors `RUST_LOG=cosmix_dnsd=info`.
+Environment=RUST_LOG=cosmix_wgd=info
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cosmix-wgd
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=10000
+Environment=HOME=%S/cosmix/wgd
+# wgd resolves this node's mesh NAME (to find "self" among members) via
+# cosmix_config::node::load_node_config(). Under the HOME override the XDG
+# resolver would miss the canonical /etc/cosmix/node.conf.mix; pin it so
+# self-identification works (same hardcoded-fallback/XDG-miss fix as
+# noded/maild/webd/dnsd).
+Environment=COSMIX_NODE_CONFIG=%E/cosmix/node.conf.mix
+ExecStart=/opt/cosmix/bin/cosmix-wgd $WGD_ARGS
+Restart=on-failure
+RestartSec=5s
+
+# wgd reads the live kernel WG peer set (`wg show <iface> dump`, spawned as a
+# child of this unit) and — in P3 — will apply peer state via the WireGuard
+# generic-netlink family. Both need CAP_NET_ADMIN and an AF_NETLINK socket.
+# Even in the P2 dry-run READ, querying live WG state requires CAP_NET_ADMIN
+# (the kernel gates `wg show`/GET_DEVICE on it), so it is granted now (Codex
+# 2026-07-06 decision #5). The ambient cap is inherited by the `wg` child
+# across execve (NoNewPrivileges + non-setuid binary).
+
+# §5.1 required (Level 1)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# §5.2 mandatory hardening (Level 2)
+# AF_NETLINK added (vs dnsd's AF_UNIX/INET set) for the WireGuard-generic /
+# rtnetlink sockets the control plane speaks.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+UMask=0027
+
+# NOT PrivateDevices=yes: the WireGuard-generic netlink path the P3 apply mode
+# uses is a socket family, not a device node, so PrivateDevices is compatible;
+# it is omitted here only to leave P3's netlink apply unconstrained by a device
+# allowlist, matching the intent of granting CAP_NET_ADMIN. P2's `wg show`
+# read works either way.
+
+[Install]
+WantedBy=multi-user.target
