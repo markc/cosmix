@@ -448,9 +448,14 @@ if byte_length($landed) != byte_length($bytes) or $landed != $bytes then
   eprint("remote write byte-identity mismatch")
   exit(7)
 end
-if stat($dest)["perm"] != $mode_value then
+$info = stat($dest)
+if $info["perm"] != $mode_value then
   eprint("remote write mode mismatch")
   exit(8)
+end
+if $info["uid"] != to_number($owner) or $info["gid"] != to_number($group) then
+  eprint("remote write ownership mismatch")
+  exit(9)
 end
 print("write-ok")
 ', {bindings: {
@@ -657,9 +662,21 @@ if not $cached["ok"] then
     fail_job("cloning", "release upload to " .. $PVE ..
       " failed (or exceeded 15m): " .. exec_err($copy))
   end
-  $landed = remote_exec($PVE_REMOTE, ["test", "-s", $remote_template], 15)
-  if not $landed["ok"] then
-    fail_job("cloning", "release upload returned success but no non-empty template landed")
+  $local_hash_result = run_argv(["sha256sum", $release], {timeout: 180})
+  if $local_hash_result["exit_code"] != 0 then
+    fail_job("cloning", "could not hash release rootfs: " ..
+      exec_err($local_hash_result))
+  end
+  $remote_hash_result = remote_exec($PVE_REMOTE,
+    ["sha256sum", $remote_template], 180)
+  if not $remote_hash_result["ok"] then
+    fail_job("cloning", "could not hash uploaded release rootfs: " ..
+      exec_err($remote_hash_result))
+  end
+  $local_hash = split(trim($local_hash_result["stdout"]), " ")[0]
+  $remote_hash = split(trim($remote_hash_result["stdout"]), " ")[0]
+  if $local_hash == "" or $remote_hash != $local_hash then
+    fail_job("cloning", "release upload byte-identity check failed")
   end
 end
 
@@ -787,6 +804,7 @@ progress("dns")
 -- One remote process owns the complete candidate-test, install, full-test,
 -- restart and rollback transaction. Splitting it would expose half-applied
 -- DNS/DHCP state between SSH calls.
+$DNS_APPLY_TOKEN = uuid()
 $dns_apply = ssh_mix($DNS_REMOTE, '
 fn fail($message)
   eprint($message)
@@ -871,10 +889,10 @@ print("DNS_COMMIT_OK " .. $token)
     conf_dir: $CONF["dnsmasq_conf_dir"],
     lease_file: $CONF["dnsmasq_lease_file"],
     service: $CONF["dnsmasq_service"],
-    mac: $mac, ip: $IP, fqdn: $FQDN, token: uuid()
+    mac: $mac, ip: $IP, fqdn: $FQDN, token: $DNS_APPLY_TOKEN
   }, connect_timeout: 8, timeout: 60, batch: true})
-if not $dns_apply["ok"] or not contains($dns_apply["stdout"],
-    "DNS_COMMIT_OK ") then
+$dns_marker_ok = trim($dns_apply["stdout"]) == "DNS_COMMIT_OK " .. $DNS_APPLY_TOKEN
+if not $dns_apply["ok"] or not $dns_marker_ok then
   fail_job("dns", "remote DNS transaction on " .. $CONF["dns_node"] ..
     " failed: " .. exec_err($dns_apply))
 end
