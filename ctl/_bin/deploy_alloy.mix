@@ -144,6 +144,7 @@ $UNIT_FOREIGN_HASH = hash_file($UNIT_FOREIGN, "sha256")
 $SYSUSERS_HASH = hash_file($SYSUSERS_FOREIGN, "sha256")
 
 fn inspect_binary($node)
+  $token = uuid()
   $probe = ssh_mix($REMOTE[$node], '
 $reach = $token
 if $reach == "" then exit(7) end
@@ -157,10 +158,10 @@ if $present then
 end
 print(data_encode({token: $reach, present: $present, version: $version, hash: $hash}))
 ', {
-    bindings: {token: uuid(), bin: "/usr/bin/alloy"},
+    bindings: {token: $token, bin: "/usr/bin/alloy"},
     decode: "data", connect_timeout: 8, timeout: 20
   })
-  $d.die_if(not $probe["ok"],
+  $d.die_if(not $probe["ok"] or $probe["value"]["token"] != $token,
     $node .. " unreachable, not a working Mix node, or Alloy inspection failed: " ..
       trim($probe["stdout"]) .. " " .. trim($probe["stderr"]))
   return $probe["value"]
@@ -426,12 +427,17 @@ end
 fn loki_has_result($body)
   $doc = nil
   try
-    $doc = json_decode($body)
+    $doc = json_parse($body)
   catch $error
     return false
   end
-  if type($doc) != "map" or $doc["status"] != "success" then return false end
-  if type($doc["data"]) != "map" or type($doc["data"]["result"]) != "list" then return false end
+  if type($doc) != "map" or not has_key($doc, "status") or $doc["status"] != "success" then
+    return false
+  end
+  if not has_key($doc, "data") or type($doc["data"]) != "map" then return false end
+  if not has_key($doc["data"], "result") or type($doc["data"]["result"]) != "list" then
+    return false
+  end
   return len($doc["data"]["result"]) > 0
 end
 

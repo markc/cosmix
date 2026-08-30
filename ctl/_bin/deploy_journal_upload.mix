@@ -232,11 +232,10 @@ end
 -- Debian-family nodes obtain the uploader from systemd-journal-remote. Other
 -- systems must already provide the vendor unit. This check remains before any
 -- deploy-owned file is changed.
-$apt = which("apt-get")
-if $apt != nil and $apt != "" then
+if is_file("/usr/bin/apt-get") then
   $_pkg = command(
-    "/usr/bin/env DEBIAN_FRONTEND=noninteractive " .. $apt ..
-      " install -y systemd-journal-remote",
+    "/usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get " ..
+      "install -y systemd-journal-remote",
     "systemd-journal-remote package install", 9)
 end
 $_unit = command(
