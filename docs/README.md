@@ -91,6 +91,7 @@ it describes land in the same commit.
 | **[cosmix.dev/mix/](https://cosmix.dev/mix/)** | Mix language manual — syntax, builtins, man pages, per-crate references |
 | **[cosmix.dev/cos/](https://cosmix.dev/cos/)** | Daemon family + foundation libraries, per-crate references |
 | **[cosmix.dev/bugs/](https://cosmix.dev/bugs/)** | Public bug reports — upstream defects found and root-caused during CosMix development |
+| **[cosmix.dev/history](https://cosmix.dev/history)** | The story so far — six months of decisions, reversals and what stuck, in one sitting |
 
 Every doc has a clean URL — `cosmix.dev/<section>/<page>` — served by a
 pre-generated HTML shell beside each markdown file. The shells are generated,

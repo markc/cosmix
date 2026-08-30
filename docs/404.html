@@ -14,7 +14,7 @@
        which renders it anyway. Anything unrecognised goes home. */
     (function () {
         var target = '/';
-        var r = location.pathname.match(/^\/(README|AGENTS|CLAUDE|VERSIONS)$/);
+        var r = location.pathname.match(/^\/(README|AGENTS|CLAUDE|VERSIONS|history)$/);
         if (r) {
             location.replace('/#' + r[1] + '.md' + (location.hash || ''));
             return;

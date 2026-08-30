@@ -66,7 +66,7 @@ $made = 0
 -- 3a. Root-level docs (cosmix.dev/README etc.). Fixed whitelist mirroring
 --     docFromPath() in index.html (and the 404.html fallback): a root doc
 --     the reader can't route must fail generation, not ship a dead stub.
-$root_docs = ["README.md", "AGENTS.md", "CLAUDE.md", "VERSIONS.md"]
+$root_docs = ["README.md", "AGENTS.md", "CLAUDE.md", "VERSIONS.md", "history.md"]
 for each $doc in split(trim(run_argv_must(["git", "ls-files"], {cwd: $root})), "\n")
     if ends_with($doc, ".md") and pos("/", $doc) == 0 then
         if not contains($root_docs, $doc) then

@@ -605,7 +605,7 @@
            rule would swallow non-doc paths like /ai.txt. The generator
            (build/gen-doc-pages.mix) mirrors this list and refuses unknown
            root docs, so the two can't drift silently. */
-        var r = pathname.match(/^\/(README|AGENTS|CLAUDE|VERSIONS)$/);
+        var r = pathname.match(/^\/(README|AGENTS|CLAUDE|VERSIONS|history)$/);
         if (r) return r[1] + '.md';
         var m = pathname.match(/^\/(bus|cos|mix|bugs)(?:\/(.*))?$/);
         if (!m) return null;
