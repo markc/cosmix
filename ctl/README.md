@@ -31,8 +31,9 @@ it locates the hub from its own path, so the copy works wherever you put it.
 | `_plan/`, `_journal/` | empty; date-prefixed `YYYY-MM-DD-title.md` files go here | fill |
 | `_lib/deploy_lib.mix` | the shared half of every deploy script: hub + `$COSMIX` locators, roster, inventory lookups (`mesh_ip`, hubs-last `rollout_order`), snapshot, version compare + downgrade refusal, `shipped()` asset resolution | require it; never re-implement it |
 | `_lib/mesh_lib.mix` | signed-inventory verification, WG/zone generation, the mesh write lock | require it |
-| `_bin/deploy_*.mix`, `provision_mix.mix` | 27 fleet deploy scripts, every remote step over `ssh_mix`, every local one over `run_argv`; each refuses clearly until its `_etc/<name>.conf.mix` exists | copy each `.example` to `.conf.mix` in your hub and fill it |
-| `_etc/*.conf.mix.example` | one template per deploy script: the site facts (nodes, URLs, paths) that never ship | copy, fill, keep private |
+| `_lib/provisiond_worker_lib.mix`, `_lib/sshm_worker_lib.mix` | the payload halves of the provisioning and ssh-manager workers, shipped to nodes by their deploy scripts | require it |
+| `_bin/*.mix` (118) | every operational script of the reference hub: 27 fleet deploys + provisioning, the mesh tooling (`mesh_*`, WG/zone/registry), the build-cluster drivers (`cbc-*`), mail/DAV operations, web-palette gates, release + dev tools, and `test-public-hygiene.mix` (the gate's own 415-probe suite). Every remote step is `ssh_mix`, every local one `run_argv`; each refuses clearly until its `_etc/<name>.conf.mix` exists | copy each `.example` you need, fill it, run |
+| `_etc/*.conf.mix.example` (91) | one template per script that needs site facts (nodes, URLs, paths) — the things that never ship | copy, fill, keep private |
 | `_bin/check-public-hygiene.mix` | the public-hygiene gate: refuses commits/pushes carrying private identity | run; never widen its allowlist to get past it |
 | `_bin/install-hygiene-hooks.mix` | installs the gate as pre-commit/pre-push in each listed repo | run after editing the conf |
 | `_bin/gen-versions.mix` | regenerates `$COSMIX/docs/VERSIONS.md` from the manifests | run at release time |
