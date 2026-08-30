@@ -29,11 +29,22 @@ it locates the hub from its own path, so the copy works wherever you put it.
 | `_spec/` | the specification suite (21 of 28 chapters — see below) | read; propose changes upstream |
 | `_decisions/` | architecture decision records (38 of 45) | read; add your own |
 | `_plan/`, `_journal/` | empty; date-prefixed `YYYY-MM-DD-title.md` files go here | fill |
+| `_lib/deploy_lib.mix` | the shared half of every deploy script: hub + `$COSMIX` locators, roster, inventory lookups (`mesh_ip`, hubs-last `rollout_order`), snapshot, version compare + downgrade refusal, `shipped()` asset resolution | require it; never re-implement it |
+| `_lib/mesh_lib.mix` | signed-inventory verification, WG/zone generation, the mesh write lock | require it |
+| `_bin/deploy_*.mix`, `provision_mix.mix` | 27 fleet deploy scripts, every remote step over `ssh_mix`, every local one over `run_argv`; each refuses clearly until its `_etc/<name>.conf.mix` exists | copy each `.example` to `.conf.mix` in your hub and fill it |
+| `_etc/*.conf.mix.example` | one template per deploy script: the site facts (nodes, URLs, paths) that never ship | copy, fill, keep private |
 | `_bin/check-public-hygiene.mix` | the public-hygiene gate: refuses commits/pushes carrying private identity | run; never widen its allowlist to get past it |
 | `_bin/install-hygiene-hooks.mix` | installs the gate as pre-commit/pre-push in each listed repo | run after editing the conf |
 | `_bin/gen-versions.mix` | regenerates `$COSMIX/docs/VERSIONS.md` from the manifests | run at release time |
 | `_etc/public-hygiene.conf.mix` | **edit first**: your repos, your domains, your home path | edit |
 | `_etc/public-hygiene.allow.conf.mix` | standing exceptions, by content fingerprint; ships empty | leave empty until a finding is inspected |
+
+**Site assets.** A unit file, sysusers/tmpfiles fragment, polkit rule or config
+payload is the public template under `$COSMIX/src/_etc` unless your hub carries
+its own copy under `_etc/systemd`, `_etc/sysusers`, `_etc/tmpfiles`,
+`_etc/polkit-1/rules.d` or `_etc/cosmix` — then that copy wins (`shipped()` in
+`deploy_lib`). A unit that names one of your addresses is config, not template;
+keep it in the hub.
 
 **Mesh inventory.** The gate derives node-name and subnet rules from
 `_etc/mesh/inventory.mix` + `inventory.signed` when they exist. A hub with no
