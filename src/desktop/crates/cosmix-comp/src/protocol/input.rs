@@ -383,6 +383,8 @@ impl InputIngressState {
 #[derive(Clone, Debug)]
 pub(crate) enum InputRouting {
     Deliver(Vec<HostInput>),
+    DeliverWithoutActivity(Vec<HostInput>),
+    ActivityOnly(&'static str),
     Ignored(&'static str),
 }
 
@@ -518,7 +520,7 @@ pub(crate) fn host_input_from_event<B: InputBackend>(
                 // a reason, not silence.
                 InputRouting::Ignored("input device removed; nothing held to reconcile")
             } else {
-                InputRouting::Deliver(inputs)
+                InputRouting::DeliverWithoutActivity(inputs)
             }
         }
         // Touch coordinates are normalised by the device and meaningless until
@@ -568,51 +570,51 @@ pub(crate) fn host_input_from_event<B: InputBackend>(
         // before it existed.
         InputEvent::GestureSwipeBegin { event } => {
             ingress.observe(&event.device(), event.time_msec());
-            InputRouting::Ignored("pointer gestures are not supported yet")
+            InputRouting::ActivityOnly("pointer gestures are not supported yet")
         }
         InputEvent::GestureSwipeUpdate { event } => {
             ingress.observe(&event.device(), event.time_msec());
-            InputRouting::Ignored("pointer gestures are not supported yet")
+            InputRouting::ActivityOnly("pointer gestures are not supported yet")
         }
         InputEvent::GestureSwipeEnd { event } => {
             ingress.observe(&event.device(), event.time_msec());
-            InputRouting::Ignored("pointer gestures are not supported yet")
+            InputRouting::ActivityOnly("pointer gestures are not supported yet")
         }
         InputEvent::GesturePinchBegin { event } => {
             ingress.observe(&event.device(), event.time_msec());
-            InputRouting::Ignored("pointer gestures are not supported yet")
+            InputRouting::ActivityOnly("pointer gestures are not supported yet")
         }
         InputEvent::GesturePinchUpdate { event } => {
             ingress.observe(&event.device(), event.time_msec());
-            InputRouting::Ignored("pointer gestures are not supported yet")
+            InputRouting::ActivityOnly("pointer gestures are not supported yet")
         }
         InputEvent::GesturePinchEnd { event } => {
             ingress.observe(&event.device(), event.time_msec());
-            InputRouting::Ignored("pointer gestures are not supported yet")
+            InputRouting::ActivityOnly("pointer gestures are not supported yet")
         }
         InputEvent::GestureHoldBegin { event } => {
             ingress.observe(&event.device(), event.time_msec());
-            InputRouting::Ignored("pointer gestures are not supported yet")
+            InputRouting::ActivityOnly("pointer gestures are not supported yet")
         }
         InputEvent::GestureHoldEnd { event } => {
             ingress.observe(&event.device(), event.time_msec());
-            InputRouting::Ignored("pointer gestures are not supported yet")
+            InputRouting::ActivityOnly("pointer gestures are not supported yet")
         }
         InputEvent::TabletToolAxis { event } => {
             ingress.observe(&event.device(), event.time_msec());
-            InputRouting::Ignored("tablet tools are not supported yet")
+            InputRouting::ActivityOnly("tablet tools are not supported yet")
         }
         InputEvent::TabletToolProximity { event } => {
             ingress.observe(&event.device(), event.time_msec());
-            InputRouting::Ignored("tablet tools are not supported yet")
+            InputRouting::ActivityOnly("tablet tools are not supported yet")
         }
         InputEvent::TabletToolTip { event } => {
             ingress.observe(&event.device(), event.time_msec());
-            InputRouting::Ignored("tablet tools are not supported yet")
+            InputRouting::ActivityOnly("tablet tools are not supported yet")
         }
         InputEvent::TabletToolButton { event } => {
             ingress.observe(&event.device(), event.time_msec());
-            InputRouting::Ignored("tablet tools are not supported yet")
+            InputRouting::ActivityOnly("tablet tools are not supported yet")
         }
         InputEvent::SwitchToggle { event } => {
             ingress.observe(&event.device(), event.time_msec());
@@ -655,6 +657,15 @@ pub(crate) fn route_input_event<B: InputBackend>(state: &mut WaylandState, event
             for input in inputs {
                 state.handle_host_input(input);
             }
+        }
+        InputRouting::DeliverWithoutActivity(inputs) => {
+            for input in inputs {
+                state.handle_host_input_with_activity(input, false);
+            }
+        }
+        InputRouting::ActivityOnly(reason) => {
+            state.notify_idle_activity();
+            tracing::trace!(reason, "input event carries activity but no seat operation");
         }
         InputRouting::Ignored(reason) => {
             tracing::trace!(reason, "input event carries no seat operation");

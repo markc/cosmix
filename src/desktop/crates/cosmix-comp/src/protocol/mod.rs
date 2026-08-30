@@ -73,8 +73,9 @@ use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::server::{
 use smithay::{
     backend::allocator::{Buffer as _, Format, dmabuf::Dmabuf},
     backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonState, KeyState, TouchSlot},
-    delegate_data_device, delegate_dmabuf, delegate_fractional_scale, delegate_output,
-    delegate_seat, delegate_shm, delegate_viewporter,
+    delegate_data_device, delegate_dmabuf, delegate_foreign_toplevel_list,
+    delegate_fractional_scale, delegate_idle_notify, delegate_output, delegate_seat, delegate_shm,
+    delegate_viewporter,
     desktop::{
         LayerMap, LayerSurface as DesktopLayerSurface, PopupKeyboardGrab, PopupKind, PopupManager,
         PopupPointerGrab, find_popup_root_surface, layer_map_for_output,
@@ -128,7 +129,11 @@ use smithay::{
             get_dmabuf,
         },
         drm_syncobj::{DrmSyncPoint, DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState},
+        foreign_toplevel_list::{
+            ForeignToplevelHandle, ForeignToplevelListHandler, ForeignToplevelListState,
+        },
         fractional_scale::{self, FractionalScaleHandler, FractionalScaleManagerState},
+        idle_notify::{IdleNotifierHandler, IdleNotifierState},
         output::{OutputHandler, OutputManagerState},
         seat::CURSOR_IMAGE_ROLE,
         selection::{
@@ -2121,6 +2126,12 @@ impl ProtocolServer {
         };
 
         let event_loop = EventLoop::try_new().map_err(|error| error.to_string())?;
+        let mut foreign_toplevel_nonce = [0_u8; 16];
+        getrandom::fill(&mut foreign_toplevel_nonce)
+            .map_err(|error| format!("failed to seed foreign-toplevel identifiers: {error}"))?;
+        let idle_notifier_state = IdleNotifierState::new(&display_handle, event_loop.handle());
+        let foreign_toplevel_list_state =
+            ForeignToplevelListState::new::<WaylandState>(&display_handle);
         let (retirement_report_sender, retirement_report_source) = channel::channel();
         let (retirement_request_sender, retirement_worker) =
             spawn_retirement_worker(retirement_adapter, MAX_GLOBAL_DMABUF_USES, move |report| {
@@ -2163,6 +2174,8 @@ impl ProtocolServer {
             output_manager_state,
             xdg_shell_state,
             layer_shell_state,
+            idle_notifier_state,
+            foreign_toplevel_list_state,
             xdg_decoration_state,
             fractional_scale_state,
             viewporter_state,
@@ -2211,6 +2224,8 @@ impl ProtocolServer {
             exclusive_keyboard_focus: None,
             minimized_toplevels: Vec::new(),
             surfaces: HashMap::new(),
+            foreign_toplevels: HashMap::new(),
+            foreign_toplevel_nonce,
             buffer_history_surfaces: HashSet::new(),
             surface_objects: HashMap::new(),
             xdg_surface_objects: HashMap::new(),
@@ -3958,6 +3973,8 @@ struct WaylandState {
     output_manager_state: OutputManagerState,
     xdg_shell_state: XdgShellState,
     layer_shell_state: WlrLayerShellState,
+    idle_notifier_state: IdleNotifierState<Self>,
+    foreign_toplevel_list_state: ForeignToplevelListState,
     #[allow(dead_code)]
     xdg_decoration_state: XdgDecorationState,
     #[allow(dead_code)]
@@ -4022,6 +4039,8 @@ struct WaylandState {
     exclusive_keyboard_focus: Option<ObjectId>,
     minimized_toplevels: Vec<ObjectId>,
     surfaces: HashMap<ObjectId, SurfaceRecord>,
+    foreign_toplevels: HashMap<SurfaceId, ForeignToplevelHandle>,
+    foreign_toplevel_nonce: [u8; 16],
     buffer_history_surfaces: HashSet<ObjectId>,
     surface_objects: HashMap<SurfaceId, ObjectId>,
     xdg_surface_objects: HashMap<ObjectId, ObjectId>,
@@ -4779,6 +4798,27 @@ impl WaylandState {
     /// calls this directly off the calloop; the nested backend calls it from
     /// `handle_frame`. See [`HostInput`].
     pub(crate) fn handle_host_input(&mut self, input: HostInput) {
+        self.handle_host_input_with_activity(input, true);
+    }
+
+    fn handle_host_input_with_activity(&mut self, input: HostInput, user_activity: bool) {
+        if user_activity
+            && matches!(
+                &input,
+                HostInput::PointerMotionAbsolute { .. }
+                    | HostInput::PointerMotion { .. }
+                    | HostInput::PointerButton { .. }
+                    | HostInput::PointerAxis { .. }
+                    | HostInput::Key { .. }
+                    | HostInput::TouchDown { .. }
+                    | HostInput::TouchMotion { .. }
+                    | HostInput::TouchUp { .. }
+                    | HostInput::TouchFrame
+                    | HostInput::TouchCancel
+            )
+        {
+            self.notify_idle_activity();
+        }
         match input {
             HostInput::PointerMotionAbsolute { x, y, time } => self.pointer_moved(x, y, time),
             HostInput::PointerMotion { dx, dy, time } => self.pointer_motion(dx, dy, time),
@@ -4823,6 +4863,11 @@ impl WaylandState {
         }
     }
 
+    fn notify_idle_activity(&mut self) {
+        let seat = self.seat.clone();
+        self.idle_notifier_state.notify_activity(&seat);
+    }
+
     fn with_client_state<T>(
         surface: &WlSurface,
         function: impl FnOnce(&WaylandClientState) -> T,
@@ -4830,6 +4875,73 @@ impl WaylandState {
         let client = surface.client()?;
         let state = client.get_data::<WaylandClientState>()?;
         Some(function(state))
+    }
+
+    fn sync_foreign_toplevel(&mut self, surface: &WlSurface) {
+        let Some((id, commit_count, title)) = self.surfaces.get(&surface.id()).and_then(|record| {
+            (record.mapped && matches!(record.role, SurfaceRole::Toplevel(_))).then(|| {
+                (
+                    record.id,
+                    record.commit_count,
+                    record.title.as_deref().unwrap_or_default().to_owned(),
+                )
+            })
+        }) else {
+            return;
+        };
+        let app_id = compositor::with_states(surface, |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .and_then(|data| data.lock().ok()?.app_id.clone())
+                .unwrap_or_default()
+        });
+        if let Some(handle) = self.foreign_toplevels.get(&id) {
+            let title_changed = handle.title() != title;
+            let app_id_changed = handle.app_id() != app_id;
+            if title_changed {
+                handle.send_title(&title);
+            }
+            if app_id_changed {
+                handle.send_app_id(&app_id);
+            }
+            if title_changed || app_id_changed {
+                handle.send_done();
+            }
+            return;
+        }
+
+        // Exactly 32 printable ASCII bytes. XOR is injective for each half
+        // within one compositor instance, while the getrandom nonce prevents
+        // deterministic SurfaceId/commit counters being reused after restart.
+        let instance_high = u64::from_ne_bytes(
+            self.foreign_toplevel_nonce[..8]
+                .try_into()
+                .expect("nonce high half"),
+        );
+        let instance_low = u64::from_ne_bytes(
+            self.foreign_toplevel_nonce[8..]
+                .try_into()
+                .expect("nonce low half"),
+        );
+        let identifier = format!(
+            "{:016x}{:016x}",
+            instance_high ^ id.0,
+            instance_low ^ commit_count
+        );
+        let handle = self
+            .foreign_toplevel_list_state
+            .new_toplevel_with_identifier::<Self>(identifier, title, app_id);
+        self.foreign_toplevels.insert(id, handle);
+    }
+
+    fn close_foreign_toplevel(&mut self, surface: &WlSurface) {
+        let Some(id) = self.surfaces.get(&surface.id()).map(|record| record.id) else {
+            return;
+        };
+        if let Some(handle) = self.foreign_toplevels.remove(&id) {
+            self.foreign_toplevel_list_state.remove_toplevel(&handle);
+        }
     }
 
     fn prepare_acquire_gate(&mut self, surface: &WlSurface) {
@@ -6459,6 +6571,7 @@ impl WaylandState {
     }
 
     fn deactivate_surface_role(&mut self, surface: &WlSurface) {
+        self.close_foreign_toplevel(surface);
         self.cancel_chrome_pointer_grab_for_surface(surface, false);
         self.reset_chrome_pointer_tracking(&surface.id());
         self.minimized_toplevels
@@ -6534,6 +6647,7 @@ impl WaylandState {
     }
 
     fn destroy_surface_record(&mut self, surface: &WlSurface) {
+        self.close_foreign_toplevel(surface);
         self.cancel_chrome_pointer_grab_for_surface(surface, false);
         self.reset_chrome_pointer_tracking(&surface.id());
         self.minimized_toplevels
@@ -7629,7 +7743,7 @@ impl WaylandState {
             );
         }
         for input in inputs {
-            self.handle_host_input(input);
+            self.handle_host_input_with_activity(input, false);
         }
     }
 

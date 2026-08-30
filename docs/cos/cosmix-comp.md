@@ -14,6 +14,8 @@ clients.
 | Protocol | Version | Current support |
 | --- | ---: | --- |
 | `zwlr_layer_shell_v1` | 4 | Layer surfaces and layer popups map, arrange and configure through Smithay's `LayerMap`; protocol strata, keyboard interactivity, input regions and exclusive usable-area effects are supported. |
+| `ext_idle_notifier_v1` | 2 | Per-seat notifications use Smithay's calloop timers; real pointer, keyboard, touch, pointer-gesture and tablet-tool activity resets the timeout and resumes an idle notification. Device-removal reconciliation does not count as activity. |
+| `ext_foreign_toplevel_list_v1` | 1 | Mapped XDG toplevels expose stable mapping identifiers, title and app ID updates; unmap or destruction closes the handle, and late clients receive the current mapped set. |
 
 Layer surfaces stack in the protocol order: Background, Bottom, normal XDG
 toplevels and popups, Top, then Overlay. Raising a surface changes its order
@@ -73,3 +75,8 @@ instead of each surface's intermediate state. Its pointer handle has one
 additive no-focus-restore grab teardown used when a grabbed surface disappears
 inside that transaction, preventing stale cached focus from being replayed
 before the final hit test.
+Smithay's foreign-toplevel list has one additive constructor accepting a
+compositor-provided identifier. This lets the identifier include Cosmix's
+surface identity, mapping generation and an unpredictable per-compositor
+instance nonce while protocol dispatch and replay remain entirely delegated
+to Smithay.

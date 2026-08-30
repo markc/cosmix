@@ -491,6 +491,7 @@ impl CompositorHandler for WaylandState {
                     self.release_buffer_token(released_dmabuf_token);
                 }
                 if let Some(id) = unmapped_id {
+                    self.close_foreign_toplevel(surface);
                     self.cancel_chrome_pointer_grab_for_surface(surface, false);
                     self.reset_chrome_pointer_tracking(&surface.id());
                     self.minimized_toplevels
@@ -599,6 +600,7 @@ impl CompositorHandler for WaylandState {
         if is_layer && (mapped_before != mapped_after || layer_focus_policy_changed) {
             self.arbitrate_keyboard_focus(None, false, false);
         }
+        self.sync_foreign_toplevel(surface);
     }
 
     fn transaction_applied(&mut self) {
@@ -989,6 +991,8 @@ impl XdgShellHandler for WaylandState {
             self.events.push(event);
         }
     }
+
+    fn app_id_changed(&mut self, _surface: ToplevelSurface) {}
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
         self.retire_unadopted_roleless_buffer(surface.wl_surface());
@@ -1591,6 +1595,18 @@ impl SeatHandler for WaylandState {
 
 impl OutputHandler for WaylandState {}
 
+impl IdleNotifierHandler for WaylandState {
+    fn idle_notifier_state(&mut self) -> &mut IdleNotifierState<Self> {
+        &mut self.idle_notifier_state
+    }
+}
+
+impl ForeignToplevelListHandler for WaylandState {
+    fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
+        &mut self.foreign_toplevel_list_state
+    }
+}
+
 impl SelectionHandler for WaylandState {
     type SelectionUserData = ();
 
@@ -2069,6 +2085,8 @@ smithay::delegate_drm_syncobj!(WaylandState);
 delegate_seat!(WaylandState);
 delegate_data_device!(WaylandState);
 delegate_output!(WaylandState);
+delegate_idle_notify!(WaylandState);
+delegate_foreign_toplevel_list!(WaylandState);
 smithay::reexports::wayland_server::delegate_global_dispatch!(WaylandState: [
     ZwlrLayerShellV1: WlrLayerShellGlobalData
 ] => WlrLayerShellState);

@@ -3,10 +3,15 @@ use super::*;
 // from smithay rather than re-exported through `protocol::input`: the fake has
 // to satisfy the real trait, or it proves nothing about the real router.
 use smithay::backend::input::{
-    AbsolutePositionEvent, Device, DeviceCapability, Event, InputBackend, InputEvent,
-    KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionAbsoluteEvent,
-    PointerMotionEvent, TouchCancelEvent, TouchDownEvent, TouchEvent as SmithayTouchEvent,
-    TouchFrameEvent, TouchMotionEvent, TouchSlot, TouchUpEvent, UnusedEvent,
+    AbsolutePositionEvent, Device, DeviceCapability, Event, GestureBeginEvent, GestureEndEvent,
+    GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent,
+    GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent,
+    InputBackend, InputEvent, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+    PointerMotionAbsoluteEvent, PointerMotionEvent, ProximityState, TabletToolAxisEvent,
+    TabletToolButtonEvent, TabletToolCapabilities, TabletToolDescriptor, TabletToolEvent,
+    TabletToolProximityEvent, TabletToolTipEvent, TabletToolTipState, TabletToolType,
+    TouchCancelEvent, TouchDownEvent, TouchEvent as SmithayTouchEvent, TouchFrameEvent,
+    TouchMotionEvent, TouchSlot, TouchUpEvent, UnusedEvent,
 };
 // The calloop halves of the fake backend. It has to be a real `EventSource`
 // registered on the real event loop, or the stall oracle would be measuring a
@@ -1768,6 +1773,23 @@ impl KeybindingHarness {
         let id = self.next_callback_id;
         self.next_callback_id += 1;
         id
+    }
+
+    fn bind_test_global(&mut self, interface: &str, maximum_version: u32) -> u32 {
+        let &(global_name, advertised_version) = self
+            .registry_globals
+            .get(interface)
+            .unwrap_or_else(|| panic!("in-process registry must advertise {interface}"));
+        let object = self.allocate_object_id();
+        bind_global(
+            &mut self.client,
+            global_name,
+            interface,
+            advertised_version.min(maximum_version),
+            object,
+        );
+        self.dispatch_client();
+        object
     }
 
     #[cfg(feature = "explicit-sync-live-test")]
@@ -11992,6 +12014,14 @@ fn map_test_popup(harness: &mut KeybindingHarness, grab_serial: Option<u32>) -> 
 }
 
 fn map_test_undecorated_toplevel(harness: &mut KeybindingHarness) -> ObjectId {
+    map_named_test_toplevel(harness, "", "").3
+}
+
+fn map_named_test_toplevel(
+    harness: &mut KeybindingHarness,
+    title: &str,
+    app_id: &str,
+) -> (u32, u32, u32, ObjectId) {
     let surface = harness.allocate_object_id();
     let xdg_surface = harness.allocate_object_id();
     let toplevel = harness.allocate_object_id();
@@ -12008,6 +12038,18 @@ fn map_test_undecorated_toplevel(harness: &mut KeybindingHarness) -> ObjectId {
         &words(&[xdg_surface, surface]),
     );
     send_request(&mut harness.client, xdg_surface, 1, &words(&[toplevel]));
+    send_request(
+        &mut harness.client,
+        toplevel,
+        2,
+        &wire_string_argument(title),
+    );
+    send_request(
+        &mut harness.client,
+        toplevel,
+        3,
+        &wire_string_argument(app_id),
+    );
     send_request(&mut harness.client, surface, 6, &[]);
     let traffic = harness.sync();
     let serial = traffic
@@ -12023,14 +12065,15 @@ fn map_test_undecorated_toplevel(harness: &mut KeybindingHarness) -> ObjectId {
     send_request(&mut harness.client, surface, 1, &words(&[buffer, 0, 0]));
     send_request(&mut harness.client, surface, 6, &[]);
     harness.dispatch_client();
-    harness
+    let object = harness
         .server
         .state
         .surfaces
         .keys()
         .find(|object| object.protocol_id() == surface)
         .cloned()
-        .expect("mapped second toplevel remains tracked")
+        .expect("mapped second toplevel remains tracked");
+    (surface, xdg_surface, toplevel, object)
 }
 
 #[test]
@@ -14079,6 +14122,470 @@ fn xdg_title_is_capped_by_unicode_scalar_count_before_unmapped_retention() {
 }
 
 #[test]
+fn idle_notify_resets_on_real_input_and_resumes_after_idling() {
+    const TIMEOUT: Duration = Duration::from_millis(40);
+    let mut harness = KeybindingHarness::new(true);
+    let notifier = harness.bind_test_global("ext_idle_notifier_v1", 2);
+    let notification = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        notifier,
+        1,
+        &words(&[notification, TIMEOUT.as_millis() as u32, TEST_SEAT_ID]),
+    );
+    harness.dispatch_client();
+
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(25)), &mut harness.server.state)
+        .expect("first partial idle interval dispatches");
+    harness.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: 0.25,
+            normalised_y: 0.25,
+        },
+    });
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(25)), &mut harness.server.state)
+        .expect("reset partial idle interval dispatches");
+    let before_reset_deadline = harness.sync();
+    assert!(
+        before_reset_deadline
+            .iter()
+            .all(|(object, opcode, _)| *object != notification || *opcode != 0),
+        "activity restarts, rather than preserves, the original deadline: {before_reset_deadline:?}"
+    );
+
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(50)), &mut harness.server.state)
+        .expect("idle deadline dispatches");
+    let idled = harness.sync();
+    assert!(
+        idled
+            .iter()
+            .any(|(object, opcode, _)| *object == notification && *opcode == 0),
+        "Smithay's calloop timer emits idled: {idled:?}"
+    );
+
+    harness.key(24, HostButtonState::Pressed);
+    let resumed = harness.sync();
+    assert!(
+        resumed
+            .iter()
+            .any(|(object, opcode, _)| *object == notification && *opcode == 1),
+        "real keyboard activity emits resumed after idle: {resumed:?}"
+    );
+}
+
+#[test]
+fn ignored_gesture_and_tablet_events_resume_idle_notifications() {
+    let mut harness = KeybindingHarness::new(true);
+    let notifier = harness.bind_test_global("ext_idle_notifier_v1", 2);
+    let notification = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        notifier,
+        1,
+        &words(&[notification, 0, TEST_SEAT_ID]),
+    );
+    harness.dispatch_client();
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(10)), &mut harness.server.state)
+        .expect("zero-timeout gesture notification idles");
+    assert!(
+        harness
+            .sync()
+            .iter()
+            .any(|(object, opcode, _)| *object == notification && *opcode == 0)
+    );
+
+    harness.route(InputEvent::GestureSwipeBegin {
+        event: FakeGestureEvent,
+    });
+    let gesture = harness.sync();
+    assert!(
+        gesture
+            .iter()
+            .any(|(object, opcode, _)| *object == notification && *opcode == 1),
+        "an unsupported gesture still counts as activity: {gesture:?}"
+    );
+
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(10)), &mut harness.server.state)
+        .expect("zero-timeout tablet notification idles");
+    assert!(
+        harness
+            .sync()
+            .iter()
+            .any(|(object, opcode, _)| *object == notification && *opcode == 0)
+    );
+    harness.route(InputEvent::TabletToolAxis {
+        event: FakeTabletEvent,
+    });
+    let tablet = harness.sync();
+    assert!(
+        tablet
+            .iter()
+            .any(|(object, opcode, _)| *object == notification && *opcode == 1),
+        "an unsupported tablet event still counts as activity: {tablet:?}"
+    );
+}
+
+#[test]
+fn every_gesture_and_tablet_event_class_routes_as_idle_activity() {
+    let events = [
+        InputEvent::<FakeInput>::GestureSwipeBegin {
+            event: FakeGestureEvent,
+        },
+        InputEvent::GestureSwipeUpdate {
+            event: FakeGestureEvent,
+        },
+        InputEvent::GestureSwipeEnd {
+            event: FakeGestureEvent,
+        },
+        InputEvent::GesturePinchBegin {
+            event: FakeGestureEvent,
+        },
+        InputEvent::GesturePinchUpdate {
+            event: FakeGestureEvent,
+        },
+        InputEvent::GesturePinchEnd {
+            event: FakeGestureEvent,
+        },
+        InputEvent::GestureHoldBegin {
+            event: FakeGestureEvent,
+        },
+        InputEvent::GestureHoldEnd {
+            event: FakeGestureEvent,
+        },
+        InputEvent::TabletToolAxis {
+            event: FakeTabletEvent,
+        },
+        InputEvent::TabletToolProximity {
+            event: FakeTabletEvent,
+        },
+        InputEvent::TabletToolTip {
+            event: FakeTabletEvent,
+        },
+        InputEvent::TabletToolButton {
+            event: FakeTabletEvent,
+        },
+    ];
+    let mut ingress = super::input::InputIngressState::default();
+    for (index, event) in events.iter().enumerate() {
+        assert!(
+            matches!(
+                super::input::host_input_from_event(&mut ingress, event, (320, 240), || {
+                    panic!("activity-only input must not sample held seat state")
+                }),
+                super::input::InputRouting::ActivityOnly(_)
+            ),
+            "gesture/tablet event {index} was not classified as activity"
+        );
+    }
+}
+
+#[test]
+fn device_removal_reconciliation_does_not_resume_idle_notification() {
+    let mut harness = KeybindingHarness::new(true);
+    harness.route(InputEvent::DeviceAdded {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    harness.route(InputEvent::Keyboard {
+        event: FakeKeyEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            keycode: Keycode::new(24),
+            state: KeyState::Pressed,
+        },
+    });
+    let notifier = harness.bind_test_global("ext_idle_notifier_v1", 2);
+    let notification = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        notifier,
+        1,
+        &words(&[notification, 0, TEST_SEAT_ID]),
+    );
+    harness.dispatch_client();
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(10)), &mut harness.server.state)
+        .expect("zero-timeout removal notification idles");
+    assert!(
+        harness
+            .sync()
+            .iter()
+            .any(|(object, opcode, _)| *object == notification && *opcode == 0)
+    );
+
+    harness.route(InputEvent::DeviceRemoved {
+        device: FakeDevice::KeyboardAndPointer,
+    });
+    let removed = harness.sync();
+    assert!(
+        removed
+            .iter()
+            .all(|(object, opcode, _)| *object != notification || *opcode != 1),
+        "synthetic releases from removal do not resume idle: {removed:?}"
+    );
+
+    harness.route(InputEvent::PointerMotion {
+        event: FakeMotionEvent { dx: 1.0, dy: 0.0 },
+    });
+    let real_activity = harness.sync();
+    assert!(
+        real_activity
+            .iter()
+            .any(|(object, opcode, _)| *object == notification && *opcode == 1),
+        "the notification stayed idle until genuine activity: {real_activity:?}"
+    );
+}
+
+#[test]
+fn foreign_toplevel_identifiers_are_unique_across_compositor_instances() {
+    let mut first = KeybindingHarness::new(true);
+    let mut second = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut first);
+    map_initial_test_toplevel(&mut second);
+    let first_identifier = first
+        .server
+        .state
+        .foreign_toplevels
+        .values()
+        .next()
+        .expect("first compositor announces its toplevel")
+        .identifier();
+    let second_identifier = second
+        .server
+        .state
+        .foreign_toplevels
+        .values()
+        .next()
+        .expect("second compositor announces its toplevel")
+        .identifier();
+    assert_ne!(first_identifier, second_identifier);
+}
+
+#[test]
+fn foreign_toplevel_list_tracks_metadata_close_and_late_client_replay() {
+    fn announcement(
+        traffic: &[(u32, u16, Vec<u8>)],
+        manager: u32,
+    ) -> (u32, String, String, String) {
+        let handles = traffic
+            .iter()
+            .filter(|(object, opcode, _)| *object == manager && *opcode == 0)
+            .map(|(_, _, body)| word(body, 0))
+            .collect::<Vec<_>>();
+        assert_eq!(handles.len(), 1, "one toplevel announcement: {traffic:?}");
+        let handle = handles[0];
+        let property = |opcode| {
+            traffic
+                .iter()
+                .find_map(|(object, event_opcode, body)| {
+                    (*object == handle && *event_opcode == opcode).then(|| {
+                        let mut offset = 0;
+                        wire_string(body, &mut offset)
+                    })
+                })
+                .unwrap_or_else(|| {
+                    panic!("handle {handle} has property opcode {opcode}: {traffic:?}")
+                })
+        };
+        assert!(
+            traffic
+                .iter()
+                .any(|(object, opcode, _)| *object == handle && *opcode == 1),
+            "initial properties end atomically: {traffic:?}"
+        );
+        (handle, property(4), property(2), property(3))
+    }
+
+    let mut harness = KeybindingHarness::new(true);
+    let manager = harness.bind_test_global("ext_foreign_toplevel_list_v1", 1);
+    let staged = harness.sync();
+    assert!(
+        staged
+            .iter()
+            .all(|(object, opcode, _)| *object != manager || *opcode != 0),
+        "no staged toplevel is announced: {staged:?}"
+    );
+
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_ID,
+        2,
+        &wire_string_argument("Alpha"),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_ID,
+        3,
+        &wire_string_argument("dev.cosmix.Alpha"),
+    );
+    map_initial_test_toplevel(&mut harness);
+    let first_traffic = harness.sync();
+    let (first_handle, first_identifier, first_title, first_app_id) =
+        announcement(&first_traffic, manager);
+    assert_eq!(
+        (first_title.as_str(), first_app_id.as_str()),
+        ("Alpha", "dev.cosmix.Alpha")
+    );
+    let first_record = test_toplevel_record(&harness);
+    let nonce_high = u64::from_ne_bytes(
+        harness.server.state.foreign_toplevel_nonce[..8]
+            .try_into()
+            .expect("nonce high half"),
+    );
+    let nonce_low = u64::from_ne_bytes(
+        harness.server.state.foreign_toplevel_nonce[8..]
+            .try_into()
+            .expect("nonce low half"),
+    );
+    assert_eq!(
+        first_identifier,
+        format!(
+            "{:016x}{:016x}",
+            nonce_high ^ first_record.id.0,
+            nonce_low ^ first_record.commit_count
+        )
+    );
+
+    let (_, _, _, second_object) = map_named_test_toplevel(&mut harness, "Beta", "dev.cosmix.Beta");
+    let second_traffic = harness.sync();
+    let (_second_handle, second_identifier, second_title, second_app_id) =
+        announcement(&second_traffic, manager);
+    assert_eq!(
+        (second_title.as_str(), second_app_id.as_str()),
+        ("Beta", "dev.cosmix.Beta")
+    );
+    assert_ne!(first_identifier, second_identifier);
+
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_ID,
+        2,
+        &wire_string_argument("Alpha renamed"),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_ID,
+        3,
+        &wire_string_argument("dev.cosmix.Alpha2"),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    let renamed = harness.sync();
+    assert!(renamed.iter().any(|(object, opcode, body)| {
+        if *object != first_handle || *opcode != 2 {
+            return false;
+        }
+        let mut offset = 0;
+        wire_string(body, &mut offset) == "Alpha renamed"
+    }));
+    assert!(renamed.iter().any(|(object, opcode, body)| {
+        if *object != first_handle || *opcode != 3 {
+            return false;
+        }
+        let mut offset = 0;
+        wire_string(body, &mut offset) == "dev.cosmix.Alpha2"
+    }));
+    assert!(
+        renamed
+            .iter()
+            .any(|(object, opcode, _)| *object == first_handle && *opcode == 1)
+    );
+
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[0, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    let unmapped = harness.sync();
+    assert!(
+        unmapped
+            .iter()
+            .any(|(object, opcode, _)| *object == first_handle && *opcode == 0)
+    );
+
+    let (mut late_client, late_server) = UnixStream::pair().expect("late client socket pair");
+    harness
+        .server
+        .state
+        .display_handle
+        .insert_client(
+            late_server,
+            Arc::new(WaylandClientState::new(
+                harness.server.state.client_disconnect_sender.clone(),
+            )),
+        )
+        .expect("register late client");
+    send_display_request(&mut late_client, 1, 2);
+    send_display_request(&mut late_client, 0, 3);
+    harness.dispatch_client();
+    let globals = registry_globals(&mut late_client, 3);
+    let (foreign_global, foreign_version) = globals["ext_foreign_toplevel_list_v1"];
+    bind_global(
+        &mut late_client,
+        foreign_global,
+        "ext_foreign_toplevel_list_v1",
+        foreign_version.min(1),
+        4,
+    );
+    send_display_request(&mut late_client, 0, 5);
+    harness.dispatch_client();
+    let late_traffic = events_until_callback(&mut late_client, 5);
+    let (_, replayed_identifier, replayed_title, replayed_app_id) = announcement(&late_traffic, 4);
+    assert_eq!(replayed_identifier, second_identifier);
+    assert_eq!(
+        (replayed_title.as_str(), replayed_app_id.as_str()),
+        ("Beta", "dev.cosmix.Beta")
+    );
+    assert!(
+        harness.server.state.surfaces[&second_object].mapped,
+        "late replay names the one remaining mapped toplevel"
+    );
+
+    // A second null-buffer commit starts the fresh configure cycle, but the
+    // already-retired mapping must not emit `closed` a second time.
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[0, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    let remap_configure = harness.sync();
+    assert!(
+        remap_configure
+            .iter()
+            .all(|(object, opcode, _)| *object != first_handle || *opcode != 0),
+        "an unmapped handle is closed exactly once: {remap_configure:?}"
+    );
+    let remap_serial = configured_toplevel_serial(&remap_configure);
+    ack_and_map_test_toplevel(&mut harness, remap_serial);
+    let remapped = harness.sync();
+    let (_, remapped_identifier, remapped_title, remapped_app_id) =
+        announcement(&remapped, manager);
+    assert_ne!(remapped_identifier, first_identifier);
+    assert_eq!(
+        (remapped_title.as_str(), remapped_app_id.as_str()),
+        ("Alpha renamed", "dev.cosmix.Alpha2")
+    );
+}
+
+#[test]
 fn default_on_honours_explicit_client_side_and_never_targets_chrome() {
     let mut harness = KeybindingHarness::new(true);
     assert!(harness.server.state.decoration.enabled);
@@ -15772,23 +16279,23 @@ impl InputBackend for FakeInput {
     type PointerButtonEvent = FakeButtonEvent;
     type PointerMotionEvent = FakeMotionEvent;
     type PointerMotionAbsoluteEvent = FakeAbsoluteEvent;
-    type GestureSwipeBeginEvent = UnusedEvent;
-    type GestureSwipeUpdateEvent = UnusedEvent;
-    type GestureSwipeEndEvent = UnusedEvent;
-    type GesturePinchBeginEvent = UnusedEvent;
-    type GesturePinchUpdateEvent = UnusedEvent;
-    type GesturePinchEndEvent = UnusedEvent;
-    type GestureHoldBeginEvent = UnusedEvent;
-    type GestureHoldEndEvent = UnusedEvent;
+    type GestureSwipeBeginEvent = FakeGestureEvent;
+    type GestureSwipeUpdateEvent = FakeGestureEvent;
+    type GestureSwipeEndEvent = FakeGestureEvent;
+    type GesturePinchBeginEvent = FakeGestureEvent;
+    type GesturePinchUpdateEvent = FakeGestureEvent;
+    type GesturePinchEndEvent = FakeGestureEvent;
+    type GestureHoldBeginEvent = FakeGestureEvent;
+    type GestureHoldEndEvent = FakeGestureEvent;
     type TouchDownEvent = FakeTouchPositionEvent;
     type TouchUpEvent = FakeTouchSlotEvent;
     type TouchMotionEvent = FakeTouchPositionEvent;
     type TouchCancelEvent = FakeTouchSlotEvent;
     type TouchFrameEvent = FakeTouchFrameEvent;
-    type TabletToolAxisEvent = UnusedEvent;
-    type TabletToolProximityEvent = UnusedEvent;
-    type TabletToolTipEvent = UnusedEvent;
-    type TabletToolButtonEvent = UnusedEvent;
+    type TabletToolAxisEvent = FakeTabletEvent;
+    type TabletToolProximityEvent = FakeTabletEvent;
+    type TabletToolTipEvent = FakeTabletEvent;
+    type TabletToolButtonEvent = FakeTabletEvent;
     type SwitchToggleEvent = UnusedEvent;
     type SpecialEvent = UnusedEvent;
 }
@@ -15863,6 +16370,186 @@ impl Device for FakeDevice {
 /// something else, and every timestamp assertion below would go red.
 const FAKE_EVENT_TIME_US: u64 = 4_321_000;
 const FAKE_EVENT_TIME_MS: u32 = 4_321;
+
+#[derive(Clone, Copy, Debug)]
+struct FakeGestureEvent;
+
+impl Event<FakeInput> for FakeGestureEvent {
+    fn time(&self) -> u64 {
+        FAKE_EVENT_TIME_US
+    }
+
+    fn device(&self) -> FakeDevice {
+        FakeDevice::KeyboardAndPointer
+    }
+}
+
+impl GestureBeginEvent<FakeInput> for FakeGestureEvent {
+    fn fingers(&self) -> u32 {
+        3
+    }
+}
+
+impl GestureEndEvent<FakeInput> for FakeGestureEvent {
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+impl GestureSwipeBeginEvent<FakeInput> for FakeGestureEvent {}
+impl GestureSwipeEndEvent<FakeInput> for FakeGestureEvent {}
+impl GesturePinchBeginEvent<FakeInput> for FakeGestureEvent {}
+impl GesturePinchEndEvent<FakeInput> for FakeGestureEvent {}
+impl GestureHoldBeginEvent<FakeInput> for FakeGestureEvent {}
+impl GestureHoldEndEvent<FakeInput> for FakeGestureEvent {}
+
+impl GestureSwipeUpdateEvent<FakeInput> for FakeGestureEvent {
+    fn delta_x(&self) -> f64 {
+        1.0
+    }
+
+    fn delta_y(&self) -> f64 {
+        1.0
+    }
+}
+
+impl GesturePinchUpdateEvent<FakeInput> for FakeGestureEvent {
+    fn delta_x(&self) -> f64 {
+        1.0
+    }
+
+    fn delta_y(&self) -> f64 {
+        1.0
+    }
+
+    fn scale(&self) -> f64 {
+        1.1
+    }
+
+    fn rotation(&self) -> f64 {
+        1.0
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FakeTabletEvent;
+
+impl Event<FakeInput> for FakeTabletEvent {
+    fn time(&self) -> u64 {
+        FAKE_EVENT_TIME_US
+    }
+
+    fn device(&self) -> FakeDevice {
+        FakeDevice::KeyboardAndPointer
+    }
+}
+
+impl AbsolutePositionEvent<FakeInput> for FakeTabletEvent {
+    fn x(&self) -> f64 {
+        0.5
+    }
+
+    fn y(&self) -> f64 {
+        0.5
+    }
+
+    fn x_transformed(&self, width: i32) -> f64 {
+        f64::from(width) * 0.5
+    }
+
+    fn y_transformed(&self, height: i32) -> f64 {
+        f64::from(height) * 0.5
+    }
+}
+
+impl TabletToolEvent<FakeInput> for FakeTabletEvent {
+    fn tool(&self) -> TabletToolDescriptor {
+        TabletToolDescriptor {
+            tool_type: TabletToolType::Pen,
+            hardware_serial: 1,
+            hardware_id_wacom: 1,
+            capabilities: TabletToolCapabilities::empty(),
+        }
+    }
+
+    fn delta_x(&self) -> f64 {
+        0.0
+    }
+    fn delta_y(&self) -> f64 {
+        0.0
+    }
+    fn distance(&self) -> f64 {
+        0.0
+    }
+    fn distance_has_changed(&self) -> bool {
+        false
+    }
+    fn pressure(&self) -> f64 {
+        0.5
+    }
+    fn pressure_has_changed(&self) -> bool {
+        true
+    }
+    fn slider_position(&self) -> f64 {
+        0.0
+    }
+    fn slider_has_changed(&self) -> bool {
+        false
+    }
+    fn tilt_x(&self) -> f64 {
+        0.0
+    }
+    fn tilt_x_has_changed(&self) -> bool {
+        false
+    }
+    fn tilt_y(&self) -> f64 {
+        0.0
+    }
+    fn tilt_y_has_changed(&self) -> bool {
+        false
+    }
+    fn rotation(&self) -> f64 {
+        0.0
+    }
+    fn rotation_has_changed(&self) -> bool {
+        false
+    }
+    fn wheel_delta(&self) -> f64 {
+        0.0
+    }
+    fn wheel_delta_discrete(&self) -> i32 {
+        0
+    }
+    fn wheel_has_changed(&self) -> bool {
+        false
+    }
+}
+
+impl TabletToolAxisEvent<FakeInput> for FakeTabletEvent {}
+
+impl TabletToolProximityEvent<FakeInput> for FakeTabletEvent {
+    fn state(&self) -> ProximityState {
+        ProximityState::In
+    }
+}
+
+impl TabletToolTipEvent<FakeInput> for FakeTabletEvent {
+    fn tip_state(&self) -> TabletToolTipState {
+        TabletToolTipState::Down
+    }
+}
+
+impl TabletToolButtonEvent<FakeInput> for FakeTabletEvent {
+    fn button(&self) -> u32 {
+        1
+    }
+    fn seat_button_count(&self) -> u32 {
+        1
+    }
+    fn button_state(&self) -> ButtonState {
+        ButtonState::Pressed
+    }
+}
 
 struct FakeKeyEvent {
     device: FakeDevice,

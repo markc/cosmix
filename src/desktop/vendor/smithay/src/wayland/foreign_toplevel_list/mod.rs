@@ -327,8 +327,23 @@ impl ForeignToplevelListState {
         title: impl Into<String>,
         app_id: impl Into<String>,
     ) -> ForeignToplevelHandle {
-        let handle = ForeignToplevelHandle::new(
+        self.new_toplevel_with_identifier::<D>(
             Alphanumeric.sample_string(&mut rand::rng(), 32),
+            title,
+            app_id,
+        )
+    }
+
+    /// Register a new toplevel with a compositor-provided stable identifier.
+    // cosmix addition: lets SurfaceRecord identity seed the protocol identifier.
+    pub fn new_toplevel_with_identifier<D: ForeignToplevelListHandler>(
+        &mut self,
+        identifier: impl Into<String>,
+        title: impl Into<String>,
+        app_id: impl Into<String>,
+    ) -> ForeignToplevelHandle {
+        let handle = ForeignToplevelHandle::new(
+            identifier.into(),
             title.into(),
             app_id.into(),
             Vec::with_capacity(self.list_instances.len()),
