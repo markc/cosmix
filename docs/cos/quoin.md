@@ -6,7 +6,7 @@ existing Quoin chrome into one explicit Bevy window target per surface. The
 installable application id and layer namespace are `dev.cosmix.quoin`.
 
 The first Arc 3 slice presents real layer-shell buffers through
-`cosmix-shell-host` 0.1.3 and SCTK 0.19.2. `cosmix-quoin-demo` remains a
+`cosmix-shell-host` 0.1.4 and SCTK 0.19.2. `cosmix-quoin-demo` remains a
 feature-gated, non-installable normal-window tuning arm; it is not a
 layer-shell client.
 
@@ -56,21 +56,24 @@ policy maps only to `None` or `OnDemand`; Quoin never requests `Exclusive`.
 ## Event-driven wake contract
 
 There is no polling, refresh tick or fixed animation sleep. The calloop runner
-coalesces work into one `app.update()` demand. `Idle` removes the timer and
-blocks on the Wayland file descriptor when no configure is outstanding.
-`WakeAt` owns one replaceable absolute calloop timer. `Animate` advances only
-from `wl_surface.frame` callbacks, with at most one outstanding callback per
-mapped animating panel. The visible bottom clock's one-second deadline is
-content work and disappears when that panel is unmapped.
+coalesces work into one `app.update()` demand. `Idle` removes the model timer
+and blocks on the Wayland file descriptor when no configure or frame request
+is outstanding. `WakeAt` owns one replaceable absolute calloop timer.
+`Animate` advances only from `wl_surface.frame` callbacks, with at most one
+outstanding callback per mapped animating panel. The visible bottom clock's
+one-second deadline is content work and disappears when that panel is
+unmapped.
 
-Two bounded one-shot liveness backstops share that single timer. While
-`Animate` is active, a one-second deadline, rounded up to a 250 ms boundary,
-releases an overdue frame callback and requests one coalesced update. The
-quantisation lets consecutive frames retain the same timer source. A
-bufferless map also arms a ten-second configure deadline; expiry exits with a
-distinct abnormal reason. These are not ticks: neither backstop remains armed
-while idle or while no request is in flight, and timely compositor replies
-replace or remove the deadline before it can fire.
+Two bounded one-shot liveness backstops share that single timer. While any
+frame callback is outstanding, its deadline is derived from the oldest
+request: one second after that request, rounded up to a 250 ms boundary. It
+releases only callbacks that are at least one second old and requests one
+coalesced update. The deadline persists across `Idle` and `WakeAt` until every
+outstanding request is answered or expired; quantisation lets consecutive
+frames retain the same timer source. A bufferless map also arms a ten-second
+configure deadline; expiry exits with a distinct abnormal reason. These are
+not ticks: no backstop remains armed when no request is in flight, and timely
+compositor replies replace or remove the deadline before it can fire.
 
 ## Exit status and reasons
 

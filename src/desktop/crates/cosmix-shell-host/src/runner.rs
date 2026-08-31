@@ -82,18 +82,18 @@ fn next_timer_deadline(
     configure_deadlines: &[Duration],
 ) -> Option<Duration> {
     let policy_deadline = match policy {
-        WakePolicy::Idle => None,
+        WakePolicy::Idle | WakePolicy::Animate => None,
         WakePolicy::WakeAt(deadline) => Some(deadline),
-        WakePolicy::Animate => animate_backstop,
     };
     policy_deadline
         .into_iter()
+        .chain(animate_backstop)
         .chain(configure_deadlines.iter().copied())
         .min()
 }
 
-fn animate_backstop_deadline(elapsed: Duration) -> Duration {
-    let deadline = elapsed.saturating_add(ANIMATE_BACKSTOP);
+fn animate_backstop_deadline(requested_at: Duration) -> Duration {
+    let deadline = requested_at.saturating_add(ANIMATE_BACKSTOP);
     let quantum_nanos = ANIMATE_BACKSTOP_QUANTUM.as_nanos();
     let remainder = deadline.as_nanos() % quantum_nanos;
     if remainder == 0 {
@@ -101,6 +101,15 @@ fn animate_backstop_deadline(elapsed: Duration) -> Duration {
     } else {
         deadline.saturating_add(Duration::from_nanos((quantum_nanos - remainder) as u64))
     }
+}
+
+fn oldest_frame_backstop_deadline(
+    requested_at: impl IntoIterator<Item = Duration>,
+) -> Option<Duration> {
+    requested_at
+        .into_iter()
+        .min()
+        .map(animate_backstop_deadline)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -464,17 +473,24 @@ fn state_exit(mut state: RunnerState, reason: &str, abnormal: bool) -> AppExit {
     if !state.outputs.is_empty() {
         state.app.update();
     }
-    for output in state.outputs.values_mut() {
-        for panel in &mut output.panels {
-            panel.finish_close();
-        }
-    }
+    finish_closed_panels(
+        state
+            .outputs
+            .values_mut()
+            .flat_map(|output| output.panels.iter_mut()),
+    );
     state.outputs.clear();
     tracing::info!("QUOIN_LAYER_HOST_EXIT reason={reason}");
     if abnormal {
         AppExit::error()
     } else {
         AppExit::Success
+    }
+}
+
+fn finish_closed_panels<'a>(panels: impl IntoIterator<Item = &'a mut PanelSurface>) {
+    for panel in panels {
+        panel.finish_close();
     }
 }
 
@@ -725,8 +741,12 @@ impl RunnerState {
         } else {
             self.last_wake
         };
-        let animate_backstop =
-            (self.last_wake == WakePolicy::Animate).then(|| animate_backstop_deadline(elapsed));
+        let animate_backstop = oldest_frame_backstop_deadline(
+            self.outputs
+                .values()
+                .flat_map(|output| output.panels.iter())
+                .filter_map(PanelSurface::pending_frame_requested_at),
+        );
         let configure_deadlines = self
             .outputs
             .values()
@@ -786,14 +806,12 @@ impl RunnerState {
             return;
         }
 
-        if self.last_wake == WakePolicy::Animate {
-            for panel in self
-                .outputs
-                .values_mut()
-                .flat_map(|output| output.panels.iter_mut())
-            {
-                panel.clear_overdue_frame(elapsed, ANIMATE_BACKSTOP);
-            }
+        for panel in self
+            .outputs
+            .values_mut()
+            .flat_map(|output| output.panels.iter_mut())
+        {
+            panel.clear_overdue_frame(elapsed, ANIMATE_BACKSTOP);
         }
         self.needs_update = true;
     }
@@ -913,10 +931,10 @@ impl CompositorHandler for RunnerState {
         surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        if let Some(panel) = self.panel_for_surface_mut(surface) {
-            panel.frame_done();
-        }
-        if self.last_wake == WakePolicy::Animate {
+        let answered = self
+            .panel_for_surface_mut(surface)
+            .is_some_and(PanelSurface::frame_done);
+        if answered || self.last_wake == WakePolicy::Animate {
             self.needs_update = true;
         }
         self.check_ready();
@@ -1139,6 +1157,12 @@ delegate_registry!(RunnerState);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use crate::surface::frame_request_overdue;
 
     #[test]
     fn layer_close_only_exits_for_a_live_output_without_replacement() {
@@ -1157,9 +1181,12 @@ mod tests {
     #[test]
     fn timer_selection_uses_the_earliest_bounded_one_shot() {
         let seconds = Duration::from_secs;
-        assert_eq!(next_timer_deadline(WakePolicy::Idle, None, &[]), None);
         assert_eq!(
-            next_timer_deadline(WakePolicy::Animate, Some(seconds(6)), &[]),
+            next_timer_deadline(
+                WakePolicy::WakeAt(seconds(8)),
+                Some(seconds(6)),
+                &[seconds(7), seconds(12)]
+            ),
             Some(seconds(6))
         );
         assert_eq!(
@@ -1174,14 +1201,72 @@ mod tests {
             next_timer_deadline(WakePolicy::Idle, None, &[seconds(10)]),
             Some(seconds(10))
         );
-        let first_frame = animate_backstop_deadline(seconds(5) + Duration::from_millis(10));
-        let second_frame = animate_backstop_deadline(seconds(5) + Duration::from_millis(20));
-        assert_eq!(first_frame, seconds(6) + Duration::from_millis(250));
-        assert_eq!(first_frame, second_frame);
+    }
+
+    #[test]
+    fn animate_backstop_quantises_request_deadlines() {
+        let seconds = Duration::from_secs;
+        let first = animate_backstop_deadline(seconds(5) + Duration::from_millis(10));
+        let second = animate_backstop_deadline(seconds(5) + Duration::from_millis(20));
+        assert_eq!(first, seconds(6) + Duration::from_millis(250));
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn oldest_stalled_frame_controls_backstop_and_expires_before_timely_frame() {
+        let seconds = Duration::from_secs;
+        let stalled = seconds(5) + Duration::from_millis(10);
+        let timely = seconds(5) + Duration::from_millis(800);
+        let deadline = oldest_frame_backstop_deadline([stalled, timely])
+            .expect("pending requests arm a deadline");
+
+        assert_eq!(deadline, seconds(6) + Duration::from_millis(250));
         assert_eq!(
-            next_timer_deadline(WakePolicy::Animate, Some(first_frame), &[]),
-            next_timer_deadline(WakePolicy::Animate, Some(second_frame), &[])
+            oldest_frame_backstop_deadline([stalled, seconds(6)]),
+            Some(deadline),
+            "a newer timely request must not push the stalled request's deadline"
         );
+        assert!(frame_request_overdue(
+            Some(stalled),
+            deadline,
+            ANIMATE_BACKSTOP
+        ));
+        assert!(!frame_request_overdue(
+            Some(timely),
+            deadline,
+            ANIMATE_BACKSTOP
+        ));
+    }
+
+    #[test]
+    fn leaving_animate_keeps_a_pending_frame_backstop_armed() {
+        let backstop = oldest_frame_backstop_deadline([Duration::from_secs(5)]);
+        assert_eq!(
+            next_timer_deadline(WakePolicy::Idle, backstop, &[]),
+            backstop
+        );
+    }
+
+    #[test]
+    fn idle_without_pending_frames_or_configures_arms_nothing() {
+        assert_eq!(next_timer_deadline(WakePolicy::Idle, None, &[]), None);
+    }
+
+    #[test]
+    fn state_exit_close_path_destroys_each_holder_once() {
+        let mut app = App::new();
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let mut panels = [
+            PanelSurface::test_double(&mut app, SurfacePhase::Closed, Arc::clone(&first)),
+            PanelSurface::test_double(&mut app, SurfacePhase::Closed, Arc::clone(&second)),
+        ];
+
+        finish_closed_panels(panels.iter_mut());
+        finish_closed_panels(panels.iter_mut());
+
+        assert_eq!(first.load(Ordering::SeqCst), 1);
+        assert_eq!(second.load(Ordering::SeqCst), 1);
     }
 
     #[test]

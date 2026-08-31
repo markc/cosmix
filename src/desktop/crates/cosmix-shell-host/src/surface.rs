@@ -4,6 +4,12 @@
 
 use std::time::Duration;
 
+#[cfg(test)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
 use bevy::camera::RenderTarget;
 use bevy::prelude::*;
 use bevy::ui::{UiTargetCamera, percent};
@@ -58,6 +64,14 @@ impl Drop for FractionalObjects {
 fn destroy_addons_in_order(destroy_viewport: impl FnOnce(), destroy_scale: impl FnOnce()) {
     destroy_viewport();
     destroy_scale();
+}
+
+pub(crate) fn frame_request_overdue(
+    requested_at: Option<Duration>,
+    elapsed: Duration,
+    backstop: Duration,
+) -> bool {
+    requested_at.is_some_and(|requested| elapsed >= requested.saturating_add(backstop))
 }
 
 #[derive(Debug)]
@@ -183,6 +197,8 @@ pub struct PanelSurface {
     preferred_fractional_scale: Option<f64>,
     configured_logical_size: Option<(u32, u32)>,
     announced_scale: Option<f64>,
+    #[cfg(test)]
+    destroy_wayland_objects_counter: Option<Arc<AtomicUsize>>,
 }
 
 impl PanelSurface {
@@ -262,6 +278,8 @@ impl PanelSurface {
             preferred_fractional_scale: None,
             configured_logical_size: None,
             announced_scale: None,
+            #[cfg(test)]
+            destroy_wayland_objects_counter: None,
         })
     }
 
@@ -282,7 +300,7 @@ impl PanelSurface {
         });
         self.preferred_fractional_scale = None;
         self.announced_scale = None;
-        self.frame_requested_at = None;
+        self.clear_frame_request();
         self.waiting_configure_since = None;
         Ok(())
     }
@@ -383,8 +401,7 @@ impl PanelSurface {
                 camera.is_active = false;
             }
             self.phase = SurfacePhase::PreparingUnmap;
-            self.frame_pending = false;
-            self.frame_requested_at = None;
+            self.clear_frame_request();
             self.waiting_configure_since = None;
         }
     }
@@ -396,7 +413,7 @@ impl PanelSurface {
             self.configured_logical_size = None;
             self.announced_scale = None;
             self.presented = false;
-            self.frame_requested_at = None;
+            self.clear_frame_request();
             self.waiting_configure_since = None;
         }
     }
@@ -582,12 +599,18 @@ impl PanelSurface {
             .commit();
     }
 
-    pub fn frame_done(&mut self) {
-        self.frame_pending = false;
-        self.frame_requested_at = None;
+    pub fn frame_done(&mut self) -> bool {
+        let answered = self.clear_frame_request();
         if self.phase == SurfacePhase::Configured {
             self.presented = true;
         }
+        answered
+    }
+
+    pub(crate) fn pending_frame_requested_at(&self) -> Option<Duration> {
+        self.frame_pending
+            .then_some(self.frame_requested_at)
+            .flatten()
     }
 
     pub fn wants_animation_callback(&self) -> bool {
@@ -608,8 +631,7 @@ impl PanelSurface {
             camera.is_active = false;
         }
         self.phase = SurfacePhase::Closed;
-        self.frame_pending = false;
-        self.frame_requested_at = None;
+        self.clear_frame_request();
         self.waiting_configure_since = None;
     }
 
@@ -619,13 +641,8 @@ impl PanelSurface {
     }
 
     pub fn clear_overdue_frame(&mut self, elapsed: Duration, backstop: Duration) -> bool {
-        if self.frame_pending
-            && self
-                .frame_requested_at
-                .is_some_and(|requested| elapsed >= requested.saturating_add(backstop))
-        {
-            self.frame_pending = false;
-            self.frame_requested_at = None;
+        if self.frame_pending && frame_request_overdue(self.frame_requested_at, elapsed, backstop) {
+            self.clear_frame_request();
             true
         } else {
             false
@@ -635,14 +652,56 @@ impl PanelSurface {
     /// Drop a drained protocol/WSI owner while preserving the mount and its
     /// chrome subtree for a replacement output runtime.
     pub fn retire(mut self, app: &mut App) {
+        self.clear_frame_request();
         self.destroy_wayland_objects();
         app.world_mut().despawn(self.camera);
         app.world_mut().despawn(self.window);
     }
 
     fn destroy_wayland_objects(&mut self) {
+        #[cfg(test)]
+        if let Some(counter) = self.destroy_wayland_objects_counter.take() {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
         if let Some(objects) = self.wayland.take() {
             objects.destroy();
+        }
+    }
+
+    fn clear_frame_request(&mut self) -> bool {
+        let pending = self.frame_pending;
+        self.frame_pending = false;
+        self.frame_requested_at = None;
+        pending
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_double(
+        app: &mut App,
+        phase: SurfacePhase,
+        destroy_wayland_objects_counter: Arc<AtomicUsize>,
+    ) -> Self {
+        let window = app.world_mut().spawn_empty().id();
+        let camera = app.world_mut().spawn_empty().id();
+        let mount = app.world_mut().spawn_empty().id();
+        Self {
+            edge: Edge::Left,
+            window,
+            camera,
+            mount,
+            phase,
+            last_committed: None,
+            presented: false,
+            frame_pending: false,
+            frame_requested_at: None,
+            waiting_configure_since: None,
+            wayland: None,
+            output_size: LogicalSize::new(1.0, 1.0).expect("test size is valid"),
+            output_scale: 1,
+            preferred_fractional_scale: None,
+            configured_logical_size: None,
+            announced_scale: None,
+            destroy_wayland_objects_counter: Some(destroy_wayland_objects_counter),
         }
     }
 
@@ -722,6 +781,48 @@ mod tests {
             || order.borrow_mut().push("fractional-scale"),
         );
         assert_eq!(*order.borrow(), ["viewport", "fractional-scale"]);
+    }
+
+    #[test]
+    fn finish_unmap_destroys_its_wayland_holder_once() {
+        let mut app = App::new();
+        let destroys = Arc::new(AtomicUsize::new(0));
+        let mut panel = PanelSurface::test_double(
+            &mut app,
+            SurfacePhase::PreparingUnmap,
+            Arc::clone(&destroys),
+        );
+
+        panel.finish_unmap();
+        panel.finish_unmap();
+
+        assert_eq!(destroys.load(Ordering::SeqCst), 1);
+        assert_eq!(panel.phase, SurfacePhase::Unmapped);
+    }
+
+    #[test]
+    fn finish_close_destroys_its_wayland_holder_once() {
+        let mut app = App::new();
+        let destroys = Arc::new(AtomicUsize::new(0));
+        let mut panel =
+            PanelSurface::test_double(&mut app, SurfacePhase::Closed, Arc::clone(&destroys));
+
+        panel.finish_close();
+        panel.finish_close();
+
+        assert_eq!(destroys.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn retire_destroys_its_wayland_holder_once() {
+        let mut app = App::new();
+        let destroys = Arc::new(AtomicUsize::new(0));
+        let panel =
+            PanelSurface::test_double(&mut app, SurfacePhase::Closed, Arc::clone(&destroys));
+
+        panel.retire(&mut app);
+
+        assert_eq!(destroys.load(Ordering::SeqCst), 1);
     }
 
     #[test]
