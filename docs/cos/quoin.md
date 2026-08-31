@@ -6,7 +6,7 @@ existing Quoin chrome into one explicit Bevy window target per surface. The
 installable application id and layer namespace are `dev.cosmix.quoin`.
 
 The first Arc 3 slice presents real layer-shell buffers through
-`cosmix-shell-host` 0.1.0 and SCTK 0.19.2. `cosmix-quoin-demo` remains a
+`cosmix-shell-host` 0.1.1 and SCTK 0.19.2. `cosmix-quoin-demo` remains a
 feature-gated, non-installable normal-window tuning arm; it is not a
 layer-shell client.
 
@@ -37,9 +37,14 @@ messages, render, attach and present.
 
 Unmap runs in the opposite lifetime order: remove `RawHandleWrapper`, disable
 the camera, run one non-pipelined Bevy update to drain render-world removal,
-then attach a null buffer and commit. Layer-shell resets role state after an
-unmap, so remap replays every property and repeats the bufferless configure
-gate before another buffer can be presented.
+then destroy the `zwlr_layer_surface_v1` and its `wl_surface`. Destroying the
+objects prevents SCTK from acknowledging a configure queued for the old role
+after the compositor has reset its configure state. The Bevy `Window`, camera
+and chrome mount entities remain stable. Remap creates a fresh `wl_surface`
+and layer role on the explicit output, recreates the retained raw-handle
+owner, replays every property, and repeats the bufferless configure gate. A
+successful remap therefore emits `WindowCreated` again before another buffer
+can be presented.
 
 Pinned panels use `Top`, reserve their complete logical thickness and keep
 protocol margin zero; chrome alone owns their transient slide. Revealed and
@@ -79,3 +84,11 @@ wire and presentation authority.
 
 This arc vendors nothing and edits no Smithay source. Quoin consumes
 `cosmix-comp`'s documented public layer-shell contract unchanged.
+
+## Known limits
+
+Destroy-and-recreate is required because the current compositor rejects an
+acknowledgement for a configure serial retained across unmap. If the
+compositor later tolerates stale post-unmap acknowledgements, a comp-side
+follow-up could make the cheaper attach-NULL path safe; this host does not
+assume that behaviour.

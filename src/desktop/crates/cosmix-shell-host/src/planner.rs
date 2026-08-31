@@ -44,6 +44,8 @@ pub enum ProtocolKeyboardInteractivity {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProtocolOp {
+    /// Ensure a fresh wl_surface and layer role exist before property replay.
+    CreateSurface,
     SetLayer(ProtocolLayer),
     SetAnchor(ProtocolAnchor),
     SetSize {
@@ -57,7 +59,7 @@ pub enum ProtocolOp {
     CommitBufferless,
     /// Commit an atomic property-only update on an already mapped surface.
     Commit,
-    /// Remove renderer ownership, drain extraction, then attach NULL and commit.
+    /// Remove renderer ownership, drain extraction, then destroy the role and surface.
     Unmap,
 }
 
@@ -282,6 +284,7 @@ fn desired(panel: &PanelPresentation) -> Result<DesiredSurface, PlanError> {
 
 fn full_replay(surface: DesiredSurface) -> Vec<ProtocolOp> {
     vec![
+        ProtocolOp::CreateSurface,
         ProtocolOp::SetLayer(surface.layer),
         ProtocolOp::SetAnchor(surface.anchor),
         ProtocolOp::SetSize {
@@ -380,9 +383,9 @@ mod tests {
         ];
         for (edge, anchor, size) in cases {
             let operations = replay(edge);
-            assert_eq!(operations[1], ProtocolOp::SetAnchor(anchor));
+            assert_eq!(operations[2], ProtocolOp::SetAnchor(anchor));
             assert_eq!(
-                operations[2],
+                operations[3],
                 ProtocolOp::SetSize {
                     width: size.0,
                     height: size.1,
@@ -401,7 +404,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                operations[4],
+                operations[5],
                 ProtocolOp::SetMargin(ProtocolMargin {
                     right: expected,
                     ..ProtocolMargin::default()
@@ -442,10 +445,11 @@ mod tests {
         let hidden = panel(Edge::Left, PanelMode::Hidden, false, 0.0);
         let pinned = panel(Edge::Left, PanelMode::Pinned, true, 0.0);
         let operations = plan_surface(Some(&hidden), &pinned, GEOMETRY).unwrap();
-        assert_eq!(operations[0], ProtocolOp::SetLayer(ProtocolLayer::Top));
-        assert_eq!(operations[3], ProtocolOp::SetExclusiveZone(101));
+        assert_eq!(operations[0], ProtocolOp::CreateSurface);
+        assert_eq!(operations[1], ProtocolOp::SetLayer(ProtocolLayer::Top));
+        assert_eq!(operations[4], ProtocolOp::SetExclusiveZone(101));
         assert_eq!(
-            operations[4],
+            operations[5],
             ProtocolOp::SetMargin(ProtocolMargin::default())
         );
         assert_eq!(operations.last(), Some(&ProtocolOp::CommitBufferless));
@@ -488,10 +492,10 @@ mod tests {
     fn remap_replays_every_property_and_configure_gate() {
         let hidden = panel(Edge::Right, PanelMode::Hidden, false, 0.0);
         let remapped = panel(Edge::Right, PanelMode::Revealed, true, 0.5);
-        assert_eq!(
-            plan_surface(Some(&hidden), &remapped, GEOMETRY).unwrap(),
-            plan_surface(None, &remapped, GEOMETRY).unwrap()
-        );
+        let operations = plan_surface(Some(&hidden), &remapped, GEOMETRY).unwrap();
+        assert_eq!(operations, plan_surface(None, &remapped, GEOMETRY).unwrap());
+        assert_eq!(operations.first(), Some(&ProtocolOp::CreateSurface));
+        assert_eq!(operations.last(), Some(&ProtocolOp::CommitBufferless));
     }
 
     #[test]
@@ -544,13 +548,13 @@ mod tests {
         let hidden = panel(Edge::Top, PanelMode::Hidden, false, 0.0);
         let mapped = panel(Edge::Top, PanelMode::Revealed, true, 1.0);
         assert_eq!(
-            plan_surface(None, &mapped, GEOMETRY).unwrap()[5],
+            plan_surface(None, &mapped, GEOMETRY).unwrap()[6],
             ProtocolOp::SetKeyboardInteractivity(ProtocolKeyboardInteractivity::OnDemand)
         );
         let mut no_keyboard = mapped.clone();
         no_keyboard.keyboard_interactivity = KeyboardInteractivity::None;
         assert_eq!(
-            plan_surface(None, &no_keyboard, GEOMETRY).unwrap()[5],
+            plan_surface(None, &no_keyboard, GEOMETRY).unwrap()[6],
             ProtocolOp::SetKeyboardInteractivity(ProtocolKeyboardInteractivity::None)
         );
         assert!(plan_surface(None, &hidden, GEOMETRY).unwrap().is_empty());

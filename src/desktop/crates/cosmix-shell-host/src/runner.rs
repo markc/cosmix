@@ -394,6 +394,44 @@ fn output_reason(error: &OutputError) -> String {
     }
 }
 
+struct PanelWaylandFactory<'a> {
+    compositor_state: &'a CompositorState,
+    layer_shell: &'a LayerShell,
+    fractional_manager: Option<&'a WpFractionalScaleManagerV1>,
+    viewporter: Option<&'a WpViewporter>,
+    namespace: &'a str,
+}
+
+impl PanelWaylandFactory<'_> {
+    fn create(
+        &self,
+        qh: &QueueHandle<RunnerState>,
+        output: &wl_output::WlOutput,
+        edge: Edge,
+    ) -> (
+        wl_surface::WlSurface,
+        LayerSurface,
+        Option<FractionalObjects>,
+    ) {
+        let wl_surface = self.compositor_state.create_surface(qh);
+        let layer_surface = self.layer_shell.create_layer_surface(
+            qh,
+            wl_surface.clone(),
+            Layer::Overlay,
+            Some(self.namespace.to_owned()),
+            Some(output),
+        );
+        let fractional = match (self.fractional_manager, self.viewporter) {
+            (Some(manager), Some(viewporter)) => Some(FractionalObjects {
+                scale: manager.get_fractional_scale(&wl_surface, qh, SurfaceTag { edge }),
+                viewport: viewporter.get_viewport(&wl_surface, qh, GlobalData),
+            }),
+            _ => None,
+        };
+        (wl_surface, layer_surface, fractional)
+    }
+}
+
 impl RunnerState {
     fn create_panels(
         &mut self,
@@ -401,23 +439,17 @@ impl RunnerState {
         selected: &SelectedOutput,
         retained_mounts: Option<QuoinPanelMounts>,
     ) -> Result<[PanelSurface; 4], LayerHostError> {
+        let factory = PanelWaylandFactory {
+            compositor_state: &self.compositor_state,
+            layer_shell: &self.layer_shell,
+            fractional_manager: self.fractional_manager.as_ref(),
+            viewporter: self.viewporter.as_ref(),
+            namespace: &self.namespace,
+        };
         let mut panel_vec = Vec::with_capacity(Edge::ALL.len());
         for edge in Edge::ALL {
-            let wl_surface = self.compositor_state.create_surface(qh);
-            let layer_surface = self.layer_shell.create_layer_surface(
-                qh,
-                wl_surface.clone(),
-                Layer::Overlay,
-                Some(self.namespace.clone()),
-                Some(&selected.wl_output),
-            );
-            let fractional = match (&self.fractional_manager, &self.viewporter) {
-                (Some(manager), Some(viewporter)) => Some(FractionalObjects {
-                    _scale: manager.get_fractional_scale(&wl_surface, qh, SurfaceTag { edge }),
-                    viewport: viewporter.get_viewport(&wl_surface, qh, GlobalData),
-                }),
-                _ => None,
-            };
+            let (wl_surface, layer_surface, fractional) =
+                factory.create(qh, &selected.wl_output, edge);
             let panel = PanelSurface::from_wayland(
                 &mut self.app,
                 &self.connection,
@@ -496,13 +528,30 @@ impl RunnerState {
             .selected_key
             .as_ref()
             .ok_or_else(|| LayerHostError::new("selected output key is unavailable"))?;
-        let output = self
-            .outputs
+        let RunnerState {
+            app,
+            connection,
+            compositor_state,
+            layer_shell,
+            fractional_manager,
+            viewporter,
+            namespace,
+            outputs,
+            ..
+        } = self;
+        let output = outputs
             .get_mut(key)
             .ok_or_else(|| LayerHostError::new("selected output runtime is unavailable"))?;
         let geometry = OutputGeometry {
             width: output.logical_size.width(),
             height: output.logical_size.height(),
+        };
+        let factory = PanelWaylandFactory {
+            compositor_state,
+            layer_shell,
+            fractional_manager: fractional_manager.as_ref(),
+            viewporter: viewporter.as_ref(),
+            namespace,
         };
         let mut unmaps = Vec::new();
         for edge in Edge::ALL {
@@ -511,16 +560,23 @@ impl RunnerState {
             let operations = plan_surface(panel.last_committed.as_ref(), next, geometry)
                 .map_err(|error| LayerHostError::new(error.to_string()))?;
             panel.last_committed = Some(next.clone());
+            if !panel.has_wayland_objects() && operations.contains(&ProtocolOp::CreateSurface) {
+                let (wl_surface, layer_surface, fractional) =
+                    factory.create(qh, &output.wl_output, edge);
+                panel
+                    .install_wayland(connection, wl_surface, layer_surface, fractional)
+                    .map_err(|error| LayerHostError::new(format!("raw-handle-failed-{error}")))?;
+            }
             if operations.contains(&ProtocolOp::Unmap) {
-                panel.begin_unmap(&mut self.app);
+                panel.begin_unmap(app);
                 unmaps.push(edge);
             }
             panel.apply_protocol_ops(&operations);
         }
         if !unmaps.is_empty() {
             // This non-pipelined update drains render extraction after raw
-            // handle removal and before the null-buffer commit.
-            self.app.update();
+            // handle removal and before destroying the protocol objects.
+            app.update();
             for edge in unmaps {
                 output.panels[edge.index()].finish_unmap();
             }
@@ -581,7 +637,7 @@ impl RunnerState {
         self.outputs
             .values_mut()
             .flat_map(|output| output.panels.iter_mut())
-            .find(|panel| panel.wl_surface == *surface)
+            .find(|panel| panel.matches_surface(surface))
     }
 
     fn check_ready(&mut self) {
@@ -628,7 +684,12 @@ impl RunnerState {
         runtime.logical_size = logical_size;
         runtime.scale = scale;
         for panel in &mut runtime.panels {
-            panel.update_output_metrics(&mut self.app, logical_size, scale);
+            if let Err(error) = panel.update_output_metrics(&mut self.app, logical_size, scale) {
+                self.abnormal_exit = true;
+                self.exit_reason =
+                    Some(format!("configure-out-of-range-{}", error.reason_suffix()));
+                return;
+            }
         }
         if let Some(key) = &self.selected_key {
             let elapsed = self
@@ -656,12 +717,14 @@ impl CompositorHandler for RunnerState {
     ) {
         let output_size = panel_output_size(&self.outputs, surface);
         let RunnerState { app, outputs, .. } = self;
-        if let Some(panel) = outputs
+        let size_error = outputs
             .values_mut()
             .flat_map(|output| output.panels.iter_mut())
-            .find(|panel| panel.wl_surface == *surface)
-        {
-            panel.update_output_metrics(app, output_size, scale);
+            .find(|panel| panel.matches_surface(surface))
+            .and_then(|panel| panel.update_output_metrics(app, output_size, scale).err());
+        if let Some(error) = size_error {
+            self.abnormal_exit = true;
+            self.exit_reason = Some(format!("configure-out-of-range-{}", error.reason_suffix()));
         }
         self.needs_update = true;
     }
@@ -717,7 +780,7 @@ fn panel_output_size(outputs: &OutputRuntimeMap, surface: &wl_surface::WlSurface
             output
                 .panels
                 .iter()
-                .any(|panel| panel.wl_surface == *surface)
+                .any(|panel| panel.matches_surface(surface))
         })
         .map_or_else(
             || LogicalSize::new(1.0, 1.0).expect("static fallback geometry is valid"),
@@ -769,7 +832,7 @@ impl LayerShellHandler for RunnerState {
         if let Some(panel) = outputs
             .values_mut()
             .flat_map(|output| output.panels.iter_mut())
-            .find(|panel| panel.layer_surface == *layer)
+            .find(|panel| panel.matches_layer(layer))
         {
             let edge = panel.edge;
             panel.close(app);
@@ -786,13 +849,19 @@ impl LayerShellHandler for RunnerState {
         _serial: u32,
     ) {
         let RunnerState { app, outputs, .. } = self;
+        let mut configure_error = None;
         if let Some(panel) = outputs
             .values_mut()
             .flat_map(|output| output.panels.iter_mut())
-            .find(|panel| panel.layer_surface == *layer)
+            .find(|panel| panel.matches_layer(layer))
         {
             // SCTK acknowledged the configure before invoking this callback.
-            panel.configure(app, qh, &configure);
+            configure_error = panel.configure(app, qh, &configure).err();
+        }
+        if let Some(error) = configure_error {
+            self.abnormal_exit = true;
+            self.exit_reason = Some(format!("configure-out-of-range-{}", error.reason_suffix()));
+        } else {
             self.needs_update = true;
         }
     }
@@ -821,7 +890,7 @@ impl Dispatch<WpFractionalScaleManagerV1, GlobalData> for RunnerState {
 impl Dispatch<WpFractionalScaleV1, SurfaceTag> for RunnerState {
     fn event(
         state: &mut Self,
-        _proxy: &WpFractionalScaleV1,
+        proxy: &WpFractionalScaleV1,
         event: <WpFractionalScaleV1 as Proxy>::Event,
         data: &SurfaceTag,
         _connection: &Connection,
@@ -834,10 +903,15 @@ impl Dispatch<WpFractionalScaleV1, SurfaceTag> for RunnerState {
         if let Some(panel) = outputs
             .values_mut()
             .flat_map(|output| output.panels.iter_mut())
-            .find(|panel| panel.edge == data.edge)
+            .find(|panel| panel.edge == data.edge && panel.matches_fractional_scale(proxy))
         {
-            panel.set_fractional_scale(app, scale);
-            state.needs_update = true;
+            if let Err(error) = panel.set_fractional_scale(app, scale) {
+                state.abnormal_exit = true;
+                state.exit_reason =
+                    Some(format!("configure-out-of-range-{}", error.reason_suffix()));
+            } else {
+                state.needs_update = true;
+            }
         }
     }
 }

@@ -117,12 +117,16 @@ mkdir($bin)
 for each $pkg in $meta.packages
   for each $t in $pkg.targets
     if contains($t.kind, "bin") then
-      $from = $src .. "/target/release/" .. $t.name
-      if is_file($from) then
-        install_bin($from, $bin .. "/" .. $t.name)
-        push($installed, $t.name)
+      if len($t["required-features"]) > 0 then
+        print("skipped (required-features): " .. $t.name)
       else
-        push($missing, $t.name)
+        $from = $src .. "/target/release/" .. $t.name
+        if is_file($from) then
+          install_bin($from, $bin .. "/" .. $t.name)
+          push($installed, $t.name)
+        else
+          push($missing, $t.name)
+        end
       end
     end
   end
@@ -145,10 +149,14 @@ if $want_desktop then
   for each $pkg in $dmeta.packages
     for each $t in $pkg.targets
       if contains($t.kind, "bin") then
-        $from = $src .. "/desktop/target/release/" .. $t.name
-        if is_file($from) then
-          install_bin($from, $bin .. "/" .. $t.name)
-          $dn = $dn + 1
+        if len($t["required-features"]) > 0 then
+          print("skipped (required-features): " .. $t.name)
+        else
+          $from = $src .. "/desktop/target/release/" .. $t.name
+          if is_file($from) then
+            install_bin($from, $bin .. "/" .. $t.name)
+            $dn = $dn + 1
+          end
         end
       end
     end

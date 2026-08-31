@@ -14,19 +14,32 @@ use cosmix_shell::runtime::ShellFrameState;
 use cosmix_shell_host::{LayerHostConfig, LayerPanelMounts, configure_layer_host};
 use ctk::theme::{CtkThemePlugin, ThemeSpec, ThemeState, apply_theme, tokens};
 
+const USAGE: &str = "usage: cosmix-quoin [--output NAME] [--smoke-all-panels]";
+
 #[derive(Debug, Default)]
 struct Cli {
     output: Option<String>,
     smoke_all_panels: bool,
 }
 
-fn main() {
+#[derive(Debug)]
+enum CliAction {
+    Run(Cli),
+    Help,
+}
+
+fn main() -> AppExit {
     let cli = match parse_cli(std::env::args().skip(1)) {
-        Ok(cli) => cli,
+        Ok(CliAction::Run(cli)) => cli,
+        Ok(CliAction::Help) => {
+            println!("{USAGE}");
+            return AppExit::Success;
+        }
         Err(error) => {
             eprintln!("{error}");
+            eprintln!("{USAGE}");
             eprintln!("QUOIN_LAYER_HOST_EXIT reason=invalid-cli");
-            return;
+            return AppExit::error();
         }
     };
     let registry = page_registry();
@@ -60,11 +73,11 @@ fn main() {
             CtkThemePlugin::default(),
             QuoinChromePlugin,
         ))
-        .add_systems(Startup, setup)
-        .run();
+        .add_systems(Startup, setup);
+    app.run()
 }
 
-fn parse_cli(arguments: impl IntoIterator<Item = String>) -> Result<Cli, String> {
+fn parse_cli(arguments: impl IntoIterator<Item = String>) -> Result<CliAction, String> {
     let mut cli = Cli::default();
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -83,12 +96,12 @@ fn parse_cli(arguments: impl IntoIterator<Item = String>) -> Result<Cli, String>
             }
             "--smoke-all-panels" => cli.smoke_all_panels = true,
             "--help" | "-h" => {
-                return Err("usage: cosmix-quoin [--output NAME] [--smoke-all-panels]".to_owned());
+                return Ok(CliAction::Help);
             }
             _ => return Err(format!("unknown option: {argument}")),
         }
     }
-    Ok(cli)
+    Ok(CliAction::Run(cli))
 }
 
 fn setup(
@@ -273,12 +286,14 @@ mod tests {
 
     #[test]
     fn cli_accepts_output_and_smoke_flag_in_either_order() {
-        let cli = parse_cli([
+        let CliAction::Run(cli) = parse_cli([
             "--smoke-all-panels".to_owned(),
             "--output".to_owned(),
             "WL-1".to_owned(),
         ])
-        .unwrap();
+        .unwrap() else {
+            panic!("valid run options returned help");
+        };
         assert_eq!(cli.output.as_deref(), Some("WL-1"));
         assert!(cli.smoke_all_panels);
     }
@@ -295,5 +310,17 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn cli_error_and_help_paths_are_distinct() {
+        assert_eq!(
+            parse_cli(["--bogus".to_owned()]).unwrap_err(),
+            "unknown option: --bogus"
+        );
+        assert!(matches!(
+            parse_cli(["--help".to_owned()]),
+            Ok(CliAction::Help)
+        ));
     }
 }

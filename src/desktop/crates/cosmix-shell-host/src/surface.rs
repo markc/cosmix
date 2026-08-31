@@ -26,6 +26,10 @@ use wayland_protocols::wp::{
 use crate::planner::{ProtocolAnchor, ProtocolKeyboardInteractivity, ProtocolLayer, ProtocolOp};
 use crate::raw_handle::{RawHandleError, RetainedWindow, retained_raw_handle};
 
+/// Conservative fallback used because the render device is not available at
+/// layer configure time. This matches wgpu's common default 2D texture limit.
+const MAX_SURFACE_DIMENSION: u32 = 16_384;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SurfaceTag {
     pub edge: Edge,
@@ -33,8 +37,34 @@ pub(crate) struct SurfaceTag {
 
 #[derive(Debug)]
 pub(crate) struct FractionalObjects {
-    pub _scale: WpFractionalScaleV1,
+    pub scale: WpFractionalScaleV1,
     pub viewport: WpViewport,
+}
+
+impl FractionalObjects {
+    fn destroy(self) {
+        self.viewport.destroy();
+        self.scale.destroy();
+    }
+}
+
+#[derive(Debug)]
+struct WaylandObjects {
+    fractional: Option<FractionalObjects>,
+    // SCTK's drop implementation destroys the layer role before its owned
+    // wl_surface. Keep it ahead of the retained raw owner for drop ordering.
+    layer_surface: LayerSurface,
+    raw_handle: RawHandleWrapper,
+    _raw_owner: RetainedWindow,
+}
+
+impl WaylandObjects {
+    fn destroy(mut self) {
+        if let Some(fractional) = self.fractional.take() {
+            fractional.destroy();
+        }
+        drop(self);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,11 +76,81 @@ pub enum SurfacePhase {
     Closed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigureEffect {
+    Ignore,
+    InitialMap,
+    Update { size_changed: bool },
+}
+
+fn configure_effect(
+    phase: SurfacePhase,
+    previous: Option<(u32, u32)>,
+    logical: (u32, u32),
+) -> ConfigureEffect {
+    match phase {
+        SurfacePhase::WaitingConfigure => ConfigureEffect::InitialMap,
+        SurfacePhase::Configured => ConfigureEffect::Update {
+            size_changed: previous != Some(logical),
+        },
+        SurfacePhase::PreparingUnmap | SurfacePhase::Unmapped | SurfacePhase::Closed => {
+            ConfigureEffect::Ignore
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SurfaceSizeError {
+    InvalidScale(f64),
+    LogicalOutOfRange { width: u32, height: u32 },
+    PhysicalOutOfRange { width: f64, height: f64 },
+}
+
+impl SurfaceSizeError {
+    pub(crate) fn reason_suffix(self) -> String {
+        match self {
+            Self::InvalidScale(scale) => format!("invalid-scale-{scale}"),
+            Self::LogicalOutOfRange { width, height } => {
+                format!("logical-{width}x{height}")
+            }
+            Self::PhysicalOutOfRange { width, height } => {
+                format!("physical-{width:.0}x{height:.0}")
+            }
+        }
+    }
+}
+
+fn validate_surface_size(logical: (u32, u32), scale: f64) -> Result<(u32, u32), SurfaceSizeError> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(SurfaceSizeError::InvalidScale(scale));
+    }
+    if logical.0 == 0
+        || logical.1 == 0
+        || logical.0 > i32::MAX as u32
+        || logical.1 > i32::MAX as u32
+    {
+        return Err(SurfaceSizeError::LogicalOutOfRange {
+            width: logical.0,
+            height: logical.1,
+        });
+    }
+    let physical = (f64::from(logical.0) * scale, f64::from(logical.1) * scale);
+    if !physical.0.is_finite()
+        || !physical.1.is_finite()
+        || physical.0.ceil() > f64::from(MAX_SURFACE_DIMENSION)
+        || physical.1.ceil() > f64::from(MAX_SURFACE_DIMENSION)
+    {
+        return Err(SurfaceSizeError::PhysicalOutOfRange {
+            width: physical.0.ceil(),
+            height: physical.1.ceil(),
+        });
+    }
+    Ok((physical.0.ceil() as u32, physical.1.ceil() as u32))
+}
+
 #[derive(Debug)]
 pub struct PanelSurface {
     pub edge: Edge,
-    pub wl_surface: wl_surface::WlSurface,
-    pub layer_surface: LayerSurface,
     pub window: Entity,
     pub camera: Entity,
     pub mount: Entity,
@@ -58,15 +158,12 @@ pub struct PanelSurface {
     pub last_committed: Option<PanelPresentation>,
     pub presented: bool,
     pub frame_pending: bool,
-    raw_handle: RawHandleWrapper,
-    // Kept after unmap so the same protocol role can be replayed. It is
-    // dropped only after renderer extraction has drained during teardown.
-    _raw_owner: RetainedWindow,
-    fractional: Option<FractionalObjects>,
+    wayland: Option<WaylandObjects>,
     output_size: LogicalSize,
     output_scale: i32,
     preferred_fractional_scale: Option<f64>,
     configured_logical_size: Option<(u32, u32)>,
+    announced_scale: Option<f64>,
 }
 
 impl PanelSurface {
@@ -82,18 +179,14 @@ impl PanelSurface {
         fractional: Option<FractionalObjects>,
         retained_mount: Option<Entity>,
     ) -> Result<Self, RawHandleError> {
-        let initial_logical = requested_logical_size(edge, output_size, 1.0);
-        let scale = output_scale.max(1) as f32;
-        let physical = (
-            (initial_logical.0 as f32 * scale).ceil() as u32,
-            (initial_logical.1 as f32 * scale).ceil() as u32,
-        );
         let window = app
             .world_mut()
             .spawn(Window {
                 title: format!("Cosmix Quoin — {edge:?}"),
-                resolution: bevy::window::WindowResolution::new(physical.0, physical.1)
-                    .with_scale_factor_override(scale),
+                // The compositor configure is validated before the real WSI
+                // dimensions are installed.
+                resolution: bevy::window::WindowResolution::new(1, 1)
+                    .with_scale_factor_override(1.0),
                 transparent: true,
                 composite_alpha_mode: CompositeAlphaMode::PreMultiplied,
                 ..default()
@@ -127,11 +220,9 @@ impl PanelSurface {
                 ))
                 .id()
         };
-        let (_raw_owner, raw_handle) = retained_raw_handle(connection.clone(), wl_surface.clone())?;
+        let (_raw_owner, raw_handle) = retained_raw_handle(connection.clone(), wl_surface)?;
         Ok(Self {
             edge,
-            wl_surface,
-            layer_surface,
             window,
             camera,
             mount,
@@ -139,14 +230,61 @@ impl PanelSurface {
             last_committed: None,
             presented: false,
             frame_pending: false,
-            raw_handle,
-            _raw_owner,
-            fractional,
+            wayland: Some(WaylandObjects {
+                fractional,
+                layer_surface,
+                raw_handle,
+                _raw_owner,
+            }),
             output_size,
             output_scale: output_scale.max(1),
             preferred_fractional_scale: None,
             configured_logical_size: None,
+            announced_scale: None,
         })
+    }
+
+    pub(crate) fn install_wayland(
+        &mut self,
+        connection: &Connection,
+        wl_surface: wl_surface::WlSurface,
+        layer_surface: LayerSurface,
+        fractional: Option<FractionalObjects>,
+    ) -> Result<(), RawHandleError> {
+        debug_assert!(self.wayland.is_none());
+        let (_raw_owner, raw_handle) = retained_raw_handle(connection.clone(), wl_surface)?;
+        self.wayland = Some(WaylandObjects {
+            fractional,
+            layer_surface,
+            raw_handle,
+            _raw_owner,
+        });
+        self.preferred_fractional_scale = None;
+        self.announced_scale = None;
+        Ok(())
+    }
+
+    pub(crate) fn has_wayland_objects(&self) -> bool {
+        self.wayland.is_some()
+    }
+
+    pub(crate) fn matches_surface(&self, surface: &wl_surface::WlSurface) -> bool {
+        self.wayland
+            .as_ref()
+            .is_some_and(|objects| objects.layer_surface.wl_surface() == surface)
+    }
+
+    pub(crate) fn matches_layer(&self, layer: &LayerSurface) -> bool {
+        self.wayland
+            .as_ref()
+            .is_some_and(|objects| objects.layer_surface == *layer)
+    }
+
+    pub(crate) fn matches_fractional_scale(&self, scale: &WpFractionalScaleV1) -> bool {
+        self.wayland
+            .as_ref()
+            .and_then(|objects| objects.fractional.as_ref())
+            .is_some_and(|fractional| fractional.scale == *scale)
     }
 
     pub fn mounts(panels: &[Self; 4]) -> QuoinPanelMounts {
@@ -159,39 +297,49 @@ impl PanelSurface {
     }
 
     pub fn apply_protocol_ops(&mut self, operations: &[ProtocolOp]) {
+        if operations.is_empty() {
+            return;
+        }
+        let objects = self
+            .wayland
+            .as_ref()
+            .expect("mapped panel has fresh Wayland objects");
         for operation in operations {
             match *operation {
-                ProtocolOp::SetLayer(layer) => self.layer_surface.set_layer(match layer {
+                ProtocolOp::CreateSurface => {
+                    // Runner creates the objects before replay reaches here.
+                }
+                ProtocolOp::SetLayer(layer) => objects.layer_surface.set_layer(match layer {
                     ProtocolLayer::Top => Layer::Top,
                     ProtocolLayer::Overlay => Layer::Overlay,
                 }),
                 ProtocolOp::SetAnchor(anchor) => {
-                    self.layer_surface.set_anchor(sctk_anchor(anchor));
+                    objects.layer_surface.set_anchor(sctk_anchor(anchor));
                 }
                 ProtocolOp::SetSize { width, height } => {
-                    self.layer_surface.set_size(width, height);
+                    objects.layer_surface.set_size(width, height);
                 }
                 ProtocolOp::SetExclusiveZone(zone) => {
-                    self.layer_surface.set_exclusive_zone(zone);
+                    objects.layer_surface.set_exclusive_zone(zone);
                 }
-                ProtocolOp::SetMargin(margin) => self.layer_surface.set_margin(
+                ProtocolOp::SetMargin(margin) => objects.layer_surface.set_margin(
                     margin.top,
                     margin.right,
                     margin.bottom,
                     margin.left,
                 ),
-                ProtocolOp::SetKeyboardInteractivity(interactivity) => self
+                ProtocolOp::SetKeyboardInteractivity(interactivity) => objects
                     .layer_surface
                     .set_keyboard_interactivity(match interactivity {
                         ProtocolKeyboardInteractivity::None => KeyboardInteractivity::None,
                         ProtocolKeyboardInteractivity::OnDemand => KeyboardInteractivity::OnDemand,
                     }),
                 ProtocolOp::CommitBufferless => {
-                    self.layer_surface.commit();
+                    objects.layer_surface.commit();
                     self.phase = SurfacePhase::WaitingConfigure;
                     self.presented = false;
                 }
-                ProtocolOp::Commit => self.layer_surface.commit(),
+                ProtocolOp::Commit => objects.layer_surface.commit(),
                 ProtocolOp::Unmap => {
                     // Runner performs this split operation around one Bevy drain update.
                 }
@@ -217,28 +365,28 @@ impl PanelSurface {
 
     pub fn finish_unmap(&mut self) {
         if self.phase == SurfacePhase::PreparingUnmap {
-            self.layer_surface.attach(None, 0, 0);
-            self.layer_surface.commit();
+            if let Some(objects) = self.wayland.take() {
+                objects.destroy();
+            }
             self.phase = SurfacePhase::Unmapped;
             self.configured_logical_size = None;
+            self.announced_scale = None;
             self.presented = false;
         }
     }
 
-    pub fn configure<State>(
+    pub(crate) fn configure<State>(
         &mut self,
         app: &mut App,
         qh: &QueueHandle<State>,
         configure: &LayerSurfaceConfigure,
-    ) where
+    ) -> Result<(), SurfaceSizeError>
+    where
         State: wayland_client::Dispatch<
                 wayland_client::protocol::wl_callback::WlCallback,
                 wl_surface::WlSurface,
             > + 'static,
     {
-        if self.phase != SurfacePhase::WaitingConfigure {
-            return;
-        }
         let thickness = self
             .last_committed
             .as_ref()
@@ -256,67 +404,124 @@ impl PanelSurface {
                 configure.new_size.1
             },
         );
+        let effect = configure_effect(self.phase, self.configured_logical_size, logical);
+        if effect == ConfigureEffect::Ignore {
+            return Ok(());
+        }
+        let scale = self.effective_scale();
+        let physical = validate_surface_size(logical, scale)?;
+        let scale_changed = self.announced_scale != Some(scale);
         self.configured_logical_size = Some(logical);
         self.apply_scale_to_surface();
-        self.update_bevy_window(app, logical);
-        app.world_mut()
-            .entity_mut(self.window)
-            .insert(self.raw_handle.clone());
-        if let Some(mut camera) = app.world_mut().get_mut::<Camera>(self.camera) {
-            camera.is_active = true;
+        self.update_bevy_window(app, physical, scale);
+        match effect {
+            ConfigureEffect::InitialMap => {
+                let raw_handle = self
+                    .wayland
+                    .as_ref()
+                    .expect("configured panel has Wayland objects")
+                    .raw_handle
+                    .clone();
+                app.world_mut().entity_mut(self.window).insert(raw_handle);
+                if let Some(mut camera) = app.world_mut().get_mut::<Camera>(self.camera) {
+                    camera.is_active = true;
+                }
+                app.world_mut().write_message(WindowCreated {
+                    window: self.window,
+                });
+                app.world_mut().write_message(WindowResized {
+                    window: self.window,
+                    width: logical.0 as f32,
+                    height: logical.1 as f32,
+                });
+                self.request_frame(qh);
+                self.phase = SurfacePhase::Configured;
+            }
+            ConfigureEffect::Update { size_changed } => {
+                if size_changed {
+                    app.world_mut().write_message(WindowResized {
+                        window: self.window,
+                        width: logical.0 as f32,
+                        height: logical.1 as f32,
+                    });
+                    self.presented = false;
+                    self.request_frame(qh);
+                }
+            }
+            ConfigureEffect::Ignore => unreachable!("ignored configure returned above"),
         }
-        app.world_mut().write_message(WindowCreated {
-            window: self.window,
-        });
-        app.world_mut().write_message(WindowResized {
-            window: self.window,
-            width: logical.0 as f32,
-            height: logical.1 as f32,
-        });
-        app.world_mut().write_message(WindowScaleFactorChanged {
-            window: self.window,
-            scale_factor: self.effective_scale(),
-        });
-        self.request_frame(qh);
-        self.phase = SurfacePhase::Configured;
+        if scale_changed {
+            app.world_mut().write_message(WindowScaleFactorChanged {
+                window: self.window,
+                scale_factor: scale,
+            });
+            self.announced_scale = Some(scale);
+        }
+        Ok(())
     }
 
-    pub fn set_fractional_scale(&mut self, app: &mut App, preferred_scale: u32) {
+    pub(crate) fn set_fractional_scale(
+        &mut self,
+        app: &mut App,
+        preferred_scale: u32,
+    ) -> Result<(), SurfaceSizeError> {
         if preferred_scale == 0 {
-            return;
+            return Ok(());
         }
-        self.preferred_fractional_scale = Some(f64::from(preferred_scale) / 120.0);
+        let scale = f64::from(preferred_scale) / 120.0;
+        let physical = self
+            .configured_logical_size
+            .map(|logical| validate_surface_size(logical, scale))
+            .transpose()?;
+        let scale_changed = self.announced_scale != Some(scale);
+        self.preferred_fractional_scale = Some(scale);
         self.apply_scale_to_surface();
-        if let Some(logical) = self.configured_logical_size {
-            self.update_bevy_window(app, logical);
+        if let (Some(logical), Some(physical)) = (self.configured_logical_size, physical) {
+            self.update_bevy_window(app, physical, scale);
             app.world_mut().write_message(WindowResized {
                 window: self.window,
                 width: logical.0 as f32,
                 height: logical.1 as f32,
             });
-            app.world_mut().write_message(WindowScaleFactorChanged {
-                window: self.window,
-                scale_factor: self.effective_scale(),
-            });
+            if scale_changed {
+                app.world_mut().write_message(WindowScaleFactorChanged {
+                    window: self.window,
+                    scale_factor: scale,
+                });
+                self.announced_scale = Some(scale);
+            }
         }
+        Ok(())
     }
 
-    pub fn update_output_metrics(
+    pub(crate) fn update_output_metrics(
         &mut self,
         app: &mut App,
         logical_size: LogicalSize,
         integer_scale: i32,
-    ) {
+    ) -> Result<(), SurfaceSizeError> {
+        let scale = self
+            .preferred_fractional_scale
+            .unwrap_or(f64::from(integer_scale.max(1)));
+        let physical = self
+            .configured_logical_size
+            .map(|logical| validate_surface_size(logical, scale))
+            .transpose()?;
+        let scale_changed = self.announced_scale != Some(scale);
         self.output_size = logical_size;
         self.output_scale = integer_scale.max(1);
         self.apply_scale_to_surface();
-        if let Some(logical) = self.configured_logical_size {
-            self.update_bevy_window(app, logical);
-            app.world_mut().write_message(WindowScaleFactorChanged {
-                window: self.window,
-                scale_factor: self.effective_scale(),
-            });
+        if let (Some(_), Some(physical)) = (self.configured_logical_size, physical) {
+            self.update_bevy_window(app, physical, scale);
+            if scale_changed {
+                app.world_mut().write_message(WindowScaleFactorChanged {
+                    window: self.window,
+                    scale_factor: scale,
+                });
+                self.announced_scale = Some(scale);
+            }
         }
+        Ok(())
     }
 
     pub fn request_frame<State>(&mut self, qh: &QueueHandle<State>)
@@ -329,13 +534,23 @@ impl PanelSurface {
         if (self.phase == SurfacePhase::Configured || self.phase == SurfacePhase::WaitingConfigure)
             && !self.frame_pending
         {
-            self.wl_surface.frame(qh, self.wl_surface.clone());
+            let surface = self
+                .wayland
+                .as_ref()
+                .expect("mapped panel has Wayland objects")
+                .layer_surface
+                .wl_surface();
+            surface.frame(qh, surface.clone());
             self.frame_pending = true;
         }
     }
 
     pub fn commit_frame_request(&self) {
-        self.layer_surface.commit();
+        self.wayland
+            .as_ref()
+            .expect("mapped panel has Wayland objects")
+            .layer_surface
+            .commit();
     }
 
     pub fn frame_done(&mut self) {
@@ -379,30 +594,31 @@ impl PanelSurface {
     }
 
     fn apply_scale_to_surface(&self) {
+        let Some(objects) = &self.wayland else {
+            return;
+        };
+        let wl_surface = objects.layer_surface.wl_surface();
         if self.preferred_fractional_scale.is_some() {
-            if self.wl_surface.version() >= 3 {
-                self.wl_surface.set_buffer_scale(1);
+            if wl_surface.version() >= 3 {
+                wl_surface.set_buffer_scale(1);
             }
             if let (Some(fractional), Some((width, height))) =
-                (&self.fractional, self.configured_logical_size)
+                (&objects.fractional, self.configured_logical_size)
             {
                 fractional
                     .viewport
                     .set_destination(width as i32, height as i32);
             }
-        } else if self.wl_surface.version() >= 3 {
-            self.wl_surface.set_buffer_scale(self.output_scale);
+        } else if wl_surface.version() >= 3 {
+            wl_surface.set_buffer_scale(self.output_scale);
         }
     }
 
-    fn update_bevy_window(&self, app: &mut App, logical: (u32, u32)) {
-        let scale = self.effective_scale() as f32;
-        let physical = (
-            (logical.0 as f32 * scale).ceil().max(1.0) as u32,
-            (logical.1 as f32 * scale).ceil().max(1.0) as u32,
-        );
+    fn update_bevy_window(&self, app: &mut App, physical: (u32, u32), scale: f64) {
         if let Some(mut window) = app.world_mut().get_mut::<Window>(self.window) {
-            window.resolution.set_scale_factor_override(Some(scale));
+            window
+                .resolution
+                .set_scale_factor_override(Some(scale as f32));
             window
                 .resolution
                 .set_physical_resolution(physical.0, physical.1);
@@ -433,4 +649,55 @@ fn sctk_anchor(anchor: ProtocolAnchor) -> Anchor {
         value |= Anchor::LEFT;
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configure_phase_table_applies_only_to_live_mapped_roles() {
+        let previous = Some((1920, 32));
+        let resized = (1280, 32);
+        let cases = [
+            (SurfacePhase::Unmapped, ConfigureEffect::Ignore),
+            (SurfacePhase::WaitingConfigure, ConfigureEffect::InitialMap),
+            (
+                SurfacePhase::Configured,
+                ConfigureEffect::Update { size_changed: true },
+            ),
+            (SurfacePhase::PreparingUnmap, ConfigureEffect::Ignore),
+            (SurfacePhase::Closed, ConfigureEffect::Ignore),
+        ];
+        for (phase, expected) in cases {
+            assert_eq!(
+                configure_effect(phase, previous, resized),
+                expected,
+                "{phase:?}"
+            );
+        }
+        assert_eq!(
+            configure_effect(SurfacePhase::Configured, previous, (1920, 32)),
+            ConfigureEffect::Update {
+                size_changed: false
+            }
+        );
+    }
+
+    #[test]
+    fn configure_size_validator_rejects_protocol_and_gpu_overflow() {
+        assert_eq!(validate_surface_size((1280, 32), 1.25), Ok((1600, 40)));
+        assert!(matches!(
+            validate_surface_size((u32::MAX, 32), 1.0),
+            Err(SurfaceSizeError::LogicalOutOfRange { .. })
+        ));
+        assert!(matches!(
+            validate_surface_size((8193, 32), 2.0),
+            Err(SurfaceSizeError::PhysicalOutOfRange { .. })
+        ));
+        assert!(matches!(
+            validate_surface_size((32, 32), f64::INFINITY),
+            Err(SurfaceSizeError::InvalidScale(_))
+        ));
+    }
 }
