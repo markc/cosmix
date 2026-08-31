@@ -18,12 +18,40 @@ use smithay::{
 };
 
 use super::{
-    ChromePointerGrabKind, InteractivePointer, LayerOutputBinding, SceneDecorationMode, StackBand,
-    SurfaceId, SurfaceRecord, SurfaceRole, WaylandState, surface_stack_cmp,
+    ChromePointerGrabKind, InteractivePointer, LayerOutputBinding, LockLifecycle,
+    LogicalOutputRect, SceneDecorationMode, StackBand, SurfaceId, SurfaceRecord, SurfaceRole,
+    WaylandState, surface_stack_cmp,
 };
 
 pub(crate) const BROKER_RETRYING: u8 = 0;
 pub(crate) const BROKER_CONNECTED: u8 = 1;
+
+/// Space reserved inside `cosmix_bus::bus::MAX_MESSAGE_BYTES` for Bus framing and
+/// response headers (`command`, `from`, `to`, `type`, `rc`, and correlation
+/// `id`). Property bodies at or below the resulting limit cannot consume the
+/// transport's entire message allowance.
+const REPLY_WIRE_HEADROOM_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_REPLY_BODY_BYTES: usize =
+    cosmix_bus::bus::MAX_MESSAGE_BYTES - REPLY_WIRE_HEADROOM_BYTES;
+
+pub(super) fn exact_i32_to_f32(value: i32) -> Option<f32> {
+    let converted = value as f32;
+    (f64::from(converted) == f64::from(value)).then_some(converted)
+}
+
+pub(super) fn exact_logical_output_rect(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Option<LogicalOutputRect> {
+    Some(LogicalOutputRect {
+        x: exact_i32_to_f32(x)?,
+        y: exact_i32_to_f32(y)?,
+        width: exact_i32_to_f32(width)?,
+        height: exact_i32_to_f32(height)?,
+    })
+}
 
 #[derive(Debug)]
 pub(crate) struct SnapshotContext {
@@ -51,7 +79,13 @@ pub(crate) struct CompSnapshot {
     pub(crate) bindings: BindingsSnapshot,
     pub(crate) port: PortSnapshot,
     #[serde(skip)]
-    full_tree: tokio::sync::OnceCell<Arc<str>>,
+    full_tree: tokio::sync::OnceCell<SerialisedReply>,
+}
+
+#[derive(Clone, Debug)]
+struct SerialisedReply {
+    body: Arc<str>,
+    bytes: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -140,6 +174,7 @@ pub(crate) struct FocusSnapshot {
     pub(crate) exclusive_latch: Option<u64>,
     pub(crate) pointer: Option<u64>,
     pub(crate) pointer_grab: &'static str,
+    pub(crate) session_lock: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -344,6 +379,7 @@ flat_snapshot!(
     exclusive_latch,
     pointer,
     pointer_grab,
+    session_lock,
 );
 flat_snapshot!(DecorationSnapshot, enabled, style);
 flat_snapshot!(BindingsSnapshot, enabled, profile, table);
@@ -447,6 +483,10 @@ impl SurfaceSnapshot {
 
 /// Build one fully owned snapshot on the protocol thread.
 pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Option<CompSnapshot> {
+    // This is the same authority boundary used by foreign-toplevel
+    // publication (`session_lock_active`) and renderer selection
+    // (`surface_is_session_presentable`). Do not derive it from visibility.
+    let session_lock_active = state.session_lock_active();
     let sources = state.backend.port_outputs();
     let mut output_keys = Vec::<(Output, String)>::with_capacity(sources.len());
     let mut outputs = BTreeMap::<String, OutputSnapshot>::new();
@@ -486,6 +526,8 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         .values()
         .filter(|record| !matches!(record.role, SurfaceRole::Dormant(_)))
     {
+        let redact_ordinary_surface =
+            session_lock_active && !state.surface_is_session_presentable(record);
         let output = surface_output(state, record, default_output.as_ref())
             .and_then(|output| output_key_for(&output_keys, output));
         let layer = match &record.role {
@@ -507,7 +549,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
                 id: record.id.0,
                 role: record.role.kind(),
                 mapped: record.mapped,
-                visible: record.layout.visible,
+                visible: record.layout.visible && !redact_ordinary_surface,
                 x: record.layout.x,
                 y: record.layout.y,
                 width: record.layout.width,
@@ -517,8 +559,12 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
                 tree_index: record.layout.z.tree_index,
                 parent: record.layout.parent.map(|id| id.0),
                 output,
-                title: record.title.clone(),
-                app_id: record.app_id.clone(),
+                title: (!redact_ordinary_surface)
+                    .then(|| record.title.clone())
+                    .flatten(),
+                app_id: (!redact_ordinary_surface)
+                    .then(|| record.app_id.clone())
+                    .flatten(),
                 focused: record.focused,
                 activated: record.focused,
                 maximized: record.committed_maximized,
@@ -533,29 +579,33 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         );
     }
 
-    let windows = surfaces
-        .iter()
-        .filter(|(_, surface)| surface.role == "toplevel" && surface.mapped)
-        .map(|(key, surface)| {
-            (
-                key.clone(),
-                WindowSnapshot {
-                    id: surface.id,
-                    foreign_id: surface.foreign_id.clone(),
-                    title: surface.title.clone(),
-                    app_id: surface.app_id.clone(),
-                    x: surface.x,
-                    y: surface.y,
-                    width: surface.width,
-                    height: surface.height,
-                    focused: surface.focused,
-                    maximized: surface.maximized,
-                    minimized: surface.minimized,
-                    output: surface.output.clone(),
-                },
-            )
-        })
-        .collect();
+    let windows = if session_lock_active {
+        BTreeMap::new()
+    } else {
+        surfaces
+            .iter()
+            .filter(|(_, surface)| surface.role == "toplevel" && surface.mapped)
+            .map(|(key, surface)| {
+                (
+                    key.clone(),
+                    WindowSnapshot {
+                        id: surface.id,
+                        foreign_id: surface.foreign_id.clone(),
+                        title: surface.title.clone(),
+                        app_id: surface.app_id.clone(),
+                        x: surface.x,
+                        y: surface.y,
+                        width: surface.width,
+                        height: surface.height,
+                        focused: surface.focused,
+                        maximized: surface.maximized,
+                        minimized: surface.minimized,
+                        output: surface.output.clone(),
+                    },
+                )
+            })
+            .collect()
+    };
 
     let mut roots = state
         .surfaces
@@ -601,6 +651,12 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
                 .and_then(|surface| state.surfaces.get(&surface.id()))
                 .map(|record| record.id.0),
             pointer_grab: pointer_grab_name(state),
+            session_lock: match &state.lock_lifecycle {
+                LockLifecycle::Unlocked => "none",
+                LockLifecycle::Locking { .. } => "locking",
+                LockLifecycle::Locked { .. } => "locked",
+                LockLifecycle::OrphanedLocked { .. } => "orphaned",
+            },
         },
         decoration: DecorationSnapshot {
             enabled: context.decoration_enabled,
@@ -1122,6 +1178,7 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         format = "surface_id"
     ),
     descriptor!(&[L("focus"), L("pointer_grab")], String, "Active pointer grab kind", enum = &["none", "chrome", "move", "resize", "popup"]),
+    descriptor!(&[L("focus"), L("session_lock")], String, "Session-lock observation state", enum = &["none", "locking", "locked", "orphaned"]),
     descriptor!(
         &[L("decoration"), L("enabled")],
         Bool,
@@ -1242,22 +1299,34 @@ pub(crate) async fn dispatch_read(
     command: String,
     args: Value,
 ) -> (u8, Arc<str>) {
+    dispatch_read_with_limit(snapshot, command, args, MAX_REPLY_BODY_BYTES).await
+}
+
+async fn dispatch_read_with_limit(
+    snapshot: Arc<CompSnapshot>,
+    command: String,
+    args: Value,
+    limit_bytes: usize,
+) -> (u8, Arc<str>) {
     if command == "comp.info" {
-        return (
-            0,
-            Arc::from(
-                json!({
-                    "service": snapshot.info.service,
-                    "version": snapshot.info.version,
-                    "backend": snapshot.info.backend,
-                    "engine": snapshot.info.engine,
-                    "output_count": snapshot.outputs.len(),
-                    "surface_count": snapshot.surfaces.len(),
-                    "event_seq": snapshot.port.event_seq,
-                    "lost_count": snapshot.port.lost_count,
-                })
-                .to_string(),
+        return enforce_reply_limit(
+            (
+                0,
+                Arc::from(
+                    json!({
+                        "service": snapshot.info.service,
+                        "version": snapshot.info.version,
+                        "backend": snapshot.info.backend,
+                        "engine": snapshot.info.engine,
+                        "output_count": snapshot.outputs.len(),
+                        "surface_count": snapshot.surfaces.len(),
+                        "event_seq": snapshot.port.event_seq,
+                        "lost_count": snapshot.port.lost_count,
+                    })
+                    .to_string(),
+                ),
             ),
+            limit_bytes,
         );
     }
     if !matches!(
@@ -1269,20 +1338,23 @@ pub(crate) async fn dispatch_read(
     if command == "comp.props.get" {
         match optional_path(&args, "path") {
             Ok(None) => {
-                return full_tree(snapshot)
-                    .await
-                    .map_or_else(|()| error("busy"), |body| (0, body));
+                return full_tree(snapshot).await.map_or_else(
+                    |()| error("busy"),
+                    |reply| enforce_measured_reply_limit(reply, limit_bytes),
+                );
             }
             Ok(Some(_)) => {}
             Err(()) => return error("unknown_path"),
         }
     }
-    tokio::task::spawn_blocking(move || dispatch_selected_read(&snapshot, &command, &args))
-        .await
-        .unwrap_or_else(|_| error("busy"))
+    let reply =
+        tokio::task::spawn_blocking(move || dispatch_selected_read(&snapshot, &command, &args))
+            .await
+            .unwrap_or_else(|_| error("busy"));
+    enforce_reply_limit(reply, limit_bytes)
 }
 
-async fn full_tree(snapshot: Arc<CompSnapshot>) -> Result<Arc<str>, ()> {
+async fn full_tree(snapshot: Arc<CompSnapshot>) -> Result<SerialisedReply, ()> {
     static SERIALISATION_PERMIT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let snapshot_for_initialiser = Arc::clone(&snapshot);
     snapshot
@@ -1297,15 +1369,53 @@ async fn full_tree(snapshot: Arc<CompSnapshot>) -> Result<Arc<str>, ()> {
             let body = tokio::task::spawn_blocking(move || {
                 let _serialisation_permit = serialisation_permit;
                 serde_json::to_string(snapshot_for_initialiser.as_ref())
-                    .map(Arc::<str>::from)
+                    .map(|body| {
+                        let bytes = body.len();
+                        SerialisedReply {
+                            body: Arc::from(body),
+                            bytes,
+                        }
+                    })
                     .map_err(|_| ())
             })
             .await
-            .map_err(|_| ())??;
+            .map_err(|error| {
+                tracing::error!(%error, "compositor Bus full-tree serialiser task failed");
+            })??;
             Ok(body)
         })
         .await
-        .map(Arc::clone)
+        .cloned()
+}
+
+fn enforce_reply_limit((rc, body): (u8, Arc<str>), limit_bytes: usize) -> (u8, Arc<str>) {
+    if rc == 0 && body.len() > limit_bytes {
+        too_large(limit_bytes)
+    } else {
+        (rc, body)
+    }
+}
+
+fn enforce_measured_reply_limit(reply: SerialisedReply, limit_bytes: usize) -> (u8, Arc<str>) {
+    if reply.bytes > limit_bytes {
+        too_large(limit_bytes)
+    } else {
+        (0, reply.body)
+    }
+}
+
+fn too_large(limit_bytes: usize) -> (u8, Arc<str>) {
+    (
+        10,
+        Arc::from(
+            json!({
+                "error": "too_large",
+                "limit_bytes": limit_bytes,
+                "hint": "read a subtree",
+            })
+            .to_string(),
+        ),
+    )
 }
 
 fn dispatch_selected_read(snapshot: &CompSnapshot, command: &str, args: &Value) -> (u8, Arc<str>) {
@@ -1573,7 +1683,7 @@ mod tests {
         CompSnapshot {
             info: InfoSnapshot {
                 service: Arc::from("comp-nested"),
-                version: Arc::from("0.33.1"),
+                version: Arc::from("0.33.2"),
                 backend: "nested",
                 engine: "bevy-0.19/wgpu",
                 instance: Arc::from("fixture"),
@@ -1587,6 +1697,7 @@ mod tests {
                 exclusive_latch: Some(1),
                 pointer: Some(2),
                 pointer_grab: "none",
+                session_lock: "none",
             },
             decoration: DecorationSnapshot {
                 enabled: true,
@@ -1783,5 +1894,56 @@ mod tests {
         .await;
         assert_eq!(rc, 0);
         assert_eq!(selected.as_ref(), "\"comp-nested\"");
+    }
+
+    #[tokio::test]
+    async fn oversized_full_tree_returns_too_large_while_leaf_read_succeeds() {
+        let mut snapshot = fixture();
+        let template = snapshot
+            .surfaces
+            .get("s2")
+            .cloned()
+            .expect("fixture toplevel");
+        for id in 100_u64..140 {
+            let mut surface = template.clone();
+            surface.id = id;
+            snapshot.surfaces.insert(format!("s{id}"), surface);
+        }
+        let snapshot = Arc::new(snapshot);
+        let injected_limit = 1_024;
+
+        let (rc, body) = dispatch_read_with_limit(
+            Arc::clone(&snapshot),
+            "comp.props.get".into(),
+            Value::Null,
+            injected_limit,
+        )
+        .await;
+        assert_eq!(rc, 10);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("too_large JSON"),
+            json!({
+                "error": "too_large",
+                "limit_bytes": injected_limit,
+                "hint": "read a subtree",
+            })
+        );
+        assert!(
+            snapshot
+                .full_tree
+                .get()
+                .is_some_and(|reply| reply.bytes > injected_limit),
+            "cached full-tree bytes are measured once"
+        );
+
+        let (rc, leaf) = dispatch_read_with_limit(
+            snapshot,
+            "comp.props.get".into(),
+            json!({"path": "info.service"}),
+            injected_limit,
+        )
+        .await;
+        assert_eq!(rc, 0);
+        assert_eq!(leaf.as_ref(), "\"comp-nested\"");
     }
 }

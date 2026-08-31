@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-comp"
-version = "0.33.1"
+version = "0.33.2"
 description = "Smithay protocol frontend with Bevy rendering for the CosMix desktop"
 edition = "2024"
 rust-version = "1.95"
@@ -10,6 +10,7 @@ license = "MIT"
 default = ["bus", "frame-capture"]
 bus = [
     "dep:cosmix-buildinfo",
+    "dep:cosmix-bus",
     "dep:cosmix-client",
     "dep:cosmix-config",
     "dep:cosmix-props-core",
@@ -52,6 +53,7 @@ bevy = { version = "=0.19.0", default-features = false, features = [
 cosmix-deco = { path = "../cosmix-deco" }
 cosmix-wgpu-dmabuf = { path = "../cosmix-wgpu-dmabuf" }
 cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo", optional = true }
+cosmix-bus = { package = "cosmix-lib-bus", path = "../../../crates/cosmix-lib-bus", default-features = false, optional = true }
 cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client", optional = true }
 cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config", features = ["client-helpers"], optional = true }
 cosmix-props-core = { package = "cosmix-lib-props-core", path = "../../../crates/cosmix-lib-props-core", optional = true }

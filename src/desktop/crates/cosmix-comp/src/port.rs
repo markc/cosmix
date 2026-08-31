@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use cosmix_client::{ConnState, NameCollision, SupervisedClient, SupervisedError};
+use cosmix_client::{ConnState, SupervisedClient, SupervisedError};
 use serde_json::Value;
 use smithay::reexports::calloop::channel;
 use tokio::{
@@ -26,11 +26,14 @@ use port_snapshot::{
     BROKER_CONNECTED, BROKER_RETRYING, CompSnapshot, SnapshotContext, dispatch_read, error,
 };
 
-const PORT_QUEUE_CAPACITY: usize = 16;
+pub(crate) const PORT_QUEUE_CAPACITY: usize = 16;
 const PORT_REPLY_CAPACITY: usize = 16;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 const REPLY_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const PORT_SHUTDOWN_GRACE: Duration = Duration::from_millis(300);
+const CLIENT_SHUTDOWN_BUDGET: Duration = Duration::from_millis(250);
+const DEREGISTER_BUDGET: Duration = Duration::from_millis(200);
+const CLOSE_BUDGET: Duration = Duration::from_millis(50);
 
 pub(crate) enum PortCommand {
     Snapshot(PortRequest),
@@ -207,7 +210,9 @@ impl PortStarter {
                         let service = connect_service.clone();
                         let url = connect_url.clone();
                         async move {
-                            SupervisedClient::connect_supervised(&service, &url)
+                            SupervisedClient::connect_options(&service, &url)
+                                .fatal_on_registration_rejection(true)
+                                .connect()
                                 .await
                                 .map_err(|error| classify_connect_error(&service, error))
                         }
@@ -275,12 +280,20 @@ impl Drop for QueueDepthGuard {
 #[derive(Debug)]
 enum ConnectAttemptError {
     Retry(String),
-    NameCollision(String),
+    RegistrationRejected {
+        service: String,
+        rc: u8,
+        message: String,
+    },
 }
 
 enum ConnectOutcome<C> {
     Connected(C),
-    Collision(String),
+    RegistrationRejected {
+        service: String,
+        rc: u8,
+        message: String,
+    },
     Shutdown,
 }
 
@@ -308,8 +321,16 @@ where
         };
         match result {
             Ok(client) => return ConnectOutcome::Connected(client),
-            Err(ConnectAttemptError::NameCollision(service)) => {
-                return ConnectOutcome::Collision(service);
+            Err(ConnectAttemptError::RegistrationRejected {
+                service,
+                rc,
+                message,
+            }) => {
+                return ConnectOutcome::RegistrationRejected {
+                    service,
+                    rc,
+                    message,
+                };
             }
             Err(ConnectAttemptError::Retry(message)) => {
                 tracing::debug!(attempt, error = %message, "compositor Bus connect failed; retrying");
@@ -337,7 +358,8 @@ trait WorkerClient: Send + Sync + 'static {
     fn subscribe_state(&self) -> watch::Receiver<ConnState>;
     fn respond_parts<'a>(&'a self, reply: &'a PendingReply)
     -> WorkerFuture<'a, Result<(), String>>;
-    fn shutdown(&self) -> WorkerFuture<'_, ()>;
+    fn deregister(&self) -> WorkerFuture<'_, Result<(), String>>;
+    fn close(&self) -> WorkerFuture<'_, ()>;
 }
 
 impl WorkerClient for SupervisedClient {
@@ -370,8 +392,16 @@ impl WorkerClient for SupervisedClient {
         })
     }
 
-    fn shutdown(&self) -> WorkerFuture<'_, ()> {
-        Box::pin(SupervisedClient::shutdown(self))
+    fn deregister(&self) -> WorkerFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            SupervisedClient::deregister(self)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn close(&self) -> WorkerFuture<'_, ()> {
+        Box::pin(SupervisedClient::close(self))
     }
 }
 
@@ -410,8 +440,12 @@ async fn worker_loop<F, Fut, C>(
     let outcome = connect_loop(&mut shutdown, &broker, connector, Duration::ZERO).await;
     let client = match outcome {
         ConnectOutcome::Connected(client) => Arc::new(client),
-        ConnectOutcome::Collision(collided) => {
-            tracing::error!(service = %collided, "Bus service name is already registered; compositor continues without a port");
+        ConnectOutcome::RegistrationRejected {
+            service,
+            rc,
+            message,
+        } => {
+            tracing::error!(service = %service, rc, %message, "Bus registration rejected; compositor continues without a port");
             return;
         }
         ConnectOutcome::Shutdown => return,
@@ -445,7 +479,7 @@ async fn worker_loop<F, Fut, C>(
                 let state = *states.borrow_and_update();
                 apply_connection_state(&broker, state);
                 if state == ConnState::Fatal {
-                    tracing::error!(service = %service, "Bus service name collided during reconnect; compositor continues without a port");
+                    tracing::error!(service = %service, "Bus registration rejected during reconnect; compositor continues without a port");
                     break;
                 }
             }
@@ -454,7 +488,7 @@ async fn worker_loop<F, Fut, C>(
                     let state = client.state();
                     apply_connection_state(&broker, state);
                     if state == ConnState::Fatal {
-                        tracing::error!(service = %service, "Bus service name collided during reconnect; compositor continues without a port");
+                        tracing::error!(service = %service, "Bus registration rejected during reconnect; compositor continues without a port");
                     }
                     break;
                 };
@@ -480,16 +514,41 @@ async fn worker_loop<F, Fut, C>(
     drop(reply_sender);
     reply_task.abort();
     let _ = reply_task.await;
-    let _ = tokio::time::timeout(Duration::from_millis(250), client.shutdown()).await;
+    graceful_client_shutdown(client.as_ref()).await;
 }
 
 fn classify_connect_error(service: &str, error: SupervisedError) -> ConnectAttemptError {
-    if let SupervisedError::InitialConnectFailed { source, .. } = &error
-        && source.downcast_ref::<NameCollision>().is_some()
-    {
-        ConnectAttemptError::NameCollision(service.to_string())
+    if let Some((rc, message)) = error.registration_rejection() {
+        ConnectAttemptError::RegistrationRejected {
+            service: service.to_string(),
+            rc,
+            message: message.to_string(),
+        }
     } else {
         ConnectAttemptError::Retry(error.to_string())
+    }
+}
+
+async fn graceful_client_shutdown<C: WorkerClient>(client: &C) {
+    debug_assert_eq!(CLIENT_SHUTDOWN_BUDGET, DEREGISTER_BUDGET + CLOSE_BUDGET);
+    match tokio::time::timeout(DEREGISTER_BUDGET, client.deregister()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "compositor Bus deregister did not complete cleanly")
+        }
+        Err(_) => tracing::debug!(
+            timeout_ms = DEREGISTER_BUDGET.as_millis(),
+            "compositor Bus deregister timed out"
+        ),
+    }
+    if tokio::time::timeout(CLOSE_BUDGET, client.close())
+        .await
+        .is_err()
+    {
+        tracing::debug!(
+            timeout_ms = CLOSE_BUDGET.as_millis(),
+            "compositor Bus close timed out"
+        );
     }
 }
 
@@ -655,13 +714,20 @@ pub(crate) fn validate_service_name(name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::BTreeMap, future, sync::atomic::AtomicUsize};
+    use std::{
+        collections::BTreeMap,
+        future,
+        sync::atomic::{AtomicBool, AtomicUsize},
+    };
 
     struct FakeClient {
         incoming: Mutex<Option<tokio_mpsc::UnboundedReceiver<cosmix_client::IncomingCommand>>>,
         states: watch::Sender<ConnState>,
         hang_replies: bool,
         responses_started: Arc<AtomicUsize>,
+        deregister_hangs: Arc<AtomicBool>,
+        deregistered: Arc<AtomicUsize>,
+        closed: Arc<AtomicUsize>,
     }
 
     impl FakeClient {
@@ -681,6 +747,9 @@ mod tests {
                     states: states.clone(),
                     hang_replies,
                     responses_started: Arc::new(AtomicUsize::new(0)),
+                    deregister_hangs: Arc::new(AtomicBool::new(false)),
+                    deregistered: Arc::new(AtomicUsize::new(0)),
+                    closed: Arc::new(AtomicUsize::new(0)),
                 },
                 commands,
                 states,
@@ -718,7 +787,17 @@ mod tests {
             }
         }
 
-        fn shutdown(&self) -> WorkerFuture<'_, ()> {
+        fn deregister(&self) -> WorkerFuture<'_, Result<(), String>> {
+            self.deregistered.fetch_add(1, Ordering::AcqRel);
+            if self.deregister_hangs.load(Ordering::Acquire) {
+                Box::pin(future::pending())
+            } else {
+                Box::pin(future::ready(Ok(())))
+            }
+        }
+
+        fn close(&self) -> WorkerFuture<'_, ()> {
+            self.closed.fetch_add(1, Ordering::AcqRel);
             Box::pin(future::ready(()))
         }
     }
@@ -871,7 +950,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_worker_loop_terminates_on_typed_collision_without_renaming() {
+    async fn complete_worker_loop_terminates_on_registration_rejection_without_renaming() {
         let (ingress, _source, _) = test_ingress();
         let broker = Arc::new(AtomicU8::new(BROKER_CONNECTED));
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -885,9 +964,13 @@ mod tests {
             shutdown,
             move || {
                 attempts_for_connector.fetch_add(1, Ordering::Relaxed);
-                future::ready(Err::<FakeClient, _>(ConnectAttemptError::NameCollision(
-                    "comp-nested".into(),
-                )))
+                future::ready(Err::<FakeClient, _>(
+                    ConnectAttemptError::RegistrationRejected {
+                        service: "comp-nested".into(),
+                        rc: 10,
+                        message: "registration refused".into(),
+                    },
+                ))
             },
         )
         .await;
@@ -1085,5 +1168,34 @@ mod tests {
         assert_eq!(reply_timeouts.load(Ordering::Acquire), 1);
         drop(sender);
         task.await.expect("reply sender exits");
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_deregisters_then_closes_when_broker_answers() {
+        let (client, _commands, _states) = FakeClient::new(ConnState::Connected, false);
+        let deregistered = Arc::clone(&client.deregistered);
+        let closed = Arc::clone(&client.closed);
+
+        graceful_client_shutdown(&client).await;
+
+        assert_eq!(deregistered.load(Ordering::Acquire), 1);
+        assert_eq!(closed.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn graceful_shutdown_closes_within_budget_when_deregister_hangs() {
+        let (client, _commands, _states) = FakeClient::new(ConnState::Connected, false);
+        client.deregister_hangs.store(true, Ordering::Release);
+        let deregistered = Arc::clone(&client.deregistered);
+        let closed = Arc::clone(&client.closed);
+        let shutdown = tokio::spawn(async move {
+            graceful_client_shutdown(&client).await;
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(CLIENT_SHUTDOWN_BUDGET).await;
+
+        shutdown.await.expect("bounded shutdown completes");
+        assert_eq!(deregistered.load(Ordering::Acquire), 1);
+        assert_eq!(closed.load(Ordering::Acquire), 1);
     }
 }

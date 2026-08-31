@@ -132,22 +132,18 @@ pub struct NodedClient {
     provenance: Option<cosmix_bus::RegisterProvenance>,
 }
 
-/// The requested Bus service name is already owned by another connection.
+/// Compatibility type retained for consumers compiled against 0.4.0.
 ///
-/// `cosmix-noded` reports this as the sole application error from
-/// `noded.register`. Keeping it as a concrete error in the `anyhow` source
-/// chain lets resident clients treat a collision as terminal without parsing
-/// the broker's diagnostic text.
+/// Current brokers do not expose a machine-readable registration rejection
+/// reason: collisions and admission refusals both use `rc=10` plus diagnostic
+/// text. New code therefore receives [`RegistrationRejected`] and must not
+/// infer a collision by matching that text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameCollision {
     service: String,
 }
 
 impl NameCollision {
-    fn new(service: String) -> Self {
-        Self { service }
-    }
-
     /// The service name whose registration was rejected.
     pub fn service(&self) -> &str {
         &self.service
@@ -165,6 +161,30 @@ impl std::fmt::Display for NameCollision {
 }
 
 impl std::error::Error for NameCollision {}
+
+/// A broker application-level refusal of `noded.register`.
+///
+/// This deliberately preserves only the machine-readable return code and the
+/// broker's diagnostic message. It does not claim that the refusal was a name
+/// collision: current `cosmix-noded` replies do not distinguish collision from
+/// admission policy with a separate code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrationRejected {
+    pub rc: u8,
+    pub message: String,
+}
+
+impl std::fmt::Display for RegistrationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Bus registration rejected with rc {}: {}",
+            self.rc, self.message
+        )
+    }
+}
+
+impl std::error::Error for RegistrationRejected {}
 
 impl NodedClient {
     /// Connect to the broker at the given URL and register as a named service.
@@ -706,6 +726,13 @@ impl NodedClient {
         self.connected.load(Ordering::Relaxed)
     }
 
+    /// Inspect an error returned by a connect/register operation without
+    /// guessing at the broker's diagnostic text.
+    pub fn registration_rejection(error: &anyhow::Error) -> Option<(u8, &str)> {
+        let rejection = error.downcast_ref::<RegistrationRejected>()?;
+        Some((rejection.rc, rejection.message.as_str()))
+    }
+
     // ── Internal ──
 
     async fn register(&self) -> Result<()> {
@@ -718,11 +745,12 @@ impl NodedClient {
         };
         match self.call_typed("noded", "noded.register", body).await? {
             cosmix_bus::PortReply::Ok { .. } => Ok(()),
-            // `noded.register` has one application rejection: the requested
-            // service name is already owned. Classify the typed AppError at
-            // this command boundary; do not couple lifecycle decisions to the
-            // broker's human-readable diagnostic text.
-            cosmix_bus::PortReply::AppError { .. } => Err(NameCollision::new(self.name()).into()),
+            // Collision and admission refusal currently share rc=10 and only
+            // differ in human diagnostic text. Preserve what the broker
+            // actually supplied; never string-match it into NameCollision.
+            cosmix_bus::PortReply::AppError { rc, message } => {
+                Err(RegistrationRejected { rc, message }.into())
+            }
         }
     }
 
@@ -767,6 +795,13 @@ impl NodedClient {
         // a concurrent observer never reads a closing connection as
         // live.
         self.connected.store(false, Ordering::Relaxed);
+        // Abort the detached reader before awaiting any network I/O. Even if a
+        // bounded caller abandons close while the WebSocket sink is wedged,
+        // the read half can no longer retain the socket and registered name by
+        // itself.
+        if let Some(h) = self.reader_handle.lock().await.take() {
+            h.abort();
+        }
         // Best-effort graceful WS close so the broker observes the
         // disconnect and reaps the registered name immediately rather
         // than on a later TCP error/timeout.
@@ -774,12 +809,6 @@ impl NodedClient {
             let mut sink = self.sink.lock().await;
             let _ = sink.send(Message::Close(None)).await;
             let _ = sink.close().await;
-        }
-        // Abort the detached reader — it owns the read half; without
-        // this the socket stays half-open until the next inbound
-        // frame and the reader task lingers.
-        if let Some(h) = self.reader_handle.lock().await.take() {
-            h.abort();
         }
         // The reader's normal exit drains `pending`; on abort that
         // never runs, so do it here — any parked caller gets a

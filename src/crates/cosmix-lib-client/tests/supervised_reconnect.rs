@@ -477,7 +477,7 @@ async fn initial_connect_failure_is_typed_fatal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn registration_collision_preserves_typed_cause() {
+async fn registration_rejection_preserves_rc_and_message_without_claiming_collision() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let stub = Stub::new(false, false);
@@ -491,10 +491,14 @@ async fn registration_collision_preserves_typed_cause() {
         Ok(_) => panic!("duplicate registration must fail"),
         Err(error) => error,
     };
-    let collision = error
-        .downcast_ref::<NameCollision>()
-        .expect("registration error keeps a typed NameCollision cause");
-    assert_eq!(collision.service(), "taken-service");
+    let (rc, message) = NodedClient::registration_rejection(&error)
+        .expect("registration error keeps a typed rejection cause");
+    assert_eq!(rc, 10);
+    assert_eq!(message, "stub collision diagnostic wording");
+    assert!(
+        error.downcast_ref::<NameCollision>().is_none(),
+        "rc=10 plus diagnostic text is not a machine-readable collision code"
+    );
 
     owner.close().await;
 }
@@ -830,20 +834,8 @@ async fn replay_failure_keeps_disconnected_no_false_connected() {
     );
 }
 
-/// A typed name collision during reconnect is terminal and must not leak the
-/// detached reader task / socket.
-///
-/// Real `cosmix-noded` answers a name collision with rc=10 but KEEPS
-/// the connection open (it does not hang up). `NodedClient::connect()`
-/// spawns the reader task *before* calling `register()`, so a bare
-/// `?` early-return on register failure would drop the `NodedClient`
-/// while the detached reader keeps the socket alive. `connect()` must close
-/// the half-built client, and the supervisor must publish `Fatal` rather than
-/// retry or rename the citizen.
-///
-/// The stub rejects the reconnect `noded.register` (rc=10, socket kept open).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reconnect_name_collision_is_terminal_without_rename_or_leak() {
+async fn reconnect_registration_rejection_retries_by_default_without_leak() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let stub = Stub::new(false, true); // reject noded.register on conn ≥ 2
@@ -854,10 +846,57 @@ async fn reconnect_name_collision_is_terminal_without_rename_or_leak() {
         .await
         .expect("initial connect (conn 1) registers fine");
     let _incoming = client.incoming().expect("incoming taken once");
-    let mut states = client.subscribe_state();
 
     stub.drop_conn1.notify_one();
 
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if stub.state.lock().await.register_names.len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("default policy retries rejected registrations");
+    assert_ne!(client.state(), ConnState::Fatal);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let s = stub.state.lock().await;
+    assert!(s.connections >= 3, "registration rejection must be retried");
+    assert!(
+        s.register_names
+            .iter()
+            .all(|name| name == "cosmix-statecache"),
+        "retry must not silently rename the service"
+    );
+    assert!(
+        s.open_connections <= 1,
+        "failed-register reconnects leaked sockets: {} open of {} total",
+        s.open_connections,
+        s.connections
+    );
+    drop(s);
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconnect_registration_rejection_is_terminal_when_opted_in() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stub = Stub::new(false, true);
+    tokio::spawn(run_stub(listener, stub.clone()));
+
+    let url = format!("ws://127.0.0.1:{port}/ws");
+    let client = SupervisedClient::connect_options("cosmix-statecache", &url)
+        .fatal_on_registration_rejection(true)
+        .connect()
+        .await
+        .expect("initial connect registers fine");
+    let _incoming = client.incoming().expect("incoming taken once");
+    let mut states = client.subscribe_state();
+
+    stub.drop_conn1.notify_one();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             states.changed().await.expect("state sender remains live");
@@ -867,27 +906,10 @@ async fn reconnect_name_collision_is_terminal_without_rename_or_leak() {
         }
     })
     .await
-    .expect("typed collision must publish a terminal state");
-    assert_eq!(client.state(), ConnState::Fatal);
+    .expect("opt-in rejection policy publishes a terminal state");
 
-    // Let any in-flight teardown settle, then assert the leak is
-    // absent: failed reconnects must NOT accumulate open sockets /
-    // reader tasks. With the leak, `open_connections` ≈ `connections`.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let s = stub.state.lock().await;
-    assert_eq!(s.connections, 2, "collision must not be retried");
-    assert_eq!(
-        s.register_names,
-        vec![
-            "cosmix-statecache".to_string(),
-            "cosmix-statecache".to_string()
-        ],
-        "collision must not silently rename the service"
-    );
-    assert!(
-        s.open_connections <= 1,
-        "failed-register reconnects leaked sockets: {} open of {} total",
-        s.open_connections,
-        s.connections
-    );
+    assert_eq!(s.connections, 2, "opt-in rejection must not be retried");
+    assert!(s.open_connections <= 1);
 }

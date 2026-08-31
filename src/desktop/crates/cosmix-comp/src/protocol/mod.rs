@@ -60,7 +60,9 @@ use crate::{
 };
 
 #[cfg(feature = "bus")]
-use crate::port::{PortCommand, PortProtocolWiring, PortRequest, PortStarter, PortWorker};
+use crate::port::{
+    PORT_QUEUE_CAPACITY, PortCommand, PortProtocolWiring, PortRequest, PortStarter, PortWorker,
+};
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 use crate::backend::kms::KmsTopologyLifecycleEvent;
@@ -420,22 +422,6 @@ struct LogicalOutputRect {
     y: f32,
     width: f32,
     height: f32,
-}
-
-#[cfg(feature = "bus")]
-fn exact_i32_to_f32(value: i32) -> Option<f32> {
-    let converted = value as f32;
-    (f64::from(converted) == f64::from(value)).then_some(converted)
-}
-
-#[cfg(feature = "bus")]
-fn exact_logical_output_rect(x: i32, y: i32, width: i32, height: i32) -> Option<LogicalOutputRect> {
-    Some(LogicalOutputRect {
-        x: exact_i32_to_f32(x)?,
-        y: exact_i32_to_f32(y)?,
-        width: exact_i32_to_f32(width)?,
-        height: exact_i32_to_f32(height)?,
-    })
 }
 
 impl From<(u32, u32)> for LogicalOutputRect {
@@ -2608,7 +2594,7 @@ impl ProtocolServer {
             #[cfg(feature = "bus")]
             port_context,
             #[cfg(feature = "bus")]
-            pending_port_requests: Vec::with_capacity(16),
+            pending_port_requests: Vec::with_capacity(PORT_QUEUE_CAPACITY),
             events: Vec::new(),
             event_flush_acknowledgements: Vec::new(),
             pending_full_upserts: HashSet::new(),
@@ -2709,7 +2695,7 @@ impl ProtocolServer {
                 .handle()
                 .insert_source(source, |event, (), state| match event {
                     ChannelEvent::Msg(PortCommand::Snapshot(request)) => {
-                        if state.pending_port_requests.len() < 16 {
+                        if state.pending_port_requests.len() < PORT_QUEUE_CAPACITY {
                             state.pending_port_requests.push(request);
                         }
                     }
@@ -10431,11 +10417,16 @@ impl WaylandState {
                     .to_i32_round::<i32>();
                 let size = output.current_transform().transform_size(size);
                 let origin = output.current_location();
-                exact_logical_output_rect(origin.x, origin.y, size.w.max(0), size.h.max(0))?
+                port_snapshot::exact_logical_output_rect(
+                    origin.x,
+                    origin.y,
+                    size.w.max(0),
+                    size.h.max(0),
+                )?
             }
             None => {
                 let (x, y, width, height) = self.backend.logical_output_rect();
-                exact_logical_output_rect(
+                port_snapshot::exact_logical_output_rect(
                     x,
                     y,
                     i32::try_from(width).ok()?,
@@ -10449,7 +10440,7 @@ impl WaylandState {
         }
         let zone = layer_map.non_exclusive_zone();
         let origin = output.current_location();
-        exact_logical_output_rect(
+        port_snapshot::exact_logical_output_rect(
             origin.x.checked_add(zone.loc.x)?,
             origin.y.checked_add(zone.loc.y)?,
             zone.size.w.max(0),

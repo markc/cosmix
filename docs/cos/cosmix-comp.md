@@ -39,7 +39,7 @@ surfaces.s<id>.{id,role,mapped,visible,x,y,width,height,band,sequence,
 windows.s<id>.{id,foreign_id,title,app_id,x,y,width,height,focused,
                maximized,minimized,output}
 stack
-focus.{keyboard,exclusive_latch,pointer,pointer_grab}
+focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock}
 decoration.{enabled,style}
 bindings.{enabled,profile,table}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,slug_collisions,broker}
@@ -59,12 +59,23 @@ zero until watch support lands. `port.broker` is driven by connection-state
 edges and is `connected` or `retrying`. `port.reply_timeouts` counts replies
 whose bounded reply lane was saturated. For a timeout: reply send abandoned after 2 s; delivery not guaranteed (the client sink may still flush it). It is separate from topic-only `lost_count`.
 
+`focus.session_lock` is `none`, `locking`, `locked` or `orphaned`. While a
+session lock is active, the read tree applies the same presentation boundary
+as `WaylandState::session_lock_active`, renderer selection through
+`surface_is_session_presentable`, and foreign-toplevel publication: ordinary
+surfaces retain ids, roles, bands and geometry, but report `visible=false` and
+null `title`/`app_id`; `windows` is empty. Unlock restores the ordinary
+projection.
+
 All application errors use Bus rc 10 with exactly one of
 `{"error":"unknown_path"}`, `{"error":"busy"}` or
-`{"error":"unknown_verb"}`. An absent broker never delays compositor startup:
-the port thread reports `retrying` and reconnects independently. A service-name
-collision is logged once, ends the port worker without renaming, and leaves the
-compositor running.
+`{"error":"unknown_verb"}`, plus
+`{"error":"too_large","limit_bytes":N,"hint":"read a subtree"}` when a
+serialised reply would exceed the Bus message limit after reserved framing and
+header headroom. Replies are never truncated. An absent broker never delays
+compositor startup: the port thread reports `retrying` and reconnects
+independently. A registration rejection (collision or admission) is logged
+once, ends the port worker without renaming, and leaves the compositor running.
 
 The broker client lives on the named `cosmix-comp-port` OS thread with its own
 current-thread Tokio runtime. At most 16 accepted reads cross a bounded calloop
@@ -77,11 +88,11 @@ serialised once per snapshot on the blocking pool, with only one full-tree
 serialisation active process-wide; requests share the resulting string. Subtree
 reads serialise only the selected value.
 
-The 16,384-surface cap bounds tree cardinality, not reply bytes. At the title and
-app-ID limits, a hostile full tree can still approach roughly 400 MiB after the
-`windows` projection duplicates toplevel strings and JSON escaping expands them.
-Single-flight serialisation prevents same-snapshot multiplication, but the
-accepted untruncated full-tree reply remains a known resource risk.
+The 16,384-surface cap bounds tree cardinality, not reply bytes. A full tree can
+still serialise far beyond the wire allowance, so comp measures the cached
+full-tree bytes once and returns `too_large`; callers can read a leaf or subtree
+from the same snapshot. Single-flight serialisation prevents same-snapshot
+multiplication.
 
 Absent by design in P-0:
 

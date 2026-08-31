@@ -44,7 +44,7 @@ fn snapshot_context(backend: &'static str) -> port_snapshot::SnapshotContext {
         } else {
             "comp-nested"
         }),
-        version: Arc::from("0.33.1-test"),
+        version: Arc::from("0.33.2-test"),
         backend,
         engine: "bevy-0.19/wgpu",
         instance: Arc::from("protocol-fixture"),
@@ -27005,10 +27005,13 @@ fn port_boundary_uses_production_admission_completion_and_sees_same_dispatch_com
 #[cfg(feature = "bus")]
 #[test]
 fn port_output_coordinate_conversion_rejects_inexact_f32_values() {
-    assert_eq!(exact_i32_to_f32(16_777_216), Some(16_777_216.0));
-    assert_eq!(exact_i32_to_f32(16_777_217), None);
-    assert!(exact_logical_output_rect(0, 0, 16_777_216, 1).is_some());
-    assert!(exact_logical_output_rect(16_777_217, 0, 1, 1).is_none());
+    assert_eq!(
+        port_snapshot::exact_i32_to_f32(16_777_216),
+        Some(16_777_216.0)
+    );
+    assert_eq!(port_snapshot::exact_i32_to_f32(16_777_217), None);
+    assert!(port_snapshot::exact_logical_output_rect(0, 0, 16_777_216, 1).is_some());
+    assert!(port_snapshot::exact_logical_output_rect(16_777_217, 0, 1, 1).is_none());
 }
 
 #[test]
@@ -30841,6 +30844,35 @@ fn session_lock_repeated_already_constructed_failures_do_not_grow_output_registr
 #[test]
 fn session_lock_acked_buffer_maps_in_lock_band_above_overlay() {
     let mut harness = KeybindingHarness::new(true);
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_ID,
+        2,
+        &wire_string_argument("Private title"),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_ID,
+        3,
+        &wire_string_argument("org.cosmix.Private"),
+    );
+    map_initial_test_toplevel(&mut harness);
+    #[cfg(feature = "bus")]
+    let ordinary_id = test_toplevel_record(&harness).id.0;
+    #[cfg(feature = "bus")]
+    {
+        let before = port_snapshot::snapshot(&harness.server.state, &snapshot_context("nested"))
+            .expect("pre-lock snapshot");
+        let ordinary = before
+            .surfaces
+            .get(&format!("s{ordinary_id}"))
+            .expect("ordinary toplevel projected before lock");
+        assert!(ordinary.visible);
+        assert_eq!(ordinary.title.as_deref(), Some("Private title"));
+        assert_eq!(ordinary.app_id.as_deref(), Some("org.cosmix.Private"));
+        assert!(before.windows.contains_key(&format!("s{ordinary_id}")));
+        assert_eq!(before.focus.session_lock, "none");
+    }
     let (overlay, _) = map_test_layer_surface(
         &mut harness,
         0,
@@ -30850,6 +30882,20 @@ fn session_lock_acked_buffer_maps_in_lock_band_above_overlay() {
         },
     );
     let lock = begin_test_session_lock(&mut harness);
+    #[cfg(feature = "bus")]
+    {
+        let locking = port_snapshot::snapshot(&harness.server.state, &snapshot_context("nested"))
+            .expect("locking snapshot");
+        let ordinary = locking
+            .surfaces
+            .get(&format!("s{ordinary_id}"))
+            .expect("ordinary toplevel shape remains projected");
+        assert!(!ordinary.visible);
+        assert_eq!(ordinary.title, None);
+        assert_eq!(ordinary.app_id, None);
+        assert!(locking.windows.is_empty());
+        assert_eq!(locking.focus.session_lock, "locking");
+    }
     ack_and_map_test_lock_surface(&mut harness, lock);
     let lock_record = test_lock_record(&harness, lock.surface);
     assert!(lock_record.mapped);
@@ -30873,6 +30919,31 @@ fn session_lock_acked_buffer_maps_in_lock_band_above_overlay() {
         assert!(lock.output.is_some());
         assert_eq!(snapshot.stack.first(), Some(&lock.id));
         assert!(lock.layer.is_none());
+        assert!(snapshot.windows.is_empty());
+        assert_eq!(snapshot.focus.session_lock, "locking");
+    }
+    let _ = present_test_security_epoch(&mut harness, lock.lock);
+    #[cfg(feature = "bus")]
+    {
+        let locked = port_snapshot::snapshot(&harness.server.state, &snapshot_context("nested"))
+            .expect("locked snapshot");
+        assert!(locked.windows.is_empty());
+        assert_eq!(locked.focus.session_lock, "locked");
+    }
+    let _ = unlock_test_session(&mut harness, lock);
+    #[cfg(feature = "bus")]
+    {
+        let after = port_snapshot::snapshot(&harness.server.state, &snapshot_context("nested"))
+            .expect("post-unlock snapshot");
+        let ordinary = after
+            .surfaces
+            .get(&format!("s{ordinary_id}"))
+            .expect("ordinary toplevel projected after unlock");
+        assert!(ordinary.visible);
+        assert_eq!(ordinary.title.as_deref(), Some("Private title"));
+        assert_eq!(ordinary.app_id.as_deref(), Some("org.cosmix.Private"));
+        assert!(after.windows.contains_key(&format!("s{ordinary_id}")));
+        assert_eq!(after.focus.session_lock, "none");
     }
 }
 

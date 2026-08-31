@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use rand::Rng;
 use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc, watch};
 
-use crate::native::{NameCollision, NodedClient};
+use crate::native::{NodedClient, RegistrationRejected};
 use crate::types::IncomingCommand;
 
 /// Bounded attempt budget for the *initial* connect+register. Exhausting
@@ -154,6 +154,18 @@ impl std::error::Error for SupervisedError {
     }
 }
 
+impl SupervisedError {
+    /// Return the broker's structured registration refusal when this error
+    /// came from the initial connect/register path.
+    pub fn registration_rejection(&self) -> Option<(u8, &str)> {
+        let Self::InitialConnectFailed { source, .. } = self else {
+            return None;
+        };
+        let rejection = source.downcast_ref::<RegistrationRejected>()?;
+        Some((rejection.rc, rejection.message.as_str()))
+    }
+}
+
 /// Ordered, deduplicated set of subscribed topic names.
 ///
 /// SPEC 18 §3.3 requires the supervised client to "record every
@@ -247,7 +259,44 @@ pub struct SupervisedClient {
     service_name: String,
 }
 
+/// Connection options for a supervised client.
+///
+/// The default preserves the pre-0.4.0 lifecycle: registration rejections are
+/// retried like other failed connection attempts. A citizen whose public name
+/// must never wait out a rejection can opt into a terminal state with
+/// [`fatal_on_registration_rejection`](Self::fatal_on_registration_rejection).
+pub struct SupervisedConnectOptions {
+    service_name: String,
+    noded_url: String,
+    provenance: Option<cosmix_bus::RegisterProvenance>,
+    fatal_on_registration_rejection: bool,
+}
+
+impl SupervisedConnectOptions {
+    /// Treat any broker registration rejection (collision or admission) as
+    /// terminal. Disabled by default for compatibility with existing citizens.
+    pub fn fatal_on_registration_rejection(mut self, enabled: bool) -> Self {
+        self.fatal_on_registration_rejection = enabled;
+        self
+    }
+
+    /// Connect using these options.
+    pub async fn connect(self) -> Result<SupervisedClient, SupervisedError> {
+        SupervisedClient::connect_with_options(self).await
+    }
+}
+
 impl SupervisedClient {
+    /// Build a supervised connection with opt-in lifecycle policy.
+    pub fn connect_options(service_name: &str, noded_url: &str) -> SupervisedConnectOptions {
+        SupervisedConnectOptions {
+            service_name: service_name.to_string(),
+            noded_url: noded_url.to_string(),
+            provenance: None,
+            fatal_on_registration_rejection: false,
+        }
+    }
+
     /// Connect (bounded budget), register, and start the reconnect
     /// supervisor. Returns [`SupervisedError::InitialConnectFailed`] if
     /// the initial connect+register cannot succeed within
@@ -257,7 +306,9 @@ impl SupervisedClient {
         service_name: &str,
         noded_url: &str,
     ) -> Result<SupervisedClient, SupervisedError> {
-        Self::connect_supervised_with_provenance(service_name, noded_url, None).await
+        Self::connect_options(service_name, noded_url)
+            .connect()
+            .await
     }
 
     /// Like [`connect_supervised`](Self::connect_supervised) but sends
@@ -271,14 +322,32 @@ impl SupervisedClient {
         noded_url: &str,
         provenance: Option<cosmix_bus::RegisterProvenance>,
     ) -> Result<SupervisedClient, SupervisedError> {
+        let mut options = Self::connect_options(service_name, noded_url);
+        options.provenance = provenance;
+        options.connect().await
+    }
+
+    async fn connect_with_options(
+        options: SupervisedConnectOptions,
+    ) -> Result<SupervisedClient, SupervisedError> {
+        let SupervisedConnectOptions {
+            service_name,
+            noded_url,
+            provenance,
+            fatal_on_registration_rejection,
+        } = options;
         let (state_tx, _) = watch::channel(ConnState::Connecting);
         let state_publish = Arc::new(std::sync::Mutex::new(()));
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut client: Option<NodedClient> = None;
         for attempt in 0..MAX_INITIAL_ATTEMPTS {
-            match NodedClient::connect_with_provenance(service_name, noded_url, provenance.clone())
-                .await
+            match NodedClient::connect_with_provenance(
+                &service_name,
+                &noded_url,
+                provenance.clone(),
+            )
+            .await
             {
                 Ok(c) => {
                     client = Some(c);
@@ -292,7 +361,9 @@ impl SupervisedClient {
                         error = %e,
                         "initial broker connect attempt failed"
                     );
-                    if e.downcast_ref::<NameCollision>().is_some() {
+                    if fatal_on_registration_rejection
+                        && e.downcast_ref::<RegistrationRejected>().is_some()
+                    {
                         publish_state(&state_tx, &state_publish, ConnState::Fatal);
                         return Err(SupervisedError::InitialConnectFailed {
                             attempts: attempt + 1,
@@ -355,6 +426,7 @@ impl SupervisedClient {
             service_name: service_name.to_string(),
             noded_url: noded_url.to_string(),
             provenance,
+            fatal_on_registration_rejection,
             first_rx,
         }));
 
@@ -367,7 +439,7 @@ impl SupervisedClient {
             incoming_rx: std::sync::Mutex::new(Some(out_rx)),
             shutdown_tx,
             supervisor: TokioMutex::new(Some(supervisor)),
-            service_name: service_name.to_string(),
+            service_name,
         })
     }
 
@@ -708,6 +780,22 @@ impl SupervisedClient {
         }
     }
 
+    /// Stop reconnect supervision and deterministically close the current
+    /// socket, including its detached reader task. Idempotent and best effort.
+    pub async fn close(&self) {
+        publish_state(&self.state_tx, &self.state_publish, ConnState::ShuttingDown);
+        let _ = self.shutdown_tx.send(true);
+        // Close the currently published socket before joining. A bounded
+        // caller may abandon this method if the supervisor itself is wedged;
+        // the detached native reader must not retain the registered name in
+        // that case. A reconnect completing after the stop edge closes its
+        // fresh client before it can swap it into `inner`.
+        self.client().await.close().await;
+        if let Some(handle) = self.supervisor.lock().await.take() {
+            let _ = handle.await;
+        }
+    }
+
     /// Graceful deregister (SPEC 18 §3.5 building block; sequencing in
     /// WS5). Marks `ShuttingDown`, stops the supervisor so it cannot
     /// race a reconnect against the deregister, then issues
@@ -770,6 +858,8 @@ struct SupervisorCtx {
     /// citizen and cloned into each reconnect, so started_at stays the
     /// true process start (version-discovery contract).
     provenance: Option<cosmix_bus::RegisterProvenance>,
+    /// Opt-in terminal policy for application-level register refusals.
+    fatal_on_registration_rejection: bool,
     first_rx: mpsc::UnboundedReceiver<IncomingCommand>,
 }
 
@@ -974,13 +1064,15 @@ async fn supervisor_loop(mut ctx: SupervisorCtx) {
                     }
                 }
                 Err(e) => {
-                    if e.downcast_ref::<NameCollision>().is_some() {
+                    if ctx.fatal_on_registration_rejection
+                        && e.downcast_ref::<RegistrationRejected>().is_some()
+                    {
                         publish_state(&ctx.state_tx, &ctx.state_publish, ConnState::Fatal);
                         tracing::debug!(
-                            event = "supervised_name_collision",
+                            event = "supervised_registration_rejected",
                             service = %ctx.service_name,
                             error = %e,
-                            "service registration collided during reconnect; supervisor stopped"
+                            "service registration was rejected during reconnect; supervisor stopped"
                         );
                         return;
                     }

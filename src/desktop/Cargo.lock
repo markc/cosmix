@@ -2527,11 +2527,12 @@ version = "0.2.0"
 
 [[package]]
 name = "cosmix-comp"
-version = "0.33.1"
+version = "0.33.2"
 dependencies = [
  "bevy",
  "cosmix-deco",
  "cosmix-lib-buildinfo",
+ "cosmix-lib-bus",
  "cosmix-lib-client",
  "cosmix-lib-config",
  "cosmix-lib-props-core",
@@ -2618,7 +2619,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-client"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",
