@@ -1006,6 +1006,7 @@ fn collect_host_input(
             // trips the `Started` reset, and its lift stops an axis that was
             // never scrolling.
             WindowEvent::CursorLeft(_) => {
+                queue.pending.push(HostInput::PointerLeave);
                 if let Some(stop) = end_scrolling_gesture(&mut queue.scrolling_axes, time) {
                     queue.pending.push(stop);
                 }
@@ -2423,17 +2424,20 @@ mod tests {
         assert!(
             matches!(
                 queue.pending.as_slice(),
-                [HostInput::PointerAxis {
-                    horizontal: None,
-                    vertical: Some(HostAxis {
-                        amount: 0.0,
-                        v120: None
-                    }),
-                    source: AxisSource::Continuous,
-                    ..
-                }]
+                [
+                    HostInput::PointerLeave,
+                    HostInput::PointerAxis {
+                        horizontal: None,
+                        vertical: Some(HostAxis {
+                            amount: 0.0,
+                            v120: None
+                        }),
+                        source: AxisSource::Continuous,
+                        ..
+                    }
+                ]
             ),
-            "the leave stops the axis that was scrolling, got {:?}",
+            "the Bevy leave reaches protocol input before stopping the active axis, got {:?}",
             queue.pending
         );
         assert!(
@@ -2498,17 +2502,25 @@ mod tests {
         app.update();
 
         let queue = app.world().resource::<HostInputQueue>();
-        let amounts: Vec<_> = queue
+        let ordered: Vec<_> = queue
             .pending
             .iter()
             .map(|input| match input {
-                HostInput::PointerAxis { vertical, .. } => vertical.map(|axis| axis.amount),
-                other => panic!("expected only pointer axes, got {other:?}"),
+                HostInput::PointerAxis { vertical, .. } => {
+                    format!("axis:{:?}", vertical.map(|axis| axis.amount))
+                }
+                HostInput::PointerLeave => "leave".into(),
+                other => panic!("expected pointer axis or leave, got {other:?}"),
             })
             .collect();
         assert_eq!(
-            amounts,
-            vec![Some(3.0), Some(0.0), Some(4.0)],
+            ordered,
+            [
+                "axis:Some(3.0)",
+                "leave",
+                "axis:Some(0.0)",
+                "axis:Some(4.0)"
+            ],
             "drag, then the leave's stop, then the new drag — in that order"
         );
         assert!(

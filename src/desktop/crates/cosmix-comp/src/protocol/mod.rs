@@ -682,6 +682,10 @@ pub(crate) enum HostInput {
         dy: f64,
         time: u32,
     },
+    /// The host pointer left the nested compositor window. There is no client
+    /// coordinate to deliver, but compositor-owned pointer observations must
+    /// tear down immediately because no later motion sample is guaranteed.
+    PointerLeave,
     PointerButton {
         button: u32,
         state: HostButtonState,
@@ -7278,6 +7282,10 @@ impl WaylandState {
         match input {
             HostInput::PointerMotionAbsolute { x, y, time } => self.pointer_moved(x, y, time),
             HostInput::PointerMotion { dx, dy, time } => self.pointer_motion(dx, dy, time),
+            HostInput::PointerLeave => {
+                #[cfg(feature = "bus")]
+                self.reset_corner_detector();
+            }
             HostInput::PointerButton {
                 button,
                 state,

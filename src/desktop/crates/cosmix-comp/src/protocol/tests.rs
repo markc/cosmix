@@ -27359,6 +27359,102 @@ fn port_corner_timer_routes_once_and_geometry_and_lock_teardown_leave() {
 
 #[cfg(feature = "bus")]
 #[test]
+fn corner_left_keeps_its_output_key_when_output_projection_fails() {
+    let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+    harness
+        .server
+        .state
+        .handle_host_input(HostInput::PointerMotionAbsolute {
+            x: 5.0,
+            y: 5.0,
+            time: 1,
+        });
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+        .expect("corner deadline dispatches");
+    let output_key = drain_observations(&observations)
+        .into_iter()
+        .find_map(|record| match record {
+            port_observation::ObservationRecord::CornerEntered { output, .. } => Some(output),
+            _ => None,
+        })
+        .expect("pointer enters the corner before projection fails");
+
+    let output = harness
+        .server
+        .state
+        .backend
+        .default_output()
+        .expect("nested output");
+    output.change_current_state(None, None, None, Some((16_777_217, 0).into()));
+    harness.server.state.refresh_corner_regions();
+
+    assert!(
+        drain_observations(&observations)
+            .iter()
+            .any(|record| matches!(
+                record,
+                port_observation::ObservationRecord::CornerLeft { output, .. }
+                    if output == &output_key
+            )),
+        "projection failure resets the detector while its output key still resolves"
+    );
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn host_pointer_leave_resets_an_engaged_corner_with_the_entered_output() {
+    let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+    harness
+        .server
+        .state
+        .handle_host_input(HostInput::PointerMotionAbsolute {
+            x: 5.0,
+            y: 5.0,
+            time: 1,
+        });
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+        .expect("corner deadline dispatches");
+    let (output_key, dwell_ms) = drain_observations(&observations)
+        .into_iter()
+        .find_map(|record| match record {
+            port_observation::ObservationRecord::CornerEntered {
+                output, dwell_ms, ..
+            } => Some((output, dwell_ms)),
+            _ => None,
+        })
+        .expect("pointer enters the corner before leaving the host window");
+
+    harness
+        .server
+        .state
+        .handle_host_input(HostInput::PointerLeave);
+
+    assert!(
+        drain_observations(&observations)
+            .iter()
+            .any(|record| matches!(
+                record,
+                port_observation::ObservationRecord::CornerLeft {
+                    output,
+                    dwell_ms: left_dwell,
+                    ..
+                } if output == &output_key && *left_dwell == dwell_ms
+            ))
+    );
+}
+
+#[cfg(feature = "bus")]
+#[test]
 fn port_watch_reports_title_and_app_id_leaf_changes() {
     let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
     map_initial_test_toplevel(&mut harness);

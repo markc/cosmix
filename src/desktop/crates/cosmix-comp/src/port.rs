@@ -27,7 +27,10 @@ use crate::{
     decoration::DecorationStartup,
     protocol::{port_observation, port_snapshot},
 };
-use port_observation::{ObservationProducer, ObservationRecord, PropValue, SetValidationError};
+use port_observation::{
+    AffectedTopics, LossState, ObservationProducer, ObservationRecord, PropValue,
+    SetValidationError,
+};
 use port_snapshot::{
     BROKER_CONNECTED, BROKER_RETRYING, CompSnapshot, MAX_REPLY_BODY_BYTES, MAX_REPLY_WIRE_BYTES,
     SnapshotContext, dispatch_read, error, too_large,
@@ -346,6 +349,7 @@ pub(crate) struct PortStarter {
     reply_timeouts: Arc<AtomicU64>,
     publish_timeouts: Arc<AtomicU64>,
     observations: crossbeam_channel::Receiver<ObservationRecord>,
+    observation_loss: Arc<LossState>,
     observation_notifier: Arc<tokio::sync::Notify>,
     lost_count: Arc<AtomicU64>,
 }
@@ -374,6 +378,7 @@ pub(crate) fn prepare(
     let pending_active_order = Arc::new(AtomicU64::new(0));
     let (observation_producer, observations) = port_observation::outbox(Arc::clone(&lost_count));
     let observation_notifier = observation_producer.notifier();
+    let observation_loss = observation_producer.loss_state();
     let (sender, source) = channel::sync_channel(PORT_QUEUE_CAPACITY);
     let ingress = PortIngress {
         sender,
@@ -414,6 +419,7 @@ pub(crate) fn prepare(
             reply_timeouts,
             publish_timeouts,
             observations,
+            observation_loss,
             observation_notifier,
             lost_count,
         },
@@ -431,6 +437,7 @@ impl PortStarter {
         let reply_timeouts = self.reply_timeouts;
         let publish_timeouts = self.publish_timeouts;
         let observations = self.observations;
+        let observation_loss = self.observation_loss;
         let observation_notifier = self.observation_notifier;
         let lost_count = self.lost_count;
         let thread = thread::Builder::new()
@@ -456,6 +463,7 @@ impl PortStarter {
                     reply_timeouts,
                     publish_timeouts,
                     observations,
+                    observation_loss,
                     observation_notifier,
                     lost_count,
                     shutdown_rx,
@@ -709,6 +717,7 @@ async fn worker_loop<F, Fut, C>(
     reply_timeouts: Arc<AtomicU64>,
     publish_timeouts: Arc<AtomicU64>,
     observations: crossbeam_channel::Receiver<ObservationRecord>,
+    observation_loss: Arc<LossState>,
     observation_notifier: Arc<tokio::sync::Notify>,
     lost_count: Arc<AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
@@ -750,6 +759,7 @@ async fn worker_loop<F, Fut, C>(
         Arc::clone(&client),
         Arc::from(service.as_str()),
         observations,
+        observation_loss,
         observation_notifier,
         Arc::clone(&lost_count),
         Arc::clone(&publish_timeouts),
@@ -1218,21 +1228,35 @@ async fn reply_loop<C: WorkerClient>(
 
 #[derive(Clone, Copy)]
 struct PendingGap {
+    topics: AffectedTopics,
     last_lost_seq: u64,
     cause: &'static str,
 }
 
+impl PendingGap {
+    fn merge(&mut self, topics: AffectedTopics, last_lost_seq: u64, cause: &'static str) {
+        self.topics.merge(topics);
+        self.last_lost_seq = self.last_lost_seq.max(last_lost_seq);
+        if cause == "publisher.loss" {
+            self.cause = cause;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn publisher_loop<C: WorkerClient>(
     client: Arc<C>,
     service: Arc<str>,
     observations: crossbeam_channel::Receiver<ObservationRecord>,
+    observation_loss: Arc<LossState>,
     observation_notifier: Arc<tokio::sync::Notify>,
     lost_count: Arc<AtomicU64>,
     publish_timeouts: Arc<AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut next_sequence = 1_u64;
-    let mut pending_gap = None;
+    let mut pending_gap: Option<PendingGap> = None;
+    let mut acknowledged_loss = [0_u64; 7];
     let mut pending_record = None;
     loop {
         if pending_record.is_none() {
@@ -1257,30 +1281,66 @@ async fn publisher_loop<C: WorkerClient>(
         };
         let topic = port_observation::topic_name(&service, record.topic_suffix());
         if record.event_seq() > next_sequence {
-            pending_gap = Some(PendingGap {
-                last_lost_seq: record.event_seq().saturating_sub(1),
-                cause: pending_gap.map_or("outbox.overflow", |gap: PendingGap| gap.cause),
-            });
+            let mut affected;
+            loop {
+                while observation_loss.update_in_progress() {
+                    tokio::task::yield_now().await;
+                }
+                let generation = observation_loss.update_generation();
+                affected = observation_loss.affected_since(&acknowledged_loss);
+                if !observation_loss.update_in_progress()
+                    && observation_loss.update_generation() == generation
+                {
+                    break;
+                }
+            }
+            if affected.is_empty() {
+                debug_assert!(false, "sequence loss has no recorded affected topic");
+                affected.insert(record.topic_suffix());
+            }
+            let last_lost_seq = record.event_seq().saturating_sub(1);
+            if let Some(gap) = pending_gap.as_mut() {
+                gap.merge(affected, last_lost_seq, "outbox.overflow");
+            } else {
+                pending_gap = Some(PendingGap {
+                    topics: affected,
+                    last_lost_seq,
+                    cause: "outbox.overflow",
+                });
+            }
         }
         if let Some(gap) = pending_gap {
-            let message = gap_message(
-                record.topic_suffix(),
-                gap,
-                lost_count.load(Ordering::Acquire),
-            );
-            if publish_message(client.as_ref(), &topic, &message)
-                .await
-                .is_err()
-            {
+            let mut remaining = gap;
+            let mut failed_gap = false;
+            for suffix in gap.topics.iter() {
+                let gap_topic = port_observation::topic_name(&service, suffix);
+                let message = gap_message(suffix, gap, lost_count.load(Ordering::Acquire));
+                if publish_message(client.as_ref(), &gap_topic, &message)
+                    .await
+                    .is_err()
+                {
+                    failed_gap = true;
+                    break;
+                }
+                remaining.topics.remove(suffix);
+                let mut published_topic = AffectedTopics::default();
+                published_topic.insert(suffix);
+                observation_loss.acknowledge(
+                    &mut acknowledged_loss,
+                    published_topic,
+                    gap.last_lost_seq,
+                );
+            }
+            if failed_gap {
                 publish_timeouts.fetch_add(1, Ordering::AcqRel);
                 let failed = pending_record.take().expect("gap has a surviving record");
-                let (discarded, last_lost_seq) = discard_publication_backlog(failed, &observations);
+                let (discarded, last_lost_seq, discarded_topics) =
+                    discard_publication_backlog(failed, &observations, &observation_loss);
                 lost_count.fetch_add(discarded, Ordering::AcqRel);
                 next_sequence = last_lost_seq.saturating_add(1);
-                pending_gap = Some(PendingGap {
-                    last_lost_seq: gap.last_lost_seq.max(last_lost_seq),
-                    cause: "publisher.loss",
-                });
+                let mut replacement = remaining;
+                replacement.merge(discarded_topics, last_lost_seq, "publisher.loss");
+                pending_gap = Some(replacement);
                 continue;
             }
             pending_gap = None;
@@ -1298,10 +1358,12 @@ async fn publisher_loop<C: WorkerClient>(
         }
 
         publish_timeouts.fetch_add(1, Ordering::AcqRel);
-        let (discarded, last_lost_seq) = discard_publication_backlog(record, &observations);
+        let (discarded, last_lost_seq, topics) =
+            discard_publication_backlog(record, &observations, &observation_loss);
         lost_count.fetch_add(discarded, Ordering::AcqRel);
         next_sequence = last_lost_seq.saturating_add(1);
         pending_gap = Some(PendingGap {
+            topics,
             last_lost_seq,
             cause: "publisher.loss",
         });
@@ -1311,14 +1373,20 @@ async fn publisher_loop<C: WorkerClient>(
 fn discard_publication_backlog(
     failed: ObservationRecord,
     observations: &crossbeam_channel::Receiver<ObservationRecord>,
-) -> (u64, u64) {
+    observation_loss: &LossState,
+) -> (u64, u64, AffectedTopics) {
     let mut discarded = 1_u64;
     let mut last_lost_seq = failed.event_seq();
+    let mut topics = AffectedTopics::default();
+    topics.insert(failed.topic_suffix());
+    observation_loss.record(&failed);
     while let Ok(queued) = observations.try_recv() {
         discarded = discarded.saturating_add(1);
         last_lost_seq = last_lost_seq.max(queued.event_seq());
+        topics.insert(queued.topic_suffix());
+        observation_loss.record(&queued);
     }
-    (discarded, last_lost_seq)
+    (discarded, last_lost_seq, topics)
 }
 
 async fn publish_message<C: WorkerClient>(
@@ -1436,6 +1504,8 @@ mod tests {
         hang_replies: bool,
         responses_started: Arc<AtomicUsize>,
         publish_mode: Arc<AtomicU8>,
+        publish_attempts: Arc<AtomicUsize>,
+        reject_publish_attempt: Arc<AtomicUsize>,
         publications: PublishedMessages,
         deregister_hangs: Arc<AtomicBool>,
         deregistered: Arc<AtomicUsize>,
@@ -1460,6 +1530,8 @@ mod tests {
                     hang_replies,
                     responses_started: Arc::new(AtomicUsize::new(0)),
                     publish_mode: Arc::new(AtomicU8::new(0)),
+                    publish_attempts: Arc::new(AtomicUsize::new(0)),
+                    reject_publish_attempt: Arc::new(AtomicUsize::new(usize::MAX)),
                     publications: Arc::new(Mutex::new(Vec::new())),
                     deregister_hangs: Arc::new(AtomicBool::new(false)),
                     deregistered: Arc::new(AtomicUsize::new(0)),
@@ -1506,6 +1578,10 @@ mod tests {
             headers: &'a BTreeMap<String, String>,
             wire: &'a str,
         ) -> WorkerFuture<'a, Result<(), String>> {
+            let attempt = self.publish_attempts.fetch_add(1, Ordering::AcqRel) + 1;
+            if attempt == self.reject_publish_attempt.load(Ordering::Acquire) {
+                return Box::pin(future::ready(Err("publication rejected".into())));
+            }
             match self.publish_mode.load(Ordering::Acquire) {
                 1 => Box::pin(future::ready(Err("publication rejected".into()))),
                 2 => Box::pin(future::pending()),
@@ -1553,11 +1629,13 @@ mod tests {
     fn test_observation_args() -> (
         Arc<AtomicU64>,
         crossbeam_channel::Receiver<ObservationRecord>,
+        Arc<LossState>,
         Arc<AtomicU64>,
     ) {
         let lost = Arc::new(AtomicU64::new(0));
-        let (_producer, receiver) = port_observation::outbox(Arc::clone(&lost));
-        (Arc::new(AtomicU64::new(0)), receiver, lost)
+        let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
+        let loss_state = producer.loss_state();
+        (Arc::new(AtomicU64::new(0)), receiver, loss_state, lost)
     }
 
     fn command(command: &str, id: usize) -> cosmix_client::IncomingCommand {
@@ -1646,7 +1724,8 @@ mod tests {
         let (ingress, _source, _) = test_ingress();
         let broker = Arc::new(AtomicU8::new(BROKER_RETRYING));
         let reply_timeouts = Arc::new(AtomicU64::new(0));
-        let (publish_timeouts, observations, lost_count) = test_observation_args();
+        let (publish_timeouts, observations, observation_loss, lost_count) =
+            test_observation_args();
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (client, _commands, states) = FakeClient::new(ConnState::Connected, false);
         let mut client = Some(client);
@@ -1658,6 +1737,7 @@ mod tests {
             reply_timeouts,
             publish_timeouts,
             observations,
+            observation_loss,
             Arc::new(tokio::sync::Notify::new()),
             lost_count,
             shutdown,
@@ -1681,7 +1761,8 @@ mod tests {
         let (_shutdown_tx, shutdown) = watch::channel(false);
         let (client, _commands, states) = FakeClient::new(ConnState::Connected, false);
         let mut client = Some(client);
-        let (publish_timeouts, observations, lost_count) = test_observation_args();
+        let (publish_timeouts, observations, observation_loss, lost_count) =
+            test_observation_args();
         let worker = tokio::spawn(worker_loop(
             "comp-nested".into(),
             ingress,
@@ -1689,6 +1770,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             publish_timeouts,
             observations,
+            observation_loss,
             Arc::new(tokio::sync::Notify::new()),
             lost_count,
             shutdown,
@@ -1711,7 +1793,8 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_for_connector = Arc::clone(&attempts);
         let (_shutdown_tx, shutdown) = watch::channel(false);
-        let (publish_timeouts, observations, lost_count) = test_observation_args();
+        let (publish_timeouts, observations, observation_loss, lost_count) =
+            test_observation_args();
         worker_loop(
             "comp-nested".into(),
             ingress,
@@ -1719,6 +1802,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             publish_timeouts,
             observations,
+            observation_loss,
             Arc::new(tokio::sync::Notify::new()),
             lost_count,
             shutdown,
@@ -2095,11 +2179,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publisher_places_outbox_gap_before_surviving_records() {
+    async fn publisher_gaps_every_affected_topic_before_the_next_survivor() {
         let lost = Arc::new(AtomicU64::new(0));
         let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
         let notifier = producer.notifier();
-        for event_seq in 1..=4 {
+        let observation_loss = producer.loss_state();
+        producer.offer(ObservationRecord::PropsChanged {
+            path: "input.corners.enabled".into(),
+            old: PropValue::Bool(true),
+            new: PropValue::Bool(false),
+            unix_ms: 0,
+            cause: "props.set",
+            event_seq: 1,
+        });
+        for event_seq in 2..=4 {
             producer.offer(ObservationRecord::FocusChanged {
                 keyboard: Some(event_seq),
                 previous: None,
@@ -2115,6 +2208,7 @@ mod tests {
             Arc::new(client),
             Arc::from("comp-nested"),
             receiver,
+            observation_loss,
             notifier,
             Arc::clone(&lost),
             Arc::clone(&publish_timeouts),
@@ -2126,7 +2220,7 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .len()
-                    == 3
+                    == 4
                 {
                     break;
                 }
@@ -2134,25 +2228,131 @@ mod tests {
             }
         })
         .await
-        .expect("gap and two survivors publish");
+        .expect("two affected-topic gaps and two survivors publish");
         shutdown_tx.send_replace(true);
         task.await.expect("publisher exits");
 
         let published = publications
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let gap = cosmix_bus::bus::parse(&published[0].1).expect("gap wire parses");
+        let props_gap = cosmix_bus::bus::parse(&published[0].1).expect("props gap parses");
         assert_eq!(
             published[0].0.get("name").map(String::as_str),
-            Some("comp-nested.focus.changed")
+            Some("comp-nested.props.changed")
         );
-        assert_eq!(gap.get("command"), Some("focus.changed"));
-        assert_eq!(gap.get("event_seq"), Some("2"));
+        assert_eq!(props_gap.get("command"), Some("props.changed"));
+        assert_eq!(props_gap.get("event_seq"), Some("2"));
         assert_eq!(
-            serde_json::from_str::<Value>(&gap.body).unwrap(),
+            serde_json::from_str::<Value>(&props_gap.body).unwrap(),
             json!({"gap": true, "lost_count": 2, "cause": "outbox.overflow"})
         );
+
+        let focus_gap = cosmix_bus::bus::parse(&published[1].1).expect("focus gap parses");
+        assert_eq!(
+            published[1].0.get("name").map(String::as_str),
+            Some("comp-nested.focus.changed")
+        );
+        assert_eq!(focus_gap.get("command"), Some("focus.changed"));
+        assert_eq!(focus_gap.get("event_seq"), Some("2"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&focus_gap.body).unwrap(),
+            json!({"gap": true, "lost_count": 2, "cause": "outbox.overflow"})
+        );
+        let survivor = cosmix_bus::bus::parse(&published[2].1).expect("survivor parses");
+        assert_eq!(survivor.get("command"), Some("focus.changed"));
+        assert_eq!(survivor.get("event_seq"), Some("3"));
         assert_eq!(publish_timeouts.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn successful_gap_topics_are_not_republished_after_a_later_gap_fails() {
+        let lost = Arc::new(AtomicU64::new(0));
+        let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
+        let notifier = producer.notifier();
+        let observation_loss = producer.loss_state();
+        producer.offer(ObservationRecord::PropsChanged {
+            path: "input.corners.enabled".into(),
+            old: PropValue::Bool(true),
+            new: PropValue::Bool(false),
+            unix_ms: 0,
+            cause: "props.set",
+            event_seq: 1,
+        });
+        for event_seq in 2..=4 {
+            producer.offer(ObservationRecord::FocusChanged {
+                keyboard: Some(event_seq),
+                previous: None,
+                exclusive_latch: None,
+                event_seq,
+            });
+        }
+        let (client, _commands, _states) = FakeClient::new(ConnState::Connected, false);
+        client.reject_publish_attempt.store(2, Ordering::Release);
+        let publications = Arc::clone(&client.publications);
+        let publish_timeouts = Arc::new(AtomicU64::new(0));
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let task = tokio::spawn(publisher_loop(
+            Arc::new(client),
+            Arc::from("comp-nested"),
+            receiver,
+            observation_loss,
+            notifier,
+            Arc::clone(&lost),
+            Arc::clone(&publish_timeouts),
+            shutdown,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while lost.load(Ordering::Acquire) != 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed focus gap discards both survivors");
+        producer.offer(ObservationRecord::FocusChanged {
+            keyboard: Some(5),
+            previous: Some(4),
+            exclusive_latch: None,
+            event_seq: 5,
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while publications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+                != 3
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("remaining focus gap and survivor publish");
+        shutdown_tx.send_replace(true);
+        task.await.expect("publisher exits");
+
+        let published = publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            published
+                .iter()
+                .filter(|(headers, _)| headers
+                    .get("name")
+                    .is_some_and(|name| name.ends_with("props.changed")))
+                .count(),
+            1,
+            "the successful props gap is acknowledged before the focus gap fails"
+        );
+        let props_gap = cosmix_bus::bus::parse(&published[0].1).expect("props gap parses");
+        assert_eq!(props_gap.get("event_seq"), Some("2"));
+        let focus_gap = cosmix_bus::bus::parse(&published[1].1).expect("focus gap parses");
+        assert_eq!(focus_gap.get("event_seq"), Some("4"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&focus_gap.body).unwrap(),
+            json!({"gap": true, "lost_count": 4, "cause": "publisher.loss"})
+        );
+        let survivor = cosmix_bus::bus::parse(&published[2].1).expect("survivor parses");
+        assert_eq!(survivor.get("event_seq"), Some("5"));
+        assert_eq!(publish_timeouts.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2160,6 +2360,7 @@ mod tests {
         let lost = Arc::new(AtomicU64::new(0));
         let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
         let notifier = producer.notifier();
+        let observation_loss = producer.loss_state();
         let (client, _commands, _states) = FakeClient::new(ConnState::Connected, false);
         let publications = Arc::clone(&client.publications);
         let (shutdown_tx, shutdown) = watch::channel(false);
@@ -2167,6 +2368,7 @@ mod tests {
             Arc::new(client),
             Arc::from("comp-nested"),
             receiver,
+            observation_loss,
             notifier,
             lost,
             Arc::new(AtomicU64::new(0)),
@@ -2204,14 +2406,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_publication_discards_backlog_and_recovers_with_one_gap() {
+    async fn rejected_publication_gaps_every_topic_in_the_discarded_backlog() {
         let lost = Arc::new(AtomicU64::new(0));
         let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
         let notifier = producer.notifier();
-        producer.offer(ObservationRecord::FocusChanged {
-            keyboard: Some(1),
-            previous: None,
-            exclusive_latch: None,
+        let observation_loss = producer.loss_state();
+        producer.offer(ObservationRecord::PropsChanged {
+            path: "input.corners.enabled".into(),
+            old: PropValue::Bool(true),
+            new: PropValue::Bool(false),
+            unix_ms: 0,
+            cause: "props.set",
             event_seq: 1,
         });
         producer.offer(ObservationRecord::FocusChanged {
@@ -2230,6 +2435,7 @@ mod tests {
             Arc::new(client),
             Arc::from("comp-nested"),
             receiver,
+            observation_loss,
             notifier,
             Arc::clone(&lost),
             Arc::clone(&publish_timeouts),
@@ -2254,23 +2460,40 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .len()
-                != 2
+                != 3
             {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("publisher-loss gap and survivor publish");
+        .expect("publisher-loss gaps and survivor publish");
         shutdown_tx.send_replace(true);
         task.await.expect("publisher exits");
         let published = publications
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let gap = cosmix_bus::bus::parse(&published[0].1).expect("gap parses");
+        let props_gap = cosmix_bus::bus::parse(&published[0].1).expect("props gap parses");
         assert_eq!(
-            serde_json::from_str::<Value>(&gap.body).unwrap(),
+            published[0].0.get("name").map(String::as_str),
+            Some("comp-nested.props.changed")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&props_gap.body).unwrap(),
             json!({"gap": true, "lost_count": 2, "cause": "publisher.loss"})
         );
+        let focus_gap = cosmix_bus::bus::parse(&published[1].1).expect("focus gap parses");
+        assert_eq!(
+            published[1].0.get("name").map(String::as_str),
+            Some("comp-nested.focus.changed")
+        );
+        assert_eq!(focus_gap.get("event_seq"), Some("2"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&focus_gap.body).unwrap(),
+            json!({"gap": true, "lost_count": 2, "cause": "publisher.loss"})
+        );
+        let survivor = cosmix_bus::bus::parse(&published[2].1).expect("survivor parses");
+        assert_eq!(survivor.get("command"), Some("focus.changed"));
+        assert_eq!(survivor.get("event_seq"), Some("3"));
         assert_eq!(publish_timeouts.load(Ordering::Acquire), 1);
     }
 
@@ -2279,6 +2502,7 @@ mod tests {
         let lost = Arc::new(AtomicU64::new(0));
         let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
         let notifier = producer.notifier();
+        let observation_loss = producer.loss_state();
         for sequence in 1..=3 {
             producer.offer(ObservationRecord::FocusChanged {
                 keyboard: Some(sequence),
@@ -2297,6 +2521,7 @@ mod tests {
             Arc::new(client),
             Arc::from("comp-nested"),
             receiver,
+            observation_loss,
             notifier,
             Arc::clone(&lost),
             Arc::clone(&publish_timeouts),
@@ -2347,6 +2572,7 @@ mod tests {
         let lost = Arc::new(AtomicU64::new(0));
         let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
         let notifier = producer.notifier();
+        let observation_loss = producer.loss_state();
         producer.offer(ObservationRecord::FocusChanged {
             keyboard: None,
             previous: Some(1),
@@ -2361,6 +2587,7 @@ mod tests {
             Arc::new(client),
             Arc::from("comp-nested"),
             receiver,
+            observation_loss,
             notifier,
             Arc::clone(&lost),
             Arc::clone(&publish_timeouts),
@@ -2387,6 +2614,7 @@ mod tests {
         let lost = Arc::new(AtomicU64::new(0));
         let (producer, observations) = port_observation::outbox(Arc::clone(&lost));
         let notifier = producer.notifier();
+        let observation_loss = producer.loss_state();
         producer.offer(ObservationRecord::FocusChanged {
             keyboard: Some(1),
             previous: None,
@@ -2405,6 +2633,7 @@ mod tests {
             reply_timeouts,
             publish_timeouts,
             observations,
+            observation_loss,
             notifier,
             lost,
             shutdown,
@@ -2450,7 +2679,8 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (client, commands, _states) = FakeClient::new(ConnState::Connected, false);
         let mut client = Some(client);
-        let (publish_timeouts, observations, lost_count) = test_observation_args();
+        let (publish_timeouts, observations, observation_loss, lost_count) =
+            test_observation_args();
         let worker = tokio::spawn(worker_loop(
             "comp-nested".into(),
             ingress,
@@ -2458,6 +2688,7 @@ mod tests {
             reply_timeouts,
             publish_timeouts,
             observations,
+            observation_loss,
             Arc::new(tokio::sync::Notify::new()),
             lost_count,
             shutdown,
@@ -2510,7 +2741,8 @@ mod tests {
         let (client, commands, _states) = FakeClient::new(ConnState::Connected, true);
         let responses_started = Arc::clone(&client.responses_started);
         let mut client = Some(client);
-        let (publish_timeouts, observations, lost_count) = test_observation_args();
+        let (publish_timeouts, observations, observation_loss, lost_count) =
+            test_observation_args();
         let worker = tokio::spawn(worker_loop(
             "comp-nested".into(),
             ingress,
@@ -2518,6 +2750,7 @@ mod tests {
             Arc::clone(&reply_timeouts),
             publish_timeouts,
             observations,
+            observation_loss,
             Arc::new(tokio::sync::Notify::new()),
             lost_count,
             shutdown,

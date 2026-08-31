@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -272,6 +272,122 @@ impl ObservationRecord {
     }
 }
 
+const TOPIC_SUFFIXES: [&str; 7] = [
+    PROPS_TOPIC_SUFFIX,
+    SURFACE_MAPPED_TOPIC_SUFFIX,
+    SURFACE_UNMAPPED_TOPIC_SUFFIX,
+    FOCUS_TOPIC_SUFFIX,
+    OUTPUT_TOPIC_SUFFIX,
+    CORNER_ENTERED_TOPIC_SUFFIX,
+    CORNER_LEFT_TOPIC_SUFFIX,
+];
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AffectedTopics(u8);
+
+impl AffectedTopics {
+    fn index(suffix: &str) -> usize {
+        TOPIC_SUFFIXES
+            .iter()
+            .position(|candidate| *candidate == suffix)
+            .expect("every observation has one of the seven fixed topic suffixes")
+    }
+
+    pub(crate) fn insert(&mut self, suffix: &str) {
+        let index = Self::index(suffix);
+        self.0 |= 1 << index;
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+
+    pub(crate) fn remove(&mut self, suffix: &str) {
+        self.0 &= !(1 << Self::index(suffix));
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub(crate) fn iter(self) -> impl Iterator<Item = &'static str> {
+        TOPIC_SUFFIXES
+            .into_iter()
+            .enumerate()
+            .filter_map(move |(index, suffix)| (self.0 & (1 << index) != 0).then_some(suffix))
+    }
+}
+
+pub(crate) struct LossState {
+    latest_by_topic: [AtomicU64; TOPIC_SUFFIXES.len()],
+    updates_in_progress: AtomicUsize,
+    update_generation: AtomicU64,
+}
+
+struct LossUpdateGuard<'a>(&'a LossState);
+
+impl Drop for LossUpdateGuard<'_> {
+    fn drop(&mut self) {
+        self.0.update_generation.fetch_add(1, Ordering::AcqRel);
+        self.0.updates_in_progress.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl LossState {
+    fn new() -> Self {
+        Self {
+            latest_by_topic: std::array::from_fn(|_| AtomicU64::new(0)),
+            updates_in_progress: AtomicUsize::new(0),
+            update_generation: AtomicU64::new(0),
+        }
+    }
+
+    fn begin_update(&self) -> LossUpdateGuard<'_> {
+        self.updates_in_progress.fetch_add(1, Ordering::AcqRel);
+        self.update_generation.fetch_add(1, Ordering::AcqRel);
+        LossUpdateGuard(self)
+    }
+
+    pub(crate) fn update_in_progress(&self) -> bool {
+        self.updates_in_progress.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) fn update_generation(&self) -> u64 {
+        self.update_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn record(&self, record: &ObservationRecord) {
+        self.latest_by_topic[AffectedTopics::index(record.topic_suffix())]
+            .fetch_max(record.event_seq(), Ordering::AcqRel);
+    }
+
+    pub(crate) fn affected_since(
+        &self,
+        acknowledged: &[u64; TOPIC_SUFFIXES.len()],
+    ) -> AffectedTopics {
+        let mut topics = AffectedTopics::default();
+        for (index, latest) in self.latest_by_topic.iter().enumerate() {
+            if latest.load(Ordering::Acquire) > acknowledged[index] {
+                topics.0 |= 1 << index;
+            }
+        }
+        topics
+    }
+
+    pub(crate) fn acknowledge(
+        &self,
+        acknowledged: &mut [u64; TOPIC_SUFFIXES.len()],
+        topics: AffectedTopics,
+        through: u64,
+    ) {
+        for (index, acknowledged) in acknowledged.iter_mut().enumerate() {
+            if topics.0 & (1 << index) != 0 {
+                *acknowledged = (*acknowledged).max(through);
+            }
+        }
+    }
+}
+
 fn rfc3339_millis(unix_ms: i64) -> String {
     Utc.timestamp_millis_opt(unix_ms)
         .single()
@@ -285,6 +401,7 @@ pub(crate) struct ObservationProducer {
     eviction: Receiver<ObservationRecord>,
     lost_count: Arc<AtomicU64>,
     notifier: Arc<Notify>,
+    loss_state: Arc<LossState>,
 }
 
 impl ObservationProducer {
@@ -301,8 +418,10 @@ impl ObservationProducer {
                 }
                 Err(TrySendError::Full(returned)) => {
                     record = returned;
+                    let _loss_update = self.loss_state.begin_update();
                     match self.eviction.try_recv() {
-                        Ok(_) => {
+                        Ok(evicted) => {
+                            self.loss_state.record(&evicted);
                             self.lost_count.fetch_add(1, Ordering::AcqRel);
                             self.notifier.notify_one();
                         }
@@ -320,6 +439,10 @@ impl ObservationProducer {
     pub(crate) fn notifier(&self) -> Arc<Notify> {
         Arc::clone(&self.notifier)
     }
+
+    pub(crate) fn loss_state(&self) -> Arc<LossState> {
+        Arc::clone(&self.loss_state)
+    }
 }
 
 pub(crate) fn outbox(
@@ -334,12 +457,14 @@ fn outbox_with_capacity(
 ) -> (ObservationProducer, Receiver<ObservationRecord>) {
     let (sender, receiver) = crossbeam_channel::bounded(capacity);
     let notifier = Arc::new(Notify::new());
+    let loss_state = Arc::new(LossState::new());
     (
         ObservationProducer {
             sender,
             eviction: receiver.clone(),
             lost_count,
             notifier,
+            loss_state,
         },
         receiver,
     )
@@ -636,8 +761,8 @@ impl WaylandState {
     pub(crate) fn refresh_corner_regions(&mut self) {
         let Some(projection) = project_outputs(self) else {
             self.observations.corner_regions.clear();
-            self.observations.corner_output_keys.clear();
             self.reset_corner_detector();
+            self.observations.corner_output_keys.clear();
             return;
         };
         let mut keys = Vec::with_capacity(projection.keys.len());

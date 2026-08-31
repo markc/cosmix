@@ -28,7 +28,9 @@ The control plane exposes seven verbs:
   owner) or an object subtree with its immediate children.
 - `comp.props.watch` seeds the property-change baseline and returns
   `{topic:"<service>.props.changed",event_seq,lost_count}`, where `service` is
-  the name this compositor instance actually registered.
+  the name this compositor instance actually registered. The reply is truthful
+  only for a caller that subscribed to that topic before calling `watch` and
+  remains subscribed.
 - `comp.props.set {path,value}` mutates one of the four corner properties and
   returns `{path,old,new}`.
 
@@ -85,7 +87,11 @@ below, so handlers do not depend on the instance name.
 For a reliable property bootstrap: subscribe to the instance topic (for
 example `comp.props.changed` on the seat or `comp-nested.props.changed` when
 nested), call `comp.props.watch`, verify its returned topic, then read the
-required tree or subtree. Mix handlers match the suffix: `on props.changed`,
+required tree or subtree. The watcher is itself the subscriber: while that
+subscription remains active, noded cannot send `topic.idle` for its subscriber
+generation. An idle delivered in the same control batch as `watch` therefore
+belongs to a previous generation; the next zero-to-one `topic.active` re-seeds
+the baseline. Mix handlers match the suffix: `on props.changed`,
 `on surface.mapped`, `on focus.changed`, and so on. Changes are reduced after
 each complete protocol dispatch. A leaf therefore appears at most once per
 cycle, with its cycle-start `old`, final `new`, lexical path order and one of
@@ -101,8 +107,9 @@ Mutations within an existing row remain leaf-granular.
 The sequence is process-global, strictly increasing and shared by property,
 surface, focus, output and corner records. If it reaches `u64::MAX`, that value
 is offered once and observation enters a terminal exhausted state rather than
-reusing a sequence. If the bounded 256-record outbox
-evicts old records, the next surviving topic receives a gap first: Bus header
+reusing a sequence. If the bounded 256-record outbox evicts old records, a gap
+is published to every topic that lost records before the next surviving record
+is published (at most seven gap publications per loss interval): Bus header
 `event_seq=<last lost seq>` and body
 `{gap:true,lost_count,cause:"outbox.overflow"}`. A rejected or timed-out
 publication discards its uncertain backlog and recovers with the same body
