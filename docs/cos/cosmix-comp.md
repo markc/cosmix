@@ -10,7 +10,9 @@ The default `bus` feature gives the compositor a read-only Bus control plane.
 The seat/KMS compositor registers as `comp`; `--nested` registers as
 `comp-nested`. `--bus-service NAME` overrides either name and accepts
 `^[a-z][a-z0-9-]{1,30}$`. A build without the `bus` feature rejects that flag
-instead of silently ignoring it.
+instead of silently ignoring it. The broker independently enforces the same
+SPEC 10 service-name grammar at registration and rejects an invalid `from`
+with Bus rc 10.
 
 P-0 exposes five verbs:
 
@@ -59,23 +61,30 @@ zero until watch support lands. `port.broker` is driven by connection-state
 edges and is `connected` or `retrying`. `port.reply_timeouts` counts replies
 whose bounded reply lane was saturated. For a timeout: reply send abandoned after 2 s; delivery not guaranteed (the client sink may still flush it). It is separate from topic-only `lost_count`.
 
-`focus.session_lock` is `none`, `locking`, `locked` or `orphaned`. While a
-session lock is active, the read tree applies the same presentation boundary
-as `WaylandState::session_lock_active`, renderer selection through
-`surface_is_session_presentable`, and foreign-toplevel publication: ordinary
-surfaces retain ids, roles, bands and geometry, but report `visible=false` and
-null `title`/`app_id`; `windows` is empty. Unlock restores the ordinary
-projection.
+`focus.session_lock` is `none`, `locking`, `locked`, `orphaned` or `unlocking`.
+While a session lock is active, the read tree applies the same
+`WaylandState::session_lock_active` presentation boundary as the renderer and
+foreign-toplevel publication: ordinary surfaces retain ids, roles, bands and
+geometry, but report `visible=false` and null `title`/`app_id`; `windows` is
+empty. During the KMS unlock window (`normal_scene_restricted()`), the read
+tree stays redacted with `focus.session_lock="unlocking"` until the
+compositor's own presentation predicate lifts, at the same moment the renderer
+resumes. Unlock then restores the ordinary projection.
 
 All application errors use Bus rc 10 with exactly one of
 `{"error":"unknown_path"}`, `{"error":"busy"}` or
 `{"error":"unknown_verb"}`, plus
 `{"error":"too_large","limit_bytes":N,"hint":"read a subtree"}` when a
-serialised reply would exceed the Bus message limit after reserved framing and
-header headroom. Replies are never truncated. An absent broker never delays
-compositor startup: the port thread reports `retrying` and reconnects
-independently. A registration rejection (collision or admission) is logged
-once, ends the port worker without renaming, and leaves the compositor running.
+serialised reply would exceed the effective broker-path ceiling. `N` is
+8,384,512 bytes: `min(16 MiB Bus message, 8 MiB single WebSocket frame)` minus
+4 KiB of documented header/framing headroom. Immediately before sending, comp
+also measures the actual canonical response headers, correlation id and
+framing with the body and refuses any reply whose complete wire size would
+exceed that ceiling. Replies are never truncated. An absent broker never
+delays compositor startup: the port thread reports `retrying` and reconnects
+independently. A registration rejection (collision, invalid SPEC 10 name or
+admission) is logged once, ends the port worker without renaming, and leaves
+the compositor running.
 
 The broker client lives on the named `cosmix-comp-port` OS thread with its own
 current-thread Tokio runtime. At most 16 accepted reads cross a bounded calloop

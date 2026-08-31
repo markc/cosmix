@@ -32,6 +32,11 @@ pub const EMPTY_MESSAGE: &str = "---\n---\n";
 /// broker's configured frame/message caps.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Maximum size of one WebSocket frame on the broker path. A Bus message is
+/// written as a single WebSocket frame on that path, so its effective
+/// per-message ceiling is `min(MAX_MESSAGE_BYTES, WS_MAX_FRAME_BYTES)`.
+pub const WS_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
 /// Maximum number of header lines parsed from a single Bus message.
 /// Bounds the `BTreeMap` a hostile frame can force the parser to build —
 /// a 16 MiB frame of 1-byte header lines would otherwise allocate

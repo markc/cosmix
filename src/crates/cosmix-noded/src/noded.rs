@@ -51,11 +51,9 @@ const PEER_OUTBOUND_BUFFER: usize = 256;
 /// path) before tungstenite rejects it — bounding the buffer+parse a
 /// mesh peer can force. 16 MiB is generous over the ~1 MiB norm for the
 /// largest legitimate Bus bodies (`subscription::MAX_SNAPSHOT_BYTES`);
-/// axum's default is 64 MiB. Mirrors `cosmix_bus::MAX_MESSAGE_BYTES` so
+/// axum's default is 64 MiB. Mirrors `cosmix_bus::bus::MAX_MESSAGE_BYTES` so
 /// neither the native-socket nor the WebSocket ingress is unbounded.
 const WS_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
-/// Max size of a single WebSocket frame (a message may span frames).
-const WS_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 /// Coalescing window for backpressure-drop warnings. A flood of dropped
 /// messages produces at most one tracing event per window per call site,
@@ -1691,7 +1689,7 @@ async fn ws_handler(
     // MiB. Mirrors the native-transport cap (cosmix-lib-bus
     // MAX_MESSAGE_BYTES) so neither ingress path is unbounded.
     ws.max_message_size(WS_MAX_MESSAGE_BYTES)
-        .max_frame_size(WS_MAX_FRAME_BYTES)
+        .max_frame_size(bus::WS_MAX_FRAME_BYTES)
         .on_upgrade(move |socket| handle_socket(socket, state, source_ip))
 }
 
@@ -2984,6 +2982,15 @@ async fn handle_noded_command(
                     return;
                 }
             };
+            if !valid_service_name(&from) {
+                let mut resp = respond("10");
+                resp.set(
+                    "error",
+                    "noded.register 'from' must match ^[a-z][a-z0-9-]{1,30}$",
+                );
+                let _ = tx.try_send(resp.to_wire());
+                return;
+            }
 
             // Build the registry record from the provenance the citizen
             // supplied in the register body (all optional — absent for an
@@ -3841,6 +3848,17 @@ async fn handle_noded_command(
             let _ = tx.try_send(resp.to_wire());
         }
     }
+}
+
+fn valid_service_name(name: &str) -> bool {
+    (2..=31).contains(&name.len())
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 /// Parse a `ui.subscribe` body (`key: value` lines per § 3.9). Returns
@@ -5881,6 +5899,29 @@ mod tests {
             "registration did not echo the requested name: body={}",
             resp.body,
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn noded_register_rejects_names_outside_spec_10_grammar() {
+        let Some(url) = spawn_broker().await else {
+            return;
+        };
+        let (mut sink, mut stream) = raw_connect(&url).await;
+        let id = "invalid-reg-1";
+        let request = BusMessage::new()
+            .with_header("command", "noded.register")
+            .with_header("from", "Invalid_Name")
+            .with_header("to", "noded")
+            .with_header("type", "request")
+            .with_header("id", id);
+        let response = raw_call(&mut sink, &mut stream, request, id).await;
+        assert_eq!(response.get("rc"), Some("10"));
+        assert_eq!(
+            response.get("error"),
+            Some("noded.register 'from' must match ^[a-z][a-z0-9-]{1,30}$")
+        );
+
+        raw_register(&mut sink, &mut stream, "valid-after-refusal").await;
     }
 
     /// Anonymous connections must NOT be able to set ANY `from`

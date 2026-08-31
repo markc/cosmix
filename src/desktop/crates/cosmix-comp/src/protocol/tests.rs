@@ -44,7 +44,7 @@ fn snapshot_context(backend: &'static str) -> port_snapshot::SnapshotContext {
         } else {
             "comp-nested"
         }),
-        version: Arc::from("0.33.2-test"),
+        version: Arc::from("0.33.3-test"),
         backend,
         engine: "bevy-0.19/wgpu",
         instance: Arc::from("protocol-fixture"),
@@ -31742,6 +31742,36 @@ fn session_lock_owner_death_orphans_after_locked_and_aborts_before_locked() {
     assert!(saw_blank_removed);
 }
 
+#[cfg(feature = "bus")]
+#[test]
+fn session_lock_orphaned_snapshot_keeps_every_lock_view_redacted() {
+    let mut harness = KeybindingHarness::new(true);
+    let ordinary_object =
+        map_named_test_toplevel(&mut harness, "Private title", "org.cosmix.Private").3;
+    let ordinary_id = harness.server.state.surfaces[&ordinary_object].id.0;
+    let lock = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    present_test_security_epoch(&mut harness, lock.lock);
+    let generation = match &harness.server.state.lock_lifecycle {
+        LockLifecycle::Locked { generation, .. } => *generation,
+        _ => panic!("fixture must be locked before orphaning"),
+    };
+    harness.server.state.lock_lifecycle = LockLifecycle::OrphanedLocked { generation };
+    harness.server.state.deactivate_all_lock_surfaces();
+
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &snapshot_context("nested"))
+        .expect("orphaned snapshot");
+    let ordinary = snapshot
+        .surfaces
+        .get(&format!("s{ordinary_id}"))
+        .expect("ordinary toplevel shape remains projected");
+    assert!(!ordinary.visible);
+    assert_eq!(ordinary.title, None);
+    assert_eq!(ordinary.app_id, None);
+    assert!(snapshot.windows.is_empty());
+    assert_eq!(snapshot.focus.session_lock, "orphaned");
+}
+
 fn kms_security_test_key(device: u64, connector_name: &str) -> OutputKey {
     OutputKey {
         device,
@@ -32236,7 +32266,10 @@ fn kms_locked_pause_unlock_and_resume_restore_only_after_displayed_epoch() {
         output_version.min(4),
         output,
     );
-    let normal_object = map_test_undecorated_toplevel(&mut harness);
+    let normal_object =
+        map_named_test_toplevel(&mut harness, "Private title", "org.cosmix.Private").3;
+    #[cfg(feature = "bus")]
+    let normal_id = harness.server.state.surfaces[&normal_object].id.0;
     let manager = harness.bind_test_global("ext_session_lock_manager_v1", 1);
     let _ = harness.sync();
     let lock_object = harness.allocate_object_id();
@@ -32354,6 +32387,20 @@ fn kms_locked_pause_unlock_and_resume_restore_only_after_displayed_epoch() {
     assert!(harness.server.state.keyboard.pressed_keys().is_empty());
     assert!(harness.server.state.pointer.current_pressed().is_empty());
     assert!(harness.server.state.saved_cursor_selection.is_some());
+    #[cfg(feature = "bus")]
+    {
+        let unlocking = port_snapshot::snapshot(&harness.server.state, &snapshot_context("kms"))
+            .expect("paused KMS unlock snapshot");
+        let ordinary = unlocking
+            .surfaces
+            .get(&format!("s{normal_id}"))
+            .expect("ordinary toplevel shape remains projected while unlocking");
+        assert!(!ordinary.visible);
+        assert_eq!(ordinary.title, None);
+        assert_eq!(ordinary.app_id, None);
+        assert!(unlocking.windows.is_empty());
+        assert_eq!(unlocking.focus.session_lock, "unlocking");
+    }
 
     let paused_retry = harness.allocate_object_id();
     send_request(&mut harness.client, manager, 1, &words(&[paused_retry]));
@@ -32412,6 +32459,20 @@ fn kms_locked_pause_unlock_and_resume_restore_only_after_displayed_epoch() {
             .kms_session_lock_gate
             .client_delivery_blocked(false, false)
     );
+    #[cfg(feature = "bus")]
+    {
+        let unlocking = port_snapshot::snapshot(&harness.server.state, &snapshot_context("kms"))
+            .expect("armed KMS unlock snapshot");
+        let ordinary = unlocking
+            .surfaces
+            .get(&format!("s{normal_id}"))
+            .expect("ordinary toplevel shape remains projected behind the barrier");
+        assert!(!ordinary.visible);
+        assert_eq!(ordinary.title, None);
+        assert_eq!(ordinary.app_id, None);
+        assert!(unlocking.windows.is_empty());
+        assert_eq!(unlocking.focus.session_lock, "unlocking");
+    }
 
     harness
         .commands
@@ -32436,6 +32497,20 @@ fn kms_locked_pause_unlock_and_resume_restore_only_after_displayed_epoch() {
             .kms_session_lock_gate
             .client_delivery_blocked(false, false)
     );
+    #[cfg(feature = "bus")]
+    {
+        let restored = port_snapshot::snapshot(&harness.server.state, &snapshot_context("kms"))
+            .expect("restored KMS snapshot");
+        let ordinary = restored
+            .surfaces
+            .get(&format!("s{normal_id}"))
+            .expect("ordinary toplevel restored after the presentation barrier");
+        assert!(ordinary.visible);
+        assert_eq!(ordinary.title.as_deref(), Some("Private title"));
+        assert_eq!(ordinary.app_id.as_deref(), Some("org.cosmix.Private"));
+        assert!(restored.windows.contains_key(&format!("s{normal_id}")));
+        assert_eq!(restored.focus.session_lock, "none");
+    }
     harness.server.state.handle_host_input(HostInput::Key {
         keycode: Keycode::new(38),
         state: HostButtonState::Released,

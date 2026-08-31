@@ -13,6 +13,7 @@ use std::{
     time::Duration,
 };
 
+use cosmix_bus::bus::BusMessage;
 use cosmix_client::{ConnState, SupervisedClient, SupervisedError};
 use serde_json::Value;
 use smithay::reexports::calloop::channel;
@@ -23,7 +24,8 @@ use tokio::{
 
 use crate::{decoration::DecorationStartup, protocol::port_snapshot};
 use port_snapshot::{
-    BROKER_CONNECTED, BROKER_RETRYING, CompSnapshot, SnapshotContext, dispatch_read, error,
+    BROKER_CONNECTED, BROKER_RETRYING, CompSnapshot, MAX_REPLY_BODY_BYTES, MAX_REPLY_WIRE_BYTES,
+    SnapshotContext, dispatch_read, error, too_large,
 };
 
 pub(crate) const PORT_QUEUE_CAPACITY: usize = 16;
@@ -461,6 +463,7 @@ async fn worker_loop<F, Fut, C>(
     let (reply_sender, reply_receiver) = tokio_mpsc::channel(PORT_REPLY_CAPACITY);
     let reply_task = tokio::spawn(reply_loop(
         Arc::clone(&client),
+        Arc::from(service.as_str()),
         reply_receiver,
         Arc::clone(&reply_timeouts),
     ));
@@ -661,10 +664,18 @@ fn queue_reply(
 
 async fn reply_loop<C: WorkerClient>(
     client: Arc<C>,
+    service: Arc<str>,
     mut replies: tokio_mpsc::Receiver<PendingReply>,
     reply_timeouts: Arc<AtomicU64>,
 ) {
     while let Some(reply) = replies.recv().await {
+        let Some(reply) = enforce_reply_wire_limit(&service, reply) else {
+            tracing::debug!(
+                service = %service,
+                "compositor Bus reply headers exceed the broker WebSocket frame cap"
+            );
+            continue;
+        };
         match tokio::time::timeout(REPLY_SEND_TIMEOUT, client.respond_parts(&reply)).await {
             Err(_) => {
                 reply_timeouts.fetch_add(1, Ordering::AcqRel);
@@ -680,6 +691,36 @@ async fn reply_loop<C: WorkerClient>(
             Ok(Ok(())) => {}
         }
     }
+}
+
+/// Exact byte count produced by `NodedClient::respond_parts` for this reply.
+/// The body stays borrowed: only the small canonical header block is assembled.
+fn reply_wire_bytes(service: &str, reply: &PendingReply) -> usize {
+    let mut message = BusMessage::new()
+        .with_header("command", &reply.command)
+        .with_header("from", service)
+        .with_header("to", &reply.from)
+        .with_header("type", "response")
+        .with_header("rc", &reply.rc.to_string());
+    if let Some(id) = reply.id.as_deref() {
+        message = message.with_header("id", id);
+    }
+    let header_and_framing = message.to_wire().len();
+    header_and_framing
+        .checked_add(reply.body.len())
+        .and_then(|bytes| {
+            bytes.checked_add(usize::from(
+                !reply.body.is_empty() && !reply.body.ends_with('\n'),
+            ))
+        })
+        .unwrap_or(usize::MAX)
+}
+
+fn enforce_reply_wire_limit(service: &str, mut reply: PendingReply) -> Option<PendingReply> {
+    if reply_wire_bytes(service, &reply) > MAX_REPLY_WIRE_BYTES {
+        (reply.rc, reply.body) = too_large(MAX_REPLY_BODY_BYTES);
+    }
+    (reply_wire_bytes(service, &reply) <= MAX_REPLY_WIRE_BYTES).then_some(reply)
 }
 
 fn random_instance_id() -> Result<String, String> {
@@ -988,6 +1029,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reply_headroom_covers_maximal_headers_and_exact_body_limit_fits() {
+        let maximal_service = format!("a{}", "z".repeat(30));
+        assert!(validate_service_name(&maximal_service).is_ok());
+        let reply = PendingReply {
+            from: maximal_service.clone(),
+            command: "comp.props.describe".into(),
+            id: Some(format!("noded-{}", u64::MAX)),
+            rc: 0,
+            body: Arc::from("x".repeat(MAX_REPLY_BODY_BYTES)),
+        };
+        let wire_bytes = reply_wire_bytes(&maximal_service, &reply);
+        let header_and_framing = wire_bytes - reply.body.len();
+        assert!(
+            header_and_framing <= port_snapshot::REPLY_WIRE_HEADROOM_BYTES,
+            "{header_and_framing} header/framing bytes exceed the documented reserve"
+        );
+        assert!(wire_bytes <= MAX_REPLY_WIRE_BYTES);
+
+        let checked = enforce_reply_wire_limit(&maximal_service, reply)
+            .expect("maximal canonical reply headers fit");
+        assert_eq!(checked.rc, 0);
+        assert_eq!(checked.body.len(), MAX_REPLY_BODY_BYTES);
+    }
+
+    #[test]
+    fn measured_wire_overflow_becomes_too_large() {
+        let reply = PendingReply {
+            from: "requester".into(),
+            command: "comp.props.get".into(),
+            id: Some("noded-1".into()),
+            rc: 0,
+            body: Arc::from("x".repeat(MAX_REPLY_WIRE_BYTES)),
+        };
+        assert!(reply_wire_bytes("comp-nested", &reply) > MAX_REPLY_WIRE_BYTES);
+
+        let checked =
+            enforce_reply_wire_limit("comp-nested", reply).expect("too_large response fits");
+        assert_eq!(checked.rc, 10);
+        assert_eq!(
+            serde_json::from_str::<Value>(&checked.body).expect("too_large JSON"),
+            serde_json::json!({
+                "error": "too_large",
+                "limit_bytes": MAX_REPLY_BODY_BYTES,
+                "hint": "read a subtree",
+            })
+        );
+        assert!(reply_wire_bytes("comp-nested", &checked) <= MAX_REPLY_WIRE_BYTES);
+    }
+
     #[tokio::test]
     async fn ping_ignores_malformed_body_while_property_reads_reject_it() {
         let (ingress, source, _) = test_ingress();
@@ -1154,7 +1245,12 @@ mod tests {
         let client = Arc::new(client);
         let reply_timeouts = Arc::new(AtomicU64::new(0));
         let (sender, receiver) = tokio_mpsc::channel(1);
-        let task = tokio::spawn(reply_loop(client, receiver, Arc::clone(&reply_timeouts)));
+        let task = tokio::spawn(reply_loop(
+            client,
+            Arc::from("comp-nested"),
+            receiver,
+            Arc::clone(&reply_timeouts),
+        ));
         sender
             .send(PendingReply::new(
                 command("comp.ping", 1),

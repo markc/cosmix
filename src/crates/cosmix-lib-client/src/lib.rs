@@ -37,7 +37,7 @@ pub use cosmix_bus::PortReply;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{NameCollision, NodedClient};
+pub use native::{NameCollision, NodedClient, RegistrationRejected};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod supervised;

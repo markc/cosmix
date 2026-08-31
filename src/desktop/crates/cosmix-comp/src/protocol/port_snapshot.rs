@@ -26,13 +26,22 @@ use super::{
 pub(crate) const BROKER_RETRYING: u8 = 0;
 pub(crate) const BROKER_CONNECTED: u8 = 1;
 
-/// Space reserved inside `cosmix_bus::bus::MAX_MESSAGE_BYTES` for Bus framing and
-/// response headers (`command`, `from`, `to`, `type`, `rc`, and correlation
-/// `id`). Property bodies at or below the resulting limit cannot consume the
-/// transport's entire message allowance.
-const REPLY_WIRE_HEADROOM_BYTES: usize = 4 * 1024;
-pub(crate) const MAX_REPLY_BODY_BYTES: usize =
-    cosmix_bus::bus::MAX_MESSAGE_BYTES - REPLY_WIRE_HEADROOM_BYTES;
+/// Effective Bus message ceiling on the broker WebSocket path. The client
+/// writes each Bus message as one frame, so both transport caps apply.
+pub(crate) const MAX_REPLY_WIRE_BYTES: usize =
+    if cosmix_bus::bus::MAX_MESSAGE_BYTES < cosmix_bus::bus::WS_MAX_FRAME_BYTES {
+        cosmix_bus::bus::MAX_MESSAGE_BYTES
+    } else {
+        cosmix_bus::bus::WS_MAX_FRAME_BYTES
+    };
+
+/// Upper bound reserved inside [`MAX_REPLY_WIRE_BYTES`] for canonical Bus
+/// framing and response headers (`command`, `from`, `to`, `type`, `rc`, and
+/// broker correlation `id`). The reply sender also measures those actual bytes
+/// immediately before sending; the corresponding test proves that maximal
+/// grammar-valid service names and correlation headers stay within this bound.
+pub(crate) const REPLY_WIRE_HEADROOM_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_REPLY_BODY_BYTES: usize = MAX_REPLY_WIRE_BYTES - REPLY_WIRE_HEADROOM_BYTES;
 
 pub(super) fn exact_i32_to_f32(value: i32) -> Option<f32> {
     let converted = value as f32;
@@ -526,8 +535,9 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         .values()
         .filter(|record| !matches!(record.role, SurfaceRole::Dormant(_)))
     {
-        let redact_ordinary_surface =
-            session_lock_active && !state.surface_is_session_presentable(record);
+        let redact_ordinary_surface = session_lock_active
+            && (matches!(&state.lock_lifecycle, LockLifecycle::Unlocked)
+                || !state.surface_is_session_presentable(record));
         let output = surface_output(state, record, default_output.as_ref())
             .and_then(|output| output_key_for(&output_keys, output));
         let layer = match &record.role {
@@ -651,11 +661,15 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
                 .and_then(|surface| state.surfaces.get(&surface.id()))
                 .map(|record| record.id.0),
             pointer_grab: pointer_grab_name(state),
-            session_lock: match &state.lock_lifecycle {
-                LockLifecycle::Unlocked => "none",
-                LockLifecycle::Locking { .. } => "locking",
-                LockLifecycle::Locked { .. } => "locked",
-                LockLifecycle::OrphanedLocked { .. } => "orphaned",
+            session_lock: if !session_lock_active {
+                "none"
+            } else {
+                match &state.lock_lifecycle {
+                    LockLifecycle::Unlocked => "unlocking",
+                    LockLifecycle::Locking { .. } => "locking",
+                    LockLifecycle::Locked { .. } => "locked",
+                    LockLifecycle::OrphanedLocked { .. } => "orphaned",
+                }
             },
         },
         decoration: DecorationSnapshot {
@@ -1178,7 +1192,7 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         format = "surface_id"
     ),
     descriptor!(&[L("focus"), L("pointer_grab")], String, "Active pointer grab kind", enum = &["none", "chrome", "move", "resize", "popup"]),
-    descriptor!(&[L("focus"), L("session_lock")], String, "Session-lock observation state", enum = &["none", "locking", "locked", "orphaned"]),
+    descriptor!(&[L("focus"), L("session_lock")], String, "Session-lock observation state", enum = &["none", "locking", "locked", "orphaned", "unlocking"]),
     descriptor!(
         &[L("decoration"), L("enabled")],
         Bool,
@@ -1404,7 +1418,7 @@ fn enforce_measured_reply_limit(reply: SerialisedReply, limit_bytes: usize) -> (
     }
 }
 
-fn too_large(limit_bytes: usize) -> (u8, Arc<str>) {
+pub(crate) fn too_large(limit_bytes: usize) -> (u8, Arc<str>) {
     (
         10,
         Arc::from(
