@@ -1,6 +1,7 @@
 //! `comp.*` Bus citizen worker and its bounded protocol ingress.
 
 use std::{
+    collections::BTreeMap,
     fmt::Write as _,
     future::Future,
     pin::Pin,
@@ -15,14 +16,18 @@ use std::{
 
 use cosmix_bus::bus::BusMessage;
 use cosmix_client::{ConnState, SupervisedClient, SupervisedError};
-use serde_json::Value;
+use serde_json::{Value, json};
 use smithay::reexports::calloop::channel;
 use tokio::{
     sync::{Semaphore, mpsc as tokio_mpsc, watch},
     task::JoinSet,
 };
 
-use crate::{decoration::DecorationStartup, protocol::port_snapshot};
+use crate::{
+    decoration::DecorationStartup,
+    protocol::{port_observation, port_snapshot},
+};
+use port_observation::{ObservationProducer, ObservationRecord};
 use port_snapshot::{
     BROKER_CONNECTED, BROKER_RETRYING, CompSnapshot, MAX_REPLY_BODY_BYTES, MAX_REPLY_WIRE_BYTES,
     SnapshotContext, dispatch_read, error, too_large,
@@ -32,6 +37,8 @@ pub(crate) const PORT_QUEUE_CAPACITY: usize = 16;
 const PORT_REPLY_CAPACITY: usize = 16;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 const REPLY_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+const PUBLISH_TIMEOUT: Duration = Duration::from_secs(2);
+const PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PORT_SHUTDOWN_GRACE: Duration = Duration::from_millis(300);
 const CLIENT_SHUTDOWN_BUDGET: Duration = Duration::from_millis(250);
 const DEREGISTER_BUDGET: Duration = Duration::from_millis(200);
@@ -39,20 +46,102 @@ const CLOSE_BUDGET: Duration = Duration::from_millis(50);
 
 pub(crate) enum PortCommand {
     Snapshot(PortRequest),
+    Watch(PortReply),
+    Set(PortSetRequest),
+    WatchState { active: bool, order: u64 },
 }
 
 pub(crate) struct PortRequest {
     pub(crate) reply: tokio::sync::oneshot::Sender<Arc<CompSnapshot>>,
 }
 
+pub(crate) struct PortReply {
+    pub(crate) order: u64,
+    pub(crate) reply: tokio::sync::oneshot::Sender<(u8, Arc<str>)>,
+}
+
+pub(crate) struct PortSetRequest {
+    pub(crate) order: u64,
+    pub(crate) path: String,
+    pub(crate) value: Value,
+    pub(crate) reply: tokio::sync::oneshot::Sender<(u8, Arc<str>)>,
+}
+
+pub(crate) enum PortControl {
+    Watch(PortReply),
+    Set(PortSetRequest),
+    WatchState { active: bool, order: u64 },
+}
+
+impl PortControl {
+    pub(crate) fn order(&self) -> u64 {
+        match self {
+            Self::Watch(request) => request.order,
+            Self::Set(request) => request.order,
+            Self::WatchState { order, .. } => *order,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct PortIngress {
     sender: channel::SyncSender<PortCommand>,
     queue_depth: Arc<AtomicUsize>,
+    control_order: Arc<AtomicU64>,
+    pending_idle_order: Arc<AtomicU64>,
 }
 
 impl PortIngress {
     pub(crate) fn request_snapshot(&self) -> Result<SnapshotAdmission, ()> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.admit(PortCommand::Snapshot(PortRequest { reply }), receive)
+            .map(SnapshotAdmission)
+    }
+
+    pub(crate) fn request_watch(&self) -> Result<ControlAdmission, ()> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let order = self.next_control_order();
+        self.admit(PortCommand::Watch(PortReply { order, reply }), receive)
+    }
+
+    pub(crate) fn request_set(&self, path: String, value: Value) -> Result<ControlAdmission, ()> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.admit(
+            PortCommand::Set(PortSetRequest {
+                order: self.next_control_order(),
+                path,
+                value,
+                reply,
+            }),
+            receive,
+        )
+    }
+
+    pub(crate) fn set_watch_state(&self, active: bool) {
+        let order = self.next_control_order();
+        if let Err(TrySendError::Full(_)) = self
+            .sender
+            .try_send(PortCommand::WatchState { active, order })
+            && !active
+        {
+            self.pending_idle_order.fetch_max(order, Ordering::AcqRel);
+        }
+    }
+
+    fn next_control_order(&self) -> u64 {
+        self.control_order
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_add(1))
+            })
+            .unwrap_or(u64::MAX)
+            .saturating_add(1)
+    }
+
+    fn admit<T>(
+        &self,
+        command: PortCommand,
+        receive: tokio::sync::oneshot::Receiver<T>,
+    ) -> Result<Admission<T>, ()> {
         let mut depth = self.queue_depth.load(Ordering::Acquire);
         loop {
             if depth >= PORT_QUEUE_CAPACITY {
@@ -68,12 +157,8 @@ impl PortIngress {
                 Err(observed) => depth = observed,
             }
         }
-        let (reply, receive) = tokio::sync::oneshot::channel();
-        match self
-            .sender
-            .try_send(PortCommand::Snapshot(PortRequest { reply }))
-        {
-            Ok(()) => Ok(SnapshotAdmission {
+        match self.sender.try_send(command) {
+            Ok(()) => Ok(Admission {
                 receive,
                 depth: QueueDepthGuard(Arc::clone(&self.queue_depth)),
             }),
@@ -90,13 +175,13 @@ impl PortIngress {
     }
 }
 
-pub(crate) struct SnapshotAdmission {
-    receive: tokio::sync::oneshot::Receiver<Arc<CompSnapshot>>,
+pub(crate) struct Admission<T> {
+    receive: tokio::sync::oneshot::Receiver<T>,
     depth: QueueDepthGuard,
 }
 
-impl SnapshotAdmission {
-    pub(crate) async fn receive(self) -> Result<Arc<CompSnapshot>, ()> {
+impl<T> Admission<T> {
+    pub(crate) async fn receive(self) -> Result<T, ()> {
         let Self { receive, depth } = self;
         let result = match tokio::time::timeout(SNAPSHOT_TIMEOUT, receive).await {
             Ok(Ok(snapshot)) => Ok(snapshot),
@@ -107,19 +192,48 @@ impl SnapshotAdmission {
     }
 }
 
+pub(crate) struct SnapshotAdmission(Admission<Arc<CompSnapshot>>);
+
+impl SnapshotAdmission {
+    pub(crate) async fn receive(self) -> Result<Arc<CompSnapshot>, ()> {
+        self.0.receive().await
+    }
+}
+
+pub(crate) type ControlAdmission = Admission<(u8, Arc<str>)>;
+
 pub(crate) struct PortProtocolWiring {
     pub(crate) source: channel::Channel<PortCommand>,
     pub(crate) context: Arc<SnapshotContext>,
+    pub(crate) observation_producer: ObservationProducer,
 }
 
 #[cfg(test)]
-pub(crate) fn test_wiring(context: Arc<SnapshotContext>) -> (PortProtocolWiring, PortIngress) {
+pub(crate) fn test_wiring(
+    context: Arc<SnapshotContext>,
+) -> (
+    PortProtocolWiring,
+    PortIngress,
+    crossbeam_channel::Receiver<ObservationRecord>,
+) {
     let (sender, source) = channel::sync_channel(PORT_QUEUE_CAPACITY);
     let ingress = PortIngress {
         sender,
         queue_depth: context.queue_depth.clone(),
+        control_order: Arc::new(AtomicU64::new(0)),
+        pending_idle_order: context.pending_idle_order.clone(),
     };
-    (PortProtocolWiring { source, context }, ingress)
+    let (observation_producer, observations) =
+        port_observation::outbox(Arc::clone(&context.lost_count));
+    (
+        PortProtocolWiring {
+            source,
+            context,
+            observation_producer,
+        },
+        ingress,
+        observations,
+    )
 }
 
 pub(crate) struct PortStarter {
@@ -128,6 +242,9 @@ pub(crate) struct PortStarter {
     ingress: PortIngress,
     broker: Arc<AtomicU8>,
     reply_timeouts: Arc<AtomicU64>,
+    publish_timeouts: Arc<AtomicU64>,
+    observations: crossbeam_channel::Receiver<ObservationRecord>,
+    lost_count: Arc<AtomicU64>,
 }
 
 pub(crate) struct PortWorker {
@@ -147,10 +264,17 @@ pub(crate) fn prepare(
     let broker = Arc::new(AtomicU8::new(BROKER_RETRYING));
     let queue_depth = Arc::new(AtomicUsize::new(0));
     let reply_timeouts = Arc::new(AtomicU64::new(0));
+    let publish_timeouts = Arc::new(AtomicU64::new(0));
+    let event_seq = Arc::new(AtomicU64::new(0));
+    let lost_count = Arc::new(AtomicU64::new(0));
+    let pending_idle_order = Arc::new(AtomicU64::new(0));
+    let (observation_producer, observations) = port_observation::outbox(Arc::clone(&lost_count));
     let (sender, source) = channel::sync_channel(PORT_QUEUE_CAPACITY);
     let ingress = PortIngress {
         sender,
         queue_depth: queue_depth.clone(),
+        control_order: Arc::new(AtomicU64::new(0)),
+        pending_idle_order: pending_idle_order.clone(),
     };
     let build = cosmix_buildinfo::build_info!();
     let context = Arc::new(SnapshotContext {
@@ -164,15 +288,26 @@ pub(crate) fn prepare(
         broker: broker.clone(),
         queue_depth,
         reply_timeouts: reply_timeouts.clone(),
+        publish_timeouts: publish_timeouts.clone(),
+        event_seq: event_seq.clone(),
+        lost_count: lost_count.clone(),
+        pending_idle_order,
     });
     Ok((
-        PortProtocolWiring { source, context },
+        PortProtocolWiring {
+            source,
+            context,
+            observation_producer,
+        },
         PortStarter {
             service,
             noded_url,
             ingress,
             broker,
             reply_timeouts,
+            publish_timeouts,
+            observations,
+            lost_count,
         },
     ))
 }
@@ -186,6 +321,9 @@ impl PortStarter {
         let noded_url = self.noded_url;
         let broker = self.broker;
         let reply_timeouts = self.reply_timeouts;
+        let publish_timeouts = self.publish_timeouts;
+        let observations = self.observations;
+        let lost_count = self.lost_count;
         let thread = thread::Builder::new()
             .name("cosmix-comp-port".into())
             .spawn(move || {
@@ -207,6 +345,9 @@ impl PortStarter {
                     thread_ingress,
                     broker,
                     reply_timeouts,
+                    publish_timeouts,
+                    observations,
+                    lost_count,
                     shutdown_rx,
                     move || {
                         let service = connect_service.clone();
@@ -360,6 +501,11 @@ trait WorkerClient: Send + Sync + 'static {
     fn subscribe_state(&self) -> watch::Receiver<ConnState>;
     fn respond_parts<'a>(&'a self, reply: &'a PendingReply)
     -> WorkerFuture<'a, Result<(), String>>;
+    fn publish<'a>(
+        &'a self,
+        headers: &'a BTreeMap<String, String>,
+        wire: &'a str,
+    ) -> WorkerFuture<'a, Result<(), String>>;
     fn deregister(&self) -> WorkerFuture<'_, Result<(), String>>;
     fn close(&self) -> WorkerFuture<'_, ()>;
 }
@@ -391,6 +537,24 @@ impl WorkerClient for SupervisedClient {
             )
             .await
             .map_err(|error| error.to_string())
+        })
+    }
+
+    fn publish<'a>(
+        &'a self,
+        headers: &'a BTreeMap<String, String>,
+        wire: &'a str,
+    ) -> WorkerFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let (rc, body, _) = self
+                .call_with_headers_raw("noded", "topic.publish", headers, wire)
+                .await
+                .map_err(|error| error.to_string())?;
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(format!("topic.publish rejected with rc {rc}: {body}"))
+            }
         })
     }
 
@@ -427,11 +591,15 @@ impl PendingReply {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn worker_loop<F, Fut, C>(
     service: String,
     ingress: PortIngress,
     broker: Arc<AtomicU8>,
     reply_timeouts: Arc<AtomicU64>,
+    publish_timeouts: Arc<AtomicU64>,
+    observations: crossbeam_channel::Receiver<ObservationRecord>,
+    lost_count: Arc<AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
     connector: F,
 ) where
@@ -467,6 +635,14 @@ async fn worker_loop<F, Fut, C>(
         reply_receiver,
         Arc::clone(&reply_timeouts),
     ));
+    let publisher_task = tokio::spawn(publisher_loop(
+        Arc::clone(&client),
+        Arc::from(service.as_str()),
+        observations,
+        Arc::clone(&lost_count),
+        Arc::clone(&publish_timeouts),
+        shutdown.clone(),
+    ));
 
     loop {
         tokio::select! {
@@ -501,6 +677,7 @@ async fn worker_loop<F, Fut, C>(
                     &responder_permits,
                     &reply_sender,
                     &reply_timeouts,
+                    &service,
                     command,
                 );
             }
@@ -517,6 +694,8 @@ async fn worker_loop<F, Fut, C>(
     drop(reply_sender);
     reply_task.abort();
     let _ = reply_task.await;
+    publisher_task.abort();
+    let _ = publisher_task.await;
     graceful_client_shutdown(client.as_ref()).await;
 }
 
@@ -572,6 +751,7 @@ fn handle_incoming(
     responder_permits: &Arc<Semaphore>,
     reply_sender: &tokio_mpsc::Sender<PendingReply>,
     reply_timeouts: &Arc<AtomicU64>,
+    service: &str,
     command: cosmix_client::IncomingCommand,
 ) {
     while let Some(completed) = responders.try_join_next() {
@@ -581,11 +761,120 @@ fn handle_incoming(
     }
     let malformed =
         !command.body.is_empty() && serde_json::from_str::<Value>(&command.body).is_err();
+    if command.from == "noded"
+        && matches!(command.command.as_str(), "topic.active" | "topic.idle")
+        && command.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("name")
+                && value
+                    == &port_observation::topic_name(service, port_observation::PROPS_TOPIC_SUFFIX)
+        })
+    {
+        ingress.set_watch_state(command.command == "topic.active");
+        return;
+    }
     if command.command == "comp.ping" {
         queue_reply(
             reply_sender,
             reply_timeouts,
             PendingReply::new(command, (0, Arc::from("{\"pong\":true}"))),
+        );
+        return;
+    }
+    if command.command == "comp.props.watch" {
+        if malformed {
+            queue_reply(
+                reply_sender,
+                reply_timeouts,
+                PendingReply::new(command, error("unknown_path")),
+            );
+            return;
+        }
+        let permit = match Arc::clone(responder_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, error("busy")),
+                );
+                return;
+            }
+        };
+        let admission = match ingress.request_watch() {
+            Ok(admission) => admission,
+            Err(()) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, error("busy")),
+                );
+                return;
+            }
+        };
+        spawn_control_responder(
+            responders,
+            reply_sender,
+            reply_timeouts,
+            command,
+            admission,
+            permit,
+        );
+        return;
+    }
+    if command.command == "comp.props.set" {
+        if authorize_set(&command).is_err() {
+            queue_reply(
+                reply_sender,
+                reply_timeouts,
+                PendingReply::new(command, error("not_local")),
+            );
+            return;
+        }
+        let parsed = if malformed {
+            Err(invalid_set_shape(None))
+        } else {
+            parse_set(&command.args)
+        };
+        let (path, value) = match parsed {
+            Ok(parsed) => parsed,
+            Err(reply) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, reply),
+                );
+                return;
+            }
+        };
+        let permit = match Arc::clone(responder_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, error("busy")),
+                );
+                return;
+            }
+        };
+        let admission = match ingress.request_set(path, value) {
+            Ok(admission) => admission,
+            Err(()) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, error("busy")),
+                );
+                return;
+            }
+        };
+        spawn_control_responder(
+            responders,
+            reply_sender,
+            reply_timeouts,
+            command,
+            admission,
+            permit,
         );
         return;
     }
@@ -650,6 +939,78 @@ fn handle_incoming(
     });
 }
 
+fn authorize_set(command: &cosmix_client::IncomingCommand) -> Result<(), ()> {
+    if command.from == "anonymous"
+        || validate_service_name(&command.from).is_err()
+        || command.headers.keys().any(|name| {
+            name.eq_ignore_ascii_case("source_peer")
+                || name.eq_ignore_ascii_case("permissions")
+                || name.eq_ignore_ascii_case("signed_ident")
+        })
+    {
+        return Err(());
+    }
+    let origins = command
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("broker_origin"))
+        .collect::<Vec<_>>();
+    if origins.len() == 1 && origins[0].1 == "local" {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+fn parse_set(args: &Value) -> Result<(String, Value), (u8, Arc<str>)> {
+    let object = args.as_object().ok_or_else(|| invalid_set_shape(None))?;
+    let path = object
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| error("unknown_path"))?;
+    let value = object
+        .get("value")
+        .cloned()
+        .ok_or_else(|| invalid_set_shape(Some(path)))?;
+    Ok((path.to_string(), value))
+}
+
+fn invalid_set_shape(path: Option<&str>) -> (u8, Arc<str>) {
+    (
+        10,
+        Arc::from(
+            json!({
+                "error": "invalid_value",
+                "path": path,
+                "expected": "JSON property value",
+                "range": "descriptor",
+            })
+            .to_string(),
+        ),
+    )
+}
+
+fn spawn_control_responder(
+    responders: &mut JoinSet<()>,
+    reply_sender: &tokio_mpsc::Sender<PendingReply>,
+    reply_timeouts: &Arc<AtomicU64>,
+    command: cosmix_client::IncomingCommand,
+    admission: ControlAdmission,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let reply_sender = reply_sender.clone();
+    let reply_timeouts = Arc::clone(reply_timeouts);
+    responders.spawn(async move {
+        let _permit = permit;
+        let reply = admission.receive().await.unwrap_or_else(|()| error("busy"));
+        queue_reply(
+            &reply_sender,
+            &reply_timeouts,
+            PendingReply::new(command, reply),
+        );
+    });
+}
+
 fn queue_reply(
     sender: &tokio_mpsc::Sender<PendingReply>,
     reply_timeouts: &AtomicU64,
@@ -691,6 +1052,151 @@ async fn reply_loop<C: WorkerClient>(
             Ok(Ok(())) => {}
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct PendingGap {
+    last_lost_seq: u64,
+    cause: &'static str,
+}
+
+async fn publisher_loop<C: WorkerClient>(
+    client: Arc<C>,
+    service: Arc<str>,
+    observations: crossbeam_channel::Receiver<ObservationRecord>,
+    lost_count: Arc<AtomicU64>,
+    publish_timeouts: Arc<AtomicU64>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(PUBLISH_POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut next_sequence = 1_u64;
+    let mut pending_gap = None;
+    let mut pending_record = None;
+    loop {
+        if pending_record.is_none() {
+            pending_record = match observations.try_recv() {
+                Ok(record) => Some(record),
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    tokio::select! {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                break;
+                            }
+                        }
+                        _ = interval.tick() => {}
+                    }
+                    continue;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            };
+        }
+        let Some(record) = pending_record.as_ref() else {
+            continue;
+        };
+        let topic = port_observation::topic_name(&service, record.topic_suffix());
+        if record.event_seq() > next_sequence {
+            pending_gap = Some(PendingGap {
+                last_lost_seq: record.event_seq().saturating_sub(1),
+                cause: pending_gap.map_or("outbox.overflow", |gap: PendingGap| gap.cause),
+            });
+        }
+        if let Some(gap) = pending_gap {
+            let message = gap_message(
+                record.topic_suffix(),
+                gap,
+                lost_count.load(Ordering::Acquire),
+            );
+            if publish_message(client.as_ref(), &topic, &message)
+                .await
+                .is_err()
+            {
+                publish_timeouts.fetch_add(1, Ordering::AcqRel);
+                let failed = pending_record.take().expect("gap has a surviving record");
+                let (discarded, last_lost_seq) = discard_publication_backlog(failed, &observations);
+                lost_count.fetch_add(discarded, Ordering::AcqRel);
+                next_sequence = last_lost_seq.saturating_add(1);
+                pending_gap = Some(PendingGap {
+                    last_lost_seq: gap.last_lost_seq.max(last_lost_seq),
+                    cause: "publisher.loss",
+                });
+                continue;
+            }
+            pending_gap = None;
+        }
+
+        let record = pending_record.take().expect("checked above");
+        let sequence = record.event_seq();
+        let message = record.wire();
+        if publish_message(client.as_ref(), &topic, &message)
+            .await
+            .is_ok()
+        {
+            next_sequence = sequence.saturating_add(1);
+            continue;
+        }
+
+        publish_timeouts.fetch_add(1, Ordering::AcqRel);
+        let (discarded, last_lost_seq) = discard_publication_backlog(record, &observations);
+        lost_count.fetch_add(discarded, Ordering::AcqRel);
+        next_sequence = last_lost_seq.saturating_add(1);
+        pending_gap = Some(PendingGap {
+            last_lost_seq,
+            cause: "publisher.loss",
+        });
+    }
+}
+
+fn discard_publication_backlog(
+    failed: ObservationRecord,
+    observations: &crossbeam_channel::Receiver<ObservationRecord>,
+) -> (u64, u64) {
+    let mut discarded = 1_u64;
+    let mut last_lost_seq = failed.event_seq();
+    while let Ok(queued) = observations.try_recv() {
+        discarded = discarded.saturating_add(1);
+        last_lost_seq = last_lost_seq.max(queued.event_seq());
+    }
+    (discarded, last_lost_seq)
+}
+
+async fn publish_message<C: WorkerClient>(
+    client: &C,
+    topic: &str,
+    message: &BusMessage,
+) -> Result<(), ()> {
+    let mut headers = BTreeMap::new();
+    headers.insert("name".to_string(), topic.to_string());
+    headers.insert("retain".to_string(), "false".to_string());
+    let wire = message.to_wire();
+    match tokio::time::timeout(PUBLISH_TIMEOUT, client.publish(&headers, &wire)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            tracing::debug!(%error, topic, "compositor Bus topic publication failed");
+            Err(())
+        }
+        Err(_) => {
+            tracing::debug!(
+                topic,
+                timeout_ms = PUBLISH_TIMEOUT.as_millis(),
+                "compositor Bus topic publication timed out"
+            );
+            Err(())
+        }
+    }
+}
+
+fn gap_message(topic_suffix: &str, gap: PendingGap, lost_count: u64) -> BusMessage {
+    let mut message = BusMessage::new()
+        .with_header("command", topic_suffix)
+        .with_header("event_seq", &gap.last_lost_seq.to_string());
+    message.body = json!({
+        "gap": true,
+        "lost_count": lost_count,
+        "cause": gap.cause,
+    })
+    .to_string();
+    message
 }
 
 /// Exact byte count produced by `NodedClient::respond_parts` for this reply.
@@ -761,11 +1267,15 @@ mod tests {
         sync::atomic::{AtomicBool, AtomicUsize},
     };
 
+    type PublishedMessages = Arc<Mutex<Vec<(BTreeMap<String, String>, String)>>>;
+
     struct FakeClient {
         incoming: Mutex<Option<tokio_mpsc::UnboundedReceiver<cosmix_client::IncomingCommand>>>,
         states: watch::Sender<ConnState>,
         hang_replies: bool,
         responses_started: Arc<AtomicUsize>,
+        publish_mode: Arc<AtomicU8>,
+        publications: PublishedMessages,
         deregister_hangs: Arc<AtomicBool>,
         deregistered: Arc<AtomicUsize>,
         closed: Arc<AtomicUsize>,
@@ -788,6 +1298,8 @@ mod tests {
                     states: states.clone(),
                     hang_replies,
                     responses_started: Arc::new(AtomicUsize::new(0)),
+                    publish_mode: Arc::new(AtomicU8::new(0)),
+                    publications: Arc::new(Mutex::new(Vec::new())),
                     deregister_hangs: Arc::new(AtomicBool::new(false)),
                     deregistered: Arc::new(AtomicUsize::new(0)),
                     closed: Arc::new(AtomicUsize::new(0)),
@@ -828,6 +1340,24 @@ mod tests {
             }
         }
 
+        fn publish<'a>(
+            &'a self,
+            headers: &'a BTreeMap<String, String>,
+            wire: &'a str,
+        ) -> WorkerFuture<'a, Result<(), String>> {
+            match self.publish_mode.load(Ordering::Acquire) {
+                1 => Box::pin(future::ready(Err("publication rejected".into()))),
+                2 => Box::pin(future::pending()),
+                _ => {
+                    self.publications
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push((headers.clone(), wire.to_string()));
+                    Box::pin(future::ready(Ok(())))
+                }
+            }
+        }
+
         fn deregister(&self) -> WorkerFuture<'_, Result<(), String>> {
             self.deregistered.fetch_add(1, Ordering::AcqRel);
             if self.deregister_hangs.load(Ordering::Acquire) {
@@ -850,10 +1380,22 @@ mod tests {
             PortIngress {
                 sender,
                 queue_depth: Arc::clone(&queue_depth),
+                control_order: Arc::new(AtomicU64::new(0)),
+                pending_idle_order: Arc::new(AtomicU64::new(0)),
             },
             source,
             queue_depth,
         )
+    }
+
+    fn test_observation_args() -> (
+        Arc<AtomicU64>,
+        crossbeam_channel::Receiver<ObservationRecord>,
+        Arc<AtomicU64>,
+    ) {
+        let lost = Arc::new(AtomicU64::new(0));
+        let (_producer, receiver) = port_observation::outbox(Arc::clone(&lost));
+        (Arc::new(AtomicU64::new(0)), receiver, lost)
     }
 
     fn command(command: &str, id: usize) -> cosmix_client::IncomingCommand {
@@ -942,6 +1484,7 @@ mod tests {
         let (ingress, _source, _) = test_ingress();
         let broker = Arc::new(AtomicU8::new(BROKER_RETRYING));
         let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let (publish_timeouts, observations, lost_count) = test_observation_args();
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (client, _commands, states) = FakeClient::new(ConnState::Connected, false);
         let mut client = Some(client);
@@ -951,6 +1494,9 @@ mod tests {
             ingress,
             Arc::clone(&broker),
             reply_timeouts,
+            publish_timeouts,
+            observations,
+            lost_count,
             shutdown,
             move || future::ready(Ok(client.take().expect("one connection attempt"))),
         ));
@@ -972,11 +1518,15 @@ mod tests {
         let (_shutdown_tx, shutdown) = watch::channel(false);
         let (client, _commands, states) = FakeClient::new(ConnState::Connected, false);
         let mut client = Some(client);
+        let (publish_timeouts, observations, lost_count) = test_observation_args();
         let worker = tokio::spawn(worker_loop(
             "comp-nested".into(),
             ingress,
             Arc::clone(&broker),
             Arc::new(AtomicU64::new(0)),
+            publish_timeouts,
+            observations,
+            lost_count,
             shutdown,
             move || future::ready(Ok(client.take().expect("one connection attempt"))),
         ));
@@ -997,11 +1547,15 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_for_connector = Arc::clone(&attempts);
         let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (publish_timeouts, observations, lost_count) = test_observation_args();
         worker_loop(
             "comp-nested".into(),
             ingress,
             Arc::clone(&broker),
             Arc::new(AtomicU64::new(0)),
+            publish_timeouts,
+            observations,
+            lost_count,
             shutdown,
             move || {
                 attempts_for_connector.fetch_add(1, Ordering::Relaxed);
@@ -1095,6 +1649,7 @@ mod tests {
             &responder_permits,
             &reply_sender,
             &reply_timeouts,
+            "comp-nested",
             ping,
         );
         let reply = replies.recv().await.expect("ping reply queued");
@@ -1109,12 +1664,508 @@ mod tests {
             &responder_permits,
             &reply_sender,
             &reply_timeouts,
+            "comp-nested",
             get,
         );
         let reply = replies.recv().await.expect("malformed read reply queued");
         assert_eq!(reply.rc, 10);
         assert_eq!(reply.body.as_ref(), "{\"error\":\"unknown_path\"}");
         assert!(matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    fn local_set_command(id: usize, path: &str, value: Value) -> cosmix_client::IncomingCommand {
+        let mut command = command("comp.props.set", id);
+        command.args = json!({"path": path, "value": value});
+        command.body = command.args.to_string();
+        command
+            .headers
+            .insert("broker_origin".into(), "local".into());
+        command
+    }
+
+    #[test]
+    fn set_authorisation_requires_one_local_stamp_and_canonical_caller() {
+        assert!(authorize_set(&local_set_command(1, "input.corners.enabled", json!(true))).is_ok());
+
+        let mut missing = local_set_command(1, "input.corners.enabled", json!(true));
+        missing.headers.clear();
+        assert!(authorize_set(&missing).is_err());
+
+        let mut duplicate = local_set_command(1, "input.corners.enabled", json!(true));
+        duplicate
+            .headers
+            .insert("Broker_Origin".into(), "local".into());
+        assert!(authorize_set(&duplicate).is_err());
+
+        let mut remote = local_set_command(1, "input.corners.enabled", json!(true));
+        remote.headers.insert("broker_origin".into(), "mesh".into());
+        assert!(authorize_set(&remote).is_err());
+
+        for caller in ["", "anonymous", "Bad-Caller", "a"] {
+            let mut command = local_set_command(1, "input.corners.enabled", json!(true));
+            command.from = caller.into();
+            assert!(authorize_set(&command).is_err(), "caller {caller:?}");
+        }
+    }
+
+    #[test]
+    fn set_authorisation_rejects_every_wire_identity_claim() {
+        for claim in ["source_peer", "permissions", "signed_ident"] {
+            let mut command = local_set_command(1, "input.corners.enabled", json!(true));
+            command.headers.insert(claim.into(), "forged".into());
+            assert!(authorize_set(&command).is_err(), "claim {claim}");
+        }
+    }
+
+    #[tokio::test]
+    async fn authorised_set_crosses_ingress_and_preserves_response_correlation() {
+        let (ingress, source, _) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let (reply_sender, mut replies) = tokio_mpsc::channel(2);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let command = local_set_command(37, "input.corners.dwell_ms", json!(250));
+
+        handle_incoming(
+            &ingress,
+            &mut responders,
+            &permits,
+            &reply_sender,
+            &reply_timeouts,
+            "comp-nested",
+            command,
+        );
+        let PortCommand::Set(request) = source.try_recv().expect("set admitted") else {
+            panic!("set command expected");
+        };
+        assert_eq!(request.path, "input.corners.dwell_ms");
+        assert_eq!(request.value, json!(250));
+        request
+            .reply
+            .send((
+                0,
+                Arc::from("{\"path\":\"input.corners.dwell_ms\",\"old\":200,\"new\":250}"),
+            ))
+            .expect("responder remains live");
+        responders
+            .join_next()
+            .await
+            .expect("responder completes")
+            .expect("task");
+        let reply = replies.recv().await.expect("correlated reply");
+        assert_eq!(reply.id.as_deref(), Some("37"));
+        assert_eq!(reply.command, "comp.props.set");
+        assert_eq!(reply.rc, 0);
+    }
+
+    #[tokio::test]
+    async fn unauthorised_set_is_rejected_before_admission() {
+        let (ingress, source, _) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let (reply_sender, mut replies) = tokio_mpsc::channel(2);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let mut command = local_set_command(2, "input.corners.enabled", json!(false));
+        command.headers.clear();
+        handle_incoming(
+            &ingress,
+            &mut responders,
+            &permits,
+            &reply_sender,
+            &reply_timeouts,
+            "comp-nested",
+            command,
+        );
+        let reply = replies.recv().await.expect("not-local reply");
+        assert_eq!(reply.rc, 10);
+        assert_eq!(reply.body.as_ref(), "{\"error\":\"not_local\"}");
+        assert!(matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn non_finite_json_set_is_rejected_before_admission() {
+        let (ingress, source, _) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let (reply_sender, mut replies) = tokio_mpsc::channel(2);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let mut command = local_set_command(3, "input.corners.velocity_max_px_s", json!(1500.0));
+        command.body = "{\"path\":\"input.corners.velocity_max_px_s\",\"value\":NaN}".into();
+        handle_incoming(
+            &ingress,
+            &mut responders,
+            &permits,
+            &reply_sender,
+            &reply_timeouts,
+            "comp-nested",
+            command,
+        );
+        let reply = replies.recv().await.expect("invalid-value reply");
+        assert_eq!(reply.rc, 10);
+        assert_eq!(
+            serde_json::from_str::<Value>(&reply.body).unwrap()["error"],
+            "invalid_value"
+        );
+        assert!(matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn exact_noded_topic_lifecycle_notices_cross_as_watch_state_only() {
+        let (ingress, source, _) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let (reply_sender, _replies) = tokio_mpsc::channel(2);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        for (verb, active) in [("topic.active", true), ("topic.idle", false)] {
+            let mut command = command(verb, 1);
+            command.from = "noded".into();
+            command
+                .headers
+                .insert("name".into(), "comp-nested.props.changed".into());
+            handle_incoming(
+                &ingress,
+                &mut responders,
+                &permits,
+                &reply_sender,
+                &reply_timeouts,
+                "comp-nested",
+                command,
+            );
+            let PortCommand::WatchState {
+                active: observed, ..
+            } = source.try_recv().expect("notice staged")
+            else {
+                panic!("watch-state command expected");
+            };
+            assert_eq!(observed, active);
+        }
+    }
+
+    #[test]
+    fn idle_notice_survives_a_saturated_control_ingress() {
+        let (ingress, _source, _) = test_ingress();
+        let _admissions = (0..PORT_QUEUE_CAPACITY)
+            .map(|_| ingress.request_snapshot().expect("fill ingress"))
+            .collect::<Vec<_>>();
+        ingress.set_watch_state(false);
+        let idle_order = ingress.pending_idle_order.load(Ordering::Acquire);
+        assert_ne!(idle_order, 0);
+        let active_order = ingress.next_control_order();
+        let (reply, _receive) = tokio::sync::oneshot::channel();
+        let watch_order = ingress.next_control_order();
+        let mut controls = [
+            PortControl::Watch(PortReply {
+                order: watch_order,
+                reply,
+            }),
+            PortControl::WatchState {
+                active: true,
+                order: active_order,
+            },
+            PortControl::WatchState {
+                active: false,
+                order: idle_order,
+            },
+        ];
+        controls.sort_by_key(PortControl::order);
+        assert_eq!(
+            controls.map(|control| control.order()),
+            [idle_order, active_order, watch_order]
+        );
+    }
+
+    #[tokio::test]
+    async fn saturated_ingress_returns_busy_before_set_reaches_calloop() {
+        let (ingress, source, _) = test_ingress();
+        let _admissions = (0..PORT_QUEUE_CAPACITY)
+            .map(|_| ingress.request_snapshot().expect("fill ingress"))
+            .collect::<Vec<_>>();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let (reply_sender, mut replies) = tokio_mpsc::channel(2);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        handle_incoming(
+            &ingress,
+            &mut responders,
+            &permits,
+            &reply_sender,
+            &reply_timeouts,
+            "comp-nested",
+            local_set_command(3, "input.corners.dwell_ms", json!(250)),
+        );
+        let reply = replies.recv().await.expect("busy reply");
+        assert_eq!(reply.body.as_ref(), "{\"error\":\"busy\"}");
+        for _ in 0..PORT_QUEUE_CAPACITY {
+            assert!(matches!(source.try_recv(), Ok(PortCommand::Snapshot(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn publisher_places_outbox_gap_before_surviving_records() {
+        let lost = Arc::new(AtomicU64::new(0));
+        let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
+        for event_seq in 1..=4 {
+            producer.offer(ObservationRecord::FocusChanged {
+                keyboard: Some(event_seq),
+                previous: None,
+                exclusive_latch: None,
+                event_seq,
+            });
+        }
+        let (client, _commands, _states) = FakeClient::new(ConnState::Connected, false);
+        let publications = Arc::clone(&client.publications);
+        let publish_timeouts = Arc::new(AtomicU64::new(0));
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let task = tokio::spawn(publisher_loop(
+            Arc::new(client),
+            Arc::from("comp-nested"),
+            receiver,
+            Arc::clone(&lost),
+            Arc::clone(&publish_timeouts),
+            shutdown,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if publications
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .len()
+                    == 3
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("gap and two survivors publish");
+        shutdown_tx.send_replace(true);
+        task.await.expect("publisher exits");
+
+        let published = publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let gap = cosmix_bus::bus::parse(&published[0].1).expect("gap wire parses");
+        assert_eq!(
+            published[0].0.get("name").map(String::as_str),
+            Some("comp-nested.focus.changed")
+        );
+        assert_eq!(gap.get("command"), Some("focus.changed"));
+        assert_eq!(gap.get("event_seq"), Some("2"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&gap.body).unwrap(),
+            json!({"gap": true, "lost_count": 2, "cause": "outbox.overflow"})
+        );
+        assert_eq!(publish_timeouts.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn rejected_publication_discards_backlog_and_recovers_with_one_gap() {
+        let lost = Arc::new(AtomicU64::new(0));
+        let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
+        producer.offer(ObservationRecord::FocusChanged {
+            keyboard: Some(1),
+            previous: None,
+            exclusive_latch: None,
+            event_seq: 1,
+        });
+        producer.offer(ObservationRecord::FocusChanged {
+            keyboard: Some(2),
+            previous: Some(1),
+            exclusive_latch: None,
+            event_seq: 2,
+        });
+        let (client, _commands, _states) = FakeClient::new(ConnState::Connected, false);
+        client.publish_mode.store(1, Ordering::Release);
+        let mode = Arc::clone(&client.publish_mode);
+        let publications = Arc::clone(&client.publications);
+        let publish_timeouts = Arc::new(AtomicU64::new(0));
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let task = tokio::spawn(publisher_loop(
+            Arc::new(client),
+            Arc::from("comp-nested"),
+            receiver,
+            Arc::clone(&lost),
+            Arc::clone(&publish_timeouts),
+            shutdown,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while lost.load(Ordering::Acquire) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed record and backlog become loss");
+        mode.store(0, Ordering::Release);
+        producer.offer(ObservationRecord::FocusChanged {
+            keyboard: Some(3),
+            previous: Some(2),
+            exclusive_latch: None,
+            event_seq: 3,
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while publications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+                != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("publisher-loss gap and survivor publish");
+        shutdown_tx.send_replace(true);
+        task.await.expect("publisher exits");
+        let published = publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let gap = cosmix_bus::bus::parse(&published[0].1).expect("gap parses");
+        assert_eq!(
+            serde_json::from_str::<Value>(&gap.body).unwrap(),
+            json!({"gap": true, "lost_count": 2, "cause": "publisher.loss"})
+        );
+        assert_eq!(publish_timeouts.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_gap_discards_its_survivor_and_recovers_as_publisher_loss() {
+        let lost = Arc::new(AtomicU64::new(0));
+        let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
+        for sequence in 1..=3 {
+            producer.offer(ObservationRecord::FocusChanged {
+                keyboard: Some(sequence),
+                previous: None,
+                exclusive_latch: None,
+                event_seq: sequence,
+            });
+        }
+        let (client, _commands, _states) = FakeClient::new(ConnState::Connected, false);
+        client.publish_mode.store(1, Ordering::Release);
+        let mode = Arc::clone(&client.publish_mode);
+        let publications = Arc::clone(&client.publications);
+        let publish_timeouts = Arc::new(AtomicU64::new(0));
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let task = tokio::spawn(publisher_loop(
+            Arc::new(client),
+            Arc::from("comp-nested"),
+            receiver,
+            Arc::clone(&lost),
+            Arc::clone(&publish_timeouts),
+            shutdown,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while lost.load(Ordering::Acquire) != 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed gap discards every surviving record");
+        mode.store(0, Ordering::Release);
+        producer.offer(ObservationRecord::FocusChanged {
+            keyboard: Some(4),
+            previous: Some(3),
+            exclusive_latch: None,
+            event_seq: 4,
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while publications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+                != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement gap and survivor publish");
+        shutdown_tx.send_replace(true);
+        task.await.expect("publisher exits");
+        let published = publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let gap = cosmix_bus::bus::parse(&published[0].1).expect("gap parses");
+        assert_eq!(gap.get("event_seq"), Some("3"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&gap.body).unwrap(),
+            json!({"gap": true, "lost_count": 3, "cause": "publisher.loss"})
+        );
+        assert_eq!(publish_timeouts.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_publication_times_out_without_blocking_shutdown() {
+        let lost = Arc::new(AtomicU64::new(0));
+        let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
+        producer.offer(ObservationRecord::FocusChanged {
+            keyboard: None,
+            previous: Some(1),
+            exclusive_latch: None,
+            event_seq: 1,
+        });
+        let (client, _commands, _states) = FakeClient::new(ConnState::Connected, false);
+        client.publish_mode.store(2, Ordering::Release);
+        let publish_timeouts = Arc::new(AtomicU64::new(0));
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let task = tokio::spawn(publisher_loop(
+            Arc::new(client),
+            Arc::from("comp-nested"),
+            receiver,
+            Arc::clone(&lost),
+            Arc::clone(&publish_timeouts),
+            shutdown,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(PUBLISH_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert_eq!(publish_timeouts.load(Ordering::Acquire), 1);
+        assert_eq!(lost.load(Ordering::Acquire), 1);
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_millis(1), task)
+            .await
+            .expect("publisher shutdown is bounded")
+            .expect("publisher exits");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_publisher_does_not_block_commands_and_worker_shutdown_is_bounded() {
+        let (ingress, _source, _) = test_ingress();
+        let broker = Arc::new(AtomicU8::new(BROKER_RETRYING));
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let publish_timeouts = Arc::new(AtomicU64::new(0));
+        let lost = Arc::new(AtomicU64::new(0));
+        let (producer, observations) = port_observation::outbox(Arc::clone(&lost));
+        producer.offer(ObservationRecord::FocusChanged {
+            keyboard: Some(1),
+            previous: None,
+            exclusive_latch: None,
+            event_seq: 1,
+        });
+        let (client, commands, _states) = FakeClient::new(ConnState::Connected, false);
+        client.publish_mode.store(2, Ordering::Release);
+        let responses_started = Arc::clone(&client.responses_started);
+        let mut client = Some(client);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let worker = tokio::spawn(worker_loop(
+            "comp-nested".into(),
+            ingress,
+            Arc::clone(&broker),
+            reply_timeouts,
+            publish_timeouts,
+            observations,
+            lost,
+            shutdown,
+            move || future::ready(Ok(client.take().expect("one connection attempt"))),
+        ));
+        wait_for_broker(&broker, BROKER_CONNECTED).await;
+        commands.send(command("comp.ping", 1)).expect("worker live");
+        wait_for_counter(&responses_started, 1, "ping replied while publish hangs").await;
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_millis(1), worker)
+            .await
+            .expect("worker shutdown does not await publisher deadline")
+            .expect("worker exits");
     }
 
     #[tokio::test]
@@ -1128,7 +2179,9 @@ mod tests {
         assert_eq!(queue_depth.load(Ordering::Acquire), PORT_QUEUE_CAPACITY);
 
         for _ in 0..PORT_QUEUE_CAPACITY {
-            let PortCommand::Snapshot(request) = source.try_recv().expect("staged request");
+            let PortCommand::Snapshot(request) = source.try_recv().expect("staged request") else {
+                panic!("snapshot request expected");
+            };
             drop(request);
         }
         for admission in admissions {
@@ -1145,11 +2198,15 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (client, commands, _states) = FakeClient::new(ConnState::Connected, false);
         let mut client = Some(client);
+        let (publish_timeouts, observations, lost_count) = test_observation_args();
         let worker = tokio::spawn(worker_loop(
             "comp-nested".into(),
             ingress,
             Arc::clone(&broker),
             reply_timeouts,
+            publish_timeouts,
+            observations,
+            lost_count,
             shutdown,
             move || future::ready(Ok(client.take().expect("one connection attempt"))),
         ));
@@ -1161,7 +2218,9 @@ mod tests {
                 .expect("worker live");
         }
         for _ in 0..PORT_QUEUE_CAPACITY {
-            let PortCommand::Snapshot(request) = next_port_command(&source).await;
+            let PortCommand::Snapshot(request) = next_port_command(&source).await else {
+                panic!("snapshot request expected");
+            };
             drop(request);
         }
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -1180,7 +2239,9 @@ mod tests {
         commands
             .send(command("comp.info", PORT_QUEUE_CAPACITY))
             .expect("worker live");
-        let PortCommand::Snapshot(request) = next_port_command(&source).await;
+        let PortCommand::Snapshot(request) = next_port_command(&source).await else {
+            panic!("snapshot request expected");
+        };
         drop(request);
 
         shutdown_tx.send_replace(true);
@@ -1196,11 +2257,15 @@ mod tests {
         let (client, commands, _states) = FakeClient::new(ConnState::Connected, true);
         let responses_started = Arc::clone(&client.responses_started);
         let mut client = Some(client);
+        let (publish_timeouts, observations, lost_count) = test_observation_args();
         let worker = tokio::spawn(worker_loop(
             "comp-nested".into(),
             ingress,
             Arc::clone(&broker),
             Arc::clone(&reply_timeouts),
+            publish_timeouts,
+            observations,
+            lost_count,
             shutdown,
             move || future::ready(Ok(client.take().expect("one connection attempt"))),
         ));
@@ -1226,7 +2291,9 @@ mod tests {
         commands
             .send(command("comp.info", 3))
             .expect("worker remains responsive");
-        let PortCommand::Snapshot(request) = next_port_command(&source).await;
+        let PortCommand::Snapshot(request) = next_port_command(&source).await else {
+            panic!("snapshot request expected");
+        };
         assert_eq!(queue_depth.load(Ordering::Acquire), 1);
         drop(request);
         wait_for_counter(&queue_depth, 0, "later admission releases depth").await;

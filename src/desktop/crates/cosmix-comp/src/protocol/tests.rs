@@ -18,6 +18,8 @@ use smithay::backend::input::{
 // registered on the real event loop, or the stall oracle would be measuring a
 // test harness instead of the protocol thread.
 use smithay::reexports::calloop::{EventSource, Poll, PostAction, Readiness, Token, TokenFactory};
+#[cfg(feature = "bus")]
+use serde_json::{Value, json};
 use smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_surface_v1::Error as SessionLockSurfaceError;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -53,6 +55,10 @@ fn snapshot_context(backend: &'static str) -> port_snapshot::SnapshotContext {
         broker: Arc::new(AtomicU8::new(port_snapshot::BROKER_CONNECTED)),
         queue_depth: Arc::new(AtomicUsize::new(0)),
         reply_timeouts: Arc::new(AtomicU64::new(0)),
+        publish_timeouts: Arc::new(AtomicU64::new(0)),
+        event_seq: Arc::new(AtomicU64::new(0)),
+        lost_count: Arc::new(AtomicU64::new(0)),
+        pending_idle_order: Arc::new(AtomicU64::new(0)),
     }
 }
 
@@ -1285,12 +1291,28 @@ impl KeybindingHarness {
     }
 
     #[cfg(feature = "bus")]
-    fn new_with_port() -> (Self, crate::port::PortIngress) {
-        let context = Arc::new(snapshot_context("nested"));
-        let (port, ingress) = crate::port::test_wiring(context);
+    fn new_with_port() -> (
+        Self,
+        crate::port::PortIngress,
+        crossbeam_channel::Receiver<port_observation::ObservationRecord>,
+    ) {
+        Self::new_with_port_backend(BackendKind::Winit, "nested")
+    }
+
+    #[cfg(feature = "bus")]
+    fn new_with_port_backend(
+        backend: BackendKind,
+        backend_name: &'static str,
+    ) -> (
+        Self,
+        crate::port::PortIngress,
+        crossbeam_channel::Receiver<port_observation::ObservationRecord>,
+    ) {
+        let context = Arc::new(snapshot_context(backend_name));
+        let (port, ingress, observations) = crate::port::test_wiring(context);
         let harness = Self::new_with_protocol_capabilities_bindings_and_port(
             true,
-            BackendKind::Winit,
+            backend,
             test_retirement_adapter(),
             DmabufCapabilities {
                 main_device: 0,
@@ -1307,7 +1329,7 @@ impl KeybindingHarness {
             None,
             Some(port),
         );
-        (harness, ingress)
+        (harness, ingress, observations)
     }
 
     fn new_with_backend(keybindings_enabled: bool, backend_kind: BackendKind) -> Self {
@@ -26871,9 +26893,10 @@ fn port_snapshot_projects_protocol_roles_focus_stack_metadata_and_usable_output(
         .expect("fixture coordinates are exactly representable");
     assert_eq!(snapshot.info.service.as_ref(), "comp-nested");
     assert_eq!(snapshot.info.backend, "nested");
-    assert_eq!(snapshot.port.level, "L1");
+    assert_eq!(snapshot.port.level, "L2");
     assert_eq!(snapshot.port.event_seq, 0);
     assert_eq!(snapshot.port.lost_count, 0);
+    assert_eq!(snapshot.port.publish_timeouts, 0);
     let output = snapshot
         .outputs
         .values()
@@ -26957,7 +26980,7 @@ fn port_snapshot_projects_protocol_roles_focus_stack_metadata_and_usable_output(
 #[cfg(feature = "bus")]
 #[test]
 fn port_boundary_uses_production_admission_completion_and_sees_same_dispatch_commits() {
-    let (mut harness, ingress) = KeybindingHarness::new_with_port();
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
     map_initial_test_toplevel(&mut harness);
     send_request(
         &mut harness.client,
@@ -27000,6 +27023,444 @@ fn port_boundary_uses_production_admission_completion_and_sees_same_dispatch_com
     assert_eq!(toplevel.title.as_deref(), Some("same-dispatch title"));
 
     assert_eq!(ingress.depth_for_test(), 0);
+}
+
+#[cfg(feature = "bus")]
+fn drain_observations(
+    receiver: &crossbeam_channel::Receiver<port_observation::ObservationRecord>,
+) -> Vec<port_observation::ObservationRecord> {
+    receiver.try_iter().collect()
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn port_observation_coalesces_map_unmap_and_preserves_foreign_id() {
+    let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+
+    map_initial_test_toplevel(&mut harness);
+    port_observation::service_observations(&mut harness.server.state);
+    let mapped = drain_observations(&observations);
+    let (id, foreign_id, mapped_sequence) = mapped
+        .iter()
+        .find_map(|record| match record {
+            port_observation::ObservationRecord::SurfaceMapped {
+                id,
+                role,
+                foreign_id,
+                event_seq,
+            } if role == "toplevel" => Some((*id, foreign_id.clone(), *event_seq)),
+            _ => None,
+        })
+        .expect("one converged toplevel map edge");
+    assert!(foreign_id.is_some());
+
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[0, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    port_observation::service_observations(&mut harness.server.state);
+    let unmapped = drain_observations(&observations);
+    assert!(unmapped.iter().any(|record| matches!(
+        record,
+        port_observation::ObservationRecord::SurfaceUnmapped {
+            id: observed,
+            role,
+            foreign_id: Some(observed_foreign),
+            event_seq,
+        } if *observed == id
+            && role == "toplevel"
+            && Some(observed_foreign) == foreign_id.as_ref()
+            && *event_seq > mapped_sequence
+    )));
+
+    let (mut net_harness, _ingress, net_observations) = KeybindingHarness::new_with_port();
+    port_observation::service_observations(&mut net_harness.server.state);
+    drain_observations(&net_observations);
+    map_initial_test_toplevel(&mut net_harness);
+    send_request(
+        &mut net_harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[0, 0, 0]),
+    );
+    send_request(&mut net_harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    net_harness.dispatch_client();
+    port_observation::service_observations(&mut net_harness.server.state);
+    assert!(drain_observations(&net_observations).iter().all(|record| {
+        !matches!(
+            record,
+            port_observation::ObservationRecord::SurfaceMapped { .. }
+                | port_observation::ObservationRecord::SurfaceUnmapped { .. }
+        )
+    }));
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn port_observation_reports_nested_resize_once_with_final_geometry() {
+    let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+
+    harness.server.state.resize_output(640, 480);
+    port_observation::service_observations(&mut harness.server.state);
+    let records = drain_observations(&observations);
+    let output = records
+        .iter()
+        .find_map(|record| match record {
+            port_observation::ObservationRecord::OutputChanged { row, .. } => Some(row),
+            _ => None,
+        })
+        .expect("one final output edge");
+    assert_eq!((output.width, output.height), (640, 480));
+    assert_eq!((output.usable.width, output.usable.height), (640.0, 480.0));
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(
+                record,
+                port_observation::ObservationRecord::OutputChanged { .. }
+            ))
+            .count(),
+        1
+    );
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn port_corner_timer_routes_once_and_geometry_and_lock_teardown_leave() {
+    let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+    harness.server.state.cursor_position = (5.0, 5.0);
+    harness
+        .server
+        .state
+        .sample_corner_motion((5.0, 5.0), 0, (0.0, 0.0));
+    let first_timer = harness.server.state.corner_timer_probe();
+    let same_timer = harness.server.state.corner_timer_probe();
+    assert_eq!(first_timer, same_timer, "unchanged deadline is not rearmed");
+    assert!(first_timer.0.is_some());
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+        .expect("corner deadline dispatches");
+    let entered = drain_observations(&observations);
+    let (output, dwell_ms) = entered
+        .iter()
+        .find_map(|record| match record {
+            port_observation::ObservationRecord::CornerEntered {
+                output, dwell_ms, ..
+            } => Some((output.clone(), *dwell_ms)),
+            _ => None,
+        })
+        .expect("stationary pointer enters its routed output corner");
+    assert!(output.starts_with("o_"));
+
+    harness.server.state.resize_output(640, 480);
+    port_observation::service_observations(&mut harness.server.state);
+    assert!(
+        drain_observations(&observations)
+            .iter()
+            .any(|record| matches!(
+                record,
+                port_observation::ObservationRecord::CornerLeft {
+                    output: left_output,
+                    dwell_ms: left_dwell,
+                    ..
+                } if left_output == &output && *left_dwell == dwell_ms
+            ))
+    );
+
+    harness.server.state.cursor_position = (5.0, 5.0);
+    harness
+        .server
+        .state
+        .sample_corner_motion((5.0, 5.0), 0, (0.0, 0.0));
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+        .expect("second corner deadline dispatches");
+    assert!(
+        drain_observations(&observations)
+            .iter()
+            .any(|record| matches!(
+                record,
+                port_observation::ObservationRecord::CornerEntered { .. }
+            ))
+    );
+    harness.server.state.teardown_input_for_session_lock();
+    assert!(
+        drain_observations(&observations)
+            .iter()
+            .any(|record| matches!(
+                record,
+                port_observation::ObservationRecord::CornerLeft { .. }
+            ))
+    );
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn port_watch_reports_title_and_app_id_leaf_changes() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("watch reply runtime");
+    let watch = ingress.request_watch().expect("watch admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("watch service cycle");
+    assert_eq!(runtime.block_on(watch.receive()).unwrap().0, 0);
+    drain_observations(&observations);
+
+    for (opcode, value, suffix) in [
+        (2, "Observed title", ".title"),
+        (3, "org.cosmix.Observed", ".app_id"),
+    ] {
+        send_request(
+            &mut harness.client,
+            TEST_TOPLEVEL_ID,
+            opcode,
+            &wire_string_argument(value),
+        );
+        harness.dispatch_client();
+        port_observation::service_observations(&mut harness.server.state);
+        let records = drain_observations(&observations);
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| matches!(
+            record,
+            port_observation::ObservationRecord::PropsChanged { path, cause: "wayland.map", .. }
+                if path.ends_with(suffix)
+        )));
+    }
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn port_observation_reports_exclusive_focus_and_layer_usable_geometry_in_order() {
+    const TOP_LEFT_RIGHT: u32 = 1 | 4 | 8;
+    let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            size: (0, 30),
+            anchor: TOP_LEFT_RIGHT,
+            exclusive_zone: 30,
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    port_observation::service_observations(&mut harness.server.state);
+    let records = drain_observations(&observations);
+    assert_eq!(
+        records.len(),
+        2,
+        "test outbox retains the final two records"
+    );
+
+    let layer_id = test_layer_record(&harness, layer.surface).id.0;
+    let (focus_sequence, output_sequence) = match (&records[0], &records[1]) {
+        (
+            port_observation::ObservationRecord::FocusChanged {
+                keyboard: Some(keyboard),
+                exclusive_latch: Some(exclusive_latch),
+                event_seq: focus_sequence,
+                ..
+            },
+            port_observation::ObservationRecord::OutputChanged {
+                row,
+                event_seq: output_sequence,
+                ..
+            },
+        ) => {
+            assert_eq!((*keyboard, *exclusive_latch), (layer_id, layer_id));
+            assert_eq!(row.usable.y, 30.0);
+            assert_eq!(row.usable.height + 30.0, row.height as f32);
+            (*focus_sequence, *output_sequence)
+        }
+        records => panic!("unexpected deterministic observation order: {records:?}"),
+    };
+    assert!(focus_sequence < output_sequence);
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn port_observation_reports_kms_topology_replacement_with_the_final_output_key() {
+    let (mut harness, _ingress, observations) =
+        KeybindingHarness::new_with_port_backend(BackendKind::Kms, "kms");
+    let old = kms_security_test_key(226, "Observation-old-1");
+    submit_kms_security_lifecycle(
+        &mut harness,
+        KmsTopologyLifecycleEvent::Initial(kms_security_test_snapshot(&old, 41)),
+    );
+    let initial = drain_observations(&observations);
+    assert!(initial.iter().any(|record| matches!(
+        record,
+        port_observation::ObservationRecord::OutputChanged { output, row, .. }
+            if output == "o_observation_old_1" && row.name == "Observation-old-1"
+    )));
+    let old_projection = port_snapshot::project_outputs(&harness.server.state).expect("old output");
+    let old_row = &old_projection.rows["o_observation_old_1"];
+    let old_position = (f64::from(old_row.x) + 5.0, f64::from(old_row.y) + 5.0);
+    harness.server.state.cursor_position = old_position;
+    harness
+        .server
+        .state
+        .sample_corner_motion(old_position, 0, (0.0, 0.0));
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+        .expect("old-output corner deadline dispatches");
+    assert!(
+        drain_observations(&observations)
+            .iter()
+            .any(|record| matches!(
+                record,
+                port_observation::ObservationRecord::CornerEntered { output, .. }
+                    if output == "o_observation_old_1"
+            ))
+    );
+
+    let replacement = kms_security_test_key(226, "Observation-new-1");
+    submit_kms_security_lifecycle(
+        &mut harness,
+        KmsTopologyLifecycleEvent::Initial(kms_security_test_snapshot(&replacement, 42)),
+    );
+    let replaced = drain_observations(&observations);
+    assert_eq!(replaced.len(), 2);
+    assert!(matches!(
+        &replaced[0],
+        port_observation::ObservationRecord::CornerLeft { output, .. }
+            if output == "o_observation_old_1"
+    ));
+    assert!(matches!(
+        &replaced[1],
+        port_observation::ObservationRecord::OutputChanged { output, row, .. }
+            if output == "o_observation_new_1" && row.name == "Observation-new-1"
+    ));
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn port_watch_and_set_share_the_stable_service_point_and_sequence() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("control reply runtime");
+
+    let watch = ingress.request_watch().expect("watch admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("watch service cycle");
+    let (rc, body) = runtime.block_on(watch.receive()).expect("watch reply");
+    assert_eq!(rc, 0);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["topic"],
+        "comp-nested.props.changed"
+    );
+
+    for (path, value, old) in [
+        ("input.corners.enabled", json!(false), json!(true)),
+        ("input.corners.deadzone_px", json!(24.5), json!(12.0)),
+        ("input.corners.dwell_ms", json!(250), json!(200)),
+        (
+            "input.corners.velocity_max_px_s",
+            json!(900.0),
+            json!(1500.0),
+        ),
+    ] {
+        let set = ingress
+            .request_set(path.to_string(), value.clone())
+            .expect("set admitted");
+        harness
+            .server
+            .dispatch_cycle(Some(Duration::ZERO))
+            .expect("set service cycle");
+        let (rc, body) = runtime.block_on(set.receive()).expect("set reply");
+        assert_eq!(rc, 0);
+        let body = serde_json::from_str::<Value>(&body).unwrap();
+        assert_eq!(body, json!({"path": path, "old": old, "new": value}));
+        let changed = drain_observations(&observations);
+        assert_eq!(changed.len(), 1);
+        assert!(matches!(
+            &changed[0],
+            port_observation::ObservationRecord::PropsChanged {
+                path: changed_path,
+                cause: "props.set",
+                ..
+            } if changed_path == path
+        ));
+    }
+
+    let no_op = ingress
+        .request_set("input.corners.dwell_ms".into(), json!(250))
+        .expect("no-op set admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("no-op service cycle");
+    assert_eq!(runtime.block_on(no_op.receive()).unwrap().0, 0);
+    assert!(drain_observations(&observations).is_empty());
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn port_set_revalidates_bounds_unknown_and_read_only_paths_on_calloop() {
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("control reply runtime");
+    for (path, value, reason) in [
+        ("input.corners.deadzone_px", json!(0.0), "invalid_value"),
+        ("input.corners.dwell_ms", json!(5001), "invalid_value"),
+        (
+            "input.corners.velocity_max_px_s",
+            json!(20001.0),
+            "invalid_value",
+        ),
+        ("info.service", json!("other"), "read_only"),
+        ("input", json!(null), "read_only"),
+        ("input.corners", json!(null), "read_only"),
+        ("input.corners.unknown", json!(1), "unknown_path"),
+        ("unknown.branch", json!(1), "unknown_path"),
+    ] {
+        let set = ingress
+            .request_set(path.to_string(), value)
+            .expect("invalid set still crosses bounded ingress");
+        harness
+            .server
+            .dispatch_cycle(Some(Duration::ZERO))
+            .expect("validation service cycle");
+        let (rc, body) = runtime.block_on(set.receive()).expect("validation reply");
+        assert_eq!(rc, 10);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["error"],
+            reason
+        );
+    }
 }
 
 #[cfg(feature = "bus")]
