@@ -1221,23 +1221,73 @@ async fn publisher_loop<C: WorkerClient>(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut pending_gap: Option<LossInterval> = None;
-    let mut deferred_gap: Option<LossInterval> = None;
     let mut defer_gap_retry_until_data = false;
     loop {
-        if let Some(gap) = deferred_gap.take() {
-            merge_pending_gap(&mut pending_gap, gap);
-        }
-        if !drain_marker_lane_when_stable(
-            &observations,
-            &mut pending_gap,
-            &observation_notifier,
-            &mut shutdown,
-        )
-        .await
-        {
+        let mut lane_empty = false;
+        let mut disconnected = false;
+
+        for _ in 0..observations.capacity {
+            let carried = match observations.records.try_recv() {
+                Ok(record) => record,
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    lane_empty = true;
+                    break;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    lane_empty = true;
+                    disconnected = true;
+                    break;
+                }
+            };
+
+            defer_gap_retry_until_data = false;
+            if let Some(loss) = carried.preceding_loss {
+                merge_pending_gap(&mut pending_gap, loss);
+            }
+            let record = carried.record;
+            let topic_suffix = record.topic_suffix();
+            if publish_pending_gap_for_topic(
+                client.as_ref(),
+                &service,
+                &lost_count,
+                &mut pending_gap,
+                topic_suffix,
+            )
+            .await
+            .is_err()
+            {
+                publish_timeouts.fetch_add(1, Ordering::AcqRel);
+                let (discarded, loss) = discard_publication_backlog(Some(record), &observations);
+                lost_count.fetch_add(discarded, Ordering::AcqRel);
+                if let Some(loss) = loss {
+                    merge_pending_gap(&mut pending_gap, loss);
+                }
+                defer_gap_retry_until_data = true;
+                break;
+            }
+
+            let topic = port_observation::topic_name(&service, topic_suffix);
+            let message = record.wire();
+            if publish_message(client.as_ref(), &topic, &message)
+                .await
+                .is_ok()
+            {
+                continue;
+            }
+
+            publish_timeouts.fetch_add(1, Ordering::AcqRel);
+            let (discarded, loss) = discard_publication_backlog(Some(record), &observations);
+            lost_count.fetch_add(discarded, Ordering::AcqRel);
+            if let Some(loss) = loss {
+                merge_pending_gap(&mut pending_gap, loss);
+            }
+            defer_gap_retry_until_data = true;
             break;
         }
-        if pending_gap.is_some()
+
+        lane_empty |= observations.records.is_empty();
+        if lane_empty
+            && pending_gap.is_some()
             && !defer_gap_retry_until_data
             && publish_pending_gap(client.as_ref(), &service, &lost_count, &mut pending_gap)
                 .await
@@ -1250,151 +1300,13 @@ async fn publisher_loop<C: WorkerClient>(
                 merge_pending_gap(&mut pending_gap, loss);
             }
             defer_gap_retry_until_data = true;
-            continue;
         }
 
-        let record = match observations.records.try_recv() {
-            Ok(record) => record,
-            Err(crossbeam_channel::TryRecvError::Empty) => {
-                if !wait_for_observation(&observation_notifier, &mut shutdown).await {
-                    break;
-                }
-                continue;
-            }
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                drain_marker_lane(&observations, &mut pending_gap);
-                if pending_gap.is_some() && !defer_gap_retry_until_data {
-                    continue;
-                }
-                break;
-            }
-        };
-
-        let record_seq = record.event_seq();
-        observations
-            .held_record_seq
-            .store(record_seq, Ordering::Release);
-        let crossed_record = match drain_marker_lane_around_record_when_stable(
-            &observations,
-            record_seq,
-            &mut pending_gap,
-            &mut deferred_gap,
-            &observation_notifier,
-            &mut shutdown,
-        )
-        .await
-        {
-            Ok(crossed) => crossed,
-            Err(()) => {
-                observations.held_record_seq.store(0, Ordering::Release);
-                break;
-            }
-        };
-        if crossed_record {
-            // Defensive recovery: making the held record part of the loss
-            // closes a malformed crossing interval without publishing a
-            // watermark followed by an older record.
-            merge_pending_gap(
-                &mut pending_gap,
-                LossInterval::from_record(&record, LossCause::PublisherLoss),
-            );
-            lost_count.fetch_add(1, Ordering::AcqRel);
-            observations.held_record_seq.store(0, Ordering::Release);
-            continue;
+        if disconnected {
+            break;
         }
-        if pending_gap.is_some()
-            && publish_pending_gap(client.as_ref(), &service, &lost_count, &mut pending_gap)
-                .await
-                .is_err()
-        {
-            observations.held_record_seq.store(0, Ordering::Release);
-            publish_timeouts.fetch_add(1, Ordering::AcqRel);
-            let (discarded, loss) = discard_publication_backlog(Some(record), &observations);
-            lost_count.fetch_add(discarded, Ordering::AcqRel);
-            if let Some(loss) = loss {
-                merge_pending_gap(&mut pending_gap, loss);
-            }
-            defer_gap_retry_until_data = true;
-            continue;
-        }
-        defer_gap_retry_until_data = false;
-
-        let topic = port_observation::topic_name(&service, record.topic_suffix());
-        let message = record.wire();
-        if publish_message(client.as_ref(), &topic, &message)
-            .await
-            .is_ok()
-        {
-            observations.held_record_seq.store(0, Ordering::Release);
-            continue;
-        }
-
-        observations.held_record_seq.store(0, Ordering::Release);
-        publish_timeouts.fetch_add(1, Ordering::AcqRel);
-        let (discarded, loss) = discard_publication_backlog(Some(record), &observations);
-        lost_count.fetch_add(discarded, Ordering::AcqRel);
-        if let Some(loss) = loss {
-            merge_pending_gap(&mut pending_gap, loss);
-        }
-        defer_gap_retry_until_data = true;
-    }
-}
-
-async fn drain_marker_lane_when_stable(
-    observations: &ObservationOutbox,
-    pending: &mut Option<LossInterval>,
-    notifier: &tokio::sync::Notify,
-    shutdown: &mut watch::Receiver<bool>,
-) -> bool {
-    loop {
-        let generation = observations
-            .marker_update_generation
-            .load(Ordering::Acquire);
-        if !generation.is_multiple_of(2) {
-            if !wait_for_observation(notifier, shutdown).await {
-                return false;
-            }
-            continue;
-        }
-        drain_marker_lane(observations, pending);
-        if observations
-            .marker_update_generation
-            .load(Ordering::Acquire)
-            == generation
-        {
-            return true;
-        }
-    }
-}
-
-async fn drain_marker_lane_around_record_when_stable(
-    observations: &ObservationOutbox,
-    record_seq: u64,
-    before: &mut Option<LossInterval>,
-    after: &mut Option<LossInterval>,
-    notifier: &tokio::sync::Notify,
-    shutdown: &mut watch::Receiver<bool>,
-) -> Result<bool, ()> {
-    loop {
-        let generation = observations
-            .marker_update_generation
-            .load(Ordering::Acquire);
-        if !generation.is_multiple_of(2) {
-            if !wait_for_observation(notifier, shutdown).await {
-                return Err(());
-            }
-            continue;
-        }
-        let crossed = drain_marker_lane_around_record(observations, record_seq, before, after);
-        if crossed {
-            return Ok(true);
-        }
-        if observations
-            .marker_update_generation
-            .load(Ordering::Acquire)
-            == generation
-        {
-            return Ok(false);
+        if !wait_for_observation(&observation_notifier, &mut shutdown).await {
+            break;
         }
     }
 }
@@ -1411,49 +1323,33 @@ async fn wait_for_observation(
     }
 }
 
-fn drain_marker_lane(observations: &ObservationOutbox, pending: &mut Option<LossInterval>) {
-    while let Ok(loss) = observations.markers.try_recv() {
-        merge_pending_gap(pending, loss);
-    }
-}
-
-fn drain_marker_lane_around_record(
-    observations: &ObservationOutbox,
-    record_seq: u64,
-    before: &mut Option<LossInterval>,
-    after: &mut Option<LossInterval>,
-) -> bool {
-    let mut crossed = false;
-    while let Ok(loss) = observations.markers.try_recv() {
-        crossed |= partition_loss_around_record(loss, record_seq, before, after);
-    }
-    crossed
-}
-
-fn partition_loss_around_record(
-    loss: LossInterval,
-    record_seq: u64,
-    before: &mut Option<LossInterval>,
-    after: &mut Option<LossInterval>,
-) -> bool {
-    if loss.last_lost_seq < record_seq {
-        merge_pending_gap(before, loss);
-        false
-    } else if loss.first_lost_seq > record_seq {
-        merge_pending_gap(after, loss);
-        false
-    } else {
-        merge_pending_gap(before, loss);
-        true
-    }
-}
-
 fn merge_pending_gap(pending: &mut Option<LossInterval>, loss: LossInterval) {
     if let Some(pending) = pending {
         pending.merge(loss);
     } else {
         *pending = Some(loss);
     }
+}
+
+async fn publish_pending_gap_for_topic<C: WorkerClient>(
+    client: &C,
+    service: &str,
+    lost_count: &AtomicU64,
+    pending: &mut Option<LossInterval>,
+    topic_suffix: &str,
+) -> Result<(), ()> {
+    let Some(mut gap) = *pending else {
+        return Ok(());
+    };
+    if !gap.topics.contains(topic_suffix) {
+        return Ok(());
+    }
+    let topic = port_observation::topic_name(service, topic_suffix);
+    let message = gap_message(topic_suffix, gap, lost_count.load(Ordering::Acquire));
+    publish_message(client, &topic, &message).await?;
+    gap.topics.remove(topic_suffix);
+    *pending = (!gap.topics.is_empty()).then_some(gap);
+    Ok(())
 }
 
 async fn publish_pending_gap<C: WorkerClient>(
@@ -1492,19 +1388,22 @@ fn discard_publication_backlog(
             loss = Some(interval);
         }
     };
-    while let Ok(interval) = observations.markers.try_recv() {
-        absorb(interval);
-    }
     if let Some(failed) = failed {
         discarded = 1;
         absorb(LossInterval::from_record(&failed, LossCause::PublisherLoss));
     }
-    while let Ok(record) = observations.records.try_recv() {
+    for _ in 0..observations.capacity {
+        let Ok(record) = observations.records.try_recv() else {
+            break;
+        };
+        if let Some(preceding) = record.preceding_loss {
+            absorb(preceding);
+        }
         discarded = discarded.saturating_add(1);
-        absorb(LossInterval::from_record(&record, LossCause::PublisherLoss));
-    }
-    while let Ok(interval) = observations.markers.try_recv() {
-        absorb(interval);
+        absorb(LossInterval::from_record(
+            &record.record,
+            LossCause::PublisherLoss,
+        ));
     }
     (discarded, loss)
 }
@@ -2286,40 +2185,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn marker_partition_defers_loss_newer_than_the_held_record() {
-        let record = |event_seq| ObservationRecord::FocusChanged {
-            keyboard: Some(event_seq),
-            previous: None,
-            exclusive_latch: None,
-            event_seq,
-        };
-        let mut before = None;
-        let mut after = None;
-        assert!(!partition_loss_around_record(
-            LossInterval::from_record(&record(1), LossCause::OutboxOverflow),
-            2,
-            &mut before,
-            &mut after,
-        ));
-        assert!(!partition_loss_around_record(
-            LossInterval::from_record(&record(3), LossCause::OutboxOverflow),
-            2,
-            &mut before,
-            &mut after,
-        ));
-        assert_eq!(
-            before.map(|gap| (gap.first_lost_seq, gap.last_lost_seq)),
-            Some((1, 1))
-        );
-        assert_eq!(
-            after.map(|gap| (gap.first_lost_seq, gap.last_lost_seq)),
-            Some((3, 3))
-        );
-    }
-
     #[tokio::test]
-    async fn publisher_gaps_every_affected_topic_before_the_next_survivor() {
+    async fn publisher_gaps_each_topic_no_later_than_its_next_record_or_idle_flush() {
         let lost = Arc::new(AtomicU64::new(0));
         let (mut producer, receiver) = port_observation::test_outbox(Arc::clone(&lost), 2);
         let notifier = producer.notifier();
@@ -2366,24 +2233,20 @@ mod tests {
             }
         })
         .await
-        .expect("two affected-topic gaps and both bounded-lane survivors publish");
+        .expect("both bounded-lane survivors and both affected-topic gaps publish");
         shutdown_tx.send_replace(true);
         task.await.expect("publisher exits");
 
         let published = publications
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let props_gap = cosmix_bus::bus::parse(&published[0].1).expect("props gap parses");
+        let first_survivor =
+            cosmix_bus::bus::parse(&published[0].1).expect("first survivor parses");
         assert_eq!(
             published[0].0.get("name").map(String::as_str),
-            Some("comp-nested.props.changed")
+            Some("comp-nested.focus.changed")
         );
-        assert_eq!(props_gap.get("command"), Some("props.changed"));
-        assert_eq!(props_gap.get("event_seq"), Some("2"));
-        assert_eq!(
-            serde_json::from_str::<Value>(&props_gap.body).unwrap(),
-            json!({"gap": true, "lost_count": 2, "cause": "outbox.overflow"})
-        );
+        assert_eq!(first_survivor.get("event_seq"), Some("3"));
 
         let focus_gap = cosmix_bus::bus::parse(&published[1].1).expect("focus gap parses");
         assert_eq!(
@@ -2396,13 +2259,77 @@ mod tests {
             serde_json::from_str::<Value>(&focus_gap.body).unwrap(),
             json!({"gap": true, "lost_count": 2, "cause": "outbox.overflow"})
         );
-        let first_survivor = cosmix_bus::bus::parse(&published[2].1).expect("survivor parses");
-        assert_eq!(first_survivor.get("command"), Some("focus.changed"));
-        assert_eq!(first_survivor.get("event_seq"), Some("3"));
+
         let second_survivor =
-            cosmix_bus::bus::parse(&published[3].1).expect("second survivor parses");
+            cosmix_bus::bus::parse(&published[2].1).expect("second survivor parses");
         assert_eq!(second_survivor.get("event_seq"), Some("4"));
+
+        let props_gap = cosmix_bus::bus::parse(&published[3].1).expect("props gap parses");
+        assert_eq!(
+            published[3].0.get("name").map(String::as_str),
+            Some("comp-nested.props.changed")
+        );
+        assert_eq!(props_gap.get("command"), Some("props.changed"));
+        assert_eq!(props_gap.get("event_seq"), Some("2"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&props_gap.body).unwrap(),
+            json!({"gap": true, "lost_count": 2, "cause": "outbox.overflow"})
+        );
         assert_eq!(publish_timeouts.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn consecutive_carried_intervals_coalesce_to_one_gap_before_the_survivor() {
+        let lost = Arc::new(AtomicU64::new(0));
+        let (mut producer, receiver) = port_observation::test_outbox(Arc::clone(&lost), 1);
+        let notifier = producer.notifier();
+        for event_seq in 1..=4 {
+            producer.offer(ObservationRecord::FocusChanged {
+                keyboard: Some(event_seq),
+                previous: None,
+                exclusive_latch: None,
+                event_seq,
+            });
+        }
+        let (client, _commands, _states) = FakeClient::new(ConnState::Connected, false);
+        let publications = Arc::clone(&client.publications);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let task = tokio::spawn(publisher_loop(
+            Arc::new(client),
+            Arc::from("comp-nested"),
+            receiver,
+            notifier,
+            Arc::clone(&lost),
+            Arc::new(AtomicU64::new(0)),
+            shutdown,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while publications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+                != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one coalesced gap and the sole survivor publish");
+        shutdown_tx.send_replace(true);
+        task.await.expect("publisher exits");
+
+        let published = publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let gap = cosmix_bus::bus::parse(&published[0].1).expect("gap parses");
+        assert_eq!(gap.get("event_seq"), Some("3"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&gap.body).unwrap(),
+            json!({"gap": true, "lost_count": 3, "cause": "outbox.overflow"})
+        );
+        let survivor = cosmix_bus::bus::parse(&published[1].1).expect("survivor parses");
+        assert_eq!(survivor.get("event_seq"), Some("4"));
+        assert_eq!(lost.load(Ordering::Acquire), 3);
     }
 
     #[tokio::test]
@@ -2455,16 +2382,22 @@ mod tests {
             cause: "props.set",
             event_seq: 1,
         });
-        for event_seq in 2..=4 {
-            producer.offer(ObservationRecord::FocusChanged {
-                keyboard: Some(event_seq),
-                previous: None,
-                exclusive_latch: None,
+        producer.offer(ObservationRecord::FocusChanged {
+            keyboard: Some(2),
+            previous: None,
+            exclusive_latch: None,
+            event_seq: 2,
+        });
+        for event_seq in 3..=4 {
+            producer.offer(ObservationRecord::SurfaceMapped {
+                id: event_seq,
+                role: "toplevel".into(),
+                foreign_id: None,
                 event_seq,
             });
         }
         let (client, _commands, _states) = FakeClient::new(ConnState::Connected, false);
-        client.reject_publish_attempt.store(2, Ordering::Release);
+        client.reject_publish_attempt.store(4, Ordering::Release);
         let publications = Arc::clone(&client.publications);
         let publish_timeouts = Arc::new(AtomicU64::new(0));
         let (shutdown_tx, shutdown) = watch::channel(false);
@@ -2478,12 +2411,12 @@ mod tests {
             shutdown,
         ));
         tokio::time::timeout(Duration::from_secs(1), async {
-            while lost.load(Ordering::Acquire) != 4 {
+            while publish_timeouts.load(Ordering::Acquire) != 1 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("failed focus gap discards both survivors");
+        .expect("the later idle-flush focus gap fails after the props gap succeeds");
         producer.offer(ObservationRecord::FocusChanged {
             keyboard: Some(5),
             previous: Some(4),
@@ -2495,7 +2428,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .len()
-                != 3
+                != 5
             {
                 tokio::task::yield_now().await;
             }
@@ -2518,15 +2451,22 @@ mod tests {
             1,
             "the successful props gap is acknowledged before the focus gap fails"
         );
-        let props_gap = cosmix_bus::bus::parse(&published[0].1).expect("props gap parses");
+        assert_eq!(lost.load(Ordering::Acquire), 2);
+        let first_survivor =
+            cosmix_bus::bus::parse(&published[0].1).expect("first survivor parses");
+        assert_eq!(first_survivor.get("event_seq"), Some("3"));
+        let second_survivor =
+            cosmix_bus::bus::parse(&published[1].1).expect("second survivor parses");
+        assert_eq!(second_survivor.get("event_seq"), Some("4"));
+        let props_gap = cosmix_bus::bus::parse(&published[2].1).expect("props gap parses");
         assert_eq!(props_gap.get("event_seq"), Some("2"));
-        let focus_gap = cosmix_bus::bus::parse(&published[1].1).expect("focus gap parses");
-        assert_eq!(focus_gap.get("event_seq"), Some("4"));
+        let focus_gap = cosmix_bus::bus::parse(&published[3].1).expect("focus gap parses");
+        assert_eq!(focus_gap.get("event_seq"), Some("2"));
         assert_eq!(
             serde_json::from_str::<Value>(&focus_gap.body).unwrap(),
-            json!({"gap": true, "lost_count": 4, "cause": "publisher.loss"})
+            json!({"gap": true, "lost_count": 2, "cause": "outbox.overflow"})
         );
-        let survivor = cosmix_bus::bus::parse(&published[2].1).expect("survivor parses");
+        let survivor = cosmix_bus::bus::parse(&published[4].1).expect("survivor parses");
         assert_eq!(survivor.get("event_seq"), Some("5"));
         assert_eq!(publish_timeouts.load(Ordering::Acquire), 1);
     }
@@ -2653,18 +2593,9 @@ mod tests {
         let published = publications
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let props_gap = cosmix_bus::bus::parse(&published[0].1).expect("props gap parses");
+        let focus_gap = cosmix_bus::bus::parse(&published[0].1).expect("focus gap parses");
         assert_eq!(
             published[0].0.get("name").map(String::as_str),
-            Some("comp-nested.props.changed")
-        );
-        assert_eq!(
-            serde_json::from_str::<Value>(&props_gap.body).unwrap(),
-            json!({"gap": true, "lost_count": 2, "cause": "publisher.loss"})
-        );
-        let focus_gap = cosmix_bus::bus::parse(&published[1].1).expect("focus gap parses");
-        assert_eq!(
-            published[1].0.get("name").map(String::as_str),
             Some("comp-nested.focus.changed")
         );
         assert_eq!(focus_gap.get("event_seq"), Some("2"));
@@ -2672,9 +2603,19 @@ mod tests {
             serde_json::from_str::<Value>(&focus_gap.body).unwrap(),
             json!({"gap": true, "lost_count": 2, "cause": "publisher.loss"})
         );
-        let survivor = cosmix_bus::bus::parse(&published[2].1).expect("survivor parses");
+        let survivor = cosmix_bus::bus::parse(&published[1].1).expect("survivor parses");
         assert_eq!(survivor.get("command"), Some("focus.changed"));
         assert_eq!(survivor.get("event_seq"), Some("3"));
+        let props_gap = cosmix_bus::bus::parse(&published[2].1).expect("props gap parses");
+        assert_eq!(
+            published[2].0.get("name").map(String::as_str),
+            Some("comp-nested.props.changed")
+        );
+        assert_eq!(props_gap.get("event_seq"), Some("2"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&props_gap.body).unwrap(),
+            json!({"gap": true, "lost_count": 2, "cause": "publisher.loss"})
+        );
         assert_eq!(publish_timeouts.load(Ordering::Acquire), 1);
     }
 
@@ -2751,28 +2692,32 @@ mod tests {
             }
         })
         .await
-        .expect("the later marker forces both gaps before its survivors");
+        .expect("publisher-loss and carried overflow gaps both publish");
         shutdown_tx.send_replace(true);
         task.await.expect("publisher exits");
 
         let published = publications
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let props_gap = cosmix_bus::bus::parse(&published[0].1).expect("props gap parses");
-        assert_eq!(props_gap.get("command"), Some("props.changed"));
-        assert_eq!(props_gap.get("event_seq"), Some("3"));
-        let focus_gap = cosmix_bus::bus::parse(&published[1].1).expect("focus gap parses");
+        let focus_gap = cosmix_bus::bus::parse(&published[0].1).expect("focus gap parses");
         assert_eq!(focus_gap.get("command"), Some("focus.changed"));
-        assert_eq!(focus_gap.get("event_seq"), Some("3"));
+        assert_eq!(focus_gap.get("event_seq"), Some("2"));
         assert_eq!(
             serde_json::from_str::<Value>(&focus_gap.body).unwrap(),
             json!({"gap": true, "lost_count": 3, "cause": "publisher.loss"})
         );
-        let first_survivor = cosmix_bus::bus::parse(&published[2].1).expect("survivor parses");
+        let first_survivor = cosmix_bus::bus::parse(&published[1].1).expect("survivor parses");
         assert_eq!(first_survivor.get("event_seq"), Some("4"));
         let second_survivor =
-            cosmix_bus::bus::parse(&published[3].1).expect("second survivor parses");
+            cosmix_bus::bus::parse(&published[2].1).expect("second survivor parses");
         assert_eq!(second_survivor.get("event_seq"), Some("5"));
+        let props_gap = cosmix_bus::bus::parse(&published[3].1).expect("props gap parses");
+        assert_eq!(props_gap.get("command"), Some("props.changed"));
+        assert_eq!(props_gap.get("event_seq"), Some("3"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&props_gap.body).unwrap(),
+            json!({"gap": true, "lost_count": 3, "cause": "outbox.overflow"})
+        );
         assert_eq!(publish_timeouts.load(Ordering::Acquire), 1);
     }
 

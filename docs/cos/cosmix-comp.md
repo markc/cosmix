@@ -107,18 +107,22 @@ Mutations within an existing row remain leaf-granular.
 The sequence is process-global, strictly increasing and shared by property,
 surface, focus, output and corner records. If it reaches `u64::MAX`, that value
 is offered once and observation enters a terminal exhausted state rather than
-reusing a sequence. The outbox has a bounded 256-record data lane and a
-separate bounded two-marker loss lane. On overflow the producer evicts one
-oldest data record in fixed time and merges its exact interval into that marker
-lane; the publisher always drains loss markers before publishing surviving
-data. A gap is published to every topic represented by that exact interval
-before its next surviving record (at most seven gap publications per interval): Bus header
-`event_seq=<last lost seq>` (the interval's last-lost sequence) and body
-`{gap:true,lost_count,cause:"outbox.overflow"}`, where `lost_count` is the
-same cumulative process-wide counter as `port.lost_count`, not a per-interval
-tally. A rejected or timed-out
-publication discards its uncertain backlog and recovers with the same body
-using `cause:"publisher.loss"`. After either gap, read a fresh property tree.
+reusing a sequence. The outbox is one bounded 256-entry lane. On overflow the
+producer evicts one oldest record in fixed time and carries that record's loss
+interval inside the next record it sends; if an evicted record already carries
+loss, both intervals coalesce. Once the publisher learns an interval, it emits
+a gap on each affected topic before the next record it publishes on that topic,
+or during the idle flush when the lane drains empty. Survivors produced before
+the carried loss reaches the publisher may therefore be published before its
+gap. The gap's Bus header is `event_seq=<last lost seq>` (the coalesced
+interval's last-lost sequence), which locates the hole, and its body is
+`{gap:true,lost_count,cause:"outbox.overflow"}`. `lost_count` is the same
+cumulative process-wide counter as `port.lost_count`, not a per-interval tally.
+Consecutive intervals coalesce while pending, bounding gap traffic to at most
+one gap per topic per published record plus the idle flush. A rejected or
+timed-out publication discards its uncertain backlog and recovers under the
+same ordering rule with `cause:"publisher.loss"`. After either gap, read a
+fresh property tree.
 
 Hot-corner detection is compositor-side and uses the current logical output.
 It emits one `entered`, then one `left` on deadzone exit, output or geometry

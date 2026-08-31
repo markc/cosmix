@@ -27103,7 +27103,11 @@ fn port_boundary_uses_production_admission_completion_and_sees_same_dispatch_com
 fn drain_observations(
     receiver: &port_observation::ObservationOutbox,
 ) -> Vec<port_observation::ObservationRecord> {
-    receiver.records.try_iter().collect()
+    receiver
+        .records
+        .try_iter()
+        .map(|record| record.record)
+        .collect()
 }
 
 #[cfg(feature = "bus")]
