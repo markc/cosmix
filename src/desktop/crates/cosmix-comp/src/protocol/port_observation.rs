@@ -1,7 +1,7 @@
 //! Calloop-owned semantic observation reduction and the bounded Bus outbox.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -11,7 +11,7 @@ use std::{
 
 use chrono::{SecondsFormat, TimeZone, Utc};
 use cosmix_bus::bus::BusMessage;
-use crossbeam_channel::{Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use serde::Serialize;
 use serde_json::{Value, json};
 use smithay::output::Output;
@@ -49,6 +49,9 @@ pub(crate) fn topic_name(service: &str, suffix: &str) -> String {
 type PendingPropChanges = BTreeMap<String, (PropValue, PropValue, &'static str)>;
 
 const OUTBOX_CAPACITY: usize = 256;
+// One interval may precede the publisher's held record while another follows
+// it. Two slots preserve that boundary without allocating or rebuilding data.
+const MARKER_CAPACITY: usize = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(untagged)]
@@ -311,16 +314,31 @@ impl AffectedTopics {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum LossCause {
+    OutboxOverflow,
+    PublisherLoss,
+}
+
+impl LossCause {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::OutboxOverflow => "outbox.overflow",
+            Self::PublisherLoss => "publisher.loss",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LossInterval {
     pub(crate) first_lost_seq: u64,
     pub(crate) last_lost_seq: u64,
     pub(crate) topics: AffectedTopics,
-    pub(crate) cause: &'static str,
+    pub(crate) cause: LossCause,
 }
 
 impl LossInterval {
-    pub(crate) fn from_record(record: &ObservationRecord, cause: &'static str) -> Self {
+    pub(crate) fn from_record(record: &ObservationRecord, cause: LossCause) -> Self {
         let mut topics = AffectedTopics::default();
         topics.insert(record.topic_suffix());
         Self {
@@ -335,26 +353,15 @@ impl LossInterval {
         self.first_lost_seq = self.first_lost_seq.min(other.first_lost_seq);
         self.last_lost_seq = self.last_lost_seq.max(other.last_lost_seq);
         self.topics.merge(other.topics);
-        if other.cause == "publisher.loss" {
-            self.cause = other.cause;
-        }
+        self.cause = self.cause.max(other.cause);
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum ObservationItem {
-    Record(ObservationRecord),
-    Loss(LossInterval),
-}
-
-impl ObservationItem {
-    #[cfg(test)]
-    pub(crate) fn into_record(self) -> Option<ObservationRecord> {
-        match self {
-            Self::Record(record) => Some(record),
-            Self::Loss(_) => None,
-        }
-    }
+pub(crate) struct ObservationOutbox {
+    pub(crate) records: Receiver<ObservationRecord>,
+    pub(crate) markers: Receiver<LossInterval>,
+    pub(crate) marker_update_generation: Arc<AtomicU64>,
+    pub(crate) held_record_seq: Arc<AtomicU64>,
 }
 
 fn rfc3339_millis(unix_ms: i64) -> String {
@@ -365,74 +372,141 @@ fn rfc3339_millis(unix_ms: i64) -> String {
 }
 
 pub(crate) struct ObservationProducer {
-    sender: Sender<ObservationItem>,
-    eviction: Receiver<ObservationItem>,
+    record_sender: Sender<ObservationRecord>,
+    record_eviction: Receiver<ObservationRecord>,
+    marker_sender: Sender<LossInterval>,
+    marker_merge: Receiver<LossInterval>,
+    pending_marker: Option<LossInterval>,
+    marker_update_generation: Arc<AtomicU64>,
+    held_record_seq: Arc<AtomicU64>,
     lost_count: Arc<AtomicU64>,
     notifier: Arc<Notify>,
 }
 
 impl ObservationProducer {
-    pub(crate) fn offer(&self, record: ObservationRecord) {
-        match self.sender.try_send(ObservationItem::Record(record)) {
+    /// Fixed-cost calloop boundary: bounded channels allocate their storage at
+    /// construction. One offer performs at most two marker flushes, two data
+    /// sends, one data eviction and a two-slot marker normalisation; it must
+    /// never grow a Vec/VecDeque/Box, serialise JSON, wait, poll, lock or loop
+    /// over either queue. The two atomics only arbitrate the independent lanes.
+    pub(crate) fn offer(&mut self, record: ObservationRecord) {
+        self.flush_pending_marker();
+        match self.record_sender.try_send(record) {
             Ok(()) => self.notifier.notify_one(),
             Err(TrySendError::Disconnected(_)) => {
                 self.lost_count.fetch_add(1, Ordering::AcqRel);
             }
-            Err(TrySendError::Full(ObservationItem::Record(record))) => {
-                self.replace_full_queue(record);
-            }
-            Err(TrySendError::Full(ObservationItem::Loss(_))) => {
-                unreachable!("offer sends a semantic record")
+            Err(TrySendError::Full(record)) => {
+                self.replace_one_oldest(record);
             }
         }
     }
 
-    /// Rebuild the bounded queued suffix with one explicit loss interval at
-    /// its front. The publisher may concurrently take an older item, but it
-    /// can only shorten this suffix; this sole producer restores the remaining
-    /// items in the same order before appending the new record.
-    fn replace_full_queue(&self, record: ObservationRecord) {
-        let capacity = self
-            .sender
-            .capacity()
-            .expect("the observation outbox is bounded");
-        debug_assert!(capacity >= 2, "a loss marker and survivor need two slots");
-        let mut queued = self.eviction.try_iter().collect::<VecDeque<_>>();
-
-        if queued.len().saturating_add(1) > capacity {
-            let prefix_len = queued.len().saturating_add(2).saturating_sub(capacity);
-            let mut interval: Option<LossInterval> = None;
-            let mut newly_lost = 0_u64;
-            for _ in 0..prefix_len {
-                let item = queued
-                    .pop_front()
-                    .expect("the full suffix contains the prefix being replaced");
-                let loss = match item {
-                    ObservationItem::Record(record) => {
-                        newly_lost = newly_lost.saturating_add(1);
-                        LossInterval::from_record(&record, "outbox.overflow")
-                    }
-                    ObservationItem::Loss(loss) => loss,
-                };
-                if let Some(current) = interval.as_mut() {
-                    current.merge(loss);
-                } else {
-                    interval = Some(loss);
-                }
+    fn replace_one_oldest(&mut self, record: ObservationRecord) {
+        match self.record_eviction.try_recv() {
+            Ok(evicted) => {
+                self.merge_pending_marker(LossInterval::from_record(
+                    &evicted,
+                    LossCause::OutboxOverflow,
+                ));
+                self.lost_count.fetch_add(1, Ordering::AcqRel);
+                self.flush_pending_marker();
             }
-            queued.push_front(ObservationItem::Loss(
-                interval.expect("a replaced prefix owns one loss interval"),
-            ));
-            self.lost_count.fetch_add(newly_lost, Ordering::AcqRel);
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.lost_count.fetch_add(1, Ordering::AcqRel);
+                return;
+            }
         }
-        queued.push_back(ObservationItem::Record(record));
 
-        for item in queued {
-            self.sender
-                .try_send(item)
-                .expect("the sole producer rebuilt no more than the bounded capacity");
+        match self.record_sender.try_send(record) {
+            Ok(()) => self.notifier.notify_one(),
+            Err(TrySendError::Disconnected(_)) => {
+                self.lost_count.fetch_add(1, Ordering::AcqRel);
+            }
+            Err(TrySendError::Full(_)) => {
+                unreachable!("one consumer or one eviction leaves one data slot")
+            }
         }
+    }
+
+    fn merge_pending_marker(&mut self, marker: LossInterval) {
+        if let Some(pending) = self.pending_marker.as_mut() {
+            pending.merge(marker);
+        } else {
+            self.pending_marker = Some(marker);
+        }
+    }
+
+    fn flush_pending_marker(&mut self) {
+        let Some(marker) = self.pending_marker.take() else {
+            return;
+        };
+        match self.marker_sender.try_send(marker) {
+            Ok(()) => self.notifier.notify_one(),
+            Err(TrySendError::Disconnected(marker)) => {
+                self.pending_marker = Some(marker);
+            }
+            Err(TrySendError::Full(marker)) => self.normalise_full_marker_lane(marker),
+        }
+    }
+
+    fn normalise_full_marker_lane(&mut self, marker: LossInterval) {
+        // The marker lane must never look empty to the publisher while its
+        // occupant is being merged. The publisher observes this fixed-cost
+        // critical section and waits on Notify; no lock or spin is involved.
+        self.marker_update_generation.fetch_add(1, Ordering::AcqRel);
+
+        let first = self.marker_merge.try_recv().ok();
+        let second = self.marker_merge.try_recv().ok();
+        let held = self.held_record_seq.load(Ordering::Acquire);
+        let mut before: Option<LossInterval> = None;
+        let mut after: Option<LossInterval> = None;
+        for candidate in [first, second, Some(marker)].into_iter().flatten() {
+            let target = if held == 0
+                || candidate.last_lost_seq < held
+                || candidate.first_lost_seq <= held
+            {
+                &mut before
+            } else {
+                &mut after
+            };
+            self.merge_marker_slot(target, candidate);
+        }
+
+        let connected = self.finish_marker_flush(before) && self.finish_marker_flush(after);
+        self.marker_update_generation
+            .fetch_add(1, Ordering::Release);
         self.notifier.notify_one();
+        if !connected {
+            if let Some(marker) = before {
+                self.merge_pending_marker(marker);
+            }
+            if let Some(marker) = after {
+                self.merge_pending_marker(marker);
+            }
+        }
+    }
+
+    fn merge_marker_slot(&self, slot: &mut Option<LossInterval>, marker: LossInterval) {
+        if let Some(current) = slot.as_mut() {
+            current.merge(marker);
+        } else {
+            *slot = Some(marker);
+        }
+    }
+
+    fn finish_marker_flush(&self, marker: Option<LossInterval>) -> bool {
+        let Some(marker) = marker else {
+            return true;
+        };
+        match self.marker_sender.try_send(marker) {
+            Ok(()) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+            Err(TrySendError::Full(_)) => {
+                unreachable!("two fixed marker slots were drained before normalisation")
+            }
+        }
     }
 
     pub(crate) fn notifier(&self) -> Arc<Notify> {
@@ -440,30 +514,38 @@ impl ObservationProducer {
     }
 }
 
-pub(crate) fn outbox(
-    lost_count: Arc<AtomicU64>,
-) -> (ObservationProducer, Receiver<ObservationItem>) {
+pub(crate) fn outbox(lost_count: Arc<AtomicU64>) -> (ObservationProducer, ObservationOutbox) {
     outbox_with_capacity(lost_count, OUTBOX_CAPACITY)
 }
 
 fn outbox_with_capacity(
     lost_count: Arc<AtomicU64>,
     capacity: usize,
-) -> (ObservationProducer, Receiver<ObservationItem>) {
-    assert!(
-        capacity >= 2,
-        "observation outbox capacity must be at least two"
-    );
-    let (sender, receiver) = crossbeam_channel::bounded(capacity);
+) -> (ObservationProducer, ObservationOutbox) {
+    assert!(capacity > 0, "observation data lane must have capacity");
+    let (record_sender, records) = crossbeam_channel::bounded(capacity);
+    let (marker_sender, markers) = crossbeam_channel::bounded(MARKER_CAPACITY);
     let notifier = Arc::new(Notify::new());
+    let marker_update_generation = Arc::new(AtomicU64::new(0));
+    let held_record_seq = Arc::new(AtomicU64::new(0));
     (
         ObservationProducer {
-            sender,
-            eviction: receiver.clone(),
+            record_sender,
+            record_eviction: records.clone(),
+            marker_sender,
+            marker_merge: markers.clone(),
+            pending_marker: None,
+            marker_update_generation: Arc::clone(&marker_update_generation),
+            held_record_seq: Arc::clone(&held_record_seq),
             lost_count,
             notifier,
         },
-        receiver,
+        ObservationOutbox {
+            records,
+            markers,
+            marker_update_generation,
+            held_record_seq,
+        },
     )
 }
 
@@ -471,7 +553,7 @@ fn outbox_with_capacity(
 pub(crate) fn test_outbox(
     lost_count: Arc<AtomicU64>,
     capacity: usize,
-) -> (ObservationProducer, Receiver<ObservationItem>) {
+) -> (ObservationProducer, ObservationOutbox) {
     outbox_with_capacity(lost_count, capacity)
 }
 
@@ -2019,39 +2101,157 @@ fn known_read_only_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+    };
+
     use super::*;
 
-    #[test]
-    fn outbox_replaces_the_oldest_prefix_with_an_exact_loss_interval() {
-        let lost = Arc::new(AtomicU64::new(0));
-        let (producer, receiver) = test_outbox(Arc::clone(&lost), 2);
-        for sequence in 1..=4 {
-            producer.offer(ObservationRecord::FocusChanged {
-                keyboard: Some(sequence),
-                previous: None,
-                exclusive_latch: None,
-                event_seq: sequence,
+    thread_local! {
+        static TRACKED_ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    struct TestAllocator;
+
+    #[global_allocator]
+    static TEST_ALLOCATOR: TestAllocator = TestAllocator;
+
+    unsafe impl GlobalAlloc for TestAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = TRACKED_ALLOCATIONS.try_with(|count| {
+                if let Some(current) = count.get() {
+                    count.set(Some(current.saturating_add(1)));
+                }
             });
+            // SAFETY: this wrapper preserves System's allocation contract.
+            unsafe { System.alloc(layout) }
         }
-        assert_eq!(lost.load(Ordering::Acquire), 3);
-        let ObservationItem::Loss(interval) = receiver.recv().unwrap() else {
-            panic!("the loss interval precedes its survivor");
-        };
-        assert_eq!((interval.first_lost_seq, interval.last_lost_seq), (1, 3));
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let _ = TRACKED_ALLOCATIONS.try_with(|count| {
+                if let Some(current) = count.get() {
+                    count.set(Some(current.saturating_add(1)));
+                }
+            });
+            // SAFETY: this wrapper preserves System's allocation contract.
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            // SAFETY: pointer/layout came from this System-backed allocator.
+            unsafe { System.dealloc(pointer, layout) }
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            let _ = TRACKED_ALLOCATIONS.try_with(|count| {
+                if let Some(current) = count.get() {
+                    count.set(Some(current.saturating_add(1)));
+                }
+            });
+            // SAFETY: pointer/layout came from System and size is forwarded.
+            unsafe { System.realloc(pointer, layout, size) }
+        }
+    }
+
+    fn allocations_during(run: impl FnOnce()) -> usize {
+        TRACKED_ALLOCATIONS.with(|count| {
+            assert_eq!(count.replace(Some(0)), None);
+        });
+        run();
+        TRACKED_ALLOCATIONS.with(|count| count.replace(None).expect("tracking was armed"))
+    }
+
+    fn merged_markers(outbox: &ObservationOutbox) -> LossInterval {
+        let mut marker = outbox.markers.recv().expect("at least one loss marker");
+        while let Ok(next) = outbox.markers.try_recv() {
+            marker.merge(next);
+        }
+        marker
+    }
+
+    #[test]
+    fn bounded_marker_lane_merges_exact_loss_without_dropping_a_marker() {
+        let lost = Arc::new(AtomicU64::new(0));
+        let (mut producer, outbox) = test_outbox(Arc::clone(&lost), 2);
+        assert_eq!(outbox.records.capacity(), Some(2));
+        assert_eq!(outbox.markers.capacity(), Some(2));
+        for sequence in 1..=6 {
+            if sequence % 2 == 0 {
+                producer.offer(ObservationRecord::FocusChanged {
+                    keyboard: Some(sequence),
+                    previous: None,
+                    exclusive_latch: None,
+                    event_seq: sequence,
+                });
+            } else {
+                producer.offer(ObservationRecord::PropsChanged {
+                    path: "input.corners.enabled".into(),
+                    old: PropValue::Bool(true),
+                    new: PropValue::Bool(false),
+                    unix_ms: 0,
+                    cause: "props.set",
+                    event_seq: sequence,
+                });
+            }
+        }
+        assert_eq!(lost.load(Ordering::Acquire), 4);
+        let interval = merged_markers(&outbox);
+        assert_eq!((interval.first_lost_seq, interval.last_lost_seq), (1, 4));
         assert_eq!(
             interval.topics.iter().collect::<Vec<_>>(),
-            [FOCUS_TOPIC_SUFFIX]
+            [PROPS_TOPIC_SUFFIX, FOCUS_TOPIC_SUFFIX]
         );
-        let ObservationItem::Record(survivor) = receiver.recv().unwrap() else {
-            panic!("the newest semantic record survives");
-        };
-        assert_eq!(survivor.event_seq(), 4);
+        assert_eq!(interval.cause, LossCause::OutboxOverflow);
+        assert_eq!(
+            outbox
+                .records
+                .try_iter()
+                .map(|record| record.event_seq())
+                .collect::<Vec<_>>(),
+            [5, 6]
+        );
+        assert!(
+            outbox.markers.is_empty(),
+            "the marker was merged, not dropped"
+        );
+    }
+
+    #[test]
+    fn marker_normalisation_preserves_the_held_survivor_boundary() {
+        let lost = Arc::new(AtomicU64::new(0));
+        let (mut producer, outbox) = test_outbox(Arc::clone(&lost), 2);
+        for event_seq in 1..=3 {
+            producer.offer(ObservationRecord::FocusChanged {
+                keyboard: Some(event_seq),
+                previous: None,
+                exclusive_latch: None,
+                event_seq,
+            });
+        }
+        let held = outbox.records.recv().expect("oldest survivor is held");
+        assert_eq!(held.event_seq(), 2);
+        outbox.held_record_seq.store(2, Ordering::Release);
+        for event_seq in 4..=6 {
+            producer.offer(ObservationRecord::FocusChanged {
+                keyboard: Some(event_seq),
+                previous: None,
+                exclusive_latch: None,
+                event_seq,
+            });
+        }
+
+        let before = outbox.markers.recv().expect("marker before survivor");
+        let after = outbox.markers.recv().expect("marker after survivor");
+        assert_eq!((before.first_lost_seq, before.last_lost_seq), (1, 1));
+        assert_eq!((after.first_lost_seq, after.last_lost_seq), (3, 4));
+        assert_eq!(lost.load(Ordering::Acquire), 3);
     }
 
     #[test]
     fn loss_interval_is_closed_when_its_marker_leaves_the_channel() {
         let lost = Arc::new(AtomicU64::new(0));
-        let (producer, receiver) = test_outbox(Arc::clone(&lost), 3);
+        let (mut producer, outbox) = test_outbox(Arc::clone(&lost), 3);
         for sequence in 1..=4 {
             producer.offer(ObservationRecord::FocusChanged {
                 keyboard: Some(sequence),
@@ -2060,10 +2260,8 @@ mod tests {
                 event_seq: sequence,
             });
         }
-        let ObservationItem::Loss(first) = receiver.recv().unwrap() else {
-            panic!("first overflow marker");
-        };
-        assert_eq!((first.first_lost_seq, first.last_lost_seq), (1, 2));
+        let first = outbox.markers.recv().unwrap();
+        assert_eq!((first.first_lost_seq, first.last_lost_seq), (1, 1));
 
         producer.offer(ObservationRecord::PropsChanged {
             path: "input.corners.enabled".into(),
@@ -2080,18 +2278,73 @@ mod tests {
             event_seq: 6,
         });
 
-        let ObservationItem::Loss(second) = receiver.recv().unwrap() else {
-            panic!("later overflow owns a separate marker");
-        };
-        assert_eq!((second.first_lost_seq, second.last_lost_seq), (3, 4));
+        let second = merged_markers(&outbox);
+        assert_eq!((second.first_lost_seq, second.last_lost_seq), (2, 3));
         assert_eq!(
             second.topics.iter().collect::<Vec<_>>(),
             [FOCUS_TOPIC_SUFFIX]
         );
         assert_eq!(
             lost.load(Ordering::Acquire),
-            4,
+            3,
             "the later interval cannot be absorbed into the earlier watermark"
+        );
+    }
+
+    #[test]
+    fn publisher_loss_dominates_interval_merges_in_both_orders() {
+        let record = ObservationRecord::FocusChanged {
+            keyboard: Some(1),
+            previous: None,
+            exclusive_latch: None,
+            event_seq: 1,
+        };
+        let overflow = LossInterval::from_record(&record, LossCause::OutboxOverflow);
+        let publisher = LossInterval::from_record(&record, LossCause::PublisherLoss);
+
+        let mut overflow_then_publisher = overflow;
+        overflow_then_publisher.merge(publisher);
+        let mut publisher_then_overflow = publisher;
+        publisher_then_overflow.merge(overflow);
+        assert_eq!(overflow_then_publisher.cause, LossCause::PublisherLoss);
+        assert_eq!(publisher_then_overflow.cause, LossCause::PublisherLoss);
+    }
+
+    #[test]
+    fn repeated_capacity_two_overflow_allocates_nothing_in_offer() {
+        let lost = Arc::new(AtomicU64::new(0));
+        let (mut producer, outbox) = test_outbox(Arc::clone(&lost), 2);
+        let allocations = allocations_during(|| {
+            for event_seq in 1..=1_024 {
+                producer.offer(ObservationRecord::FocusChanged {
+                    keyboard: Some(event_seq),
+                    previous: None,
+                    exclusive_latch: None,
+                    event_seq,
+                });
+            }
+        });
+
+        assert_eq!(allocations, 0, "offer must remain allocation-free");
+        assert_eq!(lost.load(Ordering::Acquire), 1_022);
+        let generation = outbox.marker_update_generation.load(Ordering::Acquire);
+        assert!(
+            generation > 0,
+            "repeated overflow normalised the marker lane"
+        );
+        assert!(
+            generation.is_multiple_of(2),
+            "marker normalisation finished stable"
+        );
+        let marker = merged_markers(&outbox);
+        assert_eq!((marker.first_lost_seq, marker.last_lost_seq), (1, 1_022));
+        assert_eq!(
+            outbox
+                .records
+                .try_iter()
+                .map(|record| record.event_seq())
+                .collect::<Vec<_>>(),
+            [1_023, 1_024]
         );
     }
 
@@ -2389,7 +2642,7 @@ mod tests {
         let event_loop = smithay::reexports::calloop::EventLoop::<WaylandState>::try_new()
             .expect("test event loop");
         let lost = Arc::new(AtomicU64::new(0));
-        let (producer, receiver) = outbox(lost);
+        let (producer, outbox) = outbox(lost);
         let watermark = Arc::new(AtomicU64::new(0));
         let mut state =
             ObservationState::new(producer, Arc::clone(&watermark), event_loop.handle());
@@ -2407,9 +2660,9 @@ mod tests {
             event_seq,
         });
         assert_eq!(
-            receiver
+            outbox
+                .records
                 .try_iter()
-                .filter_map(ObservationItem::into_record)
                 .map(|record| record.event_seq())
                 .collect::<Vec<_>>(),
             [u64::MAX]

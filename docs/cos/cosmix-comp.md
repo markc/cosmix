@@ -107,10 +107,12 @@ Mutations within an existing row remain leaf-granular.
 The sequence is process-global, strictly increasing and shared by property,
 surface, focus, output and corner records. If it reaches `u64::MAX`, that value
 is offered once and observation enters a terminal exhausted state rather than
-reusing a sequence. If the bounded 256-entry outbox overflows, it replaces the
-oldest queued prefix with one in-order loss-interval marker. A gap is published
-to every topic represented by that exact interval before its next surviving
-record (at most seven gap publications per interval): Bus header
+reusing a sequence. The outbox has a bounded 256-record data lane and a
+separate bounded two-marker loss lane. On overflow the producer evicts one
+oldest data record in fixed time and merges its exact interval into that marker
+lane; the publisher always drains loss markers before publishing surviving
+data. A gap is published to every topic represented by that exact interval
+before its next surviving record (at most seven gap publications per interval): Bus header
 `event_seq=<last lost seq>` (the interval's last-lost sequence) and body
 `{gap:true,lost_count,cause:"outbox.overflow"}`, where `lost_count` is the
 same cumulative process-wide counter as `port.lost_count`, not a per-interval

@@ -28,7 +28,7 @@ use crate::{
     protocol::{port_observation, port_snapshot},
 };
 use port_observation::{
-    LossInterval, ObservationItem, ObservationProducer, ObservationRecord, PropValue,
+    LossCause, LossInterval, ObservationOutbox, ObservationProducer, ObservationRecord, PropValue,
     SetValidationError,
 };
 use port_snapshot::{
@@ -285,11 +285,7 @@ pub(crate) struct PortProtocolWiring {
 #[cfg(test)]
 pub(crate) fn test_wiring(
     context: Arc<SnapshotContext>,
-) -> (
-    PortProtocolWiring,
-    PortIngress,
-    crossbeam_channel::Receiver<ObservationItem>,
-) {
+) -> (PortProtocolWiring, PortIngress, ObservationOutbox) {
     let (sender, source) = channel::sync_channel(PORT_QUEUE_CAPACITY);
     let ingress = PortIngress {
         sender,
@@ -315,11 +311,7 @@ pub(crate) fn test_wiring(
 pub(crate) fn test_wiring_with_observation_capacity(
     context: Arc<SnapshotContext>,
     capacity: usize,
-) -> (
-    PortProtocolWiring,
-    PortIngress,
-    crossbeam_channel::Receiver<ObservationItem>,
-) {
+) -> (PortProtocolWiring, PortIngress, ObservationOutbox) {
     let (sender, source) = channel::sync_channel(PORT_QUEUE_CAPACITY);
     let ingress = PortIngress {
         sender,
@@ -348,7 +340,7 @@ pub(crate) struct PortStarter {
     broker: Arc<AtomicU8>,
     reply_timeouts: Arc<AtomicU64>,
     publish_timeouts: Arc<AtomicU64>,
-    observations: crossbeam_channel::Receiver<ObservationItem>,
+    observations: ObservationOutbox,
     observation_notifier: Arc<tokio::sync::Notify>,
     lost_count: Arc<AtomicU64>,
 }
@@ -711,7 +703,7 @@ async fn worker_loop<F, Fut, C>(
     broker: Arc<AtomicU8>,
     reply_timeouts: Arc<AtomicU64>,
     publish_timeouts: Arc<AtomicU64>,
-    observations: crossbeam_channel::Receiver<ObservationItem>,
+    observations: ObservationOutbox,
     observation_notifier: Arc<tokio::sync::Notify>,
     lost_count: Arc<AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
@@ -1222,78 +1214,237 @@ async fn reply_loop<C: WorkerClient>(
 async fn publisher_loop<C: WorkerClient>(
     client: Arc<C>,
     service: Arc<str>,
-    observations: crossbeam_channel::Receiver<ObservationItem>,
+    observations: ObservationOutbox,
     observation_notifier: Arc<tokio::sync::Notify>,
     lost_count: Arc<AtomicU64>,
     publish_timeouts: Arc<AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut pending_gap: Option<LossInterval> = None;
+    let mut deferred_gap: Option<LossInterval> = None;
+    let mut defer_gap_retry_until_data = false;
     loop {
-        let item = match observations.try_recv() {
-            Ok(item) => item,
+        if let Some(gap) = deferred_gap.take() {
+            merge_pending_gap(&mut pending_gap, gap);
+        }
+        if !drain_marker_lane_when_stable(
+            &observations,
+            &mut pending_gap,
+            &observation_notifier,
+            &mut shutdown,
+        )
+        .await
+        {
+            break;
+        }
+        if pending_gap.is_some()
+            && !defer_gap_retry_until_data
+            && publish_pending_gap(client.as_ref(), &service, &lost_count, &mut pending_gap)
+                .await
+                .is_err()
+        {
+            publish_timeouts.fetch_add(1, Ordering::AcqRel);
+            let (discarded, loss) = discard_publication_backlog(None, &observations);
+            lost_count.fetch_add(discarded, Ordering::AcqRel);
+            if let Some(loss) = loss {
+                merge_pending_gap(&mut pending_gap, loss);
+            }
+            defer_gap_retry_until_data = true;
+            continue;
+        }
+
+        let record = match observations.records.try_recv() {
+            Ok(record) => record,
             Err(crossbeam_channel::TryRecvError::Empty) => {
-                tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            break;
-                        }
-                    }
-                    _ = observation_notifier.notified() => {}
+                if !wait_for_observation(&observation_notifier, &mut shutdown).await {
+                    break;
                 }
                 continue;
             }
-            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                drain_marker_lane(&observations, &mut pending_gap);
+                if pending_gap.is_some() && !defer_gap_retry_until_data {
+                    continue;
+                }
+                break;
+            }
         };
 
-        match item {
-            ObservationItem::Loss(loss) => {
-                merge_pending_gap(&mut pending_gap, loss);
-                if publish_pending_gap(client.as_ref(), &service, &lost_count, &mut pending_gap)
-                    .await
-                    .is_err()
-                {
-                    publish_timeouts.fetch_add(1, Ordering::AcqRel);
-                    let (discarded, loss) = discard_publication_backlog(None, &observations);
-                    lost_count.fetch_add(discarded, Ordering::AcqRel);
-                    if let Some(loss) = loss {
-                        merge_pending_gap(&mut pending_gap, loss);
-                    }
-                }
+        let record_seq = record.event_seq();
+        observations
+            .held_record_seq
+            .store(record_seq, Ordering::Release);
+        let crossed_record = match drain_marker_lane_around_record_when_stable(
+            &observations,
+            record_seq,
+            &mut pending_gap,
+            &mut deferred_gap,
+            &observation_notifier,
+            &mut shutdown,
+        )
+        .await
+        {
+            Ok(crossed) => crossed,
+            Err(()) => {
+                observations.held_record_seq.store(0, Ordering::Release);
+                break;
             }
-            ObservationItem::Record(record) => {
-                if pending_gap.is_some()
-                    && publish_pending_gap(client.as_ref(), &service, &lost_count, &mut pending_gap)
-                        .await
-                        .is_err()
-                {
-                    publish_timeouts.fetch_add(1, Ordering::AcqRel);
-                    let (discarded, loss) =
-                        discard_publication_backlog(Some(record), &observations);
-                    lost_count.fetch_add(discarded, Ordering::AcqRel);
-                    if let Some(loss) = loss {
-                        merge_pending_gap(&mut pending_gap, loss);
-                    }
-                    continue;
-                }
-
-                let topic = port_observation::topic_name(&service, record.topic_suffix());
-                let message = record.wire();
-                if publish_message(client.as_ref(), &topic, &message)
-                    .await
-                    .is_ok()
-                {
-                    continue;
-                }
-
-                publish_timeouts.fetch_add(1, Ordering::AcqRel);
-                let (discarded, loss) = discard_publication_backlog(Some(record), &observations);
-                lost_count.fetch_add(discarded, Ordering::AcqRel);
-                if let Some(loss) = loss {
-                    merge_pending_gap(&mut pending_gap, loss);
-                }
-            }
+        };
+        if crossed_record {
+            // Defensive recovery: making the held record part of the loss
+            // closes a malformed crossing interval without publishing a
+            // watermark followed by an older record.
+            merge_pending_gap(
+                &mut pending_gap,
+                LossInterval::from_record(&record, LossCause::PublisherLoss),
+            );
+            lost_count.fetch_add(1, Ordering::AcqRel);
+            observations.held_record_seq.store(0, Ordering::Release);
+            continue;
         }
+        if pending_gap.is_some()
+            && publish_pending_gap(client.as_ref(), &service, &lost_count, &mut pending_gap)
+                .await
+                .is_err()
+        {
+            observations.held_record_seq.store(0, Ordering::Release);
+            publish_timeouts.fetch_add(1, Ordering::AcqRel);
+            let (discarded, loss) = discard_publication_backlog(Some(record), &observations);
+            lost_count.fetch_add(discarded, Ordering::AcqRel);
+            if let Some(loss) = loss {
+                merge_pending_gap(&mut pending_gap, loss);
+            }
+            defer_gap_retry_until_data = true;
+            continue;
+        }
+        defer_gap_retry_until_data = false;
+
+        let topic = port_observation::topic_name(&service, record.topic_suffix());
+        let message = record.wire();
+        if publish_message(client.as_ref(), &topic, &message)
+            .await
+            .is_ok()
+        {
+            observations.held_record_seq.store(0, Ordering::Release);
+            continue;
+        }
+
+        observations.held_record_seq.store(0, Ordering::Release);
+        publish_timeouts.fetch_add(1, Ordering::AcqRel);
+        let (discarded, loss) = discard_publication_backlog(Some(record), &observations);
+        lost_count.fetch_add(discarded, Ordering::AcqRel);
+        if let Some(loss) = loss {
+            merge_pending_gap(&mut pending_gap, loss);
+        }
+        defer_gap_retry_until_data = true;
+    }
+}
+
+async fn drain_marker_lane_when_stable(
+    observations: &ObservationOutbox,
+    pending: &mut Option<LossInterval>,
+    notifier: &tokio::sync::Notify,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    loop {
+        let generation = observations
+            .marker_update_generation
+            .load(Ordering::Acquire);
+        if !generation.is_multiple_of(2) {
+            if !wait_for_observation(notifier, shutdown).await {
+                return false;
+            }
+            continue;
+        }
+        drain_marker_lane(observations, pending);
+        if observations
+            .marker_update_generation
+            .load(Ordering::Acquire)
+            == generation
+        {
+            return true;
+        }
+    }
+}
+
+async fn drain_marker_lane_around_record_when_stable(
+    observations: &ObservationOutbox,
+    record_seq: u64,
+    before: &mut Option<LossInterval>,
+    after: &mut Option<LossInterval>,
+    notifier: &tokio::sync::Notify,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<bool, ()> {
+    loop {
+        let generation = observations
+            .marker_update_generation
+            .load(Ordering::Acquire);
+        if !generation.is_multiple_of(2) {
+            if !wait_for_observation(notifier, shutdown).await {
+                return Err(());
+            }
+            continue;
+        }
+        let crossed = drain_marker_lane_around_record(observations, record_seq, before, after);
+        if crossed {
+            return Ok(true);
+        }
+        if observations
+            .marker_update_generation
+            .load(Ordering::Acquire)
+            == generation
+        {
+            return Ok(false);
+        }
+    }
+}
+
+async fn wait_for_observation(
+    notifier: &tokio::sync::Notify,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        changed = shutdown.changed() => {
+            changed.is_ok() && !*shutdown.borrow()
+        }
+        _ = notifier.notified() => true,
+    }
+}
+
+fn drain_marker_lane(observations: &ObservationOutbox, pending: &mut Option<LossInterval>) {
+    while let Ok(loss) = observations.markers.try_recv() {
+        merge_pending_gap(pending, loss);
+    }
+}
+
+fn drain_marker_lane_around_record(
+    observations: &ObservationOutbox,
+    record_seq: u64,
+    before: &mut Option<LossInterval>,
+    after: &mut Option<LossInterval>,
+) -> bool {
+    let mut crossed = false;
+    while let Ok(loss) = observations.markers.try_recv() {
+        crossed |= partition_loss_around_record(loss, record_seq, before, after);
+    }
+    crossed
+}
+
+fn partition_loss_around_record(
+    loss: LossInterval,
+    record_seq: u64,
+    before: &mut Option<LossInterval>,
+    after: &mut Option<LossInterval>,
+) -> bool {
+    if loss.last_lost_seq < record_seq {
+        merge_pending_gap(before, loss);
+        false
+    } else if loss.first_lost_seq > record_seq {
+        merge_pending_gap(after, loss);
+        false
+    } else {
+        merge_pending_gap(before, loss);
+        true
     }
 }
 
@@ -1330,7 +1481,7 @@ async fn publish_pending_gap<C: WorkerClient>(
 
 fn discard_publication_backlog(
     failed: Option<ObservationRecord>,
-    observations: &crossbeam_channel::Receiver<ObservationItem>,
+    observations: &ObservationOutbox,
 ) -> (u64, Option<LossInterval>) {
     let mut discarded = 0_u64;
     let mut loss: Option<LossInterval> = None;
@@ -1341,18 +1492,19 @@ fn discard_publication_backlog(
             loss = Some(interval);
         }
     };
+    while let Ok(interval) = observations.markers.try_recv() {
+        absorb(interval);
+    }
     if let Some(failed) = failed {
         discarded = 1;
-        absorb(LossInterval::from_record(&failed, "publisher.loss"));
+        absorb(LossInterval::from_record(&failed, LossCause::PublisherLoss));
     }
-    while let Ok(item) = observations.try_recv() {
-        match item {
-            ObservationItem::Record(record) => {
-                discarded = discarded.saturating_add(1);
-                absorb(LossInterval::from_record(&record, "publisher.loss"));
-            }
-            ObservationItem::Loss(interval) => absorb(interval),
-        }
+    while let Ok(record) = observations.records.try_recv() {
+        discarded = discarded.saturating_add(1);
+        absorb(LossInterval::from_record(&record, LossCause::PublisherLoss));
+    }
+    while let Ok(interval) = observations.markers.try_recv() {
+        absorb(interval);
     }
     (discarded, loss)
 }
@@ -1390,7 +1542,7 @@ fn gap_message(topic_suffix: &str, gap: LossInterval, lost_count: u64) -> BusMes
     message.body = json!({
         "gap": true,
         "lost_count": lost_count,
-        "cause": gap.cause,
+        "cause": gap.cause.as_str(),
     })
     .to_string();
     message
@@ -1594,11 +1746,7 @@ mod tests {
         )
     }
 
-    fn test_observation_args() -> (
-        Arc<AtomicU64>,
-        crossbeam_channel::Receiver<ObservationItem>,
-        Arc<AtomicU64>,
-    ) {
+    fn test_observation_args() -> (Arc<AtomicU64>, ObservationOutbox, Arc<AtomicU64>) {
         let lost = Arc::new(AtomicU64::new(0));
         let (_producer, receiver) = port_observation::outbox(Arc::clone(&lost));
         (Arc::new(AtomicU64::new(0)), receiver, lost)
@@ -2138,10 +2286,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn marker_partition_defers_loss_newer_than_the_held_record() {
+        let record = |event_seq| ObservationRecord::FocusChanged {
+            keyboard: Some(event_seq),
+            previous: None,
+            exclusive_latch: None,
+            event_seq,
+        };
+        let mut before = None;
+        let mut after = None;
+        assert!(!partition_loss_around_record(
+            LossInterval::from_record(&record(1), LossCause::OutboxOverflow),
+            2,
+            &mut before,
+            &mut after,
+        ));
+        assert!(!partition_loss_around_record(
+            LossInterval::from_record(&record(3), LossCause::OutboxOverflow),
+            2,
+            &mut before,
+            &mut after,
+        ));
+        assert_eq!(
+            before.map(|gap| (gap.first_lost_seq, gap.last_lost_seq)),
+            Some((1, 1))
+        );
+        assert_eq!(
+            after.map(|gap| (gap.first_lost_seq, gap.last_lost_seq)),
+            Some((3, 3))
+        );
+    }
+
     #[tokio::test]
     async fn publisher_gaps_every_affected_topic_before_the_next_survivor() {
         let lost = Arc::new(AtomicU64::new(0));
-        let (producer, receiver) = port_observation::test_outbox(Arc::clone(&lost), 2);
+        let (mut producer, receiver) = port_observation::test_outbox(Arc::clone(&lost), 2);
         let notifier = producer.notifier();
         producer.offer(ObservationRecord::PropsChanged {
             path: "input.corners.enabled".into(),
@@ -2178,7 +2358,7 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .len()
-                    == 3
+                    >= 4
                 {
                     break;
                 }
@@ -2186,7 +2366,7 @@ mod tests {
             }
         })
         .await
-        .expect("two affected-topic gaps and the newest survivor publish");
+        .expect("two affected-topic gaps and both bounded-lane survivors publish");
         shutdown_tx.send_replace(true);
         task.await.expect("publisher exits");
 
@@ -2199,10 +2379,10 @@ mod tests {
             Some("comp-nested.props.changed")
         );
         assert_eq!(props_gap.get("command"), Some("props.changed"));
-        assert_eq!(props_gap.get("event_seq"), Some("3"));
+        assert_eq!(props_gap.get("event_seq"), Some("2"));
         assert_eq!(
             serde_json::from_str::<Value>(&props_gap.body).unwrap(),
-            json!({"gap": true, "lost_count": 3, "cause": "outbox.overflow"})
+            json!({"gap": true, "lost_count": 2, "cause": "outbox.overflow"})
         );
 
         let focus_gap = cosmix_bus::bus::parse(&published[1].1).expect("focus gap parses");
@@ -2211,21 +2391,61 @@ mod tests {
             Some("comp-nested.focus.changed")
         );
         assert_eq!(focus_gap.get("command"), Some("focus.changed"));
-        assert_eq!(focus_gap.get("event_seq"), Some("3"));
+        assert_eq!(focus_gap.get("event_seq"), Some("2"));
         assert_eq!(
             serde_json::from_str::<Value>(&focus_gap.body).unwrap(),
-            json!({"gap": true, "lost_count": 3, "cause": "outbox.overflow"})
+            json!({"gap": true, "lost_count": 2, "cause": "outbox.overflow"})
         );
-        let survivor = cosmix_bus::bus::parse(&published[2].1).expect("survivor parses");
-        assert_eq!(survivor.get("command"), Some("focus.changed"));
-        assert_eq!(survivor.get("event_seq"), Some("4"));
+        let first_survivor = cosmix_bus::bus::parse(&published[2].1).expect("survivor parses");
+        assert_eq!(first_survivor.get("command"), Some("focus.changed"));
+        assert_eq!(first_survivor.get("event_seq"), Some("3"));
+        let second_survivor =
+            cosmix_bus::bus::parse(&published[3].1).expect("second survivor parses");
+        assert_eq!(second_survivor.get("event_seq"), Some("4"));
         assert_eq!(publish_timeouts.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn disconnected_record_lane_exits_after_a_failed_gap_without_spinning() {
+        let lost = Arc::new(AtomicU64::new(0));
+        let (mut producer, receiver) = port_observation::test_outbox(Arc::clone(&lost), 1);
+        let notifier = producer.notifier();
+        for event_seq in 1..=2 {
+            producer.offer(ObservationRecord::FocusChanged {
+                keyboard: Some(event_seq),
+                previous: None,
+                exclusive_latch: None,
+                event_seq,
+            });
+        }
+        drop(producer);
+
+        let (client, _commands, _states) = FakeClient::new(ConnState::Connected, false);
+        client.reject_publish_attempt.store(1, Ordering::Release);
+        let publish_timeouts = Arc::new(AtomicU64::new(0));
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            publisher_loop(
+                Arc::new(client),
+                Arc::from("comp-nested"),
+                receiver,
+                notifier,
+                Arc::clone(&lost),
+                Arc::clone(&publish_timeouts),
+                shutdown,
+            ),
+        )
+        .await
+        .expect("disconnected publisher exits after the failed final gap");
+        assert_eq!(lost.load(Ordering::Acquire), 2);
+        assert_eq!(publish_timeouts.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
     async fn successful_gap_topics_are_not_republished_after_a_later_gap_fails() {
         let lost = Arc::new(AtomicU64::new(0));
-        let (producer, receiver) = port_observation::test_outbox(Arc::clone(&lost), 2);
+        let (mut producer, receiver) = port_observation::test_outbox(Arc::clone(&lost), 2);
         let notifier = producer.notifier();
         producer.offer(ObservationRecord::PropsChanged {
             path: "input.corners.enabled".into(),
@@ -2299,7 +2519,7 @@ mod tests {
             "the successful props gap is acknowledged before the focus gap fails"
         );
         let props_gap = cosmix_bus::bus::parse(&published[0].1).expect("props gap parses");
-        assert_eq!(props_gap.get("event_seq"), Some("3"));
+        assert_eq!(props_gap.get("event_seq"), Some("2"));
         let focus_gap = cosmix_bus::bus::parse(&published[1].1).expect("focus gap parses");
         assert_eq!(focus_gap.get("event_seq"), Some("4"));
         assert_eq!(
@@ -2314,7 +2534,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idle_publisher_wakes_from_offer_without_a_timer_tick() {
         let lost = Arc::new(AtomicU64::new(0));
-        let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
+        let (mut producer, receiver) = port_observation::outbox(Arc::clone(&lost));
         let notifier = producer.notifier();
         let (client, _commands, _states) = FakeClient::new(ConnState::Connected, false);
         let publications = Arc::clone(&client.publications);
@@ -2336,6 +2556,15 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_empty()
+        );
+        tokio::time::advance(Duration::from_secs(3_600)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            publications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "idle publisher has no timer or polling wake"
         );
 
         producer.offer(ObservationRecord::FocusChanged {
@@ -2362,7 +2591,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_publication_gaps_every_topic_in_the_discarded_backlog() {
         let lost = Arc::new(AtomicU64::new(0));
-        let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
+        let (mut producer, receiver) = port_observation::outbox(Arc::clone(&lost));
         let notifier = producer.notifier();
         producer.offer(ObservationRecord::PropsChanged {
             path: "input.corners.enabled".into(),
@@ -2452,7 +2681,7 @@ mod tests {
     #[tokio::test]
     async fn overflow_after_failed_backlog_drain_still_gaps_its_topics() {
         let lost = Arc::new(AtomicU64::new(0));
-        let (producer, receiver) = port_observation::test_outbox(Arc::clone(&lost), 2);
+        let (mut producer, receiver) = port_observation::test_outbox(Arc::clone(&lost), 2);
         let notifier = producer.notifier();
         producer.offer(ObservationRecord::FocusChanged {
             keyboard: Some(1),
@@ -2516,13 +2745,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .len()
-                != 3
+                < 4
             {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("the later marker forces both gaps before its survivor");
+        .expect("the later marker forces both gaps before its survivors");
         shutdown_tx.send_replace(true);
         task.await.expect("publisher exits");
 
@@ -2531,23 +2760,26 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let props_gap = cosmix_bus::bus::parse(&published[0].1).expect("props gap parses");
         assert_eq!(props_gap.get("command"), Some("props.changed"));
-        assert_eq!(props_gap.get("event_seq"), Some("4"));
+        assert_eq!(props_gap.get("event_seq"), Some("3"));
         let focus_gap = cosmix_bus::bus::parse(&published[1].1).expect("focus gap parses");
         assert_eq!(focus_gap.get("command"), Some("focus.changed"));
-        assert_eq!(focus_gap.get("event_seq"), Some("4"));
+        assert_eq!(focus_gap.get("event_seq"), Some("3"));
         assert_eq!(
             serde_json::from_str::<Value>(&focus_gap.body).unwrap(),
-            json!({"gap": true, "lost_count": 4, "cause": "publisher.loss"})
+            json!({"gap": true, "lost_count": 3, "cause": "publisher.loss"})
         );
-        let survivor = cosmix_bus::bus::parse(&published[2].1).expect("survivor parses");
-        assert_eq!(survivor.get("event_seq"), Some("5"));
+        let first_survivor = cosmix_bus::bus::parse(&published[2].1).expect("survivor parses");
+        assert_eq!(first_survivor.get("event_seq"), Some("4"));
+        let second_survivor =
+            cosmix_bus::bus::parse(&published[3].1).expect("second survivor parses");
+        assert_eq!(second_survivor.get("event_seq"), Some("5"));
         assert_eq!(publish_timeouts.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
     async fn rejected_gap_discards_its_survivor_and_recovers_as_publisher_loss() {
         let lost = Arc::new(AtomicU64::new(0));
-        let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
+        let (mut producer, receiver) = port_observation::outbox(Arc::clone(&lost));
         let notifier = producer.notifier();
         for sequence in 1..=3 {
             producer.offer(ObservationRecord::FocusChanged {
@@ -2615,7 +2847,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stalled_publication_times_out_without_blocking_shutdown() {
         let lost = Arc::new(AtomicU64::new(0));
-        let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
+        let (mut producer, receiver) = port_observation::outbox(Arc::clone(&lost));
         let notifier = producer.notifier();
         producer.offer(ObservationRecord::FocusChanged {
             keyboard: None,
@@ -2655,7 +2887,7 @@ mod tests {
         let reply_timeouts = Arc::new(AtomicU64::new(0));
         let publish_timeouts = Arc::new(AtomicU64::new(0));
         let lost = Arc::new(AtomicU64::new(0));
-        let (producer, observations) = port_observation::outbox(Arc::clone(&lost));
+        let (mut producer, observations) = port_observation::outbox(Arc::clone(&lost));
         let notifier = producer.notifier();
         producer.offer(ObservationRecord::FocusChanged {
             keyboard: Some(1),

@@ -1295,7 +1295,7 @@ impl KeybindingHarness {
     fn new_with_port() -> (
         Self,
         crate::port::PortIngress,
-        crossbeam_channel::Receiver<port_observation::ObservationItem>,
+        port_observation::ObservationOutbox,
     ) {
         Self::new_with_port_backend(BackendKind::Winit, "nested")
     }
@@ -1306,7 +1306,7 @@ impl KeybindingHarness {
     ) -> (
         Self,
         crate::port::PortIngress,
-        crossbeam_channel::Receiver<port_observation::ObservationItem>,
+        port_observation::ObservationOutbox,
     ) {
         let context = Arc::new(snapshot_context("nested"));
         let (port, ingress, observations) =
@@ -1340,7 +1340,7 @@ impl KeybindingHarness {
     ) -> (
         Self,
         crate::port::PortIngress,
-        crossbeam_channel::Receiver<port_observation::ObservationItem>,
+        port_observation::ObservationOutbox,
     ) {
         let context = Arc::new(snapshot_context(backend_name));
         let (port, ingress, observations) = crate::port::test_wiring(context);
@@ -27101,12 +27101,9 @@ fn port_boundary_uses_production_admission_completion_and_sees_same_dispatch_com
 
 #[cfg(feature = "bus")]
 fn drain_observations(
-    receiver: &crossbeam_channel::Receiver<port_observation::ObservationItem>,
+    receiver: &port_observation::ObservationOutbox,
 ) -> Vec<port_observation::ObservationRecord> {
-    receiver
-        .try_iter()
-        .filter_map(port_observation::ObservationItem::into_record)
-        .collect()
+    receiver.records.try_iter().collect()
 }
 
 #[cfg(feature = "bus")]
