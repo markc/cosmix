@@ -335,7 +335,12 @@ pub struct PanelSurface {
     pub presented: bool,
     pub frame_pending: bool,
     pub frame_requested_at: Option<Duration>,
-    /// A u64 cannot realistically wrap; on exhaustion this saturates at u64::MAX instead.
+    /// Callback generation. Each request and each invalidation advances it,
+    /// so a late callback matches only within the same generation. The
+    /// guarantee is bounded, not unconditional: after 2^64 increments the
+    /// counter saturates at `u64::MAX` and tokens would repeat — at one
+    /// million requests per second that is ~580,000 years, so no exhaustion
+    /// path exists; saturation merely keeps the arithmetic defined.
     frame_generation: u64,
     pub waiting_configure_since: Option<Duration>,
     wayland: Option<PanelWaylandObjects>,

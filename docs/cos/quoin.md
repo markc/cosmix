@@ -64,7 +64,8 @@ is outstanding. `WakeAt` owns one replaceable absolute calloop timer.
 outstanding callback per mapped animating panel. The visible bottom clock's
 one-second deadline is content work and disappears when that panel is
 unmapped. Callbacks are generation-tagged, so late or expired callbacks are
-ignored.
+ignored (the tag is a saturating 64-bit counter: reuse would need 2^64
+requests, which no process lifetime reaches).
 
 Two bounded one-shot liveness backstops share that single timer. While any
 frame callback is outstanding, its deadline is derived from the oldest
