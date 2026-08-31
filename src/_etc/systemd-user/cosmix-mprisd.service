@@ -1,0 +1,25 @@
+# ~/.config/systemd/user/cosmix-mprisd.service
+#
+# MPRIS and the Cosmix Bus connection both belong to the logged-in session.
+# The SPEC-10 cosmix-mprisd row reserves daemon and namespace identity; this
+# user unit deliberately runs as the session user.
+#
+# Install:  cp this -> ~/.config/systemd/user/cosmix-mprisd.service
+#           systemctl --user daemon-reload
+#           systemctl --user enable --now cosmix-mprisd
+
+[Unit]
+Description=Cosmix MPRIS media-player citizen
+Documentation=https://cosmix.dev/cos/mprisd
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/opt/cosmix/bin/cosmix-mprisd serve
+Restart=on-failure
+RestartSec=60s
+TimeoutStopSec=75s
+
+[Install]
+WantedBy=graphical-session.target

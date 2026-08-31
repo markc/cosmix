@@ -99,21 +99,28 @@ the Cosmix Bus client belong to the graphical session. The SPEC-10
 `cosmix-mprisd` UID/GID row reserves daemon and namespace identity; it is not
 the runtime user of this session service.
 
-On graceful shutdown the broker loop first stops admitting commands. The
-control worker continues jobs whose absolute deadline has not passed and
-returns `org.cosmix.Mpris.Expired` for queued jobs whose deadline has passed.
+On graceful shutdown the broker loop stops admitting commands but continues
+polling the Bus command receiver while admitted replies drain. Every command
+received during that drain is dropped without a reply and counted in
+`controls.dropped`. The control worker continues jobs whose absolute deadline
+has not passed and returns `org.cosmix.Mpris.Expired` for queued jobs whose
+deadline has passed.
 All command replies, including validation, no-player, busy and admitted-job
 replies, run in one supervised set capped at 64 tasks; one slot is reserved so
 capacity overflow itself can receive a counted `org.cosmix.Mpris.Busy` reply.
-While serving, Bus command intake is drained unconditionally. Overflow beyond
-64 in-flight replies is dropped immediately without a task or reply and counted
-in `controls.dropped`. The Bus client's command channel is unbounded, so this
-daemon intake policy enforces the memory bound. Drop logs appear once when an
-episode starts, at most once per 60 seconds while it continues, and once when
-admission resumes.
+While serving and during the shutdown reply drain, Bus command intake is
+drained unconditionally. While serving, overflow beyond 64 in-flight replies is
+dropped immediately without a task or reply and counted in `controls.dropped`.
+The Bus client's command channel is unbounded, so this daemon intake policy
+enforces the memory bound. Drop logs appear once when an episode starts, at most
+once per 60 seconds while it continues, and once when admission resumes.
 The responder drains for at most 60 seconds inside the unit's 75-second stop
-budget. Only after that drain does mprisd close the broker client and await the
-control worker; a task still present after the bounded drain is aborted.
+budget. Each final non-blocking intake sweep stops at the same deadline or
+after 4096 commands, whichever comes first, then drops the receiver; because
+the unbounded channel's remaining length can change concurrently, the daemon
+logs that the count freed with the receiver is unknown. Only after that drain
+does mprisd close the broker client and await the control worker; a task still
+present after the bounded drain is aborted.
 
 ## Bus verbs
 
@@ -195,7 +202,7 @@ player does not provide them.
 | `players.by_id.<key>.can_*` | `CanPlay`, `CanPause`, `CanGoNext`, `CanGoPrevious`, `CanSeek`, `CanControl` |
 | `active.name` | Selected well-known name, or `null` |
 | `active.key` | Selected encoded key, or `null` |
-| `controls.dropped` | Cumulative commands dropped without reply after all 64 response slots were occupied |
+| `controls.dropped` | Cumulative commands individually observed and dropped without reply because response capacity was exhausted or shutdown draining was in progress |
 | `lifecycle.props_level` | `L2` |
 | `lifecycle.event_seq` | Daemon-session monotonic event sequence |
 | `lifecycle.publisher_loss` | Cumulative publications lost during this daemon session |

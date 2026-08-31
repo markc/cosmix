@@ -1763,6 +1763,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmix-mprisd"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cosmix-lib-buildinfo",
+ "cosmix-lib-bus",
+ "cosmix-lib-client",
+ "cosmix-lib-config",
+ "cosmix-lib-props-core",
+ "futures-util",
+ "serde_json",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "cosmix-musicd"
 version = "0.25.0"
 dependencies = [

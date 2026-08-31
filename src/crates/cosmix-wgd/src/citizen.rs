@@ -13,13 +13,13 @@
 //! wgd is UID/GID **515** — the next free daemon-identity slot after the
 //! obs-tier band (500–514 used; the append-only frontier advances to 515).
 
-/// SPEC-10 v1.4.5 registered daemon-identity facts for `cosmix-wgd`. These MUST
+/// SPEC-10 v1.4.6 registered daemon-identity facts for `cosmix-wgd`. These MUST
 /// track SPEC-10 Appendix A / §2.2 / §9.3. Drift is caught two ways: the
 /// registry-generic `spec10_postcheck.mix` lint out of process, and the unit
 /// test below cross-checking these constants against the checked-in
 /// `src/_etc/sysusers/cosmix.conf` projection (a renumber/rename trips
 /// `cargo test`, not only the Mix gate).
-const SPEC10_VERSION: &str = "1.4.5";
+const SPEC10_VERSION: &str = "1.4.6";
 const DAEMON_NAME: &str = "cosmix-wgd";
 const DAEMON_UID: u32 = 515;
 /// SPEC-10 §2.2: every daemon-identity row has GID == UID.
@@ -112,7 +112,7 @@ mod tests {
         let conf = std::fs::read_to_string(manifest_dir().join("../../_etc/sysusers/cosmix.conf"))
             .expect("checked-in sysusers fragment must be readable from the workspace");
 
-        // Header line pins the registry version: `... cosmix-daemon-identity v1.4.5.`
+        // Header line pins the registry version: `... cosmix-daemon-identity v1.4.6.`
         let version = conf
             .lines()
             .find_map(|l| l.split("cosmix-daemon-identity v").nth(1))

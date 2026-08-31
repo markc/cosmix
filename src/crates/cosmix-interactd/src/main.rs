@@ -2222,7 +2222,7 @@ mod tests {
             .find_map(|line| line.split("cosmix-daemon-identity v").nth(1))
             .and_then(|tail| tail.strip_suffix('.'))
             .expect("sysusers header must declare the SPEC-10 version");
-        assert_eq!(version, "1.4.5");
+        assert_eq!(version, "1.4.6");
 
         let row = conf
             .lines()

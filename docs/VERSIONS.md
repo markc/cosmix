@@ -79,6 +79,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-mesh-sign` | 0.7.3 |
 | `cosmix-midicomp` | 0.3.0 |
 | `cosmix-mixer-schema` | 0.5.0 |
+| `cosmix-mprisd` | 0.1.1 |
 | `cosmix-musicd` | 0.25.0 |
 | `cosmix-noded` | 0.13.0 |
 | `cosmix-nspawnd` | 0.2.0 |
@@ -89,4 +90,4 @@ CoS — substrate libraries and daemon family
 
 ---
 
-48 crates in one workspace, `$COSMIX/src` (groups are the former repositories).
+49 crates in one workspace, `$COSMIX/src` (groups are the former repositories).
