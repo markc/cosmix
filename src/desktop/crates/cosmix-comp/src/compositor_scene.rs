@@ -641,6 +641,11 @@ fn apply_protocol_events(world: &mut World, events: Vec<ProtocolEvent>) {
             ProtocolEvent::DmabufCacheInvalidated => world
                 .resource::<ImportedDmabufImages>()
                 .invalidate_all_buffers(),
+            ProtocolEvent::CaptureRequested(request) => {
+                world
+                    .resource_mut::<crate::capture::CaptureQueue>()
+                    .push(request);
+            }
             ProtocolEvent::RuntimeFailed(error) => {
                 fail_compositor_scene(world, format!("Wayland protocol thread failed: {error}"));
             }

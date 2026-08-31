@@ -86,6 +86,22 @@ pub(crate) struct WinitBackendData {
     pub(crate) output_scale: f64,
 }
 
+/// Immutable output geometry captured when a screencopy frame object is made.
+///
+/// A later mode/topology change invalidates the frame instead of silently
+/// changing the dimensions promised on the wire. `readback_supported` keeps
+/// the S-1a KMS seam fail-closed until the S-1b scanout readback lands.
+#[derive(Clone, Debug)]
+pub(crate) struct CaptureSourceSnapshot {
+    pub(crate) output_name: String,
+    pub(crate) logical_rect: (i32, i32, u32, u32),
+    pub(crate) physical_size: (u32, u32),
+    pub(crate) scale: f64,
+    pub(crate) transform: smithay::utils::Transform,
+    pub(crate) generation: u64,
+    pub(crate) readback_supported: bool,
+}
+
 pub(crate) struct KmsBackendData {
     topology: KmsTopology,
     /// Session-lifetime client outputs. Deliberately separate from
@@ -198,6 +214,76 @@ impl BackendData {
     /// globals retained by existing client resources after hot-unplug.
     pub(crate) fn output_from_resource(&self, resource: &WlOutput) -> Option<Output> {
         Output::from_resource(resource).filter(|output| self.output_is_registered(output))
+    }
+
+    /// Resolve the exact client-selected output without a default-output
+    /// fallback. S-1a reads nested output pixels; registered KMS outputs still
+    /// advertise the protocol and snapshot truthful geometry, but fail a copy
+    /// through `readback_supported` until S-1b supplies their final-output seam.
+    pub(crate) fn capture_source_for_output(
+        &self,
+        resource: &WlOutput,
+    ) -> Option<CaptureSourceSnapshot> {
+        let output = self.output_from_resource(resource)?;
+        match self {
+            Self::Winit(data) if data.output == output => {
+                let physical_width = (f64::from(data.output_size.0) * data.output_scale).round();
+                let physical_height = (f64::from(data.output_size.1) * data.output_scale).round();
+                Some(CaptureSourceSnapshot {
+                    output_name: output.name(),
+                    logical_rect: (0, 0, data.output_size.0, data.output_size.1),
+                    physical_size: (
+                        u32::try_from(physical_width as u64).ok()?,
+                        u32::try_from(physical_height as u64).ok()?,
+                    ),
+                    scale: data.output_scale,
+                    transform: smithay::utils::Transform::Normal,
+                    generation: 1,
+                    readback_supported: true,
+                })
+            }
+            Self::Kms(data) => {
+                #[cfg(any(all(feature = "kms-live", not(test)), test))]
+                {
+                    let mode = output.current_mode()?;
+                    let location = output.current_location();
+                    let scale = output.current_scale().fractional_scale();
+                    let logical_width = (f64::from(mode.size.w) / scale).round();
+                    let logical_height = (f64::from(mode.size.h) / scale).round();
+                    let key = &data
+                        .client_outputs
+                        .outputs
+                        .values()
+                        .find(|registered| registered.output == output)?
+                        .selected
+                        .key;
+                    let generation = *data.topology.presentation_generations().get(key)?;
+                    Some(CaptureSourceSnapshot {
+                        output_name: output.name(),
+                        logical_rect: (
+                            location.x,
+                            location.y,
+                            u32::try_from(logical_width as i64).ok()?,
+                            u32::try_from(logical_height as i64).ok()?,
+                        ),
+                        physical_size: (
+                            u32::try_from(mode.size.w).ok()?,
+                            u32::try_from(mode.size.h).ok()?,
+                        ),
+                        scale,
+                        transform: output.current_transform(),
+                        generation,
+                        readback_supported: false,
+                    })
+                }
+                #[cfg(not(any(all(feature = "kms-live", not(test)), test)))]
+                {
+                    let _ = (data, output);
+                    None
+                }
+            }
+            Self::Winit(_) => None,
+        }
     }
 
     pub(crate) fn output_is_registered(&self, output: &Output) -> bool {

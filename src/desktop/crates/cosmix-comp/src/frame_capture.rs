@@ -15,13 +15,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bevy::{
-    camera::RenderTarget,
-    prelude::*,
-    render::view::screenshot::{Screenshot, ScreenshotCaptured},
-    tasks::AsyncComputeTaskPool,
-    window::PrimaryWindow,
-};
+use bevy::{camera::RenderTarget, prelude::*, tasks::AsyncComputeTaskPool, window::PrimaryWindow};
+
+use crate::capture::{PngCaptureRequest, PngCaptureService, PngCaptureTarget};
 
 const CAPTURE_DIR_ENV: &str = "COSMIX_CAPTURE_DIR";
 const CAPTURE_EVERY_ENV: &str = "COSMIX_CAPTURE_EVERY";
@@ -188,12 +184,6 @@ impl FrameCaptureTarget {
     }
 }
 
-#[derive(Component)]
-struct PendingFrameCapture {
-    final_path: PathBuf,
-    temporary_path: PathBuf,
-}
-
 #[derive(Resource)]
 struct FrameCaptureRuntime {
     directory: PathBuf,
@@ -278,11 +268,10 @@ pub(crate) fn install_from_environment(app: &mut App) -> Result<(), FrameCapture
 }
 
 fn request_frame_capture(
-    mut commands: Commands,
     mut runtime: ResMut<FrameCaptureRuntime>,
+    service: Res<PngCaptureService>,
     primary_window: Query<(), With<PrimaryWindow>>,
     kms_targets: Query<(&RenderTarget, &FrameCaptureTarget)>,
-    captures: Query<(), With<Screenshot>>,
 ) {
     let kms_target_available = kms_targets
         .iter()
@@ -296,18 +285,20 @@ fn request_frame_capture(
         Instant::now(),
         signal_requested,
         target_available,
-        !captures.is_empty(),
+        service.busy(),
     ) {
         return;
     }
 
+    let mut requests = Vec::new();
     if !primary_window.is_empty() {
-        spawn_capture(
-            &mut commands,
-            &mut runtime,
-            "nested",
-            Screenshot::primary_window(),
-        );
+        let (final_path, temporary_path) = runtime.allocate_paths("nested");
+        requests.push(PngCaptureRequest {
+            target: PngCaptureTarget::Nested,
+            final_path,
+            temporary_path,
+        });
+        let _ = service.submit_batch(requests);
         return;
     }
     for (target, capture_target) in &kms_targets {
@@ -315,46 +306,36 @@ fn request_frame_capture(
             continue;
         };
         let name = capture_target.name().to_owned();
-        spawn_capture(
-            &mut commands,
-            &mut runtime,
-            &name,
-            Screenshot::texture_view(*handle),
-        );
+        let (final_path, temporary_path) = runtime.allocate_paths(&name);
+        requests.push(PngCaptureRequest {
+            target: PngCaptureTarget::TextureView(*handle),
+            final_path,
+            temporary_path,
+        });
     }
+    let _ = service.submit_batch(requests);
 }
 
-fn spawn_capture(
-    commands: &mut Commands,
-    runtime: &mut FrameCaptureRuntime,
-    target_name: &str,
-    screenshot: Screenshot,
+pub(crate) fn save_capture_image(
+    image: bevy::image::Image,
+    temporary_path: PathBuf,
+    final_path: PathBuf,
+    deadline: Instant,
+    completed: impl FnOnce() + Send + 'static,
 ) {
-    let (final_path, temporary_path) = runtime.allocate_paths(target_name);
-    commands
-        .spawn((
-            screenshot,
-            PendingFrameCapture {
-                final_path,
-                temporary_path,
-            },
-        ))
-        .observe(save_captured_frame);
-}
-
-fn save_captured_frame(captured: On<ScreenshotCaptured>, pending: Query<&PendingFrameCapture>) {
-    let Ok(paths) = pending.get(captured.entity) else {
-        error!(
-            entity = %captured.entity,
-            "captured frame has no destination paths"
-        );
-        return;
-    };
-    let image = captured.image.clone();
-    let final_path = paths.final_path.clone();
-    let temporary_path = paths.temporary_path.clone();
     AsyncComputeTaskPool::get()
         .spawn(async move {
+            let _completion = CaptureWriteCompletion(Some(completed));
+            if deadline <= Instant::now() {
+                error!(
+                    path = %final_path.display(),
+                    "could not save composed-frame capture: request deadline elapsed before PNG encode/write began"
+                );
+                return;
+            }
+            // Encoding and filesystem publication are synchronous inside this
+            // worker. A genuinely blocked filesystem write cannot be cancelled
+            // safely and is outside the S-1a deadline guarantee.
             match write_png_atomic(image, &temporary_path, &final_path) {
                 Ok(()) => info!(path = %final_path.display(), "composed frame captured"),
                 Err(error) => error!(
@@ -365,6 +346,16 @@ fn save_captured_frame(captured: On<ScreenshotCaptured>, pending: Query<&Pending
             }
         })
         .detach();
+}
+
+struct CaptureWriteCompletion<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for CaptureWriteCompletion<F> {
+    fn drop(&mut self) {
+        if let Some(completed) = self.0.take() {
+            completed();
+        }
+    }
 }
 
 fn write_png_atomic(

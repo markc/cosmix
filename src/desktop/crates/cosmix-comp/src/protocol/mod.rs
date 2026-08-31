@@ -56,6 +56,10 @@ use crate::{
         kms::{KmsRenderCommand, KmsRenderReply},
     },
     bindings::{BindingAction, BindingProfile, BindingState, KeyDisposition},
+    capture::{
+        CaptureCancellation, CaptureFormat, CaptureId, CapturePixels, CapturePresented,
+        CaptureRegion, CaptureRequest, CaptureReservationLease,
+    },
     decoration::DecorationStartup,
 };
 
@@ -79,6 +83,10 @@ use cosmix_wgpu_dmabuf::{
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::server::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
     zwlr_layer_surface_v1::{self, ZwlrLayerSurfaceV1},
+};
+use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::{
+    zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
+    zwlr_screencopy_manager_v1::{self, ZwlrScreencopyManagerV1},
 };
 use smithay::{
     backend::allocator::{Buffer as _, Format, dmabuf::Dmabuf},
@@ -104,9 +112,10 @@ use smithay::{
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::{
         calloop::{
-            EventLoop, Interest, Mode as PollMode, PostAction,
+            EventLoop, Interest, LoopHandle, Mode as PollMode, PostAction,
             channel::{self, Event as ChannelEvent, Sender as CommandSender},
             generic::Generic,
+            timer::{TimeoutAction, Timer},
         },
         wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::{
             Error as SessionLockError, ExtSessionLockV1,
@@ -119,7 +128,8 @@ use smithay::{
             shell::server::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base},
         },
         wayland_server::{
-            Client, DataInit, Dispatch, Display, DisplayHandle, Resource as _, WEnum,
+            Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New, Resource as _,
+            WEnum,
             backend::{ClientData, ClientId, DisconnectReason, ObjectId, protocol::ProtocolError},
             protocol::{
                 wl_buffer, wl_callback, wl_compositor, wl_output as wl_output_protocol, wl_region,
@@ -174,7 +184,7 @@ use smithay::{
                 XdgDecorationHandler, XdgDecorationManagerGlobalData, XdgDecorationState,
             },
         },
-        shm::{ShmHandler, ShmState, with_buffer_contents},
+        shm::{ShmHandler, ShmState, with_buffer_contents, with_buffer_contents_mut},
         socket::ListeningSocketSource,
         viewporter::{ViewportCachedState, ViewporterState, ensure_viewport_valid},
     },
@@ -239,6 +249,20 @@ const DMABUF_VALIDATION_QUEUE_CAPACITY: usize = 64;
 const ECS_ACTION_QUEUE_CAPACITY: usize = 8;
 const DIRTY_SURFACE_RECOVERY_BATCH: usize = 16;
 const MAX_COMMITTED_INPUT_REGION_RECTS: usize = 256;
+pub(crate) const MAX_CAPTURE_FRAMES: usize = 32;
+pub(crate) const MAX_CLIENT_CAPTURE_REQUESTS: usize = 4;
+pub(crate) const MAX_IN_FLIGHT_CAPTURES: usize = 8;
+pub(crate) const MAX_CLIENT_CAPTURE_MANAGERS: usize = 8;
+pub(crate) const MAX_GLOBAL_CAPTURE_MANAGERS: usize = 64;
+pub(crate) const SCREENCOPY_MANAGER_ERROR_IMPLEMENTATION_LIMIT: u32 = 0;
+pub(crate) const MAX_CLIENT_CAPTURE_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_GLOBAL_CAPTURE_BYTES: usize = 256 * 1024 * 1024;
+const CAPTURE_SHM_BYTES_PER_TURN: usize = 256 * 1024;
+/// Absolute lifetime of one admitted screencopy request. This is a request
+/// deadline, not a periodic maintenance timer: a stuck Bevy/GPU completion
+/// fails the one client operation. Once Bevy has extracted a screenshot, its
+/// reservation remains charged until Bevy reports completion.
+pub(crate) const CAPTURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SurfaceId(pub(crate) u64);
@@ -591,6 +615,9 @@ pub(crate) enum ProtocolEvent {
     /// A bounded epoch tombstone subsuming every individual DMA-BUF cache
     /// invalidation queued before it.
     DmabufCacheInvalidated,
+    /// Ordered, lossless capture work. `PendingProtocolEvents::take` emits
+    /// these after every scene/topology mutation retained in the same batch.
+    CaptureRequested(CaptureRequest),
     RuntimeFailed(String),
 }
 
@@ -794,6 +821,13 @@ enum ProtocolCommand {
     SecurityPresented {
         presentation_epoch: u64,
         evidence: SecurityPresentationEvidence,
+    },
+    CapturePixels(CapturePixels),
+    CapturePresented(CapturePresented),
+    CaptureFailed {
+        id: CaptureId,
+        generation: u64,
+        security_epoch: u64,
     },
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
     KmsTopologyLifecycle {
@@ -1108,6 +1142,12 @@ impl ClientSceneFeed {
         })
     }
 
+    pub(crate) fn capture_completion_reporter(&self) -> CaptureCompletionReporter {
+        CaptureCompletionReporter {
+            commands: self.commands.clone(),
+        }
+    }
+
     pub(crate) fn cursor_position(&self) -> CursorPositionSnapshot {
         *self
             .cursor_position
@@ -1156,6 +1196,42 @@ impl ClientSceneFeed {
             }
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn capture_outcomes_for_test(&self) -> Vec<CaptureTestOutcome> {
+        let commands = self
+            ._test_command_source
+            .as_ref()
+            .expect("test scene feed retains its command source")
+            .lock()
+            .expect("test scene command source mutex poisoned");
+        let mut outcomes = Vec::new();
+        loop {
+            match commands.try_recv() {
+                Ok(ProtocolCommand::CapturePixels(pixels)) => {
+                    outcomes.push(CaptureTestOutcome::Pixels(pixels.id));
+                }
+                Ok(ProtocolCommand::CapturePresented(presented)) => {
+                    outcomes.push(CaptureTestOutcome::Presented(presented.id));
+                }
+                Ok(ProtocolCommand::CaptureFailed { id, .. }) => {
+                    outcomes.push(CaptureTestOutcome::Failed(id));
+                }
+                Ok(_) => panic!("scene feed emitted an unrelated command"),
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
+                    return outcomes;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum CaptureTestOutcome {
+    Pixels(CaptureId),
+    Presented(CaptureId),
+    Failed(CaptureId),
 }
 
 /// Coordinator-side capability for advancing client frame callbacks.
@@ -1209,6 +1285,49 @@ impl SecurityPresentationReporter {
                 evidence: SecurityPresentationEvidence::Kms { generation, output },
             })
             .map_err(|_| "Wayland protocol thread disconnected".to_string())
+    }
+}
+
+/// Narrow cloneable return path for capture map/presentation completion.
+/// Wayland resources remain owned by the protocol thread.
+#[derive(Clone, bevy::prelude::Resource)]
+pub(crate) struct CaptureCompletionReporter {
+    commands: CommandSender<ProtocolCommand>,
+}
+
+impl CaptureCompletionReporter {
+    pub(crate) fn pixels(&self, pixels: CapturePixels) {
+        if self
+            .commands
+            .send(ProtocolCommand::CapturePixels(pixels))
+            .is_err()
+        {
+            tracing::debug!("protocol thread gone before capture pixels");
+        }
+    }
+
+    pub(crate) fn presented(&self, presented: CapturePresented) {
+        if self
+            .commands
+            .send(ProtocolCommand::CapturePresented(presented))
+            .is_err()
+        {
+            tracing::debug!("protocol thread gone before capture presentation");
+        }
+    }
+
+    pub(crate) fn failed(&self, id: CaptureId, generation: u64, security_epoch: u64) {
+        if self
+            .commands
+            .send(ProtocolCommand::CaptureFailed {
+                id,
+                generation,
+                security_epoch,
+            })
+            .is_err()
+        {
+            tracing::debug!("protocol thread gone before capture failure");
+        }
     }
 }
 
@@ -1777,6 +1896,12 @@ impl WaylandRuntime {
 
     pub(crate) fn security_presentation_reporter(&self) -> SecurityPresentationReporter {
         SecurityPresentationReporter {
+            commands: self.commands.clone(),
+        }
+    }
+
+    pub(crate) fn capture_completion_reporter(&self) -> CaptureCompletionReporter {
+        CaptureCompletionReporter {
             commands: self.commands.clone(),
         }
     }
@@ -2407,6 +2532,7 @@ impl ProtocolServer {
         let layer_shell_state = WlrLayerShellState::new::<WaylandState>(&display_handle);
         let session_lock_state =
             SessionLockManagerState::new::<WaylandState, _>(&display_handle, |_| true);
+        display_handle.create_global::<WaylandState, ZwlrScreencopyManagerV1, _>(3, ());
         let xdg_decoration_state = XdgDecorationState::new::<WaylandState>(&display_handle);
         let fractional_scale_state =
             FractionalScaleManagerState::new::<WaylandState>(&display_handle);
@@ -2485,6 +2611,7 @@ impl ProtocolServer {
             })
             .map_err(|error| format!("failed to spawn GPU retirement worker: {error}"))?;
         let (client_disconnect_sender, client_disconnect_source) = channel::channel();
+        let (capture_release_sender, capture_release_source) = channel::channel();
         // Spawned here rather than beside the other workers above because the
         // worker needs a handle onto this event loop: its outcomes are queued
         // from off-thread and only a dispatch cycle flushes them.
@@ -2528,6 +2655,14 @@ impl ProtocolServer {
             session_unlock_callbacks: 0,
             next_lock_generation: 0,
             next_security_presentation_epoch: 0,
+            next_capture_manager_id: 0,
+            next_capture_id: 0,
+            capture_managers: HashMap::new(),
+            capture_frames: HashMap::new(),
+            capture_frames_by_resource: HashMap::new(),
+            capture_reservations: HashMap::new(),
+            capture_release_sender,
+            capture_loop_handle: event_loop.handle(),
             saved_cursor_selection: None,
             idle_notifier_state,
             foreign_toplevel_list_state,
@@ -2652,6 +2787,15 @@ impl ProtocolServer {
 
         event_loop
             .handle()
+            .insert_source(capture_release_source, |event, (), state| {
+                if let ChannelEvent::Msg(id) = event {
+                    state.release_capture_reservation(id);
+                }
+            })
+            .map_err(|error| error.to_string())?;
+
+        event_loop
+            .handle()
             .insert_source(retirement_report_source, |event, (), state| match event {
                 ChannelEvent::Msg(report) => state.handle_retirement_report(report),
                 ChannelEvent::Closed => state.handle_retirement_worker_closed(),
@@ -2754,6 +2898,23 @@ impl ProtocolServer {
                     evidence,
                 }) => {
                     state.acknowledge_security_presentation(presentation_epoch, evidence);
+                }
+                ChannelEvent::Msg(ProtocolCommand::CapturePixels(pixels)) => {
+                    state.capture_pixels_ready(pixels);
+                }
+                ChannelEvent::Msg(ProtocolCommand::CapturePresented(presented)) => {
+                    state.capture_presented(presented);
+                }
+                ChannelEvent::Msg(ProtocolCommand::CaptureFailed {
+                    id,
+                    generation,
+                    security_epoch,
+                }) => {
+                    if state.capture_frames.get(&id).is_some_and(|frame| {
+                        frame.generation == generation && frame.security_epoch == security_epoch
+                    }) {
+                        state.fail_capture(id);
+                    }
                 }
                 #[cfg(any(all(feature = "kms-live", not(test)), test))]
                 ChannelEvent::Msg(ProtocolCommand::KmsTopologyLifecycle {
@@ -3061,6 +3222,10 @@ impl ProtocolServer {
             }
             Err(event) => {
                 let event = *event;
+                if let ProtocolEvent::CaptureRequested(request) = &event {
+                    self.state.fail_capture(request.id);
+                    return;
+                }
                 if let Some(token) = protocol_event_dmabuf_token(&event) {
                     self.state.release_buffer_token(token);
                 }
@@ -3354,6 +3519,7 @@ struct PendingProtocolEvents {
     surfaces: HashMap<SurfaceId, ProtocolEvent>,
     dmabuf_invalidations: HashSet<DmabufBufferId>,
     invalidate_all_dmabufs: bool,
+    captures: Vec<ProtocolEvent>,
     runtime_failures: Vec<ProtocolEvent>,
     bytes: usize,
     pressure_warned: bool,
@@ -3395,6 +3561,7 @@ impl PendingProtocolEvents {
             && self.surfaces.is_empty()
             && self.dmabuf_invalidations.is_empty()
             && !self.invalidate_all_dmabufs
+            && self.captures.is_empty()
             && self.runtime_failures.is_empty()
     }
 
@@ -3530,6 +3697,11 @@ impl PendingProtocolEvents {
                 self.dmabuf_invalidations.clear();
                 return Ok(PendingPush::default());
             }
+            ProtocolEvent::CaptureRequested(_) if self.captures.len() < MAX_CAPTURE_FRAMES => {
+                self.captures.push(event);
+                return Ok(PendingPush::default());
+            }
+            ProtocolEvent::CaptureRequested(_) => return Err(Box::new(event)),
             _ => {}
         }
         let old_bytes = match &event {
@@ -3555,13 +3727,15 @@ impl PendingProtocolEvents {
             ProtocolEvent::SurfaceRoster { .. }
             | ProtocolEvent::DmabufBufferDestroyed { .. }
             | ProtocolEvent::DmabufCacheInvalidated
+            | ProtocolEvent::CaptureRequested(_)
             | ProtocolEvent::RuntimeFailed(_) => 0,
         };
         let new_bytes = match &event {
             ProtocolEvent::SecurityScene { .. }
             | ProtocolEvent::SurfaceRoster { .. }
             | ProtocolEvent::DmabufBufferDestroyed { .. }
-            | ProtocolEvent::DmabufCacheInvalidated => 0,
+            | ProtocolEvent::DmabufCacheInvalidated
+            | ProtocolEvent::CaptureRequested(_) => 0,
             ProtocolEvent::SurfaceRelayout { id, scene }
                 if matches!(
                     self.surfaces.get(id),
@@ -3718,6 +3892,9 @@ impl PendingProtocolEvents {
                 self.invalidate_all_dmabufs = true;
                 self.dmabuf_invalidations.clear();
             }
+            ProtocolEvent::CaptureRequested(_) => {
+                self.captures.push(event);
+            }
             ProtocolEvent::RuntimeFailed(_) => {
                 if self.runtime_failures.is_empty() {
                     self.runtime_failures.push(event);
@@ -3739,6 +3916,7 @@ impl PendingProtocolEvents {
                 + self.surfaces.len()
                 + self.dmabuf_invalidations.len()
                 + usize::from(self.invalidate_all_dmabufs)
+                + self.captures.len()
                 + self.runtime_failures.len(),
         );
         // Security state goes first so the opaque blank is installed before
@@ -3768,6 +3946,7 @@ impl PendingProtocolEvents {
         if mem::take(&mut self.invalidate_all_dmabufs) {
             events.push(ProtocolEvent::DmabufCacheInvalidated);
         }
+        events.append(&mut self.captures);
         events.append(&mut self.runtime_failures);
         events
     }
@@ -3805,6 +3984,7 @@ fn protocol_event_surface_id(event: &ProtocolEvent) -> Option<SurfaceId> {
         | ProtocolEvent::CursorUpdated { .. }
         | ProtocolEvent::DmabufBufferDestroyed { .. }
         | ProtocolEvent::DmabufCacheInvalidated
+        | ProtocolEvent::CaptureRequested(_)
         | ProtocolEvent::SurfaceRoster { .. }
         | ProtocolEvent::RuntimeFailed(_) => None,
     }
@@ -3863,7 +4043,8 @@ fn protocol_event_retained_bytes(event: &ProtocolEvent) -> usize {
         | ProtocolEvent::SurfaceUnmapped { .. }
         | ProtocolEvent::SurfaceDestroyed { .. }
         | ProtocolEvent::DmabufBufferDestroyed { .. }
-        | ProtocolEvent::DmabufCacheInvalidated => mem::size_of::<ProtocolEvent>(),
+        | ProtocolEvent::DmabufCacheInvalidated
+        | ProtocolEvent::CaptureRequested(_) => mem::size_of::<ProtocolEvent>(),
         // Reported honestly for the record, but never charged: the roster's
         // worst case is reserved out of the budget once, and it is admitted
         // ahead of the accounting entirely.
@@ -4718,6 +4899,63 @@ struct SurfaceBufferCommit {
     window_geometry_changed: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScreencopyManagerData {
+    id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScreencopyFrameData {
+    id: CaptureId,
+}
+
+#[derive(Clone, Debug)]
+struct CaptureManagerRecord {
+    client_id: ClientId,
+    live_frames: usize,
+    resource_alive: bool,
+}
+
+struct CaptureFrameRecord {
+    resource: ZwlrScreencopyFrameV1,
+    client_id: ClientId,
+    manager_id: u64,
+    output_name: String,
+    generation: u64,
+    security_epoch: u64,
+    region: CaptureRegion,
+    output_size: (u32, u32),
+    format: CaptureFormat,
+    stride: u32,
+    overlay_cursor: bool,
+    readback_supported: bool,
+    submitted: bool,
+    with_damage: bool,
+    terminal: bool,
+    resource_alive: bool,
+    job_pending: bool,
+    buffer: Option<wl_buffer::WlBuffer>,
+    pixels: Option<CapturePixels>,
+    presentation: Option<CapturePresented>,
+    next_write_row: u32,
+    write_scheduled: bool,
+    reserved_bytes: usize,
+    deadline: Option<Instant>,
+    cancellation: Option<CaptureCancellation>,
+}
+
+impl CaptureFrameRecord {
+    #[cfg(test)]
+    fn in_flight(&self) -> bool {
+        self.submitted && !self.terminal
+    }
+}
+
+struct CaptureReservationRecord {
+    client_id: ClientId,
+    bytes: usize,
+}
+
 struct WaylandState {
     acquire_gates: AcquireGateEngine<LinuxAcquireGatePlatform>,
     release_uses: ReleaseUseEngine<LinuxReleaseUsePlatform>,
@@ -4736,6 +4974,14 @@ struct WaylandState {
     session_unlock_callbacks: usize,
     next_lock_generation: u64,
     next_security_presentation_epoch: u64,
+    next_capture_manager_id: u64,
+    next_capture_id: u64,
+    capture_managers: HashMap<u64, CaptureManagerRecord>,
+    capture_frames: HashMap<CaptureId, CaptureFrameRecord>,
+    capture_frames_by_resource: HashMap<ObjectId, CaptureId>,
+    capture_reservations: HashMap<CaptureId, CaptureReservationRecord>,
+    capture_release_sender: channel::Sender<CaptureId>,
+    capture_loop_handle: LoopHandle<'static, WaylandState>,
     saved_cursor_selection: Option<CursorSelection>,
     idle_notifier_state: IdleNotifierState<Self>,
     foreign_toplevel_list_state: ForeignToplevelListState,
@@ -4886,6 +5132,155 @@ struct WaylandState {
     release_use_remove_record_after_prepare: bool,
     #[cfg(test)]
     effective_window_geometry_calls: usize,
+}
+
+fn capture_physical_region(
+    source: &crate::backend::CaptureSourceSnapshot,
+    requested: Option<(i32, i32, i32, i32)>,
+) -> Option<CaptureRegion> {
+    let (_, _, logical_width, logical_height) = source.logical_rect;
+    let (x, y, width, height) = requested.unwrap_or((
+        0,
+        0,
+        i32::try_from(logical_width).ok()?,
+        i32::try_from(logical_height).ok()?,
+    ));
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let right = i64::from(x).checked_add(i64::from(width))?;
+    let bottom = i64::from(y).checked_add(i64::from(height))?;
+    let left = i64::from(x).max(0).min(i64::from(logical_width));
+    let top = i64::from(y).max(0).min(i64::from(logical_height));
+    let right = right.max(0).min(i64::from(logical_width));
+    let bottom = bottom.max(0).min(i64::from(logical_height));
+    if left >= right || top >= bottom {
+        return None;
+    }
+    let project = |edge: i64| -> Option<u32> {
+        let projected = edge as f64 * source.scale;
+        if !projected.is_finite() || projected < 0.0 || projected > f64::from(u32::MAX) {
+            return None;
+        }
+        u32::try_from((projected + 0.5).floor() as u64).ok()
+    };
+    let physical_left = project(left)?;
+    let physical_top = project(top)?;
+    let physical_right = project(right)?;
+    let physical_bottom = project(bottom)?;
+    let (x, y, width, height) = (
+        physical_left,
+        physical_top,
+        physical_right.checked_sub(physical_left)?,
+        physical_bottom.checked_sub(physical_top)?,
+    );
+    if width == 0 || height == 0 {
+        return None;
+    }
+    // Nested is Normal. KMS frames are advertised but fail before GPU work in
+    // S-1a, so S-1b owns transformed pixel projection without weakening the
+    // current never-hang contract.
+    let _ = source.transform;
+    Some(CaptureRegion {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+fn capture_reservation_bytes(output_size: (u32, u32), region: CaptureRegion) -> Option<usize> {
+    let region_bytes = usize::try_from(region.width)
+        .ok()?
+        .checked_mul(4)?
+        .checked_mul(region.height as usize)?;
+    let source_row_bytes = usize::try_from(output_size.0).ok()?.checked_mul(4)?;
+    let source_bytes = source_row_bytes.checked_mul(output_size.1 as usize)?;
+    let padded_row_bytes = source_row_bytes.checked_add(255)? & !255;
+    let staging_bytes = padded_row_bytes.checked_mul(output_size.1 as usize)?;
+    source_bytes
+        .checked_mul(2)?
+        .checked_add(staging_bytes)?
+        .checked_add(region_bytes)
+}
+
+fn validate_capture_buffer_data(
+    mapping_length: usize,
+    data: smithay::wayland::shm::BufferData,
+    format: CaptureFormat,
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> Result<(), ()> {
+    let expected_format = match format {
+        CaptureFormat::Argb8888 => wl_shm::Format::Argb8888,
+        CaptureFormat::Xrgb8888 => wl_shm::Format::Xrgb8888,
+    };
+    if data.format != expected_format
+        || data.width != i32::try_from(width).map_err(|_| ())?
+        || data.height != i32::try_from(height).map_err(|_| ())?
+        || data.stride != i32::try_from(stride).map_err(|_| ())?
+        || data.offset < 0
+    {
+        return Err(());
+    }
+    let offset = usize::try_from(data.offset).map_err(|_| ())?;
+    let stride = usize::try_from(data.stride).map_err(|_| ())?;
+    let row_bytes = usize::try_from(width)
+        .map_err(|_| ())?
+        .checked_mul(4)
+        .ok_or(())?;
+    let end = offset
+        .checked_add(
+            usize::try_from(height.saturating_sub(1))
+                .map_err(|_| ())?
+                .checked_mul(stride)
+                .ok_or(())?,
+        )
+        .and_then(|last_row| last_row.checked_add(row_bytes))
+        .ok_or(())?;
+    (end <= mapping_length).then_some(()).ok_or(())
+}
+
+fn validate_screencopy_shm_buffer(
+    buffer: &wl_buffer::WlBuffer,
+    format: CaptureFormat,
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> Result<(), ()> {
+    with_buffer_contents_mut(buffer, |_base, length, data| {
+        validate_capture_buffer_data(length, data, format, width, height, stride)
+    })
+    .map_err(|_| ())?
+}
+
+fn schedule_capture_write(handle: LoopHandle<'static, WaylandState>, id: CaptureId) {
+    let next = handle.clone();
+    handle.insert_idle(move |state| {
+        if state.write_capture_chunk(id) {
+            schedule_capture_write(next, id);
+        }
+    });
+}
+
+fn schedule_capture_deadline(
+    handle: LoopHandle<'static, WaylandState>,
+    id: CaptureId,
+    deadline: Instant,
+) {
+    handle
+        .insert_source(Timer::from_deadline(deadline), move |fired, (), state| {
+            if state
+                .capture_frames
+                .get(&id)
+                .is_some_and(|record| !record.terminal && record.deadline == Some(fired))
+            {
+                state.fail_capture(id);
+            }
+            TimeoutAction::Drop
+        })
+        .expect("insert per-request screencopy deadline");
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5486,6 +5881,494 @@ fn committed_syncobj_state(
 }
 
 impl WaylandState {
+    fn create_screencopy_manager(&mut self, client_id: ClientId) -> Option<u64> {
+        let client_live = self
+            .capture_managers
+            .values()
+            .filter(|manager| manager.client_id == client_id)
+            .count();
+        let global_live = self.capture_managers.len();
+        if client_live >= MAX_CLIENT_CAPTURE_MANAGERS || global_live >= MAX_GLOBAL_CAPTURE_MANAGERS
+        {
+            return None;
+        }
+        self.next_capture_manager_id = self.next_capture_manager_id.wrapping_add(1).max(1);
+        let id = self.next_capture_manager_id;
+        self.capture_managers.insert(
+            id,
+            CaptureManagerRecord {
+                client_id,
+                live_frames: 0,
+                resource_alive: true,
+            },
+        );
+        Some(id)
+    }
+
+    fn destroy_screencopy_manager(&mut self, id: u64) {
+        let remove = self.capture_managers.get_mut(&id).is_some_and(|manager| {
+            manager.resource_alive = false;
+            manager.live_frames == 0
+        });
+        if remove {
+            self.capture_managers.remove(&id);
+        }
+    }
+
+    fn allocate_capture_id(&mut self) -> CaptureId {
+        self.next_capture_id = self.next_capture_id.wrapping_add(1).max(1);
+        CaptureId(self.next_capture_id)
+    }
+
+    #[allow(clippy::too_many_arguments)] // mirrors the manager request plus new frame identity
+    fn create_screencopy_frame(
+        &mut self,
+        id: CaptureId,
+        manager_id: u64,
+        client: &Client,
+        resource: ZwlrScreencopyFrameV1,
+        output: &wl_output_protocol::WlOutput,
+        overlay_cursor: i32,
+        logical_region: Option<(i32, i32, i32, i32)>,
+    ) {
+        let client_live_frames = self
+            .capture_frames
+            .values()
+            .filter(|frame| frame.client_id == client.id() && frame.resource_alive)
+            .count();
+        if self.capture_frames.len() >= MAX_CAPTURE_FRAMES
+            || client_live_frames >= MAX_CLIENT_CAPTURE_REQUESTS
+        {
+            resource.failed();
+            return;
+        }
+        let Some(source) = self.backend.capture_source_for_output(output) else {
+            resource.failed();
+            return;
+        };
+        let Some(region) = capture_physical_region(&source, logical_region) else {
+            resource.failed();
+            return;
+        };
+        let Some(stride) = region.width.checked_mul(4) else {
+            resource.failed();
+            return;
+        };
+        resource.buffer(
+            wl_shm::Format::Xrgb8888,
+            region.width,
+            region.height,
+            stride,
+        );
+        if resource.version() >= 3 {
+            resource.buffer_done();
+        }
+        let record = CaptureFrameRecord {
+            resource: resource.clone(),
+            client_id: client.id(),
+            manager_id,
+            output_name: source.output_name,
+            generation: source.generation,
+            security_epoch: self.next_security_presentation_epoch,
+            region,
+            output_size: source.physical_size,
+            format: CaptureFormat::Xrgb8888,
+            stride,
+            overlay_cursor: overlay_cursor != 0,
+            readback_supported: source.readback_supported,
+            submitted: false,
+            with_damage: false,
+            terminal: false,
+            resource_alive: true,
+            job_pending: false,
+            buffer: None,
+            pixels: None,
+            presentation: None,
+            next_write_row: 0,
+            write_scheduled: false,
+            reserved_bytes: 0,
+            deadline: None,
+            cancellation: None,
+        };
+        self.capture_frames_by_resource.insert(resource.id(), id);
+        self.capture_frames.insert(id, record);
+        if let Some(manager) = self.capture_managers.get_mut(&manager_id) {
+            manager.live_frames = manager.live_frames.saturating_add(1);
+        }
+    }
+
+    fn submit_screencopy(
+        &mut self,
+        id: CaptureId,
+        frame: &ZwlrScreencopyFrameV1,
+        buffer: wl_buffer::WlBuffer,
+        with_damage: bool,
+    ) {
+        let Some(existing) = self.capture_frames.get(&id) else {
+            frame.post_error(
+                zwlr_screencopy_frame_v1::Error::AlreadyUsed,
+                "screencopy frame is no longer available",
+            );
+            return;
+        };
+        if existing.submitted {
+            frame.post_error(
+                zwlr_screencopy_frame_v1::Error::AlreadyUsed,
+                "screencopy frame has already been used",
+            );
+            return;
+        }
+        // One-shot before validation: an invalid first buffer cannot be
+        // followed by a valid second request on the same frame object.
+        let current_epoch = self.next_security_presentation_epoch;
+        let (client_id, format, region, stride, output_size, overlay_cursor) = {
+            let record = self
+                .capture_frames
+                .get_mut(&id)
+                .expect("capture checked immediately above");
+            record.submitted = true;
+            // Creation advertises immutable geometry; submission selects the
+            // security epoch whose displayed scene this request may observe.
+            record.security_epoch = current_epoch;
+            (
+                record.client_id.clone(),
+                record.format,
+                record.region,
+                record.stride,
+                record.output_size,
+                record.overlay_cursor,
+            )
+        };
+        if validate_screencopy_shm_buffer(&buffer, format, region.width, region.height, stride)
+            .is_err()
+        {
+            if let Some(record) = self.capture_frames.get_mut(&id) {
+                record.terminal = true;
+            }
+            frame.post_error(
+                zwlr_screencopy_frame_v1::Error::InvalidBuffer,
+                "buffer does not match the advertised screencopy shm layout",
+            );
+            return;
+        }
+        if overlay_cursor {
+            // S-1a cannot reproduce the retained client/chrome cursor asset,
+            // hotspot and visibility state exactly. Fail rather than fabricate.
+            self.fail_capture(id);
+            return;
+        }
+        // Account for the capture-owned render target, padded GPU staging and
+        // packed conversion result before any of them can be allocated. The
+        // job-count limits alone are not a memory bound for very large outputs.
+        let Some(reserved_bytes) = capture_reservation_bytes(output_size, region) else {
+            self.fail_capture(id);
+            return;
+        };
+        let client_in_flight = self
+            .capture_reservations
+            .values()
+            .filter(|candidate| candidate.client_id == client_id)
+            .count();
+        let global_in_flight = self.capture_reservations.len();
+        let client_bytes = self
+            .capture_reservations
+            .values()
+            .filter(|candidate| candidate.client_id == client_id)
+            .try_fold(reserved_bytes, |total, candidate| {
+                total.checked_add(candidate.bytes)
+            });
+        let global_bytes = self
+            .capture_reservations
+            .values()
+            .try_fold(reserved_bytes, |total, candidate| {
+                total.checked_add(candidate.bytes)
+            });
+        if client_in_flight >= MAX_CLIENT_CAPTURE_REQUESTS
+            || global_in_flight >= MAX_IN_FLIGHT_CAPTURES
+            || client_bytes.is_none_or(|bytes| bytes > MAX_CLIENT_CAPTURE_BYTES)
+            || global_bytes.is_none_or(|bytes| bytes > MAX_GLOBAL_CAPTURE_BYTES)
+        {
+            self.fail_capture(id);
+            return;
+        }
+        let readback_supported = self
+            .capture_frames
+            .get(&id)
+            .is_some_and(|record| record.readback_supported);
+        if !readback_supported {
+            self.fail_capture(id);
+            return;
+        }
+        let cancellation = CaptureCancellation::default();
+        let reservation = CaptureReservationLease::new(id, self.capture_release_sender.clone());
+        let request = {
+            let record = self
+                .capture_frames
+                .get_mut(&id)
+                .expect("admitted capture remains live");
+            record.buffer = Some(buffer);
+            record.with_damage = with_damage;
+            record.reserved_bytes = reserved_bytes;
+            record.job_pending = true;
+            record.cancellation = Some(cancellation.clone());
+            let deadline = Instant::now()
+                .checked_add(CAPTURE_REQUEST_TIMEOUT)
+                .unwrap_or_else(Instant::now);
+            record.deadline = Some(deadline);
+            CaptureRequest {
+                id,
+                output_name: record.output_name.clone(),
+                generation: record.generation,
+                security_epoch: record.security_epoch,
+                region: record.region,
+                output_size: record.output_size,
+                format: record.format,
+                with_damage,
+                cancellation,
+                reservation,
+                deadline,
+            }
+        };
+        self.capture_reservations.insert(
+            id,
+            CaptureReservationRecord {
+                client_id,
+                bytes: reserved_bytes,
+            },
+        );
+        schedule_capture_deadline(self.capture_loop_handle.clone(), id, request.deadline);
+        self.events.push(ProtocolEvent::CaptureRequested(request));
+    }
+
+    fn destroy_screencopy_frame(&mut self, id: CaptureId) {
+        let Some(record) = self.capture_frames.get_mut(&id) else {
+            return;
+        };
+        record.resource_alive = false;
+        record.terminal = true;
+        record.job_pending = false;
+        if let Some(cancellation) = &record.cancellation {
+            cancellation.cancel();
+        }
+        record.buffer = None;
+        record.pixels = None;
+        record.presentation = None;
+        let resource_id = record.resource.id();
+        let manager_id = record.manager_id;
+        self.capture_frames_by_resource.remove(&resource_id);
+        let remove_manager = self
+            .capture_managers
+            .get_mut(&manager_id)
+            .is_some_and(|manager| {
+                manager.live_frames = manager.live_frames.saturating_sub(1);
+                !manager.resource_alive && manager.live_frames == 0
+            });
+        if remove_manager {
+            self.capture_managers.remove(&manager_id);
+        }
+        self.capture_frames.remove(&id);
+    }
+
+    fn fail_capture(&mut self, id: CaptureId) {
+        let Some(record) = self.capture_frames.get_mut(&id) else {
+            return;
+        };
+        if record.terminal {
+            return;
+        }
+        record.terminal = true;
+        record.job_pending = false;
+        if let Some(cancellation) = &record.cancellation {
+            cancellation.cancel();
+        }
+        record.buffer = None;
+        record.pixels = None;
+        record.presentation = None;
+        if record.resource.is_alive() {
+            record.resource.failed();
+        }
+    }
+
+    fn release_capture_reservation(&mut self, id: CaptureId) {
+        self.capture_reservations.remove(&id);
+        if let Some(record) = self.capture_frames.get_mut(&id) {
+            record.reserved_bytes = 0;
+        }
+    }
+
+    fn capture_pixels_ready(&mut self, pixels: CapturePixels) {
+        let Some(record) = self.capture_frames.get_mut(&pixels.id) else {
+            return;
+        };
+        record.job_pending = false;
+        if record.terminal
+            || record.generation != pixels.generation
+            || record.security_epoch != pixels.security_epoch
+            || record.region.width != pixels.width
+            || record.region.height != pixels.height
+            || record.format != pixels.format
+        {
+            return;
+        }
+        let resource_id = record.resource.id();
+        record.pixels = Some(pixels);
+        self.maybe_schedule_capture_write(resource_id);
+    }
+
+    fn capture_presented(&mut self, presented: CapturePresented) {
+        let Some(record) = self.capture_frames.get_mut(&presented.id) else {
+            return;
+        };
+        if record.terminal
+            || record.generation != presented.generation
+            || record.security_epoch != presented.security_epoch
+            || presented.nanoseconds > 999_999_999
+        {
+            return;
+        }
+        let resource_id = record.resource.id();
+        record.presentation = Some(presented);
+        self.maybe_schedule_capture_write(resource_id);
+    }
+
+    fn maybe_schedule_capture_write(&mut self, resource_id: ObjectId) {
+        let Some(id) = self.capture_frames_by_resource.get(&resource_id).copied() else {
+            return;
+        };
+        let ready = self.capture_frames.get_mut(&id).is_some_and(|record| {
+            if record.write_scheduled
+                || record.terminal
+                || record.pixels.is_none()
+                || record.presentation.is_none()
+            {
+                return false;
+            }
+            let pixels = record.pixels.as_ref().expect("checked above");
+            let presented = record.presentation.as_ref().expect("checked above");
+            if pixels.frame_token != presented.frame_token {
+                return false;
+            }
+            record.write_scheduled = true;
+            true
+        });
+        if ready {
+            schedule_capture_write(self.capture_loop_handle.clone(), id);
+        }
+    }
+
+    /// Copy at most `CAPTURE_SHM_BYTES_PER_TURN`, then re-arm as a calloop idle
+    /// source. No one client can monopolise the shared protocol dispatch thread
+    /// with a full-output memcpy, and ready is emitted only by the final chunk.
+    fn write_capture_chunk(&mut self, id: CaptureId) -> bool {
+        let Some((buffer, pixels, presentation, format, region, stride, start_row)) =
+            self.capture_frames.get_mut(&id).and_then(|record| {
+                record.write_scheduled = false;
+                (!record.terminal).then(|| {
+                    Some((
+                        record.buffer.clone()?,
+                        record.pixels.clone()?,
+                        record.presentation.clone()?,
+                        record.format,
+                        record.region,
+                        record.stride,
+                        record.next_write_row,
+                    ))
+                })?
+            })
+        else {
+            return false;
+        };
+        if !buffer.is_alive() || pixels.frame_token != presentation.frame_token {
+            self.fail_capture(id);
+            return false;
+        }
+        let row_bytes = stride as usize;
+        let rows_per_turn = (CAPTURE_SHM_BYTES_PER_TURN / row_bytes).max(1) as u32;
+        let end_row = start_row.saturating_add(rows_per_turn).min(region.height);
+        let result = with_buffer_contents_mut(&buffer, |base, length, data| {
+            validate_capture_buffer_data(
+                length,
+                data,
+                format,
+                region.width,
+                region.height,
+                stride,
+            )?;
+            let offset = usize::try_from(data.offset).map_err(|_| ())?;
+            let stride = usize::try_from(data.stride).map_err(|_| ())?;
+            for row in start_row..end_row {
+                let row = row as usize;
+                let source = pixels
+                    .packed_bgra
+                    .get(row * row_bytes..(row + 1) * row_bytes)
+                    .ok_or(())?;
+                let destination_offset = offset
+                    .checked_add(row.checked_mul(stride).ok_or(())?)
+                    .ok_or(())?;
+                // SAFETY: the mapping and complete destination extent were
+                // checked above; no reference into client-mutated shm escapes
+                // this callback.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        source.as_ptr(),
+                        base.add(destination_offset),
+                        row_bytes,
+                    );
+                }
+            }
+            Ok::<(), ()>(())
+        });
+        if !matches!(result, Ok(Ok(()))) {
+            self.fail_capture(id);
+            return false;
+        }
+        let record = self
+            .capture_frames
+            .get_mut(&id)
+            .expect("capture survives its checked shm write");
+        record.next_write_row = end_row;
+        if end_row < record.region.height {
+            record.write_scheduled = true;
+            return true;
+        }
+        if record.with_damage {
+            record
+                .resource
+                .damage(0, 0, record.region.width, record.region.height);
+        }
+        let flags = if pixels.y_invert {
+            zwlr_screencopy_frame_v1::Flags::YInvert
+        } else {
+            zwlr_screencopy_frame_v1::Flags::empty()
+        };
+        record.resource.flags(flags);
+        record.resource.ready(
+            (presentation.seconds >> 32) as u32,
+            presentation.seconds as u32,
+            presentation.nanoseconds,
+        );
+        record.terminal = true;
+        record.job_pending = false;
+        record.buffer = None;
+        record.pixels = None;
+        record.presentation = None;
+        false
+    }
+
+    fn fail_stale_capture_epochs(&mut self, current_epoch: u64) {
+        let stale = self
+            .capture_frames
+            .iter()
+            .filter_map(|(id, frame)| {
+                (!frame.terminal && frame.submitted && frame.security_epoch != current_epoch)
+                    .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in stale {
+            self.fail_capture(id);
+        }
+    }
+
     fn session_lock_active(&self) -> bool {
         self.lock_lifecycle.is_active()
             || (matches!(self.backend, BackendData::Kms(_))
@@ -5517,6 +6400,7 @@ impl WaylandState {
         self.next_lock_generation = self.next_lock_generation.saturating_add(1);
         self.next_security_presentation_epoch =
             self.next_security_presentation_epoch.saturating_add(1);
+        self.fail_stale_capture_epochs(self.next_security_presentation_epoch);
         let generation = self.next_lock_generation;
         let presentation_epoch = self.next_security_presentation_epoch;
         let mut pending_outputs = HashSet::new();
@@ -5886,6 +6770,7 @@ impl WaylandState {
             };
             self.next_security_presentation_epoch =
                 self.next_security_presentation_epoch.saturating_add(1);
+            self.fail_stale_capture_epochs(self.next_security_presentation_epoch);
             let presentation_epoch = self.next_security_presentation_epoch;
             self.kms_session_lock_gate.deferred_unlock = false;
             self.kms_session_lock_gate.resume_barrier = None;
@@ -5907,7 +6792,16 @@ impl WaylandState {
             return;
         }
 
-        self.publish_unlocked_scene(None, Vec::new());
+        self.next_security_presentation_epoch =
+            self.next_security_presentation_epoch.saturating_add(1);
+        self.fail_stale_capture_epochs(self.next_security_presentation_epoch);
+        let presentation_epoch = self.next_security_presentation_epoch;
+        let outputs = self
+            .backend
+            .default_output()
+            .map(|output| vec![output.name()])
+            .unwrap_or_default();
+        self.publish_unlocked_scene(Some(presentation_epoch), outputs);
         self.restore_unlocked_focus_and_input();
     }
 
@@ -6001,6 +6895,7 @@ impl WaylandState {
 
         self.next_security_presentation_epoch =
             self.next_security_presentation_epoch.saturating_add(1);
+        self.fail_stale_capture_epochs(self.next_security_presentation_epoch);
         let presentation_epoch = self.next_security_presentation_epoch;
         let presentations = outputs
             .keys()
@@ -6079,6 +6974,16 @@ impl WaylandState {
 
     fn handle_client_disconnect(&mut self, client_id: &ClientId) {
         self.destroy_client_acquire_gates(client_id);
+        let frames = self
+            .capture_frames
+            .iter()
+            .filter_map(|(id, frame)| (&frame.client_id == client_id).then_some(*id))
+            .collect::<Vec<_>>();
+        for id in frames {
+            self.destroy_screencopy_frame(id);
+        }
+        self.capture_managers
+            .retain(|_, manager| &manager.client_id != client_id);
         let lifecycle = mem::replace(&mut self.lock_lifecycle, LockLifecycle::Unlocked);
         match lifecycle {
             LockLifecycle::Locking {
@@ -10598,6 +11503,10 @@ impl WaylandState {
         if !self.backend.resize_host_output((width, height)) {
             return;
         }
+        let captures = self.capture_frames.keys().copied().collect::<Vec<_>>();
+        for id in captures {
+            self.fail_capture(id);
+        }
         self.events
             .push(ProtocolEvent::OutputResized { width, height });
         self.reconfigure_lock_surfaces();
@@ -10716,6 +11625,10 @@ impl WaylandState {
     fn change_output_scale(&mut self, scale: f64) {
         if !self.backend.change_host_output_scale(scale) {
             return;
+        }
+        let captures = self.capture_frames.keys().copied().collect::<Vec<_>>();
+        for id in captures {
+            self.fail_capture(id);
         }
         // The host window's backend scale is a fractional-scale preference,
         // not the nested output's integer coordinate scale. Keep
@@ -12992,15 +13905,28 @@ fn update_shm_buffer(
         // still aliases the backing, COW may copy at most MAX_SURFACE_BYTES;
         // renderer-side subregion uploads are needed to remove that CPU cost.
         let rgba = Arc::make_mut(&mut current.rgba);
+        let mut owned_source_row = vec![0_u8; row_bytes];
         for rows in rows {
             for row in rows {
-                let source_offset = offset + row * stride;
+                let source_offset = offset
+                    .checked_add(
+                        row.checked_mul(stride)
+                            .ok_or_else(|| "SHM row offset overflow".to_string())?,
+                    )
+                    .ok_or_else(|| "SHM row offset overflow".to_string())?;
                 // SAFETY: Smithay keeps the pool mapping alive for this
-                // closure; the complete image byte range was checked above.
-                let source =
-                    unsafe { std::slice::from_raw_parts(base.add(source_offset), row_bytes) };
+                // closure and the complete source range was checked above.
+                // Client-writable shm must never become a Rust reference:
+                // copy through raw pointers into compositor-owned storage.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        base.add(source_offset),
+                        owned_source_row.as_mut_ptr(),
+                        row_bytes,
+                    );
+                }
                 let destination = &mut rgba[row * row_bytes..(row + 1) * row_bytes];
-                convert_shm_row(data.format, source, destination);
+                convert_shm_row(data.format, &owned_source_row, destination);
             }
         }
 

@@ -2,6 +2,7 @@
 
 mod backend;
 mod bindings;
+mod capture;
 mod chrome_frame_material;
 mod client_surface_material;
 mod compositor_scene;
@@ -52,9 +53,10 @@ use compositor_scene::{
 use decoration::DecorationStartup;
 use decoration_scene::init_chrome_font_cx;
 use protocol::{
-    EcsAction, ExplicitSyncExposureMode, ExplicitSyncPreparation, ExplicitSyncStartupReport,
-    ExplicitSyncStartupVerdict, HostAxis, HostButtonState, HostInput, SecurityPresentationReporter,
-    WaylandRuntime, WaylandRuntimePolicy, judge_explicit_sync_startup,
+    CaptureCompletionReporter, EcsAction, ExplicitSyncExposureMode, ExplicitSyncPreparation,
+    ExplicitSyncStartupReport, ExplicitSyncStartupVerdict, HostAxis, HostButtonState, HostInput,
+    SecurityPresentationReporter, WaylandRuntime, WaylandRuntimePolicy,
+    judge_explicit_sync_startup,
 };
 
 const DEFAULT_SOCKET: &str = "cosmix-0";
@@ -313,7 +315,8 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
             ..default()
         });
     app.add_plugins(renderer.install_into(default_plugins))
-        .add_plugins((DmabufImportPlugin, KmsRenderTargetPlugin));
+        .add_plugins((DmabufImportPlugin, KmsRenderTargetPlugin))
+        .add_plugins(capture::CaptureServicePlugin);
     #[cfg(feature = "frame-capture")]
     frame_capture::install_from_environment(&mut app)?;
     if std::env::var_os("COSMIX_DMABUF_LOG_IMPORTS").is_some_and(|value| value == "1") {
@@ -371,9 +374,11 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
     );
     report_explicit_sync_startup(runtime.explicit_sync_startup());
     let scene_feed = runtime.take_client_scene_feed()?;
+    let capture_reporter = runtime.capture_completion_reporter();
     install_nested_security_presentation_completion(
         &mut app,
         runtime.security_presentation_reporter(),
+        capture_reporter.clone(),
     );
     #[cfg(feature = "bus")]
     runtime.start_port().map_err(io::Error::other)?;
@@ -384,6 +389,7 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
     let exit = app
         .insert_resource(runtime)
         .insert_resource(scene_feed)
+        .insert_resource(capture_reporter)
         .insert_resource(decoration)
         .insert_resource(ClearColor(Color::srgb(0.025, 0.035, 0.065)))
         .init_resource::<HostInputQueue>()
@@ -1218,11 +1224,13 @@ struct NestedPostPresent;
 struct NestedPresentCandidate {
     window: Option<Entity>,
     epochs: Vec<(u64, protocol::SecurityPresentationTarget)>,
+    captures: Vec<capture::PendingCapturePresentation>,
 }
 
 #[derive(Resource)]
 struct NestedPresentationCompletion {
     reporter: SecurityPresentationReporter,
+    capture_reporter: CaptureCompletionReporter,
 }
 
 /// Install the production nested security barrier at Bevy's real completion
@@ -1230,15 +1238,24 @@ struct NestedPresentationCompletion {
 fn install_nested_security_presentation_completion(
     app: &mut App,
     reporter: SecurityPresentationReporter,
+    capture_reporter: CaptureCompletionReporter,
 ) {
     let pending = NestedSecurityPresentation::default();
     app.insert_resource(pending.clone());
+    let capture_pending = app
+        .world()
+        .resource::<capture::CapturePresentationPending>()
+        .clone();
     let render_app = app
         .get_sub_app_mut(RenderApp)
         .expect("nested renderer has a render sub-app");
     render_app
         .insert_resource(pending)
-        .insert_resource(NestedPresentationCompletion { reporter })
+        .insert_resource(capture_pending)
+        .insert_resource(NestedPresentationCompletion {
+            reporter,
+            capture_reporter,
+        })
         .init_resource::<NestedPresentCandidate>()
         .init_schedule(NestedPostPresent)
         .add_systems(
@@ -1256,11 +1273,13 @@ fn install_nested_security_presentation_completion(
 
 fn capture_nested_present_candidate(
     pending: Res<NestedSecurityPresentation>,
+    capture_pending: Res<capture::CapturePresentationPending>,
     windows: Res<ExtractedWindows>,
     mut candidate: ResMut<NestedPresentCandidate>,
 ) {
     candidate.window = None;
     candidate.epochs.clear();
+    candidate.captures.clear();
     let Some(primary) = windows.primary else {
         return;
     };
@@ -1271,16 +1290,19 @@ fn capture_nested_present_candidate(
         return;
     }
     let epochs = pending.snapshot();
-    if epochs.is_empty() {
+    let captures = capture_pending.take();
+    if epochs.is_empty() && captures.is_empty() {
         return;
     }
     candidate.window = Some(primary);
     candidate.epochs = epochs;
+    candidate.captures = captures;
 }
 
 fn complete_nested_security_presentation(
     pending: Res<NestedSecurityPresentation>,
     completion: Res<NestedPresentationCompletion>,
+    capture_pending: Res<capture::CapturePresentationPending>,
     render_device: Res<RenderDevice>,
     windows: Res<ExtractedWindows>,
     mut candidate: ResMut<NestedPresentCandidate>,
@@ -1289,15 +1311,41 @@ fn complete_nested_security_presentation(
         return;
     };
     let epochs = mem::take(&mut candidate.epochs);
+    let captures = mem::take(&mut candidate.captures);
     // `present()` consumes the acquired swapchain texture. If it remains,
     // rendering or presentation was skipped and the epoch stays pending.
     if windows
         .get(&window_id)
         .is_none_or(|window| window.swap_chain_texture.is_some())
     {
+        capture_pending.publish(captures);
         return;
     }
-    if let Err(error) = render_device.poll(PollType::wait_indefinitely()) {
+    if let Some((seconds, nanoseconds)) = monotonic_capture_timestamp() {
+        for capture in captures {
+            completion
+                .capture_reporter
+                .presented(capture::CapturePresented {
+                    id: capture.id,
+                    frame_token: capture.frame_token,
+                    generation: capture.generation,
+                    security_epoch: capture.security_epoch,
+                    seconds,
+                    nanoseconds,
+                });
+        }
+    } else {
+        for capture in captures {
+            completion.capture_reporter.failed(
+                capture.id,
+                capture.generation,
+                capture.security_epoch,
+            );
+        }
+    }
+    if let Err(error) = poll_nested_security_gpu(epochs.len(), || {
+        render_device.poll(PollType::wait_indefinitely())
+    }) {
         error!(%error, "nested security frame GPU completion failed");
         return;
     }
@@ -1318,6 +1366,32 @@ fn complete_nested_security_presentation(
     pending.complete(&reported);
 }
 
+fn poll_nested_security_gpu<T, E>(
+    epoch_count: usize,
+    poll: impl FnOnce() -> Result<T, E>,
+) -> Result<(), E> {
+    if epoch_count == 0 {
+        return Ok(());
+    }
+    poll().map(|_| ())
+}
+
+fn monotonic_capture_timestamp() -> Option<(u64, u32)> {
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `timestamp` is valid writable storage for one timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } == 0 {
+        Some((
+            u64::try_from(timestamp.tv_sec).ok()?,
+            u32::try_from(timestamp.tv_nsec).ok()?,
+        ))
+    } else {
+        None
+    }
+}
+
 fn finish_wayland_frame(world: &mut World) {
     if world.contains_resource::<CompositorSceneFailed>() {
         return;
@@ -1331,9 +1405,28 @@ fn finish_wayland_frame(world: &mut World) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn parse(args: &[&str]) -> Result<ParseOutcome, String> {
         Cli::parse(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn capture_without_security_epoch_performs_no_blocking_poll() {
+        let polls = AtomicUsize::new(0);
+        let result = poll_nested_security_gpu(0, || {
+            polls.fetch_add(1, Ordering::Relaxed);
+            Ok::<(), ()>(())
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
+
+        poll_nested_security_gpu(1, || {
+            polls.fetch_add(1, Ordering::Relaxed);
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

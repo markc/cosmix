@@ -41,6 +41,20 @@ impl BufferHandler for WaylandState {
             self.events
                 .push(ProtocolEvent::DmabufBufferDestroyed { buffer_id });
         }
+        let captures = self
+            .capture_frames
+            .iter()
+            .filter_map(|(id, frame)| {
+                frame
+                    .buffer
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.id() == buffer.id())
+                    .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in captures {
+            self.fail_capture(id);
+        }
     }
 }
 
@@ -2378,6 +2392,133 @@ delegate_output!(WaylandState);
 delegate_idle_notify!(WaylandState);
 delegate_foreign_toplevel_list!(WaylandState);
 delegate_session_lock!(WaylandState);
+impl GlobalDispatch<ZwlrScreencopyManagerV1, ()> for WaylandState {
+    fn bind(
+        state: &mut Self,
+        _display: &DisplayHandle,
+        client: &Client,
+        resource: New<ZwlrScreencopyManagerV1>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        let id = state.create_screencopy_manager(client.id());
+        let manager = data_init.init(resource, ScreencopyManagerData { id });
+        if id.is_none() {
+            // zwlr_screencopy_manager_v1 defines no named errors. Code zero is
+            // this implementation's fatal implementation-limit error on the
+            // newly-created manager object.
+            manager.post_error(
+                SCREENCOPY_MANAGER_ERROR_IMPLEMENTATION_LIMIT,
+                format!(
+                    "screencopy manager implementation limit exceeded (per-client {}, global {})",
+                    MAX_CLIENT_CAPTURE_MANAGERS, MAX_GLOBAL_CAPTURE_MANAGERS
+                ),
+            );
+        }
+    }
+}
+
+impl Dispatch<ZwlrScreencopyManagerV1, ScreencopyManagerData> for WaylandState {
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        _manager: &ZwlrScreencopyManagerV1,
+        request: zwlr_screencopy_manager_v1::Request,
+        data: &ScreencopyManagerData,
+        _display: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        let Some(manager_id) = data.id else {
+            return;
+        };
+        match request {
+            zwlr_screencopy_manager_v1::Request::CaptureOutput {
+                frame,
+                overlay_cursor,
+                output,
+            } => {
+                let id = state.allocate_capture_id();
+                let resource = data_init.init(frame, ScreencopyFrameData { id });
+                state.create_screencopy_frame(
+                    id,
+                    manager_id,
+                    client,
+                    resource,
+                    &output,
+                    overlay_cursor,
+                    None,
+                );
+            }
+            zwlr_screencopy_manager_v1::Request::CaptureOutputRegion {
+                frame,
+                overlay_cursor,
+                output,
+                x,
+                y,
+                width,
+                height,
+            } => {
+                let id = state.allocate_capture_id();
+                let resource = data_init.init(frame, ScreencopyFrameData { id });
+                state.create_screencopy_frame(
+                    id,
+                    manager_id,
+                    client,
+                    resource,
+                    &output,
+                    overlay_cursor,
+                    Some((x, y, width, height)),
+                );
+            }
+            zwlr_screencopy_manager_v1::Request::Destroy => {}
+            _ => unreachable!(),
+        }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _client: ClientId,
+        _resource: &ZwlrScreencopyManagerV1,
+        data: &ScreencopyManagerData,
+    ) {
+        if let Some(id) = data.id {
+            state.destroy_screencopy_manager(id);
+        }
+    }
+}
+
+impl Dispatch<ZwlrScreencopyFrameV1, ScreencopyFrameData> for WaylandState {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        frame: &ZwlrScreencopyFrameV1,
+        request: zwlr_screencopy_frame_v1::Request,
+        data: &ScreencopyFrameData,
+        _display: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            zwlr_screencopy_frame_v1::Request::Copy { buffer } => {
+                state.submit_screencopy(data.id, frame, buffer, false);
+            }
+            zwlr_screencopy_frame_v1::Request::CopyWithDamage { buffer } => {
+                state.submit_screencopy(data.id, frame, buffer, true);
+            }
+            zwlr_screencopy_frame_v1::Request::Destroy => {}
+            _ => unreachable!(),
+        }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _client: ClientId,
+        _resource: &ZwlrScreencopyFrameV1,
+        data: &ScreencopyFrameData,
+    ) {
+        state.destroy_screencopy_frame(data.id);
+    }
+}
+
 smithay::reexports::wayland_server::delegate_global_dispatch!(WaylandState: [
     ZwlrLayerShellV1: WlrLayerShellGlobalData
 ] => WlrLayerShellState);

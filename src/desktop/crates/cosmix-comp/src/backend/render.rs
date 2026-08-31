@@ -719,7 +719,8 @@ fn build_live_render_app(
     let mut app = App::new();
     init_chrome_font_cx(&mut app);
     app.insert_resource(decoration)
-        .add_plugins(renderer.install_into(live_headless_plugins()));
+        .add_plugins(renderer.install_into(live_headless_plugins()))
+        .add_plugins(crate::capture::CaptureServicePlugin);
     #[cfg(feature = "frame-capture")]
     crate::frame_capture::install_from_environment(&mut app)
         .map_err(|error| super::kms_live::KmsLiveError::Setup(error.to_string()))?;
@@ -5763,6 +5764,7 @@ pub(crate) mod tests {
     };
 
     use bevy::{
+        MinimalPlugins,
         app::{First, SubApp},
         camera::CameraProjection,
         core_pipeline::upscaling::ViewUpscalingPipeline,
@@ -5806,6 +5808,23 @@ pub(crate) mod tests {
             crate::backend::kms::OutputScale120::ONE,
         )
         .expect("offline client scene has its feed before the first update");
+        app
+    }
+
+    fn live_first_light_capture_app_for_test() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_message::<bevy::window::RequestRedraw>()
+            .add_plugins(crate::capture::CaptureServicePlugin);
+        install_live_scene(&mut app, LiveSceneMode::FirstLight);
+        prepare_live_scene_start(
+            &mut app,
+            LiveSceneMode::FirstLight,
+            None,
+            (320, 240),
+            crate::backend::kms::OutputScale120::ONE,
+        )
+        .expect("first-light has no client scene feed");
         app
     }
 
@@ -6903,6 +6922,49 @@ pub(crate) mod tests {
             client_content
                 .world()
                 .contains_resource::<ClientSceneFeed>()
+        );
+    }
+
+    #[test]
+    fn first_light_capture_service_ticks_once_without_a_client_scene_feed() {
+        let mut app = live_first_light_capture_app_for_test();
+        app.update();
+        assert!(!app.world().contains_resource::<ClientSceneFeed>());
+    }
+
+    #[test]
+    fn first_light_admitted_capture_without_a_feed_uses_reporter_fallback() {
+        let mut app = live_first_light_capture_app_for_test();
+        let (_events, feed) = ClientSceneFeed::test_channel();
+        app.insert_resource(feed.capture_completion_reporter());
+        app.world_mut()
+            .resource_mut::<crate::capture::CaptureQueue>()
+            .push(crate::capture::CaptureRequest {
+                id: crate::capture::CaptureId(41),
+                output_name: "cosmix-first-light-0".into(),
+                generation: 1,
+                security_epoch: 2,
+                region: crate::capture::CaptureRegion {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                output_size: (1, 1),
+                format: crate::capture::CaptureFormat::Xrgb8888,
+                with_damage: false,
+                cancellation: crate::capture::CaptureCancellation::default(),
+                reservation: crate::capture::CaptureReservationLease::detached(
+                    crate::capture::CaptureId(41),
+                ),
+                deadline: Instant::now() + crate::protocol::CAPTURE_REQUEST_TIMEOUT,
+            });
+        app.update();
+        assert_eq!(
+            feed.capture_outcomes_for_test(),
+            vec![crate::protocol::CaptureTestOutcome::Failed(
+                crate::capture::CaptureId(41)
+            )]
         );
     }
 
