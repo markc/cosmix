@@ -1,5 +1,8 @@
 //! Smithay protocol state and the narrow protocol-to-ECS bridge.
 
+#[cfg(feature = "bus")]
+pub(crate) mod port_snapshot;
+
 use std::{
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
     env,
@@ -53,6 +56,9 @@ use crate::{
     bindings::{BindingAction, BindingProfile, BindingState, KeyDisposition},
     decoration::DecorationStartup,
 };
+
+#[cfg(feature = "bus")]
+use crate::port::{PortCommand, PortProtocolWiring, PortRequest, PortStarter, PortWorker};
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 use crate::backend::kms::KmsTopologyLifecycleEvent;
@@ -1014,6 +1020,10 @@ pub(crate) struct WaylandRuntime {
     kms_render_commands: Arc<Mutex<Receiver<KmsRenderCommand>>>,
     thread: Option<JoinHandle<()>>,
     thread_completion: Option<Mutex<Receiver<()>>>,
+    #[cfg(feature = "bus")]
+    port_starter: Option<PortStarter>,
+    #[cfg(feature = "bus")]
+    port_worker: Option<PortWorker>,
     /// What the protocol thread reported about explicit sync as it came up.
     ///
     /// `None` exactly when no protocol thread was started, which is only the
@@ -1395,6 +1405,36 @@ impl WaylandRuntime {
         )
     }
 
+    #[cfg(feature = "bus")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_production(
+        socket_name: &str,
+        backend_kind: BackendKind,
+        output_size: (u32, u32),
+        dmabuf_capabilities: Option<DmabufCapabilities>,
+        dmabuf_validator: Option<Box<dyn ValidateDmabuf>>,
+        retirement_adapter: Option<Box<dyn WaitForSubmittedWork>>,
+        policy: WaylandRuntimePolicy,
+        service: String,
+    ) -> Result<Self, Box<dyn Error>> {
+        let (port, starter) = crate::port::prepare(service, "nested", &policy.decoration)?;
+        Self::with_input_source_port(
+            socket_name,
+            backend_kind,
+            output_size,
+            WaylandGpuWiring {
+                dmabuf_capabilities,
+                dmabuf_validator,
+                retirement_adapter,
+            },
+            policy,
+            None,
+            None,
+            Some(port),
+            Some(starter),
+        )
+    }
+
     /// Start the protocol thread with one mandatory bare-metal input source.
     ///
     /// The source factory crosses the thread boundary, not the source it builds:
@@ -1404,6 +1444,7 @@ impl WaylandRuntime {
     /// unexpectedly; its concrete failure vocabulary remains with the live
     /// backend that supplies it.
     #[cfg(all(feature = "kms-live", not(test)))]
+    #[cfg_attr(feature = "bus", allow(dead_code))]
     pub(crate) fn new_with_input_source<N>(
         socket_name: &str,
         backend_kind: BackendKind,
@@ -1429,6 +1470,40 @@ impl WaylandRuntime {
                 vt_switch_requested: Some(input.vt_switch_requested),
             },
             Some(Box::new(protocol_failed)),
+        )
+    }
+
+    #[cfg(all(feature = "bus", feature = "kms-live", not(test)))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_input_source_production<N>(
+        socket_name: &str,
+        backend_kind: BackendKind,
+        output_size: (u32, u32),
+        gpu: WaylandGpuWiring,
+        policy: WaylandRuntimePolicy,
+        input: LiveInputWiring,
+        protocol_failed: N,
+        service: String,
+    ) -> Result<Self, Box<dyn Error>>
+    where
+        N: FnOnce() + Send + 'static,
+    {
+        let (port, starter) = crate::port::prepare(service, "kms", &policy.decoration)?;
+        Self::with_input_source_and_bindings_port(
+            socket_name,
+            backend_kind,
+            output_size,
+            gpu,
+            policy,
+            WaylandInputWiring {
+                source: Some(input.source),
+                lifecycle: Some(input.lifecycle),
+                binding_profile: BindingProfile::KmsLive,
+                vt_switch_requested: Some(input.vt_switch_requested),
+            },
+            Some(Box::new(protocol_failed)),
+            Some(port),
+            Some(starter),
         )
     }
 
@@ -1466,6 +1541,38 @@ impl WaylandRuntime {
         )
     }
 
+    #[cfg(feature = "bus")]
+    #[allow(clippy::too_many_arguments)]
+    fn with_input_source_port(
+        socket_name: &str,
+        backend_kind: BackendKind,
+        output_size: (u32, u32),
+        gpu: WaylandGpuWiring,
+        policy: WaylandRuntimePolicy,
+        input_source: Option<Box<dyn input::InputSourceRegistration>>,
+        protocol_failed: Option<Box<dyn FnOnce() + Send>>,
+        port: Option<PortProtocolWiring>,
+        port_starter: Option<PortStarter>,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::with_input_source_and_bindings_port(
+            socket_name,
+            backend_kind,
+            output_size,
+            gpu,
+            policy,
+            WaylandInputWiring {
+                source: input_source,
+                #[cfg(any(all(feature = "kms-live", not(test)), test))]
+                lifecycle: None,
+                binding_profile: BindingProfile::Nested,
+                vt_switch_requested: None,
+            },
+            protocol_failed,
+            port,
+            port_starter,
+        )
+    }
+
     fn with_input_source_and_bindings(
         socket_name: &str,
         backend_kind: BackendKind,
@@ -1474,6 +1581,33 @@ impl WaylandRuntime {
         policy: WaylandRuntimePolicy,
         input: WaylandInputWiring,
         protocol_failed: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::with_input_source_and_bindings_port(
+            socket_name,
+            backend_kind,
+            output_size,
+            gpu,
+            policy,
+            input,
+            protocol_failed,
+            #[cfg(feature = "bus")]
+            None,
+            #[cfg(feature = "bus")]
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_input_source_and_bindings_port(
+        socket_name: &str,
+        backend_kind: BackendKind,
+        output_size: (u32, u32),
+        gpu: WaylandGpuWiring,
+        policy: WaylandRuntimePolicy,
+        input: WaylandInputWiring,
+        protocol_failed: Option<Box<dyn FnOnce() + Send>>,
+        #[cfg(feature = "bus")] port: Option<PortProtocolWiring>,
+        #[cfg(feature = "bus")] port_starter: Option<PortStarter>,
     ) -> Result<Self, Box<dyn Error>> {
         let WaylandInputWiring {
             source: input_source,
@@ -1506,25 +1640,36 @@ impl WaylandRuntime {
                 // Declared before the server so an unwinding panic drops the
                 // server first and publishes the failure afterwards.
                 let mut failure = ProtocolThreadFailure(protocol_failed);
-                let result = ProtocolServer::new(
-                    &socket_name,
-                    backend_kind,
-                    output_size,
-                    gpu,
-                    ProtocolServerBootstrap {
-                        command_source,
-                        event_sender: event_sender.clone(),
-                        ecs_action_sender,
-                        kms_render_command_sender,
-                        keybindings_enabled,
-                        binding_profile,
-                        vt_switch_requested,
-                        explicit_sync_exposure_mode,
-                        decoration,
-                        input_source,
-                        cursor_position: protocol_cursor_position,
-                    },
-                );
+                let bootstrap = ProtocolServerBootstrap {
+                    command_source,
+                    event_sender: event_sender.clone(),
+                    ecs_action_sender,
+                    kms_render_command_sender,
+                    keybindings_enabled,
+                    binding_profile,
+                    vt_switch_requested,
+                    explicit_sync_exposure_mode,
+                    decoration,
+                    input_source,
+                    cursor_position: protocol_cursor_position,
+                };
+                #[cfg(feature = "bus")]
+                let result = match port {
+                    Some(port) => ProtocolServer::new_production(
+                        &socket_name,
+                        backend_kind,
+                        output_size,
+                        gpu,
+                        bootstrap,
+                        port,
+                    ),
+                    None => {
+                        ProtocolServer::new(&socket_name, backend_kind, output_size, gpu, bootstrap)
+                    }
+                };
+                #[cfg(not(feature = "bus"))]
+                let result =
+                    ProtocolServer::new(&socket_name, backend_kind, output_size, gpu, bootstrap);
                 let mut server = match result {
                     Ok((server, explicit_sync)) => {
                         let _ = ready_sender.send(Ok(explicit_sync));
@@ -1566,6 +1711,10 @@ impl WaylandRuntime {
                 kms_render_commands: Arc::new(Mutex::new(kms_render_commands)),
                 thread: Some(thread),
                 thread_completion: Some(Mutex::new(completion_receiver)),
+                #[cfg(feature = "bus")]
+                port_starter,
+                #[cfg(feature = "bus")]
+                port_worker: None,
                 explicit_sync_startup: Some(explicit_sync_startup),
                 #[cfg(any(all(feature = "kms-live", not(test)), test))]
                 input_lifecycle,
@@ -1591,6 +1740,19 @@ impl WaylandRuntime {
     /// tracks withdrawal, not this.
     pub(crate) fn explicit_sync_startup(&self) -> Option<&ExplicitSyncStartupReport> {
         self.explicit_sync_startup.as_ref()
+    }
+
+    #[cfg(feature = "bus")]
+    pub(crate) fn start_port(&mut self) -> Result<(), String> {
+        if self.port_worker.is_some() {
+            return Ok(());
+        }
+        let starter = self
+            .port_starter
+            .take()
+            .ok_or_else(|| "compositor Bus port was not prepared".to_string())?;
+        self.port_worker = Some(starter.start()?);
+        Ok(())
     }
 
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -1637,6 +1799,10 @@ impl WaylandRuntime {
             thread: None,
             thread_completion: None,
             explicit_sync_startup: None,
+            #[cfg(feature = "bus")]
+            port_starter: None,
+            #[cfg(feature = "bus")]
+            port_worker: None,
             input_lifecycle: None,
             _test_channels: Some(TestRuntimeChannels {
                 _command_source: Mutex::new(command_source),
@@ -1670,6 +1836,10 @@ impl WaylandRuntime {
             thread: None,
             thread_completion: None,
             explicit_sync_startup: None,
+            #[cfg(feature = "bus")]
+            port_starter: None,
+            #[cfg(feature = "bus")]
+            port_worker: None,
             input_lifecycle: None,
             _test_channels: Some(TestRuntimeChannels {
                 _command_source: Mutex::new(command_source),
@@ -1809,6 +1979,14 @@ pub(crate) struct WaylandGpuWiring {
 
 impl Drop for WaylandRuntime {
     fn drop(&mut self) {
+        #[cfg(feature = "bus")]
+        let mut port = self.port_worker.take();
+        #[cfg(feature = "bus")]
+        self.port_starter.take();
+        #[cfg(feature = "bus")]
+        if let Some(port) = port.as_mut() {
+            port.begin_shutdown();
+        }
         let _ = self.commands.send(ProtocolCommand::Shutdown);
         let Some(thread) = self.thread.take() else {
             return;
@@ -1848,6 +2026,10 @@ impl Drop for WaylandRuntime {
                     );
                 }
             }
+        }
+        #[cfg(feature = "bus")]
+        if let Some(port) = port {
+            port.finish();
         }
     }
 }
@@ -2105,6 +2287,44 @@ impl ProtocolServer {
         gpu: WaylandGpuWiring,
         bootstrap: ProtocolServerBootstrap,
     ) -> Result<(Self, ExplicitSyncStartupReport), String> {
+        Self::new_with_port(
+            socket_name,
+            backend_kind,
+            output_size,
+            gpu,
+            bootstrap,
+            #[cfg(feature = "bus")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "bus")]
+    fn new_production(
+        socket_name: &str,
+        backend_kind: BackendKind,
+        output_size: (u32, u32),
+        gpu: WaylandGpuWiring,
+        bootstrap: ProtocolServerBootstrap,
+        port: PortProtocolWiring,
+    ) -> Result<(Self, ExplicitSyncStartupReport), String> {
+        Self::new_with_port(
+            socket_name,
+            backend_kind,
+            output_size,
+            gpu,
+            bootstrap,
+            Some(port),
+        )
+    }
+
+    fn new_with_port(
+        socket_name: &str,
+        backend_kind: BackendKind,
+        output_size: (u32, u32),
+        gpu: WaylandGpuWiring,
+        bootstrap: ProtocolServerBootstrap,
+        #[cfg(feature = "bus")] port: Option<PortProtocolWiring>,
+    ) -> Result<(Self, ExplicitSyncStartupReport), String> {
         let WaylandGpuWiring {
             dmabuf_capabilities,
             dmabuf_validator,
@@ -2123,6 +2343,11 @@ impl ProtocolServer {
             input_source,
             cursor_position,
         } = bootstrap;
+        #[cfg(feature = "bus")]
+        let (port_source, port_context) = match port {
+            Some(port) => (Some(port.source), Some(port.context)),
+            None => (None, None),
+        };
         let display = Display::<WaylandState>::new().map_err(|error| error.to_string())?;
         let display_handle = display.handle();
         let backend_name = match backend_kind {
@@ -2362,6 +2587,10 @@ impl ProtocolServer {
             pending_parentless_popups: HashMap::new(),
             committed_surface_stacks: HashMap::new(),
             warned_unsupported_surfaces: HashSet::new(),
+            #[cfg(feature = "bus")]
+            port_context,
+            #[cfg(feature = "bus")]
+            pending_port_requests: Vec::with_capacity(16),
             events: Vec::new(),
             event_flush_acknowledgements: Vec::new(),
             pending_full_upserts: HashSet::new(),
@@ -2454,6 +2683,21 @@ impl ProtocolServer {
             source
                 .register(&event_loop.handle())
                 .map_err(|error| format!("failed to register input source: {error}"))?;
+        }
+
+        #[cfg(feature = "bus")]
+        if let Some(source) = port_source {
+            event_loop
+                .handle()
+                .insert_source(source, |event, (), state| match event {
+                    ChannelEvent::Msg(PortCommand::Snapshot(request)) => {
+                        if state.pending_port_requests.len() < 16 {
+                            state.pending_port_requests.push(request);
+                        }
+                    }
+                    ChannelEvent::Closed => {}
+                })
+                .map_err(|error| error.to_string())?;
         }
 
         event_loop
@@ -2680,6 +2924,8 @@ impl ProtocolServer {
         self.state.reconcile_subsurface_roles();
         self.state.backend.maintain_after_protocol_dispatch();
         self.state.popup_manager.cleanup();
+        #[cfg(feature = "bus")]
+        self.state.service_port_requests();
         self.display
             .flush_clients()
             .map_err(|error| format!("Wayland client flush failed: {error}"))?;
@@ -3666,6 +3912,7 @@ struct SurfaceRecord {
     mapped: bool,
     layout: SurfaceLayout,
     title: Option<Arc<str>>,
+    app_id: Option<Arc<str>>,
     /// Global origin of the xdg_surface window geometry. `layout` starts at
     /// the wl_surface/buffer origin, which can precede it for CSD shadows.
     window_origin: (f32, f32),
@@ -4571,6 +4818,10 @@ struct WaylandState {
     pending_parentless_popups: HashMap<ObjectId, PositionerState>,
     committed_surface_stacks: HashMap<ObjectId, Vec<ObjectId>>,
     warned_unsupported_surfaces: HashSet<ObjectId>,
+    #[cfg(feature = "bus")]
+    port_context: Option<Arc<port_snapshot::SnapshotContext>>,
+    #[cfg(feature = "bus")]
+    pending_port_requests: Vec<PortRequest>,
     events: Vec<ProtocolEvent>,
     /// Flush pokes handled in this dispatch. Their callers may proceed only
     /// after `publish_events` has offered the compacted outbox.
@@ -5231,6 +5482,32 @@ fn committed_syncobj_state(
 }
 
 impl WaylandState {
+    #[cfg(feature = "bus")]
+    fn service_port_requests(&mut self) {
+        if self.pending_port_requests.is_empty() {
+            return;
+        }
+
+        let stable =
+            self.pointer_hit_test_batch_depth == 0 && !self.pointer_hit_test_transaction_applying;
+        debug_assert!(
+            stable,
+            "Bus snapshot attempted inside a protocol transaction or hit-test batch"
+        );
+        if !stable {
+            self.pending_port_requests.clear();
+            return;
+        }
+        let Some(context) = self.port_context.clone() else {
+            self.pending_port_requests.clear();
+            return;
+        };
+        let snapshot = Arc::new(port_snapshot::snapshot(self, &context));
+        for request in self.pending_port_requests.drain(..) {
+            let _ = request.reply.send(Arc::clone(&snapshot));
+        }
+    }
+
     fn session_lock_active(&self) -> bool {
         self.lock_lifecycle.is_active()
             || (matches!(self.backend, BackendData::Kms(_))
@@ -6091,24 +6368,20 @@ impl WaylandState {
         if self.session_lock_active() {
             return;
         }
-        let Some((id, commit_count, title)) = self.surfaces.get(&surface.id()).and_then(|record| {
-            (record.mapped && matches!(record.role, SurfaceRole::Toplevel(_))).then(|| {
-                (
-                    record.id,
-                    record.commit_count,
-                    record.title.as_deref().unwrap_or_default().to_owned(),
-                )
+        let Some((id, commit_count, title, app_id)) =
+            self.surfaces.get(&surface.id()).and_then(|record| {
+                (record.mapped && matches!(record.role, SurfaceRole::Toplevel(_))).then(|| {
+                    (
+                        record.id,
+                        record.commit_count,
+                        record.title.as_deref().unwrap_or_default().to_owned(),
+                        record.app_id.as_deref().unwrap_or_default().to_owned(),
+                    )
+                })
             })
-        }) else {
+        else {
             return;
         };
-        let app_id = compositor::with_states(surface, |states| {
-            states
-                .data_map
-                .get::<XdgToplevelSurfaceData>()
-                .and_then(|data| data.lock().ok()?.app_id.clone())
-                .unwrap_or_default()
-        });
         if let Some(handle) = self.foreign_toplevels.get(&id) {
             let title_changed = handle.title() != title;
             let app_id_changed = handle.app_id() != app_id;
@@ -10141,9 +10414,31 @@ impl WaylandState {
         let Some(output) = self.backend.default_output() else {
             return self.logical_output_rect();
         };
-        let layer_map = layer_map_for_output(&output);
+        self.usable_output_rect_for(&output)
+    }
+
+    fn usable_output_rect_for(&self, output: &Output) -> LogicalOutputRect {
+        let own_rect = output.current_mode().map_or_else(
+            || self.logical_output_rect(),
+            |mode| {
+                let size = mode
+                    .size
+                    .to_f64()
+                    .to_logical(output.current_scale().fractional_scale())
+                    .to_i32_round::<i32>();
+                let size = output.current_transform().transform_size(size);
+                let origin = output.current_location();
+                LogicalOutputRect {
+                    x: origin.x as f32,
+                    y: origin.y as f32,
+                    width: size.w.max(0) as f32,
+                    height: size.h.max(0) as f32,
+                }
+            },
+        );
+        let layer_map = layer_map_for_output(output);
         if layer_map.layers().next().is_none() {
-            return self.logical_output_rect();
+            return own_rect;
         }
         let zone = layer_map.non_exclusive_zone();
         let origin = output.current_location();

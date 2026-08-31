@@ -7,7 +7,16 @@ rust-version = "1.95"
 license = "MIT"
 
 [features]
-default = ["frame-capture"]
+default = ["bus", "frame-capture"]
+bus = [
+    "dep:cosmix-buildinfo",
+    "dep:cosmix-client",
+    "dep:cosmix-config",
+    "dep:cosmix-props-core",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tokio",
+]
 explicit-sync-live-test = []
 frame-capture = ["dep:signal-hook"]
 kms-live = [
@@ -42,6 +51,10 @@ bevy = { version = "=0.19.0", default-features = false, features = [
 ] }
 cosmix-deco = { path = "../cosmix-deco" }
 cosmix-wgpu-dmabuf = { path = "../cosmix-wgpu-dmabuf" }
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo", optional = true }
+cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client", optional = true }
+cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config", features = ["client-helpers"], optional = true }
+cosmix-props-core = { package = "cosmix-lib-props-core", path = "../../../crates/cosmix-lib-props-core", optional = true }
 getrandom = "0.4"
 # Not called directly: `system_font_discovery` reaches fontconfig through
 # Parley, and without this feature the binary carries `NEEDED
@@ -59,6 +72,8 @@ signal-hook = { version = "0.3", optional = true }
 smithay-client-toolkit = { version = "=0.19.2", default-features = false, features = [
     "calloop",
 ], optional = true }
+serde = { version = "1", features = ["derive", "rc"], optional = true }
+serde_json = { version = "1", optional = true }
 smithay = { version = "=0.7.0", default-features = false, features = [
     "backend_drm",
     "backend_gbm",
@@ -73,6 +88,10 @@ static_assertions = "1"
 tracing = "0.1"
 unicode-segmentation = "1"
 wayland-client = { version = "=0.31.14", optional = true }
+tokio = { version = "1", features = ["macros", "rt", "sync", "test-util", "time"], optional = true }
+
+[build-dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
 
 [dev-dependencies]
 wgpu = { version = "=29.0.4", features = ["noop"] }

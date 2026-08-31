@@ -9,6 +9,8 @@ mod decoration;
 mod decoration_scene;
 #[cfg(feature = "frame-capture")]
 mod frame_capture;
+#[cfg(feature = "bus")]
+mod port;
 mod protocol;
 mod shadow_material;
 
@@ -198,13 +200,16 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             };
         }
-        Ok(ParseOutcome::KmsLive { argv }) => {
+        Ok(ParseOutcome::KmsLive { argv, bus_service }) => {
             if let Err(error) = init_kms_live_tracing() {
                 eprintln!("kms-live tracing initialisation failed: {error}");
                 return ExitCode::FAILURE;
             }
             match backend::kms_live::authorise(&argv) {
-                Ok(grant) => match backend::kms_live::execute_live(grant) {
+                Ok(grant) => match backend::kms_live::execute_live(
+                    grant,
+                    bus_service.unwrap_or_else(|| "comp".into()),
+                ) {
                     Ok(()) => {
                         return backend::kms_live::latched_signal_exit_code()
                             .map(ExitCode::from)
@@ -331,6 +336,23 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
         .into());
     }
 
+    let policy = WaylandRuntimePolicy {
+        keybindings_enabled: cli.keybindings_enabled,
+        explicit_sync_exposure_mode: ExplicitSyncExposureMode::Production,
+        decoration: decoration.clone(),
+    };
+    #[cfg(feature = "bus")]
+    let mut runtime = WaylandRuntime::new_production(
+        &cli.socket,
+        BackendKind::Winit,
+        (INITIAL_WIDTH, INITIAL_HEIGHT),
+        Some(dmabuf_capabilities.clone()),
+        Some(Box::new(dmabuf_validator)),
+        Some(retirement_adapter),
+        policy,
+        cli.bus_service.unwrap_or_else(|| "comp-nested".into()),
+    )?;
+    #[cfg(not(feature = "bus"))]
     let mut runtime = WaylandRuntime::new(
         &cli.socket,
         BackendKind::Winit,
@@ -338,11 +360,7 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
         Some(dmabuf_capabilities.clone()),
         Some(Box::new(dmabuf_validator)),
         Some(retirement_adapter),
-        WaylandRuntimePolicy {
-            keybindings_enabled: cli.keybindings_enabled,
-            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Production,
-            decoration: decoration.clone(),
-        },
+        policy,
     )?;
     info!(
         socket = cli.socket,
@@ -357,6 +375,8 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
         &mut app,
         runtime.security_presentation_reporter(),
     );
+    #[cfg(feature = "bus")]
+    runtime.start_port().map_err(io::Error::other)?;
 
     // `App::run` reports how the app ended (window close / exit chord →
     // Success; render-error, device-lost, winit-loop, Ctrl-C → Error).
@@ -381,16 +401,17 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
 }
 
 const USAGE: &str = "\
-Usage: cosmix-comp (--nested | --kms) [--socket <name>] [--no-keybindings] [--ssd | --no-ssd] [--chrome <mac|win11|cosmix>]
+Usage: cosmix-comp (--nested | --kms) [--socket <name>] [--bus-service <name>] [--no-keybindings] [--ssd | --no-ssd] [--chrome <mac|win11|cosmix>]
        cosmix-comp --list-bindings [--binding-profile <nested|kms-live>] [--no-keybindings]
        cosmix-comp --kms-probe
        cosmix-comp --kms-watch <seconds>
-       cosmix-comp kms-live --device <path> --connector <name> [--presentation atomic] [--scale <decimal>] [--first-light] [--kms-confirm] [--ssd | --no-ssd] [--chrome <mac|win11|cosmix>]
+       cosmix-comp kms-live --device <path> --connector <name> [--bus-service <name>] [--presentation atomic] [--scale <decimal>] [--first-light] [--kms-confirm] [--ssd | --no-ssd] [--chrome <mac|win11|cosmix>]
 
 Options:
   --nested           Run in a Bevy winit window inside the current desktop
   --kms              Select the bare-metal KMS backend (Rung A topology only)
   --socket <name>    Wayland socket name (default: cosmix-0)
+  --bus-service      Override the Bus service name (default comp-nested/comp)
   --no-keybindings   Start with compositor key interception disabled
   --ssd              Explicitly enable server-side decorations (the default)
   --no-ssd           Disable server-side decorations
@@ -417,6 +438,7 @@ struct Cli {
     socket: String,
     keybindings_enabled: bool,
     decoration: DecorationStartup,
+    bus_service: Option<String>,
 }
 
 enum ParseOutcome {
@@ -431,18 +453,22 @@ enum ParseOutcome {
     },
     KmsLive {
         argv: Vec<OsString>,
+        bus_service: Option<String>,
     },
     Help,
 }
 
 impl Cli {
     fn parse(args: impl IntoIterator<Item = OsString>) -> Result<ParseOutcome, String> {
-        let args = args.into_iter().collect::<Vec<_>>();
+        let (args, bus_service) = extract_bus_service(args.into_iter().collect())?;
         if args.first().and_then(|argument| argument.to_str()) == Some("kms-live") {
             if args.len() == 2 && matches!(args[1].to_str(), Some("--help" | "-h")) {
                 return Ok(ParseOutcome::Help);
             }
-            return Ok(ParseOutcome::KmsLive { argv: args });
+            return Ok(ParseOutcome::KmsLive {
+                argv: args,
+                bus_service,
+            });
         }
         let original_args = args.clone();
         let mut args = args.into_iter();
@@ -586,6 +612,7 @@ impl Cli {
                 Some("kms-live") => {
                     return Ok(ParseOutcome::KmsLive {
                         argv: original_args,
+                        bus_service,
                     });
                 }
                 Some("-h" | "--help") => return Ok(ParseOutcome::Help),
@@ -604,6 +631,7 @@ impl Cli {
                 || kms_watch.is_some()
                 || ssd.is_some()
                 || chrome.is_some()
+                || bus_service.is_some()
             {
                 return Err("--kms-probe must be supplied by itself".into());
             }
@@ -617,12 +645,16 @@ impl Cli {
                 || binding_profile.is_some()
                 || ssd.is_some()
                 || chrome.is_some()
+                || bus_service.is_some()
             {
                 return Err("--kms-watch must be supplied by itself".into());
             }
             return Ok(ParseOutcome::KmsWatch { seconds });
         }
         if list_bindings {
+            if bus_service.is_some() {
+                return Err("--bus-service requires --nested, --kms, or kms-live".into());
+            }
             return Ok(ParseOutcome::ListBindings {
                 keybindings_enabled,
                 profile: binding_profile.unwrap_or(bindings::BindingProfile::Nested),
@@ -641,8 +673,42 @@ impl Cli {
                 ssd.unwrap_or(true) || chrome.is_some(),
                 chrome.unwrap_or(ChromeStyle::Mac),
             ),
+            bus_service,
         })))
     }
+}
+
+fn extract_bus_service(args: Vec<OsString>) -> Result<(Vec<OsString>, Option<String>), String> {
+    let mut retained = Vec::with_capacity(args.len());
+    let mut service = None;
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
+        if argument.to_str() != Some("--bus-service") {
+            retained.push(argument);
+            continue;
+        }
+        if service.is_some() {
+            return Err("--bus-service may only be supplied once".into());
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| "--bus-service requires a name".to_string())?
+            .into_string()
+            .map_err(|_| "Bus service name must be valid UTF-8".to_string())?;
+        service = Some(accept_bus_service(value)?);
+    }
+    Ok((retained, service))
+}
+
+#[cfg(feature = "bus")]
+fn accept_bus_service(value: String) -> Result<String, String> {
+    crate::port::validate_service_name(&value)?;
+    Ok(value)
+}
+
+#[cfg(not(feature = "bus"))]
+fn accept_bus_service(_value: String) -> Result<String, String> {
+    Err("--bus-service requires the compositor 'bus' feature".into())
 }
 
 #[derive(Component)]
@@ -1282,6 +1348,7 @@ mod tests {
                 socket: DEFAULT_SOCKET.into(),
                 keybindings_enabled: true,
                 decoration: DecorationStartup::default(),
+                bus_service: None,
             }
         );
     }
@@ -1300,6 +1367,42 @@ mod tests {
         };
         assert_eq!(cli.socket, "cosmix-test");
         assert!(cli.keybindings_enabled);
+    }
+
+    #[cfg(feature = "bus")]
+    #[test]
+    fn bus_service_override_is_validated_and_reaches_nested_and_kms_live() {
+        let ParseOutcome::Run(cli) =
+            parse(&["--nested", "--bus-service", "comp-test"]).expect("valid Bus name")
+        else {
+            panic!("expected runnable CLI");
+        };
+        assert_eq!(cli.bus_service.as_deref(), Some("comp-test"));
+        let ParseOutcome::KmsLive { argv, bus_service } = parse(&[
+            "kms-live",
+            "--device",
+            "/dev/dri/card0",
+            "--bus-service",
+            "comp-seat-test",
+            "--connector",
+            "eDP-1",
+        ])
+        .expect("valid KMS Bus name") else {
+            panic!("expected live interlock arguments");
+        };
+        assert_eq!(bus_service.as_deref(), Some("comp-seat-test"));
+        assert!(!argv.iter().any(|arg| arg == "--bus-service"));
+        assert!(parse(&["--nested", "--bus-service", "Comp"]).is_err());
+        assert!(parse(&["--nested", "--bus-service", "c"]).is_err());
+    }
+
+    #[cfg(not(feature = "bus"))]
+    #[test]
+    fn bus_service_flag_fails_clearly_without_the_feature() {
+        assert!(
+            parse(&["--nested", "--bus-service", "comp-test"])
+                .is_err_and(|error| error.contains("requires the compositor 'bus' feature"))
+        );
     }
 
     #[test]
@@ -1754,7 +1857,7 @@ mod tests {
 
     #[test]
     fn kms_live_arguments_are_delegated_to_the_pure_interlock() {
-        let ParseOutcome::KmsLive { argv } = parse(&[
+        let ParseOutcome::KmsLive { argv, .. } = parse(&[
             "kms-live",
             "--device",
             "/dev/dri/card0",
@@ -1782,7 +1885,7 @@ mod tests {
 
     #[test]
     fn misplaced_kms_live_is_still_delegated_for_a_stable_refusal() {
-        let ParseOutcome::KmsLive { argv } =
+        let ParseOutcome::KmsLive { argv, .. } =
             parse(&["--nested", "kms-live"]).expect("live intent must fail in the interlock")
         else {
             panic!("expected live interlock arguments");

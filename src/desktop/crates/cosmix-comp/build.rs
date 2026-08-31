@@ -1,6 +1,8 @@
 use std::env;
 
 fn main() {
+    cosmix_buildinfo::emit();
+
     // Cargo owns PROFILE for build-script processes and overwrites any parent
     // value. Keying only on the literal release profile means
     // CARGO_PROFILE_DEV_DEBUG_ASSERTIONS cannot authorise the live path. The

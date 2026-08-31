@@ -241,6 +241,31 @@ pub(crate) enum BindingProfile {
     KmsLive,
 }
 
+#[cfg(feature = "bus")]
+impl BindingProfile {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Nested => "nested",
+            Self::KmsLive => "kms-live",
+        }
+    }
+}
+
+#[cfg(feature = "bus")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BindingSnapshot {
+    pub(crate) enabled: bool,
+    pub(crate) profile: &'static str,
+    pub(crate) table: Vec<BindingSnapshotRow>,
+}
+
+#[cfg(feature = "bus")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BindingSnapshotRow {
+    pub(crate) chord: String,
+    pub(crate) action: &'static str,
+}
+
 /// One entry of the binding table.
 #[derive(Clone, Copy, Debug)]
 pub struct Binding {
@@ -382,6 +407,8 @@ pub enum KeyDisposition {
 pub struct BindingState {
     table: BindingTable,
     enabled: bool,
+    #[cfg(feature = "bus")]
+    profile: BindingProfile,
     /// Raw keycodes whose press we intercepted, awaiting their release.
     ///
     /// Wayland client focus changes deliberately do not clear this set: a new
@@ -397,6 +424,8 @@ impl BindingState {
         Self {
             table,
             enabled,
+            #[cfg(feature = "bus")]
+            profile: BindingProfile::Nested,
             intercepted: HashSet::new(),
         }
     }
@@ -408,7 +437,30 @@ impl BindingState {
     pub(crate) fn for_profile(profile: BindingProfile, enabled: bool) -> Self {
         match profile {
             BindingProfile::Nested => Self::phase1(enabled),
-            BindingProfile::KmsLive => Self::new(BindingTable::kms_live_defaults(), enabled),
+            BindingProfile::KmsLive => Self {
+                table: BindingTable::kms_live_defaults(),
+                enabled,
+                #[cfg(feature = "bus")]
+                profile,
+                intercepted: HashSet::new(),
+            },
+        }
+    }
+
+    #[cfg(feature = "bus")]
+    pub(crate) fn port_snapshot(&self) -> BindingSnapshot {
+        BindingSnapshot {
+            enabled: self.enabled,
+            profile: self.profile.name(),
+            table: self
+                .table
+                .bindings
+                .iter()
+                .map(|binding| BindingSnapshotRow {
+                    chord: binding_chord(binding),
+                    action: binding.action.name(),
+                })
+                .collect(),
         }
     }
 
@@ -530,6 +582,27 @@ impl BindingState {
         out.push_str("}\n");
         out
     }
+}
+
+#[cfg(feature = "bus")]
+fn binding_chord(binding: &Binding) -> String {
+    let mut parts = binding
+        .modifiers
+        .required
+        .names()
+        .into_iter()
+        .map(|name| match name {
+            "ctrl" => "Ctrl",
+            "alt" => "Alt",
+            "shift" => "Shift",
+            "logo" => "Super",
+            "iso_level3_shift" => "ISOLevel3Shift",
+            "iso_level5_shift" => "ISOLevel5Shift",
+            other => other,
+        })
+        .collect::<Vec<_>>();
+    parts.push(binding.keysym_name);
+    parts.join("+")
 }
 
 fn quoted_list(items: &[&str]) -> String {

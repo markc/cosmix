@@ -381,6 +381,8 @@ struct PreparedLiveOperation {
     scene_feed: Option<crate::protocol::ClientSceneFeed>,
     scene_mode: LiveSceneMode,
     decoration: DecorationStartup,
+    #[cfg(feature = "bus")]
+    bus_service: String,
     output_scale: OutputScale120,
     selected_output: Option<super::kms::SelectedOutput>,
     resume_mode: Option<super::kms::ConnectorMode>,
@@ -4033,22 +4035,23 @@ fn authorise_observed(
 /// verification, or retain the verified wrapper outside this module-owned
 /// operation boundary.
 #[cfg(all(feature = "kms-live", not(test)))]
-pub(crate) fn execute_live(grant: KmsLiveGrant) -> Result<(), KmsLiveError> {
-    match prepare_live_operation(&grant)? {
+pub(crate) fn execute_live(grant: KmsLiveGrant, bus_service: String) -> Result<(), KmsLiveError> {
+    match prepare_live_operation(&grant, bus_service)? {
         Some(prepared) => operate_verified(grant, prepared),
         None => Ok(()),
     }
 }
 
 #[cfg(any(not(feature = "kms-live"), test))]
-pub(crate) fn execute_live(grant: KmsLiveGrant) -> Result<(), KmsLiveError> {
-    let prepared = prepare_live_operation(&grant)?;
+pub(crate) fn execute_live(grant: KmsLiveGrant, bus_service: String) -> Result<(), KmsLiveError> {
+    let prepared = prepare_live_operation(&grant, bus_service)?;
     operate_verified(grant, prepared)
 }
 
 #[cfg(all(feature = "kms-live", not(test)))]
 fn prepare_live_operation(
     grant: &KmsLiveGrant,
+    bus_service: String,
 ) -> Result<Option<PreparedLiveOperation>, KmsLiveError> {
     let mut session = start_session_device_owner(grant.drm_device)?;
     let signals = LiveSignalWatcher::start(session.event_sender())?;
@@ -4137,6 +4140,8 @@ fn prepare_live_operation(
         scene_feed: None,
         scene_mode: grant.scene_mode,
         decoration: grant.decoration.clone(),
+        #[cfg(feature = "bus")]
+        bus_service,
         output_scale: grant.output_scale,
         selected_output: None,
         resume_mode: None,
@@ -4629,7 +4634,10 @@ fn build_session_device_owner(
 }
 
 #[cfg(any(not(feature = "kms-live"), test))]
-fn prepare_live_operation(_grant: &KmsLiveGrant) -> Result<PreparedLiveOperation, KmsLiveError> {
+fn prepare_live_operation(
+    _grant: &KmsLiveGrant,
+    _bus_service: String,
+) -> Result<PreparedLiveOperation, KmsLiveError> {
     Ok(PreparedLiveOperation)
 }
 
@@ -7725,6 +7733,29 @@ impl LiveActPlatform for PreparedLiveOperation {
         let input_source = session.input_source();
         let vt_switch_events = session.event_sender();
         let protocol_failure = session.fatal.clone();
+        #[cfg(feature = "bus")]
+        let mut runtime = crate::protocol::WaylandRuntime::new_with_input_source_production(
+            crate::DEFAULT_SOCKET,
+            super::BackendKind::Kms,
+            (target.bootstrap_extent.0, target.bootstrap_extent.1),
+            self.protocol_wiring
+                .take()
+                .expect("production preparation installs protocol GPU wiring"),
+            crate::protocol::WaylandRuntimePolicy {
+                keybindings_enabled: true,
+                explicit_sync_exposure_mode: crate::protocol::ExplicitSyncExposureMode::Production,
+                decoration: self.decoration.clone(),
+            },
+            crate::protocol::LiveInputWiring::new(input_source, move |vt| {
+                let _ = vt_switch_events.send(LiveCoordinatorEvent::VtSwitchRequested(vt));
+            }),
+            move || {
+                let _ = protocol_failure.send_revocation(LiveRevocation::ProtocolThreadStopped);
+            },
+            self.bus_service.clone(),
+        )
+        .map_err(|error| KmsLiveError::Setup(error.to_string()))?;
+        #[cfg(not(feature = "bus"))]
         let mut runtime = crate::protocol::WaylandRuntime::new_with_input_source(
             crate::DEFAULT_SOCKET,
             super::BackendKind::Kms,
@@ -7751,6 +7782,8 @@ impl LiveActPlatform for PreparedLiveOperation {
                 LIVE_TOPOLOGY_ACK_TIMEOUT,
             )
             .map_err(KmsLiveError::Setup)?;
+        #[cfg(feature = "bus")]
+        runtime.start_port().map_err(KmsLiveError::Setup)?;
         self.topology_client = Some(runtime.kms_topology_client());
         self.frame_clock = Some(runtime.client_frame_clock());
         self.security_reporter = Some(runtime.security_presentation_reporter());

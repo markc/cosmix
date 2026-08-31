@@ -36,6 +36,25 @@ const PROTOCOL_ACK_DEADLINE: Duration = Duration::from_secs(30);
 const EVENT_LOOP_PUMP_TIMEOUT: Duration = Duration::from_millis(10);
 const EVENT_LOOP_PUMP_LIMIT: usize = 200;
 
+#[cfg(feature = "bus")]
+fn snapshot_context(backend: &'static str) -> port_snapshot::SnapshotContext {
+    port_snapshot::SnapshotContext {
+        service: Arc::from(if backend == "kms" {
+            "comp"
+        } else {
+            "comp-nested"
+        }),
+        version: Arc::from("0.32.0-test"),
+        backend,
+        engine: "bevy-0.19/wgpu",
+        instance: Arc::from("protocol-fixture"),
+        decoration_enabled: true,
+        decoration_style: "mac",
+        broker: Arc::new(AtomicU8::new(port_snapshot::BROKER_CONNECTED)),
+        queue_depth: Arc::new(AtomicUsize::new(0)),
+    }
+}
+
 fn test_atomic_selection(
     connector_id: u32,
     mode: crate::backend::kms::ConnectorMode,
@@ -1264,6 +1283,32 @@ impl KeybindingHarness {
         Self::new_with_backend(keybindings_enabled, BackendKind::Winit)
     }
 
+    #[cfg(feature = "bus")]
+    fn new_with_port() -> (Self, crate::port::PortIngress) {
+        let context = Arc::new(snapshot_context("nested"));
+        let (port, ingress) = crate::port::test_wiring(context);
+        let harness = Self::new_with_protocol_capabilities_bindings_and_port(
+            true,
+            BackendKind::Winit,
+            test_retirement_adapter(),
+            DmabufCapabilities {
+                main_device: 0,
+                formats: vec![cosmix_wgpu_dmabuf::DmabufFormat {
+                    fourcc: smithay::backend::allocator::Fourcc::Argb8888 as u32,
+                    modifier: u64::from(smithay::backend::allocator::Modifier::Linear),
+                    plane_count: 1,
+                }],
+                adapter_name: "port-boundary-test".into(),
+                drm_adapter: synthetic_drm_adapter("port-boundary-test"),
+            },
+            ExplicitSyncExposureMode::Disabled,
+            BindingProfile::Nested,
+            None,
+            Some(port),
+        );
+        (harness, ingress)
+    }
+
     fn new_with_backend(keybindings_enabled: bool, backend_kind: BackendKind) -> Self {
         Self::new_with_backend_and_retirement_adapter(
             keybindings_enabled,
@@ -1434,6 +1479,30 @@ impl KeybindingHarness {
         binding_profile: BindingProfile,
         vt_switch_requested: Option<Box<dyn Fn(u8) + Send>>,
     ) -> Self {
+        Self::new_with_protocol_capabilities_bindings_and_port(
+            keybindings_enabled,
+            backend_kind,
+            retirement_adapter,
+            dmabuf_capabilities,
+            explicit_sync_exposure_mode,
+            binding_profile,
+            vt_switch_requested,
+            #[cfg(feature = "bus")]
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_protocol_capabilities_bindings_and_port(
+        keybindings_enabled: bool,
+        backend_kind: BackendKind,
+        retirement_adapter: Option<Box<dyn WaitForSubmittedWork>>,
+        dmabuf_capabilities: DmabufCapabilities,
+        explicit_sync_exposure_mode: ExplicitSyncExposureMode,
+        binding_profile: BindingProfile,
+        vt_switch_requested: Option<Box<dyn Fn(u8) + Send>>,
+        #[cfg(feature = "bus")] port: Option<crate::port::PortProtocolWiring>,
+    ) -> Self {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after Unix epoch")
@@ -1444,30 +1513,44 @@ impl KeybindingHarness {
         let (ecs_action_sender, ecs_actions) = mpsc::sync_channel(ECS_ACTION_QUEUE_CAPACITY);
         let (kms_render_command_sender, kms_commands) = mpsc::channel();
         let (input, input_source) = fake_input_source();
-        let server = ProtocolServer::new(
-            &socket_name,
-            BackendKind::Winit,
-            (320, 240),
-            WaylandGpuWiring {
-                dmabuf_capabilities: Some(dmabuf_capabilities),
-                dmabuf_validator: None,
-                retirement_adapter,
-            },
-            ProtocolServerBootstrap {
-                command_source,
-                event_sender,
-                ecs_action_sender,
-                kms_render_command_sender,
-                keybindings_enabled,
-                binding_profile,
-                vt_switch_requested,
-                explicit_sync_exposure_mode,
-                decoration: DecorationStartup::default(),
-                input_source: Some(input_source),
-                cursor_position: Arc::new(Mutex::new(CursorPositionSnapshot::default())),
-            },
-        )
-        .expect("construct in-process compositor state");
+        let gpu = WaylandGpuWiring {
+            dmabuf_capabilities: Some(dmabuf_capabilities),
+            dmabuf_validator: None,
+            retirement_adapter,
+        };
+        let bootstrap = ProtocolServerBootstrap {
+            command_source,
+            event_sender,
+            ecs_action_sender,
+            kms_render_command_sender,
+            keybindings_enabled,
+            binding_profile,
+            vt_switch_requested,
+            explicit_sync_exposure_mode,
+            decoration: DecorationStartup::default(),
+            input_source: Some(input_source),
+            cursor_position: Arc::new(Mutex::new(CursorPositionSnapshot::default())),
+        };
+        #[cfg(feature = "bus")]
+        let server = match port {
+            Some(port) => ProtocolServer::new_production(
+                &socket_name,
+                BackendKind::Winit,
+                (320, 240),
+                gpu,
+                bootstrap,
+                port,
+            ),
+            None => {
+                ProtocolServer::new(&socket_name, BackendKind::Winit, (320, 240), gpu, bootstrap)
+            }
+        };
+        #[cfg(not(feature = "bus"))]
+        let server =
+            ProtocolServer::new(&socket_name, BackendKind::Winit, (320, 240), gpu, bootstrap)
+                .expect("construct in-process compositor state");
+        #[cfg(feature = "bus")]
+        let server = server.expect("construct in-process compositor state");
         // This harness drives the server directly rather than through a runtime,
         // so there is no readiness channel for the startup report to travel on.
         // The report is exercised where it is consumed, in the tests that start
@@ -26747,6 +26830,171 @@ fn exclusive_layer_latch_survives_toplevel_click_then_releases_on_unmap() {
     assert_eq!(harness.server.state.exclusive_keyboard_focus, None);
 }
 
+#[cfg(feature = "bus")]
+#[test]
+fn port_snapshot_projects_protocol_roles_focus_stack_metadata_and_usable_output() {
+    const TOP_LEFT_RIGHT: u32 = 1 | 4 | 8;
+    let mut harness = KeybindingHarness::new(true);
+    let _pointer = harness.bind_pointer();
+    let _ = harness.sync();
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_ID,
+        2,
+        &wire_string_argument("Snapshot terminal"),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_ID,
+        3,
+        &wire_string_argument("org.cosmix.Snapshot"),
+    );
+    map_initial_test_toplevel(&mut harness);
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            size: (0, 30),
+            anchor: TOP_LEFT_RIGHT,
+            exclusive_zone: 30,
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    let popup_wire = map_test_layer_popup(&mut harness, layer);
+    harness.server.state.resize_output(400, 300);
+    route_pointer_to(&mut harness, 10.0, 10.0);
+    let _ = harness.sync();
+
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &snapshot_context("nested"));
+    assert_eq!(snapshot.info.service.as_ref(), "comp-nested");
+    assert_eq!(snapshot.info.backend, "nested");
+    assert_eq!(snapshot.port.level, "L1");
+    assert_eq!(snapshot.port.event_seq, 0);
+    assert_eq!(snapshot.port.lost_count, 0);
+    let output = snapshot
+        .outputs
+        .values()
+        .next()
+        .expect("nested output is present");
+    assert!(output.default);
+    assert_eq!(output.usable.y, 30.0);
+    assert_eq!(output.usable.height, 270.0);
+
+    let toplevel = snapshot
+        .surfaces
+        .values()
+        .find(|surface| surface.role == "toplevel")
+        .expect("toplevel projected");
+    assert!(toplevel.mapped);
+    assert!(toplevel.visible);
+    assert_eq!(toplevel.band, "normal");
+    assert_eq!(toplevel.title.as_deref(), Some("Snapshot terminal"));
+    assert_eq!(toplevel.app_id.as_deref(), Some("org.cosmix.Snapshot"));
+    assert!(toplevel.foreign_id.is_some());
+    assert_eq!(toplevel.focused, toplevel.activated);
+    assert!(toplevel.output.is_some());
+
+    let layer = snapshot
+        .surfaces
+        .values()
+        .find(|surface| surface.id == test_layer_record(&harness, layer.surface).id.0)
+        .expect("layer projected");
+    assert_eq!(layer.role, "layer");
+    assert_eq!(layer.band, "top");
+    assert!(layer.sequence > 0);
+    assert_eq!(layer.tree_index, 0);
+    let layer_meta = layer.layer.as_ref().expect("layer metadata projected");
+    assert_eq!(layer_meta.stratum, "top");
+    assert_eq!(layer_meta.interactivity, "exclusive");
+    assert_eq!(layer_meta.exclusive_zone, 30);
+    assert_eq!(layer_meta.binding, "default");
+
+    let popup = snapshot
+        .surfaces
+        .values()
+        .find(|surface| surface.id == test_layer_record(&harness, popup_wire.surface).id.0)
+        .expect("popup projected");
+    assert_eq!(popup.role, "popup");
+    assert!(popup.mapped);
+    assert!(popup.visible);
+    assert_eq!(popup.band, "top");
+    assert_eq!(popup.parent, Some(layer.id));
+    let popup_record = test_layer_record(&harness, popup_wire.surface);
+    assert_eq!(popup.sequence, popup_record.layout.z.sequence);
+    assert_eq!(popup.tree_index, popup_record.layout.z.tree_index);
+    assert_eq!(popup.output, layer.output);
+
+    let subsurface = snapshot
+        .surfaces
+        .values()
+        .find(|surface| surface.role == "subsurface")
+        .expect("unmapped subsurface projected");
+    assert!(!subsurface.mapped);
+    assert!(!subsurface.visible);
+    assert_eq!(subsurface.parent, Some(toplevel.id));
+    assert_eq!(subsurface.output, toplevel.output);
+
+    let projected = snapshot
+        .windows
+        .get(&format!("s{}", toplevel.id))
+        .expect("mapped toplevel appears in windows projection");
+    assert_eq!(projected.title, toplevel.title);
+    assert_eq!(projected.app_id, toplevel.app_id);
+    assert_eq!(projected.foreign_id, toplevel.foreign_id);
+    assert_eq!(snapshot.stack.first(), Some(&layer.id));
+    assert!(snapshot.stack.contains(&toplevel.id));
+    assert_eq!(snapshot.focus.keyboard, Some(layer.id));
+    assert_eq!(snapshot.focus.exclusive_latch, Some(layer.id));
+    assert_eq!(snapshot.focus.pointer, Some(popup.id));
+    assert_eq!(snapshot.focus.pointer_grab, "none");
+    assert_eq!(snapshot.decoration.style, "mac");
+    assert_eq!(snapshot.bindings.profile, "nested");
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn port_boundary_caps_sixteen_shares_one_snapshot_and_sees_same_dispatch_commits() {
+    let (mut harness, ingress) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_ID,
+        2,
+        &wire_string_argument("same-dispatch title"),
+    );
+
+    let mut replies = Vec::new();
+    for _ in 0..16 {
+        replies.push(ingress.request_snapshot().expect("request admitted"));
+    }
+    assert!(ingress.request_snapshot().is_err(), "seventeenth is busy");
+    assert_eq!(ingress.depth_for_test(), 16);
+
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("one converged dispatch services the port batch");
+    let snapshots = replies
+        .into_iter()
+        .map(|reply| reply.blocking_recv().expect("snapshot reply"))
+        .collect::<Vec<_>>();
+    for snapshot in &snapshots[1..] {
+        assert!(Arc::ptr_eq(&snapshots[0], snapshot));
+    }
+    let toplevel = snapshots[0]
+        .surfaces
+        .values()
+        .find(|surface| surface.role == "toplevel")
+        .expect("toplevel in shared snapshot");
+    assert_eq!(toplevel.title.as_deref(), Some("same-dispatch title"));
+
+    for _ in 0..16 {
+        ingress.release_test_admission();
+    }
+    assert_eq!(ingress.depth_for_test(), 0);
+}
+
 #[test]
 fn exclusive_layer_dismisses_an_existing_toplevel_popup_keyboard_grab() {
     const TOP_LEFT: u32 = 1 | 4;
@@ -27863,6 +28111,18 @@ fn kms_mode_change_arranges_layers_before_reconfiguring_maximized_windows() {
         .backend
         .reconcile_kms_client_output::<WaylandState>(&display, &[]);
     harness.server.state.reconcile_layer_output_bindings();
+
+    #[cfg(feature = "bus")]
+    {
+        let port = port_snapshot::snapshot(&harness.server.state, &snapshot_context("kms"));
+        let (key, output) = port.outputs.iter().next().expect("KMS output projected");
+        assert_eq!(key, "o_mode_change_1");
+        assert_eq!(output.name, "Mode-change-1");
+        assert_eq!((output.width, output.height), (320, 240));
+        assert_eq!(output.refresh_mhz, 60_000);
+        assert_eq!(port.info.service.as_ref(), "comp");
+        assert_eq!(port.info.backend, "kms");
+    }
 
     map_initial_test_toplevel(&mut harness);
     const TOP_LEFT_RIGHT: u32 = 1 | 4 | 8;
@@ -30581,6 +30841,21 @@ fn session_lock_acked_buffer_maps_in_lock_band_above_overlay() {
         test_layer_record(&harness, overlay.surface).layout.z < lock_record.layout.z,
         "lock band sorts above Overlay"
     );
+    #[cfg(feature = "bus")]
+    {
+        let snapshot = port_snapshot::snapshot(&harness.server.state, &snapshot_context("nested"));
+        let lock = snapshot
+            .surfaces
+            .values()
+            .find(|surface| surface.role == "lock")
+            .expect("lock role projected");
+        assert!(lock.mapped);
+        assert!(lock.visible);
+        assert_eq!(lock.band, "lock");
+        assert!(lock.output.is_some());
+        assert_eq!(snapshot.stack.first(), Some(&lock.id));
+        assert!(lock.layer.is_none());
+    }
 }
 
 #[test]

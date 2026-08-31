@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cosmix_bus::bus::{self, BusMessage};
-use cosmix_client::{ConnState, SupervisedClient};
+use cosmix_client::{ConnState, NameCollision, NodedClient, SupervisedClient};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify};
@@ -118,6 +118,12 @@ fn reply(req: &BusMessage, rc: &str) -> String {
     m.to_wire()
 }
 
+fn collision_reply(req: &BusMessage) -> String {
+    let mut response = bus::parse(&reply(req, "10")).expect("stub reply parses");
+    response.set("error", "stub collision diagnostic wording");
+    response.to_wire()
+}
+
 async fn run_stub(listener: TcpListener, stub: Arc<Stub>) {
     while let Ok((tcp, _)) = listener.accept().await {
         let stub = stub.clone();
@@ -185,9 +191,8 @@ async fn run_stub(listener: TcpListener, stub: Arc<Stub>) {
                                 }
                             }
                         };
-                        let rc = if collision { "10" } else { "0" };
-                        let _ = sink.send(Message::Text(reply(&req, rc).into())).await;
                         if collision {
+                            let _ = sink.send(Message::Text(collision_reply(&req).into())).await;
                             // KEEP the connection open (real noded
                             // behavior). The client's `connect()` sees
                             // rc=10, fails register, and must `close()`
@@ -197,6 +202,7 @@ async fn run_stub(listener: TcpListener, stub: Arc<Stub>) {
                             // regression assertion).
                             continue;
                         }
+                        let _ = sink.send(Message::Text(reply(&req, "0").into())).await;
                         // On the *reconnected* socket, push an
                         // unsolicited request AFTER re-register: it must
                         // surface on the SAME incoming receiver the test
@@ -287,6 +293,7 @@ async fn reconnects_reregisters_replays_and_keeps_incoming_stream() {
         .expect("initial connect");
     assert_eq!(client.state(), ConnState::Connected);
     assert_eq!(client.connection_generation(), 1);
+    let mut states = client.subscribe_state();
 
     // Take the outward incoming stream BEFORE the bounce — it must
     // survive the reconnect.
@@ -314,32 +321,26 @@ async fn reconnects_reregisters_replays_and_keeps_incoming_stream() {
     }
 
     // Induce the bounce.
-    stub.drop_conn1.notify_waiters();
+    // `notify_one` retains a permit if the connection task is between loop
+    // iterations. `notify_waiters` would lose this bounce in that window.
+    stub.drop_conn1.notify_one();
 
-    // Supervisor must reconnect (connection #2) and re-register.
-    let stub2 = stub.clone();
-    assert!(
-        wait_until(10, || {
-            stub2
-                .state
-                .try_lock()
-                .map(|s| s.connections >= 2 && s.register_names.len() >= 2)
-                .unwrap_or(false)
-        })
-        .await,
-        "expected a reconnect with re-registration"
-    );
-
-    // Back to Connected, and the registry was replayed in recorded
-    // order on the new connection.
-    assert!(
-        wait_until(5, || client.state() == ConnState::Connected).await,
-        "state should return to Connected"
-    );
-    assert!(
-        wait_until(5, || client.connection_generation() >= 2).await,
-        "successful reconnect must advance the connection generation"
-    );
+    // Wait on the supervisor's explicit state edge rather than racing it with
+    // wall-clock polling. The generation advances immediately before the
+    // Connected publication, so this also proves re-registration and replay
+    // completed on connection #2.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            states.changed().await.expect("state sender remains live");
+            if *states.borrow_and_update() == ConnState::Connected
+                && client.connection_generation() >= 2
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("expected a reconnect with re-registration and replay");
     {
         let s = stub.state.lock().await;
         assert_eq!(
@@ -384,14 +385,8 @@ async fn reconnects_reregisters_replays_and_keeps_incoming_stream() {
     // Graceful deregister: stops the supervisor and issues the RPC.
     client.deregister().await.expect("deregister");
     assert!(
-        wait_until(5, || {
-            stub.state
-                .try_lock()
-                .map(|s| s.deregistered)
-                .unwrap_or(false)
-        })
-        .await,
-        "broker must observe noded.deregister"
+        stub.state.lock().await.deregistered,
+        "broker must observe noded.deregister before replying"
     );
     assert_eq!(client.state(), ConnState::ShuttingDown);
 }
@@ -435,7 +430,7 @@ async fn reconnect_resends_provenance() {
     }
 
     // Bounce → reconnect → the SECOND register must carry it too.
-    stub.drop_conn1.notify_waiters();
+    stub.drop_conn1.notify_one();
     let stub2 = stub.clone();
     assert!(
         wait_until(10, || {
@@ -482,6 +477,67 @@ async fn initial_connect_failure_is_typed_fatal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registration_collision_preserves_typed_cause() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stub = Stub::new(false, false);
+    tokio::spawn(run_stub(listener, stub));
+
+    let url = format!("ws://127.0.0.1:{port}/ws");
+    let owner = NodedClient::connect("taken-service", &url)
+        .await
+        .expect("first registration owns the name");
+    let error = match NodedClient::connect("taken-service", &url).await {
+        Ok(_) => panic!("duplicate registration must fail"),
+        Err(error) => error,
+    };
+    let collision = error
+        .downcast_ref::<NameCollision>()
+        .expect("registration error keeps a typed NameCollision cause");
+    assert_eq!(collision.service(), "taken-service");
+
+    owner.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_state_watch_publishes_disconnect_and_reconnect_edges() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let stub = Stub::new(false, false);
+    let acceptor = tokio::spawn(run_stub(listener, stub.clone()));
+
+    let url = format!("ws://{address}/ws");
+    let client = SupervisedClient::connect_supervised("watched-service", &url)
+        .await
+        .expect("initial connect");
+    let mut states = client.subscribe_state();
+    assert_eq!(*states.borrow(), ConnState::Connected);
+
+    acceptor.abort();
+    stub.drop_conn1.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), states.changed())
+        .await
+        .expect("disconnect edge timeout")
+        .expect("state sender remains live");
+    assert_eq!(*states.borrow_and_update(), ConnState::Disconnected);
+
+    let listener = TcpListener::bind(address)
+        .await
+        .expect("restart stub broker on the same address");
+    tokio::spawn(run_stub(listener, stub));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            states.changed().await.expect("state sender remains live");
+            if *states.borrow_and_update() == ConnState::Connected {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("reconnect edge timeout");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn outbound_while_disconnected_fails_fast_typed() {
     // Bring up, then permanently kill the broker; the next outbound
     // call must fail fast with the typed Disconnected error — no queue.
@@ -497,7 +553,7 @@ async fn outbound_while_disconnected_fails_fast_typed() {
 
     // Drop conn1 and stop accepting (abort the listener task) so the
     // supervisor can never reconnect — steady-state Disconnected.
-    stub.drop_conn1.notify_waiters();
+    stub.drop_conn1.notify_one();
     handle.abort();
 
     assert!(
@@ -696,7 +752,7 @@ async fn subscribe_while_disconnected_fails_fast() {
         .await
         .expect("initial connect");
 
-    stub.drop_conn1.notify_waiters();
+    stub.drop_conn1.notify_one();
     handle.abort();
     assert!(
         wait_until(10, || client.state() == ConnState::Disconnected).await,
@@ -739,7 +795,7 @@ async fn replay_failure_keeps_disconnected_no_false_connected() {
         .subscription_registry()
         .record("world.statecache.probe");
 
-    stub.drop_conn1.notify_waiters();
+    stub.drop_conn1.notify_one();
 
     // The supervisor must reconnect AND attempt replay repeatedly — each
     // rejected — without ever flipping to Connected.
@@ -774,24 +830,20 @@ async fn replay_failure_keeps_disconnected_no_false_connected() {
     );
 }
 
-/// MAJOR regression (Codex round 3): a failed `noded.register` on a
-/// reconnect must not leak the detached reader task / socket.
+/// A typed name collision during reconnect is terminal and must not leak the
+/// detached reader task / socket.
 ///
 /// Real `cosmix-noded` answers a name collision with rc=10 but KEEPS
 /// the connection open (it does not hang up). `NodedClient::connect()`
 /// spawns the reader task *before* calling `register()`, so a bare
 /// `?` early-return on register failure would drop the `NodedClient`
-/// while the detached reader keeps the socket alive — an unbounded
-/// supervisor retry against a persistent register failure would then
-/// accumulate live broker connections + reader tasks. `connect()`
-/// must `close()` the half-built client before returning the error.
+/// while the detached reader keeps the socket alive. `connect()` must close
+/// the half-built client, and the supervisor must publish `Fatal` rather than
+/// retry or rename the citizen.
 ///
-/// The stub rejects every reconnect `noded.register` (rc=10, socket
-/// kept open). The load-bearing assertion is that `open_connections`
-/// stays bounded while cumulative `connections` climbs — with the
-/// leak it would track `connections` 1:1.
+/// The stub rejects the reconnect `noded.register` (rc=10, socket kept open).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_register_on_reconnect_does_not_leak_sockets() {
+async fn reconnect_name_collision_is_terminal_without_rename_or_leak() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let stub = Stub::new(false, true); // reject noded.register on conn ≥ 2
@@ -802,35 +854,38 @@ async fn failed_register_on_reconnect_does_not_leak_sockets() {
         .await
         .expect("initial connect (conn 1) registers fine");
     let _incoming = client.incoming().expect("incoming taken once");
+    let mut states = client.subscribe_state();
 
-    stub.drop_conn1.notify_waiters();
+    stub.drop_conn1.notify_one();
 
-    // Every reconnect's register is rejected (rc=10, conn kept open by
-    // the stub), so `connect()` fails and must `close()` the half-built
-    // client. Cumulative connections climb across retry attempts.
-    let stub2 = stub.clone();
-    assert!(
-        wait_until(10, || {
-            stub2
-                .state
-                .try_lock()
-                .map(|s| s.connections >= 4)
-                .unwrap_or(false)
-        })
-        .await,
-        "supervisor must keep retrying connect+register"
-    );
-
-    // Registration never succeeds on reconnect → never Connected.
-    assert_ne!(client.state(), ConnState::Connected);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            states.changed().await.expect("state sender remains live");
+            if *states.borrow_and_update() == ConnState::Fatal {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("typed collision must publish a terminal state");
+    assert_eq!(client.state(), ConnState::Fatal);
 
     // Let any in-flight teardown settle, then assert the leak is
     // absent: failed reconnects must NOT accumulate open sockets /
     // reader tasks. With the leak, `open_connections` ≈ `connections`.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let s = stub.state.lock().await;
+    assert_eq!(s.connections, 2, "collision must not be retried");
+    assert_eq!(
+        s.register_names,
+        vec![
+            "cosmix-statecache".to_string(),
+            "cosmix-statecache".to_string()
+        ],
+        "collision must not silently rename the service"
+    );
     assert!(
-        s.open_connections <= 2,
+        s.open_connections <= 1,
         "failed-register reconnects leaked sockets: {} open of {} total",
         s.open_connections,
         s.connections

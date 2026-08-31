@@ -138,6 +138,7 @@ impl CompositorHandler for WaylandState {
             record.layout.parent = parent_id;
             record.layout.toplevel = None;
             record.title = None;
+            record.app_id = None;
             // Deliberately *not* `record.layout.visible = false`. The
             // `recompute_effective_visibility` below acts only on a *change*,
             // so clearing the flag by hand hides the true -> false transition
@@ -178,6 +179,7 @@ impl CompositorHandler for WaylandState {
                     mapped: false,
                     layout,
                     title: None,
+                    app_id: None,
                     window_origin: (x, y),
                     configured_size: (1, 1),
                     commit_count: 0,
@@ -713,6 +715,7 @@ impl WlrLayerShellHandler for WaylandState {
             record.mapped = false;
             record.layout = layout;
             record.title = None;
+            record.app_id = None;
             record.window_origin = (layout.x, layout.y);
             record.configured_size = (1, 1);
             record.required_configure = None;
@@ -743,6 +746,7 @@ impl WlrLayerShellHandler for WaylandState {
                     mapped: false,
                     layout,
                     title: None,
+                    app_id: None,
                     window_origin: (layout.x, layout.y),
                     configured_size: (1, 1),
                     commit_count: 0,
@@ -909,6 +913,7 @@ impl XdgShellHandler for WaylandState {
             record.mapped = false;
             record.layout = layout;
             record.title = None;
+            record.app_id = None;
             record.window_origin = (layout.x, layout.y);
             record.configured_size = configured_size;
             record.required_configure = None;
@@ -939,6 +944,7 @@ impl XdgShellHandler for WaylandState {
                     mapped: false,
                     layout,
                     title: None,
+                    app_id: None,
                     window_origin: (layout.x, layout.y),
                     configured_size,
                     commit_count: 0,
@@ -1014,7 +1020,33 @@ impl XdgShellHandler for WaylandState {
         }
     }
 
-    fn app_id_changed(&mut self, _surface: ToplevelSurface) {}
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        let app_id = compositor::with_states(surface.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .and_then(|data| {
+                    data.lock()
+                        .ok()?
+                        .app_id
+                        .as_deref()
+                        .map(capped_toplevel_title)
+                })
+        });
+        let changed = self
+            .surfaces
+            .get_mut(&surface.wl_surface().id())
+            .is_some_and(|record| {
+                if record.app_id == app_id {
+                    return false;
+                }
+                record.app_id = app_id;
+                true
+            });
+        if changed {
+            self.sync_foreign_toplevel(surface.wl_surface());
+        }
+    }
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
         self.retire_unadopted_roleless_buffer(surface.wl_surface());
@@ -1082,6 +1114,7 @@ impl XdgShellHandler for WaylandState {
             record.mapped = false;
             record.layout = layout;
             record.title = None;
+            record.app_id = None;
             record.window_origin = window_origin;
             record.configured_size = (geometry.size.w, geometry.size.h);
             record.required_configure = None;
@@ -1112,6 +1145,7 @@ impl XdgShellHandler for WaylandState {
                     mapped: false,
                     layout,
                     title: None,
+                    app_id: None,
                     window_origin,
                     configured_size: (geometry.size.w, geometry.size.h),
                     commit_count: 0,
@@ -1572,6 +1606,7 @@ impl SessionLockHandler for WaylandState {
             record.mapped = false;
             record.layout = layout;
             record.title = None;
+            record.app_id = None;
             record.window_origin = (layout.x, layout.y);
             record.configured_size = (width as i32, height as i32);
             record.required_configure = None;
@@ -1602,6 +1637,7 @@ impl SessionLockHandler for WaylandState {
                     mapped: false,
                     layout,
                     title: None,
+                    app_id: None,
                     window_origin: (layout.x, layout.y),
                     configured_size: (width as i32, height as i32),
                     commit_count: 0,

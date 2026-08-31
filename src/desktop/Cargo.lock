@@ -2531,16 +2531,23 @@ version = "0.32.0"
 dependencies = [
  "bevy",
  "cosmix-deco",
+ "cosmix-lib-buildinfo",
+ "cosmix-lib-client",
+ "cosmix-lib-config",
+ "cosmix-lib-props-core",
  "cosmix-wgpu-dmabuf",
  "drm-fourcc",
  "fontique",
  "getrandom 0.4.3",
  "image",
  "libc",
+ "serde",
+ "serde_json",
  "signal-hook",
  "smithay",
  "smithay-client-toolkit",
  "static_assertions",
+ "tokio",
  "tracing",
  "unicode-segmentation",
  "wayland-client",
@@ -2611,7 +2618,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-client"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",

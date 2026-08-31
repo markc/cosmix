@@ -60,6 +60,20 @@ pub(crate) struct SeatRegion {
     pub(crate) height: f64,
 }
 
+#[cfg(feature = "bus")]
+#[derive(Clone)]
+pub(crate) struct PortOutputSource {
+    pub(crate) output: Output,
+    pub(crate) name: String,
+    pub(crate) default: bool,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) scale: f64,
+    pub(crate) refresh_mhz: u32,
+}
+
 pub(crate) enum BackendData {
     Winit(WinitBackendData),
     Kms(KmsBackendData),
@@ -121,6 +135,63 @@ impl BackendData {
         match self {
             Self::Winit(data) => Some(data.output.clone()),
             Self::Kms(data) => data.default_output(),
+        }
+    }
+
+    /// Owned facts for the protocol-visible output tree.
+    ///
+    /// P-0 exposes one client output, but this returns a vector so the read
+    /// surface does not need another backend seam when KMS grows multi-output
+    /// client globals.
+    #[cfg(feature = "bus")]
+    pub(crate) fn port_outputs(&self) -> Vec<PortOutputSource> {
+        let default = self.default_output();
+        match self {
+            Self::Winit(data) => {
+                let refresh_mhz = match u32::try_from(data.output_mode.refresh) {
+                    Ok(refresh) => refresh,
+                    Err(_) => return Vec::new(),
+                };
+                vec![PortOutputSource {
+                    output: data.output.clone(),
+                    name: data.output.name(),
+                    default: default.as_ref() == Some(&data.output),
+                    x: 0,
+                    y: 0,
+                    width: data.output_size.0,
+                    height: data.output_size.1,
+                    scale: data.output_scale,
+                    refresh_mhz,
+                }]
+            }
+            Self::Kms(data) => {
+                #[cfg(any(all(feature = "kms-live", not(test)), test))]
+                {
+                    data.client_outputs
+                        .outputs
+                        .values()
+                        .filter_map(|source| {
+                            let selected = &source.selected;
+                            Some(PortOutputSource {
+                                output: source.output.clone(),
+                                name: selected.key.connector_name.clone(),
+                                default: default.as_ref() == Some(&source.output),
+                                x: selected.logical_rect.x,
+                                y: selected.logical_rect.y,
+                                width: u32::try_from(selected.logical_rect.width).ok()?,
+                                height: u32::try_from(selected.logical_rect.height).ok()?,
+                                scale: selected.output_scale.as_f64(),
+                                refresh_mhz: selected.connector_mode.refresh_millihz,
+                            })
+                        })
+                        .collect()
+                }
+                #[cfg(not(any(all(feature = "kms-live", not(test)), test)))]
+                {
+                    let _ = data;
+                    Vec::new()
+                }
+            }
         }
     }
 

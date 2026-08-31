@@ -35,13 +35,13 @@
 //! but the machinery is exercised by the reconnect test.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rand::Rng;
 use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc, watch};
 
-use crate::native::NodedClient;
+use crate::native::{NameCollision, NodedClient};
 use crate::types::IncomingCommand;
 
 /// Bounded attempt budget for the *initial* connect+register. Exhausting
@@ -78,10 +78,9 @@ fn backoff_delay(attempt: u32) -> Duration {
     Duration::from_millis(ms)
 }
 
-/// Connection lifecycle state. Stored as an [`AtomicU8`] so the outbound
-/// fail-fast gate is a lock-free load on the hot path.
+/// Connection lifecycle state. The watch channel is also the sampled state
+/// authority, so edge-triggered and sampled consumers cannot diverge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum ConnState {
     /// Initial connect in progress (pre-`Connected`).
     Connecting = 0,
@@ -94,18 +93,6 @@ pub enum ConnState {
     ShuttingDown = 3,
     /// Initial connect budget exhausted — terminal.
     Fatal = 4,
-}
-
-impl ConnState {
-    fn from_u8(v: u8) -> ConnState {
-        match v {
-            0 => ConnState::Connecting,
-            1 => ConnState::Connected,
-            2 => ConnState::Disconnected,
-            3 => ConnState::ShuttingDown,
-            _ => ConnState::Fatal,
-        }
-    }
 }
 
 /// Typed error surface for the supervised client.
@@ -243,7 +230,10 @@ pub struct SupervisedClient {
     /// supervisor on reconnect; read-locked + `Arc`-cloned by outbound
     /// proxies so the network await never holds the lock.
     inner: Arc<RwLock<Arc<NodedClient>>>,
-    state: Arc<AtomicU8>,
+    /// Publishes connection-state transitions without sampling.
+    state_tx: watch::Sender<ConnState>,
+    /// Serialises terminal-state checks and watch publication.
+    state_publish: Arc<std::sync::Mutex<()>>,
     /// Monotonic successful-connection generation. Starts at one for the
     /// initial connection and increments after every complete reconnect and
     /// subscription replay, so consumers cannot sample away a fast bounce.
@@ -281,7 +271,8 @@ impl SupervisedClient {
         noded_url: &str,
         provenance: Option<cosmix_bus::RegisterProvenance>,
     ) -> Result<SupervisedClient, SupervisedError> {
-        let state = Arc::new(AtomicU8::new(ConnState::Connecting as u8));
+        let (state_tx, _) = watch::channel(ConnState::Connecting);
+        let state_publish = Arc::new(std::sync::Mutex::new(()));
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut client: Option<NodedClient> = None;
@@ -301,6 +292,13 @@ impl SupervisedClient {
                         error = %e,
                         "initial broker connect attempt failed"
                     );
+                    if e.downcast_ref::<NameCollision>().is_some() {
+                        publish_state(&state_tx, &state_publish, ConnState::Fatal);
+                        return Err(SupervisedError::InitialConnectFailed {
+                            attempts: attempt + 1,
+                            source: e,
+                        });
+                    }
                     last_err = Some(e);
                     // No sleep after the final attempt — fail fast.
                     if attempt + 1 < MAX_INITIAL_ATTEMPTS {
@@ -313,7 +311,7 @@ impl SupervisedClient {
         let client = match client {
             Some(c) => c,
             None => {
-                state.store(ConnState::Fatal as u8, Ordering::SeqCst);
+                publish_state(&state_tx, &state_publish, ConnState::Fatal);
                 return Err(SupervisedError::InitialConnectFailed {
                     attempts: MAX_INITIAL_ATTEMPTS,
                     source: last_err
@@ -334,7 +332,7 @@ impl SupervisedClient {
         })?;
 
         let inner = Arc::new(RwLock::new(Arc::new(client)));
-        state.store(ConnState::Connected as u8, Ordering::SeqCst);
+        publish_state(&state_tx, &state_publish, ConnState::Connected);
         let connection_generation = Arc::new(AtomicU64::new(1));
 
         let (out_tx, out_rx) = mpsc::unbounded_channel();
@@ -348,7 +346,8 @@ impl SupervisedClient {
 
         let supervisor = tokio::spawn(supervisor_loop(SupervisorCtx {
             inner: inner.clone(),
-            state: state.clone(),
+            state_tx: state_tx.clone(),
+            state_publish: state_publish.clone(),
             connection_generation: connection_generation.clone(),
             registry: registry.clone(),
             out_tx,
@@ -361,7 +360,8 @@ impl SupervisedClient {
 
         Ok(SupervisedClient {
             inner,
-            state,
+            state_tx,
+            state_publish,
             connection_generation,
             registry,
             incoming_rx: std::sync::Mutex::new(Some(out_rx)),
@@ -388,7 +388,15 @@ impl SupervisedClient {
 
     /// Current connection state.
     pub fn state(&self) -> ConnState {
-        ConnState::from_u8(self.state.load(Ordering::SeqCst))
+        *self.state_tx.borrow()
+    }
+
+    /// Subscribe to connection-state transitions.
+    ///
+    /// The receiver starts at the current state and is notified directly by
+    /// the supervisor on every edge; callers do not need to poll [`state`].
+    pub fn subscribe_state(&self) -> watch::Receiver<ConnState> {
+        self.state_tx.subscribe()
     }
 
     /// Monotonic generation of fully established connections.
@@ -693,8 +701,7 @@ impl SupervisedClient {
     /// `Drop` and as the defensive stop; WS5's graceful path uses
     /// [`deregister`](Self::deregister).
     pub async fn shutdown(&self) {
-        self.state
-            .store(ConnState::ShuttingDown as u8, Ordering::SeqCst);
+        publish_state(&self.state_tx, &self.state_publish, ConnState::ShuttingDown);
         let _ = self.shutdown_tx.send(true);
         if let Some(handle) = self.supervisor.lock().await.take() {
             let _ = handle.await;
@@ -710,8 +717,7 @@ impl SupervisedClient {
     /// [`SupervisedError::Disconnected`] — the caller (WS5) treats that
     /// as "already gone, proceed to exit".
     pub async fn deregister(&self) -> Result<(), SupervisedError> {
-        self.state
-            .store(ConnState::ShuttingDown as u8, Ordering::SeqCst);
+        publish_state(&self.state_tx, &self.state_publish, ConnState::ShuttingDown);
         let _ = self.shutdown_tx.send(true);
         // Join the supervisor FIRST. Once `handle.await` returns the
         // supervisor is definitively dead and `inner` can no longer be
@@ -744,6 +750,7 @@ impl Drop for SupervisedClient {
         // handle is dropped without an explicit shutdown. The supervisor
         // also notices `out_tx` send failure once traffic flows, but an
         // idle reconnect loop would otherwise leak.
+        publish_state(&self.state_tx, &self.state_publish, ConnState::ShuttingDown);
         let _ = self.shutdown_tx.send(true);
     }
 }
@@ -751,7 +758,8 @@ impl Drop for SupervisedClient {
 /// Everything the detached supervisor task owns.
 struct SupervisorCtx {
     inner: Arc<RwLock<Arc<NodedClient>>>,
-    state: Arc<AtomicU8>,
+    state_tx: watch::Sender<ConnState>,
+    state_publish: Arc<std::sync::Mutex<()>>,
     connection_generation: Arc<AtomicU64>,
     registry: SubscriptionRegistry,
     out_tx: mpsc::UnboundedSender<IncomingCommand>,
@@ -769,6 +777,23 @@ struct SupervisorCtx {
 /// `SupervisedClient` — and thus the watch sender — was dropped).
 fn stop_requested(rx: &watch::Receiver<bool>) -> bool {
     *rx.borrow()
+}
+
+fn publish_state(
+    state_tx: &watch::Sender<ConnState>,
+    state_publish: &std::sync::Mutex<()>,
+    next: ConnState,
+) {
+    let _publish = state_publish
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = *state_tx.borrow();
+    if matches!(previous, ConnState::ShuttingDown | ConnState::Fatal) {
+        return;
+    }
+    if previous != next {
+        state_tx.send_replace(next);
+    }
 }
 
 async fn supervisor_loop(mut ctx: SupervisorCtx) {
@@ -816,8 +841,7 @@ async fn supervisor_loop(mut ctx: SupervisorCtx) {
 
         // ── Reconnect phase: unbounded backoff (resident citizen waits
         // out a long broker outage; systemd not flapped). ──
-        ctx.state
-            .store(ConnState::Disconnected as u8, Ordering::SeqCst);
+        publish_state(&ctx.state_tx, &ctx.state_publish, ConnState::Disconnected);
         let down_since = Instant::now();
         tracing::warn!(
             event = "supervised_disconnect",
@@ -921,8 +945,7 @@ async fn supervisor_loop(mut ctx: SupervisorCtx) {
                             }
                             *ctx.inner.write().await = Arc::new(client);
                             ctx.connection_generation.fetch_add(1, Ordering::SeqCst);
-                            ctx.state
-                                .store(ConnState::Connected as u8, Ordering::SeqCst);
+                            publish_state(&ctx.state_tx, &ctx.state_publish, ConnState::Connected);
                             tracing::info!(
                                 event = "supervised_reconnect",
                                 service = %ctx.service_name,
@@ -951,6 +974,16 @@ async fn supervisor_loop(mut ctx: SupervisorCtx) {
                     }
                 }
                 Err(e) => {
+                    if e.downcast_ref::<NameCollision>().is_some() {
+                        publish_state(&ctx.state_tx, &ctx.state_publish, ConnState::Fatal);
+                        tracing::debug!(
+                            event = "supervised_name_collision",
+                            service = %ctx.service_name,
+                            error = %e,
+                            "service registration collided during reconnect; supervisor stopped"
+                        );
+                        return;
+                    }
                     tracing::debug!(
                         event = "supervised_reconnect_attempt_failed",
                         service = %ctx.service_name,
@@ -1055,5 +1088,26 @@ mod tests {
         };
         assert!(fatal.to_string().contains("5 attempt"));
         assert!(std::error::Error::source(&fatal).is_some());
+    }
+
+    #[test]
+    fn state_publication_cannot_overwrite_shutdown_with_reconnect() {
+        let (state_tx, state_rx) = watch::channel(ConnState::Connected);
+        let publish = Arc::new(std::sync::Mutex::new(()));
+
+        let shutdown_tx = state_tx.clone();
+        let shutdown_publish = publish.clone();
+        let shutdown = std::thread::spawn(move || {
+            publish_state(&shutdown_tx, &shutdown_publish, ConnState::ShuttingDown);
+        });
+        let reconnect_tx = state_tx.clone();
+        let reconnect_publish = publish.clone();
+        let reconnect = std::thread::spawn(move || {
+            publish_state(&reconnect_tx, &reconnect_publish, ConnState::Connected);
+        });
+        shutdown.join().expect("shutdown publisher");
+        reconnect.join().expect("reconnect publisher");
+
+        assert_eq!(*state_rx.borrow(), ConnState::ShuttingDown);
     }
 }

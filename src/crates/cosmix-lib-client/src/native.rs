@@ -132,6 +132,40 @@ pub struct NodedClient {
     provenance: Option<cosmix_bus::RegisterProvenance>,
 }
 
+/// The requested Bus service name is already owned by another connection.
+///
+/// `cosmix-noded` reports this as the sole application error from
+/// `noded.register`. Keeping it as a concrete error in the `anyhow` source
+/// chain lets resident clients treat a collision as terminal without parsing
+/// the broker's diagnostic text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameCollision {
+    service: String,
+}
+
+impl NameCollision {
+    fn new(service: String) -> Self {
+        Self { service }
+    }
+
+    /// The service name whose registration was rejected.
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+}
+
+impl std::fmt::Display for NameCollision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Bus service name '{}' is already registered",
+            self.service
+        )
+    }
+}
+
+impl std::error::Error for NameCollision {}
+
 impl NodedClient {
     /// Connect to the broker at the given URL and register as a named service.
     pub async fn connect(service_name: &str, noded_url: &str) -> Result<Self> {
@@ -682,8 +716,14 @@ impl NodedClient {
             Some(p) => serde_json::to_value(p).unwrap_or(serde_json::Value::Null),
             None => serde_json::Value::Null,
         };
-        self.call("noded", "noded.register", body).await?;
-        Ok(())
+        match self.call_typed("noded", "noded.register", body).await? {
+            cosmix_bus::PortReply::Ok { .. } => Ok(()),
+            // `noded.register` has one application rejection: the requested
+            // service name is already owned. Classify the typed AppError at
+            // this command boundary; do not couple lifecycle decisions to the
+            // broker's human-readable diagnostic text.
+            cosmix_bus::PortReply::AppError { .. } => Err(NameCollision::new(self.name()).into()),
+        }
     }
 
     /// Deregister this connection's service name from the broker and
