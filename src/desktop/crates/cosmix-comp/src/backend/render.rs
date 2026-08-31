@@ -99,6 +99,7 @@ use bevy::render::view::ExtractedView;
 #[cfg(all(feature = "kms-live", not(test)))]
 use bevy::prelude::Local;
 
+use crate::compositor_scene::NestedSecurityPresentation;
 #[cfg(all(feature = "kms-live", not(test)))]
 use crate::compositor_scene::{DmabufOutputProbeSurfaces, install_dmabuf_output_probe};
 #[cfg(all(feature = "kms-live", not(test)))]
@@ -174,6 +175,9 @@ pub(crate) enum PresentOutcome {
 pub(crate) struct ResumePresentationPlan {
     pub(crate) classification: super::resume_scanout::ResumePresentationClassification,
     pub(crate) deadline: PresentDeadline,
+    /// Protocol-thread truth sampled before resume chose whether retained
+    /// scanout could participate. Active locks always require a fresh frame.
+    pub(crate) lock_active: bool,
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -195,6 +199,7 @@ fn seamless_resume_is_eligible(
             Some(ResumePresentationPlan {
                 classification:
                     super::resume_scanout::ResumePresentationClassification::SeamlessPageFlip,
+                lock_active: false,
                 ..
             })
         )
@@ -212,7 +217,86 @@ pub(crate) fn staged_resume_lease_for_test(
                     super::resume_scanout::ResumeModesetReason::NoUsableState,
                 ),
             deadline: PresentDeadline::bounded(Instant::now() + Duration::from_secs(1)),
+            lock_active: false,
         },
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(feature = "kms-live"), allow(dead_code))]
+enum KmsResumeFirstFlipScene {
+    Lock,
+    Blank,
+    Retained,
+    Client,
+}
+
+impl KmsResumeFirstFlipScene {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Lock => "lock",
+            Self::Blank => "blank",
+            Self::Retained => "retained",
+            Self::Client => "client",
+        }
+    }
+}
+
+impl From<crate::protocol::SecurityPresentationScene> for KmsResumeFirstFlipScene {
+    fn from(scene: crate::protocol::SecurityPresentationScene) -> Self {
+        match scene {
+            crate::protocol::SecurityPresentationScene::Lock => Self::Lock,
+            crate::protocol::SecurityPresentationScene::Blank => Self::Blank,
+            crate::protocol::SecurityPresentationScene::Client => Self::Client,
+        }
+    }
+}
+
+/// Shared by the synchronous retained flip and later render-world frames so
+/// exactly one actual Displayed result names the first flip of this resume.
+#[derive(Clone, Default)]
+pub(crate) struct ResumeFirstFlipMarker(Arc<Mutex<Option<KmsResumeFirstFlipScene>>>);
+
+impl ResumeFirstFlipMarker {
+    fn report(
+        &self,
+        scene: KmsResumeFirstFlipScene,
+        key: &OutputKey,
+        presentation_epoch: Option<u64>,
+        generation: u64,
+    ) -> bool {
+        let mut reported = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reported.is_some() {
+            return false;
+        }
+        *reported = Some(scene);
+        match presentation_epoch {
+            Some(epoch) => tracing::info!(
+                "session-lock-kms-resume-first-flip scene={} output={} epoch={} generation={}",
+                scene.name(),
+                key.connector_name,
+                epoch,
+                generation
+            ),
+            None => tracing::info!(
+                "session-lock-kms-resume-first-flip scene={} output={} epoch=none generation={}",
+                scene.name(),
+                key.connector_name,
+                generation
+            ),
+        };
+        true
+    }
+
+    #[cfg(test)]
+    fn reported(&self) -> Option<KmsResumeFirstFlipScene> {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -326,6 +410,7 @@ impl PresentationCancelHandle {
 pub(crate) struct AcquiredOutputFrame {
     pub(crate) view: ManualTextureView,
     pub(crate) present: PresentOutputFrame,
+    pub(crate) resume_first_flip: Option<ResumeFirstFlipMarker>,
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -373,12 +458,16 @@ struct OutputFrameSource {
     ready_generation: Option<u64>,
     current_ready_generation: Option<u64>,
     pending_present: Option<PresentOutputFrame>,
+    pending_security_presentations: Vec<(u64, crate::protocol::SecurityPresentationTarget)>,
+    pending_resume_first_flip: Option<ResumeFirstFlipMarker>,
 }
 
 struct AcquiredOutputPresenter {
     key: OutputKey,
     generation: u64,
     present: PresentOutputFrame,
+    security_presentations: Vec<(u64, crate::protocol::SecurityPresentationTarget)>,
+    resume_first_flip: Option<ResumeFirstFlipMarker>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -392,8 +481,15 @@ struct ExtractedOutputView {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum KmsRenderFrameEvent {
-    FrameSubmitted { generation: u64, key: OutputKey },
-    PresentationCancelled { generation: u64, key: OutputKey },
+    FrameSubmitted {
+        generation: u64,
+        key: OutputKey,
+        security_epochs: Vec<u64>,
+    },
+    PresentationCancelled {
+        generation: u64,
+        key: OutputKey,
+    },
     TerminalFailure(KmsRenderWorkerFailure),
 }
 
@@ -657,6 +753,12 @@ fn install_live_scene(app: &mut App, scene_mode: LiveSceneMode) {
                 ));
             #[cfg(all(feature = "kms-live", not(test)))]
             configure_live_dmabuf_debug(app);
+        }
+    }
+    if scene_mode == LiveSceneMode::ClientContent {
+        let presentations = app.world().resource::<NestedSecurityPresentation>().clone();
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app.insert_resource(presentations);
         }
     }
 }
@@ -3150,6 +3252,10 @@ impl LiveAtomicOwnership {
                 .as_ref()
                 .is_some_and(|retained| retained.buffer.selection() == selection),
         );
+        debug_assert!(
+            !resume_plan.is_some_and(|plan| plan.lock_active) || !classifier_eligible,
+            "an active session lock must structurally disable retained resume"
+        );
         let seamless_budget_available = staged_resume_deadline
             .is_some_and(|deadline| seamless_resume_has_minimum_budget(Instant::now(), deadline));
         let seamless_eligible = classifier_eligible && seamless_budget_available;
@@ -3303,6 +3409,7 @@ impl LiveAtomicOwnership {
             .map_err(|error| atomic_platform_failure("initial target view", error))?;
 
         let mut retained_handoff = None;
+        let resume_first_flip = resume_plan.map(|_| ResumeFirstFlipMarker::default());
         if let (Some(slot), Some(_plan), Some(mut retained_buffer)) =
             (retained_candidate, resume_plan, retained.take())
         {
@@ -3339,6 +3446,15 @@ impl LiveAtomicOwnership {
                         slot = slot.0,
                         "kms-live seamless resume displayed retained scanout storage"
                     );
+                    resume_first_flip
+                        .as_ref()
+                        .expect("retained resume owns a first-flip marker")
+                        .report(
+                            KmsResumeFirstFlipScene::Retained,
+                            &output.key,
+                            None,
+                            self.target_generation,
+                        );
                 }
                 Some(Ok(PresentOutcome::Cancelled)) => {
                     if presenter.has_pending_commit() {
@@ -3393,6 +3509,15 @@ impl LiveAtomicOwnership {
                                     detail = %error.detail,
                                     "seamless pageflip completed during bounded fallback drain; retaining it as the resumed front buffer"
                                 );
+                                resume_first_flip
+                                    .as_ref()
+                                    .expect("late retained resume owns a first-flip marker")
+                                    .report(
+                                        KmsResumeFirstFlipScene::Retained,
+                                        &output.key,
+                                        None,
+                                        self.target_generation,
+                                    );
                             }
                             Ok(
                                 PendingFlipDrainOutcome::Cancelled
@@ -3561,6 +3686,7 @@ impl LiveAtomicOwnership {
                         );
                         outcome
                     }),
+                    resume_first_flip: resume_first_flip.clone(),
                 })
             }),
         })
@@ -4104,6 +4230,7 @@ fn refresh_output_readiness(
 fn acquire_output_frames(
     mut targets: bevy::prelude::ResMut<KmsRenderTargets>,
     mut views: bevy::prelude::ResMut<ManualTextureViews>,
+    security_presentations: Option<bevy::prelude::Res<NestedSecurityPresentation>>,
 ) {
     match targets.lifecycle.state() {
         KmsRenderLifecycleState::Active => {}
@@ -4149,7 +4276,24 @@ fn acquire_output_frames(
                     });
                     break;
                 }
-                results.push((key.clone(), source.handle, frame.view, frame.present));
+                let security_presentations = security_presentations
+                    .as_ref()
+                    .map(|presentations| {
+                        presentations
+                            .snapshot()
+                            .into_iter()
+                            .filter(|(_, presentation)| presentation.output == key.connector_name)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                results.push((
+                    key.clone(),
+                    source.handle,
+                    frame.view,
+                    frame.present,
+                    security_presentations,
+                    frame.resume_first_flip,
+                ));
             }
             Err(error) => {
                 terminal_failure = Some(KmsRenderWorkerFailure {
@@ -4175,14 +4319,15 @@ fn acquire_output_frames(
         return;
     }
 
-    for (key, handle, view, present) in results {
-        let pending_present = &mut targets
+    for (key, handle, view, present, security_presentations, resume_first_flip) in results {
+        let source = targets
             .sources
             .get_mut(&key)
-            .expect("acquired source remains installed through this update")
-            .pending_present;
+            .expect("acquired source remains installed through this update");
         views.insert(handle, view);
-        *pending_present = Some(present);
+        source.pending_present = Some(present);
+        source.pending_security_presentations = security_presentations;
+        source.pending_resume_first_flip = resume_first_flip;
     }
 }
 
@@ -4939,6 +5084,8 @@ fn apply_render_world_commands(
                         ready_generation: None,
                         current_ready_generation: None,
                         pending_present: None,
+                        pending_security_presentations: Vec::new(),
+                        pending_resume_first_flip: None,
                     },
                 );
             }
@@ -5018,6 +5165,7 @@ fn apply_render_world_commands(
 fn present_output_frames(
     mut targets: bevy::prelude::ResMut<KmsRenderTargets>,
     views: bevy::prelude::Query<(&ExtractedCamera, &ViewTarget)>,
+    security_presentations: Option<bevy::prelude::Res<NestedSecurityPresentation>>,
 ) {
     if targets.lifecycle.state() != KmsRenderLifecycleState::Active {
         return;
@@ -5040,7 +5188,7 @@ fn present_output_frames(
             }
         })
         .collect::<Vec<_>>();
-    present_selected_output_frames(&mut targets, &extracted);
+    present_selected_output_frames(&mut targets, &extracted, security_presentations.as_deref());
 }
 
 /// Bevy's final output pass is demand-driven: if no render node consumes an
@@ -5400,15 +5548,45 @@ fn probe_dmabuf_output(
 fn present_selected_output_frames(
     targets: &mut KmsRenderTargets,
     extracted: &[ExtractedOutputView],
+    security_presentations: Option<&NestedSecurityPresentation>,
 ) {
     let presenters = select_written_presenters(&mut targets.sources, extracted);
     let frame_events = targets.frame_events.clone();
     for presenter in presenters {
         let event = match present_output_frame(presenter.present, targets.present_deadline) {
-            Ok(PresentOutcome::Displayed) => Some(KmsRenderFrameEvent::FrameSubmitted {
-                generation: presenter.generation,
-                key: presenter.key,
-            }),
+            Ok(PresentOutcome::Displayed) => {
+                let security_epochs = presenter
+                    .security_presentations
+                    .iter()
+                    .map(|(epoch, _)| *epoch)
+                    .collect();
+                if let Some(marker) = &presenter.resume_first_flip {
+                    let presentation_epoch = presenter
+                        .security_presentations
+                        .first()
+                        .map(|(epoch, _)| *epoch);
+                    let scene = presenter
+                        .security_presentations
+                        .iter()
+                        .map(|(_, presentation)| presentation.scene.into())
+                        .next()
+                        .unwrap_or(KmsResumeFirstFlipScene::Client);
+                    marker.report(
+                        scene,
+                        &presenter.key,
+                        presentation_epoch,
+                        presenter.generation,
+                    );
+                }
+                if let Some(pending) = security_presentations {
+                    pending.complete(&presenter.security_presentations);
+                }
+                Some(KmsRenderFrameEvent::FrameSubmitted {
+                    generation: presenter.generation,
+                    key: presenter.key,
+                    security_epochs,
+                })
+            }
             Ok(PresentOutcome::Cancelled) => Some(KmsRenderFrameEvent::PresentationCancelled {
                 generation: presenter.generation,
                 key: presenter.key,
@@ -5466,6 +5644,8 @@ fn select_written_presenters(
                 key: key.clone(),
                 generation: source.generation,
                 present,
+                security_presentations: std::mem::take(&mut source.pending_security_presentations),
+                resume_first_flip: source.pending_resume_first_flip.take(),
             });
         }
     }
@@ -5780,6 +5960,7 @@ pub(crate) mod tests {
                         present: Box::new(move || {
                             presented.fetch_add(1, Ordering::SeqCst);
                         }),
+                        resume_first_flip: None,
                     })
                 }),
             }
@@ -7797,11 +7978,14 @@ pub(crate) mod tests {
                     Ok(AcquiredOutputFrame {
                         view: wrong_view.clone(),
                         present: Box::new(|| panic!("wrong-sized frame was presented")),
+                        resume_first_flip: None,
                     })
                 }),
                 ready_generation: Some(9),
                 current_ready_generation: Some(9),
                 pending_present: None,
+                pending_security_presentations: Vec::new(),
+                pending_resume_first_flip: None,
             },
         );
         let mut views = ManualTextureViews::default();
@@ -7844,11 +8028,24 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn frame_submitted_event_is_emitted_only_after_the_present_call_runs() {
+    fn locking_authority_loss_resume_displays_fresh_blank_before_any_retained_frame() {
+        use super::super::resume_scanout::ResumePresentationClassification;
+
         let key = blocked_output().key;
+        let locked_resume = Some(ResumePresentationPlan {
+            classification: ResumePresentationClassification::SeamlessPageFlip,
+            deadline: PresentDeadline::bounded(Instant::now() + Duration::from_secs(1)),
+            lock_active: true,
+        });
+        assert!(
+            !seamless_resume_is_eligible(locked_resume, true, true),
+            "Locking authority loss structurally rejects the retained pre-pause framebuffer"
+        );
         let handle = ManualTextureViewHandle(82);
         let presented = Arc::new(AtomicBool::new(false));
         let presented_probe = Arc::clone(&presented);
+        let resume_first_flip = ResumeFirstFlipMarker::default();
+        let acquired_resume_first_flip = resume_first_flip.clone();
         let view = noop_manual_view(320, 240, "present event frame");
         let (frame_event_sender, frame_events) = mpsc::channel();
         let mut targets = KmsRenderTargets::new(PresentDeadline::unbounded_non_presenting());
@@ -7866,16 +8063,28 @@ pub(crate) mod tests {
                             let presented_probe = Arc::clone(&presented_probe);
                             move || presented_probe.store(true, Ordering::SeqCst)
                         }),
+                        resume_first_flip: Some(acquired_resume_first_flip.clone()),
                     })
                 }),
                 ready_generation: Some(10),
                 current_ready_generation: Some(10),
                 pending_present: None,
+                pending_security_presentations: Vec::new(),
+                pending_resume_first_flip: None,
             },
         );
         let mut world = World::new();
         world.insert_resource(targets);
         world.insert_resource(ManualTextureViews::default());
+        let security_presentations = NestedSecurityPresentation::default();
+        security_presentations.publish(
+            73,
+            [crate::protocol::SecurityPresentationTarget {
+                output: key.connector_name.clone(),
+                scene: crate::protocol::SecurityPresentationScene::Blank,
+            }],
+        );
+        world.insert_resource(security_presentations.clone());
 
         world.run_system_once(acquire_output_frames).unwrap();
         assert!(!presented.load(Ordering::SeqCst));
@@ -7889,16 +8098,28 @@ pub(crate) mod tests {
                 ready: true,
                 written: true,
             }],
+            Some(&security_presentations),
         );
 
         assert!(presented.load(Ordering::SeqCst));
+        assert_eq!(
+            resume_first_flip.reported(),
+            Some(KmsResumeFirstFlipScene::Blank),
+            "authority loss during Locking resumes with the freshly rendered opaque blank"
+        );
+        assert!(
+            !resume_first_flip.report(KmsResumeFirstFlipScene::Retained, &key, None, 10),
+            "the retained pre-pause buffer is never accepted as the first displayed frame"
+        );
         assert_eq!(
             frame_events.recv_timeout(Duration::from_secs(1)).unwrap(),
             KmsRenderFrameEvent::FrameSubmitted {
                 generation: 10,
                 key,
+                security_epochs: vec![73],
             }
         );
+        assert!(security_presentations.snapshot().is_empty());
     }
 
     #[test]
@@ -7930,16 +8151,28 @@ pub(crate) mod tests {
                                 Ok(PresentOutcome::Cancelled)
                             }
                         }),
+                        resume_first_flip: None,
                     })
                 }),
                 ready_generation: Some(11),
                 current_ready_generation: Some(11),
                 pending_present: None,
+                pending_security_presentations: Vec::new(),
+                pending_resume_first_flip: None,
             },
         );
         let mut world = World::new();
         world.insert_resource(targets);
         world.insert_resource(ManualTextureViews::default());
+        let security_presentations = NestedSecurityPresentation::default();
+        security_presentations.publish(
+            74,
+            [crate::protocol::SecurityPresentationTarget {
+                output: key.connector_name.clone(),
+                scene: crate::protocol::SecurityPresentationScene::Client,
+            }],
+        );
+        world.insert_resource(security_presentations.clone());
 
         world.run_system_once(acquire_output_frames).unwrap();
         present_selected_output_frames(
@@ -7951,6 +8184,7 @@ pub(crate) mod tests {
                 ready: true,
                 written: true,
             }],
+            Some(&security_presentations),
         );
 
         assert_eq!(
@@ -7980,6 +8214,16 @@ pub(crate) mod tests {
                     key: cancelled_key,
                 }] if *cancelled_key == blocked_output().key)
         ));
+        assert_eq!(
+            security_presentations.snapshot(),
+            [(
+                74,
+                crate::protocol::SecurityPresentationTarget {
+                    output: blocked_output().key.connector_name,
+                    scene: crate::protocol::SecurityPresentationScene::Client,
+                }
+            )]
+        );
     }
 
     #[test]
@@ -8021,11 +8265,14 @@ pub(crate) mod tests {
                                 "atomic commit ioctl failed with errno 13: Permission denied",
                             ))
                         }),
+                        resume_first_flip: None,
                     })
                 }),
                 ready_generation: Some(61),
                 current_ready_generation: Some(61),
                 pending_present: None,
+                pending_security_presentations: Vec::new(),
+                pending_resume_first_flip: None,
             },
         );
         let mut world = World::new();
@@ -8042,6 +8289,7 @@ pub(crate) mod tests {
                 ready: true,
                 written: true,
             }],
+            None,
         );
 
         let failure = match frame_events
@@ -8307,6 +8555,7 @@ pub(crate) mod tests {
                 Some(ResumePresentationPlan {
                     classification: ResumePresentationClassification::ModesetRequired(reason),
                     deadline: PresentDeadline::bounded(Instant::now() + Duration::from_secs(1),),
+                    lock_active: false,
                 }),
                 true,
                 true,
@@ -8316,6 +8565,7 @@ pub(crate) mod tests {
             Some(ResumePresentationPlan {
                 classification: ResumePresentationClassification::SeamlessPageFlip,
                 deadline: PresentDeadline::bounded(Instant::now() + Duration::from_secs(1)),
+                lock_active: false,
             }),
             true,
             true,
@@ -8324,9 +8574,19 @@ pub(crate) mod tests {
             Some(ResumePresentationPlan {
                 classification: ResumePresentationClassification::SeamlessPageFlip,
                 deadline: PresentDeadline::bounded(Instant::now() + Duration::from_secs(1)),
+                lock_active: false,
             }),
             true,
             false,
+        ));
+        assert!(!seamless_resume_is_eligible(
+            Some(ResumePresentationPlan {
+                classification: ResumePresentationClassification::SeamlessPageFlip,
+                deadline: PresentDeadline::bounded(Instant::now() + Duration::from_secs(1)),
+                lock_active: true,
+            }),
+            true,
+            true,
         ));
     }
 
@@ -8391,11 +8651,14 @@ pub(crate) mod tests {
                             outstanding.mark_presented();
                             present_oracle.presented.fetch_add(1, Ordering::SeqCst);
                         }),
+                        resume_first_flip: None,
                     })
                 }),
                 ready_generation: None,
                 current_ready_generation: None,
                 pending_present: None,
+                pending_security_presentations: Vec::new(),
+                pending_resume_first_flip: None,
             },
         );
         let mut world = World::new();
@@ -8416,6 +8679,7 @@ pub(crate) mod tests {
                 ready: true,
                 written: true,
             }],
+            None,
         );
         world.run_system_once(acquire_output_frames).unwrap();
         assert_eq!(oracle.acquired.load(Ordering::SeqCst), 0);
@@ -8429,6 +8693,7 @@ pub(crate) mod tests {
                 ready: true,
                 written: false,
             }],
+            None,
         );
         world.run_system_once(acquire_output_frames).unwrap();
         assert_eq!(oracle.acquired.load(Ordering::SeqCst), 0);
@@ -8451,6 +8716,7 @@ pub(crate) mod tests {
                     ready: true,
                     written: false,
                 }],
+                None,
             );
             world.run_system_once(acquire_output_frames).unwrap();
         }
@@ -8468,6 +8734,7 @@ pub(crate) mod tests {
                 ready: true,
                 written: true,
             }],
+            None,
         );
 
         assert_eq!(oracle.acquired.load(Ordering::SeqCst), 1);
@@ -8476,7 +8743,11 @@ pub(crate) mod tests {
         assert_eq!(oracle.abandoned.load(Ordering::SeqCst), 0);
         assert_eq!(
             frame_events.recv_timeout(Duration::from_secs(1)).unwrap(),
-            KmsRenderFrameEvent::FrameSubmitted { generation: 8, key }
+            KmsRenderFrameEvent::FrameSubmitted {
+                generation: 8,
+                key,
+                security_epochs: Vec::new(),
+            }
         );
     }
 
@@ -8798,6 +9069,7 @@ pub(crate) mod tests {
                 Ok(AcquiredOutputFrame {
                     view: view.clone(),
                     present: Box::new(move || present_barrier.enter_and_wait()),
+                    resume_first_flip: None,
                 })
             });
             Ok(source)
@@ -9129,7 +9401,7 @@ pub(crate) mod tests {
                 written: true,
             })
             .collect::<Vec<_>>();
-        present_selected_output_frames(&mut targets, &extracted);
+        present_selected_output_frames(&mut targets, &extracted, None);
     }
 
     pub(crate) fn while_worker_teardown_is_blocked(
@@ -9284,6 +9556,8 @@ pub(crate) mod tests {
                 ready_generation: Some(12),
                 current_ready_generation: Some(12),
                 pending_present: Some(Box::new(|| panic!("drained output was presented"))),
+                pending_security_presentations: Vec::new(),
+                pending_resume_first_flip: None,
             },
         );
         let mut views = ManualTextureViews::default();
@@ -9405,6 +9679,8 @@ pub(crate) mod tests {
                 ready_generation: Some(18),
                 current_ready_generation: Some(18),
                 pending_present: None,
+                pending_security_presentations: Vec::new(),
+                pending_resume_first_flip: None,
             },
         );
         let mut views = ManualTextureViews::default();

@@ -114,9 +114,7 @@ impl SessionLockManagerState {
     }
 
     pub(crate) fn output_is_locked(&self, output: &WlOutput) -> bool {
-        self.locked_outputs
-            .iter()
-            .any(|entry| &entry.output == output)
+        self.locked_outputs.iter().any(|entry| &entry.output == output)
     }
 
     pub(crate) fn register_locked_output(
@@ -135,8 +133,7 @@ impl SessionLockManagerState {
     pub(crate) fn remove_lock_surface(&mut self, surface: &ExtSessionLockSurfaceV1) {
         // cosmix fix: remove by owning object, not output. A stale surface from
         // an aborted generation must not erase a newer owner's output entry.
-        self.locked_outputs
-            .retain(|entry| &entry.surface != surface);
+        self.locked_outputs.retain(|entry| &entry.surface != surface);
     }
 
     /// Remove only output registrations created by one aborted lock object.
@@ -144,6 +141,13 @@ impl SessionLockManagerState {
     // Cosmix also needs generation-aware cleanup when Locking aborts.
     pub fn abort_lock_outputs(&mut self, lock: &ExtSessionLockV1) {
         self.locked_outputs.retain(|entry| &entry.lock != lock);
+    }
+
+    /// Retire one exact lock-surface registration after its physical output
+    /// disappeared. The protocol object may outlive the output global, so the
+    /// ordinary destruction callback is not sufficient for hot replacement.
+    pub fn retire_lock_surface(&mut self, surface: &LockSurface) {
+        self.remove_lock_surface(surface.protocol_surface());
     }
 }
 

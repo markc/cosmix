@@ -16,7 +16,7 @@ clients.
 | `zwlr_layer_shell_v1` | 4 | Layer surfaces and layer popups map, arrange and configure through Smithay's `LayerMap`; protocol strata, keyboard interactivity, input regions and exclusive usable-area effects are supported. |
 | `ext_idle_notifier_v1` | 2 | Per-seat notifications use Smithay's calloop timers; real pointer, keyboard, touch, pointer-gesture and tablet-tool activity resets the timeout and resumes an idle notification. Device-removal reconciliation does not count as activity. |
 | `ext_foreign_toplevel_list_v1` | 1 | Mapped XDG toplevels expose stable mapping identifiers, title and app ID updates; unmap or destruction closes the handle, and late clients receive the current mapped set. |
-| `ext_session_lock_v1` | 1 | Nested mode supports immediate output-sized lock-surface configures, secure blank-first presentation acknowledgement, lock-only input and the locked/orphaned lifecycle. KMS requests receive `finished` until displayed-frame evidence is connected in the KMS session-lock slice. |
+| `ext_session_lock_v1` | 1 | Nested and live KMS modes support immediate output-sized lock-surface configures, secure blank-first presentation acknowledgement, lock-only input, VT pause/resume preservation and the locked/orphaned lifecycle. |
 
 Layer surfaces stack in the protocol order: Background, Bottom, normal XDG
 toplevels and popups, Top, then Overlay. Raising a surface changes its order
@@ -69,7 +69,7 @@ output exists, the layer surface is closed and is never mapped.
 
 ## Session locking
 
-An accepted nested lock enters `Locking`, immediately removes ordinary client
+An accepted lock enters `Locking`, immediately removes ordinary client
 content from the renderer roster and installs the opaque black security scene.
 The compositor sends `locked` only after the nested renderer acquires a
 swapchain image containing that epoch, submits the frame, calls the winit/wgpu
@@ -77,9 +77,75 @@ present path, and waits for the submitted GPU work to complete. A Bevy schedule
 turn is not presentation evidence: a minimised, occluded, skipped or failed
 frame leaves the epoch pending and `locked` withheld. The blank itself satisfies
 the barrier, so a slow or absent client lock surface never delays a frame that
-is actually presented. KMS lock requests fail closed with `finished` until the
-KMS backend can report a real displayed output and epoch; that wiring belongs
-to the next implementation slice.
+is actually presented.
+
+Live KMS uses the corresponding atomic-display authority boundary. The renderer
+captures the security epoch when it acquires the output image, carries the exact
+output key and render generation through the submission, and acknowledges it
+only when atomic presentation returns `Displayed`. `OutputReady`, an enqueued
+frame, a frame-clock pulse, cancellation and a failed commit are not security
+presentation evidence. Every output in the epoch must report its exact current
+generation before `locked` is sent.
+
+Lock ownership lives on the Wayland protocol thread and is independent of DRM,
+seat and VT authority. Losing authority never unlocks: `Locking`, `Locked` and
+`OrphanedLocked` survive the pause. Resume creates a fresh epoch, installs the
+opaque lock scene before the output becomes usable, and withholds client frame
+callbacks and physical input until that epoch is displayed. Before selecting
+its resume policy, the coordinator asks the protocol thread whether `Locking`,
+`Locked` or `OrphanedLocked` is active. Any active lock disables seamless
+resume on every output: the retained pre-pause framebuffer is discarded rather
+than page-flipped, and the first submitted frame after authority returns is a
+freshly rendered opaque lock surface or black fallback. A lock output with no
+current lock surface remains black. Unlock received while paused changes the
+protocol state exactly once but keeps the black scene and input gate in place;
+after authority returns, the compositor displays an ordinary-scene epoch before
+restoring focus, input and normal client delivery.
+Keys, pointer buttons, scroll sequences and touches held by the lock scene are
+ended before its surfaces are retired. Input arriving behind the display gate
+is quarantined until its matching physical release, so no held gesture or
+release crosses into the restored ordinary focus.
+
+The live KMS `Ctrl-Alt-F1` through `Ctrl-Alt-F12` bindings are evaluated before
+the presentation gate. They are compositor-only and never reach a Wayland
+client; every other key, pointer and touch event remains gated until secure
+presentation completes. Gated key presses advance Smithay's private XKB state
+so the VT chord can be recognised. If the presentation barrier opens before a
+matching release, quarantine still feeds that release through the same
+intercepted XKB path while suppressing client delivery; pressed keys and
+modifiers therefore cannot leak across the barrier. Physical key releases
+matching a synthetic pause release are quarantined by device and keycode, and
+pause clears both physical and suppressed touch-slot state.
+
+An output removed or replaced while locked does not change lock ownership. Its
+exact Smithay `(output, lock-surface, lock)` registration is retired, and a new
+output starts with the compositor-owned black scene until the lock client maps a
+new surface through the normal `wl_output` lifecycle. The KMS transition logs
+stable harness markers: `session-lock-kms-resume-blank-first`,
+`session-lock-kms-normal-exposure-held`,
+`session-lock-kms-{initial,resume,unlock}-epoch-displayed`, and
+`session-lock-kms-normal-exposure-restored`. The actual display path also emits
+exactly one marker for each output's first successful flip after resume:
+`session-lock-kms-resume-first-flip scene=<lock|blank|retained|client>
+output=<key> epoch=<presentation-epoch|none> generation=<generation>`. A locked
+resume is valid only with `lock` or `blank` and the epoch announced by that
+resume; `retained`, `client`, an absent epoch or a mismatched epoch are
+fail-closed evidence of exposure.
+
+The private `desk_vt_run.mix --arm session-lock-vt` arm brackets a real VT run
+with the existing recovery timer and snapshots. It launches the release
+`cosmix-lock-probe`, which creates a solid SHM lock surface for each output and
+prints `COSMIX_LOCK_PROBE checkpoint=...` records, then proves initial lock,
+VT away/back blank-first resume, delayed normal exposure and displayed-epoch
+unlock. It requires the safe per-output first-flip marker and requests a KMS
+texture-view PNG through the compositor's SIGUSR1 frame-capture path; the image
+must contain only the solid lock colour or black fallback. The arm scopes
+resume markers after a journal cursor captured while away and matches
+the resume-start epoch as well as the output. It accepts the probe's terminal
+unlock markers after either an active observation or an exact successful exit;
+mid-run lock markers still require the probe to be alive. The arm is
+intentionally a manual hardware gate; ordinary development only builds the
+helper and lints the script.
 
 Each physical output accepts one lock surface for the current generation.
 Its first configure is immediate and exactly matches the logical output; a
@@ -139,11 +205,17 @@ handler also has additive originating-lock, lock-object destruction,
 lock-surface destruction and construction-history hooks. These bind surface
 creation and `Locking` lifetime to the accepted resource while letting Cosmix's
 attach/commit ledger enforce `AlreadyConstructed`.
+The session-lock registry also exposes a narrow exact-surface retirement helper
+for KMS output replacement; it removes only the originating protocol object and
+does not alter the accepted lock generation.
 
 The vendored session-lock implementation also carries four marked fixes:
 
 - invalid `unlock_and_destroy` returns after posting `InvalidUnlock`, so a
   rejected object cannot fall through to the compositor's unlock handler;
+- a valid `unlock_and_destroy` consumes its locked state before calling the
+  compositor, so the unlock transition can occur only once even while visible
+  restoration is deferred across a VT pause;
 - `AlreadyConstructed` validation happens before the output is inserted into
   Smithay's duplicate registry, preventing failed constructions from leaking
   entries; and

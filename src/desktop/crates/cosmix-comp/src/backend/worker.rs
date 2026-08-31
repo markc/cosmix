@@ -1369,7 +1369,11 @@ where
     RenderSource {
         placeholder,
         acquire: Box::new(move || {
-            let AcquiredOutputFrame { view, present } = acquire()?;
+            let AcquiredOutputFrame {
+                view,
+                present,
+                resume_first_flip,
+            } = acquire()?;
             let frame_events = events.clone();
             let frame_key = key.clone();
             Ok(AcquiredOutputFrame {
@@ -1386,6 +1390,7 @@ where
                     }
                     Ok(outcome)
                 }),
+                resume_first_flip,
             })
         }),
     }
@@ -2175,6 +2180,7 @@ pub(crate) mod tests {
                     Ok(AcquiredOutputFrame {
                         view: view.clone(),
                         present: fallible_present_output_frame(move |_| Ok(outcome)),
+                        resume_first_flip: None,
                     })
                 }),
             };

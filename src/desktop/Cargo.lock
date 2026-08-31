@@ -2527,7 +2527,7 @@ version = "0.2.0"
 
 [[package]]
 name = "cosmix-comp"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "bevy",
  "cosmix-deco",
@@ -2539,9 +2539,11 @@ dependencies = [
  "libc",
  "signal-hook",
  "smithay",
+ "smithay-client-toolkit",
  "static_assertions",
  "tracing",
  "unicode-segmentation",
+ "wayland-client",
  "wgpu",
 ]
 

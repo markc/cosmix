@@ -90,7 +90,7 @@ use std::{
 };
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
-use super::kms::{KmsRenderCommand, KmsRenderReply, SelectedOutput};
+use super::kms::{KmsRenderCommand, KmsRenderReply, OutputKey, SelectedOutput};
 use super::kms::{OutputScale120, PresentationBackend};
 #[cfg(all(feature = "kms-live", not(test)))]
 use super::libinput_live::{
@@ -377,6 +377,7 @@ struct PreparedLiveOperation {
     initial_render_commands: Vec<KmsRenderCommand>,
     topology_client: Option<crate::protocol::KmsTopologyClient>,
     frame_clock: Option<crate::protocol::ClientFrameClock>,
+    security_reporter: Option<crate::protocol::SecurityPresentationReporter>,
     scene_feed: Option<crate::protocol::ClientSceneFeed>,
     scene_mode: LiveSceneMode,
     decoration: DecorationStartup,
@@ -4132,6 +4133,7 @@ fn prepare_live_operation(
         initial_render_commands: Vec::new(),
         topology_client: None,
         frame_clock: None,
+        security_reporter: None,
         scene_feed: None,
         scene_mode: grant.scene_mode,
         decoration: grant.decoration.clone(),
@@ -5229,8 +5231,15 @@ where
 {
     let mut output_ready = |_| {};
     let mut pulse = || Ok(());
-    let result =
-        supervise_live_render_inner(mailbox, pump, &mut now, &mut output_ready, &mut pulse);
+    let mut security_presented = |_, _, _| Ok(());
+    let result = supervise_live_render_inner(
+        mailbox,
+        pump,
+        &mut now,
+        &mut output_ready,
+        &mut pulse,
+        &mut security_presented,
+    );
     pump.begin_stop();
     result
 }
@@ -5245,7 +5254,14 @@ where
     M: LiveCoordinatorMailbox,
     P: LivePumpControl,
 {
-    supervise_active_live_operation_after_output_ready(mailbox, pump, now, |_| {}, || Ok(()))
+    supervise_active_live_operation_after_output_ready(
+        mailbox,
+        pump,
+        now,
+        |_| {},
+        || Ok(()),
+        |_, _, _| Ok(()),
+    )
 }
 
 /// The production active-operation arm: supervise the persistent render island,
@@ -5254,22 +5270,30 @@ where
 /// stopping the pump. Kept shared with tests so both branches are exercised
 /// without DRM access.
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
-fn supervise_active_live_operation_after_output_ready<M, P, R, F>(
+fn supervise_active_live_operation_after_output_ready<M, P, R, F, S>(
     mailbox: &mut M,
     pump: &mut P,
     now: impl FnMut() -> Duration,
     mut output_ready: R,
     mut pulse: F,
+    mut security_presented: S,
 ) -> Result<ActiveLiveOperationEnd, KmsLiveError>
 where
     M: LiveCoordinatorMailbox,
     P: LivePumpControl,
     R: FnMut(Duration),
     F: FnMut() -> Result<(), KmsLiveError>,
+    S: FnMut(u64, u64, OutputKey) -> Result<(), KmsLiveError>,
 {
     let mut now = now;
-    let supervised =
-        supervise_live_render_inner(mailbox, pump, &mut now, &mut output_ready, &mut pulse);
+    let supervised = supervise_live_render_inner(
+        mailbox,
+        pump,
+        &mut now,
+        &mut output_ready,
+        &mut pulse,
+        &mut security_presented,
+    );
     let end = match supervised {
         Ok(end) => end,
         Err(error) => {
@@ -5311,18 +5335,20 @@ where
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
-fn supervise_live_render_inner<M, P, R, F>(
+fn supervise_live_render_inner<M, P, R, F, S>(
     mailbox: &mut M,
     pump: &mut P,
     now: &mut impl FnMut() -> Duration,
     output_ready: &mut R,
     pulse: &mut F,
+    security_presented: &mut S,
 ) -> Result<LiveSupervisionEnd, KmsLiveError>
 where
     M: LiveCoordinatorMailbox,
     P: LivePumpControl,
     R: FnMut(Duration),
     F: FnMut() -> Result<(), KmsLiveError>,
+    S: FnMut(u64, u64, OutputKey) -> Result<(), KmsLiveError>,
 {
     let registration_started_at = now();
     let registration_deadline = registration_started_at.saturating_add(REGISTRATION_TIMEOUT);
@@ -5435,9 +5461,16 @@ where
         let mut submissions = 0_usize;
         for event in events {
             match event {
-                KmsRenderFrameEvent::FrameSubmitted { generation, key } => {
+                KmsRenderFrameEvent::FrameSubmitted {
+                    generation,
+                    key,
+                    security_epochs,
+                } => {
                     policy.observe_submitted(observed_at);
                     telemetry.observe(observed_at, generation, &key);
+                    for presentation_epoch in security_epochs {
+                        security_presented(presentation_epoch, generation, key.clone())?;
+                    }
                     submissions = submissions.saturating_add(1);
                 }
                 KmsRenderFrameEvent::PresentationCancelled { .. } => {}
@@ -5465,6 +5498,7 @@ where
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
+#[allow(clippy::too_many_arguments)]
 fn supervise_resumed_live_render<M, P>(
     mailbox: &mut M,
     pump: &mut P,
@@ -5473,6 +5507,7 @@ fn supervise_resumed_live_render<M, P>(
     mut now: impl FnMut() -> Duration,
     mut flush_events: impl FnMut(Duration) -> Result<crate::protocol::EventFlushOutcome, KmsLiveError>,
     mut pulse: impl FnMut() -> Result<(), KmsLiveError>,
+    mut security_presented: impl FnMut(u64, u64, OutputKey) -> Result<(), KmsLiveError>,
 ) -> Result<LiveSupervisionEnd, KmsLiveError>
 where
     M: LiveCoordinatorMailbox,
@@ -5551,10 +5586,17 @@ where
         let mut submissions = 0_usize;
         for event in events {
             match event {
-                KmsRenderFrameEvent::FrameSubmitted { generation, key } => {
+                KmsRenderFrameEvent::FrameSubmitted {
+                    generation,
+                    key,
+                    security_epochs,
+                } => {
                     require_resumed_frame_generation(resumed.generation, generation)?;
                     policy.observe_submitted(observed_at);
                     telemetry.observe(observed_at, generation, &key);
+                    for presentation_epoch in security_epochs {
+                        security_presented(presentation_epoch, generation, key.clone())?;
+                    }
                     submissions = submissions.saturating_add(1);
                 }
                 KmsRenderFrameEvent::PresentationCancelled { generation, .. } => {
@@ -5854,16 +5896,15 @@ fn refresh_selected_output_after_resume(
                 "resume topology emitted no selected-output command for ready generation {ready_generation}"
             ))
         })?;
-    // Connector identity must survive a resume: the retained binding and the
-    // resumed one describe the same admitted connector, or the session is in
-    // a state this coordinator never constructed.
     if let Some(retained) = selected_output.as_ref()
         && retained.key != output.key
     {
-        return Err(KmsLiveError::Setup(format!(
-            "kms-live-resume-connector-mismatch: retained {} does not match resumed {}",
-            retained.key.connector_name, output.key.connector_name
-        )));
+        tracing::info!(
+            previous_output = retained.key.connector_name,
+            replacement_output = output.key.connector_name,
+            ready_generation,
+            "session-lock-kms-output-replaced-blank"
+        );
     }
     *selected_output = Some(output);
     Ok(())
@@ -7083,6 +7124,13 @@ impl PreparedLiveOperation {
                     .resume_input(input_timeout)
                     .map_err(|error| ResumeAttemptFailure::Terminal(KmsLiveError::Setup(error)))?;
                 input_resumed = true;
+                let lock_query_timeout =
+                    remaining_resume_stage_timeout(deadline, now(), LIVE_TOPOLOGY_ACK_TIMEOUT)
+                        .map_err(ResumeAttemptFailure::Terminal)?;
+                let lock_active = self
+                    .topology_client()?
+                    .session_lock_active(lock_query_timeout)
+                    .map_err(|error| ResumeAttemptFailure::Terminal(KmsLiveError::Setup(error)))?;
                 let verification_fd = reopened
                     .fd
                     .as_ref()
@@ -7152,6 +7200,7 @@ impl PreparedLiveOperation {
                         deadline: super::render::PresentDeadline::bounded(
                             Instant::now() + seamless_budget,
                         ),
+                        lock_active,
                     },
                 };
                 render_resumed = true;
@@ -7698,6 +7747,7 @@ impl LiveActPlatform for PreparedLiveOperation {
             .map_err(KmsLiveError::Setup)?;
         self.topology_client = Some(runtime.kms_topology_client());
         self.frame_clock = Some(runtime.client_frame_clock());
+        self.security_reporter = Some(runtime.security_presentation_reporter());
         if self.scene_mode == LiveSceneMode::ClientContent {
             self.scene_feed = Some(
                 runtime
@@ -7811,6 +7861,9 @@ impl LiveActPlatform for PreparedLiveOperation {
                 let frame_clock = self.frame_clock.clone().ok_or_else(|| {
                     KmsLiveError::Setup("client frame clock is unavailable".into())
                 })?;
+                let security_reporter = self.security_reporter.clone().ok_or_else(|| {
+                    KmsLiveError::Setup("security presentation reporter is unavailable".into())
+                })?;
                 let topology_client = self.topology_client()?.clone();
                 match supervise_resumed_live_render(
                     self.session
@@ -7826,6 +7879,11 @@ impl LiveActPlatform for PreparedLiveOperation {
                             .map_err(KmsLiveError::Setup)
                     },
                     move || frame_clock.pulse().map_err(KmsLiveError::Setup),
+                    move |presentation_epoch, generation, output| {
+                        security_reporter
+                            .kms_presented(presentation_epoch, generation, output)
+                            .map_err(KmsLiveError::Setup)
+                    },
                 )? {
                     LiveSupervisionEnd::Revocation(revocation) => {
                         adapter.begin_stop();
@@ -7864,6 +7922,9 @@ impl LiveActPlatform for PreparedLiveOperation {
                 let frame_clock = self.frame_clock.clone().ok_or_else(|| {
                     KmsLiveError::Setup("client frame clock is unavailable".into())
                 })?;
+                let security_reporter = self.security_reporter.clone().ok_or_else(|| {
+                    KmsLiveError::Setup("security presentation reporter is unavailable".into())
+                })?;
                 supervise_active_live_operation_after_output_ready(
                     session,
                     adapter,
@@ -7877,6 +7938,11 @@ impl LiveActPlatform for PreparedLiveOperation {
                         );
                     },
                     move || frame_clock.pulse().map_err(KmsLiveError::Setup),
+                    move |presentation_epoch, generation, output| {
+                        security_reporter
+                            .kms_presented(presentation_epoch, generation, output)
+                            .map_err(KmsLiveError::Setup)
+                    },
                 )?
             };
             match end {
@@ -9052,7 +9118,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_refuses_a_resumed_connector_with_a_foreign_key() {
+    fn refresh_accepts_a_replacement_connector_with_a_new_key() {
         let mut retained = Some(selected_output_for_test(41));
         let mut foreign = selected_output_for_test(42);
         foreign.key.connector_name = "HDMI-A-9".into();
@@ -9061,21 +9127,14 @@ mod tests {
             output: foreign,
         }];
 
-        let error = refresh_selected_output_after_resume(
-            &mut retained,
-            resumed_selected_outputs(&commands),
-            4,
-        )
-        .expect_err("a resumed binding for a different connector key is refused");
-        assert!(
-            error
-                .to_string()
-                .contains("kms-live-resume-connector-mismatch")
-        );
+        refresh_selected_output_after_resume(&mut retained, resumed_selected_outputs(&commands), 4)
+            .expect("a replacement output becomes the retained resume binding");
         assert_eq!(
-            retained.as_ref().map(|output| output.connector_id),
-            Some(41),
-            "the retained binding is untouched on refusal"
+            retained
+                .as_ref()
+                .map(|output| (output.key.connector_name.clone(), output.connector_id)),
+            Some(("HDMI-A-9".to_string(), 42)),
+            "the replacement binding becomes authoritative"
         );
     }
 
@@ -9083,6 +9142,7 @@ mod tests {
         KmsRenderFrameEvent::FrameSubmitted {
             generation: 1,
             key: pump_key(),
+            security_epochs: Vec::new(),
         }
     }
 
@@ -9329,6 +9389,7 @@ mod tests {
             now,
             |_| observed.set(observed.get().saturating_add(1)),
             || Ok(()),
+            |_, _, _| Ok(()),
         )
         .expect("output readiness is followed by the queued revocation");
         assert_eq!(
@@ -9357,6 +9418,7 @@ mod tests {
             now,
             |_| observed.set(observed.get().saturating_add(1)),
             || Ok(()),
+            |_, _, _| Ok(()),
         )
         .expect("the pre-ready switch remains resumable");
         assert_eq!(
@@ -9394,6 +9456,7 @@ mod tests {
                 let _ = baseline.observe_output_ready(Some(40));
             },
             || Ok(()),
+            |_, _, _| Ok(()),
         )
         .expect("the pre-ready pause remains resumable");
         assert!(matches!(
@@ -9828,6 +9891,7 @@ mod tests {
             now,
             |_| Ok(crate::protocol::EventFlushOutcome::Complete),
             || Ok(()),
+            |_, _, _| Ok(()),
         )
         .expect("late external pause attributes the reply-carried authority failure");
         let LiveSupervisionEnd::PauseRequested {
@@ -9956,6 +10020,7 @@ mod tests {
             now,
             |_| Ok(crate::protocol::EventFlushOutcome::Complete),
             || Ok(()),
+            |_, _, _| Ok(()),
         )
         .expect_err("authority failure without an external pause remains terminal");
         assert!(
@@ -10297,7 +10362,11 @@ mod tests {
         let mut mailbox = SupervisorMailbox::new(
             [
                 updated_reply(Vec::new()),
-                updated_reply(vec![submitted_event()]),
+                updated_reply(vec![KmsRenderFrameEvent::FrameSubmitted {
+                    generation: 1,
+                    key: pump_key(),
+                    security_epochs: vec![51],
+                }]),
                 updated_reply(vec![
                     submitted_event(),
                     submitted_event(),
@@ -10320,6 +10389,7 @@ mod tests {
         let mut pump = SupervisorPump::at_60_hz();
         let (frame_clock, pulse_probe) = crate::protocol::ClientFrameClock::test_channel();
         let flushes = Cell::new(0_u32);
+        let displayed_security = RefCell::new(Vec::new());
         let now = mailbox.now();
         let end = supervise_resumed_live_render(
             &mut mailbox,
@@ -10335,6 +10405,12 @@ mod tests {
                 Ok(crate::protocol::EventFlushOutcome::Complete)
             },
             || frame_clock.pulse().map_err(KmsLiveError::Setup),
+            |epoch, generation, output| {
+                displayed_security
+                    .borrow_mut()
+                    .push((epoch, generation, output));
+                Ok(())
+            },
         )
         .expect("resumed client-scene supervision reaches the next terminal event");
         let LiveSupervisionEnd::PauseRequested {
@@ -10360,6 +10436,11 @@ mod tests {
             "zero, one and many submissions produce zero, one and one real client-clock pulses"
         );
         assert_eq!(pump.commands, ["update", "update", "update"]);
+        assert_eq!(
+            *displayed_security.borrow(),
+            [(51, 1, pump_key())],
+            "only a displayed frame carries its security epoch to protocol"
+        );
     }
 
     #[test]
@@ -10403,6 +10484,7 @@ mod tests {
                 Ok(crate::protocol::EventFlushOutcome::Pending)
             },
             || frame_clock.pulse().map_err(KmsLiveError::Setup),
+            |_, _, _| Ok(()),
         )
         .expect("first-light resumes without entering the client-scene flush loop");
 
@@ -10557,6 +10639,7 @@ mod tests {
                 pulses.set(pulses.get().saturating_add(1));
                 Ok(())
             },
+            |_, _, _| Ok(()),
         )
         .expect("the production resume loop drains before its first render");
 
@@ -10613,6 +10696,7 @@ mod tests {
                 Ok(crate::protocol::EventFlushOutcome::Pending)
             },
             || panic!("budget exhaustion occurs before active rendering"),
+            |_, _, _| Ok(()),
         )
         .expect_err("continuous refill must terminate at the no-submit deadline");
 
@@ -11107,6 +11191,7 @@ mod tests {
         let events = [KmsRenderFrameEvent::FrameSubmitted {
             generation: 7,
             key: selected_output_for_test(41).key,
+            security_epochs: Vec::new(),
         }];
         observe_update_watchdog_evidence(&mut policy, &events, completed_at)
             .expect("a modeset completing inside both bounded stages beats the watchdog");

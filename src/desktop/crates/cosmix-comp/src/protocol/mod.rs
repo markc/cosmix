@@ -1,7 +1,7 @@
 //! Smithay protocol state and the narrow protocol-to-ECS bridge.
 
 use std::{
-    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
     env,
     error::Error,
     fs, mem,
@@ -533,7 +533,7 @@ pub(crate) enum ProtocolEvent {
     SecurityScene {
         active: bool,
         presentation_epoch: Option<u64>,
-        presentation_outputs: Vec<String>,
+        presentations: Vec<SecurityPresentationTarget>,
     },
     OutputResized {
         width: u32,
@@ -582,6 +582,20 @@ pub(crate) enum ProtocolEvent {
     /// invalidation queued before it.
     DmabufCacheInvalidated,
     RuntimeFailed(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(feature = "kms-live"), allow(dead_code))]
+pub(crate) enum SecurityPresentationScene {
+    Lock,
+    Blank,
+    Client,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SecurityPresentationTarget {
+    pub(crate) output: String,
+    pub(crate) scene: SecurityPresentationScene,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -769,12 +783,16 @@ enum ProtocolCommand {
     },
     SecurityPresented {
         presentation_epoch: u64,
-        output: String,
+        evidence: SecurityPresentationEvidence,
     },
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
     KmsTopologyLifecycle {
         event: KmsTopologyLifecycleEvent,
         acknowledgement: SyncSender<Result<(), String>>,
+    },
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    QuerySessionLockActive {
+        acknowledgement: SyncSender<bool>,
     },
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
     FlushEvents {
@@ -785,6 +803,18 @@ enum ProtocolCommand {
         acknowledgement: SyncSender<()>,
     },
     Shutdown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SecurityPresentationEvidence {
+    Nested {
+        output: String,
+    },
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    Kms {
+        generation: u64,
+        output: crate::backend::kms::OutputKey,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1145,7 +1175,24 @@ impl SecurityPresentationReporter {
         self.commands
             .send(ProtocolCommand::SecurityPresented {
                 presentation_epoch,
-                output: output.into(),
+                evidence: SecurityPresentationEvidence::Nested {
+                    output: output.into(),
+                },
+            })
+            .map_err(|_| "Wayland protocol thread disconnected".to_string())
+    }
+
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    pub(crate) fn kms_presented(
+        &self,
+        presentation_epoch: u64,
+        generation: u64,
+        output: crate::backend::kms::OutputKey,
+    ) -> Result<(), String> {
+        self.commands
+            .send(ProtocolCommand::SecurityPresented {
+                presentation_epoch,
+                evidence: SecurityPresentationEvidence::Kms { generation, output },
             })
             .map_err(|_| "Wayland protocol thread disconnected".to_string())
     }
@@ -1234,6 +1281,21 @@ impl KmsTopologyClient {
 
     pub(crate) fn drain_render_commands(&self) -> Result<Vec<KmsRenderCommand>, String> {
         drain_kms_render_commands(&self.render_commands)
+    }
+
+    /// Ask the protocol thread which lock lifecycle owns presentation now.
+    ///
+    /// Resume must make this decision before it offers retained scanout to the
+    /// renderer. Reading a cached coordinator-side copy would create exactly
+    /// the pause race this query exists to close.
+    pub(crate) fn session_lock_active(&self, timeout: Duration) -> Result<bool, String> {
+        let (acknowledgement, reply) = mpsc::sync_channel(1);
+        self.commands
+            .send(ProtocolCommand::QuerySessionLockActive { acknowledgement })
+            .map_err(|_| "Wayland protocol thread disconnected".to_string())?;
+        reply
+            .recv_timeout(timeout)
+            .map_err(|error| format!("Wayland session-lock query failed: {error}"))
     }
 
     /// Wake the protocol loop and wait until its compacted renderer outbox has
@@ -2232,6 +2294,9 @@ impl ProtocolServer {
             session_lock_state,
             lock_lifecycle: LockLifecycle::Unlocked,
             lock_surfaces_by_output: HashMap::new(),
+            kms_session_lock_gate: KmsSessionLockGate::default(),
+            #[cfg(test)]
+            session_unlock_callbacks: 0,
             next_lock_generation: 0,
             next_security_presentation_epoch: 0,
             saved_cursor_selection: None,
@@ -2401,6 +2466,13 @@ impl ProtocolServer {
                     state.release_buffer_token(token);
                 }
                 ChannelEvent::Msg(ProtocolCommand::KmsRenderReply { reply }) => {
+                    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+                    let ready = match &reply {
+                        KmsRenderReply::OutputReady { generation, key } => {
+                            Some((*generation, key.clone()))
+                        }
+                        _ => None,
+                    };
                     match state.backend.apply_kms_render_reply(reply) {
                         Ok(commands) if !commands.is_empty() => {
                             for command in commands {
@@ -2413,7 +2485,14 @@ impl ProtocolServer {
                                 }
                             }
                         }
-                        Ok(_) => {}
+                        Ok(_) => {
+                            #[cfg(any(all(feature = "kms-live", not(test)), test))]
+                            if let Some((generation, key)) = ready
+                                && state.backend.kms_output_is_ready(generation, &key)
+                            {
+                                state.kms_output_ready(generation, &key);
+                            }
+                        }
                         Err(error) => {
                             state
                                 .events
@@ -2424,9 +2503,9 @@ impl ProtocolServer {
                 }
                 ChannelEvent::Msg(ProtocolCommand::SecurityPresented {
                     presentation_epoch,
-                    output,
+                    evidence,
                 }) => {
-                    state.acknowledge_security_presentation(presentation_epoch, &output);
+                    state.acknowledge_security_presentation(presentation_epoch, evidence);
                 }
                 #[cfg(any(all(feature = "kms-live", not(test)), test))]
                 ChannelEvent::Msg(ProtocolCommand::KmsTopologyLifecycle {
@@ -2434,6 +2513,11 @@ impl ProtocolServer {
                     acknowledgement,
                 }) => {
                     let pause = matches!(&event, KmsTopologyLifecycleEvent::Pause);
+                    let resumed = matches!(&event, KmsTopologyLifecycleEvent::Resume(_));
+                    let previous_kms_outputs = state.backend.kms_registered_outputs();
+                    if pause {
+                        state.kms_authority_lost();
+                    }
                     let previous_scale = state.backend.output_scale();
                     let previous_output = state.logical_output_rect();
                     let previous_usable = state.usable_output_rect();
@@ -2457,6 +2541,14 @@ impl ProtocolServer {
                                     &state.display_handle,
                                     &mapped_surfaces,
                                 );
+                                let current_kms_outputs = state.backend.kms_registered_outputs();
+                                state.retire_replaced_kms_lock_surfaces(
+                                    &previous_kms_outputs,
+                                    &current_kms_outputs,
+                                );
+                                let presentation_generations =
+                                    state.backend.kms_presentation_generations();
+                                state.kms_begin_preparing(presentation_generations, resumed);
                                 state.reconcile_layer_output_bindings();
                                 let scale = state.backend.output_scale();
                                 if scale != previous_scale {
@@ -2482,6 +2574,10 @@ impl ProtocolServer {
                         state.request_shutdown(ProtocolShutdownCause::RuntimeFailure);
                     }
                     let _ = acknowledgement.send(result);
+                }
+                #[cfg(any(all(feature = "kms-live", not(test)), test))]
+                ChannelEvent::Msg(ProtocolCommand::QuerySessionLockActive { acknowledgement }) => {
+                    let _ = acknowledgement.send(state.session_lock_active());
                 }
                 #[cfg(any(all(feature = "kms-live", not(test)), test))]
                 ChannelEvent::Msg(ProtocolCommand::FlushEvents { acknowledgement }) => {
@@ -3847,6 +3943,7 @@ enum LockLifecycle {
         generation: u64,
         presentation_epoch: u64,
         pending_outputs: HashSet<String>,
+        pending_kms_outputs: BTreeMap<crate::backend::kms::OutputKey, u64>,
     },
     Locked {
         owner: ClientId,
@@ -3861,6 +3958,248 @@ enum LockLifecycle {
 impl LockLifecycle {
     fn is_active(&self) -> bool {
         !matches!(self, Self::Unlocked)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(any(feature = "kms-live", test)), allow(dead_code))]
+enum KmsSecurityBarrierPurpose {
+    LockResume,
+    UnlockRestore,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KmsSecurityBarrier {
+    purpose: KmsSecurityBarrierPurpose,
+    presentation_epoch: u64,
+    pending_outputs: BTreeMap<crate::backend::kms::OutputKey, u64>,
+}
+
+impl KmsSecurityBarrier {
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    fn acknowledge(
+        &mut self,
+        presentation_epoch: u64,
+        generation: u64,
+        output: &crate::backend::kms::OutputKey,
+    ) -> bool {
+        if self.presentation_epoch != presentation_epoch
+            || self.pending_outputs.get(output) != Some(&generation)
+        {
+            return false;
+        }
+        self.pending_outputs.remove(output);
+        self.pending_outputs.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(any(feature = "kms-live", test)), allow(dead_code))]
+enum KmsPresentationPhase {
+    Unavailable,
+    Preparing {
+        outputs: BTreeMap<crate::backend::kms::OutputKey, u64>,
+        ready: BTreeSet<crate::backend::kms::OutputKey>,
+    },
+    Ready {
+        outputs: BTreeMap<crate::backend::kms::OutputKey, u64>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KmsSessionLockGate {
+    phase: KmsPresentationPhase,
+    resume_barrier: Option<KmsSecurityBarrier>,
+    deferred_unlock: bool,
+    unlock_barrier: Option<KmsSecurityBarrier>,
+    input_hold_logged: bool,
+    suppressed_keys: HashSet<Keycode>,
+    suppressed_buttons: HashSet<u32>,
+    physical_touch_slots: HashSet<TouchSlot>,
+    suppressed_touch_slots: HashSet<TouchSlot>,
+}
+
+impl Default for KmsSessionLockGate {
+    fn default() -> Self {
+        Self {
+            phase: KmsPresentationPhase::Unavailable,
+            resume_barrier: None,
+            deferred_unlock: false,
+            unlock_barrier: None,
+            input_hold_logged: false,
+            suppressed_keys: HashSet::new(),
+            suppressed_buttons: HashSet::new(),
+            physical_touch_slots: HashSet::new(),
+            suppressed_touch_slots: HashSet::new(),
+        }
+    }
+}
+
+#[cfg_attr(not(any(feature = "kms-live", test)), allow(dead_code))]
+impl KmsSessionLockGate {
+    fn authority_lost(&mut self) {
+        if self.unlock_barrier.take().is_some() {
+            self.deferred_unlock = true;
+        }
+        self.phase = KmsPresentationPhase::Unavailable;
+        self.resume_barrier = None;
+        self.input_hold_logged = false;
+        // Touch-device reconciliation reaches the seat through synthetic
+        // device removal with `user_activity=false`, so it deliberately
+        // bypasses `observe_physical_touch`. Authority loss is the physical
+        // boundary: neither the source map nor its quarantine may survive it.
+        self.physical_touch_slots.clear();
+        self.suppressed_touch_slots.clear();
+    }
+
+    fn begin_preparing(&mut self, outputs: BTreeMap<crate::backend::kms::OutputKey, u64>) {
+        self.phase = KmsPresentationPhase::Preparing {
+            outputs,
+            ready: BTreeSet::new(),
+        };
+        self.input_hold_logged = false;
+    }
+
+    fn output_ready(&mut self, generation: u64, output: &crate::backend::kms::OutputKey) -> bool {
+        let KmsPresentationPhase::Preparing { outputs, ready } = &mut self.phase else {
+            return false;
+        };
+        if outputs.get(output) != Some(&generation) {
+            return false;
+        }
+        ready.insert(output.clone());
+        if ready.len() != outputs.len() || outputs.is_empty() {
+            return false;
+        }
+        let outputs = outputs.clone();
+        self.phase = KmsPresentationPhase::Ready { outputs };
+        true
+    }
+
+    fn ready_outputs(&self) -> Option<&BTreeMap<crate::backend::kms::OutputKey, u64>> {
+        match &self.phase {
+            KmsPresentationPhase::Ready { outputs } if !outputs.is_empty() => Some(outputs),
+            KmsPresentationPhase::Unavailable
+            | KmsPresentationPhase::Preparing { .. }
+            | KmsPresentationPhase::Ready { .. } => None,
+        }
+    }
+
+    fn client_delivery_blocked(&self, lock_active: bool, locking: bool) -> bool {
+        (lock_active
+            && (!matches!(self.phase, KmsPresentationPhase::Ready { .. })
+                || locking
+                || self.resume_barrier.is_some()))
+            || self.deferred_unlock
+            || self.unlock_barrier.is_some()
+    }
+
+    fn normal_scene_restricted(&self) -> bool {
+        self.deferred_unlock || self.unlock_barrier.is_some()
+    }
+
+    fn observe_physical_touch(&mut self, input: &HostInput) {
+        match input {
+            HostInput::TouchDown { slot, .. } => {
+                self.physical_touch_slots.insert(*slot);
+            }
+            HostInput::TouchUp { slot, .. } => {
+                self.physical_touch_slots.remove(slot);
+            }
+            HostInput::TouchCancel => self.physical_touch_slots.clear(),
+            _ => {}
+        }
+    }
+
+    fn quarantine_current_input(
+        &mut self,
+        keys: impl IntoIterator<Item = Keycode>,
+        buttons: impl IntoIterator<Item = u32>,
+    ) {
+        self.suppressed_keys.extend(keys);
+        self.suppressed_buttons.extend(buttons);
+        self.suppressed_touch_slots
+            .extend(self.physical_touch_slots.iter().copied());
+    }
+
+    fn observe_blocked_input(&mut self, input: &HostInput) {
+        match input {
+            HostInput::Key {
+                keycode,
+                state: HostButtonState::Pressed,
+                ..
+            } => {
+                self.suppressed_keys.insert(*keycode);
+            }
+            HostInput::Key {
+                keycode,
+                state: HostButtonState::Released,
+                ..
+            } => {
+                self.suppressed_keys.remove(keycode);
+            }
+            HostInput::PointerButton {
+                button,
+                state: HostButtonState::Pressed,
+                ..
+            } => {
+                self.suppressed_buttons.insert(*button);
+            }
+            HostInput::PointerButton {
+                button,
+                state: HostButtonState::Released,
+                ..
+            } => {
+                self.suppressed_buttons.remove(button);
+            }
+            HostInput::TouchDown { slot, .. } => {
+                self.suppressed_touch_slots.insert(*slot);
+            }
+            HostInput::TouchUp { slot, .. } => {
+                self.suppressed_touch_slots.remove(slot);
+            }
+            HostInput::TouchCancel => self.suppressed_touch_slots.clear(),
+            _ => {}
+        }
+    }
+
+    fn suppress_quarantined_input(&mut self, input: &HostInput) -> bool {
+        match input {
+            HostInput::Key {
+                keycode,
+                state: HostButtonState::Released,
+                ..
+            } if self.suppressed_keys.remove(keycode) => true,
+            HostInput::Key { keycode, .. } if self.suppressed_keys.contains(keycode) => true,
+            HostInput::PointerButton {
+                button,
+                state: HostButtonState::Released,
+                ..
+            } if self.suppressed_buttons.remove(button) => true,
+            HostInput::PointerButton { button, .. } if self.suppressed_buttons.contains(button) => {
+                true
+            }
+            HostInput::TouchDown { slot, .. } if !self.suppressed_touch_slots.is_empty() => {
+                self.suppressed_touch_slots.insert(*slot);
+                true
+            }
+            HostInput::TouchMotion { .. } | HostInput::TouchFrame
+                if !self.suppressed_touch_slots.is_empty() =>
+            {
+                true
+            }
+            HostInput::TouchUp { slot, .. }
+                if self.suppressed_touch_slots.remove(slot)
+                    || !self.suppressed_touch_slots.is_empty() =>
+            {
+                true
+            }
+            HostInput::TouchCancel if !self.suppressed_touch_slots.is_empty() => {
+                self.suppressed_touch_slots.clear();
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -4141,6 +4480,9 @@ struct WaylandState {
     session_lock_state: SessionLockManagerState,
     lock_lifecycle: LockLifecycle,
     lock_surfaces_by_output: HashMap<String, ObjectId>,
+    kms_session_lock_gate: KmsSessionLockGate,
+    #[cfg(test)]
+    session_unlock_callbacks: usize,
     next_lock_generation: u64,
     next_security_presentation_epoch: u64,
     saved_cursor_selection: Option<CursorSelection>,
@@ -4891,12 +5233,14 @@ fn committed_syncobj_state(
 impl WaylandState {
     fn session_lock_active(&self) -> bool {
         self.lock_lifecycle.is_active()
+            || (matches!(self.backend, BackendData::Kms(_))
+                && self.kms_session_lock_gate.normal_scene_restricted())
     }
 
     fn session_lock_acceptance_output(&self) -> Option<Output> {
-        if !matches!(self.backend, BackendData::Winit(_)) {
-            // Slice 2 connects KMS displayed-frame evidence to
-            // SecurityPresentationReporter. Until then KMS must fail closed.
+        if matches!(self.backend, BackendData::Kms(_))
+            && self.kms_session_lock_gate.ready_outputs().is_none()
+        {
             return None;
         }
         self.backend
@@ -4922,6 +5266,11 @@ impl WaylandState {
         let presentation_epoch = self.next_security_presentation_epoch;
         let mut pending_outputs = HashSet::new();
         pending_outputs.insert(output.name());
+        let pending_kms_outputs = self
+            .kms_session_lock_gate
+            .ready_outputs()
+            .cloned()
+            .unwrap_or_default();
 
         // Reconcile releases while ordinary focus and binding state still have
         // their pre-lock meaning, then make every later policy query fail closed.
@@ -4933,13 +5282,17 @@ impl WaylandState {
             generation,
             presentation_epoch,
             pending_outputs,
+            pending_kms_outputs,
         };
         self.teardown_input_for_session_lock();
         self.close_all_foreign_toplevels();
         self.events.push(ProtocolEvent::SecurityScene {
             active: true,
             presentation_epoch: Some(presentation_epoch),
-            presentation_outputs: vec![output.name()],
+            presentations: vec![SecurityPresentationTarget {
+                output: output.name(),
+                scene: SecurityPresentationScene::Blank,
+            }],
         });
         self.events.push(ProtocolEvent::SurfaceRoster {
             mapped: self.mapped_surface_ids().into_iter().collect(),
@@ -5005,7 +5358,23 @@ impl WaylandState {
         self.publish_current_cursor();
     }
 
-    fn acknowledge_security_presentation(&mut self, presentation_epoch: u64, output: &str) {
+    fn acknowledge_security_presentation(
+        &mut self,
+        presentation_epoch: u64,
+        evidence: SecurityPresentationEvidence,
+    ) {
+        match evidence {
+            SecurityPresentationEvidence::Nested { output } => {
+                self.acknowledge_nested_security_presentation(presentation_epoch, &output);
+            }
+            #[cfg(any(all(feature = "kms-live", not(test)), test))]
+            SecurityPresentationEvidence::Kms { generation, output } => {
+                self.acknowledge_kms_security_presentation(presentation_epoch, generation, &output);
+            }
+        }
+    }
+
+    fn acknowledge_nested_security_presentation(&mut self, presentation_epoch: u64, output: &str) {
         let lifecycle = mem::replace(&mut self.lock_lifecycle, LockLifecycle::Unlocked);
         match lifecycle {
             LockLifecycle::Locking {
@@ -5015,6 +5384,7 @@ impl WaylandState {
                 generation,
                 presentation_epoch: expected,
                 mut pending_outputs,
+                pending_kms_outputs,
             } if expected == presentation_epoch => {
                 pending_outputs.remove(output);
                 if pending_outputs.is_empty() {
@@ -5037,10 +5407,121 @@ impl WaylandState {
                         generation,
                         presentation_epoch: expected,
                         pending_outputs,
+                        pending_kms_outputs,
                     };
                 }
             }
             other => self.lock_lifecycle = other,
+        }
+    }
+
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    fn acknowledge_kms_security_presentation(
+        &mut self,
+        presentation_epoch: u64,
+        generation: u64,
+        output: &crate::backend::kms::OutputKey,
+    ) {
+        let lifecycle = mem::replace(&mut self.lock_lifecycle, LockLifecycle::Unlocked);
+        match lifecycle {
+            LockLifecycle::Locking {
+                owner,
+                lock_resource,
+                locker,
+                generation: lock_generation,
+                presentation_epoch: expected_epoch,
+                pending_outputs,
+                mut pending_kms_outputs,
+            } if expected_epoch == presentation_epoch
+                && pending_kms_outputs.get(output) == Some(&generation) =>
+            {
+                pending_kms_outputs.remove(output);
+                tracing::info!(
+                    presentation_epoch,
+                    generation,
+                    output = output.connector_name,
+                    phase = "initial-lock",
+                    "session-lock-kms-epoch-displayed"
+                );
+                tracing::info!(
+                    presentation_epoch,
+                    generation,
+                    "session-lock-kms-initial-epoch-displayed"
+                );
+                if pending_kms_outputs.is_empty() {
+                    locker.lock();
+                    self.lock_lifecycle = LockLifecycle::Locked {
+                        owner,
+                        lock_resource,
+                        generation: lock_generation,
+                    };
+                    tracing::info!(
+                        generation = lock_generation,
+                        presentation_epoch,
+                        "session lock entered Locked"
+                    );
+                } else {
+                    self.lock_lifecycle = LockLifecycle::Locking {
+                        owner,
+                        lock_resource,
+                        locker,
+                        generation: lock_generation,
+                        presentation_epoch: expected_epoch,
+                        pending_outputs,
+                        pending_kms_outputs,
+                    };
+                }
+                return;
+            }
+            other => self.lock_lifecycle = other,
+        }
+
+        let resume_complete = self
+            .kms_session_lock_gate
+            .resume_barrier
+            .as_mut()
+            .is_some_and(|barrier| barrier.acknowledge(presentation_epoch, generation, output));
+        if resume_complete {
+            self.kms_session_lock_gate.resume_barrier = None;
+            self.kms_session_lock_gate.input_hold_logged = false;
+            tracing::info!(
+                presentation_epoch,
+                generation,
+                output = output.connector_name,
+                phase = "resume-lock",
+                "session-lock-kms-epoch-displayed"
+            );
+            tracing::info!(
+                presentation_epoch,
+                generation,
+                "session-lock-kms-resume-epoch-displayed"
+            );
+            tracing::info!("session-lock-kms-locked-exposure-enabled");
+            return;
+        }
+
+        let unlock_complete = self
+            .kms_session_lock_gate
+            .unlock_barrier
+            .as_mut()
+            .is_some_and(|barrier| barrier.acknowledge(presentation_epoch, generation, output));
+        if unlock_complete {
+            self.kms_session_lock_gate.unlock_barrier = None;
+            self.kms_session_lock_gate.input_hold_logged = false;
+            tracing::info!(
+                presentation_epoch,
+                generation,
+                output = output.connector_name,
+                phase = "resume-unlock",
+                "session-lock-kms-epoch-displayed"
+            );
+            tracing::info!(
+                presentation_epoch,
+                generation,
+                "session-lock-kms-unlock-epoch-displayed"
+            );
+            self.restore_unlocked_focus_and_input();
+            tracing::info!("session-lock-kms-normal-exposure-restored");
         }
     }
 
@@ -5065,24 +5546,65 @@ impl WaylandState {
         }
     }
 
-    fn leave_session_lock(&mut self) {
-        if !matches!(self.lock_lifecycle, LockLifecycle::Locked { .. }) {
-            return;
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    fn reconcile_input_before_kms_unlock(&mut self) {
+        let keys = self.keyboard.pressed_keys();
+        let buttons = self.pointer.current_pressed();
+        self.kms_session_lock_gate
+            .quarantine_current_input(keys.iter().copied(), buttons.iter().copied());
+        let held = input::SeatHeldState {
+            keys: keys.clone(),
+            buttons: buttons.clone(),
+        };
+        let releases = self.input_ingress.release_session_boundary(&held);
+        for input in releases {
+            self.handle_host_input_with_activity(input, false);
         }
-        self.lock_lifecycle = LockLifecycle::Unlocked;
-        self.deactivate_all_lock_surfaces();
+        self.release_pressed_keys();
+        let time = monotonic_millis();
+        for button in self.pointer.current_pressed() {
+            self.pointer_button(button, HostButtonState::Released, time);
+        }
+        self.teardown_input_for_session_lock();
+        tracing::info!("session-lock-kms-lock-input-reconciled");
+    }
+
+    fn prepare_unlock_scene_transition(&mut self) {
+        #[cfg(any(all(feature = "kms-live", not(test)), test))]
+        if matches!(self.backend, BackendData::Kms(_)) {
+            self.reconcile_input_before_kms_unlock();
+            // Establish the policy gate before changing the protocol lifecycle.
+            // Surface deactivation re-hit-tests focus synchronously.
+            self.kms_session_lock_gate.deferred_unlock = true;
+        }
+    }
+
+    fn publish_unlocked_scene(
+        &mut self,
+        presentation_epoch: Option<u64>,
+        presentation_outputs: Vec<String>,
+    ) {
         self.events.push(ProtocolEvent::SecurityScene {
             active: false,
-            presentation_epoch: None,
-            presentation_outputs: Vec::new(),
+            presentation_epoch,
+            presentations: presentation_outputs
+                .into_iter()
+                .map(|output| SecurityPresentationTarget {
+                    output,
+                    scene: SecurityPresentationScene::Client,
+                })
+                .collect(),
         });
         self.events.push(ProtocolEvent::SurfaceRoster {
             mapped: self.mapped_surface_ids().into_iter().collect(),
         });
-        // A roster removes stale entities but cannot recreate the static
-        // surfaces withdrawn at lock entry. Re-derive a complete upsert for
-        // every presentable surface even when it did not commit while locked.
         self.pending_full_upserts.extend(self.mapped_surface_ids());
+    }
+
+    fn restore_unlocked_focus_and_input(&mut self) {
+        if self.session_lock_active() {
+            return;
+        }
         if let Some(selection) = self.saved_cursor_selection.take() {
             self.cursor_selection = selection;
             self.publish_current_cursor();
@@ -5098,37 +5620,206 @@ impl WaylandState {
         }
         self.arbitrate_keyboard_focus(None, true, false);
         self.retarget_pointer_after_visibility_change();
+    }
+
+    fn finish_unlock_scene_transition(&mut self) {
+        if matches!(self.backend, BackendData::Kms(_)) {
+            let Some(outputs) = self.kms_session_lock_gate.ready_outputs().cloned() else {
+                self.kms_session_lock_gate.deferred_unlock = true;
+                tracing::info!("session-lock-kms-unlock-deferred-authority-lost");
+                return;
+            };
+            self.next_security_presentation_epoch =
+                self.next_security_presentation_epoch.saturating_add(1);
+            let presentation_epoch = self.next_security_presentation_epoch;
+            self.kms_session_lock_gate.deferred_unlock = false;
+            self.kms_session_lock_gate.resume_barrier = None;
+            self.kms_session_lock_gate.unlock_barrier = Some(KmsSecurityBarrier {
+                purpose: KmsSecurityBarrierPurpose::UnlockRestore,
+                presentation_epoch,
+                pending_outputs: outputs.clone(),
+            });
+            let presentation_outputs = outputs
+                .keys()
+                .map(|output| output.connector_name.clone())
+                .collect();
+            self.publish_unlocked_scene(Some(presentation_epoch), presentation_outputs);
+            tracing::info!(
+                presentation_epoch,
+                outputs = outputs.len(),
+                "session-lock-kms-unlock-presentation-armed"
+            );
+            return;
+        }
+
+        self.publish_unlocked_scene(None, Vec::new());
+        self.restore_unlocked_focus_and_input();
+    }
+
+    fn leave_session_lock(&mut self) {
+        if !matches!(self.lock_lifecycle, LockLifecycle::Locked { .. }) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.session_unlock_callbacks = self.session_unlock_callbacks.saturating_add(1);
+        }
+        self.prepare_unlock_scene_transition();
+        self.lock_lifecycle = LockLifecycle::Unlocked;
+        self.deactivate_all_lock_surfaces();
+        self.finish_unlock_scene_transition();
         tracing::info!("session lock returned to Unlocked");
     }
 
     fn abort_locking_after_owner_death(&mut self, lock_resource: &ExtSessionLockV1) {
         self.session_lock_state.abort_lock_outputs(lock_resource);
+        self.prepare_unlock_scene_transition();
         self.lock_lifecycle = LockLifecycle::Unlocked;
         self.deactivate_all_lock_surfaces();
+        self.finish_unlock_scene_transition();
+    }
+
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    fn kms_authority_lost(&mut self) {
+        self.reconcile_all_input_authority_loss();
+        self.kms_session_lock_gate.authority_lost();
+        tracing::info!(
+            lock_state = match self.lock_lifecycle {
+                LockLifecycle::Unlocked => "unlocked",
+                LockLifecycle::Locking { .. } => "locking",
+                LockLifecycle::Locked { .. } => "locked",
+                LockLifecycle::OrphanedLocked { .. } => "orphaned-locked",
+            },
+            "session-lock-kms-authority-lost"
+        );
+    }
+
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    fn retire_replaced_kms_lock_surfaces(
+        &mut self,
+        previous: &[(crate::backend::kms::OutputKey, Output)],
+        current: &[(crate::backend::kms::OutputKey, Output)],
+    ) {
+        let current_keys = current.iter().map(|(key, _)| key).collect::<HashSet<_>>();
+        let retired_outputs = previous
+            .iter()
+            .filter(|(key, _)| !current_keys.contains(key))
+            .map(|(_, output)| output.clone())
+            .collect::<Vec<_>>();
+        for retired_output in retired_outputs {
+            let lock_surface = self.surfaces.values().find_map(|record| {
+                let SurfaceRole::LockSurface(role) = &record.role else {
+                    return None;
+                };
+                (role.output == retired_output)
+                    .then_some((role.surface.clone(), role.surface.wl_surface().clone()))
+            });
+            let Some((lock_surface, wl_surface)) = lock_surface else {
+                continue;
+            };
+            self.session_lock_state.retire_lock_surface(&lock_surface);
+            if self
+                .lock_surfaces_by_output
+                .get(&retired_output.name())
+                .is_some_and(|object| object == &wl_surface.id())
+            {
+                self.lock_surfaces_by_output.remove(&retired_output.name());
+            }
+            self.deactivate_surface_role(&wl_surface);
+            tracing::info!(
+                output = retired_output.name(),
+                "session-lock-kms-output-lock-surface-retired"
+            );
+        }
+    }
+
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    fn kms_begin_preparing(
+        &mut self,
+        outputs: BTreeMap<crate::backend::kms::OutputKey, u64>,
+        resumed: bool,
+    ) {
+        self.kms_session_lock_gate.begin_preparing(outputs.clone());
+        if !self.lock_lifecycle.is_active() {
+            return;
+        }
+
+        self.next_security_presentation_epoch =
+            self.next_security_presentation_epoch.saturating_add(1);
+        let presentation_epoch = self.next_security_presentation_epoch;
+        let presentations = outputs
+            .keys()
+            .map(|output| SecurityPresentationTarget {
+                output: output.connector_name.clone(),
+                scene: self.kms_lock_scene_for_output(&output.connector_name),
+            })
+            .collect::<Vec<_>>();
+        let presentation_outputs = presentations
+            .iter()
+            .map(|presentation| presentation.output.clone())
+            .collect::<Vec<_>>();
+        match &mut self.lock_lifecycle {
+            LockLifecycle::Locking {
+                presentation_epoch: epoch,
+                pending_outputs,
+                pending_kms_outputs,
+                ..
+            } => {
+                *epoch = presentation_epoch;
+                *pending_outputs = presentation_outputs.iter().cloned().collect();
+                *pending_kms_outputs = outputs.clone();
+            }
+            LockLifecycle::Locked { .. } | LockLifecycle::OrphanedLocked { .. } => {
+                self.kms_session_lock_gate.resume_barrier = Some(KmsSecurityBarrier {
+                    purpose: KmsSecurityBarrierPurpose::LockResume,
+                    presentation_epoch,
+                    pending_outputs: outputs.clone(),
+                });
+            }
+            LockLifecycle::Unlocked => unreachable!("active lock checked above"),
+        }
         self.events.push(ProtocolEvent::SecurityScene {
-            active: false,
-            presentation_epoch: None,
-            presentation_outputs: Vec::new(),
+            active: true,
+            presentation_epoch: Some(presentation_epoch),
+            presentations,
         });
         self.events.push(ProtocolEvent::SurfaceRoster {
             mapped: self.mapped_surface_ids().into_iter().collect(),
         });
-        self.pending_full_upserts.extend(self.mapped_surface_ids());
-        if let Some(selection) = self.saved_cursor_selection.take() {
-            self.cursor_selection = selection;
-            self.publish_current_cursor();
+        tracing::info!(
+            presentation_epoch,
+            outputs = outputs.len(),
+            resumed,
+            "session-lock-kms-resume-blank-first"
+        );
+        tracing::info!(presentation_epoch, "session-lock-kms-normal-exposure-held");
+    }
+
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    fn kms_lock_scene_for_output(&self, output_name: &str) -> SecurityPresentationScene {
+        let has_mapped_lock_surface = self
+            .lock_surfaces_by_output
+            .get(output_name)
+            .and_then(|object| self.surfaces.get(object))
+            .is_some_and(|record| {
+                record.mapped && matches!(record.role, SurfaceRole::LockSurface(_))
+            });
+        if has_mapped_lock_surface {
+            SecurityPresentationScene::Lock
+        } else {
+            SecurityPresentationScene::Blank
         }
-        let toplevels = self
-            .surfaces
-            .values()
-            .filter(|record| record.mapped && matches!(record.role, SurfaceRole::Toplevel(_)))
-            .map(|record| record.role.wl_surface().clone())
-            .collect::<Vec<_>>();
-        for surface in toplevels {
-            self.sync_foreign_toplevel(&surface);
+    }
+
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    fn kms_output_ready(&mut self, generation: u64, output: &crate::backend::kms::OutputKey) {
+        if !self.kms_session_lock_gate.output_ready(generation, output) {
+            return;
         }
-        self.arbitrate_keyboard_focus(None, true, false);
-        self.retarget_pointer_after_visibility_change();
+        tracing::info!(generation, "session-lock-kms-output-set-ready");
+        if self.kms_session_lock_gate.deferred_unlock {
+            self.finish_unlock_scene_transition();
+        }
     }
 
     fn handle_client_disconnect(&mut self, client_id: &ClientId) {
@@ -5213,6 +5904,15 @@ impl WaylandState {
             self.handle_host_input(input);
         }
 
+        if matches!(self.backend, BackendData::Kms(_))
+            && self.kms_session_lock_gate.client_delivery_blocked(
+                self.session_lock_active(),
+                matches!(self.lock_lifecycle, LockLifecycle::Locking { .. }),
+            )
+        {
+            return;
+        }
+
         let frame_time = monotonic_millis();
         let mut delivered = self
             .surfaces
@@ -5254,22 +5954,80 @@ impl WaylandState {
     }
 
     fn handle_host_input_with_activity(&mut self, input: HostInput, user_activity: bool) {
-        if user_activity
-            && matches!(
-                &input,
-                HostInput::PointerMotionAbsolute { .. }
-                    | HostInput::PointerMotion { .. }
-                    | HostInput::PointerButton { .. }
-                    | HostInput::PointerAxis { .. }
-                    | HostInput::Key { .. }
-                    | HostInput::TouchDown { .. }
-                    | HostInput::TouchMotion { .. }
-                    | HostInput::TouchUp { .. }
-                    | HostInput::TouchFrame
-                    | HostInput::TouchCancel
-            )
-        {
+        let exposure_sensitive = matches!(
+            &input,
+            HostInput::PointerMotionAbsolute { .. }
+                | HostInput::PointerMotion { .. }
+                | HostInput::PointerButton { .. }
+                | HostInput::PointerAxis { .. }
+                | HostInput::Key { .. }
+                | HostInput::TouchDown { .. }
+                | HostInput::TouchMotion { .. }
+                | HostInput::TouchUp { .. }
+                | HostInput::TouchFrame
+                | HostInput::TouchCancel
+        );
+        if user_activity && exposure_sensitive {
             self.notify_idle_activity();
+        }
+        if user_activity && matches!(self.backend, BackendData::Kms(_)) {
+            self.kms_session_lock_gate.observe_physical_touch(&input);
+        }
+        let kms_delivery_blocked = user_activity
+            && exposure_sensitive
+            && matches!(self.backend, BackendData::Kms(_))
+            && self.kms_session_lock_gate.client_delivery_blocked(
+                self.session_lock_active(),
+                matches!(self.lock_lifecycle, LockLifecycle::Locking { .. }),
+            );
+        if kms_delivery_blocked
+            && let HostInput::Key {
+                keycode,
+                state,
+                time,
+            } = input
+        {
+            self.kms_session_lock_gate.observe_blocked_input(&input);
+            if !self.kms_session_lock_gate.input_hold_logged {
+                self.kms_session_lock_gate.input_hold_logged = true;
+                tracing::info!("session-lock-kms-input-held");
+            }
+            // Update XKB and evaluate the compositor-only Ctrl-Alt-Fn escape
+            // route before the client-presentation gate swallows the key.
+            // Every non-VT disposition is intercepted below and cannot reach
+            // a client.
+            self.keyboard_keycode_presentation_gated(keycode, state, time);
+            return;
+        }
+        if kms_delivery_blocked {
+            self.kms_session_lock_gate.observe_blocked_input(&input);
+            if !self.kms_session_lock_gate.input_hold_logged {
+                self.kms_session_lock_gate.input_hold_logged = true;
+                tracing::info!("session-lock-kms-input-held");
+            }
+            return;
+        }
+        if user_activity
+            && matches!(self.backend, BackendData::Kms(_))
+            && self
+                .kms_session_lock_gate
+                .suppress_quarantined_input(&input)
+        {
+            if let HostInput::Key {
+                keycode,
+                state: HostButtonState::Released,
+                time,
+            } = input
+            {
+                // Quarantine is a client-delivery boundary, not an XKB
+                // boundary. A press observed while the presentation gate was
+                // closed already advanced Smithay's pressed/modifier state,
+                // so its release must take the same intercepted path even if
+                // the display barrier opened in between.
+                self.keyboard_keycode_presentation_gated(keycode, HostButtonState::Released, time);
+            }
+            tracing::debug!("suppressed input carried across the KMS lock boundary");
+            return;
         }
         match input {
             HostInput::PointerMotionAbsolute { x, y, time } => self.pointer_moved(x, y, time),
@@ -8240,6 +8998,46 @@ impl WaylandState {
         }
     }
 
+    /// Advance XKB while presentation is closed, retaining only the KMS
+    /// Ctrl-Alt-Fn action. The filter intercepts every event, including keys
+    /// which are not compositor bindings, so the stalled client sees nothing.
+    fn keyboard_keycode_presentation_gated(
+        &mut self,
+        keycode: Keycode,
+        state: HostButtonState,
+        time: u32,
+    ) {
+        let keyboard = self.keyboard.clone();
+        let pressed = state == HostButtonState::Pressed;
+        let action = keyboard
+            .input::<Option<BindingAction>, _>(
+                self,
+                keycode,
+                smithay_key_state(state),
+                SERIAL_COUNTER.next_serial(),
+                time,
+                |state, modifiers, key_handle| {
+                    let keysym = key_handle.raw_latin_sym_or_raw_current_sym();
+                    match state
+                        .bindings
+                        .dispatch_session_locked(keycode, pressed, keysym, modifiers)
+                    {
+                        KeyDisposition::Act(action @ BindingAction::SwitchVt(_)) => {
+                            FilterResult::Intercept(Some(action))
+                        }
+                        KeyDisposition::Forward
+                        | KeyDisposition::SwallowRelease
+                        | KeyDisposition::Act(_) => FilterResult::Intercept(None),
+                    }
+                },
+            )
+            .flatten();
+        invalidate_keyboard_action(&mut self.last_keyboard_action);
+        if let Some(action) = action {
+            self.handle_binding_action(action);
+        }
+    }
+
     /// Release every pressed key when input authority is lost.
     ///
     /// Both backends lose authority, for different reasons: the nested one when
@@ -8356,7 +9154,7 @@ impl WaylandState {
         self.surfaces
             .values()
             .filter(|record| {
-                if !self.surface_is_session_presentable(record)
+                if !self.surface_is_input_presentable(record)
                     || !record.layout.visible
                     || x < f64::from(record.layout.x)
                     || y < f64::from(record.layout.y)
@@ -8400,6 +9198,15 @@ impl WaylandState {
             | LockLifecycle::Locked { generation, .. }
             | LockLifecycle::OrphanedLocked { generation } => lock_generation == Some(*generation),
         }
+    }
+
+    fn surface_is_input_presentable(&self, record: &SurfaceRecord) -> bool {
+        if matches!(self.lock_lifecycle, LockLifecycle::Unlocked)
+            && self.kms_session_lock_gate.normal_scene_restricted()
+        {
+            return false;
+        }
+        self.surface_is_session_presentable(record)
     }
 
     fn surface_is_renderer_presentable(&self, record: &SurfaceRecord) -> bool {
@@ -9168,7 +9975,7 @@ impl WaylandState {
                 .filter(|surface| {
                     self.surfaces
                         .get(&surface.id())
-                        .is_some_and(|record| self.surface_is_session_presentable(record))
+                        .is_some_and(|record| self.surface_is_input_presentable(record))
                 })
                 .or_else(|| self.highest_visible_lock_surface())
         } else if let Some((object, surface)) = self.highest_exclusive_layer() {

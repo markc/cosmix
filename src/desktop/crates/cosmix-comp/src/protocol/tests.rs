@@ -1,4 +1,5 @@
 use super::*;
+use crate::backend::kms::OutputKey;
 // The input traits the Rung E-1 fake backend implements. Deliberately imported
 // from smithay rather than re-exported through `protocol::input`: the fake has
 // to satisfy the real trait, or it proves nothing about the real router.
@@ -19,7 +20,7 @@ use smithay::backend::input::{
 use smithay::reexports::calloop::{EventSource, Poll, PostAction, Readiness, Token, TokenFactory};
 use smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_surface_v1::Error as SessionLockSurfaceError;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     ffi::CString,
     fs::File,
@@ -9301,6 +9302,98 @@ fn live_input_dispatch_publishes_the_kms_vt_switch_request() {
 }
 
 #[test]
+fn kms_vt_switch_binding_precedes_the_locked_presentation_gate() {
+    let (vt_requests, requested_vt) = mpsc::channel();
+    let mut harness = KeybindingHarness::new_with_kms_live_bindings(vt_requests);
+    let _ = harness.sync();
+    harness.server.state.kms_session_lock_gate.deferred_unlock = true;
+
+    for keycode in [37, 64, 69] {
+        harness.route(InputEvent::Keyboard {
+            event: FakeKeyEvent {
+                device: FakeDevice::KeyboardAndPointer,
+                keycode: Keycode::new(keycode),
+                state: KeyState::Pressed,
+            },
+        });
+    }
+    assert_eq!(
+        requested_vt
+            .recv_timeout(PROTOCOL_ACK_DEADLINE)
+            .expect("Ctrl+Alt+F3 bypasses only the presentation gate"),
+        3
+    );
+
+    harness.route(InputEvent::Keyboard {
+        event: FakeKeyEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            keycode: Keycode::new(30),
+            state: KeyState::Pressed,
+        },
+    });
+    assert!(
+        keyboard_key_events(&harness.sync()).is_empty(),
+        "VT evaluation is compositor-only and every other key remains gated"
+    );
+}
+
+#[test]
+fn kms_quarantined_release_reconciles_gated_xkb_before_a_later_bare_fn() {
+    let (vt_requests, requested_vt) = mpsc::channel();
+    let mut harness = KeybindingHarness::new_with_kms_live_bindings(vt_requests);
+    let control = Keycode::new(37);
+    let f3 = Keycode::new(69);
+
+    harness.server.state.kms_session_lock_gate.deferred_unlock = true;
+    harness.server.state.handle_host_input(HostInput::Key {
+        keycode: control,
+        state: HostButtonState::Pressed,
+        time: 1,
+    });
+    assert!(harness.server.state.keyboard.modifier_state().ctrl);
+    assert!(
+        harness
+            .server
+            .state
+            .kms_session_lock_gate
+            .suppressed_keys
+            .contains(&control)
+    );
+
+    harness.server.state.kms_session_lock_gate.deferred_unlock = false;
+    harness.server.state.handle_host_input(HostInput::Key {
+        keycode: control,
+        state: HostButtonState::Released,
+        time: 2,
+    });
+    assert_eq!(
+        harness.server.state.keyboard.modifier_state(),
+        smithay::input::keyboard::ModifiersState::default(),
+        "the quarantined release still clears Smithay's XKB modifier state"
+    );
+    assert!(
+        harness
+            .server
+            .state
+            .kms_session_lock_gate
+            .suppressed_keys
+            .is_empty()
+    );
+
+    for state in [HostButtonState::Pressed, HostButtonState::Released] {
+        harness.server.state.handle_host_input(HostInput::Key {
+            keycode: f3,
+            state,
+            time: 3,
+        });
+    }
+    assert!(
+        matches!(requested_vt.try_recv(), Err(TryRecvError::Empty)),
+        "a bare F3 after Ctrl reconciliation must not request a VT switch"
+    );
+}
+
+#[test]
 fn live_input_lifecycle_reconciles_the_intercepted_chord_before_suspend_and_resumes() {
     use crate::backend::kms::{
         ConnectorDescription, ConnectorMode, KmsRenderCommand, KmsTopologyLifecycleEvent,
@@ -9345,6 +9438,11 @@ fn live_input_lifecycle_reconciles_the_intercepted_chord_before_suspend_and_resu
     )
     .expect("lifecycle-backed protocol runtime starts");
     let topology = runtime.kms_topology_client();
+    assert!(
+        !topology
+            .session_lock_active(PROTOCOL_ACK_DEADLINE)
+            .expect("resume policy can query protocol-thread lock truth")
+    );
     let frame_clock = runtime.client_frame_clock();
     let key = OutputKey {
         device: 226,
@@ -18504,6 +18602,39 @@ fn all_device_authority_loss_reuses_reconciliation_for_every_held_input_class() 
             HostInput::TouchDeviceRemoved,
         ] if *keycode == key
     ));
+    let stale_release = InputEvent::<FakeInput>::Keyboard {
+        event: FakeKeyEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            keycode: key,
+            state: KeyState::Released,
+        },
+    };
+    assert!(matches!(
+        super::input::host_input_from_event(&mut ingress, &stale_release, extent, || {
+            panic!("a physical release does not sample held seat state")
+        }),
+        super::input::InputRouting::Ignored(
+            "physical key release matched a synthetic boundary release"
+        )
+    ));
+    let unrelated_release = InputEvent::<FakeInput>::Keyboard {
+        event: FakeKeyEvent {
+            device: FakeDevice::SecondKeyboardAndPointer,
+            keycode: key,
+            state: KeyState::Released,
+        },
+    };
+    assert!(matches!(
+        super::input::host_input_from_event(&mut ingress, &unrelated_release, extent, || {
+            panic!("an unrelated physical release does not sample held seat state")
+        }),
+        super::input::InputRouting::Deliver(inputs)
+            if matches!(inputs.as_slice(), [HostInput::Key {
+                keycode,
+                state: HostButtonState::Released,
+                ..
+            }] if *keycode == key)
+    ));
     assert!(
         ingress
             .all_devices_lost_authority(&super::input::SeatHeldState {
@@ -18513,6 +18644,103 @@ fn all_device_authority_loss_reuses_reconciliation_for_every_held_input_class() 
             .is_empty(),
         "the operation consumes every device lifetime exactly once"
     );
+}
+
+#[test]
+fn session_boundary_releases_held_input_without_removing_devices() {
+    let mut ingress = super::input::InputIngressState::default();
+    let extent = (320, 240);
+    let key = Keycode::new(24);
+    {
+        let mut route = |event: InputEvent<FakeInput>| {
+            super::input::host_input_from_event(&mut ingress, &event, extent, || {
+                panic!("ordinary input must not sample held seat state")
+            })
+        };
+        let _ = route(InputEvent::DeviceAdded {
+            device: FakeDevice::KeyboardAndPointer,
+        });
+        let _ = route(InputEvent::Keyboard {
+            event: FakeKeyEvent {
+                device: FakeDevice::KeyboardAndPointer,
+                keycode: key,
+                state: KeyState::Pressed,
+            },
+        });
+        let _ = route(InputEvent::PointerButton {
+            event: FakeButtonEvent {
+                device: FakeDevice::KeyboardAndPointer,
+                button: 0x110,
+                state: ButtonState::Pressed,
+            },
+        });
+        let _ = route(InputEvent::PointerAxis {
+            event: FakeAxisEvent {
+                device: FakeDevice::KeyboardAndPointer,
+                horizontal: None,
+                vertical: Some(FakeAxis::pixels(8.0)),
+                source: AxisSource::Finger,
+                relative_direction: AxisRelativeDirection::Identical,
+            },
+        });
+    }
+
+    let released = ingress.release_session_boundary(&super::input::SeatHeldState {
+        keys: HashSet::from([key]),
+        buttons: vec![0x110],
+    });
+    assert!(matches!(
+        released.as_slice(),
+        [
+            HostInput::Key {
+                keycode,
+                state: HostButtonState::Released,
+                ..
+            },
+            HostInput::PointerButton {
+                button: 0x110,
+                state: HostButtonState::Released,
+                ..
+            },
+            HostInput::PointerAxis {
+                vertical: Some(HostAxis { amount: 0.0, .. }),
+                ..
+            }
+        ] if *keycode == key
+    ));
+    assert!(
+        ingress
+            .release_session_boundary(&super::input::SeatHeldState {
+                keys: HashSet::new(),
+                buttons: Vec::new(),
+            })
+            .is_empty(),
+        "the boundary consumes held contributions without consuming device identity"
+    );
+
+    let pressed_again = InputEvent::<FakeInput>::Keyboard {
+        event: FakeKeyEvent {
+            device: FakeDevice::KeyboardAndPointer,
+            keycode: key,
+            state: KeyState::Pressed,
+        },
+    };
+    let _ = super::input::host_input_from_event(&mut ingress, &pressed_again, extent, || {
+        panic!("the retained device accepts new input without held-state sampling")
+    });
+    assert!(matches!(
+        ingress
+            .release_session_boundary(&super::input::SeatHeldState {
+                keys: HashSet::from([key]),
+                buttons: Vec::new(),
+            })
+            .as_slice(),
+        [HostInput::Key {
+            keycode,
+            state: HostButtonState::Released,
+            ..
+        }] if *keycode == key
+    ));
 }
 
 #[test]
@@ -29769,7 +29997,7 @@ fn present_test_security_epoch(
         .commands
         .send(ProtocolCommand::SecurityPresented {
             presentation_epoch: epoch,
-            output,
+            evidence: SecurityPresentationEvidence::Nested { output },
         })
         .expect("inject renderer presentation acknowledgement");
     pump_protocol_event_loop_until(
@@ -30916,7 +31144,7 @@ fn session_lock_destroyed_during_locking_aborts_and_ignores_late_completion() {
         .commands
         .send(ProtocolCommand::SecurityPresented {
             presentation_epoch: epoch,
-            output,
+            evidence: SecurityPresentationEvidence::Nested { output },
         })
         .expect("inject stale renderer completion");
     harness
@@ -31065,6 +31293,36 @@ fn session_lock_valid_unlock_clears_vendor_output_registry() {
 }
 
 #[test]
+fn session_lock_valid_unlock_is_consumed_exactly_once() {
+    let mut harness = KeybindingHarness::new(true);
+    let lock = begin_test_session_lock(&mut harness);
+    present_test_security_epoch(&mut harness, lock.lock);
+
+    send_request(&mut harness.client, lock.lock, 2, &[]);
+    send_request(&mut harness.client, lock.lock, 2, &[]);
+    harness.dispatch_client();
+
+    let disconnect_reason = harness
+        .client_state
+        .disconnect_reason
+        .lock()
+        .expect("test disconnect-reason mutex poisoned")
+        .clone();
+    assert!(
+        disconnect_reason.is_some(),
+        "the destroyed lock object cannot accept a second unlock request"
+    );
+    assert!(matches!(
+        harness.server.state.lock_lifecycle,
+        LockLifecycle::Unlocked
+    ));
+    assert_eq!(
+        harness.server.state.session_unlock_callbacks, 1,
+        "the compositor unlock handler ran exactly once"
+    );
+}
+
+#[test]
 fn session_lock_destroyed_surface_leaves_opaque_blank() {
     let mut harness = KeybindingHarness::new(true);
     let lock = begin_test_session_lock(&mut harness);
@@ -31118,4 +31376,729 @@ fn session_lock_owner_death_orphans_after_locked_and_aborts_before_locked() {
             .any(|event| matches!(event, ProtocolEvent::SecurityScene { active: false, .. }));
     }
     assert!(saw_blank_removed);
+}
+
+fn kms_security_test_key(device: u64, connector_name: &str) -> OutputKey {
+    OutputKey {
+        device,
+        connector_name: connector_name.into(),
+    }
+}
+
+fn kms_security_test_snapshot(
+    key: &OutputKey,
+    connector_id: u32,
+) -> crate::backend::kms::KmsTopologySnapshot {
+    use crate::backend::kms::{
+        ConnectorDescription, ConnectorMode, KmsTopologySnapshot, OutputScale120,
+        PreselectedAtomicOutput,
+    };
+    let mode = ConnectorMode {
+        width: 320,
+        height: 240,
+        refresh_millihz: 60_000,
+        preferred: true,
+        clock_khz: 12_000,
+        hsync: (320, 328, 400),
+        vsync: (240, 244, 260),
+        hskew: 0,
+        vscan: 0,
+        flags: 0,
+    };
+    KmsTopologySnapshot {
+        connectors: vec![ConnectorDescription {
+            key: key.clone(),
+            connector_id,
+            modes: vec![mode],
+        }],
+        selections: vec![PreselectedAtomicOutput {
+            key: key.clone(),
+            connector_mode: mode,
+            selection: Ok(test_atomic_selection(connector_id, mode)),
+        }],
+        output_scale: OutputScale120::ONE,
+    }
+}
+
+fn submit_kms_security_lifecycle(
+    harness: &mut KeybindingHarness,
+    event: KmsTopologyLifecycleEvent,
+) {
+    let (acknowledgement, acknowledged) = mpsc::sync_channel(1);
+    harness
+        .commands
+        .send(ProtocolCommand::KmsTopologyLifecycle {
+            event,
+            acknowledgement,
+        })
+        .expect("submit KMS security lifecycle");
+    harness
+        .server
+        .dispatch_cycle(Some(EVENT_LOOP_PUMP_TIMEOUT))
+        .expect("dispatch KMS security lifecycle");
+    acknowledged
+        .recv_timeout(PROTOCOL_ACK_DEADLINE)
+        .expect("KMS security lifecycle acknowledgement")
+        .expect("KMS security lifecycle accepted");
+}
+
+#[test]
+fn kms_security_reporter_carries_exact_epoch_generation_and_output() {
+    let (commands, source) = smithay::reexports::calloop::channel::channel();
+    let reporter = SecurityPresentationReporter { commands };
+    let output = kms_security_test_key(226, "Offline-1");
+
+    reporter
+        .kms_presented(71, 9, output.clone())
+        .expect("KMS displayed evidence reaches the protocol channel");
+
+    assert!(matches!(
+        source.try_recv(),
+        Ok(ProtocolCommand::SecurityPresented {
+            presentation_epoch: 71,
+            evidence: SecurityPresentationEvidence::Kms {
+                generation: 9,
+                output: observed,
+            },
+        }) if observed == output
+    ));
+}
+
+#[test]
+fn kms_security_gate_rearms_epochs_and_requires_every_replacement_output() {
+    let first = kms_security_test_key(226, "Offline-1");
+    let second = kms_security_test_key(226, "Offline-2");
+    let replacement = kms_security_test_key(227, "Offline-1");
+    let mut gate = KmsSessionLockGate::default();
+
+    for (state, lock_active, locking) in [
+        ("Locking", true, true),
+        ("Locked", true, false),
+        ("OrphanedLocked", true, false),
+    ] {
+        assert!(
+            gate.client_delivery_blocked(lock_active, locking),
+            "authority loss blocks client delivery for {state}"
+        );
+    }
+
+    gate.begin_preparing(BTreeMap::from([(first.clone(), 4), (second.clone(), 5)]));
+    assert!(!gate.output_ready(4, &first));
+    assert!(gate.client_delivery_blocked(true, false));
+    assert!(gate.output_ready(5, &second));
+    assert_eq!(gate.ready_outputs().map(BTreeMap::len), Some(2));
+    assert!(
+        gate.client_delivery_blocked(true, true),
+        "Locking stays closed even after OutputReady"
+    );
+
+    gate.resume_barrier = Some(KmsSecurityBarrier {
+        purpose: KmsSecurityBarrierPurpose::LockResume,
+        presentation_epoch: 80,
+        pending_outputs: BTreeMap::from([(first.clone(), 4), (second.clone(), 5)]),
+    });
+    assert!(gate.client_delivery_blocked(true, false));
+    assert!(
+        !gate
+            .resume_barrier
+            .as_mut()
+            .unwrap()
+            .acknowledge(79, 4, &first)
+    );
+    assert!(
+        !gate
+            .resume_barrier
+            .as_mut()
+            .unwrap()
+            .acknowledge(80, 3, &first)
+    );
+    assert!(
+        !gate
+            .resume_barrier
+            .as_mut()
+            .unwrap()
+            .acknowledge(80, 4, &first)
+    );
+    assert!(
+        gate.resume_barrier
+            .as_mut()
+            .unwrap()
+            .acknowledge(80, 5, &second)
+    );
+
+    gate.authority_lost();
+    assert!(matches!(gate.phase, KmsPresentationPhase::Unavailable));
+    assert!(gate.resume_barrier.is_none());
+    assert!(gate.client_delivery_blocked(true, false));
+
+    gate.begin_preparing(BTreeMap::from([(replacement.clone(), 7)]));
+    gate.resume_barrier = Some(KmsSecurityBarrier {
+        purpose: KmsSecurityBarrierPurpose::LockResume,
+        presentation_epoch: 81,
+        pending_outputs: BTreeMap::from([(replacement.clone(), 7)]),
+    });
+    assert!(gate.output_ready(7, &replacement));
+    assert!(
+        !gate
+            .resume_barrier
+            .as_mut()
+            .unwrap()
+            .acknowledge(80, 4, &first),
+        "the pre-pause epoch and removed output cannot open the resumed gate"
+    );
+    assert!(
+        gate.resume_barrier
+            .as_mut()
+            .unwrap()
+            .acknowledge(81, 7, &replacement)
+    );
+}
+
+#[test]
+fn kms_security_gate_preserves_deferred_unlock_across_authority_loss() {
+    let output = kms_security_test_key(226, "Offline-1");
+    let mut gate = KmsSessionLockGate::default();
+    gate.begin_preparing(BTreeMap::from([(output.clone(), 3)]));
+    assert!(gate.output_ready(3, &output));
+    gate.unlock_barrier = Some(KmsSecurityBarrier {
+        purpose: KmsSecurityBarrierPurpose::UnlockRestore,
+        presentation_epoch: 90,
+        pending_outputs: BTreeMap::from([(output.clone(), 3)]),
+    });
+    gate.authority_lost();
+
+    assert!(
+        gate.deferred_unlock,
+        "pause converts an undisplayed unlock barrier back into deferred work"
+    );
+    assert!(gate.unlock_barrier.is_none());
+    assert!(gate.client_delivery_blocked(false, false));
+
+    gate.begin_preparing(BTreeMap::from([(output.clone(), 6)]));
+    assert!(gate.output_ready(6, &output));
+    gate.unlock_barrier = Some(KmsSecurityBarrier {
+        purpose: KmsSecurityBarrierPurpose::UnlockRestore,
+        presentation_epoch: 91,
+        pending_outputs: BTreeMap::from([(output.clone(), 6)]),
+    });
+    gate.deferred_unlock = false;
+    assert!(gate.client_delivery_blocked(false, false));
+    assert!(
+        gate.unlock_barrier
+            .as_mut()
+            .unwrap()
+            .acknowledge(91, 6, &output)
+    );
+    gate.unlock_barrier = None;
+    assert!(!gate.client_delivery_blocked(false, false));
+
+    let key = Keycode::new(38);
+    let touch_slot = TouchSlot::from(Some(2));
+    gate.observe_physical_touch(&HostInput::TouchDown {
+        slot: touch_slot,
+        x: 1.0,
+        y: 1.0,
+        time: 1,
+    });
+    gate.quarantine_current_input([key], [0x110]);
+    gate.authority_lost();
+    assert!(gate.physical_touch_slots.is_empty());
+    assert!(gate.suppressed_touch_slots.is_empty());
+    assert!(gate.suppress_quarantined_input(&HostInput::Key {
+        keycode: key,
+        state: HostButtonState::Pressed,
+        time: 2,
+    }));
+    assert!(gate.suppress_quarantined_input(&HostInput::Key {
+        keycode: key,
+        state: HostButtonState::Released,
+        time: 3,
+    }));
+    assert!(gate.suppress_quarantined_input(&HostInput::PointerButton {
+        button: 0x110,
+        state: HostButtonState::Released,
+        time: 4,
+    }));
+    assert!(!gate.suppress_quarantined_input(&HostInput::TouchDown {
+        slot: touch_slot,
+        x: 2.0,
+        y: 2.0,
+        time: 5,
+    }));
+    assert!(!gate.suppress_quarantined_input(&HostInput::TouchUp {
+        slot: touch_slot,
+        time: 6,
+    }));
+}
+
+#[test]
+fn kms_authority_cycle_preserves_and_rearms_locking_locked_and_orphaned() {
+    let output = kms_security_test_key(226, "Offline-1");
+    let resumed_outputs = BTreeMap::from([(output.clone(), 12)]);
+
+    let mut locking = KeybindingHarness::new(true);
+    let _ = request_test_session_lock(&mut locking);
+    let old_epoch = match locking.server.state.lock_lifecycle {
+        LockLifecycle::Locking {
+            presentation_epoch, ..
+        } => presentation_epoch,
+        _ => panic!("nested lock enters Locking"),
+    };
+    locking.server.state.kms_authority_lost();
+    locking
+        .server
+        .state
+        .kms_begin_preparing(resumed_outputs.clone(), true);
+    assert!(matches!(
+        &locking.server.state.lock_lifecycle,
+        LockLifecycle::Locking {
+            presentation_epoch,
+            pending_kms_outputs,
+            ..
+        } if *presentation_epoch > old_epoch
+            && pending_kms_outputs.get(&output) == Some(&12)
+    ));
+
+    let mut locked = KeybindingHarness::new(true);
+    let locked_lock = begin_test_session_lock(&mut locked);
+    present_test_security_epoch(&mut locked, locked_lock.lock);
+    locked.server.state.kms_authority_lost();
+    assert!(matches!(
+        locked.server.state.lock_lifecycle,
+        LockLifecycle::Locked { .. }
+    ));
+    locked
+        .server
+        .state
+        .kms_begin_preparing(resumed_outputs.clone(), true);
+    assert!(matches!(
+        &locked.server.state.kms_session_lock_gate.resume_barrier,
+        Some(KmsSecurityBarrier {
+            purpose: KmsSecurityBarrierPurpose::LockResume,
+            pending_outputs,
+            ..
+        }) if pending_outputs.get(&output) == Some(&12)
+    ));
+
+    let mut orphaned = KeybindingHarness::new(true);
+    let orphaned_lock = begin_test_session_lock(&mut orphaned);
+    present_test_security_epoch(&mut orphaned, orphaned_lock.lock);
+    disconnect_test_client(&mut orphaned);
+    orphaned.server.state.kms_authority_lost();
+    assert!(matches!(
+        orphaned.server.state.lock_lifecycle,
+        LockLifecycle::OrphanedLocked { .. }
+    ));
+    orphaned
+        .server
+        .state
+        .kms_begin_preparing(resumed_outputs, true);
+    assert!(
+        orphaned
+            .server
+            .state
+            .kms_session_lock_gate
+            .resume_barrier
+            .is_some()
+    );
+    assert!(orphaned.server.state.events.iter().any(|event| matches!(
+        event,
+        ProtocolEvent::SecurityScene {
+            active: true,
+            presentation_epoch: Some(_),
+            ..
+        }
+    )));
+}
+
+#[test]
+fn kms_output_replacement_retires_only_that_lock_surface_without_unlocking() {
+    let mut harness = KeybindingHarness::new(true);
+    let lock = begin_test_session_lock(&mut harness);
+    let output = match &test_lock_record(&harness, lock.surface).role {
+        SurfaceRole::LockSurface(role) => role.output.clone(),
+        _ => panic!("test lock surface has its lock role"),
+    };
+    let old_key = kms_security_test_key(226, "Offline-1");
+    let replacement_key = kms_security_test_key(227, "Offline-1");
+    assert_eq!(
+        harness
+            .server
+            .state
+            .session_lock_state
+            .locked_output_count(),
+        1
+    );
+
+    harness.server.state.retire_replaced_kms_lock_surfaces(
+        &[(old_key, output.clone())],
+        &[(replacement_key, output)],
+    );
+
+    assert_eq!(
+        harness
+            .server
+            .state
+            .session_lock_state
+            .locked_output_count(),
+        0
+    );
+    assert!(harness.server.state.lock_surfaces_by_output.is_empty());
+    assert!(matches!(
+        harness.server.state.lock_lifecycle,
+        LockLifecycle::Locking { .. }
+    ));
+    assert!(matches!(
+        test_lock_record(&harness, lock.surface).role,
+        SurfaceRole::Dormant(_)
+    ));
+}
+
+#[test]
+fn kms_unlock_reconciles_lock_input_and_keeps_normal_focus_hidden() {
+    let mut harness = KeybindingHarness::new(true);
+    let normal_object = map_test_undecorated_toplevel(&mut harness);
+    let lock = begin_test_session_lock(&mut harness);
+    present_test_security_epoch(&mut harness, lock.lock);
+    harness
+        .server
+        .state
+        .handle_host_input(HostInput::PointerMotionAbsolute {
+            x: 8.0,
+            y: 8.0,
+            time: 1,
+        });
+    harness.server.state.handle_host_input(HostInput::Key {
+        keycode: Keycode::new(38),
+        state: HostButtonState::Pressed,
+        time: 2,
+    });
+    harness
+        .server
+        .state
+        .handle_host_input(HostInput::PointerButton {
+            button: 0x110,
+            state: HostButtonState::Pressed,
+            time: 3,
+        });
+
+    harness.server.state.reconcile_input_before_kms_unlock();
+    harness.server.state.kms_session_lock_gate.deferred_unlock = true;
+    harness.server.state.lock_lifecycle = LockLifecycle::Unlocked;
+    harness.server.state.deactivate_all_lock_surfaces();
+
+    assert!(harness.server.state.keyboard.pressed_keys().is_empty());
+    assert!(harness.server.state.pointer.current_pressed().is_empty());
+    assert_eq!(harness.server.state.keyboard.current_focus(), None);
+    assert_eq!(harness.server.state.pointer.current_focus(), None);
+    assert!(harness.server.state.surface_at(8.0, 8.0).is_none());
+    assert!(
+        harness
+            .server
+            .state
+            .mapped_surface_ids()
+            .contains(&harness.server.state.surfaces[&normal_object].id),
+        "ordinary content is renderer-ready behind the input gate"
+    );
+    assert!(
+        harness
+            .server
+            .state
+            .kms_session_lock_gate
+            .suppressed_keys
+            .contains(&Keycode::new(38))
+    );
+    assert!(
+        harness
+            .server
+            .state
+            .kms_session_lock_gate
+            .suppressed_buttons
+            .contains(&0x110)
+    );
+}
+
+#[test]
+fn kms_locked_pause_unlock_and_resume_restore_only_after_displayed_epoch() {
+    let mut harness = KeybindingHarness::new_with_backend(true, BackendKind::Kms);
+    let key = kms_security_test_key(226, "Offline-1");
+    let snapshot = kms_security_test_snapshot(&key, 41);
+
+    submit_kms_security_lifecycle(
+        &mut harness,
+        KmsTopologyLifecycleEvent::Initial(snapshot.clone()),
+    );
+    assert!(matches!(
+        harness._kms_commands.try_recv(),
+        Ok(KmsRenderCommand::AddOutput { generation: 1, .. })
+    ));
+    harness
+        .commands
+        .send(ProtocolCommand::KmsRenderReply {
+            reply: KmsRenderReply::OutputReady {
+                generation: 1,
+                key: key.clone(),
+            },
+        })
+        .expect("submit initial OutputReady");
+    pump_protocol_event_loop_until(&mut harness.server, "initial KMS OutputReady", |state| {
+        state.backend.kms_output_is_ready(1, &key)
+    });
+    assert_eq!(
+        harness
+            .server
+            .state
+            .kms_session_lock_gate
+            .ready_outputs()
+            .map(BTreeMap::len),
+        Some(1)
+    );
+    assert!(
+        harness
+            .server
+            .state
+            .backend
+            .default_output()
+            .is_some_and(|output| output.current_mode().is_some())
+    );
+    let globals = harness.sync();
+    let (output_global, output_version) = registry_global_from_events(&globals, 2, "wl_output")
+        .expect("KMS output is advertised on the existing registry");
+    let output = harness.allocate_object_id();
+    bind_global(
+        &mut harness.client,
+        output_global,
+        "wl_output",
+        output_version.min(4),
+        output,
+    );
+    let normal_object = map_test_undecorated_toplevel(&mut harness);
+    let manager = harness.bind_test_global("ext_session_lock_manager_v1", 1);
+    let _ = harness.sync();
+    let lock_object = harness.allocate_object_id();
+    send_request(&mut harness.client, manager, 1, &words(&[lock_object]));
+    let _ = harness.sync();
+    assert!(
+        matches!(
+            harness.server.state.lock_lifecycle,
+            LockLifecycle::Locking { .. }
+        ),
+        "KMS-ready backend accepts the lock object"
+    );
+    let (surface, lock_surface, configure, _) =
+        create_test_lock_surface(&mut harness, lock_object, output);
+    let lock = TestSessionLock {
+        lock: lock_object,
+        surface,
+        lock_surface,
+        configure,
+    };
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    let epoch = match &harness.server.state.lock_lifecycle {
+        LockLifecycle::Locking {
+            presentation_epoch,
+            pending_kms_outputs,
+            ..
+        } if pending_kms_outputs.get(&key) == Some(&1) => *presentation_epoch,
+        _ => panic!("KMS lock did not enter its generation-1 barrier"),
+    };
+    harness
+        .commands
+        .send(ProtocolCommand::SecurityPresented {
+            presentation_epoch: epoch,
+            evidence: SecurityPresentationEvidence::Kms {
+                generation: 1,
+                output: key.clone(),
+            },
+        })
+        .expect("submit initial KMS displayed epoch");
+    pump_protocol_event_loop_until(&mut harness.server, "KMS lock displayed", |state| {
+        matches!(state.lock_lifecycle, LockLifecycle::Locked { .. })
+    });
+    let _ = harness.sync();
+    harness
+        .server
+        .state
+        .handle_host_input(HostInput::PointerMotionAbsolute {
+            x: 8.0,
+            y: 8.0,
+            time: 10,
+        });
+    submit_kms_security_lifecycle(&mut harness, KmsTopologyLifecycleEvent::Pause);
+    assert!(matches!(
+        harness.server.state.lock_lifecycle,
+        LockLifecycle::Locked { .. }
+    ));
+    assert!(matches!(
+        harness.server.state.kms_session_lock_gate.phase,
+        KmsPresentationPhase::Unavailable
+    ));
+    harness.server.state.handle_host_input(HostInput::Key {
+        keycode: Keycode::new(38),
+        state: HostButtonState::Pressed,
+        time: 20,
+    });
+    harness
+        .server
+        .state
+        .handle_host_input(HostInput::PointerButton {
+            button: 0x110,
+            state: HostButtonState::Pressed,
+            time: 21,
+        });
+    assert_eq!(
+        harness.server.state.keyboard.pressed_keys(),
+        HashSet::from([Keycode::new(38)]),
+        "the gated keyboard state advances only so compositor VT chords remain recognisable"
+    );
+    assert!(harness.server.state.pointer.current_pressed().is_empty());
+    assert!(
+        harness
+            .server
+            .state
+            .kms_session_lock_gate
+            .suppressed_keys
+            .contains(&Keycode::new(38))
+    );
+    assert!(
+        harness
+            .server
+            .state
+            .kms_session_lock_gate
+            .suppressed_buttons
+            .contains(&0x110)
+    );
+
+    send_request(&mut harness.client, lock.lock, 2, &[]);
+    let _ = harness.sync();
+    assert!(matches!(
+        harness.server.state.lock_lifecycle,
+        LockLifecycle::Unlocked
+    ));
+    assert!(harness.server.state.kms_session_lock_gate.deferred_unlock);
+    assert_eq!(harness.server.state.keyboard.current_focus(), None);
+    assert_eq!(harness.server.state.pointer.current_focus(), None);
+    assert!(harness.server.state.surface_at(8.0, 8.0).is_none());
+    assert!(
+        harness
+            .server
+            .state
+            .mapped_surface_ids()
+            .contains(&harness.server.state.surfaces[&normal_object].id),
+        "the ordinary surface is staged for the renderer while input remains gated"
+    );
+    assert!(harness.server.state.keyboard.pressed_keys().is_empty());
+    assert!(harness.server.state.pointer.current_pressed().is_empty());
+    assert!(harness.server.state.saved_cursor_selection.is_some());
+
+    let paused_retry = harness.allocate_object_id();
+    send_request(&mut harness.client, manager, 1, &words(&[paused_retry]));
+    let paused_retry_traffic = harness.sync();
+    assert!(
+        paused_retry_traffic
+            .iter()
+            .any(|(object, opcode, _)| *object == paused_retry && *opcode == 1),
+        "a new lock request while KMS authority is unavailable receives finished"
+    );
+    assert!(matches!(
+        harness.server.state.lock_lifecycle,
+        LockLifecycle::Unlocked
+    ));
+    assert!(harness.server.state.kms_session_lock_gate.deferred_unlock);
+
+    submit_kms_security_lifecycle(&mut harness, KmsTopologyLifecycleEvent::Resume(snapshot));
+    assert!(matches!(
+        harness
+            ._kms_commands
+            .try_iter()
+            .collect::<Vec<_>>()
+            .as_slice(),
+        [
+            KmsRenderCommand::Suspend { generation: 2 },
+            KmsRenderCommand::Resume { generation: 3 },
+            KmsRenderCommand::AddOutput { generation: 4, .. }
+        ]
+    ));
+    harness
+        .commands
+        .send(ProtocolCommand::KmsRenderReply {
+            reply: KmsRenderReply::OutputReady {
+                generation: 4,
+                key: key.clone(),
+            },
+        })
+        .expect("submit resumed OutputReady");
+    harness
+        .server
+        .dispatch_cycle(Some(EVENT_LOOP_PUMP_TIMEOUT))
+        .expect("dispatch resumed OutputReady");
+    let restore_epoch = harness
+        .server
+        .state
+        .kms_session_lock_gate
+        .unlock_barrier
+        .as_ref()
+        .expect("resume arms ordinary-scene display barrier")
+        .presentation_epoch;
+    assert_eq!(harness.server.state.keyboard.current_focus(), None);
+    assert!(
+        harness
+            .server
+            .state
+            .kms_session_lock_gate
+            .client_delivery_blocked(false, false)
+    );
+
+    harness
+        .commands
+        .send(ProtocolCommand::SecurityPresented {
+            presentation_epoch: restore_epoch,
+            evidence: SecurityPresentationEvidence::Kms {
+                generation: 4,
+                output: key,
+            },
+        })
+        .expect("submit resumed ordinary-scene displayed epoch");
+    pump_protocol_event_loop_until(
+        &mut harness.server,
+        "KMS unlock restoration displayed",
+        |state| state.kms_session_lock_gate.unlock_barrier.is_none(),
+    );
+    assert!(harness.server.state.saved_cursor_selection.is_none());
+    assert!(
+        !harness
+            .server
+            .state
+            .kms_session_lock_gate
+            .client_delivery_blocked(false, false)
+    );
+    harness.server.state.handle_host_input(HostInput::Key {
+        keycode: Keycode::new(38),
+        state: HostButtonState::Released,
+        time: 13,
+    });
+    harness
+        .server
+        .state
+        .handle_host_input(HostInput::PointerButton {
+            button: 0x110,
+            state: HostButtonState::Released,
+            time: 14,
+        });
+    assert!(
+        harness
+            .server
+            .state
+            .kms_session_lock_gate
+            .suppressed_keys
+            .is_empty()
+    );
+    assert!(
+        harness
+            .server
+            .state
+            .kms_session_lock_gate
+            .suppressed_buttons
+            .is_empty()
+    );
 }

@@ -546,6 +546,27 @@ impl Default for KmsTopology {
 }
 
 impl KmsTopology {
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    pub(crate) fn output_is_ready(&self, generation: u64, key: &OutputKey) -> bool {
+        self.outputs.get(key).is_some_and(|output| {
+            output.generation == generation && output.phase == OutputPhase::Ready
+        })
+    }
+
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    pub(crate) fn presentation_generations(&self) -> BTreeMap<OutputKey, u64> {
+        self.outputs
+            .iter()
+            .filter(|(_, output)| {
+                !matches!(
+                    output.phase,
+                    OutputPhase::Removing | OutputPhase::RemovalFailed
+                )
+            })
+            .map(|(key, output)| (key.clone(), output.generation))
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn generation(&self) -> u64 {
         self.generation

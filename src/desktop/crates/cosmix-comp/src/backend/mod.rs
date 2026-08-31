@@ -138,6 +138,35 @@ impl BackendData {
         }
     }
 
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    pub(crate) fn kms_registered_outputs(&self) -> Vec<(OutputKey, Output)> {
+        match self {
+            Self::Winit(_) => Vec::new(),
+            Self::Kms(data) => data
+                .client_outputs
+                .outputs
+                .iter()
+                .map(|(key, output)| (key.clone(), output.output.clone()))
+                .collect(),
+        }
+    }
+
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    pub(crate) fn kms_output_is_ready(&self, generation: u64, key: &self::kms::OutputKey) -> bool {
+        match self {
+            Self::Winit(_) => false,
+            Self::Kms(data) => data.topology.output_is_ready(generation, key),
+        }
+    }
+
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    pub(crate) fn kms_presentation_generations(&self) -> BTreeMap<OutputKey, u64> {
+        match self {
+            Self::Winit(_) => BTreeMap::new(),
+            Self::Kms(data) => data.topology.presentation_generations(),
+        }
+    }
+
     /// Perform backend-specific maintenance after one protocol dispatch.
     ///
     /// The nested backend owns one Smithay output that needs cleanup. The KMS

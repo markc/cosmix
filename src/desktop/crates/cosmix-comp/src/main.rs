@@ -1151,7 +1151,7 @@ struct NestedPostPresent;
 #[derive(Resource, Default)]
 struct NestedPresentCandidate {
     window: Option<Entity>,
-    epochs: Vec<(u64, String)>,
+    epochs: Vec<(u64, protocol::SecurityPresentationTarget)>,
 }
 
 #[derive(Resource)]
@@ -1237,9 +1237,12 @@ fn complete_nested_security_presentation(
     }
 
     let mut reported = Vec::new();
-    for (epoch, output) in epochs {
-        match completion.reporter.presented(epoch, output.clone()) {
-            Ok(()) => reported.push((epoch, output)),
+    for (epoch, presentation) in epochs {
+        match completion
+            .reporter
+            .presented(epoch, presentation.output.clone())
+        {
+            Ok(()) => reported.push((epoch, presentation)),
             Err(error) => {
                 error!(%error, "nested security presentation report failed");
                 break;

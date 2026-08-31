@@ -19,6 +19,10 @@ use crate::wayland::session_lock::{SessionLockHandler, SessionLockManagerState};
 /// Surface role for ext-session-lock surfaces.
 const LOCK_SURFACE_ROLE: &str = "ext_session_lock_surface_v1";
 
+fn consume_unlock_status(status: &AtomicBool) -> bool {
+    status.swap(false, Ordering::Relaxed)
+}
+
 /// [`ExtSessionLockV1`] state.
 #[derive(Debug)]
 pub struct SessionLockState {
@@ -98,11 +102,9 @@ where
                     surface: surface.downgrade(),
                 };
                 let lock_surface = data_init.init(id, data);
-                state.lock_state().register_locked_output(
-                    output.clone(),
-                    lock_surface.clone(),
-                    lock.clone(),
-                );
+                state
+                    .lock_state()
+                    .register_locked_output(output.clone(), lock_surface.clone(), lock.clone());
 
                 // Initialize surface data.
                 compositor::with_states(&surface, |states| {
@@ -208,15 +210,17 @@ where
                 lock_surface.send_configure();
             }
             Request::UnlockAndDestroy => {
-                // Ensure session is locked.
-                if !data.lock_status.load(Ordering::Relaxed) {
+                // Atomically consume the one successful unlock before invoking
+                // the compositor. The destructor request itself prevents a
+                // second wire request; consuming the state here also makes the
+                // handler transition one-shot before any deferred presentation.
+                if !consume_unlock_status(&data.lock_status) {
                     lock.post_error(Error::InvalidUnlock, "Session is not locked.");
                     // cosmix fix: a rejected lock object receives `finished`
                     // but remains usable until destroyed. It must not fall
                     // through and unlock the real owner's session.
                     return;
                 }
-
                 state.lock_state().locked_outputs.clear();
                 state.unlock();
             }
@@ -233,5 +237,19 @@ where
     fn destroyed(state: &mut D, _client: ClientId, lock: &ExtSessionLockV1, _data: &SessionLockState) {
         // cosmix addition: bind Locking lifetime to the protocol object.
         state.lock_destroyed(lock.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    use super::consume_unlock_status;
+
+    #[test]
+    fn unlock_state_is_consumed_exactly_once() {
+        let locked = AtomicBool::new(true);
+        assert!(consume_unlock_status(&locked));
+        assert!(!consume_unlock_status(&locked));
     }
 }

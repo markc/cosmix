@@ -18,13 +18,14 @@ use bevy::{
 use cosmix_wgpu_dmabuf::{DmabufRelease, ImportedDmabufImages, ReleaseCallback};
 use smithay::reexports::wayland_server::backend::ObjectId;
 
-#[cfg(test)]
-use crate::protocol::SurfaceStackKey;
 use crate::protocol::{
     ChromeCursorIcon, ClientSceneFeed, CursorImage, CursorPositionSnapshot, CursorPresentation,
-    DmabufUseId, MAX_GLOBAL_SURFACES, ProtocolEvent, SceneSurfaceKind, ShmFrame, StackBand,
-    SurfaceFrame, SurfaceId, SurfaceLayout, SurfaceSceneSnapshot, SurfaceTransform,
+    DmabufUseId, MAX_GLOBAL_SURFACES, ProtocolEvent, SceneSurfaceKind, SecurityPresentationTarget,
+    ShmFrame, StackBand, SurfaceFrame, SurfaceId, SurfaceLayout, SurfaceSceneSnapshot,
+    SurfaceTransform,
 };
+#[cfg(test)]
+use crate::protocol::{SecurityPresentationScene, SurfaceStackKey};
 use crate::{
     client_surface_material::{
         ClientSurfaceImage, ClientSurfaceMaterial, ClientSurfaceMaterialPlugin,
@@ -311,31 +312,35 @@ pub(crate) struct RendererOutputScale120(pub(crate) u32);
 /// main-world schedule phase, owns swapchain presentation and GPU completion.
 #[derive(Clone, Resource, Default)]
 pub(crate) struct NestedSecurityPresentation {
-    pending: Arc<Mutex<Vec<(u64, String)>>>,
+    pending: Arc<Mutex<Vec<(u64, SecurityPresentationTarget)>>>,
 }
 
 impl NestedSecurityPresentation {
-    pub(crate) fn publish(&self, epoch: u64, outputs: impl IntoIterator<Item = String>) {
+    pub(crate) fn publish(
+        &self,
+        epoch: u64,
+        presentations: impl IntoIterator<Item = SecurityPresentationTarget>,
+    ) {
         let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for output in outputs {
-            let item = (epoch, output);
+        for presentation in presentations {
+            let item = (epoch, presentation);
             if !pending.contains(&item) {
                 pending.push(item);
             }
         }
     }
 
-    pub(crate) fn snapshot(&self) -> Vec<(u64, String)> {
+    pub(crate) fn snapshot(&self) -> Vec<(u64, SecurityPresentationTarget)> {
         self.pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
-    pub(crate) fn complete(&self, completed: &[(u64, String)]) {
+    pub(crate) fn complete(&self, completed: &[(u64, SecurityPresentationTarget)]) {
         let mut pending = self
             .pending
             .lock()
@@ -595,8 +600,8 @@ fn apply_protocol_events(world: &mut World, events: Vec<ProtocolEvent>) {
             ProtocolEvent::SecurityScene {
                 active,
                 presentation_epoch,
-                presentation_outputs,
-            } => apply_security_scene(world, active, presentation_epoch, presentation_outputs),
+                presentations,
+            } => apply_security_scene(world, active, presentation_epoch, presentations),
             ProtocolEvent::OutputResized { width, height } => {
                 resize_compositor_logical_canvas(world, width, height);
             }
@@ -651,7 +656,7 @@ fn apply_security_scene(
     world: &mut World,
     active: bool,
     presentation_epoch: Option<u64>,
-    presentation_outputs: Vec<String>,
+    presentations: Vec<SecurityPresentationTarget>,
 ) {
     if active {
         let canvas = world.resource::<LogicalCanvasSize>().0;
@@ -668,10 +673,10 @@ fn apply_security_scene(
                     .id()
             });
         world.resource_mut::<LockBlankScene>().entity = Some(entity);
+        let security_presentations = world.resource::<NestedSecurityPresentation>();
+        security_presentations.clear();
         if let Some(epoch) = presentation_epoch {
-            world
-                .resource::<NestedSecurityPresentation>()
-                .publish(epoch, presentation_outputs);
+            security_presentations.publish(epoch, presentations);
         }
         return;
     }
@@ -682,7 +687,11 @@ fn apply_security_scene(
     {
         entity.despawn();
     }
-    world.resource::<NestedSecurityPresentation>().clear();
+    let security_presentations = world.resource::<NestedSecurityPresentation>();
+    security_presentations.clear();
+    if let Some(epoch) = presentation_epoch {
+        security_presentations.publish(epoch, presentations);
+    }
 }
 
 fn refresh_lock_blank(world: &mut World) {
@@ -2390,6 +2399,78 @@ mod tests {
             )
             .expect("tracing output is UTF-8")
         }
+    }
+
+    #[test]
+    fn unlocked_security_epoch_is_published_only_after_the_blank_is_removed() {
+        let mut world = World::new();
+        world.insert_resource(LogicalCanvasSize(Vec2::new(320.0, 240.0)));
+        world.insert_resource(LockBlankScene::default());
+        world.insert_resource(NestedSecurityPresentation::default());
+
+        apply_security_scene(
+            &mut world,
+            true,
+            Some(40),
+            vec![SecurityPresentationTarget {
+                output: "Offline-1".into(),
+                scene: SecurityPresentationScene::Blank,
+            }],
+        );
+        assert!(world.resource::<LockBlankScene>().entity.is_some());
+        assert_eq!(
+            world.resource::<NestedSecurityPresentation>().snapshot(),
+            [(
+                40,
+                SecurityPresentationTarget {
+                    output: "Offline-1".to_string(),
+                    scene: SecurityPresentationScene::Blank,
+                }
+            )]
+        );
+
+        apply_security_scene(
+            &mut world,
+            true,
+            Some(41),
+            vec![SecurityPresentationTarget {
+                output: "Offline-2".into(),
+                scene: SecurityPresentationScene::Lock,
+            }],
+        );
+        assert_eq!(
+            world.resource::<NestedSecurityPresentation>().snapshot(),
+            [(
+                41,
+                SecurityPresentationTarget {
+                    output: "Offline-2".to_string(),
+                    scene: SecurityPresentationScene::Lock,
+                }
+            )],
+            "re-arming an active lock replaces the superseded epoch"
+        );
+
+        apply_security_scene(
+            &mut world,
+            false,
+            Some(42),
+            vec![SecurityPresentationTarget {
+                output: "Offline-1".into(),
+                scene: SecurityPresentationScene::Client,
+            }],
+        );
+        assert!(world.resource::<LockBlankScene>().entity.is_none());
+        assert_eq!(
+            world.resource::<NestedSecurityPresentation>().snapshot(),
+            [(
+                42,
+                SecurityPresentationTarget {
+                    output: "Offline-1".to_string(),
+                    scene: SecurityPresentationScene::Client,
+                }
+            )],
+            "the ordinary-scene epoch replaces the lock epoch after blank removal"
+        );
     }
 
     fn frame(value: u8) -> SurfaceFrame {

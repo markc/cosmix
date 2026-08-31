@@ -224,6 +224,10 @@ impl LockSurface {
         &self.surface
     }
 
+    pub(super) fn protocol_surface(&self) -> &ExtSessionLockSurfaceV1 {
+        &self.shell_surface
+    }
+
     /// Manipulate this surface's pending state.
     pub fn with_pending_state<F, T>(&self, f: F) -> T
     where

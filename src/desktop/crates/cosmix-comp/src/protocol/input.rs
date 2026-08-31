@@ -131,6 +131,10 @@ pub(crate) struct SeatHeldState {
 #[derive(Default)]
 pub(crate) struct InputIngressState {
     devices: HashMap<String, InputDeviceState>,
+    /// Physical releases still owed after authority loss synthetically
+    /// released the seat. Device identity is essential: a release from
+    /// another keyboard is not the matching tail of this press.
+    synthetic_key_releases: HashSet<(String, smithay::input::keyboard::Keycode)>,
     /// Scroll sequences whose newest client-visible word is "moving".
     ///
     /// Keys and buttons intersect a departing device's bookkeeping against the
@@ -213,7 +217,10 @@ impl InputIngressState {
             tracing::debug!(device_id = id, "removed input device had no ingress record");
             return Vec::new();
         };
-        self.releases_for(&departing, held)
+        let releases = self.releases_for(&departing, held);
+        self.synthetic_key_releases
+            .retain(|(device_id, _)| device_id != &id);
+        releases
     }
 
     fn releases_for(
@@ -353,6 +360,13 @@ impl InputIngressState {
                 .devices
                 .remove(&id)
                 .expect("the all-device reconciliation collected a live id");
+            self.synthetic_key_releases.extend(
+                departing
+                    .keys
+                    .intersection(&held.keys)
+                    .copied()
+                    .map(|keycode| (id.clone(), keycode)),
+            );
             for input in self.releases_for(&departing, held) {
                 match input {
                     HostInput::Key { .. } => keys.push(input),
@@ -368,6 +382,44 @@ impl InputIngressState {
         // sequence before updating the capability count. Reuse that operation
         // rather than manufacturing a pause-only cancellation path here.
         keys.extend((0..touch_devices).map(|_| HostInput::TouchDeviceRemoved));
+        keys
+    }
+
+    /// End input sequences at a security-scene boundary without pretending
+    /// the devices disappeared. Their capabilities and identities remain
+    /// live, but every held contribution is consumed so a later physical
+    /// release cannot be attributed to the post-lock focus.
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    pub(crate) fn release_session_boundary(&mut self, held: &SeatHeldState) -> Vec<HostInput> {
+        let mut device_ids = self.devices.keys().cloned().collect::<Vec<_>>();
+        device_ids.sort();
+        let mut retained = Vec::with_capacity(device_ids.len());
+        let mut keys = Vec::new();
+        let mut buttons = Vec::new();
+        let mut axes = Vec::new();
+        for id in device_ids {
+            let departing = self
+                .devices
+                .remove(&id)
+                .expect("the session boundary collected a live input device");
+            let cleared = InputDeviceState {
+                last_event_time_msec: departing.last_event_time_msec,
+                touch: departing.touch,
+                ..InputDeviceState::default()
+            };
+            for input in self.releases_for(&departing, held) {
+                match input {
+                    HostInput::Key { .. } => keys.push(input),
+                    HostInput::PointerButton { .. } => buttons.push(input),
+                    HostInput::PointerAxis { .. } => axes.push(input),
+                    _ => unreachable!("session-boundary reconciliation emits held releases"),
+                }
+            }
+            retained.push((id, cleared));
+        }
+        self.devices.extend(retained);
+        keys.extend(buttons);
+        keys.extend(axes);
         keys
     }
 }
@@ -413,19 +465,29 @@ pub(crate) fn host_input_from_event<B: InputBackend>(
 ) -> InputRouting {
     match event {
         InputEvent::Keyboard { event } => {
-            let record = ingress.observe(&event.device(), event.time_msec());
+            let device = event.device();
+            let device_id = device.id();
+            let keycode = event.key_code();
+            let suppress_release = event.state() == KeyState::Released
+                && ingress.synthetic_key_releases.remove(&(device_id, keycode));
+            let record = ingress.observe(&device, event.time_msec());
             match event.state() {
                 KeyState::Pressed => {
-                    record.keys.insert(event.key_code());
+                    record.keys.insert(keycode);
                 }
                 KeyState::Released => {
-                    record.keys.remove(&event.key_code());
+                    record.keys.remove(&keycode);
                 }
+            }
+            if suppress_release {
+                return InputRouting::Ignored(
+                    "physical key release matched a synthetic boundary release",
+                );
             }
             InputRouting::deliver(HostInput::Key {
                 // Already an XKB keycode: Smithay's libinput backend applies the
                 // evdev offset. See `HostInput::key_from_evdev`.
-                keycode: event.key_code(),
+                keycode,
                 state: host_key_state(event.state()),
                 time: event.time_msec(),
             })
