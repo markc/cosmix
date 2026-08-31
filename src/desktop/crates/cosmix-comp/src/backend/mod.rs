@@ -147,23 +147,21 @@ impl BackendData {
     pub(crate) fn port_outputs(&self) -> Vec<PortOutputSource> {
         let default = self.default_output();
         match self {
-            Self::Winit(data) => {
-                let refresh_mhz = match u32::try_from(data.output_mode.refresh) {
-                    Ok(refresh) => refresh,
-                    Err(_) => return Vec::new(),
-                };
-                vec![PortOutputSource {
-                    output: data.output.clone(),
-                    name: data.output.name(),
-                    default: default.as_ref() == Some(&data.output),
-                    x: 0,
-                    y: 0,
-                    width: data.output_size.0,
-                    height: data.output_size.1,
-                    scale: data.output_scale,
-                    refresh_mhz,
-                }]
-            }
+            Self::Winit(data) => std::iter::once(data)
+                .filter_map(|data| {
+                    Some(PortOutputSource {
+                        output: data.output.clone(),
+                        name: data.output.name(),
+                        default: default.as_ref() == Some(&data.output),
+                        x: 0,
+                        y: 0,
+                        width: data.output_size.0,
+                        height: data.output_size.1,
+                        scale: data.output_scale,
+                        refresh_mhz: u32::try_from(data.output_mode.refresh).ok()?,
+                    })
+                })
+                .collect(),
             Self::Kms(data) => {
                 #[cfg(any(all(feature = "kms-live", not(test)), test))]
                 {
@@ -708,5 +706,30 @@ mod tests {
             backend.output_size(),
             "with no admitted output the two coincide; they diverge the moment one lands"
         );
+    }
+
+    #[cfg(feature = "bus")]
+    #[test]
+    fn winit_port_output_with_invalid_refresh_is_skipped() {
+        let output = Output::new(
+            "invalid-refresh".into(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "CosMix".into(),
+                model: "Invalid refresh fixture".into(),
+            },
+        );
+        let backend = BackendData::Winit(WinitBackendData {
+            output,
+            output_mode: Mode {
+                size: (1920, 1080).into(),
+                refresh: -1,
+            },
+            output_size: (1920, 1080),
+            output_scale: 1.0,
+        });
+
+        assert!(backend.port_outputs().is_empty());
     }
 }

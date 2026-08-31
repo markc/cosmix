@@ -4053,6 +4053,8 @@ fn prepare_live_operation(
     grant: &KmsLiveGrant,
     bus_service: String,
 ) -> Result<Option<PreparedLiveOperation>, KmsLiveError> {
+    #[cfg(not(feature = "bus"))]
+    drop(bus_service);
     let mut session = start_session_device_owner(grant.drm_device)?;
     let signals = LiveSignalWatcher::start(session.event_sender())?;
     let target_pairing = LiveTargetPairingLedger::default();

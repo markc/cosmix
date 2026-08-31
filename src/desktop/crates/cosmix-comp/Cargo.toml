@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-comp"
-version = "0.32.1"
+version = "0.33.0"
 description = "Smithay protocol frontend with Bevy rendering for the CosMix desktop"
 edition = "2024"
 rust-version = "1.95"
@@ -88,10 +88,11 @@ static_assertions = "1"
 tracing = "0.1"
 unicode-segmentation = "1"
 wayland-client = { version = "=0.31.14", optional = true }
-tokio = { version = "1", features = ["macros", "rt", "sync", "test-util", "time"], optional = true }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"], optional = true }
 
 [build-dependencies]
 cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 wgpu = { version = "=29.0.4", features = ["noop"] }

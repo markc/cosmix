@@ -4,6 +4,95 @@
 nested inside an existing Wayland session with `cosmix-comp --nested`, or use
 the KMS backend on a system seat.
 
+## Bus control plane
+
+The default `bus` feature gives the compositor a read-only Bus control plane.
+The seat/KMS compositor registers as `comp`; `--nested` registers as
+`comp-nested`. `--bus-service NAME` overrides either name and accepts
+`^[a-z][a-z0-9-]{1,30}$`. A build without the `bus` feature rejects that flag
+instead of silently ignoring it.
+
+P-0 exposes five verbs:
+
+- `comp.ping` returns `{"pong":true}` without taking a compositor snapshot.
+- `comp.info` returns service/build/backend provenance plus output and surface
+  counts and the property event counters.
+- `comp.props.get path?` returns one leaf or subtree, or the complete tree when
+  `path` is omitted.
+- `comp.props.list prefix?` returns leaf paths. A prefix is matched by complete
+  path segments, never by string prefix.
+- `comp.props.describe path` returns leaf metadata (`type`, `mutable`,
+  `sensitive`, description, optional `format`/`enum`, and owner) or an object
+  subtree with its immediate children. Every P-0 leaf is immutable,
+  non-sensitive and owned by `comp`.
+
+The complete P-0 read tree is:
+
+```text
+info.{service,version,backend,engine,instance}
+outputs.o_<slug>.{name,default,x,y,width,height,scale,refresh_mhz,
+                  usable.{x,y,width,height}}
+surfaces.s<id>.{id,role,mapped,visible,x,y,width,height,band,sequence,
+                tree_index,parent,output,title,app_id,focused,activated,
+                maximized,minimized,decoration,
+                layer.{stratum,interactivity,exclusive_zone,binding},foreign_id}
+windows.s<id>.{id,foreign_id,title,app_id,x,y,width,height,focused,
+               maximized,minimized,output}
+stack
+focus.{keyboard,exclusive_latch,pointer,pointer_grab}
+decoration.{enabled,style}
+bindings.{enabled,profile,table}
+port.{level,event_seq,lost_count,queue_depth,reply_timeouts,slug_collisions,broker}
+```
+
+Surface keys are `s` plus the decimal session-local surface ID. Output keys are
+`o_` plus the lower-case output name with each non-alphanumeric character
+replaced by `_`; the raw output name remains in `name`. If output names collide
+after slugging, the first output wins, each omitted output increments
+`port.slug_collisions`, and the compositor warns once for that slug. P-0 has one
+protocol-visible client output, so collisions remain a documented known limit.
+`band` includes `background`, `bottom`, `normal`, `top`, `overlay` and `lock`.
+`stack` contains mapped roots from top to bottom. `windows` is a projection of
+mapped XDG toplevels. `port.level` is `L1`; `event_seq` and `lost_count` remain
+zero until watch support lands. `port.broker` is driven by connection-state
+edges and is `connected` or `retrying`. `port.reply_timeouts` counts replies
+dropped because the bounded reply lane was saturated or the broker send
+exceeded its two-second deadline; it is separate from topic-only `lost_count`.
+
+All application errors use Bus rc 10 with exactly one of
+`{"error":"unknown_path"}`, `{"error":"busy"}` or
+`{"error":"unknown_verb"}`. An absent broker never delays compositor startup:
+the port thread reports `retrying` and reconnects independently. A service-name
+collision is logged once, ends the port worker without renaming, and leaves the
+compositor running.
+
+The broker client lives on the named `cosmix-comp-port` OS thread with its own
+current-thread Tokio runtime. At most 16 accepted reads cross a bounded calloop
+channel. The calloop callback only stages requests; after the current protocol
+transaction and popup cleanup, one owned snapshot is built and shared by all
+requests in that dispatch. Snapshot admission is released before reply I/O.
+Replies cross a separate bounded lane whose sender applies a two-second deadline,
+so the incoming command loop never awaits a broker send. Full-tree JSON is
+serialised once per snapshot on the blocking pool, with only one full-tree
+serialisation active process-wide; requests share the resulting string. Subtree
+reads serialise only the selected value.
+
+The 16,384-surface cap bounds tree cardinality, not reply bytes. At the title and
+app-ID limits, a hostile full tree can still approach roughly 400 MiB after the
+`windows` projection duplicates toplevel strings and JSON escaping expands them.
+Single-flight serialisation prevents same-snapshot multiplication, but the
+accepted untruncated full-tree reply remains a known resource risk.
+
+Absent by design in P-0:
+
+- mutation and `input.corners`, because the policy/store slice is P-1;
+- topics and watch, because event sequencing, coalescing and gap recovery are
+  P-1;
+- `comp.surface.*`, because focus/raise/close operations arrive in P-2 and
+  move/resize in P-3;
+- render timings, because they are metrics rather than properties; and
+- screenshot, because it waits for the capture service seam after Arc 4.
+
 ## Supported Wayland protocols
 
 The compositor advertises the core compositor, subcompositor, seat, output,
@@ -180,94 +269,6 @@ exact `ext_session_lock_v1` resource, so a rejected object from the same client
 cannot create surfaces or unlock it. Destroying the accepted resource during
 `Locking` aborts safely. An orphaned lock never auto-unlocks and persists until
 the compositor exits.
-
-## Bus control plane
-
-The default `bus` feature gives the compositor a read-only Bus control plane.
-The seat/KMS compositor registers as `comp`; `--nested` registers as
-`comp-nested`. `--bus-service NAME` overrides either name and accepts
-`^[a-z][a-z0-9-]{1,30}$`. A build without the `bus` feature rejects that flag
-instead of silently ignoring it.
-
-P-0 exposes five verbs:
-
-- `comp.ping` returns `{"pong":true}` without taking a compositor snapshot.
-- `comp.info` returns service/build/backend provenance plus output and surface
-  counts and the property event counters.
-- `comp.props.get path?` returns one leaf or subtree, or the complete tree when
-  `path` is omitted.
-- `comp.props.list prefix?` returns leaf paths. A prefix is matched by complete
-  path segments, never by string prefix.
-- `comp.props.describe path` returns leaf metadata (`type`, `mutable`,
-  `sensitive`, description, optional `format`/`enum`, and owner) or an object
-  subtree with its immediate children. Every P-0 leaf is immutable,
-  non-sensitive and owned by `comp`.
-
-The complete P-0 read tree is:
-
-```text
-info.{service,version,backend,engine,instance}
-outputs.o_<slug>.{name,default,x,y,width,height,scale,refresh_mhz,
-                  usable.{x,y,width,height}}
-surfaces.s<id>.{id,role,mapped,visible,x,y,width,height,band,sequence,
-                tree_index,parent,output,title,app_id,focused,activated,
-                maximized,minimized,decoration,
-                layer.{stratum,interactivity,exclusive_zone,binding},foreign_id}
-windows.s<id>.{id,foreign_id,title,app_id,x,y,width,height,focused,
-               maximized,minimized,output}
-stack
-focus.{keyboard,exclusive_latch,pointer,pointer_grab}
-decoration.{enabled,style}
-bindings.{enabled,profile,table}
-port.{level,event_seq,lost_count,queue_depth,reply_timeouts,broker}
-```
-
-Surface keys are `s` plus the decimal session-local surface ID. Output keys are
-`o_` plus the lower-case output name with each non-alphanumeric character
-replaced by `_`; the raw output name remains in `name`. P-0 has one
-protocol-visible client output, so colliding output slugs are a documented
-known limit rather than a guessed multi-output suffix rule. `band` includes
-`background`, `bottom`, `normal`, `top`, `overlay` and `lock`. `stack` contains
-mapped roots from top to bottom. `windows` is a projection of mapped XDG
-toplevels. `port.level` is `L1`; `event_seq` and `lost_count` remain zero until
-watch support lands. `port.broker` is driven by connection-state edges and is
-`connected` or `retrying`. `port.reply_timeouts` counts replies dropped because
-the bounded reply lane was saturated or the broker send exceeded its two-second
-deadline; it is separate from topic-only `lost_count`.
-
-All application errors use Bus rc 10 with exactly one of
-`{"error":"unknown_path"}`, `{"error":"busy"}` or
-`{"error":"unknown_verb"}`. An absent broker never delays compositor startup:
-the port thread reports `retrying` and reconnects independently. A service-name
-collision is logged once, ends the port worker without renaming, and leaves the
-compositor running.
-
-The broker client lives on the named `cosmix-comp-port` OS thread with its own
-current-thread Tokio runtime. At most 16 accepted reads cross a bounded calloop
-channel. The calloop callback only stages requests; after the current protocol
-transaction and popup cleanup, one owned snapshot is built and shared by all
-requests in that dispatch. Snapshot admission is released before reply I/O.
-Replies cross a separate bounded lane whose sender applies a two-second deadline,
-so the incoming command loop never awaits a broker send. Full-tree JSON is
-serialised once per snapshot on the blocking pool, with only one full-tree
-serialisation active process-wide; requests share the resulting string. Subtree
-reads serialise only the selected value.
-
-The 16,384-surface cap bounds tree cardinality, not reply bytes. At the title and
-app-ID limits, a hostile full tree can still approach roughly 400 MiB after the
-`windows` projection duplicates toplevel strings and JSON escaping expands them.
-Single-flight serialisation prevents same-snapshot multiplication, but the
-accepted untruncated full-tree reply remains a known resource risk.
-
-Absent by design in P-0:
-
-- mutation and `input.corners`, because the policy/store slice is P-1;
-- topics and watch, because event sequencing, coalescing and gap recovery are
-  P-1;
-- `comp.surface.*`, because focus/raise/close operations arrive in P-2 and
-  move/resize in P-3;
-- render timings, because they are metrics rather than properties; and
-- screenshot, because it waits for the capture service seam after Arc 4.
 
 ## Vendored changes
 

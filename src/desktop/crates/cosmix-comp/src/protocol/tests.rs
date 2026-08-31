@@ -44,7 +44,7 @@ fn snapshot_context(backend: &'static str) -> port_snapshot::SnapshotContext {
         } else {
             "comp-nested"
         }),
-        version: Arc::from("0.32.1-test"),
+        version: Arc::from("0.33.0-test"),
         backend,
         engine: "bevy-0.19/wgpu",
         instance: Arc::from("protocol-fixture"),

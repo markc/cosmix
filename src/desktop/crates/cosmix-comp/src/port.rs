@@ -515,7 +515,7 @@ fn handle_incoming(
     }
     let malformed =
         !command.body.is_empty() && serde_json::from_str::<Value>(&command.body).is_err();
-    if command.command == "comp.ping" && !malformed {
+    if command.command == "comp.ping" {
         queue_reply(
             reply_sender,
             reply_timeouts,
@@ -883,6 +883,44 @@ mod tests {
         for invalid in ["c", "Comp", "comp_nested", "-comp", "comp-é"] {
             assert!(validate_service_name(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[tokio::test]
+    async fn ping_ignores_malformed_body_while_property_reads_reject_it() {
+        let (ingress, source, _) = test_ingress();
+        let mut responders = JoinSet::new();
+        let responder_permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let (reply_sender, mut replies) = tokio_mpsc::channel(2);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+
+        let mut ping = command("comp.ping", 1);
+        ping.body = "{".into();
+        handle_incoming(
+            &ingress,
+            &mut responders,
+            &responder_permits,
+            &reply_sender,
+            &reply_timeouts,
+            ping,
+        );
+        let reply = replies.recv().await.expect("ping reply queued");
+        assert_eq!(reply.rc, 0);
+        assert_eq!(reply.body.as_ref(), "{\"pong\":true}");
+
+        let mut get = command("comp.props.get", 2);
+        get.body = "{".into();
+        handle_incoming(
+            &ingress,
+            &mut responders,
+            &responder_permits,
+            &reply_sender,
+            &reply_timeouts,
+            get,
+        );
+        let reply = replies.recv().await.expect("malformed read reply queued");
+        assert_eq!(reply.rc, 10);
+        assert_eq!(reply.body.as_ref(), "{\"error\":\"unknown_path\"}");
+        assert!(matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)));
     }
 
     #[tokio::test]

@@ -170,6 +170,7 @@ pub(crate) struct PortSnapshot {
     pub(crate) lost_count: u64,
     pub(crate) queue_depth: usize,
     pub(crate) reply_timeouts: u64,
+    pub(crate) slug_collisions: u64,
     pub(crate) broker: &'static str,
 }
 
@@ -177,14 +178,14 @@ pub(crate) struct PortSnapshot {
 pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Option<CompSnapshot> {
     let sources = state.backend.port_outputs();
     let mut output_keys = Vec::<(Output, String)>::with_capacity(sources.len());
-    let mut outputs = BTreeMap::new();
+    let mut outputs = BTreeMap::<String, OutputSnapshot>::new();
+    let mut slug_collisions = 0_u64;
     for source in sources {
         let key = output_key(&source.name);
+        if output_slug_collides(&outputs, &key, &source.name, &mut slug_collisions) {
+            continue;
+        }
         let usable = state.port_usable_output_rect_for(&source.output)?;
-        assert!(
-            !outputs.contains_key(&key),
-            "P-0 output slug collision; define the multi-output collision rule before exposing it"
-        );
         output_keys.push((source.output, key.clone()));
         outputs.insert(
             key,
@@ -352,6 +353,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
             lost_count: 0,
             queue_depth: context.queue_depth.load(Ordering::Acquire),
             reply_timeouts: context.reply_timeouts.load(Ordering::Acquire),
+            slug_collisions,
             broker: if context.broker.load(Ordering::Acquire) == BROKER_CONNECTED {
                 "connected"
             } else {
@@ -361,6 +363,32 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         property_tree: OnceLock::new(),
         full_tree: tokio::sync::OnceCell::new(),
     })
+}
+
+fn output_slug_collides(
+    outputs: &BTreeMap<String, OutputSnapshot>,
+    key: &str,
+    dropped_output: &str,
+    collisions: &mut u64,
+) -> bool {
+    let Some(first) = outputs.get(key) else {
+        return false;
+    };
+    *collisions = collisions.saturating_add(1);
+    static WARNED_KEYS: OnceLock<std::sync::Mutex<BTreeSet<String>>> = OnceLock::new();
+    let mut warned = WARNED_KEYS
+        .get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if warned.insert(key.to_string()) {
+        tracing::warn!(
+            slug = key,
+            kept_output = %first.name,
+            dropped_output,
+            "compositor Bus output slug collision; keeping first output"
+        );
+    }
+    true
 }
 
 fn surface_output<'a>(
@@ -867,6 +895,11 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         Number,
         "Replies dropped after a send deadline or saturated reply lane"
     ),
+    descriptor!(
+        &[L("port"), L("slug_collisions")],
+        Number,
+        "Outputs omitted because their public slug collided with an earlier output"
+    ),
     descriptor!(&[L("port"), L("broker")], String, "Live broker connection state", enum = &["connected", "retrying"]),
 ];
 
@@ -1289,7 +1322,7 @@ mod tests {
         CompSnapshot {
             info: InfoSnapshot {
                 service: Arc::from("comp-nested"),
-                version: Arc::from("0.32.1"),
+                version: Arc::from("0.33.0"),
                 backend: "nested",
                 engine: "bevy-0.19/wgpu",
                 instance: Arc::from("fixture"),
@@ -1322,6 +1355,7 @@ mod tests {
                 lost_count: 0,
                 queue_depth: 1,
                 reply_timeouts: 0,
+                slug_collisions: 0,
                 broker: "connected",
             },
             property_tree: OnceLock::new(),
@@ -1404,6 +1438,28 @@ mod tests {
     fn output_keys_obey_the_public_slug_encoding() {
         assert_eq!(output_key("cosmix-nested-0"), "o_cosmix_nested_0");
         assert_eq!(output_key("DP-1"), "o_dp_1");
+    }
+
+    #[test]
+    fn output_slug_collision_keeps_first_and_counts_dropped_output() {
+        let snapshot = fixture();
+        let mut outputs = snapshot.outputs;
+        let mut collisions = 0;
+
+        assert!(output_slug_collides(
+            &outputs,
+            "o_dp_1",
+            "DP_1",
+            &mut collisions,
+        ));
+        assert_eq!(collisions, 1);
+        assert_eq!(
+            outputs
+                .remove("o_dp_1")
+                .expect("first output retained")
+                .name,
+            "DP-1"
+        );
     }
 
     #[tokio::test]
