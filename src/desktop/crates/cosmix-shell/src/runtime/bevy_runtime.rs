@@ -7,7 +7,7 @@
 use bevy::app::{App, Plugin, Update};
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::schedule::{IntoScheduleConfigs, SystemSet};
-use bevy::prelude::{Res, ResMut, Resource, Time};
+use bevy::prelude::{Res, ResMut, Resource, Time, World};
 use bevy::time::Real;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -65,6 +65,20 @@ impl Plugin for ShellRuntimePlugin {
             )
             .add_systems(Update, update_model.in_set(ShellRuntimeSet::Model));
     }
+}
+
+/// Replace the singleton v1 model after its selected output disappears.
+///
+/// The layer host drains and destroys the old surfaces first, then calls this
+/// before mapping fresh surfaces on the replacement output.
+pub fn replace_shell_model(world: &mut World, model: ShellModel) {
+    let frame = ShellFrame::from_model(&model);
+    *world.resource_mut::<ShellRuntime>() = ShellRuntime {
+        model,
+        clock_text: String::new(),
+        clock_deadline: None,
+    };
+    world.resource_mut::<ShellFrameState>().0 = frame;
 }
 
 fn update_model(

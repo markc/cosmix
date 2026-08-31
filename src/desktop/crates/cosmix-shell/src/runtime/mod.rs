@@ -12,4 +12,4 @@ pub use messages::{
 };
 
 #[cfg(feature = "chrome")]
-pub use bevy_runtime::{ShellFrameState, ShellRuntimePlugin, ShellRuntimeSet};
+pub use bevy_runtime::{ShellFrameState, ShellRuntimePlugin, ShellRuntimeSet, replace_shell_model};

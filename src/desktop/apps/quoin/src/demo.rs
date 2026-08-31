@@ -1,99 +1,74 @@
-//! Cosmix Quoin's real SCTK layer-shell host.
+//! Runnable Q-0 Quoin normal-window tuning harness.
+//!
+//! This is intentionally not a layer-shell client. F11 switches to
+//! borderless fullscreen so physical output corners can be used for tuning.
 
 use std::time::Duration;
 
 use bevy::feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme};
 use bevy::prelude::*;
 use bevy::ui::{UiRect, percent, px};
+use bevy::window::PrimaryWindow;
+use bevy::winit::{UpdateMode, WinitSettings};
 use cosmix_shell::chrome::{
-    QuoinChromePlugin, QuoinClock, QuoinContentBindings, QuoinPageContent, QuoinPageRegistry,
-    QuoinPageSpec, spawn_quoin_chrome,
+    QuoinChromePlugin, QuoinChromeProps, QuoinClock, QuoinContentBindings, QuoinPageContent,
+    QuoinPageRegistry, QuoinPageSpec, spawn_quoin_chrome,
 };
-use cosmix_shell::core::{Edge, PanelInput, ShellModel};
-use cosmix_shell::runtime::ShellFrameState;
-use cosmix_shell_host::{LayerHostConfig, LayerPanelMounts, configure_layer_host};
+use cosmix_shell::core::{CornerDetectorConfig, Edge, LogicalSize, OutputKey, ShellModel};
+use cosmix_shell::dev_host::{DevShellHostConfig, DevShellHostPlugin, IDLE_WAIT, spawn_dev_host};
+use cosmix_shell::runtime::{ShellFrameState, ShellRuntimePlugin};
 use ctk::theme::{CtkThemePlugin, ThemeSpec, ThemeState, apply_theme, tokens};
 
-#[derive(Debug, Default)]
-struct Cli {
-    output: Option<String>,
-    smoke_all_panels: bool,
-}
+const OUTPUT: &str = "quoin-dev-window";
 
+#[allow(dead_code)]
 fn main() {
-    let cli = match parse_cli(std::env::args().skip(1)) {
-        Ok(cli) => cli,
-        Err(error) => {
-            eprintln!("{error}");
-            eprintln!("QUOIN_LAYER_HOST_EXIT reason=invalid-cli");
-            return;
-        }
-    };
+    let size = LogicalSize::new(1440.0, 900.0).expect("static demo geometry is valid");
+    let output = OutputKey::new(OUTPUT).expect("static output key is valid");
     let registry = page_registry();
-    let model_registry = registry.clone();
-    let smoke_all_panels = cli.smoke_all_panels;
-    let host = LayerHostConfig::new(cli.output, move |output, logical_size| {
-        let mut model = ShellModel::new(
-            output,
-            logical_size,
-            Duration::ZERO,
-            Duration::from_millis(800),
-            Duration::from_millis(200),
-        )
-        .expect("SCTK supplied valid positive output geometry");
-        for edge in Edge::ALL {
-            model.set_carousel(edge, model_registry.carousel(edge));
-            if smoke_all_panels {
-                model
-                    .panel_input(edge, Duration::ZERO, PanelInput::Pin)
-                    .expect("static smoke input is monotonic");
-            }
-        }
-        model
-    });
+    let mut model = ShellModel::new(
+        output,
+        size,
+        Duration::ZERO,
+        Duration::from_millis(350),
+        Duration::from_millis(180),
+    )
+    .expect("static panel configuration is valid");
+    for edge in Edge::ALL {
+        model.set_carousel(edge, registry.carousel(edge));
+    }
 
-    let mut app = App::new();
-    configure_layer_host(&mut app, host);
-    app.insert_resource(registry)
+    App::new()
+        .insert_resource(WinitSettings {
+            // Keep this finite: bevy_winit 0.19 state.rs:711 leaves a stale
+            // WaitUntil armed when Instant::checked_add overflows on MAX.
+            focused_mode: UpdateMode::reactive(IDLE_WAIT),
+            unfocused_mode: UpdateMode::reactive_low_power(IDLE_WAIT),
+        })
+        .insert_resource(registry)
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "Cosmix Quoin — Q-0 dev harness (F11 fullscreen)".into(),
+                resolution: (1440, 900).into(),
+                resizable: true,
+                ..default()
+            }),
+            ..default()
+        }))
         .add_plugins((
             FeathersPlugins,
             CtkThemePlugin::default(),
+            ShellRuntimePlugin::new(model),
             QuoinChromePlugin,
+            DevShellHostPlugin,
         ))
         .add_systems(Startup, setup)
         .run();
 }
 
-fn parse_cli(arguments: impl IntoIterator<Item = String>) -> Result<Cli, String> {
-    let mut cli = Cli::default();
-    let mut arguments = arguments.into_iter();
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "--output" => {
-                if cli.output.is_some() {
-                    return Err("--output may be supplied only once".to_owned());
-                }
-                let output = arguments
-                    .next()
-                    .ok_or_else(|| "--output requires a NAME".to_owned())?;
-                if output.trim().is_empty() || output.starts_with('-') {
-                    return Err("--output requires a non-empty NAME".to_owned());
-                }
-                cli.output = Some(output);
-            }
-            "--smoke-all-panels" => cli.smoke_all_panels = true,
-            "--help" | "-h" => {
-                return Err("usage: cosmix-quoin [--output NAME] [--smoke-all-panels]".to_owned());
-            }
-            _ => return Err(format!("unknown option: {argument}")),
-        }
-    }
-    Ok(cli)
-}
-
 fn setup(
     mut commands: Commands,
-    mounts: Res<LayerPanelMounts>,
+    windows: Query<Entity, With<PrimaryWindow>>,
     mut theme: ResMut<UiTheme>,
     mut theme_state: ResMut<ThemeState>,
     registry: Res<QuoinPageRegistry>,
@@ -101,16 +76,39 @@ fn setup(
 ) {
     *theme = UiTheme(create_dark_theme());
     apply_theme(&mut theme, &mut theme_state, &ThemeSpec::builtin());
+    commands.spawn(Camera2d);
 
+    let window = windows.single().expect("demo has one primary window");
+    let logical_size = LogicalSize::new(1440.0, 900.0).expect("static geometry is valid");
+    let mounts = spawn_dev_host(
+        &mut commands,
+        window,
+        DevShellHostConfig {
+            output: OutputKey::new(OUTPUT).expect("static output key is valid"),
+            logical_size,
+            corner: CornerDetectorConfig::new(12.0, Duration::from_millis(200), 1500.0)
+                .expect("plan seed values are valid"),
+        },
+    );
+
+    let props = quoin_props(&mut commands, &registry, &frame);
+    spawn_quoin_chrome(&mut commands, mounts, props);
+}
+
+pub(crate) fn quoin_props(
+    commands: &mut Commands,
+    registry: &QuoinPageRegistry,
+    frame: &ShellFrameState,
+) -> QuoinChromeProps {
     let mut bindings = QuoinContentBindings::default();
     bindings.set(
         Edge::Bottom,
         vec![
-            QuoinPageContent::new("launcher", bottom_launcher(&mut commands)),
+            QuoinPageContent::new("launcher", bottom_launcher(commands)),
             QuoinPageContent::new(
                 "tasks",
                 placeholder(
-                    &mut commands,
+                    commands,
                     "Task strip",
                     "Studio  •  Mail  •  Files  •  Terminal",
                     true,
@@ -123,21 +121,11 @@ fn setup(
         vec![
             QuoinPageContent::new(
                 "nav",
-                placeholder(
-                    &mut commands,
-                    "Navigation",
-                    "Home\nApps\nFiles\nSettings",
-                    false,
-                ),
+                placeholder(commands, "Navigation", "Home\nApps\nFiles\nSettings", false),
             ),
             QuoinPageContent::new(
                 "places",
-                placeholder(
-                    &mut commands,
-                    "Places",
-                    "Desktop\nProjects\nDownloads",
-                    false,
-                ),
+                placeholder(commands, "Places", "Desktop\nProjects\nDownloads", false),
             ),
         ],
     );
@@ -147,7 +135,7 @@ fn setup(
             QuoinPageContent::new(
                 "monitor",
                 placeholder(
-                    &mut commands,
+                    commands,
                     "Monitoring",
                     "CPU  12%\nMemory  8.4 GiB\nMesh  healthy",
                     false,
@@ -155,7 +143,7 @@ fn setup(
             ),
             QuoinPageContent::new(
                 "agents",
-                placeholder(&mut commands, "Agents", "No active jobs", false),
+                placeholder(commands, "Agents", "No active jobs", false),
             ),
         ],
     );
@@ -165,7 +153,7 @@ fn setup(
             QuoinPageContent::new(
                 "status",
                 placeholder(
-                    &mut commands,
+                    commands,
                     "Cosmix",
                     "Network online  •  Audio ready  •  Power balanced",
                     true,
@@ -173,17 +161,16 @@ fn setup(
             ),
             QuoinPageContent::new(
                 "spaces",
-                placeholder(&mut commands, "Spaces", "1  ●   2  ○   3  ○", true),
+                placeholder(commands, "Spaces", "1  ●   2  ○   3  ○", true),
             ),
         ],
     );
-    let props = registry
+    registry
         .bind(&frame.0, bindings)
-        .expect("Quoin content IDs match its validated registry");
-    spawn_quoin_chrome(&mut commands, mounts.0, props);
+        .expect("Quoin content IDs match its validated registry")
 }
 
-fn page_registry() -> QuoinPageRegistry {
+pub(crate) fn page_registry() -> QuoinPageRegistry {
     let pages = |values: &[(&str, &str)]| {
         values
             .iter()
@@ -265,35 +252,4 @@ fn bottom_launcher(commands: &mut Commands) -> Entity {
         })
         .add_children(&[apps, clock])
         .id()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cli_accepts_output_and_smoke_flag_in_either_order() {
-        let cli = parse_cli([
-            "--smoke-all-panels".to_owned(),
-            "--output".to_owned(),
-            "WL-1".to_owned(),
-        ])
-        .unwrap();
-        assert_eq!(cli.output.as_deref(), Some("WL-1"));
-        assert!(cli.smoke_all_panels);
-    }
-
-    #[test]
-    fn cli_rejects_missing_or_duplicate_output_name() {
-        assert!(parse_cli(["--output".to_owned()]).is_err());
-        assert!(
-            parse_cli([
-                "--output".to_owned(),
-                "WL-1".to_owned(),
-                "--output".to_owned(),
-                "WL-2".to_owned(),
-            ])
-            .is_err()
-        );
-    }
 }

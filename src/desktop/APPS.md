@@ -46,6 +46,10 @@ channel/note inspector), not before (decision 2026-07-25). New apps must
 use the shell. Contract and procedure: `_doc/2026-07-25-dcs-app-shell.md`
 (control repo).
 
+Quoin is the explicit `DcsAppShell` exception: it is desktop furniture with
+four independent edge roots, not an application injecting content into a
+centre/side-slot frame.
+
 ## Registry
 
 | State | Slug | Display name | Role |
@@ -56,3 +60,4 @@ use the shell. Contract and procedure: `_doc/2026-07-25-dcs-app-shell.md`
 | active | `tray` | CosMix Tray | Plasma StatusNotifierItem — launch apps, start/stop cosmix daemons, mesh health (kind: tray, engine: none) |
 | active | `tower` | CosMix Tower | Mesh mission control — verified node atlas, same-node citizen/daemon controls, live traffic animation, and persisted filters/layout |
 | active | `mail` | CosMix Mail | Frontend mail reader and composer (Bevy + ctk); reads the `maild` domain, which stays the backend server. Not a reused retired slug: the archived Bus/`ui.*` disp-skia client of the same name was never registered here and was carved out to `_attic/bus-display/` on 2026-07-20. Landed 2026-07-31 as the widget vertical slice — fixture corpus, no JMAP transport yet. |
+| active | `quoin` | CosMix Quoin | Furniture-tier desktop shell: four edge panels; Bus service `shell` |

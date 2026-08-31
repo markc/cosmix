@@ -13,6 +13,7 @@ members = [
     "crates/cosmix-comp",
     "crates/cosmix-deco",
     "crates/cosmix-shell",
+    "crates/cosmix-shell-host",
     "crates/cosmix-wgpu-dmabuf",
     "crates/cosmix-wl-dnd",
     "spike/wl-dnd",

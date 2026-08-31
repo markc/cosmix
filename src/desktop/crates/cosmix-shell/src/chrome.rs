@@ -3,8 +3,10 @@
 //!
 //! The chrome owns no shell semantics and performs no window queries. A host
 //! supplies four mount entities; every visual update is driven only by the
-//! renderer-neutral [`ShellFrameState`]. Panels keep their final layout size
-//! while [`UiTransform::translation`] performs the off-edge slide.
+//! renderer-neutral [`ShellFrameState`]. Panels keep their final layout size.
+//! The development host lets chrome own the complete off-edge slide, while a
+//! layer-shell host selects protocol margins for non-pinned motion and leaves
+//! only pinned motion with [`UiTransform::translation`].
 
 use accesskit::Role;
 use std::error::Error;
@@ -34,6 +36,17 @@ use crate::runtime::{
 #[derive(Clone, Copy, Debug)]
 pub struct QuoinPanelMounts {
     mounts: [Entity; 4],
+    motion_ownership: QuoinMotionOwnership,
+}
+
+/// Selects the one visual-motion owner used by chrome for every panel state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum QuoinMotionOwnership {
+    /// Chrome translates every mapped panel (the normal-window development host).
+    #[default]
+    Chrome,
+    /// Protocol margins translate non-pinned panels; chrome translates pinned panels.
+    ProtocolWhenUnpinned,
 }
 
 impl QuoinPanelMounts {
@@ -42,11 +55,36 @@ impl QuoinPanelMounts {
         mounts[Edge::Bottom.index()] = bottom;
         mounts[Edge::Right.index()] = right;
         mounts[Edge::Top.index()] = top;
-        Self { mounts }
+        Self {
+            mounts,
+            motion_ownership: QuoinMotionOwnership::Chrome,
+        }
+    }
+
+    /// Construct mounts for layer-shell surfaces, where protocol margins own
+    /// revealed and concealing motion and chrome owns pinned motion.
+    pub const fn for_layer_surfaces(
+        left: Entity,
+        bottom: Entity,
+        right: Entity,
+        top: Entity,
+    ) -> Self {
+        let mut mounts = [left; 4];
+        mounts[Edge::Bottom.index()] = bottom;
+        mounts[Edge::Right.index()] = right;
+        mounts[Edge::Top.index()] = top;
+        Self {
+            mounts,
+            motion_ownership: QuoinMotionOwnership::ProtocolWhenUnpinned,
+        }
     }
 
     pub const fn get(self, edge: Edge) -> Entity {
         self.mounts[edge.index()]
+    }
+
+    pub const fn motion_ownership(self) -> QuoinMotionOwnership {
+        self.motion_ownership
     }
 }
 
@@ -260,6 +298,7 @@ pub struct QuoinClock;
 #[derive(Component)]
 struct QuoinPanelChrome {
     edge: Edge,
+    motion_ownership: QuoinMotionOwnership,
 }
 
 #[derive(Component)]
@@ -338,12 +377,19 @@ pub fn spawn_quoin_chrome(
             commands,
             mounts.get(edge),
             edge,
+            mounts.motion_ownership(),
             std::mem::take(&mut panels[edge.index()]),
         );
     }
 }
 
-fn spawn_panel(commands: &mut Commands, mount: Entity, edge: Edge, pages: Vec<QuoinPage>) {
+fn spawn_panel(
+    commands: &mut Commands,
+    mount: Entity,
+    edge: Edge,
+    motion_ownership: QuoinMotionOwnership,
+    pages: Vec<QuoinPage>,
+) {
     let page_titles = pages
         .iter()
         .map(|page| (page.id.clone(), page.title.clone()))
@@ -469,7 +515,10 @@ fn spawn_panel(commands: &mut Commands, mount: Entity, edge: Edge, pages: Vec<Qu
             Pickable::default(),
             Hovered::default(),
             TabGroup::new(edge.index() as i32),
-            QuoinPanelChrome { edge },
+            QuoinPanelChrome {
+                edge,
+                motion_ownership,
+            },
             QuoinPanelParts {
                 pin_label,
                 title_label,
@@ -661,7 +710,13 @@ fn present_panels(
                 focus.clear();
             }
         }
-        let hidden = (1.0 - panel.visible_fraction) * panel.thickness_px;
+        let chrome_owns_motion = chrome.motion_ownership == QuoinMotionOwnership::Chrome
+            || panel.mode == PanelMode::Pinned;
+        let hidden = if chrome_owns_motion {
+            (1.0 - panel.visible_fraction) * panel.thickness_px
+        } else {
+            0.0
+        };
         transform.translation = match chrome.edge {
             Edge::Left => Val2::new(px(-hidden), px(0)),
             Edge::Bottom => Val2::new(px(0), px(hidden)),
@@ -807,6 +862,62 @@ mod tests {
     }
 
     #[test]
+    fn layer_mounts_leave_unpinned_motion_to_protocol_but_own_pinned_motion() {
+        let mut model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(300),
+            Duration::from_millis(180),
+        )
+        .unwrap();
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::Reveal)
+            .unwrap();
+
+        let mut world = World::new();
+        let pin_label = world.spawn(Text::new("◇")).id();
+        let title_label = world.spawn(Text::new("Panel")).id();
+        let chrome = world
+            .spawn((
+                QuoinPanelChrome {
+                    edge: Edge::Left,
+                    motion_ownership: QuoinMotionOwnership::ProtocolWhenUnpinned,
+                },
+                QuoinPanelParts {
+                    pin_label,
+                    title_label,
+                    page_titles: Vec::new(),
+                    page_wrappers: Vec::new(),
+                    dot_labels: Vec::new(),
+                    controls: Vec::new(),
+                },
+                Node::default(),
+                UiTransform::default(),
+            ))
+            .id();
+        world.insert_resource(ShellFrameState(ShellFrame::from_model(&model)));
+        world.insert_resource(InputFocus::default());
+        world.run_system_once(present_panels).unwrap();
+        assert_eq!(
+            world.get::<UiTransform>(chrome).unwrap().translation,
+            Val2::new(px(0), px(0))
+        );
+
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::Pin)
+            .unwrap();
+        world.resource_mut::<ShellFrameState>().0 = ShellFrame::from_model(&model);
+        world.run_system_once(present_panels).unwrap();
+        assert_eq!(
+            world.get::<UiTransform>(chrome).unwrap().translation,
+            Val2::new(px(-240.0), px(0))
+        );
+        assert_eq!(model.panel(Edge::Left).visible_fraction, 0.0);
+        assert_eq!(model.panel(Edge::Left).exclusive_zone_px, 240.0);
+    }
+
+    #[test]
     fn unmapping_panel_disables_controls_and_clears_focus() {
         let mut model = ShellModel::new(
             OutputKey::new("test").unwrap(),
@@ -826,7 +937,10 @@ mod tests {
         let pin_label = world.spawn(Text::new("◇")).id();
         let title_label = world.spawn(Text::new("Panel")).id();
         world.spawn((
-            QuoinPanelChrome { edge: Edge::Left },
+            QuoinPanelChrome {
+                edge: Edge::Left,
+                motion_ownership: QuoinMotionOwnership::Chrome,
+            },
             QuoinPanelParts {
                 pin_label,
                 title_label,
