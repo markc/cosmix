@@ -111,8 +111,10 @@ reusing a sequence. If the bounded 256-entry outbox overflows, it replaces the
 oldest queued prefix with one in-order loss-interval marker. A gap is published
 to every topic represented by that exact interval before its next surviving
 record (at most seven gap publications per interval): Bus header
-`event_seq=<last lost seq>` and body
-`{gap:true,lost_count,cause:"outbox.overflow"}`. A rejected or timed-out
+`event_seq=<last lost seq>` (the interval's last-lost sequence) and body
+`{gap:true,lost_count,cause:"outbox.overflow"}`, where `lost_count` is the
+same cumulative process-wide counter as `port.lost_count`, not a per-interval
+tally. A rejected or timed-out
 publication discards its uncertain backlog and recovers with the same body
 using `cause:"publisher.loss"`. After either gap, read a fresh property tree.
 
