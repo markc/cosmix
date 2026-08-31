@@ -2,13 +2,10 @@
 
 #![deny(unsafe_code)]
 
-use std::time::Duration;
+use std::{fmt::Debug, time::Duration};
 
 #[cfg(test)]
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::{Arc, Mutex};
 
 use bevy::camera::RenderTarget;
 use bevy::prelude::*;
@@ -25,7 +22,10 @@ use smithay_client_toolkit::shell::{
     WaylandSurface,
     wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerSurface, LayerSurfaceConfigure},
 };
-use wayland_client::{Connection, Proxy, QueueHandle, protocol::wl_surface};
+use wayland_client::{
+    Connection, Dispatch, Proxy, QueueHandle,
+    protocol::{wl_callback::WlCallback, wl_surface},
+};
 use wayland_protocols::wp::{
     fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1,
     viewporter::client::wp_viewport::WpViewport,
@@ -41,6 +41,12 @@ const MAX_SURFACE_DIMENSION: u32 = 16_384;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SurfaceTag {
     pub edge: Edge,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FrameCallbackData {
+    pub surface: wl_surface::WlSurface,
+    pub generation: u64,
 }
 
 #[derive(Debug)]
@@ -74,26 +80,93 @@ pub(crate) fn frame_request_overdue(
     requested_at.is_some_and(|requested| elapsed >= requested.saturating_add(backstop))
 }
 
-#[derive(Debug)]
-struct WaylandObjects {
-    fractional: Option<FractionalObjects>,
-    // SCTK's drop implementation destroys the layer role before its owned
-    // wl_surface. Keep it ahead of the retained raw owner for drop ordering.
-    layer_surface: LayerSurface,
-    raw_handle: RawHandleWrapper,
-    _raw_owner: RetainedWindow,
+trait Teardown: Debug {
+    fn teardown(self);
 }
 
-impl WaylandObjects {
-    fn destroy(self) {
-        drop(self);
+#[derive(Debug)]
+struct LiveObjects {
+    fractional: Option<FractionalObjects>,
+    layer_surface: LayerSurface,
+    raw_handle: RawHandleWrapper,
+    raw_owner: RetainedWindow,
+}
+
+impl Teardown for LiveObjects {
+    fn teardown(mut self) {
+        if let Some(fractional) = self.fractional.take() {
+            fractional.destroy();
+        }
+        // SCTK destroys the layer role when the last LayerSurface drops.
+        // Release both raw-handle owner references only after that role.
+        drop(self.layer_surface);
+        drop(self.raw_handle);
+        drop(self.raw_owner);
     }
 }
 
-impl Drop for WaylandObjects {
+#[cfg(test)]
+#[derive(Debug)]
+struct TeardownProbe {
+    sequence: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[cfg(test)]
+impl Teardown for TeardownProbe {
+    fn teardown(self) {
+        self.sequence
+            .lock()
+            .expect("teardown probe lock is not poisoned")
+            .extend(["viewport", "fractional", "layer", "owner"]);
+    }
+}
+
+#[derive(Debug)]
+struct WaylandObjects<T: Teardown = LiveObjects> {
+    objects: Option<T>,
+}
+
+impl<T: Teardown> WaylandObjects<T> {
+    fn new(objects: T) -> Self {
+        Self {
+            objects: Some(objects),
+        }
+    }
+
+    fn objects(&self) -> &T {
+        self.objects
+            .as_ref()
+            .expect("live Wayland holder retains its objects")
+    }
+}
+
+impl<T: Teardown> Drop for WaylandObjects<T> {
     fn drop(&mut self) {
-        if let Some(fractional) = self.fractional.take() {
-            fractional.destroy();
+        if let Some(objects) = self.objects.take() {
+            objects.teardown();
+        }
+    }
+}
+
+#[derive(Debug)]
+// The small Probe arm exists only in tests; boxing Live would add a
+// production allocation solely for instrumentation.
+#[cfg_attr(test, allow(clippy::large_enum_variant))]
+enum PanelWaylandObjects {
+    Live(WaylandObjects),
+    #[cfg(test)]
+    Probe(WaylandObjects<TeardownProbe>),
+}
+
+impl PanelWaylandObjects {
+    fn live(&self) -> &LiveObjects {
+        match self {
+            Self::Live(objects) => objects.objects(),
+            #[cfg(test)]
+            Self::Probe(objects) => {
+                let _probe = objects.objects();
+                panic!("teardown probe has no live Wayland objects")
+            }
         }
     }
 }
@@ -190,15 +263,14 @@ pub struct PanelSurface {
     pub presented: bool,
     pub frame_pending: bool,
     pub frame_requested_at: Option<Duration>,
+    frame_generation: u64,
     pub waiting_configure_since: Option<Duration>,
-    wayland: Option<WaylandObjects>,
+    wayland: Option<PanelWaylandObjects>,
     output_size: LogicalSize,
     output_scale: i32,
     preferred_fractional_scale: Option<f64>,
     configured_logical_size: Option<(u32, u32)>,
     announced_scale: Option<f64>,
-    #[cfg(test)]
-    destroy_wayland_objects_counter: Option<Arc<AtomicUsize>>,
 }
 
 impl PanelSurface {
@@ -266,20 +338,21 @@ impl PanelSurface {
             presented: false,
             frame_pending: false,
             frame_requested_at: None,
+            frame_generation: 0,
             waiting_configure_since: None,
-            wayland: Some(WaylandObjects {
-                fractional,
-                layer_surface,
-                raw_handle,
-                _raw_owner,
-            }),
+            wayland: Some(PanelWaylandObjects::Live(WaylandObjects::new(
+                LiveObjects {
+                    fractional,
+                    layer_surface,
+                    raw_handle,
+                    raw_owner: _raw_owner,
+                },
+            ))),
             output_size,
             output_scale: output_scale.max(1),
             preferred_fractional_scale: None,
             configured_logical_size: None,
             announced_scale: None,
-            #[cfg(test)]
-            destroy_wayland_objects_counter: None,
         })
     }
 
@@ -292,15 +365,17 @@ impl PanelSurface {
     ) -> Result<(), RawHandleError> {
         debug_assert!(self.wayland.is_none());
         let (_raw_owner, raw_handle) = retained_raw_handle(connection.clone(), wl_surface)?;
-        self.wayland = Some(WaylandObjects {
-            fractional,
-            layer_surface,
-            raw_handle,
-            _raw_owner,
-        });
+        self.wayland = Some(PanelWaylandObjects::Live(WaylandObjects::new(
+            LiveObjects {
+                fractional,
+                layer_surface,
+                raw_handle,
+                raw_owner: _raw_owner,
+            },
+        )));
         self.preferred_fractional_scale = None;
         self.announced_scale = None;
-        self.clear_frame_request();
+        self.invalidate_frame_request();
         self.waiting_configure_since = None;
         Ok(())
     }
@@ -312,19 +387,19 @@ impl PanelSurface {
     pub(crate) fn matches_surface(&self, surface: &wl_surface::WlSurface) -> bool {
         self.wayland
             .as_ref()
-            .is_some_and(|objects| objects.layer_surface.wl_surface() == surface)
+            .is_some_and(|objects| objects.live().layer_surface.wl_surface() == surface)
     }
 
     pub(crate) fn matches_layer(&self, layer: &LayerSurface) -> bool {
         self.wayland
             .as_ref()
-            .is_some_and(|objects| objects.layer_surface == *layer)
+            .is_some_and(|objects| objects.live().layer_surface == *layer)
     }
 
     pub(crate) fn matches_fractional_scale(&self, scale: &WpFractionalScaleV1) -> bool {
         self.wayland
             .as_ref()
-            .and_then(|objects| objects.fractional.as_ref())
+            .and_then(|objects| objects.live().fractional.as_ref())
             .is_some_and(|fractional| fractional.scale == *scale)
     }
 
@@ -344,7 +419,8 @@ impl PanelSurface {
         let objects = self
             .wayland
             .as_ref()
-            .expect("mapped panel has fresh Wayland objects");
+            .expect("mapped panel has fresh Wayland objects")
+            .live();
         for operation in operations {
             match *operation {
                 ProtocolOp::CreateSurface => {
@@ -401,7 +477,7 @@ impl PanelSurface {
                 camera.is_active = false;
             }
             self.phase = SurfacePhase::PreparingUnmap;
-            self.clear_frame_request();
+            self.invalidate_frame_request();
             self.waiting_configure_since = None;
         }
     }
@@ -413,7 +489,7 @@ impl PanelSurface {
             self.configured_logical_size = None;
             self.announced_scale = None;
             self.presented = false;
-            self.clear_frame_request();
+            self.invalidate_frame_request();
             self.waiting_configure_since = None;
         }
     }
@@ -426,10 +502,7 @@ impl PanelSurface {
         elapsed: Duration,
     ) -> Result<(), SurfaceSizeError>
     where
-        State: wayland_client::Dispatch<
-                wayland_client::protocol::wl_callback::WlCallback,
-                wl_surface::WlSurface,
-            > + 'static,
+        State: Dispatch<WlCallback, FrameCallbackData> + 'static,
     {
         let thickness = self
             .last_committed
@@ -465,6 +538,7 @@ impl PanelSurface {
                     .wayland
                     .as_ref()
                     .expect("configured panel has Wayland objects")
+                    .live()
                     .raw_handle
                     .clone();
                 app.world_mut().entity_mut(self.window).insert(raw_handle);
@@ -569,25 +643,26 @@ impl PanelSurface {
         Ok(())
     }
 
-    pub fn request_frame<State>(&mut self, qh: &QueueHandle<State>, elapsed: Duration)
+    pub(crate) fn request_frame<State>(&mut self, qh: &QueueHandle<State>, elapsed: Duration)
     where
-        State: wayland_client::Dispatch<
-                wayland_client::protocol::wl_callback::WlCallback,
-                wl_surface::WlSurface,
-            > + 'static,
+        State: Dispatch<WlCallback, FrameCallbackData> + 'static,
     {
-        if (self.phase == SurfacePhase::Configured || self.phase == SurfacePhase::WaitingConfigure)
-            && !self.frame_pending
-        {
+        if let Some(generation) = self.begin_frame_request(elapsed) {
             let surface = self
                 .wayland
                 .as_ref()
                 .expect("mapped panel has Wayland objects")
+                .live()
                 .layer_surface
-                .wl_surface();
-            surface.frame(qh, surface.clone());
-            self.frame_pending = true;
-            self.frame_requested_at = Some(elapsed);
+                .wl_surface()
+                .clone();
+            surface.frame(
+                qh,
+                FrameCallbackData {
+                    surface: surface.clone(),
+                    generation,
+                },
+            );
         }
     }
 
@@ -595,16 +670,28 @@ impl PanelSurface {
         self.wayland
             .as_ref()
             .expect("mapped panel has Wayland objects")
+            .live()
             .layer_surface
             .commit();
     }
 
-    pub fn frame_done(&mut self) -> bool {
-        let answered = self.clear_frame_request();
+    pub fn frame_done(&mut self, generation: u64) -> bool {
+        if !self.frame_pending || generation != self.frame_generation {
+            tracing::trace!(
+                edge = ?self.edge,
+                callback_generation = generation,
+                current_generation = self.frame_generation,
+                frame_pending = self.frame_pending,
+                "ignoring stale frame callback"
+            );
+            return false;
+        }
+        self.frame_pending = false;
+        self.frame_requested_at = None;
         if self.phase == SurfacePhase::Configured {
             self.presented = true;
         }
-        answered
+        true
     }
 
     pub(crate) fn pending_frame_requested_at(&self) -> Option<Duration> {
@@ -631,7 +718,7 @@ impl PanelSurface {
             camera.is_active = false;
         }
         self.phase = SurfacePhase::Closed;
-        self.clear_frame_request();
+        self.invalidate_frame_request();
         self.waiting_configure_since = None;
     }
 
@@ -642,7 +729,7 @@ impl PanelSurface {
 
     pub fn clear_overdue_frame(&mut self, elapsed: Duration, backstop: Duration) -> bool {
         if self.frame_pending && frame_request_overdue(self.frame_requested_at, elapsed, backstop) {
-            self.clear_frame_request();
+            self.invalidate_frame_request();
             true
         } else {
             false
@@ -652,34 +739,45 @@ impl PanelSurface {
     /// Drop a drained protocol/WSI owner while preserving the mount and its
     /// chrome subtree for a replacement output runtime.
     pub fn retire(mut self, app: &mut App) {
-        self.clear_frame_request();
-        self.destroy_wayland_objects();
+        self.prepare_retire();
         app.world_mut().despawn(self.camera);
         app.world_mut().despawn(self.window);
     }
 
-    fn destroy_wayland_objects(&mut self) {
-        #[cfg(test)]
-        if let Some(counter) = self.destroy_wayland_objects_counter.take() {
-            counter.fetch_add(1, Ordering::SeqCst);
-        }
-        if let Some(objects) = self.wayland.take() {
-            objects.destroy();
-        }
+    fn prepare_retire(&mut self) {
+        self.invalidate_frame_request();
+        self.destroy_wayland_objects();
     }
 
-    fn clear_frame_request(&mut self) -> bool {
-        let pending = self.frame_pending;
+    fn destroy_wayland_objects(&mut self) {
+        drop(self.wayland.take());
+    }
+
+    fn begin_frame_request(&mut self, elapsed: Duration) -> Option<u64> {
+        if !matches!(
+            self.phase,
+            SurfacePhase::Configured | SurfacePhase::WaitingConfigure
+        ) || self.frame_pending
+        {
+            return None;
+        }
+        self.frame_generation = self.frame_generation.wrapping_add(1);
+        self.frame_pending = true;
+        self.frame_requested_at = Some(elapsed);
+        Some(self.frame_generation)
+    }
+
+    fn invalidate_frame_request(&mut self) {
+        self.frame_generation = self.frame_generation.wrapping_add(1);
         self.frame_pending = false;
         self.frame_requested_at = None;
-        pending
     }
 
     #[cfg(test)]
     pub(crate) fn test_double(
         app: &mut App,
         phase: SurfacePhase,
-        destroy_wayland_objects_counter: Arc<AtomicUsize>,
+        teardown_sequence: Arc<Mutex<Vec<&'static str>>>,
     ) -> Self {
         let window = app.world_mut().spawn_empty().id();
         let camera = app.world_mut().spawn_empty().id();
@@ -694,14 +792,18 @@ impl PanelSurface {
             presented: false,
             frame_pending: false,
             frame_requested_at: None,
+            frame_generation: 0,
             waiting_configure_since: None,
-            wayland: None,
+            wayland: Some(PanelWaylandObjects::Probe(WaylandObjects::new(
+                TeardownProbe {
+                    sequence: teardown_sequence,
+                },
+            ))),
             output_size: LogicalSize::new(1.0, 1.0).expect("test size is valid"),
             output_scale: 1,
             preferred_fractional_scale: None,
             configured_logical_size: None,
             announced_scale: None,
-            destroy_wayland_objects_counter: Some(destroy_wayland_objects_counter),
         }
     }
 
@@ -714,6 +816,7 @@ impl PanelSurface {
         let Some(objects) = &self.wayland else {
             return;
         };
+        let objects = objects.live();
         let wl_surface = objects.layer_surface.wl_surface();
         if self.preferred_fractional_scale.is_some() {
             if wl_surface.version() >= 3 {
@@ -773,6 +876,19 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
+    const TEARDOWN_ORDER: [&str; 4] = ["viewport", "fractional", "layer", "owner"];
+
+    fn teardown_sequence() -> Arc<Mutex<Vec<&'static str>>> {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    fn recorded(sequence: &Arc<Mutex<Vec<&'static str>>>) -> Vec<&'static str> {
+        sequence
+            .lock()
+            .expect("teardown probe lock is not poisoned")
+            .clone()
+    }
+
     #[test]
     fn fractional_addons_destroy_viewport_before_scale() {
         let order = RefCell::new(Vec::new());
@@ -786,43 +902,118 @@ mod tests {
     #[test]
     fn finish_unmap_destroys_its_wayland_holder_once() {
         let mut app = App::new();
-        let destroys = Arc::new(AtomicUsize::new(0));
+        let sequence = teardown_sequence();
         let mut panel = PanelSurface::test_double(
             &mut app,
             SurfacePhase::PreparingUnmap,
-            Arc::clone(&destroys),
+            Arc::clone(&sequence),
         );
 
         panel.finish_unmap();
         panel.finish_unmap();
 
-        assert_eq!(destroys.load(Ordering::SeqCst), 1);
+        assert_eq!(recorded(&sequence), TEARDOWN_ORDER);
         assert_eq!(panel.phase, SurfacePhase::Unmapped);
     }
 
     #[test]
     fn finish_close_destroys_its_wayland_holder_once() {
         let mut app = App::new();
-        let destroys = Arc::new(AtomicUsize::new(0));
+        let sequence = teardown_sequence();
         let mut panel =
-            PanelSurface::test_double(&mut app, SurfacePhase::Closed, Arc::clone(&destroys));
+            PanelSurface::test_double(&mut app, SurfacePhase::Closed, Arc::clone(&sequence));
 
         panel.finish_close();
         panel.finish_close();
 
-        assert_eq!(destroys.load(Ordering::SeqCst), 1);
+        assert_eq!(recorded(&sequence), TEARDOWN_ORDER);
     }
 
     #[test]
     fn retire_destroys_its_wayland_holder_once() {
         let mut app = App::new();
-        let destroys = Arc::new(AtomicUsize::new(0));
+        let sequence = teardown_sequence();
         let panel =
-            PanelSurface::test_double(&mut app, SurfacePhase::Closed, Arc::clone(&destroys));
+            PanelSurface::test_double(&mut app, SurfacePhase::Closed, Arc::clone(&sequence));
 
         panel.retire(&mut app);
 
-        assert_eq!(destroys.load(Ordering::SeqCst), 1);
+        assert_eq!(recorded(&sequence), TEARDOWN_ORDER);
+    }
+
+    #[test]
+    fn expired_generation_cannot_clear_a_new_frame_request() {
+        let mut app = App::new();
+        let mut panel =
+            PanelSurface::test_double(&mut app, SurfacePhase::Configured, teardown_sequence());
+        let requested_a = Duration::from_secs(1);
+        let generation_a = panel
+            .begin_frame_request(requested_a)
+            .expect("request A is accepted");
+
+        assert!(panel.clear_overdue_frame(Duration::from_secs(2), Duration::from_secs(1)));
+        let requested_b = Duration::from_secs(3);
+        let generation_b = panel
+            .begin_frame_request(requested_b)
+            .expect("request B is accepted after A expires");
+
+        assert!(!panel.frame_done(generation_a));
+        assert!(panel.frame_pending);
+        assert_eq!(panel.frame_requested_at, Some(requested_b));
+        assert!(panel.frame_done(generation_b));
+        assert!(!panel.frame_pending);
+        assert_eq!(panel.frame_requested_at, None);
+    }
+
+    #[test]
+    fn current_generation_completes_a_normal_frame_request() {
+        let mut app = App::new();
+        let mut panel =
+            PanelSurface::test_double(&mut app, SurfacePhase::Configured, teardown_sequence());
+        let generation = panel
+            .begin_frame_request(Duration::from_secs(1))
+            .expect("normal request is accepted");
+
+        assert!(panel.frame_done(generation));
+        assert!(panel.presented);
+        assert!(!panel.frame_pending);
+        assert_eq!(panel.frame_requested_at, None);
+    }
+
+    #[test]
+    fn lifecycle_transitions_invalidate_frame_generations() {
+        let mut app = App::new();
+
+        let mut unmapping =
+            PanelSurface::test_double(&mut app, SurfacePhase::Configured, teardown_sequence());
+        let unmap_generation = unmapping
+            .begin_frame_request(Duration::from_secs(1))
+            .expect("unmap request is accepted");
+        unmapping.begin_unmap(&mut app);
+        assert!(!unmapping.frame_pending);
+        assert_ne!(unmapping.frame_generation, unmap_generation);
+
+        let mut closing =
+            PanelSurface::test_double(&mut app, SurfacePhase::Configured, teardown_sequence());
+        let close_generation = closing
+            .begin_frame_request(Duration::from_secs(1))
+            .expect("close request is accepted");
+        closing.close(&mut app);
+        assert!(!closing.frame_pending);
+        assert_ne!(closing.frame_generation, close_generation);
+
+        let sequence = teardown_sequence();
+        let mut retiring =
+            PanelSurface::test_double(&mut app, SurfacePhase::Configured, Arc::clone(&sequence));
+        let retire_generation = retiring
+            .begin_frame_request(Duration::from_secs(1))
+            .expect("retire request is accepted");
+        retiring.prepare_retire();
+        assert!(!retiring.frame_pending);
+        assert_ne!(retiring.frame_generation, retire_generation);
+        assert_eq!(recorded(&sequence), TEARDOWN_ORDER);
+        retiring.retire(&mut app);
+        assert_eq!(recorded(&sequence), TEARDOWN_ORDER);
     }
 
     #[test]

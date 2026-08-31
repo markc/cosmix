@@ -24,8 +24,7 @@ use cosmix_shell::runtime::{
     ShellCommand, ShellCommandKind, ShellFrameState, ShellRuntimePlugin, WakePolicy,
     replace_shell_model,
 };
-use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
-use smithay_client_toolkit::delegate_compositor;
+use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, SurfaceData};
 use smithay_client_toolkit::delegate_layer;
 use smithay_client_toolkit::delegate_output;
 use smithay_client_toolkit::delegate_registry;
@@ -38,7 +37,7 @@ use smithay_client_toolkit::shell::wlr_layer::{
     Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure,
 };
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_output, wl_surface};
+use wayland_client::protocol::{wl_callback, wl_compositor, wl_output, wl_surface};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
@@ -53,7 +52,9 @@ use crate::output::{
     select_output,
 };
 use crate::planner::{OutputGeometry, ProtocolOp, plan_surface};
-use crate::surface::{FractionalObjects, PanelSurface, SurfacePhase, SurfaceTag};
+use crate::surface::{
+    FractionalObjects, FrameCallbackData, PanelSurface, SurfacePhase, SurfaceTag,
+};
 
 type ModelFactory = dyn Fn(OutputKey, LogicalSize) -> ShellModel + Send + Sync;
 
@@ -928,16 +929,10 @@ impl CompositorHandler for RunnerState {
         &mut self,
         _connection: &Connection,
         _qh: &QueueHandle<Self>,
-        surface: &wl_surface::WlSurface,
+        _surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        let answered = self
-            .panel_for_surface_mut(surface)
-            .is_some_and(PanelSurface::frame_done);
-        if answered || self.last_wake == WakePolicy::Animate {
-            self.needs_update = true;
-        }
-        self.check_ready();
+        unreachable!("frame callbacks use generation-tagged user data")
     }
 
     fn surface_enter(
@@ -1149,7 +1144,34 @@ impl Dispatch<WpViewport, GlobalData> for RunnerState {
     }
 }
 
-delegate_compositor!(RunnerState);
+impl Dispatch<wl_callback::WlCallback, FrameCallbackData> for RunnerState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_callback::WlCallback,
+        event: <wl_callback::WlCallback as Proxy>::Event,
+        data: &FrameCallbackData,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let wl_callback::Event::Done { .. } = event else {
+            unreachable!("wl_callback has only the done event")
+        };
+        let Some(panel) = state.panel_for_surface_mut(&data.surface) else {
+            tracing::trace!(
+                callback_generation = data.generation,
+                "ignoring frame callback for retired surface"
+            );
+            return;
+        };
+        if panel.frame_done(data.generation) {
+            state.needs_update = true;
+            state.check_ready();
+        }
+    }
+}
+
+wayland_client::delegate_dispatch!(RunnerState: [wl_compositor::WlCompositor: GlobalData] => CompositorState);
+wayland_client::delegate_dispatch!(RunnerState: [wl_surface::WlSurface: SurfaceData] => CompositorState);
 delegate_output!(RunnerState);
 delegate_layer!(RunnerState);
 delegate_registry!(RunnerState);
@@ -1157,10 +1179,7 @@ delegate_registry!(RunnerState);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::{Arc, Mutex};
 
     use crate::surface::frame_request_overdue;
 
@@ -1255,8 +1274,8 @@ mod tests {
     #[test]
     fn state_exit_close_path_destroys_each_holder_once() {
         let mut app = App::new();
-        let first = Arc::new(AtomicUsize::new(0));
-        let second = Arc::new(AtomicUsize::new(0));
+        let first = Arc::new(Mutex::new(Vec::new()));
+        let second = Arc::new(Mutex::new(Vec::new()));
         let mut panels = [
             PanelSurface::test_double(&mut app, SurfacePhase::Closed, Arc::clone(&first)),
             PanelSurface::test_double(&mut app, SurfacePhase::Closed, Arc::clone(&second)),
@@ -1265,8 +1284,9 @@ mod tests {
         finish_closed_panels(panels.iter_mut());
         finish_closed_panels(panels.iter_mut());
 
-        assert_eq!(first.load(Ordering::SeqCst), 1);
-        assert_eq!(second.load(Ordering::SeqCst), 1);
+        let expected = ["viewport", "fractional", "layer", "owner"];
+        assert_eq!(*first.lock().unwrap(), expected);
+        assert_eq!(*second.lock().unwrap(), expected);
     }
 
     #[test]

@@ -6,7 +6,7 @@ existing Quoin chrome into one explicit Bevy window target per surface. The
 installable application id and layer namespace are `dev.cosmix.quoin`.
 
 The first Arc 3 slice presents real layer-shell buffers through
-`cosmix-shell-host` 0.1.4 and SCTK 0.19.2. `cosmix-quoin-demo` remains a
+`cosmix-shell-host` 0.1.5 and SCTK 0.19.2. `cosmix-quoin-demo` remains a
 feature-gated, non-installable normal-window tuning arm; it is not a
 layer-shell client.
 
@@ -62,7 +62,8 @@ is outstanding. `WakeAt` owns one replaceable absolute calloop timer.
 `Animate` advances only from `wl_surface.frame` callbacks, with at most one
 outstanding callback per mapped animating panel. The visible bottom clock's
 one-second deadline is content work and disappears when that panel is
-unmapped.
+unmapped. Callbacks are generation-tagged, so late or expired callbacks are
+ignored.
 
 Two bounded one-shot liveness backstops share that single timer. While any
 frame callback is outstanding, its deadline is derived from the oldest
