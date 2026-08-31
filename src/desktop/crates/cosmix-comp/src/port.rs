@@ -335,7 +335,8 @@ trait WorkerClient: Send + Sync + 'static {
     fn incoming(&self) -> Option<tokio_mpsc::UnboundedReceiver<cosmix_client::IncomingCommand>>;
     fn state(&self) -> ConnState;
     fn subscribe_state(&self) -> watch::Receiver<ConnState>;
-    fn respond<'a>(&'a self, reply: &'a PendingReply) -> WorkerFuture<'a, Result<(), String>>;
+    fn respond_parts<'a>(&'a self, reply: &'a PendingReply)
+    -> WorkerFuture<'a, Result<(), String>>;
     fn shutdown(&self) -> WorkerFuture<'_, ()>;
 }
 
@@ -352,7 +353,10 @@ impl WorkerClient for SupervisedClient {
         SupervisedClient::subscribe_state(self)
     }
 
-    fn respond<'a>(&'a self, reply: &'a PendingReply) -> WorkerFuture<'a, Result<(), String>> {
+    fn respond_parts<'a>(
+        &'a self,
+        reply: &'a PendingReply,
+    ) -> WorkerFuture<'a, Result<(), String>> {
         Box::pin(async move {
             self.respond_parts(
                 &reply.from,
@@ -602,7 +606,7 @@ async fn reply_loop<C: WorkerClient>(
     reply_timeouts: Arc<AtomicU64>,
 ) {
     while let Some(reply) = replies.recv().await {
-        match tokio::time::timeout(REPLY_SEND_TIMEOUT, client.respond(&reply)).await {
+        match tokio::time::timeout(REPLY_SEND_TIMEOUT, client.respond_parts(&reply)).await {
             Err(_) => {
                 reply_timeouts.fetch_add(1, Ordering::AcqRel);
                 tracing::debug!(
@@ -657,6 +661,7 @@ mod tests {
         incoming: Mutex<Option<tokio_mpsc::UnboundedReceiver<cosmix_client::IncomingCommand>>>,
         states: watch::Sender<ConnState>,
         hang_replies: bool,
+        responses_started: Arc<AtomicUsize>,
     }
 
     impl FakeClient {
@@ -675,6 +680,7 @@ mod tests {
                     incoming: Mutex::new(Some(incoming)),
                     states: states.clone(),
                     hang_replies,
+                    responses_started: Arc::new(AtomicUsize::new(0)),
                 },
                 commands,
                 states,
@@ -700,7 +706,11 @@ mod tests {
             self.states.subscribe()
         }
 
-        fn respond<'a>(&'a self, _reply: &'a PendingReply) -> WorkerFuture<'a, Result<(), String>> {
+        fn respond_parts<'a>(
+            &'a self,
+            _reply: &'a PendingReply,
+        ) -> WorkerFuture<'a, Result<(), String>> {
+            self.responses_started.fetch_add(1, Ordering::AcqRel);
             if self.hang_replies {
                 Box::pin(future::pending())
             } else {
@@ -745,6 +755,16 @@ mod tests {
         })
         .await
         .expect("worker publishes broker edge");
+    }
+
+    async fn wait_for_counter(counter: &AtomicUsize, expected: usize, message: &'static str) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while counter.load(Ordering::Acquire) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect(message);
     }
 
     async fn next_port_command(source: &channel::Channel<PortCommand>) -> PortCommand {
@@ -994,7 +1014,59 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn reply_sender_drops_black_holed_reply_after_deadline_and_counts_it() {
+    async fn worker_loop_abandons_black_holed_replies_and_stays_responsive() {
+        let (ingress, source, queue_depth) = test_ingress();
+        let broker = Arc::new(AtomicU8::new(BROKER_RETRYING));
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let (client, commands, _states) = FakeClient::new(ConnState::Connected, true);
+        let responses_started = Arc::clone(&client.responses_started);
+        let mut client = Some(client);
+        let worker = tokio::spawn(worker_loop(
+            "comp-nested".into(),
+            ingress,
+            Arc::clone(&broker),
+            Arc::clone(&reply_timeouts),
+            shutdown,
+            move || future::ready(Ok(client.take().expect("one connection attempt"))),
+        ));
+        wait_for_broker(&broker, BROKER_CONNECTED).await;
+
+        commands
+            .send(command("comp.ping", 1))
+            .expect("worker admits ping");
+        commands
+            .send(command("comp.unknown", 2))
+            .expect("worker admits error reply");
+        wait_for_counter(&responses_started, 1, "first reply send starts").await;
+        assert_eq!(queue_depth.load(Ordering::Acquire), 0);
+
+        tokio::time::advance(REPLY_SEND_TIMEOUT).await;
+        wait_for_counter(&responses_started, 2, "second reply send starts").await;
+        assert_eq!(reply_timeouts.load(Ordering::Acquire), 1);
+        tokio::time::advance(REPLY_SEND_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert_eq!(reply_timeouts.load(Ordering::Acquire), 2);
+        assert_eq!(queue_depth.load(Ordering::Acquire), 0);
+
+        commands
+            .send(command("comp.info", 3))
+            .expect("worker remains responsive");
+        let PortCommand::Snapshot(request) = next_port_command(&source).await;
+        assert_eq!(queue_depth.load(Ordering::Acquire), 1);
+        drop(request);
+        wait_for_counter(&queue_depth, 0, "later admission releases depth").await;
+        wait_for_counter(&responses_started, 3, "later error reply send starts").await;
+        tokio::time::advance(REPLY_SEND_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert_eq!(reply_timeouts.load(Ordering::Acquire), 3);
+
+        shutdown_tx.send_replace(true);
+        worker.await.expect("worker exits cleanly");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reply_sender_abandons_black_holed_reply_after_deadline_and_counts_it() {
         let (client, _commands, _states) = FakeClient::new(ConnState::Connected, true);
         let client = Arc::new(client);
         let reply_timeouts = Arc::new(AtomicU64::new(0));

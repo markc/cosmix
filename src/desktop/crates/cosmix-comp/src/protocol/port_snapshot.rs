@@ -51,8 +51,6 @@ pub(crate) struct CompSnapshot {
     pub(crate) bindings: BindingsSnapshot,
     pub(crate) port: PortSnapshot,
     #[serde(skip)]
-    property_tree: OnceLock<Value>,
-    #[serde(skip)]
     full_tree: tokio::sync::OnceCell<Arc<str>>,
 }
 
@@ -172,6 +170,279 @@ pub(crate) struct PortSnapshot {
     pub(crate) reply_timeouts: u64,
     pub(crate) slug_collisions: u64,
     pub(crate) broker: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotNodeKind {
+    Leaf,
+    Object,
+}
+
+fn serialise_selected<T: Serialize>(value: &T) -> Option<Value> {
+    serde_json::to_value(value).ok()
+}
+
+impl CompSnapshot {
+    fn select(&self, path: &[&str]) -> Option<Value> {
+        let [head, tail @ ..] = path else {
+            return None;
+        };
+        match *head {
+            "info" => self.info.select(tail),
+            "outputs" => select_map(&self.outputs, tail, OutputSnapshot::select),
+            "surfaces" => select_map(&self.surfaces, tail, SurfaceSnapshot::select),
+            "windows" => select_map(&self.windows, tail, WindowSnapshot::select),
+            "stack" if tail.is_empty() => serialise_selected(&self.stack),
+            "focus" => self.focus.select(tail),
+            "decoration" => self.decoration.select(tail),
+            "bindings" => self.bindings.select(tail),
+            "port" => self.port.select(tail),
+            _ => None,
+        }
+    }
+
+    fn node_kind(&self, path: &[&str]) -> Option<SnapshotNodeKind> {
+        let [head, tail @ ..] = path else {
+            return None;
+        };
+        match *head {
+            "info" => self.info.node_kind(tail),
+            "outputs" => map_node_kind(&self.outputs, tail, OutputSnapshot::node_kind),
+            "surfaces" => map_node_kind(&self.surfaces, tail, SurfaceSnapshot::node_kind),
+            "windows" => map_node_kind(&self.windows, tail, WindowSnapshot::node_kind),
+            "stack" if tail.is_empty() => Some(SnapshotNodeKind::Leaf),
+            "focus" => self.focus.node_kind(tail),
+            "decoration" => self.decoration.node_kind(tail),
+            "bindings" => self.bindings.node_kind(tail),
+            "port" => self.port.node_kind(tail),
+            _ => None,
+        }
+    }
+
+    fn leaf_paths(&self) -> Vec<PropPath> {
+        let mut paths = Vec::new();
+        for descriptor in DESCRIPTORS {
+            for candidate in self.expand_pattern(descriptor.pattern) {
+                let Ok(path) = PropPath::new(candidate) else {
+                    continue;
+                };
+                let segments = path.segments().collect::<Vec<_>>();
+                if self.node_kind(&segments) == Some(SnapshotNodeKind::Leaf) {
+                    paths.push(path);
+                }
+            }
+        }
+        paths.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        paths
+    }
+
+    fn expand_pattern(&self, pattern: &[PatternSegment]) -> Vec<String> {
+        let mut paths = vec![String::new()];
+        for segment in pattern {
+            match segment {
+                PatternSegment::Literal(segment) => append_segments(&mut paths, [*segment]),
+                PatternSegment::OutputKey => {
+                    append_segments(&mut paths, self.outputs.keys().map(String::as_str));
+                }
+                PatternSegment::SurfaceKey => match pattern.first() {
+                    Some(PatternSegment::Literal("surfaces")) => {
+                        append_segments(&mut paths, self.surfaces.keys().map(String::as_str))
+                    }
+                    Some(PatternSegment::Literal("windows")) => {
+                        append_segments(&mut paths, self.windows.keys().map(String::as_str));
+                    }
+                    _ => return Vec::new(),
+                },
+            }
+        }
+        paths
+    }
+}
+
+fn append_segments<'a>(
+    paths: &mut Vec<String>,
+    segments: impl IntoIterator<Item = &'a str> + Clone,
+) {
+    let existing = std::mem::take(paths);
+    for path in existing {
+        for segment in segments.clone() {
+            paths.push(if path.is_empty() {
+                segment.to_string()
+            } else {
+                format!("{path}.{segment}")
+            });
+        }
+    }
+}
+
+fn select_map<T>(
+    values: &BTreeMap<String, T>,
+    path: &[&str],
+    select: fn(&T, &[&str]) -> Option<Value>,
+) -> Option<Value>
+where
+    T: Serialize,
+{
+    let Some((key, tail)) = path.split_first() else {
+        return serialise_selected(values);
+    };
+    select(values.get(*key)?, tail)
+}
+
+fn map_node_kind<T>(
+    values: &BTreeMap<String, T>,
+    path: &[&str],
+    node_kind: fn(&T, &[&str]) -> Option<SnapshotNodeKind>,
+) -> Option<SnapshotNodeKind> {
+    let Some((key, tail)) = path.split_first() else {
+        return Some(SnapshotNodeKind::Object);
+    };
+    node_kind(values.get(*key)?, tail)
+}
+
+macro_rules! flat_snapshot {
+    ($ty:ty, $($field:ident),+ $(,)?) => {
+        impl $ty {
+            fn select(&self, path: &[&str]) -> Option<Value> {
+                match path {
+                    [] => serialise_selected(self),
+                    $([stringify!($field)] => serialise_selected(&self.$field),)+
+                    _ => None,
+                }
+            }
+
+            fn node_kind(&self, path: &[&str]) -> Option<SnapshotNodeKind> {
+                match path {
+                    [] => Some(SnapshotNodeKind::Object),
+                    $([stringify!($field)] => Some(SnapshotNodeKind::Leaf),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+flat_snapshot!(InfoSnapshot, service, version, backend, engine, instance);
+flat_snapshot!(
+    WindowSnapshot,
+    id,
+    foreign_id,
+    title,
+    app_id,
+    x,
+    y,
+    width,
+    height,
+    focused,
+    maximized,
+    minimized,
+    output,
+);
+flat_snapshot!(
+    FocusSnapshot,
+    keyboard,
+    exclusive_latch,
+    pointer,
+    pointer_grab,
+);
+flat_snapshot!(DecorationSnapshot, enabled, style);
+flat_snapshot!(BindingsSnapshot, enabled, profile, table);
+flat_snapshot!(
+    PortSnapshot,
+    level,
+    event_seq,
+    lost_count,
+    queue_depth,
+    reply_timeouts,
+    slug_collisions,
+    broker,
+);
+flat_snapshot!(RectSnapshot, x, y, width, height);
+flat_snapshot!(
+    LayerSnapshot,
+    stratum,
+    interactivity,
+    exclusive_zone,
+    binding,
+);
+
+impl OutputSnapshot {
+    fn select(&self, path: &[&str]) -> Option<Value> {
+        match path {
+            [] => serialise_selected(self),
+            ["name"] => serialise_selected(&self.name),
+            ["default"] => serialise_selected(&self.default),
+            ["x"] => serialise_selected(&self.x),
+            ["y"] => serialise_selected(&self.y),
+            ["width"] => serialise_selected(&self.width),
+            ["height"] => serialise_selected(&self.height),
+            ["scale"] => serialise_selected(&self.scale),
+            ["refresh_mhz"] => serialise_selected(&self.refresh_mhz),
+            ["usable", tail @ ..] => self.usable.select(tail),
+            _ => None,
+        }
+    }
+
+    fn node_kind(&self, path: &[&str]) -> Option<SnapshotNodeKind> {
+        match path {
+            [] | ["usable"] => Some(SnapshotNodeKind::Object),
+            ["name" | "default" | "x" | "y" | "width" | "height" | "scale" | "refresh_mhz"] => {
+                Some(SnapshotNodeKind::Leaf)
+            }
+            ["usable", tail @ ..] => self.usable.node_kind(tail),
+            _ => None,
+        }
+    }
+}
+
+impl SurfaceSnapshot {
+    fn select(&self, path: &[&str]) -> Option<Value> {
+        match path {
+            [] => serialise_selected(self),
+            ["id"] => serialise_selected(&self.id),
+            ["role"] => serialise_selected(&self.role),
+            ["mapped"] => serialise_selected(&self.mapped),
+            ["visible"] => serialise_selected(&self.visible),
+            ["x"] => serialise_selected(&self.x),
+            ["y"] => serialise_selected(&self.y),
+            ["width"] => serialise_selected(&self.width),
+            ["height"] => serialise_selected(&self.height),
+            ["band"] => serialise_selected(&self.band),
+            ["sequence"] => serialise_selected(&self.sequence),
+            ["tree_index"] => serialise_selected(&self.tree_index),
+            ["parent"] => serialise_selected(&self.parent),
+            ["output"] => serialise_selected(&self.output),
+            ["title"] => serialise_selected(&self.title),
+            ["app_id"] => serialise_selected(&self.app_id),
+            ["focused"] => serialise_selected(&self.focused),
+            ["activated"] => serialise_selected(&self.activated),
+            ["maximized"] => serialise_selected(&self.maximized),
+            ["minimized"] => serialise_selected(&self.minimized),
+            ["decoration"] => serialise_selected(&self.decoration),
+            ["layer"] => serialise_selected(&self.layer),
+            ["layer", tail @ ..] => self.layer.as_ref()?.select(tail),
+            ["foreign_id"] => serialise_selected(&self.foreign_id),
+            _ => None,
+        }
+    }
+
+    fn node_kind(&self, path: &[&str]) -> Option<SnapshotNodeKind> {
+        match path {
+            [] => Some(SnapshotNodeKind::Object),
+            [
+                "id" | "role" | "mapped" | "visible" | "x" | "y" | "width" | "height" | "band"
+                | "sequence" | "tree_index" | "parent" | "output" | "title" | "app_id" | "focused"
+                | "activated" | "maximized" | "minimized" | "decoration" | "foreign_id",
+            ] => Some(SnapshotNodeKind::Leaf),
+            ["layer"] => Some(if self.layer.is_some() {
+                SnapshotNodeKind::Object
+            } else {
+                SnapshotNodeKind::Leaf
+            }),
+            ["layer", tail @ ..] => self.layer.as_ref()?.node_kind(tail),
+            _ => None,
+        }
+    }
 }
 
 /// Build one fully owned snapshot on the protocol thread.
@@ -360,7 +631,6 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
                 "retrying"
             },
         },
-        property_tree: OnceLock::new(),
         full_tree: tokio::sync::OnceCell::new(),
     })
 }
@@ -375,19 +645,14 @@ fn output_slug_collides(
         return false;
     };
     *collisions = collisions.saturating_add(1);
-    static WARNED_KEYS: OnceLock<std::sync::Mutex<BTreeSet<String>>> = OnceLock::new();
-    let mut warned = WARNED_KEYS
-        .get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if warned.insert(key.to_string()) {
-        tracing::warn!(
-            slug = key,
-            kept_output = %first.name,
-            dropped_output,
-            "compositor Bus output slug collision; keeping first output"
-        );
-    }
+    // Snapshotting is a calloop service point: keep this path free of shared
+    // mutable statics and locks. The snapshot counter is authoritative.
+    tracing::debug!(
+        slug = key,
+        kept_output = %first.name,
+        dropped_output,
+        "compositor Bus output slug collision; keeping first output"
+    );
     true
 }
 
@@ -893,7 +1158,7 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
     descriptor!(
         &[L("port"), L("reply_timeouts")],
         Number,
-        "Replies dropped after a send deadline or saturated reply lane"
+        "Reply send abandoned after 2 s; delivery not guaranteed (the client sink may still flush it); also counts saturated reply lanes"
     ),
     descriptor!(
         &[L("port"), L("slug_collisions")],
@@ -1044,22 +1309,21 @@ async fn full_tree(snapshot: Arc<CompSnapshot>) -> Result<Arc<str>, ()> {
 }
 
 fn dispatch_selected_read(snapshot: &CompSnapshot, command: &str, args: &Value) -> (u8, Arc<str>) {
-    let tree = match property_tree(snapshot) {
-        Ok(tree) => tree,
-        Err(()) => return error("busy"),
-    };
     match command {
         "comp.props.get" => match optional_path(args, "path") {
-            Ok(Some(path)) => select(tree, &path).map_or_else(
-                || error("unknown_path"),
-                |value| (0, Arc::from(value.to_string())),
-            ),
+            Ok(Some(path)) => {
+                let segments = path.segments().collect::<Vec<_>>();
+                snapshot.select(&segments).map_or_else(
+                    || error("unknown_path"),
+                    |value| (0, Arc::from(value.to_string())),
+                )
+            }
             Ok(None) => error("busy"),
             Err(()) => error("unknown_path"),
         },
         "comp.props.list" => match optional_path(args, "prefix") {
             Ok(prefix) => {
-                let leaves = flattened_paths(tree);
+                let leaves = snapshot.leaf_paths();
                 let paths = match prefix {
                     None => leaves,
                     Some(prefix) => leaves
@@ -1072,20 +1336,12 @@ fn dispatch_selected_read(snapshot: &CompSnapshot, command: &str, args: &Value) 
             Err(()) => error("unknown_path"),
         },
         "comp.props.describe" => match required_path(args, "path") {
-            Ok(path) => describe(tree, &path)
+            Ok(path) => describe(snapshot, &path)
                 .map_or_else(|| error("unknown_path"), |body| (0, Arc::from(body))),
             Err(()) => error("unknown_path"),
         },
         _ => error("unknown_verb"),
     }
-}
-
-fn property_tree(snapshot: &CompSnapshot) -> Result<&Value, ()> {
-    if snapshot.property_tree.get().is_none() {
-        let tree = serde_json::to_value(snapshot).map_err(|_| ())?;
-        let _ = snapshot.property_tree.set(tree);
-    }
-    snapshot.property_tree.get().ok_or(())
 }
 
 fn optional_path(args: &Value, key: &str) -> Result<Option<PropPath>, ()> {
@@ -1104,20 +1360,14 @@ fn required_path(args: &Value, key: &str) -> Result<PropPath, ()> {
     optional_path(args, key)?.ok_or(())
 }
 
-fn select<'a>(tree: &'a Value, path: &PropPath) -> Option<&'a Value> {
-    let mut current = tree;
-    for segment in path.segments() {
-        current = current.as_object()?.get(segment)?;
-    }
-    Some(current)
-}
-
+#[cfg(test)]
 pub(crate) fn flattened_paths(tree: &Value) -> Vec<PropPath> {
     let mut paths = Vec::new();
     flatten_into(tree, "", &mut paths);
     paths
 }
 
+#[cfg(test)]
 fn flatten_into(value: &Value, prefix: &str, paths: &mut Vec<PropPath>) {
     if let Value::Object(object) = value {
         for (key, child) in object {
@@ -1133,14 +1383,15 @@ fn flatten_into(value: &Value, prefix: &str, paths: &mut Vec<PropPath>) {
     }
 }
 
-fn describe(tree: &Value, path: &PropPath) -> Option<String> {
-    let value = select(tree, path)?;
+fn describe(snapshot: &CompSnapshot, path: &PropPath) -> Option<String> {
+    let segments = path.segments().collect::<Vec<_>>();
+    let node_kind = snapshot.node_kind(&segments)?;
     let matches = DESCRIPTORS
         .iter()
         .copied()
         .filter(|entry| entry.matches(path))
         .collect::<Vec<_>>();
-    if !value.is_object() {
+    if node_kind == SnapshotNodeKind::Leaf {
         let [entry] = matches.as_slice() else {
             return None;
         };
@@ -1158,7 +1409,7 @@ fn describe(tree: &Value, path: &PropPath) -> Option<String> {
         .ok();
     }
 
-    let leaves = flattened_paths(tree);
+    let leaves = snapshot.leaf_paths();
     let mut children = BTreeSet::new();
     let prefix_len = path.segments().count();
     for leaf in leaves.into_iter().filter(|leaf| leaf.starts_with(path)) {
@@ -1322,7 +1573,7 @@ mod tests {
         CompSnapshot {
             info: InfoSnapshot {
                 service: Arc::from("comp-nested"),
-                version: Arc::from("0.33.0"),
+                version: Arc::from("0.33.1"),
                 backend: "nested",
                 engine: "bevy-0.19/wgpu",
                 instance: Arc::from("fixture"),
@@ -1358,7 +1609,6 @@ mod tests {
                 slug_collisions: 0,
                 broker: "connected",
             },
-            property_tree: OnceLock::new(),
             full_tree: tokio::sync::OnceCell::new(),
         }
     }
@@ -1432,6 +1682,35 @@ mod tests {
                 leaf.as_str()
             );
         }
+    }
+
+    #[test]
+    fn typed_leaf_selection_size_is_independent_of_surface_count() {
+        let mut snapshot = fixture();
+        let selected = snapshot
+            .select(&["surfaces", "s2", "title"])
+            .expect("fixture leaf exists");
+        let selected_size = selected.to_string().len();
+        assert!(selected.is_string());
+        assert!(selected_size < 64);
+
+        let template = snapshot
+            .surfaces
+            .get("s2")
+            .cloned()
+            .expect("fixture surface exists");
+        for id in 100_u64..1_100 {
+            let mut surface = template.clone();
+            surface.id = id;
+            snapshot.surfaces.insert(format!("s{id}"), surface);
+        }
+
+        let selected_with_many_surfaces = snapshot
+            .select(&["surfaces", "s2", "title"])
+            .expect("fixture leaf still exists");
+        assert!(selected_with_many_surfaces.is_string());
+        assert_eq!(selected_with_many_surfaces.to_string().len(), selected_size);
+        assert!(snapshot.full_tree.get().is_none());
     }
 
     #[test]

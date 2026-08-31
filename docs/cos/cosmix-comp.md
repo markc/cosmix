@@ -49,15 +49,15 @@ Surface keys are `s` plus the decimal session-local surface ID. Output keys are
 `o_` plus the lower-case output name with each non-alphanumeric character
 replaced by `_`; the raw output name remains in `name`. If output names collide
 after slugging, the first output wins, each omitted output increments
-`port.slug_collisions`, and the compositor warns once for that slug. P-0 has one
-protocol-visible client output, so collisions remain a documented known limit.
+`port.slug_collisions`, and the compositor logs each collision at debug level.
+P-0 has one protocol-visible client output, so collisions remain a documented
+known limit.
 `band` includes `background`, `bottom`, `normal`, `top`, `overlay` and `lock`.
 `stack` contains mapped roots from top to bottom. `windows` is a projection of
 mapped XDG toplevels. `port.level` is `L1`; `event_seq` and `lost_count` remain
 zero until watch support lands. `port.broker` is driven by connection-state
 edges and is `connected` or `retrying`. `port.reply_timeouts` counts replies
-dropped because the bounded reply lane was saturated or the broker send
-exceeded its two-second deadline; it is separate from topic-only `lost_count`.
+whose bounded reply lane was saturated. For a timeout: reply send abandoned after 2 s; delivery not guaranteed (the client sink may still flush it). It is separate from topic-only `lost_count`.
 
 All application errors use Bus rc 10 with exactly one of
 `{"error":"unknown_path"}`, `{"error":"busy"}` or
