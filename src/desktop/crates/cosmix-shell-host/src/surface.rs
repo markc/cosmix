@@ -45,9 +45,19 @@ pub(crate) struct FractionalObjects {
 
 impl FractionalObjects {
     fn destroy(self) {
-        self.viewport.destroy();
-        self.scale.destroy();
+        drop(self);
     }
+}
+
+impl Drop for FractionalObjects {
+    fn drop(&mut self) {
+        destroy_addons_in_order(|| self.viewport.destroy(), || self.scale.destroy());
+    }
+}
+
+fn destroy_addons_in_order(destroy_viewport: impl FnOnce(), destroy_scale: impl FnOnce()) {
+    destroy_viewport();
+    destroy_scale();
 }
 
 #[derive(Debug)]
@@ -61,11 +71,16 @@ struct WaylandObjects {
 }
 
 impl WaylandObjects {
-    fn destroy(mut self) {
+    fn destroy(self) {
+        drop(self);
+    }
+}
+
+impl Drop for WaylandObjects {
+    fn drop(&mut self) {
         if let Some(fractional) = self.fractional.take() {
             fractional.destroy();
         }
-        drop(self);
     }
 }
 
@@ -376,9 +391,7 @@ impl PanelSurface {
 
     pub fn finish_unmap(&mut self) {
         if self.phase == SurfacePhase::PreparingUnmap {
-            if let Some(objects) = self.wayland.take() {
-                objects.destroy();
-            }
+            self.destroy_wayland_objects();
             self.phase = SurfacePhase::Unmapped;
             self.configured_logical_size = None;
             self.announced_scale = None;
@@ -600,6 +613,11 @@ impl PanelSurface {
         self.waiting_configure_since = None;
     }
 
+    pub(crate) fn finish_close(&mut self) {
+        debug_assert_eq!(self.phase, SurfacePhase::Closed);
+        self.destroy_wayland_objects();
+    }
+
     pub fn clear_overdue_frame(&mut self, elapsed: Duration, backstop: Duration) -> bool {
         if self.frame_pending
             && self
@@ -616,9 +634,16 @@ impl PanelSurface {
 
     /// Drop a drained protocol/WSI owner while preserving the mount and its
     /// chrome subtree for a replacement output runtime.
-    pub fn retire(self, app: &mut App) {
+    pub fn retire(mut self, app: &mut App) {
+        self.destroy_wayland_objects();
         app.world_mut().despawn(self.camera);
         app.world_mut().despawn(self.window);
+    }
+
+    fn destroy_wayland_objects(&mut self) {
+        if let Some(objects) = self.wayland.take() {
+            objects.destroy();
+        }
     }
 
     fn effective_scale(&self) -> f64 {
@@ -687,6 +712,17 @@ fn sctk_anchor(anchor: ProtocolAnchor) -> Anchor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn fractional_addons_destroy_viewport_before_scale() {
+        let order = RefCell::new(Vec::new());
+        destroy_addons_in_order(
+            || order.borrow_mut().push("viewport"),
+            || order.borrow_mut().push("fractional-scale"),
+        );
+        assert_eq!(*order.borrow(), ["viewport", "fractional-scale"]);
+    }
 
     #[test]
     fn configure_phase_table_applies_only_to_live_mapped_roles() {

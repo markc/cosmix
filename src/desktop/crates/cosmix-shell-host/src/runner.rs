@@ -58,6 +58,7 @@ use crate::surface::{FractionalObjects, PanelSurface, SurfacePhase, SurfaceTag};
 type ModelFactory = dyn Fn(OutputKey, LogicalSize) -> ShellModel + Send + Sync;
 
 const ANIMATE_BACKSTOP: Duration = Duration::from_secs(1);
+const ANIMATE_BACKSTOP_QUANTUM: Duration = Duration::from_millis(250);
 const CONFIGURE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONSECUTIVE_PAST_DEADLINES: u8 = 64;
 
@@ -91,6 +92,17 @@ fn next_timer_deadline(
         .min()
 }
 
+fn animate_backstop_deadline(elapsed: Duration) -> Duration {
+    let deadline = elapsed.saturating_add(ANIMATE_BACKSTOP);
+    let quantum_nanos = ANIMATE_BACKSTOP_QUANTUM.as_nanos();
+    let remainder = deadline.as_nanos() % quantum_nanos;
+    if remainder == 0 {
+        deadline
+    } else {
+        deadline.saturating_add(Duration::from_nanos((quantum_nanos - remainder) as u64))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PastDeadlineObservation {
     consecutive: u8,
@@ -108,7 +120,7 @@ fn observe_past_deadline(
         PastDeadlineObservation {
             consecutive,
             past: true,
-            stuck: consecutive > MAX_CONSECUTIVE_PAST_DEADLINES,
+            stuck: consecutive >= MAX_CONSECUTIVE_PAST_DEADLINES,
         }
     } else {
         PastDeadlineObservation {
@@ -452,6 +464,11 @@ fn state_exit(mut state: RunnerState, reason: &str, abnormal: bool) -> AppExit {
     if !state.outputs.is_empty() {
         state.app.update();
     }
+    for output in state.outputs.values_mut() {
+        for panel in &mut output.panels {
+            panel.finish_close();
+        }
+    }
     state.outputs.clear();
     tracing::info!("QUOIN_LAYER_HOST_EXIT reason={reason}");
     if abnormal {
@@ -708,8 +725,8 @@ impl RunnerState {
         } else {
             self.last_wake
         };
-        let animate_backstop = (self.last_wake == WakePolicy::Animate)
-            .then(|| elapsed.saturating_add(ANIMATE_BACKSTOP));
+        let animate_backstop =
+            (self.last_wake == WakePolicy::Animate).then(|| animate_backstop_deadline(elapsed));
         let configure_deadlines = self
             .outputs
             .values()
@@ -1157,22 +1174,37 @@ mod tests {
             next_timer_deadline(WakePolicy::Idle, None, &[seconds(10)]),
             Some(seconds(10))
         );
+        let first_frame = animate_backstop_deadline(seconds(5) + Duration::from_millis(10));
+        let second_frame = animate_backstop_deadline(seconds(5) + Duration::from_millis(20));
+        assert_eq!(first_frame, seconds(6) + Duration::from_millis(250));
+        assert_eq!(first_frame, second_frame);
+        assert_eq!(
+            next_timer_deadline(WakePolicy::Animate, Some(first_frame), &[]),
+            next_timer_deadline(WakePolicy::Animate, Some(second_frame), &[])
+        );
     }
 
     #[test]
     fn past_deadline_counter_is_bounded_and_resets() {
         let elapsed = Duration::from_secs(10);
         let past = WakePolicy::WakeAt(elapsed);
-        let at_limit = observe_past_deadline(past, elapsed, 63);
+        let before_limit = observe_past_deadline(past, elapsed, 62);
         assert_eq!(
-            at_limit,
+            before_limit,
             PastDeadlineObservation {
-                consecutive: 64,
+                consecutive: 63,
                 past: true,
                 stuck: false,
             }
         );
-        assert!(observe_past_deadline(past, elapsed, at_limit.consecutive).stuck);
+        assert_eq!(
+            observe_past_deadline(past, elapsed, before_limit.consecutive),
+            PastDeadlineObservation {
+                consecutive: 64,
+                past: true,
+                stuck: true,
+            }
+        );
         assert_eq!(
             observe_past_deadline(
                 WakePolicy::WakeAt(elapsed + Duration::from_secs(1)),

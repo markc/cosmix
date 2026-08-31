@@ -6,7 +6,7 @@ existing Quoin chrome into one explicit Bevy window target per surface. The
 installable application id and layer namespace are `dev.cosmix.quoin`.
 
 The first Arc 3 slice presents real layer-shell buffers through
-`cosmix-shell-host` 0.1.2 and SCTK 0.19.2. `cosmix-quoin-demo` remains a
+`cosmix-shell-host` 0.1.3 and SCTK 0.19.2. `cosmix-quoin-demo` remains a
 feature-gated, non-installable normal-window tuning arm; it is not a
 layer-shell client.
 
@@ -64,12 +64,36 @@ mapped animating panel. The visible bottom clock's one-second deadline is
 content work and disappears when that panel is unmapped.
 
 Two bounded one-shot liveness backstops share that single timer. While
-`Animate` is active, each update arms a one-second deadline which releases an
-overdue frame callback and requests one coalesced update. A bufferless map also
-arms a ten-second configure deadline; expiry exits with a distinct abnormal
-reason. These are not ticks: neither backstop remains armed while idle or while
-no request is in flight, and timely compositor replies replace or remove the
-deadline before it can fire.
+`Animate` is active, a one-second deadline, rounded up to a 250 ms boundary,
+releases an overdue frame callback and requests one coalesced update. The
+quantisation lets consecutive frames retain the same timer source. A
+bufferless map also arms a ten-second configure deadline; expiry exits with a
+distinct abnormal reason. These are not ticks: neither backstop remains armed
+while idle or while no request is in flight, and timely compositor replies
+replace or remove the deadline before it can fire.
+
+## Exit status and reasons
+
+The final marker is `QUOIN_LAYER_HOST_EXIT reason=...`. `--help` is the one
+successful path which prints usage and no marker. Error details replace `*` in
+the patterns below.
+
+| Status | Reason value or pattern | Meaning |
+|---|---|---|
+| 0 | no marker (`--help`) | Usage requested. |
+| 0 | `signal-int`, `signal-term` | Clean SIGINT or SIGTERM drain. |
+| 0 | `layer-surface-closed-{Left,Bottom,Right,Top}` | The compositor closed a live layer surface. |
+| 0 | `selected-output-removed-no-replacement` | The selected output disappeared and no eligible replacement remained. |
+| 0 | `bevy-app-exit`, `clean` | Clean application exit, or the defensive clean fallback. |
+| non-zero | `invalid-cli` | Invalid command-line arguments. |
+| non-zero | `wayland-connect-failed-*`, `wayland-registry-failed-*`, `wl-compositor-unavailable-*`, `layer-shell-unavailable-*` | Wayland connection, registry or required-global setup failed. |
+| non-zero | `output-discovery-failed-*`, `requested-output-unavailable-*`, `no-complete-output`, `v1-output-limit-exceeded` | Output discovery or single-output selection failed. |
+| non-zero | `raw-handle-failed-*`, `panel construction count was not four`, `forbidden-bevy-host-plugin-active` | Initial surface/renderer setup failed an invariant. |
+| non-zero | `output-replacement-failed-*`, `surface-plan-failed-*` | Output migration or surface reconciliation failed. |
+| non-zero | `configure-out-of-range-*`, `configure-timeout-*` | A configure was invalid or did not arrive in time. |
+| non-zero | `wake-deadline-stuck`, `wake-timer-failed-*` | Wake scheduling stopped making progress or its timer failed. |
+| non-zero | `bevy-app-error` | Bevy requested an error exit. |
+| non-zero | `calloop-create-failed-*`, `wayland-source-failed-*`, `signal-source-failed-*`, `signal-source-insert-failed-*`, `calloop-dispatch-failed-*`, `wayland-flush-failed-*` | Event-loop, signal integration, dispatch or Wayland flushing failed. |
 
 ## Current slice boundary
 
