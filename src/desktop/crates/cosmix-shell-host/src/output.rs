@@ -71,13 +71,9 @@ pub fn select_output(
         let info = state.info(&wl_output)?;
         let (width, height) = info.logical_size?;
         let logical_size = LogicalSize::new(width as f32, height as f32).ok()?;
+        let key = output_key(info.name.as_deref(), info.id)?;
         (info.scale_factor > 0).then(|| SelectedOutput {
-            key: OutputKey::new(
-                info.name
-                    .clone()
-                    .unwrap_or_else(|| format!("wl-output-{}", info.id)),
-            )
-            .expect("generated output keys are non-empty"),
+            key,
             wl_output,
             scale: info.scale_factor,
             info,
@@ -94,6 +90,16 @@ pub fn select_output(
     }
 }
 
+fn output_key(name: Option<&str>, id: u32) -> Option<OutputKey> {
+    let fallback = || format!("wl-output-{id}");
+    let value = name
+        .filter(|name| !name.trim().is_empty())
+        .map_or_else(fallback, ToOwned::to_owned);
+    OutputKey::new(value)
+        .ok()
+        .or_else(|| OutputKey::new(fallback()).ok())
+}
+
 pub fn insert_single_output(
     outputs: &mut OutputRuntimeMap,
     key: OutputKey,
@@ -105,4 +111,23 @@ pub fn insert_single_output(
     outputs.insert(key, runtime);
     debug_assert_eq!(outputs.len(), 1);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_or_whitespace_output_names_use_the_protocol_id() {
+        for name in [None, Some(""), Some(" \t\n")] {
+            assert_eq!(
+                output_key(name, 42).as_ref().map(OutputKey::as_str),
+                Some("wl-output-42")
+            );
+        }
+        assert_eq!(
+            output_key(Some("DP-1"), 42).as_ref().map(OutputKey::as_str),
+            Some("DP-1")
+        );
+    }
 }

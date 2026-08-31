@@ -2731,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bevy",
  "cosmix-shell",
@@ -2750,7 +2750,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell-host"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bevy",
  "calloop 0.13.0",
@@ -2760,6 +2760,7 @@ dependencies = [
  "raw-window-handle",
  "smithay-client-toolkit",
  "tracing",
+ "wayland-backend",
  "wayland-client",
  "wayland-protocols",
 ]

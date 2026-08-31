@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-shell-host"
-version = "0.1.1"
+version = "0.1.2"
 description = "SCTK layer-shell renderer host for Cosmix Quoin"
 edition = "2024"
 rust-version = "1.95"
@@ -20,6 +20,7 @@ raw-window-handle = "=0.6.2"
 smithay-client-toolkit = { version = "=0.19.2", default-features = false, features = ["calloop"] }
 tracing = "0.1"
 wayland-client = "=0.31.14"
+wayland-backend = { version = "=0.3.15", features = ["client_system"] }
 wayland-protocols = { version = "=0.32.13", default-features = false, features = ["client", "staging"] }
 
 [dev-dependencies]

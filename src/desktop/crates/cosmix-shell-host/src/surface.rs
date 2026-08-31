@@ -2,6 +2,8 @@
 
 #![deny(unsafe_code)]
 
+use std::time::Duration;
+
 use bevy::camera::RenderTarget;
 use bevy::prelude::*;
 use bevy::ui::{UiTargetCamera, percent};
@@ -158,6 +160,8 @@ pub struct PanelSurface {
     pub last_committed: Option<PanelPresentation>,
     pub presented: bool,
     pub frame_pending: bool,
+    pub frame_requested_at: Option<Duration>,
+    pub waiting_configure_since: Option<Duration>,
     wayland: Option<WaylandObjects>,
     output_size: LogicalSize,
     output_scale: i32,
@@ -230,6 +234,8 @@ impl PanelSurface {
             last_committed: None,
             presented: false,
             frame_pending: false,
+            frame_requested_at: None,
+            waiting_configure_since: None,
             wayland: Some(WaylandObjects {
                 fractional,
                 layer_surface,
@@ -261,6 +267,8 @@ impl PanelSurface {
         });
         self.preferred_fractional_scale = None;
         self.announced_scale = None;
+        self.frame_requested_at = None;
+        self.waiting_configure_since = None;
         Ok(())
     }
 
@@ -296,7 +304,7 @@ impl PanelSurface {
         )
     }
 
-    pub fn apply_protocol_ops(&mut self, operations: &[ProtocolOp]) {
+    pub fn apply_protocol_ops(&mut self, operations: &[ProtocolOp], elapsed: Duration) {
         if operations.is_empty() {
             return;
         }
@@ -337,6 +345,7 @@ impl PanelSurface {
                 ProtocolOp::CommitBufferless => {
                     objects.layer_surface.commit();
                     self.phase = SurfacePhase::WaitingConfigure;
+                    self.waiting_configure_since = Some(elapsed);
                     self.presented = false;
                 }
                 ProtocolOp::Commit => objects.layer_surface.commit(),
@@ -360,6 +369,8 @@ impl PanelSurface {
             }
             self.phase = SurfacePhase::PreparingUnmap;
             self.frame_pending = false;
+            self.frame_requested_at = None;
+            self.waiting_configure_since = None;
         }
     }
 
@@ -372,6 +383,8 @@ impl PanelSurface {
             self.configured_logical_size = None;
             self.announced_scale = None;
             self.presented = false;
+            self.frame_requested_at = None;
+            self.waiting_configure_since = None;
         }
     }
 
@@ -380,6 +393,7 @@ impl PanelSurface {
         app: &mut App,
         qh: &QueueHandle<State>,
         configure: &LayerSurfaceConfigure,
+        elapsed: Duration,
     ) -> Result<(), SurfaceSizeError>
     where
         State: wayland_client::Dispatch<
@@ -416,6 +430,7 @@ impl PanelSurface {
         self.update_bevy_window(app, physical, scale);
         match effect {
             ConfigureEffect::InitialMap => {
+                self.waiting_configure_since = None;
                 let raw_handle = self
                     .wayland
                     .as_ref()
@@ -434,7 +449,7 @@ impl PanelSurface {
                     width: logical.0 as f32,
                     height: logical.1 as f32,
                 });
-                self.request_frame(qh);
+                self.request_frame(qh, elapsed);
                 self.phase = SurfacePhase::Configured;
             }
             ConfigureEffect::Update { size_changed } => {
@@ -445,7 +460,7 @@ impl PanelSurface {
                         height: logical.1 as f32,
                     });
                     self.presented = false;
-                    self.request_frame(qh);
+                    self.request_frame(qh, elapsed);
                 }
             }
             ConfigureEffect::Ignore => unreachable!("ignored configure returned above"),
@@ -524,7 +539,7 @@ impl PanelSurface {
         Ok(())
     }
 
-    pub fn request_frame<State>(&mut self, qh: &QueueHandle<State>)
+    pub fn request_frame<State>(&mut self, qh: &QueueHandle<State>, elapsed: Duration)
     where
         State: wayland_client::Dispatch<
                 wayland_client::protocol::wl_callback::WlCallback,
@@ -542,6 +557,7 @@ impl PanelSurface {
                 .wl_surface();
             surface.frame(qh, surface.clone());
             self.frame_pending = true;
+            self.frame_requested_at = Some(elapsed);
         }
     }
 
@@ -555,6 +571,7 @@ impl PanelSurface {
 
     pub fn frame_done(&mut self) {
         self.frame_pending = false;
+        self.frame_requested_at = None;
         if self.phase == SurfacePhase::Configured {
             self.presented = true;
         }
@@ -579,6 +596,22 @@ impl PanelSurface {
         }
         self.phase = SurfacePhase::Closed;
         self.frame_pending = false;
+        self.frame_requested_at = None;
+        self.waiting_configure_since = None;
+    }
+
+    pub fn clear_overdue_frame(&mut self, elapsed: Duration, backstop: Duration) -> bool {
+        if self.frame_pending
+            && self
+                .frame_requested_at
+                .is_some_and(|requested| elapsed >= requested.saturating_add(backstop))
+        {
+            self.frame_pending = false;
+            self.frame_requested_at = None;
+            true
+        } else {
+            false
+        }
     }
 
     /// Drop a drained protocol/WSI owner while preserving the mount and its

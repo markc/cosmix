@@ -57,6 +57,68 @@ use crate::surface::{FractionalObjects, PanelSurface, SurfacePhase, SurfaceTag};
 
 type ModelFactory = dyn Fn(OutputKey, LogicalSize) -> ShellModel + Send + Sync;
 
+const ANIMATE_BACKSTOP: Duration = Duration::from_secs(1);
+const CONFIGURE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_CONSECUTIVE_PAST_DEADLINES: u8 = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LayerCloseDecision {
+    Retire,
+    Exit,
+}
+
+fn layer_close_decision(output_live: bool, replacement_pending: bool) -> LayerCloseDecision {
+    if output_live && !replacement_pending {
+        LayerCloseDecision::Exit
+    } else {
+        LayerCloseDecision::Retire
+    }
+}
+
+fn next_timer_deadline(
+    policy: WakePolicy,
+    animate_backstop: Option<Duration>,
+    configure_deadlines: &[Duration],
+) -> Option<Duration> {
+    let policy_deadline = match policy {
+        WakePolicy::Idle => None,
+        WakePolicy::WakeAt(deadline) => Some(deadline),
+        WakePolicy::Animate => animate_backstop,
+    };
+    policy_deadline
+        .into_iter()
+        .chain(configure_deadlines.iter().copied())
+        .min()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PastDeadlineObservation {
+    consecutive: u8,
+    past: bool,
+    stuck: bool,
+}
+
+fn observe_past_deadline(
+    policy: WakePolicy,
+    elapsed: Duration,
+    consecutive: u8,
+) -> PastDeadlineObservation {
+    if matches!(policy, WakePolicy::WakeAt(deadline) if deadline <= elapsed) {
+        let consecutive = consecutive.saturating_add(1);
+        PastDeadlineObservation {
+            consecutive,
+            past: true,
+            stuck: consecutive > MAX_CONSECUTIVE_PAST_DEADLINES,
+        }
+    } else {
+        PastDeadlineObservation {
+            consecutive: 0,
+            past: false,
+            stuck: false,
+        }
+    }
+}
+
 /// Startup policy supplied by the application while output identity and
 /// geometry remain owned by SCTK discovery.
 #[derive(Clone)]
@@ -159,6 +221,7 @@ struct RunnerState {
     last_wake: WakePolicy,
     timer_token: Option<RegistrationToken>,
     timer_deadline: Option<Duration>,
+    consecutive_past_deadlines: u8,
     exit_reason: Option<String>,
     abnormal_exit: bool,
     ready_logged: bool,
@@ -219,6 +282,7 @@ fn run_layer_host(
         last_wake: WakePolicy::Idle,
         timer_token: None,
         timer_deadline: None,
+        consecutive_past_deadlines: 0,
         exit_reason: None,
         abnormal_exit: false,
         ready_logged: false,
@@ -300,14 +364,24 @@ fn run_layer_host(
     }
 
     let loop_handle = event_loop.handle();
-    while state.exit_reason.is_none() {
+    loop {
         if state.replacement_needed {
+            let closed_exit_pending = state
+                .exit_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("layer-surface-closed-"));
             state.replacement_needed = false;
             if let Err(error) = state.replace_selected_output(&qh) {
                 state.abnormal_exit = true;
                 state.exit_reason = Some(format!("output-replacement-failed-{error}"));
                 continue;
             }
+            if closed_exit_pending && state.selected_key.is_some() {
+                state.exit_reason = None;
+            }
+        }
+        if state.exit_reason.is_some() {
+            break;
         }
         if state.needs_update {
             state.needs_update = false;
@@ -336,6 +410,9 @@ fn run_layer_host(
                 state.exit_reason = Some(format!("wayland-flush-failed-{error}"));
                 continue;
             }
+        }
+        if state.needs_update || state.exit_reason.is_some() || state.replacement_needed {
+            continue;
         }
         if let Err(error) = event_loop.dispatch(None, &mut state) {
             state.abnormal_exit = true;
@@ -512,11 +589,17 @@ impl RunnerState {
         .map_err(|error| LayerHostError::new(output_reason(&error)))?;
         self.selected_key = Some(selected_key);
         self.last_wake = WakePolicy::Idle;
+        self.consecutive_past_deadlines = 0;
         self.needs_update = true;
         Ok(())
     }
 
     fn reconcile(&mut self, qh: &QueueHandle<Self>) -> Result<(), LayerHostError> {
+        let elapsed = self
+            .app
+            .world()
+            .get_resource::<Time<Real>>()
+            .map_or(Duration::ZERO, Time::elapsed);
         let frame = self
             .app
             .world()
@@ -571,7 +654,7 @@ impl RunnerState {
                 panel.begin_unmap(app);
                 unmaps.push(edge);
             }
-            panel.apply_protocol_ops(&operations);
+            panel.apply_protocol_ops(&operations, elapsed);
         }
         if !unmaps.is_empty() {
             // This non-pipelined update drains render extraction after raw
@@ -588,7 +671,7 @@ impl RunnerState {
                     && panel.wants_animation_callback()
                     && !panel.frame_pending
                 {
-                    panel.request_frame(qh);
+                    panel.request_frame(qh, elapsed);
                     panel.commit_frame_request();
                 }
             }
@@ -600,10 +683,46 @@ impl RunnerState {
         &mut self,
         loop_handle: &LoopHandle<'_, Self>,
     ) -> Result<(), LayerHostError> {
-        let next_deadline = match self.last_wake {
-            WakePolicy::WakeAt(deadline) => Some(deadline),
-            WakePolicy::Idle | WakePolicy::Animate => None,
+        let elapsed = self
+            .app
+            .world()
+            .get_resource::<Time<Real>>()
+            .map_or(Duration::ZERO, Time::elapsed);
+        let observation =
+            observe_past_deadline(self.last_wake, elapsed, self.consecutive_past_deadlines);
+        self.consecutive_past_deadlines = observation.consecutive;
+        if observation.past {
+            self.needs_update = true;
+        }
+        if observation.stuck {
+            if let Some(token) = self.timer_token.take() {
+                loop_handle.remove(token);
+            }
+            self.timer_deadline = None;
+            self.abnormal_exit = true;
+            self.exit_reason = Some("wake-deadline-stuck".to_owned());
+            return Ok(());
+        }
+        let effective_policy = if observation.past {
+            WakePolicy::Idle
+        } else {
+            self.last_wake
         };
+        let animate_backstop = (self.last_wake == WakePolicy::Animate)
+            .then(|| elapsed.saturating_add(ANIMATE_BACKSTOP));
+        let configure_deadlines = self
+            .outputs
+            .values()
+            .flat_map(|output| output.panels.iter())
+            .filter_map(|panel| {
+                (panel.phase == SurfacePhase::WaitingConfigure)
+                    .then_some(panel.waiting_configure_since)
+                    .flatten()
+                    .map(|started| started.saturating_add(CONFIGURE_TIMEOUT))
+            })
+            .collect::<Vec<_>>();
+        let next_deadline =
+            next_timer_deadline(effective_policy, animate_backstop, &configure_deadlines);
         if self.timer_deadline == next_deadline {
             return Ok(());
         }
@@ -612,22 +731,54 @@ impl RunnerState {
         }
         self.timer_deadline = next_deadline;
         if let Some(deadline) = next_deadline {
-            let elapsed = self
-                .app
-                .world()
-                .get_resource::<Time<Real>>()
-                .map_or(Duration::ZERO, Time::elapsed);
             let timer = Timer::from_duration(deadline.saturating_sub(elapsed));
             let token = loop_handle
                 .insert_source(timer, |_, _, state| {
-                    state.timer_deadline = None;
-                    state.needs_update = true;
+                    let fired_at = state.timer_deadline.take().unwrap_or_else(|| {
+                        state
+                            .app
+                            .world()
+                            .get_resource::<Time<Real>>()
+                            .map_or(Duration::ZERO, Time::elapsed)
+                    });
+                    state.timer_token = None;
+                    state.handle_wake_timer(fired_at);
                     TimeoutAction::Drop
                 })
                 .map_err(|error| LayerHostError::new(error.to_string()))?;
             self.timer_token = Some(token);
         }
         Ok(())
+    }
+
+    fn handle_wake_timer(&mut self, elapsed: Duration) {
+        let configure_timeout = self
+            .outputs
+            .values()
+            .flat_map(|output| output.panels.iter())
+            .find(|panel| {
+                panel.phase == SurfacePhase::WaitingConfigure
+                    && panel
+                        .waiting_configure_since
+                        .is_some_and(|started| elapsed >= started.saturating_add(CONFIGURE_TIMEOUT))
+            })
+            .map(|panel| panel.edge);
+        if let Some(edge) = configure_timeout {
+            self.abnormal_exit = true;
+            self.exit_reason = Some(format!("configure-timeout-{edge:?}"));
+            return;
+        }
+
+        if self.last_wake == WakePolicy::Animate {
+            for panel in self
+                .outputs
+                .values_mut()
+                .flat_map(|output| output.panels.iter_mut())
+            {
+                panel.clear_overdue_frame(elapsed, ANIMATE_BACKSTOP);
+            }
+        }
+        self.needs_update = true;
     }
 
     fn panel_for_surface_mut(
@@ -828,15 +979,33 @@ impl OutputHandler for RunnerState {
 
 impl LayerShellHandler for RunnerState {
     fn closed(&mut self, _connection: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
+        let Some((panel_output, edge)) = self.outputs.values().find_map(|output| {
+            output
+                .panels
+                .iter()
+                .find(|panel| panel.matches_layer(layer))
+                .map(|panel| (output.wl_output.clone(), panel.edge))
+        }) else {
+            return;
+        };
+        let output_live = self
+            .output_state
+            .outputs()
+            .any(|output| output == panel_output);
+        let decision = layer_close_decision(output_live, self.replacement_needed);
         let RunnerState { app, outputs, .. } = self;
         if let Some(panel) = outputs
             .values_mut()
             .flat_map(|output| output.panels.iter_mut())
             .find(|panel| panel.matches_layer(layer))
         {
-            let edge = panel.edge;
             panel.close(app);
-            self.exit_reason = Some(format!("layer-surface-closed-{edge:?}"));
+            match decision {
+                LayerCloseDecision::Retire => self.replacement_needed = true,
+                LayerCloseDecision::Exit => {
+                    self.exit_reason = Some(format!("layer-surface-closed-{edge:?}"));
+                }
+            }
         }
     }
 
@@ -848,6 +1017,11 @@ impl LayerShellHandler for RunnerState {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
+        let elapsed = self
+            .app
+            .world()
+            .get_resource::<Time<Real>>()
+            .map_or(Duration::ZERO, Time::elapsed);
         let RunnerState { app, outputs, .. } = self;
         let mut configure_error = None;
         if let Some(panel) = outputs
@@ -856,7 +1030,7 @@ impl LayerShellHandler for RunnerState {
             .find(|panel| panel.matches_layer(layer))
         {
             // SCTK acknowledged the configure before invoking this callback.
-            configure_error = panel.configure(app, qh, &configure).err();
+            configure_error = panel.configure(app, qh, &configure, elapsed).err();
         }
         if let Some(error) = configure_error {
             self.abnormal_exit = true;
@@ -944,3 +1118,76 @@ delegate_compositor!(RunnerState);
 delegate_output!(RunnerState);
 delegate_layer!(RunnerState);
 delegate_registry!(RunnerState);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layer_close_only_exits_for_a_live_output_without_replacement() {
+        assert_eq!(layer_close_decision(true, false), LayerCloseDecision::Exit);
+        assert_eq!(
+            layer_close_decision(false, false),
+            LayerCloseDecision::Retire
+        );
+        assert_eq!(layer_close_decision(true, true), LayerCloseDecision::Retire);
+        assert_eq!(
+            layer_close_decision(false, true),
+            LayerCloseDecision::Retire
+        );
+    }
+
+    #[test]
+    fn timer_selection_uses_the_earliest_bounded_one_shot() {
+        let seconds = Duration::from_secs;
+        assert_eq!(next_timer_deadline(WakePolicy::Idle, None, &[]), None);
+        assert_eq!(
+            next_timer_deadline(WakePolicy::Animate, Some(seconds(6)), &[]),
+            Some(seconds(6))
+        );
+        assert_eq!(
+            next_timer_deadline(
+                WakePolicy::WakeAt(seconds(8)),
+                None,
+                &[seconds(7), seconds(12)]
+            ),
+            Some(seconds(7))
+        );
+        assert_eq!(
+            next_timer_deadline(WakePolicy::Idle, None, &[seconds(10)]),
+            Some(seconds(10))
+        );
+    }
+
+    #[test]
+    fn past_deadline_counter_is_bounded_and_resets() {
+        let elapsed = Duration::from_secs(10);
+        let past = WakePolicy::WakeAt(elapsed);
+        let at_limit = observe_past_deadline(past, elapsed, 63);
+        assert_eq!(
+            at_limit,
+            PastDeadlineObservation {
+                consecutive: 64,
+                past: true,
+                stuck: false,
+            }
+        );
+        assert!(observe_past_deadline(past, elapsed, at_limit.consecutive).stuck);
+        assert_eq!(
+            observe_past_deadline(
+                WakePolicy::WakeAt(elapsed + Duration::from_secs(1)),
+                elapsed,
+                42
+            ),
+            PastDeadlineObservation {
+                consecutive: 0,
+                past: false,
+                stuck: false,
+            }
+        );
+        assert_eq!(
+            observe_past_deadline(WakePolicy::Animate, elapsed, 42).consecutive,
+            0
+        );
+    }
+}
