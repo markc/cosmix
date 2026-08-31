@@ -74,8 +74,8 @@ use smithay::{
     backend::allocator::{Buffer as _, Format, dmabuf::Dmabuf},
     backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonState, KeyState, TouchSlot},
     delegate_data_device, delegate_dmabuf, delegate_foreign_toplevel_list,
-    delegate_fractional_scale, delegate_idle_notify, delegate_output, delegate_seat, delegate_shm,
-    delegate_viewporter,
+    delegate_fractional_scale, delegate_idle_notify, delegate_output, delegate_seat,
+    delegate_session_lock, delegate_shm, delegate_viewporter,
     desktop::{
         LayerMap, LayerSurface as DesktopLayerSurface, PopupKeyboardGrab, PopupKind, PopupManager,
         PopupPointerGrab, find_popup_root_surface, layer_map_for_output,
@@ -97,6 +97,9 @@ use smithay::{
             EventLoop, Interest, Mode as PollMode, PostAction,
             channel::{self, Event as ChannelEvent, Sender as CommandSender},
             generic::Generic,
+        },
+        wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::{
+            Error as SessionLockError, ExtSessionLockV1,
         },
         wayland_protocols::xdg::{
             decoration::zv1::server::{
@@ -142,6 +145,10 @@ use smithay::{
                 ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
                 set_data_device_focus,
             },
+        },
+        session_lock::{
+            LockSurface, LockSurfaceConfigure, SessionLockHandler, SessionLockManagerState,
+            SessionLocker,
         },
         shell::wlr_layer::{
             Anchor, ExclusiveZone, KeyboardInteractivity, Layer as WlrLayer,
@@ -234,10 +241,11 @@ pub(crate) enum StackBand {
     Normal,
     Top,
     Overlay,
+    Lock,
 }
 
 impl StackBand {
-    const COUNT: usize = 5;
+    const COUNT: usize = 6;
 
     const fn index(self) -> usize {
         match self {
@@ -246,6 +254,7 @@ impl StackBand {
             Self::Normal => 2,
             Self::Top => 3,
             Self::Overlay => 4,
+            Self::Lock => 5,
         }
     }
 
@@ -518,6 +527,14 @@ pub(crate) enum ChromeCursorIcon {
 
 #[derive(Debug)]
 pub(crate) enum ProtocolEvent {
+    /// Compositor-owned session-lock cover state. An active event installs an
+    /// opaque blank before any lock-surface content and names the security
+    /// epoch a renderer must report only after presenting it.
+    SecurityScene {
+        active: bool,
+        presentation_epoch: Option<u64>,
+        presentation_outputs: Vec<String>,
+    },
     OutputResized {
         width: u32,
         height: u32,
@@ -749,6 +766,10 @@ enum ProtocolCommand {
     },
     KmsRenderReply {
         reply: KmsRenderReply,
+    },
+    SecurityPresented {
+        presentation_epoch: u64,
+        output: String,
     },
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
     KmsTopologyLifecycle {
@@ -1102,6 +1123,32 @@ impl ClientSceneFeed {
 #[derive(Clone)]
 pub(crate) struct ClientFrameClock {
     commands: CommandSender<ProtocolCommand>,
+}
+
+/// Renderer-to-protocol acknowledgement for a security presentation epoch.
+///
+/// Nested mode reports only after its swapchain image was presented and the
+/// submitted GPU work completed through this interface.
+/// The KMS displayed-frame wiring intentionally lands here in session-lock
+/// slice 2; enqueuing or submitting a frame is not sufficient evidence.
+#[derive(Clone)]
+pub(crate) struct SecurityPresentationReporter {
+    commands: CommandSender<ProtocolCommand>,
+}
+
+impl SecurityPresentationReporter {
+    pub(crate) fn presented(
+        &self,
+        presentation_epoch: u64,
+        output: impl Into<String>,
+    ) -> Result<(), String> {
+        self.commands
+            .send(ProtocolCommand::SecurityPresented {
+                presentation_epoch,
+                output: output.into(),
+            })
+            .map_err(|_| "Wayland protocol thread disconnected".to_string())
+    }
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -1496,6 +1543,12 @@ impl WaylandRuntime {
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
     pub(crate) fn client_frame_clock(&self) -> ClientFrameClock {
         ClientFrameClock {
+            commands: self.commands.clone(),
+        }
+    }
+
+    pub(crate) fn security_presentation_reporter(&self) -> SecurityPresentationReporter {
+        SecurityPresentationReporter {
             commands: self.commands.clone(),
         }
     }
@@ -2061,6 +2114,8 @@ impl ProtocolServer {
             OutputManagerState::new_with_xdg_output::<WaylandState>(&display_handle);
         let xdg_shell_state = XdgShellState::new::<WaylandState>(&display_handle);
         let layer_shell_state = WlrLayerShellState::new::<WaylandState>(&display_handle);
+        let session_lock_state =
+            SessionLockManagerState::new::<WaylandState, _>(&display_handle, |_| true);
         let xdg_decoration_state = XdgDecorationState::new::<WaylandState>(&display_handle);
         let fractional_scale_state =
             FractionalScaleManagerState::new::<WaylandState>(&display_handle);
@@ -2174,6 +2229,12 @@ impl ProtocolServer {
             output_manager_state,
             xdg_shell_state,
             layer_shell_state,
+            session_lock_state,
+            lock_lifecycle: LockLifecycle::Unlocked,
+            lock_surfaces_by_output: HashMap::new(),
+            next_lock_generation: 0,
+            next_security_presentation_epoch: 0,
+            saved_cursor_selection: None,
             idle_notifier_state,
             foreign_toplevel_list_state,
             xdg_decoration_state,
@@ -2225,8 +2286,11 @@ impl ProtocolServer {
             minimized_toplevels: Vec::new(),
             surfaces: HashMap::new(),
             foreign_toplevels: HashMap::new(),
+            foreign_toplevel_identifiers: HashMap::new(),
             foreign_toplevel_nonce,
             buffer_history_surfaces: HashSet::new(),
+            attach_history_surfaces: HashSet::new(),
+            committed_surfaces: HashSet::new(),
             surface_objects: HashMap::new(),
             xdg_surface_objects: HashMap::new(),
             dispatching_xdg_surface: None,
@@ -2283,7 +2347,7 @@ impl ProtocolServer {
             .handle()
             .insert_source(client_disconnect_source, |event, (), state| {
                 if let ChannelEvent::Msg(client_id) = event {
-                    state.destroy_client_acquire_gates(&client_id);
+                    state.handle_client_disconnect(&client_id);
                 }
             })
             .map_err(|error| error.to_string())?;
@@ -2357,6 +2421,12 @@ impl ProtocolServer {
                             state.request_shutdown(ProtocolShutdownCause::RuntimeFailure);
                         }
                     }
+                }
+                ChannelEvent::Msg(ProtocolCommand::SecurityPresented {
+                    presentation_epoch,
+                    output,
+                }) => {
+                    state.acknowledge_security_presentation(presentation_epoch, &output);
                 }
                 #[cfg(any(all(feature = "kms-live", not(test)), test))]
                 ChannelEvent::Msg(ProtocolCommand::KmsTopologyLifecycle {
@@ -2595,6 +2665,17 @@ impl ProtocolServer {
     }
 
     fn queue_renderer_event_with_limit(&mut self, event: ProtocolEvent, limit: usize) {
+        if matches!(&event, ProtocolEvent::SecurityScene { active: true, .. }) {
+            // Lock entry is a hard publication boundary. A normal-surface
+            // upsert may already be retained from an earlier full channel;
+            // purge it before the empty/lock-only roster is installed.
+            let retained = self.state.mapped_surface_ids();
+            let retired = self.pending_events.retain_surface_events(&retained);
+            for token in retired {
+                self.state.release_buffer_token(token);
+            }
+            self.dirty_surfaces.retain(|id| retained.contains(id));
+        }
         let surface_id = protocol_event_surface_id(&event);
         let complete_state = matches!(event, ProtocolEvent::SurfaceUpserted { .. });
         let cursor_state = matches!(event, ProtocolEvent::CursorUpdated { .. });
@@ -2920,6 +3001,7 @@ impl Extend<SurfaceId> for DirtySurfaces {
 
 #[derive(Default)]
 struct PendingProtocolEvents {
+    security: Option<ProtocolEvent>,
     roster: Option<ProtocolEvent>,
     output: Option<ProtocolEvent>,
     cursor: Option<ProtocolEvent>,
@@ -2960,13 +3042,33 @@ impl PendingProtocolEvents {
     }
 
     fn is_empty(&self) -> bool {
-        self.roster.is_none()
+        self.security.is_none()
+            && self.roster.is_none()
             && self.output.is_none()
             && self.cursor.is_none()
             && self.surfaces.is_empty()
             && self.dmabuf_invalidations.is_empty()
             && !self.invalidate_all_dmabufs
             && self.runtime_failures.is_empty()
+    }
+
+    /// Drop queued surface deltas that the renderer must no longer observe.
+    /// Returns renderer-owned DMA-BUF tokens carried by discarded upserts.
+    fn retain_surface_events(&mut self, retained: &HashSet<SurfaceId>) -> Vec<u64> {
+        let mut retired_tokens = Vec::new();
+        let mut bytes = self.bytes;
+        self.surfaces.retain(|id, event| {
+            if retained.contains(id) {
+                return true;
+            }
+            bytes = bytes.saturating_sub(protocol_event_retained_bytes(event));
+            if let Some(token) = protocol_event_dmabuf_token(event) {
+                retired_tokens.push(token);
+            }
+            false
+        });
+        self.bytes = bytes;
+        retired_tokens
     }
 
     fn push(&mut self, event: ProtocolEvent) -> Result<PendingPush, Box<ProtocolEvent>> {
@@ -3065,6 +3167,10 @@ impl PendingProtocolEvents {
         // what round-trips a roster back in through `from_events` when a full
         // channel hands the batch back.
         match event {
+            ProtocolEvent::SecurityScene { .. } => {
+                self.security = Some(event);
+                return Ok(PendingPush::default());
+            }
             ProtocolEvent::SurfaceRoster { .. } => {
                 self.roster = Some(event);
                 return Ok(PendingPush::default());
@@ -3081,6 +3187,7 @@ impl PendingProtocolEvents {
             _ => {}
         }
         let old_bytes = match &event {
+            ProtocolEvent::SecurityScene { .. } => 0,
             ProtocolEvent::OutputResized { .. } => self
                 .output
                 .as_ref()
@@ -3105,7 +3212,8 @@ impl PendingProtocolEvents {
             | ProtocolEvent::RuntimeFailed(_) => 0,
         };
         let new_bytes = match &event {
-            ProtocolEvent::SurfaceRoster { .. }
+            ProtocolEvent::SecurityScene { .. }
+            | ProtocolEvent::SurfaceRoster { .. }
             | ProtocolEvent::DmabufBufferDestroyed { .. }
             | ProtocolEvent::DmabufCacheInvalidated => 0,
             ProtocolEvent::SurfaceRelayout { id, scene }
@@ -3211,6 +3319,9 @@ impl PendingProtocolEvents {
         }
 
         match event {
+            ProtocolEvent::SecurityScene { .. } => {
+                self.security = Some(event);
+            }
             ProtocolEvent::OutputResized { .. } => {
                 self.output = Some(event);
             }
@@ -3275,7 +3386,8 @@ impl PendingProtocolEvents {
         self.bytes = 0;
         self.pressure_warned = false;
         let mut events = Vec::with_capacity(
-            usize::from(self.roster.is_some())
+            usize::from(self.security.is_some())
+                + usize::from(self.roster.is_some())
                 + usize::from(self.output.is_some())
                 + usize::from(self.cursor.is_some())
                 + self.surfaces.len()
@@ -3283,7 +3395,12 @@ impl PendingProtocolEvents {
                 + usize::from(self.invalidate_all_dmabufs)
                 + self.runtime_failures.len(),
         );
-        // The roster goes first, ahead of every per-surface event in the
+        // Security state goes first so the opaque blank is installed before
+        // ordinary surface membership is withdrawn in the same batch.
+        if let Some(security) = self.security.take() {
+            events.push(security);
+        }
+        // The roster goes ahead of every per-surface event in the
         // batch. Reversed, a queued upsert for a surface the roster removes
         // would recreate the entity immediately after it was dropped, which is
         // the very defect the roster exists to close.
@@ -3337,7 +3454,8 @@ fn protocol_event_surface_id(event: &ProtocolEvent) -> Option<SurfaceId> {
         | ProtocolEvent::SurfaceRelayout { id, .. }
         | ProtocolEvent::SurfaceUnmapped { id }
         | ProtocolEvent::SurfaceDestroyed { id } => Some(*id),
-        ProtocolEvent::OutputResized { .. }
+        ProtocolEvent::SecurityScene { .. }
+        | ProtocolEvent::OutputResized { .. }
         | ProtocolEvent::CursorUpdated { .. }
         | ProtocolEvent::DmabufBufferDestroyed { .. }
         | ProtocolEvent::DmabufCacheInvalidated
@@ -3393,7 +3511,8 @@ fn protocol_event_retained_bytes(event: &ProtocolEvent) -> usize {
         ProtocolEvent::SurfaceUpserted { scene, .. }
         | ProtocolEvent::SurfaceRelayout { scene, .. } => mem::size_of::<ProtocolEvent>()
             .saturating_add(scene.title.as_deref().map_or(0, str::len)),
-        ProtocolEvent::OutputResized { .. }
+        ProtocolEvent::SecurityScene { .. }
+        | ProtocolEvent::OutputResized { .. }
         | ProtocolEvent::CursorUpdated { .. }
         | ProtocolEvent::SurfaceUnmapped { .. }
         | ProtocolEvent::SurfaceDestroyed { .. }
@@ -3647,11 +3766,18 @@ enum SurfaceRole {
     Toplevel(ToplevelSurface),
     Popup(PopupSurface),
     Layer(LayerRole),
+    LockSurface(LockSurfaceRole),
     Subsurface {
         surface: WlSurface,
         parent: WlSurface,
     },
     Dormant(WlSurface),
+}
+
+struct LockSurfaceRole {
+    surface: LockSurface,
+    output: Output,
+    lock_generation: u64,
 }
 
 struct LayerRole {
@@ -3709,12 +3835,40 @@ enum ConfigureTarget {
     Toplevel(ToplevelSurface),
     Popup(PopupSurface),
     Layer(DesktopLayerSurface),
+    Lock(LockSurface),
+}
+
+enum LockLifecycle {
+    Unlocked,
+    Locking {
+        owner: ClientId,
+        lock_resource: ExtSessionLockV1,
+        locker: SessionLocker,
+        generation: u64,
+        presentation_epoch: u64,
+        pending_outputs: HashSet<String>,
+    },
+    Locked {
+        owner: ClientId,
+        lock_resource: ExtSessionLockV1,
+        generation: u64,
+    },
+    OrphanedLocked {
+        generation: u64,
+    },
+}
+
+impl LockLifecycle {
+    fn is_active(&self) -> bool {
+        !matches!(self, Self::Unlocked)
+    }
 }
 
 enum XdgConfigureRequest {
     Initial,
     Toplevel { force: bool },
     PopupReposition { token: u32 },
+    Lock,
 }
 
 impl SurfaceRole {
@@ -3724,6 +3878,7 @@ impl SurfaceRole {
             Self::Subsurface { .. } => SceneSurfaceKind::Subsurface,
             Self::Popup(_) => SceneSurfaceKind::Popup,
             Self::Layer(_) => SceneSurfaceKind::Subsurface,
+            Self::LockSurface(_) => SceneSurfaceKind::Subsurface,
             // Dormant records are excluded by `surface_is_presentable`, so
             // this value can never cross the protocol-to-scene boundary.
             Self::Dormant(_) => SceneSurfaceKind::Subsurface,
@@ -3735,6 +3890,7 @@ impl SurfaceRole {
             Self::Toplevel(surface) => surface.wl_surface(),
             Self::Popup(surface) => surface.wl_surface(),
             Self::Layer(role) => role.surface.wl_surface(),
+            Self::LockSurface(role) => role.surface.wl_surface(),
             Self::Subsurface { surface, .. } => surface,
             Self::Dormant(surface) => surface,
         }
@@ -3743,14 +3899,22 @@ impl SurfaceRole {
     fn toplevel(&self) -> Option<&ToplevelSurface> {
         match self {
             Self::Toplevel(surface) => Some(surface),
-            Self::Popup(_) | Self::Layer(_) | Self::Subsurface { .. } | Self::Dormant(_) => None,
+            Self::Popup(_)
+            | Self::Layer(_)
+            | Self::LockSurface(_)
+            | Self::Subsurface { .. }
+            | Self::Dormant(_) => None,
         }
     }
 
     fn parent_surface(&self) -> Option<&WlSurface> {
         match self {
             Self::Subsurface { parent, .. } => Some(parent),
-            Self::Toplevel(_) | Self::Popup(_) | Self::Layer(_) | Self::Dormant(_) => None,
+            Self::Toplevel(_)
+            | Self::Popup(_)
+            | Self::Layer(_)
+            | Self::LockSurface(_)
+            | Self::Dormant(_) => None,
         }
     }
 
@@ -3759,6 +3923,7 @@ impl SurfaceRole {
             Self::Toplevel(_) => "toplevel",
             Self::Popup(_) => "popup",
             Self::Layer(_) => "layer",
+            Self::LockSurface(_) => "lock",
             Self::Subsurface { .. } => "subsurface",
             Self::Dormant(_) => "dormant",
         }
@@ -3973,6 +4138,12 @@ struct WaylandState {
     output_manager_state: OutputManagerState,
     xdg_shell_state: XdgShellState,
     layer_shell_state: WlrLayerShellState,
+    session_lock_state: SessionLockManagerState,
+    lock_lifecycle: LockLifecycle,
+    lock_surfaces_by_output: HashMap<String, ObjectId>,
+    next_lock_generation: u64,
+    next_security_presentation_epoch: u64,
+    saved_cursor_selection: Option<CursorSelection>,
     idle_notifier_state: IdleNotifierState<Self>,
     foreign_toplevel_list_state: ForeignToplevelListState,
     #[allow(dead_code)]
@@ -4040,8 +4211,18 @@ struct WaylandState {
     minimized_toplevels: Vec<ObjectId>,
     surfaces: HashMap<ObjectId, SurfaceRecord>,
     foreign_toplevels: HashMap<SurfaceId, ForeignToplevelHandle>,
+    foreign_toplevel_identifiers: HashMap<SurfaceId, String>,
     foreign_toplevel_nonce: [u8; 16],
+    /// Surfaces that have ever attached a non-null buffer. Layer-shell's
+    /// AlreadyConstructed rule uses this narrower history.
     buffer_history_surfaces: HashSet<ObjectId>,
+    /// Every surface that has received wl_surface.attach, including NULL.
+    /// ext-session-lock rejects any prior attach history.
+    attach_history_surfaces: HashSet<ObjectId>,
+    /// Every wl_surface that has ever committed, including an empty commit.
+    /// ext-session-lock's AlreadyConstructed rule includes both commit and
+    /// attach history, while layer-shell only needs the latter.
+    committed_surfaces: HashSet<ObjectId>,
     surface_objects: HashMap<SurfaceId, ObjectId>,
     xdg_surface_objects: HashMap<ObjectId, ObjectId>,
     dispatching_xdg_surface: Option<ObjectId>,
@@ -4708,6 +4889,276 @@ fn committed_syncobj_state(
 }
 
 impl WaylandState {
+    fn session_lock_active(&self) -> bool {
+        self.lock_lifecycle.is_active()
+    }
+
+    fn session_lock_acceptance_output(&self) -> Option<Output> {
+        if !matches!(self.backend, BackendData::Winit(_)) {
+            // Slice 2 connects KMS displayed-frame evidence to
+            // SecurityPresentationReporter. Until then KMS must fail closed.
+            return None;
+        }
+        self.backend
+            .default_output()
+            .filter(|output| output.current_mode().is_some())
+    }
+
+    fn begin_session_lock(&mut self, locker: SessionLocker) {
+        let Some(output) = self.session_lock_acceptance_output() else {
+            return;
+        };
+        if self.session_lock_active() {
+            return;
+        }
+        let Some(owner) = locker.ext_session_lock().client().map(|client| client.id()) else {
+            return;
+        };
+        let lock_resource = locker.ext_session_lock().clone();
+        self.next_lock_generation = self.next_lock_generation.saturating_add(1);
+        self.next_security_presentation_epoch =
+            self.next_security_presentation_epoch.saturating_add(1);
+        let generation = self.next_lock_generation;
+        let presentation_epoch = self.next_security_presentation_epoch;
+        let mut pending_outputs = HashSet::new();
+        pending_outputs.insert(output.name());
+
+        // Reconcile releases while ordinary focus and binding state still have
+        // their pre-lock meaning, then make every later policy query fail closed.
+        self.release_pressed_keys();
+        self.lock_lifecycle = LockLifecycle::Locking {
+            owner,
+            lock_resource,
+            locker,
+            generation,
+            presentation_epoch,
+            pending_outputs,
+        };
+        self.teardown_input_for_session_lock();
+        self.close_all_foreign_toplevels();
+        self.events.push(ProtocolEvent::SecurityScene {
+            active: true,
+            presentation_epoch: Some(presentation_epoch),
+            presentation_outputs: vec![output.name()],
+        });
+        self.events.push(ProtocolEvent::SurfaceRoster {
+            mapped: self.mapped_surface_ids().into_iter().collect(),
+        });
+        tracing::info!(
+            generation,
+            presentation_epoch,
+            "session lock entering Locking"
+        );
+    }
+
+    fn teardown_input_for_session_lock(&mut self) {
+        let popup_parents = self
+            .surfaces
+            .values()
+            .filter(|record| {
+                matches!(
+                    record.role,
+                    SurfaceRole::Toplevel(_) | SurfaceRole::Layer(_)
+                )
+            })
+            .map(|record| record.role.wl_surface().clone())
+            .collect::<Vec<_>>();
+        for parent in popup_parents {
+            self.dismiss_popup_descendants(&parent);
+        }
+        if self.keyboard.is_grabbed() {
+            self.keyboard.clone().unset_grab(self);
+        }
+        if self.pointer.is_grabbed() {
+            self.pointer.clone().unset_grab_without_focus_restore(
+                self,
+                SERIAL_COUNTER.next_serial(),
+                monotonic_millis(),
+            );
+        }
+        self.cancel_touch();
+        self.cancel_chrome_pointer_grab(false);
+        self.finish_interactive_pointer(false);
+        self.interactive_pointer = None;
+        self.exclusive_keyboard_focus = None;
+        self.last_keyboard_action = None;
+        self.keyboard
+            .clone()
+            .set_focus(self, None, SERIAL_COUNTER.next_serial());
+        let (x, y) = self.cursor_position;
+        self.pointer.clone().motion(
+            self,
+            None,
+            &MotionEvent {
+                location: (x, y).into(),
+                serial: SERIAL_COUNTER.next_serial(),
+                time: monotonic_millis(),
+            },
+        );
+        self.pointer.clone().frame(self);
+        self.pointer_focus_local_position = None;
+        if self.saved_cursor_selection.is_none() {
+            self.saved_cursor_selection = Some(self.cursor_selection.clone());
+        }
+        self.cursor_selection = CursorSelection::Hidden;
+        self.chrome_cursor_override = None;
+        self.publish_current_cursor();
+    }
+
+    fn acknowledge_security_presentation(&mut self, presentation_epoch: u64, output: &str) {
+        let lifecycle = mem::replace(&mut self.lock_lifecycle, LockLifecycle::Unlocked);
+        match lifecycle {
+            LockLifecycle::Locking {
+                owner,
+                lock_resource,
+                locker,
+                generation,
+                presentation_epoch: expected,
+                mut pending_outputs,
+            } if expected == presentation_epoch => {
+                pending_outputs.remove(output);
+                if pending_outputs.is_empty() {
+                    locker.lock();
+                    self.lock_lifecycle = LockLifecycle::Locked {
+                        owner,
+                        lock_resource,
+                        generation,
+                    };
+                    tracing::info!(
+                        generation,
+                        presentation_epoch,
+                        "session lock entered Locked"
+                    );
+                } else {
+                    self.lock_lifecycle = LockLifecycle::Locking {
+                        owner,
+                        lock_resource,
+                        locker,
+                        generation,
+                        presentation_epoch: expected,
+                        pending_outputs,
+                    };
+                }
+            }
+            other => self.lock_lifecycle = other,
+        }
+    }
+
+    fn close_all_foreign_toplevels(&mut self) {
+        for (_, handle) in self.foreign_toplevels.drain() {
+            self.foreign_toplevel_list_state.remove_toplevel(&handle);
+        }
+    }
+
+    fn deactivate_all_lock_surfaces(&mut self) {
+        let surfaces = self
+            .lock_surfaces_by_output
+            .drain()
+            .filter_map(|(_, object)| {
+                self.surfaces
+                    .get(&object)
+                    .map(|record| record.role.wl_surface().clone())
+            })
+            .collect::<Vec<_>>();
+        for surface in surfaces {
+            self.deactivate_surface_role(&surface);
+        }
+    }
+
+    fn leave_session_lock(&mut self) {
+        if !matches!(self.lock_lifecycle, LockLifecycle::Locked { .. }) {
+            return;
+        }
+        self.lock_lifecycle = LockLifecycle::Unlocked;
+        self.deactivate_all_lock_surfaces();
+        self.events.push(ProtocolEvent::SecurityScene {
+            active: false,
+            presentation_epoch: None,
+            presentation_outputs: Vec::new(),
+        });
+        self.events.push(ProtocolEvent::SurfaceRoster {
+            mapped: self.mapped_surface_ids().into_iter().collect(),
+        });
+        // A roster removes stale entities but cannot recreate the static
+        // surfaces withdrawn at lock entry. Re-derive a complete upsert for
+        // every presentable surface even when it did not commit while locked.
+        self.pending_full_upserts.extend(self.mapped_surface_ids());
+        if let Some(selection) = self.saved_cursor_selection.take() {
+            self.cursor_selection = selection;
+            self.publish_current_cursor();
+        }
+        let toplevels = self
+            .surfaces
+            .values()
+            .filter(|record| record.mapped && matches!(record.role, SurfaceRole::Toplevel(_)))
+            .map(|record| record.role.wl_surface().clone())
+            .collect::<Vec<_>>();
+        for surface in toplevels {
+            self.sync_foreign_toplevel(&surface);
+        }
+        self.arbitrate_keyboard_focus(None, true, false);
+        self.retarget_pointer_after_visibility_change();
+        tracing::info!("session lock returned to Unlocked");
+    }
+
+    fn abort_locking_after_owner_death(&mut self, lock_resource: &ExtSessionLockV1) {
+        self.session_lock_state.abort_lock_outputs(lock_resource);
+        self.lock_lifecycle = LockLifecycle::Unlocked;
+        self.deactivate_all_lock_surfaces();
+        self.events.push(ProtocolEvent::SecurityScene {
+            active: false,
+            presentation_epoch: None,
+            presentation_outputs: Vec::new(),
+        });
+        self.events.push(ProtocolEvent::SurfaceRoster {
+            mapped: self.mapped_surface_ids().into_iter().collect(),
+        });
+        self.pending_full_upserts.extend(self.mapped_surface_ids());
+        if let Some(selection) = self.saved_cursor_selection.take() {
+            self.cursor_selection = selection;
+            self.publish_current_cursor();
+        }
+        let toplevels = self
+            .surfaces
+            .values()
+            .filter(|record| record.mapped && matches!(record.role, SurfaceRole::Toplevel(_)))
+            .map(|record| record.role.wl_surface().clone())
+            .collect::<Vec<_>>();
+        for surface in toplevels {
+            self.sync_foreign_toplevel(&surface);
+        }
+        self.arbitrate_keyboard_focus(None, true, false);
+        self.retarget_pointer_after_visibility_change();
+    }
+
+    fn handle_client_disconnect(&mut self, client_id: &ClientId) {
+        self.destroy_client_acquire_gates(client_id);
+        let lifecycle = mem::replace(&mut self.lock_lifecycle, LockLifecycle::Unlocked);
+        match lifecycle {
+            LockLifecycle::Locking {
+                owner,
+                lock_resource,
+                ..
+            } if &owner == client_id => {
+                self.abort_locking_after_owner_death(&lock_resource);
+                tracing::warn!("session-lock owner died before Locked; lock aborted");
+            }
+            LockLifecycle::Locked {
+                owner, generation, ..
+            } if &owner == client_id => {
+                self.lock_lifecycle = LockLifecycle::OrphanedLocked { generation };
+                self.deactivate_all_lock_surfaces();
+                self.events
+                    .push(ProtocolEvent::SurfaceRoster { mapped: Vec::new() });
+                tracing::error!(
+                    generation,
+                    "session-lock owner died; remaining orphan-locked"
+                );
+            }
+            other => self.lock_lifecycle = other,
+        }
+    }
+
     /// Record why the protocol run is ending, with runtime failure dominating.
     ///
     /// The calloop channel drains every queued command in a single dispatch, so
@@ -4768,6 +5219,7 @@ impl WaylandState {
             .values()
             .filter(|record| {
                 !matches!(record.role, SurfaceRole::Dormant(_))
+                    && self.surface_is_session_presentable(record)
                     && record.role.parent_surface().is_none()
                     && !self.surface_belongs_to_minimized_toplevel(record.role.wl_surface())
             })
@@ -4878,6 +5330,9 @@ impl WaylandState {
     }
 
     fn sync_foreign_toplevel(&mut self, surface: &WlSurface) {
+        if self.session_lock_active() {
+            return;
+        }
         let Some((id, commit_count, title)) = self.surfaces.get(&surface.id()).and_then(|record| {
             (record.mapped && matches!(record.role, SurfaceRole::Toplevel(_))).then(|| {
                 (
@@ -4924,11 +5379,17 @@ impl WaylandState {
                 .try_into()
                 .expect("nonce low half"),
         );
-        let identifier = format!(
-            "{:016x}{:016x}",
-            instance_high ^ id.0,
-            instance_low ^ commit_count
-        );
+        let identifier = self
+            .foreign_toplevel_identifiers
+            .entry(id)
+            .or_insert_with(|| {
+                format!(
+                    "{:016x}{:016x}",
+                    instance_high ^ id.0,
+                    instance_low ^ commit_count
+                )
+            })
+            .clone();
         let handle = self
             .foreign_toplevel_list_state
             .new_toplevel_with_identifier::<Self>(identifier, title, app_id);
@@ -4939,6 +5400,7 @@ impl WaylandState {
         let Some(id) = self.surfaces.get(&surface.id()).map(|record| record.id) else {
             return;
         };
+        self.foreign_toplevel_identifiers.remove(&id);
         if let Some(handle) = self.foreign_toplevels.remove(&id) {
             self.foreign_toplevel_list_state.remove_toplevel(&handle);
         }
@@ -5912,6 +6374,51 @@ impl WaylandState {
         }
     }
 
+    fn apply_acked_lock_state(&mut self, surface: &WlSurface) {
+        let Some((width, height)) = self.surfaces.get(&surface.id()).and_then(|record| {
+            matches!(record.role, SurfaceRole::LockSurface(_))
+                .then_some(())
+                .filter(|_| {
+                    configure_sequence_is_acked(
+                        record.required_configure,
+                        record.last_acked_configure,
+                    )
+                })?;
+            record.last_acked_size
+        }) else {
+            return;
+        };
+        let (x, y, _, _) = self.backend.logical_output_rect();
+        if let Some(record) = self.surfaces.get_mut(&surface.id()) {
+            record.configured_size = (width, height);
+            record.layout.x = x as f32;
+            record.layout.y = y as f32;
+            record.layout.width = width as f32;
+            record.layout.height = height as f32;
+        }
+    }
+
+    fn reconfigure_lock_surfaces(&mut self) {
+        if !self.session_lock_active() {
+            return;
+        }
+        let (_, _, width, height) = self.backend.logical_output_rect();
+        let surfaces = self
+            .surfaces
+            .values()
+            .filter_map(|record| match &record.role {
+                SurfaceRole::LockSurface(role) => Some(role.surface.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for lock in surfaces {
+            lock.with_pending_state(|state| {
+                state.size = Some((width, height).into());
+            });
+            let _ = self.send_lock_configure(lock.wl_surface());
+        }
+    }
+
     fn emit_xdg_configure(
         &mut self,
         surface: &WlSurface,
@@ -5924,6 +6431,7 @@ impl WaylandState {
                 | XdgConfigureRequest::PopupReposition { .. } => {
                     record.required_configure.is_some()
                 }
+                XdgConfigureRequest::Lock => matches!(record.role, SurfaceRole::LockSurface(_)),
             };
             if !gate_open {
                 return None;
@@ -5936,6 +6444,7 @@ impl WaylandState {
                 SurfaceRole::Layer(role) if role.output.output().is_some() => {
                     Some(ConfigureTarget::Layer(role.surface.clone()))
                 }
+                SurfaceRole::LockSurface(role) => Some(ConfigureTarget::Lock(role.surface.clone())),
                 SurfaceRole::Layer(_)
                 | SurfaceRole::Subsurface { .. }
                 | SurfaceRole::Dormant(_) => None,
@@ -5973,16 +6482,27 @@ impl WaylandState {
             (ConfigureTarget::Layer(layer), XdgConfigureRequest::Initial) => {
                 layer.layer_surface().send_configure()
             }
+            (ConfigureTarget::Lock(lock), XdgConfigureRequest::Lock) => {
+                lock.send_configure_with_serial()?
+            }
             (ConfigureTarget::Toplevel(_), XdgConfigureRequest::PopupReposition { .. })
             | (ConfigureTarget::Popup(_), XdgConfigureRequest::Toplevel { .. })
             | (ConfigureTarget::Layer(_), XdgConfigureRequest::Toplevel { .. })
-            | (ConfigureTarget::Layer(_), XdgConfigureRequest::PopupReposition { .. }) => {
+            | (ConfigureTarget::Layer(_), XdgConfigureRequest::PopupReposition { .. })
+            | (ConfigureTarget::Toplevel(_), XdgConfigureRequest::Lock)
+            | (ConfigureTarget::Popup(_), XdgConfigureRequest::Lock)
+            | (ConfigureTarget::Layer(_), XdgConfigureRequest::Lock)
+            | (ConfigureTarget::Lock(_), XdgConfigureRequest::Initial)
+            | (ConfigureTarget::Lock(_), XdgConfigureRequest::Toplevel { .. })
+            | (ConfigureTarget::Lock(_), XdgConfigureRequest::PopupReposition { .. }) => {
                 return None;
             }
         };
         if matches!(
             request,
-            XdgConfigureRequest::Initial | XdgConfigureRequest::PopupReposition { .. }
+            XdgConfigureRequest::Initial
+                | XdgConfigureRequest::PopupReposition { .. }
+                | XdgConfigureRequest::Lock
         ) {
             let is_layer = self
                 .surfaces
@@ -6023,6 +6543,10 @@ impl WaylandState {
         force: bool,
     ) -> Option<Serial> {
         self.emit_xdg_configure(surface, XdgConfigureRequest::Toplevel { force })
+    }
+
+    fn send_lock_configure(&mut self, surface: &WlSurface) -> Option<Serial> {
+        self.emit_xdg_configure(surface, XdgConfigureRequest::Lock)
     }
 
     fn configure_client_side_decoration(&mut self, surface: &ToplevelSurface) {
@@ -6102,6 +6626,7 @@ impl WaylandState {
                 SurfaceRole::Layer(role) if role.output.output().is_some() => {
                     Some(ConfigureTarget::Layer(role.surface.clone()))
                 }
+                SurfaceRole::LockSurface(role) => Some(ConfigureTarget::Lock(role.surface.clone())),
                 SurfaceRole::Layer(_)
                 | SurfaceRole::Subsurface { .. }
                 | SurfaceRole::Dormant(_) => None,
@@ -6151,6 +6676,7 @@ impl WaylandState {
                     }
                 }
             }
+            ConfigureTarget::Lock(_) => {}
         }
         false
     }
@@ -6171,6 +6697,7 @@ impl WaylandState {
                 }
                 SurfaceRole::Popup(popup) => Some(ConfigureTarget::Popup(popup.clone())),
                 SurfaceRole::Layer(role) => Some(ConfigureTarget::Layer(role.surface.clone())),
+                SurfaceRole::LockSurface(role) => Some(ConfigureTarget::Lock(role.surface.clone())),
                 SurfaceRole::Subsurface { .. } | SurfaceRole::Dormant(_) => None,
             });
         let reset_xdg_protocol_state = match target {
@@ -6188,6 +6715,7 @@ impl WaylandState {
                     .reset_after_unmap(initial_layer.expect("layer configure target owns role"));
                 false
             }
+            Some(ConfigureTarget::Lock(_)) => false,
             None => return,
         };
         if reset_xdg_protocol_state {
@@ -6313,7 +6841,10 @@ impl WaylandState {
             let association_visible = match record.role {
                 SurfaceRole::Subsurface { .. } => record.parent_association_committed,
                 SurfaceRole::Dormant(_) => false,
-                SurfaceRole::Toplevel(_) | SurfaceRole::Popup(_) | SurfaceRole::Layer(_) => true,
+                SurfaceRole::Toplevel(_)
+                | SurfaceRole::Popup(_)
+                | SurfaceRole::Layer(_)
+                | SurfaceRole::LockSurface(_) => true,
             };
             let visible = effectively_visible(
                 record.mapped && !record.minimized,
@@ -6647,6 +7178,14 @@ impl WaylandState {
     }
 
     fn destroy_surface_record(&mut self, surface: &WlSurface) {
+        if let Some(output) = self.surfaces.get(&surface.id()).and_then(|record| {
+            let SurfaceRole::LockSurface(role) = &record.role else {
+                return None;
+            };
+            Some(role.output.name())
+        }) {
+            self.lock_surfaces_by_output.remove(&output);
+        }
         self.close_foreign_toplevel(surface);
         self.cancel_chrome_pointer_grab_for_surface(surface, false);
         self.reset_chrome_pointer_tracking(&surface.id());
@@ -6663,6 +7202,7 @@ impl WaylandState {
             return;
         };
         self.surface_objects.remove(&record.id);
+        self.foreign_toplevel_identifiers.remove(&record.id);
         if record.layout.visible {
             self.backend.output_leave(surface);
         }
@@ -7667,12 +8207,15 @@ impl WaylandState {
                 serial,
                 time,
                 |state, modifiers, key_handle| {
-                    binding_filter_result(state.bindings.dispatch(
-                        keycode,
-                        pressed,
-                        key_handle.raw_latin_sym_or_raw_current_sym(),
-                        modifiers,
-                    ))
+                    let keysym = key_handle.raw_latin_sym_or_raw_current_sym();
+                    let disposition = if state.session_lock_active() {
+                        state
+                            .bindings
+                            .dispatch_session_locked(keycode, pressed, keysym, modifiers)
+                    } else {
+                        state.bindings.dispatch(keycode, pressed, keysym, modifiers)
+                    };
+                    binding_filter_result(disposition)
                 },
             )
             .flatten();
@@ -7813,7 +8356,8 @@ impl WaylandState {
         self.surfaces
             .values()
             .filter(|record| {
-                if !record.layout.visible
+                if !self.surface_is_session_presentable(record)
+                    || !record.layout.visible
                     || x < f64::from(record.layout.x)
                     || y < f64::from(record.layout.y)
                     || x >= f64::from(record.layout.x + record.layout.width)
@@ -7831,6 +8375,35 @@ impl WaylandState {
                     .is_none_or(|region| region.contains(local))
             })
             .max_by(|left, right| surface_stack_cmp(left, right))
+    }
+
+    fn surface_is_session_presentable(&self, record: &SurfaceRecord) -> bool {
+        if matches!(self.lock_lifecycle, LockLifecycle::Unlocked) {
+            return !matches!(record.role, SurfaceRole::LockSurface(_));
+        }
+        let lock_generation = match &record.role {
+            SurfaceRole::LockSurface(role) => Some(role.lock_generation),
+            SurfaceRole::Subsurface { surface, .. } => {
+                let root = root_compositor_surface(surface);
+                self.surfaces.get(&root.id()).and_then(|root| {
+                    let SurfaceRole::LockSurface(role) = &root.role else {
+                        return None;
+                    };
+                    Some(role.lock_generation)
+                })
+            }
+            _ => None,
+        };
+        match &self.lock_lifecycle {
+            LockLifecycle::Unlocked => unreachable!("Unlocked returned on the fast path"),
+            LockLifecycle::Locking { generation, .. }
+            | LockLifecycle::Locked { generation, .. }
+            | LockLifecycle::OrphanedLocked { generation } => lock_generation == Some(*generation),
+        }
+    }
+
+    fn surface_is_renderer_presentable(&self, record: &SurfaceRecord) -> bool {
+        surface_is_presentable(record) && self.surface_is_session_presentable(record)
     }
 
     fn refresh_committed_input_region(&mut self, surface: &WlSurface) -> bool {
@@ -7992,6 +8565,15 @@ impl WaylandState {
 
     fn pointer_target_at(&self, x: f64, y: f64) -> Option<PointerTarget> {
         let client = self.surface_at(x, y);
+        if self.session_lock_active() {
+            // Compositor chrome belongs to hidden ordinary toplevels. Under
+            // lock it must not start grabs, dispatch caption buttons or reveal
+            // a chrome cursor through a blank/input-region hole.
+            return client.map(|record| PointerTarget::Client {
+                surface: record.role.wl_surface().clone(),
+                origin: (f64::from(record.layout.x), f64::from(record.layout.y)).into(),
+            });
+        }
         if !self.decoration.enabled {
             return client.map(|record| PointerTarget::Client {
                 surface: record.role.wl_surface().clone(),
@@ -8530,6 +9112,18 @@ impl WaylandState {
             .map(|record| record.role.wl_surface().clone())
     }
 
+    fn highest_visible_lock_surface(&self) -> Option<WlSurface> {
+        self.surfaces
+            .values()
+            .filter(|record| {
+                record.layout.visible
+                    && self.surface_is_session_presentable(record)
+                    && matches!(record.role, SurfaceRole::LockSurface(_))
+            })
+            .max_by(|left, right| surface_stack_cmp(left, right))
+            .map(|record| record.role.wl_surface().clone())
+    }
+
     fn interaction_focus_root(&self, surface: &WlSurface) -> Option<WlSurface> {
         if let Some(layer_root) = self.layer_root_object_for_surface(surface) {
             return self
@@ -8541,6 +9135,9 @@ impl WaylandState {
     }
 
     fn raise_for_focus_interaction(&mut self, surface: &WlSurface) {
+        if self.session_lock_active() {
+            return;
+        }
         if self.layer_keyboard_interactivity_for_surface(surface)
             == Some(KeyboardInteractivity::None)
         {
@@ -8566,7 +9163,15 @@ impl WaylandState {
                 self.layer_keyboard_interactivity_for_surface(focus)
                     == Some(KeyboardInteractivity::None)
             });
-        let target = if let Some((object, surface)) = self.highest_exclusive_layer() {
+        let target = if self.session_lock_active() {
+            requested
+                .filter(|surface| {
+                    self.surfaces
+                        .get(&surface.id())
+                        .is_some_and(|record| self.surface_is_session_presentable(record))
+                })
+                .or_else(|| self.highest_visible_lock_surface())
+        } else if let Some((object, surface)) = self.highest_exclusive_layer() {
             self.exclusive_keyboard_focus = Some(object);
             Some(surface)
         } else {
@@ -8895,6 +9500,7 @@ impl WaylandState {
         }
         self.events
             .push(ProtocolEvent::OutputResized { width, height });
+        self.reconfigure_lock_surfaces();
         self.begin_pointer_hit_test_batch();
         self.arrange_all_layer_outputs();
         let usable = self.usable_output_rect();
@@ -9412,7 +10018,10 @@ impl WaylandState {
             match &record.role {
                 SurfaceRole::Subsurface { parent, .. } => current = parent.clone(),
                 SurfaceRole::Toplevel(_) => return Some(current),
-                SurfaceRole::Popup(_) | SurfaceRole::Layer(_) | SurfaceRole::Dormant(_) => {
+                SurfaceRole::Popup(_)
+                | SurfaceRole::Layer(_)
+                | SurfaceRole::LockSurface(_)
+                | SurfaceRole::Dormant(_) => {
                     return None;
                 }
             }
@@ -9722,7 +10331,7 @@ impl WaylandState {
             .filter(|(_, object)| {
                 self.surfaces
                     .get(object)
-                    .is_some_and(surface_is_presentable)
+                    .is_some_and(|record| self.surface_is_renderer_presentable(record))
             })
             .map(|(id, _)| *id)
             .collect()
@@ -9739,7 +10348,7 @@ impl WaylandState {
         self.surface_objects
             .get(&id)
             .and_then(|object| self.surfaces.get(object))
-            .is_some_and(surface_is_presentable)
+            .is_some_and(|record| self.surface_is_renderer_presentable(record))
     }
 
     /// Publish a surface upsert, unless the surface is not presentable.
@@ -9760,7 +10369,7 @@ impl WaylandState {
         if self
             .surfaces
             .get(&surface.id())
-            .is_some_and(surface_is_presentable)
+            .is_some_and(|record| self.surface_is_renderer_presentable(record))
         {
             self.events.push(event);
             return;
@@ -9777,7 +10386,7 @@ impl WaylandState {
         let Some(record) = self.surfaces.get(&object) else {
             return LatestSurfaceUpsert::Gone;
         };
-        if !surface_is_presentable(record) {
+        if !self.surface_is_renderer_presentable(record) {
             return LatestSurfaceUpsert::Gone;
         }
         let scene = record.scene_snapshot();

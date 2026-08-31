@@ -17,6 +17,7 @@ use std::{env, error::Error, ffi::OsString, io, mem, process::ExitCode, time::Du
 use backend::{BackendKind, render::KmsRenderTargetPlugin};
 use bevy::{
     app::AppExit,
+    ecs::schedule::ScheduleLabel,
     input::{
         ButtonState as BevyButtonState,
         keyboard::{KeyCode, NativeKeyCode},
@@ -24,7 +25,13 @@ use bevy::{
         touch::TouchPhase,
     },
     prelude::*,
-    render::pipelined_rendering::{PipelinedRenderingPlugin, RenderExtractApp},
+    render::{
+        Render, RenderApp, RenderScheduleOrder, RenderSystems,
+        pipelined_rendering::{PipelinedRenderingPlugin, RenderExtractApp},
+        render_resource::PollType,
+        renderer::{RenderDevice, render_system},
+        view::ExtractedWindows,
+    },
     window::{
         CursorMoved, PresentMode, WindowBackendScaleFactorChanged, WindowEvent, WindowPlugin,
         WindowResized,
@@ -37,14 +44,15 @@ use cosmix_wgpu_dmabuf::{
 use smithay::backend::input::{AxisRelativeDirection, AxisSource};
 
 use compositor_scene::{
-    CompositorSceneFailed, CompositorScenePlugin, CompositorSceneSet, SceneCursorMode,
+    CompositorSceneFailed, CompositorScenePlugin, CompositorSceneSet, NestedSecurityPresentation,
+    SceneCursorMode,
 };
 use decoration::DecorationStartup;
 use decoration_scene::init_chrome_font_cx;
 use protocol::{
     EcsAction, ExplicitSyncExposureMode, ExplicitSyncPreparation, ExplicitSyncStartupReport,
-    ExplicitSyncStartupVerdict, HostAxis, HostButtonState, HostInput, WaylandRuntime,
-    WaylandRuntimePolicy, judge_explicit_sync_startup,
+    ExplicitSyncStartupVerdict, HostAxis, HostButtonState, HostInput, SecurityPresentationReporter,
+    WaylandRuntime, WaylandRuntimePolicy, judge_explicit_sync_startup,
 };
 
 const DEFAULT_SOCKET: &str = "cosmix-0";
@@ -345,6 +353,10 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
     );
     report_explicit_sync_startup(runtime.explicit_sync_startup());
     let scene_feed = runtime.take_client_scene_feed()?;
+    install_nested_security_presentation_completion(
+        &mut app,
+        runtime.security_presentation_reporter(),
+    );
 
     // `App::run` reports how the app ended (window close / exit chord →
     // Success; render-error, device-lost, winit-loop, Ctrl-C → Error).
@@ -1131,6 +1143,110 @@ fn pump_wayland(world: &mut World) {
         }
         Err(error) => panic!("{error}"),
     }
+}
+
+#[derive(ScheduleLabel, Clone, Debug, Eq, Hash, PartialEq)]
+struct NestedPostPresent;
+
+#[derive(Resource, Default)]
+struct NestedPresentCandidate {
+    window: Option<Entity>,
+    epochs: Vec<(u64, String)>,
+}
+
+#[derive(Resource)]
+struct NestedPresentationCompletion {
+    reporter: SecurityPresentationReporter,
+}
+
+/// Install the production nested security barrier at Bevy's real completion
+/// boundary: after queue submission and `SurfaceTexture::present()`.
+fn install_nested_security_presentation_completion(
+    app: &mut App,
+    reporter: SecurityPresentationReporter,
+) {
+    let pending = NestedSecurityPresentation::default();
+    app.insert_resource(pending.clone());
+    let render_app = app
+        .get_sub_app_mut(RenderApp)
+        .expect("nested renderer has a render sub-app");
+    render_app
+        .insert_resource(pending)
+        .insert_resource(NestedPresentationCompletion { reporter })
+        .init_resource::<NestedPresentCandidate>()
+        .init_schedule(NestedPostPresent)
+        .add_systems(
+            Render,
+            capture_nested_present_candidate
+                .in_set(RenderSystems::Render)
+                .before(render_system),
+        )
+        .add_systems(NestedPostPresent, complete_nested_security_presentation);
+    render_app
+        .world_mut()
+        .resource_mut::<RenderScheduleOrder>()
+        .insert_after(Render, NestedPostPresent);
+}
+
+fn capture_nested_present_candidate(
+    pending: Res<NestedSecurityPresentation>,
+    windows: Res<ExtractedWindows>,
+    mut candidate: ResMut<NestedPresentCandidate>,
+) {
+    candidate.window = None;
+    candidate.epochs.clear();
+    let Some(primary) = windows.primary else {
+        return;
+    };
+    let Some(window) = windows.get(&primary) else {
+        return;
+    };
+    if window.swap_chain_texture.is_none() {
+        return;
+    }
+    let epochs = pending.snapshot();
+    if epochs.is_empty() {
+        return;
+    }
+    candidate.window = Some(primary);
+    candidate.epochs = epochs;
+}
+
+fn complete_nested_security_presentation(
+    pending: Res<NestedSecurityPresentation>,
+    completion: Res<NestedPresentationCompletion>,
+    render_device: Res<RenderDevice>,
+    windows: Res<ExtractedWindows>,
+    mut candidate: ResMut<NestedPresentCandidate>,
+) {
+    let Some(window_id) = candidate.window.take() else {
+        return;
+    };
+    let epochs = mem::take(&mut candidate.epochs);
+    // `present()` consumes the acquired swapchain texture. If it remains,
+    // rendering or presentation was skipped and the epoch stays pending.
+    if windows
+        .get(&window_id)
+        .is_none_or(|window| window.swap_chain_texture.is_some())
+    {
+        return;
+    }
+    if let Err(error) = render_device.poll(PollType::wait_indefinitely()) {
+        error!(%error, "nested security frame GPU completion failed");
+        return;
+    }
+
+    let mut reported = Vec::new();
+    for (epoch, output) in epochs {
+        match completion.reporter.presented(epoch, output.clone()) {
+            Ok(()) => reported.push((epoch, output)),
+            Err(error) => {
+                error!(%error, "nested security presentation report failed");
+                break;
+            }
+        }
+    }
+    pending.complete(&reported);
 }
 
 fn finish_wayland_frame(world: &mut World) {

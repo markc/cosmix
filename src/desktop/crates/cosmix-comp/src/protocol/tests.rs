@@ -17,6 +17,7 @@ use smithay::backend::input::{
 // registered on the real event loop, or the stall oracle would be measuring a
 // test harness instead of the protocol thread.
 use smithay::reexports::calloop::{EventSource, Poll, PostAction, Readiness, Token, TokenFactory};
+use smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_surface_v1::Error as SessionLockSurfaceError;
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -29643,4 +29644,1478 @@ fn layer_rearrange_shifts_subsurface_and_popup_layout_and_hit_testing() {
         )
         .map(|record| record.id);
     assert_eq!(popup_hit, Some(popup_id));
+}
+
+// ext-session-lock-v1 slice 1 wire harness. Every scenario below creates and
+// drives real protocol objects on the existing UnixStream client; direct state
+// assertions only inspect compositor policy reached through that wire.
+type SessionLockTraffic = Vec<(u32, u16, Vec<u8>)>;
+type TestLockSurfaceWire = (u32, u32, (u32, u32, u32), SessionLockTraffic);
+
+#[derive(Clone, Copy)]
+struct TestSessionLock {
+    lock: u32,
+    surface: u32,
+    lock_surface: u32,
+    configure: (u32, u32, u32),
+}
+
+fn request_test_session_lock(harness: &mut KeybindingHarness) -> (u32, u32, u32) {
+    let (manager, lock, output, _) = request_test_session_lock_with_traffic(harness);
+    (manager, lock, output)
+}
+
+fn request_test_session_lock_with_traffic(
+    harness: &mut KeybindingHarness,
+) -> (u32, u32, u32, SessionLockTraffic) {
+    let manager = harness.bind_test_global("ext_session_lock_manager_v1", 1);
+    let output = harness.bind_test_global("wl_output", 4);
+    let _ = harness.sync();
+    let lock = harness.allocate_object_id();
+    send_request(&mut harness.client, manager, 1, &words(&[lock]));
+    let traffic = harness.sync();
+    assert!(
+        traffic
+            .iter()
+            .all(|(object, opcode, _)| *object != lock || *opcode != 0),
+        "locked is withheld before presentation: {traffic:?}"
+    );
+    (manager, lock, output, traffic)
+}
+
+fn create_test_lock_surface(
+    harness: &mut KeybindingHarness,
+    lock: u32,
+    output: u32,
+) -> TestLockSurfaceWire {
+    let surface = harness.allocate_object_id();
+    let lock_surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface]),
+    );
+    send_request(
+        &mut harness.client,
+        lock,
+        1,
+        &words(&[lock_surface, surface, output]),
+    );
+    let traffic = harness.sync();
+    let configures = traffic
+        .iter()
+        .filter(|(object, opcode, _)| *object == lock_surface && *opcode == 0)
+        .map(|(_, _, body)| (word(body, 0), word(body, 1), word(body, 2)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        configures.len(),
+        1,
+        "lock surface receives exactly one immediate configure: {traffic:?}"
+    );
+    let configure = configures[0];
+    (surface, lock_surface, configure, traffic)
+}
+
+fn begin_test_session_lock(harness: &mut KeybindingHarness) -> TestSessionLock {
+    let (_manager, lock, output) = request_test_session_lock(harness);
+    let (surface, lock_surface, configure, _) = create_test_lock_surface(harness, lock, output);
+    TestSessionLock {
+        lock,
+        surface,
+        lock_surface,
+        configure,
+    }
+}
+
+fn ack_and_map_test_lock_surface(harness: &mut KeybindingHarness, lock: TestSessionLock) {
+    send_request(
+        &mut harness.client,
+        lock.lock_surface,
+        1,
+        &words(&[lock.configure.0]),
+    );
+    let buffer = harness.create_dmabuf_buffer_sized(lock.configure.1, lock.configure.2);
+    send_request(
+        &mut harness.client,
+        lock.surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, lock.surface, 6, &[]);
+    let _ = harness.sync();
+}
+
+fn present_test_security_epoch(
+    harness: &mut KeybindingHarness,
+    lock_object: u32,
+) -> Vec<(u32, u16, Vec<u8>)> {
+    let (epoch, output) = match &harness.server.state.lock_lifecycle {
+        LockLifecycle::Locking {
+            presentation_epoch,
+            pending_outputs,
+            ..
+        } => (
+            *presentation_epoch,
+            pending_outputs
+                .iter()
+                .next()
+                .expect("locking waits for one nested output")
+                .clone(),
+        ),
+        _ => panic!("expected Locking before presentation"),
+    };
+    harness
+        .commands
+        .send(ProtocolCommand::SecurityPresented {
+            presentation_epoch: epoch,
+            output,
+        })
+        .expect("inject renderer presentation acknowledgement");
+    pump_protocol_event_loop_until(
+        &mut harness.server,
+        "session lock presentation acknowledgement",
+        |state| matches!(state.lock_lifecycle, LockLifecycle::Locked { .. }),
+    );
+    let traffic = harness.sync();
+    assert!(
+        traffic
+            .iter()
+            .any(|(object, opcode, _)| *object == lock_object && *opcode == 0),
+        "locked follows the injected presented epoch: {traffic:?}"
+    );
+    traffic
+}
+
+fn unlock_test_session(
+    harness: &mut KeybindingHarness,
+    lock: TestSessionLock,
+) -> Vec<(u32, u16, Vec<u8>)> {
+    send_request(&mut harness.client, lock.lock, 2, &[]);
+    let traffic = harness.sync();
+    assert!(matches!(
+        harness.server.state.lock_lifecycle,
+        LockLifecycle::Unlocked
+    ));
+    traffic
+}
+
+fn test_lock_record(harness: &KeybindingHarness, surface: u32) -> &SurfaceRecord {
+    harness
+        .server
+        .state
+        .surfaces
+        .values()
+        .find(|record| record.role.wl_surface().id().protocol_id() == surface)
+        .expect("lock surface record exists")
+}
+
+fn test_foreign_announcement(traffic: &[(u32, u16, Vec<u8>)], manager: u32) -> (u32, String) {
+    let handles = traffic
+        .iter()
+        .filter(|(object, opcode, _)| *object == manager && *opcode == 0)
+        .map(|(_, _, body)| word(body, 0))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        handles.len(),
+        1,
+        "one foreign-toplevel announcement: {traffic:?}"
+    );
+    let handle = handles[0];
+    let identifier = traffic
+        .iter()
+        .find_map(|(object, opcode, body)| {
+            (*object == handle && *opcode == 4).then(|| {
+                let mut offset = 0;
+                wire_string(body, &mut offset)
+            })
+        })
+        .unwrap_or_else(|| panic!("foreign handle has an identifier: {traffic:?}"));
+    (handle, identifier)
+}
+
+fn disconnect_test_client(harness: &mut KeybindingHarness) {
+    let (replacement, replacement_peer) =
+        UnixStream::pair().expect("create inert replacement test socket");
+    let client = mem::replace(&mut harness.client, replacement);
+    drop(client);
+    drop(replacement_peer);
+    for dispatch in 1..=EVENT_LOOP_PUMP_LIMIT {
+        harness
+            .server
+            .dispatch_cycle(Some(EVENT_LOOP_PUMP_TIMEOUT))
+            .unwrap_or_else(|error| panic!("disconnect dispatch {dispatch} failed: {error}"));
+        if harness
+            .client_state
+            .disconnect_reason
+            .lock()
+            .expect("test disconnect-reason mutex poisoned")
+            .is_some()
+        {
+            // ClientData::disconnected queues the policy transition into
+            // calloop, so one more cycle consumes it.
+            harness
+                .server
+                .dispatch_cycle(Some(EVENT_LOOP_PUMP_TIMEOUT))
+                .expect("dispatch queued client-disconnect policy");
+            return;
+        }
+    }
+    panic!("Wayland test client did not disconnect");
+}
+
+fn connect_secondary_client(
+    harness: &mut KeybindingHarness,
+) -> (UnixStream, HashMap<String, (u32, u32)>) {
+    let (mut client, server) = UnixStream::pair().expect("secondary Wayland test socket pair");
+    let client_state = Arc::new(WaylandClientState::new(
+        harness.server.state.client_disconnect_sender.clone(),
+    ));
+    harness
+        .server
+        .state
+        .display_handle
+        .insert_client(server, client_state)
+        .expect("register secondary Wayland client");
+    send_display_request(&mut client, 1, 2);
+    send_display_request(&mut client, 0, 3);
+    harness.dispatch_client();
+    let globals = registry_globals(&mut client, 3);
+    (client, globals)
+}
+
+#[test]
+fn session_lock_locked_is_withheld_until_presented_blank_epoch() {
+    let mut harness = KeybindingHarness::new(true);
+    let (_, lock, _) = request_test_session_lock(&mut harness);
+    assert!(matches!(
+        harness.server.state.lock_lifecycle,
+        LockLifecycle::Locking { .. }
+    ));
+    assert!(harness.server.state.events.iter().any(|event| matches!(
+        event,
+        ProtocolEvent::SecurityScene {
+            active: true,
+            presentation_epoch: Some(_),
+            ..
+        }
+    )));
+    for _ in 0..3 {
+        harness
+            .server
+            .dispatch_cycle(Some(Duration::ZERO))
+            .expect("withheld renderer completion leaves Locking live");
+    }
+    assert!(matches!(
+        harness.server.state.lock_lifecycle,
+        LockLifecycle::Locking { .. }
+    ));
+    present_test_security_epoch(&mut harness, lock);
+}
+
+#[test]
+fn session_lock_rejected_non_owner_cannot_unlock_the_owner() {
+    let mut harness = KeybindingHarness::new(true);
+    let owner = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, owner);
+    present_test_security_epoch(&mut harness, owner.lock);
+
+    let (mut intruder, globals) = connect_secondary_client(&mut harness);
+    let (manager_name, manager_version) = globals["ext_session_lock_manager_v1"];
+    bind_global(
+        &mut intruder,
+        manager_name,
+        "ext_session_lock_manager_v1",
+        manager_version.min(1),
+        4,
+    );
+    send_request(&mut intruder, 4, 1, &words(&[5]));
+    send_display_request(&mut intruder, 0, 6);
+    harness.dispatch_client();
+    let rejected = events_until_callback(&mut intruder, 6);
+    assert!(
+        rejected
+            .iter()
+            .any(|(object, opcode, _)| *object == 5 && *opcode == 1),
+        "second client receives finished: {rejected:?}"
+    );
+
+    send_request(&mut intruder, 5, 2, &[]);
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut intruder);
+    assert_eq!(offending, 5);
+    assert_eq!(code, SessionLockError::InvalidUnlock as u32);
+    assert!(message.contains("not locked"));
+    assert!(matches!(
+        harness.server.state.lock_lifecycle,
+        LockLifecycle::Locked { .. }
+    ));
+
+    let _ = unlock_test_session(&mut harness, owner);
+}
+
+#[test]
+fn session_lock_finished_same_client_object_cannot_create_active_generation_surfaces() {
+    let mut harness = KeybindingHarness::new(true);
+    let (manager, owner, output) = request_test_session_lock(&mut harness);
+    let rejected = harness.allocate_object_id();
+    send_request(&mut harness.client, manager, 1, &words(&[rejected]));
+    let traffic = harness.sync();
+    assert!(
+        traffic
+            .iter()
+            .any(|(object, opcode, _)| *object == rejected && *opcode == 1)
+    );
+
+    let surface = harness.allocate_object_id();
+    let lock_surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface]),
+    );
+    send_request(
+        &mut harness.client,
+        rejected,
+        1,
+        &words(&[lock_surface, surface, output]),
+    );
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(offending, rejected);
+    assert_eq!(code, SessionLockError::InvalidUnlock as u32);
+    assert!(message.contains("active lock generation"));
+    assert!(harness.server.state.lock_surfaces_by_output.is_empty());
+    assert!(!matches!(
+        harness.server.state.lock_lifecycle,
+        LockLifecycle::Locked { .. }
+    ));
+    let _ = owner;
+}
+
+#[test]
+fn session_lock_duplicate_request_receives_finished() {
+    let mut harness = KeybindingHarness::new(true);
+    let (manager, first, _) = request_test_session_lock(&mut harness);
+    let duplicate = harness.allocate_object_id();
+    send_request(&mut harness.client, manager, 1, &words(&[duplicate]));
+    let traffic = harness.sync();
+    assert!(
+        traffic
+            .iter()
+            .any(|(object, opcode, _)| *object == duplicate && *opcode == 1)
+    );
+    assert!(
+        traffic
+            .iter()
+            .all(|(object, opcode, _)| *object != first || *opcode != 0)
+    );
+}
+
+#[test]
+fn session_lock_unavailable_backend_receives_finished() {
+    let mut harness = KeybindingHarness::new_with_backend(true, BackendKind::Kms);
+    let manager = harness.bind_test_global("ext_session_lock_manager_v1", 1);
+    let lock = harness.allocate_object_id();
+    send_request(&mut harness.client, manager, 1, &words(&[lock]));
+    let traffic = harness.sync();
+    assert!(
+        traffic
+            .iter()
+            .any(|(object, opcode, _)| *object == lock && *opcode == 1)
+    );
+    assert!(matches!(
+        harness.server.state.lock_lifecycle,
+        LockLifecycle::Unlocked
+    ));
+}
+
+#[test]
+fn session_lock_one_surface_per_physical_output_across_resources() {
+    let mut harness = KeybindingHarness::new(true);
+    let (_, lock, first_output) = request_test_session_lock(&mut harness);
+    let _ = create_test_lock_surface(&mut harness, lock, first_output);
+    let second_output = harness.bind_test_global("wl_output", 4);
+    let _ = harness.sync();
+    let surface = harness.allocate_object_id();
+    let lock_surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface]),
+    );
+    send_request(
+        &mut harness.client,
+        lock,
+        1,
+        &words(&[lock_surface, surface, second_output]),
+    );
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(offending, lock);
+    assert_eq!(code, SessionLockError::DuplicateOutput as u32);
+    assert!(message.contains("physical output"));
+}
+
+#[test]
+fn session_lock_role_conflict_and_prior_buffer_are_protocol_errors() {
+    let mut role = KeybindingHarness::new(true);
+    let (_, role_lock, role_output) = request_test_session_lock(&mut role);
+    let role_surface = role.allocate_object_id();
+    send_request(
+        &mut role.client,
+        role_lock,
+        1,
+        &words(&[role_surface, TEST_TOPLEVEL_SURFACE_ID, role_output]),
+    );
+    role.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut role.client);
+    assert_eq!(offending, role_lock);
+    assert_eq!(code, SessionLockError::Role as u32);
+    assert!(message.contains("role"));
+
+    let mut buffered = KeybindingHarness::new(true);
+    let (_, lock, output) = request_test_session_lock(&mut buffered);
+    let surface = buffered.allocate_object_id();
+    send_request(
+        &mut buffered.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface]),
+    );
+    let buffer = buffered.create_dmabuf_buffer_sized(320, 240);
+    let lock_surface = buffered.allocate_object_id();
+    send_request(&mut buffered.client, surface, 1, &words(&[buffer, 0, 0]));
+    send_request(
+        &mut buffered.client,
+        lock,
+        1,
+        &words(&[lock_surface, surface, output]),
+    );
+    buffered.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut buffered.client);
+    assert_eq!(offending, lock);
+    assert_eq!(code, SessionLockError::AlreadyConstructed as u32);
+    assert!(message.contains("buffer"));
+}
+
+#[test]
+fn session_lock_initial_configure_is_immediate_and_exact_output_size() {
+    let mut harness = KeybindingHarness::new(true);
+    let lock = begin_test_session_lock(&mut harness);
+    assert_eq!(lock.configure.1, 320);
+    assert_eq!(lock.configure.2, 240);
+    let record = test_lock_record(&harness, lock.surface);
+    assert_eq!(
+        record.required_configure.map(u32::from),
+        Some(lock.configure.0)
+    );
+    assert_eq!((record.layout.width, record.layout.height), (320.0, 240.0));
+}
+
+#[test]
+fn session_lock_buffer_before_ack_is_protocol_error() {
+    let mut harness = KeybindingHarness::new(true);
+    let lock = begin_test_session_lock(&mut harness);
+    let buffer = harness.create_dmabuf_buffer_sized(lock.configure.1, lock.configure.2);
+    send_request(
+        &mut harness.client,
+        lock.surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, lock.surface, 6, &[]);
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(offending, lock.lock_surface);
+    assert_eq!(code, SessionLockSurfaceError::CommitBeforeFirstAck as u32);
+    assert!(message.contains("ack_configure"));
+}
+
+#[test]
+fn session_lock_wrong_dimensions_are_protocol_error() {
+    let mut harness = KeybindingHarness::new(true);
+    let lock = begin_test_session_lock(&mut harness);
+    send_request(
+        &mut harness.client,
+        lock.lock_surface,
+        1,
+        &words(&[lock.configure.0]),
+    );
+    let buffer = harness.create_dmabuf_buffer_sized(lock.configure.1 - 1, lock.configure.2);
+    send_request(
+        &mut harness.client,
+        lock.surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, lock.surface, 6, &[]);
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(offending, lock.lock_surface);
+    assert_eq!(code, SessionLockSurfaceError::DimensionsMismatch as u32);
+    assert!(message.contains("dimensions"));
+}
+
+#[test]
+fn session_lock_acked_empty_first_commit_is_null_buffer_error() {
+    let mut harness = KeybindingHarness::new(true);
+    let lock = begin_test_session_lock(&mut harness);
+    send_request(
+        &mut harness.client,
+        lock.lock_surface,
+        1,
+        &words(&[lock.configure.0]),
+    );
+    send_request(&mut harness.client, lock.surface, 6, &[]);
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(offending, lock.lock_surface);
+    assert_eq!(code, SessionLockSurfaceError::NullBuffer as u32);
+    assert!(message.contains("effective buffer"));
+}
+
+#[test]
+fn session_lock_resize_empty_commit_revalidates_retained_buffer_size() {
+    let mut harness = KeybindingHarness::new(true);
+    let lock = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    harness
+        .server
+        .state
+        .handle_host_input(HostInput::OutputResized {
+            width: 400,
+            height: 300,
+        });
+    let traffic = harness.sync();
+    let resized_serial = traffic
+        .iter()
+        .find_map(|(object, opcode, body)| {
+            (*object == lock.lock_surface && *opcode == 0).then(|| word(body, 0))
+        })
+        .expect("resize configure serial");
+    send_request(
+        &mut harness.client,
+        lock.lock_surface,
+        1,
+        &words(&[resized_serial]),
+    );
+    send_request(&mut harness.client, lock.surface, 6, &[]);
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(offending, lock.lock_surface);
+    assert_eq!(code, SessionLockSurfaceError::DimensionsMismatch as u32);
+    assert!(message.contains("dimensions"));
+}
+
+#[test]
+fn session_lock_previously_empty_committed_surface_is_already_constructed() {
+    let mut harness = KeybindingHarness::new(true);
+    let (_, lock, output) = request_test_session_lock(&mut harness);
+    let surface = harness.allocate_object_id();
+    let lock_surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface]),
+    );
+    send_request(&mut harness.client, surface, 6, &[]);
+    send_request(
+        &mut harness.client,
+        lock,
+        1,
+        &words(&[lock_surface, surface, output]),
+    );
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(offending, lock);
+    assert_eq!(code, SessionLockError::AlreadyConstructed as u32);
+    assert!(message.contains("committed"));
+    assert_eq!(
+        harness
+            .server
+            .state
+            .session_lock_state
+            .locked_output_count(),
+        0
+    );
+}
+
+#[test]
+fn session_lock_prior_null_attach_history_is_already_constructed() {
+    let mut harness = KeybindingHarness::new(true);
+    let (_, lock, output) = request_test_session_lock(&mut harness);
+    let surface = harness.allocate_object_id();
+    let lock_surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface]),
+    );
+    send_request(&mut harness.client, surface, 1, &words(&[0, 0, 0]));
+    send_request(
+        &mut harness.client,
+        lock,
+        1,
+        &words(&[lock_surface, surface, output]),
+    );
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(offending, lock);
+    assert_eq!(code, SessionLockError::AlreadyConstructed as u32);
+    assert!(message.contains("buffer attached"));
+}
+
+#[test]
+fn session_lock_repeated_already_constructed_failures_do_not_grow_output_registry() {
+    let mut harness = KeybindingHarness::new(true);
+    for attempt in 0..3 {
+        while harness.renderer_events.try_recv().is_ok() {}
+        let (mut client, globals) = connect_secondary_client(&mut harness);
+        let (compositor_name, compositor_version) = globals["wl_compositor"];
+        let (output_name, output_version) = globals["wl_output"];
+        let (manager_name, manager_version) = globals["ext_session_lock_manager_v1"];
+        bind_global(
+            &mut client,
+            compositor_name,
+            "wl_compositor",
+            compositor_version.min(5),
+            4,
+        );
+        bind_global(
+            &mut client,
+            output_name,
+            "wl_output",
+            output_version.min(4),
+            5,
+        );
+        bind_global(
+            &mut client,
+            manager_name,
+            "ext_session_lock_manager_v1",
+            manager_version.min(1),
+            6,
+        );
+        send_display_request(&mut client, 0, 7);
+        harness.dispatch_client();
+        let _ = events_until_callback(&mut client, 7);
+        send_request(&mut client, 6, 1, &words(&[8]));
+        send_request(&mut client, 4, 0, &words(&[9]));
+        send_request(&mut client, 9, 6, &[]);
+        send_request(&mut client, 8, 1, &words(&[10, 9, 5]));
+        harness.dispatch_client();
+        let (offending, code, message) = read_protocol_error(&mut client);
+        assert_eq!(offending, 8, "unexpected protocol error: {message}");
+        assert_eq!(
+            code,
+            SessionLockError::AlreadyConstructed as u32,
+            "unexpected protocol error: {message}"
+        );
+        assert_eq!(
+            harness
+                .server
+                .state
+                .session_lock_state
+                .locked_output_count(),
+            0,
+            "failing construction {attempt} left an output registered"
+        );
+        drop(client);
+        pump_protocol_event_loop_until(
+            &mut harness.server,
+            "failed lock client disconnect abort",
+            |state| matches!(state.lock_lifecycle, LockLifecycle::Unlocked),
+        );
+    }
+}
+
+#[test]
+fn session_lock_acked_buffer_maps_in_lock_band_above_overlay() {
+    let mut harness = KeybindingHarness::new(true);
+    let (overlay, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            layer: WlrLayer::Overlay as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    let lock = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    let lock_record = test_lock_record(&harness, lock.surface);
+    assert!(lock_record.mapped);
+    assert_eq!(lock_record.layout.z.band, StackBand::Lock);
+    assert!(
+        test_layer_record(&harness, overlay.surface).layout.z < lock_record.layout.z,
+        "lock band sorts above Overlay"
+    );
+}
+
+#[test]
+fn session_lock_resize_reconfigures_and_applies_on_acked_commit() {
+    let mut harness = KeybindingHarness::new(true);
+    let lock = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    harness
+        .server
+        .state
+        .handle_host_input(HostInput::OutputResized {
+            width: 400,
+            height: 300,
+        });
+    let traffic = harness.sync();
+    let resized = traffic
+        .iter()
+        .find_map(|(object, opcode, body)| {
+            (*object == lock.lock_surface && *opcode == 0)
+                .then(|| (word(body, 0), word(body, 1), word(body, 2)))
+        })
+        .expect("output resize sends a lock configure");
+    assert_eq!((resized.1, resized.2), (400, 300));
+    assert_eq!(
+        (
+            test_lock_record(&harness, lock.surface).layout.width,
+            test_lock_record(&harness, lock.surface).layout.height
+        ),
+        (320.0, 240.0),
+        "new geometry waits for the responding commit"
+    );
+    send_request(
+        &mut harness.client,
+        lock.lock_surface,
+        1,
+        &words(&[resized.0]),
+    );
+    let buffer = harness.create_dmabuf_buffer_sized(400, 300);
+    send_request(
+        &mut harness.client,
+        lock.surface,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, lock.surface, 6, &[]);
+    let _ = harness.sync();
+    let record = test_lock_record(&harness, lock.surface);
+    assert_eq!((record.layout.width, record.layout.height), (400.0, 300.0));
+}
+
+#[test]
+fn session_lock_surface_never_enters_layer_map_or_changes_usable_area() {
+    let mut harness = KeybindingHarness::new(true);
+    let output = harness
+        .server
+        .state
+        .backend
+        .default_output()
+        .expect("nested output");
+    let before = harness.server.state.usable_output_rect();
+    let layer_count = layer_map_for_output(&output).layers().count();
+    let lock = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    assert_eq!(harness.server.state.usable_output_rect(), before);
+    assert_eq!(layer_map_for_output(&output).layers().count(), layer_count);
+}
+
+#[test]
+fn session_lock_stops_normal_publication_and_frame_callbacks() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let normal_id = test_toplevel_record(&harness).id;
+    let lock = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    harness.server.state.events.clear();
+
+    let callback = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_ID,
+        2,
+        &wire_string_argument("private while locked"),
+    );
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        3,
+        &words(&[callback]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    harness.server.state.handle_frame(Vec::new());
+    let traffic = harness.sync();
+    assert!(
+        traffic
+            .iter()
+            .all(|(object, opcode, _)| *object != callback || *opcode != 0)
+    );
+    assert!(harness.server.state.events.iter().all(|event| !matches!(
+        event,
+        ProtocolEvent::SurfaceUpserted { id, .. }
+            | ProtocolEvent::SurfaceRelayout { id, .. }
+            if *id == normal_id
+    )));
+}
+
+#[test]
+fn session_lock_entry_purges_queued_normal_surface_upsert_before_roster() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let normal_id = test_toplevel_record(&harness).id;
+    let queued = harness
+        .server
+        .state
+        .events
+        .iter()
+        .position(
+            |event| matches!(event, ProtocolEvent::SurfaceUpserted { id, .. } if *id == normal_id),
+        )
+        .map(|index| harness.server.state.events.remove(index))
+        .expect("mapped toplevel produced a complete upsert");
+    harness.server.state.events.clear();
+    harness.server.queue_renderer_event(queued);
+    assert!(
+        harness
+            .server
+            .pending_events
+            .surfaces
+            .contains_key(&normal_id)
+    );
+
+    let _ = request_test_session_lock(&mut harness);
+    harness
+        .server
+        .publish_events()
+        .expect("publish lock-entry boundary");
+    let mut published = Vec::new();
+    while let Ok(batch) = harness.renderer_events.try_recv() {
+        published.extend(batch);
+    }
+    assert!(published.iter().all(|event| !matches!(
+        event,
+        ProtocolEvent::SurfaceUpserted { id, .. }
+            | ProtocolEvent::SurfaceRelayout { id, .. }
+            if *id == normal_id
+    )));
+    let security = published
+        .iter()
+        .position(|event| matches!(event, ProtocolEvent::SecurityScene { active: true, .. }))
+        .expect("active security scene was published");
+    let roster = published
+        .iter()
+        .position(|event| matches!(event, ProtocolEvent::SurfaceRoster { .. }))
+        .expect("lock roster was published");
+    assert!(security < roster);
+}
+
+#[test]
+fn session_lock_routes_input_only_to_lock_surfaces() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let pointer = harness.bind_pointer();
+    let lock = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    let child = harness.allocate_object_id();
+    let subsurface = harness.allocate_object_id();
+    send_request(&mut harness.client, TEST_COMPOSITOR_ID, 0, &words(&[child]));
+    send_request(
+        &mut harness.client,
+        TEST_SUBCOMPOSITOR_ID,
+        1,
+        &words(&[subsurface, child, lock.surface]),
+    );
+    send_request(&mut harness.client, subsurface, 1, &words(&[20, 20]));
+    let child_buffer = harness.create_dmabuf_buffer_sized(40, 40);
+    send_request(&mut harness.client, child, 1, &words(&[child_buffer, 0, 0]));
+    send_request(&mut harness.client, child, 6, &[]);
+    send_request(&mut harness.client, lock.surface, 6, &[]);
+    let _ = harness.sync();
+
+    route_pointer_to(&mut harness, 30.0, 30.0);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    harness.key(24, HostButtonState::Pressed);
+    let traffic = harness.sync();
+    assert!(traffic.iter().any(|(object, opcode, body)| {
+        *object == pointer
+            && (*opcode == 2 || (*opcode == 0 && body.len() >= 8 && word(body, 1) == child))
+    }));
+    assert!(keyboard_key_events(&traffic).contains(&(24, 1)));
+    assert_eq!(
+        harness
+            .server
+            .state
+            .keyboard
+            .current_focus()
+            .map(|surface| surface.id().protocol_id()),
+        Some(child)
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .pointer
+            .current_focus()
+            .map(|surface| surface.id().protocol_id()),
+        Some(child)
+    );
+}
+
+#[test]
+fn session_lock_entry_cancels_grabs_popups_dnd_and_touch() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let pointer = harness.bind_pointer();
+    harness.prime_pointer_focus();
+
+    let key_serial = press_test_key_and_serial(&mut harness, 24);
+    let (popup_surface, popup_role) = map_test_popup(&mut harness, Some(key_serial));
+    harness.key(24, HostButtonState::Released);
+    let _ = harness.sync();
+    assert!(harness.server.state.keyboard.is_grabbed());
+
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    let pressed = harness.sync();
+    let pointer_serial = word(&pointer_body(&pressed, pointer, 3), 0);
+    let data_manager = harness.bind_test_global("wl_data_device_manager", 3);
+    let data_device = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        data_manager,
+        1,
+        &words(&[data_device, TEST_SEAT_ID]),
+    );
+    let _ = harness.sync();
+    send_request(
+        &mut harness.client,
+        data_device,
+        0,
+        &words(&[0, TEST_TOPLEVEL_SURFACE_ID, 0, pointer_serial]),
+    );
+    let _ = harness.sync();
+    assert!(harness.server.state.pointer.is_grabbed());
+
+    harness.route(InputEvent::DeviceAdded {
+        device: FakeDevice::Touchscreen,
+    });
+    let touch = harness.allocate_object_id();
+    send_request(&mut harness.client, TEST_SEAT_ID, 2, &words(&[touch]));
+    let _ = harness.sync();
+    harness.route(InputEvent::TouchDown {
+        event: FakeTouchPositionEvent {
+            slot: TouchSlot::from(Some(0)),
+            normalised_x: 0.25,
+            normalised_y: 0.25,
+            time_us: FAKE_EVENT_TIME_US,
+        },
+    });
+    let _ = harness.sync();
+
+    let (_, _, _, entry) = request_test_session_lock_with_traffic(&mut harness);
+    assert!(!harness.server.state.keyboard.is_grabbed());
+    assert!(!harness.server.state.pointer.is_grabbed());
+    assert!(!harness.server.state.surfaces[&popup_surface].mapped);
+    assert!(
+        entry
+            .iter()
+            .any(|(object, opcode, _)| *object == popup_role && *opcode == 1)
+    );
+    assert!(
+        entry
+            .iter()
+            .any(|(object, opcode, _)| *object == touch && *opcode == 4)
+    );
+    assert_eq!(harness.server.state.keyboard.current_focus(), None);
+    assert_eq!(harness.server.state.pointer.current_focus(), None);
+}
+
+#[test]
+fn session_lock_suppresses_ordinary_bindings() {
+    let mut harness = KeybindingHarness::new(true);
+    let lock = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    let _ = harness.sync();
+
+    harness.chord(&[125, 42, 1]);
+    let traffic = harness.sync();
+    assert!(matches!(
+        harness.ecs_actions.try_recv(),
+        Err(TryRecvError::Empty)
+    ));
+    let keys = keyboard_key_events(&traffic);
+    assert!(keys.contains(&(125, 1)));
+    assert!(keys.contains(&(42, 1)));
+    assert!(keys.contains(&(1, 1)));
+    assert!(keys.contains(&(1, 0)));
+}
+
+#[test]
+fn session_lock_blank_only_swallowing_skips_hidden_compositor_chrome() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let close = chrome_button_point(&harness, CaptionButton::Close);
+    let _ = request_test_session_lock(&mut harness);
+    assert!(matches!(
+        harness.server.state.lock_lifecycle,
+        LockLifecycle::Locking { .. }
+    ));
+    assert!(
+        harness
+            .server
+            .state
+            .pointer_target_at(close.0, close.1)
+            .is_none()
+    );
+
+    route_pointer_to(&mut harness, close.0, close.1);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let traffic = harness.sync();
+    assert!(
+        traffic
+            .iter()
+            .all(|(object, opcode, _)| *object != TEST_TOPLEVEL_ID || *opcode != 1),
+        "hidden close button must not dispatch xdg_toplevel.close: {traffic:?}"
+    );
+    assert!(harness.server.state.chrome_pointer_grab.is_none());
+    assert!(harness.server.state.interactive_pointer.is_none());
+    assert_eq!(harness.server.state.chrome_cursor_override, None);
+    assert!(matches!(
+        harness.server.state.cursor_selection,
+        CursorSelection::Hidden
+    ));
+}
+
+#[test]
+fn session_lock_foreign_handles_close_hide_and_reannounce_same_ids() {
+    let mut harness = KeybindingHarness::new(true);
+    let manager = harness.bind_test_global("ext_foreign_toplevel_list_v1", 1);
+    map_initial_test_toplevel(&mut harness);
+    let initial = harness.sync();
+    let (handle, identifier) = test_foreign_announcement(&initial, manager);
+
+    let (_, lock_object, output, entry) = request_test_session_lock_with_traffic(&mut harness);
+    assert!(
+        entry
+            .iter()
+            .any(|(object, opcode, _)| *object == handle && *opcode == 0)
+    );
+    let late_manager = harness.bind_test_global("ext_foreign_toplevel_list_v1", 1);
+    let hidden = harness.sync();
+    assert!(
+        hidden
+            .iter()
+            .all(|(object, opcode, _)| *object != late_manager || *opcode != 0)
+    );
+
+    let (surface, lock_surface, configure, _) =
+        create_test_lock_surface(&mut harness, lock_object, output);
+    let lock = TestSessionLock {
+        lock: lock_object,
+        surface,
+        lock_surface,
+        configure,
+    };
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    present_test_security_epoch(&mut harness, lock.lock);
+    let unlocked = unlock_test_session(&mut harness, lock);
+    let (_, first_reannounced) = test_foreign_announcement(&unlocked, manager);
+    let (_, late_reannounced) = test_foreign_announcement(&unlocked, late_manager);
+    assert_eq!(first_reannounced, identifier);
+    assert_eq!(late_reannounced, identifier);
+}
+
+#[test]
+fn session_lock_physical_input_still_resets_idle() {
+    let mut harness = KeybindingHarness::new(true);
+    let lock = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    present_test_security_epoch(&mut harness, lock.lock);
+    let notifier = harness.bind_test_global("ext_idle_notifier_v1", 2);
+    let notification = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        notifier,
+        1,
+        &words(&[notification, 0, TEST_SEAT_ID]),
+    );
+    harness.dispatch_client();
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(10)), &mut harness.server.state)
+        .expect("locked idle deadline dispatches");
+    assert!(
+        harness
+            .sync()
+            .iter()
+            .any(|(object, opcode, _)| *object == notification && *opcode == 0)
+    );
+
+    harness.route(InputEvent::PointerMotionAbsolute {
+        event: FakeAbsoluteEvent {
+            normalised_x: 0.5,
+            normalised_y: 0.5,
+        },
+    });
+    let resumed = harness.sync();
+    assert!(
+        resumed
+            .iter()
+            .any(|(object, opcode, _)| *object == notification && *opcode == 1)
+    );
+}
+
+#[test]
+fn session_lock_unlock_restores_scene_focus_input_and_frames() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let normal = test_toplevel_record(&harness).role.wl_surface().clone();
+    let normal_id = test_toplevel_record(&harness).id;
+    let pointer = harness.bind_pointer();
+    let callback = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        3,
+        &words(&[callback]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+
+    let lock = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    present_test_security_epoch(&mut harness, lock.lock);
+    harness.server.state.handle_frame(Vec::new());
+    assert!(
+        harness
+            .sync()
+            .iter()
+            .all(|(object, opcode, _)| *object != callback || *opcode != 0)
+    );
+
+    harness.server.state.events.clear();
+    while harness.renderer_events.try_recv().is_ok() {}
+    let _ = unlock_test_session(&mut harness, lock);
+    harness
+        .server
+        .publish_events()
+        .expect("publish unlock restoration");
+    let mut restored_events = Vec::new();
+    while let Ok(batch) = harness.renderer_events.try_recv() {
+        restored_events.extend(batch);
+    }
+    assert!(restored_events.iter().any(|event| matches!(
+        event,
+        ProtocolEvent::SurfaceUpserted { id, .. } if *id == normal_id
+    )));
+    assert_eq!(harness.server.state.keyboard.current_focus(), Some(normal));
+    assert!(
+        restored_events
+            .iter()
+            .any(|event| matches!(event, ProtocolEvent::SecurityScene { active: false, .. }))
+    );
+    assert!(restored_events.iter().any(|event| matches!(
+        event,
+        ProtocolEvent::SurfaceRoster { mapped } if mapped.contains(&normal_id)
+    )));
+    let restored_layout = test_toplevel_record(&harness).layout;
+    route_pointer_to(
+        &mut harness,
+        f64::from(restored_layout.x + 5.0),
+        f64::from(restored_layout.y + 5.0),
+    );
+    let pointer_traffic = harness.sync();
+    assert!(pointer_traffic.iter().any(|(object, opcode, body)| {
+        *object == pointer
+            && (*opcode == 2
+                || (*opcode == 0 && body.len() >= 8 && word(body, 1) == TEST_TOPLEVEL_SURFACE_ID))
+    }));
+    assert_eq!(
+        harness
+            .server
+            .state
+            .pointer
+            .current_focus()
+            .map(|surface| surface.id().protocol_id()),
+        Some(TEST_TOPLEVEL_SURFACE_ID)
+    );
+    harness.server.state.handle_frame(Vec::new());
+    assert!(
+        harness
+            .sync()
+            .iter()
+            .any(|(object, opcode, _)| *object == callback && *opcode == 0)
+    );
+}
+
+#[test]
+fn session_lock_illegal_destruction_is_protocol_error() {
+    let mut harness = KeybindingHarness::new(true);
+    let lock = begin_test_session_lock(&mut harness);
+    present_test_security_epoch(&mut harness, lock.lock);
+    send_request(&mut harness.client, lock.lock, 0, &[]);
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(offending, lock.lock);
+    assert_eq!(code, SessionLockError::InvalidDestroy as u32);
+    assert!(message.contains("locked"));
+}
+
+#[test]
+fn session_lock_destroyed_during_locking_aborts_and_ignores_late_completion() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let normal_id = test_toplevel_record(&harness).id;
+    let (_, lock, _) = request_test_session_lock(&mut harness);
+    let (epoch, output) = match &harness.server.state.lock_lifecycle {
+        LockLifecycle::Locking {
+            presentation_epoch,
+            pending_outputs,
+            ..
+        } => (
+            *presentation_epoch,
+            pending_outputs
+                .iter()
+                .next()
+                .expect("nested output")
+                .clone(),
+        ),
+        _ => panic!("lock request entered Locking"),
+    };
+    harness.server.state.events.clear();
+    send_request(&mut harness.client, lock, 0, &[]);
+    let _ = harness.sync();
+    assert!(matches!(
+        harness.server.state.lock_lifecycle,
+        LockLifecycle::Unlocked
+    ));
+    assert!(
+        harness
+            .server
+            .state
+            .events
+            .iter()
+            .any(|event| matches!(event, ProtocolEvent::SecurityScene { active: false, .. }))
+    );
+    harness
+        .server
+        .publish_events()
+        .expect("publish pre-locked abort restoration");
+    let mut restored = Vec::new();
+    while let Ok(batch) = harness.renderer_events.try_recv() {
+        restored.extend(batch);
+    }
+    assert!(restored.iter().any(|event| matches!(
+        event,
+        ProtocolEvent::SurfaceUpserted { id, .. } if *id == normal_id
+    )));
+
+    harness
+        .commands
+        .send(ProtocolCommand::SecurityPresented {
+            presentation_epoch: epoch,
+            output,
+        })
+        .expect("inject stale renderer completion");
+    harness
+        .server
+        .dispatch_cycle(Some(EVENT_LOOP_PUMP_TIMEOUT))
+        .expect("dispatch stale completion");
+    assert!(matches!(
+        harness.server.state.lock_lifecycle,
+        LockLifecycle::Unlocked
+    ));
+}
+
+#[test]
+fn session_lock_aborted_generation_releases_output_without_stale_destructor_aliasing() {
+    let mut harness = KeybindingHarness::new(true);
+    let (manager, old_lock, output) = request_test_session_lock(&mut harness);
+    let (_old_surface, old_lock_surface, _, _) =
+        create_test_lock_surface(&mut harness, old_lock, output);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .session_lock_state
+            .locked_output_count(),
+        1
+    );
+
+    send_request(&mut harness.client, old_lock, 0, &[]);
+    let _ = harness.sync();
+    assert!(matches!(
+        harness.server.state.lock_lifecycle,
+        LockLifecycle::Unlocked
+    ));
+    assert_eq!(
+        harness
+            .server
+            .state
+            .session_lock_state
+            .locked_output_count(),
+        0
+    );
+
+    let new_lock = harness.allocate_object_id();
+    send_request(&mut harness.client, manager, 1, &words(&[new_lock]));
+    let traffic = harness.sync();
+    assert!(
+        traffic
+            .iter()
+            .all(|(object, opcode, _)| *object != new_lock || *opcode != 1),
+        "retry lock is accepted: {traffic:?}"
+    );
+    let (_new_surface, _new_lock_surface, _, _) =
+        create_test_lock_surface(&mut harness, new_lock, output);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .session_lock_state
+            .locked_output_count(),
+        1
+    );
+    present_test_security_epoch(&mut harness, new_lock);
+
+    send_request(&mut harness.client, old_lock_surface, 0, &[]);
+    let _ = harness.sync();
+    assert_eq!(
+        harness
+            .server
+            .state
+            .session_lock_state
+            .locked_output_count(),
+        1,
+        "the old surface destructor preserves the new generation's entry"
+    );
+
+    let duplicate_surface = harness.allocate_object_id();
+    let duplicate_lock_surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[duplicate_surface]),
+    );
+    send_request(
+        &mut harness.client,
+        new_lock,
+        1,
+        &words(&[duplicate_lock_surface, duplicate_surface, output]),
+    );
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(offending, new_lock);
+    assert_eq!(code, SessionLockError::DuplicateOutput as u32);
+    assert!(message.contains("already locked"));
+}
+
+#[test]
+fn session_lock_valid_unlock_clears_vendor_output_registry() {
+    let mut harness = KeybindingHarness::new(true);
+    let (manager, lock, output) = request_test_session_lock(&mut harness);
+    let (surface, lock_surface, configure, _) =
+        create_test_lock_surface(&mut harness, lock, output);
+    let first = TestSessionLock {
+        lock,
+        surface,
+        lock_surface,
+        configure,
+    };
+    present_test_security_epoch(&mut harness, lock);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .session_lock_state
+            .locked_output_count(),
+        1
+    );
+    let _ = unlock_test_session(&mut harness, first);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .session_lock_state
+            .locked_output_count(),
+        0
+    );
+
+    let retry = harness.allocate_object_id();
+    send_request(&mut harness.client, manager, 1, &words(&[retry]));
+    let traffic = harness.sync();
+    assert!(
+        traffic
+            .iter()
+            .all(|(object, opcode, _)| *object != retry || *opcode != 1),
+        "lock after valid unlock is accepted: {traffic:?}"
+    );
+    let _ = create_test_lock_surface(&mut harness, retry, output);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .session_lock_state
+            .locked_output_count(),
+        1
+    );
+}
+
+#[test]
+fn session_lock_destroyed_surface_leaves_opaque_blank() {
+    let mut harness = KeybindingHarness::new(true);
+    let lock = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    present_test_security_epoch(&mut harness, lock.lock);
+    let object = test_lock_record(&harness, lock.surface)
+        .role
+        .wl_surface()
+        .id();
+    harness.server.state.events.clear();
+    send_request(&mut harness.client, lock.lock_surface, 0, &[]);
+    let _ = harness.sync();
+    let record = &harness.server.state.surfaces[&object];
+    assert!(!record.mapped);
+    assert!(matches!(record.role, SurfaceRole::Dormant(_)));
+    assert!(matches!(
+        harness.server.state.lock_lifecycle,
+        LockLifecycle::Locked { .. }
+    ));
+    assert!(harness.server.state.session_lock_active());
+    assert!(harness.server.state.mapped_surface_ids().is_empty());
+}
+
+#[test]
+fn session_lock_owner_death_orphans_after_locked_and_aborts_before_locked() {
+    let mut locked = KeybindingHarness::new(true);
+    let lock = begin_test_session_lock(&mut locked);
+    ack_and_map_test_lock_surface(&mut locked, lock);
+    present_test_security_epoch(&mut locked, lock.lock);
+    disconnect_test_client(&mut locked);
+    assert!(matches!(
+        locked.server.state.lock_lifecycle,
+        LockLifecycle::OrphanedLocked { .. }
+    ));
+    assert!(locked.server.state.session_lock_active());
+    assert!(locked.server.state.mapped_surface_ids().is_empty());
+
+    let mut locking = KeybindingHarness::new(true);
+    let _ = request_test_session_lock(&mut locking);
+    locking.server.state.events.clear();
+    disconnect_test_client(&mut locking);
+    assert!(matches!(
+        locking.server.state.lock_lifecycle,
+        LockLifecycle::Unlocked
+    ));
+    assert!(!locking.server.state.session_lock_active());
+    let mut saw_blank_removed = false;
+    while let Ok(batch) = locking.renderer_events.try_recv() {
+        saw_blank_removed |= batch
+            .iter()
+            .any(|event| matches!(event, ProtocolEvent::SecurityScene { active: false, .. }));
+    }
+    assert!(saw_blank_removed);
 }

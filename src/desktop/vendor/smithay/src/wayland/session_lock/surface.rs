@@ -7,7 +7,7 @@ use crate::wayland::compositor;
 use _session_lock::ext_session_lock_surface_v1::{Error, ExtSessionLockSurfaceV1, Request};
 use wayland_protocols::ext::session_lock::v1::server::{self as _session_lock, ext_session_lock_surface_v1};
 use wayland_server::protocol::wl_surface::WlSurface;
-use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, Resource, Weak};
+use wayland_server::{backend::ClientId, Client, DataInit, Dispatch, DisplayHandle, Resource, Weak};
 
 use crate::wayland::session_lock::{SessionLockHandler, SessionLockManagerState};
 
@@ -60,6 +60,20 @@ where
             _ => unreachable!(),
         }
     }
+
+    fn destroyed(
+        state: &mut D,
+        _client: ClientId,
+        lock_surface: &ExtSessionLockSurfaceV1,
+        data: &ExtLockSurfaceUserData,
+    ) {
+        state.lock_state().remove_lock_surface(lock_surface);
+        // cosmix addition: notify the compositor when the protocol role object
+        // disappears so its physical-output ownership map cannot stay stale.
+        if let Ok(surface) = data.surface.upgrade() {
+            state.lock_surface_destroyed(surface);
+        }
+    }
 }
 
 /// Attributes for ext-session-lock surfaces.
@@ -85,6 +99,12 @@ pub struct LockSurfaceAttributes {
 
     /// Holds the current state of the layer after a successful commit.
     pub current: LockSurfaceState,
+
+    /// The effective wl_surface buffer retained across empty commits.
+    // cosmix addition: SurfaceAttributes is compositor-consumed after commit,
+    // so Smithay needs its own ledger to revalidate a retained buffer after a
+    // newly acknowledged resize.
+    pub(crate) effective_buffer: Option<wayland_server::protocol::wl_buffer::WlBuffer>,
 }
 
 impl LockSurfaceAttributes {
@@ -96,6 +116,7 @@ impl LockSurfaceAttributes {
             pending_configures: vec![],
             last_acked: None,
             current: Default::default(),
+            effective_buffer: None,
         }
     }
 
@@ -163,6 +184,14 @@ impl LockSurface {
     /// You can manipulate the client's state using
     /// [`LockSurface::with_pending_state`].
     pub fn send_configure(&self) {
+        let _ = self.send_configure_with_serial();
+    }
+
+    /// Send a configure and return the serial queued for the client.
+    ///
+    // cosmix addition: lets one compositor-side configure ledger record the
+    // ext-session-lock serial without reaching into Smithay's private queue.
+    pub fn send_configure_with_serial(&self) -> Option<Serial> {
         compositor::with_states(&self.surface, |states| {
             // Get surface attributes.
             let attributes = states.data_map.get::<Mutex<LockSurfaceAttributes>>();
@@ -171,7 +200,7 @@ impl LockSurface {
             // Create our new configure event.
             let pending = match self.get_pending_state(&mut attributes) {
                 Some(pending) => pending,
-                None => return,
+                None => return None,
             };
             let configure = LockSurfaceConfigure::new(pending);
 
@@ -184,6 +213,8 @@ impl LockSurface {
 
             // Send configure to the client.
             self.shell_surface.configure(serial.into(), width, height);
+
+            Some(serial)
         })
     }
 

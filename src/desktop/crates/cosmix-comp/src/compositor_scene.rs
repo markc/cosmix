@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use bevy::{
@@ -22,8 +22,8 @@ use smithay::reexports::wayland_server::backend::ObjectId;
 use crate::protocol::SurfaceStackKey;
 use crate::protocol::{
     ChromeCursorIcon, ClientSceneFeed, CursorImage, CursorPositionSnapshot, CursorPresentation,
-    DmabufUseId, MAX_GLOBAL_SURFACES, ProtocolEvent, SceneSurfaceKind, ShmFrame, SurfaceFrame,
-    SurfaceId, SurfaceLayout, SurfaceSceneSnapshot, SurfaceTransform,
+    DmabufUseId, MAX_GLOBAL_SURFACES, ProtocolEvent, SceneSurfaceKind, ShmFrame, StackBand,
+    SurfaceFrame, SurfaceId, SurfaceLayout, SurfaceSceneSnapshot, SurfaceTransform,
 };
 use crate::{
     client_surface_material::{
@@ -39,6 +39,7 @@ use crate::{
 pub(crate) const CLIENT_CONTENT_Z_MIN: f32 = 0.0;
 pub(crate) const CLIENT_CONTENT_Z_MAX: f32 = 900.0;
 const CURSOR_Z: f32 = 950.0;
+const LOCK_BLANK_FALLBACK_Z: f32 = 925.0;
 const DEFAULT_CURSOR_WIDTH: u32 = 16;
 const DEFAULT_CURSOR_HEIGHT: u32 = 20;
 const DEFAULT_CURSOR_MASTER_SCALE: u32 = 3;
@@ -213,6 +214,8 @@ pub(crate) enum SceneCursorMode {
 impl Plugin for CompositorScenePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SurfaceEntities>()
+            .init_resource::<NestedSecurityPresentation>()
+            .init_resource::<LockBlankScene>()
             .init_resource::<ClientSamplingContractLog>()
             .init_resource::<DecorationStartup>()
             .insert_resource(LogicalCanvasSize(self.initial_canvas))
@@ -301,6 +304,60 @@ pub(crate) struct LogicalCanvasSize(pub(crate) Vec2);
 /// unsnapped logical coordinates.
 #[derive(Resource)]
 pub(crate) struct RendererOutputScale120(pub(crate) u32);
+
+/// Security epochs awaiting the nested renderer's actual post-present seam.
+///
+/// The Arc is shared with the render world because the render system, not a
+/// main-world schedule phase, owns swapchain presentation and GPU completion.
+#[derive(Clone, Resource, Default)]
+pub(crate) struct NestedSecurityPresentation {
+    pending: Arc<Mutex<Vec<(u64, String)>>>,
+}
+
+impl NestedSecurityPresentation {
+    pub(crate) fn publish(&self, epoch: u64, outputs: impl IntoIterator<Item = String>) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for output in outputs {
+            let item = (epoch, output);
+            if !pending.contains(&item) {
+                pending.push(item);
+            }
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<(u64, String)> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn complete(&self, completed: &[(u64, String)]) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.retain(|item| !completed.contains(item));
+    }
+
+    pub(crate) fn clear(&self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+}
+
+#[derive(Resource, Default)]
+struct LockBlankScene {
+    entity: Option<Entity>,
+}
+
+#[derive(Component)]
+struct LockBlank;
 
 #[derive(Resource, Default)]
 pub(crate) struct SurfaceEntities {
@@ -535,6 +592,11 @@ fn apply_protocol_events(world: &mut World, events: Vec<ProtocolEvent>) {
     let mut z_ranks_dirty = false;
     for event in events {
         match event {
+            ProtocolEvent::SecurityScene {
+                active,
+                presentation_epoch,
+                presentation_outputs,
+            } => apply_security_scene(world, active, presentation_epoch, presentation_outputs),
             ProtocolEvent::OutputResized { width, height } => {
                 resize_compositor_logical_canvas(world, width, height);
             }
@@ -581,6 +643,85 @@ fn apply_protocol_events(world: &mut World, events: Vec<ProtocolEvent>) {
     }
     if z_ranks_dirty {
         recompute_surface_z_ranks(world);
+    }
+    refresh_lock_blank(world);
+}
+
+fn apply_security_scene(
+    world: &mut World,
+    active: bool,
+    presentation_epoch: Option<u64>,
+    presentation_outputs: Vec<String>,
+) {
+    if active {
+        let canvas = world.resource::<LogicalCanvasSize>().0;
+        let existing = world.resource::<LockBlankScene>().entity;
+        let entity = existing
+            .filter(|entity| world.get_entity(*entity).is_ok())
+            .unwrap_or_else(|| {
+                world
+                    .spawn((
+                        LockBlank,
+                        Sprite::from_color(Color::BLACK, canvas),
+                        Transform::from_xyz(0.0, 0.0, LOCK_BLANK_FALLBACK_Z),
+                    ))
+                    .id()
+            });
+        world.resource_mut::<LockBlankScene>().entity = Some(entity);
+        if let Some(epoch) = presentation_epoch {
+            world
+                .resource::<NestedSecurityPresentation>()
+                .publish(epoch, presentation_outputs);
+        }
+        return;
+    }
+
+    let entity = world.resource_mut::<LockBlankScene>().entity.take();
+    if let Some(entity) = entity
+        && let Ok(entity) = world.get_entity_mut(entity)
+    {
+        entity.despawn();
+    }
+    world.resource::<NestedSecurityPresentation>().clear();
+}
+
+fn refresh_lock_blank(world: &mut World) {
+    let Some(entity) = world
+        .get_resource::<LockBlankScene>()
+        .and_then(|blank| blank.entity)
+    else {
+        return;
+    };
+    let canvas = world.resource::<LogicalCanvasSize>().0;
+    let (highest_client, lowest_lock) = {
+        let surfaces = world.resource::<SurfaceEntities>();
+        let highest_client = surfaces
+            .surfaces
+            .values()
+            .filter(|surface| surface.layout.z.band != StackBand::Lock)
+            .map(|surface| surface.renderer_z)
+            .max_by(f32::total_cmp);
+        let lowest_lock = surfaces
+            .surfaces
+            .values()
+            .filter(|surface| surface.layout.z.band == StackBand::Lock)
+            .map(|surface| surface.renderer_z)
+            .min_by(f32::total_cmp);
+        (highest_client, lowest_lock)
+    };
+    let z = match (highest_client, lowest_lock) {
+        (Some(client), Some(lock)) => client + (lock - client) / 2.0,
+        (None, Some(lock)) => lock - 1.0,
+        (Some(_), None) => LOCK_BLANK_FALLBACK_Z,
+        (None, None) => LOCK_BLANK_FALLBACK_Z,
+    };
+    if let Ok(mut blank) = world.get_entity_mut(entity) {
+        if let Some(mut sprite) = blank.get_mut::<Sprite>() {
+            sprite.custom_size = Some(canvas);
+        }
+        if let Some(mut transform) = blank.get_mut::<Transform>() {
+            transform.translation = Vec3::new(0.0, 0.0, z);
+        }
     }
 }
 
@@ -1220,6 +1361,7 @@ fn resize_compositor_logical_canvas(world: &mut World, width: u32, height: u32) 
         mark_decoration_dirty(world, id);
     }
     refresh_cursor_entity(world);
+    refresh_lock_blank(world);
 }
 
 #[cfg(test)]

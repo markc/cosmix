@@ -226,6 +226,7 @@ impl CompositorHandler for WaylandState {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        self.committed_surfaces.insert(surface.id());
         // Smithay invokes this handler only when a transaction is applied.
         // Synchronized-child commits remain counted while cached under their
         // parent, then reset here when the parent makes them current.
@@ -339,6 +340,7 @@ impl CompositorHandler for WaylandState {
                             .then_some(popup.clone()),
                         SurfaceRole::Toplevel(_)
                         | SurfaceRole::Layer(_)
+                        | SurfaceRole::LockSurface(_)
                         | SurfaceRole::Subsurface { .. }
                         | SurfaceRole::Dormant(_) => None,
                     })
@@ -395,6 +397,9 @@ impl CompositorHandler for WaylandState {
                     }
                     SurfaceRole::Popup(popup) => Some(ConfigureTarget::Popup(popup.clone())),
                     SurfaceRole::Layer(role) => Some(ConfigureTarget::Layer(role.surface.clone())),
+                    SurfaceRole::LockSurface(role) => {
+                        Some(ConfigureTarget::Lock(role.surface.clone()))
+                    }
                     SurfaceRole::Subsurface { .. } | SurfaceRole::Dormant(_) => None,
                 });
         if configure_target.is_some() && !layer_restarts_configure_cycle {
@@ -421,6 +426,7 @@ impl CompositorHandler for WaylandState {
             }
         }
         self.apply_acked_layer_state(surface);
+        self.apply_acked_lock_state(surface);
         self.apply_committed_toplevel_state(surface, scene_commit);
 
         if self.commit_cursor_surface(
@@ -446,6 +452,10 @@ impl CompositorHandler for WaylandState {
             }
             return;
         }
+        let publish_surface = self
+            .surfaces
+            .get(&surface.id())
+            .is_some_and(|record| self.surface_is_renderer_presentable(record));
 
         match buffer {
             Some(BufferAssignment::NewBuffer(buffer)) => {
@@ -546,10 +556,12 @@ impl CompositorHandler for WaylandState {
                                 record.layout.y - old_origin.1,
                             );
                             let record_id = record.id;
-                            self.events.push(ProtocolEvent::SurfaceRelayout {
-                                id: record.id,
-                                scene: record.scene_snapshot(),
-                            });
+                            if publish_surface {
+                                self.events.push(ProtocolEvent::SurfaceRelayout {
+                                    id: record.id,
+                                    scene: record.scene_snapshot(),
+                                });
+                            }
                             if delta != (0.0, 0.0) {
                                 self.shift_surface_descendants(record_id, delta);
                             }
@@ -596,9 +608,16 @@ impl CompositorHandler for WaylandState {
             .surfaces
             .get(&surface.id())
             .is_some_and(|record| matches!(record.role, SurfaceRole::Layer(_)));
+        let is_lock = self
+            .surfaces
+            .get(&surface.id())
+            .is_some_and(|record| matches!(record.role, SurfaceRole::LockSurface(_)));
         let layer_focus_policy_changed = self.sync_committed_layer_focus_policy(surface);
         if is_layer && (mapped_before != mapped_after || layer_focus_policy_changed) {
             self.arbitrate_keyboard_focus(None, false, false);
+        }
+        if is_lock && mapped_before != mapped_after {
+            self.arbitrate_keyboard_focus(Some(surface.clone()), false, true);
         }
         self.sync_foreign_toplevel(surface);
     }
@@ -611,6 +630,8 @@ impl CompositorHandler for WaylandState {
     fn destroyed(&mut self, surface: &WlSurface) {
         let former_root = self.toplevel_root_for_surface(surface);
         self.buffer_history_surfaces.remove(&surface.id());
+        self.attach_history_surfaces.remove(&surface.id());
+        self.committed_surfaces.remove(&surface.id());
         self.warned_unsupported_surfaces.remove(&surface.id());
         self.damage_requests_since_apply.remove(&surface.id());
         self.remove_subsurface_topology(surface);
@@ -963,6 +984,7 @@ impl XdgShellHandler for WaylandState {
     }
 
     fn title_changed(&mut self, surface: ToplevelSurface) {
+        let publish = !self.session_lock_active();
         let title = compositor::with_states(surface.wl_surface(), |states| {
             states
                 .data_map
@@ -982,7 +1004,7 @@ impl XdgShellHandler for WaylandState {
                     return None;
                 }
                 record.title = title;
-                record.mapped.then(|| ProtocolEvent::SurfaceRelayout {
+                (record.mapped && publish).then(|| ProtocolEvent::SurfaceRelayout {
                     id: record.id,
                     scene: record.scene_snapshot(),
                 })
@@ -1439,6 +1461,233 @@ impl XdgShellHandler for WaylandState {
     }
 }
 
+impl SessionLockHandler for WaylandState {
+    fn lock_state(&mut self) -> &mut SessionLockManagerState {
+        &mut self.session_lock_state
+    }
+
+    fn lock(&mut self, confirmation: SessionLocker) {
+        self.begin_session_lock(confirmation);
+    }
+
+    fn unlock(&mut self) {
+        self.leave_session_lock();
+    }
+
+    fn new_surface(
+        &mut self,
+        _surface: LockSurface,
+        _output_resource: wl_output_protocol::WlOutput,
+    ) {
+        unreachable!("vendored Smithay must retain the originating lock resource");
+    }
+
+    fn lock_object_may_create_surface(&self, lock: &ExtSessionLockV1) -> bool {
+        match &self.lock_lifecycle {
+            LockLifecycle::Locking { lock_resource, .. }
+            | LockLifecycle::Locked { lock_resource, .. } => lock_resource == lock,
+            LockLifecycle::Unlocked | LockLifecycle::OrphanedLocked { .. } => false,
+        }
+    }
+
+    fn lock_surface_already_constructed(&self, surface: &WlSurface) -> bool {
+        self.attach_history_surfaces.contains(&surface.id())
+            || self.committed_surfaces.contains(&surface.id())
+    }
+
+    fn new_surface_for_lock(
+        &mut self,
+        originating_lock: ExtSessionLockV1,
+        surface: LockSurface,
+        output_resource: wl_output_protocol::WlOutput,
+    ) {
+        let Some(output) = self.backend.output_from_resource(&output_resource) else {
+            return;
+        };
+        let Some(client_id) = surface.wl_surface().client().map(|client| client.id()) else {
+            return;
+        };
+        let Some((owner, generation, lock_resource)) = (match &self.lock_lifecycle {
+            LockLifecycle::Locking {
+                owner,
+                generation,
+                lock_resource,
+                ..
+            }
+            | LockLifecycle::Locked {
+                owner,
+                generation,
+                lock_resource,
+            } => Some((owner.clone(), *generation, lock_resource.clone())),
+            LockLifecycle::Unlocked | LockLifecycle::OrphanedLocked { .. } => None,
+        }) else {
+            return;
+        };
+        if owner != client_id {
+            return;
+        }
+        if lock_resource != originating_lock {
+            originating_lock.post_error(
+                SessionLockError::InvalidUnlock,
+                "lock surface did not originate from the active lock object",
+            );
+            return;
+        }
+
+        let output_name = output.name();
+        if self.lock_surfaces_by_output.contains_key(&output_name) {
+            lock_resource.post_error(
+                SessionLockError::DuplicateOutput,
+                "physical output already has a lock surface",
+            );
+            return;
+        }
+        let (x, y, width, height) = self.backend.logical_output_rect();
+        let size = (width, height);
+        surface.with_pending_state(|state| {
+            state.size = Some(size.into());
+        });
+        let z = self.allocate_stack_key(StackBand::Lock);
+        let layout = SurfaceLayout {
+            x: x as f32,
+            y: y as f32,
+            width: width as f32,
+            height: height as f32,
+            z,
+            source: None,
+            parent: None,
+            transform: SurfaceTransform::Normal,
+            visible: false,
+            toplevel: None,
+        };
+        let role = LockSurfaceRole {
+            surface: surface.clone(),
+            output: output.clone(),
+            lock_generation: generation,
+        };
+        let surface_object = surface.wl_surface().id();
+        let id = if let Some(record) = self.surfaces.get_mut(&surface_object) {
+            let id = record.id;
+            record.role = SurfaceRole::LockSurface(role);
+            record.mapped = false;
+            record.layout = layout;
+            record.title = None;
+            record.window_origin = (layout.x, layout.y);
+            record.configured_size = (width as i32, height as i32);
+            record.required_configure = None;
+            record.last_acked_configure = None;
+            record.last_acked_size = None;
+            record.decoration_object_bound = false;
+            record.committed_decoration = SceneDecorationMode::Unbound;
+            record.requested_maximized = false;
+            record.committed_maximized = false;
+            record.normal_restore = None;
+            record.pending_window_state = None;
+            record.configured_window_states.clear();
+            record.minimized = false;
+            record.focused = false;
+            record.committed_window_geometry = None;
+            record.committed_window_geometry_explicit = false;
+            record.pending_popup_reposition = None;
+            record.parent_association_committed = true;
+            id
+        } else {
+            let id = SurfaceId(self.next_surface_id);
+            self.next_surface_id = self.next_surface_id.saturating_add(1);
+            self.surfaces.insert(
+                surface_object.clone(),
+                SurfaceRecord {
+                    id,
+                    role: SurfaceRole::LockSurface(role),
+                    mapped: false,
+                    layout,
+                    title: None,
+                    window_origin: (layout.x, layout.y),
+                    configured_size: (width as i32, height as i32),
+                    commit_count: 0,
+                    shm_backing: None,
+                    dmabuf_backing: None,
+                    buffer_dimensions: None,
+                    required_configure: None,
+                    last_acked_configure: None,
+                    last_acked_size: None,
+                    decoration_object_bound: false,
+                    committed_decoration: SceneDecorationMode::Unbound,
+                    requested_maximized: false,
+                    committed_maximized: false,
+                    normal_restore: None,
+                    pending_window_state: None,
+                    configured_window_states: Vec::new(),
+                    minimized: false,
+                    focused: false,
+                    chrome_pointer: ChromePointerSceneState::default(),
+                    committed_window_geometry: None,
+                    committed_window_geometry_explicit: false,
+                    pending_popup_reposition: None,
+                    parent_association_committed: true,
+                    committed_input_region: None,
+                    pixel_probe_logged: false,
+                    logged_diagnostics: HashSet::new(),
+                },
+            );
+            self.surface_objects.insert(id, surface_object.clone());
+            id
+        };
+        self.committed_surface_stacks
+            .insert(surface_object.clone(), vec![surface_object.clone()]);
+        self.lock_surfaces_by_output
+            .insert(output_name, surface_object);
+        self.backend.output_enter(surface.wl_surface());
+        let serial = self
+            .send_lock_configure(surface.wl_surface())
+            .expect("new lock surface has an immediate configure");
+        tracing::info!(
+            surface_id = id.0,
+            ?serial,
+            generation,
+            "new lock surface configured"
+        );
+    }
+
+    fn ack_configure(&mut self, surface: WlSurface, configure: LockSurfaceConfigure) {
+        let Some(record) = self.surfaces.get_mut(&surface.id()) else {
+            return;
+        };
+        if !matches!(record.role, SurfaceRole::LockSurface(_)) {
+            return;
+        }
+        record.last_acked_configure = Some(configure.serial);
+        record.last_acked_size = configure
+            .state
+            .size
+            .map(|size| (size.w as i32, size.h as i32));
+    }
+
+    fn lock_surface_destroyed(&mut self, surface: WlSurface) {
+        let output = self.surfaces.get(&surface.id()).and_then(|record| {
+            let SurfaceRole::LockSurface(role) = &record.role else {
+                return None;
+            };
+            Some(role.output.name())
+        });
+        if let Some(output) = output {
+            self.lock_surfaces_by_output.remove(&output);
+            self.deactivate_surface_role(&surface);
+        }
+    }
+
+    fn lock_destroyed(&mut self, lock: ExtSessionLockV1) {
+        let abort = matches!(
+            &self.lock_lifecycle,
+            LockLifecycle::Locking { lock_resource, .. } if lock_resource == &lock
+        );
+        if abort {
+            self.abort_locking_after_owner_death(&lock);
+            tracing::info!("session-lock object destroyed during Locking; lock aborted");
+        }
+    }
+}
+
 impl ShmHandler for WaylandState {
     fn shm_state(&self) -> &ShmState {
         &self.shm_state
@@ -1545,7 +1794,9 @@ impl SeatHandler for WaylandState {
         set_data_device_focus(
             &self.display_handle,
             seat,
-            focused.and_then(|surface| surface.client()),
+            (!self.session_lock_active())
+                .then(|| focused.and_then(|surface| surface.client()))
+                .flatten(),
         );
         let toplevels = self
             .surfaces
@@ -1825,6 +2076,9 @@ impl Dispatch<wl_surface::WlSurface, SurfaceUserData> for WaylandState {
                 DamageCapAction::Drop => return,
             }
         }
+        if matches!(&request, wl_surface::Request::Attach { .. }) {
+            state.attach_history_surfaces.insert(surface.id());
+        }
         if matches!(
             &request,
             wl_surface::Request::Attach {
@@ -2087,6 +2341,7 @@ delegate_data_device!(WaylandState);
 delegate_output!(WaylandState);
 delegate_idle_notify!(WaylandState);
 delegate_foreign_toplevel_list!(WaylandState);
+delegate_session_lock!(WaylandState);
 smithay::reexports::wayland_server::delegate_global_dispatch!(WaylandState: [
     ZwlrLayerShellV1: WlrLayerShellGlobalData
 ] => WlrLayerShellState);

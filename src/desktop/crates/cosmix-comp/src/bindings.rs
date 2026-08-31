@@ -453,6 +453,37 @@ impl BindingState {
         KeyDisposition::Act(action)
     }
 
+    /// Decide a key while ext-session-lock owns the seat. Only the KMS VT
+    /// escape route remains a compositor binding; every ordinary chord is
+    /// forwarded to the lock surface and never enters intercepted bookkeeping.
+    pub(crate) fn dispatch_session_locked(
+        &mut self,
+        keycode: Keycode,
+        pressed: bool,
+        keysym: Option<Keysym>,
+        modifiers: &ModifiersState,
+    ) -> KeyDisposition {
+        let raw_code = keycode.raw();
+        if !pressed {
+            return if self.intercepted.remove(&raw_code) {
+                KeyDisposition::SwallowRelease
+            } else {
+                KeyDisposition::Forward
+            };
+        }
+        let Some(keysym) = keysym else {
+            return KeyDisposition::Forward;
+        };
+        let Some(binding) = self.table.find(keysym.raw(), modifiers, self.enabled) else {
+            return KeyDisposition::Forward;
+        };
+        if !matches!(binding.action, BindingAction::SwitchVt(_)) {
+            return KeyDisposition::Forward;
+        }
+        self.intercepted.insert(raw_code);
+        KeyDisposition::Act(binding.action)
+    }
+
     /// The binding table as Mix strict-data.
     ///
     /// Strict-data rather than JSON because it is the substrate's format for

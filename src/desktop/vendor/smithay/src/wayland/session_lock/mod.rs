@@ -52,26 +52,37 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use _session_lock::ext_session_lock_manager_v1::{ExtSessionLockManagerV1, Request};
+use _session_lock::ext_session_lock_surface_v1::ExtSessionLockSurfaceV1;
 use _session_lock::ext_session_lock_v1::ExtSessionLockV1;
 use wayland_protocols::ext::session_lock::v1::server as _session_lock;
 use wayland_server::protocol::wl_output::WlOutput;
 use wayland_server::protocol::wl_surface::WlSurface;
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New};
 
-use crate::wayland::session_lock::surface::LockSurfaceConfigure;
-
 mod lock;
 mod surface;
 
 pub use lock::SessionLockState;
-pub use surface::{ExtLockSurfaceUserData, LockSurface, LockSurfaceState};
+// cosmix addition: expose the configure record already named by the public
+// handler trait so a compositor can keep one configure ledger.
+pub use surface::{ExtLockSurfaceUserData, LockSurface, LockSurfaceConfigure, LockSurfaceState};
 
 const MANAGER_VERSION: u32 = 1;
 
 /// State of the [`ExtSessionLockManagerV1`] Global.
 #[derive(Debug)]
 pub struct SessionLockManagerState {
-    pub(crate) locked_outputs: Vec<WlOutput>,
+    // cosmix fix: retain the exact lock-surface owner and originating lock for
+    // every output. An aborted generation can then be retired without letting
+    // a stale surface destructor remove a newer generation's registration.
+    locked_outputs: Vec<LockedOutput>,
+}
+
+#[derive(Debug)]
+struct LockedOutput {
+    output: WlOutput,
+    surface: ExtSessionLockSurfaceV1,
+    lock: ExtSessionLockV1,
 }
 
 impl SessionLockManagerState {
@@ -93,6 +104,46 @@ impl SessionLockManagerState {
         Self {
             locked_outputs: Vec::new(),
         }
+    }
+
+    /// Number of outputs retained by Smithay's lock-surface registry.
+    // cosmix addition: exposes a narrow invariant probe for the vendored
+    // duplicate-registry regressions without exposing the registry itself.
+    pub fn locked_output_count(&self) -> usize {
+        self.locked_outputs.len()
+    }
+
+    pub(crate) fn output_is_locked(&self, output: &WlOutput) -> bool {
+        self.locked_outputs
+            .iter()
+            .any(|entry| &entry.output == output)
+    }
+
+    pub(crate) fn register_locked_output(
+        &mut self,
+        output: WlOutput,
+        surface: ExtSessionLockSurfaceV1,
+        lock: ExtSessionLockV1,
+    ) {
+        self.locked_outputs.push(LockedOutput {
+            output,
+            surface,
+            lock,
+        });
+    }
+
+    pub(crate) fn remove_lock_surface(&mut self, surface: &ExtSessionLockSurfaceV1) {
+        // cosmix fix: remove by owning object, not output. A stale surface from
+        // an aborted generation must not erase a newer owner's output entry.
+        self.locked_outputs
+            .retain(|entry| &entry.surface != surface);
+    }
+
+    /// Remove only output registrations created by one aborted lock object.
+    // cosmix fix: upstream only clears the whole registry on valid unlock;
+    // Cosmix also needs generation-aware cleanup when Locking aborts.
+    pub fn abort_lock_outputs(&mut self, lock: &ExtSessionLockV1) {
+        self.locked_outputs.retain(|entry| &entry.lock != lock);
     }
 }
 
@@ -178,8 +229,41 @@ pub trait SessionLockHandler {
     /// Add a new lock surface for an output.
     fn new_surface(&mut self, surface: LockSurface, output: WlOutput);
 
+    /// Add a new lock surface, retaining the lock object that created it.
+    ///
+    // cosmix addition: a rejected same-client lock object must not be able to
+    // create surfaces for the active lock generation.
+    fn new_surface_for_lock(&mut self, _lock: ExtSessionLockV1, surface: LockSurface, output: WlOutput) {
+        self.new_surface(surface, output);
+    }
+
+    /// Whether this wl_surface has any commit or buffer-attach history.
+    // cosmix addition: the protocol's AlreadyConstructed rule is broader than
+    // the buffer state Smithay can reconstruct from SurfaceAttributes alone.
+    fn lock_surface_already_constructed(&self, _surface: &WlSurface) -> bool {
+        false
+    }
+
+    /// Whether this lock object owns the compositor's active lock generation.
+    // cosmix addition: SessionLockState's client-local boolean cannot
+    // distinguish an accepted lock object from a rejected same-client one.
+    fn lock_object_may_create_surface(&self, _lock: &ExtSessionLockV1) -> bool {
+        true
+    }
+
     /// A surface has acknowledged a configure serial.
     fn ack_configure(&mut self, _surface: WlSurface, _configure: LockSurfaceConfigure) {}
+
+    /// A lock-surface protocol object was destroyed.
+    ///
+    // cosmix addition: ext-session-lock needs to retain the compositor-owned
+    // blank while retiring the destroyed client surface immediately.
+    fn lock_surface_destroyed(&mut self, _surface: WlSurface) {}
+
+    /// The ext_session_lock_v1 object was destroyed.
+    // cosmix addition: destroying the owner object while Locking is legal and
+    // must abort the pending lock instead of leaving an un-unlockable epoch.
+    fn lock_destroyed(&mut self, _lock: ExtSessionLockV1) {}
 }
 
 /// Manage session locking.
