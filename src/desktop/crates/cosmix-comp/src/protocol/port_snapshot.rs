@@ -78,6 +78,7 @@ pub(crate) struct SnapshotContext {
     pub(crate) event_seq: Arc<AtomicU64>,
     pub(crate) lost_count: Arc<AtomicU64>,
     pub(crate) pending_idle_order: Arc<AtomicU64>,
+    pub(crate) pending_active_order: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -102,7 +103,7 @@ struct SerialisedReply {
     bytes: usize,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct InfoSnapshot {
     pub(crate) service: Arc<str>,
     pub(crate) version: Arc<str>,
@@ -191,20 +192,20 @@ pub(crate) struct FocusSnapshot {
     pub(crate) session_lock: &'static str,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct DecorationSnapshot {
     pub(crate) enabled: bool,
     pub(crate) style: &'static str,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct BindingsSnapshot {
     pub(crate) enabled: bool,
     pub(crate) profile: &'static str,
     pub(crate) table: Vec<BindingRowSnapshot>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct BindingRowSnapshot {
     pub(crate) chord: String,
     pub(crate) action: &'static str,
@@ -591,6 +592,34 @@ pub(super) fn project_outputs(state: &WaylandState) -> Option<OutputProjection> 
         keys,
         slug_collisions,
     })
+}
+
+pub(super) fn project_output(
+    state: &WaylandState,
+    output: &Output,
+) -> Option<(String, OutputSnapshot)> {
+    let source = state.backend.port_output(output)?;
+    let key = output_key(&source.name);
+    let usable = state.port_usable_output_rect_for(&source.output)?;
+    Some((
+        key,
+        OutputSnapshot {
+            name: source.name,
+            default: source.default,
+            x: source.x,
+            y: source.y,
+            width: source.width,
+            height: source.height,
+            scale: source.scale,
+            refresh_mhz: source.refresh_mhz,
+            usable: RectSnapshot {
+                x: usable.x,
+                y: usable.y,
+                width: usable.width,
+                height: usable.height,
+            },
+        },
+    ))
 }
 
 pub(super) fn project_surface_by_id(

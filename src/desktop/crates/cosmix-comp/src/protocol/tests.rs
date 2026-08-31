@@ -59,6 +59,7 @@ fn snapshot_context(backend: &'static str) -> port_snapshot::SnapshotContext {
         event_seq: Arc::new(AtomicU64::new(0)),
         lost_count: Arc::new(AtomicU64::new(0)),
         pending_idle_order: Arc::new(AtomicU64::new(0)),
+        pending_active_order: Arc::new(AtomicU64::new(0)),
     }
 }
 
@@ -15445,6 +15446,46 @@ fn toplevel_window_geometry_origin_shift_moves_existing_subsurfaces() {
     );
 }
 
+#[cfg(feature = "bus")]
+#[test]
+fn bufferless_window_geometry_commit_publishes_surface_and_window_x_changes() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let surface_id = test_toplevel_record(&harness).id.0;
+    let watch = ingress.request_watch().expect("watch admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("watch service cycle");
+    drop(watch);
+    drain_observations(&observations);
+
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        3,
+        &words(&[10, 0, 40, 20]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    port_observation::service_observations(&mut harness.server.state);
+
+    let paths = drain_observations(&observations)
+        .into_iter()
+        .filter_map(|record| match record {
+            port_observation::ObservationRecord::PropsChanged { path, .. } => Some(path),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        paths,
+        BTreeSet::from([
+            format!("surfaces.s{surface_id}.x"),
+            format!("windows.s{surface_id}.x"),
+        ])
+    );
+}
+
 #[test]
 fn subsurface_buffer_commit_never_applies_xdg_window_geometry() {
     let mut harness = KeybindingHarness::new(true);
@@ -27138,11 +27179,14 @@ fn port_corner_timer_routes_once_and_geometry_and_lock_teardown_leave() {
     let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
     port_observation::service_observations(&mut harness.server.state);
     drain_observations(&observations);
-    harness.server.state.cursor_position = (5.0, 5.0);
     harness
         .server
         .state
-        .sample_corner_motion((5.0, 5.0), 0, (0.0, 0.0));
+        .handle_host_input(HostInput::PointerMotionAbsolute {
+            x: 5.0,
+            y: 5.0,
+            time: 1,
+        });
     let first_timer = harness.server.state.corner_timer_probe();
     let same_timer = harness.server.state.corner_timer_probe();
     assert_eq!(first_timer, same_timer, "unchanged deadline is not rearmed");
@@ -27179,11 +27223,14 @@ fn port_corner_timer_routes_once_and_geometry_and_lock_teardown_leave() {
             ))
     );
 
-    harness.server.state.cursor_position = (5.0, 5.0);
     harness
         .server
         .state
-        .sample_corner_motion((5.0, 5.0), 0, (0.0, 0.0));
+        .handle_host_input(HostInput::PointerMotionAbsolute {
+            x: 5.0,
+            y: 5.0,
+            time: 2,
+        });
     harness
         .server
         .event_loop
@@ -27222,7 +27269,7 @@ fn port_watch_reports_title_and_app_id_leaf_changes() {
         .server
         .dispatch_cycle(Some(Duration::ZERO))
         .expect("watch service cycle");
-    assert_eq!(runtime.block_on(watch.receive()).unwrap().0, 0);
+    assert_eq!(runtime.block_on(watch.receive()).unwrap().into_wire().0, 0);
     drain_observations(&observations);
 
     for (opcode, value, suffix) in [
@@ -27374,7 +27421,10 @@ fn port_watch_and_set_share_the_stable_service_point_and_sequence() {
         .server
         .dispatch_cycle(Some(Duration::ZERO))
         .expect("watch service cycle");
-    let (rc, body) = runtime.block_on(watch.receive()).expect("watch reply");
+    let (rc, body) = runtime
+        .block_on(watch.receive())
+        .expect("watch reply")
+        .into_wire();
     assert_eq!(rc, 0);
     assert_eq!(
         serde_json::from_str::<Value>(&body).unwrap()["topic"],
@@ -27398,7 +27448,10 @@ fn port_watch_and_set_share_the_stable_service_point_and_sequence() {
             .server
             .dispatch_cycle(Some(Duration::ZERO))
             .expect("set service cycle");
-        let (rc, body) = runtime.block_on(set.receive()).expect("set reply");
+        let (rc, body) = runtime
+            .block_on(set.receive())
+            .expect("set reply")
+            .into_wire();
         assert_eq!(rc, 0);
         let body = serde_json::from_str::<Value>(&body).unwrap();
         assert_eq!(body, json!({"path": path, "old": old, "new": value}));
@@ -27421,8 +27474,121 @@ fn port_watch_and_set_share_the_stable_service_point_and_sequence() {
         .server
         .dispatch_cycle(Some(Duration::ZERO))
         .expect("no-op service cycle");
-    assert_eq!(runtime.block_on(no_op.receive()).unwrap().0, 0);
+    assert_eq!(runtime.block_on(no_op.receive()).unwrap().into_wire().0, 0);
     assert!(drain_observations(&observations).is_empty());
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn port_controls_apply_all_sets_once_and_answer_watches_from_one_final_seed() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("control reply runtime");
+    let first_set = ingress
+        .request_set("input.corners.dwell_ms".into(), json!(210))
+        .expect("first set admitted");
+    let first_watch = ingress.request_watch().expect("first watch admitted");
+    let final_set = ingress
+        .request_set("input.corners.dwell_ms".into(), json!(220))
+        .expect("final set admitted");
+    let final_watch = ingress.request_watch().expect("final watch admitted");
+
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("one stable control cycle");
+    assert!(matches!(
+        runtime.block_on(first_set.receive()).unwrap(),
+        crate::port::ControlReply::Set {
+            old: port_observation::PropValue::U64(200),
+            new: port_observation::PropValue::U64(210),
+            ..
+        }
+    ));
+    assert!(matches!(
+        runtime.block_on(final_set.receive()).unwrap(),
+        crate::port::ControlReply::Set {
+            old: port_observation::PropValue::U64(210),
+            new: port_observation::PropValue::U64(220),
+            ..
+        }
+    ));
+    let first_watch = runtime.block_on(first_watch.receive()).unwrap();
+    let final_watch = runtime.block_on(final_watch.receive()).unwrap();
+    assert_eq!(first_watch, final_watch);
+    assert!(matches!(
+        first_watch,
+        crate::port::ControlReply::Watch { event_seq: 1, .. }
+    ));
+    let records = drain_observations(&observations);
+    assert_eq!(records.len(), 1);
+    assert!(matches!(
+        &records[0],
+        port_observation::ObservationRecord::PropsChanged {
+            path,
+            old: port_observation::PropValue::U64(200),
+            new: port_observation::PropValue::U64(220),
+            ..
+        } if path == "input.corners.dwell_ms"
+    ));
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn topic_idle_then_active_rearms_property_observation() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("watch reply runtime");
+    let watch = ingress.request_watch().expect("watch admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("watch service cycle");
+    runtime.block_on(watch.receive()).expect("watch reply");
+    drain_observations(&observations);
+
+    ingress.set_watch_state(false);
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("idle lifecycle cycle");
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_ID,
+        2,
+        &wire_string_argument("unwatched title"),
+    );
+    harness.dispatch_client();
+    port_observation::service_observations(&mut harness.server.state);
+    assert!(drain_observations(&observations).is_empty());
+
+    ingress.set_watch_state(true);
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("active lifecycle cycle");
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_ID,
+        2,
+        &wire_string_argument("rearmed title"),
+    );
+    harness.dispatch_client();
+    port_observation::service_observations(&mut harness.server.state);
+    assert!(
+        drain_observations(&observations)
+            .iter()
+            .any(|record| matches!(
+                record,
+                port_observation::ObservationRecord::PropsChanged { path, .. }
+                    if path.ends_with(".title")
+            ))
+    );
 }
 
 #[cfg(feature = "bus")]
@@ -27449,12 +27615,15 @@ fn port_set_revalidates_bounds_unknown_and_read_only_paths_on_calloop() {
     ] {
         let set = ingress
             .request_set(path.to_string(), value)
-            .expect("invalid set still crosses bounded ingress");
+            .expect("defence-in-depth probe is admitted directly at the ingress seam");
         harness
             .server
             .dispatch_cycle(Some(Duration::ZERO))
             .expect("validation service cycle");
-        let (rc, body) = runtime.block_on(set.receive()).expect("validation reply");
+        let (rc, body) = runtime
+            .block_on(set.receive())
+            .expect("validation reply")
+            .into_wire();
         assert_eq!(rc, 10);
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap()["error"],

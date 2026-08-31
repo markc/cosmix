@@ -2889,10 +2889,16 @@ impl ProtocolServer {
                             state
                                 .pending_port_controls
                                 .push(PortControl::WatchState { active, order });
-                        } else if !active && let Some(context) = state.port_context.as_ref() {
-                            context
-                                .pending_idle_order
-                                .fetch_max(order, Ordering::AcqRel);
+                        } else if let Some(context) = state.port_context.as_ref() {
+                            if active {
+                                context
+                                    .pending_active_order
+                                    .fetch_max(order, Ordering::AcqRel);
+                            } else {
+                                context
+                                    .pending_idle_order
+                                    .fetch_max(order, Ordering::AcqRel);
+                            }
                         }
                     }
                     ChannelEvent::Closed => {}

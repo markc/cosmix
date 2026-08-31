@@ -27,7 +27,7 @@ use crate::{
     decoration::DecorationStartup,
     protocol::{port_observation, port_snapshot},
 };
-use port_observation::{ObservationProducer, ObservationRecord};
+use port_observation::{ObservationProducer, ObservationRecord, PropValue, SetValidationError};
 use port_snapshot::{
     BROKER_CONNECTED, BROKER_RETRYING, CompSnapshot, MAX_REPLY_BODY_BYTES, MAX_REPLY_WIRE_BYTES,
     SnapshotContext, dispatch_read, error, too_large,
@@ -38,7 +38,6 @@ const PORT_REPLY_CAPACITY: usize = 16;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 const REPLY_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(2);
-const PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PORT_SHUTDOWN_GRACE: Duration = Duration::from_millis(300);
 const CLIENT_SHUTDOWN_BUDGET: Duration = Duration::from_millis(250);
 const DEREGISTER_BUDGET: Duration = Duration::from_millis(200);
@@ -57,14 +56,82 @@ pub(crate) struct PortRequest {
 
 pub(crate) struct PortReply {
     pub(crate) order: u64,
-    pub(crate) reply: tokio::sync::oneshot::Sender<(u8, Arc<str>)>,
+    pub(crate) reply: tokio::sync::oneshot::Sender<ControlReply>,
 }
 
 pub(crate) struct PortSetRequest {
     pub(crate) order: u64,
     pub(crate) path: String,
     pub(crate) value: Value,
-    pub(crate) reply: tokio::sync::oneshot::Sender<(u8, Arc<str>)>,
+    pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ControlReply {
+    Watch {
+        topic: String,
+        event_seq: u64,
+        lost_count: u64,
+    },
+    Set {
+        path: String,
+        old: PropValue,
+        new: PropValue,
+    },
+    Validation(SetValidationError),
+    Busy,
+}
+
+impl ControlReply {
+    pub(crate) fn into_wire(self) -> (u8, Arc<str>) {
+        match self {
+            Self::Watch {
+                topic,
+                event_seq,
+                lost_count,
+            } => (
+                0,
+                Arc::from(
+                    json!({
+                        "topic": topic,
+                        "event_seq": event_seq,
+                        "lost_count": lost_count,
+                    })
+                    .to_string(),
+                ),
+            ),
+            Self::Set { path, old, new } => (
+                0,
+                Arc::from(
+                    json!({
+                        "path": path,
+                        "old": old.wire_value(),
+                        "new": new.wire_value(),
+                    })
+                    .to_string(),
+                ),
+            ),
+            Self::Validation(SetValidationError::UnknownPath) => error("unknown_path"),
+            Self::Validation(SetValidationError::ReadOnly) => error("read_only"),
+            Self::Validation(SetValidationError::InvalidValue {
+                path,
+                expected,
+                range,
+            }) => (
+                10,
+                Arc::from(
+                    json!({
+                        "error": "invalid_value",
+                        "path": path,
+                        "expected": expected,
+                        "range": range,
+                    })
+                    .to_string(),
+                ),
+            ),
+            Self::Busy => error("busy"),
+        }
+    }
 }
 
 pub(crate) enum PortControl {
@@ -89,6 +156,7 @@ pub(crate) struct PortIngress {
     queue_depth: Arc<AtomicUsize>,
     control_order: Arc<AtomicU64>,
     pending_idle_order: Arc<AtomicU64>,
+    pending_active_order: Arc<AtomicU64>,
 }
 
 impl PortIngress {
@@ -111,7 +179,7 @@ impl PortIngress {
                 order: self.next_control_order(),
                 path,
                 value,
-                reply,
+                reply: Some(reply),
             }),
             receive,
         )
@@ -122,9 +190,12 @@ impl PortIngress {
         if let Err(TrySendError::Full(_)) = self
             .sender
             .try_send(PortCommand::WatchState { active, order })
-            && !active
         {
-            self.pending_idle_order.fetch_max(order, Ordering::AcqRel);
+            if active {
+                self.pending_active_order.fetch_max(order, Ordering::AcqRel);
+            } else {
+                self.pending_idle_order.fetch_max(order, Ordering::AcqRel);
+            }
         }
     }
 
@@ -200,7 +271,7 @@ impl SnapshotAdmission {
     }
 }
 
-pub(crate) type ControlAdmission = Admission<(u8, Arc<str>)>;
+pub(crate) type ControlAdmission = Admission<ControlReply>;
 
 pub(crate) struct PortProtocolWiring {
     pub(crate) source: channel::Channel<PortCommand>,
@@ -222,6 +293,7 @@ pub(crate) fn test_wiring(
         queue_depth: context.queue_depth.clone(),
         control_order: Arc::new(AtomicU64::new(0)),
         pending_idle_order: context.pending_idle_order.clone(),
+        pending_active_order: context.pending_active_order.clone(),
     };
     let (observation_producer, observations) =
         port_observation::outbox(Arc::clone(&context.lost_count));
@@ -244,6 +316,7 @@ pub(crate) struct PortStarter {
     reply_timeouts: Arc<AtomicU64>,
     publish_timeouts: Arc<AtomicU64>,
     observations: crossbeam_channel::Receiver<ObservationRecord>,
+    observation_notifier: Arc<tokio::sync::Notify>,
     lost_count: Arc<AtomicU64>,
 }
 
@@ -268,13 +341,16 @@ pub(crate) fn prepare(
     let event_seq = Arc::new(AtomicU64::new(0));
     let lost_count = Arc::new(AtomicU64::new(0));
     let pending_idle_order = Arc::new(AtomicU64::new(0));
+    let pending_active_order = Arc::new(AtomicU64::new(0));
     let (observation_producer, observations) = port_observation::outbox(Arc::clone(&lost_count));
+    let observation_notifier = observation_producer.notifier();
     let (sender, source) = channel::sync_channel(PORT_QUEUE_CAPACITY);
     let ingress = PortIngress {
         sender,
         queue_depth: queue_depth.clone(),
         control_order: Arc::new(AtomicU64::new(0)),
         pending_idle_order: pending_idle_order.clone(),
+        pending_active_order: pending_active_order.clone(),
     };
     let build = cosmix_buildinfo::build_info!();
     let context = Arc::new(SnapshotContext {
@@ -292,6 +368,7 @@ pub(crate) fn prepare(
         event_seq: event_seq.clone(),
         lost_count: lost_count.clone(),
         pending_idle_order,
+        pending_active_order,
     });
     Ok((
         PortProtocolWiring {
@@ -307,6 +384,7 @@ pub(crate) fn prepare(
             reply_timeouts,
             publish_timeouts,
             observations,
+            observation_notifier,
             lost_count,
         },
     ))
@@ -323,6 +401,7 @@ impl PortStarter {
         let reply_timeouts = self.reply_timeouts;
         let publish_timeouts = self.publish_timeouts;
         let observations = self.observations;
+        let observation_notifier = self.observation_notifier;
         let lost_count = self.lost_count;
         let thread = thread::Builder::new()
             .name("cosmix-comp-port".into())
@@ -347,6 +426,7 @@ impl PortStarter {
                     reply_timeouts,
                     publish_timeouts,
                     observations,
+                    observation_notifier,
                     lost_count,
                     shutdown_rx,
                     move || {
@@ -599,6 +679,7 @@ async fn worker_loop<F, Fut, C>(
     reply_timeouts: Arc<AtomicU64>,
     publish_timeouts: Arc<AtomicU64>,
     observations: crossbeam_channel::Receiver<ObservationRecord>,
+    observation_notifier: Arc<tokio::sync::Notify>,
     lost_count: Arc<AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
     connector: F,
@@ -639,6 +720,7 @@ async fn worker_loop<F, Fut, C>(
         Arc::clone(&client),
         Arc::from(service.as_str()),
         observations,
+        observation_notifier,
         Arc::clone(&lost_count),
         Arc::clone(&publish_timeouts),
         shutdown.clone(),
@@ -846,6 +928,14 @@ fn handle_incoming(
                 return;
             }
         };
+        if let Err(error) = port_observation::validate_corner_value(&path, &value) {
+            queue_reply(
+                reply_sender,
+                reply_timeouts,
+                PendingReply::new(command, ControlReply::Validation(error).into_wire()),
+            );
+            return;
+        }
         let permit = match Arc::clone(responder_permits).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -1002,7 +1092,11 @@ fn spawn_control_responder(
     let reply_timeouts = Arc::clone(reply_timeouts);
     responders.spawn(async move {
         let _permit = permit;
-        let reply = admission.receive().await.unwrap_or_else(|()| error("busy"));
+        let reply = admission
+            .receive()
+            .await
+            .unwrap_or(ControlReply::Busy)
+            .into_wire();
         queue_reply(
             &reply_sender,
             &reply_timeouts,
@@ -1064,12 +1158,11 @@ async fn publisher_loop<C: WorkerClient>(
     client: Arc<C>,
     service: Arc<str>,
     observations: crossbeam_channel::Receiver<ObservationRecord>,
+    observation_notifier: Arc<tokio::sync::Notify>,
     lost_count: Arc<AtomicU64>,
     publish_timeouts: Arc<AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let mut interval = tokio::time::interval(PUBLISH_POLL_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut next_sequence = 1_u64;
     let mut pending_gap = None;
     let mut pending_record = None;
@@ -1084,7 +1177,7 @@ async fn publisher_loop<C: WorkerClient>(
                                 break;
                             }
                         }
-                        _ = interval.tick() => {}
+                        _ = observation_notifier.notified() => {}
                     }
                     continue;
                 }
@@ -1382,6 +1475,7 @@ mod tests {
                 queue_depth: Arc::clone(&queue_depth),
                 control_order: Arc::new(AtomicU64::new(0)),
                 pending_idle_order: Arc::new(AtomicU64::new(0)),
+                pending_active_order: Arc::new(AtomicU64::new(0)),
             },
             source,
             queue_depth,
@@ -1496,6 +1590,7 @@ mod tests {
             reply_timeouts,
             publish_timeouts,
             observations,
+            Arc::new(tokio::sync::Notify::new()),
             lost_count,
             shutdown,
             move || future::ready(Ok(client.take().expect("one connection attempt"))),
@@ -1526,6 +1621,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             publish_timeouts,
             observations,
+            Arc::new(tokio::sync::Notify::new()),
             lost_count,
             shutdown,
             move || future::ready(Ok(client.take().expect("one connection attempt"))),
@@ -1555,6 +1651,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             publish_timeouts,
             observations,
+            Arc::new(tokio::sync::Notify::new()),
             lost_count,
             shutdown,
             move || {
@@ -1742,10 +1839,12 @@ mod tests {
         assert_eq!(request.value, json!(250));
         request
             .reply
-            .send((
-                0,
-                Arc::from("{\"path\":\"input.corners.dwell_ms\",\"old\":200,\"new\":250}"),
-            ))
+            .expect("set reply sender")
+            .send(ControlReply::Set {
+                path: "input.corners.dwell_ms".into(),
+                old: PropValue::U64(200),
+                new: PropValue::U64(250),
+            })
             .expect("responder remains live");
         responders
             .join_next()
@@ -1780,6 +1879,50 @@ mod tests {
         assert_eq!(reply.rc, 10);
         assert_eq!(reply.body.as_ref(), "{\"error\":\"not_local\"}");
         assert!(matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn invalid_sets_cannot_exhaust_ingress_or_responder_permits() {
+        let (ingress, source, _) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let (reply_sender, mut replies) = tokio_mpsc::channel(PORT_QUEUE_CAPACITY + 1);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+
+        for id in 0..PORT_QUEUE_CAPACITY {
+            handle_incoming(
+                &ingress,
+                &mut responders,
+                &permits,
+                &reply_sender,
+                &reply_timeouts,
+                "comp-nested",
+                local_set_command(id, "input.corners.dwell_ms", json!(5001)),
+            );
+        }
+        for _ in 0..PORT_QUEUE_CAPACITY {
+            let reply = replies.recv().await.expect("invalid-value reply");
+            assert_eq!(reply.rc, 10);
+            assert_eq!(
+                serde_json::from_str::<Value>(&reply.body).unwrap()["error"],
+                "invalid_value"
+            );
+        }
+        assert!(responders.is_empty());
+        assert_eq!(permits.available_permits(), PORT_QUEUE_CAPACITY);
+        assert_eq!(ingress.depth_for_test(), 0);
+        assert!(matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        handle_incoming(
+            &ingress,
+            &mut responders,
+            &permits,
+            &reply_sender,
+            &reply_timeouts,
+            "comp-nested",
+            command("comp.info", PORT_QUEUE_CAPACITY),
+        );
+        assert!(matches!(source.try_recv(), Ok(PortCommand::Snapshot(_))));
     }
 
     #[tokio::test]
@@ -1842,36 +1985,19 @@ mod tests {
     }
 
     #[test]
-    fn idle_notice_survives_a_saturated_control_ingress() {
+    fn both_lifecycle_directions_coalesce_latest_wins_when_ingress_is_full() {
         let (ingress, _source, _) = test_ingress();
         let _admissions = (0..PORT_QUEUE_CAPACITY)
             .map(|_| ingress.request_snapshot().expect("fill ingress"))
             .collect::<Vec<_>>();
         ingress.set_watch_state(false);
-        let idle_order = ingress.pending_idle_order.load(Ordering::Acquire);
-        assert_ne!(idle_order, 0);
-        let active_order = ingress.next_control_order();
-        let (reply, _receive) = tokio::sync::oneshot::channel();
-        let watch_order = ingress.next_control_order();
-        let mut controls = [
-            PortControl::Watch(PortReply {
-                order: watch_order,
-                reply,
-            }),
-            PortControl::WatchState {
-                active: true,
-                order: active_order,
-            },
-            PortControl::WatchState {
-                active: false,
-                order: idle_order,
-            },
-        ];
-        controls.sort_by_key(PortControl::order);
-        assert_eq!(
-            controls.map(|control| control.order()),
-            [idle_order, active_order, watch_order]
-        );
+        let first_idle = ingress.pending_idle_order.load(Ordering::Acquire);
+        ingress.set_watch_state(true);
+        let active = ingress.pending_active_order.load(Ordering::Acquire);
+        ingress.set_watch_state(false);
+        let final_idle = ingress.pending_idle_order.load(Ordering::Acquire);
+        assert_ne!(first_idle, 0);
+        assert!(first_idle < active && active < final_idle);
     }
 
     #[tokio::test]
@@ -1904,6 +2030,7 @@ mod tests {
     async fn publisher_places_outbox_gap_before_surviving_records() {
         let lost = Arc::new(AtomicU64::new(0));
         let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
+        let notifier = producer.notifier();
         for event_seq in 1..=4 {
             producer.offer(ObservationRecord::FocusChanged {
                 keyboard: Some(event_seq),
@@ -1920,6 +2047,7 @@ mod tests {
             Arc::new(client),
             Arc::from("comp-nested"),
             receiver,
+            notifier,
             Arc::clone(&lost),
             Arc::clone(&publish_timeouts),
             shutdown,
@@ -1959,10 +2087,59 @@ mod tests {
         assert_eq!(publish_timeouts.load(Ordering::Acquire), 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn idle_publisher_wakes_from_offer_without_a_timer_tick() {
+        let lost = Arc::new(AtomicU64::new(0));
+        let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
+        let notifier = producer.notifier();
+        let (client, _commands, _states) = FakeClient::new(ConnState::Connected, false);
+        let publications = Arc::clone(&client.publications);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let task = tokio::spawn(publisher_loop(
+            Arc::new(client),
+            Arc::from("comp-nested"),
+            receiver,
+            notifier,
+            lost,
+            Arc::new(AtomicU64::new(0)),
+            shutdown,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3_600)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            publications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
+
+        producer.offer(ObservationRecord::FocusChanged {
+            keyboard: Some(1),
+            previous: None,
+            exclusive_latch: None,
+            event_seq: 1,
+        });
+        tokio::time::timeout(Duration::from_millis(1), async {
+            while publications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful offer wakes idle publisher without advancing time");
+        shutdown_tx.send_replace(true);
+        task.await.expect("publisher exits");
+    }
+
     #[tokio::test]
     async fn rejected_publication_discards_backlog_and_recovers_with_one_gap() {
         let lost = Arc::new(AtomicU64::new(0));
         let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
+        let notifier = producer.notifier();
         producer.offer(ObservationRecord::FocusChanged {
             keyboard: Some(1),
             previous: None,
@@ -1985,6 +2162,7 @@ mod tests {
             Arc::new(client),
             Arc::from("comp-nested"),
             receiver,
+            notifier,
             Arc::clone(&lost),
             Arc::clone(&publish_timeouts),
             shutdown,
@@ -2032,6 +2210,7 @@ mod tests {
     async fn rejected_gap_discards_its_survivor_and_recovers_as_publisher_loss() {
         let lost = Arc::new(AtomicU64::new(0));
         let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
+        let notifier = producer.notifier();
         for sequence in 1..=3 {
             producer.offer(ObservationRecord::FocusChanged {
                 keyboard: Some(sequence),
@@ -2050,6 +2229,7 @@ mod tests {
             Arc::new(client),
             Arc::from("comp-nested"),
             receiver,
+            notifier,
             Arc::clone(&lost),
             Arc::clone(&publish_timeouts),
             shutdown,
@@ -2098,6 +2278,7 @@ mod tests {
     async fn stalled_publication_times_out_without_blocking_shutdown() {
         let lost = Arc::new(AtomicU64::new(0));
         let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
+        let notifier = producer.notifier();
         producer.offer(ObservationRecord::FocusChanged {
             keyboard: None,
             previous: Some(1),
@@ -2112,6 +2293,7 @@ mod tests {
             Arc::new(client),
             Arc::from("comp-nested"),
             receiver,
+            notifier,
             Arc::clone(&lost),
             Arc::clone(&publish_timeouts),
             shutdown,
@@ -2136,6 +2318,7 @@ mod tests {
         let publish_timeouts = Arc::new(AtomicU64::new(0));
         let lost = Arc::new(AtomicU64::new(0));
         let (producer, observations) = port_observation::outbox(Arc::clone(&lost));
+        let notifier = producer.notifier();
         producer.offer(ObservationRecord::FocusChanged {
             keyboard: Some(1),
             previous: None,
@@ -2154,6 +2337,7 @@ mod tests {
             reply_timeouts,
             publish_timeouts,
             observations,
+            notifier,
             lost,
             shutdown,
             move || future::ready(Ok(client.take().expect("one connection attempt"))),
@@ -2206,6 +2390,7 @@ mod tests {
             reply_timeouts,
             publish_timeouts,
             observations,
+            Arc::new(tokio::sync::Notify::new()),
             lost_count,
             shutdown,
             move || future::ready(Ok(client.take().expect("one connection attempt"))),
@@ -2265,6 +2450,7 @@ mod tests {
             Arc::clone(&reply_timeouts),
             publish_timeouts,
             observations,
+            Arc::new(tokio::sync::Notify::new()),
             lost_count,
             shutdown,
             move || future::ready(Ok(client.take().expect("one connection attempt"))),

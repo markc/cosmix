@@ -25,7 +25,6 @@ frame-capture = ["dep:signal-hook"]
 kms-live = [
     "dep:signal-hook",
     "dep:smithay-client-toolkit",
-    "dep:wayland-client",
 ]
 
 [lints.rust]
@@ -39,6 +38,10 @@ path = "src/main.rs"
 name = "cosmix-lock-probe"
 path = "src/bin/cosmix-lock-probe.rs"
 required-features = ["kms-live"]
+
+[[bin]]
+name = "cosmix-screencopy-probe"
+path = "src/bin/cosmix-screencopy-probe.rs"
 
 [dependencies]
 bevy = { version = "=0.19.0", default-features = false, features = [
@@ -93,7 +96,7 @@ drm-fourcc = "=2.2.0"
 static_assertions = "1"
 tracing = "0.1"
 unicode-segmentation = "1"
-wayland-client = { version = "=0.31.14", optional = true }
+wayland-client = { version = "=0.31.14" }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"], optional = true }
 
 [build-dependencies]

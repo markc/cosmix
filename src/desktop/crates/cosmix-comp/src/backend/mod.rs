@@ -209,6 +209,45 @@ impl BackendData {
         }
     }
 
+    /// Owned facts for one protocol-visible output without projecting the
+    /// complete output set. Observation dirty hooks use this fixed-cost path.
+    #[cfg(feature = "bus")]
+    pub(crate) fn port_output(&self, requested: &Output) -> Option<PortOutputSource> {
+        let default = self.default_output().as_ref() == Some(requested);
+        match self {
+            Self::Winit(data) if data.output == *requested => Some(PortOutputSource {
+                output: data.output.clone(),
+                name: data.output.name(),
+                default,
+                x: 0,
+                y: 0,
+                width: data.output_size.0,
+                height: data.output_size.1,
+                scale: data.output_scale,
+                refresh_mhz: u32::try_from(data.output_mode.refresh).ok()?,
+            }),
+            Self::Winit(_) => None,
+            Self::Kms(_) => {
+                let mode = requested.current_mode()?;
+                let location = requested.current_location();
+                let scale = requested.current_scale().fractional_scale();
+                let logical_size = mode.size.to_f64().to_logical(scale).to_i32_round::<i32>();
+                let logical_size = requested.current_transform().transform_size(logical_size);
+                Some(PortOutputSource {
+                    output: requested.clone(),
+                    name: requested.name(),
+                    default,
+                    x: location.x,
+                    y: location.y,
+                    width: u32::try_from(logical_size.w.max(0)).ok()?,
+                    height: u32::try_from(logical_size.h.max(0)).ok()?,
+                    scale,
+                    refresh_mhz: u32::try_from(mode.refresh).ok()?,
+                })
+            }
+        }
+    }
+
     /// Resolve a client output only while it remains in this backend's live
     /// protocol registry. `Output::from_resource` alone also resolves disabled
     /// globals retained by existing client resources after hot-unplug.

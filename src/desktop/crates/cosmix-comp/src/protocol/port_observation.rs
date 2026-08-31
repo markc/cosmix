@@ -12,6 +12,7 @@ use std::{
 use chrono::{SecondsFormat, TimeZone, Utc};
 use cosmix_bus::bus::BusMessage;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
+use serde::Serialize;
 use serde_json::{Value, json};
 use smithay::output::Output;
 use smithay::reexports::calloop::{
@@ -19,15 +20,17 @@ use smithay::reexports::calloop::{
     timer::{TimeoutAction, Timer},
 };
 use smithay::reexports::wayland_server::Resource;
+use tokio::sync::Notify;
 
-use crate::port::{PortControl, PortSetRequest};
+use crate::port::{ControlReply, PortControl, PortSetRequest};
 
 use super::{
     SurfaceId, WaylandState,
     corner::{Corner, CornerConfig, CornerDetector, CornerEvent},
     port_snapshot::{
-        CompSnapshot, FocusSnapshot, OutputSnapshot, WindowSnapshot, error, project_focus,
-        project_outputs, project_stack, project_surface_by_id, project_window_row, snapshot,
+        BindingRowSnapshot, CompSnapshot, FocusSnapshot, LayerSnapshot, OutputSnapshot,
+        SurfaceSnapshot, WindowSnapshot, project_focus, project_output, project_outputs,
+        project_stack, project_surface_by_id, project_window_row, snapshot,
     },
 };
 
@@ -43,19 +46,66 @@ pub(crate) fn topic_name(service: &str, suffix: &str) -> String {
     format!("{service}.{suffix}")
 }
 
-type PendingPropChanges = BTreeMap<String, (Value, Value, &'static str)>;
+type PendingPropChanges = BTreeMap<String, (PropValue, PropValue, &'static str)>;
 
 #[cfg(test)]
 const OUTBOX_CAPACITY: usize = 2;
 #[cfg(not(test))]
-const OUTBOX_CAPACITY: usize = 64;
+const OUTBOX_CAPACITY: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+pub(crate) enum PropValue {
+    Null(()),
+    Bool(bool),
+    U64(u64),
+    I32(i32),
+    U32(u32),
+    F32(f32),
+    F64(f64),
+    String(String),
+    U64List(Vec<u64>),
+    BindingRows(Vec<BindingRowSnapshot>),
+    OutputRow(Box<OutputSnapshot>),
+    SurfaceRow(Box<SurfaceSnapshot>),
+    WindowRow(Box<WindowSnapshot>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SetValidationError {
+    UnknownPath,
+    ReadOnly,
+    InvalidValue {
+        path: String,
+        expected: &'static str,
+        range: &'static str,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ValidatedCornerValue {
+    Enabled(bool),
+    DeadzonePx(f64),
+    DwellMs(u64),
+    VelocityMaxPxS(f64),
+}
+
+impl PropValue {
+    fn null() -> Self {
+        Self::Null(())
+    }
+
+    pub(crate) fn wire_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ObservationRecord {
     PropsChanged {
         path: String,
-        old: Value,
-        new: Value,
+        old: PropValue,
+        new: PropValue,
         unix_ms: i64,
         cause: &'static str,
         event_seq: u64,
@@ -139,8 +189,8 @@ impl ObservationRecord {
                 message.set("cause", cause);
                 json!({
                     "path": path,
-                    "old": old,
-                    "new": new,
+                    "old": old.wire_value(),
+                    "new": new.wire_value(),
                     "ts": rfc3339_millis(*unix_ms),
                     "cause": cause,
                     "event_seq": event_seq,
@@ -234,13 +284,17 @@ pub(crate) struct ObservationProducer {
     sender: Sender<ObservationRecord>,
     eviction: Receiver<ObservationRecord>,
     lost_count: Arc<AtomicU64>,
+    notifier: Arc<Notify>,
 }
 
 impl ObservationProducer {
     pub(crate) fn offer(&self, mut record: ObservationRecord) {
         loop {
             match self.sender.try_send(record) {
-                Ok(()) => return,
+                Ok(()) => {
+                    self.notifier.notify_one();
+                    return;
+                }
                 Err(TrySendError::Disconnected(_)) => {
                     self.lost_count.fetch_add(1, Ordering::AcqRel);
                     return;
@@ -250,6 +304,7 @@ impl ObservationProducer {
                     match self.eviction.try_recv() {
                         Ok(_) => {
                             self.lost_count.fetch_add(1, Ordering::AcqRel);
+                            self.notifier.notify_one();
                         }
                         Err(TryRecvError::Empty) => continue,
                         Err(TryRecvError::Disconnected) => {
@@ -261,17 +316,23 @@ impl ObservationProducer {
             }
         }
     }
+
+    pub(crate) fn notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.notifier)
+    }
 }
 
 pub(crate) fn outbox(
     lost_count: Arc<AtomicU64>,
 ) -> (ObservationProducer, Receiver<ObservationRecord>) {
     let (sender, receiver) = crossbeam_channel::bounded(OUTBOX_CAPACITY);
+    let notifier = Arc::new(Notify::new());
     (
         ObservationProducer {
             sender,
             eviction: receiver.clone(),
             lost_count,
+            notifier,
         },
         receiver,
     )
@@ -286,7 +347,14 @@ struct SurfaceEdgeStart {
 
 #[derive(Clone, Debug)]
 struct OutputEdgeStart {
+    output: Output,
     row: OutputSnapshot,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FocusEdgeStart {
+    keyboard: Option<u64>,
+    exclusive_latch: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -301,8 +369,8 @@ pub(crate) struct ObservationState {
     dirty_surfaces: BTreeMap<u64, &'static str>,
     dirty_outputs: BTreeMap<String, OutputEdgeStart>,
     output_topology_dirty: bool,
-    property_dirty_outputs: BTreeMap<String, &'static str>,
-    pending_focus: Option<FocusSnapshot>,
+    property_dirty_outputs: BTreeMap<String, (Output, &'static str)>,
+    pending_focus: Option<FocusEdgeStart>,
     focus_cause: &'static str,
     stack_dirty: Option<&'static str>,
     full_dirty: Option<&'static str>,
@@ -320,6 +388,7 @@ pub(crate) struct ObservationState {
     loop_handle: LoopHandle<'static, WaylandState>,
     producer: ObservationProducer,
     event_seq: u64,
+    event_seq_exhausted: bool,
     event_seq_watermark: Arc<AtomicU64>,
 }
 
@@ -354,21 +423,26 @@ impl ObservationState {
             loop_handle,
             producer,
             event_seq: 0,
+            event_seq_exhausted: false,
             event_seq_watermark,
         }
     }
 
-    fn next_seq(&mut self) -> u64 {
-        self.event_seq = self.event_seq.saturating_add(1);
+    fn next_seq(&mut self) -> Option<u64> {
+        if self.event_seq_exhausted {
+            return None;
+        }
+        self.event_seq += 1;
+        self.event_seq_exhausted = self.event_seq == u64::MAX;
         self.event_seq_watermark
             .store(self.event_seq, Ordering::Release);
-        self.event_seq
+        Some(self.event_seq)
     }
 
-    fn offer(&mut self, build: impl FnOnce(u64) -> ObservationRecord) -> u64 {
-        let sequence = self.next_seq();
+    fn offer(&mut self, build: impl FnOnce(u64) -> ObservationRecord) -> Option<u64> {
+        let sequence = self.next_seq()?;
         self.producer.offer(build(sequence));
-        sequence
+        Some(sequence)
     }
 
     pub(crate) fn drop_watch(&mut self) {
@@ -456,32 +530,32 @@ impl WaylandState {
 
     pub(crate) fn mark_focus_before_change(&mut self, cause: &'static str) {
         if self.observations.pending_focus.is_none() {
-            self.observations.pending_focus = Some(project_focus(self));
-            self.observations.focus_cause = cause;
+            self.observations.pending_focus = Some(project_focus_edge(self));
         }
+        if self.observations.watched_baseline.is_none() {
+            return;
+        }
+        self.observations.focus_cause = cause;
     }
 
     pub(crate) fn mark_output_before_change(&mut self, output: &Output, cause: &'static str) {
-        let Some(projection) = project_outputs(self) else {
+        let Some((key, row)) = project_output(self, output) else {
             return;
         };
-        let Some((_, key)) = projection
-            .keys
-            .iter()
-            .find(|(candidate, _)| candidate == output)
-        else {
+        self.observations
+            .dirty_outputs
+            .entry(key.clone())
+            .or_insert_with(|| OutputEdgeStart {
+                output: output.clone(),
+                row,
+            });
+        if self.observations.watched_baseline.is_none() {
             return;
-        };
-        if let Some(row) = projection.rows.get(key) {
-            self.observations
-                .property_dirty_outputs
-                .entry(key.clone())
-                .or_insert(cause);
-            self.observations
-                .dirty_outputs
-                .entry(key.clone())
-                .or_insert_with(|| OutputEdgeStart { row: row.clone() });
         }
+        self.observations
+            .property_dirty_outputs
+            .entry(key)
+            .or_insert_with(|| (output.clone(), cause));
     }
 
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -489,15 +563,18 @@ impl WaylandState {
         let Some(projection) = project_outputs(self) else {
             return;
         };
-        for (key, row) in projection.rows {
+        for (output, key) in projection.keys {
+            let Some(row) = projection.rows.get(&key).cloned() else {
+                continue;
+            };
             self.observations
                 .property_dirty_outputs
                 .entry(key.clone())
-                .or_insert(cause);
+                .or_insert((output.clone(), cause));
             self.observations
                 .dirty_outputs
                 .entry(key)
-                .or_insert(OutputEdgeStart { row });
+                .or_insert(OutputEdgeStart { output, row });
         }
     }
 
@@ -765,7 +842,7 @@ fn service_focus_edge(state: &mut WaylandState) {
     let Some(previous) = state.observations.pending_focus.take() else {
         return;
     };
-    let current = project_focus(state);
+    let current = project_focus_edge(state);
     if previous.keyboard == current.keyboard && previous.exclusive_latch == current.exclusive_latch
     {
         return;
@@ -786,14 +863,31 @@ fn service_focus_edge(state: &mut WaylandState) {
         });
 }
 
+fn project_focus_edge(state: &WaylandState) -> FocusEdgeStart {
+    FocusEdgeStart {
+        keyboard: state
+            .keyboard
+            .current_focus()
+            .as_ref()
+            .and_then(|surface| state.surfaces.get(&surface.id()))
+            .map(|record| record.id.0),
+        exclusive_latch: state
+            .exclusive_keyboard_focus
+            .as_ref()
+            .and_then(|object| state.surfaces.get(object))
+            .map(|record| record.id.0),
+    }
+}
+
 fn service_output_edges(state: &mut WaylandState) {
     let pending = std::mem::take(&mut state.observations.dirty_outputs);
     let topology_dirty = std::mem::take(&mut state.observations.output_topology_dirty);
     if pending.is_empty() && !topology_dirty {
         return;
     }
-    let final_rows = project_outputs(state)
-        .map(|projection| projection.rows)
+    let final_rows = topology_dirty
+        .then(|| project_outputs(state).map(|projection| projection.rows))
+        .flatten()
         .unwrap_or_default();
     let old_keys = pending.keys().cloned().collect::<BTreeSet<_>>();
     let final_keys = final_rows.keys().cloned().collect::<BTreeSet<_>>();
@@ -803,7 +897,13 @@ fn service_output_edges(state: &mut WaylandState) {
     }
     let mut emitted = BTreeSet::new();
     for (key, old) in pending {
-        let Some(row) = final_rows.get(&key) else {
+        let row = if topology_dirty {
+            final_rows.get(&key).cloned()
+        } else {
+            project_output(state, &old.output)
+                .and_then(|(final_key, row)| (final_key == key).then_some(row))
+        };
+        let Some(row) = row else {
             continue;
         };
         if old.row.x == row.x
@@ -815,7 +915,6 @@ fn service_output_edges(state: &mut WaylandState) {
             continue;
         }
         state.reset_corner_detector();
-        let row = row.clone();
         state
             .observations
             .offer(|event_seq| ObservationRecord::OutputChanged {
@@ -876,36 +975,37 @@ fn service_property_diffs(state: &mut WaylandState) {
         return;
     }
 
-    let output_projection = project_outputs(state);
     let dirty_outputs = std::mem::take(&mut state.observations.property_dirty_outputs);
-    if let Some(projection) = &output_projection {
-        for (key, cause) in dirty_outputs {
-            let old = baseline.outputs.get(&key).cloned();
-            let new = projection.rows.get(&key).cloned();
-            diff_row(
-                &format!("outputs.{key}"),
-                old.as_ref(),
-                new.as_ref(),
-                cause,
-                &mut changes,
-            );
-            match new {
-                Some(row) => {
-                    baseline.outputs.insert(key, row);
-                }
-                None => {
-                    baseline.outputs.remove(&key);
-                }
+    for (key, (output, cause)) in dirty_outputs {
+        let old = baseline.outputs.get(&key).cloned();
+        let new = project_output(state, &output)
+            .filter(|(final_key, _)| final_key == &key)
+            .map(|(_, row)| row);
+        diff_output_row(
+            &format!("outputs.{key}"),
+            old.as_ref(),
+            new.as_ref(),
+            cause,
+            &mut changes,
+        );
+        match new {
+            Some(row) => {
+                baseline.outputs.insert(key, row);
+            }
+            None => {
+                baseline.outputs.remove(&key);
             }
         }
     }
     let dirty_surfaces = std::mem::take(&mut state.observations.dirty_surfaces);
-    if let Some(projection) = &output_projection {
+    if !dirty_surfaces.is_empty()
+        && let Some(projection) = project_outputs(state)
+    {
         for (raw_id, cause) in dirty_surfaces {
             let key = format!("s{raw_id}");
             let old_surface = baseline.surfaces.get(&key).cloned();
             let new_surface = project_surface_by_id(state, SurfaceId(raw_id), &projection.keys);
-            diff_row(
+            diff_surface_row(
                 &format!("surfaces.{key}"),
                 old_surface.as_ref(),
                 new_surface.as_ref(),
@@ -918,7 +1018,7 @@ fn service_property_diffs(state: &mut WaylandState) {
                     if row.role == "toplevel" && row.mapped && !state.session_lock_active() {
                         let old_window = baseline.windows.get(&key).cloned();
                         let new_window = project_window_row(&row);
-                        diff_row(
+                        diff_window_row(
                             &format!("windows.{key}"),
                             old_window.as_ref(),
                             Some(&new_window),
@@ -927,7 +1027,7 @@ fn service_property_diffs(state: &mut WaylandState) {
                         );
                         baseline.windows.insert(key, new_window);
                     } else if let Some(old_window) = baseline.windows.remove(&key) {
-                        diff_row::<WindowSnapshot>(
+                        diff_window_row(
                             &format!("windows.{key}"),
                             Some(&old_window),
                             None,
@@ -939,7 +1039,7 @@ fn service_property_diffs(state: &mut WaylandState) {
                 None => {
                     baseline.surfaces.remove(&key);
                     if let Some(old_window) = baseline.windows.remove(&key) {
-                        diff_row::<WindowSnapshot>(
+                        diff_window_row(
                             &format!("windows.{key}"),
                             Some(&old_window),
                             None,
@@ -958,8 +1058,8 @@ fn service_property_diffs(state: &mut WaylandState) {
             queue_prop_change(
                 &mut changes,
                 "stack".to_string(),
-                json!(baseline.stack),
-                json!(next),
+                PropValue::U64List(baseline.stack.clone()),
+                PropValue::U64List(next.clone()),
                 cause,
             );
             baseline.stack = next;
@@ -968,13 +1068,7 @@ fn service_property_diffs(state: &mut WaylandState) {
     let focus = project_focus(state);
     if baseline.focus != focus {
         let cause = state.observations.focus_cause;
-        diff_row(
-            "focus",
-            Some(&baseline.focus),
-            Some(&focus),
-            cause,
-            &mut changes,
-        );
+        diff_focus("focus", &baseline.focus, &focus, cause, &mut changes);
         baseline.focus = focus;
     }
     state.observations.focus_cause = "wayland.focus";
@@ -988,40 +1082,505 @@ fn collect_snapshot_diff(
     cause: &'static str,
     pending: &mut PendingPropChanges,
 ) {
-    let old = serde_json::to_value(old).unwrap_or(Value::Null);
-    let new = serde_json::to_value(new).unwrap_or(Value::Null);
-    let mut changes = BTreeMap::new();
-    collect_leaf_diffs("", &old, &new, &mut changes);
-    for (path, (old, new)) in changes {
-        queue_prop_change(pending, path, old, new, cause);
+    let output_keys = old
+        .outputs
+        .keys()
+        .chain(new.outputs.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for key in output_keys {
+        diff_output_row(
+            &format!("outputs.{key}"),
+            old.outputs.get(&key),
+            new.outputs.get(&key),
+            cause,
+            pending,
+        );
     }
+    let surface_keys = old
+        .surfaces
+        .keys()
+        .chain(new.surfaces.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for key in surface_keys {
+        diff_surface_row(
+            &format!("surfaces.{key}"),
+            old.surfaces.get(&key),
+            new.surfaces.get(&key),
+            cause,
+            pending,
+        );
+    }
+    let window_keys = old
+        .windows
+        .keys()
+        .chain(new.windows.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for key in window_keys {
+        diff_window_row(
+            &format!("windows.{key}"),
+            old.windows.get(&key),
+            new.windows.get(&key),
+            cause,
+            pending,
+        );
+    }
+    queue_prop_change(
+        pending,
+        "stack".into(),
+        PropValue::U64List(old.stack.clone()),
+        PropValue::U64List(new.stack.clone()),
+        cause,
+    );
+    diff_focus("focus", &old.focus, &new.focus, cause, pending);
+    queue_prop_change(
+        pending,
+        "decoration.enabled".into(),
+        PropValue::Bool(old.decoration.enabled),
+        PropValue::Bool(new.decoration.enabled),
+        cause,
+    );
+    queue_prop_change(
+        pending,
+        "decoration.style".into(),
+        prop_str(old.decoration.style),
+        prop_str(new.decoration.style),
+        cause,
+    );
+    queue_prop_change(
+        pending,
+        "bindings.enabled".into(),
+        PropValue::Bool(old.bindings.enabled),
+        PropValue::Bool(new.bindings.enabled),
+        cause,
+    );
+    queue_prop_change(
+        pending,
+        "bindings.profile".into(),
+        prop_str(old.bindings.profile),
+        prop_str(new.bindings.profile),
+        cause,
+    );
+    queue_prop_change(
+        pending,
+        "bindings.table".into(),
+        PropValue::BindingRows(old.bindings.table.clone()),
+        PropValue::BindingRows(new.bindings.table.clone()),
+        cause,
+    );
+    diff_corners(old, new, cause, pending);
 }
 
-fn diff_row<T: serde::Serialize>(
-    prefix: &str,
-    old: Option<&T>,
-    new: Option<&T>,
+fn diff_corners(
+    old: &CompSnapshot,
+    new: &CompSnapshot,
     cause: &'static str,
     pending: &mut PendingPropChanges,
 ) {
-    let old = old
-        .and_then(|row| serde_json::to_value(row).ok())
-        .unwrap_or(Value::Null);
-    let new = new
-        .and_then(|row| serde_json::to_value(row).ok())
-        .unwrap_or(Value::Null);
-    let mut changes = BTreeMap::new();
-    collect_leaf_diffs(prefix, &old, &new, &mut changes);
-    for (path, (old, new)) in changes {
-        queue_prop_change(pending, path, old, new, cause);
+    let old = old.input.corners;
+    let new = new.input.corners;
+    for (leaf, old, new) in [
+        (
+            "enabled",
+            PropValue::Bool(old.enabled),
+            PropValue::Bool(new.enabled),
+        ),
+        (
+            "deadzone_px",
+            PropValue::F64(old.deadzone_px),
+            PropValue::F64(new.deadzone_px),
+        ),
+        (
+            "dwell_ms",
+            PropValue::U64(old.dwell_ms),
+            PropValue::U64(new.dwell_ms),
+        ),
+        (
+            "velocity_max_px_s",
+            PropValue::F64(old.velocity_max_px_s),
+            PropValue::F64(new.velocity_max_px_s),
+        ),
+    ] {
+        queue_prop_change(pending, format!("input.corners.{leaf}"), old, new, cause);
     }
+}
+
+fn diff_output_row(
+    prefix: &str,
+    old: Option<&OutputSnapshot>,
+    new: Option<&OutputSnapshot>,
+    cause: &'static str,
+    pending: &mut PendingPropChanges,
+) {
+    match (old, new) {
+        (None, None) => {}
+        (None, Some(new)) => {
+            queue_prop_change(
+                pending,
+                prefix.into(),
+                PropValue::null(),
+                PropValue::OutputRow(Box::new(new.clone())),
+                cause,
+            );
+        }
+        (Some(old), None) => {
+            queue_prop_change(
+                pending,
+                prefix.into(),
+                PropValue::OutputRow(Box::new(old.clone())),
+                PropValue::null(),
+                cause,
+            );
+        }
+        (Some(old), Some(new)) => {
+            for (leaf, old, new) in [
+                ("name", prop_str(&old.name), prop_str(&new.name)),
+                (
+                    "default",
+                    PropValue::Bool(old.default),
+                    PropValue::Bool(new.default),
+                ),
+                ("x", PropValue::I32(old.x), PropValue::I32(new.x)),
+                ("y", PropValue::I32(old.y), PropValue::I32(new.y)),
+                (
+                    "width",
+                    PropValue::U32(old.width),
+                    PropValue::U32(new.width),
+                ),
+                (
+                    "height",
+                    PropValue::U32(old.height),
+                    PropValue::U32(new.height),
+                ),
+                (
+                    "scale",
+                    PropValue::F64(old.scale),
+                    PropValue::F64(new.scale),
+                ),
+                (
+                    "refresh_mhz",
+                    PropValue::U32(old.refresh_mhz),
+                    PropValue::U32(new.refresh_mhz),
+                ),
+                (
+                    "usable.x",
+                    PropValue::F32(old.usable.x),
+                    PropValue::F32(new.usable.x),
+                ),
+                (
+                    "usable.y",
+                    PropValue::F32(old.usable.y),
+                    PropValue::F32(new.usable.y),
+                ),
+                (
+                    "usable.width",
+                    PropValue::F32(old.usable.width),
+                    PropValue::F32(new.usable.width),
+                ),
+                (
+                    "usable.height",
+                    PropValue::F32(old.usable.height),
+                    PropValue::F32(new.usable.height),
+                ),
+            ] {
+                queue_prop_change(pending, format!("{prefix}.{leaf}"), old, new, cause);
+            }
+        }
+    }
+}
+
+fn diff_surface_row(
+    prefix: &str,
+    old: Option<&SurfaceSnapshot>,
+    new: Option<&SurfaceSnapshot>,
+    cause: &'static str,
+    pending: &mut PendingPropChanges,
+) {
+    let (old, new) = match (old, new) {
+        (None, None) => return,
+        (None, Some(new)) => {
+            queue_prop_change(
+                pending,
+                prefix.into(),
+                PropValue::null(),
+                PropValue::SurfaceRow(Box::new(new.clone())),
+                cause,
+            );
+            return;
+        }
+        (Some(old), None) => {
+            queue_prop_change(
+                pending,
+                prefix.into(),
+                PropValue::SurfaceRow(Box::new(old.clone())),
+                PropValue::null(),
+                cause,
+            );
+            return;
+        }
+        (Some(old), Some(new)) => (old, new),
+    };
+    for (leaf, old, new) in [
+        ("id", PropValue::U64(old.id), PropValue::U64(new.id)),
+        ("role", prop_str(old.role), prop_str(new.role)),
+        (
+            "mapped",
+            PropValue::Bool(old.mapped),
+            PropValue::Bool(new.mapped),
+        ),
+        (
+            "visible",
+            PropValue::Bool(old.visible),
+            PropValue::Bool(new.visible),
+        ),
+        ("x", PropValue::F32(old.x), PropValue::F32(new.x)),
+        ("y", PropValue::F32(old.y), PropValue::F32(new.y)),
+        (
+            "width",
+            PropValue::F32(old.width),
+            PropValue::F32(new.width),
+        ),
+        (
+            "height",
+            PropValue::F32(old.height),
+            PropValue::F32(new.height),
+        ),
+        ("band", prop_str(old.band), prop_str(new.band)),
+        (
+            "sequence",
+            PropValue::U64(old.sequence),
+            PropValue::U64(new.sequence),
+        ),
+        (
+            "tree_index",
+            PropValue::U32(old.tree_index),
+            PropValue::U32(new.tree_index),
+        ),
+        ("parent", prop_opt_u64(old.parent), prop_opt_u64(new.parent)),
+        (
+            "output",
+            prop_opt_string(old.output.as_deref()),
+            prop_opt_string(new.output.as_deref()),
+        ),
+        (
+            "title",
+            prop_opt_string(old.title.as_deref()),
+            prop_opt_string(new.title.as_deref()),
+        ),
+        (
+            "app_id",
+            prop_opt_string(old.app_id.as_deref()),
+            prop_opt_string(new.app_id.as_deref()),
+        ),
+        (
+            "focused",
+            PropValue::Bool(old.focused),
+            PropValue::Bool(new.focused),
+        ),
+        (
+            "activated",
+            PropValue::Bool(old.activated),
+            PropValue::Bool(new.activated),
+        ),
+        (
+            "maximized",
+            PropValue::Bool(old.maximized),
+            PropValue::Bool(new.maximized),
+        ),
+        (
+            "minimized",
+            PropValue::Bool(old.minimized),
+            PropValue::Bool(new.minimized),
+        ),
+        (
+            "decoration",
+            prop_opt_string(old.decoration),
+            prop_opt_string(new.decoration),
+        ),
+        (
+            "foreign_id",
+            prop_opt_string(old.foreign_id.as_deref()),
+            prop_opt_string(new.foreign_id.as_deref()),
+        ),
+    ] {
+        queue_prop_change(pending, format!("{prefix}.{leaf}"), old, new, cause);
+    }
+    diff_layer(
+        prefix,
+        old.layer.as_ref(),
+        new.layer.as_ref(),
+        cause,
+        pending,
+    );
+}
+
+fn diff_layer(
+    prefix: &str,
+    old: Option<&LayerSnapshot>,
+    new: Option<&LayerSnapshot>,
+    cause: &'static str,
+    pending: &mut PendingPropChanges,
+) {
+    let old_stratum = old.map_or_else(PropValue::null, |row| prop_str(row.stratum));
+    let new_stratum = new.map_or_else(PropValue::null, |row| prop_str(row.stratum));
+    let old_interactivity = old.map_or_else(PropValue::null, |row| prop_str(row.interactivity));
+    let new_interactivity = new.map_or_else(PropValue::null, |row| prop_str(row.interactivity));
+    let old_zone = old.map_or_else(PropValue::null, |row| PropValue::I32(row.exclusive_zone));
+    let new_zone = new.map_or_else(PropValue::null, |row| PropValue::I32(row.exclusive_zone));
+    let old_binding = old.map_or_else(PropValue::null, |row| prop_str(row.binding));
+    let new_binding = new.map_or_else(PropValue::null, |row| prop_str(row.binding));
+    for (leaf, old, new) in [
+        ("stratum", old_stratum, new_stratum),
+        ("interactivity", old_interactivity, new_interactivity),
+        ("exclusive_zone", old_zone, new_zone),
+        ("binding", old_binding, new_binding),
+    ] {
+        queue_prop_change(pending, format!("{prefix}.layer.{leaf}"), old, new, cause);
+    }
+}
+
+fn diff_window_row(
+    prefix: &str,
+    old: Option<&WindowSnapshot>,
+    new: Option<&WindowSnapshot>,
+    cause: &'static str,
+    pending: &mut PendingPropChanges,
+) {
+    let (old, new) = match (old, new) {
+        (None, None) => return,
+        (None, Some(new)) => {
+            queue_prop_change(
+                pending,
+                prefix.into(),
+                PropValue::null(),
+                PropValue::WindowRow(Box::new(new.clone())),
+                cause,
+            );
+            return;
+        }
+        (Some(old), None) => {
+            queue_prop_change(
+                pending,
+                prefix.into(),
+                PropValue::WindowRow(Box::new(old.clone())),
+                PropValue::null(),
+                cause,
+            );
+            return;
+        }
+        (Some(old), Some(new)) => (old, new),
+    };
+    for (leaf, old, new) in [
+        ("id", PropValue::U64(old.id), PropValue::U64(new.id)),
+        (
+            "foreign_id",
+            prop_opt_string(old.foreign_id.as_deref()),
+            prop_opt_string(new.foreign_id.as_deref()),
+        ),
+        (
+            "title",
+            prop_opt_string(old.title.as_deref()),
+            prop_opt_string(new.title.as_deref()),
+        ),
+        (
+            "app_id",
+            prop_opt_string(old.app_id.as_deref()),
+            prop_opt_string(new.app_id.as_deref()),
+        ),
+        ("x", PropValue::F32(old.x), PropValue::F32(new.x)),
+        ("y", PropValue::F32(old.y), PropValue::F32(new.y)),
+        (
+            "width",
+            PropValue::F32(old.width),
+            PropValue::F32(new.width),
+        ),
+        (
+            "height",
+            PropValue::F32(old.height),
+            PropValue::F32(new.height),
+        ),
+        (
+            "focused",
+            PropValue::Bool(old.focused),
+            PropValue::Bool(new.focused),
+        ),
+        (
+            "maximized",
+            PropValue::Bool(old.maximized),
+            PropValue::Bool(new.maximized),
+        ),
+        (
+            "minimized",
+            PropValue::Bool(old.minimized),
+            PropValue::Bool(new.minimized),
+        ),
+        (
+            "output",
+            prop_opt_string(old.output.as_deref()),
+            prop_opt_string(new.output.as_deref()),
+        ),
+    ] {
+        queue_prop_change(pending, format!("{prefix}.{leaf}"), old, new, cause);
+    }
+}
+
+fn diff_focus(
+    prefix: &str,
+    old: &FocusSnapshot,
+    new: &FocusSnapshot,
+    cause: &'static str,
+    pending: &mut PendingPropChanges,
+) {
+    for (leaf, old, new) in [
+        (
+            "keyboard",
+            prop_opt_u64(old.keyboard),
+            prop_opt_u64(new.keyboard),
+        ),
+        (
+            "exclusive_latch",
+            prop_opt_u64(old.exclusive_latch),
+            prop_opt_u64(new.exclusive_latch),
+        ),
+        (
+            "pointer",
+            prop_opt_u64(old.pointer),
+            prop_opt_u64(new.pointer),
+        ),
+        (
+            "pointer_grab",
+            prop_str(old.pointer_grab),
+            prop_str(new.pointer_grab),
+        ),
+        (
+            "session_lock",
+            prop_str(old.session_lock),
+            prop_str(new.session_lock),
+        ),
+    ] {
+        queue_prop_change(pending, format!("{prefix}.{leaf}"), old, new, cause);
+    }
+}
+
+fn prop_str(value: &str) -> PropValue {
+    PropValue::String(value.to_string())
+}
+
+fn prop_opt_string(value: Option<&str>) -> PropValue {
+    value.map_or_else(PropValue::null, prop_str)
+}
+
+fn prop_opt_u64(value: Option<u64>) -> PropValue {
+    value.map_or_else(PropValue::null, PropValue::U64)
 }
 
 fn queue_prop_change(
     pending: &mut PendingPropChanges,
     path: String,
-    old: Value,
-    new: Value,
+    old: PropValue,
+    new: PropValue,
     cause: &'static str,
 ) {
     if old == new || path.starts_with("port.") {
@@ -1046,52 +1605,11 @@ fn flush_prop_changes(state: &mut WaylandState, changes: PendingPropChanges) {
     }
 }
 
-fn collect_leaf_diffs(
-    prefix: &str,
-    old: &Value,
-    new: &Value,
-    changes: &mut BTreeMap<String, (Value, Value)>,
-) {
-    if old == new {
-        return;
-    }
-    let old_object = old.as_object();
-    let new_object = new.as_object();
-    if old_object.is_none() && new_object.is_none() {
-        changes.insert(prefix.to_string(), (old.clone(), new.clone()));
-        return;
-    }
-    let mut keys = BTreeSet::new();
-    if let Some(object) = old_object {
-        keys.extend(object.keys().cloned());
-    }
-    if let Some(object) = new_object {
-        keys.extend(object.keys().cloned());
-    }
-    for key in keys {
-        let child_prefix = if prefix.is_empty() {
-            key.clone()
-        } else {
-            format!("{prefix}.{key}")
-        };
-        collect_leaf_diffs(
-            &child_prefix,
-            old_object
-                .and_then(|object| object.get(&key))
-                .unwrap_or(&Value::Null),
-            new_object
-                .and_then(|object| object.get(&key))
-                .unwrap_or(&Value::Null),
-            changes,
-        );
-    }
-}
-
 fn emit_prop_change(
     state: &mut WaylandState,
     path: String,
-    old: Value,
-    new: Value,
+    old: PropValue,
+    new: PropValue,
     cause: &'static str,
 ) {
     if old == new || path.starts_with("port.") {
@@ -1120,87 +1638,92 @@ fn unix_millis() -> i64 {
 
 fn service_controls(state: &mut WaylandState) {
     let mut controls = std::mem::take(&mut state.pending_port_controls);
-    if let Some(order) = state
-        .port_context
-        .as_ref()
-        .map(|context| context.pending_idle_order.swap(0, Ordering::AcqRel))
-        .filter(|order| *order != 0)
-    {
-        controls.push(PortControl::WatchState {
-            active: false,
-            order,
-        });
-    }
-    controls.sort_by_key(PortControl::order);
-    let mut changes = PendingPropChanges::new();
-    let mut watch_seed = None;
-    for control in controls {
-        match control {
-            PortControl::Watch(request) => {
-                flush_set_changes(state, std::mem::take(&mut changes));
-                let reply = state.port_context.clone().and_then(|context| {
-                    if watch_seed.is_none() {
-                        watch_seed = snapshot(state, &context);
-                    }
-                    watch_seed.clone().map(|baseline| {
-                        state.observations.watched_baseline = Some(baseline);
-                        (
-                            0,
-                            Arc::from(
-                                json!({
-                                    "topic": topic_name(
-                                        &context.service,
-                                        PROPS_TOPIC_SUFFIX,
-                                    ),
-                                    "event_seq": state.observations.event_seq,
-                                    "lost_count": context.lost_count.load(Ordering::Acquire),
-                                })
-                                .to_string(),
-                            ),
-                        )
-                    })
-                });
-                let _ = request.reply.send(reply.unwrap_or_else(|| error("busy")));
-            }
-            PortControl::Set(request) => {
-                watch_seed = None;
-                service_set(state, request, &mut changes);
-            }
-            PortControl::WatchState { active, .. } => {
-                if !active {
-                    flush_set_changes(state, std::mem::take(&mut changes));
-                    watch_seed = None;
-                    state.observations.drop_watch();
-                }
+    if let Some(context) = state.port_context.as_ref() {
+        for (active, order) in [
+            (false, context.pending_idle_order.swap(0, Ordering::AcqRel)),
+            (true, context.pending_active_order.swap(0, Ordering::AcqRel)),
+        ] {
+            if order != 0 {
+                controls.push(PortControl::WatchState { active, order });
             }
         }
     }
+    controls.sort_by_key(PortControl::order);
+    let mut changes = PendingPropChanges::new();
+    for control in &mut controls {
+        if let PortControl::Set(request) = control {
+            service_set(state, request, &mut changes);
+        }
+    }
     flush_set_changes(state, changes);
+
+    let mut desired_active = state.observations.watched_baseline.is_some();
+    let mut watches = Vec::new();
+    for control in controls {
+        match control {
+            PortControl::Watch(request) => {
+                desired_active = true;
+                watches.push(request);
+            }
+            PortControl::WatchState { active, .. } => desired_active = active,
+            PortControl::Set(_) => {}
+        }
+    }
+
+    let needs_seed =
+        !watches.is_empty() || (desired_active && state.observations.watched_baseline.is_none());
+    let seed = needs_seed
+        .then(|| {
+            state
+                .port_context
+                .clone()
+                .and_then(|context| snapshot(state, &context).map(|baseline| (context, baseline)))
+        })
+        .flatten();
+    if desired_active {
+        if let Some((_, baseline)) = &seed {
+            state.observations.watched_baseline = Some(baseline.clone());
+        }
+    } else {
+        state.observations.drop_watch();
+    }
+    for request in watches {
+        let reply = seed
+            .as_ref()
+            .map_or(ControlReply::Busy, |(context, _)| ControlReply::Watch {
+                topic: topic_name(&context.service, PROPS_TOPIC_SUFFIX),
+                event_seq: state.observations.event_seq,
+                lost_count: context.lost_count.load(Ordering::Acquire),
+            });
+        let _ = request.reply.send(reply);
+    }
 }
 
 fn service_set(
     state: &mut WaylandState,
-    request: PortSetRequest,
+    request: &mut PortSetRequest,
     changes: &mut PendingPropChanges,
 ) {
-    let path = request.path;
+    let path = request.path.clone();
     let old_config = state.observations.corner_config;
     let mut new_config = old_config;
-    let (old, new) = match validate_corner_value(&path, &request.value, &mut new_config) {
-        Ok(values) => values,
-        Err(reply) => {
-            let _ = request.reply.send(reply);
+    let validated = match validate_corner_value(&path, &request.value) {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(reply) = request.reply.take() {
+                let _ = reply.send(ControlReply::Validation(error));
+            }
             return;
         }
     };
+    let (old, new) = apply_corner_value(&mut new_config, validated);
     if old != new {
         state.apply_corner_config(new_config);
         queue_prop_change(changes, path.clone(), old.clone(), new.clone(), "props.set");
     }
-    let _ = request.reply.send((
-        0,
-        Arc::from(json!({"path": path, "old": old, "new": new}).to_string()),
-    ));
+    if let Some(reply) = request.reply.take() {
+        let _ = reply.send(ControlReply::Set { path, old, new });
+    }
 }
 
 fn flush_set_changes(state: &mut WaylandState, changes: PendingPropChanges) {
@@ -1210,49 +1733,68 @@ fn flush_set_changes(state: &mut WaylandState, changes: PendingPropChanges) {
     }
 }
 
-fn validate_corner_value(
+pub(crate) fn validate_corner_value(
     path: &str,
     value: &Value,
-    config: &mut CornerConfig,
-) -> Result<(Value, Value), (u8, Arc<str>)> {
+) -> Result<ValidatedCornerValue, SetValidationError> {
     match path {
         "input.corners.enabled" => {
             let Some(value) = value.as_bool() else {
                 return Err(invalid_value(path, "bool", "true|false"));
             };
-            let old = config.enabled;
-            config.enabled = value;
-            Ok((json!(old), json!(value)))
+            Ok(ValidatedCornerValue::Enabled(value))
         }
         "input.corners.deadzone_px" => {
             let value = finite_number(path, value, "finite number", "1.0..=256.0")?;
             if !(1.0..=256.0).contains(&value) {
                 return Err(invalid_value(path, "finite number", "1.0..=256.0"));
             }
-            let old = config.deadzone_px;
-            config.deadzone_px = value;
-            Ok((json!(old), json!(value)))
+            Ok(ValidatedCornerValue::DeadzonePx(value))
         }
         "input.corners.dwell_ms" => {
             let Some(value) = value.as_u64().filter(|value| *value <= 5_000) else {
                 return Err(invalid_value(path, "integer", "0..=5000"));
             };
-            let old = config.dwell_ms;
-            config.dwell_ms = value;
-            Ok((json!(old), json!(value)))
+            Ok(ValidatedCornerValue::DwellMs(value))
         }
         "input.corners.velocity_max_px_s" => {
             let value = finite_number(path, value, "finite number", "1.0..=20000.0")?;
             if !(1.0..=20_000.0).contains(&value) {
                 return Err(invalid_value(path, "finite number", "1.0..=20000.0"));
             }
+            Ok(ValidatedCornerValue::VelocityMaxPxS(value))
+        }
+        _ if path.starts_with("input.corners.") => Err(SetValidationError::UnknownPath),
+        _ if known_read_only_path(path) => Err(SetValidationError::ReadOnly),
+        _ => Err(SetValidationError::UnknownPath),
+    }
+}
+
+fn apply_corner_value(
+    config: &mut CornerConfig,
+    value: ValidatedCornerValue,
+) -> (PropValue, PropValue) {
+    match value {
+        ValidatedCornerValue::Enabled(value) => {
+            let old = config.enabled;
+            config.enabled = value;
+            (PropValue::Bool(old), PropValue::Bool(value))
+        }
+        ValidatedCornerValue::DeadzonePx(value) => {
+            let old = config.deadzone_px;
+            config.deadzone_px = value;
+            (PropValue::F64(old), PropValue::F64(value))
+        }
+        ValidatedCornerValue::DwellMs(value) => {
+            let old = config.dwell_ms;
+            config.dwell_ms = value;
+            (PropValue::U64(old), PropValue::U64(value))
+        }
+        ValidatedCornerValue::VelocityMaxPxS(value) => {
             let old = config.velocity_max_px_s;
             config.velocity_max_px_s = value;
-            Ok((json!(old), json!(value)))
+            (PropValue::F64(old), PropValue::F64(value))
         }
-        _ if path.starts_with("input.corners.") => Err(error("unknown_path")),
-        _ if known_read_only_path(path) => Err(error("read_only")),
-        _ => Err(error("unknown_path")),
     }
 }
 
@@ -1261,26 +1803,19 @@ fn finite_number(
     value: &Value,
     expected: &'static str,
     range: &'static str,
-) -> Result<f64, (u8, Arc<str>)> {
+) -> Result<f64, SetValidationError> {
     value
         .as_f64()
         .filter(|number| number.is_finite())
         .ok_or_else(|| invalid_value(path, expected, range))
 }
 
-fn invalid_value(path: &str, expected: &str, range: &str) -> (u8, Arc<str>) {
-    (
-        10,
-        Arc::from(
-            json!({
-                "error": "invalid_value",
-                "path": path,
-                "expected": expected,
-                "range": range,
-            })
-            .to_string(),
-        ),
-    )
+fn invalid_value(path: &str, expected: &'static str, range: &'static str) -> SetValidationError {
+    SetValidationError::InvalidValue {
+        path: path.to_string(),
+        expected,
+        range,
+    }
 }
 
 fn known_read_only_path(path: &str) -> bool {
@@ -1324,15 +1859,108 @@ mod tests {
     }
 
     #[test]
-    fn recursive_diff_is_lexical_and_leaf_level() {
-        let old = json!({"b": {"z": 1}, "a": 1});
-        let new = json!({"b": {"z": 2}, "a": 3});
-        let mut changes = BTreeMap::new();
-        collect_leaf_diffs("root", &old, &new, &mut changes);
-        assert_eq!(
-            changes.keys().cloned().collect::<Vec<_>>(),
-            ["root.a", "root.b.z"]
+    fn keyed_row_add_is_one_row_granular_change() {
+        let row = OutputSnapshot {
+            name: "nested".into(),
+            default: true,
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 480,
+            scale: 1.0,
+            refresh_mhz: 60_000,
+            usable: crate::protocol::port_snapshot::RectSnapshot {
+                x: 0.0,
+                y: 0.0,
+                width: 640.0,
+                height: 480.0,
+            },
+        };
+        let mut changes = PendingPropChanges::new();
+        diff_output_row(
+            "outputs.o_nested",
+            None,
+            Some(&row),
+            "output.geometry",
+            &mut changes,
         );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes.remove("outputs.o_nested"),
+            Some((
+                PropValue::null(),
+                PropValue::OutputRow(Box::new(row.clone())),
+                "output.geometry"
+            ))
+        );
+        let wire = ObservationRecord::PropsChanged {
+            path: "outputs.o_nested".into(),
+            old: PropValue::null(),
+            new: PropValue::OutputRow(Box::new(row)),
+            unix_ms: 0,
+            cause: "output.geometry",
+            event_seq: 1,
+        }
+        .wire();
+        let body = serde_json::from_str::<Value>(&wire.body).expect("row frame body");
+        assert!(body["old"].is_null());
+        assert_eq!(body["path"], "outputs.o_nested");
+        assert_eq!(body["new"]["width"], 640);
+
+        let surface = SurfaceSnapshot {
+            id: 7,
+            role: "toplevel",
+            mapped: true,
+            visible: true,
+            x: 1.0,
+            y: 2.0,
+            width: 3.0,
+            height: 4.0,
+            band: "normal",
+            sequence: 1,
+            tree_index: 0,
+            parent: None,
+            output: Some("o_nested".into()),
+            title: Some(Arc::from("row")),
+            app_id: None,
+            focused: false,
+            activated: false,
+            maximized: false,
+            minimized: false,
+            decoration: Some("server"),
+            layer: None,
+            foreign_id: Some("f_7".into()),
+        };
+        let window = project_window_row(&surface);
+        let mut keyed = PendingPropChanges::new();
+        diff_surface_row(
+            "surfaces.s7",
+            None,
+            Some(&surface),
+            "wayland.map",
+            &mut keyed,
+        );
+        diff_window_row("windows.s7", None, Some(&window), "wayland.map", &mut keyed);
+        assert_eq!(
+            keyed.keys().cloned().collect::<Vec<_>>(),
+            ["surfaces.s7", "windows.s7"]
+        );
+        let mut removed = PendingPropChanges::new();
+        diff_surface_row(
+            "surfaces.s7",
+            Some(&surface),
+            None,
+            "wayland.unmap",
+            &mut removed,
+        );
+        assert!(matches!(
+            removed.get("surfaces.s7"),
+            Some((
+                PropValue::SurfaceRow(_),
+                PropValue::Null(()),
+                "wayland.unmap"
+            ))
+        ));
     }
 
     #[test]
@@ -1341,42 +1969,42 @@ mod tests {
         queue_prop_change(
             &mut pending,
             "surfaces.s2.title".into(),
-            json!("old"),
-            json!("middle"),
+            prop_str("old"),
+            prop_str("middle"),
             "wayland.map",
         );
         queue_prop_change(
             &mut pending,
             "surfaces.s2.title".into(),
-            json!("middle"),
-            json!("new"),
+            prop_str("middle"),
+            prop_str("new"),
             "wayland.focus",
         );
         queue_prop_change(
             &mut pending,
             "port.event_seq".into(),
-            json!(1),
-            json!(2),
+            PropValue::U64(1),
+            PropValue::U64(2),
             "wayland.map",
         );
         assert_eq!(
             pending.remove("surfaces.s2.title"),
-            Some((json!("old"), json!("new"), "wayland.map"))
+            Some((prop_str("old"), prop_str("new"), "wayland.map"))
         );
         assert!(pending.is_empty());
 
         queue_prop_change(
             &mut pending,
             "focus.keyboard".into(),
-            Value::Null,
-            json!(2),
+            PropValue::null(),
+            PropValue::U64(2),
             "wayland.focus",
         );
         queue_prop_change(
             &mut pending,
             "focus.keyboard".into(),
-            json!(2),
-            Value::Null,
+            PropValue::U64(2),
+            PropValue::null(),
             "wayland.focus",
         );
         assert!(pending.is_empty());
@@ -1413,8 +2041,8 @@ mod tests {
         let records = [
             ObservationRecord::PropsChanged {
                 path: "input.corners.dwell_ms".into(),
-                old: json!(200),
-                new: json!(250),
+                old: PropValue::U64(200),
+                new: PropValue::U64(250),
                 unix_ms: 0,
                 cause: "props.set",
                 event_seq: 1,
@@ -1500,9 +2128,8 @@ mod tests {
             ("input.corners.velocity_max_px_s", json!(1.0)),
             ("input.corners.velocity_max_px_s", json!(20_000.0)),
         ] {
-            let mut config = CornerConfig::default();
             assert!(
-                validate_corner_value(path, &value, &mut config).is_ok(),
+                validate_corner_value(path, &value).is_ok(),
                 "{path}={value}"
             );
         }
@@ -1513,13 +2140,43 @@ mod tests {
             ("input.corners.dwell_ms", json!(-1)),
             ("input.corners.velocity_max_px_s", json!(null)),
         ] {
-            let mut config = CornerConfig::default();
-            let (rc, body) = validate_corner_value(path, &value, &mut config).unwrap_err();
-            assert_eq!(rc, 10);
-            assert_eq!(
-                serde_json::from_str::<Value>(&body).unwrap()["error"],
-                "invalid_value"
-            );
+            assert!(matches!(
+                validate_corner_value(path, &value),
+                Err(SetValidationError::InvalidValue { .. })
+            ));
         }
+    }
+
+    #[test]
+    fn event_sequence_exhaustion_offers_max_once_then_stops() {
+        let event_loop = smithay::reexports::calloop::EventLoop::<WaylandState>::try_new()
+            .expect("test event loop");
+        let lost = Arc::new(AtomicU64::new(0));
+        let (producer, receiver) = outbox(lost);
+        let watermark = Arc::new(AtomicU64::new(0));
+        let mut state =
+            ObservationState::new(producer, Arc::clone(&watermark), event_loop.handle());
+        state.event_seq = u64::MAX - 1;
+        state.offer(|event_seq| ObservationRecord::FocusChanged {
+            keyboard: None,
+            previous: None,
+            exclusive_latch: None,
+            event_seq,
+        });
+        state.offer(|event_seq| ObservationRecord::FocusChanged {
+            keyboard: None,
+            previous: None,
+            exclusive_latch: None,
+            event_seq,
+        });
+        assert_eq!(
+            receiver
+                .try_iter()
+                .map(|record| record.event_seq())
+                .collect::<Vec<_>>(),
+            [u64::MAX]
+        );
+        assert_eq!(watermark.load(Ordering::Acquire), u64::MAX);
+        assert!(state.event_seq_exhausted);
     }
 }

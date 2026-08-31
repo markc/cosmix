@@ -93,8 +93,15 @@ cycle, with its cycle-start `old`, final `new`, lexical path order and one of
 `layer.arrange`, `session.lock` or `props.set` as `cause`. Operational `port.*`
 leaves are readable but are not self-published as property changes.
 
+Keyed row creation and removal are row-granular: an appearing
+`surfaces.s<id>`, `windows.s<id>` or `outputs.o_<slug>` emits one frame at the
+row path with `old:null,new:<full row>`, and removal emits the inverse.
+Mutations within an existing row remain leaf-granular.
+
 The sequence is process-global, strictly increasing and shared by property,
-surface, focus, output and corner records. If the bounded 64-record outbox
+surface, focus, output and corner records. If it reaches `u64::MAX`, that value
+is offered once and observation enters a terminal exhausted state rather than
+reusing a sequence. If the bounded 256-record outbox
 evicts old records, the next surviving topic receives a gap first: Bus header
 `event_seq=<last lost seq>` and body
 `{gap:true,lost_count,cause:"outbox.overflow"}`. A rejected or timed-out
@@ -124,8 +131,10 @@ the caller has a canonical registered service name, and the wire contains no
 `source_peer`, `permissions` or `signed_ident` claim. Otherwise the reply is
 rc 10 `{"error":"not_local"}` before calloop admission. Unknown and immutable
 paths return `unknown_path` and `read_only`; type/range failures return
-`{error:"invalid_value",path,expected,range}`. A no-op write replies normally
-without a change record.
+`{error:"invalid_value",path,expected,range}`. All four path/type/range checks
+run on the worker before admission and are repeated on calloop as
+defence-in-depth, so invalid writes consume no ingress or responder permit. A
+no-op write replies normally without a change record.
 
 `focus.session_lock` is `none`, `locking`, `locked`, `orphaned` or `unlocking`.
 While a session lock is active, the read tree applies the same
@@ -161,6 +170,14 @@ stalled topic sink does not stop incoming commands. Full-tree JSON is
 serialised once per snapshot on the blocking pool, with only one full-tree
 serialisation active process-wide; requests share the resulting string. Subtree
 reads serialise only the selected value.
+
+The semantic observation reducer carries typed rows and scalar values across
+the bounded outbox; only the worker constructs topic JSON. Successful offers
+wake the publisher with an event notification, which drains the outbox to
+empty. There is no publisher polling timer or idle tick source. `topic.idle`
+drops the property baseline and a later `topic.active` seeds one at the next
+stable service point; both lifecycle directions coalesce latest-wins if the
+ingress is temporarily full.
 
 The 16,384-surface cap bounds tree cardinality, not reply bytes. A full tree can
 still serialise far beyond the wire allowance, so comp measures the cached

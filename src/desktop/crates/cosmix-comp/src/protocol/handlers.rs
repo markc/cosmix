@@ -567,6 +567,13 @@ impl CompositorHandler for WaylandState {
                                 .get_mut(&surface.id())
                                 .expect("surface existence checked above");
                             let old_origin = (record.layout.x, record.layout.y);
+                            #[cfg(feature = "bus")]
+                            let old_layout = (
+                                record.layout.x,
+                                record.layout.y,
+                                record.layout.width,
+                                record.layout.height,
+                            );
                             if let Some(window_geometry) = window_geometry {
                                 record.layout.x = record.window_origin.0 - window_geometry.x;
                                 record.layout.y = record.window_origin.1 - window_geometry.y;
@@ -582,6 +589,14 @@ impl CompositorHandler for WaylandState {
                                 record.layout.y - old_origin.1,
                             );
                             let record_id = record.id;
+                            #[cfg(feature = "bus")]
+                            let projected_layout_changed = old_layout
+                                != (
+                                    record.layout.x,
+                                    record.layout.y,
+                                    record.layout.width,
+                                    record.layout.height,
+                                );
                             if publish_surface {
                                 self.events.push(ProtocolEvent::SurfaceRelayout {
                                     id: record.id,
@@ -590,6 +605,10 @@ impl CompositorHandler for WaylandState {
                             }
                             if delta != (0.0, 0.0) {
                                 self.shift_surface_descendants(record_id, delta);
+                            }
+                            #[cfg(feature = "bus")]
+                            if projected_layout_changed {
+                                self.mark_surface_dirty(record_id, "wayland.map");
                             }
                         }
                         Err(error) => {
