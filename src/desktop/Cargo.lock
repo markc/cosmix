@@ -2731,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "bevy",
  "cosmix-shell",
@@ -2750,7 +2750,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell-host"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bevy",
  "calloop 0.13.0",

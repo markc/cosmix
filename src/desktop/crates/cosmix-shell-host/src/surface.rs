@@ -51,25 +51,19 @@ pub(crate) struct FrameCallbackData {
 
 #[derive(Debug)]
 pub(crate) struct FractionalObjects {
-    pub scale: WpFractionalScaleV1,
-    pub viewport: WpViewport,
-}
-
-impl FractionalObjects {
-    fn destroy(self) {
-        drop(self);
-    }
+    pub scale: Option<WpFractionalScaleV1>,
+    pub viewport: Option<WpViewport>,
 }
 
 impl Drop for FractionalObjects {
     fn drop(&mut self) {
-        destroy_addons_in_order(|| self.viewport.destroy(), || self.scale.destroy());
+        if let Some(viewport) = self.viewport.take() {
+            viewport.destroy();
+        }
+        if let Some(scale) = self.scale.take() {
+            scale.destroy();
+        }
     }
-}
-
-fn destroy_addons_in_order(destroy_viewport: impl FnOnce(), destroy_scale: impl FnOnce()) {
-    destroy_viewport();
-    destroy_scale();
 }
 
 pub(crate) fn frame_request_overdue(
@@ -81,27 +75,77 @@ pub(crate) fn frame_request_overdue(
 }
 
 trait Teardown: Debug {
-    fn teardown(self);
+    fn teardown(&mut self);
+}
+
+trait TeardownSteps {
+    fn destroy_viewport(&mut self);
+    fn destroy_fractional_scale(&mut self);
+    fn drop_layer_role(&mut self);
+    fn drop_retained_owner(&mut self);
+}
+
+fn run_teardown<S: TeardownSteps>(steps: &mut S) {
+    steps.destroy_viewport();
+    steps.destroy_fractional_scale();
+    steps.drop_layer_role();
+    steps.drop_retained_owner();
 }
 
 #[derive(Debug)]
 struct LiveObjects {
     fractional: Option<FractionalObjects>,
-    layer_surface: LayerSurface,
-    raw_handle: RawHandleWrapper,
-    raw_owner: RetainedWindow,
+    layer_surface: Option<LayerSurface>,
+    raw_handle: Option<RawHandleWrapper>,
+    raw_owner: Option<RetainedWindow>,
+}
+
+impl LiveObjects {
+    fn layer_surface(&self) -> &LayerSurface {
+        self.layer_surface
+            .as_ref()
+            .expect("live Wayland objects retain their layer role")
+    }
+
+    fn raw_handle(&self) -> &RawHandleWrapper {
+        self.raw_handle
+            .as_ref()
+            .expect("live Wayland objects retain their raw handle")
+    }
+}
+
+impl TeardownSteps for LiveObjects {
+    fn destroy_viewport(&mut self) {
+        if let Some(fractional) = self.fractional.as_mut()
+            && let Some(viewport) = fractional.viewport.take()
+        {
+            viewport.destroy();
+        }
+    }
+
+    fn destroy_fractional_scale(&mut self) {
+        if let Some(mut fractional) = self.fractional.take()
+            && let Some(scale) = fractional.scale.take()
+        {
+            scale.destroy();
+        }
+    }
+
+    fn drop_layer_role(&mut self) {
+        // SCTK destroys the layer role when the last LayerSurface drops.
+        drop(self.layer_surface.take());
+    }
+
+    fn drop_retained_owner(&mut self) {
+        // Release both raw-handle owner references only after the layer role.
+        drop(self.raw_handle.take());
+        drop(self.raw_owner.take());
+    }
 }
 
 impl Teardown for LiveObjects {
-    fn teardown(mut self) {
-        if let Some(fractional) = self.fractional.take() {
-            fractional.destroy();
-        }
-        // SCTK destroys the layer role when the last LayerSurface drops.
-        // Release both raw-handle owner references only after that role.
-        drop(self.layer_surface);
-        drop(self.raw_handle);
-        drop(self.raw_owner);
+    fn teardown(&mut self) {
+        run_teardown(self);
     }
 }
 
@@ -113,11 +157,39 @@ struct TeardownProbe {
 
 #[cfg(test)]
 impl Teardown for TeardownProbe {
-    fn teardown(self) {
+    fn teardown(&mut self) {
+        run_teardown(self);
+    }
+}
+
+#[cfg(test)]
+impl TeardownSteps for TeardownProbe {
+    fn destroy_viewport(&mut self) {
         self.sequence
             .lock()
             .expect("teardown probe lock is not poisoned")
-            .extend(["viewport", "fractional", "layer", "owner"]);
+            .push("viewport");
+    }
+
+    fn destroy_fractional_scale(&mut self) {
+        self.sequence
+            .lock()
+            .expect("teardown probe lock is not poisoned")
+            .push("fractional");
+    }
+
+    fn drop_layer_role(&mut self) {
+        self.sequence
+            .lock()
+            .expect("teardown probe lock is not poisoned")
+            .push("layer");
+    }
+
+    fn drop_retained_owner(&mut self) {
+        self.sequence
+            .lock()
+            .expect("teardown probe lock is not poisoned")
+            .push("owner");
     }
 }
 
@@ -142,7 +214,7 @@ impl<T: Teardown> WaylandObjects<T> {
 
 impl<T: Teardown> Drop for WaylandObjects<T> {
     fn drop(&mut self) {
-        if let Some(objects) = self.objects.take() {
+        if let Some(mut objects) = self.objects.take() {
             objects.teardown();
         }
     }
@@ -263,6 +335,7 @@ pub struct PanelSurface {
     pub presented: bool,
     pub frame_pending: bool,
     pub frame_requested_at: Option<Duration>,
+    /// A u64 cannot realistically wrap; on exhaustion this saturates at u64::MAX instead.
     frame_generation: u64,
     pub waiting_configure_since: Option<Duration>,
     wayland: Option<PanelWaylandObjects>,
@@ -343,9 +416,9 @@ impl PanelSurface {
             wayland: Some(PanelWaylandObjects::Live(WaylandObjects::new(
                 LiveObjects {
                     fractional,
-                    layer_surface,
-                    raw_handle,
-                    raw_owner: _raw_owner,
+                    layer_surface: Some(layer_surface),
+                    raw_handle: Some(raw_handle),
+                    raw_owner: Some(_raw_owner),
                 },
             ))),
             output_size,
@@ -368,9 +441,9 @@ impl PanelSurface {
         self.wayland = Some(PanelWaylandObjects::Live(WaylandObjects::new(
             LiveObjects {
                 fractional,
-                layer_surface,
-                raw_handle,
-                raw_owner: _raw_owner,
+                layer_surface: Some(layer_surface),
+                raw_handle: Some(raw_handle),
+                raw_owner: Some(_raw_owner),
             },
         )));
         self.preferred_fractional_scale = None;
@@ -387,20 +460,21 @@ impl PanelSurface {
     pub(crate) fn matches_surface(&self, surface: &wl_surface::WlSurface) -> bool {
         self.wayland
             .as_ref()
-            .is_some_and(|objects| objects.live().layer_surface.wl_surface() == surface)
+            .is_some_and(|objects| objects.live().layer_surface().wl_surface() == surface)
     }
 
     pub(crate) fn matches_layer(&self, layer: &LayerSurface) -> bool {
         self.wayland
             .as_ref()
-            .is_some_and(|objects| objects.live().layer_surface == *layer)
+            .is_some_and(|objects| objects.live().layer_surface() == layer)
     }
 
     pub(crate) fn matches_fractional_scale(&self, scale: &WpFractionalScaleV1) -> bool {
         self.wayland
             .as_ref()
             .and_then(|objects| objects.live().fractional.as_ref())
-            .is_some_and(|fractional| fractional.scale == *scale)
+            .and_then(|fractional| fractional.scale.as_ref())
+            .is_some_and(|fractional| fractional == scale)
     }
 
     pub fn mounts(panels: &[Self; 4]) -> QuoinPanelMounts {
@@ -416,48 +490,45 @@ impl PanelSurface {
         if operations.is_empty() {
             return;
         }
-        let objects = self
+        let layer_surface = self
             .wayland
             .as_ref()
             .expect("mapped panel has fresh Wayland objects")
-            .live();
+            .live()
+            .layer_surface();
         for operation in operations {
             match *operation {
                 ProtocolOp::CreateSurface => {
                     // Runner creates the objects before replay reaches here.
                 }
-                ProtocolOp::SetLayer(layer) => objects.layer_surface.set_layer(match layer {
+                ProtocolOp::SetLayer(layer) => layer_surface.set_layer(match layer {
                     ProtocolLayer::Top => Layer::Top,
                     ProtocolLayer::Overlay => Layer::Overlay,
                 }),
                 ProtocolOp::SetAnchor(anchor) => {
-                    objects.layer_surface.set_anchor(sctk_anchor(anchor));
+                    layer_surface.set_anchor(sctk_anchor(anchor));
                 }
                 ProtocolOp::SetSize { width, height } => {
-                    objects.layer_surface.set_size(width, height);
+                    layer_surface.set_size(width, height);
                 }
                 ProtocolOp::SetExclusiveZone(zone) => {
-                    objects.layer_surface.set_exclusive_zone(zone);
+                    layer_surface.set_exclusive_zone(zone);
                 }
-                ProtocolOp::SetMargin(margin) => objects.layer_surface.set_margin(
-                    margin.top,
-                    margin.right,
-                    margin.bottom,
-                    margin.left,
-                ),
-                ProtocolOp::SetKeyboardInteractivity(interactivity) => objects
-                    .layer_surface
+                ProtocolOp::SetMargin(margin) => {
+                    layer_surface.set_margin(margin.top, margin.right, margin.bottom, margin.left)
+                }
+                ProtocolOp::SetKeyboardInteractivity(interactivity) => layer_surface
                     .set_keyboard_interactivity(match interactivity {
                         ProtocolKeyboardInteractivity::None => KeyboardInteractivity::None,
                         ProtocolKeyboardInteractivity::OnDemand => KeyboardInteractivity::OnDemand,
                     }),
                 ProtocolOp::CommitBufferless => {
-                    objects.layer_surface.commit();
+                    layer_surface.commit();
                     self.phase = SurfacePhase::WaitingConfigure;
                     self.waiting_configure_since = Some(elapsed);
                     self.presented = false;
                 }
-                ProtocolOp::Commit => objects.layer_surface.commit(),
+                ProtocolOp::Commit => layer_surface.commit(),
                 ProtocolOp::Unmap => {
                     // Runner performs this split operation around one Bevy drain update.
                 }
@@ -539,7 +610,7 @@ impl PanelSurface {
                     .as_ref()
                     .expect("configured panel has Wayland objects")
                     .live()
-                    .raw_handle
+                    .raw_handle()
                     .clone();
                 app.world_mut().entity_mut(self.window).insert(raw_handle);
                 if let Some(mut camera) = app.world_mut().get_mut::<Camera>(self.camera) {
@@ -653,7 +724,7 @@ impl PanelSurface {
                 .as_ref()
                 .expect("mapped panel has Wayland objects")
                 .live()
-                .layer_surface
+                .layer_surface()
                 .wl_surface()
                 .clone();
             surface.frame(
@@ -671,7 +742,7 @@ impl PanelSurface {
             .as_ref()
             .expect("mapped panel has Wayland objects")
             .live()
-            .layer_surface
+            .layer_surface()
             .commit();
     }
 
@@ -761,14 +832,14 @@ impl PanelSurface {
         {
             return None;
         }
-        self.frame_generation = self.frame_generation.wrapping_add(1);
+        self.frame_generation = self.frame_generation.saturating_add(1);
         self.frame_pending = true;
         self.frame_requested_at = Some(elapsed);
         Some(self.frame_generation)
     }
 
     fn invalidate_frame_request(&mut self) {
-        self.frame_generation = self.frame_generation.wrapping_add(1);
+        self.frame_generation = self.frame_generation.saturating_add(1);
         self.frame_pending = false;
         self.frame_requested_at = None;
     }
@@ -817,7 +888,7 @@ impl PanelSurface {
             return;
         };
         let objects = objects.live();
-        let wl_surface = objects.layer_surface.wl_surface();
+        let wl_surface = objects.layer_surface().wl_surface();
         if self.preferred_fractional_scale.is_some() {
             if wl_surface.version() >= 3 {
                 wl_surface.set_buffer_scale(1);
@@ -827,6 +898,8 @@ impl PanelSurface {
             {
                 fractional
                     .viewport
+                    .as_ref()
+                    .expect("live fractional objects retain their viewport")
                     .set_destination(width as i32, height as i32);
             }
         } else if wl_surface.version() >= 3 {
@@ -874,7 +947,6 @@ fn sctk_anchor(anchor: ProtocolAnchor) -> Anchor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
 
     const TEARDOWN_ORDER: [&str; 4] = ["viewport", "fractional", "layer", "owner"];
 
@@ -890,13 +962,15 @@ mod tests {
     }
 
     #[test]
-    fn fractional_addons_destroy_viewport_before_scale() {
-        let order = RefCell::new(Vec::new());
-        destroy_addons_in_order(
-            || order.borrow_mut().push("viewport"),
-            || order.borrow_mut().push("fractional-scale"),
-        );
-        assert_eq!(*order.borrow(), ["viewport", "fractional-scale"]);
+    fn teardown_runs_steps_in_required_order() {
+        let sequence = teardown_sequence();
+        let mut probe = TeardownProbe {
+            sequence: Arc::clone(&sequence),
+        };
+
+        run_teardown(&mut probe);
+
+        assert_eq!(recorded(&sequence), TEARDOWN_ORDER);
     }
 
     #[test]

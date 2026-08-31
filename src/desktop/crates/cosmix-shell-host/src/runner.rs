@@ -534,8 +534,8 @@ impl PanelWaylandFactory<'_> {
         );
         let fractional = match (self.fractional_manager, self.viewporter) {
             (Some(manager), Some(viewporter)) => Some(FractionalObjects {
-                scale: manager.get_fractional_scale(&wl_surface, qh, SurfaceTag { edge }),
-                viewport: viewporter.get_viewport(&wl_surface, qh, GlobalData),
+                scale: Some(manager.get_fractional_scale(&wl_surface, qh, SurfaceTag { edge })),
+                viewport: Some(viewporter.get_viewport(&wl_surface, qh, GlobalData)),
             }),
             _ => None,
         };

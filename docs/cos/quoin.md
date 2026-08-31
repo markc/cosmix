@@ -6,7 +6,7 @@ existing Quoin chrome into one explicit Bevy window target per surface. The
 installable application id and layer namespace are `dev.cosmix.quoin`.
 
 The first Arc 3 slice presents real layer-shell buffers through
-`cosmix-shell-host` 0.1.5 and SCTK 0.19.2. `cosmix-quoin-demo` remains a
+`cosmix-shell-host` 0.1.6 and SCTK 0.19.2. `cosmix-quoin-demo` remains a
 feature-gated, non-installable normal-window tuning arm; it is not a
 layer-shell client.
 
@@ -44,7 +44,8 @@ and chrome mount entities remain stable. Remap creates a fresh `wl_surface`
 and layer role on the explicit output, recreates the retained raw-handle
 owner, replays every property, and repeats the bufferless configure gate. A
 successful remap therefore emits `WindowCreated` again before another buffer
-can be presented.
+can be presented. Teardown order is defined in one place and tested through a
+probe.
 
 Pinned panels use `Top`, reserve their complete logical thickness and keep
 protocol margin zero; chrome alone owns their transient slide. Revealed and
