@@ -25,11 +25,12 @@ exhaustive manpages. For the language that drives these daemons, see the
 - **[webd](webd.md)** — multi-vhost HTTPS + ACME; server-rendered web UI.
 - **[dnsd](dnsd.md)** — authoritative WireGuard-mesh DNS.
 - **[indexd](indexd.md)** — vector knowledge base / indexer.
-- **[disp-skia](disp-skia.md)** — Skia display compositor; the desktop surface.
+- **[desktop](desktop.md)** — the CosMix desktop: `cosmix-comp` (Smithay + Bevy Wayland compositor), the `ctk` toolkit and the native apps.
 - **[cosmix-comp](cosmix-comp.md)** — Wayland compositor and supported protocol globals.
 - **[quoin](quoin.md)** — four-edge layer-shell desktop furniture hosted through SCTK.
 - **[agentd](agentd.md)** — agent supervision.
 - **[powerd](powerd.md)** — event-driven UPower battery and power state.
+- **[mprisd](mprisd.md)** — event-driven MPRIS2 media-player state and delegated controls.
 
 ## Bridge & libraries
 

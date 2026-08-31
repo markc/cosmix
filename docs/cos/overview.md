@@ -14,7 +14,7 @@ fits with its sibling repos, and where to go next.
 
 A single Cargo workspace of ~33 crates, split three ways:
 
-- **Daemons** — the long-running services: an Bus broker, a mail server, a web server, an authoritative DNS server, a knowledge indexer, a display compositor, and an agent supervisor.
+- **Daemons** — the long-running services: an Bus broker, a mail server, a web server, an authoritative DNS server, a knowledge indexer, and an agent supervisor — with the Wayland compositor and native apps in the sibling `src/desktop/` workspace.
 - **Helpers & adapters** — CLI subcrates and integration shims the daemons lean on (the MCP bridge, the Claude SDK adapter, the mail data store, the mail auth / rules / spam subcrates).
 - **Libraries** — the shared substrate (`cosmix-lib-*`): property store, mesh peering, node identity, WireGuard config, logging, agent runtime pieces, and protocol codecs.
 
@@ -35,9 +35,10 @@ Pick any component in the sidebar for its own page.
 - **[webd](webd.md)** — multi-vhost HTTPS with automatic ACME certificates; server-rendered web UI over Datastar SSE.
 - **[dnsd](dnsd.md)** — authoritative WireGuard-mesh DNS, zones generated from the mesh inventory.
 - **[indexd](indexd.md)** — vector knowledge base; auto-indexes workspaces on commit and powers agent recall.
-- **[disp-skia](disp-skia.md)** — Skia display compositor rendering a markdown-over-Bus UI: the desktop surface.
+- **[desktop](desktop.md)** — the CosMix desktop: `cosmix-comp` (Smithay + Bevy Wayland compositor), the `ctk` toolkit and the native apps; protocol coverage on [cosmix-comp](cosmix-comp.md).
 - **[agentd](agentd.md)** — agent supervision.
 - **[powerd](powerd.md)** — event-driven UPower battery and power-source state.
+- **[mprisd](mprisd.md)** — event-driven MPRIS2 media-player state and delegated controls.
 
 ### Bridge & libraries
 

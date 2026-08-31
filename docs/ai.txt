@@ -1,5 +1,5 @@
 ---
-updated: 2026-08-16
+updated: 2026-08-31
 scope: /
 ---
 
@@ -18,20 +18,26 @@ API endpoints.
 
 ## Structure
 
-The project is a one-way dependency chain — **bus ← mix ← cos** — across
-three public code repositories plus this umbrella:
+Since 2026-08-30 the whole project is ONE public repository,
+`github.com/markc/cosmix`. Inside it, `src/` is a single Cargo workspace with
+a one-way dependency chain — **bus ← mix ← cos** — and `src/desktop/` is a
+second workspace for the desktop:
 
-- **bus** (`github.com/markc/bus`) — the CosMix Agent Bus: wire protocol,
-  broker client, and shared primitives every layer talks over. Docs:
-  https://cosmix.dev/bus/
-- **mix** (`github.com/markc/mix`) — a pure-Rust, ARexx-inspired shell and
-  scripting language with first-class Bus messaging keywords. Manual:
-  https://cosmix.dev/mix/
-- **cos** (`github.com/markc/cos`) — the daemon family (broker, mail, web,
-  DNS, knowledge indexer, display compositor, agent runtime) plus shared
-  foundation libraries. Docs: https://cosmix.dev/cos/
-- **cosmix** (`github.com/markc/cosmix`) — this umbrella: thesis, docs,
-  and build orchestration.
+- **bus** — the CosMix Agent Bus: wire protocol, broker client, and shared
+  primitives every layer talks over. Docs: https://cosmix.dev/bus/
+- **mix** — a pure-Rust, ARexx-inspired shell and scripting language with
+  first-class Bus messaging keywords. Manual: https://cosmix.dev/mix/
+- **cos** — the daemon family (broker, mail, web, DNS, knowledge indexer,
+  agent runtime, power, media) plus shared foundation libraries. Docs:
+  https://cosmix.dev/cos/
+- **desktop** (`src/desktop/`) — the CosMix desktop: `cosmix-comp`, a
+  Smithay + Bevy Wayland compositor; `ctk`, the Bus-citizen Bevy widget
+  toolkit; and the native apps (Studio, FileMgr, Mail, Tower, Tray). Docs:
+  https://cosmix.dev/cos/desktop
+- `docs/` — this site, served by GitHub Pages.
+
+The former repositories `markc/bus`, `markc/mix` and `markc/cos` are frozen
+at the import commit and archived; they are history, not the current tree.
 
 Documentation URLs of the form `cosmix.dev/{bus,cos,mix}/<page>.md` are the
 canonical source of truth for the docs; a repo checkout mirrors them but
@@ -43,8 +49,9 @@ tools should resolve against the site.
   path to the site root to fetch raw markdown (e.g. `/mix/builtins.md`).
 - The same page without the `.md` extension (e.g. `/mix/builtins`) serves
   a human-readable HTML rendering; prefer the raw `.md` for machine use.
-- The whole system builds from a clean clone of the three code repos in
-  dependency order (`build/build.sh` or `build/build.mix` in the umbrella).
+- The whole system builds from a clean clone: `git clone
+  https://github.com/markc/cosmix && cd cosmix && ./bootstrap` (add
+  `--desktop` to `setup.mix` for the compositor and apps).
 - The Mix binary is self-documenting: `mix man <topic>`, `mix builtins`,
   and `mix -c '<probe>'` are authoritative over any prose.
 
@@ -65,6 +72,12 @@ tools should resolve against the site.
   Agent Bus crate family. Older material found elsewhere that says AMP,
   `amp_call`, or `markc/amp` refers to the same thing by its former
   name; the `markc/amp` repository no longer exists.
+- The desktop is `cosmix-comp` + `ctk` + native Bevy apps (see
+  https://cosmix.dev/cos/desktop). Material naming `cosmix-disp-skia`,
+  `cosmix-deskd`, `cosmix-disp-wgpu`, `cosmix-lib-display` or a `ui.panel` /
+  `ui.window` "markdown-over-Bus" display protocol describes a lane retired
+  in July 2026 and removed from this site on 2026-08-31; treat it as
+  history, never as the current architecture.
 - Quote code and builtin signatures from the docs verbatim; for Mix
   language behaviour prefer probing a live `mix` binary over quoting prose.
 - Do not invent daemons, verbs, or builtins not listed in these docs.
@@ -73,8 +86,8 @@ tools should resolve against the site.
 
 - project: CosMix
 - site: https://cosmix.dev
-- repos: https://github.com/markc/bus, https://github.com/markc/mix,
-  https://github.com/markc/cos, https://github.com/markc/cosmix
+- repo: https://github.com/markc/cosmix (former markc/bus, markc/mix and
+  markc/cos are archived history)
 - language: Rust (daemons, protocol, Mix interpreter)
 - license: MIT
 - author: Mark Constable <mc@cosmix.dev>

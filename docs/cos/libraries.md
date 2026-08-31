@@ -39,7 +39,6 @@ are the cos-side substrate.
 | `cosmix-lib-llm` | Generic multi-backend LLM client — Anthropic, OpenAI-compatible (OpenAI/vLLM/LMStudio), Ollama, and Bus (route through `cosmix-claud` on the mesh). One `LlmClient::from_config` entry point. |
 | `cosmix-lib-agent` | The agent loop: drives multi-turn conversations against an `LlmClient`, dispatching model tool calls through a pluggable `ToolRegistry`; sessions persist as JSONL. Backs [agentd](agentd.md). |
 | `cosmix-lib-skills` | The skill-learning loop — evaluate an interaction, extract a reusable skill, retrieve relevant skills, and refine confidence over time. Backs the knowledge augmentation in `cosmix-claud`. |
-| `cosmix-lib-display` | Bus Display Protocol *types* only (no rendering): window properties, style values, the widget registry, layout enums, and the `ui.*` command vocabulary shared by producers (Mix scripts, daemons, peers) and consumers ([disp-skia](disp-skia.md) and any other renderer). |
 
 ## Protocol codecs
 
@@ -52,5 +51,5 @@ are the cos-side substrate.
 
 - [overview](overview.md) — the substrate at a glance
 - [noded](noded.md) — the Bus broker every node runs
-- [disp-skia](disp-skia.md) — the display surface (consumes `cosmix-lib-display`)
+- [desktop](desktop.md) — the CosMix desktop (compositor, toolkit, apps)
 - [agentd](agentd.md) — agent supervision (consumes `cosmix-lib-agent` / `-llm`)

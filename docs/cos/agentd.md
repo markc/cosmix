@@ -85,4 +85,4 @@ self-observation / self-modification loops, not an end-user chat product.
 - [overview](overview.md) — the substrate at a glance
 - [noded](noded.md) — the Bus broker
 - [libraries](libraries.md) — `cosmix-lib-agent`, `cosmix-lib-llm`, `cosmix-lib-skills`
-- [disp-skia](disp-skia.md) — the display surface
+- [desktop](desktop.md) — the CosMix desktop (compositor, toolkit, apps)
