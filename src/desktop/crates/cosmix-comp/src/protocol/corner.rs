@@ -117,6 +117,12 @@ impl CornerDetector {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn candidate_position(&self) -> Option<(f64, f64)> {
+        self.candidate
+            .and_then(|_| self.last_sample.map(|sample| sample.position))
+    }
+
     pub(crate) fn sample(
         &mut self,
         at_ms: u64,

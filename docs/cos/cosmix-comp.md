@@ -107,9 +107,10 @@ Mutations within an existing row remain leaf-granular.
 The sequence is process-global, strictly increasing and shared by property,
 surface, focus, output and corner records. If it reaches `u64::MAX`, that value
 is offered once and observation enters a terminal exhausted state rather than
-reusing a sequence. If the bounded 256-record outbox evicts old records, a gap
-is published to every topic that lost records before the next surviving record
-is published (at most seven gap publications per loss interval): Bus header
+reusing a sequence. If the bounded 256-entry outbox overflows, it replaces the
+oldest queued prefix with one in-order loss-interval marker. A gap is published
+to every topic represented by that exact interval before its next surviving
+record (at most seven gap publications per interval): Bus header
 `event_seq=<last lost seq>` and body
 `{gap:true,lost_count,cause:"outbox.overflow"}`. A rejected or timed-out
 publication discards its uncertain backlog and recovers with the same body

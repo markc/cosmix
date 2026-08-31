@@ -1,17 +1,17 @@
 //! Calloop-owned semantic observation reduction and the bounded Bus outbox.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use chrono::{SecondsFormat, TimeZone, Utc};
 use cosmix_bus::bus::BusMessage;
-use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 use serde::Serialize;
 use serde_json::{Value, json};
 use smithay::output::Output;
@@ -48,9 +48,6 @@ pub(crate) fn topic_name(service: &str, suffix: &str) -> String {
 
 type PendingPropChanges = BTreeMap<String, (PropValue, PropValue, &'static str)>;
 
-#[cfg(test)]
-const OUTBOX_CAPACITY: usize = 2;
-#[cfg(not(test))]
 const OUTBOX_CAPACITY: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -306,10 +303,6 @@ impl AffectedTopics {
         self.0 &= !(1 << Self::index(suffix));
     }
 
-    pub(crate) fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-
     pub(crate) fn iter(self) -> impl Iterator<Item = &'static str> {
         TOPIC_SUFFIXES
             .into_iter()
@@ -318,72 +311,48 @@ impl AffectedTopics {
     }
 }
 
-pub(crate) struct LossState {
-    latest_by_topic: [AtomicU64; TOPIC_SUFFIXES.len()],
-    updates_in_progress: AtomicUsize,
-    update_generation: AtomicU64,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LossInterval {
+    pub(crate) first_lost_seq: u64,
+    pub(crate) last_lost_seq: u64,
+    pub(crate) topics: AffectedTopics,
+    pub(crate) cause: &'static str,
 }
 
-struct LossUpdateGuard<'a>(&'a LossState);
-
-impl Drop for LossUpdateGuard<'_> {
-    fn drop(&mut self) {
-        self.0.update_generation.fetch_add(1, Ordering::AcqRel);
-        self.0.updates_in_progress.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-impl LossState {
-    fn new() -> Self {
-        Self {
-            latest_by_topic: std::array::from_fn(|_| AtomicU64::new(0)),
-            updates_in_progress: AtomicUsize::new(0),
-            update_generation: AtomicU64::new(0),
-        }
-    }
-
-    fn begin_update(&self) -> LossUpdateGuard<'_> {
-        self.updates_in_progress.fetch_add(1, Ordering::AcqRel);
-        self.update_generation.fetch_add(1, Ordering::AcqRel);
-        LossUpdateGuard(self)
-    }
-
-    pub(crate) fn update_in_progress(&self) -> bool {
-        self.updates_in_progress.load(Ordering::Acquire) != 0
-    }
-
-    pub(crate) fn update_generation(&self) -> u64 {
-        self.update_generation.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn record(&self, record: &ObservationRecord) {
-        self.latest_by_topic[AffectedTopics::index(record.topic_suffix())]
-            .fetch_max(record.event_seq(), Ordering::AcqRel);
-    }
-
-    pub(crate) fn affected_since(
-        &self,
-        acknowledged: &[u64; TOPIC_SUFFIXES.len()],
-    ) -> AffectedTopics {
+impl LossInterval {
+    pub(crate) fn from_record(record: &ObservationRecord, cause: &'static str) -> Self {
         let mut topics = AffectedTopics::default();
-        for (index, latest) in self.latest_by_topic.iter().enumerate() {
-            if latest.load(Ordering::Acquire) > acknowledged[index] {
-                topics.0 |= 1 << index;
-            }
+        topics.insert(record.topic_suffix());
+        Self {
+            first_lost_seq: record.event_seq(),
+            last_lost_seq: record.event_seq(),
+            topics,
+            cause,
         }
-        topics
     }
 
-    pub(crate) fn acknowledge(
-        &self,
-        acknowledged: &mut [u64; TOPIC_SUFFIXES.len()],
-        topics: AffectedTopics,
-        through: u64,
-    ) {
-        for (index, acknowledged) in acknowledged.iter_mut().enumerate() {
-            if topics.0 & (1 << index) != 0 {
-                *acknowledged = (*acknowledged).max(through);
-            }
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.first_lost_seq = self.first_lost_seq.min(other.first_lost_seq);
+        self.last_lost_seq = self.last_lost_seq.max(other.last_lost_seq);
+        self.topics.merge(other.topics);
+        if other.cause == "publisher.loss" {
+            self.cause = other.cause;
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ObservationItem {
+    Record(ObservationRecord),
+    Loss(LossInterval),
+}
+
+impl ObservationItem {
+    #[cfg(test)]
+    pub(crate) fn into_record(self) -> Option<ObservationRecord> {
+        match self {
+            Self::Record(record) => Some(record),
+            Self::Loss(_) => None,
         }
     }
 }
@@ -395,76 +364,104 @@ fn rfc3339_millis(unix_ms: i64) -> String {
         .to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-#[derive(Clone)]
 pub(crate) struct ObservationProducer {
-    sender: Sender<ObservationRecord>,
-    eviction: Receiver<ObservationRecord>,
+    sender: Sender<ObservationItem>,
+    eviction: Receiver<ObservationItem>,
     lost_count: Arc<AtomicU64>,
     notifier: Arc<Notify>,
-    loss_state: Arc<LossState>,
 }
 
 impl ObservationProducer {
-    pub(crate) fn offer(&self, mut record: ObservationRecord) {
-        loop {
-            match self.sender.try_send(record) {
-                Ok(()) => {
-                    self.notifier.notify_one();
-                    return;
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    self.lost_count.fetch_add(1, Ordering::AcqRel);
-                    return;
-                }
-                Err(TrySendError::Full(returned)) => {
-                    record = returned;
-                    let _loss_update = self.loss_state.begin_update();
-                    match self.eviction.try_recv() {
-                        Ok(evicted) => {
-                            self.loss_state.record(&evicted);
-                            self.lost_count.fetch_add(1, Ordering::AcqRel);
-                            self.notifier.notify_one();
-                        }
-                        Err(TryRecvError::Empty) => continue,
-                        Err(TryRecvError::Disconnected) => {
-                            self.lost_count.fetch_add(1, Ordering::AcqRel);
-                            return;
-                        }
-                    }
-                }
+    pub(crate) fn offer(&self, record: ObservationRecord) {
+        match self.sender.try_send(ObservationItem::Record(record)) {
+            Ok(()) => self.notifier.notify_one(),
+            Err(TrySendError::Disconnected(_)) => {
+                self.lost_count.fetch_add(1, Ordering::AcqRel);
+            }
+            Err(TrySendError::Full(ObservationItem::Record(record))) => {
+                self.replace_full_queue(record);
+            }
+            Err(TrySendError::Full(ObservationItem::Loss(_))) => {
+                unreachable!("offer sends a semantic record")
             }
         }
+    }
+
+    /// Rebuild the bounded queued suffix with one explicit loss interval at
+    /// its front. The publisher may concurrently take an older item, but it
+    /// can only shorten this suffix; this sole producer restores the remaining
+    /// items in the same order before appending the new record.
+    fn replace_full_queue(&self, record: ObservationRecord) {
+        let capacity = self
+            .sender
+            .capacity()
+            .expect("the observation outbox is bounded");
+        debug_assert!(capacity >= 2, "a loss marker and survivor need two slots");
+        let mut queued = self.eviction.try_iter().collect::<VecDeque<_>>();
+
+        if queued.len().saturating_add(1) > capacity {
+            let prefix_len = queued.len().saturating_add(2).saturating_sub(capacity);
+            let mut interval: Option<LossInterval> = None;
+            let mut newly_lost = 0_u64;
+            for _ in 0..prefix_len {
+                let item = queued
+                    .pop_front()
+                    .expect("the full suffix contains the prefix being replaced");
+                let loss = match item {
+                    ObservationItem::Record(record) => {
+                        newly_lost = newly_lost.saturating_add(1);
+                        LossInterval::from_record(&record, "outbox.overflow")
+                    }
+                    ObservationItem::Loss(loss) => loss,
+                };
+                if let Some(current) = interval.as_mut() {
+                    current.merge(loss);
+                } else {
+                    interval = Some(loss);
+                }
+            }
+            queued.push_front(ObservationItem::Loss(
+                interval.expect("a replaced prefix owns one loss interval"),
+            ));
+            self.lost_count.fetch_add(newly_lost, Ordering::AcqRel);
+        }
+        queued.push_back(ObservationItem::Record(record));
+
+        for item in queued {
+            self.sender
+                .try_send(item)
+                .expect("the sole producer rebuilt no more than the bounded capacity");
+        }
+        self.notifier.notify_one();
     }
 
     pub(crate) fn notifier(&self) -> Arc<Notify> {
         Arc::clone(&self.notifier)
     }
-
-    pub(crate) fn loss_state(&self) -> Arc<LossState> {
-        Arc::clone(&self.loss_state)
-    }
 }
 
 pub(crate) fn outbox(
     lost_count: Arc<AtomicU64>,
-) -> (ObservationProducer, Receiver<ObservationRecord>) {
+) -> (ObservationProducer, Receiver<ObservationItem>) {
     outbox_with_capacity(lost_count, OUTBOX_CAPACITY)
 }
 
 fn outbox_with_capacity(
     lost_count: Arc<AtomicU64>,
     capacity: usize,
-) -> (ObservationProducer, Receiver<ObservationRecord>) {
+) -> (ObservationProducer, Receiver<ObservationItem>) {
+    assert!(
+        capacity >= 2,
+        "observation outbox capacity must be at least two"
+    );
     let (sender, receiver) = crossbeam_channel::bounded(capacity);
     let notifier = Arc::new(Notify::new());
-    let loss_state = Arc::new(LossState::new());
     (
         ObservationProducer {
             sender,
             eviction: receiver.clone(),
             lost_count,
             notifier,
-            loss_state,
         },
         receiver,
     )
@@ -474,7 +471,7 @@ fn outbox_with_capacity(
 pub(crate) fn test_outbox(
     lost_count: Arc<AtomicU64>,
     capacity: usize,
-) -> (ObservationProducer, Receiver<ObservationRecord>) {
+) -> (ObservationProducer, Receiver<ObservationItem>) {
     outbox_with_capacity(lost_count, capacity)
 }
 
@@ -929,6 +926,11 @@ impl WaylandState {
             self.observations.corner_timer_deadline_ms,
             self.observations.corner_timer_arms,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corner_candidate_position_probe(&self) -> Option<(f64, f64)> {
+        self.observations.corner_detector.candidate_position()
     }
 }
 
@@ -2020,9 +2022,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn outbox_evicts_oldest_and_counts_cumulative_loss() {
+    fn outbox_replaces_the_oldest_prefix_with_an_exact_loss_interval() {
         let lost = Arc::new(AtomicU64::new(0));
-        let (producer, receiver) = outbox(Arc::clone(&lost));
+        let (producer, receiver) = test_outbox(Arc::clone(&lost), 2);
         for sequence in 1..=4 {
             producer.offer(ObservationRecord::FocusChanged {
                 keyboard: Some(sequence),
@@ -2031,9 +2033,66 @@ mod tests {
                 event_seq: sequence,
             });
         }
-        assert_eq!(lost.load(Ordering::Acquire), 2);
-        assert_eq!(receiver.recv().unwrap().event_seq(), 3);
-        assert_eq!(receiver.recv().unwrap().event_seq(), 4);
+        assert_eq!(lost.load(Ordering::Acquire), 3);
+        let ObservationItem::Loss(interval) = receiver.recv().unwrap() else {
+            panic!("the loss interval precedes its survivor");
+        };
+        assert_eq!((interval.first_lost_seq, interval.last_lost_seq), (1, 3));
+        assert_eq!(
+            interval.topics.iter().collect::<Vec<_>>(),
+            [FOCUS_TOPIC_SUFFIX]
+        );
+        let ObservationItem::Record(survivor) = receiver.recv().unwrap() else {
+            panic!("the newest semantic record survives");
+        };
+        assert_eq!(survivor.event_seq(), 4);
+    }
+
+    #[test]
+    fn loss_interval_is_closed_when_its_marker_leaves_the_channel() {
+        let lost = Arc::new(AtomicU64::new(0));
+        let (producer, receiver) = test_outbox(Arc::clone(&lost), 3);
+        for sequence in 1..=4 {
+            producer.offer(ObservationRecord::FocusChanged {
+                keyboard: Some(sequence),
+                previous: None,
+                exclusive_latch: None,
+                event_seq: sequence,
+            });
+        }
+        let ObservationItem::Loss(first) = receiver.recv().unwrap() else {
+            panic!("first overflow marker");
+        };
+        assert_eq!((first.first_lost_seq, first.last_lost_seq), (1, 2));
+
+        producer.offer(ObservationRecord::PropsChanged {
+            path: "input.corners.enabled".into(),
+            old: PropValue::Bool(true),
+            new: PropValue::Bool(false),
+            unix_ms: 0,
+            cause: "props.set",
+            event_seq: 5,
+        });
+        producer.offer(ObservationRecord::FocusChanged {
+            keyboard: Some(6),
+            previous: None,
+            exclusive_latch: None,
+            event_seq: 6,
+        });
+
+        let ObservationItem::Loss(second) = receiver.recv().unwrap() else {
+            panic!("later overflow owns a separate marker");
+        };
+        assert_eq!((second.first_lost_seq, second.last_lost_seq), (3, 4));
+        assert_eq!(
+            second.topics.iter().collect::<Vec<_>>(),
+            [FOCUS_TOPIC_SUFFIX]
+        );
+        assert_eq!(
+            lost.load(Ordering::Acquire),
+            4,
+            "the later interval cannot be absorbed into the earlier watermark"
+        );
     }
 
     #[test]
@@ -2350,6 +2409,7 @@ mod tests {
         assert_eq!(
             receiver
                 .try_iter()
+                .filter_map(ObservationItem::into_record)
                 .map(|record| record.event_seq())
                 .collect::<Vec<_>>(),
             [u64::MAX]

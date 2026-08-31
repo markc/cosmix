@@ -1295,7 +1295,7 @@ impl KeybindingHarness {
     fn new_with_port() -> (
         Self,
         crate::port::PortIngress,
-        crossbeam_channel::Receiver<port_observation::ObservationRecord>,
+        crossbeam_channel::Receiver<port_observation::ObservationItem>,
     ) {
         Self::new_with_port_backend(BackendKind::Winit, "nested")
     }
@@ -1306,7 +1306,7 @@ impl KeybindingHarness {
     ) -> (
         Self,
         crate::port::PortIngress,
-        crossbeam_channel::Receiver<port_observation::ObservationRecord>,
+        crossbeam_channel::Receiver<port_observation::ObservationItem>,
     ) {
         let context = Arc::new(snapshot_context("nested"));
         let (port, ingress, observations) =
@@ -1340,7 +1340,7 @@ impl KeybindingHarness {
     ) -> (
         Self,
         crate::port::PortIngress,
-        crossbeam_channel::Receiver<port_observation::ObservationRecord>,
+        crossbeam_channel::Receiver<port_observation::ObservationItem>,
     ) {
         let context = Arc::new(snapshot_context(backend_name));
         let (port, ingress, observations) = crate::port::test_wiring(context);
@@ -27101,9 +27101,12 @@ fn port_boundary_uses_production_admission_completion_and_sees_same_dispatch_com
 
 #[cfg(feature = "bus")]
 fn drain_observations(
-    receiver: &crossbeam_channel::Receiver<port_observation::ObservationRecord>,
+    receiver: &crossbeam_channel::Receiver<port_observation::ObservationItem>,
 ) -> Vec<port_observation::ObservationRecord> {
-    receiver.try_iter().collect()
+    receiver
+        .try_iter()
+        .filter_map(port_observation::ObservationItem::into_record)
+        .collect()
 }
 
 #[cfg(feature = "bus")]
@@ -27455,6 +27458,41 @@ fn host_pointer_leave_resets_an_engaged_corner_with_the_entered_output() {
 
 #[cfg(feature = "bus")]
 #[test]
+fn host_pointer_leave_then_reentry_motion_rearms_at_the_new_position() {
+    let (mut harness, _ingress, _observations) = KeybindingHarness::new_with_port();
+    port_observation::service_observations(&mut harness.server.state);
+
+    harness
+        .server
+        .state
+        .handle_host_input(HostInput::PointerMotionAbsolute {
+            x: 5.0,
+            y: 5.0,
+            time: 1,
+        });
+    harness
+        .server
+        .state
+        .handle_host_input(HostInput::PointerLeave);
+    harness
+        .server
+        .state
+        .handle_host_input(HostInput::PointerMotionAbsolute {
+            x: 6.0,
+            y: 7.0,
+            time: 2,
+        });
+
+    assert_eq!(
+        harness.server.state.corner_candidate_position_probe(),
+        Some((6.0, 7.0)),
+        "the re-entry motion after leave owns the newly armed detector"
+    );
+    assert!(harness.server.state.corner_timer_probe().0.is_some());
+}
+
+#[cfg(feature = "bus")]
+#[test]
 fn port_watch_reports_title_and_app_id_leaf_changes() {
     let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
     map_initial_test_toplevel(&mut harness);
@@ -27514,15 +27552,20 @@ fn port_observation_reports_exclusive_focus_and_layer_usable_geometry_in_order()
     );
     port_observation::service_observations(&mut harness.server.state);
     let records = drain_observations(&observations);
-    assert_eq!(
-        records.len(),
-        2,
-        "test outbox retains the final two records"
-    );
+    let ordered = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record,
+                port_observation::ObservationRecord::FocusChanged { .. }
+                    | port_observation::ObservationRecord::OutputChanged { .. }
+            )
+        })
+        .collect::<Vec<_>>();
 
     let layer_id = test_layer_record(&harness, layer.surface).id.0;
-    let (focus_sequence, output_sequence) = match (&records[0], &records[1]) {
-        (
+    let (focus_sequence, output_sequence) = match ordered.as_slice() {
+        [
             port_observation::ObservationRecord::FocusChanged {
                 keyboard: Some(keyboard),
                 exclusive_latch: Some(exclusive_latch),
@@ -27534,7 +27577,7 @@ fn port_observation_reports_exclusive_focus_and_layer_usable_geometry_in_order()
                 event_seq: output_sequence,
                 ..
             },
-        ) => {
+        ] => {
             assert_eq!((*keyboard, *exclusive_latch), (layer_id, layer_id));
             assert_eq!(row.usable.y, 30.0);
             assert_eq!(row.usable.height + 30.0, row.height as f32);
