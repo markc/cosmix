@@ -5896,6 +5896,12 @@ fn refresh_selected_output_after_resume(
                 "resume topology emitted no selected-output command for ready generation {ready_generation}"
             ))
         })?;
+    // A replaced connector is accepted here rather than refused: it can never
+    // reach the retained-framebuffer scan-out path, because `retained_buffers`
+    // in backend/render.rs is keyed by the NEW output key (see
+    // `retained_buffers.remove(&output.key)` in `render_kms_frame`) and no
+    // entry exists for a key that was never rendered. The lock-aware refusal in
+    // `seamless_resume_is_eligible` is a second, independent gate.
     if let Some(retained) = selected_output.as_ref()
         && retained.key != output.key
     {
