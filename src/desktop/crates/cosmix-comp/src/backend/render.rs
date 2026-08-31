@@ -52,15 +52,16 @@ use bevy::{
     app::{App, Plugin, SubApp},
     camera::{
         Camera, CameraOutputMode, ClearColorConfig, ManualTextureViewHandle,
-        NormalizedRenderTarget, RenderTarget,
+        NormalizedRenderTarget, RenderTarget, visibility::RenderLayers,
     },
     prelude::{
-        Camera2d, ClearColor, Component, Entity, IntoScheduleConfigs, Msaa, Name, Resource, World,
+        Assets, Camera2d, ClearColor, Component, Entity, Handle, Image, IntoScheduleConfigs, Msaa,
+        Name, Resource, World,
     },
     render::{
         Render, RenderApp, RenderSystems,
         camera::ExtractedCamera,
-        render_resource::{CommandEncoderDescriptor, RenderPassDescriptor},
+        render_resource::{BlendState, CommandEncoderDescriptor, RenderPassDescriptor},
         renderer::{RenderDevice, RenderQueue, render_system},
         texture::{ManualTextureView, ManualTextureViews},
         view::{ViewTarget, prepare_view_attachments},
@@ -411,6 +412,13 @@ pub(crate) struct AcquiredOutputFrame {
     pub(crate) view: ManualTextureView,
     pub(crate) present: PresentOutputFrame,
     pub(crate) resume_first_flip: Option<ResumeFirstFlipMarker>,
+    pub(crate) presentation_timestamp: Arc<Mutex<Option<KmsPresentationTimestamp>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KmsPresentationTimestamp {
+    pub(crate) seconds: u64,
+    pub(crate) nanoseconds: u32,
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -457,17 +465,24 @@ struct OutputFrameSource {
     >,
     ready_generation: Option<u64>,
     current_ready_generation: Option<u64>,
+    next_frame_token: u64,
+    pending_frame_token: Option<u64>,
     pending_present: Option<PresentOutputFrame>,
     pending_security_presentations: Vec<(u64, crate::protocol::SecurityPresentationTarget)>,
+    pending_capture_presentations: Vec<crate::capture::PendingCapturePresentation>,
     pending_resume_first_flip: Option<ResumeFirstFlipMarker>,
+    pending_presentation_timestamp: Option<Arc<Mutex<Option<KmsPresentationTimestamp>>>>,
 }
 
 struct AcquiredOutputPresenter {
     key: OutputKey,
     generation: u64,
+    frame_token: u64,
     present: PresentOutputFrame,
     security_presentations: Vec<(u64, crate::protocol::SecurityPresentationTarget)>,
+    capture_presentations: Vec<crate::capture::PendingCapturePresentation>,
     resume_first_flip: Option<ResumeFirstFlipMarker>,
+    presentation_timestamp: Arc<Mutex<Option<KmsPresentationTimestamp>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -484,6 +499,8 @@ pub(crate) enum KmsRenderFrameEvent {
     FrameSubmitted {
         generation: u64,
         key: OutputKey,
+        frame_token: u64,
+        timestamp: KmsPresentationTimestamp,
         security_epochs: Vec<u64>,
     },
     PresentationCancelled {
@@ -501,6 +518,7 @@ pub(crate) struct KmsRenderTargets {
     worker_stop: Option<KmsRenderWorkerStop>,
     frame_events: Option<Sender<KmsRenderFrameEvent>>,
     present_deadline: PresentDeadline,
+    capture_reporter: Option<crate::protocol::CaptureCompletionReporter>,
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
     destructive_quiescence: Option<DestructiveQuiescenceLatch>,
 }
@@ -514,9 +532,42 @@ impl KmsRenderTargets {
             worker_stop: None,
             frame_events: None,
             present_deadline,
+            capture_reporter: None,
             #[cfg(any(all(feature = "kms-live", not(test)), test))]
             destructive_quiescence: None,
         }
+    }
+
+    pub(crate) fn capture_frame_token(
+        &self,
+        source_id: &crate::backend::CaptureSourceId,
+    ) -> Option<u64> {
+        let crate::backend::CaptureSourceId::Kms { key, generation } = source_id else {
+            return None;
+        };
+        let source = self.sources.get(key)?;
+        (source.generation == *generation && source.pending_present.is_some())
+            .then_some(source.pending_frame_token?)
+    }
+
+    pub(crate) fn bind_capture_presentations(
+        &mut self,
+        source_id: &crate::backend::CaptureSourceId,
+        presentations: Vec<crate::capture::PendingCapturePresentation>,
+        reporter: Option<crate::protocol::CaptureCompletionReporter>,
+    ) -> bool {
+        let crate::backend::CaptureSourceId::Kms { key, generation } = source_id else {
+            return false;
+        };
+        let Some(source) = self.sources.get_mut(key) else {
+            return false;
+        };
+        if source.generation != *generation || source.pending_present.is_none() {
+            return false;
+        }
+        source.pending_capture_presentations.extend(presentations);
+        self.capture_reporter = reporter;
+        true
     }
 }
 
@@ -626,6 +677,7 @@ fn wire_kms_render_target(
     })
     .insert_resource(KmsRegistrarReplies(Mutex::new(reply_receiver)))
     .init_resource::<KmsMainWorldOutputs>()
+    .init_resource::<KmsCursorOverlayImages>()
     .add_systems(bevy::app::First, apply_registrar_events);
     configure_render_app(
         app.sub_app_mut(RenderApp),
@@ -3620,6 +3672,8 @@ impl LiveAtomicOwnership {
                     (slot, view, guard)
                 };
                 let presentation_state = Arc::clone(&acquisition_state);
+                let presentation_timestamp = Arc::new(Mutex::new(None::<KmsPresentationTimestamp>));
+                let reported_timestamp = Arc::clone(&presentation_timestamp);
                 Ok(AcquiredOutputFrame {
                     view,
                     present: fallible_present_output_frame(move |_present_deadline| {
@@ -3657,6 +3711,17 @@ impl LiveAtomicOwnership {
                             .map_err(|error| atomic_platform_failure("slot queue", error))?;
                         unpresented_guard.disarm();
                         let outcome = state.presenter.present(slot, generation, deadline);
+                        if matches!(outcome, Ok(PresentOutcome::Displayed)) {
+                            let timestamp = state.presenter.take_displayed_timestamp().map(
+                                |(seconds, nanoseconds)| KmsPresentationTimestamp {
+                                    seconds,
+                                    nanoseconds,
+                                },
+                            );
+                            *reported_timestamp
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = timestamp;
+                        }
                         match &outcome {
                             Ok(PresentOutcome::Displayed) => {
                                 let old_front =
@@ -3688,6 +3753,7 @@ impl LiveAtomicOwnership {
                         outcome
                     }),
                     resume_first_flip: resume_first_flip.clone(),
+                    presentation_timestamp,
                 })
             }),
         })
@@ -4202,6 +4268,12 @@ fn configure_render_app(
                 .after(render_system)
                 .before(present_output_frames),
         )
+        .configure_sets(
+            Render,
+            crate::capture::CaptureRenderSet
+                .after(clear_unwritten_output_frames)
+                .before(present_output_frames),
+        )
         .add_systems(
             Render,
             present_output_frames.after(clear_unwritten_output_frames),
@@ -4287,6 +4359,8 @@ fn acquire_output_frames(
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
+                source.next_frame_token = source.next_frame_token.wrapping_add(1).max(1);
+                let frame_token = source.next_frame_token;
                 results.push((
                     key.clone(),
                     source.handle,
@@ -4294,6 +4368,8 @@ fn acquire_output_frames(
                     frame.present,
                     security_presentations,
                     frame.resume_first_flip,
+                    frame.presentation_timestamp,
+                    frame_token,
                 ));
             }
             Err(error) => {
@@ -4320,7 +4396,17 @@ fn acquire_output_frames(
         return;
     }
 
-    for (key, handle, view, present, security_presentations, resume_first_flip) in results {
+    for (
+        key,
+        handle,
+        view,
+        present,
+        security_presentations,
+        resume_first_flip,
+        presentation_timestamp,
+        frame_token,
+    ) in results
+    {
         let source = targets
             .sources
             .get_mut(&key)
@@ -4329,6 +4415,8 @@ fn acquire_output_frames(
         source.pending_present = Some(present);
         source.pending_security_presentations = security_presentations;
         source.pending_resume_first_flip = resume_first_flip;
+        source.pending_presentation_timestamp = Some(presentation_timestamp);
+        source.pending_frame_token = Some(frame_token);
     }
 }
 
@@ -4338,9 +4426,13 @@ struct KmsOutputCamera;
 #[derive(Resource, Default)]
 struct KmsMainWorldOutputs(BTreeMap<OutputKey, MainWorldOutput>);
 
+#[derive(Resource, Default)]
+struct KmsCursorOverlayImages(BTreeMap<OutputKey, Handle<Image>>);
+
 #[derive(Clone, Copy)]
 struct MainWorldOutput {
     entity: Entity,
+    cursor_entity: Option<Entity>,
     handle: ManualTextureViewHandle,
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
     generation: u64,
@@ -4867,6 +4959,12 @@ fn apply_main_world_effect(
             placeholder,
             acquire,
         } => {
+            if !world.contains_resource::<KmsCursorOverlayImages>() {
+                world.init_resource::<KmsCursorOverlayImages>();
+            }
+            if !world.contains_resource::<Assets<Image>>() {
+                world.init_resource::<Assets<Image>>();
+            }
             let extent = super::worker::PlaceholderExtent::extent(&placeholder);
             let logical_extent = placeholder.logical_extent;
             world
@@ -4892,6 +4990,28 @@ fn apply_main_world_effect(
                 .resource_mut::<ManualTextureViews>()
                 .insert(handle, placeholder);
             let existing = world.resource::<KmsMainWorldOutputs>().0.get(&key).copied();
+            let overlay_image = world
+                .resource::<KmsCursorOverlayImages>()
+                .0
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| {
+                    let image = world
+                        .resource_mut::<Assets<Image>>()
+                        .add(crate::compositor_scene::cursor_overlay_image(extent));
+                    world
+                        .resource_mut::<KmsCursorOverlayImages>()
+                        .0
+                        .insert(key.clone(), image.clone());
+                    image
+                });
+            if let Some(mut image) = world
+                .resource_mut::<Assets<Image>>()
+                .get_mut(&overlay_image)
+                && (image.width() != extent.0 || image.height() != extent.1)
+            {
+                *image = crate::compositor_scene::cursor_overlay_image(extent);
+            }
             // Bevy 0.19 reports scale 1.0 for every TextureView target and has
             // no supported camera-level override. Decoration Text2d therefore
             // rasterises at RendererOutputScale120 and inversely scales its
@@ -4907,6 +5027,14 @@ fn apply_main_world_effect(
                     logical_output_projection(logical_extent),
                     RenderTarget::TextureView(handle),
                     KmsOutputCamera,
+                    RenderLayers::layer(0),
+                    crate::capture::CaptureOutputSource {
+                        source_id: crate::backend::CaptureSourceId::Kms {
+                            key: key.clone(),
+                            generation,
+                        },
+                        output_name: key.connector_name.clone(),
+                    },
                     Msaa::Off,
                 ));
                 #[cfg(feature = "frame-capture")]
@@ -4926,16 +5054,81 @@ fn apply_main_world_effect(
                         logical_output_projection(logical_extent),
                         RenderTarget::TextureView(handle),
                         KmsOutputCamera,
+                        RenderLayers::layer(0),
+                        crate::capture::CaptureOutputSource {
+                            source_id: crate::backend::CaptureSourceId::Kms {
+                                key: key.clone(),
+                                generation,
+                            },
+                            output_name: key.connector_name.clone(),
+                        },
                         Msaa::Off,
                         #[cfg(feature = "frame-capture")]
                         crate::frame_capture::FrameCaptureTarget::new(&key.connector_name),
                     ))
                     .id()
             };
+            let cursor_entity = if let Some(existing) = existing {
+                existing.cursor_entity.inspect(|cursor_entity| {
+                    world.entity_mut(*cursor_entity).insert((
+                        Camera {
+                            order: 1,
+                            clear_color: ClearColorConfig::Custom(bevy::color::Color::NONE),
+                            output_mode: CameraOutputMode::Write {
+                                blend_state: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                                clear_color: ClearColorConfig::None,
+                            },
+                            ..Default::default()
+                        },
+                        logical_output_projection(logical_extent),
+                        RenderTarget::from(overlay_image.clone()),
+                        RenderLayers::layer(31),
+                        Msaa::Off,
+                        crate::capture::CaptureCursorOverlaySource {
+                            source_id: crate::backend::CaptureSourceId::Kms {
+                                key: key.clone(),
+                                generation,
+                            },
+                        },
+                    ));
+                })
+            } else {
+                Some(
+                    world
+                        .spawn((
+                            Name::new(format!(
+                                "KMS cursor overlay camera {}:{}",
+                                key.device, key.connector_name
+                            )),
+                            Camera2d,
+                            Camera {
+                                order: 1,
+                                clear_color: ClearColorConfig::Custom(bevy::color::Color::NONE),
+                                output_mode: CameraOutputMode::Write {
+                                    blend_state: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                                    clear_color: ClearColorConfig::None,
+                                },
+                                ..Default::default()
+                            },
+                            logical_output_projection(logical_extent),
+                            RenderTarget::from(overlay_image),
+                            RenderLayers::layer(31),
+                            Msaa::Off,
+                            crate::capture::CaptureCursorOverlaySource {
+                                source_id: crate::backend::CaptureSourceId::Kms {
+                                    key: key.clone(),
+                                    generation,
+                                },
+                            },
+                        ))
+                        .id(),
+                )
+            };
             world.resource_mut::<KmsMainWorldOutputs>().0.insert(
                 key.clone(),
                 MainWorldOutput {
                     entity,
+                    cursor_entity,
                     handle,
                     #[cfg(any(all(feature = "kms-live", not(test)), test))]
                     generation,
@@ -4960,6 +5153,15 @@ fn apply_main_world_effect(
                 .map_err(|_| KmsRegistrarChannelError::RenderChannelDisconnected)?;
             if let Some(output) = world.resource::<KmsMainWorldOutputs>().0.get(&key).copied()
                 && let Some(mut camera) = world.get_mut::<Camera>(output.entity)
+            {
+                camera.is_active = false;
+            }
+            if let Some(cursor_entity) = world
+                .resource::<KmsMainWorldOutputs>()
+                .0
+                .get(&key)
+                .and_then(|output| output.cursor_entity)
+                && let Some(mut camera) = world.get_mut::<Camera>(cursor_entity)
             {
                 camera.is_active = false;
             }
@@ -5005,6 +5207,20 @@ fn apply_main_world_effect(
                 if let Ok(entity) = world.get_entity_mut(output.entity) {
                     entity.despawn();
                 }
+                if let Some(cursor_entity) = output.cursor_entity
+                    && let Ok(entity) = world.get_entity_mut(cursor_entity)
+                {
+                    entity.despawn();
+                }
+            }
+            if world.contains_resource::<KmsCursorOverlayImages>() {
+                let overlays =
+                    std::mem::take(&mut world.resource_mut::<KmsCursorOverlayImages>().0);
+                for (_, image) in overlays {
+                    if let Some(mut images) = world.get_resource_mut::<Assets<Image>>() {
+                        images.remove(image.id());
+                    }
+                }
             }
             Ok(())
         }
@@ -5030,10 +5246,23 @@ fn apply_main_world_effect(
 
 fn remove_main_world_source(world: &mut World, key: &OutputKey, handle: ManualTextureViewHandle) {
     world.resource_mut::<ManualTextureViews>().remove(&handle);
-    if let Some(output) = world.resource_mut::<KmsMainWorldOutputs>().0.remove(key)
-        && let Ok(entity) = world.get_entity_mut(output.entity)
+    if let Some(output) = world.resource_mut::<KmsMainWorldOutputs>().0.remove(key) {
+        if let Ok(entity) = world.get_entity_mut(output.entity) {
+            entity.despawn();
+        }
+        if let Some(cursor_entity) = output.cursor_entity
+            && let Ok(entity) = world.get_entity_mut(cursor_entity)
+        {
+            entity.despawn();
+        }
+    }
+    let image = world
+        .get_resource_mut::<KmsCursorOverlayImages>()
+        .and_then(|mut overlays| overlays.0.remove(key));
+    if let Some(image) = image
+        && let Some(mut images) = world.get_resource_mut::<Assets<Image>>()
     {
-        entity.despawn();
+        images.remove(image.id());
     }
 }
 
@@ -5084,9 +5313,13 @@ fn apply_render_world_commands(
                         acquire,
                         ready_generation: None,
                         current_ready_generation: None,
+                        next_frame_token: 0,
+                        pending_frame_token: None,
                         pending_present: None,
                         pending_security_presentations: Vec::new(),
+                        pending_capture_presentations: Vec::new(),
                         pending_resume_first_flip: None,
+                        pending_presentation_timestamp: None,
                     },
                 );
             }
@@ -5167,6 +5400,7 @@ fn present_output_frames(
     mut targets: bevy::prelude::ResMut<KmsRenderTargets>,
     views: bevy::prelude::Query<(&ExtractedCamera, &ViewTarget)>,
     security_presentations: Option<bevy::prelude::Res<NestedSecurityPresentation>>,
+    capture_reporter: Option<bevy::prelude::Res<crate::capture::CaptureReporterBridge>>,
 ) {
     if targets.lifecycle.state() != KmsRenderLifecycleState::Active {
         return;
@@ -5189,7 +5423,12 @@ fn present_output_frames(
             }
         })
         .collect::<Vec<_>>();
-    present_selected_output_frames(&mut targets, &extracted, security_presentations.as_deref());
+    present_selected_output_frames(
+        &mut targets,
+        &extracted,
+        security_presentations.as_deref(),
+        capture_reporter.as_deref(),
+    );
 }
 
 /// Bevy's final output pass is demand-driven: if no render node consumes an
@@ -5550,12 +5789,37 @@ fn present_selected_output_frames(
     targets: &mut KmsRenderTargets,
     extracted: &[ExtractedOutputView],
     security_presentations: Option<&NestedSecurityPresentation>,
+    capture_reporter: Option<&crate::capture::CaptureReporterBridge>,
 ) {
     let presenters = select_written_presenters(&mut targets.sources, extracted);
     let frame_events = targets.frame_events.clone();
     for presenter in presenters {
         let event = match present_output_frame(presenter.present, targets.present_deadline) {
             Ok(PresentOutcome::Displayed) => {
+                let Some(timestamp) = *presenter
+                    .presentation_timestamp
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                else {
+                    fail_capture_presentations(&presenter.capture_presentations, capture_reporter);
+                    let failure = KmsRenderWorkerFailure {
+                        operation: KmsRenderOperation::Worker,
+                        generation: presenter.generation,
+                        key: Some(presenter.key),
+                        failure: KmsRenderPlatformFailure::new(
+                            "kms-pageflip-timestamp-missing",
+                            "displayed KMS frame had no retained kernel page-flip timestamp",
+                        ),
+                    };
+                    if let Some(worker_stop) = &targets.worker_stop {
+                        worker_stop.begin_render_path_failure(failure.clone());
+                        worker_stop.wake();
+                    }
+                    if let Some(frame_events) = &frame_events {
+                        let _ = frame_events.send(KmsRenderFrameEvent::TerminalFailure(failure));
+                    }
+                    break;
+                };
                 let security_epochs = presenter
                     .security_presentations
                     .iter()
@@ -5582,24 +5846,45 @@ fn present_selected_output_frames(
                 if let Some(pending) = security_presentations {
                     pending.complete(&presenter.security_presentations);
                 }
+                if let Some(reporter) = capture_reporter.and_then(|bridge| bridge.reporter()) {
+                    for capture in &presenter.capture_presentations {
+                        reporter.presented(crate::capture::CapturePresented {
+                            id: capture.id,
+                            source_id: capture.source_id.clone(),
+                            frame_token: capture.frame_token,
+                            generation: capture.generation,
+                            security_epoch: capture.security_epoch,
+                            seconds: timestamp.seconds,
+                            nanoseconds: timestamp.nanoseconds,
+                        });
+                    }
+                }
                 Some(KmsRenderFrameEvent::FrameSubmitted {
                     generation: presenter.generation,
                     key: presenter.key,
+                    frame_token: presenter.frame_token,
+                    timestamp,
                     security_epochs,
                 })
             }
-            Ok(PresentOutcome::Cancelled) => Some(KmsRenderFrameEvent::PresentationCancelled {
-                generation: presenter.generation,
-                key: presenter.key,
-            }),
-            Err(failure) => Some(KmsRenderFrameEvent::TerminalFailure(
-                KmsRenderWorkerFailure {
-                    operation: KmsRenderOperation::Worker,
+            Ok(PresentOutcome::Cancelled) => {
+                fail_capture_presentations(&presenter.capture_presentations, capture_reporter);
+                Some(KmsRenderFrameEvent::PresentationCancelled {
                     generation: presenter.generation,
-                    key: Some(presenter.key),
-                    failure,
-                },
-            )),
+                    key: presenter.key,
+                })
+            }
+            Err(failure) => {
+                fail_capture_presentations(&presenter.capture_presentations, capture_reporter);
+                Some(KmsRenderFrameEvent::TerminalFailure(
+                    KmsRenderWorkerFailure {
+                        operation: KmsRenderOperation::Worker,
+                        generation: presenter.generation,
+                        key: Some(presenter.key),
+                        failure,
+                    },
+                ))
+            }
         };
         let terminal = matches!(event, Some(KmsRenderFrameEvent::TerminalFailure(_)));
         let reply_carried_authority_failure = matches!(
@@ -5644,13 +5929,34 @@ fn select_written_presenters(
             presenters.push(AcquiredOutputPresenter {
                 key: key.clone(),
                 generation: source.generation,
+                frame_token: source
+                    .pending_frame_token
+                    .take()
+                    .expect("presentable frame owns its acquisition token"),
                 present,
                 security_presentations: std::mem::take(&mut source.pending_security_presentations),
                 resume_first_flip: source.pending_resume_first_flip.take(),
+                capture_presentations: std::mem::take(&mut source.pending_capture_presentations),
+                presentation_timestamp: source
+                    .pending_presentation_timestamp
+                    .take()
+                    .expect("presentable frame owns its kernel timestamp slot"),
             });
         }
     }
     presenters
+}
+
+fn fail_capture_presentations(
+    captures: &[crate::capture::PendingCapturePresentation],
+    bridge: Option<&crate::capture::CaptureReporterBridge>,
+) {
+    let Some(reporter) = bridge.and_then(|bridge| bridge.reporter()) else {
+        return;
+    };
+    for capture in captures {
+        reporter.failed(capture.id, capture.generation, capture.security_epoch);
+    }
 }
 
 fn complete_render_quiescence(
@@ -5740,7 +6046,13 @@ fn drain_render_resources(
         })
         .collect::<Vec<_>>();
     for (key, handle) in removed_handles {
-        targets.sources.remove(&key);
+        if let Some(source) = targets.sources.remove(&key)
+            && let Some(reporter) = &targets.capture_reporter
+        {
+            for capture in source.pending_capture_presentations {
+                reporter.failed(capture.id, capture.generation, capture.security_epoch);
+            }
+        }
         views.remove(&handle);
     }
 }
@@ -5970,6 +6282,12 @@ pub(crate) mod tests {
                 acquire: Box::new(move || {
                     let presented = Arc::clone(&presented);
                     Ok(AcquiredOutputFrame {
+                        presentation_timestamp: Arc::new(Mutex::new(Some(
+                            KmsPresentationTimestamp {
+                                seconds: 1,
+                                nanoseconds: 2,
+                            },
+                        ))),
                         view: frame_driver_view(
                             &device,
                             width,
@@ -6941,6 +7259,9 @@ pub(crate) mod tests {
             .resource_mut::<crate::capture::CaptureQueue>()
             .push(crate::capture::CaptureRequest {
                 id: crate::capture::CaptureId(41),
+                source_id: crate::backend::CaptureSourceId::Nested {
+                    output_name: "cosmix-first-light-0".into(),
+                },
                 output_name: "cosmix-first-light-0".into(),
                 generation: 1,
                 security_epoch: 2,
@@ -6950,9 +7271,18 @@ pub(crate) mod tests {
                     width: 1,
                     height: 1,
                 },
-                output_size: (1, 1),
+                logical_rect: (0, 0, 1, 1),
+                source_storage_extent: (1, 1),
+                displayed_physical_extent: (1, 1),
+                scale120: 120,
+                transform: smithay::utils::Transform::Normal,
                 format: crate::capture::CaptureFormat::Xrgb8888,
+                overlay_cursor: false,
+                cursor: None,
                 with_damage: false,
+                damage_baseline: None,
+                damage_revision: 0,
+                damage: Vec::new(),
                 cancellation: crate::capture::CaptureCancellation::default(),
                 reservation: crate::capture::CaptureReservationLease::detached(
                     crate::capture::CaptureId(41),
@@ -8033,11 +8363,21 @@ pub(crate) mod tests {
         targets.sources.insert(
             key.clone(),
             OutputFrameSource {
+                next_frame_token: 0,
+                pending_frame_token: None,
+                pending_capture_presentations: Vec::new(),
+                pending_presentation_timestamp: None,
                 generation: 9,
                 handle,
                 extent: (320, 240),
                 acquire: Box::new(move || {
                     Ok(AcquiredOutputFrame {
+                        presentation_timestamp: Arc::new(Mutex::new(Some(
+                            KmsPresentationTimestamp {
+                                seconds: 1,
+                                nanoseconds: 2,
+                            },
+                        ))),
                         view: wrong_view.clone(),
                         present: Box::new(|| panic!("wrong-sized frame was presented")),
                         resume_first_flip: None,
@@ -8115,11 +8455,21 @@ pub(crate) mod tests {
         targets.sources.insert(
             key.clone(),
             OutputFrameSource {
+                next_frame_token: 0,
+                pending_frame_token: None,
+                pending_capture_presentations: Vec::new(),
+                pending_presentation_timestamp: None,
                 generation: 10,
                 handle,
                 extent: (320, 240),
                 acquire: Box::new(move || {
                     Ok(AcquiredOutputFrame {
+                        presentation_timestamp: Arc::new(Mutex::new(Some(
+                            KmsPresentationTimestamp {
+                                seconds: 1,
+                                nanoseconds: 2,
+                            },
+                        ))),
                         view: view.clone(),
                         present: Box::new({
                             let presented_probe = Arc::clone(&presented_probe);
@@ -8161,6 +8511,7 @@ pub(crate) mod tests {
                 written: true,
             }],
             Some(&security_presentations),
+            None,
         );
 
         assert!(presented.load(Ordering::SeqCst));
@@ -8178,6 +8529,11 @@ pub(crate) mod tests {
             KmsRenderFrameEvent::FrameSubmitted {
                 generation: 10,
                 key,
+                frame_token: 1,
+                timestamp: KmsPresentationTimestamp {
+                    seconds: 1,
+                    nanoseconds: 2,
+                },
                 security_epochs: vec![73],
             }
         );
@@ -8199,11 +8555,21 @@ pub(crate) mod tests {
         targets.sources.insert(
             key.clone(),
             OutputFrameSource {
+                next_frame_token: 0,
+                pending_frame_token: None,
+                pending_capture_presentations: Vec::new(),
+                pending_presentation_timestamp: None,
                 generation: 11,
                 handle,
                 extent: (320, 240),
                 acquire: Box::new(move || {
                     Ok(AcquiredOutputFrame {
+                        presentation_timestamp: Arc::new(Mutex::new(Some(
+                            KmsPresentationTimestamp {
+                                seconds: 1,
+                                nanoseconds: 2,
+                            },
+                        ))),
                         view: view.clone(),
                         present: fallible_present_output_frame({
                             let present_deadline = Arc::clone(&present_deadline);
@@ -8247,6 +8613,7 @@ pub(crate) mod tests {
                 written: true,
             }],
             Some(&security_presentations),
+            None,
         );
 
         assert_eq!(
@@ -8274,6 +8641,7 @@ pub(crate) mod tests {
                 if matches!(events.as_slice(), [KmsRenderFrameEvent::PresentationCancelled {
                     generation: 11,
                     key: cancelled_key,
+                    ..
                 }] if *cancelled_key == blocked_output().key)
         ));
         assert_eq!(
@@ -8315,11 +8683,21 @@ pub(crate) mod tests {
         targets.sources.insert(
             key.clone(),
             OutputFrameSource {
+                next_frame_token: 0,
+                pending_frame_token: None,
+                pending_capture_presentations: Vec::new(),
+                pending_presentation_timestamp: None,
                 generation: 61,
                 handle,
                 extent: (320, 240),
                 acquire: Box::new(move || {
                     Ok(AcquiredOutputFrame {
+                        presentation_timestamp: Arc::new(Mutex::new(Some(
+                            KmsPresentationTimestamp {
+                                seconds: 1,
+                                nanoseconds: 2,
+                            },
+                        ))),
                         view: view.clone(),
                         present: fallible_present_output_frame(move |_| {
                             Err(KmsRenderPlatformFailure::terminal(
@@ -8351,6 +8729,7 @@ pub(crate) mod tests {
                 ready: true,
                 written: true,
             }],
+            None,
             None,
         );
 
@@ -8692,6 +9071,10 @@ pub(crate) mod tests {
         targets.sources.insert(
             key.clone(),
             OutputFrameSource {
+                next_frame_token: 0,
+                pending_frame_token: None,
+                pending_capture_presentations: Vec::new(),
+                pending_presentation_timestamp: None,
                 generation: 8,
                 handle,
                 extent: (320, 240),
@@ -8703,6 +9086,12 @@ pub(crate) mod tests {
                     };
                     let present_oracle = Arc::clone(&acquire_oracle);
                     Ok(AcquiredOutputFrame {
+                        presentation_timestamp: Arc::new(Mutex::new(Some(
+                            KmsPresentationTimestamp {
+                                seconds: 1,
+                                nanoseconds: 2,
+                            },
+                        ))),
                         view: view.clone(),
                         present: Box::new(move || {
                             assert!(
@@ -8742,6 +9131,7 @@ pub(crate) mod tests {
                 written: true,
             }],
             None,
+            None,
         );
         world.run_system_once(acquire_output_frames).unwrap();
         assert_eq!(oracle.acquired.load(Ordering::SeqCst), 0);
@@ -8755,6 +9145,7 @@ pub(crate) mod tests {
                 ready: true,
                 written: false,
             }],
+            None,
             None,
         );
         world.run_system_once(acquire_output_frames).unwrap();
@@ -8779,6 +9170,7 @@ pub(crate) mod tests {
                     written: false,
                 }],
                 None,
+                None,
             );
             world.run_system_once(acquire_output_frames).unwrap();
         }
@@ -8797,6 +9189,7 @@ pub(crate) mod tests {
                 written: true,
             }],
             None,
+            None,
         );
 
         assert_eq!(oracle.acquired.load(Ordering::SeqCst), 1);
@@ -8808,6 +9201,11 @@ pub(crate) mod tests {
             KmsRenderFrameEvent::FrameSubmitted {
                 generation: 8,
                 key,
+                frame_token: 1,
+                timestamp: KmsPresentationTimestamp {
+                    seconds: 1,
+                    nanoseconds: 2,
+                },
                 security_epochs: Vec::new(),
             }
         );
@@ -9129,6 +9527,10 @@ pub(crate) mod tests {
             source.acquire = Box::new(move || {
                 let present_barrier = barrier.clone();
                 Ok(AcquiredOutputFrame {
+                    presentation_timestamp: Arc::new(Mutex::new(Some(KmsPresentationTimestamp {
+                        seconds: 1,
+                        nanoseconds: 2,
+                    }))),
                     view: view.clone(),
                     present: Box::new(move || present_barrier.enter_and_wait()),
                     resume_first_flip: None,
@@ -9463,7 +9865,7 @@ pub(crate) mod tests {
                 written: true,
             })
             .collect::<Vec<_>>();
-        present_selected_output_frames(&mut targets, &extracted, None);
+        present_selected_output_frames(&mut targets, &extracted, None, None);
     }
 
     pub(crate) fn while_worker_teardown_is_blocked(
@@ -9611,6 +10013,10 @@ pub(crate) mod tests {
         targets.sources.insert(
             key.clone(),
             OutputFrameSource {
+                next_frame_token: 0,
+                pending_frame_token: None,
+                pending_capture_presentations: Vec::new(),
+                pending_presentation_timestamp: None,
                 generation: 12,
                 handle: output_handle,
                 extent: (320, 240),
@@ -9734,6 +10140,10 @@ pub(crate) mod tests {
         targets.sources.insert(
             key.clone(),
             OutputFrameSource {
+                next_frame_token: 0,
+                pending_frame_token: None,
+                pending_capture_presentations: Vec::new(),
+                pending_presentation_timestamp: None,
                 generation: 18,
                 handle,
                 extent: (output.display.mode.width, output.display.mode.height),
@@ -10411,6 +10821,7 @@ pub(crate) mod tests {
             output.key.clone(),
             MainWorldOutput {
                 entity,
+                cursor_entity: None,
                 handle,
                 generation: 1,
             },

@@ -7,10 +7,13 @@ use std::{
 
 use bevy::{
     asset::RenderAssetUsages,
-    camera::visibility::NoFrustumCulling,
+    camera::{
+        CameraOutputMode, ClearColorConfig, RenderTarget,
+        visibility::{NoFrustumCulling, RenderLayers},
+    },
     image::ImageSampler,
     prelude::*,
-    render::render_resource::{Extent3d, TextureDimension, TextureFormat},
+    render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages},
     sprite::SpriteAlphaMode,
     sprite_render::{MeshMaterial2d, SpriteMaterial},
     window::{CursorIcon, PrimaryWindow, SystemCursorIcon},
@@ -207,6 +210,7 @@ impl CompositorScenePlugin {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(any(feature = "kms-live", test)), allow(dead_code))]
 pub(crate) enum SceneCursorMode {
     HostCursor,
     SoftwareCursor,
@@ -224,15 +228,15 @@ impl Plugin for CompositorScenePlugin {
                 crate::backend::kms::OutputScale120::ONE.get(),
             ))
             .insert_resource(CursorScene::new(self.cursor_mode))
+            .init_resource::<HostCursor>()
             .add_systems(First, drain_protocol_events.in_set(CompositorSceneSet))
+            .add_systems(Startup, spawn_software_cursor)
+            .add_systems(Last, refresh_retained_capture_cursor)
             .add_systems(Last, log_settled_client_sampling_contracts)
             .add_plugins(ClientSurfaceMaterialPlugin)
             .add_plugins(DecorationPlugin);
-        if self.cursor_mode == SceneCursorMode::SoftwareCursor {
-            app.add_systems(Startup, spawn_software_cursor);
-        } else {
-            app.init_resource::<HostCursor>()
-                .add_systems(Last, project_host_cursor);
+        if self.cursor_mode == SceneCursorMode::HostCursor {
+            app.add_systems(Last, project_host_cursor);
         }
     }
 }
@@ -436,6 +440,11 @@ struct CursorScene {
     resize_images: Option<ResizeCursorImages>,
 }
 
+#[derive(Resource)]
+pub(crate) struct NestedCursorOverlay {
+    pub(crate) image: Handle<Image>,
+}
+
 impl CursorScene {
     fn new(mode: SceneCursorMode) -> Self {
         Self {
@@ -601,19 +610,26 @@ fn apply_protocol_events(world: &mut World, events: Vec<ProtocolEvent>) {
                 active,
                 presentation_epoch,
                 presentations,
-            } => apply_security_scene(world, active, presentation_epoch, presentations),
+            } => {
+                mark_base_damage(world);
+                apply_security_scene(world, active, presentation_epoch, presentations);
+            }
             ProtocolEvent::OutputResized { width, height } => {
+                mark_base_damage(world);
                 resize_compositor_logical_canvas(world, width, height);
             }
             ProtocolEvent::SurfaceUpserted { id, scene, frame } => {
+                mark_surface_change_damage(world, id, scene.layout);
                 z_ranks_dirty |= upsert_surface_snapshot(world, id, scene, frame);
                 mark_decoration_dirty(world, id);
             }
             ProtocolEvent::SurfaceRelayout { id, scene } => {
+                mark_surface_change_damage(world, id, scene.layout);
                 z_ranks_dirty |= relayout_surface(world, id, scene);
                 mark_decoration_dirty(world, id);
             }
             ProtocolEvent::SurfaceUnmapped { id } | ProtocolEvent::SurfaceDestroyed { id } => {
+                mark_removed_surface_damage(world, id);
                 z_ranks_dirty |= remove_surface(world, id);
             }
             ProtocolEvent::SurfaceRoster { mapped } => {
@@ -630,6 +646,17 @@ fn apply_protocol_events(world: &mut World, events: Vec<ProtocolEvent>) {
                     .copied()
                     .filter(|id| !mapped.contains(id))
                     .collect::<Vec<_>>();
+                let damage = stale
+                    .iter()
+                    .filter_map(|id| {
+                        world
+                            .resource::<SurfaceEntities>()
+                            .surfaces
+                            .get(id)
+                            .and_then(|surface| surface_damage_region(surface.layout))
+                    })
+                    .collect::<Vec<_>>();
+                mark_base_regions(world, damage);
                 for id in stale {
                     z_ranks_dirty |= remove_surface(world, id);
                 }
@@ -646,6 +673,17 @@ fn apply_protocol_events(world: &mut World, events: Vec<ProtocolEvent>) {
                     .resource_mut::<crate::capture::CaptureQueue>()
                     .push(request);
             }
+            ProtocolEvent::CaptureDamageWatch(watch) => {
+                world
+                    .resource_mut::<crate::capture::CaptureDamageEligibilityWatches>()
+                    .0
+                    .push(watch);
+            }
+            ProtocolEvent::CaptureKmsSourcesRetired => {
+                if let Some(journal) = world.get_resource::<crate::capture::OutputDamageJournal>() {
+                    journal.retire_kms_sources();
+                }
+            }
             ProtocolEvent::RuntimeFailed(error) => {
                 fail_compositor_scene(world, format!("Wayland protocol thread failed: {error}"));
             }
@@ -655,6 +693,131 @@ fn apply_protocol_events(world: &mut World, events: Vec<ProtocolEvent>) {
         recompute_surface_z_ranks(world);
     }
     refresh_lock_blank(world);
+}
+
+fn capture_cursor_snapshot(world: &World) -> Option<crate::capture::CaptureCursorSnapshot> {
+    let cursor = world.resource::<CursorScene>();
+    let (handle, hotspot, logical_size, source_rect, image_transform, premultiplied) =
+        match cursor.selection {
+            ProjectedCursorSelection::Hidden => return None,
+            ProjectedCursorSelection::Default => (
+                cursor.default_image.clone()?,
+                (0, 0),
+                Vec2::new(DEFAULT_CURSOR_WIDTH as f32, DEFAULT_CURSOR_HEIGHT as f32),
+                None,
+                SurfaceTransform::Normal,
+                false,
+            ),
+            ProjectedCursorSelection::Chrome(icon) => match icon {
+                ChromeCursorIcon::Move => (
+                    cursor.default_image.clone()?,
+                    (0, 0),
+                    Vec2::new(DEFAULT_CURSOR_WIDTH as f32, DEFAULT_CURSOR_HEIGHT as f32),
+                    None,
+                    SurfaceTransform::Normal,
+                    false,
+                ),
+                _ => (
+                    resize_cursor_handle(cursor.resize_images.as_ref()?, icon).clone(),
+                    RESIZE_CURSOR_HOTSPOT,
+                    Vec2::splat(RESIZE_CURSOR_SIZE as f32),
+                    None,
+                    SurfaceTransform::Normal,
+                    false,
+                ),
+            },
+            ProjectedCursorSelection::Surface => {
+                let client = cursor.client.as_ref()?;
+                (
+                    client.image.handle().clone(),
+                    client.hotspot,
+                    Vec2::new(client.presentation.width, client.presentation.height),
+                    client.presentation.source,
+                    client.presentation.transform,
+                    true,
+                )
+            }
+        };
+    let image = world.resource::<Assets<Image>>().get(&handle)?;
+    let source = image.data.as_ref()?;
+    let source_size = image.size();
+    let (x, y, width, height) = cursor_capture_geometry(
+        cursor.position,
+        hotspot,
+        logical_size,
+        world.resource::<RendererOutputScale120>().0,
+    )?;
+    let (raw_width, raw_height) = if surface_transform_swaps_axes(image_transform) {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let source_rect = source_rect.unwrap_or(crate::protocol::TextureSourceRect {
+        x: 0.0,
+        y: 0.0,
+        width: source_size.x as f32,
+        height: source_size.y as f32,
+    });
+    if source_rect.width <= 0.0 || source_rect.height <= 0.0 {
+        return None;
+    }
+    let smithay_transform = match image_transform {
+        SurfaceTransform::Normal => smithay::utils::Transform::Normal,
+        SurfaceTransform::Rotate90 => smithay::utils::Transform::_90,
+        SurfaceTransform::Rotate180 => smithay::utils::Transform::_180,
+        SurfaceTransform::Rotate270 => smithay::utils::Transform::_270,
+        SurfaceTransform::Flipped => smithay::utils::Transform::Flipped,
+        SurfaceTransform::Flipped90 => smithay::utils::Transform::Flipped90,
+        SurfaceTransform::Flipped180 => smithay::utils::Transform::Flipped180,
+        SurfaceTransform::Flipped270 => smithay::utils::Transform::Flipped270,
+    };
+    let mut rgba = vec![0_u8; width as usize * height as usize * 4];
+    for raw_y in 0..raw_height {
+        for raw_x in 0..raw_width {
+            let sx = (source_rect.x + (raw_x as f32 + 0.5) * source_rect.width / raw_width as f32)
+                .floor()
+                .clamp(0.0, source_size.x.saturating_sub(1) as f32) as u32;
+            let sy = (source_rect.y + (raw_y as f32 + 0.5) * source_rect.height / raw_height as f32)
+                .floor()
+                .clamp(0.0, source_size.y.saturating_sub(1) as f32) as u32;
+            let source_offset = ((sy * source_size.x + sx) * 4) as usize;
+            let (dx, dy) = crate::capture::transform_pixel(
+                smithay_transform,
+                raw_x,
+                raw_y,
+                raw_width,
+                raw_height,
+            )?;
+            let destination = ((dy * width + dx) * 4) as usize;
+            let pixel = source.get(source_offset..source_offset + 4)?;
+            match image.texture_descriptor.format {
+                bevy::render::render_resource::TextureFormat::Bgra8Unorm
+                | bevy::render::render_resource::TextureFormat::Bgra8UnormSrgb => {
+                    rgba[destination..destination + 4]
+                        .copy_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                }
+                _ => rgba[destination..destination + 4].copy_from_slice(pixel),
+            }
+        }
+    }
+    Some(crate::capture::CaptureCursorSnapshot {
+        x,
+        y,
+        width,
+        height,
+        rgba: Arc::new(rgba),
+        premultiplied,
+    })
+}
+
+fn refresh_retained_capture_cursor(world: &mut World) {
+    if !world.contains_resource::<crate::capture::RetainedCaptureCursor>() {
+        return;
+    }
+    let snapshot = capture_cursor_snapshot(world);
+    world
+        .resource_mut::<crate::capture::RetainedCaptureCursor>()
+        .0 = snapshot;
 }
 
 fn apply_security_scene(
@@ -746,7 +909,6 @@ fn spawn_software_cursor(
     output_scale: Res<RendererOutputScale120>,
     mut cursor: ResMut<CursorScene>,
 ) {
-    debug_assert_eq!(cursor.mode, SceneCursorMode::SoftwareCursor);
     let image = images.add(default_cursor_image());
     let resize_images = ResizeCursorImages {
         horizontal: images.add(resize_cursor_image(ResizeCursorAxis::Horizontal)),
@@ -777,6 +939,7 @@ fn spawn_software_cursor(
         .spawn((
             Name::new("CosMix software cursor"),
             SoftwareCursorEntity,
+            RenderLayers::layer(31),
             sprite,
             transform,
             if visible {
@@ -789,6 +952,61 @@ fn spawn_software_cursor(
     cursor.entity = Some(entity);
     cursor.default_image = Some(image);
     cursor.resize_images = Some(resize_images);
+
+    if cursor.mode == SceneCursorMode::HostCursor {
+        let extent = physical_canvas_extent(canvas.0, output_scale.0);
+        let overlay = images.add(cursor_overlay_image(extent));
+        commands.spawn((
+            Name::new("Nested cursor capture overlay camera"),
+            Camera2d,
+            Camera {
+                order: 1,
+                clear_color: ClearColorConfig::Custom(Color::NONE),
+                output_mode: CameraOutputMode::Write {
+                    blend_state: None,
+                    clear_color: ClearColorConfig::None,
+                },
+                ..Default::default()
+            },
+            RenderTarget::from(overlay.clone()),
+            RenderLayers::layer(31),
+            Msaa::Off,
+            crate::capture::CaptureCursorOverlaySource {
+                source_id: crate::backend::CaptureSourceId::Nested {
+                    output_name: "cosmix-nested-0".into(),
+                },
+            },
+        ));
+        commands.insert_resource(NestedCursorOverlay { image: overlay });
+    }
+}
+
+fn physical_canvas_extent(canvas: Vec2, scale120: u32) -> (u32, u32) {
+    let width = project_logical_edge(canvas.x, scale120).max(1);
+    let height = project_logical_edge(canvas.y, scale120).max(1);
+    (
+        u32::try_from(width).unwrap_or(u32::MAX),
+        u32::try_from(height).unwrap_or(u32::MAX),
+    )
+}
+
+pub(crate) fn cursor_overlay_image(extent: (u32, u32)) -> Image {
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: extent.0,
+            height: extent.1,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0, 0, 0],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    image.texture_descriptor.usage = TextureUsages::RENDER_ATTACHMENT
+        | TextureUsages::TEXTURE_BINDING
+        | TextureUsages::COPY_SRC
+        | TextureUsages::COPY_DST;
+    image
 }
 
 fn project_host_cursor(
@@ -807,11 +1025,17 @@ fn project_host_cursor(
 }
 
 fn sample_cursor_position(world: &mut World, position: CursorPositionSnapshot) {
+    let old = capture_cursor_damage_bounds(world);
+    let changed = world.resource::<CursorScene>().position != position;
     world.resource_mut::<CursorScene>().position = position;
     refresh_cursor_entity(world);
+    if changed {
+        mark_cursor_regions(world, old, capture_cursor_damage_bounds(world));
+    }
 }
 
 fn apply_cursor_image(world: &mut World, image: CursorImage) {
+    let old = capture_cursor_damage_bounds(world);
     if world.resource::<CursorScene>().mode == SceneCursorMode::HostCursor {
         let icon = match &image {
             CursorImage::Chrome(cursor) => host_cursor_icon(*cursor),
@@ -820,16 +1044,6 @@ fn apply_cursor_image(world: &mut World, image: CursorImage) {
             }
         };
         world.resource_mut::<HostCursor>().icon = icon;
-        if let CursorImage::Surface {
-            frame: Some(SurfaceFrame::Dmabuf(frame)),
-            ..
-        } = image
-        {
-            world
-                .resource::<ClientSceneFeed>()
-                .dmabuf_release_callback(frame.token)();
-        }
-        return;
     }
 
     match image {
@@ -865,6 +1079,111 @@ fn apply_cursor_image(world: &mut World, image: CursorImage) {
         },
     }
     refresh_cursor_entity(world);
+    mark_cursor_regions(world, old, capture_cursor_damage_bounds(world));
+}
+
+fn mark_base_damage(world: &World) {
+    if let Some(journal) = world.get_resource::<crate::capture::OutputDamageJournal>() {
+        journal.mark_all_base_full();
+    }
+}
+
+fn mark_surface_change_damage(world: &World, id: SurfaceId, new_layout: SurfaceLayout) {
+    let old = world
+        .resource::<SurfaceEntities>()
+        .surfaces
+        .get(&id)
+        .and_then(|surface| surface_damage_region(surface.layout));
+    let new = surface_damage_region(new_layout);
+    mark_base_regions(world, old.into_iter().chain(new).collect::<Vec<_>>());
+}
+
+fn mark_removed_surface_damage(world: &World, id: SurfaceId) {
+    let surface = world.resource::<SurfaceEntities>().surfaces.get(&id);
+    let old = surface.and_then(|surface| surface_damage_region(surface.layout));
+    mark_base_regions(world, old.into_iter().collect::<Vec<_>>());
+}
+
+fn surface_damage_region(layout: SurfaceLayout) -> Option<crate::capture::CaptureLogicalRegion> {
+    if !layout.visible || layout.width <= 0.0 || layout.height <= 0.0 {
+        return None;
+    }
+    Some(crate::capture::CaptureLogicalRegion {
+        x: layout.x,
+        y: layout.y,
+        width: layout.width,
+        height: layout.height,
+    })
+}
+
+fn mark_base_regions(world: &World, rectangles: Vec<crate::capture::CaptureLogicalRegion>) {
+    if rectangles.is_empty() {
+        return;
+    }
+    if let Some(journal) = world.get_resource::<crate::capture::OutputDamageJournal>() {
+        journal.mark_base_logical_regions(&rectangles);
+    }
+}
+
+fn mark_cursor_regions(
+    world: &World,
+    old: Option<crate::capture::CaptureLogicalRegion>,
+    new: Option<crate::capture::CaptureLogicalRegion>,
+) {
+    let rectangles = old.into_iter().chain(new).collect::<Vec<_>>();
+    if rectangles.is_empty() {
+        return;
+    }
+    if let Some(journal) = world.get_resource::<crate::capture::OutputDamageJournal>() {
+        journal.mark_cursor_logical_regions(&rectangles);
+    }
+}
+
+fn capture_cursor_damage_bounds(world: &World) -> Option<crate::capture::CaptureLogicalRegion> {
+    let cursor = world.resource::<CursorScene>();
+    let (hotspot, logical_size) = match cursor.selection {
+        ProjectedCursorSelection::Hidden => return None,
+        ProjectedCursorSelection::Default | ProjectedCursorSelection::Chrome(_) => (
+            (0, 0),
+            Vec2::new(DEFAULT_CURSOR_WIDTH as f32, DEFAULT_CURSOR_HEIGHT as f32),
+        ),
+        ProjectedCursorSelection::Surface => {
+            let client = cursor.client.as_ref()?;
+            (
+                client.hotspot,
+                Vec2::new(client.presentation.width, client.presentation.height),
+            )
+        }
+    };
+    Some(crate::capture::CaptureLogicalRegion {
+        x: cursor.position.x as f32 - hotspot.0 as f32,
+        y: cursor.position.y as f32 - hotspot.1 as f32,
+        width: logical_size.x,
+        height: logical_size.y,
+    })
+}
+
+fn cursor_capture_geometry(
+    position: CursorPositionSnapshot,
+    hotspot: (i32, i32),
+    logical_size: Vec2,
+    scale120: u32,
+) -> Option<(i32, i32, u32, u32)> {
+    let (left, top, right, bottom) = projected_renderer_physical_edges(
+        position.x as f32 - hotspot.0 as f32,
+        position.y as f32 - hotspot.1 as f32,
+        logical_size.x,
+        logical_size.y,
+        scale120,
+    );
+    let width = u32::try_from(right.checked_sub(left)?).ok()?;
+    let height = u32::try_from(bottom.checked_sub(top)?).ok()?;
+    Some((
+        i32::try_from(left).ok()?,
+        i32::try_from(top).ok()?,
+        width,
+        height,
+    ))
 }
 
 fn host_cursor_icon(cursor: ChromeCursorIcon) -> SystemCursorIcon {
@@ -1032,9 +1351,7 @@ fn refresh_cursor_entity(world: &mut World) {
             cursor.position,
         )
     };
-    if mode != SceneCursorMode::SoftwareCursor {
-        return;
-    }
+    let _ = mode;
     let Some(entity) = entity else {
         return;
     };
@@ -1364,6 +1681,14 @@ pub(crate) fn set_compositor_logical_output_geometry(
 
 fn resize_compositor_logical_canvas(world: &mut World, width: u32, height: u32) {
     world.resource_mut::<LogicalCanvasSize>().0 = Vec2::new(width as f32, height as f32);
+    if let Some(overlay) = world.get_resource::<NestedCursorOverlay>() {
+        let handle = overlay.image.clone();
+        let scale120 = world.resource::<RendererOutputScale120>().0;
+        let extent = physical_canvas_extent(Vec2::new(width as f32, height as f32), scale120);
+        if let Some(mut image) = world.resource_mut::<Assets<Image>>().get_mut(&handle) {
+            *image = cursor_overlay_image(extent);
+        }
+    }
     let surfaces = world
         .resource::<SurfaceEntities>()
         .surfaces
@@ -2682,7 +3007,7 @@ mod tests {
     }
 
     #[test]
-    fn host_cursor_mode_never_spawns_a_software_cursor_entity() {
+    fn host_cursor_mode_retains_one_gpu_cursor_entity_for_capture_only() {
         let (mut app, _sender) = scene_app();
         app.update();
         assert_eq!(
@@ -2690,7 +3015,14 @@ mod tests {
                 .query_filtered::<Entity, With<SoftwareCursorEntity>>()
                 .iter(app.world())
                 .count(),
-            0
+            1
+        );
+        assert_eq!(
+            app.world_mut()
+                .query_filtered::<Entity, With<crate::capture::CaptureCursorOverlaySource>>()
+                .iter(app.world())
+                .count(),
+            1
         );
         assert_eq!(
             app.world().resource::<CursorScene>().mode,
@@ -3491,6 +3823,62 @@ mod tests {
     }
 
     #[test]
+    fn shm_capture_snapshot_applies_viewport_crop_transform_and_hotspot() {
+        let (mut app, _sender) = software_cursor_scene_app();
+        app.update();
+        let image = Image::new(
+            Extent3d {
+                width: 4,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            vec![
+                1, 2, 3, 255, 10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255,
+            ],
+            TextureFormat::Rgba8Unorm,
+            RenderAssetUsages::MAIN_WORLD,
+        );
+        let handle = app.world_mut().resource_mut::<Assets<Image>>().add(image);
+        {
+            let mut cursor = app.world_mut().resource_mut::<CursorScene>();
+            cursor.position = CursorPositionSnapshot {
+                x: 10.0,
+                y: 10.0,
+                revision: 1,
+            };
+            cursor.client = Some(ProjectedClientCursor {
+                id: ObjectId::null(),
+                hotspot: (2, 3),
+                presentation: CursorPresentation {
+                    width: 1.0,
+                    height: 2.0,
+                    source: Some(crate::protocol::TextureSourceRect {
+                        x: 1.0,
+                        y: 0.0,
+                        width: 2.0,
+                        height: 1.0,
+                    }),
+                    transform: SurfaceTransform::Rotate90,
+                },
+                image: ClientSurfaceImage::encoded_premultiplied_unorm(handle),
+                buffer_kind: SurfaceBufferKind::Shm,
+                opaque: false,
+            });
+            cursor.selection = ProjectedCursorSelection::Surface;
+        }
+        let snapshot = capture_cursor_snapshot(app.world()).expect("SHM cursor has CPU pixels");
+        assert_eq!(
+            (snapshot.x, snapshot.y, snapshot.width, snapshot.height),
+            (8, 7, 1, 2)
+        );
+        assert_eq!(
+            snapshot.rgba.as_slice(),
+            &[10, 20, 30, 255, 40, 50, 60, 255]
+        );
+    }
+
+    #[test]
     fn fractional_cursor_hotspot_and_placement_remain_logical() {
         let position = CursorPositionSnapshot {
             x: 1535.5,
@@ -4024,6 +4412,67 @@ mod tests {
             "detached child position {detached_position:?} differs from authoritative layout \
              position {detached_expected:?}"
         );
+    }
+
+    #[test]
+    fn production_surface_events_damage_only_intersecting_outputs() {
+        let (mut app, sender) = scene_app();
+        let journal = crate::capture::OutputDamageJournal::default();
+        let source = |connector_name: &str| crate::backend::CaptureSourceId::Kms {
+            key: crate::backend::kms::OutputKey {
+                device: 17,
+                connector_name: connector_name.into(),
+            },
+            generation: 1,
+        };
+        let a = source("A");
+        let b = source("B");
+        for (source, logical_rect) in [
+            (a.clone(), (0, 0, 480, 640)),
+            (b.clone(), (480, 0, 480, 640)),
+        ] {
+            journal.register(
+                source,
+                logical_rect,
+                (480, 640),
+                (480, 640),
+                120,
+                smithay::utils::Transform::Normal,
+            );
+        }
+        app.insert_resource(journal.clone());
+        let capture = crate::capture::CaptureRegion {
+            x: 0,
+            y: 0,
+            width: 480,
+            height: 640,
+        };
+        let id = SurfaceId(1);
+        let mut current = layout(1);
+        let events = [
+            ProtocolEvent::SurfaceUpserted {
+                id,
+                scene: scene(current),
+                frame: frame(3),
+            },
+            {
+                current.x = 40.0;
+                ProtocolEvent::SurfaceRelayout {
+                    id,
+                    scene: scene(current),
+                }
+            },
+            ProtocolEvent::SurfaceUnmapped { id },
+        ];
+        let mut baseline = 0;
+        for event in events {
+            publish(&mut app, &sender, vec![event]);
+            let (revision, damage) = journal.snapshot(&a, Some(baseline), false, capture);
+            assert!(!damage.is_empty(), "upsert, relayout and unmap each wake A");
+            assert!(revision > baseline);
+            baseline = revision;
+            assert!(journal.snapshot(&b, Some(0), false, capture).1.is_empty());
+        }
     }
 
     #[test]

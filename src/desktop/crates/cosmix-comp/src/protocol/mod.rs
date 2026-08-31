@@ -52,7 +52,7 @@ use self::{
 };
 use crate::{
     backend::{
-        BackendData, BackendKind, KmsBackendData, SeatRegion, WinitBackendData,
+        BackendData, BackendKind, CaptureSourceId, KmsBackendData, SeatRegion, WinitBackendData,
         kms::{KmsRenderCommand, KmsRenderReply},
     },
     bindings::{BindingAction, BindingProfile, BindingState, KeyDisposition},
@@ -618,6 +618,11 @@ pub(crate) enum ProtocolEvent {
     /// Ordered, lossless capture work. `PendingProtocolEvents::take` emits
     /// these after every scene/topology mutation retained in the same batch.
     CaptureRequested(CaptureRequest),
+    CaptureDamageWatch(crate::capture::CaptureDamageWatch),
+    /// Every KMS source generation known to the main-world damage journal is
+    /// obsolete after a topology lifecycle transition. A later request
+    /// registers the exact live generation again.
+    CaptureKmsSourcesRetired,
     RuntimeFailed(String),
 }
 
@@ -824,6 +829,13 @@ enum ProtocolCommand {
     },
     CapturePixels(CapturePixels),
     CapturePresented(CapturePresented),
+    CaptureDamageEligible {
+        id: CaptureId,
+        generation: u64,
+        security_epoch: u64,
+        revision: u64,
+        damage: Vec<CaptureRegion>,
+    },
     CaptureFailed {
         id: CaptureId,
         generation: u64,
@@ -1296,6 +1308,29 @@ pub(crate) struct CaptureCompletionReporter {
 }
 
 impl CaptureCompletionReporter {
+    pub(crate) fn damage_eligible(
+        &self,
+        id: CaptureId,
+        generation: u64,
+        security_epoch: u64,
+        revision: u64,
+        damage: Vec<CaptureRegion>,
+    ) {
+        if self
+            .commands
+            .send(ProtocolCommand::CaptureDamageEligible {
+                id,
+                generation,
+                security_epoch,
+                revision,
+                damage,
+            })
+            .is_err()
+        {
+            tracing::debug!("protocol thread gone before capture damage eligibility");
+        }
+    }
+
     pub(crate) fn pixels(&self, pixels: CapturePixels) {
         if self
             .commands
@@ -2905,6 +2940,23 @@ impl ProtocolServer {
                 ChannelEvent::Msg(ProtocolCommand::CapturePresented(presented)) => {
                     state.capture_presented(presented);
                 }
+                ChannelEvent::Msg(ProtocolCommand::CaptureDamageEligible {
+                    id,
+                    generation,
+                    security_epoch,
+                    revision,
+                    damage,
+                }) => {
+                    if state.capture_frames.get(&id).is_some_and(|frame| {
+                        frame.generation == generation
+                            && frame.security_epoch == security_epoch
+                            && frame.submitted
+                            && !frame.terminal
+                            && !frame.job_pending
+                    }) {
+                        state.admit_capture(id, revision, damage);
+                    }
+                }
                 ChannelEvent::Msg(ProtocolCommand::CaptureFailed {
                     id,
                     generation,
@@ -2921,9 +2973,20 @@ impl ProtocolServer {
                     event,
                     acknowledgement,
                 }) => {
+                    state.events.push(ProtocolEvent::CaptureKmsSourcesRetired);
                     let pause = matches!(&event, KmsTopologyLifecycleEvent::Pause);
                     let resumed = matches!(&event, KmsTopologyLifecycleEvent::Resume(_));
                     let previous_kms_outputs = state.backend.kms_registered_outputs();
+                    let kms_captures = state
+                        .capture_frames
+                        .iter()
+                        .filter_map(|(id, frame)| {
+                            matches!(frame.source_id, CaptureSourceId::Kms { .. }).then_some(*id)
+                        })
+                        .collect::<Vec<_>>();
+                    for id in kms_captures {
+                        state.fail_capture(id);
+                    }
                     if pause {
                         state.kms_authority_lost();
                     }
@@ -3519,6 +3582,7 @@ struct PendingProtocolEvents {
     surfaces: HashMap<SurfaceId, ProtocolEvent>,
     dmabuf_invalidations: HashSet<DmabufBufferId>,
     invalidate_all_dmabufs: bool,
+    retire_kms_capture_sources: bool,
     captures: Vec<ProtocolEvent>,
     runtime_failures: Vec<ProtocolEvent>,
     bytes: usize,
@@ -3561,6 +3625,7 @@ impl PendingProtocolEvents {
             && self.surfaces.is_empty()
             && self.dmabuf_invalidations.is_empty()
             && !self.invalidate_all_dmabufs
+            && !self.retire_kms_capture_sources
             && self.captures.is_empty()
             && self.runtime_failures.is_empty()
     }
@@ -3697,11 +3762,19 @@ impl PendingProtocolEvents {
                 self.dmabuf_invalidations.clear();
                 return Ok(PendingPush::default());
             }
-            ProtocolEvent::CaptureRequested(_) if self.captures.len() < MAX_CAPTURE_FRAMES => {
+            ProtocolEvent::CaptureKmsSourcesRetired => {
+                self.retire_kms_capture_sources = true;
+                return Ok(PendingPush::default());
+            }
+            ProtocolEvent::CaptureRequested(_) | ProtocolEvent::CaptureDamageWatch(_)
+                if self.captures.len() < MAX_CAPTURE_FRAMES =>
+            {
                 self.captures.push(event);
                 return Ok(PendingPush::default());
             }
-            ProtocolEvent::CaptureRequested(_) => return Err(Box::new(event)),
+            ProtocolEvent::CaptureRequested(_) | ProtocolEvent::CaptureDamageWatch(_) => {
+                return Err(Box::new(event));
+            }
             _ => {}
         }
         let old_bytes = match &event {
@@ -3727,7 +3800,9 @@ impl PendingProtocolEvents {
             ProtocolEvent::SurfaceRoster { .. }
             | ProtocolEvent::DmabufBufferDestroyed { .. }
             | ProtocolEvent::DmabufCacheInvalidated
+            | ProtocolEvent::CaptureKmsSourcesRetired
             | ProtocolEvent::CaptureRequested(_)
+            | ProtocolEvent::CaptureDamageWatch(_)
             | ProtocolEvent::RuntimeFailed(_) => 0,
         };
         let new_bytes = match &event {
@@ -3735,7 +3810,9 @@ impl PendingProtocolEvents {
             | ProtocolEvent::SurfaceRoster { .. }
             | ProtocolEvent::DmabufBufferDestroyed { .. }
             | ProtocolEvent::DmabufCacheInvalidated
-            | ProtocolEvent::CaptureRequested(_) => 0,
+            | ProtocolEvent::CaptureKmsSourcesRetired
+            | ProtocolEvent::CaptureRequested(_)
+            | ProtocolEvent::CaptureDamageWatch(_) => 0,
             ProtocolEvent::SurfaceRelayout { id, scene }
                 if matches!(
                     self.surfaces.get(id),
@@ -3892,7 +3969,10 @@ impl PendingProtocolEvents {
                 self.invalidate_all_dmabufs = true;
                 self.dmabuf_invalidations.clear();
             }
-            ProtocolEvent::CaptureRequested(_) => {
+            ProtocolEvent::CaptureKmsSourcesRetired => {
+                self.retire_kms_capture_sources = true;
+            }
+            ProtocolEvent::CaptureRequested(_) | ProtocolEvent::CaptureDamageWatch(_) => {
                 self.captures.push(event);
             }
             ProtocolEvent::RuntimeFailed(_) => {
@@ -3916,6 +3996,7 @@ impl PendingProtocolEvents {
                 + self.surfaces.len()
                 + self.dmabuf_invalidations.len()
                 + usize::from(self.invalidate_all_dmabufs)
+                + usize::from(self.retire_kms_capture_sources)
                 + self.captures.len()
                 + self.runtime_failures.len(),
         );
@@ -3945,6 +4026,9 @@ impl PendingProtocolEvents {
         );
         if mem::take(&mut self.invalidate_all_dmabufs) {
             events.push(ProtocolEvent::DmabufCacheInvalidated);
+        }
+        if mem::take(&mut self.retire_kms_capture_sources) {
+            events.push(ProtocolEvent::CaptureKmsSourcesRetired);
         }
         events.append(&mut self.captures);
         events.append(&mut self.runtime_failures);
@@ -3984,7 +4068,9 @@ fn protocol_event_surface_id(event: &ProtocolEvent) -> Option<SurfaceId> {
         | ProtocolEvent::CursorUpdated { .. }
         | ProtocolEvent::DmabufBufferDestroyed { .. }
         | ProtocolEvent::DmabufCacheInvalidated
+        | ProtocolEvent::CaptureKmsSourcesRetired
         | ProtocolEvent::CaptureRequested(_)
+        | ProtocolEvent::CaptureDamageWatch(_)
         | ProtocolEvent::SurfaceRoster { .. }
         | ProtocolEvent::RuntimeFailed(_) => None,
     }
@@ -4044,7 +4130,9 @@ fn protocol_event_retained_bytes(event: &ProtocolEvent) -> usize {
         | ProtocolEvent::SurfaceDestroyed { .. }
         | ProtocolEvent::DmabufBufferDestroyed { .. }
         | ProtocolEvent::DmabufCacheInvalidated
-        | ProtocolEvent::CaptureRequested(_) => mem::size_of::<ProtocolEvent>(),
+        | ProtocolEvent::CaptureKmsSourcesRetired
+        | ProtocolEvent::CaptureRequested(_)
+        | ProtocolEvent::CaptureDamageWatch(_) => mem::size_of::<ProtocolEvent>(),
         // Reported honestly for the record, but never charged: the roster's
         // worst case is reserved out of the budget once, and it is admitted
         // ahead of the accounting entirely.
@@ -4914,21 +5002,26 @@ struct CaptureManagerRecord {
     client_id: ClientId,
     live_frames: usize,
     resource_alive: bool,
+    damage_baselines: HashMap<CaptureSourceId, u64>,
 }
 
 struct CaptureFrameRecord {
     resource: ZwlrScreencopyFrameV1,
     client_id: ClientId,
     manager_id: u64,
+    source_id: CaptureSourceId,
     output_name: String,
     generation: u64,
     security_epoch: u64,
     region: CaptureRegion,
-    output_size: (u32, u32),
+    logical_rect: (i32, i32, u32, u32),
+    source_storage_extent: (u32, u32),
+    displayed_physical_extent: (u32, u32),
+    scale120: u32,
+    transform: smithay::utils::Transform,
     format: CaptureFormat,
     stride: u32,
     overlay_cursor: bool,
-    readback_supported: bool,
     submitted: bool,
     with_damage: bool,
     terminal: bool,
@@ -4942,6 +5035,9 @@ struct CaptureFrameRecord {
     reserved_bytes: usize,
     deadline: Option<Instant>,
     cancellation: Option<CaptureCancellation>,
+    damage_baseline: Option<u64>,
+    damage_revision: u64,
+    damage: Vec<CaptureRegion>,
 }
 
 impl CaptureFrameRecord {
@@ -5158,11 +5254,9 @@ fn capture_physical_region(
         return None;
     }
     let project = |edge: i64| -> Option<u32> {
-        let projected = edge as f64 * source.scale;
-        if !projected.is_finite() || projected < 0.0 || projected > f64::from(u32::MAX) {
-            return None;
-        }
-        u32::try_from((projected + 0.5).floor() as u64).ok()
+        let numerator = i128::from(edge).checked_mul(i128::from(source.scale120))?;
+        let rounded = numerator.checked_add(60)?.checked_div(120)?;
+        u32::try_from(rounded).ok()
     };
     let physical_left = project(left)?;
     let physical_top = project(top)?;
@@ -5177,10 +5271,12 @@ fn capture_physical_region(
     if width == 0 || height == 0 {
         return None;
     }
-    // Nested is Normal. KMS frames are advertised but fail before GPU work in
-    // S-1a, so S-1b owns transformed pixel projection without weakening the
-    // current never-hang contract.
-    let _ = source.transform;
+    let (displayed_width, displayed_height) = source.displayed_physical_extent;
+    let right = x.checked_add(width)?;
+    let bottom = y.checked_add(height)?;
+    if right > displayed_width || bottom > displayed_height {
+        return None;
+    }
     Some(CaptureRegion {
         x,
         y,
@@ -5900,6 +5996,7 @@ impl WaylandState {
                 client_id,
                 live_frames: 0,
                 resource_alive: true,
+                damage_baselines: HashMap::new(),
             },
         );
         Some(id)
@@ -5967,15 +6064,19 @@ impl WaylandState {
             resource: resource.clone(),
             client_id: client.id(),
             manager_id,
+            source_id: source.source_id,
             output_name: source.output_name,
             generation: source.generation,
             security_epoch: self.next_security_presentation_epoch,
             region,
-            output_size: source.physical_size,
+            logical_rect: source.logical_rect,
+            source_storage_extent: source.source_storage_extent,
+            displayed_physical_extent: source.displayed_physical_extent,
+            scale120: source.scale120,
+            transform: source.transform,
             format: CaptureFormat::Xrgb8888,
             stride,
             overlay_cursor: overlay_cursor != 0,
-            readback_supported: source.readback_supported,
             submitted: false,
             with_damage: false,
             terminal: false,
@@ -5989,6 +6090,9 @@ impl WaylandState {
             reserved_bytes: 0,
             deadline: None,
             cancellation: None,
+            damage_baseline: None,
+            damage_revision: 0,
+            damage: Vec::new(),
         };
         self.capture_frames_by_resource.insert(resource.id(), id);
         self.capture_frames.insert(id, record);
@@ -6021,7 +6125,12 @@ impl WaylandState {
         // One-shot before validation: an invalid first buffer cannot be
         // followed by a valid second request on the same frame object.
         let current_epoch = self.next_security_presentation_epoch;
-        let (client_id, format, region, stride, output_size, overlay_cursor) = {
+        let damage_baseline = self.capture_frames.get(&id).and_then(|record| {
+            self.capture_managers
+                .get(&record.manager_id)
+                .and_then(|manager| manager.damage_baselines.get(&record.source_id).copied())
+        });
+        let (format, region, stride) = {
             let record = self
                 .capture_frames
                 .get_mut(&id)
@@ -6030,14 +6139,8 @@ impl WaylandState {
             // Creation advertises immutable geometry; submission selects the
             // security epoch whose displayed scene this request may observe.
             record.security_epoch = current_epoch;
-            (
-                record.client_id.clone(),
-                record.format,
-                record.region,
-                record.stride,
-                record.output_size,
-                record.overlay_cursor,
-            )
+            record.damage_baseline = damage_baseline;
+            (record.format, record.region, record.stride)
         };
         if validate_screencopy_shm_buffer(&buffer, format, region.width, region.height, stride)
             .is_err()
@@ -6051,16 +6154,65 @@ impl WaylandState {
             );
             return;
         }
-        if overlay_cursor {
-            // S-1a cannot reproduce the retained client/chrome cursor asset,
-            // hotspot and visibility state exactly. Fail rather than fabricate.
+        let cancellation = CaptureCancellation::default();
+        let deadline = Instant::now()
+            .checked_add(CAPTURE_REQUEST_TIMEOUT)
+            .unwrap_or_else(Instant::now);
+        let wait = {
+            let record = self
+                .capture_frames
+                .get_mut(&id)
+                .expect("validated capture remains live");
+            record.buffer = Some(buffer);
+            record.with_damage = with_damage;
+            record.cancellation = Some(cancellation.clone());
+            record.deadline = Some(deadline);
+            (with_damage && record.damage_baseline.is_some()).then(|| {
+                crate::capture::CaptureDamageWatch {
+                    id,
+                    source_id: record.source_id.clone(),
+                    generation: record.generation,
+                    security_epoch: record.security_epoch,
+                    region: record.region,
+                    logical_rect: record.logical_rect,
+                    source_storage_extent: record.source_storage_extent,
+                    displayed_physical_extent: record.displayed_physical_extent,
+                    scale120: record.scale120,
+                    transform: record.transform,
+                    overlay_cursor: record.overlay_cursor,
+                    baseline: record
+                        .damage_baseline
+                        .expect("damage waiter has a baseline"),
+                    cancellation: cancellation.clone(),
+                    deadline,
+                }
+            })
+        };
+        schedule_capture_deadline(self.capture_loop_handle.clone(), id, deadline);
+        if let Some(wait) = wait {
+            self.events.push(ProtocolEvent::CaptureDamageWatch(wait));
+        } else {
+            self.admit_capture(id, 0, Vec::new());
+        }
+    }
+
+    fn admit_capture(&mut self, id: CaptureId, damage_revision: u64, damage: Vec<CaptureRegion>) {
+        let Some(record) = self.capture_frames.get(&id) else {
+            return;
+        };
+        if record.terminal
+            || record.job_pending
+            || record.deadline.is_none_or(|at| at <= Instant::now())
+        {
             self.fail_capture(id);
             return;
         }
-        // Account for the capture-owned render target, padded GPU staging and
-        // packed conversion result before any of them can be allocated. The
-        // job-count limits alone are not a memory bound for very large outputs.
-        let Some(reserved_bytes) = capture_reservation_bytes(output_size, region) else {
+        let client_id = record.client_id.clone();
+        let source_storage_extent = record.source_storage_extent;
+        let region = record.region;
+        // Account for the capture-owned staging and packed conversion result
+        // only after a damage waiter becomes eligible.
+        let Some(reserved_bytes) = capture_reservation_bytes(source_storage_extent, region) else {
             self.fail_capture(id);
             return;
         };
@@ -6091,39 +6243,40 @@ impl WaylandState {
             self.fail_capture(id);
             return;
         }
-        let readback_supported = self
-            .capture_frames
-            .get(&id)
-            .is_some_and(|record| record.readback_supported);
-        if !readback_supported {
-            self.fail_capture(id);
-            return;
-        }
-        let cancellation = CaptureCancellation::default();
+        let cancellation = record
+            .cancellation
+            .clone()
+            .expect("submitted capture owns cancellation state");
         let reservation = CaptureReservationLease::new(id, self.capture_release_sender.clone());
         let request = {
             let record = self
                 .capture_frames
                 .get_mut(&id)
                 .expect("admitted capture remains live");
-            record.buffer = Some(buffer);
-            record.with_damage = with_damage;
+            record.damage_revision = damage_revision;
+            record.damage = damage;
             record.reserved_bytes = reserved_bytes;
             record.job_pending = true;
-            record.cancellation = Some(cancellation.clone());
-            let deadline = Instant::now()
-                .checked_add(CAPTURE_REQUEST_TIMEOUT)
-                .unwrap_or_else(Instant::now);
-            record.deadline = Some(deadline);
+            let deadline = record.deadline.expect("submitted capture owns a deadline");
             CaptureRequest {
                 id,
+                source_id: record.source_id.clone(),
                 output_name: record.output_name.clone(),
                 generation: record.generation,
                 security_epoch: record.security_epoch,
                 region: record.region,
-                output_size: record.output_size,
+                logical_rect: record.logical_rect,
+                source_storage_extent: record.source_storage_extent,
+                displayed_physical_extent: record.displayed_physical_extent,
+                scale120: record.scale120,
+                transform: record.transform,
                 format: record.format,
-                with_damage,
+                overlay_cursor: record.overlay_cursor,
+                cursor: None,
+                with_damage: record.with_damage,
+                damage_baseline: record.damage_baseline,
+                damage_revision: record.damage_revision,
+                damage: record.damage.clone(),
                 cancellation,
                 reservation,
                 deadline,
@@ -6136,7 +6289,6 @@ impl WaylandState {
                 bytes: reserved_bytes,
             },
         );
-        schedule_capture_deadline(self.capture_loop_handle.clone(), id, request.deadline);
         self.events.push(ProtocolEvent::CaptureRequested(request));
     }
 
@@ -6202,6 +6354,7 @@ impl WaylandState {
         };
         record.job_pending = false;
         if record.terminal
+            || record.source_id != pixels.source_id
             || record.generation != pixels.generation
             || record.security_epoch != pixels.security_epoch
             || record.region.width != pixels.width
@@ -6220,6 +6373,7 @@ impl WaylandState {
             return;
         };
         if record.terminal
+            || record.source_id != presented.source_id
             || record.generation != presented.generation
             || record.security_epoch != presented.security_epoch
             || presented.nanoseconds > 999_999_999
@@ -6332,9 +6486,17 @@ impl WaylandState {
             return true;
         }
         if record.with_damage {
-            record
-                .resource
-                .damage(0, 0, record.region.width, record.region.height);
+            for damage in &pixels.damage {
+                if damage.width != 0
+                    && damage.height != 0
+                    && damage.x.saturating_add(damage.width) <= record.region.width
+                    && damage.y.saturating_add(damage.height) <= record.region.height
+                {
+                    record
+                        .resource
+                        .damage(damage.x, damage.y, damage.width, damage.height);
+                }
+            }
         }
         let flags = if pixels.y_invert {
             zwlr_screencopy_frame_v1::Flags::YInvert
@@ -6347,6 +6509,13 @@ impl WaylandState {
             presentation.seconds as u32,
             presentation.nanoseconds,
         );
+        if let Some(manager) = self.capture_managers.get_mut(&record.manager_id) {
+            manager
+                .damage_baselines
+                .entry(record.source_id.clone())
+                .and_modify(|revision| *revision = (*revision).max(pixels.damage_revision))
+                .or_insert(pixels.damage_revision);
+        }
         record.terminal = true;
         record.job_pending = false;
         record.buffer = None;

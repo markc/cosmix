@@ -32708,9 +32708,10 @@ fn inject_capture_halves(
     seconds: u64,
     nanoseconds: u32,
 ) {
-    let (generation, security_epoch, region, format) = {
+    let (source_id, generation, security_epoch, region, format) = {
         let record = &state.capture_frames[&id];
         (
+            record.source_id.clone(),
             record.generation,
             record.security_epoch,
             record.region,
@@ -32719,6 +32720,7 @@ fn inject_capture_halves(
     };
     state.capture_pixels_ready(CapturePixels {
         id,
+        source_id: source_id.clone(),
         frame_token,
         generation,
         security_epoch,
@@ -32726,6 +32728,8 @@ fn inject_capture_halves(
         height: region.height,
         format,
         y_invert: false,
+        damage_revision: 1,
+        damage: vec![region],
         packed_bgra: Arc::new(vec![
             0x55;
             region.width as usize * region.height as usize * 4
@@ -32734,6 +32738,7 @@ fn inject_capture_halves(
     });
     state.capture_presented(CapturePresented {
         id,
+        source_id,
         frame_token,
         generation,
         security_epoch,
@@ -32829,7 +32834,19 @@ impl ScreencopyWireHarness {
         stride: i32,
         format: wl_shm::Format,
     ) -> (File, u32) {
-        let length = usize::try_from(height).unwrap() * usize::try_from(stride).unwrap();
+        self.shm_buffer_with_offset_and_format(width, height, stride, 0, format)
+    }
+
+    fn shm_buffer_with_offset_and_format(
+        &mut self,
+        width: i32,
+        height: i32,
+        stride: i32,
+        offset: u32,
+        format: wl_shm::Format,
+    ) -> (File, u32) {
+        let length = usize::try_from(offset).unwrap()
+            + usize::try_from(height).unwrap() * usize::try_from(stride).unwrap();
         let name = CString::new("cosmix-screencopy-wire").unwrap();
         // SAFETY: name is a valid C string and success returns a new owned fd.
         let raw = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
@@ -32856,7 +32873,7 @@ impl ScreencopyWireHarness {
             0,
             &words(&[
                 buffer,
-                0,
+                offset,
                 width as u32,
                 height as u32,
                 stride as u32,
@@ -33069,6 +33086,51 @@ fn screencopy_s1a_03_logical_region_clipping_and_invalid_regions() {
 }
 
 #[test]
+fn transformed_kms_capture_regions_are_projected_in_displayed_space_once() {
+    for (transform, displayed) in [
+        (smithay::utils::Transform::_90, (1080, 1920)),
+        (smithay::utils::Transform::_180, (1920, 1080)),
+        (smithay::utils::Transform::_270, (1080, 1920)),
+    ] {
+        let source = crate::backend::CaptureSourceSnapshot {
+            source_id: crate::backend::CaptureSourceId::Kms {
+                key: OutputKey {
+                    device: 17,
+                    connector_name: "DP-1".into(),
+                },
+                generation: 3,
+            },
+            output_name: "DP-1".into(),
+            logical_rect: (0, 0, displayed.0, displayed.1),
+            source_storage_extent: (1920, 1080),
+            displayed_physical_extent: displayed,
+            scale120: 120,
+            transform,
+            generation: 3,
+        };
+        assert_eq!(
+            capture_physical_region(&source, Some((10, 20, 30, 40))),
+            Some(CaptureRegion {
+                x: 10,
+                y: 20,
+                width: 30,
+                height: 40
+            }),
+            "{transform:?} must not rotate a displayed-space request twice"
+        );
+        assert_eq!(
+            capture_physical_region(&source, None),
+            Some(CaptureRegion {
+                x: 0,
+                y: 0,
+                width: displayed.0,
+                height: displayed.1,
+            })
+        );
+    }
+}
+
+#[test]
 fn screencopy_s1a_04_foreign_output_fails_without_default_fallback() {
     let mut wire = ScreencopyWireHarness::new(3);
     let _probe = wire.harness.arm_explicit_sync_withdrawal_probe();
@@ -33094,6 +33156,28 @@ fn screencopy_s1a_04_foreign_output_fails_without_default_fallback() {
     let events = wire.harness.sync();
     assert!(events.iter().any(|event| event.0 == frame && event.1 == 3));
     assert!(!events.iter().any(|event| event.0 == frame && event.1 == 0));
+}
+
+#[test]
+fn screencopy_s1a_06_non_zero_shm_offset_preserves_prefix_guard() {
+    let mut wire = ScreencopyWireHarness::new(3);
+    let (frame, _) = wire.capture_output(false);
+    let (file, buffer) =
+        wire.shm_buffer_with_offset_and_format(320, 240, 1280, 64, wl_shm::Format::Xrgb8888);
+    file.write_all_at(&[0xa5; 64], 0).unwrap();
+    let id = submit_primary_capture(&mut wire, frame, buffer);
+    inject_capture_halves(&mut wire.harness.server.state, id, 5, 7, 11);
+    finish_capture_publication(&mut wire.harness.server.state, id);
+
+    let mut prefix = [0_u8; 64];
+    file.read_exact_at(&mut prefix, 0).unwrap();
+    assert_eq!(
+        prefix, [0xa5; 64],
+        "the production shm walk honours wl_buffer.offset"
+    );
+    let mut first_pixel = [0_u8; 4];
+    file.read_exact_at(&mut first_pixel, 64).unwrap();
+    assert_eq!(first_pixel, [0x55; 4]);
 }
 
 #[test]
@@ -33174,6 +33258,39 @@ fn screencopy_s1a_10_ready_uses_the_injected_presentation_clock() {
 }
 
 #[test]
+fn screencopy_damage_rectangles_precede_flags_and_ready_on_the_wire() {
+    let mut wire = ScreencopyWireHarness::new(3);
+    let (frame, _) = wire.capture_output(false);
+    let (_file, buffer) = wire.shm_buffer(320, 240, 1280);
+    send_request(&mut wire.harness.client, frame, 2, &words(&[buffer]));
+    wire.harness.dispatch_client();
+    let id = capture_id_for_frame(&wire.harness.server.state, frame);
+    inject_capture_halves(&mut wire.harness.server.state, id, 41, 7, 9);
+    finish_capture_publication(&mut wire.harness.server.state, id);
+    let events = wire.harness.sync();
+    let opcodes = events
+        .iter()
+        .filter_map(|(object, opcode, _)| (*object == frame).then_some(*opcode))
+        .collect::<Vec<_>>();
+    let damage = opcodes
+        .iter()
+        .position(|opcode| *opcode == 4)
+        .expect("damage event");
+    let flags = opcodes
+        .iter()
+        .position(|opcode| *opcode == 1)
+        .expect("flags event");
+    let ready = opcodes
+        .iter()
+        .position(|opcode| *opcode == 2)
+        .expect("ready event");
+    assert!(
+        damage < flags && flags < ready,
+        "wire order was {opcodes:?}"
+    );
+}
+
+#[test]
 fn screencopy_s1a_12_manager_destroy_leaves_derived_frame_usable() {
     let mut wire = ScreencopyWireHarness::new(3);
     let (frame, _) = wire.capture_output(false);
@@ -33237,6 +33354,16 @@ fn screencopy_s1a_13_client_death_mid_capture_tombstones_and_releases() {
         .state
         .capture_pixels_ready(CapturePixels {
             id,
+            source_id: wire
+                .harness
+                .server
+                .state
+                .capture_frames
+                .get(&id)
+                .map(|record| record.source_id.clone())
+                .unwrap_or_else(|| crate::backend::CaptureSourceId::Nested {
+                    output_name: "cosmix-nested-0".into(),
+                }),
             frame_token: 1,
             generation,
             security_epoch,
@@ -33244,6 +33371,8 @@ fn screencopy_s1a_13_client_death_mid_capture_tombstones_and_releases() {
             height: 240,
             format: CaptureFormat::Xrgb8888,
             y_invert: false,
+            damage_revision: 1,
+            damage: Vec::new(),
             packed_bgra: Arc::new(vec![0; 320 * 240 * 4]),
             _reservation: CaptureReservationLease::detached(id),
         });
@@ -33290,17 +33419,118 @@ fn screencopy_cancel_before_renderer_keeps_budget_until_queued_work_drops() {
 }
 
 #[test]
-fn screencopy_overlay_cursor_submission_fails_without_renderer_pixels() {
+fn screencopy_overlay_cursor_submission_reaches_the_renderer_and_readies() {
     let mut wire = ScreencopyWireHarness::new(3);
     let (frame, _) = wire.capture_output(true);
     let (_file, buffer) = wire.shm_buffer(320, 240, 1280);
     let id = submit_primary_capture(&mut wire, frame, buffer);
-    let events = wire.harness.sync();
-    assert!(events.iter().any(|event| event.0 == frame && event.1 == 3));
-    assert!(wire.harness.server.state.capture_frames[&id].terminal);
-    assert!(!wire.harness.server.state.events.iter().any(
-        |event| matches!(event, ProtocolEvent::CaptureRequested(request) if request.id == id)
+    assert!(wire.harness.server.state.events.iter().any(
+        |event| matches!(event, ProtocolEvent::CaptureRequested(request)
+            if request.id == id && request.overlay_cursor)
     ));
+    inject_capture_halves(&mut wire.harness.server.state, id, 7, 9, 11);
+    finish_capture_publication(&mut wire.harness.server.state, id);
+    let events = wire.harness.sync();
+    assert!(events.iter().any(|event| event.0 == frame && event.1 == 2));
+    assert!(!events.iter().any(|event| event.0 == frame && event.1 == 3));
+}
+
+#[test]
+fn screencopy_damage_waiter_holds_no_job_or_byte_reservation_until_eligible() {
+    let mut wire = ScreencopyWireHarness::new(3);
+    let (first_frame, _) = wire.capture_output(false);
+    let (_first_file, first_buffer) = wire.shm_buffer(320, 240, 1280);
+    let first_id = submit_primary_capture(&mut wire, first_frame, first_buffer);
+    inject_capture_halves(&mut wire.harness.server.state, first_id, 1, 1, 0);
+    finish_capture_publication(&mut wire.harness.server.state, first_id);
+    drop_renderer_capture_requests(&mut wire.harness, &[first_id]);
+    let (_waiting_file, waiting_buffer) = wire.shm_buffer(320, 240, 1280);
+    let frame_resource = {
+        let record = wire
+            .harness
+            .server
+            .state
+            .capture_frames
+            .get_mut(&first_id)
+            .expect("first capture record remains for its frame resource");
+        record.submitted = false;
+        record.terminal = false;
+        record.job_pending = false;
+        record.next_write_row = 0;
+        record.resource.clone()
+    };
+    let waiting_buffer = frame_resource
+        .client()
+        .expect("capture client remains live")
+        .object_from_protocol_id::<wl_buffer::WlBuffer>(
+            &wire.harness.server.state.display_handle,
+            waiting_buffer,
+        )
+        .expect("waiting wl_buffer exists");
+    wire.harness
+        .server
+        .state
+        .submit_screencopy(first_id, &frame_resource, waiting_buffer, true);
+    let waiting_id = first_id;
+    assert!(
+        !wire
+            .harness
+            .server
+            .state
+            .capture_reservations
+            .contains_key(&waiting_id)
+    );
+    assert!(wire.harness.server.state.events.iter().any(|event| {
+        matches!(event, ProtocolEvent::CaptureDamageWatch(watch) if watch.id == waiting_id)
+    }));
+
+    wire.harness.server.state.admit_capture(
+        waiting_id,
+        2,
+        vec![CaptureRegion {
+            x: 4,
+            y: 5,
+            width: 6,
+            height: 7,
+        }],
+    );
+    assert!(
+        wire.harness
+            .server
+            .state
+            .capture_reservations
+            .contains_key(&waiting_id)
+    );
+    assert!(wire.harness.server.state.events.iter().any(|event| {
+        matches!(event, ProtocolEvent::CaptureRequested(request)
+            if request.id == waiting_id && request.damage_revision == 2)
+    }));
+}
+
+#[test]
+fn screencopy_waiting_damage_fails_cleanly_when_admission_saturates() {
+    let mut wire = ScreencopyWireHarness::new(3);
+    let (frame, _) = wire.capture_output(false);
+    let id = capture_id_for_frame(&wire.harness.server.state, frame);
+    let (manager_id, source_id, client_id) = {
+        let record = &wire.harness.server.state.capture_frames[&id];
+        (
+            record.manager_id,
+            record.source_id.clone(),
+            record.client_id.clone(),
+        )
+    };
+    wire.harness
+        .server
+        .state
+        .capture_managers
+        .get_mut(&manager_id)
+        .unwrap()
+        .damage_baselines
+        .insert(source_id, 1);
+    let (_file, buffer) = wire.shm_buffer(320, 240, 1280);
+    send_request(&mut wire.harness.client, frame, 2, &words(&[buffer]));
+    wire.harness.dispatch_client();
     assert!(
         !wire
             .harness
@@ -33309,6 +33539,37 @@ fn screencopy_overlay_cursor_submission_fails_without_renderer_pixels() {
             .capture_reservations
             .contains_key(&id)
     );
+    assert!(
+        wire.harness.server.state.events.iter().any(
+            |event| matches!(event, ProtocolEvent::CaptureDamageWatch(watch) if watch.id == id)
+        )
+    );
+
+    for raw in 10_000..10_000 + MAX_CLIENT_CAPTURE_REQUESTS as u64 {
+        wire.harness.server.state.capture_reservations.insert(
+            CaptureId(raw),
+            CaptureReservationRecord {
+                client_id: client_id.clone(),
+                bytes: 1,
+            },
+        );
+    }
+    wire.harness.server.state.admit_capture(
+        id,
+        2,
+        vec![CaptureRegion {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        }],
+    );
+    assert!(wire.harness.server.state.capture_frames[&id].terminal);
+    assert!(!wire.harness.server.state.events.iter().any(
+        |event| matches!(event, ProtocolEvent::CaptureRequested(request) if request.id == id)
+    ));
+    let events = wire.harness.sync();
+    assert!(events.iter().any(|event| event.0 == frame && event.1 == 3));
 }
 
 #[test]

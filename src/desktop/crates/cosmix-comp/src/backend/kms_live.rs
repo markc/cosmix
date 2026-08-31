@@ -5475,6 +5475,7 @@ where
                     generation,
                     key,
                     security_epochs,
+                    ..
                 } => {
                     policy.observe_submitted(observed_at);
                     telemetry.observe(observed_at, generation, &key);
@@ -5600,6 +5601,7 @@ where
                     generation,
                     key,
                     security_epochs,
+                    ..
                 } => {
                     require_resumed_frame_generation(resumed.generation, generation)?;
                     policy.observe_submitted(observed_at);
@@ -9183,6 +9185,11 @@ mod tests {
         KmsRenderFrameEvent::FrameSubmitted {
             generation: 1,
             key: pump_key(),
+            frame_token: 1,
+            timestamp: super::super::render::KmsPresentationTimestamp {
+                seconds: 1,
+                nanoseconds: 2,
+            },
             security_epochs: Vec::new(),
         }
     }
@@ -10406,6 +10413,11 @@ mod tests {
                 updated_reply(vec![KmsRenderFrameEvent::FrameSubmitted {
                     generation: 1,
                     key: pump_key(),
+                    frame_token: 1,
+                    timestamp: super::super::render::KmsPresentationTimestamp {
+                        seconds: 1,
+                        nanoseconds: 2,
+                    },
                     security_epochs: vec![51],
                 }]),
                 updated_reply(vec![
@@ -11232,6 +11244,11 @@ mod tests {
         let events = [KmsRenderFrameEvent::FrameSubmitted {
             generation: 7,
             key: selected_output_for_test(41).key,
+            frame_token: 1,
+            timestamp: super::super::render::KmsPresentationTimestamp {
+                seconds: 1,
+                nanoseconds: 2,
+            },
             security_epochs: Vec::new(),
         }];
         observe_update_watchdog_evidence(&mut policy, &events, completed_at)

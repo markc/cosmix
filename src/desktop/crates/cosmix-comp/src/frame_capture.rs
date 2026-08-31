@@ -15,9 +15,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bevy::{camera::RenderTarget, prelude::*, tasks::AsyncComputeTaskPool, window::PrimaryWindow};
+use bevy::{prelude::*, tasks::AsyncComputeTaskPool, window::PrimaryWindow};
 
-use crate::capture::{PngCaptureRequest, PngCaptureService, PngCaptureTarget};
+use crate::capture::{
+    CaptureOutputSource, PngCaptureRequest, PngCaptureService, PngCaptureTarget,
+    RetainedCaptureCursor,
+};
 
 const CAPTURE_DIR_ENV: &str = "COSMIX_CAPTURE_DIR";
 const CAPTURE_EVERY_ENV: &str = "COSMIX_CAPTURE_EVERY";
@@ -270,12 +273,11 @@ pub(crate) fn install_from_environment(app: &mut App) -> Result<(), FrameCapture
 fn request_frame_capture(
     mut runtime: ResMut<FrameCaptureRuntime>,
     service: Res<PngCaptureService>,
+    cursor: Res<RetainedCaptureCursor>,
     primary_window: Query<(), With<PrimaryWindow>>,
-    kms_targets: Query<(&RenderTarget, &FrameCaptureTarget)>,
+    kms_targets: Query<(&FrameCaptureTarget, &CaptureOutputSource)>,
 ) {
-    let kms_target_available = kms_targets
-        .iter()
-        .any(|(target, _)| matches!(target, RenderTarget::TextureView(_)));
+    let kms_target_available = !kms_targets.is_empty();
     let target_available = !primary_window.is_empty() || kms_target_available;
     let signal_requested = runtime
         .signal
@@ -295,20 +297,22 @@ fn request_frame_capture(
         let (final_path, temporary_path) = runtime.allocate_paths("nested");
         requests.push(PngCaptureRequest {
             target: PngCaptureTarget::Nested,
+            cursor: None,
             final_path,
             temporary_path,
         });
         let _ = service.submit_batch(requests);
         return;
     }
-    for (target, capture_target) in &kms_targets {
-        let RenderTarget::TextureView(handle) = target else {
-            continue;
-        };
+    for (capture_target, source) in &kms_targets {
         let name = capture_target.name().to_owned();
         let (final_path, temporary_path) = runtime.allocate_paths(&name);
         requests.push(PngCaptureRequest {
-            target: PngCaptureTarget::TextureView(*handle),
+            target: PngCaptureTarget::Kms {
+                source_id: source.source_id.clone(),
+                output_name: source.output_name.clone(),
+            },
+            cursor: cursor.0.clone(),
             final_path,
             temporary_path,
         });

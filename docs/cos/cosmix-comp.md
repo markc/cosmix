@@ -126,53 +126,57 @@ clients.
 | `ext_idle_notifier_v1` | 2 | Per-seat notifications use Smithay's calloop timers; real pointer, keyboard, touch, pointer-gesture and tablet-tool activity resets the timeout and resumes an idle notification. Device-removal reconciliation does not count as activity. |
 | `ext_foreign_toplevel_list_v1` | 1 | Mapped XDG toplevels expose stable mapping identifiers, title and app ID updates; unmap or destruction closes the handle, and late clients receive the current mapped set. |
 | `ext_session_lock_v1` | 1 | Nested and live KMS modes support immediate output-sized lock-surface configures, secure blank-first presentation acknowledgement, lock-only input, VT pause/resume preservation and the locked/orphaned lifecycle. |
-| `zwlr_screencopy_manager_v1` | 3 | Compatibility output capture into exact-layout `wl_shm` buffers, including clipped regions, damage requests and presentation-timestamped completion; S-1a fails cursor-inclusive requests. |
+| `zwlr_screencopy_manager_v1` | 3 | Compatibility output capture into exact-layout `wl_shm` buffers, including clipped regions, real damage waiting, exact cursor inclusion and presentation-timestamped nested or KMS completion. |
 
 ## Screen capture
 
-Arc 4 S-1a provides `wlr-screencopy-unstable-v1` output capture for existing
+Arc 4 provides `wlr-screencopy-unstable-v1` output capture for existing
 clients such as `grim`. A frame advertises one opaque `XRGB8888` shared-memory
 layout with an exact `width * 4` stride. Whole-output and logically clipped
 region requests are converted into displayed physical pixels; invalid or stale
 outputs fail rather than falling back to another output. Plain copies are
-force-presented, including on an otherwise idle output. Damage copies complete
-on the next composited frame and report a full capture rectangle in S-1a.
+force-presented, including on an otherwise idle output. Damage copies wait for
+relevant base-scene damage, or cursor-only damage for a cursor-inclusive copy,
+without forcing a frame. The bounded journal is manager-scoped; its baseline
+advances only after `ready`, and history overflow conservatively reports the
+full captured region.
 
 Pixel readback and the matching output presentation form a two-part completion
-latch: `ready` is sent only after both arrive and carries the real nested
-presentation timestamp. The compositor bounds live and in-flight jobs, reserves
+latch: `ready` is sent only after both arrive. Nested mode uses the completed
+host presentation time; KMS retains the exact `tv_sec`/`tv_usec` from the
+matching kernel page-flip event. The compositor bounds live and in-flight jobs, reserves
 a byte budget before allocation, performs conversion away from the render and
 protocol threads, then copies shared memory in bounded chunks across protocol
 loop iterations. Each client may bind at most eight live screencopy managers,
 with 64 live managers globally; exceeding either implementation limit is a fatal
 protocol error on the new manager object. Cancellation is checked at the
-protocol outbox, ECS queue, Screenshot observer and conversion worker. The byte
+protocol outbox, ECS queue, renderer-owned map and conversion worker. GPU map
+errors become the frame's `failed` event. The byte
 reservation remains charged until the last renderer-side request or
-packed-result holder drops. Once Bevy has extracted a Screenshot, its lease is
-held separately from the deadline-swept entity until Bevy reports completion:
-stalled GPU maps are charged until they resolve, and admission fails closed once
-the eight-completion limit is full. Admission also requests a redraw, so a plain
+packed-result holder drops. Once the renderer submits its COPY_SRC readback,
+the lease remains with the cancellable map job. Admission also requests a redraw, so a plain
 copy is presented even when the output has no animation or other damage. Every
 admitted copy has a five-second absolute request deadline: this is a deadline on
 that one client operation, not a periodic compositor timer.
 
-The existing SIGUSR1/evidence PNG path shares the captured RGBA snapshot,
+The existing SIGUSR1/evidence PNG path shares the renderer-owned RGBA snapshot,
 deadline, cancellation sweep and conversion worker with wire capture. The PNG
 and wire consumers then create their own packed BGRA buffers for their distinct
 outputs. PNG capture retains its filename, atomic-rename and cadence contract;
-an absent Screenshot or an encode/write task which starts after the deadline
+an unavailable output or an encode/write task which starts after the deadline
 releases the one-batch-in-flight latch. A genuinely blocked filesystem write
 cannot be cancelled safely and remains outside this deadline guarantee.
 
-S-1a still uses Bevy's Screenshot primitive. A GPU map error therefore panics
-inside Bevy's internal task; the S-1b renderer-owned readback replaces that path
-and converts map errors into the frame's `failed` event.
-
-S-1a accepts only `overlay_cursor=0`. A non-zero cursor request receives
-`failed` before any pixels are queued because the compositor cannot yet reproduce
-the retained client/chrome cursor image, hotspot and hidden state exactly. The
-retained cursor asset and ordered pre/post-overlay split are S-1b work; S-1a
-stops rather than drawing a fabricated arrow. `grim` sends zero by default.
+`overlay_cursor=0` selects the cursor-free base. Every non-zero value selects an
+inclusive copy using the retained default, chrome or client cursor asset with
+its hotspot, clipping and hidden state. Nested mode copies its cursor-free scene
+to the host swapchain and composites the capture-only overlay into a separate
+temporary target, avoiding a doubled host cursor. The production cursor camera
+renders into an independent transparent target, so it cannot clear or swap the
+scene camera's base texture. SHM and imported DMA-BUF cursor assets remain
+retained and are sampled from that target on the GPU in both nested and KMS
+capture. KMS base copies precede the GPU overlay into scan-out and inclusive
+copies follow it.
 
 Capture is deliberately default-open, including while the session is locked.
 Lock and unlock change the capture epoch: stale work fails, while newly admitted
@@ -180,15 +184,22 @@ work captures the currently displayed lock surface or compositor-owned black
 fallback. This is an agentic desktop policy rather than a portal permission
 prompt.
 
-S-1a proves the complete nested path and keeps the v3 global advertised on KMS.
-Every S-1a KMS snapshot reports `readback_supported=false`, so every otherwise
-valid KMS copy receives `failed`; S-1b adds physical KMS readback and page-flip
-timestamps, persistent real-damage tracking and the exact cursor-overlay split.
+KMS copies select the exact Ready `OutputKey` and generation, copy the scan-out
+target within that frame without retaining a slot, and latch pixels against its
+acquisition token and kernel page-flip timestamp. Pause, unplug, generation
+replacement, cancellation and map failure fail the affected one-shot rather
+than returning another output or stale pixels.
 The wlr protocol is a compatibility surface; the planned
 `ext-image-copy-capture-v1` implementation will become another consumer of the
 same capture service. The automated nested acceptance gate uses `grim`; the
 `cosmix-screencopy-probe` binary is a deadline-bounded manual diagnostic for the
 advertised layout, non-zero shm offset, guard bytes and non-black pixels.
+Automated tests cover readback, transforms, ordering and damage. A real Vulkan
+render-attachment gate uses the production GPU cursor-composite pass, reads back
+base and inclusive bytes, compares both with byte-exact references, and proves
+that channel-swap and shifted-hotspot mutants fail. Physical driver behaviour,
+real kernel page-flip clock provenance
+and end-to-end `grim -o` on KMS remain manual-hardware-only checks.
 
 Layer surfaces stack in the protocol order: Background, Bottom, normal XDG
 toplevels and popups, Top, then Overlay. Raising a surface changes its order

@@ -32,7 +32,7 @@ use bevy::{
         Render, RenderApp, RenderScheduleOrder, RenderSystems,
         pipelined_rendering::{PipelinedRenderingPlugin, RenderExtractApp},
         render_resource::PollType,
-        renderer::{RenderDevice, render_system},
+        renderer::RenderDevice,
         view::ExtractedWindows,
     },
     window::{
@@ -721,7 +721,15 @@ fn accept_bus_service(_value: String) -> Result<String, String> {
 struct BackgroundQuad;
 
 fn setup_scene(mut commands: Commands) {
-    commands.spawn(Camera2d);
+    commands.spawn((
+        Camera2d,
+        capture::CaptureOutputSource {
+            source_id: backend::CaptureSourceId::Nested {
+                output_name: "cosmix-nested-0".into(),
+            },
+            output_name: "cosmix-nested-0".into(),
+        },
+    ));
     commands.spawn((
         BackgroundQuad,
         Sprite::from_color(Color::hsl(195.0, 0.82, 0.34), Vec2::new(250.0, 170.0)),
@@ -732,12 +740,14 @@ fn setup_scene(mut commands: Commands) {
 fn animate_background(
     time: Res<Time>,
     mut quad: Single<(&mut Transform, &mut Sprite), With<BackgroundQuad>>,
+    damage: Res<capture::OutputDamageJournal>,
 ) {
     let elapsed = time.elapsed_secs();
     quad.0.translation.x = elapsed.sin() * 180.0;
     quad.0.translation.y = (elapsed * 0.7).cos() * 80.0;
     quad.0.rotation = Quat::from_rotation_z(elapsed * 0.65);
     quad.1.color = Color::hsl((elapsed * 55.0) % 360.0, 0.72, 0.34);
+    damage.mark_nested_base_full();
 }
 
 #[derive(Resource)]
@@ -1262,7 +1272,7 @@ fn install_nested_security_presentation_completion(
             Render,
             capture_nested_present_candidate
                 .in_set(RenderSystems::Render)
-                .before(render_system),
+                .after(capture::CaptureRenderSet),
         )
         .add_systems(NestedPostPresent, complete_nested_security_presentation);
     render_app
@@ -1283,12 +1293,9 @@ fn capture_nested_present_candidate(
     let Some(primary) = windows.primary else {
         return;
     };
-    let Some(window) = windows.get(&primary) else {
+    let Some(_window) = windows.get(&primary) else {
         return;
     };
-    if window.swap_chain_texture.is_none() {
-        return;
-    }
     let epochs = pending.snapshot();
     let captures = capture_pending.take();
     if epochs.is_empty() && captures.is_empty() {
@@ -1327,6 +1334,7 @@ fn complete_nested_security_presentation(
                 .capture_reporter
                 .presented(capture::CapturePresented {
                     id: capture.id,
+                    source_id: capture.source_id,
                     frame_token: capture.frame_token,
                     generation: capture.generation,
                     security_epoch: capture.security_epoch,

@@ -25,8 +25,8 @@ CosMix Agent Bus — protocol family
 | crate | version |
 |---|---|
 | `cosmix-lib-buildinfo` | 0.1.0 |
-| `cosmix-lib-bus` | 0.3.1 |
-| `cosmix-lib-client` | 0.3.1 |
+| `cosmix-lib-bus` | 0.3.2 |
+| `cosmix-lib-client` | 0.4.1 |
 | `cosmix-lib-log` | 0.3.0 |
 | `cosmix-lib-props-core` | 0.3.0 |
 
@@ -81,7 +81,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-mixer-schema` | 0.5.0 |
 | `cosmix-mprisd` | 0.1.1 |
 | `cosmix-musicd` | 0.25.0 |
-| `cosmix-noded` | 0.13.0 |
+| `cosmix-noded` | 0.13.1 |
 | `cosmix-nspawnd` | 0.2.0 |
 | `cosmix-powerd` | 0.1.0 |
 | `cosmix-song` | 0.2.0 |

@@ -99,6 +99,8 @@ struct PendingAtomicCommit {
 pub(crate) struct AtomicPageFlip {
     pub(crate) crtc_id: u32,
     pub(crate) tag: Option<AtomicPageFlipTag>,
+    pub(crate) tv_sec: u32,
+    pub(crate) tv_usec: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -383,6 +385,7 @@ pub(crate) struct AtomicPresenter<I: AtomicIo> {
     cancellation: Arc<AtomicCancellation>,
     modeset_required: bool,
     pending_commit: Option<PendingAtomicCommit>,
+    displayed_timestamp: Option<(u64, u32)>,
 }
 
 impl<I: AtomicIo> AtomicPresenter<I> {
@@ -403,6 +406,7 @@ impl<I: AtomicIo> AtomicPresenter<I> {
             cancellation,
             modeset_required: true,
             pending_commit: None,
+            displayed_timestamp: None,
         }
     }
 
@@ -490,6 +494,10 @@ impl<I: AtomicIo> AtomicPresenter<I> {
         self.modeset_required
     }
 
+    pub(crate) fn take_displayed_timestamp(&mut self) -> Option<(u64, u32)> {
+        self.displayed_timestamp.take()
+    }
+
     /// Try the retained buffer as a same-mode plane flip. TEST_ONLY and the
     /// real request share the exact property builder and never carry
     /// ALLOW_MODESET. The caller owns fallback policy and may safely demote any
@@ -542,6 +550,7 @@ impl<I: AtomicIo> AtomicPresenter<I> {
         allow_modeset: bool,
         seamless: bool,
     ) -> Result<PresentOutcome, KmsRenderPlatformFailure> {
+        self.displayed_timestamp = None;
         // Cancellation is authoritative before the ioctl as well as after it:
         // a published authority loss must never enqueue a new scanout commit.
         if self.cancellation.cancelled(generation) {
@@ -631,7 +640,7 @@ impl<I: AtomicIo> AtomicPresenter<I> {
                             .decode_pageflips(self.selection.crtc_id)
                             .map_err(atomic_failure)?
                             .into_iter()
-                            .any(|event| {
+                            .find(|event| {
                                 event.crtc_id == self.selection.crtc_id
                                     && event.tag
                                         == Some(AtomicPageFlipTag::Presentation(correlation))
@@ -640,7 +649,7 @@ impl<I: AtomicIo> AtomicPresenter<I> {
                         // authority loss raced its decode. Retire pending state
                         // before final cancellation arbitration so teardown
                         // cannot wait for a phantom event that no longer exists.
-                        if matching {
+                        if matching.is_some() {
                             self.pending_commit = None;
                         }
                         // Decode may itself overlap the authority-loss callback.
@@ -649,7 +658,25 @@ impl<I: AtomicIo> AtomicPresenter<I> {
                         if self.cancellation.cancelled(generation) {
                             return Ok(PresentOutcome::Cancelled);
                         }
-                        if matching {
+                        if let Some(matching) = matching {
+                            if matching.tv_usec >= 1_000_000 {
+                                return Err(KmsRenderPlatformFailure::terminal(
+                                    "kms-live-atomic-pageflip-timestamp-invalid",
+                                    format!(
+                                        "kernel page-flip timestamp has invalid microseconds {}",
+                                        matching.tv_usec
+                                    ),
+                                ));
+                            }
+                            self.displayed_timestamp = Some((
+                                u64::from(matching.tv_sec),
+                                matching.tv_usec.checked_mul(1_000).ok_or_else(|| {
+                                    KmsRenderPlatformFailure::terminal(
+                                        "kms-live-atomic-pageflip-timestamp-overflow",
+                                        "kernel page-flip microseconds overflowed nanoseconds",
+                                    )
+                                })?,
+                            ));
                             // A retained same-mode flip deliberately does not
                             // establish the new generation's full property
                             // set. Keep the first fresh frame modeset-shaped so
@@ -1606,6 +1633,8 @@ fn decode_raw_pageflips(
             flips.push(AtomicPageFlip {
                 crtc_id: event.crtc_id,
                 tag,
+                tv_sec: event.tv_sec,
+                tv_usec: event.tv_usec,
             });
         }
         offset += length;
@@ -1919,6 +1948,8 @@ mod tests {
             cancel: false,
         });
         io.events.push_back(vec![AtomicPageFlip {
+            tv_sec: 123,
+            tv_usec: 456_789,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -1934,10 +1965,16 @@ mod tests {
             ),
             Ok(PresentOutcome::Displayed)
         );
+        assert_eq!(
+            presenter.take_displayed_timestamp(),
+            Some((123, 456_789_000))
+        );
     }
 
     fn matching_flip(generation: u64) -> AtomicPageFlip {
         AtomicPageFlip {
+            tv_sec: 0,
+            tv_usec: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation,
@@ -2307,6 +2344,8 @@ mod tests {
             cancel: false,
         });
         io.events.push_back(vec![AtomicPageFlip {
+            tv_sec: 0,
+            tv_usec: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -2335,6 +2374,8 @@ mod tests {
             cancel: false,
         });
         io.events.push_back(vec![AtomicPageFlip {
+            tv_sec: 0,
+            tv_usec: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -2405,6 +2446,8 @@ mod tests {
         io.waits.push_back(AtomicWaitReady::Deadline);
         io.events.extend((0..STALE_WAKES).map(|_| {
             vec![AtomicPageFlip {
+                tv_sec: 0,
+                tv_usec: 0,
                 crtc_id: 999,
                 tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                     generation: 7,
@@ -2467,6 +2510,8 @@ mod tests {
             cancel: true,
         });
         io.events.push_back(vec![AtomicPageFlip {
+            tv_sec: 0,
+            tv_usec: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -2500,6 +2545,8 @@ mod tests {
             },
         ]);
         io.events.push_back(vec![AtomicPageFlip {
+            tv_sec: 0,
+            tv_usec: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -2507,6 +2554,8 @@ mod tests {
             })),
         }]);
         io.events.push_back(vec![AtomicPageFlip {
+            tv_sec: 0,
+            tv_usec: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 8,
@@ -2540,6 +2589,8 @@ mod tests {
             },
         ]);
         io.events.push_back(vec![AtomicPageFlip {
+            tv_sec: 0,
+            tv_usec: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 8,
@@ -2614,6 +2665,8 @@ mod tests {
             cancel: false,
         });
         stale.io.events.push_back(vec![AtomicPageFlip {
+            tv_sec: 0,
+            tv_usec: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 8,
@@ -2669,6 +2722,8 @@ mod tests {
             cancel: false,
         });
         presenter.io.events.push_back(vec![AtomicPageFlip {
+            tv_sec: 0,
+            tv_usec: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -2797,6 +2852,8 @@ mod tests {
             cancel: false,
         });
         presenter.io.events.push_back(vec![AtomicPageFlip {
+            tv_sec: 0,
+            tv_usec: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -2823,6 +2880,8 @@ mod tests {
             cancel: false,
         });
         presenter.io.events.push_back(vec![AtomicPageFlip {
+            tv_sec: 0,
+            tv_usec: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Disable),
         }]);
@@ -2881,10 +2940,14 @@ mod tests {
             decode_raw_pageflips(bytes, &state).expect("raw pageflip decode"),
             [
                 AtomicPageFlip {
+                    tv_sec: 0,
+                    tv_usec: 0,
                     crtc_id: 202,
                     tag: Some(AtomicPageFlipTag::Presentation(second)),
                 },
                 AtomicPageFlip {
+                    tv_sec: 0,
+                    tv_usec: 0,
                     crtc_id: 101,
                     tag: Some(AtomicPageFlipTag::Presentation(first)),
                 },
@@ -2901,10 +2964,14 @@ mod tests {
             completed: BTreeMap::new(),
         });
         let first = AtomicPageFlip {
+            tv_sec: 0,
+            tv_usec: 0,
             crtc_id: 101,
             tag: Some(AtomicPageFlipTag::Disable),
         };
         let second = AtomicPageFlip {
+            tv_sec: 0,
+            tv_usec: 0,
             crtc_id: 202,
             tag: Some(AtomicPageFlipTag::Disable),
         };

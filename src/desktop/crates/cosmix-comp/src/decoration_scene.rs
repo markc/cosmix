@@ -32,6 +32,8 @@ use crate::{
     },
     shadow_material::{ShadowMaterial, ShadowMaterialPlugin},
 };
+#[cfg(test)]
+use bevy::camera::visibility::RenderLayers;
 
 const MIN_CLIENT_Z_GAP: f32 =
     (CLIENT_CONTENT_Z_MAX - CLIENT_CONTENT_Z_MIN) / (MAX_GLOBAL_SURFACES as f32 + 1.0);
@@ -2328,7 +2330,15 @@ mod tests {
             world.query::<&Mesh2d>().iter(world).count(),
             circle_count + sprite_count + 2
         );
-        assert_eq!(world.query::<&SpriteMesh>().iter(world).count(), 0);
+        assert_eq!(
+            world
+                .query::<(&SpriteMesh, Option<&RenderLayers>)>()
+                .iter(world)
+                .filter(|(_, layers)| layers
+                    .is_none_or(|layers| !layers.intersects(&RenderLayers::layer(31))))
+                .count(),
+            0
+        );
         assert_eq!(
             world
                 .query::<&MeshMaterial2d<ClientSurfaceMaterial>>()
@@ -4511,6 +4521,17 @@ mod tests {
                 .iter(world)
                 .filter_map(|(entity, value)| value.is_changed().then_some(entity)),
         );
+        let capture_cursor = world
+            .query::<(Entity, Option<&RenderLayers>)>()
+            .iter(world)
+            .find_map(|(entity, layers)| {
+                layers
+                    .is_some_and(|layers| layers.intersects(&RenderLayers::layer(31)))
+                    .then_some(entity)
+            });
+        if let Some(cursor) = capture_cursor {
+            changed.remove(&cursor);
+        }
         assert_eq!(changed, std::collections::HashSet::from([root]));
         let surface = &world.resource::<SurfaceEntities>().surfaces[&id];
         assert_eq!(surface.material, material_handle);

@@ -34,10 +34,10 @@ use smithay::{
     wayland::output::WlOutputData,
 };
 
-use self::kms::{KmsRenderCommand, KmsRenderReply, KmsTopology, KmsTopologyError};
+use self::kms::{KmsRenderCommand, KmsRenderReply, KmsTopology, KmsTopologyError, OutputKey};
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
-use self::kms::{OutputKey, SelectedOutput};
+use self::kms::SelectedOutput;
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 use self::kms::KmsTopologyLifecycleEvent;
@@ -86,20 +86,44 @@ pub(crate) struct WinitBackendData {
     pub(crate) output_scale: f64,
 }
 
-/// Immutable output geometry captured when a screencopy frame object is made.
-///
-/// A later mode/topology change invalidates the frame instead of silently
-/// changing the dimensions promised on the wire. `readback_supported` keeps
-/// the S-1a KMS seam fail-closed until the S-1b scanout readback lands.
+/// Exact physical source selected by a screencopy request.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum CaptureSourceId {
+    Nested { output_name: String },
+    Kms { key: OutputKey, generation: u64 },
+}
+
+/// Immutable output identity and geometry captured when a screencopy frame is
+/// advertised. A later identity, mode, scale or transform change fails the
+/// frame instead of mutating the layout promised to the client.
 #[derive(Clone, Debug)]
 pub(crate) struct CaptureSourceSnapshot {
+    pub(crate) source_id: CaptureSourceId,
     pub(crate) output_name: String,
     pub(crate) logical_rect: (i32, i32, u32, u32),
-    pub(crate) physical_size: (u32, u32),
-    pub(crate) scale: f64,
+    pub(crate) source_storage_extent: (u32, u32),
+    pub(crate) displayed_physical_extent: (u32, u32),
+    pub(crate) scale120: u32,
     pub(crate) transform: smithay::utils::Transform,
     pub(crate) generation: u64,
-    pub(crate) readback_supported: bool,
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+fn displayed_capture_extent(
+    storage: (u32, u32),
+    transform: smithay::utils::Transform,
+) -> (u32, u32) {
+    if matches!(
+        transform,
+        smithay::utils::Transform::_90
+            | smithay::utils::Transform::_270
+            | smithay::utils::Transform::Flipped90
+            | smithay::utils::Transform::Flipped270
+    ) {
+        (storage.1, storage.0)
+    } else {
+        storage
+    }
 }
 
 pub(crate) struct KmsBackendData {
@@ -217,9 +241,8 @@ impl BackendData {
     }
 
     /// Resolve the exact client-selected output without a default-output
-    /// fallback. S-1a reads nested output pixels; registered KMS outputs still
-    /// advertise the protocol and snapshot truthful geometry, but fail a copy
-    /// through `readback_supported` until S-1b supplies their final-output seam.
+    /// fallback. KMS selection is generation-exact and only Ready outputs can
+    /// become renderer-owned readback sources.
     pub(crate) fn capture_source_for_output(
         &self,
         resource: &WlOutput,
@@ -227,19 +250,34 @@ impl BackendData {
         let output = self.output_from_resource(resource)?;
         match self {
             Self::Winit(data) if data.output == output => {
-                let physical_width = (f64::from(data.output_size.0) * data.output_scale).round();
-                let physical_height = (f64::from(data.output_size.1) * data.output_scale).round();
+                let scale120 = (data.output_scale * 120.0).round();
+                let scale120 = u32::try_from(scale120 as u64).ok()?.max(1);
+                let physical_width = u64::from(data.output_size.0)
+                    .checked_mul(u64::from(scale120))?
+                    .checked_add(60)?
+                    / 120;
+                let physical_height = u64::from(data.output_size.1)
+                    .checked_mul(u64::from(scale120))?
+                    .checked_add(60)?
+                    / 120;
+                let output_name = output.name();
                 Some(CaptureSourceSnapshot {
-                    output_name: output.name(),
+                    source_id: CaptureSourceId::Nested {
+                        output_name: output_name.clone(),
+                    },
+                    output_name,
                     logical_rect: (0, 0, data.output_size.0, data.output_size.1),
-                    physical_size: (
-                        u32::try_from(physical_width as u64).ok()?,
-                        u32::try_from(physical_height as u64).ok()?,
+                    source_storage_extent: (
+                        u32::try_from(physical_width).ok()?,
+                        u32::try_from(physical_height).ok()?,
                     ),
-                    scale: data.output_scale,
+                    displayed_physical_extent: (
+                        u32::try_from(physical_width).ok()?,
+                        u32::try_from(physical_height).ok()?,
+                    ),
+                    scale120,
                     transform: smithay::utils::Transform::Normal,
                     generation: 1,
-                    readback_supported: true,
                 })
             }
             Self::Kms(data) => {
@@ -248,17 +286,33 @@ impl BackendData {
                     let mode = output.current_mode()?;
                     let location = output.current_location();
                     let scale = output.current_scale().fractional_scale();
-                    let logical_width = (f64::from(mode.size.w) / scale).round();
-                    let logical_height = (f64::from(mode.size.h) / scale).round();
-                    let key = &data
+                    let key = data
                         .client_outputs
                         .outputs
                         .values()
                         .find(|registered| registered.output == output)?
                         .selected
-                        .key;
-                    let generation = *data.topology.presentation_generations().get(key)?;
+                        .key
+                        .clone();
+                    let generation = *data.topology.presentation_generations().get(&key)?;
+                    if !data.topology.output_is_ready(generation, &key) {
+                        return None;
+                    }
+                    let storage = (
+                        u32::try_from(mode.size.w).ok()?,
+                        u32::try_from(mode.size.h).ok()?,
+                    );
+                    let transform = output.current_transform();
+                    let displayed = displayed_capture_extent(storage, transform);
+                    // wl_output logical geometry is in displayed orientation.
+                    // A quarter-turn swaps the mode axes once here; region
+                    // projection must not rotate those displayed coordinates a
+                    // second time.
+                    let logical_width = (f64::from(displayed.0) / scale).round();
+                    let logical_height = (f64::from(displayed.1) / scale).round();
+                    let scale120 = u32::try_from((scale * 120.0).round() as u64).ok()?.max(1);
                     Some(CaptureSourceSnapshot {
+                        source_id: CaptureSourceId::Kms { key, generation },
                         output_name: output.name(),
                         logical_rect: (
                             location.x,
@@ -266,14 +320,11 @@ impl BackendData {
                             u32::try_from(logical_width as i64).ok()?,
                             u32::try_from(logical_height as i64).ok()?,
                         ),
-                        physical_size: (
-                            u32::try_from(mode.size.w).ok()?,
-                            u32::try_from(mode.size.h).ok()?,
-                        ),
-                        scale,
-                        transform: output.current_transform(),
+                        source_storage_extent: storage,
+                        displayed_physical_extent: displayed,
+                        scale120,
+                        transform,
                         generation,
-                        readback_supported: false,
                     })
                 }
                 #[cfg(not(any(all(feature = "kms-live", not(test)), test)))]
@@ -791,6 +842,23 @@ mod tests {
             backend.seat_extent(),
             backend.output_size(),
             "with no admitted output the two coincide; they diverge the moment one lands"
+        );
+    }
+
+    #[test]
+    fn capture_extent_advertises_displayed_axes_for_quarter_turns_once() {
+        let storage = (1920, 1080);
+        assert_eq!(
+            displayed_capture_extent(storage, smithay::utils::Transform::_90),
+            (1080, 1920)
+        );
+        assert_eq!(
+            displayed_capture_extent(storage, smithay::utils::Transform::_180),
+            storage
+        );
+        assert_eq!(
+            displayed_capture_extent(storage, smithay::utils::Transform::_270),
+            (1080, 1920)
         );
     }
 

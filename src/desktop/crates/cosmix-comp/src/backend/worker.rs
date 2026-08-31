@@ -1373,6 +1373,7 @@ where
                 view,
                 present,
                 resume_first_flip,
+                presentation_timestamp,
             } = acquire()?;
             let frame_events = events.clone();
             let frame_key = key.clone();
@@ -1391,6 +1392,7 @@ where
                     Ok(outcome)
                 }),
                 resume_first_flip,
+                presentation_timestamp,
             })
         }),
     }
@@ -2178,6 +2180,12 @@ pub(crate) mod tests {
                 placeholder: FakePlaceholder((16, 16)),
                 acquire: Box::new(move || {
                     Ok(AcquiredOutputFrame {
+                        presentation_timestamp: Arc::new(Mutex::new(Some(
+                            crate::backend::render::KmsPresentationTimestamp {
+                                seconds: 1,
+                                nanoseconds: 2,
+                            },
+                        ))),
                         view: view.clone(),
                         present: fallible_present_output_frame(move |_| Ok(outcome)),
                         resume_first_flip: None,
