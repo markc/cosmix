@@ -308,6 +308,36 @@ pub(crate) fn test_wiring(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn test_wiring_with_observation_capacity(
+    context: Arc<SnapshotContext>,
+    capacity: usize,
+) -> (
+    PortProtocolWiring,
+    PortIngress,
+    crossbeam_channel::Receiver<ObservationRecord>,
+) {
+    let (sender, source) = channel::sync_channel(PORT_QUEUE_CAPACITY);
+    let ingress = PortIngress {
+        sender,
+        queue_depth: context.queue_depth.clone(),
+        control_order: Arc::new(AtomicU64::new(0)),
+        pending_idle_order: context.pending_idle_order.clone(),
+        pending_active_order: context.pending_active_order.clone(),
+    };
+    let (observation_producer, observations) =
+        port_observation::test_outbox(Arc::clone(&context.lost_count), capacity);
+    (
+        PortProtocolWiring {
+            source,
+            context,
+            observation_producer,
+        },
+        ingress,
+        observations,
+    )
+}
+
 pub(crate) struct PortStarter {
     service: String,
     noded_url: String,
@@ -1027,6 +1057,44 @@ fn handle_incoming(
             PendingReply::new(command, reply),
         );
     });
+}
+
+#[cfg(test)]
+pub(crate) fn inject_topic_lifecycle_notice_for_test(
+    ingress: &PortIngress,
+    service: &str,
+    active: bool,
+) {
+    let mut responders = JoinSet::new();
+    let responder_permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+    let (reply_sender, _replies) = tokio_mpsc::channel(1);
+    let reply_timeouts = Arc::new(AtomicU64::new(0));
+    let mut headers = BTreeMap::new();
+    headers.insert(
+        "name".into(),
+        port_observation::topic_name(service, port_observation::PROPS_TOPIC_SUFFIX),
+    );
+    handle_incoming(
+        ingress,
+        &mut responders,
+        &responder_permits,
+        &reply_sender,
+        &reply_timeouts,
+        service,
+        cosmix_client::IncomingCommand {
+            from: "noded".into(),
+            command: if active {
+                "topic.active".into()
+            } else {
+                "topic.idle".into()
+            },
+            id: None,
+            args: Value::Null,
+            body: String::new(),
+            headers,
+        },
+    );
+    debug_assert!(responders.is_empty());
 }
 
 fn authorize_set(command: &cosmix_client::IncomingCommand) -> Result<(), ()> {

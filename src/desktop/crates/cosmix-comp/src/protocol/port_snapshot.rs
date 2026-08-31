@@ -1417,7 +1417,7 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
     descriptor!(
         &[L("port"), L("publish_timeouts")],
         Number,
-        "Topic publication failures, timeouts and saturated publisher lanes"
+        "Topic publication failures and timeouts"
     ),
     descriptor!(
         &[L("port"), L("slug_collisions")],

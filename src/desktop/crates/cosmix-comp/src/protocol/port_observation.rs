@@ -325,7 +325,14 @@ impl ObservationProducer {
 pub(crate) fn outbox(
     lost_count: Arc<AtomicU64>,
 ) -> (ObservationProducer, Receiver<ObservationRecord>) {
-    let (sender, receiver) = crossbeam_channel::bounded(OUTBOX_CAPACITY);
+    outbox_with_capacity(lost_count, OUTBOX_CAPACITY)
+}
+
+fn outbox_with_capacity(
+    lost_count: Arc<AtomicU64>,
+    capacity: usize,
+) -> (ObservationProducer, Receiver<ObservationRecord>) {
+    let (sender, receiver) = crossbeam_channel::bounded(capacity);
     let notifier = Arc::new(Notify::new());
     (
         ObservationProducer {
@@ -336,6 +343,14 @@ pub(crate) fn outbox(
         },
         receiver,
     )
+}
+
+#[cfg(test)]
+pub(crate) fn test_outbox(
+    lost_count: Arc<AtomicU64>,
+    capacity: usize,
+) -> (ObservationProducer, Receiver<ObservationRecord>) {
+    outbox_with_capacity(lost_count, capacity)
 }
 
 #[derive(Clone, Debug)]
@@ -540,6 +555,9 @@ impl WaylandState {
 
     pub(crate) fn mark_output_before_change(&mut self, output: &Output, cause: &'static str) {
         let Some((key, row)) = project_output(self, output) else {
+            if self.observations.watched_baseline.is_some() {
+                self.observations.full_dirty.get_or_insert(cause);
+            }
             return;
         };
         self.observations
@@ -561,6 +579,9 @@ impl WaylandState {
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
     pub(crate) fn mark_all_outputs_before_change(&mut self, cause: &'static str) {
         let Some(projection) = project_outputs(self) else {
+            if self.observations.watched_baseline.is_some() {
+                self.observations.full_dirty.get_or_insert(cause);
+            }
             return;
         };
         for (output, key) in projection.keys {
@@ -787,6 +808,15 @@ impl WaylandState {
 }
 
 pub(super) fn service_observations(state: &mut WaylandState) {
+    let stable =
+        state.pointer_hit_test_batch_depth == 0 && !state.pointer_hit_test_transaction_applying;
+    debug_assert!(
+        stable,
+        "Bus observation attempted inside a protocol transaction or hit-test batch"
+    );
+    if !stable {
+        return;
+    }
     service_surface_edges(state);
     service_focus_edge(state);
     service_output_edges(state);
@@ -885,10 +915,22 @@ fn service_output_edges(state: &mut WaylandState) {
     if pending.is_empty() && !topology_dirty {
         return;
     }
-    let final_rows = topology_dirty
-        .then(|| project_outputs(state).map(|projection| projection.rows))
-        .flatten()
-        .unwrap_or_default();
+    let final_rows = if topology_dirty {
+        let Some(projection) = project_outputs(state) else {
+            state.observations.dirty_outputs = pending;
+            state.observations.output_topology_dirty = true;
+            if state.observations.watched_baseline.is_some() {
+                state
+                    .observations
+                    .full_dirty
+                    .get_or_insert("output.geometry");
+            }
+            return;
+        };
+        projection.rows
+    } else {
+        BTreeMap::new()
+    };
     let old_keys = pending.keys().cloned().collect::<BTreeSet<_>>();
     let final_keys = final_rows.keys().cloned().collect::<BTreeSet<_>>();
     let topology_replaced = topology_dirty && old_keys != final_keys;
@@ -896,6 +938,7 @@ fn service_output_edges(state: &mut WaylandState) {
         state.reset_corner_detector();
     }
     let mut emitted = BTreeSet::new();
+    let mut retry = BTreeMap::new();
     for (key, old) in pending {
         let row = if topology_dirty {
             final_rows.get(&key).cloned()
@@ -904,6 +947,9 @@ fn service_output_edges(state: &mut WaylandState) {
                 .and_then(|(final_key, row)| (final_key == key).then_some(row))
         };
         let Some(row) = row else {
+            if state.backend.port_output(&old.output).is_some() {
+                retry.insert(key, old);
+            }
             continue;
         };
         if old.row.x == row.x
@@ -924,6 +970,7 @@ fn service_output_edges(state: &mut WaylandState) {
             });
         emitted.insert(key);
     }
+    state.observations.dirty_outputs.extend(retry);
     if topology_replaced {
         for (key, row) in final_rows {
             if old_keys.contains(&key) || emitted.contains(&key) {
@@ -981,6 +1028,10 @@ fn service_property_diffs(state: &mut WaylandState) {
         let new = project_output(state, &output)
             .filter(|(final_key, _)| final_key == &key)
             .map(|(_, row)| row);
+        if new.is_none() && state.backend.port_output(&output).is_some() {
+            state.observations.full_dirty.get_or_insert(cause);
+            continue;
+        }
         diff_output_row(
             &format!("outputs.{key}"),
             old.as_ref(),
@@ -998,57 +1049,59 @@ fn service_property_diffs(state: &mut WaylandState) {
         }
     }
     let dirty_surfaces = std::mem::take(&mut state.observations.dirty_surfaces);
-    if !dirty_surfaces.is_empty()
-        && let Some(projection) = project_outputs(state)
-    {
-        for (raw_id, cause) in dirty_surfaces {
-            let key = format!("s{raw_id}");
-            let old_surface = baseline.surfaces.get(&key).cloned();
-            let new_surface = project_surface_by_id(state, SurfaceId(raw_id), &projection.keys);
-            diff_surface_row(
-                &format!("surfaces.{key}"),
-                old_surface.as_ref(),
-                new_surface.as_ref(),
-                cause,
-                &mut changes,
-            );
-            match new_surface {
-                Some(row) => {
-                    baseline.surfaces.insert(key.clone(), row.clone());
-                    if row.role == "toplevel" && row.mapped && !state.session_lock_active() {
-                        let old_window = baseline.windows.get(&key).cloned();
-                        let new_window = project_window_row(&row);
-                        diff_window_row(
-                            &format!("windows.{key}"),
-                            old_window.as_ref(),
-                            Some(&new_window),
-                            cause,
-                            &mut changes,
-                        );
-                        baseline.windows.insert(key, new_window);
-                    } else if let Some(old_window) = baseline.windows.remove(&key) {
-                        diff_window_row(
-                            &format!("windows.{key}"),
-                            Some(&old_window),
-                            None,
-                            cause,
-                            &mut changes,
-                        );
+    if !dirty_surfaces.is_empty() {
+        if let Some(projection) = project_outputs(state) {
+            for (raw_id, cause) in dirty_surfaces {
+                let key = format!("s{raw_id}");
+                let old_surface = baseline.surfaces.get(&key).cloned();
+                let new_surface = project_surface_by_id(state, SurfaceId(raw_id), &projection.keys);
+                diff_surface_row(
+                    &format!("surfaces.{key}"),
+                    old_surface.as_ref(),
+                    new_surface.as_ref(),
+                    cause,
+                    &mut changes,
+                );
+                match new_surface {
+                    Some(row) => {
+                        baseline.surfaces.insert(key.clone(), row.clone());
+                        if row.role == "toplevel" && row.mapped && !state.session_lock_active() {
+                            let old_window = baseline.windows.get(&key).cloned();
+                            let new_window = project_window_row(&row);
+                            diff_window_row(
+                                &format!("windows.{key}"),
+                                old_window.as_ref(),
+                                Some(&new_window),
+                                cause,
+                                &mut changes,
+                            );
+                            baseline.windows.insert(key, new_window);
+                        } else if let Some(old_window) = baseline.windows.remove(&key) {
+                            diff_window_row(
+                                &format!("windows.{key}"),
+                                Some(&old_window),
+                                None,
+                                cause,
+                                &mut changes,
+                            );
+                        }
                     }
-                }
-                None => {
-                    baseline.surfaces.remove(&key);
-                    if let Some(old_window) = baseline.windows.remove(&key) {
-                        diff_window_row(
-                            &format!("windows.{key}"),
-                            Some(&old_window),
-                            None,
-                            cause,
-                            &mut changes,
-                        );
+                    None => {
+                        baseline.surfaces.remove(&key);
+                        if let Some(old_window) = baseline.windows.remove(&key) {
+                            diff_window_row(
+                                &format!("windows.{key}"),
+                                Some(&old_window),
+                                None,
+                                cause,
+                                &mut changes,
+                            );
+                        }
                     }
                 }
             }
+        } else if let Some(cause) = dirty_surfaces.values().next().copied() {
+            state.observations.full_dirty.get_or_insert(cause);
         }
     }
 
