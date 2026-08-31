@@ -44,7 +44,7 @@ fn snapshot_context(backend: &'static str) -> port_snapshot::SnapshotContext {
         } else {
             "comp-nested"
         }),
-        version: Arc::from("0.32.0-test"),
+        version: Arc::from("0.32.1-test"),
         backend,
         engine: "bevy-0.19/wgpu",
         instance: Arc::from("protocol-fixture"),
@@ -52,6 +52,7 @@ fn snapshot_context(backend: &'static str) -> port_snapshot::SnapshotContext {
         decoration_style: "mac",
         broker: Arc::new(AtomicU8::new(port_snapshot::BROKER_CONNECTED)),
         queue_depth: Arc::new(AtomicUsize::new(0)),
+        reply_timeouts: Arc::new(AtomicU64::new(0)),
     }
 }
 
@@ -26866,7 +26867,8 @@ fn port_snapshot_projects_protocol_roles_focus_stack_metadata_and_usable_output(
     route_pointer_to(&mut harness, 10.0, 10.0);
     let _ = harness.sync();
 
-    let snapshot = port_snapshot::snapshot(&harness.server.state, &snapshot_context("nested"));
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &snapshot_context("nested"))
+        .expect("fixture coordinates are exactly representable");
     assert_eq!(snapshot.info.service.as_ref(), "comp-nested");
     assert_eq!(snapshot.info.backend, "nested");
     assert_eq!(snapshot.port.level, "L1");
@@ -26954,7 +26956,7 @@ fn port_snapshot_projects_protocol_roles_focus_stack_metadata_and_usable_output(
 
 #[cfg(feature = "bus")]
 #[test]
-fn port_boundary_caps_sixteen_shares_one_snapshot_and_sees_same_dispatch_commits() {
+fn port_boundary_uses_production_admission_completion_and_sees_same_dispatch_commits() {
     let (mut harness, ingress) = KeybindingHarness::new_with_port();
     map_initial_test_toplevel(&mut harness);
     send_request(
@@ -26975,9 +26977,17 @@ fn port_boundary_caps_sixteen_shares_one_snapshot_and_sees_same_dispatch_commits
         .server
         .dispatch_cycle(Some(Duration::ZERO))
         .expect("one converged dispatch services the port batch");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("fake port worker runtime");
     let snapshots = replies
         .into_iter()
-        .map(|reply| reply.blocking_recv().expect("snapshot reply"))
+        .map(|admission| {
+            runtime
+                .block_on(admission.receive())
+                .expect("snapshot reply")
+        })
         .collect::<Vec<_>>();
     for snapshot in &snapshots[1..] {
         assert!(Arc::ptr_eq(&snapshots[0], snapshot));
@@ -26989,10 +26999,16 @@ fn port_boundary_caps_sixteen_shares_one_snapshot_and_sees_same_dispatch_commits
         .expect("toplevel in shared snapshot");
     assert_eq!(toplevel.title.as_deref(), Some("same-dispatch title"));
 
-    for _ in 0..16 {
-        ingress.release_test_admission();
-    }
     assert_eq!(ingress.depth_for_test(), 0);
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn port_output_coordinate_conversion_rejects_inexact_f32_values() {
+    assert_eq!(exact_i32_to_f32(16_777_216), Some(16_777_216.0));
+    assert_eq!(exact_i32_to_f32(16_777_217), None);
+    assert!(exact_logical_output_rect(0, 0, 16_777_216, 1).is_some());
+    assert!(exact_logical_output_rect(16_777_217, 0, 1, 1).is_none());
 }
 
 #[test]
@@ -28114,7 +28130,8 @@ fn kms_mode_change_arranges_layers_before_reconfiguring_maximized_windows() {
 
     #[cfg(feature = "bus")]
     {
-        let port = port_snapshot::snapshot(&harness.server.state, &snapshot_context("kms"));
+        let port = port_snapshot::snapshot(&harness.server.state, &snapshot_context("kms"))
+            .expect("KMS fixture coordinates are exactly representable");
         let (key, output) = port.outputs.iter().next().expect("KMS output projected");
         assert_eq!(key, "o_mode_change_1");
         assert_eq!(output.name, "Mode-change-1");
@@ -30843,7 +30860,8 @@ fn session_lock_acked_buffer_maps_in_lock_band_above_overlay() {
     );
     #[cfg(feature = "bus")]
     {
-        let snapshot = port_snapshot::snapshot(&harness.server.state, &snapshot_context("nested"));
+        let snapshot = port_snapshot::snapshot(&harness.server.state, &snapshot_context("nested"))
+            .expect("fixture coordinates are exactly representable");
         let lock = snapshot
             .surfaces
             .values()

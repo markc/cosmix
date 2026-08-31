@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -36,6 +36,7 @@ pub(crate) struct SnapshotContext {
     pub(crate) decoration_style: &'static str,
     pub(crate) broker: Arc<AtomicU8>,
     pub(crate) queue_depth: Arc<AtomicUsize>,
+    pub(crate) reply_timeouts: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -51,6 +52,8 @@ pub(crate) struct CompSnapshot {
     pub(crate) port: PortSnapshot,
     #[serde(skip)]
     property_tree: OnceLock<Value>,
+    #[serde(skip)]
+    full_tree: tokio::sync::OnceCell<Arc<str>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -166,17 +169,18 @@ pub(crate) struct PortSnapshot {
     pub(crate) event_seq: u64,
     pub(crate) lost_count: u64,
     pub(crate) queue_depth: usize,
+    pub(crate) reply_timeouts: u64,
     pub(crate) broker: &'static str,
 }
 
 /// Build one fully owned snapshot on the protocol thread.
-pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> CompSnapshot {
+pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Option<CompSnapshot> {
     let sources = state.backend.port_outputs();
     let mut output_keys = Vec::<(Output, String)>::with_capacity(sources.len());
     let mut outputs = BTreeMap::new();
     for source in sources {
         let key = output_key(&source.name);
-        let usable = state.usable_output_rect_for(&source.output);
+        let usable = state.port_usable_output_rect_for(&source.output)?;
         assert!(
             !outputs.contains_key(&key),
             "P-0 output slug collision; define the multi-output collision rule before exposing it"
@@ -294,7 +298,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> CompS
     let stack = roots.into_iter().map(|record| record.id.0).collect();
 
     let bindings = state.bindings.port_snapshot();
-    CompSnapshot {
+    Some(CompSnapshot {
         info: InfoSnapshot {
             service: context.service.clone(),
             version: context.version.clone(),
@@ -347,6 +351,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> CompS
             event_seq: 0,
             lost_count: 0,
             queue_depth: context.queue_depth.load(Ordering::Acquire),
+            reply_timeouts: context.reply_timeouts.load(Ordering::Acquire),
             broker: if context.broker.load(Ordering::Acquire) == BROKER_CONNECTED {
                 "connected"
             } else {
@@ -354,7 +359,8 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> CompS
             },
         },
         property_tree: OnceLock::new(),
-    }
+        full_tree: tokio::sync::OnceCell::new(),
+    })
 }
 
 fn surface_output<'a>(
@@ -856,6 +862,11 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         Number,
         "Accepted snapshot requests not yet completed"
     ),
+    descriptor!(
+        &[L("port"), L("reply_timeouts")],
+        Number,
+        "Replies dropped after a send deadline or saturated reply lane"
+    ),
     descriptor!(&[L("port"), L("broker")], String, "Live broker connection state", enum = &["connected", "retrying"]),
 ];
 
@@ -897,38 +908,120 @@ fn slice_is_empty(values: &&[&str]) -> bool {
     values.is_empty()
 }
 
-pub(crate) fn dispatch_read(snapshot: &CompSnapshot, command: &str, args: &Value) -> (u8, String) {
+pub(super) fn service_requests(state: &mut WaylandState) {
+    if state.pending_port_requests.is_empty() {
+        return;
+    }
+
+    let stable =
+        state.pointer_hit_test_batch_depth == 0 && !state.pointer_hit_test_transaction_applying;
+    debug_assert!(
+        stable,
+        "Bus snapshot attempted inside a protocol transaction or hit-test batch"
+    );
+    if !stable {
+        state.pending_port_requests.clear();
+        return;
+    }
+    let Some(context) = state.port_context.clone() else {
+        state.pending_port_requests.clear();
+        return;
+    };
+    let Some(snapshot) = snapshot(state, &context).map(Arc::new) else {
+        tracing::warn!(
+            "compositor Bus snapshot contains coordinates not exactly representable as f32"
+        );
+        state.pending_port_requests.clear();
+        return;
+    };
+    for request in state.pending_port_requests.drain(..) {
+        let _ = request.reply.send(Arc::clone(&snapshot));
+    }
+}
+
+pub(crate) async fn dispatch_read(
+    snapshot: Arc<CompSnapshot>,
+    command: String,
+    args: Value,
+) -> (u8, Arc<str>) {
     if command == "comp.info" {
         return (
             0,
-            json!({
-                "service": snapshot.info.service,
-                "version": snapshot.info.version,
-                "backend": snapshot.info.backend,
-                "engine": snapshot.info.engine,
-                "output_count": snapshot.outputs.len(),
-                "surface_count": snapshot.surfaces.len(),
-                "event_seq": snapshot.port.event_seq,
-                "lost_count": snapshot.port.lost_count,
-            })
-            .to_string(),
+            Arc::from(
+                json!({
+                    "service": snapshot.info.service,
+                    "version": snapshot.info.version,
+                    "backend": snapshot.info.backend,
+                    "engine": snapshot.info.engine,
+                    "output_count": snapshot.outputs.len(),
+                    "surface_count": snapshot.surfaces.len(),
+                    "event_seq": snapshot.port.event_seq,
+                    "lost_count": snapshot.port.lost_count,
+                })
+                .to_string(),
+            ),
         );
     }
     if !matches!(
-        command,
+        command.as_str(),
         "comp.props.get" | "comp.props.list" | "comp.props.describe"
     ) {
         return error("unknown_verb");
     }
+    if command == "comp.props.get" {
+        match optional_path(&args, "path") {
+            Ok(None) => {
+                return full_tree(snapshot)
+                    .await
+                    .map_or_else(|()| error("busy"), |body| (0, body));
+            }
+            Ok(Some(_)) => {}
+            Err(()) => return error("unknown_path"),
+        }
+    }
+    tokio::task::spawn_blocking(move || dispatch_selected_read(&snapshot, &command, &args))
+        .await
+        .unwrap_or_else(|_| error("busy"))
+}
+
+async fn full_tree(snapshot: Arc<CompSnapshot>) -> Result<Arc<str>, ()> {
+    static SERIALISATION_PERMIT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let snapshot_for_initialiser = Arc::clone(&snapshot);
+    snapshot
+        .full_tree
+        .get_or_try_init(|| async move {
+            let serialisation_permit = SERIALISATION_PERMIT
+                .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| ())?;
+            let body = tokio::task::spawn_blocking(move || {
+                let _serialisation_permit = serialisation_permit;
+                serde_json::to_string(snapshot_for_initialiser.as_ref())
+                    .map(Arc::<str>::from)
+                    .map_err(|_| ())
+            })
+            .await
+            .map_err(|_| ())??;
+            Ok(body)
+        })
+        .await
+        .map(Arc::clone)
+}
+
+fn dispatch_selected_read(snapshot: &CompSnapshot, command: &str, args: &Value) -> (u8, Arc<str>) {
     let tree = match property_tree(snapshot) {
         Ok(tree) => tree,
         Err(()) => return error("busy"),
     };
     match command {
         "comp.props.get" => match optional_path(args, "path") {
-            Ok(None) => (0, tree.to_string()),
-            Ok(Some(path)) => select(tree, &path)
-                .map_or_else(|| error("unknown_path"), |value| (0, value.to_string())),
+            Ok(Some(path)) => select(tree, &path).map_or_else(
+                || error("unknown_path"),
+                |value| (0, Arc::from(value.to_string())),
+            ),
+            Ok(None) => error("busy"),
             Err(()) => error("unknown_path"),
         },
         "comp.props.list" => match optional_path(args, "prefix") {
@@ -941,14 +1034,13 @@ pub(crate) fn dispatch_read(snapshot: &CompSnapshot, command: &str, args: &Value
                         .filter(|leaf| leaf.starts_with(&prefix))
                         .collect(),
                 };
-                (0, json!(paths).to_string())
+                (0, Arc::from(json!(paths).to_string()))
             }
             Err(()) => error("unknown_path"),
         },
         "comp.props.describe" => match required_path(args, "path") {
-            Ok(path) => {
-                describe(tree, &path).map_or_else(|| error("unknown_path"), |body| (0, body))
-            }
+            Ok(path) => describe(tree, &path)
+                .map_or_else(|| error("unknown_path"), |body| (0, Arc::from(body))),
             Err(()) => error("unknown_path"),
         },
         _ => error("unknown_verb"),
@@ -1055,8 +1147,8 @@ fn describe(tree: &Value, path: &PropPath) -> Option<String> {
     .ok()
 }
 
-pub(crate) fn error(reason: &'static str) -> (u8, String) {
-    (10, json!({"error": reason}).to_string())
+pub(crate) fn error(reason: &'static str) -> (u8, Arc<str>) {
+    (10, Arc::from(json!({"error": reason}).to_string()))
 }
 
 #[cfg(test)]
@@ -1197,7 +1289,7 @@ mod tests {
         CompSnapshot {
             info: InfoSnapshot {
                 service: Arc::from("comp-nested"),
-                version: Arc::from("0.32.0"),
+                version: Arc::from("0.32.1"),
                 backend: "nested",
                 engine: "bevy-0.19/wgpu",
                 instance: Arc::from("fixture"),
@@ -1229,9 +1321,11 @@ mod tests {
                 event_seq: 0,
                 lost_count: 0,
                 queue_depth: 1,
+                reply_timeouts: 0,
                 broker: "connected",
             },
             property_tree: OnceLock::new(),
+            full_tree: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -1255,8 +1349,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn list_uses_segment_ancestry_and_every_leaf_round_trips() {
+    #[tokio::test]
+    async fn list_uses_segment_ancestry_and_every_leaf_round_trips() {
         let snapshot = fixture();
         let tree = serde_json::to_value(&snapshot).expect("fixture serialises");
         let leaves = flattened_paths(&tree);
@@ -1266,29 +1360,39 @@ mod tests {
             .filter(|leaf| leaf.starts_with(&prefix))
             .map(|leaf| leaf.as_str().to_string())
             .collect::<Vec<_>>();
+        let snapshot = Arc::new(snapshot);
         let (rc, body) = dispatch_read(
-            &snapshot,
-            "comp.props.list",
-            &json!({"prefix": "surfaces.s1"}),
-        );
+            Arc::clone(&snapshot),
+            "comp.props.list".into(),
+            json!({"prefix": "surfaces.s1"}),
+        )
+        .await;
         assert_eq!(rc, 0);
         assert_eq!(
             serde_json::from_str::<Vec<String>>(&body).expect("path list"),
             expected
         );
         let (rc, body) = dispatch_read(
-            &snapshot,
-            "comp.props.list",
-            &json!({"prefix": "surfaces.s"}),
-        );
+            Arc::clone(&snapshot),
+            "comp.props.list".into(),
+            json!({"prefix": "surfaces.s"}),
+        )
+        .await;
         assert_eq!(rc, 0);
-        assert_eq!(body, "[]");
+        assert_eq!(body.as_ref(), "[]");
 
         for leaf in leaves {
             let args = json!({"path": leaf.as_str()});
-            assert_eq!(dispatch_read(&snapshot, "comp.props.get", &args).0, 0);
             assert_eq!(
-                dispatch_read(&snapshot, "comp.props.describe", &args).0,
+                dispatch_read(Arc::clone(&snapshot), "comp.props.get".into(), args.clone())
+                    .await
+                    .0,
+                0
+            );
+            assert_eq!(
+                dispatch_read(Arc::clone(&snapshot), "comp.props.describe".into(), args)
+                    .await
+                    .0,
                 0,
                 "describe {}",
                 leaf.as_str()
@@ -1302,14 +1406,19 @@ mod tests {
         assert_eq!(output_key("DP-1"), "o_dp_1");
     }
 
-    #[test]
-    fn describe_accepts_empty_collection_subtrees() {
+    #[tokio::test]
+    async fn describe_accepts_empty_collection_subtrees() {
         let mut snapshot = fixture();
         snapshot.surfaces.clear();
         snapshot.windows.clear();
+        let snapshot = Arc::new(snapshot);
         for path in ["surfaces", "windows"] {
-            let (rc, body) =
-                dispatch_read(&snapshot, "comp.props.describe", &json!({"path": path}));
+            let (rc, body) = dispatch_read(
+                Arc::clone(&snapshot),
+                "comp.props.describe".into(),
+                json!({"path": path}),
+            )
+            .await;
             assert_eq!(rc, 0, "{path}: {body}");
             assert_eq!(
                 serde_json::from_str::<Value>(&body)
@@ -1319,5 +1428,25 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn full_tree_serialisation_is_single_flight_and_shares_the_cached_bytes() {
+        let snapshot = Arc::new(fixture());
+        let left = dispatch_read(Arc::clone(&snapshot), "comp.props.get".into(), Value::Null);
+        let right = dispatch_read(Arc::clone(&snapshot), "comp.props.get".into(), json!({}));
+        let ((left_rc, left_body), (right_rc, right_body)) = tokio::join!(left, right);
+        assert_eq!((left_rc, right_rc), (0, 0));
+        assert!(Arc::ptr_eq(&left_body, &right_body));
+        assert!(snapshot.full_tree.get().is_some());
+
+        let (rc, selected) = dispatch_read(
+            snapshot,
+            "comp.props.get".into(),
+            json!({"path": "info.service"}),
+        )
+        .await;
+        assert_eq!(rc, 0);
+        assert_eq!(selected.as_ref(), "\"comp-nested\"");
     }
 }

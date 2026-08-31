@@ -219,7 +219,7 @@ stack
 focus.{keyboard,exclusive_latch,pointer,pointer_grab}
 decoration.{enabled,style}
 bindings.{enabled,profile,table}
-port.{level,event_seq,lost_count,queue_depth,broker}
+port.{level,event_seq,lost_count,queue_depth,reply_timeouts,broker}
 ```
 
 Surface keys are `s` plus the decimal session-local surface ID. Output keys are
@@ -231,7 +231,9 @@ known limit rather than a guessed multi-output suffix rule. `band` includes
 mapped roots from top to bottom. `windows` is a projection of mapped XDG
 toplevels. `port.level` is `L1`; `event_seq` and `lost_count` remain zero until
 watch support lands. `port.broker` is driven by connection-state edges and is
-`connected` or `retrying`.
+`connected` or `retrying`. `port.reply_timeouts` counts replies dropped because
+the bounded reply lane was saturated or the broker send exceeded its two-second
+deadline; it is separate from topic-only `lost_count`.
 
 All application errors use Bus rc 10 with exactly one of
 `{"error":"unknown_path"}`, `{"error":"busy"}` or
@@ -244,9 +246,18 @@ The broker client lives on the named `cosmix-comp-port` OS thread with its own
 current-thread Tokio runtime. At most 16 accepted reads cross a bounded calloop
 channel. The calloop callback only stages requests; after the current protocol
 transaction and popup cleanup, one owned snapshot is built and shared by all
-requests in that dispatch. JSON selection, serialisation, broker waits and the
-two-second timeout stay on the port thread. An absent or slow broker therefore
-adds no work to a compositor frame when no read was admitted.
+requests in that dispatch. Snapshot admission is released before reply I/O.
+Replies cross a separate bounded lane whose sender applies a two-second deadline,
+so the incoming command loop never awaits a broker send. Full-tree JSON is
+serialised once per snapshot on the blocking pool, with only one full-tree
+serialisation active process-wide; requests share the resulting string. Subtree
+reads serialise only the selected value.
+
+The 16,384-surface cap bounds tree cardinality, not reply bytes. At the title and
+app-ID limits, a hostile full tree can still approach roughly 400 MiB after the
+`windows` projection duplicates toplevel strings and JSON escaping expands them.
+Single-flight serialisation prevents same-snapshot multiplication, but the
+accepted untruncated full-tree reply remains a known resource risk.
 
 Absent by design in P-0:
 

@@ -3,9 +3,10 @@
 use std::{
     fmt::Write as _,
     future::Future,
+    pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -15,7 +16,10 @@ use std::{
 use cosmix_client::{ConnState, NameCollision, SupervisedClient, SupervisedError};
 use serde_json::Value;
 use smithay::reexports::calloop::channel;
-use tokio::{sync::watch, task::JoinSet};
+use tokio::{
+    sync::{Semaphore, mpsc as tokio_mpsc, watch},
+    task::JoinSet,
+};
 
 use crate::{decoration::DecorationStartup, protocol::port_snapshot};
 use port_snapshot::{
@@ -23,7 +27,9 @@ use port_snapshot::{
 };
 
 const PORT_QUEUE_CAPACITY: usize = 16;
+const PORT_REPLY_CAPACITY: usize = 16;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
+const REPLY_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const PORT_SHUTDOWN_GRACE: Duration = Duration::from_millis(300);
 
 pub(crate) enum PortCommand {
@@ -41,9 +47,7 @@ pub(crate) struct PortIngress {
 }
 
 impl PortIngress {
-    pub(crate) fn request_snapshot(
-        &self,
-    ) -> Result<tokio::sync::oneshot::Receiver<Arc<CompSnapshot>>, ()> {
+    pub(crate) fn request_snapshot(&self) -> Result<SnapshotAdmission, ()> {
         let mut depth = self.queue_depth.load(Ordering::Acquire);
         loop {
             if depth >= PORT_QUEUE_CAPACITY {
@@ -64,7 +68,10 @@ impl PortIngress {
             .sender
             .try_send(PortCommand::Snapshot(PortRequest { reply }))
         {
-            Ok(()) => Ok(receive),
+            Ok(()) => Ok(SnapshotAdmission {
+                receive,
+                depth: QueueDepthGuard(Arc::clone(&self.queue_depth)),
+            }),
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 self.queue_depth.fetch_sub(1, Ordering::AcqRel);
                 Err(())
@@ -73,13 +80,25 @@ impl PortIngress {
     }
 
     #[cfg(test)]
-    pub(crate) fn release_test_admission(&self) {
-        self.queue_depth.fetch_sub(1, Ordering::AcqRel);
-    }
-
-    #[cfg(test)]
     pub(crate) fn depth_for_test(&self) -> usize {
         self.queue_depth.load(Ordering::Acquire)
+    }
+}
+
+pub(crate) struct SnapshotAdmission {
+    receive: tokio::sync::oneshot::Receiver<Arc<CompSnapshot>>,
+    depth: QueueDepthGuard,
+}
+
+impl SnapshotAdmission {
+    pub(crate) async fn receive(self) -> Result<Arc<CompSnapshot>, ()> {
+        let Self { receive, depth } = self;
+        let result = match tokio::time::timeout(SNAPSHOT_TIMEOUT, receive).await {
+            Ok(Ok(snapshot)) => Ok(snapshot),
+            Ok(Err(_)) | Err(_) => Err(()),
+        };
+        drop(depth);
+        result
     }
 }
 
@@ -103,6 +122,7 @@ pub(crate) struct PortStarter {
     noded_url: String,
     ingress: PortIngress,
     broker: Arc<AtomicU8>,
+    reply_timeouts: Arc<AtomicU64>,
 }
 
 pub(crate) struct PortWorker {
@@ -121,6 +141,7 @@ pub(crate) fn prepare(
     let noded_url = cosmix_config::client_helpers::resolve_noded_url();
     let broker = Arc::new(AtomicU8::new(BROKER_RETRYING));
     let queue_depth = Arc::new(AtomicUsize::new(0));
+    let reply_timeouts = Arc::new(AtomicU64::new(0));
     let (sender, source) = channel::sync_channel(PORT_QUEUE_CAPACITY);
     let ingress = PortIngress {
         sender,
@@ -137,6 +158,7 @@ pub(crate) fn prepare(
         decoration_style: decoration.theme.style.name(),
         broker: broker.clone(),
         queue_depth,
+        reply_timeouts: reply_timeouts.clone(),
     });
     Ok((
         PortProtocolWiring { source, context },
@@ -145,6 +167,7 @@ pub(crate) fn prepare(
             noded_url,
             ingress,
             broker,
+            reply_timeouts,
         },
     ))
 }
@@ -157,6 +180,7 @@ impl PortStarter {
         let service = self.service;
         let noded_url = self.noded_url;
         let broker = self.broker;
+        let reply_timeouts = self.reply_timeouts;
         let thread = thread::Builder::new()
             .name("cosmix-comp-port".into())
             .spawn(move || {
@@ -171,12 +195,23 @@ impl PortStarter {
                         return;
                     }
                 };
+                let connect_service = service.clone();
+                let connect_url = noded_url;
                 runtime.block_on(worker_loop(
                     service,
-                    noded_url,
                     thread_ingress,
                     broker,
+                    reply_timeouts,
                     shutdown_rx,
+                    move || {
+                        let service = connect_service.clone();
+                        let url = connect_url.clone();
+                        async move {
+                            SupervisedClient::connect_supervised(&service, &url)
+                                .await
+                                .map_err(|error| classify_connect_error(&service, error))
+                        }
+                    },
                 ));
             })
             .map_err(|error| format!("failed to spawn compositor Bus worker: {error}"))?;
@@ -294,30 +329,81 @@ where
     }
 }
 
-async fn worker_loop(
+type WorkerFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+trait WorkerClient: Send + Sync + 'static {
+    fn incoming(&self) -> Option<tokio_mpsc::UnboundedReceiver<cosmix_client::IncomingCommand>>;
+    fn state(&self) -> ConnState;
+    fn subscribe_state(&self) -> watch::Receiver<ConnState>;
+    fn respond<'a>(&'a self, reply: &'a PendingReply) -> WorkerFuture<'a, Result<(), String>>;
+    fn shutdown(&self) -> WorkerFuture<'_, ()>;
+}
+
+impl WorkerClient for SupervisedClient {
+    fn incoming(&self) -> Option<tokio_mpsc::UnboundedReceiver<cosmix_client::IncomingCommand>> {
+        SupervisedClient::incoming(self)
+    }
+
+    fn state(&self) -> ConnState {
+        SupervisedClient::state(self)
+    }
+
+    fn subscribe_state(&self) -> watch::Receiver<ConnState> {
+        SupervisedClient::subscribe_state(self)
+    }
+
+    fn respond<'a>(&'a self, reply: &'a PendingReply) -> WorkerFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            self.respond_parts(
+                &reply.from,
+                &reply.command,
+                reply.id.as_deref(),
+                reply.rc,
+                &reply.body,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+    }
+
+    fn shutdown(&self) -> WorkerFuture<'_, ()> {
+        Box::pin(SupervisedClient::shutdown(self))
+    }
+}
+
+struct PendingReply {
+    from: String,
+    command: String,
+    id: Option<String>,
+    rc: u8,
+    body: Arc<str>,
+}
+
+impl PendingReply {
+    fn new(command: cosmix_client::IncomingCommand, (rc, body): (u8, Arc<str>)) -> Self {
+        Self {
+            from: command.from,
+            command: command.command,
+            id: command.id,
+            rc,
+            body,
+        }
+    }
+}
+
+async fn worker_loop<F, Fut, C>(
     service: String,
-    noded_url: String,
     ingress: PortIngress,
     broker: Arc<AtomicU8>,
+    reply_timeouts: Arc<AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
-) {
-    let connect_service = service.clone();
-    let connect_url = noded_url.clone();
-    let outcome = connect_loop(
-        &mut shutdown,
-        &broker,
-        move || {
-            let service = connect_service.clone();
-            let url = connect_url.clone();
-            async move {
-                SupervisedClient::connect_supervised(&service, &url)
-                    .await
-                    .map_err(|error| classify_connect_error(&service, error))
-            }
-        },
-        Duration::ZERO,
-    )
-    .await;
+    connector: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<C, ConnectAttemptError>>,
+    C: WorkerClient,
+{
+    let outcome = connect_loop(&mut shutdown, &broker, connector, Duration::ZERO).await;
     let client = match outcome {
         ConnectOutcome::Connected(client) => Arc::new(client),
         ConnectOutcome::Collision(collided) => {
@@ -333,10 +419,16 @@ async fn worker_loop(
     let mut states = client.subscribe_state();
     apply_connection_state(&broker, *states.borrow());
     let mut responders = JoinSet::new();
+    let responder_permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+    let (reply_sender, reply_receiver) = tokio_mpsc::channel(PORT_REPLY_CAPACITY);
+    let reply_task = tokio::spawn(reply_loop(
+        Arc::clone(&client),
+        reply_receiver,
+        Arc::clone(&reply_timeouts),
+    ));
 
     loop {
         tokio::select! {
-            biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break;
@@ -362,7 +454,14 @@ async fn worker_loop(
                     }
                     break;
                 };
-                handle_incoming(&client, &ingress, &mut responders, command).await;
+                handle_incoming(
+                    &ingress,
+                    &mut responders,
+                    &responder_permits,
+                    &reply_sender,
+                    &reply_timeouts,
+                    command,
+                );
             }
             completed = responders.join_next(), if !responders.is_empty() => {
                 if let Some(Err(error)) = completed {
@@ -374,6 +473,9 @@ async fn worker_loop(
 
     responders.abort_all();
     while responders.join_next().await.is_some() {}
+    drop(reply_sender);
+    reply_task.abort();
+    let _ = reply_task.await;
     let _ = tokio::time::timeout(Duration::from_millis(250), client.shutdown()).await;
 }
 
@@ -398,16 +500,27 @@ fn apply_connection_state(broker: &AtomicU8, state: ConnState) {
     );
 }
 
-async fn handle_incoming(
-    client: &Arc<SupervisedClient>,
+fn handle_incoming(
     ingress: &PortIngress,
     responders: &mut JoinSet<()>,
+    responder_permits: &Arc<Semaphore>,
+    reply_sender: &tokio_mpsc::Sender<PendingReply>,
+    reply_timeouts: &Arc<AtomicU64>,
     command: cosmix_client::IncomingCommand,
 ) {
+    while let Some(completed) = responders.try_join_next() {
+        if let Err(error) = completed {
+            tracing::debug!(%error, "compositor Bus responder task stopped");
+        }
+    }
     let malformed =
         !command.body.is_empty() && serde_json::from_str::<Value>(&command.body).is_err();
     if command.command == "comp.ping" && !malformed {
-        respond(client, &command, (0, "{\"pong\":true}".to_string())).await;
+        queue_reply(
+            reply_sender,
+            reply_timeouts,
+            PendingReply::new(command, (0, Arc::from("{\"pong\":true}"))),
+        );
         return;
     }
     let needs_snapshot = matches!(
@@ -415,52 +528,94 @@ async fn handle_incoming(
         "comp.info" | "comp.props.get" | "comp.props.list" | "comp.props.describe"
     );
     if !needs_snapshot {
-        respond(client, &command, error("unknown_verb")).await;
+        queue_reply(
+            reply_sender,
+            reply_timeouts,
+            PendingReply::new(command, error("unknown_verb")),
+        );
         return;
     }
     if malformed {
-        respond(client, &command, error("unknown_path")).await;
+        queue_reply(
+            reply_sender,
+            reply_timeouts,
+            PendingReply::new(command, error("unknown_path")),
+        );
         return;
     }
-    if responders.len() >= PORT_QUEUE_CAPACITY {
-        respond(client, &command, error("busy")).await;
-        return;
-    }
-    let receive = match ingress.request_snapshot() {
-        Ok(receive) => receive,
-        Err(()) => {
-            respond(client, &command, error("busy")).await;
+    let permit = match Arc::clone(responder_permits).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            queue_reply(
+                reply_sender,
+                reply_timeouts,
+                PendingReply::new(command, error("busy")),
+            );
             return;
         }
     };
-    let depth = ingress.queue_depth.clone();
-    let client = Arc::clone(client);
+    let admission = match ingress.request_snapshot() {
+        Ok(admission) => admission,
+        Err(()) => {
+            queue_reply(
+                reply_sender,
+                reply_timeouts,
+                PendingReply::new(command, error("busy")),
+            );
+            drop(permit);
+            return;
+        }
+    };
+    let reply_sender = reply_sender.clone();
+    let reply_timeouts = Arc::clone(reply_timeouts);
     responders.spawn(async move {
-        let _depth = QueueDepthGuard(depth);
-        let reply = match tokio::time::timeout(SNAPSHOT_TIMEOUT, receive).await {
-            Ok(Ok(snapshot)) => dispatch_read(&snapshot, &command.command, &command.args),
-            Ok(Err(_)) | Err(_) => error("busy"),
+        let _permit = permit;
+        let reply = match admission.receive().await {
+            Ok(snapshot) => {
+                dispatch_read(snapshot, command.command.clone(), command.args.clone()).await
+            }
+            Err(()) => error("busy"),
         };
-        respond(&client, &command, reply).await;
+        queue_reply(
+            &reply_sender,
+            &reply_timeouts,
+            PendingReply::new(command, reply),
+        );
     });
 }
 
-async fn respond(
-    client: &SupervisedClient,
-    command: &cosmix_client::IncomingCommand,
-    (rc, body): (u8, String),
+fn queue_reply(
+    sender: &tokio_mpsc::Sender<PendingReply>,
+    reply_timeouts: &AtomicU64,
+    reply: PendingReply,
 ) {
-    if let Err(error) = client
-        .respond_parts(
-            &command.from,
-            &command.command,
-            command.id.as_deref(),
-            rc,
-            &body,
-        )
-        .await
+    if let Err(error) = sender.try_send(reply)
+        && matches!(error, tokio_mpsc::error::TrySendError::Full(_))
     {
-        tracing::debug!(%error, command = %command.command, "compositor Bus reply failed");
+        reply_timeouts.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+async fn reply_loop<C: WorkerClient>(
+    client: Arc<C>,
+    mut replies: tokio_mpsc::Receiver<PendingReply>,
+    reply_timeouts: Arc<AtomicU64>,
+) {
+    while let Some(reply) = replies.recv().await {
+        match tokio::time::timeout(REPLY_SEND_TIMEOUT, client.respond(&reply)).await {
+            Err(_) => {
+                reply_timeouts.fetch_add(1, Ordering::AcqRel);
+                tracing::debug!(
+                    command = %reply.command,
+                    timeout_ms = REPLY_SEND_TIMEOUT.as_millis(),
+                    "compositor Bus reply timed out"
+                );
+            }
+            Ok(Err(error)) => {
+                tracing::debug!(%error, command = %reply.command, "compositor Bus reply failed");
+            }
+            Ok(Ok(())) => {}
+        }
     }
 }
 
@@ -496,7 +651,117 @@ pub(crate) fn validate_service_name(name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::{collections::BTreeMap, future, sync::atomic::AtomicUsize};
+
+    struct FakeClient {
+        incoming: Mutex<Option<tokio_mpsc::UnboundedReceiver<cosmix_client::IncomingCommand>>>,
+        states: watch::Sender<ConnState>,
+        hang_replies: bool,
+    }
+
+    impl FakeClient {
+        fn new(
+            initial_state: ConnState,
+            hang_replies: bool,
+        ) -> (
+            Self,
+            tokio_mpsc::UnboundedSender<cosmix_client::IncomingCommand>,
+            watch::Sender<ConnState>,
+        ) {
+            let (commands, incoming) = tokio_mpsc::unbounded_channel();
+            let (states, _) = watch::channel(initial_state);
+            (
+                Self {
+                    incoming: Mutex::new(Some(incoming)),
+                    states: states.clone(),
+                    hang_replies,
+                },
+                commands,
+                states,
+            )
+        }
+    }
+
+    impl WorkerClient for FakeClient {
+        fn incoming(
+            &self,
+        ) -> Option<tokio_mpsc::UnboundedReceiver<cosmix_client::IncomingCommand>> {
+            self.incoming
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        }
+
+        fn state(&self) -> ConnState {
+            *self.states.borrow()
+        }
+
+        fn subscribe_state(&self) -> watch::Receiver<ConnState> {
+            self.states.subscribe()
+        }
+
+        fn respond<'a>(&'a self, _reply: &'a PendingReply) -> WorkerFuture<'a, Result<(), String>> {
+            if self.hang_replies {
+                Box::pin(future::pending())
+            } else {
+                Box::pin(future::ready(Ok(())))
+            }
+        }
+
+        fn shutdown(&self) -> WorkerFuture<'_, ()> {
+            Box::pin(future::ready(()))
+        }
+    }
+
+    fn test_ingress() -> (PortIngress, channel::Channel<PortCommand>, Arc<AtomicUsize>) {
+        let queue_depth = Arc::new(AtomicUsize::new(0));
+        let (sender, source) = channel::sync_channel(PORT_QUEUE_CAPACITY);
+        (
+            PortIngress {
+                sender,
+                queue_depth: Arc::clone(&queue_depth),
+            },
+            source,
+            queue_depth,
+        )
+    }
+
+    fn command(command: &str, id: usize) -> cosmix_client::IncomingCommand {
+        cosmix_client::IncomingCommand {
+            from: "test-caller".into(),
+            command: command.into(),
+            id: Some(id.to_string()),
+            args: Value::Null,
+            body: String::new(),
+            headers: BTreeMap::new(),
+        }
+    }
+
+    async fn wait_for_broker(broker: &AtomicU8, expected: u8) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while broker.load(Ordering::Acquire) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker publishes broker edge");
+    }
+
+    async fn next_port_command(source: &channel::Channel<PortCommand>) -> PortCommand {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match source.try_recv() {
+                    Ok(command) => return command,
+                    Err(mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        panic!("port source disconnected")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("worker admits command")
+    }
 
     #[tokio::test(start_paused = true)]
     async fn worker_refusal_stays_retrying_without_panicking() {
@@ -533,41 +798,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_state_edges_update_broker_without_polling() {
-        let broker = AtomicU8::new(BROKER_RETRYING);
-        let (states, mut receiver) = watch::channel(ConnState::Disconnected);
-        states.send_replace(ConnState::Connected);
-        receiver.changed().await.expect("watch remains open");
-        apply_connection_state(&broker, *receiver.borrow_and_update());
-        assert_eq!(broker.load(Ordering::Acquire), BROKER_CONNECTED);
-        states.send_replace(ConnState::Disconnected);
-        receiver.changed().await.expect("watch remains open");
-        apply_connection_state(&broker, *receiver.borrow_and_update());
+    async fn complete_worker_loop_tracks_state_edges_without_polling() {
+        let (ingress, _source, _) = test_ingress();
+        let broker = Arc::new(AtomicU8::new(BROKER_RETRYING));
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let (client, _commands, states) = FakeClient::new(ConnState::Connected, false);
+        let mut client = Some(client);
         assert_eq!(broker.load(Ordering::Acquire), BROKER_RETRYING);
+        let worker = tokio::spawn(worker_loop(
+            "comp-nested".into(),
+            ingress,
+            Arc::clone(&broker),
+            reply_timeouts,
+            shutdown,
+            move || future::ready(Ok(client.take().expect("one connection attempt"))),
+        ));
+
+        wait_for_broker(&broker, BROKER_CONNECTED).await;
+        states.send_replace(ConnState::Disconnected);
+        wait_for_broker(&broker, BROKER_RETRYING).await;
         states.send_replace(ConnState::Connected);
-        receiver.changed().await.expect("watch remains open");
-        apply_connection_state(&broker, *receiver.borrow_and_update());
-        assert_eq!(broker.load(Ordering::Acquire), BROKER_CONNECTED);
+        wait_for_broker(&broker, BROKER_CONNECTED).await;
+
+        shutdown_tx.send_replace(true);
+        worker.await.expect("worker exits cleanly");
     }
 
     #[tokio::test]
-    async fn worker_typed_collision_exits_once_without_renaming() {
-        let (_shutdown_tx, mut shutdown) = watch::channel(false);
-        let broker = AtomicU8::new(BROKER_CONNECTED);
-        let attempts = AtomicUsize::new(0);
-        let outcome = connect_loop(
-            &mut shutdown,
-            &broker,
-            || {
-                attempts.fetch_add(1, Ordering::Relaxed);
-                std::future::ready(Err::<(), _>(ConnectAttemptError::NameCollision(
+    async fn complete_worker_loop_terminates_on_fatal_reconnect_collision() {
+        let (ingress, _source, _) = test_ingress();
+        let broker = Arc::new(AtomicU8::new(BROKER_RETRYING));
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (client, _commands, states) = FakeClient::new(ConnState::Connected, false);
+        let mut client = Some(client);
+        let worker = tokio::spawn(worker_loop(
+            "comp-nested".into(),
+            ingress,
+            Arc::clone(&broker),
+            Arc::new(AtomicU64::new(0)),
+            shutdown,
+            move || future::ready(Ok(client.take().expect("one connection attempt"))),
+        ));
+
+        wait_for_broker(&broker, BROKER_CONNECTED).await;
+        states.send_replace(ConnState::Fatal);
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("fatal reconnect collision terminates worker")
+            .expect("worker exits cleanly");
+        assert_eq!(broker.load(Ordering::Acquire), BROKER_RETRYING);
+    }
+
+    #[tokio::test]
+    async fn complete_worker_loop_terminates_on_typed_collision_without_renaming() {
+        let (ingress, _source, _) = test_ingress();
+        let broker = Arc::new(AtomicU8::new(BROKER_CONNECTED));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_connector = Arc::clone(&attempts);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        worker_loop(
+            "comp-nested".into(),
+            ingress,
+            Arc::clone(&broker),
+            Arc::new(AtomicU64::new(0)),
+            shutdown,
+            move || {
+                attempts_for_connector.fetch_add(1, Ordering::Relaxed);
+                future::ready(Err::<FakeClient, _>(ConnectAttemptError::NameCollision(
                     "comp-nested".into(),
                 )))
             },
-            Duration::ZERO,
         )
         .await;
-        assert!(matches!(outcome, ConnectOutcome::Collision(ref name) if name == "comp-nested"));
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
         assert_eq!(broker.load(Ordering::Acquire), BROKER_RETRYING);
     }
@@ -582,17 +885,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bounded_ingress_accepts_sixteen_rejects_the_seventeenth_and_releases_depth() {
-        let queue_depth = Arc::new(AtomicUsize::new(0));
-        let (sender, source) = channel::sync_channel(PORT_QUEUE_CAPACITY);
-        let ingress = PortIngress {
-            sender,
-            queue_depth: queue_depth.clone(),
-        };
-        let mut receives = Vec::new();
+    #[tokio::test]
+    async fn bounded_ingress_releases_depth_through_production_admission_completion() {
+        let (ingress, source, queue_depth) = test_ingress();
+        let mut admissions = Vec::new();
         for _ in 0..PORT_QUEUE_CAPACITY {
-            receives.push(ingress.request_snapshot().expect("request admitted"));
+            admissions.push(ingress.request_snapshot().expect("request admitted"));
         }
         assert!(ingress.request_snapshot().is_err());
         assert_eq!(queue_depth.load(Ordering::Acquire), PORT_QUEUE_CAPACITY);
@@ -600,11 +898,82 @@ mod tests {
         for _ in 0..PORT_QUEUE_CAPACITY {
             let PortCommand::Snapshot(request) = source.try_recv().expect("staged request");
             drop(request);
-            drop(QueueDepthGuard(queue_depth.clone()));
         }
-        for receive in receives {
-            assert!(receive.blocking_recv().is_err());
+        for admission in admissions {
+            assert!(admission.receive().await.is_err());
         }
         assert_eq!(queue_depth.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn completed_responders_are_reaped_and_seventeenth_command_is_admitted() {
+        let (ingress, source, queue_depth) = test_ingress();
+        let broker = Arc::new(AtomicU8::new(BROKER_RETRYING));
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let (client, commands, _states) = FakeClient::new(ConnState::Connected, false);
+        let mut client = Some(client);
+        let worker = tokio::spawn(worker_loop(
+            "comp-nested".into(),
+            ingress,
+            Arc::clone(&broker),
+            reply_timeouts,
+            shutdown,
+            move || future::ready(Ok(client.take().expect("one connection attempt"))),
+        ));
+        wait_for_broker(&broker, BROKER_CONNECTED).await;
+
+        for id in 0..PORT_QUEUE_CAPACITY {
+            commands
+                .send(command("comp.info", id))
+                .expect("worker live");
+        }
+        for _ in 0..PORT_QUEUE_CAPACITY {
+            let PortCommand::Snapshot(request) = next_port_command(&source).await;
+            drop(request);
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while queue_depth.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("production responder completion releases all admissions");
+
+        for id in 100..164 {
+            commands
+                .send(command("comp.ping", id))
+                .expect("worker live");
+        }
+        commands
+            .send(command("comp.info", PORT_QUEUE_CAPACITY))
+            .expect("worker live");
+        let PortCommand::Snapshot(request) = next_port_command(&source).await;
+        drop(request);
+
+        shutdown_tx.send_replace(true);
+        worker.await.expect("worker exits cleanly");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reply_sender_drops_black_holed_reply_after_deadline_and_counts_it() {
+        let (client, _commands, _states) = FakeClient::new(ConnState::Connected, true);
+        let client = Arc::new(client);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let (sender, receiver) = tokio_mpsc::channel(1);
+        let task = tokio::spawn(reply_loop(client, receiver, Arc::clone(&reply_timeouts)));
+        sender
+            .send(PendingReply::new(
+                command("comp.ping", 1),
+                (0, Arc::from("{}")),
+            ))
+            .await
+            .expect("reply lane open");
+        tokio::task::yield_now().await;
+        tokio::time::advance(REPLY_SEND_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert_eq!(reply_timeouts.load(Ordering::Acquire), 1);
+        drop(sender);
+        task.await.expect("reply sender exits");
     }
 }

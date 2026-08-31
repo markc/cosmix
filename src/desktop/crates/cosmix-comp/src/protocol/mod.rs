@@ -22,6 +22,8 @@ use std::{
 
 #[cfg(test)]
 use std::sync::atomic::AtomicU8;
+#[cfg(all(test, feature = "bus"))]
+use std::sync::atomic::AtomicU64;
 
 #[cfg(test)]
 use smithay::reexports::wayland_server::backend::GlobalId;
@@ -418,6 +420,22 @@ struct LogicalOutputRect {
     y: f32,
     width: f32,
     height: f32,
+}
+
+#[cfg(feature = "bus")]
+fn exact_i32_to_f32(value: i32) -> Option<f32> {
+    let converted = value as f32;
+    (f64::from(converted) == f64::from(value)).then_some(converted)
+}
+
+#[cfg(feature = "bus")]
+fn exact_logical_output_rect(x: i32, y: i32, width: i32, height: i32) -> Option<LogicalOutputRect> {
+    Some(LogicalOutputRect {
+        x: exact_i32_to_f32(x)?,
+        y: exact_i32_to_f32(y)?,
+        width: exact_i32_to_f32(width)?,
+        height: exact_i32_to_f32(height)?,
+    })
 }
 
 impl From<(u32, u32)> for LogicalOutputRect {
@@ -2925,7 +2943,7 @@ impl ProtocolServer {
         self.state.backend.maintain_after_protocol_dispatch();
         self.state.popup_manager.cleanup();
         #[cfg(feature = "bus")]
-        self.state.service_port_requests();
+        port_snapshot::service_requests(&mut self.state);
         self.display
             .flush_clients()
             .map_err(|error| format!("Wayland client flush failed: {error}"))?;
@@ -5482,32 +5500,6 @@ fn committed_syncobj_state(
 }
 
 impl WaylandState {
-    #[cfg(feature = "bus")]
-    fn service_port_requests(&mut self) {
-        if self.pending_port_requests.is_empty() {
-            return;
-        }
-
-        let stable =
-            self.pointer_hit_test_batch_depth == 0 && !self.pointer_hit_test_transaction_applying;
-        debug_assert!(
-            stable,
-            "Bus snapshot attempted inside a protocol transaction or hit-test batch"
-        );
-        if !stable {
-            self.pending_port_requests.clear();
-            return;
-        }
-        let Some(context) = self.port_context.clone() else {
-            self.pending_port_requests.clear();
-            return;
-        };
-        let snapshot = Arc::new(port_snapshot::snapshot(self, &context));
-        for request in self.pending_port_requests.drain(..) {
-            let _ = request.reply.send(Arc::clone(&snapshot));
-        }
-    }
-
     fn session_lock_active(&self) -> bool {
         self.lock_lifecycle.is_active()
             || (matches!(self.backend, BackendData::Kms(_))
@@ -10414,31 +10406,9 @@ impl WaylandState {
         let Some(output) = self.backend.default_output() else {
             return self.logical_output_rect();
         };
-        self.usable_output_rect_for(&output)
-    }
-
-    fn usable_output_rect_for(&self, output: &Output) -> LogicalOutputRect {
-        let own_rect = output.current_mode().map_or_else(
-            || self.logical_output_rect(),
-            |mode| {
-                let size = mode
-                    .size
-                    .to_f64()
-                    .to_logical(output.current_scale().fractional_scale())
-                    .to_i32_round::<i32>();
-                let size = output.current_transform().transform_size(size);
-                let origin = output.current_location();
-                LogicalOutputRect {
-                    x: origin.x as f32,
-                    y: origin.y as f32,
-                    width: size.w.max(0) as f32,
-                    height: size.h.max(0) as f32,
-                }
-            },
-        );
-        let layer_map = layer_map_for_output(output);
+        let layer_map = layer_map_for_output(&output);
         if layer_map.layers().next().is_none() {
-            return own_rect;
+            return self.logical_output_rect();
         }
         let zone = layer_map.non_exclusive_zone();
         let origin = output.current_location();
@@ -10448,6 +10418,43 @@ impl WaylandState {
             width: zone.size.w.max(0) as f32,
             height: zone.size.h.max(0) as f32,
         }
+    }
+
+    #[cfg(feature = "bus")]
+    fn port_usable_output_rect_for(&self, output: &Output) -> Option<LogicalOutputRect> {
+        let own_rect = match output.current_mode() {
+            Some(mode) => {
+                let size = mode
+                    .size
+                    .to_f64()
+                    .to_logical(output.current_scale().fractional_scale())
+                    .to_i32_round::<i32>();
+                let size = output.current_transform().transform_size(size);
+                let origin = output.current_location();
+                exact_logical_output_rect(origin.x, origin.y, size.w.max(0), size.h.max(0))?
+            }
+            None => {
+                let (x, y, width, height) = self.backend.logical_output_rect();
+                exact_logical_output_rect(
+                    x,
+                    y,
+                    i32::try_from(width).ok()?,
+                    i32::try_from(height).ok()?,
+                )?
+            }
+        };
+        let layer_map = layer_map_for_output(output);
+        if layer_map.layers().next().is_none() {
+            return Some(own_rect);
+        }
+        let zone = layer_map.non_exclusive_zone();
+        let origin = output.current_location();
+        exact_logical_output_rect(
+            origin.x.checked_add(zone.loc.x)?,
+            origin.y.checked_add(zone.loc.y)?,
+            zone.size.w.max(0),
+            zone.size.h.max(0),
+        )
     }
 
     fn request_maximized_state(&mut self, surface: &WlSurface, maximized: bool) {
