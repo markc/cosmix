@@ -209,7 +209,7 @@ The session-lock registry also exposes a narrow exact-surface retirement helper
 for KMS output replacement; it removes only the originating protocol object and
 does not alter the accepted lock generation.
 
-The vendored session-lock implementation also carries four marked fixes:
+The vendored session-lock implementation also carries five marked fixes:
 
 - invalid `unlock_and_destroy` returns after posting `InvalidUnlock`, so a
   rejected object cannot fall through to the compositor's unlock handler;
