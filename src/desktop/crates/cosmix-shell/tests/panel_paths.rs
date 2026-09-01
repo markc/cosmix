@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use cosmix_shell::core::{
-    Carousel, CarouselError, Edge, LogicalSize, MotionError, PanelConfig, PanelInput, PanelMode,
-    PanelMotion, PanelStateMachine, PanelWake, seed_panel_thickness,
+    Carousel, CarouselError, ConcealReason, Edge, LogicalSize, MotionError, PanelConfig,
+    PanelEffect, PanelInput, PanelMode, PanelMotion, PanelStateMachine, PanelWake, RevealTrigger,
+    seed_panel_thickness,
 };
 
 fn ms(value: u64) -> Duration {
@@ -46,16 +47,87 @@ fn pointer_leave_conceals_only_after_grace() {
 }
 
 #[test]
-fn reveal_without_hover_conceals_after_fallback_grace() {
+fn generic_reveal_has_no_fallback_grace() {
     let mut panel = panel();
     panel.apply(ms(0), PanelInput::Reveal).unwrap();
-    assert_eq!(panel.snapshot().hide_at, Some(ms(800)));
-    panel.tick(ms(799)).unwrap();
-    assert_eq!(panel.snapshot().mode, PanelMode::Revealed);
-    panel.tick(ms(800)).unwrap();
-    assert_eq!(panel.snapshot().mode, PanelMode::Hidden);
+    assert_eq!(panel.snapshot().hide_at, None);
     panel.tick(ms(1_000)).unwrap();
-    assert!(!panel.snapshot().mapped);
+    assert_eq!(panel.snapshot().mode, PanelMode::Revealed);
+}
+
+#[test]
+fn corner_and_pointer_are_independent_holds_with_explicit_causes() {
+    let mut panel = panel();
+    let entered = panel.apply(ms(0), PanelInput::CornerEntered).unwrap();
+    assert_eq!(
+        entered.effect,
+        Some(PanelEffect::Reveal {
+            trigger: RevealTrigger::Corner,
+        })
+    );
+    panel.apply(ms(100), PanelInput::PointerEntered).unwrap();
+    panel.apply(ms(200), PanelInput::CornerLeft).unwrap();
+    assert_eq!(panel.snapshot().hide_at, None);
+    panel.apply(ms(300), PanelInput::PointerLeft).unwrap();
+    assert_eq!(panel.snapshot().conceal_reason, Some(ConcealReason::Grace));
+    panel.apply(ms(400), PanelInput::CornerEntered).unwrap();
+    assert_eq!(panel.snapshot().hide_at, None);
+    panel.apply(ms(500), PanelInput::PointerLeft).unwrap();
+    assert_eq!(panel.snapshot().hide_at, None);
+    panel.apply(ms(600), PanelInput::CornerLeft).unwrap();
+    assert_eq!(
+        panel.snapshot().conceal_reason,
+        Some(ConcealReason::CornerLeft)
+    );
+}
+
+#[test]
+fn pin_survives_both_leaves_and_unpin_outside_arms_grace() {
+    let mut panel = panel();
+    assert_eq!(
+        panel.apply(ms(0), PanelInput::Pin).unwrap().effect,
+        Some(PanelEffect::Pin { pinned: true })
+    );
+    panel.apply(ms(1), PanelInput::CornerLeft).unwrap();
+    panel.apply(ms(2), PanelInput::PointerLeft).unwrap();
+    panel.tick(ms(2_000)).unwrap();
+    assert_eq!(panel.snapshot().mode, PanelMode::Pinned);
+    assert_eq!(
+        panel.apply(ms(2_000), PanelInput::Unpin).unwrap().effect,
+        Some(PanelEffect::Pin { pinned: false })
+    );
+    assert_eq!(panel.snapshot().conceal_reason, Some(ConcealReason::Grace));
+}
+
+#[test]
+fn pointer_enter_after_corner_left_cancels_corner_conceal() {
+    let mut panel = panel();
+    panel.apply(ms(0), PanelInput::CornerEntered).unwrap();
+    panel.apply(ms(1), PanelInput::CornerLeft).unwrap();
+    panel.apply(ms(500), PanelInput::PointerEntered).unwrap();
+    panel.tick(ms(2_000)).unwrap();
+    assert_eq!(panel.snapshot().mode, PanelMode::Revealed);
+    assert_eq!(panel.snapshot().conceal_reason, None);
+}
+
+#[test]
+fn late_corner_or_pin_effect_supersedes_an_unpresented_expired_conceal() {
+    let mut panel = panel();
+    panel.apply(ms(0), PanelInput::CornerEntered).unwrap();
+    panel.apply(ms(1), PanelInput::CornerLeft).unwrap();
+    let entered = panel.apply(ms(1_000), PanelInput::CornerEntered).unwrap();
+    assert_eq!(
+        entered.effect,
+        Some(PanelEffect::Reveal {
+            trigger: RevealTrigger::Corner,
+        })
+    );
+    assert_eq!(entered.snapshot.mode, PanelMode::Revealed);
+
+    panel.apply(ms(1_001), PanelInput::CornerLeft).unwrap();
+    let pinned = panel.apply(ms(2_000), PanelInput::Pin).unwrap();
+    assert_eq!(pinned.effect, Some(PanelEffect::Pin { pinned: true }));
+    assert_eq!(pinned.snapshot.mode, PanelMode::Pinned);
 }
 
 #[test]

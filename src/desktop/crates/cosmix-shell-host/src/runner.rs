@@ -2,7 +2,7 @@
 
 #![deny(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use bevy::winit::WinitPlugin;
 use calloop::signals::{Signal, Signals};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, LoopHandle, RegistrationToken};
-use cosmix_shell::chrome::QuoinPanelMounts;
+use cosmix_shell::chrome::{QuoinCommittedMotionModes, QuoinPanelMounts};
 use cosmix_shell::core::{Edge, LogicalSize, OutputKey, ShellModel};
 use cosmix_shell::runtime::{
     ShellCommand, ShellCommandKind, ShellFrameState, ShellRuntimePlugin, WakePolicy,
@@ -27,17 +27,23 @@ use cosmix_shell::runtime::{
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, SurfaceData};
 use smithay_client_toolkit::delegate_layer;
 use smithay_client_toolkit::delegate_output;
+use smithay_client_toolkit::delegate_pointer;
 use smithay_client_toolkit::delegate_registry;
+use smithay_client_toolkit::delegate_seat;
 use smithay_client_toolkit::globals::GlobalData;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::registry_handlers;
+use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerHandler};
+use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::wlr_layer::{
     Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure,
 };
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_callback, wl_compositor, wl_output, wl_surface};
+use wayland_client::protocol::{
+    wl_callback, wl_compositor, wl_output, wl_pointer, wl_seat, wl_surface,
+};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
@@ -47,13 +53,15 @@ use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
 
+use crate::corner_bus::{CornerBusHandle, CornerIngress, gate_ingress, start as start_corner_bus};
+use crate::input::{PointerBridge, SurfaceTarget};
 use crate::output::{
     OutputError, OutputRuntime, OutputRuntimeMap, SelectedOutput, insert_single_output,
     select_output,
 };
 use crate::planner::{OutputGeometry, ProtocolOp, plan_surface};
 use crate::surface::{
-    FractionalObjects, FrameCallbackData, PanelSurface, SurfacePhase, SurfaceTag,
+    ApplyResult, FractionalObjects, FrameCallbackData, PanelSurface, SurfacePhase, SurfaceTag,
 };
 
 type ModelFactory = dyn Fn(OutputKey, LogicalSize) -> ShellModel + Send + Sync;
@@ -67,6 +75,23 @@ const MAX_CONSECUTIVE_PAST_DEADLINES: u8 = 64;
 enum LayerCloseDecision {
     Retire,
     Exit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommitAdvance {
+    Retain,
+    Pending,
+    Advance,
+    Repair,
+}
+
+fn commit_advance<E>(execution: Result<ApplyResult, E>, unmap: bool) -> Result<CommitAdvance, E> {
+    execution.map(|result| match result {
+        ApplyResult::Committed => CommitAdvance::Advance,
+        ApplyResult::AwaitingConfigure => CommitAdvance::Pending,
+        ApplyResult::Noop if unmap => CommitAdvance::Retain,
+        ApplyResult::Noop => CommitAdvance::Repair,
+    })
 }
 
 fn layer_close_decision(output_live: bool, replacement_pending: bool) -> LayerCloseDecision {
@@ -148,6 +173,7 @@ pub struct LayerHostConfig {
     output_name: Option<String>,
     namespace: String,
     model_factory: Arc<ModelFactory>,
+    comp_service: String,
 }
 
 impl Debug for LayerHostConfig {
@@ -156,6 +182,7 @@ impl Debug for LayerHostConfig {
             .debug_struct("LayerHostConfig")
             .field("output_name", &self.output_name)
             .field("namespace", &self.namespace)
+            .field("comp_service", &self.comp_service)
             .finish_non_exhaustive()
     }
 }
@@ -169,7 +196,13 @@ impl LayerHostConfig {
             output_name,
             namespace: "dev.cosmix.quoin".to_owned(),
             model_factory: Arc::new(model_factory),
+            comp_service: "comp".to_owned(),
         }
+    }
+
+    pub fn with_comp_service(mut self, service: impl Into<String>) -> Self {
+        self.comp_service = service.into();
+        self
     }
 }
 
@@ -231,6 +264,7 @@ struct RunnerState {
     registry_state: RegistryState,
     compositor_state: CompositorState,
     output_state: OutputState,
+    seat_state: SeatState,
     layer_shell: LayerShell,
     fractional_manager: Option<WpFractionalScaleManagerV1>,
     viewporter: Option<WpViewporter>,
@@ -248,6 +282,13 @@ struct RunnerState {
     abnormal_exit: bool,
     ready_logged: bool,
     replacement_needed: bool,
+    pointer_bridge: PointerBridge,
+    pointer_seats: Vec<wl_seat::WlSeat>,
+    active_pointer_seat: Option<wl_seat::WlSeat>,
+    active_pointer: Option<wl_pointer::WlPointer>,
+    corner_bus: Option<CornerBusHandle>,
+    corner_engaged: BTreeSet<cosmix_shell::core::Corner>,
+    corner_epoch: u64,
 }
 
 fn run_layer_host(
@@ -284,6 +325,7 @@ fn run_layer_host(
     };
     let registry_state = RegistryState::new(&globals);
     let output_state = OutputState::new(&globals, &qh);
+    let seat_state = SeatState::new(&globals, &qh);
     let fractional_manager = globals.bind(&qh, 1..=1, GlobalData).ok();
     let viewporter = globals.bind(&qh, 1..=1, GlobalData).ok();
     let mut state = RunnerState {
@@ -292,6 +334,7 @@ fn run_layer_host(
         registry_state,
         compositor_state,
         output_state,
+        seat_state,
         layer_shell,
         fractional_manager,
         viewporter,
@@ -309,6 +352,13 @@ fn run_layer_host(
         abnormal_exit: false,
         ready_logged: false,
         replacement_needed: false,
+        pointer_bridge: PointerBridge::default(),
+        pointer_seats: Vec::new(),
+        active_pointer_seat: None,
+        active_pointer: None,
+        corner_bus: None,
+        corner_engaged: BTreeSet::new(),
+        corner_epoch: 0,
     };
 
     // wl_output and xdg-output each use done boundaries. Two roundtrips make
@@ -346,6 +396,9 @@ fn run_layer_host(
     }
     state.selected_key = Some(selected_key);
     state.app.insert_resource(LayerPanelMounts(mounts));
+    state
+        .app
+        .insert_resource(QuoinCommittedMotionModes::hidden());
     state.app.finish();
     state.app.cleanup();
 
@@ -360,6 +413,45 @@ fn run_layer_host(
         Ok(event_loop) => event_loop,
         Err(error) => return state_exit(state, &format!("calloop-create-failed-{error}"), true),
     };
+    let corner_bus = start_corner_bus(
+        config.comp_service.clone(),
+        state
+            .selected_key
+            .clone()
+            .expect("selected output exists before corner ingress"),
+    );
+    let overflowed = corner_bus.overflowed.clone();
+    let corner_epoch = corner_bus.epoch.clone();
+    if let Err(error) =
+        event_loop
+            .handle()
+            .insert_source(corner_bus.channel, move |event, _, state| match event {
+                calloop::channel::Event::Msg(event) => {
+                    let (reset, event) =
+                        gate_ingress(event, &overflowed, &corner_epoch, &mut state.corner_epoch);
+                    if reset {
+                        state.apply_corner_ingress(CornerIngress::Reset {
+                            epoch: state.corner_epoch,
+                        });
+                    }
+                    if let Some(event) = event {
+                        state.apply_corner_ingress(event);
+                    }
+                }
+                calloop::channel::Event::Closed => {
+                    state.apply_corner_ingress(CornerIngress::Reset {
+                        epoch: state.corner_epoch,
+                    })
+                }
+            })
+    {
+        return state_exit(
+            state,
+            &format!("corner-channel-insert-failed-{error}"),
+            true,
+        );
+    }
+    state.corner_bus = Some(corner_bus.handle);
     if let Err(error) = WaylandSource::new(connection, event_queue).insert(event_loop.handle()) {
         return state_exit(state, &format!("wayland-source-failed-{error}"), true);
     }
@@ -466,6 +558,20 @@ fn state_setup_error(mut state: RunnerState, reason: String) -> AppExit {
 
 fn state_exit(mut state: RunnerState, reason: &str, abnormal: bool) -> AppExit {
     state.timer_token = None;
+    state.apply_corner_ingress(CornerIngress::Reset {
+        epoch: state.corner_epoch,
+    });
+    if let Some(output) = state.selected_key.clone() {
+        state.pointer_bridge.cleanup(&mut state.app, &output, None);
+    }
+    if let Some(pointer) = state.active_pointer.take() {
+        pointer.release();
+    }
+    if let Some(corner_bus) = state.corner_bus.take()
+        && !corner_bus.shutdown()
+    {
+        tracing::warn!(event = "quoin_corner_shutdown_timeout");
+    }
     for output in state.outputs.values_mut() {
         for panel in &mut output.panels {
             panel.close(&mut state.app);
@@ -581,11 +687,17 @@ impl RunnerState {
     }
 
     fn replace_selected_output(&mut self, qh: &QueueHandle<Self>) -> Result<(), LayerHostError> {
+        self.apply_corner_ingress(CornerIngress::Reset {
+            epoch: self.corner_epoch,
+        });
         let mut retired = std::mem::take(&mut self.outputs)
             .into_values()
             .next()
             .ok_or_else(|| LayerHostError::new("removed output runtime was unavailable"))?;
         let retained_mounts = PanelSurface::mounts(&retired.panels);
+        if let Some(output) = self.selected_key.clone() {
+            self.pointer_bridge.cleanup(&mut self.app, &output, None);
+        }
         for panel in &mut retired.panels {
             panel.close(&mut self.app);
         }
@@ -621,7 +733,10 @@ impl RunnerState {
             },
         )
         .map_err(|error| LayerHostError::new(output_reason(&error)))?;
-        self.selected_key = Some(selected_key);
+        self.selected_key = Some(selected_key.clone());
+        if let Some(corner_bus) = self.corner_bus.as_ref() {
+            self.corner_epoch = corner_bus.select_output(selected_key);
+        }
         self.last_wake = WakePolicy::Idle;
         self.consecutive_past_deadlines = 0;
         self.needs_update = true;
@@ -671,12 +786,17 @@ impl RunnerState {
             namespace,
         };
         let mut unmaps = Vec::new();
+        let mut committed_modes = Vec::new();
         for edge in Edge::ALL {
             let panel = &mut output.panels[edge.index()];
             let next = frame.panel(edge);
+            if panel.phase == SurfacePhase::WaitingConfigure
+                && panel.pending_committed.as_ref() == Some(next)
+            {
+                continue;
+            }
             let operations = plan_surface(panel.last_committed.as_ref(), next, geometry)
                 .map_err(|error| LayerHostError::new(error.to_string()))?;
-            panel.last_committed = Some(next.clone());
             if !panel.has_wayland_objects() && operations.contains(&ProtocolOp::CreateSurface) {
                 let (wl_surface, layer_surface, fractional) =
                     factory.create(qh, &output.wl_output, edge);
@@ -685,18 +805,50 @@ impl RunnerState {
                     .map_err(|error| LayerHostError::new(format!("raw-handle-failed-{error}")))?;
             }
             if operations.contains(&ProtocolOp::Unmap) {
+                self.pointer_bridge.cleanup(app, key, Some(panel.window));
                 panel.begin_unmap(app);
-                unmaps.push(edge);
+                unmaps.push((edge, next.clone()));
             }
-            panel.apply_protocol_ops(&operations, elapsed);
+            let advance = commit_advance::<std::convert::Infallible>(
+                Ok(panel.apply_protocol_ops(&operations, elapsed)),
+                operations.contains(&ProtocolOp::Unmap),
+            )
+            .expect("infallible Wayland request executor");
+            match advance {
+                CommitAdvance::Advance => {
+                    panel.last_committed = Some(next.clone());
+                    panel.pending_committed = None;
+                    committed_modes.push((edge, next.mode));
+                }
+                CommitAdvance::Pending => {
+                    panel.pending_committed = Some(next.clone());
+                }
+                CommitAdvance::Repair => {
+                    if panel.last_committed.as_ref() == Some(next)
+                        && !operations.contains(&ProtocolOp::Unmap)
+                    {
+                        committed_modes.push((edge, next.mode));
+                    }
+                }
+                CommitAdvance::Retain => {}
+            }
         }
         if !unmaps.is_empty() {
             // This non-pipelined update drains render extraction after raw
             // handle removal and before destroying the protocol objects.
             app.update();
-            for edge in unmaps {
+            for (edge, next) in unmaps {
                 output.panels[edge.index()].finish_unmap();
+                output.panels[edge.index()].last_committed = Some(next.clone());
+                committed_modes.push((edge, next.mode));
             }
+        }
+        if !committed_modes.is_empty() {
+            let mut modes = app.world_mut().resource_mut::<QuoinCommittedMotionModes>();
+            for (edge, mode) in committed_modes {
+                modes.set(edge, mode);
+            }
+            self.needs_update = true;
         }
         self.last_wake = frame.wake;
         if frame.wake == WakePolicy::Animate {
@@ -1054,18 +1206,27 @@ impl LayerShellHandler for RunnerState {
             .map_or(Duration::ZERO, Time::elapsed);
         let RunnerState { app, outputs, .. } = self;
         let mut configure_error = None;
+        let mut committed_mode = None;
         if let Some(panel) = outputs
             .values_mut()
             .flat_map(|output| output.panels.iter_mut())
             .find(|panel| panel.matches_layer(layer))
         {
             // SCTK acknowledged the configure before invoking this callback.
-            configure_error = panel.configure(app, qh, &configure, elapsed).err();
+            match panel.configure(app, qh, &configure, elapsed) {
+                Ok(mode) => committed_mode = mode.map(|mode| (panel.edge, mode)),
+                Err(error) => configure_error = Some(error),
+            }
         }
         if let Some(error) = configure_error {
             self.abnormal_exit = true;
             self.exit_reason = Some(format!("configure-out-of-range-{}", error.reason_suffix()));
         } else {
+            if let Some((edge, mode)) = committed_mode {
+                app.world_mut()
+                    .resource_mut::<QuoinCommittedMotionModes>()
+                    .set(edge, mode);
+            }
             self.needs_update = true;
         }
     }
@@ -1076,8 +1237,176 @@ impl ProvidesRegistryState for RunnerState {
         &mut self.registry_state
     }
 
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
+
+impl SeatHandler for RunnerState {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(
+        &mut self,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+        _seat: wl_seat::WlSeat,
+    ) {
+    }
+
+    fn new_capability(
+        &mut self,
+        _connection: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability != Capability::Pointer {
+            return;
+        }
+        if !self.pointer_seats.contains(&seat) {
+            self.pointer_seats.push(seat);
+        }
+        self.promote_pointer(qh);
+    }
+
+    fn remove_capability(
+        &mut self,
+        _connection: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer {
+            self.remove_pointer_seat(qh, &seat);
+        }
+    }
+
+    fn remove_seat(
+        &mut self,
+        _connection: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+    ) {
+        self.remove_pointer_seat(qh, &seat);
+    }
+}
+
+impl PointerHandler for RunnerState {
+    fn pointer_frame(
+        &mut self,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+        pointer: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        if events.is_empty() || self.active_pointer.as_ref() != Some(pointer) {
+            return;
+        }
+        self.needs_update = true;
+        let targets = self
+            .outputs
+            .values()
+            .flat_map(|output| output.panels.iter())
+            .filter_map(|panel| {
+                panel.wayland_surface().map(|surface| SurfaceTarget {
+                    surface,
+                    window: panel.window,
+                    edge: panel.edge,
+                })
+            })
+            .collect::<Vec<_>>();
+        let Some(output) = self.selected_key.as_ref() else {
+            return;
+        };
+        self.pointer_bridge
+            .frame(&mut self.app, output, &targets, events);
+    }
+}
+
+impl RunnerState {
+    fn apply_corner_ingress(&mut self, ingress: CornerIngress) {
+        let at = self
+            .app
+            .world()
+            .get_resource::<Time<Real>>()
+            .map_or(Duration::ZERO, Time::elapsed);
+        self.corner_epoch = self.corner_epoch.max(ingress.epoch());
+        let resets = matches!(
+            &ingress,
+            CornerIngress::Reset { .. } | CornerIngress::Disabled { .. }
+        );
+        let events = match ingress {
+            CornerIngress::Event { output, event, .. }
+                if self.selected_key.as_ref() == Some(&output) =>
+            {
+                let corner = event.corner();
+                let changed = match event {
+                    cosmix_shell::core::CornerEvent::Entered { .. } => {
+                        self.corner_engaged.insert(corner)
+                    }
+                    cosmix_shell::core::CornerEvent::Left { .. } => {
+                        self.corner_engaged.remove(&corner)
+                    }
+                };
+                changed.then_some(event).into_iter().collect::<Vec<_>>()
+            }
+            CornerIngress::Event { .. } => Vec::new(),
+            CornerIngress::Reset { .. } | CornerIngress::Disabled { .. } => self
+                .corner_engaged
+                .iter()
+                .copied()
+                .map(|corner| cosmix_shell::core::CornerEvent::Left { corner })
+                .collect::<Vec<_>>(),
+        };
+        if resets {
+            self.corner_engaged.clear();
+        }
+        let Some(output) = self.selected_key.clone() else {
+            return;
+        };
+        for event in events {
+            self.app.world_mut().write_message(ShellCommand {
+                output: output.clone(),
+                at,
+                kind: ShellCommandKind::Corner(event),
+            });
+            self.needs_update = true;
+        }
+    }
+
+    fn promote_pointer(&mut self, qh: &QueueHandle<Self>) {
+        if self.active_pointer.is_some() {
+            return;
+        }
+        for seat in self.pointer_seats.clone() {
+            if let Ok(pointer) = self.seat_state.get_pointer(qh, &seat) {
+                self.active_pointer_seat = Some(seat);
+                self.active_pointer = Some(pointer);
+                break;
+            }
+        }
+    }
+
+    fn remove_pointer_seat(&mut self, qh: &QueueHandle<Self>, seat: &wl_seat::WlSeat) {
+        self.pointer_seats.retain(|candidate| candidate != seat);
+        if self.active_pointer_seat.as_ref() != Some(seat) {
+            return;
+        }
+        if let Some(output) = self.selected_key.clone()
+            && self.pointer_bridge.cleanup(&mut self.app, &output, None)
+        {
+            self.needs_update = true;
+        }
+        if let Some(pointer) = self.active_pointer.take() {
+            pointer.release();
+        }
+        self.active_pointer_seat = None;
+        self.promote_pointer(qh);
+    }
+}
+
+delegate_seat!(RunnerState);
+delegate_pointer!(RunnerState);
 
 impl Dispatch<WpFractionalScaleManagerV1, GlobalData> for RunnerState {
     fn event(
@@ -1194,6 +1523,22 @@ mod tests {
         assert_eq!(
             layer_close_decision(false, true),
             LayerCloseDecision::Retire
+        );
+    }
+
+    #[test]
+    fn executor_failure_and_deferred_configure_cannot_advance_committed_state() {
+        assert_eq!(
+            commit_advance::<&str>(Ok(ApplyResult::AwaitingConfigure), false),
+            Ok(CommitAdvance::Pending)
+        );
+        assert_eq!(
+            commit_advance(Err("executor failed"), false),
+            Err("executor failed")
+        );
+        assert_eq!(
+            commit_advance::<&str>(Ok(ApplyResult::Noop), true),
+            Ok(CommitAdvance::Retain)
         );
     }
 

@@ -37,6 +37,7 @@ use crate::runtime::{
 pub struct QuoinPanelMounts {
     mounts: [Entity; 4],
     motion_ownership: QuoinMotionOwnership,
+    pointer_ownership: QuoinPointerOwnership,
 }
 
 /// Selects the one visual-motion owner used by chrome for every panel state.
@@ -49,6 +50,34 @@ pub enum QuoinMotionOwnership {
     ProtocolWhenUnpinned,
 }
 
+/// Selects the source of semantic pointer enter/leave commands.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum QuoinPointerOwnership {
+    /// Chrome hover messages own containment in the normal-window dev host.
+    #[default]
+    ChromeHover,
+    /// Native surface events own containment in the layer-shell host.
+    NativeSurface,
+}
+
+/// Motion modes retained by the host after successful protocol commits.
+#[derive(Resource, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuoinCommittedMotionModes([PanelMode; 4]);
+
+impl QuoinCommittedMotionModes {
+    pub const fn hidden() -> Self {
+        Self([PanelMode::Hidden; 4])
+    }
+
+    pub const fn get(&self, edge: Edge) -> PanelMode {
+        self.0[edge.index()]
+    }
+
+    pub fn set(&mut self, edge: Edge, mode: PanelMode) {
+        self.0[edge.index()] = mode;
+    }
+}
+
 impl QuoinPanelMounts {
     pub const fn new(left: Entity, bottom: Entity, right: Entity, top: Entity) -> Self {
         let mut mounts = [left; 4];
@@ -58,6 +87,7 @@ impl QuoinPanelMounts {
         Self {
             mounts,
             motion_ownership: QuoinMotionOwnership::Chrome,
+            pointer_ownership: QuoinPointerOwnership::ChromeHover,
         }
     }
 
@@ -76,6 +106,7 @@ impl QuoinPanelMounts {
         Self {
             mounts,
             motion_ownership: QuoinMotionOwnership::ProtocolWhenUnpinned,
+            pointer_ownership: QuoinPointerOwnership::NativeSurface,
         }
     }
 
@@ -85,6 +116,10 @@ impl QuoinPanelMounts {
 
     pub const fn motion_ownership(self) -> QuoinMotionOwnership {
         self.motion_ownership
+    }
+
+    pub const fn pointer_ownership(self) -> QuoinPointerOwnership {
+        self.pointer_ownership
     }
 }
 
@@ -299,6 +334,7 @@ pub struct QuoinClock;
 struct QuoinPanelChrome {
     edge: Edge,
     motion_ownership: QuoinMotionOwnership,
+    pointer_ownership: QuoinPointerOwnership,
 }
 
 #[derive(Component)]
@@ -378,6 +414,7 @@ pub fn spawn_quoin_chrome(
             mounts.get(edge),
             edge,
             mounts.motion_ownership(),
+            mounts.pointer_ownership(),
             std::mem::take(&mut panels[edge.index()]),
         );
     }
@@ -388,6 +425,7 @@ fn spawn_panel(
     mount: Entity,
     edge: Edge,
     motion_ownership: QuoinMotionOwnership,
+    pointer_ownership: QuoinPointerOwnership,
     pages: Vec<QuoinPage>,
 ) {
     let page_titles = pages
@@ -518,6 +556,7 @@ fn spawn_panel(
             QuoinPanelChrome {
                 edge,
                 motion_ownership,
+                pointer_ownership,
             },
             QuoinPanelParts {
                 pin_label,
@@ -645,6 +684,9 @@ fn panel_hover(
     mut commands: MessageWriter<ShellCommand>,
 ) {
     for (panel, hovered) in &changed {
+        if panel.pointer_ownership == QuoinPointerOwnership::NativeSurface {
+            continue;
+        }
         commands.write(ShellCommand {
             output: frame.0.geometry.output.clone(),
             at: time.elapsed(),
@@ -686,6 +728,7 @@ fn escape_panels(
 fn present_panels(
     mut commands: Commands,
     frame: Res<ShellFrameState>,
+    committed_modes: Option<Res<QuoinCommittedMotionModes>>,
     mut focus: ResMut<InputFocus>,
     mut queries: PresentPanelQueries,
 ) {
@@ -710,8 +753,16 @@ fn present_panels(
                 focus.clear();
             }
         }
-        let chrome_owns_motion = chrome.motion_ownership == QuoinMotionOwnership::Chrome
-            || panel.mode == PanelMode::Pinned;
+        let chrome_owns_motion = match chrome.motion_ownership {
+            QuoinMotionOwnership::Chrome => true,
+            QuoinMotionOwnership::ProtocolWhenUnpinned => {
+                committed_modes
+                    .as_ref()
+                    .expect("layer mounts require QuoinCommittedMotionModes")
+                    .get(chrome.edge)
+                    == PanelMode::Pinned
+            }
+        };
         let hidden = if chrome_owns_motion {
             (1.0 - panel.visible_fraction) * panel.thickness_px
         } else {
@@ -773,7 +824,25 @@ fn present_content(frame: Res<ShellFrameState>, mut clocks: Query<&mut Text, Wit
 mod tests {
     use super::*;
     use crate::core::{LogicalSize, OutputKey, PanelInput, ShellModel};
+    use bevy::camera::RenderTarget;
+    use bevy::ecs::message::Messages;
     use bevy::ecs::system::RunSystemOnce;
+    use bevy::input::ButtonState;
+    use bevy::input::mouse::{MouseButton, MouseButtonInput};
+    use bevy::picking::PickingSettings;
+    use bevy::picking::backend::HitData;
+    use bevy::picking::events::{
+        Cancel, Click, Drag, DragDrop, DragEnd, DragEnter, DragLeave, DragOver, DragStart, Enter,
+        Leave, Move, Out, Over, Pointer, PointerState, Press, Release, Scroll, pointer_events,
+    };
+    use bevy::picking::hover::{HoverMap, PreviousHoverMap};
+    use bevy::picking::input::mouse_pick_events;
+    use bevy::picking::pointer::{
+        Location, PointerId, PointerInput, PointerLocation, PointerMap, PointerPress,
+        update_pointer_map,
+    };
+    use bevy::ui_widgets::ButtonPlugin;
+    use bevy::window::{CursorMoved, WindowEvent, WindowRef};
     use std::time::Duration;
 
     fn spec(id: &str) -> QuoinPageSpec {
@@ -793,6 +862,186 @@ mod tests {
             model.set_carousel(edge, registry.carousel(edge));
         }
         ShellFrame::from_model(&model)
+    }
+
+    fn pointer_click_command(action: QuoinAction) -> ShellCommandKind {
+        let output = OutputKey::new("test").unwrap();
+        let mut model = ShellModel::new(
+            output,
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(300),
+            Duration::from_millis(180),
+        )
+        .unwrap();
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::Reveal)
+            .unwrap();
+
+        let mut app = App::new();
+        app.add_plugins((ButtonPlugin, QuoinChromePlugin))
+            .insert_resource(Time::<Real>::default())
+            .insert_resource(ButtonInput::<KeyCode>::default())
+            .insert_resource(ShellFrameState(ShellFrame::from_model(&model)))
+            .init_resource::<PickingSettings>()
+            .init_resource::<PointerState>()
+            .init_resource::<PointerMap>()
+            .init_resource::<HoverMap>()
+            .init_resource::<PreviousHoverMap>()
+            .add_message::<PointerInput>()
+            .add_message::<Pointer<Cancel>>()
+            .add_message::<Pointer<Click>>()
+            .add_message::<Pointer<Press>>()
+            .add_message::<Pointer<DragDrop>>()
+            .add_message::<Pointer<DragEnd>>()
+            .add_message::<Pointer<DragEnter>>()
+            .add_message::<Pointer<Drag>>()
+            .add_message::<Pointer<DragLeave>>()
+            .add_message::<Pointer<DragOver>>()
+            .add_message::<Pointer<DragStart>>()
+            .add_message::<Pointer<Scroll>>()
+            .add_message::<Pointer<Move>>()
+            .add_message::<Pointer<Out>>()
+            .add_message::<Pointer<Over>>()
+            .add_message::<Pointer<Leave>>()
+            .add_message::<Pointer<Enter>>()
+            .add_message::<Pointer<Release>>()
+            .add_message::<WindowEvent>()
+            .add_message::<ShellCommand>()
+            .add_message::<RequestRedraw>();
+        app.finish();
+        app.cleanup();
+        let window = app.world_mut().spawn(Window::default()).id();
+        let target = RenderTarget::Window(WindowRef::Entity(window))
+            .normalize(None)
+            .unwrap();
+        let location = Location {
+            target: target.clone(),
+            position: Vec2::new(12.0, 8.0),
+        };
+        app.world_mut().spawn((
+            PointerId::Mouse,
+            PointerLocation::new(location),
+            PointerPress::default(),
+        ));
+        app.world_mut()
+            .run_system_cached(update_pointer_map)
+            .unwrap();
+        assert!(
+            app.world()
+                .resource::<PointerMap>()
+                .get_entity(PointerId::Mouse)
+                .is_some()
+        );
+        let control = app
+            .world_mut()
+            .spawn((
+                bevy::ui_widgets::Button,
+                QuoinControl {
+                    edge: Edge::Left,
+                    action,
+                },
+            ))
+            .id();
+        let hit = HitData::new(control, 0.0, None, None);
+        app.world_mut()
+            .resource_mut::<HoverMap>()
+            .entry(PointerId::Mouse)
+            .or_default()
+            .insert(control, hit.clone());
+        app.world_mut()
+            .resource_mut::<PreviousHoverMap>()
+            .entry(PointerId::Mouse)
+            .or_default()
+            .insert(control, hit);
+
+        app.world_mut()
+            .write_message(WindowEvent::CursorMoved(CursorMoved {
+                window,
+                position: Vec2::new(12.0, 8.0),
+                delta: None,
+            }));
+        app.world_mut()
+            .write_message(WindowEvent::MouseButtonInput(MouseButtonInput {
+                button: MouseButton::Left,
+                state: ButtonState::Pressed,
+                window,
+            }));
+        app.world_mut()
+            .run_system_cached(mouse_pick_events)
+            .unwrap();
+        assert!(
+            app.world().resource::<Messages<PointerInput>>().len() >= 2,
+            "cursor and press must translate into pointer input"
+        );
+        app.world_mut()
+            .run_system_cached(PointerInput::receive)
+            .unwrap();
+        app.world_mut().run_system_cached(pointer_events).unwrap();
+        app.world_mut().flush();
+        assert!(
+            !app.world()
+                .resource::<Messages<Pointer<Press>>>()
+                .is_empty(),
+            "pointer synthesis must target the control"
+        );
+        assert!(
+            app.world().entity(control).contains::<bevy::ui::Pressed>(),
+            "press must traverse Bevy picking into the Button observer"
+        );
+        app.world_mut()
+            .write_message(WindowEvent::MouseButtonInput(MouseButtonInput {
+                button: MouseButton::Left,
+                state: ButtonState::Released,
+                window,
+            }));
+        app.world_mut()
+            .run_system_cached(mouse_pick_events)
+            .unwrap();
+        app.world_mut()
+            .run_system_cached(PointerInput::receive)
+            .unwrap();
+        app.world_mut().run_system_cached(pointer_events).unwrap();
+        app.world_mut().flush();
+        assert_eq!(app.world().resource::<Messages<Pointer<Click>>>().len(), 1);
+        app.world_mut()
+            .resource_mut::<Messages<ShellCommand>>()
+            .drain()
+            .next()
+            .expect("pointer click activates the chrome control")
+            .kind
+    }
+
+    #[test]
+    fn pointer_cursor_press_release_activates_pin_both_chevrons_and_dot() {
+        assert_eq!(
+            pointer_click_command(QuoinAction::TogglePin),
+            ShellCommandKind::Panel {
+                edge: Edge::Left,
+                input: PanelInput::Pin,
+            }
+        );
+        assert_eq!(
+            pointer_click_command(QuoinAction::Previous),
+            ShellCommandKind::Carousel {
+                edge: Edge::Left,
+                input: CarouselInput::Previous,
+            }
+        );
+        assert_eq!(
+            pointer_click_command(QuoinAction::Next),
+            ShellCommandKind::Carousel {
+                edge: Edge::Left,
+                input: CarouselInput::Next,
+            }
+        );
+        assert_eq!(
+            pointer_click_command(QuoinAction::Select("places".to_owned())),
+            ShellCommandKind::Carousel {
+                edge: Edge::Left,
+                input: CarouselInput::SelectId("places".to_owned()),
+            }
+        );
     }
 
     #[test]
@@ -883,6 +1132,7 @@ mod tests {
                 QuoinPanelChrome {
                     edge: Edge::Left,
                     motion_ownership: QuoinMotionOwnership::ProtocolWhenUnpinned,
+                    pointer_ownership: QuoinPointerOwnership::NativeSurface,
                 },
                 QuoinPanelParts {
                     pin_label,
@@ -897,6 +1147,7 @@ mod tests {
             ))
             .id();
         world.insert_resource(ShellFrameState(ShellFrame::from_model(&model)));
+        world.insert_resource(QuoinCommittedMotionModes::hidden());
         world.insert_resource(InputFocus::default());
         world.run_system_once(present_panels).unwrap();
         assert_eq!(
@@ -909,12 +1160,39 @@ mod tests {
             .unwrap();
         world.resource_mut::<ShellFrameState>().0 = ShellFrame::from_model(&model);
         world.run_system_once(present_panels).unwrap();
+        // Current pinned with committed unpinned remains protocol-owned.
+        assert_eq!(
+            world.get::<UiTransform>(chrome).unwrap().translation,
+            Val2::new(px(0), px(0))
+        );
+        world
+            .resource_mut::<QuoinCommittedMotionModes>()
+            .set(Edge::Left, PanelMode::Pinned);
+        world.run_system_once(present_panels).unwrap();
         assert_eq!(
             world.get::<UiTransform>(chrome).unwrap().translation,
             Val2::new(px(-240.0), px(0))
         );
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::Unpin)
+            .unwrap();
+        world.resource_mut::<ShellFrameState>().0 = ShellFrame::from_model(&model);
+        world.run_system_once(present_panels).unwrap();
+        // Current unpinned with committed pinned remains chrome-owned.
+        assert_eq!(
+            world.get::<UiTransform>(chrome).unwrap().translation,
+            Val2::new(px(-240.0), px(0))
+        );
+        world
+            .resource_mut::<QuoinCommittedMotionModes>()
+            .set(Edge::Left, PanelMode::Revealed);
+        world.run_system_once(present_panels).unwrap();
+        assert_eq!(
+            world.get::<UiTransform>(chrome).unwrap().translation,
+            Val2::new(px(0), px(0))
+        );
         assert_eq!(model.panel(Edge::Left).visible_fraction, 0.0);
-        assert_eq!(model.panel(Edge::Left).exclusive_zone_px, 240.0);
+        assert_eq!(model.panel(Edge::Left).exclusive_zone_px, 0.0);
     }
 
     #[test]
@@ -940,6 +1218,7 @@ mod tests {
             QuoinPanelChrome {
                 edge: Edge::Left,
                 motion_ownership: QuoinMotionOwnership::Chrome,
+                pointer_ownership: QuoinPointerOwnership::ChromeHover,
             },
             QuoinPanelParts {
                 pin_label,

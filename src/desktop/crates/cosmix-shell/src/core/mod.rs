@@ -15,8 +15,8 @@ pub use corner::{
 };
 pub use motion::{MotionError, PanelMotion};
 pub use panel::{
-    PanelConfig, PanelConfigError, PanelInput, PanelMode, PanelSnapshot, PanelStateMachine,
-    PanelTimeError, PanelUpdate, PanelWake,
+    ConcealReason, PanelConfig, PanelConfigError, PanelEffect, PanelInput, PanelMode,
+    PanelSnapshot, PanelStateMachine, PanelTimeError, PanelUpdate, PanelWake, RevealTrigger,
 };
 pub use shell::{ShellError, ShellModel};
 pub use types::{

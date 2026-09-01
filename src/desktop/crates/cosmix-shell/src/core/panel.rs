@@ -2,10 +2,9 @@
 //! `_plan/2026-08-06-cosmix-shell-corner-panels.md` §E1 and logical-pixel
 //! thickness storage from §E2.
 //!
-//! Ordinary hide and Escape are intentional no-ops while pinned. Unpinning is
-//! always explicit; if the pointer is outside when unpinned, the normal grace
-//! deadline begins at that moment. A reveal received before panel containment
-//! is observable gets the same fallback grace, preventing an orphaned panel.
+//! Ordinary hide and Escape are intentional no-ops while pinned. Corner and
+//! pointer containment are independent holds; concealment after either hold is
+//! attributed to the event which armed the grace deadline.
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -25,12 +24,35 @@ pub enum PanelMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PanelInput {
     Reveal,
+    CornerEntered,
+    CornerLeft,
     Hide,
     Escape,
     Pin,
     Unpin,
     PointerEntered,
     PointerLeft,
+}
+
+/// Why an actual reveal transition occurred.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RevealTrigger {
+    Corner,
+}
+
+/// Why a grace deadline was armed before an actual conceal transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConcealReason {
+    CornerLeft,
+    Grace,
+}
+
+/// One observable semantic transition. An update carries at most one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PanelEffect {
+    Reveal { trigger: RevealTrigger },
+    Conceal { reason: ConcealReason },
+    Pin { pinned: bool },
 }
 
 /// Per-panel timing and stored thickness.
@@ -84,7 +106,9 @@ pub struct PanelSnapshot {
     pub mapped: bool,
     pub exclusive_zone_px: f32,
     pub pointer_inside: bool,
+    pub corner_inside: bool,
     pub hide_at: Option<Duration>,
+    pub conceal_reason: Option<ConcealReason>,
 }
 
 /// Result of applying input or advancing real time.
@@ -92,6 +116,7 @@ pub struct PanelSnapshot {
 pub struct PanelUpdate {
     pub changed: bool,
     pub snapshot: PanelSnapshot,
+    pub effect: Option<PanelEffect>,
 }
 
 /// The next host wake requirement for one panel.
@@ -109,7 +134,9 @@ pub struct PanelStateMachine {
     mode: PanelMode,
     motion: PanelMotion,
     pointer_inside: bool,
+    corner_inside: bool,
     hide_at: Option<Duration>,
+    conceal_reason: Option<ConcealReason>,
     last_update: Duration,
 }
 
@@ -120,7 +147,9 @@ impl PanelStateMachine {
             mode: PanelMode::Hidden,
             motion: PanelMotion::new(config.motion_time).map_err(PanelConfigError::Motion)?,
             pointer_inside: false,
+            corner_inside: false,
             hide_at: None,
+            conceal_reason: None,
             last_update: start_at,
         })
     }
@@ -131,59 +160,92 @@ impl PanelStateMachine {
         input: PanelInput,
     ) -> Result<PanelUpdate, PanelTimeError> {
         let before = self.snapshot();
-        self.advance_to(at)?;
+        let mut effect = self.advance_to(at)?;
         match input {
             PanelInput::Reveal => {
                 if self.mode != PanelMode::Pinned {
                     self.mode = PanelMode::Revealed;
-                    if self.pointer_inside {
-                        self.hide_at = None;
-                    } else if self.hide_at.is_none() {
-                        self.hide_at = Some(at + self.config.grace);
-                    }
+                    self.clear_deadline();
                 }
                 self.motion.reveal();
+            }
+            PanelInput::CornerEntered => {
+                if self.corner_inside {
+                    return Ok(self.update_since(before, effect));
+                }
+                self.corner_inside = true;
+                self.clear_deadline();
+                if self.mode != PanelMode::Pinned {
+                    if self.mode == PanelMode::Hidden {
+                        effect = Some(PanelEffect::Reveal {
+                            trigger: RevealTrigger::Corner,
+                        });
+                    }
+                    self.mode = PanelMode::Revealed;
+                    self.motion.reveal();
+                }
+            }
+            PanelInput::CornerLeft => {
+                if !self.corner_inside {
+                    return Ok(self.update_since(before, effect));
+                }
+                self.corner_inside = false;
+                if self.mode == PanelMode::Revealed && !self.pointer_inside {
+                    self.arm_deadline(at, ConcealReason::CornerLeft);
+                }
             }
             PanelInput::Hide | PanelInput::Escape => {
                 if self.mode != PanelMode::Pinned {
                     self.mode = PanelMode::Hidden;
-                    self.hide_at = None;
+                    self.clear_deadline();
                     self.motion.conceal();
                 }
             }
             PanelInput::Pin => {
+                if self.mode != PanelMode::Pinned {
+                    effect = Some(PanelEffect::Pin { pinned: true });
+                }
                 self.mode = PanelMode::Pinned;
-                self.hide_at = None;
+                self.clear_deadline();
                 self.motion.reveal();
             }
             PanelInput::Unpin => {
                 if self.mode == PanelMode::Pinned {
                     self.mode = PanelMode::Revealed;
-                    self.hide_at = (!self.pointer_inside).then_some(at + self.config.grace);
+                    effect = effect.or(Some(PanelEffect::Pin { pinned: false }));
+                    if !self.pointer_inside && !self.corner_inside {
+                        self.arm_deadline(at, ConcealReason::Grace);
+                    }
                 }
             }
             PanelInput::PointerEntered => {
+                if self.pointer_inside {
+                    return Ok(self.update_since(before, effect));
+                }
                 self.pointer_inside = true;
-                self.hide_at = None;
+                self.clear_deadline();
                 if self.mode == PanelMode::Hidden && self.motion.visible_fraction() > 0.0 {
                     self.mode = PanelMode::Revealed;
                     self.motion.reveal();
                 }
             }
             PanelInput::PointerLeft => {
+                if !self.pointer_inside {
+                    return Ok(self.update_since(before, effect));
+                }
                 self.pointer_inside = false;
-                if self.mode == PanelMode::Revealed {
-                    self.hide_at = Some(at + self.config.grace);
+                if self.mode == PanelMode::Revealed && !self.corner_inside {
+                    self.arm_deadline(at, ConcealReason::Grace);
                 }
             }
         }
-        Ok(self.update_since(before))
+        Ok(self.update_since(before, effect))
     }
 
     pub fn tick(&mut self, at: Duration) -> Result<PanelUpdate, PanelTimeError> {
         let before = self.snapshot();
-        self.advance_to(at)?;
-        Ok(self.update_since(before))
+        let effect = self.advance_to(at)?;
+        Ok(self.update_since(before, effect))
     }
 
     pub fn snapshot(&self) -> PanelSnapshot {
@@ -201,7 +263,9 @@ impl PanelStateMachine {
                 0.0
             },
             pointer_inside: self.pointer_inside,
+            corner_inside: self.corner_inside,
             hide_at: self.hide_at,
+            conceal_reason: self.conceal_reason,
         }
     }
 
@@ -215,7 +279,7 @@ impl PanelStateMachine {
         }
     }
 
-    fn advance_to(&mut self, at: Duration) -> Result<(), PanelTimeError> {
+    fn advance_to(&mut self, at: Duration) -> Result<Option<PanelEffect>, PanelTimeError> {
         if at < self.last_update {
             return Err(PanelTimeError {
                 previous: self.last_update,
@@ -223,30 +287,47 @@ impl PanelStateMachine {
             });
         }
 
+        let mut effect = None;
         if let Some(deadline) = self.hide_at
             && deadline <= at
             && self.mode == PanelMode::Revealed
             && !self.pointer_inside
+            && !self.corner_inside
         {
             let before_deadline = deadline.saturating_sub(self.last_update);
             self.motion.advance(before_deadline);
             self.mode = PanelMode::Hidden;
+            effect = self
+                .conceal_reason
+                .map(|reason| PanelEffect::Conceal { reason });
             self.hide_at = None;
+            self.conceal_reason = None;
             self.motion.conceal();
             self.motion.advance(at.saturating_sub(deadline));
         } else {
             self.motion.advance(at.saturating_sub(self.last_update));
         }
         self.last_update = at;
-        Ok(())
+        Ok(effect)
     }
 
-    fn update_since(&self, before: PanelSnapshot) -> PanelUpdate {
+    fn update_since(&self, before: PanelSnapshot, effect: Option<PanelEffect>) -> PanelUpdate {
         let snapshot = self.snapshot();
         PanelUpdate {
             changed: snapshot != before,
             snapshot,
+            effect,
         }
+    }
+
+    fn clear_deadline(&mut self) {
+        self.hide_at = None;
+        self.conceal_reason = None;
+    }
+
+    fn arm_deadline(&mut self, at: Duration, reason: ConcealReason) {
+        self.hide_at = Some(at + self.config.grace);
+        self.conceal_reason = Some(reason);
     }
 }
 

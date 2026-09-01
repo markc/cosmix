@@ -2743,7 +2743,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "bevy",
  "cosmix-shell",
@@ -2753,7 +2753,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "accesskit",
  "bevy",
@@ -2762,15 +2762,20 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell-host"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "bevy",
  "calloop 0.13.0",
+ "cosmix-lib-client",
+ "cosmix-lib-config",
  "cosmix-shell",
  "ctk",
  "pretty_assertions",
  "raw-window-handle",
+ "serde",
+ "serde_json",
  "smithay-client-toolkit",
+ "tokio",
  "tracing",
  "wayland-backend",
  "wayland-client",

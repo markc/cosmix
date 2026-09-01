@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::core::{
-    CornerEvent, Edge, LogicalSize, OutputKey, PanelInput, PanelMode, PanelWake, ShellModel,
+    CornerEvent, Edge, LogicalSize, OutputKey, PanelEffect, PanelInput, PanelMode, PanelWake,
+    ShellModel,
 };
 
 /// Geometry reported by a renderer/window-system host.
@@ -28,6 +29,13 @@ pub enum ShellCommandKind {
     Corner(CornerEvent),
     Panel { edge: Edge, input: PanelInput },
     Carousel { edge: Edge, input: CarouselInput },
+}
+
+/// One edge-attributed semantic transition from the current model update.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShellEffect {
+    pub edge: Edge,
+    pub effect: PanelEffect,
 }
 
 /// Carousel controls shared by pointer, keyboard, and future verb adapters.

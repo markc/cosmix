@@ -55,6 +55,13 @@ pub(crate) struct FractionalObjects {
     pub viewport: Option<WpViewport>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ApplyResult {
+    Noop,
+    Committed,
+    AwaitingConfigure,
+}
+
 impl Drop for FractionalObjects {
     fn drop(&mut self) {
         if let Some(viewport) = self.viewport.take() {
@@ -332,6 +339,7 @@ pub struct PanelSurface {
     pub mount: Entity,
     pub phase: SurfacePhase,
     pub last_committed: Option<PanelPresentation>,
+    pub pending_committed: Option<PanelPresentation>,
     pub presented: bool,
     pub frame_pending: bool,
     pub frame_requested_at: Option<Duration>,
@@ -413,6 +421,7 @@ impl PanelSurface {
             mount,
             phase: SurfacePhase::Unmapped,
             last_committed: None,
+            pending_committed: None,
             presented: false,
             frame_pending: false,
             frame_requested_at: None,
@@ -468,6 +477,12 @@ impl PanelSurface {
             .is_some_and(|objects| objects.live().layer_surface().wl_surface() == surface)
     }
 
+    pub(crate) fn wayland_surface(&self) -> Option<wl_surface::WlSurface> {
+        self.wayland
+            .as_ref()
+            .map(|objects| objects.live().layer_surface().wl_surface().clone())
+    }
+
     pub(crate) fn matches_layer(&self, layer: &LayerSurface) -> bool {
         self.wayland
             .as_ref()
@@ -491,9 +506,13 @@ impl PanelSurface {
         )
     }
 
-    pub fn apply_protocol_ops(&mut self, operations: &[ProtocolOp], elapsed: Duration) {
+    pub(crate) fn apply_protocol_ops(
+        &mut self,
+        operations: &[ProtocolOp],
+        elapsed: Duration,
+    ) -> ApplyResult {
         if operations.is_empty() {
-            return;
+            return ApplyResult::Noop;
         }
         let layer_surface = self
             .wayland
@@ -501,6 +520,7 @@ impl PanelSurface {
             .expect("mapped panel has fresh Wayland objects")
             .live()
             .layer_surface();
+        let mut result = ApplyResult::Noop;
         for operation in operations {
             match *operation {
                 ProtocolOp::CreateSurface => {
@@ -532,13 +552,18 @@ impl PanelSurface {
                     self.phase = SurfacePhase::WaitingConfigure;
                     self.waiting_configure_since = Some(elapsed);
                     self.presented = false;
+                    result = ApplyResult::AwaitingConfigure;
                 }
-                ProtocolOp::Commit => layer_surface.commit(),
+                ProtocolOp::Commit => {
+                    layer_surface.commit();
+                    result = ApplyResult::Committed;
+                }
                 ProtocolOp::Unmap => {
                     // Runner performs this split operation around one Bevy drain update.
                 }
             }
         }
+        result
     }
 
     pub fn begin_unmap(&mut self, app: &mut App) {
@@ -565,6 +590,7 @@ impl PanelSurface {
             self.configured_logical_size = None;
             self.announced_scale = None;
             self.presented = false;
+            self.pending_committed = None;
             self.invalidate_frame_request();
             self.waiting_configure_since = None;
         }
@@ -576,13 +602,14 @@ impl PanelSurface {
         qh: &QueueHandle<State>,
         configure: &LayerSurfaceConfigure,
         elapsed: Duration,
-    ) -> Result<(), SurfaceSizeError>
+    ) -> Result<Option<PanelMode>, SurfaceSizeError>
     where
         State: Dispatch<WlCallback, FrameCallbackData> + 'static,
     {
         let thickness = self
-            .last_committed
+            .pending_committed
             .as_ref()
+            .or(self.last_committed.as_ref())
             .map_or(1.0, |panel| panel.thickness_px);
         let requested = requested_logical_size(self.edge, self.output_size, thickness);
         let logical = (
@@ -599,7 +626,7 @@ impl PanelSurface {
         );
         let effect = configure_effect(self.phase, self.configured_logical_size, logical);
         if effect == ConfigureEffect::Ignore {
-            return Ok(());
+            return Ok(None);
         }
         let scale = self.effective_scale();
         let physical = validate_surface_size(logical, scale)?;
@@ -652,7 +679,16 @@ impl PanelSurface {
             });
             self.announced_scale = Some(scale);
         }
-        Ok(())
+        let mode = if effect == ConfigureEffect::InitialMap {
+            self.pending_committed.take().map(|presentation| {
+                let mode = presentation.mode;
+                self.last_committed = Some(presentation);
+                mode
+            })
+        } else {
+            None
+        };
+        Ok(mode)
     }
 
     pub(crate) fn set_fractional_scale(
@@ -865,6 +901,7 @@ impl PanelSurface {
             mount,
             phase,
             last_committed: None,
+            pending_committed: None,
             presented: false,
             frame_pending: false,
             frame_requested_at: None,

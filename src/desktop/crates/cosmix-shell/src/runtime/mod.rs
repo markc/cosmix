@@ -8,8 +8,10 @@ mod bevy_runtime;
 
 pub use messages::{
     CarouselInput, HostGeometry, KeyboardInteractivity, PanelPresentation, ShellCommand,
-    ShellCommandKind, ShellContentPresentation, ShellFrame, WakePolicy,
+    ShellCommandKind, ShellContentPresentation, ShellEffect, ShellFrame, WakePolicy,
 };
 
 #[cfg(feature = "chrome")]
-pub use bevy_runtime::{ShellFrameState, ShellRuntimePlugin, ShellRuntimeSet, replace_shell_model};
+pub use bevy_runtime::{
+    ShellEffects, ShellFrameState, ShellRuntimePlugin, ShellRuntimeSet, replace_shell_model,
+};
