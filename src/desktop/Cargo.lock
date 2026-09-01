@@ -2782,6 +2782,7 @@ dependencies = [
  "wayland-protocols",
  "winit",
  "xkbcommon 0.7.0",
+ "xkbcommon-dl",
 ]
 
 [[package]]

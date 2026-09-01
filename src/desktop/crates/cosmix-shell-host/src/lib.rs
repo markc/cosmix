@@ -4,6 +4,7 @@
 
 mod corner_bus;
 pub mod input;
+mod input_keysym;
 pub mod output;
 pub mod planner;
 pub mod raw_handle;

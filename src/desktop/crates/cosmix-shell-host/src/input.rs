@@ -18,7 +18,7 @@ use bevy::prelude::{
 };
 use bevy::time::Real;
 use bevy::window::{CursorEntered, CursorLeft, CursorMoved, WindowEvent, WindowFocused};
-use bevy_winit::converters::convert_physical_key_code;
+use bevy_winit::converters::{convert_logical_key, convert_physical_key_code};
 use cosmix_shell::core::{CornerEvent, Edge, OutputKey, PanelInput};
 use cosmix_shell::runtime::{ShellCommand, ShellCommandKind, ShellRuntimeSet};
 use smithay_client_toolkit::seat::keyboard::{
@@ -192,6 +192,8 @@ impl KeyboardBridge {
         // Physical modifier keys already enter Bevy through press/release.
         // SCTK deliberately exposes only an effective six-boolean summary
         // here, not the raw XKB masks needed to reinterpret text losslessly.
+        // Stop rather than emit a repeat with stale text after any state change.
+        self.cancel_repeat();
     }
 
     pub(crate) fn update_repeat_info(&mut self, info: RepeatInfo, elapsed: Duration) {
@@ -291,128 +293,27 @@ fn map_key(raw_code: u32, keysym: Keysym, text: Option<String>) -> MappedKey {
     MappedKey {
         raw_code,
         key_code,
-        logical_key: logical_key(keysym, key_code),
+        logical_key: logical_key(keysym),
         text: text.filter(|value| !value.is_empty()),
     }
 }
 
-fn logical_key(keysym: Keysym, key_code: KeyCode) -> Key {
-    match keysym {
-        Keysym::BackSpace => Key::Backspace,
-        Keysym::Tab | Keysym::ISO_Left_Tab => Key::Tab,
-        Keysym::Return | Keysym::KP_Enter => Key::Enter,
-        Keysym::Escape => Key::Escape,
-        Keysym::Delete | Keysym::KP_Delete => Key::Delete,
-        Keysym::Insert | Keysym::KP_Insert => Key::Insert,
-        Keysym::Home | Keysym::KP_Home => Key::Home,
-        Keysym::End | Keysym::KP_End => Key::End,
-        Keysym::Page_Up | Keysym::KP_Page_Up => Key::PageUp,
-        Keysym::Page_Down | Keysym::KP_Page_Down => Key::PageDown,
-        Keysym::Left | Keysym::KP_Left => Key::ArrowLeft,
-        Keysym::Right | Keysym::KP_Right => Key::ArrowRight,
-        Keysym::Up | Keysym::KP_Up => Key::ArrowUp,
-        Keysym::Down | Keysym::KP_Down => Key::ArrowDown,
-        Keysym::Shift_L | Keysym::Shift_R => Key::Shift,
-        Keysym::Control_L | Keysym::Control_R => Key::Control,
-        Keysym::Alt_L | Keysym::Alt_R => Key::Alt,
-        Keysym::Super_L | Keysym::Super_R => Key::Super,
-        Keysym::Caps_Lock => Key::CapsLock,
-        Keysym::Num_Lock => Key::NumLock,
-        Keysym::F1 => Key::F1,
-        Keysym::F2 => Key::F2,
-        Keysym::F3 => Key::F3,
-        Keysym::F4 => Key::F4,
-        Keysym::F5 => Key::F5,
-        Keysym::F6 => Key::F6,
-        Keysym::F7 => Key::F7,
-        Keysym::F8 => Key::F8,
-        Keysym::F9 => Key::F9,
-        Keysym::F10 => Key::F10,
-        Keysym::F11 => Key::F11,
-        Keysym::F12 => Key::F12,
-        _ if (0xfe50..=0xfe6f).contains(&keysym.raw()) => {
-            let character =
-                char::from_u32(xkb::keysym_to_utf32(keysym)).filter(|value| *value != '\0');
-            Key::Dead(character)
-        }
-        _ => keysym.key_char().map_or_else(
-            || {
-                named_key_from_physical(key_code)
-                    .unwrap_or(Key::Unidentified(NativeKey::Xkb(keysym.raw())))
-            },
-            |character| Key::Character(character.to_string().into()),
-        ),
+fn logical_key(keysym: Keysym) -> Key {
+    let mapped = crate::input_keysym::keysym_to_key(keysym.raw());
+    if !matches!(mapped, winit::keyboard::Key::Unidentified(_)) {
+        return convert_logical_key(&mapped);
     }
-}
-
-fn named_key_from_physical(key_code: KeyCode) -> Option<Key> {
-    Some(match key_code {
-        KeyCode::ContextMenu => Key::ContextMenu,
-        KeyCode::Help => Key::Help,
-        KeyCode::PrintScreen => Key::PrintScreen,
-        KeyCode::ScrollLock => Key::ScrollLock,
-        KeyCode::Pause => Key::Pause,
-        KeyCode::BrowserBack => Key::BrowserBack,
-        KeyCode::BrowserFavorites => Key::BrowserFavorites,
-        KeyCode::BrowserForward => Key::BrowserForward,
-        KeyCode::BrowserHome => Key::BrowserHome,
-        KeyCode::BrowserRefresh => Key::BrowserRefresh,
-        KeyCode::BrowserSearch => Key::BrowserSearch,
-        KeyCode::BrowserStop => Key::BrowserStop,
-        KeyCode::Eject => Key::Eject,
-        KeyCode::LaunchApp1 => Key::LaunchApplication1,
-        KeyCode::LaunchApp2 => Key::LaunchApplication2,
-        KeyCode::LaunchMail => Key::LaunchMail,
-        KeyCode::MediaPlayPause => Key::MediaPlayPause,
-        KeyCode::MediaSelect => Key::LaunchMediaPlayer,
-        KeyCode::MediaStop => Key::MediaStop,
-        KeyCode::MediaTrackNext => Key::MediaTrackNext,
-        KeyCode::MediaTrackPrevious => Key::MediaTrackPrevious,
-        KeyCode::Power => Key::Power,
-        KeyCode::Sleep => Key::Standby,
-        KeyCode::AudioVolumeDown => Key::AudioVolumeDown,
-        KeyCode::AudioVolumeMute => Key::AudioVolumeMute,
-        KeyCode::AudioVolumeUp => Key::AudioVolumeUp,
-        KeyCode::WakeUp => Key::WakeUp,
-        KeyCode::Again => Key::Again,
-        KeyCode::Copy => Key::Copy,
-        KeyCode::Cut => Key::Cut,
-        KeyCode::Find => Key::Find,
-        KeyCode::Open => Key::Open,
-        KeyCode::Paste => Key::Paste,
-        KeyCode::Props => Key::Props,
-        KeyCode::Select => Key::Select,
-        KeyCode::Undo => Key::Undo,
-        KeyCode::Convert => Key::Convert,
-        KeyCode::KanaMode => Key::KanaMode,
-        KeyCode::NonConvert => Key::NonConvert,
-        KeyCode::Hiragana => Key::Hiragana,
-        KeyCode::Katakana => Key::Katakana,
-        KeyCode::F13 => Key::F13,
-        KeyCode::F14 => Key::F14,
-        KeyCode::F15 => Key::F15,
-        KeyCode::F16 => Key::F16,
-        KeyCode::F17 => Key::F17,
-        KeyCode::F18 => Key::F18,
-        KeyCode::F19 => Key::F19,
-        KeyCode::F20 => Key::F20,
-        KeyCode::F21 => Key::F21,
-        KeyCode::F22 => Key::F22,
-        KeyCode::F23 => Key::F23,
-        KeyCode::F24 => Key::F24,
-        KeyCode::F25 => Key::F25,
-        KeyCode::F26 => Key::F26,
-        KeyCode::F27 => Key::F27,
-        KeyCode::F28 => Key::F28,
-        KeyCode::F29 => Key::F29,
-        KeyCode::F30 => Key::F30,
-        KeyCode::F31 => Key::F31,
-        KeyCode::F32 => Key::F32,
-        KeyCode::F33 => Key::F33,
-        KeyCode::F34 => Key::F34,
-        KeyCode::F35 => Key::F35,
-        _ => return None,
-    })
+    if matches!(
+        keysym.raw(),
+        0xfe50..=0xfe6f | 0xfe80..=0xfe8c | 0xfe90..=0xfe93
+    ) {
+        let character = char::from_u32(xkb::keysym_to_utf32(keysym)).filter(|value| *value != '\0');
+        return Key::Dead(character);
+    }
+    keysym.key_char().map_or_else(
+        || Key::Unidentified(NativeKey::Xkb(keysym.raw())),
+        |character| Key::Character(character.to_string().into()),
+    )
 }
 
 fn set_window_focused(app: &mut App, window: Entity, focused: bool) {
@@ -1537,6 +1438,8 @@ mod tests {
         assert_eq!(bridge.repeat_deadline(), Some(Duration::from_millis(1_200)));
         assert!(!bridge.fire_repeat(&mut app, Duration::from_millis(1_199)));
         assert!(bridge.fire_repeat(&mut app, Duration::from_millis(1_200)));
+        bridge.update_modifiers(Modifiers::default(), 0);
+        assert_eq!(bridge.repeat_deadline(), None);
 
         let events = app
             .world_mut()
@@ -1622,14 +1525,13 @@ mod tests {
     #[test]
     fn named_and_dead_keys_do_not_collapse_to_unidentified() {
         assert_eq!(
-            logical_key(Keysym::XF86_AudioRaiseVolume, KeyCode::AudioVolumeUp),
+            logical_key(Keysym::XF86_AudioRaiseVolume),
             Key::AudioVolumeUp
         );
-        assert!(matches!(
-            logical_key(Keysym::dead_acute, KeyCode::Quote),
-            Key::Dead(_)
-        ));
-        assert_eq!(logical_key(Keysym::F35, KeyCode::F35), Key::F35);
+        assert!(matches!(logical_key(Keysym::dead_lowline), Key::Dead(_)));
+        assert_eq!(logical_key(Keysym::F35), Key::F35);
+        assert_eq!(logical_key(Keysym::space), Key::Space);
+        assert_eq!(logical_key(Keysym::XF86_AudioPlay), Key::MediaPlay);
     }
 
     #[test]
