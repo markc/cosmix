@@ -71,16 +71,16 @@ unmapped. Callbacks are generation-tagged, so late or expired callbacks are
 ignored (the tag is a saturating 64-bit counter: reuse would need 2^64
 requests, which no process lifetime reaches).
 
-Two bounded one-shot liveness backstops share that single timer. While any
-frame callback is outstanding, its deadline is derived from the oldest
-request: one second after that request, rounded up to a 250 ms boundary. It
-releases only callbacks that are at least one second old and requests one
-coalesced update. The deadline persists across `Idle` and `WakeAt` until every
-outstanding request is answered or expired; quantisation lets consecutive
-frames retain the same timer source. A bufferless map also arms a ten-second
-configure deadline; expiry exits with a distinct abnormal reason. These are
-not ticks: no backstop remains armed when no request is in flight, and timely
-compositor replies replace or remove the deadline before it can fire.
+Two bounded one-shot liveness backstops share that single timer. The frame
+backstop participates only while the policy is `Animate` and a frame callback
+is outstanding. Its deadline is derived from the oldest request: one second
+after that request, rounded up to a 250 ms boundary. It releases only callbacks
+that are at least one second old and requests one coalesced update;
+quantisation lets consecutive animated frames retain the same timer source.
+A bufferless map independently arms a ten-second configure deadline; expiry
+exits with a distinct abnormal reason. These are not ticks: no backstop remains
+armed when its qualifying work is absent, and timely compositor replies
+replace or remove the deadline before it can fire.
 
 ## Exit status and reasons
 

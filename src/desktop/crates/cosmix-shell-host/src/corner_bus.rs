@@ -726,6 +726,8 @@ impl IncomingLane {
                     .state
                     .lock()
                     .expect("incoming lane lock is not poisoned");
+                // TODO(slice-2.1): generation-tag lane entries so overflow cannot race
+                // refresh installation and admit one pre-refresh entered event.
                 if state.overflowed {
                     state.overflowed = false;
                     return IncomingObservation::Overflow;
