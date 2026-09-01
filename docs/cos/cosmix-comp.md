@@ -121,8 +121,10 @@ cumulative process-wide counter as `port.lost_count`, not a per-interval tally.
 Consecutive intervals coalesce while pending, bounding gap traffic to at most
 one gap per topic per published record plus the idle flush. A rejected or
 timed-out publication discards its uncertain backlog and recovers under the
-same ordering rule with `cause:"publisher.loss"`. After either gap, read a
-fresh property tree.
+same ordering rule with `cause:"publisher.loss"`. A failed pending gap retries
+immediately on broker connection-state edges and on a single one-shot backoff
+timer (1 second, doubling to a 30-second cap); that timer exists only while the
+gap remains pending. After either gap, read a fresh property tree.
 
 Hot-corner detection is compositor-side and uses the current logical output.
 It emits one `entered`, then one `left` on deadzone exit, output or geometry

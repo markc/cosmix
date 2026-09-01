@@ -41,6 +41,8 @@ const PORT_REPLY_CAPACITY: usize = 16;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 const REPLY_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(2);
+const GAP_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const GAP_RETRY_MAX: Duration = Duration::from_secs(30);
 const PORT_SHUTDOWN_GRACE: Duration = Duration::from_millis(300);
 const CLIENT_SHUTDOWN_BUDGET: Duration = Duration::from_millis(250);
 const DEREGISTER_BUDGET: Duration = Duration::from_millis(200);
@@ -745,7 +747,7 @@ async fn worker_loop<F, Fut, C>(
         Arc::clone(&client),
         Arc::from(service.as_str()),
         observations,
-        observation_notifier,
+        Arc::clone(&observation_notifier),
         Arc::clone(&lost_count),
         Arc::clone(&publish_timeouts),
         shutdown.clone(),
@@ -764,6 +766,7 @@ async fn worker_loop<F, Fut, C>(
                 }
                 let state = *states.borrow_and_update();
                 apply_connection_state(&broker, state);
+                observation_notifier.notify_one();
                 if state == ConnState::Fatal {
                     tracing::error!(service = %service, "Bus registration rejected during reconnect; compositor continues without a port");
                     break;
@@ -801,6 +804,8 @@ async fn worker_loop<F, Fut, C>(
     drop(reply_sender);
     reply_task.abort();
     let _ = reply_task.await;
+    // Port shutdown is deliberately bounded: once requested, a retained gap
+    // may be abandoned rather than extending compositor teardown indefinitely.
     publisher_task.abort();
     let _ = publisher_task.await;
     graceful_client_shutdown(client.as_ref()).await;
@@ -1221,14 +1226,25 @@ async fn publisher_loop<C: WorkerClient>(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut pending_gap: Option<LossInterval> = None;
-    let mut defer_gap_retry_until_data = false;
+    let mut gap_retry_delay = None;
+    let mut retry_gap_without_data = false;
+    let mut connection_states = client.subscribe_state();
     loop {
         let mut lane_empty = false;
         let mut disconnected = false;
+        let mut gap_failed_this_pass = false;
+        let mut saw_record = false;
+        let connection_edge = connection_states.has_changed().unwrap_or(false);
+        if connection_edge {
+            connection_states.borrow_and_update();
+        }
 
         for _ in 0..observations.capacity {
             let carried = match observations.records.try_recv() {
-                Ok(record) => record,
+                Ok(record) => {
+                    saw_record = true;
+                    record
+                }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     lane_empty = true;
                     break;
@@ -1240,30 +1256,32 @@ async fn publisher_loop<C: WorkerClient>(
                 }
             };
 
-            defer_gap_retry_until_data = false;
             if let Some(loss) = carried.preceding_loss {
                 merge_pending_gap(&mut pending_gap, loss);
             }
             let record = carried.record;
             let topic_suffix = record.topic_suffix();
-            if publish_pending_gap_for_topic(
+            let gap_result = publish_pending_gap_for_topic(
                 client.as_ref(),
                 &service,
                 &lost_count,
                 &mut pending_gap,
                 topic_suffix,
             )
-            .await
-            .is_err()
-            {
+            .await;
+            if gap_result.is_err() {
                 publish_timeouts.fetch_add(1, Ordering::AcqRel);
                 let (discarded, loss) = discard_publication_backlog(Some(record), &observations);
                 lost_count.fetch_add(discarded, Ordering::AcqRel);
                 if let Some(loss) = loss {
                     merge_pending_gap(&mut pending_gap, loss);
                 }
-                defer_gap_retry_until_data = true;
+                arm_gap_retry(&mut gap_retry_delay);
+                gap_failed_this_pass = true;
                 break;
+            }
+            if pending_gap.is_none() {
+                gap_retry_delay = None;
             }
 
             let topic = port_observation::topic_name(&service, topic_suffix);
@@ -1281,14 +1299,16 @@ async fn publisher_loop<C: WorkerClient>(
             if let Some(loss) = loss {
                 merge_pending_gap(&mut pending_gap, loss);
             }
-            defer_gap_retry_until_data = true;
+            arm_gap_retry(&mut gap_retry_delay);
+            gap_failed_this_pass = true;
             break;
         }
 
         lane_empty |= observations.records.is_empty();
         if lane_empty
             && pending_gap.is_some()
-            && !defer_gap_retry_until_data
+            && !gap_failed_this_pass
+            && (saw_record || connection_edge || retry_gap_without_data)
             && publish_pending_gap(client.as_ref(), &service, &lost_count, &mut pending_gap)
                 .await
                 .is_err()
@@ -1299,27 +1319,76 @@ async fn publisher_loop<C: WorkerClient>(
             if let Some(loss) = loss {
                 merge_pending_gap(&mut pending_gap, loss);
             }
-            defer_gap_retry_until_data = true;
+            arm_gap_retry(&mut gap_retry_delay);
+        }
+        if pending_gap.is_none() {
+            gap_retry_delay = None;
         }
 
         if disconnected {
+            assert!(
+                *shutdown.borrow(),
+                "observation producer disconnected before port shutdown"
+            );
+            // WaylandRuntime signals port shutdown before its protocol state
+            // drops the sole producer. A pending gap may remain only here,
+            // under the accepted bounded-shutdown posture above.
             break;
         }
-        if !wait_for_observation(&observation_notifier, &mut shutdown).await {
-            break;
-        }
+        retry_gap_without_data =
+            match wait_for_publisher_wake(&observation_notifier, &mut shutdown, gap_retry_delay)
+                .await
+            {
+                PublisherWake::Notified => false,
+                PublisherWake::RetryTimer => true,
+                PublisherWake::Shutdown => break,
+            };
     }
 }
 
-async fn wait_for_observation(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublisherWake {
+    Notified,
+    RetryTimer,
+    Shutdown,
+}
+
+fn arm_gap_retry(delay: &mut Option<Duration>) {
+    *delay = Some(
+        delay
+            .map(|current| current.saturating_mul(2).min(GAP_RETRY_MAX))
+            .unwrap_or(GAP_RETRY_INITIAL),
+    );
+}
+
+async fn wait_for_publisher_wake(
     notifier: &tokio::sync::Notify,
     shutdown: &mut watch::Receiver<bool>,
-) -> bool {
-    tokio::select! {
-        changed = shutdown.changed() => {
-            changed.is_ok() && !*shutdown.borrow()
+    retry_delay: Option<Duration>,
+) -> PublisherWake {
+    if let Some(delay) = retry_delay {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_ok() && !*shutdown.borrow() {
+                    PublisherWake::Notified
+                } else {
+                    PublisherWake::Shutdown
+                }
+            }
+            _ = notifier.notified() => PublisherWake::Notified,
+            _ = tokio::time::sleep(delay) => PublisherWake::RetryTimer,
         }
-        _ = notifier.notified() => true,
+    } else {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_ok() && !*shutdown.borrow() {
+                    PublisherWake::Notified
+                } else {
+                    PublisherWake::Shutdown
+                }
+            }
+            _ = notifier.notified() => PublisherWake::Notified,
+        }
     }
 }
 
@@ -2332,41 +2401,222 @@ mod tests {
         assert_eq!(lost.load(Ordering::Acquire), 3);
     }
 
-    #[tokio::test]
-    async fn disconnected_record_lane_exits_after_a_failed_gap_without_spinning() {
+    #[tokio::test(start_paused = true)]
+    async fn failed_idle_gap_retries_on_broker_reconnect_without_a_new_record() {
         let lost = Arc::new(AtomicU64::new(0));
         let (mut producer, receiver) = port_observation::test_outbox(Arc::clone(&lost), 1);
         let notifier = producer.notifier();
-        for event_seq in 1..=2 {
-            producer.offer(ObservationRecord::FocusChanged {
-                keyboard: Some(event_seq),
-                previous: None,
-                exclusive_latch: None,
-                event_seq,
-            });
-        }
-        drop(producer);
+        producer.offer(ObservationRecord::PropsChanged {
+            path: "input.corners.enabled".into(),
+            old: PropValue::Bool(true),
+            new: PropValue::Bool(false),
+            unix_ms: 0,
+            cause: "props.set",
+            event_seq: 1,
+        });
+        producer.offer(ObservationRecord::FocusChanged {
+            keyboard: Some(2),
+            previous: None,
+            exclusive_latch: None,
+            event_seq: 2,
+        });
+        notifier.notified().await;
+
+        let (ingress, _source, _) = test_ingress();
+        let broker = Arc::new(AtomicU8::new(BROKER_RETRYING));
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let publish_timeouts = Arc::new(AtomicU64::new(0));
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let (client, _commands, states) = FakeClient::new(ConnState::Connected, false);
+        client.reject_publish_attempt.store(2, Ordering::Release);
+        let publish_mode = Arc::clone(&client.publish_mode);
+        let publications = Arc::clone(&client.publications);
+        let mut client = Some(client);
+        let worker = tokio::spawn(worker_loop(
+            "comp-nested".into(),
+            ingress,
+            Arc::clone(&broker),
+            reply_timeouts,
+            Arc::clone(&publish_timeouts),
+            receiver,
+            notifier,
+            Arc::clone(&lost),
+            shutdown,
+            move || future::ready(Ok(client.take().expect("one connection attempt"))),
+        ));
+
+        wait_for_broker(&broker, BROKER_CONNECTED).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while publish_timeouts.load(Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the idle-flush props gap fails once");
+        assert_eq!(
+            publications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "only the focus survivor publishes before broker recovery"
+        );
+
+        publish_mode.store(1, Ordering::Release);
+        states.send_replace(ConnState::Disconnected);
+        wait_for_broker(&broker, BROKER_RETRYING).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while publish_timeouts.load(Ordering::Acquire) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the disconnected edge wakes the retained gap retry");
+
+        publish_mode.store(0, Ordering::Release);
+        states.send_replace(ConnState::Connected);
+        wait_for_broker(&broker, BROKER_CONNECTED).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while publications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+                != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the reconnect edge publishes the retained gap without new data");
+
+        shutdown_tx.send_replace(true);
+        worker.await.expect("worker exits cleanly");
+        let published = publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let survivor = cosmix_bus::bus::parse(&published[0].1).expect("survivor parses");
+        assert_eq!(survivor.get("event_seq"), Some("2"));
+        let gap = cosmix_bus::bus::parse(&published[1].1).expect("gap parses");
+        assert_eq!(gap.get("command"), Some("props.changed"));
+        assert_eq!(gap.get("event_seq"), Some("1"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&gap.body).unwrap(),
+            json!({"gap": true, "lost_count": 1, "cause": "outbox.overflow"})
+        );
+        assert_eq!(lost.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_gap_after_event_sequence_exhaustion_retries_on_backoff_without_data() {
+        let lost = Arc::new(AtomicU64::new(0));
+        let (mut producer, receiver) = port_observation::test_outbox(Arc::clone(&lost), 1);
+        let notifier = producer.notifier();
+        producer.offer(ObservationRecord::PropsChanged {
+            path: "input.corners.enabled".into(),
+            old: PropValue::Bool(true),
+            new: PropValue::Bool(false),
+            unix_ms: 0,
+            cause: "props.set",
+            event_seq: u64::MAX - 1,
+        });
+        producer.offer(ObservationRecord::FocusChanged {
+            keyboard: None,
+            previous: Some(1),
+            exclusive_latch: None,
+            event_seq: u64::MAX,
+        });
+        notifier.notified().await;
 
         let (client, _commands, _states) = FakeClient::new(ConnState::Connected, false);
-        client.reject_publish_attempt.store(1, Ordering::Release);
+        client.reject_publish_attempt.store(2, Ordering::Release);
+        let publish_attempts = Arc::clone(&client.publish_attempts);
+        let publications = Arc::clone(&client.publications);
         let publish_timeouts = Arc::new(AtomicU64::new(0));
-        let (_shutdown_tx, shutdown) = watch::channel(false);
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            publisher_loop(
-                Arc::new(client),
-                Arc::from("comp-nested"),
-                receiver,
-                notifier,
-                Arc::clone(&lost),
-                Arc::clone(&publish_timeouts),
-                shutdown,
-            ),
-        )
-        .await
-        .expect("disconnected publisher exits after the failed final gap");
-        assert_eq!(lost.load(Ordering::Acquire), 2);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let task = tokio::spawn(publisher_loop(
+            Arc::new(client),
+            Arc::from("comp-nested"),
+            receiver,
+            notifier,
+            Arc::clone(&lost),
+            Arc::clone(&publish_timeouts),
+            shutdown,
+        ));
+        while publish_timeouts.load(Ordering::Acquire) != 1 {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(publish_attempts.load(Ordering::Acquire), 2);
+        assert_eq!(
+            publications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1
+        );
+
+        tokio::time::advance(Duration::from_millis(999)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            publish_attempts.load(Ordering::Acquire),
+            2,
+            "the failed gap waits for its one-second first backoff"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        while publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+            != 2
+        {
+            tokio::task::yield_now().await;
+        }
+
+        shutdown_tx.send_replace(true);
+        task.await.expect("publisher exits");
+        let published = publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let exhausted_sequence = u64::MAX.to_string();
+        let last_lost_sequence = (u64::MAX - 1).to_string();
+        let survivor = cosmix_bus::bus::parse(&published[0].1).expect("survivor parses");
+        assert_eq!(survivor.get("event_seq"), Some(exhausted_sequence.as_str()));
+        let gap = cosmix_bus::bus::parse(&published[1].1).expect("gap parses");
+        assert_eq!(gap.get("command"), Some("props.changed"));
+        assert_eq!(gap.get("event_seq"), Some(last_lost_sequence.as_str()));
+        assert_eq!(publish_attempts.load(Ordering::Acquire), 3);
         assert_eq!(publish_timeouts.load(Ordering::Acquire), 1);
+        assert_eq!(lost.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "observation producer disconnected before port shutdown")]
+    async fn observation_lane_disconnect_without_shutdown_violates_lifecycle() {
+        let lost = Arc::new(AtomicU64::new(0));
+        let (producer, receiver) = port_observation::outbox(Arc::clone(&lost));
+        let notifier = producer.notifier();
+        drop(producer);
+        let (client, _commands, _states) = FakeClient::new(ConnState::Connected, false);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        publisher_loop(
+            Arc::new(client),
+            Arc::from("comp-nested"),
+            receiver,
+            notifier,
+            lost,
+            Arc::new(AtomicU64::new(0)),
+            shutdown,
+        )
+        .await;
+    }
+
+    #[test]
+    fn failed_gap_retry_backoff_doubles_and_caps_at_thirty_seconds() {
+        let mut delay = None;
+        for expected in [1, 2, 4, 8, 16, 30, 30] {
+            arm_gap_retry(&mut delay);
+            assert_eq!(delay, Some(Duration::from_secs(expected)));
+        }
     }
 
     #[tokio::test]
@@ -2472,11 +2722,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn idle_publisher_wakes_from_offer_without_a_timer_tick() {
+    async fn idle_publisher_has_no_retry_timer_when_nothing_is_pending() {
         let lost = Arc::new(AtomicU64::new(0));
         let (mut producer, receiver) = port_observation::outbox(Arc::clone(&lost));
         let notifier = producer.notifier();
         let (client, _commands, _states) = FakeClient::new(ConnState::Connected, false);
+        let publish_attempts = Arc::clone(&client.publish_attempts);
         let publications = Arc::clone(&client.publications);
         let (shutdown_tx, shutdown) = watch::channel(false);
         let task = tokio::spawn(publisher_loop(
@@ -2491,6 +2742,7 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(3_600)).await;
         tokio::task::yield_now().await;
+        assert_eq!(publish_attempts.load(Ordering::Acquire), 0);
         assert!(
             publications
                 .lock()
@@ -2499,6 +2751,11 @@ mod tests {
         );
         tokio::time::advance(Duration::from_secs(3_600)).await;
         tokio::task::yield_now().await;
+        assert_eq!(
+            publish_attempts.load(Ordering::Acquire),
+            0,
+            "idle publisher performs no timer-driven publication attempt"
+        );
         assert!(
             publications
                 .lock()
