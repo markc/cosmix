@@ -1227,6 +1227,9 @@ async fn publisher_loop<C: WorkerClient>(
 ) {
     let mut pending_gap: Option<LossInterval> = None;
     let mut gap_retry_delay = None;
+    // The armed deadline outlives a wake that attempts nothing: `sleep_until`
+    // it, so elapsed backoff is never discarded by a stale Notify permit.
+    let mut gap_retry_deadline: Option<tokio::time::Instant> = None;
     let mut retry_gap_without_data = false;
     let mut connection_states = client.subscribe_state();
     loop {
@@ -1277,11 +1280,14 @@ async fn publisher_loop<C: WorkerClient>(
                     merge_pending_gap(&mut pending_gap, loss);
                 }
                 arm_gap_retry(&mut gap_retry_delay);
+                gap_retry_deadline =
+                    gap_retry_delay.map(|delay| tokio::time::Instant::now() + delay);
                 gap_failed_this_pass = true;
                 break;
             }
             if pending_gap.is_none() {
                 gap_retry_delay = None;
+                gap_retry_deadline = None;
             }
 
             let topic = port_observation::topic_name(&service, topic_suffix);
@@ -1300,6 +1306,7 @@ async fn publisher_loop<C: WorkerClient>(
                 merge_pending_gap(&mut pending_gap, loss);
             }
             arm_gap_retry(&mut gap_retry_delay);
+            gap_retry_deadline = gap_retry_delay.map(|delay| tokio::time::Instant::now() + delay);
             gap_failed_this_pass = true;
             break;
         }
@@ -1320,12 +1327,22 @@ async fn publisher_loop<C: WorkerClient>(
                 merge_pending_gap(&mut pending_gap, loss);
             }
             arm_gap_retry(&mut gap_retry_delay);
+            gap_retry_deadline = gap_retry_delay.map(|delay| tokio::time::Instant::now() + delay);
         }
         if pending_gap.is_none() {
             gap_retry_delay = None;
+            gap_retry_deadline = None;
         }
 
         if disconnected {
+            if !*shutdown.borrow() {
+                // Fail fast, but say so where an operator can see it: a
+                // silent task death here would leave the worker running while
+                // publication stops and the lane overflows.
+                tracing::error!(
+                    "observation producer disconnected before port shutdown; publisher task aborting"
+                );
+            }
             assert!(
                 *shutdown.borrow(),
                 "observation producer disconnected before port shutdown"
@@ -1336,7 +1353,7 @@ async fn publisher_loop<C: WorkerClient>(
             break;
         }
         retry_gap_without_data =
-            match wait_for_publisher_wake(&observation_notifier, &mut shutdown, gap_retry_delay)
+            match wait_for_publisher_wake(&observation_notifier, &mut shutdown, gap_retry_deadline)
                 .await
             {
                 PublisherWake::Notified => false,
@@ -1364,9 +1381,9 @@ fn arm_gap_retry(delay: &mut Option<Duration>) {
 async fn wait_for_publisher_wake(
     notifier: &tokio::sync::Notify,
     shutdown: &mut watch::Receiver<bool>,
-    retry_delay: Option<Duration>,
+    retry_deadline: Option<tokio::time::Instant>,
 ) -> PublisherWake {
-    if let Some(delay) = retry_delay {
+    if let Some(deadline) = retry_deadline {
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_ok() && !*shutdown.borrow() {
@@ -1376,7 +1393,7 @@ async fn wait_for_publisher_wake(
                 }
             }
             _ = notifier.notified() => PublisherWake::Notified,
-            _ = tokio::time::sleep(delay) => PublisherWake::RetryTimer,
+            _ = tokio::time::sleep_until(deadline) => PublisherWake::RetryTimer,
         }
     } else {
         tokio::select! {
