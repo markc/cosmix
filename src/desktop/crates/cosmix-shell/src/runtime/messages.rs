@@ -14,7 +14,7 @@ pub struct HostGeometry {
 }
 
 /// Renderer-neutral control ingress.
-#[cfg_attr(feature = "chrome", derive(bevy::prelude::Message))]
+#[cfg_attr(feature = "chrome-core", derive(bevy::prelude::Message))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShellCommand {
     pub output: OutputKey,

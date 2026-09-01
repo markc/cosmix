@@ -10,7 +10,7 @@ pub mod core;
 pub mod host;
 pub mod runtime;
 
-#[cfg(feature = "chrome")]
+#[cfg(feature = "chrome-core")]
 pub mod chrome;
 #[cfg(feature = "dev-host")]
 pub mod dev_host;

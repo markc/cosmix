@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.50.1 — 2026-09-02
+
+- Select Bevy's Wayland and clipboard features explicitly so standalone CTK
+  examples compile without borrowing either feature from another workspace
+  package.
+
 ## 0.50.0 — 2026-08-30
 
 - Load a complete `design` section directly from the existing shared or

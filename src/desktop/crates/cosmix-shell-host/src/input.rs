@@ -250,6 +250,28 @@ impl KeyboardBridge {
         self.repeating.as_ref().map(|repeat| repeat.next_deadline)
     }
 
+    #[cfg(test)]
+    pub(crate) fn repeating_for_test(
+        window: Entity,
+        next_deadline: Duration,
+        gap: Duration,
+    ) -> Self {
+        let key = map_key(30, Keysym::a, Some("a".to_owned()));
+        Self {
+            focus: Some(KeyboardFocus {
+                surface: None,
+                window,
+            }),
+            pressed: BTreeMap::from([(key.raw_code, key.clone())]),
+            repeat_settings: Some(RepeatSettings {
+                delay: MIN_REPEAT_DELAY,
+                gap,
+            }),
+            repeating: Some(RepeatingKey { key, next_deadline }),
+            ..Default::default()
+        }
+    }
+
     pub(crate) fn fire_repeat(&mut self, app: &mut App, elapsed: Duration) -> bool {
         let (Some(window), Some(settings)) = (
             self.focus.as_ref().map(|focus| focus.window),

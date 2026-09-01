@@ -3,7 +3,7 @@
 
 mod messages;
 
-#[cfg(feature = "chrome")]
+#[cfg(feature = "chrome-core")]
 mod bevy_runtime;
 
 pub use messages::{
@@ -11,7 +11,7 @@ pub use messages::{
     ShellCommandKind, ShellContentPresentation, ShellEffect, ShellFrame, WakePolicy,
 };
 
-#[cfg(feature = "chrome")]
+#[cfg(feature = "chrome-core")]
 pub use bevy_runtime::{
     ShellEffects, ShellFrameState, ShellRuntimePlugin, ShellRuntimeSet, replace_shell_model,
 };

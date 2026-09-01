@@ -3,7 +3,7 @@
 # consumed by apps over a `../../ctk` path dependency. See desktop/APPS.md.
 [package]
 name = "ctk"
-version = "0.50.0"
+version = "0.50.1"
 description = "Cosmix Tool Kit — reusable, Bus-citizen Bevy widgets for dense desktop surfaces"
 edition = "2021"
 rust-version = "1.95"
@@ -14,10 +14,14 @@ kind = "toolkit"
 engine = "bevy"
 
 [features]
-default = ["menus"]
+default = ["menus", "platform-wayland"]
 # Menu bars and context menus. This remains a default feature to preserve the
 # existing CTK surface; consumers can opt out with `default-features = false`.
 menus = []
+# Standalone CTK commands default to Wayland. Platform features remain
+# separate so a no-default-features consumer can select a future X11 host.
+platform-wayland = ["bevy/wayland"]
+platform-x11 = ["bevy/x11"]
 # `bus` carries every wire codec (JSON bodies via serde_json, base64 A.6
 # frames) — the codecs live inside the Bus transport, not the pipeline.
 bus = [
@@ -91,6 +95,7 @@ bevy = { version = "=0.19.0", default-features = false, features = [
     "picking",
     "bevy_ui_widgets",
     "bevy_feathers",
+    "bevy_clipboard",
     "accesskit_unix",
     "system_font_discovery",
 ] }

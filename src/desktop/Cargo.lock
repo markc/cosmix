@@ -2753,7 +2753,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "accesskit",
  "bevy",
@@ -3035,7 +3035,7 @@ dependencies = [
 
 [[package]]
 name = "ctk"
-version = "0.50.0"
+version = "0.50.1"
 dependencies = [
  "accesskit",
  "ammonia",

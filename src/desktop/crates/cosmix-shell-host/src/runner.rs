@@ -498,6 +498,12 @@ enum PastDeadline {
     Stuck,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WakeTimerSchedule {
+    Source,
+    HandleDue(PastDeadline),
+}
+
 impl WakeTimerState {
     fn observe_queued_fire(&mut self, elapsed: Duration) -> QueuedWake {
         let Some(deadline) = self.fired_deadline.take() else {
@@ -595,6 +601,26 @@ fn replace_wake_timer_source<S: WakeTimerTarget + 'static>(
         .map_err(|error| LayerHostError::new(error.to_string()))?;
     timer.token = Some(token);
     Ok(())
+}
+
+fn schedule_wake_timer_source<S: WakeTimerTarget + 'static>(
+    loop_handle: &LoopHandle<'_, S>,
+    timer: &mut WakeTimerState,
+    next_deadline: Option<Duration>,
+    repeat_deadline: Option<Duration>,
+    elapsed: Duration,
+    model_progressed: bool,
+) -> Result<WakeTimerSchedule, LayerHostError> {
+    let past = timer.observe_next_deadline(next_deadline, elapsed, model_progressed);
+    if past == PastDeadline::NotPast || repeat_drives_deadline(next_deadline, repeat_deadline) {
+        // Even when a slow update has already overrun the 8 ms ceiling gap,
+        // repeat must re-enter through calloop. The zero-delay one-shot lets
+        // Wayland and signal fds dispatch before the next repeat update.
+        replace_wake_timer_source(loop_handle, timer, next_deadline, elapsed)?;
+        Ok(WakeTimerSchedule::Source)
+    } else {
+        Ok(WakeTimerSchedule::HandleDue(past))
+    }
 }
 
 fn reset_wake_timer_for_output_replacement<S>(
@@ -1547,22 +1573,15 @@ impl RunnerState {
             .world()
             .get_resource::<cosmix_shell::runtime::ShellEffects>()
             .is_some_and(|effects| !effects.0.is_empty());
-        let past = self
-            .wake_timer
-            .observe_next_deadline(next_deadline, elapsed, model_progressed);
-        if past != PastDeadline::NotPast && repeat_drives_deadline(next_deadline, repeat_deadline) {
-            // Even when a slow update has already overrun the 8 ms ceiling gap,
-            // repeat must re-enter through calloop. The zero-delay one-shot lets
-            // Wayland and signal fds dispatch before the next repeat update.
-            return replace_wake_timer_source(
-                loop_handle,
-                &mut self.wake_timer,
-                next_deadline,
-                elapsed,
-            );
-        }
-        match past {
-            PastDeadline::DueNow { .. } | PastDeadline::Stuck => {
+        match schedule_wake_timer_source(
+            loop_handle,
+            &mut self.wake_timer,
+            next_deadline,
+            repeat_deadline,
+            elapsed,
+            model_progressed,
+        )? {
+            WakeTimerSchedule::HandleDue(past) => {
                 let deadline = next_deadline.expect("past observation has a deadline");
                 if matches!(past, PastDeadline::DueNow { first: true }) {
                     tracing::warn!(
@@ -1589,11 +1608,10 @@ impl RunnerState {
                     self.abnormal_exit = true;
                     self.exit_reason = Some("wake-deadline-stuck".to_owned());
                 }
-                return Ok(());
+                Ok(())
             }
-            PastDeadline::NotPast => {}
+            WakeTimerSchedule::Source => Ok(()),
         }
-        replace_wake_timer_source(loop_handle, &mut self.wake_timer, next_deadline, elapsed)
     }
 
     fn handle_queued_wake_timer(&mut self, elapsed: Duration) {
@@ -2584,6 +2602,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use bevy::MinimalPlugins;
+    use bevy::input::keyboard::KeyboardInput;
     use bevy::time::TimeUpdateStrategy;
     use cosmix_shell::core::{
         ConcealReason, Corner, CornerEvent, CornerTrigger, PanelEffect, PanelMode,
@@ -2632,6 +2651,7 @@ mod tests {
         output: OutputKey,
         needs_update: bool,
         wake_timer: WakeTimerState,
+        keyboard_bridge: KeyboardBridge,
         fresh_elapsed: Duration,
         last_timer_delay: Option<Duration>,
         last_timer_rearmed: bool,
@@ -2639,6 +2659,16 @@ mod tests {
         abnormal_exit: bool,
         exit_reason: Option<String>,
         iteration_steps: Vec<&'static str>,
+    }
+
+    #[derive(Resource, Default)]
+    struct RepeatInputsSeen(usize);
+
+    fn capture_repeat_inputs(
+        mut inputs: MessageReader<KeyboardInput>,
+        mut seen: ResMut<RepeatInputsSeen>,
+    ) {
+        seen.0 += inputs.read().filter(|event| event.repeat).count();
     }
 
     impl WakeTimerTarget for TestRunnerState {
@@ -2674,7 +2704,14 @@ mod tests {
                 self.wake_timer.observe_queued_fire(self.fresh_elapsed),
                 QueuedWake::Due(_)
             ) {
-                self.iteration_steps.push("timer-due");
+                let repeat_fired = self
+                    .keyboard_bridge
+                    .fire_repeat(&mut self.app, self.fresh_elapsed);
+                self.iteration_steps.push(if repeat_fired {
+                    "repeat-fired"
+                } else {
+                    "timer-due"
+                });
                 self.animate_requested_at = None;
             }
             self.iteration_steps.push("update");
@@ -3465,6 +3502,7 @@ mod tests {
                 output: output.clone(),
                 needs_update: false,
                 wake_timer: WakeTimerState::default(),
+                keyboard_bridge: KeyboardBridge::default(),
                 fresh_elapsed: Duration::ZERO,
                 last_timer_delay: None,
                 last_timer_rearmed: false,
@@ -3665,11 +3703,15 @@ mod tests {
         let mut app = App::new();
         configure_ingress(&mut app);
         app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)))
+            .add_message::<KeyboardInput>()
             .add_message::<RequestRedraw>()
             .init_resource::<LayerHostUpdateWake>()
+            .init_resource::<RepeatInputsSeen>()
+            .add_systems(PreUpdate, capture_repeat_inputs)
             .add_systems(Last, capture_layer_host_redraw)
             .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
         let deadline = Duration::from_millis(8);
+        let window = app.world_mut().spawn_empty().id();
         let mut state = TestRunnerState {
             app,
             output,
@@ -3678,6 +3720,11 @@ mod tests {
                 fired_deadline: Some(deadline),
                 ..Default::default()
             },
+            keyboard_bridge: KeyboardBridge::repeating_for_test(
+                window,
+                deadline,
+                Duration::from_millis(8),
+            ),
             fresh_elapsed: deadline,
             last_timer_delay: None,
             last_timer_rearmed: false,
@@ -3693,7 +3740,7 @@ mod tests {
         assert_eq!(
             state.iteration_steps,
             [
-                "timer-due",
+                "repeat-fired",
                 "update",
                 "should-exit",
                 "reconcile",
@@ -3701,6 +3748,11 @@ mod tests {
                 "flush"
             ],
             "repeat input must exist before the update that consumes it"
+        );
+        assert_eq!(
+            state.app.world().resource::<RepeatInputsSeen>().0,
+            1,
+            "the consuming Bevy update must receive real KeyboardBridge repeat input"
         );
         assert!(!state.needs_update, "timer work must not chain an update");
     }
@@ -3735,18 +3787,19 @@ mod tests {
             .unwrap();
 
         let next_deadline = Some(repeat_deadline);
-        let past = state
-            .wake_timer
-            .observe_next_deadline(next_deadline, slow_update_elapsed, true);
-        assert_eq!(past, PastDeadline::DueNow { first: true });
-        assert!(repeat_drives_deadline(next_deadline, Some(repeat_deadline)));
-        replace_wake_timer_source(
-            &handle,
-            &mut state.wake_timer,
-            next_deadline,
-            slow_update_elapsed,
-        )
-        .unwrap();
+        assert_eq!(
+            schedule_wake_timer_source(
+                &handle,
+                &mut state.wake_timer,
+                next_deadline,
+                Some(repeat_deadline),
+                slow_update_elapsed,
+                true,
+            )
+            .unwrap(),
+            WakeTimerSchedule::Source,
+            "the production decision seam must force an overdue repeat through calloop"
+        );
         assert!(state.wake_timer.token.is_some());
         assert!(
             !state.needs_update,
@@ -3776,6 +3829,7 @@ mod tests {
             output: OutputKey::new("DP-1").unwrap(),
             needs_update: false,
             wake_timer: WakeTimerState::default(),
+            keyboard_bridge: KeyboardBridge::default(),
             fresh_elapsed: Duration::ZERO,
             last_timer_delay: None,
             last_timer_rearmed: false,
@@ -3817,6 +3871,7 @@ mod tests {
             output: OutputKey::new("DP-1").unwrap(),
             needs_update: false,
             wake_timer: WakeTimerState::default(),
+            keyboard_bridge: KeyboardBridge::default(),
             fresh_elapsed: Duration::ZERO,
             last_timer_delay: None,
             last_timer_rearmed: false,
@@ -3940,6 +3995,7 @@ mod tests {
             output,
             needs_update: true,
             wake_timer: WakeTimerState::default(),
+            keyboard_bridge: KeyboardBridge::default(),
             fresh_elapsed: Duration::from_millis(10),
             last_timer_delay: None,
             last_timer_rearmed: false,

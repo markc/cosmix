@@ -6,7 +6,7 @@ existing Quoin chrome into one explicit Bevy window target per surface. The
 installable application id and layer namespace are `dev.cosmix.quoin`.
 
 Arc 3 presents real layer-shell buffers through `cosmix-shell-host` 0.3.0,
-`cosmix-shell` 0.3.0 and SCTK 0.19.2. `cosmix-quoin` is 0.4.0;
+`cosmix-shell` 0.3.1 and SCTK 0.19.2. `cosmix-quoin` is 0.4.0;
 `cosmix-quoin-demo` remains a
 feature-gated, non-installable normal-window tuning arm; it is not a
 layer-shell client.
@@ -204,6 +204,28 @@ wire and presentation authority.
 
 This arc vendors nothing and edits no Smithay source. Quoin consumes
 `cosmix-comp`'s documented public layer-shell contract unchanged.
+
+## Source gates
+
+The Quoin source gate must prove that the shipped demo graph remains
+Wayland-only. Cargo does not expose a dependency's active features through a
+consumer crate's `cfg`, so this graph check is the enforcement boundary:
+
+```sh
+graph="$(cargo tree -e features -p cosmix-quoin --features demo)" && ! printf '%s\n' "$graph" | rg -q 'winit feature "x11"'
+```
+
+## Hardware-only deferrals
+
+The source and nested gates cannot prove these real-session paths:
+
+- the KMS four-panel path, including fuzzel retaining its `Exclusive` latch
+  while Quoin's `None` and `OnDemand` panels redraw;
+- texture-limit preflight against the real GPU's negotiated limit;
+- scale 2 and a real 1.25 fractional scale end-to-end through
+  `wp_fractional_scale` and viewporter;
+- keyboard repeat pausing rather than bursting under KMS load; and
+- VT switch and seat re-add on a real session.
 
 ## Known limits
 
