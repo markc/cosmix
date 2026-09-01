@@ -5175,9 +5175,15 @@ enum CaptureFrameDestination {
     Dmabuf {
         buffer: wl_buffer::WlBuffer,
         descriptor: Arc<DmabufDescriptor>,
-        drm_device: u64,
         retention_token: Option<u64>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureDmabufMetadataMatch {
+    Matches,
+    InvalidBuffer,
+    UnsupportedModifier,
 }
 
 impl CaptureFrameDestination {
@@ -6406,15 +6412,22 @@ impl WaylandState {
                     dmabuf.format().code as u32,
                     u64::from(dmabuf.format().modifier),
                 );
-                if !metadata_matches {
-                    if let Some(record) = self.capture_frames.get_mut(&id) {
-                        record.terminal = true;
+                match metadata_matches {
+                    CaptureDmabufMetadataMatch::Matches => {}
+                    CaptureDmabufMetadataMatch::InvalidBuffer => {
+                        if let Some(record) = self.capture_frames.get_mut(&id) {
+                            record.terminal = true;
+                        }
+                        frame.post_error(
+                            zwlr_screencopy_frame_v1::Error::InvalidBuffer,
+                            "DMA-BUF does not match the immutable screencopy advertisement",
+                        );
+                        return;
                     }
-                    frame.post_error(
-                        zwlr_screencopy_frame_v1::Error::InvalidBuffer,
-                        "DMA-BUF does not match the immutable screencopy advertisement",
-                    );
-                    return;
+                    CaptureDmabufMetadataMatch::UnsupportedModifier => {
+                        self.fail_capture(id);
+                        return;
+                    }
                 }
                 let descriptor = match describe_dmabuf(dmabuf) {
                     Ok(descriptor) => Arc::new(descriptor),
@@ -6424,7 +6437,6 @@ impl WaylandState {
                         return;
                     }
                 };
-                let drm_device = dmabuf.node().map(|node| node.dev_id()).unwrap_or(u64::MAX);
                 let Some(retention_token) = self.try_retain_capture_dmabuf(buffer.clone()) else {
                     self.fail_capture(id);
                     return;
@@ -6432,7 +6444,6 @@ impl WaylandState {
                 CaptureFrameDestination::Dmabuf {
                     buffer,
                     descriptor,
-                    drm_device,
                     retention_token: Some(retention_token),
                 }
             }
@@ -6507,15 +6518,22 @@ impl WaylandState {
         height: Option<u32>,
         fourcc: u32,
         modifier: u64,
-    ) -> bool {
-        planes == 1
-            && width == Some(advertisement.width)
-            && height == Some(advertisement.height)
-            && fourcc == advertisement.fourcc
-            && advertisement
-                .allowed_modifiers
-                .binary_search(&modifier)
-                .is_ok()
+    ) -> CaptureDmabufMetadataMatch {
+        if planes != 1
+            || width != Some(advertisement.width)
+            || height != Some(advertisement.height)
+            || fourcc != advertisement.fourcc
+        {
+            CaptureDmabufMetadataMatch::InvalidBuffer
+        } else if advertisement
+            .allowed_modifiers
+            .binary_search(&modifier)
+            .is_err()
+        {
+            CaptureDmabufMetadataMatch::UnsupportedModifier
+        } else {
+            CaptureDmabufMetadataMatch::Matches
+        }
     }
 
     fn admit_capture(&mut self, id: CaptureId, damage_revision: u64, damage: Vec<CaptureRegion>) {
@@ -6597,12 +6615,10 @@ impl WaylandState {
                 CaptureFrameDestination::Shm(_) => CaptureDestination::Shm,
                 CaptureFrameDestination::Dmabuf {
                     descriptor,
-                    drm_device,
                     retention_token,
                     ..
                 } => CaptureDestination::Dmabuf(CaptureDmabufDestination {
                     descriptor: Arc::clone(descriptor),
-                    drm_device: *drm_device,
                     retention_token: retention_token
                         .take()
                         .expect("DMA-BUF capture token moves to the render request once"),

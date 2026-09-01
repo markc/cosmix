@@ -2759,10 +2759,8 @@ fn run_live_render_pump(
         .scanout_render_bridge()
         .expect("live renderer retains its DRM identity");
     let capture_bridge = renderer.capture_destination_bridge();
-    let capture_advertisements = crate::capture::CaptureAdvertisementRegistry::new(
-        capture_bridge.capabilities(),
-        renderer.capabilities(),
-    );
+    let capture_advertisements =
+        crate::capture::CaptureAdvertisementRegistry::new(&capture_bridge, renderer.capabilities());
     // The Rung-2 direct-display comparison sidecar retired with its backend.
     let output_selector = PreparedLiveOutputSelector(scanout_bridge.capabilities());
     let backend = LivePreparedBackend {

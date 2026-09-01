@@ -76,13 +76,16 @@ struct CaptureAdvertisementDiscovery {
 pub(crate) struct CaptureAdvertisementRegistry {
     discovery: Option<Arc<CaptureAdvertisementDiscovery>>,
     advertisements: Arc<Mutex<HashMap<CaptureSourceId, CaptureDmabufAdvertisement>>>,
+    healthy: Arc<AtomicBool>,
 }
 
 impl CaptureAdvertisementRegistry {
     pub(crate) fn new(
-        capabilities: cosmix_wgpu_dmabuf::CaptureDestinationCapabilities,
+        bridge: &cosmix_wgpu_dmabuf::CaptureDestinationBridge,
         dmabuf: &cosmix_wgpu_dmabuf::DmabufCapabilities,
     ) -> Self {
+        let main_device = bridge.main_device();
+        let healthy = main_device == dmabuf.main_device;
         let mut feedback = HashMap::<u32, Vec<u64>>::new();
         for format in &dmabuf.formats {
             feedback
@@ -91,12 +94,15 @@ impl CaptureAdvertisementRegistry {
                 .push(format.modifier);
         }
         Self {
-            discovery: Some(Arc::new(CaptureAdvertisementDiscovery {
-                capabilities,
-                feedback,
-                drm_device: dmabuf.main_device,
-            })),
+            discovery: healthy.then(|| {
+                Arc::new(CaptureAdvertisementDiscovery {
+                    capabilities: bridge.capabilities(),
+                    feedback,
+                    drm_device: main_device,
+                })
+            }),
             advertisements: Arc::default(),
+            healthy: Arc::new(AtomicBool::new(healthy)),
         }
     }
 
@@ -105,6 +111,9 @@ impl CaptureAdvertisementRegistry {
         source: &CaptureSourceId,
         extent: (u32, u32),
     ) -> Option<CaptureDmabufAdvertisement> {
+        if !self.healthy.load(Ordering::Acquire) {
+            return None;
+        }
         self.advertisements
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -114,6 +123,10 @@ impl CaptureAdvertisementRegistry {
     }
 
     fn publish(&self, source: &CaptureSourceId, extent: (u32, u32), format: TextureFormat) {
+        if !self.healthy.load(Ordering::Acquire) {
+            self.remove(source);
+            return;
+        }
         let Some(discovery) = &self.discovery else {
             return;
         };
@@ -159,17 +172,30 @@ impl CaptureAdvertisementRegistry {
             .remove(source);
     }
 
+    fn disable(&self) {
+        self.healthy.store(false, Ordering::Release);
+        self.advertisements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
     #[cfg(test)]
     pub(crate) fn insert_for_test(
         &self,
         source: CaptureSourceId,
         advertisement: CaptureDmabufAdvertisement,
     ) {
+        self.healthy.store(true, Ordering::Release);
         self.advertisements
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(source, advertisement);
     }
+}
+
+fn capture_storage_format(view_format: TextureFormat) -> TextureFormat {
+    view_format.remove_srgb_suffix()
 }
 
 #[derive(Resource, Clone)]
@@ -196,7 +222,6 @@ pub(crate) enum CaptureDestination {
 #[derive(Clone, Debug)]
 pub(crate) struct CaptureDmabufDestination {
     pub(crate) descriptor: Arc<cosmix_wgpu_dmabuf::DmabufDescriptor>,
-    pub(crate) drm_device: u64,
     pub(crate) retention_token: u64,
 }
 
@@ -1248,6 +1273,8 @@ struct CaptureDmabufJob {
     destination: cosmix_wgpu_dmabuf::ImportedCaptureDestination,
     frame_token: u64,
     publication_failed: bool,
+    copy_submission: cosmix_wgpu_dmabuf::CaptureSubmissionIndex,
+    reporter: Option<CaptureCompletionReporter>,
 }
 
 struct PreparedCaptureDmabuf {
@@ -1274,11 +1301,11 @@ fn encode_capture_dmabuf_copies(
             || source_format != prepared.destination.format()
             || prepared.destination.extent() != extent
         {
-            if prepared.destination.release_to_foreign().is_ok() {
-                fail_dmabuf_request(prepared.request, reporter);
-            } else {
-                std::mem::forget(prepared.request);
-            }
+            fail_dmabuf_request(prepared.request, reporter);
+            continue;
+        }
+        if prepared.destination.encode_acquire(encoder).is_err() {
+            fail_dmabuf_request(prepared.request, reporter);
             continue;
         }
         encoder.copy_texture_to_texture(
@@ -1315,151 +1342,224 @@ fn encode_capture_readback_copy(
     );
 }
 
+const CAPTURE_RETIREMENT_WAIT_ATTEMPTS: usize = 4;
+
 #[derive(Resource)]
 struct CaptureDmabufCompletionService {
-    sender: Option<cosmix_wgpu_dmabuf::RetirementRequestSender>,
-    worker: Option<cosmix_wgpu_dmabuf::RetirementWorker>,
-    reports: Mutex<Receiver<cosmix_wgpu_dmabuf::RetirementWorkerReport>>,
-    jobs: BTreeMap<cosmix_wgpu_dmabuf::RetirementSequence, CaptureDmabufJob>,
-    next_sequence: u64,
+    sender: Option<SyncSender<CaptureDmabufJob>>,
+    worker: Option<JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+    advertisements: CaptureAdvertisementRegistry,
 }
 
 impl CaptureDmabufCompletionService {
-    fn new(bridge: &cosmix_wgpu_dmabuf::CaptureDestinationBridge) -> Option<Self> {
-        let (report_sender, reports) = mpsc::sync_channel::<
-            cosmix_wgpu_dmabuf::RetirementWorkerReport,
-        >(crate::protocol::MAX_IN_FLIGHT_CAPTURES);
-        let (sender, worker) = cosmix_wgpu_dmabuf::spawn_retirement_worker(
-            Box::new(bridge.retirement_adapter()),
-            crate::protocol::MAX_IN_FLIGHT_CAPTURES,
-            move |report| report_sender.try_send(report).is_ok(),
-        )
-        .ok()?;
+    fn new(
+        bridge: &cosmix_wgpu_dmabuf::CaptureDestinationBridge,
+        advertisements: CaptureAdvertisementRegistry,
+    ) -> Option<Self> {
+        let (sender, receiver) =
+            mpsc::sync_channel::<CaptureDmabufJob>(crate::protocol::MAX_IN_FLIGHT_CAPTURES);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_bridge = bridge.clone();
+        let worker_advertisements = advertisements.clone();
+        let worker = match std::thread::Builder::new()
+            .name("cosmix-capture-dmabuf-retirement".into())
+            .spawn(move || {
+                run_capture_dmabuf_completion_worker(
+                    worker_bridge,
+                    receiver,
+                    &worker_stop,
+                    &worker_advertisements,
+                );
+            }) {
+            Ok(worker) => worker,
+            Err(_) => {
+                advertisements.disable();
+                return None;
+            }
+        };
         Some(Self {
             sender: Some(sender),
             worker: Some(worker),
-            reports: Mutex::new(reports),
-            jobs: BTreeMap::new(),
-            next_sequence: 0,
+            stop,
+            advertisements,
         })
     }
 
-    fn submit(&mut self, mut job: CaptureDmabufJob, reporter: Option<&CaptureCompletionReporter>) {
-        let Some(next) = self.next_sequence.checked_add(1) else {
-            fail_dmabuf_request(job.request, reporter);
-            std::mem::forget(job.destination);
-            return;
+    fn submit(&mut self, job: CaptureDmabufJob) {
+        let result = match self.sender.as_ref() {
+            Some(sender) => sender.try_send(job),
+            None => Err(TrySendError::Disconnected(job)),
         };
-        self.next_sequence = next;
-        let sequence = cosmix_wgpu_dmabuf::RetirementSequence(next);
-        let send = self.sender.as_ref().map_or(
-            Err(cosmix_wgpu_dmabuf::RetirementRequestError::Disconnected),
-            |sender| sender.try_send(sequence),
-        );
-        if send.is_err() {
-            job.publication_failed = true;
-            if let Some(reporter) = reporter {
-                reporter.failed(
-                    job.request.id,
-                    job.request.generation,
-                    job.request.security_epoch,
-                );
-            }
-        }
-        self.jobs.insert(sequence, job);
-    }
-
-    fn drain(&mut self, reporter: Option<&CaptureCompletionReporter>) {
-        loop {
-            let received = {
-                self.reports
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .try_recv()
-            };
-            let report = match received {
-                Ok(report) => report,
-                Err(TryRecvError::Empty) => return,
-                Err(TryRecvError::Disconnected) => {
-                    self.fail_and_strand_all(reporter);
+        if let Err(error) = result {
+            let job = match error {
+                TrySendError::Full(job) => job,
+                TrySendError::Disconnected(job) => {
+                    self.advertisements.disable();
                     self.sender = None;
-                    return;
+                    job
                 }
             };
-            if report.result.is_err() {
-                self.fail_and_strand_all(reporter);
-                self.sender = None;
-                return;
-            }
-            let completed = self
-                .jobs
-                .keys()
-                .copied()
-                .take_while(|sequence| *sequence <= report.high_water)
-                .collect::<Vec<_>>();
-            for sequence in completed {
-                let Some(job) = self.jobs.remove(&sequence) else {
-                    continue;
-                };
-                self.complete_job(job, reporter);
-            }
-        }
-    }
-
-    fn complete_job(&self, job: CaptureDmabufJob, reporter: Option<&CaptureCompletionReporter>) {
-        let CaptureDmabufJob {
-            request,
-            destination,
-            frame_token,
-            publication_failed: _,
-        } = job;
-        if destination.release_to_foreign().is_err() {
-            if let Some(reporter) = reporter {
-                reporter.failed(request.id, request.generation, request.security_epoch);
-            }
-            std::mem::forget(request);
-            return;
-        }
-        let CaptureDestination::Dmabuf(destination) = &request.destination else {
-            unreachable!("DMA-BUF retirement job retains a DMA-BUF request")
-        };
-        if let Some(reporter) = reporter {
-            reporter.dmabuf_complete(CaptureDmabufComplete {
-                id: request.id,
-                source_id: request.source_id.clone(),
-                frame_token,
-                generation: request.generation,
-                security_epoch: request.security_epoch,
-                damage_revision: request.damage_revision,
-                damage: request.damage.clone(),
-                retention_token: destination.retention_token,
-                _reservation: request.reservation.clone(),
-            });
-        }
-    }
-
-    fn fail_and_strand_all(&mut self, reporter: Option<&CaptureCompletionReporter>) {
-        for (_, job) in std::mem::take(&mut self.jobs) {
-            if let Some(reporter) = reporter {
-                reporter.failed(
-                    job.request.id,
-                    job.request.generation,
-                    job.request.security_epoch,
-                );
-            }
-            std::mem::forget(job);
+            fail_and_strand_capture_dmabuf_job(job);
         }
     }
 }
 
 impl Drop for CaptureDmabufCompletionService {
     fn drop(&mut self) {
+        // Pin teardown: mark every queued/live job failed, close the sole
+        // sender, join after at most one bounded wait slice, then let the job
+        // reporters close as the worker drains them.
+        self.advertisements.disable();
+        self.stop.store(true, Ordering::Release);
         self.sender = None;
-        if let Some(worker) = self.worker.as_mut() {
+        if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        for (_, job) in std::mem::take(&mut self.jobs) {
-            std::mem::forget(job);
+    }
+}
+
+fn wait_for_capture_submission(
+    retirement: &cosmix_wgpu_dmabuf::WgpuWaitForSubmittedWork,
+    submission: cosmix_wgpu_dmabuf::CaptureSubmissionIndex,
+    stop: &AtomicBool,
+) -> Result<(), cosmix_wgpu_dmabuf::RetirementWaitError> {
+    wait_for_capture_submission_with(stop, || {
+        retirement.wait_for_submission(
+            submission.clone(),
+            cosmix_wgpu_dmabuf::RETIREMENT_WAIT_TIMEOUT,
+        )
+    })
+}
+
+fn wait_for_capture_submission_with(
+    stop: &AtomicBool,
+    mut wait: impl FnMut() -> Result<(), cosmix_wgpu_dmabuf::RetirementWaitError>,
+) -> Result<(), cosmix_wgpu_dmabuf::RetirementWaitError> {
+    for attempt in 0..CAPTURE_RETIREMENT_WAIT_ATTEMPTS {
+        if stop.load(Ordering::Acquire) {
+            return Err(cosmix_wgpu_dmabuf::RetirementWaitError::Failed(
+                "capture retirement service is stopping".into(),
+            ));
+        }
+        match wait() {
+            Err(cosmix_wgpu_dmabuf::RetirementWaitError::Timeout)
+                if attempt + 1 < CAPTURE_RETIREMENT_WAIT_ATTEMPTS => {}
+            result => return result,
+        }
+    }
+    unreachable!("the final bounded wait attempt always returns")
+}
+
+fn fail_and_strand_capture_dmabuf_job(job: CaptureDmabufJob) {
+    let CaptureDmabufJob {
+        request,
+        destination,
+        reporter,
+        ..
+    } = job;
+    if let Some(reporter) = &reporter {
+        reporter.failed(request.id, request.generation, request.security_epoch);
+    }
+    // The copy submission may own or still reference the external image. Keep
+    // both the Vulkan import and retained wl_buffer token until process exit.
+    std::mem::forget(destination);
+    std::mem::forget(request);
+}
+
+fn complete_capture_dmabuf_job(
+    bridge: &cosmix_wgpu_dmabuf::CaptureDestinationBridge,
+    retirement: &cosmix_wgpu_dmabuf::WgpuWaitForSubmittedWork,
+    job: CaptureDmabufJob,
+    stop: &AtomicBool,
+) -> Result<(), ()> {
+    let copy_wait = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for_capture_submission(retirement, job.copy_submission.clone(), stop)
+    }));
+    if !matches!(copy_wait, Ok(Ok(()))) {
+        fail_and_strand_capture_dmabuf_job(job);
+        return Err(());
+    }
+    let CaptureDmabufJob {
+        request,
+        destination,
+        frame_token,
+        publication_failed,
+        copy_submission: _,
+        reporter,
+    } = job;
+    let release = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        bridge.submit_release_to_foreign(destination)
+    }));
+    let pending_release = match release {
+        Ok(Ok(pending)) => pending,
+        Ok(Err(_)) | Err(_) => {
+            if let Some(reporter) = &reporter {
+                reporter.failed(request.id, request.generation, request.security_epoch);
+            }
+            std::mem::forget(request);
+            return Err(());
+        }
+    };
+    let release_wait = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for_capture_submission(retirement, pending_release.submission(), stop)
+    }));
+    if !matches!(release_wait, Ok(Ok(()))) {
+        if let Some(reporter) = &reporter {
+            reporter.failed(request.id, request.generation, request.security_epoch);
+        }
+        std::mem::forget(pending_release);
+        std::mem::forget(request);
+        return Err(());
+    }
+    pending_release.complete();
+    if publication_failed {
+        fail_dmabuf_request(request, reporter.as_ref());
+        return Ok(());
+    }
+    let CaptureDestination::Dmabuf(destination) = &request.destination else {
+        unreachable!("DMA-BUF retirement job retains a DMA-BUF request")
+    };
+    if let Some(reporter) = &reporter {
+        reporter.dmabuf_complete(CaptureDmabufComplete {
+            id: request.id,
+            source_id: request.source_id.clone(),
+            frame_token,
+            generation: request.generation,
+            security_epoch: request.security_epoch,
+            damage_revision: request.damage_revision,
+            damage: request.damage.clone(),
+            retention_token: destination.retention_token,
+            _reservation: request.reservation.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn run_capture_dmabuf_completion_worker(
+    bridge: cosmix_wgpu_dmabuf::CaptureDestinationBridge,
+    receiver: Receiver<CaptureDmabufJob>,
+    stop: &AtomicBool,
+    advertisements: &CaptureAdvertisementRegistry,
+) {
+    struct DisableAdvertisementsOnExit<'a>(&'a CaptureAdvertisementRegistry);
+    impl Drop for DisableAdvertisementsOnExit<'_> {
+        fn drop(&mut self) {
+            self.0.disable();
+        }
+    }
+    let _disable_on_exit = DisableAdvertisementsOnExit(advertisements);
+    let retirement = bridge.retirement_adapter();
+    while let Ok(job) = receiver.recv() {
+        if stop.load(Ordering::Acquire)
+            || complete_capture_dmabuf_job(&bridge, &retirement, job, stop).is_err()
+        {
+            advertisements.disable();
+            while let Ok(queued) = receiver.try_recv() {
+                fail_and_strand_capture_dmabuf_job(queued);
+            }
+            return;
         }
     }
 }
@@ -1596,9 +1696,9 @@ impl Plugin for CaptureServicePlugin {
             .world()
             .get_resource::<CaptureDestinationRenderBridge>()
             .cloned();
-        let dmabuf_completion = destination_bridge
-            .as_ref()
-            .and_then(|bridge| CaptureDmabufCompletionService::new(&bridge.0));
+        let dmabuf_completion = destination_bridge.as_ref().and_then(|bridge| {
+            CaptureDmabufCompletionService::new(&bridge.0, advertisement_registry.clone())
+        });
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
                 .insert_resource(batches)
@@ -1710,21 +1810,31 @@ fn prepare_nested_capture_redirect(
         height: size.y,
         depth_or_array_layers: 1,
     };
+    let storage_format = capture_storage_format(format);
+    let view_formats = [format];
     let texture = device.create_texture(&TextureDescriptor {
         label: Some("CosMix nested capture render target"),
         size: extent,
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
-        format,
+        format: storage_format,
         usage: TextureUsages::RENDER_ATTACHMENT
             | TextureUsages::COPY_SRC
             | TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
+        view_formats: if format != storage_format {
+            view_formats.as_slice()
+        } else {
+            &[]
+        },
+    });
+    let capture_view = texture.create_view(&TextureViewDescriptor {
+        format: Some(format),
+        ..Default::default()
     });
     attachments.insert(
         target.clone(),
-        OutputColorAttachment::new(texture.create_view(&Default::default()), format),
+        OutputColorAttachment::new(capture_view, format),
     );
     redirect.0 = Some(PreparedNestedCaptureRedirect {
         source_id: source.source_id.clone(),
@@ -2022,10 +2132,8 @@ fn retain_prepared_dmabufs(
     for prepared in std::mem::take(prepared) {
         if capture_request_is_copyable(&prepared.request, Some(current_extent)) {
             retained.push(prepared);
-        } else if prepared.destination.release_to_foreign().is_ok() {
-            fail_dmabuf_request(prepared.request, reporter);
         } else {
-            std::mem::forget(prepared.request);
+            fail_dmabuf_request(prepared.request, reporter);
         }
     }
     *prepared = retained;
@@ -2036,11 +2144,7 @@ fn fail_prepared_dmabufs(
     reporter: Option<&CaptureCompletionReporter>,
 ) {
     for prepared in prepared {
-        if prepared.destination.release_to_foreign().is_ok() {
-            fail_dmabuf_request(prepared.request, reporter);
-        } else {
-            std::mem::forget(prepared.request);
-        }
+        fail_dmabuf_request(prepared.request, reporter);
     }
 }
 
@@ -2076,9 +2180,6 @@ fn capture_output_frames(
 ) {
     let phase = *phase;
     let reporter = reporter.reporter();
-    if let Some(completion) = dmabuf.completion.as_deref_mut() {
-        completion.drain(reporter.as_ref());
-    }
     let requests = std::mem::take(
         &mut *batches
             .0
@@ -2268,10 +2369,10 @@ fn capture_output_frames(
         }
         group.requests = shm_requests;
         let mut prepared_dmabufs = Vec::new();
-        let mut available_destination_slots =
-            dmabuf.completion.as_deref().map_or(0, |completion| {
-                crate::protocol::MAX_IN_FLIGHT_CAPTURES.saturating_sub(completion.jobs.len())
-            });
+        let mut available_destination_slots = dmabuf
+            .completion
+            .as_deref()
+            .map_or(0, |_| crate::protocol::MAX_IN_FLIGHT_CAPTURES);
         for request in dmabuf_requests {
             if !capture_request_is_copyable(&request, Some(current_extent)) {
                 fail_dmabuf_request(request, reporter.as_ref());
@@ -2337,7 +2438,7 @@ fn capture_output_frames(
                     continue;
                 }
             };
-            let imported = match bridge.0.import(destination.drm_device, descriptor) {
+            let imported = match bridge.0.import(descriptor) {
                 Ok(imported) => imported,
                 Err(_) => {
                     fail_dmabuf_request(request, reporter.as_ref());
@@ -2345,11 +2446,7 @@ fn capture_output_frames(
                 }
             };
             if !capture_request_is_copyable(&request, Some(current_extent)) {
-                if imported.release_to_foreign().is_ok() {
-                    fail_dmabuf_request(request, reporter.as_ref());
-                } else {
-                    std::mem::forget(request);
-                }
+                fail_dmabuf_request(request, reporter.as_ref());
                 continue;
             }
             available_destination_slots -= 1;
@@ -2680,15 +2777,14 @@ fn capture_output_frames(
         }
         if let Some(completion) = dmabuf.completion.as_deref_mut() {
             for prepared in encoded_dmabufs {
-                completion.submit(
-                    CaptureDmabufJob {
-                        request: prepared.request,
-                        destination: prepared.destination,
-                        frame_token,
-                        publication_failed: !presentation_bound,
-                    },
-                    reporter.as_ref(),
-                );
+                completion.submit(CaptureDmabufJob {
+                    request: prepared.request,
+                    destination: prepared.destination,
+                    frame_token,
+                    publication_failed: !presentation_bound,
+                    copy_submission: submission.clone(),
+                    reporter: reporter.clone(),
+                });
             }
         } else {
             for prepared in encoded_dmabufs {
@@ -3439,6 +3535,124 @@ mod tests {
         let started = Instant::now();
         drop(CaptureReadbackWorker::default());
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn capture_retirement_retries_transient_timeouts_but_remains_bounded() {
+        let calls = AtomicUsize::new(0);
+        let result = wait_for_capture_submission_with(&AtomicBool::new(false), || {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            if call < CAPTURE_RETIREMENT_WAIT_ATTEMPTS - 1 {
+                Err(cosmix_wgpu_dmabuf::RetirementWaitError::Timeout)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            CAPTURE_RETIREMENT_WAIT_ATTEMPTS
+        );
+
+        let calls = AtomicUsize::new(0);
+        let result = wait_for_capture_submission_with(&AtomicBool::new(false), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(cosmix_wgpu_dmabuf::RetirementWaitError::Timeout)
+        });
+        assert_eq!(
+            result,
+            Err(cosmix_wgpu_dmabuf::RetirementWaitError::Timeout)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            CAPTURE_RETIREMENT_WAIT_ATTEMPTS
+        );
+
+        let calls = AtomicUsize::new(0);
+        let result = wait_for_capture_submission_with(&AtomicBool::new(true), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(matches!(
+            result,
+            Err(cosmix_wgpu_dmabuf::RetirementWaitError::Failed(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn nested_srgb_source_has_the_exact_linear_dmabuf_copy_format() {
+        for (view, expected, fourcc) in [
+            (
+                TextureFormat::Bgra8UnormSrgb,
+                TextureFormat::Bgra8Unorm,
+                drm_fourcc::DrmFourcc::Xrgb8888,
+            ),
+            (
+                TextureFormat::Rgba8UnormSrgb,
+                TextureFormat::Rgba8Unorm,
+                drm_fourcc::DrmFourcc::Xbgr8888,
+            ),
+        ] {
+            let storage = capture_storage_format(view);
+            assert_eq!(storage, expected);
+            let destination = cosmix_wgpu_dmabuf::capture_destination_wgpu_format(fourcc as u32);
+            assert!(matches!(
+                (storage, destination),
+                (
+                    TextureFormat::Bgra8Unorm,
+                    Some(cosmix_wgpu_dmabuf::CaptureDestinationWgpuFormat::Bgra8Unorm)
+                ) | (
+                    TextureFormat::Rgba8Unorm,
+                    Some(cosmix_wgpu_dmabuf::CaptureDestinationWgpuFormat::Rgba8Unorm)
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn dead_capture_service_withdraws_and_cannot_republish_dmabuf_advertisements() {
+        let source = CaptureSourceId::Nested {
+            output_name: "nested-1".into(),
+        };
+        let registry = CaptureAdvertisementRegistry::default();
+        registry.insert_for_test(
+            source.clone(),
+            CaptureDmabufAdvertisement {
+                fourcc: drm_fourcc::DrmFourcc::Xrgb8888 as u32,
+                width: 320,
+                height: 240,
+                allowed_modifiers: vec![7],
+                drm_device: 19,
+            },
+        );
+        assert!(registry.advertisement(&source, (320, 240)).is_some());
+
+        registry.disable();
+        registry.publish(&source, (320, 240), TextureFormat::Bgra8Unorm);
+        assert!(registry.advertisement(&source, (320, 240)).is_none());
+    }
+
+    #[test]
+    fn kms_capture_groups_order_base_before_cursor_inclusive() {
+        let source = CaptureSourceId::Kms {
+            key: crate::backend::kms::OutputKey {
+                device: 1,
+                connector_name: "DP-1".into(),
+            },
+            generation: 4,
+        };
+        let mut groups = BTreeMap::<(CaptureSourceId, bool), ()>::new();
+        groups.insert((source.clone(), true), ());
+        groups.insert((source, false), ());
+        assert_eq!(
+            groups
+                .keys()
+                .map(|(_, inclusive)| *inclusive)
+                .collect::<Vec<_>>(),
+            [false, true],
+            "the production BTreeMap key makes base submit before cursor-inclusive submit"
+        );
     }
 
     #[test]
@@ -5017,14 +5231,21 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut outcomes = Vec::new();
         app.update();
-        assert!(
-            app.sub_app(RenderApp)
-                .world()
-                .resource::<NestedCaptureRedirect>()
-                .0
-                .is_some(),
-            "nested admission must install the capture-owned final target"
-        );
+        let redirect = app
+            .sub_app(RenderApp)
+            .world()
+            .resource::<NestedCaptureRedirect>()
+            .0
+            .as_ref()
+            .expect("nested admission must install the capture-owned final target");
+        assert_eq!(redirect.format, TextureFormat::Rgba8UnormSrgb);
+        assert_eq!(redirect.texture.format(), TextureFormat::Rgba8Unorm);
+        assert!(matches!(
+            cosmix_wgpu_dmabuf::capture_destination_wgpu_format(
+                drm_fourcc::DrmFourcc::Xbgr8888 as u32
+            ),
+            Some(cosmix_wgpu_dmabuf::CaptureDestinationWgpuFormat::Rgba8Unorm)
+        ));
         assert!(
             app.world()
                 .resource::<CaptureReadbackBatch>()

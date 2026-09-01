@@ -26,9 +26,7 @@ use crate::formats::{
 };
 use crate::{
     DmabufDescriptor, WgpuWaitForSubmittedWork,
-    import::{
-        OwnershipDirection, OwnershipRole, import_vulkan_image, submit_raw_ownership_barrier,
-    },
+    import::{OwnershipDirection, OwnershipRole, encode_ownership_barrier, import_vulkan_image},
 };
 
 const BGRA8_SRGB_VIEW_FORMATS: &[wgpu::TextureFormat] = &[wgpu::TextureFormat::Bgra8UnormSrgb];
@@ -96,8 +94,6 @@ pub enum ScanoutImportError {
 
 #[derive(Debug, Error)]
 pub enum CaptureDestinationError {
-    #[error("capture DMA-BUF belongs to DRM device {supplied}, renderer uses {renderer}")]
-    DeviceMismatch { supplied: u64, renderer: u64 },
     #[error("capture DMA-BUF import failed: {0}")]
     Import(String),
     #[error("capture DMA-BUF FOREIGN ownership release failed: {0}")]
@@ -107,8 +103,9 @@ pub enum CaptureDestinationError {
 /// Cloneable external-image import boundary for screencopy destinations.
 ///
 /// Unlike the scanout bridge this is available to nested renderers as well as
-/// DRM-pinned renderers. Every import still supplies the allocation's feedback
-/// device identity, which must match the Vulkan physical device used by wgpu.
+/// DRM-pinned renderers. `main_device` is the real renderer identity used for
+/// feedback and advertisement; a submitted `wl_buffer` carries no allocating
+/// device identity to validate at import time.
 #[derive(Clone)]
 pub struct CaptureDestinationBridge {
     instance: RenderInstance,
@@ -139,12 +136,14 @@ impl CaptureDestinationBridge {
         CaptureDestinationCapabilities::new(self.instance.clone(), self.adapter.clone())
     }
 
+    pub fn main_device(&self) -> u64 {
+        self.main_device
+    }
+
     pub fn import(
         &self,
-        drm_device: u64,
         descriptor: DmabufDescriptor,
     ) -> Result<ImportedCaptureDestination, CaptureDestinationError> {
-        validate_capture_renderer_device(self.main_device, drm_device)?;
         import_capture_destination(&self.device, descriptor)
             .map_err(|error| CaptureDestinationError::Import(error.to_string()))
     }
@@ -152,16 +151,12 @@ impl CaptureDestinationBridge {
     pub fn retirement_adapter(&self) -> WgpuWaitForSubmittedWork {
         WgpuWaitForSubmittedWork::with_queue(self.device.clone(), self.queue.clone())
     }
-}
 
-fn validate_capture_renderer_device(
-    renderer: u64,
-    supplied: u64,
-) -> Result<(), CaptureDestinationError> {
-    if renderer == supplied {
-        Ok(())
-    } else {
-        Err(CaptureDestinationError::DeviceMismatch { supplied, renderer })
+    pub fn submit_release_to_foreign(
+        &self,
+        destination: ImportedCaptureDestination,
+    ) -> Result<PendingCaptureDestinationRelease, CaptureDestinationError> {
+        destination.submit_release_to_foreign(&self.queue)
     }
 }
 
@@ -315,9 +310,10 @@ fn capture_destination_texture_descriptor(
     })
 }
 
-/// One client-owned external image acquired from FOREIGN for a screencopy.
-/// The caller must retain it through submitted-work retirement and then call
-/// [`ImportedCaptureDestination::release_to_foreign`].
+/// One client-owned external image imported for a screencopy. Acquisition is
+/// encoded into the same wgpu submission as the copy; the caller retains it
+/// until the matching submission retires and then submits the release through
+/// [`CaptureDestinationBridge::submit_release_to_foreign`].
 pub struct ImportedCaptureDestination {
     texture: Texture,
     device: RenderDevice,
@@ -349,33 +345,73 @@ impl ImportedCaptureDestination {
         self.modifier
     }
 
-    /// Return the exclusive image to FOREIGN after the caller has proved the
-    /// dependent wgpu copy retired. A failed raw release strands the image
-    /// deliberately: destroying or reusing an image with unknown ownership
-    /// would turn a recoverable capture failure into cross-queue corruption.
-    pub fn release_to_foreign(self) -> Result<(), CaptureDestinationError> {
-        let result = unsafe {
-            let Some(device) = self.device.wgpu_device().as_hal::<Vulkan>() else {
-                let error = CaptureDestinationError::Release(
-                    crate::import::ImportError::NotVulkan.to_string(),
-                );
-                std::mem::forget(self);
-                return Err(error);
-            };
-            submit_raw_ownership_barrier(
-                &device,
+    /// Record FOREIGN -> local acquisition in a wgpu-owned command buffer.
+    /// The caller places the destination copy immediately after this barrier
+    /// and submits both through `Queue::submit`.
+    pub fn encode_acquire(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(), CaptureDestinationError> {
+        unsafe {
+            encode_ownership_barrier(
+                &self.device,
+                encoder,
                 &[self.image],
+                OwnershipDirection::Acquire,
+                OwnershipRole::CaptureDestination,
+            )
+        }
+        .map_err(|error| CaptureDestinationError::Import(error.to_string()))
+    }
+
+    fn submit_release_to_foreign(
+        self,
+        queue: &RenderQueue,
+    ) -> Result<PendingCaptureDestinationRelease, CaptureDestinationError> {
+        // Queue submission is not expected to panic, but validation failures
+        // can do so. Leak the import on unwind: dropping an image whose
+        // release was not proved would be less safe than stranding it.
+        let destination = std::mem::ManuallyDrop::new(self);
+        let mut encoder =
+            destination
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("CosMix screencopy DMA-BUF FOREIGN release"),
+                });
+        let encoded = unsafe {
+            encode_ownership_barrier(
+                &destination.device,
+                &mut encoder,
+                &[destination.image],
                 OwnershipDirection::Release,
                 OwnershipRole::CaptureDestination,
             )
         };
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                std::mem::forget(self);
-                Err(CaptureDestinationError::Release(error.to_string()))
-            }
+        if let Err(error) = encoded {
+            return Err(CaptureDestinationError::Release(error.to_string()));
         }
+        let submission = queue.submit([encoder.finish()]);
+        Ok(PendingCaptureDestinationRelease {
+            destination: std::mem::ManuallyDrop::into_inner(destination),
+            submission,
+        })
+    }
+}
+
+/// A wgpu-submitted local -> FOREIGN release. The destination stays alive
+/// until the exact release submission retires.
+pub struct PendingCaptureDestinationRelease {
+    destination: ImportedCaptureDestination,
+    submission: wgpu::SubmissionIndex,
+}
+
+impl PendingCaptureDestinationRelease {
+    pub fn submission(&self) -> wgpu::SubmissionIndex {
+        self.submission.clone()
+    }
+
+    pub fn complete(self) {
+        drop(self.destination);
     }
 }
 
@@ -402,18 +438,6 @@ fn import_capture_destination(
             capture_destination_vulkan_usage(),
             &[],
         )?;
-        if let Err(error) = submit_raw_ownership_barrier(
-            &device,
-            &[image],
-            OwnershipDirection::Acquire,
-            OwnershipRole::CaptureDestination,
-        ) {
-            device.raw_device().destroy_image(image, None);
-            for memory in memories {
-                device.raw_device().free_memory(memory, None);
-            }
-            return Err(error);
-        }
         let drop_callback: wgpu_hal::DropCallback = Box::new(move || {
             if let Some(device) = render_device_for_drop.wgpu_device().as_hal::<Vulkan>() {
                 device.raw_device().destroy_image(image, None);
@@ -1076,18 +1100,6 @@ mod tests {
             capture_destination_wgpu_format(DrmFourcc::Nv12 as u32),
             None
         );
-    }
-
-    #[test]
-    fn capture_destination_identity_mismatch_is_named() {
-        assert!(matches!(
-            validate_capture_renderer_device(10, 11),
-            Err(CaptureDestinationError::DeviceMismatch {
-                renderer: 10,
-                supplied: 11,
-            })
-        ));
-        assert!(validate_capture_renderer_device(10, 10).is_ok());
     }
 
     #[test]

@@ -1689,16 +1689,15 @@ fn submit_ownership_barrier(
         let Some(device) = render_device.wgpu_device().as_hal::<Vulkan>() else {
             return Err(ImportError::NotVulkan);
         };
-        submit_raw_ownership_barrier(&device, &images, direction, OwnershipRole::Sampled)?;
+        submit_raw_sampled_ownership_barrier(&device, &images, direction)?;
     }
     Ok(())
 }
 
-pub(crate) unsafe fn submit_raw_ownership_barrier(
+unsafe fn submit_raw_sampled_ownership_barrier(
     device: &wgpu_hal::vulkan::Device,
     images: &[vk::Image],
     direction: OwnershipDirection,
-    role: OwnershipRole,
 ) -> Result<(), ImportError> {
     let raw = device.raw_device();
     unsafe {
@@ -1736,60 +1735,12 @@ pub(crate) unsafe fn submit_raw_ownership_barrier(
             return Err(ImportError::Vulkan(error));
         }
 
-        let (local_layout, local_access, local_stage) = match role {
-            OwnershipRole::Sampled => (
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::AccessFlags::SHADER_READ,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-            ),
-            OwnershipRole::CaptureDestination => (
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::PipelineStageFlags::TRANSFER,
-            ),
-        };
-        let (src_stage, dst_stage) = match direction {
-            OwnershipDirection::Acquire => (vk::PipelineStageFlags::TOP_OF_PIPE, local_stage),
-            OwnershipDirection::Release => (local_stage, vk::PipelineStageFlags::BOTTOM_OF_PIPE),
-        };
-        let barriers = images
-            .iter()
-            .map(|image| {
-                let (src_family, dst_family, old_layout, new_layout, src_access, dst_access) =
-                    match direction {
-                        OwnershipDirection::Acquire => (
-                            vk::QUEUE_FAMILY_FOREIGN_EXT,
-                            device.queue_family_index(),
-                            vk::ImageLayout::GENERAL,
-                            local_layout,
-                            vk::AccessFlags::empty(),
-                            local_access,
-                        ),
-                        OwnershipDirection::Release => (
-                            device.queue_family_index(),
-                            vk::QUEUE_FAMILY_FOREIGN_EXT,
-                            local_layout,
-                            vk::ImageLayout::GENERAL,
-                            local_access,
-                            vk::AccessFlags::empty(),
-                        ),
-                    };
-                vk::ImageMemoryBarrier::default()
-                    .src_access_mask(src_access)
-                    .dst_access_mask(dst_access)
-                    .old_layout(old_layout)
-                    .new_layout(new_layout)
-                    .src_queue_family_index(src_family)
-                    .dst_queue_family_index(dst_family)
-                    .image(*image)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1),
-                    )
-            })
-            .collect::<Vec<_>>();
+        let (src_stage, dst_stage, barriers) = ownership_barriers(
+            device.queue_family_index(),
+            images,
+            direction,
+            OwnershipRole::Sampled,
+        );
         raw.cmd_pipeline_barrier(
             command_buffer,
             src_stage,
@@ -1824,6 +1775,105 @@ pub(crate) unsafe fn submit_raw_ownership_barrier(
         wait_result?;
     }
     Ok(())
+}
+
+pub(crate) unsafe fn encode_ownership_barrier(
+    render_device: &RenderDevice,
+    encoder: &mut wgpu::CommandEncoder,
+    images: &[vk::Image],
+    direction: OwnershipDirection,
+    role: OwnershipRole,
+) -> Result<(), ImportError> {
+    if images.is_empty() {
+        return Ok(());
+    }
+    let Some(device) = (unsafe { render_device.wgpu_device().as_hal::<Vulkan>() }) else {
+        return Err(ImportError::NotVulkan);
+    };
+    let (src_stage, dst_stage, barriers) =
+        ownership_barriers(device.queue_family_index(), images, direction, role);
+    unsafe {
+        encoder.as_hal_mut::<Vulkan, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.ok_or(ImportError::NotVulkan)?;
+            device.raw_device().cmd_pipeline_barrier(
+                hal_encoder.raw_handle(),
+                src_stage,
+                dst_stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barriers,
+            );
+            Ok(())
+        })
+    }
+}
+
+fn ownership_barriers(
+    queue_family_index: u32,
+    images: &[vk::Image],
+    direction: OwnershipDirection,
+    role: OwnershipRole,
+) -> (
+    vk::PipelineStageFlags,
+    vk::PipelineStageFlags,
+    Vec<vk::ImageMemoryBarrier<'static>>,
+) {
+    let (local_layout, local_access, local_stage) = match role {
+        OwnershipRole::Sampled => (
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::AccessFlags::SHADER_READ,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+        ),
+        OwnershipRole::CaptureDestination => (
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::PipelineStageFlags::TRANSFER,
+        ),
+    };
+    let (src_stage, dst_stage) = match direction {
+        OwnershipDirection::Acquire => (vk::PipelineStageFlags::TOP_OF_PIPE, local_stage),
+        OwnershipDirection::Release => (local_stage, vk::PipelineStageFlags::BOTTOM_OF_PIPE),
+    };
+    let barriers = images
+        .iter()
+        .map(|image| {
+            let (src_family, dst_family, old_layout, new_layout, src_access, dst_access) =
+                match direction {
+                    OwnershipDirection::Acquire => (
+                        vk::QUEUE_FAMILY_FOREIGN_EXT,
+                        queue_family_index,
+                        vk::ImageLayout::GENERAL,
+                        local_layout,
+                        vk::AccessFlags::empty(),
+                        local_access,
+                    ),
+                    OwnershipDirection::Release => (
+                        queue_family_index,
+                        vk::QUEUE_FAMILY_FOREIGN_EXT,
+                        local_layout,
+                        vk::ImageLayout::GENERAL,
+                        local_access,
+                        vk::AccessFlags::empty(),
+                    ),
+                };
+            vk::ImageMemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(dst_access)
+                .old_layout(old_layout)
+                .new_layout(new_layout)
+                .src_queue_family_index(src_family)
+                .dst_queue_family_index(dst_family)
+                .image(*image)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                )
+        })
+        .collect();
+    (src_stage, dst_stage, barriers)
 }
 
 fn texture_descriptor(
@@ -1921,12 +1971,9 @@ fn import_texture(
                 },
             &[],
         )?;
-        if let Err(error) = submit_raw_ownership_barrier(
-            &device,
-            &[image],
-            OwnershipDirection::Acquire,
-            OwnershipRole::Sampled,
-        ) {
+        if let Err(error) =
+            submit_raw_sampled_ownership_barrier(&device, &[image], OwnershipDirection::Acquire)
+        {
             cleanup_vulkan_import(&device, image, &memories);
             return Err(error);
         }
@@ -2314,6 +2361,46 @@ mod tests {
             );
             self.dropped.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn capture_ownership_barriers_use_foreign_and_transfer() {
+        use ash::vk::Handle;
+
+        let image = vk::Image::from_raw(7);
+        let (src_stage, dst_stage, acquire) = ownership_barriers(
+            3,
+            &[image],
+            OwnershipDirection::Acquire,
+            OwnershipRole::CaptureDestination,
+        );
+        assert_eq!(src_stage, vk::PipelineStageFlags::TOP_OF_PIPE);
+        assert_eq!(dst_stage, vk::PipelineStageFlags::TRANSFER);
+        assert_eq!(
+            acquire[0].src_queue_family_index,
+            vk::QUEUE_FAMILY_FOREIGN_EXT
+        );
+        assert_eq!(acquire[0].dst_queue_family_index, 3);
+        assert_eq!(acquire[0].old_layout, vk::ImageLayout::GENERAL);
+        assert_eq!(acquire[0].new_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        assert_eq!(acquire[0].dst_access_mask, vk::AccessFlags::TRANSFER_WRITE);
+
+        let (src_stage, dst_stage, release) = ownership_barriers(
+            3,
+            &[image],
+            OwnershipDirection::Release,
+            OwnershipRole::CaptureDestination,
+        );
+        assert_eq!(src_stage, vk::PipelineStageFlags::TRANSFER);
+        assert_eq!(dst_stage, vk::PipelineStageFlags::BOTTOM_OF_PIPE);
+        assert_eq!(release[0].src_queue_family_index, 3);
+        assert_eq!(
+            release[0].dst_queue_family_index,
+            vk::QUEUE_FAMILY_FOREIGN_EXT
+        );
+        assert_eq!(release[0].old_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        assert_eq!(release[0].new_layout, vk::ImageLayout::GENERAL);
+        assert_eq!(release[0].src_access_mask, vk::AccessFlags::TRANSFER_WRITE);
     }
 
     struct FailingImportPlatform;

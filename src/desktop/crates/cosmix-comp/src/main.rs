@@ -295,7 +295,7 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
     let dmabuf_capabilities = renderer.capabilities().clone();
     let capture_destination_bridge = renderer.capture_destination_bridge();
     let capture_advertisements = capture::CaptureAdvertisementRegistry::new(
-        capture_destination_bridge.capabilities(),
+        &capture_destination_bridge,
         &dmabuf_capabilities,
     );
     let dmabuf_validator = renderer.dmabuf_validator();

@@ -34677,20 +34677,66 @@ fn screencopy_s2_strict_dmabuf_metadata_validation_precedes_admission() {
             modifier,
         )
     };
-    assert!(matches(1, Some(320), Some(240), advertisement.fourcc, 7));
-    assert!(!matches(2, Some(320), Some(240), advertisement.fourcc, 7));
-    assert!(!matches(1, None, Some(240), advertisement.fourcc, 7));
-    assert!(!matches(1, Some(320), None, advertisement.fourcc, 7));
-    assert!(!matches(1, Some(319), Some(240), advertisement.fourcc, 7));
-    assert!(!matches(1, Some(320), Some(239), advertisement.fourcc, 7));
-    assert!(!matches(
-        1,
-        Some(320),
-        Some(240),
-        smithay::backend::allocator::Fourcc::Argb8888 as u32,
-        7
-    ));
-    assert!(!matches(1, Some(320), Some(240), advertisement.fourcc, 9));
+    assert_eq!(
+        matches(1, Some(320), Some(240), advertisement.fourcc, 7),
+        CaptureDmabufMetadataMatch::Matches
+    );
+    for result in [
+        matches(2, Some(320), Some(240), advertisement.fourcc, 7),
+        matches(1, None, Some(240), advertisement.fourcc, 7),
+        matches(1, Some(320), None, advertisement.fourcc, 7),
+        matches(1, Some(319), Some(240), advertisement.fourcc, 7),
+        matches(1, Some(320), Some(239), advertisement.fourcc, 7),
+        matches(
+            1,
+            Some(320),
+            Some(240),
+            smithay::backend::allocator::Fourcc::Argb8888 as u32,
+            7,
+        ),
+    ] {
+        assert_eq!(result, CaptureDmabufMetadataMatch::InvalidBuffer);
+    }
+    assert_eq!(
+        matches(1, Some(320), Some(240), advertisement.fourcc, 9),
+        CaptureDmabufMetadataMatch::UnsupportedModifier
+    );
+}
+
+#[test]
+fn screencopy_s2_unusable_modifier_is_recoverable_failed() {
+    let mut wire = ScreencopyWireHarness::new(3);
+    let (probe, _) = wire.capture_output(false);
+    let id = capture_id_for_frame(&wire.harness.server.state, probe);
+    let source = wire.harness.server.state.capture_frames[&id]
+        .source_id
+        .clone();
+    wire.harness
+        .server
+        .state
+        .capture_advertisements
+        .insert_for_test(
+            source,
+            crate::backend::CaptureDmabufAdvertisement {
+                fourcc: smithay::backend::allocator::Fourcc::Argb8888 as u32,
+                width: 320,
+                height: 240,
+                allowed_modifiers: vec![7],
+                drm_device: 19,
+            },
+        );
+    let (frame, _) = wire.capture_output(false);
+    let buffer = wire.dmabuf_buffer(320, 240);
+    send_request(&mut wire.harness.client, frame, 0, &words(&[buffer]));
+    wire.harness.dispatch_client();
+
+    let events = wire.harness.sync();
+    assert!(
+        events
+            .iter()
+            .any(|(object, opcode, _)| *object == frame && *opcode == 3),
+        "modifier rejection emits zwlr_screencopy_frame_v1.failed"
+    );
 }
 
 #[test]
@@ -34834,6 +34880,52 @@ fn screencopy_s2_dmabuf_completion_and_presentation_share_one_terminal_latch() {
             .collect::<Vec<_>>(),
         vec![3],
         "invalid terminal metadata emits failed without partial events"
+    );
+}
+
+#[test]
+fn screencopy_s2_completion_channel_wakes_an_idle_protocol_loop_without_a_render_tick() {
+    let mut wire = ScreencopyWireHarness::new(3);
+    let (probe, _) = wire.capture_output(false);
+    wire.seed_dmabuf_advertisement_from_frame(probe);
+    let (frame, _) = wire.capture_output(false);
+    let buffer = wire.dmabuf_buffer(320, 240);
+    send_request(&mut wire.harness.client, frame, 2, &words(&[buffer]));
+    wire.harness.dispatch_client();
+    let id = capture_id_for_frame(&wire.harness.server.state, frame);
+    let request = take_renderer_capture_request(&mut wire.harness.server.state, id);
+    wire.harness
+        .server
+        .state
+        .capture_presented(CapturePresented {
+            id,
+            source_id: request.source_id.clone(),
+            frame_token: 73,
+            generation: request.generation,
+            security_epoch: request.security_epoch,
+            seconds: 12,
+            nanoseconds: 34,
+        });
+    let completion = dmabuf_completion_for_request(&request, 73, Vec::new());
+    let reporter = CaptureCompletionReporter {
+        commands: wire.harness.commands.clone(),
+    };
+    std::thread::spawn(move || reporter.dmabuf_complete(completion))
+        .join()
+        .expect("completion sender thread exits");
+
+    wire.harness
+        .server
+        .dispatch_cycle(Some(EVENT_LOOP_PUMP_TIMEOUT))
+        .expect("the completion channel wakes the otherwise idle protocol loop");
+    let events = wire.harness.sync();
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| (event.0 == frame).then_some(event.1))
+            .collect::<Vec<_>>(),
+        [1, 2],
+        "flags and ready publish without another Bevy render tick"
     );
 }
 
