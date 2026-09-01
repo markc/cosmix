@@ -5,6 +5,10 @@ use bevy::ecs::message::MessageWriter;
 use bevy::input::ButtonState;
 use bevy::input::mouse::{MouseButton, MouseButtonInput, MouseScrollUnit, MouseWheel};
 use bevy::input::touch::TouchPhase;
+use bevy::picking::events::PointerState;
+use bevy::picking::pointer::{
+    PointerAction, PointerId, PointerInput, PointerLocation, PointerPress,
+};
 use bevy::prelude::{App, Entity, IntoScheduleConfigs, Res, ResMut, Resource, Time, Vec2, Window};
 use bevy::time::Real;
 use bevy::window::{CursorEntered, CursorLeft, CursorMoved, WindowEvent};
@@ -245,6 +249,9 @@ impl PointerBridge {
             return false;
         };
         self.motion(app, focus.window, focus.position);
+        if !self.pressed.is_empty() {
+            cancel_picking_press(app);
+        }
         self.release_state(app, focus.window);
         self.leave(app, output);
         true
@@ -376,6 +383,38 @@ impl PointerBridge {
     }
 }
 
+fn cancel_picking_press(app: &mut App) {
+    let location = {
+        let world = app.world_mut();
+        let mut pointers = world.query::<(&PointerId, &PointerLocation)>();
+        pointers
+            .iter(world)
+            .find_map(|(id, location)| (*id == PointerId::Mouse).then(|| location.location.clone()))
+            .flatten()
+    };
+    if let Some(location) = location
+        && let Some(mut messages) = app
+            .world_mut()
+            .get_resource_mut::<bevy::ecs::message::Messages<PointerInput>>()
+    {
+        messages.write(PointerInput::new(
+            PointerId::Mouse,
+            location,
+            PointerAction::Cancel,
+        ));
+    }
+    if let Some(mut state) = app.world_mut().get_resource_mut::<PointerState>() {
+        state.clear(PointerId::Mouse);
+    }
+    let world = app.world_mut();
+    let mut pointers = world.query::<(&PointerId, &mut PointerPress)>();
+    for (id, mut press) in pointers.iter_mut(world) {
+        if *id == PointerId::Mouse {
+            *press = PointerPress::default();
+        }
+    }
+}
+
 fn valid_position(app: &App, window: Entity, position: (f64, f64)) -> Option<Vec2> {
     if !position.0.is_finite() || !position.1.is_finite() {
         return None;
@@ -447,7 +486,28 @@ pub fn output_logical_position(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::MinimalPlugins;
+    use bevy::camera::RenderTarget;
     use bevy::ecs::message::Messages;
+    use bevy::ecs::observer::On;
+    use bevy::picking::Pickable;
+    use bevy::picking::PickingSettings;
+    use bevy::picking::backend::HitData;
+    use bevy::picking::events::{
+        Cancel, Click, Drag, DragDrop, DragEnd, DragEnter, DragLeave, DragOver, DragStart, Enter,
+        Leave, Move, Out, Over, Pointer, Press, Release, Scroll, pointer_events,
+    };
+    use bevy::picking::hover::{HoverMap, PreviousHoverMap};
+    use bevy::picking::input::mouse_pick_events;
+    use bevy::picking::pointer::{Location, PointerMap, update_pointer_map};
+    use bevy::time::TimeUpdateStrategy;
+    use bevy::ui_widgets::{Activate, Button, ButtonPlugin};
+    use bevy::window::WindowRef;
+    use cosmix_shell::core::{
+        Corner, CornerEvent, CornerTrigger, LogicalSize, PanelMode, ShellModel,
+    };
+    use cosmix_shell::runtime::{ShellFrameState, ShellRuntimePlugin, WakePolicy};
+    use std::time::Duration;
 
     fn pointer_app() -> (App, Entity, OutputKey) {
         let mut app = App::new();
@@ -470,6 +530,74 @@ mod tests {
         (app, window, OutputKey::new("DP-1").unwrap())
     }
 
+    #[derive(Resource, Default)]
+    struct ActivationCount(u32);
+
+    fn count_activation(_activation: On<Activate>, mut count: ResMut<ActivationCount>) {
+        count.0 += 1;
+    }
+
+    fn picking_app() -> (App, Entity, Entity, OutputKey) {
+        let (mut app, window, output) = pointer_app();
+        app.add_plugins(ButtonPlugin)
+            .init_resource::<PickingSettings>()
+            .init_resource::<PointerState>()
+            .init_resource::<PointerMap>()
+            .init_resource::<HoverMap>()
+            .init_resource::<PreviousHoverMap>()
+            .init_resource::<ActivationCount>()
+            .add_message::<PointerInput>()
+            .add_message::<Pointer<Cancel>>()
+            .add_message::<Pointer<Click>>()
+            .add_message::<Pointer<Press>>()
+            .add_message::<Pointer<DragDrop>>()
+            .add_message::<Pointer<DragEnd>>()
+            .add_message::<Pointer<DragEnter>>()
+            .add_message::<Pointer<Drag>>()
+            .add_message::<Pointer<DragLeave>>()
+            .add_message::<Pointer<DragOver>>()
+            .add_message::<Pointer<DragStart>>()
+            .add_message::<Pointer<Scroll>>()
+            .add_message::<Pointer<Move>>()
+            .add_message::<Pointer<Out>>()
+            .add_message::<Pointer<Over>>()
+            .add_message::<Pointer<Leave>>()
+            .add_message::<Pointer<Enter>>()
+            .add_message::<Pointer<Release>>()
+            .add_observer(count_activation);
+        app.finish();
+        app.cleanup();
+
+        let target = RenderTarget::Window(WindowRef::Entity(window))
+            .normalize(None)
+            .unwrap();
+        let location = Location {
+            target,
+            position: Vec2::new(12.0, 8.0),
+        };
+        app.world_mut().spawn((
+            PointerId::Mouse,
+            PointerLocation::new(location),
+            PointerPress::default(),
+        ));
+        app.world_mut()
+            .run_system_cached(update_pointer_map)
+            .unwrap();
+        let button = app.world_mut().spawn((Button, Pickable::default())).id();
+        let hit = HitData::new(button, 0.0, None, None);
+        app.world_mut()
+            .resource_mut::<HoverMap>()
+            .entry(PointerId::Mouse)
+            .or_default()
+            .insert(button, hit.clone());
+        app.world_mut()
+            .resource_mut::<PreviousHoverMap>()
+            .entry(PointerId::Mouse)
+            .or_default()
+            .insert(button, hit);
+        (app, window, button, output)
+    }
+
     #[test]
     fn output_logical_conversion_covers_every_edge_and_margin_sign() {
         let local = Vec2::new(5.0, 7.0);
@@ -489,6 +617,74 @@ mod tests {
         assert_eq!(
             output_logical_position(Edge::Bottom, local, output, 100.0, 0),
             Vec2::new(5.0, 707.0)
+        );
+    }
+
+    #[test]
+    fn staged_corner_times_start_after_idle_and_left_gets_a_fresh_grace() {
+        let output = OutputKey::new("DP-1").unwrap();
+        let model = ShellModel::new(
+            output.clone(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let mut app = App::new();
+        configure_ingress(&mut app);
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)))
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs(1)));
+
+        app.update();
+        stage_shell_command(
+            &mut app,
+            output.clone(),
+            ShellCommandKind::Corner(CornerEvent::Entered {
+                corner: Corner::TopLeft,
+                dwell: Duration::from_millis(200),
+                trigger: CornerTrigger::Compositor,
+            }),
+        );
+        app.update();
+        let entered = app
+            .world()
+            .resource::<ShellFrameState>()
+            .0
+            .panel(Edge::Left);
+        assert_eq!(entered.mode, PanelMode::Revealed);
+        assert_eq!(
+            entered.visible_fraction, 0.0,
+            "late enter starts its animation now"
+        );
+
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .mode,
+            PanelMode::Revealed,
+            "an active corner hold survives more than one grace interval"
+        );
+        *app.world_mut().resource_mut::<TimeUpdateStrategy>() =
+            TimeUpdateStrategy::ManualDuration(Duration::ZERO);
+        stage_shell_command(
+            &mut app,
+            output,
+            ShellCommandKind::Corner(CornerEvent::Left {
+                corner: Corner::TopLeft,
+            }),
+        );
+        app.update();
+        let now = app.world().resource::<Time<Real>>().elapsed();
+        let frame = &app.world().resource::<ShellFrameState>().0;
+        let left = frame.panel(Edge::Left);
+        assert_eq!(left.mode, PanelMode::Revealed);
+        assert_eq!(
+            frame.wake,
+            WakePolicy::WakeAt(now + Duration::from_millis(800))
         );
     }
 
@@ -638,6 +834,59 @@ mod tests {
         assert!(bridge.pressed.is_empty());
         assert!(!bridge.axis_active);
         assert!(!bridge.cleanup(&mut app, &output, None));
+    }
+
+    #[test]
+    fn teardown_cancels_a_pressed_control_without_activating_it() {
+        let (mut app, window, button, output) = picking_app();
+        let mut bridge = PointerBridge::default();
+        bridge.enter(
+            &mut app,
+            &output,
+            (7, window, Edge::Left),
+            (Vec2::new(12.0, 8.0), Vec2::new(12.0, 8.0)),
+        );
+        app.world_mut()
+            .resource_mut::<Messages<WindowEvent>>()
+            .clear();
+
+        emit_window(
+            &mut app,
+            MouseButtonInput {
+                button: MouseButton::Left,
+                state: ButtonState::Pressed,
+                window,
+            },
+        );
+        app.world_mut()
+            .run_system_cached(mouse_pick_events)
+            .unwrap();
+        app.world_mut()
+            .run_system_cached(PointerInput::receive)
+            .unwrap();
+        app.world_mut().run_system_cached(pointer_events).unwrap();
+        app.world_mut().flush();
+        assert!(app.world().entity(button).contains::<bevy::ui::Pressed>());
+
+        bridge.pressed.push(MouseButton::Left);
+        assert!(bridge.cleanup(&mut app, &output, Some(window)));
+        app.world_mut()
+            .run_system_cached(mouse_pick_events)
+            .unwrap();
+        app.world_mut()
+            .run_system_cached(PointerInput::receive)
+            .unwrap();
+        app.world_mut().run_system_cached(pointer_events).unwrap();
+        app.world_mut().flush();
+
+        assert_eq!(app.world().resource::<ActivationCount>().0, 0);
+        assert!(!app.world().entity(button).contains::<bevy::ui::Pressed>());
+        let mut pointers = app.world_mut().query::<(&PointerId, &PointerPress)>();
+        let press = pointers
+            .iter(app.world())
+            .find_map(|(id, press)| (*id == PointerId::Mouse).then_some(press))
+            .unwrap();
+        assert!(!press.is_any_pressed());
     }
 
     #[test]

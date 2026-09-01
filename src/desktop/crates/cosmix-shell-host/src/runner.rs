@@ -8,18 +8,19 @@ use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bevy::app::{App, AppExit, PluginGroup, TerminalCtrlCHandlerPlugin};
+use bevy::app::{App, AppExit, Last, PluginGroup, TerminalCtrlCHandlerPlugin};
+use bevy::ecs::message::MessageReader;
 use bevy::prelude::*;
 use bevy::render::pipelined_rendering::PipelinedRenderingPlugin;
 use bevy::time::Real;
-use bevy::window::{ExitCondition, WindowPlugin};
+use bevy::window::{ExitCondition, RequestRedraw, WindowPlugin};
 use bevy::winit::WinitPlugin;
 #[cfg(target_os = "linux")]
 use calloop::signals::{Signal, Signals};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, LoopHandle, RegistrationToken};
 use cosmix_shell::chrome::{QuoinCommittedMotionModes, QuoinPanelMounts};
-use cosmix_shell::core::{Edge, LogicalSize, OutputKey, ShellModel};
+use cosmix_shell::core::{Edge, LogicalSize, OutputKey, PanelMode, ShellModel};
 use cosmix_shell::runtime::{
     ShellCommand, ShellCommandKind, ShellFrameState, ShellRuntimePlugin, WakePolicy,
     replace_shell_model,
@@ -70,6 +71,22 @@ const ANIMATE_BACKSTOP: Duration = Duration::from_secs(1);
 const ANIMATE_BACKSTOP_QUANTUM: Duration = Duration::from_millis(250);
 const CONFIGURE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONSECUTIVE_PAST_DEADLINES: u8 = 64;
+
+#[derive(Resource, Default)]
+struct LayerHostUpdateWake(bool);
+
+fn capture_layer_host_redraw(
+    mut redraws: MessageReader<RequestRedraw>,
+    mut wake: ResMut<LayerHostUpdateWake>,
+) {
+    if redraws.read().next().is_some() {
+        wake.0 = true;
+    }
+}
+
+fn take_layer_host_update_wake(app: &mut App) -> bool {
+    std::mem::take(&mut app.world_mut().resource_mut::<LayerHostUpdateWake>().0)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LayerCloseDecision {
@@ -142,11 +159,64 @@ fn update_committed_modes(
     changed
 }
 
+trait ProtocolExecutor {
+    fn execute(
+        &mut self,
+        panel: &mut PanelSurface,
+        operations: &[ProtocolOp],
+        elapsed: Duration,
+    ) -> Result<ApplyResult, LayerHostError>;
+}
+
+struct WaylandProtocolExecutor;
+
+impl ProtocolExecutor for WaylandProtocolExecutor {
+    fn execute(
+        &mut self,
+        panel: &mut PanelSurface,
+        operations: &[ProtocolOp],
+        elapsed: Duration,
+    ) -> Result<ApplyResult, LayerHostError> {
+        Ok(panel.apply_protocol_ops(operations, elapsed))
+    }
+}
+
+fn write_configured_motion_latch(app: &mut App, committed: Option<(Edge, PanelMode)>) -> bool {
+    let Some((edge, mode)) = committed else {
+        return false;
+    };
+    app.world_mut()
+        .resource_mut::<QuoinCommittedMotionModes>()
+        .set(edge, mode);
+    true
+}
+
 fn layer_close_decision(output_live: bool, replacement_pending: bool) -> LayerCloseDecision {
     if output_live && !replacement_pending {
         LayerCloseDecision::Exit
     } else {
         LayerCloseDecision::Retire
+    }
+}
+
+trait PointerRelease {
+    fn protocol_version(&self) -> u32;
+    fn release(self);
+}
+
+impl PointerRelease for wl_pointer::WlPointer {
+    fn protocol_version(&self) -> u32 {
+        self.version()
+    }
+
+    fn release(self) {
+        wl_pointer::WlPointer::release(&self);
+    }
+}
+
+fn release_pointer(pointer: impl PointerRelease) {
+    if pointer.protocol_version() >= 3 {
+        pointer.release();
     }
 }
 
@@ -297,6 +367,8 @@ pub fn configure_layer_host(app: &mut App, config: LayerHostConfig) -> &mut App 
                 ..default()
             }),
     );
+    app.init_resource::<LayerHostUpdateWake>()
+        .add_systems(Last, capture_layer_host_redraw);
     app.set_runner(move |app| {
         run_layer_host(
             app,
@@ -338,6 +410,82 @@ struct RunnerState {
     corner_bus: Option<CornerBusHandle>,
     corner_engaged: BTreeSet<cosmix_shell::core::Corner>,
     corner_epoch: u64,
+}
+
+impl RunnerState {
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile<E: ProtocolExecutor>(
+        app: &mut App,
+        pointer_bridge: &mut PointerBridge,
+        output_key: &OutputKey,
+        panels: &mut [PanelSurface; 4],
+        output_size: LogicalSize,
+        frame: &cosmix_shell::runtime::ShellFrame,
+        elapsed: Duration,
+        executor: &mut E,
+    ) -> Result<bool, LayerHostError> {
+        let geometry = OutputGeometry {
+            width: output_size.width(),
+            height: output_size.height(),
+        };
+        let mut unmaps = Vec::new();
+        let mut committed_modes = Vec::new();
+        for edge in Edge::ALL {
+            let panel = &mut panels[edge.index()];
+            let next = frame.panel(edge);
+            if panel.phase == SurfacePhase::WaitingConfigure
+                && panel.pending_committed.as_ref() == Some(next)
+            {
+                continue;
+            }
+            let effective_previous = panel
+                .pending_committed
+                .as_ref()
+                .or(panel.last_committed.as_ref());
+            let operations = plan_surface(effective_previous, next, geometry)
+                .map_err(|error| LayerHostError::new(error.to_string()))?;
+            if operations.contains(&ProtocolOp::Unmap) {
+                pointer_bridge.cleanup(app, output_key, Some(panel.window));
+                panel.begin_unmap(app);
+                unmaps.push((edge, next.clone()));
+            }
+            let awaiting_initial_configure =
+                panel.phase == SurfacePhase::WaitingConfigure && panel.pending_committed.is_some();
+            let advance = commit_advance_for_phase(
+                executor.execute(panel, &operations, elapsed),
+                operations.contains(&ProtocolOp::Unmap),
+                awaiting_initial_configure,
+            )?;
+            if let Some(mode) = record_commit_advance(
+                &mut panel.last_committed,
+                &mut panel.pending_committed,
+                next,
+                advance,
+                operations.contains(&ProtocolOp::Unmap),
+            ) {
+                committed_modes.push((edge, mode));
+            }
+        }
+        if !unmaps.is_empty() {
+            // This non-pipelined update drains render extraction after raw handle
+            // removal and before destroying the protocol objects.
+            app.update();
+            for (edge, next) in unmaps {
+                panels[edge.index()].finish_unmap();
+                panels[edge.index()].last_committed = Some(next.clone());
+                committed_modes.push((edge, next.mode));
+            }
+        }
+        let mut latch_changed = false;
+        if !committed_modes.is_empty() {
+            let changed = {
+                let mut modes = app.world_mut().resource_mut::<QuoinCommittedMotionModes>();
+                update_committed_modes(&mut modes, committed_modes)
+            };
+            latch_changed = changed;
+        }
+        Ok(latch_changed)
+    }
 }
 
 fn run_layer_host(
@@ -549,6 +697,9 @@ fn run_layer_host(
         if state.needs_update {
             state.needs_update = false;
             state.app.update();
+            if take_layer_host_update_wake(&mut state.app) {
+                state.needs_update = true;
+            }
             if let Some(exit) = state.app.should_exit() {
                 state.abnormal_exit = exit.is_error();
                 state.exit_reason = Some(if exit.is_error() {
@@ -558,7 +709,7 @@ fn run_layer_host(
                 });
                 continue;
             }
-            if let Err(error) = state.reconcile(&qh) {
+            if let Err(error) = state.reconcile_live(&qh) {
                 state.abnormal_exit = true;
                 state.exit_reason = Some(format!("surface-plan-failed-{error}"));
                 continue;
@@ -614,7 +765,7 @@ fn state_exit(mut state: RunnerState, reason: &str, abnormal: bool) -> AppExit {
         state.pointer_bridge.cleanup(&mut state.app, &output, None);
     }
     if let Some(pointer) = state.active_pointer.take() {
-        pointer.release();
+        release_pointer(pointer);
     }
     if let Some(corner_bus) = state.corner_bus.take()
         && !corner_bus.shutdown()
@@ -792,7 +943,7 @@ impl RunnerState {
         Ok(())
     }
 
-    fn reconcile(&mut self, qh: &QueueHandle<Self>) -> Result<(), LayerHostError> {
+    fn reconcile_live(&mut self, qh: &QueueHandle<Self>) -> Result<(), LayerHostError> {
         let elapsed = self
             .app
             .world()
@@ -818,6 +969,8 @@ impl RunnerState {
             viewporter,
             namespace,
             outputs,
+            pointer_bridge,
+            needs_update,
             ..
         } = self;
         let output = outputs
@@ -834,16 +987,9 @@ impl RunnerState {
             viewporter: viewporter.as_ref(),
             namespace,
         };
-        let mut unmaps = Vec::new();
-        let mut committed_modes = Vec::new();
         for edge in Edge::ALL {
             let panel = &mut output.panels[edge.index()];
             let next = frame.panel(edge);
-            if panel.phase == SurfacePhase::WaitingConfigure
-                && panel.pending_committed.as_ref() == Some(next)
-            {
-                continue;
-            }
             let effective_previous = panel
                 .pending_committed
                 .as_ref()
@@ -857,47 +1003,18 @@ impl RunnerState {
                     .install_wayland(connection, wl_surface, layer_surface, fractional)
                     .map_err(|error| LayerHostError::new(format!("raw-handle-failed-{error}")))?;
             }
-            if operations.contains(&ProtocolOp::Unmap) {
-                self.pointer_bridge.cleanup(app, key, Some(panel.window));
-                panel.begin_unmap(app);
-                unmaps.push((edge, next.clone()));
-            }
-            let awaiting_initial_configure =
-                panel.phase == SurfacePhase::WaitingConfigure && panel.pending_committed.is_some();
-            let advance = commit_advance_for_phase::<std::convert::Infallible>(
-                Ok(panel.apply_protocol_ops(&operations, elapsed)),
-                operations.contains(&ProtocolOp::Unmap),
-                awaiting_initial_configure,
-            )
-            .expect("infallible Wayland request executor");
-            if let Some(mode) = record_commit_advance(
-                &mut panel.last_committed,
-                &mut panel.pending_committed,
-                next,
-                advance,
-                operations.contains(&ProtocolOp::Unmap),
-            ) {
-                committed_modes.push((edge, mode));
-            }
         }
-        if !unmaps.is_empty() {
-            // This non-pipelined update drains render extraction after raw
-            // handle removal and before destroying the protocol objects.
-            app.update();
-            for (edge, next) in unmaps {
-                output.panels[edge.index()].finish_unmap();
-                output.panels[edge.index()].last_committed = Some(next.clone());
-                committed_modes.push((edge, next.mode));
-            }
-        }
-        if !committed_modes.is_empty() {
-            let changed = {
-                let mut modes = app.world_mut().resource_mut::<QuoinCommittedMotionModes>();
-                update_committed_modes(&mut modes, committed_modes)
-            };
-            if changed {
-                self.needs_update = true;
-            }
+        if Self::reconcile(
+            app,
+            pointer_bridge,
+            key,
+            &mut output.panels,
+            output.logical_size,
+            &frame,
+            elapsed,
+            &mut WaylandProtocolExecutor,
+        )? {
+            *needs_update = true;
         }
         self.last_wake = frame.wake;
         if frame.wake == WakePolicy::Animate {
@@ -1271,11 +1388,7 @@ impl LayerShellHandler for RunnerState {
             self.abnormal_exit = true;
             self.exit_reason = Some(format!("configure-out-of-range-{}", error.reason_suffix()));
         } else {
-            if let Some((edge, mode)) = committed_mode {
-                app.world_mut()
-                    .resource_mut::<QuoinCommittedMotionModes>()
-                    .set(edge, mode);
-            }
+            write_configured_motion_latch(app, committed_mode);
             self.needs_update = true;
         }
     }
@@ -1391,45 +1504,12 @@ impl PointerHandler for RunnerState {
 impl RunnerState {
     fn apply_corner_ingress(&mut self, ingress: CornerIngress) {
         self.corner_epoch = self.corner_epoch.max(ingress.epoch());
-        let resets = matches!(
-            &ingress,
-            CornerIngress::Reset { .. } | CornerIngress::Disabled { .. }
-        );
-        let events = match ingress {
-            CornerIngress::Event { output, event, .. }
-                if self.selected_key.as_ref() == Some(&output) =>
-            {
-                let corner = event.corner();
-                let changed = match event {
-                    cosmix_shell::core::CornerEvent::Entered { .. } => {
-                        self.corner_engaged.insert(corner)
-                    }
-                    cosmix_shell::core::CornerEvent::Left { .. } => {
-                        self.corner_engaged.remove(&corner)
-                    }
-                };
-                changed.then_some(event).into_iter().collect::<Vec<_>>()
-            }
-            CornerIngress::Event { .. } => Vec::new(),
-            CornerIngress::Reset { .. } | CornerIngress::Disabled { .. } => self
-                .corner_engaged
-                .iter()
-                .copied()
-                .map(|corner| cosmix_shell::core::CornerEvent::Left { corner })
-                .collect::<Vec<_>>(),
-        };
-        if resets {
-            self.corner_engaged.clear();
-        }
-        let Some(output) = self.selected_key.clone() else {
-            return;
-        };
-        for event in events {
-            stage_shell_command(
-                &mut self.app,
-                output.clone(),
-                ShellCommandKind::Corner(event),
-            );
+        if apply_corner_ingress_to_app(
+            &mut self.app,
+            self.selected_key.as_ref(),
+            &mut self.corner_engaged,
+            ingress,
+        ) {
             self.needs_update = true;
         }
     }
@@ -1458,11 +1538,50 @@ impl RunnerState {
             self.needs_update = true;
         }
         if let Some(pointer) = self.active_pointer.take() {
-            pointer.release();
+            release_pointer(pointer);
         }
         self.active_pointer_seat = None;
         self.promote_pointer(qh);
     }
+}
+
+pub(crate) fn apply_corner_ingress_to_app(
+    app: &mut App,
+    selected_key: Option<&OutputKey>,
+    corner_engaged: &mut BTreeSet<cosmix_shell::core::Corner>,
+    ingress: CornerIngress,
+) -> bool {
+    let resets = matches!(
+        &ingress,
+        CornerIngress::Reset { .. } | CornerIngress::Disabled { .. }
+    );
+    let events = match ingress {
+        CornerIngress::Event { output, event, .. } if selected_key == Some(&output) => {
+            let corner = event.corner();
+            let changed = match event {
+                cosmix_shell::core::CornerEvent::Entered { .. } => corner_engaged.insert(corner),
+                cosmix_shell::core::CornerEvent::Left { .. } => corner_engaged.remove(&corner),
+            };
+            changed.then_some(event).into_iter().collect::<Vec<_>>()
+        }
+        CornerIngress::Event { .. } => Vec::new(),
+        CornerIngress::Reset { .. } | CornerIngress::Disabled { .. } => corner_engaged
+            .iter()
+            .copied()
+            .map(|corner| cosmix_shell::core::CornerEvent::Left { corner })
+            .collect::<Vec<_>>(),
+    };
+    if resets {
+        corner_engaged.clear();
+    }
+    let Some(output) = selected_key.cloned() else {
+        return false;
+    };
+    let changed = !events.is_empty();
+    for event in events {
+        stage_shell_command(app, output.clone(), ShellCommandKind::Corner(event));
+    }
+    changed
 }
 
 delegate_seat!(RunnerState);
@@ -1568,6 +1687,7 @@ delegate_registry!(RunnerState);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
     use bevy::MinimalPlugins;
@@ -1578,6 +1698,102 @@ mod tests {
     use cosmix_shell::runtime::{ShellEffects, ShellRuntimePlugin};
 
     use crate::surface::frame_request_overdue;
+
+    struct FakePointer {
+        version: u32,
+        releases: Arc<Mutex<u32>>,
+    }
+
+    struct ScriptedExecutor {
+        results: VecDeque<Result<ApplyResult, &'static str>>,
+        operations: Vec<(Edge, Vec<ProtocolOp>)>,
+    }
+
+    type TeardownSequences = [Arc<Mutex<Vec<&'static str>>>; 4];
+
+    #[derive(Resource)]
+    struct LateActivation {
+        output: OutputKey,
+        armed: bool,
+    }
+
+    fn emit_late_activation(
+        time: Res<Time<Real>>,
+        mut activation: ResMut<LateActivation>,
+        mut commands: MessageWriter<ShellCommand>,
+        mut redraw: MessageWriter<RequestRedraw>,
+    ) {
+        if !activation.armed {
+            return;
+        }
+        activation.armed = false;
+        commands.write(ShellCommand {
+            output: activation.output.clone(),
+            at: time.elapsed(),
+            kind: ShellCommandKind::Panel {
+                edge: Edge::Left,
+                input: cosmix_shell::core::PanelInput::Pin,
+            },
+        });
+        redraw.write(RequestRedraw);
+    }
+
+    impl ProtocolExecutor for ScriptedExecutor {
+        fn execute(
+            &mut self,
+            panel: &mut PanelSurface,
+            operations: &[ProtocolOp],
+            _elapsed: Duration,
+        ) -> Result<ApplyResult, LayerHostError> {
+            if operations.is_empty() {
+                return Ok(ApplyResult::Noop);
+            }
+            self.operations.push((panel.edge, operations.to_vec()));
+            self.results
+                .pop_front()
+                .unwrap_or(Ok(ApplyResult::Noop))
+                .map_err(LayerHostError::new)
+        }
+    }
+
+    fn reconciliation_panels(
+        app: &mut App,
+        phase: SurfacePhase,
+    ) -> ([PanelSurface; 4], TeardownSequences) {
+        let sequences = std::array::from_fn(|_| Arc::new(Mutex::new(Vec::new())));
+        let panels = std::array::from_fn(|index| {
+            let mut panel = PanelSurface::test_double(app, phase, Arc::clone(&sequences[index]));
+            panel.edge = Edge::ALL[index];
+            panel
+        });
+        (panels, sequences)
+    }
+
+    impl PointerRelease for FakePointer {
+        fn protocol_version(&self) -> u32 {
+            self.version
+        }
+
+        fn release(self) {
+            *self.releases.lock().unwrap() += 1;
+        }
+    }
+
+    #[test]
+    fn pointer_release_is_sent_only_when_the_advertised_version_supports_it() {
+        let releases = Arc::new(Mutex::new(0));
+        release_pointer(FakePointer {
+            version: 2,
+            releases: Arc::clone(&releases),
+        });
+        assert_eq!(*releases.lock().unwrap(), 0);
+
+        release_pointer(FakePointer {
+            version: 3,
+            releases: Arc::clone(&releases),
+        });
+        assert_eq!(*releases.lock().unwrap(), 1);
+    }
 
     #[test]
     fn layer_close_only_exits_for_a_live_output_without_replacement() {
@@ -1627,6 +1843,63 @@ mod tests {
             [(Edge::Left, PanelMode::Hidden)]
         ));
         assert_eq!(modes.get(Edge::Left), PanelMode::Hidden);
+    }
+
+    #[test]
+    fn late_pointer_activation_gets_exactly_one_host_owned_follow_up_update() {
+        let output = OutputKey::new("DP-1").unwrap();
+        let model = ShellModel::new(
+            output.clone(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let mut app = App::new();
+        configure_ingress(&mut app);
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)));
+        app.add_message::<RequestRedraw>()
+            .init_resource::<LayerHostUpdateWake>()
+            .insert_resource(LateActivation {
+                output,
+                armed: true,
+            })
+            .add_systems(Last, capture_layer_host_redraw)
+            .add_systems(
+                Update,
+                emit_late_activation.in_set(cosmix_shell::runtime::ShellRuntimeSet::Host),
+            );
+
+        app.update();
+        assert!(
+            take_layer_host_update_wake(&mut app),
+            "the late activation must request one host follow-up"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .mode,
+            PanelMode::Hidden,
+            "the activation command was produced after this update's Model set"
+        );
+
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .mode,
+            PanelMode::Pinned,
+            "the single follow-up consumes the activation command"
+        );
+        assert!(
+            !take_layer_host_update_wake(&mut app),
+            "a stable app schedules zero further updates"
+        );
     }
 
     #[test]
@@ -1700,6 +1973,206 @@ mod tests {
             [(Edge::Left, hidden.mode)]
         ));
         assert_eq!(last.as_ref(), Some(&hidden));
+    }
+
+    #[test]
+    fn production_reconciliation_commits_configure_latch_rejects_failure_and_unmaps() {
+        let output = OutputKey::new("DP-1").unwrap();
+        let mut model = ShellModel::new(
+            output.clone(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let hidden_frame = cosmix_shell::runtime::ShellFrame::from_model(&model);
+        model
+            .panel_input(
+                Edge::Left,
+                Duration::ZERO,
+                cosmix_shell::core::PanelInput::Reveal,
+            )
+            .unwrap();
+        let revealed_frame = cosmix_shell::runtime::ShellFrame::from_model(&model);
+
+        let mut app = App::new();
+        app.insert_resource(QuoinCommittedMotionModes::hidden());
+        let (mut panels, sequences) = reconciliation_panels(&mut app, SurfacePhase::Configured);
+        for edge in Edge::ALL {
+            panels[edge.index()].last_committed = Some(hidden_frame.panel(edge).clone());
+        }
+        let mut pointer = PointerBridge::default();
+        let mut deferred = ScriptedExecutor {
+            results: VecDeque::from([Ok(ApplyResult::AwaitingConfigure)]),
+            operations: Vec::new(),
+        };
+        assert!(
+            !RunnerState::reconcile(
+                &mut app,
+                &mut pointer,
+                &output,
+                &mut panels,
+                LogicalSize::new(1_000.0, 800.0).unwrap(),
+                &revealed_frame,
+                Duration::ZERO,
+                &mut deferred,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            panels[Edge::Left.index()].pending_committed.as_ref(),
+            Some(revealed_frame.panel(Edge::Left))
+        );
+        assert_eq!(
+            app.world()
+                .resource::<QuoinCommittedMotionModes>()
+                .get(Edge::Left),
+            PanelMode::Hidden
+        );
+
+        let panel = &mut panels[Edge::Left.index()];
+        panel.phase = SurfacePhase::Configured;
+        let configured = panel
+            .commit_pending_configure()
+            .map(|mode| (Edge::Left, mode));
+        assert!(write_configured_motion_latch(&mut app, configured));
+        assert_eq!(
+            app.world()
+                .resource::<QuoinCommittedMotionModes>()
+                .get(Edge::Left),
+            PanelMode::Revealed,
+            "deleting the configured-latch resource write leaves this Hidden"
+        );
+
+        model
+            .panel_input(
+                Edge::Left,
+                Duration::from_millis(1),
+                cosmix_shell::core::PanelInput::Pin,
+            )
+            .unwrap();
+        let pinned_frame = cosmix_shell::runtime::ShellFrame::from_model(&model);
+        let mut failing = ScriptedExecutor {
+            results: VecDeque::from([Err("executor failed")]),
+            operations: Vec::new(),
+        };
+        assert!(
+            RunnerState::reconcile(
+                &mut app,
+                &mut pointer,
+                &output,
+                &mut panels,
+                LogicalSize::new(1_000.0, 800.0).unwrap(),
+                &pinned_frame,
+                Duration::from_millis(1),
+                &mut failing,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            panels[Edge::Left.index()].last_committed.as_ref(),
+            Some(revealed_frame.panel(Edge::Left))
+        );
+        assert_eq!(
+            app.world()
+                .resource::<QuoinCommittedMotionModes>()
+                .get(Edge::Left),
+            PanelMode::Revealed
+        );
+
+        let mut unmapping = ScriptedExecutor {
+            results: VecDeque::from([Ok(ApplyResult::Noop)]),
+            operations: Vec::new(),
+        };
+        assert!(
+            RunnerState::reconcile(
+                &mut app,
+                &mut pointer,
+                &output,
+                &mut panels,
+                LogicalSize::new(1_000.0, 800.0).unwrap(),
+                &hidden_frame,
+                Duration::from_millis(2),
+                &mut unmapping,
+            )
+            .unwrap()
+        );
+        assert_eq!(panels[Edge::Left.index()].phase, SurfacePhase::Unmapped);
+        assert_eq!(
+            app.world()
+                .resource::<QuoinCommittedMotionModes>()
+                .get(Edge::Left),
+            PanelMode::Hidden
+        );
+        assert_eq!(sequences[Edge::Left.index()].lock().unwrap().len(), 4);
+        assert!(unmapping.operations[0].1.contains(&ProtocolOp::Unmap));
+    }
+
+    #[test]
+    fn pending_first_map_whose_grace_expires_unmaps_through_reconciliation() {
+        let output = OutputKey::new("DP-1").unwrap();
+        let mut model = ShellModel::new(
+            output.clone(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        model
+            .panel_input(
+                Edge::Left,
+                Duration::ZERO,
+                cosmix_shell::core::PanelInput::CornerEntered,
+            )
+            .unwrap();
+        let pending_reveal = cosmix_shell::runtime::ShellFrame::from_model(&model);
+        model
+            .panel_input(
+                Edge::Left,
+                Duration::from_millis(1),
+                cosmix_shell::core::PanelInput::CornerLeft,
+            )
+            .unwrap();
+        model.tick(Duration::from_millis(1_001)).unwrap();
+        let expired = cosmix_shell::runtime::ShellFrame::from_model(&model);
+        assert!(!expired.panel(Edge::Left).mapped);
+
+        let mut app = App::new();
+        app.insert_resource(QuoinCommittedMotionModes::hidden());
+        let (mut panels, sequences) =
+            reconciliation_panels(&mut app, SurfacePhase::WaitingConfigure);
+        panels[Edge::Left.index()].pending_committed =
+            Some(pending_reveal.panel(Edge::Left).clone());
+        for edge in [Edge::Bottom, Edge::Right, Edge::Top] {
+            panels[edge.index()].last_committed = Some(expired.panel(edge).clone());
+        }
+        let mut executor = ScriptedExecutor {
+            results: VecDeque::from([Ok(ApplyResult::Noop)]),
+            operations: Vec::new(),
+        };
+
+        RunnerState::reconcile(
+            &mut app,
+            &mut PointerBridge::default(),
+            &output,
+            &mut panels,
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            &expired,
+            Duration::from_millis(1_001),
+            &mut executor,
+        )
+        .unwrap();
+
+        assert_eq!(panels[Edge::Left.index()].phase, SurfacePhase::Unmapped);
+        assert!(panels[Edge::Left.index()].pending_committed.is_none());
+        assert_eq!(
+            panels[Edge::Left.index()].last_committed.as_ref(),
+            Some(expired.panel(Edge::Left))
+        );
+        assert_eq!(sequences[Edge::Left.index()].lock().unwrap().len(), 4);
+        assert!(executor.operations[0].1.contains(&ProtocolOp::Unmap));
     }
 
     #[test]

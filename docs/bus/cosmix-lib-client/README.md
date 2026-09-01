@@ -113,6 +113,15 @@ The outward receiver returned by `incoming` survives transient reconnects.
 fully established connection. The states are `Connecting`, `Connected`,
 `Disconnected`, `ShuttingDown`, and `Fatal`.
 
+That unbounded receiver remains the compatibility default. Opt in to a hard
+subscription memory bound with
+`connect_options(...).bounded_incoming(capacity)`, then take
+`incoming_bounded()`. The socket reader and outward supervisor lane both use
+`try_send`; full lanes drop the new command and expose the loss as a cumulative
+`overflow_count()` plus a one-shot `BoundedIncomingEvent::Overflow` marker.
+Consumers can therefore reset derived state instead of silently continuing
+from an incomplete event stream.
+
 Outbound supervised methods fail immediately unless the state is
 `Connected`. The client does not queue work while disconnected.
 `SupervisedError::Disconnected` and `SupervisedError::ShuttingDown` make

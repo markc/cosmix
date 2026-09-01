@@ -680,15 +680,19 @@ impl PanelSurface {
             self.announced_scale = Some(scale);
         }
         let mode = if effect == ConfigureEffect::InitialMap {
-            self.pending_committed.take().map(|presentation| {
-                let mode = presentation.mode;
-                self.last_committed = Some(presentation);
-                mode
-            })
+            self.commit_pending_configure()
         } else {
             None
         };
         Ok(mode)
+    }
+
+    pub(crate) fn commit_pending_configure(&mut self) -> Option<PanelMode> {
+        self.pending_committed.take().map(|presentation| {
+            let mode = presentation.mode;
+            self.last_committed = Some(presentation);
+            mode
+        })
     }
 
     pub(crate) fn set_fractional_scale(

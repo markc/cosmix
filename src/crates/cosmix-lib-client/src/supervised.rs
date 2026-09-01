@@ -41,7 +41,10 @@ use std::time::{Duration, Instant};
 use rand::Rng;
 use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc, watch};
 
-use crate::native::{NodedClient, RegistrationRejected};
+use crate::bounded::{
+    BoundedIncomingEvent, BoundedIncomingReceiver, BoundedIncomingSender, bounded_incoming_channel,
+};
+use crate::native::{NativeIncomingReceiver, NodedClient, RegistrationRejected};
 use crate::types::IncomingCommand;
 
 /// Bounded attempt budget for the *initial* connect+register. Exhausting
@@ -253,6 +256,8 @@ pub struct SupervisedClient {
     registry: SubscriptionRegistry,
     /// Outward replaceable incoming stream — taken once by the pump.
     incoming_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<IncomingCommand>>>,
+    /// Opt-in bounded outward incoming stream, taken once by its consumer.
+    bounded_incoming_rx: std::sync::Mutex<Option<BoundedIncomingReceiver>>,
     /// Signals the supervisor to stop (no reconnect). `true` = stop.
     shutdown_tx: watch::Sender<bool>,
     supervisor: TokioMutex<Option<tokio::task::JoinHandle<()>>>,
@@ -270,6 +275,7 @@ pub struct SupervisedConnectOptions {
     noded_url: String,
     provenance: Option<cosmix_bus::RegisterProvenance>,
     fatal_on_registration_rejection: bool,
+    bounded_incoming_capacity: Option<usize>,
 }
 
 impl SupervisedConnectOptions {
@@ -277,6 +283,23 @@ impl SupervisedConnectOptions {
     /// terminal. Disabled by default for compatibility with existing citizens.
     pub fn fatal_on_registration_rejection(mut self, enabled: bool) -> Self {
         self.fatal_on_registration_rejection = enabled;
+        self
+    }
+
+    /// Bound every incoming subscription lane for this supervised client.
+    ///
+    /// The socket reader and reconnect-stable outward lane both use
+    /// non-blocking `try_send`. A full lane drops the new command and exposes
+    /// loss through [`BoundedIncomingEvent::Overflow`] and the receiver's
+    /// cumulative overflow counter. Existing users remain unbounded unless
+    /// they opt in here.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `capacity` is zero.
+    pub fn bounded_incoming(mut self, capacity: usize) -> Self {
+        assert!(capacity > 0, "bounded incoming capacity must be non-zero");
+        self.bounded_incoming_capacity = Some(capacity);
         self
     }
 
@@ -294,6 +317,7 @@ impl SupervisedClient {
             noded_url: noded_url.to_string(),
             provenance: None,
             fatal_on_registration_rejection: false,
+            bounded_incoming_capacity: None,
         }
     }
 
@@ -335,6 +359,7 @@ impl SupervisedClient {
             noded_url,
             provenance,
             fatal_on_registration_rejection,
+            bounded_incoming_capacity,
         } = options;
         let (state_tx, _) = watch::channel(ConnState::Connecting);
         let state_publish = Arc::new(std::sync::Mutex::new(()));
@@ -342,10 +367,11 @@ impl SupervisedClient {
         let mut last_err: Option<anyhow::Error> = None;
         let mut client: Option<NodedClient> = None;
         for attempt in 0..MAX_INITIAL_ATTEMPTS {
-            match NodedClient::connect_with_provenance(
+            match NodedClient::connect_with_provenance_and_capacity(
                 &service_name,
                 &noded_url,
                 provenance.clone(),
+                bounded_incoming_capacity,
             )
             .await
             {
@@ -394,7 +420,7 @@ impl SupervisedClient {
         // Take the *first* connection's incoming receiver. The
         // supervisor forwards from it (and every later one) into the
         // single outward channel below.
-        let first_rx = client.incoming_async().await.ok_or_else(|| {
+        let first_rx = client.take_native_incoming().await.ok_or_else(|| {
             // A fresh NodedClient always has its receiver; this only
             // fires on a programming error (someone took it first).
             SupervisedError::Transport(anyhow::anyhow!(
@@ -406,7 +432,16 @@ impl SupervisedClient {
         publish_state(&state_tx, &state_publish, ConnState::Connected);
         let connection_generation = Arc::new(AtomicU64::new(1));
 
-        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let (out_tx, out_rx, bounded_out_rx) = match bounded_incoming_capacity {
+            Some(capacity) => {
+                let (sender, receiver) = bounded_incoming_channel(capacity);
+                (SupervisorOutgoing::Bounded(sender), None, Some(receiver))
+            }
+            None => {
+                let (sender, receiver) = mpsc::unbounded_channel();
+                (SupervisorOutgoing::Unbounded(sender), Some(receiver), None)
+            }
+        };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         // One registry, two handles over the same `Arc<Mutex<…>>`: the
@@ -427,6 +462,7 @@ impl SupervisedClient {
             noded_url: noded_url.to_string(),
             provenance,
             fatal_on_registration_rejection,
+            bounded_incoming_capacity,
             first_rx,
         }));
 
@@ -436,7 +472,8 @@ impl SupervisedClient {
             state_publish,
             connection_generation,
             registry,
-            incoming_rx: std::sync::Mutex::new(Some(out_rx)),
+            incoming_rx: std::sync::Mutex::new(out_rx),
+            bounded_incoming_rx: std::sync::Mutex::new(bounded_out_rx),
             shutdown_tx,
             supervisor: TokioMutex::new(Some(supervisor)),
             service_name,
@@ -456,6 +493,14 @@ impl SupervisedClient {
     /// this.
     pub fn incoming(&self) -> Option<mpsc::UnboundedReceiver<IncomingCommand>> {
         self.incoming_rx.lock().unwrap().take()
+    }
+
+    /// Take the opt-in bounded incoming stream once.
+    ///
+    /// Returns `None` when this client was built with the default unbounded
+    /// lane, or when the bounded receiver has already been taken.
+    pub fn incoming_bounded(&self) -> Option<BoundedIncomingReceiver> {
+        self.bounded_incoming_rx.lock().unwrap().take()
     }
 
     /// Current connection state.
@@ -844,13 +889,39 @@ impl Drop for SupervisedClient {
 }
 
 /// Everything the detached supervisor task owns.
+enum SupervisorOutgoing {
+    Unbounded(mpsc::UnboundedSender<IncomingCommand>),
+    Bounded(BoundedIncomingSender),
+}
+
+impl SupervisorOutgoing {
+    /// Returns `false` only when the outward consumer has gone away.
+    fn forward(&self, event: BoundedIncomingEvent) -> bool {
+        match (self, event) {
+            (Self::Unbounded(sender), BoundedIncomingEvent::Command(command)) => {
+                sender.send(command).is_ok()
+            }
+            (Self::Unbounded(_), BoundedIncomingEvent::Overflow { .. }) => {
+                unreachable!("an unbounded native lane cannot overflow")
+            }
+            (Self::Bounded(sender), BoundedIncomingEvent::Command(command)) => {
+                sender.try_send(command)
+            }
+            (Self::Bounded(sender), BoundedIncomingEvent::Overflow { dropped }) => {
+                sender.record_overflow(dropped);
+                true
+            }
+        }
+    }
+}
+
 struct SupervisorCtx {
     inner: Arc<RwLock<Arc<NodedClient>>>,
     state_tx: watch::Sender<ConnState>,
     state_publish: Arc<std::sync::Mutex<()>>,
     connection_generation: Arc<AtomicU64>,
     registry: SubscriptionRegistry,
-    out_tx: mpsc::UnboundedSender<IncomingCommand>,
+    out_tx: SupervisorOutgoing,
     shutdown_rx: watch::Receiver<bool>,
     service_name: String,
     noded_url: String,
@@ -860,7 +931,8 @@ struct SupervisorCtx {
     provenance: Option<cosmix_bus::RegisterProvenance>,
     /// Opt-in terminal policy for application-level register refusals.
     fatal_on_registration_rejection: bool,
-    first_rx: mpsc::UnboundedReceiver<IncomingCommand>,
+    bounded_incoming_capacity: Option<usize>,
+    first_rx: NativeIncomingReceiver,
 }
 
 /// `true` once a stop has been requested (explicit shutdown, or the
@@ -907,8 +979,8 @@ async fn supervisor_loop(mut ctx: SupervisorCtx) {
                 }
                 maybe = current_rx.recv() => {
                     match maybe {
-                        Some(cmd) => {
-                            if ctx.out_tx.send(cmd).is_err() {
+                        Some(event) => {
+                            if !ctx.out_tx.forward(event) {
                                 // Pump (consumer) gone — nothing left to
                                 // supervise.
                                 tracing::info!(
@@ -955,10 +1027,11 @@ async fn supervisor_loop(mut ctx: SupervisorCtx) {
                 return;
             }
 
-            match NodedClient::connect_with_provenance(
+            match NodedClient::connect_with_provenance_and_capacity(
                 &ctx.service_name,
                 &ctx.noded_url,
                 ctx.provenance.clone(),
+                ctx.bounded_incoming_capacity,
             )
             .await
             {
@@ -1021,7 +1094,7 @@ async fn supervisor_loop(mut ctx: SupervisorCtx) {
                         continue;
                     }
 
-                    match client.incoming_async().await {
+                    match client.take_native_incoming().await {
                         Some(rx) => {
                             // Final stop check before the swap: if a stop
                             // landed after the post-connect check, do not

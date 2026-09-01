@@ -1004,6 +1004,11 @@ mod tests {
         app.world_mut().run_system_cached(pointer_events).unwrap();
         app.world_mut().flush();
         assert_eq!(app.world().resource::<Messages<Pointer<Click>>>().len(), 1);
+        assert_eq!(
+            app.world().resource::<Messages<RequestRedraw>>().len(),
+            1,
+            "a pointer activation must request the non-Winit host follow-up"
+        );
         app.world_mut()
             .resource_mut::<Messages<ShellCommand>>()
             .drain()

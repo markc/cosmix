@@ -126,6 +126,12 @@ and reconnect is automatic and starts disengaged. Topic delivery authenticates
 neither the original publisher nor its `from` header, so any local publisher
 authorised for those topics can inject corner events.
 
+Quoin opts into `cosmix-lib-client`'s bounded subscription receiver at 64
+commands. The socket reader never waits for capacity; a full lane drops the new
+frame and surfaces an overflow marker. Quoin treats that marker exactly like a
+disconnect: synthesize left for all engagements, invalidate the slug map, and
+refresh it before accepting mapped corner state again.
+
 A compositor enter reveals and holds the clockwise edge (TL→left, BL→bottom,
 BR→right, TR→top). Matching left starts the 800 ms grace only when the native
 pointer is also outside. Native SCTK pointer enter/leave supplies the second

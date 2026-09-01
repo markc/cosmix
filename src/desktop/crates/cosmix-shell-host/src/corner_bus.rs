@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use calloop::channel::{Channel, SyncSender, sync_channel};
 use cosmix_client::{
-    ConnState, IncomingCommand, RegistrationRejected, SupervisedClient, SupervisedError,
+    BoundedIncomingEvent, BoundedIncomingReceiver, ConnState, IncomingCommand,
+    RegistrationRejected, SupervisedClient, SupervisedError,
 };
 use cosmix_shell::core::{Corner, CornerEvent, CornerTrigger, OutputKey};
 use serde::Deserialize;
@@ -180,6 +181,25 @@ trait LiveCornerBusSession: CornerBusSession + Send + Sync + 'static {
     fn connection_generation(&self) -> u64;
 }
 
+trait WorkerSession: LiveCornerBusSession {
+    fn take_incoming_lane(&self) -> Option<Arc<IncomingLane>>;
+    fn close_session(&self) -> impl std::future::Future<Output = ()> + Send;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerConnectError {
+    Unavailable,
+    Rejected,
+}
+
+trait WorkerConnector {
+    type Session: WorkerSession;
+
+    fn connect(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Arc<Self::Session>, WorkerConnectError>> + Send;
+}
+
 impl CornerBusSession for SupervisedClient {
     async fn subscribe(&self, topic: &str) -> Result<(), String> {
         self.subscribe_topic(topic)
@@ -206,6 +226,40 @@ impl LiveCornerBusSession for SupervisedClient {
 
     fn connection_generation(&self) -> u64 {
         SupervisedClient::connection_generation(self)
+    }
+}
+
+impl WorkerSession for SupervisedClient {
+    fn take_incoming_lane(&self) -> Option<Arc<IncomingLane>> {
+        self.incoming_bounded().map(start_incoming_pump)
+    }
+
+    async fn close_session(&self) {
+        close_client(self).await;
+    }
+}
+
+struct SupervisedConnector {
+    url: String,
+}
+
+impl WorkerConnector for SupervisedConnector {
+    type Session = SupervisedClient;
+
+    async fn connect(&mut self) -> Result<Arc<Self::Session>, WorkerConnectError> {
+        SupervisedClient::connect_options(SERVICE, &self.url)
+            .fatal_on_registration_rejection(true)
+            .bounded_incoming(CHANNEL_CAPACITY)
+            .connect()
+            .await
+            .map(Arc::new)
+            .map_err(|error| {
+                if registration_rejected(&error) {
+                    WorkerConnectError::Rejected
+                } else {
+                    WorkerConnectError::Unavailable
+                }
+            })
     }
 }
 
@@ -431,6 +485,7 @@ enum ConnectOutcome<T> {
     Shutdown,
 }
 
+#[cfg(test)]
 async fn connect_optional<T, E, F, Fut, P>(
     shutdown: &mut watch::Receiver<bool>,
     mut connect: F,
@@ -470,6 +525,34 @@ async fn wait_backoff(shutdown: &mut watch::Receiver<bool>, duration: Duration) 
     tokio::select! {
         _ = tokio::time::sleep(duration) => Ok(()),
         _ = wait_shutdown(shutdown) => Err(()),
+    }
+}
+
+async fn connect_worker<C: WorkerConnector>(
+    connector: &mut C,
+    shutdown: &mut watch::Receiver<bool>,
+) -> ConnectOutcome<Arc<C::Session>> {
+    let mut backoff = Duration::from_millis(100);
+    loop {
+        if *shutdown.borrow() {
+            return ConnectOutcome::Shutdown;
+        }
+        let connecting = connector.connect();
+        tokio::pin!(connecting);
+        match tokio::select! {
+            connected = &mut connecting => Some(connected),
+            _ = wait_shutdown(shutdown) => None,
+        } {
+            Some(Ok(client)) => return ConnectOutcome::Connected(client),
+            Some(Err(WorkerConnectError::Rejected)) => return ConnectOutcome::Rejected,
+            Some(Err(WorkerConnectError::Unavailable)) => {
+                if wait_backoff(shutdown, backoff).await.is_err() {
+                    return ConnectOutcome::Shutdown;
+                }
+                backoff = next_backoff(backoff);
+            }
+            None => return ConnectOutcome::Shutdown,
+        }
     }
 }
 
@@ -545,9 +628,10 @@ fn process_incoming_observation(
             Some(state.decode_and_apply(command, sender, overflowed, shared_epoch))
         }
         IncomingObservation::Overflow => {
+            state.map_valid = false;
             state.reset(sender, overflowed, shared_epoch);
             tracing::warn!(event = "quoin_corner_client_ingress_overflow");
-            Some(DecodeAction::None)
+            Some(DecodeAction::Refresh)
         }
         IncomingObservation::Closed => None,
     }
@@ -587,6 +671,14 @@ impl IncomingLane {
         self.notify.notify_one();
     }
 
+    fn overflow(&self) {
+        self.state
+            .lock()
+            .expect("incoming lane lock is not poisoned")
+            .overflowed = true;
+        self.notify.notify_one();
+    }
+
     async fn observe(&self) -> IncomingObservation {
         loop {
             let notified = self.notify.notified();
@@ -611,14 +703,15 @@ impl IncomingLane {
     }
 }
 
-fn start_incoming_pump(
-    mut incoming: tokio_mpsc::UnboundedReceiver<IncomingCommand>,
-) -> Arc<IncomingLane> {
+fn start_incoming_pump(mut incoming: BoundedIncomingReceiver) -> Arc<IncomingLane> {
     let lane = IncomingLane::new();
     let pump_lane = Arc::clone(&lane);
     tokio::spawn(async move {
-        while let Some(command) = incoming.recv().await {
-            pump_lane.push(command);
+        while let Some(event) = incoming.recv().await {
+            match event {
+                BoundedIncomingEvent::Command(command) => pump_lane.push(command),
+                BoundedIncomingEvent::Overflow { .. } => pump_lane.overflow(),
+            }
         }
         pump_lane.close();
     });
@@ -669,31 +762,47 @@ impl RefreshRetry {
 
 async fn worker(
     comp_service: String,
+    selected: OutputKey,
+    selected_rx: watch::Receiver<(OutputKey, u64)>,
+    sender: SyncSender<CornerIngress>,
+    overflowed: Arc<AtomicBool>,
+    shared_epoch: Arc<AtomicU64>,
+    shutdown: watch::Receiver<bool>,
+) {
+    let mut connector = SupervisedConnector {
+        url: cosmix_config::client_helpers::resolve_noded_url(),
+    };
+    worker_with_connector(
+        comp_service,
+        selected,
+        selected_rx,
+        sender,
+        overflowed,
+        shared_epoch,
+        shutdown,
+        &mut connector,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn worker_with_connector<C: WorkerConnector>(
+    comp_service: String,
     _selected: OutputKey,
     mut selected_rx: watch::Receiver<(OutputKey, u64)>,
     sender: SyncSender<CornerIngress>,
     overflowed: Arc<AtomicBool>,
     shared_epoch: Arc<AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
+    connector: &mut C,
 ) {
     let topics = Topics::new(&comp_service);
-    let url = cosmix_config::client_helpers::resolve_noded_url();
     let mut bootstrap_backoff = Duration::from_millis(100);
     while !*shutdown.borrow() {
         let current_selection = selected_rx.borrow_and_update().clone();
         let selected = current_selection.0;
-        let client = match connect_optional(
-            &mut shutdown,
-            || {
-                SupervisedClient::connect_options(SERVICE, &url)
-                    .fatal_on_registration_rejection(true)
-                    .connect()
-            },
-            registration_rejected,
-        )
-        .await
-        {
-            ConnectOutcome::Connected(client) => Arc::new(client),
+        let client = match connect_worker(connector, &mut shutdown).await {
+            ConnectOutcome::Connected(client) => client,
             ConnectOutcome::Rejected => {
                 let mut epoch = shared_epoch.load(Ordering::Acquire);
                 send(
@@ -707,8 +816,8 @@ async fn worker(
             }
             ConnectOutcome::Shutdown => return,
         };
-        let Some(incoming) = client.incoming() else {
-            close_client(&client).await;
+        let Some(incoming) = client.take_incoming_lane() else {
+            client.close_session().await;
             if wait_backoff(&mut shutdown, bootstrap_backoff)
                 .await
                 .is_err()
@@ -718,7 +827,6 @@ async fn worker(
             bootstrap_backoff = next_backoff(bootstrap_backoff);
             continue;
         };
-        let incoming = start_incoming_pump(incoming);
         // Subscribe to state and sample its generation before bootstrap so a
         // disconnect/reconnect cannot make the snapshot look current.
         let connection_state = LiveCornerBusSession::subscribe_state(client.as_ref());
@@ -740,12 +848,12 @@ async fn worker(
                 bootstrap_backoff = Duration::from_millis(100);
             }
             None => {
-                close_client(&client).await;
+                client.close_session().await;
                 return;
             }
             Some(Err(error)) => {
                 tracing::warn!(event = "quoin_corner_bootstrap_failed", reason = %error);
-                close_client(&client).await;
+                client.close_session().await;
                 if wait_backoff(&mut shutdown, bootstrap_backoff)
                     .await
                     .is_err()
@@ -757,7 +865,7 @@ async fn worker(
             }
             Some(Ok(_)) => {
                 tracing::warn!(event = "quoin_corner_bootstrap_stale_generation");
-                close_client(&client).await;
+                client.close_session().await;
                 if wait_backoff(&mut shutdown, bootstrap_backoff)
                     .await
                     .is_err()
@@ -783,7 +891,7 @@ async fn worker(
         )
         .await;
         state.reset(&sender, &overflowed, &shared_epoch);
-        close_client(&client).await;
+        client.close_session().await;
         if session_exit != SessionExit::Ended {
             return;
         }
@@ -1202,6 +1310,21 @@ mod tests {
         generation: AtomicU64,
     }
 
+    struct FakeWorkerSession {
+        name: &'static str,
+        calls: Arc<Mutex<Vec<String>>>,
+        output_results: Mutex<VecDeque<Result<OutputMap, String>>>,
+        state_tx: watch::Sender<ConnState>,
+        generation: AtomicU64,
+        incoming: Mutex<Option<Arc<IncomingLane>>>,
+    }
+
+    struct FakeWorkerConnector {
+        calls: Arc<Mutex<Vec<String>>>,
+        attempts: usize,
+        results: VecDeque<Result<Arc<FakeWorkerSession>, WorkerConnectError>>,
+    }
+
     impl CornerBusSession for FakeSession {
         async fn subscribe(&self, topic: &str) -> Result<(), String> {
             self.calls
@@ -1279,6 +1402,97 @@ mod tests {
         fn connection_generation(&self) -> u64 {
             self.generation.load(Ordering::Acquire)
         }
+    }
+
+    impl CornerBusSession for FakeWorkerSession {
+        async fn subscribe(&self, topic: &str) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("subscribe:{}:{topic}", self.name));
+            Ok(())
+        }
+
+        fn outputs(
+            &self,
+            service: &str,
+        ) -> impl std::future::Future<Output = Result<OutputMap, String>> + Send {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("read:{}:{service}", self.name));
+            std::future::ready(
+                self.output_results
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| {
+                        Ok(BTreeMap::from([(
+                            "o_dp_1".to_owned(),
+                            OutputKey::new("DP-1").unwrap(),
+                        )]))
+                    }),
+            )
+        }
+    }
+
+    impl LiveCornerBusSession for FakeWorkerSession {
+        fn state(&self) -> ConnState {
+            *self.state_tx.borrow()
+        }
+
+        fn subscribe_state(&self) -> watch::Receiver<ConnState> {
+            self.state_tx.subscribe()
+        }
+
+        fn connection_generation(&self) -> u64 {
+            self.generation.load(Ordering::Acquire)
+        }
+    }
+
+    impl WorkerSession for FakeWorkerSession {
+        fn take_incoming_lane(&self) -> Option<Arc<IncomingLane>> {
+            self.incoming.lock().unwrap().take()
+        }
+
+        async fn close_session(&self) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("close-and-reap:{}", self.name));
+        }
+    }
+
+    impl WorkerConnector for FakeWorkerConnector {
+        type Session = FakeWorkerSession;
+
+        async fn connect(&mut self) -> Result<Arc<Self::Session>, WorkerConnectError> {
+            self.attempts += 1;
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("connect:{}", self.attempts));
+            self.results
+                .pop_front()
+                .expect("fake connector has one result per expected attempt")
+        }
+    }
+
+    fn fake_worker_session(
+        name: &'static str,
+        calls: Arc<Mutex<Vec<String>>>,
+        outputs: Result<OutputMap, String>,
+        incoming: Arc<IncomingLane>,
+    ) -> Arc<FakeWorkerSession> {
+        let (state_tx, _) = watch::channel(ConnState::Connected);
+        Arc::new(FakeWorkerSession {
+            name,
+            calls,
+            output_results: Mutex::new(VecDeque::from([outputs])),
+            state_tx,
+            generation: AtomicU64::new(1),
+            incoming: Mutex::new(Some(incoming)),
+        })
     }
 
     fn incoming(topic: &str, command: &str, body: &str) -> IncomingCommand {
@@ -1848,7 +2062,7 @@ mod tests {
                         &overflow,
                         &epoch,
                     ),
-                    Some(DecodeAction::None)
+                    Some(DecodeAction::Refresh)
                 );
                 assert!(matches!(channel.try_recv(), Ok(CornerIngress::Reset { .. })));
                 lane.close();
@@ -2031,6 +2245,78 @@ mod tests {
     }
 
     #[test]
+    fn fake_session_flood_surfaces_overflow_and_resets_before_retained_frames() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (state_tx, state_rx) = watch::channel(ConnState::Connected);
+                let client = Arc::new(FakeLiveSession {
+                    output_results: Mutex::new(VecDeque::new()),
+                    output_calls: AtomicU64::new(0),
+                    state_tx,
+                    generation: AtomicU64::new(1),
+                });
+                let lane = IncomingLane::new();
+                for sequence in 0..=CHANNEL_CAPACITY {
+                    lane.push(incoming(
+                        "comp.corner.entered",
+                        "corner.entered",
+                        &format!(
+                            r#"{{"output":"o_dp_1","corner":"tl","dwell_ms":200,"event_seq":{sequence}}}"#
+                        ),
+                    ));
+                }
+                let closing_lane = Arc::clone(&lane);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    closing_lane.close();
+                });
+                let (sender, channel) = sync_channel(CHANNEL_CAPACITY + 4);
+                let overflow = AtomicBool::new(false);
+                let epoch = AtomicU64::new(0);
+                let mut state = WorkerState::new("comp", OutputKey::new("DP-1").unwrap());
+                state.install_outputs(
+                    BTreeMap::from([(
+                        "o_dp_1".to_owned(),
+                        OutputKey::new("DP-1").unwrap(),
+                    )]),
+                    &sender,
+                    &overflow,
+                    &epoch,
+                );
+                state.engaged.insert(("o_dp_1".to_owned(), Corner::TopLeft));
+                let (_selected_tx, mut selected_rx) =
+                    watch::channel((OutputKey::new("DP-1").unwrap(), 0));
+                let (_shutdown_tx, mut shutdown) = watch::channel(false);
+
+                assert_eq!(
+                    run_connected_session(
+                        Arc::clone(&client),
+                        "comp".to_owned(),
+                        lane,
+                        state_rx,
+                        1,
+                        &mut selected_rx,
+                        &sender,
+                        &overflow,
+                        &epoch,
+                        &mut shutdown,
+                        &mut state,
+                    )
+                    .await,
+                    SessionExit::Ended
+                );
+                assert!(matches!(
+                    channel.try_recv(),
+                    Ok(CornerIngress::Reset { .. })
+                ));
+                assert!(client.output_calls.load(Ordering::Acquire) >= 1);
+            });
+    }
+
+    #[test]
     fn fake_absent_broker_retry_and_shutdown_ack_are_bounded() {
         let (shutdown_tx, mut shutdown) = watch::channel(false);
         let attempts = std::cell::Cell::new(0_u8);
@@ -2063,5 +2349,205 @@ mod tests {
         let before = Instant::now();
         assert!(handle.shutdown());
         assert!(before.elapsed() <= Duration::from_millis(300));
+    }
+
+    #[test]
+    fn outer_worker_closes_and_reaps_the_old_name_before_reconnect() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let lane = IncomingLane::new();
+                lane.close();
+                let first = fake_worker_session(
+                    "first",
+                    Arc::clone(&calls),
+                    Ok(BTreeMap::from([(
+                        "o_dp_1".to_owned(),
+                        OutputKey::new("DP-1").unwrap(),
+                    )])),
+                    lane,
+                );
+                let mut connector = FakeWorkerConnector {
+                    calls: Arc::clone(&calls),
+                    attempts: 0,
+                    results: VecDeque::from([Ok(first), Err(WorkerConnectError::Rejected)]),
+                };
+                let (_selected_tx, selected_rx) =
+                    watch::channel((OutputKey::new("DP-1").unwrap(), 0));
+                let (_shutdown_tx, shutdown) = watch::channel(false);
+                let (sender, _channel) = sync_channel(CHANNEL_CAPACITY);
+
+                worker_with_connector(
+                    "comp".to_owned(),
+                    OutputKey::new("DP-1").unwrap(),
+                    selected_rx,
+                    sender,
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicU64::new(0)),
+                    shutdown,
+                    &mut connector,
+                )
+                .await;
+
+                let calls = calls.lock().unwrap();
+                let close = calls
+                    .iter()
+                    .position(|call| call == "close-and-reap:first")
+                    .unwrap();
+                let reconnect = calls.iter().position(|call| call == "connect:2").unwrap();
+                assert!(
+                    close < reconnect,
+                    "old name must be reaped before reconnect"
+                );
+            });
+    }
+
+    #[test]
+    fn outer_worker_registration_rejection_disables_only_corner_ingress() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let mut connector = FakeWorkerConnector {
+                    calls: Arc::clone(&calls),
+                    attempts: 0,
+                    results: VecDeque::from([Err(WorkerConnectError::Rejected)]),
+                };
+                let (_selected_tx, selected_rx) =
+                    watch::channel((OutputKey::new("DP-1").unwrap(), 0));
+                let (_shutdown_tx, shutdown) = watch::channel(false);
+                let (sender, channel) = sync_channel(CHANNEL_CAPACITY);
+
+                worker_with_connector(
+                    "comp".to_owned(),
+                    OutputKey::new("DP-1").unwrap(),
+                    selected_rx,
+                    sender,
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicU64::new(0)),
+                    shutdown,
+                    &mut connector,
+                )
+                .await;
+
+                assert_eq!(&*calls.lock().unwrap(), &["connect:1"]);
+                let disabled = channel.try_recv().unwrap();
+                assert!(matches!(disabled, CornerIngress::Disabled { epoch: 0 }));
+                assert!(channel.try_recv().is_err());
+
+                let output = OutputKey::new("DP-1").unwrap();
+                let model = cosmix_shell::core::ShellModel::new(
+                    output.clone(),
+                    cosmix_shell::core::LogicalSize::new(1_000.0, 800.0).unwrap(),
+                    Duration::ZERO,
+                    Duration::from_millis(800),
+                    Duration::from_millis(200),
+                )
+                .unwrap();
+                let mut app = bevy::prelude::App::new();
+                crate::input::configure_ingress(&mut app);
+                app.add_plugins((
+                    bevy::MinimalPlugins,
+                    cosmix_shell::runtime::ShellRuntimePlugin::new(model),
+                ))
+                .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                    Duration::from_millis(200),
+                ));
+                crate::input::stage_shell_command(
+                    &mut app,
+                    output.clone(),
+                    cosmix_shell::runtime::ShellCommandKind::Panel {
+                        edge: cosmix_shell::core::Edge::Left,
+                        input: cosmix_shell::core::PanelInput::Reveal,
+                    },
+                );
+                crate::input::stage_shell_command(
+                    &mut app,
+                    output.clone(),
+                    cosmix_shell::runtime::ShellCommandKind::Panel {
+                        edge: cosmix_shell::core::Edge::Left,
+                        input: cosmix_shell::core::PanelInput::PointerEntered,
+                    },
+                );
+                let mut corners = BTreeSet::from([Corner::TopLeft]);
+                assert!(crate::runner::apply_corner_ingress_to_app(
+                    &mut app,
+                    Some(&output),
+                    &mut corners,
+                    disabled,
+                ));
+                app.update();
+                crate::input::stage_shell_command(
+                    &mut app,
+                    output,
+                    cosmix_shell::runtime::ShellCommandKind::Panel {
+                        edge: cosmix_shell::core::Edge::Left,
+                        input: cosmix_shell::core::PanelInput::PointerLeft,
+                    },
+                );
+                app.update();
+                assert!(
+                    matches!(
+                        app.world()
+                            .resource::<cosmix_shell::runtime::ShellFrameState>()
+                            .0
+                            .wake,
+                        cosmix_shell::runtime::WakePolicy::WakeAt(_)
+                    ),
+                    "registration rejection must leave pointer enter/leave and grace operational"
+                );
+            });
+    }
+
+    #[test]
+    fn outer_worker_bootstrap_failure_closes_before_retrying() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let lane = IncomingLane::new();
+                let first = fake_worker_session(
+                    "bootstrap-failed",
+                    Arc::clone(&calls),
+                    Err("snapshot rejected".to_owned()),
+                    lane,
+                );
+                let mut connector = FakeWorkerConnector {
+                    calls: Arc::clone(&calls),
+                    attempts: 0,
+                    results: VecDeque::from([Ok(first), Err(WorkerConnectError::Rejected)]),
+                };
+                let (_selected_tx, selected_rx) =
+                    watch::channel((OutputKey::new("DP-1").unwrap(), 0));
+                let (_shutdown_tx, shutdown) = watch::channel(false);
+                let (sender, _channel) = sync_channel(CHANNEL_CAPACITY);
+
+                worker_with_connector(
+                    "comp".to_owned(),
+                    OutputKey::new("DP-1").unwrap(),
+                    selected_rx,
+                    sender,
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicU64::new(0)),
+                    shutdown,
+                    &mut connector,
+                )
+                .await;
+
+                let calls = calls.lock().unwrap();
+                let close = calls
+                    .iter()
+                    .position(|call| call == "close-and-reap:bootstrap-failed")
+                    .unwrap();
+                let retry = calls.iter().position(|call| call == "connect:2").unwrap();
+                assert!(close < retry, "failed bootstrap must close before retry");
+            });
     }
 }
