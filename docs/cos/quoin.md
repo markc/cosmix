@@ -22,6 +22,8 @@ explicitly selected output unmaps and render-drains all four panels, drops
 their protocol resources, then exits cleanly; a later output reusing the same
 name is not the selected object. A default selection instead migrates to the
 next complete output, or exits cleanly when none remains.
+If a compositor advertises duplicate output names, explicit selection uses the
+first complete match in advertisement order.
 
 Layer protocol and viewport destination dimensions remain logical. Integer
 output scale 1 or 2 renders physical buffers at `logical × scale` and applies
@@ -29,8 +31,10 @@ that integer with `wl_surface.set_buffer_scale`. With a fractional preferred
 scale such as 1.25 (150/120), Quoin keeps buffer scale 1, renders
 `ceil(logical × scale)` physical pixels and sets the `wp_viewport` destination
 back to the configured logical size. Bevy stores the corresponding physical
-resolution and scale override. Either zero configure dimension falls back to
-the planner-requested logical dimension; a compositor close or invalid scale
+resolution and scale override. Every configure and scale change is checked
+against the renderer's negotiated maximum 2D texture dimension before protocol
+or Bevy window state changes. Either zero configure dimension falls back to the
+planner-requested logical dimension; a compositor close or invalid scale
 terminates the affected lifecycle cleanly rather than panicking.
 
 ## Map, presentation and replay
@@ -156,12 +160,13 @@ consume them.
 SCTK installs the compositor xkb keymap and maps physical keys, logical keys,
 text, modifiers and repeat into Bevy's input model. Focus loss, panel teardown
 and keyboard capability loss synthesize releases for held keys, clear pressed
-state and stop repeat. Touch down is attributed to the exact panel surface;
-motion and up retain that attribution and use the same panel-to-output logical
-coordinate conversion as the pointer bridge. Touch cancel, teardown and
-capability loss emit cancellation and clear every held contact. Quoin chooses
-the first advertised seat independently for pointer, keyboard and touch, and
-fails each capability over after its selected seat is removed.
+state and stop repeat. Compositor repeat settings are clamped to 1–125 Hz and a
+50–2000 ms delay; each fired deadline advances strictly beyond both its prior
+deadline and current model time. Touch down is attributed to the exact panel
+surface; motion and up retain that local Bevy window attribution. Touch cancel,
+teardown and capability loss emit cancellation and clear every held contact.
+Quoin chooses the first advertised seat independently for pointer, keyboard
+and touch, and fails each capability over after its selected seat is removed.
 
 The pure `CornerDetector` remains a development-host tuning tool and is not a
 production reveal source.
@@ -203,6 +208,10 @@ input capability. It does not mirror panels across several outputs; pointer,
 keyboard and touch may come from different seats when the compositor splits
 those capabilities. Use `--output NAME` when advertisement-order selection is
 not appropriate.
+
+On compositors binding `wl_keyboard` below version 4 and therefore sending no
+`repeat_info`, SCTK 0.19.2 supplies no usable synthetic default, so keyboard
+repeat is unavailable.
 
 Destroy-and-recreate is required because the current compositor rejects an
 acknowledgement for a configure serial retained across unmap. If the
