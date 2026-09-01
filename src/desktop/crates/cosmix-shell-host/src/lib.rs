@@ -3,6 +3,8 @@
 #![deny(unsafe_code)]
 
 mod corner_bus;
+#[cfg(test)]
+mod feature_graph;
 pub mod input;
 mod input_keysym;
 pub mod output;

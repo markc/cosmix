@@ -3,7 +3,7 @@
 # consumed by apps over a `../../ctk` path dependency. See desktop/APPS.md.
 [package]
 name = "ctk"
-version = "0.50.1"
+version = "0.51.0"
 description = "Cosmix Tool Kit — reusable, Bus-citizen Bevy widgets for dense desktop surfaces"
 edition = "2021"
 rust-version = "1.95"
@@ -18,8 +18,8 @@ default = ["menus", "platform-wayland"]
 # Menu bars and context menus. This remains a default feature to preserve the
 # existing CTK surface; consumers can opt out with `default-features = false`.
 menus = []
-# Standalone CTK commands default to Wayland. Platform features remain
-# separate so a no-default-features consumer can select a future X11 host.
+# Standalone CTK commands default to Wayland. A default-features=false
+# consumer must pair CTK with platform-wayland or platform-x11.
 platform-wayland = ["bevy/wayland"]
 platform-x11 = ["bevy/x11"]
 # `bus` carries every wire codec (JSON bodies via serde_json, base64 A.6
@@ -89,13 +89,23 @@ system-clipboard = ["bevy/system_clipboard"]
 # CTK follows Feathers rather than copying it. Keep this exact: every Bevy
 # release is a deliberate compatibility pass because the widget APIs churn.
 bevy = { version = "=0.19.0", default-features = false, features = [
+    # Preserve `ui`'s non-backend `default_platform` surface. Backend choice
+    # belongs to CTK's platform-wayland/platform-x11 features above.
     "ui_api",
     "ui_bevy_render",
     "scene",
     "picking",
     "bevy_ui_widgets",
-    "bevy_feathers",
+    "std",
+    "bevy_gilrs",
+    "bevy_winit",
     "bevy_clipboard",
+    "default_font",
+    "multi_threaded",
+    "webgl2",
+    "custom_cursor",
+    "sysinfo_plugin",
+    "bevy_feathers",
     "accesskit_unix",
     "system_font_discovery",
 ] }

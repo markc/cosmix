@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-shell"
-version = "0.3.1"
+version = "0.4.0"
 description = "Pure core and host seams for the Cosmix Quoin desktop shell"
 edition = "2024"
 rust-version = "1.95"
@@ -10,7 +10,8 @@ license = "MIT"
 default = []
 # The normal chrome surface selects Wayland explicitly. `chrome-core` keeps
 # the UI separate from platform selection, so a future X11 host can pair it
-# with `platform-x11` without also enabling Wayland.
+# with `platform-x11` without also enabling Wayland. `chrome-core` must be
+# paired with at least one platform feature on Unix.
 chrome = ["chrome-core", "platform-wayland"]
 chrome-core = ["dep:accesskit", "dep:bevy", "dep:ctk"]
 dev-host = ["chrome"]
@@ -19,5 +20,22 @@ platform-x11 = ["bevy/bevy_winit", "bevy/x11", "ctk?/platform-x11"]
 
 [dependencies]
 accesskit = { version = "0.24", optional = true }
-bevy = { version = "=0.19.0", default-features = false, features = ["ui_api", "ui_bevy_render", "scene", "picking", "bevy_ui_widgets", "bevy_feathers"], optional = true }
+bevy = { version = "=0.19.0", default-features = false, features = [
+    # Preserve `ui`'s non-backend `default_platform` surface. Backend choice
+    # belongs to platform-wayland/platform-x11 above.
+    "ui_api",
+    "ui_bevy_render",
+    "scene",
+    "picking",
+    "bevy_ui_widgets",
+    "std",
+    "bevy_gilrs",
+    "bevy_clipboard",
+    "default_font",
+    "multi_threaded",
+    "webgl2",
+    "custom_cursor",
+    "sysinfo_plugin",
+    "bevy_feathers",
+], optional = true }
 ctk = { path = "../../ctk", default-features = false, optional = true }

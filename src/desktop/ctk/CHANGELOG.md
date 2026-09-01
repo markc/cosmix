@@ -1,10 +1,17 @@
 # Changelog
 
-## 0.50.1 — 2026-09-02
+## 0.51.0 — 2026-09-02
 
-- Select Bevy's Wayland and clipboard features explicitly so standalone CTK
-  examples compile without borrowing either feature from another workspace
-  package.
+- Breaking: replace Bevy's combined default-platform backend behaviour with
+  explicit `platform-wayland` and `platform-x11` CTK features. Defaults now
+  select Wayland only; a `default-features = false` consumer must select the
+  platform feature matching its host, and an X11 consumer must enable
+  `platform-x11`.
+- Preserve the non-backend members formerly supplied by Bevy's `ui` umbrella,
+  including its embedded default font, multi-threaded scheduler, cursor,
+  clipboard, gamepad, web and system-information support. CTK also declares
+  `bevy_winit` directly for its theme wake path instead of borrowing it from a
+  host's unified feature graph.
 
 ## 0.50.0 — 2026-08-30
 
