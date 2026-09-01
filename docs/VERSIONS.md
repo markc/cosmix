@@ -26,7 +26,7 @@ CosMix Agent Bus — protocol family
 |---|---|
 | `cosmix-lib-buildinfo` | 0.1.0 |
 | `cosmix-lib-bus` | 0.3.2 |
-| `cosmix-lib-client` | 0.4.1 |
+| `cosmix-lib-client` | 0.4.2 |
 | `cosmix-lib-log` | 0.3.0 |
 | `cosmix-lib-props-core` | 0.3.0 |
 

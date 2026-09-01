@@ -250,19 +250,36 @@ DMA-BUF event; regions, transformed outputs and unsupported renderer states
 remain SHM-only.
 
 A submitted DMA-BUF must have exactly one plane and match the advertised
-fourcc, extent and modifier. A kind or metadata mismatch posts
-`invalid_buffer` on the frame and never enters renderer admission. Later
-operational misses—device identity, fd cloning, import/acquire, capacity,
-deadline, cancellation, resize, completion or FOREIGN release—produce one
+fourcc and extent. A kind, fourcc, extent or plane-count mismatch posts
+`invalid_buffer` on the frame and never enters renderer admission. A modifier
+outside the frame's stored transfer-destination set is instead an operational
+miss and produces recoverable `failed`: linux-dmabuf feedback can legitimately
+guide a client to a sampled-image modifier which this exact capture use cannot
+import. Other operational misses—fd cloning, import/acquire, capacity,
+deadline, cancellation, resize, completion or FOREIGN release—also produce one
 `failed`. The compositor never sends damage or flags before discovering such a
 failure.
 
+A submitted `wl_buffer` does not carry the DRM device which allocated it.
+Version 4 linux-dmabuf feedback steers compliant allocators to the renderer's
+real `main_device`, and an import failure fails the frame, but the compositor
+also fail-closes advertisement if bridge and feedback renderer identities ever
+disagree. It does not pretend that `Dmabuf::node()` proves allocation identity. A
+cross-device import which succeeds is a residual hardware risk and belongs to
+the real-GBM gate.
+
 Pixel completion and the matching output presentation form a two-part completion
 latch: `ready` is sent only after both arrive for the same frame. For SHM the
-completion half is mapped readback; for DMA-BUF it is proven GPU retirement
-followed by release back to FOREIGN ownership. A single bounded completion
-authority owns those destination jobs; a full queue fails immediately and is
-never retried on the render thread. Nested records
+completion half is mapped readback. For DMA-BUF, FOREIGN acquire is encoded in
+the same wgpu command buffer as the copy; the worker waits for that exact
+`SubmissionIndex`, submits the release barrier through wgpu's thread-safe queue,
+then waits for the exact release submission. No capture ownership barrier uses
+a raw queue submit or an infinite fence wait. A single bounded completion
+authority owns those destination jobs. It retries a transient 250 ms GPU wait
+up to four bounded attempts, fails immediately on a full/disconnected job
+queue, and never waits on the render or protocol thread. Any terminal worker
+failure fails and safely strands every live post-import job and clears future
+screencopy DMA-BUF advertisements. Nested records
 are bound to the exact acquired host window texture-view identity; a missing,
 unconsumed or mismatched acquisition fails that capture instead of rebinding it
 to a later presentation. Nested mode uses the completed host presentation time;
@@ -282,6 +299,19 @@ copy is presented even when the output has no animation or other damage. Every
 admitted copy has a five-second absolute request deadline: this is a deadline on
 that one client operation, not a periodic compositor timer.
 
+Completion does not depend on a later render tick. The retirement worker sends
+its result directly through the calloop-backed protocol command channel, which
+wakes an idle protocol loop; the destination can therefore reach `ready` on a
+static desktop without polling or a redraw timer. Teardown first puts every
+live job into failed/strand mode, then drops the sole job sender, joins after at
+most the current bounded wait slice, and finally drops the per-job reporters.
+A pre-import failure releases the retained buffer token immediately. After an
+acquire/copy submission, only successful copy retirement plus successful
+FOREIGN hand-back may release it; an unprovable hand-back strands both import
+and token. `fail_capture` cancels publication but cannot release that
+renderer-owned half early. Sending `wl_buffer.release` after the client has
+already destroyed its object relies on Wayland's inert-object send behaviour.
+
 The existing SIGUSR1/evidence PNG path shares the renderer-owned RGBA snapshot,
 deadline, cancellation sweep and conversion worker with wire capture. The PNG
 and wire consumers then create their own packed BGRA buffers for their distinct
@@ -300,6 +330,11 @@ scene camera's base texture. SHM and imported DMA-BUF cursor assets remain
 retained and are sampled from that target on the GPU in both nested and KMS
 capture. KMS base copies precede the GPU overlay into scan-out and inclusive
 copies follow it.
+
+Nested redirect and cursor-composed textures use an unsuffixed BGRA8/RGBA8 base
+with the matching sRGB view format. Rendering therefore keeps the sRGB view,
+while DMA-BUF copies compare and copy the exact linear base format used by the
+destination import.
 
 Capture is deliberately default-open, including while the session is locked.
 Lock and unlock change the capture epoch: stale work fails, while newly admitted
@@ -323,6 +358,11 @@ advertised layout, non-zero SHM offset, guard bytes and non-black pixels. Its
 `--dmabuf --drm-node PATH` mode waits for `buffer_done`, allocates an advertised
 modifier with GBM, submits that destination, maps it only after `ready`, and
 prints the presentation timestamp plus a content checksum.
+DMA-BUF advertisements are republished from live view targets after every
+output registration/re-registration and generation change. Reconstructing a
+renderer reconstructs its bridge, completion worker and advertisement registry;
+until that replacement has published fresh capabilities, new frames advertise
+SHM only.
 Automated tests cover readback, transforms, ordering and damage. A real Vulkan
 render-attachment gate uses the production GPU cursor-composite pass, reads back
 base and inclusive bytes, compares both with byte-exact references, and proves
@@ -330,8 +370,11 @@ that channel-swap and shifted-hotspot mutants fail. These gates prefer a Vulkan
 fallback adapter. With `COSMIX_REQUIRE_FALLBACK_ADAPTER=1`, absence of one fails
 the test (the CI rule); otherwise the gate runs on an available Vulkan adapter
 and prints one line naming the adapter actually used. Physical driver behaviour,
-real kernel page-flip clock provenance
-and end-to-end `grim -o` on KMS remain manual-hardware-only checks.
+real kernel page-flip clock provenance and end-to-end `grim -o` on KMS remain
+manual-hardware-only checks. The automated Vulkan equivalence gate uses an
+ordinary Vulkan COPY_DST texture; it does not prove real GBM allocation,
+DMA-BUF import, cross-device behaviour or FOREIGN ownership on a physical
+driver. Those are explicitly hardware-gated.
 
 Layer surfaces stack in the protocol order: Background, Bottom, normal XDG
 toplevels and popups, Top, then Overlay. Raising a surface changes its order
