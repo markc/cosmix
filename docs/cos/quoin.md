@@ -207,13 +207,21 @@ This arc vendors nothing and edits no Smithay source. Quoin consumes
 
 ## Source gates
 
-The `cosmix-shell-host` test suite proves that the shipped demo graph remains
-Wayland-only by running this locked, offline graph check. Cargo does not expose
-a dependency's active features through a consumer crate's `cfg`, so the test
-inspects Cargo's resolved graph directly:
+`setup.mix --desktop` first retains the desktop workspace release build used
+for every other app, then rebuilds the installed `cosmix-quoin` binary from the
+isolated shipping selection in `src/desktop/Cargo.toml`, using
+`src/desktop/target/quoin-install` as its target directory. The demo target is
+still skipped because it has `required-features = ["demo"]`.
+
+The `cosmix-shell-host` test suite reads that same shipping selection and proves
+its full locked, offline graph remains Wayland-only. Cargo does not expose a
+dependency's active features through a consumer crate's `cfg`, so the test
+inspects Cargo's forward feature graph directly, rejects multiple resolved
+`winit` packages, clears inherited `CARGO_*` configuration, requires Wayland
+and rejects X11:
 
 ```sh
-graph="$(cargo tree --locked --offline -e features -i winit@0.30.13 -p cosmix-quoin --features demo)" && printf '%s\n' "$graph" | rg -q 'winit feature "wayland"' && ! printf '%s\n' "$graph" | rg -q 'winit feature "x11"'
+cargo test -p cosmix-shell-host shipped_quoin_graph_has_wayland_without_x11
 ```
 
 ## Hardware-only deferrals

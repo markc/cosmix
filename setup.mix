@@ -11,7 +11,8 @@
 --                 the location the systemd units under src/_etc expect. The
 --                 units themselves are installed by the operator's deploy
 --                 tooling, not by this script — it says so at the end.
---   --skip-build  install what target/release already holds
+--   --skip-build  install what the workspace and isolated target/release
+--                 directories already hold
 --   --ctl DIR     copy the starter control folder ($COSMIX/ctl) to DIR — a
 --                 private hub for specs, decisions, plans, deploy scripts and
 --                 the public-hygiene gate; see ctl/README.md. With --skip-build
@@ -138,13 +139,33 @@ end
 
 -- 3. optional desktop workspace
 if $want_desktop then
-  print(">> building src/desktop (its own workspace + toolchain)")
-  $rc = run_stream(["cargo", "build", "--release"], {cwd: $src .. "/desktop"})
-  if $rc != 0 then
-    print("setup: desktop build failed (exit " .. $rc .. ")")
-    exit(1)
+  $desktop = $src .. "/desktop"
+  $dmeta = json_parse(run_argv_must(["cargo", "metadata", "--no-deps", "--format-version", "1"], {cwd: $desktop}))
+  $qship = $dmeta.metadata["cosmix-install"].quoin
+  $qtarget = $desktop .. "/target/quoin-install"
+  if not $skip_build then
+    print(">> building src/desktop (its own workspace + toolchain)")
+    $rc = run_stream(["cargo", "build", "--release"], {cwd: $desktop})
+    if $rc != 0 then
+      print("setup: desktop build failed (exit " .. $rc .. ")")
+      exit(1)
+    end
+
+    -- The workspace graph contains X11 consumers. Rebuild the shipped Quoin
+    -- binary alone so Cargo cannot unify their backend features into it.
+    $qargs = ["cargo", "build", "--release", "--locked", "--offline",
+              "-p", $qship.package, "--bin", $qship.bin]
+    if len($qship.features) > 0 then
+      push($qargs, "--features")
+      push($qargs, join($qship.features, ","))
+    end
+    print(">> building " .. $qship.bin .. " in its isolated shipping graph")
+    $rc = run_stream($qargs, {cwd: $desktop, env: {CARGO_TARGET_DIR: $qtarget}})
+    if $rc != 0 then
+      print("setup: isolated " .. $qship.bin .. " build failed (exit " .. $rc .. ")")
+      exit(1)
+    end
   end
-  $dmeta = json_parse(run_argv_must(["cargo", "metadata", "--no-deps", "--format-version", "1"], {cwd: $src .. "/desktop"}))
   $dn = 0
   for each $pkg in $dmeta.packages
     for each $t in $pkg.targets
@@ -152,7 +173,11 @@ if $want_desktop then
         if len($t["required-features"]) > 0 then
           print("skipped (required-features): " .. $t.name)
         else
-          $from = $src .. "/desktop/target/release/" .. $t.name
+          if $pkg.name == $qship.package and $t.name == $qship.bin then
+            $from = $qtarget .. "/release/" .. $t.name
+          else
+            $from = $desktop .. "/target/release/" .. $t.name
+          end
           if is_file($from) then
             install_bin($from, $bin .. "/" .. $t.name)
             $dn = $dn + 1

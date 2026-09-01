@@ -25,6 +25,14 @@ members = [
 exclude = ["vendor"]
 resolver = "3"
 
+# setup.mix builds this selection in its own target directory and installs the
+# resulting binary instead of the X11-unified desktop-workspace artefact. The
+# shell-host feature-graph gate reads the same metadata.
+[workspace.metadata.cosmix-install.quoin]
+package = "cosmix-quoin"
+features = []
+bin = "cosmix-quoin"
+
 # Vendored upstream sources with narrow local patches: see vendor/README.md for
 # provenance, exact patch shape and source-routing assertions.
 [patch.crates-io]
