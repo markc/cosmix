@@ -3,6 +3,7 @@
 //! Adapted verbatim from winit 0.30.13's Linux XKB keymap module so the
 //! SCTK host and Bevy's winit host agree on named keys. Winit is distributed
 //! under Apache-2.0 OR MIT; this repository is MIT.
+//! Copyright © The winit contributors and Pierre Krieger.
 
 use winit::keyboard::{Key, NamedKey, NativeKey};
 
