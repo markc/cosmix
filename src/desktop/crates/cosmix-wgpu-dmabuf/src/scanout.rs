@@ -356,9 +356,11 @@ impl ImportedCaptureDestination {
     pub fn release_to_foreign(self) -> Result<(), CaptureDestinationError> {
         let result = unsafe {
             let Some(device) = self.device.wgpu_device().as_hal::<Vulkan>() else {
-                return Err(CaptureDestinationError::Release(
+                let error = CaptureDestinationError::Release(
                     crate::import::ImportError::NotVulkan.to_string(),
-                ));
+                );
+                std::mem::forget(self);
+                return Err(error);
             };
             submit_raw_ownership_barrier(
                 &device,

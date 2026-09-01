@@ -61,7 +61,8 @@ use crate::{
     },
     bindings::{BindingAction, BindingProfile, BindingState, KeyDisposition},
     capture::{
-        CaptureCancellation, CaptureFormat, CaptureId, CapturePixels, CapturePresented,
+        CaptureCancellation, CaptureDestination, CaptureDmabufComplete, CaptureDmabufDestination,
+        CaptureDmabufFailed, CaptureFormat, CaptureId, CapturePixels, CapturePresented,
         CaptureRegion, CaptureRequest, CaptureReservationLease,
     },
     decoration::DecorationStartup,
@@ -856,6 +857,8 @@ enum ProtocolCommand {
         evidence: SecurityPresentationEvidence,
     },
     CapturePixels(CapturePixels),
+    CaptureDmabufComplete(CaptureDmabufComplete),
+    CaptureDmabufFailed(CaptureDmabufFailed),
     CapturePresented(CapturePresented),
     CaptureDamageEligible {
         id: CaptureId,
@@ -1251,6 +1254,12 @@ impl ClientSceneFeed {
                 Ok(ProtocolCommand::CapturePixels(pixels)) => {
                     outcomes.push(CaptureTestOutcome::Pixels(pixels.id));
                 }
+                Ok(ProtocolCommand::CaptureDmabufComplete(completion)) => {
+                    outcomes.push(CaptureTestOutcome::Pixels(completion.id));
+                }
+                Ok(ProtocolCommand::CaptureDmabufFailed(failure)) => {
+                    outcomes.push(CaptureTestOutcome::Failed(failure.id));
+                }
                 Ok(ProtocolCommand::CapturePresented(presented)) => {
                     outcomes.push(CaptureTestOutcome::Presented {
                         id: presented.id,
@@ -1374,6 +1383,26 @@ impl CaptureCompletionReporter {
             .is_err()
         {
             tracing::debug!("protocol thread gone before capture pixels");
+        }
+    }
+
+    pub(crate) fn dmabuf_complete(&self, completion: CaptureDmabufComplete) {
+        if self
+            .commands
+            .send(ProtocolCommand::CaptureDmabufComplete(completion))
+            .is_err()
+        {
+            tracing::debug!("protocol thread gone before capture DMA-BUF completion");
+        }
+    }
+
+    pub(crate) fn dmabuf_failed(&self, failure: CaptureDmabufFailed) {
+        if self
+            .commands
+            .send(ProtocolCommand::CaptureDmabufFailed(failure))
+            .is_err()
+        {
+            tracing::debug!("protocol thread gone before capture DMA-BUF failure");
         }
     }
 
@@ -1575,6 +1604,7 @@ impl LiveInputWiring {
 }
 
 impl WaylandRuntime {
+    #[allow(clippy::too_many_arguments)] // explicit test/runtime wiring stays visible at construction
     pub(crate) fn new(
         socket_name: &str,
         backend_kind: BackendKind,
@@ -1582,6 +1612,7 @@ impl WaylandRuntime {
         dmabuf_capabilities: Option<DmabufCapabilities>,
         dmabuf_validator: Option<Box<dyn ValidateDmabuf>>,
         retirement_adapter: Option<Box<dyn WaitForSubmittedWork>>,
+        capture_advertisements: crate::capture::CaptureAdvertisementRegistry,
         policy: WaylandRuntimePolicy,
     ) -> Result<Self, Box<dyn Error>> {
         Self::with_input_source(
@@ -1592,6 +1623,7 @@ impl WaylandRuntime {
                 dmabuf_capabilities,
                 dmabuf_validator,
                 retirement_adapter,
+                capture_advertisements,
             },
             policy,
             None,
@@ -1608,6 +1640,7 @@ impl WaylandRuntime {
         dmabuf_capabilities: Option<DmabufCapabilities>,
         dmabuf_validator: Option<Box<dyn ValidateDmabuf>>,
         retirement_adapter: Option<Box<dyn WaitForSubmittedWork>>,
+        capture_advertisements: crate::capture::CaptureAdvertisementRegistry,
         policy: WaylandRuntimePolicy,
         service: String,
     ) -> Result<Self, Box<dyn Error>> {
@@ -1620,6 +1653,7 @@ impl WaylandRuntime {
                 dmabuf_capabilities,
                 dmabuf_validator,
                 retirement_adapter,
+                capture_advertisements,
             },
             policy,
             None,
@@ -2175,6 +2209,7 @@ pub(crate) struct WaylandGpuWiring {
     pub(crate) dmabuf_capabilities: Option<DmabufCapabilities>,
     pub(crate) dmabuf_validator: Option<Box<dyn ValidateDmabuf>>,
     pub(crate) retirement_adapter: Option<Box<dyn WaitForSubmittedWork>>,
+    pub(crate) capture_advertisements: crate::capture::CaptureAdvertisementRegistry,
 }
 
 impl Drop for WaylandRuntime {
@@ -2529,6 +2564,7 @@ impl ProtocolServer {
             dmabuf_capabilities,
             dmabuf_validator,
             retirement_adapter,
+            capture_advertisements,
         } = gpu;
         let ProtocolServerBootstrap {
             command_source,
@@ -2756,6 +2792,7 @@ impl ProtocolServer {
             drm_syncobj_state,
             dmabuf_global,
             supported_dmabuf_formats,
+            capture_advertisements,
             dmabuf_validation,
             data_device_state,
             seat_state,
@@ -3025,6 +3062,12 @@ impl ProtocolServer {
                 }
                 ChannelEvent::Msg(ProtocolCommand::CapturePixels(pixels)) => {
                     state.capture_pixels_ready(pixels);
+                }
+                ChannelEvent::Msg(ProtocolCommand::CaptureDmabufComplete(completion)) => {
+                    state.capture_dmabuf_ready(completion);
+                }
+                ChannelEvent::Msg(ProtocolCommand::CaptureDmabufFailed(failure)) => {
+                    state.capture_dmabuf_failed(failure);
                 }
                 ChannelEvent::Msg(ProtocolCommand::CapturePresented(presented)) => {
                     state.capture_presented(presented);
@@ -5127,6 +5170,33 @@ struct CaptureManagerRecord {
     damage_baselines: HashMap<CaptureSourceId, u64>,
 }
 
+enum CaptureFrameDestination {
+    Shm(wl_buffer::WlBuffer),
+    Dmabuf {
+        buffer: wl_buffer::WlBuffer,
+        descriptor: Arc<DmabufDescriptor>,
+        drm_device: u64,
+        retention_token: Option<u64>,
+    },
+}
+
+impl CaptureFrameDestination {
+    fn buffer(&self) -> &wl_buffer::WlBuffer {
+        match self {
+            Self::Shm(buffer) | Self::Dmabuf { buffer, .. } => buffer,
+        }
+    }
+
+    fn take_retention_token(&mut self) -> Option<u64> {
+        match self {
+            Self::Shm(_) => None,
+            Self::Dmabuf {
+                retention_token, ..
+            } => retention_token.take(),
+        }
+    }
+}
+
 struct CaptureFrameRecord {
     resource: ZwlrScreencopyFrameV1,
     client_id: ClientId,
@@ -5141,6 +5211,7 @@ struct CaptureFrameRecord {
     displayed_physical_extent: (u32, u32),
     scale120: u32,
     transform: smithay::utils::Transform,
+    dmabuf_advertisement: Option<crate::backend::CaptureDmabufAdvertisement>,
     format: CaptureFormat,
     stride: u32,
     overlay_cursor: bool,
@@ -5149,8 +5220,9 @@ struct CaptureFrameRecord {
     terminal: bool,
     resource_alive: bool,
     job_pending: bool,
-    buffer: Option<wl_buffer::WlBuffer>,
+    destination: Option<CaptureFrameDestination>,
     pixels: Option<CapturePixels>,
+    dmabuf_completion: Option<CaptureDmabufComplete>,
     presentation: Option<CapturePresented>,
     next_write_row: u32,
     write_scheduled: bool,
@@ -5215,6 +5287,7 @@ struct WaylandState {
     #[allow(dead_code)]
     dmabuf_global: DmabufGlobal,
     supported_dmabuf_formats: Vec<Format>,
+    capture_advertisements: crate::capture::CaptureAdvertisementRegistry,
     /// The protocol thread's end of the DMA-BUF validation queue. `None` when
     /// the compositor runs without a probe, in which case metadata validation is
     /// the whole of the check.
@@ -5411,6 +5484,23 @@ fn capture_physical_region(
     })
 }
 
+fn capture_dmabuf_is_eligible(
+    source: &crate::backend::CaptureSourceSnapshot,
+    logical_region: Option<(i32, i32, i32, i32)>,
+    region: CaptureRegion,
+) -> bool {
+    logical_region.is_none()
+        && region
+            == (CaptureRegion {
+                x: 0,
+                y: 0,
+                width: source.displayed_physical_extent.0,
+                height: source.displayed_physical_extent.1,
+            })
+        && source.transform == smithay::utils::Transform::Normal
+        && source.source_storage_extent == source.displayed_physical_extent
+}
+
 fn capture_reservation_bytes(output_size: (u32, u32), region: CaptureRegion) -> Option<usize> {
     let region_bytes = usize::try_from(region.width)
         .ok()?
@@ -5424,6 +5514,13 @@ fn capture_reservation_bytes(output_size: (u32, u32), region: CaptureRegion) -> 
         .checked_mul(2)?
         .checked_add(staging_bytes)?
         .checked_add(region_bytes)
+}
+
+fn capture_dmabuf_reservation_bytes(extent: (u32, u32)) -> Option<usize> {
+    usize::try_from(extent.0)
+        .ok()?
+        .checked_mul(4)?
+        .checked_mul(extent.1 as usize)
 }
 
 fn validate_capture_buffer_data(
@@ -6165,7 +6262,7 @@ impl WaylandState {
             resource.failed();
             return;
         }
-        let Some(source) = self.backend.capture_source_for_output(output) else {
+        let Some(mut source) = self.backend.capture_source_for_output(output) else {
             resource.failed();
             return;
         };
@@ -6177,6 +6274,13 @@ impl WaylandState {
             resource.failed();
             return;
         };
+        let dmabuf_eligible = capture_dmabuf_is_eligible(&source, logical_region, region);
+        source.dmabuf = dmabuf_eligible
+            .then(|| {
+                self.capture_advertisements
+                    .advertisement(&source.source_id, source.source_storage_extent)
+            })
+            .flatten();
         resource.buffer(
             wl_shm::Format::Xrgb8888,
             region.width,
@@ -6184,6 +6288,13 @@ impl WaylandState {
             stride,
         );
         if resource.version() >= 3 {
+            if let Some(advertisement) = &source.dmabuf {
+                resource.linux_dmabuf(
+                    advertisement.fourcc,
+                    advertisement.width,
+                    advertisement.height,
+                );
+            }
             resource.buffer_done();
         }
         let record = CaptureFrameRecord {
@@ -6200,6 +6311,7 @@ impl WaylandState {
             displayed_physical_extent: source.displayed_physical_extent,
             scale120: source.scale120,
             transform: source.transform,
+            dmabuf_advertisement: source.dmabuf,
             format: CaptureFormat::Xrgb8888,
             stride,
             overlay_cursor: overlay_cursor != 0,
@@ -6208,8 +6320,9 @@ impl WaylandState {
             terminal: false,
             resource_alive: true,
             job_pending: false,
-            buffer: None,
+            destination: None,
             pixels: None,
+            dmabuf_completion: None,
             presentation: None,
             next_write_row: 0,
             write_scheduled: false,
@@ -6256,7 +6369,7 @@ impl WaylandState {
                 .get(&record.manager_id)
                 .and_then(|manager| manager.damage_baselines.get(&record.source_id).copied())
         });
-        let (format, region, stride) = {
+        let (format, region, stride, dmabuf_advertisement) = {
             let record = self
                 .capture_frames
                 .get_mut(&id)
@@ -6266,20 +6379,85 @@ impl WaylandState {
             // security epoch whose displayed scene this request may observe.
             record.security_epoch = current_epoch;
             record.damage_baseline = damage_baseline;
-            (record.format, record.region, record.stride)
+            (
+                record.format,
+                record.region,
+                record.stride,
+                record.dmabuf_advertisement.clone(),
+            )
         };
-        if validate_screencopy_shm_buffer(&buffer, format, region.width, region.height, stride)
-            .is_err()
-        {
-            if let Some(record) = self.capture_frames.get_mut(&id) {
-                record.terminal = true;
+        let destination = match get_dmabuf(&buffer) {
+            Ok(dmabuf) => {
+                let Some(advertisement) = dmabuf_advertisement else {
+                    if let Some(record) = self.capture_frames.get_mut(&id) {
+                        record.terminal = true;
+                    }
+                    frame.post_error(
+                        zwlr_screencopy_frame_v1::Error::InvalidBuffer,
+                        "DMA-BUF was not advertised for this screencopy frame",
+                    );
+                    return;
+                };
+                let metadata_matches = Self::capture_dmabuf_metadata_matches(
+                    &advertisement,
+                    dmabuf.num_planes(),
+                    u32::try_from(dmabuf.size().w).ok(),
+                    u32::try_from(dmabuf.size().h).ok(),
+                    dmabuf.format().code as u32,
+                    u64::from(dmabuf.format().modifier),
+                );
+                if !metadata_matches {
+                    if let Some(record) = self.capture_frames.get_mut(&id) {
+                        record.terminal = true;
+                    }
+                    frame.post_error(
+                        zwlr_screencopy_frame_v1::Error::InvalidBuffer,
+                        "DMA-BUF does not match the immutable screencopy advertisement",
+                    );
+                    return;
+                }
+                let descriptor = match describe_dmabuf(dmabuf) {
+                    Ok(descriptor) => Arc::new(descriptor),
+                    Err(error) => {
+                        tracing::warn!(capture_id = id.0, %error, "failed to retain screencopy DMA-BUF descriptor");
+                        self.fail_capture(id);
+                        return;
+                    }
+                };
+                let drm_device = dmabuf.node().map(|node| node.dev_id()).unwrap_or(u64::MAX);
+                let Some(retention_token) = self.try_retain_capture_dmabuf(buffer.clone()) else {
+                    self.fail_capture(id);
+                    return;
+                };
+                CaptureFrameDestination::Dmabuf {
+                    buffer,
+                    descriptor,
+                    drm_device,
+                    retention_token: Some(retention_token),
+                }
             }
-            frame.post_error(
-                zwlr_screencopy_frame_v1::Error::InvalidBuffer,
-                "buffer does not match the advertised screencopy shm layout",
-            );
-            return;
-        }
+            Err(_) => {
+                if validate_screencopy_shm_buffer(
+                    &buffer,
+                    format,
+                    region.width,
+                    region.height,
+                    stride,
+                )
+                .is_err()
+                {
+                    if let Some(record) = self.capture_frames.get_mut(&id) {
+                        record.terminal = true;
+                    }
+                    frame.post_error(
+                        zwlr_screencopy_frame_v1::Error::InvalidBuffer,
+                        "buffer does not match the advertised screencopy shm layout",
+                    );
+                    return;
+                }
+                CaptureFrameDestination::Shm(buffer)
+            }
+        };
         let cancellation = CaptureCancellation::default();
         let deadline = Instant::now()
             .checked_add(CAPTURE_REQUEST_TIMEOUT)
@@ -6289,7 +6467,7 @@ impl WaylandState {
                 .capture_frames
                 .get_mut(&id)
                 .expect("validated capture remains live");
-            record.buffer = Some(buffer);
+            record.destination = Some(destination);
             record.with_damage = with_damage;
             record.cancellation = Some(cancellation.clone());
             record.deadline = Some(deadline);
@@ -6322,6 +6500,24 @@ impl WaylandState {
         }
     }
 
+    fn capture_dmabuf_metadata_matches(
+        advertisement: &crate::backend::CaptureDmabufAdvertisement,
+        planes: usize,
+        width: Option<u32>,
+        height: Option<u32>,
+        fourcc: u32,
+        modifier: u64,
+    ) -> bool {
+        planes == 1
+            && width == Some(advertisement.width)
+            && height == Some(advertisement.height)
+            && fourcc == advertisement.fourcc
+            && advertisement
+                .allowed_modifiers
+                .binary_search(&modifier)
+                .is_ok()
+    }
+
     fn admit_capture(&mut self, id: CaptureId, damage_revision: u64, damage: Vec<CaptureRegion>) {
         let Some(record) = self.capture_frames.get(&id) else {
             return;
@@ -6338,7 +6534,16 @@ impl WaylandState {
         let region = record.region;
         // Account for the capture-owned staging and packed conversion result
         // only after a damage waiter becomes eligible.
-        let Some(reserved_bytes) = capture_reservation_bytes(source_storage_extent, region) else {
+        let dmabuf_destination = matches!(
+            record.destination,
+            Some(CaptureFrameDestination::Dmabuf { .. })
+        );
+        let reserved_bytes = if dmabuf_destination {
+            capture_dmabuf_reservation_bytes(record.displayed_physical_extent)
+        } else {
+            capture_reservation_bytes(source_storage_extent, region)
+        };
+        let Some(reserved_bytes) = reserved_bytes else {
             self.fail_capture(id);
             return;
         };
@@ -6384,6 +6589,25 @@ impl WaylandState {
             record.reserved_bytes = reserved_bytes;
             record.job_pending = true;
             let deadline = record.deadline.expect("submitted capture owns a deadline");
+            let destination = match record
+                .destination
+                .as_mut()
+                .expect("submitted capture owns its destination")
+            {
+                CaptureFrameDestination::Shm(_) => CaptureDestination::Shm,
+                CaptureFrameDestination::Dmabuf {
+                    descriptor,
+                    drm_device,
+                    retention_token,
+                    ..
+                } => CaptureDestination::Dmabuf(CaptureDmabufDestination {
+                    descriptor: Arc::clone(descriptor),
+                    drm_device: *drm_device,
+                    retention_token: retention_token
+                        .take()
+                        .expect("DMA-BUF capture token moves to the render request once"),
+                }),
+            };
             CaptureRequest {
                 id,
                 source_id: record.source_id.clone(),
@@ -6397,6 +6621,7 @@ impl WaylandState {
                 scale120: record.scale120,
                 transform: record.transform,
                 format: record.format,
+                destination,
                 overlay_cursor: record.overlay_cursor,
                 cursor: None,
                 with_damage: record.with_damage,
@@ -6428,11 +6653,25 @@ impl WaylandState {
         if let Some(cancellation) = &record.cancellation {
             cancellation.cancel();
         }
-        record.buffer = None;
+        let retention_token = record
+            .destination
+            .as_mut()
+            .and_then(CaptureFrameDestination::take_retention_token);
+        let completion_token = record
+            .dmabuf_completion
+            .take()
+            .map(|completion| completion.retention_token);
+        record.destination = None;
         record.pixels = None;
         record.presentation = None;
         let resource_id = record.resource.id();
         let manager_id = record.manager_id;
+        if let Some(token) = retention_token {
+            self.release_buffer_token(token);
+        }
+        if let Some(token) = completion_token {
+            self.release_buffer_token(token);
+        }
         self.capture_frames_by_resource.remove(&resource_id);
         let remove_manager = self
             .capture_managers
@@ -6459,11 +6698,25 @@ impl WaylandState {
         if let Some(cancellation) = &record.cancellation {
             cancellation.cancel();
         }
-        record.buffer = None;
+        let retention_token = record
+            .destination
+            .as_mut()
+            .and_then(CaptureFrameDestination::take_retention_token);
+        let completion_token = record
+            .dmabuf_completion
+            .take()
+            .map(|completion| completion.retention_token);
+        record.destination = None;
         record.pixels = None;
         record.presentation = None;
         if record.resource.is_alive() {
             record.resource.failed();
+        }
+        if let Some(token) = retention_token {
+            self.release_buffer_token(token);
+        }
+        if let Some(token) = completion_token {
+            self.release_buffer_token(token);
         }
     }
 
@@ -6494,6 +6747,48 @@ impl WaylandState {
         self.maybe_schedule_capture_write(resource_id);
     }
 
+    fn capture_dmabuf_ready(&mut self, completion: CaptureDmabufComplete) {
+        let id = completion.id;
+        let accepted = self.capture_frames.get_mut(&id).is_some_and(|record| {
+            record.job_pending = false;
+            if record.terminal
+                || record.source_id != completion.source_id
+                || record.generation != completion.generation
+                || record.security_epoch != completion.security_epoch
+                || !matches!(
+                    record.destination,
+                    Some(CaptureFrameDestination::Dmabuf { .. })
+                )
+            {
+                return false;
+            }
+            record.dmabuf_completion = Some(completion.clone());
+            true
+        });
+        if accepted {
+            let resource_id = self
+                .capture_frames
+                .get(&id)
+                .expect("accepted DMA-BUF completion retains its frame")
+                .resource
+                .id();
+            self.maybe_schedule_capture_write(resource_id);
+        } else {
+            self.release_buffer_token(completion.retention_token);
+        }
+    }
+
+    fn capture_dmabuf_failed(&mut self, failure: CaptureDmabufFailed) {
+        let matching = self.capture_frames.get(&failure.id).is_some_and(|record| {
+            record.generation == failure.generation
+                && record.security_epoch == failure.security_epoch
+        });
+        if matching {
+            self.fail_capture(failure.id);
+        }
+        self.release_buffer_token(failure.retention_token);
+    }
+
     fn capture_presented(&mut self, presented: CapturePresented) {
         let Some(record) = self.capture_frames.get_mut(&presented.id) else {
             return;
@@ -6515,6 +6810,9 @@ impl WaylandState {
         let Some(id) = self.capture_frames_by_resource.get(&resource_id).copied() else {
             return;
         };
+        if self.maybe_publish_capture_dmabuf(id) {
+            return;
+        }
         let ready = self.capture_frames.get_mut(&id).is_some_and(|record| {
             if record.write_scheduled
                 || record.terminal
@@ -6536,6 +6834,86 @@ impl WaylandState {
         }
     }
 
+    fn maybe_publish_capture_dmabuf(&mut self, id: CaptureId) -> bool {
+        let ready = self.capture_frames.get(&id).is_some_and(|record| {
+            !record.terminal
+                && record.dmabuf_completion.is_some()
+                && record.presentation.is_some()
+                && matches!(
+                    record.destination,
+                    Some(CaptureFrameDestination::Dmabuf { .. })
+                )
+        });
+        if !ready {
+            return false;
+        }
+        let invalid_token = self.capture_frames.get(&id).and_then(|record| {
+            let completion = record.dmabuf_completion.as_ref()?;
+            let presentation = record.presentation.as_ref()?;
+            (completion.frame_token != presentation.frame_token
+                || presentation.nanoseconds > 999_999_999
+                || completion.damage.iter().any(|damage| {
+                    damage.width == 0
+                        || damage.height == 0
+                        || damage.x.saturating_add(damage.width) > record.region.width
+                        || damage.y.saturating_add(damage.height) > record.region.height
+                }))
+            .then_some(completion.retention_token)
+        });
+        if invalid_token.is_some() {
+            self.fail_capture(id);
+            return true;
+        }
+        let (retention_token, manager_id, source_id, damage_revision) = {
+            let record = self
+                .capture_frames
+                .get_mut(&id)
+                .expect("DMA-BUF terminal checked immediately above");
+            let completion = record
+                .dmabuf_completion
+                .take()
+                .expect("DMA-BUF terminal owns completion");
+            let presentation = record
+                .presentation
+                .take()
+                .expect("DMA-BUF terminal owns presentation");
+            debug_assert_eq!(completion.frame_token, presentation.frame_token);
+            if record.with_damage {
+                for damage in &completion.damage {
+                    record
+                        .resource
+                        .damage(damage.x, damage.y, damage.width, damage.height);
+                }
+            }
+            record
+                .resource
+                .flags(zwlr_screencopy_frame_v1::Flags::empty());
+            record.resource.ready(
+                (presentation.seconds >> 32) as u32,
+                presentation.seconds as u32,
+                presentation.nanoseconds,
+            );
+            record.terminal = true;
+            record.job_pending = false;
+            record.destination = None;
+            (
+                completion.retention_token,
+                record.manager_id,
+                record.source_id.clone(),
+                completion.damage_revision,
+            )
+        };
+        if let Some(manager) = self.capture_managers.get_mut(&manager_id) {
+            manager
+                .damage_baselines
+                .entry(source_id)
+                .and_modify(|revision| *revision = (*revision).max(damage_revision))
+                .or_insert(damage_revision);
+        }
+        self.release_buffer_token(retention_token);
+        true
+    }
+
     /// Copy at most `CAPTURE_SHM_BYTES_PER_TURN`, then re-arm as a calloop idle
     /// source. No one client can monopolise the shared protocol dispatch thread
     /// with a full-output memcpy, and ready is emitted only by the final chunk.
@@ -6545,7 +6923,10 @@ impl WaylandState {
                 record.write_scheduled = false;
                 (!record.terminal).then(|| {
                     Some((
-                        record.buffer.clone()?,
+                        match record.destination.as_ref()? {
+                            CaptureFrameDestination::Shm(buffer) => buffer.clone(),
+                            CaptureFrameDestination::Dmabuf { .. } => return None,
+                        },
                         record.pixels.clone()?,
                         record.presentation.clone()?,
                         record.format,
@@ -6644,7 +7025,7 @@ impl WaylandState {
         }
         record.terminal = true;
         record.job_pending = false;
-        record.buffer = None;
+        record.destination = None;
         record.pixels = None;
         record.presentation = None;
         false
@@ -12779,6 +13160,34 @@ impl WaylandState {
         let _ = Self::with_client_state(surface, |state| {
             state.retained_dmabufs.fetch_add(1, Ordering::Relaxed);
         });
+        let token = self.retain_buffer(buffer);
+        self.budgeted_dmabuf_tokens.insert(token);
+        Some(token)
+    }
+
+    fn try_retain_capture_dmabuf(&mut self, buffer: wl_buffer::WlBuffer) -> Option<u64> {
+        let client = buffer.client();
+        let client_count = client
+            .as_ref()
+            .and_then(|client| client.get_data::<WaylandClientState>())
+            .map(|state| state.retained_dmabufs.load(Ordering::Relaxed))
+            .unwrap_or_default();
+        let already_retained = self.retained_buffers.buffers.contains_key(&buffer.id());
+        if client_count >= MAX_CLIENT_RETAINED_DMABUFS
+            || (!already_retained
+                && self.retained_buffers.buffers.len() >= MAX_GLOBAL_RETAINED_DMABUFS)
+        {
+            self.retire_buffer_immediately(buffer);
+            return None;
+        }
+        if let Some(client_state) = client
+            .as_ref()
+            .and_then(|client| client.get_data::<WaylandClientState>())
+        {
+            client_state
+                .retained_dmabufs
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let token = self.retain_buffer(buffer);
         self.budgeted_dmabuf_tokens.insert(token);
         Some(token)

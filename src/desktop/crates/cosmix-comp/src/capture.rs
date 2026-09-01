@@ -7,7 +7,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt,
     sync::{
         Arc, Mutex,
@@ -25,6 +25,7 @@ use std::sync::atomic::AtomicUsize;
 use bevy::asset::RenderAssetUsages;
 use bevy::{
     camera::NormalizedRenderTarget,
+    ecs::system::SystemParam,
     prelude::*,
     render::{
         Render, RenderApp, RenderSystems,
@@ -41,8 +42,8 @@ use bevy::{
             SamplerBindingType, SamplerDescriptor, ShaderModuleDescriptor, ShaderSource,
             ShaderStages, StoreOp, TexelCopyBufferInfo, TexelCopyBufferLayout,
             TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor, TextureDimension,
-            TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDimension,
-            TextureViewId,
+            TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor,
+            TextureViewDimension, TextureViewId,
         },
         renderer::{
             FlushCommands, RenderDevice, RenderGraph, RenderGraphSystems, RenderQueue,
@@ -59,10 +60,122 @@ use bevy::{
 use smithay::reexports::calloop::channel::Sender as CalloopSender;
 
 use crate::{
-    backend::CaptureSourceId,
+    backend::{CaptureDmabufAdvertisement, CaptureSourceId},
     compositor_scene::CompositorSceneSet,
     protocol::{CaptureCompletionReporter, ClientSceneFeed},
 };
+
+#[derive(Clone)]
+struct CaptureAdvertisementDiscovery {
+    capabilities: cosmix_wgpu_dmabuf::CaptureDestinationCapabilities,
+    feedback: HashMap<u32, Vec<u64>>,
+    drm_device: u64,
+}
+
+#[derive(Resource, Clone, Default)]
+pub(crate) struct CaptureAdvertisementRegistry {
+    discovery: Option<Arc<CaptureAdvertisementDiscovery>>,
+    advertisements: Arc<Mutex<HashMap<CaptureSourceId, CaptureDmabufAdvertisement>>>,
+}
+
+impl CaptureAdvertisementRegistry {
+    pub(crate) fn new(
+        capabilities: cosmix_wgpu_dmabuf::CaptureDestinationCapabilities,
+        dmabuf: &cosmix_wgpu_dmabuf::DmabufCapabilities,
+    ) -> Self {
+        let mut feedback = HashMap::<u32, Vec<u64>>::new();
+        for format in &dmabuf.formats {
+            feedback
+                .entry(format.fourcc)
+                .or_default()
+                .push(format.modifier);
+        }
+        Self {
+            discovery: Some(Arc::new(CaptureAdvertisementDiscovery {
+                capabilities,
+                feedback,
+                drm_device: dmabuf.main_device,
+            })),
+            advertisements: Arc::default(),
+        }
+    }
+
+    pub(crate) fn advertisement(
+        &self,
+        source: &CaptureSourceId,
+        extent: (u32, u32),
+    ) -> Option<CaptureDmabufAdvertisement> {
+        self.advertisements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(source)
+            .filter(|advertisement| (advertisement.width, advertisement.height) == extent)
+            .cloned()
+    }
+
+    fn publish(&self, source: &CaptureSourceId, extent: (u32, u32), format: TextureFormat) {
+        let Some(discovery) = &self.discovery else {
+            return;
+        };
+        let fourcc = match format {
+            TextureFormat::Bgra8Unorm => drm_fourcc::DrmFourcc::Xrgb8888 as u32,
+            TextureFormat::Rgba8Unorm => drm_fourcc::DrmFourcc::Xbgr8888 as u32,
+            _ => {
+                self.remove(source);
+                return;
+            }
+        };
+        let modifiers = discovery.feedback.get(&fourcc).cloned().unwrap_or_default();
+        let Ok(allowed_modifiers) = discovery
+            .capabilities
+            .supported_modifiers(fourcc, extent.0, extent.1, modifiers)
+        else {
+            self.remove(source);
+            return;
+        };
+        if allowed_modifiers.is_empty() {
+            self.remove(source);
+            return;
+        }
+        self.advertisements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                source.clone(),
+                CaptureDmabufAdvertisement {
+                    fourcc,
+                    width: extent.0,
+                    height: extent.1,
+                    allowed_modifiers,
+                    drm_device: discovery.drm_device,
+                },
+            );
+    }
+
+    fn remove(&self, source: &CaptureSourceId) {
+        self.advertisements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(source);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(
+        &self,
+        source: CaptureSourceId,
+        advertisement: CaptureDmabufAdvertisement,
+    ) {
+        self.advertisements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(source, advertisement);
+    }
+}
+
+#[derive(Resource, Clone)]
+pub(crate) struct CaptureDestinationRenderBridge(
+    pub(crate) cosmix_wgpu_dmabuf::CaptureDestinationBridge,
+);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct CaptureId(pub(crate) u64);
@@ -72,6 +185,19 @@ pub(crate) enum CaptureFormat {
     #[allow(dead_code)]
     Argb8888,
     Xrgb8888,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum CaptureDestination {
+    Shm,
+    Dmabuf(CaptureDmabufDestination),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CaptureDmabufDestination {
+    pub(crate) descriptor: Arc<cosmix_wgpu_dmabuf::DmabufDescriptor>,
+    pub(crate) drm_device: u64,
+    pub(crate) retention_token: u64,
 }
 
 /// Physical rectangle in the output's displayed orientation.
@@ -113,6 +239,7 @@ pub(crate) struct CaptureRequest {
     pub(crate) scale120: u32,
     pub(crate) transform: smithay::utils::Transform,
     pub(crate) format: CaptureFormat,
+    pub(crate) destination: CaptureDestination,
     pub(crate) overlay_cursor: bool,
     pub(crate) cursor: Option<CaptureCursorSnapshot>,
     pub(crate) with_damage: bool,
@@ -714,6 +841,28 @@ pub(crate) struct CapturePixels {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct CaptureDmabufComplete {
+    pub(crate) id: CaptureId,
+    pub(crate) source_id: CaptureSourceId,
+    pub(crate) frame_token: u64,
+    pub(crate) generation: u64,
+    pub(crate) security_epoch: u64,
+    pub(crate) damage_revision: u64,
+    pub(crate) damage: Vec<CaptureRegion>,
+    pub(crate) retention_token: u64,
+    pub(crate) _reservation: CaptureReservationLease,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CaptureDmabufFailed {
+    pub(crate) id: CaptureId,
+    pub(crate) generation: u64,
+    pub(crate) security_epoch: u64,
+    pub(crate) retention_token: u64,
+    pub(crate) _reservation: CaptureReservationLease,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct CapturePresented {
     pub(crate) id: CaptureId,
     pub(crate) source_id: CaptureSourceId,
@@ -1094,6 +1243,269 @@ impl Drop for CaptureReadbackWorker {
     }
 }
 
+struct CaptureDmabufJob {
+    request: CaptureRequest,
+    destination: cosmix_wgpu_dmabuf::ImportedCaptureDestination,
+    frame_token: u64,
+    publication_failed: bool,
+}
+
+struct PreparedCaptureDmabuf {
+    request: CaptureRequest,
+    destination: cosmix_wgpu_dmabuf::ImportedCaptureDestination,
+}
+
+fn encode_capture_dmabuf_copies(
+    encoder: &mut CommandEncoder,
+    source: TexelCopyTextureInfo<'_>,
+    source_format: TextureFormat,
+    extent: (u32, u32),
+    prepared: Vec<PreparedCaptureDmabuf>,
+    reporter: Option<&CaptureCompletionReporter>,
+) -> Vec<PreparedCaptureDmabuf> {
+    let copy_extent = Extent3d {
+        width: extent.0,
+        height: extent.1,
+        depth_or_array_layers: 1,
+    };
+    let mut encoded = Vec::new();
+    for prepared in prepared {
+        if !capture_request_is_copyable(&prepared.request, Some(extent))
+            || source_format != prepared.destination.format()
+            || prepared.destination.extent() != extent
+        {
+            if prepared.destination.release_to_foreign().is_ok() {
+                fail_dmabuf_request(prepared.request, reporter);
+            } else {
+                std::mem::forget(prepared.request);
+            }
+            continue;
+        }
+        encoder.copy_texture_to_texture(
+            source,
+            prepared.destination.texture().as_image_copy(),
+            copy_extent,
+        );
+        encoded.push(prepared);
+    }
+    encoded
+}
+
+fn encode_capture_readback_copy(
+    encoder: &mut CommandEncoder,
+    source: TexelCopyTextureInfo<'_>,
+    buffer: Option<&Buffer>,
+    row_pitch: u32,
+    extent: Extent3d,
+) {
+    let Some(buffer) = buffer else {
+        return;
+    };
+    encoder.copy_texture_to_buffer(
+        source,
+        TexelCopyBufferInfo {
+            buffer,
+            layout: TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row_pitch),
+                rows_per_image: Some(extent.height),
+            },
+        },
+        extent,
+    );
+}
+
+#[derive(Resource)]
+struct CaptureDmabufCompletionService {
+    sender: Option<cosmix_wgpu_dmabuf::RetirementRequestSender>,
+    worker: Option<cosmix_wgpu_dmabuf::RetirementWorker>,
+    reports: Mutex<Receiver<cosmix_wgpu_dmabuf::RetirementWorkerReport>>,
+    jobs: BTreeMap<cosmix_wgpu_dmabuf::RetirementSequence, CaptureDmabufJob>,
+    next_sequence: u64,
+}
+
+impl CaptureDmabufCompletionService {
+    fn new(bridge: &cosmix_wgpu_dmabuf::CaptureDestinationBridge) -> Option<Self> {
+        let (report_sender, reports) = mpsc::sync_channel::<
+            cosmix_wgpu_dmabuf::RetirementWorkerReport,
+        >(crate::protocol::MAX_IN_FLIGHT_CAPTURES);
+        let (sender, worker) = cosmix_wgpu_dmabuf::spawn_retirement_worker(
+            Box::new(bridge.retirement_adapter()),
+            crate::protocol::MAX_IN_FLIGHT_CAPTURES,
+            move |report| report_sender.try_send(report).is_ok(),
+        )
+        .ok()?;
+        Some(Self {
+            sender: Some(sender),
+            worker: Some(worker),
+            reports: Mutex::new(reports),
+            jobs: BTreeMap::new(),
+            next_sequence: 0,
+        })
+    }
+
+    fn submit(&mut self, mut job: CaptureDmabufJob, reporter: Option<&CaptureCompletionReporter>) {
+        let Some(next) = self.next_sequence.checked_add(1) else {
+            fail_dmabuf_request(job.request, reporter);
+            std::mem::forget(job.destination);
+            return;
+        };
+        self.next_sequence = next;
+        let sequence = cosmix_wgpu_dmabuf::RetirementSequence(next);
+        let send = self.sender.as_ref().map_or(
+            Err(cosmix_wgpu_dmabuf::RetirementRequestError::Disconnected),
+            |sender| sender.try_send(sequence),
+        );
+        if send.is_err() {
+            job.publication_failed = true;
+            if let Some(reporter) = reporter {
+                reporter.failed(
+                    job.request.id,
+                    job.request.generation,
+                    job.request.security_epoch,
+                );
+            }
+        }
+        self.jobs.insert(sequence, job);
+    }
+
+    fn drain(&mut self, reporter: Option<&CaptureCompletionReporter>) {
+        loop {
+            let received = {
+                self.reports
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .try_recv()
+            };
+            let report = match received {
+                Ok(report) => report,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.fail_and_strand_all(reporter);
+                    self.sender = None;
+                    return;
+                }
+            };
+            if report.result.is_err() {
+                self.fail_and_strand_all(reporter);
+                self.sender = None;
+                return;
+            }
+            let completed = self
+                .jobs
+                .keys()
+                .copied()
+                .take_while(|sequence| *sequence <= report.high_water)
+                .collect::<Vec<_>>();
+            for sequence in completed {
+                let Some(job) = self.jobs.remove(&sequence) else {
+                    continue;
+                };
+                self.complete_job(job, reporter);
+            }
+        }
+    }
+
+    fn complete_job(&self, job: CaptureDmabufJob, reporter: Option<&CaptureCompletionReporter>) {
+        let CaptureDmabufJob {
+            request,
+            destination,
+            frame_token,
+            publication_failed: _,
+        } = job;
+        if destination.release_to_foreign().is_err() {
+            if let Some(reporter) = reporter {
+                reporter.failed(request.id, request.generation, request.security_epoch);
+            }
+            std::mem::forget(request);
+            return;
+        }
+        let CaptureDestination::Dmabuf(destination) = &request.destination else {
+            unreachable!("DMA-BUF retirement job retains a DMA-BUF request")
+        };
+        if let Some(reporter) = reporter {
+            reporter.dmabuf_complete(CaptureDmabufComplete {
+                id: request.id,
+                source_id: request.source_id.clone(),
+                frame_token,
+                generation: request.generation,
+                security_epoch: request.security_epoch,
+                damage_revision: request.damage_revision,
+                damage: request.damage.clone(),
+                retention_token: destination.retention_token,
+                _reservation: request.reservation.clone(),
+            });
+        }
+    }
+
+    fn fail_and_strand_all(&mut self, reporter: Option<&CaptureCompletionReporter>) {
+        for (_, job) in std::mem::take(&mut self.jobs) {
+            if let Some(reporter) = reporter {
+                reporter.failed(
+                    job.request.id,
+                    job.request.generation,
+                    job.request.security_epoch,
+                );
+            }
+            std::mem::forget(job);
+        }
+    }
+}
+
+impl Drop for CaptureDmabufCompletionService {
+    fn drop(&mut self) {
+        self.sender = None;
+        if let Some(worker) = self.worker.as_mut() {
+            let _ = worker.join();
+        }
+        for (_, job) in std::mem::take(&mut self.jobs) {
+            std::mem::forget(job);
+        }
+    }
+}
+
+fn fail_dmabuf_request(request: CaptureRequest, reporter: Option<&CaptureCompletionReporter>) {
+    let CaptureDestination::Dmabuf(destination) = &request.destination else {
+        if let Some(reporter) = reporter {
+            reporter.failed(request.id, request.generation, request.security_epoch);
+        }
+        return;
+    };
+    if let Some(reporter) = reporter {
+        reporter.dmabuf_failed(CaptureDmabufFailed {
+            id: request.id,
+            generation: request.generation,
+            security_epoch: request.security_epoch,
+            retention_token: destination.retention_token,
+            _reservation: request.reservation.clone(),
+        });
+    }
+}
+
+fn report_capture_request_failed(
+    request: &CaptureRequest,
+    reporter: Option<&CaptureCompletionReporter>,
+) {
+    let Some(reporter) = reporter else {
+        return;
+    };
+    match &request.destination {
+        CaptureDestination::Dmabuf(destination) => {
+            reporter.dmabuf_failed(CaptureDmabufFailed {
+                id: request.id,
+                generation: request.generation,
+                security_epoch: request.security_epoch,
+                retention_token: destination.retention_token,
+                _reservation: request.reservation.clone(),
+            });
+        }
+        CaptureDestination::Shm if !request.cancellation.is_cancelled() => {
+            reporter.failed(request.id, request.generation, request.security_epoch);
+        }
+        CaptureDestination::Shm => {}
+    }
+}
+
 pub(crate) struct CaptureServicePlugin;
 
 #[derive(SystemSet, Clone, Debug, Eq, Hash, PartialEq)]
@@ -1113,6 +1525,36 @@ impl CaptureExecutionPhase {
                 | (Self::Kms, CaptureSourceId::Kms { .. })
         )
     }
+}
+
+fn publish_capture_dmabuf_advertisements(
+    registry: Res<CaptureAdvertisementRegistry>,
+    views: Query<(&ViewTarget, &CaptureOutputSource)>,
+) {
+    for (target, source) in &views {
+        let Some(view) = target.out_texture() else {
+            registry.remove(&source.source_id);
+            continue;
+        };
+        let texture = view.texture();
+        let extent = texture.size();
+        if extent.depth_or_array_layers != 1 {
+            registry.remove(&source.source_id);
+            continue;
+        }
+        registry.publish(
+            &source.source_id,
+            (extent.width, extent.height),
+            texture.format(),
+        );
+    }
+}
+
+#[derive(SystemParam)]
+struct CaptureDmabufParams<'w> {
+    bridge: Option<Res<'w, CaptureDestinationRenderBridge>>,
+    completion: Option<ResMut<'w, CaptureDmabufCompletionService>>,
+    damage: Res<'w, OutputDamageJournal>,
 }
 
 impl Plugin for CaptureServicePlugin {
@@ -1145,6 +1587,18 @@ impl Plugin for CaptureServicePlugin {
         #[cfg(feature = "frame-capture")]
         app.insert_resource(png.clone());
 
+        let advertisement_registry = app
+            .world()
+            .get_resource::<CaptureAdvertisementRegistry>()
+            .cloned()
+            .unwrap_or_default();
+        let destination_bridge = app
+            .world()
+            .get_resource::<CaptureDestinationRenderBridge>()
+            .cloned();
+        let dmabuf_completion = destination_bridge
+            .as_ref()
+            .and_then(|bridge| CaptureDmabufCompletionService::new(&bridge.0));
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
                 .insert_resource(batches)
@@ -1152,15 +1606,25 @@ impl Plugin for CaptureServicePlugin {
                 .insert_resource(CaptureReadbackWorker::default())
                 .insert_resource(reporter)
                 .insert_resource(damage)
+                .insert_resource(advertisement_registry)
                 .init_resource::<NestedCaptureRedirect>();
+            if let Some(destination_bridge) = destination_bridge {
+                render_app.insert_resource(destination_bridge);
+            }
+            if let Some(dmabuf_completion) = dmabuf_completion {
+                render_app.insert_resource(dmabuf_completion);
+            }
             #[cfg(feature = "frame-capture")]
             render_app.insert_resource(png);
             render_app
                 .add_systems(
                     Render,
-                    prepare_nested_capture_redirect
-                        .after(prepare_view_attachments)
-                        .before(prepare_view_targets)
+                    (
+                        prepare_nested_capture_redirect
+                            .after(prepare_view_attachments)
+                            .before(prepare_view_targets),
+                        publish_capture_dmabuf_advertisements.after(prepare_view_targets),
+                    )
                         .in_set(RenderSystems::PrepareViews),
                 )
                 .add_systems(
@@ -1350,18 +1814,15 @@ fn schedule_capture_requests(
     let mut waiting = Vec::new();
     for mut request in std::mem::take(&mut watches.0) {
         if request.cancellation.is_cancelled() {
+            report_capture_request_failed(&request, reporter.as_ref());
             continue;
         }
         if request.deadline <= now {
-            if let Some(reporter) = &reporter {
-                reporter.failed(request.id, request.generation, request.security_epoch);
-            }
+            report_capture_request_failed(&request, reporter.as_ref());
             continue;
         }
         if !renderer.0 {
-            if let Some(reporter) = &reporter {
-                reporter.failed(request.id, request.generation, request.security_epoch);
-            }
+            report_capture_request_failed(&request, reporter.as_ref());
             continue;
         }
         damage.register(
@@ -1506,7 +1967,6 @@ fn encode_nested_swapchain_blit(
 
 fn capture_request_is_copyable(
     request: &CaptureRequest,
-    reporter: Option<&CaptureCompletionReporter>,
     current_extent: Option<(u32, u32)>,
 ) -> bool {
     if request.cancellation.is_cancelled() {
@@ -1515,9 +1975,6 @@ fn capture_request_is_copyable(
     if request.deadline <= Instant::now()
         || current_extent.is_some_and(|extent| request.source_storage_extent != extent)
     {
-        if let Some(reporter) = reporter {
-            reporter.failed(request.id, request.generation, request.security_epoch);
-        }
         return false;
     }
     true
@@ -1528,9 +1985,13 @@ fn retain_copyable_consumers(
     reporter: Option<&CaptureCompletionReporter>,
     current_extent: Option<(u32, u32)>,
 ) -> bool {
-    group
-        .requests
-        .retain(|request| capture_request_is_copyable(request, reporter, current_extent));
+    group.requests.retain(|request| {
+        let copyable = capture_request_is_copyable(request, current_extent);
+        if !copyable {
+            report_capture_request_failed(request, reporter);
+        }
+        copyable
+    });
     #[cfg(feature = "frame-capture")]
     group.png.retain(|request| {
         if request.deadline <= Instant::now() {
@@ -1552,16 +2013,58 @@ fn retain_copyable_consumers(
     }
 }
 
+fn retain_prepared_dmabufs(
+    prepared: &mut Vec<PreparedCaptureDmabuf>,
+    reporter: Option<&CaptureCompletionReporter>,
+    current_extent: (u32, u32),
+) {
+    let mut retained = Vec::with_capacity(prepared.len());
+    for prepared in std::mem::take(prepared) {
+        if capture_request_is_copyable(&prepared.request, Some(current_extent)) {
+            retained.push(prepared);
+        } else if prepared.destination.release_to_foreign().is_ok() {
+            fail_dmabuf_request(prepared.request, reporter);
+        } else {
+            std::mem::forget(prepared.request);
+        }
+    }
+    *prepared = retained;
+}
+
+fn fail_prepared_dmabufs(
+    prepared: Vec<PreparedCaptureDmabuf>,
+    reporter: Option<&CaptureCompletionReporter>,
+) {
+    for prepared in prepared {
+        if prepared.destination.release_to_foreign().is_ok() {
+            fail_dmabuf_request(prepared.request, reporter);
+        } else {
+            std::mem::forget(prepared.request);
+        }
+    }
+}
+
+fn retain_all_copyable_consumers(
+    group: &mut CaptureReadbackGroup,
+    prepared: &mut Vec<PreparedCaptureDmabuf>,
+    reporter: Option<&CaptureCompletionReporter>,
+    current_extent: (u32, u32),
+) -> bool {
+    let readback = retain_copyable_consumers(group, reporter, Some(current_extent));
+    retain_prepared_dmabufs(prepared, reporter, current_extent);
+    readback || !prepared.is_empty()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn capture_output_frames(
     InMut(phase): InMut<CaptureExecutionPhase>,
     batches: Res<CaptureReadbackBatch>,
     tokens: Res<CaptureFrameTokens>,
     worker: Res<CaptureReadbackWorker>,
+    mut dmabuf: CaptureDmabufParams,
     reporter: Res<CaptureReporterBridge>,
     pending_nested: Option<Res<CapturePresentationPending>>,
     mut kms_targets: Option<ResMut<crate::backend::render::KmsRenderTargets>>,
-    damage: Res<OutputDamageJournal>,
     #[cfg(feature = "frame-capture")] png_service: Res<PngCaptureService>,
     device: Res<RenderDevice>,
     mut flush_commands: FlushCommands,
@@ -1573,6 +2076,9 @@ fn capture_output_frames(
 ) {
     let phase = *phase;
     let reporter = reporter.reporter();
+    if let Some(completion) = dmabuf.completion.as_deref_mut() {
+        completion.drain(reporter.as_ref());
+    }
     let requests = std::mem::take(
         &mut *batches
             .0
@@ -1582,7 +2088,8 @@ fn capture_output_frames(
     let mut groups = BTreeMap::<(CaptureSourceId, bool), CaptureReadbackGroup>::new();
     let mut deferred = Vec::new();
     for request in requests {
-        if !capture_request_is_copyable(&request, reporter.as_ref(), None) {
+        if !capture_request_is_copyable(&request, None) {
+            report_capture_request_failed(&request, reporter.as_ref());
             continue;
         }
         if phase.accepts(&request.source_id) {
@@ -1699,7 +2206,7 @@ fn capture_output_frames(
             continue;
         };
         for request in &mut group.requests {
-            let (revision, rectangles) = damage.snapshot(
+            let (revision, rectangles) = dmabuf.damage.snapshot(
                 &request.source_id,
                 request.damage_baseline,
                 request.overlay_cursor,
@@ -1740,6 +2247,7 @@ fn capture_output_frames(
             fail_readback_group(&group, reporter.as_ref());
             continue;
         };
+        let source_base_format = scene_texture.texture().format();
         let source_extent = group
             .requests
             .first()
@@ -1750,6 +2258,106 @@ fn capture_output_frames(
             .map_or(smithay::utils::Transform::Normal, |request| {
                 request.transform
             });
+        let mut dmabuf_requests = Vec::new();
+        let mut shm_requests = Vec::new();
+        for request in std::mem::take(&mut group.requests) {
+            match &request.destination {
+                CaptureDestination::Shm => shm_requests.push(request),
+                CaptureDestination::Dmabuf(_) => dmabuf_requests.push(request),
+            }
+        }
+        group.requests = shm_requests;
+        let mut prepared_dmabufs = Vec::new();
+        let mut available_destination_slots =
+            dmabuf.completion.as_deref().map_or(0, |completion| {
+                crate::protocol::MAX_IN_FLIGHT_CAPTURES.saturating_sub(completion.jobs.len())
+            });
+        for request in dmabuf_requests {
+            if !capture_request_is_copyable(&request, Some(current_extent)) {
+                fail_dmabuf_request(request, reporter.as_ref());
+                continue;
+            }
+            if available_destination_slots == 0 {
+                fail_dmabuf_request(request, reporter.as_ref());
+                continue;
+            }
+            let Some(bridge) = dmabuf.bridge.as_deref() else {
+                fail_dmabuf_request(request, reporter.as_ref());
+                continue;
+            };
+            let CaptureDestination::Dmabuf(destination) = &request.destination else {
+                unreachable!("partitioned DMA-BUF request changed destination")
+            };
+            let expected_format = match cosmix_wgpu_dmabuf::capture_destination_wgpu_format(
+                destination.descriptor.fourcc,
+            ) {
+                Some(cosmix_wgpu_dmabuf::CaptureDestinationWgpuFormat::Bgra8Unorm) => {
+                    TextureFormat::Bgra8Unorm
+                }
+                Some(cosmix_wgpu_dmabuf::CaptureDestinationWgpuFormat::Rgba8Unorm) => {
+                    TextureFormat::Rgba8Unorm
+                }
+                None => {
+                    fail_dmabuf_request(request, reporter.as_ref());
+                    continue;
+                }
+            };
+            let metadata_current = request.region
+                == (CaptureRegion {
+                    x: 0,
+                    y: 0,
+                    width: current_extent.0,
+                    height: current_extent.1,
+                })
+                && request.transform == smithay::utils::Transform::Normal
+                && request.source_storage_extent == request.displayed_physical_extent
+                && request.source_storage_extent == current_extent
+                && destination.descriptor.width == current_extent.0
+                && destination.descriptor.height == current_extent.1
+                && destination.descriptor.planes.len() == 1
+                && source_base_format == expected_format;
+            let fresh_support = bridge
+                .0
+                .capabilities()
+                .query(
+                    destination.descriptor.fourcc,
+                    destination.descriptor.modifier,
+                    current_extent.0,
+                    current_extent.1,
+                )
+                .is_ok_and(|support| support.supported());
+            if !metadata_current || !fresh_support {
+                fail_dmabuf_request(request, reporter.as_ref());
+                continue;
+            }
+            let descriptor = match destination.descriptor.try_clone() {
+                Ok(descriptor) => descriptor,
+                Err(_) => {
+                    fail_dmabuf_request(request, reporter.as_ref());
+                    continue;
+                }
+            };
+            let imported = match bridge.0.import(destination.drm_device, descriptor) {
+                Ok(imported) => imported,
+                Err(_) => {
+                    fail_dmabuf_request(request, reporter.as_ref());
+                    continue;
+                }
+            };
+            if !capture_request_is_copyable(&request, Some(current_extent)) {
+                if imported.release_to_foreign().is_ok() {
+                    fail_dmabuf_request(request, reporter.as_ref());
+                } else {
+                    std::mem::forget(request);
+                }
+                continue;
+            }
+            available_destination_slots -= 1;
+            prepared_dmabufs.push(PreparedCaptureDmabuf {
+                request,
+                destination: imported,
+            });
+        }
         #[cfg(feature = "frame-capture")]
         let displayed_extent = group
             .requests
@@ -1763,37 +2371,49 @@ fn capture_output_frames(
                 | TextureFormat::Bgra8UnormSrgb
         ) {
             fail_readback_group(&group, reporter.as_ref());
+            fail_prepared_dmabufs(prepared_dmabufs, reporter.as_ref());
             continue;
         }
-        let Some(row_bytes) = usize::try_from(source_extent.0)
-            .ok()
-            .and_then(|width| width.checked_mul(4))
-        else {
-            fail_readback_group(&group, reporter.as_ref());
-            continue;
+        let readback_needed = !group.requests.is_empty() || {
+            #[cfg(feature = "frame-capture")]
+            {
+                !group.png.is_empty()
+            }
+            #[cfg(not(feature = "frame-capture"))]
+            {
+                false
+            }
         };
-        let row_pitch = RenderDevice::align_copy_bytes_per_row(row_bytes);
-        let Some(buffer_size) = row_pitch.checked_mul(source_extent.1 as usize) else {
-            fail_readback_group(&group, reporter.as_ref());
-            continue;
+        let (row_pitch, buffer) = if readback_needed {
+            let Some(row_bytes) = usize::try_from(source_extent.0)
+                .ok()
+                .and_then(|width| width.checked_mul(4))
+            else {
+                fail_readback_group(&group, reporter.as_ref());
+                fail_prepared_dmabufs(prepared_dmabufs, reporter.as_ref());
+                continue;
+            };
+            let row_pitch = RenderDevice::align_copy_bytes_per_row(row_bytes);
+            let Some(buffer_size) = row_pitch.checked_mul(source_extent.1 as usize) else {
+                fail_readback_group(&group, reporter.as_ref());
+                fail_prepared_dmabufs(prepared_dmabufs, reporter.as_ref());
+                continue;
+            };
+            (
+                row_pitch,
+                Some(device.create_buffer(&BufferDescriptor {
+                    label: Some("CosMix capture readback staging"),
+                    size: buffer_size as u64,
+                    usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                })),
+            )
+        } else {
+            (0, None)
         };
-        let buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("CosMix capture readback staging"),
-            size: buffer_size as u64,
-            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("CosMix capture readback encoder"),
         });
-        let destination = TexelCopyBufferInfo {
-            buffer: &buffer,
-            layout: TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(row_pitch as u32),
-                rows_per_image: Some(source_extent.1),
-            },
-        };
         let copy_extent = Extent3d {
             width: source_extent.0,
             height: source_extent.1,
@@ -1805,6 +2425,7 @@ fn capture_output_frames(
             origin: Origin3d::ZERO,
             aspect: TextureAspect::All,
         };
+        let encoded_dmabufs;
         if cursor_inclusive
             && matches!(source_id, CaptureSourceId::Nested { .. })
             && !nested_blitted.contains(&source_id)
@@ -1827,18 +2448,21 @@ fn capture_output_frames(
                 .find(|(_, overlay)| overlay.source_id == source_id)
             else {
                 fail_readback_group(&group, reporter.as_ref());
+                fail_prepared_dmabufs(prepared_dmabufs, reporter.as_ref());
                 continue;
             };
             let Some(overlay_texture) = overlay_target.out_texture() else {
                 fail_readback_group(&group, reporter.as_ref());
+                fail_prepared_dmabufs(prepared_dmabufs, reporter.as_ref());
                 continue;
             };
             match &source_id {
                 CaptureSourceId::Kms { .. } => {
-                    if !retain_copyable_consumers(
+                    if !retain_all_copyable_consumers(
                         &mut group,
+                        &mut prepared_dmabufs,
                         reporter.as_ref(),
-                        Some(current_extent),
+                        current_extent,
                     ) {
                         continue 'groups;
                     }
@@ -1852,39 +2476,64 @@ fn capture_output_frames(
                         source_format,
                     ) {
                         fail_readback_group(&group, reporter.as_ref());
+                        fail_prepared_dmabufs(prepared_dmabufs, reporter.as_ref());
                         continue;
                     }
-                    if !retain_copyable_consumers(
+                    if !retain_all_copyable_consumers(
                         &mut group,
+                        &mut prepared_dmabufs,
                         reporter.as_ref(),
-                        Some(current_extent),
+                        current_extent,
                     ) {
                         continue 'groups;
                     }
-                    encoder.copy_texture_to_buffer(scene_copy, destination, copy_extent);
+                    encoded_dmabufs = encode_capture_dmabuf_copies(
+                        &mut encoder,
+                        scene_copy,
+                        source_base_format,
+                        current_extent,
+                        std::mem::take(&mut prepared_dmabufs),
+                        reporter.as_ref(),
+                    );
+                    encode_capture_readback_copy(
+                        &mut encoder,
+                        scene_copy,
+                        buffer.as_ref(),
+                        row_pitch as u32,
+                        copy_extent,
+                    );
                     kms_composited.insert(source_id.clone());
                 }
                 CaptureSourceId::Nested { .. } => {
                     // The host swapchain already contains the cursor-free scene.
                     // Compose only into this capture-owned intermediate so the
                     // host compositor still draws exactly one cursor.
+                    let composed_view_formats = [source_format];
                     let composed = device.create_texture(&TextureDescriptor {
                         label: Some("CosMix nested cursor-inclusive capture"),
                         size: copy_extent,
                         mip_level_count: 1,
                         sample_count: 1,
                         dimension: TextureDimension::D2,
-                        format: source_format,
+                        format: source_base_format,
                         usage: TextureUsages::COPY_DST
                             | TextureUsages::COPY_SRC
                             | TextureUsages::RENDER_ATTACHMENT,
-                        view_formats: &[],
+                        view_formats: if source_format != source_base_format {
+                            composed_view_formats.as_slice()
+                        } else {
+                            &[]
+                        },
                     });
-                    let composed_view = composed.create_view(&Default::default());
-                    if !retain_copyable_consumers(
+                    let composed_view = composed.create_view(&TextureViewDescriptor {
+                        format: Some(source_format),
+                        ..Default::default()
+                    });
+                    if !retain_all_copyable_consumers(
                         &mut group,
+                        &mut prepared_dmabufs,
                         reporter.as_ref(),
-                        Some(current_extent),
+                        current_extent,
                     ) {
                         nested_blitted.remove(&source_id);
                         continue 'groups;
@@ -1903,19 +2552,31 @@ fn capture_output_frames(
                         source_format,
                     ) {
                         fail_readback_group(&group, reporter.as_ref());
+                        fail_prepared_dmabufs(prepared_dmabufs, reporter.as_ref());
                         continue;
                     }
-                    if !retain_copyable_consumers(
+                    if !retain_all_copyable_consumers(
                         &mut group,
+                        &mut prepared_dmabufs,
                         reporter.as_ref(),
-                        Some(current_extent),
+                        current_extent,
                     ) {
                         nested_blitted.remove(&source_id);
                         continue 'groups;
                     }
-                    encoder.copy_texture_to_buffer(
+                    encoded_dmabufs = encode_capture_dmabuf_copies(
+                        &mut encoder,
                         composed.as_image_copy(),
-                        destination,
+                        source_base_format,
+                        current_extent,
+                        std::mem::take(&mut prepared_dmabufs),
+                        reporter.as_ref(),
+                    );
+                    encode_capture_readback_copy(
+                        &mut encoder,
+                        composed.as_image_copy(),
+                        buffer.as_ref(),
+                        row_pitch as u32,
                         copy_extent,
                     );
                 }
@@ -1930,11 +2591,30 @@ fn capture_output_frames(
                 request.request.cursor = None;
             }
         } else {
-            if !retain_copyable_consumers(&mut group, reporter.as_ref(), Some(current_extent)) {
+            if !retain_all_copyable_consumers(
+                &mut group,
+                &mut prepared_dmabufs,
+                reporter.as_ref(),
+                current_extent,
+            ) {
                 nested_blitted.remove(&source_id);
                 continue 'groups;
             }
-            encoder.copy_texture_to_buffer(scene_copy, destination, copy_extent);
+            encoded_dmabufs = encode_capture_dmabuf_copies(
+                &mut encoder,
+                scene_copy,
+                source_base_format,
+                current_extent,
+                std::mem::take(&mut prepared_dmabufs),
+                reporter.as_ref(),
+            );
+            encode_capture_readback_copy(
+                &mut encoder,
+                scene_copy,
+                buffer.as_ref(),
+                row_pitch as u32,
+                copy_extent,
+            );
             if matches!(source_id, CaptureSourceId::Nested { .. })
                 && !nested_blitted.contains(&source_id)
                 && redirect.0.as_ref().is_some_and(|redirect| {
@@ -1952,10 +2632,6 @@ fn capture_output_frames(
             }
         }
         let submission = queue.submit([encoder.finish()]);
-        let (mapped_tx, mapped) = mpsc::sync_channel(1);
-        buffer.slice(..).map_async(MapMode::Read, move |result| {
-            let _ = mapped_tx.try_send(result.map_err(|error| error.to_string()));
-        });
         let nested_acquisition = matches!(&source_id, CaptureSourceId::Nested { .. })
             .then(|| {
                 pending_nested
@@ -1966,6 +2642,7 @@ fn capture_output_frames(
         let presentations = group
             .requests
             .iter()
+            .chain(encoded_dmabufs.iter().map(|prepared| &prepared.request))
             .map(|request| PendingCapturePresentation {
                 id: request.id,
                 source_id: request.source_id.clone(),
@@ -1976,7 +2653,7 @@ fn capture_output_frames(
                 nested_acquisition,
             })
             .collect::<Vec<_>>();
-        let presentation_bound = group.requests.is_empty()
+        let presentation_bound = presentations.is_empty()
             || match &source_id {
                 CaptureSourceId::Nested { .. } => pending_nested.as_ref().is_some_and(|pending| {
                     if nested_acquisition.is_none() {
@@ -1991,6 +2668,48 @@ fn capture_output_frames(
             };
         if !presentation_bound {
             fail_readback_group(&group, reporter.as_ref());
+            for prepared in &encoded_dmabufs {
+                if let Some(reporter) = reporter.as_ref() {
+                    reporter.failed(
+                        prepared.request.id,
+                        prepared.request.generation,
+                        prepared.request.security_epoch,
+                    );
+                }
+            }
+        }
+        if let Some(completion) = dmabuf.completion.as_deref_mut() {
+            for prepared in encoded_dmabufs {
+                completion.submit(
+                    CaptureDmabufJob {
+                        request: prepared.request,
+                        destination: prepared.destination,
+                        frame_token,
+                        publication_failed: !presentation_bound,
+                    },
+                    reporter.as_ref(),
+                );
+            }
+        } else {
+            for prepared in encoded_dmabufs {
+                if let Some(reporter) = reporter.as_ref() {
+                    reporter.failed(
+                        prepared.request.id,
+                        prepared.request.generation,
+                        prepared.request.security_epoch,
+                    );
+                }
+                std::mem::forget(prepared);
+            }
+        }
+        let Some(buffer) = buffer else {
+            continue;
+        };
+        let (mapped_tx, mapped) = mpsc::sync_channel(1);
+        buffer.slice(..).map_async(MapMode::Read, move |result| {
+            let _ = mapped_tx.try_send(result.map_err(|error| error.to_string()));
+        });
+        if !presentation_bound {
             buffer.unmap();
             continue;
         }
@@ -2306,13 +3025,8 @@ fn overlay_cursor(target: &mut [u8], extent: (u32, u32), cursor: &CaptureCursorS
 }
 
 fn fail_requests(requests: &[CaptureRequest], reporter: Option<&CaptureCompletionReporter>) {
-    let Some(reporter) = reporter else {
-        return;
-    };
     for request in requests {
-        if !request.cancellation.is_cancelled() {
-            reporter.failed(request.id, request.generation, request.security_epoch);
-        }
+        report_capture_request_failed(request, reporter);
     }
 }
 
@@ -2645,6 +3359,7 @@ mod tests {
             scale120: 120,
             transform,
             format: CaptureFormat::Xrgb8888,
+            destination: CaptureDestination::Shm,
             overlay_cursor: false,
             cursor: None,
             with_damage: false,
@@ -3640,6 +4355,20 @@ mod tests {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
+            let destination = |label| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: extent,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                })
+            };
+            let base_destination = destination("capture base COPY_DST destination");
+            let inclusive_destination = destination("capture inclusive COPY_DST destination");
             let cursor_offset = (CURSOR_X * 4) as usize;
             let staging = |label| {
                 device.create_buffer(&wgpu::BufferDescriptor {
@@ -3688,9 +4417,20 @@ mod tests {
                     multiview_mask: None,
                 });
             }
-            // This is the production structural order: base readback first,
-            // then the production overlay pass, then inclusive readback.
-            encoder.copy_texture_to_buffer(texture.as_image_copy(), copy_to(&base_buffer), extent);
+            // This is the production structural order: base destination copy
+            // first, then the production overlay pass, then inclusive
+            // destination copy. Both readbacks come from distinct COPY_DST
+            // textures, not directly from the render attachment.
+            encoder.copy_texture_to_texture(
+                texture.as_image_copy(),
+                base_destination.as_image_copy(),
+                extent,
+            );
+            encoder.copy_texture_to_buffer(
+                base_destination.as_image_copy(),
+                copy_to(&base_buffer),
+                extent,
+            );
             let overlay_view = overlay.create_view(&wgpu::TextureViewDescriptor::default());
             let destination_view =
                 TextureView::from(texture.create_view(&wgpu::TextureViewDescriptor::default()));
@@ -3702,12 +4442,24 @@ mod tests {
                 &destination_view,
                 format,
             ));
-            encoder.copy_texture_to_buffer(
+            encoder.copy_texture_to_texture(
                 texture.as_image_copy(),
+                inclusive_destination.as_image_copy(),
+                extent,
+            );
+            encoder.copy_texture_to_buffer(
+                inclusive_destination.as_image_copy(),
                 copy_to(&inclusive_buffer),
                 extent,
             );
             queue.submit([encoder.finish()]);
+            let mut retirement =
+                cosmix_wgpu_dmabuf::WgpuWaitForSubmittedWork::new(render_device.clone());
+            cosmix_wgpu_dmabuf::WaitForSubmittedWork::wait_for_submitted_work(
+                &mut retirement,
+                cosmix_wgpu_dmabuf::RETIREMENT_WAIT_TIMEOUT,
+            )
+            .expect("COPY_DST destination work retires before readback");
 
             let map = |buffer: &wgpu::Buffer| {
                 let (sender, receiver) = mpsc::sync_channel(1);

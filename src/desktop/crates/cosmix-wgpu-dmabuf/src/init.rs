@@ -440,18 +440,6 @@ impl ManualVulkanRenderer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::SampledImportRequirement;
-
-    #[test]
-    fn scanout_probe_allows_an_empty_sampled_set_without_weakening_renderer_policy() {
-        assert!(!SampledImportRequirement::Required.admits(true));
-        assert!(SampledImportRequirement::Required.admits(false));
-        assert!(SampledImportRequirement::NotRequiredForScanoutProbe.admits(true));
-    }
-}
-
 fn device_preference(device_type: vk::PhysicalDeviceType) -> u8 {
     match device_type {
         vk::PhysicalDeviceType::DISCRETE_GPU => 0,
@@ -485,4 +473,16 @@ fn deduplicate_extensions(extensions: &mut Vec<&'static CStr>) {
         }
     }
     *extensions = unique;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SampledImportRequirement;
+
+    #[test]
+    fn scanout_probe_allows_an_empty_sampled_set_without_weakening_renderer_policy() {
+        assert!(!SampledImportRequirement::Required.admits(true));
+        assert!(SampledImportRequirement::Required.admits(false));
+        assert!(SampledImportRequirement::NotRequiredForScanoutProbe.admits(true));
+    }
 }
