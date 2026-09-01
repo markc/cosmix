@@ -416,6 +416,19 @@ impl ManualVulkanRenderer {
         ))
     }
 
+    /// Clone the renderer handles used for client-owned screencopy destination
+    /// imports. This bridge is valid for nested and DRM-pinned renderers; each
+    /// operation still validates the allocation's advertised DRM identity.
+    pub fn capture_destination_bridge(&self) -> crate::CaptureDestinationBridge {
+        crate::CaptureDestinationBridge::new(
+            self.resources.4.clone(),
+            self.resources.3.clone(),
+            self.resources.0.clone(),
+            self.resources.1.clone(),
+            self.capabilities.main_device,
+        )
+    }
+
     /// Replace Bevy's automatic `RenderPlugin` in its original plugin-group slot.
     pub fn install_into<G: PluginGroup>(self, plugins: G) -> PluginGroupBuilder {
         plugins

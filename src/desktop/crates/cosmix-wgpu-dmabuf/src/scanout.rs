@@ -24,7 +24,12 @@ use crate::formats::{
     drm_modifier_properties, drm_to_vulkan, external_import_properties_with_usage,
     external_import_properties_with_usage_and_view_formats, is_opaque, vulkan_to_wgpu,
 };
-use crate::{DmabufDescriptor, WgpuWaitForSubmittedWork, import::import_vulkan_image};
+use crate::{
+    DmabufDescriptor, WgpuWaitForSubmittedWork,
+    import::{
+        OwnershipDirection, OwnershipRole, import_vulkan_image, submit_raw_ownership_barrier,
+    },
+};
 
 const BGRA8_SRGB_VIEW_FORMATS: &[wgpu::TextureFormat] = &[wgpu::TextureFormat::Bgra8UnormSrgb];
 const RGBA8_SRGB_VIEW_FORMATS: &[wgpu::TextureFormat] = &[wgpu::TextureFormat::Rgba8UnormSrgb];
@@ -53,6 +58,28 @@ impl ScanoutImportSupport {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureDestinationWgpuFormat {
+    Bgra8Unorm,
+    Rgba8Unorm,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureDestinationSupport {
+    pub wgpu_format: Option<CaptureDestinationWgpuFormat>,
+    pub vulkan_external_memory_transfer_dst: bool,
+    pub extent_supported: bool,
+    pub max_extent: Option<(u32, u32)>,
+}
+
+impl CaptureDestinationSupport {
+    pub fn supported(self) -> bool {
+        self.wgpu_format.is_some()
+            && self.vulkan_external_memory_transfer_dst
+            && self.extent_supported
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ScanoutCapabilityError {
     #[error("manual renderer is not backed by Vulkan")]
@@ -65,6 +92,77 @@ pub enum ScanoutImportError {
     DeviceMismatch { supplied: u64, renderer: u64 },
     #[error("scanout DMA-BUF import failed: {0}")]
     Import(String),
+}
+
+#[derive(Debug, Error)]
+pub enum CaptureDestinationError {
+    #[error("capture DMA-BUF belongs to DRM device {supplied}, renderer uses {renderer}")]
+    DeviceMismatch { supplied: u64, renderer: u64 },
+    #[error("capture DMA-BUF import failed: {0}")]
+    Import(String),
+    #[error("capture DMA-BUF FOREIGN ownership release failed: {0}")]
+    Release(String),
+}
+
+/// Cloneable external-image import boundary for screencopy destinations.
+///
+/// Unlike the scanout bridge this is available to nested renderers as well as
+/// DRM-pinned renderers. Every import still supplies the allocation's feedback
+/// device identity, which must match the Vulkan physical device used by wgpu.
+#[derive(Clone)]
+pub struct CaptureDestinationBridge {
+    instance: RenderInstance,
+    adapter: RenderAdapter,
+    device: RenderDevice,
+    queue: RenderQueue,
+    main_device: u64,
+}
+
+impl CaptureDestinationBridge {
+    pub(crate) fn new(
+        instance: RenderInstance,
+        adapter: RenderAdapter,
+        device: RenderDevice,
+        queue: RenderQueue,
+        main_device: u64,
+    ) -> Self {
+        Self {
+            instance,
+            adapter,
+            device,
+            queue,
+            main_device,
+        }
+    }
+
+    pub fn capabilities(&self) -> CaptureDestinationCapabilities {
+        CaptureDestinationCapabilities::new(self.instance.clone(), self.adapter.clone())
+    }
+
+    pub fn import(
+        &self,
+        drm_device: u64,
+        descriptor: DmabufDescriptor,
+    ) -> Result<ImportedCaptureDestination, CaptureDestinationError> {
+        validate_capture_renderer_device(self.main_device, drm_device)?;
+        import_capture_destination(&self.device, descriptor)
+            .map_err(|error| CaptureDestinationError::Import(error.to_string()))
+    }
+
+    pub fn retirement_adapter(&self) -> WgpuWaitForSubmittedWork {
+        WgpuWaitForSubmittedWork::with_queue(self.device.clone(), self.queue.clone())
+    }
+}
+
+fn validate_capture_renderer_device(
+    renderer: u64,
+    supplied: u64,
+) -> Result<(), CaptureDestinationError> {
+    if renderer == supplied {
+        Ok(())
+    } else {
+        Err(CaptureDestinationError::DeviceMismatch { supplied, renderer })
+    }
 }
 
 /// Cloneable import boundary for compositor-allocated scanout buffers.
@@ -175,6 +273,195 @@ fn scanout_texture_descriptor(
     })
 }
 
+fn capture_destination_texture_descriptor(
+    descriptor: &DmabufDescriptor,
+) -> Result<wgpu::TextureDescriptor<'static>, crate::import::ImportError> {
+    if descriptor.width == 0 || descriptor.height == 0 {
+        return Err(crate::import::ImportError::InvalidDimensions);
+    }
+    if descriptor.planes.is_empty() {
+        return Err(crate::import::ImportError::NoPlanes);
+    }
+    if descriptor.planes.len() != 1 {
+        return Err(crate::import::ImportError::PlaneCount {
+            expected: 1,
+            actual: descriptor.planes.len(),
+        });
+    }
+    let vulkan_format = drm_to_vulkan(descriptor.fourcc).ok_or(
+        crate::import::ImportError::UnsupportedFourcc(descriptor.fourcc),
+    )?;
+    let format = vulkan_to_wgpu(vulkan_format).ok_or(
+        crate::import::ImportError::UnsupportedFourcc(descriptor.fourcc),
+    )?;
+    if capture_destination_wgpu_format(descriptor.fourcc).is_none() {
+        return Err(crate::import::ImportError::UnsupportedFourcc(
+            descriptor.fourcc,
+        ));
+    }
+    Ok(wgpu::TextureDescriptor {
+        label: Some("CosMix screencopy DMA-BUF destination"),
+        size: wgpu::Extent3d {
+            width: descriptor.width,
+            height: descriptor.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+/// One client-owned external image acquired from FOREIGN for a screencopy.
+/// The caller must retain it through submitted-work retirement and then call
+/// [`ImportedCaptureDestination::release_to_foreign`].
+pub struct ImportedCaptureDestination {
+    texture: Texture,
+    device: RenderDevice,
+    image: vk::Image,
+    extent: (u32, u32),
+    format: wgpu::TextureFormat,
+    fourcc: u32,
+    modifier: u64,
+}
+
+impl ImportedCaptureDestination {
+    pub fn texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+
+    pub fn extent(&self) -> (u32, u32) {
+        self.extent
+    }
+
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.format
+    }
+
+    pub fn fourcc(&self) -> u32 {
+        self.fourcc
+    }
+
+    pub fn modifier(&self) -> u64 {
+        self.modifier
+    }
+
+    /// Return the exclusive image to FOREIGN after the caller has proved the
+    /// dependent wgpu copy retired. A failed raw release strands the image
+    /// deliberately: destroying or reusing an image with unknown ownership
+    /// would turn a recoverable capture failure into cross-queue corruption.
+    pub fn release_to_foreign(self) -> Result<(), CaptureDestinationError> {
+        let result = unsafe {
+            let Some(device) = self.device.wgpu_device().as_hal::<Vulkan>() else {
+                return Err(CaptureDestinationError::Release(
+                    crate::import::ImportError::NotVulkan.to_string(),
+                ));
+            };
+            submit_raw_ownership_barrier(
+                &device,
+                &[self.image],
+                OwnershipDirection::Release,
+                OwnershipRole::CaptureDestination,
+            )
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                std::mem::forget(self);
+                Err(CaptureDestinationError::Release(error.to_string()))
+            }
+        }
+    }
+}
+
+fn import_capture_destination(
+    render_device: &RenderDevice,
+    descriptor: DmabufDescriptor,
+) -> Result<ImportedCaptureDestination, crate::import::ImportError> {
+    let wgpu_descriptor = capture_destination_texture_descriptor(&descriptor)?;
+    let vulkan_format = drm_to_vulkan(descriptor.fourcc).ok_or(
+        crate::import::ImportError::UnsupportedFourcc(descriptor.fourcc),
+    )?;
+    let extent = (descriptor.width, descriptor.height);
+    let fourcc = descriptor.fourcc;
+    let modifier = descriptor.modifier;
+    let render_device_for_drop = render_device.clone();
+    let (hal_texture, image) = unsafe {
+        let Some(device) = render_device.wgpu_device().as_hal::<Vulkan>() else {
+            return Err(crate::import::ImportError::NotVulkan);
+        };
+        let (image, memories, _) = import_vulkan_image(
+            &device,
+            descriptor,
+            vulkan_format,
+            capture_destination_vulkan_usage(),
+            &[],
+        )?;
+        if let Err(error) = submit_raw_ownership_barrier(
+            &device,
+            &[image],
+            OwnershipDirection::Acquire,
+            OwnershipRole::CaptureDestination,
+        ) {
+            device.raw_device().destroy_image(image, None);
+            for memory in memories {
+                device.raw_device().free_memory(memory, None);
+            }
+            return Err(error);
+        }
+        let drop_callback: wgpu_hal::DropCallback = Box::new(move || {
+            if let Some(device) = render_device_for_drop.wgpu_device().as_hal::<Vulkan>() {
+                device.raw_device().destroy_image(image, None);
+                for memory in memories {
+                    device.raw_device().free_memory(memory, None);
+                }
+            }
+        });
+        let hal_descriptor = HalTextureDescriptor {
+            label: wgpu_descriptor.label,
+            size: wgpu_descriptor.size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu_descriptor.format,
+            usage: capture_destination_hal_usage(),
+            memory_flags: MemoryFlags::empty(),
+            view_formats: Vec::new(),
+        };
+        (
+            device.texture_from_raw(
+                image,
+                &hal_descriptor,
+                Some(drop_callback),
+                TextureMemory::External,
+            ),
+            image,
+        )
+    };
+    let (wgpu_texture, tracker_seed) = unsafe {
+        render_device
+            .wgpu_device()
+            .create_texture_from_hal_with_initial_usage::<Vulkan>(
+                hal_texture,
+                &wgpu_descriptor,
+                TextureUses::COPY_DST,
+            )
+    };
+    debug_assert_eq!(tracker_seed, TextureUses::COPY_DST);
+    Ok(ImportedCaptureDestination {
+        texture: Texture::from(wgpu_texture),
+        device: render_device.clone(),
+        image,
+        extent,
+        format: wgpu_descriptor.format,
+        fourcc,
+        modifier,
+    })
+}
+
 fn import_scanout_target(
     render_device: &RenderDevice,
     descriptor: DmabufDescriptor,
@@ -266,6 +553,14 @@ fn scanout_vulkan_usage() -> vk::ImageUsageFlags {
     vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC
 }
 
+fn capture_destination_hal_usage() -> TextureUses {
+    TextureUses::COPY_DST
+}
+
+fn capture_destination_vulkan_usage() -> vk::ImageUsageFlags {
+    vk::ImageUsageFlags::TRANSFER_DST
+}
+
 fn scanout_srgb_view_formats(
     format: wgpu::TextureFormat,
 ) -> Option<&'static [wgpu::TextureFormat]> {
@@ -345,6 +640,86 @@ impl ScanoutImportCapabilities {
     }
 }
 
+#[derive(Clone)]
+pub struct CaptureDestinationCapabilities {
+    instance: RenderInstance,
+    adapter: RenderAdapter,
+}
+
+impl CaptureDestinationCapabilities {
+    pub(crate) fn new(instance: RenderInstance, adapter: RenderAdapter) -> Self {
+        Self { instance, adapter }
+    }
+
+    pub fn query(
+        &self,
+        fourcc: u32,
+        modifier: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<CaptureDestinationSupport, ScanoutCapabilityError> {
+        self.with_vulkan(|instance, physical_device| {
+            query_vulkan_capture_destination_support(
+                instance,
+                physical_device,
+                fourcc,
+                modifier,
+                width,
+                height,
+            )
+        })
+    }
+
+    pub fn supported_modifiers(
+        &self,
+        fourcc: u32,
+        width: u32,
+        height: u32,
+        feedback_modifiers: impl IntoIterator<Item = u64>,
+    ) -> Result<Vec<u64>, ScanoutCapabilityError> {
+        self.with_vulkan(|instance, physical_device| {
+            filter_capture_modifiers(feedback_modifiers, |modifier| {
+                query_vulkan_capture_destination_support(
+                    instance,
+                    physical_device,
+                    fourcc,
+                    modifier,
+                    width,
+                    height,
+                )
+                .supported()
+            })
+        })
+    }
+
+    fn with_vulkan<R>(
+        &self,
+        operation: impl FnOnce(&ash::Instance, vk::PhysicalDevice) -> R,
+    ) -> Result<R, ScanoutCapabilityError> {
+        let instance =
+            unsafe { self.instance.as_hal::<Vulkan>() }.ok_or(ScanoutCapabilityError::NotVulkan)?;
+        let adapter =
+            unsafe { self.adapter.as_hal::<Vulkan>() }.ok_or(ScanoutCapabilityError::NotVulkan)?;
+        Ok(operation(
+            instance.shared_instance().raw_instance(),
+            adapter.raw_physical_device(),
+        ))
+    }
+}
+
+fn filter_capture_modifiers(
+    modifiers: impl IntoIterator<Item = u64>,
+    mut supported: impl FnMut(u64) -> bool,
+) -> Vec<u64> {
+    let mut modifiers = modifiers.into_iter().collect::<Vec<_>>();
+    modifiers.sort_unstable();
+    modifiers.dedup();
+    modifiers
+        .into_iter()
+        .filter(|modifier| supported(*modifier))
+        .collect()
+}
+
 fn query_vulkan_scanout_support(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -410,6 +785,75 @@ fn query_vulkan_scanout_support(
     }
 }
 
+fn query_vulkan_capture_destination_support(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    fourcc: u32,
+    modifier: u64,
+    width: u32,
+    height: u32,
+) -> CaptureDestinationSupport {
+    let Some(vulkan_format) = drm_to_vulkan(fourcc) else {
+        return CaptureDestinationSupport {
+            wgpu_format: None,
+            vulkan_external_memory_transfer_dst: false,
+            extent_supported: false,
+            max_extent: None,
+        };
+    };
+    let wgpu_format = capture_destination_wgpu_format(fourcc);
+    let modifier_support = drm_modifier_properties(instance, physical_device, vulkan_format)
+        .into_iter()
+        .find(|properties| properties.drm_format_modifier == modifier);
+    let external_max_extent = modifier_support
+        .filter(|properties| properties.drm_format_modifier_plane_count == 1)
+        .filter(|properties| {
+            properties
+                .drm_format_modifier_tiling_features
+                .contains(vk::FormatFeatureFlags2::TRANSFER_DST)
+        })
+        .and_then(|_| {
+            external_import_properties_with_usage(
+                instance,
+                physical_device,
+                vulkan_format,
+                modifier,
+                capture_destination_vulkan_usage(),
+            )
+        })
+        .map(|properties| (properties.max_extent.width, properties.max_extent.height));
+    capture_destination_support_from_facts(
+        wgpu_format,
+        modifier_support.map(|properties| properties.drm_format_modifier_plane_count),
+        modifier_support.map_or(vk::FormatFeatureFlags2::empty(), |properties| {
+            properties.drm_format_modifier_tiling_features
+        }),
+        external_max_extent,
+        width,
+        height,
+    )
+}
+
+fn capture_destination_support_from_facts(
+    wgpu_format: Option<CaptureDestinationWgpuFormat>,
+    plane_count: Option<u32>,
+    tiling_features: vk::FormatFeatureFlags2,
+    external_max_extent: Option<(u32, u32)>,
+    width: u32,
+    height: u32,
+) -> CaptureDestinationSupport {
+    let transfer_dst = plane_count == Some(1)
+        && tiling_features.contains(vk::FormatFeatureFlags2::TRANSFER_DST)
+        && external_max_extent.is_some();
+    let max_extent = transfer_dst.then_some(external_max_extent).flatten();
+    CaptureDestinationSupport {
+        wgpu_format,
+        vulkan_external_memory_transfer_dst: transfer_dst,
+        extent_supported: max_extent.is_some_and(|extent| mode_fits_extent(width, height, extent)),
+        max_extent,
+    }
+}
+
 fn required_scanout_usage() -> vk::ImageUsageFlags {
     vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC
 }
@@ -426,6 +870,14 @@ pub fn scanout_wgpu_format(fourcc: u32) -> Option<ScanoutWgpuFormat> {
         // only while atomic admission separately enforces the opaque policy.
         wgpu::TextureFormat::Bgra8Unorm => Some(ScanoutWgpuFormat::Bgra8Unorm),
         wgpu::TextureFormat::Rgba8Unorm => Some(ScanoutWgpuFormat::Rgba8Unorm),
+        _ => None,
+    }
+}
+
+pub fn capture_destination_wgpu_format(fourcc: u32) -> Option<CaptureDestinationWgpuFormat> {
+    match DrmFourcc::try_from(fourcc).ok()? {
+        DrmFourcc::Xrgb8888 => Some(CaptureDestinationWgpuFormat::Bgra8Unorm),
+        DrmFourcc::Xbgr8888 => Some(CaptureDestinationWgpuFormat::Rgba8Unorm),
         _ => None,
     }
 }
@@ -533,6 +985,114 @@ mod tests {
         assert_eq!(
             scanout_vulkan_usage(),
             vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC
+        );
+    }
+
+    #[test]
+    fn capture_destination_contract_is_copy_dst_only_at_every_api_layer() {
+        let capture = capture_destination_texture_descriptor(&descriptor(DrmFourcc::Xrgb8888))
+            .expect("XR24 capture destination descriptor");
+        assert_eq!(capture.format, wgpu::TextureFormat::Bgra8Unorm);
+        assert!(capture.view_formats.is_empty());
+        assert_eq!(capture.usage, wgpu::TextureUsages::COPY_DST);
+        assert_eq!(capture_destination_hal_usage(), TextureUses::COPY_DST);
+        assert_eq!(
+            capture_destination_vulkan_usage(),
+            vk::ImageUsageFlags::TRANSFER_DST
+        );
+        let scanout = scanout_texture_descriptor(&descriptor(DrmFourcc::Xrgb8888))
+            .expect("scanout descriptor remains isolated");
+        assert_eq!(
+            scanout.usage,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+        );
+    }
+
+    #[test]
+    fn capture_destination_capability_matrix_is_role_and_extent_exact() {
+        let support = |planes, features, extent, width, height| {
+            capture_destination_support_from_facts(
+                Some(CaptureDestinationWgpuFormat::Bgra8Unorm),
+                planes,
+                features,
+                extent,
+                width,
+                height,
+            )
+        };
+        assert!(
+            support(
+                Some(1),
+                vk::FormatFeatureFlags2::TRANSFER_DST,
+                Some((1920, 1080)),
+                1920,
+                1080,
+            )
+            .supported()
+        );
+        assert!(
+            !support(
+                Some(2),
+                vk::FormatFeatureFlags2::TRANSFER_DST,
+                Some((1920, 1080)),
+                1920,
+                1080,
+            )
+            .supported()
+        );
+        assert!(
+            !support(
+                Some(1),
+                vk::FormatFeatureFlags2::SAMPLED_IMAGE,
+                Some((1920, 1080)),
+                1920,
+                1080,
+            )
+            .supported()
+        );
+        assert!(
+            !support(
+                Some(1),
+                vk::FormatFeatureFlags2::TRANSFER_DST,
+                None,
+                1920,
+                1080,
+            )
+            .supported()
+        );
+        assert!(
+            !support(
+                Some(1),
+                vk::FormatFeatureFlags2::TRANSFER_DST,
+                Some((1919, 1080)),
+                1920,
+                1080,
+            )
+            .supported()
+        );
+        assert_eq!(
+            capture_destination_wgpu_format(DrmFourcc::Nv12 as u32),
+            None
+        );
+    }
+
+    #[test]
+    fn capture_destination_identity_mismatch_is_named() {
+        assert!(matches!(
+            validate_capture_renderer_device(10, 11),
+            Err(CaptureDestinationError::DeviceMismatch {
+                renderer: 10,
+                supplied: 11,
+            })
+        ));
+        assert!(validate_capture_renderer_device(10, 10).is_ok());
+    }
+
+    #[test]
+    fn capture_destination_modifier_filter_is_sorted_deduplicated_intersection() {
+        assert_eq!(
+            filter_capture_modifiers([9, 3, 9, 4, 3], |modifier| modifier != 4),
+            vec![3, 9]
         );
     }
 
