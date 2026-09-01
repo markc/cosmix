@@ -13,5 +13,5 @@ dev-host = ["chrome"]
 
 [dependencies]
 accesskit = { version = "0.24", optional = true }
-bevy = { version = "=0.19.0", default-features = false, features = ["ui", "bevy_feathers", "bevy_winit"], optional = true }
+bevy = { version = "=0.19.0", default-features = false, features = ["ui_api", "ui_bevy_render", "scene", "picking", "bevy_ui_widgets", "bevy_feathers", "bevy_winit"], optional = true }
 ctk = { path = "../../ctk", default-features = false, optional = true }

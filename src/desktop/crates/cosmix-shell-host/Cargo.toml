@@ -8,12 +8,26 @@ license = "MIT"
 
 [dependencies]
 bevy = { version = "=0.19.0", default-features = false, features = [
-    "ui",
+    # Bevy's `ui` convenience feature includes `default_platform`, hence X11.
+    # Spell out the same UI/platform surface with Wayland as the sole backend.
+    "ui_api",
+    "ui_bevy_render",
+    "scene",
+    "picking",
+    "bevy_ui_widgets",
+    "std",
+    "bevy_gilrs",
+    "bevy_clipboard",
+    "default_font",
+    "multi_threaded",
+    "webgl2",
+    "custom_cursor",
+    "sysinfo_plugin",
     "bevy_feathers",
     "bevy_winit",
     "wayland",
 ] }
-bevy_winit = "=0.19.1"
+bevy_winit = { version = "=0.19.1", default-features = false, features = ["wayland"] }
 calloop = { version = "=0.13.0", features = ["signals"] }
 cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client" }
 cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config", features = ["client-helpers"] }

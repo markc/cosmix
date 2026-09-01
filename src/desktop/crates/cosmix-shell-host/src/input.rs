@@ -1650,6 +1650,7 @@ mod tests {
             },
             0,
         ));
+        assert_eq!(bridge.repeat_deadline(), None);
         let events = app
             .world_mut()
             .resource_mut::<Messages<KeyboardInput>>()

@@ -85,7 +85,11 @@ system-clipboard = ["bevy/system_clipboard"]
 # CTK follows Feathers rather than copying it. Keep this exact: every Bevy
 # release is a deliberate compatibility pass because the widget APIs churn.
 bevy = { version = "=0.19.0", default-features = false, features = [
-    "ui",
+    "ui_api",
+    "ui_bevy_render",
+    "scene",
+    "picking",
+    "bevy_ui_widgets",
     "bevy_feathers",
     "accesskit_unix",
     "system_font_discovery",

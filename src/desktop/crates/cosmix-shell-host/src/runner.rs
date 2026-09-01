@@ -203,6 +203,23 @@ fn run_layer_host_app_update_at(app: &mut App, instant: Instant) -> bool {
     follow_up
 }
 
+fn render_device_texture_limit(app: &App) -> Option<u32> {
+    app.get_sub_app(RenderApp)
+        .and_then(|render_app| render_app.world().get_resource::<RenderDevice>())
+        .map(|device| device.limits().max_texture_dimension_2d)
+        .filter(|limit| *limit > 0)
+}
+
+#[inline]
+fn debug_assert_render_device_texture_limit(_app: &App, _cached: u32) {
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(
+        render_device_texture_limit(_app),
+        Some(_cached),
+        "the live render-device texture limit changed without updating the host cache"
+    );
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LayerCloseDecision {
     Retire,
@@ -396,6 +413,13 @@ fn next_timer_deadline(
         .chain(keyboard_repeat)
         .chain(configure_deadlines.iter().copied())
         .min()
+}
+
+fn repeat_drives_deadline(
+    next_deadline: Option<Duration>,
+    repeat_deadline: Option<Duration>,
+) -> bool {
+    repeat_deadline.is_some() && next_deadline == repeat_deadline
 }
 
 fn animate_backstop_deadline(requested_at: Duration) -> Duration {
@@ -848,15 +872,15 @@ impl<'loop_handle>
     fn begin_update(&mut self, now: Instant) {
         self.needs_update = false;
         let sample = update_sample_instant(&self.app, &self.wake_timer, now);
-        if run_layer_host_app_update_at(&mut self.app, sample) {
-            self.needs_update = true;
-        }
         let elapsed = self
             .app
             .world()
             .get_resource::<Time<Real>>()
-            .map_or(Duration::ZERO, Time::elapsed);
+            .map_or(Duration::ZERO, |time| model_elapsed_at(time, sample));
         self.handle_queued_wake_timer(elapsed);
+        if run_layer_host_app_update_at(&mut self.app, sample) {
+            self.needs_update = true;
+        }
     }
 
     fn app_exit(&mut self) -> Option<AppExit> {
@@ -1032,18 +1056,12 @@ fn run_layer_host(
     state.app.finish();
     state.app.cleanup();
 
-    let Some(max_texture_dimension_2d) = state
-        .app
-        .get_sub_app(RenderApp)
-        .and_then(|render_app| render_app.world().get_resource::<RenderDevice>())
-        .map(|device| device.limits().max_texture_dimension_2d)
-        .filter(|limit| *limit > 0)
-    else {
+    let Some(max_texture_dimension_2d) = render_device_texture_limit(&state.app) else {
         return state_setup_error(state, "render-device-texture-limit-unavailable".to_owned());
     };
-    // Invariant: the render device is never replaced. If device-loss recovery,
-    // GPU re-enumeration or backend switching ever replaces it, re-capture the
-    // negotiated limit here at the same time.
+    // Release builds cache the negotiated limit; debug builds compare it with
+    // the live RenderDevice at every validation boundary below. Device-loss
+    // recovery, GPU re-enumeration or backend switching must update this cache.
     state.max_texture_dimension_2d = max_texture_dimension_2d;
 
     if state.app.is_plugin_added::<WinitPlugin>()
@@ -1516,11 +1534,12 @@ impl RunnerState {
                     .map(|started| started.saturating_add(CONFIGURE_TIMEOUT))
             })
             .collect::<Vec<_>>();
+        let repeat_deadline = self.keyboard_bridge.repeat_deadline();
         let next_deadline = next_timer_deadline(
             self.last_wake,
             self.last_wake_deadline,
             animate_backstop,
-            self.keyboard_bridge.repeat_deadline(),
+            repeat_deadline,
             &configure_deadlines,
         );
         let model_progressed = self
@@ -1531,6 +1550,17 @@ impl RunnerState {
         let past = self
             .wake_timer
             .observe_next_deadline(next_deadline, elapsed, model_progressed);
+        if past != PastDeadline::NotPast && repeat_drives_deadline(next_deadline, repeat_deadline) {
+            // Even when a slow update has already overrun the 8 ms ceiling gap,
+            // repeat must re-enter through calloop. The zero-delay one-shot lets
+            // Wayland and signal fds dispatch before the next repeat update.
+            return replace_wake_timer_source(
+                loop_handle,
+                &mut self.wake_timer,
+                next_deadline,
+                elapsed,
+            );
+        }
         match past {
             PastDeadline::DueNow { .. } | PastDeadline::Stuck => {
                 let deadline = next_deadline.expect("past observation has a deadline");
@@ -1547,6 +1577,7 @@ impl RunnerState {
                 self.wake_timer.deadline = None;
                 self.wake_timer.pending_early_rearm = None;
                 self.handle_due_wake_timer(elapsed);
+                self.needs_update = true;
                 if past == PastDeadline::Stuck {
                     tracing::error!(
                         event = "quoin_wake_deadline_stuck",
@@ -1570,12 +1601,14 @@ impl RunnerState {
             self.wake_timer.observe_queued_fire(elapsed),
             QueuedWake::Due(_)
         ) {
+            // Repeat input is emitted only after an actual calloop one-shot
+            // dispatch, and before the Bevy update that consumes it.
+            self.keyboard_bridge.fire_repeat(&mut self.app, elapsed);
             self.handle_due_wake_timer(elapsed);
         }
     }
 
     fn handle_due_wake_timer(&mut self, elapsed: Duration) {
-        self.keyboard_bridge.fire_repeat(&mut self.app, elapsed);
         let configure_timeout = self
             .outputs
             .values()
@@ -1602,7 +1635,6 @@ impl RunnerState {
         {
             panel.clear_overdue_frame(elapsed, ANIMATE_BACKSTOP);
         }
-        self.needs_update = true;
     }
 
     fn panel_for_surface_mut(
@@ -1655,6 +1687,7 @@ impl RunnerState {
         else {
             return;
         };
+        debug_assert_render_device_texture_limit(&self.app, self.max_texture_dimension_2d);
         if let Some(error) = runtime.panels.iter().find_map(|panel| {
             panel
                 .validate_output_metrics(scale, self.max_texture_dimension_2d)
@@ -1706,6 +1739,7 @@ impl CompositorHandler for RunnerState {
         surface: &wl_surface::WlSurface,
         scale: i32,
     ) {
+        debug_assert_render_device_texture_limit(&self.app, self.max_texture_dimension_2d);
         let output_size = panel_output_size(&self.outputs, surface);
         let elapsed = self
             .app
@@ -1887,6 +1921,7 @@ impl LayerShellHandler for RunnerState {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
+        debug_assert_render_device_texture_limit(&self.app, self.max_texture_dimension_2d);
         let elapsed = self
             .app
             .world()
@@ -2456,6 +2491,7 @@ impl Dispatch<WpFractionalScaleV1, SurfaceTag> for RunnerState {
         let wp_fractional_scale_v1::Event::PreferredScale { scale } = event else {
             return;
         };
+        debug_assert_render_device_texture_limit(&state.app, state.max_texture_dimension_2d);
         let elapsed = state
             .app
             .world()
@@ -2570,6 +2606,27 @@ mod tests {
         Corner(CornerEvent),
     }
 
+    #[derive(Default)]
+    struct RepeatDispatchState {
+        wake_timer: WakeTimerState,
+        needs_update: bool,
+        repeat_active: bool,
+        release_dispatched: bool,
+        termination_signal_dispatched: bool,
+    }
+
+    impl WakeTimerTarget for RepeatDispatchState {
+        fn clear_wake_timer_registration(&mut self) {
+            self.wake_timer.deadline = None;
+            self.wake_timer.token = None;
+        }
+
+        fn queue_wake_timer_fire(&mut self, deadline: Duration) {
+            self.wake_timer.fired_deadline = Some(deadline);
+            self.needs_update = true;
+        }
+    }
+
     struct TestRunnerState {
         app: App,
         output: OutputKey,
@@ -2599,7 +2656,6 @@ mod tests {
     impl<'loop_handle> RunnerIteration<LoopHandle<'loop_handle, TestRunnerState>> for TestRunnerState {
         fn begin_update(&mut self, _now: Instant) {
             // Mirrors the production RunnerState::begin_update timer/update ordering.
-            self.iteration_steps.push("update");
             self.needs_update = false;
             let model_elapsed = self.app.world().resource::<Time<Real>>().elapsed();
             if self.fresh_elapsed > model_elapsed {
@@ -2614,17 +2670,19 @@ mod tests {
                     TimeUpdateStrategy::ManualDuration(deadline - model_elapsed);
                 self.fresh_elapsed = deadline;
             }
+            if matches!(
+                self.wake_timer.observe_queued_fire(self.fresh_elapsed),
+                QueuedWake::Due(_)
+            ) {
+                self.iteration_steps.push("timer-due");
+                self.animate_requested_at = None;
+            }
+            self.iteration_steps.push("update");
             if run_layer_host_app_update(&mut self.app) {
                 self.needs_update = true;
             }
             let elapsed = self.app.world().resource::<Time<Real>>().elapsed();
             self.fresh_elapsed = self.fresh_elapsed.max(elapsed);
-            if matches!(
-                self.wake_timer.observe_queued_fire(self.fresh_elapsed),
-                QueuedWake::Due(_)
-            ) {
-                self.needs_update = true;
-            }
         }
 
         fn app_exit(&mut self) -> Option<AppExit> {
@@ -3521,6 +3579,9 @@ mod tests {
             let conceal_effects = state.app.world().resource::<ShellEffects>().0.clone();
             let after_motion = deadline + Duration::from_millis(201);
             state.fresh_elapsed = after_motion;
+            // A real frame callback requests this animation update; the timer's
+            // consuming update no longer creates a redundant immediate chain.
+            state.needs_update = true;
             drive_test_runner_update(&mut state, &handle);
             let frame = &state.app.world().resource::<ShellFrameState>().0;
             let concealed = frame.panel(Edge::Left);
@@ -3588,6 +3649,124 @@ mod tests {
             Some(seconds(5)),
             "keyboard repeat shares the one earliest-deadline timer"
         );
+    }
+
+    #[test]
+    fn queued_timer_work_precedes_its_consuming_update() {
+        let output = OutputKey::new("DP-1").unwrap();
+        let model = ShellModel::new(
+            output.clone(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let mut app = App::new();
+        configure_ingress(&mut app);
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)))
+            .add_message::<RequestRedraw>()
+            .init_resource::<LayerHostUpdateWake>()
+            .add_systems(Last, capture_layer_host_redraw)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
+        let deadline = Duration::from_millis(8);
+        let mut state = TestRunnerState {
+            app,
+            output,
+            needs_update: true,
+            wake_timer: WakeTimerState {
+                fired_deadline: Some(deadline),
+                ..Default::default()
+            },
+            fresh_elapsed: deadline,
+            last_timer_delay: None,
+            last_timer_rearmed: false,
+            animate_requested_at: None,
+            abnormal_exit: false,
+            exit_reason: None,
+            iteration_steps: Vec::new(),
+        };
+        let event_loop: EventLoop<TestRunnerState> = EventLoop::try_new().unwrap();
+
+        drive_test_runner_update(&mut state, &event_loop.handle());
+
+        assert_eq!(
+            state.iteration_steps,
+            [
+                "timer-due",
+                "update",
+                "should-exit",
+                "reconcile",
+                "replace-timer",
+                "flush"
+            ],
+            "repeat input must exist before the update that consumes it"
+        );
+        assert!(!state.needs_update, "timer work must not chain an update");
+    }
+
+    #[test]
+    fn slow_max_rate_repeat_dispatches_queued_release_and_termination_signal() {
+        let repeat_deadline = Duration::from_millis(8);
+        let slow_update_elapsed = Duration::from_millis(10);
+        let mut state = RepeatDispatchState {
+            repeat_active: true,
+            ..Default::default()
+        };
+        let mut event_loop: EventLoop<RepeatDispatchState> = EventLoop::try_new().unwrap();
+        let handle = event_loop.handle();
+        let (release_sender, release_channel) = calloop::channel::sync_channel(1);
+        handle
+            .insert_source(release_channel, |event, _, state| {
+                if matches!(event, calloop::channel::Event::Msg(())) {
+                    state.repeat_active = false;
+                    state.release_dispatched = true;
+                    state.needs_update = true;
+                }
+            })
+            .unwrap();
+        let (signal_sender, signal_channel) = calloop::channel::sync_channel(1);
+        handle
+            .insert_source(signal_channel, |event, _, state| {
+                if matches!(event, calloop::channel::Event::Msg(())) {
+                    state.termination_signal_dispatched = true;
+                }
+            })
+            .unwrap();
+
+        let next_deadline = Some(repeat_deadline);
+        let past = state
+            .wake_timer
+            .observe_next_deadline(next_deadline, slow_update_elapsed, true);
+        assert_eq!(past, PastDeadline::DueNow { first: true });
+        assert!(repeat_drives_deadline(next_deadline, Some(repeat_deadline)));
+        replace_wake_timer_source(
+            &handle,
+            &mut state.wake_timer,
+            next_deadline,
+            slow_update_elapsed,
+        )
+        .unwrap();
+        assert!(state.wake_timer.token.is_some());
+        assert!(
+            !state.needs_update,
+            "an overrun repeat must arm calloop, not chain an update"
+        );
+
+        // These stand in for release arriving on the Wayland fd and SIGTERM on
+        // signalfd while the four-window update overruns the 125 Hz repeat gap.
+        release_sender.try_send(()).unwrap();
+        signal_sender.try_send(()).unwrap();
+        event_loop.dispatch(None, &mut state).unwrap();
+
+        assert_eq!(
+            state.wake_timer.fired_deadline,
+            Some(repeat_deadline),
+            "the one-shot repeat deadline must still fire"
+        );
+        assert!(state.release_dispatched);
+        assert!(!state.repeat_active, "release must cancel the repeat");
+        assert!(state.termination_signal_dispatched);
     }
 
     #[test]

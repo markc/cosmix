@@ -163,8 +163,11 @@ text, modifiers and repeat into Bevy's input model. Focus loss, panel teardown
 and keyboard capability loss synthesize releases for held keys, clear pressed
 state and stop repeat. Compositor repeat settings are clamped to 1–125 Hz and a
 50–2000 ms delay; each fired deadline advances strictly beyond both its prior
-deadline and current model time. Touch down is attributed to the exact panel
-surface; motion and up retain that local Bevy window attribution. Touch cancel,
+deadline and current model time. Because SCTK does not expose the raw XKB masks
+needed to reinterpret repeated text safely, any compositor modifier callback
+stops repeat for that press; release and press the key again to resume. Touch
+down is attributed to the exact panel surface; motion and up retain that local
+Bevy window attribution. Touch cancel,
 teardown and capability loss emit cancellation and clear every held contact.
 Quoin chooses the first advertised seat independently for pointer, keyboard
 and touch, and fails each capability over after its selected seat is removed.
