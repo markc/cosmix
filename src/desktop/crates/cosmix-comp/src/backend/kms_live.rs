@@ -379,7 +379,6 @@ struct PreparedLiveOperation {
     frame_clock: Option<crate::protocol::ClientFrameClock>,
     security_reporter: Option<crate::protocol::SecurityPresentationReporter>,
     scene_feed: Option<crate::protocol::ClientSceneFeed>,
-    scene_mode: LiveSceneMode,
     decoration: DecorationStartup,
     #[cfg(feature = "bus")]
     bus_service: String,
@@ -4140,7 +4139,6 @@ fn prepare_live_operation(
         frame_clock: None,
         security_reporter: None,
         scene_feed: None,
-        scene_mode: grant.scene_mode,
         decoration: grant.decoration.clone(),
         #[cfg(feature = "bus")]
         bus_service,
@@ -5514,7 +5512,6 @@ fn supervise_resumed_live_render<M, P>(
     mailbox: &mut M,
     pump: &mut P,
     resumed: ResumedLiveOutput,
-    scene_mode: LiveSceneMode,
     mut now: impl FnMut() -> Duration,
     mut flush_events: impl FnMut(Duration) -> Result<crate::protocol::EventFlushOutcome, KmsLiveError>,
     mut pulse: impl FnMut() -> Result<(), KmsLiveError>,
@@ -5524,50 +5521,45 @@ where
     M: LiveCoordinatorMailbox,
     P: LivePumpControl,
 {
-    if scene_mode == LiveSceneMode::ClientContent {
-        // The transition update which observed OutputReady drained stale scene
-        // batches queued while paused. Draining cannot wake calloop, and a busy
-        // client can refill both slots before our flush is handled. Alternate a
-        // flush with a scene-only drain until the publisher confirms that nothing
-        // remains compacted protocol-side. The OutputReady no-submit deadline
-        // bounds sustained refill; only the following update is the first resumed
-        // render and frame-clock pulse candidate. First-light leaves the scene
-        // feed in WaylandRuntime, so it has nothing to drain and skips this stage.
-        let submit_deadline = resumed.ready_at.saturating_add(NO_SUBMIT_TIMEOUT);
-        loop {
-            let observed_at = now();
-            if observed_at >= submit_deadline {
+    // The transition update which observed OutputReady drained stale protocol
+    // batches queued while paused. Draining cannot wake calloop, and a busy
+    // client can refill both slots before our flush is handled. Alternate a
+    // flush with a scene-only drain until the publisher confirms that nothing
+    // remains compacted protocol-side. The OutputReady no-submit deadline
+    // bounds sustained refill; only the following update is the first resumed
+    // render and frame-clock pulse candidate. Both scene modes own this feed:
+    // first-light consumes capture traffic while ignoring client pixels.
+    let submit_deadline = resumed.ready_at.saturating_add(NO_SUBMIT_TIMEOUT);
+    loop {
+        let observed_at = now();
+        if observed_at >= submit_deadline {
+            return Err(no_submit_timeout_error());
+        }
+        let timeout = LIVE_TOPOLOGY_ACK_TIMEOUT.min(submit_deadline.saturating_sub(observed_at));
+        if flush_events(timeout)? == crate::protocol::EventFlushOutcome::Complete {
+            if now() >= submit_deadline {
                 return Err(no_submit_timeout_error());
             }
-            let timeout =
-                LIVE_TOPOLOGY_ACK_TIMEOUT.min(submit_deadline.saturating_sub(observed_at));
-            if flush_events(timeout)? == crate::protocol::EventFlushOutcome::Complete {
-                if now() >= submit_deadline {
-                    return Err(no_submit_timeout_error());
-                }
-                break;
+            break;
+        }
+        pump.drain_scene(resumed.generation)?;
+        let reply = match wait_for_pump_reply(
+            mailbox,
+            submit_deadline,
+            &mut now,
+            "resume scene drain",
+            OutstandingPumpCommand::DrainScene {
+                generation: resumed.generation,
+            },
+        )? {
+            PumpWait::Reply(reply) => reply,
+            PumpWait::End(end) => return Ok(end),
+        };
+        match reply {
+            PumpReply::SceneDrained { generation, result } if generation == resumed.generation => {
+                result?;
             }
-            pump.drain_scene(resumed.generation)?;
-            let reply = match wait_for_pump_reply(
-                mailbox,
-                submit_deadline,
-                &mut now,
-                "resume scene drain",
-                OutstandingPumpCommand::DrainScene {
-                    generation: resumed.generation,
-                },
-            )? {
-                PumpWait::Reply(reply) => reply,
-                PumpWait::End(end) => return Ok(end),
-            };
-            match reply {
-                PumpReply::SceneDrained { generation, result }
-                    if generation == resumed.generation =>
-                {
-                    result?;
-                }
-                reply => return Err(unexpected_pump_reply("resume scene drain", reply)),
-            }
+            reply => return Err(unexpected_pump_reply("resume scene drain", reply)),
         }
     }
     let mut policy = SubmitWatchdog::new(resumed.ready_at);
@@ -7791,13 +7783,11 @@ impl LiveActPlatform for PreparedLiveOperation {
         self.topology_client = Some(runtime.kms_topology_client());
         self.frame_clock = Some(runtime.client_frame_clock());
         self.security_reporter = Some(runtime.security_presentation_reporter());
-        if self.scene_mode == LiveSceneMode::ClientContent {
-            self.scene_feed = Some(
-                runtime
-                    .take_client_scene_feed()
-                    .map_err(KmsLiveError::Setup)?,
-            );
-        }
+        self.scene_feed = Some(
+            runtime
+                .take_client_scene_feed()
+                .map_err(KmsLiveError::Setup)?,
+        );
         self.initial_render_commands = runtime
             .drain_kms_render_commands()
             .map_err(KmsLiveError::Setup)?;
@@ -7914,7 +7904,6 @@ impl LiveActPlatform for PreparedLiveOperation {
                         .expect("production preparation installs the session owner"),
                     adapter,
                     resumed,
-                    self.scene_mode,
                     || started.elapsed(),
                     move |timeout| {
                         topology_client
@@ -9935,7 +9924,6 @@ mod tests {
                 ready_at: Duration::ZERO,
                 generation: 61,
             },
-            LiveSceneMode::FirstLight,
             now,
             |_| Ok(crate::protocol::EventFlushOutcome::Complete),
             || Ok(()),
@@ -10064,7 +10052,6 @@ mod tests {
                 ready_at: Duration::ZERO,
                 generation: 61,
             },
-            LiveSceneMode::FirstLight,
             now,
             |_| Ok(crate::protocol::EventFlushOutcome::Complete),
             || Ok(()),
@@ -10451,7 +10438,6 @@ mod tests {
                 ready_at: Duration::ZERO,
                 generation: 1,
             },
-            LiveSceneMode::ClientContent,
             now,
             |_| {
                 flushes.set(flushes.get() + 1);
@@ -10497,8 +10483,37 @@ mod tests {
     }
 
     #[test]
-    fn first_light_resume_skips_flush_when_runtime_owned_scene_channel_is_saturated() {
-        let (scene_sender, _runtime_owned_feed) = crate::protocol::ClientSceneFeed::test_channel();
+    fn first_light_resume_flushes_its_capture_scene_feed_when_saturated() {
+        struct FirstLightDrainPump {
+            app: bevy::app::App,
+            commands: Vec<&'static str>,
+        }
+
+        impl LivePumpControl for FirstLightDrainPump {
+            fn request_registration(&mut self) -> Result<(), KmsLiveError> {
+                unreachable!("the resumed path is already registered")
+            }
+
+            fn request_update(&mut self) -> Result<(), KmsLiveError> {
+                self.commands.push("update");
+                Ok(())
+            }
+
+            fn begin_stop(&mut self) {}
+
+            fn nominal_refresh_interval(&self) -> Duration {
+                Duration::from_millis(16)
+            }
+
+            fn drain_scene(&mut self, _generation: u64) -> Result<(), KmsLiveError> {
+                self.commands.push("drain-scene");
+                super::super::render::drain_live_client_scene(&mut self.app);
+                Ok(())
+            }
+        }
+
+        let (app, scene_sender) =
+            super::super::render::tests::live_first_light_capture_app_for_test();
         scene_sender.send(Vec::new()).expect("fill event slot A");
         scene_sender.send(Vec::new()).expect("fill event slot B");
         assert!(matches!(
@@ -10508,8 +10523,15 @@ mod tests {
 
         let (acknowledgement, acknowledged) = observed_pause_acknowledgement();
         let mut mailbox = SupervisorMailbox::new(
-            [updated_reply(vec![submitted_event()])],
             [
+                pump_reply(PumpReply::SceneDrained {
+                    generation: 1,
+                    result: Ok(()),
+                }),
+                updated_reply(vec![submitted_event()]),
+            ],
+            [
+                None,
                 None,
                 None,
                 Some(LiveCoordinatorEvent::PauseRequested {
@@ -10518,7 +10540,10 @@ mod tests {
                 }),
             ],
         );
-        let mut pump = SupervisorPump::at_60_hz();
+        let mut pump = FirstLightDrainPump {
+            app,
+            commands: Vec::new(),
+        };
         let (frame_clock, pulse_probe) = crate::protocol::ClientFrameClock::test_channel();
         let flushes = Cell::new(0_u32);
         let now = mailbox.now();
@@ -10530,16 +10555,19 @@ mod tests {
                 ready_at: Duration::ZERO,
                 generation: 1,
             },
-            LiveSceneMode::FirstLight,
             now,
             |_| {
                 flushes.set(flushes.get().saturating_add(1));
-                Ok(crate::protocol::EventFlushOutcome::Pending)
+                Ok(if flushes.get() == 1 {
+                    crate::protocol::EventFlushOutcome::Pending
+                } else {
+                    crate::protocol::EventFlushOutcome::Complete
+                })
             },
             || frame_clock.pulse().map_err(KmsLiveError::Setup),
             |_, _, _| Ok(()),
         )
-        .expect("first-light resumes without entering the client-scene flush loop");
+        .expect("first-light drains capture traffic before its resumed render");
 
         let LiveSupervisionEnd::PauseRequested {
             generation,
@@ -10553,9 +10581,9 @@ mod tests {
         assert_eq!(outstanding_command, None);
         assert!(acknowledgement.acknowledge());
         assert_eq!(acknowledged.recv().expect("ack observed"), "acknowledged");
-        assert_eq!(flushes.get(), 0, "first-light has no scene flush stage");
+        assert_eq!(flushes.get(), 2, "first-light flushes its capture feed");
         assert_eq!(pulse_probe.drain(), 1);
-        assert_eq!(pump.commands, ["update"]);
+        assert_eq!(pump.commands, ["drain-scene", "update"]);
     }
 
     #[test]
@@ -10667,7 +10695,6 @@ mod tests {
                 ready_at: Duration::ZERO,
                 generation: 1,
             },
-            LiveSceneMode::ClientContent,
             now,
             |timeout| {
                 timeouts.borrow_mut().push(timeout);
@@ -10742,7 +10769,6 @@ mod tests {
                 ready_at: Duration::ZERO,
                 generation: 1,
             },
-            LiveSceneMode::ClientContent,
             now,
             |_| {
                 flushes.set(flushes.get() + 1);

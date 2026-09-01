@@ -24,25 +24,35 @@ use std::sync::atomic::AtomicUsize;
 #[cfg(feature = "frame-capture")]
 use bevy::asset::RenderAssetUsages;
 use bevy::{
+    camera::NormalizedRenderTarget,
     prelude::*,
     render::{
-        Render, RenderApp,
-        camera::ExtractedCamera,
+        Render, RenderApp, RenderSystems,
+        camera::{ExtractedCamera, NormalizedRenderTargetExt},
         extract_component::{ExtractComponent, ExtractComponentPlugin},
+        render_asset::RenderAssets,
         render_resource::{
             BindGroupEntry, BindGroupLayout, BindGroupLayoutEntry, BindingResource, BindingType,
             BlendState, Buffer, BufferDescriptor, BufferUsages, ColorTargetState, ColorWrites,
             CommandEncoder, CommandEncoderDescriptor, Extent3d, LoadOp, MapMode, MultisampleState,
-            Operations, Origin3d, PipelineCompilationOptions, PipelineLayoutDescriptor,
+            Operations, Origin3d, PipelineCompilationOptions, PipelineLayoutDescriptor, PollType,
             PrimitiveState, RawFragmentState, RawRenderPipelineDescriptor, RawVertexState,
             RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, Sampler,
             SamplerBindingType, SamplerDescriptor, ShaderModuleDescriptor, ShaderSource,
             ShaderStages, StoreOp, TexelCopyBufferInfo, TexelCopyBufferLayout,
-            TexelCopyTextureInfo, TextureAspect, TextureDescriptor, TextureDimension,
+            TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor, TextureDimension,
             TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDimension,
+            TextureViewId,
         },
-        renderer::{RenderDevice, RenderQueue, render_system},
-        view::ViewTarget,
+        renderer::{
+            FlushCommands, RenderDevice, RenderGraph, RenderGraphSystems, RenderQueue,
+            render_system,
+        },
+        texture::{GpuImage, ManualTextureViews, OutputColorAttachment},
+        view::{
+            ExtractedWindows, ViewTarget, ViewTargetAttachments, prepare_view_attachments,
+            prepare_view_targets,
+        },
     },
     window::RequestRedraw,
 };
@@ -64,6 +74,7 @@ pub(crate) enum CaptureFormat {
     Xrgb8888,
 }
 
+/// Physical rectangle in the output's displayed orientation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CaptureRegion {
     pub(crate) x: u32,
@@ -72,13 +83,18 @@ pub(crate) struct CaptureRegion {
     pub(crate) height: u32,
 }
 
+/// Global logical rectangle in the output's displayed orientation.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct CaptureLogicalRegion {
+pub(crate) struct DisplayedLogicalRegion {
     pub(crate) x: f32,
     pub(crate) y: f32,
     pub(crate) width: f32,
     pub(crate) height: f32,
 }
+
+/// Physical damage measured in the scan-out texture's storage orientation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StorageDamageRegion(CaptureRegion);
 
 #[derive(Clone, Debug)]
 pub(crate) struct CaptureRequest {
@@ -157,6 +173,7 @@ struct SourceDamageJournal {
     extent: (u32, u32),
     scale120: u32,
     transform: smithay::utils::Transform,
+    /// Damage entries are always physical rectangles in displayed orientation.
     entries: VecDeque<DamageEntry>,
 }
 
@@ -221,11 +238,14 @@ impl OutputDamageJournal {
         }
     }
 
-    pub(crate) fn retire_kms_sources(&self) {
+    pub(crate) fn retain_current_kms_sources(
+        &self,
+        generations: &BTreeMap<crate::backend::kms::OutputKey, u64>,
+    ) {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|source, _| !matches!(source, CaptureSourceId::Kms { .. }));
+            .retain(|source, _| kms_capture_source_is_current(source, generations));
     }
 
     pub(crate) fn mark_nested_base_full(&self) {
@@ -251,15 +271,15 @@ impl OutputDamageJournal {
         self.mark_all_regions(false, rectangles);
     }
 
-    pub(crate) fn mark_base_logical_regions(&self, rectangles: &[CaptureLogicalRegion]) {
+    pub(crate) fn mark_base_logical_regions(&self, rectangles: &[DisplayedLogicalRegion]) {
         self.mark_logical_regions(true, rectangles);
     }
 
-    pub(crate) fn mark_cursor_logical_regions(&self, rectangles: &[CaptureLogicalRegion]) {
+    pub(crate) fn mark_cursor_logical_regions(&self, rectangles: &[DisplayedLogicalRegion]) {
         self.mark_logical_regions(false, rectangles);
     }
 
-    fn mark_logical_regions(&self, base: bool, rectangles: &[CaptureLogicalRegion]) {
+    fn mark_logical_regions(&self, base: bool, rectangles: &[DisplayedLogicalRegion]) {
         let mut journals = self
             .0
             .lock()
@@ -348,8 +368,8 @@ impl OutputDamageJournal {
                         intersect_damage(*rectangle, full_region(journal.storage_extent))
                     })
                     .filter_map(|rectangle| {
-                        transform_damage_region(
-                            rectangle,
+                        transform_storage_damage_region(
+                            StorageDamageRegion(rectangle),
                             journal.storage_extent,
                             journal.transform,
                         )
@@ -424,6 +444,16 @@ impl OutputDamageJournal {
     }
 }
 
+pub(crate) fn kms_capture_source_is_current(
+    source: &CaptureSourceId,
+    generations: &BTreeMap<crate::backend::kms::OutputKey, u64>,
+) -> bool {
+    match source {
+        CaptureSourceId::Kms { key, generation } => generations.get(key) == Some(generation),
+        CaptureSourceId::Nested { .. } => true,
+    }
+}
+
 fn record_damage(journal: &mut SourceDamageJournal, base: bool, damage: Vec<CaptureRegion>) {
     if damage.is_empty() {
         return;
@@ -472,8 +502,8 @@ fn intersect_damage(damage: CaptureRegion, capture: CaptureRegion) -> Option<Cap
     })
 }
 
-fn transform_damage_region(
-    rectangle: CaptureRegion,
+fn transform_storage_damage_region(
+    StorageDamageRegion(rectangle): StorageDamageRegion,
     storage: (u32, u32),
     transform: smithay::utils::Transform,
 ) -> Option<CaptureRegion> {
@@ -702,12 +732,39 @@ pub(crate) struct PendingCapturePresentation {
     pub(crate) generation: u64,
     pub(crate) security_epoch: u64,
     pub(crate) deadline: Instant,
+    pub(crate) nested_acquisition: Option<NestedCaptureAcquisition>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NestedCaptureAcquisition {
+    pub(crate) window: Entity,
+    pub(crate) texture_view: TextureViewId,
+}
+
+#[derive(Default)]
+struct CapturePresentationState {
+    nested_acquisition: Option<NestedCaptureAcquisition>,
+    presentations: Vec<PendingCapturePresentation>,
 }
 
 #[derive(Resource, Clone, Default)]
-pub(crate) struct CapturePresentationPending(Arc<Mutex<Vec<PendingCapturePresentation>>>);
+pub(crate) struct CapturePresentationPending(Arc<Mutex<CapturePresentationState>>);
 
 impl CapturePresentationPending {
+    pub(crate) fn set_nested_acquisition(&self, acquisition: Option<NestedCaptureAcquisition>) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .nested_acquisition = acquisition;
+    }
+
+    fn nested_acquisition(&self) -> Option<NestedCaptureAcquisition> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .nested_acquisition
+    }
+
     pub(crate) fn publish(
         &self,
         presentations: impl IntoIterator<Item = PendingCapturePresentation>,
@@ -715,15 +772,17 @@ impl CapturePresentationPending {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .presentations
             .extend(presentations);
     }
 
     pub(crate) fn take(&self) -> Vec<PendingCapturePresentation> {
         std::mem::take(
-            &mut *self
+            &mut self
                 .0
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .presentations,
         )
         .into_iter()
         .filter(|pending| pending.deadline > Instant::now())
@@ -769,6 +828,18 @@ struct CaptureReadbackGroup {
 }
 
 #[derive(Resource, Default)]
+struct NestedCaptureRedirect(Option<PreparedNestedCaptureRedirect>);
+
+struct PreparedNestedCaptureRedirect {
+    source_id: CaptureSourceId,
+    _target: NormalizedRenderTarget,
+    texture: Texture,
+    destination: TextureView,
+    format: TextureFormat,
+    extent: Extent3d,
+}
+
+#[derive(Resource, Default)]
 struct CaptureDamageWatches(Vec<CaptureRequest>);
 
 #[derive(Resource, Default)]
@@ -788,6 +859,10 @@ impl CaptureFrameTokens {
 
 struct CaptureReadbackJob {
     buffer: Buffer,
+    /// Keeps a redirected nested render target alive through map completion.
+    /// KMS jobs never retain the scan-out source.
+    _source_texture: Option<Texture>,
+    submission_poll: Option<PollType>,
     mapped: Receiver<Result<(), String>>,
     device: RenderDevice,
     row_pitch: usize,
@@ -807,7 +882,8 @@ struct CaptureReadbackJob {
 struct CaptureCursorCompositePipeline {
     layout: BindGroupLayout,
     sampler: Sampler,
-    pipelines: Vec<(TextureFormat, RenderPipeline)>,
+    overlay_pipelines: Vec<(TextureFormat, RenderPipeline)>,
+    replace_pipelines: Vec<(TextureFormat, RenderPipeline)>,
 }
 
 impl FromWorld for CaptureCursorCompositePipeline {
@@ -877,20 +953,19 @@ fn fragment(input: VertexOutput) -> @location(0) vec4<f32> {
             immediate_size: 0,
         });
         let compilation_options = PipelineCompilationOptions::default();
-        let pipelines = [
+        let formats = [
             TextureFormat::Rgba8Unorm,
             TextureFormat::Rgba8UnormSrgb,
             TextureFormat::Bgra8Unorm,
             TextureFormat::Bgra8UnormSrgb,
-        ]
-        .into_iter()
-        .map(|format| {
+        ];
+        let make_pipeline = |format, blend| {
             let targets = [Some(ColorTargetState {
                 format,
-                blend: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                blend,
                 write_mask: ColorWrites::ALL,
             })];
-            let pipeline = device.create_render_pipeline(&RawRenderPipelineDescriptor {
+            device.create_render_pipeline(&RawRenderPipelineDescriptor {
                 label: Some("CosMix capture cursor overlay pipeline"),
                 layout: Some(&pipeline_layout),
                 vertex: RawVertexState {
@@ -910,21 +985,39 @@ fn fragment(input: VertexOutput) -> @location(0) vec4<f32> {
                 }),
                 multiview_mask: None,
                 cache: None,
-            });
-            (format, pipeline)
-        })
-        .collect();
+            })
+        };
+        let overlay_pipelines = formats
+            .into_iter()
+            .map(|format| {
+                (
+                    format,
+                    make_pipeline(format, Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING)),
+                )
+            })
+            .collect();
+        let replace_pipelines = formats
+            .into_iter()
+            .map(|format| (format, make_pipeline(format, None)))
+            .collect();
         Self {
             layout,
             sampler,
-            pipelines,
+            overlay_pipelines,
+            replace_pipelines,
         }
     }
 }
 
 impl CaptureCursorCompositePipeline {
     fn pipeline(&self, format: TextureFormat) -> Option<&RenderPipeline> {
-        self.pipelines
+        self.overlay_pipelines
+            .iter()
+            .find_map(|(candidate, pipeline)| (*candidate == format).then_some(pipeline))
+    }
+
+    fn replace_pipeline(&self, format: TextureFormat) -> Option<&RenderPipeline> {
+        self.replace_pipelines
             .iter()
             .find_map(|(candidate, pipeline)| (*candidate == format).then_some(pipeline))
     }
@@ -1006,6 +1099,22 @@ pub(crate) struct CaptureServicePlugin;
 #[derive(SystemSet, Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct CaptureRenderSet;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureExecutionPhase {
+    Nested,
+    Kms,
+}
+
+impl CaptureExecutionPhase {
+    fn accepts(self, source: &CaptureSourceId) -> bool {
+        matches!(
+            (self, source),
+            (Self::Nested, CaptureSourceId::Nested { .. })
+                | (Self::Kms, CaptureSourceId::Kms { .. })
+        )
+    }
+}
+
 impl Plugin for CaptureServicePlugin {
     fn build(&self, app: &mut App) {
         let renderer_available = app.get_sub_app(RenderApp).is_some();
@@ -1042,15 +1151,32 @@ impl Plugin for CaptureServicePlugin {
                 .insert_resource(tokens)
                 .insert_resource(CaptureReadbackWorker::default())
                 .insert_resource(reporter)
-                .insert_resource(damage);
+                .insert_resource(damage)
+                .init_resource::<NestedCaptureRedirect>();
             #[cfg(feature = "frame-capture")]
             render_app.insert_resource(png);
-            render_app.add_systems(
-                Render,
-                capture_output_frames
-                    .in_set(CaptureRenderSet)
-                    .after(render_system),
-            );
+            render_app
+                .add_systems(
+                    Render,
+                    prepare_nested_capture_redirect
+                        .after(prepare_view_attachments)
+                        .before(prepare_view_targets)
+                        .in_set(RenderSystems::PrepareViews),
+                )
+                .add_systems(
+                    RenderGraph,
+                    capture_output_frames
+                        .with_input(CaptureExecutionPhase::Nested)
+                        .after(RenderGraphSystems::Render)
+                        .before(RenderGraphSystems::Submit),
+                )
+                .add_systems(
+                    Render,
+                    capture_output_frames
+                        .with_input(CaptureExecutionPhase::Kms)
+                        .in_set(CaptureRenderSet)
+                        .after(render_system),
+                );
         }
     }
 
@@ -1059,6 +1185,91 @@ impl Plugin for CaptureServicePlugin {
             render_app.init_resource::<CaptureCursorCompositePipeline>();
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_nested_capture_redirect(
+    batches: Res<CaptureReadbackBatch>,
+    #[cfg(feature = "frame-capture")] png_service: Res<PngCaptureService>,
+    device: Res<RenderDevice>,
+    windows: Res<ExtractedWindows>,
+    images: Res<RenderAssets<GpuImage>>,
+    manual_texture_views: Res<ManualTextureViews>,
+    cameras: Query<(&ExtractedCamera, &CaptureOutputSource)>,
+    mut attachments: ResMut<ViewTargetAttachments>,
+    mut redirect: ResMut<NestedCaptureRedirect>,
+) {
+    redirect.0 = None;
+    let wire_requested = batches
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|request| matches!(request.source_id, CaptureSourceId::Nested { .. }));
+    #[cfg(feature = "frame-capture")]
+    let png_requested = png_service
+        .queue
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|request| matches!(request.request.target, PngCaptureTarget::Nested));
+    #[cfg(not(feature = "frame-capture"))]
+    let png_requested = false;
+    if !wire_requested && !png_requested {
+        return;
+    }
+
+    let Some((camera, source)) = cameras
+        .iter()
+        .find(|(_, source)| matches!(source.source_id, CaptureSourceId::Nested { .. }))
+    else {
+        return;
+    };
+    let Some(target) = camera.target.clone() else {
+        return;
+    };
+    let Some(destination) = target
+        .get_texture_view(&windows, &images, &manual_texture_views)
+        .cloned()
+    else {
+        return;
+    };
+    let Some(format) = target.get_texture_view_format(&windows, &images, &manual_texture_views)
+    else {
+        return;
+    };
+    let Some(size) = camera.physical_target_size else {
+        return;
+    };
+    let extent = Extent3d {
+        width: size.x,
+        height: size.y,
+        depth_or_array_layers: 1,
+    };
+    let texture = device.create_texture(&TextureDescriptor {
+        label: Some("CosMix nested capture render target"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format,
+        usage: TextureUsages::RENDER_ATTACHMENT
+            | TextureUsages::COPY_SRC
+            | TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    attachments.insert(
+        target.clone(),
+        OutputColorAttachment::new(texture.create_view(&Default::default()), format),
+    );
+    redirect.0 = Some(PreparedNestedCaptureRedirect {
+        source_id: source.source_id.clone(),
+        _target: target,
+        texture,
+        destination,
+        format,
+        extent,
+    });
 }
 
 fn evaluate_damage_eligibility(
@@ -1243,8 +1454,107 @@ fn encode_cursor_overlay(
     true
 }
 
+fn encode_nested_swapchain_blit(
+    encoder: &mut CommandEncoder,
+    device: &RenderDevice,
+    composite: &CaptureCursorCompositePipeline,
+    redirect: &PreparedNestedCaptureRedirect,
+    source_id: &CaptureSourceId,
+    source: &TextureView,
+) -> bool {
+    if &redirect.source_id != source_id {
+        return false;
+    }
+    let Some(pipeline) = composite.replace_pipeline(redirect.format) else {
+        return false;
+    };
+    let bind_group = device.create_bind_group(
+        "CosMix nested capture swapchain blit bind group",
+        &composite.layout,
+        &[
+            BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::TextureView(source),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: BindingResource::Sampler(&composite.sampler),
+            },
+        ],
+    );
+    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+        label: Some("CosMix nested cursor-free swapchain blit"),
+        color_attachments: &[Some(RenderPassColorAttachment {
+            view: &redirect.destination,
+            depth_slice: None,
+            resolve_target: None,
+            ops: Operations {
+                load: LoadOp::Load,
+                store: StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind_group, &[]);
+    pass.draw(0..3, 0..1);
+    true
+}
+
+fn capture_request_is_copyable(
+    request: &CaptureRequest,
+    reporter: Option<&CaptureCompletionReporter>,
+    current_extent: Option<(u32, u32)>,
+) -> bool {
+    if request.cancellation.is_cancelled() {
+        return false;
+    }
+    if request.deadline <= Instant::now()
+        || current_extent.is_some_and(|extent| request.source_storage_extent != extent)
+    {
+        if let Some(reporter) = reporter {
+            reporter.failed(request.id, request.generation, request.security_epoch);
+        }
+        return false;
+    }
+    true
+}
+
+fn retain_copyable_consumers(
+    group: &mut CaptureReadbackGroup,
+    reporter: Option<&CaptureCompletionReporter>,
+    current_extent: Option<(u32, u32)>,
+) -> bool {
+    group
+        .requests
+        .retain(|request| capture_request_is_copyable(request, reporter, current_extent));
+    #[cfg(feature = "frame-capture")]
+    group.png.retain(|request| {
+        if request.deadline <= Instant::now() {
+            request.complete();
+            false
+        } else {
+            true
+        }
+    });
+    !group.requests.is_empty() || {
+        #[cfg(feature = "frame-capture")]
+        {
+            !group.png.is_empty()
+        }
+        #[cfg(not(feature = "frame-capture"))]
+        {
+            false
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn capture_output_frames(
+    InMut(phase): InMut<CaptureExecutionPhase>,
     batches: Res<CaptureReadbackBatch>,
     tokens: Res<CaptureFrameTokens>,
     worker: Res<CaptureReadbackWorker>,
@@ -1254,11 +1564,14 @@ fn capture_output_frames(
     damage: Res<OutputDamageJournal>,
     #[cfg(feature = "frame-capture")] png_service: Res<PngCaptureService>,
     device: Res<RenderDevice>,
+    mut flush_commands: FlushCommands,
     queue: Res<RenderQueue>,
     composite: Res<CaptureCursorCompositePipeline>,
+    redirect: Res<NestedCaptureRedirect>,
     views: Query<(&ExtractedCamera, &ViewTarget, Option<&CaptureOutputSource>)>,
     overlay_views: Query<(&ViewTarget, &CaptureCursorOverlaySource)>,
 ) {
+    let phase = *phase;
     let reporter = reporter.reporter();
     let requests = std::mem::take(
         &mut *batches
@@ -1267,21 +1580,38 @@ fn capture_output_frames(
             .unwrap_or_else(|poisoned| poisoned.into_inner()),
     );
     let mut groups = BTreeMap::<(CaptureSourceId, bool), CaptureReadbackGroup>::new();
+    let mut deferred = Vec::new();
     for request in requests {
-        groups
-            .entry((request.source_id.clone(), request.overlay_cursor))
-            .or_default()
-            .requests
-            .push(request);
+        if !capture_request_is_copyable(&request, reporter.as_ref(), None) {
+            continue;
+        }
+        if phase.accepts(&request.source_id) {
+            groups
+                .entry((request.source_id.clone(), request.overlay_cursor))
+                .or_default()
+                .requests
+                .push(request);
+        } else {
+            deferred.push(request);
+        }
     }
+    batches
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .extend(deferred);
 
     #[cfg(feature = "frame-capture")]
-    for admission in std::mem::take(
+    let png_admissions = std::mem::take(
         &mut *png_service
             .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()),
-    ) {
+    );
+    #[cfg(feature = "frame-capture")]
+    let mut deferred_png = Vec::new();
+    #[cfg(feature = "frame-capture")]
+    for admission in png_admissions {
         let source = match &admission.request.target {
             PngCaptureTarget::Nested => views.iter().find_map(|(_, _, source)| {
                 source.and_then(|source| {
@@ -1291,15 +1621,31 @@ fn capture_output_frames(
             }),
             PngCaptureTarget::Kms { source_id, .. } => Some((source_id.clone(), true)),
         };
-        if let Some(source) = source {
-            groups.entry(source).or_default().png.push(admission);
-        } else {
-            admission.complete();
+        match source {
+            Some(source) if phase.accepts(&source.0) => {
+                groups.entry(source).or_default().png.push(admission);
+            }
+            Some(_) => deferred_png.push(admission),
+            None => admission.complete(),
         }
     }
+    #[cfg(feature = "frame-capture")]
+    png_service
+        .queue
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .extend(deferred_png);
+    if phase == CaptureExecutionPhase::Nested && !groups.is_empty() {
+        // Camera render systems have recorded the scene into the redirected
+        // target. Submit those buffers first; the following direct submissions
+        // then encode base copy -> cursor-free blit -> overlay -> inclusive
+        // copy before Bevy presents the window later in render_system.
+        flush_commands.flush();
+    }
     let mut kms_composited = BTreeSet::new();
+    let mut nested_blitted = BTreeSet::new();
 
-    for ((source_id, cursor_inclusive), mut group) in groups {
+    'groups: for ((source_id, cursor_inclusive), mut group) in groups {
         let Some((_camera, target, _)) = views.iter().find(|(_, _, source)| {
             source.is_some_and(|source| {
                 source.source_id == source_id
@@ -1330,6 +1676,18 @@ fn capture_output_frames(
             fail_readback_group(&group, reporter.as_ref());
             continue;
         };
+        if matches!(&source_id, CaptureSourceId::Nested { .. })
+            && redirect
+                .0
+                .as_ref()
+                .is_none_or(|redirect| redirect.source_id != source_id)
+        {
+            // Never fall back to copying the window surface: Bevy configures
+            // it RENDER_ATTACHMENT-only. A missing redirect is a bounded
+            // capture failure, not a wgpu validation error.
+            fail_readback_group(&group, reporter.as_ref());
+            continue;
+        }
         let frame_token = match &source_id {
             CaptureSourceId::Nested { .. } => Some(tokens.next()),
             CaptureSourceId::Kms { .. } => kms_targets
@@ -1361,6 +1719,23 @@ fn capture_output_frames(
         };
         let texture_size = scene_texture.texture().size();
         let texture_size = (texture_size.width, texture_size.height);
+        let current_extent = match &source_id {
+            CaptureSourceId::Nested { .. } => {
+                let redirect_extent = redirect
+                    .0
+                    .as_ref()
+                    .map(|redirect| (redirect.extent.width, redirect.extent.height));
+                if redirect_extent != Some(texture_size) {
+                    fail_readback_group(&group, reporter.as_ref());
+                    continue;
+                }
+                texture_size
+            }
+            CaptureSourceId::Kms { .. } => texture_size,
+        };
+        if !retain_copyable_consumers(&mut group, reporter.as_ref(), Some(current_extent)) {
+            continue;
+        }
         let Some(source_format) = target.out_texture_view_format() else {
             fail_readback_group(&group, reporter.as_ref());
             continue;
@@ -1430,6 +1805,22 @@ fn capture_output_frames(
             origin: Origin3d::ZERO,
             aspect: TextureAspect::All,
         };
+        if cursor_inclusive
+            && matches!(source_id, CaptureSourceId::Nested { .. })
+            && !nested_blitted.contains(&source_id)
+            && redirect.0.as_ref().is_some_and(|redirect| {
+                encode_nested_swapchain_blit(
+                    &mut encoder,
+                    &device,
+                    &composite,
+                    redirect,
+                    &source_id,
+                    scene_texture,
+                )
+            })
+        {
+            nested_blitted.insert(source_id.clone());
+        }
         if cursor_inclusive {
             let Some((overlay_target, _)) = overlay_views
                 .iter()
@@ -1444,6 +1835,13 @@ fn capture_output_frames(
             };
             match &source_id {
                 CaptureSourceId::Kms { .. } => {
+                    if !retain_copyable_consumers(
+                        &mut group,
+                        reporter.as_ref(),
+                        Some(current_extent),
+                    ) {
+                        continue 'groups;
+                    }
                     let _written = target.out_texture_color_attachment(None);
                     if !encode_cursor_overlay(
                         &mut encoder,
@@ -1456,8 +1854,15 @@ fn capture_output_frames(
                         fail_readback_group(&group, reporter.as_ref());
                         continue;
                     }
-                    kms_composited.insert(source_id.clone());
+                    if !retain_copyable_consumers(
+                        &mut group,
+                        reporter.as_ref(),
+                        Some(current_extent),
+                    ) {
+                        continue 'groups;
+                    }
                     encoder.copy_texture_to_buffer(scene_copy, destination, copy_extent);
+                    kms_composited.insert(source_id.clone());
                 }
                 CaptureSourceId::Nested { .. } => {
                     // The host swapchain already contains the cursor-free scene.
@@ -1476,6 +1881,14 @@ fn capture_output_frames(
                         view_formats: &[],
                     });
                     let composed_view = composed.create_view(&Default::default());
+                    if !retain_copyable_consumers(
+                        &mut group,
+                        reporter.as_ref(),
+                        Some(current_extent),
+                    ) {
+                        nested_blitted.remove(&source_id);
+                        continue 'groups;
+                    }
                     encoder.copy_texture_to_texture(
                         scene_copy,
                         composed.as_image_copy(),
@@ -1491,6 +1904,14 @@ fn capture_output_frames(
                     ) {
                         fail_readback_group(&group, reporter.as_ref());
                         continue;
+                    }
+                    if !retain_copyable_consumers(
+                        &mut group,
+                        reporter.as_ref(),
+                        Some(current_extent),
+                    ) {
+                        nested_blitted.remove(&source_id);
+                        continue 'groups;
                     }
                     encoder.copy_texture_to_buffer(
                         composed.as_image_copy(),
@@ -1509,13 +1930,39 @@ fn capture_output_frames(
                 request.request.cursor = None;
             }
         } else {
+            if !retain_copyable_consumers(&mut group, reporter.as_ref(), Some(current_extent)) {
+                nested_blitted.remove(&source_id);
+                continue 'groups;
+            }
             encoder.copy_texture_to_buffer(scene_copy, destination, copy_extent);
+            if matches!(source_id, CaptureSourceId::Nested { .. })
+                && !nested_blitted.contains(&source_id)
+                && redirect.0.as_ref().is_some_and(|redirect| {
+                    encode_nested_swapchain_blit(
+                        &mut encoder,
+                        &device,
+                        &composite,
+                        redirect,
+                        &source_id,
+                        scene_texture,
+                    )
+                })
+            {
+                nested_blitted.insert(source_id.clone());
+            }
         }
-        queue.submit([encoder.finish()]);
+        let submission = queue.submit([encoder.finish()]);
         let (mapped_tx, mapped) = mpsc::sync_channel(1);
         buffer.slice(..).map_async(MapMode::Read, move |result| {
             let _ = mapped_tx.try_send(result.map_err(|error| error.to_string()));
         });
+        let nested_acquisition = matches!(&source_id, CaptureSourceId::Nested { .. })
+            .then(|| {
+                pending_nested
+                    .as_ref()
+                    .and_then(|pending| pending.nested_acquisition())
+            })
+            .flatten();
         let presentations = group
             .requests
             .iter()
@@ -1526,11 +1973,15 @@ fn capture_output_frames(
                 generation: request.generation,
                 security_epoch: request.security_epoch,
                 deadline: request.deadline,
+                nested_acquisition,
             })
             .collect::<Vec<_>>();
         let presentation_bound = group.requests.is_empty()
             || match &source_id {
                 CaptureSourceId::Nested { .. } => pending_nested.as_ref().is_some_and(|pending| {
+                    if nested_acquisition.is_none() {
+                        return false;
+                    }
                     pending.publish(presentations);
                     true
                 }),
@@ -1545,6 +1996,13 @@ fn capture_output_frames(
         }
         let job = CaptureReadbackJob {
             buffer,
+            _source_texture: matches!(&source_id, CaptureSourceId::Nested { .. })
+                .then(|| redirect.0.as_ref().map(|redirect| redirect.texture.clone()))
+                .flatten(),
+            submission_poll: Some(PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(Duration::from_millis(1)),
+            }),
             mapped,
             device: device.clone(),
             row_pitch,
@@ -1572,6 +2030,9 @@ fn capture_output_frames(
     // requested an inclusive readback. Base copies above have already been
     // submitted, so this final pass cannot contaminate them.
     for (_, target, source) in &views {
+        if phase != CaptureExecutionPhase::Kms {
+            break;
+        }
         let Some(source) = source else {
             continue;
         };
@@ -1606,6 +2067,28 @@ fn capture_output_frames(
             overlay,
             destination,
             format,
+        ) {
+            queue.submit([encoder.finish()]);
+        }
+    }
+
+    // A redirected window must still receive its cursor-free scene if the
+    // associated request failed before it reached the normal readback path.
+    if phase == CaptureExecutionPhase::Nested
+        && let Some(redirect) = redirect.0.as_ref()
+        && !nested_blitted.contains(&redirect.source_id)
+    {
+        let source = redirect.texture.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("CosMix nested capture fallback blit encoder"),
+        });
+        if encode_nested_swapchain_blit(
+            &mut encoder,
+            &device,
+            &composite,
+            redirect,
+            &redirect.source_id,
+            &source,
         ) {
             queue.submit([encoder.finish()]);
         }
@@ -1685,17 +2168,12 @@ fn complete_readback(mut job: CaptureReadbackJob, stop: &AtomicBool) {
             job.buffer.unmap();
             return;
         };
-        if job
-            .device
-            .poll(bevy::render::render_resource::PollType::Poll)
-            .is_err()
-        {
-            fail_requests(&job.requests, job.reporter.as_ref());
-            #[cfg(feature = "frame-capture")]
-            fail_png(&job.png_requests);
-            job.buffer.unmap();
-            return;
-        }
+        let poll = job.submission_poll.clone().unwrap_or(PollType::Poll);
+        // A bounded exact-submission wait normally returns Timeout while the
+        // GPU is still busy. Map completion remains the authority; malformed
+        // submission indices and device loss also terminate through the map
+        // error or the request deadline without blocking this worker.
+        let _ = job.device.poll(poll);
         match job.mapped.try_recv() {
             Ok(Ok(())) => break true,
             Ok(Err(_)) | Err(TryRecvError::Disconnected) => break false,
@@ -2072,6 +2550,61 @@ mod tests {
     use cosmix_wgpu_dmabuf::DmabufImportPlugin;
     use smithay::reexports::wayland_server::backend::ObjectId;
 
+    const TEST_GPU_TIMEOUT: Duration = Duration::from_secs(30);
+
+    fn select_vulkan_test_adapter(instance: &wgpu::Instance, gate: &str) -> wgpu::Adapter {
+        let fallback =
+            bevy::tasks::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: true,
+            }));
+        let (adapter, fallback_selected) = match fallback {
+            Ok(adapter) => (adapter, true),
+            Err(error)
+                if matches!(
+                    std::env::var("COSMIX_REQUIRE_FALLBACK_ADAPTER").as_deref(),
+                    Ok("1")
+                ) =>
+            {
+                panic!(
+                    "{gate} requires a Vulkan fallback adapter because \
+                     COSMIX_REQUIRE_FALLBACK_ADAPTER=1, but none was available: {error}"
+                );
+            }
+            Err(_) => (
+                bevy::tasks::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                }))
+                .unwrap_or_else(|error| panic!("{gate} requires a Vulkan adapter: {error}")),
+                false,
+            ),
+        };
+        let info = adapter.get_info();
+        eprintln!(
+            "{gate}: using Vulkan adapter '{}' (fallback={fallback_selected})",
+            info.name
+        );
+        assert_eq!(info.backend, wgpu::Backend::Vulkan);
+        adapter
+    }
+
+    fn poll_test_gpu(device: &wgpu::Device, context: &str) {
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(TEST_GPU_TIMEOUT),
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{context} did not complete within {} seconds: {error}",
+                    TEST_GPU_TIMEOUT.as_secs()
+                )
+            });
+    }
+
     fn test_render_device() -> (wgpu::Device, RenderDevice) {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
@@ -2219,6 +2752,8 @@ mod tests {
         complete_readback(
             CaptureReadbackJob {
                 buffer,
+                _source_texture: None,
+                submission_poll: None,
                 mapped,
                 device: render_device,
                 row_pitch: 4,
@@ -2262,6 +2797,8 @@ mod tests {
             &sender,
             CaptureReadbackJob {
                 buffer,
+                _source_texture: None,
+                submission_poll: None,
                 mapped,
                 device: render_device,
                 row_pitch: 4,
@@ -2459,6 +2996,72 @@ mod tests {
     }
 
     #[test]
+    fn displayed_logical_damage_wakes_rotated_output_waiters_without_a_second_transform() {
+        const DISPLAYED: (u32, u32) = (1080, 1920);
+        const WAITER: CaptureRegion = CaptureRegion {
+            x: 0,
+            y: 1400,
+            width: 100,
+            height: 200,
+        };
+        const EXPECTED: CaptureRegion = CaptureRegion {
+            x: 10,
+            y: 100,
+            width: 10,
+            height: 10,
+        };
+        for (transform, storage) in [
+            (smithay::utils::Transform::_90, (1920, 1080)),
+            (smithay::utils::Transform::_270, (1920, 1080)),
+            (smithay::utils::Transform::_180, (1080, 1920)),
+            (smithay::utils::Transform::Flipped90, (1920, 1080)),
+        ] {
+            let journal = OutputDamageJournal::default();
+            let source = CaptureSourceId::Kms {
+                key: crate::backend::kms::OutputKey {
+                    device: 17,
+                    connector_name: format!("rotated-{transform:?}"),
+                },
+                generation: 9,
+            };
+            journal.register(
+                source.clone(),
+                (0, 0, DISPLAYED.0, DISPLAYED.1),
+                storage,
+                DISPLAYED,
+                120,
+                transform,
+            );
+            journal.mark_base_logical_regions(&[DisplayedLogicalRegion {
+                x: 10.0,
+                y: 1500.0,
+                width: 10.0,
+                height: 10.0,
+            }]);
+            let (logical_revision, damage) = journal.snapshot(&source, Some(0), false, WAITER);
+            assert_eq!(
+                damage,
+                vec![EXPECTED],
+                "displayed-space damage must wake its covering waiter after {transform:?}"
+            );
+
+            journal.mark_all_base_regions(&[full_region(storage)]);
+            assert_eq!(
+                journal
+                    .snapshot(
+                        &source,
+                        Some(logical_revision),
+                        false,
+                        full_region(DISPLAYED),
+                    )
+                    .1,
+                vec![full_region(DISPLAYED)],
+                "a full storage-space update must cover the displayed output after {transform:?}"
+            );
+        }
+    }
+
+    #[test]
     fn damage_journal_transforms_storage_rectangles_into_displayed_orientation() {
         let journal = OutputDamageJournal::default();
         let source = CaptureSourceId::Kms {
@@ -2523,7 +3126,7 @@ mod tests {
             120,
             smithay::utils::Transform::Normal,
         );
-        journal.mark_base_logical_regions(&[CaptureLogicalRegion {
+        journal.mark_base_logical_regions(&[DisplayedLogicalRegion {
             x: 10.0,
             y: 12.0,
             width: 8.0,
@@ -2542,7 +3145,7 @@ mod tests {
                 .is_empty()
         );
 
-        journal.mark_cursor_logical_regions(&[CaptureLogicalRegion {
+        journal.mark_cursor_logical_regions(&[DisplayedLogicalRegion {
             x: 120.0,
             y: 20.0,
             width: 4.0,
@@ -2568,28 +3171,86 @@ mod tests {
     }
 
     #[test]
-    fn damage_journal_prunes_replaced_generations_and_pause_retirement() {
+    fn unrelated_kms_generation_change_preserves_damage_waiter_baseline() {
         let journal = OutputDamageJournal::default();
-        let key = crate::backend::kms::OutputKey {
+        let unchanged_key = crate::backend::kms::OutputKey {
             device: 17,
             connector_name: "A".into(),
         };
-        for generation in 1..=64 {
-            journal.register(
-                CaptureSourceId::Kms {
-                    key: key.clone(),
-                    generation,
-                },
-                (0, 0, 100, 100),
-                (100, 100),
-                (100, 100),
-                120,
-                smithay::utils::Transform::Normal,
-            );
-            assert_eq!(journal.0.lock().unwrap().len(), 1);
-        }
-        journal.retire_kms_sources();
-        assert!(journal.0.lock().unwrap().is_empty());
+        let changed_key = crate::backend::kms::OutputKey {
+            device: 17,
+            connector_name: "B".into(),
+        };
+        let unchanged = CaptureSourceId::Kms {
+            key: unchanged_key.clone(),
+            generation: 7,
+        };
+        let changed = CaptureSourceId::Kms {
+            key: changed_key.clone(),
+            generation: 3,
+        };
+        journal.register(
+            unchanged.clone(),
+            (0, 0, 100, 100),
+            (100, 100),
+            (100, 100),
+            120,
+            smithay::utils::Transform::Normal,
+        );
+        journal.register(
+            changed,
+            (100, 0, 100, 100),
+            (100, 100),
+            (100, 100),
+            120,
+            smithay::utils::Transform::Normal,
+        );
+        journal.mark_base_logical_regions(&[DisplayedLogicalRegion {
+            x: 2.0,
+            y: 3.0,
+            width: 4.0,
+            height: 5.0,
+        }]);
+        let baseline = journal
+            .snapshot(&unchanged, None, false, full_region((100, 100)))
+            .0;
+        assert_eq!(baseline, 1);
+
+        journal.retain_current_kms_sources(&BTreeMap::from([
+            (unchanged_key, 7),
+            (changed_key.clone(), 4),
+        ]));
+        journal.register(
+            CaptureSourceId::Kms {
+                key: changed_key,
+                generation: 4,
+            },
+            (100, 0, 100, 100),
+            (100, 100),
+            (100, 100),
+            120,
+            smithay::utils::Transform::Normal,
+        );
+        journal.mark_base_logical_regions(&[DisplayedLogicalRegion {
+            x: 11.0,
+            y: 13.0,
+            width: 7.0,
+            height: 9.0,
+        }]);
+
+        assert_eq!(
+            journal.snapshot(&unchanged, Some(baseline), false, full_region((100, 100)),),
+            (
+                2,
+                vec![CaptureRegion {
+                    x: 11,
+                    y: 13,
+                    width: 7,
+                    height: 9,
+                }],
+            ),
+            "output A's manager baseline must remain comparable after only output B changes",
+        );
     }
 
     #[test]
@@ -2608,19 +3269,19 @@ mod tests {
         );
         let mut baseline = 0;
         for bounds in [
-            CaptureLogicalRegion {
+            DisplayedLogicalRegion {
                 x: 4.0,
                 y: 5.0,
                 width: 10.0,
                 height: 12.0,
             },
-            CaptureLogicalRegion {
+            DisplayedLogicalRegion {
                 x: 20.0,
                 y: 5.0,
                 width: 10.0,
                 height: 12.0,
             },
-            CaptureLogicalRegion {
+            DisplayedLogicalRegion {
                 x: 20.0,
                 y: 5.0,
                 width: 10.0,
@@ -2651,13 +3312,13 @@ mod tests {
             smithay::utils::Transform::Normal,
         );
         journal.mark_cursor_logical_regions(&[
-            CaptureLogicalRegion {
+            DisplayedLogicalRegion {
                 x: 2.0,
                 y: 3.0,
                 width: 8.0,
                 height: 9.0,
             },
-            CaptureLogicalRegion {
+            DisplayedLogicalRegion {
                 x: 12.0,
                 y: 13.0,
                 width: 8.0,
@@ -2722,7 +3383,7 @@ mod tests {
             120,
             smithay::utils::Transform::Normal,
         );
-        journal.mark_base_logical_regions(&[CaptureLogicalRegion {
+        journal.mark_base_logical_regions(&[DisplayedLogicalRegion {
             x: 1.0,
             y: 1.0,
             width: 2.0,
@@ -2732,7 +3393,7 @@ mod tests {
             .snapshot(&source, Some(0), false, full_region((100, 100)))
             .0;
         let manager_b = 0;
-        journal.mark_base_logical_regions(&[CaptureLogicalRegion {
+        journal.mark_base_logical_regions(&[DisplayedLogicalRegion {
             x: 10.0,
             y: 10.0,
             width: 2.0,
@@ -2772,27 +3433,94 @@ mod tests {
         assert_eq!(target, vec![5, 74, 15, 255, 10, 20, 30, 255]);
     }
 
+    fn srgb_eotf(encoded: f32) -> f32 {
+        if encoded <= 0.04045 {
+            encoded / 12.92
+        } else {
+            ((encoded + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn srgb_oetf(linear: f32) -> f32 {
+        if linear <= 0.003_130_8 {
+            linear * 12.92
+        } else {
+            1.055 * linear.powf(1.0 / 2.4) - 0.055
+        }
+    }
+
+    fn cpu_cursor_reference(
+        base: &[u8],
+        extent: (u32, u32),
+        format: TextureFormat,
+        cursor: Option<&CaptureCursorSnapshot>,
+    ) -> Vec<u8> {
+        let mut reference = base.to_vec();
+        let Some(cursor) = cursor else {
+            return reference;
+        };
+        for cy in 0..cursor.height {
+            for cx in 0..cursor.width {
+                let x = cursor.x + cx as i32;
+                let y = cursor.y + cy as i32;
+                if x < 0 || y < 0 || x >= extent.0 as i32 || y >= extent.1 as i32 {
+                    continue;
+                }
+                let source_offset = ((cy * cursor.width + cx) * 4) as usize;
+                let destination_offset = ((y as u32 * extent.0 + x as u32) * 4) as usize;
+                let source = &cursor.rgba[source_offset..source_offset + 4];
+                let destination = &mut reference[destination_offset..destination_offset + 4];
+                let alpha = f32::from(source[3]) / 255.0;
+                for rgba_channel in 0..3 {
+                    let encoded = if cursor.premultiplied && source[3] != 0 {
+                        (f32::from(source[rgba_channel]) / f32::from(source[3])).clamp(0.0, 1.0)
+                    } else {
+                        f32::from(source[rgba_channel]) / 255.0
+                    };
+                    // The KMS-shaped overlay is Rgba8UnormSrgb. Model its
+                    // independent quantisation before the final-output pass
+                    // samples it and performs premultiplied source-over.
+                    let overlay_encoded =
+                        (srgb_oetf(srgb_eotf(encoded) * alpha) * 255.0).round() as u8;
+                    let overlay_linear = srgb_eotf(f32::from(overlay_encoded) / 255.0);
+                    let storage_channel = match format {
+                        TextureFormat::Rgba8Unorm => rgba_channel,
+                        TextureFormat::Bgra8Unorm => 2 - rgba_channel,
+                        _ => unreachable!("equivalence fixture uses 8-bit RGBA/BGRA"),
+                    };
+                    destination[storage_channel] = (overlay_linear * 255.0
+                        + f32::from(destination[storage_channel]) * (1.0 - alpha))
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                }
+                destination[3] = 255;
+            }
+        }
+        reference
+    }
+
     #[test]
     fn pixel_equivalence_uses_a_real_render_attachment_and_raw_readback() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
-        let adapter =
-            bevy::tasks::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            }))
-            .expect("pixel-equivalence gate requires a real Vulkan adapter");
+        let adapter = select_vulkan_test_adapter(&instance, "capture pixel-equivalence gate");
         let adapter_info = adapter.get_info();
-        assert_eq!(adapter_info.backend, wgpu::Backend::Vulkan);
         let (device, queue) =
             bevy::tasks::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("capture pixel-equivalence device"),
                 ..Default::default()
             }))
             .expect("pixel-equivalence gate opens its Vulkan device");
+        let validation_errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_validation_errors = Arc::clone(&validation_errors);
+        device.on_uncaptured_error(Arc::new(move |error| {
+            captured_validation_errors
+                .lock()
+                .expect("validation error log")
+                .push(error.to_string());
+        }));
         let render_device = RenderDevice::from(device.clone());
         let mut world = World::new();
         world.insert_resource(render_device.clone());
@@ -2836,6 +3564,7 @@ mod tests {
                     }),
             )
             .insert_resource(cursor_feed)
+            .init_resource::<RetainedCaptureCursor>()
             .add_plugins((
                 DmabufImportPlugin,
                 crate::compositor_scene::CompositorScenePlugin::new(
@@ -2871,9 +3600,7 @@ mod tests {
         for _ in 0..12 {
             cursor_app.update();
         }
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("production cursor overlay render completes");
+        poll_test_gpu(&device, "production cursor overlay render");
         let overlay_handle = cursor_app
             .world()
             .resource::<crate::compositor_scene::NestedCursorOverlay>()
@@ -2887,6 +3614,12 @@ mod tests {
             .expect("production cursor overlay image is prepared")
             .texture
             .clone();
+        let retained_cursor = cursor_app
+            .world()
+            .resource::<RetainedCaptureCursor>()
+            .0
+            .clone()
+            .expect("production cursor retains the independently composable asset");
         let extent = wgpu::Extent3d {
             width: WIDTH,
             height: HEIGHT,
@@ -2982,8 +3715,11 @@ mod tests {
                     .map_async(wgpu::MapMode::Read, move |result| {
                         sender.send(result).unwrap();
                     });
-                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-                receiver.recv().unwrap().unwrap();
+                poll_test_gpu(&device, "capture pixel-equivalence readback");
+                receiver
+                    .recv_timeout(TEST_GPU_TIMEOUT)
+                    .expect("capture pixel-equivalence map callback timed out")
+                    .expect("capture pixel-equivalence map failed");
                 let bytes = buffer.slice(..).get_mapped_range().to_vec();
                 buffer.unmap();
                 bytes
@@ -2996,13 +3732,13 @@ mod tests {
                 _ => unreachable!(),
             };
             assert!(base.chunks_exact(4).all(|pixel| pixel == base_pixel));
-            let mut reference = base.clone();
             let inclusive_pixel = match format {
                 wgpu::TextureFormat::Rgba8Unorm => [255, 0, 0, 255],
                 wgpu::TextureFormat::Bgra8Unorm => [0, 0, 255, 255],
                 _ => unreachable!(),
             };
-            reference[cursor_offset..cursor_offset + 4].copy_from_slice(&inclusive_pixel);
+            let reference =
+                cpu_cursor_reference(&base, (WIDTH, HEIGHT), format, Some(&retained_cursor));
             assert_eq!(
                 inclusive, reference,
                 "production overlay must be byte-exact"
@@ -3022,5 +3758,596 @@ mod tests {
                 40_515
             );
         }
+        poll_test_gpu(&device, "capture equivalence validation callback drain");
+        assert!(
+            validation_errors.lock().unwrap().is_empty(),
+            "real-adapter equivalence emitted wgpu validation errors: {:?}",
+            validation_errors.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn kms_overlay_equivalence_covers_translucency_fractional_scale_clipping_and_hide() {
+        const LOGICAL: (u32, u32) = (32, 16);
+        const SCALE120: u32 = 300;
+        const PHYSICAL: (u32, u32) = (80, 40);
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = select_vulkan_test_adapter(&instance, "capture cursor-equivalence gate");
+        let adapter_info = adapter.get_info();
+        let (device, queue) =
+            bevy::tasks::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("cursor variant equivalence device"),
+                ..Default::default()
+            }))
+            .expect("cursor variant equivalence opens its fallback device");
+        let validation_errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_validation_errors = Arc::clone(&validation_errors);
+        device.on_uncaptured_error(Arc::new(move |error| {
+            captured_validation_errors
+                .lock()
+                .expect("validation error log")
+                .push(error.to_string());
+        }));
+        let render_device = RenderDevice::from(device.clone());
+        let render_creation = RenderCreation::manual(
+            device.clone().into(),
+            RenderQueue(Arc::new(WgpuWrapper::new(queue.clone()))),
+            RenderAdapterInfo(WgpuWrapper::new(adapter_info)),
+            RenderAdapter(Arc::new(WgpuWrapper::new(adapter))),
+            RenderInstance(Arc::new(WgpuWrapper::new(instance))),
+        );
+        let (cursor_events, cursor_feed) = ClientSceneFeed::test_channel();
+        let mut app = App::new();
+        app.add_plugins(
+            DefaultPlugins
+                .build()
+                .disable::<LogPlugin>()
+                .disable::<WinitPlugin>()
+                .disable::<PipelinedRenderingPlugin>()
+                .disable::<TerminalCtrlCHandlerPlugin>()
+                .set(WindowPlugin {
+                    primary_window: None,
+                    exit_condition: ExitCondition::DontExit,
+                    close_when_requested: false,
+                    ..Default::default()
+                })
+                .set(RenderPlugin {
+                    render_creation,
+                    synchronous_pipeline_compilation: true,
+                    ..Default::default()
+                }),
+        )
+        .insert_resource(cursor_feed)
+        .init_resource::<RetainedCaptureCursor>()
+        .add_plugins((
+            DmabufImportPlugin,
+            crate::compositor_scene::CompositorScenePlugin::new(
+                LOGICAL.0,
+                LOGICAL.1,
+                crate::compositor_scene::SceneCursorMode::SoftwareCursor,
+            ),
+        ))
+        .insert_resource(crate::compositor_scene::RendererOutputScale120(SCALE120));
+        let overlay_handle = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(crate::compositor_scene::cursor_overlay_image(PHYSICAL));
+        let overlay_source = CaptureSourceId::Kms {
+            key: crate::backend::kms::OutputKey {
+                device: 1,
+                connector_name: "equivalence".into(),
+            },
+            generation: 1,
+        };
+        app.world_mut().spawn((
+            Name::new("KMS-shaped persistent cursor overlay fixture"),
+            Camera2d,
+            bevy::camera::Camera {
+                order: 1,
+                clear_color: bevy::camera::ClearColorConfig::Custom(Color::NONE),
+                output_mode: bevy::camera::CameraOutputMode::Write {
+                    blend_state: None,
+                    clear_color: bevy::camera::ClearColorConfig::None,
+                },
+                ..Default::default()
+            },
+            crate::backend::render::logical_output_projection(LOGICAL),
+            bevy::camera::RenderTarget::from(overlay_handle.clone()),
+            bevy::camera::visibility::RenderLayers::layer(31),
+            Msaa::Off,
+            CaptureCursorOverlaySource {
+                source_id: overlay_source,
+            },
+        ));
+        app.finish();
+        app.cleanup();
+        for _ in 0..12 {
+            app.update();
+        }
+
+        let read_texture = |texture: &wgpu::Texture, format: TextureFormat| {
+            let row_bytes = PHYSICAL.0 as usize * 4;
+            let row_pitch = RenderDevice::align_copy_bytes_per_row(row_bytes);
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cursor variant readback"),
+                size: (row_pitch * PHYSICAL.1 as usize) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cursor variant readback encoder"),
+            });
+            encoder.copy_texture_to_buffer(
+                texture.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row_pitch as u32),
+                        rows_per_image: Some(PHYSICAL.1),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: PHYSICAL.0,
+                    height: PHYSICAL.1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit([encoder.finish()]);
+            let (sender, receiver) = mpsc::sync_channel(1);
+            buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    sender.send(result).unwrap();
+                });
+            poll_test_gpu(&device, "cursor variant source readback");
+            receiver
+                .recv_timeout(TEST_GPU_TIMEOUT)
+                .expect("cursor variant source map callback timed out")
+                .expect("cursor variant source map failed");
+            let mapped = buffer.slice(..).get_mapped_range();
+            let mut packed = Vec::with_capacity(PHYSICAL.0 as usize * PHYSICAL.1 as usize * 4);
+            for row in mapped.chunks_exact(row_pitch).take(PHYSICAL.1 as usize) {
+                packed.extend_from_slice(&row[..row_bytes]);
+            }
+            drop(mapped);
+            buffer.unmap();
+            assert!(matches!(format, TextureFormat::Rgba8UnormSrgb));
+            packed
+        };
+
+        let mut pipeline_world = World::new();
+        pipeline_world.insert_resource(render_device.clone());
+        let composite = CaptureCursorCompositePipeline::from_world(&mut pipeline_world);
+
+        let render_variant = |overlay: &Texture, format: TextureFormat| {
+            let extent = wgpu::Extent3d {
+                width: PHYSICAL.0,
+                height: PHYSICAL.1,
+                depth_or_array_layers: 1,
+            };
+            let target = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("cursor variant displayed target"),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let row_pitch = RenderDevice::align_copy_bytes_per_row(PHYSICAL.0 as usize * 4);
+            let staging = |label| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: (row_pitch * PHYSICAL.1 as usize) as u64,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                })
+            };
+            let base_buffer = staging("cursor variant base");
+            let inclusive_buffer = staging("cursor variant inclusive");
+            let copy_to = |buffer| wgpu::TexelCopyBufferInfo {
+                buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_pitch as u32),
+                    rows_per_image: Some(PHYSICAL.1),
+                },
+            };
+            let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("cursor variant equivalence encoder"),
+            });
+            let target_view = target.create_view(&Default::default());
+            {
+                let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("cursor variant deterministic base"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &target_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 10.0 / 255.0,
+                                g: 20.0 / 255.0,
+                                b: 30.0 / 255.0,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            }
+            encoder.copy_texture_to_buffer(target.as_image_copy(), copy_to(&base_buffer), extent);
+            let overlay_view = overlay.create_view(&Default::default());
+            let destination_view = TextureView::from(target.create_view(&Default::default()));
+            assert!(encode_cursor_overlay(
+                &mut encoder,
+                &render_device,
+                &composite,
+                &overlay_view,
+                &destination_view,
+                format,
+            ));
+            encoder.copy_texture_to_buffer(
+                target.as_image_copy(),
+                copy_to(&inclusive_buffer),
+                extent,
+            );
+            queue.submit([encoder.finish()]);
+            let map = |buffer: &wgpu::Buffer| {
+                let (sender, receiver) = mpsc::sync_channel(1);
+                buffer
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |result| {
+                        sender.send(result).unwrap();
+                    });
+                poll_test_gpu(&device, "cursor variant composed readback");
+                receiver
+                    .recv_timeout(TEST_GPU_TIMEOUT)
+                    .expect("cursor variant composed map callback timed out")
+                    .expect("cursor variant composed map failed");
+                let mapped = buffer.slice(..).get_mapped_range();
+                let mut packed = Vec::new();
+                for row in mapped.chunks_exact(row_pitch).take(PHYSICAL.1 as usize) {
+                    packed.extend_from_slice(&row[..PHYSICAL.0 as usize * 4]);
+                }
+                drop(mapped);
+                buffer.unmap();
+                packed
+            };
+            (map(&base_buffer), map(&inclusive_buffer))
+        };
+
+        for (label, position, hotspot, size, rgba, opaque) in [
+            (
+                "opaque fractional hotspot",
+                (4.2, 3.8),
+                (1, 1),
+                (0.4, 0.4),
+                [220, 80, 20, 255],
+                true,
+            ),
+            (
+                "premultiplied translucent fractional",
+                (6.2, 4.2),
+                (0, 0),
+                (0.4, 0.4),
+                [100, 50, 25, 128],
+                false,
+            ),
+            (
+                "edge clipped",
+                (0.6, 2.0),
+                (1, 0),
+                (0.8, 0.4),
+                [40, 160, 80, 255],
+                true,
+            ),
+        ] {
+            app.world()
+                .resource::<ClientSceneFeed>()
+                .set_cursor_position_for_test(crate::protocol::CursorPositionSnapshot {
+                    x: position.0,
+                    y: position.1,
+                    revision: 2,
+                });
+            cursor_events
+                .try_send(vec![crate::protocol::ProtocolEvent::CursorUpdated {
+                    image: crate::protocol::CursorImage::Surface {
+                        id: ObjectId::null(),
+                        hotspot,
+                        presentation: crate::protocol::CursorPresentation {
+                            width: size.0,
+                            height: size.1,
+                            source: None,
+                            transform: crate::protocol::SurfaceTransform::Normal,
+                        },
+                        frame: Some(crate::protocol::SurfaceFrame::Shm(
+                            crate::protocol::ShmFrame {
+                                width: 1,
+                                height: 1,
+                                opaque,
+                                rgba: Arc::new(rgba.to_vec()),
+                            },
+                        )),
+                    },
+                }])
+                .expect("cursor variant enters the production scene");
+            for _ in 0..4 {
+                app.update();
+            }
+            poll_test_gpu(&device, "cursor variant production render");
+            let cursor = app
+                .world()
+                .resource::<RetainedCaptureCursor>()
+                .0
+                .clone()
+                .expect("visible cursor retains its CPU asset");
+            let overlay = app
+                .sub_app(RenderApp)
+                .world()
+                .resource::<RenderAssets<GpuImage>>()
+                .get(&overlay_handle)
+                .expect("KMS-shaped overlay image is prepared")
+                .texture
+                .clone();
+            for format in [TextureFormat::Rgba8Unorm, TextureFormat::Bgra8Unorm] {
+                let (base, inclusive) = render_variant(&overlay, format);
+                assert_eq!(
+                    inclusive,
+                    cpu_cursor_reference(&base, PHYSICAL, format, Some(&cursor)),
+                    "{label} must match independent CPU source-over for {format:?}"
+                );
+            }
+        }
+
+        cursor_events
+            .try_send(vec![crate::protocol::ProtocolEvent::CursorUpdated {
+                image: crate::protocol::CursorImage::Hidden,
+            }])
+            .expect("cursor hide enters the production scene");
+        for _ in 0..4 {
+            app.update();
+        }
+        poll_test_gpu(&device, "hidden cursor production render");
+        assert!(app.world().resource::<RetainedCaptureCursor>().0.is_none());
+        let overlay = app
+            .sub_app(RenderApp)
+            .world()
+            .resource::<RenderAssets<GpuImage>>()
+            .get(&overlay_handle)
+            .expect("persistent KMS overlay remains allocated after hide")
+            .texture
+            .clone();
+        assert!(
+            read_texture(&overlay, TextureFormat::Rgba8UnormSrgb)
+                .iter()
+                .all(|byte| *byte == 0),
+            "the hide frame must replace every old cursor pixel with transparent black"
+        );
+        for format in [TextureFormat::Rgba8Unorm, TextureFormat::Bgra8Unorm] {
+            let (base, inclusive) = render_variant(&overlay, format);
+            assert_eq!(inclusive, base, "hidden inclusive capture equals base");
+        }
+        assert!(
+            validation_errors.lock().unwrap().is_empty(),
+            "cursor variant fixture emitted validation errors: {:?}",
+            validation_errors.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn nested_capture_redirect_reads_back_from_a_copy_src_intermediate() {
+        const EXTENT: (u32, u32) = (8, 8);
+        const TARGET: bevy::camera::ManualTextureViewHandle =
+            bevy::camera::ManualTextureViewHandle(0xc4a7);
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = select_vulkan_test_adapter(&instance, "nested capture redirection gate");
+        let adapter_info = adapter.get_info();
+        let (device, queue) =
+            bevy::tasks::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("nested capture redirection device"),
+                ..Default::default()
+            }))
+            .expect("nested capture gate opens its Vulkan device");
+        let validation_errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_validation_errors = Arc::clone(&validation_errors);
+        device.on_uncaptured_error(Arc::new(move |error| {
+            captured_validation_errors
+                .lock()
+                .expect("validation error log")
+                .push(error.to_string());
+        }));
+        let render_creation = RenderCreation::manual(
+            device.clone().into(),
+            RenderQueue(Arc::new(WgpuWrapper::new(queue))),
+            RenderAdapterInfo(WgpuWrapper::new(adapter_info)),
+            RenderAdapter(Arc::new(WgpuWrapper::new(adapter))),
+            RenderInstance(Arc::new(WgpuWrapper::new(instance))),
+        );
+        let (_events, feed) = ClientSceneFeed::test_channel();
+        let destination = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("render-attachment-only nested destination"),
+            size: wgpu::Extent3d {
+                width: EXTENT.0,
+                height: EXTENT.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let mut app = App::new();
+        app.add_plugins(
+            DefaultPlugins
+                .build()
+                .disable::<LogPlugin>()
+                .disable::<WinitPlugin>()
+                .disable::<PipelinedRenderingPlugin>()
+                .disable::<TerminalCtrlCHandlerPlugin>()
+                .set(WindowPlugin {
+                    primary_window: None,
+                    exit_condition: ExitCondition::DontExit,
+                    close_when_requested: false,
+                    ..Default::default()
+                })
+                .set(RenderPlugin {
+                    render_creation,
+                    synchronous_pipeline_compilation: true,
+                    ..Default::default()
+                }),
+        )
+        .init_resource::<ManualTextureViews>()
+        .insert_resource(feed)
+        .add_plugins(CaptureServicePlugin);
+        app.world_mut().resource_mut::<ManualTextureViews>().insert(
+            TARGET,
+            bevy::render::texture::ManualTextureView {
+                texture_view: TextureView::from(destination.create_view(&Default::default())),
+                size: UVec2::new(EXTENT.0, EXTENT.1),
+                view_format: TextureFormat::Rgba8UnormSrgb,
+            },
+        );
+        let acquisition_window = app
+            .world_mut()
+            .spawn((
+                Camera2d,
+                bevy::camera::Camera {
+                    clear_color: bevy::camera::ClearColorConfig::Custom(Color::srgb_u8(7, 31, 83)),
+                    ..Default::default()
+                },
+                bevy::camera::RenderTarget::TextureView(TARGET),
+                CaptureOutputSource {
+                    source_id: CaptureSourceId::Nested {
+                        output_name: "nested-redirection".into(),
+                    },
+                    output_name: "nested-redirection".into(),
+                },
+                Msaa::Off,
+            ))
+            .id();
+        let pending = app.world().resource::<CapturePresentationPending>().clone();
+        pending.set_nested_acquisition(Some(NestedCaptureAcquisition {
+            window: acquisition_window,
+            texture_view: TextureViewId::new(),
+        }));
+        app.sub_app_mut(RenderApp).insert_resource(pending);
+        app.finish();
+        app.cleanup();
+        let mut capture = request(smithay::utils::Transform::Normal);
+        capture.source_id = CaptureSourceId::Nested {
+            output_name: "nested-redirection".into(),
+        };
+        capture.output_name = "nested-redirection".into();
+        capture.region = full_region(EXTENT);
+        capture.logical_rect = (0, 0, EXTENT.0, EXTENT.1);
+        capture.source_storage_extent = EXTENT;
+        capture.displayed_physical_extent = EXTENT;
+        capture.deadline = Instant::now() + Duration::from_secs(30);
+        app.world_mut().resource_mut::<CaptureQueue>().push(capture);
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut outcomes = Vec::new();
+        app.update();
+        assert!(
+            app.sub_app(RenderApp)
+                .world()
+                .resource::<NestedCaptureRedirect>()
+                .0
+                .is_some(),
+            "nested admission must install the capture-owned final target"
+        );
+        assert!(
+            app.world()
+                .resource::<CaptureReadbackBatch>()
+                .0
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "the render-graph capture system must consume the admitted batch"
+        );
+        while Instant::now() < deadline {
+            outcomes.extend(
+                app.world()
+                    .resource::<ClientSceneFeed>()
+                    .capture_outcomes_for_test(),
+            );
+            if outcomes.contains(&crate::protocol::CaptureTestOutcome::Pixels(CaptureId(1))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            outcomes.contains(&crate::protocol::CaptureTestOutcome::Pixels(CaptureId(1))),
+            "the nested path must complete a copy from its redirected target: {outcomes:?}; validation={:?}",
+            validation_errors.lock().unwrap()
+        );
+
+        // Model the protocol/render race directly: this immutable request was
+        // admitted while the output was 16x16, then the renderer observed the
+        // current 8x8 redirect after the host resize had cancelled protocol
+        // state. It is already inside CaptureReadbackBatch, beyond the ECS
+        // queue's earlier cancellation check.
+        let releases = Arc::new(AtomicUsize::new(0));
+        let mut stale = request(smithay::utils::Transform::Normal);
+        stale.id = CaptureId(2);
+        stale.source_id = CaptureSourceId::Nested {
+            output_name: "nested-redirection".into(),
+        };
+        stale.output_name = "nested-redirection".into();
+        stale.region = full_region((16, 16));
+        stale.logical_rect = (0, 0, 16, 16);
+        stale.source_storage_extent = (16, 16);
+        stale.displayed_physical_extent = (16, 16);
+        stale.reservation = CaptureReservationLease::counted(stale.id, Arc::clone(&releases));
+        stale.deadline = Instant::now() + TEST_GPU_TIMEOUT;
+        app.world()
+            .resource::<CaptureReadbackBatch>()
+            .0
+            .lock()
+            .unwrap()
+            .push(stale);
+
+        app.update();
+
+        let resized_outcomes = app
+            .world()
+            .resource::<ClientSceneFeed>()
+            .capture_outcomes_for_test();
+        assert_eq!(
+            resized_outcomes,
+            vec![crate::protocol::CaptureTestOutcome::Failed(CaptureId(2))],
+            "the stale advertised extent must become one terminal failure"
+        );
+        assert_eq!(releases.load(Ordering::Acquire), 1);
+        assert!(
+            app.world()
+                .resource::<CaptureReadbackBatch>()
+                .0
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "the stale request must not remain queued"
+        );
+        poll_test_gpu(&device, "nested capture validation callback drain");
+        assert!(
+            validation_errors.lock().unwrap().is_empty(),
+            "nested redirection emitted a wgpu validation error: {:?}",
+            validation_errors.lock().unwrap()
+        );
     }
 }

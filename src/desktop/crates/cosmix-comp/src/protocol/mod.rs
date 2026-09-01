@@ -70,6 +70,8 @@ use crate::port::{
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 use crate::backend::kms::KmsTopologyLifecycleEvent;
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+use crate::capture::kms_capture_source_is_current;
 use cosmix_deco::{
     CaptionButton, ChromeLayout, ChromePart, DecoExtents, DecoTheme, ResizeEdge as DecoResizeEdge,
     vec2,
@@ -619,10 +621,11 @@ pub(crate) enum ProtocolEvent {
     /// these after every scene/topology mutation retained in the same batch.
     CaptureRequested(CaptureRequest),
     CaptureDamageWatch(crate::capture::CaptureDamageWatch),
-    /// Every KMS source generation known to the main-world damage journal is
-    /// obsolete after a topology lifecycle transition. A later request
-    /// registers the exact live generation again.
-    CaptureKmsSourcesRetired,
+    /// Retain only these current KMS source generations in the main-world
+    /// damage journal. Unchanged outputs keep their revision history.
+    CaptureKmsSourcesRetired {
+        current: BTreeMap<crate::backend::kms::OutputKey, u64>,
+    },
     RuntimeFailed(String),
 }
 
@@ -1224,7 +1227,11 @@ impl ClientSceneFeed {
                     outcomes.push(CaptureTestOutcome::Pixels(pixels.id));
                 }
                 Ok(ProtocolCommand::CapturePresented(presented)) => {
-                    outcomes.push(CaptureTestOutcome::Presented(presented.id));
+                    outcomes.push(CaptureTestOutcome::Presented {
+                        id: presented.id,
+                        seconds: presented.seconds,
+                        nanoseconds: presented.nanoseconds,
+                    });
                 }
                 Ok(ProtocolCommand::CaptureFailed { id, .. }) => {
                     outcomes.push(CaptureTestOutcome::Failed(id));
@@ -1242,7 +1249,11 @@ impl ClientSceneFeed {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CaptureTestOutcome {
     Pixels(CaptureId),
-    Presented(CaptureId),
+    Presented {
+        id: CaptureId,
+        seconds: u64,
+        nanoseconds: u32,
+    },
     Failed(CaptureId),
 }
 
@@ -2973,21 +2984,21 @@ impl ProtocolServer {
                     event,
                     acknowledgement,
                 }) => {
-                    state.events.push(ProtocolEvent::CaptureKmsSourcesRetired);
                     let pause = matches!(&event, KmsTopologyLifecycleEvent::Pause);
                     let resumed = matches!(&event, KmsTopologyLifecycleEvent::Resume(_));
                     let previous_kms_outputs = state.backend.kms_registered_outputs();
-                    let kms_captures = state
-                        .capture_frames
-                        .iter()
-                        .filter_map(|(id, frame)| {
-                            matches!(frame.source_id, CaptureSourceId::Kms { .. }).then_some(*id)
-                        })
-                        .collect::<Vec<_>>();
-                    for id in kms_captures {
-                        state.fail_capture(id);
-                    }
                     if pause {
+                        let kms_captures = state
+                            .capture_frames
+                            .iter()
+                            .filter_map(|(id, frame)| {
+                                matches!(frame.source_id, CaptureSourceId::Kms { .. })
+                                    .then_some(*id)
+                            })
+                            .collect::<Vec<_>>();
+                        for id in kms_captures {
+                            state.fail_capture(id);
+                        }
                         state.kms_authority_lost();
                     }
                     let previous_scale = state.backend.output_scale();
@@ -2998,6 +3009,15 @@ impl ProtocolServer {
                         .apply_kms_topology_lifecycle(event)
                         .map_err(|error| error.to_string())
                         .and_then(|commands| {
+                            let presentation_generations = if pause {
+                                BTreeMap::new()
+                            } else {
+                                state.backend.kms_presentation_generations()
+                            };
+                            state.retain_current_kms_capture_baselines(&presentation_generations);
+                            state.events.push(ProtocolEvent::CaptureKmsSourcesRetired {
+                                current: presentation_generations.clone(),
+                            });
                             if !pause {
                                 state.begin_pointer_hit_test_batch();
                                 let mapped_surfaces = state
@@ -3018,8 +3038,20 @@ impl ProtocolServer {
                                     &previous_kms_outputs,
                                     &current_kms_outputs,
                                 );
-                                let presentation_generations =
-                                    state.backend.kms_presentation_generations();
+                                let replaced_captures = state
+                                    .capture_frames
+                                    .iter()
+                                    .filter_map(|(id, frame)| {
+                                        (!kms_capture_source_is_current(
+                                            &frame.source_id,
+                                            &presentation_generations,
+                                        ))
+                                        .then_some(*id)
+                                    })
+                                    .collect::<Vec<_>>();
+                                for id in replaced_captures {
+                                    state.fail_capture(id);
+                                }
                                 state.kms_begin_preparing(presentation_generations, resumed);
                                 state.reconcile_layer_output_bindings();
                                 let scale = state.backend.output_scale();
@@ -3335,6 +3367,14 @@ impl ProtocolServer {
     }
 }
 
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+fn retain_current_kms_damage_baselines(
+    baselines: &mut HashMap<CaptureSourceId, u64>,
+    generations: &BTreeMap<crate::backend::kms::OutputKey, u64>,
+) {
+    baselines.retain(|source, _| kms_capture_source_is_current(source, generations));
+}
+
 impl Drop for ProtocolServer {
     fn drop(&mut self) {
         // `state` still owns the sole request sender while this destructor is
@@ -3582,7 +3622,7 @@ struct PendingProtocolEvents {
     surfaces: HashMap<SurfaceId, ProtocolEvent>,
     dmabuf_invalidations: HashSet<DmabufBufferId>,
     invalidate_all_dmabufs: bool,
-    retire_kms_capture_sources: bool,
+    current_kms_capture_sources: Option<BTreeMap<crate::backend::kms::OutputKey, u64>>,
     captures: Vec<ProtocolEvent>,
     runtime_failures: Vec<ProtocolEvent>,
     bytes: usize,
@@ -3625,7 +3665,7 @@ impl PendingProtocolEvents {
             && self.surfaces.is_empty()
             && self.dmabuf_invalidations.is_empty()
             && !self.invalidate_all_dmabufs
-            && !self.retire_kms_capture_sources
+            && self.current_kms_capture_sources.is_none()
             && self.captures.is_empty()
             && self.runtime_failures.is_empty()
     }
@@ -3762,8 +3802,8 @@ impl PendingProtocolEvents {
                 self.dmabuf_invalidations.clear();
                 return Ok(PendingPush::default());
             }
-            ProtocolEvent::CaptureKmsSourcesRetired => {
-                self.retire_kms_capture_sources = true;
+            ProtocolEvent::CaptureKmsSourcesRetired { current } => {
+                self.current_kms_capture_sources = Some(current);
                 return Ok(PendingPush::default());
             }
             ProtocolEvent::CaptureRequested(_) | ProtocolEvent::CaptureDamageWatch(_)
@@ -3800,7 +3840,7 @@ impl PendingProtocolEvents {
             ProtocolEvent::SurfaceRoster { .. }
             | ProtocolEvent::DmabufBufferDestroyed { .. }
             | ProtocolEvent::DmabufCacheInvalidated
-            | ProtocolEvent::CaptureKmsSourcesRetired
+            | ProtocolEvent::CaptureKmsSourcesRetired { .. }
             | ProtocolEvent::CaptureRequested(_)
             | ProtocolEvent::CaptureDamageWatch(_)
             | ProtocolEvent::RuntimeFailed(_) => 0,
@@ -3810,7 +3850,7 @@ impl PendingProtocolEvents {
             | ProtocolEvent::SurfaceRoster { .. }
             | ProtocolEvent::DmabufBufferDestroyed { .. }
             | ProtocolEvent::DmabufCacheInvalidated
-            | ProtocolEvent::CaptureKmsSourcesRetired
+            | ProtocolEvent::CaptureKmsSourcesRetired { .. }
             | ProtocolEvent::CaptureRequested(_)
             | ProtocolEvent::CaptureDamageWatch(_) => 0,
             ProtocolEvent::SurfaceRelayout { id, scene }
@@ -3969,8 +4009,8 @@ impl PendingProtocolEvents {
                 self.invalidate_all_dmabufs = true;
                 self.dmabuf_invalidations.clear();
             }
-            ProtocolEvent::CaptureKmsSourcesRetired => {
-                self.retire_kms_capture_sources = true;
+            ProtocolEvent::CaptureKmsSourcesRetired { current } => {
+                self.current_kms_capture_sources = Some(current);
             }
             ProtocolEvent::CaptureRequested(_) | ProtocolEvent::CaptureDamageWatch(_) => {
                 self.captures.push(event);
@@ -3996,7 +4036,7 @@ impl PendingProtocolEvents {
                 + self.surfaces.len()
                 + self.dmabuf_invalidations.len()
                 + usize::from(self.invalidate_all_dmabufs)
-                + usize::from(self.retire_kms_capture_sources)
+                + usize::from(self.current_kms_capture_sources.is_some())
                 + self.captures.len()
                 + self.runtime_failures.len(),
         );
@@ -4027,8 +4067,8 @@ impl PendingProtocolEvents {
         if mem::take(&mut self.invalidate_all_dmabufs) {
             events.push(ProtocolEvent::DmabufCacheInvalidated);
         }
-        if mem::take(&mut self.retire_kms_capture_sources) {
-            events.push(ProtocolEvent::CaptureKmsSourcesRetired);
+        if let Some(current) = self.current_kms_capture_sources.take() {
+            events.push(ProtocolEvent::CaptureKmsSourcesRetired { current });
         }
         events.append(&mut self.captures);
         events.append(&mut self.runtime_failures);
@@ -4068,7 +4108,7 @@ fn protocol_event_surface_id(event: &ProtocolEvent) -> Option<SurfaceId> {
         | ProtocolEvent::CursorUpdated { .. }
         | ProtocolEvent::DmabufBufferDestroyed { .. }
         | ProtocolEvent::DmabufCacheInvalidated
-        | ProtocolEvent::CaptureKmsSourcesRetired
+        | ProtocolEvent::CaptureKmsSourcesRetired { .. }
         | ProtocolEvent::CaptureRequested(_)
         | ProtocolEvent::CaptureDamageWatch(_)
         | ProtocolEvent::SurfaceRoster { .. }
@@ -4130,7 +4170,7 @@ fn protocol_event_retained_bytes(event: &ProtocolEvent) -> usize {
         | ProtocolEvent::SurfaceDestroyed { .. }
         | ProtocolEvent::DmabufBufferDestroyed { .. }
         | ProtocolEvent::DmabufCacheInvalidated
-        | ProtocolEvent::CaptureKmsSourcesRetired
+        | ProtocolEvent::CaptureKmsSourcesRetired { .. }
         | ProtocolEvent::CaptureRequested(_)
         | ProtocolEvent::CaptureDamageWatch(_) => mem::size_of::<ProtocolEvent>(),
         // Reported honestly for the record, but never charged: the roster's
@@ -6522,6 +6562,16 @@ impl WaylandState {
         record.pixels = None;
         record.presentation = None;
         false
+    }
+
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    fn retain_current_kms_capture_baselines(
+        &mut self,
+        generations: &BTreeMap<crate::backend::kms::OutputKey, u64>,
+    ) {
+        for manager in self.capture_managers.values_mut() {
+            retain_current_kms_damage_baselines(&mut manager.damage_baselines, generations);
+        }
     }
 
     fn fail_stale_capture_epochs(&mut self, current_epoch: u64) {

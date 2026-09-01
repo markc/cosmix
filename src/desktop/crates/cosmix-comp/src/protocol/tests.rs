@@ -1861,6 +1861,15 @@ impl KeybindingHarness {
         id
     }
 
+    fn take_renderer_feed(&mut self) -> ClientSceneFeed {
+        let (_replacement_sender, replacement) = mpsc::sync_channel(1);
+        ClientSceneFeed::new(
+            std::mem::replace(&mut self.renderer_events, replacement),
+            self.commands.clone(),
+            Arc::clone(&self.server.state.cursor_position_snapshot),
+        )
+    }
+
     fn bind_test_global(&mut self, interface: &str, maximum_version: u32) -> u32 {
         let &(global_name, advertised_version) = self
             .registry_globals
@@ -32701,6 +32710,20 @@ fn submit_primary_capture(wire: &mut ScreencopyWireHarness, frame: u32, buffer: 
     capture_id_for_frame(&wire.harness.server.state, frame)
 }
 
+fn dispatch_first_light_capture_until_terminal(wire: &mut ScreencopyWireHarness, id: CaptureId) {
+    let deadline = Instant::now() + CAPTURE_REQUEST_TIMEOUT;
+    while !wire.harness.server.state.capture_frames[&id].terminal {
+        wire.harness
+            .server
+            .dispatch_cycle(Some(EVENT_LOOP_PUMP_TIMEOUT))
+            .expect("first-light capture completion dispatch remains healthy");
+        assert!(
+            Instant::now() < deadline,
+            "first-light capture did not complete before its protocol deadline"
+        );
+    }
+}
+
 fn inject_capture_halves(
     state: &mut WaylandState,
     id: CaptureId,
@@ -32785,6 +32808,53 @@ impl ScreencopyWireHarness {
             output,
             shm,
         }
+    }
+
+    fn new_first_light() -> (Self, crate::backend::render::tests::FirstLightCaptureDriver) {
+        let mut harness = KeybindingHarness::new_with_backend(false, BackendKind::Kms);
+        let key = kms_security_test_key(226, "Blocked-1");
+        submit_kms_security_lifecycle(
+            &mut harness,
+            KmsTopologyLifecycleEvent::Initial(kms_security_test_snapshot(&key, 91)),
+        );
+        assert!(matches!(
+            harness._kms_commands.try_recv(),
+            Ok(KmsRenderCommand::AddOutput { generation: 1, .. })
+        ));
+        harness
+            .commands
+            .send(ProtocolCommand::KmsRenderReply {
+                reply: KmsRenderReply::OutputReady {
+                    generation: 1,
+                    key: key.clone(),
+                },
+            })
+            .expect("submit first-light OutputReady");
+        pump_protocol_event_loop_until(&mut harness.server, "first-light OutputReady", |state| {
+            state.backend.kms_output_is_ready(1, &key)
+        });
+        let announced = harness.sync();
+        let output_global = registry_global_from_events(&announced, 2, "wl_output")
+            .expect("first-light KMS output is announced");
+        harness
+            .registry_globals
+            .insert("wl_output".into(), output_global);
+
+        let feed = harness.take_renderer_feed();
+        let driver = crate::backend::render::tests::first_light_capture_driver(feed);
+        let manager = harness.bind_test_global("zwlr_screencopy_manager_v1", 3);
+        let output = harness.bind_test_global("wl_output", 4);
+        let shm = harness.bind_test_global("wl_shm", 1);
+        let _ = harness.sync();
+        (
+            Self {
+                harness,
+                manager,
+                output,
+                shm,
+            },
+            driver,
+        )
     }
 
     fn capture_output(&mut self, overlay: bool) -> (u32, Vec<(u32, u16, Vec<u8>)>) {
@@ -33057,6 +33127,103 @@ fn screencopy_s1a_02_exact_whole_output_shm_advertisement() {
             .count(),
         1
     );
+}
+
+#[test]
+fn first_light_wire_copy_then_copy_with_damage_complete_across_animation_frames() {
+    let started = Instant::now();
+    let (mut wire, mut driver) = ScreencopyWireHarness::new_first_light();
+
+    let (first_frame, _) = wire.capture_output(false);
+    let (first_file, first_buffer) = wire.shm_buffer(320, 240, 1280);
+    let first_id = submit_primary_capture(&mut wire, first_frame, first_buffer);
+    wire.harness
+        .server
+        .dispatch_cycle(Some(EVENT_LOOP_PUMP_TIMEOUT))
+        .expect("publish first-light copy to the renderer");
+    driver.update();
+    dispatch_first_light_capture_until_terminal(&mut wire, first_id);
+    let first_events = wire.harness.sync();
+    assert!(
+        first_events
+            .iter()
+            .any(|event| event.0 == first_frame && event.1 == 2),
+        "first-light copy readies with rendered pixels: {first_events:?}"
+    );
+    assert!(
+        !first_events
+            .iter()
+            .any(|event| event.0 == first_frame && event.1 == 3),
+        "first-light copy must not fail: {first_events:?}"
+    );
+    let mut first_pixels = vec![0_u8; 320 * 240 * 4];
+    first_file.read_exact_at(&mut first_pixels, 0).unwrap();
+    assert!(
+        first_pixels.iter().any(|byte| *byte != 0),
+        "the wire buffer contains the rendered first-light scene"
+    );
+
+    let (damage_frame, _) = wire.capture_output(false);
+    let (_damage_file, damage_buffer) = wire.shm_buffer(320, 240, 1280);
+    send_request(
+        &mut wire.harness.client,
+        damage_frame,
+        2,
+        &words(&[damage_buffer]),
+    );
+    wire.harness.dispatch_client();
+    let damage_id = capture_id_for_frame(&wire.harness.server.state, damage_frame);
+    assert!(
+        !wire.harness.server.state.capture_frames[&damage_id].job_pending,
+        "copy_with_damage waits on the first copy's damage baseline"
+    );
+    wire.harness
+        .server
+        .dispatch_cycle(Some(EVENT_LOOP_PUMP_TIMEOUT))
+        .expect("publish first-light damage watch to the renderer");
+
+    driver.update();
+    wire.harness
+        .server
+        .dispatch_cycle(Some(EVENT_LOOP_PUMP_TIMEOUT))
+        .expect("settle the animation frame");
+    assert!(
+        !wire.harness.server.state.capture_frames[&damage_id].job_pending,
+        "the animation frame marks damage after the watch evaluation"
+    );
+
+    driver.update();
+    wire.harness
+        .server
+        .dispatch_cycle(Some(EVENT_LOOP_PUMP_TIMEOUT))
+        .expect("admit the now-damaged first-light copy");
+    assert!(
+        wire.harness.server.state.capture_frames[&damage_id].job_pending,
+        "the next damage evaluation wakes copy_with_damage"
+    );
+    driver.update();
+    dispatch_first_light_capture_until_terminal(&mut wire, damage_id);
+    let damage_events = wire.harness.sync();
+    assert!(
+        damage_events
+            .iter()
+            .any(|event| event.0 == damage_frame && event.1 == 4),
+        "copy_with_damage reports the animated full-output damage: {damage_events:?}"
+    );
+    assert!(
+        damage_events
+            .iter()
+            .any(|event| event.0 == damage_frame && event.1 == 2),
+        "copy_with_damage readies after animation: {damage_events:?}"
+    );
+    assert!(
+        !damage_events
+            .iter()
+            .any(|event| event.0 == damage_frame && event.1 == 3),
+        "copy_with_damage must not time out or fail: {damage_events:?}"
+    );
+    assert!(started.elapsed() < CAPTURE_REQUEST_TIMEOUT);
+    driver.shutdown();
 }
 
 #[test]
@@ -33782,6 +33949,33 @@ fn screencopy_s1a_21_missing_completion_expires_and_releases_boundedly() {
 }
 
 #[test]
+fn nested_resize_terminally_cancels_an_already_admitted_capture() {
+    let mut wire = ScreencopyWireHarness::new(3);
+    let (frame, _) = wire.capture_output(false);
+    let (_file, buffer) = wire.shm_buffer(320, 240, 1280);
+    let id = submit_primary_capture(&mut wire, frame, buffer);
+    let cancellation = wire.harness.server.state.capture_frames[&id]
+        .cancellation
+        .clone()
+        .expect("admitted capture has a cancellation token");
+    assert!(wire.harness.server.state.capture_frames[&id].job_pending);
+
+    wire.harness.server.state.resize_output(160, 120);
+
+    let record = &wire.harness.server.state.capture_frames[&id];
+    assert!(record.terminal);
+    assert!(!record.job_pending);
+    assert!(cancellation.is_cancelled());
+    let events = wire.harness.sync();
+    assert!(events.iter().any(|event| event.0 == frame && event.1 == 3));
+    drop_renderer_capture_requests(&mut wire.harness, &[id]);
+    assert_eq!(
+        wire.harness.server.state.capture_frames[&id].reserved_bytes,
+        0
+    );
+}
+
+#[test]
 fn screencopy_copy_with_damage_is_rejected_for_a_v1_frame() {
     let mut wire = ScreencopyWireHarness::new(1);
     let (frame, _) = wire.capture_output(false);
@@ -33798,4 +33992,39 @@ fn screencopy_copy_with_damage_is_rejected_for_a_v1_frame() {
         message.to_ascii_lowercase().contains("invalid method"),
         "{message}"
     );
+}
+
+#[test]
+fn topology_change_retires_only_changed_kms_capture_generations() {
+    let unchanged = OutputKey {
+        device: 1,
+        connector_name: "unchanged".into(),
+    };
+    let replaced = OutputKey {
+        device: 1,
+        connector_name: "replaced".into(),
+    };
+    let generations = BTreeMap::from([(unchanged.clone(), 7), (replaced.clone(), 9)]);
+    let unchanged_source = CaptureSourceId::Kms {
+        key: unchanged,
+        generation: 7,
+    };
+    let replaced_source = CaptureSourceId::Kms {
+        key: replaced,
+        generation: 8,
+    };
+    let nested_source = CaptureSourceId::Nested {
+        output_name: "nested".into(),
+    };
+    let mut manager_baselines = HashMap::from([
+        (unchanged_source.clone(), 41),
+        (replaced_source.clone(), 73),
+        (nested_source.clone(), 5),
+    ]);
+
+    retain_current_kms_damage_baselines(&mut manager_baselines, &generations);
+
+    assert_eq!(manager_baselines.get(&unchanged_source), Some(&41));
+    assert!(!manager_baselines.contains_key(&replaced_source));
+    assert_eq!(manager_baselines.get(&nested_source), Some(&5));
 }

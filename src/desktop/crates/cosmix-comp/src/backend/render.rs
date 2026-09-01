@@ -61,7 +61,7 @@ use bevy::{
     render::{
         Render, RenderApp, RenderSystems,
         camera::ExtractedCamera,
-        render_resource::{BlendState, CommandEncoderDescriptor, RenderPassDescriptor},
+        render_resource::{CommandEncoderDescriptor, RenderPassDescriptor},
         renderer::{RenderDevice, RenderQueue, render_system},
         texture::{ManualTextureView, ManualTextureViews},
         view::{ViewTarget, prepare_view_attachments},
@@ -111,10 +111,10 @@ use crate::decoration_scene::init_chrome_font_cx;
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 use crate::{
     compositor_scene::{
-        CompositorScenePlugin, DmabufOutputProbeSurface, SceneCursorMode, drain_protocol_events,
-        set_compositor_logical_output_geometry,
+        CompositorScenePlugin, CompositorSceneSet, DmabufOutputProbeSurface, SceneCursorMode,
+        drain_protocol_events, set_compositor_logical_output_geometry,
     },
-    protocol::ClientSceneFeed,
+    protocol::{ClientSceneFeed, ProtocolEvent},
 };
 
 use super::{
@@ -786,7 +786,7 @@ fn build_live_render_app(
     Ok(app)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Resource)]
 pub(crate) enum LiveSceneMode {
     FirstLight,
     ClientContent,
@@ -794,6 +794,7 @@ pub(crate) enum LiveSceneMode {
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 fn install_live_scene(app: &mut App, scene_mode: LiveSceneMode) {
+    app.insert_resource(scene_mode);
     match scene_mode {
         LiveSceneMode::FirstLight => {
             app.add_plugins(FirstLightScenePlugin);
@@ -870,23 +871,23 @@ fn prepare_live_scene_start(
     output_scale: super::kms::OutputScale120,
 ) -> Result<(), super::kms_live::KmsLiveError> {
     match (scene_mode, scene_feed) {
-        (LiveSceneMode::FirstLight, None) => Ok(()),
-        (LiveSceneMode::ClientContent, Some(scene_feed)) => {
+        (LiveSceneMode::FirstLight | LiveSceneMode::ClientContent, Some(scene_feed)) => {
             app.insert_resource(scene_feed);
-            set_compositor_logical_output_geometry(
-                app.world_mut(),
-                logical_extent.0,
-                logical_extent.1,
-                output_scale,
-            );
+            if scene_mode == LiveSceneMode::ClientContent {
+                set_compositor_logical_output_geometry(
+                    app.world_mut(),
+                    logical_extent.0,
+                    logical_extent.1,
+                    output_scale,
+                );
+            }
             Ok(())
         }
-        (LiveSceneMode::FirstLight, Some(_)) => Err(super::kms_live::KmsLiveError::Setup(
-            "first-light App received a client scene feed".into(),
-        )),
-        (LiveSceneMode::ClientContent, None) => Err(super::kms_live::KmsLiveError::Setup(
-            "client-content App started without its client scene feed".into(),
-        )),
+        (LiveSceneMode::FirstLight | LiveSceneMode::ClientContent, None) => {
+            Err(super::kms_live::KmsLiveError::Setup(format!(
+                "{scene_mode:?} App started without its protocol scene feed"
+            )))
+        }
     }
 }
 
@@ -897,14 +898,72 @@ struct FirstLightScenePlugin;
 impl Plugin for FirstLightScenePlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(ClearColor(Color::srgb(0.010, 0.018, 0.055)))
+            .init_resource::<FirstLightDamageState>()
+            .add_systems(
+                bevy::app::First,
+                drain_first_light_protocol_events.in_set(CompositorSceneSet),
+            )
             .add_systems(bevy::app::Startup, spawn_first_light_scene)
             .add_systems(bevy::app::Update, animate_first_light_scene);
     }
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
+fn drain_first_light_protocol_events(world: &mut bevy::prelude::World) {
+    let events = world
+        .resource::<ClientSceneFeed>()
+        .drain_events()
+        .unwrap_or_else(|error| panic!("{error}"));
+    for event in events {
+        match event {
+            ProtocolEvent::CaptureRequested(request) => {
+                world
+                    .resource_mut::<crate::capture::CaptureQueue>()
+                    .push(request);
+            }
+            ProtocolEvent::CaptureDamageWatch(watch) => {
+                world
+                    .resource_mut::<crate::capture::CaptureDamageEligibilityWatches>()
+                    .0
+                    .push(watch);
+            }
+            ProtocolEvent::CaptureKmsSourcesRetired { current } => {
+                world
+                    .resource::<crate::capture::OutputDamageJournal>()
+                    .retain_current_kms_sources(&current);
+            }
+            ProtocolEvent::RuntimeFailed(error) => {
+                panic!("Wayland protocol thread failed: {error}");
+            }
+            ProtocolEvent::SecurityScene { .. }
+            | ProtocolEvent::OutputResized { .. }
+            | ProtocolEvent::SurfaceUpserted { .. }
+            | ProtocolEvent::SurfaceRelayout { .. }
+            | ProtocolEvent::SurfaceUnmapped { .. }
+            | ProtocolEvent::SurfaceDestroyed { .. }
+            | ProtocolEvent::SurfaceRoster { .. }
+            | ProtocolEvent::CursorUpdated { .. }
+            | ProtocolEvent::DmabufBufferDestroyed { .. }
+            | ProtocolEvent::DmabufCacheInvalidated => {}
+        }
+    }
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
 #[derive(Component)]
 struct FirstLightRectangle;
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+#[derive(Clone, Copy, PartialEq)]
+struct FirstLightAnimationFrame {
+    clear_blue: f32,
+    translation: Vec2,
+    rotation_radians: f32,
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+#[derive(Default, Resource)]
+struct FirstLightDamageState(Option<FirstLightAnimationFrame>);
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 fn spawn_first_light_scene(mut commands: Commands) {
@@ -920,14 +979,27 @@ fn animate_first_light_scene(
     time: Res<Time>,
     mut clear: ResMut<ClearColor>,
     mut rectangle: Query<&mut Transform, With<FirstLightRectangle>>,
+    damage: Res<crate::capture::OutputDamageJournal>,
+    mut last_marked: ResMut<FirstLightDamageState>,
 ) {
     let elapsed = time.elapsed_secs();
-    let blue = 0.052 + 0.018 * (elapsed * 0.19).sin();
-    clear.0 = Color::srgb(0.008, 0.016, blue);
+    let frame = FirstLightAnimationFrame {
+        clear_blue: 0.052 + 0.018 * (elapsed * 0.19).sin(),
+        translation: Vec2::new(
+            (elapsed * 0.31).sin() * 280.0,
+            (elapsed * 0.47 + 0.8).sin() * 140.0,
+        ),
+        rotation_radians: elapsed * 0.22,
+    };
+    clear.0 = Color::srgb(0.008, 0.016, frame.clear_blue);
     for mut transform in &mut rectangle {
-        transform.translation.x = (elapsed * 0.31).sin() * 280.0;
-        transform.translation.y = (elapsed * 0.47 + 0.8).sin() * 140.0;
-        transform.rotation = Quat::from_rotation_z(elapsed * 0.22);
+        transform.translation.x = frame.translation.x;
+        transform.translation.y = frame.translation.y;
+        transform.rotation = Quat::from_rotation_z(frame.rotation_radians);
+    }
+    if last_marked.0 != Some(frame) {
+        damage.mark_all_base_full();
+        last_marked.0 = Some(frame);
     }
 }
 
@@ -1725,8 +1797,12 @@ impl LiveRenderEngine {
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 pub(crate) fn drain_live_client_scene(app: &mut App) {
-    if app.world().contains_resource::<ClientSceneFeed>() {
-        drain_protocol_events(app.world_mut());
+    if !app.world().contains_resource::<ClientSceneFeed>() {
+        return;
+    }
+    match *app.world().resource::<LiveSceneMode>() {
+        LiveSceneMode::FirstLight => drain_first_light_protocol_events(app.world_mut()),
+        LiveSceneMode::ClientContent => drain_protocol_events(app.world_mut()),
     }
 }
 
@@ -5075,7 +5151,7 @@ fn apply_main_world_effect(
                             order: 1,
                             clear_color: ClearColorConfig::Custom(bevy::color::Color::NONE),
                             output_mode: CameraOutputMode::Write {
-                                blend_state: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                                blend_state: None,
                                 clear_color: ClearColorConfig::None,
                             },
                             ..Default::default()
@@ -5105,7 +5181,7 @@ fn apply_main_world_effect(
                                 order: 1,
                                 clear_color: ClearColorConfig::Custom(bevy::color::Color::NONE),
                                 output_mode: CameraOutputMode::Write {
-                                    blend_state: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                                    blend_state: None,
                                     clear_color: ClearColorConfig::None,
                                 },
                                 ..Default::default()
@@ -6123,7 +6199,8 @@ pub(crate) mod tests {
         app
     }
 
-    fn live_first_light_capture_app_for_test() -> App {
+    pub(crate) fn live_first_light_capture_app_for_test() -> (App, SyncSender<Vec<ProtocolEvent>>) {
+        let (events, feed) = ClientSceneFeed::test_channel();
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .add_message::<bevy::window::RequestRedraw>()
@@ -6132,12 +6209,12 @@ pub(crate) mod tests {
         prepare_live_scene_start(
             &mut app,
             LiveSceneMode::FirstLight,
-            None,
+            Some(feed),
             (320, 240),
             crate::backend::kms::OutputScale120::ONE,
         )
-        .expect("first-light has no client scene feed");
-        app
+        .expect("first-light owns the protocol feed used by capture");
+        (app, events)
     }
 
     #[test]
@@ -6237,7 +6314,7 @@ pub(crate) mod tests {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         ManualTextureView::with_default_format(
@@ -6512,6 +6589,98 @@ pub(crate) mod tests {
             fallback_clears,
             suppress_upscaling,
         )
+    }
+
+    pub(crate) struct FirstLightCaptureDriver {
+        adapter: LiveRenderAdapter,
+    }
+
+    impl FirstLightCaptureDriver {
+        pub(crate) fn update(&mut self) {
+            self.adapter
+                .update()
+                .expect("first-light capture frame remains healthy");
+            self.adapter.drain_frame_events();
+        }
+
+        pub(crate) fn shutdown(mut self) {
+            self.adapter
+                .shutdown_inner()
+                .expect("first-light capture frame driver shuts down");
+        }
+    }
+
+    pub(crate) fn first_light_capture_driver(feed: ClientSceneFeed) -> FirstLightCaptureDriver {
+        let (render_plugin, device) = noop_render_plugin();
+        let mut app = App::new();
+        app.add_plugins(configure_live_headless_plugins(DefaultPlugins.build()).set(render_plugin))
+            .add_plugins(crate::capture::CaptureServicePlugin);
+        install_live_scene(&mut app, LiveSceneMode::FirstLight);
+        prepare_live_scene_start(
+            &mut app,
+            LiveSceneMode::FirstLight,
+            Some(feed),
+            (320, 240),
+            crate::backend::kms::OutputScale120::ONE,
+        )
+        .expect("first-light capture driver owns its protocol feed");
+        app.finish();
+        app.cleanup();
+
+        let output = blocked_output();
+        let LiveKmsRenderInstallation {
+            worker,
+            render_world_dropped,
+            frame_events,
+            destructive_quiescence,
+        } = install_live_kms_render_target(
+            &mut app,
+            FrameDriverPlatform {
+                device,
+                presented: Arc::new(AtomicUsize::new(0)),
+                destructive_release: None,
+                terminal_teardown: None,
+                destroyed: None,
+                add_failures: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .expect("first-light capture render target installs");
+        worker
+            .send(KmsRenderCommand::AddOutput {
+                generation: 1,
+                output: output.clone(),
+            })
+            .expect("first-light output registration is queued");
+        let mut adapter = LiveRenderAdapter {
+            app: Some(app),
+            render_world_dropped: Some(render_world_dropped),
+            worker: Some(worker),
+            frame_events,
+            destructive_quiescence,
+            update_gate: LiveRenderUpdateGate::Open,
+            terminal_updates_stopped: Arc::new(AtomicBool::new(false)),
+            expected_destructive_quiescence: Vec::new(),
+            output: output.key,
+            generation: 1,
+            transition_generation: 1,
+            output_ready: false,
+            resume_leases: Arc::new(Mutex::new(GenerationLeaseSlot::default())),
+            topology_client: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while adapter
+            .poll_output_registration()
+            .expect("first-light output registration remains healthy")
+            != LiveOutputRegistration::Ready
+        {
+            assert!(
+                Instant::now() < deadline,
+                "first-light output registration timed out"
+            );
+            thread::yield_now();
+        }
+        reach_steady_frame_submission(&mut adapter);
+        FirstLightCaptureDriver { adapter }
     }
 
     fn suppress_frame_driver_upscaling(world: &mut World) {
@@ -7244,54 +7413,113 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn first_light_capture_service_ticks_once_without_a_client_scene_feed() {
-        let mut app = live_first_light_capture_app_for_test();
+    fn first_light_capture_service_ticks_with_its_protocol_feed() {
+        let (mut app, _events) = live_first_light_capture_app_for_test();
         app.update();
-        assert!(!app.world().contains_resource::<ClientSceneFeed>());
+        assert!(app.world().contains_resource::<ClientSceneFeed>());
     }
 
     #[test]
-    fn first_light_admitted_capture_without_a_feed_uses_reporter_fallback() {
-        let mut app = live_first_light_capture_app_for_test();
-        let (_events, feed) = ClientSceneFeed::test_channel();
-        app.insert_resource(feed.capture_completion_reporter());
-        app.world_mut()
-            .resource_mut::<crate::capture::CaptureQueue>()
-            .push(crate::capture::CaptureRequest {
-                id: crate::capture::CaptureId(41),
-                source_id: crate::backend::CaptureSourceId::Nested {
+    fn first_light_marks_damage_only_when_its_animation_frame_changes() {
+        let (mut app, _events) = live_first_light_capture_app_for_test();
+        let source = crate::backend::CaptureSourceId::Nested {
+            output_name: "cosmix-first-light-0".into(),
+        };
+        let journal = app
+            .world()
+            .resource::<crate::capture::OutputDamageJournal>()
+            .clone();
+        journal.register(
+            source.clone(),
+            (0, 0, 320, 240),
+            (320, 240),
+            (320, 240),
+            120,
+            smithay::utils::Transform::Normal,
+        );
+        *app.world_mut().resource_mut::<TimeUpdateStrategy>() =
+            TimeUpdateStrategy::ManualDuration(Duration::ZERO);
+
+        app.update();
+        let capture = crate::capture::CaptureRegion {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 240,
+        };
+        let (baseline, initial_damage) = journal.snapshot(&source, Some(0), false, capture);
+        assert_eq!(
+            initial_damage,
+            [capture],
+            "the first displayed animation state marks full damage"
+        );
+
+        app.update();
+        let (unchanged_revision, unchanged_damage) =
+            journal.snapshot(&source, Some(baseline), false, capture);
+        assert_eq!(unchanged_revision, baseline);
+        assert!(
+            unchanged_damage.is_empty(),
+            "an unchanged animation tick must not mark damage"
+        );
+
+        *app.world_mut().resource_mut::<TimeUpdateStrategy>() =
+            TimeUpdateStrategy::ManualDuration(Duration::from_millis(16));
+        app.update();
+        let (changed_revision, changed_damage) =
+            journal.snapshot(&source, Some(baseline), false, capture);
+        assert!(changed_revision > baseline);
+        assert_eq!(
+            changed_damage,
+            [capture],
+            "a changed animation frame marks full displayed damage"
+        );
+    }
+
+    #[test]
+    fn first_light_routes_capture_events_and_completion_through_its_protocol_feed() {
+        let (mut app, events) = live_first_light_capture_app_for_test();
+        events
+            .send(vec![ProtocolEvent::CaptureRequested(
+                crate::capture::CaptureRequest {
+                    id: crate::capture::CaptureId(41),
+                    source_id: crate::backend::CaptureSourceId::Nested {
+                        output_name: "cosmix-first-light-0".into(),
+                    },
                     output_name: "cosmix-first-light-0".into(),
+                    generation: 1,
+                    security_epoch: 2,
+                    region: crate::capture::CaptureRegion {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    logical_rect: (0, 0, 1, 1),
+                    source_storage_extent: (1, 1),
+                    displayed_physical_extent: (1, 1),
+                    scale120: 120,
+                    transform: smithay::utils::Transform::Normal,
+                    format: crate::capture::CaptureFormat::Xrgb8888,
+                    overlay_cursor: false,
+                    cursor: None,
+                    with_damage: false,
+                    damage_baseline: None,
+                    damage_revision: 0,
+                    damage: Vec::new(),
+                    cancellation: crate::capture::CaptureCancellation::default(),
+                    reservation: crate::capture::CaptureReservationLease::detached(
+                        crate::capture::CaptureId(41),
+                    ),
+                    deadline: Instant::now() + crate::protocol::CAPTURE_REQUEST_TIMEOUT,
                 },
-                output_name: "cosmix-first-light-0".into(),
-                generation: 1,
-                security_epoch: 2,
-                region: crate::capture::CaptureRegion {
-                    x: 0,
-                    y: 0,
-                    width: 1,
-                    height: 1,
-                },
-                logical_rect: (0, 0, 1, 1),
-                source_storage_extent: (1, 1),
-                displayed_physical_extent: (1, 1),
-                scale120: 120,
-                transform: smithay::utils::Transform::Normal,
-                format: crate::capture::CaptureFormat::Xrgb8888,
-                overlay_cursor: false,
-                cursor: None,
-                with_damage: false,
-                damage_baseline: None,
-                damage_revision: 0,
-                damage: Vec::new(),
-                cancellation: crate::capture::CaptureCancellation::default(),
-                reservation: crate::capture::CaptureReservationLease::detached(
-                    crate::capture::CaptureId(41),
-                ),
-                deadline: Instant::now() + crate::protocol::CAPTURE_REQUEST_TIMEOUT,
-            });
+            )])
+            .expect("capture request reaches first-light");
         app.update();
         assert_eq!(
-            feed.capture_outcomes_for_test(),
+            app.world()
+                .resource::<ClientSceneFeed>()
+                .capture_outcomes_for_test(),
             vec![crate::protocol::CaptureTestOutcome::Failed(
                 crate::capture::CaptureId(41)
             )]

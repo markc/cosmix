@@ -508,6 +508,67 @@ pub(crate) fn sync_static_decorations(world: &mut World) {
     }
 }
 
+/// The logical bounds of every pixel the SSD scene may draw for this surface.
+/// This includes the titlebar/frame and the shadow texture, not just client
+/// content, so damage waiters cannot sleep through chrome-only changes.
+pub(crate) fn decoration_damage_region(
+    world: &World,
+    layout: SurfaceLayout,
+) -> Option<crate::capture::DisplayedLogicalRegion> {
+    if !layout.visible || layout.width <= 0.0 || layout.height <= 0.0 {
+        return None;
+    }
+    let mut left = layout.x;
+    let mut top = layout.y;
+    let mut right = layout.x + layout.width;
+    let mut bottom = layout.y + layout.height;
+    let Some(toplevel) = layout.toplevel else {
+        return Some(crate::capture::DisplayedLogicalRegion {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        });
+    };
+    if toplevel.decoration != SceneDecorationMode::ServerSide {
+        return Some(crate::capture::DisplayedLogicalRegion {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        });
+    }
+    let theme = &world.get_resource::<DecorationSceneTheme>()?.0;
+    let chrome = ChromeLayout::compute(
+        theme,
+        vec2(
+            toplevel.window_geometry.width,
+            toplevel.window_geometry.height,
+        ),
+    );
+    let content_offset = chrome.content_offset();
+    let geometry_global = vec2(
+        layout.x + toplevel.window_geometry.x,
+        layout.y + toplevel.window_geometry.y,
+    );
+    let outer_origin = vec2(
+        geometry_global.x - content_offset.x,
+        geometry_global.y - content_offset.y,
+    );
+    for drawn in [chrome.window, chrome.shadow] {
+        left = left.min(outer_origin.x + drawn.x);
+        top = top.min(outer_origin.y + drawn.y);
+        right = right.max(outer_origin.x + drawn.x + drawn.w);
+        bottom = bottom.max(outer_origin.y + drawn.y + drawn.h);
+    }
+    Some(crate::capture::DisplayedLogicalRegion {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
 /// Resolved placement forensics for the intermittent two-window fault reported
 /// 2026-08-11: a second window arriving with a blank titlebar and no content,
 /// both restored by maximising either window.

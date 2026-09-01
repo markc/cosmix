@@ -142,8 +142,11 @@ advances only after `ready`, and history overflow conservatively reports the
 full captured region.
 
 Pixel readback and the matching output presentation form a two-part completion
-latch: `ready` is sent only after both arrive. Nested mode uses the completed
-host presentation time; KMS retains the exact `tv_sec`/`tv_usec` from the
+latch: `ready` is sent only after both arrive for the same frame. Nested records
+are bound to the exact acquired host window texture-view identity; a missing,
+unconsumed or mismatched acquisition fails that capture instead of rebinding it
+to a later presentation. Nested mode uses the completed host presentation time;
+KMS retains the exact `tv_sec`/`tv_usec` from the
 matching kernel page-flip event. The compositor bounds live and in-flight jobs, reserves
 a byte budget before allocation, performs conversion away from the render and
 protocol threads, then copies shared memory in bounded chunks across protocol
@@ -188,7 +191,9 @@ KMS copies select the exact Ready `OutputKey` and generation, copy the scan-out
 target within that frame without retaining a slot, and latch pixels against its
 acquisition token and kernel page-flip timestamp. Pause, unplug, generation
 replacement, cancellation and map failure fail the affected one-shot rather
-than returning another output or stale pixels.
+than returning another output or stale pixels. `--first-light` keeps the same
+capture feed and completion path while ignoring client scene content; every
+changed animation frame marks full-output damage, so `copy_with_damage` wakes.
 The wlr protocol is a compatibility surface; the planned
 `ext-image-copy-capture-v1` implementation will become another consumer of the
 same capture service. The automated nested acceptance gate uses `grim`; the
@@ -197,7 +202,10 @@ advertised layout, non-zero shm offset, guard bytes and non-black pixels.
 Automated tests cover readback, transforms, ordering and damage. A real Vulkan
 render-attachment gate uses the production GPU cursor-composite pass, reads back
 base and inclusive bytes, compares both with byte-exact references, and proves
-that channel-swap and shifted-hotspot mutants fail. Physical driver behaviour,
+that channel-swap and shifted-hotspot mutants fail. These gates prefer a Vulkan
+fallback adapter. With `COSMIX_REQUIRE_FALLBACK_ADAPTER=1`, absence of one fails
+the test (the CI rule); otherwise the gate runs on an available Vulkan adapter
+and prints one line naming the adapter actually used. Physical driver behaviour,
 real kernel page-flip clock provenance
 and end-to-end `grim -o` on KMS remain manual-hardware-only checks.
 

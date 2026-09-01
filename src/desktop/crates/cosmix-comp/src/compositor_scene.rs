@@ -36,7 +36,8 @@ use crate::{
     },
     decoration::DecorationStartup,
     decoration_scene::{
-        DecorationDirtySurfaceIds, DecorationEntities, DecorationPlugin, remove_static_decoration,
+        DecorationDirtySurfaceIds, DecorationEntities, DecorationPlugin, decoration_damage_region,
+        remove_static_decoration,
     },
 };
 
@@ -653,7 +654,7 @@ fn apply_protocol_events(world: &mut World, events: Vec<ProtocolEvent>) {
                             .resource::<SurfaceEntities>()
                             .surfaces
                             .get(id)
-                            .and_then(|surface| surface_damage_region(surface.layout))
+                            .and_then(|surface| surface_damage_region(world, surface.layout))
                     })
                     .collect::<Vec<_>>();
                 mark_base_regions(world, damage);
@@ -679,9 +680,9 @@ fn apply_protocol_events(world: &mut World, events: Vec<ProtocolEvent>) {
                     .0
                     .push(watch);
             }
-            ProtocolEvent::CaptureKmsSourcesRetired => {
+            ProtocolEvent::CaptureKmsSourcesRetired { current } => {
                 if let Some(journal) = world.get_resource::<crate::capture::OutputDamageJournal>() {
-                    journal.retire_kms_sources();
+                    journal.retain_current_kms_sources(&current);
                 }
             }
             ProtocolEvent::RuntimeFailed(error) => {
@@ -1093,30 +1094,34 @@ fn mark_surface_change_damage(world: &World, id: SurfaceId, new_layout: SurfaceL
         .resource::<SurfaceEntities>()
         .surfaces
         .get(&id)
-        .and_then(|surface| surface_damage_region(surface.layout));
-    let new = surface_damage_region(new_layout);
+        .and_then(|surface| surface_damage_region(world, surface.layout));
+    let new = surface_damage_region(world, new_layout);
     mark_base_regions(world, old.into_iter().chain(new).collect::<Vec<_>>());
 }
 
 fn mark_removed_surface_damage(world: &World, id: SurfaceId) {
     let surface = world.resource::<SurfaceEntities>().surfaces.get(&id);
-    let old = surface.and_then(|surface| surface_damage_region(surface.layout));
+    let old = surface.and_then(|surface| surface_damage_region(world, surface.layout));
     mark_base_regions(world, old.into_iter().collect::<Vec<_>>());
 }
 
-fn surface_damage_region(layout: SurfaceLayout) -> Option<crate::capture::CaptureLogicalRegion> {
-    if !layout.visible || layout.width <= 0.0 || layout.height <= 0.0 {
-        return None;
-    }
-    Some(crate::capture::CaptureLogicalRegion {
-        x: layout.x,
-        y: layout.y,
-        width: layout.width,
-        height: layout.height,
+fn surface_damage_region(
+    world: &World,
+    layout: SurfaceLayout,
+) -> Option<crate::capture::DisplayedLogicalRegion> {
+    decoration_damage_region(world, layout).or_else(|| {
+        (layout.visible && layout.width > 0.0 && layout.height > 0.0).then_some(
+            crate::capture::DisplayedLogicalRegion {
+                x: layout.x,
+                y: layout.y,
+                width: layout.width,
+                height: layout.height,
+            },
+        )
     })
 }
 
-fn mark_base_regions(world: &World, rectangles: Vec<crate::capture::CaptureLogicalRegion>) {
+fn mark_base_regions(world: &World, rectangles: Vec<crate::capture::DisplayedLogicalRegion>) {
     if rectangles.is_empty() {
         return;
     }
@@ -1127,8 +1132,8 @@ fn mark_base_regions(world: &World, rectangles: Vec<crate::capture::CaptureLogic
 
 fn mark_cursor_regions(
     world: &World,
-    old: Option<crate::capture::CaptureLogicalRegion>,
-    new: Option<crate::capture::CaptureLogicalRegion>,
+    old: Option<crate::capture::DisplayedLogicalRegion>,
+    new: Option<crate::capture::DisplayedLogicalRegion>,
 ) {
     let rectangles = old.into_iter().chain(new).collect::<Vec<_>>();
     if rectangles.is_empty() {
@@ -1139,7 +1144,7 @@ fn mark_cursor_regions(
     }
 }
 
-fn capture_cursor_damage_bounds(world: &World) -> Option<crate::capture::CaptureLogicalRegion> {
+fn capture_cursor_damage_bounds(world: &World) -> Option<crate::capture::DisplayedLogicalRegion> {
     let cursor = world.resource::<CursorScene>();
     let (hotspot, logical_size) = match cursor.selection {
         ProjectedCursorSelection::Hidden => return None,
@@ -1155,7 +1160,7 @@ fn capture_cursor_damage_bounds(world: &World) -> Option<crate::capture::Capture
             )
         }
     };
-    Some(crate::capture::CaptureLogicalRegion {
+    Some(crate::capture::DisplayedLogicalRegion {
         x: cursor.position.x as f32 - hotspot.0 as f32,
         y: cursor.position.y as f32 - hotspot.1 as f32,
         width: logical_size.x,
@@ -2550,6 +2555,12 @@ pub(crate) fn client_content_z(rank: usize, surface_count: usize) -> f32 {
 }
 
 fn mark_decoration_dirty(world: &mut World, id: SurfaceId) {
+    let damage = world
+        .resource::<SurfaceEntities>()
+        .surfaces
+        .get(&id)
+        .and_then(|surface| surface_damage_region(world, surface.layout));
+    mark_base_regions(world, damage.into_iter().collect());
     if let Some(mut dirty) = world.get_resource_mut::<DecorationDirtySurfaceIds>() {
         dirty.0.insert(id);
     }
@@ -2673,7 +2684,11 @@ mod tests {
     use std::{
         fs::File,
         io::{self, Write},
-        sync::{Arc, Mutex, mpsc::SyncSender},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+            mpsc::SyncSender,
+        },
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
@@ -2692,6 +2707,8 @@ mod tests {
         },
     };
     use cosmix_deco::ChromeStyle;
+
+    static NEXT_CURSOR_SOCKET: AtomicU64 = AtomicU64::new(1);
 
     #[derive(Clone, Default)]
     struct LogCapture(Arc<Mutex<Vec<u8>>>);
@@ -3616,6 +3633,99 @@ mod tests {
             !lines[0].contains("rounded_coverage=false"),
             "the transient unclipped material must never be logged: {}",
             lines[0],
+        );
+    }
+
+    #[test]
+    fn titlebar_only_change_wakes_a_damage_waiter_above_client_content() {
+        let (mut app, sender) = scene_app();
+        let journal = crate::capture::OutputDamageJournal::default();
+        let source = crate::backend::CaptureSourceId::Nested {
+            output_name: "cosmix-nested-0".into(),
+        };
+        journal.register(
+            source.clone(),
+            (0, 0, 960, 640),
+            (960, 640),
+            (960, 640),
+            120,
+            smithay::utils::Transform::Normal,
+        );
+        app.insert_resource(journal.clone());
+        let id = SurfaceId(72);
+        let layout = SurfaceLayout {
+            x: 100.0,
+            y: 80.0,
+            width: 320.0,
+            height: 200.0,
+            z: SurfaceStackKey::normal(1),
+            source: None,
+            parent: None,
+            transform: SurfaceTransform::Normal,
+            visible: true,
+            toplevel: Some(ToplevelSceneState {
+                decoration: SceneDecorationMode::ServerSide,
+                focused: true,
+                committed_maximized: false,
+                window_geometry: SceneWindowGeometry {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 320.0,
+                    height: 200.0,
+                },
+                chrome_pointer: ChromePointerSceneState::default(),
+            }),
+        };
+        let snapshot = |title: &'static str| SurfaceSceneSnapshot {
+            layout,
+            kind: SceneSurfaceKind::Toplevel,
+            title: Some(Arc::from(title)),
+        };
+        publish(
+            &mut app,
+            &sender,
+            vec![ProtocolEvent::SurfaceUpserted {
+                id,
+                scene: snapshot("Before"),
+                frame: frame(1),
+            }],
+        );
+        let baseline = journal
+            .snapshot(
+                &source,
+                Some(0),
+                false,
+                crate::capture::CaptureRegion {
+                    x: 0,
+                    y: 0,
+                    width: 960,
+                    height: 640,
+                },
+            )
+            .0;
+        publish(
+            &mut app,
+            &sender,
+            vec![ProtocolEvent::SurfaceUpserted {
+                id,
+                scene: snapshot("After"),
+                frame: frame(1),
+            }],
+        );
+        let (_, damage) = journal.snapshot(
+            &source,
+            Some(baseline),
+            false,
+            crate::capture::CaptureRegion {
+                x: 0,
+                y: 0,
+                width: 960,
+                height: 80,
+            },
+        );
+        assert!(
+            !damage.is_empty(),
+            "a title change must wake a waiter covering only chrome above the client rect"
         );
     }
 
@@ -4603,7 +4713,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after Unix epoch")
             .as_nanos();
-        let socket_name = format!("cosmix-live-cursor-{}-{unique}", std::process::id());
+        let sequence = NEXT_CURSOR_SOCKET.fetch_add(1, Ordering::Relaxed);
+        let socket_name = format!(
+            "cosmix-live-cursor-{}-{unique}-{sequence}",
+            std::process::id()
+        );
         let mut runtime = real_shm_scene_runtime(&socket_name, (320, 240));
         let feed = runtime
             .take_client_scene_feed()

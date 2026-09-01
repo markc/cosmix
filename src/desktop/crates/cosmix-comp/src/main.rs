@@ -31,8 +31,8 @@ use bevy::{
     render::{
         Render, RenderApp, RenderScheduleOrder, RenderSystems,
         pipelined_rendering::{PipelinedRenderingPlugin, RenderExtractApp},
-        render_resource::PollType,
-        renderer::RenderDevice,
+        render_resource::{PollType, TextureViewId},
+        renderer::{RenderDevice, render_system},
         view::ExtractedWindows,
     },
     window::{
@@ -1232,7 +1232,7 @@ struct NestedPostPresent;
 
 #[derive(Resource, Default)]
 struct NestedPresentCandidate {
-    window: Option<Entity>,
+    acquisition: Option<capture::NestedCaptureAcquisition>,
     epochs: Vec<(u64, protocol::SecurityPresentationTarget)>,
     captures: Vec<capture::PendingCapturePresentation>,
 }
@@ -1270,7 +1270,13 @@ fn install_nested_security_presentation_completion(
         .init_schedule(NestedPostPresent)
         .add_systems(
             Render,
-            capture_nested_present_candidate
+            capture_nested_swapchain_acquisition
+                .in_set(RenderSystems::Render)
+                .before(render_system),
+        )
+        .add_systems(
+            Render,
+            stage_nested_capture_presentations
                 .in_set(RenderSystems::Render)
                 .after(capture::CaptureRenderSet),
         )
@@ -1281,75 +1287,74 @@ fn install_nested_security_presentation_completion(
         .insert_after(Render, NestedPostPresent);
 }
 
-fn capture_nested_present_candidate(
+fn capture_nested_swapchain_acquisition(
     pending: Res<NestedSecurityPresentation>,
     capture_pending: Res<capture::CapturePresentationPending>,
     windows: Res<ExtractedWindows>,
     mut candidate: ResMut<NestedPresentCandidate>,
 ) {
-    candidate.window = None;
+    candidate.acquisition = None;
     candidate.epochs.clear();
     candidate.captures.clear();
+    capture_pending.set_nested_acquisition(None);
     let Some(primary) = windows.primary else {
         return;
     };
-    let Some(_window) = windows.get(&primary) else {
+    let Some(window) = windows.get(&primary) else {
         return;
     };
-    let epochs = pending.snapshot();
-    let captures = capture_pending.take();
-    if epochs.is_empty() && captures.is_empty() {
+    let (Some(_texture), Some(texture_view)) = (
+        window.swap_chain_texture.as_ref(),
+        window.swap_chain_texture_view.as_ref(),
+    ) else {
         return;
+    };
+    let acquisition = capture::NestedCaptureAcquisition {
+        window: primary,
+        // Bevy creates a fresh paired view for every acquired surface texture.
+        // Its ID is therefore the observable identity of this exact acquisition.
+        texture_view: texture_view.id(),
+    };
+    candidate.acquisition = Some(acquisition);
+    capture_pending.set_nested_acquisition(Some(acquisition));
+    candidate.epochs = pending.snapshot();
+}
+
+fn stage_nested_capture_presentations(
+    capture_pending: Res<capture::CapturePresentationPending>,
+    mut candidate: ResMut<NestedPresentCandidate>,
+) {
+    // Nested capture records its presentation-bound copies inside render_system.
+    // Keep this S-1b ordering between acquisition proof and post-present proof.
+    if candidate.acquisition.is_some() {
+        candidate.captures = capture_pending.take();
     }
-    candidate.window = Some(primary);
-    candidate.epochs = epochs;
-    candidate.captures = captures;
 }
 
 fn complete_nested_security_presentation(
     pending: Res<NestedSecurityPresentation>,
     completion: Res<NestedPresentationCompletion>,
-    capture_pending: Res<capture::CapturePresentationPending>,
     render_device: Res<RenderDevice>,
     windows: Res<ExtractedWindows>,
     mut candidate: ResMut<NestedPresentCandidate>,
 ) {
-    let Some(window_id) = candidate.window.take() else {
+    let Some(acquisition) = candidate.acquisition.take() else {
         return;
     };
     let epochs = mem::take(&mut candidate.epochs);
     let captures = mem::take(&mut candidate.captures);
-    // `present()` consumes the acquired swapchain texture. If it remains,
-    // rendering or presentation was skipped and the epoch stays pending.
-    if windows
-        .get(&window_id)
-        .is_none_or(|window| window.swap_chain_texture.is_some())
-    {
-        capture_pending.publish(captures);
+    let acquisition_consumed = nested_swapchain_acquisition_was_consumed(acquisition, &windows);
+    complete_nested_capture_presentations(
+        &completion.capture_reporter,
+        captures,
+        acquisition,
+        acquisition_consumed,
+        acquisition_consumed
+            .then(monotonic_capture_timestamp)
+            .flatten(),
+    );
+    if !acquisition_consumed {
         return;
-    }
-    if let Some((seconds, nanoseconds)) = monotonic_capture_timestamp() {
-        for capture in captures {
-            completion
-                .capture_reporter
-                .presented(capture::CapturePresented {
-                    id: capture.id,
-                    source_id: capture.source_id,
-                    frame_token: capture.frame_token,
-                    generation: capture.generation,
-                    security_epoch: capture.security_epoch,
-                    seconds,
-                    nanoseconds,
-                });
-        }
-    } else {
-        for capture in captures {
-            completion.capture_reporter.failed(
-                capture.id,
-                capture.generation,
-                capture.security_epoch,
-            );
-        }
     }
     if let Err(error) = poll_nested_security_gpu(epochs.len(), || {
         render_device.poll(PollType::wait_indefinitely())
@@ -1372,6 +1377,57 @@ fn complete_nested_security_presentation(
         }
     }
     pending.complete(&reported);
+}
+
+fn nested_swapchain_acquisition_was_consumed(
+    acquisition: capture::NestedCaptureAcquisition,
+    windows: &ExtractedWindows,
+) -> bool {
+    let Some(window) = windows.get(&acquisition.window) else {
+        return false;
+    };
+    acquired_texture_identity_was_consumed(
+        Some(acquisition.texture_view),
+        window
+            .swap_chain_texture_view
+            .as_ref()
+            .map(|view| view.id()),
+        window.swap_chain_texture.is_some(),
+    )
+}
+
+fn complete_nested_capture_presentations(
+    reporter: &CaptureCompletionReporter,
+    captures: Vec<capture::PendingCapturePresentation>,
+    acquisition: capture::NestedCaptureAcquisition,
+    acquisition_consumed: bool,
+    timestamp: Option<(u64, u32)>,
+) {
+    for pending in captures {
+        let Some((seconds, nanoseconds)) = timestamp
+            .filter(|_| acquisition_consumed && pending.nested_acquisition == Some(acquisition))
+        else {
+            reporter.failed(pending.id, pending.generation, pending.security_epoch);
+            continue;
+        };
+        reporter.presented(capture::CapturePresented {
+            id: pending.id,
+            source_id: pending.source_id,
+            frame_token: pending.frame_token,
+            generation: pending.generation,
+            security_epoch: pending.security_epoch,
+            seconds,
+            nanoseconds,
+        });
+    }
+}
+
+fn acquired_texture_identity_was_consumed(
+    acquired: Option<TextureViewId>,
+    observed: Option<TextureViewId>,
+    swapchain_texture_remains: bool,
+) -> bool {
+    !swapchain_texture_remains && acquired.is_some() && acquired == observed
 }
 
 fn poll_nested_security_gpu<T, E>(
@@ -1413,10 +1469,132 @@ fn finish_wayland_frame(world: &mut World) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use bevy::{
+        app::TerminalCtrlCHandlerPlugin,
+        ecs::{
+            schedule::{NodeId, ScheduleGraph},
+            system::{IntoSystem, System},
+        },
+        log::LogPlugin,
+        render::{
+            RenderPlugin,
+            renderer::{
+                RenderAdapter, RenderAdapterInfo, RenderInstance, RenderQueue, WgpuWrapper,
+            },
+            settings::RenderCreation,
+        },
+        window::ExitCondition,
+        winit::WinitPlugin,
+    };
 
     fn parse(args: &[&str]) -> Result<ParseOutcome, String> {
         Cli::parse(args.iter().map(OsString::from))
+    }
+
+    fn noop_render_plugin() -> RenderPlugin {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::NOOP,
+            backend_options: wgpu::BackendOptions {
+                noop: wgpu::NoopBackendOptions { enable: true },
+                ..Default::default()
+            },
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = bevy::tasks::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        )
+        .expect("noop render adapter exists");
+        let adapter_info = adapter.get_info();
+        let (device, queue) =
+            bevy::tasks::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("noop render device exists");
+        RenderPlugin {
+            render_creation: RenderCreation::manual(
+                device.into(),
+                RenderQueue(Arc::new(WgpuWrapper::new(queue))),
+                RenderAdapterInfo(WgpuWrapper::new(adapter_info)),
+                RenderAdapter(Arc::new(WgpuWrapper::new(adapter))),
+                RenderInstance(Arc::new(WgpuWrapper::new(instance))),
+            ),
+            synchronous_pipeline_compilation: true,
+            ..Default::default()
+        }
+    }
+
+    fn production_nested_render_app() -> (App, WaylandRuntime) {
+        let mut app = App::new();
+        app.add_plugins(
+            DefaultPlugins
+                .build()
+                .disable::<LogPlugin>()
+                .disable::<WinitPlugin>()
+                .disable::<PipelinedRenderingPlugin>()
+                .disable::<TerminalCtrlCHandlerPlugin>()
+                .set(WindowPlugin {
+                    primary_window: None,
+                    exit_condition: ExitCondition::DontExit,
+                    close_when_requested: false,
+                    ..Default::default()
+                })
+                .set(noop_render_plugin()),
+        )
+        .add_plugins(capture::CaptureServicePlugin);
+        let runtime = WaylandRuntime::with_test_ecs_action(EcsAction::ExitNestedCompositor);
+        install_nested_security_presentation_completion(
+            &mut app,
+            runtime.security_presentation_reporter(),
+            runtime.capture_completion_reporter(),
+        );
+        (app, runtime)
+    }
+
+    fn system_node<Out, Marker>(
+        graph: &ScheduleGraph,
+        system: impl IntoSystem<(), Out, Marker>,
+    ) -> NodeId {
+        let system_type = IntoSystem::into_system(system).system_type();
+        graph
+            .systems
+            .iter()
+            .find(|(_, candidate, _)| candidate.system_type() == system_type)
+            .map(|(key, _, _)| NodeId::System(key))
+            .expect("production system is present in the render schedule")
+    }
+
+    fn has_configured_ordering(graph: &ScheduleGraph, before: NodeId, after: NodeId) -> bool {
+        use bevy::ecs::schedule::graph::Direction;
+
+        let dependency = graph.dependency().graph();
+        let hierarchy = graph.hierarchy().graph();
+        dependency.contains_edge(before, after)
+            || hierarchy
+                .neighbors_directed(before, Direction::Incoming)
+                .any(|set| dependency.contains_edge(set, after))
+            || hierarchy
+                .neighbors_directed(after, Direction::Incoming)
+                .any(|set| dependency.contains_edge(before, set))
+    }
+
+    fn pending_capture(
+        id: u64,
+        acquisition: capture::NestedCaptureAcquisition,
+    ) -> capture::PendingCapturePresentation {
+        capture::PendingCapturePresentation {
+            id: capture::CaptureId(id),
+            source_id: backend::CaptureSourceId::Nested {
+                output_name: "nested-order-test".into(),
+            },
+            frame_token: id,
+            generation: 1,
+            security_epoch: 1,
+            deadline: std::time::Instant::now() + Duration::from_secs(30),
+            nested_acquisition: Some(acquisition),
+        }
     }
 
     #[test]
@@ -1435,6 +1613,160 @@ mod tests {
         })
         .unwrap();
         assert_eq!(polls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn nested_presented_epoch_requires_the_same_acquired_texture_to_be_consumed() {
+        let acquired = TextureViewId::new();
+        let replacement = TextureViewId::new();
+
+        assert!(!acquired_texture_identity_was_consumed(
+            None,
+            Some(acquired),
+            false
+        ));
+        assert!(!acquired_texture_identity_was_consumed(
+            Some(acquired),
+            Some(acquired),
+            true
+        ));
+        assert!(!acquired_texture_identity_was_consumed(
+            Some(acquired),
+            Some(replacement),
+            false
+        ));
+        assert!(acquired_texture_identity_was_consumed(
+            Some(acquired),
+            Some(acquired),
+            false
+        ));
+    }
+
+    #[test]
+    fn production_nested_render_schedule_preserves_acquire_capture_present_order() {
+        let (app, _runtime) = production_nested_render_app();
+        let render_app = app.sub_app(RenderApp);
+        let schedule = render_app
+            .get_schedule(Render)
+            .expect("production Render schedule is installed");
+        let graph = schedule.graph();
+        let acquisition = system_node(graph, capture_nested_swapchain_acquisition);
+        let render = system_node(graph, render_system);
+        assert!(
+            has_configured_ordering(graph, acquisition, render),
+            "production acquisition must have an explicit edge before render_system"
+        );
+
+        let staging = system_node(graph, stage_nested_capture_presentations);
+        let capture_set = graph
+            .system_sets
+            .iter()
+            .find(|(_, set, _)| format!("{set:?}") == "CaptureRenderSet")
+            .map(|(key, _, _)| NodeId::Set(key))
+            .expect("production CaptureRenderSet is present");
+        assert!(
+            has_configured_ordering(graph, capture_set, staging),
+            "production staging must have an explicit edge after CaptureRenderSet"
+        );
+        let order = render_app.world().resource::<RenderScheduleOrder>();
+        assert!(
+            order
+                .labels
+                .windows(2)
+                .any(|labels| { (*labels[0]).eq(&Render) && (*labels[1]).eq(&NestedPostPresent) }),
+            "completion must run in the schedule immediately after Render"
+        );
+    }
+
+    #[test]
+    fn unconsumed_nested_capture_fails_and_the_next_frame_keeps_its_own_timestamp() {
+        let (_events, feed) = protocol::ClientSceneFeed::test_channel();
+        let reporter = feed.capture_completion_reporter();
+        let window = World::new().spawn_empty().id();
+        let first = capture::NestedCaptureAcquisition {
+            window,
+            texture_view: TextureViewId::new(),
+        };
+        let second = capture::NestedCaptureAcquisition {
+            window,
+            texture_view: TextureViewId::new(),
+        };
+        let pending = capture::CapturePresentationPending::default();
+
+        pending.publish([pending_capture(1, first)]);
+        complete_nested_capture_presentations(&reporter, pending.take(), first, false, None);
+        assert!(
+            pending.take().is_empty(),
+            "failed work must not be republished"
+        );
+        assert_eq!(
+            feed.capture_outcomes_for_test(),
+            [protocol::CaptureTestOutcome::Failed(capture::CaptureId(1))]
+        );
+
+        pending.publish([pending_capture(2, second)]);
+        complete_nested_capture_presentations(
+            &reporter,
+            pending.take(),
+            second,
+            true,
+            Some((83, 901)),
+        );
+        assert_eq!(
+            feed.capture_outcomes_for_test(),
+            [protocol::CaptureTestOutcome::Presented {
+                id: capture::CaptureId(2),
+                seconds: 83,
+                nanoseconds: 901,
+            }]
+        );
+    }
+
+    #[test]
+    fn mismatched_nested_acquisition_never_reaches_the_presentation_latch() {
+        let (_events, feed) = protocol::ClientSceneFeed::test_channel();
+        let reporter = feed.capture_completion_reporter();
+        let window = World::new().spawn_empty().id();
+        let encoded = capture::NestedCaptureAcquisition {
+            window,
+            texture_view: TextureViewId::new(),
+        };
+        let consumed = capture::NestedCaptureAcquisition {
+            window,
+            texture_view: TextureViewId::new(),
+        };
+
+        complete_nested_capture_presentations(
+            &reporter,
+            vec![pending_capture(3, encoded)],
+            consumed,
+            true,
+            Some((97, 123)),
+        );
+
+        assert_eq!(
+            feed.capture_outcomes_for_test(),
+            [protocol::CaptureTestOutcome::Failed(capture::CaptureId(3))]
+        );
+    }
+
+    #[test]
+    fn nested_epoch_without_swapchain_acquisition_stays_pending_and_sends_no_ack() {
+        let pending = NestedSecurityPresentation::default();
+        let presentation = protocol::SecurityPresentationTarget {
+            output: "Offline-1".into(),
+            scene: protocol::SecurityPresentationScene::Blank,
+        };
+        pending.publish(71, [presentation.clone()]);
+        let acknowledgements = AtomicUsize::new(0);
+
+        if acquired_texture_identity_was_consumed(None, None, false) {
+            acknowledgements.fetch_add(1, Ordering::Relaxed);
+            pending.complete(&[(71, presentation.clone())]);
+        }
+
+        assert_eq!(acknowledgements.load(Ordering::Relaxed), 0);
+        assert_eq!(pending.snapshot(), [(71, presentation)]);
     }
 
     #[test]
