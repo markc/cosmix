@@ -2527,7 +2527,7 @@ version = "0.2.0"
 
 [[package]]
 name = "cosmix-comp"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "bevy",
  "chrono",
@@ -2859,7 +2859,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-wgpu-dmabuf"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "ash",
  "bevy",

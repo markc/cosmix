@@ -55,11 +55,14 @@ Stock wgpu-core 29.0.4 records `create_texture_from_hal` textures as
 `UNINITIALIZED`, making the first sample derive Vulkan `UNDEFINED` and allowing
 the client contents to be discarded. The workspace patches wgpu and wgpu-core
 with `create_texture_from_hal_with_initial_usage`; this importer passes
-`TextureUses::RESOURCE`, matching the completed
-`GENERAL -> SHADER_READ_ONLY_OPTIMAL` raw acquire barrier. The ordinary wgpu
-HAL-import API remains unchanged and still seeds `UNINITIALIZED`. Provenance,
-the exact patch boundary and the mandatory `cargo tree` assertion are recorded
-in `vendor/README.md`.
+`TextureUses::RESOURCE`, matching the
+`GENERAL -> SHADER_READ_ONLY_OPTIMAL` acquire barrier recorded into a
+wgpu-owned command buffer before installation. Sampled imports and capture
+destinations submit ownership barriers only through `wgpu::Queue`; no raw
+Vulkan queue submission bypasses wgpu's cross-thread serialisation. The
+ordinary wgpu HAL-import API remains unchanged and still seeds `UNINITIALIZED`.
+Provenance, the exact patch boundary and the mandatory `cargo tree` assertion
+are recorded in `vendor/README.md`.
 
 The registration itself is owned by the main-world surface. Render extraction
 may temporarily have no `GpuImage`; that defers import rather than removing the

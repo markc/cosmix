@@ -338,7 +338,6 @@ struct ImportRegistry {
     retired: HashMap<AssetId<Image>, Vec<ImportedTexture>>,
     cache: ImportCache<CachedTexture>,
     ever_imported: bool,
-    preacquired: HashSet<usize>,
     local_owned: HashSet<usize>,
     ownership_retired: Vec<ImportedTexture>,
     debug: DmabufDebugState,
@@ -960,9 +959,6 @@ fn apply_imports(
                 Ok(ready) => {
                     if ready.newly_imported {
                         record_successful_import(&mut imports.debug, fourcc, instrumentation);
-                        imports
-                            .preacquired
-                            .insert(Arc::as_ptr(&ready.current.backing) as usize);
                     }
                     imports.active.insert(id, ImportState::Imported(ready));
                 }
@@ -1016,7 +1012,6 @@ struct AcquireBatch<T> {
 
 fn pending_acquire_batch<T>(
     active: &HashMap<AssetId<Image>, ImportState<ImportedUse<T>>>,
-    preacquired: &HashSet<usize>,
     local_owned: &HashSet<usize>,
 ) -> AcquireBatch<T> {
     let mut submitted_seen = HashSet::new();
@@ -1040,7 +1035,7 @@ fn pending_acquire_batch<T>(
         if ready.probe_after_acquire {
             batch.probe_backings.push(Arc::clone(backing));
         }
-        if preacquired.contains(&identity) || local_owned.contains(&identity) {
+        if local_owned.contains(&identity) {
             batch.ready_without_submission.insert(*id);
         } else {
             batch.submitted_ids.insert(*id);
@@ -1221,19 +1216,19 @@ fn acquire_external_images(
             .0
             .lock()
             .expect("DMA-BUF import registry mutex poisoned");
-        pending_acquire_batch(&imports.active, &imports.preacquired, &imports.local_owned)
+        pending_acquire_batch(&imports.active, &imports.local_owned)
     };
     let barrier_result = submit_ownership_barrier(
         &device,
+        &queue,
         &batch.submitted_backings,
         OwnershipDirection::Acquire,
-    );
+    )
+    .map(|_| ());
     let mut imports = imports
         .0
         .lock()
         .expect("DMA-BUF import registry mutex poisoned");
-    imports.preacquired.clear();
-
     if barrier_result.is_err() {
         evict_cache_backings(&mut imports.cache, &batch.submitted_backings);
     }
@@ -1591,8 +1586,21 @@ fn release_external_images(
         return;
     }
     transition_imported_images_to_resource(&device, &queue, &release_backings);
-    let barrier_result =
-        submit_ownership_barrier(&device, &release_backings, OwnershipDirection::Release);
+    let barrier_result = submit_ownership_barrier(
+        &device,
+        &queue,
+        &release_backings,
+        OwnershipDirection::Release,
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|submission| {
+        let Some(submission) = submission else {
+            return Ok(());
+        };
+        crate::WgpuWaitForSubmittedWork::new(device.clone())
+            .wait_for_submission(submission, crate::RETIREMENT_WAIT_TIMEOUT)
+            .map_err(|error| error.to_string())
+    });
     let mut imports = imports
         .0
         .lock()
@@ -1632,7 +1640,7 @@ fn transition_imported_images_to_resource(
         return;
     }
 
-    // The patched HAL import path seeds RESOURCE, matching the raw acquire.
+    // The patched HAL import path seeds RESOURCE, matching the encoded acquire.
     // Keep it there before the shader-read -> GENERAL ownership release even
     // when a sprite was culled and therefore never sampled this frame.
     let mut encoder = render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1650,21 +1658,29 @@ fn transition_imported_images_to_resource(
 }
 
 #[derive(Clone, Copy)]
-enum OwnershipDirection {
+pub(crate) enum OwnershipDirection {
     Acquire,
     Release,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum OwnershipRole {
+    Sampled,
+    CaptureDestination,
+}
+
 fn submit_ownership_barrier(
     render_device: &RenderDevice,
+    render_queue: &RenderQueue,
     backings: &[Arc<CachedTexture>],
     direction: OwnershipDirection,
-) -> Result<(), ImportError> {
+) -> Result<Option<wgpu::SubmissionIndex>, ImportError> {
     let images = backings
         .iter()
         .filter_map(|backing| {
-            // SAFETY: We only copy the Vulkan handle. `backings` retains every
-            // owning wgpu texture until the synchronous submission completes.
+            // SAFETY: We only copy the Vulkan handle. The import registry keeps
+            // every backing alive across acquire submission; release waits for
+            // its exact submission before completing or strands the use.
             unsafe {
                 backing
                     .texture
@@ -1674,143 +1690,132 @@ fn submit_ownership_barrier(
         })
         .collect::<Vec<_>>();
     if images.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
-    // SAFETY: All Vulkan work is submitted on wgpu's own queue from the render
-    // thread, and the fence is waited before temporary command resources drop.
+    let label = match direction {
+        OwnershipDirection::Acquire => "acquire sampled DMA-BUF ownership",
+        OwnershipDirection::Release => "release sampled DMA-BUF ownership",
+    };
+    let mut encoder = render_device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+    // SAFETY: The barrier is recorded into a wgpu-owned command buffer. The
+    // only submission is `RenderQueue::submit`, so wgpu remains the single
+    // authority which serialises access to the externally synchronised queue.
     unsafe {
-        let Some(device) = render_device.wgpu_device().as_hal::<Vulkan>() else {
-            return Err(ImportError::NotVulkan);
-        };
-        submit_raw_ownership_barrier(&device, &images, direction)?;
+        encode_ownership_barrier(
+            render_device,
+            &mut encoder,
+            &images,
+            direction,
+            OwnershipRole::Sampled,
+        )?;
     }
-    Ok(())
+    Ok(Some(render_queue.submit([encoder.finish()])))
 }
 
-unsafe fn submit_raw_ownership_barrier(
-    device: &wgpu_hal::vulkan::Device,
+pub(crate) unsafe fn encode_ownership_barrier(
+    render_device: &RenderDevice,
+    encoder: &mut wgpu::CommandEncoder,
     images: &[vk::Image],
     direction: OwnershipDirection,
+    role: OwnershipRole,
 ) -> Result<(), ImportError> {
-    let raw = device.raw_device();
-    unsafe {
-        let pool = raw.create_command_pool(
-            &vk::CommandPoolCreateInfo::default()
-                .flags(vk::CommandPoolCreateFlags::TRANSIENT)
-                .queue_family_index(device.queue_family_index()),
-            None,
-        )?;
-        let allocated = match raw.allocate_command_buffers(
-            &vk::CommandBufferAllocateInfo::default()
-                .command_pool(pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1),
-        ) {
-            Ok(allocated) => allocated,
-            Err(error) => {
-                raw.destroy_command_pool(pool, None);
-                return Err(ImportError::Vulkan(error));
-            }
-        };
-        let command_buffer = match allocated.into_iter().next() {
-            Some(command_buffer) => command_buffer,
-            None => {
-                raw.destroy_command_pool(pool, None);
-                return Err(ImportError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED));
-            }
-        };
-        if let Err(error) = raw.begin_command_buffer(
-            command_buffer,
-            &vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        ) {
-            raw.destroy_command_pool(pool, None);
-            return Err(ImportError::Vulkan(error));
-        }
-
-        let (src_stage, dst_stage) = match direction {
-            OwnershipDirection::Acquire => (
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-            ),
-            OwnershipDirection::Release => (
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            ),
-        };
-        let barriers = images
-            .iter()
-            .map(|image| {
-                let (src_family, dst_family, old_layout, new_layout, src_access, dst_access) =
-                    match direction {
-                        OwnershipDirection::Acquire => (
-                            vk::QUEUE_FAMILY_FOREIGN_EXT,
-                            device.queue_family_index(),
-                            vk::ImageLayout::GENERAL,
-                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                            vk::AccessFlags::empty(),
-                            vk::AccessFlags::SHADER_READ,
-                        ),
-                        OwnershipDirection::Release => (
-                            device.queue_family_index(),
-                            vk::QUEUE_FAMILY_FOREIGN_EXT,
-                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                            vk::ImageLayout::GENERAL,
-                            vk::AccessFlags::SHADER_READ,
-                            vk::AccessFlags::empty(),
-                        ),
-                    };
-                vk::ImageMemoryBarrier::default()
-                    .src_access_mask(src_access)
-                    .dst_access_mask(dst_access)
-                    .old_layout(old_layout)
-                    .new_layout(new_layout)
-                    .src_queue_family_index(src_family)
-                    .dst_queue_family_index(dst_family)
-                    .image(*image)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1),
-                    )
-            })
-            .collect::<Vec<_>>();
-        raw.cmd_pipeline_barrier(
-            command_buffer,
-            src_stage,
-            dst_stage,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &barriers,
-        );
-        if let Err(error) = raw.end_command_buffer(command_buffer) {
-            raw.destroy_command_pool(pool, None);
-            return Err(ImportError::Vulkan(error));
-        }
-        let fence = match raw.create_fence(&vk::FenceCreateInfo::default(), None) {
-            Ok(fence) => fence,
-            Err(error) => {
-                raw.destroy_command_pool(pool, None);
-                return Err(ImportError::Vulkan(error));
-            }
-        };
-        let command_buffers = [command_buffer];
-        let submit = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
-        let result = raw.queue_submit(device.raw_queue(), &submit, fence);
-        if let Err(submit_error) = result {
-            raw.destroy_fence(fence, None);
-            raw.destroy_command_pool(pool, None);
-            return Err(ImportError::Vulkan(submit_error));
-        }
-        let wait_result = raw.wait_for_fences(&[fence], true, u64::MAX);
-        raw.destroy_fence(fence, None);
-        raw.destroy_command_pool(pool, None);
-        wait_result?;
+    if images.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    let Some(device) = (unsafe { render_device.wgpu_device().as_hal::<Vulkan>() }) else {
+        return Err(ImportError::NotVulkan);
+    };
+    let (src_stage, dst_stage, barriers) =
+        ownership_barriers(device.queue_family_index(), images, direction, role);
+    unsafe {
+        encoder.as_hal_mut::<Vulkan, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.ok_or(ImportError::NotVulkan)?;
+            device.raw_device().cmd_pipeline_barrier(
+                hal_encoder.raw_handle(),
+                src_stage,
+                dst_stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barriers,
+            );
+            Ok(())
+        })
+    }
+}
+
+fn ownership_barriers(
+    queue_family_index: u32,
+    images: &[vk::Image],
+    direction: OwnershipDirection,
+    role: OwnershipRole,
+) -> (
+    vk::PipelineStageFlags,
+    vk::PipelineStageFlags,
+    Vec<vk::ImageMemoryBarrier<'static>>,
+) {
+    // Pinned wgpu 29.0.4 maps RESOURCE to SHADER_READ_ONLY_OPTIMAL and
+    // COPY_DST to TRANSFER_DST_OPTIMAL. Each imported tracker is seeded with
+    // its matching TextureUses state, and a first use equal to that seed must
+    // emit no wgpu barrier: wgpu cannot see the raw barriers recorded above.
+    // Re-verify all three facts whenever the exact wgpu pin moves.
+    let (local_layout, local_access, local_stage) = match role {
+        OwnershipRole::Sampled => (
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::AccessFlags::SHADER_READ,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+        ),
+        OwnershipRole::CaptureDestination => (
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::PipelineStageFlags::TRANSFER,
+        ),
+    };
+    let (src_stage, dst_stage) = match direction {
+        OwnershipDirection::Acquire => (vk::PipelineStageFlags::TOP_OF_PIPE, local_stage),
+        OwnershipDirection::Release => (local_stage, vk::PipelineStageFlags::BOTTOM_OF_PIPE),
+    };
+    let barriers = images
+        .iter()
+        .map(|image| {
+            let (src_family, dst_family, old_layout, new_layout, src_access, dst_access) =
+                match direction {
+                    OwnershipDirection::Acquire => (
+                        vk::QUEUE_FAMILY_FOREIGN_EXT,
+                        queue_family_index,
+                        vk::ImageLayout::GENERAL,
+                        local_layout,
+                        vk::AccessFlags::empty(),
+                        local_access,
+                    ),
+                    OwnershipDirection::Release => (
+                        queue_family_index,
+                        vk::QUEUE_FAMILY_FOREIGN_EXT,
+                        local_layout,
+                        vk::ImageLayout::GENERAL,
+                        local_access,
+                        vk::AccessFlags::empty(),
+                    ),
+                };
+            vk::ImageMemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(dst_access)
+                .old_layout(old_layout)
+                .new_layout(new_layout)
+                .src_queue_family_index(src_family)
+                .dst_queue_family_index(dst_family)
+                .image(*image)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                )
+        })
+        .collect();
+    (src_stage, dst_stage, barriers)
 }
 
 fn texture_descriptor(
@@ -1908,12 +1913,6 @@ fn import_texture(
                 },
             &[],
         )?;
-        if let Err(error) =
-            submit_raw_ownership_barrier(&device, &[image], OwnershipDirection::Acquire)
-        {
-            cleanup_vulkan_import(&device, image, &memories);
-            return Err(error);
-        }
         if let Some(strides) = &strides {
             info!(
                 buffer_id = instrumentation.buffer_id.0,
@@ -1947,10 +1946,12 @@ fn import_texture(
         )
     };
     let (wgpu_texture, tracker_seed) = unsafe {
-        // The fallible raw acquire above completed GENERAL ->
-        // SHADER_READ_ONLY_OPTIMAL before this call claims RESOURCE in
-        // wgpu-core. An acquire failure returns through the ordinary import
-        // failure path without installing or sampling this texture.
+        // Claim RESOURCE in wgpu-core without emitting a HAL transition. The
+        // following Acquire system records GENERAL/FOREIGN -> Vulkan
+        // SHADER_READ_ONLY_OPTIMAL into a wgpu-owned command buffer before this
+        // texture can be installed or sampled; RESOURCE is the matching wgpu
+        // tracker use. An acquire failure follows the ordinary import failure
+        // path.
         render_device
             .wgpu_device()
             .create_texture_from_hal_with_initial_usage::<Vulkan>(
@@ -2298,6 +2299,46 @@ mod tests {
             );
             self.dropped.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn capture_ownership_barriers_use_foreign_and_transfer() {
+        use ash::vk::Handle;
+
+        let image = vk::Image::from_raw(7);
+        let (src_stage, dst_stage, acquire) = ownership_barriers(
+            3,
+            &[image],
+            OwnershipDirection::Acquire,
+            OwnershipRole::CaptureDestination,
+        );
+        assert_eq!(src_stage, vk::PipelineStageFlags::TOP_OF_PIPE);
+        assert_eq!(dst_stage, vk::PipelineStageFlags::TRANSFER);
+        assert_eq!(
+            acquire[0].src_queue_family_index,
+            vk::QUEUE_FAMILY_FOREIGN_EXT
+        );
+        assert_eq!(acquire[0].dst_queue_family_index, 3);
+        assert_eq!(acquire[0].old_layout, vk::ImageLayout::GENERAL);
+        assert_eq!(acquire[0].new_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        assert_eq!(acquire[0].dst_access_mask, vk::AccessFlags::TRANSFER_WRITE);
+
+        let (src_stage, dst_stage, release) = ownership_barriers(
+            3,
+            &[image],
+            OwnershipDirection::Release,
+            OwnershipRole::CaptureDestination,
+        );
+        assert_eq!(src_stage, vk::PipelineStageFlags::TRANSFER);
+        assert_eq!(dst_stage, vk::PipelineStageFlags::BOTTOM_OF_PIPE);
+        assert_eq!(release[0].src_queue_family_index, 3);
+        assert_eq!(
+            release[0].dst_queue_family_index,
+            vk::QUEUE_FAMILY_FOREIGN_EXT
+        );
+        assert_eq!(release[0].old_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        assert_eq!(release[0].new_layout, vk::ImageLayout::GENERAL);
+        assert_eq!(release[0].src_access_mask, vk::AccessFlags::TRANSFER_WRITE);
     }
 
     struct FailingImportPlatform;
@@ -2907,7 +2948,6 @@ mod tests {
     struct OwnershipCadenceHarness {
         active: HashMap<AssetId<Image>, ImportState<ImportedUse<usize>>>,
         cache: ImportCache<usize>,
-        preacquired: HashSet<usize>,
         local_owned: HashSet<usize>,
         ownership_retired: Vec<ImportedUse<usize>>,
         acquire_submissions: usize,
@@ -2916,8 +2956,7 @@ mod tests {
     }
 
     fn run_rendered_ownership_update(mut harness: ResMut<OwnershipCadenceHarness>) {
-        let batch =
-            pending_acquire_batch(&harness.active, &harness.preacquired, &harness.local_owned);
+        let batch = pending_acquire_batch(&harness.active, &harness.local_owned);
         if !batch.submitted_backings.is_empty() {
             harness.acquire_submissions += 1;
         }
@@ -2929,7 +2968,6 @@ mod tests {
         ) else {
             panic!("synthetic acquire succeeds");
         };
-        harness.preacquired.clear();
         for backing in &batch.ready_backings {
             harness.local_owned.insert(Arc::as_ptr(backing) as usize);
         }
@@ -3006,11 +3044,9 @@ mod tests {
         let harness = OwnershipCadenceHarness {
             active: HashMap::from([(image_id, ImportState::Imported(first))]),
             cache,
-            preacquired: HashSet::from([first_identity]),
             local_owned: HashSet::new(),
             ownership_retired: Vec::new(),
-            // Production performs the fresh-import acquire inside import_texture.
-            acquire_submissions: 1,
+            acquire_submissions: 0,
             release_submissions: 0,
             sampled_updates: 0,
         };
@@ -3469,7 +3505,7 @@ mod tests {
                 .lock()
                 .expect("DMA-BUF import registry mutex is available");
             registry
-                .preacquired
+                .local_owned
                 .insert(Arc::as_ptr(&replacement) as usize);
             registry.active.insert(
                 installed_id,
@@ -3694,7 +3730,7 @@ mod tests {
             assert!(!ready.newly_imported, "both ring buffers stay cached");
             active.insert(image_id, ImportState::Imported(ready));
 
-            let batch = pending_acquire_batch(&active, &HashSet::new(), &local_owned);
+            let batch = pending_acquire_batch(&active, &local_owned);
             assert_eq!(batch.submitted_ids, HashSet::from([image_id]));
             let Ok(updates) = complete_acquire(
                 &mut active,
@@ -3968,7 +4004,7 @@ mod tests {
                 )),
             ),
         ]);
-        let batch = pending_acquire_batch(&active, &HashSet::new(), &HashSet::new());
+        let batch = pending_acquire_batch(&active, &HashSet::new());
         assert_eq!(batch.submitted_ids, HashSet::from([failed_id]));
         evict_cache_backings(&mut cache, &batch.submitted_backings);
 
@@ -4077,12 +4113,10 @@ mod tests {
 
         let mut images = Assets::<Image>::default();
         let image_id = images.add(Image::default()).id();
-        let fresh_identity = Arc::as_ptr(&ready.current.backing) as usize;
         let active = HashMap::from([(image_id, ImportState::Imported(ready))]);
-        let batch =
-            pending_acquire_batch(&active, &HashSet::from([fresh_identity]), &HashSet::new());
-        assert!(batch.submitted_backings.is_empty());
-        assert_eq!(batch.ready_without_submission, HashSet::from([image_id]));
+        let batch = pending_acquire_batch(&active, &HashSet::new());
+        assert_eq!(batch.submitted_ids, HashSet::from([image_id]));
+        assert!(batch.ready_without_submission.is_empty());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-wgpu-dmabuf"
-version = "0.12.0"
+version = "0.13.0"
 description = "DMA-BUF to Bevy/wgpu bridge for the CosMix compositor"
 edition = "2024"
 rust-version = "1.95"
@@ -18,6 +18,9 @@ drm-fourcc = "=2.2.0"
 libc = "0.2"
 thiserror = "2"
 tracing = "0.1"
+# import.rs ownership barriers rely on wgpu 29.0.4's RESOURCE/COPY_DST Vulkan
+# layout mappings and barrier-free first matching use; re-verify before moving
+# the three exact wgpu-family pins below.
 wgpu = { version = "=29.0.4", default-features = false, features = ["std", "vulkan"] }
 wgpu-hal = "=29.0.4"
 wgpu-types = "=29.0.4"

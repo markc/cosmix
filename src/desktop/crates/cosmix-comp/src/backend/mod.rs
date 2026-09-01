@@ -93,6 +93,15 @@ pub(crate) enum CaptureSourceId {
     Kms { key: OutputKey, generation: u64 },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CaptureDmabufAdvertisement {
+    pub(crate) fourcc: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) allowed_modifiers: Vec<u64>,
+    pub(crate) drm_device: u64,
+}
+
 /// Immutable output identity and geometry captured when a screencopy frame is
 /// advertised. A later identity, mode, scale or transform change fails the
 /// frame instead of mutating the layout promised to the client.
@@ -106,6 +115,7 @@ pub(crate) struct CaptureSourceSnapshot {
     pub(crate) scale120: u32,
     pub(crate) transform: smithay::utils::Transform,
     pub(crate) generation: u64,
+    pub(crate) dmabuf: Option<CaptureDmabufAdvertisement>,
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -317,6 +327,7 @@ impl BackendData {
                     scale120,
                     transform: smithay::utils::Transform::Normal,
                     generation: 1,
+                    dmabuf: None,
                 })
             }
             Self::Kms(data) => {
@@ -364,6 +375,7 @@ impl BackendData {
                         scale120,
                         transform,
                         generation,
+                        dmabuf: None,
                     })
                 }
                 #[cfg(not(any(all(feature = "kms-live", not(test)), test)))]

@@ -765,12 +765,18 @@ fn assert_non_pipelined_rendering(app: &App) -> Result<(), super::kms_live::KmsL
 #[cfg(all(feature = "kms-live", not(test)))]
 fn build_live_render_app(
     renderer: cosmix_wgpu_dmabuf::ManualVulkanRenderer,
+    capture_bridge: cosmix_wgpu_dmabuf::CaptureDestinationBridge,
+    capture_advertisements: crate::capture::CaptureAdvertisementRegistry,
     scene_mode: LiveSceneMode,
     decoration: DecorationStartup,
 ) -> Result<App, super::kms_live::KmsLiveError> {
     let mut app = App::new();
     init_chrome_font_cx(&mut app);
     app.insert_resource(decoration)
+        .insert_resource(capture_advertisements)
+        .insert_resource(crate::capture::CaptureDestinationRenderBridge(
+            capture_bridge,
+        ))
         .add_plugins(renderer.install_into(live_headless_plugins()))
         .add_plugins(crate::capture::CaptureServicePlugin);
     #[cfg(feature = "frame-capture")]
@@ -2752,6 +2758,9 @@ fn run_live_render_pump(
     let scanout_bridge = renderer
         .scanout_render_bridge()
         .expect("live renderer retains its DRM identity");
+    let capture_bridge = renderer.capture_destination_bridge();
+    let capture_advertisements =
+        crate::capture::CaptureAdvertisementRegistry::new(&capture_bridge, renderer.capabilities());
     // The Rung-2 direct-display comparison sidecar retired with its backend.
     let output_selector = PreparedLiveOutputSelector(scanout_bridge.capabilities());
     let backend = LivePreparedBackend {
@@ -2762,9 +2771,16 @@ fn run_live_render_pump(
         dmabuf_capabilities: Some(renderer.capabilities().clone()),
         dmabuf_validator: Some(Box::new(renderer.dmabuf_validator())),
         retirement_adapter: Some(Box::new(renderer.retirement_adapter())),
+        capture_advertisements: capture_advertisements.clone(),
     };
     let scene_mode = scene.mode;
-    let app = match build_live_render_app(renderer, scene_mode, scene.decoration) {
+    let app = match build_live_render_app(
+        renderer,
+        capture_bridge,
+        capture_advertisements,
+        scene_mode,
+        scene.decoration,
+    ) {
         Ok(app) => app,
         Err(error) => {
             let detail = error.to_string();
@@ -7501,6 +7517,7 @@ pub(crate) mod tests {
                     scale120: 120,
                     transform: smithay::utils::Transform::Normal,
                     format: crate::capture::CaptureFormat::Xrgb8888,
+                    destination: crate::capture::CaptureDestination::Shm,
                     overlay_cursor: false,
                     cursor: None,
                     with_damage: false,

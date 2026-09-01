@@ -224,7 +224,7 @@ clients.
 | `ext_idle_notifier_v1` | 2 | Per-seat notifications use Smithay's calloop timers; real pointer, keyboard, touch, pointer-gesture and tablet-tool activity resets the timeout and resumes an idle notification. Device-removal reconciliation does not count as activity. |
 | `ext_foreign_toplevel_list_v1` | 1 | Mapped XDG toplevels expose stable mapping identifiers, title and app ID updates; unmap or destruction closes the handle, and late clients receive the current mapped set. |
 | `ext_session_lock_v1` | 1 | Nested and live KMS modes support immediate output-sized lock-surface configures, secure blank-first presentation acknowledgement, lock-only input, VT pause/resume preservation and the locked/orphaned lifecycle. |
-| `zwlr_screencopy_manager_v1` | 3 | Compatibility output capture into exact-layout `wl_shm` buffers, including clipped regions, real damage waiting, exact cursor inclusion and presentation-timestamped nested or KMS completion. |
+| `zwlr_screencopy_manager_v1` | 3 | Compatibility output capture into exact-layout `wl_shm` buffers, plus eligible whole-output v3 DMA-BUF destinations; includes clipped SHM regions, real damage waiting, exact cursor inclusion and presentation-timestamped nested or KMS completion. |
 
 ## Screen capture
 
@@ -239,8 +239,51 @@ without forcing a frame. The bounded journal is manager-scoped; its baseline
 advances only after `ready`, and history overflow conservatively reports the
 full captured region.
 
-Pixel readback and the matching output presentation form a two-part completion
-latch: `ready` is sent only after both arrive for the same frame. Nested records
+Version 3 frames may additionally advertise a DMA-BUF destination after the
+SHM `buffer` event and before `buffer_done`. The advertisement is immutable for
+that frame and exists only for a whole-output request whose transform is
+Normal, whose displayed and storage extents are equal, and whose underlying
+render texture has an exact copy-compatible opaque format. Its modifiers are
+the intersection of linux-dmabuf feedback and an exact Vulkan external-image
+`TRANSFER_DST` import query at that extent. Versions 1 and 2 never receive the
+DMA-BUF event; regions, transformed outputs and unsupported renderer states
+remain SHM-only.
+
+A submitted DMA-BUF must have exactly one plane and match the advertised
+fourcc and extent. A kind, fourcc, extent or plane-count mismatch posts
+`invalid_buffer` on the frame and never enters renderer admission. A modifier
+outside the frame's stored transfer-destination set is instead an operational
+miss and produces recoverable `failed`: linux-dmabuf feedback can legitimately
+guide a client to a sampled-image modifier which this exact capture use cannot
+import. Other operational misses—fd cloning, import/acquire, capacity,
+deadline, cancellation, resize, completion or FOREIGN release—also produce one
+`failed`. The compositor never sends damage or flags before discovering such a
+failure.
+
+A submitted `wl_buffer` does not carry the DRM device which allocated it.
+Version 4 linux-dmabuf feedback steers compliant allocators to the renderer's
+real `main_device`, and an import failure fails the frame, but the compositor
+also fail-closes advertisement if bridge and feedback renderer identities ever
+disagree. It does not pretend that `Dmabuf::node()` proves allocation identity. A
+cross-device import which succeeds is a residual hardware risk and belongs to
+the real-GBM gate.
+
+Pixel completion and the matching output presentation form a two-part completion
+latch: `ready` is sent only after both arrive for the same frame. For SHM the
+completion half is mapped readback. For DMA-BUF, FOREIGN acquire is encoded in
+the same wgpu command buffer as the copy; the worker waits for that exact
+`SubmissionIndex`, submits the release barrier through wgpu's thread-safe queue,
+then waits for the exact release submission. No capture ownership barrier uses
+a raw queue submit or an infinite fence wait. Sampled-image ownership barriers
+also enter wgpu-owned command buffers, so every renderer-queue submission has
+one authority: `wgpu::Queue`. A single bounded completion
+authority owns those destination jobs. It retries a transient 250 ms GPU wait
+up to four bounded attempts, treats a full/disconnected job queue as terminal,
+and never waits on the render or protocol thread. The shared terminal gate
+closes the sole sender while excluding concurrent submissions, then drains the
+definitively closed channel. Any terminal worker failure fails and safely
+strands every live post-import job and clears future
+screencopy DMA-BUF advertisements. Nested records
 are bound to the exact acquired host window texture-view identity; a missing,
 unconsumed or mismatched acquisition fails that capture instead of rebinding it
 to a later presentation. Nested mode uses the completed host presentation time;
@@ -260,6 +303,24 @@ copy is presented even when the output has no animation or other damage. Every
 admitted copy has a five-second absolute request deadline: this is a deadline on
 that one client operation, not a periodic compositor timer.
 
+Completion does not depend on a later render tick. The retirement worker sends
+its result directly through the calloop-backed protocol command channel, which
+wakes an idle protocol loop; the destination can therefore reach `ready` on a
+static desktop without polling or a redraw timer. Teardown first puts every
+live job into failed/strand mode and closes the sole job sender. It performs a
+non-blocking worker acknowledgement check: an already-finished worker is
+joined, while an unacknowledged worker is detached. If a driver call never
+returns, that detached worker retains the in-flight job and all queued jobs,
+including every import, buffer token and reporter, until it returns or the
+process exits. The retained set is bounded by `MAX_IN_FLIGHT_CAPTURES`; renderer
+teardown itself does not wait.
+A pre-import failure releases the retained buffer token immediately. After an
+acquire/copy submission, only successful copy retirement plus successful
+FOREIGN hand-back may release it; an unprovable hand-back strands both import
+and token. `fail_capture` cancels publication but cannot release that
+renderer-owned half early. Sending `wl_buffer.release` after the client has
+already destroyed its object relies on Wayland's inert-object send behaviour.
+
 The existing SIGUSR1/evidence PNG path shares the renderer-owned RGBA snapshot,
 deadline, cancellation sweep and conversion worker with wire capture. The PNG
 and wire consumers then create their own packed BGRA buffers for their distinct
@@ -267,6 +328,23 @@ outputs. PNG capture retains its filename, atomic-rename and cadence contract;
 an unavailable output or an encode/write task which starts after the deadline
 releases the one-batch-in-flight latch. A genuinely blocked filesystem write
 cannot be cancelled safely and remains outside this deadline guarantee.
+
+The per-destination fd duplication and Vulkan image creation/bind syscalls run
+on the render thread. This is intentionally retained for S-2: admission is
+bounded to eight destinations per render batch, and moving import into the
+worker would break same-frame copy-out. Hardware-gate runs should continue to
+record this bounded syscall cost. They should also flag the
+`failed to release DMA-BUF queue ownership; backing and release use stranded
+fail-closed` log line: it means the sampled path exceeded its 250 ms exact-index
+wait, deliberately withheld `wl_buffer.release`, and requires a fresh import
+before that client buffer can be used again.
+
+Live renderer reconstruction currently rebuilds the renderer, capture bridge,
+advertisement registry and retirement worker together, leaving DMA-BUF
+advertisement empty until the new render world republishes it. This whole
+restart path is structurally pinned by `run_live_render_pump`, but remains an
+explicit untested end-to-end path because the regression would require the
+forbidden real-seat live pump.
 
 `overlay_cursor=0` selects the cursor-free base. Every non-zero value selects an
 inclusive copy using the retained default, chrome or client cursor asset with
@@ -279,14 +357,20 @@ retained and are sampled from that target on the GPU in both nested and KMS
 capture. KMS base copies precede the GPU overlay into scan-out and inclusive
 copies follow it.
 
+Nested redirect and cursor-composed textures use an unsuffixed BGRA8/RGBA8 base
+with the matching sRGB view format. Rendering therefore keeps the sRGB view,
+while DMA-BUF copies compare and copy the exact linear base format used by the
+destination import.
+
 Capture is deliberately default-open, including while the session is locked.
 Lock and unlock change the capture epoch: stale work fails, while newly admitted
 work captures the currently displayed lock surface or compositor-owned black
 fallback. This is an agentic desktop policy rather than a portal permission
 prompt.
 
-KMS copies select the exact Ready `OutputKey` and generation, copy the scan-out
-target within that frame without retaining a slot, and latch pixels against its
+KMS copies select the exact Ready `OutputKey` and generation, copy out within
+that frame without retaining a slot or storing a destination token in the
+scan-out pool, and latch completion against its
 acquisition token and kernel page-flip timestamp. Pause, unplug, generation
 replacement, cancellation and map failure fail the affected one-shot rather
 than returning another output or stale pixels. `--first-light` keeps the same
@@ -296,7 +380,15 @@ The wlr protocol is a compatibility surface; the planned
 `ext-image-copy-capture-v1` implementation will become another consumer of the
 same capture service. The automated nested acceptance gate uses `grim`; the
 `cosmix-screencopy-probe` binary is a deadline-bounded manual diagnostic for the
-advertised layout, non-zero shm offset, guard bytes and non-black pixels.
+advertised layout, non-zero SHM offset, guard bytes and non-black pixels. Its
+`--dmabuf --drm-node PATH` mode waits for `buffer_done`, allocates an advertised
+modifier with GBM, submits that destination, maps it only after `ready`, and
+prints the presentation timestamp plus a content checksum.
+DMA-BUF advertisements are republished from live view targets after every
+output registration/re-registration and generation change. Reconstructing a
+renderer reconstructs its bridge, completion worker and advertisement registry;
+until that replacement has published fresh capabilities, new frames advertise
+SHM only.
 Automated tests cover readback, transforms, ordering and damage. A real Vulkan
 render-attachment gate uses the production GPU cursor-composite pass, reads back
 base and inclusive bytes, compares both with byte-exact references, and proves
@@ -304,8 +396,11 @@ that channel-swap and shifted-hotspot mutants fail. These gates prefer a Vulkan
 fallback adapter. With `COSMIX_REQUIRE_FALLBACK_ADAPTER=1`, absence of one fails
 the test (the CI rule); otherwise the gate runs on an available Vulkan adapter
 and prints one line naming the adapter actually used. Physical driver behaviour,
-real kernel page-flip clock provenance
-and end-to-end `grim -o` on KMS remain manual-hardware-only checks.
+real kernel page-flip clock provenance and end-to-end `grim -o` on KMS remain
+manual-hardware-only checks. The automated Vulkan equivalence gate uses an
+ordinary Vulkan COPY_DST texture; it does not prove real GBM allocation,
+DMA-BUF import, cross-device behaviour or FOREIGN ownership on a physical
+driver. Those are explicitly hardware-gated.
 
 Layer surfaces stack in the protocol order: Background, Bottom, normal XDG
 toplevels and popups, Top, then Overlay. Raising a surface changes its order

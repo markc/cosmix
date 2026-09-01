@@ -472,6 +472,7 @@ fn a_started_runtime_reports_the_preparation_outcome_its_own_thread_reached() {
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: true,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Production,
@@ -527,6 +528,7 @@ fn a_started_runtime_distinguishes_a_skipped_preparation_from_a_refused_one() {
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: true,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -630,6 +632,7 @@ fn runtime_with_failure_probe(
             }),
             dmabuf_validator: None,
             retirement_adapter: test_retirement_adapter(),
+            capture_advertisements: Default::default(),
         },
         WaylandRuntimePolicy {
             keybindings_enabled: false,
@@ -761,6 +764,7 @@ fn a_factory_error_reports_synchronously_and_does_not_fire_the_callback() {
             }),
             dmabuf_validator: None,
             retirement_adapter: test_retirement_adapter(),
+            capture_advertisements: Default::default(),
         },
         WaylandRuntimePolicy {
             keybindings_enabled: false,
@@ -819,6 +823,7 @@ fn a_panicking_registration_factory_fires_the_callback_and_fails_construction() 
             }),
             dmabuf_validator: None,
             retirement_adapter: test_retirement_adapter(),
+            capture_advertisements: Default::default(),
         },
         WaylandRuntimePolicy {
             keybindings_enabled: false,
@@ -1574,6 +1579,7 @@ impl KeybindingHarness {
             dmabuf_capabilities: Some(dmabuf_capabilities),
             dmabuf_validator: None,
             retirement_adapter,
+            capture_advertisements: Default::default(),
         };
         let bootstrap = ProtocolServerBootstrap {
             command_source,
@@ -2014,6 +2020,19 @@ impl KeybindingHarness {
     /// a single generation, a replay of stale content is indistinguishable from
     /// a replay of current content — they are the same bytes.
     fn create_dmabuf_buffer_sized(&mut self, width: u32, height: u32) -> u32 {
+        self.create_dmabuf_buffer_sized_with_format(
+            width,
+            height,
+            smithay::backend::allocator::Fourcc::Argb8888,
+        )
+    }
+
+    fn create_dmabuf_buffer_sized_with_format(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: smithay::backend::allocator::Fourcc,
+    ) -> u32 {
         let stride = width * 4;
         let params_id = self.allocate_object_id();
         let buffer_id = self.allocate_object_id();
@@ -2050,13 +2069,7 @@ impl KeybindingHarness {
             &mut self.client,
             params_id,
             3,
-            &words(&[
-                buffer_id,
-                width,
-                height,
-                smithay::backend::allocator::Fourcc::Argb8888 as u32,
-                0,
-            ]),
+            &words(&[buffer_id, width, height, format as u32, 0]),
         );
         self.dispatch_client();
         assert_eq!(
@@ -4240,6 +4253,7 @@ fn live_syncobj_registry(
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: true,
             explicit_sync_exposure_mode: exposure_mode,
@@ -8928,6 +8942,7 @@ fn kms_wl_output_is_real_late_bound_and_stable_across_pause_resume() {
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -9569,6 +9584,7 @@ fn live_input_lifecycle_reconciles_the_intercepted_chord_before_suspend_and_resu
             }),
             dmabuf_validator: None,
             retirement_adapter: test_retirement_adapter(),
+            capture_advertisements: Default::default(),
         },
         WaylandRuntimePolicy {
             keybindings_enabled: true,
@@ -9719,6 +9735,7 @@ fn kms_client_syncs_while_paused_and_its_frame_waits_for_resumed_submission() {
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -9887,6 +9904,7 @@ fn real_reserved_toggle_round_trips_logs_and_changes_forwarding() {
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: true,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -15973,6 +15991,7 @@ fn xdg_configures_are_staged_and_popup_requires_a_mapped_parent() {
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: true,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -16143,6 +16162,7 @@ fn registry_round_trip_does_not_require_a_bevy_frame() {
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: true,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -16215,6 +16235,7 @@ fn assert_blocked_kms_path_keeps_protocol_live(
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: true,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -16261,6 +16282,7 @@ fn frame_callback_is_sent_before_first_buffer_commit() {
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: true,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -19153,6 +19175,7 @@ fn injected_key_reaches_a_focused_client_while_acquire_is_blocked() {
             }),
             dmabuf_validator: None,
             retirement_adapter: test_retirement_adapter(),
+            capture_advertisements: Default::default(),
         },
         WaylandRuntimePolicy {
             keybindings_enabled: false,
@@ -19474,6 +19497,7 @@ fn touch_oracle_runtime(label: &str) -> (FakeInputInjector, WaylandRuntime, Unix
             }),
             dmabuf_validator: None,
             retirement_adapter: test_retirement_adapter(),
+            capture_advertisements: Default::default(),
         },
         WaylandRuntimePolicy {
             keybindings_enabled: false,
@@ -20180,6 +20204,7 @@ pub(crate) fn real_shm_scene_runtime_with_decoration(
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -20910,6 +20935,7 @@ fn two_client_focus_runtime(
             }),
             dmabuf_validator: None,
             retirement_adapter: test_retirement_adapter(),
+            capture_advertisements: Default::default(),
         },
         WaylandRuntimePolicy {
             keybindings_enabled: false,
@@ -22691,6 +22717,7 @@ fn destroying_a_surface_does_not_enter_its_orphaned_descendant() {
             }),
             dmabuf_validator: None,
             retirement_adapter: test_retirement_adapter(),
+            capture_advertisements: Default::default(),
         },
         WaylandRuntimePolicy {
             keybindings_enabled: false,
@@ -23324,6 +23351,7 @@ fn resume_flush_refill_race_puts_newest_commit_in_the_first_render_drain() {
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -23512,6 +23540,7 @@ fn a_full_renderer_channel_does_not_stop_the_protocol_thread_serving_clients() {
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -23695,6 +23724,7 @@ fn shm_commit_reaches_the_renderer_pixel_exact_and_releases_the_buffer() {
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -23902,6 +23932,7 @@ fn frame_callbacks_are_frame_paced_and_reach_a_subsurface() {
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -24483,6 +24514,7 @@ fn a_second_xdg_surface_for_a_role_bearing_wl_surface_is_a_fatal_protocol_error(
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -24630,6 +24662,7 @@ fn a_second_role_object_on_one_xdg_surface_is_a_fatal_protocol_error() {
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -24721,6 +24754,7 @@ fn role_guard_runtime(label: &str) -> (WaylandRuntime, UnixStream) {
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -24932,6 +24966,7 @@ fn a_role_less_wrapper_cannot_duplicate_the_live_popup_role() {
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -25192,6 +25227,7 @@ fn a_second_subsurface_on_a_live_subsurface_is_refused_before_this_compositor_se
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -25296,6 +25332,7 @@ fn a_live_subsurface_cannot_obtain_an_xdg_surface_wrapper() {
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -25412,6 +25449,7 @@ fn a_subsurface_destroyed_and_recreated_in_one_dispatch_publishes_its_removal() 
         }),
         None,
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -26043,6 +26081,7 @@ fn dmabuf_validation_runtime(
         }),
         Some(validator),
         test_retirement_adapter(),
+        Default::default(),
         WaylandRuntimePolicy {
             keybindings_enabled: false,
             explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -33869,6 +33908,41 @@ fn inject_capture_halves(
     });
 }
 
+fn take_renderer_capture_request(state: &mut WaylandState, id: CaptureId) -> CaptureRequest {
+    let index = state
+        .events
+        .iter()
+        .position(
+            |event| matches!(event, ProtocolEvent::CaptureRequested(request) if request.id == id),
+        )
+        .expect("submitted screencopy reaches renderer admission");
+    let ProtocolEvent::CaptureRequested(request) = state.events.remove(index) else {
+        unreachable!("matched capture request changes variant")
+    };
+    request
+}
+
+fn dmabuf_completion_for_request(
+    request: &CaptureRequest,
+    frame_token: u64,
+    damage: Vec<CaptureRegion>,
+) -> CaptureDmabufComplete {
+    let CaptureDestination::Dmabuf(destination) = &request.destination else {
+        panic!("DMA-BUF fixture produced a SHM request")
+    };
+    CaptureDmabufComplete {
+        id: request.id,
+        source_id: request.source_id.clone(),
+        frame_token,
+        generation: request.generation,
+        security_epoch: request.security_epoch,
+        damage_revision: 7,
+        damage,
+        retention_token: destination.retention_token,
+        _reservation: request.reservation.clone(),
+    }
+}
+
 fn finish_capture_publication(state: &mut WaylandState, id: CaptureId) {
     while state.write_capture_chunk(id) {}
 }
@@ -33965,6 +34039,37 @@ impl ScreencopyWireHarness {
             &words(&[frame, u32::from(overlay), self.output]),
         );
         (frame, self.harness.sync())
+    }
+
+    fn seed_dmabuf_advertisement_from_frame(&mut self, frame: u32) {
+        let id = capture_id_for_frame(&self.harness.server.state, frame);
+        let source = self.harness.server.state.capture_frames[&id]
+            .source_id
+            .clone();
+        self.harness
+            .server
+            .state
+            .capture_advertisements
+            .insert_for_test(
+                source,
+                crate::backend::CaptureDmabufAdvertisement {
+                    fourcc: smithay::backend::allocator::Fourcc::Argb8888 as u32,
+                    width: 320,
+                    height: 240,
+                    allowed_modifiers: vec![u64::from(
+                        smithay::backend::allocator::Modifier::Linear,
+                    )],
+                    drm_device: u64::MAX,
+                },
+            );
+    }
+
+    fn dmabuf_buffer(&mut self, width: u32, height: u32) -> u32 {
+        self.harness.create_dmabuf_buffer_sized_with_format(
+            width,
+            height,
+            smithay::backend::allocator::Fourcc::Argb8888,
+        )
     }
 
     fn capture_region(
@@ -34185,29 +34290,33 @@ fn screencopy_buffer_words(events: &[(u32, u16, Vec<u8>)], frame: u32) -> Vec<u3
 }
 
 #[test]
-fn screencopy_s1a_01_registry_and_version_legal_events() {
+fn screencopy_s2_v1_v2_v3_advertisement_matrix_and_ordering() {
     for version in 1..=3 {
         let mut wire = ScreencopyWireHarness::new(version);
         assert_eq!(
             wire.harness.registry_globals["zwlr_screencopy_manager_v1"].1,
             3
         );
+        let (probe, _) = wire.capture_output(false);
+        wire.seed_dmabuf_advertisement_from_frame(probe);
         let (frame, events) = wire.capture_output(false);
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.0 == frame && event.1 == 0)
-                .count(),
-            1
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.0 == frame && event.1 == 6)
-                .count(),
-            usize::from(version == 3)
-        );
-        assert!(!events.iter().any(|event| event.0 == frame && event.1 == 5));
+        let opcodes = events
+            .iter()
+            .filter_map(|event| (event.0 == frame).then_some(event.1))
+            .collect::<Vec<_>>();
+        assert_eq!(opcodes, if version == 3 { vec![0, 5, 6] } else { vec![0] });
+
+        if version == 3 {
+            let (region, events) = wire.capture_region(0, 0, 319, 240);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter_map(|event| (event.0 == region).then_some(event.1))
+                    .collect::<Vec<_>>(),
+                vec![0, 6],
+                "a region is never DMA-BUF eligible"
+            );
+        }
     }
 }
 
@@ -34373,6 +34482,7 @@ fn transformed_kms_capture_regions_are_projected_in_displayed_space_once() {
             scale120: 120,
             transform,
             generation: 3,
+            dmabuf: None,
         };
         assert_eq!(
             capture_physical_region(&source, Some((10, 20, 30, 40))),
@@ -34394,6 +34504,62 @@ fn transformed_kms_capture_regions_are_projected_in_displayed_space_once() {
             })
         );
     }
+}
+
+#[test]
+fn screencopy_s2_whole_output_normal_equal_extent_is_the_only_dmabuf_shape() {
+    let source = crate::backend::CaptureSourceSnapshot {
+        source_id: crate::backend::CaptureSourceId::Nested {
+            output_name: "Nested-1".into(),
+        },
+        output_name: "Nested-1".into(),
+        logical_rect: (0, 0, 320, 240),
+        source_storage_extent: (320, 240),
+        displayed_physical_extent: (320, 240),
+        scale120: 120,
+        transform: smithay::utils::Transform::Normal,
+        generation: 4,
+        dmabuf: None,
+    };
+    let full = CaptureRegion {
+        x: 0,
+        y: 0,
+        width: 320,
+        height: 240,
+    };
+    assert!(capture_dmabuf_is_eligible(&source, None, full));
+    assert!(!capture_dmabuf_is_eligible(
+        &source,
+        Some((0, 0, 320, 240)),
+        full
+    ));
+    assert!(!capture_dmabuf_is_eligible(
+        &source,
+        None,
+        CaptureRegion { width: 319, ..full }
+    ));
+    for transform in [
+        smithay::utils::Transform::_90,
+        smithay::utils::Transform::_180,
+        smithay::utils::Transform::_270,
+        smithay::utils::Transform::Flipped,
+        smithay::utils::Transform::Flipped90,
+        smithay::utils::Transform::Flipped180,
+        smithay::utils::Transform::Flipped270,
+    ] {
+        let mut transformed = source.clone();
+        transformed.transform = transform;
+        assert!(!capture_dmabuf_is_eligible(&transformed, None, full));
+    }
+    let mut unequal = source.clone();
+    unequal.source_storage_extent = (240, 320);
+    assert!(!capture_dmabuf_is_eligible(&unequal, None, full));
+    assert!(
+        crate::capture::CaptureAdvertisementRegistry::default()
+            .advertisement(&source.source_id, source.source_storage_extent)
+            .is_none(),
+        "absent renderer support never guesses an advertisement"
+    );
 }
 
 #[test]
@@ -34463,6 +34629,363 @@ fn screencopy_s1a_08_invalid_buffer_posts_exact_frame_error() {
         assert_eq!(object, frame);
         assert_eq!(code, zwlr_screencopy_frame_v1::Error::InvalidBuffer as u32);
     }
+}
+
+#[test]
+fn screencopy_s2_strict_dmabuf_metadata_validation_precedes_admission() {
+    for (width, height) in [(319, 240), (320, 239)] {
+        let mut wire = ScreencopyWireHarness::new(3);
+        let (probe, _) = wire.capture_output(false);
+        wire.seed_dmabuf_advertisement_from_frame(probe);
+        let (frame, _) = wire.capture_output(false);
+        let buffer = wire.harness.create_dmabuf_buffer_sized_with_format(
+            width,
+            height,
+            smithay::backend::allocator::Fourcc::Argb8888,
+        );
+        send_request(&mut wire.harness.client, frame, 0, &words(&[buffer]));
+        wire.harness.dispatch_client();
+        let (object, code, _) = read_protocol_error(&mut wire.harness.client);
+        assert_eq!(object, frame);
+        assert_eq!(code, zwlr_screencopy_frame_v1::Error::InvalidBuffer as u32);
+        assert!(
+            !wire
+                .harness
+                .server
+                .state
+                .events
+                .iter()
+                .any(|event| matches!(event, ProtocolEvent::CaptureRequested(_))),
+            "invalid immutable metadata never reaches capture admission"
+        );
+    }
+
+    let advertisement = crate::backend::CaptureDmabufAdvertisement {
+        fourcc: smithay::backend::allocator::Fourcc::Xrgb8888 as u32,
+        width: 320,
+        height: 240,
+        allowed_modifiers: vec![7, 11],
+        drm_device: 19,
+    };
+    let matches = |planes, width, height, fourcc, modifier| {
+        WaylandState::capture_dmabuf_metadata_matches(
+            &advertisement,
+            planes,
+            width,
+            height,
+            fourcc,
+            modifier,
+        )
+    };
+    assert_eq!(
+        matches(1, Some(320), Some(240), advertisement.fourcc, 7),
+        CaptureDmabufMetadataMatch::Matches
+    );
+    for result in [
+        matches(2, Some(320), Some(240), advertisement.fourcc, 7),
+        matches(1, None, Some(240), advertisement.fourcc, 7),
+        matches(1, Some(320), None, advertisement.fourcc, 7),
+        matches(1, Some(319), Some(240), advertisement.fourcc, 7),
+        matches(1, Some(320), Some(239), advertisement.fourcc, 7),
+        matches(
+            1,
+            Some(320),
+            Some(240),
+            smithay::backend::allocator::Fourcc::Argb8888 as u32,
+            7,
+        ),
+    ] {
+        assert_eq!(result, CaptureDmabufMetadataMatch::InvalidBuffer);
+    }
+    assert_eq!(
+        matches(1, Some(320), Some(240), advertisement.fourcc, 9),
+        CaptureDmabufMetadataMatch::UnsupportedModifier
+    );
+}
+
+#[test]
+fn screencopy_s2_unusable_modifier_is_recoverable_failed() {
+    let mut wire = ScreencopyWireHarness::new(3);
+    let (probe, _) = wire.capture_output(false);
+    let id = capture_id_for_frame(&wire.harness.server.state, probe);
+    let source = wire.harness.server.state.capture_frames[&id]
+        .source_id
+        .clone();
+    wire.harness
+        .server
+        .state
+        .capture_advertisements
+        .insert_for_test(
+            source,
+            crate::backend::CaptureDmabufAdvertisement {
+                fourcc: smithay::backend::allocator::Fourcc::Argb8888 as u32,
+                width: 320,
+                height: 240,
+                allowed_modifiers: vec![7],
+                drm_device: 19,
+            },
+        );
+    let (frame, _) = wire.capture_output(false);
+    let buffer = wire.dmabuf_buffer(320, 240);
+    send_request(&mut wire.harness.client, frame, 0, &words(&[buffer]));
+    wire.harness.dispatch_client();
+
+    let events = wire.harness.sync();
+    assert!(
+        events
+            .iter()
+            .any(|(object, opcode, _)| *object == frame && *opcode == 3),
+        "modifier rejection emits zwlr_screencopy_frame_v1.failed"
+    );
+}
+
+#[test]
+fn screencopy_s2_one_shot_is_shared_across_shm_and_dmabuf_destinations() {
+    for (dmabuf_first, first_opcode, second_opcode) in
+        [(false, 0, 0), (false, 2, 2), (true, 0, 2), (true, 2, 0)]
+    {
+        let mut wire = ScreencopyWireHarness::new(3);
+        let (probe, _) = wire.capture_output(false);
+        wire.seed_dmabuf_advertisement_from_frame(probe);
+        let (frame, _) = wire.capture_output(false);
+        let (_shm_file, shm) = wire.shm_buffer(320, 240, 1280);
+        let dmabuf = wire.dmabuf_buffer(320, 240);
+        let (first, second) = if dmabuf_first {
+            (dmabuf, shm)
+        } else {
+            (shm, dmabuf)
+        };
+        send_requests_atomically(
+            &mut wire.harness.client,
+            &[
+                (frame, first_opcode, words(&[first])),
+                (frame, second_opcode, words(&[second])),
+            ],
+        );
+        wire.harness.dispatch_client();
+        let (object, code, _) = read_protocol_error(&mut wire.harness.client);
+        assert_eq!(object, frame);
+        assert_eq!(code, zwlr_screencopy_frame_v1::Error::AlreadyUsed as u32);
+    }
+}
+
+#[test]
+fn screencopy_s2_dmabuf_completion_and_presentation_share_one_terminal_latch() {
+    for completion_first in [false, true] {
+        let mut wire = ScreencopyWireHarness::new(3);
+        let (probe, _) = wire.capture_output(false);
+        wire.seed_dmabuf_advertisement_from_frame(probe);
+        let (frame, _) = wire.capture_output(false);
+        let buffer = wire.dmabuf_buffer(320, 240);
+        send_request(&mut wire.harness.client, frame, 2, &words(&[buffer]));
+        wire.harness.dispatch_client();
+        let id = capture_id_for_frame(&wire.harness.server.state, frame);
+        let request = take_renderer_capture_request(&mut wire.harness.server.state, id);
+        let completion = dmabuf_completion_for_request(
+            &request,
+            41,
+            vec![CaptureRegion {
+                x: 3,
+                y: 4,
+                width: 5,
+                height: 6,
+            }],
+        );
+        let token = completion.retention_token;
+        let presentation = CapturePresented {
+            id,
+            source_id: request.source_id.clone(),
+            frame_token: 41,
+            generation: request.generation,
+            security_epoch: request.security_epoch,
+            seconds: 9,
+            nanoseconds: 17,
+        };
+        if completion_first {
+            wire.harness.server.state.capture_dmabuf_ready(completion);
+            assert!(!wire.harness.server.state.capture_frames[&id].terminal);
+            wire.harness.server.state.capture_presented(presentation);
+        } else {
+            wire.harness.server.state.capture_presented(presentation);
+            assert!(!wire.harness.server.state.capture_frames[&id].terminal);
+            wire.harness.server.state.capture_dmabuf_ready(completion);
+        }
+        let events = wire.harness.sync();
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| (event.0 == frame).then_some(event.1))
+                .collect::<Vec<_>>(),
+            vec![4, 1, 2],
+            "damage, flags and ready publish only after both halves"
+        );
+        assert!(
+            !wire
+                .harness
+                .server
+                .state
+                .retained_buffers
+                .tokens
+                .contains_key(&token)
+        );
+        let manager_id = wire.harness.server.state.capture_frames[&id].manager_id;
+        assert_eq!(
+            wire.harness.server.state.capture_managers[&manager_id]
+                .damage_baselines
+                .get(&request.source_id),
+            Some(&7),
+            "the damage baseline advances at the ready terminal"
+        );
+    }
+
+    let mut wire = ScreencopyWireHarness::new(3);
+    let (probe, _) = wire.capture_output(false);
+    wire.seed_dmabuf_advertisement_from_frame(probe);
+    let (frame, _) = wire.capture_output(false);
+    let buffer = wire.dmabuf_buffer(320, 240);
+    send_request(&mut wire.harness.client, frame, 2, &words(&[buffer]));
+    wire.harness.dispatch_client();
+    let id = capture_id_for_frame(&wire.harness.server.state, frame);
+    let request = take_renderer_capture_request(&mut wire.harness.server.state, id);
+    wire.harness
+        .server
+        .state
+        .capture_dmabuf_ready(dmabuf_completion_for_request(
+            &request,
+            5,
+            vec![CaptureRegion {
+                x: 319,
+                y: 239,
+                width: 2,
+                height: 2,
+            }],
+        ));
+    wire.harness
+        .server
+        .state
+        .capture_presented(CapturePresented {
+            id,
+            source_id: request.source_id.clone(),
+            frame_token: 5,
+            generation: request.generation,
+            security_epoch: request.security_epoch,
+            seconds: 10,
+            nanoseconds: 2,
+        });
+    let events = wire.harness.sync();
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| (event.0 == frame).then_some(event.1))
+            .collect::<Vec<_>>(),
+        vec![3],
+        "invalid terminal metadata emits failed without partial events"
+    );
+}
+
+#[test]
+fn screencopy_s2_completion_channel_wakes_an_idle_protocol_loop_without_a_render_tick() {
+    let mut wire = ScreencopyWireHarness::new(3);
+    let (probe, _) = wire.capture_output(false);
+    wire.seed_dmabuf_advertisement_from_frame(probe);
+    let (frame, _) = wire.capture_output(false);
+    let buffer = wire.dmabuf_buffer(320, 240);
+    send_request(&mut wire.harness.client, frame, 2, &words(&[buffer]));
+    wire.harness.dispatch_client();
+    let id = capture_id_for_frame(&wire.harness.server.state, frame);
+    let request = take_renderer_capture_request(&mut wire.harness.server.state, id);
+    wire.harness
+        .server
+        .state
+        .capture_presented(CapturePresented {
+            id,
+            source_id: request.source_id.clone(),
+            frame_token: 73,
+            generation: request.generation,
+            security_epoch: request.security_epoch,
+            seconds: 12,
+            nanoseconds: 34,
+        });
+    let completion = dmabuf_completion_for_request(&request, 73, Vec::new());
+    let reporter = CaptureCompletionReporter {
+        commands: wire.harness.commands.clone(),
+    };
+    std::thread::spawn(move || reporter.dmabuf_complete(completion))
+        .join()
+        .expect("completion sender thread exits");
+
+    wire.harness
+        .server
+        .dispatch_cycle(Some(EVENT_LOOP_PUMP_TIMEOUT))
+        .expect("the completion channel wakes the otherwise idle protocol loop");
+    let events = wire.harness.sync();
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| (event.0 == frame).then_some(event.1))
+            .collect::<Vec<_>>(),
+        [1, 2],
+        "flags and ready publish without another Bevy render tick"
+    );
+}
+
+#[test]
+fn screencopy_s2_lock_epoch_failure_keeps_dmabuf_until_renderer_retirement() {
+    let mut wire = ScreencopyWireHarness::new(3);
+    let (probe, _) = wire.capture_output(false);
+    wire.seed_dmabuf_advertisement_from_frame(probe);
+    let (frame, _) = wire.capture_output(false);
+    let buffer = wire.dmabuf_buffer(320, 240);
+    send_request(&mut wire.harness.client, frame, 0, &words(&[buffer]));
+    wire.harness.dispatch_client();
+    let id = capture_id_for_frame(&wire.harness.server.state, frame);
+    let request = take_renderer_capture_request(&mut wire.harness.server.state, id);
+    let CaptureDestination::Dmabuf(destination) = &request.destination else {
+        panic!("DMA-BUF fixture produced a SHM request")
+    };
+    let token = destination.retention_token;
+    assert!(
+        wire.harness
+            .server
+            .state
+            .retained_buffers
+            .tokens
+            .contains_key(&token)
+    );
+
+    wire.harness
+        .server
+        .state
+        .fail_stale_capture_epochs(request.security_epoch + 1);
+    let failed = wire.harness.sync();
+    assert!(failed.iter().any(|event| event.0 == frame && event.1 == 3));
+    assert!(!failed.iter().any(|event| event.0 == frame && event.1 == 2));
+    assert!(
+        wire.harness
+            .server
+            .state
+            .retained_buffers
+            .tokens
+            .contains_key(&token),
+        "terminal protocol state cannot release a renderer-resident destination"
+    );
+
+    wire.harness
+        .server
+        .state
+        .capture_dmabuf_ready(dmabuf_completion_for_request(&request, 88, Vec::new()));
+    assert!(
+        !wire
+            .harness
+            .server
+            .state
+            .retained_buffers
+            .tokens
+            .contains_key(&token),
+        "the stale destination releases only when renderer retirement arrives"
+    );
+    let late = wire.harness.sync();
+    assert!(!late.iter().any(|event| event.0 == frame && event.1 == 2));
 }
 
 #[test]

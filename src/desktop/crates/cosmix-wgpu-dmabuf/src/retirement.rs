@@ -34,9 +34,9 @@ pub trait WaitForSubmittedWork: Send + 'static {
 /// Production adapter over the same Bevy/wgpu device as rendering.
 ///
 /// Before an explicit release callback fires, all GPU work that could reference
-/// that buffer has already been submitted. Raw ownership barriers do not escape
-/// that snapshot because the render system synchronously waits on their fence
-/// before returning.
+/// that buffer has already been submitted. Ownership barriers are recorded in
+/// wgpu-owned command buffers, so exact submission indices cover them through
+/// the same queue authority as ordinary renderer work.
 pub struct WgpuWaitForSubmittedWork {
     device: RenderDevice,
     queue: Option<RenderQueue>,
@@ -58,6 +58,22 @@ impl WgpuWaitForSubmittedWork {
             queue: Some(queue),
         }
     }
+
+    /// Wait for one exact wgpu submission. Capture destinations use this for
+    /// both the copy and the subsequent FOREIGN release submission.
+    pub fn wait_for_submission(
+        &self,
+        submission: wgpu::SubmissionIndex,
+        timeout: Duration,
+    ) -> Result<(), RetirementWaitError> {
+        poll_submitted_work(
+            &self.device,
+            wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(timeout),
+            },
+        )
+    }
 }
 
 fn submitted_work_wait(timeout: Duration) -> wgpu::PollType {
@@ -72,30 +88,28 @@ impl WaitForSubmittedWork for WgpuWaitForSubmittedWork {
         if let Some(queue) = &self.queue {
             queue.submit(std::iter::empty());
         }
-        let status =
-            self.device
-                .poll(submitted_work_wait(timeout))
-                .map_err(|error| match error {
-                    wgpu::PollError::Timeout => RetirementWaitError::Timeout,
-                    wgpu::PollError::WrongSubmissionIndex(requested, last_successful) => {
-                        // Unreachable: wgpu only performs this check on the
-                        // `submission_index: Some(..)` path, and we always wait
-                        // for the last successful submission. Kept exhaustive
-                        // for wgpu, reported as a diagnostic rather than a
-                        // typed variant so the public error surface never
-                        // advertises a condition production cannot produce.
-                        RetirementWaitError::Failed(format!(
-                            "wgpu reported a wrong submission index ({requested}; last successful \
-                             {last_successful}) while waiting for the latest successful submission"
-                        ))
-                    }
-                })?;
-        match status {
-            wgpu::PollStatus::QueueEmpty | wgpu::PollStatus::WaitSucceeded => Ok(()),
-            wgpu::PollStatus::Poll => Err(RetirementWaitError::Failed(
-                "blocking submitted-work wait returned poll status".into(),
-            )),
+        poll_submitted_work(&self.device, submitted_work_wait(timeout))
+    }
+}
+
+fn poll_submitted_work(
+    device: &RenderDevice,
+    poll_type: wgpu::PollType,
+) -> Result<(), RetirementWaitError> {
+    let status = device.poll(poll_type).map_err(|error| match error {
+        wgpu::PollError::Timeout => RetirementWaitError::Timeout,
+        wgpu::PollError::WrongSubmissionIndex(requested, last_successful) => {
+            RetirementWaitError::Failed(format!(
+                "wgpu reported a wrong submission index ({requested}; last successful \
+                 {last_successful})"
+            ))
         }
+    })?;
+    match status {
+        wgpu::PollStatus::QueueEmpty | wgpu::PollStatus::WaitSucceeded => Ok(()),
+        wgpu::PollStatus::Poll => Err(RetirementWaitError::Failed(
+            "blocking submitted-work wait returned poll status".into(),
+        )),
     }
 }
 
@@ -310,6 +324,17 @@ mod tests {
         adapter
             .wait_for_submitted_work(RETIREMENT_WAIT_TIMEOUT)
             .expect("noop submitted-work wait completes");
+    }
+
+    #[test]
+    fn production_adapter_waits_for_the_exact_copy_submission() {
+        let (device, queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+        let submission = queue.submit(std::iter::empty());
+        let adapter = WgpuWaitForSubmittedWork::new(RenderDevice::from(device));
+
+        adapter
+            .wait_for_submission(submission, RETIREMENT_WAIT_TIMEOUT)
+            .expect("noop exact-submission wait completes");
     }
 
     #[test]

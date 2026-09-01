@@ -17,7 +17,7 @@ page: [cosmix-comp](cosmix-comp.md).
 | Decorations | `cosmix-deco` | Server-side decoration theme engine: chrome styles, tokens, layout and hit-testing. Dependency-free. |
 | Design system | `cosmix-design` | Headless compiler and family-schema registry for the `.mix` design source — one styling contract for chrome and app widgets. |
 | Shell | `cosmix-shell` | Pure core and host seams for the Quoin desktop shell. |
-| GPU bridge | `cosmix-wgpu-dmabuf` | DMA-BUF to Bevy/wgpu import for zero-copy client buffers. |
+| GPU bridge | [`cosmix-wgpu-dmabuf`](cosmix-wgpu-dmabuf.md) | Role-specific DMA-BUF import for client textures, scan-out targets and screencopy destinations. |
 | Apps | `apps/*` | Studio (DAW / mixer), FileMgr, Mail, Tower (mesh mission control), Tray + trayd, Interact GUI (native presenter for `interactd` dialogs). Registry and identity rules in `src/desktop/APPS.md`. |
 
 ## How it hangs together
@@ -67,6 +67,7 @@ behaviour are documented on [cosmix-comp](cosmix-comp.md).
 ## See also
 
 - [cosmix-comp](cosmix-comp.md) — protocol globals, layer strata, session lock
+- [cosmix-wgpu-dmabuf](cosmix-wgpu-dmabuf.md) — Vulkan import roles and ownership contracts
 - [overview](overview.md) — the daemon family the desktop sits on
 - [noded](noded.md) — the Bus broker every app and the compositor talk to
 - [interactd](cosmix-interactd/README.md) — system-to-human dialogs, presented natively by Interact GUI

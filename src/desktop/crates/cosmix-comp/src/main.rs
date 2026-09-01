@@ -278,6 +278,7 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
             None,
             None,
             None,
+            Default::default(),
             WaylandRuntimePolicy {
                 keybindings_enabled: cli.keybindings_enabled,
                 explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
@@ -292,6 +293,11 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
 
     let renderer = ManualVulkanRenderer::new()?;
     let dmabuf_capabilities = renderer.capabilities().clone();
+    let capture_destination_bridge = renderer.capture_destination_bridge();
+    let capture_advertisements = capture::CaptureAdvertisementRegistry::new(
+        &capture_destination_bridge,
+        &dmabuf_capabilities,
+    );
     let dmabuf_validator = renderer.dmabuf_validator();
     let retirement_adapter: Box<dyn WaitForSubmittedWork> = Box::new(renderer.retirement_adapter());
     let mut app = App::new();
@@ -313,7 +319,11 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
             }),
             ..default()
         });
-    app.add_plugins(renderer.install_into(default_plugins))
+    app.insert_resource(capture_advertisements.clone())
+        .insert_resource(capture::CaptureDestinationRenderBridge(
+            capture_destination_bridge,
+        ))
+        .add_plugins(renderer.install_into(default_plugins))
         .add_plugins((DmabufImportPlugin, KmsRenderTargetPlugin))
         .add_plugins(capture::CaptureServicePlugin);
     #[cfg(feature = "frame-capture")]
@@ -351,6 +361,7 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
         Some(dmabuf_capabilities.clone()),
         Some(Box::new(dmabuf_validator)),
         Some(retirement_adapter),
+        capture_advertisements.clone(),
         policy,
         cli.bus_service.unwrap_or_else(|| "comp-nested".into()),
     )?;
@@ -362,6 +373,7 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
         Some(dmabuf_capabilities.clone()),
         Some(Box::new(dmabuf_validator)),
         Some(retirement_adapter),
+        capture_advertisements.clone(),
         policy,
     )?;
     info!(

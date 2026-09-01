@@ -26,13 +26,19 @@ pub use retirement::{
     spawn_retirement_worker,
 };
 pub use scanout::{
-    ScanoutCapabilityError, ScanoutImportCapabilities, ScanoutImportError, ScanoutImportSupport,
-    ScanoutRenderBridge, ScanoutRenderTarget, ScanoutWgpuFormat, is_opaque_scanout_format,
+    CaptureDestinationBridge, CaptureDestinationCapabilities, CaptureDestinationError,
+    CaptureDestinationSupport, CaptureDestinationWgpuFormat, ImportedCaptureDestination,
+    PendingCaptureDestinationRelease, ScanoutCapabilityError, ScanoutImportCapabilities,
+    ScanoutImportError, ScanoutImportSupport, ScanoutRenderBridge, ScanoutRenderTarget,
+    ScanoutWgpuFormat, capture_destination_wgpu_format, is_opaque_scanout_format,
     preferred_scanout_fourccs, scanout_wgpu_format,
 };
 
 /// Current implementation status, exposed in compositor startup diagnostics.
 pub const BRIDGE_STATUS: &str = "rung-d-vulkan-dmabuf";
+
+/// Exact wgpu queue submission identity used by capture retirement.
+pub type CaptureSubmissionIndex = wgpu::SubmissionIndex;
 
 /// Renderer cache identity for one Wayland `wl_buffer` resource.
 ///

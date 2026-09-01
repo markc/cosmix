@@ -46,9 +46,9 @@ impl BufferHandler for WaylandState {
             .iter()
             .filter_map(|(id, frame)| {
                 frame
-                    .buffer
+                    .destination
                     .as_ref()
-                    .is_some_and(|candidate| candidate.id() == buffer.id())
+                    .is_some_and(|candidate| candidate.buffer().id() == buffer.id())
                     .then_some(*id)
             })
             .collect::<Vec<_>>();

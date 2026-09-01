@@ -416,6 +416,20 @@ impl ManualVulkanRenderer {
         ))
     }
 
+    /// Clone the renderer handles used for client-owned screencopy destination
+    /// imports. `main_device` keeps feedback and advertisement identity
+    /// consistent; a submitted buffer does not expose its allocation identity,
+    /// so individual capture imports cannot validate it.
+    pub fn capture_destination_bridge(&self) -> crate::CaptureDestinationBridge {
+        crate::CaptureDestinationBridge::new(
+            self.resources.4.clone(),
+            self.resources.3.clone(),
+            self.resources.0.clone(),
+            self.resources.1.clone(),
+            self.capabilities.main_device,
+        )
+    }
+
     /// Replace Bevy's automatic `RenderPlugin` in its original plugin-group slot.
     pub fn install_into<G: PluginGroup>(self, plugins: G) -> PluginGroupBuilder {
         plugins
@@ -424,18 +438,6 @@ impl ManualVulkanRenderer {
             .add_before::<RenderPlugin>(ManualVulkanPlugin {
                 resources: self.resources,
             })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::SampledImportRequirement;
-
-    #[test]
-    fn scanout_probe_allows_an_empty_sampled_set_without_weakening_renderer_policy() {
-        assert!(!SampledImportRequirement::Required.admits(true));
-        assert!(SampledImportRequirement::Required.admits(false));
-        assert!(SampledImportRequirement::NotRequiredForScanoutProbe.admits(true));
     }
 }
 
@@ -472,4 +474,16 @@ fn deduplicate_extensions(extensions: &mut Vec<&'static CStr>) {
         }
     }
     *extensions = unique;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SampledImportRequirement;
+
+    #[test]
+    fn scanout_probe_allows_an_empty_sampled_set_without_weakening_renderer_policy() {
+        assert!(!SampledImportRequirement::Required.admits(true));
+        assert!(SampledImportRequirement::Required.admits(false));
+        assert!(SampledImportRequirement::NotRequiredForScanoutProbe.admits(true));
+    }
 }
