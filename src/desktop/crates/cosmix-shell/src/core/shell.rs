@@ -96,8 +96,7 @@ impl ShellModel {
         Ok(update)
     }
 
-    /// Reveal on `Entered`; `Left` does not conceal because panel containment
-    /// and its grace timer own concealment.
+    /// Apply compositor corner containment to the mapped clockwise edge.
     pub fn corner_event(
         &mut self,
         at: Duration,
@@ -105,13 +104,11 @@ impl ShellModel {
     ) -> Result<Option<PanelUpdate>, PanelTimeError> {
         match event {
             CornerEvent::Entered { corner, .. } => self
-                .panel_input(corner.summoned_edge(), at, PanelInput::Reveal)
+                .panel_input(corner.summoned_edge(), at, PanelInput::CornerEntered)
                 .map(Some),
-            CornerEvent::Left { .. } => {
-                self.ensure_monotonic(at)?;
-                self.last_update = at;
-                Ok(None)
-            }
+            CornerEvent::Left { corner } => self
+                .panel_input(corner.summoned_edge(), at, PanelInput::CornerLeft)
+                .map(Some),
         }
     }
 
@@ -141,6 +138,13 @@ impl ShellModel {
             }
         }
         earliest.map_or(PanelWake::Idle, PanelWake::WakeAt)
+    }
+
+    pub fn next_deadline(&self) -> Option<Duration> {
+        self.panels
+            .iter()
+            .filter_map(PanelStateMachine::next_deadline)
+            .min()
     }
 
     fn ensure_monotonic(&self, at: Duration) -> Result<(), PanelTimeError> {

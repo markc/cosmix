@@ -54,6 +54,16 @@ it with `connect_supervised` or `connect_supervised_with_provenance`. It:
 - fails outbound work immediately with a typed `SupervisedError` while disconnected; and
 - re-registers and replays confirmed subscriptions in recorded order before returning to `ConnState::Connected`.
 
+The compatibility default remains an unbounded reconnect-stable receiver from
+`incoming()`. A subscriber that needs a hard memory bound can instead use
+`connect_options(...).bounded_incoming(capacity)` and take
+`incoming_bounded()`. Both the socket-reader lane and the reconnect-stable
+outward lane then use non-blocking `try_send`: a full lane drops the new
+command, increments `overflow_count()`, and emits one
+`BoundedIncomingEvent::Overflow { dropped }` observation for the accumulated
+loss. State-reconstructing consumers should invalidate conservatively before
+accepting later commands.
+
 Use `subscribe_topic(topic)` and `unsubscribe_topic(topic)` on
 `SupervisedClient`. These call the broker's `topic.subscribe` /
 `topic.unsubscribe` verbs and update the `SubscriptionRegistry` only after a

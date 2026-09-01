@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cosmix_bus::bus::{self, BusMessage};
-use cosmix_client::{ConnState, NameCollision, NodedClient, SupervisedClient};
+use cosmix_client::{
+    BoundedIncomingEvent, ConnState, NameCollision, NodedClient, SupervisedClient,
+};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify};
@@ -79,6 +81,8 @@ struct Stub {
     /// WS2's "rejected (un)subscribe leaves the registry unchanged"
     /// transactional contract is testable on the first connection.
     reject_topic: Option<String>,
+    /// Number of unsolicited requests pushed immediately after registration.
+    flood_on_register: usize,
 }
 
 impl Stub {
@@ -89,6 +93,7 @@ impl Stub {
             fail_replay_on_reconnect,
             reject_register_on_reconnect,
             reject_topic: None,
+            flood_on_register: 0,
         })
     }
 
@@ -101,6 +106,18 @@ impl Stub {
             fail_replay_on_reconnect: false,
             reject_register_on_reconnect: false,
             reject_topic: Some(topic.to_string()),
+            flood_on_register: 0,
+        })
+    }
+
+    fn flooding(commands: usize) -> Arc<Stub> {
+        Arc::new(Stub {
+            state: Mutex::new(StubState::default()),
+            drop_conn1: Notify::new(),
+            fail_replay_on_reconnect: false,
+            reject_register_on_reconnect: false,
+            reject_topic: None,
+            flood_on_register: commands,
         })
     }
 }
@@ -203,6 +220,16 @@ async fn run_stub(listener: TcpListener, stub: Arc<Stub>) {
                             continue;
                         }
                         let _ = sink.send(Message::Text(reply(&req, "0").into())).await;
+                        for sequence in 0..stub.flood_on_register {
+                            let command = BusMessage::new()
+                                .with_header("type", "request")
+                                .with_header("command", "world.test.flood")
+                                .with_header("from", "publisher")
+                                .with_header("id", &format!("flood-{sequence}"))
+                                .with_body(&sequence.to_string())
+                                .to_wire();
+                            let _ = sink.send(Message::Text(command.into())).await;
+                        }
                         // On the *reconnected* socket, push an
                         // unsolicited request AFTER re-register: it must
                         // surface on the SAME incoming receiver the test
@@ -389,6 +416,44 @@ async fn reconnects_reregisters_replays_and_keeps_incoming_stream() {
         "broker must observe noded.deregister before replying"
     );
     assert_eq!(client.state(), ConnState::ShuttingDown);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_supervised_lane_reports_socket_reader_overflow_without_growing() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stub = Stub::flooding(128);
+    tokio::spawn(run_stub(listener, stub));
+
+    let url = format!("ws://127.0.0.1:{port}/ws");
+    let client = SupervisedClient::connect_options("bounded-consumer", &url)
+        .bounded_incoming(2)
+        .connect()
+        .await
+        .expect("initial bounded connect");
+    assert!(
+        client.incoming().is_none(),
+        "bounded opt-in must not expose the default unbounded receiver"
+    );
+    let mut incoming = client
+        .incoming_bounded()
+        .expect("bounded receiver is available exactly once");
+
+    let dropped = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match incoming.recv().await {
+                Some(BoundedIncomingEvent::Overflow { dropped }) => break dropped,
+                Some(BoundedIncomingEvent::Command(_)) => {}
+                None => panic!("bounded lane closed before reporting overflow"),
+            }
+        }
+    })
+    .await
+    .expect("flood must produce an observable overflow marker");
+    assert!(dropped > 0);
+    assert!(incoming.overflow_count() >= dropped);
+
+    client.close().await;
 }
 
 /// Version-discovery contract: provenance passed to

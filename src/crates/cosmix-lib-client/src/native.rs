@@ -25,10 +25,62 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use crate::bounded::{
+    BoundedIncomingEvent, BoundedIncomingReceiver, BoundedIncomingSender, bounded_incoming_channel,
+};
 use crate::types::IncomingCommand;
 
 type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 type PendingMap = HashMap<String, oneshot::Sender<BusMessage>>;
+
+pub(crate) enum NativeIncomingReceiver {
+    Unbounded(mpsc::UnboundedReceiver<IncomingCommand>),
+    Bounded(BoundedIncomingReceiver),
+}
+
+impl NativeIncomingReceiver {
+    pub(crate) async fn recv(&mut self) -> Option<BoundedIncomingEvent> {
+        match self {
+            Self::Unbounded(receiver) => receiver.recv().await.map(BoundedIncomingEvent::Command),
+            Self::Bounded(receiver) => receiver.recv().await,
+        }
+    }
+}
+
+enum NativeIncomingSender {
+    Unbounded(mpsc::UnboundedSender<IncomingCommand>),
+    Bounded(BoundedIncomingSender),
+}
+
+impl NativeIncomingSender {
+    fn send(&self, command: IncomingCommand) -> bool {
+        match self {
+            Self::Unbounded(sender) => sender.send(command).is_ok(),
+            Self::Bounded(sender) => sender.try_send(command),
+        }
+    }
+}
+
+fn incoming_channel(
+    bounded_capacity: Option<usize>,
+) -> (NativeIncomingSender, NativeIncomingReceiver) {
+    match bounded_capacity {
+        Some(capacity) => {
+            let (sender, receiver) = bounded_incoming_channel(capacity);
+            (
+                NativeIncomingSender::Bounded(sender),
+                NativeIncomingReceiver::Bounded(receiver),
+            )
+        }
+        None => {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            (
+                NativeIncomingSender::Unbounded(sender),
+                NativeIncomingReceiver::Unbounded(receiver),
+            )
+        }
+    }
+}
 
 /// Abort a spawned task if construction is cancelled before ownership of the
 /// task has safely transferred to the returned client.
@@ -117,7 +169,7 @@ pub struct NodedClient {
     service_name: RwLock<String>,
     sink: Arc<Mutex<WsSink>>,
     pending: Arc<StdMutex<PendingMap>>,
-    incoming_rx: Mutex<Option<mpsc::UnboundedReceiver<IncomingCommand>>>,
+    incoming_rx: Mutex<Option<NativeIncomingReceiver>>,
     next_id: AtomicU64,
     connected: Arc<AtomicBool>,
     /// Join handle for the detached reader task. The task owns the read
@@ -204,6 +256,15 @@ impl NodedClient {
         noded_url: &str,
         provenance: Option<cosmix_bus::RegisterProvenance>,
     ) -> Result<Self> {
+        Self::connect_with_provenance_and_capacity(service_name, noded_url, provenance, None).await
+    }
+
+    pub(crate) async fn connect_with_provenance_and_capacity(
+        service_name: &str,
+        noded_url: &str,
+        provenance: Option<cosmix_bus::RegisterProvenance>,
+        bounded_capacity: Option<usize>,
+    ) -> Result<Self> {
         let (ws_stream, _) = tokio_tungstenite::connect_async(noded_url)
             .await
             .context("failed to connect to broker")?;
@@ -212,7 +273,7 @@ impl NodedClient {
         let sink = Arc::new(Mutex::new(sink));
         let pending: Arc<StdMutex<PendingMap>> = Arc::new(StdMutex::new(HashMap::new()));
         let connected = Arc::new(AtomicBool::new(true));
-        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (incoming_tx, incoming_rx) = incoming_channel(bounded_capacity);
 
         // Spawn the reader task
         let reader_pending = pending.clone();
@@ -273,7 +334,7 @@ impl NodedClient {
         let sink = Arc::new(Mutex::new(sink));
         let pending: Arc<StdMutex<PendingMap>> = Arc::new(StdMutex::new(HashMap::new()));
         let connected = Arc::new(AtomicBool::new(true));
-        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (incoming_tx, incoming_rx) = incoming_channel(None);
 
         let reader_pending = pending.clone();
         let reader_connected = connected.clone();
@@ -689,11 +750,29 @@ impl NodedClient {
     ///
     /// Can only be called once; subsequent calls return `None`.
     pub fn incoming(&self) -> Option<mpsc::UnboundedReceiver<IncomingCommand>> {
-        self.incoming_rx.blocking_lock().take()
+        let mut incoming = self.incoming_rx.blocking_lock();
+        match incoming.take()? {
+            NativeIncomingReceiver::Unbounded(receiver) => Some(receiver),
+            bounded @ NativeIncomingReceiver::Bounded(_) => {
+                *incoming = Some(bounded);
+                None
+            }
+        }
     }
 
     /// Take the receiver for incoming commands (async version).
     pub async fn incoming_async(&self) -> Option<mpsc::UnboundedReceiver<IncomingCommand>> {
+        let mut incoming = self.incoming_rx.lock().await;
+        match incoming.take()? {
+            NativeIncomingReceiver::Unbounded(receiver) => Some(receiver),
+            bounded @ NativeIncomingReceiver::Bounded(_) => {
+                *incoming = Some(bounded);
+                None
+            }
+        }
+    }
+
+    pub(crate) async fn take_native_incoming(&self) -> Option<NativeIncomingReceiver> {
         self.incoming_rx.lock().await.take()
     }
 
@@ -845,7 +924,7 @@ impl NodedClient {
     async fn reader_loop(
         mut stream: futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
         pending: Arc<StdMutex<PendingMap>>,
-        incoming_tx: mpsc::UnboundedSender<IncomingCommand>,
+        incoming_tx: NativeIncomingSender,
         connected: Arc<AtomicBool>,
         service_name: String,
     ) {
@@ -918,7 +997,7 @@ impl NodedClient {
                     body: msg.body.clone(),
                     headers: msg.headers.clone(),
                 };
-                if incoming_tx.send(cmd).is_err() {
+                if !incoming_tx.send(cmd) {
                     tracing::debug!("{service_name}: incoming channel closed");
                     break;
                 }

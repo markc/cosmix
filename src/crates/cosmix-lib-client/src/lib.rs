@@ -28,6 +28,11 @@
 mod types;
 pub use types::IncomingCommand;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod bounded;
+#[cfg(not(target_arch = "wasm32"))]
+pub use bounded::{BoundedIncomingEvent, BoundedIncomingReceiver};
+
 // Re-export the typed port-call outcome so consumers of `call_typed`
 // (NodedClient / SupervisedClient) get the type from this crate rather than
 // reaching into `cosmix-lib-bus` directly.

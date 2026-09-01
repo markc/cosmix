@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cosmix_shell::core::{
-    Carousel, Corner, CornerEvent, CornerTrigger, Edge, LogicalSize, OutputKey, PanelInput,
-    PanelMode, ShellModel,
+    Carousel, ConcealReason, Corner, CornerEvent, CornerTrigger, Edge, LogicalSize, OutputKey,
+    PanelEffect, PanelInput, PanelMode, RevealTrigger, ShellModel,
 };
 use cosmix_shell::host::ShellHost;
 use cosmix_shell::runtime::{HostGeometry, KeyboardInteractivity, ShellFrame, WakePolicy};
@@ -115,18 +115,25 @@ fn corner_reveal_reconciles_an_animating_on_demand_panel() {
 }
 
 #[test]
-fn settled_reveal_arms_fallback_then_returns_idle_after_conceal() {
+fn settled_corner_reveal_waits_for_left_then_returns_idle_after_conceal() {
     let mut model = model();
     model
-        .panel_input(Edge::Bottom, Duration::ZERO, PanelInput::Reveal)
+        .panel_input(Edge::Bottom, Duration::ZERO, PanelInput::CornerEntered)
         .unwrap();
     model.tick(ms(200)).unwrap();
     let revealed = ShellFrame::from_model(&model);
     assert_eq!(revealed.panel(Edge::Bottom).visible_fraction, 1.0);
-    assert_eq!(revealed.wake, WakePolicy::WakeAt(ms(800)));
-    model.tick(ms(800)).unwrap();
-    assert_eq!(ShellFrame::from_model(&model).wake, WakePolicy::Animate);
+    assert_eq!(revealed.wake, WakePolicy::Idle);
+    model
+        .panel_input(Edge::Bottom, ms(200), PanelInput::CornerLeft)
+        .unwrap();
+    assert_eq!(
+        ShellFrame::from_model(&model).wake,
+        WakePolicy::WakeAt(ms(1_000))
+    );
     model.tick(ms(1_000)).unwrap();
+    assert_eq!(ShellFrame::from_model(&model).wake, WakePolicy::Animate);
+    model.tick(ms(1_200)).unwrap();
     assert_eq!(ShellFrame::from_model(&model).wake, WakePolicy::Idle);
 }
 
@@ -166,7 +173,7 @@ fn frames_share_carousel_page_schema_without_cloning_ids() {
 }
 
 #[test]
-fn corner_left_is_not_a_panel_hide_command() {
+fn corner_left_arms_attributed_grace_and_conceals_at_deadline() {
     let mut model = model();
     model
         .corner_event(
@@ -174,22 +181,75 @@ fn corner_left_is_not_a_panel_hide_command() {
             CornerEvent::Entered {
                 corner: Corner::TopRight,
                 dwell: ms(200),
-                trigger: CornerTrigger::Dwell,
+                trigger: CornerTrigger::Compositor,
             },
         )
         .unwrap();
-    assert!(
-        model
-            .corner_event(
-                ms(10),
-                CornerEvent::Left {
-                    corner: Corner::TopRight,
-                },
-            )
-            .unwrap()
-            .is_none()
+    let left = model
+        .corner_event(
+            ms(10),
+            CornerEvent::Left {
+                corner: Corner::TopRight,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(left.snapshot.hide_at, Some(ms(810)));
+    assert_eq!(
+        left.snapshot.conceal_reason,
+        Some(ConcealReason::CornerLeft)
     );
+    let frame = ShellFrame::from_model(&model);
+    assert_eq!(frame.wake, WakePolicy::Animate);
+    assert_eq!(
+        frame.wake_deadline,
+        Some(ms(810)),
+        "animation must not mask the grace timer"
+    );
+    model.tick(ms(809)).unwrap();
     assert_eq!(model.panel(Edge::Top).mode, PanelMode::Revealed);
+    let concealed = model.tick(ms(810)).unwrap();
+    assert_eq!(
+        concealed[Edge::Top.index()].effect,
+        Some(PanelEffect::Conceal {
+            reason: ConcealReason::CornerLeft,
+        })
+    );
+}
+
+#[test]
+fn corner_dwell_is_diagnostic_only_and_duplicate_transitions_are_idempotent() {
+    let mut model = model();
+    let entered = CornerEvent::Entered {
+        corner: Corner::TopLeft,
+        dwell: ms(5_000),
+        trigger: CornerTrigger::Compositor,
+    };
+    assert_eq!(
+        model
+            .corner_event(Duration::ZERO, entered)
+            .unwrap()
+            .unwrap()
+            .effect,
+        Some(PanelEffect::Reveal {
+            trigger: RevealTrigger::Corner,
+        })
+    );
+    assert_eq!(
+        model
+            .corner_event(Duration::ZERO, entered)
+            .unwrap()
+            .unwrap()
+            .effect,
+        None
+    );
+    let left = CornerEvent::Left {
+        corner: Corner::TopLeft,
+    };
+    model.corner_event(ms(1), left).unwrap();
+    let deadline = model.panel(Edge::Left).hide_at;
+    model.corner_event(ms(2), left).unwrap();
+    assert_eq!(model.panel(Edge::Left).hide_at, deadline);
 }
 
 #[test]

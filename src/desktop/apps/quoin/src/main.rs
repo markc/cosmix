@@ -9,17 +9,38 @@ use cosmix_shell::chrome::{
     QuoinChromePlugin, QuoinClock, QuoinContentBindings, QuoinPageContent, QuoinPageRegistry,
     QuoinPageSpec, spawn_quoin_chrome,
 };
-use cosmix_shell::core::{Edge, PanelInput, ShellModel};
-use cosmix_shell::runtime::ShellFrameState;
+use cosmix_shell::core::{ConcealReason, Edge, PanelEffect, PanelInput, RevealTrigger, ShellModel};
+use cosmix_shell::runtime::{ShellEffects, ShellFrameState, ShellRuntimeSet};
 use cosmix_shell_host::{LayerHostConfig, LayerPanelMounts, configure_layer_host};
 use ctk::theme::{CtkThemePlugin, ThemeSpec, ThemeState, apply_theme, tokens};
 
-const USAGE: &str = "usage: cosmix-quoin [--output NAME] [--smoke-all-panels]";
+const USAGE: &str =
+    "usage: cosmix-quoin [--output NAME] [--comp-service NAME] [--smoke-all-panels|--smoke-hidden]";
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Cli {
     output: Option<String>,
     smoke_all_panels: bool,
+    smoke_hidden: bool,
+    comp_service: String,
+}
+
+impl Default for Cli {
+    fn default() -> Self {
+        Self {
+            output: None,
+            smoke_all_panels: false,
+            smoke_hidden: false,
+            comp_service: "comp".to_owned(),
+        }
+    }
+}
+
+#[derive(Resource)]
+struct SmokeState {
+    all_panels: bool,
+    hidden: bool,
+    emitted: bool,
 }
 
 #[derive(Debug)]
@@ -45,6 +66,7 @@ fn main() -> AppExit {
     let registry = page_registry();
     let model_registry = registry.clone();
     let smoke_all_panels = cli.smoke_all_panels;
+    let smoke_hidden = cli.smoke_hidden;
     let host = LayerHostConfig::new(cli.output, move |output, logical_size| {
         let mut model = ShellModel::new(
             output,
@@ -63,22 +85,30 @@ fn main() -> AppExit {
             }
         }
         model
-    });
+    })
+    .with_comp_service(cli.comp_service);
 
     let mut app = App::new();
     configure_layer_host(&mut app, host);
     app.insert_resource(registry)
+        .insert_resource(SmokeState {
+            all_panels: smoke_all_panels,
+            hidden: smoke_hidden,
+            emitted: false,
+        })
         .add_plugins((
             FeathersPlugins,
             CtkThemePlugin::default(),
             QuoinChromePlugin,
         ))
-        .add_systems(Startup, setup);
+        .add_systems(Startup, setup)
+        .add_systems(Update, log_transitions.in_set(ShellRuntimeSet::Host));
     app.run()
 }
 
 fn parse_cli(arguments: impl IntoIterator<Item = String>) -> Result<CliAction, String> {
     let mut cli = Cli::default();
+    let mut comp_service_seen = false;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -95,13 +125,88 @@ fn parse_cli(arguments: impl IntoIterator<Item = String>) -> Result<CliAction, S
                 cli.output = Some(output);
             }
             "--smoke-all-panels" => cli.smoke_all_panels = true,
+            "--smoke-hidden" => cli.smoke_hidden = true,
+            "--comp-service" => {
+                if comp_service_seen {
+                    return Err("--comp-service may be supplied only once".to_owned());
+                }
+                let service = arguments
+                    .next()
+                    .ok_or_else(|| "--comp-service requires a NAME".to_owned())?;
+                if !valid_service_name(&service) {
+                    return Err("--comp-service requires a canonical service NAME".to_owned());
+                }
+                cli.comp_service = service;
+                comp_service_seen = true;
+            }
             "--help" | "-h" => {
                 return Ok(CliAction::Help);
             }
             _ => return Err(format!("unknown option: {argument}")),
         }
     }
+    if cli.smoke_all_panels && cli.smoke_hidden {
+        return Err("--smoke-all-panels and --smoke-hidden are mutually exclusive".to_owned());
+    }
     Ok(CliAction::Run(cli))
+}
+
+fn valid_service_name(name: &str) -> bool {
+    (2..=31).contains(&name.len())
+        && name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn edge_name(edge: Edge) -> &'static str {
+    match edge {
+        Edge::Left => "left",
+        Edge::Bottom => "bottom",
+        Edge::Right => "right",
+        Edge::Top => "top",
+    }
+}
+
+fn log_transitions(
+    effects: Res<ShellEffects>,
+    frame: Res<ShellFrameState>,
+    mut smoke: ResMut<SmokeState>,
+) {
+    for effect in &effects.0 {
+        let edge = edge_name(effect.edge);
+        match effect.effect {
+            PanelEffect::Reveal {
+                trigger: RevealTrigger::Corner,
+            } => println!("QUOIN_REVEAL edge={edge} trigger=corner"),
+            PanelEffect::Conceal {
+                reason: ConcealReason::CornerLeft,
+            } => println!("QUOIN_CONCEAL edge={edge} reason=corner-left"),
+            PanelEffect::Conceal {
+                reason: ConcealReason::Grace,
+            } => println!("QUOIN_CONCEAL edge={edge} reason=grace"),
+            PanelEffect::Pin { pinned } => println!(
+                "QUOIN_PIN edge={edge} state={}",
+                if pinned { "pinned" } else { "unpinned" }
+            ),
+        }
+    }
+    if smoke.emitted {
+        return;
+    }
+    if smoke.all_panels {
+        for edge in Edge::ALL {
+            println!("QUOIN_PIN edge={} state=pinned", edge_name(edge));
+        }
+        smoke.emitted = true;
+    } else if smoke.hidden
+        && Edge::ALL
+            .into_iter()
+            .all(|edge| !frame.0.panel(edge).mapped)
+    {
+        println!("QUOIN_HIDDEN_READY panels=4");
+        smoke.emitted = true;
+    }
 }
 
 fn setup(
@@ -296,6 +401,22 @@ mod tests {
         };
         assert_eq!(cli.output.as_deref(), Some("WL-1"));
         assert!(cli.smoke_all_panels);
+        assert_eq!(cli.comp_service, "comp");
+    }
+
+    #[test]
+    fn cli_accepts_shape_amended_service_and_rejects_smoke_conflict() {
+        let CliAction::Run(cli) = parse_cli([
+            "--comp-service".to_owned(),
+            "comp-nested".to_owned(),
+            "--smoke-hidden".to_owned(),
+        ])
+        .unwrap() else {
+            panic!("valid run options returned help");
+        };
+        assert_eq!(cli.comp_service, "comp-nested");
+        assert!(cli.smoke_hidden);
+        assert!(parse_cli(["--smoke-hidden".to_owned(), "--smoke-all-panels".to_owned()]).is_err());
     }
 
     #[test]

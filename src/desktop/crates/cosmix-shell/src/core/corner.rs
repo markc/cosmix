@@ -92,6 +92,8 @@ impl PointerSample {
 pub enum CornerTrigger {
     Dwell,
     SyntheticPush,
+    /// Engagement reported by the compositor Bus service.
+    Compositor,
 }
 
 /// Observable corner engagement transitions.
@@ -105,6 +107,14 @@ pub enum CornerEvent {
     Left {
         corner: Corner,
     },
+}
+
+impl CornerEvent {
+    pub const fn corner(self) -> Corner {
+        match self {
+            Self::Entered { corner, .. } | Self::Left { corner } => corner,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

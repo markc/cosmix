@@ -5,8 +5,8 @@
 existing Quoin chrome into one explicit Bevy window target per surface. The
 installable application id and layer namespace are `dev.cosmix.quoin`.
 
-The first Arc 3 slice presents real layer-shell buffers through
-`cosmix-shell-host` 0.1.6 and SCTK 0.19.2. `cosmix-quoin-demo` remains a
+Arc 3 presents real layer-shell buffers through `cosmix-shell-host` 0.2.0,
+`cosmix-shell` 0.3.0 and SCTK 0.19.2. `cosmix-quoin-demo` remains a
 feature-gated, non-installable normal-window tuning arm; it is not a
 layer-shell client.
 
@@ -53,6 +53,10 @@ mapped-concealing panels use `Overlay`, reserve zero and slide with their edge
 protocol margin. This also covers pin-from-hidden: the full zone exists at
 fraction zero while chrome supplies the only visual translation. Keyboard
 policy maps only to `None` or `OnDemand`; Quoin never requests `Exclusive`.
+Chrome selects its translation owner from the last successfully committed
+protocol mode, not the model's next desired mode. The host advances that latch
+only after a commit, or after completed role destruction for unmap, so pin and
+unpin cannot hand motion between protocol margin and chrome one frame early.
 
 ## Event-driven wake contract
 
@@ -67,16 +71,16 @@ unmapped. Callbacks are generation-tagged, so late or expired callbacks are
 ignored (the tag is a saturating 64-bit counter: reuse would need 2^64
 requests, which no process lifetime reaches).
 
-Two bounded one-shot liveness backstops share that single timer. While any
-frame callback is outstanding, its deadline is derived from the oldest
-request: one second after that request, rounded up to a 250 ms boundary. It
-releases only callbacks that are at least one second old and requests one
-coalesced update. The deadline persists across `Idle` and `WakeAt` until every
-outstanding request is answered or expired; quantisation lets consecutive
-frames retain the same timer source. A bufferless map also arms a ten-second
-configure deadline; expiry exits with a distinct abnormal reason. These are
-not ticks: no backstop remains armed when no request is in flight, and timely
-compositor replies replace or remove the deadline before it can fire.
+Two bounded one-shot liveness backstops share that single timer. The frame
+backstop participates only while the policy is `Animate` and a frame callback
+is outstanding. Its deadline is derived from the oldest request: one second
+after that request, rounded up to a 250 ms boundary. It releases only callbacks
+that are at least one second old and requests one coalesced update;
+quantisation lets consecutive animated frames retain the same timer source.
+A bufferless map independently arms a ten-second configure deadline; expiry
+exits with a distinct abnormal reason. These are not ticks: no backstop remains
+armed when its qualifying work is absent, and timely compositor replies
+replace or remove the deadline before it can fire.
 
 ## Exit status and reasons
 
@@ -101,13 +105,58 @@ the patterns below.
 | non-zero | `bevy-app-error` | Bevy requested an error exit. |
 | non-zero | `calloop-create-failed-*`, `wayland-source-failed-*`, `signal-source-failed-*`, `signal-source-insert-failed-*`, `calloop-dispatch-failed-*`, `wayland-flush-failed-*` | Event-loop, signal integration, dispatch or Wayland flushing failed. |
 
-## Current slice boundary
+## Interaction boundary
 
-Slice 1 intentionally has no pointer or keyboard bridge, no corner surfaces
-and no Bus adapter. `--smoke-all-panels` starts all four panels mapped and
-pinned for the presentation gate. Interim 1×1 corner hotspots arrive in slice
-2; they are not a source in slice 1. The permanent corner source is the
-compositor's semantic Bus topics.
+Production reveal comes only from the compositor's semantic corner topics;
+Quoin creates no corner hotspot surfaces. `--comp-service NAME` selects the
+registered compositor instance (default `comp`), giving topic headers
+`<service>.corner.entered`, `<service>.corner.left` and
+`<service>.output.changed`. Their inner commands remain the unprefixed
+`corner.entered`, `corner.left` and `output.changed`.
+
+Quoin subscribes to all three topics before addressing the selected service
+with the fixed `comp.props.get` request verb at `outputs`. It maps the topic's
+stable `o_<slug>` output key through the public
+row's raw `name` and accepts only the exact SCTK-selected output. Output-change
+notices and each reconnect generation refresh the complete map. A topic gap,
+disconnect, channel overflow, output replacement or shutdown clears every
+corner hold conservatively. Broker absence or restart disables only corner
+ingress: the layer surfaces, pointer controls and static smoke mode continue,
+and reconnect is automatic and starts disengaged. Topic delivery authenticates
+neither the original publisher nor its `from` header, so any local publisher
+authorised for those topics can inject corner events.
+
+Quoin opts into `cosmix-lib-client`'s bounded subscription receiver at 64
+commands. The socket reader never waits for capacity; a full lane drops the new
+frame and surfaces an overflow marker. Quoin treats that marker exactly like a
+disconnect: synthesize left for all engagements, invalidate the slug map, and
+refresh it before accepting mapped corner state again.
+
+A compositor enter reveals and holds the clockwise edge (TL→left, BL→bottom,
+BR→right, TR→top). Matching left starts the 800 ms grace only when the native
+pointer is also outside. Native SCTK pointer enter/leave supplies the second
+hold; Bevy pointer button events drive pin, both carousel chevrons and page
+dots. Pin survives both leaves, and unpin outside both holds starts normal
+grace. Wheel events are delivered to Bevy although current chrome does not
+consume them. Keyboard, touch and resize interaction remain slice 3. The pure
+`CornerDetector` remains a development-host tuning tool and is not a
+production reveal source.
+
+Stable transition markers are:
+
+```text
+QUOIN_REVEAL edge=left trigger=corner
+QUOIN_CONCEAL edge=left reason=corner-left
+QUOIN_CONCEAL edge=left reason=grace
+QUOIN_PIN edge=left state=pinned
+QUOIN_PIN edge=left state=unpinned
+```
+
+The edge is one of `left`, `bottom`, `right` or `top`. A marker is printed once
+per real semantic transition. `--smoke-all-panels` starts all four panels
+pinned and prints one pinned marker per edge before the existing four-surface
+ready marker. Mutually exclusive `--smoke-hidden` starts them hidden and prints
+`QUOIN_HIDDEN_READY panels=4` after the first complete hidden frame.
 
 Chrome retains semantic AccessKit nodes, but disabling winit also removes its
 platform AccessKit adapter. Platform accessibility is therefore deferred and
@@ -124,9 +173,6 @@ This arc vendors nothing and edits no Smithay source. Quoin consumes
 `cosmix-comp`'s documented public layer-shell contract unchanged.
 
 ## Known limits
-
-Motion ownership handoff mid-motion may show a single-frame position jump
-until slice 2.
 
 Destroy-and-recreate is required because the current compositor rejects an
 acknowledgement for a configure serial retained across unmap. If the
