@@ -34,7 +34,10 @@ pub type OutputRuntimeMap = BTreeMap<OutputKey, OutputRuntime>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OutputError {
-    RequestedOutputUnavailable(String),
+    RequestedOutputUnavailable {
+        requested: String,
+        available: Vec<String>,
+    },
     NoCompleteOutput,
     MoreThanOneOutput,
 }
@@ -42,10 +45,14 @@ pub enum OutputError {
 impl Display for OutputError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::RequestedOutputUnavailable(name) => {
+            Self::RequestedOutputUnavailable {
+                requested,
+                available,
+            } => {
                 write!(
                     formatter,
-                    "requested output {name:?} is not complete or available"
+                    "requested output {requested:?} is not complete or available; advertised outputs: {}",
+                    display_output_names(available)
                 )
             }
             Self::NoCompleteOutput => {
@@ -67,6 +74,10 @@ pub fn select_output(
     state: &OutputState,
     requested_name: Option<&str>,
 ) -> Result<SelectedOutput, OutputError> {
+    let available = state
+        .outputs()
+        .filter_map(|output| state.info(&output).and_then(|info| info.name))
+        .collect::<Vec<_>>();
     let mut complete = state.outputs().filter_map(|wl_output| {
         let info = state.info(&wl_output)?;
         let (width, height) = info.logical_size?;
@@ -84,9 +95,24 @@ pub fn select_output(
     if let Some(requested_name) = requested_name {
         complete
             .find(|output| output.info.name.as_deref() == Some(requested_name))
-            .ok_or_else(|| OutputError::RequestedOutputUnavailable(requested_name.to_owned()))
+            .ok_or_else(|| OutputError::RequestedOutputUnavailable {
+                requested: requested_name.to_owned(),
+                available,
+            })
     } else {
         complete.next().ok_or(OutputError::NoCompleteOutput)
+    }
+}
+
+fn display_output_names(names: &[String]) -> String {
+    if names.is_empty() {
+        "(none)".to_owned()
+    } else {
+        names
+            .iter()
+            .map(|name| format!("{name:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -129,5 +155,18 @@ mod tests {
             output_key(Some("DP-1"), 42).as_ref().map(OutputKey::as_str),
             Some("DP-1")
         );
+    }
+
+    #[test]
+    fn missing_requested_output_error_lists_advertised_names_clearly() {
+        let error = OutputError::RequestedOutputUnavailable {
+            requested: "DP-9".to_owned(),
+            available: vec!["DP-1".to_owned(), "HDMI-A-1".to_owned()],
+        };
+        assert_eq!(
+            error.to_string(),
+            "requested output \"DP-9\" is not complete or available; advertised outputs: \"DP-1\", \"HDMI-A-1\""
+        );
+        assert_eq!(display_output_names(&[]), "(none)");
     }
 }

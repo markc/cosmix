@@ -26,24 +26,30 @@ use cosmix_shell::runtime::{
     replace_shell_model,
 };
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, SurfaceData};
+use smithay_client_toolkit::delegate_keyboard;
 use smithay_client_toolkit::delegate_layer;
 use smithay_client_toolkit::delegate_output;
 use smithay_client_toolkit::delegate_pointer;
 use smithay_client_toolkit::delegate_registry;
 use smithay_client_toolkit::delegate_seat;
+use smithay_client_toolkit::delegate_touch;
 use smithay_client_toolkit::globals::GlobalData;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::registry_handlers;
+use smithay_client_toolkit::seat::keyboard::{
+    KeyEvent, KeyboardHandler, Keymap, Modifiers, RepeatInfo,
+};
 use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerHandler};
+use smithay_client_toolkit::seat::touch::TouchHandler;
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::wlr_layer::{
     Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure,
 };
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{
-    wl_callback, wl_compositor, wl_output, wl_pointer, wl_seat, wl_surface,
+    wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface, wl_touch,
 };
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols::wp::fractional_scale::v1::client::{
@@ -56,8 +62,8 @@ use wayland_protocols::wp::viewporter::client::{
 
 use crate::corner_bus::{CornerBusHandle, CornerIngress, gate_ingress, start as start_corner_bus};
 use crate::input::{
-    PointerBridge, SurfaceTarget, configure_ingress, stage_shell_command,
-    staged_shell_commands_pending,
+    KeyboardBridge, PointerBridge, SurfaceTarget, TouchBridge, configure_ingress,
+    stage_shell_command, staged_shell_commands_pending,
 };
 use crate::output::{
     OutputError, OutputRuntime, OutputRuntimeMap, SelectedOutput, insert_single_output,
@@ -352,10 +358,23 @@ fn release_pointer(pointer: impl PointerRelease) {
     }
 }
 
+fn release_keyboard(keyboard: wl_keyboard::WlKeyboard) {
+    if keyboard.version() >= 3 {
+        keyboard.release();
+    }
+}
+
+fn release_touch(touch: wl_touch::WlTouch) {
+    if touch.version() >= 3 {
+        touch.release();
+    }
+}
+
 fn next_timer_deadline(
     policy: WakePolicy,
     model_deadline: Option<Duration>,
     animate_backstop: Option<Duration>,
+    keyboard_repeat: Option<Duration>,
     configure_deadlines: &[Duration],
 ) -> Option<Duration> {
     let policy_deadline = match policy {
@@ -372,6 +391,7 @@ fn next_timer_deadline(
         .into_iter()
         .chain(model_deadline)
         .chain(animate_backstop)
+        .chain(keyboard_repeat)
         .chain(configure_deadlines.iter().copied())
         .min()
 }
@@ -683,6 +703,14 @@ struct RunnerState {
     pointer_seats: Vec<wl_seat::WlSeat>,
     active_pointer_seat: Option<wl_seat::WlSeat>,
     active_pointer: Option<wl_pointer::WlPointer>,
+    keyboard_bridge: KeyboardBridge,
+    keyboard_seats: Vec<wl_seat::WlSeat>,
+    active_keyboard_seat: Option<wl_seat::WlSeat>,
+    active_keyboard: Option<wl_keyboard::WlKeyboard>,
+    touch_bridge: TouchBridge,
+    touch_seats: Vec<wl_seat::WlSeat>,
+    active_touch_seat: Option<wl_seat::WlSeat>,
+    active_touch: Option<wl_touch::WlTouch>,
     corner_bus: Option<CornerBusHandle>,
     corner_engaged: BTreeSet<cosmix_shell::core::Corner>,
     corner_epoch: u64,
@@ -943,6 +971,14 @@ fn run_layer_host(
         pointer_seats: Vec::new(),
         active_pointer_seat: None,
         active_pointer: None,
+        keyboard_bridge: KeyboardBridge::default(),
+        keyboard_seats: Vec::new(),
+        active_keyboard_seat: None,
+        active_keyboard: None,
+        touch_bridge: TouchBridge::default(),
+        touch_seats: Vec::new(),
+        active_touch_seat: None,
+        active_touch: None,
         corner_bus: None,
         corner_engaged: BTreeSet::new(),
         corner_epoch: 0,
@@ -957,7 +993,10 @@ fn run_layer_host(
     }
     let selected = match select_output(&state.output_state, config.output_name.as_deref()) {
         Ok(selected) => selected,
-        Err(error) => return state_setup_error(state, output_reason(&error)),
+        Err(error) => {
+            tracing::error!(event = "quoin_output_selection_failed", error = %error);
+            return state_setup_error(state, output_reason(&error));
+        }
     };
     let model = (config.model_factory)(selected.key.clone(), selected.logical_size);
     state.app.add_plugins(ShellRuntimePlugin::new(model));
@@ -1128,8 +1167,16 @@ fn state_exit(mut state: RunnerState, reason: &str, abnormal: bool) -> AppExit {
     if let Some(output) = state.selected_key.clone() {
         state.pointer_bridge.cleanup(&mut state.app, &output, None);
     }
+    state.keyboard_bridge.cleanup(&mut state.app, None);
+    state.touch_bridge.cancel(&mut state.app);
     if let Some(pointer) = state.active_pointer.take() {
         release_pointer(pointer);
+    }
+    if let Some(keyboard) = state.active_keyboard.take() {
+        release_keyboard(keyboard);
+    }
+    if let Some(touch) = state.active_touch.take() {
+        release_touch(touch);
     }
     if let Some(corner_bus) = state.corner_bus.take()
         && !corner_bus.shutdown()
@@ -1165,14 +1212,27 @@ fn finish_closed_panels<'a>(panels: impl IntoIterator<Item = &'a mut PanelSurfac
     }
 }
 
+fn render_drain_and_retire(app: &mut App, panels: [PanelSurface; 4]) {
+    // `close` has removed each Bevy raw-handle component. This update is the
+    // non-pipelined render extraction barrier; Wayland resources drop after it.
+    app.update();
+    for panel in panels {
+        panel.retire(app);
+    }
+}
+
 fn output_reason(error: &OutputError) -> String {
     match error {
-        OutputError::RequestedOutputUnavailable(name) => {
-            format!("requested-output-unavailable-{name}")
+        OutputError::RequestedOutputUnavailable { requested, .. } => {
+            format!("requested-output-unavailable-{requested}")
         }
         OutputError::NoCompleteOutput => "no-complete-output".to_owned(),
         OutputError::MoreThanOneOutput => "v1-output-limit-exceeded".to_owned(),
     }
+}
+
+fn reselect_after_output_removal(requested_output: Option<&str>) -> bool {
+    requested_output.is_none()
 }
 
 struct PanelWaylandFactory<'a> {
@@ -1266,19 +1326,24 @@ impl RunnerState {
         if let Some(output) = self.selected_key.clone() {
             self.pointer_bridge.cleanup(&mut self.app, &output, None);
         }
+        self.keyboard_bridge.cleanup(&mut self.app, None);
+        self.touch_bridge.cancel(&mut self.app);
         for panel in &mut retired.panels {
             panel.close(&mut self.app);
         }
-        // Drain render extraction before any raw owner or protocol object is
-        // dropped, exactly as for a normal unmap.
-        self.app.update();
-        for panel in retired.panels {
-            panel.retire(&mut self.app);
+        render_drain_and_retire(&mut self.app, retired.panels);
+
+        // An explicit binding is to this exact wl_output lifetime, not to a
+        // reusable advertised name. Its removal closes Quoin cleanly.
+        if !reselect_after_output_removal(self.requested_output.as_deref()) {
+            self.selected_key = None;
+            self.exit_reason = Some("selected-output-removed-no-replacement".to_owned());
+            return Ok(());
         }
 
-        let selected = match select_output(&self.output_state, self.requested_output.as_deref()) {
+        let selected = match select_output(&self.output_state, None) {
             Ok(selected) => selected,
-            Err(OutputError::NoCompleteOutput | OutputError::RequestedOutputUnavailable(_)) => {
+            Err(OutputError::NoCompleteOutput | OutputError::RequestedOutputUnavailable { .. }) => {
                 self.selected_key = None;
                 self.exit_reason = Some("selected-output-removed-no-replacement".to_owned());
                 return Ok(());
@@ -1339,6 +1404,8 @@ impl RunnerState {
             namespace,
             outputs,
             pointer_bridge,
+            keyboard_bridge,
+            touch_bridge,
             needs_update,
             ..
         } = self;
@@ -1371,6 +1438,10 @@ impl RunnerState {
                 panel
                     .install_wayland(connection, wl_surface, layer_surface, fractional)
                     .map_err(|error| LayerHostError::new(format!("raw-handle-failed-{error}")))?;
+            }
+            if operations.contains(&ProtocolOp::Unmap) {
+                keyboard_bridge.cleanup(app, Some(panel.window));
+                touch_bridge.cleanup(app, Some(panel.window));
             }
         }
         if Self::reconcile(
@@ -1431,6 +1502,7 @@ impl RunnerState {
             self.last_wake,
             self.last_wake_deadline,
             animate_backstop,
+            self.keyboard_bridge.repeat_deadline(),
             &configure_deadlines,
         );
         let model_progressed = self
@@ -1485,6 +1557,7 @@ impl RunnerState {
     }
 
     fn handle_due_wake_timer(&mut self, elapsed: Duration) {
+        self.keyboard_bridge.fire_repeat(&mut self.app, elapsed);
         let configure_timeout = self
             .outputs
             .values()
@@ -1556,7 +1629,7 @@ impl RunnerState {
         let Ok(logical_size) = LogicalSize::new(width as f32, height as f32) else {
             return;
         };
-        let scale = info.scale_factor.max(1);
+        let scale = info.scale_factor;
         let Some(runtime) = self
             .outputs
             .values_mut()
@@ -1706,13 +1779,15 @@ impl OutputHandler for RunnerState {
 
 impl LayerShellHandler for RunnerState {
     fn closed(&mut self, _connection: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
-        let Some((panel_output, edge)) = self.outputs.values().find_map(|output| {
-            output
-                .panels
-                .iter()
-                .find(|panel| panel.matches_layer(layer))
-                .map(|panel| (output.wl_output.clone(), panel.edge))
-        }) else {
+        let Some((output_key, panel_output, edge)) =
+            self.outputs.iter().find_map(|(key, output)| {
+                output
+                    .panels
+                    .iter()
+                    .find(|panel| panel.matches_layer(layer))
+                    .map(|panel| (key.clone(), output.wl_output.clone(), panel.edge))
+            })
+        else {
             return;
         };
         let output_live = self
@@ -1720,17 +1795,30 @@ impl LayerShellHandler for RunnerState {
             .outputs()
             .any(|output| output == panel_output);
         let decision = layer_close_decision(output_live, self.replacement_needed);
-        let RunnerState { app, outputs, .. } = self;
+        let RunnerState {
+            app,
+            outputs,
+            pointer_bridge,
+            keyboard_bridge,
+            touch_bridge,
+            replacement_needed,
+            exit_reason,
+            needs_update,
+            ..
+        } = self;
         if let Some(panel) = outputs
             .values_mut()
             .flat_map(|output| output.panels.iter_mut())
             .find(|panel| panel.matches_layer(layer))
         {
+            *needs_update |= pointer_bridge.cleanup(app, &output_key, Some(panel.window));
+            *needs_update |= keyboard_bridge.cleanup(app, Some(panel.window));
+            *needs_update |= touch_bridge.cleanup(app, Some(panel.window));
             panel.close(app);
             match decision {
-                LayerCloseDecision::Retire => self.replacement_needed = true,
+                LayerCloseDecision::Retire => *replacement_needed = true,
                 LayerCloseDecision::Exit => {
-                    self.exit_reason = Some(format!("layer-surface-closed-{edge:?}"));
+                    *exit_reason = Some(format!("layer-surface-closed-{edge:?}"));
                 }
             }
         }
@@ -1802,13 +1890,27 @@ impl SeatHandler for RunnerState {
         seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if capability != Capability::Pointer {
-            return;
+        match capability {
+            Capability::Pointer => {
+                if !self.pointer_seats.contains(&seat) {
+                    self.pointer_seats.push(seat);
+                }
+                self.promote_pointer(qh);
+            }
+            Capability::Keyboard => {
+                if !self.keyboard_seats.contains(&seat) {
+                    self.keyboard_seats.push(seat);
+                }
+                self.promote_keyboard(qh);
+            }
+            Capability::Touch => {
+                if !self.touch_seats.contains(&seat) {
+                    self.touch_seats.push(seat);
+                }
+                self.promote_touch(qh);
+            }
+            _ => {}
         }
-        if !self.pointer_seats.contains(&seat) {
-            self.pointer_seats.push(seat);
-        }
-        self.promote_pointer(qh);
     }
 
     fn remove_capability(
@@ -1818,8 +1920,11 @@ impl SeatHandler for RunnerState {
         seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if capability == Capability::Pointer {
-            self.remove_pointer_seat(qh, &seat);
+        match capability {
+            Capability::Pointer => self.remove_pointer_seat(qh, &seat),
+            Capability::Keyboard => self.remove_keyboard_seat(qh, &seat),
+            Capability::Touch => self.remove_touch_seat(qh, &seat),
+            _ => {}
         }
     }
 
@@ -1830,6 +1935,8 @@ impl SeatHandler for RunnerState {
         seat: wl_seat::WlSeat,
     ) {
         self.remove_pointer_seat(qh, &seat);
+        self.remove_keyboard_seat(qh, &seat);
+        self.remove_touch_seat(qh, &seat);
     }
 }
 
@@ -1845,25 +1952,7 @@ impl PointerHandler for RunnerState {
             return;
         }
         self.needs_update = true;
-        let targets = self
-            .outputs
-            .values()
-            .flat_map(|output| output.panels.iter().map(move |panel| (output, panel)))
-            .filter_map(|(output, panel)| {
-                let presentation = panel.last_committed.as_ref()?;
-                panel.wayland_surface().map(|surface| SurfaceTarget {
-                    surface,
-                    window: panel.window,
-                    edge: panel.edge,
-                    output_size: Vec2::new(
-                        output.logical_size.width(),
-                        output.logical_size.height(),
-                    ),
-                    thickness: presentation.thickness_px,
-                    committed_margin: committed_edge_margin(presentation),
-                })
-            })
-            .collect::<Vec<_>>();
+        let targets = self.surface_targets();
         let Some(output) = self.selected_key.as_ref() else {
             return;
         };
@@ -1881,7 +1970,241 @@ impl PointerHandler for RunnerState {
     }
 }
 
+impl KeyboardHandler for RunnerState {
+    fn enter(
+        &mut self,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+        keyboard: &wl_keyboard::WlKeyboard,
+        surface: &wl_surface::WlSurface,
+        _serial: u32,
+        raw: &[u32],
+        keysyms: &[smithay_client_toolkit::seat::keyboard::Keysym],
+    ) {
+        if self.active_keyboard.as_ref() != Some(keyboard) {
+            return;
+        }
+        let target = self
+            .surface_targets()
+            .into_iter()
+            .find(|target| target.surface == *surface);
+        if let Some(target) = target {
+            self.keyboard_bridge
+                .enter(&mut self.app, &target, raw, keysyms);
+            self.needs_update = true;
+        }
+    }
+
+    fn leave(
+        &mut self,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+        keyboard: &wl_keyboard::WlKeyboard,
+        surface: &wl_surface::WlSurface,
+        _serial: u32,
+    ) {
+        if self.active_keyboard.as_ref() == Some(keyboard)
+            && self.keyboard_bridge.leave(&mut self.app, surface)
+        {
+            self.needs_update = true;
+        }
+    }
+
+    fn press_key(
+        &mut self,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+        keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        event: KeyEvent,
+    ) {
+        if self.active_keyboard.as_ref() != Some(keyboard) {
+            return;
+        }
+        let now = Instant::now();
+        let elapsed = self
+            .app
+            .world()
+            .get_resource::<Time<Real>>()
+            .map_or(Duration::ZERO, |time| model_elapsed_at(time, now));
+        if self.keyboard_bridge.press(&mut self.app, event, elapsed) {
+            self.needs_update = true;
+        }
+    }
+
+    fn release_key(
+        &mut self,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+        keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        event: KeyEvent,
+    ) {
+        if self.active_keyboard.as_ref() == Some(keyboard)
+            && self.keyboard_bridge.release(&mut self.app, event)
+        {
+            self.needs_update = true;
+        }
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+        keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        modifiers: Modifiers,
+        layout: u32,
+    ) {
+        if self.active_keyboard.as_ref() == Some(keyboard) {
+            self.keyboard_bridge.update_modifiers(modifiers, layout);
+        }
+    }
+
+    fn update_repeat_info(
+        &mut self,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+        keyboard: &wl_keyboard::WlKeyboard,
+        info: RepeatInfo,
+    ) {
+        if self.active_keyboard.as_ref() != Some(keyboard) {
+            return;
+        }
+        let now = Instant::now();
+        let elapsed = self
+            .app
+            .world()
+            .get_resource::<Time<Real>>()
+            .map_or(Duration::ZERO, |time| model_elapsed_at(time, now));
+        self.keyboard_bridge.update_repeat_info(info, elapsed);
+        self.needs_update = true;
+    }
+
+    fn update_keymap(
+        &mut self,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+        keyboard: &wl_keyboard::WlKeyboard,
+        keymap: Keymap<'_>,
+    ) {
+        if self.active_keyboard.as_ref() == Some(keyboard)
+            && self.keyboard_bridge.install_keymap(keymap)
+        {
+            tracing::debug!(event = "quoin_keyboard_keymap_installed");
+        }
+    }
+}
+
+impl TouchHandler for RunnerState {
+    fn down(
+        &mut self,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+        touch: &wl_touch::WlTouch,
+        _serial: u32,
+        _time: u32,
+        surface: wl_surface::WlSurface,
+        id: i32,
+        position: (f64, f64),
+    ) {
+        if self.active_touch.as_ref() != Some(touch) {
+            return;
+        }
+        let targets = self.surface_targets();
+        if self
+            .touch_bridge
+            .down(&mut self.app, &targets, &surface, id, position)
+        {
+            self.needs_update = true;
+        }
+    }
+
+    fn up(
+        &mut self,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+        touch: &wl_touch::WlTouch,
+        _serial: u32,
+        _time: u32,
+        id: i32,
+    ) {
+        if self.active_touch.as_ref() == Some(touch) && self.touch_bridge.up(&mut self.app, id) {
+            self.needs_update = true;
+        }
+    }
+
+    fn motion(
+        &mut self,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+        touch: &wl_touch::WlTouch,
+        _time: u32,
+        id: i32,
+        position: (f64, f64),
+    ) {
+        if self.active_touch.as_ref() == Some(touch)
+            && self.touch_bridge.motion(&mut self.app, id, position)
+        {
+            self.needs_update = true;
+        }
+    }
+
+    fn shape(
+        &mut self,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+        _touch: &wl_touch::WlTouch,
+        _id: i32,
+        _major: f64,
+        _minor: f64,
+    ) {
+    }
+
+    fn orientation(
+        &mut self,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+        _touch: &wl_touch::WlTouch,
+        _id: i32,
+        _orientation: f64,
+    ) {
+    }
+
+    fn cancel(
+        &mut self,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+        touch: &wl_touch::WlTouch,
+    ) {
+        if self.active_touch.as_ref() == Some(touch) && self.touch_bridge.cancel(&mut self.app) {
+            self.needs_update = true;
+        }
+    }
+}
+
 impl RunnerState {
+    fn surface_targets(&self) -> Vec<SurfaceTarget> {
+        self.outputs
+            .values()
+            .flat_map(|output| output.panels.iter().map(move |panel| (output, panel)))
+            .filter_map(|(output, panel)| {
+                let presentation = panel.last_committed.as_ref()?;
+                panel.wayland_surface().map(|surface| SurfaceTarget {
+                    surface,
+                    window: panel.window,
+                    edge: panel.edge,
+                    output_size: Vec2::new(
+                        output.logical_size.width(),
+                        output.logical_size.height(),
+                    ),
+                    thickness: presentation.thickness_px,
+                    committed_margin: committed_edge_margin(presentation),
+                })
+            })
+            .collect()
+    }
+
     fn apply_corner_ingress(&mut self, ingress: CornerIngress) {
         match &ingress {
             CornerIngress::Event {
@@ -1950,6 +2273,62 @@ impl RunnerState {
         self.active_pointer_seat = None;
         self.promote_pointer(qh);
     }
+
+    fn promote_keyboard(&mut self, qh: &QueueHandle<Self>) {
+        if self.active_keyboard.is_some() {
+            return;
+        }
+        for seat in self.keyboard_seats.clone() {
+            if let Ok(keyboard) = self.seat_state.get_keyboard(qh, &seat, None) {
+                self.active_keyboard_seat = Some(seat);
+                self.active_keyboard = Some(keyboard);
+                break;
+            }
+        }
+    }
+
+    fn remove_keyboard_seat(&mut self, qh: &QueueHandle<Self>, seat: &wl_seat::WlSeat) {
+        self.keyboard_seats.retain(|candidate| candidate != seat);
+        if self.active_keyboard_seat.as_ref() != Some(seat) {
+            return;
+        }
+        if self.keyboard_bridge.cleanup(&mut self.app, None) {
+            self.needs_update = true;
+        }
+        if let Some(keyboard) = self.active_keyboard.take() {
+            release_keyboard(keyboard);
+        }
+        self.active_keyboard_seat = None;
+        self.promote_keyboard(qh);
+    }
+
+    fn promote_touch(&mut self, qh: &QueueHandle<Self>) {
+        if self.active_touch.is_some() {
+            return;
+        }
+        for seat in self.touch_seats.clone() {
+            if let Ok(touch) = self.seat_state.get_touch(qh, &seat) {
+                self.active_touch_seat = Some(seat);
+                self.active_touch = Some(touch);
+                break;
+            }
+        }
+    }
+
+    fn remove_touch_seat(&mut self, qh: &QueueHandle<Self>, seat: &wl_seat::WlSeat) {
+        self.touch_seats.retain(|candidate| candidate != seat);
+        if self.active_touch_seat.as_ref() != Some(seat) {
+            return;
+        }
+        if self.touch_bridge.cancel(&mut self.app) {
+            self.needs_update = true;
+        }
+        if let Some(touch) = self.active_touch.take() {
+            release_touch(touch);
+        }
+        self.active_touch_seat = None;
+        self.promote_touch(qh);
+    }
 }
 
 pub(crate) fn apply_corner_ingress_to_app(
@@ -1993,6 +2372,8 @@ pub(crate) fn apply_corner_ingress_to_app(
 
 delegate_seat!(RunnerState);
 delegate_pointer!(RunnerState);
+delegate_keyboard!(RunnerState);
+delegate_touch!(RunnerState);
 
 impl Dispatch<WpFractionalScaleManagerV1, GlobalData> for RunnerState {
     fn event(
@@ -2205,7 +2586,7 @@ mod tests {
             let frame = &self.app.world().resource::<ShellFrameState>().0;
             let animate_backstop = self.animate_requested_at.map(animate_backstop_deadline);
             let next_deadline =
-                next_timer_deadline(frame.wake, frame.wake_deadline, animate_backstop, &[]);
+                next_timer_deadline(frame.wake, frame.wake_deadline, animate_backstop, None, &[]);
             let past = self.wake_timer.observe_next_deadline(
                 next_deadline,
                 self.fresh_elapsed,
@@ -2758,7 +3139,7 @@ mod tests {
                 .get(Edge::Left),
             PanelMode::Hidden
         );
-        assert_eq!(sequences[Edge::Left.index()].lock().unwrap().len(), 4);
+        assert_eq!(sequences[Edge::Left.index()].lock().unwrap().len(), 5);
         assert!(unmapping.operations[0].1.contains(&ProtocolOp::Unmap));
     }
 
@@ -2824,7 +3205,7 @@ mod tests {
             panels[Edge::Left.index()].last_committed.as_ref(),
             Some(expired.panel(Edge::Left))
         );
-        assert_eq!(sequences[Edge::Left.index()].lock().unwrap().len(), 4);
+        assert_eq!(sequences[Edge::Left.index()].lock().unwrap().len(), 5);
         assert!(executor.operations[0].1.contains(&ProtocolOp::Unmap));
     }
 
@@ -2892,7 +3273,7 @@ mod tests {
         };
         assert_eq!(deadline, Duration::from_millis(1_010));
         assert_eq!(
-            next_timer_deadline(left.wake, left.wake_deadline, None, &[]),
+            next_timer_deadline(left.wake, left.wake_deadline, None, None, &[]),
             Some(deadline)
         );
 
@@ -3108,6 +3489,7 @@ mod tests {
                 WakePolicy::Animate,
                 None,
                 Some(seconds(6)),
+                None,
                 &[seconds(7), seconds(12)]
             ),
             Some(seconds(6))
@@ -3117,13 +3499,25 @@ mod tests {
                 WakePolicy::WakeAt(seconds(8)),
                 None,
                 None,
+                None,
                 &[seconds(7), seconds(12)]
             ),
             Some(seconds(7))
         );
         assert_eq!(
-            next_timer_deadline(WakePolicy::Idle, None, None, &[seconds(10)]),
+            next_timer_deadline(WakePolicy::Idle, None, None, None, &[seconds(10)]),
             Some(seconds(10))
+        );
+        assert_eq!(
+            next_timer_deadline(
+                WakePolicy::Idle,
+                None,
+                None,
+                Some(seconds(5)),
+                &[seconds(10)]
+            ),
+            Some(seconds(5)),
+            "keyboard repeat shares the one earliest-deadline timer"
         );
     }
 
@@ -3373,6 +3767,7 @@ mod tests {
                 WakePolicy::Idle,
                 Some(Duration::from_secs(4)),
                 backstop,
+                None,
                 &[]
             ),
             None
@@ -3381,7 +3776,10 @@ mod tests {
 
     #[test]
     fn idle_without_pending_frames_or_configures_arms_nothing() {
-        assert_eq!(next_timer_deadline(WakePolicy::Idle, None, None, &[]), None);
+        assert_eq!(
+            next_timer_deadline(WakePolicy::Idle, None, None, None, &[]),
+            None
+        );
     }
 
     #[test]
@@ -3397,9 +3795,49 @@ mod tests {
         finish_closed_panels(panels.iter_mut());
         finish_closed_panels(panels.iter_mut());
 
-        let expected = ["viewport", "fractional", "layer", "owner"];
+        let expected = ["viewport", "fractional", "layer", "raw-handle", "owner"];
         assert_eq!(*first.lock().unwrap(), expected);
         assert_eq!(*second.lock().unwrap(), expected);
+    }
+
+    #[test]
+    fn selected_output_removal_render_drains_before_every_wayland_drop() {
+        let sequence = Arc::new(Mutex::new(Vec::new()));
+        let update_sequence = Arc::clone(&sequence);
+        let mut app = App::new();
+        app.add_systems(Update, move || {
+            update_sequence
+                .lock()
+                .expect("drop-order probe lock is not poisoned")
+                .push("render-drain");
+        });
+        let mut panels = std::array::from_fn(|_| {
+            PanelSurface::test_double(&mut app, SurfacePhase::Configured, Arc::clone(&sequence))
+        });
+        for panel in &mut panels {
+            panel.close(&mut app);
+        }
+
+        render_drain_and_retire(&mut app, panels);
+
+        let recorded = sequence
+            .lock()
+            .expect("drop-order probe lock is not poisoned")
+            .clone();
+        assert_eq!(recorded.first(), Some(&"render-drain"));
+        for chunk in recorded[1..].chunks_exact(5) {
+            assert_eq!(
+                chunk,
+                ["viewport", "fractional", "layer", "raw-handle", "owner"]
+            );
+        }
+        assert_eq!(recorded.len(), 1 + 4 * 5);
+    }
+
+    #[test]
+    fn explicit_output_removal_exits_instead_of_rebinding_a_reused_name() {
+        assert!(!reselect_after_output_removal(Some("DP-1")));
+        assert!(reselect_after_output_removal(None));
     }
 
     #[test]

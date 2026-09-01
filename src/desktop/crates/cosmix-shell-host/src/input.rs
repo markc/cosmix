@@ -1,10 +1,14 @@
-//! Native SCTK pointer input translated into Bevy window input and shell holds.
+//! Native SCTK pointer, keyboard and touch input translated into Bevy input.
+
+use std::collections::BTreeMap;
+use std::time::Duration;
 
 use bevy::app::Update;
 use bevy::ecs::message::MessageWriter;
 use bevy::input::ButtonState;
+use bevy::input::keyboard::{Key, KeyCode, KeyboardFocusLost, KeyboardInput, NativeKey};
 use bevy::input::mouse::{MouseButton, MouseButtonInput, MouseScrollUnit, MouseWheel};
-use bevy::input::touch::TouchPhase;
+use bevy::input::touch::{TouchInput, TouchPhase};
 use bevy::picking::events::PointerState;
 use bevy::picking::pointer::{
     PointerAction, PointerId, PointerInput, PointerLocation, PointerPress,
@@ -13,15 +17,22 @@ use bevy::prelude::{
     App, Entity, IntoScheduleConfigs, Res, ResMut, Resource, Time, Vec2, Window, World,
 };
 use bevy::time::Real;
-use bevy::window::{CursorEntered, CursorLeft, CursorMoved, WindowEvent};
+use bevy::window::{CursorEntered, CursorLeft, CursorMoved, WindowEvent, WindowFocused};
+use bevy_winit::converters::convert_physical_key_code;
 use cosmix_shell::core::{CornerEvent, Edge, OutputKey, PanelInput};
 use cosmix_shell::runtime::{ShellCommand, ShellCommandKind, ShellRuntimeSet};
+use smithay_client_toolkit::seat::keyboard::{
+    KeyEvent as SctkKeyEvent, Keymap as SctkKeymap, Keysym, Modifiers, RepeatInfo,
+};
 use smithay_client_toolkit::seat::pointer::{
     AxisScroll, BTN_BACK, BTN_EXTRA, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE,
     PointerEvent, PointerEventKind,
 };
 use wayland_client::Proxy;
 use wayland_client::protocol::wl_surface;
+use winit::keyboard::PhysicalKey;
+use winit::platform::scancode::PhysicalKeyExtScancode;
+use xkbcommon::xkb;
 
 #[derive(Clone)]
 pub(crate) struct SurfaceTarget {
@@ -31,6 +42,510 @@ pub(crate) struct SurfaceTarget {
     pub output_size: Vec2,
     pub thickness: f32,
     pub committed_margin: i32,
+}
+
+#[derive(Clone, Debug)]
+struct MappedKey {
+    raw_code: u32,
+    key_code: KeyCode,
+    logical_key: Key,
+    text: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct KeyboardFocus {
+    surface: Option<wl_surface::WlSurface>,
+    window: Entity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RepeatSettings {
+    delay: Duration,
+    gap: Duration,
+}
+
+#[derive(Clone, Debug)]
+struct RepeatingKey {
+    key: MappedKey,
+    next_deadline: Duration,
+}
+
+/// One active SCTK keyboard translated into Bevy's renderer-neutral input.
+/// Repeat is intentionally data-only here: the runner folds its deadline into
+/// the host's single replaceable calloop timer.
+#[derive(Default)]
+pub(crate) struct KeyboardBridge {
+    focus: Option<KeyboardFocus>,
+    pressed: BTreeMap<u32, MappedKey>,
+    modifiers: Modifiers,
+    layout: u32,
+    repeat_settings: Option<RepeatSettings>,
+    repeating: Option<RepeatingKey>,
+    keymap: Option<xkb::Keymap>,
+    xkb_state: Option<xkb::State>,
+    diagnostics: u64,
+}
+
+impl KeyboardBridge {
+    pub(crate) fn install_keymap(&mut self, keymap: SctkKeymap<'_>) -> bool {
+        self.install_keymap_text(keymap.as_string())
+    }
+
+    fn install_keymap_text(&mut self, source: String) -> bool {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let Some(keymap) = xkb::Keymap::new_from_string(
+            &context,
+            source,
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::COMPILE_NO_FLAGS,
+        ) else {
+            self.reject("invalid-keymap-copy");
+            self.cancel_repeat();
+            return false;
+        };
+        self.xkb_state = Some(xkb::State::new(&keymap));
+        self.keymap = Some(keymap);
+        true
+    }
+
+    pub(crate) fn enter(
+        &mut self,
+        app: &mut App,
+        target: &SurfaceTarget,
+        raw: &[u32],
+        keysyms: &[Keysym],
+    ) -> bool {
+        if self.focus.is_some() {
+            self.focus_lost(app, false);
+        }
+        self.focus = Some(KeyboardFocus {
+            surface: Some(target.surface.clone()),
+            window: target.window,
+        });
+        self.reset_xkb_state();
+        emit_window(
+            app,
+            WindowFocused {
+                window: target.window,
+                focused: true,
+            },
+        );
+        for (&raw_code, &keysym) in raw.iter().zip(keysyms) {
+            self.update_xkb_key(raw_code, xkb::KeyDirection::Down);
+            let mapped = map_key(raw_code, keysym, None);
+            emit_keyboard(app, target.window, &mapped, ButtonState::Pressed, false);
+            self.pressed.insert(raw_code, mapped);
+        }
+        true
+    }
+
+    pub(crate) fn leave(&mut self, app: &mut App, surface: &wl_surface::WlSurface) -> bool {
+        if self
+            .focus
+            .as_ref()
+            .is_none_or(|focus| focus.surface.as_ref() != Some(surface))
+        {
+            return false;
+        }
+        self.focus_lost(app, true)
+    }
+
+    pub(crate) fn press(&mut self, app: &mut App, event: SctkKeyEvent, elapsed: Duration) -> bool {
+        let Some(window) = self.focus.as_ref().map(|focus| focus.window) else {
+            self.reject("key-without-focus");
+            return false;
+        };
+        self.update_xkb_key(event.raw_code, xkb::KeyDirection::Down);
+        let mapped = map_key(event.raw_code, event.keysym, event.utf8);
+        emit_keyboard(app, window, &mapped, ButtonState::Pressed, false);
+        self.pressed.insert(event.raw_code, mapped.clone());
+        if self.key_repeats(event.raw_code)
+            && let Some(settings) = self.repeat_settings
+        {
+            self.cancel_repeat();
+            self.repeating = Some(RepeatingKey {
+                key: mapped,
+                next_deadline: elapsed.saturating_add(settings.delay),
+            });
+        }
+        true
+    }
+
+    pub(crate) fn release(&mut self, app: &mut App, event: SctkKeyEvent) -> bool {
+        let Some(window) = self.focus.as_ref().map(|focus| focus.window) else {
+            return false;
+        };
+        self.update_xkb_key(event.raw_code, xkb::KeyDirection::Up);
+        let mapped = self
+            .pressed
+            .remove(&event.raw_code)
+            .unwrap_or_else(|| map_key(event.raw_code, event.keysym, None));
+        emit_keyboard(app, window, &mapped, ButtonState::Released, false);
+        if self
+            .repeating
+            .as_ref()
+            .is_some_and(|repeat| repeat.key.raw_code == event.raw_code)
+        {
+            self.cancel_repeat();
+        }
+        true
+    }
+
+    pub(crate) fn update_modifiers(&mut self, modifiers: Modifiers, layout: u32) {
+        self.modifiers = modifiers;
+        self.layout = layout;
+        self.apply_xkb_modifiers();
+        self.refresh_repeating_key();
+    }
+
+    pub(crate) fn update_repeat_info(&mut self, info: RepeatInfo, elapsed: Duration) {
+        self.repeat_settings = match info {
+            RepeatInfo::Disable => None,
+            RepeatInfo::Repeat { rate, delay } => Some(RepeatSettings {
+                delay: Duration::from_millis(u64::from(delay)),
+                gap: Duration::from_micros((1_000_000 / u64::from(rate.get())).max(1)),
+            }),
+        };
+        let Some(settings) = self.repeat_settings else {
+            self.cancel_repeat();
+            return;
+        };
+        if let Some(repeating) = self.repeating.as_mut() {
+            repeating.next_deadline = elapsed.saturating_add(settings.delay);
+        }
+    }
+
+    pub(crate) fn repeat_deadline(&self) -> Option<Duration> {
+        self.repeating.as_ref().map(|repeat| repeat.next_deadline)
+    }
+
+    pub(crate) fn fire_repeat(&mut self, app: &mut App, elapsed: Duration) -> bool {
+        let (Some(window), Some(settings), Some(repeating)) = (
+            self.focus.as_ref().map(|focus| focus.window),
+            self.repeat_settings,
+            self.repeating.as_mut(),
+        ) else {
+            return false;
+        };
+        if elapsed < repeating.next_deadline {
+            return false;
+        }
+        emit_keyboard(app, window, &repeating.key, ButtonState::Pressed, true);
+        repeating.next_deadline = elapsed.saturating_add(settings.gap);
+        true
+    }
+
+    pub(crate) fn cleanup(&mut self, app: &mut App, window: Option<Entity>) -> bool {
+        if window.is_some_and(|window| {
+            self.focus
+                .as_ref()
+                .is_none_or(|focus| focus.window != window)
+        }) {
+            return false;
+        }
+        self.focus_lost(app, true)
+    }
+
+    fn focus_lost(&mut self, app: &mut App, emit_global_loss: bool) -> bool {
+        let Some(focus) = self.focus.take() else {
+            return false;
+        };
+        for (_, mapped) in std::mem::take(&mut self.pressed) {
+            emit_keyboard(app, focus.window, &mapped, ButtonState::Released, false);
+        }
+        self.cancel_repeat();
+        self.modifiers = Modifiers::default();
+        self.layout = 0;
+        emit_window(
+            app,
+            WindowFocused {
+                window: focus.window,
+                focused: false,
+            },
+        );
+        if emit_global_loss {
+            emit_window(app, KeyboardFocusLost);
+        }
+        self.reset_xkb_state();
+        true
+    }
+
+    fn key_repeats(&self, raw_code: u32) -> bool {
+        self.keymap
+            .as_ref()
+            .is_some_and(|keymap| keymap.key_repeats(xkb::Keycode::new(raw_code.saturating_add(8))))
+    }
+
+    fn cancel_repeat(&mut self) {
+        self.repeating = None;
+    }
+
+    fn reset_xkb_state(&mut self) {
+        self.xkb_state = self.keymap.as_ref().map(xkb::State::new);
+    }
+
+    fn update_xkb_key(&mut self, raw_code: u32, direction: xkb::KeyDirection) {
+        if let Some(state) = self.xkb_state.as_mut() {
+            state.update_key(xkb::Keycode::new(raw_code.saturating_add(8)), direction);
+        }
+    }
+
+    fn apply_xkb_modifiers(&mut self) {
+        let (Some(keymap), Some(state)) = (self.keymap.as_ref(), self.xkb_state.as_mut()) else {
+            return;
+        };
+        let mut depressed = 0;
+        let mut locked = 0;
+        for (active, name) in [
+            (self.modifiers.shift, xkb::MOD_NAME_SHIFT),
+            (self.modifiers.ctrl, xkb::MOD_NAME_CTRL),
+            (self.modifiers.alt, xkb::MOD_NAME_ALT),
+            (self.modifiers.logo, xkb::MOD_NAME_LOGO),
+        ] {
+            let index = keymap.mod_get_index(name);
+            if active && index != xkb::MOD_INVALID {
+                depressed |= 1_u32.checked_shl(index).unwrap_or(0);
+            }
+        }
+        for (active, name) in [
+            (self.modifiers.caps_lock, xkb::MOD_NAME_CAPS),
+            (self.modifiers.num_lock, xkb::MOD_NAME_NUM),
+        ] {
+            let index = keymap.mod_get_index(name);
+            if active && index != xkb::MOD_INVALID {
+                locked |= 1_u32.checked_shl(index).unwrap_or(0);
+            }
+        }
+        state.update_mask(depressed, 0, locked, 0, 0, self.layout);
+    }
+
+    fn refresh_repeating_key(&mut self) {
+        let (Some(state), Some(repeating)) = (self.xkb_state.as_ref(), self.repeating.as_mut())
+        else {
+            return;
+        };
+        let keycode = xkb::Keycode::new(repeating.key.raw_code.saturating_add(8));
+        let text = state.key_get_utf8(keycode);
+        repeating.key = map_key(
+            repeating.key.raw_code,
+            state.key_get_one_sym(keycode),
+            (!text.is_empty()).then_some(text),
+        );
+    }
+
+    fn reject(&mut self, reason: &'static str) {
+        self.diagnostics = self.diagnostics.saturating_add(1);
+        if self.diagnostics.is_power_of_two() {
+            tracing::warn!(
+                event = "quoin_keyboard_event_rejected",
+                count = self.diagnostics,
+                reason
+            );
+        }
+    }
+}
+
+fn map_key(raw_code: u32, keysym: Keysym, text: Option<String>) -> MappedKey {
+    MappedKey {
+        raw_code,
+        key_code: convert_physical_key_code(PhysicalKey::from_scancode(raw_code)),
+        logical_key: logical_key(keysym),
+        text: text.filter(|value| !value.is_empty()),
+    }
+}
+
+fn logical_key(keysym: Keysym) -> Key {
+    match keysym {
+        Keysym::BackSpace => Key::Backspace,
+        Keysym::Tab | Keysym::ISO_Left_Tab => Key::Tab,
+        Keysym::Return | Keysym::KP_Enter => Key::Enter,
+        Keysym::Escape => Key::Escape,
+        Keysym::Delete | Keysym::KP_Delete => Key::Delete,
+        Keysym::Insert | Keysym::KP_Insert => Key::Insert,
+        Keysym::Home | Keysym::KP_Home => Key::Home,
+        Keysym::End | Keysym::KP_End => Key::End,
+        Keysym::Page_Up | Keysym::KP_Page_Up => Key::PageUp,
+        Keysym::Page_Down | Keysym::KP_Page_Down => Key::PageDown,
+        Keysym::Left | Keysym::KP_Left => Key::ArrowLeft,
+        Keysym::Right | Keysym::KP_Right => Key::ArrowRight,
+        Keysym::Up | Keysym::KP_Up => Key::ArrowUp,
+        Keysym::Down | Keysym::KP_Down => Key::ArrowDown,
+        Keysym::Shift_L | Keysym::Shift_R => Key::Shift,
+        Keysym::Control_L | Keysym::Control_R => Key::Control,
+        Keysym::Alt_L | Keysym::Alt_R => Key::Alt,
+        Keysym::Super_L | Keysym::Super_R => Key::Super,
+        Keysym::Caps_Lock => Key::CapsLock,
+        Keysym::Num_Lock => Key::NumLock,
+        Keysym::F1 => Key::F1,
+        Keysym::F2 => Key::F2,
+        Keysym::F3 => Key::F3,
+        Keysym::F4 => Key::F4,
+        Keysym::F5 => Key::F5,
+        Keysym::F6 => Key::F6,
+        Keysym::F7 => Key::F7,
+        Keysym::F8 => Key::F8,
+        Keysym::F9 => Key::F9,
+        Keysym::F10 => Key::F10,
+        Keysym::F11 => Key::F11,
+        Keysym::F12 => Key::F12,
+        _ => keysym.key_char().map_or_else(
+            || Key::Unidentified(NativeKey::Xkb(keysym.raw())),
+            |character| Key::Character(character.to_string().into()),
+        ),
+    }
+}
+
+fn emit_keyboard(app: &mut App, window: Entity, key: &MappedKey, state: ButtonState, repeat: bool) {
+    let event = KeyboardInput {
+        key_code: key.key_code,
+        logical_key: key.logical_key.clone(),
+        state,
+        text: (state == ButtonState::Pressed)
+            .then_some(key.text.as_deref())
+            .flatten()
+            .map(Into::into),
+        repeat,
+        window,
+    };
+    emit_window(app, event);
+}
+
+#[derive(Clone, Debug)]
+struct TouchContact {
+    window: Entity,
+    position: Vec2,
+    output_position: Vec2,
+}
+
+/// Active touch contacts, attributed on down so later id-only events cannot
+/// drift to a recreated or differently selected panel surface.
+#[derive(Default)]
+pub(crate) struct TouchBridge {
+    contacts: BTreeMap<i32, TouchContact>,
+    diagnostics: u64,
+}
+
+impl TouchBridge {
+    pub(crate) fn down(
+        &mut self,
+        app: &mut App,
+        targets: &[SurfaceTarget],
+        surface: &wl_surface::WlSurface,
+        id: i32,
+        position: (f64, f64),
+    ) -> bool {
+        let Some(target) = targets.iter().find(|target| target.surface == *surface) else {
+            return false;
+        };
+        let Some(position) = valid_position(app, target.window, position) else {
+            self.reject("invalid-down-position");
+            return false;
+        };
+        if let Some(previous) = self.contacts.remove(&id) {
+            emit_touch(app, id, &previous, TouchPhase::Canceled);
+        }
+        self.start_contact(
+            app,
+            target.window,
+            id,
+            position,
+            output_position(target, position),
+        );
+        true
+    }
+
+    fn start_contact(
+        &mut self,
+        app: &mut App,
+        window: Entity,
+        id: i32,
+        position: Vec2,
+        output_position: Vec2,
+    ) {
+        let contact = TouchContact {
+            window,
+            position,
+            output_position,
+        };
+        emit_touch(app, id, &contact, TouchPhase::Started);
+        self.contacts.insert(id, contact);
+    }
+
+    pub(crate) fn motion(&mut self, app: &mut App, id: i32, position: (f64, f64)) -> bool {
+        let Some(previous) = self.contacts.get(&id) else {
+            return false;
+        };
+        let Some(position) = valid_position(app, previous.window, position) else {
+            self.reject("invalid-motion-position");
+            return false;
+        };
+        let delta = position - previous.position;
+        let Some(contact) = self.contacts.get_mut(&id) else {
+            return false;
+        };
+        contact.position = position;
+        contact.output_position += delta;
+        emit_touch(app, id, contact, TouchPhase::Moved);
+        true
+    }
+
+    pub(crate) fn up(&mut self, app: &mut App, id: i32) -> bool {
+        let Some(contact) = self.contacts.remove(&id) else {
+            return false;
+        };
+        emit_touch(app, id, &contact, TouchPhase::Ended);
+        true
+    }
+
+    pub(crate) fn cancel(&mut self, app: &mut App) -> bool {
+        let changed = !self.contacts.is_empty();
+        for (id, contact) in std::mem::take(&mut self.contacts) {
+            emit_touch(app, id, &contact, TouchPhase::Canceled);
+        }
+        changed
+    }
+
+    pub(crate) fn cleanup(&mut self, app: &mut App, window: Option<Entity>) -> bool {
+        let ids = self
+            .contacts
+            .iter()
+            .filter_map(|(&id, contact)| {
+                window
+                    .is_none_or(|window| contact.window == window)
+                    .then_some(id)
+            })
+            .collect::<Vec<_>>();
+        for id in &ids {
+            if let Some(contact) = self.contacts.remove(id) {
+                emit_touch(app, *id, &contact, TouchPhase::Canceled);
+            }
+        }
+        !ids.is_empty()
+    }
+
+    fn reject(&mut self, reason: &'static str) {
+        self.diagnostics = self.diagnostics.saturating_add(1);
+        if self.diagnostics.is_power_of_two() {
+            tracing::warn!(
+                event = "quoin_touch_event_rejected",
+                count = self.diagnostics,
+                reason
+            );
+        }
+    }
+}
+
+fn emit_touch(app: &mut App, id: i32, contact: &TouchContact, phase: TouchPhase) {
+    emit_window(
+        app,
+        TouchInput {
+            phase,
+            position: contact.position,
+            window: contact.window,
+            force: None,
+            id: id as u64,
+        },
+    );
 }
 
 #[derive(Clone)]
@@ -449,10 +964,14 @@ fn valid_position(app: &App, window: Entity, position: (f64, f64)) -> Option<Vec
     if !position.0.is_finite() || !position.1.is_finite() {
         return None;
     }
+    let position = Vec2::new(position.0 as f32, position.1 as f32);
+    if !position.is_finite() {
+        return None;
+    }
     let window = app.world().get::<Window>(window)?;
     Some(Vec2::new(
-        (position.0 as f32).clamp(0.0, window.resolution.width()),
-        (position.1 as f32).clamp(0.0, window.resolution.height()),
+        position.x.clamp(0.0, window.resolution.width()),
+        position.y.clamp(0.0, window.resolution.height()),
     ))
 }
 
@@ -917,6 +1436,295 @@ mod tests {
             .find_map(|(id, press)| (*id == PointerId::Mouse).then_some(press))
             .unwrap();
         assert!(!press.is_any_pressed());
+    }
+
+    fn keyboard_app() -> (App, Entity) {
+        let mut app = App::new();
+        app.add_message::<KeyboardInput>()
+            .add_message::<KeyboardFocusLost>()
+            .add_message::<WindowFocused>()
+            .add_message::<WindowEvent>()
+            .add_message::<TouchInput>();
+        let window = app
+            .world_mut()
+            .spawn(Window {
+                resolution: bevy::window::WindowResolution::new(200, 100),
+                ..Default::default()
+            })
+            .id();
+        (app, window)
+    }
+
+    fn us_keymap() -> xkb::Keymap {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        xkb::Keymap::new_from_names(&context, "", "", "us", "", None, xkb::COMPILE_NO_FLAGS)
+            .expect("the test host supplies the standard US xkb keymap")
+    }
+
+    #[test]
+    fn xkb_keymap_install_owns_a_compiled_copy_and_bounds_repeat_gap() {
+        let keymap = us_keymap();
+        let mut bridge = KeyboardBridge::default();
+        assert!(bridge.install_keymap_text(keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)));
+        assert!(bridge.keymap.is_some());
+        assert!(bridge.xkb_state.is_some());
+
+        bridge.update_repeat_info(
+            RepeatInfo::Repeat {
+                rate: std::num::NonZeroU32::new(u32::MAX).unwrap(),
+                delay: 1,
+            },
+            Duration::ZERO,
+        );
+        assert_eq!(
+            bridge.repeat_settings.unwrap().gap,
+            Duration::from_micros(1)
+        );
+    }
+
+    #[test]
+    fn xkb_key_text_modifier_and_repeat_mapping_is_exact() {
+        let (mut app, window) = keyboard_app();
+        let keymap = us_keymap();
+        let mut bridge = KeyboardBridge {
+            focus: Some(KeyboardFocus {
+                surface: None,
+                window,
+            }),
+            xkb_state: Some(xkb::State::new(&keymap)),
+            keymap: Some(keymap),
+            ..Default::default()
+        };
+        bridge.update_modifiers(
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+            0,
+        );
+        bridge.update_repeat_info(
+            RepeatInfo::Repeat {
+                rate: std::num::NonZeroU32::new(20).unwrap(),
+                delay: 200,
+            },
+            Duration::from_secs(1),
+        );
+        let press = SctkKeyEvent {
+            time: 10,
+            raw_code: 30,
+            keysym: Keysym::A,
+            utf8: Some("A".to_owned()),
+        };
+
+        assert!(bridge.press(&mut app, press.clone(), Duration::from_secs(1)));
+        bridge.update_modifiers(Modifiers::default(), 0);
+        assert_eq!(bridge.repeat_deadline(), Some(Duration::from_millis(1_200)));
+        assert!(!bridge.fire_repeat(&mut app, Duration::from_millis(1_199)));
+        assert!(bridge.fire_repeat(&mut app, Duration::from_millis(1_200)));
+        assert!(!bridge.modifiers.shift);
+        assert_eq!(bridge.layout, 0);
+
+        let events = app
+            .world_mut()
+            .resource_mut::<Messages<KeyboardInput>>()
+            .drain()
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].window, window);
+        assert_eq!(events[0].key_code, KeyCode::KeyA);
+        assert_eq!(events[0].logical_key, Key::Character("A".into()));
+        assert_eq!(events[0].text.as_deref(), Some("A"));
+        assert!(!events[0].repeat);
+        assert!(events[1].repeat);
+        assert_eq!(events[1].logical_key, Key::Character("a".into()));
+        assert_eq!(events[1].text.as_deref(), Some("a"));
+
+        assert!(bridge.release(
+            &mut app,
+            SctkKeyEvent {
+                utf8: None,
+                ..press
+            }
+        ));
+        assert_eq!(bridge.repeat_deadline(), None);
+        assert!(bridge.pressed.is_empty());
+    }
+
+    #[test]
+    fn keyboard_focus_loss_stops_repeat_and_clears_held_state() {
+        let (mut app, window) = keyboard_app();
+        let mut bridge = KeyboardBridge {
+            focus: Some(KeyboardFocus {
+                surface: None,
+                window,
+            }),
+            keymap: Some(us_keymap()),
+            repeat_settings: Some(RepeatSettings {
+                delay: Duration::from_millis(200),
+                gap: Duration::from_millis(50),
+            }),
+            ..Default::default()
+        };
+        bridge.press(
+            &mut app,
+            SctkKeyEvent {
+                time: 10,
+                raw_code: 30,
+                keysym: Keysym::a,
+                utf8: Some("a".to_owned()),
+            },
+            Duration::ZERO,
+        );
+
+        assert!(bridge.cleanup(&mut app, Some(window)));
+        assert!(bridge.focus.is_none());
+        assert!(bridge.pressed.is_empty());
+        let events = app
+            .world_mut()
+            .resource_mut::<Messages<KeyboardInput>>()
+            .drain()
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].state, ButtonState::Pressed);
+        assert_eq!(events[1].state, ButtonState::Released);
+        assert_eq!(events[0].key_code, events[1].key_code);
+        assert_eq!(bridge.repeat_deadline(), None);
+        assert!(!bridge.modifiers.ctrl);
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<Messages<KeyboardFocusLost>>()
+                .drain()
+                .count(),
+            1
+        );
+        let focused = app
+            .world_mut()
+            .resource_mut::<Messages<WindowFocused>>()
+            .drain()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            focused,
+            [WindowFocused {
+                window,
+                focused: false
+            }]
+        );
+    }
+
+    #[test]
+    fn focus_loss_and_touch_cancel_clear_bevy_pressed_resources() {
+        let mut app = App::new();
+        app.add_plugins(bevy::input::InputPlugin)
+            .add_message::<WindowFocused>()
+            .add_message::<WindowEvent>();
+        let window = app
+            .world_mut()
+            .spawn(Window {
+                resolution: bevy::window::WindowResolution::new(200, 100),
+                ..Default::default()
+            })
+            .id();
+        let keymap = us_keymap();
+        let mut keyboard = KeyboardBridge {
+            focus: Some(KeyboardFocus {
+                surface: None,
+                window,
+            }),
+            xkb_state: Some(xkb::State::new(&keymap)),
+            keymap: Some(keymap),
+            ..Default::default()
+        };
+        keyboard.press(
+            &mut app,
+            SctkKeyEvent {
+                time: 10,
+                raw_code: 30,
+                keysym: Keysym::a,
+                utf8: Some("a".to_owned()),
+            },
+            Duration::ZERO,
+        );
+        let mut touch = TouchBridge::default();
+        touch.start_contact(
+            &mut app,
+            window,
+            8,
+            Vec2::new(5.0, 7.0),
+            Vec2::new(5.0, 7.0),
+        );
+        app.update();
+        assert!(
+            app.world()
+                .resource::<bevy::input::ButtonInput<KeyCode>>()
+                .pressed(KeyCode::KeyA)
+        );
+        assert!(
+            app.world()
+                .resource::<bevy::input::touch::Touches>()
+                .get_pressed(8)
+                .is_some()
+        );
+
+        assert!(keyboard.cleanup(&mut app, Some(window)));
+        assert!(touch.cancel(&mut app));
+        app.update();
+        assert!(
+            app.world()
+                .resource::<bevy::input::ButtonInput<KeyCode>>()
+                .get_pressed()
+                .next()
+                .is_none()
+        );
+        assert!(
+            app.world()
+                .resource::<bevy::input::touch::Touches>()
+                .get_pressed(8)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn touch_attribution_motion_and_cancel_clear_pressed_contacts() {
+        let (mut app, left) = keyboard_app();
+        let right = app
+            .world_mut()
+            .spawn(Window {
+                resolution: bevy::window::WindowResolution::new(200, 100),
+                ..Default::default()
+            })
+            .id();
+        let mut bridge = TouchBridge::default();
+        bridge.start_contact(
+            &mut app,
+            right,
+            -4,
+            Vec2::new(5.0, 7.0),
+            output_logical_position(
+                Edge::Right,
+                Vec2::new(5.0, 7.0),
+                Vec2::new(1_000.0, 800.0),
+                100.0,
+                -20,
+            ),
+        );
+        assert!(bridge.motion(&mut app, -4, (9.0, 10.0)));
+        assert_eq!(bridge.contacts[&-4].window, right);
+        assert_ne!(bridge.contacts[&-4].window, left);
+        assert_eq!(bridge.contacts[&-4].output_position, Vec2::new(929.0, 10.0));
+        assert!(bridge.cancel(&mut app));
+        assert!(bridge.contacts.is_empty());
+
+        let events = app
+            .world_mut()
+            .resource_mut::<Messages<TouchInput>>()
+            .drain()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events.iter().map(|event| event.phase).collect::<Vec<_>>(),
+            [TouchPhase::Started, TouchPhase::Moved, TouchPhase::Canceled]
+        );
+        assert!(events.iter().all(|event| event.window == right));
+        assert!(events.iter().all(|event| event.id == (-4_i32) as u64));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-shell-host"
-version = "0.2.0"
+version = "0.3.0"
 description = "SCTK layer-shell renderer host for Cosmix Quoin"
 edition = "2024"
 rust-version = "1.95"
@@ -13,6 +13,7 @@ bevy = { version = "=0.19.0", default-features = false, features = [
     "bevy_winit",
     "wayland",
 ] }
+bevy_winit = "=0.19.1"
 calloop = { version = "=0.13.0", features = ["signals"] }
 cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client" }
 cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config", features = ["client-helpers"] }
@@ -20,12 +21,14 @@ cosmix-shell = { path = "../cosmix-shell", default-features = false, features = 
 raw-window-handle = "=0.6.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-smithay-client-toolkit = { version = "=0.19.2", default-features = false, features = ["calloop"] }
+smithay-client-toolkit = { version = "=0.19.2", default-features = false, features = ["calloop", "xkbcommon"] }
 tracing = "0.1"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 wayland-client = "=0.31.14"
 wayland-backend = { version = "=0.3.15", features = ["client_system"] }
 wayland-protocols = { version = "=0.32.13", default-features = false, features = ["client", "staging"] }
+winit = { version = "=0.30.13", default-features = false, features = ["wayland", "x11"] }
+xkbcommon = "=0.7.0"
 
 [dev-dependencies]
 pretty_assertions = "1"

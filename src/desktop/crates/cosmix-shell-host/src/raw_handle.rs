@@ -153,8 +153,12 @@ mod tests {
     }
 
     #[test]
-    fn retained_owner_drops_surface_before_connection() {
+    fn raw_handle_drops_before_retained_surface_and_connection() {
         let log = Arc::new(Mutex::new(Vec::new()));
+        let raw_handle = DropProbe {
+            name: "raw-handle",
+            log: log.clone(),
+        };
         let owner = OrderedWaylandOwner {
             surface: DropProbe {
                 name: "surface",
@@ -165,7 +169,11 @@ mod tests {
                 log: log.clone(),
             },
         };
+        drop(raw_handle);
         drop(owner);
-        assert_eq!(*log.lock().unwrap(), ["surface", "connection"]);
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["raw-handle", "surface", "connection"]
+        );
     }
 }

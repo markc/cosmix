@@ -89,6 +89,7 @@ trait TeardownSteps {
     fn destroy_viewport(&mut self);
     fn destroy_fractional_scale(&mut self);
     fn drop_layer_role(&mut self);
+    fn drop_raw_handle(&mut self);
     fn drop_retained_owner(&mut self);
 }
 
@@ -96,6 +97,7 @@ fn run_teardown<S: TeardownSteps>(steps: &mut S) {
     steps.destroy_viewport();
     steps.destroy_fractional_scale();
     steps.drop_layer_role();
+    steps.drop_raw_handle();
     steps.drop_retained_owner();
 }
 
@@ -143,9 +145,12 @@ impl TeardownSteps for LiveObjects {
         drop(self.layer_surface.take());
     }
 
-    fn drop_retained_owner(&mut self) {
-        // Release both raw-handle owner references only after the layer role.
+    fn drop_raw_handle(&mut self) {
         drop(self.raw_handle.take());
+    }
+
+    fn drop_retained_owner(&mut self) {
+        // The retained wl_surface/display owner is always last.
         drop(self.raw_owner.take());
     }
 }
@@ -190,6 +195,13 @@ impl TeardownSteps for TeardownProbe {
             .lock()
             .expect("teardown probe lock is not poisoned")
             .push("layer");
+    }
+
+    fn drop_raw_handle(&mut self) {
+        self.sequence
+            .lock()
+            .expect("teardown probe lock is not poisoned")
+            .push("raw-handle");
     }
 
     fn drop_retained_owner(&mut self) {
@@ -331,6 +343,49 @@ fn validate_surface_size(logical: (u32, u32), scale: f64) -> Result<(u32, u32), 
     Ok((physical.0.ceil() as u32, physical.1.ceil() as u32))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SurfaceScalePlan {
+    scale_factor: f64,
+    physical_size: (u32, u32),
+    buffer_scale: i32,
+    viewport_destination: Option<(i32, i32)>,
+}
+
+fn surface_scale_plan(
+    logical: (u32, u32),
+    integer_scale: i32,
+    preferred_fractional_scale: Option<f64>,
+) -> Result<SurfaceScalePlan, SurfaceSizeError> {
+    let (scale_factor, buffer_scale, viewport_destination) =
+        if let Some(scale) = preferred_fractional_scale {
+            (
+                scale,
+                1,
+                Some((
+                    i32::try_from(logical.0).map_err(|_| SurfaceSizeError::LogicalOutOfRange {
+                        width: logical.0,
+                        height: logical.1,
+                    })?,
+                    i32::try_from(logical.1).map_err(|_| SurfaceSizeError::LogicalOutOfRange {
+                        width: logical.0,
+                        height: logical.1,
+                    })?,
+                )),
+            )
+        } else {
+            if integer_scale <= 0 {
+                return Err(SurfaceSizeError::InvalidScale(f64::from(integer_scale)));
+            }
+            (f64::from(integer_scale), integer_scale, None)
+        };
+    Ok(SurfaceScalePlan {
+        scale_factor,
+        physical_size: validate_surface_size(logical, scale_factor)?,
+        buffer_scale,
+        viewport_destination,
+    })
+}
+
 #[derive(Debug)]
 pub struct PanelSurface {
     pub edge: Edge,
@@ -372,6 +427,7 @@ impl PanelSurface {
         fractional: Option<FractionalObjects>,
         retained_mount: Option<Entity>,
     ) -> Result<Self, RawHandleError> {
+        debug_assert!(output_scale > 0, "selected output scale was validated");
         let window = app
             .world_mut()
             .spawn(Window {
@@ -436,7 +492,7 @@ impl PanelSurface {
                 },
             ))),
             output_size,
-            output_scale: output_scale.max(1),
+            output_scale,
             preferred_fractional_scale: None,
             configured_logical_size: None,
             announced_scale: None,
@@ -612,28 +668,17 @@ impl PanelSurface {
             .or(self.last_committed.as_ref())
             .map_or(1.0, |panel| panel.thickness_px);
         let requested = requested_logical_size(self.edge, self.output_size, thickness);
-        let logical = (
-            if configure.new_size.0 == 0 {
-                requested.0
-            } else {
-                configure.new_size.0
-            },
-            if configure.new_size.1 == 0 {
-                requested.1
-            } else {
-                configure.new_size.1
-            },
-        );
+        let logical = resolve_configure_size(configure.new_size, requested);
         let effect = configure_effect(self.phase, self.configured_logical_size, logical);
         if effect == ConfigureEffect::Ignore {
             return Ok(None);
         }
-        let scale = self.effective_scale();
-        let physical = validate_surface_size(logical, scale)?;
-        let scale_changed = self.announced_scale != Some(scale);
+        let scale =
+            surface_scale_plan(logical, self.output_scale, self.preferred_fractional_scale)?;
+        let scale_changed = self.announced_scale != Some(scale.scale_factor);
         self.configured_logical_size = Some(logical);
-        self.apply_scale_to_surface();
-        self.update_bevy_window(app, physical, scale);
+        self.apply_scale_to_surface(&scale);
+        self.update_bevy_window(app, scale.physical_size, scale.scale_factor);
         match effect {
             ConfigureEffect::InitialMap => {
                 self.waiting_configure_since = None;
@@ -675,9 +720,9 @@ impl PanelSurface {
         if scale_changed {
             app.world_mut().write_message(WindowScaleFactorChanged {
                 window: self.window,
-                scale_factor: scale,
+                scale_factor: scale.scale_factor,
             });
-            self.announced_scale = Some(scale);
+            self.announced_scale = Some(scale.scale_factor);
         }
         let mode = if effect == ConfigureEffect::InitialMap {
             self.commit_pending_configure()
@@ -701,18 +746,18 @@ impl PanelSurface {
         preferred_scale: u32,
     ) -> Result<(), SurfaceSizeError> {
         if preferred_scale == 0 {
-            return Ok(());
+            return Err(SurfaceSizeError::InvalidScale(0.0));
         }
-        let scale = f64::from(preferred_scale) / 120.0;
-        let physical = self
+        let preferred_scale = f64::from(preferred_scale) / 120.0;
+        let plan = self
             .configured_logical_size
-            .map(|logical| validate_surface_size(logical, scale))
+            .map(|logical| surface_scale_plan(logical, self.output_scale, Some(preferred_scale)))
             .transpose()?;
-        let scale_changed = self.announced_scale != Some(scale);
-        self.preferred_fractional_scale = Some(scale);
-        self.apply_scale_to_surface();
-        if let (Some(logical), Some(physical)) = (self.configured_logical_size, physical) {
-            self.update_bevy_window(app, physical, scale);
+        let scale_changed = self.announced_scale != Some(preferred_scale);
+        self.preferred_fractional_scale = Some(preferred_scale);
+        if let (Some(logical), Some(plan)) = (self.configured_logical_size, plan) {
+            self.apply_scale_to_surface(&plan);
+            self.update_bevy_window(app, plan.physical_size, plan.scale_factor);
             app.world_mut().write_message(WindowResized {
                 window: self.window,
                 width: logical.0 as f32,
@@ -721,9 +766,9 @@ impl PanelSurface {
             if scale_changed {
                 app.world_mut().write_message(WindowScaleFactorChanged {
                     window: self.window,
-                    scale_factor: scale,
+                    scale_factor: plan.scale_factor,
                 });
-                self.announced_scale = Some(scale);
+                self.announced_scale = Some(plan.scale_factor);
             }
         }
         Ok(())
@@ -735,25 +780,29 @@ impl PanelSurface {
         logical_size: LogicalSize,
         integer_scale: i32,
     ) -> Result<(), SurfaceSizeError> {
-        let scale = self
-            .preferred_fractional_scale
-            .unwrap_or(f64::from(integer_scale.max(1)));
-        let physical = self
+        if integer_scale <= 0 {
+            return Err(SurfaceSizeError::InvalidScale(f64::from(integer_scale)));
+        }
+        let plan = self
             .configured_logical_size
-            .map(|logical| validate_surface_size(logical, scale))
+            .map(|logical| {
+                surface_scale_plan(logical, integer_scale, self.preferred_fractional_scale)
+            })
             .transpose()?;
-        let scale_changed = self.announced_scale != Some(scale);
+        let scale_changed = plan
+            .as_ref()
+            .is_some_and(|plan| self.announced_scale != Some(plan.scale_factor));
         self.output_size = logical_size;
-        self.output_scale = integer_scale.max(1);
-        self.apply_scale_to_surface();
-        if let (Some(_), Some(physical)) = (self.configured_logical_size, physical) {
-            self.update_bevy_window(app, physical, scale);
+        self.output_scale = integer_scale;
+        if let (Some(_), Some(plan)) = (self.configured_logical_size, plan) {
+            self.apply_scale_to_surface(&plan);
+            self.update_bevy_window(app, plan.physical_size, plan.scale_factor);
             if scale_changed {
                 app.world_mut().write_message(WindowScaleFactorChanged {
                     window: self.window,
-                    scale_factor: scale,
+                    scale_factor: plan.scale_factor,
                 });
-                self.announced_scale = Some(scale);
+                self.announced_scale = Some(plan.scale_factor);
             }
         }
         Ok(())
@@ -924,32 +973,27 @@ impl PanelSurface {
         }
     }
 
-    fn effective_scale(&self) -> f64 {
-        self.preferred_fractional_scale
-            .unwrap_or(f64::from(self.output_scale))
-    }
-
-    fn apply_scale_to_surface(&self) {
+    fn apply_scale_to_surface(&self, plan: &SurfaceScalePlan) {
         let Some(objects) = &self.wayland else {
             return;
         };
         let objects = objects.live();
         let wl_surface = objects.layer_surface().wl_surface();
-        if self.preferred_fractional_scale.is_some() {
+        if plan.viewport_destination.is_some() {
             if wl_surface.version() >= 3 {
-                wl_surface.set_buffer_scale(1);
+                wl_surface.set_buffer_scale(plan.buffer_scale);
             }
             if let (Some(fractional), Some((width, height))) =
-                (&objects.fractional, self.configured_logical_size)
+                (&objects.fractional, plan.viewport_destination)
             {
                 fractional
                     .viewport
                     .as_ref()
                     .expect("live fractional objects retain their viewport")
-                    .set_destination(width as i32, height as i32);
+                    .set_destination(width, height);
             }
         } else if wl_surface.version() >= 3 {
-            wl_surface.set_buffer_scale(self.output_scale);
+            wl_surface.set_buffer_scale(plan.buffer_scale);
         }
     }
 
@@ -973,6 +1017,21 @@ fn requested_logical_size(edge: Edge, output: LogicalSize, thickness: f32) -> (u
     }
 }
 
+fn resolve_configure_size(configured: (u32, u32), requested: (u32, u32)) -> (u32, u32) {
+    (
+        if configured.0 == 0 {
+            requested.0
+        } else {
+            configured.0
+        },
+        if configured.1 == 0 {
+            requested.1
+        } else {
+            configured.1
+        },
+    )
+}
+
 fn sctk_anchor(anchor: ProtocolAnchor) -> Anchor {
     let mut value = Anchor::empty();
     if anchor.top {
@@ -994,7 +1053,7 @@ fn sctk_anchor(anchor: ProtocolAnchor) -> Anchor {
 mod tests {
     use super::*;
 
-    const TEARDOWN_ORDER: [&str; 4] = ["viewport", "fractional", "layer", "owner"];
+    const TEARDOWN_ORDER: [&str; 5] = ["viewport", "fractional", "layer", "raw-handle", "owner"];
 
     fn teardown_sequence() -> Arc<Mutex<Vec<&'static str>>> {
         Arc::new(Mutex::new(Vec::new()))
@@ -1180,5 +1239,68 @@ mod tests {
             validate_surface_size((32, 32), f64::INFINITY),
             Err(SurfaceSizeError::InvalidScale(_))
         ));
+    }
+
+    #[test]
+    fn integer_and_fractional_scale_plans_keep_protocol_geometry_logical() {
+        let logical = (1_001, 33);
+        assert_eq!(
+            surface_scale_plan(logical, 1, None),
+            Ok(SurfaceScalePlan {
+                scale_factor: 1.0,
+                physical_size: (1_001, 33),
+                buffer_scale: 1,
+                viewport_destination: None,
+            })
+        );
+        assert!(matches!(
+            surface_scale_plan(logical, 0, None),
+            Err(SurfaceSizeError::InvalidScale(0.0))
+        ));
+        assert!(matches!(
+            surface_scale_plan(logical, 2, Some(0.0)),
+            Err(SurfaceSizeError::InvalidScale(0.0))
+        ));
+        assert_eq!(
+            surface_scale_plan(logical, 2, None),
+            Ok(SurfaceScalePlan {
+                scale_factor: 2.0,
+                physical_size: (2_002, 66),
+                buffer_scale: 2,
+                viewport_destination: None,
+            })
+        );
+        assert_eq!(
+            surface_scale_plan(logical, 2, Some(150.0 / 120.0)),
+            Ok(SurfaceScalePlan {
+                scale_factor: 1.25,
+                physical_size: (1_252, 42),
+                buffer_scale: 1,
+                viewport_destination: Some((1_001, 33)),
+            })
+        );
+    }
+
+    #[test]
+    fn configure_size_zero_falls_back_per_axis_to_the_planner_request() {
+        assert_eq!(resolve_configure_size((0, 0), (1_920, 32)), (1_920, 32));
+        assert_eq!(resolve_configure_size((800, 0), (1_920, 32)), (800, 32));
+        assert_eq!(resolve_configure_size((0, 48), (1_920, 32)), (1_920, 48));
+    }
+
+    #[test]
+    fn surface_close_is_idempotent_and_tears_down_without_panicking() {
+        let mut app = App::new();
+        let sequence = teardown_sequence();
+        let mut panel =
+            PanelSurface::test_double(&mut app, SurfacePhase::Configured, Arc::clone(&sequence));
+
+        panel.close(&mut app);
+        panel.close(&mut app);
+        assert_eq!(panel.phase, SurfacePhase::Closed);
+        panel.finish_close();
+        panel.finish_close();
+
+        assert_eq!(recorded(&sequence), TEARDOWN_ORDER);
     }
 }

@@ -5,26 +5,33 @@
 existing Quoin chrome into one explicit Bevy window target per surface. The
 installable application id and layer namespace are `dev.cosmix.quoin`.
 
-Arc 3 presents real layer-shell buffers through `cosmix-shell-host` 0.2.0,
-`cosmix-shell` 0.3.0 and SCTK 0.19.2. `cosmix-quoin-demo` remains a
+Arc 3 presents real layer-shell buffers through `cosmix-shell-host` 0.3.0,
+`cosmix-shell` 0.3.0 and SCTK 0.19.2. `cosmix-quoin` is 0.4.0;
+`cosmix-quoin-demo` remains a
 feature-gated, non-installable normal-window tuning arm; it is not a
 layer-shell client.
 
 ## Output and scale
 
-Version 1 owns exactly one output runtime. `--output NAME` selects an exact
-complete SCTK output; without it, Quoin selects the first complete output in
-advertisement order. Every panel role is created with that explicit
-`wl_output`, never the compositor default. Removing the selected output closes
-and render-drains its surfaces; Quoin then creates a fresh singleton runtime
-on the next complete output, or exits cleanly when no requested replacement
-remains.
+Version 1 owns exactly one output runtime. `--output NAME` selects the exact
+complete SCTK `wl_output` advertising that name. A missing name is an error
+which lists every advertised output. Without the option, Quoin selects the
+first complete output in advertisement order. Every panel role is created
+with that explicit `wl_output`, never the compositor default. Removing an
+explicitly selected output unmaps and render-drains all four panels, drops
+their protocol resources, then exits cleanly; a later output reusing the same
+name is not the selected object. A default selection instead migrates to the
+next complete output, or exits cleanly when none remains.
 
-Layer protocol dimensions remain logical. Integer output scale uses
-`wl_surface.set_buffer_scale`; when fractional-scale and viewporter are
-available, Quoin keeps buffer scale 1, renders `ceil(logical × scale)` pixels
-and sets the viewport destination back to the configured logical size. Bevy
-stores the corresponding physical resolution and scale override.
+Layer protocol and viewport destination dimensions remain logical. Integer
+output scale 1 or 2 renders physical buffers at `logical × scale` and applies
+that integer with `wl_surface.set_buffer_scale`. With a fractional preferred
+scale such as 1.25 (150/120), Quoin keeps buffer scale 1, renders
+`ceil(logical × scale)` physical pixels and sets the `wp_viewport` destination
+back to the configured logical size. Bevy stores the corresponding physical
+resolution and scale override. Either zero configure dimension falls back to
+the planner-requested logical dimension; a compositor close or invalid scale
+terminates the affected lifecycle cleanly rather than panicking.
 
 ## Map, presentation and replay
 
@@ -70,6 +77,12 @@ one-second deadline is content work and disappears when that panel is
 unmapped. Callbacks are generation-tagged, so late or expired callbacks are
 ignored (the tag is a saturating 64-bit counter: reuse would need 2^64
 requests, which no process lifetime reaches).
+
+Keyboard repeat shares this wake layer. The active key owns one replaceable
+absolute deadline; a due wake emits one coalesced repeat and arms the next
+deadline from the actual wake time. There is no per-key thread, catch-up burst,
+sleep loop or refresh timer. `Idle` therefore has no timer unless a real
+repeat, configure or other bounded deadline is outstanding.
 
 Two bounded one-shot liveness backstops share that single timer. The frame
 backstop participates only while the policy is `Animate` and a frame callback
@@ -138,8 +151,19 @@ pointer is also outside. Native SCTK pointer enter/leave supplies the second
 hold; Bevy pointer button events drive pin, both carousel chevrons and page
 dots. Pin survives both leaves, and unpin outside both holds starts normal
 grace. Wheel events are delivered to Bevy although current chrome does not
-consume them. Keyboard, touch and resize interaction remain slice 3. The pure
-`CornerDetector` remains a development-host tuning tool and is not a
+consume them.
+
+SCTK installs the compositor xkb keymap and maps physical keys, logical keys,
+text, modifiers and repeat into Bevy's input model. Focus loss, panel teardown
+and keyboard capability loss synthesize releases for held keys, clear pressed
+state and stop repeat. Touch down is attributed to the exact panel surface;
+motion and up retain that attribution and use the same panel-to-output logical
+coordinate conversion as the pointer bridge. Touch cancel, teardown and
+capability loss emit cancellation and clear every held contact. One active
+seat is supported: Quoin chooses the first advertised capable seat and fails
+over after its removal.
+
+The pure `CornerDetector` remains a development-host tuning tool and is not a
 production reveal source.
 
 Stable transition markers are:
@@ -173,6 +197,11 @@ This arc vendors nothing and edits no Smithay source. Quoin consumes
 `cosmix-comp`'s documented public layer-shell contract unchanged.
 
 ## Known limits
+
+This host deliberately supports one output runtime and one active seat. It
+does not mirror panels across several outputs or merge simultaneous input from
+several seats. Use `--output NAME` when advertisement-order selection is not
+appropriate.
 
 Destroy-and-recreate is required because the current compositor rejects an
 acknowledgement for a configure serial retained across unmap. If the
