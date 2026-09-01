@@ -54,12 +54,12 @@ use wayland_protocols::wp::viewporter::client::{
 };
 
 use crate::corner_bus::{CornerBusHandle, CornerIngress, gate_ingress, start as start_corner_bus};
-use crate::input::{PointerBridge, SurfaceTarget};
+use crate::input::{PointerBridge, SurfaceTarget, configure_ingress, stage_shell_command};
 use crate::output::{
     OutputError, OutputRuntime, OutputRuntimeMap, SelectedOutput, insert_single_output,
     select_output,
 };
-use crate::planner::{OutputGeometry, ProtocolOp, plan_surface};
+use crate::planner::{OutputGeometry, ProtocolOp, committed_edge_margin, plan_surface};
 use crate::surface::{
     ApplyResult, FractionalObjects, FrameCallbackData, PanelSurface, SurfacePhase, SurfaceTag,
 };
@@ -92,6 +92,54 @@ fn commit_advance<E>(execution: Result<ApplyResult, E>, unmap: bool) -> Result<C
         ApplyResult::Noop if unmap => CommitAdvance::Retain,
         ApplyResult::Noop => CommitAdvance::Repair,
     })
+}
+
+fn commit_advance_for_phase<E>(
+    execution: Result<ApplyResult, E>,
+    unmap: bool,
+    awaiting_initial_configure: bool,
+) -> Result<CommitAdvance, E> {
+    if awaiting_initial_configure && !unmap {
+        execution.map(|_| CommitAdvance::Pending)
+    } else {
+        commit_advance(execution, unmap)
+    }
+}
+
+fn record_commit_advance(
+    last_committed: &mut Option<cosmix_shell::runtime::PanelPresentation>,
+    pending_committed: &mut Option<cosmix_shell::runtime::PanelPresentation>,
+    next: &cosmix_shell::runtime::PanelPresentation,
+    advance: CommitAdvance,
+    unmap: bool,
+) -> Option<cosmix_shell::core::PanelMode> {
+    match advance {
+        CommitAdvance::Advance => {
+            *last_committed = Some(next.clone());
+            *pending_committed = None;
+            Some(next.mode)
+        }
+        CommitAdvance::Pending => {
+            *pending_committed = Some(next.clone());
+            None
+        }
+        CommitAdvance::Repair if last_committed.as_ref() == Some(next) && !unmap => Some(next.mode),
+        CommitAdvance::Repair | CommitAdvance::Retain => None,
+    }
+}
+
+fn update_committed_modes(
+    modes: &mut QuoinCommittedMotionModes,
+    committed: impl IntoIterator<Item = (Edge, cosmix_shell::core::PanelMode)>,
+) -> bool {
+    let mut changed = false;
+    for (edge, mode) in committed {
+        if modes.get(edge) != mode {
+            modes.set(edge, mode);
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn layer_close_decision(output_live: bool, replacement_pending: bool) -> LayerCloseDecision {
@@ -235,6 +283,7 @@ pub fn configure_layer_host(app: &mut App, config: LayerHostConfig) -> &mut App 
     // the sole owner and the runner can log and drain a clean exit.
     #[cfg(target_os = "linux")]
     let signals = Signals::new(&[Signal::SIGINT, Signal::SIGTERM]);
+    configure_ingress(app);
     app.add_plugins(
         DefaultPlugins
             .build()
@@ -795,7 +844,11 @@ impl RunnerState {
             {
                 continue;
             }
-            let operations = plan_surface(panel.last_committed.as_ref(), next, geometry)
+            let effective_previous = panel
+                .pending_committed
+                .as_ref()
+                .or(panel.last_committed.as_ref());
+            let operations = plan_surface(effective_previous, next, geometry)
                 .map_err(|error| LayerHostError::new(error.to_string()))?;
             if !panel.has_wayland_objects() && operations.contains(&ProtocolOp::CreateSurface) {
                 let (wl_surface, layer_surface, fractional) =
@@ -809,28 +862,22 @@ impl RunnerState {
                 panel.begin_unmap(app);
                 unmaps.push((edge, next.clone()));
             }
-            let advance = commit_advance::<std::convert::Infallible>(
+            let awaiting_initial_configure =
+                panel.phase == SurfacePhase::WaitingConfigure && panel.pending_committed.is_some();
+            let advance = commit_advance_for_phase::<std::convert::Infallible>(
                 Ok(panel.apply_protocol_ops(&operations, elapsed)),
                 operations.contains(&ProtocolOp::Unmap),
+                awaiting_initial_configure,
             )
             .expect("infallible Wayland request executor");
-            match advance {
-                CommitAdvance::Advance => {
-                    panel.last_committed = Some(next.clone());
-                    panel.pending_committed = None;
-                    committed_modes.push((edge, next.mode));
-                }
-                CommitAdvance::Pending => {
-                    panel.pending_committed = Some(next.clone());
-                }
-                CommitAdvance::Repair => {
-                    if panel.last_committed.as_ref() == Some(next)
-                        && !operations.contains(&ProtocolOp::Unmap)
-                    {
-                        committed_modes.push((edge, next.mode));
-                    }
-                }
-                CommitAdvance::Retain => {}
+            if let Some(mode) = record_commit_advance(
+                &mut panel.last_committed,
+                &mut panel.pending_committed,
+                next,
+                advance,
+                operations.contains(&ProtocolOp::Unmap),
+            ) {
+                committed_modes.push((edge, mode));
             }
         }
         if !unmaps.is_empty() {
@@ -844,11 +891,13 @@ impl RunnerState {
             }
         }
         if !committed_modes.is_empty() {
-            let mut modes = app.world_mut().resource_mut::<QuoinCommittedMotionModes>();
-            for (edge, mode) in committed_modes {
-                modes.set(edge, mode);
+            let changed = {
+                let mut modes = app.world_mut().resource_mut::<QuoinCommittedMotionModes>();
+                update_committed_modes(&mut modes, committed_modes)
+            };
+            if changed {
+                self.needs_update = true;
             }
-            self.needs_update = true;
         }
         self.last_wake = frame.wake;
         if frame.wake == WakePolicy::Animate {
@@ -1306,30 +1355,41 @@ impl PointerHandler for RunnerState {
         let targets = self
             .outputs
             .values()
-            .flat_map(|output| output.panels.iter())
-            .filter_map(|panel| {
+            .flat_map(|output| output.panels.iter().map(move |panel| (output, panel)))
+            .filter_map(|(output, panel)| {
+                let presentation = panel.last_committed.as_ref()?;
                 panel.wayland_surface().map(|surface| SurfaceTarget {
                     surface,
                     window: panel.window,
                     edge: panel.edge,
+                    output_size: Vec2::new(
+                        output.logical_size.width(),
+                        output.logical_size.height(),
+                    ),
+                    thickness: presentation.thickness_px,
+                    committed_margin: committed_edge_margin(presentation),
                 })
             })
             .collect::<Vec<_>>();
         let Some(output) = self.selected_key.as_ref() else {
             return;
         };
-        self.pointer_bridge
-            .frame(&mut self.app, output, &targets, events);
+        if self
+            .pointer_bridge
+            .frame(&mut self.app, output, &targets, events)
+            && let Some(position) = self.pointer_bridge.last_output_position()
+        {
+            tracing::trace!(
+                event = "quoin_pointer_output_position",
+                x = position.x,
+                y = position.y
+            );
+        }
     }
 }
 
 impl RunnerState {
     fn apply_corner_ingress(&mut self, ingress: CornerIngress) {
-        let at = self
-            .app
-            .world()
-            .get_resource::<Time<Real>>()
-            .map_or(Duration::ZERO, Time::elapsed);
         self.corner_epoch = self.corner_epoch.max(ingress.epoch());
         let resets = matches!(
             &ingress,
@@ -1365,11 +1425,11 @@ impl RunnerState {
             return;
         };
         for event in events {
-            self.app.world_mut().write_message(ShellCommand {
-                output: output.clone(),
-                at,
-                kind: ShellCommandKind::Corner(event),
-            });
+            stage_shell_command(
+                &mut self.app,
+                output.clone(),
+                ShellCommandKind::Corner(event),
+            );
             self.needs_update = true;
         }
     }
@@ -1510,6 +1570,13 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    use bevy::MinimalPlugins;
+    use bevy::time::TimeUpdateStrategy;
+    use cosmix_shell::core::{
+        ConcealReason, Corner, CornerEvent, CornerTrigger, PanelEffect, PanelMode,
+    };
+    use cosmix_shell::runtime::{ShellEffects, ShellRuntimePlugin};
+
     use crate::surface::frame_request_overdue;
 
     #[test]
@@ -1539,6 +1606,201 @@ mod tests {
         assert_eq!(
             commit_advance::<&str>(Ok(ApplyResult::Noop), true),
             Ok(CommitAdvance::Retain)
+        );
+        assert_eq!(
+            commit_advance_for_phase::<&str>(Ok(ApplyResult::Committed), false, true),
+            Ok(CommitAdvance::Pending),
+            "property commits before the first configure remain pending"
+        );
+        assert_eq!(
+            commit_advance_for_phase::<&str>(Ok(ApplyResult::Noop), true, true),
+            Ok(CommitAdvance::Retain),
+            "cancelling a pending first map must still take the unmap path"
+        );
+    }
+
+    #[test]
+    fn stable_committed_presentation_schedules_zero_further_updates() {
+        let mut modes = QuoinCommittedMotionModes::hidden();
+        assert!(!update_committed_modes(
+            &mut modes,
+            [(Edge::Left, PanelMode::Hidden)]
+        ));
+        assert_eq!(modes.get(Edge::Left), PanelMode::Hidden);
+    }
+
+    #[test]
+    fn committed_owner_seam_covers_deferred_failure_commit_and_unmap() {
+        let model = ShellModel::new(
+            OutputKey::new("DP-1").unwrap(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let hidden = cosmix_shell::runtime::ShellFrame::from_model(&model)
+            .panel(Edge::Left)
+            .clone();
+        let mut revealed = hidden.clone();
+        revealed.mode = PanelMode::Revealed;
+        revealed.mapped = true;
+
+        let mut last = None;
+        let mut pending = None;
+        let committed = record_commit_advance(
+            &mut last,
+            &mut pending,
+            &revealed,
+            commit_advance::<&str>(Ok(ApplyResult::Committed), false).unwrap(),
+            false,
+        )
+        .unwrap();
+        let mut modes = QuoinCommittedMotionModes::hidden();
+        assert!(update_committed_modes(
+            &mut modes,
+            [(Edge::Left, committed)]
+        ));
+        assert_eq!(modes.get(Edge::Left), PanelMode::Revealed);
+
+        last = None;
+        pending = None;
+        assert_eq!(
+            record_commit_advance(
+                &mut last,
+                &mut pending,
+                &revealed,
+                commit_advance::<&str>(Ok(ApplyResult::AwaitingConfigure), false).unwrap(),
+                false,
+            ),
+            None
+        );
+        assert_eq!(pending.as_ref(), Some(&revealed));
+
+        assert!(commit_advance(Err::<ApplyResult, _>("commit failed"), false).is_err());
+        assert!(last.is_none(), "failure must not fabricate a commit");
+        assert_eq!(pending.as_ref(), Some(&revealed));
+
+        let operations = plan_surface(
+            pending.as_ref().or(last.as_ref()),
+            &hidden,
+            OutputGeometry {
+                width: 1_000.0,
+                height: 800.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(operations, [ProtocolOp::Unmap]);
+
+        assert!(pending.take().is_some());
+        last = Some(hidden.clone());
+        modes = QuoinCommittedMotionModes::hidden();
+        assert!(!update_committed_modes(
+            &mut modes,
+            [(Edge::Left, hidden.mode)]
+        ));
+        assert_eq!(last.as_ref(), Some(&hidden));
+    }
+
+    #[test]
+    fn production_ingress_timer_and_pending_map_reconcile_corner_left_without_frames() {
+        let output = OutputKey::new("DP-1").unwrap();
+        let model = ShellModel::new(
+            output.clone(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let mut app = App::new();
+        configure_ingress(&mut app);
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)));
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs(1)));
+
+        stage_shell_command(
+            &mut app,
+            output.clone(),
+            ShellCommandKind::Corner(CornerEvent::Entered {
+                corner: Corner::TopLeft,
+                dwell: Duration::from_millis(200),
+                trigger: CornerTrigger::Compositor,
+            }),
+        );
+        app.update();
+        *app.world_mut().resource_mut::<TimeUpdateStrategy>() =
+            TimeUpdateStrategy::ManualDuration(Duration::from_millis(200));
+        app.update();
+        let revealed = app
+            .world()
+            .resource::<ShellFrameState>()
+            .0
+            .panel(Edge::Left)
+            .clone();
+        assert!(revealed.mapped);
+
+        let mut last = None;
+        let mut pending = None;
+        record_commit_advance(
+            &mut last,
+            &mut pending,
+            &revealed,
+            CommitAdvance::Pending,
+            false,
+        );
+
+        *app.world_mut().resource_mut::<TimeUpdateStrategy>() =
+            TimeUpdateStrategy::ManualDuration(Duration::from_millis(10));
+        stage_shell_command(
+            &mut app,
+            output,
+            ShellCommandKind::Corner(CornerEvent::Left {
+                corner: Corner::TopLeft,
+            }),
+        );
+        app.update();
+        let left = app.world().resource::<ShellFrameState>().0.clone();
+        let deadline = match left.wake {
+            WakePolicy::WakeAt(deadline) => deadline,
+            policy => panic!("left must arm one calloop deadline, got {policy:?}"),
+        };
+        assert_eq!(deadline, Duration::from_millis(1_010));
+        assert_eq!(next_timer_deadline(left.wake, None, &[]), Some(deadline));
+
+        *app.world_mut().resource_mut::<TimeUpdateStrategy>() =
+            TimeUpdateStrategy::ManualDuration(Duration::from_millis(800));
+        app.update();
+        assert_eq!(
+            app.world().resource::<ShellEffects>().0,
+            [cosmix_shell::runtime::ShellEffect {
+                edge: Edge::Left,
+                effect: PanelEffect::Conceal {
+                    reason: ConcealReason::CornerLeft,
+                },
+            }]
+        );
+
+        *app.world_mut().resource_mut::<TimeUpdateStrategy>() =
+            TimeUpdateStrategy::ManualDuration(Duration::from_millis(200));
+        app.update();
+        let concealed = app
+            .world()
+            .resource::<ShellFrameState>()
+            .0
+            .panel(Edge::Left)
+            .clone();
+        assert!(!concealed.mapped);
+        assert_eq!(
+            plan_surface(
+                pending.as_ref().or(last.as_ref()),
+                &concealed,
+                OutputGeometry {
+                    width: 1_000.0,
+                    height: 800.0,
+                },
+            )
+            .unwrap(),
+            [ProtocolOp::Unmap]
         );
     }
 

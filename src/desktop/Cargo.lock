@@ -2769,7 +2769,6 @@ dependencies = [
  "cosmix-lib-client",
  "cosmix-lib-config",
  "cosmix-shell",
- "ctk",
  "pretty_assertions",
  "raw-window-handle",
  "serde",

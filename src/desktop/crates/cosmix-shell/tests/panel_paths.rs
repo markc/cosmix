@@ -111,6 +111,20 @@ fn pointer_enter_after_corner_left_cancels_corner_conceal() {
 }
 
 #[test]
+fn pointer_leave_during_active_corner_does_not_arm_conceal() {
+    let mut panel = panel();
+    panel.apply(ms(0), PanelInput::CornerEntered).unwrap();
+    panel.apply(ms(100), PanelInput::PointerEntered).unwrap();
+    panel.apply(ms(200), PanelInput::PointerLeft).unwrap();
+
+    assert!(panel.snapshot().corner_inside);
+    assert!(!panel.snapshot().pointer_inside);
+    assert_eq!(panel.snapshot().hide_at, None);
+    panel.tick(ms(2_000)).unwrap();
+    assert_eq!(panel.snapshot().mode, PanelMode::Revealed);
+}
+
+#[test]
 fn late_corner_or_pin_effect_supersedes_an_unpresented_expired_conceal() {
     let mut panel = panel();
     panel.apply(ms(0), PanelInput::CornerEntered).unwrap();

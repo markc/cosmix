@@ -282,6 +282,14 @@ fn desired(panel: &PanelPresentation) -> Result<DesiredSurface, PlanError> {
     })
 }
 
+pub(crate) fn committed_edge_margin(panel: &PanelPresentation) -> i32 {
+    if panel.mode == PanelMode::Pinned {
+        0
+    } else {
+        -((1.0 - panel.visible_fraction) * panel.thickness_px).round() as i32
+    }
+}
+
 fn full_replay(surface: DesiredSurface) -> Vec<ProtocolOp> {
     vec![
         ProtocolOp::CreateSurface,

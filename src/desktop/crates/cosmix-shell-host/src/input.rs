@@ -1,14 +1,15 @@
 //! Native SCTK pointer input translated into Bevy window input and shell holds.
 
-use std::time::Duration;
-
+use bevy::app::Update;
+use bevy::ecs::message::MessageWriter;
 use bevy::input::ButtonState;
 use bevy::input::mouse::{MouseButton, MouseButtonInput, MouseScrollUnit, MouseWheel};
 use bevy::input::touch::TouchPhase;
-use bevy::prelude::{App, Entity, Vec2, Window};
+use bevy::prelude::{App, Entity, IntoScheduleConfigs, Res, ResMut, Resource, Time, Vec2, Window};
+use bevy::time::Real;
 use bevy::window::{CursorEntered, CursorLeft, CursorMoved, WindowEvent};
 use cosmix_shell::core::{Edge, OutputKey, PanelInput};
-use cosmix_shell::runtime::{ShellCommand, ShellCommandKind};
+use cosmix_shell::runtime::{ShellCommand, ShellCommandKind, ShellRuntimeSet};
 use smithay_client_toolkit::seat::pointer::{
     AxisScroll, BTN_BACK, BTN_EXTRA, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE,
     PointerEvent, PointerEventKind,
@@ -21,6 +22,9 @@ pub(crate) struct SurfaceTarget {
     pub surface: wl_surface::WlSurface,
     pub window: Entity,
     pub edge: Edge,
+    pub output_size: Vec2,
+    pub thickness: f32,
+    pub committed_margin: i32,
 }
 
 #[derive(Clone)]
@@ -29,6 +33,35 @@ struct Focus {
     window: Entity,
     edge: Edge,
     position: Vec2,
+    output_position: Vec2,
+}
+
+#[derive(Resource, Default)]
+pub(crate) struct StagedShellCommands(Vec<(OutputKey, ShellCommandKind)>);
+
+pub(crate) fn configure_ingress(app: &mut App) {
+    app.init_resource::<StagedShellCommands>().add_systems(
+        Update,
+        flush_staged_shell_commands.in_set(ShellRuntimeSet::Input),
+    );
+}
+
+pub(crate) fn stage_shell_command(app: &mut App, output: OutputKey, kind: ShellCommandKind) {
+    app.world_mut()
+        .resource_mut::<StagedShellCommands>()
+        .0
+        .push((output, kind));
+}
+
+fn flush_staged_shell_commands(
+    time: Res<Time<Real>>,
+    mut staged: ResMut<StagedShellCommands>,
+    mut commands: MessageWriter<ShellCommand>,
+) {
+    let at = time.elapsed();
+    for (output, kind) in staged.0.drain(..) {
+        commands.write(ShellCommand { output, at, kind });
+    }
 }
 
 #[derive(Default)]
@@ -37,6 +70,7 @@ pub(crate) struct PointerBridge {
     pressed: Vec<MouseButton>,
     axis_active: bool,
     diagnostics: u64,
+    last_output_position: Option<Vec2>,
 }
 
 impl PointerBridge {
@@ -71,10 +105,12 @@ impl PointerBridge {
                     self.enter(
                         app,
                         output,
-                        target.surface.id().protocol_id(),
-                        target.window,
-                        target.edge,
-                        position,
+                        (
+                            target.surface.id().protocol_id(),
+                            target.window,
+                            target.edge,
+                        ),
+                        (position, output_position(target, position)),
                     );
                     handled = true;
                 }
@@ -103,6 +139,7 @@ impl PointerBridge {
                         continue;
                     };
                     self.motion(app, target.window, position);
+                    self.record_output_position(target, position);
                     match event.kind {
                         PointerEventKind::Press { button, .. } => {
                             if let Some(button) = translate_button(button) {
@@ -153,6 +190,11 @@ impl PointerBridge {
                     {
                         continue;
                     }
+                    let Some(position) = valid_position(app, target.window, event.position) else {
+                        self.reject("invalid-axis-position");
+                        continue;
+                    };
+                    self.record_output_position(target, position);
                     self.axis(app, target.window, *horizontal, *vertical);
                     handled = true;
                 }
@@ -165,11 +207,11 @@ impl PointerBridge {
         &mut self,
         app: &mut App,
         output: &OutputKey,
-        surface_id: u32,
-        window: Entity,
-        edge: Edge,
-        position: Vec2,
+        target: (u32, Entity, Edge),
+        positions: (Vec2, Vec2),
     ) {
+        let (surface_id, window, edge) = target;
+        let (position, output_position) = positions;
         set_cursor(app, window, Some(position));
         emit_window(app, CursorEntered { window });
         emit_window(
@@ -181,11 +223,13 @@ impl PointerBridge {
             },
         );
         semantic(app, output, edge, PanelInput::PointerEntered);
+        self.last_output_position = Some(output_position);
         self.focus = Some(Focus {
             surface_id,
             window,
             edge,
             position,
+            output_position,
         });
     }
 
@@ -250,6 +294,18 @@ impl PointerBridge {
         if let Some(focus) = self.focus.as_mut() {
             focus.position = position;
         }
+    }
+
+    fn record_output_position(&mut self, target: &SurfaceTarget, local: Vec2) {
+        let position = output_position(target, local);
+        self.last_output_position = Some(position);
+        if let Some(focus) = self.focus.as_mut() {
+            focus.output_position = position;
+        }
+    }
+
+    pub(crate) const fn last_output_position(&self) -> Option<Vec2> {
+        self.last_output_position
     }
 
     fn leave(&mut self, app: &mut App, output: &OutputKey) {
@@ -347,15 +403,17 @@ where
 }
 
 fn semantic(app: &mut App, output: &OutputKey, edge: Edge, input: PanelInput) {
-    let at = app
-        .world()
-        .get_resource::<bevy::time::Time<bevy::time::Real>>()
-        .map_or(Duration::ZERO, bevy::time::Time::elapsed);
-    app.world_mut().write_message(ShellCommand {
-        output: output.clone(),
-        at,
-        kind: ShellCommandKind::Panel { edge, input },
-    });
+    stage_shell_command(app, output.clone(), ShellCommandKind::Panel { edge, input });
+}
+
+fn output_position(target: &SurfaceTarget, local: Vec2) -> Vec2 {
+    output_logical_position(
+        target.edge,
+        local,
+        target.output_size,
+        target.thickness,
+        target.committed_margin,
+    )
 }
 
 fn translate_button(button: u32) -> Option<MouseButton> {
@@ -393,6 +451,7 @@ mod tests {
 
     fn pointer_app() -> (App, Entity, OutputKey) {
         let mut app = App::new();
+        app.init_resource::<StagedShellCommands>();
         app.add_message::<CursorEntered>()
             .add_message::<CursorMoved>()
             .add_message::<CursorLeft>()
@@ -440,10 +499,8 @@ mod tests {
         bridge.enter(
             &mut app,
             &output,
-            7,
-            window,
-            Edge::Left,
-            Vec2::new(20.0, 10.0),
+            (7, window, Edge::Left),
+            (Vec2::new(20.0, 10.0), Vec2::new(20.0, 10.0)),
         );
         bridge.motion(&mut app, window, Vec2::new(24.0, 13.0));
         let events = app
@@ -476,10 +533,8 @@ mod tests {
         bridge.enter(
             &mut app,
             &output,
-            7,
-            window,
-            Edge::Top,
-            Vec2::new(20.0, 10.0),
+            (7, window, Edge::Top),
+            (Vec2::new(20.0, 10.0), Vec2::new(20.0, 10.0)),
         );
         bridge.axis(
             &mut app,
@@ -538,10 +593,8 @@ mod tests {
         bridge.enter(
             &mut app,
             &output,
-            7,
-            window,
-            Edge::Right,
-            Vec2::new(10.0, 20.0),
+            (7, window, Edge::Right),
+            (Vec2::new(10.0, 20.0), Vec2::new(10.0, 20.0)),
         );
         bridge.pressed.push(MouseButton::Left);
         bridge.axis_active = true;

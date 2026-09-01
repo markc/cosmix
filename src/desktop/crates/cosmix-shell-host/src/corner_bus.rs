@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ use cosmix_client::{
 use cosmix_shell::core::{Corner, CornerEvent, CornerTrigger, OutputKey};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{Notify, mpsc as tokio_mpsc, watch};
 
 const SERVICE: &str = "quoin-corners";
 const CHANNEL_CAPACITY: usize = 64;
@@ -21,7 +21,11 @@ const MAX_BODY_BYTES: usize = 4 * 1024;
 const MAX_DWELL_MS: u64 = 5_000;
 const PROPS_GET_COMMAND: &str = "comp.props.get";
 type OutputMap = BTreeMap<String, OutputKey>;
-type OutputRefresh = (u64, Result<OutputMap, String>);
+type OutputRefresh = (u64, u64, Result<OutputMap, String>);
+
+fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(Duration::from_secs(5))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CornerIngress {
@@ -47,9 +51,9 @@ impl CornerIngress {
 }
 
 pub(crate) struct CornerBusHandle {
-    shutdown: Arc<AtomicBool>,
-    ack: mpsc::Receiver<()>,
-    selected_tx: UnboundedSender<(OutputKey, u64)>,
+    shutdown: watch::Sender<bool>,
+    ack: std_mpsc::Receiver<()>,
+    selected_tx: watch::Sender<(OutputKey, u64)>,
     epoch: Arc<AtomicU64>,
 }
 
@@ -61,7 +65,7 @@ impl CornerBusHandle {
     }
 
     pub fn shutdown(self) -> bool {
-        self.shutdown.store(true, Ordering::Release);
+        self.shutdown.send_replace(true);
         self.ack.recv_timeout(Duration::from_millis(300)).is_ok()
     }
 }
@@ -91,10 +95,9 @@ pub(crate) fn start(comp_service: String, selected: OutputKey) -> CornerBusStart
     let (sender, channel) = sync_channel(CHANNEL_CAPACITY);
     let overflowed = Arc::new(AtomicBool::new(false));
     let epoch = Arc::new(AtomicU64::new(0));
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let (ack_tx, ack) = mpsc::sync_channel(1);
-    let (selected_tx, selected_rx) = unbounded_channel();
-    let worker_shutdown = shutdown.clone();
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ack_tx, ack) = std_mpsc::sync_channel(1);
+    let (selected_tx, selected_rx) = watch::channel((selected.clone(), 0));
     let worker_overflowed = overflowed.clone();
     let worker_epoch = epoch.clone();
     thread::Builder::new()
@@ -111,7 +114,7 @@ pub(crate) fn start(comp_service: String, selected: OutputKey) -> CornerBusStart
                     sender,
                     worker_overflowed,
                     worker_epoch,
-                    worker_shutdown,
+                    shutdown_rx,
                 ));
             }
             let _ = ack_tx.try_send(());
@@ -165,7 +168,16 @@ impl Topics {
 
 trait CornerBusSession {
     async fn subscribe(&self, topic: &str) -> Result<(), String>;
-    async fn outputs(&self, service: &str) -> Result<BTreeMap<String, OutputKey>, String>;
+    fn outputs(
+        &self,
+        service: &str,
+    ) -> impl std::future::Future<Output = Result<BTreeMap<String, OutputKey>, String>> + Send;
+}
+
+trait LiveCornerBusSession: CornerBusSession + Send + Sync + 'static {
+    fn state(&self) -> ConnState;
+    fn subscribe_state(&self) -> watch::Receiver<ConnState>;
+    fn connection_generation(&self) -> u64;
 }
 
 impl CornerBusSession for SupervisedClient {
@@ -175,8 +187,25 @@ impl CornerBusSession for SupervisedClient {
             .map_err(|error| error.to_string())
     }
 
-    async fn outputs(&self, service: &str) -> Result<BTreeMap<String, OutputKey>, String> {
-        read_outputs(self, service).await
+    fn outputs(
+        &self,
+        service: &str,
+    ) -> impl std::future::Future<Output = Result<BTreeMap<String, OutputKey>, String>> + Send {
+        read_outputs(self, service)
+    }
+}
+
+impl LiveCornerBusSession for SupervisedClient {
+    fn state(&self) -> ConnState {
+        SupervisedClient::state(self)
+    }
+
+    fn subscribe_state(&self) -> watch::Receiver<ConnState> {
+        SupervisedClient::subscribe_state(self)
+    }
+
+    fn connection_generation(&self) -> u64 {
+        SupervisedClient::connection_generation(self)
     }
 }
 
@@ -330,6 +359,9 @@ impl WorkerState {
             .and_then(|map| map.get(&event.output))
             .cloned()
         else {
+            if !event.entered {
+                self.warn_rejected("left-output-unmapped");
+            }
             return;
         };
         if output != self.selected {
@@ -342,6 +374,9 @@ impl WorkerState {
             self.engaged.remove(&key)
         };
         if !changed {
+            if !event.entered {
+                self.warn_rejected("left-without-matching-engagement");
+            }
             return;
         }
         let event = if event.entered {
@@ -371,6 +406,17 @@ impl WorkerState {
             self.queued.clear();
         }
     }
+
+    fn warn_rejected(&mut self, reason: &'static str) {
+        self.diagnostics = self.diagnostics.saturating_add(1);
+        if self.diagnostics.is_power_of_two() {
+            tracing::warn!(
+                event = "quoin_corner_event_rejected",
+                count = self.diagnostics,
+                reason
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -386,7 +432,7 @@ enum ConnectOutcome<T> {
 }
 
 async fn connect_optional<T, E, F, Fut, P>(
-    shutdown: &AtomicBool,
+    shutdown: &mut watch::Receiver<bool>,
     mut connect: F,
     rejected: P,
 ) -> ConnectOutcome<T>
@@ -397,7 +443,7 @@ where
 {
     let mut backoff = Duration::from_millis(100);
     loop {
-        if shutdown.load(Ordering::Acquire) {
+        if *shutdown.borrow() {
             return ConnectOutcome::Shutdown;
         }
         let connecting = connect();
@@ -413,60 +459,231 @@ where
                     _ = tokio::time::sleep(backoff) => {},
                     _ = wait_shutdown(shutdown) => return ConnectOutcome::Shutdown,
                 }
-                backoff = (backoff * 2).min(Duration::from_secs(5));
+                backoff = next_backoff(backoff);
             }
             None => return ConnectOutcome::Shutdown,
         }
     }
 }
 
+async fn wait_backoff(shutdown: &mut watch::Receiver<bool>, duration: Duration) -> Result<(), ()> {
+    tokio::select! {
+        _ = tokio::time::sleep(duration) => Ok(()),
+        _ = wait_shutdown(shutdown) => Err(()),
+    }
+}
+
 #[derive(Default)]
 struct RefreshGate {
     generation: u64,
-    in_flight: bool,
+    active: Option<u64>,
     pending: bool,
 }
 
 impl RefreshGate {
     fn invalidate(&mut self) -> Option<u64> {
         self.generation = self.generation.wrapping_add(1);
-        if self.in_flight {
+        if self.active.is_some() {
             self.pending = true;
             None
         } else {
-            self.in_flight = true;
+            self.active = Some(self.generation);
             Some(self.generation)
         }
     }
 
     fn complete(&mut self, completed_generation: u64) -> (bool, Option<u64>) {
-        self.in_flight = false;
+        if self.active != Some(completed_generation) {
+            return (false, None);
+        }
+        self.active = None;
         let install = completed_generation == self.generation;
         let follow_up = if self.pending {
             self.pending = false;
-            self.in_flight = true;
+            self.active = Some(self.generation);
             Some(self.generation)
         } else {
             None
         };
         (install, follow_up)
     }
+
+    fn cancel(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.active = None;
+        self.pending = false;
+    }
+}
+
+struct IncomingLane {
+    state: Mutex<IncomingLaneState>,
+    notify: Notify,
+}
+
+#[derive(Default)]
+struct IncomingLaneState {
+    commands: VecDeque<IncomingCommand>,
+    overflowed: bool,
+    closed: bool,
+}
+
+enum IncomingObservation {
+    Command(IncomingCommand),
+    Overflow,
+    Closed,
+}
+
+fn process_incoming_observation(
+    state: &mut WorkerState,
+    observation: IncomingObservation,
+    sender: &SyncSender<CornerIngress>,
+    overflowed: &AtomicBool,
+    shared_epoch: &AtomicU64,
+) -> Option<DecodeAction> {
+    match observation {
+        IncomingObservation::Command(command) => {
+            Some(state.decode_and_apply(command, sender, overflowed, shared_epoch))
+        }
+        IncomingObservation::Overflow => {
+            state.reset(sender, overflowed, shared_epoch);
+            tracing::warn!(event = "quoin_corner_client_ingress_overflow");
+            Some(DecodeAction::None)
+        }
+        IncomingObservation::Closed => None,
+    }
+}
+
+impl IncomingLane {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(IncomingLaneState::default()),
+            notify: Notify::new(),
+        })
+    }
+
+    fn push(&self, command: IncomingCommand) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("incoming lane lock is not poisoned");
+        if command.body.len() > MAX_BODY_BYTES {
+            state.overflowed = true;
+        } else {
+            if state.commands.len() == CHANNEL_CAPACITY {
+                state.commands.pop_front();
+                state.overflowed = true;
+            }
+            state.commands.push_back(command);
+        }
+        drop(state);
+        self.notify.notify_one();
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .expect("incoming lane lock is not poisoned")
+            .closed = true;
+        self.notify.notify_one();
+    }
+
+    async fn observe(&self) -> IncomingObservation {
+        loop {
+            let notified = self.notify.notified();
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("incoming lane lock is not poisoned");
+                if state.overflowed {
+                    state.overflowed = false;
+                    return IncomingObservation::Overflow;
+                }
+                if let Some(command) = state.commands.pop_front() {
+                    return IncomingObservation::Command(command);
+                }
+                if state.closed {
+                    return IncomingObservation::Closed;
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+fn start_incoming_pump(
+    mut incoming: tokio_mpsc::UnboundedReceiver<IncomingCommand>,
+) -> Arc<IncomingLane> {
+    let lane = IncomingLane::new();
+    let pump_lane = Arc::clone(&lane);
+    tokio::spawn(async move {
+        while let Some(command) = incoming.recv().await {
+            pump_lane.push(command);
+        }
+        pump_lane.close();
+    });
+    lane
+}
+
+#[derive(Default)]
+struct RefreshRetry {
+    owed: bool,
+    deadline: Option<tokio::time::Instant>,
+    backoff: Duration,
+}
+
+impl RefreshRetry {
+    fn failed(&mut self) {
+        self.owed = true;
+        self.backoff = if self.backoff.is_zero() {
+            Duration::from_millis(100)
+        } else {
+            next_backoff(self.backoff)
+        };
+        self.deadline = Some(tokio::time::Instant::now() + self.backoff);
+    }
+
+    fn clear(&mut self) {
+        self.owed = false;
+        self.deadline = None;
+        self.backoff = Duration::ZERO;
+    }
+
+    fn on_observation(&mut self) -> bool {
+        if self.owed {
+            self.owed = false;
+            self.deadline = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn wait(&self) {
+        match self.deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending().await,
+        }
+    }
 }
 
 async fn worker(
     comp_service: String,
-    selected: OutputKey,
-    mut selected_rx: UnboundedReceiver<(OutputKey, u64)>,
+    _selected: OutputKey,
+    mut selected_rx: watch::Receiver<(OutputKey, u64)>,
     sender: SyncSender<CornerIngress>,
     overflowed: Arc<AtomicBool>,
     shared_epoch: Arc<AtomicU64>,
-    shutdown: Arc<AtomicBool>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let topics = Topics::new(&comp_service);
     let url = cosmix_config::client_helpers::resolve_noded_url();
-    while !shutdown.load(Ordering::Acquire) {
+    let mut bootstrap_backoff = Duration::from_millis(100);
+    while !*shutdown.borrow() {
+        let current_selection = selected_rx.borrow_and_update().clone();
+        let selected = current_selection.0;
         let client = match connect_optional(
-            &shutdown,
+            &mut shutdown,
             || {
                 SupervisedClient::connect_options(SERVICE, &url)
                     .fatal_on_registration_rejection(true)
@@ -490,130 +707,290 @@ async fn worker(
             }
             ConnectOutcome::Shutdown => return,
         };
-        let Some(mut incoming) = client.incoming() else {
-            client.shutdown().await;
+        let Some(incoming) = client.incoming() else {
+            close_client(&client).await;
+            if wait_backoff(&mut shutdown, bootstrap_backoff)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            bootstrap_backoff = next_backoff(bootstrap_backoff);
             continue;
         };
+        let incoming = start_incoming_pump(incoming);
+        // Subscribe to state and sample its generation before bootstrap so a
+        // disconnect/reconnect cannot make the snapshot look current.
+        let connection_state = LiveCornerBusSession::subscribe_state(client.as_ref());
+        let bootstrap_generation = client.connection_generation();
         let mut state = WorkerState::new(&comp_service, selected.clone());
-        state.epoch = shared_epoch.load(Ordering::Acquire);
-        match bootstrap(client.as_ref(), &topics, &comp_service).await {
-            Ok(outputs) => state.install_outputs(outputs, &sender, &overflowed, &shared_epoch),
-            Err(_) => {
-                client.shutdown().await;
+        state.epoch = state
+            .epoch
+            .max(current_selection.1)
+            .max(shared_epoch.load(Ordering::Acquire));
+        let bootstrapped = tokio::select! {
+            result = bootstrap(client.as_ref(), &topics, &comp_service) => Some(result),
+            _ = wait_shutdown(&mut shutdown) => None,
+        };
+        let bootstrap_current = client.state() == ConnState::Connected
+            && client.connection_generation() == bootstrap_generation;
+        match bootstrapped {
+            Some(Ok(outputs)) if bootstrap_current => {
+                state.install_outputs(outputs, &sender, &overflowed, &shared_epoch);
+                bootstrap_backoff = Duration::from_millis(100);
+            }
+            None => {
+                close_client(&client).await;
+                return;
+            }
+            Some(Err(error)) => {
+                tracing::warn!(event = "quoin_corner_bootstrap_failed", reason = %error);
+                close_client(&client).await;
+                if wait_backoff(&mut shutdown, bootstrap_backoff)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                bootstrap_backoff = next_backoff(bootstrap_backoff);
+                continue;
+            }
+            Some(Ok(_)) => {
+                tracing::warn!(event = "quoin_corner_bootstrap_stale_generation");
+                close_client(&client).await;
+                if wait_backoff(&mut shutdown, bootstrap_backoff)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                bootstrap_backoff = next_backoff(bootstrap_backoff);
                 continue;
             }
         }
-        let mut connection_state = client.subscribe_state();
-        let mut generation = client.connection_generation();
-        let (refresh_tx, mut refresh_rx) = unbounded_channel();
-        let mut refresh_gate = RefreshGate::default();
-        loop {
-            if shutdown.load(Ordering::Acquire) {
-                state.reset(&sender, &overflowed, &shared_epoch);
-                let _ = tokio::time::timeout(Duration::from_millis(250), client.shutdown()).await;
-                return;
-            }
-            tokio::select! {
-                command = incoming.recv() => {
-                    let Some(command) = command else { break; };
-                    if state.decode_and_apply(command, &sender, &overflowed, &shared_epoch) == DecodeAction::Refresh
-                        && let Some(generation) = refresh_gate.invalidate()
-                    {
-                        start_output_refresh(
-                            client.clone(),
-                            comp_service.clone(),
-                            generation,
-                            refresh_tx.clone(),
-                        );
-                    }
+        let session_exit = run_connected_session(
+            client.clone(),
+            comp_service.clone(),
+            incoming,
+            connection_state,
+            bootstrap_generation,
+            &mut selected_rx,
+            &sender,
+            &overflowed,
+            &shared_epoch,
+            &mut shutdown,
+            &mut state,
+        )
+        .await;
+        state.reset(&sender, &overflowed, &shared_epoch);
+        close_client(&client).await;
+        if session_exit != SessionExit::Ended {
+            return;
+        }
+        if wait_backoff(&mut shutdown, bootstrap_backoff)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        bootstrap_backoff = next_backoff(bootstrap_backoff);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionExit {
+    Ended,
+    Fatal,
+    Shutdown,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_connected_session<S: LiveCornerBusSession>(
+    client: Arc<S>,
+    comp_service: String,
+    incoming: Arc<IncomingLane>,
+    mut connection_state: watch::Receiver<ConnState>,
+    mut generation: u64,
+    selected_rx: &mut watch::Receiver<(OutputKey, u64)>,
+    sender: &SyncSender<CornerIngress>,
+    overflowed: &AtomicBool,
+    shared_epoch: &AtomicU64,
+    shutdown: &mut watch::Receiver<bool>,
+    state: &mut WorkerState,
+) -> SessionExit {
+    let (refresh_tx, mut refresh_rx) = tokio_mpsc::channel(1);
+    let mut refresh_gate = RefreshGate::default();
+    let mut refresh_retry = RefreshRetry::default();
+    loop {
+        tokio::select! {
+            observation = incoming.observe() => {
+                if refresh_retry.on_observation()
+                    && let Some(refresh_generation) = refresh_gate.invalidate() {
+                    start_output_refresh(
+                        client.clone(),
+                        comp_service.clone(),
+                        refresh_generation,
+                        generation,
+                        refresh_tx.clone(),
+                    );
                 }
-                refreshed = refresh_rx.recv() => {
-                    let Some((completed_generation, result)) = refreshed else { break; };
-                    let (install, follow_up) = refresh_gate.complete(completed_generation);
-                    if install && let Ok(outputs) = result
-                    {
-                        state.install_outputs(outputs, &sender, &overflowed, &shared_epoch);
-                    }
-                    if let Some(generation) = follow_up {
-                        start_output_refresh(
-                            client.clone(),
-                            comp_service.clone(),
-                            generation,
-                            refresh_tx.clone(),
-                        );
-                    }
-                }
-                changed = connection_state.changed() => {
-                    if changed.is_err() { break; }
-                    match *connection_state.borrow_and_update() {
-                        ConnState::Disconnected => {
-                            state.map_valid = false;
-                            state.reset(&sender, &overflowed, &shared_epoch);
-                        }
-                        ConnState::Connected if take_new_generation(&mut generation, client.connection_generation()) => {
-                            state.map_valid = false;
-                            state.reset(&sender, &overflowed, &shared_epoch);
-                            if let Some(generation) = refresh_gate.invalidate() {
-                                start_output_refresh(
-                                    client.clone(),
-                                    comp_service.clone(),
-                                    generation,
-                                    refresh_tx.clone(),
-                                );
-                            }
-                        }
-                        ConnState::Fatal => {
-                            send(
-                                &sender,
-                                CornerIngress::Disabled { epoch: state.epoch },
-                                &overflowed,
-                                &mut state.epoch,
-                                &shared_epoch,
-                            );
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                selected = selected_rx.recv() => {
-                    if let Some((selected, epoch)) = selected {
-                        state.selected = selected;
-                        state.epoch = state.epoch.max(epoch);
-                        state.map_valid = false;
-                        state.reset(&sender, &overflowed, &shared_epoch);
-                        if let Some(generation) = refresh_gate.invalidate() {
+                match process_incoming_observation(
+                    state,
+                    observation,
+                    sender,
+                    overflowed,
+                    shared_epoch,
+                ) {
+                    Some(DecodeAction::Refresh) => {
+                        if let Some(refresh_generation) = refresh_gate.invalidate() {
                             start_output_refresh(
                                 client.clone(),
                                 comp_service.clone(),
+                                refresh_generation,
                                 generation,
                                 refresh_tx.clone(),
                             );
                         }
                     }
+                    Some(DecodeAction::None) => {}
+                    None => return SessionExit::Ended,
                 }
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
+            refreshed = refresh_rx.recv() => {
+                let Some((completed_generation, completed_session, result)) = refreshed else {
+                    return SessionExit::Ended;
+                };
+                let (install, follow_up) = refresh_gate.complete(completed_generation);
+                let current = completed_session == generation
+                    && client.state() == ConnState::Connected
+                    && client.connection_generation() == completed_session;
+                if install && current {
+                    match result {
+                        Ok(outputs) => {
+                            state.install_outputs(outputs, sender, overflowed, shared_epoch);
+                            refresh_retry.clear();
+                        }
+                        Err(error) => {
+                            state.map_valid = false;
+                            refresh_retry.failed();
+                            tracing::warn!(event = "quoin_corner_output_refresh_failed", reason = %error);
+                        }
+                    }
+                }
+                if let Some(refresh_generation) = follow_up {
+                    start_output_refresh(
+                        client.clone(),
+                        comp_service.clone(),
+                        refresh_generation,
+                        generation,
+                        refresh_tx.clone(),
+                    );
+                }
+            }
+            changed = connection_state.changed() => {
+                if changed.is_err() {
+                    return SessionExit::Ended;
+                }
+                match *connection_state.borrow_and_update() {
+                    ConnState::Disconnected => {
+                        refresh_gate.cancel();
+                        refresh_retry.clear();
+                        state.map_valid = false;
+                        state.reset(sender, overflowed, shared_epoch);
+                    }
+                    ConnState::Connected
+                        if take_new_generation(&mut generation, client.connection_generation()) =>
+                    {
+                        refresh_retry.clear();
+                        state.map_valid = false;
+                        state.reset(sender, overflowed, shared_epoch);
+                        if let Some(refresh_generation) = refresh_gate.invalidate() {
+                            start_output_refresh(
+                                client.clone(),
+                                comp_service.clone(),
+                                refresh_generation,
+                                generation,
+                                refresh_tx.clone(),
+                            );
+                        }
+                    }
+                    ConnState::Fatal => {
+                        send(
+                            sender,
+                            CornerIngress::Disabled { epoch: state.epoch },
+                            overflowed,
+                            &mut state.epoch,
+                            shared_epoch,
+                        );
+                        return SessionExit::Fatal;
+                    }
+                    _ => {}
+                }
+            }
+            changed = selected_rx.changed() => {
+                if changed.is_err() {
+                    return SessionExit::Ended;
+                }
+                let (selected, epoch) = selected_rx.borrow_and_update().clone();
+                state.selected = selected;
+                state.epoch = state.epoch.max(epoch);
+                refresh_retry.clear();
+                state.map_valid = false;
+                state.reset(sender, overflowed, shared_epoch);
+                if let Some(refresh_generation) = refresh_gate.invalidate() {
+                    start_output_refresh(
+                        client.clone(),
+                        comp_service.clone(),
+                        refresh_generation,
+                        generation,
+                        refresh_tx.clone(),
+                    );
+                }
+            }
+            _ = refresh_retry.wait() => {
+                if refresh_retry.on_observation()
+                    && let Some(refresh_generation) = refresh_gate.invalidate() {
+                    start_output_refresh(
+                        client.clone(),
+                        comp_service.clone(),
+                        refresh_generation,
+                        generation,
+                        refresh_tx.clone(),
+                    );
+                }
+            }
+            _ = wait_shutdown(shutdown) => return SessionExit::Shutdown,
         }
-        state.reset(&sender, &overflowed, &shared_epoch);
-        client.shutdown().await;
     }
 }
 
-fn start_output_refresh(
-    client: Arc<SupervisedClient>,
+fn start_output_refresh<S: LiveCornerBusSession>(
+    client: Arc<S>,
     service: String,
-    generation: u64,
-    sender: UnboundedSender<OutputRefresh>,
+    refresh_generation: u64,
+    session_generation: u64,
+    sender: tokio_mpsc::Sender<OutputRefresh>,
 ) {
     tokio::spawn(async move {
-        let result = read_outputs(&client, &service).await;
-        let _ = sender.send((generation, result));
+        let result = client.outputs(&service).await;
+        let _ = sender
+            .send((refresh_generation, session_generation, result))
+            .await;
     });
 }
 
-async fn wait_shutdown(shutdown: &AtomicBool) {
-    while !shutdown.load(Ordering::Acquire) {
-        tokio::time::sleep(Duration::from_millis(25)).await;
+async fn close_client(client: &SupervisedClient) {
+    let _ = tokio::time::timeout(Duration::from_millis(250), client.close()).await;
+}
+
+async fn wait_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
     }
 }
 
@@ -816,6 +1193,15 @@ mod tests {
         calls: std::sync::Mutex<Vec<String>>,
     }
 
+    struct FailingBootstrapSession;
+
+    struct FakeLiveSession {
+        output_results: Mutex<VecDeque<Result<OutputMap, String>>>,
+        output_calls: AtomicU64,
+        state_tx: watch::Sender<ConnState>,
+        generation: AtomicU64,
+    }
+
     impl CornerBusSession for FakeSession {
         async fn subscribe(&self, topic: &str) -> Result<(), String> {
             self.calls
@@ -825,12 +1211,73 @@ mod tests {
             Ok(())
         }
 
-        async fn outputs(&self, service: &str) -> Result<BTreeMap<String, OutputKey>, String> {
-            self.calls.lock().unwrap().push(format!("read:{service}"));
-            Ok(BTreeMap::from([(
-                "o_dp_1".to_owned(),
-                OutputKey::new("DP-1").unwrap(),
-            )]))
+        fn outputs(
+            &self,
+            service: &str,
+        ) -> impl std::future::Future<Output = Result<BTreeMap<String, OutputKey>, String>> + Send
+        {
+            let result = {
+                self.calls.lock().unwrap().push(format!("read:{service}"));
+                Ok(BTreeMap::from([(
+                    "o_dp_1".to_owned(),
+                    OutputKey::new("DP-1").unwrap(),
+                )]))
+            };
+            std::future::ready(result)
+        }
+    }
+
+    impl CornerBusSession for FailingBootstrapSession {
+        async fn subscribe(&self, _topic: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn outputs(
+            &self,
+            _service: &str,
+        ) -> impl std::future::Future<Output = Result<BTreeMap<String, OutputKey>, String>> + Send
+        {
+            std::future::ready(Err("compositor unavailable".to_owned()))
+        }
+    }
+
+    impl CornerBusSession for FakeLiveSession {
+        async fn subscribe(&self, _topic: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn outputs(
+            &self,
+            _service: &str,
+        ) -> impl std::future::Future<Output = Result<BTreeMap<String, OutputKey>, String>> + Send
+        {
+            self.output_calls.fetch_add(1, Ordering::AcqRel);
+            let result = self
+                .output_results
+                .lock()
+                .expect("fake output queue lock is not poisoned")
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Ok(BTreeMap::from([(
+                        "o_dp_1".to_owned(),
+                        OutputKey::new("DP-1").unwrap(),
+                    )]))
+                });
+            std::future::ready(result)
+        }
+    }
+
+    impl LiveCornerBusSession for FakeLiveSession {
+        fn state(&self) -> ConnState {
+            *self.state_tx.borrow()
+        }
+
+        fn subscribe_state(&self) -> watch::Receiver<ConnState> {
+            self.state_tx.subscribe()
+        }
+
+        fn connection_generation(&self) -> u64 {
+            self.generation.load(Ordering::Acquire)
         }
     }
 
@@ -916,6 +1363,32 @@ mod tests {
                 "read:comp-nested",
             ]
         );
+    }
+
+    #[test]
+    fn bootstrap_failure_uses_capped_shutdown_selectable_backoff() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                assert!(
+                    bootstrap(&FailingBootstrapSession, &Topics::new("comp"), "comp")
+                        .await
+                        .is_err()
+                );
+                let (shutdown_tx, mut shutdown) = watch::channel(false);
+                shutdown_tx.send_replace(true);
+                assert_eq!(
+                    wait_backoff(&mut shutdown, Duration::from_secs(5)).await,
+                    Err(())
+                );
+                let mut backoff = Duration::from_millis(100);
+                for _ in 0..10 {
+                    backoff = next_backoff(backoff);
+                }
+                assert_eq!(backoff, Duration::from_secs(5));
+            });
     }
 
     #[test]
@@ -1110,6 +1583,50 @@ mod tests {
     }
 
     #[test]
+    fn refresh_failure_owes_one_event_driven_retry_with_capped_backoff() {
+        let mut retry = RefreshRetry::default();
+        retry.failed();
+        assert_eq!(retry.backoff, Duration::from_millis(100));
+        assert!(retry.deadline.is_some());
+        assert!(retry.on_observation());
+        assert!(!retry.on_observation());
+        for _ in 0..10 {
+            retry.failed();
+        }
+        assert_eq!(retry.backoff, Duration::from_secs(5));
+        retry.clear();
+        assert!(!retry.owed);
+        assert!(retry.deadline.is_none());
+    }
+
+    #[test]
+    fn refresh_failure_timer_fires_without_an_observation() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut retry = RefreshRetry::default();
+                retry.failed();
+                retry.deadline = Some(tokio::time::Instant::now());
+                retry.wait().await;
+                assert!(retry.on_observation());
+                assert!(!retry.owed);
+            });
+    }
+
+    #[test]
+    fn disconnect_cancels_old_refresh_generation_before_reinstall() {
+        let mut gate = RefreshGate::default();
+        let old = gate.invalidate().unwrap();
+        gate.cancel();
+        let current = gate.invalidate().unwrap();
+        assert_ne!(old, current);
+        assert_eq!(gate.complete(old), (false, None));
+        assert_eq!(gate.complete(current), (true, None));
+    }
+
+    #[test]
     fn disconnect_reset_clears_engagement_once() {
         let (sender, channel) = sync_channel(8);
         let overflow = AtomicBool::new(false);
@@ -1146,6 +1663,18 @@ mod tests {
         assert!(is_registration_rejection(&rejection));
         let absence = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "absent");
         assert!(!is_registration_rejection(&absence));
+
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(connect_optional(
+                &mut shutdown,
+                || std::future::ready(Err::<(), _>("rejected")),
+                |_| true,
+            ));
+        assert!(matches!(outcome, ConnectOutcome::Rejected));
     }
 
     #[test]
@@ -1216,18 +1745,304 @@ mod tests {
     }
 
     #[test]
+    fn select_output_advances_the_runner_barrier_before_worker_reset() {
+        let (ack_tx, ack) = std_mpsc::sync_channel(1);
+        ack_tx.send(()).unwrap();
+        let (selected_tx, mut selected_rx) = watch::channel((OutputKey::new("DP-1").unwrap(), 0));
+        let (shutdown, _shutdown_rx) = watch::channel(false);
+        let shared_epoch = Arc::new(AtomicU64::new(0));
+        let handle = CornerBusHandle {
+            shutdown,
+            ack,
+            selected_tx,
+            epoch: Arc::clone(&shared_epoch),
+        };
+        let mut accepted_epoch = handle.select_output(OutputKey::new("DP-1").unwrap());
+        assert_eq!(accepted_epoch, 1);
+        assert_eq!(selected_rx.borrow_and_update().1, 1);
+
+        let stale = CornerIngress::Event {
+            output: OutputKey::new("DP-1").unwrap(),
+            epoch: 0,
+            event: CornerEvent::Entered {
+                corner: Corner::TopLeft,
+                dwell: Duration::ZERO,
+                trigger: CornerTrigger::Compositor,
+            },
+        };
+        let (reset, accepted) = gate_ingress(
+            stale,
+            &AtomicBool::new(false),
+            &shared_epoch,
+            &mut accepted_epoch,
+        );
+        assert!(!reset);
+        assert!(accepted.is_none());
+    }
+
+    #[test]
+    fn bounded_fake_worker_boundary_drives_enter_left_overflow_and_close() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let lane = IncomingLane::new();
+                let (sender, channel) = sync_channel(CHANNEL_CAPACITY + 4);
+                let overflow = AtomicBool::new(false);
+                let epoch = AtomicU64::new(0);
+                let mut state = WorkerState::new("comp", OutputKey::new("DP-1").unwrap());
+                state.install_outputs(
+                    BTreeMap::from([(
+                        "o_dp_1".to_owned(),
+                        OutputKey::new("DP-1").unwrap(),
+                    )]),
+                    &sender,
+                    &overflow,
+                    &epoch,
+                );
+                let entered = r#"{"output":"o_dp_1","corner":"tl","dwell_ms":200,"event_seq":1000}"#;
+                let left = r#"{"output":"o_dp_1","corner":"tl","dwell_ms":200,"event_seq":1001}"#;
+                lane.push(incoming("comp.corner.entered", "corner.entered", entered));
+                lane.push(incoming("comp.corner.left", "corner.left", left));
+
+                for _ in 0..2 {
+                    assert!(process_incoming_observation(
+                        &mut state,
+                        lane.observe().await,
+                        &sender,
+                        &overflow,
+                        &epoch,
+                    )
+                    .is_some());
+                }
+                assert!(matches!(
+                    channel.try_recv(),
+                    Ok(CornerIngress::Event {
+                        event: CornerEvent::Entered { .. },
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    channel.try_recv(),
+                    Ok(CornerIngress::Event {
+                        event: CornerEvent::Left { .. },
+                        ..
+                    })
+                ));
+
+                for sequence in 0..=CHANNEL_CAPACITY {
+                    lane.push(incoming(
+                        "comp.corner.entered",
+                        "corner.entered",
+                        &format!(
+                            r#"{{"output":"o_dp_1","corner":"tl","dwell_ms":200,"event_seq":{sequence}}}"#
+                        ),
+                    ));
+                }
+                assert_eq!(
+                    process_incoming_observation(
+                        &mut state,
+                        lane.observe().await,
+                        &sender,
+                        &overflow,
+                        &epoch,
+                    ),
+                    Some(DecodeAction::None)
+                );
+                assert!(matches!(channel.try_recv(), Ok(CornerIngress::Reset { .. })));
+                lane.close();
+                for _ in 0..CHANNEL_CAPACITY {
+                    assert!(matches!(lane.observe().await, IncomingObservation::Command(_)));
+                }
+                assert!(matches!(lane.observe().await, IncomingObservation::Closed));
+            });
+    }
+
+    #[test]
+    fn real_session_loop_retries_failed_refresh_and_processes_enter_left() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (state_tx, state_rx) = watch::channel(ConnState::Connected);
+                let client = Arc::new(FakeLiveSession {
+                    output_results: Mutex::new(VecDeque::from([
+                        Err("busy".to_owned()),
+                        Ok(BTreeMap::from([(
+                            "o_dp_1".to_owned(),
+                            OutputKey::new("DP-1").unwrap(),
+                        )])),
+                    ])),
+                    output_calls: AtomicU64::new(0),
+                    state_tx,
+                    generation: AtomicU64::new(1),
+                });
+                let lane = IncomingLane::new();
+                let (sender, channel) = sync_channel(CHANNEL_CAPACITY);
+                let overflow = AtomicBool::new(false);
+                let epoch = AtomicU64::new(0);
+                let mut state = WorkerState::new("comp", OutputKey::new("DP-1").unwrap());
+                state.install_outputs(
+                    BTreeMap::from([(
+                        "o_dp_1".to_owned(),
+                        OutputKey::new("DP-1").unwrap(),
+                    )]),
+                    &sender,
+                    &overflow,
+                    &epoch,
+                );
+                lane.push(incoming(
+                    "comp.corner.entered",
+                    "corner.entered",
+                    r#"{"output":"o_dp_1","corner":"tl","dwell_ms":200,"event_seq":1000}"#,
+                ));
+                lane.push(incoming(
+                    "comp.corner.left",
+                    "corner.left",
+                    r#"{"output":"o_dp_1","corner":"tl","dwell_ms":200,"event_seq":1001}"#,
+                ));
+                lane.push(incoming(
+                    "comp.output.changed",
+                    "output.changed",
+                    r#"{"output":"o_dp_1","geometry":{"x":0,"y":0,"width":1000,"height":800},"usable":{"x":0.0,"y":0.0,"width":1000.0,"height":760.0},"event_seq":1002}"#,
+                ));
+                let closing_lane = Arc::clone(&lane);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    closing_lane.close();
+                });
+                let (_selected_tx, mut selected_rx) = watch::channel((
+                    OutputKey::new("DP-1").unwrap(),
+                    0,
+                ));
+                let (_shutdown_tx, mut shutdown) = watch::channel(false);
+
+                assert_eq!(
+                    run_connected_session(
+                        Arc::clone(&client),
+                        "comp".to_owned(),
+                        lane,
+                        state_rx,
+                        1,
+                        &mut selected_rx,
+                        &sender,
+                        &overflow,
+                        &epoch,
+                        &mut shutdown,
+                        &mut state,
+                    )
+                    .await,
+                    SessionExit::Ended
+                );
+                assert_eq!(client.output_calls.load(Ordering::Acquire), 2);
+                assert!(state.map_valid);
+                assert!(matches!(
+                    channel.try_recv(),
+                    Ok(CornerIngress::Event {
+                        event: CornerEvent::Entered { .. },
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    channel.try_recv(),
+                    Ok(CornerIngress::Event {
+                        event: CornerEvent::Left { .. },
+                        ..
+                    })
+                ));
+                assert!(matches!(channel.try_recv(), Ok(CornerIngress::Reset { .. })));
+            });
+    }
+
+    #[test]
+    fn real_session_loop_resets_and_refreshes_the_new_connection_generation() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (state_tx, state_rx) = watch::channel(ConnState::Connected);
+                let client = Arc::new(FakeLiveSession {
+                    output_results: Mutex::new(VecDeque::new()),
+                    output_calls: AtomicU64::new(0),
+                    state_tx,
+                    generation: AtomicU64::new(1),
+                });
+                let lane = IncomingLane::new();
+                let transition_client = Arc::clone(&client);
+                let closing_lane = Arc::clone(&lane);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    transition_client
+                        .state_tx
+                        .send_replace(ConnState::Disconnected);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    transition_client.generation.store(2, Ordering::Release);
+                    transition_client
+                        .state_tx
+                        .send_replace(ConnState::Connected);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    closing_lane.close();
+                });
+                let (sender, channel) = sync_channel(CHANNEL_CAPACITY);
+                let overflow = AtomicBool::new(false);
+                let epoch = AtomicU64::new(0);
+                let mut state = WorkerState::new("comp", OutputKey::new("DP-1").unwrap());
+                state.install_outputs(
+                    BTreeMap::from([("o_dp_1".to_owned(), OutputKey::new("DP-1").unwrap())]),
+                    &sender,
+                    &overflow,
+                    &epoch,
+                );
+                let (_selected_tx, mut selected_rx) =
+                    watch::channel((OutputKey::new("DP-1").unwrap(), 0));
+                let (_shutdown_tx, mut shutdown) = watch::channel(false);
+
+                assert_eq!(
+                    run_connected_session(
+                        Arc::clone(&client),
+                        "comp".to_owned(),
+                        lane,
+                        state_rx,
+                        1,
+                        &mut selected_rx,
+                        &sender,
+                        &overflow,
+                        &epoch,
+                        &mut shutdown,
+                        &mut state,
+                    )
+                    .await,
+                    SessionExit::Ended
+                );
+                assert_eq!(client.output_calls.load(Ordering::Acquire), 1);
+                assert!(state.map_valid);
+                assert!(matches!(
+                    channel.try_recv(),
+                    Ok(CornerIngress::Reset { .. })
+                ));
+                assert!(matches!(
+                    channel.try_recv(),
+                    Ok(CornerIngress::Reset { .. })
+                ));
+            });
+    }
+
+    #[test]
     fn fake_absent_broker_retry_and_shutdown_ack_are_bounded() {
-        let shutdown = AtomicBool::new(false);
+        let (shutdown_tx, mut shutdown) = watch::channel(false);
         let attempts = std::cell::Cell::new(0_u8);
         let outcome = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(connect_optional(
-                &shutdown,
+                &mut shutdown,
                 || {
                     attempts.set(attempts.get() + 1);
-                    shutdown.store(true, Ordering::Release);
+                    shutdown_tx.send_replace(true);
                     std::future::ready(Err::<(), ()>(()))
                 },
                 |_| false,
@@ -1235,11 +2050,12 @@ mod tests {
         assert!(matches!(outcome, ConnectOutcome::Shutdown));
         assert_eq!(attempts.get(), 1);
 
-        let (ack_tx, ack) = mpsc::sync_channel(1);
+        let (ack_tx, ack) = std_mpsc::sync_channel(1);
         ack_tx.send(()).unwrap();
-        let (selected_tx, _selected_rx) = unbounded_channel();
+        let (selected_tx, _selected_rx) = watch::channel((OutputKey::new("DP-1").unwrap(), 0));
+        let (shutdown, _shutdown_rx) = watch::channel(false);
         let handle = CornerBusHandle {
-            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown,
             ack,
             selected_tx,
             epoch: Arc::new(AtomicU64::new(0)),
