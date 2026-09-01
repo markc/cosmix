@@ -124,10 +124,14 @@ impl CompositorHandler for WaylandState {
         // Whether the renderer can be holding an entity for this surface. A
         // re-role unmaps it below, and a transition to unmapped is only real to
         // the renderer if it is published — see the removal at the end.
-        let mut was_mapped = false;
+        let was_mapped = self
+            .surfaces
+            .get(&surface.id())
+            .is_some_and(|record| record.mapped);
+        #[cfg(feature = "bus")]
+        self.mark_surface_unmapped(surface);
         let id = if let Some(record) = self.surfaces.get_mut(&surface.id()) {
             let id = record.id;
-            was_mapped = record.mapped;
             record.role = SurfaceRole::Subsurface {
                 surface: surface.clone(),
                 parent: parent.clone(),
@@ -488,6 +492,12 @@ impl CompositorHandler for WaylandState {
                 );
             }
             Some(BufferAssignment::Removed) => {
+                let was_mapped = self
+                    .surfaces
+                    .get(&surface.id())
+                    .is_some_and(|record| record.mapped);
+                #[cfg(feature = "bus")]
+                self.mark_surface_unmapped(surface);
                 let (unmapped_id, released_shm_bytes, released_dmabuf_token) = {
                     let record = self
                         .surfaces
@@ -503,7 +513,7 @@ impl CompositorHandler for WaylandState {
                         .map(|backing| backing.retention_token);
                     record.buffer_dimensions = None;
                     record.minimized = false;
-                    if record.mapped {
+                    if was_mapped {
                         record.mapped = false;
                         (Some(record.id), released_shm_bytes, released_dmabuf_token)
                     } else {
@@ -557,6 +567,13 @@ impl CompositorHandler for WaylandState {
                                 .get_mut(&surface.id())
                                 .expect("surface existence checked above");
                             let old_origin = (record.layout.x, record.layout.y);
+                            #[cfg(feature = "bus")]
+                            let old_layout = (
+                                record.layout.x,
+                                record.layout.y,
+                                record.layout.width,
+                                record.layout.height,
+                            );
                             if let Some(window_geometry) = window_geometry {
                                 record.layout.x = record.window_origin.0 - window_geometry.x;
                                 record.layout.y = record.window_origin.1 - window_geometry.y;
@@ -572,6 +589,14 @@ impl CompositorHandler for WaylandState {
                                 record.layout.y - old_origin.1,
                             );
                             let record_id = record.id;
+                            #[cfg(feature = "bus")]
+                            let projected_layout_changed = old_layout
+                                != (
+                                    record.layout.x,
+                                    record.layout.y,
+                                    record.layout.width,
+                                    record.layout.height,
+                                );
                             if publish_surface {
                                 self.events.push(ProtocolEvent::SurfaceRelayout {
                                     id: record.id,
@@ -580,6 +605,10 @@ impl CompositorHandler for WaylandState {
                             }
                             if delta != (0.0, 0.0) {
                                 self.shift_surface_descendants(record_id, delta);
+                            }
+                            #[cfg(feature = "bus")]
+                            if projected_layout_changed {
+                                self.mark_surface_dirty(record_id, "wayland.map");
                             }
                         }
                         Err(error) => {
@@ -723,6 +752,8 @@ impl WlrLayerShellHandler for WaylandState {
             committed_layer: layer,
             committed_keyboard_interactivity: KeyboardInteractivity::None,
         };
+        #[cfg(feature = "bus")]
+        self.mark_surface_unmapped(surface.wl_surface());
         let id = if let Some(record) = self.surfaces.get_mut(&surface_object) {
             let id = record.id;
             record.role = SurfaceRole::Layer(role);
@@ -921,6 +952,8 @@ impl XdgShellHandler for WaylandState {
             toplevel: None,
         };
         set_toplevel_configuration(&surface, configured_size);
+        #[cfg(feature = "bus")]
+        self.mark_surface_unmapped(surface.wl_surface());
         let id = if let Some(record) = self.surfaces.get_mut(&surface_object) {
             let id = record.id;
             record.role = SurfaceRole::Toplevel(surface);
@@ -1016,21 +1049,28 @@ impl XdgShellHandler for WaylandState {
                 .as_deref()
                 .map(capped_toplevel_title)
         });
-        let event = self
-            .surfaces
-            .get_mut(&surface.wl_surface().id())
-            .and_then(|record| {
-                if record.title == title {
-                    return None;
-                }
-                record.title = title;
-                (record.mapped && publish).then(|| ProtocolEvent::SurfaceRelayout {
-                    id: record.id,
-                    scene: record.scene_snapshot(),
-                })
-            });
+        let (event, _changed_id) =
+            self.surfaces
+                .get_mut(&surface.wl_surface().id())
+                .map_or((None, None), |record| {
+                    if record.title == title {
+                        return (None, None);
+                    }
+                    record.title = title;
+                    (
+                        (record.mapped && publish).then(|| ProtocolEvent::SurfaceRelayout {
+                            id: record.id,
+                            scene: record.scene_snapshot(),
+                        }),
+                        Some(record.id),
+                    )
+                });
         if let Some(event) = event {
             self.events.push(event);
+        }
+        #[cfg(feature = "bus")]
+        if let Some(id) = _changed_id {
+            self.mark_surface_dirty(id, "wayland.map");
         }
     }
 
@@ -1047,18 +1087,22 @@ impl XdgShellHandler for WaylandState {
                         .map(capped_toplevel_title)
                 })
         });
-        let changed = self
+        let changed_id = self
             .surfaces
             .get_mut(&surface.wl_surface().id())
-            .is_some_and(|record| {
+            .and_then(|record| {
                 if record.app_id == app_id {
-                    return false;
+                    return None;
                 }
                 record.app_id = app_id;
-                true
+                Some(record.id)
             });
-        if changed {
+        if changed_id.is_some() {
             self.sync_foreign_toplevel(surface.wl_surface());
+        }
+        #[cfg(feature = "bus")]
+        if let Some(id) = changed_id {
+            self.mark_surface_dirty(id, "wayland.map");
         }
     }
 
@@ -1122,6 +1166,8 @@ impl XdgShellHandler for WaylandState {
             return;
         }
 
+        #[cfg(feature = "bus")]
+        self.mark_surface_unmapped(surface.wl_surface());
         let id = if let Some(record) = self.surfaces.get_mut(&surface_object) {
             let id = record.id;
             record.role = SurfaceRole::Popup(surface);
@@ -1614,6 +1660,8 @@ impl SessionLockHandler for WaylandState {
             lock_generation: generation,
         };
         let surface_object = surface.wl_surface().id();
+        #[cfg(feature = "bus")]
+        self.mark_surface_unmapped(surface.wl_surface());
         let id = if let Some(record) = self.surfaces.get_mut(&surface_object) {
             let id = record.id;
             record.role = SurfaceRole::LockSurface(role);

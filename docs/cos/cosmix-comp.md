@@ -6,7 +6,7 @@ the KMS backend on a system seat.
 
 ## Bus control plane
 
-The default `bus` feature gives the compositor a read-only Bus control plane.
+The default `bus` feature gives the compositor an L2 Bus control plane.
 The seat/KMS compositor registers as `comp`; `--nested` registers as
 `comp-nested`. `--bus-service NAME` overrides either name and accepts
 `^[a-z][a-z0-9-]{1,30}$`. A build without the `bus` feature rejects that flag
@@ -14,7 +14,7 @@ instead of silently ignoring it. The broker independently enforces the same
 SPEC 10 service-name grammar at registration and rejects an invalid `from`
 with Bus rc 10.
 
-P-0 exposes five verbs:
+The control plane exposes seven verbs:
 
 - `comp.ping` returns `{"pong":true}` without taking a compositor snapshot.
 - `comp.info` returns service/build/backend provenance plus output and surface
@@ -24,11 +24,17 @@ P-0 exposes five verbs:
 - `comp.props.list prefix?` returns leaf paths. A prefix is matched by complete
   path segments, never by string prefix.
 - `comp.props.describe path` returns leaf metadata (`type`, `mutable`,
-  `sensitive`, description, optional `format`/`enum`, and owner) or an object
-  subtree with its immediate children. Every P-0 leaf is immutable,
-  non-sensitive and owned by `comp`.
+  `sensitive`, description, optional `format`/`enum`/`range`/`persistence`, and
+  owner) or an object subtree with its immediate children.
+- `comp.props.watch` seeds the property-change baseline and returns
+  `{topic:"<service>.props.changed",event_seq,lost_count}`, where `service` is
+  the name this compositor instance actually registered. The reply is truthful
+  only for a caller that subscribed to that topic before calling `watch` and
+  remains subscribed.
+- `comp.props.set {path,value}` mutates one of the four corner properties and
+  returns `{path,old,new}`.
 
-The complete P-0 read tree is:
+The complete L2 read tree is:
 
 ```text
 info.{service,version,backend,engine,instance}
@@ -44,7 +50,9 @@ stack
 focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock}
 decoration.{enabled,style}
 bindings.{enabled,profile,table}
-port.{level,event_seq,lost_count,queue_depth,reply_timeouts,slug_collisions,broker}
+input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s}
+port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
+      slug_collisions,broker}
 ```
 
 Surface keys are `s` plus the decimal session-local surface ID. Output keys are
@@ -52,14 +60,99 @@ Surface keys are `s` plus the decimal session-local surface ID. Output keys are
 replaced by `_`; the raw output name remains in `name`. If output names collide
 after slugging, the first output wins, each omitted output increments
 `port.slug_collisions`, and the compositor logs each collision at debug level.
-P-0 has one protocol-visible client output, so collisions remain a documented
-known limit.
 `band` includes `background`, `bottom`, `normal`, `top`, `overlay` and `lock`.
 `stack` contains mapped roots from top to bottom. `windows` is a projection of
-mapped XDG toplevels. `port.level` is `L1`; `event_seq` and `lost_count` remain
-zero until watch support lands. `port.broker` is driven by connection-state
-edges and is `connected` or `retrying`. `port.reply_timeouts` counts replies
-whose bounded reply lane was saturated. For a timeout: reply send abandoned after 2 s; delivery not guaranteed (the client sink may still flush it). It is separate from topic-only `lost_count`.
+mapped XDG toplevels. `port.level` is `L2`. `port.event_seq` is the live global
+sequence watermark across every topic, and `port.lost_count` is cumulative.
+`port.broker` is driven by connection-state edges and is `connected` or
+`retrying`. `port.reply_timeouts` and `port.publish_timeouts` count their
+separate bounded lanes; both abandon a sink wait after two seconds.
+
+The compositor publishes non-retained messages under the registered service
+namespace. The seat instance therefore uses `comp.*`, the default nested
+instance uses `comp-nested.*`, and `--bus-service NAME` moves the complete
+namespace to `NAME.*`. Every inner command is the unprefixed suffix shown
+below, so handlers do not depend on the instance name.
+
+| Topic | Inner command | Exact body |
+| --- | --- | --- |
+| `<service>.props.changed` | `props.changed` | `{path,old,new,ts,cause,event_seq}` |
+| `<service>.surface.mapped` | `surface.mapped` | `{id,role,foreign_id?,event_seq}` |
+| `<service>.surface.unmapped` | `surface.unmapped` | `{id,role,foreign_id?,event_seq}` |
+| `<service>.focus.changed` | `focus.changed` | `{keyboard,previous,exclusive_latch,event_seq}` |
+| `<service>.output.changed` | `output.changed` | `{output,geometry:{x,y,width,height},usable:{x,y,width,height},event_seq}` |
+| `<service>.corner.entered` | `corner.entered` | `{output,corner,dwell_ms,event_seq}` |
+| `<service>.corner.left` | `corner.left` | `{output,corner,dwell_ms,event_seq}` |
+
+For a reliable property bootstrap: subscribe to the instance topic (for
+example `comp.props.changed` on the seat or `comp-nested.props.changed` when
+nested), call `comp.props.watch`, verify its returned topic, then read the
+required tree or subtree. The watcher is itself the subscriber: while that
+subscription remains active, noded cannot send `topic.idle` for its subscriber
+generation. An idle delivered in the same control batch as `watch` therefore
+belongs to a previous generation; the next zero-to-one `topic.active` re-seeds
+the baseline. Mix handlers match the suffix: `on props.changed`,
+`on surface.mapped`, `on focus.changed`, and so on. Changes are reduced after
+each complete protocol dispatch. A leaf therefore appears at most once per
+cycle, with its cycle-start `old`, final `new`, lexical path order and one of
+`wayland.map`, `wayland.unmap`, `wayland.focus`, `output.geometry`,
+`layer.arrange`, `session.lock` or `props.set` as `cause`. Operational `port.*`
+leaves are readable but are not self-published as property changes.
+
+Keyed row creation and removal are row-granular: an appearing
+`surfaces.s<id>`, `windows.s<id>` or `outputs.o_<slug>` emits one frame at the
+row path with `old:null,new:<full row>`, and removal emits the inverse.
+Mutations within an existing row remain leaf-granular.
+
+The sequence is process-global, strictly increasing and shared by property,
+surface, focus, output and corner records. If it reaches `u64::MAX`, that value
+is offered once and observation enters a terminal exhausted state rather than
+reusing a sequence. The outbox is one bounded 256-entry lane. On overflow the
+producer evicts one oldest record in fixed time and carries that record's loss
+interval inside the next record it sends; if an evicted record already carries
+loss, both intervals coalesce. Once the publisher learns an interval, it emits
+a gap on each affected topic before the next record it publishes on that topic,
+or during the idle flush when the lane drains empty. Survivors produced before
+the carried loss reaches the publisher may therefore be published before its
+gap. The gap's Bus header is `event_seq=<last lost seq>` (the coalesced
+interval's last-lost sequence), which locates the hole, and its body is
+`{gap:true,lost_count,cause:"outbox.overflow"}`. `lost_count` is the same
+cumulative process-wide counter as `port.lost_count`, not a per-interval tally.
+Consecutive intervals coalesce while pending, bounding gap traffic to at most
+one gap per topic per published record plus the idle flush. A rejected or
+timed-out publication discards its uncertain backlog and recovers under the
+same ordering rule with `cause:"publisher.loss"`. A failed pending gap retries
+immediately on broker connection-state edges and on a single one-shot backoff
+timer (1 second, doubling to a 30-second cap); that timer exists only while the
+gap remains pending. After either gap, read a fresh property tree.
+
+Hot-corner detection is compositor-side and uses the current logical output.
+It emits one `entered`, then one `left` on deadzone exit, output or geometry
+change, session lock, disable, or config invalidation. `corner` is `tl`, `tr`,
+`bl` or `br`; `left` repeats the dwell measured by `entered`. Fast transit is
+not accepted until a velocity-qualified dwell, while continued slow outward
+motion constrained by the output edge can enter early. Defaults and inclusive
+ranges are:
+
+| Property | Default | Range |
+| --- | ---: | ---: |
+| `input.corners.enabled` | `true` | boolean |
+| `input.corners.deadzone_px` | `12.0` | `1.0..=256.0` logical px |
+| `input.corners.dwell_ms` | `200` | `0..=5000` ms |
+| `input.corners.velocity_max_px_s` | `1500.0` | `1.0..=20000.0` logical px/s |
+
+These are the only mutable leaves. Their descriptors say `mutable:true` and
+`persistence:"none"`; numeric leaves also carry the range above. Values live
+for the compositor process only. Writes are admitted only when noded supplied
+exactly one case-insensitive `broker_origin` header whose value is `local`,
+the caller has a canonical registered service name, and the wire contains no
+`source_peer`, `permissions` or `signed_ident` claim. Otherwise the reply is
+rc 10 `{"error":"not_local"}` before calloop admission. Unknown and immutable
+paths return `unknown_path` and `read_only`; type/range failures return
+`{error:"invalid_value",path,expected,range}`. All four path/type/range checks
+run on the worker before admission and are repeated on calloop as
+defence-in-depth, so invalid writes consume no ingress or responder permit. A
+no-op write replies normally without a change record.
 
 `focus.session_lock` is `none`, `locking`, `locked`, `orphaned` or `unlocking`.
 While a session lock is active, the read tree applies the same
@@ -71,9 +164,8 @@ tree stays redacted with `focus.session_lock="unlocking"` until the
 compositor's own presentation predicate lifts, at the same moment the renderer
 resumes. Unlock then restores the ordinary projection.
 
-All application errors use Bus rc 10 with exactly one of
-`{"error":"unknown_path"}`, `{"error":"busy"}` or
-`{"error":"unknown_verb"}`, plus
+All application errors use Bus rc 10. In addition to the write errors above,
+read/dispatch errors include `unknown_path`, `busy` and `unknown_verb`, plus
 `{"error":"too_large","limit_bytes":N,"hint":"read a subtree"}` when a
 serialised reply would exceed the effective broker-path ceiling. `N` is
 8,384,512 bytes: `min(16 MiB Bus message, 8 MiB single WebSocket frame)` minus
@@ -87,15 +179,23 @@ admission) is logged once, ends the port worker without renaming, and leaves
 the compositor running.
 
 The broker client lives on the named `cosmix-comp-port` OS thread with its own
-current-thread Tokio runtime. At most 16 accepted reads cross a bounded calloop
+current-thread Tokio runtime. At most 16 accepted controls/reads cross a bounded calloop
 channel. The calloop callback only stages requests; after the current protocol
 transaction and popup cleanup, one owned snapshot is built and shared by all
 requests in that dispatch. Snapshot admission is released before reply I/O.
-Replies cross a separate bounded lane whose sender applies a two-second deadline,
-so the incoming command loop never awaits a broker send. Full-tree JSON is
+Replies and publications use separate lanes and two-second deadlines, so a
+stalled topic sink does not stop incoming commands. Full-tree JSON is
 serialised once per snapshot on the blocking pool, with only one full-tree
 serialisation active process-wide; requests share the resulting string. Subtree
 reads serialise only the selected value.
+
+The semantic observation reducer carries typed rows and scalar values across
+the bounded outbox; only the worker constructs topic JSON. Successful offers
+wake the publisher with an event notification, which drains the outbox to
+empty. There is no publisher polling timer or idle tick source. `topic.idle`
+drops the property baseline and a later `topic.active` seeds one at the next
+stable service point; both lifecycle directions coalesce latest-wins if the
+ingress is temporarily full.
 
 The 16,384-surface cap bounds tree cardinality, not reply bytes. A full tree can
 still serialise far beyond the wire allowance, so comp measures the cached
@@ -103,15 +203,13 @@ full-tree bytes once and returns `too_large`; callers can read a leaf or subtree
 from the same snapshot. Single-flight serialisation prevents same-snapshot
 multiplication.
 
-Absent by design in P-0:
+Absent by design after P-1:
 
-- mutation and `input.corners`, because the policy/store slice is P-1;
-- topics and watch, because event sequencing, coalescing and gap recovery are
-  P-1;
-- `comp.surface.*`, because focus/raise/close operations arrive in P-2 and
+- `comp.surface.*` control verbs, because focus/raise/close operations arrive in P-2 and
   move/resize in P-3;
 - render timings, because they are metrics rather than properties; and
-- screenshot, because it waits for the capture service seam after Arc 4.
+- a Bus screenshot verb, because it is a later control-plane slice; Arc 4's
+  capture service is available through the Wayland protocol described below.
 
 ## Supported Wayland protocols
 

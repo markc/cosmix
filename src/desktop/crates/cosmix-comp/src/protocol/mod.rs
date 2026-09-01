@@ -1,6 +1,10 @@
 //! Smithay protocol state and the narrow protocol-to-ECS bridge.
 
 #[cfg(feature = "bus")]
+mod corner;
+#[cfg(feature = "bus")]
+pub(crate) mod port_observation;
+#[cfg(feature = "bus")]
 pub(crate) mod port_snapshot;
 
 use std::{
@@ -65,7 +69,8 @@ use crate::{
 
 #[cfg(feature = "bus")]
 use crate::port::{
-    PORT_QUEUE_CAPACITY, PortCommand, PortProtocolWiring, PortRequest, PortStarter, PortWorker,
+    PORT_QUEUE_CAPACITY, PortCommand, PortControl, PortProtocolWiring, PortRequest, PortStarter,
+    PortWorker,
 };
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -328,13 +333,29 @@ impl SurfaceStackKey {
 
 /// Latest confined pointer coordinate shared with the renderer.
 ///
-/// The three fields are one mutex-protected value so a renderer can never
-/// combine one motion's x coordinate with another motion's y or revision.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// The four fields are one mutex-protected value so a renderer can never
+/// combine one motion's coordinate with another motion's visibility or
+/// revision.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct CursorPositionSnapshot {
     pub(crate) x: f64,
     pub(crate) y: f64,
+    /// False only while the nested host pointer is outside the compositor
+    /// window. The retained cursor asset remains live, but capture must not
+    /// overlay it until a later ordered motion re-enters the output.
+    pub(crate) on_output: bool,
     pub(crate) revision: u64,
+}
+
+impl Default for CursorPositionSnapshot {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            on_output: true,
+            revision: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -685,6 +706,10 @@ pub(crate) enum HostInput {
         dy: f64,
         time: u32,
     },
+    /// The host pointer left the nested compositor window. There is no client
+    /// coordinate to deliver, but compositor-owned pointer observations must
+    /// tear down immediately because no later motion sample is guaranteed.
+    PointerLeave,
     PointerButton {
         button: u32,
         state: HostButtonState,
@@ -2519,9 +2544,20 @@ impl ProtocolServer {
             cursor_position,
         } = bootstrap;
         #[cfg(feature = "bus")]
-        let (port_source, port_context) = match port {
-            Some(port) => (Some(port.source), Some(port.context)),
-            None => (None, None),
+        let (port_source, port_context, observation_producer, observation_event_seq) = match port {
+            Some(port) => (
+                Some(port.source),
+                Some(port.context.clone()),
+                port.observation_producer,
+                port.context.event_seq.clone(),
+            ),
+            None => {
+                let lost_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let event_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let (producer, receiver) = port_observation::outbox(lost_count);
+                drop(receiver);
+                (None, None, producer, event_seq)
+            }
         };
         let display = Display::<WaylandState>::new().map_err(|error| error.to_string())?;
         let display_handle = display.handle();
@@ -2776,6 +2812,14 @@ impl ProtocolServer {
             port_context,
             #[cfg(feature = "bus")]
             pending_port_requests: Vec::with_capacity(PORT_QUEUE_CAPACITY),
+            #[cfg(feature = "bus")]
+            pending_port_controls: Vec::with_capacity(PORT_QUEUE_CAPACITY),
+            #[cfg(feature = "bus")]
+            observations: port_observation::ObservationState::new(
+                observation_producer,
+                observation_event_seq,
+                event_loop.handle(),
+            ),
             events: Vec::new(),
             event_flush_acknowledgements: Vec::new(),
             pending_full_upserts: HashSet::new(),
@@ -2821,6 +2865,11 @@ impl ProtocolServer {
             #[cfg(test)]
             effective_window_geometry_calls: 0,
         };
+
+        #[cfg(feature = "bus")]
+        let mut state = state;
+        #[cfg(feature = "bus")]
+        state.refresh_corner_regions();
 
         event_loop
             .handle()
@@ -2887,6 +2936,35 @@ impl ProtocolServer {
                     ChannelEvent::Msg(PortCommand::Snapshot(request)) => {
                         if state.pending_port_requests.len() < PORT_QUEUE_CAPACITY {
                             state.pending_port_requests.push(request);
+                        }
+                    }
+                    ChannelEvent::Msg(PortCommand::Watch(request)) => {
+                        if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
+                            state
+                                .pending_port_controls
+                                .push(PortControl::Watch(request));
+                        }
+                    }
+                    ChannelEvent::Msg(PortCommand::Set(request)) => {
+                        if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
+                            state.pending_port_controls.push(PortControl::Set(request));
+                        }
+                    }
+                    ChannelEvent::Msg(PortCommand::WatchState { active, order }) => {
+                        if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
+                            state
+                                .pending_port_controls
+                                .push(PortControl::WatchState { active, order });
+                        } else if let Some(context) = state.port_context.as_ref() {
+                            if active {
+                                context
+                                    .pending_active_order
+                                    .fetch_max(order, Ordering::AcqRel);
+                            } else {
+                                context
+                                    .pending_idle_order
+                                    .fetch_max(order, Ordering::AcqRel);
+                            }
                         }
                     }
                     ChannelEvent::Closed => {}
@@ -2984,6 +3062,8 @@ impl ProtocolServer {
                     event,
                     acknowledgement,
                 }) => {
+                    #[cfg(feature = "bus")]
+                    state.mark_output_topology_before_change();
                     let pause = matches!(&event, KmsTopologyLifecycleEvent::Pause);
                     let resumed = matches!(&event, KmsTopologyLifecycleEvent::Resume(_));
                     let previous_kms_outputs = state.backend.kms_registered_outputs();
@@ -3184,6 +3264,8 @@ impl ProtocolServer {
         self.state.reconcile_subsurface_roles();
         self.state.backend.maintain_after_protocol_dispatch();
         self.state.popup_manager.cleanup();
+        #[cfg(feature = "bus")]
+        port_observation::service_observations(&mut self.state);
         #[cfg(feature = "bus")]
         port_snapshot::service_requests(&mut self.state);
         self.display
@@ -5208,6 +5290,10 @@ struct WaylandState {
     port_context: Option<Arc<port_snapshot::SnapshotContext>>,
     #[cfg(feature = "bus")]
     pending_port_requests: Vec<PortRequest>,
+    #[cfg(feature = "bus")]
+    pending_port_controls: Vec<PortControl>,
+    #[cfg(feature = "bus")]
+    observations: port_observation::ObservationState,
     events: Vec<ProtocolEvent>,
     /// Flush pokes handled in this dispatch. Their callers may proceed only
     /// after `publish_events` has offered the compacted outbox.
@@ -6633,6 +6719,8 @@ impl WaylandState {
         // Reconcile releases while ordinary focus and binding state still have
         // their pre-lock meaning, then make every later policy query fail closed.
         self.release_pressed_keys();
+        #[cfg(feature = "bus")]
+        self.mark_session_observation_dirty();
         self.lock_lifecycle = LockLifecycle::Locking {
             owner,
             lock_resource,
@@ -6663,6 +6751,8 @@ impl WaylandState {
     }
 
     fn teardown_input_for_session_lock(&mut self) {
+        #[cfg(feature = "bus")]
+        self.reset_corner_detector();
         let popup_parents = self
             .surfaces
             .values()
@@ -6733,6 +6823,8 @@ impl WaylandState {
     }
 
     fn acknowledge_nested_security_presentation(&mut self, presentation_epoch: u64, output: &str) {
+        #[cfg(feature = "bus")]
+        self.mark_session_observation_dirty();
         let lifecycle = mem::replace(&mut self.lock_lifecycle, LockLifecycle::Unlocked);
         match lifecycle {
             LockLifecycle::Locking {
@@ -6780,6 +6872,8 @@ impl WaylandState {
         generation: u64,
         output: &crate::backend::kms::OutputKey,
     ) {
+        #[cfg(feature = "bus")]
+        self.mark_session_observation_dirty();
         let lifecycle = mem::replace(&mut self.lock_lifecycle, LockLifecycle::Unlocked);
         match lifecycle {
             LockLifecycle::Locking {
@@ -7028,6 +7122,8 @@ impl WaylandState {
         if !matches!(self.lock_lifecycle, LockLifecycle::Locked { .. }) {
             return;
         }
+        #[cfg(feature = "bus")]
+        self.mark_session_observation_dirty();
         #[cfg(test)]
         {
             self.session_unlock_callbacks = self.session_unlock_callbacks.saturating_add(1);
@@ -7040,6 +7136,8 @@ impl WaylandState {
     }
 
     fn abort_locking_after_owner_death(&mut self, lock_resource: &ExtSessionLockV1) {
+        #[cfg(feature = "bus")]
+        self.mark_session_observation_dirty();
         self.session_lock_state.abort_lock_outputs(lock_resource);
         self.prepare_unlock_scene_transition();
         self.lock_lifecycle = LockLifecycle::Unlocked;
@@ -7203,6 +7301,14 @@ impl WaylandState {
         }
         self.capture_managers
             .retain(|_, manager| &manager.client_id != client_id);
+        #[cfg(feature = "bus")]
+        if matches!(
+            &self.lock_lifecycle,
+            LockLifecycle::Locking { owner, .. } | LockLifecycle::Locked { owner, .. }
+                if owner == client_id
+        ) {
+            self.mark_session_observation_dirty();
+        }
         let lifecycle = mem::replace(&mut self.lock_lifecycle, LockLifecycle::Unlocked);
         match lifecycle {
             LockLifecycle::Locking {
@@ -7411,6 +7517,18 @@ impl WaylandState {
         match input {
             HostInput::PointerMotionAbsolute { x, y, time } => self.pointer_moved(x, y, time),
             HostInput::PointerMotion { dx, dy, time } => self.pointer_motion(dx, dy, time),
+            HostInput::PointerLeave => {
+                #[cfg(feature = "bus")]
+                self.reset_corner_detector();
+                let mut snapshot = self
+                    .cursor_position_snapshot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if snapshot.on_output {
+                    snapshot.on_output = false;
+                    snapshot.revision = snapshot.revision.saturating_add(1);
+                }
+            }
             HostInput::PointerButton {
                 button,
                 state,
@@ -7749,6 +7867,8 @@ impl WaylandState {
         output: &Output,
         update: impl FnOnce(&mut LayerMap) -> R,
     ) -> R {
+        #[cfg(feature = "bus")]
+        self.mark_output_before_change(output, "layer.arrange");
         let output_origin = output.current_location();
         let (existing, geometry_before) = {
             let layer_map = layer_map_for_output(output);
@@ -7826,6 +7946,8 @@ impl WaylandState {
         }
 
         let mut moved_roots = Vec::new();
+        #[cfg(feature = "bus")]
+        let mut observed_layers = Vec::new();
         for (layer, geometry) in arranged {
             let Some(record) = self.surfaces.get_mut(&layer.wl_surface().id()) else {
                 continue;
@@ -7833,6 +7955,8 @@ impl WaylandState {
             if !matches!(record.role, SurfaceRole::Layer(_)) {
                 continue;
             }
+            #[cfg(feature = "bus")]
+            observed_layers.push(record.id);
             let location = (
                 (output_origin.x + geometry.loc.x) as f32,
                 (output_origin.y + geometry.loc.y) as f32,
@@ -7854,6 +7978,10 @@ impl WaylandState {
         }
         for (root, delta) in moved_roots {
             self.shift_surface_descendants(root, delta);
+        }
+        #[cfg(feature = "bus")]
+        for id in observed_layers {
+            self.mark_surface_dirty(id, "layer.arrange");
         }
         if geometry_changed {
             self.invalidate_pointer_hit_test_geometry();
@@ -8058,6 +8186,8 @@ impl WaylandState {
                     }
                 }
                 LayerOutputTransition::Close => {
+                    #[cfg(feature = "bus")]
+                    self.mark_surface_unmapped(layer.wl_surface());
                     let unmapped = self.surfaces.get_mut(&object).and_then(|record| {
                         let SurfaceRole::Layer(role) = &mut record.role else {
                             return None;
@@ -8116,10 +8246,10 @@ impl WaylandState {
         if self.surfaces[&surface.id()].layout.z.band == band {
             return;
         }
-        self.restack_role_tree(surface, band);
+        self.restack_role_tree(surface, band, "layer.arrange");
     }
 
-    fn restack_role_tree(&mut self, surface: &WlSurface, band: StackBand) {
+    fn restack_role_tree(&mut self, surface: &WlSurface, band: StackBand, _cause: &'static str) {
         let Some(root_id) = record_root_id(&self.surfaces, &self.surface_objects, surface.id())
         else {
             return;
@@ -8147,6 +8277,8 @@ impl WaylandState {
                 .entry((key.band, key.sequence))
                 .or_insert_with(|| self.allocate_stack_key(band));
         }
+        #[cfg(feature = "bus")]
+        let mut observed = Vec::new();
         for (old_key, object) in groups {
             let new_root = next_keys[&(old_key.band, old_key.sequence)];
             if let Some(record) = self.surfaces.get_mut(&object) {
@@ -8160,8 +8292,16 @@ impl WaylandState {
                         scene: record.scene_snapshot(),
                     });
                 }
+                #[cfg(feature = "bus")]
+                observed.push(record.id);
             }
         }
+        #[cfg(feature = "bus")]
+        for id in observed {
+            self.mark_surface_dirty(id, _cause);
+        }
+        #[cfg(feature = "bus")]
+        self.mark_stack_dirty(_cause);
         self.refresh_committed_surface_stack(surface);
         self.invalidate_pointer_hit_test();
     }
@@ -8522,12 +8662,22 @@ impl WaylandState {
             return;
         };
         let (x, y, _, _) = self.backend.logical_output_rect();
-        if let Some(record) = self.surfaces.get_mut(&surface.id()) {
+        let _changed_id = self.surfaces.get_mut(&surface.id()).and_then(|record| {
+            let changed = record.configured_size != (width, height)
+                || record.layout.x != x as f32
+                || record.layout.y != y as f32
+                || record.layout.width != width as f32
+                || record.layout.height != height as f32;
             record.configured_size = (width, height);
             record.layout.x = x as f32;
             record.layout.y = y as f32;
             record.layout.width = width as f32;
             record.layout.height = height as f32;
+            changed.then_some(record.id)
+        });
+        #[cfg(feature = "bus")]
+        if let Some(id) = _changed_id {
+            self.mark_surface_dirty(id, "output.geometry");
         }
     }
 
@@ -8732,10 +8882,13 @@ impl WaylandState {
         record.layout = pending.layout;
         record.window_origin = pending.window_origin;
         record.configured_size = pending.configured_size;
+        let id = record.id;
         self.events.push(ProtocolEvent::SurfaceRelayout {
-            id: record.id,
+            id,
             scene: record.scene_snapshot(),
         });
+        #[cfg(feature = "bus")]
+        self.mark_surface_dirty(id, "wayland.map");
     }
 
     fn current_configure_sequence_is_acked(&self, surface: &WlSurface) -> bool {
@@ -8907,6 +9060,12 @@ impl WaylandState {
             else {
                 continue;
             };
+            let was_mapped = self
+                .surfaces
+                .get(&object)
+                .is_some_and(|record| record.mapped);
+            #[cfg(feature = "bus")]
+            self.mark_surface_unmapped(&popup_surface);
             self.reset_configure_sequence(&popup_surface);
             let Some(record) = self.surfaces.get_mut(&object) else {
                 continue;
@@ -8921,8 +9080,8 @@ impl WaylandState {
                 .map(|backing| backing.retention_token);
             record.buffer_dimensions = None;
             record.minimized = false;
-            let unmapped = record.mapped.then_some(record.id);
             record.mapped = false;
+            let unmapped = was_mapped.then_some(record.id);
             retired.push((
                 popup_surface,
                 unmapped,
@@ -8964,6 +9123,8 @@ impl WaylandState {
             .collect::<Vec<_>>();
         let mut stack = roots;
         let mut output_changes = Vec::new();
+        #[cfg(feature = "bus")]
+        let mut observed = Vec::new();
         while let Some((id, ancestor_visible)) = stack.pop() {
             let Some(object) = self.surface_objects.get(&id).cloned() else {
                 continue;
@@ -8991,10 +9152,16 @@ impl WaylandState {
                     id: record.id,
                     scene: record.scene_snapshot(),
                 });
+                #[cfg(feature = "bus")]
+                observed.push(record.id);
             }
             if let Some(descendants) = children.get(&id) {
                 stack.extend(descendants.iter().copied().map(|child| (child, visible)));
             }
+        }
+        #[cfg(feature = "bus")]
+        for id in observed {
+            self.mark_surface_dirty(id, "wayland.map");
         }
         for (surface, visible) in output_changes {
             if visible {
@@ -9036,6 +9203,23 @@ impl WaylandState {
         let children = compositor::get_children(parent);
         let mut any_remapped = false;
         for child in children {
+            #[cfg(feature = "bus")]
+            let remap_id = self
+                .surfaces
+                .get(&child.id())
+                .filter(|record| {
+                    matches!(record.role, SurfaceRole::Subsurface { .. })
+                        && !record.parent_association_committed
+                        && !record.mapped
+                        && (record.shm_backing.is_some() || record.dmabuf_backing.is_some())
+                })
+                .map(|record| record.id);
+            #[cfg(feature = "bus")]
+            if let Some(id) = remap_id {
+                self.mark_surface_before_change(id);
+            }
+            #[cfg(feature = "bus")]
+            let mut remapped_id = None;
             if let Some(record) = self.surfaces.get_mut(&child.id())
                 && matches!(record.role, SurfaceRole::Subsurface { .. })
             {
@@ -9057,7 +9241,15 @@ impl WaylandState {
                     any_remapped = true;
                     let id = record.id;
                     self.pending_full_upserts.insert(id);
+                    #[cfg(feature = "bus")]
+                    {
+                        remapped_id = Some(id);
+                    }
                 }
+            }
+            #[cfg(feature = "bus")]
+            if let Some(id) = remapped_id {
+                self.mark_surface_dirty(id, "wayland.map");
             }
         }
         self.refresh_committed_surface_stack(parent);
@@ -9095,6 +9287,8 @@ impl WaylandState {
                 )
             })
             .collect::<HashMap<_, _>>();
+        #[cfg(feature = "bus")]
+        let mut observed = Vec::new();
         for record in self
             .surfaces
             .values_mut()
@@ -9103,6 +9297,8 @@ impl WaylandState {
             let sequence = dense[&record.layout.z.sequence];
             if record.layout.z.sequence != sequence {
                 record.layout.z.sequence = sequence;
+                #[cfg(feature = "bus")]
+                observed.push(record.id);
                 if record.mapped {
                     self.events.push(ProtocolEvent::SurfaceRelayout {
                         id: record.id,
@@ -9110,6 +9306,16 @@ impl WaylandState {
                     });
                 }
             }
+        }
+        #[cfg(feature = "bus")]
+        let observed_stack_change = !observed.is_empty();
+        #[cfg(feature = "bus")]
+        for id in observed {
+            self.mark_surface_dirty(id, "wayland.map");
+        }
+        #[cfg(feature = "bus")]
+        if observed_stack_change {
+            self.mark_stack_dirty("wayland.map");
         }
         self.next_stack_sequences[band.index()] =
             u64::try_from(dense.len()).expect("surface bound fits u64");
@@ -9158,6 +9364,8 @@ impl WaylandState {
             }
         }
         let mut stack_changed = false;
+        #[cfg(feature = "bus")]
+        let mut observed = Vec::new();
         for (index, object) in ordered.into_iter().enumerate() {
             let Some(record) = self.surfaces.get_mut(&object) else {
                 continue;
@@ -9169,6 +9377,8 @@ impl WaylandState {
             if record.layout.z != z {
                 stack_changed = true;
                 record.layout.z = z;
+                #[cfg(feature = "bus")]
+                observed.push(record.id);
                 if record.mapped {
                     self.events.push(ProtocolEvent::SurfaceRelayout {
                         id: record.id,
@@ -9176,6 +9386,14 @@ impl WaylandState {
                     });
                 }
             }
+        }
+        #[cfg(feature = "bus")]
+        for id in observed {
+            self.mark_surface_dirty(id, "wayland.map");
+        }
+        #[cfg(feature = "bus")]
+        if stack_changed {
+            self.mark_stack_dirty("wayland.map");
         }
         if stack_changed {
             self.invalidate_pointer_hit_test();
@@ -9235,6 +9453,12 @@ impl WaylandState {
     }
 
     fn deactivate_surface_role(&mut self, surface: &WlSurface) {
+        let was_mapped_before = self
+            .surfaces
+            .get(&surface.id())
+            .is_some_and(|record| record.mapped);
+        #[cfg(feature = "bus")]
+        self.mark_surface_unmapped(surface);
         self.close_foreign_toplevel(surface);
         self.cancel_chrome_pointer_grab_for_surface(surface, false);
         self.reset_chrome_pointer_tracking(&surface.id());
@@ -9256,10 +9480,9 @@ impl WaylandState {
         // Whether the renderer can be holding an entity for this surface. A
         // surface the compositor called mapped is one it may have published a
         // complete upsert for, so going dormant has to be *said*, below.
-        let was_mapped = record.mapped;
+        let was_mapped = was_mapped_before;
         let id = record.id;
         record.role = SurfaceRole::Dormant(surface.clone());
-        record.mapped = false;
         record.required_configure = None;
         record.last_acked_configure = None;
         record.last_acked_size = None;
@@ -9267,6 +9490,7 @@ impl WaylandState {
         record.pending_window_state = None;
         record.pending_popup_reposition = None;
         record.minimized = false;
+        record.mapped = false;
         record.parent_association_committed = false;
         if interactive_surface(self.interactive_pointer.as_ref())
             .is_some_and(|interactive| interactive == surface)
@@ -9311,6 +9535,8 @@ impl WaylandState {
     }
 
     fn destroy_surface_record(&mut self, surface: &WlSurface) {
+        #[cfg(feature = "bus")]
+        self.mark_surface_unmapped(surface);
         if let Some(output) = self.surfaces.get(&surface.id()).and_then(|record| {
             let SurfaceRole::LockSurface(role) = &record.role else {
                 return None;
@@ -9896,7 +10122,14 @@ impl WaylandState {
         {
             self.titlebar_click_candidate = None;
         }
-        let (x, y) = clamp_point_to_seat((x, y), &self.backend.seat_regions());
+        let clamped = clamp_point_to_seat((x, y), &self.backend.seat_regions());
+        let (x, y) = clamped.position;
+        #[cfg(feature = "bus")]
+        self.sample_corner_motion(
+            clamped.position,
+            clamped.region_index,
+            clamped.attempted_motion,
+        );
         {
             let mut snapshot = self
                 .cursor_position_snapshot
@@ -9904,6 +10137,7 @@ impl WaylandState {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             snapshot.x = x;
             snapshot.y = y;
+            snapshot.on_output = true;
             snapshot.revision = snapshot.revision.saturating_add(1);
         }
         self.cursor_position = (x, y);
@@ -10158,7 +10392,7 @@ impl WaylandState {
         let Some(touch) = self.seat.get_touch() else {
             return;
         };
-        let (x, y) = clamp_point_to_seat((x, y), &self.backend.seat_regions());
+        let (x, y) = clamp_point_to_seat((x, y), &self.backend.seat_regions()).position;
         let focus = self.touch_focus_at(x, y);
         if !touch.is_grabbed() {
             let requested = focus.as_ref().map(|(surface, _)| surface.clone());
@@ -10188,7 +10422,7 @@ impl WaylandState {
         let Some(touch) = self.seat.get_touch() else {
             return;
         };
-        let (x, y) = clamp_point_to_seat((x, y), &self.backend.seat_regions());
+        let (x, y) = clamp_point_to_seat((x, y), &self.backend.seat_regions()).position;
         let focus = self.touch_focus_at(x, y);
         touch.motion(
             self,
@@ -11222,7 +11456,7 @@ impl WaylandState {
         else {
             return;
         };
-        self.restack_role_tree(surface, band);
+        self.restack_role_tree(surface, band, "wayland.focus");
     }
 
     fn layer_root_object_for_surface(&self, surface: &WlSurface) -> Option<ObjectId> {
@@ -11339,72 +11573,76 @@ impl WaylandState {
         fallback: bool,
         clear_if_unrequested: bool,
     ) {
-        let previous_exclusive = self.exclusive_keyboard_focus.take();
-        let current_layer_became_none =
-            self.keyboard.current_focus().as_ref().is_some_and(|focus| {
-                self.layer_keyboard_interactivity_for_surface(focus)
-                    == Some(KeyboardInteractivity::None)
-            });
-        let target = if self.session_lock_active() {
-            requested
-                .filter(|surface| {
-                    self.surfaces
-                        .get(&surface.id())
-                        .is_some_and(|record| self.surface_is_input_presentable(record))
-                })
-                .or_else(|| self.highest_visible_lock_surface())
-        } else if let Some((object, surface)) = self.highest_exclusive_layer() {
-            self.exclusive_keyboard_focus = Some(object);
-            Some(surface)
-        } else {
-            let requested = match requested {
-                Some(surface)
-                    if self.layer_keyboard_interactivity_for_surface(&surface)
-                        == Some(KeyboardInteractivity::None) =>
-                {
-                    // A non-interactive layer receives pointer/touch events but
-                    // must not disturb whichever surface owns the keyboard.
-                    return;
-                }
-                Some(surface) => self.interaction_focus_root(&surface),
-                None => None,
-            };
-            if requested.is_some() {
+        #[cfg(feature = "bus")]
+        self.mark_focus_before_change("wayland.focus");
+        'focus_policy: {
+            let previous_exclusive = self.exclusive_keyboard_focus.take();
+            let current_layer_became_none =
+                self.keyboard.current_focus().as_ref().is_some_and(|focus| {
+                    self.layer_keyboard_interactivity_for_surface(focus)
+                        == Some(KeyboardInteractivity::None)
+                });
+            let target = if self.session_lock_active() {
                 requested
-            } else if fallback || current_layer_became_none || previous_exclusive.is_some() {
-                self.highest_visible_toplevel_surface()
-            } else if clear_if_unrequested {
-                None
+                    .filter(|surface| {
+                        self.surfaces
+                            .get(&surface.id())
+                            .is_some_and(|record| self.surface_is_input_presentable(record))
+                    })
+                    .or_else(|| self.highest_visible_lock_surface())
+            } else if let Some((object, surface)) = self.highest_exclusive_layer() {
+                self.exclusive_keyboard_focus = Some(object);
+                Some(surface)
             } else {
-                return;
-            }
-        };
-        if self.keyboard.current_focus() == target
-            || self.keyboard_focus_is_related_grabbing_popup(target.as_ref())
-        {
-            return;
-        }
-        if self.keyboard.is_grabbed() {
-            let popup_root = self
-                .keyboard
-                .grab_start_data()
-                .and_then(|start| start.focus);
-            let keyboard = self.keyboard.clone();
-            keyboard.unset_grab(self);
-            if let Some(root) = popup_root {
-                let pointer_grabs_root = self
-                    .pointer
-                    .grab_start_data()
-                    .and_then(|start| start.focus)
-                    .is_some_and(|(focus, _)| focus == root);
-                if pointer_grabs_root {
-                    self.defer_or_cancel_pointer_grab_for_focus_policy();
+                let requested = match requested {
+                    Some(surface)
+                        if self.layer_keyboard_interactivity_for_surface(&surface)
+                            == Some(KeyboardInteractivity::None) =>
+                    {
+                        // A non-interactive layer receives pointer/touch events but
+                        // must not disturb whichever surface owns the keyboard.
+                        break 'focus_policy;
+                    }
+                    Some(surface) => self.interaction_focus_root(&surface),
+                    None => None,
+                };
+                if requested.is_some() {
+                    requested
+                } else if fallback || current_layer_became_none || previous_exclusive.is_some() {
+                    self.highest_visible_toplevel_surface()
+                } else if clear_if_unrequested {
+                    None
+                } else {
+                    break 'focus_policy;
                 }
-                self.dismiss_popup_descendants(&root);
+            };
+            if self.keyboard.current_focus() == target
+                || self.keyboard_focus_is_related_grabbing_popup(target.as_ref())
+            {
+                break 'focus_policy;
             }
+            if self.keyboard.is_grabbed() {
+                let popup_root = self
+                    .keyboard
+                    .grab_start_data()
+                    .and_then(|start| start.focus);
+                let keyboard = self.keyboard.clone();
+                keyboard.unset_grab(self);
+                if let Some(root) = popup_root {
+                    let pointer_grabs_root = self
+                        .pointer
+                        .grab_start_data()
+                        .and_then(|start| start.focus)
+                        .is_some_and(|(focus, _)| focus == root);
+                    if pointer_grabs_root {
+                        self.defer_or_cancel_pointer_grab_for_focus_policy();
+                    }
+                    self.dismiss_popup_descendants(&root);
+                }
+            }
+            let keyboard = self.keyboard.clone();
+            keyboard.set_focus(self, target, SERIAL_COUNTER.next_serial());
         }
-        let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, target, SERIAL_COUNTER.next_serial());
     }
 
     fn keyboard_focus_is_related_grabbing_popup(&self, target: Option<&WlSurface>) -> bool {
@@ -11460,7 +11698,7 @@ impl WaylandState {
         self.cancel_chrome_pointer_grab_for_surface(surface, true);
         self.titlebar_click_candidate = None;
         self.reset_chrome_pointer_tracking(&surface.id());
-        let Some(object) = self.surfaces.get_mut(&surface.id()).and_then(|record| {
+        let Some((object, _id)) = self.surfaces.get_mut(&surface.id()).and_then(|record| {
             if !record.mapped
                 || record.minimized
                 || !matches!(record.role, SurfaceRole::Toplevel(_))
@@ -11468,12 +11706,14 @@ impl WaylandState {
                 return None;
             }
             record.minimized = true;
-            Some(surface.id())
+            Some((surface.id(), record.id))
         }) else {
             return;
         };
         self.minimized_toplevels.retain(|entry| *entry != object);
         self.minimized_toplevels.push(object);
+        #[cfg(feature = "bus")]
+        self.mark_surface_dirty(_id, "wayland.focus");
         self.recompute_effective_visibility();
         self.focus_highest_visible_toplevel();
         self.retarget_pointer_after_visibility_change();
@@ -11481,7 +11721,7 @@ impl WaylandState {
 
     fn restore_most_recently_minimized(&mut self) {
         while let Some(object) = self.minimized_toplevels.pop() {
-            let surface = self.surfaces.get_mut(&object).and_then(|record| {
+            let restored = self.surfaces.get_mut(&object).and_then(|record| {
                 if !record.mapped
                     || !record.minimized
                     || !matches!(record.role, SurfaceRole::Toplevel(_))
@@ -11489,11 +11729,13 @@ impl WaylandState {
                     return None;
                 }
                 record.minimized = false;
-                Some(record.role.wl_surface().clone())
+                Some((record.role.wl_surface().clone(), record.id))
             });
-            let Some(surface) = surface else {
+            let Some((surface, _id)) = restored else {
                 continue;
             };
+            #[cfg(feature = "bus")]
+            self.mark_surface_dirty(_id, "wayland.focus");
             self.recompute_effective_visibility();
             self.raise_surface(&surface);
             self.arbitrate_keyboard_focus(Some(surface), false, false);
@@ -11719,6 +11961,10 @@ impl WaylandState {
     }
 
     fn resize_output(&mut self, width: u32, height: u32) {
+        #[cfg(feature = "bus")]
+        if let Some(output) = self.backend.default_output() {
+            self.mark_output_before_change(&output, "output.geometry");
+        }
         if !self.backend.resize_host_output((width, height)) {
             return;
         }
@@ -11735,11 +11981,15 @@ impl WaylandState {
 
         let mut shifted_roots = Vec::new();
         let mut configure_surfaces = Vec::new();
+        #[cfg(feature = "bus")]
+        let mut observed_toplevels = Vec::new();
         let decoration_theme = self.decoration.theme.clone();
         for record in self.surfaces.values_mut() {
             if !matches!(record.role, SurfaceRole::Toplevel(_)) {
                 continue;
             }
+            #[cfg(feature = "bus")]
+            observed_toplevels.push(record.id);
             if record.committed_maximized
                 || record.requested_maximized
                 || record.pending_window_state.is_some()
@@ -11836,12 +12086,20 @@ impl WaylandState {
         for surface in configure_surfaces {
             let _ = self.send_pending_toplevel_configure(&surface, true);
         }
+        #[cfg(feature = "bus")]
+        for id in observed_toplevels {
+            self.mark_surface_dirty(id, "output.geometry");
+        }
         self.reconfigure_window_states_for_output();
         self.invalidate_pointer_hit_test_geometry();
         self.end_pointer_hit_test_batch();
     }
 
     fn change_output_scale(&mut self, scale: f64) {
+        #[cfg(feature = "bus")]
+        if let Some(output) = self.backend.default_output() {
+            self.mark_output_before_change(&output, "output.geometry");
+        }
         if !self.backend.change_host_output_scale(scale) {
             return;
         }
@@ -11899,6 +12157,8 @@ impl WaylandState {
                 let scene = record.scene_snapshot();
                 self.events
                     .push(ProtocolEvent::SurfaceRelayout { id, scene });
+                #[cfg(feature = "bus")]
+                self.mark_surface_dirty(id, "wayland.map");
                 self.shift_surface_descendants(id, delta);
                 delta != (0.0, 0.0)
             }
@@ -12005,6 +12265,8 @@ impl WaylandState {
                 }
                 self.events
                     .push(ProtocolEvent::SurfaceRelayout { id, scene });
+                #[cfg(feature = "bus")]
+                self.mark_surface_dirty(id, "wayland.map");
                 self.shift_surface_descendants(id, delta);
                 true
             }
@@ -12014,6 +12276,8 @@ impl WaylandState {
     fn shift_surface_descendants(&mut self, parent: SurfaceId, delta: (f32, f32)) {
         let children = child_surface_ids(&self.surfaces);
         let mut stack = children.get(&parent).cloned().unwrap_or_default();
+        #[cfg(feature = "bus")]
+        let mut observed = Vec::new();
         while let Some(child_id) = stack.pop() {
             let Some(object) = self.surface_objects.get(&child_id).cloned() else {
                 continue;
@@ -12037,10 +12301,16 @@ impl WaylandState {
                     id: child_id,
                     scene,
                 });
+                #[cfg(feature = "bus")]
+                observed.push(child_id);
             }
             if let Some(descendants) = children.get(&child_id) {
                 stack.extend(descendants.iter().copied());
             }
+        }
+        #[cfg(feature = "bus")]
+        for id in observed {
+            self.mark_surface_dirty(id, "wayland.map");
         }
     }
 
@@ -12305,6 +12575,8 @@ impl WaylandState {
             self.events
                 .push(ProtocolEvent::SurfaceRelayout { id, scene });
         }
+        #[cfg(feature = "bus")]
+        self.mark_surface_dirty(id, "wayland.map");
         let delta = (new_layout.0 - old_layout.0, new_layout.1 - old_layout.1);
         if delta != (0.0, 0.0) {
             self.shift_surface_descendants(id, delta);
@@ -12401,6 +12673,10 @@ impl WaylandState {
             self.shift_surface_descendants(id, delta);
         }
         if chrome_scene_changed {
+            #[cfg(feature = "bus")]
+            if let Some(id) = self.surfaces.get(&surface.id()).map(|record| record.id) {
+                self.mark_surface_dirty(id, "wayland.map");
+            }
             self.refresh_chrome_pointer_after_scene_change();
         }
     }
@@ -12794,6 +13070,8 @@ impl WaylandState {
             record.commit_count = record.commit_count.saturating_add(1);
             (record.id, record.commit_count)
         };
+        #[cfg(feature = "bus")]
+        self.mark_surface_dirty(surface_id, "wayland.map");
         if let Ok(dmabuf) = get_dmabuf(&buffer) {
             match describe_dmabuf(dmabuf) {
                 Ok(descriptor) => {
@@ -12889,6 +13167,8 @@ impl WaylandState {
                         presentation.size,
                         window_geometry_changed,
                     );
+                    #[cfg(feature = "bus")]
+                    self.mark_surface_mapped(surface);
                     let Some(record) = self.surfaces.get_mut(&surface.id()) else {
                         #[cfg(test)]
                         {
@@ -12899,6 +13179,7 @@ impl WaylandState {
                         self.release_buffer_token(backing_retention_token);
                         return;
                     };
+                    record.mapped = true;
                     let old_origin = (record.layout.x, record.layout.y);
                     if let Some(window_geometry) = window_geometry {
                         record.layout.x = record.window_origin.0 - window_geometry.x;
@@ -12933,9 +13214,6 @@ impl WaylandState {
                     let log_commit = record
                         .logged_diagnostics
                         .insert(SurfaceDiagnostic::DmabufCommitted);
-                    if !record.mapped {
-                        record.mapped = true;
-                    }
                     if log_commit {
                         tracing::info!(
                             surface_id = surface_id.0,
@@ -13056,9 +13334,12 @@ impl WaylandState {
                     presentation.size,
                     window_geometry_changed,
                 );
+                #[cfg(feature = "bus")]
+                self.mark_surface_mapped(surface);
                 let Some(record) = self.surfaces.get_mut(&surface.id()) else {
                     return;
                 };
+                record.mapped = true;
                 let old_origin = (record.layout.x, record.layout.y);
                 if let Some(window_geometry) = window_geometry {
                     record.layout.x = record.window_origin.0 - window_geometry.x;
@@ -13090,9 +13371,6 @@ impl WaylandState {
                 let log_commit = record
                     .logged_diagnostics
                     .insert(SurfaceDiagnostic::ShmCommitted);
-                if !record.mapped {
-                    record.mapped = true;
-                }
                 if log_commit {
                     tracing::info!(
                         surface_id = surface_id.0,
@@ -13473,7 +13751,26 @@ fn cursor_surface_hotspot(surface: &WlSurface) -> (i32, i32) {
     })
 }
 
-fn clamp_point_to_seat(position: (f64, f64), regions: &[SeatRegion]) -> (f64, f64) {
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ClampResult {
+    position: (f64, f64),
+    region_index: usize,
+    attempted_motion: (f64, f64),
+}
+
+impl PartialEq<(f64, f64)> for ClampResult {
+    fn eq(&self, other: &(f64, f64)) -> bool {
+        self.position == *other
+    }
+}
+
+impl PartialEq<ClampResult> for (f64, f64) {
+    fn eq(&self, other: &ClampResult) -> bool {
+        *self == other.position
+    }
+}
+
+fn clamp_point_to_seat(position: (f64, f64), regions: &[SeatRegion]) -> ClampResult {
     let clamp_into = |region: &SeatRegion| {
         let axis = |value: f64, origin: f64, extent: f64| {
             // `max(origin)` covers a zero-extent output, where `next_down`
@@ -13499,12 +13796,17 @@ fn clamp_point_to_seat(position: (f64, f64), regions: &[SeatRegion]) -> (f64, f6
             && position.1 < region.y + region.height
     };
 
-    if regions.iter().any(contains) {
-        return position;
+    if let Some(region_index) = regions.iter().position(contains) {
+        return ClampResult {
+            position,
+            region_index,
+            attempted_motion: (0.0, 0.0),
+        };
     }
-    regions
+    let (region_index, clamped) = regions
         .iter()
-        .map(clamp_into)
+        .enumerate()
+        .map(|(index, region)| (index, clamp_into(region)))
         .reduce(|nearest, candidate| {
             let distance = |point: (f64, f64)| {
                 if !position.0.is_finite() || !position.1.is_finite() {
@@ -13513,7 +13815,7 @@ fn clamp_point_to_seat(position: (f64, f64), regions: &[SeatRegion]) -> (f64, f6
                 let (dx, dy) = (point.0 - position.0, point.1 - position.1);
                 dx * dx + dy * dy
             };
-            if distance(candidate) < distance(nearest) {
+            if distance(candidate.1) < distance(nearest.1) {
                 candidate
             } else {
                 nearest
@@ -13521,7 +13823,17 @@ fn clamp_point_to_seat(position: (f64, f64), regions: &[SeatRegion]) -> (f64, f6
         })
         // `seat_regions` is never empty, so this is unreachable in production;
         // the origin is the only answer that cannot be outside a seat.
-        .unwrap_or((0.0, 0.0))
+        .unwrap_or((0, (0.0, 0.0)));
+    let attempted_motion = if clamped == position {
+        (0.0, 0.0)
+    } else {
+        (position.0 - clamped.0, position.1 - clamped.1)
+    };
+    ClampResult {
+        position: clamped,
+        region_index,
+        attempted_motion,
+    }
 }
 
 pub(crate) fn monotonic_millis() -> u32 {

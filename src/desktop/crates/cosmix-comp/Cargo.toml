@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-comp"
-version = "0.35.0"
+version = "0.36.0"
 description = "Smithay protocol frontend with Bevy rendering for the CosMix desktop"
 edition = "2024"
 rust-version = "1.95"
@@ -14,6 +14,8 @@ bus = [
     "dep:cosmix-client",
     "dep:cosmix-config",
     "dep:cosmix-props-core",
+    "dep:chrono",
+    "dep:crossbeam-channel",
     "dep:serde",
     "dep:serde_json",
     "dep:tokio",
@@ -60,6 +62,8 @@ cosmix-bus = { package = "cosmix-lib-bus", path = "../../../crates/cosmix-lib-bu
 cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client", optional = true }
 cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config", features = ["client-helpers"], optional = true }
 cosmix-props-core = { package = "cosmix-lib-props-core", path = "../../../crates/cosmix-lib-props-core", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+crossbeam-channel = { version = "0.5", optional = true }
 getrandom = "0.4"
 # Not called directly: `system_font_discovery` reaches fontconfig through
 # Parley, and without this feature the binary carries `NEEDED

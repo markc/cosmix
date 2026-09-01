@@ -36,8 +36,7 @@ use bevy::{
         view::ExtractedWindows,
     },
     window::{
-        CursorMoved, PresentMode, WindowBackendScaleFactorChanged, WindowEvent, WindowPlugin,
-        WindowResized,
+        PresentMode, WindowBackendScaleFactorChanged, WindowEvent, WindowPlugin, WindowResized,
     },
 };
 use cosmix_deco::ChromeStyle;
@@ -947,7 +946,6 @@ fn gesture_axis(value: f32, ending: bool, in_flight: &mut bool) -> Option<HostAx
 }
 
 fn collect_host_input(
-    mut cursor_events: MessageReader<CursorMoved>,
     mut button_events: MessageReader<MouseButtonInput>,
     mut window_events: MessageReader<WindowEvent>,
     mut resize_events: MessageReader<WindowResized>,
@@ -973,14 +971,6 @@ fn collect_host_input(
         });
     }
 
-    for event in cursor_events.read() {
-        queue.pending.push(HostInput::PointerMotionAbsolute {
-            x: f64::from(event.position.x),
-            y: f64::from(event.position.y),
-            time,
-        });
-    }
-
     for event in button_events.read() {
         if let Some(button) = linux_mouse_button(event.button) {
             queue.pending.push(HostInput::PointerButton {
@@ -1000,6 +990,13 @@ fn collect_host_input(
     // that preceded a scroll synthetically stop it.
     for event in window_events.read() {
         match event {
+            WindowEvent::CursorMoved(event) => {
+                queue.pending.push(HostInput::PointerMotionAbsolute {
+                    x: f64::from(event.position.x),
+                    y: f64::from(event.position.y),
+                    time,
+                });
+            }
             WindowEvent::MouseWheel(event) => {
                 if let Some(input) = host_axis_from_wheel(event, &mut queue.scrolling_axes, time) {
                     queue.pending.push(input);
@@ -1016,6 +1013,7 @@ fn collect_host_input(
             // trips the `Started` reset, and its lift stops an axis that was
             // never scrolling.
             WindowEvent::CursorLeft(_) => {
+                queue.pending.push(HostInput::PointerLeave);
                 if let Some(stop) = end_scrolling_gesture(&mut queue.scrolling_axes, time) {
                     queue.pending.push(stop);
                 }
@@ -2712,7 +2710,6 @@ mod tests {
     fn collector_app() -> (App, Entity) {
         let mut app = App::new();
         app.init_resource::<HostInputQueue>()
-            .add_message::<CursorMoved>()
             .add_message::<MouseButtonInput>()
             .add_message::<WindowEvent>()
             .add_message::<WindowResized>()
@@ -2763,17 +2760,20 @@ mod tests {
         assert!(
             matches!(
                 queue.pending.as_slice(),
-                [HostInput::PointerAxis {
-                    horizontal: None,
-                    vertical: Some(HostAxis {
-                        amount: 0.0,
-                        v120: None
-                    }),
-                    source: AxisSource::Continuous,
-                    ..
-                }]
+                [
+                    HostInput::PointerLeave,
+                    HostInput::PointerAxis {
+                        horizontal: None,
+                        vertical: Some(HostAxis {
+                            amount: 0.0,
+                            v120: None
+                        }),
+                        source: AxisSource::Continuous,
+                        ..
+                    }
+                ]
             ),
-            "the leave stops the axis that was scrolling, got {:?}",
+            "the Bevy leave reaches protocol input before stopping the active axis, got {:?}",
             queue.pending
         );
         assert!(
@@ -2838,23 +2838,52 @@ mod tests {
         app.update();
 
         let queue = app.world().resource::<HostInputQueue>();
-        let amounts: Vec<_> = queue
+        let ordered: Vec<_> = queue
             .pending
             .iter()
             .map(|input| match input {
-                HostInput::PointerAxis { vertical, .. } => vertical.map(|axis| axis.amount),
-                other => panic!("expected only pointer axes, got {other:?}"),
+                HostInput::PointerAxis { vertical, .. } => {
+                    format!("axis:{:?}", vertical.map(|axis| axis.amount))
+                }
+                HostInput::PointerLeave => "leave".into(),
+                other => panic!("expected pointer axis or leave, got {other:?}"),
             })
             .collect();
         assert_eq!(
-            amounts,
-            vec![Some(3.0), Some(0.0), Some(4.0)],
+            ordered,
+            [
+                "axis:Some(3.0)",
+                "leave",
+                "axis:Some(0.0)",
+                "axis:Some(4.0)"
+            ],
             "drag, then the leave's stop, then the new drag — in that order"
         );
         assert!(
             queue.scrolling_axes.vertical,
             "the gesture that arrived last is the one left in flight"
         );
+    }
+
+    #[test]
+    fn nested_leave_then_reentry_motion_stays_in_os_order_in_one_update() {
+        let (mut app, window) = collector_app();
+        let world = app.world_mut();
+        world.write_message(WindowEvent::CursorLeft(bevy::window::CursorLeft { window }));
+        world.write_message(WindowEvent::CursorMoved(bevy::window::CursorMoved {
+            window,
+            position: Vec2::new(5.0, 6.0),
+            delta: None,
+        }));
+        app.update();
+
+        assert!(matches!(
+            app.world().resource::<HostInputQueue>().pending.as_slice(),
+            [
+                HostInput::PointerLeave,
+                HostInput::PointerMotionAbsolute { x, y, .. }
+            ] if *x == 5.0 && *y == 6.0
+        ));
     }
 
     #[test]

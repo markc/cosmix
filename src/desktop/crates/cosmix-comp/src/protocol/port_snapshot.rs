@@ -20,7 +20,7 @@ use smithay::{
 use super::{
     ChromePointerGrabKind, InteractivePointer, LayerOutputBinding, LockLifecycle,
     LogicalOutputRect, SceneDecorationMode, StackBand, SurfaceId, SurfaceRecord, SurfaceRole,
-    WaylandState, surface_stack_cmp,
+    WaylandState, corner::CornerConfig, surface_stack_cmp,
 };
 
 pub(crate) const BROKER_RETRYING: u8 = 0;
@@ -74,6 +74,11 @@ pub(crate) struct SnapshotContext {
     pub(crate) broker: Arc<AtomicU8>,
     pub(crate) queue_depth: Arc<AtomicUsize>,
     pub(crate) reply_timeouts: Arc<AtomicU64>,
+    pub(crate) publish_timeouts: Arc<AtomicU64>,
+    pub(crate) event_seq: Arc<AtomicU64>,
+    pub(crate) lost_count: Arc<AtomicU64>,
+    pub(crate) pending_idle_order: Arc<AtomicU64>,
+    pub(crate) pending_active_order: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -86,6 +91,7 @@ pub(crate) struct CompSnapshot {
     pub(crate) focus: FocusSnapshot,
     pub(crate) decoration: DecorationSnapshot,
     pub(crate) bindings: BindingsSnapshot,
+    pub(crate) input: InputSnapshot,
     pub(crate) port: PortSnapshot,
     #[serde(skip)]
     full_tree: tokio::sync::OnceCell<SerialisedReply>,
@@ -97,7 +103,7 @@ struct SerialisedReply {
     bytes: usize,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct InfoSnapshot {
     pub(crate) service: Arc<str>,
     pub(crate) version: Arc<str>,
@@ -106,7 +112,7 @@ pub(crate) struct InfoSnapshot {
     pub(crate) instance: Arc<str>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct OutputSnapshot {
     pub(crate) name: String,
     pub(crate) default: bool,
@@ -119,7 +125,7 @@ pub(crate) struct OutputSnapshot {
     pub(crate) usable: RectSnapshot,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub(crate) struct RectSnapshot {
     pub(crate) x: f32,
     pub(crate) y: f32,
@@ -127,7 +133,7 @@ pub(crate) struct RectSnapshot {
     pub(crate) height: f32,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct SurfaceSnapshot {
     pub(crate) id: u64,
     pub(crate) role: &'static str,
@@ -153,7 +159,7 @@ pub(crate) struct SurfaceSnapshot {
     pub(crate) foreign_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct LayerSnapshot {
     pub(crate) stratum: &'static str,
     pub(crate) interactivity: &'static str,
@@ -161,7 +167,7 @@ pub(crate) struct LayerSnapshot {
     pub(crate) binding: &'static str,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct WindowSnapshot {
     pub(crate) id: u64,
     pub(crate) foreign_id: Option<String>,
@@ -177,7 +183,7 @@ pub(crate) struct WindowSnapshot {
     pub(crate) output: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct FocusSnapshot {
     pub(crate) keyboard: Option<u64>,
     pub(crate) exclusive_latch: Option<u64>,
@@ -186,23 +192,47 @@ pub(crate) struct FocusSnapshot {
     pub(crate) session_lock: &'static str,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct DecorationSnapshot {
     pub(crate) enabled: bool,
     pub(crate) style: &'static str,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct BindingsSnapshot {
     pub(crate) enabled: bool,
     pub(crate) profile: &'static str,
     pub(crate) table: Vec<BindingRowSnapshot>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct BindingRowSnapshot {
     pub(crate) chord: String,
     pub(crate) action: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct InputSnapshot {
+    pub(crate) corners: CornersSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub(crate) struct CornersSnapshot {
+    pub(crate) enabled: bool,
+    pub(crate) deadzone_px: f64,
+    pub(crate) dwell_ms: u64,
+    pub(crate) velocity_max_px_s: f64,
+}
+
+impl From<CornerConfig> for CornersSnapshot {
+    fn from(config: CornerConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            deadzone_px: config.deadzone_px,
+            dwell_ms: config.dwell_ms,
+            velocity_max_px_s: config.velocity_max_px_s,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -212,6 +242,7 @@ pub(crate) struct PortSnapshot {
     pub(crate) lost_count: u64,
     pub(crate) queue_depth: usize,
     pub(crate) reply_timeouts: u64,
+    pub(crate) publish_timeouts: u64,
     pub(crate) slug_collisions: u64,
     pub(crate) broker: &'static str,
 }
@@ -240,6 +271,7 @@ impl CompSnapshot {
             "focus" => self.focus.select(tail),
             "decoration" => self.decoration.select(tail),
             "bindings" => self.bindings.select(tail),
+            "input" => self.input.select(tail),
             "port" => self.port.select(tail),
             _ => None,
         }
@@ -258,6 +290,7 @@ impl CompSnapshot {
             "focus" => self.focus.node_kind(tail),
             "decoration" => self.decoration.node_kind(tail),
             "bindings" => self.bindings.node_kind(tail),
+            "input" => self.input.node_kind(tail),
             "port" => self.port.node_kind(tail),
             _ => None,
         }
@@ -393,12 +426,20 @@ flat_snapshot!(
 flat_snapshot!(DecorationSnapshot, enabled, style);
 flat_snapshot!(BindingsSnapshot, enabled, profile, table);
 flat_snapshot!(
+    CornersSnapshot,
+    enabled,
+    deadzone_px,
+    dwell_ms,
+    velocity_max_px_s
+);
+flat_snapshot!(
     PortSnapshot,
     level,
     event_seq,
     lost_count,
     queue_depth,
     reply_timeouts,
+    publish_timeouts,
     slug_collisions,
     broker,
 );
@@ -435,6 +476,24 @@ impl OutputSnapshot {
                 Some(SnapshotNodeKind::Leaf)
             }
             ["usable", tail @ ..] => self.usable.node_kind(tail),
+            _ => None,
+        }
+    }
+}
+
+impl InputSnapshot {
+    fn select(&self, path: &[&str]) -> Option<Value> {
+        match path {
+            [] => serialise_selected(self),
+            ["corners", tail @ ..] => self.corners.select(tail),
+            _ => None,
+        }
+    }
+
+    fn node_kind(&self, path: &[&str]) -> Option<SnapshotNodeKind> {
+        match path {
+            [] | ["corners"] => Some(SnapshotNodeKind::Object),
+            ["corners", tail @ ..] => self.corners.node_kind(tail),
             _ => None,
         }
     }
@@ -490,24 +549,25 @@ impl SurfaceSnapshot {
     }
 }
 
-/// Build one fully owned snapshot on the protocol thread.
-pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Option<CompSnapshot> {
-    // This is the same authority boundary used by foreign-toplevel
-    // publication (`session_lock_active`) and renderer selection
-    // (`surface_is_session_presentable`). Do not derive it from visibility.
-    let session_lock_active = state.session_lock_active();
+pub(super) struct OutputProjection {
+    pub(super) rows: BTreeMap<String, OutputSnapshot>,
+    pub(super) keys: Vec<(Output, String)>,
+    pub(super) slug_collisions: u64,
+}
+
+pub(super) fn project_outputs(state: &WaylandState) -> Option<OutputProjection> {
     let sources = state.backend.port_outputs();
-    let mut output_keys = Vec::<(Output, String)>::with_capacity(sources.len());
-    let mut outputs = BTreeMap::<String, OutputSnapshot>::new();
+    let mut keys = Vec::<(Output, String)>::with_capacity(sources.len());
+    let mut rows = BTreeMap::<String, OutputSnapshot>::new();
     let mut slug_collisions = 0_u64;
     for source in sources {
         let key = output_key(&source.name);
-        if output_slug_collides(&outputs, &key, &source.name, &mut slug_collisions) {
+        if output_slug_collides(&rows, &key, &source.name, &mut slug_collisions) {
             continue;
         }
         let usable = state.port_usable_output_rect_for(&source.output)?;
-        output_keys.push((source.output, key.clone()));
-        outputs.insert(
+        keys.push((source.output, key.clone()));
+        rows.insert(
             key,
             OutputSnapshot {
                 name: source.name,
@@ -527,96 +587,160 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
             },
         );
     }
+    Some(OutputProjection {
+        rows,
+        keys,
+        slug_collisions,
+    })
+}
 
-    let default_output = state.backend.default_output();
-    let mut surfaces = BTreeMap::new();
-    for record in state
-        .surfaces
-        .values()
-        .filter(|record| !matches!(record.role, SurfaceRole::Dormant(_)))
-    {
-        let redact_ordinary_surface = session_lock_active
-            && (matches!(&state.lock_lifecycle, LockLifecycle::Unlocked)
-                || !state.surface_is_session_presentable(record));
-        let output = surface_output(state, record, default_output.as_ref())
-            .and_then(|output| output_key_for(&output_keys, output));
-        let layer = match &record.role {
-            SurfaceRole::Layer(role) => Some(LayerSnapshot {
-                stratum: layer_name(role.committed_layer),
-                interactivity: interactivity_name(role.committed_keyboard_interactivity),
-                exclusive_zone: exclusive_zone_value(role.surface.cached_state().exclusive_zone),
-                binding: match role.output {
-                    LayerOutputBinding::Explicit(_) => "explicit",
-                    LayerOutputBinding::Default(_) | LayerOutputBinding::Closed => "default",
-                },
-            }),
-            _ => None,
-        };
-        let key = surface_key(record.id);
-        surfaces.insert(
-            key,
-            SurfaceSnapshot {
-                id: record.id.0,
-                role: record.role.kind(),
-                mapped: record.mapped,
-                visible: record.layout.visible && !redact_ordinary_surface,
-                x: record.layout.x,
-                y: record.layout.y,
-                width: record.layout.width,
-                height: record.layout.height,
-                band: band_name(record.layout.z.band),
-                sequence: record.layout.z.sequence,
-                tree_index: record.layout.z.tree_index,
-                parent: record.layout.parent.map(|id| id.0),
-                output,
-                title: (!redact_ordinary_surface)
-                    .then(|| record.title.clone())
-                    .flatten(),
-                app_id: (!redact_ordinary_surface)
-                    .then(|| record.app_id.clone())
-                    .flatten(),
-                focused: record.focused,
-                activated: record.focused,
-                maximized: record.committed_maximized,
-                minimized: record.minimized,
-                decoration: matches!(record.role, SurfaceRole::Toplevel(_))
-                    .then_some(decoration_name(record.committed_decoration)),
-                layer,
-                foreign_id: (record.mapped && matches!(record.role, SurfaceRole::Toplevel(_)))
-                    .then(|| state.foreign_toplevel_identifiers.get(&record.id).cloned())
-                    .flatten(),
+pub(super) fn project_output(
+    state: &WaylandState,
+    output: &Output,
+) -> Option<(String, OutputSnapshot)> {
+    let source = state.backend.port_output(output)?;
+    let key = output_key(&source.name);
+    let usable = state.port_usable_output_rect_for(&source.output)?;
+    Some((
+        key,
+        OutputSnapshot {
+            name: source.name,
+            default: source.default,
+            x: source.x,
+            y: source.y,
+            width: source.width,
+            height: source.height,
+            scale: source.scale,
+            refresh_mhz: source.refresh_mhz,
+            usable: RectSnapshot {
+                x: usable.x,
+                y: usable.y,
+                width: usable.width,
+                height: usable.height,
             },
-        );
-    }
+        },
+    ))
+}
 
-    let windows = if session_lock_active {
-        BTreeMap::new()
-    } else {
-        surfaces
-            .iter()
-            .filter(|(_, surface)| surface.role == "toplevel" && surface.mapped)
-            .map(|(key, surface)| {
-                (
-                    key.clone(),
-                    WindowSnapshot {
-                        id: surface.id,
-                        foreign_id: surface.foreign_id.clone(),
-                        title: surface.title.clone(),
-                        app_id: surface.app_id.clone(),
-                        x: surface.x,
-                        y: surface.y,
-                        width: surface.width,
-                        height: surface.height,
-                        focused: surface.focused,
-                        maximized: surface.maximized,
-                        minimized: surface.minimized,
-                        output: surface.output.clone(),
-                    },
-                )
-            })
-            .collect()
+pub(super) fn project_surface_by_id(
+    state: &WaylandState,
+    id: SurfaceId,
+    output_keys: &[(Output, String)],
+) -> Option<SurfaceSnapshot> {
+    let object = state.surface_objects.get(&id)?;
+    let record = state.surfaces.get(object)?;
+    (!matches!(record.role, SurfaceRole::Dormant(_)))
+        .then(|| project_surface_row(state, record, output_keys, state.session_lock_active()))
+}
+
+fn project_surface_row(
+    state: &WaylandState,
+    record: &SurfaceRecord,
+    output_keys: &[(Output, String)],
+    session_lock_active: bool,
+) -> SurfaceSnapshot {
+    let redact_ordinary_surface = session_lock_active
+        && (matches!(&state.lock_lifecycle, LockLifecycle::Unlocked)
+            || !state.surface_is_session_presentable(record));
+    let output = surface_output(state, record, state.backend.default_output().as_ref())
+        .and_then(|output| output_key_for(output_keys, output));
+    let layer = match &record.role {
+        SurfaceRole::Layer(role) => Some(LayerSnapshot {
+            stratum: layer_name(role.committed_layer),
+            interactivity: interactivity_name(role.committed_keyboard_interactivity),
+            exclusive_zone: exclusive_zone_value(role.surface.cached_state().exclusive_zone),
+            binding: match role.output {
+                LayerOutputBinding::Explicit(_) => "explicit",
+                LayerOutputBinding::Default(_) | LayerOutputBinding::Closed => "default",
+            },
+        }),
+        _ => None,
     };
+    SurfaceSnapshot {
+        id: record.id.0,
+        role: record.role.kind(),
+        mapped: record.mapped,
+        visible: record.layout.visible && !redact_ordinary_surface,
+        x: record.layout.x,
+        y: record.layout.y,
+        width: record.layout.width,
+        height: record.layout.height,
+        band: band_name(record.layout.z.band),
+        sequence: record.layout.z.sequence,
+        tree_index: record.layout.z.tree_index,
+        parent: record.layout.parent.map(|id| id.0),
+        output,
+        title: (!redact_ordinary_surface)
+            .then(|| record.title.clone())
+            .flatten(),
+        app_id: (!redact_ordinary_surface)
+            .then(|| record.app_id.clone())
+            .flatten(),
+        focused: record.focused,
+        activated: record.focused,
+        maximized: record.committed_maximized,
+        minimized: record.minimized,
+        decoration: matches!(record.role, SurfaceRole::Toplevel(_))
+            .then_some(decoration_name(record.committed_decoration)),
+        layer,
+        foreign_id: (record.mapped && matches!(record.role, SurfaceRole::Toplevel(_)))
+            .then(|| state.foreign_toplevel_identifiers.get(&record.id).cloned())
+            .flatten(),
+    }
+}
 
+pub(super) fn project_window_row(surface: &SurfaceSnapshot) -> WindowSnapshot {
+    WindowSnapshot {
+        id: surface.id,
+        foreign_id: surface.foreign_id.clone(),
+        title: surface.title.clone(),
+        app_id: surface.app_id.clone(),
+        x: surface.x,
+        y: surface.y,
+        width: surface.width,
+        height: surface.height,
+        focused: surface.focused,
+        maximized: surface.maximized,
+        minimized: surface.minimized,
+        output: surface.output.clone(),
+    }
+}
+
+pub(super) fn project_focus(state: &WaylandState) -> FocusSnapshot {
+    let session_lock_active = state.session_lock_active();
+    FocusSnapshot {
+        keyboard: state
+            .keyboard
+            .current_focus()
+            .as_ref()
+            .and_then(|surface| state.surfaces.get(&surface.id()))
+            .map(|record| record.id.0),
+        exclusive_latch: state
+            .exclusive_keyboard_focus
+            .as_ref()
+            .and_then(|object| state.surfaces.get(object))
+            .map(|record| record.id.0),
+        pointer: state
+            .pointer
+            .current_focus()
+            .as_ref()
+            .and_then(|surface| state.surfaces.get(&surface.id()))
+            .map(|record| record.id.0),
+        pointer_grab: pointer_grab_name(state),
+        session_lock: if !session_lock_active {
+            "none"
+        } else {
+            match &state.lock_lifecycle {
+                LockLifecycle::Unlocked => "unlocking",
+                LockLifecycle::Locking { .. } => "locking",
+                LockLifecycle::Locked { .. } => "locked",
+                LockLifecycle::OrphanedLocked { .. } => "orphaned",
+            }
+        },
+    }
+}
+
+pub(super) fn project_stack(state: &WaylandState) -> Vec<u64> {
     let mut roots = state
         .surfaces
         .values()
@@ -627,7 +751,45 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         })
         .collect::<Vec<_>>();
     roots.sort_by(|left, right| surface_stack_cmp(left, right).reverse());
-    let stack = roots.into_iter().map(|record| record.id.0).collect();
+    roots.into_iter().map(|record| record.id.0).collect()
+}
+
+/// Build one fully owned snapshot on the protocol thread.
+pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Option<CompSnapshot> {
+    // This is the same authority boundary used by foreign-toplevel
+    // publication (`session_lock_active`) and renderer selection
+    // (`surface_is_session_presentable`). Do not derive it from visibility.
+    let session_lock_active = state.session_lock_active();
+    let OutputProjection {
+        rows: outputs,
+        keys: output_keys,
+        slug_collisions,
+    } = project_outputs(state)?;
+
+    let mut surfaces = BTreeMap::new();
+    for record in state
+        .surfaces
+        .values()
+        .filter(|record| !matches!(record.role, SurfaceRole::Dormant(_)))
+    {
+        let key = surface_key(record.id);
+        surfaces.insert(
+            key,
+            project_surface_row(state, record, &output_keys, session_lock_active),
+        );
+    }
+
+    let windows = if session_lock_active {
+        BTreeMap::new()
+    } else {
+        surfaces
+            .iter()
+            .filter(|(_, surface)| surface.role == "toplevel" && surface.mapped)
+            .map(|(key, surface)| (key.clone(), project_window_row(surface)))
+            .collect()
+    };
+
+    let stack = project_stack(state);
 
     let bindings = state.bindings.port_snapshot();
     Some(CompSnapshot {
@@ -642,36 +804,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         surfaces,
         windows,
         stack,
-        focus: FocusSnapshot {
-            keyboard: state
-                .keyboard
-                .current_focus()
-                .as_ref()
-                .and_then(|surface| state.surfaces.get(&surface.id()))
-                .map(|record| record.id.0),
-            exclusive_latch: state
-                .exclusive_keyboard_focus
-                .as_ref()
-                .and_then(|object| state.surfaces.get(object))
-                .map(|record| record.id.0),
-            pointer: state
-                .pointer
-                .current_focus()
-                .as_ref()
-                .and_then(|surface| state.surfaces.get(&surface.id()))
-                .map(|record| record.id.0),
-            pointer_grab: pointer_grab_name(state),
-            session_lock: if !session_lock_active {
-                "none"
-            } else {
-                match &state.lock_lifecycle {
-                    LockLifecycle::Unlocked => "unlocking",
-                    LockLifecycle::Locking { .. } => "locking",
-                    LockLifecycle::Locked { .. } => "locked",
-                    LockLifecycle::OrphanedLocked { .. } => "orphaned",
-                }
-            },
-        },
+        focus: project_focus(state),
         decoration: DecorationSnapshot {
             enabled: context.decoration_enabled,
             style: context.decoration_style,
@@ -688,12 +821,16 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
                 })
                 .collect(),
         },
+        input: InputSnapshot {
+            corners: state.observations.corner_config.into(),
+        },
         port: PortSnapshot {
-            level: "L1",
-            event_seq: 0,
-            lost_count: 0,
+            level: "L2",
+            event_seq: context.event_seq.load(Ordering::Acquire),
+            lost_count: context.lost_count.load(Ordering::Acquire),
             queue_depth: context.queue_depth.load(Ordering::Acquire),
             reply_timeouts: context.reply_timeouts.load(Ordering::Acquire),
+            publish_timeouts: context.publish_timeouts.load(Ordering::Acquire),
             slug_collisions,
             broker: if context.broker.load(Ordering::Acquire) == BROKER_CONNECTED {
                 "connected"
@@ -869,6 +1006,8 @@ pub(crate) struct DescribeEntry {
     pub(crate) sensitive: bool,
     pub(crate) format: Option<&'static str>,
     pub(crate) enum_values: &'static [&'static str],
+    pub(crate) range: Option<&'static str>,
+    pub(crate) persistence: Option<&'static str>,
     pub(crate) owner: &'static str,
 }
 
@@ -882,7 +1021,24 @@ macro_rules! descriptor {
             sensitive: false,
             format: None,
             enum_values: &[],
+            range: None,
+            persistence: None,
             owner: "comp",
+        }
+    };
+    ($segments:expr, $ty:ident, $description:expr, mutable, range = $range:expr) => {
+        DescribeEntry {
+            mutable: true,
+            range: Some($range),
+            persistence: Some("none"),
+            ..descriptor!($segments, $ty, $description)
+        }
+    };
+    ($segments:expr, $ty:ident, $description:expr, mutable) => {
+        DescribeEntry {
+            mutable: true,
+            persistence: Some("none"),
+            ..descriptor!($segments, $ty, $description)
         }
     };
     ($segments:expr, $ty:ident, $description:expr, format = $format:expr) => {
@@ -1210,26 +1366,58 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         List,
         "Compiled keybinding chord/action rows"
     ),
-    descriptor!(&[L("port"), L("level")], String, "Implemented property substrate level", enum = &["L1"]),
+    descriptor!(
+        &[L("input"), L("corners"), L("enabled")],
+        Bool,
+        "Whether compositor hot-corner detection is enabled",
+        mutable
+    ),
+    descriptor!(
+        &[L("input"), L("corners"), L("deadzone_px")],
+        Number,
+        "Corner deadzone in logical pixels",
+        mutable,
+        range = "1.0..=256.0"
+    ),
+    descriptor!(
+        &[L("input"), L("corners"), L("dwell_ms")],
+        Number,
+        "Velocity-qualified corner dwell in milliseconds",
+        mutable,
+        range = "0..=5000"
+    ),
+    descriptor!(
+        &[L("input"), L("corners"), L("velocity_max_px_s")],
+        Number,
+        "Maximum corner-entry velocity in logical pixels per second",
+        mutable,
+        range = "1.0..=20000.0"
+    ),
+    descriptor!(&[L("port"), L("level")], String, "Implemented property substrate level", enum = &["L2"]),
     descriptor!(
         &[L("port"), L("event_seq")],
         Number,
-        "Property event sequence; zero until P-1"
+        "Global compositor observation event sequence"
     ),
     descriptor!(
         &[L("port"), L("lost_count")],
         Number,
-        "Lost property events; zero until P-1"
+        "Cumulative compositor observation records lost"
     ),
     descriptor!(
         &[L("port"), L("queue_depth")],
         Number,
-        "Accepted snapshot requests not yet completed"
+        "Accepted port reads and controls not yet completed"
     ),
     descriptor!(
         &[L("port"), L("reply_timeouts")],
         Number,
         "Reply send abandoned after 2 s; delivery not guaranteed (the client sink may still flush it); also counts saturated reply lanes"
+    ),
+    descriptor!(
+        &[L("port"), L("publish_timeouts")],
+        Number,
+        "Topic publication failures and timeouts"
     ),
     descriptor!(
         &[L("port"), L("slug_collisions")],
@@ -1268,6 +1456,10 @@ struct DescribeReply<'a> {
     format: Option<&'a str>,
     #[serde(rename = "enum", skip_serializing_if = "slice_is_empty")]
     enum_values: &'a [&'a str],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    range: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    persistence: Option<&'a str>,
     owner: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     children: Option<Vec<String>>,
@@ -1527,6 +1719,8 @@ fn describe(snapshot: &CompSnapshot, path: &PropPath) -> Option<String> {
             description: entry.description,
             format: entry.format,
             enum_values: entry.enum_values,
+            range: entry.range,
+            persistence: entry.persistence,
             owner: entry.owner,
             children: None,
         })
@@ -1549,6 +1743,8 @@ fn describe(snapshot: &CompSnapshot, path: &PropPath) -> Option<String> {
         description: "Compositor property subtree",
         format: None,
         enum_values: &[],
+        range: None,
+        persistence: None,
         owner: "comp",
         children: Some(children.into_iter().collect()),
     })
@@ -1697,7 +1893,7 @@ mod tests {
         CompSnapshot {
             info: InfoSnapshot {
                 service: Arc::from("comp-nested"),
-                version: Arc::from("0.33.2"),
+                version: Arc::from("0.35.0"),
                 backend: "nested",
                 engine: "bevy-0.19/wgpu",
                 instance: Arc::from("fixture"),
@@ -1725,17 +1921,48 @@ mod tests {
                     action: "close-focused",
                 }],
             },
+            input: InputSnapshot {
+                corners: CornerConfig::default().into(),
+            },
             port: PortSnapshot {
-                level: "L1",
+                level: "L2",
                 event_seq: 0,
                 lost_count: 0,
                 queue_depth: 1,
                 reply_timeouts: 0,
+                publish_timeouts: 0,
                 slug_collisions: 0,
                 broker: "connected",
             },
             full_tree: tokio::sync::OnceCell::new(),
         }
+    }
+
+    #[test]
+    fn corner_descriptors_are_the_only_mutable_process_lifetime_leaves() {
+        let snapshot = fixture();
+        let mutable = DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.mutable)
+            .collect::<Vec<_>>();
+        assert_eq!(mutable.len(), 4);
+        for path in [
+            "input.corners.enabled",
+            "input.corners.deadzone_px",
+            "input.corners.dwell_ms",
+            "input.corners.velocity_max_px_s",
+        ] {
+            let path = PropPath::new(path).unwrap();
+            let body = describe(&snapshot, &path).expect("mutable descriptor");
+            let body = serde_json::from_str::<Value>(&body).unwrap();
+            assert_eq!(body["mutable"], true);
+            assert_eq!(body["persistence"], "none");
+        }
+        let dwell = describe(&snapshot, &PropPath::new("input.corners.dwell_ms").unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&dwell).unwrap()["range"],
+            "0..=5000"
+        );
     }
 
     #[test]

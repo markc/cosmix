@@ -3540,6 +3540,7 @@ mod tests {
         cursor_feed.set_cursor_position_for_test(crate::protocol::CursorPositionSnapshot {
             x: 8.0,
             y: 0.0,
+            on_output: true,
             revision: 1,
         });
         let mut cursor_app = App::new();
@@ -4057,6 +4058,7 @@ mod tests {
                 .set_cursor_position_for_test(crate::protocol::CursorPositionSnapshot {
                     x: position.0,
                     y: position.1,
+                    on_output: true,
                     revision: 2,
                 });
             cursor_events

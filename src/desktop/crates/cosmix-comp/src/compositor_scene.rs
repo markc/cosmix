@@ -698,6 +698,9 @@ fn apply_protocol_events(world: &mut World, events: Vec<ProtocolEvent>) {
 
 fn capture_cursor_snapshot(world: &World) -> Option<crate::capture::CaptureCursorSnapshot> {
     let cursor = world.resource::<CursorScene>();
+    if !cursor.position.on_output {
+        return None;
+    }
     let (handle, hotspot, logical_size, source_rect, image_transform, premultiplied) =
         match cursor.selection {
             ProjectedCursorSelection::Hidden => return None,
@@ -1146,6 +1149,9 @@ fn mark_cursor_regions(
 
 fn capture_cursor_damage_bounds(world: &World) -> Option<crate::capture::DisplayedLogicalRegion> {
     let cursor = world.resource::<CursorScene>();
+    if !cursor.position.on_output {
+        return None;
+    }
     let (hotspot, logical_size) = match cursor.selection {
         ProjectedCursorSelection::Hidden => return None,
         ProjectedCursorSelection::Default | ProjectedCursorSelection::Chrome(_) => (
@@ -1360,6 +1366,12 @@ fn refresh_cursor_entity(world: &mut World) {
     let Some(entity) = entity else {
         return;
     };
+    if !position.on_output {
+        if let Ok(mut cursor_entity) = world.get_entity_mut(entity) {
+            cursor_entity.insert(Visibility::Hidden);
+        }
+        return;
+    }
     match selection {
         ProjectedCursorSelection::Hidden => {
             if let Ok(mut cursor_entity) = world.get_entity_mut(entity) {
@@ -3245,6 +3257,7 @@ mod tests {
         let position = CursorPositionSnapshot {
             x: 100.0,
             y: 80.0,
+            on_output: true,
             revision: 1,
         };
         let rect = cursor_renderer_rect(
@@ -3325,6 +3338,62 @@ mod tests {
     }
 
     #[test]
+    fn capture_cursor_visibility_tracks_host_leave_without_dropping_the_asset() {
+        let (mut app, _sender) = software_cursor_scene_app();
+        app.update();
+        let (entity, default_image) = {
+            let cursor = app.world().resource::<CursorScene>();
+            (
+                cursor.entity.expect("cursor entity"),
+                cursor
+                    .default_image
+                    .clone()
+                    .expect("retained default cursor"),
+            )
+        };
+        assert!(capture_cursor_snapshot(app.world()).is_some());
+
+        sample_cursor_position(
+            app.world_mut(),
+            CursorPositionSnapshot {
+                x: 10.0,
+                y: 12.0,
+                on_output: false,
+                revision: 1,
+            },
+        );
+        assert!(capture_cursor_snapshot(app.world()).is_none());
+        assert!(capture_cursor_damage_bounds(app.world()).is_none());
+        assert_eq!(
+            app.world().get::<Visibility>(entity),
+            Some(&Visibility::Hidden)
+        );
+        assert!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .contains(&default_image),
+            "leave hides the logical cursor but retains its capture asset"
+        );
+
+        sample_cursor_position(
+            app.world_mut(),
+            CursorPositionSnapshot {
+                x: 20.0,
+                y: 24.0,
+                on_output: true,
+                revision: 2,
+            },
+        );
+        let resumed = capture_cursor_snapshot(app.world()).expect("re-entry restores overlay");
+        assert!(capture_cursor_damage_bounds(app.world()).is_some());
+        assert_eq!((resumed.x, resumed.y), (20, 24));
+        assert_eq!(
+            app.world().get::<Visibility>(entity),
+            Some(&Visibility::Inherited)
+        );
+    }
+
+    #[test]
     fn cursor_position_and_hotspot_math_preserve_top_left_at_corners_and_offscreen() {
         let canvas = Vec2::new(320.0, 240.0);
         let size = Vec2::new(16.0, 20.0);
@@ -3333,6 +3402,7 @@ mod tests {
                 CursorPositionSnapshot {
                     x: 0.0,
                     y: 0.0,
+                    on_output: true,
                     revision: 1,
                 },
                 (0, 0),
@@ -3341,6 +3411,7 @@ mod tests {
                 CursorPositionSnapshot {
                     x: 319.999,
                     y: 239.999,
+                    on_output: true,
                     revision: 2,
                 },
                 (0, 0),
@@ -3349,6 +3420,7 @@ mod tests {
                 CursorPositionSnapshot {
                     x: 2.0,
                     y: 3.0,
+                    on_output: true,
                     revision: 3,
                 },
                 (7, 9),
@@ -3378,6 +3450,7 @@ mod tests {
         feed.set_cursor_position_for_test(CursorPositionSnapshot {
             x: 123.5,
             y: 77.25,
+            on_output: true,
             revision: 44,
         });
         let mut app = App::new();
@@ -3400,6 +3473,7 @@ mod tests {
             CursorPositionSnapshot {
                 x: 123.5,
                 y: 77.25,
+                on_output: true,
                 revision: 44,
             }
         );
@@ -3955,6 +4029,7 @@ mod tests {
             cursor.position = CursorPositionSnapshot {
                 x: 10.0,
                 y: 10.0,
+                on_output: true,
                 revision: 1,
             };
             cursor.client = Some(ProjectedClientCursor {
@@ -3993,6 +4068,7 @@ mod tests {
         let position = CursorPositionSnapshot {
             x: 1535.5,
             y: 863.5,
+            on_output: true,
             revision: 7,
         };
         let rendered = cursor_renderer_rect(position, (7, 9), Vec2::new(16.0, 20.0), 300);
