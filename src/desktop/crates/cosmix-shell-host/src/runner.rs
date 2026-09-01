@@ -76,6 +76,7 @@ const ANIMATE_BACKSTOP_QUANTUM: Duration = Duration::from_millis(250);
 const CONFIGURE_TIMEOUT: Duration = Duration::from_secs(10);
 const EARLY_TIMER_REARM_GUARD: Duration = Duration::from_millis(1);
 const MAX_CONSECUTIVE_PAST_DEADLINES: u8 = 16;
+const MAX_PAST_DEADLINE_OBSERVATIONS: u8 = 64;
 
 #[derive(Resource, Default)]
 struct LayerHostUpdateWake(bool);
@@ -434,6 +435,7 @@ struct WakeTimerState {
     early_rearmed_deadline: Option<Duration>,
     observed_past_deadline: Option<Duration>,
     consecutive_past_deadlines: u8,
+    total_past_deadline_observations: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -470,27 +472,31 @@ impl WakeTimerState {
         elapsed: Duration,
         model_progressed: bool,
     ) -> PastDeadline {
-        if model_progressed {
-            self.observed_past_deadline = None;
-            self.consecutive_past_deadlines = 0;
-        }
         if next_deadline.is_none_or(|deadline| deadline > elapsed) {
             self.observed_past_deadline = None;
             self.consecutive_past_deadlines = 0;
+            self.total_past_deadline_observations = 0;
             return PastDeadline::NotPast;
         }
         let deadline = next_deadline.expect("past deadline was checked above");
-        if self.observed_past_deadline == Some(deadline) {
-            self.consecutive_past_deadlines = self.consecutive_past_deadlines.saturating_add(1);
-        } else {
+        let same_deadline = self.observed_past_deadline == Some(deadline);
+        if !same_deadline {
             self.observed_past_deadline = Some(deadline);
-            self.consecutive_past_deadlines = 1;
+            self.total_past_deadline_observations = 0;
         }
-        if self.consecutive_past_deadlines >= MAX_CONSECUTIVE_PAST_DEADLINES {
+        if model_progressed || !same_deadline {
+            self.consecutive_past_deadlines = 0;
+        }
+        self.consecutive_past_deadlines = self.consecutive_past_deadlines.saturating_add(1);
+        self.total_past_deadline_observations =
+            self.total_past_deadline_observations.saturating_add(1);
+        if self.consecutive_past_deadlines >= MAX_CONSECUTIVE_PAST_DEADLINES
+            || self.total_past_deadline_observations >= MAX_PAST_DEADLINE_OBSERVATIONS
+        {
             PastDeadline::Stuck
         } else {
             PastDeadline::DueNow {
-                first: self.consecutive_past_deadlines == 1,
+                first: self.total_past_deadline_observations == 1,
             }
         }
     }
@@ -1456,7 +1462,8 @@ impl RunnerState {
                         event = "quoin_wake_deadline_stuck",
                         elapsed_us = elapsed.as_micros(),
                         deadline_us = deadline.as_micros(),
-                        consecutive = self.wake_timer.consecutive_past_deadlines
+                        consecutive = self.wake_timer.consecutive_past_deadlines,
+                        total = self.wake_timer.total_past_deadline_observations
                     );
                     self.abnormal_exit = true;
                     self.exit_reason = Some("wake-deadline-stuck".to_owned());
@@ -3202,13 +3209,41 @@ mod tests {
     }
 
     #[test]
-    fn advancing_past_deadlines_are_progress_not_a_stuck_loop() {
+    fn same_past_deadline_with_model_progress_trips_the_total_cap() {
+        let mut timer = WakeTimerState::default();
+        let deadline = Duration::from_millis(1);
+        let elapsed = Duration::from_secs(1);
+
+        for observation in 1..=MAX_PAST_DEADLINE_OBSERVATIONS {
+            let expected = if observation == MAX_PAST_DEADLINE_OBSERVATIONS {
+                PastDeadline::Stuck
+            } else {
+                PastDeadline::DueNow {
+                    first: observation == 1,
+                }
+            };
+            assert_eq!(
+                timer.observe_next_deadline(Some(deadline), elapsed, true),
+                expected,
+                "model progress must not reset observation {observation} for the same deadline"
+            );
+        }
+
+        assert_eq!(timer.consecutive_past_deadlines, 1);
+        assert_eq!(
+            timer.total_past_deadline_observations,
+            MAX_PAST_DEADLINE_OBSERVATIONS
+        );
+    }
+
+    #[test]
+    fn advancing_past_deadlines_with_progress_are_not_a_stuck_loop() {
         let mut timer = WakeTimerState::default();
         let elapsed = Duration::from_secs(1);
 
         for millis in 1..=20 {
             assert_eq!(
-                timer.observe_next_deadline(Some(Duration::from_millis(millis)), elapsed, false,),
+                timer.observe_next_deadline(Some(Duration::from_millis(millis)), elapsed, true,),
                 PastDeadline::DueNow { first: true },
                 "advancing past deadline {millis} must reset the stuck count"
             );
@@ -3219,6 +3254,25 @@ mod tests {
             timer.observed_past_deadline,
             Some(Duration::from_millis(20))
         );
+        assert_eq!(timer.total_past_deadline_observations, 1);
+    }
+
+    #[test]
+    fn advancing_deadline_resets_the_total_observation_count() {
+        let mut timer = WakeTimerState::default();
+        let elapsed = Duration::from_secs(1);
+        let deadline_count = u64::from(MAX_PAST_DEADLINE_OBSERVATIONS) + 20;
+
+        for millis in 1..=deadline_count {
+            assert_eq!(
+                timer.observe_next_deadline(Some(Duration::from_millis(millis)), elapsed, false,),
+                PastDeadline::DueNow { first: true },
+                "distinct past deadline {millis} must start a fresh total"
+            );
+        }
+
+        assert_eq!(timer.consecutive_past_deadlines, 1);
+        assert_eq!(timer.total_past_deadline_observations, 1);
     }
 
     #[test]
@@ -3268,6 +3322,10 @@ mod tests {
         assert_eq!(state.exit_reason.as_deref(), Some("wake-deadline-stuck"));
         assert_eq!(
             state.wake_timer.consecutive_past_deadlines,
+            MAX_CONSECUTIVE_PAST_DEADLINES
+        );
+        assert_eq!(
+            state.wake_timer.total_past_deadline_observations,
             MAX_CONSECUTIVE_PAST_DEADLINES
         );
     }
