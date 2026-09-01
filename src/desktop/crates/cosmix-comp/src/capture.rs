@@ -1465,6 +1465,14 @@ impl CaptureDmabufCompletionService {
             let job = match error {
                 TrySendError::Full(job) | TrySendError::Disconnected(job) => job,
             };
+            // Full is structurally unreachable under legitimate load: this
+            // channel's capacity equals MAX_IN_FLIGHT_CAPTURES, protocol
+            // admission rejects another live reservation at that same cap,
+            // and every queued job owns its undropped CaptureReservationLease.
+            // Only the lease's calloop path may release that reservation; do
+            // not release it while its job remains queued. If any of those
+            // three facts changes, Full becomes reachable and this terminal
+            // policy must be reconsidered rather than used as load-shedding.
             // A full channel is terminal too. Continuing to import and submit
             // destinations while retirement is stalled would make intentional
             // fail-closed strands accumulate without a lifetime bound.
@@ -1485,7 +1493,9 @@ impl Drop for CaptureDmabufCompletionService {
         // Pin teardown without an unbounded join: mark every queued/live job
         // failed, close the sole sender and detach unless the worker has
         // already acknowledged a normal return. A stuck driver call can then
-        // retain the detached worker's job and GPU handles, but cannot block
+        // retain the in-flight job and all queued jobs through the receiver,
+        // including every import, buffer token and reporter, plus GPU handles.
+        // That set is bounded by MAX_IN_FLIGHT_CAPTURES and cannot block
         // renderer reconstruction or App destruction.
         self.advertisements.disable();
         self.stop.store(true, Ordering::Release);

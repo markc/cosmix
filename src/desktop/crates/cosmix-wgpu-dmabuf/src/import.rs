@@ -1756,6 +1756,11 @@ fn ownership_barriers(
     vk::PipelineStageFlags,
     Vec<vk::ImageMemoryBarrier<'static>>,
 ) {
+    // Pinned wgpu 29.0.4 maps RESOURCE to SHADER_READ_ONLY_OPTIMAL and
+    // COPY_DST to TRANSFER_DST_OPTIMAL. Each imported tracker is seeded with
+    // its matching TextureUses state, and a first use equal to that seed must
+    // emit no wgpu barrier: wgpu cannot see the raw barriers recorded above.
+    // Re-verify all three facts whenever the exact wgpu pin moves.
     let (local_layout, local_access, local_stage) = match role {
         OwnershipRole::Sampled => (
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -1763,9 +1768,6 @@ fn ownership_barriers(
             vk::PipelineStageFlags::ALL_COMMANDS,
         ),
         OwnershipRole::CaptureDestination => (
-            // Pinned wgpu maps COPY_DST to TRANSFER_DST_OPTIMAL and the
-            // imported destination tracker is seeded with COPY_DST. Re-verify
-            // this Vulkan layout mapping whenever the exact wgpu pin moves.
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::AccessFlags::TRANSFER_WRITE,
             vk::PipelineStageFlags::TRANSFER,
@@ -1945,9 +1947,11 @@ fn import_texture(
     };
     let (wgpu_texture, tracker_seed) = unsafe {
         // Claim RESOURCE in wgpu-core without emitting a HAL transition. The
-        // following Acquire system records GENERAL/FOREIGN -> RESOURCE into a
-        // wgpu-owned command buffer before this texture can be installed or
-        // sampled. An acquire failure follows the ordinary import failure path.
+        // following Acquire system records GENERAL/FOREIGN -> Vulkan
+        // SHADER_READ_ONLY_OPTIMAL into a wgpu-owned command buffer before this
+        // texture can be installed or sampled; RESOURCE is the matching wgpu
+        // tracker use. An acquire failure follows the ordinary import failure
+        // path.
         render_device
             .wgpu_device()
             .create_texture_from_hal_with_initial_usage::<Vulkan>(

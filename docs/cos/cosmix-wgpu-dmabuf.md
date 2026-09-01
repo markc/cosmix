@@ -71,8 +71,10 @@ allowing a stalled worker to accumulate one batch per frame. Terminal close and
 send share one mutex: close excludes senders, removes the sole endpoint, then
 the worker drains to disconnection. Shutdown does not join an unacknowledged
 worker. It detaches immediately; if the worker never returns, its in-flight
-import and retained buffer token remain owned until process exit. These rules
-are part of memory safety, not optional error recovery.
+job and all queued jobs remain owned until process exit, including every
+import, retained buffer token and reporter. The retained set is bounded by
+`MAX_IN_FLIGHT_CAPTURES`. These rules are part of memory safety, not optional
+error recovery.
 
 The automated equivalence gate proves rendering and copying on a real Vulkan
 adapter with an ordinary COPY_DST texture. A real GBM allocation, imported

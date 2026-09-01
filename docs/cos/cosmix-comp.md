@@ -310,8 +310,10 @@ static desktop without polling or a redraw timer. Teardown first puts every
 live job into failed/strand mode and closes the sole job sender. It performs a
 non-blocking worker acknowledgement check: an already-finished worker is
 joined, while an unacknowledged worker is detached. If a driver call never
-returns, that detached worker retains its in-flight job, import and reporter
-until it returns or the process exits; renderer teardown itself does not wait.
+returns, that detached worker retains the in-flight job and all queued jobs,
+including every import, buffer token and reporter, until it returns or the
+process exits. The retained set is bounded by `MAX_IN_FLIGHT_CAPTURES`; renderer
+teardown itself does not wait.
 A pre-import failure releases the retained buffer token immediately. After an
 acquire/copy submission, only successful copy retirement plus successful
 FOREIGN hand-back may release it; an unprovable hand-back strands both import
@@ -331,7 +333,11 @@ The per-destination fd duplication and Vulkan image creation/bind syscalls run
 on the render thread. This is intentionally retained for S-2: admission is
 bounded to eight destinations per render batch, and moving import into the
 worker would break same-frame copy-out. Hardware-gate runs should continue to
-record this bounded syscall cost.
+record this bounded syscall cost. They should also flag the
+`failed to release DMA-BUF queue ownership; backing and release use stranded
+fail-closed` log line: it means the sampled path exceeded its 250 ms exact-index
+wait, deliberately withheld `wl_buffer.release`, and requires a fresh import
+before that client buffer can be used again.
 
 Live renderer reconstruction currently rebuilds the renderer, capture bridge,
 advertisement registry and retirement worker together, leaving DMA-BUF
