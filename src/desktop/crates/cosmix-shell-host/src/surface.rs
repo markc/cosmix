@@ -34,10 +34,6 @@ use wayland_protocols::wp::{
 use crate::planner::{ProtocolAnchor, ProtocolKeyboardInteractivity, ProtocolLayer, ProtocolOp};
 use crate::raw_handle::{RawHandleError, RetainedWindow, retained_raw_handle};
 
-/// Conservative fallback used because the render device is not available at
-/// layer configure time. This matches wgpu's common default 2D texture limit.
-const MAX_SURFACE_DIMENSION: u32 = 16_384;
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SurfaceTag {
     pub edge: Edge,
@@ -315,7 +311,11 @@ impl SurfaceSizeError {
     }
 }
 
-fn validate_surface_size(logical: (u32, u32), scale: f64) -> Result<(u32, u32), SurfaceSizeError> {
+fn validate_surface_size(
+    logical: (u32, u32),
+    scale: f64,
+    max_texture_dimension_2d: u32,
+) -> Result<(u32, u32), SurfaceSizeError> {
     if !scale.is_finite() || scale <= 0.0 {
         return Err(SurfaceSizeError::InvalidScale(scale));
     }
@@ -332,8 +332,8 @@ fn validate_surface_size(logical: (u32, u32), scale: f64) -> Result<(u32, u32), 
     let physical = (f64::from(logical.0) * scale, f64::from(logical.1) * scale);
     if !physical.0.is_finite()
         || !physical.1.is_finite()
-        || physical.0.ceil() > f64::from(MAX_SURFACE_DIMENSION)
-        || physical.1.ceil() > f64::from(MAX_SURFACE_DIMENSION)
+        || physical.0.ceil() > f64::from(max_texture_dimension_2d)
+        || physical.1.ceil() > f64::from(max_texture_dimension_2d)
     {
         return Err(SurfaceSizeError::PhysicalOutOfRange {
             width: physical.0.ceil(),
@@ -355,6 +355,7 @@ fn surface_scale_plan(
     logical: (u32, u32),
     integer_scale: i32,
     preferred_fractional_scale: Option<f64>,
+    max_texture_dimension_2d: u32,
 ) -> Result<SurfaceScalePlan, SurfaceSizeError> {
     let (scale_factor, buffer_scale, viewport_destination) =
         if let Some(scale) = preferred_fractional_scale {
@@ -380,7 +381,7 @@ fn surface_scale_plan(
         };
     Ok(SurfaceScalePlan {
         scale_factor,
-        physical_size: validate_surface_size(logical, scale_factor)?,
+        physical_size: validate_surface_size(logical, scale_factor, max_texture_dimension_2d)?,
         buffer_scale,
         viewport_destination,
     })
@@ -659,6 +660,7 @@ impl PanelSurface {
         qh: &QueueHandle<State>,
         configure: &LayerSurfaceConfigure,
         elapsed: Duration,
+        max_texture_dimension_2d: u32,
     ) -> Result<Option<PanelMode>, SurfaceSizeError>
     where
         State: Dispatch<WlCallback, FrameCallbackData> + 'static,
@@ -674,8 +676,12 @@ impl PanelSurface {
         if effect == ConfigureEffect::Ignore {
             return Ok(None);
         }
-        let scale =
-            surface_scale_plan(logical, self.output_scale, self.preferred_fractional_scale)?;
+        let scale = surface_scale_plan(
+            logical,
+            self.output_scale,
+            self.preferred_fractional_scale,
+            max_texture_dimension_2d,
+        )?;
         let scale_changed = self.announced_scale != Some(scale.scale_factor);
         self.configured_logical_size = Some(logical);
         self.apply_scale_to_surface(&scale);
@@ -741,22 +747,36 @@ impl PanelSurface {
         })
     }
 
-    pub(crate) fn set_fractional_scale(
+    pub(crate) fn set_fractional_scale<State>(
         &mut self,
         app: &mut App,
         preferred_scale: u32,
-    ) -> Result<(), SurfaceSizeError> {
+        qh: &QueueHandle<State>,
+        elapsed: Duration,
+        max_texture_dimension_2d: u32,
+    ) -> Result<(), SurfaceSizeError>
+    where
+        State: Dispatch<WlCallback, FrameCallbackData> + 'static,
+    {
         if preferred_scale == 0 {
             return Err(SurfaceSizeError::InvalidScale(0.0));
         }
         let preferred_scale = f64::from(preferred_scale) / 120.0;
         let plan = self
             .configured_logical_size
-            .map(|logical| surface_scale_plan(logical, self.output_scale, Some(preferred_scale)))
+            .map(|logical| {
+                surface_scale_plan(
+                    logical,
+                    self.output_scale,
+                    Some(preferred_scale),
+                    max_texture_dimension_2d,
+                )
+            })
             .transpose()?;
         let scale_changed = self.announced_scale != Some(preferred_scale);
         self.preferred_fractional_scale = Some(preferred_scale);
         if let (Some(logical), Some(plan)) = (self.configured_logical_size, plan) {
+            let render_changed = self.window_scale_plan_changed(app, &plan);
             self.apply_scale_to_surface(&plan);
             self.update_bevy_window(app, plan.physical_size, plan.scale_factor);
             app.world_mut().write_message(WindowResized {
@@ -771,31 +791,34 @@ impl PanelSurface {
                 });
                 self.announced_scale = Some(plan.scale_factor);
             }
+            if render_changed {
+                self.presented = false;
+                self.request_frame(qh, elapsed);
+            }
         }
         Ok(())
     }
 
-    pub(crate) fn update_output_metrics(
+    pub(crate) fn update_output_metrics<State>(
         &mut self,
         app: &mut App,
         logical_size: LogicalSize,
         integer_scale: i32,
-    ) -> Result<(), SurfaceSizeError> {
-        if integer_scale <= 0 {
-            return Err(SurfaceSizeError::InvalidScale(f64::from(integer_scale)));
-        }
-        let plan = self
-            .configured_logical_size
-            .map(|logical| {
-                surface_scale_plan(logical, integer_scale, self.preferred_fractional_scale)
-            })
-            .transpose()?;
+        qh: &QueueHandle<State>,
+        elapsed: Duration,
+        max_texture_dimension_2d: u32,
+    ) -> Result<(), SurfaceSizeError>
+    where
+        State: Dispatch<WlCallback, FrameCallbackData> + 'static,
+    {
+        let plan = self.output_scale_plan(integer_scale, max_texture_dimension_2d)?;
         let scale_changed = plan
             .as_ref()
             .is_some_and(|plan| self.announced_scale != Some(plan.scale_factor));
         self.output_size = logical_size;
         self.output_scale = integer_scale;
         if let (Some(_), Some(plan)) = (self.configured_logical_size, plan) {
+            let render_changed = self.window_scale_plan_changed(app, &plan);
             self.apply_scale_to_surface(&plan);
             self.update_bevy_window(app, plan.physical_size, plan.scale_factor);
             if scale_changed {
@@ -805,8 +828,21 @@ impl PanelSurface {
                 });
                 self.announced_scale = Some(plan.scale_factor);
             }
+            if render_changed {
+                self.presented = false;
+                self.request_frame(qh, elapsed);
+            }
         }
         Ok(())
+    }
+
+    pub(crate) fn validate_output_metrics(
+        &self,
+        integer_scale: i32,
+        max_texture_dimension_2d: u32,
+    ) -> Result<(), SurfaceSizeError> {
+        self.output_scale_plan(integer_scale, max_texture_dimension_2d)
+            .map(|_| ())
     }
 
     pub(crate) fn request_frame<State>(&mut self, qh: &QueueHandle<State>, elapsed: Duration)
@@ -1008,6 +1044,34 @@ impl PanelSurface {
                 .set_physical_resolution(physical.0, physical.1);
         }
     }
+
+    fn window_scale_plan_changed(&self, app: &App, plan: &SurfaceScalePlan) -> bool {
+        app.world().get::<Window>(self.window).is_none_or(|window| {
+            window.physical_width() != plan.physical_size.0
+                || window.physical_height() != plan.physical_size.1
+                || self.announced_scale != Some(plan.scale_factor)
+        })
+    }
+
+    fn output_scale_plan(
+        &self,
+        integer_scale: i32,
+        max_texture_dimension_2d: u32,
+    ) -> Result<Option<SurfaceScalePlan>, SurfaceSizeError> {
+        if integer_scale <= 0 {
+            return Err(SurfaceSizeError::InvalidScale(f64::from(integer_scale)));
+        }
+        self.configured_logical_size
+            .map(|logical| {
+                surface_scale_plan(
+                    logical,
+                    integer_scale,
+                    self.preferred_fractional_scale,
+                    max_texture_dimension_2d,
+                )
+            })
+            .transpose()
+    }
 }
 
 fn requested_logical_size(edge: Edge, output: LogicalSize, thickness: f32) -> (u32, u32) {
@@ -1055,6 +1119,7 @@ mod tests {
     use super::*;
 
     const TEARDOWN_ORDER: [&str; 5] = ["viewport", "fractional", "layer", "raw-handle", "owner"];
+    const TEST_MAX_TEXTURE_DIMENSION_2D: u32 = 8_192;
 
     fn teardown_sequence() -> Arc<Mutex<Vec<&'static str>>> {
         Arc::new(Mutex::new(Vec::new()))
@@ -1227,17 +1292,24 @@ mod tests {
 
     #[test]
     fn configure_size_validator_rejects_protocol_and_gpu_overflow() {
-        assert_eq!(validate_surface_size((1280, 32), 1.25), Ok((1600, 40)));
+        assert_eq!(
+            validate_surface_size((1280, 32), 1.25, TEST_MAX_TEXTURE_DIMENSION_2D),
+            Ok((1600, 40))
+        );
         assert!(matches!(
-            validate_surface_size((u32::MAX, 32), 1.0),
+            validate_surface_size((u32::MAX, 32), 1.0, TEST_MAX_TEXTURE_DIMENSION_2D),
             Err(SurfaceSizeError::LogicalOutOfRange { .. })
         ));
         assert!(matches!(
-            validate_surface_size((8193, 32), 2.0),
+            validate_surface_size((9_000, 32), 1.0, TEST_MAX_TEXTURE_DIMENSION_2D),
             Err(SurfaceSizeError::PhysicalOutOfRange { .. })
         ));
+        assert_eq!(
+            validate_surface_size((9_000, 32), 1.0, 16_384),
+            Ok((9_000, 32))
+        );
         assert!(matches!(
-            validate_surface_size((32, 32), f64::INFINITY),
+            validate_surface_size((32, 32), f64::INFINITY, TEST_MAX_TEXTURE_DIMENSION_2D),
             Err(SurfaceSizeError::InvalidScale(_))
         ));
     }
@@ -1246,7 +1318,7 @@ mod tests {
     fn integer_and_fractional_scale_plans_keep_protocol_geometry_logical() {
         let logical = (1_001, 33);
         assert_eq!(
-            surface_scale_plan(logical, 1, None),
+            surface_scale_plan(logical, 1, None, TEST_MAX_TEXTURE_DIMENSION_2D),
             Ok(SurfaceScalePlan {
                 scale_factor: 1.0,
                 physical_size: (1_001, 33),
@@ -1255,15 +1327,15 @@ mod tests {
             })
         );
         assert!(matches!(
-            surface_scale_plan(logical, 0, None),
+            surface_scale_plan(logical, 0, None, TEST_MAX_TEXTURE_DIMENSION_2D),
             Err(SurfaceSizeError::InvalidScale(0.0))
         ));
         assert!(matches!(
-            surface_scale_plan(logical, 2, Some(0.0)),
+            surface_scale_plan(logical, 2, Some(0.0), TEST_MAX_TEXTURE_DIMENSION_2D),
             Err(SurfaceSizeError::InvalidScale(0.0))
         ));
         assert_eq!(
-            surface_scale_plan(logical, 2, None),
+            surface_scale_plan(logical, 2, None, TEST_MAX_TEXTURE_DIMENSION_2D),
             Ok(SurfaceScalePlan {
                 scale_factor: 2.0,
                 physical_size: (2_002, 66),
@@ -1272,7 +1344,12 @@ mod tests {
             })
         );
         assert_eq!(
-            surface_scale_plan(logical, 2, Some(150.0 / 120.0)),
+            surface_scale_plan(
+                logical,
+                2,
+                Some(150.0 / 120.0),
+                TEST_MAX_TEXTURE_DIMENSION_2D
+            ),
             Ok(SurfaceScalePlan {
                 scale_factor: 1.25,
                 physical_size: (1_252, 42),

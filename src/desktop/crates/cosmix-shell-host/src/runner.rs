@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use bevy::app::{App, AppExit, Last, PluginGroup, TerminalCtrlCHandlerPlugin};
 use bevy::ecs::message::MessageReader;
 use bevy::prelude::*;
-use bevy::render::pipelined_rendering::PipelinedRenderingPlugin;
+use bevy::render::{
+    RenderApp, pipelined_rendering::PipelinedRenderingPlugin, renderer::RenderDevice,
+};
 use bevy::time::{Real, TimeUpdateStrategy};
 use bevy::window::{ExitCondition, RequestRedraw, WindowPlugin};
 use bevy::winit::WinitPlugin;
@@ -699,6 +701,7 @@ struct RunnerState {
     abnormal_exit: bool,
     ready_logged: bool,
     replacement_needed: bool,
+    max_texture_dimension_2d: u32,
     pointer_bridge: PointerBridge,
     pointer_seats: Vec<wl_seat::WlSeat>,
     active_pointer_seat: Option<wl_seat::WlSeat>,
@@ -967,6 +970,7 @@ fn run_layer_host(
         abnormal_exit: false,
         ready_logged: false,
         replacement_needed: false,
+        max_texture_dimension_2d: 0,
         pointer_bridge: PointerBridge::default(),
         pointer_seats: Vec::new(),
         active_pointer_seat: None,
@@ -1027,6 +1031,17 @@ fn run_layer_host(
         .insert_resource(QuoinCommittedMotionModes::hidden());
     state.app.finish();
     state.app.cleanup();
+
+    let Some(max_texture_dimension_2d) = state
+        .app
+        .get_sub_app(RenderApp)
+        .and_then(|render_app| render_app.world().get_resource::<RenderDevice>())
+        .map(|device| device.limits().max_texture_dimension_2d)
+        .filter(|limit| *limit > 0)
+    else {
+        return state_setup_error(state, "render-device-texture-limit-unavailable".to_owned());
+    };
+    state.max_texture_dimension_2d = max_texture_dimension_2d;
 
     if state.app.is_plugin_added::<WinitPlugin>()
         || state.app.is_plugin_added::<PipelinedRenderingPlugin>()
@@ -1619,7 +1634,7 @@ impl RunnerState {
         }
     }
 
-    fn refresh_output(&mut self, output: &wl_output::WlOutput) {
+    fn refresh_output(&mut self, qh: &QueueHandle<Self>, output: &wl_output::WlOutput) {
         let Some(info) = self.output_state.info(output) else {
             return;
         };
@@ -1637,11 +1652,32 @@ impl RunnerState {
         else {
             return;
         };
+        if let Some(error) = runtime.panels.iter().find_map(|panel| {
+            panel
+                .validate_output_metrics(scale, self.max_texture_dimension_2d)
+                .err()
+        }) {
+            self.abnormal_exit = true;
+            self.exit_reason = Some(format!("configure-out-of-range-{}", error.reason_suffix()));
+            return;
+        }
         runtime.info = info;
         runtime.logical_size = logical_size;
         runtime.scale = scale;
+        let elapsed = self
+            .app
+            .world()
+            .get_resource::<Time<Real>>()
+            .map_or(Duration::ZERO, Time::elapsed);
         for panel in &mut runtime.panels {
-            if let Err(error) = panel.update_output_metrics(&mut self.app, logical_size, scale) {
+            if let Err(error) = panel.update_output_metrics(
+                &mut self.app,
+                logical_size,
+                scale,
+                qh,
+                elapsed,
+                self.max_texture_dimension_2d,
+            ) {
                 self.abnormal_exit = true;
                 self.exit_reason =
                     Some(format!("configure-out-of-range-{}", error.reason_suffix()));
@@ -1649,11 +1685,6 @@ impl RunnerState {
             }
         }
         if let Some(key) = &self.selected_key {
-            let elapsed = self
-                .app
-                .world()
-                .get_resource::<Time<Real>>()
-                .map_or(Duration::ZERO, Time::elapsed);
             self.app.world_mut().write_message(ShellCommand {
                 output: key.clone(),
                 at: elapsed,
@@ -1668,17 +1699,38 @@ impl CompositorHandler for RunnerState {
     fn scale_factor_changed(
         &mut self,
         _connection: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         surface: &wl_surface::WlSurface,
         scale: i32,
     ) {
         let output_size = panel_output_size(&self.outputs, surface);
-        let RunnerState { app, outputs, .. } = self;
+        let elapsed = self
+            .app
+            .world()
+            .get_resource::<Time<Real>>()
+            .map_or(Duration::ZERO, Time::elapsed);
+        let RunnerState {
+            app,
+            outputs,
+            max_texture_dimension_2d,
+            ..
+        } = self;
         let size_error = outputs
             .values_mut()
             .flat_map(|output| output.panels.iter_mut())
             .find(|panel| panel.matches_surface(surface))
-            .and_then(|panel| panel.update_output_metrics(app, output_size, scale).err());
+            .and_then(|panel| {
+                panel
+                    .update_output_metrics(
+                        app,
+                        output_size,
+                        scale,
+                        qh,
+                        elapsed,
+                        *max_texture_dimension_2d,
+                    )
+                    .err()
+            });
         if let Some(error) = size_error {
             self.abnormal_exit = true;
             self.exit_reason = Some(format!("configure-out-of-range-{}", error.reason_suffix()));
@@ -1755,10 +1807,10 @@ impl OutputHandler for RunnerState {
     fn update_output(
         &mut self,
         _connection: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        self.refresh_output(&output);
+        self.refresh_output(qh, &output);
     }
 
     fn output_destroyed(
@@ -1843,6 +1895,7 @@ impl LayerShellHandler for RunnerState {
             needs_update,
             abnormal_exit,
             exit_reason,
+            max_texture_dimension_2d,
             ..
         } = self;
         let result = if let Some(panel) = outputs
@@ -1851,7 +1904,7 @@ impl LayerShellHandler for RunnerState {
             .find(|panel| panel.matches_layer(layer))
         {
             // SCTK acknowledged the configure before invoking this callback.
-            match panel.configure(app, qh, &configure, elapsed) {
+            match panel.configure(app, qh, &configure, elapsed, *max_texture_dimension_2d) {
                 Ok(mode) => Ok(mode.map(|mode| (panel.edge, mode))),
                 Err(error) => Err(error),
             }
@@ -2057,7 +2110,7 @@ impl KeyboardHandler for RunnerState {
         layout: u32,
     ) {
         if self.active_keyboard.as_ref() == Some(keyboard) {
-            self.keyboard_bridge.update_modifiers(modifiers, layout);
+            self.needs_update |= self.keyboard_bridge.update_modifiers(modifiers, layout);
         }
     }
 
@@ -2077,8 +2130,7 @@ impl KeyboardHandler for RunnerState {
             .world()
             .get_resource::<Time<Real>>()
             .map_or(Duration::ZERO, |time| model_elapsed_at(time, now));
-        self.keyboard_bridge.update_repeat_info(info, elapsed);
-        self.needs_update = true;
+        self.needs_update |= self.keyboard_bridge.update_repeat_info(info, elapsed);
     }
 
     fn update_keymap(
@@ -2088,10 +2140,12 @@ impl KeyboardHandler for RunnerState {
         keyboard: &wl_keyboard::WlKeyboard,
         keymap: Keymap<'_>,
     ) {
-        if self.active_keyboard.as_ref() == Some(keyboard)
-            && self.keyboard_bridge.install_keymap(keymap)
-        {
-            tracing::debug!(event = "quoin_keyboard_keymap_installed");
+        if self.active_keyboard.as_ref() == Some(keyboard) {
+            let update = self.keyboard_bridge.install_keymap(keymap);
+            self.needs_update |= update.deadline_changed;
+            if update.installed {
+                tracing::debug!(event = "quoin_keyboard_keymap_installed");
+            }
         }
     }
 }
@@ -2394,18 +2448,30 @@ impl Dispatch<WpFractionalScaleV1, SurfaceTag> for RunnerState {
         event: <WpFractionalScaleV1 as Proxy>::Event,
         data: &SurfaceTag,
         _connection: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
         let wp_fractional_scale_v1::Event::PreferredScale { scale } = event else {
             return;
         };
-        let RunnerState { app, outputs, .. } = state;
+        let elapsed = state
+            .app
+            .world()
+            .get_resource::<Time<Real>>()
+            .map_or(Duration::ZERO, Time::elapsed);
+        let RunnerState {
+            app,
+            outputs,
+            max_texture_dimension_2d,
+            ..
+        } = state;
         if let Some(panel) = outputs
             .values_mut()
             .flat_map(|output| output.panels.iter_mut())
             .find(|panel| panel.edge == data.edge && panel.matches_fractional_scale(proxy))
         {
-            if let Err(error) = panel.set_fractional_scale(app, scale) {
+            if let Err(error) =
+                panel.set_fractional_scale(app, scale, qh, elapsed, *max_texture_dimension_2d)
+            {
                 state.abnormal_exit = true;
                 state.exit_reason =
                     Some(format!("configure-out-of-range-{}", error.reason_suffix()));

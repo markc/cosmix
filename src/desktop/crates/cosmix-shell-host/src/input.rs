@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use bevy::app::Update;
-use bevy::ecs::message::MessageWriter;
+use bevy::app::{Last, Update};
+use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::input::ButtonState;
 use bevy::input::keyboard::{Key, KeyCode, KeyboardFocusLost, KeyboardInput, NativeKey};
 use bevy::input::mouse::{MouseButton, MouseButtonInput, MouseScrollUnit, MouseWheel};
@@ -64,6 +64,42 @@ struct RepeatSettings {
     gap: Duration,
 }
 
+const MIN_REPEAT_DELAY: Duration = Duration::from_millis(50);
+const MAX_REPEAT_DELAY: Duration = Duration::from_secs(2);
+const MIN_REPEAT_GAP: Duration = Duration::from_millis(8);
+const MAX_REPEAT_GAP: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EffectiveModifiers {
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    caps_lock: bool,
+    logo: bool,
+    num_lock: bool,
+    layout: u32,
+}
+
+impl EffectiveModifiers {
+    fn new(modifiers: Modifiers, layout: u32) -> Self {
+        Self {
+            ctrl: modifiers.ctrl,
+            alt: modifiers.alt,
+            shift: modifiers.shift,
+            caps_lock: modifiers.caps_lock,
+            logo: modifiers.logo,
+            num_lock: modifiers.num_lock,
+            layout,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KeymapUpdate {
+    pub installed: bool,
+    pub deadline_changed: bool,
+}
+
 #[derive(Clone, Debug)]
 struct RepeatingKey {
     key: MappedKey,
@@ -80,29 +116,44 @@ pub(crate) struct KeyboardBridge {
     repeat_settings: Option<RepeatSettings>,
     repeating: Option<RepeatingKey>,
     keymap: Option<xkb::Keymap>,
+    keymap_source: Option<String>,
+    modifiers: Option<EffectiveModifiers>,
     diagnostics: u64,
 }
 
 impl KeyboardBridge {
-    pub(crate) fn install_keymap(&mut self, keymap: SctkKeymap<'_>) -> bool {
+    pub(crate) fn install_keymap(&mut self, keymap: SctkKeymap<'_>) -> KeymapUpdate {
         self.install_keymap_text(keymap.as_string())
     }
 
-    fn install_keymap_text(&mut self, source: String) -> bool {
+    fn install_keymap_text(&mut self, source: String) -> KeymapUpdate {
+        if self.keymap_source.as_ref() == Some(&source) {
+            return KeymapUpdate {
+                installed: true,
+                deadline_changed: false,
+            };
+        }
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
         let Some(keymap) = xkb::Keymap::new_from_string(
             &context,
-            source,
+            source.clone(),
             xkb::KEYMAP_FORMAT_TEXT_V1,
             xkb::COMPILE_NO_FLAGS,
         ) else {
             self.reject("invalid-keymap-copy");
-            self.cancel_repeat();
-            return false;
+            return KeymapUpdate {
+                installed: false,
+                deadline_changed: self.cancel_repeat(),
+            };
         };
-        self.cancel_repeat();
+        let deadline_changed = self.cancel_repeat();
         self.keymap = Some(keymap);
-        true
+        self.keymap_source = Some(source);
+        self.modifiers = None;
+        KeymapUpdate {
+            installed: true,
+            deadline_changed,
+        }
     }
 
     pub(crate) fn enter(
@@ -113,7 +164,7 @@ impl KeyboardBridge {
         keysyms: &[Keysym],
     ) -> bool {
         if self.focus.is_some() {
-            self.focus_lost(app, false);
+            self.focus_lost(app);
         }
         self.focus = Some(KeyboardFocus {
             surface: Some(target.surface.clone()),
@@ -127,6 +178,10 @@ impl KeyboardBridge {
                 focused: true,
             },
         );
+        // SCTK 0.19.2 constructs `keysyms` one-for-one from `raw`, including
+        // NoSymbol placeholders. Surface a changed upstream invariant in debug
+        // builds instead of silently dropping an enter-held key from the zip.
+        debug_assert_eq!(raw.len(), keysyms.len());
         for (&raw_code, &keysym) in raw.iter().zip(keysyms) {
             let mapped = map_key(raw_code, keysym, None);
             emit_keyboard(app, target.window, &mapped, ButtonState::Pressed, false);
@@ -143,7 +198,7 @@ impl KeyboardBridge {
         {
             return false;
         }
-        self.focus_lost(app, true)
+        self.focus_lost(app)
     }
 
     pub(crate) fn press(&mut self, app: &mut App, event: SctkKeyEvent, elapsed: Duration) -> bool {
@@ -154,13 +209,10 @@ impl KeyboardBridge {
         let mapped = map_key(event.raw_code, event.keysym, event.utf8);
         emit_keyboard(app, window, &mapped, ButtonState::Pressed, false);
         self.pressed.insert(event.raw_code, mapped.clone());
-        // wl_keyboard repeat semantics make every later key press replace the
-        // current candidate. A non-repeatable modifier therefore stops repeat
-        // instead of forcing us to reconstruct compositor-private XKB masks.
-        self.cancel_repeat();
         if self.key_repeats(event.raw_code)
             && let Some(settings) = self.repeat_settings
         {
+            self.cancel_repeat();
             self.repeating = Some(RepeatingKey {
                 key: mapped,
                 next_deadline: elapsed.saturating_add(settings.delay),
@@ -188,29 +240,41 @@ impl KeyboardBridge {
         true
     }
 
-    pub(crate) fn update_modifiers(&mut self, _modifiers: Modifiers, _layout: u32) {
+    pub(crate) fn update_modifiers(&mut self, modifiers: Modifiers, layout: u32) -> bool {
         // Physical modifier keys already enter Bevy through press/release.
         // SCTK deliberately exposes only an effective six-boolean summary
         // here, not the raw XKB masks needed to reinterpret text losslessly.
-        // Stop rather than emit a repeat with stale text after any state change.
-        self.cancel_repeat();
+        // Stop rather than emit a repeat with stale text after a real state
+        // change, while redundant compositor callbacks leave repeat intact.
+        let next = EffectiveModifiers::new(modifiers, layout);
+        if self.modifiers == Some(next) {
+            return false;
+        }
+        self.modifiers = Some(next);
+        self.cancel_repeat()
     }
 
-    pub(crate) fn update_repeat_info(&mut self, info: RepeatInfo, elapsed: Duration) {
+    pub(crate) fn update_repeat_info(&mut self, info: RepeatInfo, elapsed: Duration) -> bool {
+        let previous_deadline = self.repeat_deadline();
         self.repeat_settings = match info {
             RepeatInfo::Disable => None,
             RepeatInfo::Repeat { rate, delay } => Some(RepeatSettings {
-                delay: Duration::from_millis(u64::from(delay)),
-                gap: Duration::from_micros((1_000_000 / u64::from(rate.get())).max(1)),
+                // The compositor controls these values. Bound them to human
+                // input rates so repeat can never starve the calloop dispatch.
+                delay: Duration::from_millis(u64::from(delay))
+                    .clamp(MIN_REPEAT_DELAY, MAX_REPEAT_DELAY),
+                gap: Duration::from_micros(1_000_000 / u64::from(rate.get()))
+                    .clamp(MIN_REPEAT_GAP, MAX_REPEAT_GAP),
             }),
         };
         let Some(settings) = self.repeat_settings else {
             self.cancel_repeat();
-            return;
+            return previous_deadline != self.repeat_deadline();
         };
         if let Some(repeating) = self.repeating.as_mut() {
             repeating.next_deadline = elapsed.saturating_add(settings.delay);
         }
+        previous_deadline != self.repeat_deadline()
     }
 
     pub(crate) fn repeat_deadline(&self) -> Option<Duration> {
@@ -218,18 +282,29 @@ impl KeyboardBridge {
     }
 
     pub(crate) fn fire_repeat(&mut self, app: &mut App, elapsed: Duration) -> bool {
-        let (Some(window), Some(settings), Some(repeating)) = (
+        let (Some(window), Some(settings)) = (
             self.focus.as_ref().map(|focus| focus.window),
             self.repeat_settings,
-            self.repeating.as_mut(),
         ) else {
+            return false;
+        };
+        let Some(repeating) = self.repeating.as_mut() else {
             return false;
         };
         if elapsed < repeating.next_deadline {
             return false;
         }
-        emit_keyboard(app, window, &repeating.key, ButtonState::Pressed, true);
-        repeating.next_deadline = elapsed.saturating_add(settings.gap);
+        let key = repeating.key.clone();
+        let next_deadline = repeating
+            .next_deadline
+            .max(elapsed)
+            .checked_add(settings.gap);
+        emit_keyboard(app, window, &key, ButtonState::Pressed, true);
+        if let Some(next_deadline) = next_deadline {
+            repeating.next_deadline = next_deadline;
+        } else {
+            self.repeating = None;
+        }
         true
     }
 
@@ -241,10 +316,10 @@ impl KeyboardBridge {
         }) {
             return false;
         }
-        self.focus_lost(app, true)
+        self.focus_lost(app)
     }
 
-    fn focus_lost(&mut self, app: &mut App, emit_global_loss: bool) -> bool {
+    fn focus_lost(&mut self, app: &mut App) -> bool {
         let Some(focus) = self.focus.take() else {
             return false;
         };
@@ -260,9 +335,6 @@ impl KeyboardBridge {
                 focused: false,
             },
         );
-        if emit_global_loss {
-            emit_window(app, KeyboardFocusLost);
-        }
         true
     }
 
@@ -272,8 +344,8 @@ impl KeyboardBridge {
             .is_some_and(|keymap| keymap.key_repeats(xkb::Keycode::new(raw_code.saturating_add(8))))
     }
 
-    fn cancel_repeat(&mut self) {
-        self.repeating = None;
+    fn cancel_repeat(&mut self) -> bool {
+        self.repeating.take().is_some()
     }
 
     fn reject(&mut self, reason: &'static str) {
@@ -341,7 +413,6 @@ fn emit_keyboard(app: &mut App, window: Entity, key: &MappedKey, state: ButtonSt
 struct TouchContact {
     window: Entity,
     position: Vec2,
-    output_position: Vec2,
 }
 
 /// Active touch contacts, attributed on down so later id-only events cannot
@@ -371,29 +442,12 @@ impl TouchBridge {
         if let Some(previous) = self.contacts.remove(&id) {
             emit_touch(app, id, &previous, TouchPhase::Canceled);
         }
-        self.start_contact(
-            app,
-            target.window,
-            id,
-            position,
-            output_position(target, position),
-        );
+        self.start_contact(app, target.window, id, position);
         true
     }
 
-    fn start_contact(
-        &mut self,
-        app: &mut App,
-        window: Entity,
-        id: i32,
-        position: Vec2,
-        output_position: Vec2,
-    ) {
-        let contact = TouchContact {
-            window,
-            position,
-            output_position,
-        };
+    fn start_contact(&mut self, app: &mut App, window: Entity, id: i32, position: Vec2) {
+        let contact = TouchContact { window, position };
         emit_touch(app, id, &contact, TouchPhase::Started);
         self.contacts.insert(id, contact);
     }
@@ -406,12 +460,10 @@ impl TouchBridge {
             self.reject("invalid-motion-position");
             return false;
         };
-        let delta = position - previous.position;
         let Some(contact) = self.contacts.get_mut(&id) else {
             return false;
         };
         contact.position = position;
-        contact.output_position += delta;
         emit_touch(app, id, contact, TouchPhase::Moved);
         true
     }
@@ -488,10 +540,35 @@ struct Focus {
 pub(crate) struct StagedShellCommands(Vec<(OutputKey, ShellCommandKind)>);
 
 pub(crate) fn configure_ingress(app: &mut App) {
-    app.init_resource::<StagedShellCommands>().add_systems(
-        Update,
-        flush_staged_shell_commands.in_set(ShellRuntimeSet::Input),
-    );
+    app.add_message::<KeyboardFocusLost>()
+        .add_message::<WindowFocused>()
+        .add_message::<WindowEvent>()
+        .init_resource::<StagedShellCommands>()
+        .add_systems(
+            Update,
+            flush_staged_shell_commands.in_set(ShellRuntimeSet::Input),
+        )
+        .add_systems(Last, coalesce_keyboard_focus_lost);
+}
+
+/// Emit a global keyboard loss only when an update batch contains no focus
+/// gain. This mirrors Bevy's winit host and keeps leave(A)+enter(B) in one
+/// Wayland dispatch from clearing B's newly pressed input resources.
+fn coalesce_keyboard_focus_lost(
+    mut focused: MessageReader<WindowFocused>,
+    mut keyboard_focus_lost: MessageWriter<KeyboardFocusLost>,
+    mut window_events: MessageWriter<WindowEvent>,
+) {
+    let mut lost = false;
+    let mut gained = false;
+    for event in focused.read() {
+        lost |= !event.focused;
+        gained |= event.focused;
+    }
+    if lost && !gained {
+        keyboard_focus_lost.write(KeyboardFocusLost);
+        window_events.write(WindowEvent::KeyboardFocusLost(KeyboardFocusLost));
+    }
 }
 
 pub(crate) fn stage_shell_command(app: &mut App, output: OutputKey, kind: ShellCommandKind) {
@@ -897,8 +974,8 @@ fn valid_position(app: &App, window: Entity, position: (f64, f64)) -> Option<Vec
     }
     let window = app.world().get::<Window>(window)?;
     Some(Vec2::new(
-        position.x.clamp(0.0, window.resolution.width()),
-        position.y.clamp(0.0, window.resolution.height()),
+        position.x.clamp(0.0, window.width()),
+        position.y.clamp(0.0, window.height()),
     ))
 }
 
@@ -1372,6 +1449,7 @@ mod tests {
             .add_message::<WindowFocused>()
             .add_message::<WindowEvent>()
             .add_message::<TouchInput>();
+        app.add_systems(Last, coalesce_keyboard_focus_lost);
         let window = app
             .world_mut()
             .spawn(Window {
@@ -1391,21 +1469,90 @@ mod tests {
     #[test]
     fn xkb_keymap_install_owns_a_compiled_copy_and_bounds_repeat_gap() {
         let keymap = us_keymap();
+        let source = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
         let mut bridge = KeyboardBridge::default();
-        assert!(bridge.install_keymap_text(keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)));
+        assert!(bridge.install_keymap_text(source.clone()).installed);
         assert!(bridge.keymap.is_some());
+
+        assert!(!bridge.update_repeat_info(
+            RepeatInfo::Repeat {
+                rate: std::num::NonZeroU32::new(u32::MAX).unwrap(),
+                delay: 0,
+            },
+            Duration::ZERO,
+        ));
+        assert_eq!(
+            bridge.repeat_settings,
+            Some(RepeatSettings {
+                delay: MIN_REPEAT_DELAY,
+                gap: MIN_REPEAT_GAP,
+            })
+        );
 
         bridge.update_repeat_info(
             RepeatInfo::Repeat {
-                rate: std::num::NonZeroU32::new(u32::MAX).unwrap(),
-                delay: 1,
+                rate: std::num::NonZeroU32::new(1).unwrap(),
+                delay: u32::MAX,
             },
             Duration::ZERO,
         );
         assert_eq!(
-            bridge.repeat_settings.unwrap().gap,
-            Duration::from_micros(1)
+            bridge.repeat_settings,
+            Some(RepeatSettings {
+                delay: MAX_REPEAT_DELAY,
+                gap: MAX_REPEAT_GAP,
+            })
         );
+        bridge.repeating = Some(RepeatingKey {
+            key: map_key(30, Keysym::a, Some("a".to_owned())),
+            next_deadline: Duration::from_secs(3),
+        });
+        assert_eq!(
+            bridge.install_keymap_text(source),
+            KeymapUpdate {
+                installed: true,
+                deadline_changed: false,
+            }
+        );
+        assert_eq!(bridge.repeat_deadline(), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn pathological_repeat_info_is_clamped_and_cannot_refire_at_one_instant() {
+        let (mut app, window) = keyboard_app();
+        let mut bridge = KeyboardBridge {
+            focus: Some(KeyboardFocus {
+                surface: None,
+                window,
+            }),
+            keymap: Some(us_keymap()),
+            ..Default::default()
+        };
+        bridge.update_repeat_info(
+            RepeatInfo::Repeat {
+                rate: std::num::NonZeroU32::new(u32::MAX).unwrap(),
+                delay: 0,
+            },
+            Duration::ZERO,
+        );
+        bridge.press(
+            &mut app,
+            SctkKeyEvent {
+                time: 1,
+                raw_code: 30,
+                keysym: Keysym::a,
+                utf8: Some("a".to_owned()),
+            },
+            Duration::ZERO,
+        );
+
+        assert_eq!(bridge.repeat_deadline(), Some(MIN_REPEAT_DELAY));
+        assert!(bridge.fire_repeat(&mut app, MIN_REPEAT_DELAY));
+        assert_eq!(
+            bridge.repeat_deadline(),
+            Some(MIN_REPEAT_DELAY + MIN_REPEAT_GAP)
+        );
+        assert!(!bridge.fire_repeat(&mut app, MIN_REPEAT_DELAY));
     }
 
     #[test]
@@ -1468,7 +1615,7 @@ mod tests {
     }
 
     #[test]
-    fn modifier_press_maps_and_replaces_the_repeat_candidate() {
+    fn non_repeating_press_preserves_candidate_until_effective_modifiers_change() {
         let (mut app, window) = keyboard_app();
         let mut bridge = KeyboardBridge {
             focus: Some(KeyboardFocus {
@@ -1504,15 +1651,23 @@ mod tests {
             },
             Duration::from_millis(10),
         );
-        bridge.update_modifiers(
+        assert_eq!(bridge.repeat_deadline(), Some(Duration::from_millis(200)));
+        assert!(bridge.update_modifiers(
             Modifiers {
                 shift: true,
                 ..Default::default()
             },
             0,
-        );
+        ));
 
         assert_eq!(bridge.repeat_deadline(), None);
+        assert!(!bridge.update_modifiers(
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+            0,
+        ));
         let events = app
             .world_mut()
             .resource_mut::<Messages<KeyboardInput>>()
@@ -1563,6 +1718,7 @@ mod tests {
         assert!(bridge.cleanup(&mut app, Some(window)));
         assert!(bridge.focus.is_none());
         assert!(bridge.pressed.is_empty());
+        app.update();
         let events = app
             .world_mut()
             .resource_mut::<Messages<KeyboardInput>>()
@@ -1601,6 +1757,7 @@ mod tests {
         app.add_plugins(bevy::input::InputPlugin)
             .add_message::<WindowFocused>()
             .add_message::<WindowEvent>();
+        app.add_systems(Last, coalesce_keyboard_focus_lost);
         let window = app
             .world_mut()
             .spawn(Window {
@@ -1628,13 +1785,7 @@ mod tests {
             Duration::ZERO,
         );
         let mut touch = TouchBridge::default();
-        touch.start_contact(
-            &mut app,
-            window,
-            8,
-            Vec2::new(5.0, 7.0),
-            Vec2::new(5.0, 7.0),
-        );
+        touch.start_contact(&mut app, window, 8, Vec2::new(5.0, 7.0));
         app.update();
         assert!(
             app.world()
@@ -1667,6 +1818,64 @@ mod tests {
     }
 
     #[test]
+    fn leave_then_enter_before_update_preserves_both_pressed_key_resources() {
+        let mut app = App::new();
+        app.add_plugins(bevy::input::InputPlugin)
+            .add_message::<WindowFocused>()
+            .add_message::<WindowEvent>();
+        app.add_systems(Last, coalesce_keyboard_focus_lost);
+        let old_window = app.world_mut().spawn(Window::default()).id();
+        let new_window = app.world_mut().spawn(Window::default()).id();
+        let old_key = MappedKey {
+            raw_code: 30,
+            key_code: KeyCode::KeyA,
+            logical_key: Key::Character("a".into()),
+            text: Some("a".to_owned()),
+        };
+        let new_key = MappedKey {
+            raw_code: 45,
+            key_code: KeyCode::KeyX,
+            logical_key: Key::Character("x".into()),
+            text: Some("x".to_owned()),
+        };
+
+        emit_keyboard(&mut app, old_window, &old_key, ButtonState::Pressed, false);
+        app.update();
+
+        emit_keyboard(&mut app, old_window, &old_key, ButtonState::Released, false);
+        emit_window(
+            &mut app,
+            WindowFocused {
+                window: old_window,
+                focused: false,
+            },
+        );
+        emit_window(
+            &mut app,
+            WindowFocused {
+                window: new_window,
+                focused: true,
+            },
+        );
+        emit_keyboard(&mut app, new_window, &new_key, ButtonState::Pressed, false);
+        app.update();
+
+        let key_codes = app.world().resource::<bevy::input::ButtonInput<KeyCode>>();
+        assert!(!key_codes.pressed(KeyCode::KeyA));
+        assert!(key_codes.pressed(KeyCode::KeyX));
+        let logical_keys = app.world().resource::<bevy::input::ButtonInput<Key>>();
+        assert!(!logical_keys.pressed(Key::Character("a".into())));
+        assert!(logical_keys.pressed(Key::Character("x".into())));
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<Messages<KeyboardFocusLost>>()
+                .drain()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn touch_attribution_motion_and_cancel_clear_pressed_contacts() {
         let (mut app, left) = keyboard_app();
         let right = app
@@ -1677,23 +1886,11 @@ mod tests {
             })
             .id();
         let mut bridge = TouchBridge::default();
-        bridge.start_contact(
-            &mut app,
-            right,
-            -4,
-            Vec2::new(5.0, 7.0),
-            output_logical_position(
-                Edge::Right,
-                Vec2::new(5.0, 7.0),
-                Vec2::new(1_000.0, 800.0),
-                100.0,
-                -20,
-            ),
-        );
+        bridge.start_contact(&mut app, right, -4, Vec2::new(5.0, 7.0));
         assert!(bridge.motion(&mut app, -4, (9.0, 10.0)));
         assert_eq!(bridge.contacts[&-4].window, right);
         assert_ne!(bridge.contacts[&-4].window, left);
-        assert_eq!(bridge.contacts[&-4].output_position, Vec2::new(929.0, 10.0));
+        assert_eq!(bridge.contacts[&-4].position, Vec2::new(9.0, 10.0));
         assert!(bridge.cancel(&mut app));
         assert!(bridge.contacts.is_empty());
 
@@ -1714,6 +1911,10 @@ mod tests {
     fn invalid_positions_and_unknown_wide_buttons_are_rejected() {
         let (app, window, _) = pointer_app();
         assert_eq!(valid_position(&app, window, (f64::NAN, 1.0)), None);
+        assert_eq!(
+            valid_position(&app, window, (150.0, 75.0)),
+            Some(Vec2::new(100.0, 50.0))
+        );
         assert_eq!(translate_button(u32::MAX), None);
         assert_eq!(translate_button(BTN_LEFT), Some(MouseButton::Left));
     }
