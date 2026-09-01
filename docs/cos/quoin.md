@@ -159,9 +159,9 @@ and keyboard capability loss synthesize releases for held keys, clear pressed
 state and stop repeat. Touch down is attributed to the exact panel surface;
 motion and up retain that attribution and use the same panel-to-output logical
 coordinate conversion as the pointer bridge. Touch cancel, teardown and
-capability loss emit cancellation and clear every held contact. One active
-seat is supported: Quoin chooses the first advertised capable seat and fails
-over after its removal.
+capability loss emit cancellation and clear every held contact. Quoin chooses
+the first advertised seat independently for pointer, keyboard and touch, and
+fails each capability over after its selected seat is removed.
 
 The pure `CornerDetector` remains a development-host tuning tool and is not a
 production reveal source.
@@ -198,10 +198,11 @@ This arc vendors nothing and edits no Smithay source. Quoin consumes
 
 ## Known limits
 
-This host deliberately supports one output runtime and one active seat. It
-does not mirror panels across several outputs or merge simultaneous input from
-several seats. Use `--output NAME` when advertisement-order selection is not
-appropriate.
+This host deliberately supports one output runtime and one active device per
+input capability. It does not mirror panels across several outputs; pointer,
+keyboard and touch may come from different seats when the compositor splits
+those capabilities. Use `--output NAME` when advertisement-order selection is
+not appropriate.
 
 Destroy-and-recreate is required because the current compositor rejects an
 acknowledgement for a configure serial retained across unmap. If the

@@ -437,6 +437,7 @@ impl PanelSurface {
                 resolution: bevy::window::WindowResolution::new(1, 1)
                     .with_scale_factor_override(1.0),
                 transparent: true,
+                focused: false,
                 composite_alpha_mode: CompositeAlphaMode::PreMultiplied,
                 ..default()
             })

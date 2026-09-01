@@ -77,12 +77,9 @@ struct RepeatingKey {
 pub(crate) struct KeyboardBridge {
     focus: Option<KeyboardFocus>,
     pressed: BTreeMap<u32, MappedKey>,
-    modifiers: Modifiers,
-    layout: u32,
     repeat_settings: Option<RepeatSettings>,
     repeating: Option<RepeatingKey>,
     keymap: Option<xkb::Keymap>,
-    xkb_state: Option<xkb::State>,
     diagnostics: u64,
 }
 
@@ -103,7 +100,7 @@ impl KeyboardBridge {
             self.cancel_repeat();
             return false;
         };
-        self.xkb_state = Some(xkb::State::new(&keymap));
+        self.cancel_repeat();
         self.keymap = Some(keymap);
         true
     }
@@ -122,7 +119,7 @@ impl KeyboardBridge {
             surface: Some(target.surface.clone()),
             window: target.window,
         });
-        self.reset_xkb_state();
+        set_window_focused(app, target.window, true);
         emit_window(
             app,
             WindowFocused {
@@ -131,7 +128,6 @@ impl KeyboardBridge {
             },
         );
         for (&raw_code, &keysym) in raw.iter().zip(keysyms) {
-            self.update_xkb_key(raw_code, xkb::KeyDirection::Down);
             let mapped = map_key(raw_code, keysym, None);
             emit_keyboard(app, target.window, &mapped, ButtonState::Pressed, false);
             self.pressed.insert(raw_code, mapped);
@@ -155,14 +151,16 @@ impl KeyboardBridge {
             self.reject("key-without-focus");
             return false;
         };
-        self.update_xkb_key(event.raw_code, xkb::KeyDirection::Down);
         let mapped = map_key(event.raw_code, event.keysym, event.utf8);
         emit_keyboard(app, window, &mapped, ButtonState::Pressed, false);
         self.pressed.insert(event.raw_code, mapped.clone());
+        // wl_keyboard repeat semantics make every later key press replace the
+        // current candidate. A non-repeatable modifier therefore stops repeat
+        // instead of forcing us to reconstruct compositor-private XKB masks.
+        self.cancel_repeat();
         if self.key_repeats(event.raw_code)
             && let Some(settings) = self.repeat_settings
         {
-            self.cancel_repeat();
             self.repeating = Some(RepeatingKey {
                 key: mapped,
                 next_deadline: elapsed.saturating_add(settings.delay),
@@ -175,7 +173,6 @@ impl KeyboardBridge {
         let Some(window) = self.focus.as_ref().map(|focus| focus.window) else {
             return false;
         };
-        self.update_xkb_key(event.raw_code, xkb::KeyDirection::Up);
         let mapped = self
             .pressed
             .remove(&event.raw_code)
@@ -191,11 +188,10 @@ impl KeyboardBridge {
         true
     }
 
-    pub(crate) fn update_modifiers(&mut self, modifiers: Modifiers, layout: u32) {
-        self.modifiers = modifiers;
-        self.layout = layout;
-        self.apply_xkb_modifiers();
-        self.refresh_repeating_key();
+    pub(crate) fn update_modifiers(&mut self, _modifiers: Modifiers, _layout: u32) {
+        // Physical modifier keys already enter Bevy through press/release.
+        // SCTK deliberately exposes only an effective six-boolean summary
+        // here, not the raw XKB masks needed to reinterpret text losslessly.
     }
 
     pub(crate) fn update_repeat_info(&mut self, info: RepeatInfo, elapsed: Duration) {
@@ -254,8 +250,7 @@ impl KeyboardBridge {
             emit_keyboard(app, focus.window, &mapped, ButtonState::Released, false);
         }
         self.cancel_repeat();
-        self.modifiers = Modifiers::default();
-        self.layout = 0;
+        set_window_focused(app, focus.window, false);
         emit_window(
             app,
             WindowFocused {
@@ -266,7 +261,6 @@ impl KeyboardBridge {
         if emit_global_loss {
             emit_window(app, KeyboardFocusLost);
         }
-        self.reset_xkb_state();
         true
     }
 
@@ -278,59 +272,6 @@ impl KeyboardBridge {
 
     fn cancel_repeat(&mut self) {
         self.repeating = None;
-    }
-
-    fn reset_xkb_state(&mut self) {
-        self.xkb_state = self.keymap.as_ref().map(xkb::State::new);
-    }
-
-    fn update_xkb_key(&mut self, raw_code: u32, direction: xkb::KeyDirection) {
-        if let Some(state) = self.xkb_state.as_mut() {
-            state.update_key(xkb::Keycode::new(raw_code.saturating_add(8)), direction);
-        }
-    }
-
-    fn apply_xkb_modifiers(&mut self) {
-        let (Some(keymap), Some(state)) = (self.keymap.as_ref(), self.xkb_state.as_mut()) else {
-            return;
-        };
-        let mut depressed = 0;
-        let mut locked = 0;
-        for (active, name) in [
-            (self.modifiers.shift, xkb::MOD_NAME_SHIFT),
-            (self.modifiers.ctrl, xkb::MOD_NAME_CTRL),
-            (self.modifiers.alt, xkb::MOD_NAME_ALT),
-            (self.modifiers.logo, xkb::MOD_NAME_LOGO),
-        ] {
-            let index = keymap.mod_get_index(name);
-            if active && index != xkb::MOD_INVALID {
-                depressed |= 1_u32.checked_shl(index).unwrap_or(0);
-            }
-        }
-        for (active, name) in [
-            (self.modifiers.caps_lock, xkb::MOD_NAME_CAPS),
-            (self.modifiers.num_lock, xkb::MOD_NAME_NUM),
-        ] {
-            let index = keymap.mod_get_index(name);
-            if active && index != xkb::MOD_INVALID {
-                locked |= 1_u32.checked_shl(index).unwrap_or(0);
-            }
-        }
-        state.update_mask(depressed, 0, locked, 0, 0, self.layout);
-    }
-
-    fn refresh_repeating_key(&mut self) {
-        let (Some(state), Some(repeating)) = (self.xkb_state.as_ref(), self.repeating.as_mut())
-        else {
-            return;
-        };
-        let keycode = xkb::Keycode::new(repeating.key.raw_code.saturating_add(8));
-        let text = state.key_get_utf8(keycode);
-        repeating.key = map_key(
-            repeating.key.raw_code,
-            state.key_get_one_sym(keycode),
-            (!text.is_empty()).then_some(text),
-        );
     }
 
     fn reject(&mut self, reason: &'static str) {
@@ -346,15 +287,16 @@ impl KeyboardBridge {
 }
 
 fn map_key(raw_code: u32, keysym: Keysym, text: Option<String>) -> MappedKey {
+    let key_code = convert_physical_key_code(PhysicalKey::from_scancode(raw_code));
     MappedKey {
         raw_code,
-        key_code: convert_physical_key_code(PhysicalKey::from_scancode(raw_code)),
-        logical_key: logical_key(keysym),
+        key_code,
+        logical_key: logical_key(keysym, key_code),
         text: text.filter(|value| !value.is_empty()),
     }
 }
 
-fn logical_key(keysym: Keysym) -> Key {
+fn logical_key(keysym: Keysym, key_code: KeyCode) -> Key {
     match keysym {
         Keysym::BackSpace => Key::Backspace,
         Keysym::Tab | Keysym::ISO_Left_Tab => Key::Tab,
@@ -388,10 +330,94 @@ fn logical_key(keysym: Keysym) -> Key {
         Keysym::F10 => Key::F10,
         Keysym::F11 => Key::F11,
         Keysym::F12 => Key::F12,
+        _ if (0xfe50..=0xfe6f).contains(&keysym.raw()) => {
+            let character =
+                char::from_u32(xkb::keysym_to_utf32(keysym)).filter(|value| *value != '\0');
+            Key::Dead(character)
+        }
         _ => keysym.key_char().map_or_else(
-            || Key::Unidentified(NativeKey::Xkb(keysym.raw())),
+            || {
+                named_key_from_physical(key_code)
+                    .unwrap_or(Key::Unidentified(NativeKey::Xkb(keysym.raw())))
+            },
             |character| Key::Character(character.to_string().into()),
         ),
+    }
+}
+
+fn named_key_from_physical(key_code: KeyCode) -> Option<Key> {
+    Some(match key_code {
+        KeyCode::ContextMenu => Key::ContextMenu,
+        KeyCode::Help => Key::Help,
+        KeyCode::PrintScreen => Key::PrintScreen,
+        KeyCode::ScrollLock => Key::ScrollLock,
+        KeyCode::Pause => Key::Pause,
+        KeyCode::BrowserBack => Key::BrowserBack,
+        KeyCode::BrowserFavorites => Key::BrowserFavorites,
+        KeyCode::BrowserForward => Key::BrowserForward,
+        KeyCode::BrowserHome => Key::BrowserHome,
+        KeyCode::BrowserRefresh => Key::BrowserRefresh,
+        KeyCode::BrowserSearch => Key::BrowserSearch,
+        KeyCode::BrowserStop => Key::BrowserStop,
+        KeyCode::Eject => Key::Eject,
+        KeyCode::LaunchApp1 => Key::LaunchApplication1,
+        KeyCode::LaunchApp2 => Key::LaunchApplication2,
+        KeyCode::LaunchMail => Key::LaunchMail,
+        KeyCode::MediaPlayPause => Key::MediaPlayPause,
+        KeyCode::MediaSelect => Key::LaunchMediaPlayer,
+        KeyCode::MediaStop => Key::MediaStop,
+        KeyCode::MediaTrackNext => Key::MediaTrackNext,
+        KeyCode::MediaTrackPrevious => Key::MediaTrackPrevious,
+        KeyCode::Power => Key::Power,
+        KeyCode::Sleep => Key::Standby,
+        KeyCode::AudioVolumeDown => Key::AudioVolumeDown,
+        KeyCode::AudioVolumeMute => Key::AudioVolumeMute,
+        KeyCode::AudioVolumeUp => Key::AudioVolumeUp,
+        KeyCode::WakeUp => Key::WakeUp,
+        KeyCode::Again => Key::Again,
+        KeyCode::Copy => Key::Copy,
+        KeyCode::Cut => Key::Cut,
+        KeyCode::Find => Key::Find,
+        KeyCode::Open => Key::Open,
+        KeyCode::Paste => Key::Paste,
+        KeyCode::Props => Key::Props,
+        KeyCode::Select => Key::Select,
+        KeyCode::Undo => Key::Undo,
+        KeyCode::Convert => Key::Convert,
+        KeyCode::KanaMode => Key::KanaMode,
+        KeyCode::NonConvert => Key::NonConvert,
+        KeyCode::Hiragana => Key::Hiragana,
+        KeyCode::Katakana => Key::Katakana,
+        KeyCode::F13 => Key::F13,
+        KeyCode::F14 => Key::F14,
+        KeyCode::F15 => Key::F15,
+        KeyCode::F16 => Key::F16,
+        KeyCode::F17 => Key::F17,
+        KeyCode::F18 => Key::F18,
+        KeyCode::F19 => Key::F19,
+        KeyCode::F20 => Key::F20,
+        KeyCode::F21 => Key::F21,
+        KeyCode::F22 => Key::F22,
+        KeyCode::F23 => Key::F23,
+        KeyCode::F24 => Key::F24,
+        KeyCode::F25 => Key::F25,
+        KeyCode::F26 => Key::F26,
+        KeyCode::F27 => Key::F27,
+        KeyCode::F28 => Key::F28,
+        KeyCode::F29 => Key::F29,
+        KeyCode::F30 => Key::F30,
+        KeyCode::F31 => Key::F31,
+        KeyCode::F32 => Key::F32,
+        KeyCode::F33 => Key::F33,
+        KeyCode::F34 => Key::F34,
+        KeyCode::F35 => Key::F35,
+        _ => return None,
+    })
+}
+
+fn set_window_focused(app: &mut App, window: Entity, focused: bool) {
+    if let Some(mut window) = app.world_mut().get_mut::<Window>(window) {
+        window.focused = focused;
     }
 }
 
@@ -1467,7 +1493,6 @@ mod tests {
         let mut bridge = KeyboardBridge::default();
         assert!(bridge.install_keymap_text(keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)));
         assert!(bridge.keymap.is_some());
-        assert!(bridge.xkb_state.is_some());
 
         bridge.update_repeat_info(
             RepeatInfo::Repeat {
@@ -1483,7 +1508,7 @@ mod tests {
     }
 
     #[test]
-    fn xkb_key_text_modifier_and_repeat_mapping_is_exact() {
+    fn xkb_key_text_and_repeat_mapping_is_exact() {
         let (mut app, window) = keyboard_app();
         let keymap = us_keymap();
         let mut bridge = KeyboardBridge {
@@ -1491,17 +1516,9 @@ mod tests {
                 surface: None,
                 window,
             }),
-            xkb_state: Some(xkb::State::new(&keymap)),
             keymap: Some(keymap),
             ..Default::default()
         };
-        bridge.update_modifiers(
-            Modifiers {
-                shift: true,
-                ..Default::default()
-            },
-            0,
-        );
         bridge.update_repeat_info(
             RepeatInfo::Repeat {
                 rate: std::num::NonZeroU32::new(20).unwrap(),
@@ -1517,12 +1534,9 @@ mod tests {
         };
 
         assert!(bridge.press(&mut app, press.clone(), Duration::from_secs(1)));
-        bridge.update_modifiers(Modifiers::default(), 0);
         assert_eq!(bridge.repeat_deadline(), Some(Duration::from_millis(1_200)));
         assert!(!bridge.fire_repeat(&mut app, Duration::from_millis(1_199)));
         assert!(bridge.fire_repeat(&mut app, Duration::from_millis(1_200)));
-        assert!(!bridge.modifiers.shift);
-        assert_eq!(bridge.layout, 0);
 
         let events = app
             .world_mut()
@@ -1536,8 +1550,8 @@ mod tests {
         assert_eq!(events[0].text.as_deref(), Some("A"));
         assert!(!events[0].repeat);
         assert!(events[1].repeat);
-        assert_eq!(events[1].logical_key, Key::Character("a".into()));
-        assert_eq!(events[1].text.as_deref(), Some("a"));
+        assert_eq!(events[1].logical_key, Key::Character("A".into()));
+        assert_eq!(events[1].text.as_deref(), Some("A"));
 
         assert!(bridge.release(
             &mut app,
@@ -1548,6 +1562,74 @@ mod tests {
         ));
         assert_eq!(bridge.repeat_deadline(), None);
         assert!(bridge.pressed.is_empty());
+    }
+
+    #[test]
+    fn modifier_press_maps_and_replaces_the_repeat_candidate() {
+        let (mut app, window) = keyboard_app();
+        let mut bridge = KeyboardBridge {
+            focus: Some(KeyboardFocus {
+                surface: None,
+                window,
+            }),
+            keymap: Some(us_keymap()),
+            repeat_settings: Some(RepeatSettings {
+                delay: Duration::from_millis(200),
+                gap: Duration::from_millis(50),
+            }),
+            ..Default::default()
+        };
+        bridge.press(
+            &mut app,
+            SctkKeyEvent {
+                time: 10,
+                raw_code: 30,
+                keysym: Keysym::a,
+                utf8: Some("a".to_owned()),
+            },
+            Duration::ZERO,
+        );
+        assert!(bridge.repeat_deadline().is_some());
+
+        bridge.press(
+            &mut app,
+            SctkKeyEvent {
+                time: 11,
+                raw_code: 42,
+                keysym: Keysym::Shift_L,
+                utf8: None,
+            },
+            Duration::from_millis(10),
+        );
+        bridge.update_modifiers(
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+            0,
+        );
+
+        assert_eq!(bridge.repeat_deadline(), None);
+        let events = app
+            .world_mut()
+            .resource_mut::<Messages<KeyboardInput>>()
+            .drain()
+            .collect::<Vec<_>>();
+        assert_eq!(events[1].logical_key, Key::Shift);
+        assert_eq!(events[1].key_code, KeyCode::ShiftLeft);
+    }
+
+    #[test]
+    fn named_and_dead_keys_do_not_collapse_to_unidentified() {
+        assert_eq!(
+            logical_key(Keysym::XF86_AudioRaiseVolume, KeyCode::AudioVolumeUp),
+            Key::AudioVolumeUp
+        );
+        assert!(matches!(
+            logical_key(Keysym::dead_acute, KeyCode::Quote),
+            Key::Dead(_)
+        ));
+        assert_eq!(logical_key(Keysym::F35, KeyCode::F35), Key::F35);
     }
 
     #[test]
@@ -1589,7 +1671,7 @@ mod tests {
         assert_eq!(events[1].state, ButtonState::Released);
         assert_eq!(events[0].key_code, events[1].key_code);
         assert_eq!(bridge.repeat_deadline(), None);
-        assert!(!bridge.modifiers.ctrl);
+        assert!(!app.world().get::<Window>(window).unwrap().focused);
         assert_eq!(
             app.world_mut()
                 .resource_mut::<Messages<KeyboardFocusLost>>()
@@ -1630,7 +1712,6 @@ mod tests {
                 surface: None,
                 window,
             }),
-            xkb_state: Some(xkb::State::new(&keymap)),
             keymap: Some(keymap),
             ..Default::default()
         };
