@@ -78,6 +78,51 @@ pub(crate) struct CornerBusStart {
     pub epoch: Arc<AtomicU64>,
 }
 
+fn start_worker_thread<F>(selected: OutputKey, body: F) -> CornerBusStart
+where
+    F: FnOnce(
+            watch::Receiver<(OutputKey, u64)>,
+            SyncSender<CornerIngress>,
+            Arc<AtomicBool>,
+            Arc<AtomicU64>,
+            watch::Receiver<bool>,
+        ) + Send
+        + 'static,
+{
+    let (sender, channel) = sync_channel(CHANNEL_CAPACITY);
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let epoch = Arc::new(AtomicU64::new(0));
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ack_tx, ack) = std_mpsc::sync_channel(1);
+    let (selected_tx, selected_rx) = watch::channel((selected, 0));
+    let worker_overflowed = overflowed.clone();
+    let worker_epoch = epoch.clone();
+    thread::Builder::new()
+        .name("quoin-corner-bus".to_owned())
+        .spawn(move || {
+            body(
+                selected_rx,
+                sender,
+                worker_overflowed,
+                worker_epoch,
+                shutdown_rx,
+            );
+            let _ = ack_tx.try_send(());
+        })
+        .expect("corner Bus worker thread must spawn");
+    CornerBusStart {
+        handle: CornerBusHandle {
+            shutdown,
+            ack,
+            selected_tx,
+            epoch: epoch.clone(),
+        },
+        channel,
+        overflowed,
+        epoch,
+    }
+}
+
 pub(crate) fn gate_ingress(
     event: CornerIngress,
     overflowed: &AtomicBool,
@@ -93,45 +138,26 @@ pub(crate) fn gate_ingress(
 }
 
 pub(crate) fn start(comp_service: String, selected: OutputKey) -> CornerBusStart {
-    let (sender, channel) = sync_channel(CHANNEL_CAPACITY);
-    let overflowed = Arc::new(AtomicBool::new(false));
-    let epoch = Arc::new(AtomicU64::new(0));
-    let (shutdown, shutdown_rx) = watch::channel(false);
-    let (ack_tx, ack) = std_mpsc::sync_channel(1);
-    let (selected_tx, selected_rx) = watch::channel((selected.clone(), 0));
-    let worker_overflowed = overflowed.clone();
-    let worker_epoch = epoch.clone();
-    thread::Builder::new()
-        .name("quoin-corner-bus".to_owned())
-        .spawn(move || {
+    let worker_selected = selected.clone();
+    start_worker_thread(
+        selected,
+        move |selected_rx, sender, overflowed, epoch, shutdown_rx| {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build();
             if let Ok(runtime) = runtime {
                 runtime.block_on(worker(
                     comp_service,
-                    selected,
+                    worker_selected,
                     selected_rx,
                     sender,
-                    worker_overflowed,
-                    worker_epoch,
+                    overflowed,
+                    epoch,
                     shutdown_rx,
                 ));
             }
-            let _ = ack_tx.try_send(());
-        })
-        .expect("corner Bus worker thread must spawn");
-    CornerBusStart {
-        handle: CornerBusHandle {
-            shutdown,
-            ack,
-            selected_tx,
-            epoch: epoch.clone(),
         },
-        channel,
-        overflowed,
-        epoch,
-    }
+    )
 }
 
 #[derive(Clone)]
@@ -381,6 +407,7 @@ impl WorkerState {
                     if !self.discard_until_refresh {
                         if self.queued.len() == CHANNEL_CAPACITY {
                             self.reset(sender, overflowed, shared_epoch);
+                            self.discard_until_refresh = true;
                             overflowed.store(true, Ordering::Release);
                         } else {
                             self.queued.push_back(corner);
@@ -2136,6 +2163,98 @@ mod tests {
     }
 
     #[test]
+    fn queued_corner_capacity_overflow_quarantines_until_refresh_install() {
+        let (sender, channel) = sync_channel(CHANNEL_CAPACITY + 4);
+        let overflow = AtomicBool::new(false);
+        let epoch = AtomicU64::new(0);
+        let mut state = WorkerState::new("comp", OutputKey::new("DP-1").unwrap());
+        state.map_valid = false;
+        for sequence in 0..CHANNEL_CAPACITY {
+            assert_eq!(
+                state.decode_and_apply(
+                    incoming(
+                        "comp.corner.entered",
+                        "corner.entered",
+                        &format!(
+                            r#"{{"output":"o_dp_1","corner":"tl","dwell_ms":200,"event_seq":{sequence}}}"#
+                        ),
+                    ),
+                    &sender,
+                    &overflow,
+                    &epoch,
+                ),
+                DecodeAction::None
+            );
+        }
+        assert_eq!(state.queued.len(), CHANNEL_CAPACITY);
+
+        state.decode_and_apply(
+            incoming(
+                "comp.corner.entered",
+                "corner.entered",
+                r#"{"output":"o_dp_1","corner":"bl","dwell_ms":200,"event_seq":64}"#,
+            ),
+            &sender,
+            &overflow,
+            &epoch,
+        );
+        assert!(state.discard_until_refresh);
+        assert!(state.queued.is_empty());
+        assert!(matches!(
+            channel.try_recv(),
+            Ok(CornerIngress::Reset { .. })
+        ));
+        overflow.store(false, Ordering::Release);
+
+        state.decode_and_apply(
+            incoming(
+                "comp.corner.entered",
+                "corner.entered",
+                r#"{"output":"o_dp_1","corner":"br","dwell_ms":200,"event_seq":65}"#,
+            ),
+            &sender,
+            &overflow,
+            &epoch,
+        );
+        state.install_outputs(
+            BTreeMap::from([("o_dp_1".to_owned(), OutputKey::new("DP-1").unwrap())]),
+            &sender,
+            &overflow,
+            &epoch,
+        );
+        assert!(
+            state.engaged.is_empty(),
+            "pre-refresh events stay quarantined"
+        );
+
+        state.decode_and_apply(
+            incoming(
+                "comp.corner.entered",
+                "corner.entered",
+                r#"{"output":"o_dp_1","corner":"tr","dwell_ms":200,"event_seq":66}"#,
+            ),
+            &sender,
+            &overflow,
+            &epoch,
+        );
+        assert!(
+            state
+                .engaged
+                .contains(&("o_dp_1".to_owned(), Corner::TopRight))
+        );
+        assert!(matches!(
+            channel.try_recv(),
+            Ok(CornerIngress::Event {
+                event: CornerEvent::Entered {
+                    corner: Corner::TopRight,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn real_session_loop_retries_failed_refresh_and_processes_enter_left() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2399,31 +2518,23 @@ mod tests {
         assert_eq!(attempts.get(), 1);
 
         for acknowledge in [true, false] {
-            let (ack_tx, ack) = std_mpsc::sync_channel(1);
-            let (selected_tx, _selected_rx) = watch::channel((OutputKey::new("DP-1").unwrap(), 0));
-            let (shutdown, mut shutdown_rx) = watch::channel(false);
-            thread::spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                runtime.block_on(async move {
-                    wait_shutdown(&mut shutdown_rx).await;
-                    if acknowledge {
-                        let _ = ack_tx.try_send(());
-                    } else {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                });
-            });
-            let handle = CornerBusHandle {
-                shutdown,
-                ack,
-                selected_tx,
-                epoch: Arc::new(AtomicU64::new(0)),
-            };
+            let started = start_worker_thread(
+                OutputKey::new("DP-1").unwrap(),
+                move |_selected_rx, _sender, _overflowed, _epoch, mut shutdown_rx| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    runtime.block_on(async move {
+                        wait_shutdown(&mut shutdown_rx).await;
+                        if !acknowledge {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    });
+                },
+            );
             let before = Instant::now();
-            assert_eq!(handle.shutdown(), acknowledge);
+            assert_eq!(started.handle.shutdown(), acknowledge);
             let elapsed = before.elapsed();
             if acknowledge {
                 assert!(elapsed < Duration::from_millis(300));

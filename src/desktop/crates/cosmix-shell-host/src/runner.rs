@@ -12,7 +12,7 @@ use bevy::app::{App, AppExit, Last, PluginGroup, TerminalCtrlCHandlerPlugin};
 use bevy::ecs::message::MessageReader;
 use bevy::prelude::*;
 use bevy::render::pipelined_rendering::PipelinedRenderingPlugin;
-use bevy::time::Real;
+use bevy::time::{Real, TimeUpdateStrategy};
 use bevy::window::{ExitCondition, RequestRedraw, WindowPlugin};
 use bevy::winit::WinitPlugin;
 #[cfg(target_os = "linux")]
@@ -65,7 +65,8 @@ use crate::output::{
 };
 use crate::planner::{OutputGeometry, ProtocolOp, committed_edge_margin, plan_surface};
 use crate::surface::{
-    ApplyResult, FractionalObjects, FrameCallbackData, PanelSurface, SurfacePhase, SurfaceTag,
+    ApplyResult, FractionalObjects, FrameCallbackData, PanelSurface, SurfacePhase,
+    SurfaceSizeError, SurfaceTag,
 };
 
 type ModelFactory = dyn Fn(OutputKey, LogicalSize) -> ShellModel + Send + Sync;
@@ -74,6 +75,7 @@ const ANIMATE_BACKSTOP: Duration = Duration::from_secs(1);
 const ANIMATE_BACKSTOP_QUANTUM: Duration = Duration::from_millis(250);
 const CONFIGURE_TIMEOUT: Duration = Duration::from_secs(10);
 const EARLY_TIMER_REARM_GUARD: Duration = Duration::from_millis(1);
+const MAX_CONSECUTIVE_PAST_DEADLINES: u8 = 16;
 
 #[derive(Resource, Default)]
 struct LayerHostUpdateWake(bool);
@@ -149,28 +151,47 @@ fn run_layer_host_app_update(app: &mut App) -> bool {
     redraw || staged
 }
 
-#[derive(Debug)]
-struct RunnerClock {
-    anchor: Instant,
-    elapsed: Duration,
+fn model_elapsed_at(time: &Time<Real>, instant: Instant) -> Duration {
+    time.last_update().map_or(Duration::ZERO, |last_update| {
+        time.elapsed()
+            .saturating_add(instant.saturating_duration_since(last_update))
+    })
 }
 
-impl RunnerClock {
-    fn new(elapsed: Duration) -> Self {
-        Self {
-            anchor: Instant::now(),
-            elapsed,
-        }
+fn update_sample_instant(app: &App, wake_timer: &WakeTimerState, now: Instant) -> Instant {
+    let Some(time) = app.world().get_resource::<Time<Real>>() else {
+        return now;
+    };
+    let elapsed = model_elapsed_at(time, now);
+    let force_due = wake_timer.fired_deadline.is_some_and(|deadline| {
+        wake_timer.early_rearmed_deadline == Some(deadline) && elapsed < deadline
+    });
+    if force_due {
+        now.checked_add(
+            wake_timer
+                .fired_deadline
+                .expect("force-due has a fired deadline")
+                .saturating_sub(elapsed),
+        )
+        .unwrap_or(now)
+    } else {
+        now
     }
+}
 
-    fn sync(&mut self, elapsed: Duration) {
-        self.anchor = Instant::now();
-        self.elapsed = elapsed;
-    }
-
-    fn elapsed(&self) -> Duration {
-        self.elapsed.saturating_add(self.anchor.elapsed())
-    }
+fn run_layer_host_app_update_at(app: &mut App, instant: Instant) -> bool {
+    let expected_elapsed = app
+        .world()
+        .get_resource::<Time<Real>>()
+        .map_or(Duration::ZERO, |time| model_elapsed_at(time, instant));
+    app.insert_resource(TimeUpdateStrategy::ManualInstant(instant));
+    let follow_up = run_layer_host_app_update(app);
+    let actual_elapsed = app
+        .world()
+        .get_resource::<Time<Real>>()
+        .map_or(Duration::ZERO, Time::elapsed);
+    debug_assert_eq!(actual_elapsed, expected_elapsed);
+    follow_up
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -285,6 +306,22 @@ fn handle_configure_success(
     *needs_update = true;
 }
 
+fn complete_configure_callback(
+    app: &mut App,
+    needs_update: &mut bool,
+    abnormal_exit: &mut bool,
+    exit_reason: &mut Option<String>,
+    result: Result<Option<(Edge, PanelMode)>, SurfaceSizeError>,
+) {
+    match result {
+        Ok(committed) => handle_configure_success(app, needs_update, committed),
+        Err(error) => {
+            *abnormal_exit = true;
+            *exit_reason = Some(format!("configure-out-of-range-{}", error.reason_suffix()));
+        }
+    }
+}
+
 fn layer_close_decision(output_live: bool, replacement_pending: bool) -> LayerCloseDecision {
     if output_live && !replacement_pending {
         LayerCloseDecision::Exit
@@ -324,6 +361,12 @@ fn next_timer_deadline(
         WakePolicy::Idle | WakePolicy::Animate => None,
         WakePolicy::WakeAt(deadline) => Some(deadline),
     };
+    let model_deadline = (policy != WakePolicy::Idle)
+        .then_some(model_deadline)
+        .flatten();
+    let animate_backstop = (policy == WakePolicy::Animate)
+        .then_some(animate_backstop)
+        .flatten();
     policy_deadline
         .into_iter()
         .chain(model_deadline)
@@ -374,36 +417,96 @@ fn observe_wake_timer_fire(elapsed: Duration, deadline: Duration) -> Option<Dura
 
 trait WakeTimerTarget {
     fn clear_wake_timer_registration(&mut self);
-    fn fresh_wake_elapsed(&self) -> Duration;
-    fn dispatch_wake_timer(&mut self, elapsed: Duration, deadline: Duration);
+    fn queue_wake_timer_fire(&mut self, deadline: Duration);
 }
 
 fn wake_timer_source_fired<S: WakeTimerTarget>(state: &mut S, deadline: Duration) {
     state.clear_wake_timer_registration();
-    let elapsed = state.fresh_wake_elapsed();
-    state.dispatch_wake_timer(elapsed, deadline);
+    state.queue_wake_timer_fire(deadline);
+}
+
+#[derive(Default)]
+struct WakeTimerState {
+    token: Option<RegistrationToken>,
+    deadline: Option<Duration>,
+    fired_deadline: Option<Duration>,
+    pending_early_rearm: Option<Duration>,
+    early_rearmed_deadline: Option<Duration>,
+    consecutive_past_deadlines: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueuedWake {
+    None,
+    Early(Duration),
+    Due(Duration),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PastDeadline {
+    NotPast,
+    DueNow { first: bool },
+    Stuck,
+}
+
+impl WakeTimerState {
+    fn observe_queued_fire(&mut self, elapsed: Duration) -> QueuedWake {
+        let Some(deadline) = self.fired_deadline.take() else {
+            return QueuedWake::None;
+        };
+        if observe_wake_timer_fire(elapsed, deadline).is_some() {
+            debug_assert_ne!(self.early_rearmed_deadline, Some(deadline));
+            self.pending_early_rearm = Some(deadline);
+            QueuedWake::Early(deadline)
+        } else {
+            QueuedWake::Due(deadline)
+        }
+    }
+
+    fn observe_next_deadline(
+        &mut self,
+        next_deadline: Option<Duration>,
+        elapsed: Duration,
+    ) -> PastDeadline {
+        if next_deadline.is_none_or(|deadline| deadline > elapsed) {
+            self.consecutive_past_deadlines = 0;
+            return PastDeadline::NotPast;
+        }
+        self.consecutive_past_deadlines = self.consecutive_past_deadlines.saturating_add(1);
+        if self.consecutive_past_deadlines >= MAX_CONSECUTIVE_PAST_DEADLINES {
+            PastDeadline::Stuck
+        } else {
+            PastDeadline::DueNow {
+                first: self.consecutive_past_deadlines == 1,
+            }
+        }
+    }
 }
 
 fn replace_wake_timer_source<S: WakeTimerTarget + 'static>(
     loop_handle: &LoopHandle<'_, S>,
-    timer_token: &mut Option<RegistrationToken>,
-    timer_deadline: &mut Option<Duration>,
-    early_rearm_deadline: &mut Option<Duration>,
+    timer: &mut WakeTimerState,
     next_deadline: Option<Duration>,
     elapsed: Duration,
 ) -> Result<(), LayerHostError> {
-    if *timer_deadline == next_deadline {
+    if timer.deadline == next_deadline {
         return Ok(());
     }
-    if let Some(token) = timer_token.take() {
+    if let Some(token) = timer.token.take() {
         loop_handle.remove(token);
     }
-    *timer_deadline = next_deadline;
+    if timer.deadline != next_deadline {
+        timer.early_rearmed_deadline = None;
+    }
+    timer.deadline = next_deadline;
     let Some(deadline) = next_deadline else {
-        *early_rearm_deadline = None;
+        timer.pending_early_rearm = None;
         return Ok(());
     };
-    let rearmed = early_rearm_deadline.take() == Some(deadline);
+    let rearmed = timer.pending_early_rearm.take() == Some(deadline);
+    if rearmed {
+        timer.early_rearmed_deadline = Some(deadline);
+    }
     let delay = wake_timer_delay(deadline, elapsed, rearmed);
     tracing::debug!(
         event = if rearmed {
@@ -421,7 +524,7 @@ fn replace_wake_timer_source<S: WakeTimerTarget + 'static>(
             TimeoutAction::Drop
         })
         .map_err(|error| LayerHostError::new(error.to_string()))?;
-    *timer_token = Some(token);
+    timer.token = Some(token);
     Ok(())
 }
 
@@ -538,10 +641,7 @@ struct RunnerState {
     needs_update: bool,
     last_wake: WakePolicy,
     last_wake_deadline: Option<Duration>,
-    timer_token: Option<RegistrationToken>,
-    timer_deadline: Option<Duration>,
-    early_rearm_deadline: Option<Duration>,
-    runner_clock: RunnerClock,
+    wake_timer: WakeTimerState,
     exit_reason: Option<String>,
     abnormal_exit: bool,
     ready_logged: bool,
@@ -557,16 +657,13 @@ struct RunnerState {
 
 impl WakeTimerTarget for RunnerState {
     fn clear_wake_timer_registration(&mut self) {
-        self.timer_deadline = None;
-        self.timer_token = None;
+        self.wake_timer.deadline = None;
+        self.wake_timer.token = None;
     }
 
-    fn fresh_wake_elapsed(&self) -> Duration {
-        self.runner_clock.elapsed()
-    }
-
-    fn dispatch_wake_timer(&mut self, elapsed: Duration, deadline: Duration) {
-        self.handle_wake_timer(elapsed, deadline);
+    fn queue_wake_timer_fire(&mut self, deadline: Duration) {
+        self.wake_timer.fired_deadline = Some(deadline);
+        self.needs_update = true;
     }
 }
 
@@ -646,6 +743,109 @@ impl RunnerState {
     }
 }
 
+trait RunnerIteration<Context> {
+    fn begin_update(&mut self, now: Instant);
+    fn app_exit(&mut self) -> Option<AppExit>;
+    fn record_app_exit(&mut self, exit: AppExit);
+    fn reconcile_iteration(&mut self, context: &Context) -> Result<(), LayerHostError>;
+    fn replace_timer_iteration(&mut self, context: &Context) -> Result<(), LayerHostError>;
+    fn flush_iteration(&mut self, context: &Context) -> Result<(), LayerHostError>;
+    fn fail_iteration(&mut self, stage: &'static str, error: LayerHostError);
+}
+
+fn run_update_iteration<State, Context>(state: &mut State, context: &Context, now: Instant)
+where
+    State: RunnerIteration<Context>,
+{
+    state.begin_update(now);
+    if let Some(exit) = state.app_exit() {
+        state.record_app_exit(exit);
+        return;
+    }
+    if let Err(error) = state.reconcile_iteration(context) {
+        state.fail_iteration("surface-plan", error);
+        return;
+    }
+    if let Err(error) = state.replace_timer_iteration(context) {
+        state.fail_iteration("wake-timer", error);
+        return;
+    }
+    if let Err(error) = state.flush_iteration(context) {
+        state.fail_iteration("wayland-flush", error);
+    }
+}
+
+impl<'loop_handle>
+    RunnerIteration<(
+        &QueueHandle<RunnerState>,
+        &LoopHandle<'loop_handle, RunnerState>,
+    )> for RunnerState
+{
+    fn begin_update(&mut self, now: Instant) {
+        self.needs_update = false;
+        let sample = update_sample_instant(&self.app, &self.wake_timer, now);
+        if run_layer_host_app_update_at(&mut self.app, sample) {
+            self.needs_update = true;
+        }
+        let elapsed = self
+            .app
+            .world()
+            .get_resource::<Time<Real>>()
+            .map_or(Duration::ZERO, Time::elapsed);
+        self.handle_queued_wake_timer(elapsed);
+    }
+
+    fn app_exit(&mut self) -> Option<AppExit> {
+        self.app.should_exit()
+    }
+
+    fn record_app_exit(&mut self, exit: AppExit) {
+        self.abnormal_exit = exit.is_error();
+        self.exit_reason = Some(if exit.is_error() {
+            "bevy-app-error".to_owned()
+        } else {
+            "bevy-app-exit".to_owned()
+        });
+    }
+
+    fn reconcile_iteration(
+        &mut self,
+        context: &(
+            &QueueHandle<RunnerState>,
+            &LoopHandle<'loop_handle, RunnerState>,
+        ),
+    ) -> Result<(), LayerHostError> {
+        self.reconcile_live(context.0)
+    }
+
+    fn replace_timer_iteration(
+        &mut self,
+        context: &(
+            &QueueHandle<RunnerState>,
+            &LoopHandle<'loop_handle, RunnerState>,
+        ),
+    ) -> Result<(), LayerHostError> {
+        self.replace_wake_timer(context.1)
+    }
+
+    fn flush_iteration(
+        &mut self,
+        _context: &(
+            &QueueHandle<RunnerState>,
+            &LoopHandle<'loop_handle, RunnerState>,
+        ),
+    ) -> Result<(), LayerHostError> {
+        self.connection
+            .flush()
+            .map_err(|error| LayerHostError::new(error.to_string()))
+    }
+
+    fn fail_iteration(&mut self, stage: &'static str, error: LayerHostError) {
+        self.abnormal_exit = true;
+        self.exit_reason = Some(format!("{stage}-failed-{error}"));
+    }
+}
+
 fn run_layer_host(
     mut app: App,
     config: LayerHostConfig,
@@ -701,10 +901,7 @@ fn run_layer_host(
         needs_update: true,
         last_wake: WakePolicy::Idle,
         last_wake_deadline: None,
-        timer_token: None,
-        timer_deadline: None,
-        early_rearm_deadline: None,
-        runner_clock: RunnerClock::new(Duration::ZERO),
+        wake_timer: WakeTimerState::default(),
         exit_reason: None,
         abnormal_exit: false,
         ready_logged: false,
@@ -855,40 +1052,7 @@ fn run_layer_host(
             break;
         }
         if state.needs_update {
-            state.needs_update = false;
-            if run_layer_host_app_update(&mut state.app) {
-                state.needs_update = true;
-            }
-            let elapsed = state
-                .app
-                .world()
-                .get_resource::<Time<Real>>()
-                .map_or(Duration::ZERO, Time::elapsed);
-            state.runner_clock.sync(elapsed);
-            if let Some(exit) = state.app.should_exit() {
-                state.abnormal_exit = exit.is_error();
-                state.exit_reason = Some(if exit.is_error() {
-                    "bevy-app-error".to_owned()
-                } else {
-                    "bevy-app-exit".to_owned()
-                });
-                continue;
-            }
-            if let Err(error) = state.reconcile_live(&qh) {
-                state.abnormal_exit = true;
-                state.exit_reason = Some(format!("surface-plan-failed-{error}"));
-                continue;
-            }
-            if let Err(error) = state.replace_wake_timer(&loop_handle) {
-                state.abnormal_exit = true;
-                state.exit_reason = Some(format!("wake-timer-failed-{error}"));
-                continue;
-            }
-            if let Err(error) = state.connection.flush() {
-                state.abnormal_exit = true;
-                state.exit_reason = Some(format!("wayland-flush-failed-{error}"));
-                continue;
-            }
+            run_update_iteration(&mut state, &(&qh, &loop_handle), Instant::now());
         }
         if state.needs_update || state.exit_reason.is_some() || state.replacement_needed {
             continue;
@@ -922,7 +1086,7 @@ fn state_setup_error(mut state: RunnerState, reason: String) -> AppExit {
 }
 
 fn state_exit(mut state: RunnerState, reason: &str, abnormal: bool) -> AppExit {
-    state.timer_token = None;
+    state.wake_timer.token = None;
     state.apply_corner_ingress(CornerIngress::Reset {
         epoch: state.corner_epoch,
     });
@@ -1104,7 +1268,7 @@ impl RunnerState {
         }
         self.last_wake = WakePolicy::Idle;
         self.last_wake_deadline = None;
-        self.early_rearm_deadline = None;
+        self.wake_timer = WakeTimerState::default();
         self.needs_update = true;
         Ok(())
     }
@@ -1230,34 +1394,52 @@ impl RunnerState {
             animate_backstop,
             &configure_deadlines,
         );
-        if let Some(deadline) = next_deadline
-            && deadline <= elapsed
-        {
-            tracing::warn!(
-                event = "quoin_wake_deadline_unconsumed",
-                elapsed_us = elapsed.as_micros(),
-                deadline_us = deadline.as_micros()
-            );
-            if let Some(token) = self.timer_token.take() {
-                loop_handle.remove(token);
+        let past = self
+            .wake_timer
+            .observe_next_deadline(next_deadline, elapsed);
+        match past {
+            PastDeadline::DueNow { .. } | PastDeadline::Stuck => {
+                let deadline = next_deadline.expect("past observation has a deadline");
+                if matches!(past, PastDeadline::DueNow { first: true }) {
+                    tracing::warn!(
+                        event = "quoin_wake_deadline_unconsumed",
+                        elapsed_us = elapsed.as_micros(),
+                        deadline_us = deadline.as_micros()
+                    );
+                }
+                if let Some(token) = self.wake_timer.token.take() {
+                    loop_handle.remove(token);
+                }
+                self.wake_timer.deadline = None;
+                self.wake_timer.pending_early_rearm = None;
+                self.handle_due_wake_timer(elapsed);
+                if past == PastDeadline::Stuck {
+                    tracing::error!(
+                        event = "quoin_wake_deadline_stuck",
+                        elapsed_us = elapsed.as_micros(),
+                        deadline_us = deadline.as_micros(),
+                        consecutive = self.wake_timer.consecutive_past_deadlines
+                    );
+                    self.abnormal_exit = true;
+                    self.exit_reason = Some("wake-deadline-stuck".to_owned());
+                }
+                return Ok(());
             }
-            self.timer_deadline = None;
-            self.abnormal_exit = true;
-            self.exit_reason = Some("wake-deadline-unconsumed".to_owned());
-            return Ok(());
+            PastDeadline::NotPast => {}
         }
-        replace_wake_timer_source(
-            loop_handle,
-            &mut self.timer_token,
-            &mut self.timer_deadline,
-            &mut self.early_rearm_deadline,
-            next_deadline,
-            elapsed,
-        )
+        replace_wake_timer_source(loop_handle, &mut self.wake_timer, next_deadline, elapsed)
     }
 
-    fn handle_wake_timer(&mut self, elapsed: Duration, deadline: Duration) {
-        self.early_rearm_deadline = observe_wake_timer_fire(elapsed, deadline);
+    fn handle_queued_wake_timer(&mut self, elapsed: Duration) {
+        if matches!(
+            self.wake_timer.observe_queued_fire(elapsed),
+            QueuedWake::Due(_)
+        ) {
+            self.handle_due_wake_timer(elapsed);
+        }
+    }
+
+    fn handle_due_wake_timer(&mut self, elapsed: Duration) {
         let configure_timeout = self
             .outputs
             .values()
@@ -1524,27 +1706,24 @@ impl LayerShellHandler for RunnerState {
             app,
             outputs,
             needs_update,
+            abnormal_exit,
+            exit_reason,
             ..
         } = self;
-        let mut configure_error = None;
-        let mut committed_mode = None;
-        if let Some(panel) = outputs
+        let result = if let Some(panel) = outputs
             .values_mut()
             .flat_map(|output| output.panels.iter_mut())
             .find(|panel| panel.matches_layer(layer))
         {
             // SCTK acknowledged the configure before invoking this callback.
             match panel.configure(app, qh, &configure, elapsed) {
-                Ok(mode) => committed_mode = mode.map(|mode| (panel.edge, mode)),
-                Err(error) => configure_error = Some(error),
+                Ok(mode) => Ok(mode.map(|mode| (panel.edge, mode))),
+                Err(error) => Err(error),
             }
-        }
-        if let Some(error) = configure_error {
-            self.abnormal_exit = true;
-            self.exit_reason = Some(format!("configure-out-of-range-{}", error.reason_suffix()));
         } else {
-            handle_configure_success(app, needs_update, committed_mode);
-        }
+            Ok(None)
+        };
+        complete_configure_callback(app, needs_update, abnormal_exit, exit_reason, result);
     }
 }
 
@@ -1898,27 +2077,124 @@ mod tests {
         app: App,
         output: OutputKey,
         needs_update: bool,
-        timer_token: Option<RegistrationToken>,
-        timer_deadline: Option<Duration>,
-        early_rearm_deadline: Option<Duration>,
+        wake_timer: WakeTimerState,
         fresh_elapsed: Duration,
         last_timer_delay: Option<Duration>,
         last_timer_rearmed: bool,
+        animate_requested_at: Option<Duration>,
+        abnormal_exit: bool,
+        exit_reason: Option<String>,
+        iteration_steps: Vec<&'static str>,
     }
 
     impl WakeTimerTarget for TestRunnerState {
         fn clear_wake_timer_registration(&mut self) {
-            self.timer_deadline = None;
-            self.timer_token = None;
+            self.wake_timer.deadline = None;
+            self.wake_timer.token = None;
         }
 
-        fn fresh_wake_elapsed(&self) -> Duration {
-            self.fresh_elapsed
-        }
-
-        fn dispatch_wake_timer(&mut self, elapsed: Duration, deadline: Duration) {
-            self.early_rearm_deadline = observe_wake_timer_fire(elapsed, deadline);
+        fn queue_wake_timer_fire(&mut self, deadline: Duration) {
+            self.wake_timer.fired_deadline = Some(deadline);
             self.needs_update = true;
+        }
+    }
+
+    impl<'loop_handle> RunnerIteration<LoopHandle<'loop_handle, TestRunnerState>> for TestRunnerState {
+        fn begin_update(&mut self, _now: Instant) {
+            self.iteration_steps.push("update");
+            self.needs_update = false;
+            let model_elapsed = self.app.world().resource::<Time<Real>>().elapsed();
+            if self.fresh_elapsed > model_elapsed {
+                *self.app.world_mut().resource_mut::<TimeUpdateStrategy>() =
+                    TimeUpdateStrategy::ManualDuration(self.fresh_elapsed - model_elapsed);
+            }
+            if let Some(deadline) = self.wake_timer.fired_deadline
+                && self.wake_timer.early_rearmed_deadline == Some(deadline)
+                && self.fresh_elapsed < deadline
+            {
+                *self.app.world_mut().resource_mut::<TimeUpdateStrategy>() =
+                    TimeUpdateStrategy::ManualDuration(deadline - model_elapsed);
+                self.fresh_elapsed = deadline;
+            }
+            if run_layer_host_app_update(&mut self.app) {
+                self.needs_update = true;
+            }
+            let elapsed = self.app.world().resource::<Time<Real>>().elapsed();
+            self.fresh_elapsed = self.fresh_elapsed.max(elapsed);
+            if matches!(
+                self.wake_timer.observe_queued_fire(self.fresh_elapsed),
+                QueuedWake::Due(_)
+            ) {
+                self.needs_update = true;
+            }
+        }
+
+        fn app_exit(&mut self) -> Option<AppExit> {
+            self.iteration_steps.push("should-exit");
+            self.app.should_exit()
+        }
+
+        fn record_app_exit(&mut self, exit: AppExit) {
+            self.abnormal_exit = exit.is_error();
+            self.exit_reason = Some("test-app-exit".to_owned());
+        }
+
+        fn reconcile_iteration(
+            &mut self,
+            _handle: &LoopHandle<'loop_handle, TestRunnerState>,
+        ) -> Result<(), LayerHostError> {
+            self.iteration_steps.push("reconcile");
+            Ok(())
+        }
+
+        fn replace_timer_iteration(
+            &mut self,
+            handle: &LoopHandle<'loop_handle, TestRunnerState>,
+        ) -> Result<(), LayerHostError> {
+            self.iteration_steps.push("replace-timer");
+            let elapsed = self.app.world().resource::<Time<Real>>().elapsed();
+            let frame = &self.app.world().resource::<ShellFrameState>().0;
+            let animate_backstop = self.animate_requested_at.map(animate_backstop_deadline);
+            let next_deadline =
+                next_timer_deadline(frame.wake, frame.wake_deadline, animate_backstop, &[]);
+            let past = self
+                .wake_timer
+                .observe_next_deadline(next_deadline, self.fresh_elapsed);
+            if past != PastDeadline::NotPast {
+                if let Some(token) = self.wake_timer.token.take() {
+                    handle.remove(token);
+                }
+                self.wake_timer.deadline = None;
+                self.wake_timer.pending_early_rearm = None;
+                self.animate_requested_at = None;
+                self.needs_update = true;
+                if past == PastDeadline::Stuck {
+                    self.abnormal_exit = true;
+                    self.exit_reason = Some("wake-deadline-stuck".to_owned());
+                }
+                return Ok(());
+            }
+            if self.wake_timer.deadline != next_deadline
+                && let Some(deadline) = next_deadline
+            {
+                self.last_timer_rearmed = self.wake_timer.pending_early_rearm == Some(deadline);
+                self.last_timer_delay =
+                    Some(wake_timer_delay(deadline, elapsed, self.last_timer_rearmed));
+            }
+            replace_wake_timer_source(handle, &mut self.wake_timer, next_deadline, elapsed)
+        }
+
+        fn flush_iteration(
+            &mut self,
+            _handle: &LoopHandle<'loop_handle, TestRunnerState>,
+        ) -> Result<(), LayerHostError> {
+            self.iteration_steps.push("flush");
+            Ok(())
+        }
+
+        fn fail_iteration(&mut self, stage: &'static str, error: LayerHostError) {
+            self.abnormal_exit = true;
+            self.exit_reason = Some(format!("{stage}-failed-{error}"));
         }
     }
 
@@ -1927,45 +2203,19 @@ mod tests {
         handle: &LoopHandle<'_, TestRunnerState>,
     ) {
         assert!(state.needs_update);
-        state.needs_update = false;
-        if run_layer_host_app_update(&mut state.app) {
-            state.needs_update = true;
-        }
-        let elapsed = state.app.world().resource::<Time<Real>>().elapsed();
-        state.fresh_elapsed = state.fresh_elapsed.max(elapsed);
-        let frame = &state.app.world().resource::<ShellFrameState>().0;
-        let next_deadline = next_timer_deadline(frame.wake, frame.wake_deadline, None, &[]);
-        if state.timer_deadline != next_deadline
-            && let Some(deadline) = next_deadline
-        {
-            state.last_timer_rearmed = state.early_rearm_deadline == Some(deadline);
-            state.last_timer_delay = Some(wake_timer_delay(
-                deadline,
-                elapsed,
-                state.last_timer_rearmed,
-            ));
-        }
-        replace_wake_timer_source(
-            handle,
-            &mut state.timer_token,
-            &mut state.timer_deadline,
-            &mut state.early_rearm_deadline,
-            next_deadline,
-            elapsed,
-        )
-        .unwrap();
+        run_update_iteration(state, handle, Instant::now());
     }
 
     fn force_test_timer_one_quantum_early(
         state: &mut TestRunnerState,
         handle: &LoopHandle<'_, TestRunnerState>,
     ) {
-        let deadline = state.timer_deadline.expect("grace timer is armed");
-        if let Some(token) = state.timer_token.take() {
+        let deadline = state.wake_timer.deadline.expect("grace timer is armed");
+        if let Some(token) = state.wake_timer.token.take() {
             handle.remove(token);
         }
-        state.timer_deadline = Some(deadline);
-        state.timer_token = Some(
+        state.wake_timer.deadline = Some(deadline);
+        state.wake_timer.token = Some(
             handle
                 .insert_source(Timer::immediate(), move |_, _, state| {
                     wake_timer_source_fired(state, deadline);
@@ -2027,6 +2277,12 @@ mod tests {
                 input: cosmix_shell::core::PanelInput::Pin,
             },
         );
+    }
+
+    fn refuse_to_consume_wake_deadline(mut frame: ResMut<ShellFrameState>) {
+        let deadline = Duration::from_millis(1);
+        frame.0.wake = WakePolicy::WakeAt(deadline);
+        frame.0.wake_deadline = Some(deadline);
     }
 
     impl ProtocolExecutor for ScriptedExecutor {
@@ -2368,11 +2624,21 @@ mod tests {
             .commit_pending_configure()
             .map(|mode| (Edge::Left, mode));
         let mut configure_wake = false;
-        handle_configure_success(&mut app, &mut configure_wake, configured);
+        let mut configure_abnormal = false;
+        let mut configure_exit_reason = None;
+        complete_configure_callback(
+            &mut app,
+            &mut configure_wake,
+            &mut configure_abnormal,
+            &mut configure_exit_reason,
+            Ok(configured),
+        );
         assert!(
             configure_wake,
-            "the production configure seam wakes the loop"
+            "deleting the production configure completion call loses this wake"
         );
+        assert!(!configure_abnormal);
+        assert_eq!(configure_exit_reason, None);
         assert_eq!(
             app.world()
                 .resource::<QuoinCommittedMotionModes>()
@@ -2639,12 +2905,14 @@ mod tests {
                 app,
                 output: output.clone(),
                 needs_update: false,
-                timer_token: None,
-                timer_deadline: None,
-                early_rearm_deadline: None,
+                wake_timer: WakeTimerState::default(),
                 fresh_elapsed: Duration::ZERO,
                 last_timer_delay: None,
                 last_timer_rearmed: false,
+                animate_requested_at: None,
+                abnormal_exit: false,
+                exit_reason: None,
+                iteration_steps: Vec::new(),
             };
             let mut event_loop: EventLoop<TestRunnerState> = EventLoop::try_new().unwrap();
             let handle = event_loop.handle();
@@ -2670,7 +2938,29 @@ mod tests {
                 }))
                 .unwrap();
             event_loop.dispatch(None, &mut state).unwrap();
+            if iteration == 0 {
+                state.animate_requested_at = Some(Duration::ZERO);
+                state.fresh_elapsed = Duration::from_millis(1_600);
+            }
             drive_test_runner_update(&mut state, &handle);
+
+            if iteration == 0 {
+                assert_eq!(
+                    state.iteration_steps,
+                    [
+                        "update",
+                        "should-exit",
+                        "reconcile",
+                        "replace-timer",
+                        "flush"
+                    ],
+                    "deleting or reordering a production update-iteration phase breaks this"
+                );
+                assert!(state.needs_update, "a past backstop is due-now");
+                assert!(!state.abnormal_exit, "a slow first map is recoverable");
+                assert_eq!(state.exit_reason, None);
+                drive_test_runner_update(&mut state, &handle);
+            }
 
             let revealed = state
                 .app
@@ -2690,7 +2980,7 @@ mod tests {
                 .unwrap();
             event_loop.dispatch(None, &mut state).unwrap();
             drive_test_runner_update(&mut state, &handle);
-            let deadline = state.timer_deadline.expect("left arms grace timer");
+            let deadline = state.wake_timer.deadline.expect("left arms grace timer");
             let now = state.app.world().resource::<Time<Real>>().elapsed();
             let before = deadline - Duration::from_millis(1);
             *state.app.world_mut().resource_mut::<TimeUpdateStrategy>() =
@@ -2715,24 +3005,28 @@ mod tests {
                 PanelMode::Revealed,
                 "iteration {iteration}: early timer must not conceal"
             );
-            assert_eq!(state.timer_deadline, Some(deadline));
-            assert!(state.timer_token.is_some(), "early timer must re-arm");
+            assert_eq!(state.wake_timer.deadline, Some(deadline));
+            assert!(state.wake_timer.token.is_some(), "early timer must re-arm");
             assert!(state.last_timer_rearmed);
             assert_eq!(state.last_timer_delay, Some(Duration::from_millis(2)));
 
-            let after = deadline + Duration::from_millis(201);
-            let elapsed = state.app.world().resource::<Time<Real>>().elapsed();
-            *state.app.world_mut().resource_mut::<TimeUpdateStrategy>() =
-                TimeUpdateStrategy::ManualDuration(after - elapsed);
-            state.fresh_elapsed = after;
+            force_test_timer_one_quantum_early(&mut state, &handle);
             event_loop.dispatch(None, &mut state).unwrap();
+            drive_test_runner_update(&mut state, &handle);
+            assert!(
+                state.wake_timer.token.is_none(),
+                "iteration {iteration}: the second early firing is due-now, never a third arm"
+            );
+            let conceal_effects = state.app.world().resource::<ShellEffects>().0.clone();
+            let after_motion = deadline + Duration::from_millis(201);
+            state.fresh_elapsed = after_motion;
             drive_test_runner_update(&mut state, &handle);
             let frame = &state.app.world().resource::<ShellFrameState>().0;
             let concealed = frame.panel(Edge::Left);
             assert_eq!(concealed.mode, PanelMode::Hidden);
             assert!(!concealed.mapped, "iteration {iteration}: panel must unmap");
             assert_eq!(
-                state.app.world().resource::<ShellEffects>().0,
+                conceal_effects,
                 [cosmix_shell::runtime::ShellEffect {
                     edge: Edge::Left,
                     effect: PanelEffect::Conceal {
@@ -2760,7 +3054,7 @@ mod tests {
         let seconds = Duration::from_secs;
         assert_eq!(
             next_timer_deadline(
-                WakePolicy::WakeAt(seconds(8)),
+                WakePolicy::Animate,
                 None,
                 Some(seconds(6)),
                 &[seconds(7), seconds(12)]
@@ -2779,6 +3073,57 @@ mod tests {
         assert_eq!(
             next_timer_deadline(WakePolicy::Idle, None, None, &[seconds(10)]),
             Some(seconds(10))
+        );
+    }
+
+    #[test]
+    fn never_consumed_deadline_trips_the_bounded_abnormal_exit() {
+        let output = OutputKey::new("DP-1").unwrap();
+        let model = ShellModel::new(
+            output.clone(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let mut app = App::new();
+        configure_ingress(&mut app);
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)))
+            .add_message::<RequestRedraw>()
+            .init_resource::<LayerHostUpdateWake>()
+            .add_systems(Last, refuse_to_consume_wake_deadline)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
+        let mut state = TestRunnerState {
+            app,
+            output,
+            needs_update: true,
+            wake_timer: WakeTimerState::default(),
+            fresh_elapsed: Duration::from_millis(10),
+            last_timer_delay: None,
+            last_timer_rearmed: false,
+            animate_requested_at: None,
+            abnormal_exit: false,
+            exit_reason: None,
+            iteration_steps: Vec::new(),
+        };
+        let event_loop: EventLoop<TestRunnerState> = EventLoop::try_new().unwrap();
+        let handle = event_loop.handle();
+
+        for attempt in 1..=MAX_CONSECUTIVE_PAST_DEADLINES {
+            drive_test_runner_update(&mut state, &handle);
+            if attempt < MAX_CONSECUTIVE_PAST_DEADLINES {
+                assert!(
+                    !state.abnormal_exit,
+                    "attempt {attempt} remains bounded recovery"
+                );
+            }
+        }
+        assert!(state.abnormal_exit);
+        assert_eq!(state.exit_reason.as_deref(), Some("wake-deadline-stuck"));
+        assert_eq!(
+            state.wake_timer.consecutive_past_deadlines,
+            MAX_CONSECUTIVE_PAST_DEADLINES
         );
     }
 
@@ -2818,11 +3163,16 @@ mod tests {
     }
 
     #[test]
-    fn leaving_animate_keeps_a_pending_frame_backstop_armed() {
+    fn leaving_animate_does_not_resurrect_a_stale_frame_backstop() {
         let backstop = oldest_frame_backstop_deadline([Duration::from_secs(5)]);
         assert_eq!(
-            next_timer_deadline(WakePolicy::Idle, None, backstop, &[]),
-            backstop
+            next_timer_deadline(
+                WakePolicy::Idle,
+                Some(Duration::from_secs(4)),
+                backstop,
+                &[]
+            ),
+            None
         );
     }
 
@@ -2862,5 +3212,36 @@ mod tests {
             Duration::from_millis(1)
         );
         assert_eq!(wake_timer_delay(deadline, deadline, true), Duration::ZERO);
+    }
+
+    #[test]
+    fn production_clock_sample_is_the_exact_model_elapsed() {
+        let output = OutputKey::new("DP-1").unwrap();
+        let model = ShellModel::new(
+            output,
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let mut app = App::new();
+        configure_ingress(&mut app);
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)))
+            .add_message::<RequestRedraw>()
+            .init_resource::<LayerHostUpdateWake>();
+        let first = Instant::now();
+        run_layer_host_app_update_at(&mut app, first);
+        assert_eq!(
+            app.world().resource::<Time<Real>>().elapsed(),
+            Duration::ZERO
+        );
+
+        run_layer_host_app_update_at(&mut app, first + Duration::from_millis(1_600));
+        assert_eq!(
+            app.world().resource::<Time<Real>>().elapsed(),
+            Duration::from_millis(1_600),
+            "the timer decision and model update consume one sampled clock value"
+        );
     }
 }
