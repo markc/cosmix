@@ -32,10 +32,11 @@ scale such as 1.25 (150/120), Quoin keeps buffer scale 1, renders
 `ceil(logical × scale)` physical pixels and sets the `wp_viewport` destination
 back to the configured logical size. Bevy stores the corresponding physical
 resolution and scale override. Every configure and scale change is checked
-against the renderer's negotiated maximum 2D texture dimension before protocol
-or Bevy window state changes. Either zero configure dimension falls back to the
-planner-requested logical dimension; a compositor close or invalid scale
-terminates the affected lifecycle cleanly rather than panicking.
+against the renderer's negotiated maximum 2D texture dimension before surface
+scaling requests or Bevy window mutation. SCTK acknowledges each configure
+first, as required by the protocol. Either zero configure dimension falls back
+to the planner-requested logical dimension; a compositor close or invalid
+scale terminates the affected lifecycle cleanly rather than panicking.
 
 ## Map, presentation and replay
 
@@ -115,7 +116,7 @@ the patterns below.
 | non-zero | `invalid-cli` | Invalid command-line arguments. |
 | non-zero | `wayland-connect-failed-*`, `wayland-registry-failed-*`, `wl-compositor-unavailable-*`, `layer-shell-unavailable-*` | Wayland connection, registry or required-global setup failed. |
 | non-zero | `output-discovery-failed-*`, `requested-output-unavailable-*`, `no-complete-output`, `v1-output-limit-exceeded` | Output discovery or single-output selection failed. |
-| non-zero | `raw-handle-failed-*`, `panel construction count was not four`, `forbidden-bevy-host-plugin-active` | Initial surface/renderer setup failed an invariant. |
+| non-zero | `raw-handle-failed-*`, `panel construction count was not four`, `forbidden-bevy-host-plugin-active`, `render-device-texture-limit-unavailable` | Initial surface/renderer setup failed an invariant. The texture-limit reason specifically means that no usable `RenderDevice` was present after Bevy finish; renderer initialisation failures retain Bevy's existing panic path. |
 | non-zero | `output-replacement-failed-*`, `surface-plan-failed-*` | Output migration or surface reconciliation failed. |
 | non-zero | `configure-out-of-range-*`, `configure-timeout-*` | A configure was invalid or did not arrive in time. |
 | non-zero | `wake-deadline-stuck`, `wake-timer-failed-*` | Wake scheduling stopped making progress or its timer failed. |

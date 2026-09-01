@@ -1041,6 +1041,9 @@ fn run_layer_host(
     else {
         return state_setup_error(state, "render-device-texture-limit-unavailable".to_owned());
     };
+    // Invariant: the render device is never replaced. If device-loss recovery,
+    // GPU re-enumeration or backend switching ever replaces it, re-capture the
+    // negotiated limit here at the same time.
     state.max_texture_dimension_2d = max_texture_dimension_2d;
 
     if state.app.is_plugin_added::<WinitPlugin>()

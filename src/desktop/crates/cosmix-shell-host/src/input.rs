@@ -3,12 +3,12 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use bevy::app::{Last, Update};
+use bevy::app::{PreUpdate, Update};
 use bevy::ecs::message::{MessageReader, MessageWriter};
-use bevy::input::ButtonState;
 use bevy::input::keyboard::{Key, KeyCode, KeyboardFocusLost, KeyboardInput, NativeKey};
 use bevy::input::mouse::{MouseButton, MouseButtonInput, MouseScrollUnit, MouseWheel};
 use bevy::input::touch::{TouchInput, TouchPhase};
+use bevy::input::{ButtonState, InputSystems};
 use bevy::picking::events::PointerState;
 use bevy::picking::pointer::{
     PointerAction, PointerId, PointerInput, PointerLocation, PointerPress,
@@ -70,31 +70,6 @@ const MIN_REPEAT_GAP: Duration = Duration::from_millis(8);
 const MAX_REPEAT_GAP: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct EffectiveModifiers {
-    ctrl: bool,
-    alt: bool,
-    shift: bool,
-    caps_lock: bool,
-    logo: bool,
-    num_lock: bool,
-    layout: u32,
-}
-
-impl EffectiveModifiers {
-    fn new(modifiers: Modifiers, layout: u32) -> Self {
-        Self {
-            ctrl: modifiers.ctrl,
-            alt: modifiers.alt,
-            shift: modifiers.shift,
-            caps_lock: modifiers.caps_lock,
-            logo: modifiers.logo,
-            num_lock: modifiers.num_lock,
-            layout,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct KeymapUpdate {
     pub installed: bool,
     pub deadline_changed: bool,
@@ -117,7 +92,6 @@ pub(crate) struct KeyboardBridge {
     repeating: Option<RepeatingKey>,
     keymap: Option<xkb::Keymap>,
     keymap_source: Option<String>,
-    modifiers: Option<EffectiveModifiers>,
     diagnostics: u64,
 }
 
@@ -149,7 +123,6 @@ impl KeyboardBridge {
         let deadline_changed = self.cancel_repeat();
         self.keymap = Some(keymap);
         self.keymap_source = Some(source);
-        self.modifiers = None;
         KeymapUpdate {
             installed: true,
             deadline_changed,
@@ -181,6 +154,7 @@ impl KeyboardBridge {
         // SCTK 0.19.2 constructs `keysyms` one-for-one from `raw`, including
         // NoSymbol placeholders. Surface a changed upstream invariant in debug
         // builds instead of silently dropping an enter-held key from the zip.
+        // Revisit this guard whenever SCTK is upgraded.
         debug_assert_eq!(raw.len(), keysyms.len());
         for (&raw_code, &keysym) in raw.iter().zip(keysyms) {
             let mapped = map_key(raw_code, keysym, None);
@@ -240,17 +214,12 @@ impl KeyboardBridge {
         true
     }
 
-    pub(crate) fn update_modifiers(&mut self, modifiers: Modifiers, layout: u32) -> bool {
+    pub(crate) fn update_modifiers(&mut self, _modifiers: Modifiers, _layout: u32) -> bool {
         // Physical modifier keys already enter Bevy through press/release.
         // SCTK deliberately exposes only an effective six-boolean summary
         // here, not the raw XKB masks needed to reinterpret text losslessly.
-        // Stop rather than emit a repeat with stale text after a real state
-        // change, while redundant compositor callbacks leave repeat intact.
-        let next = EffectiveModifiers::new(modifiers, layout);
-        if self.modifiers == Some(next) {
-            return false;
-        }
-        self.modifiers = Some(next);
+        // Invariant: every modifier callback cancels repeat because no callback
+        // is provably text-irrelevant without those raw masks or live XKB state.
         self.cancel_repeat()
     }
 
@@ -548,12 +517,14 @@ pub(crate) fn configure_ingress(app: &mut App) {
             Update,
             flush_staged_shell_commands.in_set(ShellRuntimeSet::Input),
         )
-        .add_systems(Last, coalesce_keyboard_focus_lost);
+        .add_systems(PreUpdate, coalesce_keyboard_focus_lost.before(InputSystems));
 }
 
 /// Emit a global keyboard loss only when an update batch contains no focus
 /// gain. This mirrors Bevy's winit host and keeps leave(A)+enter(B) in one
-/// Wayland dispatch from clearing B's newly pressed input resources.
+/// Wayland dispatch from clearing B's newly pressed input resources. Running
+/// before `InputSystems` makes the leave-triggered update consume the marker in
+/// the same schedule, so it cannot survive an idle dispatch or a later gain.
 fn coalesce_keyboard_focus_lost(
     mut focused: MessageReader<WindowFocused>,
     mut keyboard_focus_lost: MessageWriter<KeyboardFocusLost>,
@@ -1449,7 +1420,7 @@ mod tests {
             .add_message::<WindowFocused>()
             .add_message::<WindowEvent>()
             .add_message::<TouchInput>();
-        app.add_systems(Last, coalesce_keyboard_focus_lost);
+        app.add_systems(PreUpdate, coalesce_keyboard_focus_lost.before(InputSystems));
         let window = app
             .world_mut()
             .spawn(Window {
@@ -1615,7 +1586,7 @@ mod tests {
     }
 
     #[test]
-    fn non_repeating_press_preserves_candidate_until_effective_modifiers_change() {
+    fn non_repeating_press_preserves_candidate_until_any_modifier_callback() {
         let (mut app, window) = keyboard_app();
         let mut bridge = KeyboardBridge {
             focus: Some(KeyboardFocus {
@@ -1661,7 +1632,18 @@ mod tests {
         ));
 
         assert_eq!(bridge.repeat_deadline(), None);
-        assert!(!bridge.update_modifiers(
+        bridge.press(
+            &mut app,
+            SctkKeyEvent {
+                time: 12,
+                raw_code: 30,
+                keysym: Keysym::a,
+                utf8: Some("a".to_owned()),
+            },
+            Duration::from_millis(20),
+        );
+        assert!(bridge.repeat_deadline().is_some());
+        assert!(bridge.update_modifiers(
             Modifiers {
                 shift: true,
                 ..Default::default()
@@ -1757,7 +1739,7 @@ mod tests {
         app.add_plugins(bevy::input::InputPlugin)
             .add_message::<WindowFocused>()
             .add_message::<WindowEvent>();
-        app.add_systems(Last, coalesce_keyboard_focus_lost);
+        app.add_systems(PreUpdate, coalesce_keyboard_focus_lost.before(InputSystems));
         let window = app
             .world_mut()
             .spawn(Window {
@@ -1823,7 +1805,7 @@ mod tests {
         app.add_plugins(bevy::input::InputPlugin)
             .add_message::<WindowFocused>()
             .add_message::<WindowEvent>();
-        app.add_systems(Last, coalesce_keyboard_focus_lost);
+        app.add_systems(PreUpdate, coalesce_keyboard_focus_lost.before(InputSystems));
         let old_window = app.world_mut().spawn(Window::default()).id();
         let new_window = app.world_mut().spawn(Window::default()).id();
         let old_key = MappedKey {
@@ -1873,6 +1855,62 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn leave_update_then_later_enter_preserves_both_pressed_key_resources() {
+        let mut app = App::new();
+        app.add_plugins(bevy::input::InputPlugin)
+            .add_message::<WindowFocused>()
+            .add_message::<WindowEvent>();
+        app.add_systems(PreUpdate, coalesce_keyboard_focus_lost.before(InputSystems));
+        let old_window = app.world_mut().spawn(Window::default()).id();
+        let new_window = app.world_mut().spawn(Window::default()).id();
+        let old_key = MappedKey {
+            raw_code: 30,
+            key_code: KeyCode::KeyA,
+            logical_key: Key::Character("a".into()),
+            text: Some("a".to_owned()),
+        };
+        let new_key = MappedKey {
+            raw_code: 45,
+            key_code: KeyCode::KeyX,
+            logical_key: Key::Character("x".into()),
+            text: Some("x".to_owned()),
+        };
+
+        emit_keyboard(&mut app, old_window, &old_key, ButtonState::Pressed, false);
+        app.update();
+
+        // Dispatch 1: its requested update must write and consume the global
+        // loss marker before the runner is allowed to return to dispatch.
+        emit_keyboard(&mut app, old_window, &old_key, ButtonState::Released, false);
+        emit_window(
+            &mut app,
+            WindowFocused {
+                window: old_window,
+                focused: false,
+            },
+        );
+        app.update();
+
+        // Dispatch 2: a later focus gain and press cannot meet a stale marker.
+        emit_window(
+            &mut app,
+            WindowFocused {
+                window: new_window,
+                focused: true,
+            },
+        );
+        emit_keyboard(&mut app, new_window, &new_key, ButtonState::Pressed, false);
+        app.update();
+
+        let key_codes = app.world().resource::<bevy::input::ButtonInput<KeyCode>>();
+        assert!(!key_codes.pressed(KeyCode::KeyA));
+        assert!(key_codes.pressed(KeyCode::KeyX));
+        let logical_keys = app.world().resource::<bevy::input::ButtonInput<Key>>();
+        assert!(!logical_keys.pressed(Key::Character("a".into())));
+        assert!(logical_keys.pressed(Key::Character("x".into())));
     }
 
     #[test]
