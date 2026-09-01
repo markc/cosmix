@@ -1893,7 +1893,7 @@ mod tests {
         CompSnapshot {
             info: InfoSnapshot {
                 service: Arc::from("comp-nested"),
-                version: Arc::from("0.35.0"),
+                version: Arc::from("0.37.0"),
                 backend: "nested",
                 engine: "bevy-0.19/wgpu",
                 instance: Arc::from("fixture"),

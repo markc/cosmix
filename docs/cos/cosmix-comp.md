@@ -224,7 +224,7 @@ clients.
 | `ext_idle_notifier_v1` | 2 | Per-seat notifications use Smithay's calloop timers; real pointer, keyboard, touch, pointer-gesture and tablet-tool activity resets the timeout and resumes an idle notification. Device-removal reconciliation does not count as activity. |
 | `ext_foreign_toplevel_list_v1` | 1 | Mapped XDG toplevels expose stable mapping identifiers, title and app ID updates; unmap or destruction closes the handle, and late clients receive the current mapped set. |
 | `ext_session_lock_v1` | 1 | Nested and live KMS modes support immediate output-sized lock-surface configures, secure blank-first presentation acknowledgement, lock-only input, VT pause/resume preservation and the locked/orphaned lifecycle. |
-| `zwlr_screencopy_manager_v1` | 3 | Compatibility output capture into exact-layout `wl_shm` buffers, including clipped regions, real damage waiting, exact cursor inclusion and presentation-timestamped nested or KMS completion. |
+| `zwlr_screencopy_manager_v1` | 3 | Compatibility output capture into exact-layout `wl_shm` buffers, plus eligible whole-output v3 DMA-BUF destinations; includes clipped SHM regions, real damage waiting, exact cursor inclusion and presentation-timestamped nested or KMS completion. |
 
 ## Screen capture
 
@@ -239,8 +239,30 @@ without forcing a frame. The bounded journal is manager-scoped; its baseline
 advances only after `ready`, and history overflow conservatively reports the
 full captured region.
 
-Pixel readback and the matching output presentation form a two-part completion
-latch: `ready` is sent only after both arrive for the same frame. Nested records
+Version 3 frames may additionally advertise a DMA-BUF destination after the
+SHM `buffer` event and before `buffer_done`. The advertisement is immutable for
+that frame and exists only for a whole-output request whose transform is
+Normal, whose displayed and storage extents are equal, and whose underlying
+render texture has an exact copy-compatible opaque format. Its modifiers are
+the intersection of linux-dmabuf feedback and an exact Vulkan external-image
+`TRANSFER_DST` import query at that extent. Versions 1 and 2 never receive the
+DMA-BUF event; regions, transformed outputs and unsupported renderer states
+remain SHM-only.
+
+A submitted DMA-BUF must have exactly one plane and match the advertised
+fourcc, extent and modifier. A kind or metadata mismatch posts
+`invalid_buffer` on the frame and never enters renderer admission. Later
+operational misses—device identity, fd cloning, import/acquire, capacity,
+deadline, cancellation, resize, completion or FOREIGN release—produce one
+`failed`. The compositor never sends damage or flags before discovering such a
+failure.
+
+Pixel completion and the matching output presentation form a two-part completion
+latch: `ready` is sent only after both arrive for the same frame. For SHM the
+completion half is mapped readback; for DMA-BUF it is proven GPU retirement
+followed by release back to FOREIGN ownership. A single bounded completion
+authority owns those destination jobs; a full queue fails immediately and is
+never retried on the render thread. Nested records
 are bound to the exact acquired host window texture-view identity; a missing,
 unconsumed or mismatched acquisition fails that capture instead of rebinding it
 to a later presentation. Nested mode uses the completed host presentation time;
@@ -285,8 +307,9 @@ work captures the currently displayed lock surface or compositor-owned black
 fallback. This is an agentic desktop policy rather than a portal permission
 prompt.
 
-KMS copies select the exact Ready `OutputKey` and generation, copy the scan-out
-target within that frame without retaining a slot, and latch pixels against its
+KMS copies select the exact Ready `OutputKey` and generation, copy out within
+that frame without retaining a slot or storing a destination token in the
+scan-out pool, and latch completion against its
 acquisition token and kernel page-flip timestamp. Pause, unplug, generation
 replacement, cancellation and map failure fail the affected one-shot rather
 than returning another output or stale pixels. `--first-light` keeps the same
@@ -296,7 +319,10 @@ The wlr protocol is a compatibility surface; the planned
 `ext-image-copy-capture-v1` implementation will become another consumer of the
 same capture service. The automated nested acceptance gate uses `grim`; the
 `cosmix-screencopy-probe` binary is a deadline-bounded manual diagnostic for the
-advertised layout, non-zero shm offset, guard bytes and non-black pixels.
+advertised layout, non-zero SHM offset, guard bytes and non-black pixels. Its
+`--dmabuf --drm-node PATH` mode waits for `buffer_done`, allocates an advertised
+modifier with GBM, submits that destination, maps it only after `ready`, and
+prints the presentation timestamp plus a content checksum.
 Automated tests cover readback, transforms, ordering and damage. A real Vulkan
 render-attachment gate uses the production GPU cursor-composite pass, reads back
 base and inclusive bytes, compares both with byte-exact references, and proves

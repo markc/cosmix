@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-wgpu-dmabuf"
-version = "0.12.0"
+version = "0.13.0"
 description = "DMA-BUF to Bevy/wgpu bridge for the CosMix compositor"
 edition = "2024"
 rust-version = "1.95"
