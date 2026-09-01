@@ -80,6 +80,9 @@ pub struct ShellFrame {
     pub panels: [PanelPresentation; 4],
     pub content: ShellContentPresentation,
     pub wake: WakePolicy,
+    /// Earliest timer-driven model transition, retained even while animation
+    /// also requests frame callbacks.
+    pub wake_deadline: Option<Duration>,
 }
 
 impl ShellFrame {
@@ -111,6 +114,7 @@ impl ShellFrame {
             panels,
             content: ShellContentPresentation::default(),
             wake: model.wake().into(),
+            wake_deadline: model.next_deadline(),
         }
     }
 

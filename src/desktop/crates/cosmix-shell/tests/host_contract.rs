@@ -199,6 +199,13 @@ fn corner_left_arms_attributed_grace_and_conceals_at_deadline() {
         left.snapshot.conceal_reason,
         Some(ConcealReason::CornerLeft)
     );
+    let frame = ShellFrame::from_model(&model);
+    assert_eq!(frame.wake, WakePolicy::Animate);
+    assert_eq!(
+        frame.wake_deadline,
+        Some(ms(810)),
+        "animation must not mask the grace timer"
+    );
     model.tick(ms(809)).unwrap();
     assert_eq!(model.panel(Edge::Top).mode, PanelMode::Revealed);
     let concealed = model.tick(ms(810)).unwrap();

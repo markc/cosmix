@@ -279,6 +279,10 @@ impl PanelStateMachine {
         }
     }
 
+    pub const fn next_deadline(&self) -> Option<Duration> {
+        self.hide_at
+    }
+
     fn advance_to(&mut self, at: Duration) -> Result<Option<PanelEffect>, PanelTimeError> {
         if at < self.last_update {
             return Err(PanelTimeError {

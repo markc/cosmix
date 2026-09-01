@@ -163,6 +163,11 @@ fn update_model(
         next_frame.content.bottom_clock_text = Some(runtime.clock_text.clone());
         if let Some(deadline) = runtime.clock_deadline {
             next_frame.wake = merge_wake(next_frame.wake, deadline);
+            next_frame.wake_deadline = Some(
+                next_frame
+                    .wake_deadline
+                    .map_or(deadline, |current| current.min(deadline)),
+            );
         }
     } else {
         runtime.clock_deadline = None;

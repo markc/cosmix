@@ -140,6 +140,13 @@ impl ShellModel {
         earliest.map_or(PanelWake::Idle, PanelWake::WakeAt)
     }
 
+    pub fn next_deadline(&self) -> Option<Duration> {
+        self.panels
+            .iter()
+            .filter_map(PanelStateMachine::next_deadline)
+            .min()
+    }
+
     fn ensure_monotonic(&self, at: Duration) -> Result<(), PanelTimeError> {
         if at < self.last_update {
             return Err(PanelTimeError {

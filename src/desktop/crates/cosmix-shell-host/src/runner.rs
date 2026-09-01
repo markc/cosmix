@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bevy::app::{App, AppExit, Last, PluginGroup, TerminalCtrlCHandlerPlugin};
 use bevy::ecs::message::MessageReader;
@@ -55,7 +55,10 @@ use wayland_protocols::wp::viewporter::client::{
 };
 
 use crate::corner_bus::{CornerBusHandle, CornerIngress, gate_ingress, start as start_corner_bus};
-use crate::input::{PointerBridge, SurfaceTarget, configure_ingress, stage_shell_command};
+use crate::input::{
+    PointerBridge, SurfaceTarget, configure_ingress, stage_shell_command,
+    staged_shell_commands_pending,
+};
 use crate::output::{
     OutputError, OutputRuntime, OutputRuntimeMap, SelectedOutput, insert_single_output,
     select_output,
@@ -70,7 +73,7 @@ type ModelFactory = dyn Fn(OutputKey, LogicalSize) -> ShellModel + Send + Sync;
 const ANIMATE_BACKSTOP: Duration = Duration::from_secs(1);
 const ANIMATE_BACKSTOP_QUANTUM: Duration = Duration::from_millis(250);
 const CONFIGURE_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_CONSECUTIVE_PAST_DEADLINES: u8 = 64;
+const EARLY_TIMER_REARM_GUARD: Duration = Duration::from_millis(1);
 
 #[derive(Resource, Default)]
 struct LayerHostUpdateWake(bool);
@@ -86,6 +89,88 @@ fn capture_layer_host_redraw(
 
 fn take_layer_host_update_wake(app: &mut App) -> bool {
     std::mem::take(&mut app.world_mut().resource_mut::<LayerHostUpdateWake>().0)
+}
+
+fn run_layer_host_app_update(app: &mut App) -> bool {
+    app.update();
+    let redraw = take_layer_host_update_wake(app);
+    let staged = staged_shell_commands_pending(app);
+    let elapsed = app
+        .world()
+        .get_resource::<Time<Real>>()
+        .map_or(Duration::ZERO, Time::elapsed);
+    if let Some(frame) = app.world().get_resource::<ShellFrameState>() {
+        match frame.0.wake {
+            WakePolicy::WakeAt(deadline) => tracing::debug!(
+                event = "quoin_wake_policy",
+                policy = "wake-at",
+                elapsed_us = elapsed.as_micros(),
+                deadline_us = deadline.as_micros()
+            ),
+            WakePolicy::Animate => tracing::debug!(
+                event = "quoin_wake_policy",
+                policy = "animate",
+                elapsed_us = elapsed.as_micros()
+            ),
+            WakePolicy::Idle => tracing::debug!(
+                event = "quoin_wake_policy",
+                policy = "none",
+                elapsed_us = elapsed.as_micros()
+            ),
+        }
+        if let Some(deadline) = frame.0.wake_deadline {
+            tracing::debug!(
+                event = "quoin_model_wake_deadline",
+                result = "wake-at",
+                elapsed_us = elapsed.as_micros(),
+                deadline_us = deadline.as_micros()
+            );
+        } else {
+            tracing::debug!(
+                event = "quoin_model_wake_deadline",
+                result = "none",
+                elapsed_us = elapsed.as_micros()
+            );
+        }
+    }
+    if let Some(effects) = app
+        .world()
+        .get_resource::<cosmix_shell::runtime::ShellEffects>()
+    {
+        for effect in &effects.0 {
+            tracing::debug!(
+                event = "quoin_model_transition",
+                edge = ?effect.edge,
+                transition = ?effect.effect,
+                elapsed_us = elapsed.as_micros()
+            );
+        }
+    }
+    redraw || staged
+}
+
+#[derive(Debug)]
+struct RunnerClock {
+    anchor: Instant,
+    elapsed: Duration,
+}
+
+impl RunnerClock {
+    fn new(elapsed: Duration) -> Self {
+        Self {
+            anchor: Instant::now(),
+            elapsed,
+        }
+    }
+
+    fn sync(&mut self, elapsed: Duration) {
+        self.anchor = Instant::now();
+        self.elapsed = elapsed;
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.elapsed.saturating_add(self.anchor.elapsed())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,6 +276,15 @@ fn write_configured_motion_latch(app: &mut App, committed: Option<(Edge, PanelMo
     true
 }
 
+fn handle_configure_success(
+    app: &mut App,
+    needs_update: &mut bool,
+    committed: Option<(Edge, PanelMode)>,
+) {
+    write_configured_motion_latch(app, committed);
+    *needs_update = true;
+}
+
 fn layer_close_decision(output_live: bool, replacement_pending: bool) -> LayerCloseDecision {
     if output_live && !replacement_pending {
         LayerCloseDecision::Exit
@@ -222,6 +316,7 @@ fn release_pointer(pointer: impl PointerRelease) {
 
 fn next_timer_deadline(
     policy: WakePolicy,
+    model_deadline: Option<Duration>,
     animate_backstop: Option<Duration>,
     configure_deadlines: &[Duration],
 ) -> Option<Duration> {
@@ -231,6 +326,7 @@ fn next_timer_deadline(
     };
     policy_deadline
         .into_iter()
+        .chain(model_deadline)
         .chain(animate_backstop)
         .chain(configure_deadlines.iter().copied())
         .min()
@@ -256,32 +352,77 @@ fn oldest_frame_backstop_deadline(
         .map(animate_backstop_deadline)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PastDeadlineObservation {
-    consecutive: u8,
-    past: bool,
-    stuck: bool,
+fn wake_timer_delay(deadline: Duration, elapsed: Duration, early_rearm: bool) -> Duration {
+    let remaining = deadline.saturating_sub(elapsed);
+    if early_rearm && !remaining.is_zero() {
+        remaining.saturating_add(EARLY_TIMER_REARM_GUARD)
+    } else {
+        remaining
+    }
 }
 
-fn observe_past_deadline(
-    policy: WakePolicy,
+fn observe_wake_timer_fire(elapsed: Duration, deadline: Duration) -> Option<Duration> {
+    let early = elapsed < deadline;
+    tracing::debug!(
+        event = "quoin_wake_timer_fired",
+        elapsed_us = elapsed.as_micros(),
+        deadline_us = deadline.as_micros(),
+        early
+    );
+    early.then_some(deadline)
+}
+
+trait WakeTimerTarget {
+    fn clear_wake_timer_registration(&mut self);
+    fn fresh_wake_elapsed(&self) -> Duration;
+    fn dispatch_wake_timer(&mut self, elapsed: Duration, deadline: Duration);
+}
+
+fn wake_timer_source_fired<S: WakeTimerTarget>(state: &mut S, deadline: Duration) {
+    state.clear_wake_timer_registration();
+    let elapsed = state.fresh_wake_elapsed();
+    state.dispatch_wake_timer(elapsed, deadline);
+}
+
+fn replace_wake_timer_source<S: WakeTimerTarget + 'static>(
+    loop_handle: &LoopHandle<'_, S>,
+    timer_token: &mut Option<RegistrationToken>,
+    timer_deadline: &mut Option<Duration>,
+    early_rearm_deadline: &mut Option<Duration>,
+    next_deadline: Option<Duration>,
     elapsed: Duration,
-    consecutive: u8,
-) -> PastDeadlineObservation {
-    if matches!(policy, WakePolicy::WakeAt(deadline) if deadline <= elapsed) {
-        let consecutive = consecutive.saturating_add(1);
-        PastDeadlineObservation {
-            consecutive,
-            past: true,
-            stuck: consecutive >= MAX_CONSECUTIVE_PAST_DEADLINES,
-        }
-    } else {
-        PastDeadlineObservation {
-            consecutive: 0,
-            past: false,
-            stuck: false,
-        }
+) -> Result<(), LayerHostError> {
+    if *timer_deadline == next_deadline {
+        return Ok(());
     }
+    if let Some(token) = timer_token.take() {
+        loop_handle.remove(token);
+    }
+    *timer_deadline = next_deadline;
+    let Some(deadline) = next_deadline else {
+        *early_rearm_deadline = None;
+        return Ok(());
+    };
+    let rearmed = early_rearm_deadline.take() == Some(deadline);
+    let delay = wake_timer_delay(deadline, elapsed, rearmed);
+    tracing::debug!(
+        event = if rearmed {
+            "quoin_wake_timer_rearmed"
+        } else {
+            "quoin_wake_timer_armed"
+        },
+        deadline_us = deadline.as_micros(),
+        elapsed_us = elapsed.as_micros(),
+        delay_us = delay.as_micros()
+    );
+    let token = loop_handle
+        .insert_source(Timer::from_duration(delay), move |_, _, state| {
+            wake_timer_source_fired(state, deadline);
+            TimeoutAction::Drop
+        })
+        .map_err(|error| LayerHostError::new(error.to_string()))?;
+    *timer_token = Some(token);
+    Ok(())
 }
 
 /// Startup policy supplied by the application while output identity and
@@ -396,9 +537,11 @@ struct RunnerState {
     selected_key: Option<OutputKey>,
     needs_update: bool,
     last_wake: WakePolicy,
+    last_wake_deadline: Option<Duration>,
     timer_token: Option<RegistrationToken>,
     timer_deadline: Option<Duration>,
-    consecutive_past_deadlines: u8,
+    early_rearm_deadline: Option<Duration>,
+    runner_clock: RunnerClock,
     exit_reason: Option<String>,
     abnormal_exit: bool,
     ready_logged: bool,
@@ -410,6 +553,21 @@ struct RunnerState {
     corner_bus: Option<CornerBusHandle>,
     corner_engaged: BTreeSet<cosmix_shell::core::Corner>,
     corner_epoch: u64,
+}
+
+impl WakeTimerTarget for RunnerState {
+    fn clear_wake_timer_registration(&mut self) {
+        self.timer_deadline = None;
+        self.timer_token = None;
+    }
+
+    fn fresh_wake_elapsed(&self) -> Duration {
+        self.runner_clock.elapsed()
+    }
+
+    fn dispatch_wake_timer(&mut self, elapsed: Duration, deadline: Duration) {
+        self.handle_wake_timer(elapsed, deadline);
+    }
 }
 
 impl RunnerState {
@@ -542,9 +700,11 @@ fn run_layer_host(
         selected_key: None,
         needs_update: true,
         last_wake: WakePolicy::Idle,
+        last_wake_deadline: None,
         timer_token: None,
         timer_deadline: None,
-        consecutive_past_deadlines: 0,
+        early_rearm_deadline: None,
+        runner_clock: RunnerClock::new(Duration::ZERO),
         exit_reason: None,
         abnormal_exit: false,
         ready_logged: false,
@@ -696,10 +856,15 @@ fn run_layer_host(
         }
         if state.needs_update {
             state.needs_update = false;
-            state.app.update();
-            if take_layer_host_update_wake(&mut state.app) {
+            if run_layer_host_app_update(&mut state.app) {
                 state.needs_update = true;
             }
+            let elapsed = state
+                .app
+                .world()
+                .get_resource::<Time<Real>>()
+                .map_or(Duration::ZERO, Time::elapsed);
+            state.runner_clock.sync(elapsed);
             if let Some(exit) = state.app.should_exit() {
                 state.abnormal_exit = exit.is_error();
                 state.exit_reason = Some(if exit.is_error() {
@@ -938,7 +1103,8 @@ impl RunnerState {
             self.corner_epoch = corner_bus.select_output(selected_key);
         }
         self.last_wake = WakePolicy::Idle;
-        self.consecutive_past_deadlines = 0;
+        self.last_wake_deadline = None;
+        self.early_rearm_deadline = None;
         self.needs_update = true;
         Ok(())
     }
@@ -1017,6 +1183,7 @@ impl RunnerState {
             *needs_update = true;
         }
         self.last_wake = frame.wake;
+        self.last_wake_deadline = frame.wake_deadline;
         if frame.wake == WakePolicy::Animate {
             for panel in &mut output.panels {
                 if panel.phase == SurfacePhase::Configured
@@ -1040,26 +1207,6 @@ impl RunnerState {
             .world()
             .get_resource::<Time<Real>>()
             .map_or(Duration::ZERO, Time::elapsed);
-        let observation =
-            observe_past_deadline(self.last_wake, elapsed, self.consecutive_past_deadlines);
-        self.consecutive_past_deadlines = observation.consecutive;
-        if observation.past {
-            self.needs_update = true;
-        }
-        if observation.stuck {
-            if let Some(token) = self.timer_token.take() {
-                loop_handle.remove(token);
-            }
-            self.timer_deadline = None;
-            self.abnormal_exit = true;
-            self.exit_reason = Some("wake-deadline-stuck".to_owned());
-            return Ok(());
-        }
-        let effective_policy = if observation.past {
-            WakePolicy::Idle
-        } else {
-            self.last_wake
-        };
         let animate_backstop = oldest_frame_backstop_deadline(
             self.outputs
                 .values()
@@ -1077,37 +1224,40 @@ impl RunnerState {
                     .map(|started| started.saturating_add(CONFIGURE_TIMEOUT))
             })
             .collect::<Vec<_>>();
-        let next_deadline =
-            next_timer_deadline(effective_policy, animate_backstop, &configure_deadlines);
-        if self.timer_deadline == next_deadline {
+        let next_deadline = next_timer_deadline(
+            self.last_wake,
+            self.last_wake_deadline,
+            animate_backstop,
+            &configure_deadlines,
+        );
+        if let Some(deadline) = next_deadline
+            && deadline <= elapsed
+        {
+            tracing::warn!(
+                event = "quoin_wake_deadline_unconsumed",
+                elapsed_us = elapsed.as_micros(),
+                deadline_us = deadline.as_micros()
+            );
+            if let Some(token) = self.timer_token.take() {
+                loop_handle.remove(token);
+            }
+            self.timer_deadline = None;
+            self.abnormal_exit = true;
+            self.exit_reason = Some("wake-deadline-unconsumed".to_owned());
             return Ok(());
         }
-        if let Some(token) = self.timer_token.take() {
-            loop_handle.remove(token);
-        }
-        self.timer_deadline = next_deadline;
-        if let Some(deadline) = next_deadline {
-            let timer = Timer::from_duration(deadline.saturating_sub(elapsed));
-            let token = loop_handle
-                .insert_source(timer, |_, _, state| {
-                    let fired_at = state.timer_deadline.take().unwrap_or_else(|| {
-                        state
-                            .app
-                            .world()
-                            .get_resource::<Time<Real>>()
-                            .map_or(Duration::ZERO, Time::elapsed)
-                    });
-                    state.timer_token = None;
-                    state.handle_wake_timer(fired_at);
-                    TimeoutAction::Drop
-                })
-                .map_err(|error| LayerHostError::new(error.to_string()))?;
-            self.timer_token = Some(token);
-        }
-        Ok(())
+        replace_wake_timer_source(
+            loop_handle,
+            &mut self.timer_token,
+            &mut self.timer_deadline,
+            &mut self.early_rearm_deadline,
+            next_deadline,
+            elapsed,
+        )
     }
 
-    fn handle_wake_timer(&mut self, elapsed: Duration) {
+    fn handle_wake_timer(&mut self, elapsed: Duration, deadline: Duration) {
+        self.early_rearm_deadline = observe_wake_timer_fire(elapsed, deadline);
         let configure_timeout = self
             .outputs
             .values()
@@ -1370,7 +1520,12 @@ impl LayerShellHandler for RunnerState {
             .world()
             .get_resource::<Time<Real>>()
             .map_or(Duration::ZERO, Time::elapsed);
-        let RunnerState { app, outputs, .. } = self;
+        let RunnerState {
+            app,
+            outputs,
+            needs_update,
+            ..
+        } = self;
         let mut configure_error = None;
         let mut committed_mode = None;
         if let Some(panel) = outputs
@@ -1388,8 +1543,7 @@ impl LayerShellHandler for RunnerState {
             self.abnormal_exit = true;
             self.exit_reason = Some(format!("configure-out-of-range-{}", error.reason_suffix()));
         } else {
-            write_configured_motion_latch(app, committed_mode);
-            self.needs_update = true;
+            handle_configure_success(app, needs_update, committed_mode);
         }
     }
 }
@@ -1503,6 +1657,33 @@ impl PointerHandler for RunnerState {
 
 impl RunnerState {
     fn apply_corner_ingress(&mut self, ingress: CornerIngress) {
+        match &ingress {
+            CornerIngress::Event {
+                output,
+                epoch,
+                event,
+            } => tracing::debug!(
+                event = "quoin_corner_ingress_applied",
+                kind = match event {
+                    cosmix_shell::core::CornerEvent::Entered { .. } => "entered",
+                    cosmix_shell::core::CornerEvent::Left { .. } => "left",
+                },
+                output = output.as_str(),
+                epoch
+            ),
+            CornerIngress::Reset { epoch } => tracing::debug!(
+                event = "quoin_corner_ingress_applied",
+                kind = "reset",
+                output = self.selected_key.as_ref().map_or("none", OutputKey::as_str),
+                epoch
+            ),
+            CornerIngress::Disabled { epoch } => tracing::debug!(
+                event = "quoin_corner_ingress_applied",
+                kind = "disabled",
+                output = self.selected_key.as_ref().map_or("none", OutputKey::as_str),
+                epoch
+            ),
+        }
         self.corner_epoch = self.corner_epoch.max(ingress.epoch());
         if apply_corner_ingress_to_app(
             &mut self.app,
@@ -1709,10 +1890,101 @@ mod tests {
         operations: Vec<(Edge, Vec<ProtocolOp>)>,
     }
 
+    enum TestRunnerIngress {
+        Corner(CornerEvent),
+    }
+
+    struct TestRunnerState {
+        app: App,
+        output: OutputKey,
+        needs_update: bool,
+        timer_token: Option<RegistrationToken>,
+        timer_deadline: Option<Duration>,
+        early_rearm_deadline: Option<Duration>,
+        fresh_elapsed: Duration,
+        last_timer_delay: Option<Duration>,
+        last_timer_rearmed: bool,
+    }
+
+    impl WakeTimerTarget for TestRunnerState {
+        fn clear_wake_timer_registration(&mut self) {
+            self.timer_deadline = None;
+            self.timer_token = None;
+        }
+
+        fn fresh_wake_elapsed(&self) -> Duration {
+            self.fresh_elapsed
+        }
+
+        fn dispatch_wake_timer(&mut self, elapsed: Duration, deadline: Duration) {
+            self.early_rearm_deadline = observe_wake_timer_fire(elapsed, deadline);
+            self.needs_update = true;
+        }
+    }
+
+    fn drive_test_runner_update(
+        state: &mut TestRunnerState,
+        handle: &LoopHandle<'_, TestRunnerState>,
+    ) {
+        assert!(state.needs_update);
+        state.needs_update = false;
+        if run_layer_host_app_update(&mut state.app) {
+            state.needs_update = true;
+        }
+        let elapsed = state.app.world().resource::<Time<Real>>().elapsed();
+        state.fresh_elapsed = state.fresh_elapsed.max(elapsed);
+        let frame = &state.app.world().resource::<ShellFrameState>().0;
+        let next_deadline = next_timer_deadline(frame.wake, frame.wake_deadline, None, &[]);
+        if state.timer_deadline != next_deadline
+            && let Some(deadline) = next_deadline
+        {
+            state.last_timer_rearmed = state.early_rearm_deadline == Some(deadline);
+            state.last_timer_delay = Some(wake_timer_delay(
+                deadline,
+                elapsed,
+                state.last_timer_rearmed,
+            ));
+        }
+        replace_wake_timer_source(
+            handle,
+            &mut state.timer_token,
+            &mut state.timer_deadline,
+            &mut state.early_rearm_deadline,
+            next_deadline,
+            elapsed,
+        )
+        .unwrap();
+    }
+
+    fn force_test_timer_one_quantum_early(
+        state: &mut TestRunnerState,
+        handle: &LoopHandle<'_, TestRunnerState>,
+    ) {
+        let deadline = state.timer_deadline.expect("grace timer is armed");
+        if let Some(token) = state.timer_token.take() {
+            handle.remove(token);
+        }
+        state.timer_deadline = Some(deadline);
+        state.timer_token = Some(
+            handle
+                .insert_source(Timer::immediate(), move |_, _, state| {
+                    wake_timer_source_fired(state, deadline);
+                    TimeoutAction::Drop
+                })
+                .unwrap(),
+        );
+    }
+
     type TeardownSequences = [Arc<Mutex<Vec<&'static str>>>; 4];
 
     #[derive(Resource)]
     struct LateActivation {
+        output: OutputKey,
+        armed: bool,
+    }
+
+    #[derive(Resource)]
+    struct LateStagedCommand {
         output: OutputKey,
         armed: bool,
     }
@@ -1736,6 +2008,25 @@ mod tests {
             },
         });
         redraw.write(RequestRedraw);
+    }
+
+    fn emit_late_staged_command(world: &mut World) {
+        let output = {
+            let mut late = world.resource_mut::<LateStagedCommand>();
+            if !late.armed {
+                return;
+            }
+            late.armed = false;
+            late.output.clone()
+        };
+        crate::input::stage_shell_command_world(
+            world,
+            output,
+            ShellCommandKind::Panel {
+                edge: Edge::Left,
+                input: cosmix_shell::core::PanelInput::Pin,
+            },
+        );
     }
 
     impl ProtocolExecutor for ScriptedExecutor {
@@ -1871,10 +2162,9 @@ mod tests {
                 emit_late_activation.in_set(cosmix_shell::runtime::ShellRuntimeSet::Host),
             );
 
-        app.update();
         assert!(
-            take_layer_host_update_wake(&mut app),
-            "the late activation must request one host follow-up"
+            run_layer_host_app_update(&mut app),
+            "the production loop must request one host follow-up"
         );
         assert_eq!(
             app.world()
@@ -1886,7 +2176,7 @@ mod tests {
             "the activation command was produced after this update's Model set"
         );
 
-        app.update();
+        assert!(!run_layer_host_app_update(&mut app));
         assert_eq!(
             app.world()
                 .resource::<ShellFrameState>()
@@ -1896,9 +2186,50 @@ mod tests {
             PanelMode::Pinned,
             "the single follow-up consumes the activation command"
         );
-        assert!(
-            !take_layer_host_update_wake(&mut app),
-            "a stable app schedules zero further updates"
+    }
+
+    #[test]
+    fn command_staged_after_model_forces_one_production_loop_follow_up() {
+        let output = OutputKey::new("DP-1").unwrap();
+        let model = ShellModel::new(
+            output.clone(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let mut app = App::new();
+        configure_ingress(&mut app);
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)))
+            .add_message::<RequestRedraw>()
+            .init_resource::<LayerHostUpdateWake>()
+            .insert_resource(LateStagedCommand {
+                output,
+                armed: true,
+            })
+            .add_systems(
+                Update,
+                emit_late_staged_command.in_set(cosmix_shell::runtime::ShellRuntimeSet::Host),
+            );
+
+        assert!(run_layer_host_app_update(&mut app));
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .mode,
+            PanelMode::Hidden
+        );
+        assert!(!run_layer_host_app_update(&mut app));
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .mode,
+            PanelMode::Pinned
         );
     }
 
@@ -2036,7 +2367,12 @@ mod tests {
         let configured = panel
             .commit_pending_configure()
             .map(|mode| (Edge::Left, mode));
-        assert!(write_configured_motion_latch(&mut app, configured));
+        let mut configure_wake = false;
+        handle_configure_success(&mut app, &mut configure_wake, configured);
+        assert!(
+            configure_wake,
+            "the production configure seam wakes the loop"
+        );
         assert_eq!(
             app.world()
                 .resource::<QuoinCommittedMotionModes>()
@@ -2238,7 +2574,10 @@ mod tests {
             policy => panic!("left must arm one calloop deadline, got {policy:?}"),
         };
         assert_eq!(deadline, Duration::from_millis(1_010));
-        assert_eq!(next_timer_deadline(left.wake, None, &[]), Some(deadline));
+        assert_eq!(
+            next_timer_deadline(left.wake, left.wake_deadline, None, &[]),
+            Some(deadline)
+        );
 
         *app.world_mut().resource_mut::<TimeUpdateStrategy>() =
             TimeUpdateStrategy::ManualDuration(Duration::from_millis(800));
@@ -2278,11 +2617,151 @@ mod tests {
     }
 
     #[test]
+    fn production_calloop_rearms_an_early_grace_timer_and_conceals_fifty_times() {
+        for iteration in 0..50 {
+            let output = OutputKey::new("DP-1").unwrap();
+            let model = ShellModel::new(
+                output.clone(),
+                LogicalSize::new(1_000.0, 800.0).unwrap(),
+                Duration::ZERO,
+                Duration::from_millis(800),
+                Duration::from_millis(200),
+            )
+            .unwrap();
+            let mut app = App::new();
+            configure_ingress(&mut app);
+            app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)))
+                .add_message::<RequestRedraw>()
+                .init_resource::<LayerHostUpdateWake>()
+                .add_systems(Last, capture_layer_host_redraw)
+                .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
+            let mut state = TestRunnerState {
+                app,
+                output: output.clone(),
+                needs_update: false,
+                timer_token: None,
+                timer_deadline: None,
+                early_rearm_deadline: None,
+                fresh_elapsed: Duration::ZERO,
+                last_timer_delay: None,
+                last_timer_rearmed: false,
+            };
+            let mut event_loop: EventLoop<TestRunnerState> = EventLoop::try_new().unwrap();
+            let handle = event_loop.handle();
+            let (sender, channel) = calloop::channel::sync_channel(4);
+            handle
+                .insert_source(channel, |event, _, state| {
+                    if let calloop::channel::Event::Msg(TestRunnerIngress::Corner(event)) = event {
+                        stage_shell_command(
+                            &mut state.app,
+                            state.output.clone(),
+                            ShellCommandKind::Corner(event),
+                        );
+                        state.needs_update = true;
+                    }
+                })
+                .unwrap();
+
+            sender
+                .try_send(TestRunnerIngress::Corner(CornerEvent::Entered {
+                    corner: Corner::TopLeft,
+                    dwell: Duration::from_millis(200),
+                    trigger: CornerTrigger::Compositor,
+                }))
+                .unwrap();
+            event_loop.dispatch(None, &mut state).unwrap();
+            drive_test_runner_update(&mut state, &handle);
+
+            let revealed = state
+                .app
+                .world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .clone();
+            assert!(revealed.mapped, "iteration {iteration}: enter must map");
+
+            *state.app.world_mut().resource_mut::<TimeUpdateStrategy>() =
+                TimeUpdateStrategy::ManualDuration(Duration::ZERO);
+            sender
+                .try_send(TestRunnerIngress::Corner(CornerEvent::Left {
+                    corner: Corner::TopLeft,
+                }))
+                .unwrap();
+            event_loop.dispatch(None, &mut state).unwrap();
+            drive_test_runner_update(&mut state, &handle);
+            let deadline = state.timer_deadline.expect("left arms grace timer");
+            let now = state.app.world().resource::<Time<Real>>().elapsed();
+            let before = deadline - Duration::from_millis(1);
+            *state.app.world_mut().resource_mut::<TimeUpdateStrategy>() =
+                TimeUpdateStrategy::ManualDuration(before - now);
+            state.fresh_elapsed = before;
+            state.needs_update = true;
+            drive_test_runner_update(&mut state, &handle);
+
+            force_test_timer_one_quantum_early(&mut state, &handle);
+            event_loop.dispatch(None, &mut state).unwrap();
+            *state.app.world_mut().resource_mut::<TimeUpdateStrategy>() =
+                TimeUpdateStrategy::ManualDuration(Duration::ZERO);
+            drive_test_runner_update(&mut state, &handle);
+            assert_eq!(
+                state
+                    .app
+                    .world()
+                    .resource::<ShellFrameState>()
+                    .0
+                    .panel(Edge::Left)
+                    .mode,
+                PanelMode::Revealed,
+                "iteration {iteration}: early timer must not conceal"
+            );
+            assert_eq!(state.timer_deadline, Some(deadline));
+            assert!(state.timer_token.is_some(), "early timer must re-arm");
+            assert!(state.last_timer_rearmed);
+            assert_eq!(state.last_timer_delay, Some(Duration::from_millis(2)));
+
+            let after = deadline + Duration::from_millis(201);
+            let elapsed = state.app.world().resource::<Time<Real>>().elapsed();
+            *state.app.world_mut().resource_mut::<TimeUpdateStrategy>() =
+                TimeUpdateStrategy::ManualDuration(after - elapsed);
+            state.fresh_elapsed = after;
+            event_loop.dispatch(None, &mut state).unwrap();
+            drive_test_runner_update(&mut state, &handle);
+            let frame = &state.app.world().resource::<ShellFrameState>().0;
+            let concealed = frame.panel(Edge::Left);
+            assert_eq!(concealed.mode, PanelMode::Hidden);
+            assert!(!concealed.mapped, "iteration {iteration}: panel must unmap");
+            assert_eq!(
+                state.app.world().resource::<ShellEffects>().0,
+                [cosmix_shell::runtime::ShellEffect {
+                    edge: Edge::Left,
+                    effect: PanelEffect::Conceal {
+                        reason: ConcealReason::CornerLeft,
+                    },
+                }]
+            );
+            assert_eq!(
+                plan_surface(
+                    Some(&revealed),
+                    concealed,
+                    OutputGeometry {
+                        width: 1_000.0,
+                        height: 800.0,
+                    },
+                )
+                .unwrap(),
+                [ProtocolOp::Unmap]
+            );
+        }
+    }
+
+    #[test]
     fn timer_selection_uses_the_earliest_bounded_one_shot() {
         let seconds = Duration::from_secs;
         assert_eq!(
             next_timer_deadline(
                 WakePolicy::WakeAt(seconds(8)),
+                None,
                 Some(seconds(6)),
                 &[seconds(7), seconds(12)]
             ),
@@ -2292,12 +2771,13 @@ mod tests {
             next_timer_deadline(
                 WakePolicy::WakeAt(seconds(8)),
                 None,
+                None,
                 &[seconds(7), seconds(12)]
             ),
             Some(seconds(7))
         );
         assert_eq!(
-            next_timer_deadline(WakePolicy::Idle, None, &[seconds(10)]),
+            next_timer_deadline(WakePolicy::Idle, None, None, &[seconds(10)]),
             Some(seconds(10))
         );
     }
@@ -2341,14 +2821,14 @@ mod tests {
     fn leaving_animate_keeps_a_pending_frame_backstop_armed() {
         let backstop = oldest_frame_backstop_deadline([Duration::from_secs(5)]);
         assert_eq!(
-            next_timer_deadline(WakePolicy::Idle, backstop, &[]),
+            next_timer_deadline(WakePolicy::Idle, None, backstop, &[]),
             backstop
         );
     }
 
     #[test]
     fn idle_without_pending_frames_or_configures_arms_nothing() {
-        assert_eq!(next_timer_deadline(WakePolicy::Idle, None, &[]), None);
+        assert_eq!(next_timer_deadline(WakePolicy::Idle, None, None, &[]), None);
     }
 
     #[test]
@@ -2370,41 +2850,17 @@ mod tests {
     }
 
     #[test]
-    fn past_deadline_counter_is_bounded_and_resets() {
-        let elapsed = Duration::from_secs(10);
-        let past = WakePolicy::WakeAt(elapsed);
-        let before_limit = observe_past_deadline(past, elapsed, 62);
+    fn early_timer_rearm_uses_the_real_remaining_time_with_one_guard() {
+        let deadline = Duration::from_millis(800);
+        let elapsed = deadline - Duration::from_millis(1);
         assert_eq!(
-            before_limit,
-            PastDeadlineObservation {
-                consecutive: 63,
-                past: true,
-                stuck: false,
-            }
+            wake_timer_delay(deadline, elapsed, true),
+            Duration::from_millis(2)
         );
         assert_eq!(
-            observe_past_deadline(past, elapsed, before_limit.consecutive),
-            PastDeadlineObservation {
-                consecutive: 64,
-                past: true,
-                stuck: true,
-            }
+            wake_timer_delay(deadline, elapsed, false),
+            Duration::from_millis(1)
         );
-        assert_eq!(
-            observe_past_deadline(
-                WakePolicy::WakeAt(elapsed + Duration::from_secs(1)),
-                elapsed,
-                42
-            ),
-            PastDeadlineObservation {
-                consecutive: 0,
-                past: false,
-                stuck: false,
-            }
-        );
-        assert_eq!(
-            observe_past_deadline(WakePolicy::Animate, elapsed, 42).consecutive,
-            0
-        );
+        assert_eq!(wake_timer_delay(deadline, deadline, true), Duration::ZERO);
     }
 }

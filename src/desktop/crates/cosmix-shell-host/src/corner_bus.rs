@@ -279,6 +279,7 @@ struct WorkerState {
     selected: OutputKey,
     outputs: Option<BTreeMap<String, OutputKey>>,
     map_valid: bool,
+    discard_until_refresh: bool,
     queued: VecDeque<DecodedCorner>,
     engaged: BTreeSet<(String, Corner)>,
     diagnostics: u64,
@@ -292,6 +293,7 @@ impl WorkerState {
             selected,
             outputs: None,
             map_valid: false,
+            discard_until_refresh: false,
             queued: VecDeque::new(),
             engaged: BTreeSet::new(),
             diagnostics: 0,
@@ -354,6 +356,10 @@ impl WorkerState {
         }
         self.outputs = Some(next);
         self.map_valid = true;
+        if self.discard_until_refresh {
+            self.queued.clear();
+            self.discard_until_refresh = false;
+        }
         while let Some(event) = self.queued.pop_front() {
             self.apply_corner(event, sender, overflowed, shared_epoch);
         }
@@ -369,11 +375,16 @@ impl WorkerState {
         match decode(&self.topics, &command) {
             Ok(Decoded::Corner(corner)) => {
                 if !self.map_valid {
-                    if self.queued.len() == CHANNEL_CAPACITY {
-                        self.reset(sender, overflowed, shared_epoch);
-                        overflowed.store(true, Ordering::Release);
-                    } else {
-                        self.queued.push_back(corner);
+                    // A loss marker invalidates the retained lane. The reset
+                    // already synthesized Left for every engagement; only
+                    // post-install events may establish a fresh hold.
+                    if !self.discard_until_refresh {
+                        if self.queued.len() == CHANNEL_CAPACITY {
+                            self.reset(sender, overflowed, shared_epoch);
+                            overflowed.store(true, Ordering::Release);
+                        } else {
+                            self.queued.push_back(corner);
+                        }
                     }
                 } else {
                     self.apply_corner(corner, sender, overflowed, shared_epoch);
@@ -629,6 +640,7 @@ fn process_incoming_observation(
         }
         IncomingObservation::Overflow => {
             state.map_valid = false;
+            state.discard_until_refresh = true;
             state.reset(sender, overflowed, shared_epoch);
             tracing::warn!(event = "quoin_corner_client_ingress_overflow");
             Some(DecodeAction::Refresh)
@@ -2074,6 +2086,56 @@ mod tests {
     }
 
     #[test]
+    fn overflow_discards_retained_enter_when_matching_left_was_lost() {
+        let (sender, channel) = sync_channel(CHANNEL_CAPACITY);
+        let overflow = AtomicBool::new(false);
+        let epoch = AtomicU64::new(0);
+        let mut state = WorkerState::new("comp", OutputKey::new("DP-1").unwrap());
+        let outputs = BTreeMap::from([("o_dp_1".to_owned(), OutputKey::new("DP-1").unwrap())]);
+        state.install_outputs(outputs.clone(), &sender, &overflow, &epoch);
+        state.engaged.insert(("o_dp_1".to_owned(), Corner::TopLeft));
+
+        assert_eq!(
+            process_incoming_observation(
+                &mut state,
+                IncomingObservation::Overflow,
+                &sender,
+                &overflow,
+                &epoch,
+            ),
+            Some(DecodeAction::Refresh)
+        );
+        assert!(matches!(
+            channel.try_recv(),
+            Ok(CornerIngress::Reset { .. })
+        ));
+
+        let retained_enter = incoming(
+            "comp.corner.entered",
+            "corner.entered",
+            r#"{"output":"o_dp_1","corner":"tl","dwell_ms":200,"event_seq":44}"#,
+        );
+        assert_eq!(
+            process_incoming_observation(
+                &mut state,
+                IncomingObservation::Command(retained_enter),
+                &sender,
+                &overflow,
+                &epoch,
+            ),
+            Some(DecodeAction::None)
+        );
+        state.install_outputs(outputs, &sender, &overflow, &epoch);
+
+        assert!(state.engaged.is_empty());
+        assert!(state.queued.is_empty());
+        assert!(
+            channel.try_recv().is_err(),
+            "retained enter must not replay"
+        );
+    }
+
+    #[test]
     fn real_session_loop_retries_failed_refresh_and_processes_enter_left() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2317,7 +2379,7 @@ mod tests {
     }
 
     #[test]
-    fn fake_absent_broker_retry_and_shutdown_ack_are_bounded() {
+    fn fake_absent_broker_retry_and_real_worker_shutdown_are_bounded() {
         let (shutdown_tx, mut shutdown) = watch::channel(false);
         let attempts = std::cell::Cell::new(0_u8);
         let outcome = tokio::runtime::Builder::new_current_thread()
@@ -2336,19 +2398,40 @@ mod tests {
         assert!(matches!(outcome, ConnectOutcome::Shutdown));
         assert_eq!(attempts.get(), 1);
 
-        let (ack_tx, ack) = std_mpsc::sync_channel(1);
-        ack_tx.send(()).unwrap();
-        let (selected_tx, _selected_rx) = watch::channel((OutputKey::new("DP-1").unwrap(), 0));
-        let (shutdown, _shutdown_rx) = watch::channel(false);
-        let handle = CornerBusHandle {
-            shutdown,
-            ack,
-            selected_tx,
-            epoch: Arc::new(AtomicU64::new(0)),
-        };
-        let before = Instant::now();
-        assert!(handle.shutdown());
-        assert!(before.elapsed() <= Duration::from_millis(300));
+        for acknowledge in [true, false] {
+            let (ack_tx, ack) = std_mpsc::sync_channel(1);
+            let (selected_tx, _selected_rx) = watch::channel((OutputKey::new("DP-1").unwrap(), 0));
+            let (shutdown, mut shutdown_rx) = watch::channel(false);
+            thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    wait_shutdown(&mut shutdown_rx).await;
+                    if acknowledge {
+                        let _ = ack_tx.try_send(());
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                });
+            });
+            let handle = CornerBusHandle {
+                shutdown,
+                ack,
+                selected_tx,
+                epoch: Arc::new(AtomicU64::new(0)),
+            };
+            let before = Instant::now();
+            assert_eq!(handle.shutdown(), acknowledge);
+            let elapsed = before.elapsed();
+            if acknowledge {
+                assert!(elapsed < Duration::from_millis(300));
+            } else {
+                assert!(elapsed >= Duration::from_millis(300));
+                assert!(elapsed < Duration::from_millis(600));
+            }
+        }
     }
 
     #[test]

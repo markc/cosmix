@@ -9,10 +9,12 @@ use bevy::picking::events::PointerState;
 use bevy::picking::pointer::{
     PointerAction, PointerId, PointerInput, PointerLocation, PointerPress,
 };
-use bevy::prelude::{App, Entity, IntoScheduleConfigs, Res, ResMut, Resource, Time, Vec2, Window};
+use bevy::prelude::{
+    App, Entity, IntoScheduleConfigs, Res, ResMut, Resource, Time, Vec2, Window, World,
+};
 use bevy::time::Real;
 use bevy::window::{CursorEntered, CursorLeft, CursorMoved, WindowEvent};
-use cosmix_shell::core::{Edge, OutputKey, PanelInput};
+use cosmix_shell::core::{CornerEvent, Edge, OutputKey, PanelInput};
 use cosmix_shell::runtime::{ShellCommand, ShellCommandKind, ShellRuntimeSet};
 use smithay_client_toolkit::seat::pointer::{
     AxisScroll, BTN_BACK, BTN_EXTRA, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE,
@@ -51,10 +53,32 @@ pub(crate) fn configure_ingress(app: &mut App) {
 }
 
 pub(crate) fn stage_shell_command(app: &mut App, output: OutputKey, kind: ShellCommandKind) {
-    app.world_mut()
+    stage_shell_command_world(app.world_mut(), output, kind);
+}
+
+pub(crate) fn stage_shell_command_world(
+    world: &mut World,
+    output: OutputKey,
+    kind: ShellCommandKind,
+) {
+    world
         .resource_mut::<StagedShellCommands>()
         .0
         .push((output, kind));
+}
+
+pub(crate) fn staged_shell_commands_pending(app: &App) -> bool {
+    !app.world().resource::<StagedShellCommands>().0.is_empty()
+}
+
+fn shell_command_kind(kind: &ShellCommandKind) -> &'static str {
+    match kind {
+        ShellCommandKind::Geometry(_) => "geometry",
+        ShellCommandKind::Corner(CornerEvent::Entered { .. }) => "corner-entered",
+        ShellCommandKind::Corner(CornerEvent::Left { .. }) => "corner-left",
+        ShellCommandKind::Panel { .. } => "panel",
+        ShellCommandKind::Carousel { .. } => "carousel",
+    }
 }
 
 fn flush_staged_shell_commands(
@@ -64,6 +88,12 @@ fn flush_staged_shell_commands(
 ) {
     let at = time.elapsed();
     for (output, kind) in staged.0.drain(..) {
+        tracing::debug!(
+            event = "quoin_staged_command_flushed",
+            kind = shell_command_kind(&kind),
+            output = output.as_str(),
+            stamped_us = at.as_micros()
+        );
         commands.write(ShellCommand { output, at, kind });
     }
 }
