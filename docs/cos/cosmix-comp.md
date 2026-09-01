@@ -274,11 +274,15 @@ completion half is mapped readback. For DMA-BUF, FOREIGN acquire is encoded in
 the same wgpu command buffer as the copy; the worker waits for that exact
 `SubmissionIndex`, submits the release barrier through wgpu's thread-safe queue,
 then waits for the exact release submission. No capture ownership barrier uses
-a raw queue submit or an infinite fence wait. A single bounded completion
+a raw queue submit or an infinite fence wait. Sampled-image ownership barriers
+also enter wgpu-owned command buffers, so every renderer-queue submission has
+one authority: `wgpu::Queue`. A single bounded completion
 authority owns those destination jobs. It retries a transient 250 ms GPU wait
-up to four bounded attempts, fails immediately on a full/disconnected job
-queue, and never waits on the render or protocol thread. Any terminal worker
-failure fails and safely strands every live post-import job and clears future
+up to four bounded attempts, treats a full/disconnected job queue as terminal,
+and never waits on the render or protocol thread. The shared terminal gate
+closes the sole sender while excluding concurrent submissions, then drains the
+definitively closed channel. Any terminal worker failure fails and safely
+strands every live post-import job and clears future
 screencopy DMA-BUF advertisements. Nested records
 are bound to the exact acquired host window texture-view identity; a missing,
 unconsumed or mismatched acquisition fails that capture instead of rebinding it
@@ -303,8 +307,11 @@ Completion does not depend on a later render tick. The retirement worker sends
 its result directly through the calloop-backed protocol command channel, which
 wakes an idle protocol loop; the destination can therefore reach `ready` on a
 static desktop without polling or a redraw timer. Teardown first puts every
-live job into failed/strand mode, then drops the sole job sender, joins after at
-most the current bounded wait slice, and finally drops the per-job reporters.
+live job into failed/strand mode and closes the sole job sender. It performs a
+non-blocking worker acknowledgement check: an already-finished worker is
+joined, while an unacknowledged worker is detached. If a driver call never
+returns, that detached worker retains its in-flight job, import and reporter
+until it returns or the process exits; renderer teardown itself does not wait.
 A pre-import failure releases the retained buffer token immediately. After an
 acquire/copy submission, only successful copy retirement plus successful
 FOREIGN hand-back may release it; an unprovable hand-back strands both import
@@ -319,6 +326,19 @@ outputs. PNG capture retains its filename, atomic-rename and cadence contract;
 an unavailable output or an encode/write task which starts after the deadline
 releases the one-batch-in-flight latch. A genuinely blocked filesystem write
 cannot be cancelled safely and remains outside this deadline guarantee.
+
+The per-destination fd duplication and Vulkan image creation/bind syscalls run
+on the render thread. This is intentionally retained for S-2: admission is
+bounded to eight destinations per render batch, and moving import into the
+worker would break same-frame copy-out. Hardware-gate runs should continue to
+record this bounded syscall cost.
+
+Live renderer reconstruction currently rebuilds the renderer, capture bridge,
+advertisement registry and retirement worker together, leaving DMA-BUF
+advertisement empty until the new render world republishes it. This whole
+restart path is structurally pinned by `run_live_render_pump`, but remains an
+explicit untested end-to-end path because the regression would require the
+forbidden real-seat live pump.
 
 `overlay_cursor=0` selects the cursor-free base. Every non-zero value selects an
 inclusive copy using the retained default, chrome or client cursor asset with

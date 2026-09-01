@@ -1344,10 +1344,75 @@ fn encode_capture_readback_copy(
 
 const CAPTURE_RETIREMENT_WAIT_ATTEMPTS: usize = 4;
 
+struct TerminalJobSenderState<T> {
+    sender: Option<SyncSender<T>>,
+    terminal: bool,
+}
+
+struct TerminalJobSender<T> {
+    state: Arc<Mutex<TerminalJobSenderState<T>>>,
+}
+
+impl<T> Clone for TerminalJobSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl<T> TerminalJobSender<T> {
+    fn new(sender: SyncSender<T>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(TerminalJobSenderState {
+                sender: Some(sender),
+                terminal: false,
+            })),
+        }
+    }
+
+    fn try_send(&self, job: T) -> Result<(), TrySendError<T>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.terminal {
+            return Err(TrySendError::Disconnected(job));
+        }
+        let result = match state.sender.as_ref() {
+            Some(sender) => sender.try_send(job),
+            None => Err(TrySendError::Disconnected(job)),
+        };
+        if matches!(result, Err(TrySendError::Disconnected(_))) {
+            state.terminal = true;
+            state.sender = None;
+        }
+        result
+    }
+
+    fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.terminal = true;
+        state.sender = None;
+    }
+
+    fn is_accepting(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        !state.terminal && state.sender.is_some()
+    }
+}
+
 #[derive(Resource)]
 struct CaptureDmabufCompletionService {
-    sender: Option<SyncSender<CaptureDmabufJob>>,
+    submissions: TerminalJobSender<CaptureDmabufJob>,
     worker: Option<JoinHandle<()>>,
+    worker_acknowledged: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     advertisements: CaptureAdvertisementRegistry,
 }
@@ -1359,8 +1424,12 @@ impl CaptureDmabufCompletionService {
     ) -> Option<Self> {
         let (sender, receiver) =
             mpsc::sync_channel::<CaptureDmabufJob>(crate::protocol::MAX_IN_FLIGHT_CAPTURES);
+        let submissions = TerminalJobSender::new(sender);
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
+        let worker_submissions = submissions.clone();
+        let worker_acknowledged = Arc::new(AtomicBool::new(false));
+        let worker_ack = Arc::clone(&worker_acknowledged);
         let worker_bridge = bridge.clone();
         let worker_advertisements = advertisements.clone();
         let worker = match std::thread::Builder::new()
@@ -1371,7 +1440,9 @@ impl CaptureDmabufCompletionService {
                     receiver,
                     &worker_stop,
                     &worker_advertisements,
+                    &worker_submissions,
                 );
+                worker_ack.store(true, Ordering::Release);
             }) {
             Ok(worker) => worker,
             Err(_) => {
@@ -1380,42 +1451,51 @@ impl CaptureDmabufCompletionService {
             }
         };
         Some(Self {
-            sender: Some(sender),
+            submissions,
             worker: Some(worker),
+            worker_acknowledged,
             stop,
             advertisements,
         })
     }
 
     fn submit(&mut self, job: CaptureDmabufJob) {
-        let result = match self.sender.as_ref() {
-            Some(sender) => sender.try_send(job),
-            None => Err(TrySendError::Disconnected(job)),
-        };
+        let result = self.submissions.try_send(job);
         if let Err(error) = result {
             let job = match error {
-                TrySendError::Full(job) => job,
-                TrySendError::Disconnected(job) => {
-                    self.advertisements.disable();
-                    self.sender = None;
-                    job
-                }
+                TrySendError::Full(job) | TrySendError::Disconnected(job) => job,
             };
+            // A full channel is terminal too. Continuing to import and submit
+            // destinations while retirement is stalled would make intentional
+            // fail-closed strands accumulate without a lifetime bound.
+            self.advertisements.disable();
+            self.stop.store(true, Ordering::Release);
+            self.submissions.close();
             fail_and_strand_capture_dmabuf_job(job);
         }
+    }
+
+    fn is_accepting(&self) -> bool {
+        self.submissions.is_accepting()
     }
 }
 
 impl Drop for CaptureDmabufCompletionService {
     fn drop(&mut self) {
-        // Pin teardown: mark every queued/live job failed, close the sole
-        // sender, join after at most one bounded wait slice, then let the job
-        // reporters close as the worker drains them.
+        // Pin teardown without an unbounded join: mark every queued/live job
+        // failed, close the sole sender and detach unless the worker has
+        // already acknowledged a normal return. A stuck driver call can then
+        // retain the detached worker's job and GPU handles, but cannot block
+        // renderer reconstruction or App destruction.
         self.advertisements.disable();
         self.stop.store(true, Ordering::Release);
-        self.sender = None;
+        self.submissions.close();
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            if self.worker_acknowledged.load(Ordering::Acquire) && worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                drop(worker);
+            }
         }
     }
 }
@@ -1464,6 +1544,8 @@ fn fail_and_strand_capture_dmabuf_job(job: CaptureDmabufJob) {
     }
     // The copy submission may own or still reference the external image. Keep
     // both the Vulkan import and retained wl_buffer token until process exit.
+    // Queue-full is terminal, so strands are bounded by one worker job, the
+    // MAX_IN_FLIGHT_CAPTURES queued jobs and one already-encoded render batch.
     std::mem::forget(destination);
     std::mem::forget(request);
 }
@@ -1542,20 +1624,32 @@ fn run_capture_dmabuf_completion_worker(
     receiver: Receiver<CaptureDmabufJob>,
     stop: &AtomicBool,
     advertisements: &CaptureAdvertisementRegistry,
+    submissions: &TerminalJobSender<CaptureDmabufJob>,
 ) {
-    struct DisableAdvertisementsOnExit<'a>(&'a CaptureAdvertisementRegistry);
-    impl Drop for DisableAdvertisementsOnExit<'_> {
+    struct CloseServiceOnExit<'a> {
+        advertisements: &'a CaptureAdvertisementRegistry,
+        submissions: &'a TerminalJobSender<CaptureDmabufJob>,
+    }
+    impl Drop for CloseServiceOnExit<'_> {
         fn drop(&mut self) {
-            self.0.disable();
+            self.advertisements.disable();
+            self.submissions.close();
         }
     }
-    let _disable_on_exit = DisableAdvertisementsOnExit(advertisements);
+    let _close_on_exit = CloseServiceOnExit {
+        advertisements,
+        submissions,
+    };
     let retirement = bridge.retirement_adapter();
     while let Ok(job) = receiver.recv() {
         if stop.load(Ordering::Acquire)
             || complete_capture_dmabuf_job(&bridge, &retirement, job, stop).is_err()
         {
             advertisements.disable();
+            // Close while holding the same mutex every sender uses. Once this
+            // returns no send can succeed, so draining to Disconnected cannot
+            // miss a job accepted after an observed Empty state.
+            submissions.close();
             while let Ok(queued) = receiver.try_recv() {
                 fail_and_strand_capture_dmabuf_job(queued);
             }
@@ -2369,10 +2463,14 @@ fn capture_output_frames(
         }
         group.requests = shm_requests;
         let mut prepared_dmabufs = Vec::new();
-        let mut available_destination_slots = dmabuf
-            .completion
-            .as_deref()
-            .map_or(0, |_| crate::protocol::MAX_IN_FLIGHT_CAPTURES);
+        let mut available_destination_slots =
+            dmabuf.completion.as_deref().map_or(0, |completion| {
+                if completion.is_accepting() {
+                    crate::protocol::MAX_IN_FLIGHT_CAPTURES
+                } else {
+                    0
+                }
+            });
         for request in dmabuf_requests {
             if !capture_request_is_copyable(&request, Some(current_extent)) {
                 fail_dmabuf_request(request, reporter.as_ref());
@@ -3578,6 +3676,71 @@ mod tests {
             Err(cosmix_wgpu_dmabuf::RetirementWaitError::Failed(_))
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn terminal_close_cannot_miss_a_sender_after_an_observed_empty() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let submissions = TerminalJobSender::new(sender);
+        let sender_state = Arc::clone(&submissions.state);
+        let (sender_locked_tx, sender_locked_rx) = mpsc::sync_channel(1);
+        let (release_sender_tx, release_sender_rx) = mpsc::sync_channel(1);
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+        let sender_thread = std::thread::spawn(move || {
+            let state = sender_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            sender_locked_tx
+                .send(())
+                .expect("test sender reports holding the submission mutex");
+            release_sender_rx
+                .recv()
+                .expect("test sender receives the deterministic release gate");
+            let result = state
+                .sender
+                .as_ref()
+                .expect("sender remains open inside its critical section")
+                .try_send(7_u8);
+            accepted_tx
+                .send(result)
+                .expect("test sender reports its enqueue result");
+        });
+        sender_locked_rx
+            .recv()
+            .expect("test sender reaches the gated critical section");
+
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+
+        let closer = submissions.clone();
+        let (close_started_tx, close_started_rx) = mpsc::sync_channel(1);
+        let (close_done_tx, close_done_rx) = mpsc::sync_channel(1);
+        let close_thread = std::thread::spawn(move || {
+            close_started_tx
+                .send(())
+                .expect("closer reports it is about to close");
+            closer.close();
+            close_done_tx
+                .send(())
+                .expect("closer reports the endpoint is definitively closed");
+        });
+        close_started_rx
+            .recv()
+            .expect("closer reaches the deterministic gate");
+        release_sender_tx
+            .send(())
+            .expect("release the in-flight sender");
+
+        assert_eq!(accepted_rx.recv(), Ok(Ok(())));
+        sender_thread.join().expect("gated sender exits");
+        close_done_rx.recv().expect("terminal close completes");
+        close_thread.join().expect("closer exits");
+
+        assert_eq!(receiver.try_recv(), Ok(7));
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Disconnected));
+        assert!(matches!(
+            submissions.try_send(8),
+            Err(TrySendError::Disconnected(8))
+        ));
     }
 
     #[test]

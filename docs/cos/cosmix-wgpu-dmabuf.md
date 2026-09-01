@@ -52,14 +52,27 @@ submission retires, then complete it. The capture path performs no raw
 `vkQueueSubmit`, no `u64::MAX` fence wait, and no queue submission from an
 externally unsynchronised Vulkan worker.
 
+Sampled-image imports use the same authority: their FOREIGN acquire/release
+barriers are injected into wgpu-owned encoders and submitted only with
+`wgpu::Queue::submit`. No CosMix path calls raw `vkQueueSubmit` on the renderer
+queue. The exact wgpu/wgpu-hal pin maps `TextureUses::COPY_DST` to Vulkan
+`TRANSFER_DST_OPTIMAL`; the capture barrier deliberately names that layout.
+Re-verify the mapping and the no-extra-transition tracker seed whenever the
+pinned wgpu version changes.
+
 An acquire failure means no copy may be encoded. Capture retirement retries a
 transient bounded timeout, but a terminal wait failure, worker disconnection or
 FOREIGN release failure means the imported image has unknown ownership and must
 be stranded: do not drop, reuse or report it ready. All queued jobs fail on
 worker death and future screencopy frames stop advertising DMA-BUF destinations.
-Queue-full handling is immediate and non-blocking. Sender drop wakes an idle
-worker; shutdown can wait only for the current bounded GPU wait slice. These
-rules are part of memory safety, not optional error recovery.
+Queue-full handling is immediate, terminal and non-blocking, which bounds
+fail-closed strands to the current worker/queue/render batch rather than
+allowing a stalled worker to accumulate one batch per frame. Terminal close and
+send share one mutex: close excludes senders, removes the sole endpoint, then
+the worker drains to disconnection. Shutdown does not join an unacknowledged
+worker. It detaches immediately; if the worker never returns, its in-flight
+import and retained buffer token remain owned until process exit. These rules
+are part of memory safety, not optional error recovery.
 
 The automated equivalence gate proves rendering and copying on a real Vulkan
 adapter with an ordinary COPY_DST texture. A real GBM allocation, imported

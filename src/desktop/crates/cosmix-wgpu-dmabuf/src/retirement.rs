@@ -34,9 +34,9 @@ pub trait WaitForSubmittedWork: Send + 'static {
 /// Production adapter over the same Bevy/wgpu device as rendering.
 ///
 /// Before an explicit release callback fires, all GPU work that could reference
-/// that buffer has already been submitted. Raw ownership barriers do not escape
-/// that snapshot because the render system synchronously waits on their fence
-/// before returning.
+/// that buffer has already been submitted. Ownership barriers are recorded in
+/// wgpu-owned command buffers, so exact submission indices cover them through
+/// the same queue authority as ordinary renderer work.
 pub struct WgpuWaitForSubmittedWork {
     device: RenderDevice,
     queue: Option<RenderQueue>,

@@ -417,8 +417,9 @@ impl ManualVulkanRenderer {
     }
 
     /// Clone the renderer handles used for client-owned screencopy destination
-    /// imports. This bridge is valid for nested and DRM-pinned renderers; each
-    /// operation still validates the allocation's advertised DRM identity.
+    /// imports. `main_device` keeps feedback and advertisement identity
+    /// consistent; a submitted buffer does not expose its allocation identity,
+    /// so individual capture imports cannot validate it.
     pub fn capture_destination_bridge(&self) -> crate::CaptureDestinationBridge {
         crate::CaptureDestinationBridge::new(
             self.resources.4.clone(),
