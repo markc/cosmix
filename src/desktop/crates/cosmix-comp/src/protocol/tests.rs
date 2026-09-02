@@ -36752,6 +36752,87 @@ mod x11 {
     }
 
     #[test]
+    fn x11_or_remap_destroys_the_managed_record() {
+        // Q3: a client can leave management at runtime — unmap, set
+        // override-redirect, remap. From then on `configure` is refused
+        // per-request (`UnsupportedForOverrideRedirect`) on a healthy
+        // connection while a surviving managed record would keep accepting
+        // maximize/move/resize requests, diverging until DestroyNotify. The
+        // OR-map callback must destroy the record so nothing is left to
+        // diverge.
+        let mut harness = KeybindingHarness::new(true);
+        let (surface_id, _surface, window, object) = associate_normal_window(&mut harness, 70);
+        commit_dmabuf(&mut harness, surface_id, 32, 24);
+        assert!(harness.server.state.surfaces.contains_key(&object));
+        harness.server.state.x11_unmapped_window(window);
+        let or_window = fake_x11_window(70, true, Rectangle::new((5, 5).into(), (64, 48).into()));
+        harness
+            .server
+            .state
+            .x11_mapped_override_redirect_window(or_window);
+        assert!(
+            !harness.server.state.surfaces.contains_key(&object),
+            "the managed record does not survive the window leaving management"
+        );
+        assert!(
+            harness.server.state.xwayland.surfaces_by_xid.is_empty(),
+            "no managed XID mapping survives"
+        );
+        assert!(
+            harness
+                .server
+                .state
+                .xwayland
+                .override_redirect_windows
+                .contains(&70),
+            "the XID is recorded as override-redirect after the destroy"
+        );
+    }
+
+    #[test]
+    fn x11_reassociation_to_a_new_xid_drops_the_stale_forward_entry() {
+        // NEW-8: the same wl_surface re-associated under a DIFFERENT XID
+        // used to leave `surfaces_by_xid[old]` pointing at the live record,
+        // so a later DestroyNotify for the old XID destroyed it.
+        let mut harness = KeybindingHarness::new(true);
+        let (surface_id, surface, old_window, object) = associate_normal_window(&mut harness, 71);
+        commit_dmabuf(&mut harness, surface_id, 32, 24);
+        let new_window =
+            fake_x11_window(72, false, Rectangle::new((0, 0).into(), (200, 150).into()));
+        new_window.set_wl_surface_offline(Some(surface.clone()));
+        harness.server.state.x11_new_window(new_window.clone());
+        harness
+            .server
+            .state
+            .x11_map_window_request(new_window.clone());
+        harness
+            .server
+            .state
+            .x11_associate_window(surface, new_window);
+        assert!(
+            !harness
+                .server
+                .state
+                .xwayland
+                .surfaces_by_xid
+                .contains_key(&71),
+            "the old XID's forward entry is dropped"
+        );
+        assert_eq!(
+            harness.server.state.xwayland.surfaces_by_xid.get(&72),
+            Some(&object),
+            "the new XID owns the record"
+        );
+        // The killer shape: DestroyNotify for the old XID must not destroy
+        // the live record.
+        harness.server.state.x11_destroyed_window(old_window);
+        assert!(
+            harness.server.state.surfaces.contains_key(&object),
+            "a stale DestroyNotify for the old XID leaves the live record alone"
+        );
+    }
+
+    #[test]
     fn x11_initial_placement_honours_a_requested_origin_inside_the_output() {
         // The `xmessage -center` decision: a client that states where it
         // wants to appear — a creation origin, or explicit x/y in a pre-map
@@ -36834,8 +36915,7 @@ mod x11 {
         let expected = (
             (usable.x + CASCADE_ORIGIN + cascade * CASCADE_STEP).max(usable.x + extents.left)
                 as i32,
-            (usable.y + CASCADE_ORIGIN + cascade * CASCADE_STEP).max(usable.y + extents.top)
-                as i32,
+            (usable.y + CASCADE_ORIGIN + cascade * CASCADE_STEP).max(usable.y + extents.top) as i32,
         );
         assert_eq!(
             (granted.loc.x, granted.loc.y),
