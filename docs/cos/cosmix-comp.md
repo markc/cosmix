@@ -240,11 +240,14 @@ clients.
 | `ext_session_lock_v1` | 1 | Nested and live KMS modes support immediate output-sized lock-surface configures, secure blank-first presentation acknowledgement, lock-only input, VT pause/resume preservation and the locked/orphaned lifecycle. |
 | `zwlr_screencopy_manager_v1` | 3 | Compatibility output capture into exact-layout `wl_shm` buffers, plus eligible whole-output v3 DMA-BUF destinations; includes clipped SHM regions, real damage waiting, exact cursor inclusion and presentation-timestamped nested or KMS completion. |
 
-## XWayland (X-1)
+## XWayland
 
-Behind the `xwayland` cargo feature (not yet in the default set), the
-compositor supervises one rootless Xwayland instance and acts as its X11
-window manager. Normal X11 windows become managed toplevels on the existing
+The `xwayland` cargo feature is in the default set: every default build
+supervises one rootless Xwayland instance and acts as its X11 window
+manager. The runtime control is the `xwayland.enabled` property described
+above (startup-read, file-persisted per socket) with the
+`COSMIX_COMP_XWAYLAND` environment variable as the launch-time override —
+the cargo feature is no longer the switch. Normal X11 windows become managed toplevels on the existing
 scene, buffer, focus, stacking and server-side-decoration paths: association
 (via the xwayland-shell serial handshake) creates the window's surface
 record, the map grant makes it eligible, and its first committed buffer
@@ -267,13 +270,25 @@ one retry credit exists, and only a generation that then survives five
 minutes restores it. There is no readiness or liveness polling anywhere in
 the path.
 
-**X-1 deliberately does not mean "X applications work".** Not yet supported,
-by design:
+**Override-redirect windows** — X11 menus, context menus, tooltips and
+combo-box drop-downs — render (X-2a): they get a surface record on the
+ordinary renderer path at their own absolute client coordinates (negative
+origins included; the compositor never places, clamps, configures, grants
+or decorates them), stack in the normal band raised above their
+application like a Wayland popup, and acquire none of the managed
+behaviours — no focus candidacy, no minimise/maximise, no
+foreign-toplevel export. Keyboard focus deliberately never moves to an
+override-redirect window: the X client's own grab machinery routes keys,
+and a click on one changes no focus. Known scope edges: relative sibling
+restacks are ignored, a menu overlapping a layer-shell panel draws under
+the panel, and dismissal is client-owned — a click on a pure-Wayland
+surface is invisible to the X grab and dismissal then depends on the
+client's grab-break handling.
 
-- **Override-redirect windows** — most X11 menus, context menus, tooltips
-  and combo-box drop-downs — are recorded and ignored, not rendered (X-2).
+**Still not supported, by design:**
+
 - **Clipboard and primary selection** are not bridged in either direction;
-  selection access is refused at the XWM (X-2).
+  selection access is refused at the XWM (X-2b).
 - **Drag-and-drop** across the X11/Wayland boundary (X-3).
 - **HiDPI/fractional scaling** for X11 clients: the X11 client scale is held
   at 1 and RandR primary-output changes are only logged (X-3).
