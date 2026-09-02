@@ -35987,11 +35987,12 @@ fn cosmix_comp_default_features_are_deliberate() {
         .unwrap_or_else(|error| panic!("cosmix-comp Cargo.toml unreadable at {path:?}: {error}"));
     assert_eq!(
         manifest
-            .matches("default = [\"bus\", \"frame-capture\"]")
+            .matches("default = [\"bus\", \"frame-capture\", \"xwayland\"]")
             .count(),
         1,
         "the cosmix-comp default feature set changed; if deliberate, update this assert \
-         in the same commit"
+         in the same commit (xwayland joined default 2026-09-02, Mark's decision, with \
+         the xwayland.enabled runtime switch as the control the feature used to be)"
     );
 }
 
