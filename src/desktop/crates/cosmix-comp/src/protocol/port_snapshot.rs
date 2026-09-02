@@ -13,7 +13,6 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use smithay::{
     output::Output,
-    reexports::wayland_server::Resource,
     wayland::shell::wlr_layer::{ExclusiveZone, KeyboardInteractivity, Layer as WlrLayer},
 };
 
@@ -712,8 +711,8 @@ pub(super) fn project_focus(state: &WaylandState) -> FocusSnapshot {
         keyboard: state
             .keyboard
             .current_focus()
-            .as_ref()
-            .and_then(|surface| state.surfaces.get(&surface.id()))
+            .and_then(|target| target.surface_id())
+            .and_then(|object| state.surfaces.get(&object))
             .map(|record| record.id.0),
         exclusive_latch: state
             .exclusive_keyboard_focus
@@ -723,8 +722,8 @@ pub(super) fn project_focus(state: &WaylandState) -> FocusSnapshot {
         pointer: state
             .pointer
             .current_focus()
-            .as_ref()
-            .and_then(|surface| state.surfaces.get(&surface.id()))
+            .and_then(|target| target.surface_id())
+            .and_then(|object| state.surfaces.get(&object))
             .map(|record| record.id.0),
         pointer_grab: pointer_grab_name(state),
         session_lock: if !session_lock_active {
@@ -877,6 +876,8 @@ fn surface_output<'a>(
         SurfaceRole::Layer(role) => role.output.output(),
         SurfaceRole::LockSurface(role) => Some(&role.output),
         SurfaceRole::Toplevel(_) => default,
+        #[cfg(feature = "xwayland")]
+        SurfaceRole::X11(_) => default,
         SurfaceRole::Popup(_) | SurfaceRole::Subsurface { .. } | SurfaceRole::Dormant(_) => None,
     }
 }

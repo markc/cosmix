@@ -10112,13 +10112,6 @@ fn viewport_scaled_surface_damage_maps_to_source_buffer_rows() {
 }
 
 #[test]
-fn removed_surface_is_recognised_as_stale_focus() {
-    assert!(focus_is_surface(Some(&7_u32), &7));
-    assert!(!focus_is_surface(Some(&8_u32), &7));
-    assert!(!focus_is_surface::<u32>(None, &7));
-}
-
-#[test]
 fn popup_grab_rejects_an_invented_serial_without_live_input_provenance() {
     assert!(!popup_grab_has_live_action(false, false, false));
     assert!(popup_grab_has_live_action(true, false, false));

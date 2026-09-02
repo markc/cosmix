@@ -1038,8 +1038,8 @@ fn project_focus_edge(state: &WaylandState) -> FocusEdgeStart {
         keyboard: state
             .keyboard
             .current_focus()
-            .as_ref()
-            .and_then(|surface| state.surfaces.get(&surface.id()))
+            .and_then(|target| target.surface_id())
+            .and_then(|object| state.surfaces.get(&object))
             .map(|record| record.id.0),
         exclusive_latch: state
             .exclusive_keyboard_focus

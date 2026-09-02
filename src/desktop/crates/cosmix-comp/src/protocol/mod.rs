@@ -8,6 +8,7 @@ pub(crate) mod port_observation;
 pub(crate) mod port_snapshot;
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
     env,
     error::Error,
@@ -2650,6 +2651,13 @@ impl ProtocolServer {
         let layer_shell_state = WlrLayerShellState::new::<WaylandState>(&display_handle);
         let session_lock_state =
             SessionLockManagerState::new::<WaylandState, _>(&display_handle, |_| true);
+        // Visible only to clients carrying XWaylandClientData; native clients
+        // cannot bind it (Smithay's can_view filter).
+        #[cfg(feature = "xwayland")]
+        let xwayland_shell_state =
+            smithay::wayland::xwayland_shell::XWaylandShellState::new::<WaylandState>(
+                &display_handle,
+            );
         display_handle.create_global::<WaylandState, ZwlrScreencopyManagerV1, _>(3, ());
         let xdg_decoration_state = XdgDecorationState::new::<WaylandState>(&display_handle);
         let fractional_scale_state =
@@ -2787,6 +2795,10 @@ impl ProtocolServer {
             xdg_decoration_state,
             fractional_scale_state,
             viewporter_state,
+            #[cfg(feature = "xwayland")]
+            xwayland_shell_state,
+            #[cfg(feature = "xwayland")]
+            xwayland: xwayland::XwaylandRuntime::new(socket_name.to_owned()),
             shm_state,
             dmabuf_state,
             drm_syncobj_state,
@@ -2907,6 +2919,14 @@ impl ProtocolServer {
         let mut state = state;
         #[cfg(feature = "bus")]
         state.refresh_corner_regions();
+
+        // Spawn the first XWayland generation once the event loop exists.
+        // Not under `cfg(test)`: the in-process protocol tests must never
+        // launch a real Xwayland; the live gate owns that proof.
+        #[cfg(all(feature = "xwayland", not(test)))]
+        let mut state = state;
+        #[cfg(all(feature = "xwayland", not(test)))]
+        state.start_xwayland();
 
         event_loop
             .handle()
@@ -3282,6 +3302,11 @@ impl ProtocolServer {
             }
             Ok(())
         })();
+        // Orderly XWayland teardown: descriptor removed first, launches
+        // refused, X records destroyed, source/XWM dropped — before the rest
+        // of protocol teardown proceeds.
+        #[cfg(feature = "xwayland")]
+        self.state.shutdown_xwayland();
         let reason = match &result {
             Ok(()) => self
                 .state
@@ -4268,6 +4293,19 @@ fn surface_is_presentable(record: &SurfaceRecord) -> bool {
     record.mapped && !matches!(record.role, SurfaceRole::Dormant(_))
 }
 
+/// A committed buffer may map the surface unless it belongs to an X11 window
+/// that is not yet association+map eligible: the backing is retained for the
+/// map grant to republish, but nothing is presented early.
+fn commit_may_map_surface(record: &SurfaceRecord) -> bool {
+    #[cfg(feature = "xwayland")]
+    if let SurfaceRole::X11(role) = &record.role {
+        return role.phase.eligible();
+    }
+    #[cfg(not(feature = "xwayland"))]
+    let _ = record;
+    true
+}
+
 fn protocol_event_retained_bytes(event: &ProtocolEvent) -> usize {
     match event {
         ProtocolEvent::SurfaceUpserted {
@@ -4333,7 +4371,10 @@ fn scene_decoration_mode(mode: DecorationMode) -> SceneDecorationMode {
 
 fn sync_toplevel_scene_state(record: &mut SurfaceRecord) {
     record.layout.toplevel = match (&record.role, record.committed_window_geometry) {
-        (SurfaceRole::Toplevel(_), Some(window_geometry)) => Some(ToplevelSceneState {
+        // Both managed-toplevel roles publish the same scene state; the
+        // renderer selects SSD chrome purely on `decoration == ServerSide`
+        // and never learns which protocol the window arrived through.
+        (role, Some(window_geometry)) if role.managed_toplevel() => Some(ToplevelSceneState {
             decoration: record.committed_decoration,
             focused: record.focused,
             committed_maximized: record.committed_maximized,
@@ -4553,6 +4594,28 @@ enum SurfaceRole {
         parent: WlSurface,
     },
     Dormant(WlSurface),
+    /// A normal managed X11 toplevel, created at XWayland association time.
+    /// Override-redirect windows never get this role (X-1 refusal).
+    #[cfg(feature = "xwayland")]
+    X11(X11ToplevelRole),
+}
+
+#[cfg(feature = "xwayland")]
+struct X11ToplevelRole {
+    /// The associated Wayland surface XWayland commits buffers through.
+    wl_surface: WlSurface,
+    surface: smithay::xwayland::X11Surface,
+    xid: smithay::xwayland::xwm::X11Window,
+    /// XWayland generation this window belongs to; teardown is
+    /// generation-guarded.
+    #[allow(dead_code)]
+    generation: u64,
+    /// Association/map eligibility state machine (the presentation gate).
+    phase: xwayland::X11WindowPhase,
+    /// Last granted global content rectangle (X geometry authority; the
+    /// committed buffer remains the presentation authority).
+    granted_geometry: Rectangle<i32, Logical>,
+    fullscreen: bool,
 }
 
 struct LockSurfaceRole {
@@ -4899,6 +4962,8 @@ impl SurfaceRole {
     fn scene_kind(&self) -> SceneSurfaceKind {
         match self {
             Self::Toplevel(_) => SceneSurfaceKind::Toplevel,
+            #[cfg(feature = "xwayland")]
+            Self::X11(_) => SceneSurfaceKind::Toplevel,
             Self::Subsurface { .. } => SceneSurfaceKind::Subsurface,
             Self::Popup(_) => SceneSurfaceKind::Popup,
             Self::Layer(_) => SceneSurfaceKind::Subsurface,
@@ -4917,6 +4982,8 @@ impl SurfaceRole {
             Self::LockSurface(role) => role.surface.wl_surface(),
             Self::Subsurface { surface, .. } => surface,
             Self::Dormant(surface) => surface,
+            #[cfg(feature = "xwayland")]
+            Self::X11(role) => &role.wl_surface,
         }
     }
 
@@ -4928,6 +4995,32 @@ impl SurfaceRole {
             | Self::LockSurface(_)
             | Self::Subsurface { .. }
             | Self::Dormant(_) => None,
+            // Deliberately None: this accessor answers "which xdg toplevel",
+            // and X11 windows have none. Managed-toplevel policy uses
+            // `managed_toplevel()` instead.
+            #[cfg(feature = "xwayland")]
+            Self::X11(_) => None,
+        }
+    }
+
+    /// Whether this role is a managed toplevel window — xdg or X11 — for
+    /// chrome, focus, stacking and foreign-toplevel policy. Every policy
+    /// site that used to test `SurfaceRole::Toplevel` alone must use this
+    /// unless it genuinely needs the xdg configure machinery.
+    fn managed_toplevel(&self) -> bool {
+        match self {
+            Self::Toplevel(_) => true,
+            #[cfg(feature = "xwayland")]
+            Self::X11(_) => true,
+            _ => false,
+        }
+    }
+
+    #[cfg(feature = "xwayland")]
+    fn x11(&self) -> Option<&X11ToplevelRole> {
+        match self {
+            Self::X11(role) => Some(role),
+            _ => None,
         }
     }
 
@@ -4939,6 +5032,8 @@ impl SurfaceRole {
             | Self::Layer(_)
             | Self::LockSurface(_)
             | Self::Dormant(_) => None,
+            #[cfg(feature = "xwayland")]
+            Self::X11(_) => None,
         }
     }
 
@@ -4950,6 +5045,8 @@ impl SurfaceRole {
             Self::LockSurface(_) => "lock",
             Self::Subsurface { .. } => "subsurface",
             Self::Dormant(_) => "dormant",
+            #[cfg(feature = "xwayland")]
+            Self::X11(_) => "x11-toplevel",
         }
     }
 }
@@ -5287,6 +5384,10 @@ struct WaylandState {
     fractional_scale_state: FractionalScaleManagerState,
     #[allow(dead_code)]
     viewporter_state: ViewporterState,
+    #[cfg(feature = "xwayland")]
+    xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
+    #[cfg(feature = "xwayland")]
+    xwayland: xwayland::XwaylandRuntime,
     shm_state: ShmState,
     dmabuf_state: DmabufState,
     drm_syncobj_state: Option<ExplicitSyncGlobal>,
@@ -7987,7 +8088,7 @@ impl WaylandState {
         }
         let Some((id, commit_count, title, app_id)) =
             self.surfaces.get(&surface.id()).and_then(|record| {
-                (record.mapped && matches!(record.role, SurfaceRole::Toplevel(_))).then(|| {
+                (record.mapped && record.role.managed_toplevel()).then(|| {
                     (
                         record.id,
                         record.commit_count,
@@ -8118,13 +8219,23 @@ impl WaylandState {
         else {
             return;
         };
-        let client_state = client_data
-            .downcast_ref::<WaylandClientState>()
-            .expect("all clients are registered with WaylandClientState");
         let display_handle = self.display_handle.clone();
-        client_state
-            .compositor_state
-            .blocker_cleared(self, &display_handle);
+        if let Some(client_state) = client_data.downcast_ref::<WaylandClientState>() {
+            client_state
+                .compositor_state
+                .blocker_cleared(self, &display_handle);
+            return;
+        }
+        #[cfg(feature = "xwayland")]
+        if let Some(client_state) =
+            client_data.downcast_ref::<smithay::xwayland::XWaylandClientData>()
+        {
+            client_state
+                .compositor_state
+                .blocker_cleared(self, &display_handle);
+            return;
+        }
+        unreachable!("clients carry WaylandClientState or XWaylandClientData")
     }
 
     fn prepare_scene_commit(&self, surface: &WlSurface) {
@@ -8701,6 +8812,10 @@ impl WaylandState {
         self.mark_stack_dirty(_cause);
         self.refresh_committed_surface_stack(surface);
         self.invalidate_pointer_hit_test();
+        // The comp scene is authoritative for cross-protocol ordering; every
+        // restack is mirrored into the XWM stacking state.
+        #[cfg(feature = "xwayland")]
+        self.sync_xwm_stacking();
     }
 
     fn validate_layer_surface_state(&self, surface: &WlSurface) -> Result<(), String> {
@@ -9128,6 +9243,10 @@ impl WaylandState {
                 SurfaceRole::Layer(_)
                 | SurfaceRole::Subsurface { .. }
                 | SurfaceRole::Dormant(_) => None,
+                // X11 has no xdg configure/ack cycle; its geometry authority
+                // is `X11Surface::configure`, never a serial.
+                #[cfg(feature = "xwayland")]
+                SurfaceRole::X11(_) => None,
             }
         })?;
 
@@ -9313,6 +9432,8 @@ impl WaylandState {
                 SurfaceRole::Layer(_)
                 | SurfaceRole::Subsurface { .. }
                 | SurfaceRole::Dormant(_) => None,
+                #[cfg(feature = "xwayland")]
+                SurfaceRole::X11(_) => None,
             });
         let Some(target) = target else {
             return true;
@@ -9382,6 +9503,8 @@ impl WaylandState {
                 SurfaceRole::Layer(role) => Some(ConfigureTarget::Layer(role.surface.clone())),
                 SurfaceRole::LockSurface(role) => Some(ConfigureTarget::Lock(role.surface.clone())),
                 SurfaceRole::Subsurface { .. } | SurfaceRole::Dormant(_) => None,
+                #[cfg(feature = "xwayland")]
+                SurfaceRole::X11(_) => None,
             });
         let reset_xdg_protocol_state = match target {
             Some(ConfigureTarget::Toplevel(toplevel)) => {
@@ -9536,6 +9659,10 @@ impl WaylandState {
                 | SurfaceRole::Popup(_)
                 | SurfaceRole::Layer(_)
                 | SurfaceRole::LockSurface(_) => true,
+                // The X11 association is established before the record exists
+                // (`surface_associated` creates it), so it is always current.
+                #[cfg(feature = "xwayland")]
+                SurfaceRole::X11(_) => true,
             };
             let visible = effectively_visible(
                 record.mapped && !record.minimized,
@@ -9798,19 +9925,21 @@ impl WaylandState {
     }
 
     fn clear_focus_for_surface(&mut self, surface: &WlSurface) {
-        let clears_keyboard = focus_is_surface(self.keyboard.current_focus().as_ref(), surface)
+        let clears_keyboard = focus_targets_surface(self.keyboard.current_focus().as_ref(), surface)
             || self.exclusive_keyboard_focus.as_ref() == Some(&surface.id());
         if clears_keyboard {
             self.arbitrate_keyboard_focus(None, false, true);
         }
 
         let pointer_focus_matches =
-            focus_is_surface(self.pointer.current_focus().as_ref(), surface);
+            focus_targets_surface(self.pointer.current_focus().as_ref(), surface);
         let pointer_grab_matches = self
             .pointer
             .grab_start_data()
             .and_then(|start| start.focus)
-            .is_some_and(|(focus, _)| focus == *surface);
+            .is_some_and(|(focus, _)| {
+                focus.surface().is_some_and(|focused| focused.as_ref() == surface)
+            });
         if pointer_focus_matches || pointer_grab_matches {
             let pointer = self.pointer.clone();
             if self.pointer_hit_test_reconciliation_deferred() {
@@ -9830,7 +9959,7 @@ impl WaylandState {
             let (x, y) = self.cursor_position;
             let replacement = self.surface_at(x, y).map(|record| {
                 (
-                    record.role.wl_surface().clone(),
+                    self.seat_focus_target_for(record.role.wl_surface()),
                     (f64::from(record.layout.x), f64::from(record.layout.y)).into(),
                 )
             });
@@ -9957,6 +10086,13 @@ impl WaylandState {
         let Some(record) = self.surfaces.remove(&surface.id()) else {
             return;
         };
+        // Whichever side dies first — DestroyNotify or the wl_surface — the
+        // XID maps must not keep pointing at a removed record.
+        #[cfg(feature = "xwayland")]
+        if let SurfaceRole::X11(role) = &record.role {
+            self.xwayland.surfaces_by_xid.remove(&role.xid);
+            self.xwayland.xids_by_object.remove(&surface.id());
+        }
         self.surface_objects.remove(&record.id);
         self.foreign_toplevel_identifiers.remove(&record.id);
         if record.layout.visible {
@@ -10564,7 +10700,9 @@ impl WaylandState {
         };
         self.update_chrome_pointer_from_target(target.clone());
         let focus = match target {
-            Some(PointerTarget::Client { surface, origin }) => Some((surface, origin)),
+            Some(PointerTarget::Client { surface, origin }) => {
+                Some((self.seat_focus_target_for(&surface), origin))
+            }
             Some(PointerTarget::Chrome { .. }) | None => None,
         };
         let pointer = self.pointer.clone();
@@ -10798,6 +10936,7 @@ impl WaylandState {
             }
             self.arbitrate_keyboard_focus(requested, false, true);
         }
+        let focus = focus.map(|(surface, origin)| (self.seat_focus_target_for(&surface), origin));
         touch.down(
             self,
             focus,
@@ -10820,7 +10959,9 @@ impl WaylandState {
             return;
         };
         let (x, y) = clamp_point_to_seat((x, y), &self.backend.seat_regions()).position;
-        let focus = self.touch_focus_at(x, y);
+        let focus = self
+            .touch_focus_at(x, y)
+            .map(|(surface, origin)| (self.seat_focus_target_for(&surface), origin));
         touch.motion(
             self,
             focus,
@@ -10986,12 +11127,15 @@ impl WaylandState {
 
         if pressed {
             if action.is_none() {
-                self.last_keyboard_action = keyboard.current_focus().map(|surface| {
-                    (
-                        serial,
-                        canonical_root_surface(&self.popup_manager, &surface),
-                    )
-                });
+                self.last_keyboard_action = keyboard
+                    .current_focus()
+                    .and_then(|target| target.owned_surface())
+                    .map(|surface| {
+                        (
+                            serial,
+                            canonical_root_surface(&self.popup_manager, &surface),
+                        )
+                    });
             } else {
                 invalidate_keyboard_action(&mut self.last_keyboard_action);
             }
@@ -11098,27 +11242,40 @@ impl WaylandState {
         match action {
             BindingAction::RequestCloseFocused => {
                 debug_assert!(!action.needs_ecs());
-                let Some(focused) = self.keyboard.current_focus() else {
+                let Some(focused) = self
+                    .keyboard
+                    .current_focus()
+                    .and_then(|target| target.owned_surface())
+                else {
                     tracing::debug!("close-focused binding had no keyboard focus");
                     return;
                 };
                 let root = canonical_root_surface(&self.popup_manager, &focused);
-                let Some(toplevel) = self
-                    .surfaces
-                    .get(&root.id())
-                    .and_then(|record| record.role.toplevel())
-                    .filter(|toplevel| toplevel.wl_surface().is_alive())
-                    .cloned()
-                else {
-                    tracing::debug!(
-                        surface = ?focused.id(),
-                        root = ?root.id(),
-                        "close-focused binding resolved to no live toplevel"
-                    );
-                    return;
-                };
-                toplevel.send_close();
-                tracing::debug!(surface = ?root.id(), "requested focused toplevel close");
+                match self.surfaces.get(&root.id()).map(|record| &record.role) {
+                    Some(SurfaceRole::Toplevel(toplevel))
+                        if toplevel.wl_surface().is_alive() =>
+                    {
+                        toplevel.send_close();
+                        tracing::debug!(surface = ?root.id(), "requested focused toplevel close");
+                    }
+                    // X11 close: WM_DELETE_WINDOW when supported, destroy
+                    // otherwise (Smithay decides).
+                    #[cfg(feature = "xwayland")]
+                    Some(SurfaceRole::X11(role)) => {
+                        if let Err(error) = role.surface.close() {
+                            tracing::debug!(%error, "failed to request X11 window close");
+                        } else {
+                            tracing::debug!(surface = ?root.id(), "requested focused X11 close");
+                        }
+                    }
+                    _ => {
+                        tracing::debug!(
+                            surface = ?focused.id(),
+                            root = ?root.id(),
+                            "close-focused binding resolved to no live toplevel"
+                        );
+                    }
+                }
             }
             BindingAction::RestoreMostRecentlyMinimized => {
                 debug_assert!(!action.needs_ecs());
@@ -11252,7 +11409,10 @@ impl WaylandState {
         } else {
             self.pointer_target_at(x, y)
         };
-        let current = self.pointer.current_focus().map(|surface| surface.id());
+        let current = self
+            .pointer
+            .current_focus()
+            .and_then(|target| target.surface_id());
         let next = match target.as_ref() {
             Some(PointerTarget::Client { surface, .. }) => Some(surface.id()),
             Some(PointerTarget::Chrome { .. }) | None => None,
@@ -11273,7 +11433,7 @@ impl WaylandState {
                 let pointer = self.pointer.clone();
                 pointer.motion(
                     self,
-                    Some((surface.clone(), origin)),
+                    Some((self.seat_focus_target_for(&surface), origin)),
                     &MotionEvent {
                         location: (x, y).into(),
                         serial: SERIAL_COUNTER.next_serial(),
@@ -11288,18 +11448,19 @@ impl WaylandState {
 
     fn record_pointer_focus_local_position(
         &mut self,
-        requested: Option<&(WlSurface, Point<f64, Logical>)>,
+        requested: Option<&(SeatFocusTarget, Point<f64, Logical>)>,
         global: (f64, f64),
     ) {
         let current = self.pointer.current_focus();
         let previous = self.pointer_focus_local_position.take();
         self.pointer_focus_local_position = current.and_then(|current| {
-            if let Some((surface, origin)) = requested
-                && *surface == current
+            let current_id = current.surface_id()?;
+            if let Some((target, origin)) = requested
+                && target.surface_id().as_ref() == Some(&current_id)
             {
-                return Some((current.id(), (global.0 - origin.x, global.1 - origin.y)));
+                return Some((current_id, (global.0 - origin.x, global.1 - origin.y)));
             }
-            previous.filter(|(object, _)| *object == current.id())
+            previous.filter(|(object, _)| *object == current_id)
         });
     }
 
@@ -11398,7 +11559,7 @@ impl WaylandState {
             .values()
             .filter_map(|record| {
                 if !record.layout.visible
-                    || !matches!(record.role, SurfaceRole::Toplevel(_))
+                    || !record.role.managed_toplevel()
                     || record.committed_decoration != SceneDecorationMode::ServerSide
                 {
                     return None;
@@ -11545,7 +11706,7 @@ impl WaylandState {
         };
         if !record.mapped
             || record.committed_decoration != SceneDecorationMode::ServerSide
-            || !matches!(record.role, SurfaceRole::Toplevel(_))
+            || !record.role.managed_toplevel()
         {
             return false;
         }
@@ -11603,19 +11764,20 @@ impl WaylandState {
                     start_origin,
                     start_size,
                 });
-                let toplevel = self
-                    .surfaces
-                    .get_mut(&object)
-                    .and_then(|record| {
-                        record.configured_size = start_size;
-                        record.role.toplevel().cloned()
-                    })
-                    .expect("captured resize keeps its toplevel role");
-                set_toplevel_configuration(&toplevel, start_size);
-                toplevel.with_pending_state(|state| {
-                    state.states.set(xdg_toplevel::State::Resizing);
+                let toplevel = self.surfaces.get_mut(&object).and_then(|record| {
+                    record.configured_size = start_size;
+                    record.role.toplevel().cloned()
                 });
-                let _ = self.send_pending_toplevel_configure(&surface, false);
+                // xdg toplevels get a Resizing configure; X11 windows have no
+                // configure cycle — `update_interactive_pointer` issues X
+                // configures as the size changes.
+                if let Some(toplevel) = toplevel {
+                    set_toplevel_configuration(&toplevel, start_size);
+                    toplevel.with_pending_state(|state| {
+                        state.states.set(xdg_toplevel::State::Resizing);
+                    });
+                    let _ = self.send_pending_toplevel_configure(&surface, false);
+                }
             }
             ChromePointerGrabKind::Button(caption) => {
                 self.update_chrome_pressed(Some((object, caption, button)));
@@ -11652,26 +11814,44 @@ impl WaylandState {
             self.handle_titlebar_click(&grab.surface, time);
         }
         match action {
-            Some(CaptionButton::Close) => {
-                if let Some(toplevel) = self
-                    .surfaces
-                    .get(&grab.surface.id())
-                    .and_then(|record| record.role.toplevel())
-                    .filter(|toplevel| toplevel.wl_surface().is_alive())
-                    .cloned()
-                {
-                    toplevel.send_close();
+            Some(CaptionButton::Close) => self.close_managed_toplevel(&grab.surface),
+            Some(CaptionButton::Minimize) => self.minimize_toplevel(&grab.surface),
+            Some(CaptionButton::Maximize) => self.toggle_managed_maximized(&grab.surface),
+            None => {}
+        }
+    }
+
+    /// Chrome close for either managed-toplevel protocol: xdg `close` event,
+    /// or X11 `WM_DELETE_WINDOW`/destroy via Smithay.
+    fn close_managed_toplevel(&mut self, surface: &WlSurface) {
+        match self.surfaces.get(&surface.id()).map(|record| &record.role) {
+            Some(SurfaceRole::Toplevel(toplevel)) if toplevel.wl_surface().is_alive() => {
+                toplevel.send_close();
+            }
+            #[cfg(feature = "xwayland")]
+            Some(SurfaceRole::X11(role)) => {
+                if let Err(error) = role.surface.close() {
+                    tracing::debug!(%error, "failed to request X11 window close");
                 }
             }
-            Some(CaptionButton::Minimize) => self.minimize_toplevel(&grab.surface),
-            Some(CaptionButton::Maximize) => {
-                let maximized = self
-                    .surfaces
-                    .get(&grab.surface.id())
-                    .is_some_and(|record| record.requested_maximized);
-                self.request_maximized_state(&grab.surface, !maximized);
+            _ => {}
+        }
+    }
+
+    /// Chrome maximize toggle for either managed-toplevel protocol.
+    fn toggle_managed_maximized(&mut self, surface: &WlSurface) {
+        let Some(record) = self.surfaces.get(&surface.id()) else {
+            return;
+        };
+        let maximized = record.requested_maximized;
+        match &record.role {
+            SurfaceRole::Toplevel(_) => self.request_maximized_state(surface, !maximized),
+            #[cfg(feature = "xwayland")]
+            SurfaceRole::X11(role) => {
+                let window = role.surface.clone();
+                self.request_x11_maximized(&window, !maximized);
             }
-            None => {}
+            _ => {}
         }
     }
 
@@ -11688,11 +11868,7 @@ impl WaylandState {
                     && dx * dx + dy * dy <= TITLEBAR_DOUBLE_CLICK_SLOP * TITLEBAR_DOUBLE_CLICK_SLOP
             });
         if double_click {
-            let maximized = self
-                .surfaces
-                .get(&surface.id())
-                .is_some_and(|record| record.requested_maximized);
-            self.request_maximized_state(surface, !maximized);
+            self.toggle_managed_maximized(surface);
         } else {
             self.titlebar_click_candidate = Some(TitlebarClickCandidate {
                 surface: surface.clone(),
@@ -11845,6 +12021,45 @@ impl WaylandState {
         }
     }
 
+    /// Min/max size constraints for interactive resize: WM_NORMAL_HINTS for
+    /// X11 windows, the xdg surface cached state for everything else.
+    fn managed_size_constraints(&self, surface: &WlSurface) -> ((i32, i32), (i32, i32)) {
+        #[cfg(feature = "xwayland")]
+        if let Some(role) = self
+            .surfaces
+            .get(&surface.id())
+            .and_then(|record| record.role.x11())
+        {
+            let min = role
+                .surface
+                .min_size()
+                .map(|size| (size.w, size.h))
+                .unwrap_or((0, 0));
+            let max = role
+                .surface
+                .max_size()
+                .map(|size| (size.w, size.h))
+                .unwrap_or((0, 0));
+            return (min, max);
+        }
+        surface_size_constraints(surface)
+    }
+
+    /// Resolve a `wl_surface` to its seat focus target: X11-managed roots
+    /// focus through Smithay's `X11Surface` (which performs the X half of
+    /// focus), everything else through the surface itself.
+    fn seat_focus_target_for(&self, surface: &WlSurface) -> SeatFocusTarget {
+        #[cfg(feature = "xwayland")]
+        if let Some(role) = self
+            .surfaces
+            .get(&surface.id())
+            .and_then(|record| record.role.x11())
+        {
+            return SeatFocusTarget::X11(role.surface.clone());
+        }
+        SeatFocusTarget::Wayland(surface.clone())
+    }
+
     fn raise_surface(&mut self, surface: &WlSurface) {
         let Some(band) = self
             .surfaces
@@ -11917,9 +12132,7 @@ impl WaylandState {
         self.surfaces
             .values()
             .filter(|record| {
-                record.mapped
-                    && record.layout.visible
-                    && matches!(record.role, SurfaceRole::Toplevel(_))
+                record.mapped && record.layout.visible && record.role.managed_toplevel()
             })
             .max_by(|left, right| surface_stack_cmp(left, right))
             .map(|record| record.role.wl_surface().clone())
@@ -11974,11 +12187,14 @@ impl WaylandState {
         self.mark_focus_before_change("wayland.focus");
         'focus_policy: {
             let previous_exclusive = self.exclusive_keyboard_focus.take();
-            let current_layer_became_none =
-                self.keyboard.current_focus().as_ref().is_some_and(|focus| {
-                    self.layer_keyboard_interactivity_for_surface(focus)
-                        == Some(KeyboardInteractivity::None)
-                });
+            let current_focus_surface = self
+                .keyboard
+                .current_focus()
+                .and_then(|target| target.owned_surface());
+            let current_layer_became_none = current_focus_surface.as_ref().is_some_and(|focus| {
+                self.layer_keyboard_interactivity_for_surface(focus)
+                    == Some(KeyboardInteractivity::None)
+            });
             let target = if self.session_lock_active() {
                 requested
                     .filter(|surface| {
@@ -12013,7 +12229,7 @@ impl WaylandState {
                     break 'focus_policy;
                 }
             };
-            if self.keyboard.current_focus() == target
+            if current_focus_surface == target
                 || self.keyboard_focus_is_related_grabbing_popup(target.as_ref())
             {
                 break 'focus_policy;
@@ -12022,7 +12238,8 @@ impl WaylandState {
                 let popup_root = self
                     .keyboard
                     .grab_start_data()
-                    .and_then(|start| start.focus);
+                    .and_then(|start| start.focus)
+                    .and_then(|focus| focus.owned_surface());
                 let keyboard = self.keyboard.clone();
                 keyboard.unset_grab(self);
                 if let Some(root) = popup_root {
@@ -12030,13 +12247,16 @@ impl WaylandState {
                         .pointer
                         .grab_start_data()
                         .and_then(|start| start.focus)
-                        .is_some_and(|(focus, _)| focus == root);
+                        .is_some_and(|(focus, _)| {
+                            focus.surface().is_some_and(|focused| focused.as_ref() == &root)
+                        });
                     if pointer_grabs_root {
                         self.defer_or_cancel_pointer_grab_for_focus_policy();
                     }
                     self.dismiss_popup_descendants(&root);
                 }
             }
+            let target = target.map(|surface| self.seat_focus_target_for(&surface));
             let keyboard = self.keyboard.clone();
             keyboard.set_focus(self, target, SERIAL_COUNTER.next_serial());
         }
@@ -12046,13 +12266,18 @@ impl WaylandState {
         let Some(target) = target else {
             return false;
         };
-        let Some(current) = self.keyboard.current_focus() else {
+        let Some(current) = self
+            .keyboard
+            .current_focus()
+            .and_then(|focus| focus.owned_surface())
+        else {
             return false;
         };
         let Some(grab_root) = self
             .keyboard
             .grab_start_data()
             .and_then(|start| start.focus)
+            .and_then(|focus| focus.owned_surface())
         else {
             return false;
         };
@@ -12074,7 +12299,9 @@ impl WaylandState {
         };
         self.update_chrome_pointer_from_target(target.clone());
         let focus = match target {
-            Some(PointerTarget::Client { surface, origin }) => Some((surface, origin)),
+            Some(PointerTarget::Client { surface, origin }) => {
+                Some((self.seat_focus_target_for(&surface), origin))
+            }
             Some(PointerTarget::Chrome { .. }) | None => None,
         };
         let pointer = self.pointer.clone();
@@ -12096,10 +12323,7 @@ impl WaylandState {
         self.titlebar_click_candidate = None;
         self.reset_chrome_pointer_tracking(&surface.id());
         let Some((object, _id)) = self.surfaces.get_mut(&surface.id()).and_then(|record| {
-            if !record.mapped
-                || record.minimized
-                || !matches!(record.role, SurfaceRole::Toplevel(_))
-            {
+            if !record.mapped || record.minimized || !record.role.managed_toplevel() {
                 return None;
             }
             record.minimized = true;
@@ -12107,6 +12331,16 @@ impl WaylandState {
         }) else {
             return;
         };
+        // X11 windows also learn the state through EWMH so the client can
+        // stop rendering.
+        #[cfg(feature = "xwayland")]
+        if let Some(role) = self
+            .surfaces
+            .get(&object)
+            .and_then(|record| record.role.x11())
+        {
+            let _ = role.surface.set_suspended(true);
+        }
         self.minimized_toplevels.retain(|entry| *entry != object);
         self.minimized_toplevels.push(object);
         #[cfg(feature = "bus")]
@@ -12119,10 +12353,7 @@ impl WaylandState {
     fn restore_most_recently_minimized(&mut self) {
         while let Some(object) = self.minimized_toplevels.pop() {
             let restored = self.surfaces.get_mut(&object).and_then(|record| {
-                if !record.mapped
-                    || !record.minimized
-                    || !matches!(record.role, SurfaceRole::Toplevel(_))
-                {
+                if !record.mapped || !record.minimized || !record.role.managed_toplevel() {
                     return None;
                 }
                 record.minimized = false;
@@ -12131,6 +12362,14 @@ impl WaylandState {
             let Some((surface, _id)) = restored else {
                 continue;
             };
+            #[cfg(feature = "xwayland")]
+            if let Some(role) = self
+                .surfaces
+                .get(&object)
+                .and_then(|record| record.role.x11())
+            {
+                let _ = role.surface.set_suspended(false);
+            }
             #[cfg(feature = "bus")]
             self.mark_surface_dirty(_id, "wayland.focus");
             self.recompute_effective_visibility();
@@ -12552,6 +12791,30 @@ impl WaylandState {
                 );
                 let id = record.id;
                 let scene = record.scene_snapshot();
+                // An X11 window must learn its new position through an X
+                // configure (there is no xdg configure for it), or the client
+                // keeps stale global coordinates.
+                #[cfg(feature = "xwayland")]
+                if delta != (0.0, 0.0)
+                    && let SurfaceRole::X11(role) = &mut record.role
+                {
+                    let rect = Rectangle::new(
+                        (
+                            record.window_origin.0 as i32,
+                            record.window_origin.1 as i32,
+                        )
+                            .into(),
+                        (
+                            record.configured_size.0.max(1),
+                            record.configured_size.1.max(1),
+                        )
+                            .into(),
+                    );
+                    role.granted_geometry = rect;
+                    if let Err(error) = role.surface.configure(Some(rect)) {
+                        tracing::debug!(%error, "failed to send X11 move configure");
+                    }
+                }
                 self.events
                     .push(ProtocolEvent::SurfaceRelayout { id, scene });
                 #[cfg(feature = "bus")]
@@ -12607,7 +12870,7 @@ impl WaylandState {
                     0
                 };
                 let (min_size, max_size) =
-                    clamped_toplevel_constraints(surface_size_constraints(&surface));
+                    clamped_toplevel_constraints(self.managed_size_constraints(&surface));
                 let min_width = min_size.0;
                 let min_height = min_size.1;
                 let max_width = max_size.0;
@@ -12656,6 +12919,23 @@ impl WaylandState {
                     record.window_origin.0 - old_origin.0,
                     record.window_origin.1 - old_origin.1,
                 );
+                // X11 interactive resize is granted through X configures; the
+                // committed buffer remains the presentation authority.
+                #[cfg(feature = "xwayland")]
+                if let SurfaceRole::X11(role) = &mut record.role {
+                    let rect = Rectangle::new(
+                        (
+                            record.window_origin.0 as i32,
+                            record.window_origin.1 as i32,
+                        )
+                            .into(),
+                        (new_size.0.max(1), new_size.1.max(1)).into(),
+                    );
+                    role.granted_geometry = rect;
+                    if let Err(error) = role.surface.configure(Some(rect)) {
+                        tracing::debug!(%error, "failed to send X11 resize configure");
+                    }
+                }
                 if let Some(toplevel) = toplevel {
                     set_toplevel_configuration(&toplevel, new_size);
                     let _ = self.send_pending_toplevel_configure(&surface, true);
@@ -12892,6 +13172,19 @@ impl WaylandState {
     ) -> Option<SceneWindowGeometry> {
         let (explicit, existing) = {
             let record = self.surfaces.get(&surface.id())?;
+            // X11 content geometry is always the full committed buffer at
+            // origin: SSD sits outside it, and X outer-frame coordinates must
+            // never be fed into `SceneWindowGeometry` (they live in
+            // `window_origin`/`granted_geometry` instead).
+            #[cfg(feature = "xwayland")]
+            if matches!(record.role, SurfaceRole::X11(_)) {
+                return Some(SceneWindowGeometry {
+                    x: 0.0,
+                    y: 0.0,
+                    width: presented_size.0,
+                    height: presented_size.1,
+                });
+            }
             if !matches!(record.role, SurfaceRole::Toplevel(_)) {
                 return None;
             }
@@ -12917,6 +13210,8 @@ impl WaylandState {
             match &record.role {
                 SurfaceRole::Subsurface { parent, .. } => current = parent.clone(),
                 SurfaceRole::Toplevel(_) => return Some(current),
+                #[cfg(feature = "xwayland")]
+                SurfaceRole::X11(_) => return Some(current),
                 SurfaceRole::Popup(_)
                 | SurfaceRole::Layer(_)
                 | SurfaceRole::LockSurface(_)
@@ -13604,7 +13899,7 @@ impl WaylandState {
                         self.release_buffer_token(backing_retention_token);
                         return;
                     };
-                    record.mapped = true;
+                    record.mapped = commit_may_map_surface(record);
                     let old_origin = (record.layout.x, record.layout.y);
                     if let Some(window_geometry) = window_geometry {
                         record.layout.x = record.window_origin.0 - window_geometry.x;
@@ -13764,7 +14059,7 @@ impl WaylandState {
                 let Some(record) = self.surfaces.get_mut(&surface.id()) else {
                     return;
                 };
-                record.mapped = true;
+                record.mapped = commit_may_map_surface(record);
                 let old_origin = (record.layout.x, record.layout.y);
                 if let Some(window_geometry) = window_geometry {
                     record.layout.x = record.window_origin.0 - window_geometry.x;
@@ -13914,10 +14209,6 @@ impl WaylandState {
     }
 }
 
-fn focus_is_surface<T: PartialEq>(focus: Option<&T>, surface: &T) -> bool {
-    focus == Some(surface)
-}
-
 fn surface_stack_cmp(left: &SurfaceRecord, right: &SurfaceRecord) -> std::cmp::Ordering {
     left.layout
         .z
@@ -14009,7 +14300,8 @@ fn pointer_grab_targets_surface(
     pointer
         .grab_start_data()
         .and_then(|start| start.focus)
-        .is_some_and(|(focus, _)| {
+        .and_then(|(focus, _)| focus.owned_surface())
+        .is_some_and(|focus| {
             canonical_root_surface(popup_manager, &focus)
                 == canonical_root_surface(popup_manager, requested)
         })
@@ -14035,9 +14327,14 @@ fn invalidate_keyboard_action<T>(action: &mut Option<T>) {
 
 mod acquire_gate;
 mod explicit_sync;
+mod focus;
 mod handlers;
 mod input;
 mod release_use;
+#[cfg(feature = "xwayland")]
+mod xwayland;
+
+use focus::{SeatFocusTarget, focus_targets_surface};
 
 struct WaylandClientState {
     compositor_state: CompositorClientState,

@@ -64,10 +64,16 @@ impl CompositorHandler for WaylandState {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client
-            .get_data::<WaylandClientState>()
-            .expect("all clients are registered with WaylandClientState")
-            .compositor_state
+        if let Some(state) = client.get_data::<WaylandClientState>() {
+            return &state.compositor_state;
+        }
+        // The XWayland client is registered by Smithay with its own data
+        // type; treating it as native would panic on its first wl_surface.
+        #[cfg(feature = "xwayland")]
+        if let Some(state) = client.get_data::<smithay::xwayland::XWaylandClientData>() {
+            return &state.compositor_state;
+        }
+        unreachable!("clients carry WaylandClientState or XWaylandClientData")
     }
 
     fn new_surface(&mut self, surface: &WlSurface) {
@@ -363,6 +369,8 @@ impl CompositorHandler for WaylandState {
                         | SurfaceRole::LockSurface(_)
                         | SurfaceRole::Subsurface { .. }
                         | SurfaceRole::Dormant(_) => None,
+                        #[cfg(feature = "xwayland")]
+                        SurfaceRole::X11(_) => None,
                     })
             })
             .flatten();
@@ -421,6 +429,12 @@ impl CompositorHandler for WaylandState {
                         Some(ConfigureTarget::Lock(role.surface.clone()))
                     }
                     SurfaceRole::Subsurface { .. } | SurfaceRole::Dormant(_) => None,
+                    // X11 bypasses the xdg configure/ack gate entirely: its
+                    // first buffer must not be retired waiting for a serial
+                    // that can never exist. Map eligibility is gated in
+                    // `commit_may_map_surface` instead.
+                    #[cfg(feature = "xwayland")]
+                    SurfaceRole::X11(_) => None,
                 });
         if configure_target.is_some() && !layer_restarts_configure_cycle {
             let initial_sent = self
@@ -1452,7 +1466,8 @@ impl XdgShellHandler for WaylandState {
                 && touch
                     .grab_start_data()
                     .and_then(|start| start.focus)
-                    .is_some_and(|(focus, _)| {
+                    .and_then(|(focus, _)| focus.owned_surface())
+                    .is_some_and(|focus| {
                         canonical_root_surface(&self.popup_manager, &focus)
                             == canonical_root_surface(&self.popup_manager, &root)
                     })
@@ -1481,7 +1496,11 @@ impl XdgShellHandler for WaylandState {
             return;
         }
         let seat = self.seat.clone();
-        match self.popup_manager.grab_popup(root, popup, &seat, serial) {
+        let root_target = SeatFocusTarget::Wayland(root);
+        match self
+            .popup_manager
+            .grab_popup(root_target, popup, &seat, serial)
+        {
             Ok(grab) => {
                 self.cancel_chrome_pointer_grab(true);
                 let pointer = self.pointer.clone();
@@ -1877,39 +1896,46 @@ impl DrmSyncobjHandler for WaylandState {
 }
 
 impl SeatHandler for WaylandState {
-    type KeyboardFocus = WlSurface;
-    type PointerFocus = WlSurface;
-    type TouchFocus = WlSurface;
+    type KeyboardFocus = SeatFocusTarget;
+    type PointerFocus = SeatFocusTarget;
+    type TouchFocus = SeatFocusTarget;
 
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&SeatFocusTarget>) {
         invalidate_keyboard_action(&mut self.last_keyboard_action);
-        let focused_root =
-            focused.map(|surface| canonical_root_surface(&self.popup_manager, surface));
-        set_data_device_focus(
-            &self.display_handle,
-            seat,
-            (!self.session_lock_active())
-                .then(|| focused.and_then(|surface| surface.client()))
-                .flatten(),
-        );
+        let focused_surface = focused
+            .and_then(SeatFocusTarget::surface)
+            .map(Cow::into_owned);
+        let focused_root = focused_surface
+            .as_ref()
+            .map(|surface| canonical_root_surface(&self.popup_manager, surface));
+        // Data-device focus is withheld from X11 targets in X-1: the
+        // compositor must not imply a clipboard bridge it refuses to provide
+        // (selection access is refused in the XWM).
+        let data_device_client = (!self.session_lock_active())
+            .then(|| match focused {
+                Some(SeatFocusTarget::Wayland(surface)) => surface.client(),
+                #[cfg(feature = "xwayland")]
+                Some(SeatFocusTarget::X11(_)) => None,
+                None => None,
+            })
+            .flatten();
+        set_data_device_focus(&self.display_handle, seat, data_device_client);
         let toplevels = self
             .surfaces
             .values()
             .filter_map(|record| {
                 record
                     .role
-                    .toplevel()
-                    .map(|toplevel| (toplevel.clone(), toplevel.wl_surface().clone()))
+                    .managed_toplevel()
+                    .then(|| record.role.wl_surface().clone())
             })
             .collect::<Vec<_>>();
-        for (toplevel, surface) in toplevels {
-            let active = focused_root
-                .as_ref()
-                .is_some_and(|focused| focused == toplevel.wl_surface());
+        for surface in toplevels {
+            let active = focused_root.as_ref().is_some_and(|focused| focused == &surface);
             if let Some(record) = self.surfaces.get_mut(&surface.id())
                 && record.focused != active
             {
@@ -1922,17 +1948,30 @@ impl SeatHandler for WaylandState {
                     });
                 }
             }
-            toplevel.with_pending_state(|state| {
-                if active {
-                    state.states.set(xdg_toplevel::State::Activated);
-                } else {
-                    state.states.unset(xdg_toplevel::State::Activated);
+            match self.surfaces.get(&surface.id()).map(|record| &record.role) {
+                Some(SurfaceRole::Toplevel(toplevel)) => {
+                    let toplevel = toplevel.clone();
+                    toplevel.with_pending_state(|state| {
+                        if active {
+                            state.states.set(xdg_toplevel::State::Activated);
+                        } else {
+                            state.states.unset(xdg_toplevel::State::Activated);
+                        }
+                    });
+                    let _ = self.send_pending_toplevel_configure(&surface, false);
                 }
-            });
-            let _ = self.send_pending_toplevel_configure(&surface, false);
+                // X11 activation is EWMH state, not an xdg configure.
+                #[cfg(feature = "xwayland")]
+                Some(SurfaceRole::X11(role)) => {
+                    if let Err(error) = role.surface.set_activated(active) {
+                        tracing::debug!(%error, "failed to set X11 EWMH activated state");
+                    }
+                }
+                _ => {}
+            }
         }
         tracing::info!(
-            surface = ?focused.map(|surface| surface.id()),
+            surface = ?focused_surface.map(|surface| surface.id()),
             "keyboard focus changed"
         );
     }
