@@ -339,6 +339,22 @@ impl X11Surface {
         self.state.lock().unwrap().motif_hints = hints.to_vec();
     }
 
+    /// Set the raw `WL_SURFACE_SERIAL` directly, bypassing the client
+    /// message that normally records it.
+    ///
+    /// CosMix vendor addition, same contract as
+    /// [`Self::set_wl_surface_offline`]: downstream deterministic compositor
+    /// tests fabricate offline `X11Surface`s and must be able to drive the
+    /// unmap ordering pin's serial CLASSIFIER — the logic that separates a
+    /// legal unpaired-serial null (serial changed since association) from a
+    /// vendored ordering flip (serial unchanged). Production code must never
+    /// call this; the `WL_SURFACE_SERIAL` client message owns the real
+    /// serial.
+    #[cfg(feature = "cosmix_offline_test")]
+    pub fn set_wl_surface_serial_offline(&self, serial: Option<u64>) {
+        self.state.lock().unwrap().wl_surface_serial = serial;
+    }
+
     /// Returns the associated wl_surface.
     ///
     /// This will only return `Some` once:

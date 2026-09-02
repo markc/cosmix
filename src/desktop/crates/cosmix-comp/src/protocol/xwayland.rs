@@ -1016,12 +1016,14 @@ impl WaylandState {
             //   consumption reads as different and drops the debt; after
             //   dismissal, focus lands on the grab ROOT — but on the NEXT
             //   input event, not at dismissal: the pointer grab notices
-            //   `has_ended()` in its next `motion` and unsets with
-            //   restore (popup/grab.rs:548), whose `unset` (:697-700)
-            //   runs `unset_keyboard_grab` = the no-restore two-arg
-            //   `KeyboardHandle::unset_grab(data)` + explicit
+            //   `has_ended()` in its next `motion` (popup/grab.rs:548) or
+            //   `button` (:586) and unsets with restore, whose `unset`
+            //   (:697-700) runs `unset_keyboard_grab` = the no-restore
+            //   two-arg `KeyboardHandle::unset_grab(data)` + explicit
             //   `set_focus(Some(self.root))` (popup/grab.rs:371-381;
-            //   keyboard/mod.rs:891-897). A consume in the
+            //   keyboard/mod.rs:891-897) — and the keyboard grab's own
+            //   `input` path restores the root directly on the next key
+            //   (:443-451). A consume in the
             //   dismissal-to-next-event window still sees pre-restore
             //   focus and DROPS — the safe direction; after the restore,
             //   the debt pays exactly when the root is the recorded
@@ -1670,20 +1672,34 @@ impl WaylandState {
         //
         // The two causes of a mapped-but-unresolvable window ARE
         // separable, just not through `wl_surface()` alone: the vendor
-        // bumps `wl_surface_serial` BEFORE both arms of the pairing branch
-        // (xwm/mod.rs:2303), so the legal unpaired-serial null
+        // records `wl_surface_serial` BEFORE both arms of the pairing
+        // branch (xwm/mod.rs:2303), so the legal unpaired-serial null
         // (xwm/mod.rs:2320-2328 — WL_SURFACE_SERIAL before its commit, an
-        // explicitly supported ordering) carries a serial NEWER than the
-        // one this role captured at association, while an ordering flip
-        // (a vendor bump moving `state.wl_surface = None` above this
-        // callback) leaves it untouched. The flip is a genuine invariant
-        // breach and logs `error!` (which also reds the nested smoke
-        // gate's bare ERROR needle — deliberately); the legal window logs
-        // `debug!`, below every gate needle. Narrowing worth knowing:
-        // `mapped` only becomes true once a buffer has presented, so this
+        // explicitly supported ordering) carries a serial DIFFERENT from
+        // the one this role captured at association (the code compares
+        // `!=`; the vendor guarantees no monotonicity), while an ordering
+        // flip (a vendor bump moving the null above this callback) leaves
+        // it untouched.
+        //
+        // The flip branch is `warn!`, not `error!`, because the runtime
+        // line is the SECONDARY instrument: a flip can only ever arrive
+        // via a vendor bump — never at runtime — and the source-text pins
+        // in the default suite (`vendored_xwm_serial_recorded_before_
+        // unpaired_insert` / `vendored_xwm_unmap_callback_precedes_the_
+        // null`) detect that deterministically at bump time. A runtime
+        // `error!` would also red the smoke gate's bare ERROR needle on
+        // the one UNRULED-OUT legal path: `by_serial` is insert-only
+        // (xwayland_shell.rs:299-304), so an X-first-associated window's
+        // serial is never registered and a client resending the IDENTICAL
+        // serial would land here legally — unproven, but not worth an
+        // abortive gate red to find out. Two more scope facts: the
+        // classifier's false-negative direction is a flip that lands
+        // INSIDE a legal re-serial window (classifies as the legal arm and
+        // is missed — coverage is "flip outside a re-serial window"); and
+        // `mapped` only becomes true once a buffer has presented, so the
         // pin is silently inert for a window that unmaps before first
         // present — benign (a pointer grab needs hit-test presence, which
-        // needs presentation), but a narrowing, not full coverage.
+        // needs presentation), but a narrowing.
         let pin = self
             .xwayland
             .surfaces_by_xid
@@ -1712,12 +1728,14 @@ impl WaylandState {
                     {
                         self.x11_unmap_pin_flip_count += 1;
                     }
-                    tracing::error!(
+                    tracing::warn!(
                         xid,
                         current = ?current.map(|surface| surface.id()),
                         expected = ?expected_surface,
-                        "vendored wl_surface null moved above unmapped_window: the \
-                         resolution-based grab teardown for this unmap is broken"
+                        "X11 wl_surface resolution diverged from the association with no \
+                         new serial: vendored unmap ordering flip (see the source pins), \
+                         or the unproven same-serial re-association residual — either way \
+                         the resolution-based grab teardown for this unmap did not run"
                     );
                 }
             }

@@ -35730,6 +35730,57 @@ fn vendored_xwayland_disconnected_stays_idempotent() {
     );
 }
 
+/// Source-text pins for the two vendored orderings the unmap ordering pin's
+/// serial classifier depends on (`xwm/mod.rs`). Both are PRIMARY
+/// instruments: the ordering can only ever change via a vendor bump — never
+/// at runtime — so a deterministic bump-time source read beats the runtime
+/// `warn!`, which exists only as the secondary signal. Same style and
+/// reasoning as `vendored_xwayland_disconnected_stays_idempotent`. Needle
+/// uniqueness was verified when written; the count asserts keep it honest.
+#[test]
+fn vendored_xwm_serial_recorded_before_unpaired_insert() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../vendor/smithay/src/xwayland/xwm/mod.rs");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("vendored xwm/mod.rs unreadable at {path:?}: {error}"));
+    let serial_write = "guard.wl_surface_serial = Some(serial)";
+    let unpaired_insert = "unpaired_surfaces.insert";
+    assert_eq!(
+        source.matches(serial_write).count(),
+        1,
+        "the serial-write needle must stay unique for the ordering assert to mean anything"
+    );
+    assert_eq!(
+        source.matches(unpaired_insert).count(),
+        1,
+        "needle uniqueness"
+    );
+    assert!(
+        source.find(serial_write).unwrap() < source.find(unpaired_insert).unwrap(),
+        "the vendor must record wl_surface_serial BEFORE the unpaired arm: the unmap \
+         ordering pin's classifier reads a changed serial as the legal unpaired window"
+    );
+}
+
+#[test]
+fn vendored_xwm_unmap_callback_precedes_the_null() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../vendor/smithay/src/xwayland/xwm/mod.rs");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("vendored xwm/mod.rs unreadable at {path:?}: {error}"));
+    let callback = "state.unmapped_window(";
+    let null = "state.wl_surface = None";
+    assert_eq!(source.matches(callback).count(), 1, "needle uniqueness");
+    assert_eq!(source.matches(null).count(), 1, "needle uniqueness");
+    assert!(
+        source.find(callback).unwrap() < source.find(null).unwrap(),
+        "the vendor must invoke unmapped_window BEFORE nulling state.wl_surface: comp's \
+         resolution-based unmap teardown (clear_focus_for_surface's pointer and grab \
+         arms) works only on that ordering, and a flipped vendor silently stops tearing \
+         down grabs held on unmapping windows"
+    );
+}
+
 #[cfg(feature = "xwayland")]
 mod x11 {
     use super::*;
@@ -37546,6 +37597,66 @@ mod x11 {
                 .surfaces_by_xid
                 .contains_key(&87),
             "the association survives for the idempotent remap"
+        );
+    }
+
+    #[test]
+    fn x11_unmap_pin_classifies_an_unchanged_serial_as_a_flip() {
+        // Round 11 MAJOR-1/2: the positive half of the classifier, driven
+        // through the new vendored serial setter so the association
+        // carries Some(serial) exactly as production does. A mapped window
+        // whose resolution nulls while its serial stays the association's
+        // is the flip shape — the counter must move. Without this test the
+        // counter was a constant zero and the flip increment could be
+        // deleted (or the whole classifier reverted to round 9's
+        // unconditional form) with all tests green.
+        let mut harness = KeybindingHarness::new(true);
+        let (sid, surface) = roleless_wl_surface(&mut harness);
+        let window = fake_x11_window(88, false, Rectangle::new((0, 0).into(), (200, 150).into()));
+        window.set_wl_surface_serial_offline(Some(41));
+        window.set_wl_surface_offline(Some(surface.clone()));
+        harness.server.state.x11_new_window(window.clone());
+        harness.server.state.x11_map_window_request(window.clone());
+        harness
+            .server
+            .state
+            .x11_associate_window(surface.clone(), window.clone());
+        commit_dmabuf(&mut harness, sid, 32, 24);
+        // The null lands with the serial UNCHANGED since association.
+        window.set_wl_surface_offline(None);
+        harness.server.state.x11_unmapped_window(window);
+        assert_eq!(
+            harness.server.state.x11_unmap_pin_flip_count, 1,
+            "an unchanged serial with a nulled resolution classifies as the flip"
+        );
+    }
+
+    #[test]
+    fn x11_unmap_pin_classifies_a_changed_serial_as_the_legal_window() {
+        // Round 11 MAJOR-2: the other half — the serial CHANGED since
+        // association, which is the vendor's legal unpaired-serial window
+        // (a new WL_SURFACE_SERIAL recorded before its commit paired).
+        // The classifier must NOT count a flip; reverting it to round 9's
+        // unconditional error/count reds exactly here.
+        let mut harness = KeybindingHarness::new(true);
+        let (sid, surface) = roleless_wl_surface(&mut harness);
+        let window = fake_x11_window(89, false, Rectangle::new((0, 0).into(), (200, 150).into()));
+        window.set_wl_surface_serial_offline(Some(41));
+        window.set_wl_surface_offline(Some(surface.clone()));
+        harness.server.state.x11_new_window(window.clone());
+        harness.server.state.x11_map_window_request(window.clone());
+        harness
+            .server
+            .state
+            .x11_associate_window(surface.clone(), window.clone());
+        commit_dmabuf(&mut harness, sid, 32, 24);
+        // The vendor records a NEW serial, then nulls pending its commit.
+        window.set_wl_surface_serial_offline(Some(42));
+        window.set_wl_surface_offline(None);
+        harness.server.state.x11_unmapped_window(window);
+        assert_eq!(
+            harness.server.state.x11_unmap_pin_flip_count, 0,
+            "a changed serial is the legal unpaired window, not a flip"
         );
     }
 
