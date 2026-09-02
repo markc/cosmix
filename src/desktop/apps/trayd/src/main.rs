@@ -8,6 +8,7 @@ mod node;
 mod process;
 mod ssh;
 mod systemd;
+mod xwayland;
 
 use std::env;
 use std::fs::{self, File, OpenOptions};

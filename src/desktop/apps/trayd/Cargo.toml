@@ -2,7 +2,7 @@
 # It deliberately does not depend on CTK: this state daemon has no renderer.
 [package]
 name = "cosmix-trayd"
-version = "0.6.1"
+version = "0.6.2"
 description = "CosMix Tray Daemon — session state and allowlisted actions for tray skins"
 edition = "2021"
 rust-version = "1.95"

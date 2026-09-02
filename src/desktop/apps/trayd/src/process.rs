@@ -13,6 +13,7 @@ use std::thread;
 #[cfg(test)]
 use crate::bus::TestOpenGate;
 use crate::systemd::Manager;
+use crate::xwayland;
 
 static LAUNCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -118,26 +119,63 @@ fn run_transient(slug: &str, argv: &[String]) -> Result<(), String> {
     };
     let executable = resolve_executable(program)?;
     let unit = launch_unit(slug);
-    let output = Command::new("systemd-run")
-        .args([
-            "--user",
-            "--collect",
-            "--slice=app.slice",
-            "--service-type=exec",
-            "--quiet",
-            "--unit",
-            &unit,
-            "--",
-        ])
-        .arg(&executable)
-        .args(&argv[1..])
-        .output()
-        .map_err(|error| format!("cannot run systemd-run: {error}"))?;
+    let output = transient_command(
+        &unit,
+        &executable,
+        &argv[1..],
+        xwayland::launch_display().as_deref(),
+    )
+    .output()
+    .map_err(|error| format!("cannot run systemd-run: {error}"))?;
     if output.status.success() {
         Ok(())
     } else {
         Err(command_error("systemd-run", &output))
     }
+}
+
+/// Build the transient-unit invocation for one application.
+///
+/// `display` is the XWayland `DISPLAY` published by *this* compositor, or
+/// `None` when there is none — see `crate::xwayland`. The two arms are
+/// deliberate and neither of them is "inherit":
+///
+/// * `Some` — the child is pinned to our X server with `--setenv`, so an X11
+///   application launches without anyone having to know XWayland exists.
+/// * `None` — `DISPLAY` is stripped from the unit's environment rather than
+///   left alone. A transient unit inherits the systemd *user manager's*
+///   environment, and that manager may well carry a `DISPLAY` belonging to
+///   somebody else's X server (the host session's, whenever comp runs
+///   nested — verified live: a bare `systemd-run --user` child inherits the
+///   manager's `DISPLAY` verbatim). Leaving it in place is the worse of the
+///   two failures, because it half-works: the application starts, on the
+///   wrong server, in the wrong session. Failing to connect is a legible
+///   fault an operator can act on; silently landing in another session's
+///   display is not. systemd-run has no `--unsetenv`, so this is
+///   `UnsetEnvironment=`, which the manual documents as the final step in
+///   compiling the environment — it beats inheritance from every source.
+fn transient_command(
+    unit: &str,
+    executable: &Path,
+    arguments: &[String],
+    display: Option<&str>,
+) -> Command {
+    let mut command = Command::new("systemd-run");
+    command.args([
+        "--user",
+        "--collect",
+        "--slice=app.slice",
+        "--service-type=exec",
+        "--quiet",
+        "--unit",
+        unit,
+    ]);
+    match display {
+        Some(display) => command.arg(format!("--setenv=DISPLAY={display}")),
+        None => command.arg("--property=UnsetEnvironment=DISPLAY"),
+    };
+    command.arg("--").arg(executable).args(arguments);
+    command
 }
 
 fn resolve_executable(program: &str) -> Result<PathBuf, String> {
@@ -297,6 +335,51 @@ mod tests {
         assert!(first
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '-'));
+    }
+
+    #[test]
+    fn a_published_display_is_pinned_onto_the_launched_unit() {
+        let rendered = format!(
+            "{:?}",
+            transient_command(
+                "cosmix-launch-xterm-1",
+                Path::new("/usr/bin/xterm"),
+                &["-e".to_owned(), "top".to_owned()],
+                Some(":4"),
+            )
+        );
+        assert!(rendered.contains("\"--setenv=DISPLAY=:4\""), "{rendered}");
+        assert!(!rendered.contains("UnsetEnvironment"), "{rendered}");
+        // The environment argument stays on systemd-run's side of `--`, and
+        // the application's own arguments survive untouched.
+        let separator = rendered.find("\"--\"").expect("argument separator");
+        let setenv = rendered.find("\"--setenv=").expect("setenv argument");
+        assert!(setenv < separator, "{rendered}");
+        assert!(
+            rendered.contains("\"/usr/bin/xterm\" \"-e\" \"top\""),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn no_descriptor_means_no_display_rather_than_an_inherited_one() {
+        let rendered = format!(
+            "{:?}",
+            transient_command(
+                "cosmix-launch-xterm-1",
+                Path::new("/usr/bin/xterm"),
+                &[],
+                None,
+            )
+        );
+        assert!(
+            rendered.contains("\"--property=UnsetEnvironment=DISPLAY\""),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("--setenv"), "{rendered}");
+        // Absence changes only the environment: the unit still launches.
+        assert!(rendered.contains("\"/usr/bin/xterm\""), "{rendered}");
+        assert!(rendered.contains("\"--slice=app.slice\""), "{rendered}");
     }
 
     #[test]
