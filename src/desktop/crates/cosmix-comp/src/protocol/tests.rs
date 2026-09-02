@@ -37367,7 +37367,7 @@ mod x11 {
         // `surface_id()` mutant — in this scenario the fallback is a live
         // Wayland toplevel, so identity and surface-id comparison agree;
         // the mutant's killer is
-        // `x11_surface_swap_debt_drops_when_the_x11_fallback_dies`.
+        // `x11_surface_swap_debt_drops_when_the_x11_fallbacks_surface_is_nulled`.
         let mut harness = KeybindingHarness::new(true);
         // A real focusable window for the fallback to land on.
         let initial_serial = test_toplevel_record(&harness)
@@ -37495,27 +37495,30 @@ mod x11 {
     }
 
     #[test]
-    fn x11_duplicate_unmap_with_a_nulled_surface_does_not_panic() {
-        // Round 8 BLOCKER-1 regression: a compliant withdraw
-        // (XWithdrawWindow, a GTK/Qt menu closing) delivers TWO unmaps —
-        // real + ICCCM-4.1.4 synthetic — and the vendor dedupes neither
-        // and nulls `state.wl_surface` after the FIRST callback returns,
-        // while comp deliberately keeps the record for the idempotent
-        // remap. Round 7's unmap ordering pin asserted `Some` resolution
-        // unconditionally and panicked every debug build on the duplicate.
-        // The fabricated window cannot null itself, so the test performs
-        // the vendor's null by hand between the two unmaps.
+    fn x11_duplicate_unmap_with_a_nulled_surface_is_a_quiet_no_op() {
+        // Round 8 BLOCKER-1 regression, reshaped in round 10: a compliant
+        // withdraw (XWithdrawWindow, a GTK/Qt menu closing) delivers TWO
+        // unmaps — real + ICCCM-4.1.4 synthetic — and the vendor dedupes
+        // neither and nulls `state.wl_surface` after the FIRST callback
+        // returns, while comp deliberately keeps the record for the
+        // idempotent remap. Round 7's pin PANICKED debug builds here;
+        // round 9's demotion would have redd the release smoke gate's
+        // bare ERROR needle instead. The pin now discriminates by serial
+        // and this path must classify as neither: the offline observation
+        // is the test-only flip counter — the log line alone is read by
+        // nothing, so without the counter, deleting the `record.mapped`
+        // gate would leave all tests green while every menu close reds
+        // the live gate. The fabricated window cannot null itself, so the
+        // test performs the vendor's null by hand between the two unmaps.
         let mut harness = KeybindingHarness::new(true);
         let (sid_a, _surface_a, window, object_a) = associate_normal_window(&mut harness, 87);
         commit_dmabuf(&mut harness, sid_a, 32, 24);
         harness.server.state.x11_unmapped_window(window.clone());
         // What the vendor does after the first callback returns.
         window.set_wl_surface_offline(None);
-        // The duplicate must be a quiet no-op, not a debug-build panic —
-        // and "quiet" is asserted on something only the DUPLICATE could
-        // break: the first unmap already withdrew, so a second
-        // SurfaceUnmapped for this id would be the duplicate re-announcing
-        // a withdrawal the renderer already has.
+        // "Quiet" is asserted on discriminators only the DUPLICATE could
+        // break: no second SurfaceUnmapped for the id, and no flip
+        // classification from the ordering pin.
         harness.server.state.events.clear();
         harness.server.state.x11_unmapped_window(window);
         let record = &harness.server.state.surfaces[&object_a];
@@ -37523,6 +37526,10 @@ mod x11 {
         assert!(
             !record.mapped,
             "the duplicate unmap leaves the withdrawn record withdrawn"
+        );
+        assert_eq!(
+            harness.server.state.x11_unmap_pin_flip_count, 0,
+            "the duplicate unmap must not classify as a vendored ordering flip"
         );
         assert!(
             !harness.server.state.events.iter().any(|event| matches!(

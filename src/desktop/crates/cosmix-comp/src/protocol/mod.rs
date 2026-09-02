@@ -2906,6 +2906,8 @@ impl ProtocolServer {
             release_use_client_missing_count: 0,
             #[cfg(test)]
             release_use_record_missing_count: 0,
+            #[cfg(all(test, feature = "xwayland"))]
+            x11_unmap_pin_flip_count: 0,
             #[cfg(test)]
             release_use_force_client_missing: false,
             #[cfg(test)]
@@ -4617,6 +4619,14 @@ struct X11ToplevelRole {
     /// committed buffer remains the presentation authority).
     granted_geometry: Rectangle<i32, Logical>,
     fullscreen: bool,
+    /// The vendored `WL_SURFACE_SERIAL` as of association. The unmap
+    /// ordering pin compares it against the window's CURRENT serial: the
+    /// vendor bumps the serial before both arms of the pairing branch
+    /// (xwm/mod.rs:2303), so a legal unpaired-serial null carries a NEW
+    /// serial while an ordering flip (the null moved above the callback)
+    /// leaves this one — the discriminator that lets the pin log the flip
+    /// as an error without crying wolf on supported behaviour.
+    wl_surface_serial: Option<u64>,
 }
 
 struct LockSurfaceRole {
@@ -5529,6 +5539,11 @@ struct WaylandState {
     release_use_client_missing_count: usize,
     #[cfg(test)]
     release_use_record_missing_count: usize,
+    /// Times the unmap ordering pin classified a mapped, unresolvable
+    /// window as a vendored ordering FLIP (the `error!` branch). Gives the
+    /// pin an offline observation: the log alone is read by nothing.
+    #[cfg(all(test, feature = "xwayland"))]
+    x11_unmap_pin_flip_count: usize,
     #[cfg(test)]
     release_use_force_client_missing: bool,
     #[cfg(test)]

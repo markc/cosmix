@@ -1007,22 +1007,26 @@ impl WaylandState {
             //   silently convert every dying-fallback drop into a pay;
             //   this comment is the only comp-side record of the
             //   dependency.
-            // - A POPUP over the fallback: a popup still open at
-            //   consumption reads as different and drops the debt; a
-            //   dismissed popup leaves focus on the grab ROOT —
-            //   `PopupGrab::unset_keyboard_grab` calls the no-restore
-            //   two-arg `KeyboardHandle::unset_grab(data)` and then
-            //   explicitly `set_focus(Some(self.root))`
-            //   (popup/grab.rs:370-380; keyboard/mod.rs:891-897 has no
-            //   restore machinery; the `restore_focus: true` calls in
-            //   popup/grab.rs are POINTER grabs, irrelevant to this
-            //   keyboard predicate) — so the debt pays exactly when that
-            //   root IS the recorded fallback. Desirable in both
-            //   directions — the open popup is a live interaction, the
-            //   dismissed one hands focus back to the window the popup
-            //   grew from. No offline test drives this pair; the citation
-            //   is the verification, and it was read from the vendored
-            //   source, not recalled.
+            // - A POPUP over the fallback, scoped to popups that actually
+            //   take the keyboard: comp installs `PopupKeyboardGrab` only
+            //   when the surface's layer interactivity is not `None`
+            //   (handlers.rs:1513-1518) — a `KeyboardInteractivity::None`
+            //   layer popup never moves keyboard focus, and a debt pays
+            //   with it open. For a keyboard-grabbing popup: open at
+            //   consumption reads as different and drops the debt; after
+            //   dismissal, focus lands on the grab ROOT — but on the NEXT
+            //   input event, not at dismissal: the pointer grab notices
+            //   `has_ended()` in its next `motion` and unsets with
+            //   restore (popup/grab.rs:548), whose `unset` (:697-700)
+            //   runs `unset_keyboard_grab` = the no-restore two-arg
+            //   `KeyboardHandle::unset_grab(data)` + explicit
+            //   `set_focus(Some(self.root))` (popup/grab.rs:371-381;
+            //   keyboard/mod.rs:891-897). A consume in the
+            //   dismissal-to-next-event window still sees pre-restore
+            //   focus and DROPS — the safe direction; after the restore,
+            //   the debt pays exactly when the root is the recorded
+            //   fallback. No offline test drives this; these citations
+            //   are the verification, read from the vendored source.
             tracing::debug!(
                 xid,
                 "dropped X11 refocus debt; focus moved deliberately while it was pending"
@@ -1303,12 +1307,14 @@ impl WaylandState {
                                 // retarget below supplies the correct focus
                                 // from a current hit test. The restore is
                                 // strictly redundant with that retarget.
-                                // (The sibling destroy path's grab arm in
-                                // `clear_focus_for_surface` still uses the
-                                // restoring `unset_grab` with the same
-                                // record-already-removed shape; it should
-                                // migrate for the same reason, but that is
-                                // its own change, not a rider on this one.)
+                                // (`clear_focus_for_surface`'s grab arm
+                                // still uses the restoring `unset_grab`;
+                                // of its six callers, only the
+                                // `destroy_surface_record` invocation has
+                                // this record-already-removed shape, and
+                                // only that call should migrate for the
+                                // same reason — its own change, not a
+                                // rider on this one.)
                                 let pointer = self.pointer.clone();
                                 pointer.unset_grab_without_focus_restore(
                                     self,
@@ -1387,6 +1393,7 @@ impl WaylandState {
             phase,
             granted_geometry: geometry,
             fullscreen: false,
+            wl_surface_serial: surface.wl_surface_serial(),
         }));
         #[cfg(feature = "bus")]
         self.mark_surface_unmapped(&wl_surface);
@@ -1661,41 +1668,59 @@ impl WaylandState {
         // duplicate a `None` resolution is the correct, supported state
         // (`record.mapped` went false at the first unmap).
         //
-        // This is an `error!`, NOT a `debug_assert!`, because the
-        // observation is provably ambiguous: the vendor's unpaired-serial
-        // path (xwm/mod.rs:2320-2328 — WL_SURFACE_SERIAL arriving before
-        // its commit, an ordering the vendor explicitly supports) nulls
-        // `wl_surface` on a still-MAPPED, presented record with no
-        // callback into comp, and an UnmapNotify landing in that window
-        // is LEGAL vendor behaviour that passes the `mapped` gate and is
-        // indistinguishable from the ordering flip through `wl_surface()`
-        // alone. A panic here would abort a developer build on correct
-        // behaviour; a loud log line still surfaces the flip the moment a
-        // vendor bump moves the null above the callback. Narrowing worth
-        // knowing: `mapped` only becomes true once a buffer has
-        // presented, so this pin is silently inert for a window that
-        // unmaps before first present — benign (a pointer grab needs
-        // hit-test presence, which needs presentation), but a narrowing,
-        // not full coverage.
-        if !self
+        // The two causes of a mapped-but-unresolvable window ARE
+        // separable, just not through `wl_surface()` alone: the vendor
+        // bumps `wl_surface_serial` BEFORE both arms of the pairing branch
+        // (xwm/mod.rs:2303), so the legal unpaired-serial null
+        // (xwm/mod.rs:2320-2328 — WL_SURFACE_SERIAL before its commit, an
+        // explicitly supported ordering) carries a serial NEWER than the
+        // one this role captured at association, while an ordering flip
+        // (a vendor bump moving `state.wl_surface = None` above this
+        // callback) leaves it untouched. The flip is a genuine invariant
+        // breach and logs `error!` (which also reds the nested smoke
+        // gate's bare ERROR needle — deliberately); the legal window logs
+        // `debug!`, below every gate needle. Narrowing worth knowing:
+        // `mapped` only becomes true once a buffer has presented, so this
+        // pin is silently inert for a window that unmaps before first
+        // present — benign (a pointer grab needs hit-test presence, which
+        // needs presentation), but a narrowing, not full coverage.
+        let pin = self
             .xwayland
             .surfaces_by_xid
             .get(&xid)
             .and_then(|object| self.surfaces.get(object))
             .filter(|record| record.mapped)
             .and_then(|record| record.role.x11())
-            .is_none_or(|role| {
-                window
-                    .wl_surface()
-                    .is_some_and(|current| current == role.wl_surface)
-            })
-        {
-            tracing::error!(
-                xid,
-                "unmapped_window saw a mapped record with no wl_surface resolution: either \
-                 the vendored null moved above the callback (grab teardown is now broken) or \
-                 this is the legal unpaired-serial window (xwm/mod.rs:2320-2328)"
-            );
+            .map(|role| (role.wl_surface.id(), role.wl_surface_serial));
+        if let Some((expected_surface, association_serial)) = pin {
+            let current = window.wl_surface();
+            let resolves = current
+                .as_ref()
+                .is_some_and(|current| current.id() == expected_surface);
+            if !resolves {
+                let current_serial = window.wl_surface_serial();
+                if current_serial != association_serial {
+                    tracing::debug!(
+                        xid,
+                        ?association_serial,
+                        ?current_serial,
+                        "unmap inside the legal unpaired-serial window; \
+                         resolution returns when the commit pairs the new serial"
+                    );
+                } else {
+                    #[cfg(test)]
+                    {
+                        self.x11_unmap_pin_flip_count += 1;
+                    }
+                    tracing::error!(
+                        xid,
+                        current = ?current.map(|surface| surface.id()),
+                        expected = ?expected_surface,
+                        "vendored wl_surface null moved above unmapped_window: the \
+                         resolution-based grab teardown for this unmap is broken"
+                    );
+                }
+            }
         }
         if self
             .xwayland
