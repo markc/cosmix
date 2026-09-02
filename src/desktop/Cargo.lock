@@ -2584,6 +2584,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmix-imeprobe"
+version = "0.1.0"
+dependencies = [
+ "rustix 1.1.4",
+ "wayland-client",
+ "wayland-protocols-misc",
+]
+
+[[package]]
 name = "cosmix-interactgui"
 version = "0.1.1"
 dependencies = [
@@ -7638,6 +7647,7 @@ checksum = "6e9567599ef23e09b8dad6e429e5738d4509dfc46b3b21f32841a304d16b29c8"
 dependencies = [
  "bitflags 2.13.1",
  "wayland-backend",
+ "wayland-client",
  "wayland-protocols",
  "wayland-scanner",
  "wayland-server",

@@ -8,6 +8,7 @@ members = [
     "apps/tower",
     "apps/mail",
     "apps/interactgui",
+    "apps/imeprobe",
     "apps/quoin",
     "crates/cosmix-design",
     "crates/cosmix-comp",

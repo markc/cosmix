@@ -1,0 +1,19 @@
+# desktop/apps/imeprobe — a SYNTHETIC input method, for gating IME support.
+#
+# Not a usable IME and not shipped to users: it exists so the smoke gate can
+# assert that the compositor places and PAINTS an input-method candidate
+# window. Without it, IME support could only ever be verified by installing a
+# real IME and looking at the screen — which is a check that happens once and
+# then rots. This one runs on every gate.
+[package]
+name = "cosmix-imeprobe"
+version = "0.1.0"
+description = "CosMix synthetic input method — gate fixture for zwp_input_method_v2"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+
+[dependencies]
+wayland-client = "=0.31.14"
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+rustix = { version = "1", features = ["fs", "shm", "mm"] }
