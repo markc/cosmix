@@ -166,13 +166,16 @@ pub(super) enum XwaylandLifecycle {
         token: RegistrationToken,
         client: Client,
     },
-    // Neither live variant retains the generation's Wayland client for
-    // teardown: exactly ONE kill may ever reach it. `Drop for XWayland`
+    // `Ready` does not retain the generation's Wayland client for teardown
+    // (`Starting` holds one only to hand to `start_wm`): the client gets
+    // exactly ONE deliberate kill, and `Drop for XWayland`
     // (vendor/smithay/src/xwayland/xserver.rs:330-336) already delivers
-    // `kill_client(client, ConnectionClosed)` when teardown removes `token`,
-    // and the vendored `XWaylandClientData::disconnected` is not idempotent
-    // (`child.lock().unwrap().take().unwrap()`, xserver.rs:378) — a second
-    // kill panics the compositor. The vendor drop still closes the
+    // `kill_client(client, ConnectionClosed)` when teardown removes `token`.
+    // Upstream's `XWaylandClientData::disconnected` panicked on a second
+    // kill (`take().unwrap()`); the vendored copy is idempotent now, but
+    // only as defense-in-depth for killers comp does not control (the
+    // explicit-sync fault path kills by client key, XWayland-blind) — never
+    // a licence to double-kill here. The vendor drop still closes the
     // `serial_commit_hook` route into `xwm_state` by construction: it lands
     // either synchronously inside `remove(token)` or at the end of the
     // current calloop iteration (the dispatcher `Rc` cloned for a running
@@ -627,9 +630,10 @@ impl WaylandState {
         let lifecycle = mem::replace(&mut self.xwayland.lifecycle, XwaylandLifecycle::Inert);
         match lifecycle {
             // Removing `token` drops the `XWayland` source, whose `Drop`
-            // kills the generation's Wayland client — the ONLY kill it may
-            // ever receive (see the `XwaylandLifecycle::Ready` comment: the
-            // vendored `disconnected` panics on a second one).
+            // kills the generation's Wayland client — the only deliberate
+            // kill it receives (see the `XwaylandLifecycle::Ready` comment;
+            // the vendored `disconnected` tolerates a stray second kill,
+            // teardown still never issues one).
             XwaylandLifecycle::Starting { token, client: _ } => {
                 self.capture_loop_handle.remove(token);
             }
@@ -1119,14 +1123,26 @@ impl WaylandState {
         };
         self.committed_surface_stacks
             .insert(object.clone(), vec![object.clone()]);
-        // Re-association to a DIFFERENT XID: drop the old XID's forward
-        // entry (when it still points at this object), or a later
-        // DestroyNotify for the old XID would destroy the live record.
+        // Re-association is guarded in BOTH directions. Same object, new
+        // XID: drop the old XID's forward entry (when it still points at
+        // this object), or a later DestroyNotify for the old XID would
+        // destroy the live record. Same XID, new object: the insert below
+        // repoints the forward entry, and the old object's stale reverse
+        // entry is dropped here so no map claims a pairing that no longer
+        // holds — the old record's own death is harmless either way, since
+        // `destroy_surface_record` only removes a forward entry that still
+        // points at the dying object.
         if let Some(previous_xid) = self.xwayland.xids_by_object.get(&object).copied()
             && previous_xid != xid
             && self.xwayland.surfaces_by_xid.get(&previous_xid) == Some(&object)
         {
             self.xwayland.surfaces_by_xid.remove(&previous_xid);
+        }
+        if let Some(previous_object) = self.xwayland.surfaces_by_xid.get(&xid).cloned()
+            && previous_object != object
+            && self.xwayland.xids_by_object.get(&previous_object) == Some(&xid)
+        {
+            self.xwayland.xids_by_object.remove(&previous_object);
         }
         self.xwayland.surfaces_by_xid.insert(xid, object.clone());
         self.xwayland.xids_by_object.insert(object, xid);
@@ -1651,6 +1667,13 @@ impl WaylandState {
 
     pub(super) fn x11_allow_selection_access(&mut self, selection: SelectionTarget) -> bool {
         // Deliberate X-2 gap: no clipboard/primary bridging in X-1.
+        //
+        // X-2 AUTHOR, BEFORE RETURNING `true` HERE: this refusal is load-
+        // bearing for teardown, not just scope. It is the only thing that
+        // stops smithay from registering selection-transfer calloop sources
+        // that call `xwm_state` and are never unregistered by `Drop for
+        // X11Wm` — a wm dropped with a live transfer panics in `xwm_state`.
+        // Revisit the `draining_wms` drain proof first.
         tracing::debug!(?selection, "refused X11 selection access (X-1)");
         false
     }
@@ -1664,6 +1687,11 @@ impl WaylandState {
         // Defensive: reachable only if `allow_selection_access` ever returned
         // true, which X-1 never does. Drop the fd, log the invariant breach,
         // never panic (the trait default panics).
+        //
+        // X-2 AUTHOR: implementing this for real means comp drives outgoing
+        // selection transfers, whose calloop sources call `xwm_state` and
+        // outlive `Drop for X11Wm` — the `draining_wms` drain proof depends
+        // on these transfers never existing. Revisit it before wiring this.
         drop(fd);
         tracing::error!(
             ?selection,

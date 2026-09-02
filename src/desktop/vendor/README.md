@@ -552,6 +552,22 @@ not exist there and a production call site fails to compile. (`#[cfg(test)]`
 was deliberately not used: it is false when the vendored crate is compiled as
 a dependency, which would silently compile the setters into every build.)
 
+`XWaylandClientData::disconnected` (`src/xwayland/xserver.rs`, changed
+2026-09-02) is made idempotent: upstream does
+`self.child.lock().unwrap().take().unwrap()`, so the second `disconnected`
+for the same client panics on the `None`. Two kills can genuinely reach one
+XWayland client from callers that do not know about each other: `Drop for
+XWayland` kills it on teardown, and `cosmix-comp`'s explicit-sync fault path
+(`disconnect_explicit_sync_client`) kills every client owning a DMA-BUF use
+by client key, with no XWayland lifecycle knowledge — and Xwayland speaks
+`linux-drm-syncobj-v1`. Both kills can land in one dispatch batch with no
+`cleanup()` between them (`get_client_mut` returns killed clients and
+`Client::kill` has no killed-guard), so `disconnected` runs twice. The fix
+returns early when the child was already taken; the compositor keeps its
+exactly-one-kill discipline regardless — this makes the invariant hold for
+callers comp does not control instead of being prose. Genuine upstream bug,
+worth reporting.
+
 ### Re-verifying the pristine import
 
 ```sh

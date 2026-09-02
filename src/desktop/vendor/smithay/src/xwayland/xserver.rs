@@ -375,7 +375,14 @@ impl ClientData for XWaylandClientData {
             error!("Xwayland disconnected: {}", err);
         }
 
-        let mut child = self.child.lock().unwrap().take().unwrap();
+        // CosMix vendor fix: `disconnected` must be idempotent. Upstream
+        // unwraps the taken child, so a client killed twice — e.g. once by
+        // a subsystem that kills by client key without XWayland knowledge
+        // (an explicit-sync fault) and once by `Drop for XWayland` — panics
+        // the compositor. The second call has nothing left to reap; return.
+        let Some(mut child) = self.child.lock().unwrap().take() else {
+            return;
+        };
         thread::spawn(move || {
             if let Ok(status) = child.wait() {
                 if !status.success() {

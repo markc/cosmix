@@ -36501,8 +36501,8 @@ mod x11 {
         // `start_xwayland` is compiled out under test, so without fabrication
         // every teardown in this suite would run the `Inert => {}` arm and
         // the real teardown branches would be executed by no test at all.
-        // Fabricate a live `Starting` lifecycle: a real calloop token (dummy
-        // timer source on the real loop), a real Wayland client, and a
+        // Fabricate a live `Starting` lifecycle: a real calloop token (a
+        // drop-flag source on the real loop), a real Wayland client, and a
         // descriptor file on disk. The `Ready` arm differs from `Starting`
         // only by the stability-timer removal and the wm drain, and a real
         // `X11Wm` is unconstructible offline — that half stays with the live
@@ -36527,15 +36527,48 @@ mod x11 {
             harness.server.state.keyboard.current_focus().is_none(),
             "precondition: no keyboard focus held"
         );
+        // The stand-in source makes the token-drop half of teardown
+        // assertable: in production, `remove(token)` dropping the `XWayland`
+        // source IS the kill delivery (`Drop for XWayland`), so the stand-in
+        // observes its own `Drop` — deleting `remove(token)` from the
+        // `Starting` arm now reds this test instead of leaving every gate
+        // green. (The kill itself stays live-gate-only; see below.)
+        struct DropFlagSource {
+            _held: UnixStream,
+            stream: UnixStream,
+            dropped: Arc<AtomicBool>,
+        }
+        impl AsFd for DropFlagSource {
+            fn as_fd(&self) -> BorrowedFd<'_> {
+                self.stream.as_fd()
+            }
+        }
+        impl Drop for DropFlagSource {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+        let source_dropped = Arc::new(AtomicBool::new(false));
+        let (held_end, source_end) = UnixStream::pair().expect("drop-flag source socket pair");
         let token = harness
             .server
             .state
             .capture_loop_handle
             .insert_source(
-                Timer::from_duration(Duration::from_secs(3600)),
-                move |_, (), _state: &mut WaylandState| TimeoutAction::Drop,
+                smithay::reexports::calloop::generic::Generic::new(
+                    DropFlagSource {
+                        _held: held_end,
+                        stream: source_end,
+                        dropped: source_dropped.clone(),
+                    },
+                    smithay::reexports::calloop::Interest::READ,
+                    smithay::reexports::calloop::Mode::Level,
+                ),
+                move |_, _, _state: &mut WaylandState| {
+                    Ok(smithay::reexports::calloop::PostAction::Continue)
+                },
             )
-            .expect("insert dummy XWayland source stand-in");
+            .expect("insert drop-flag XWayland source stand-in");
         let (xwayland_side, server_stream) =
             UnixStream::pair().expect("fabricated Xwayland client socket pair");
         let xclient_state = Arc::new(WaylandClientState::new(
@@ -36586,18 +36619,22 @@ mod x11 {
             harness.server.state.keyboard.current_focus().is_none(),
             "teardown of a generation that held no focus must not steal one"
         );
-        // NOT asserted here: the client kill. In production the ONE kill the
-        // client may ever receive comes from `Drop for XWayland` when
-        // teardown removes the source token (the vendored `disconnected`
-        // panics on a second kill — that is why teardown has no explicit
-        // kill of its own). This fabrication stands a dummy `Timer` behind
-        // the token, so removing it runs no `Drop for XWayland` and no kill
-        // happens; and the fabricated client carries comp's own
+        // The token-drop half IS asserted: `remove(token)` dropping the
+        // source is production's kill delivery, and the stand-in's `Drop`
+        // observed it.
+        assert!(
+            source_dropped.load(Ordering::SeqCst),
+            "teardown removes (and thereby drops) the XWayland source token"
+        );
+        // NOT asserted here: the client kill itself. In production the one
+        // deliberate kill comes from `Drop for XWayland` when the token
+        // drop above happens — but the stand-in is not an `XWayland`, so no
+        // kill fires; and the fabricated client carries comp's own
         // `WaylandClientState`, not smithay's `XWaylandClientData`, so the
-        // vendor's non-idempotent child-reaping is not in the picture
-        // either. The two elisions are exactly the two halves of the
-        // double-kill bug this arrangement replaced; the kill itself is
-        // live-gate-only.
+        // vendor's child-reaping (now idempotent, then panicking) is not in
+        // the picture either. The two elisions are exactly the two halves
+        // of the double-kill bug this arrangement replaced; the kill itself
+        // is live-gate-only.
         drop(xclient_state);
         drop(xwayland_side);
         // A stale/duplicate failure callback is a no-op.
@@ -36833,6 +36870,57 @@ mod x11 {
     }
 
     #[test]
+    fn x11_same_xid_reassociated_to_a_new_object_survives_the_old_records_death() {
+        // MAJOR-B (round 3): the OTHER re-association direction. The same
+        // XID re-associates to a different wl_surface; the old record still
+        // carries `role.xid`, and `destroy_surface_record` used to remove
+        // `surfaces_by_xid[xid]` unconditionally — the dying OLD record
+        // wiped the LIVE record's forward mapping, orphaning it from every
+        // XID lookup (geometry, decoration, unmap, destroy).
+        let mut harness = KeybindingHarness::new(true);
+        let (surface_id, old_surface, _window, old_object) =
+            associate_normal_window(&mut harness, 73);
+        commit_dmabuf(&mut harness, surface_id, 32, 24);
+        // Same XID arrives on a fresh wl_surface (Xwayland reused the XID
+        // after a fresh serial handshake).
+        let (_new_surface_id, new_surface) = roleless_wl_surface(&mut harness);
+        let new_window =
+            fake_x11_window(73, false, Rectangle::new((0, 0).into(), (200, 150).into()));
+        new_window.set_wl_surface_offline(Some(new_surface.clone()));
+        harness
+            .server
+            .state
+            .x11_associate_window(new_surface.clone(), new_window);
+        let new_object = new_surface.id();
+        assert_eq!(
+            harness.server.state.xwayland.surfaces_by_xid.get(&73),
+            Some(&new_object),
+            "the forward entry follows the new object"
+        );
+        assert!(
+            !harness
+                .server
+                .state
+                .xwayland
+                .xids_by_object
+                .contains_key(&old_object),
+            "the old object's stale reverse entry is dropped at re-association"
+        );
+        // The old record dies (its wl_surface is destroyed). The guard in
+        // `destroy_surface_record` must leave the live mapping alone.
+        harness.server.state.destroy_surface_record(&old_surface);
+        assert!(
+            !harness.server.state.surfaces.contains_key(&old_object),
+            "the old record itself is gone"
+        );
+        assert_eq!(
+            harness.server.state.xwayland.surfaces_by_xid.get(&73),
+            Some(&new_object),
+            "the dying old record must not wipe the live record's mapping"
+        );
+    }
+
+    #[test]
     fn x11_initial_placement_honours_a_requested_origin_inside_the_output() {
         // The `xmessage -center` decision: a client that states where it
         // wants to appear — a creation origin, or explicit x/y in a pre-map
@@ -36906,16 +36994,20 @@ mod x11 {
             Rectangle::new((-5000, -5000).into(), (200, 150).into()),
         );
         let cascade = (harness.server.state.next_layout_index % 6) as f32;
-        let extents = DecoExtents::of(&harness.server.state.decoration.theme);
         harness.server.state.x11_new_window(outside.clone());
         harness.server.state.x11_map_window_request(outside.clone());
         let granted = harness.server.state.xwayland.pending_windows[&outside.window_id()]
             .granted_geometry
             .expect("map grants a geometry");
+        // No SSD-extents clamp in the expectation: under the default theme
+        // this harness runs, `CASCADE_ORIGIN` (36.0) exceeds the largest
+        // extent (top = titlebar 32 + border 1), so the production clamp
+        // cannot move a cascade slot here and replicating it would be dead
+        // arithmetic dressed as coverage. (The clamp itself stays in
+        // production for themes with taller chrome.)
         let expected = (
-            (usable.x + CASCADE_ORIGIN + cascade * CASCADE_STEP).max(usable.x + extents.left)
-                as i32,
-            (usable.y + CASCADE_ORIGIN + cascade * CASCADE_STEP).max(usable.y + extents.top) as i32,
+            (usable.x + CASCADE_ORIGIN + cascade * CASCADE_STEP) as i32,
+            (usable.y + CASCADE_ORIGIN + cascade * CASCADE_STEP) as i32,
         );
         assert_eq!(
             (granted.loc.x, granted.loc.y),

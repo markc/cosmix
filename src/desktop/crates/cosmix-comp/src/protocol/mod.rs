@@ -10091,10 +10091,15 @@ impl WaylandState {
             return;
         };
         // Whichever side dies first — DestroyNotify or the wl_surface — the
-        // XID maps must not keep pointing at a removed record.
+        // XID maps must not keep pointing at a removed record. The forward
+        // removal is conditional on the entry still pointing at THIS object:
+        // after the same XID re-associates to a different wl_surface, the
+        // dying old record must not wipe the live record's mapping.
         #[cfg(feature = "xwayland")]
         if let SurfaceRole::X11(role) = &record.role {
-            self.xwayland.surfaces_by_xid.remove(&role.xid);
+            if self.xwayland.surfaces_by_xid.get(&role.xid) == Some(&surface.id()) {
+                self.xwayland.surfaces_by_xid.remove(&role.xid);
+            }
             self.xwayland.xids_by_object.remove(&surface.id());
         }
         self.surface_objects.remove(&record.id);
