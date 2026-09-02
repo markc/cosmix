@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.0 — 2026-09-02
+
+- Add the renderer-neutral semantic panel/page adapter. Bus verbs now produce
+  the same `ShellCommand` values as direct UI ingress.
+
 ## 0.4.0 — 2026-09-02
 
 - Breaking: `chrome` now selects Wayland only instead of Bevy's combined X11

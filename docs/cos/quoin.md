@@ -5,8 +5,8 @@
 existing Quoin chrome into one explicit Bevy window target per surface. The
 installable application id and layer namespace are `dev.cosmix.quoin`.
 
-Arc 3 presents real layer-shell buffers through `cosmix-shell-host` 0.3.0,
-`cosmix-shell` 0.4.0 and SCTK 0.19.2. `cosmix-quoin` is 0.4.0;
+Arc 3 presents real layer-shell buffers through `cosmix-shell-host` 0.4.0,
+`cosmix-shell` 0.5.0 and SCTK 0.19.2. `cosmix-quoin` is 0.5.0;
 `cosmix-quoin-demo` remains a
 feature-gated, non-installable normal-window tuning arm; it is not a
 layer-shell client.
@@ -122,6 +122,29 @@ the patterns below.
 | non-zero | `wake-deadline-stuck`, `wake-timer-failed-*` | Wake scheduling stopped making progress or its timer failed. |
 | non-zero | `bevy-app-error` | Bevy requested an error exit. |
 | non-zero | `calloop-create-failed-*`, `wayland-source-failed-*`, `signal-source-failed-*`, `signal-source-insert-failed-*`, `calloop-dispatch-failed-*`, `wayland-flush-failed-*` | Event-loop, signal integration, dispatch or Wayland flushing failed. |
+
+## Bus identity and live power
+
+Quoin registers the stable Bus service identity `shell`; its subscription
+plane is `shell-sub`. `shell.ping` and `shell.info` provide presence and
+discovery. Live panel state is read through the uniform
+`shell.props.{get,list,describe}` surface under
+`panels.<edge>.{visible,pinned,width_px,page,pages,output}`.
+
+The ephemeral semantic verbs are `shell.panel.{show,hide,toggle,pin,unpin}`
+and `shell.panel.page.{next,prev,set}`. They require a broker-stamped local,
+registered caller and are translated to the same `ShellCommand` ingress used
+by Quoin's controls. There is no resize, arrangement, persistence, geometry or
+synthetic pointer/corner verb in this slice.
+
+The bottom carousel places `power` immediately after the clock-bearing
+launcher page. It subscribes to `power.props.changed` before reading
+`power.props.get`, snapshots again on reconnect or a delivery gap, and never
+polls. Before an authoritative snapshot it says `Power unavailable`; a host
+without a battery says `No system battery`; a partial battery reading names
+missing charge or state explicitly; a full reading renders only the supplied
+percentage, state, time, rate and health fields. Missing values are never
+rendered as zero.
 
 ## Interaction boundary
 

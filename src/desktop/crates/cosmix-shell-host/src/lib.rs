@@ -13,4 +13,6 @@ pub mod raw_handle;
 pub mod runner;
 pub mod surface;
 
-pub use runner::{LayerHostConfig, LayerHostError, LayerPanelMounts, configure_layer_host};
+pub use runner::{
+    LayerHostConfig, LayerHostError, LayerHostWake, LayerPanelMounts, configure_layer_host,
+};

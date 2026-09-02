@@ -2688,6 +2688,8 @@ dependencies = [
 name = "cosmix-lib-props-core"
 version = "0.3.0"
 dependencies = [
+ "chrono",
+ "cosmix-lib-bus",
  "serde",
  "serde_json",
 ]
@@ -2743,17 +2745,20 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bevy",
+ "cosmix-lib-buildinfo",
+ "cosmix-lib-props-core",
  "cosmix-shell",
  "cosmix-shell-host",
  "ctk",
+ "serde_json",
 ]
 
 [[package]]
 name = "cosmix-shell"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "accesskit",
  "bevy",
@@ -2762,7 +2767,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell-host"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bevy",
  "bevy_winit",
@@ -3035,7 +3040,7 @@ dependencies = [
 
 [[package]]
 name = "ctk"
-version = "0.51.0"
+version = "0.52.0"
 dependencies = [
  "accesskit",
  "ammonia",

@@ -100,6 +100,66 @@ fn no_op_wake() -> WorkerWake {
     Arc::new(|| {})
 }
 
+/// Event-loop wake callback used when CTK is hosted without winit.
+#[derive(Clone)]
+pub struct BusWorkerWake(WorkerWake);
+
+impl std::fmt::Debug for BusWorkerWake {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BusWorkerWake(..)")
+    }
+}
+
+impl BusWorkerWake {
+    pub fn new(callback: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self(callback)
+    }
+}
+
+#[derive(Clone)]
+struct WakeSender<T> {
+    inner: Sender<T>,
+    wake: WorkerWake,
+}
+
+impl<T> WakeSender<T> {
+    fn new(inner: Sender<T>, wake: WorkerWake) -> Self {
+        Self { inner, wake }
+    }
+
+    fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
+        let result = self.inner.try_send(value);
+        if result.is_ok() {
+            (self.wake)();
+        }
+        result
+    }
+
+    async fn send_async(&self, value: T) -> Result<(), flume::SendError<T>> {
+        let result = self.inner.send_async(value).await;
+        if result.is_ok() {
+            (self.wake)();
+        }
+        result
+    }
+}
+
+fn try_deliver<T>(
+    sender: &WakeSender<T>,
+    value: T,
+    _wake: &WorkerWake,
+) -> Result<(), TrySendError<T>> {
+    sender.try_send(value)
+}
+
+async fn deliver<T>(
+    sender: &WakeSender<T>,
+    value: T,
+    _wake: &WorkerWake,
+) -> Result<(), flume::SendError<T>> {
+    sender.send_async(value).await
+}
+
 #[derive(Default)]
 struct SemanticInboxes {
     #[cfg(feature = "theme")]
@@ -218,6 +278,10 @@ pub struct BusBridgeConfig {
     /// reconnect. Constructed once per process so `started_at` cannot drift.
     pub provenance: RegisterProvenance,
     pub subscriptions: Vec<String>,
+    /// Additional directed command prefixes admitted to the exclusive service port.
+    pub inbound_prefixes: Vec<String>,
+    /// Explicit non-winit event-loop wake. When absent, CTK retains its winit fallback.
+    pub worker_wake: Option<BusWorkerWake>,
     /// Topics whose newest message replaces the previous one instead of queuing.
     pub latest_topics: Vec<String>,
     pub outbound_capacity: usize,
@@ -237,6 +301,8 @@ impl BusBridgeConfig {
             noded_url: noded_url.into(),
             provenance: process_provenance(),
             subscriptions: Vec::new(),
+            inbound_prefixes: Vec::new(),
+            worker_wake: None,
             latest_topics: Vec::new(),
             outbound_capacity: 64,
             event_capacity: 128,
@@ -555,7 +621,7 @@ impl BusBridge {
     /// the [`InboundRequest`] (for params/provenance) but must never reach the
     /// correlation-bearing response path, or it could double-answer one id or
     /// steal another request's inbound. See the app-port split rationale.
-    pub(crate) fn drain_inbound(&self) -> impl Iterator<Item = InboundRequest> + '_ {
+    pub fn drain_inbound(&self) -> impl Iterator<Item = InboundRequest> + '_ {
         let current = self.committed_generation.load(Ordering::Acquire);
         self.inbound
             .try_iter()
@@ -566,7 +632,7 @@ impl BusBridge {
     /// correlation id) is silently a no-op — there is nothing to answer.
     ///
     /// `pub(crate)`: sole caller is the app-port router (see `drain_inbound`).
-    pub(crate) fn try_respond(
+    pub fn try_respond(
         &self,
         request: &InboundRequest,
         rc: u8,
@@ -775,14 +841,22 @@ pub(crate) fn start_bridge(
     let worker_semantic = semantic_inboxes.clone();
     let worker_generation = committed_generation.clone();
     #[cfg(feature = "theme")]
-    let worker_wake: WorkerWake = event_loop_proxy.map_or_else(no_op_wake, |proxy| {
-        let proxy = (**proxy).clone();
-        Arc::new(move || {
-            let _ = proxy.send_event(bevy::winit::WinitUserEvent::WakeUp);
-        })
-    });
+    let worker_wake: WorkerWake = config.worker_wake.clone().map_or_else(
+        || {
+            event_loop_proxy.map_or_else(no_op_wake, |proxy| {
+                let proxy = (**proxy).clone();
+                Arc::new(move || {
+                    let _ = proxy.send_event(bevy::winit::WinitUserEvent::WakeUp);
+                })
+            })
+        },
+        |wake| wake.0,
+    );
     #[cfg(not(feature = "theme"))]
-    let worker_wake = no_op_wake();
+    let worker_wake = config
+        .worker_wake
+        .clone()
+        .map_or_else(no_op_wake, |wake| wake.0);
 
     thread::Builder::new()
         .name(format!("ctk-bus-{}", worker_config.service_name))
@@ -791,10 +865,10 @@ pub(crate) fn start_bridge(
                 config: worker_config,
                 requests: request_rx,
                 observation_requests: observation_request_rx,
-                events: event_tx,
-                messages: message_tx,
-                observation_messages: observation_message_tx,
-                inbound: inbound_tx,
+                events: WakeSender::new(event_tx, worker_wake.clone()),
+                messages: WakeSender::new(message_tx, worker_wake.clone()),
+                observation_messages: WakeSender::new(observation_message_tx, worker_wake.clone()),
+                inbound: WakeSender::new(inbound_tx, worker_wake.clone()),
                 committed_generation: worker_generation,
                 latest_messages: worker_latest,
                 semantic_inboxes: worker_semantic,
@@ -826,10 +900,10 @@ struct WorkerMainParams {
     config: BusBridgeConfig,
     requests: Receiver<WorkerRequest>,
     observation_requests: Receiver<ObservationRequest>,
-    events: Sender<BusBridgeEvent>,
-    messages: Sender<BusMessage>,
-    observation_messages: Sender<BusMessage>,
-    inbound: Sender<InboundRequest>,
+    events: WakeSender<BusBridgeEvent>,
+    messages: WakeSender<BusMessage>,
+    observation_messages: WakeSender<BusMessage>,
+    inbound: WakeSender<InboundRequest>,
     committed_generation: Arc<AtomicU64>,
     latest_messages: Arc<Mutex<HashMap<String, BusMessage>>>,
     semantic_inboxes: Arc<SemanticInboxes>,
@@ -864,7 +938,7 @@ fn worker_main(params: WorkerMainParams) {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            let _ = events.send(BusBridgeEvent::Fatal(error.to_string()));
+            let _ = try_deliver(&events, BusBridgeEvent::Fatal(error.to_string()), &wake);
             return;
         }
     };
@@ -923,10 +997,10 @@ struct WorkerLoopParams {
     config: BusBridgeConfig,
     requests: Receiver<WorkerRequest>,
     observation_requests: Receiver<ObservationRequest>,
-    events: Sender<BusBridgeEvent>,
-    messages: Sender<BusMessage>,
-    observation_messages: Sender<BusMessage>,
-    inbound: Sender<InboundRequest>,
+    events: WakeSender<BusBridgeEvent>,
+    messages: WakeSender<BusMessage>,
+    observation_messages: WakeSender<BusMessage>,
+    inbound: WakeSender<InboundRequest>,
     committed_generation: Arc<AtomicU64>,
     latest_messages: Arc<Mutex<HashMap<String, BusMessage>>>,
     semantic_inboxes: Arc<SemanticInboxes>,
@@ -958,9 +1032,7 @@ async fn worker_loop(params: WorkerLoopParams) {
         {
             Ok(client) => client,
             Err(error) => {
-                let _ = events
-                    .send_async(BusBridgeEvent::Fatal(error.to_string()))
-                    .await;
+                let _ = deliver(&events, BusBridgeEvent::Fatal(error.to_string()), &wake).await;
                 return;
             }
         },
@@ -980,9 +1052,7 @@ async fn worker_loop(params: WorkerLoopParams) {
         Ok(client) => client,
         Err(error) => {
             control.shutdown().await;
-            let _ = events
-                .send_async(BusBridgeEvent::Fatal(error.to_string()))
-                .await;
+            let _ = deliver(&events, BusBridgeEvent::Fatal(error.to_string()), &wake).await;
             return;
         }
     };
@@ -990,18 +1060,19 @@ async fn worker_loop(params: WorkerLoopParams) {
     if let Err(error) = install_subscriptions(&telemetry, &config.subscriptions).await {
         control.shutdown().await;
         telemetry.shutdown().await;
-        let _ = events.send_async(BusBridgeEvent::Fatal(error)).await;
+        let _ = deliver(&events, BusBridgeEvent::Fatal(error), &wake).await;
         return;
     }
 
     let Some(mut incoming) = telemetry.incoming() else {
         control.shutdown().await;
         telemetry.shutdown().await;
-        let _ = events
-            .send_async(BusBridgeEvent::Fatal(
-                "Bus incoming stream already taken".into(),
-            ))
-            .await;
+        let _ = deliver(
+            &events,
+            BusBridgeEvent::Fatal("Bus incoming stream already taken".into()),
+            &wake,
+        )
+        .await;
         return;
     };
 
@@ -1022,12 +1093,15 @@ async fn worker_loop(params: WorkerLoopParams) {
         {
             Ok(client) => Some(Arc::new(client)),
             Err(error) => {
-                let _ = events
-                    .send_async(BusBridgeEvent::ObservationConnection {
+                let _ = deliver(
+                    &events,
+                    BusBridgeEvent::ObservationConnection {
                         state: BusConnectionState::Fatal,
                         generation: 0,
-                    })
-                    .await;
+                    },
+                    &wake,
+                )
+                .await;
                 bevy::log::error!("Bus observation connection failed: {error}");
                 None
             }
@@ -1045,12 +1119,15 @@ async fn worker_loop(params: WorkerLoopParams) {
             BusConnectionState::from(client.state())
         });
     if observation.is_some() {
-        let _ = events
-            .send_async(BusBridgeEvent::ObservationConnection {
+        let _ = deliver(
+            &events,
+            BusBridgeEvent::ObservationConnection {
                 state: last_observation_state,
                 generation: last_observation_gen,
-            })
-            .await;
+            },
+            &wake,
+        )
+        .await;
     }
 
     // One combined generation exposed to Bevy: start at 1 (matching a single
@@ -1061,12 +1138,15 @@ async fn worker_loop(params: WorkerLoopParams) {
     let mut combined_generation = 1u64;
     let mut epoch_pending = false;
     let mut last_state = combined_connection_state(control.state(), telemetry.state());
-    let _ = events
-        .send_async(BusBridgeEvent::Connection {
+    let _ = deliver(
+        &events,
+        BusBridgeEvent::Connection {
             state: last_state,
             generation: combined_generation,
-        })
-        .await;
+        },
+        &wake,
+    )
+    .await;
     let mut state_tick = tokio::time::interval(std::time::Duration::from_millis(50));
     state_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dropped = 0usize;
@@ -1354,6 +1434,7 @@ async fn worker_loop(params: WorkerLoopParams) {
                     }) {
                         let topic = message.topic().unwrap().to_string();
                         latest_messages.lock().unwrap().insert(topic, message);
+                        wake();
                     } else if messages.try_send(message).is_err() {
                         dropped = dropped.saturating_add(1);
                         // Usually publish the critical notice immediately. If the
@@ -1481,7 +1562,7 @@ async fn worker_loop(params: WorkerLoopParams) {
                             body,
                         );
                     }
-                } else if is_app_verb(&command.command) {
+                } else if is_inbound_verb(&command.command, &config.inbound_prefixes) {
                     if epoch_pending {
                         // Mid-reconnect the app is resyncing; answer busy
                         // rather than hold a request across an epoch. (An
@@ -1670,6 +1751,10 @@ fn is_app_verb(command: &str) -> bool {
         )
 }
 
+fn is_inbound_verb(command: &str, prefixes: &[String]) -> bool {
+    is_app_verb(command) || prefixes.iter().any(|prefix| command.starts_with(prefix))
+}
+
 fn is_observe_event(command: &str) -> bool {
     command == "noded.observe.event"
 }
@@ -1763,7 +1848,7 @@ fn enter_epoch_fence(
     semantic_inboxes: &SemanticInboxes,
     committed_generation: &AtomicU64,
     tasks: EpochFenceTasks<'_>,
-    events: &Sender<BusBridgeEvent>,
+    events: &WakeSender<BusBridgeEvent>,
 ) {
     let EpochFenceTasks {
         calls,
@@ -2536,6 +2621,7 @@ mod tests {
                 ),
             ]);
             let (event_tx, event_rx) = flume::bounded(8);
+            let event_tx = WakeSender::new(event_tx, no_op_wake());
             let semantic_inboxes = SemanticInboxes::default();
             #[cfg(feature = "theme")]
             semantic_inboxes.enqueue_theme_changed(
@@ -2742,5 +2828,21 @@ mod tests {
         let (rc, body) = app_body_too_large_error("app.controls.set");
         assert_eq!(rc, 10);
         assert_eq!(body, r#"{"error":"body too large"}"#);
+    }
+
+    #[test]
+    fn successful_worker_delivery_requests_one_coalesced_wake() {
+        let (tx, rx) = flume::bounded(2);
+        let wakes = Arc::new(AtomicU64::new(0));
+        let observed = Arc::clone(&wakes);
+        let sender = WakeSender::new(
+            tx,
+            Arc::new(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+        sender.try_send(1_u8).unwrap();
+        assert_eq!(rx.try_recv(), Ok(1));
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
     }
 }

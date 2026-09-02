@@ -199,6 +199,7 @@ mod tests {
         Corner, CornerEvent, CornerTrigger, LogicalSize, OutputKey, PanelEffect, PanelMode,
         RevealTrigger,
     };
+    use crate::runtime::{ShellSemanticVerb, semantic_shell_command};
     use bevy::MinimalPlugins;
     use bevy::prelude::App;
 
@@ -281,5 +282,95 @@ mod tests {
                 .get(Edge::Left),
             PanelMode::Hidden
         );
+    }
+
+    #[test]
+    fn semantic_verbs_reproduce_direct_shell_command_results() {
+        let cases = [
+            (
+                ShellSemanticVerb::PanelShow,
+                ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input: crate::core::PanelInput::Reveal,
+                },
+            ),
+            (
+                ShellSemanticVerb::PanelHide,
+                ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input: crate::core::PanelInput::Hide,
+                },
+            ),
+            (
+                ShellSemanticVerb::PanelToggle,
+                ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input: crate::core::PanelInput::Reveal,
+                },
+            ),
+            (
+                ShellSemanticVerb::PanelPin,
+                ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input: crate::core::PanelInput::Pin,
+                },
+            ),
+            (
+                ShellSemanticVerb::PanelUnpin,
+                ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input: crate::core::PanelInput::Unpin,
+                },
+            ),
+            (
+                ShellSemanticVerb::PageNext,
+                ShellCommandKind::Carousel {
+                    edge: Edge::Left,
+                    input: CarouselInput::Next,
+                },
+            ),
+            (
+                ShellSemanticVerb::PagePrevious,
+                ShellCommandKind::Carousel {
+                    edge: Edge::Left,
+                    input: CarouselInput::Previous,
+                },
+            ),
+            (
+                ShellSemanticVerb::PageSet("places".to_owned()),
+                ShellCommandKind::Carousel {
+                    edge: Edge::Left,
+                    input: CarouselInput::SelectId("places".to_owned()),
+                },
+            ),
+        ];
+        for (verb, direct_kind) in cases {
+            let mut adapted = app();
+            let mut direct = app();
+            let frame = adapted.world().resource::<ShellFrameState>().0.clone();
+            let output = frame.geometry.output.clone();
+            adapted.world_mut().write_message(semantic_shell_command(
+                &frame,
+                output.clone(),
+                Duration::ZERO,
+                Edge::Left,
+                verb,
+            ));
+            direct.world_mut().write_message(ShellCommand {
+                output,
+                at: Duration::ZERO,
+                kind: direct_kind,
+            });
+            adapted.update();
+            direct.update();
+            assert_eq!(
+                adapted.world().resource::<ShellFrameState>().0,
+                direct.world().resource::<ShellFrameState>().0,
+            );
+            assert_eq!(
+                adapted.world().resource::<ShellEffects>().0,
+                direct.world().resource::<ShellEffects>().0,
+            );
+        }
     }
 }

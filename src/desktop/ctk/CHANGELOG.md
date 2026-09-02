@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.52.0 — 2026-09-02
+
+- Add a generic worker wake callback and explicit directed-command prefixes to
+  the Bus bridge. Successful worker delivery now wakes non-winit event loops.
+- Expose the generation-filtered service-port drain/reply seam and registered-
+  local caller gate for application-owned substrate services.
+
 ## 0.51.0 — 2026-09-02
 
 - Breaking: replace Bevy's combined default-platform backend behaviour with

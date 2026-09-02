@@ -80,7 +80,7 @@ pub const APP_CONTROL_CONTRACT: &str = "ctk-app-control.v0";
 
 /// Why an Bus caller failed the current same-node provenance gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LocalCallerError {
+pub enum LocalCallerError {
     UnregisteredCaller,
     RemoteIdentityUnavailable,
 }
@@ -90,7 +90,7 @@ pub(crate) enum LocalCallerError {
 /// `broker_origin` is broker-owned: noded strips every client spelling and
 /// overwrites it from connection state on delivery. Absence fails closed, so
 /// CTK mutation requires the matching broker release.
-pub(crate) fn authorize_local_caller(request: &InboundRequest) -> Result<(), LocalCallerError> {
+pub fn authorize_local_caller(request: &InboundRequest) -> Result<(), LocalCallerError> {
     let asserted = request.headers.keys().any(|name| {
         name.eq_ignore_ascii_case("source_peer")
             || name.eq_ignore_ascii_case("permissions")

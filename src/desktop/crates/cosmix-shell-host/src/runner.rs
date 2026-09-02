@@ -89,6 +89,24 @@ const MAX_PAST_DEADLINE_OBSERVATIONS: u8 = 64;
 #[derive(Resource, Default)]
 struct LayerHostUpdateWake(bool);
 
+/// Thread-safe, coalescing wake handle for producers outside Bevy.
+///
+/// A successful send makes the host's blocked calloop dispatcher runnable.
+/// Capacity one deliberately collapses a burst into one pending update.
+#[derive(Resource, Clone)]
+pub struct LayerHostWake(calloop::channel::SyncSender<()>);
+
+impl LayerHostWake {
+    pub fn wake(&self) {
+        let _ = self.0.try_send(());
+    }
+
+    pub fn callback(&self) -> std::sync::Arc<dyn Fn() + Send + Sync> {
+        let wake = self.clone();
+        std::sync::Arc::new(move || wake.wake())
+    }
+}
+
 fn capture_layer_host_redraw(
     mut redraws: MessageReader<RequestRedraw>,
     mut wake: ResMut<LayerHostUpdateWake>,
@@ -702,6 +720,7 @@ pub fn configure_layer_host(app: &mut App, config: LayerHostConfig) -> &mut App 
     // the sole owner and the runner can log and drain a clean exit.
     #[cfg(target_os = "linux")]
     let signals = Signals::new(&[Signal::SIGINT, Signal::SIGTERM]);
+    let (external_wake, external_wakes) = calloop::channel::sync_channel(1);
     configure_ingress(app);
     app.add_plugins(
         DefaultPlugins
@@ -716,12 +735,14 @@ pub fn configure_layer_host(app: &mut App, config: LayerHostConfig) -> &mut App 
                 ..default()
             }),
     );
-    app.init_resource::<LayerHostUpdateWake>()
+    app.insert_resource(LayerHostWake(external_wake))
+        .init_resource::<LayerHostUpdateWake>()
         .add_systems(Last, capture_layer_host_redraw);
     app.set_runner(move |app| {
         run_layer_host(
             app,
             config,
+            external_wakes,
             #[cfg(target_os = "linux")]
             signals,
         )
@@ -963,6 +984,7 @@ impl<'loop_handle>
 fn run_layer_host(
     mut app: App,
     config: LayerHostConfig,
+    external_wakes: calloop::channel::Channel<()>,
     #[cfg(target_os = "linux")] signals: calloop::Result<Signals>,
 ) -> AppExit {
     let connection = match Connection::connect_to_env() {
@@ -1101,6 +1123,20 @@ fn run_layer_host(
         Ok(event_loop) => event_loop,
         Err(error) => return state_exit(state, &format!("calloop-create-failed-{error}"), true),
     };
+    if let Err(error) = event_loop
+        .handle()
+        .insert_source(external_wakes, |event, _, state| {
+            if matches!(event, calloop::channel::Event::Msg(())) {
+                state.needs_update = true;
+            }
+        })
+    {
+        return state_exit(
+            state,
+            &format!("external-wake-channel-insert-failed-{error}"),
+            true,
+        );
+    }
     let corner_bus = start_corner_bus(
         config.comp_service.clone(),
         state
@@ -4188,5 +4224,32 @@ mod tests {
             Duration::from_millis(1_600),
             "the timer decision and model update consume one sampled clock value"
         );
+    }
+
+    #[test]
+    fn bus_worker_wake_reaches_a_blocked_calloop_runner() {
+        let (sender, channel) = calloop::channel::sync_channel(1);
+        let wake = LayerHostWake(sender);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let mut loop_ = calloop::EventLoop::<bool>::try_new().unwrap();
+            loop_
+                .handle()
+                .insert_source(channel, |event, _, woke| {
+                    if matches!(event, calloop::channel::Event::Msg(())) {
+                        *woke = true;
+                    }
+                })
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            let mut woke = false;
+            loop_.dispatch(None, &mut woke).unwrap();
+            done_tx.send(woke).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        wake.wake();
+        assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        worker.join().unwrap();
     }
 }
