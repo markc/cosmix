@@ -35704,6 +35704,32 @@ fn topology_change_retires_only_changed_kms_capture_generations() {
 // pixels (the presented capture), X focus delivery, and XWM stack mirroring
 // over a live connection.
 // ---------------------------------------------------------------------------
+/// Presence guard for vendored smithay fix 8 (`vendor/README.md`): the
+/// idempotent `XWaylandClientData::disconnected`. Deliberately a SOURCE read
+/// in the default suite — the behaviour is unreachable offline (the
+/// `ClientData` instance is built inside `XWayland::spawn`), and a vendor
+/// bump that silently reverts the patch reintroduces a compositor-killing
+/// panic on the second kill of one Xwayland client. Runs without the
+/// `xwayland` feature on purpose: the vendored file exists regardless, and
+/// the plain `cargo test -p cosmix-comp` gate is the one every bump runs.
+#[test]
+fn vendored_xwayland_disconnected_stays_idempotent() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../vendor/smithay/src/xwayland/xserver.rs");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("vendored xserver.rs unreadable at {path:?}: {error}"));
+    assert!(
+        !source.contains(".take().unwrap()"),
+        "vendored XWaylandClientData::disconnected must stay idempotent: a \
+         take().unwrap() shape means the fix-8 patch was reverted and a second \
+         kill of one Xwayland client panics the compositor again"
+    );
+    assert!(
+        source.contains("let Some(mut child) = self.child.lock().unwrap().take() else"),
+        "the fix-8 idempotence pattern is missing from the vendored disconnected"
+    );
+}
+
 #[cfg(feature = "xwayland")]
 mod x11 {
     use super::*;
@@ -36887,6 +36913,8 @@ mod x11 {
         let new_window =
             fake_x11_window(73, false, Rectangle::new((0, 0).into(), (200, 150).into()));
         new_window.set_wl_surface_offline(Some(new_surface.clone()));
+        let old_id = harness.server.state.surfaces[&old_object].id;
+        harness.server.state.events.clear();
         harness
             .server
             .state
@@ -36897,6 +36925,16 @@ mod x11 {
             Some(&new_object),
             "the forward entry follows the new object"
         );
+        // Round 4 MAJOR-2: the displaced record is WITHDRAWN at hand-over,
+        // not left behind as a live mapped ghost (it was mapped with a
+        // committed dmabuf): gone from the surfaces table, both map entries
+        // cleaned, and the renderer told — before anything else can
+        // composite it or hand `sync_xwm_stacking` two entries for one X11
+        // window.
+        assert!(
+            !harness.server.state.surfaces.contains_key(&old_object),
+            "the displaced record is withdrawn at hand-over, not orphaned mapped"
+        );
         assert!(
             !harness
                 .server
@@ -36904,19 +36942,80 @@ mod x11 {
                 .xwayland
                 .xids_by_object
                 .contains_key(&old_object),
-            "the old object's stale reverse entry is dropped at re-association"
+            "the old object's reverse entry is gone with its record"
         );
-        // The old record dies (its wl_surface is destroyed). The guard in
-        // `destroy_surface_record` must leave the live mapping alone.
-        harness.server.state.destroy_surface_record(&old_surface);
         assert!(
-            !harness.server.state.surfaces.contains_key(&old_object),
-            "the old record itself is gone"
+            harness.server.state.events.iter().any(|event| matches!(
+                event,
+                ProtocolEvent::SurfaceDestroyed { id } if *id == old_id
+            )),
+            "the renderer is told the displaced entity is gone"
         );
+        // The old wl_surface's own later destruction is a no-op on the
+        // absent record and must leave the live mapping alone.
+        harness.server.state.destroy_surface_record(&old_surface);
         assert_eq!(
             harness.server.state.xwayland.surfaces_by_xid.get(&73),
             Some(&new_object),
-            "the dying old record must not wipe the live record's mapping"
+            "the trailing wl_surface destroy must not wipe the live record's mapping"
+        );
+    }
+
+    #[test]
+    fn x11_map_request_before_reassociation_survives_the_surface_swap() {
+        // Round 4 MAJOR-1: the ordering the trailing-destroy test steps
+        // over. The client's single MapRequest lands BEFORE Xwayland swaps
+        // the wl_surface. At the second association the incoming surface
+        // has no record and `pending_windows[xid]` was consumed by the
+        // first association — without the displaced-record hand-over the
+        // new record starts ineligible (`map_requested == false`) with
+        // geometry from raw X hints, no further MapRequest ever arrives,
+        // and `commit_may_map_surface` withholds every buffer forever.
+        let mut harness = KeybindingHarness::new(true);
+        let (surface_id_a, _surface_a, window, object_a) =
+            associate_normal_window(&mut harness, 75);
+        commit_dmabuf(&mut harness, surface_id_a, 32, 24);
+        assert!(
+            harness.server.state.surfaces[&object_a].mapped,
+            "precondition: the first surface presented"
+        );
+        let SurfaceRole::X11(role) = &harness.server.state.surfaces[&object_a].role else {
+            panic!("first surface carries the X11 role");
+        };
+        let granted = role.granted_geometry;
+        assert_ne!(
+            granted,
+            Rectangle::new((0, 0).into(), (200, 150).into()),
+            "precondition: the granted rect differs from the raw X hints"
+        );
+        // Xwayland swaps the wl_surface: same XID, fresh surface, and the
+        // client sends no second MapRequest.
+        let (surface_id_b, surface_b) = roleless_wl_surface(&mut harness);
+        window.set_wl_surface_offline(Some(surface_b.clone()));
+        harness
+            .server
+            .state
+            .x11_associate_window(surface_b.clone(), window);
+        let object_b = surface_b.id();
+        assert!(
+            !harness.server.state.surfaces.contains_key(&object_a),
+            "the displaced record is withdrawn at hand-over"
+        );
+        let SurfaceRole::X11(role) = &harness.server.state.surfaces[&object_b].role else {
+            panic!("swapped surface carries the X11 role");
+        };
+        assert!(
+            role.phase.eligible(),
+            "the map grant crosses the surface swap; the client will not re-request it"
+        );
+        assert_eq!(
+            role.granted_geometry, granted,
+            "the granted rect crosses the swap too, not raw X hints"
+        );
+        commit_dmabuf(&mut harness, surface_id_b, 32, 24);
+        assert!(
+            harness.server.state.surfaces[&object_b].mapped,
+            "the swapped surface presents its first buffer without a second MapRequest"
         );
     }
 

@@ -162,7 +162,7 @@ To move to a new upstream release:
      … }`. **A `[patch]` whose version does not satisfy the dependency is not an
      error.** Cargo prints `warning: patch smithay v0.8.0 … was not used in the
      crate graph`, resolves the dependency from crates.io instead, and builds
-     clean — against the *unpatched* upstream crate, with all seven fixes gone.
+     clean — against the *unpatched* upstream crate, with all eight fixes gone.
      Measured in a throwaway worktree: bumping only the vendored manifest left
      `cargo tree` selecting registry `smithay v0.7.0`. **Fixes 6 and 7 changed what this
      costs.** It used to be that nothing else caught this: the four live tests
@@ -170,7 +170,7 @@ To move to a new upstream release:
      green. Their four tests are neither, so an unapplied patch now turns the
      ordinary `cargo test -p cosmix-comp` red — measured only indirectly, by removing the
      vendored guard and watching that test fail. That is **not** the same tree an
-     unapplied patch produces, which loses all seven fixes and not just one hunk;
+     unapplied patch produces, which loses all eight fixes and not just one hunk;
      it only reproduces the acceptance path the test reads.
      Do not let that soften row 5: four tests out of
      ten are a smoke alarm, not the check, and they say nothing about the other
@@ -267,8 +267,8 @@ To move to a new upstream release:
 
    ```sh
    ROOT=$(git rev-parse --show-toplevel) &&
-   sha=$(grep -o '[0-9a-f]\{40\}' "$ROOT/desktop/vendor/smithay/.cargo_vcs_info.json") &&
-   grep -q "^| upstream commit | \`$sha\`" "$ROOT/desktop/vendor/README.md"
+   sha=$(grep -o '[0-9a-f]\{40\}' "$ROOT/src/desktop/vendor/smithay/.cargo_vcs_info.json") &&
+   grep -q "^| upstream commit | \`$sha\`" "$ROOT/src/desktop/vendor/README.md"
    provenance=$?
    echo "provenance=$provenance"   # 0 = the table row names the tarball's commit
    ( exit "$provenance" )          # ...and so does the block, for anything scripting it
@@ -322,10 +322,12 @@ To move to a new upstream release:
    `destruction_hook`, `CachedState::cached`, `destroy_syncobj_handle`,
    `DeviceFd::downgrade` or `DmabufParamsData::create_dmabuf` are present. The
    ten tests below answer a *different*
-   question — they establish the seven **behaviours**, not the presence of any
-   named symbol; a restructured upstream could pass all ten with every one of
-   those names gone. Symbol presence is established by reading the source, and
-   nothing automated here checks it. Worth re-running this command after step 4
+   question — they establish the **behaviours** of fixes 1-7, not the presence
+   of any named symbol; a restructured upstream could pass all ten with every
+   one of those names gone. Symbol presence is established by reading the
+   source, and nothing automated here checks it — except fix 8, whose guard
+   (`vendored_xwayland_disconnected_stays_idempotent`, in the default suite)
+   is precisely a source read. Worth re-running this command after step 4
    as well, since it is cheap and a reapply can go wrong in the other direction.
 
    One more limit, because it is the difference between "verified" and
@@ -482,7 +484,7 @@ The sha256 above is the one `Cargo.lock` recorded for the registry package
 before the patch was added, so it pins exactly what the unpatched build used.
 
 Vendored because Cargo can only replace a **whole package source**. Six of the
-seven defects we need fixed live in private items — `commit_hook`, `destruction_hook`
+eight defects we need fixed live in private items — `commit_hook`, `destruction_hook`
 and the `GetSurface` handler in `src/wayland/drm_syncobj/mod.rs`;
 `DrmTimelineDeviceSpecific` in `src/wayland/drm_syncobj/sync_point.rs`;
 `CachedState`'s private `cache` field in `src/wayland/compositor/cache.rs`,
@@ -509,9 +511,33 @@ keyboard grab, which may defer or refuse the focus change — leaving the call
 site to announce a change that did not happen while smithay and the client still
 agree focus is held. Compensation is reachable; correctness is not.
 
+**Fix 8** (2026-09-02): `XWaylandClientData::disconnected`
+(`src/xwayland/xserver.rs`) is made idempotent. Upstream does
+`self.child.lock().unwrap().take().unwrap()`, so the second `disconnected`
+for the same client panics on the `None`. Two kills can genuinely reach one
+XWayland client from callers that do not know about each other: `Drop for
+XWayland` kills it on teardown, and `cosmix-comp`'s explicit-sync fault path
+(`disconnect_explicit_sync_client`) kills every client owning a DMA-BUF use
+by client key, with no XWayland lifecycle knowledge — and Xwayland speaks
+`linux-drm-syncobj-v1`. Both kills can land in one dispatch batch with no
+`cleanup()` between them (`get_client_mut` returns killed clients and
+`Client::kill` has no killed-guard), so `disconnected` runs twice. The fix
+takes the child once, and a second call logs
+`Xwayland client disconnected twice` and returns — the log line is
+deliberate, because the removed panic was, accidentally, the only
+enforcement of the compositor's one-deliberate-kill discipline. Like the
+others this is non-interposable, though not via privacy: the `ClientData`
+instance is constructed inside `XWayland::spawn`, so no downstream wrapper
+can stand between the backend and this method. Its presence guard is
+`vendored_xwayland_disconnected_stays_idempotent` in `cosmix-comp`'s
+**default** test suite (no feature, no device, not `#[ignore]`d): it reads
+the vendored source and reds if the `take().unwrap()` shape returns, so a
+bump that silently drops this fix fails plain `cargo test -p cosmix-comp`.
+Genuine upstream bug, worth reporting.
+
 ### Downstream API additions
 
-Separate from the seven defect fixes above, `PointerHandle::current_pressed`
+Separate from the eight defect fixes above, `PointerHandle::current_pressed`
 mirrors `current_location`: it locks the outer handle, clones the physically
 pressed button list, and makes removal reconciliation available without entering
 a pointer grab.
@@ -552,22 +578,6 @@ not exist there and a production call site fails to compile. (`#[cfg(test)]`
 was deliberately not used: it is false when the vendored crate is compiled as
 a dependency, which would silently compile the setters into every build.)
 
-`XWaylandClientData::disconnected` (`src/xwayland/xserver.rs`, changed
-2026-09-02) is made idempotent: upstream does
-`self.child.lock().unwrap().take().unwrap()`, so the second `disconnected`
-for the same client panics on the `None`. Two kills can genuinely reach one
-XWayland client from callers that do not know about each other: `Drop for
-XWayland` kills it on teardown, and `cosmix-comp`'s explicit-sync fault path
-(`disconnect_explicit_sync_client`) kills every client owning a DMA-BUF use
-by client key, with no XWayland lifecycle knowledge — and Xwayland speaks
-`linux-drm-syncobj-v1`. Both kills can land in one dispatch batch with no
-`cleanup()` between them (`get_client_mut` returns killed clients and
-`Client::kill` has no killed-guard), so `disconnected` runs twice. The fix
-returns early when the child was already taken; the compositor keeps its
-exactly-one-kill discipline regardless — this makes the invariant hold for
-callers comp does not control instead of being prose. Genuine upstream bug,
-worth reporting.
-
 ### Re-verifying the pristine import
 
 ```sh
@@ -579,7 +589,7 @@ curl -fsSLo /tmp/smithay-0.7.0.crate https://static.crates.io/crates/smithay/smi
 echo "740cea6927892bc182d5bf70c8f79806c8bc9f68f2fb96e55a30be171b63af98  /tmp/smithay-0.7.0.crate" |
   sha256sum -c - &&
 tar -xzf /tmp/smithay-0.7.0.crate -C /tmp/smithay-pristine --strip-components=1 &&
-git -C "$ROOT" archive -o /tmp/smithay-tracked.tar HEAD:desktop/vendor/smithay &&
+git -C "$ROOT" archive -o /tmp/smithay-tracked.tar HEAD:src/desktop/vendor/smithay &&
 tar -xf /tmp/smithay-tracked.tar -C /tmp/smithay-tracked &&
 git diff --no-index /tmp/smithay-pristine /tmp/smithay-tracked > /tmp/pristine.diff 2>&1
 rc=$?

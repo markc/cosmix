@@ -379,8 +379,13 @@ impl ClientData for XWaylandClientData {
         // unwraps the taken child, so a client killed twice — e.g. once by
         // a subsystem that kills by client key without XWayland knowledge
         // (an explicit-sync fault) and once by `Drop for XWayland` — panics
-        // the compositor. The second call has nothing left to reap; return.
+        // the compositor. The second call has nothing left to reap; log and
+        // return. The log line matters: the removed panic was, accidentally,
+        // the only enforcement of the compositor's one-deliberate-kill
+        // discipline, so a comp-side double-kill regression must at least be
+        // a visible line rather than silence.
         let Some(mut child) = self.child.lock().unwrap().take() else {
+            error!("Xwayland client disconnected twice; second kill ignored (child already reaped)");
             return;
         };
         thread::spawn(move || {

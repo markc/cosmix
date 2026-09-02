@@ -1011,11 +1011,82 @@ impl WaylandState {
             };
             (role.xid == xid).then_some(role.phase)
         });
+        // Same XID re-associating to a DIFFERENT wl_surface: the previous
+        // record is displaced, and it carries two obligations.
+        //
+        // 1. Phase + geometry hand-over. The map grant belongs to the XID
+        //    and the client will not re-request it. On this ordering the
+        //    incoming surface has no record (`existing_phase` is None) and
+        //    `pending_windows[xid]` was consumed by the first association —
+        //    without the hand-over the new record starts ineligible
+        //    (`map_requested == false`) with geometry from raw X hints, and
+        //    `commit_may_map_surface` withholds every buffer forever.
+        // 2. Withdrawal. The displaced record must not survive as a live
+        //    mapped ghost: unreachable from either XID map, it would keep
+        //    compositing, hand `sync_xwm_stacking` two entries for one X11
+        //    window, and leak its buffer retention token at teardown.
+        //    `destroy_surface_record` withdraws it fully (renderer told via
+        //    `SurfaceDestroyed`, backings released, both XID map entries
+        //    cleaned) — the same established path `x11_destroyed_window`
+        //    uses while the wl_surface is still protocol-alive; the
+        //    surface's own later destruction is a no-op on the absent
+        //    record.
+        let displaced_object = self
+            .xwayland
+            .surfaces_by_xid
+            .get(&xid)
+            .filter(|previous| **previous != wl_surface.id())
+            .cloned();
+        let mut displaced_phase = None;
+        let mut displaced_geometry = None;
+        if let Some(previous_object) = displaced_object {
+            let displaced_surface = self.surfaces.get(&previous_object).and_then(|record| {
+                let SurfaceRole::X11(role) = &record.role else {
+                    return None;
+                };
+                if role.xid != xid {
+                    return None;
+                }
+                displaced_phase = Some(role.phase);
+                displaced_geometry = Some(role.granted_geometry);
+                Some(role.wl_surface.clone())
+            });
+            match displaced_surface {
+                Some(displaced_surface) => {
+                    // Same focus discipline as unmap/destroy: fall back only
+                    // when this X window actually held the keyboard (the new
+                    // surface re-takes focus when it maps).
+                    let held_focus = self.x11_window_holds_keyboard_focus(xid, &displaced_surface);
+                    self.destroy_surface_record(&displaced_surface);
+                    if held_focus {
+                        self.arbitrate_keyboard_focus(None, true, false);
+                    }
+                    tracing::debug!(
+                        xid,
+                        "withdrew displaced X11 record on re-association to a new wl_surface"
+                    );
+                }
+                None => {
+                    // The forward entry points at an object with no matching
+                    // X11 record (already destroyed, or its role replaced).
+                    // Hygiene only — no demonstrated failure mode rides on
+                    // this arm: drop the stale reverse entry when it still
+                    // claims this XID; the insert below repoints the forward
+                    // one.
+                    if self.xwayland.xids_by_object.get(&previous_object) == Some(&xid) {
+                        self.xwayland.xids_by_object.remove(&previous_object);
+                    }
+                }
+            }
+        }
         let mut phase = existing_phase
             .or_else(|| pending.as_ref().map(|entry| entry.phase))
+            .or(displaced_phase)
             .unwrap_or_default();
         phase.on_associated();
-        let granted = pending.and_then(|entry| entry.granted_geometry);
+        let granted = pending
+            .and_then(|entry| entry.granted_geometry)
+            .or(displaced_geometry);
         let geometry = granted.unwrap_or_else(|| surface.geometry());
         let decoration = self.x11_decoration_mode(&surface, false);
         let title = capped_toplevel_title(&surface.title());
@@ -1123,26 +1194,16 @@ impl WaylandState {
         };
         self.committed_surface_stacks
             .insert(object.clone(), vec![object.clone()]);
-        // Re-association is guarded in BOTH directions. Same object, new
-        // XID: drop the old XID's forward entry (when it still points at
-        // this object), or a later DestroyNotify for the old XID would
-        // destroy the live record. Same XID, new object: the insert below
-        // repoints the forward entry, and the old object's stale reverse
-        // entry is dropped here so no map claims a pairing that no longer
-        // holds — the old record's own death is harmless either way, since
-        // `destroy_surface_record` only removes a forward entry that still
-        // points at the dying object.
+        // Same object, new XID: drop the old XID's forward entry (when it
+        // still points at this object), or a later DestroyNotify for the
+        // old XID would destroy the live record. (The same-XID/new-object
+        // direction is fully handled by the displaced-record withdrawal
+        // above.)
         if let Some(previous_xid) = self.xwayland.xids_by_object.get(&object).copied()
             && previous_xid != xid
             && self.xwayland.surfaces_by_xid.get(&previous_xid) == Some(&object)
         {
             self.xwayland.surfaces_by_xid.remove(&previous_xid);
-        }
-        if let Some(previous_object) = self.xwayland.surfaces_by_xid.get(&xid).cloned()
-            && previous_object != object
-            && self.xwayland.xids_by_object.get(&previous_object) == Some(&xid)
-        {
-            self.xwayland.xids_by_object.remove(&previous_object);
         }
         self.xwayland.surfaces_by_xid.insert(xid, object.clone());
         self.xwayland.xids_by_object.insert(object, xid);
