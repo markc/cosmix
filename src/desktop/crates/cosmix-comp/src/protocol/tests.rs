@@ -37112,8 +37112,9 @@ mod x11 {
         // keyboard, so the withdrawal introduced a focus drop nothing paid
         // back — a focused X11 client that recreated its wl_surface lost
         // the keyboard until the user clicked it. The withdrawal now owes
-        // the window its focus (`refocus_xid`) and pays the debt the
-        // moment the replacement record presents.
+        // the window its focus (`XwaylandRuntime::refocus`) and pays the
+        // debt the moment the replacement record presents — here nothing
+        // touches the keyboard while the debt is pending, so it pays.
         let mut harness = KeybindingHarness::new(true);
         let (sid_a, surface_a, window, _object_a) = associate_normal_window(&mut harness, 78);
         commit_dmabuf(&mut harness, sid_a, 32, 24);
@@ -37145,7 +37146,13 @@ mod x11 {
             "the withdrawn record does not keep the keyboard while absent"
         );
         assert_eq!(
-            harness.server.state.xwayland.refocus_xid,
+            harness
+                .server
+                .state
+                .xwayland
+                .refocus
+                .as_ref()
+                .map(|pending| pending.xid),
             Some(78),
             "the swap records the focus debt"
         );
@@ -37158,9 +37165,77 @@ mod x11 {
             ),
             "keyboard focus returns when the replacement surface presents"
         );
-        assert_eq!(
-            harness.server.state.xwayland.refocus_xid, None,
+        assert!(
+            harness.server.state.xwayland.refocus.is_none(),
             "the focus debt is consumed exactly once"
+        );
+    }
+
+    #[test]
+    fn x11_surface_swap_focus_debt_is_dropped_when_focus_moves_deliberately() {
+        // Round 5+ (driver-directed): the inverse arc. A debt consumed
+        // UNCONDITIONALLY would yank the keyboard away from whatever the
+        // user focused while the replacement was pending — keystrokes into
+        // the wrong window, worse than the drop the debt repairs. The debt
+        // pays only while focus still sits exactly where the arming
+        // fallback parked it; any change in the interim drops it silently.
+        let mut harness = KeybindingHarness::new(true);
+        // A second focusable window, so the arming fallback has somewhere
+        // real to land.
+        let initial_serial = test_toplevel_record(&harness)
+            .required_configure
+            .expect("initial toplevel configure")
+            .into();
+        ack_and_map_test_toplevel(&mut harness, initial_serial);
+        let (sid_a, surface_a, window, _object_a) = associate_normal_window(&mut harness, 79);
+        commit_dmabuf(&mut harness, sid_a, 32, 24);
+        harness
+            .server
+            .state
+            .arbitrate_keyboard_focus(Some(surface_a.clone()), false, false);
+        assert!(
+            matches!(
+                harness.server.state.keyboard.current_focus(),
+                Some(SeatFocusTarget::X11(target)) if target.window_id() == 79
+            ),
+            "precondition: the X11 window holds the keyboard"
+        );
+        // Swap: the arming fallback lands on the mapped xdg toplevel and is
+        // recorded as the debt's baseline.
+        let (sid_b, surface_b) = roleless_wl_surface(&mut harness);
+        window.set_wl_surface_offline(Some(surface_b.clone()));
+        harness
+            .server
+            .state
+            .x11_associate_window(surface_b.clone(), window);
+        let fallback_focus = harness.server.state.keyboard.current_focus();
+        assert!(
+            harness.server.state.xwayland.refocus.is_some(),
+            "the swap records the focus debt"
+        );
+        // The deliberate interim choice: the user parks focus on nothing
+        // (clicked the desktop) — different from the recorded fallback.
+        harness
+            .server
+            .state
+            .arbitrate_keyboard_focus(None, false, true);
+        assert!(
+            harness.server.state.keyboard.current_focus().is_none(),
+            "precondition: the deliberate choice differs from the fallback"
+        );
+        assert!(
+            fallback_focus.is_some(),
+            "precondition: the fallback landed on a real window"
+        );
+        // The replacement presents: the debt must be dropped, not paid.
+        commit_dmabuf(&mut harness, sid_b, 32, 24);
+        assert!(
+            harness.server.state.keyboard.current_focus().is_none(),
+            "focus stays where the user deliberately put it"
+        );
+        assert!(
+            harness.server.state.xwayland.refocus.is_none(),
+            "the dropped debt does not linger"
         );
     }
 

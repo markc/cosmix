@@ -236,13 +236,32 @@ pub(super) struct XwaylandRuntime {
     /// `send_selection`. X-2's clipboard bridge must revisit this drain
     /// before relaxing either refusal.
     pub(super) draining_wms: Vec<X11Wm>,
-    /// XID owed a keyboard refocus: its window held the keyboard when a
+    /// Keyboard refocus debt: the XID's window held the keyboard when a
     /// surface swap withdrew the displaced record, and the replacement is
-    /// not presentable yet. Consumed (focus handed back) the moment the
-    /// XID's record maps; cleared if the window or generation dies first.
-    /// Event-driven — set at the swap, consumed at map, no polling.
-    pub(super) refocus_xid: Option<X11Window>,
+    /// not presentable yet. Paid (focus handed back) the moment the XID's
+    /// record maps — but ONLY if the keyboard still sits exactly where the
+    /// arming fallback parked it; a focus change in the interim is a
+    /// deliberate choice by a human or another surface, and yanking the
+    /// keyboard back mid-interaction would send keystrokes to the wrong
+    /// window, which is worse than the focus drop the debt repairs.
+    /// Cleared if the window or generation dies first. Event-driven — set
+    /// at the swap, consumed at map, no polling.
+    pub(super) refocus: Option<PendingX11Refocus>,
     pub(super) shutting_down: bool,
+}
+
+/// See `XwaylandRuntime::refocus`.
+#[derive(Debug)]
+pub(super) struct PendingX11Refocus {
+    pub(super) xid: X11Window,
+    /// What the arming fallback landed the keyboard on (`None` = nothing).
+    /// Consumption compares this against the CURRENT focus: equal means the
+    /// keyboard is still where comp's own fallback put it and nobody has
+    /// made a choice since; different means someone has, and the debt is
+    /// dropped silently. Comparing against bare `None` would not work — the
+    /// fallback frequently lands on a real window, and that landing is not
+    /// a deliberate choice by anyone.
+    pub(super) fallback: Option<SeatFocusTarget>,
 }
 
 impl XwaylandRuntime {
@@ -258,7 +277,7 @@ impl XwaylandRuntime {
             xids_by_object: HashMap::new(),
             override_redirect_windows: HashSet::new(),
             draining_wms: Vec::new(),
-            refocus_xid: None,
+            refocus: None,
             shutting_down: false,
         }
     }
@@ -698,7 +717,7 @@ impl WaylandState {
         self.xwayland.surfaces_by_xid.clear();
         self.xwayland.xids_by_object.clear();
         self.xwayland.override_redirect_windows.clear();
-        self.xwayland.refocus_xid = None;
+        self.xwayland.refocus = None;
         for surface in surfaces {
             self.destroy_surface_record(&surface);
         }
@@ -916,25 +935,44 @@ impl WaylandState {
     /// its record is presentable again (first buffer commit on the new
     /// surface, or a retained-buffer remap). Cheap no-op while unarmed.
     pub(super) fn consume_pending_x11_refocus(&mut self) {
-        let Some(xid) = self.xwayland.refocus_xid else {
+        let Some(xid) = self.xwayland.refocus.as_ref().map(|pending| pending.xid) else {
             return;
         };
         let Some(object) = self.xwayland.surfaces_by_xid.get(&xid).cloned() else {
             // The window died before its replacement presented; the debt
             // dies with it.
-            self.xwayland.refocus_xid = None;
+            self.xwayland.refocus = None;
             return;
         };
-        let Some(record) = self.surfaces.get(&object) else {
-            self.xwayland.refocus_xid = None;
+        let Some((mapped, surface)) = self
+            .surfaces
+            .get(&object)
+            .map(|record| (record.mapped, record.role.wl_surface().clone()))
+        else {
+            self.xwayland.refocus = None;
             return;
         };
-        if !record.mapped {
+        if !mapped {
             // Not presentable yet; stay armed for the mapping commit.
             return;
         }
-        self.xwayland.refocus_xid = None;
-        let surface = record.role.wl_surface().clone();
+        let Some(pending) = self.xwayland.refocus.take() else {
+            return;
+        };
+        if self.keyboard.current_focus() != pending.fallback {
+            // A human or another surface made a deliberate focus choice
+            // while the debt was pending (this also covers the fallback
+            // target dying in the interim — the world changed either way).
+            // Yanking the keyboard back now would send keystrokes to the
+            // wrong window, which is worse than the drop the debt repairs.
+            // Expected whenever the user interacts during a swap, so drop
+            // quietly.
+            tracing::debug!(
+                xid,
+                "dropped X11 refocus debt; focus moved deliberately while it was pending"
+            );
+            return;
+        }
         self.arbitrate_keyboard_focus(Some(surface), false, false);
         tracing::debug!(xid, "returned keyboard focus after X11 surface swap");
     }
@@ -1123,7 +1161,16 @@ impl WaylandState {
                         // the X half of focus; the map-time refocus's
                         // `enter` balances it.
                         self.arbitrate_keyboard_focus(None, true, false);
-                        self.xwayland.refocus_xid = Some(xid);
+                        // Record where the fallback parked the keyboard
+                        // (possibly nowhere): consumption pays the debt only
+                        // while focus still sits exactly there — anything
+                        // else means a deliberate choice was made in the
+                        // interim, and the debt is dropped instead of
+                        // stealing the keyboard back.
+                        self.xwayland.refocus = Some(PendingX11Refocus {
+                            xid,
+                            fallback: self.keyboard.current_focus(),
+                        });
                     }
                     if pointer_on_window {
                         // The destroy's own pointer arm mismatched for the
@@ -1502,10 +1549,21 @@ impl WaylandState {
         let xid = window.window_id();
         self.xwayland.pending_windows.remove(&xid);
         self.xwayland.override_redirect_windows.remove(&xid);
-        if self.xwayland.refocus_xid == Some(xid) {
+        if self
+            .xwayland
+            .refocus
+            .as_ref()
+            .is_some_and(|pending| pending.xid == xid)
+        {
             // The window died before its swapped surface presented; the
-            // focus debt dies with it.
-            self.xwayland.refocus_xid = None;
+            // focus debt dies with it. This clear is also what makes XID
+            // reuse safe for the debt: an X server cannot recycle an XID it
+            // has not destroyed, DestroyNotify for the destruction lands
+            // here before any CreateWindow can reuse the id (the X event
+            // stream is ordered), and generation teardown clears the field
+            // wholesale — so a pending debt can never be paid to a
+            // different window that inherited the XID.
+            self.xwayland.refocus = None;
         }
         let Some(object) = self.xwayland.surfaces_by_xid.remove(&xid) else {
             return;
