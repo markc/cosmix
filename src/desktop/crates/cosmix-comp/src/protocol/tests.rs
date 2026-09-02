@@ -37424,16 +37424,24 @@ mod x11 {
     }
 
     #[test]
-    fn x11_surface_swap_debt_drops_when_the_x11_fallback_dies() {
-        // Round 8 MAJOR-1: THE mutant killer, and the dying-fallback drop's
-        // missing coverage. The debt's recorded fallback is a second X11
-        // window; focus is then deliberately parked on None and the
-        // fallback's `wl_surface()` is nulled (modelling its death). The
-        // real predicate compares identities: `Some(X11) != None` → drop.
-        // The `surface_id()` mutant resolves the nulled X11 target to
-        // `None` and compares it equal to the unfocused seat → pays a debt
-        // that must drop, yanking focus — which reds this test's final
-        // asserts. (Red-proven by installing exactly that mutant.)
+    fn x11_surface_swap_debt_drops_when_the_x11_fallbacks_surface_is_nulled() {
+        // Round 8 MAJOR-1: THE mutant killer. The debt's recorded fallback
+        // is a second X11 window; focus is then deliberately parked on
+        // None and the fallback's `wl_surface()` is nulled. The real
+        // predicate compares identities: `Some(X11) != None` → drop. The
+        // `surface_id()` mutant resolves the nulled X11 target to `None`
+        // and compares it equal to the unfocused seat → pays a debt that
+        // must drop, yanking focus — which reds this test's final asserts.
+        // (Red-proven by installing exactly that mutant.)
+        //
+        // Scope honesty: this is NOT coverage of the alive-gated
+        // dying-fallback drop documented at the consume site. With
+        // `current == None` and `fallback == Some(_)`, `Option`'s derived
+        // `PartialEq` short-circuits on the discriminant and
+        // `X11Surface::PartialEq` (the `state.alive` gate) is never
+        // invoked — and `state.alive` has no offline setter, so no better
+        // offline test can reach it. That mechanism is live-only; its
+        // written citation at the consume site is its verification.
         let mut harness = KeybindingHarness::new(true);
         // The fallback window: a second mapped X11 toplevel.
         let (sid_fb, _surface_fb, fallback_window, _object_fb) =
@@ -37503,12 +37511,25 @@ mod x11 {
         harness.server.state.x11_unmapped_window(window.clone());
         // What the vendor does after the first callback returns.
         window.set_wl_surface_offline(None);
-        // The duplicate must be a quiet no-op, not a debug-build panic.
+        // The duplicate must be a quiet no-op, not a debug-build panic —
+        // and "quiet" is asserted on something only the DUPLICATE could
+        // break: the first unmap already withdrew, so a second
+        // SurfaceUnmapped for this id would be the duplicate re-announcing
+        // a withdrawal the renderer already has.
+        harness.server.state.events.clear();
         harness.server.state.x11_unmapped_window(window);
         let record = &harness.server.state.surfaces[&object_a];
+        let id = record.id;
         assert!(
             !record.mapped,
             "the duplicate unmap leaves the withdrawn record withdrawn"
+        );
+        assert!(
+            !harness.server.state.events.iter().any(|event| matches!(
+                event,
+                ProtocolEvent::SurfaceUnmapped { id: unmapped } if *unmapped == id
+            )),
+            "the duplicate publishes no second SurfaceUnmapped"
         );
         assert!(
             harness

@@ -1008,17 +1008,21 @@ impl WaylandState {
             //   this comment is the only comp-side record of the
             //   dependency.
             // - A POPUP over the fallback: a popup still open at
-            //   consumption reads as different and drops the debt; a popup
-            //   already dismissed restored focus to its parent (the
-            //   vendored keyboard grab's `unset_grab(.., restore_focus:
-            //   true)` replays `pending_focus` — input/keyboard/mod.rs:
-            //   1228-1243, driven by the popup grab machinery in
-            //   desktop/wayland/popup/grab.rs), and when that parent IS
-            //   the recorded fallback the debt pays. Desirable in both
+            //   consumption reads as different and drops the debt; a
+            //   dismissed popup leaves focus on the grab ROOT —
+            //   `PopupGrab::unset_keyboard_grab` calls the no-restore
+            //   two-arg `KeyboardHandle::unset_grab(data)` and then
+            //   explicitly `set_focus(Some(self.root))`
+            //   (popup/grab.rs:370-380; keyboard/mod.rs:891-897 has no
+            //   restore machinery; the `restore_focus: true` calls in
+            //   popup/grab.rs are POINTER grabs, irrelevant to this
+            //   keyboard predicate) — so the debt pays exactly when that
+            //   root IS the recorded fallback. Desirable in both
             //   directions — the open popup is a live interaction, the
-            //   dismissed one left the world as the fallback made it. No
-            //   offline test drives this pair; the citation is the
-            //   verification.
+            //   dismissed one hands focus back to the window the popup
+            //   grew from. No offline test drives this pair; the citation
+            //   is the verification, and it was read from the vendored
+            //   source, not recalled.
             tracing::debug!(
                 xid,
                 "dropped X11 refocus debt; focus moved deliberately while it was pending"
@@ -1290,20 +1294,23 @@ impl WaylandState {
                             self.mark_pointer_hit_test_dirty();
                         } else {
                             if pointer_grab_on_window {
-                                // `unset_grab` (WITH focus restore), unlike
-                                // the reconciler's
-                                // `unset_grab_without_focus_restore` for the
-                                // deferred arm: same policy, two mechanisms,
-                                // deliberately. Here the retarget below runs
-                                // against a CURRENT hit test, so the restore
-                                // is immediately corrected and matches the
-                                // sibling destroy path (`mod.rs`
-                                // `clear_focus_for_surface`); the reconciler
-                                // runs against a hit test it is about to
-                                // rebuild, where a restore would replay a
-                                // stale focus it immediately overwrites.
+                                // WITHOUT focus restore, matching the
+                                // reconciler's deferred arm: the record was
+                                // destroyed just above, so a restore here
+                                // would emit a `wl_pointer.enter` naming the
+                                // just-destroyed surface — wire traffic, not
+                                // merely transient state — before the
+                                // retarget below supplies the correct focus
+                                // from a current hit test. The restore is
+                                // strictly redundant with that retarget.
+                                // (The sibling destroy path's grab arm in
+                                // `clear_focus_for_surface` still uses the
+                                // restoring `unset_grab` with the same
+                                // record-already-removed shape; it should
+                                // migrate for the same reason, but that is
+                                // its own change, not a rider on this one.)
                                 let pointer = self.pointer.clone();
-                                pointer.unset_grab(
+                                pointer.unset_grab_without_focus_restore(
                                     self,
                                     SERIAL_COUNTER.next_serial(),
                                     monotonic_millis(),
@@ -1652,29 +1659,44 @@ impl WaylandState {
         // smithay has nulled `wl_surface` while comp DELIBERATELY keeps
         // the record and association for the idempotent remap, so on the
         // duplicate a `None` resolution is the correct, supported state
-        // (`record.mapped` went false at the first unmap). Asserting
-        // `Some` unconditionally here panicked every debug build on any
-        // withdraw. Gating on `mapped` still catches the ordering flip
-        // this pin exists for — a flipped vendor yields `None` on the
-        // FIRST, still-mapped unmap. Accepted limit: the rarer
-        // xwm/mod.rs:2326 unpaired-serial null (mapped record, nulled
-        // surface) is indistinguishable from the flip through
-        // `wl_surface()` alone and is not covered.
-        debug_assert!(
-            self.xwayland
-                .surfaces_by_xid
-                .get(&xid)
-                .and_then(|object| self.surfaces.get(object))
-                .filter(|record| record.mapped)
-                .and_then(|record| record.role.x11())
-                .is_none_or(|role| {
-                    window
-                        .wl_surface()
-                        .is_some_and(|current| current == role.wl_surface)
-                }),
-            "unmapped_window ran after smithay nulled X11Surface::wl_surface(); \
-             the resolution-based grab teardown here is built on the opposite ordering"
-        );
+        // (`record.mapped` went false at the first unmap).
+        //
+        // This is an `error!`, NOT a `debug_assert!`, because the
+        // observation is provably ambiguous: the vendor's unpaired-serial
+        // path (xwm/mod.rs:2320-2328 — WL_SURFACE_SERIAL arriving before
+        // its commit, an ordering the vendor explicitly supports) nulls
+        // `wl_surface` on a still-MAPPED, presented record with no
+        // callback into comp, and an UnmapNotify landing in that window
+        // is LEGAL vendor behaviour that passes the `mapped` gate and is
+        // indistinguishable from the ordering flip through `wl_surface()`
+        // alone. A panic here would abort a developer build on correct
+        // behaviour; a loud log line still surfaces the flip the moment a
+        // vendor bump moves the null above the callback. Narrowing worth
+        // knowing: `mapped` only becomes true once a buffer has
+        // presented, so this pin is silently inert for a window that
+        // unmaps before first present — benign (a pointer grab needs
+        // hit-test presence, which needs presentation), but a narrowing,
+        // not full coverage.
+        if !self
+            .xwayland
+            .surfaces_by_xid
+            .get(&xid)
+            .and_then(|object| self.surfaces.get(object))
+            .filter(|record| record.mapped)
+            .and_then(|record| record.role.x11())
+            .is_none_or(|role| {
+                window
+                    .wl_surface()
+                    .is_some_and(|current| current == role.wl_surface)
+            })
+        {
+            tracing::error!(
+                xid,
+                "unmapped_window saw a mapped record with no wl_surface resolution: either \
+                 the vendored null moved above the callback (grab teardown is now broken) or \
+                 this is the legal unpaired-serial window (xwm/mod.rs:2320-2328)"
+            );
+        }
         if self
             .xwayland
             .refocus
