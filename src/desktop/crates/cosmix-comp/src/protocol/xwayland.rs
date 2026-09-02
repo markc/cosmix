@@ -83,6 +83,15 @@ impl X11WindowPhase {
         first
     }
 
+    /// Override-redirect map: the X server mapping the window IS the
+    /// eligibility — there is no grant. Deliberately does NOT set
+    /// `ever_granted`: an OR rect is client truth, not comp position
+    /// memory, and the surface-swap hand-over's geometry gate must keep
+    /// refusing to carry it.
+    pub(super) fn on_or_mapped(&mut self) {
+        self.map_requested = true;
+    }
+
     pub(super) fn on_map_notify(&mut self) -> bool {
         let first = !self.map_notified;
         self.map_notified = true;
@@ -879,26 +888,77 @@ impl WaylandState {
         self.xwayland.lifecycle = XwaylandLifecycle::Failed;
     }
 
+    /// Any X11 record for this xid — override-redirect included. The shared
+    /// paths (phase, presentability, client-authoritative geometry, title)
+    /// use this.
     fn x11_role_record_mut(&mut self, xid: X11Window) -> Option<&mut SurfaceRecord> {
         let object = self.xwayland.surfaces_by_xid.get(&xid)?.clone();
         self.surfaces.get_mut(&object)
     }
 
+    /// The MANAGED X11 record for this xid — `None` for an
+    /// override-redirect record. This is the structural refusal for the
+    /// grant-side behaviours (geometry grants, decoration, maximize,
+    /// fullscreen, unminimize, state relayout): a site reached through this
+    /// accessor cannot forget the OR check, because there is nothing to
+    /// forget. (The refusals that cannot route through an xid lookup —
+    /// `sync_xwm_stacking`'s filter, decoration at association, and the
+    /// press-path focus guard — are per-site, each with its own test.)
+    fn managed_x11_record_mut(&mut self, xid: X11Window) -> Option<&mut SurfaceRecord> {
+        self.x11_role_record_mut(xid)
+            .filter(|record| record.role.managed_toplevel())
+    }
+
     /// The one idempotent X geometry authority: applies a granted/notified
     /// global content rectangle to the record without touching the committed
     /// buffer presentation (`layout.width/height` follow pixels, not grants).
-    fn apply_x11_geometry(&mut self, xid: X11Window, rect: Rectangle<i32, Logical>) {
-        let Some(record) = self.x11_role_record_mut(xid) else {
+    pub(super) fn apply_x11_geometry(&mut self, xid: X11Window, rect: Rectangle<i32, Logical>) {
+        self.apply_x11_content_rect(xid, rect, false);
+    }
+
+    /// The override-redirect twin: CLIENT-authoritative geometry from the
+    /// vendor's OR ConfigureNotify branch (xwm/mod.rs:1661-1676, the one
+    /// place `state.geometry` is maintained). No grant, no clamp, no
+    /// cascade — the client's absolute rect is honoured verbatim, negative
+    /// origins included (menus overhang edges).
+    fn apply_or_geometry(&mut self, xid: X11Window, rect: Rectangle<i32, Logical>) {
+        self.apply_x11_content_rect(xid, rect, true);
+    }
+
+    fn apply_x11_content_rect(
+        &mut self,
+        xid: X11Window,
+        rect: Rectangle<i32, Logical>,
+        client_authoritative: bool,
+    ) {
+        let record = if client_authoritative {
+            // Raw lookup, then require the OR role: the managed accessor
+            // would refuse the record this arm exists for.
+            self.x11_role_record_mut(xid).filter(
+                |record| matches!(&record.role, SurfaceRole::X11(role) if role.override_redirect),
+            )
+        } else {
+            self.managed_x11_record_mut(xid)
+        };
+        let Some(record) = record else {
             return;
         };
         let SurfaceRole::X11(role) = &mut record.role else {
             return;
         };
         role.granted_geometry = rect;
-        // Whatever wrote this rect (map grant, configure answer, maximize,
-        // fullscreen, notify), it is now real position memory worth carrying
-        // across a surface swap.
-        role.phase.ever_granted = true;
+        if !client_authoritative {
+            // Whatever wrote this rect (map grant, configure answer,
+            // maximize, fullscreen, notify), it is now real position memory
+            // worth carrying across a surface swap. OR rects deliberately
+            // never set this: the swap hand-over's `ever_granted` gate —
+            // built in round 6 for stale-hint hygiene — thereby refuses to
+            // carry stale geometry to an OR record, whose truth is always
+            // the vendor-maintained `surface.geometry()`. The lattice
+            // composed before this feature existed; recorded so nobody
+            // wonders whether it was luck.
+            role.phase.ever_granted = true;
+        }
         let new_origin = (rect.loc.x as f32, rect.loc.y as f32);
         let new_size = (rect.size.w.max(1), rect.size.h.max(1));
         let size_changed = record.configured_size != new_size;
@@ -942,14 +1002,28 @@ impl WaylandState {
     /// decoration is enabled, unless Motif hints refuse WM decorations or the
     /// window is fullscreen. Never touches xdg decoration state.
     fn x11_decoration_mode(&self, surface: &X11Surface, fullscreen: bool) -> SceneDecorationMode {
-        if !self.decoration.enabled || fullscreen || surface.is_decorated() {
+        // Override-redirect first (X-2a per-site refusal #2, tested): a
+        // menu/tooltip never wears SSD chrome, regardless of Motif hints or
+        // the compositor decoration policy. This check runs at association,
+        // BEFORE a record exists, so it cannot route through the managed
+        // accessor.
+        if surface.is_override_redirect()
+            || !self.decoration.enabled
+            || fullscreen
+            || surface.is_decorated()
+        {
             SceneDecorationMode::ClientSide
         } else {
             SceneDecorationMode::ServerSide
         }
     }
 
-    fn refresh_x11_decoration(&mut self, xid: X11Window) {
+    pub(super) fn refresh_x11_decoration(&mut self, xid: X11Window) {
+        // Structural refusal: an OR record's decoration is ClientSide for
+        // life; Motif changes on it must not re-run the policy.
+        if self.managed_x11_record_mut(xid).is_none() {
+            return;
+        }
         let Some(object) = self.xwayland.surfaces_by_xid.get(&xid).cloned() else {
             return;
         };
@@ -1178,6 +1252,15 @@ impl WaylandState {
                 let SurfaceRole::X11(role) = &record.role else {
                     return None;
                 };
+                // Per-site refusal #1 (X-2a, tested): an OR window must
+                // never be fed to `update_stacking_order_upwards`, whose
+                // configure calls are `UnsupportedForOverrideRedirect` —
+                // and the X side agrees, since OR windows never enter
+                // `client_list_stacking` (vendor MapNotify, managed arm
+                // only).
+                if role.override_redirect {
+                    return None;
+                }
                 record
                     .mapped
                     .then_some((record.layout.z, role.surface.clone()))
@@ -1274,11 +1357,15 @@ impl WaylandState {
             "surface_associated ran before smithay repointed X11Surface::wl_surface(); \
              the by-id focus capture below is built on the opposite ordering"
         );
-        if surface.is_override_redirect() {
-            // X-2 gap: recorded, never managed.
+        // X-2a: override-redirect windows associate through the SAME flow —
+        // same record, same maps, same teardown/swap lattice — carrying the
+        // role flag that makes every managed behaviour refuse them. Their
+        // geometry falls out correctly below: OR pending entries never hold
+        // a grant, so `granted.unwrap_or_else(|| surface.geometry())` takes
+        // the vendor-maintained client rect.
+        let override_redirect = surface.is_override_redirect();
+        if override_redirect {
             self.xwayland.override_redirect_windows.insert(xid);
-            tracing::debug!(xid, "ignored override-redirect surface association (X-1)");
-            return;
         }
         let pending = self.xwayland.pending_windows.remove(&xid);
         // Re-association: the same wl_surface can be associated again (either
@@ -1516,6 +1603,7 @@ impl WaylandState {
             granted_geometry: geometry,
             fullscreen: false,
             wl_surface_serial: surface.wl_surface_serial(),
+            override_redirect,
         }));
         #[cfg(feature = "bus")]
         self.mark_surface_unmapped(&wl_surface);
@@ -1633,14 +1721,15 @@ impl WaylandState {
     }
 
     pub(super) fn x11_new_override_redirect_window(&mut self, window: X11Surface) {
-        // Deliberate X-2 gap: the WM must not manage these; X-1 records them
-        // for diagnostics and renders nothing.
+        // X-2a: an OR window is rendered but never managed. A pending entry
+        // carries the phase across the association/map ordering races,
+        // exactly like a managed window's — it just never holds a grant.
         let xid = window.window_id();
         self.xwayland.override_redirect_windows.insert(xid);
-        tracing::debug!(
-            xid,
-            "recorded override-redirect X11 window (ignored in X-1)"
-        );
+        self.xwayland
+            .pending_windows
+            .insert(xid, PendingX11Window::default());
+        tracing::debug!(xid, "new override-redirect X11 window");
     }
 
     pub(super) fn x11_map_window_request(&mut self, window: X11Surface) {
@@ -1698,7 +1787,7 @@ impl WaylandState {
             entry.phase.on_map_requested();
             entry.granted_geometry = Some(geometry);
         }
-        if let Some(record) = self.x11_role_record_mut(xid)
+        if let Some(record) = self.managed_x11_record_mut(xid)
             && let SurfaceRole::X11(role) = &mut record.role
         {
             role.phase.on_map_requested();
@@ -1745,27 +1834,60 @@ impl WaylandState {
     pub(super) fn x11_mapped_override_redirect_window(&mut self, window: X11Surface) {
         let xid = window.window_id();
         // A managed window can leave management at runtime: unmap, set
-        // override-redirect, remap. From here on every managed-path X write
-        // for this XID is refused per-request
-        // (`UnsupportedForOverrideRedirect`) while a surviving managed
-        // record would keep accepting maximize/move/resize requests —
-        // divergence that outlives the connection until DestroyNotify.
-        // Destroy the record: with no record there is nothing to diverge.
-        if self.xwayland.surfaces_by_xid.contains_key(&xid) {
+        // override-redirect, remap. The MANAGED record must not survive
+        // that transition (round 4's Q3 fix): a surviving one would keep
+        // accepting maximize/move/resize while every managed X write is
+        // refused per-request (`UnsupportedForOverrideRedirect`). With OR
+        // windows rendered (X-2a) this is a destroy-then-birth, not a
+        // mutation: dragging SSD state, grants and stacking assumptions
+        // across the managed/OR boundary in place would cross a line the
+        // whole lattice assumes records never cross, and no consumer needs
+        // identity continuity. The OR record is born below (or at the next
+        // association) through the ordinary path.
+        let existing_is_managed = self
+            .xwayland
+            .surfaces_by_xid
+            .get(&xid)
+            .and_then(|object| self.surfaces.get(object))
+            .is_some_and(|record| record.role.managed_toplevel());
+        if existing_is_managed {
             tracing::info!(
                 xid,
                 "managed X11 window remapped as override-redirect; destroying its managed record"
             );
             self.x11_destroyed_window(window.clone());
         }
-        // Deliberate X-2 gap: visually ignored. Logged once per XID so the
-        // gate can see the gap without the log flooding.
         if self.xwayland.override_redirect_windows.insert(xid) {
             tracing::info!(
                 xid,
                 window_type = ?window.window_type(),
-                "override-redirect X11 window mapped; not rendered in X-1"
+                "override-redirect X11 window mapped"
             );
+        }
+        // The X server mapped it — for an OR window that IS the map
+        // eligibility (there is no grant to wait for). Either callback
+        // order is legal: pending carries the phase to a later
+        // association; an existing OR record becomes presentable now, with
+        // the vendor-maintained client rect and a raise to the top of its
+        // band (fresh records are born top-of-band; a REMAP of a kept
+        // record needs the raise).
+        let or_surface = self.x11_role_record_mut(xid).and_then(|record| {
+            let SurfaceRole::X11(role) = &mut record.role else {
+                return None;
+            };
+            if !role.override_redirect {
+                return None;
+            }
+            role.phase.on_or_mapped();
+            Some(role.wl_surface.clone())
+        });
+        if let Some(surface) = or_surface {
+            self.apply_or_geometry(xid, window.geometry());
+            self.make_x11_record_presentable(xid);
+            self.raise_surface(&surface);
+        } else if !self.xwayland.surfaces_by_xid.contains_key(&xid) {
+            let entry = self.xwayland.pending_windows.entry(xid).or_default();
+            entry.phase.on_or_mapped();
         }
     }
 
@@ -2083,12 +2205,14 @@ impl WaylandState {
     ) {
         let xid = window.window_id();
         if window.is_override_redirect() {
-            // Diagnostics only in X-1; X-2 must mirror these faithfully.
-            tracing::trace!(
-                xid,
-                ?geometry,
-                "override-redirect configure notify (ignored in X-1)"
-            );
+            // X-2a: mirrored faithfully — the vendor's OR ConfigureNotify
+            // branch is the one place `state.geometry` is maintained
+            // (xwm/mod.rs:1661-1676), and this is its comp-side apply:
+            // client-authoritative, no grant, no clamp.
+            self.apply_or_geometry(xid, geometry);
+            if let Some(above) = above {
+                tracing::debug!(xid, above, "ignored OR sibling restack notify (X-2a)");
+            }
             return;
         }
         self.apply_x11_geometry(xid, geometry);
@@ -2172,6 +2296,13 @@ impl WaylandState {
 
     pub(super) fn x11_unminimize_request(&mut self, window: X11Surface) {
         let xid = window.window_id();
+        // Structural refusal: minimize is a managed behaviour (an OR record
+        // also cannot BE minimized — `minimize_toplevel`'s
+        // `managed_toplevel` gate refuses it — so this is symmetry, not the
+        // only defence).
+        if self.managed_x11_record_mut(xid).is_none() {
+            return;
+        }
         let Some(object) = self.xwayland.surfaces_by_xid.get(&xid).cloned() else {
             return;
         };
@@ -2568,7 +2699,7 @@ impl WaylandState {
     /// change at all: `apply_x11_geometry` publishes nothing then, but the
     /// scene state (SSD maximize glyph, fullscreen flag) still flipped.
     fn publish_x11_state_relayout(&mut self, xid: X11Window) {
-        let Some(record) = self.x11_role_record_mut(xid) else {
+        let Some(record) = self.managed_x11_record_mut(xid) else {
             return;
         };
         if !record.mapped {
@@ -2584,6 +2715,12 @@ impl WaylandState {
     /// the content rectangle immediately (no xdg serial), set the EWMH state.
     pub(super) fn request_x11_maximized(&mut self, window: &X11Surface, maximized: bool) {
         let xid = window.window_id();
+        // Structural refusal: maximize configures the window, and an OR
+        // window must never receive a `configure`
+        // (`UnsupportedForOverrideRedirect` before the wire).
+        if self.managed_x11_record_mut(xid).is_none() {
+            return;
+        }
         let usable = self.usable_output_rect();
         let extents = DecoExtents::of(&self.decoration.theme);
         let Some(object) = self.xwayland.surfaces_by_xid.get(&xid).cloned() else {
@@ -2669,6 +2806,11 @@ impl WaylandState {
     /// fullscreen, restore the prior policy on leave.
     pub(super) fn request_x11_fullscreen(&mut self, window: &X11Surface, fullscreen: bool) {
         let xid = window.window_id();
+        // Structural refusal: fullscreen configures the window — same
+        // never-configure-an-OR-window rule as maximize.
+        if self.managed_x11_record_mut(xid).is_none() {
+            return;
+        }
         let output = self.logical_output_rect();
         let Some(object) = self.xwayland.surfaces_by_xid.get(&xid).cloned() else {
             return;

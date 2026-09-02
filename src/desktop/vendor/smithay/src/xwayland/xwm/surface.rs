@@ -355,6 +355,21 @@ impl X11Surface {
         self.state.lock().unwrap().wl_surface_serial = serial;
     }
 
+    /// Set the override-redirect flag directly, bypassing the MapNotify
+    /// that normally refreshes it.
+    ///
+    /// CosMix vendor addition, same contract as
+    /// [`Self::set_wl_surface_offline`]: downstream deterministic compositor
+    /// tests must drive the managed→override-redirect TRANSITION of one
+    /// window (unmap, set the flag, remap) — the production sequence the
+    /// downstream managed-record destroy exists for, which two separate
+    /// fake windows cannot reproduce. Production code must never call this;
+    /// MapNotify owns the real flag.
+    #[cfg(feature = "cosmix_offline_test")]
+    pub fn set_override_redirect_offline(&self, override_redirect: bool) {
+        self.state.lock().unwrap().override_redirect = override_redirect;
+    }
+
     /// Returns the associated wl_surface.
     ///
     /// This will only return `Some` once:

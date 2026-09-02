@@ -36620,10 +36620,17 @@ mod x11 {
     }
 
     #[test]
-    fn x11_override_redirect_windows_never_get_scene_records() {
+    fn x11_override_redirect_windows_render_but_are_never_managed() {
+        // X-2a inversion of the X-1 refusal this test used to pin: an OR
+        // window (a menu, tooltip, dropdown) now gets a record and
+        // presents — at ITS OWN absolute coordinates, negative origins
+        // included — but acquires none of the managed behaviours: no SSD,
+        // not a managed toplevel (no focus candidacy, no minimize, no
+        // foreign export), never granted.
         let mut harness = KeybindingHarness::new(true);
-        let (_, surface) = roleless_wl_surface(&mut harness);
-        let window = fake_x11_window(46, true, Rectangle::new((5, 5).into(), (60, 20).into()));
+        let (sid, surface) = roleless_wl_surface(&mut harness);
+        // A menu overhanging the output's left edge: (-5, 5).
+        let window = fake_x11_window(46, true, Rectangle::new((-5, 5).into(), (60, 20).into()));
         window.set_wl_surface_offline(Some(surface.clone()));
         harness
             .server
@@ -36637,28 +36644,220 @@ mod x11 {
             .server
             .state
             .x11_associate_window(surface.clone(), window.clone());
+        let object = surface.id();
         assert!(
-            !harness.server.state.surfaces.contains_key(&surface.id()),
-            "override-redirect windows are recorded, never managed (X-1)"
+            harness.server.state.surfaces.contains_key(&object),
+            "X-2a: an override-redirect window gets a scene record"
         );
         assert!(
             harness
                 .server
                 .state
                 .xwayland
-                .override_redirect_windows
-                .contains(&46),
-            "the XID is recorded for diagnostics and cleanup"
-        );
-        assert!(
-            !harness
-                .server
-                .state
-                .xwayland
                 .surfaces_by_xid
                 .contains_key(&46),
-            "no managed association for an override-redirect window"
+            "the OR record rides the same XID maps as a managed one"
         );
+        commit_dmabuf(&mut harness, sid, 32, 24);
+        let record = &harness.server.state.surfaces[&object];
+        assert!(
+            record.mapped,
+            "an OR window presents after its first buffer"
+        );
+        assert_eq!(
+            record.window_origin,
+            (-5.0, 5.0),
+            "client-authoritative placement: the absolute rect is honoured, \
+             negative origin included — no cascade, no clamp"
+        );
+        assert_eq!(
+            record.committed_decoration,
+            SceneDecorationMode::ClientSide,
+            "an OR window never wears SSD chrome"
+        );
+        assert!(
+            !record.role.managed_toplevel(),
+            "the structural chokepoint: not a managed toplevel — excluded \
+             from focus candidacy, minimize, foreign export and chrome state"
+        );
+        let SurfaceRole::X11(role) = &record.role else {
+            panic!("record carries the X11 role");
+        };
+        assert!(
+            !role.phase.ever_granted,
+            "an OR record is never granted; the swap hand-over's geometry \
+             gate therefore never carries stale rects to it"
+        );
+    }
+
+    #[test]
+    fn x11_or_geometry_follows_configure_notify_verbatim() {
+        // The vendor's OR ConfigureNotify branch is the geometry authority
+        // (xwm/mod.rs:1661-1676); comp mirrors it with no grant, no clamp,
+        // no cascade — including moves to negative coordinates.
+        let mut harness = KeybindingHarness::new(true);
+        let (sid, surface) = roleless_wl_surface(&mut harness);
+        let window = fake_x11_window(47, true, Rectangle::new((10, 10).into(), (60, 20).into()));
+        window.set_wl_surface_offline(Some(surface.clone()));
+        harness
+            .server
+            .state
+            .x11_new_override_redirect_window(window.clone());
+        harness
+            .server
+            .state
+            .x11_mapped_override_redirect_window(window.clone());
+        harness
+            .server
+            .state
+            .x11_associate_window(surface.clone(), window.clone());
+        commit_dmabuf(&mut harness, sid, 32, 24);
+        let object = surface.id();
+        harness.server.state.x11_configure_notify(
+            window.clone(),
+            Rectangle::new((-30, 700).into(), (90, 40).into()),
+            None,
+        );
+        let record = &harness.server.state.surfaces[&object];
+        assert_eq!(
+            record.window_origin,
+            (-30.0, 700.0),
+            "OR configure notifies move the record verbatim"
+        );
+        assert_eq!(
+            record.configured_size,
+            (90, 40),
+            "and resize it verbatim, unclamped"
+        );
+        // The managed grant authority must refuse the same record: a grant
+        // applied to this xid is a no-op (structural accessor refusal).
+        harness
+            .server
+            .state
+            .apply_x11_geometry(47, Rectangle::new((0, 0).into(), (10, 10).into()));
+        let record = &harness.server.state.surfaces[&object];
+        assert_eq!(
+            record.window_origin,
+            (-30.0, 700.0),
+            "the managed geometry authority cannot touch an OR record"
+        );
+    }
+
+    #[test]
+    fn x11_or_windows_refuse_every_managed_behaviour() {
+        // The countable refusals, driven one by one against a live OR
+        // record: maximize, fullscreen, minimize, decoration refresh and
+        // stacking sync must all leave it untouched — the OR window is
+        // never configured (maximize/fullscreen bottom out in `configure`,
+        // which is UnsupportedForOverrideRedirect before the wire).
+        let mut harness = KeybindingHarness::new(true);
+        let (sid, surface) = roleless_wl_surface(&mut harness);
+        let window = fake_x11_window(48, true, Rectangle::new((20, 20).into(), (60, 20).into()));
+        window.set_wl_surface_offline(Some(surface.clone()));
+        harness
+            .server
+            .state
+            .x11_new_override_redirect_window(window.clone());
+        harness
+            .server
+            .state
+            .x11_mapped_override_redirect_window(window.clone());
+        harness
+            .server
+            .state
+            .x11_associate_window(surface.clone(), window.clone());
+        commit_dmabuf(&mut harness, sid, 32, 24);
+        let object = surface.id();
+        let before = {
+            let record = &harness.server.state.surfaces[&object];
+            (
+                record.window_origin,
+                record.configured_size,
+                record.committed_maximized,
+                record.minimized,
+                record.committed_decoration,
+            )
+        };
+        harness.server.state.request_x11_maximized(&window, true);
+        harness.server.state.request_x11_fullscreen(&window, true);
+        harness.server.state.x11_minimize_request(window.clone());
+        harness.server.state.x11_unminimize_request(window.clone());
+        harness.server.state.refresh_x11_decoration(48);
+        harness.server.state.sync_xwm_stacking();
+        let record = &harness.server.state.surfaces[&object];
+        assert_eq!(
+            (
+                record.window_origin,
+                record.configured_size,
+                record.committed_maximized,
+                record.minimized,
+                record.committed_decoration,
+            ),
+            before,
+            "every managed behaviour is a no-op on an override-redirect record"
+        );
+        let SurfaceRole::X11(role) = &record.role else {
+            panic!("record keeps the X11 role");
+        };
+        assert!(!role.fullscreen, "fullscreen state untouched");
+        assert!(record.mapped, "and the record still presents");
+    }
+
+    #[test]
+    fn x11_or_press_moves_no_keyboard_focus() {
+        // A click on a menu item must not re-arbitrate keyboard focus: the
+        // X client's grab machinery depends on wl focus staying wherever it
+        // already is (Xwayland routes keys through it). The press still
+        // reaches the surface as a pointer event.
+        let mut harness = KeybindingHarness::new(true);
+        // A focused managed X11 toplevel (the menu's app).
+        let (sid_app, app_surface, _app_window, _app_object) =
+            associate_normal_window(&mut harness, 49);
+        commit_dmabuf(&mut harness, sid_app, 32, 24);
+        harness
+            .server
+            .state
+            .arbitrate_keyboard_focus(Some(app_surface.clone()), false, false);
+        assert!(
+            matches!(
+                harness.server.state.keyboard.current_focus(),
+                Some(SeatFocusTarget::X11(target)) if target.window_id() == 49
+            ),
+            "precondition: the app holds the keyboard"
+        );
+        // An OR menu at a known spot.
+        let (sid_or, or_surface) = roleless_wl_surface(&mut harness);
+        let menu = fake_x11_window(50, true, Rectangle::new((300, 300).into(), (80, 40).into()));
+        menu.set_wl_surface_offline(Some(or_surface.clone()));
+        harness
+            .server
+            .state
+            .x11_new_override_redirect_window(menu.clone());
+        harness
+            .server
+            .state
+            .x11_mapped_override_redirect_window(menu.clone());
+        harness
+            .server
+            .state
+            .x11_associate_window(or_surface.clone(), menu);
+        commit_dmabuf(&mut harness, sid_or, 32, 24);
+        // Click inside the menu. The cursor is parked directly rather than
+        // routed: `route_pointer_to` normalises by the seat extent, whose
+        // aspect differs from the logical output in this harness, and this
+        // test's subject is the PRESS path's focus decision, which reads
+        // `cursor_position` + `surface_at` — not the motion transform.
+        harness.server.state.cursor_position = (310.0, 310.0);
+        route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+        assert!(
+            matches!(
+                harness.server.state.keyboard.current_focus(),
+                Some(SeatFocusTarget::X11(target)) if target.window_id() == 49
+            ),
+            "a press on an OR window leaves keyboard focus exactly where the \
+             X grab needs it"
+        );
+        route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     }
 
     #[test]
@@ -37238,6 +37437,60 @@ mod x11 {
     }
 
     #[test]
+    fn x11_managed_to_or_transition_is_a_destroy_then_birth() {
+        // X-2a, single-window shape via the vendored flag setter: THE
+        // production sequence round 4's Q3 fix exists for — one window
+        // unmaps, sets override-redirect, remaps. The managed record must
+        // die (it would keep accepting managed behaviours while every
+        // managed X write is refused per-request) and the OR record is
+        // born fresh through the ordinary path — a destroy-then-birth,
+        // never a mutation across the managed/OR boundary. Two separate
+        // windows cannot reproduce "a record already exists for THIS
+        // window", which is why the two-window variant below is not this
+        // test's coverage.
+        let mut harness = KeybindingHarness::new(true);
+        let (sid, _surface, window, object) = associate_normal_window(&mut harness, 69);
+        commit_dmabuf(&mut harness, sid, 32, 24);
+        let managed_id = harness.server.state.surfaces[&object].id;
+        // The transition: unmap, flip the flag (what MapNotify does in
+        // production), remap as OR.
+        harness.server.state.x11_unmapped_window(window.clone());
+        window.set_override_redirect_offline(true);
+        harness
+            .server
+            .state
+            .x11_mapped_override_redirect_window(window.clone());
+        assert!(
+            !harness.server.state.surfaces.contains_key(&object),
+            "the managed record dies at the transition"
+        );
+        // The OR birth: Xwayland re-associates (fresh serial handshake on a
+        // fresh wl_surface, as after any unmap — the vendor nulled the old
+        // resolution) and the same window presents as OR.
+        let (sid_or, or_surface) = roleless_wl_surface(&mut harness);
+        window.set_wl_surface_offline(Some(or_surface.clone()));
+        harness
+            .server
+            .state
+            .x11_associate_window(or_surface.clone(), window.clone());
+        commit_dmabuf(&mut harness, sid_or, 32, 24);
+        let record = &harness.server.state.surfaces[&or_surface.id()];
+        assert!(record.mapped, "the reborn OR record presents");
+        assert_ne!(
+            record.id, managed_id,
+            "a birth, not a mutation: the managed identity did not cross the boundary"
+        );
+        let SurfaceRole::X11(role) = &record.role else {
+            panic!("record carries the X11 role");
+        };
+        assert!(role.override_redirect, "and it carries the OR flag");
+        assert!(
+            !record.role.managed_toplevel(),
+            "excluded from every managed behaviour from birth"
+        );
+    }
+
+    #[test]
     fn x11_or_remap_destroys_the_managed_record() {
         // Q3: a client can leave management at runtime — unmap, set
         // override-redirect, remap. From then on `configure` is refused
@@ -37245,7 +37498,8 @@ mod x11 {
         // connection while a surviving managed record would keep accepting
         // maximize/move/resize requests, diverging until DestroyNotify. The
         // OR-map callback must destroy the record so nothing is left to
-        // diverge.
+        // diverge. (Two-window variant; the single-window production shape
+        // is `x11_managed_to_or_transition_is_a_destroy_then_birth`.)
         let mut harness = KeybindingHarness::new(true);
         let (surface_id, _surface, window, object) = associate_normal_window(&mut harness, 70);
         commit_dmabuf(&mut harness, surface_id, 32, 24);
@@ -38308,3 +38562,4 @@ mod x11 {
         assert!(pending.granted_geometry.is_none());
     }
 }
+

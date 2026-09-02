@@ -4628,6 +4628,14 @@ struct X11ToplevelRole {
     /// discriminator that lets the pin `warn!` on the flip without crying
     /// wolf on supported behaviour.
     wl_surface_serial: Option<u64>,
+    /// Override-redirect (X-2a): the window positions itself, is never
+    /// configured, granted, decorated, focused or exported — it rides the
+    /// same record/teardown/XID-map lattice as a managed toplevel but the
+    /// MANAGED behaviours refuse it structurally: `managed_toplevel()`
+    /// answers false (one arm covers focus candidacy, minimize,
+    /// foreign-toplevel export, chrome scene state and activation), and
+    /// the grant-side accessor `managed_x11_record_mut` filters it out.
+    override_redirect: bool,
 }
 
 struct LockSurfaceRole {
@@ -5022,8 +5030,14 @@ impl SurfaceRole {
     fn managed_toplevel(&self) -> bool {
         match self {
             Self::Toplevel(_) => true,
+            // The X-2a structural chokepoint: an override-redirect record is
+            // a rendered surface but NOT a managed toplevel — this one arm
+            // excludes it from keyboard-focus candidacy
+            // (`highest_visible_toplevel_surface`), minimize, the
+            // foreign-toplevel export, chrome/SSD scene state and
+            // activation, without each site remembering a flag.
             #[cfg(feature = "xwayland")]
-            Self::X11(_) => true,
+            Self::X11(role) => !role.override_redirect,
             _ => false,
         }
     }
@@ -10847,13 +10861,27 @@ impl WaylandState {
 
         if state == HostButtonState::Pressed {
             self.titlebar_click_candidate = None;
-            let focused = self
-                .surface_at(self.cursor_position.0, self.cursor_position.1)
-                .map(|record| record.role.wl_surface().clone());
-            if let Some(surface) = focused.as_ref() {
-                self.raise_for_focus_interaction(surface);
+            let target = self.surface_at(self.cursor_position.0, self.cursor_position.1);
+            // Per-site refusal #3 (X-2a, tested): a click on an
+            // override-redirect X11 window — a menu item — is not a focus
+            // interaction. The client holds an X-side grab and Xwayland
+            // routes keys through whatever surface already has wl focus;
+            // moving focus (or raising) here would disturb exactly the
+            // machinery that makes the menu work. The button still reaches
+            // the surface through `pointer.button` below.
+            #[cfg(feature = "xwayland")]
+            let or_target = target.is_some_and(
+                |record| matches!(&record.role, SurfaceRole::X11(role) if role.override_redirect),
+            );
+            #[cfg(not(feature = "xwayland"))]
+            let or_target = false;
+            if !or_target {
+                let focused = target.map(|record| record.role.wl_surface().clone());
+                if let Some(surface) = focused.as_ref() {
+                    self.raise_for_focus_interaction(surface);
+                }
+                self.arbitrate_keyboard_focus(focused, false, true);
             }
-            self.arbitrate_keyboard_focus(focused, false, true);
         }
 
         let pointer = self.pointer.clone();
