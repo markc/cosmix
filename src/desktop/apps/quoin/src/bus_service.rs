@@ -352,12 +352,63 @@ fn parse_args(request: &InboundRequest) -> Option<Value> {
     serde_json::from_str(&request.body).ok()
 }
 
+/// Bus wire headers the TRANSPORT owns, never the caller.
+///
+/// `InboundRequest::headers` is documented as carrying *every* header off the
+/// wire, and the broker stamps this core-protocol block itself — `id` is the
+/// request's correlation id (`cosmix_lib_client`'s `call_typed` assigns it a
+/// monotonic counter), `from`/`to`/`command`/`type` are routing. Reading a
+/// verb argument out of one of these names does not read the caller's word
+/// for it; it reads the transport's, silently.
+///
+/// That is not hypothetical: `shell.panel.page.set … id=<page>` sent through
+/// Mix's ordinary JSON-body RPC put the page id in the BODY while the broker
+/// put its correlation id in the `id` HEADER, and a header-first lookup
+/// validated the correlation id as a page id — so every well-formed
+/// `page.set` was refused with "unknown page id for this edge" while
+/// `shell.props.get panels.<edge>.pages` (which reads the body only)
+/// advertised that exact page. The list mirrors the core-protocol block of
+/// `cosmix_lib_bus::KNOWN_HEADERS`; the display-protocol names in that
+/// constant are NOT transport-owned and stay addressable.
+///
+/// Deliberately not a header-stripping change in the transport: `InboundRequest`
+/// hands the app the wire verbatim on purpose (`broker_origin` and
+/// `signed_ident` are read straight off it by [`authorize_local_caller`]), so
+/// the rule belongs at the one place that maps headers to caller arguments.
+const WIRE_OWNED_HEADERS: &[&str] = &[
+    "bus",
+    "type",
+    "id",
+    "from",
+    "to",
+    "command",
+    "args",
+    "json",
+    "reply-to",
+    "ttl",
+    "error",
+    "timestamp",
+    "rc",
+];
+
+/// A caller-supplied argument, from the JSON body or a non-transport header.
+///
+/// Header routing (Mix's `body=` shape) and JSON-body RPC are both live
+/// callers, so both sources are read; a name the transport owns is read from
+/// the body ONLY, because a header of that name is the broker's value and
+/// never the caller's. Under header routing such an argument is therefore
+/// simply absent — the honest answer, and the one that makes `page.set`
+/// report "requires an id argument" instead of rejecting the broker's
+/// correlation id as an unknown page.
 fn argument(request: &InboundRequest, name: &str) -> Option<String> {
-    request
-        .headers
-        .get(name)
-        .cloned()
-        .or_else(|| parse_args(request)?.get(name)?.as_str().map(str::to_owned))
+    if !WIRE_OWNED_HEADERS
+        .iter()
+        .any(|owned| owned.eq_ignore_ascii_case(name))
+        && let Some(value) = request.headers.get(name)
+    {
+        return Some(value.clone());
+    }
+    parse_args(request)?.get(name)?.as_str().map(str::to_owned)
 }
 
 fn parse_edge(value: String) -> Option<Edge> {
@@ -454,6 +505,8 @@ fn edge_name(edge: Edge) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cosmix_shell::core::PanelInput;
+    use cosmix_shell::runtime::{CarouselInput, ShellCommandKind};
     use ctk::bus::{BusMessage, test_bridge};
 
     fn request(command: &str) -> InboundRequest {
@@ -472,6 +525,27 @@ mod tests {
         request
             .headers
             .insert("broker_origin".to_owned(), "local".to_owned());
+        request
+    }
+
+    /// A request shaped the way the LIVE wire delivers one: caller arguments
+    /// in the JSON body (Mix's ordinary `send target cmd k=v` RPC), and the
+    /// broker's own core-protocol headers stamped alongside — including the
+    /// correlation `id`, which is what a header-first argument lookup used to
+    /// mistake for the caller's `id=` argument.
+    fn wire(command: &str, body: Value) -> InboundRequest {
+        let mut request = local(command);
+        request.body = body.to_string();
+        for (name, value) in [
+            ("bus", "1.0"),
+            ("type", "request"),
+            ("id", "7"),
+            ("from", "peer"),
+            ("to", "shell"),
+            ("command", command),
+        ] {
+            request.headers.insert(name.to_owned(), value.to_owned());
+        }
         request
     }
 
@@ -494,7 +568,7 @@ mod tests {
 
     #[test]
     fn app_verbs_and_bad_page_arguments_get_precise_errors() {
-        let frame = test_frame();
+        let frame = paged_frame();
         let (rc, body, command) =
             dispatch_shell_request(&request("app.ping"), &frame, Default::default());
         assert_eq!(rc, 10);
@@ -506,8 +580,10 @@ mod tests {
         assert_eq!(rc, 10);
         assert!(body.contains("requires an id"), "{body}");
 
-        let mut set = local("shell.panel.page.set");
-        set.headers.insert("id".to_owned(), "no-such".to_owned());
+        let set = wire(
+            "shell.panel.page.set",
+            json!({"edge":"left","id":"no-such"}),
+        );
         let (rc, body, command) = dispatch_shell_request(&set, &frame, Default::default());
         assert_eq!(rc, 10);
         assert!(body.contains("unknown page id"), "{body}");
@@ -515,6 +591,141 @@ mod tests {
             command.is_none(),
             "an unacceptable verb must not be enqueued"
         );
+    }
+
+    /// The accepting path of `page.set`, over the wire shape a live citizen
+    /// actually produces — the case no test covered, and the one the live
+    /// gate caught in production.
+    ///
+    /// Every earlier `page.set` test ran against a frame whose carousels were
+    /// empty, so *every* page id was unknown and the refusal branch was the
+    /// only branch a test could ever reach. Under a realistic frame the
+    /// broker's stamped correlation `id` header is what a header-first lookup
+    /// read as the page id, so a valid `id=` in the body was rejected with
+    /// "unknown page id for this edge" while `shell.props.get
+    /// panels.<edge>.pages` advertised that same page — one frame, two
+    /// argument sources. This pins the accepting branch AND that the stamped
+    /// header does not shadow the caller's argument.
+    #[test]
+    fn a_valid_page_id_in_the_body_is_accepted_despite_the_brokers_stamped_id_header() {
+        let frame = paged_frame();
+        let set = wire(
+            "shell.panel.page.set",
+            json!({"edge":"bottom","id":"power"}),
+        );
+        assert_eq!(
+            set.headers.get("id").map(String::as_str),
+            Some("7"),
+            "the wire fixture must carry a stamped correlation id — without it \
+             this test cannot fail the way production did"
+        );
+
+        let (rc, body, command) = dispatch_shell_request(&set, &frame, Default::default());
+        assert_eq!(rc, 0, "{body}");
+        assert!(body.contains("\"accepted\":true"), "{body}");
+        let command = command.expect("an accepted page.set must enqueue its command");
+        assert_eq!(command.output, frame.geometry.output);
+        assert_eq!(
+            command.kind,
+            ShellCommandKind::Carousel {
+                edge: Edge::Bottom,
+                input: CarouselInput::SelectId("power".to_owned()),
+            },
+            "the enqueued command must carry the CALLER's page id"
+        );
+    }
+
+    /// The rest of the verb family reads `edge` — a name the transport does
+    /// not own — so it was never shadowed; pinned here so a future change to
+    /// argument resolution cannot break them silently while `page.set` keeps
+    /// passing.
+    #[test]
+    fn every_panel_verb_resolves_its_edge_from_the_live_wire_shape() {
+        let frame = paged_frame();
+        for (command, expected) in [
+            (
+                "shell.panel.show",
+                ShellCommandKind::Panel {
+                    edge: Edge::Bottom,
+                    input: PanelInput::Reveal,
+                },
+            ),
+            (
+                "shell.panel.hide",
+                ShellCommandKind::Panel {
+                    edge: Edge::Bottom,
+                    input: PanelInput::Hide,
+                },
+            ),
+            (
+                "shell.panel.toggle",
+                ShellCommandKind::Panel {
+                    edge: Edge::Bottom,
+                    input: PanelInput::Toggle,
+                },
+            ),
+            (
+                "shell.panel.pin",
+                ShellCommandKind::Panel {
+                    edge: Edge::Bottom,
+                    input: PanelInput::Pin,
+                },
+            ),
+            (
+                "shell.panel.unpin",
+                ShellCommandKind::Panel {
+                    edge: Edge::Bottom,
+                    input: PanelInput::Unpin,
+                },
+            ),
+            (
+                "shell.panel.page.next",
+                ShellCommandKind::Carousel {
+                    edge: Edge::Bottom,
+                    input: CarouselInput::Next,
+                },
+            ),
+            (
+                "shell.panel.page.prev",
+                ShellCommandKind::Carousel {
+                    edge: Edge::Bottom,
+                    input: CarouselInput::Previous,
+                },
+            ),
+        ] {
+            let request = wire(command, json!({"edge":"bottom"}));
+            let (rc, body, enqueued) = dispatch_shell_request(&request, &frame, Default::default());
+            assert_eq!(rc, 0, "{command}: {body}");
+            assert_eq!(
+                enqueued.expect("accepted verb enqueues a command").kind,
+                expected,
+                "{command}"
+            );
+        }
+    }
+
+    /// The two surfaces the live gate found contradicting each other, read
+    /// off ONE frame in one test: whatever `panels.<edge>.pages` advertises,
+    /// `page.set` must accept.
+    #[test]
+    fn every_page_the_props_tree_advertises_is_accepted_by_page_set() {
+        let frame = paged_frame();
+        for edge in Edge::ALL {
+            let name = edge_name(edge);
+            for page in frame.panel(edge).page_ids.iter() {
+                let request = wire(
+                    "shell.panel.page.set",
+                    json!({"edge": name, "id": page.clone()}),
+                );
+                let (rc, body, command) =
+                    dispatch_shell_request(&request, &frame, Default::default());
+                assert_eq!(rc, 0, "panels.{name}.pages advertises {page}: {body}");
+                assert!(
+                    command.is_some(),
+                    "panels.{name}.pages advertises {page} but nothing was enqueued"
+                );
+            }
+        }
     }
 
     /// An `App` carrying just what `service_bus` reads, driven by a bridge
@@ -671,15 +882,41 @@ mod tests {
         );
     }
 
-    fn test_frame() -> ShellFrame {
-        let model = cosmix_shell::core::ShellModel::new(
+    fn test_model() -> cosmix_shell::core::ShellModel {
+        cosmix_shell::core::ShellModel::new(
             cosmix_shell::core::OutputKey::new("test").unwrap(),
             cosmix_shell::core::LogicalSize::new(1000.0, 800.0).unwrap(),
             Default::default(),
             std::time::Duration::from_millis(800),
             std::time::Duration::from_millis(200),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn test_frame() -> ShellFrame {
+        ShellFrame::from_model(&test_model())
+    }
+
+    /// A frame whose carousels carry Quoin's real page schema.
+    ///
+    /// [`test_frame`]'s carousels are empty, which makes every page id
+    /// unknown and every `page.set` refusable — a frame in which the
+    /// accepting branch is unreachable, so no assertion written against it
+    /// can distinguish a working verb from a broken one.
+    fn paged_frame() -> ShellFrame {
+        let mut model = test_model();
+        for (edge, pages) in [
+            (Edge::Left, ["nav", "places"].as_slice()),
+            (Edge::Bottom, ["launcher", "power", "tasks"].as_slice()),
+            (Edge::Right, ["monitor", "agents"].as_slice()),
+            (Edge::Top, ["status", "spaces"].as_slice()),
+        ] {
+            model.set_carousel(
+                edge,
+                cosmix_shell::core::Carousel::new(pages.iter().copied())
+                    .expect("static test page schema is valid"),
+            );
+        }
         ShellFrame::from_model(&model)
     }
 }
