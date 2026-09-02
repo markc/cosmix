@@ -26,6 +26,10 @@ kms-live = [
     "dep:signal-hook",
     "dep:smithay-client-toolkit",
 ]
+# XWayland X-1: rootless Xwayland + XWM for normal X11 toplevels. Deliberately
+# NOT in `default` yet — it joins the defaults only as the arc's final commit
+# after the live Firefox gate is green (Mark's ruling, 2026-09-02).
+xwayland = ["smithay/xwayland"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(cosmix_kms_live_release)'] }
