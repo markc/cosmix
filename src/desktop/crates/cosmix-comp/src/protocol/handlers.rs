@@ -2022,6 +2022,35 @@ impl SelectionHandler for WaylandState {
         // pipe fd and writes directly, so the protocol thread never copies or
         // blocks on clipboard payload bytes. Host clipboard bridging is a
         // later phase concern.
+        //
+        // X-2b: mirror a WAYLAND client's selection onto the X side so an X
+        // client can paste it. Only a real client source is mirrored — a
+        // `None` source, or one comp itself installed while bridging an X
+        // selection the other way, must not be echoed back, or the two sides
+        // would hand ownership to each other in a loop.
+        #[cfg(feature = "xwayland")]
+        {
+            let offered = source.as_ref().map(SelectionSource::mime_types);
+            self.bridge_selection_to_x11(target, offered.as_deref());
+        }
+    }
+
+    /// An X client is pasting a selection comp advertised on Wayland'\''s behalf.
+    ///
+    /// Reached only for a selection whose source is the COMPOSITOR — which, in
+    /// this compositor, means one bridged from X by `x11_new_selection`. So the
+    /// answer is to ask the X side for the bytes.
+    #[cfg_attr(not(feature = "xwayland"), allow(unused_variables))]
+    fn send_selection(
+        &mut self,
+        target: SelectionTarget,
+        mime_type: String,
+        fd: std::os::fd::OwnedFd,
+        _seat: Seat<Self>,
+        _user_data: &(),
+    ) {
+        #[cfg(feature = "xwayland")]
+        self.serve_x11_selection(target, mime_type, fd);
     }
 }
 

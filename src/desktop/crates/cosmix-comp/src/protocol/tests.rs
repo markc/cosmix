@@ -37328,25 +37328,36 @@ mod x11 {
     }
 
     #[test]
-    fn x11_selection_access_is_refused_and_send_selection_never_panics() {
+    fn x11_selection_access_is_granted_and_send_selection_never_panics() {
         let mut harness = KeybindingHarness::new(true);
+        // X-2b grants access unconditionally, per the agentic-first law: a
+        // clipboard gate is the human-in-the-loop ceremony that law makes
+        // opt-in, and an agent driving X clients cannot answer a prompt.
+        //
+        // This assertion is not decoration. Granting access is what makes
+        // Smithay register selection-transfer sources that call `xwm_state`
+        // and outlive `Drop for X11Wm`, which is why `disconnected` retains
+        // the drained wm. If someone flips this back to a refusal, the
+        // retention becomes dead weight and the comment there becomes a lie;
+        // if someone removes the retention, this grant becomes a panic.
         assert!(
-            !harness
+            harness
                 .server
                 .state
                 .x11_allow_selection_access(SelectionTarget::Clipboard),
-            "X-1 refuses clipboard bridging"
+            "X-2b bridges the clipboard"
         );
         assert!(
-            !harness
+            harness
                 .server
                 .state
                 .x11_allow_selection_access(SelectionTarget::Primary),
-            "X-1 refuses primary-selection bridging"
+            "X-2b bridges the primary selection"
         );
-        // The trait default panics here; the X-1 implementation must drop the
-        // fd and carry on.
-        let name = CString::new("cosmix-x11-selection-refusal").unwrap();
+        // The trait default PANICS. With no Wayland client offering anything,
+        // an X paste must still be an ordinary no-op: the request is answered,
+        // the fd is dropped, the compositor carries on.
+        let name = CString::new("cosmix-x11-selection-bridge").unwrap();
         // SAFETY: name is a valid C string and success returns a new owned fd.
         let raw = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
         assert!(raw >= 0);
@@ -37357,7 +37368,8 @@ mod x11 {
             "text/plain".into(),
             fd,
         );
-        // Inert notifications retain no bridge state.
+        // And the notification paths are safe with no generation live: no wm
+        // means nothing to mirror, not a panic.
         harness
             .server
             .state

@@ -31,6 +31,12 @@
 use super::*;
 use smithay::{
     reexports::calloop::RegistrationToken,
+    wayland::selection::data_device::{
+        request_data_device_client_selection, set_data_device_selection,
+    },
+    wayland::selection::primary_selection::{
+        request_primary_client_selection, set_primary_selection,
+    },
     wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState},
     xwayland::{
         X11Surface, X11Wm, XWayland, XWaylandEvent, XwmHandler,
@@ -272,6 +278,10 @@ pub(super) struct XwaylandRuntime {
     /// `send_selection`. X-2's clipboard bridge must revisit this drain
     /// before relaxing either refusal.
     pub(super) draining_wms: Vec<X11Wm>,
+    /// Set only while comp is installing an X-originated selection on the
+    /// Wayland side, to stop the resulting `new_selection` echo bridging it
+    /// back to X — which would release comp's own X ownership.
+    pub(super) bridging_selection_from_x11: bool,
     /// Keyboard refocus debt: the XID's window held the keyboard when a
     /// surface swap withdrew the displaced record, and the replacement is
     /// not presentable yet. Paid (focus handed back) the moment the XID's
@@ -323,6 +333,7 @@ impl XwaylandRuntime {
             xids_by_object: HashMap::new(),
             override_redirect_windows: HashSet::new(),
             draining_wms: Vec::new(),
+            bridging_selection_from_x11: false,
             refocus: None,
             shutting_down: false,
         }
@@ -2509,56 +2520,152 @@ impl WaylandState {
         });
     }
 
-    pub(super) fn x11_allow_selection_access(&mut self, selection: SelectionTarget) -> bool {
-        // Deliberate X-2 gap: no clipboard/primary bridging in X-1.
-        //
-        // X-2 AUTHOR, BEFORE RETURNING `true` HERE: this refusal is load-
-        // bearing for teardown, not just scope. It is the only thing that
-        // stops smithay from registering selection-transfer calloop sources
-        // that call `xwm_state` and are never unregistered by `Drop for
-        // X11Wm` — a wm dropped with a live transfer panics in `xwm_state`.
-        // Revisit the `draining_wms` drain proof first.
-        tracing::debug!(?selection, "refused X11 selection access (X-1)");
-        false
+    /// Mirror a Wayland client's selection onto the X side.
+    ///
+    /// `mime_types` is `None` when the selection was cleared or when comp
+    /// itself is the source — the latter is the loop guard: comp installs
+    /// itself as the source when bridging an X selection to Wayland, and
+    /// echoing that back would hand ownership between the two sides forever.
+    pub(super) fn bridge_selection_to_x11(
+        &mut self,
+        target: SelectionTarget,
+        mime_types: Option<&[String]>,
+    ) {
+        let XwaylandLifecycle::Ready { wm, .. } = &mut self.xwayland.lifecycle else {
+            return;
+        };
+        if self.xwayland.bridging_selection_from_x11 {
+            // Re-entrant: this call is the echo of comp installing an X-owned
+            // selection on the Wayland side. Bridging it back would hand
+            // ownership between the two sides forever, and — because the echo
+            // carries no client source — the `None` arm would RELEASE comp's X
+            // ownership a second after taking it.
+            tracing::trace!(?target, "ignoring the echo of an X-originated selection");
+            return;
+        }
+        let owned = mime_types.map(<[String]>::to_vec);
+        tracing::debug!(
+            ?target,
+            offering = owned.as_ref().map(Vec::len),
+            "offering a Wayland selection to X11"
+        );
+        if let Err(error) = wm.new_selection(target, owned) {
+            tracing::warn!(?target, %error, "failed to offer a Wayland selection to X11");
+        }
     }
 
+    /// Ask the X side for the bytes of a selection an X client owns.
+    ///
+    /// The transfer is driven by Smithay on the event loop; comp hands over the
+    /// fd and does not touch the payload.
+    pub(super) fn serve_x11_selection(
+        &mut self,
+        target: SelectionTarget,
+        mime_type: String,
+        fd: std::os::fd::OwnedFd,
+    ) {
+        let loop_handle = self.capture_loop_handle.clone();
+        let XwaylandLifecycle::Ready { wm, .. } = &mut self.xwayland.lifecycle else {
+            // No generation: nobody can be offering an X selection, so the
+            // reader simply gets an empty pipe when the fd drops.
+            return;
+        };
+        if let Err(error) = wm.send_selection(target, mime_type.clone(), fd, loop_handle) {
+            tracing::debug!(?target, mime_type, %error, "X11 selection transfer refused");
+        }
+    }
+
+    pub(super) fn x11_allow_selection_access(&mut self, selection: SelectionTarget) -> bool {
+        // X-2b: bridging is ON. The refusal that used to live here was
+        // load-bearing for TEARDOWN, not merely scope — it was the only thing
+        // stopping Smithay registering selection-transfer sources that call
+        // `xwm_state` and outlive `Drop for X11Wm`. That is answered in
+        // `disconnected`, which now RETAINS the drained wm instead of dropping
+        // it, so a stale transfer callback still resolves. Read that comment
+        // before narrowing anything here.
+        //
+        // Access is granted unconditionally, per the agentic-first law: a
+        // clipboard gate is exactly the human-in-the-loop ceremony that law
+        // makes opt-in, and an agent driving X clients through this compositor
+        // has no way to answer a prompt.
+        let _ = selection;
+        true
+    }
+
+    /// An X client is pasting: write the WAYLAND selection into its fd.
+    ///
+    /// The bytes never pass through comp — `request_*_client_selection` hands
+    /// the owning Wayland client the fd and it writes directly, exactly as a
+    /// Wayland-to-Wayland paste does. comp only decides which selection the
+    /// request refers to.
     pub(super) fn x11_send_selection(
         &mut self,
         selection: SelectionTarget,
         mime_type: String,
         fd: std::os::fd::OwnedFd,
     ) {
-        // Defensive: reachable only if `allow_selection_access` ever returned
-        // true, which X-1 never does. Drop the fd, log the invariant breach,
-        // never panic (the trait default panics).
-        //
-        // X-2 AUTHOR: implementing this for real means comp drives outgoing
-        // selection transfers, whose calloop sources call `xwm_state` and
-        // outlive `Drop for X11Wm` — the `draining_wms` drain proof depends
-        // on these transfers never existing. Revisit it before wiring this.
-        drop(fd);
-        tracing::error!(
-            ?selection,
-            mime_type,
-            "send_selection reached despite X-1 refusing selection access; dropped fd"
-        );
+        // The two helpers carry DIFFERENT error types, so each arm reports its
+        // own. Both failures mean the same thing to a user — "nobody is
+        // offering that" — and neither is worth reddening a gate: "no
+        // selection" and "that mime type is not on offer" are ordinary answers
+        // to an X client asking for something no Wayland client has.
+        let seat = self.seat.clone();
+        match selection {
+            SelectionTarget::Clipboard => {
+                if let Err(error) =
+                    request_data_device_client_selection(&seat, mime_type.clone(), fd)
+                {
+                    tracing::debug!(
+                        mime_type,
+                        %error,
+                        "X11 clipboard paste found no matching Wayland selection"
+                    );
+                }
+            }
+            SelectionTarget::Primary => {
+                if let Err(error) = request_primary_client_selection(&seat, mime_type.clone(), fd) {
+                    tracing::debug!(
+                        mime_type,
+                        %error,
+                        "X11 primary paste found no matching Wayland selection"
+                    );
+                }
+            }
+        }
     }
 
+    /// An X client took ownership: advertise it to Wayland clients.
+    ///
+    /// comp registers itself as the selection's source. When a Wayland client
+    /// then reads, `SelectionHandler::send_selection` fires and comp asks the X
+    /// side for the bytes — see `bridge_selection_to_x11`.
     pub(super) fn x11_new_selection(
         &mut self,
         selection: SelectionTarget,
         mime_types: Vec<String>,
     ) {
-        // Log-only in X-1; no bridge state is retained.
-        tracing::debug!(
-            ?selection,
-            ?mime_types,
-            "X11 selection changed (not bridged in X-1)"
-        );
+        tracing::debug!(?selection, ?mime_types, "X11 selection offered to Wayland");
+        let seat = self.seat.clone();
+        // Installing this fires `SelectionHandler::new_selection` synchronously,
+        // which would bridge straight back to X. The flag is the loop breaker;
+        // see `bridge_selection_to_x11` for what the echo would otherwise do.
+        self.xwayland.bridging_selection_from_x11 = true;
+        match selection {
+            SelectionTarget::Clipboard => {
+                set_data_device_selection(&self.display_handle, &seat, mime_types, ());
+            }
+            SelectionTarget::Primary => {
+                set_primary_selection(&self.display_handle, &seat, mime_types, ());
+            }
+        }
+        self.xwayland.bridging_selection_from_x11 = false;
     }
 
     pub(super) fn x11_cleared_selection(&mut self, selection: SelectionTarget) {
-        tracing::debug!(?selection, "X11 selection cleared (not bridged in X-1)");
+        // An X client dropped its selection. Nothing to mirror: the Wayland
+        // side keeps whatever it had, exactly as it would if no X client had
+        // ever owned one.
+        tracing::debug!(?selection, "X11 selection cleared");
     }
 
     pub(super) fn x11_randr_primary_output_change(&mut self, output_name: Option<String>) {
@@ -2815,11 +2922,32 @@ impl XwmHandler for WaylandState {
         if self.xwm_event_is_live(xwm) {
             self.fail_xwayland_generation(generation, "XWM connection closed");
         }
-        // `Closed` is the channel's final event and the source removes
-        // itself after delivering it, so nothing can ask `xwm_state` for
-        // this id again: the drained wm (pushed by the teardown above, or by
-        // an earlier one) can now be dropped.
-        self.xwayland.draining_wms.retain(|wm| wm.id() != xwm);
+        // `Closed` is the X11 EVENT SOURCE's final event, and while that was
+        // the only source keying off this wm it did prove nothing could ask
+        // `xwm_state` for the id again — which is why the wm was dropped here.
+        //
+        // X-2b makes that proof false. Selection bridging lets Smithay register
+        // incoming/outgoing transfer `Generic` sources that also capture the
+        // `XwmId` and call `xwm_state`, and `Drop for X11Wm` does NOT remove
+        // their tokens (`vendor/smithay/src/xwayland/xwm/mod.rs:428-434`; the
+        // transfers' own `Drop` merely logs "freed before being removed from
+        // EventLoop" and leaves the source registered). A transfer can outlive
+        // `Closed`, so dropping here would resurrect the `unreachable!` in
+        // `xwm_state` — as a compositor panic, on a live clipboard path.
+        //
+        // The wm is therefore KEPT. Its X connection is already dead, so every
+        // call a stale callback can make fails harmlessly; what it buys is that
+        // `xwm_state` always resolves. The cost is one retired `X11Wm` per
+        // Xwayland GENERATION — not per client, per window or per transfer —
+        // and a generation ends only when Xwayland dies or the compositor
+        // restarts it. A session that never restarts Xwayland retains none.
+        //
+        // The cleaner fix is upstream: a read-only `X11Wm::has_pending_transfers()`
+        // would let this retire the wm once its transfers are done, and is a far
+        // lighter vendor delta than making `disconnected` idempotent. Recorded
+        // for Mark rather than taken unilaterally — a third vendored patch is
+        // his call, and this shape is correct without one.
+        let _retired = xwm;
     }
 }
 
