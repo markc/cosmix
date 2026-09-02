@@ -103,7 +103,7 @@ use smithay::{
     delegate_data_control, delegate_data_device, delegate_dmabuf, delegate_ext_data_control,
     delegate_foreign_toplevel_list, delegate_fractional_scale, delegate_idle_notify,
     delegate_output, delegate_primary_selection, delegate_seat, delegate_session_lock,
-    delegate_shm, delegate_viewporter,
+    delegate_shm, delegate_viewporter, delegate_xdg_activation,
     desktop::{
         LayerMap, LayerSurface as DesktopLayerSurface, PopupKeyboardGrab, PopupKind, PopupManager,
         PopupPointerGrab, find_popup_root_surface, layer_map_for_output,
@@ -206,6 +206,9 @@ use smithay::{
         shm::{ShmHandler, ShmState, with_buffer_contents, with_buffer_contents_mut},
         socket::ListeningSocketSource,
         viewporter::{ViewportCachedState, ViewporterState, ensure_viewport_valid},
+        xdg_activation::{
+            XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+        },
     },
 };
 
@@ -2710,6 +2713,14 @@ impl ProtocolServer {
         // The access filter admits every client, per the agentic-first law:
         // the unattended path is the default, and a clipboard gate would be
         // exactly the human-in-the-loop ceremony that law makes opt-in.
+        // xdg-activation: the protocol an app uses to ask that a surface be
+        // focused — "open this link" handing focus to the browser it launched,
+        // a running instance raising itself instead of starting a second copy.
+        // Advertised WITH a real implementation: comp raises and focuses the
+        // named surface. A global that accepted tokens and did nothing would be
+        // worse than not offering it, because clients would stop falling back
+        // to their own workarounds.
+        let xdg_activation_state = XdgActivationState::new::<WaylandState>(&display_handle);
         let primary_selection_state = PrimarySelectionState::new::<WaylandState>(&display_handle);
         let wlr_data_control_state = WlrDataControlState::new::<WaylandState, _>(
             &display_handle,
@@ -2843,6 +2854,7 @@ impl ProtocolServer {
             capture_advertisements,
             dmabuf_validation,
             data_device_state,
+            xdg_activation_state,
             primary_selection_state,
             wlr_data_control_state,
             ext_data_control_state,
@@ -5480,6 +5492,7 @@ struct WaylandState {
     /// the whole of the check.
     dmabuf_validation: Option<SyncSender<DmabufValidationRequest>>,
     data_device_state: DataDeviceState,
+    xdg_activation_state: XdgActivationState,
     primary_selection_state: PrimarySelectionState,
     wlr_data_control_state: WlrDataControlState,
     ext_data_control_state: ExtDataControlState,

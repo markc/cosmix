@@ -2025,6 +2025,45 @@ impl SelectionHandler for WaylandState {
     }
 }
 
+impl XdgActivationHandler for WaylandState {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.xdg_activation_state
+    }
+
+    fn request_activation(
+        &mut self,
+        _token: XdgActivationToken,
+        _token_data: XdgActivationTokenData,
+        surface: WlSurface,
+    ) {
+        // Honour the request by raising and focusing, which is the whole point
+        // of the protocol: an app handing focus to the window it just launched,
+        // or a running instance raising itself instead of starting a second
+        // copy. Both routes go through the existing focus arbitration rather
+        // than setting focus directly, so layer-shell policy, the session-lock
+        // refusal and the override-redirect exclusion all still apply — an
+        // activation request is an interaction like any other and must not be
+        // a side door around the rules every other focus path obeys.
+        //
+        // Deliberately NOT gated on token freshness or requesting-client
+        // identity: per the agentic-first law the unattended path is the
+        // default, and a focus-stealing guard here is exactly the
+        // human-in-the-loop ceremony that law makes opt-in. If focus stealing
+        // ever becomes a real complaint, the guard belongs behind a property,
+        // not in front of every client.
+        if self.session_lock_active() {
+            return;
+        }
+        let known = self.surfaces.contains_key(&surface.id());
+        if !known {
+            tracing::debug!("xdg-activation for a surface this compositor does not know");
+            return;
+        }
+        self.raise_for_focus_interaction(&surface);
+        self.arbitrate_keyboard_focus(Some(surface), false, false);
+    }
+}
+
 impl PrimarySelectionHandler for WaylandState {
     fn primary_selection_state(&self) -> &PrimarySelectionState {
         &self.primary_selection_state
@@ -2506,6 +2545,7 @@ smithay::delegate_drm_syncobj!(WaylandState);
 delegate_seat!(WaylandState);
 delegate_data_device!(WaylandState);
 delegate_primary_selection!(WaylandState);
+delegate_xdg_activation!(WaylandState);
 delegate_data_control!(WaylandState);
 delegate_ext_data_control!(WaylandState);
 delegate_output!(WaylandState);
