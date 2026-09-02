@@ -2025,6 +2025,18 @@ impl SelectionHandler for WaylandState {
     }
 }
 
+// `wp_cursor_shape_v1` serves tablet tools as well as pointers, so its delegate
+// requires this trait even though comp advertises no tablet manager: with no
+// `zwp_tablet_manager_v2` global there is no way for a client to obtain a tool,
+// so nothing can reach the callback. Implemented with a log rather than an empty
+// body so that if that assumption ever stops holding — someone wires the tablet
+// protocol — the first tool image says so instead of vanishing.
+impl TabletSeatHandler for WaylandState {
+    fn tablet_tool_image(&mut self, _tool: &TabletToolDescriptor, _image: CursorImageStatus) {
+        tracing::debug!("tablet tool cursor image ignored: comp advertises no tablet manager");
+    }
+}
+
 impl PointerConstraintsHandler for WaylandState {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
         // Activation is compositor policy — Smithay deliberately does not do it
@@ -2771,3 +2783,5 @@ impl Dispatch<ZwlrLayerShellV1, ()> for WaylandState {
 
 delegate_relative_pointer!(WaylandState);
 delegate_pointer_constraints!(WaylandState);
+
+delegate_cursor_shape!(WaylandState);

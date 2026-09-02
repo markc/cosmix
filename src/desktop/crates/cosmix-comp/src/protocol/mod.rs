@@ -99,12 +99,15 @@ use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::{
 };
 use smithay::{
     backend::allocator::{Buffer as _, Format, dmabuf::Dmabuf},
-    backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonState, KeyState, TouchSlot},
-    delegate_data_control, delegate_data_device, delegate_dmabuf, delegate_ext_data_control,
-    delegate_foreign_toplevel_list, delegate_fractional_scale, delegate_idle_notify,
-    delegate_output, delegate_pointer_constraints, delegate_primary_selection,
-    delegate_relative_pointer, delegate_seat, delegate_session_lock, delegate_shm,
-    delegate_viewporter, delegate_xdg_activation,
+    backend::input::{
+        Axis, AxisRelativeDirection, AxisSource, ButtonState, KeyState, TabletToolDescriptor,
+        TouchSlot,
+    },
+    delegate_cursor_shape, delegate_data_control, delegate_data_device, delegate_dmabuf,
+    delegate_ext_data_control, delegate_foreign_toplevel_list, delegate_fractional_scale,
+    delegate_idle_notify, delegate_output, delegate_pointer_constraints,
+    delegate_primary_selection, delegate_relative_pointer, delegate_seat, delegate_session_lock,
+    delegate_shm, delegate_viewporter, delegate_xdg_activation,
     desktop::{
         LayerMap, LayerSurface as DesktopLayerSurface, PopupKeyboardGrab, PopupKind, PopupManager,
         PopupPointerGrab, find_popup_root_surface, layer_map_for_output,
@@ -113,8 +116,8 @@ use smithay::{
         Seat, SeatHandler, SeatState,
         keyboard::{FilterResult, KeyboardHandle, Keycode},
         pointer::{
-            AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, Focus, MotionEvent,
-            PointerHandle, RelativeMotionEvent,
+            AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, CursorImageSurfaceData, Focus,
+            MotionEvent, PointerHandle, RelativeMotionEvent,
         },
         touch::{
             DownEvent as TouchDownEvent, MotionEvent as TouchMotionEvent, UpEvent as TouchUpEvent,
@@ -158,6 +161,7 @@ use smithay::{
             SubsurfaceUserData, SurfaceAttributes, SurfaceUserData, TraversalAction,
             with_surface_tree_downward, with_surface_tree_upward,
         },
+        cursor_shape::CursorShapeManagerState,
         dmabuf::{
             DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
             get_dmabuf,
@@ -211,6 +215,7 @@ use smithay::{
         },
         shm::{ShmHandler, ShmState, with_buffer_contents, with_buffer_contents_mut},
         socket::ListeningSocketSource,
+        tablet_manager::TabletSeatHandler,
         viewporter::{ViewportCachedState, ViewporterState, ensure_viewport_valid},
         xdg_activation::{
             XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
@@ -582,6 +587,7 @@ pub(crate) enum CursorImage {
     Default,
     Hidden,
     Chrome(ChromeCursorIcon),
+    Named(NamedCursorShape),
     Surface {
         id: ObjectId,
         hotspot: (i32, i32),
@@ -590,7 +596,68 @@ pub(crate) enum CursorImage {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// The named cursor shapes this compositor can actually DRAW.
+///
+/// Deliberately not a mirror of `cursor_icon::CursorIcon`, which has forty-odd
+/// members. A shape belongs here only once there is artwork for it; everything
+/// else resolves to `Default`, which is exactly what every named cursor did
+/// before this existed — so an unlisted shape is no worse off than it was, and
+/// a listed one is strictly better. That asymmetry is what makes advertising
+/// `wp_cursor_shape_v1` an improvement rather than a regression: a client that
+/// adopts the protocol keeps the arrow it would have got anyway for exotic
+/// shapes, and gains a real I-beam and hand for the two that actually matter.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum NamedCursorShape {
+    Text,
+    Pointer,
+    Wait,
+    Help,
+    Crosshair,
+    NotAllowed,
+    Grab,
+    Grabbing,
+}
+
+/// Map a client's requested icon onto what comp can draw.
+///
+/// Returns `Ok(shape)` for a shape with artwork, `Err(Some(icon))` for one that
+/// belongs to the SSD chrome set (reusing the resize/move artwork already
+/// drawn), and `Err(None)` for everything else, which falls back to the default
+/// arrow.
+pub(crate) fn resolve_named_cursor(
+    icon: CursorIcon,
+) -> Result<NamedCursorShape, Option<ChromeCursorIcon>> {
+    match icon {
+        CursorIcon::Text | CursorIcon::VerticalText => Ok(NamedCursorShape::Text),
+        CursorIcon::Pointer => Ok(NamedCursorShape::Pointer),
+        CursorIcon::Wait => Ok(NamedCursorShape::Wait),
+        CursorIcon::Progress => Ok(NamedCursorShape::Wait),
+        CursorIcon::Help => Ok(NamedCursorShape::Help),
+        CursorIcon::Crosshair | CursorIcon::Cell => Ok(NamedCursorShape::Crosshair),
+        CursorIcon::NotAllowed | CursorIcon::NoDrop => Ok(NamedCursorShape::NotAllowed),
+        CursorIcon::Grab => Ok(NamedCursorShape::Grab),
+        CursorIcon::Grabbing | CursorIcon::AllScroll | CursorIcon::Move => {
+            Ok(NamedCursorShape::Grabbing)
+        }
+        // The SSD chrome set already has artwork for these; reuse it rather
+        // than draw a second, subtly different arrow for the same meaning.
+        CursorIcon::NResize | CursorIcon::NsResize | CursorIcon::RowResize => {
+            Err(Some(ChromeCursorIcon::NResize))
+        }
+        CursorIcon::SResize => Err(Some(ChromeCursorIcon::SResize)),
+        CursorIcon::EResize | CursorIcon::EwResize | CursorIcon::ColResize => {
+            Err(Some(ChromeCursorIcon::EResize))
+        }
+        CursorIcon::WResize => Err(Some(ChromeCursorIcon::WResize)),
+        CursorIcon::NeResize | CursorIcon::NeswResize => Err(Some(ChromeCursorIcon::NeResize)),
+        CursorIcon::SwResize => Err(Some(ChromeCursorIcon::SwResize)),
+        CursorIcon::NwResize | CursorIcon::NwseResize => Err(Some(ChromeCursorIcon::NwResize)),
+        CursorIcon::SeResize => Err(Some(ChromeCursorIcon::SeResize)),
+        _ => Err(None),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum ChromeCursorIcon {
     Move,
     NResize,
@@ -2747,6 +2814,13 @@ impl ProtocolServer {
         // alone is unusable for the clients that ask for them.
         let pointer_constraints_state =
             PointerConstraintsState::new::<WaylandState>(&display_handle);
+        // wp_cursor_shape_v1: the modern way a client asks for a named cursor,
+        // replacing "upload your own bitmap as a surface". Safe to advertise
+        // only now that comp can DRAW the named shapes — a client that adopts
+        // this protocol stops uploading cursor surfaces, so advertising it
+        // while flattening every shape to an arrow would have made cursors
+        // visibly worse than not offering it at all.
+        let cursor_shape_state = CursorShapeManagerState::new::<WaylandState>(&display_handle);
         let primary_selection_state = PrimarySelectionState::new::<WaylandState>(&display_handle);
         let wlr_data_control_state = WlrDataControlState::new::<WaylandState, _>(
             &display_handle,
@@ -2883,6 +2957,7 @@ impl ProtocolServer {
             xdg_activation_state,
             relative_pointer_state,
             pointer_constraints_state,
+            cursor_shape_state,
             pending_relative_motion: None,
             primary_selection_state,
             wlr_data_control_state,
@@ -5335,6 +5410,11 @@ where
 enum CursorSelection {
     Default,
     Hidden,
+    Named(NamedCursorShape),
+    /// A client asking for a resize/move shape, borrowing the SSD chrome
+    /// artwork. Distinct from `chrome_cursor_override`, which is the
+    /// compositor's OWN chrome and outranks anything a client selects.
+    Chrome(ChromeCursorIcon),
     Surface(ObjectId),
 }
 
@@ -5545,6 +5625,9 @@ struct WaylandState {
     /// nothing asks for the state object back.
     #[allow(dead_code)]
     pointer_constraints_state: PointerConstraintsState,
+    /// Held, never read — same reason as the two above.
+    #[allow(dead_code)]
+    cursor_shape_state: CursorShapeManagerState,
     pending_relative_motion: Option<PendingRelativeMotion>,
     primary_selection_state: PrimarySelectionState,
     wlr_data_control_state: WlrDataControlState,
@@ -10327,7 +10410,15 @@ impl WaylandState {
         }
         self.cursor_selection = match image {
             CursorImageStatus::Hidden => CursorSelection::Hidden,
-            CursorImageStatus::Named(_) => CursorSelection::Default,
+            // A named shape now resolves to real artwork where comp has it,
+            // to the SSD chrome set for resize/move, and to the default arrow
+            // otherwise — which is what every named cursor did before, so an
+            // unlisted shape is no worse off than it was.
+            CursorImageStatus::Named(icon) => match resolve_named_cursor(icon) {
+                Ok(shape) => CursorSelection::Named(shape),
+                Err(Some(chrome)) => CursorSelection::Chrome(chrome),
+                Err(None) => CursorSelection::Default,
+            },
             CursorImageStatus::Surface(surface) => {
                 let id = surface.id();
                 let hotspot = cursor_surface_hotspot(&surface);
@@ -10736,6 +10827,8 @@ impl WaylandState {
         let image = match self.cursor_selection.clone() {
             CursorSelection::Default => CursorImage::Default,
             CursorSelection::Hidden => CursorImage::Hidden,
+            CursorSelection::Named(shape) => CursorImage::Named(shape),
+            CursorSelection::Chrome(icon) => CursorImage::Chrome(icon),
             CursorSelection::Surface(id) => {
                 let Some(record) = self.cursor_surfaces.get(&id) else {
                     return Some(ProtocolEvent::CursorUpdated {

@@ -23,9 +23,9 @@ use smithay::reexports::wayland_server::backend::ObjectId;
 
 use crate::protocol::{
     ChromeCursorIcon, ClientSceneFeed, CursorImage, CursorPositionSnapshot, CursorPresentation,
-    DmabufUseId, MAX_GLOBAL_SURFACES, ProtocolEvent, SceneSurfaceKind, SecurityPresentationTarget,
-    ShmFrame, StackBand, SurfaceFrame, SurfaceId, SurfaceLayout, SurfaceSceneSnapshot,
-    SurfaceTransform,
+    DmabufUseId, MAX_GLOBAL_SURFACES, NamedCursorShape, ProtocolEvent, SceneSurfaceKind,
+    SecurityPresentationTarget, ShmFrame, StackBand, SurfaceFrame, SurfaceId, SurfaceLayout,
+    SurfaceSceneSnapshot, SurfaceTransform,
 };
 #[cfg(test)]
 use crate::protocol::{SecurityPresentationScene, SurfaceStackKey};
@@ -439,6 +439,7 @@ struct CursorScene {
     entity: Option<Entity>,
     default_image: Option<Handle<Image>>,
     resize_images: Option<ResizeCursorImages>,
+    named_images: Option<NamedCursorImages>,
 }
 
 #[derive(Resource)]
@@ -456,11 +457,41 @@ impl CursorScene {
             entity: None,
             default_image: None,
             resize_images: None,
+            named_images: None,
         }
     }
 }
 
 #[derive(Clone)]
+/// One handle per drawable named shape, built once at scene setup like the
+/// resize set — a cursor texture created per request would allocate on every
+/// pointer crossing between a link and its page.
+struct NamedCursorImages {
+    text: Handle<Image>,
+    pointer: Handle<Image>,
+    wait: Handle<Image>,
+    help: Handle<Image>,
+    crosshair: Handle<Image>,
+    not_allowed: Handle<Image>,
+    grab: Handle<Image>,
+    grabbing: Handle<Image>,
+}
+
+impl NamedCursorImages {
+    fn handle(&self, shape: NamedCursorShape) -> &Handle<Image> {
+        match shape {
+            NamedCursorShape::Text => &self.text,
+            NamedCursorShape::Pointer => &self.pointer,
+            NamedCursorShape::Wait => &self.wait,
+            NamedCursorShape::Help => &self.help,
+            NamedCursorShape::Crosshair => &self.crosshair,
+            NamedCursorShape::NotAllowed => &self.not_allowed,
+            NamedCursorShape::Grab => &self.grab,
+            NamedCursorShape::Grabbing => &self.grabbing,
+        }
+    }
+}
+
 struct ResizeCursorImages {
     horizontal: Handle<Image>,
     vertical: Handle<Image>,
@@ -485,6 +516,7 @@ impl Default for HostCursor {
 enum ProjectedCursorSelection {
     Default,
     Hidden,
+    Named(NamedCursorShape),
     Chrome(ChromeCursorIcon),
     Surface,
 }
@@ -712,6 +744,14 @@ fn capture_cursor_snapshot(world: &World) -> Option<crate::capture::CaptureCurso
                 SurfaceTransform::Normal,
                 false,
             ),
+            ProjectedCursorSelection::Named(shape) => (
+                cursor.named_images.as_ref()?.handle(shape).clone(),
+                named_cursor_hotspot(shape),
+                Vec2::new(DEFAULT_CURSOR_WIDTH as f32, DEFAULT_CURSOR_HEIGHT as f32),
+                None,
+                SurfaceTransform::Normal,
+                false,
+            ),
             ProjectedCursorSelection::Chrome(icon) => match icon {
                 ChromeCursorIcon::Move => (
                     cursor.default_image.clone()?,
@@ -920,6 +960,16 @@ fn spawn_software_cursor(
         ne_sw: images.add(resize_cursor_image(ResizeCursorAxis::NeSw)),
         nw_se: images.add(resize_cursor_image(ResizeCursorAxis::NwSe)),
     };
+    let named_images = NamedCursorImages {
+        text: images.add(text_cursor_image()),
+        pointer: images.add(pointer_cursor_image()),
+        wait: images.add(wait_cursor_image()),
+        help: images.add(help_cursor_image()),
+        crosshair: images.add(crosshair_cursor_image()),
+        not_allowed: images.add(not_allowed_cursor_image()),
+        grab: images.add(grab_cursor_image()),
+        grabbing: images.add(grabbing_cursor_image()),
+    };
     let mut sprite = SpriteMesh::from_image(image.clone());
     sprite.alpha_mode = SpriteAlphaMode::Blend;
     let scale120 = output_scale.0;
@@ -956,6 +1006,7 @@ fn spawn_software_cursor(
     cursor.entity = Some(entity);
     cursor.default_image = Some(image);
     cursor.resize_images = Some(resize_images);
+    cursor.named_images = Some(named_images);
 
     if cursor.mode == SceneCursorMode::HostCursor {
         let extent = physical_canvas_extent(canvas.0, output_scale.0);
@@ -1043,6 +1094,7 @@ fn apply_cursor_image(world: &mut World, image: CursorImage) {
     if world.resource::<CursorScene>().mode == SceneCursorMode::HostCursor {
         let icon = match &image {
             CursorImage::Chrome(cursor) => host_cursor_icon(*cursor),
+            CursorImage::Named(shape) => named_host_cursor_icon(*shape),
             CursorImage::Default | CursorImage::Hidden | CursorImage::Surface { .. } => {
                 SystemCursorIcon::Default
             }
@@ -1062,6 +1114,10 @@ fn apply_cursor_image(world: &mut World, image: CursorImage) {
         CursorImage::Chrome(cursor) => {
             world.resource_mut::<CursorScene>().selection =
                 ProjectedCursorSelection::Chrome(cursor);
+        }
+        CursorImage::Named(shape) => {
+            clear_client_cursor(world);
+            world.resource_mut::<CursorScene>().selection = ProjectedCursorSelection::Named(shape);
         }
         CursorImage::Surface {
             id,
@@ -1156,6 +1212,10 @@ fn capture_cursor_damage_bounds(world: &World) -> Option<crate::capture::Display
         ProjectedCursorSelection::Hidden => return None,
         ProjectedCursorSelection::Default | ProjectedCursorSelection::Chrome(_) => (
             (0, 0),
+            Vec2::new(DEFAULT_CURSOR_WIDTH as f32, DEFAULT_CURSOR_HEIGHT as f32),
+        ),
+        ProjectedCursorSelection::Named(shape) => (
+            named_cursor_hotspot(shape),
             Vec2::new(DEFAULT_CURSOR_WIDTH as f32, DEFAULT_CURSOR_HEIGHT as f32),
         ),
         ProjectedCursorSelection::Surface => {
@@ -1400,6 +1460,31 @@ fn refresh_cursor_entity(world: &mut World) {
             );
             replace_cursor_with_sprite(world, entity, sprite, transform);
         }
+        ProjectedCursorSelection::Named(shape) => {
+            let image = world
+                .resource::<CursorScene>()
+                .named_images
+                .as_ref()
+                .expect("software cursor owns its named images")
+                .handle(shape)
+                .clone();
+            let hotspot = named_cursor_hotspot(shape);
+            let mut sprite = SpriteMesh::from_image(image);
+            sprite.alpha_mode = SpriteAlphaMode::Blend;
+            let scale120 = world.resource::<RendererOutputScale120>().0;
+            let image_size = Vec2::new(DEFAULT_CURSOR_WIDTH as f32, DEFAULT_CURSOR_HEIGHT as f32);
+            let rendered = cursor_renderer_rect(position, hotspot, image_size, scale120);
+            sprite.custom_size = Some(Vec2::new(rendered.width, rendered.height));
+            let transform = cursor_transform(
+                position,
+                hotspot,
+                image_size,
+                SurfaceTransform::Normal,
+                world.resource::<LogicalCanvasSize>().0,
+                scale120,
+            );
+            replace_cursor_with_sprite(world, entity, sprite, transform);
+        }
         ProjectedCursorSelection::Chrome(cursor_icon) => {
             let (image, hotspot, image_size) = {
                 let cursor = world.resource::<CursorScene>();
@@ -1620,6 +1705,287 @@ fn paint_cursor_line(
             y += step_y;
         }
     }
+}
+
+/// The host's equivalent shape, for a nested run where the HOST draws the
+/// cursor. Without this the shape would be flattened to an arrow on exactly the
+/// path where honouring it costs nothing — the host already has the artwork.
+fn named_host_cursor_icon(shape: NamedCursorShape) -> SystemCursorIcon {
+    match shape {
+        NamedCursorShape::Text => SystemCursorIcon::Text,
+        NamedCursorShape::Pointer => SystemCursorIcon::Pointer,
+        NamedCursorShape::Wait => SystemCursorIcon::Wait,
+        NamedCursorShape::Help => SystemCursorIcon::Help,
+        NamedCursorShape::Crosshair => SystemCursorIcon::Crosshair,
+        NamedCursorShape::NotAllowed => SystemCursorIcon::NotAllowed,
+        NamedCursorShape::Grab => SystemCursorIcon::Grab,
+        NamedCursorShape::Grabbing => SystemCursorIcon::Grabbing,
+    }
+}
+
+/// Where each shape actually points. An I-beam addresses its centre, a hand its
+/// fingertip, a crosshair its intersection — getting this wrong is not cosmetic:
+/// the click lands where the hotspot is, not where the drawing looks like it is.
+fn named_cursor_hotspot(shape: NamedCursorShape) -> (i32, i32) {
+    match shape {
+        NamedCursorShape::Text => (7, 10),
+        NamedCursorShape::Pointer => (6, 0),
+        NamedCursorShape::Wait => (7, 8),
+        NamedCursorShape::Help => (0, 0),
+        NamedCursorShape::Crosshair => (7, 9),
+        NamedCursorShape::NotAllowed => (7, 9),
+        NamedCursorShape::Grab | NamedCursorShape::Grabbing => (7, 8),
+    }
+}
+
+/// Build a cursor texture from the same 16x20 glyph grid the default arrow
+/// uses: `D` outline, `W` fill, `.` transparent. Every named shape goes through
+/// here so they share one hotspot convention, one palette and one sampler —
+/// eight near-identical copies of the pixel loop is how they drift apart.
+fn cursor_image_from_rows(rows: &[&str; DEFAULT_CURSOR_HEIGHT as usize]) -> Image {
+    let mut rgba = Vec::with_capacity(
+        (DEFAULT_CURSOR_WIDTH * DEFAULT_CURSOR_MASTER_SCALE) as usize
+            * (DEFAULT_CURSOR_HEIGHT * DEFAULT_CURSOR_MASTER_SCALE) as usize
+            * 4,
+    );
+    for row in rows {
+        debug_assert_eq!(row.len(), DEFAULT_CURSOR_WIDTH as usize);
+        for _ in 0..DEFAULT_CURSOR_MASTER_SCALE {
+            for pixel in row.bytes() {
+                let rgba_pixel: &[u8; 4] = match pixel {
+                    b'D' => &[30, 32, 38, 255],
+                    b'W' => &[248, 248, 245, 255],
+                    _ => &[0, 0, 0, 0],
+                };
+                for _ in 0..DEFAULT_CURSOR_MASTER_SCALE {
+                    rgba.extend_from_slice(rgba_pixel);
+                }
+            }
+        }
+    }
+    let mut image = Image::new(
+        Extent3d {
+            width: DEFAULT_CURSOR_WIDTH * DEFAULT_CURSOR_MASTER_SCALE,
+            height: DEFAULT_CURSOR_HEIGHT * DEFAULT_CURSOR_MASTER_SCALE,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        rgba,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    image.sampler = ImageSampler::linear();
+    image
+}
+
+/// An I-beam. The single most valuable named shape: without it every text field
+/// in every GTK4/Firefox build shows an arrow.
+fn text_cursor_image() -> Image {
+    cursor_image_from_rows(&[
+        "................",
+        "................",
+        "....DDDDDDD.....",
+        "....DWWWWWD.....",
+        "....DDDWDDD.....",
+        "......DWD.......",
+        "......DWD.......",
+        "......DWD.......",
+        "......DWD.......",
+        "......DWD.......",
+        "......DWD.......",
+        "......DWD.......",
+        "......DWD.......",
+        "......DWD.......",
+        "......DWD.......",
+        "....DDDWDDD.....",
+        "....DWWWWWD.....",
+        "....DDDDDDD.....",
+        "................",
+        "................",
+    ])
+}
+
+/// A pointing hand, for links.
+fn pointer_cursor_image() -> Image {
+    cursor_image_from_rows(&[
+        "......DD........",
+        ".....DWWD.......",
+        ".....DWWD.......",
+        ".....DWWD.......",
+        ".....DWWD.......",
+        ".....DWWD.......",
+        ".....DWWDDD.....",
+        ".....DWWDWWDD...",
+        ".....DWWDWWDWD..",
+        "..DD.DWWDWWDWWD.",
+        ".DWWDDWWWWWWWWD.",
+        ".DWWWDWWWWWWWWD.",
+        "..DWWWWWWWWWWWD.",
+        "..DWWWWWWWWWWWD.",
+        "...DWWWWWWWWWWD.",
+        "...DWWWWWWWWWD..",
+        "....DWWWWWWWD...",
+        "....DWWWWWWWD...",
+        ".....DDDDDDD....",
+        "................",
+    ])
+}
+
+/// An hourglass. Also serves `Progress`, which differs from `Wait` only by
+/// carrying an arrow alongside — a distinction not worth a second bitmap.
+fn wait_cursor_image() -> Image {
+    cursor_image_from_rows(&[
+        "................",
+        "...DDDDDDDDD....",
+        "...DWWWWWWWD....",
+        "...DWWWWWWWD....",
+        "....DWWWWWD.....",
+        ".....DWWWD......",
+        "......DWD.......",
+        "......DWD.......",
+        ".......D........",
+        ".......D........",
+        "......DWD.......",
+        "......DWD.......",
+        ".....DWWWD......",
+        "....DWWWWWD.....",
+        "...DWWWWWWWD....",
+        "...DWWWWWWWD....",
+        "...DDDDDDDDD....",
+        "................",
+        "................",
+        "................",
+    ])
+}
+
+/// Arrow with a question mark.
+fn help_cursor_image() -> Image {
+    cursor_image_from_rows(&[
+        "D...............",
+        "DD..............",
+        "DWD.............",
+        "DWWD............",
+        "DWWWD...DDDD....",
+        "DWWWWD.DWWWWD...",
+        "DWWWWWD DDDWWD..",
+        "DWWWWWWD...DWD..",
+        "DWWWWWWWD.DWWD..",
+        "DWWWWWWWWDDWD...",
+        "DWWWWDDDDDDWD...",
+        "DWWDWD...DDD....",
+        "DWD.DWD..DWD....",
+        "DD..DWD..DDD....",
+        "D...DWWD........",
+        "....DWWD........",
+        ".....DD.........",
+        "................",
+        "................",
+        "................",
+    ])
+}
+
+/// A crosshair, for precise selection.
+fn crosshair_cursor_image() -> Image {
+    cursor_image_from_rows(&[
+        "................",
+        "................",
+        ".......DD.......",
+        ".......DD.......",
+        ".......DD.......",
+        ".......DD.......",
+        ".......DD.......",
+        "................",
+        "..DDDDD..DDDDD..",
+        "..DDDDD..DDDDD..",
+        "................",
+        ".......DD.......",
+        ".......DD.......",
+        ".......DD.......",
+        ".......DD.......",
+        ".......DD.......",
+        "................",
+        "................",
+        "................",
+        "................",
+    ])
+}
+
+/// A barred circle.
+fn not_allowed_cursor_image() -> Image {
+    cursor_image_from_rows(&[
+        "................",
+        ".....DDDDD......",
+        "...DDWWWWWDD....",
+        "..DWWWWWWWDWD...",
+        ".DWWWWWWDDWWWD..",
+        ".DWWWWWDDWWWWD..",
+        ".DWWWWDDWWWWWD..",
+        "DWWWWDDWWWWWWWD.",
+        "DWWWDDWWWWWWWWD.",
+        "DWWDDWWWWWWWWWD.",
+        "DWDDWWWWWWWWWWD.",
+        "DDDWWWWWWWWWWWD.",
+        ".DWWWWWWWWWWWD..",
+        ".DDWWWWWWWWWDD..",
+        "..DWDDDDDDDWD...",
+        "...DDWWWWWDD....",
+        ".....DDDDD......",
+        "................",
+        "................",
+        "................",
+    ])
+}
+
+/// An open hand.
+fn grab_cursor_image() -> Image {
+    cursor_image_from_rows(&[
+        "................",
+        "................",
+        "....DD.DD.DD....",
+        "...DWWDWWDWWD...",
+        "...DWWDWWDWWD...",
+        "DD.DWWDWWDWWD...",
+        "DWWDWWWWWWWWDD..",
+        "DWWWWWWWWWWWWD..",
+        ".DWWWWWWWWWWWD..",
+        ".DWWWWWWWWWWWD..",
+        "..DWWWWWWWWWWD..",
+        "..DWWWWWWWWWWD..",
+        "...DWWWWWWWWD...",
+        "...DWWWWWWWWD...",
+        "....DWWWWWWD....",
+        "....DDDDDDDD....",
+        "................",
+        "................",
+        "................",
+        "................",
+    ])
+}
+
+/// A closed hand. Also serves `Move` and `AllScroll` — dragging is dragging.
+fn grabbing_cursor_image() -> Image {
+    cursor_image_from_rows(&[
+        "................",
+        "................",
+        "................",
+        "................",
+        "....DDDDDDD.....",
+        "...DWWWWWWWDD...",
+        "..DWWWWWWWWWWD..",
+        ".DWWWWWWWWWWWD..",
+        ".DWWWWWWWWWWWD..",
+        ".DWWWWWWWWWWWD..",
+        "..DWWWWWWWWWWD..",
+        "..DWWWWWWWWWWD..",
+        "...DWWWWWWWWD...",
+        "...DWWWWWWWWD...",
+        "....DWWWWWWD....",
+        "....DDDDDDDD....",
+        "................",
+        "................",
+        "................",
+        "................",
+    ])
 }
 
 fn default_cursor_image() -> Image {
@@ -3174,7 +3540,15 @@ mod tests {
             .expect("software cursor entity exists");
         let images_before = app.world().resource::<Assets<Image>>().len();
         let materials_before = app.world().resource::<Assets<SpriteMaterial>>().len();
-        assert_eq!(images_before, 5, "default plus four resize images");
+        // The point of this assertion is that the cursor set is BOUNDED and
+        // built once — not that it is any particular size. It went 5 -> 13 when
+        // the eight named shapes landed, and that is the number to keep honest:
+        // a cursor texture created per request would allocate on every crossing
+        // between a link and its page, and this count is what would notice.
+        assert_eq!(
+            images_before, 13,
+            "default, four resize images, eight named shapes — built once, not per request"
+        );
 
         let (horizontal, vertical, ne_sw, nw_se) = {
             let cursor = app.world().resource::<CursorScene>();
