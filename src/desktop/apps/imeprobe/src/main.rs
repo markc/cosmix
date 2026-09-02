@@ -25,6 +25,15 @@ use wayland_client::protocol::{
     wl_shm_pool::WlShmPool, wl_surface::WlSurface,
 };
 use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
+use wayland_protocols::wp::text_input::zv3::client::{
+    zwp_text_input_manager_v3::ZwpTextInputManagerV3,
+    zwp_text_input_v3::{self, ZwpTextInputV3},
+};
+use wayland_protocols::xdg::shell::client::{
+    xdg_surface::{self, XdgSurface},
+    xdg_toplevel::{self, XdgToplevel},
+    xdg_wm_base::{self, XdgWmBase},
+};
 use wayland_protocols_misc::zwp_input_method_v2::client::{
     zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
     zwp_input_method_v2::{self, ZwpInputMethodV2},
@@ -42,6 +51,14 @@ struct App {
     compositor: Option<WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     seat: Option<WlSeat>,
+    wm_base: Option<XdgWmBase>,
+    text_input_manager: Option<ZwpTextInputManagerV3>,
+    text_input: Option<ZwpTextInputV3>,
+    window: Option<WlSurface>,
+    xdg_surface: Option<XdgSurface>,
+    toplevel: Option<XdgToplevel>,
+    window_configured: bool,
+    text_input_enabled: bool,
     manager: Option<ZwpInputMethodManagerV2>,
     input_method: Option<ZwpInputMethodV2>,
     popup: Option<ZwpInputPopupSurfaceV2>,
@@ -76,6 +93,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
             }
             "wl_seat" => {
                 state.seat = Some(registry.bind::<WlSeat, _, _>(name, 1, qh, ()));
+            }
+            "xdg_wm_base" => {
+                state.wm_base = Some(registry.bind::<XdgWmBase, _, _>(name, 1, qh, ()));
+            }
+            "zwp_text_input_manager_v3" => {
+                state.text_input_manager =
+                    Some(registry.bind::<ZwpTextInputManagerV3, _, _>(name, 1, qh, ()));
             }
             "zwp_input_method_manager_v2" => {
                 state.manager =
@@ -186,6 +210,87 @@ impl App {
     }
 }
 
+// The probe is BOTH the input method and the text field it serves.
+//
+// That is deliberate, not a shortcut: a gate that relied on some other client
+// happening to bind text-input AND happening to hold focus would be testing
+// the fixture's luck, not the compositor. Owning both ends makes activation
+// deterministic — the probe maps a window, takes focus, enables text input,
+// and the compositor must then activate the input method.
+impl Dispatch<XdgWmBase, ()> for App {
+    fn event(
+        _: &mut Self,
+        wm_base: &XdgWmBase,
+        event: xdg_wm_base::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_wm_base::Event::Ping { serial } = event {
+            wm_base.pong(serial);
+        }
+    }
+}
+
+impl Dispatch<XdgSurface, ()> for App {
+    fn event(
+        state: &mut Self,
+        xdg_surface: &XdgSurface,
+        event: xdg_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_surface::Event::Configure { serial } = event {
+            xdg_surface.ack_configure(serial);
+            state.window_configured = true;
+            if let Some(window) = &state.window {
+                window.commit();
+            }
+        }
+    }
+}
+
+impl Dispatch<XdgToplevel, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &XdgToplevel,
+        _: xdg_toplevel::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpTextInputV3, ()> for App {
+    fn event(
+        state: &mut Self,
+        text_input: &ZwpTextInputV3,
+        event: zwp_text_input_v3::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_text_input_v3::Event::Enter { .. } => {
+                // Keyboard focus reached our window. Enabling here is what
+                // makes the compositor activate the input method.
+                text_input.enable();
+                text_input.set_cursor_rectangle(20, 20, 10, 20);
+                text_input.commit();
+                state.text_input_enabled = true;
+                println!("IMEPROBE text-input entered and enabled");
+            }
+            zwp_text_input_v3::Event::Leave { .. } => {
+                state.text_input_enabled = false;
+                println!("IMEPROBE text-input left");
+            }
+            _ => {}
+        }
+    }
+}
+
 delegate_noop!(App: ignore WlCompositor);
 delegate_noop!(App: ignore WlSurface);
 delegate_noop!(App: ignore wl_shm::WlShm);
@@ -193,6 +298,7 @@ delegate_noop!(App: ignore WlShmPool);
 delegate_noop!(App: ignore WlBuffer);
 delegate_noop!(App: ignore WlSeat);
 delegate_noop!(App: ignore ZwpInputMethodManagerV2);
+delegate_noop!(App: ignore ZwpTextInputManagerV3);
 delegate_noop!(App: ignore ZwpInputPopupSurfaceV2);
 
 fn main() {
@@ -222,6 +328,64 @@ fn main() {
     };
     app.input_method = Some(manager.get_input_method(&seat, &qh, ()));
     let _ = queue.roundtrip(&mut app);
+
+    // Now the text field half: a real window that takes focus, so the
+    // compositor has something to activate the input method FOR.
+    let (Some(compositor), Some(wm_base), Some(text_input_manager)) = (
+        app.compositor.clone(),
+        app.wm_base.clone(),
+        app.text_input_manager.clone(),
+    ) else {
+        println!("IMEPROBE FAILED no xdg_wm_base or zwp_text_input_manager_v3 advertised");
+        std::process::exit(4);
+    };
+    // Create the text-input object BEFORE the window can take focus. The
+    // `enter` event is delivered to an existing object or not at all — create
+    // it after mapping and a focus that arrives first is simply missed, which
+    // looks exactly like the compositor failing to activate.
+    app.text_input = Some(text_input_manager.get_text_input(&seat, &qh, ()));
+    let window = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&window, &qh, ());
+    let toplevel = xdg_surface.get_toplevel(&qh, ());
+    toplevel.set_title("cosmix imeprobe".to_string());
+    window.commit();
+    let _ = queue.roundtrip(&mut app);
+
+    // A buffer, so the window actually maps and can take focus. An unmapped
+    // surface never receives a text-input enter and the probe would wait
+    // forever for an activation that cannot come.
+    if let Some(shm) = app.shm.clone() {
+        let stride = 200 * 4;
+        let size = (stride * 120) as usize;
+        // Nested rather than a let-chain: this crate is edition 2021.
+        if let Ok(file) =
+            rustix::fs::memfd_create("cosmix-imeprobe-win", rustix::fs::MemfdFlags::CLOEXEC)
+                .and_then(|file| rustix::fs::ftruncate(&file, size as u64).map(|()| file))
+        {
+            let mut mapped = std::fs::File::from(file);
+            let row = [0x18u8, 0x1C, 0x24, 0xFF].repeat(200);
+            let mut ok = true;
+            for _ in 0..120 {
+                if mapped.write_all(&row).is_err() {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                let pool = shm.create_pool(mapped.as_fd(), size as i32, &qh, ());
+                let buffer =
+                    pool.create_buffer(0, 200, 120, stride, wl_shm::Format::Argb8888, &qh, ());
+                window.attach(Some(&buffer), 0, 0);
+                window.damage(0, 0, 200, 120);
+                window.commit();
+            }
+        }
+    }
+    app.window = Some(window);
+    app.xdg_surface = Some(xdg_surface);
+    app.toplevel = Some(toplevel);
+    let _ = queue.roundtrip(&mut app);
+    println!("IMEPROBE text field mapped, waiting for focus");
 
     // Serve until killed. The harness focuses a text input, waits for the
     // candidate window, captures, and then tears this down.

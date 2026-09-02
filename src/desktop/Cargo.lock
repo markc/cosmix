@@ -2589,6 +2589,7 @@ version = "0.1.0"
 dependencies = [
  "rustix 1.1.4",
  "wayland-client",
+ "wayland-protocols",
  "wayland-protocols-misc",
 ]
 
