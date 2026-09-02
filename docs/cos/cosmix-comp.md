@@ -226,6 +226,49 @@ clients.
 | `ext_session_lock_v1` | 1 | Nested and live KMS modes support immediate output-sized lock-surface configures, secure blank-first presentation acknowledgement, lock-only input, VT pause/resume preservation and the locked/orphaned lifecycle. |
 | `zwlr_screencopy_manager_v1` | 3 | Compatibility output capture into exact-layout `wl_shm` buffers, plus eligible whole-output v3 DMA-BUF destinations; includes clipped SHM regions, real damage waiting, exact cursor inclusion and presentation-timestamped nested or KMS completion. |
 
+## XWayland (X-1)
+
+Behind the `xwayland` cargo feature (not yet in the default set), the
+compositor supervises one rootless Xwayland instance and acts as its X11
+window manager. Normal X11 windows become managed toplevels on the existing
+scene, buffer, focus, stacking and server-side-decoration paths: association
+(via the xwayland-shell serial handshake) creates the window's surface
+record, the map grant makes it eligible, and its first committed buffer
+renders through exactly the renderer path a Wayland toplevel uses — the
+renderer has no X11 branch. Title/class metadata, focus (including the X
+`SetInputFocus`/`WM_TAKE_FOCUS` half), interactive and client-requested
+move/resize, maximise/minimise/fullscreen, EWMH state mirroring, close via
+`WM_DELETE_WINDOW`, and cross-protocol stacking in the normal band are
+supported.
+
+`DISPLAY` is never set globally. After the XWM owns `WM_S0`, the compositor
+atomically publishes a mode-0600 per-socket descriptor at
+`$XDG_RUNTIME_DIR/cosmix-comp/<WAYLAND_DISPLAY>.xwayland.env` containing
+`DISPLAY=:N` and the XWayland generation; launchers read it once and pass
+`DISPLAY` explicitly to each X client. A missing `Xwayland` binary or a
+failed start degrades to a fully working native-Wayland compositor with a
+warning. An unexpected XWayland death destroys that generation's windows,
+removes the descriptor and arms a single 60-second one-shot restart backstop;
+one retry credit exists, and only a generation that then survives five
+minutes restores it. There is no readiness or liveness polling anywhere in
+the path.
+
+**X-1 deliberately does not mean "X applications work".** Not yet supported,
+by design:
+
+- **Override-redirect windows** — most X11 menus, context menus, tooltips
+  and combo-box drop-downs — are recorded and ignored, not rendered (X-2).
+- **Clipboard and primary selection** are not bridged in either direction;
+  selection access is refused at the XWM (X-2).
+- **Drag-and-drop** across the X11/Wayland boundary (X-3).
+- **HiDPI/fractional scaling** for X11 clients: the X11 client scale is held
+  at 1 and RandR primary-output changes are only logged (X-3).
+- **KMS qualification**: X11 rendering is proven on the nested backend; the
+  live-KMS proof is a later slice (X-3).
+- Relative X restack requests (`Above`/`Below`/`Bottom` siblings) are refused
+  with a log; the compositor scene stays the stacking authority and only
+  raise-to-top is honoured.
+
 ## Screen capture
 
 Arc 4 provides `wlr-screencopy-unstable-v1` output capture for existing
@@ -592,6 +635,13 @@ attach/commit ledger enforce `AlreadyConstructed`.
 The session-lock registry also exposes a narrow exact-surface retirement helper
 for KMS output replacement; it removes only the originating protocol object and
 does not alter the accepted lock generation.
+
+Smithay's `X11Surface` has one additive test-support setter
+(`set_wl_surface_offline`) that assigns the associated `wl_surface` directly.
+The xwayland-shell serial handshake owns the real association; the setter
+exists only so the compositor's deterministic tests can fabricate offline
+X11 surfaces whose focus forwarding and metadata lookups still reach a real
+`wl_surface`.
 
 The vendored session-lock implementation also carries five marked fixes:
 
