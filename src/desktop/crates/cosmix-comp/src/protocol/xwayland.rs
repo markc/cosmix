@@ -93,10 +93,13 @@ impl X11WindowPhase {
 /// window-manager decorations (Smithay surfaces this as
 /// `X11Surface::is_decorated()`, "client-side decorated"). Flag unset, or a
 /// non-zero decorations value, accepts server-side decorations.
-// Consumed by the deterministic tests only: the live path reads the same
-// interpretation through `X11Surface::is_decorated()`, whose raw hint fields
-// Smithay keeps private — this copy pins the semantics so an inversion there
-// (or in a Smithay bump) fails a test instead of double-decorating Firefox.
+// Consumed by the deterministic tests only: production decoration reads
+// `X11Surface::is_decorated()`, never this copy. The pin is two-sided:
+// `x11_motif_decoration_interpretation_is_pinned` fixes this copy's truth
+// table, and `x11_motif_hints_drive_the_live_decoration_path` drives the
+// REAL `is_decorated()` path (via the vendored `set_motif_hints_offline`)
+// and asserts it agrees with this copy — so an inversion in a Smithay bump
+// fails a test instead of double-decorating Firefox.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn motif_refuses_server_decorations(flags: u32, decorations: u32) -> bool {
     const MWM_HINTS_DECORATIONS: u32 = 1 << 1;
@@ -163,6 +166,11 @@ pub(super) enum XwaylandLifecycle {
         token: RegistrationToken,
         wm: Box<X11Wm>,
         stability_timer: Option<RegistrationToken>,
+        /// The generation's Wayland client, retained so teardown can kill it
+        /// explicitly: a killed client dispatches nothing further (buffered
+        /// requests included), which closes the `serial_commit_hook` path to
+        /// `xwm_state` by construction rather than by timing.
+        client: Client,
     },
     RetryArmed {
         timer: RegistrationToken,
@@ -186,6 +194,24 @@ pub(super) struct XwaylandRuntime {
     /// Override-redirect XIDs, recorded for diagnostics/cleanup only.
     /// Deliberately never managed, mapped, or decorated in X-1.
     pub(super) override_redirect_windows: HashSet<X11Window>,
+    /// XWMs of torn-down generations, kept alive until their X11 event
+    /// source delivers calloop's `Closed` (surfaced as `disconnected`).
+    ///
+    /// `X11Wm::start_wm` inserts the X11 channel source and discards the
+    /// `RegistrationToken`, and `Drop for X11Wm` does not unregister it — so
+    /// after a failure teardown that source stays registered and its buffered
+    /// events still reach `XwmHandler::xwm_state` with the dead generation's
+    /// id. Dropping the wm at teardown would make that an `unreachable!`
+    /// panic. Instead the wm drains here: `xwm_state` answers for it, the
+    /// gated `XwmHandler` delegates ignore its events, and `disconnected`
+    /// drops it — `Closed` is provably the channel's final event (mpsc
+    /// reports `Disconnected` only once the queue is drained) and the source
+    /// removes itself after delivering it, so nothing can ask for the id
+    /// again. The other entry point to `xwm_state`, the per-surface
+    /// `serial_commit_hook`, dies at teardown itself: the generation's
+    /// Wayland client is killed there, and a killed client dispatches no
+    /// further requests, buffered ones included.
+    pub(super) draining_wms: Vec<Box<X11Wm>>,
     pub(super) shutting_down: bool,
 }
 
@@ -201,6 +227,7 @@ impl XwaylandRuntime {
             surfaces_by_xid: HashMap::new(),
             xids_by_object: HashMap::new(),
             override_redirect_windows: HashSet::new(),
+            draining_wms: Vec::new(),
             shutting_down: false,
         }
     }
@@ -286,11 +313,12 @@ pub(super) fn clamp_x11_content_size(
     fallback: (i32, i32),
     usable: (i32, i32),
 ) -> (i32, i32) {
-    let requested = if requested.0 > 1 && requested.1 > 1 {
-        requested
-    } else {
-        fallback
-    };
+    // Per-axis: a degenerate axis falls back alone — a 1000×1 request keeps
+    // its legitimate width and only the height is replaced.
+    let requested = (
+        if requested.0 > 1 { requested.0 } else { fallback.0 },
+        if requested.1 > 1 { requested.1 } else { fallback.1 },
+    );
     let min = min_hint.unwrap_or((1, 1));
     let max = max_hint.unwrap_or((i32::MAX, i32::MAX));
     let upper = (
@@ -388,40 +416,69 @@ impl WaylandState {
             return;
         };
         let client_for_retry = client.clone();
+        let wm_client = client.clone();
         match X11Wm::start_wm(self.capture_loop_handle.clone(), x11_socket, client) {
             Ok(wm) => {
                 // `DISPLAY` is published only after the XWM owns WM_S0:
                 // Smithay accepts no X clients before `start_wm` completes.
+                // Publication failure fails the generation: an Xwayland
+                // running on a display nothing can discover is not "ready",
+                // and logging it as such buries the fault.
                 let path = xwayland_descriptor_path(&self.xwayland.socket_name);
-                match path.as_deref() {
+                let published = match path.as_deref() {
                     Some(path) => {
-                        if let Err(error) =
-                            publish_xwayland_descriptor(path, display_number, generation)
-                        {
-                            tracing::warn!(
-                                path = %path.display(),
-                                %error,
-                                "failed to publish XWayland DISPLAY descriptor"
-                            );
+                        match publish_xwayland_descriptor(path, display_number, generation) {
+                            Ok(()) => true,
+                            Err(error) => {
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    %error,
+                                    "failed to publish XWayland DISPLAY descriptor"
+                                );
+                                false
+                            }
                         }
                     }
                     None => {
                         tracing::warn!(
                             "XDG_RUNTIME_DIR unset; XWayland DISPLAY descriptor not published"
                         );
+                        false
                     }
+                };
+                if !published {
+                    // Hand the wm to the Ready teardown arm so the source is
+                    // removed, the wm drains, and the client is killed.
+                    self.xwayland.lifecycle = XwaylandLifecycle::Ready {
+                        token,
+                        wm: Box::new(wm),
+                        stability_timer: None,
+                        client: wm_client,
+                    };
+                    self.fail_xwayland_generation(generation, "descriptor publication failed");
+                    return;
                 }
                 self.xwayland.descriptor_path = path;
-                let stability_timer = self
-                    .capture_loop_handle
-                    .insert_source(
-                        Timer::from_duration(XWAYLAND_STABILITY_WINDOW),
-                        move |_, (), state: &mut WaylandState| {
-                            state.xwayland_stable(generation);
-                            TimeoutAction::Drop
-                        },
-                    )
-                    .ok();
+                let stability_timer = match self.capture_loop_handle.insert_source(
+                    Timer::from_duration(XWAYLAND_STABILITY_WINDOW),
+                    move |_, (), state: &mut WaylandState| {
+                        state.xwayland_stable(generation);
+                        TimeoutAction::Drop
+                    },
+                ) {
+                    Ok(timer) => Some(timer),
+                    Err(error) => {
+                        // The generation still runs; only the credit restore
+                        // is forfeited, and silently forfeiting it hides why
+                        // a later crash stays failed.
+                        tracing::warn!(
+                            generation,
+                            %error,
+                            "failed to arm XWayland stability window; retry credit will not be restored this generation"
+                        );
+                        None
+                    }
+                };
                 tracing::info!(
                     generation,
                     display = display_number,
@@ -432,6 +489,7 @@ impl WaylandState {
                     token,
                     wm: Box::new(wm),
                     stability_timer,
+                    client: wm_client,
                 };
             }
             Err(error) => {
@@ -528,27 +586,33 @@ impl WaylandState {
     }
 
     /// Shared teardown for failure and orderly shutdown: descriptor first,
-    /// then X records, then the source/XWM.
+    /// then the source/XWM/client, then X records.
     fn teardown_xwayland_generation(&mut self) {
         remove_xwayland_descriptor(self.xwayland.descriptor_path.as_ref());
         self.xwayland.descriptor_path = None;
         let lifecycle = mem::replace(&mut self.xwayland.lifecycle, XwaylandLifecycle::Inert);
         match lifecycle {
-            XwaylandLifecycle::Starting { token, .. } => {
+            XwaylandLifecycle::Starting { token, client } => {
                 self.capture_loop_handle.remove(token);
+                self.kill_xwayland_client(&client);
             }
             XwaylandLifecycle::Ready {
                 token,
                 wm,
                 stability_timer,
-                ..
+                client,
             } => {
                 self.capture_loop_handle.remove(token);
                 if let Some(timer) = stability_timer {
                     self.capture_loop_handle.remove(timer);
                 }
-                // Dropping the X11Wm closes the privileged connection.
-                drop(wm);
+                // The X11 event source Smithay registered for this wm has no
+                // token we can remove; the wm drains until that source
+                // delivers `Closed` (see `draining_wms`). Dropping it here
+                // would leave a registered callback that panics in
+                // `xwm_state`.
+                self.xwayland.draining_wms.push(wm);
+                self.kill_xwayland_client(&client);
             }
             XwaylandLifecycle::RetryArmed { timer } => {
                 self.capture_loop_handle.remove(timer);
@@ -565,6 +629,17 @@ impl WaylandState {
                     .map(|record| record.role.wl_surface().clone())
             })
             .collect::<Vec<_>>();
+        // Fall back to another focus target only when an X11 surface of this
+        // generation actually held the keyboard; an unconditional fallback
+        // would steal focus from an unrelated Wayland surface (and dismiss
+        // its popup grabs) on every generation death.
+        let held_focus = match self.keyboard.current_focus() {
+            Some(SeatFocusTarget::X11(_)) => true,
+            Some(SeatFocusTarget::Wayland(focused)) => {
+                surfaces.iter().any(|surface| *surface == focused)
+            }
+            None => false,
+        };
         self.xwayland.pending_windows.clear();
         self.xwayland.surfaces_by_xid.clear();
         self.xwayland.xids_by_object.clear();
@@ -572,8 +647,22 @@ impl WaylandState {
         for surface in surfaces {
             self.destroy_surface_record(&surface);
         }
-        self.arbitrate_keyboard_focus(None, true, false);
+        if held_focus {
+            self.arbitrate_keyboard_focus(None, true, false);
+        }
         self.refresh_chrome_pointer_after_scene_change();
+    }
+
+    /// Kill a torn-down generation's Wayland client. A killed client
+    /// dispatches no further requests — buffered ones included — so the
+    /// `serial_commit_hook` route into `xwm_state` is closed the moment this
+    /// returns, not whenever the dead process happens to be reaped.
+    /// (Dropping the `XWayland` source kills it too; this makes the
+    /// guarantee comp-side and testable instead of vendor-`Drop`-order.)
+    fn kill_xwayland_client(&mut self, client: &Client) {
+        self.display_handle
+            .backend_handle()
+            .kill_client(client.id(), DisconnectReason::ConnectionClosed);
     }
 
     /// Orderly compositor shutdown: reject further launches, remove the
@@ -601,9 +690,23 @@ impl WaylandState {
         };
         role.granted_geometry = rect;
         let new_origin = (rect.loc.x as f32, rect.loc.y as f32);
-        record.configured_size = (rect.size.w.max(1), rect.size.h.max(1));
+        let new_size = (rect.size.w.max(1), rect.size.h.max(1));
+        let size_changed = record.configured_size != new_size;
+        record.configured_size = new_size;
         let old_origin = record.window_origin;
         if old_origin == new_origin {
+            // A size-only grant still changes the scene (SSD chrome and the
+            // hit-test box follow `configured_size`); publish it even though
+            // nothing moves.
+            if size_changed {
+                if record.mapped {
+                    let id = record.id;
+                    let scene = record.scene_snapshot();
+                    self.events
+                        .push(ProtocolEvent::SurfaceRelayout { id, scene });
+                }
+                self.invalidate_pointer_hit_test_geometry();
+            }
             return;
         }
         record.window_origin = new_origin;
@@ -666,19 +769,38 @@ impl WaylandState {
         self.invalidate_pointer_hit_test_geometry();
     }
 
-    /// Grant an initial normal geometry: existing cascade origin, size from
-    /// the client's request clamped by hints and the usable output.
+    /// Grant an initial normal geometry: the client's requested origin when
+    /// it stated one inside the usable rect, else the cascade; size from the
+    /// client's request clamped by hints and the usable output.
     fn choose_initial_x11_geometry(&mut self, window: &X11Surface) -> Rectangle<i32, Logical> {
         let usable = self.usable_output_rect();
-        let cascade = self.next_layout_index % 6;
-        self.next_layout_index = self.next_layout_index.saturating_add(1);
         let extents = DecoExtents::of(&self.decoration.theme);
         let server_side =
             self.x11_decoration_mode(window, false) == SceneDecorationMode::ServerSide;
-        // Content origin: cascade like a Wayland toplevel; with SSD, keep the
-        // outer frame inside the usable rect.
-        let mut x = usable.x + CASCADE_ORIGIN + cascade as f32 * CASCADE_STEP;
-        let mut y = usable.y + CASCADE_ORIGIN + cascade as f32 * CASCADE_STEP;
+        // Content origin: honour a requested origin at INITIAL placement only
+        // (the "ignore client x/y" rule governs windows the compositor has
+        // already placed) — `xmessage -center` computes its own centre and
+        // creates the window there. Smithay does not expose the
+        // WM_NORMAL_HINTS US/PPosition flags, so (0,0) — every X client's
+        // default — is indistinguishable from "no preference" and cascades.
+        let requested = window.geometry().loc;
+        let requested_inside = (requested.x != 0 || requested.y != 0)
+            && (requested.x as f32) >= usable.x
+            && (requested.y as f32) >= usable.y
+            && (requested.x as f32) < usable.x + usable.width
+            && (requested.y as f32) < usable.y + usable.height;
+        let (mut x, mut y) = if requested_inside {
+            (requested.x as f32, requested.y as f32)
+        } else {
+            // Cascade like a Wayland toplevel; with SSD, keep the outer
+            // frame inside the usable rect.
+            let cascade = self.next_layout_index % 6;
+            self.next_layout_index = self.next_layout_index.saturating_add(1);
+            (
+                usable.x + CASCADE_ORIGIN + cascade as f32 * CASCADE_STEP,
+                usable.y + CASCADE_ORIGIN + cascade as f32 * CASCADE_STEP,
+            )
+        };
         if server_side {
             x = x.max(usable.x + extents.left);
             y = y.max(usable.y + extents.top);
@@ -761,6 +883,21 @@ impl WaylandState {
         }
     }
 
+    /// Whether the seat's keyboard focus currently resolves to this X11
+    /// window. X11 targets are compared by window id — not through
+    /// `X11Surface::wl_surface()` — so the answer does not depend on how far
+    /// Smithay's own teardown for the window has progressed when the
+    /// callback runs (it clears `wl_surface` only after `unmapped_window`
+    /// returns, and never before `destroyed_window`; neither ordering is
+    /// load-bearing here).
+    fn x11_window_holds_keyboard_focus(&self, xid: X11Window, wl_surface: &WlSurface) -> bool {
+        match self.keyboard.current_focus() {
+            Some(SeatFocusTarget::X11(surface)) => surface.window_id() == xid,
+            Some(SeatFocusTarget::Wayland(focused)) => focused == *wl_surface,
+            None => false,
+        }
+    }
+
     /// X11 (`_NET_WM_MOVERESIZE`) requests carry a pressed button, not a
     /// Wayland serial: validate that the pointer currently holds an implicit
     /// grab whose focus resolves to this window's surface tree.
@@ -790,7 +927,12 @@ impl XWaylandShellHandler for WaylandState {
         &mut self.xwayland_shell_state
     }
 
-    fn surface_associated(&mut self, _xwm: XwmId, wl_surface: WlSurface, surface: X11Surface) {
+    fn surface_associated(&mut self, xwm: XwmId, wl_surface: WlSurface, surface: X11Surface) {
+        // Same liveness gate as the XwmHandler delegates: an association for
+        // a torn-down generation must not mint a fresh scene record.
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_associate_window(wl_surface, surface);
     }
 }
@@ -809,9 +951,19 @@ impl WaylandState {
             return;
         }
         let pending = self.xwayland.pending_windows.remove(&xid);
-        let mut phase = pending
-            .as_ref()
-            .map(|entry| entry.phase)
+        // Re-association: the same wl_surface can be associated again (either
+        // callback can repeat). The map grant belongs to the XID, so carry
+        // the phase over from the existing record when it is this window's —
+        // taking it from `pending_windows` alone would silently revoke a
+        // granted map the client will never re-request.
+        let existing_phase = self.surfaces.get(&wl_surface.id()).and_then(|record| {
+            let SurfaceRole::X11(role) = &record.role else {
+                return None;
+            };
+            (role.xid == xid).then_some(role.phase)
+        });
+        let mut phase = existing_phase
+            .or_else(|| pending.as_ref().map(|entry| entry.phase))
             .unwrap_or_default();
         phase.on_associated();
         let granted = pending.and_then(|entry| entry.granted_geometry);
@@ -848,6 +1000,11 @@ impl WaylandState {
         self.mark_surface_unmapped(&wl_surface);
         let id = if let Some(record) = self.surfaces.get_mut(&object) {
             let id = record.id;
+            // Re-associating a presented record withdraws it: tell the
+            // renderer, or it keeps an entity the protocol thinks is gone.
+            if record.mapped {
+                self.events.push(ProtocolEvent::SurfaceUnmapped { id });
+            }
             record.role = role;
             record.mapped = false;
             record.layout = layout;
@@ -984,10 +1141,9 @@ impl WaylandState {
         if let Err(error) = window.configure(Some(geometry)) {
             tracing::warn!(xid, %error, "failed to grant initial X11 geometry");
         }
-        if let Err(error) = window.set_mapped(true) {
-            tracing::warn!(xid, %error, "failed to grant X11 map");
-            return;
-        }
+        // The grant is recorded BEFORE the fallible `set_mapped`: the client
+        // sent its one MapRequest and will not resend it, so a transient X
+        // failure below must not leave the window permanently ineligible.
         if !self.xwayland.surfaces_by_xid.contains_key(&xid) {
             // Not associated yet: record the grant so association starts
             // eligible (either callback order is legal).
@@ -1008,6 +1164,10 @@ impl WaylandState {
                 .unwrap_or_default();
             record.layout.x = record.window_origin.0 - offset.0;
             record.layout.y = record.window_origin.1 - offset.1;
+        }
+        if let Err(error) = window.set_mapped(true) {
+            tracing::warn!(xid, %error, "failed to grant X11 map");
+            return;
         }
         self.refresh_x11_decoration(xid);
         self.make_x11_record_presentable(xid);
@@ -1072,6 +1232,7 @@ impl WaylandState {
         };
         // Keep the association and retained backing for an idempotent remap;
         // clear focus, grabs and the foreign handle like a Wayland unmap.
+        let held_focus = self.x11_window_holds_keyboard_focus(xid, &wl_surface);
         #[cfg(feature = "bus")]
         self.mark_surface_unmapped(&wl_surface);
         self.close_foreign_toplevel(&wl_surface);
@@ -1088,7 +1249,16 @@ impl WaylandState {
         if was_mapped {
             self.events.push(ProtocolEvent::SurfaceUnmapped { id });
         }
-        self.arbitrate_keyboard_focus(None, true, false);
+        // Fall back only when this window actually held the keyboard: an
+        // unconditional fallback stole focus from unrelated surfaces (an
+        // OnDemand layer panel, an idle focus) and its `unset_grab` path
+        // dismissed open Wayland popups whenever any background X11 window
+        // unmapped. The gated call also guarantees the move-away for the
+        // held case even if `clear_focus_for_surface`'s target resolution
+        // ever fails, since the gate compares window ids.
+        if held_focus {
+            self.arbitrate_keyboard_focus(None, true, false);
+        }
         self.refresh_chrome_pointer_after_scene_change();
         tracing::debug!(xid, surface_id = id.0, "X11 window unmapped");
     }
@@ -1108,10 +1278,15 @@ impl WaylandState {
         else {
             return;
         };
+        let held_focus = self.x11_window_holds_keyboard_focus(xid, &wl_surface);
         // Existing destruction path: exactly once; the later wl_surface
         // destroy is a no-op for the absent record.
         self.destroy_surface_record(&wl_surface);
-        self.arbitrate_keyboard_focus(None, true, false);
+        // Same gate as `x11_unmapped_window`: the fallback re-focus runs only
+        // for a window that held the keyboard.
+        if held_focus {
+            self.arbitrate_keyboard_focus(None, true, false);
+        }
         self.refresh_chrome_pointer_after_scene_change();
         tracing::debug!(xid, "X11 window destroyed");
     }
@@ -1120,8 +1295,8 @@ impl WaylandState {
     pub(super) fn x11_configure_request(
         &mut self,
         window: X11Surface,
-        _x: Option<i32>,
-        _y: Option<i32>,
+        x: Option<i32>,
+        y: Option<i32>,
         w: Option<u32>,
         h: Option<u32>,
         reorder: Option<Reorder>,
@@ -1130,8 +1305,10 @@ impl WaylandState {
         if window.is_override_redirect() {
             return;
         }
-        // Position policy: client x/y is ignored once the compositor has
-        // placed the window (initial placement is the cascade).
+        // Position policy: an explicit client x/y is honoured only BEFORE
+        // first placement (a pre-map ConfigureRequest is how an X client
+        // states where it wants to appear); once the compositor has placed
+        // the window, client x/y is ignored.
         let current = self
             .xwayland
             .surfaces_by_xid
@@ -1153,6 +1330,20 @@ impl WaylandState {
             });
         let base = current.unwrap_or_else(|| window.geometry());
         let usable = self.usable_output_rect();
+        let origin = if current.is_none() && (x.is_some() || y.is_some()) {
+            let requested = (x.unwrap_or(base.loc.x), y.unwrap_or(base.loc.y));
+            let inside = (requested.0 as f32) >= usable.x
+                && (requested.1 as f32) >= usable.y
+                && (requested.0 as f32) < usable.x + usable.width
+                && (requested.1 as f32) < usable.y + usable.height;
+            if inside {
+                requested.into()
+            } else {
+                base.loc
+            }
+        } else {
+            base.loc
+        };
         let usable_size = (usable.width.max(1.0) as i32, usable.height.max(1.0) as i32);
         let requested = (
             w.map_or(base.size.w, |w| w.min(i32::MAX as u32) as i32),
@@ -1165,7 +1356,7 @@ impl WaylandState {
             (base.size.w.max(1), base.size.h.max(1)),
             usable_size,
         );
-        let granted = Rectangle::new(base.loc, size.into());
+        let granted = Rectangle::new(origin, size.into());
         let changed = Some(granted) != current;
         let result = if changed {
             window.configure(Some(granted))
@@ -1424,52 +1615,101 @@ impl WaylandState {
     }
 }
 
+impl WaylandState {
+    /// Whether an XWM callback belongs to the live generation. Buffered
+    /// events from a draining (torn-down) wm still arrive until its channel
+    /// delivers `Closed`; acting on them would repopulate the maps the
+    /// teardown just cleared, so the delegates below drop them.
+    fn xwm_event_is_live(&self, xwm: XwmId) -> bool {
+        matches!(
+            &self.xwayland.lifecycle,
+            XwaylandLifecycle::Ready { wm, .. } if wm.id() == xwm
+        )
+    }
+}
+
 /// Thin delegation: every callback body lives in the inherent `x11_*`
 /// methods above so the deterministic tests can drive it without a live
-/// `XwmId`.
+/// `XwmId`. Every delegate (except `xwm_state`/`disconnected`, which manage
+/// the drain) is gated on the callback's generation being the live one.
 impl XwmHandler for WaylandState {
     fn xwm_state(&mut self, xwm: XwmId) -> &mut X11Wm {
-        match &mut self.xwayland.lifecycle {
-            XwaylandLifecycle::Ready { wm, .. } if wm.id() == xwm => wm,
-            _ => unreachable!(
-                "XWM callback for a generation that is not live; \
-                 the X11 event source must be torn down with its generation"
-            ),
+        if self.xwm_event_is_live(xwm) {
+            match &mut self.xwayland.lifecycle {
+                XwaylandLifecycle::Ready { wm, .. } => wm,
+                _ => unreachable!("xwm_event_is_live guarantees Ready"),
+            }
+        } else {
+            // Unreachable-by-construction fallback: every wm ever started is
+            // either live or draining until its channel's final `Closed`
+            // event, and the commit-hook route dies with the generation's
+            // killed client.
+            self.xwayland
+                .draining_wms
+                .iter_mut()
+                .find(|wm| wm.id() == xwm)
+                .unwrap_or_else(|| {
+                    unreachable!(
+                        "XWM callback for a generation that is neither live nor draining; \
+                         a wm was dropped before its X11 event source delivered Closed"
+                    )
+                })
         }
     }
 
-    fn new_window(&mut self, _xwm: XwmId, window: X11Surface) {
+    fn new_window(&mut self, xwm: XwmId, window: X11Surface) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_new_window(window);
     }
 
-    fn new_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+    fn new_override_redirect_window(&mut self, xwm: XwmId, window: X11Surface) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_new_override_redirect_window(window);
     }
 
-    fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
+    fn map_window_request(&mut self, xwm: XwmId, window: X11Surface) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_map_window_request(window);
     }
 
-    fn map_window_notify(&mut self, _xwm: XwmId, window: X11Surface) {
+    fn map_window_notify(&mut self, xwm: XwmId, window: X11Surface) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_map_window_notify(window);
     }
 
-    fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+    fn mapped_override_redirect_window(&mut self, xwm: XwmId, window: X11Surface) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_mapped_override_redirect_window(window);
     }
 
-    fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
+    fn unmapped_window(&mut self, xwm: XwmId, window: X11Surface) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_unmapped_window(window);
     }
 
-    fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+    fn destroyed_window(&mut self, xwm: XwmId, window: X11Surface) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_destroyed_window(window);
     }
 
     #[allow(clippy::too_many_arguments)]
     fn configure_request(
         &mut self,
-        _xwm: XwmId,
+        xwm: XwmId,
         window: X11Surface,
         x: Option<i32>,
         y: Option<i32>,
@@ -1477,100 +1717,168 @@ impl XwmHandler for WaylandState {
         h: Option<u32>,
         reorder: Option<Reorder>,
     ) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_configure_request(window, x, y, w, h, reorder);
     }
 
     fn configure_notify(
         &mut self,
-        _xwm: XwmId,
+        xwm: XwmId,
         window: X11Surface,
         geometry: Rectangle<i32, Logical>,
         above: Option<X11Window>,
     ) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_configure_notify(window, geometry, above);
     }
 
-    fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
+    fn property_notify(&mut self, xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_property_notify(window, property);
     }
 
-    fn maximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+    fn maximize_request(&mut self, xwm: XwmId, window: X11Surface) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.request_x11_maximized(&window, true);
     }
 
-    fn unmaximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+    fn unmaximize_request(&mut self, xwm: XwmId, window: X11Surface) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.request_x11_maximized(&window, false);
     }
 
-    fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+    fn fullscreen_request(&mut self, xwm: XwmId, window: X11Surface) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.request_x11_fullscreen(&window, true);
     }
 
-    fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+    fn unfullscreen_request(&mut self, xwm: XwmId, window: X11Surface) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.request_x11_fullscreen(&window, false);
     }
 
-    fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+    fn minimize_request(&mut self, xwm: XwmId, window: X11Surface) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_minimize_request(window);
     }
 
-    fn unminimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+    fn unminimize_request(&mut self, xwm: XwmId, window: X11Surface) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_unminimize_request(window);
     }
 
     fn resize_request(
         &mut self,
-        _xwm: XwmId,
+        xwm: XwmId,
         window: X11Surface,
         button: u32,
         resize_edge: X11ResizeEdge,
     ) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_resize_request(window, button, resize_edge);
     }
 
-    fn move_request(&mut self, _xwm: XwmId, window: X11Surface, button: u32) {
+    fn move_request(&mut self, xwm: XwmId, window: X11Surface, button: u32) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_move_request(window, button);
     }
 
-    fn allow_selection_access(&mut self, _xwm: XwmId, selection: SelectionTarget) -> bool {
+    fn allow_selection_access(&mut self, xwm: XwmId, selection: SelectionTarget) -> bool {
+        if !self.xwm_event_is_live(xwm) {
+            return false;
+        }
         self.x11_allow_selection_access(selection)
     }
 
     fn send_selection(
         &mut self,
-        _xwm: XwmId,
+        xwm: XwmId,
         selection: SelectionTarget,
         mime_type: String,
         fd: std::os::fd::OwnedFd,
     ) {
+        if !self.xwm_event_is_live(xwm) {
+            // Stale generation: drop the fd, exactly as the live refusal does.
+            drop(fd);
+            return;
+        }
         self.x11_send_selection(selection, mime_type, fd);
     }
 
-    fn new_selection(&mut self, _xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
+    fn new_selection(&mut self, xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_new_selection(selection, mime_types);
     }
 
-    fn cleared_selection(&mut self, _xwm: XwmId, selection: SelectionTarget) {
+    fn cleared_selection(&mut self, xwm: XwmId, selection: SelectionTarget) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_cleared_selection(selection);
     }
 
-    fn randr_primary_output_change(&mut self, _xwm: XwmId, output_name: Option<String>) {
+    fn randr_primary_output_change(&mut self, xwm: XwmId, output_name: Option<String>) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
         self.x11_randr_primary_output_change(output_name);
     }
 
     fn disconnected(&mut self, xwm: XwmId) {
         let generation = self.xwayland.generation;
-        let live = matches!(
-            &self.xwayland.lifecycle,
-            XwaylandLifecycle::Ready { wm, .. } if wm.id() == xwm
-        );
-        if live {
+        if self.xwm_event_is_live(xwm) {
             self.fail_xwayland_generation(generation, "XWM connection closed");
         }
+        // `Closed` is the channel's final event and the source removes
+        // itself after delivering it, so nothing can ask `xwm_state` for
+        // this id again: the drained wm (pushed by the teardown above, or by
+        // an earlier one) can now be dropped.
+        self.xwayland.draining_wms.retain(|wm| wm.id() != xwm);
     }
 }
 
 impl WaylandState {
+    /// Publish the scene snapshot of a mapped X11 record. Used by the
+    /// maximize/fullscreen state functions when the granted geometry did not
+    /// change at all: `apply_x11_geometry` publishes nothing then, but the
+    /// scene state (SSD maximize glyph, fullscreen flag) still flipped.
+    fn publish_x11_state_relayout(&mut self, xid: X11Window) {
+        let Some(record) = self.x11_role_record_mut(xid) else {
+            return;
+        };
+        if !record.mapped {
+            return;
+        }
+        let id = record.id;
+        let scene = record.scene_snapshot();
+        self.events
+            .push(ProtocolEvent::SurfaceRelayout { id, scene });
+    }
+
     /// X11 maximize/unmaximize: save/restore the normal geometry, configure
     /// the content rectangle immediately (no xdg serial), set the EWMH state.
     pub(super) fn request_x11_maximized(&mut self, window: &X11Surface, maximized: bool) {
@@ -1638,6 +1946,9 @@ impl WaylandState {
                 (size.0.max(1), size.1.max(1)).into(),
             )
         };
+        let geometry_unchanged = record.window_origin
+            == (target.loc.x as f32, target.loc.y as f32)
+            && record.configured_size == (target.size.w.max(1), target.size.h.max(1));
         record.requested_maximized = maximized;
         record.committed_maximized = maximized;
         sync_toplevel_scene_state(record);
@@ -1648,6 +1959,9 @@ impl WaylandState {
             tracing::warn!(xid, %error, "failed to set X11 EWMH maximized state");
         }
         self.apply_x11_geometry(xid, target);
+        if geometry_unchanged {
+            self.publish_x11_state_relayout(xid);
+        }
         tracing::debug!(xid, maximized, "applied X11 maximize state");
     }
 
@@ -1693,6 +2007,9 @@ impl WaylandState {
                 (size.0.max(1), size.1.max(1)).into(),
             )
         };
+        let geometry_unchanged = record.window_origin
+            == (target.loc.x as f32, target.loc.y as f32)
+            && record.configured_size == (target.size.w.max(1), target.size.h.max(1));
         if let Err(error) = window.configure(Some(target)) {
             tracing::warn!(xid, %error, "failed to configure X11 fullscreen geometry");
         }
@@ -1700,6 +2017,9 @@ impl WaylandState {
             tracing::warn!(xid, %error, "failed to set X11 EWMH fullscreen state");
         }
         self.apply_x11_geometry(xid, target);
+        if geometry_unchanged {
+            self.publish_x11_state_relayout(xid);
+        }
         self.refresh_x11_decoration(xid);
         tracing::debug!(xid, fullscreen, "applied X11 fullscreen state");
     }

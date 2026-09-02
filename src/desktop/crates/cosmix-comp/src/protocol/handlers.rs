@@ -1934,9 +1934,11 @@ impl SeatHandler for WaylandState {
             let active = focused_root
                 .as_ref()
                 .is_some_and(|focused| focused == &surface);
-            if let Some(record) = self.surfaces.get_mut(&surface.id())
-                && record.focused != active
-            {
+            let changed = self
+                .surfaces
+                .get(&surface.id())
+                .is_some_and(|record| record.focused != active);
+            if changed && let Some(record) = self.surfaces.get_mut(&surface.id()) {
                 record.focused = active;
                 sync_toplevel_scene_state(record);
                 if record.mapped && record.committed_decoration == SceneDecorationMode::ServerSide {
@@ -1958,10 +1960,15 @@ impl SeatHandler for WaylandState {
                     });
                     let _ = self.send_pending_toplevel_configure(&surface, false);
                 }
-                // X11 activation is EWMH state, not an xdg configure.
+                // X11 activation is EWMH state, not an xdg configure. Gated
+                // on an actual change: `set_activated` is one X round trip,
+                // and issuing it for every X11 window on every focus change
+                // floods the wire with no-ops.
                 #[cfg(feature = "xwayland")]
                 Some(SurfaceRole::X11(role)) => {
-                    if let Err(error) = role.surface.set_activated(active) {
+                    if changed
+                        && let Err(error) = role.surface.set_activated(active)
+                    {
                         tracing::debug!(%error, "failed to set X11 EWMH activated state");
                     }
                 }

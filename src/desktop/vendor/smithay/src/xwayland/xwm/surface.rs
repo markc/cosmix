@@ -322,6 +322,18 @@ impl X11Surface {
         self.state.lock().unwrap().wl_surface = surface;
     }
 
+    /// Set the raw `_MOTIF_WM_HINTS` fields directly, bypassing the X11
+    /// property machinery.
+    ///
+    /// CosMix vendor addition, same contract as [`Self::set_wl_surface_offline`]:
+    /// downstream deterministic compositor tests fabricate offline
+    /// `X11Surface`s and must be able to drive the real
+    /// [`Self::is_decorated`] predicate. Production code must never call
+    /// this; `PropertyNotify` owns the real hints.
+    pub fn set_motif_hints_offline(&self, hints: [u32; 5]) {
+        self.state.lock().unwrap().motif_hints = hints.to_vec();
+    }
+
     /// Returns the associated wl_surface.
     ///
     /// This will only return `Some` once:

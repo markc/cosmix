@@ -11779,6 +11779,24 @@ impl WaylandState {
                         state.states.set(xdg_toplevel::State::Resizing);
                     });
                     let _ = self.send_pending_toplevel_configure(&surface, false);
+                } else {
+                    // The only managed toplevel without an xdg handle is an
+                    // X11 window; anything else here lost its role mid-grab,
+                    // which the old `.expect` used to make loud.
+                    #[cfg(feature = "xwayland")]
+                    let role_accounted_for = self
+                        .surfaces
+                        .get(&object)
+                        .is_some_and(|record| record.role.x11().is_some());
+                    #[cfg(not(feature = "xwayland"))]
+                    let role_accounted_for = false;
+                    if !role_accounted_for {
+                        debug_assert!(false, "captured resize lost its toplevel role");
+                        tracing::error!(
+                            surface_id = surface_id.0,
+                            "captured resize grab on a managed surface with no toplevel role"
+                        );
+                    }
                 }
             }
             ChromePointerGrabKind::Button(caption) => {
