@@ -4,8 +4,14 @@
 
 - Add a generic worker wake callback and explicit directed-command prefixes to
   the Bus bridge. Successful worker delivery now wakes non-winit event loops.
+- The capped per-frame drains (`drain_messages`,
+  `drain_observation_messages`) re-arm that wake when a burst exceeds the
+  frame cap, so the undrained remainder is processed by a real follow-up
+  update instead of waiting for an unrelated event.
 - Expose the generation-filtered service-port drain/reply seam and registered-
-  local caller gate for application-owned substrate services.
+  local caller gate for application-owned substrate services. Invariant: one
+  inbound drain + reply owner per app — the app-port router or one app-owned
+  service system, never both.
 
 ## 0.51.0 — 2026-09-02
 

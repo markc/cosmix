@@ -373,4 +373,58 @@ mod tests {
             );
         }
     }
+
+    /// The other toggle direction: on a MAPPED panel the semantic toggle must
+    /// reproduce a direct Hide, not a second Reveal.
+    #[test]
+    fn semantic_toggle_on_a_mapped_panel_reproduces_direct_hide() {
+        let mut adapted = app();
+        let mut direct = app();
+        for app in [&mut adapted, &mut direct] {
+            let output = app
+                .world()
+                .resource::<ShellFrameState>()
+                .0
+                .geometry
+                .output
+                .clone();
+            app.world_mut().write_message(ShellCommand {
+                output,
+                at: Duration::ZERO,
+                kind: ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input: crate::core::PanelInput::Reveal,
+                },
+            });
+            app.update();
+        }
+        let frame = adapted.world().resource::<ShellFrameState>().0.clone();
+        assert!(frame.panel(Edge::Left).mapped, "precondition: mapped");
+        let output = frame.geometry.output.clone();
+        adapted.world_mut().write_message(semantic_shell_command(
+            &frame,
+            output.clone(),
+            Duration::ZERO,
+            Edge::Left,
+            ShellSemanticVerb::PanelToggle,
+        ));
+        direct.world_mut().write_message(ShellCommand {
+            output,
+            at: Duration::ZERO,
+            kind: ShellCommandKind::Panel {
+                edge: Edge::Left,
+                input: crate::core::PanelInput::Hide,
+            },
+        });
+        adapted.update();
+        direct.update();
+        assert_eq!(
+            adapted.world().resource::<ShellFrameState>().0,
+            direct.world().resource::<ShellFrameState>().0,
+        );
+        assert_eq!(
+            adapted.world().resource::<ShellEffects>().0,
+            direct.world().resource::<ShellEffects>().0,
+        );
+    }
 }
