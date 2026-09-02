@@ -27944,7 +27944,10 @@ fn xwayland_enabled_prop_round_trips_and_gates_startup() {
     ));
     assert!(!harness.server.state.xwayland.enabled);
 
-    // No-op set publishes nothing.
+    // No-op set publishes nothing — but its reply STILL reports
+    // durability: the persist runs on every admitted set (the retry after
+    // a persisted:false, and making an env-override value durable, are
+    // both no-op-shaped), only the changed event dedups.
     let no_op = ingress
         .request_set("xwayland.enabled".into(), json!(false))
         .expect("no-op set admitted");
@@ -27952,8 +27955,21 @@ fn xwayland_enabled_prop_round_trips_and_gates_startup() {
         .server
         .dispatch_cycle(Some(Duration::ZERO))
         .expect("no-op service cycle");
-    assert_eq!(runtime.block_on(no_op.receive()).unwrap().into_wire().0, 0);
+    let (rc, body) = runtime
+        .block_on(no_op.receive())
+        .expect("no-op reply")
+        .into_wire();
+    assert_eq!(rc, 0);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        json!({"path": "xwayland.enabled", "old": false, "new": false, "persisted": true})
+    );
     assert!(drain_observations(&observations).is_empty());
+    assert_eq!(
+        harness.server.state.x11_persist_attempts, 2,
+        "the persist runs on EVERY admitted set, no-ops included — the retry after \
+         persisted:false and the make-env-durable set are both no-op-shaped"
+    );
 
     // A non-bool is refused by validation.
     let invalid = ingress
@@ -36209,6 +36225,127 @@ mod x11 {
     };
     use smithay::xwayland::{X11Surface, xwm::Atoms};
 
+    /// A hand-installed pointer grab for tests (routed presses cannot hold
+    /// a grab on a fabricated X11 window: the inherent `alive()` requires a
+    /// live conn and smithay discards dead-focus grabs on the next pointer
+    /// operation). The start focus decides which comp arm can match it —
+    /// an X11 target is matchable only by-id, a Wayland surface also by
+    /// resolution.
+    struct TestHeldGrab {
+        start_data: smithay::input::pointer::GrabStartData<WaylandState>,
+    }
+    impl smithay::input::pointer::PointerGrab<WaylandState> for TestHeldGrab {
+        fn motion(
+            &mut self,
+            data: &mut WaylandState,
+            handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+            focus: Option<(SeatFocusTarget, Point<f64, Logical>)>,
+            event: &MotionEvent,
+        ) {
+            handle.motion(data, focus, event);
+        }
+        fn relative_motion(
+            &mut self,
+            data: &mut WaylandState,
+            handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+            focus: Option<(SeatFocusTarget, Point<f64, Logical>)>,
+            event: &smithay::input::pointer::RelativeMotionEvent,
+        ) {
+            handle.relative_motion(data, focus, event);
+        }
+        fn button(
+            &mut self,
+            data: &mut WaylandState,
+            handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+            event: &ButtonEvent,
+        ) {
+            handle.button(data, event);
+        }
+        fn axis(
+            &mut self,
+            data: &mut WaylandState,
+            handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+            details: smithay::input::pointer::AxisFrame,
+        ) {
+            handle.axis(data, details);
+        }
+        fn frame(
+            &mut self,
+            data: &mut WaylandState,
+            handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+        ) {
+            handle.frame(data);
+        }
+        fn gesture_swipe_begin(
+            &mut self,
+            data: &mut WaylandState,
+            handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+            event: &smithay::input::pointer::GestureSwipeBeginEvent,
+        ) {
+            handle.gesture_swipe_begin(data, event);
+        }
+        fn gesture_swipe_update(
+            &mut self,
+            data: &mut WaylandState,
+            handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+            event: &smithay::input::pointer::GestureSwipeUpdateEvent,
+        ) {
+            handle.gesture_swipe_update(data, event);
+        }
+        fn gesture_swipe_end(
+            &mut self,
+            data: &mut WaylandState,
+            handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+            event: &smithay::input::pointer::GestureSwipeEndEvent,
+        ) {
+            handle.gesture_swipe_end(data, event);
+        }
+        fn gesture_pinch_begin(
+            &mut self,
+            data: &mut WaylandState,
+            handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+            event: &smithay::input::pointer::GesturePinchBeginEvent,
+        ) {
+            handle.gesture_pinch_begin(data, event);
+        }
+        fn gesture_pinch_update(
+            &mut self,
+            data: &mut WaylandState,
+            handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+            event: &smithay::input::pointer::GesturePinchUpdateEvent,
+        ) {
+            handle.gesture_pinch_update(data, event);
+        }
+        fn gesture_pinch_end(
+            &mut self,
+            data: &mut WaylandState,
+            handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+            event: &smithay::input::pointer::GesturePinchEndEvent,
+        ) {
+            handle.gesture_pinch_end(data, event);
+        }
+        fn gesture_hold_begin(
+            &mut self,
+            data: &mut WaylandState,
+            handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+            event: &smithay::input::pointer::GestureHoldBeginEvent,
+        ) {
+            handle.gesture_hold_begin(data, event);
+        }
+        fn gesture_hold_end(
+            &mut self,
+            data: &mut WaylandState,
+            handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+            event: &smithay::input::pointer::GestureHoldEndEvent,
+        ) {
+            handle.gesture_hold_end(data, event);
+        }
+        fn start_data(&self) -> &smithay::input::pointer::GrabStartData<WaylandState> {
+            &self.start_data
+        }
+        fn unset(&mut self, _data: &mut WaylandState) {}
+    }
+
     fn fake_atoms() -> Atoms {
         let mut next = 0;
         let mut atom = move || {
@@ -36849,8 +36986,47 @@ mod x11 {
         harness.server.state.request_x11_fullscreen(&window, true);
         harness.server.state.x11_minimize_request(window.clone());
         harness.server.state.x11_unminimize_request(window.clone());
+        // The next two lines are DOCUMENTATION, not coverage: the
+        // decoration refusal is unobservable here (an OR record is born
+        // ClientSide, so "unchanged" cannot distinguish refused from
+        // re-derived), and sync_xwm_stacking has no side effect without a
+        // live wm. They stay to record that the paths were considered.
         harness.server.state.refresh_x11_decoration(48);
         harness.server.state.sync_xwm_stacking();
+        // Per-site refusals #5/#4: interactive move/resize on an OR window
+        // must not arm the interactive pointer — the vendor dispatches
+        // _NET_WM_MOVERESIZE for OR unfiltered, and a press on a menu
+        // deliberately still forms the pointer grab these handlers check.
+        // A REAL grab is installed (Wayland start focus = the OR surface,
+        // so `x11_pointer_grab_targets` passes) — without it the grab gate
+        // would refuse first and deleting the OR refusal would stay green.
+        let pointer = harness.server.state.pointer.clone();
+        pointer.set_grab(
+            &mut harness.server.state,
+            TestHeldGrab {
+                start_data: smithay::input::pointer::GrabStartData {
+                    focus: Some((
+                        SeatFocusTarget::Wayland(surface.clone()),
+                        (25.0, 25.0).into(),
+                    )),
+                    button: PRIMARY_POINTER_BUTTON,
+                    location: (25.0, 25.0).into(),
+                },
+            },
+            SERIAL_COUNTER.next_serial(),
+            smithay::input::pointer::Focus::Keep,
+        );
+        harness.server.state.x11_move_request(window.clone(), 1);
+        harness.server.state.x11_resize_request(
+            window.clone(),
+            1,
+            smithay::xwayland::xwm::ResizeEdge::BottomRight,
+        );
+        assert!(
+            harness.server.state.interactive_pointer.is_none(),
+            "move/resize requests on an override-redirect window arm nothing, even \
+             with the pointer grab a menu press forms"
+        );
         let record = &harness.server.state.surfaces[&object];
         assert_eq!(
             (
@@ -36925,6 +37101,79 @@ mod x11 {
              X grab needs it"
         );
         route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+        // The STRUCTURAL gate inside arbitration (round-7 fix): ANY caller
+        // requesting focus for an OR surface keeps the current focus — this
+        // is what backstops the touch path (whose device machinery is not
+        // drivable offline) and any future interaction site.
+        harness
+            .server
+            .state
+            .arbitrate_keyboard_focus(Some(or_surface.clone()), false, true);
+        assert!(
+            matches!(
+                harness.server.state.keyboard.current_focus(),
+                Some(SeatFocusTarget::X11(target)) if target.window_id() == 49
+            ),
+            "arbitration itself refuses an OR surface, regardless of caller"
+        );
+    }
+
+    #[test]
+    fn x11_or_to_managed_transition_is_a_destroy_then_birth() {
+        // The mirror of the managed→OR transition (X-2a fix round): a
+        // window born override-redirect that unsets the flag before
+        // mapping (the vendor clears its own flag at MapRequest,
+        // xwm/mod.rs:1527). Without the mirror, the OR-born record sailed
+        // into a limbo the managed accessor refuses forever — never
+        // granted, never a focus candidate, nothing logged.
+        let mut harness = KeybindingHarness::new(true);
+        let (sid_or, or_surface) = roleless_wl_surface(&mut harness);
+        let window = fake_x11_window(51, true, Rectangle::new((40, 40).into(), (60, 20).into()));
+        window.set_wl_surface_offline(Some(or_surface.clone()));
+        harness
+            .server
+            .state
+            .x11_new_override_redirect_window(window.clone());
+        harness
+            .server
+            .state
+            .x11_mapped_override_redirect_window(window.clone());
+        harness
+            .server
+            .state
+            .x11_associate_window(or_surface.clone(), window.clone());
+        commit_dmabuf(&mut harness, sid_or, 32, 24);
+        let or_object = or_surface.id();
+        let or_id = harness.server.state.surfaces[&or_object].id;
+        assert!(
+            !harness.server.state.surfaces[&or_object]
+                .role
+                .managed_toplevel()
+        );
+        // The client unsets the flag and maps normally (what the vendor
+        // does at MapRequest).
+        window.set_override_redirect_offline(false);
+        harness.server.state.x11_map_window_request(window.clone());
+        assert!(
+            !harness.server.state.surfaces.contains_key(&or_object),
+            "the OR record dies when the window enters management"
+        );
+        // The managed birth: fresh association, presents as a managed
+        // toplevel with the full grant machinery.
+        let (sid_m, managed_surface) = roleless_wl_surface(&mut harness);
+        window.set_wl_surface_offline(Some(managed_surface.clone()));
+        harness
+            .server
+            .state
+            .x11_associate_window(managed_surface.clone(), window);
+        commit_dmabuf(&mut harness, sid_m, 32, 24);
+        let record = &harness.server.state.surfaces[&managed_surface.id()];
+        assert!(record.mapped, "the managed rebirth presents");
+        assert_ne!(record.id, or_id, "a birth, not a mutation");
+        assert!(
+            record.role.managed_toplevel(),
+            "and it is a full managed toplevel — grants, focus candidacy, export"
+        );
     }
 
     #[test]
@@ -38369,120 +38618,6 @@ mod x11 {
         // contrast, is matched by the destroy path itself — verified by
         // mutation: with a Wayland start focus, deleting the withdrawal's
         // flag arm leaves this test green; with the X11 target it reds.)
-        struct TestHeldGrab {
-            start_data: smithay::input::pointer::GrabStartData<WaylandState>,
-        }
-        impl smithay::input::pointer::PointerGrab<WaylandState> for TestHeldGrab {
-            fn motion(
-                &mut self,
-                data: &mut WaylandState,
-                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
-                focus: Option<(SeatFocusTarget, Point<f64, Logical>)>,
-                event: &MotionEvent,
-            ) {
-                handle.motion(data, focus, event);
-            }
-            fn relative_motion(
-                &mut self,
-                data: &mut WaylandState,
-                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
-                focus: Option<(SeatFocusTarget, Point<f64, Logical>)>,
-                event: &smithay::input::pointer::RelativeMotionEvent,
-            ) {
-                handle.relative_motion(data, focus, event);
-            }
-            fn button(
-                &mut self,
-                data: &mut WaylandState,
-                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
-                event: &ButtonEvent,
-            ) {
-                handle.button(data, event);
-            }
-            fn axis(
-                &mut self,
-                data: &mut WaylandState,
-                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
-                details: smithay::input::pointer::AxisFrame,
-            ) {
-                handle.axis(data, details);
-            }
-            fn frame(
-                &mut self,
-                data: &mut WaylandState,
-                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
-            ) {
-                handle.frame(data);
-            }
-            fn gesture_swipe_begin(
-                &mut self,
-                data: &mut WaylandState,
-                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
-                event: &smithay::input::pointer::GestureSwipeBeginEvent,
-            ) {
-                handle.gesture_swipe_begin(data, event);
-            }
-            fn gesture_swipe_update(
-                &mut self,
-                data: &mut WaylandState,
-                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
-                event: &smithay::input::pointer::GestureSwipeUpdateEvent,
-            ) {
-                handle.gesture_swipe_update(data, event);
-            }
-            fn gesture_swipe_end(
-                &mut self,
-                data: &mut WaylandState,
-                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
-                event: &smithay::input::pointer::GestureSwipeEndEvent,
-            ) {
-                handle.gesture_swipe_end(data, event);
-            }
-            fn gesture_pinch_begin(
-                &mut self,
-                data: &mut WaylandState,
-                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
-                event: &smithay::input::pointer::GesturePinchBeginEvent,
-            ) {
-                handle.gesture_pinch_begin(data, event);
-            }
-            fn gesture_pinch_update(
-                &mut self,
-                data: &mut WaylandState,
-                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
-                event: &smithay::input::pointer::GesturePinchUpdateEvent,
-            ) {
-                handle.gesture_pinch_update(data, event);
-            }
-            fn gesture_pinch_end(
-                &mut self,
-                data: &mut WaylandState,
-                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
-                event: &smithay::input::pointer::GesturePinchEndEvent,
-            ) {
-                handle.gesture_pinch_end(data, event);
-            }
-            fn gesture_hold_begin(
-                &mut self,
-                data: &mut WaylandState,
-                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
-                event: &smithay::input::pointer::GestureHoldBeginEvent,
-            ) {
-                handle.gesture_hold_begin(data, event);
-            }
-            fn gesture_hold_end(
-                &mut self,
-                data: &mut WaylandState,
-                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
-                event: &smithay::input::pointer::GestureHoldEndEvent,
-            ) {
-                handle.gesture_hold_end(data, event);
-            }
-            fn start_data(&self) -> &smithay::input::pointer::GrabStartData<WaylandState> {
-                &self.start_data
-            }
-            fn unset(&mut self, _data: &mut WaylandState) {}
-        }
         let mut harness = KeybindingHarness::new(true);
         let (sid_a, _surface_a, window, object_a) = associate_normal_window(&mut harness, 84);
         commit_dmabuf(&mut harness, sid_a, 32, 24);

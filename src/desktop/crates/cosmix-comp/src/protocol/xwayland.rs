@@ -238,8 +238,11 @@ pub(super) struct XwaylandRuntime {
     /// XID → associated `wl_surface` object for normal managed windows.
     pub(super) surfaces_by_xid: HashMap<X11Window, ObjectId>,
     pub(super) xids_by_object: HashMap<ObjectId, X11Window>,
-    /// Override-redirect XIDs, recorded for diagnostics/cleanup only.
-    /// Deliberately never managed, mapped, or decorated in X-1.
+    /// DIAGNOSTIC ONLY (demoted, X-2a): XIDs ever seen override-redirect.
+    /// No decision reads this set — the authority is `role.override_redirect`
+    /// on the record — it exists to dedup the once-per-XID birth log and as
+    /// a teardown-scoped trace of which XIDs were OR at any point. Do not
+    /// gate behaviour on it.
     pub(super) override_redirect_windows: HashSet<X11Window>,
     /// XWMs of torn-down generations, kept alive until their X11 event
     /// source delivers calloop's `Closed` (surfaced as `disconnected`).
@@ -337,14 +340,15 @@ impl XwaylandRuntime {
 /// file (`true`/`false`) under the COSMIX etc tree, KEYED PER SOCKET like
 /// the `DISPLAY` descriptor and for the same reason — a nested test
 /// compositor's props write must never change the real seat's next
-/// startup. (The residual: socket names are assigned at bind time, so a
-/// real-seat comp that lands on `wayland-1` because something briefly held
-/// `wayland-0` reads a different file. Rare on a real seat, recoverable by
-/// the env override, and the startup log plus the read-only
-/// `xwayland.persist_path` leaf make the resolved file visible instead of
-/// guessed.) Plain `fs::write`, not the atomic-rename dance: the worst
-/// torn write is an unparseable word, which reads as the default `true` —
-/// recoverable, and the env override can still veto.
+/// startup. (The real residual is the ROOT, not the socket: comp's socket
+/// name is explicit, but `cosmix_path(Etc)` depends on which COSMIX root
+/// this binary resolves — a comp run from a dev worktree and the system
+/// install read different files, and removing the worktree discards the
+/// setting. The startup log plus the read-only `xwayland.persist_path`
+/// leaf make the resolved file visible instead of guessed, and the env
+/// override works regardless.) Plain `fs::write`, not the atomic-rename
+/// dance: the worst torn write is an unparseable word, which reads as the
+/// default `true` — recoverable, and the env override can still veto.
 #[cfg(feature = "bus")]
 pub(super) fn xwayland_enabled_persist_path(socket_name: &str) -> PathBuf {
     cosmix_config::paths::cosmix_path(cosmix_config::paths::CosmixDir::Etc)
@@ -972,9 +976,16 @@ impl WaylandState {
     /// grant-side behaviours (geometry grants, decoration, maximize,
     /// fullscreen, unminimize, state relayout): a site reached through this
     /// accessor cannot forget the OR check, because there is nothing to
-    /// forget. (The refusals that cannot route through an xid lookup —
-    /// `sync_xwm_stacking`'s filter, decoration at association, and the
-    /// press-path focus guard — are per-site, each with its own test.)
+    /// forget. The refusals that cannot route through an xid lookup are
+    /// per-site — the COMPLETE list: (1) `sync_xwm_stacking`'s filter,
+    /// (2) `x11_decoration_mode`'s OR-first arm (pre-record), (3) the
+    /// press-path and (4) touch-path interaction guards (whose focus half
+    /// is additionally backstopped by the structural OR gate inside
+    /// `arbitrate_keyboard_focus`), (5) `x11_resize_request` and (6)
+    /// `x11_move_request` (`is_override_redirect()`-first — the vendor
+    /// dispatches _NET_WM_MOVERESIZE for OR unfiltered and the press grab
+    /// deliberately still forms), plus the two window-flag refusals that
+    /// predate X-2a: `x11_map_window_request` and `x11_configure_request`.
     fn managed_x11_record_mut(&mut self, xid: X11Window) -> Option<&mut SurfaceRecord> {
         self.x11_role_record_mut(xid)
             .filter(|record| record.role.managed_toplevel())
@@ -1808,6 +1819,30 @@ impl WaylandState {
         if window.is_override_redirect() {
             return;
         }
+        // The OR→managed mirror of the managed→OR transition: the vendor
+        // clears its own flag at MapRequest (xwm/mod.rs:1527 — a window
+        // created override-redirect that unset the flag before mapping)
+        // and comp's role flag is written once at association, so without
+        // this a record born OR would sail through here into a limbo the
+        // managed accessor refuses forever — never granted, never SSD,
+        // never a focus candidate, invisible to stacking and foreign
+        // export, nothing logged. Same destroy-then-birth as the other
+        // direction, for the same reason: state must not mutate across the
+        // managed/OR boundary in place.
+        let existing_is_or = self
+            .xwayland
+            .surfaces_by_xid
+            .get(&xid)
+            .and_then(|object| self.surfaces.get(object))
+            .and_then(|record| record.role.x11())
+            .is_some_and(|role| role.override_redirect);
+        if existing_is_or {
+            tracing::info!(
+                xid,
+                "override-redirect X11 window entered management; destroying its OR record"
+            );
+            self.x11_destroyed_window(window.clone());
+        }
         // Idempotent: repeated requests re-grant the same geometry.
         let existing = self
             .xwayland
@@ -2401,6 +2436,16 @@ impl WaylandState {
         _button: u32,
         resize_edge: X11ResizeEdge,
     ) {
+        // Per-site refusal #4 (X-2a): the vendor dispatches
+        // _NET_WM_MOVERESIZE for OR windows unfiltered, and a press on a
+        // menu deliberately still forms the pointer grab this handler
+        // checks — so without this line an interactive resize would place,
+        // clamp AND configure an OR record, violating both X-2a
+        // guarantees on one path (the wire stays legal only because the
+        // vendor refuses configure(Some) for OR — an unenforced reliance).
+        if window.is_override_redirect() {
+            return;
+        }
         if self.chrome_pointer_grab.is_some() || !self.x11_pointer_grab_targets(&window) {
             tracing::debug!(
                 xid = window.window_id(),
@@ -2427,6 +2472,12 @@ impl WaylandState {
     }
 
     pub(super) fn x11_move_request(&mut self, window: X11Surface, _button: u32) {
+        // Per-site refusal #5 (X-2a): same reasoning as the resize refusal
+        // above — an interactive move would drag an OR record off its
+        // client-authoritative rect and fight the next OR ConfigureNotify.
+        if window.is_override_redirect() {
+            return;
+        }
         if self.chrome_pointer_grab.is_some() || !self.x11_pointer_grab_targets(&window) {
             tracing::debug!(
                 xid = window.window_id(),

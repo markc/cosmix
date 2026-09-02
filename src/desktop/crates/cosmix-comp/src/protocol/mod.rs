@@ -2908,6 +2908,8 @@ impl ProtocolServer {
             release_use_record_missing_count: 0,
             #[cfg(all(test, feature = "xwayland"))]
             x11_unmap_pin_flip_count: 0,
+            #[cfg(all(test, feature = "xwayland"))]
+            x11_persist_attempts: 0,
             #[cfg(test)]
             release_use_force_client_missing: false,
             #[cfg(test)]
@@ -5071,8 +5073,20 @@ impl SurfaceRole {
             Self::LockSurface(_) => "lock",
             Self::Subsurface { .. } => "subsurface",
             Self::Dormant(_) => "dormant",
+            // Distinct role strings so the props surface can tell a menu
+            // from an app window (X-2a legibility): both ride the same
+            // record machinery, but an agent reading `surfaces.*` must not
+            // have to guess which behave as toplevels. The `windows.*`
+            // projection filters on "toplevel" and is unaffected either
+            // way (no X11 record has ever appeared there).
             #[cfg(feature = "xwayland")]
-            Self::X11(_) => "x11-toplevel",
+            Self::X11(role) => {
+                if role.override_redirect {
+                    "x11-override-redirect"
+                } else {
+                    "x11-toplevel"
+                }
+            }
         }
     }
 }
@@ -5564,6 +5578,13 @@ struct WaylandState {
     /// unproven-but-legal same-serial residual into a fatal gate red.
     #[cfg(all(test, feature = "xwayland"))]
     x11_unmap_pin_flip_count: usize,
+    /// Times the xwayland.enabled set path reached its persist step. The
+    /// real write is cfg(not(test)), so this counter is what lets the
+    /// suite red if the persist ever moves back inside the changed-value
+    /// dedup — the regression where a retry after persisted:false, or
+    /// making an env-override value durable, silently writes nothing.
+    #[cfg(all(test, feature = "xwayland"))]
+    x11_persist_attempts: usize,
     #[cfg(test)]
     release_use_force_client_missing: bool,
     #[cfg(test)]
@@ -10995,10 +11016,27 @@ impl WaylandState {
         let focus = self.touch_focus_at(x, y);
         if !touch.is_grabbed() {
             let requested = focus.as_ref().map(|(surface, _)| surface.clone());
-            if let Some(surface) = requested.as_ref() {
-                self.raise_for_focus_interaction(surface);
+            // The press-path guard's twin (X-2a MAJOR-1): a tap on an
+            // override-redirect X11 window — a menu item on a touchscreen —
+            // is not a focus interaction and must not raise either. The
+            // structural gate inside `arbitrate_keyboard_focus` backstops
+            // the focus half; this guard exists for the raise and to keep
+            // the two interaction paths symmetrical. The touch itself still
+            // reaches the surface below.
+            #[cfg(feature = "xwayland")]
+            let or_target = requested.as_ref().is_some_and(|surface| {
+                self.surfaces.get(&surface.id()).is_some_and(|record| {
+                    matches!(&record.role, SurfaceRole::X11(role) if role.override_redirect)
+                })
+            });
+            #[cfg(not(feature = "xwayland"))]
+            let or_target = false;
+            if !or_target {
+                if let Some(surface) = requested.as_ref() {
+                    self.raise_for_focus_interaction(surface);
+                }
+                self.arbitrate_keyboard_focus(requested, false, true);
             }
-            self.arbitrate_keyboard_focus(requested, false, true);
         }
         let focus = focus.map(|(surface, origin)| (self.seat_focus_target_for(&surface), origin));
         touch.down(
@@ -12318,6 +12356,27 @@ impl WaylandState {
                     {
                         // A non-interactive layer receives pointer/touch events but
                         // must not disturb whichever surface owns the keyboard.
+                        break 'focus_policy;
+                    }
+                    // The STRUCTURAL override-redirect gate (X-2a): any
+                    // caller requesting focus for an OR X11 surface keeps
+                    // the current focus instead — the X client's grab
+                    // machinery routes keys through wherever wl focus
+                    // already is, and moving it is the breakage. This gate
+                    // is inside arbitration so the invariant is enforced in
+                    // ONE place rather than remembered at every
+                    // interaction site (the press/touch guards remain for
+                    // their raise half); it is deliberately OR-specific,
+                    // not `managed_toplevel()`-wide, because non-managed
+                    // requested surfaces are legitimate here — the
+                    // session-lock branch above requests lock surfaces and
+                    // layer policy has its own arms.
+                    #[cfg(feature = "xwayland")]
+                    Some(surface)
+                        if self.surfaces.get(&surface.id()).is_some_and(|record| {
+                            matches!(&record.role, SurfaceRole::X11(role) if role.override_redirect)
+                        }) =>
+                    {
                         break 'focus_policy;
                     }
                     Some(surface) => self.interaction_focus_root(&surface),

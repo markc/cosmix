@@ -274,16 +274,24 @@ the path.
 combo-box drop-downs — render (X-2a): they get a surface record on the
 ordinary renderer path at their own absolute client coordinates (negative
 origins included; the compositor never places, clamps, configures, grants
-or decorates them), stack in the normal band raised above their
-application like a Wayland popup, and acquire none of the managed
+or decorates them — including for `_NET_WM_MOVERESIZE`, whose interactive
+move/resize is refused for override-redirect windows), stack in the
+normal band and are raised to its top when mapped (not tethered to a
+parent and not kept on top afterwards), and acquire none of the managed
 behaviours — no focus candidacy, no minimise/maximise, no
 foreign-toplevel export. Keyboard focus deliberately never moves to an
-override-redirect window: the X client's own grab machinery routes keys,
-and a click on one changes no focus. Known scope edges: relative sibling
-restacks are ignored, a menu overlapping a layer-shell panel draws under
-the panel, and dismissal is client-owned — a click on a pure-Wayland
-surface is invisible to the X grab and dismissal then depends on the
-client's grab-break handling.
+override-redirect window — focus arbitration itself refuses them, so
+neither a click nor a touchscreen tap on one changes focus: the X
+client's own grab machinery routes keys. In the property tree they appear
+under `surfaces.*` with `role:"x11-override-redirect"` (managed X11
+windows are `"x11-toplevel"`); neither appears in `windows.*`, which
+remains the xdg-toplevel projection. A window that changes its
+override-redirect flag between map cycles transitions by record
+destruction and rebirth in both directions. Known scope edges: relative
+sibling restacks are ignored, a menu overlapping a layer-shell panel
+draws under the panel, and dismissal is client-owned — a click on a
+pure-Wayland surface is invisible to the X grab and dismissal then
+depends on the client's grab-break handling.
 
 **Still not supported, by design:**
 
