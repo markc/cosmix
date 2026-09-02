@@ -36921,6 +36921,56 @@ mod x11 {
     }
 
     #[test]
+    fn x11_trailing_destroy_of_a_replaced_surface_must_not_orphan_the_live_window() {
+        // The full blanking sequence MAJOR-B's guard closes, end to end:
+        // Xwayland replaces a window's wl_surface before the map grant
+        // lands (surface churn around first map), and the OLD surface's
+        // destruction trails in after the hand-over. Pre-guard,
+        // `destroy_surface_record` for the old record unconditionally
+        // evicted `surfaces_by_xid[xid]` — which by then pointed at the LIVE
+        // surface — so the map grant parked itself in `pending_windows`,
+        // the live record's phase never gained `map_requested`, and
+        // `commit_may_map_surface` withheld every buffer forever: a healthy-
+        // looking record that composites nothing.
+        let mut harness = KeybindingHarness::new(true);
+        let window = fake_x11_window(74, false, Rectangle::new((0, 0).into(), (200, 150).into()));
+        harness.server.state.x11_new_window(window.clone());
+        // First wl_surface associates…
+        let (_sid_a, surface_a) = roleless_wl_surface(&mut harness);
+        window.set_wl_surface_offline(Some(surface_a.clone()));
+        harness
+            .server
+            .state
+            .x11_associate_window(surface_a.clone(), window.clone());
+        let object_a = surface_a.id();
+        // …Xwayland replaces it with a fresh one for the same XID…
+        let (sid_b, surface_b) = roleless_wl_surface(&mut harness);
+        window.set_wl_surface_offline(Some(surface_b.clone()));
+        harness
+            .server
+            .state
+            .x11_associate_window(surface_b.clone(), window.clone());
+        let object_b = surface_b.id();
+        // …and the old surface's destruction arrives after the hand-over.
+        harness.server.state.destroy_surface_record(&surface_a);
+        assert!(!harness.server.state.surfaces.contains_key(&object_a));
+        assert_eq!(
+            harness.server.state.xwayland.surfaces_by_xid.get(&74),
+            Some(&object_b),
+            "the trailing destroy must not evict the live surface's mapping"
+        );
+        // The map grant arrives, keyed by XID, and must find the live record.
+        harness.server.state.x11_map_window_request(window.clone());
+        commit_dmabuf(&mut harness, sid_b, 32, 24);
+        let record = &harness.server.state.surfaces[&object_b];
+        assert!(
+            record.mapped,
+            "the live window presents its first buffer; an orphaned XID map \
+             leaves a healthy-looking record that composites nothing"
+        );
+    }
+
+    #[test]
     fn x11_initial_placement_honours_a_requested_origin_inside_the_output() {
         // The `xmessage -center` decision: a client that states where it
         // wants to appear — a creation origin, or explicit x/y in a pre-map
