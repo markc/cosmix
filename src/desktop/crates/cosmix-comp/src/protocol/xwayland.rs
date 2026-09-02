@@ -990,18 +990,43 @@ impl WaylandState {
         };
         if self.keyboard.current_focus() != pending.fallback {
             // A human or another surface made a deliberate focus choice
-            // while the debt was pending (this also covers the fallback
-            // target dying in the interim — the world changed either way).
-            // Yanking the keyboard back now would send keystrokes to the
-            // wrong window, which is worse than the drop the debt repairs.
-            // Expected whenever the user interacts during a swap, so drop
-            // quietly.
+            // while the debt was pending. Yanking the keyboard back now
+            // would send keystrokes to the wrong window, which is worse
+            // than the drop the debt repairs. Expected whenever the user
+            // interacts during a swap, so drop quietly.
+            //
+            // Two adjudications worth being precise about:
+            // - A DYING fallback target also lands here — but not for the
+            //   reason a first read suggests. The working mechanism is the
+            //   vendored `X11Surface` `PartialEq`, which requires BOTH
+            //   sides alive (xwm/surface.rs:100-107), and DestroyNotify
+            //   sets `alive = false` before `destroyed_window` runs — so a
+            //   recorded X11 fallback whose window died can never compare
+            //   equal, and a false pay is impossible. A vendor bump that
+            //   simplifies that `PartialEq` to a plain id comparison would
+            //   silently convert every dying-fallback drop into a pay;
+            //   this comment is the only comp-side record of the
+            //   dependency.
+            // - A POPUP over the fallback: a popup still open at
+            //   consumption reads as different and drops the debt; a popup
+            //   already dismissed restored focus to its parent, and when
+            //   that parent IS the recorded fallback the debt pays.
+            //   Desirable in both directions — the open popup is a live
+            //   interaction, the dismissed one left the world as the
+            //   fallback made it.
             tracing::debug!(
                 xid,
                 "dropped X11 refocus debt; focus moved deliberately while it was pending"
             );
             return;
         }
+        // The pay is BEST-EFFORT: the debt was `take()`n above, and
+        // `arbitrate_keyboard_focus` may still decline (session-lock
+        // filtering, `interaction_focus_root` resolving to nothing). The
+        // debt is gone either way and the keyboard stays put — by design:
+        // a declined arbitration means a policy says this window must not
+        // have the keyboard right now, and a retried debt would be a
+        // standing argument with that policy.
         self.arbitrate_keyboard_focus(Some(surface), false, false);
         tracing::debug!(xid, "returned keyboard focus after X11 surface swap");
     }
@@ -1229,6 +1254,20 @@ impl WaylandState {
                         // else means a deliberate choice was made in the
                         // interim, and the debt is dropped instead of
                         // stealing the keyboard back.
+                        if let Some(previous) = &self.xwayland.refocus
+                            && previous.xid != xid
+                        {
+                            // Single slot by design: a second focused-window
+                            // swap before the first debt resolves discards
+                            // the older debt — at most one window can owe
+                            // the user a refocus, and the newer swap is the
+                            // newer truth. Say so, or the loss is invisible.
+                            tracing::debug!(
+                                previous_xid = previous.xid,
+                                xid,
+                                "second surface swap discards an outstanding focus debt"
+                            );
+                        }
                         self.xwayland.refocus = Some(PendingX11Refocus {
                             xid,
                             fallback: self.keyboard.current_focus(),
@@ -1578,6 +1617,31 @@ impl WaylandState {
 
     pub(super) fn x11_unmapped_window(&mut self, window: X11Surface) {
         let xid = window.window_id();
+        // Twin of the association-time ordering pin: smithay nulls
+        // `state.wl_surface` only AFTER `unmapped_window` returns
+        // (vendored xwm/mod.rs:1715-1719), and this path's
+        // resolution-based teardown — `clear_focus_for_surface`'s pointer
+        // and grab arms in particular — works ONLY because resolution
+        // still succeeds here. A vendor bump that moves that assignment
+        // above the callback would silently stop tearing down a pointer
+        // grab held on the unmapping window (the same defect the surface-
+        // swap path fixed by-id); this assert makes it loud instead. The
+        // record check keeps it honest for windows unmapped before
+        // association, where a `None` resolution is legitimate.
+        debug_assert!(
+            self.xwayland
+                .surfaces_by_xid
+                .get(&xid)
+                .and_then(|object| self.surfaces.get(object))
+                .and_then(|record| record.role.x11())
+                .is_none_or(|role| {
+                    window
+                        .wl_surface()
+                        .is_some_and(|current| current == role.wl_surface)
+                }),
+            "unmapped_window ran after smithay nulled X11Surface::wl_surface(); \
+             the resolution-based grab teardown here is built on the opposite ordering"
+        );
         if self
             .xwayland
             .refocus

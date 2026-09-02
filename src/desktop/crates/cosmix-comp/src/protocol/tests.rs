@@ -37296,6 +37296,16 @@ mod x11 {
         // resized window's rect as "raw hints" whenever Xwayland
         // re-associated between the unmap and the remap, reopening the
         // window in the wrong place. The gate is the sticky `ever_granted`.
+        //
+        // Offline-vs-production honesty: here the grant/hint divergence is
+        // manufactured by the fake window's dangling `Weak` connection
+        // short-circuiting `configure()` (the vendored geometry never
+        // updates); production reaches the same divergence by a different
+        // route — comp writes `granted_geometry` while the vendor's
+        // MANAGED ConfigureNotify branch does not assign `state.geometry`
+        // (only the override-redirect branch does). Same observable shape,
+        // different plumbing; do not read this test as the production
+        // mechanism.
         let mut harness = KeybindingHarness::new(true);
         let (sid_a, _surface_a, window, object_a) = associate_normal_window(&mut harness, 82);
         commit_dmabuf(&mut harness, sid_a, 32, 24);
@@ -37346,6 +37356,251 @@ mod x11 {
             role.granted_geometry, moved,
             "the remap grants the remembered rect, not a fresh placement"
         );
+    }
+
+    #[test]
+    fn x11_surface_swap_pays_the_debt_when_a_real_fallback_is_undisturbed() {
+        // Round 7 MINOR-A: the `Some(X) == Some(X)` arm of the baseline
+        // predicate — the arc the feature exists for. The other two debt
+        // tests bottom out on a `None` half (pay: None == None; drop:
+        // Some != None), so this is the only test in which a debt whose
+        // fallback landed on a REAL window is repaid. It also kills the
+        // surviving mutant: an identity comparison rewritten to match on
+        // `surface_id()` would treat an X11 target with a nulled
+        // `wl_surface()` as equal to an unfocused seat and pay a debt that
+        // must drop — that rewrite fails this test's baseline asserts.
+        let mut harness = KeybindingHarness::new(true);
+        // A real focusable window for the fallback to land on.
+        let initial_serial = test_toplevel_record(&harness)
+            .required_configure
+            .expect("initial toplevel configure")
+            .into();
+        ack_and_map_test_toplevel(&mut harness, initial_serial);
+        let (sid_a, surface_a, window, _object_a) = associate_normal_window(&mut harness, 83);
+        commit_dmabuf(&mut harness, sid_a, 32, 24);
+        harness
+            .server
+            .state
+            .arbitrate_keyboard_focus(Some(surface_a.clone()), false, false);
+        // Swap: the fallback lands on the xdg toplevel and is recorded.
+        let (sid_b, surface_b) = roleless_wl_surface(&mut harness);
+        window.set_wl_surface_offline(Some(surface_b.clone()));
+        harness
+            .server
+            .state
+            .x11_associate_window(surface_b.clone(), window);
+        let current = harness.server.state.keyboard.current_focus();
+        assert!(
+            current.is_some(),
+            "precondition: the fallback landed on a real window"
+        );
+        assert_eq!(
+            harness
+                .server
+                .state
+                .xwayland
+                .refocus
+                .as_ref()
+                .map(|pending| pending.fallback.clone()),
+            Some(current),
+            "precondition: the recorded baseline is that real window"
+        );
+        // Nothing touches focus; the replacement presents; the debt pays.
+        commit_dmabuf(&mut harness, sid_b, 32, 24);
+        assert!(
+            matches!(
+                harness.server.state.keyboard.current_focus(),
+                Some(SeatFocusTarget::X11(target)) if target.window_id() == 83
+            ),
+            "an undisturbed real fallback pays the debt back to the window"
+        );
+        assert!(
+            harness.server.state.xwayland.refocus.is_none(),
+            "the paid debt is consumed"
+        );
+    }
+
+    #[test]
+    fn x11_swap_during_deferred_hit_test_defers_the_grab_teardown() {
+        // Round 7 MINOR-C: the first executable test anywhere in the suite
+        // for `pointer_grab_teardown_deferred`. A grab is held whose start
+        // focus is the X11 window's surface, hit-test reconciliation is
+        // deferred (mid-transaction), and the surface swaps: the withdrawal
+        // must arm the deferred teardown flag rather than unsetting the
+        // grab mid-transaction — and rather than doing NOTHING, which was
+        // the pre-round-6 defect (a dead grab kept routing motion).
+        //
+        // Why a hand-installed grab and not a routed button press: a REAL
+        // implicit grab on a fabricated X11 window is impossible offline —
+        // the inherent `X11Surface::alive()` requires
+        // `conn.strong_count() != 0`, the fake window's connection is a
+        // dangling `Weak`, and smithay discards any grab with a dead start
+        // focus on the very next pointer OPERATION (measured: the ClickGrab
+        // set by a routed press was discarded at the following `frame`).
+        // The hand grab holds the X11 TARGET as start focus — which
+        // survives here because `grab_start_data()` is a plain read with no
+        // liveness discard, and which is the one shape only the
+        // withdrawal's by-id arm can match: the destroy path's own
+        // resolution-based arm reads the target's already-flipped
+        // `wl_surface()` and misses. (A Wayland-surface start focus, by
+        // contrast, is matched by the destroy path itself — verified by
+        // mutation: with a Wayland start focus, deleting the withdrawal's
+        // flag arm leaves this test green; with the X11 target it reds.)
+        struct TestHeldGrab {
+            start_data: smithay::input::pointer::GrabStartData<WaylandState>,
+        }
+        impl smithay::input::pointer::PointerGrab<WaylandState> for TestHeldGrab {
+            fn motion(
+                &mut self,
+                data: &mut WaylandState,
+                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+                focus: Option<(SeatFocusTarget, Point<f64, Logical>)>,
+                event: &MotionEvent,
+            ) {
+                handle.motion(data, focus, event);
+            }
+            fn relative_motion(
+                &mut self,
+                data: &mut WaylandState,
+                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+                focus: Option<(SeatFocusTarget, Point<f64, Logical>)>,
+                event: &smithay::input::pointer::RelativeMotionEvent,
+            ) {
+                handle.relative_motion(data, focus, event);
+            }
+            fn button(
+                &mut self,
+                data: &mut WaylandState,
+                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+                event: &ButtonEvent,
+            ) {
+                handle.button(data, event);
+            }
+            fn axis(
+                &mut self,
+                data: &mut WaylandState,
+                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+                details: smithay::input::pointer::AxisFrame,
+            ) {
+                handle.axis(data, details);
+            }
+            fn frame(
+                &mut self,
+                data: &mut WaylandState,
+                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+            ) {
+                handle.frame(data);
+            }
+            fn gesture_swipe_begin(
+                &mut self,
+                data: &mut WaylandState,
+                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+                event: &smithay::input::pointer::GestureSwipeBeginEvent,
+            ) {
+                handle.gesture_swipe_begin(data, event);
+            }
+            fn gesture_swipe_update(
+                &mut self,
+                data: &mut WaylandState,
+                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+                event: &smithay::input::pointer::GestureSwipeUpdateEvent,
+            ) {
+                handle.gesture_swipe_update(data, event);
+            }
+            fn gesture_swipe_end(
+                &mut self,
+                data: &mut WaylandState,
+                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+                event: &smithay::input::pointer::GestureSwipeEndEvent,
+            ) {
+                handle.gesture_swipe_end(data, event);
+            }
+            fn gesture_pinch_begin(
+                &mut self,
+                data: &mut WaylandState,
+                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+                event: &smithay::input::pointer::GesturePinchBeginEvent,
+            ) {
+                handle.gesture_pinch_begin(data, event);
+            }
+            fn gesture_pinch_update(
+                &mut self,
+                data: &mut WaylandState,
+                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+                event: &smithay::input::pointer::GesturePinchUpdateEvent,
+            ) {
+                handle.gesture_pinch_update(data, event);
+            }
+            fn gesture_pinch_end(
+                &mut self,
+                data: &mut WaylandState,
+                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+                event: &smithay::input::pointer::GesturePinchEndEvent,
+            ) {
+                handle.gesture_pinch_end(data, event);
+            }
+            fn gesture_hold_begin(
+                &mut self,
+                data: &mut WaylandState,
+                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+                event: &smithay::input::pointer::GestureHoldBeginEvent,
+            ) {
+                handle.gesture_hold_begin(data, event);
+            }
+            fn gesture_hold_end(
+                &mut self,
+                data: &mut WaylandState,
+                handle: &mut smithay::input::pointer::PointerInnerHandle<'_, WaylandState>,
+                event: &smithay::input::pointer::GestureHoldEndEvent,
+            ) {
+                handle.gesture_hold_end(data, event);
+            }
+            fn start_data(&self) -> &smithay::input::pointer::GrabStartData<WaylandState> {
+                &self.start_data
+            }
+            fn unset(&mut self, _data: &mut WaylandState) {}
+        }
+        let mut harness = KeybindingHarness::new(true);
+        let (sid_a, _surface_a, window, object_a) = associate_normal_window(&mut harness, 84);
+        commit_dmabuf(&mut harness, sid_a, 32, 24);
+        let record = &harness.server.state.surfaces[&object_a];
+        let (x, y) = (
+            f64::from(record.window_origin.0) + 10.0,
+            f64::from(record.window_origin.1) + 10.0,
+        );
+        let pointer = harness.server.state.pointer.clone();
+        pointer.set_grab(
+            &mut harness.server.state,
+            TestHeldGrab {
+                start_data: smithay::input::pointer::GrabStartData {
+                    focus: Some((SeatFocusTarget::X11(window.clone()), (x, y).into())),
+                    button: PRIMARY_POINTER_BUTTON,
+                    location: (x, y).into(),
+                },
+            },
+            SERIAL_COUNTER.next_serial(),
+            smithay::input::pointer::Focus::Keep,
+        );
+        assert!(
+            harness.server.state.pointer.is_grabbed(),
+            "precondition: a grab is held with the X11 window's surface as start focus"
+        );
+        assert!(
+            !harness.server.state.pointer_grab_teardown_deferred,
+            "precondition: no teardown pending yet"
+        );
+        harness.server.state.pointer_hit_test_transaction_applying = true;
+        let (_sid_b, surface_b) = roleless_wl_surface(&mut harness);
+        window.set_wl_surface_offline(Some(surface_b.clone()));
+        harness
+            .server
+            .state
+            .x11_associate_window(surface_b.clone(), window);
+        assert!(
+            harness.server.state.pointer_grab_teardown_deferred,
+            "a swap under a deferred hit-test arms the grab teardown for the reconciler"
+        );
+        harness.server.state.pointer_hit_test_transaction_applying = false;
     }
 
     #[test]
