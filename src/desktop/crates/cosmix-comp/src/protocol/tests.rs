@@ -35745,18 +35745,51 @@ fn vendored_xwm_serial_recorded_before_unpaired_insert() {
         .unwrap_or_else(|error| panic!("vendored xwm/mod.rs unreadable at {path:?}: {error}"));
     let serial_write = "guard.wl_surface_serial = Some(serial)";
     let unpaired_insert = "unpaired_surfaces.insert";
+    let guard_lock = "let mut guard = surface_state.lock().unwrap();";
+    let paired_branch = "if let Some(wl_surface) =";
     assert_eq!(
         source.matches(serial_write).count(),
         1,
-        "the serial-write needle must stay unique for the ordering assert to mean anything"
+        "the serial-write needle must stay unique for the ordering asserts to mean anything"
     );
     assert_eq!(
         source.matches(unpaired_insert).count(),
         1,
         "needle uniqueness"
     );
+    assert_eq!(source.matches(guard_lock).count(), 1, "needle uniqueness");
+    assert_eq!(
+        source.matches(paired_branch).count(),
+        1,
+        "needle uniqueness"
+    );
+    // The premise is DOMINANCE, not byte precedence: the write must be
+    // unconditional, so BOTH pairing arms carry the new serial. Byte
+    // precedence alone waves through two plausible bumps — the write moved
+    // into the paired arm (still before the unpaired insert), and the write
+    // wrapped in an `if` at its current offset. So: the write precedes the
+    // branch opener itself, and no block opens between taking the guard
+    // lock and the write.
+    let write_at = source.find(serial_write).unwrap();
     assert!(
-        source.find(serial_write).unwrap() < source.find(unpaired_insert).unwrap(),
+        write_at < source.find(paired_branch).unwrap(),
+        "the serial write moved to or below the pairing branch: it is no longer \
+         unconditional, and the unmap pin's classifier premise (both arms record the \
+         serial) is broken"
+    );
+    let lock_at = source.find(guard_lock).unwrap();
+    assert!(
+        lock_at < write_at,
+        "the guard lock no longer precedes the serial write; re-read the pairing block"
+    );
+    assert!(
+        !source[lock_at + guard_lock.len()..write_at].contains('{'),
+        "a block opens between the guard lock and the serial write: the write is \
+         conditional now, and a re-serial may never be recorded — every legal unpaired \
+         null would then classify as a flip"
+    );
+    assert!(
+        write_at < source.find(unpaired_insert).unwrap(),
         "the vendor must record wl_surface_serial BEFORE the unpaired arm: the unmap \
          ordering pin's classifier reads a changed serial as the legal unpaired window"
     );
@@ -35772,12 +35805,57 @@ fn vendored_xwm_unmap_callback_precedes_the_null() {
     let null = "state.wl_surface = None";
     assert_eq!(source.matches(callback).count(), 1, "needle uniqueness");
     assert_eq!(source.matches(null).count(), 1, "needle uniqueness");
+    // Byte order is not execution order across sites, so pin the TOTAL
+    // populations too: a new null written in the file's other receiver
+    // idiom (`surface.state.lock().unwrap().field = …`, cf. :2282), a
+    // second callback under a different receiver name, or the null hoisted
+    // into a helper defined below its call site would each leave the two
+    // needles above unique and byte-ordered while breaking the ordering in
+    // fact. A population change is not automatically a defect — these fail
+    // so a HUMAN re-verifies the ordering by hand and updates the counts
+    // deliberately.
+    assert_eq!(
+        source.matches("wl_surface = None").count(),
+        2,
+        "the population of wl_surface nulls changed (was: the unmap block and the \
+         unpaired arm); re-verify by hand that the unmap-path null still follows the \
+         unmapped_window callback, then update this count"
+    );
+    assert_eq!(
+        source.matches("unmapped_window(").count(),
+        3,
+        "the population of unmapped_window mentions changed (was: doc comment, trait \
+         declaration, the one dispatch call); re-verify the dispatch ordering by hand, \
+         then update this count"
+    );
     assert!(
         source.find(callback).unwrap() < source.find(null).unwrap(),
         "the vendor must invoke unmapped_window BEFORE nulling state.wl_surface: comp's \
          resolution-based unmap teardown (clear_focus_for_surface's pointer and grab \
          arms) works only on that ordering, and a flipped vendor silently stops tearing \
          down grabs held on unmapping windows"
+    );
+}
+
+/// Routing guard for the source pins above and the fix-8 presence guard:
+/// they read files under `vendor/smithay/`, which means anything only while
+/// the workspace COMPILES that tree. Drop the `[patch.crates-io]` redirect
+/// and cargo resolves registry smithay silently (a mis-versioned patch is a
+/// warning, not an error — vendor/README.md documents exactly that trap)
+/// while every pin keeps green-reading a file that no longer builds.
+#[test]
+fn vendored_smithay_is_the_compiled_smithay() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+    let manifest = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("workspace Cargo.toml unreadable at {path:?}: {error}"));
+    assert!(
+        manifest.contains("[patch.crates-io]"),
+        "the workspace patch table is gone; the source pins read a tree cargo no longer compiles"
+    );
+    assert!(
+        manifest.contains("smithay = { path = \"vendor/smithay\" }"),
+        "smithay is no longer routed to vendor/; the source pins read a tree cargo no \
+         longer compiles"
     );
 }
 
@@ -35898,8 +35976,23 @@ mod x11 {
         harness: &mut KeybindingHarness,
         xid: u32,
     ) -> (u32, WlSurface, X11Surface, ObjectId) {
+        associate_normal_window_with_serial(harness, xid, None)
+    }
+
+    /// `associate_normal_window` with an explicit `WL_SURFACE_SERIAL` set
+    /// before association (production associations always carry one), so
+    /// the unmap ordering pin's serial classifier is drivable with
+    /// production-shaped state.
+    fn associate_normal_window_with_serial(
+        harness: &mut KeybindingHarness,
+        xid: u32,
+        serial: Option<u64>,
+    ) -> (u32, WlSurface, X11Surface, ObjectId) {
         let (surface_id, surface) = roleless_wl_surface(harness);
         let window = fake_x11_window(xid, false, Rectangle::new((0, 0).into(), (200, 150).into()));
+        if serial.is_some() {
+            window.set_wl_surface_serial_offline(serial);
+        }
         window.set_wl_surface_offline(Some(surface.clone()));
         harness.server.state.x11_new_window(window.clone());
         harness.server.state.x11_map_window_request(window.clone());
@@ -37611,16 +37704,8 @@ mod x11 {
         // deleted (or the whole classifier reverted to round 9's
         // unconditional form) with all tests green.
         let mut harness = KeybindingHarness::new(true);
-        let (sid, surface) = roleless_wl_surface(&mut harness);
-        let window = fake_x11_window(88, false, Rectangle::new((0, 0).into(), (200, 150).into()));
-        window.set_wl_surface_serial_offline(Some(41));
-        window.set_wl_surface_offline(Some(surface.clone()));
-        harness.server.state.x11_new_window(window.clone());
-        harness.server.state.x11_map_window_request(window.clone());
-        harness
-            .server
-            .state
-            .x11_associate_window(surface.clone(), window.clone());
+        let (sid, _surface, window, _object) =
+            associate_normal_window_with_serial(&mut harness, 88, Some(41));
         commit_dmabuf(&mut harness, sid, 32, 24);
         // The null lands with the serial UNCHANGED since association.
         window.set_wl_surface_offline(None);
@@ -37639,16 +37724,8 @@ mod x11 {
         // The classifier must NOT count a flip; reverting it to round 9's
         // unconditional error/count reds exactly here.
         let mut harness = KeybindingHarness::new(true);
-        let (sid, surface) = roleless_wl_surface(&mut harness);
-        let window = fake_x11_window(89, false, Rectangle::new((0, 0).into(), (200, 150).into()));
-        window.set_wl_surface_serial_offline(Some(41));
-        window.set_wl_surface_offline(Some(surface.clone()));
-        harness.server.state.x11_new_window(window.clone());
-        harness.server.state.x11_map_window_request(window.clone());
-        harness
-            .server
-            .state
-            .x11_associate_window(surface.clone(), window.clone());
+        let (sid, _surface, window, _object) =
+            associate_normal_window_with_serial(&mut harness, 89, Some(41));
         commit_dmabuf(&mut harness, sid, 32, 24);
         // The vendor records a NEW serial, then nulls pending its commit.
         window.set_wl_surface_serial_offline(Some(42));

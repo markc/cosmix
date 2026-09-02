@@ -137,8 +137,10 @@ It pins its own directory because the bare form is a fail-open: run
 `git log … -- vendor/smithay/` from the repository root and the pathspec matches
 nothing, so it prints **no commits and exits 0** — a reapply list that is empty
 because you were standing in the wrong place looks exactly like a bump with
-nothing to reapply. Measured: 0 from the root, 11 (2026-09-02, after fix 8's
-round) from `src/desktop/`. The `&&` is
+nothing to reapply. Measured: 0 from the root, non-zero from `src/desktop/` —
+the exact count grows with every commit touching `vendor/smithay/` and has
+now gone stale in this sentence three times, so it is deliberately not
+written down: run the command. The `&&` is
 load-bearing for the same reason as everywhere else here; outside a repository
 `rev-parse` fails, and unchained the next command would run with `ROOT` empty.
 
@@ -329,9 +331,19 @@ To move to a new upstream release:
    question — they establish the **behaviours** of fixes 1-7, not the presence
    of any named symbol; a restructured upstream could pass all ten with every
    one of those names gone. Symbol presence is established by reading the
-   source, and nothing automated here checks it — except fix 8, whose guard
-   (`vendored_xwayland_disconnected_stays_idempotent`, in the default suite)
-   is precisely a source read. Worth re-running this command after step 4
+   source, and nothing automated here checks it — except the default suite's
+   source-read guards, of which there are now FOUR, all red on a plain
+   `cargo test -p cosmix-comp` after a bump that breaks what they pin:
+   `vendored_xwayland_disconnected_stays_idempotent` (fix 8's presence),
+   `vendored_xwm_serial_recorded_before_unpaired_insert` and
+   `vendored_xwm_unmap_callback_precedes_the_null` (the two xwm orderings
+   cosmix-comp's unmap teardown and its serial classifier ride — these are
+   the PRIMARY instrument for those orderings; the compositor's runtime
+   `warn!` is only the secondary signal), and
+   `vendored_smithay_is_the_compiled_smithay` (the `[patch.crates-io]`
+   routing every other pin silently depends on). A bump that reds one of
+   the ordering pins needs a human to re-verify the ordering in the new
+   tree, not a mechanical count update. Worth re-running this command after step 4
    as well, since it is cheap and a reapply can go wrong in the other direction.
 
    One more limit, because it is the difference between "verified" and

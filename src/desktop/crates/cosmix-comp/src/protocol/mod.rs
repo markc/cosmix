@@ -4621,11 +4621,12 @@ struct X11ToplevelRole {
     fullscreen: bool,
     /// The vendored `WL_SURFACE_SERIAL` as of association. The unmap
     /// ordering pin compares it against the window's CURRENT serial: the
-    /// vendor bumps the serial before both arms of the pairing branch
-    /// (xwm/mod.rs:2303), so a legal unpaired-serial null carries a NEW
-    /// serial while an ordering flip (the null moved above the callback)
-    /// leaves this one — the discriminator that lets the pin log the flip
-    /// as an error without crying wolf on supported behaviour.
+    /// vendor records the serial before both arms of the pairing branch
+    /// (xwm/mod.rs:2303, pinned by the source-text tests), so a legal
+    /// unpaired-serial null carries a DIFFERENT serial while an ordering
+    /// flip (the null moved above the callback) leaves this one — the
+    /// discriminator that lets the pin `warn!` on the flip without crying
+    /// wolf on supported behaviour.
     wl_surface_serial: Option<u64>,
 }
 
@@ -5540,8 +5541,10 @@ struct WaylandState {
     #[cfg(test)]
     release_use_record_missing_count: usize,
     /// Times the unmap ordering pin classified a mapped, unresolvable
-    /// window as a vendored ordering FLIP (the `error!` branch). Gives the
-    /// pin an offline observation: the log alone is read by nothing.
+    /// window as a vendored ordering FLIP (the `warn!` branch). Gives the
+    /// CLASSIFIER an offline observation: the log alone is read by nothing
+    /// (and the log LEVEL is observed by nothing offline either — the
+    /// nested gate's evidence needle is the level's observer).
     #[cfg(all(test, feature = "xwayland"))]
     x11_unmap_pin_flip_count: usize,
     #[cfg(test)]
