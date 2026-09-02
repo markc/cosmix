@@ -211,7 +211,7 @@ pub(super) struct XwaylandRuntime {
     /// `serial_commit_hook`, dies at teardown itself: the generation's
     /// Wayland client is killed there, and a killed client dispatches no
     /// further requests, buffered ones included.
-    pub(super) draining_wms: Vec<Box<X11Wm>>,
+    pub(super) draining_wms: Vec<X11Wm>,
     pub(super) shutting_down: bool,
 }
 
@@ -316,8 +316,16 @@ pub(super) fn clamp_x11_content_size(
     // Per-axis: a degenerate axis falls back alone — a 1000×1 request keeps
     // its legitimate width and only the height is replaced.
     let requested = (
-        if requested.0 > 1 { requested.0 } else { fallback.0 },
-        if requested.1 > 1 { requested.1 } else { fallback.1 },
+        if requested.0 > 1 {
+            requested.0
+        } else {
+            fallback.0
+        },
+        if requested.1 > 1 {
+            requested.1
+        } else {
+            fallback.1
+        },
     );
     let min = min_hint.unwrap_or((1, 1));
     let max = max_hint.unwrap_or((i32::MAX, i32::MAX));
@@ -611,7 +619,7 @@ impl WaylandState {
                 // delivers `Closed` (see `draining_wms`). Dropping it here
                 // would leave a registered callback that panics in
                 // `xwm_state`.
-                self.xwayland.draining_wms.push(wm);
+                self.xwayland.draining_wms.push(*wm);
                 self.kill_xwayland_client(&client);
             }
             XwaylandLifecycle::RetryArmed { timer } => {
@@ -635,9 +643,7 @@ impl WaylandState {
         // its popup grabs) on every generation death.
         let held_focus = match self.keyboard.current_focus() {
             Some(SeatFocusTarget::X11(_)) => true,
-            Some(SeatFocusTarget::Wayland(focused)) => {
-                surfaces.iter().any(|surface| *surface == focused)
-            }
+            Some(SeatFocusTarget::Wayland(focused)) => surfaces.contains(&focused),
             None => false,
         };
         self.xwayland.pending_windows.clear();
@@ -1336,11 +1342,7 @@ impl WaylandState {
                 && (requested.1 as f32) >= usable.y
                 && (requested.0 as f32) < usable.x + usable.width
                 && (requested.1 as f32) < usable.y + usable.height;
-            if inside {
-                requested.into()
-            } else {
-                base.loc
-            }
+            if inside { requested.into() } else { base.loc }
         } else {
             base.loc
         };
@@ -1946,8 +1948,7 @@ impl WaylandState {
                 (size.0.max(1), size.1.max(1)).into(),
             )
         };
-        let geometry_unchanged = record.window_origin
-            == (target.loc.x as f32, target.loc.y as f32)
+        let geometry_unchanged = record.window_origin == (target.loc.x as f32, target.loc.y as f32)
             && record.configured_size == (target.size.w.max(1), target.size.h.max(1));
         record.requested_maximized = maximized;
         record.committed_maximized = maximized;
@@ -2007,8 +2008,7 @@ impl WaylandState {
                 (size.0.max(1), size.1.max(1)).into(),
             )
         };
-        let geometry_unchanged = record.window_origin
-            == (target.loc.x as f32, target.loc.y as f32)
+        let geometry_unchanged = record.window_origin == (target.loc.x as f32, target.loc.y as f32)
             && record.configured_size == (target.size.w.max(1), target.size.h.max(1));
         if let Err(error) = window.configure(Some(target)) {
             tracing::warn!(xid, %error, "failed to configure X11 fullscreen geometry");

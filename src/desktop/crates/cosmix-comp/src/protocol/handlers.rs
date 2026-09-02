@@ -1966,9 +1966,7 @@ impl SeatHandler for WaylandState {
                 // floods the wire with no-ops.
                 #[cfg(feature = "xwayland")]
                 Some(SurfaceRole::X11(role)) => {
-                    if changed
-                        && let Err(error) = role.surface.set_activated(active)
-                    {
+                    if changed && let Err(error) = role.surface.set_activated(active) {
                         tracing::debug!(%error, "failed to set X11 EWMH activated state");
                     }
                 }

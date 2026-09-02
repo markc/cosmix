@@ -36743,15 +36743,10 @@ mod x11 {
         assert!(!record.mapped, "re-association withdraws presentation");
         let id = record.id;
         assert!(
-            harness
-                .server
-                .state
-                .events
-                .iter()
-                .any(|event| matches!(
-                    event,
-                    ProtocolEvent::SurfaceUnmapped { id: unmapped } if *unmapped == id
-                )),
+            harness.server.state.events.iter().any(|event| matches!(
+                event,
+                ProtocolEvent::SurfaceUnmapped { id: unmapped } if *unmapped == id
+            )),
             "the renderer is told the entity is withdrawn"
         );
         let SurfaceRole::X11(role) = &harness.server.state.surfaces[&object].role else {
