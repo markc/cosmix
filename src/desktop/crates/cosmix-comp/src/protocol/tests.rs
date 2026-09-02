@@ -37360,15 +37360,14 @@ mod x11 {
 
     #[test]
     fn x11_surface_swap_pays_the_debt_when_a_real_fallback_is_undisturbed() {
-        // Round 7 MINOR-A: the `Some(X) == Some(X)` arm of the baseline
-        // predicate — the arc the feature exists for. The other two debt
-        // tests bottom out on a `None` half (pay: None == None; drop:
-        // Some != None), so this is the only test in which a debt whose
-        // fallback landed on a REAL window is repaid. It also kills the
-        // surviving mutant: an identity comparison rewritten to match on
-        // `surface_id()` would treat an X11 target with a nulled
-        // `wl_surface()` as equal to an unfocused seat and pay a debt that
-        // must drop — that rewrite fails this test's baseline asserts.
+        // Round 7 MINOR-A, restated in round 8: the `Some(X) == Some(X)`
+        // arm of the baseline predicate — the arc the feature exists for,
+        // and the FIRST test to reach that arm at all (the other debt
+        // tests bottom out on a `None` half). It does NOT kill the
+        // `surface_id()` mutant — in this scenario the fallback is a live
+        // Wayland toplevel, so identity and surface-id comparison agree;
+        // the mutant's killer is
+        // `x11_surface_swap_debt_drops_when_the_x11_fallback_dies`.
         let mut harness = KeybindingHarness::new(true);
         // A real focusable window for the fallback to land on.
         let initial_serial = test_toplevel_record(&harness)
@@ -37376,6 +37375,7 @@ mod x11 {
             .expect("initial toplevel configure")
             .into();
         ack_and_map_test_toplevel(&mut harness, initial_serial);
+        let toplevel_surface = test_toplevel_record(&harness).role.wl_surface().clone();
         let (sid_a, surface_a, window, _object_a) = associate_normal_window(&mut harness, 83);
         commit_dmabuf(&mut harness, sid_a, 32, 24);
         harness
@@ -37389,10 +37389,13 @@ mod x11 {
             .server
             .state
             .x11_associate_window(surface_b.clone(), window);
-        let current = harness.server.state.keyboard.current_focus();
-        assert!(
-            current.is_some(),
-            "precondition: the fallback landed on a real window"
+        // Independently-derived expectation, not a read-back of the same
+        // state: the fallback must have landed on the xdg toplevel
+        // specifically.
+        assert_eq!(
+            harness.server.state.keyboard.current_focus(),
+            Some(SeatFocusTarget::Wayland(toplevel_surface.clone())),
+            "precondition: the fallback landed on the xdg toplevel"
         );
         assert_eq!(
             harness
@@ -37402,8 +37405,8 @@ mod x11 {
                 .refocus
                 .as_ref()
                 .map(|pending| pending.fallback.clone()),
-            Some(current),
-            "precondition: the recorded baseline is that real window"
+            Some(Some(SeatFocusTarget::Wayland(toplevel_surface))),
+            "precondition: the recorded baseline is the toplevel, independently derived"
         );
         // Nothing touches focus; the replacement presents; the debt pays.
         commit_dmabuf(&mut harness, sid_b, 32, 24);
@@ -37421,14 +37424,118 @@ mod x11 {
     }
 
     #[test]
-    fn x11_swap_during_deferred_hit_test_defers_the_grab_teardown() {
+    fn x11_surface_swap_debt_drops_when_the_x11_fallback_dies() {
+        // Round 8 MAJOR-1: THE mutant killer, and the dying-fallback drop's
+        // missing coverage. The debt's recorded fallback is a second X11
+        // window; focus is then deliberately parked on None and the
+        // fallback's `wl_surface()` is nulled (modelling its death). The
+        // real predicate compares identities: `Some(X11) != None` → drop.
+        // The `surface_id()` mutant resolves the nulled X11 target to
+        // `None` and compares it equal to the unfocused seat → pays a debt
+        // that must drop, yanking focus — which reds this test's final
+        // asserts. (Red-proven by installing exactly that mutant.)
+        let mut harness = KeybindingHarness::new(true);
+        // The fallback window: a second mapped X11 toplevel.
+        let (sid_fb, _surface_fb, fallback_window, _object_fb) =
+            associate_normal_window(&mut harness, 86);
+        commit_dmabuf(&mut harness, sid_fb, 32, 24);
+        // The debt owner, focused.
+        let (sid_a, surface_a, window, _object_a) = associate_normal_window(&mut harness, 85);
+        commit_dmabuf(&mut harness, sid_a, 32, 24);
+        harness
+            .server
+            .state
+            .arbitrate_keyboard_focus(Some(surface_a.clone()), false, false);
+        // Swap arms the debt; the fallback lands on the X11 window 86.
+        let (sid_b, surface_b) = roleless_wl_surface(&mut harness);
+        window.set_wl_surface_offline(Some(surface_b.clone()));
+        harness
+            .server
+            .state
+            .x11_associate_window(surface_b.clone(), window);
+        assert!(
+            matches!(
+                harness
+                    .server
+                    .state
+                    .xwayland
+                    .refocus
+                    .as_ref()
+                    .and_then(|pending| pending.fallback.as_ref()),
+                Some(SeatFocusTarget::X11(target)) if target.window_id() == 86
+            ),
+            "precondition: the recorded fallback is the second X11 window"
+        );
+        // The user parks focus on nothing, and the fallback window dies
+        // (its wl_surface resolution nulled, as the vendor does).
+        harness
+            .server
+            .state
+            .arbitrate_keyboard_focus(None, false, true);
+        fallback_window.set_wl_surface_offline(None);
+        // The replacement presents: identity comparison says Some(X11) !=
+        // None → the debt drops and focus stays where the user put it.
+        commit_dmabuf(&mut harness, sid_b, 32, 24);
+        assert!(
+            harness.server.state.keyboard.current_focus().is_none(),
+            "a dying X11 fallback must not read as an unfocused seat; the debt drops"
+        );
+        assert!(
+            harness.server.state.xwayland.refocus.is_none(),
+            "the dropped debt does not linger"
+        );
+    }
+
+    #[test]
+    fn x11_duplicate_unmap_with_a_nulled_surface_does_not_panic() {
+        // Round 8 BLOCKER-1 regression: a compliant withdraw
+        // (XWithdrawWindow, a GTK/Qt menu closing) delivers TWO unmaps —
+        // real + ICCCM-4.1.4 synthetic — and the vendor dedupes neither
+        // and nulls `state.wl_surface` after the FIRST callback returns,
+        // while comp deliberately keeps the record for the idempotent
+        // remap. Round 7's unmap ordering pin asserted `Some` resolution
+        // unconditionally and panicked every debug build on the duplicate.
+        // The fabricated window cannot null itself, so the test performs
+        // the vendor's null by hand between the two unmaps.
+        let mut harness = KeybindingHarness::new(true);
+        let (sid_a, _surface_a, window, object_a) = associate_normal_window(&mut harness, 87);
+        commit_dmabuf(&mut harness, sid_a, 32, 24);
+        harness.server.state.x11_unmapped_window(window.clone());
+        // What the vendor does after the first callback returns.
+        window.set_wl_surface_offline(None);
+        // The duplicate must be a quiet no-op, not a debug-build panic.
+        harness.server.state.x11_unmapped_window(window);
+        let record = &harness.server.state.surfaces[&object_a];
+        assert!(
+            !record.mapped,
+            "the duplicate unmap leaves the withdrawn record withdrawn"
+        );
+        assert!(
+            harness
+                .server
+                .state
+                .xwayland
+                .surfaces_by_xid
+                .contains_key(&87),
+            "the association survives for the idempotent remap"
+        );
+    }
+
+    #[test]
+    fn x11_swap_during_deferred_hit_test_arms_the_deferred_grab_teardown() {
         // Round 7 MINOR-C: the first executable test anywhere in the suite
         // for `pointer_grab_teardown_deferred`. A grab is held whose start
         // focus is the X11 window's surface, hit-test reconciliation is
         // deferred (mid-transaction), and the surface swaps: the withdrawal
-        // must arm the deferred teardown flag rather than unsetting the
+        // must ARM the deferred teardown flag rather than unsetting the
         // grab mid-transaction — and rather than doing NOTHING, which was
         // the pre-round-6 defect (a dead grab kept routing motion).
+        // Scope honesty: only the ARMING is asserted. The teardown's
+        // eventual consumption by the reconciler is unobservable offline —
+        // the dead-focus grab is discarded by smithay's liveness check on
+        // the next pointer operation regardless, so a post-reconciliation
+        // `!is_grabbed()` would pass with the reconciler's teardown arm
+        // deleted.
         //
         // Why a hand-installed grab and not a routed button press: a REAL
         // implicit grab on a fabricated X11 window is impossible offline —

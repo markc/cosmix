@@ -1009,11 +1009,16 @@ impl WaylandState {
             //   dependency.
             // - A POPUP over the fallback: a popup still open at
             //   consumption reads as different and drops the debt; a popup
-            //   already dismissed restored focus to its parent, and when
-            //   that parent IS the recorded fallback the debt pays.
-            //   Desirable in both directions — the open popup is a live
-            //   interaction, the dismissed one left the world as the
-            //   fallback made it.
+            //   already dismissed restored focus to its parent (the
+            //   vendored keyboard grab's `unset_grab(.., restore_focus:
+            //   true)` replays `pending_focus` — input/keyboard/mod.rs:
+            //   1228-1243, driven by the popup grab machinery in
+            //   desktop/wayland/popup/grab.rs), and when that parent IS
+            //   the recorded fallback the debt pays. Desirable in both
+            //   directions — the open popup is a live interaction, the
+            //   dismissed one left the world as the fallback made it. No
+            //   offline test drives this pair; the citation is the
+            //   verification.
             tracing::debug!(
                 xid,
                 "dropped X11 refocus debt; focus moved deliberately while it was pending"
@@ -1021,8 +1026,9 @@ impl WaylandState {
             return;
         }
         // The pay is BEST-EFFORT: the debt was `take()`n above, and
-        // `arbitrate_keyboard_focus` may still decline (session-lock
-        // filtering, `interaction_focus_root` resolving to nothing). The
+        // `arbitrate_keyboard_focus` may still decline — including
+        // session-lock filtering, an exclusive layer holding the keyboard,
+        // and `interaction_focus_root` resolving to nothing. The
         // debt is gone either way and the keyboard stays put — by design:
         // a declined arbitration means a policy says this window must not
         // have the keyboard right now, and a retried debt would be a
@@ -1254,18 +1260,18 @@ impl WaylandState {
                         // else means a deliberate choice was made in the
                         // interim, and the debt is dropped instead of
                         // stealing the keyboard back.
-                        if let Some(previous) = &self.xwayland.refocus
-                            && previous.xid != xid
-                        {
-                            // Single slot by design: a second focused-window
-                            // swap before the first debt resolves discards
-                            // the older debt — at most one window can owe
-                            // the user a refocus, and the newer swap is the
-                            // newer truth. Say so, or the loss is invisible.
+                        if let Some(previous) = &self.xwayland.refocus {
+                            // Single slot by design: any second arming
+                            // before the first debt resolves discards the
+                            // older debt AND its recorded baseline — at
+                            // most one window can owe the user a refocus,
+                            // and the newer swap is the newer truth. Logged
+                            // for the same-xid overwrite too: the baseline
+                            // it discards is the load-bearing half.
                             tracing::debug!(
                                 previous_xid = previous.xid,
                                 xid,
-                                "second surface swap discards an outstanding focus debt"
+                                "surface swap discards an outstanding focus debt and its baseline"
                             );
                         }
                         self.xwayland.refocus = Some(PendingX11Refocus {
@@ -1284,6 +1290,18 @@ impl WaylandState {
                             self.mark_pointer_hit_test_dirty();
                         } else {
                             if pointer_grab_on_window {
+                                // `unset_grab` (WITH focus restore), unlike
+                                // the reconciler's
+                                // `unset_grab_without_focus_restore` for the
+                                // deferred arm: same policy, two mechanisms,
+                                // deliberately. Here the retarget below runs
+                                // against a CURRENT hit test, so the restore
+                                // is immediately corrected and matches the
+                                // sibling destroy path (`mod.rs`
+                                // `clear_focus_for_surface`); the reconciler
+                                // runs against a hit test it is about to
+                                // rebuild, where a restore would replay a
+                                // stale focus it immediately overwrites.
                                 let pointer = self.pointer.clone();
                                 pointer.unset_grab(
                                     self,
@@ -1625,14 +1643,29 @@ impl WaylandState {
         // still succeeds here. A vendor bump that moves that assignment
         // above the callback would silently stop tearing down a pointer
         // grab held on the unmapping window (the same defect the surface-
-        // swap path fixed by-id); this assert makes it loud instead. The
-        // record check keeps it honest for windows unmapped before
-        // association, where a `None` resolution is legitimate.
+        // swap path fixed by-id); this assert makes it loud instead.
+        //
+        // The `record.mapped` gate is load-bearing, not hygiene: a
+        // compliant withdraw (XWithdrawWindow, a GTK/Qt menu closing)
+        // delivers TWO unmaps — the real UnmapNotify and the ICCCM-4.1.4
+        // synthetic one — and the vendor dedupes neither. After the first,
+        // smithay has nulled `wl_surface` while comp DELIBERATELY keeps
+        // the record and association for the idempotent remap, so on the
+        // duplicate a `None` resolution is the correct, supported state
+        // (`record.mapped` went false at the first unmap). Asserting
+        // `Some` unconditionally here panicked every debug build on any
+        // withdraw. Gating on `mapped` still catches the ordering flip
+        // this pin exists for — a flipped vendor yields `None` on the
+        // FIRST, still-mapped unmap. Accepted limit: the rarer
+        // xwm/mod.rs:2326 unpaired-serial null (mapped record, nulled
+        // surface) is indistinguishable from the flip through
+        // `wl_surface()` alone and is not covered.
         debug_assert!(
             self.xwayland
                 .surfaces_by_xid
                 .get(&xid)
                 .and_then(|object| self.surfaces.get(object))
+                .filter(|record| record.mapped)
                 .and_then(|record| record.role.x11())
                 .is_none_or(|role| {
                     window
