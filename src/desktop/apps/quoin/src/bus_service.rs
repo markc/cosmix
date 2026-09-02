@@ -14,9 +14,13 @@ use ctk::app_control::authorize_local_caller;
 use ctk::bus::{BusBridge, BusBridgeEvent, BusConnectionState, InboundRequest};
 use serde_json::{Value, json};
 
-use crate::power::PowerSync;
+use crate::power::{PowerAction, PowerSync};
 
-const POWER_TOPIC: &str = "power.props.changed";
+/// Bound on replies stashed while the outbound channel is full. Beyond this
+/// the oldest is dropped with a warning — a bounded stash that eventually
+/// answers beats an unbounded one, and both beat silently losing every reply
+/// the moment the channel blinks.
+const MAX_PENDING_REPLIES: usize = 32;
 
 #[derive(Component)]
 pub(crate) struct QuoinPowerText;
@@ -26,6 +30,15 @@ struct ShellBusState {
     power: PowerSync,
     ready_logged: bool,
     next_request_id: u64,
+    /// A snapshot request that could not be queued (outbound channel full).
+    /// Re-issued state-drivenly on a later update — no timer — so a
+    /// transiently full channel cannot dead-end the display in
+    /// "Power unavailable" until an unrelated reconnect.
+    snapshot_retry: Option<u64>,
+    /// Replies that hit a full outbound channel, retried before new inbound
+    /// work. Losing a reply outright would leave the peer hanging until its
+    /// own timeout — worse than answering late.
+    pending_replies: Vec<(InboundRequest, u8, String)>,
 }
 
 impl Default for ShellBusState {
@@ -34,6 +47,8 @@ impl Default for ShellBusState {
             power: PowerSync::default(),
             ready_logged: false,
             next_request_id: 0x51_0000_0000,
+            snapshot_retry: None,
+            pending_replies: Vec::new(),
         }
     }
 }
@@ -55,6 +70,14 @@ fn service_bus(
     mut shell_commands: MessageWriter<ShellCommand>,
     mut power_text: Query<&mut Text, With<QuoinPowerText>>,
 ) {
+    // This system is the app's single inbound drain + reply owner (see
+    // `BusBridge::claim_inbound`); Quoin installs no `AppPortPlugin`.
+    bridge.claim_inbound("quoin shell service");
+
+    if let Some(generation) = state.snapshot_retry.take() {
+        request_power_snapshot(&bridge, &mut state, generation);
+    }
+
     let mut power_changed = false;
     for event in bridge.drain_events() {
         match event {
@@ -71,6 +94,7 @@ fn service_bus(
             }
             BusBridgeEvent::Connection { .. } | BusBridgeEvent::Fatal(_) => {
                 state.power.invalidate();
+                state.snapshot_retry = None;
                 power_changed = true;
             }
             BusBridgeEvent::Reply { request_id, result } => {
@@ -80,6 +104,8 @@ fn service_bus(
                 if let Some(generation) = state.power.generation() {
                     request_power_snapshot(&bridge, &mut state, generation);
                 } else {
+                    // No generation to key a sync on; MAJOR-1 recovery kicks
+                    // in on the next delivered change instead.
                     state.power.invalidate();
                 }
                 power_changed = true;
@@ -90,20 +116,13 @@ fn service_bus(
         }
     }
     for message in bridge.drain_messages() {
-        if message.topic() == Some(POWER_TOPIC)
-            && message
-                .headers
-                .get("gap")
-                .is_some_and(|value| value == "true")
-        {
-            if let Some(generation) = state.power.generation() {
+        match state.power.observe_message(message) {
+            PowerAction::None => {}
+            PowerAction::Changed => power_changed = true,
+            PowerAction::Resync { generation } => {
                 request_power_snapshot(&bridge, &mut state, generation);
-            } else {
-                state.power.invalidate();
+                power_changed = true;
             }
-            power_changed = true;
-        } else {
-            power_changed |= state.power.accept_message(message);
         }
     }
     if power_changed {
@@ -113,18 +132,46 @@ fn service_bus(
         }
     }
 
+    // Retry stashed replies before answering new work so a recovered channel
+    // drains in arrival order.
+    let pending = std::mem::take(&mut state.pending_replies);
+    for (request, rc, body) in pending {
+        stash_or_respond(&bridge, &mut state, request, rc, body);
+    }
+
     for request in bridge.drain_inbound() {
         let (rc, body, command) = dispatch_shell_request(&request, &frame.0, time.elapsed());
         if let Some(command) = command {
             shell_commands.write(command);
         }
-        if let Err(error) = bridge.try_respond(&request, rc, body) {
-            bevy::log::warn!("shell Bus response dropped: {error}");
+        stash_or_respond(&bridge, &mut state, request, rc, body);
+    }
+}
+
+/// Answer, or stash for a state-driven retry when the outbound channel is
+/// full. A dropped reply leaves the peer hanging until its own timeout.
+fn stash_or_respond(
+    bridge: &BusBridge,
+    state: &mut ShellBusState,
+    request: InboundRequest,
+    rc: u8,
+    body: String,
+) {
+    if let Err(error) = bridge.try_respond(&request, rc, body.clone()) {
+        if state.pending_replies.len() >= MAX_PENDING_REPLIES {
+            let (dropped, ..) = state.pending_replies.remove(0);
+            bevy::log::warn!(
+                command = dropped.command.as_str(),
+                "shell Bus reply stash full; dropping oldest pending reply"
+            );
         }
+        bevy::log::warn!("shell Bus response deferred: {error}");
+        state.pending_replies.push((request, rc, body));
     }
 }
 
 fn request_power_snapshot(bridge: &BusBridge, state: &mut ShellBusState, generation: u64) {
+    state.snapshot_retry = None;
     state.next_request_id = state.next_request_id.saturating_add(1);
     let request_id = state.next_request_id;
     state.power.begin(generation, request_id);
@@ -138,7 +185,11 @@ fn request_power_snapshot(bridge: &BusBridge, state: &mut ShellBusState, generat
         )
         .is_err()
     {
-        state.power.invalidate();
+        // Outbound channel full (or worker gone, in which case a Fatal event
+        // clears this). Stay Syncing — rendered honestly as "Power
+        // unavailable" — and re-issue on a later update instead of
+        // dead-ending until an unrelated reconnect.
+        state.snapshot_retry = Some(generation);
     }
 }
 
@@ -162,6 +213,16 @@ fn dispatch_shell_request(
             "verbs":["panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.page.next","panel.page.prev","panel.page.set"]
         }).to_string(), None);
     }
+    // The transport admits `app.*`/`action.*` on every inbound port; this
+    // service does not implement that contract. Answer with the real reason,
+    // not a routing-confusion "unknown shell command".
+    if request.command.starts_with("app.") || request.command.starts_with("action") {
+        return (
+            10,
+            json!({"error":"app and action verbs are not supported by service shell"}).to_string(),
+            None,
+        );
+    }
     if let Some(suffix) = request.command.strip_prefix("shell.props.") {
         let args = parse_args(request);
         let response = cosmix_props_core::bus::dispatch_props(
@@ -176,6 +237,13 @@ fn dispatch_shell_request(
             None,
         );
     }
+    if request.command == "shell.panel.page.set" && argument(request, "id").is_none() {
+        return (
+            10,
+            json!({"error":"page.set requires an id argument"}).to_string(),
+            None,
+        );
+    }
     let Some(verb) = semantic_verb(request) else {
         return (
             10,
@@ -183,6 +251,14 @@ fn dispatch_shell_request(
             None,
         );
     };
+    // The mutation gate. CROSS-COMPONENT TRUST DEPENDENCY: this authorization
+    // is only as strong as noded's guarantee to strip client-supplied
+    // `broker_origin`/identity headers and restamp them from connection
+    // state. If noded ever forwards a client's own header spelling, every
+    // mesh peer gains unauthenticated mutation of the desktop shell, and no
+    // test in this repository can catch it — the invariant lives in noded and
+    // must be enforced (and tested) there. Failure the other way (noded stops
+    // stamping) fails closed here.
     if let Err(error) = authorize_local_caller(request) {
         return (
             10,
@@ -197,7 +273,22 @@ fn dispatch_shell_request(
             None,
         );
     };
-    let command = semantic_shell_command(frame, frame.geometry.output.clone(), at, edge, verb);
+    // Refuse an unknown page id here, against the current frame: the Model
+    // stage silently drops carousel errors, so acking it would report a
+    // mutation that will never happen.
+    if let ShellSemanticVerb::PageSet(ref id) = verb
+        && !frame.panel(edge).page_ids.iter().any(|page| page == id)
+    {
+        return (
+            10,
+            json!({"error":"unknown page id for this edge"}).to_string(),
+            None,
+        );
+    }
+    let command = semantic_shell_command(frame.geometry.output.clone(), at, edge, verb);
+    // `accepted` means validated and enqueued for the Model stage of this
+    // update — an acceptance ack, not an application receipt. Callers needing
+    // the applied state read it back via `shell.props.get`.
     (0, json!({"accepted":true}).to_string(), Some(command))
 }
 
@@ -322,17 +413,28 @@ fn edge_name(edge: Edge) -> &'static str {
 mod tests {
     use super::*;
 
-    #[test]
-    fn read_surface_is_open_but_semantic_verbs_require_local_registration() {
-        let frame = test_frame();
-        let request = |command: &str| InboundRequest {
+    fn request(command: &str) -> InboundRequest {
+        InboundRequest {
             connection_generation: 1,
             from: "peer".to_owned(),
             command: command.to_owned(),
             headers: BTreeMap::new(),
             body: r#"{"edge":"left"}"#.to_owned(),
             reply_id: Some("1".to_owned()),
-        };
+        }
+    }
+
+    fn local(command: &str) -> InboundRequest {
+        let mut request = request(command);
+        request
+            .headers
+            .insert("broker_origin".to_owned(), "local".to_owned());
+        request
+    }
+
+    #[test]
+    fn read_surface_is_open_but_semantic_verbs_require_local_registration() {
+        let frame = test_frame();
         assert_eq!(
             dispatch_shell_request(&request("shell.ping"), &frame, Default::default()).0,
             0
@@ -341,13 +443,34 @@ mod tests {
             dispatch_shell_request(&request("shell.panel.show"), &frame, Default::default()).0,
             10
         );
-        let mut local = request("shell.panel.show");
-        local
-            .headers
-            .insert("broker_origin".to_owned(), "local".to_owned());
         assert_eq!(
-            dispatch_shell_request(&local, &frame, Default::default()).0,
+            dispatch_shell_request(&local("shell.panel.show"), &frame, Default::default()).0,
             0
+        );
+    }
+
+    #[test]
+    fn app_verbs_and_bad_page_arguments_get_precise_errors() {
+        let frame = test_frame();
+        let (rc, body, command) =
+            dispatch_shell_request(&request("app.ping"), &frame, Default::default());
+        assert_eq!(rc, 10);
+        assert!(body.contains("not supported by service shell"), "{body}");
+        assert!(command.is_none());
+
+        let (rc, body, _) =
+            dispatch_shell_request(&local("shell.panel.page.set"), &frame, Default::default());
+        assert_eq!(rc, 10);
+        assert!(body.contains("requires an id"), "{body}");
+
+        let mut set = local("shell.panel.page.set");
+        set.headers.insert("id".to_owned(), "no-such".to_owned());
+        let (rc, body, command) = dispatch_shell_request(&set, &frame, Default::default());
+        assert_eq!(rc, 10);
+        assert!(body.contains("unknown page id"), "{body}");
+        assert!(
+            command.is_none(),
+            "an unacceptable verb must not be enqueued"
         );
     }
 

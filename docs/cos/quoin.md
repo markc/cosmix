@@ -139,8 +139,12 @@ synthetic pointer/corner verb in this slice.
 
 The bottom carousel places `power` immediately after the clock-bearing
 launcher page. It subscribes to `power.props.changed` before reading
-`power.props.get`, snapshots again on reconnect or a delivery gap, and never
-polls. Before an authoritative snapshot it says `Power unavailable`; a host
+`power.props.get`, snapshots again on reconnect, on a delivery gap, on a
+change arriving while it holds no snapshot (a powerd that was down at connect
+recovers on its first publication — no broker reconnect needed), and on a
+stale event sequence while live (a restarted powerd republishes from 1), and
+never polls. Before an authoritative snapshot it says `Power unavailable`; a
+host
 without a battery says `No system battery`; a partial battery reading names
 missing charge or state explicitly; a full reading renders only the supplied
 percentage, state, time, rate and health fields. Missing values are never

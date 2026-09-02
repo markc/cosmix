@@ -464,6 +464,11 @@ pub struct BusBridge {
     /// mixer seam (`mixer` feature). The bridge's own drain methods then
     /// panic instead of silently competing for the shared flume queues.
     telemetry_taken: bool,
+    /// The single declared inbound drain + reply owner (see
+    /// [`Self::claim_inbound`]). `None` until claimed; [`Self::drain_inbound`]
+    /// refuses to run unclaimed so two drainers cannot silently steal each
+    /// other's requests.
+    inbound_claim: Arc<Mutex<Option<&'static str>>>,
 }
 
 impl BusBridge {
@@ -576,6 +581,11 @@ impl BusBridge {
         self.events.try_iter()
     }
 
+    /// CONTRACT: the caller must exhaust the returned iterator in the same
+    /// frame. The capped `take` plus the pre-drain re-arm above assume a full
+    /// drain; a partially consumed iterator leaves messages queued with their
+    /// wakes already spent (they are picked up on the next armed update, but
+    /// the frame-cap accounting is designed around exhaustion).
     pub fn drain_messages(&self) -> impl Iterator<Item = BusMessage> + '_ {
         self.assert_telemetry_owned();
         if self.messages.len() > self.max_messages_per_frame {
@@ -615,19 +625,46 @@ impl BusBridge {
     /// worker anyway, and a stale `set` must not execute against freshly
     /// resynced state.
     ///
-    /// INVARIANT (conventional since this went `pub` for app-owned substrate
-    /// services): each app has exactly ONE inbound drain + reply owner —
-    /// either the [`AppPortPlugin`](crate::app_control) router OR one
-    /// app-owned service system, never both in the same `App`. Two drainers
-    /// steal each other's requests nondeterministically; a registered verb
-    /// handler holds the [`InboundRequest`] (for params/provenance) but must
-    /// never reach the correlation-bearing response path, or it could
-    /// double-answer one id or steal another request's inbound.
+    /// INVARIANT (enforced by [`Self::claim_inbound`], mirroring the
+    /// `telemetry_taken` take-once lease): each app has exactly ONE inbound
+    /// drain + reply owner — either the [`AppPortPlugin`](crate::app_control)
+    /// router OR one app-owned service system, never both in the same `App`.
+    /// Two drainers steal each other's requests nondeterministically; a
+    /// registered verb handler holds the [`InboundRequest`] (for
+    /// params/provenance) but must never reach the correlation-bearing
+    /// response path, or it could double-answer one id or steal another
+    /// request's inbound.
+    ///
+    /// Panics unless the caller has declared itself via
+    /// [`Self::claim_inbound`] first.
     pub fn drain_inbound(&self) -> impl Iterator<Item = InboundRequest> + '_ {
+        assert!(
+            self.inbound_claim.lock().unwrap().is_some(),
+            "drain_inbound without claim_inbound — declare the app's single inbound owner first"
+        );
         let current = self.committed_generation.load(Ordering::Acquire);
         self.inbound
             .try_iter()
             .filter(move |request| request.connection_generation == current)
+    }
+
+    /// Declare the app's single inbound drain + reply owner (idempotent for
+    /// the same owner; call it from the draining system before
+    /// [`Self::drain_inbound`]). A second, differently-named claimant panics
+    /// immediately and deterministically — the alternative is the two systems
+    /// stealing each other's requests nondeterministically at runtime, which
+    /// is strictly worse than failing loudly on the first frame.
+    pub fn claim_inbound(&self, owner: &'static str) {
+        let mut claim = self.inbound_claim.lock().unwrap();
+        match *claim {
+            None => *claim = Some(owner),
+            Some(existing) if existing == owner => {}
+            Some(existing) => panic!(
+                "BusBridge inbound requests are already owned by {existing:?}; \
+                 {owner:?} must not also drain — one inbound owner per app \
+                 (drop AppPortPlugin or the app-owned service system)"
+            ),
+        }
     }
 
     /// Answer a drained [`InboundRequest`]. A fire-and-forget send (no
@@ -794,6 +831,7 @@ pub(crate) fn test_bridge(service_name: &str) -> (BusBridge, TestBusPeer) {
             service_name: service_name.into(),
             shutdown_done: shutdown_done_rx,
             telemetry_taken: false,
+            inbound_claim: Arc::new(Mutex::new(None)),
         },
         TestBusPeer {
             inbound: inbound_tx,
@@ -899,6 +937,7 @@ pub(crate) fn start_bridge(
         service_name: config.service_name.clone(),
         shutdown_done: shutdown_done_rx,
         telemetry_taken: false,
+        inbound_claim: Arc::new(Mutex::new(None)),
     });
 }
 
@@ -2566,6 +2605,7 @@ mod tests {
             service_name: "test-app".into(),
             shutdown_done: shutdown_done_rx,
             telemetry_taken: false,
+            inbound_claim: Arc::new(Mutex::new(None)),
         };
         (bridge, inbound_tx, request_rx, committed_generation)
     }
@@ -2727,6 +2767,7 @@ mod tests {
     #[test]
     fn inbound_drain_filters_stale_and_fenced_epochs() {
         let (bridge, inbound_tx, _request_rx, committed) = test_bridge(2);
+        bridge.claim_inbound("epoch-filter test");
         inbound_tx.send(request(1, "app.controls.set")).unwrap();
         inbound_tx.send(request(2, "app.describe")).unwrap();
         inbound_tx.send(request(1, "app.controls.get")).unwrap();
@@ -2747,6 +2788,32 @@ mod tests {
         // resurrect what was queued across it.
         committed.store(2, Ordering::Release);
         assert_eq!(bridge.drain_inbound().count(), 0);
+    }
+
+    /// The one-inbound-owner invariant is enforced, not conventional: the
+    /// same owner re-claims freely (it claims every frame), a second owner
+    /// panics deterministically, and draining without any claim panics.
+    #[test]
+    fn inbound_lease_is_take_once_per_app() {
+        let (bridge, _inbound_tx, _request_rx, _committed) = test_bridge(2);
+        bridge.claim_inbound("owner-a");
+        bridge.claim_inbound("owner-a");
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                bridge.claim_inbound("owner-b");
+            }))
+            .is_err(),
+            "a second inbound owner must fail loudly, not steal requests"
+        );
+    }
+
+    #[test]
+    fn unclaimed_inbound_drain_refuses_to_run() {
+        let (bridge, _inbound_tx, _request_rx, _committed) = test_bridge(2);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bridge.drain_inbound().count()
+        }))
+        .is_err());
     }
 
     /// Fire-and-forget requests never produce a response; correlated ones
@@ -2878,6 +2945,7 @@ mod tests {
             service_name: "test-app".into(),
             shutdown_done: shutdown_done_rx,
             telemetry_taken: false,
+            inbound_claim: Arc::new(Mutex::new(None)),
         };
         let message = || BusMessage {
             connection_generation: 1,

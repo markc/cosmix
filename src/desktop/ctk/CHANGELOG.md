@@ -9,9 +9,14 @@
   frame cap, so the undrained remainder is processed by a real follow-up
   update instead of waiting for an unrelated event.
 - Expose the generation-filtered service-port drain/reply seam and registered-
-  local caller gate for application-owned substrate services. Invariant: one
-  inbound drain + reply owner per app — the app-port router or one app-owned
-  service system, never both.
+  local caller gate for application-owned substrate services. The one-inbound-
+  owner invariant is enforced, not conventional: drainers declare themselves
+  via `claim_inbound` (the app-port router does so automatically), a second
+  differently-named claimant panics deterministically on its first frame, and
+  an unclaimed `drain_inbound` refuses to run.
+- Build-time guard: enabling `theme` without `platform-wayland`/`platform-x11`
+  now fails in ctk`s build script with the real reason instead of dying inside
+  winit with a "platform not supported" error.
 
 ## 0.51.0 — 2026-09-02
 

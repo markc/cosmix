@@ -454,6 +454,10 @@ fn classify(
 pub(crate) fn route_app_port(world: &mut World) {
     let (app_name, requests) = {
         let bridge = world.resource::<BusBridge>();
+        // The router is the app's single inbound drain + reply owner; an
+        // app-owned service system claiming alongside it panics on frame one
+        // instead of stealing requests nondeterministically.
+        bridge.claim_inbound("AppPortPlugin router");
         (
             bridge.service_name().to_string(),
             bridge.drain_inbound().collect::<Vec<_>>(),
