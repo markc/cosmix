@@ -35973,6 +35973,28 @@ fn vendored_xwm_unmap_callback_precedes_the_null() {
     );
 }
 
+/// The default feature set, asserted. Every "inert on a user's desktop"
+/// claim about an off-by-default capability rests on this one line of
+/// Cargo.toml, and until this guard nothing defended it — a feature
+/// slipping into (or out of) `default` changed what every plain build
+/// ships with no test noticing. A red here means someone changed the
+/// default set: confirm it was deliberate, then update this assert in the
+/// SAME commit, so the diff shows the set and its guard moving together.
+#[test]
+fn cosmix_comp_default_features_are_deliberate() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cosmix-comp Cargo.toml unreadable at {path:?}: {error}"));
+    assert_eq!(
+        manifest
+            .matches("default = [\"bus\", \"frame-capture\"]")
+            .count(),
+        1,
+        "the cosmix-comp default feature set changed; if deliberate, update this assert \
+         in the same commit"
+    );
+}
+
 /// Routing guard for the source pins above and the fix-8 presence guard:
 /// they read files under `vendor/smithay/`, which means anything only while
 /// the workspace COMPILES that tree. TWO orthogonal axes, both asserted:
