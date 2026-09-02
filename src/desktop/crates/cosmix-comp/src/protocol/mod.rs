@@ -104,6 +104,7 @@ use smithay::{
         TouchSlot,
     },
     delegate_cursor_shape, delegate_data_control, delegate_data_device, delegate_dmabuf,
+    delegate_text_input_manager,
     delegate_ext_data_control, delegate_foreign_toplevel_list, delegate_fractional_scale,
     delegate_idle_notify, delegate_output, delegate_pointer_constraints,
     delegate_primary_selection, delegate_relative_pointer, delegate_seat, delegate_session_lock,
@@ -162,6 +163,7 @@ use smithay::{
             with_surface_tree_downward, with_surface_tree_upward,
         },
         cursor_shape::CursorShapeManagerState,
+        text_input::{TextInputManagerState, TextInputSeat},
         dmabuf::{
             DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
             get_dmabuf,
@@ -2821,6 +2823,11 @@ impl ProtocolServer {
         // while flattening every shape to an arrow would have made cursors
         // visibly worse than not offering it at all.
         let cursor_shape_state = CursorShapeManagerState::new::<WaylandState>(&display_handle);
+        // zwp_text_input_v3: how a client tells the compositor where its text
+        // cursor is and receives pre-edit text. Harmless on its own — with no
+        // input method connected a client simply gets no pre-edit and types
+        // exactly as it does today — and it is the half an IME attaches to.
+        let text_input_state = TextInputManagerState::new::<WaylandState>(&display_handle);
         let primary_selection_state = PrimarySelectionState::new::<WaylandState>(&display_handle);
         let wlr_data_control_state = WlrDataControlState::new::<WaylandState, _>(
             &display_handle,
@@ -2958,6 +2965,7 @@ impl ProtocolServer {
             relative_pointer_state,
             pointer_constraints_state,
             cursor_shape_state,
+            text_input_state,
             pending_relative_motion: None,
             primary_selection_state,
             wlr_data_control_state,
@@ -5628,6 +5636,9 @@ struct WaylandState {
     /// Held, never read — same reason as the two above.
     #[allow(dead_code)]
     cursor_shape_state: CursorShapeManagerState,
+    /// Held, never read — same reason as the globals above.
+    #[allow(dead_code)]
+    text_input_state: TextInputManagerState,
     pending_relative_motion: Option<PendingRelativeMotion>,
     primary_selection_state: PrimarySelectionState,
     wlr_data_control_state: WlrDataControlState,

@@ -1917,9 +1917,14 @@ impl SeatHandler for WaylandState {
         let focused_root = focused_surface
             .as_ref()
             .map(|surface| canonical_root_surface(&self.popup_manager, surface));
-        // Data-device focus is withheld from X11 targets in X-1: the
-        // compositor must not imply a clipboard bridge it refuses to provide
-        // (selection access is refused in the XWM).
+        // Data-device focus is still withheld from X11 targets, but the reason
+        // CHANGED with X-2b and the old one ("comp refuses to bridge") is no
+        // longer true. Xwayland is itself a Wayland client, so granting it
+        // data-device focus would give it a second, independent route to the
+        // selection alongside the XWM bridge comp now drives — two mechanisms
+        // racing to own the same clipboard. The bridge serves X pastes through
+        // `request_*_client_selection`, which needs no data-device focus for
+        // Xwayland at all.
         let data_device_client = (!self.session_lock_active())
             .then(|| match focused {
                 Some(SeatFocusTarget::Wayland(surface)) => surface.client(),
@@ -1929,6 +1934,13 @@ impl SeatHandler for WaylandState {
             })
             .flatten();
         set_data_device_focus(&self.display_handle, seat, data_device_client);
+        // Text-input focus is NOT automatic: nothing in Smithay's keyboard
+        // touches `text_input`, so the compositor must drive it or a client's
+        // `zwp_text_input_v3` never learns which surface is focused and an IME
+        // has nothing to attach to. Routed through the same
+        // resolved-focus surface every other consumer here uses, so text input
+        // cannot disagree with keyboard focus about where typing goes.
+        seat.text_input().set_focus(focused_surface.clone());
         let toplevels = self
             .surfaces
             .values()
@@ -2814,3 +2826,5 @@ delegate_relative_pointer!(WaylandState);
 delegate_pointer_constraints!(WaylandState);
 
 delegate_cursor_shape!(WaylandState);
+
+delegate_text_input_manager!(WaylandState);
