@@ -35750,14 +35750,21 @@ fn vendored_xwm_serial_recorded_before_unpaired_insert() {
     assert_eq!(
         source.matches(serial_write).count(),
         1,
-        "the serial-write needle must stay unique for the ordering asserts to mean anything"
+        "the serial-write needle must stay unique for the ordering asserts to mean \
+         anything; note two of these needles are local VARIABLE names, so a cosmetic \
+         rename in a bump reds this without being a defect — re-verify the ordering, \
+         then update the needle"
     );
     assert_eq!(
         source.matches(unpaired_insert).count(),
         1,
         "needle uniqueness"
     );
-    assert_eq!(source.matches(guard_lock).count(), 1, "needle uniqueness");
+    assert_eq!(
+        source.matches(guard_lock).count(),
+        1,
+        "needle uniqueness (a variable rename is not a defect; re-verify, then update)"
+    );
     assert_eq!(
         source.matches(paired_branch).count(),
         1,
@@ -35782,11 +35789,23 @@ fn vendored_xwm_serial_recorded_before_unpaired_insert() {
         lock_at < write_at,
         "the guard lock no longer precedes the serial write; re-read the pairing block"
     );
+    // This is a BRACE scan, honestly labelled: a `{` in this span is
+    // suspect (a block opener — or merely a format-string interpolation
+    // like `trace!("{serial}")`, which reds this spuriously; re-verify and
+    // move the write above it or widen the needle). And brace-free
+    // conditionalisers exist — `#[cfg]` is caught below, `?`/macro wrappers
+    // are not; the scan narrows the hole, it does not close it.
+    let between = &source[lock_at + guard_lock.len()..write_at];
     assert!(
-        !source[lock_at + guard_lock.len()..write_at].contains('{'),
-        "a block opens between the guard lock and the serial write: the write is \
-         conditional now, and a re-serial may never be recorded — every legal unpaired \
-         null would then classify as a flip"
+        !between.contains('{'),
+        "a brace appears between the guard lock and the serial write — a block opener \
+         (the write is conditional now, and every legal unpaired null would classify as \
+         a flip) or an interpolation; re-verify by hand which"
+    );
+    assert!(
+        !between.contains("#["),
+        "an attribute appears between the guard lock and the serial write — a `#[cfg]` \
+         here makes the write conditional per-build; re-verify by hand"
     );
     assert!(
         write_at < source.find(unpaired_insert).unwrap(),
@@ -35807,13 +35826,14 @@ fn vendored_xwm_unmap_callback_precedes_the_null() {
     assert_eq!(source.matches(null).count(), 1, "needle uniqueness");
     // Byte order is not execution order across sites, so pin the TOTAL
     // populations too: a new null written in the file's other receiver
-    // idiom (`surface.state.lock().unwrap().field = …`, cf. :2282), a
-    // second callback under a different receiver name, or the null hoisted
-    // into a helper defined below its call site would each leave the two
-    // needles above unique and byte-ordered while breaking the ordering in
-    // fact. A population change is not automatically a defect — these fail
-    // so a HUMAN re-verifies the ordering by hand and updates the counts
-    // deliberately.
+    // idiom (`surface.state.lock().unwrap().field = …`, cf. :2282) or a
+    // second callback under a different receiver name would each leave the
+    // two needles above unique and byte-ordered while breaking the
+    // ordering in fact. (The third evasion — the null hoisted into a
+    // helper — is caught by the UNIQUENESS asserts going to zero, not by
+    // these.) A population change is not automatically a defect — these
+    // fail so a HUMAN re-verifies the ordering by hand and updates the
+    // counts deliberately.
     assert_eq!(
         source.matches("wl_surface = None").count(),
         2,
@@ -35839,23 +35859,91 @@ fn vendored_xwm_unmap_callback_precedes_the_null() {
 
 /// Routing guard for the source pins above and the fix-8 presence guard:
 /// they read files under `vendor/smithay/`, which means anything only while
-/// the workspace COMPILES that tree. Drop the `[patch.crates-io]` redirect
-/// and cargo resolves registry smithay silently (a mis-versioned patch is a
-/// warning, not an error — vendor/README.md documents exactly that trap)
-/// while every pin keeps green-reading a file that no longer builds.
+/// the workspace COMPILES that tree. The guard asserts the RESOLUTION, not
+/// the request: `Cargo.toml` can contain a byte-identical patch table while
+/// cargo resolves registry smithay anyway — a version-mismatched patch is a
+/// warning, not an error (vendor/README.md records that outcome as
+/// measured), and a commented-out table still "contains" the text. The
+/// direct observation is `Cargo.lock`: a path-resolved package block has no
+/// `source =` line, a registry one does (cf. smithay-client-toolkit's
+/// `source = "registry+…"` + checksum).
 #[test]
 fn vendored_smithay_is_the_compiled_smithay() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
-    let manifest = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("workspace Cargo.toml unreadable at {path:?}: {error}"));
-    assert!(
-        manifest.contains("[patch.crates-io]"),
-        "the workspace patch table is gone; the source pins read a tree cargo no longer compiles"
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
+    let lock = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("workspace Cargo.lock unreadable at {path:?}: {error}"));
+    let header = "\nname = \"smithay\"\n";
+    assert_eq!(
+        lock.matches(header).count(),
+        1,
+        "exactly one resolved package named smithay (the exact-match needle excludes \
+         smithay-client-toolkit and friends)"
     );
+    let block_start = lock.find(header).unwrap();
+    let rest = &lock[block_start + 1..];
+    let block_end = rest.find("[[package]]").unwrap_or(rest.len());
+    let block = &rest[..block_end];
     assert!(
-        manifest.contains("smithay = { path = \"vendor/smithay\" }"),
-        "smithay is no longer routed to vendor/; the source pins read a tree cargo no \
-         longer compiles"
+        !block.contains("source ="),
+        "cargo resolved smithay from a REGISTRY, not vendor/ — the patch is missing, \
+         commented out, or version-mismatched (a warning, not an error!), and every \
+         source pin above is green-reading a tree that is not being compiled"
+    );
+}
+
+/// File-scope companion to `vendored_xwm_unmap_callback_precedes_the_null`:
+/// the pins over `xwm/mod.rs` prove nothing about OTHER writers of
+/// `X11Surface::state.wl_surface`, and `xwayland_shell.rs` is one (the
+/// commit hook's pairing write). A null added THERE — the natural upstream
+/// spots being the unknown-window warn arm and the Destroy request — would
+/// carry the association serial unchanged, so comp's unmap pin would report
+/// a vendored ordering flip on supported behaviour, while every xwm-scoped
+/// assert stayed green. A population change here is not automatically a
+/// defect: it fails so a HUMAN re-verifies where the new write sits relative
+/// to `unmapped_window`, then updates the counts deliberately.
+#[test]
+fn vendored_xwayland_shell_null_population_is_pinned() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../vendor/smithay/src/wayland/xwayland_shell.rs");
+    let source = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!("vendored xwayland_shell.rs unreadable at {path:?}: {error}")
+    });
+    assert_eq!(
+        source.matches("wl_surface = None").count(),
+        0,
+        "xwayland_shell.rs now writes a wl_surface null; re-verify by hand where it \
+         sits relative to unmapped_window and whether the serial classifier still \
+         separates it from an ordering flip, then update this count"
+    );
+    assert_eq!(
+        source.matches("wl_surface = Some").count(),
+        1,
+        "the population of xwayland_shell.rs wl_surface writes changed (was: the commit \
+         hook's pairing write); re-verify by hand, then update this count"
+    );
+}
+
+/// The seam guard: the nested smoke gate
+/// (`$CMCTL/_bin/smoke_desktop_nested.mix`) counts the unmap ordering pin's
+/// `warn!` by grepping a literal fragment of its message across the repo
+/// boundary, and reports the count non-fatally into the evidence dir. If the
+/// message is reworded and the grep not updated, the gate reports "0 warns"
+/// forever — absence of detector reading as evidence of absence. Comp owns
+/// the string; the gate owns the grep; this guard is what makes the pair
+/// honest. Reword the message ONLY together with the gate's needle.
+#[test]
+fn x11_unmap_pin_warn_message_matches_the_gate_needle() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/protocol/xwayland.rs");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("xwayland.rs unreadable at {path:?}: {error}"));
+    assert_eq!(
+        source
+            .matches("resolution diverged from the association")
+            .count(),
+        1,
+        "the unmap pin's warn message moved or was reworded: update the WARN needle in \
+         _bin/smoke_desktop_nested.mix (cmctl) in the same change, or the gate counts \
+         zero forever"
     );
 }
 
@@ -35971,18 +36059,23 @@ mod x11 {
     }
 
     /// Fabricate a normal X11 window, run new-window → map-request →
-    /// association (X-first order), and return the pieces.
+    /// association (X-first order), and return the pieces. Associates with
+    /// `Some(1)` as the `WL_SURFACE_SERIAL` — the production shape — so an
+    /// incidental unmap-with-nulled-resolution elsewhere in the suite does
+    /// not hit the classifier's `None == None` arm and silently dirty the
+    /// flip counter, which is meant to be a clean instrument for exactly
+    /// one claim. A test that wants the pre-serial shape asks for it with
+    /// `associate_normal_window_with_serial(.., None)`.
     fn associate_normal_window(
         harness: &mut KeybindingHarness,
         xid: u32,
     ) -> (u32, WlSurface, X11Surface, ObjectId) {
-        associate_normal_window_with_serial(harness, xid, None)
+        associate_normal_window_with_serial(harness, xid, Some(1))
     }
 
     /// `associate_normal_window` with an explicit `WL_SURFACE_SERIAL` set
-    /// before association (production associations always carry one), so
-    /// the unmap ordering pin's serial classifier is drivable with
-    /// production-shaped state.
+    /// before association, so the unmap ordering pin's serial classifier is
+    /// drivable in both directions.
     fn associate_normal_window_with_serial(
         harness: &mut KeybindingHarness,
         xid: u32,
@@ -35990,9 +36083,7 @@ mod x11 {
     ) -> (u32, WlSurface, X11Surface, ObjectId) {
         let (surface_id, surface) = roleless_wl_surface(harness);
         let window = fake_x11_window(xid, false, Rectangle::new((0, 0).into(), (200, 150).into()));
-        if serial.is_some() {
-            window.set_wl_surface_serial_offline(serial);
-        }
+        window.set_wl_surface_serial_offline(serial);
         window.set_wl_surface_offline(Some(surface.clone()));
         harness.server.state.x11_new_window(window.clone());
         harness.server.state.x11_map_window_request(window.clone());

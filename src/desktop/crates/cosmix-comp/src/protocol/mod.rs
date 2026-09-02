@@ -5542,9 +5542,12 @@ struct WaylandState {
     release_use_record_missing_count: usize,
     /// Times the unmap ordering pin classified a mapped, unresolvable
     /// window as a vendored ordering FLIP (the `warn!` branch). Gives the
-    /// CLASSIFIER an offline observation: the log alone is read by nothing
-    /// (and the log LEVEL is observed by nothing offline either — the
-    /// nested gate's evidence needle is the level's observer).
+    /// CLASSIFIER an offline observation. The log's TEXT is read by the
+    /// nested smoke gate's evidence needle (which fires on the message at
+    /// any level — the seam guard in tests.rs pins the string); the LEVEL
+    /// is observed only by the gate's bare ERROR needle, which is the real
+    /// argument for `warn!`: a restoration to `error!` turns the
+    /// unproven-but-legal same-serial residual into a fatal gate red.
     #[cfg(all(test, feature = "xwayland"))]
     x11_unmap_pin_flip_count: usize,
     #[cfg(test)]

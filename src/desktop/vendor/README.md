@@ -332,18 +332,19 @@ To move to a new upstream release:
    of any named symbol; a restructured upstream could pass all ten with every
    one of those names gone. Symbol presence is established by reading the
    source, and nothing automated here checks it — except the default suite's
-   source-read guards, of which there are now FOUR, all red on a plain
-   `cargo test -p cosmix-comp` after a bump that breaks what they pin:
-   `vendored_xwayland_disconnected_stays_idempotent` (fix 8's presence),
-   `vendored_xwm_serial_recorded_before_unpaired_insert` and
-   `vendored_xwm_unmap_callback_precedes_the_null` (the two xwm orderings
-   cosmix-comp's unmap teardown and its serial classifier ride — these are
-   the PRIMARY instrument for those orderings; the compositor's runtime
-   `warn!` is only the secondary signal), and
-   `vendored_smithay_is_the_compiled_smithay` (the `[patch.crates-io]`
-   routing every other pin silently depends on). A bump that reds one of
-   the ordering pins needs a human to re-verify the ordering in the new
-   tree, not a mechanical count update. Worth re-running this command after step 4
+   source-read guards (grep tests.rs for `vendored_` to enumerate them; a
+   count written here went stale within one round, twice), all red on a
+   plain `cargo test -p cosmix-comp` after a bump that breaks what they
+   pin: fix 8's presence, the two xwm orderings cosmix-comp's unmap
+   teardown and its serial classifier ride (the PRIMARY instrument for
+   those orderings; the compositor's runtime `warn!` is only the secondary
+   signal), the xwayland_shell.rs null population, and the resolved-from-
+   vendor routing every other pin silently depends on (asserted from
+   Cargo.lock's missing `source =` line — the Cargo.toml TEXT can be intact
+   while a version-mismatched patch resolves registry smithay with only a
+   warning). A bump that reds an ordering or population pin needs a human
+   to re-verify in the new tree, not a mechanical count update. Worth
+   re-running this command after step 4
    as well, since it is cheap and a reapply can go wrong in the other direction.
 
    One more limit, because it is the difference between "verified" and
