@@ -27828,6 +27828,96 @@ fn port_watch_and_set_share_the_stable_service_point_and_sequence() {
     assert!(drain_observations(&observations).is_empty());
 }
 
+/// The XWayland runtime switch as a props leaf: set round-trip, changed
+/// event, no-op dedup, validation, and the startup gate it feeds. The
+/// PERSISTED half (the etc-tree file) is deliberately not driven here —
+/// the offline suite must never write the dev machine's real config tree,
+/// and the set path cfg-gates the write out under test; the live gate owns
+/// that half.
+#[cfg(all(feature = "bus", feature = "xwayland"))]
+#[test]
+fn xwayland_enabled_prop_round_trips_and_gates_startup() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("control reply runtime");
+    assert!(
+        harness.server.state.xwayland.enabled,
+        "precondition: tests start with the switch on (cfg(test) fixes it, \
+         independent of the dev machine's real config)"
+    );
+
+    // Set false: reply carries old/new, one changed event fires.
+    let set = ingress
+        .request_set("xwayland.enabled".into(), json!(false))
+        .expect("set admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("set service cycle");
+    let (rc, body) = runtime
+        .block_on(set.receive())
+        .expect("set reply")
+        .into_wire();
+    assert_eq!(rc, 0);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        json!({"path": "xwayland.enabled", "old": true, "new": false})
+    );
+    let changed = drain_observations(&observations);
+    assert_eq!(changed.len(), 1);
+    assert!(matches!(
+        &changed[0],
+        port_observation::ObservationRecord::PropsChanged {
+            path,
+            cause: "props.set",
+            ..
+        } if path == "xwayland.enabled"
+    ));
+    assert!(!harness.server.state.xwayland.enabled);
+
+    // No-op set publishes nothing.
+    let no_op = ingress
+        .request_set("xwayland.enabled".into(), json!(false))
+        .expect("no-op set admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("no-op service cycle");
+    assert_eq!(runtime.block_on(no_op.receive()).unwrap().into_wire().0, 0);
+    assert!(drain_observations(&observations).is_empty());
+
+    // A non-bool is refused by validation.
+    let invalid = ingress
+        .request_set("xwayland.enabled".into(), json!("nope"))
+        .expect("invalid set admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("invalid service cycle");
+    let (rc, _) = runtime
+        .block_on(invalid.receive())
+        .expect("validation reply")
+        .into_wire();
+    assert_ne!(rc, 0, "a non-bool must be refused");
+    assert!(!harness.server.state.xwayland.enabled);
+
+    // The startup gate: with the switch off, start_xwayland is inert — no
+    // lifecycle transition, nothing spawned. (Safe to call in tests
+    // precisely BECAUSE the gate returns before any spawn.)
+    harness.server.state.start_xwayland();
+    assert!(
+        matches!(
+            harness.server.state.xwayland.lifecycle,
+            crate::protocol::xwayland::XwaylandLifecycle::Inert
+        ),
+        "a disabled compositor stays Inert through the ordinary lifecycle"
+    );
+}
+
 #[cfg(feature = "bus")]
 #[test]
 fn port_controls_apply_all_sets_once_and_answer_watches_from_one_final_seed() {

@@ -204,6 +204,20 @@ pub(super) enum XwaylandLifecycle {
 
 /// Per-compositor XWayland runtime state, held by `WaylandState`.
 pub(super) struct XwaylandRuntime {
+    /// The runtime switch: whether this compositor spawns XWayland at all.
+    /// Read ONCE at startup (`xwayland_enabled_at_startup`) and gating
+    /// `start_xwayland`; also the `xwayland.enabled` props leaf, whose
+    /// writes persist for the NEXT startup. A live toggle is deliberately
+    /// not attempted — what a mid-session disable does to running X
+    /// clients (tear down a live generation? orphan it?) is a design
+    /// question this switch does not answer, and answering it badly would
+    /// be worse than restarting comp. This switch exists because the
+    /// `xwayland` cargo feature joined `default`: everything the X-1 arc
+    /// proved is NESTED — real-seat input stacks, DPMS/VT, multi-output,
+    /// Firefox in actual use are all unproven — so the first real-seat
+    /// problem needs a back-out that does not require a rebuild
+    /// (`COSMIX_COMP_XWAYLAND=0` in the unit, or a props write + restart).
+    pub(super) enabled: bool,
     pub(super) generation: u64,
     pub(super) lifecycle: XwaylandLifecycle,
     pub(super) retry: XwaylandRetryPolicy,
@@ -277,6 +291,14 @@ pub(super) struct PendingX11Refocus {
 impl XwaylandRuntime {
     pub(super) fn new(socket_name: String) -> Self {
         Self {
+            // Tests get a fixed `true`: the resolver reads the machine's
+            // real environment and config file, and a dev box that has
+            // disabled XWayland must not flip test outcomes.
+            enabled: if cfg!(test) {
+                true
+            } else {
+                xwayland_enabled_at_startup()
+            },
             generation: 0,
             lifecycle: XwaylandLifecycle::Inert,
             retry: XwaylandRetryPolicy::new(),
@@ -298,6 +320,92 @@ impl XwaylandRuntime {
             _ => None,
         }
     }
+}
+
+/// The persisted location of the `xwayland.enabled` switch: a one-word
+/// file (`true`/`false`) under the COSMIX etc tree. Written by the props
+/// set (plain `fs::write`, not the atomic-rename dance: the worst torn
+/// write is an unparseable word, which reads as the default `true` — a
+/// recoverable state the env override can still veto), read once at
+/// startup.
+#[cfg(feature = "bus")]
+fn xwayland_enabled_persist_path() -> PathBuf {
+    cosmix_config::paths::cosmix_path(cosmix_config::paths::CosmixDir::Etc)
+        .join("comp")
+        .join("xwayland-enabled")
+}
+
+/// Persist the switch for the next startup. Failure is logged, not
+/// propagated: the in-memory value and the changed event already happened,
+/// and refusing the set for an I/O error would leave the operator with no
+/// structured channel at all — the env override remains the last resort.
+#[cfg(feature = "bus")]
+pub(super) fn persist_xwayland_enabled(value: bool) {
+    let path = xwayland_enabled_persist_path();
+    let write = path
+        .parent()
+        .map(fs::create_dir_all)
+        .transpose()
+        .and_then(|_| fs::write(&path, if value { "true\n" } else { "false\n" }));
+    if let Err(error) = write {
+        tracing::warn!(
+            path = %path.display(),
+            %error,
+            "failed to persist xwayland.enabled; the setting will not survive restart"
+        );
+    }
+}
+
+/// Resolve the startup value of the XWayland switch. Precedence, and why:
+///
+/// 1. `COSMIX_COMP_XWAYLAND` (`0/false/off/no` disables, `1/true/on/yes`
+///    enables) — the no-rebuild, no-props back-out: one line in the unit
+///    or launch wrapper works even when the props surface or the persisted
+///    file is itself the problem.
+/// 2. The persisted file (written by `xwayland.enabled` props sets).
+/// 3. Default `true` — the `xwayland` feature is in `default`, and the
+///    agentic-first law wants the capability on unless someone chose
+///    otherwise.
+///
+/// Persistence semantics were chosen deliberately: this surface had no
+/// persisted leaf before this one, but a STARTUP-READ switch with
+/// `persistence: none` would be unreachable from its own surface — comp
+/// must be running to accept the write, and by then startup has passed —
+/// which would make the leaf decorative. File-persisted-for-next-startup
+/// is the smallest semantics under which the props write is honest.
+fn xwayland_enabled_at_startup() -> bool {
+    if let Ok(value) = env::var("COSMIX_COMP_XWAYLAND") {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "off" | "no" => return false,
+            "1" | "true" | "on" | "yes" => return true,
+            other => {
+                tracing::warn!(
+                    value = other,
+                    "unrecognised COSMIX_COMP_XWAYLAND; falling through to the persisted file"
+                );
+            }
+        }
+    }
+    #[cfg(feature = "bus")]
+    {
+        match fs::read_to_string(xwayland_enabled_persist_path()) {
+            Ok(text) => match text.trim() {
+                "true" => return true,
+                "false" => return false,
+                other => {
+                    tracing::warn!(
+                        value = other,
+                        "unparseable persisted xwayland.enabled; defaulting to enabled"
+                    );
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(%error, "unreadable persisted xwayland.enabled; defaulting to enabled");
+            }
+        }
+    }
+    true
 }
 
 fn xwayland_descriptor_path(socket_name: &str) -> Option<PathBuf> {
@@ -411,6 +519,15 @@ impl WaylandState {
     /// Spawn a new XWayland generation. Called at protocol startup and by the
     /// one-shot retry backstop; never from a periodic tick.
     pub(super) fn start_xwayland(&mut self) {
+        if !self.xwayland.enabled {
+            // The runtime switch (startup-read; see `XwaylandRuntime::
+            // enabled`). Gated here rather than at the call site so every
+            // entry point — protocol startup AND the crash-retry backstop —
+            // respects it; a disabled comp is inert through the ordinary
+            // `Inert` lifecycle, not a special case.
+            tracing::info!("XWayland disabled by configuration; not spawning");
+            return;
+        }
         if self.xwayland.shutting_down {
             return;
         }

@@ -91,6 +91,8 @@ pub(crate) struct CompSnapshot {
     pub(crate) decoration: DecorationSnapshot,
     pub(crate) bindings: BindingsSnapshot,
     pub(crate) input: InputSnapshot,
+    #[cfg(feature = "xwayland")]
+    pub(crate) xwayland: XwaylandSnapshot,
     pub(crate) port: PortSnapshot,
     #[serde(skip)]
     full_tree: tokio::sync::OnceCell<SerialisedReply>,
@@ -215,6 +217,16 @@ pub(crate) struct InputSnapshot {
     pub(crate) corners: CornersSnapshot,
 }
 
+/// The XWayland runtime switch as a props subtree. One leaf today:
+/// `xwayland.enabled` — the CONFIGURED value (startup-read; a set persists
+/// for the next compositor startup), not whether a generation is currently
+/// running, which the lifecycle owns.
+#[cfg(feature = "xwayland")]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub(crate) struct XwaylandSnapshot {
+    pub(crate) enabled: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub(crate) struct CornersSnapshot {
     pub(crate) enabled: bool,
@@ -271,6 +283,8 @@ impl CompSnapshot {
             "decoration" => self.decoration.select(tail),
             "bindings" => self.bindings.select(tail),
             "input" => self.input.select(tail),
+            #[cfg(feature = "xwayland")]
+            "xwayland" => self.xwayland.select(tail),
             "port" => self.port.select(tail),
             _ => None,
         }
@@ -290,6 +304,8 @@ impl CompSnapshot {
             "decoration" => self.decoration.node_kind(tail),
             "bindings" => self.bindings.node_kind(tail),
             "input" => self.input.node_kind(tail),
+            #[cfg(feature = "xwayland")]
+            "xwayland" => self.xwayland.node_kind(tail),
             "port" => self.port.node_kind(tail),
             _ => None,
         }
@@ -399,6 +415,8 @@ macro_rules! flat_snapshot {
 }
 
 flat_snapshot!(InfoSnapshot, service, version, backend, engine, instance);
+#[cfg(feature = "xwayland")]
+flat_snapshot!(XwaylandSnapshot, enabled);
 flat_snapshot!(
     WindowSnapshot,
     id,
@@ -822,6 +840,10 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         },
         input: InputSnapshot {
             corners: state.observations.corner_config.into(),
+        },
+        #[cfg(feature = "xwayland")]
+        xwayland: XwaylandSnapshot {
+            enabled: state.xwayland.enabled,
         },
         port: PortSnapshot {
             level: "L2",
@@ -1394,6 +1416,21 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         mutable,
         range = "1.0..=20000.0"
     ),
+    // The one file-persisted leaf on this surface (see the resolver in
+    // xwayland.rs for why startup-read + persistence:none would make the
+    // leaf decorative). `persistence: "file"` overrides the mutable
+    // macro-arm's "none".
+    #[cfg(feature = "xwayland")]
+    DescribeEntry {
+        persistence: Some("file"),
+        ..descriptor!(
+            &[L("xwayland"), L("enabled")],
+            Bool,
+            "Whether this compositor spawns XWayland; read at startup, a write persists \
+             for the NEXT startup (no live toggle). COSMIX_COMP_XWAYLAND overrides at launch",
+            mutable
+        )
+    },
     descriptor!(&[L("port"), L("level")], String, "Implemented property substrate level", enum = &["L2"]),
     descriptor!(
         &[L("port"), L("event_seq")],
@@ -1925,6 +1962,8 @@ mod tests {
             input: InputSnapshot {
                 corners: CornerConfig::default().into(),
             },
+            #[cfg(feature = "xwayland")]
+            xwayland: XwaylandSnapshot { enabled: true },
             port: PortSnapshot {
                 level: "L2",
                 event_seq: 0,
@@ -1946,6 +1985,13 @@ mod tests {
             .iter()
             .filter(|descriptor| descriptor.mutable)
             .collect::<Vec<_>>();
+        // The corner leaves are process-lifetime (persistence "none");
+        // `xwayland.enabled` is deliberately the surface's ONE
+        // file-persisted mutable leaf (startup-read — a non-persisted
+        // startup switch would be unreachable from its own surface).
+        #[cfg(feature = "xwayland")]
+        assert_eq!(mutable.len(), 5);
+        #[cfg(not(feature = "xwayland"))]
         assert_eq!(mutable.len(), 4);
         for path in [
             "input.corners.enabled",
@@ -1958,6 +2004,15 @@ mod tests {
             let body = serde_json::from_str::<Value>(&body).unwrap();
             assert_eq!(body["mutable"], true);
             assert_eq!(body["persistence"], "none");
+        }
+        #[cfg(feature = "xwayland")]
+        {
+            let body = describe(&snapshot, &PropPath::new("xwayland.enabled").unwrap())
+                .expect("xwayland.enabled descriptor");
+            let body = serde_json::from_str::<Value>(&body).unwrap();
+            assert_eq!(body["mutable"], true);
+            assert_eq!(body["persistence"], "file");
+            assert_eq!(body["type"], "bool");
         }
         let dwell = describe(&snapshot, &PropPath::new("input.corners.dwell_ms").unwrap()).unwrap();
         assert_eq!(

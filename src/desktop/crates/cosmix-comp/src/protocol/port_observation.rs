@@ -1898,6 +1898,11 @@ fn service_set(
     changes: &mut PendingPropChanges,
 ) {
     let path = request.path.clone();
+    #[cfg(feature = "xwayland")]
+    if path == "xwayland.enabled" {
+        service_set_xwayland_enabled(state, request, changes);
+        return;
+    }
     let old_config = state.observations.corner_config;
     let mut new_config = old_config;
     let validated = match validate_corner_value(&path, &request.value) {
@@ -1919,10 +1924,62 @@ fn service_set(
     }
 }
 
+/// The `xwayland.enabled` set: validate a bool, update the CONFIGURED
+/// value (get/describe read it; the running lifecycle is untouched — the
+/// switch is startup-read, see `XwaylandRuntime::enabled`), persist for
+/// the next startup, and emit the changed event through the same queue as
+/// every other leaf.
+#[cfg(feature = "xwayland")]
+fn service_set_xwayland_enabled(
+    state: &mut WaylandState,
+    request: &mut PortSetRequest,
+    changes: &mut PendingPropChanges,
+) {
+    let path = request.path.clone();
+    let Some(value) = request.value.as_bool() else {
+        if let Some(reply) = request.reply.take() {
+            let _ = reply.send(ControlReply::Validation(invalid_value(
+                &path,
+                "bool",
+                "true|false",
+            )));
+        }
+        return;
+    };
+    let old = state.xwayland.enabled;
+    if old != value {
+        state.xwayland.enabled = value;
+        // The offline suite must never write the dev machine's real etc
+        // tree; the persisted half is live-gate territory (the file write
+        // is a plain fs::write whose failure is logged, not propagated —
+        // see `persist_xwayland_enabled`).
+        #[cfg(not(test))]
+        super::xwayland::persist_xwayland_enabled(value);
+        queue_prop_change(
+            changes,
+            path.clone(),
+            PropValue::Bool(old),
+            PropValue::Bool(value),
+            "props.set",
+        );
+    }
+    if let Some(reply) = request.reply.take() {
+        let _ = reply.send(ControlReply::Set {
+            path,
+            old: PropValue::Bool(old),
+            new: PropValue::Bool(value),
+        });
+    }
+}
+
 fn flush_set_changes(state: &mut WaylandState, changes: PendingPropChanges) {
     flush_prop_changes(state, changes);
     if let Some(baseline) = state.observations.watched_baseline.as_mut() {
         baseline.input.corners = state.observations.corner_config.into();
+        #[cfg(feature = "xwayland")]
+        {
+            baseline.xwayland.enabled = state.xwayland.enabled;
+        }
     }
 }
 
@@ -2023,6 +2080,12 @@ fn known_read_only_path(path: &str) -> bool {
         "bindings",
         "port",
     ];
+    #[cfg(feature = "xwayland")]
+    if path == "xwayland" {
+        // The subtree object is read-only like "input"; its one leaf is
+        // routed before validation ever runs.
+        return true;
+    }
     path == "input"
         || path == "input.corners"
         || ROOTS
