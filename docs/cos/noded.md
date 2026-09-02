@@ -49,7 +49,7 @@ to `ws://127.0.0.1:4200/ws` (loopback).
 
 ## Where it fits
 
-- Links the Bus protocol family from the [bus](https://github.com/markc/bus) repo (`cosmix-lib-bus`, `cosmix-lib-client`) and the substrate libraries `cosmix-lib-config`, `cosmix-lib-mesh`, `cosmix-lib-mesh-trust`, `cosmix-lib-props-store`, and `cosmix-lib-log`.
+- Links the Bus protocol family from the [bus](https://github.com/markc/cosmix) repo (`cosmix-lib-bus`, `cosmix-lib-client`) and the substrate libraries `cosmix-lib-config`, `cosmix-lib-mesh`, `cosmix-lib-mesh-trust`, `cosmix-lib-props-store`, and `cosmix-lib-log`.
 - Every other daemon — `cosmix-maild`, `cosmix-webd`, `cosmix-dnsd`, `cosmix-indexd` — and every Mix `--serve` citizen is a client of it.
 - Cross-mesh routing rides the WireGuard peering that `cosmix-lib-mesh` describes.
 

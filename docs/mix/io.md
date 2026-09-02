@@ -982,4 +982,4 @@ mix help              the full categorized builtin reference
 - [data](data.md) — `json_parse`, `load_data`, `data_encode` for structured files
 - [modules](functions.md) — `source` / `include` for loading `.mix` code (vs `load_data` for inert data)
 - [capabilities](capabilities.md) — the FsRead/FsWrite gating an embedder can apply to these builtins
-- [builtins index](builtins.md) · [mix repo](https://github.com/markc/mix)
+- [builtins index](builtins.md) · [mix repo](https://github.com/markc/cosmix)

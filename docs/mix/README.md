@@ -2,14 +2,14 @@
 
 The reference manual for the **Mix** language, one page per topic. The canonical
 home of these pages is
-[`docs/_man/`](https://github.com/markc/mix/tree/main/docs/_man) in the public
-[markc/mix](https://github.com/markc/mix) repo; add a page by dropping `TOPIC.md`
+[`docs/_man/`](https://github.com/markc/cosmix/tree/main/docs/mix) in the public
+[markc/mix](https://github.com/markc/cosmix) repo; add a page by dropping `TOPIC.md`
 there. The same files render everywhere:
 
 - **Terminal** — `mix man TOPIC` (`mix man` alone prints this index).
 - **`mix man`** — reads [cosmix.dev/mix](https://cosmix.dev/mix/overview), a mirror of this directory in the `cosmix` repo (`$COSMIX/mix/`). It is kept in step automatically: the mix repo's post-commit hook runs `$COSMIX/build/sync-man.mix` whenever a page here is committed (copy, prune, regenerate HTML stubs, commit, push). If `mix man` looks stale, run that script by hand and check `~/.cache/cosmix/man/` (24 h cache).
 - **Web** — [markc.github.io/mix](https://markc.github.io/mix/#_man/overview.md) serves the manual in the site's left-hand **Manual** pane; any page deep-links as `#_man/PAGE.md`.
-- **GitHub** — browse [`docs/_man/`](https://github.com/markc/mix/tree/main/docs/_man) directly; this file doubles as the directory README.
+- **GitHub** — browse [`docs/_man/`](https://github.com/markc/cosmix/tree/main/docs/mix) directly; this file doubles as the directory README.
 - **Local clone** — plain markdown with relative links; any editor or viewer works.
 
 ## Start here
@@ -72,6 +72,6 @@ mix what NAME         one-line description of a builtin or keyword
 mix man TOPIC         read any of the pages above in the terminal
 ```
 
-For AI agents: [`AGENTS.md`](https://github.com/markc/mix/blob/main/AGENTS.md) at
+For AI agents: [`AGENTS.md`](https://github.com/markc/cosmix/blob/main/AGENTS.md) at
 the repo root is a short orientation sheet whose canonical reference is this
 manual.

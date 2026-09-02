@@ -427,7 +427,7 @@ html_escape($text)                                   -- escape text INTO html el
 - [capabilities](capabilities.md) — the `ds_*` and `markdown` builtins are Pure
 - [Bus messaging](bus.md) — the mesh transport behind a live-data handler
 - Datastar — <https://data-star.dev> (hypermedia framework, SSE patch semantics)
-- The Mix repo — <https://github.com/markc/mix>
+- The Mix repo — <https://github.com/markc/cosmix>
 - ARexx lineage (every app an addressable, scriptable port) — the ergonomic precedent for Mix as a control surface
 - `mix what ds_patch_elements` · `mix what ds_patch_signals` · `mix what ds_sse` · `mix what markdown`
 

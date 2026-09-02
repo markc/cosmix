@@ -682,4 +682,4 @@ end
 - [overview](overview.md) — Mix vs shell, the `mix -c` classifier, statement separation
 - [builtins index](builtins.md) — every builtin by category
 - `mix what die` · `mix what exit` · `mix what panic` · `mix what run` · `mix what run_rc` — one-line live help
-- [Mix on GitHub](https://github.com/markc/mix)
+- [Mix on GitHub](https://github.com/markc/cosmix)

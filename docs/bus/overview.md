@@ -16,7 +16,7 @@ to its event topics. Local names such as `maild` resolve through the node's
 service registry; `maild.delta.bus` addresses the service on a named mesh node.
 
 Every node runs a `cosmix-noded` broker, supplied by the
-[cos](https://github.com/markc/cos) repo. Citizens connect over WebSocket,
+[cos](https://github.com/markc/cosmix) repo. Citizens connect over WebSocket,
 register a service name, and exchange Bus messages through that broker. Remote
 node traffic crosses the WireGuard mesh. Trust is granted per WireGuard subnet:
 peers admitted to that subnet are inside the corresponding Bus trust boundary.
@@ -60,15 +60,15 @@ a service-state backend.
 The public repositories have a one-way dependency order:
 
 - **bus** — protocol libraries at the bottom; depends on neither sibling.
-- **[mix](https://github.com/markc/mix)** — the ARexx-flavoured language and shell; depends on bus for `send`, `address`, `emit`, subscriptions, and serving.
-- **[cos](https://github.com/markc/cos)** — the daemon and substrate family; depends on bus and mix, and ships `cosmix-noded`.
+- **[mix](https://github.com/markc/cosmix)** — the ARexx-flavoured language and shell; depends on bus for `send`, `address`, `emit`, subscriptions, and serving.
+- **[cos](https://github.com/markc/cosmix)** — the daemon and substrate family; depends on bus and mix, and ships `cosmix-noded`.
 
 Neither mix nor cos is required to compile the bus workspace.
 
 ## Building
 
 ```sh
-git clone https://github.com/markc/bus ~/.bus
+git clone https://github.com/markc/cosmix ~/.bus
 cd ~/.bus/src
 cargo build --workspace
 cargo test --workspace

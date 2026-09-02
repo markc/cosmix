@@ -8,7 +8,7 @@ Controlling systems across many machines normally means stitching together a sta
 
 Mix collapses that stack. It makes network communication a core part of the language rather than something bolted on with external tools, so coordinating remote machines and services feels like writing a plain local script.
 
-- **Built-in networking.** Communication between machines is a language feature, not an add-on. `send`, `address`, `emit`, and `on … end` are keywords — not library calls. A Mix script reaches a peer service over the [Bus](https://github.com/markc/bus) mesh in one line, with no SDK boilerplate.
+- **Built-in networking.** Communication between machines is a language feature, not an add-on. `send`, `address`, `emit`, and `on … end` are keywords — not library calls. A Mix script reaches a peer service over the [Bus](https://github.com/markc/cosmix) mesh in one line, with no SDK boilerplate.
 - **Less boilerplate.** No repeated wiring for sockets, retries, serialization, queues, or service-to-service messaging — Mix handles that underneath.
 - **Modern ARexx-style scripting.** Like ARexx on the Amiga, Mix lets independent programs and machines talk to each other through a lightweight scripting layer.
 - **Rust-based safety.** Written in Rust, so it inherits stronger memory safety and safer concurrency than the older automation tools it replaces.
@@ -26,7 +26,7 @@ Mix also runs as an ordinary scripting language and as a login shell, so the sam
 The **Mix manual** — one page per topic, from syntax to Bus messaging — lives in
 this repo and renders in three places from the same files:
 
-- **[docs/_man/](https://github.com/markc/mix/tree/main/docs/_man)** — the
+- **[docs/_man/](https://github.com/markc/cosmix/tree/main/docs/mix)** — the
   canonical pages on GitHub (the directory README is the index).
 - **[markc.github.io/mix](https://markc.github.io/mix/#_man/overview.md)** — the
   same pages in the website's Manual pane.
@@ -48,11 +48,11 @@ The interpreter is feature-gated for opt-in capabilities (`json`, `regex`, `toml
 
 ## Building
 
-Mix depends on the [bus](https://github.com/markc/bus) library family. Both repos must be present as sibling checkouts under `$HOME`:
+Mix depends on the [bus](https://github.com/markc/cosmix) library family. Both repos must be present as sibling checkouts under `$HOME`:
 
 ```sh
-git clone https://github.com/markc/bus $COSMIX
-git clone https://github.com/markc/mix $COSMIX
+git clone https://github.com/markc/cosmix $COSMIX
+git clone https://github.com/markc/cosmix $COSMIX
 cd $COSMIX/src && cargo build --release
 ```
 
@@ -62,7 +62,7 @@ Install the resulting binary:
 sudo install -m 0755 $COSMIX/src/target/release/mix /opt/cosmix/bin/mix
 ```
 
-(Adjust the install path to taste; `/opt/cosmix/bin/` is the convention used by the cosmix daemon family in [cos](https://github.com/markc/cos).)
+(Adjust the install path to taste; `/opt/cosmix/bin/` is the convention used by the cosmix daemon family in [cos](https://github.com/markc/cosmix).)
 
 ## Using
 
@@ -90,7 +90,7 @@ Read from stdin (useful over `ssh`):
 ssh host mix - <local-script.mix
 ```
 
-As a supervised Bus citizen (needs a running `cosmix-noded` broker — ships with [cos](https://github.com/markc/cos)):
+As a supervised Bus citizen (needs a running `cosmix-noded` broker — ships with [cos](https://github.com/markc/cosmix)):
 
 ```sh
 mix --serve service.mix --name my-service
@@ -143,8 +143,8 @@ Both crate versions are kept in lockstep (the `mix` binary the user installs is 
 
 ## Related projects
 
-- **[bus](https://github.com/markc/bus)** — the Bus protocol library family that mix consumes for `send` / `call` / topic-subscribe.
-- **[cos](https://github.com/markc/cos)** — the cosmix daemon family. Ships `cosmix-noded` (the broker mix's `--serve` mode connects to) plus mail, web, DNS, knowledge indexer, display compositor.
+- **[bus](https://github.com/markc/cosmix)** — the Bus protocol library family that mix consumes for `send` / `call` / topic-subscribe.
+- **[cos](https://github.com/markc/cosmix)** — the cosmix daemon family. Ships `cosmix-noded` (the broker mix's `--serve` mode connects to) plus mail, web, DNS, knowledge indexer, display compositor.
 
 ## License
 

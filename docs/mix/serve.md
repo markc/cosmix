@@ -12,7 +12,7 @@ contract is **SPEC 18** (the Mix Citizen Runtime); this page is the operational
 view — what the flag does, what the runtime injects, and how a citizen behaves.
 
 > **Most examples here need a live broker** (`cosmix-noded`, from the
-> [cos repo](https://github.com/markc/cos)). Where one is running, the output
+> [cos repo](https://github.com/markc/cosmix)). Where one is running, the output
 > shown is **real**, captured from a live `statecache` citizen on a dev node.
 > Examples that *start* a daemon (the `mix --serve …` invocations) are
 > illustrative of the command shape — you can't paste them into a terminal and
@@ -542,6 +542,6 @@ resident `--serve` daemon is what requires the broker to be up.
 - [capabilities & embedding](capabilities.md) — the trust model; a citizen is a *trusted, full-capability* process, not a sandbox for untrusted code
 - [errors](errors.md) — `try … catch`, `die`, and how runaways become clean errors inside a handler
 - [functions](functions.md) — handler bodies, lambdas, and the pass-in / return / reassign idiom for threading state
-- The [cos repo](https://github.com/markc/cos) — `cosmix-noded`, the Bus broker
-- The [mix repo](https://github.com/markc/mix) — [AGENTS.md](https://github.com/markc/mix/blob/main/AGENTS.md) is the agent orientation sheet; this manual is the language reference
+- The [cos repo](https://github.com/markc/cosmix) — `cosmix-noded`, the Bus broker
+- The [mix repo](https://github.com/markc/cosmix) — [AGENTS.md](https://github.com/markc/cosmix/blob/main/AGENTS.md) is the agent orientation sheet; this manual is the language reference
 - `mix help` · `mix what send` · `mix what emit` · `mix what address` (`mix what` covers the Bus keywords; `on`/`reply` are handler forms it does not index)

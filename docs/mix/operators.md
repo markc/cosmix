@@ -547,5 +547,5 @@ use the ternary `cond ? a : b` above or an [`if` expression](control-flow.md).
 - [errors](errors.md) — `try`/`catch` for division-by-zero and coercion errors
 - [variables](variables.md) — the `$` sigil and scope
 - [lists](collections.md) — why `List == List` is false; element comparison
-- The source: [`evaluator.rs`](https://github.com/markc/mix/blob/main/src/crates/cosmix-lib-mix/src/evaluator.rs) (`eval_binop`, `num_cmp`) and [`parser.rs`](https://github.com/markc/mix/blob/main/src/crates/cosmix-lib-mix/src/parser.rs) (`parse_binary_rhs` precedence table)
+- The source: [`evaluator.rs`](https://github.com/markc/cosmix/blob/main/src/crates/cosmix-lib-mix/src/evaluator.rs) (`eval_binop`, `num_cmp`) and [`parser.rs`](https://github.com/markc/cosmix/blob/main/src/crates/cosmix-lib-mix/src/parser.rs) (`parse_binary_rhs` precedence table)
 - `mix help` for the topic list; `mix what NAME` for one-line builtin help

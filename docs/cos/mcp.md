@@ -57,9 +57,9 @@ retrieved skill → `*_feedback` to score the chunks you used.
 
 ## Where it fits
 
-Depends on the Bus client from [bus](https://github.com/markc/bus)
+Depends on the Bus client from [bus](https://github.com/markc/cosmix)
 (`cosmix-lib-client`), `cosmix-lib-skills` for the skill loop, and the embedded
-[mix](https://github.com/markc/mix) engine for `mix_execute`. At runtime it
+[mix](https://github.com/markc/cosmix) engine for `mix_execute`. At runtime it
 talks to [cosmix-noded](noded.md) (Bus surface) and [cosmix-indexd](indexd.md)
 (semantic recall + skills). It is a client of the mesh, not a member of it.
 

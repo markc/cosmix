@@ -618,5 +618,5 @@ mix what NAME         one-line description of a single builtin
 mix help              the full categorized builtin reference
 ```
 
-Source of truth: the Mix repo at <https://github.com/markc/mix> (verified
+Source of truth: the Mix repo at <https://github.com/markc/cosmix> (verified
 against **mix 0.21.2** — the binary is the oracle).

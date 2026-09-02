@@ -18,7 +18,7 @@ Pages are **server-side rendered**. Interactive behaviour comes from
 [Datastar](https://data-star.dev) — the server pushes DOM patches over a
 Server-Sent-Events stream (`text/event-stream`) instead of shipping a
 client-side framework. Handler logic for a vhost is written in
-[Mix](https://github.com/markc/mix) and evaluated per request, with seams into
+[Mix](https://github.com/markc/cosmix) and evaluated per request, with seams into
 the mail daemon (`jmap()`), the files daemon, and the CMS database.
 
 ## What it does
@@ -67,10 +67,10 @@ Bus verbs (service `webd`):
 
 Depends on `cosmix-lib-daemon` (the `tls` feature: rustls + ACME + SNI),
 `cosmix-lib-props-store` (SPEC-12 state), `cosmix-lib-config`, and the Bus
-client libraries from [bus](https://github.com/markc/bus). It reaches a local
+client libraries from [bus](https://github.com/markc/cosmix). It reaches a local
 or remote `cosmix-maild` over JMAP for mail, the files daemon for the file
 manager, and evaluates per-vhost handlers through the embedded
-[mix](https://github.com/markc/mix) engine. Every node needs a
+[mix](https://github.com/markc/cosmix) engine. Every node needs a
 [cosmix-noded](noded.md) broker for the Bus surface.
 
 ## See also

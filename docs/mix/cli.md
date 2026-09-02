@@ -536,7 +536,7 @@ removes the socket, `status` probes it and flags a stale socket.
 - [keywords](keywords.md) · [operators](operators.md) · [math](math.md) — topics readable via `mix man TOPIC`
 - [Bus messaging](bus.md) — the `send`/`emit`/`address` mesh `mix mesh`/`ports`/`ping` probe
 - [builtins index](builtins.md) — the full builtin catalogue behind `mix builtins`
-- The public repo: [github.com/markc/mix](https://github.com/markc/mix)
+- The public repo: [github.com/markc/cosmix](https://github.com/markc/cosmix)
 
 ```
 mix help          full categorized reference + the complete subcommand map

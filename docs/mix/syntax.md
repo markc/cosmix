@@ -697,4 +697,4 @@ mix what NAME         one-line description of a builtin or keyword
 ```
 
 The source of truth is the lexer and parser in the public
-[mix repo](https://github.com/markc/mix/tree/main/src/crates/cosmix-lib-mix/src).
+[mix repo](https://github.com/markc/cosmix/tree/main/src/crates/cosmix-lib-mix/src).

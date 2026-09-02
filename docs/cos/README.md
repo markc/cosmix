@@ -2,12 +2,12 @@
 
 Summary documentation for the **cos** daemon family, one page per component. The
 canonical home of these pages is
-[`docs/_man/`](https://github.com/markc/cos/tree/main/docs/_man) in the public
-[markc/cos](https://github.com/markc/cos) repo; add a page by dropping
+[`docs/_man/`](https://github.com/markc/cosmix/tree/main/docs/cos) in the public
+[markc/cos](https://github.com/markc/cosmix) repo; add a page by dropping
 `COMPONENT.md` there. The same files render three ways:
 
 - **Web** — [markc.github.io/cos](https://markc.github.io/cos/) serves this manual in the site's left-hand **Components** pane; any page deep-links as `#_man/PAGE.md`.
-- **GitHub** — browse [`docs/_man/`](https://github.com/markc/cos/tree/main/docs/_man) directly; this file doubles as the directory README.
+- **GitHub** — browse [`docs/_man/`](https://github.com/markc/cosmix/tree/main/docs/cos) directly; this file doubles as the directory README.
 - **Local clone** — plain markdown with relative links; any editor or viewer works.
 
 These are **summaries** — what each component is and how to use it — not
@@ -40,5 +40,5 @@ exhaustive manpages. For the language that drives these daemons, see the
 
 ## See also
 
-- Repos: [markc/cos](https://github.com/markc/cos) · [markc/mix](https://github.com/markc/mix) · [markc/bus](https://github.com/markc/bus).
+- Repos: [markc/cos](https://github.com/markc/cosmix) · [markc/mix](https://github.com/markc/cosmix) · [markc/bus](https://github.com/markc/cosmix).
 - The [mix manual](https://markc.github.io/mix/) — the language and shell used to operate these daemons.

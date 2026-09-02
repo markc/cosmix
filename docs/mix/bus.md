@@ -7,7 +7,7 @@ no client object, no boilerplate. This is the ARexx lineage made native: every
 service is a named, addressable port; a Mix one-liner can drive any of them.
 
 > **Most examples on this page need a live broker** (`cosmix-noded`, from the
-> [cos repo](https://github.com/markc/cos)). Where a broker is running the output
+> [cos repo](https://github.com/markc/cosmix)). Where a broker is running the output
 > shown is real, captured from `mix 0.21.2`. Where no broker is present the Bus
 > forms **degrade gracefully** (see [No broker](#no-broker-graceful-degradation)) —
 > that path is verified separately. Treat the networked examples as illustrative
@@ -522,7 +522,7 @@ Sharp edges:
 - [functions](functions.md) — handler bodies, lambdas, the pass-in/return/reassign state idiom
 - [running commands](system.md) — `run` / `run_rc` / `ssh_run` for non-Bus I/O
 - [builtins index](builtins.md) — `port_exists`, `subscribe`, `reply`, `bus_reconnect`, `sleep_ms`
-- The [cos repo](https://github.com/markc/cos) — `cosmix-noded`, the Bus broker
-- The [mix repo](https://github.com/markc/mix) — [AGENTS.md](https://github.com/markc/mix/blob/main/AGENTS.md) is the agent orientation sheet; this manual is the language reference
+- The [cos repo](https://github.com/markc/cosmix) — `cosmix-noded`, the Bus broker
+- The [mix repo](https://github.com/markc/cosmix) — [AGENTS.md](https://github.com/markc/cosmix/blob/main/AGENTS.md) is the agent orientation sheet; this manual is the language reference
 - ARexx background — [Wikipedia: ARexx](https://en.wikipedia.org/wiki/ARexx)
 - `mix help` · `mix what send` · `mix what emit` · `mix what address` (`on`/`reply` are handler forms `mix what` does not index)

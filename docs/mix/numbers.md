@@ -406,5 +406,5 @@ Keep generated config values finite, or `try`/`catch` the encode ([errors](error
 - [builtins index](builtins.md) — `to_number`, `chmod` / `write_new` (mode is the f64 value), `stat` (ino/dev as strings), `sqlexec` typed binds
 - [data](data.md) — `json_encode` / `data_encode` serialization (both reject non-finite numbers)
 - [bus](bus.md) — `send` arg serialization (whole numbers as JSON integers)
-- The repo: <https://github.com/markc/mix>
+- The repo: <https://github.com/markc/cosmix>
 - `mix help` for the topic list; `mix what to_number` (or `round`, `pow`, …) for a one-line builtin reference

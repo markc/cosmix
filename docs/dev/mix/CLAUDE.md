@@ -48,10 +48,10 @@ $COSMIX/src/
 
 ## Build / test / lint
 
-Mix depends on the sibling [bus](https://github.com/markc/bus) repo at `$COSMIX/` for the five Bus-family path-deps. Both must be present:
+Mix depends on the sibling [bus](https://github.com/markc/cosmix) repo at `$COSMIX/` for the five Bus-family path-deps. Both must be present:
 
 ```sh
-git clone https://github.com/markc/bus $COSMIX           # if not already present
+git clone https://github.com/markc/cosmix $COSMIX           # if not already present
 cd $COSMIX/src
 cargo build --workspace
 cargo test --workspace
@@ -113,7 +113,7 @@ The `mix` binary turns all on.
 
 ## Auto-upgrade story (don't break this)
 
-A standalone `mix` install runs as a scripting shell. When `cosmix-noded` (from [cos](https://github.com/markc/cos)) is installed later on the same host, the **same `mix` binary** becomes mesh-viable on next invocation — no recompile. A runtime lazy-probe state machine in `MixBusHandler` makes the bare-vs-mesh distinction at execution time. Bus forms degrade gracefully on bare hosts (silent `nil` for `send`/`emit`; explicit `mesh unavailable` for the bare-incoherent ones like `noded_register` / `subscribe` / `reply`).
+A standalone `mix` install runs as a scripting shell. When `cosmix-noded` (from [cos](https://github.com/markc/cosmix)) is installed later on the same host, the **same `mix` binary** becomes mesh-viable on next invocation — no recompile. A runtime lazy-probe state machine in `MixBusHandler` makes the bare-vs-mesh distinction at execution time. Bus forms degrade gracefully on bare hosts (silent `nil` for `send`/`emit`; explicit `mesh unavailable` for the bare-incoherent ones like `noded_register` / `subscribe` / `reply`).
 
 When touching `bus.rs` / `serve_runtime.rs`: preserve the `Unprobed` → `NeverPresent | Connected(handle)` → `Lost` semantics. Collapsing states, removing the lazy-probe boundary, or making `send` fail loudly on bare hosts breaks the auto-upgrade contract.
 

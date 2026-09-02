@@ -2,7 +2,7 @@
 
 **Mix** is an [ARexx](https://en.wikipedia.org/wiki/ARexx)-inspired, Bus-native
 shell and scripting language, implemented in pure Rust. It is the orchestration
-control surface for the [cosmix](https://github.com/markc/cos) substrate: one
+control surface for the [cosmix](https://github.com/markc/cosmix) substrate: one
 language that covers one-off glue, daily shell work, and distributed mesh
 coordination — with network messaging built into the grammar rather than bolted
 on with external clients.
@@ -56,7 +56,7 @@ is silently dropped — and it lights up unchanged when a broker appears (more i
 
 ## What Mix is
 
-- **A Bus-native shell + scripting language.** `send`, `emit`, `address`, and `on … end` are language keywords that reach peer services over the [Bus](https://github.com/markc/bus) mesh. No client library, no boilerplate — remote orchestration reads like a local script. See [Bus messaging](bus.md).
+- **A Bus-native shell + scripting language.** `send`, `emit`, `address`, and `on … end` are language keywords that reach peer services over the [Bus](https://github.com/markc/cosmix) mesh. No client library, no boilerplate — remote orchestration reads like a local script. See [Bus messaging](bus.md).
 - **A real scripting language.** First-class functions and terse lambdas, higher-order builtins (`map` / `filter` / `reduce` / `sort_by` / …), structured values (string, number, bool, bytes, list, map), `try`/`catch`, closures. See [functions](functions.md) and the [builtins index](builtins.md).
 - **A shell.** It runs external commands, has a REPL with meta-commands (`mix status`, `mix help`, `mix what NAME`), and serves as a daily-driver login shell (`chsh -s /opt/cosmix/bin/mix`). Command results are **structured** — `run_rc("cmd")` returns `{rc, stdout, stderr, timed_out, interrupted}`, not exit-code soup. See [running commands](system.md), the [shell](shell-mode.md) page, and [the `mix` meta-command](cli.md).
 - **A structured-data format.** Strict-data `.*.mix` files (`.conf.mix`, `.spec.mix`, …) are parsed without executing anything — the substrate's config/state format. See [data & serialization](data.md).
@@ -109,7 +109,7 @@ It ships as two crates that version in lockstep (a third workspace member,
 | **`cosmix-mix`** | The `mix` binary — REPL, shell layer, Bus wiring, the `--serve` supervised-citizen runtime, and the `mix man`/`help`/`what` meta-commands. |
 
 A standalone `mix` install runs as a normal scripting shell. When a Bus broker
-(`cosmix-noded`, from the [cos](https://github.com/markc/cos) repo) later appears
+(`cosmix-noded`, from the [cos](https://github.com/markc/cosmix) repo) later appears
 on the host, the **same binary** becomes mesh-viable on next invocation — no
 reinstall, no recompile, no script edits. A runtime lazy-probe decides
 bare-vs-mesh at execution time.
@@ -224,8 +224,8 @@ with `mix -c '<code>'` and trust what it prints. The full topic list lives in
 
 ## Related projects
 
-- **[bus](https://github.com/markc/bus)** — the CosMix Agent Bus (the Bus) library family Mix consumes for `send` / `call` / topic subscription.
-- **[cos](https://github.com/markc/cos)** — the cosmix daemon family: ships `cosmix-noded` (the broker `--serve` connects to) plus mail, web, DNS, the knowledge indexer, and the display compositor.
+- **[bus](https://github.com/markc/cosmix)** — the CosMix Agent Bus (the Bus) library family Mix consumes for `send` / `call` / topic subscription.
+- **[cos](https://github.com/markc/cosmix)** — the cosmix daemon family: ships `cosmix-noded` (the broker `--serve` connects to) plus mail, web, DNS, the knowledge indexer, and the display compositor.
 - **[Datastar](https://data-star.dev)** — the hypermedia framework the `ds_*` builtins frame SSE events for (server-side reactive UI from Mix).
 - **[ARexx background](https://en.wikipedia.org/wiki/ARexx)** — the message-port scripting model Mix descends from.
 

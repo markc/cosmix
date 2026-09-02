@@ -252,6 +252,6 @@ A short decision guide for an embedder wiring up a `CategoryAllowList`:
 - `mix what NAME` — one-line description of a builtin or keyword
 - `mix builtins [CATEGORY]` — list builtins by (doc) category
 - `mix help` — the `mix` command surface and CLI flags
-- Source of truth: [`builtins.rs`](https://github.com/markc/mix/blob/main/src/crates/cosmix-lib-mix/src/builtins.rs) (`CapabilityClass`, `CategoryAllowList`, `capability_category`), [`evaluator.rs`](https://github.com/markc/mix/blob/main/src/crates/cosmix-lib-mix/src/evaluator.rs) (`CapabilityPolicy`, `EvalLimits`)
-- [AGENTS.md](https://github.com/markc/mix/blob/main/AGENTS.md) — the agent orientation sheet (this manual is the language reference)
-- The [mix](https://github.com/markc/mix) · [bus](https://github.com/markc/bus) · [cos](https://github.com/markc/cos) repos
+- Source of truth: [`builtins.rs`](https://github.com/markc/cosmix/blob/main/src/crates/cosmix-lib-mix/src/builtins.rs) (`CapabilityClass`, `CategoryAllowList`, `capability_category`), [`evaluator.rs`](https://github.com/markc/cosmix/blob/main/src/crates/cosmix-lib-mix/src/evaluator.rs) (`CapabilityPolicy`, `EvalLimits`)
+- [AGENTS.md](https://github.com/markc/cosmix/blob/main/AGENTS.md) — the agent orientation sheet (this manual is the language reference)
+- The [mix](https://github.com/markc/cosmix) · [bus](https://github.com/markc/cosmix) · [cos](https://github.com/markc/cosmix) repos

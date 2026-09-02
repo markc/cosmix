@@ -10,7 +10,7 @@ extrapolate from bash/python; ask the binary, which is the oracle:
   **Start with `mix man overview` and `mix man syntax`** — the mental model, the
   newline rule, and the shell-vs-Mix classifier (the mistakes an agent makes
   first). The same pages render at
-  <https://github.com/markc/mix/tree/main/docs/_man> and under `$COSMIX/docs/mix/`.
+  <https://github.com/markc/cosmix/tree/main/docs/mix> and under `$COSMIX/docs/mix/`.
 - `mix builtins` — every builtin with `name(args) -> ret` signatures
   (`mix builtins --json` machine-readable · `mix builtins <name>` for one ·
   `mix builtins <category>` to filter).

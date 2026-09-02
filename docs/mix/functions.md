@@ -581,5 +581,5 @@ print($mathlib["mul"](3, 4))
 - [keywords](keywords.md) — the reserved words that can't be function names
 - [builtins index](builtins.md) — everything callable out of the box
 - [Bus messaging](bus.md) — `send`/`on`/`emit` keywords (where `$rc`/`$result` come from)
-- The [mix repo](https://github.com/markc/mix) · [bus](https://github.com/markc/bus) · [cos](https://github.com/markc/cos)
+- The [mix repo](https://github.com/markc/cosmix) · [bus](https://github.com/markc/cosmix) · [cos](https://github.com/markc/cosmix)
 - `mix help` — command overview · `mix what map` (and any builtin) — one-line signature + version

@@ -852,7 +852,7 @@ assertion — the raise is the point; the return value is for composing.
 - [math](math.md) — numeric builtins over the numbers `to_number` produces
 - [numbers](numbers.md) — f64 precision, radix literals, non-finite propagation
 - [system](system.md) — `sql_quote` / `shell_quote` and when binds beat quoting
-- The [mix repo](https://github.com/markc/mix)
+- The [mix repo](https://github.com/markc/cosmix)
 
 ```
 mix builtins json     list every JSON / TOML / data builtin

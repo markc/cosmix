@@ -659,4 +659,4 @@ mix keywords          every Mix keyword (so you know what the classifier reserve
 - [keywords](keywords.md) — Mix keywords the classifier routes to Mix
 - [control-flow](control-flow.md) — `if` / `for each` / `while` (the Mix replacements for shell control flow)
 - [bus](bus.md) — `send` / `emit` / `on … end`, the Bus-native side of the language
-- [The Mix repo](https://github.com/markc/mix) — [AGENTS.md](https://github.com/markc/mix/blob/main/AGENTS.md) is the agent orientation sheet on top of this manual
+- [The Mix repo](https://github.com/markc/cosmix) — [AGENTS.md](https://github.com/markc/cosmix/blob/main/AGENTS.md) is the agent orientation sheet on top of this manual

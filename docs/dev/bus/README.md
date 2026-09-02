@@ -2,7 +2,7 @@
 
 **CosMix Agent Bus (the Bus)** — a pure-Rust library family for messaging across a WireGuard-secured mesh of agent-operable services.
 
-Bus follows the AmigaOS ARexx convention: every service in the mesh exposes a named, addressable port; any peer can `send` it a command, `call` it for a reply, or subscribe to its event topics. The broker (`cosmix-noded`, in [cos](https://github.com/markc/cos)) routes messages between peers; everything inside the mesh is trusted on a per-WireGuard-subnet basis. bus is the protocol library that lets a service participate.
+Bus follows the AmigaOS ARexx convention: every service in the mesh exposes a named, addressable port; any peer can `send` it a command, `call` it for a reply, or subscribe to its event topics. The broker (`cosmix-noded`, in [cos](https://github.com/markc/cosmix)) routes messages between peers; everything inside the mesh is trusted on a per-WireGuard-subnet basis. bus is the protocol library that lets a service participate.
 
 ## Crates
 
@@ -21,7 +21,7 @@ bus deliberately holds the *protocol* layer only — no storage, no TLS, no conf
 bus builds standalone — no sibling checkouts required.
 
 ```sh
-git clone https://github.com/markc/bus $COSMIX
+git clone https://github.com/markc/cosmix $COSMIX
 cd $COSMIX/src && cargo build --workspace
 ```
 
@@ -42,7 +42,7 @@ cd $COSMIX/src && cargo clippy --workspace --all-targets -- -D warnings
 bus is not on crates.io yet. Cargo's git dependency form has no sub-directory selector and this workspace lives under `src/`, so depend on it via path-deps to a sibling checkout:
 
 ```sh
-git clone https://github.com/markc/bus $COSMIX
+git clone https://github.com/markc/cosmix $COSMIX
 ```
 
 ```toml
@@ -72,12 +72,12 @@ async fn main() -> anyhow::Result<()> {
 
 ## Where the broker comes from
 
-bus ships the *client* and *protocol* — not the broker. The reference broker (`cosmix-noded`) lives in [cos](https://github.com/markc/cos). A bare-system bus consumer can still serialise / deserialise `BusMessage` values without a broker present; `NodedClient::connect` is the call that requires one.
+bus ships the *client* and *protocol* — not the broker. The reference broker (`cosmix-noded`) lives in [cos](https://github.com/markc/cosmix). A bare-system bus consumer can still serialise / deserialise `BusMessage` values without a broker present; `NodedClient::connect` is the call that requires one.
 
 ## Related projects
 
-- **[mix](https://github.com/markc/mix)** — ARexx-flavoured scripting language with `send` / `address` / `emit` / `on … do` as first-class keywords, built on bus.
-- **[cos](https://github.com/markc/cos)** — the cosmix daemon family: broker, mail, web, DNS, knowledge indexer, display compositor. Consumer of bus; ships the broker.
+- **[mix](https://github.com/markc/cosmix)** — ARexx-flavoured scripting language with `send` / `address` / `emit` / `on … do` as first-class keywords, built on bus.
+- **[cos](https://github.com/markc/cosmix)** — the cosmix daemon family: broker, mail, web, DNS, knowledge indexer, display compositor. Consumer of bus; ships the broker.
 
 ## History
 

@@ -6,7 +6,7 @@ Guidance for Claude Code sessions working in `$COSMIX/`.
 
 The CosMix Agent Bus library family. Five crates: `cosmix-lib-bus` (wire format), `cosmix-lib-client` (broker WebSocket client, native + wasm32), `cosmix-lib-props-core` (SPEC 07 property read surface), `cosmix-lib-log` (tracing/stats), `cosmix-lib-buildinfo` (build metadata).
 
-bus is the *protocol layer* — every byte that travels between Bus peers is defined here. It deliberately holds no substrate (storage, TLS, auto-resolve, config-file loaders). Anything that needs files, sockets beyond the broker WebSocket, or persistent state belongs in [cos](https://github.com/markc/cos), not here.
+bus is the *protocol layer* — every byte that travels between Bus peers is defined here. It deliberately holds no substrate (storage, TLS, auto-resolve, config-file loaders). Anything that needs files, sockets beyond the broker WebSocket, or persistent state belongs in [cos](https://github.com/markc/cosmix), not here.
 
 ## Four-repo split
 

@@ -2,7 +2,7 @@
 
 **cos** is the cosmix daemon family: every Rust crate that runs a node in a
 cosmix mesh, plus the substrate libraries they share. Where
-[mix](https://github.com/markc/mix) is the language you drive the mesh *with*,
+[mix](https://github.com/markc/cosmix) is the language you drive the mesh *with*,
 cos is what actually *runs* on each node — a set of long-running daemons that
 speak the Bus mesh protocol, expose their state as typed property namespaces,
 and are operable from the outside by agents and scripts.
@@ -49,8 +49,8 @@ Pick any component in the sidebar for its own page.
 
 cos is one of three public sibling repos with a one-way dependency order:
 
-- **[bus](https://github.com/markc/bus)** — the Bus protocol family. Depends on nothing.
-- **[mix](https://github.com/markc/mix)** — the language. Depends on bus.
+- **[bus](https://github.com/markc/cosmix)** — the Bus protocol family. Depends on nothing.
+- **[mix](https://github.com/markc/cosmix)** — the language. Depends on bus.
 - **cos** — the daemon family. Depends on both: its config, DNS, mail, and agent crates consume the mix strict-data parser, and every daemon speaks Bus.
 
 Neither sibling depends on cos. Build bus and mix first (see
@@ -61,9 +61,9 @@ Neither sibling depends on cos. Build bus and mix first (see
 
 ```sh
 # cos depends on two sibling checkouts under $HOME
-git clone https://github.com/markc/bus $COSMIX
-git clone https://github.com/markc/mix $COSMIX
-git clone https://github.com/markc/cos $COSMIX
+git clone https://github.com/markc/cosmix $COSMIX
+git clone https://github.com/markc/cosmix $COSMIX
+git clone https://github.com/markc/cosmix $COSMIX
 
 # build the whole daemon family (release)
 cd $COSMIX/src && cargo build --workspace --release
@@ -76,4 +76,4 @@ Bus broker and exposes its runtime state through property namespaces.
 ## See also
 
 - **[the component index](README.md)** — every page in this manual.
-- Repos: [markc/cos](https://github.com/markc/cos) · [markc/mix](https://github.com/markc/mix) · [markc/bus](https://github.com/markc/bus).
+- Repos: [markc/cos](https://github.com/markc/cosmix) · [markc/mix](https://github.com/markc/cosmix) · [markc/bus](https://github.com/markc/cosmix).

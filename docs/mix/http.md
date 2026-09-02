@@ -416,5 +416,5 @@ end
 - [builtins index](builtins.md) — the full builtin catalogue
 - [Bus messaging](bus.md) — in-mesh RPC (`send`/`emit`); HTTP is for the world *outside* the mesh
 - [the manual index](README.md) — every page in this manual
-- `mix what http_get` · `mix what http_post` · `mix what http_request` · `mix builtins system` · the [mix repo](https://github.com/markc/mix)
+- `mix what http_get` · `mix what http_post` · `mix what http_request` · `mix builtins system` · the [mix repo](https://github.com/markc/cosmix)
 

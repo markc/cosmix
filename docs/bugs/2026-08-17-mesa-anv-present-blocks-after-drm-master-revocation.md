@@ -1,7 +1,7 @@
 # anv/wsi_display: `vkQueuePresentKHR` never returns after DRM master revocation (VT switch)
 
 **Found:** 2026-08-17, during development of
-[cosmix-comp](https://github.com/markc/cos), the CosMix Wayland compositor.
+[cosmix-comp](https://github.com/markc/cosmix), the CosMix Wayland compositor.
 **Status:** documented here; not yet filed upstream. CosMix's own exposure is
 closed — the compositor retired its `VK_KHR_display` presentation path
 entirely (2026-08-18) in favour of compositor-owned KMS atomic commits with

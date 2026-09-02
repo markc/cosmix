@@ -118,8 +118,8 @@ startup.
 ## Where it fits
 
 - Registers with and is addressed through [noded](noded.md), the Bus broker.
-- Links the Bus protocol family (`cosmix-lib-bus`, `cosmix-lib-client`) from the [bus](https://github.com/markc/bus) repo, and substrate libraries `cosmix-lib-config`, `cosmix-lib-daemon` (TLS / ACME), `cosmix-lib-props-store`, and `cosmix-lib-log`.
-- Parses its native `*.conf.mix` config through `cosmix-lib-mix` from the [mix](https://github.com/markc/mix) repo.
+- Links the Bus protocol family (`cosmix-lib-bus`, `cosmix-lib-client`) from the [bus](https://github.com/markc/cosmix) repo, and substrate libraries `cosmix-lib-config`, `cosmix-lib-daemon` (TLS / ACME), `cosmix-lib-props-store`, and `cosmix-lib-log`.
+- Parses its native `*.conf.mix` config through `cosmix-lib-mix` from the [mix](https://github.com/markc/cosmix) repo.
 - `cosmix-webd` fronts webmail against maild's JMAP; `cosmix-mail` is a native client; both drive it over JMAP + Bus.
 
 ## See also

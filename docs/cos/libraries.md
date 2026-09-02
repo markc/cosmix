@@ -9,8 +9,8 @@ crates. Inherently-mesh libraries are exempt. This keeps most substrate logic
 mesh-free and fast to test — the granularity an agent-modifiable system needs.
 
 The Bus protocol crates (`cosmix-lib-bus`, `-client`, `-props-core`, `-log`,
-`-buildinfo`) live in the sibling [bus](https://github.com/markc/bus) repo; the
-Mix language crates live in [mix](https://github.com/markc/mix). The crates below
+`-buildinfo`) live in the sibling [bus](https://github.com/markc/cosmix) repo; the
+Mix language crates live in [mix](https://github.com/markc/cosmix). The crates below
 are the cos-side substrate.
 
 ## Substrate
