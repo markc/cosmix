@@ -338,13 +338,20 @@ To move to a new upstream release:
    pin: fix 8's presence, the two xwm orderings cosmix-comp's unmap
    teardown and its serial classifier ride (the PRIMARY instrument for
    those orderings; the compositor's runtime `warn!` is only the secondary
-   signal), the xwayland_shell.rs null population, and the resolved-from-
-   vendor routing every other pin silently depends on (asserted from
-   Cargo.lock's missing `source =` line — the Cargo.toml TEXT can be intact
-   while a version-mismatched patch resolves registry smithay with only a
-   warning). A bump that reds an ordering or population pin needs a human
-   to re-verify in the new tree, not a mechanical count update. Worth
-   re-running this command after step 4
+   signal), the xwayland_shell.rs null population, and the routed-to-
+   vendor/smithay identity every other pin silently depends on (two axes:
+   Cargo.lock's missing `source =` line proves PATH resolution, the
+   manifest text proves WHICH path — the lock cannot distinguish
+   `vendor/smithay` from a repointed `vendor/smithay-next`). Note the
+   front line for a dropped or mismatched patch in THIS workspace is not
+   the plain-build warning documented above: `cosmix-comp`'s
+   dev-dependency demands the CosMix-invented `cosmix_offline_test`
+   feature unconditionally, so the default suite fails resolution HARD —
+   the routing guard is defence-in-depth for the compound case (that
+   demand removed too) and for the repoint, which errors nowhere. A bump
+   that reds an ordering or population pin needs a human to re-verify in
+   the new tree, not a mechanical count update. Worth re-running this
+   command after step 4
    as well, since it is cheap and a reapply can go wrong in the other direction.
 
    One more limit, because it is the difference between "verified" and

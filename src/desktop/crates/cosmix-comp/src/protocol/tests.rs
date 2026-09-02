@@ -35848,6 +35848,32 @@ fn vendored_xwm_unmap_callback_precedes_the_null() {
          declaration, the one dispatch call); re-verify the dispatch ordering by hand, \
          then update this count"
     );
+    // Spelling-independent net: a null written as `.take()`, `mem::replace`
+    // or an assignment from an Option-valued variable moves neither literal
+    // count above — and `.take()` on a `SharedSurfaceState` field is the
+    // house idiom nine lines above the pinned null (`mapped_onto.take()`,
+    // :1709). `wl_surface = ` catches any assignment shape; the negatives
+    // catch the taking idioms.
+    assert_eq!(
+        source.matches("wl_surface = ").count(),
+        4,
+        "the total population of wl_surface assignments in xwm/mod.rs changed (was 4: \
+         the unmap null, a tracing log field, the pairing write, the unpaired null); \
+         re-verify each site's position relative to unmapped_window by hand, then \
+         update this count"
+    );
+    assert_eq!(
+        source.matches("wl_surface.take()").count(),
+        0,
+        "xwm/mod.rs now takes wl_surface — a null spelled without an assignment \
+         literal; re-verify by hand where it sits relative to unmapped_window"
+    );
+    assert_eq!(
+        source.matches("mem::replace").count(),
+        0,
+        "xwm/mod.rs now uses mem::replace — re-verify by hand whether it writes \
+         wl_surface"
+    );
     assert!(
         source.find(callback).unwrap() < source.find(null).unwrap(),
         "the vendor must invoke unmapped_window BEFORE nulling state.wl_surface: comp's \
@@ -35859,19 +35885,31 @@ fn vendored_xwm_unmap_callback_precedes_the_null() {
 
 /// Routing guard for the source pins above and the fix-8 presence guard:
 /// they read files under `vendor/smithay/`, which means anything only while
-/// the workspace COMPILES that tree. The guard asserts the RESOLUTION, not
-/// the request: `Cargo.toml` can contain a byte-identical patch table while
-/// cargo resolves registry smithay anyway — a version-mismatched patch is a
-/// warning, not an error (vendor/README.md records that outcome as
-/// measured), and a commented-out table still "contains" the text. The
-/// direct observation is `Cargo.lock`: a path-resolved package block has no
-/// `source =` line, a registry one does (cf. smithay-client-toolkit's
-/// `source = "registry+…"` + checksum).
+/// the workspace COMPILES that tree. TWO orthogonal axes, both asserted:
+///
+/// - RESOLUTION (`Cargo.lock`): a path-resolved package block has no
+///   `source =` line, a registry one does (cf. smithay-client-toolkit's
+///   `source = "registry+…"` + checksum). Catches a registry fallback.
+/// - IDENTITY (`Cargo.toml` text): the lock omits `source` for EVERY path
+///   source, so it cannot say WHICH path — vendor smithay 0.8 to
+///   `vendor/smithay-next`, repoint the patch, leave the old tree on disk,
+///   and the lock stays sourceless while every pin reads the abandoned
+///   tree. The manifest text is the identity axis the lock lacks.
+///
+/// Honest weight: this guard is defence-in-depth, not the front line.
+/// `cosmix-comp/Cargo.toml`'s dev-dependency demands the CosMix-invented
+/// `cosmix_offline_test` feature unconditionally, so a dropped or
+/// version-mismatched patch is a HARD resolution error in the default
+/// suite (registry smithay has no such feature) — not the bare warning the
+/// plain-build trap in vendor/README.md describes. The guard is
+/// load-bearing in the compound case: that feature demand removed AND the
+/// routing broken, or the vendor-next repoint above, which errors nowhere.
 #[test]
 fn vendored_smithay_is_the_compiled_smithay() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
-    let lock = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("workspace Cargo.lock unreadable at {path:?}: {error}"));
+    let lock_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
+    let lock = std::fs::read_to_string(&lock_path).unwrap_or_else(|error| {
+        panic!("workspace Cargo.lock unreadable at {lock_path:?}: {error}")
+    });
     let header = "\nname = \"smithay\"\n";
     assert_eq!(
         lock.matches(header).count(),
@@ -35885,9 +35923,19 @@ fn vendored_smithay_is_the_compiled_smithay() {
     let block = &rest[..block_end];
     assert!(
         !block.contains("source ="),
-        "cargo resolved smithay from a REGISTRY, not vendor/ — the patch is missing, \
-         commented out, or version-mismatched (a warning, not an error!), and every \
-         source pin above is green-reading a tree that is not being compiled"
+        "cargo resolved smithay from a REGISTRY, not a path — the patch is missing, \
+         commented out, or version-mismatched, and every source pin above is \
+         green-reading a tree that is not being compiled"
+    );
+    let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_else(|error| {
+        panic!("workspace Cargo.toml unreadable at {manifest_path:?}: {error}")
+    });
+    assert!(
+        manifest.contains("smithay = { path = \"vendor/smithay\" }"),
+        "smithay no longer routes to vendor/smithay SPECIFICALLY — the lock cannot see \
+         which path (cargo omits `source` for every path source), so if the vendor tree \
+         moved, every source pin above must move with it"
     );
 }
 
@@ -35920,6 +35968,31 @@ fn vendored_xwayland_shell_null_population_is_pinned() {
         1,
         "the population of xwayland_shell.rs wl_surface writes changed (was: the commit \
          hook's pairing write); re-verify by hand, then update this count"
+    );
+    // Spelling-independent net under the two literals above: a null written
+    // as `.take()`, `mem::replace`, or an assignment from an Option-valued
+    // variable moves neither literal count — and `.take()` on a
+    // `SharedSurfaceState` field is the house idiom (cf. xwm/mod.rs:1709,
+    // nine lines above the pinned null). `wl_surface = ` catches any
+    // assignment of any shape; the negatives catch the taking idioms.
+    assert_eq!(
+        source.matches("wl_surface = ").count(),
+        3,
+        "the total population of wl_surface assignments in xwayland_shell.rs changed \
+         (was 3: two tracing log fields and the pairing write); re-verify by hand, \
+         then update this count"
+    );
+    assert_eq!(
+        source.matches("wl_surface.take()").count(),
+        0,
+        "xwayland_shell.rs now takes wl_surface — a null spelled without an assignment \
+         literal; re-verify by hand where it sits relative to unmapped_window"
+    );
+    assert_eq!(
+        source.matches("mem::replace").count(),
+        0,
+        "xwayland_shell.rs now uses mem::replace — re-verify by hand whether it writes \
+         wl_surface"
     );
 }
 
@@ -36060,12 +36133,14 @@ mod x11 {
 
     /// Fabricate a normal X11 window, run new-window → map-request →
     /// association (X-first order), and return the pieces. Associates with
-    /// `Some(1)` as the `WL_SURFACE_SERIAL` — the production shape — so an
-    /// incidental unmap-with-nulled-resolution elsewhere in the suite does
-    /// not hit the classifier's `None == None` arm and silently dirty the
-    /// flip counter, which is meant to be a clean instrument for exactly
-    /// one claim. A test that wants the pre-serial shape asks for it with
-    /// `associate_normal_window_with_serial(.., None)`.
+    /// `Some(1)` as the `WL_SURFACE_SERIAL` purely for REALISM — production
+    /// associations always carry one. Be precise about what this does not
+    /// buy: the unmap classifier compares current against association, both
+    /// halves come from the same fake state, and nothing mutates the serial
+    /// after association — so `Some(1) == Some(1)` takes the same flip arm
+    /// `None == None` would, and each test's own harness means the flip
+    /// counter was never cross-test dirtiable anyway. Tests that need a
+    /// specific serial use `associate_normal_window_with_serial`.
     fn associate_normal_window(
         harness: &mut KeybindingHarness,
         xid: u32,
