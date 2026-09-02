@@ -443,3 +443,31 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Seam guard: the smoke gate's `--ime` arm greps this binary's stdout for
+    /// each milestone, across a repo boundary
+    /// (`$CMCTL/_bin/smoke_desktop_nested.mix`). Reword a milestone without
+    /// updating the gate and the arm silently stops seeing it — which reads as
+    /// the compositor failing to activate or paint, not as a broken needle.
+    /// That exact failure shape already cost this project a false bug report
+    /// once; this is the cheap insurance against a second.
+    #[test]
+    fn milestone_lines_match_the_gate_needles() {
+        let source = include_str!("main.rs");
+        for needle in [
+            "IMEPROBE activate",
+            "IMEPROBE painted",
+            "IMEPROBE text-input entered",
+            "no zwp_input_method_manager_v2 advertised",
+        ] {
+            assert!(
+                source.contains(needle),
+                "milestone {needle:?} was reworded: update the --ime arm's grep in \
+                 _bin/smoke_desktop_nested.mix (cmctl) in the same change, or the gate \
+                 stops seeing a milestone it reports as a compositor failure"
+            );
+        }
+    }
+}

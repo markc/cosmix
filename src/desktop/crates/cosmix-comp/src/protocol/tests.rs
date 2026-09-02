@@ -36297,6 +36297,35 @@ fn x11_unmap_pin_warn_message_matches_the_gate_needle() {
     );
 }
 
+/// The second seam guard, added after the first one of these failed for real.
+///
+/// The nested smoke gate'\''s `--x-menu` arm greps comp'\''s log for
+/// `role="x11-override-redirect"` to decide whether an override-redirect
+/// window mapped. That string is produced HERE, by `SurfaceRole::kind()`, and
+/// the grep lives across a repo boundary in `$CMCTL/_bin/smoke_desktop_nested.mix`.
+///
+/// This guard exists because the arm originally hunted a DIFFERENT string —
+/// `"override-redirect X11 window mapped"` — which comp does contain but which
+/// sat behind an `insert()` that had already returned false by then, so the
+/// line never printed. An assertion whose needle matches nothing the program
+/// can emit is one that can only FAIL, and it cost a false "the feature
+/// produces nothing" report to the implementer before anyone doubted the
+/// needle. Rename the role string ONLY together with the gate'\''s grep.
+#[cfg(feature = "xwayland")]
+#[test]
+fn x11_override_redirect_role_string_matches_the_gate_needle() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/protocol/mod.rs");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("mod.rs unreadable at {path:?}: {error}"));
+    assert_eq!(
+        source.matches("\"x11-override-redirect\"").count(),
+        1,
+        "the override-redirect role string moved or was reworded: update the needle in \
+         _bin/smoke_desktop_nested.mix (cmctl) in the same change, or the --x-menu arm \
+         hunts a string comp cannot emit and reds against working code"
+    );
+}
+
 #[cfg(feature = "xwayland")]
 mod x11 {
     use super::*;

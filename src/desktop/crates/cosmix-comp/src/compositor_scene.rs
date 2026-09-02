@@ -2086,11 +2086,20 @@ fn resize_compositor_logical_canvas(world: &mut World, width: u32, height: u32) 
     refresh_lock_blank(world);
 }
 
+/// Upsert with an EXPLICIT kind, the way production does it.
+///
+/// Production never derives kind from `layout.toplevel`: it comes from
+/// `SurfaceRole::scene_kind()` protocol-side and travels inside the snapshot.
+/// The derived helper below cannot express `kind = Toplevel` with
+/// `toplevel = None` — the combination ONLY override-redirect X11 records
+/// produce — so every test written through it is structurally blind to that
+/// shape. Reach for this one whenever the kind matters.
 #[cfg(test)]
-fn upsert_surface(
+fn upsert_surface_with_kind(
     world: &mut World,
     id: SurfaceId,
     layout: SurfaceLayout,
+    kind: SceneSurfaceKind,
     frame: SurfaceFrame,
 ) -> bool {
     upsert_surface_snapshot(
@@ -2098,15 +2107,28 @@ fn upsert_surface(
         id,
         SurfaceSceneSnapshot {
             layout,
-            kind: if layout.toplevel.is_some() {
-                SceneSurfaceKind::Toplevel
-            } else {
-                SceneSurfaceKind::Subsurface
-            },
+            kind,
             title: None,
         },
         frame,
     )
+}
+
+/// Convenience for the managed shapes, where kind and `layout.toplevel` do
+/// agree. NOT how production derives kind — see `upsert_surface_with_kind`.
+#[cfg(test)]
+fn upsert_surface(
+    world: &mut World,
+    id: SurfaceId,
+    layout: SurfaceLayout,
+    frame: SurfaceFrame,
+) -> bool {
+    let kind = if layout.toplevel.is_some() {
+        SceneSurfaceKind::Toplevel
+    } else {
+        SceneSurfaceKind::Subsurface
+    };
+    upsert_surface_with_kind(world, id, layout, kind, frame)
 }
 
 fn upsert_surface_snapshot(
@@ -4462,6 +4484,80 @@ mod tests {
             300,
         );
         assert_eq!(transform.translation.z, CURSOR_Z);
+    }
+
+    /// The override-redirect shape reaches the scene as a visible root entity.
+    ///
+    /// `kind = Toplevel` with `toplevel = None` is produced by exactly one
+    /// thing in production — an override-redirect X11 record — and until this
+    /// test the scene harness could not even CONSTRUCT it, because its helper
+    /// derived kind from `toplevel.is_some()`. That is why a blank-menu
+    /// investigation could not be settled offline: not merely that nothing
+    /// renders in a unit test, but that the harness could not represent the
+    /// state under suspicion.
+    ///
+    /// What it pins is narrow and deliberate: record -> entity is
+    /// role-agnostic. It does NOT cover the dmabuf/alpha path (offline tests
+    /// cannot mint dmabufs), so it is not a substitute for the live gate.
+    #[test]
+    fn an_override_redirect_shaped_snapshot_becomes_a_visible_root_entity() {
+        let mut world = World::new();
+        world.insert_resource(LogicalCanvasSize(Vec2::new(320.0, 240.0)));
+        world.insert_resource(RendererOutputScale120(120));
+        world.insert_resource(SurfaceEntities::default());
+        world.insert_resource(Assets::<Image>::default());
+        insert_client_surface_render_resources(&mut world);
+
+        let mut or_layout = layout(1);
+        // The combination that only an override-redirect record produces.
+        or_layout.toplevel = None;
+        or_layout.parent = None;
+        or_layout.visible = true;
+        upsert_surface_with_kind(
+            &mut world,
+            SurfaceId(1),
+            or_layout,
+            SceneSurfaceKind::Toplevel,
+            frame(1),
+        );
+
+        let entities = world.resource::<SurfaceEntities>();
+        let surface = entities
+            .surfaces
+            .get(&SurfaceId(1))
+            .expect("an override-redirect shaped snapshot produces a scene entity");
+        assert_eq!(
+            surface.kind,
+            SceneSurfaceKind::Toplevel,
+            "the scene stores the kind the protocol sent, and never re-derives it \
+             from layout.toplevel"
+        );
+        assert!(
+            surface.layout.visible,
+            "a visible override-redirect record stays visible in the scene"
+        );
+        assert!(
+            world.get_entity(surface.entity).is_ok(),
+            "the entity is live, not merely recorded"
+        );
+
+        // And the claim this test exists to make FAILABLE: the derived helper
+        // cannot express the shape above. Given the same layout it produces
+        // Subsurface, so a test written through it is examining a different
+        // record than production would build. If someone ever teaches the
+        // derived helper to carry kind properly, this assertion fails and the
+        // explicit helper can retire — which is the outcome to want.
+        let mut same_layout = layout(2);
+        same_layout.toplevel = None;
+        same_layout.visible = true;
+        upsert_surface(&mut world, SurfaceId(2), same_layout, frame(2));
+        let derived = world.resource::<SurfaceEntities>().surfaces[&SurfaceId(2)].kind;
+        assert_eq!(
+            derived,
+            SceneSurfaceKind::Subsurface,
+            "the derived helper mis-kinds the override-redirect shape as a subsurface; \
+             that is exactly why upsert_surface_with_kind exists"
+        );
     }
 
     #[test]
