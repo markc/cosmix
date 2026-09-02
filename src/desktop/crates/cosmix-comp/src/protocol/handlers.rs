@@ -2717,3 +2717,5 @@ impl Dispatch<ZwlrLayerShellV1, ()> for WaylandState {
         );
     }
 }
+
+delegate_relative_pointer!(WaylandState);

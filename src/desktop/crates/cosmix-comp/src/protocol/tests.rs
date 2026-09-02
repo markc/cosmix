@@ -14606,7 +14606,12 @@ fn device_removal_reconciliation_does_not_resume_idle_notification() {
     );
 
     harness.route(InputEvent::PointerMotion {
-        event: FakeMotionEvent { dx: 1.0, dy: 0.0 },
+        event: FakeMotionEvent {
+            dx: 1.0,
+            dy: 0.0,
+            dx_unaccel: None,
+            dy_unaccel: None,
+        },
     });
     let real_activity = harness.sync();
     assert!(
@@ -16894,9 +16899,71 @@ impl KeyboardKeyEvent<FakeInput> for FakeKeyEvent {
     }
 }
 
+/// The unaccelerated vector must survive the transport SEPARATELY from the
+/// accelerated one. `zwp_relative_pointer_v1` carries both because a client
+/// doing its own cursor maths — a game, a 3D viewport, a remote-desktop viewer
+/// — needs the raw delta, and would apply acceleration twice if handed the
+/// accelerated one under its name.
+///
+/// This test can only fail because `FakeMotionEvent` now reports a DIFFERENT
+/// unaccelerated pair. While it returned `dx`/`dy` for both, passing `dx` twice
+/// in the producer — the exact slip this guards — was indistinguishable from
+/// correct code.
+#[test]
+fn relative_motion_carries_the_unaccelerated_vector_separately() {
+    let motion = InputEvent::<FakeInput>::PointerMotion {
+        event: FakeMotionEvent {
+            dx: 12.0,
+            dy: -4.0,
+            dx_unaccel: Some(3.0),
+            dy_unaccel: Some(-1.0),
+        },
+    };
+    let mut ingress = super::input::InputIngressState::default();
+    let super::input::InputRouting::Deliver(inputs) =
+        super::input::host_input_from_event(&mut ingress, &motion, (1920, 1080), || {
+            super::input::SeatHeldState {
+                keys: HashSet::new(),
+                buttons: Vec::new(),
+            }
+        })
+    else {
+        panic!("relative motion produces a seat input");
+    };
+    let [
+        HostInput::PointerMotion {
+            dx,
+            dy,
+            dx_unaccel,
+            dy_unaccel,
+            ..
+        },
+    ] = inputs.as_slice()
+    else {
+        panic!("one relative motion: {inputs:?}");
+    };
+    assert_eq!(
+        (*dx, *dy),
+        (12.0, -4.0),
+        "the accelerated vector is carried"
+    );
+    assert_eq!(
+        (*dx_unaccel, *dy_unaccel),
+        (3.0, -1.0),
+        "and the unaccelerated vector is carried as itself, not as a copy of the accelerated one"
+    );
+}
+
 struct FakeMotionEvent {
     dx: f64,
     dy: f64,
+    /// Deliberately SEPARATE from `dx`/`dy`. While the fake reported the
+    /// accelerated delta for both, a test asserting the unaccelerated vector
+    /// reaches the client could not distinguish the two and so could not fail.
+    /// `Default` keeps it equal to the accelerated pair, which is what every
+    /// pre-existing construction site means.
+    dx_unaccel: Option<f64>,
+    dy_unaccel: Option<f64>,
 }
 
 impl Event<FakeInput> for FakeMotionEvent {
@@ -16919,11 +16986,11 @@ impl PointerMotionEvent<FakeInput> for FakeMotionEvent {
     }
 
     fn delta_x_unaccel(&self) -> f64 {
-        self.dx
+        self.dx_unaccel.unwrap_or(self.dx)
     }
 
     fn delta_y_unaccel(&self) -> f64 {
-        self.dy
+        self.dy_unaccel.unwrap_or(self.dy)
     }
 }
 
@@ -17322,10 +17389,20 @@ fn fake_backend_relative_motion_accumulates_into_one_cursor_position() {
     let origin = harness.server.state.cursor_position;
 
     harness.route(InputEvent::PointerMotion {
-        event: FakeMotionEvent { dx: 30.0, dy: 20.0 },
+        event: FakeMotionEvent {
+            dx: 30.0,
+            dy: 20.0,
+            dx_unaccel: None,
+            dy_unaccel: None,
+        },
     });
     harness.route(InputEvent::PointerMotion {
-        event: FakeMotionEvent { dx: 12.0, dy: 5.0 },
+        event: FakeMotionEvent {
+            dx: 12.0,
+            dy: 5.0,
+            dx_unaccel: None,
+            dy_unaccel: None,
+        },
     });
     let events = harness.sync();
 
@@ -17361,6 +17438,8 @@ fn fake_backend_relative_motion_clamps_to_the_output_instead_of_losing_focus() {
         event: FakeMotionEvent {
             dx: f64::from(width) * 4.0,
             dy: f64::from(height) * 4.0,
+            dx_unaccel: None,
+            dy_unaccel: None,
         },
     });
     let far_corner = harness.sync();
@@ -17400,6 +17479,8 @@ fn fake_backend_relative_motion_clamps_to_the_output_instead_of_losing_focus() {
         event: FakeMotionEvent {
             dx: f64::from(width) * -8.0,
             dy: f64::from(height) * -8.0,
+            dx_unaccel: None,
+            dy_unaccel: None,
         },
     });
     let origin = harness.sync();

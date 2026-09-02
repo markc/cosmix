@@ -102,8 +102,8 @@ use smithay::{
     backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonState, KeyState, TouchSlot},
     delegate_data_control, delegate_data_device, delegate_dmabuf, delegate_ext_data_control,
     delegate_foreign_toplevel_list, delegate_fractional_scale, delegate_idle_notify,
-    delegate_output, delegate_primary_selection, delegate_seat, delegate_session_lock,
-    delegate_shm, delegate_viewporter, delegate_xdg_activation,
+    delegate_output, delegate_primary_selection, delegate_relative_pointer, delegate_seat,
+    delegate_session_lock, delegate_shm, delegate_viewporter, delegate_xdg_activation,
     desktop::{
         LayerMap, LayerSurface as DesktopLayerSurface, PopupKeyboardGrab, PopupKind, PopupManager,
         PopupPointerGrab, find_popup_root_surface, layer_map_for_output,
@@ -113,7 +113,7 @@ use smithay::{
         keyboard::{FilterResult, KeyboardHandle, Keycode},
         pointer::{
             AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, Focus, MotionEvent,
-            PointerHandle,
+            PointerHandle, RelativeMotionEvent,
         },
         touch::{
             DownEvent as TouchDownEvent, MotionEvent as TouchMotionEvent, UpEvent as TouchUpEvent,
@@ -168,6 +168,7 @@ use smithay::{
         fractional_scale::{self, FractionalScaleHandler, FractionalScaleManagerState},
         idle_notify::{IdleNotifierHandler, IdleNotifierState},
         output::{OutputHandler, OutputManagerState},
+        relative_pointer::RelativePointerManagerState,
         seat::CURSOR_IMAGE_ROLE,
         selection::{
             SelectionHandler, SelectionSource, SelectionTarget,
@@ -719,6 +720,12 @@ pub(crate) enum HostInput {
     PointerMotion {
         dx: f64,
         dy: f64,
+        /// The same motion before pointer acceleration. libinput reports both
+        /// and `zwp_relative_pointer_v1` carries both, because a client doing
+        /// its own acceleration (a game, a 3D viewport) needs the raw vector
+        /// and would otherwise have acceleration applied twice.
+        dx_unaccel: f64,
+        dy_unaccel: f64,
         time: u32,
     },
     /// The host pointer left the nested compositor window. There is no client
@@ -2721,6 +2728,13 @@ impl ProtocolServer {
         // worse than not offering it, because clients would stop falling back
         // to their own workarounds.
         let xdg_activation_state = XdgActivationState::new::<WaylandState>(&display_handle);
+        // Relative pointer: raw motion deltas for clients that do their own
+        // cursor maths — games, 3D viewports, remote-desktop viewers. Only a
+        // relative input device feeds it, so it is live on a real seat and
+        // silent under the nested transport, which sees absolute host
+        // coordinates only.
+        let relative_pointer_state =
+            RelativePointerManagerState::new::<WaylandState>(&display_handle);
         let primary_selection_state = PrimarySelectionState::new::<WaylandState>(&display_handle);
         let wlr_data_control_state = WlrDataControlState::new::<WaylandState, _>(
             &display_handle,
@@ -2855,6 +2869,8 @@ impl ProtocolServer {
             dmabuf_validation,
             data_device_state,
             xdg_activation_state,
+            relative_pointer_state,
+            pending_relative_motion: None,
             primary_selection_state,
             wlr_data_control_state,
             ext_data_control_state,
@@ -4480,6 +4496,14 @@ struct SurfaceRecord {
     logged_diagnostics: HashSet<SurfaceDiagnostic>,
 }
 
+/// A relative pointer vector waiting for `pointer_moved` to resolve focus.
+#[derive(Clone, Copy, Debug)]
+struct PendingRelativeMotion {
+    delta: (f64, f64),
+    delta_unaccel: (f64, f64),
+    time: u32,
+}
+
 impl SurfaceRecord {
     fn scene_snapshot(&self) -> SurfaceSceneSnapshot {
         SurfaceSceneSnapshot {
@@ -5493,6 +5517,17 @@ struct WaylandState {
     dmabuf_validation: Option<SyncSender<DmabufValidationRequest>>,
     data_device_state: DataDeviceState,
     xdg_activation_state: XdgActivationState,
+    /// Held, never read. `zwp_relative_pointer_v1` has no handler trait — the
+    /// compositor drives it by calling `PointerHandle::relative_motion`, not by
+    /// answering callbacks — so nothing ever asks for this state back. It is
+    /// retained rather than dropped because a state object owning a `GlobalId`
+    /// is the shape every other protocol here uses, and a future Smithay that
+    /// gave it a `Drop` (unregistering the global) would silently retire the
+    /// protocol if this were let go at construction. Kept deliberately, not
+    /// forgotten.
+    #[allow(dead_code)]
+    relative_pointer_state: RelativePointerManagerState,
+    pending_relative_motion: Option<PendingRelativeMotion>,
     primary_selection_state: PrimarySelectionState,
     wlr_data_control_state: WlrDataControlState,
     ext_data_control_state: ExtDataControlState,
@@ -8127,7 +8162,13 @@ impl WaylandState {
         }
         match input {
             HostInput::PointerMotionAbsolute { x, y, time } => self.pointer_moved(x, y, time),
-            HostInput::PointerMotion { dx, dy, time } => self.pointer_motion(dx, dy, time),
+            HostInput::PointerMotion {
+                dx,
+                dy,
+                dx_unaccel,
+                dy_unaccel,
+                time,
+            } => self.pointer_motion(dx, dy, dx_unaccel, dy_unaccel, time),
             HostInput::PointerLeave => {
                 #[cfg(feature = "bus")]
                 self.reset_corner_detector();
@@ -10833,6 +10874,27 @@ impl WaylandState {
             Some(PointerTarget::Chrome { .. }) | None => None,
         };
         let pointer = self.pointer.clone();
+        // `zwp_relative_pointer_v1` before `wl_pointer.motion`, matching the
+        // ordering every other compositor ships: a client reading both sees the
+        // delta that produced the position it is about to be given.
+        //
+        // Only a RELATIVE device produces this — the nested transport is handed
+        // absolute host coordinates and sets nothing here, so on a nested run
+        // no relative motion is sent at all. That is correct rather than a gap:
+        // a derived delta would be a fabrication, and under a pointer lock it
+        // would be a fabrication of exactly ZERO, since a locked cursor does not
+        // move.
+        if let Some(relative) = self.pending_relative_motion.take() {
+            pointer.relative_motion(
+                self,
+                focus.clone(),
+                &RelativeMotionEvent {
+                    delta: relative.delta.into(),
+                    delta_unaccel: relative.delta_unaccel.into(),
+                    utime: u64::from(relative.time) * 1000,
+                },
+            );
+        }
         pointer.motion(
             self,
             focus.clone(),
@@ -10854,7 +10916,15 @@ impl WaylandState {
     /// — including the confinement, which a bare-metal pointer needs because it
     /// has no host window to be bounded by and would otherwise walk off the
     /// output and silently lose focus at the first edge.
-    fn pointer_motion(&mut self, dx: f64, dy: f64, time: u32) {
+    fn pointer_motion(&mut self, dx: f64, dy: f64, dx_unaccel: f64, dy_unaccel: f64, time: u32) {
+        // Stash the relative vector for `pointer_moved` to emit once it has
+        // resolved focus. Relative motion must go to the SAME surface the
+        // absolute event goes to, and only `pointer_moved` knows which that is.
+        self.pending_relative_motion = Some(PendingRelativeMotion {
+            delta: (dx, dy),
+            delta_unaccel: (dx_unaccel, dy_unaccel),
+            time,
+        });
         self.pointer_moved(
             self.cursor_position.0 + dx,
             self.cursor_position.1 + dy,

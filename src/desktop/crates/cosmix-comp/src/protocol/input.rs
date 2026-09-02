@@ -497,6 +497,11 @@ pub(crate) fn host_input_from_event<B: InputBackend>(
             InputRouting::deliver(HostInput::PointerMotion {
                 dx: event.delta_x(),
                 dy: event.delta_y(),
+                // libinput reports the pre-acceleration vector separately and
+                // `zwp_relative_pointer_v1` carries it, because a client doing
+                // its own acceleration would otherwise accelerate twice.
+                dx_unaccel: event.delta_x_unaccel(),
+                dy_unaccel: event.delta_y_unaccel(),
                 time: event.time_msec(),
             })
         }
