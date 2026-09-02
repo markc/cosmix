@@ -102,8 +102,9 @@ use smithay::{
     backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonState, KeyState, TouchSlot},
     delegate_data_control, delegate_data_device, delegate_dmabuf, delegate_ext_data_control,
     delegate_foreign_toplevel_list, delegate_fractional_scale, delegate_idle_notify,
-    delegate_output, delegate_primary_selection, delegate_relative_pointer, delegate_seat,
-    delegate_session_lock, delegate_shm, delegate_viewporter, delegate_xdg_activation,
+    delegate_output, delegate_pointer_constraints, delegate_primary_selection,
+    delegate_relative_pointer, delegate_seat, delegate_session_lock, delegate_shm,
+    delegate_viewporter, delegate_xdg_activation,
     desktop::{
         LayerMap, LayerSurface as DesktopLayerSurface, PopupKeyboardGrab, PopupKind, PopupManager,
         PopupPointerGrab, find_popup_root_surface, layer_map_for_output,
@@ -168,6 +169,10 @@ use smithay::{
         fractional_scale::{self, FractionalScaleHandler, FractionalScaleManagerState},
         idle_notify::{IdleNotifierHandler, IdleNotifierState},
         output::{OutputHandler, OutputManagerState},
+        pointer_constraints::{
+            PointerConstraint, PointerConstraintsHandler, PointerConstraintsState,
+            with_pointer_constraint,
+        },
         relative_pointer::RelativePointerManagerState,
         seat::CURSOR_IMAGE_ROLE,
         selection::{
@@ -2735,6 +2740,13 @@ impl ProtocolServer {
         // coordinates only.
         let relative_pointer_state =
             RelativePointerManagerState::new::<WaylandState>(&display_handle);
+        // Pointer lock/confinement. The other half of what a game or a 3D
+        // viewport needs: relative motion tells it how far the mouse moved,
+        // and the lock is what stops the cursor walking off the window while
+        // it does. Advertised together with relative-pointer because either
+        // alone is unusable for the clients that ask for them.
+        let pointer_constraints_state =
+            PointerConstraintsState::new::<WaylandState>(&display_handle);
         let primary_selection_state = PrimarySelectionState::new::<WaylandState>(&display_handle);
         let wlr_data_control_state = WlrDataControlState::new::<WaylandState, _>(
             &display_handle,
@@ -2870,6 +2882,7 @@ impl ProtocolServer {
             data_device_state,
             xdg_activation_state,
             relative_pointer_state,
+            pointer_constraints_state,
             pending_relative_motion: None,
             primary_selection_state,
             wlr_data_control_state,
@@ -5527,6 +5540,11 @@ struct WaylandState {
     /// forgotten.
     #[allow(dead_code)]
     relative_pointer_state: RelativePointerManagerState,
+    /// Held, never read — same reason as `relative_pointer_state` above: the
+    /// compositor drives constraints by calling `with_pointer_constraint`, so
+    /// nothing asks for the state object back.
+    #[allow(dead_code)]
+    pointer_constraints_state: PointerConstraintsState,
     pending_relative_motion: Option<PendingRelativeMotion>,
     primary_selection_state: PrimarySelectionState,
     wlr_data_control_state: WlrDataControlState,
@@ -10916,6 +10934,25 @@ impl WaylandState {
     /// — including the confinement, which a bare-metal pointer needs because it
     /// has no host window to be bounded by and would otherwise walk off the
     /// output and silently lose focus at the first edge.
+    /// Whether the surface under the pointer holds an ACTIVE lock.
+    ///
+    /// `is_active` is the load-bearing half: a client may create a constraint
+    /// that this compositor has not activated (it activates on pointer focus),
+    /// and an inactive constraint must not freeze anything.
+    fn pointer_is_locked(&self) -> bool {
+        let Some(focus) = self.pointer.current_focus() else {
+            return false;
+        };
+        let Some(surface) = focus.owned_surface() else {
+            return false;
+        };
+        with_pointer_constraint(&surface, &self.pointer, |constraint| {
+            constraint.is_some_and(|constraint| {
+                constraint.is_active() && matches!(&*constraint, PointerConstraint::Locked(_))
+            })
+        })
+    }
+
     fn pointer_motion(&mut self, dx: f64, dy: f64, dx_unaccel: f64, dy_unaccel: f64, time: u32) {
         // Stash the relative vector for `pointer_moved` to emit once it has
         // resolved focus. Relative motion must go to the SAME surface the
@@ -10925,6 +10962,34 @@ impl WaylandState {
             delta_unaccel: (dx_unaccel, dy_unaccel),
             time,
         });
+        if self.pointer_is_locked() {
+            // Locked: deliver the delta and leave the cursor exactly where it
+            // is. Resolving focus at the UNCHANGED position is the point — the
+            // lock exists so that focus cannot move, and re-deriving it here
+            // rather than caching it keeps one source of truth for which
+            // surface the pointer is over.
+            let (x, y) = self.cursor_position;
+            let focus = match self.pointer_target_at(x, y) {
+                Some(PointerTarget::Client { surface, origin }) => {
+                    Some((self.seat_focus_target_for(&surface), origin))
+                }
+                Some(PointerTarget::Chrome { .. }) | None => None,
+            };
+            let pointer = self.pointer.clone();
+            if let Some(relative) = self.pending_relative_motion.take() {
+                pointer.relative_motion(
+                    self,
+                    focus,
+                    &RelativeMotionEvent {
+                        delta: relative.delta.into(),
+                        delta_unaccel: relative.delta_unaccel.into(),
+                        utime: u64::from(relative.time) * 1000,
+                    },
+                );
+                pointer.frame(self);
+            }
+            return;
+        }
         self.pointer_moved(
             self.cursor_position.0 + dx,
             self.cursor_position.1 + dy,

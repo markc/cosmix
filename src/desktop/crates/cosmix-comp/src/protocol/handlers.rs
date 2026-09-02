@@ -2025,6 +2025,57 @@ impl SelectionHandler for WaylandState {
     }
 }
 
+impl PointerConstraintsHandler for WaylandState {
+    fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
+        // Activation is compositor policy — Smithay deliberately does not do it
+        // for you. The policy here is the conventional one: a constraint becomes
+        // active only while its surface actually has the pointer, so a client
+        // cannot lock a pointer that is somewhere else entirely.
+        //
+        // Per the agentic-first law there is no further gate: no click-to-confirm,
+        // no allowlist. A lock is released by the client, by focus leaving, or by
+        // the compositor tearing it down — never by asking a human first.
+        let focused = pointer
+            .current_focus()
+            .and_then(|focus| focus.owned_surface())
+            .is_some_and(|focused| &focused == surface);
+        if !focused {
+            return;
+        }
+        with_pointer_constraint(surface, pointer, |constraint| {
+            if let Some(constraint) = constraint {
+                constraint.activate();
+            }
+        });
+    }
+
+    fn cursor_position_hint(
+        &mut self,
+        surface: &WlSurface,
+        pointer: &PointerHandle<Self>,
+        location: Point<f64, Logical>,
+    ) {
+        // Where the client wants the cursor to reappear when the lock ends.
+        // Honoured only while the lock is ACTIVE and only for the surface that
+        // holds it: an inactive constraint asking to move the cursor is a client
+        // moving a pointer it does not own.
+        let active = with_pointer_constraint(surface, pointer, |constraint| {
+            constraint.is_some_and(|constraint| constraint.is_active())
+        });
+        if !active {
+            return;
+        }
+        let Some(record) = self.surfaces.get(&surface.id()) else {
+            return;
+        };
+        let origin = record.window_origin;
+        self.cursor_position = (
+            f64::from(origin.0) + location.x,
+            f64::from(origin.1) + location.y,
+        );
+    }
+}
+
 impl XdgActivationHandler for WaylandState {
     fn activation_state(&mut self) -> &mut XdgActivationState {
         &mut self.xdg_activation_state
@@ -2719,3 +2770,4 @@ impl Dispatch<ZwlrLayerShellV1, ()> for WaylandState {
 }
 
 delegate_relative_pointer!(WaylandState);
+delegate_pointer_constraints!(WaylandState);
