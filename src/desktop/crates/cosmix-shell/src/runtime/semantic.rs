@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::core::{Edge, OutputKey, PanelInput};
 
-use super::{CarouselInput, ShellCommand, ShellCommandKind, ShellFrame};
+use super::{CarouselInput, ShellCommand, ShellCommandKind};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShellSemanticVerb {
@@ -19,8 +19,11 @@ pub enum ShellSemanticVerb {
 }
 
 /// Produce the same [`ShellCommand`] used by pointer and keyboard input.
+///
+/// Deliberately takes no frame snapshot: every verb (toggle included) binds
+/// its direction inside the core at Model time, so a stale snapshot cannot
+/// mis-route a verb and two toggles drained in one batch net to identity.
 pub fn semantic_shell_command(
-    frame: &ShellFrame,
     output: OutputKey,
     at: Duration,
     edge: Edge,
@@ -37,11 +40,7 @@ pub fn semantic_shell_command(
         },
         ShellSemanticVerb::PanelToggle => ShellCommandKind::Panel {
             edge,
-            input: if frame.panel(edge).mapped {
-                PanelInput::Hide
-            } else {
-                PanelInput::Reveal
-            },
+            input: PanelInput::Toggle,
         },
         ShellSemanticVerb::PanelPin => ShellCommandKind::Panel {
             edge,

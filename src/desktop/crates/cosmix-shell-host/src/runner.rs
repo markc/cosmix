@@ -4252,4 +4252,17 @@ mod tests {
         assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
         worker.join().unwrap();
     }
+
+    /// The Bus worker's cloned wake handle outlives the event loop. A wake
+    /// arriving after teardown must be an inert no-op (`try_send` on the
+    /// dropped calloop receiver errors and is ignored), never a panic.
+    #[test]
+    fn wake_after_runner_teardown_is_a_safe_no_op() {
+        let (sender, channel) = calloop::channel::sync_channel::<()>(1);
+        let wake = LayerHostWake(sender);
+        drop(channel);
+        wake.wake();
+        wake.wake();
+        wake.callback()();
+    }
 }

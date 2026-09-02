@@ -350,7 +350,6 @@ mod tests {
             let frame = adapted.world().resource::<ShellFrameState>().0.clone();
             let output = frame.geometry.output.clone();
             adapted.world_mut().write_message(semantic_shell_command(
-                &frame,
                 output.clone(),
                 Duration::ZERO,
                 Edge::Left,
@@ -402,7 +401,6 @@ mod tests {
         assert!(frame.panel(Edge::Left).mapped, "precondition: mapped");
         let output = frame.geometry.output.clone();
         adapted.world_mut().write_message(semantic_shell_command(
-            &frame,
             output.clone(),
             Duration::ZERO,
             Edge::Left,
@@ -425,6 +423,95 @@ mod tests {
         assert_eq!(
             adapted.world().resource::<ShellEffects>().0,
             direct.world().resource::<ShellEffects>().0,
+        );
+    }
+
+    /// A panel animating shut still has `mapped == true` but mode `Hidden`.
+    /// The toggle direction binds at Model time against the mode, so the user
+    /// can toggle a mid-conceal panel straight back open — the old
+    /// snapshot-keyed adapter sent `Hide` here (a no-op) and locked the panel
+    /// out until the unmap completed.
+    #[test]
+    fn semantic_toggle_reopens_a_panel_animating_shut() {
+        let mut app = app();
+        let output = app
+            .world()
+            .resource::<ShellFrameState>()
+            .0
+            .geometry
+            .output
+            .clone();
+        for (at, verb) in [
+            (Duration::ZERO, ShellSemanticVerb::PanelShow),
+            (Duration::from_millis(400), ShellSemanticVerb::PanelHide),
+        ] {
+            app.world_mut().write_message(semantic_shell_command(
+                output.clone(),
+                at,
+                Edge::Left,
+                verb,
+            ));
+            app.update();
+        }
+        // Mid-conceal: the panel is still mapped but semantically Hidden.
+        app.world_mut().write_message(semantic_shell_command(
+            output.clone(),
+            Duration::from_millis(450),
+            Edge::Left,
+            ShellSemanticVerb::PanelToggle,
+        ));
+        app.update();
+        let panel = app
+            .world()
+            .resource::<ShellFrameState>()
+            .0
+            .panel(Edge::Left)
+            .clone();
+        assert_eq!(
+            panel.mode,
+            PanelMode::Revealed,
+            "toggle must reopen a mid-conceal panel"
+        );
+        assert!(panel.mapped);
+    }
+
+    /// Two toggles drained in one Bus batch both apply within one update; with
+    /// the direction bound at Model time they net to identity instead of to a
+    /// single toggle read off the same stale frame.
+    #[test]
+    fn two_semantic_toggles_in_one_batch_net_to_identity() {
+        let mut app = app();
+        let output = app
+            .world()
+            .resource::<ShellFrameState>()
+            .0
+            .geometry
+            .output
+            .clone();
+        app.world_mut().write_message(semantic_shell_command(
+            output.clone(),
+            Duration::ZERO,
+            Edge::Left,
+            ShellSemanticVerb::PanelShow,
+        ));
+        app.update();
+        for _ in 0..2 {
+            app.world_mut().write_message(semantic_shell_command(
+                output.clone(),
+                Duration::from_millis(400),
+                Edge::Left,
+                ShellSemanticVerb::PanelToggle,
+            ));
+        }
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .mode,
+            PanelMode::Revealed,
+            "toggle+toggle in one batch must be identity, not one toggle"
         );
     }
 }

@@ -4,6 +4,11 @@
 
 - Add the renderer-neutral semantic panel/page adapter. Bus verbs now produce
   the same `ShellCommand` values as direct UI ingress.
+- Add `PanelInput::Toggle` to the core panel state machine. The toggle
+  direction binds at Model time against the authoritative mode (never a caller
+  frame snapshot), so a mid-conceal panel toggles straight back open and two
+  toggles in one drained batch net to identity. The semantic adapter emits it
+  and no longer takes a `ShellFrame`.
 
 ## 0.4.0 — 2026-09-02
 

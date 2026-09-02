@@ -24,6 +24,13 @@ pub enum PanelMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PanelInput {
     Reveal,
+    /// Reveal when `Hidden`, hide otherwise; a pinned panel ignores it (the
+    /// same law as [`PanelInput::Hide`]). The direction binds at APPLY time against the authoritative [`PanelMode`] — never
+    /// against a caller's frame snapshot — so a mid-conceal panel
+    /// (`mapped == true`, mode already `Hidden`) toggles back open, and two
+    /// toggles applied in one drained batch net to identity rather than to a
+    /// single toggle.
+    Toggle,
     CornerEntered,
     CornerLeft,
     Hide,
@@ -168,6 +175,18 @@ impl PanelStateMachine {
                     self.clear_deadline();
                 }
                 self.motion.reveal();
+            }
+            PanelInput::Toggle => {
+                if self.mode == PanelMode::Hidden {
+                    self.mode = PanelMode::Revealed;
+                    self.clear_deadline();
+                    self.motion.reveal();
+                } else if self.mode != PanelMode::Pinned {
+                    // Mirrors Hide: a pinned panel ignores both directions.
+                    self.mode = PanelMode::Hidden;
+                    self.clear_deadline();
+                    self.motion.conceal();
+                }
             }
             PanelInput::CornerEntered => {
                 if self.corner_inside {
