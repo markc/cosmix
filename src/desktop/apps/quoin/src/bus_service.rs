@@ -106,6 +106,10 @@ fn service_bus(
                 state.power.invalidate();
                 state.snapshot_retry = None;
                 state.live_generation = None;
+                // Replies stashed under the epoch that just ended: the worker
+                // drops a response stamped with a stale generation anyway, so
+                // retrying them only re-fires dead sends.
+                state.pending_replies.clear();
                 power_changed = true;
             }
             BusBridgeEvent::Reply { request_id, result } => {
@@ -166,6 +170,13 @@ fn service_bus(
 
 /// Answer, or stash for a state-driven retry when the outbound channel is
 /// full. A dropped reply leaves the peer hanging until its own timeout.
+///
+/// A send failure is only worth retrying when the channel is FULL. When the
+/// worker is GONE nothing will ever drain it, and — because the worker owned
+/// the sending end of the event channel too — no `Fatal`/`Connection` event
+/// can arrive to clear the stash either, so a stashed reply would re-fire a
+/// dead `try_send` every frame for the life of the process. Drop it loudly
+/// instead; the peer's own timeout is the honest outcome.
 fn stash_or_respond(
     bridge: &BusBridge,
     state: &mut ShellBusState,
@@ -174,6 +185,13 @@ fn stash_or_respond(
     body: String,
 ) {
     if let Err(error) = bridge.try_respond(&request, rc, body.clone()) {
+        if bridge.worker_is_gone() {
+            bevy::log::warn!(
+                command = request.command.as_str(),
+                "shell Bus worker has stopped; dropping reply ({error})"
+            );
+            return;
+        }
         if state.pending_replies.len() >= MAX_PENDING_REPLIES {
             let (dropped, ..) = state.pending_replies.remove(0);
             bevy::log::warn!(
@@ -201,9 +219,17 @@ fn request_power_snapshot(bridge: &BusBridge, state: &mut ShellBusState, generat
         )
         .is_err()
     {
-        // Outbound channel full (or worker gone, in which case a Fatal event
-        // clears this). Stay Syncing — rendered honestly as "Power
-        // unavailable" — and re-issue on a later update instead of
+        if bridge.worker_is_gone() {
+            // No retry can ever succeed, and no Fatal event will arrive to
+            // clear one — the events channel died with the worker. Settle on
+            // Unavailable (rendered honestly as "Power unavailable") and stop
+            // asking, rather than re-firing a dead send every frame forever.
+            state.power.invalidate();
+            state.live_generation = None;
+            return;
+        }
+        // Outbound channel merely full. Stay Syncing — also rendered as
+        // "Power unavailable" — and re-issue on a later update instead of
         // dead-ending until an unrelated reconnect.
         state.snapshot_retry = Some(generation);
     }
@@ -428,6 +454,7 @@ fn edge_name(edge: Edge) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ctk::bus::{BusMessage, test_bridge};
 
     fn request(command: &str) -> InboundRequest {
         InboundRequest {
@@ -487,6 +514,160 @@ mod tests {
         assert!(
             command.is_none(),
             "an unacceptable verb must not be enqueued"
+        );
+    }
+
+    /// An `App` carrying just what `service_bus` reads, driven by a bridge
+    /// with no worker behind it.
+    fn bus_app(bridge: BusBridge) -> App {
+        let mut app = App::new();
+        app.add_plugins(bevy::MinimalPlugins)
+            .add_message::<ShellCommand>()
+            .init_resource::<ShellBusState>()
+            .insert_resource(ShellFrameState(test_frame()))
+            .insert_resource(bridge)
+            .add_systems(Update, service_bus);
+        app
+    }
+
+    /// A `power.props.changed` delivery-gap notice on `generation`.
+    fn gap_change(generation: u64) -> BusMessage {
+        let mut headers = BTreeMap::new();
+        headers.insert("topic".to_owned(), "power.props.changed".to_owned());
+        headers.insert("gap".to_owned(), "true".to_owned());
+        BusMessage {
+            connection_generation: generation,
+            from: "power".to_owned(),
+            command: "noded.topic.event".to_owned(),
+            body: "{}".to_owned(),
+            headers,
+        }
+    }
+
+    /// The `live_generation` gate itself — NOT `PowerSync`'s own sync
+    /// generation (that one is `power.rs`'s
+    /// `gap_recovery_is_keyed_on_the_sync_generation`).
+    ///
+    /// Honoring a stale-epoch `PowerAction::Resync` would land `Ready` on a
+    /// dead generation and ignore live telemetry from then on — MAJOR 1's
+    /// permanent "Power unavailable", restored. The gate's correctness
+    /// otherwise rests entirely on an unwritten cross-crate invariant (the
+    /// worker enqueues `Connected{g}` before any g-stamped message can be
+    /// forwarded), so both directions are pinned here.
+    #[test]
+    fn the_live_generation_gate_refuses_a_stale_epoch_resync_and_honors_a_live_one() {
+        let (bridge, peer) = test_bridge("quoin");
+        let mut app = bus_app(bridge);
+
+        // Connect on generation 2: the event records the live generation and
+        // issues that epoch's own snapshot.
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected,
+            generation: 2,
+        });
+        app.update();
+        let calls = peer.drain_calls();
+        assert_eq!(calls.len(), 1, "the Connected event issues one snapshot");
+        assert_eq!(calls[0].command, "power.props.get");
+        let request_id = calls[0].request_id;
+
+        // powerd is down: the snapshot fails, so the projection falls back to
+        // Unavailable while the CONNECTION stays live on generation 2.
+        peer.deliver_event(BusBridgeEvent::Reply {
+            request_id,
+            result: Err("powerd is down".to_owned()),
+        });
+        app.update();
+        assert!(peer.drain_calls().is_empty());
+
+        // A message forwarded under the OLD epoch, drained after the
+        // reconnect. `PowerSync` holds no generation, so it asks for a resync
+        // keyed on the message's own stale epoch; the gate must refuse it.
+        peer.deliver_message(gap_change(1));
+        app.update();
+        assert!(
+            peer.drain_calls().is_empty(),
+            "a stale-epoch resync must not issue a request"
+        );
+
+        // The same notice on the live epoch must start a sync — refusing
+        // everything would be the other half of MAJOR 1.
+        peer.deliver_message(gap_change(2));
+        app.update();
+        let calls = peer.drain_calls();
+        assert_eq!(calls.len(), 1, "a live-generation resync must be honored");
+        assert_eq!(calls[0].command, "power.props.get");
+    }
+
+    /// The drain order the gate depends on: `drain_events` BEFORE
+    /// `drain_messages`, so a connect and a message forwarded under the same
+    /// generation both take effect in one frame.
+    ///
+    /// Reversed, `live_generation` would still be unset when the message is
+    /// read, the gate would refuse it, and only the Connected event's own
+    /// snapshot would appear — one call, not two.
+    #[test]
+    fn events_drain_before_messages_within_one_frame() {
+        let (bridge, peer) = test_bridge("quoin");
+        let mut app = bus_app(bridge);
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected,
+            generation: 2,
+        });
+        peer.deliver_message(gap_change(2));
+        app.update();
+        assert_eq!(
+            peer.drain_calls().len(),
+            2,
+            "drain_events must run before drain_messages"
+        );
+    }
+
+    /// A reply that failed because the worker is GONE must be dropped, not
+    /// stashed: nothing will ever drain the queue, and no `Fatal` event can
+    /// arrive to clear the stash because the worker owned that channel too.
+    #[test]
+    fn a_dead_worker_drops_the_reply_instead_of_retrying_it_forever() {
+        let (bridge, peer) = test_bridge("quoin");
+        peer.send(request("shell.ping"));
+        // The worker dies with the request still queued.
+        drop(peer);
+        let mut app = bus_app(bridge);
+        app.update();
+        assert!(
+            app.world()
+                .resource::<ShellBusState>()
+                .pending_replies
+                .is_empty(),
+            "a reply that can never be sent must be dropped, not retried every frame"
+        );
+    }
+
+    /// The other half of that distinction: a merely FULL channel is
+    /// retryable, so the reply is still stashed.
+    #[test]
+    fn a_full_outbound_channel_still_stashes_the_reply() {
+        let (bridge, peer) = test_bridge("quoin");
+        let mut app = bus_app(bridge);
+        // Sixteen connects fill the sixteen-slot outbound queue with snapshot
+        // requests; the inbound work behind them then cannot be answered.
+        for generation in 1..=16u64 {
+            peer.deliver_event(BusBridgeEvent::Connection {
+                state: BusConnectionState::Connected,
+                generation,
+            });
+        }
+        for _ in 0..4 {
+            peer.send(request("shell.ping"));
+        }
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ShellBusState>()
+                .pending_replies
+                .len(),
+            4,
+            "a full channel is retryable — the replies must be stashed"
         );
     }
 

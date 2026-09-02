@@ -13,4 +13,8 @@
   powerd restart and triggers a re-snapshot (state-driven; no timers).
 - Full outbound channels defer rather than drop: an unsendable snapshot
   request or reply is retried on a later update instead of dead-ending the
-  display or leaving the peer hanging.
+  display or leaving the peer hanging. A DEAD worker is not the same case and
+  is no longer treated as one — nothing will ever drain that queue and no
+  `Fatal` event can arrive to clear a stash, so the reply is dropped with a
+  warning and the power display settles on "Power unavailable" instead of
+  re-firing dead sends every frame for the life of the process.

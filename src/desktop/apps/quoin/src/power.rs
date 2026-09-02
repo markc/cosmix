@@ -431,9 +431,17 @@ mod tests {
     }
 
     /// A gap while `Unavailable` also restarts the sync (same dead-end as
-    /// MAJOR 1's non-gap case), while a stale-epoch gap stays inert.
+    /// MAJOR 1's non-gap case), while a gap whose epoch differs from THIS
+    /// projection's own sync generation stays inert.
+    ///
+    /// Scope: this is `PowerSync`'s internal generation field only. The
+    /// separate `ShellBusState::live_generation` gate — the connection
+    /// epoch the bridge last announced, which decides whether a returned
+    /// `PowerAction::Resync` is allowed to issue a request at all — is
+    /// pinned by `bus_service`'s `the_live_generation_gate_*` tests, not
+    /// here.
     #[test]
-    fn gap_recovery_is_keyed_on_the_live_generation() {
+    fn gap_recovery_is_keyed_on_the_sync_generation() {
         let mut state = PowerSync::Unavailable;
         let mut gap = change(9, None, "{}");
         gap.headers.insert("gap".to_owned(), "true".to_owned());

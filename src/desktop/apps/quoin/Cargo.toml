@@ -48,5 +48,11 @@ cosmix-props-core = { package = "cosmix-lib-props-core", path = "../../../crates
 ctk = { path = "../../ctk", default-features = false, features = ["bus"] }
 serde_json = "1"
 
+[dev-dependencies]
+# The driverless bridge + peer used by `bus_service`'s App-level tests. Only
+# the dev targets enable it (Cargo's v2+ resolver does not unify
+# dev-dependency features into `cargo build`), so no shipped binary links it.
+ctk = { path = "../../ctk", default-features = false, features = ["bus", "test-support"] }
+
 [build-dependencies]
 cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }

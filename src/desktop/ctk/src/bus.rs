@@ -487,6 +487,21 @@ impl BusBridge {
         &self.service_name
     }
 
+    /// Whether the worker has dropped its end of the outbound queue — i.e.
+    /// the Bus thread is gone and no queued call, publish or response can
+    /// ever be sent.
+    ///
+    /// This is the distinction a failed `try_call`/`try_respond` cannot make
+    /// on its own without parsing an error string, and it matters: a FULL
+    /// channel drains and a retry succeeds, while a DISCONNECTED one never
+    /// will — and because the worker owned the sending end of the event
+    /// channel too, no later `Fatal`/`Connection` event will arrive to clear
+    /// whatever the app stashed for retry. Anything an app retries on send
+    /// failure must ask this before deciding to keep it.
+    pub fn worker_is_gone(&self) -> bool {
+        self.requests.is_disconnected()
+    }
+
     pub fn try_call(
         &self,
         request_id: u64,
@@ -728,33 +743,86 @@ impl Drop for BusBridge {
     }
 }
 
-#[cfg(test)]
-pub(crate) struct TestBusPeer {
+/// The peer end of a [`test_bridge`]: injects what a worker would deliver and
+/// observes what the app queued outbound. Available to other crates via the
+/// default-off `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestBusPeer {
     inbound: Sender<InboundRequest>,
     requests: Receiver<WorkerRequest>,
+    events: Sender<BusBridgeEvent>,
+    messages: Sender<BusMessage>,
     #[cfg(feature = "theme")]
     semantic_inboxes: Arc<SemanticInboxes>,
 }
 
-#[cfg(test)]
-pub(crate) struct TestBusResponse {
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestBusResponse {
     pub command: String,
     pub rc: u8,
     pub body: String,
 }
 
-#[cfg(all(test, feature = "theme"))]
-pub(crate) struct TestBusPublish {
+/// One outbound call the app queued for the worker.
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestBusCall {
+    pub request_id: u64,
     pub to: String,
     pub command: String,
     pub headers: BTreeMap<String, String>,
     pub body: String,
 }
 
-#[cfg(test)]
+#[cfg(all(any(test, feature = "test-support"), feature = "theme"))]
+pub struct TestBusPublish {
+    pub to: String,
+    pub command: String,
+    pub headers: BTreeMap<String, String>,
+    pub body: String,
+}
+
+#[cfg(any(test, feature = "test-support"))]
 impl TestBusPeer {
     pub fn send(&self, request: InboundRequest) {
         self.inbound.send(request).expect("test inbound is open");
+    }
+
+    /// Deliver one bridge event, as the worker would.
+    pub fn deliver_event(&self, event: BusBridgeEvent) {
+        self.events.send(event).expect("test events are open");
+    }
+
+    /// Deliver one ordinary telemetry message, as the worker would.
+    pub fn deliver_message(&self, message: BusMessage) {
+        self.messages.send(message).expect("test messages are open");
+    }
+
+    /// The outbound calls queued since the last drain.
+    ///
+    /// NOTE: this and [`Self::drain_responses`] share one queue and each
+    /// discards what the other selects — drain for one kind per assertion.
+    pub fn drain_calls(&self) -> Vec<TestBusCall> {
+        self.requests
+            .try_iter()
+            .filter_map(|request| match request {
+                WorkerRequest::Call {
+                    request_id,
+                    to,
+                    command,
+                    headers,
+                    body,
+                } => Some(TestBusCall {
+                    request_id,
+                    to,
+                    command,
+                    headers,
+                    body,
+                }),
+                WorkerRequest::Respond { .. }
+                | WorkerRequest::Publish { .. }
+                | WorkerRequest::Shutdown => None,
+            })
+            .collect()
     }
 
     pub fn drain_responses(&self) -> Vec<TestBusResponse> {
@@ -801,12 +869,17 @@ impl TestBusPeer {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn test_bridge(service_name: &str) -> (BusBridge, TestBusPeer) {
+/// A `BusBridge` with no worker behind it, plus the peer that drives it.
+///
+/// The outbound queue is bounded at 16, so a test can fill it and exercise the
+/// full-channel path; dropping the peer disconnects it and exercises the
+/// worker-gone path ([`BusBridge::worker_is_gone`]).
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_bridge(service_name: &str) -> (BusBridge, TestBusPeer) {
     let (request_tx, request_rx) = flume::bounded(16);
     let (observation_request_tx, _observation_request_rx) = flume::bounded(4);
-    let (_event_tx, event_rx) = flume::bounded(16);
-    let (_message_tx, message_rx) = flume::bounded(16);
+    let (event_tx, event_rx) = flume::bounded(16);
+    let (message_tx, message_rx) = flume::bounded(16);
     let (_observation_message_tx, observation_message_rx) = flume::bounded(16);
     let (inbound_tx, inbound_rx) = flume::bounded(16);
     // Pre-seed the done channel so Drop (no worker here) returns instantly
@@ -836,6 +909,8 @@ pub(crate) fn test_bridge(service_name: &str) -> (BusBridge, TestBusPeer) {
         TestBusPeer {
             inbound: inbound_tx,
             requests: request_rx,
+            events: event_tx,
+            messages: message_tx,
             #[cfg(feature = "theme")]
             semantic_inboxes,
         },
