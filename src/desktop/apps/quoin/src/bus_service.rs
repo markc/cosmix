@@ -35,6 +35,14 @@ struct ShellBusState {
     /// transiently full channel cannot dead-end the display in
     /// "Power unavailable" until an unrelated reconnect.
     snapshot_retry: Option<u64>,
+    /// The generation of the last `Connected` event, `None` while down. A
+    /// message-triggered resync (`PowerAction::Resync`) is honored only for
+    /// this generation: a stale-epoch message drained from the queue after a
+    /// reconnect must not start a sync that could land `Ready` on a dead
+    /// generation and ignore live telemetry from then on. Refusing costs
+    /// nothing — the `Connected` event for the live generation runs its own
+    /// sync, and a live-generation change retriggers recovery.
+    live_generation: Option<u64>,
     /// Replies that hit a full outbound channel, retried before new inbound
     /// work. Losing a reply outright would leave the peer hanging until its
     /// own timeout — worse than answering late.
@@ -48,6 +56,7 @@ impl Default for ShellBusState {
             ready_logged: false,
             next_request_id: 0x51_0000_0000,
             snapshot_retry: None,
+            live_generation: None,
             pending_replies: Vec::new(),
         }
     }
@@ -89,12 +98,14 @@ fn service_bus(
                     println!("QUOIN_BUS_READY service=shell");
                     state.ready_logged = true;
                 }
+                state.live_generation = Some(generation);
                 request_power_snapshot(&bridge, &mut state, generation);
                 power_changed = true;
             }
             BusBridgeEvent::Connection { .. } | BusBridgeEvent::Fatal(_) => {
                 state.power.invalidate();
                 state.snapshot_retry = None;
+                state.live_generation = None;
                 power_changed = true;
             }
             BusBridgeEvent::Reply { request_id, result } => {
@@ -120,8 +131,13 @@ fn service_bus(
             PowerAction::None => {}
             PowerAction::Changed => power_changed = true,
             PowerAction::Resync { generation } => {
-                request_power_snapshot(&bridge, &mut state, generation);
-                power_changed = true;
+                // Only the live generation may start a sync (see
+                // `live_generation`); a refused stale trigger recovers via
+                // the Connected event or the next live-generation change.
+                if state.live_generation == Some(generation) {
+                    request_power_snapshot(&bridge, &mut state, generation);
+                    power_changed = true;
+                }
             }
         }
     }
