@@ -26,7 +26,11 @@ bevy = { version = "=0.19.0", default-features = false, features = [
     "bevy_feathers",
     "accesskit_unix",
 ] }
-ctk = { path = "../../ctk", default-features = false, features = ["bus", "theme"] }
+# platform-wayland is load-bearing: ctk's build guard refuses `theme` without
+# a winit backend, and borrowing bevy/wayland from workspace unification is the
+# fragility slice 3 removed (an isolated `cargo build -p interactgui` died
+# inside winit before this line).
+ctk = { path = "../../ctk", default-features = false, features = ["bus", "theme", "platform-wayland"] }
 cosmix-interaction-schema = { path = "../../../crates/cosmix-interaction-schema" }
 cosmix-app-identity = { path = "../../../crates/cosmix-app-identity" }
 serde = "1"

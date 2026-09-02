@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.52.0 — 2026-09-02
+
+- Add a generic worker wake callback and explicit directed-command prefixes to
+  the Bus bridge. Successful worker delivery now wakes non-winit event loops.
+- The capped per-frame drains (`drain_messages`,
+  `drain_observation_messages`) re-arm that wake when a burst exceeds the
+  frame cap, so the undrained remainder is processed by a real follow-up
+  update instead of waiting for an unrelated event.
+- Expose the generation-filtered service-port drain/reply seam and registered-
+  local caller gate for application-owned substrate services. The one-inbound-
+  owner invariant is enforced, not conventional: drainers declare themselves
+  via `claim_inbound` (the app-port router does so automatically), a second
+  differently-named claimant panics deterministically on its first frame, and
+  an unclaimed `drain_inbound` refuses to run.
+- Add `BusBridge::worker_is_gone()`. A failed `try_call`/`try_respond` could
+  not distinguish a FULL outbound channel (retry succeeds later) from a
+  DISCONNECTED one (no retry can ever succeed, and no `Fatal` event will
+  arrive either — the worker owned the event channel too) without parsing an
+  error string. Anything that retries on send failure must ask this first.
+- New default-off `test-support` feature exposing `test_bridge()` and
+  `TestBusPeer` (now able to inject connection events, replies and telemetry
+  messages, and to observe queued outbound calls). Consumers enable it from
+  `[dev-dependencies]` to unit-test their own Bus-facing Bevy systems —
+  generation gates, drain order — at `App` level with no broker and no
+  worker. Cargo's v2+ resolver keeps dev-dependency features out of a plain
+  `cargo build`, so no shipped binary links it.
+- Build-time guard: enabling `theme` without `platform-wayland`/`platform-x11`
+  now fails in ctk's build script with the real reason instead of dying inside
+  winit with a "platform not supported" error.
+
 ## 0.51.0 — 2026-09-02
 
 - Breaking: replace Bevy's combined default-platform backend behaviour with

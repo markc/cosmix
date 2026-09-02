@@ -3,7 +3,7 @@
 # consumed by apps over a `../../ctk` path dependency. See desktop/APPS.md.
 [package]
 name = "ctk"
-version = "0.51.0"
+version = "0.52.0"
 description = "Cosmix Tool Kit — reusable, Bus-citizen Bevy widgets for dense desktop surfaces"
 edition = "2021"
 rust-version = "1.95"
@@ -34,6 +34,14 @@ bus = [
     "dep:serde_json",
     "dep:tokio",
 ]
+# A driverless `BusBridge` plus a peer that injects connection events, replies,
+# telemetry messages and inbound requests, and observes what the app queued.
+# Default-off and consumed from `[dev-dependencies]`: it links no worker and no
+# socket, so an application can unit-test its own Bus-facing Bevy systems (the
+# generation gates, the drain order) at `App` level without a broker. Cargo's
+# v2+ resolver does not unify dev-dependency features into a plain `cargo
+# build`, so enabling it never reaches a shipped binary.
+test-support = ["bus"]
 # The mixer pipeline + transport seam. Deliberately does NOT require `bus`
 # (and pulls NO codec deps): the D4 fused arm links the identical board +
 # pipeline over an in-process transport with zero broker/socket/codec code in

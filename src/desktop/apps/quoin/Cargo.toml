@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-quoin"
-version = "0.4.0"
+version = "0.5.0"
 description = "Cosmix Quoin four-edge layer-shell furniture"
 edition = "2024"
 rust-version = "1.95"
@@ -43,4 +43,16 @@ bevy = { version = "=0.19.0", default-features = false, features = [
 ] }
 cosmix-shell = { path = "../../crates/cosmix-shell", default-features = false, features = ["chrome"] }
 cosmix-shell-host = { path = "../../crates/cosmix-shell-host" }
-ctk = { path = "../../ctk", default-features = false }
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+cosmix-props-core = { package = "cosmix-lib-props-core", path = "../../../crates/cosmix-lib-props-core", features = ["bus"] }
+ctk = { path = "../../ctk", default-features = false, features = ["bus"] }
+serde_json = "1"
+
+[dev-dependencies]
+# The driverless bridge + peer used by `bus_service`'s App-level tests. Only
+# the dev targets enable it (Cargo's v2+ resolver does not unify
+# dev-dependency features into `cargo build`), so no shipped binary links it.
+ctk = { path = "../../ctk", default-features = false, features = ["bus", "test-support"] }
+
+[build-dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }

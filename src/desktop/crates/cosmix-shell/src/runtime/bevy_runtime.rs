@@ -199,6 +199,7 @@ mod tests {
         Corner, CornerEvent, CornerTrigger, LogicalSize, OutputKey, PanelEffect, PanelMode,
         RevealTrigger,
     };
+    use crate::runtime::{ShellSemanticVerb, semantic_shell_command};
     use bevy::MinimalPlugins;
     use bevy::prelude::App;
 
@@ -280,6 +281,258 @@ mod tests {
                 .resource::<QuoinCommittedMotionModes>()
                 .get(Edge::Left),
             PanelMode::Hidden
+        );
+    }
+
+    #[test]
+    fn semantic_verbs_reproduce_direct_shell_command_results() {
+        let cases = [
+            (
+                ShellSemanticVerb::PanelShow,
+                ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input: crate::core::PanelInput::Reveal,
+                },
+            ),
+            (
+                ShellSemanticVerb::PanelHide,
+                ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input: crate::core::PanelInput::Hide,
+                },
+            ),
+            // `PanelToggle` maps to core `Toggle`, NOT to `Reveal`: the
+            // direction binds at Model time. This fixture starts Hidden,
+            // where the two coincide, so the row records the mapping rather
+            // than discriminating it — the tests that DO discriminate are
+            // `semantic_toggle_on_a_mapped_panel_reproduces_direct_hide` and
+            // `semantic_toggle_reopens_a_panel_animating_shut` below.
+            (
+                ShellSemanticVerb::PanelToggle,
+                ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input: crate::core::PanelInput::Toggle,
+                },
+            ),
+            (
+                ShellSemanticVerb::PanelPin,
+                ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input: crate::core::PanelInput::Pin,
+                },
+            ),
+            (
+                ShellSemanticVerb::PanelUnpin,
+                ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input: crate::core::PanelInput::Unpin,
+                },
+            ),
+            (
+                ShellSemanticVerb::PageNext,
+                ShellCommandKind::Carousel {
+                    edge: Edge::Left,
+                    input: CarouselInput::Next,
+                },
+            ),
+            (
+                ShellSemanticVerb::PagePrevious,
+                ShellCommandKind::Carousel {
+                    edge: Edge::Left,
+                    input: CarouselInput::Previous,
+                },
+            ),
+            (
+                ShellSemanticVerb::PageSet("places".to_owned()),
+                ShellCommandKind::Carousel {
+                    edge: Edge::Left,
+                    input: CarouselInput::SelectId("places".to_owned()),
+                },
+            ),
+        ];
+        for (verb, direct_kind) in cases {
+            let mut adapted = app();
+            let mut direct = app();
+            let frame = adapted.world().resource::<ShellFrameState>().0.clone();
+            let output = frame.geometry.output.clone();
+            adapted.world_mut().write_message(semantic_shell_command(
+                output.clone(),
+                Duration::ZERO,
+                Edge::Left,
+                verb,
+            ));
+            direct.world_mut().write_message(ShellCommand {
+                output,
+                at: Duration::ZERO,
+                kind: direct_kind,
+            });
+            adapted.update();
+            direct.update();
+            assert_eq!(
+                adapted.world().resource::<ShellFrameState>().0,
+                direct.world().resource::<ShellFrameState>().0,
+            );
+            assert_eq!(
+                adapted.world().resource::<ShellEffects>().0,
+                direct.world().resource::<ShellEffects>().0,
+            );
+        }
+    }
+
+    /// The other toggle direction: on a MAPPED panel the semantic toggle must
+    /// reproduce a direct Hide, not a second Reveal.
+    #[test]
+    fn semantic_toggle_on_a_mapped_panel_reproduces_direct_hide() {
+        let mut adapted = app();
+        let mut direct = app();
+        for app in [&mut adapted, &mut direct] {
+            let output = app
+                .world()
+                .resource::<ShellFrameState>()
+                .0
+                .geometry
+                .output
+                .clone();
+            app.world_mut().write_message(ShellCommand {
+                output,
+                at: Duration::ZERO,
+                kind: ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input: crate::core::PanelInput::Reveal,
+                },
+            });
+            app.update();
+        }
+        let frame = adapted.world().resource::<ShellFrameState>().0.clone();
+        assert!(frame.panel(Edge::Left).mapped, "precondition: mapped");
+        let output = frame.geometry.output.clone();
+        adapted.world_mut().write_message(semantic_shell_command(
+            output.clone(),
+            Duration::ZERO,
+            Edge::Left,
+            ShellSemanticVerb::PanelToggle,
+        ));
+        direct.world_mut().write_message(ShellCommand {
+            output,
+            at: Duration::ZERO,
+            kind: ShellCommandKind::Panel {
+                edge: Edge::Left,
+                input: crate::core::PanelInput::Hide,
+            },
+        });
+        adapted.update();
+        direct.update();
+        assert_eq!(
+            adapted.world().resource::<ShellFrameState>().0,
+            direct.world().resource::<ShellFrameState>().0,
+        );
+        assert_eq!(
+            adapted.world().resource::<ShellEffects>().0,
+            direct.world().resource::<ShellEffects>().0,
+        );
+    }
+
+    /// A panel animating shut still has `mapped == true` but mode `Hidden`.
+    /// The toggle direction binds at Model time against the mode, so the user
+    /// can toggle a mid-conceal panel straight back open — the old
+    /// snapshot-keyed adapter sent `Hide` here (a no-op) and locked the panel
+    /// out until the unmap completed.
+    #[test]
+    fn semantic_toggle_reopens_a_panel_animating_shut() {
+        let mut app = app();
+        let output = app
+            .world()
+            .resource::<ShellFrameState>()
+            .0
+            .geometry
+            .output
+            .clone();
+        for (at, verb) in [
+            (Duration::ZERO, ShellSemanticVerb::PanelShow),
+            (Duration::from_millis(400), ShellSemanticVerb::PanelHide),
+        ] {
+            app.world_mut().write_message(semantic_shell_command(
+                output.clone(),
+                at,
+                Edge::Left,
+                verb,
+            ));
+            app.update();
+        }
+        // Mid-conceal: the panel is still mapped but semantically Hidden.
+        // Assert it, or a fixture timing change silently degrades this into a
+        // plain toggle-from-Hidden and stops testing the thing it names.
+        {
+            let panel = app
+                .world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left);
+            assert!(panel.mapped, "precondition: mid-conceal panel is mapped");
+            assert_eq!(
+                panel.mode,
+                PanelMode::Hidden,
+                "precondition: mid-conceal panel is semantically Hidden"
+            );
+        }
+        app.world_mut().write_message(semantic_shell_command(
+            output.clone(),
+            Duration::from_millis(450),
+            Edge::Left,
+            ShellSemanticVerb::PanelToggle,
+        ));
+        app.update();
+        let panel = app
+            .world()
+            .resource::<ShellFrameState>()
+            .0
+            .panel(Edge::Left)
+            .clone();
+        assert_eq!(
+            panel.mode,
+            PanelMode::Revealed,
+            "toggle must reopen a mid-conceal panel"
+        );
+        assert!(panel.mapped);
+    }
+
+    /// Two toggles drained in one Bus batch both apply within one update; with
+    /// the direction bound at Model time they net to identity instead of to a
+    /// single toggle read off the same stale frame.
+    #[test]
+    fn two_semantic_toggles_in_one_batch_net_to_identity() {
+        let mut app = app();
+        let output = app
+            .world()
+            .resource::<ShellFrameState>()
+            .0
+            .geometry
+            .output
+            .clone();
+        app.world_mut().write_message(semantic_shell_command(
+            output.clone(),
+            Duration::ZERO,
+            Edge::Left,
+            ShellSemanticVerb::PanelShow,
+        ));
+        app.update();
+        for _ in 0..2 {
+            app.world_mut().write_message(semantic_shell_command(
+                output.clone(),
+                Duration::from_millis(400),
+                Edge::Left,
+                ShellSemanticVerb::PanelToggle,
+            ));
+        }
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .mode,
+            PanelMode::Revealed,
+            "toggle+toggle in one batch must be identity, not one toggle"
         );
     }
 }

@@ -1,17 +1,24 @@
 //! Cosmix Quoin's real SCTK layer-shell host.
 
+mod bus_service;
+mod power;
+
 use std::time::Duration;
 
 use bevy::feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme};
 use bevy::prelude::*;
 use bevy::ui::{UiRect, percent, px};
+use bus_service::{QuoinPowerText, ShellBusPlugin};
 use cosmix_shell::chrome::{
     QuoinChromePlugin, QuoinClock, QuoinContentBindings, QuoinPageContent, QuoinPageRegistry,
     QuoinPageSpec, spawn_quoin_chrome,
 };
 use cosmix_shell::core::{ConcealReason, Edge, PanelEffect, PanelInput, RevealTrigger, ShellModel};
 use cosmix_shell::runtime::{ShellEffects, ShellFrameState, ShellRuntimeSet};
-use cosmix_shell_host::{LayerHostConfig, LayerPanelMounts, configure_layer_host};
+use cosmix_shell_host::{LayerHostConfig, LayerHostWake, LayerPanelMounts, configure_layer_host};
+use ctk::bus::{
+    BusBridgeConfig, BusBridgePlugin, BusWorkerWake, provenance_from_build, resolve_noded_url,
+};
 use ctk::theme::{CtkThemePlugin, ThemeSpec, ThemeState, apply_theme, tokens};
 
 const USAGE: &str =
@@ -90,6 +97,12 @@ fn main() -> AppExit {
 
     let mut app = App::new();
     configure_layer_host(&mut app, host);
+    let wake = app.world().resource::<LayerHostWake>().callback();
+    let mut bus = BusBridgeConfig::new("shell", resolve_noded_url());
+    bus.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
+    bus.subscriptions.push("power.props.changed".to_owned());
+    bus.inbound_prefixes.push("shell.".to_owned());
+    bus.worker_wake = Some(BusWorkerWake::new(wake));
     app.insert_resource(registry)
         .insert_resource(SmokeState {
             all_panels: smoke_all_panels,
@@ -97,9 +110,11 @@ fn main() -> AppExit {
             emitted: false,
         })
         .add_plugins((
+            BusBridgePlugin::new(bus),
             FeathersPlugins,
             CtkThemePlugin::default(),
             QuoinChromePlugin,
+            ShellBusPlugin,
         ))
         .add_systems(Startup, setup)
         .add_systems(Update, log_transitions.in_set(ShellRuntimeSet::Host));
@@ -225,6 +240,7 @@ fn setup(
         Edge::Bottom,
         vec![
             QuoinPageContent::new("launcher", bottom_launcher(&mut commands)),
+            QuoinPageContent::new("power", bottom_power(&mut commands)),
             QuoinPageContent::new(
                 "tasks",
                 placeholder(
@@ -310,7 +326,11 @@ fn page_registry() -> QuoinPageRegistry {
     };
     QuoinPageRegistry::new(
         pages(&[("nav", "Navigation"), ("places", "Places")]),
-        pages(&[("launcher", "Launcher"), ("tasks", "Tasks")]),
+        pages(&[
+            ("launcher", "Launcher"),
+            ("power", "Power"),
+            ("tasks", "Tasks"),
+        ]),
         pages(&[("monitor", "Monitoring"), ("agents", "Agents")]),
         pages(&[("status", "Status"), ("spaces", "Spaces")]),
     )
@@ -382,6 +402,37 @@ fn bottom_launcher(commands: &mut Commands) -> Entity {
             ..default()
         })
         .add_children(&[apps, clock])
+        .id()
+}
+
+fn bottom_power(commands: &mut Commands) -> Entity {
+    let heading = commands
+        .spawn((
+            Text::new("Power"),
+            TextFont::from_font_size(14.0),
+            bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
+        ))
+        .id();
+    let reading = commands
+        .spawn((
+            Text::new("Power unavailable"),
+            TextFont::from_font_size(13.0),
+            bevy::feathers::theme::ThemeTextColor(tokens::TEXT_DIM),
+            QuoinPowerText,
+        ))
+        .id();
+    commands
+        .spawn(Node {
+            width: percent(100),
+            height: percent(100),
+            min_width: px(0),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::SpaceBetween,
+            padding: UiRect::axes(px(14), px(8)),
+            ..default()
+        })
+        .add_children(&[heading, reading])
         .id()
 }
 

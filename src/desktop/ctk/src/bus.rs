@@ -100,6 +100,50 @@ fn no_op_wake() -> WorkerWake {
     Arc::new(|| {})
 }
 
+/// Event-loop wake callback used when CTK is hosted without winit.
+#[derive(Clone)]
+pub struct BusWorkerWake(WorkerWake);
+
+impl std::fmt::Debug for BusWorkerWake {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BusWorkerWake(..)")
+    }
+}
+
+impl BusWorkerWake {
+    pub fn new(callback: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self(callback)
+    }
+}
+
+#[derive(Clone)]
+struct WakeSender<T> {
+    inner: Sender<T>,
+    wake: WorkerWake,
+}
+
+impl<T> WakeSender<T> {
+    fn new(inner: Sender<T>, wake: WorkerWake) -> Self {
+        Self { inner, wake }
+    }
+
+    fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
+        let result = self.inner.try_send(value);
+        if result.is_ok() {
+            (self.wake)();
+        }
+        result
+    }
+
+    async fn send_async(&self, value: T) -> Result<(), flume::SendError<T>> {
+        let result = self.inner.send_async(value).await;
+        if result.is_ok() {
+            (self.wake)();
+        }
+        result
+    }
+}
+
 #[derive(Default)]
 struct SemanticInboxes {
     #[cfg(feature = "theme")]
@@ -218,6 +262,10 @@ pub struct BusBridgeConfig {
     /// reconnect. Constructed once per process so `started_at` cannot drift.
     pub provenance: RegisterProvenance,
     pub subscriptions: Vec<String>,
+    /// Additional directed command prefixes admitted to the exclusive service port.
+    pub inbound_prefixes: Vec<String>,
+    /// Explicit non-winit event-loop wake. When absent, CTK retains its winit fallback.
+    pub worker_wake: Option<BusWorkerWake>,
     /// Topics whose newest message replaces the previous one instead of queuing.
     pub latest_topics: Vec<String>,
     pub outbound_capacity: usize,
@@ -237,6 +285,8 @@ impl BusBridgeConfig {
             noded_url: noded_url.into(),
             provenance: process_provenance(),
             subscriptions: Vec::new(),
+            inbound_prefixes: Vec::new(),
+            worker_wake: None,
             latest_topics: Vec::new(),
             outbound_capacity: 64,
             event_capacity: 128,
@@ -397,6 +447,11 @@ pub struct BusBridge {
     committed_generation: Arc<AtomicU64>,
     latest_messages: Arc<Mutex<HashMap<String, BusMessage>>>,
     semantic_inboxes: Arc<SemanticInboxes>,
+    /// Same wake the worker fires on delivery. The capped drains re-arm it
+    /// when a frame cannot clear the queue, so a burst larger than the
+    /// per-frame cap never strands messages waiting for an unrelated event
+    /// (the worker's per-send wakes have already been coalesced away by then).
+    wake: WorkerWake,
     max_messages_per_frame: usize,
     max_observation_messages_per_frame: usize,
     service_name: String,
@@ -409,6 +464,11 @@ pub struct BusBridge {
     /// mixer seam (`mixer` feature). The bridge's own drain methods then
     /// panic instead of silently competing for the shared flume queues.
     telemetry_taken: bool,
+    /// The single declared inbound drain + reply owner (see
+    /// [`Self::claim_inbound`]). `None` until claimed; [`Self::drain_inbound`]
+    /// refuses to run unclaimed so two drainers cannot silently steal each
+    /// other's requests.
+    inbound_claim: Arc<Mutex<Option<&'static str>>>,
 }
 
 impl BusBridge {
@@ -425,6 +485,21 @@ impl BusBridge {
     /// peers see on our accepted writes (own-write attribution).
     pub fn service_name(&self) -> &str {
         &self.service_name
+    }
+
+    /// Whether the worker has dropped its end of the outbound queue — i.e.
+    /// the Bus thread is gone and no queued call, publish or response can
+    /// ever be sent.
+    ///
+    /// This is the distinction a failed `try_call`/`try_respond` cannot make
+    /// on its own without parsing an error string, and it matters: a FULL
+    /// channel drains and a retry succeeds, while a DISCONNECTED one never
+    /// will — and because the worker owned the sending end of the event
+    /// channel too, no later `Fatal`/`Connection` event will arrive to clear
+    /// whatever the app stashed for retry. Anything an app retries on send
+    /// failure must ask this before deciding to keep it.
+    pub fn worker_is_gone(&self) -> bool {
+        self.requests.is_disconnected()
     }
 
     pub fn try_call(
@@ -521,12 +596,27 @@ impl BusBridge {
         self.events.try_iter()
     }
 
+    /// CONTRACT: the caller must exhaust the returned iterator in the same
+    /// frame. The capped `take` plus the pre-drain re-arm above assume a full
+    /// drain; a partially consumed iterator leaves messages queued with their
+    /// wakes already spent (they are picked up on the next armed update, but
+    /// the frame-cap accounting is designed around exhaustion).
     pub fn drain_messages(&self) -> impl Iterator<Item = BusMessage> + '_ {
         self.assert_telemetry_owned();
+        if self.messages.len() > self.max_messages_per_frame {
+            // This frame's capped drain cannot clear the queue and the
+            // worker's sends already spent their wakes: re-arm one so the
+            // remainder is drained by a real follow-up update, not by
+            // whenever the next unrelated event happens to tick the loop.
+            (self.wake)();
+        }
         self.messages.try_iter().take(self.max_messages_per_frame)
     }
 
     pub fn drain_observation_messages(&self) -> impl Iterator<Item = BusMessage> + '_ {
+        if self.observation_messages.len() > self.max_observation_messages_per_frame {
+            (self.wake)();
+        }
         self.observation_messages
             .try_iter()
             .take(self.max_observation_messages_per_frame)
@@ -550,23 +640,54 @@ impl BusBridge {
     /// worker anyway, and a stale `set` must not execute against freshly
     /// resynced state.
     ///
-    /// `pub(crate)` on purpose: the [`AppPortPlugin`](crate::app_control) router
-    /// is the SOLE inbound drain + reply owner. A registered verb handler holds
-    /// the [`InboundRequest`] (for params/provenance) but must never reach the
-    /// correlation-bearing response path, or it could double-answer one id or
-    /// steal another request's inbound. See the app-port split rationale.
-    pub(crate) fn drain_inbound(&self) -> impl Iterator<Item = InboundRequest> + '_ {
+    /// INVARIANT (enforced by [`Self::claim_inbound`], mirroring the
+    /// `telemetry_taken` take-once lease): each app has exactly ONE inbound
+    /// drain + reply owner — either the [`AppPortPlugin`](crate::app_control)
+    /// router OR one app-owned service system, never both in the same `App`.
+    /// Two drainers steal each other's requests nondeterministically; a
+    /// registered verb handler holds the [`InboundRequest`] (for
+    /// params/provenance) but must never reach the correlation-bearing
+    /// response path, or it could double-answer one id or steal another
+    /// request's inbound.
+    ///
+    /// Panics unless the caller has declared itself via
+    /// [`Self::claim_inbound`] first.
+    pub fn drain_inbound(&self) -> impl Iterator<Item = InboundRequest> + '_ {
+        assert!(
+            self.inbound_claim.lock().unwrap().is_some(),
+            "drain_inbound without claim_inbound — declare the app's single inbound owner first"
+        );
         let current = self.committed_generation.load(Ordering::Acquire);
         self.inbound
             .try_iter()
             .filter(move |request| request.connection_generation == current)
     }
 
+    /// Declare the app's single inbound drain + reply owner (idempotent for
+    /// the same owner; call it from the draining system before
+    /// [`Self::drain_inbound`]). A second, differently-named claimant panics
+    /// immediately and deterministically — the alternative is the two systems
+    /// stealing each other's requests nondeterministically at runtime, which
+    /// is strictly worse than failing loudly on the first frame.
+    pub fn claim_inbound(&self, owner: &'static str) {
+        let mut claim = self.inbound_claim.lock().unwrap();
+        match *claim {
+            None => *claim = Some(owner),
+            Some(existing) if existing == owner => {}
+            Some(existing) => panic!(
+                "BusBridge inbound requests are already owned by {existing:?}; \
+                 {owner:?} must not also drain — one inbound owner per app \
+                 (drop AppPortPlugin or the app-owned service system)"
+            ),
+        }
+    }
+
     /// Answer a drained [`InboundRequest`]. A fire-and-forget send (no
     /// correlation id) is silently a no-op — there is nothing to answer.
     ///
-    /// `pub(crate)`: sole caller is the app-port router (see `drain_inbound`).
-    pub(crate) fn try_respond(
+    /// Caller: the app's single inbound drain + reply owner only (see
+    /// `drain_inbound`'s invariant).
+    pub fn try_respond(
         &self,
         request: &InboundRequest,
         rc: u8,
@@ -622,33 +743,86 @@ impl Drop for BusBridge {
     }
 }
 
-#[cfg(test)]
-pub(crate) struct TestBusPeer {
+/// The peer end of a [`test_bridge`]: injects what a worker would deliver and
+/// observes what the app queued outbound. Available to other crates via the
+/// default-off `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestBusPeer {
     inbound: Sender<InboundRequest>,
     requests: Receiver<WorkerRequest>,
+    events: Sender<BusBridgeEvent>,
+    messages: Sender<BusMessage>,
     #[cfg(feature = "theme")]
     semantic_inboxes: Arc<SemanticInboxes>,
 }
 
-#[cfg(test)]
-pub(crate) struct TestBusResponse {
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestBusResponse {
     pub command: String,
     pub rc: u8,
     pub body: String,
 }
 
-#[cfg(all(test, feature = "theme"))]
-pub(crate) struct TestBusPublish {
+/// One outbound call the app queued for the worker.
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestBusCall {
+    pub request_id: u64,
     pub to: String,
     pub command: String,
     pub headers: BTreeMap<String, String>,
     pub body: String,
 }
 
-#[cfg(test)]
+#[cfg(all(any(test, feature = "test-support"), feature = "theme"))]
+pub struct TestBusPublish {
+    pub to: String,
+    pub command: String,
+    pub headers: BTreeMap<String, String>,
+    pub body: String,
+}
+
+#[cfg(any(test, feature = "test-support"))]
 impl TestBusPeer {
     pub fn send(&self, request: InboundRequest) {
         self.inbound.send(request).expect("test inbound is open");
+    }
+
+    /// Deliver one bridge event, as the worker would.
+    pub fn deliver_event(&self, event: BusBridgeEvent) {
+        self.events.send(event).expect("test events are open");
+    }
+
+    /// Deliver one ordinary telemetry message, as the worker would.
+    pub fn deliver_message(&self, message: BusMessage) {
+        self.messages.send(message).expect("test messages are open");
+    }
+
+    /// The outbound calls queued since the last drain.
+    ///
+    /// NOTE: this and [`Self::drain_responses`] share one queue and each
+    /// discards what the other selects — drain for one kind per assertion.
+    pub fn drain_calls(&self) -> Vec<TestBusCall> {
+        self.requests
+            .try_iter()
+            .filter_map(|request| match request {
+                WorkerRequest::Call {
+                    request_id,
+                    to,
+                    command,
+                    headers,
+                    body,
+                } => Some(TestBusCall {
+                    request_id,
+                    to,
+                    command,
+                    headers,
+                    body,
+                }),
+                WorkerRequest::Respond { .. }
+                | WorkerRequest::Publish { .. }
+                | WorkerRequest::Shutdown => None,
+            })
+            .collect()
     }
 
     pub fn drain_responses(&self) -> Vec<TestBusResponse> {
@@ -695,12 +869,17 @@ impl TestBusPeer {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn test_bridge(service_name: &str) -> (BusBridge, TestBusPeer) {
+/// A `BusBridge` with no worker behind it, plus the peer that drives it.
+///
+/// The outbound queue is bounded at 16, so a test can fill it and exercise the
+/// full-channel path; dropping the peer disconnects it and exercises the
+/// worker-gone path ([`BusBridge::worker_is_gone`]).
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_bridge(service_name: &str) -> (BusBridge, TestBusPeer) {
     let (request_tx, request_rx) = flume::bounded(16);
     let (observation_request_tx, _observation_request_rx) = flume::bounded(4);
-    let (_event_tx, event_rx) = flume::bounded(16);
-    let (_message_tx, message_rx) = flume::bounded(16);
+    let (event_tx, event_rx) = flume::bounded(16);
+    let (message_tx, message_rx) = flume::bounded(16);
     let (_observation_message_tx, observation_message_rx) = flume::bounded(16);
     let (inbound_tx, inbound_rx) = flume::bounded(16);
     // Pre-seed the done channel so Drop (no worker here) returns instantly
@@ -719,15 +898,19 @@ pub(crate) fn test_bridge(service_name: &str) -> (BusBridge, TestBusPeer) {
             committed_generation: Arc::new(AtomicU64::new(1)),
             latest_messages: Arc::new(Mutex::new(HashMap::new())),
             semantic_inboxes: semantic_inboxes.clone(),
+            wake: no_op_wake(),
             max_messages_per_frame: 16,
             max_observation_messages_per_frame: 16,
             service_name: service_name.into(),
             shutdown_done: shutdown_done_rx,
             telemetry_taken: false,
+            inbound_claim: Arc::new(Mutex::new(None)),
         },
         TestBusPeer {
             inbound: inbound_tx,
             requests: request_rx,
+            events: event_tx,
+            messages: message_tx,
             #[cfg(feature = "theme")]
             semantic_inboxes,
         },
@@ -775,15 +958,24 @@ pub(crate) fn start_bridge(
     let worker_semantic = semantic_inboxes.clone();
     let worker_generation = committed_generation.clone();
     #[cfg(feature = "theme")]
-    let worker_wake: WorkerWake = event_loop_proxy.map_or_else(no_op_wake, |proxy| {
-        let proxy = (**proxy).clone();
-        Arc::new(move || {
-            let _ = proxy.send_event(bevy::winit::WinitUserEvent::WakeUp);
-        })
-    });
+    let worker_wake: WorkerWake = config.worker_wake.clone().map_or_else(
+        || {
+            event_loop_proxy.map_or_else(no_op_wake, |proxy| {
+                let proxy = (**proxy).clone();
+                Arc::new(move || {
+                    let _ = proxy.send_event(bevy::winit::WinitUserEvent::WakeUp);
+                })
+            })
+        },
+        |wake| wake.0,
+    );
     #[cfg(not(feature = "theme"))]
-    let worker_wake = no_op_wake();
+    let worker_wake = config
+        .worker_wake
+        .clone()
+        .map_or_else(no_op_wake, |wake| wake.0);
 
+    let bridge_wake = worker_wake.clone();
     thread::Builder::new()
         .name(format!("ctk-bus-{}", worker_config.service_name))
         .spawn(move || {
@@ -791,10 +983,10 @@ pub(crate) fn start_bridge(
                 config: worker_config,
                 requests: request_rx,
                 observation_requests: observation_request_rx,
-                events: event_tx,
-                messages: message_tx,
-                observation_messages: observation_message_tx,
-                inbound: inbound_tx,
+                events: WakeSender::new(event_tx, worker_wake.clone()),
+                messages: WakeSender::new(message_tx, worker_wake.clone()),
+                observation_messages: WakeSender::new(observation_message_tx, worker_wake.clone()),
+                inbound: WakeSender::new(inbound_tx, worker_wake.clone()),
                 committed_generation: worker_generation,
                 latest_messages: worker_latest,
                 semantic_inboxes: worker_semantic,
@@ -814,11 +1006,13 @@ pub(crate) fn start_bridge(
         committed_generation,
         latest_messages,
         semantic_inboxes,
+        wake: bridge_wake,
         max_messages_per_frame: config.max_messages_per_frame.max(1),
         max_observation_messages_per_frame: config.max_observation_messages_per_frame.max(1),
         service_name: config.service_name.clone(),
         shutdown_done: shutdown_done_rx,
         telemetry_taken: false,
+        inbound_claim: Arc::new(Mutex::new(None)),
     });
 }
 
@@ -826,10 +1020,10 @@ struct WorkerMainParams {
     config: BusBridgeConfig,
     requests: Receiver<WorkerRequest>,
     observation_requests: Receiver<ObservationRequest>,
-    events: Sender<BusBridgeEvent>,
-    messages: Sender<BusMessage>,
-    observation_messages: Sender<BusMessage>,
-    inbound: Sender<InboundRequest>,
+    events: WakeSender<BusBridgeEvent>,
+    messages: WakeSender<BusMessage>,
+    observation_messages: WakeSender<BusMessage>,
+    inbound: WakeSender<InboundRequest>,
     committed_generation: Arc<AtomicU64>,
     latest_messages: Arc<Mutex<HashMap<String, BusMessage>>>,
     semantic_inboxes: Arc<SemanticInboxes>,
@@ -864,7 +1058,7 @@ fn worker_main(params: WorkerMainParams) {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            let _ = events.send(BusBridgeEvent::Fatal(error.to_string()));
+            let _ = events.try_send(BusBridgeEvent::Fatal(error.to_string()));
             return;
         }
     };
@@ -923,10 +1117,10 @@ struct WorkerLoopParams {
     config: BusBridgeConfig,
     requests: Receiver<WorkerRequest>,
     observation_requests: Receiver<ObservationRequest>,
-    events: Sender<BusBridgeEvent>,
-    messages: Sender<BusMessage>,
-    observation_messages: Sender<BusMessage>,
-    inbound: Sender<InboundRequest>,
+    events: WakeSender<BusBridgeEvent>,
+    messages: WakeSender<BusMessage>,
+    observation_messages: WakeSender<BusMessage>,
+    inbound: WakeSender<InboundRequest>,
     committed_generation: Arc<AtomicU64>,
     latest_messages: Arc<Mutex<HashMap<String, BusMessage>>>,
     semantic_inboxes: Arc<SemanticInboxes>,
@@ -947,8 +1141,6 @@ async fn worker_loop(params: WorkerLoopParams) {
         semantic_inboxes,
         wake,
     } = params;
-    #[cfg(not(feature = "theme"))]
-    let _ = &wake;
     // CONTROL plane: the broker-verified writing identity. Every
     // WorkerRequest::Call is issued here and it carries NO subscriptions, so
     // RPC replies are never head-of-line-blocked behind telemetry publications.
@@ -1354,6 +1546,7 @@ async fn worker_loop(params: WorkerLoopParams) {
                     }) {
                         let topic = message.topic().unwrap().to_string();
                         latest_messages.lock().unwrap().insert(topic, message);
+                        wake();
                     } else if messages.try_send(message).is_err() {
                         dropped = dropped.saturating_add(1);
                         // Usually publish the critical notice immediately. If the
@@ -1481,7 +1674,7 @@ async fn worker_loop(params: WorkerLoopParams) {
                             body,
                         );
                     }
-                } else if is_app_verb(&command.command) {
+                } else if is_inbound_verb(&command.command, &config.inbound_prefixes) {
                     if epoch_pending {
                         // Mid-reconnect the app is resyncing; answer busy
                         // rather than hold a request across an epoch. (An
@@ -1670,6 +1863,10 @@ fn is_app_verb(command: &str) -> bool {
         )
 }
 
+fn is_inbound_verb(command: &str, prefixes: &[String]) -> bool {
+    is_app_verb(command) || prefixes.iter().any(|prefix| command.starts_with(prefix))
+}
+
 fn is_observe_event(command: &str) -> bool {
     command == "noded.observe.event"
 }
@@ -1763,7 +1960,7 @@ fn enter_epoch_fence(
     semantic_inboxes: &SemanticInboxes,
     committed_generation: &AtomicU64,
     tasks: EpochFenceTasks<'_>,
-    events: &Sender<BusBridgeEvent>,
+    events: &WakeSender<BusBridgeEvent>,
 ) {
     let EpochFenceTasks {
         calls,
@@ -2477,11 +2674,13 @@ mod tests {
             committed_generation: committed_generation.clone(),
             latest_messages: Arc::new(Mutex::new(HashMap::new())),
             semantic_inboxes,
+            wake: no_op_wake(),
             max_messages_per_frame: 8,
             max_observation_messages_per_frame: 8,
             service_name: "test-app".into(),
             shutdown_done: shutdown_done_rx,
             telemetry_taken: false,
+            inbound_claim: Arc::new(Mutex::new(None)),
         };
         (bridge, inbound_tx, request_rx, committed_generation)
     }
@@ -2536,6 +2735,7 @@ mod tests {
                 ),
             ]);
             let (event_tx, event_rx) = flume::bounded(8);
+            let event_tx = WakeSender::new(event_tx, no_op_wake());
             let semantic_inboxes = SemanticInboxes::default();
             #[cfg(feature = "theme")]
             semantic_inboxes.enqueue_theme_changed(
@@ -2642,6 +2842,7 @@ mod tests {
     #[test]
     fn inbound_drain_filters_stale_and_fenced_epochs() {
         let (bridge, inbound_tx, _request_rx, committed) = test_bridge(2);
+        bridge.claim_inbound("epoch-filter test");
         inbound_tx.send(request(1, "app.controls.set")).unwrap();
         inbound_tx.send(request(2, "app.describe")).unwrap();
         inbound_tx.send(request(1, "app.controls.get")).unwrap();
@@ -2662,6 +2863,32 @@ mod tests {
         // resurrect what was queued across it.
         committed.store(2, Ordering::Release);
         assert_eq!(bridge.drain_inbound().count(), 0);
+    }
+
+    /// The one-inbound-owner invariant is enforced, not conventional: the
+    /// same owner re-claims freely (it claims every frame), a second owner
+    /// panics deterministically, and draining without any claim panics.
+    #[test]
+    fn inbound_lease_is_take_once_per_app() {
+        let (bridge, _inbound_tx, _request_rx, _committed) = test_bridge(2);
+        bridge.claim_inbound("owner-a");
+        bridge.claim_inbound("owner-a");
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                bridge.claim_inbound("owner-b");
+            }))
+            .is_err(),
+            "a second inbound owner must fail loudly, not steal requests"
+        );
+    }
+
+    #[test]
+    fn unclaimed_inbound_drain_refuses_to_run() {
+        let (bridge, _inbound_tx, _request_rx, _committed) = test_bridge(2);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bridge.drain_inbound().count()
+        }))
+        .is_err());
     }
 
     /// Fire-and-forget requests never produce a response; correlated ones
@@ -2742,5 +2969,76 @@ mod tests {
         let (rc, body) = app_body_too_large_error("app.controls.set");
         assert_eq!(rc, 10);
         assert_eq!(body, r#"{"error":"body too large"}"#);
+    }
+
+    #[test]
+    fn successful_worker_delivery_requests_one_coalesced_wake() {
+        let (tx, rx) = flume::bounded(2);
+        let wakes = Arc::new(AtomicU64::new(0));
+        let observed = Arc::clone(&wakes);
+        let sender = WakeSender::new(
+            tx,
+            Arc::new(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+        sender.try_send(1_u8).unwrap();
+        assert_eq!(rx.try_recv(), Ok(1));
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+    }
+
+    /// A burst larger than the per-frame cap has already spent its per-send
+    /// wakes by the time the frame drains: the capped drain must re-arm the
+    /// wake itself, or the remainder waits for an unrelated event.
+    #[test]
+    fn capped_drain_rearms_the_wake_for_the_undrained_remainder() {
+        let (message_tx, message_rx) = flume::bounded::<BusMessage>(8);
+        let (request_tx, _request_rx) = flume::bounded(1);
+        let (observation_request_tx, _orx) = flume::bounded(1);
+        let (_event_tx, event_rx) = flume::bounded(1);
+        let (_observation_message_tx, observation_message_rx) = flume::bounded(1);
+        let (_inbound_tx, inbound_rx) = flume::bounded(1);
+        let (shutdown_done_tx, shutdown_done_rx) = flume::bounded(1);
+        let _ = shutdown_done_tx.send(());
+        let wakes = Arc::new(AtomicU64::new(0));
+        let observed = Arc::clone(&wakes);
+        let bridge = BusBridge {
+            requests: request_tx,
+            observation_requests: observation_request_tx,
+            events: event_rx,
+            messages: message_rx,
+            observation_messages: observation_message_rx,
+            inbound: inbound_rx,
+            committed_generation: Arc::new(AtomicU64::new(1)),
+            latest_messages: Arc::new(Mutex::new(HashMap::new())),
+            semantic_inboxes: Arc::new(SemanticInboxes::default()),
+            wake: Arc::new(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }),
+            max_messages_per_frame: 2,
+            max_observation_messages_per_frame: 2,
+            service_name: "test-app".into(),
+            shutdown_done: shutdown_done_rx,
+            telemetry_taken: false,
+            inbound_claim: Arc::new(Mutex::new(None)),
+        };
+        let message = || BusMessage {
+            connection_generation: 1,
+            from: "peer".into(),
+            command: "publish".into(),
+            body: String::new(),
+            headers: BTreeMap::new(),
+        };
+        for _ in 0..3 {
+            message_tx.send(message()).unwrap();
+        }
+        assert_eq!(bridge.drain_messages().count(), 2);
+        assert_eq!(wakes.load(Ordering::Relaxed), 1, "over-cap drain re-arms");
+        assert_eq!(bridge.drain_messages().count(), 1);
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            1,
+            "an under-cap drain never self-wakes"
+        );
     }
 }
