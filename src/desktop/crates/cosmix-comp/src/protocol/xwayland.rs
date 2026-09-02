@@ -1963,13 +1963,21 @@ impl WaylandState {
             );
             self.x11_destroyed_window(window.clone());
         }
-        if self.xwayland.override_redirect_windows.insert(xid) {
-            tracing::info!(
-                xid,
-                window_type = ?window.window_type(),
-                "override-redirect X11 window mapped"
-            );
-        }
+        // Unconditional, deliberately: this is the one INFO-level line
+        // announcing an OR map, and it was originally gated on
+        // `override_redirect_windows.insert(xid)` returning true — but
+        // `x11_new_override_redirect_window` inserts the same xid at
+        // CreateNotify on the ordinary vendor flow, so the guarded log
+        // never fired once in practice (found live 2026-09-03: the
+        // acceptance arm grepped for a line comp could not emit). The
+        // insert stays for the diagnostic set; the log reports every map
+        // event, remaps included, which is what actually happened.
+        self.xwayland.override_redirect_windows.insert(xid);
+        tracing::info!(
+            xid,
+            window_type = ?window.window_type(),
+            "override-redirect X11 window mapped"
+        );
         // The X server mapped it — for an OR window that IS the map
         // eligibility (there is no grant to wait for). Either callback
         // order is legal: pending carries the phase to a later
