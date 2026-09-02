@@ -104,11 +104,10 @@ use smithay::{
         TouchSlot,
     },
     delegate_cursor_shape, delegate_data_control, delegate_data_device, delegate_dmabuf,
-    delegate_text_input_manager,
     delegate_ext_data_control, delegate_foreign_toplevel_list, delegate_fractional_scale,
     delegate_idle_notify, delegate_output, delegate_pointer_constraints,
     delegate_primary_selection, delegate_relative_pointer, delegate_seat, delegate_session_lock,
-    delegate_shm, delegate_viewporter, delegate_xdg_activation,
+    delegate_shm, delegate_text_input_manager, delegate_viewporter, delegate_xdg_activation,
     desktop::{
         LayerMap, LayerSurface as DesktopLayerSurface, PopupKeyboardGrab, PopupKind, PopupManager,
         PopupPointerGrab, find_popup_root_surface, layer_map_for_output,
@@ -163,7 +162,6 @@ use smithay::{
             with_surface_tree_downward, with_surface_tree_upward,
         },
         cursor_shape::CursorShapeManagerState,
-        text_input::{TextInputManagerState, TextInputSeat},
         dmabuf::{
             DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
             get_dmabuf,
@@ -218,6 +216,7 @@ use smithay::{
         shm::{ShmHandler, ShmState, with_buffer_contents, with_buffer_contents_mut},
         socket::ListeningSocketSource,
         tablet_manager::TabletSeatHandler,
+        text_input::{TextInputManagerState, TextInputSeat},
         viewporter::{ViewportCachedState, ViewporterState, ensure_viewport_valid},
         xdg_activation::{
             XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
