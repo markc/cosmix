@@ -144,11 +144,10 @@ change arriving while it holds no snapshot (a powerd that was down at connect
 recovers on its first publication — no broker reconnect needed), and on a
 stale event sequence while live (a restarted powerd republishes from 1), and
 never polls. Before an authoritative snapshot it says `Power unavailable`; a
-host
-without a battery says `No system battery`; a partial battery reading names
-missing charge or state explicitly; a full reading renders only the supplied
-percentage, state, time, rate and health fields. Missing values are never
-rendered as zero.
+host without a battery says `No system battery`; a partial battery reading
+names missing charge or state explicitly; a full reading renders only the
+supplied percentage, state, time, rate and health fields. Missing values are
+never rendered as zero.
 
 ## Interaction boundary
 

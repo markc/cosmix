@@ -25,11 +25,11 @@ pub enum PanelMode {
 pub enum PanelInput {
     Reveal,
     /// Reveal when `Hidden`, hide otherwise; a pinned panel ignores it (the
-    /// same law as [`PanelInput::Hide`]). The direction binds at APPLY time against the authoritative [`PanelMode`] — never
-    /// against a caller's frame snapshot — so a mid-conceal panel
-    /// (`mapped == true`, mode already `Hidden`) toggles back open, and two
-    /// toggles applied in one drained batch net to identity rather than to a
-    /// single toggle.
+    /// same law as [`PanelInput::Hide`]). The direction binds at Model time
+    /// against the authoritative [`PanelMode`] — never against a caller's
+    /// frame snapshot — so a mid-conceal panel (`mapped == true`, mode
+    /// already `Hidden`) toggles back open, and two toggles applied in one
+    /// drained batch net to identity rather than to a single toggle.
     Toggle,
     CornerEntered,
     CornerLeft,

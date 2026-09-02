@@ -301,11 +301,17 @@ mod tests {
                     input: crate::core::PanelInput::Hide,
                 },
             ),
+            // `PanelToggle` maps to core `Toggle`, NOT to `Reveal`: the
+            // direction binds at Model time. This fixture starts Hidden,
+            // where the two coincide, so the row records the mapping rather
+            // than discriminating it — the tests that DO discriminate are
+            // `semantic_toggle_on_a_mapped_panel_reproduces_direct_hide` and
+            // `semantic_toggle_reopens_a_panel_animating_shut` below.
             (
                 ShellSemanticVerb::PanelToggle,
                 ShellCommandKind::Panel {
                     edge: Edge::Left,
-                    input: crate::core::PanelInput::Reveal,
+                    input: crate::core::PanelInput::Toggle,
                 },
             ),
             (
@@ -454,6 +460,21 @@ mod tests {
             app.update();
         }
         // Mid-conceal: the panel is still mapped but semantically Hidden.
+        // Assert it, or a fixture timing change silently degrades this into a
+        // plain toggle-from-Hidden and stops testing the thing it names.
+        {
+            let panel = app
+                .world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left);
+            assert!(panel.mapped, "precondition: mid-conceal panel is mapped");
+            assert_eq!(
+                panel.mode,
+                PanelMode::Hidden,
+                "precondition: mid-conceal panel is semantically Hidden"
+            );
+        }
         app.world_mut().write_message(semantic_shell_command(
             output.clone(),
             Duration::from_millis(450),

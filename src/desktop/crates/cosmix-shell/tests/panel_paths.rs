@@ -182,6 +182,33 @@ fn ordinary_hide_never_unpins() {
     assert_eq!(update.snapshot.exclusive_zone_px, 100.0);
 }
 
+/// `Toggle` mirrors `Hide`: a pinned panel ignores BOTH directions. The law
+/// is stated in `PanelInput::Toggle`'s docs and in `apply`'s Toggle arm, and
+/// until now was asserted at no level — the toggle rewire's own tests all
+/// start from Hidden or Revealed.
+#[test]
+fn a_pinned_panel_ignores_the_toggle_in_both_directions() {
+    let mut panel = panel();
+    panel.apply(ms(0), PanelInput::Pin).unwrap();
+    panel.tick(ms(200)).unwrap();
+    let pinned = panel.snapshot();
+    assert_eq!(pinned.mode, PanelMode::Pinned);
+
+    // Pinned is not Hidden, so this takes the "hide otherwise" branch — and
+    // the pin must veto it, exactly as `Hide` is vetoed above.
+    let update = panel.apply(ms(300), PanelInput::Toggle).unwrap();
+    assert!(!update.changed);
+    assert_eq!(update.snapshot.mode, PanelMode::Pinned);
+    assert_eq!(update.snapshot.exclusive_zone_px, 100.0);
+
+    // And the other direction is no different: a second toggle must not
+    // reveal-cycle it either.
+    let update = panel.apply(ms(400), PanelInput::Toggle).unwrap();
+    assert!(!update.changed);
+    assert_eq!(update.snapshot.mode, PanelMode::Pinned);
+    assert_eq!(update.snapshot.exclusive_zone_px, 100.0);
+}
+
 #[test]
 fn escape_never_unpins() {
     let mut panel = panel();

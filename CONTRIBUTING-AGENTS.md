@@ -49,7 +49,18 @@ and output.
 
 3. **Tests at the tree's density, green before you push.**
    `cargo test -p <crate>` for every crate you changed, plus the workspace run
-   for anything touching a shared library. A protocol change in `cosmix-comp`
+   for anything touching a shared library. **A per-crate gate must name the
+   feature set that makes that crate's tests compile, and must assert a
+   non-zero test count.** A bare `-p <crate>` on a crate whose tests live
+   behind a non-default feature compiles them out and still reports `ok`,
+   which reads exactly like coverage. Worked examples:
+   `cargo test -p ctk --features bus,theme` — ctk's default is
+   `menus, platform-wayland`, so a bare run drops every Bus and theme test;
+   and `cargo test -p cosmix-shell --features chrome` — `cosmix-shell` has
+   `default = []`, so a bare run reports `0 passed` for `src/lib.rs` while the
+   `tests/` files still pass, and the whole thing looks green. Read a crate's
+   `[features]` before trusting its run, and if the count is zero say so
+   rather than calling it green. A protocol change in `cosmix-comp`
    gets a test in `src/desktop/crates/cosmix-comp/src/protocol/tests.rs` — a
    real Wayland socket and hand-assembled wire bytes, not a mock. Copy the
    shape of the nearest existing test.
