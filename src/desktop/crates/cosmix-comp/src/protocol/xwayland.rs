@@ -1144,6 +1144,16 @@ impl WaylandState {
         let geometry = existing
             .or(pending_granted)
             .unwrap_or_else(|| self.choose_initial_x11_geometry(&window));
+        // Failure policy for `configure`/`set_maximized`/`set_fullscreen`
+        // (here and in the maximize/fullscreen state functions): comp-side
+        // state is recorded even when the X call errors, deliberately. These
+        // are fire-and-forget writes — x11rb surfaces only stream-level
+        // failures here (a broken connection), never a per-request refusal —
+        // so an `Err` means the generation is dying and `disconnected` will
+        // destroy every record shortly. Recording unconditionally keeps comp
+        // internally coherent for that short window; skipping on error would
+        // instead desynchronise phase from geometry with no client to
+        // reconcile against.
         if let Err(error) = window.configure(Some(geometry)) {
             tracing::warn!(xid, %error, "failed to grant initial X11 geometry");
         }
@@ -1277,13 +1287,27 @@ impl WaylandState {
             return;
         };
         self.xwayland.xids_by_object.remove(&object);
-        let Some(wl_surface) = self
-            .surfaces
-            .get(&object)
-            .map(|record| record.role.wl_surface().clone())
-        else {
+        let Some((wl_surface, record_generation)) = self.surfaces.get(&object).map(|record| {
+            (
+                record.role.wl_surface().clone(),
+                record.role.x11().map(|role| role.generation),
+            )
+        }) else {
             return;
         };
+        // The record's birth generation should always be the current one —
+        // teardown destroys a generation's records wholesale. A mismatch
+        // here means a record leaked across generations; make it loud.
+        if let Some(record_generation) = record_generation
+            && record_generation != self.xwayland.generation
+        {
+            tracing::warn!(
+                xid,
+                record_generation,
+                current_generation = self.xwayland.generation,
+                "destroying an X11 record that outlived its generation"
+            );
+        }
         let held_focus = self.x11_window_holds_keyboard_focus(xid, &wl_surface);
         // Existing destruction path: exactly once; the later wl_surface
         // destroy is a no-op for the absent record.
@@ -1634,6 +1658,12 @@ impl WaylandState {
 /// methods above so the deterministic tests can drive it without a live
 /// `XwmId`. Every delegate (except `xwm_state`/`disconnected`, which manage
 /// the drain) is gated on the callback's generation being the live one.
+///
+/// Known blind spot, accepted with the split: because `XwmId` is
+/// unconstructible offline, NO test executes this layer — a swapped
+/// delegation (say `unmap` wired to `destroy`) would compile and stay
+/// green. Each arm was verified by read in review (2026-09-02); the live
+/// nested gate is the only executable check. Keep the arms boring and 1:1.
 impl XwmHandler for WaylandState {
     fn xwm_state(&mut self, xwm: XwmId) -> &mut X11Wm {
         if self.xwm_event_is_live(xwm) {

@@ -12070,12 +12070,30 @@ impl WaylandState {
     /// focus), everything else through the surface itself.
     fn seat_focus_target_for(&self, surface: &WlSurface) -> SeatFocusTarget {
         #[cfg(feature = "xwayland")]
-        if let Some(role) = self
-            .surfaces
-            .get(&surface.id())
-            .and_then(|record| record.role.x11())
         {
-            return SeatFocusTarget::X11(role.surface.clone());
+            if let Some(role) = self
+                .surfaces
+                .get(&surface.id())
+                .and_then(|record| record.role.x11())
+            {
+                return SeatFocusTarget::X11(role.surface.clone());
+            }
+            // An XWayland-client surface with no X11 record falls through to
+            // plain Wayland focus, which skips the ICCCM half — such a
+            // window would look focused but take no keys. Should not happen
+            // (association precedes mapping precedes focus); make the ghost
+            // visible if it ever does.
+            if surface.client().is_some_and(|client| {
+                client
+                    .get_data::<smithay::xwayland::XWaylandClientData>()
+                    .is_some()
+            }) {
+                tracing::debug!(
+                    surface = ?surface.id(),
+                    "focusing an XWayland-client surface with no X11 record; \
+                     ICCCM focus half will be skipped"
+                );
+            }
         }
         SeatFocusTarget::Wayland(surface.clone())
     }
