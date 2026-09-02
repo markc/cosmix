@@ -36897,12 +36897,16 @@ mod x11 {
 
     #[test]
     fn x11_same_xid_reassociated_to_a_new_object_survives_the_old_records_death() {
-        // MAJOR-B (round 3): the OTHER re-association direction. The same
-        // XID re-associates to a different wl_surface; the old record still
-        // carries `role.xid`, and `destroy_surface_record` used to remove
-        // `surfaces_by_xid[xid]` unconditionally — the dying OLD record
-        // wiped the LIVE record's forward mapping, orphaning it from every
-        // XID lookup (geometry, decoration, unmap, destroy).
+        // Pins the round-4 withdrawal semantics of a same-XID/new-object
+        // re-association: the displaced record is withdrawn at hand-over
+        // (record gone, maps cleaned, renderer told) and the old
+        // wl_surface's trailing destroy is a no-op that leaves the live
+        // mapping alone. NOTE: since the withdrawal, the trailing destroy
+        // early-returns on the absent record and never reaches the
+        // conditional forward-removal guard in `destroy_surface_record` —
+        // that guard's coverage lives in
+        // `x11_destroy_of_a_stale_record_leaves_a_repointed_mapping_alone`,
+        // which constructs the divergent state directly.
         let mut harness = KeybindingHarness::new(true);
         let (surface_id, old_surface, _window, old_object) =
             associate_normal_window(&mut harness, 73);
@@ -37021,16 +37025,17 @@ mod x11 {
 
     #[test]
     fn x11_trailing_destroy_of_a_replaced_surface_must_not_orphan_the_live_window() {
-        // The full blanking sequence MAJOR-B's guard closes, end to end:
-        // Xwayland replaces a window's wl_surface before the map grant
-        // lands (surface churn around first map), and the OLD surface's
-        // destruction trails in after the hand-over. Pre-guard,
-        // `destroy_surface_record` for the old record unconditionally
-        // evicted `surfaces_by_xid[xid]` — which by then pointed at the LIVE
-        // surface — so the map grant parked itself in `pending_windows`,
-        // the live record's phase never gained `map_requested`, and
-        // `commit_may_map_surface` withheld every buffer forever: a healthy-
-        // looking record that composites nothing.
+        // End-to-end: surface churn around first map (association, swap,
+        // trailing destroy of the replaced surface, late map grant) still
+        // ends in a presented window. Historically this bottled the round-3
+        // eviction defect (an unconditional `surfaces_by_xid` removal in
+        // `destroy_surface_record` orphaned the live record; red on
+        // pre-guard trees). Since round 4's withdrawal the old record dies
+        // at hand-over, so the trailing destroy here is a no-op and never
+        // reaches that guarded block — the guard's coverage lives in
+        // `x11_destroy_of_a_stale_record_leaves_a_repointed_mapping_alone`;
+        // this test remains the end-to-end pin that the whole churn shape
+        // presents.
         let mut harness = KeybindingHarness::new(true);
         let window = fake_x11_window(74, false, Rectangle::new((0, 0).into(), (200, 150).into()));
         harness.server.state.x11_new_window(window.clone());
@@ -37066,6 +37071,96 @@ mod x11 {
             record.mapped,
             "the live window presents its first buffer; an orphaned XID map \
              leaves a healthy-looking record that composites nothing"
+        );
+    }
+
+    #[test]
+    fn x11_destroy_of_a_stale_record_leaves_a_repointed_mapping_alone() {
+        // Round 5 MAJOR-A: the conditional forward-removal guard in
+        // `destroy_surface_record` lost all coverage when round 4's
+        // withdrawal started destroying displaced records before any
+        // trailing destroy could reach the guarded block — reverting the
+        // guard to an unconditional remove left every test green. No known
+        // production path reaches the repointed arm any more (the
+        // withdrawal prevents the divergence), so this constructs the
+        // divergent state directly: a record dies while the forward entry
+        // points at a DIFFERENT live object. The guard is defense-in-depth
+        // against map/record divergence, and this test is what keeps it
+        // enforced.
+        let mut harness = KeybindingHarness::new(true);
+        let (_sid_a, surface_a, _window_a, _object_a) = associate_normal_window(&mut harness, 76);
+        let (_sid_b, _surface_b, _window_b, object_b) = associate_normal_window(&mut harness, 77);
+        // Diverge: xid 76's forward entry is repointed at window 77's
+        // object while window 76's record still carries `role.xid == 76`.
+        harness
+            .server
+            .state
+            .xwayland
+            .surfaces_by_xid
+            .insert(76, object_b.clone());
+        harness.server.state.destroy_surface_record(&surface_a);
+        assert_eq!(
+            harness.server.state.xwayland.surfaces_by_xid.get(&76),
+            Some(&object_b),
+            "a dying record must not remove a forward entry that no longer points at it"
+        );
+    }
+
+    #[test]
+    fn x11_surface_swap_returns_keyboard_focus_when_the_new_surface_presents() {
+        // Round 5 MINOR-B: pre-round-4 the displaced ghost RETAINED the
+        // keyboard, so the withdrawal introduced a focus drop nothing paid
+        // back — a focused X11 client that recreated its wl_surface lost
+        // the keyboard until the user clicked it. The withdrawal now owes
+        // the window its focus (`refocus_xid`) and pays the debt the
+        // moment the replacement record presents.
+        let mut harness = KeybindingHarness::new(true);
+        let (sid_a, surface_a, window, _object_a) = associate_normal_window(&mut harness, 78);
+        commit_dmabuf(&mut harness, sid_a, 32, 24);
+        harness
+            .server
+            .state
+            .arbitrate_keyboard_focus(Some(surface_a.clone()), false, false);
+        assert!(
+            matches!(
+                harness.server.state.keyboard.current_focus(),
+                Some(SeatFocusTarget::X11(target)) if target.window_id() == 78
+            ),
+            "precondition: the X11 window holds the keyboard"
+        );
+        // Xwayland swaps the wl_surface mid-life.
+        let (sid_b, surface_b) = roleless_wl_surface(&mut harness);
+        window.set_wl_surface_offline(Some(surface_b.clone()));
+        harness
+            .server
+            .state
+            .x11_associate_window(surface_b.clone(), window);
+        // Between swap and first commit the window is genuinely absent and
+        // must not hold the keyboard...
+        assert!(
+            !matches!(
+                harness.server.state.keyboard.current_focus(),
+                Some(SeatFocusTarget::X11(target)) if target.window_id() == 78
+            ),
+            "the withdrawn record does not keep the keyboard while absent"
+        );
+        assert_eq!(
+            harness.server.state.xwayland.refocus_xid,
+            Some(78),
+            "the swap records the focus debt"
+        );
+        // ...and gets it back the moment the replacement presents.
+        commit_dmabuf(&mut harness, sid_b, 32, 24);
+        assert!(
+            matches!(
+                harness.server.state.keyboard.current_focus(),
+                Some(SeatFocusTarget::X11(target)) if target.window_id() == 78
+            ),
+            "keyboard focus returns when the replacement surface presents"
+        );
+        assert_eq!(
+            harness.server.state.xwayland.refocus_xid, None,
+            "the focus debt is consumed exactly once"
         );
     }
 

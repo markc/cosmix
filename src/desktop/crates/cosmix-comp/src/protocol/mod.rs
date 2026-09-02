@@ -10093,8 +10093,14 @@ impl WaylandState {
         // Whichever side dies first — DestroyNotify or the wl_surface — the
         // XID maps must not keep pointing at a removed record. The forward
         // removal is conditional on the entry still pointing at THIS object:
-        // after the same XID re-associates to a different wl_surface, the
-        // dying old record must not wipe the live record's mapping.
+        // a dying record must not wipe a mapping that has moved on. Since
+        // the displaced-record withdrawal in `x11_associate_window`, no
+        // production path is known to reach the repointed (`Some(other)`)
+        // arm — the withdrawal destroys the old record before the maps
+        // move — so this is defense-in-depth against map/record divergence,
+        // and its coverage is the direct-state test
+        // `x11_destroy_of_a_stale_record_leaves_a_repointed_mapping_alone`
+        // (reverting to an unconditional remove reds it).
         #[cfg(feature = "xwayland")]
         if let SurfaceRole::X11(role) = &record.role {
             if self.xwayland.surfaces_by_xid.get(&role.xid) == Some(&surface.id()) {

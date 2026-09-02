@@ -678,6 +678,11 @@ impl CompositorHandler for WaylandState {
         if is_lock && mapped_before != mapped_after {
             self.arbitrate_keyboard_focus(Some(surface.clone()), false, true);
         }
+        // A window whose surface swap took the keyboard gets it back the
+        // moment its replacement record maps (armed by the displaced-record
+        // withdrawal; Option check while unarmed).
+        #[cfg(feature = "xwayland")]
+        self.consume_pending_x11_refocus();
         self.sync_foreign_toplevel(surface);
     }
 

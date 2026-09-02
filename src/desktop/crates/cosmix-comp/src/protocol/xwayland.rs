@@ -236,6 +236,12 @@ pub(super) struct XwaylandRuntime {
     /// `send_selection`. X-2's clipboard bridge must revisit this drain
     /// before relaxing either refusal.
     pub(super) draining_wms: Vec<X11Wm>,
+    /// XID owed a keyboard refocus: its window held the keyboard when a
+    /// surface swap withdrew the displaced record, and the replacement is
+    /// not presentable yet. Consumed (focus handed back) the moment the
+    /// XID's record maps; cleared if the window or generation dies first.
+    /// Event-driven — set at the swap, consumed at map, no polling.
+    pub(super) refocus_xid: Option<X11Window>,
     pub(super) shutting_down: bool,
 }
 
@@ -252,6 +258,7 @@ impl XwaylandRuntime {
             xids_by_object: HashMap::new(),
             override_redirect_windows: HashSet::new(),
             draining_wms: Vec::new(),
+            refocus_xid: None,
             shutting_down: false,
         }
     }
@@ -691,6 +698,7 @@ impl WaylandState {
         self.xwayland.surfaces_by_xid.clear();
         self.xwayland.xids_by_object.clear();
         self.xwayland.override_redirect_windows.clear();
+        self.xwayland.refocus_xid = None;
         for surface in surfaces {
             self.destroy_surface_record(&surface);
         }
@@ -898,7 +906,37 @@ impl WaylandState {
             self.pending_full_upserts.insert(id);
             self.recompute_effective_visibility();
             self.mark_pointer_hit_test_dirty();
+            self.consume_pending_x11_refocus();
         }
+    }
+
+    /// Hand the keyboard back to a window whose surface swap took it away.
+    /// Armed by the displaced-record withdrawal in `x11_associate_window`
+    /// when the swapped window held the keyboard; consumed here the moment
+    /// its record is presentable again (first buffer commit on the new
+    /// surface, or a retained-buffer remap). Cheap no-op while unarmed.
+    pub(super) fn consume_pending_x11_refocus(&mut self) {
+        let Some(xid) = self.xwayland.refocus_xid else {
+            return;
+        };
+        let Some(object) = self.xwayland.surfaces_by_xid.get(&xid).cloned() else {
+            // The window died before its replacement presented; the debt
+            // dies with it.
+            self.xwayland.refocus_xid = None;
+            return;
+        };
+        let Some(record) = self.surfaces.get(&object) else {
+            self.xwayland.refocus_xid = None;
+            return;
+        };
+        if !record.mapped {
+            // Not presentable yet; stay armed for the mapping commit.
+            return;
+        }
+        self.xwayland.refocus_xid = None;
+        let surface = record.role.wl_surface().clone();
+        self.arbitrate_keyboard_focus(Some(surface), false, false);
+        tracing::debug!(xid, "returned keyboard focus after X11 surface swap");
     }
 
     /// Mirror the comp scene's authoritative normal-band order into the XWM
@@ -1048,21 +1086,58 @@ impl WaylandState {
                     return None;
                 }
                 displaced_phase = Some(role.phase);
-                displaced_geometry = Some(role.granted_geometry);
+                // Hand the geometry over only when the phase carries an
+                // actual grant: on an ungranted record `granted_geometry`
+                // holds raw X hints under a granted name, and a stale hint
+                // must not outrank the incoming surface's current one.
+                displaced_geometry =
+                    Some(role.granted_geometry).filter(|_| role.phase.map_requested);
                 Some(role.wl_surface.clone())
             });
             match displaced_surface {
                 Some(displaced_surface) => {
-                    // Same focus discipline as unmap/destroy: fall back only
-                    // when this X window actually held the keyboard (the new
-                    // surface re-takes focus when it maps).
+                    // Focus identity is captured BY WINDOW ID before the
+                    // destroy, not by resolving the focus target's surface:
+                    // smithay repoints `X11Surface::wl_surface()` at the
+                    // incoming surface BEFORE `surface_associated` runs, so
+                    // resolution-based matching (`clear_focus_for_surface`
+                    // inside the destroy, its pointer arm likewise) can no
+                    // longer see that the seat is parked on the displaced
+                    // surface.
                     let held_focus = self.x11_window_holds_keyboard_focus(xid, &displaced_surface);
+                    let pointer_on_window = match self.pointer.current_focus() {
+                        Some(SeatFocusTarget::X11(target)) => target.window_id() == xid,
+                        Some(SeatFocusTarget::Wayland(focused)) => focused == displaced_surface,
+                        None => false,
+                    };
                     self.destroy_surface_record(&displaced_surface);
                     if held_focus {
+                        // Clear explicitly against the captured identity —
+                        // AFTER the destroy, so the fallback cannot re-pick
+                        // the still-mapped record it is clearing — and owe
+                        // the window its focus back the moment the new
+                        // surface presents (`consume_pending_x11_refocus`).
+                        // The `wl_keyboard.leave` this delivers resolves
+                        // against the already-flipped surface — vendor lazy
+                        // resolution comp cannot redirect without forking
+                        // the X half of focus; the map-time refocus's
+                        // `enter` balances it.
                         self.arbitrate_keyboard_focus(None, true, false);
+                        self.xwayland.refocus_xid = Some(xid);
                     }
+                    if pointer_on_window {
+                        // The destroy's own pointer arm mismatched for the
+                        // same flipped-resolution reason; re-hit-test off
+                        // the dead entity explicitly.
+                        self.retarget_pointer_after_visibility_change();
+                    }
+                    // Same scene-change epilogue as the sibling destroy
+                    // paths (`x11_unmapped_window`/`x11_destroyed_window`):
+                    // chrome hover state must not survive the entity.
+                    self.refresh_chrome_pointer_after_scene_change();
                     tracing::debug!(
                         xid,
+                        held_focus,
                         "withdrew displaced X11 record on re-association to a new wl_surface"
                     );
                 }
@@ -1427,6 +1502,11 @@ impl WaylandState {
         let xid = window.window_id();
         self.xwayland.pending_windows.remove(&xid);
         self.xwayland.override_redirect_windows.remove(&xid);
+        if self.xwayland.refocus_xid == Some(xid) {
+            // The window died before its swapped surface presented; the
+            // focus debt dies with it.
+            self.xwayland.refocus_xid = None;
+        }
         let Some(object) = self.xwayland.surfaces_by_xid.remove(&xid) else {
             return;
         };

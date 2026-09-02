@@ -33,7 +33,7 @@ inside § *smithay* — they are that crate's procedure. The wgpu pair has its o
 smaller version-locked procedure below because its patch is one API pipeline,
 not the Smithay defect series.
 
-**Run every command in this file from `desktop/`** unless it sets `ROOT` itself.
+**Run every command in this file from `src/desktop/`** unless it sets `ROOT` itself.
 This is the single most likely way to get a false pass: git commands with a
 pathspec that matches nothing print nothing and exit **0**, so the wrong
 directory is indistinguishable from a clean result. Measured — from the
@@ -51,7 +51,7 @@ gate and the baseline roll-forward — an invitation to destroy the very list th
 procedure starts from.
 
 Each subdirectory here is a published crate, extracted byte-for-byte from its
-crates.io tarball and then patched in-tree. `desktop/Cargo.toml` redirects the
+crates.io tarball and then patched in-tree. `src/desktop/Cargo.toml` redirects the
 dependency with `[patch.crates-io]`, and sets `exclude = ["vendor"]` so
 cargo resolves these as their crates.io packages rather than as members of this
 workspace.
@@ -72,12 +72,15 @@ not a guarantee:
 
 - A *closed* set. Naming the three commits that carry fix 5's behaviour, as the
   retention note below does, is history; no later commit can falsify it.
-- A count of what this file itself describes — "six of the seven defects", "run
-  these ten tests", the retention note's "three ways". An eighth defect changes those
+- A count of what this file itself describes — "six of the eight defects", "run
+  these ten tests", the retention note's "three ways". A ninth defect changes those
   answers, and nothing stops it landing entirely under `vendor/smithay/` and
   `crates/cosmix-comp/` without touching this file. What makes it the safer kind
   is only that the count sits in the same paragraph as the thing it counts, so
-  whoever documents the eighth defect is reading the stale number as they write.
+  whoever documents the ninth defect is reading the stale number as they write.
+  (This paragraph has proven its own point once already: fix 8 landed
+  2026-09-02 and the "eighth defect" this line used to anticipate arrived while
+  the line still called it hypothetical.)
   **If you are that person: fix them.** It works twice over: fix 6 was written by
   someone who read these numbers here, found them stale, and was told what to do
   about it by this paragraph — and fix 7 then did the same. Fix 7 also shows the
@@ -96,8 +99,8 @@ That is the one that has gone stale here, repeatedly. Enumerate:
 ROOT=$(git rev-parse --show-toplevel) &&
 BASE=ff4e3c1 &&
 : > /tmp/fixlist.txt &&
-git -C "$ROOT/desktop" merge-base --is-ancestor "$BASE" HEAD &&
-git -C "$ROOT/desktop" log --reverse --oneline "$BASE"..HEAD -- vendor/smithay/ \
+git -C "$ROOT/src/desktop" merge-base --is-ancestor "$BASE" HEAD &&
+git -C "$ROOT/src/desktop" log --reverse --oneline "$BASE"..HEAD -- vendor/smithay/ \
   > /tmp/fixlist.txt
 rc=$?
 cat /tmp/fixlist.txt
@@ -134,7 +137,7 @@ It pins its own directory because the bare form is a fail-open: run
 `git log … -- vendor/smithay/` from the repository root and the pathspec matches
 nothing, so it prints **no commits and exits 0** — a reapply list that is empty
 because you were standing in the wrong place looks exactly like a bump with
-nothing to reapply. Measured: 0 from the root, 10 from `desktop/`. The `&&` is
+nothing to reapply. Measured: 0 from the root, 10 from `src/desktop/`. The `&&` is
 load-bearing for the same reason as everywhere else here; outside a repository
 `rev-parse` fails, and unchained the next command would run with `ROOT` empty.
 
@@ -175,7 +178,7 @@ To move to a new upstream release:
      Do not let that soften row 5: four tests out of
      ten are a smoke alarm, not the check, and they say nothing about the other
      five fixes.
-   - `desktop/Cargo.lock`.
+   - `src/desktop/Cargo.lock`.
    - the version, source, sha256 **and upstream commit** in the table below. The
      new tarball ships its own `.cargo_vcs_info.json`; leaving that last field is
      a bump that checksums clean while attributing the tree to the wrong upstream
@@ -302,7 +305,7 @@ To move to a new upstream release:
    catch. Measured: with the patch version-mismatched, `cargo tree` prints
    registry `smithay v0.7.0` and exits 0.
 
-   It must name the vendored path — `smithay v0.7.0 (…/desktop/vendor/smithay)`.
+   It must name the vendored path — `smithay v0.7.0 (…/src/desktop/vendor/smithay)`.
    A bare `smithay v0.7.0` with no path in parentheses is the registry crate, and
    means the patch was dropped. It catches more than a version mismatch: removing
    `[patch]`, pointing it elsewhere, or changing the dependency's source all fail
@@ -332,7 +335,7 @@ To move to a new upstream release:
 
    One more limit, because it is the difference between "verified" and
    "verified in my working directory": `--locked` stops cargo *writing* a
-   lockfile, but it says nothing about whether `desktop/Cargo.lock` was
+   lockfile, but it says nothing about whether `src/desktop/Cargo.lock` was
    **committed**. A valid-but-uncommitted lockfile passes this command and every
    test below, and a clean checkout then gets the incomplete import. Confirm the
    commit, not the directory:
@@ -340,7 +343,7 @@ To move to a new upstream release:
    ```sh
    ROOT=$(git rev-parse --show-toplevel) &&
    : > /tmp/dirty.txt &&
-   git -C "$ROOT/desktop" status --porcelain \
+   git -C "$ROOT/src/desktop" status --porcelain \
      Cargo.lock crates/cosmix-comp/Cargo.toml vendor/smithay vendor/README.md \
      crates/cosmix-comp/src > /tmp/dirty.txt
    rc=$?
@@ -373,8 +376,8 @@ To move to a new upstream release:
 
    Empty output means what you verified is what you committed — and this one
    pins its own directory because it has **two** ways to lie, both measured. Run
-   it with `desktop/`-prefixed paths from `desktop/` and git warns
-   `could not open directory 'desktop/desktop/'` to stderr, then exits 0 with no
+   it with `src/desktop/`-prefixed paths from `src/desktop/` and git warns
+   `could not open directory 'src/desktop/src/'` to stderr, then exits 0 with no
    output. Run the unpinned form from the repository root and there is not even a
    warning: the pathspec simply matches nothing, and an entirely uncommitted
    import reports clean. Both are indistinguishable from a pass.
@@ -615,18 +618,18 @@ outcome a bump can produce, and the one this whole file exists to prevent.
 Measured at the pristine baseline commit: empty diff, exit 0. At `HEAD`: 498
 lines, exit 1.
 
-Runs from `desktop/`, like everything else here, and leaves you there. Three
+Runs from `src/desktop/`, like everything else here, and leaves you there. Three
 things in it are load-bearing rather than style, and each is a way an earlier
 version of this recipe reported success it had not earned:
 
 - **`git -C "$ROOT"`, not a bare `git archive`.** `git archive HEAD:<path>`
-  resolves the path relative to the current directory, so from `desktop/` a bare
-  invocation asks for `desktop/desktop/vendor/smithay` and git answers with an
+  resolves the path relative to the current directory, so from `src/desktop/` a bare
+  invocation asks for `src/desktop/src/desktop/vendor/smithay` and git answers with an
   empty archive and **exit status 0**. The comparison then reports the whole
   crate as removed, which reads as catastrophic drift rather than as the operator
   error it is. Anchoring to the repository root fixes that without a `cd`, which
   matters because a `cd` would strand the shell at the root and every test
-  command below resolves `vendor/smithay/Cargo.toml` relative to `desktop/`.
+  command below resolves `vendor/smithay/Cargo.toml` relative to `src/desktop/`.
 - **`&&` throughout.** Measured: with both `/tmp` directories present, identical,
   and unremovable, an unchained version runs its `rm`, `curl` and both `tar`
   steps, watches every one of them fail, and then compares the two survivors and
