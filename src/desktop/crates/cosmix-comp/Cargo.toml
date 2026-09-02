@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-comp"
-version = "0.38.0"
+version = "0.39.0"
 description = "Smithay protocol frontend with Bevy rendering for the CosMix desktop"
 edition = "2024"
 rust-version = "1.95"
@@ -26,9 +26,10 @@ kms-live = [
     "dep:signal-hook",
     "dep:smithay-client-toolkit",
 ]
-# XWayland X-1: rootless Xwayland + XWM for normal X11 toplevels. Deliberately
-# NOT in `default` yet — it joins the defaults only as the arc's final commit
-# after the live Firefox gate is green (Mark's ruling, 2026-09-02).
+# XWayland X-1: rootless Xwayland + XWM for normal X11 toplevels. In `default`
+# since 0.39.0 (Mark's decision, 2026-09-02, after the live Firefox gate went
+# green); the runtime control is the `xwayland.enabled` props leaf plus the
+# COSMIX_COMP_XWAYLAND launch override — the feature is no longer the switch.
 xwayland = ["smithay/xwayland"]
 
 [lints.rust]
@@ -115,3 +116,4 @@ wgpu = { version = "=29.0.4", features = ["noop"] }
 smithay = { version = "=0.7.0", default-features = false, features = [
     "cosmix_offline_test",
 ] }
+
