@@ -37084,9 +37084,11 @@ mod x11 {
         // production path reaches the repointed arm any more (the
         // withdrawal prevents the divergence), so this constructs the
         // divergent state directly: a record dies while the forward entry
-        // points at a DIFFERENT live object. The guard is defense-in-depth
-        // against map/record divergence, and this test is what keeps it
-        // enforced.
+        // points at a DIFFERENT live object. To be explicit about what this
+        // pin is FOR: it protects a future refactor that reintroduces a
+        // path to the repointed arm (the divergence class this arc kept
+        // producing), not any live path today — treat it as the guard's
+        // specification, not as evidence the shape occurs.
         let mut harness = KeybindingHarness::new(true);
         let (_sid_a, surface_a, _window_a, _object_a) = associate_normal_window(&mut harness, 76);
         let (_sid_b, _surface_b, _window_b, object_b) = associate_normal_window(&mut harness, 77);
@@ -37236,6 +37238,113 @@ mod x11 {
         assert!(
             harness.server.state.xwayland.refocus.is_none(),
             "the dropped debt does not linger"
+        );
+    }
+
+    #[test]
+    fn x11_unmap_forfeits_a_pending_focus_debt() {
+        // Round 6 MAJOR-1: a debt armed at a swap, then the client UNMAPS
+        // before the replacement commits. Without the unmap clear, the debt
+        // parks behind the consume's `!record.mapped` early-return for as
+        // long as the window stays unmapped — minutes of the user working
+        // elsewhere — and the baseline comparison does not save it: a user
+        // who never changed focus again still matches the recorded
+        // fallback, so the eventual remap would yank the keyboard back
+        // mid-keystroke. An unmap is the window forfeiting its claim.
+        let mut harness = KeybindingHarness::new(true);
+        let (sid_a, surface_a, window, _object_a) = associate_normal_window(&mut harness, 81);
+        commit_dmabuf(&mut harness, sid_a, 32, 24);
+        harness
+            .server
+            .state
+            .arbitrate_keyboard_focus(Some(surface_a.clone()), false, false);
+        // Swap arms the debt...
+        let (sid_b, surface_b) = roleless_wl_surface(&mut harness);
+        window.set_wl_surface_offline(Some(surface_b.clone()));
+        harness
+            .server
+            .state
+            .x11_associate_window(surface_b.clone(), window.clone());
+        assert!(
+            harness.server.state.xwayland.refocus.is_some(),
+            "precondition: the swap armed the debt"
+        );
+        // ...and the client unmaps before the replacement commits.
+        harness.server.state.x11_unmapped_window(window.clone());
+        assert!(
+            harness.server.state.xwayland.refocus.is_none(),
+            "an unmap forfeits the pending focus debt"
+        );
+        // The eventual remap presents without stealing the keyboard.
+        harness.server.state.x11_map_window_request(window);
+        commit_dmabuf(&mut harness, sid_b, 32, 24);
+        assert!(
+            !matches!(
+                harness.server.state.keyboard.current_focus(),
+                Some(SeatFocusTarget::X11(target)) if target.window_id() == 81
+            ),
+            "the remap does not pay a forfeited debt"
+        );
+    }
+
+    #[test]
+    fn x11_position_memory_survives_a_swap_between_unmap_and_remap() {
+        // Round 6 MINOR-3: `granted_geometry` is the window's position
+        // memory across unmap→remap (`x11_map_window_request` reuses it for
+        // an idempotent remap), and `on_unmapped` clears `map_requested` —
+        // so a hand-over gated on `map_requested` discarded a moved or
+        // resized window's rect as "raw hints" whenever Xwayland
+        // re-associated between the unmap and the remap, reopening the
+        // window in the wrong place. The gate is the sticky `ever_granted`.
+        let mut harness = KeybindingHarness::new(true);
+        let (sid_a, _surface_a, window, object_a) = associate_normal_window(&mut harness, 82);
+        commit_dmabuf(&mut harness, sid_a, 32, 24);
+        // The user resizes the window: a post-map ConfigureRequest grants a
+        // new size, which becomes position memory.
+        harness.server.state.x11_configure_request(
+            window.clone(),
+            None,
+            None,
+            Some(320),
+            Some(240),
+            None,
+        );
+        let SurfaceRole::X11(role) = &harness.server.state.surfaces[&object_a].role else {
+            panic!("record carries the X11 role");
+        };
+        let moved = role.granted_geometry;
+        assert_eq!(
+            (moved.size.w, moved.size.h),
+            (320, 240),
+            "precondition: the granted rect reflects the user's resize"
+        );
+        // The client unmaps (clears `map_requested`; the record and its
+        // grant deliberately survive for the remap)...
+        harness.server.state.x11_unmapped_window(window.clone());
+        // ...and Xwayland re-associates to a fresh wl_surface BEFORE the
+        // remap.
+        let (_sid_b, surface_b) = roleless_wl_surface(&mut harness);
+        window.set_wl_surface_offline(Some(surface_b.clone()));
+        harness
+            .server
+            .state
+            .x11_associate_window(surface_b.clone(), window.clone());
+        let object_b = surface_b.id();
+        let SurfaceRole::X11(role) = &harness.server.state.surfaces[&object_b].role else {
+            panic!("swapped record carries the X11 role");
+        };
+        assert_eq!(
+            role.granted_geometry, moved,
+            "the user's rect crosses the swap; it is a grant, not raw hints"
+        );
+        // The remap reuses the same memory.
+        harness.server.state.x11_map_window_request(window);
+        let SurfaceRole::X11(role) = &harness.server.state.surfaces[&object_b].role else {
+            panic!("swapped record keeps the X11 role");
+        };
+        assert_eq!(
+            role.granted_geometry, moved,
+            "the remap grants the remembered rect, not a fresh placement"
         );
     }
 

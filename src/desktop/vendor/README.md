@@ -137,7 +137,8 @@ It pins its own directory because the bare form is a fail-open: run
 `git log … -- vendor/smithay/` from the repository root and the pathspec matches
 nothing, so it prints **no commits and exits 0** — a reapply list that is empty
 because you were standing in the wrong place looks exactly like a bump with
-nothing to reapply. Measured: 0 from the root, 10 from `src/desktop/`. The `&&` is
+nothing to reapply. Measured: 0 from the root, 11 (2026-09-02, after fix 8's
+round) from `src/desktop/`. The `&&` is
 load-bearing for the same reason as everywhere else here; outside a repository
 `rev-parse` fails, and unchained the next command would run with `ROOT` empty.
 
@@ -377,7 +378,7 @@ To move to a new upstream release:
    Empty output means what you verified is what you committed — and this one
    pins its own directory because it has **two** ways to lie, both measured. Run
    it with `src/desktop/`-prefixed paths from `src/desktop/` and git warns
-   `could not open directory 'src/desktop/src/'` to stderr, then exits 0 with no
+   `could not open directory 'src/desktop/src/desktop/'` to stderr, then exits 0 with no
    output. Run the unpinned form from the repository root and there is not even a
    warning: the pathspec simply matches nothing, and an entirely uncommitted
    import reports clean. Both are indistinguishable from a pass.

@@ -58,6 +58,15 @@ pub(super) struct X11WindowPhase {
     pub(super) associated: bool,
     pub(super) map_requested: bool,
     pub(super) map_notified: bool,
+    /// Sticky: comp has written a real granted rectangle for this window at
+    /// least once. Unlike `map_requested` this survives `on_unmapped`,
+    /// because `granted_geometry` is the window's position memory across
+    /// unmap→remap (`x11_map_window_request` reuses it to keep the remap
+    /// idempotent) and remains a genuine grant — the surface-swap hand-over
+    /// gates on THIS, not on `map_requested`, so an unmapped window's moved
+    /// or maximized rect crosses the swap instead of being discarded as raw
+    /// hints.
+    pub(super) ever_granted: bool,
 }
 
 impl X11WindowPhase {
@@ -70,6 +79,7 @@ impl X11WindowPhase {
     pub(super) fn on_map_requested(&mut self) -> bool {
         let first = !self.map_requested;
         self.map_requested = true;
+        self.ever_granted = true;
         first
     }
 
@@ -765,6 +775,10 @@ impl WaylandState {
             return;
         };
         role.granted_geometry = rect;
+        // Whatever wrote this rect (map grant, configure answer, maximize,
+        // fullscreen, notify), it is now real position memory worth carrying
+        // across a surface swap.
+        role.phase.ever_granted = true;
         let new_origin = (rect.loc.x as f32, rect.loc.y as f32);
         let new_size = (rect.size.w.max(1), rect.size.h.max(1));
         let size_changed = record.configured_size != new_size;
@@ -956,6 +970,21 @@ impl WaylandState {
             // Not presentable yet; stay armed for the mapping commit.
             return;
         }
+        // `record.mapped` is the ONLY predicate checked here — not
+        // `layout.visible`, not `minimized`, not `role.xid`, not the
+        // record's generation. That is sound today because of three facts
+        // stated nowhere else, so they are stated here: (1) visibility —
+        // every map site runs `recompute_effective_visibility` (which
+        // maintains mapped && !minimized ⇒ visible) before this consume,
+        // and a record cannot be minimized in the same dispatch that maps
+        // it (minimize acts on mapped records); (2) identity —
+        // `surfaces_by_xid` only ever maps an xid to a record whose role
+        // carries that xid (association writes both together, destroy
+        // removes them together), so the record found via the map IS this
+        // debt's window; (3) generation — teardown clears the forward map
+        // wholesale, so a hit here is always current-generation. A refactor
+        // that breaks any of the three breaks this consume silently; move
+        // the corresponding check here with it.
         let Some(pending) = self.xwayland.refocus.take() else {
             return;
         };
@@ -1069,6 +1098,21 @@ impl WaylandState {
     /// the record exists before `CompositorHandler::commit` sees the buffer).
     pub(super) fn x11_associate_window(&mut self, wl_surface: WlSurface, surface: X11Surface) {
         let xid = surface.window_id();
+        // Pin the vendor ordering this function's focus-identity capture
+        // depends on: smithay repoints `X11Surface::wl_surface()` at the
+        // incoming surface BEFORE invoking `surface_associated` (and the
+        // offline tests hand-simulate the same ordering via
+        // `set_wl_surface_offline`). Every by-window-id focus/grab match
+        // below exists because resolution through `wl_surface()` is already
+        // flipped here — a smithay bump that moves the assignment would
+        // falsify those comments silently; this assert makes it loud.
+        debug_assert!(
+            surface
+                .wl_surface()
+                .is_none_or(|current| current == wl_surface),
+            "surface_associated ran before smithay repointed X11Surface::wl_surface(); \
+             the by-id focus capture below is built on the opposite ordering"
+        );
         if surface.is_override_redirect() {
             // X-2 gap: recorded, never managed.
             self.xwayland.override_redirect_windows.insert(xid);
@@ -1124,12 +1168,17 @@ impl WaylandState {
                     return None;
                 }
                 displaced_phase = Some(role.phase);
-                // Hand the geometry over only when the phase carries an
-                // actual grant: on an ungranted record `granted_geometry`
+                // Hand the geometry over only when comp has ever actually
+                // granted one: on a never-granted record `granted_geometry`
                 // holds raw X hints under a granted name, and a stale hint
-                // must not outrank the incoming surface's current one.
+                // must not outrank the incoming surface's current one. The
+                // gate is the STICKY `ever_granted`, not `map_requested` —
+                // an unmap clears the latter while `granted_geometry` stays
+                // the window's position memory for the remap, and
+                // discarding it here would reopen a moved/maximized window
+                // in the wrong place.
                 displaced_geometry =
-                    Some(role.granted_geometry).filter(|_| role.phase.map_requested);
+                    Some(role.granted_geometry).filter(|_| role.phase.ever_granted);
                 Some(role.wl_surface.clone())
             });
             match displaced_surface {
@@ -1148,6 +1197,19 @@ impl WaylandState {
                         Some(SeatFocusTarget::Wayland(focused)) => focused == displaced_surface,
                         None => false,
                     };
+                    // The implicit-grab identity, captured by window id for
+                    // the same reason as the two above: the destroy's own
+                    // grab arm resolves `start.focus` through the flipped
+                    // `wl_surface()` and cannot match, which would leave a
+                    // held button routing motion through a dead grab.
+                    let pointer_grab_on_window = self
+                        .pointer
+                        .grab_start_data()
+                        .and_then(|start| start.focus)
+                        .is_some_and(|(focus, _)| match focus {
+                            SeatFocusTarget::X11(target) => target.window_id() == xid,
+                            SeatFocusTarget::Wayland(focused) => focused == displaced_surface,
+                        });
                     self.destroy_surface_record(&displaced_surface);
                     if held_focus {
                         // Clear explicitly against the captured identity —
@@ -1172,11 +1234,30 @@ impl WaylandState {
                             fallback: self.keyboard.current_focus(),
                         });
                     }
-                    if pointer_on_window {
-                        // The destroy's own pointer arm mismatched for the
-                        // same flipped-resolution reason; re-hit-test off
-                        // the dead entity explicitly.
-                        self.retarget_pointer_after_visibility_change();
+                    if pointer_on_window || pointer_grab_on_window {
+                        // The destroy's own pointer arms mismatched for the
+                        // flipped-resolution reason above; mirror its
+                        // teardown protocol explicitly, deferral included.
+                        if self.pointer_hit_test_reconciliation_deferred() {
+                            if pointer_grab_on_window {
+                                self.pointer_grab_teardown_deferred = true;
+                            }
+                            self.mark_pointer_hit_test_dirty();
+                        } else {
+                            if pointer_grab_on_window {
+                                let pointer = self.pointer.clone();
+                                pointer.unset_grab(
+                                    self,
+                                    SERIAL_COUNTER.next_serial(),
+                                    monotonic_millis(),
+                                );
+                                tracing::debug!(
+                                    xid,
+                                    "cancelled pointer grab held on a swapped X11 surface"
+                                );
+                            }
+                            self.retarget_pointer_after_visibility_change();
+                        }
                     }
                     // Same scene-change epilogue as the sibling destroy
                     // paths (`x11_unmapped_window`/`x11_destroyed_window`):
@@ -1209,6 +1290,11 @@ impl WaylandState {
         let granted = pending
             .and_then(|entry| entry.granted_geometry)
             .or(displaced_geometry);
+        if granted.is_some() {
+            // Covers the pre-map ConfigureRequest grant, whose pending
+            // entry records a geometry without a phase transition.
+            phase.ever_granted = true;
+        }
         let geometry = granted.unwrap_or_else(|| surface.geometry());
         let decoration = self.x11_decoration_mode(&surface, false);
         let title = capped_toplevel_title(&surface.title());
@@ -1492,6 +1578,22 @@ impl WaylandState {
 
     pub(super) fn x11_unmapped_window(&mut self, window: X11Surface) {
         let xid = window.window_id();
+        if self
+            .xwayland
+            .refocus
+            .as_ref()
+            .is_some_and(|pending| pending.xid == xid)
+        {
+            // An unmap is the window forfeiting its claim: without this, a
+            // debt armed at a swap could park behind the consume's
+            // `!record.mapped` early-return for MINUTES (unmap holds
+            // `map_requested` false until a remap), and the baseline
+            // comparison would not save it — a user who worked elsewhere
+            // without changing focus again still matches the recorded
+            // fallback, and the eventual remap would yank the keyboard
+            // mid-keystroke.
+            self.xwayland.refocus = None;
+        }
         if let Some(entry) = self.xwayland.pending_windows.get_mut(&xid) {
             entry.phase.on_unmapped();
         }
