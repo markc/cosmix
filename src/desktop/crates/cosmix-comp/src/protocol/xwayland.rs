@@ -300,13 +300,15 @@ pub(super) struct PendingX11Refocus {
 impl XwaylandRuntime {
     pub(super) fn new(socket_name: String) -> Self {
         Self {
-            // Tests get a fixed `true`: the resolver reads the machine's
+            // Tests get a fixed `true`: the I/O shell reads the machine's
             // real environment and config file, and a dev box that has
-            // disabled XWayland must not flip test outcomes.
+            // disabled XWayland must not flip test outcomes. The shell's
+            // components ARE tested — the resolver over its whole value
+            // table, and the write/read round trip against a tempdir.
             enabled: if cfg!(test) {
                 true
             } else {
-                xwayland_enabled_at_startup()
+                xwayland_enabled_at_startup(&socket_name)
             },
             generation: 0,
             lifecycle: XwaylandLifecycle::Inert,
@@ -332,40 +334,96 @@ impl XwaylandRuntime {
 }
 
 /// The persisted location of the `xwayland.enabled` switch: a one-word
-/// file (`true`/`false`) under the COSMIX etc tree. Written by the props
-/// set (plain `fs::write`, not the atomic-rename dance: the worst torn
-/// write is an unparseable word, which reads as the default `true` — a
-/// recoverable state the env override can still veto), read once at
-/// startup.
+/// file (`true`/`false`) under the COSMIX etc tree, KEYED PER SOCKET like
+/// the `DISPLAY` descriptor and for the same reason — a nested test
+/// compositor's props write must never change the real seat's next
+/// startup. (The residual: socket names are assigned at bind time, so a
+/// real-seat comp that lands on `wayland-1` because something briefly held
+/// `wayland-0` reads a different file. Rare on a real seat, recoverable by
+/// the env override, and the startup log plus the read-only
+/// `xwayland.persist_path` leaf make the resolved file visible instead of
+/// guessed.) Plain `fs::write`, not the atomic-rename dance: the worst
+/// torn write is an unparseable word, which reads as the default `true` —
+/// recoverable, and the env override can still veto.
 #[cfg(feature = "bus")]
-fn xwayland_enabled_persist_path() -> PathBuf {
+pub(super) fn xwayland_enabled_persist_path(socket_name: &str) -> PathBuf {
     cosmix_config::paths::cosmix_path(cosmix_config::paths::CosmixDir::Etc)
         .join("comp")
-        .join("xwayland-enabled")
+        .join(format!("xwayland-enabled.{socket_name}"))
 }
 
-/// Persist the switch for the next startup. Failure is logged, not
-/// propagated: the in-memory value and the changed event already happened,
-/// and refusing the set for an I/O error would leave the operator with no
-/// structured channel at all — the env override remains the last resort.
-// Dead in test builds by design: the sole caller (the props set) cfg-gates
-// the persist out so the offline suite never writes the real etc tree.
-#[cfg_attr(test, allow(dead_code))]
+/// The write half, path-parameterised so the round-trip is testable
+/// against a tempdir (the production shell supplies the per-socket path).
+/// The error is RETURNED as well as logged: the props reply must report a
+/// write that did not persist (`persisted: false`) instead of claiming
+/// durability it did not achieve — the in-memory change and the changed
+/// event stand either way, per the no-rollback reasoning at the set site.
 #[cfg(feature = "bus")]
-pub(super) fn persist_xwayland_enabled(value: bool) {
-    let path = xwayland_enabled_persist_path();
+pub(super) fn write_xwayland_enabled(path: &std::path::Path, value: bool) -> std::io::Result<()> {
     let write = path
         .parent()
         .map(fs::create_dir_all)
         .transpose()
-        .and_then(|_| fs::write(&path, if value { "true\n" } else { "false\n" }));
-    if let Err(error) = write {
+        .and_then(|_| fs::write(path, if value { "true\n" } else { "false\n" }));
+    if let Err(error) = &write {
         tracing::warn!(
             path = %path.display(),
             %error,
             "failed to persist xwayland.enabled; the setting will not survive restart"
         );
     }
+    write
+}
+
+/// Parse one `COSMIX_COMP_XWAYLAND` value. `None` = unrecognised (the
+/// caller warns and falls through) — including the empty string, so an
+/// accidentally-blank override cannot silently disable anything.
+pub(super) fn parse_xwayland_env(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => Some(false),
+        "1" | "true" | "on" | "yes" => Some(true),
+        _ => None,
+    }
+}
+
+/// Parse one persisted-file body. Strict on purpose: only the two words
+/// the writer produces; anything else is `None` (caller warns, defaults).
+pub(super) fn parse_xwayland_file(text: &str) -> Option<bool> {
+    match text.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// The PURE precedence decision, unit-tested over the whole value table:
+/// env override (works even when the props surface or the file is the
+/// problem) > persisted file > default `true`. The I/O lives in the thin
+/// shell below; this function never touches the machine.
+pub(super) fn resolve_xwayland_enabled(env: Option<&str>, file: Option<&str>) -> bool {
+    if let Some(value) = env {
+        match parse_xwayland_env(value) {
+            Some(enabled) => return enabled,
+            None => {
+                tracing::warn!(
+                    value,
+                    "unrecognised COSMIX_COMP_XWAYLAND; falling through to the persisted file"
+                );
+            }
+        }
+    }
+    if let Some(text) = file {
+        match parse_xwayland_file(text) {
+            Some(enabled) => return enabled,
+            None => {
+                tracing::warn!(
+                    value = text.trim(),
+                    "unparseable persisted xwayland.enabled; defaulting to enabled"
+                );
+            }
+        }
+    }
+    true
 }
 
 /// Resolve the startup value of the XWayland switch. Precedence, and why:
@@ -385,39 +443,52 @@ pub(super) fn persist_xwayland_enabled(value: bool) {
 /// must be running to accept the write, and by then startup has passed —
 /// which would make the leaf decorative. File-persisted-for-next-startup
 /// is the smallest semantics under which the props write is honest.
-fn xwayland_enabled_at_startup() -> bool {
-    if let Ok(value) = env::var("COSMIX_COMP_XWAYLAND") {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "0" | "false" | "off" | "no" => return false,
-            "1" | "true" | "on" | "yes" => return true,
-            other => {
-                tracing::warn!(
-                    value = other,
-                    "unrecognised COSMIX_COMP_XWAYLAND; falling through to the persisted file"
-                );
-            }
-        }
-    }
+///
+/// This is the two-line I/O shell over the pure, unit-tested
+/// `resolve_xwayland_enabled`; it also logs the RESOLVED file path and
+/// outcome, because the path depends on the COSMIX root and the socket
+/// name and an operator debugging "why is XWayland back" must see which
+/// file was consulted, not deduce it. Precedence note for feature combos:
+/// the three-level chain applies to `bus` builds (the path helper lives in
+/// cosmix-config, a bus dependency); a no-bus build has no props surface
+/// and no persisted file — env override or default only.
+fn xwayland_enabled_at_startup(socket_name: &str) -> bool {
+    let env_value = env::var("COSMIX_COMP_XWAYLAND").ok();
     #[cfg(feature = "bus")]
     {
-        match fs::read_to_string(xwayland_enabled_persist_path()) {
-            Ok(text) => match text.trim() {
-                "true" => return true,
-                "false" => return false,
-                other => {
-                    tracing::warn!(
-                        value = other,
-                        "unparseable persisted xwayland.enabled; defaulting to enabled"
-                    );
-                }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        let path = xwayland_enabled_persist_path(socket_name);
+        let file_value = match fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
-                tracing::warn!(%error, "unreadable persisted xwayland.enabled; defaulting to enabled");
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "unreadable persisted xwayland.enabled; defaulting to enabled"
+                );
+                None
             }
-        }
+        };
+        let enabled = resolve_xwayland_enabled(env_value.as_deref(), file_value.as_deref());
+        tracing::info!(
+            enabled,
+            persist_path = %path.display(),
+            env_override = env_value.is_some(),
+            "resolved xwayland.enabled at startup"
+        );
+        enabled
     }
-    true
+    #[cfg(not(feature = "bus"))]
+    {
+        let _ = socket_name;
+        let enabled = resolve_xwayland_enabled(env_value.as_deref(), None);
+        tracing::info!(
+            enabled,
+            env_override = env_value.is_some(),
+            "resolved xwayland.enabled at startup (no persisted file without the bus feature)"
+        );
+        enabled
+    }
 }
 
 fn xwayland_descriptor_path(socket_name: &str) -> Option<PathBuf> {

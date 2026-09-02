@@ -31,8 +31,12 @@ The control plane exposes seven verbs:
   the name this compositor instance actually registered. The reply is truthful
   only for a caller that subscribed to that topic before calling `watch` and
   remains subscribed.
-- `comp.props.set {path,value}` mutates one of the four corner properties and
-  returns `{path,old,new}`.
+- `comp.props.set {path,value}` mutates one of the five mutable leaves (the
+  four corner properties plus `xwayland.enabled`) and returns
+  `{path,old,new}`; for the file-persisted `xwayland.enabled` the reply also
+  carries `persisted` — `false` means the in-memory change and the changed
+  event stand but the write to disk failed and the value will not survive
+  restart.
 
 The complete L2 read tree is:
 
@@ -51,6 +55,7 @@ focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock}
 decoration.{enabled,style}
 bindings.{enabled,profile,table}
 input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s}
+xwayland.{enabled,persist_path}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
       slug_collisions,broker}
 ```
@@ -141,9 +146,18 @@ ranges are:
 | `input.corners.dwell_ms` | `200` | `0..=5000` ms |
 | `input.corners.velocity_max_px_s` | `1500.0` | `1.0..=20000.0` logical px/s |
 
-These are the only mutable leaves. Their descriptors say `mutable:true` and
-`persistence:"none"`; numeric leaves also carry the range above. Values live
-for the compositor process only. Writes are admitted only when noded supplied
+The corner leaves and `xwayland.enabled` are the only mutable leaves. The
+corner descriptors say `mutable:true` and `persistence:"none"` (numeric
+leaves also carry the range above) and those values live for the compositor
+process only. `xwayland.enabled` is the one exception: its descriptor says
+`persistence:"file"` — the value is read once at compositor startup (whether
+to spawn XWayland at all; there is no live toggle) and a write persists it
+for the NEXT startup into a per-socket file under the COSMIX etc tree, whose
+resolved absolute path the read-only `xwayland.persist_path` leaf reports
+and the compositor logs at startup. The `COSMIX_COMP_XWAYLAND` environment
+variable (`0/false/off/no` or `1/true/on/yes`) overrides both the file and
+the default at launch — the no-rebuild back-out that works even when the
+props surface is unreachable. Writes are admitted only when noded supplied
 exactly one case-insensitive `broker_origin` header whose value is `local`,
 the caller has a canonical registered service name, and the wire contains no
 `source_peer`, `permissions` or `signed_ident` claim. Otherwise the reply is

@@ -217,14 +217,19 @@ pub(crate) struct InputSnapshot {
     pub(crate) corners: CornersSnapshot,
 }
 
-/// The XWayland runtime switch as a props subtree. One leaf today:
-/// `xwayland.enabled` — the CONFIGURED value (startup-read; a set persists
-/// for the next compositor startup), not whether a generation is currently
-/// running, which the lifecycle owns.
+/// The XWayland runtime switch as a props subtree: `xwayland.enabled` is
+/// the CONFIGURED value (startup-read; a set persists for the next
+/// compositor startup — not whether a generation is currently running,
+/// which the lifecycle owns), and `xwayland.persist_path` is the resolved
+/// per-socket file that value persists to — read-only, surfaced because
+/// the path depends on the COSMIX root and the socket name, and an
+/// operator must be able to SEE which file governs the next startup
+/// rather than deduce it.
 #[cfg(feature = "xwayland")]
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct XwaylandSnapshot {
     pub(crate) enabled: bool,
+    pub(crate) persist_path: Arc<str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -416,7 +421,7 @@ macro_rules! flat_snapshot {
 
 flat_snapshot!(InfoSnapshot, service, version, backend, engine, instance);
 #[cfg(feature = "xwayland")]
-flat_snapshot!(XwaylandSnapshot, enabled);
+flat_snapshot!(XwaylandSnapshot, enabled, persist_path);
 flat_snapshot!(
     WindowSnapshot,
     id,
@@ -844,6 +849,11 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         #[cfg(feature = "xwayland")]
         xwayland: XwaylandSnapshot {
             enabled: state.xwayland.enabled,
+            persist_path: Arc::from(
+                super::xwayland::xwayland_enabled_persist_path(&state.xwayland.socket_name)
+                    .display()
+                    .to_string(),
+            ),
         },
         port: PortSnapshot {
             level: "L2",
@@ -1427,10 +1437,18 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
             &[L("xwayland"), L("enabled")],
             Bool,
             "Whether this compositor spawns XWayland; read at startup, a write persists \
-             for the NEXT startup (no live toggle). COSMIX_COMP_XWAYLAND overrides at launch",
+             for the NEXT startup (no live toggle; the Set reply's `persisted` field \
+             reports write durability). COSMIX_COMP_XWAYLAND overrides at launch",
             mutable
         )
     },
+    #[cfg(feature = "xwayland")]
+    descriptor!(
+        &[L("xwayland"), L("persist_path")],
+        String,
+        "Resolved per-socket file xwayland.enabled persists to (root- and \
+         socket-dependent; read-only so the governing file is visible, not deduced)"
+    ),
     descriptor!(&[L("port"), L("level")], String, "Implemented property substrate level", enum = &["L2"]),
     descriptor!(
         &[L("port"), L("event_seq")],
@@ -1963,7 +1981,10 @@ mod tests {
                 corners: CornerConfig::default().into(),
             },
             #[cfg(feature = "xwayland")]
-            xwayland: XwaylandSnapshot { enabled: true },
+            xwayland: XwaylandSnapshot {
+                enabled: true,
+                persist_path: Arc::from("/tmp/fixture/etc/comp/xwayland-enabled.comp-nested"),
+            },
             port: PortSnapshot {
                 level: "L2",
                 event_seq: 0,

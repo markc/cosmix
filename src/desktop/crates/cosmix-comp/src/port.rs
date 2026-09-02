@@ -82,6 +82,13 @@ pub(crate) enum ControlReply {
         path: String,
         old: PropValue,
         new: PropValue,
+        /// Durability report for file-persisted leaves: `Some(false)` means
+        /// the in-memory change and the changed event stand but the write
+        /// to disk FAILED and the value will not survive restart — the
+        /// reply must not claim an outcome it did not achieve. `None` for
+        /// process-lifetime leaves (field absent on the wire, so their
+        /// bodies are byte-identical to before this field existed).
+        persisted: Option<bool>,
     },
     Validation(SetValidationError),
     Busy,
@@ -105,14 +112,25 @@ impl ControlReply {
                     .to_string(),
                 ),
             ),
-            Self::Set { path, old, new } => (
+            Self::Set {
+                path,
+                old,
+                new,
+                persisted,
+            } => (
                 0,
                 Arc::from(
-                    json!({
-                        "path": path,
-                        "old": old.wire_value(),
-                        "new": new.wire_value(),
-                    })
+                    {
+                        let mut body = json!({
+                            "path": path,
+                            "old": old.wire_value(),
+                            "new": new.wire_value(),
+                        });
+                        if let Some(persisted) = persisted {
+                            body["persisted"] = json!(persisted);
+                        }
+                        body
+                    }
                     .to_string(),
                 ),
             ),
@@ -2089,6 +2107,7 @@ mod tests {
                 path: "input.corners.dwell_ms".into(),
                 old: PropValue::U64(200),
                 new: PropValue::U64(250),
+                persisted: None,
             })
             .expect("responder remains live");
         responders

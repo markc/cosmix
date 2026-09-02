@@ -27828,12 +27828,77 @@ fn port_watch_and_set_share_the_stable_service_point_and_sequence() {
     assert!(drain_observations(&observations).is_empty());
 }
 
+/// The pure precedence decision behind the XWayland switch, over its whole
+/// value table — this and the tempdir round trip below are what replaced
+/// the untestable-in-place I/O shell (the shell short-circuits under
+/// cfg(test) so a dev machine's real config cannot flip test outcomes; its
+/// COMPONENTS are what these tests execute).
+#[cfg(feature = "xwayland")]
+#[test]
+fn xwayland_enabled_resolver_covers_the_value_table() {
+    use crate::protocol::xwayland::{
+        parse_xwayland_env, parse_xwayland_file, resolve_xwayland_enabled,
+    };
+    // Env parse: blank and unrecognised values must NOT silently disable.
+    assert_eq!(parse_xwayland_env(""), None);
+    assert_eq!(parse_xwayland_env(" 0 "), Some(false));
+    assert_eq!(parse_xwayland_env("OFF"), Some(false));
+    assert_eq!(parse_xwayland_env("No"), Some(false));
+    assert_eq!(parse_xwayland_env("1"), Some(true));
+    assert_eq!(parse_xwayland_env("Yes"), Some(true));
+    assert_eq!(parse_xwayland_env("2"), None);
+    // File parse: strict — only the writer's two words.
+    assert_eq!(parse_xwayland_file("true\n"), Some(true));
+    assert_eq!(parse_xwayland_file(" false "), Some(false));
+    assert_eq!(parse_xwayland_file("garbage"), None);
+    assert_eq!(parse_xwayland_file(""), None);
+    // Precedence: env > file > default true, with unrecognised values
+    // falling THROUGH rather than deciding.
+    assert!(resolve_xwayland_enabled(None, None));
+    assert!(!resolve_xwayland_enabled(Some("0"), Some("true\n")));
+    assert!(resolve_xwayland_enabled(Some(""), Some("true\n")));
+    assert!(!resolve_xwayland_enabled(Some("2"), Some("false")));
+    assert!(resolve_xwayland_enabled(Some("2"), Some("junk")));
+    assert!(!resolve_xwayland_enabled(None, Some("false\n")));
+}
+
+/// The write/read round trip the switch exists for, against a tempdir —
+/// the REAL production write and parse code, never the machine's real etc
+/// tree. Also pins the persisted:false contract: a write into an
+/// impossible location must surface as Err, because the props reply
+/// reports that outcome instead of claiming durability.
+#[cfg(all(feature = "xwayland", feature = "bus"))]
+#[test]
+fn xwayland_enabled_persist_round_trips_through_a_tempdir() {
+    use crate::protocol::xwayland::{resolve_xwayland_enabled, write_xwayland_enabled};
+    let dir = env::temp_dir().join(format!("cosmix-xwl-persist-test-{}", std::process::id()));
+    let path = dir.join("comp").join("xwayland-enabled.test-socket");
+    write_xwayland_enabled(&path, false).expect("write false");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(
+        !resolve_xwayland_enabled(None, Some(&text)),
+        "a persisted false survives the round trip"
+    );
+    write_xwayland_enabled(&path, true).expect("overwrite true");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(resolve_xwayland_enabled(None, Some(&text)));
+    // The failure contract: `path` is a FILE, so a child under it cannot
+    // be created — the write must report Err, not warn-and-vanish.
+    let blocked = path.join("cannot-create-under-a-file");
+    assert!(
+        write_xwayland_enabled(&blocked, true).is_err(),
+        "a failed write surfaces as Err — the persisted:false reply contract"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The XWayland runtime switch as a props leaf: set round-trip, changed
 /// event, no-op dedup, validation, and the startup gate it feeds. The
 /// PERSISTED half (the etc-tree file) is deliberately not driven here —
 /// the offline suite must never write the dev machine's real config tree,
-/// and the set path cfg-gates the write out under test; the live gate owns
-/// that half.
+/// and the set path cfg-gates the write out under test (reporting
+/// persisted:true deterministically); the write/read round trip is the
+/// tempdir test above, and the live gate owns the real-path half.
 #[cfg(all(feature = "bus", feature = "xwayland"))]
 #[test]
 fn xwayland_enabled_prop_round_trips_and_gates_startup() {
@@ -27865,7 +27930,7 @@ fn xwayland_enabled_prop_round_trips_and_gates_startup() {
     assert_eq!(rc, 0);
     assert_eq!(
         serde_json::from_str::<Value>(&body).unwrap(),
-        json!({"path": "xwayland.enabled", "old": true, "new": false})
+        json!({"path": "xwayland.enabled", "old": true, "new": false, "persisted": true})
     );
     let changed = drain_observations(&observations);
     assert_eq!(changed.len(), 1);
@@ -35990,9 +36055,11 @@ fn cosmix_comp_default_features_are_deliberate() {
             .matches("default = [\"bus\", \"frame-capture\", \"xwayland\"]")
             .count(),
         1,
-        "the cosmix-comp default feature set changed; if deliberate, update this assert \
-         in the same commit (xwayland joined default 2026-09-02, Mark's decision, with \
-         the xwayland.enabled runtime switch as the control the feature used to be)"
+        "the cosmix-comp default feature set changed — OR the line was merely reformatted \
+         (this is a text match, not a feature parse); if the SET changed deliberately, \
+         update this assert in the same commit (xwayland joined default 2026-09-02, \
+         Mark's decision, with the xwayland.enabled runtime switch as the control the \
+         feature used to be); if only formatting changed, update the needle"
     );
 }
 
@@ -38562,4 +38629,3 @@ mod x11 {
         assert!(pending.granted_geometry.is_none());
     }
 }
-

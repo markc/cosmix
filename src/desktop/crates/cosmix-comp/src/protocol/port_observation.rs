@@ -1920,7 +1920,12 @@ fn service_set(
         queue_prop_change(changes, path.clone(), old.clone(), new.clone(), "props.set");
     }
     if let Some(reply) = request.reply.take() {
-        let _ = reply.send(ControlReply::Set { path, old, new });
+        let _ = reply.send(ControlReply::Set {
+            path,
+            old,
+            new,
+            persisted: None,
+        });
     }
 }
 
@@ -1947,14 +1952,26 @@ fn service_set_xwayland_enabled(
         return;
     };
     let old = state.xwayland.enabled;
+    // mut is only exercised outside test builds (the persist arm is
+    // cfg(not(test)); the tempdir round trip covers the real write).
+    #[cfg_attr(test, allow(unused_mut))]
+    let mut persisted = true;
     if old != value {
         state.xwayland.enabled = value;
-        // The offline suite must never write the dev machine's real etc
-        // tree; the persisted half is live-gate territory (the file write
-        // is a plain fs::write whose failure is logged, not propagated —
-        // see `persist_xwayland_enabled`).
+        // The write's outcome is REPORTED, not swallowed: an operator
+        // driving an emergency back-out must not get rc=0 for a value that
+        // will not survive restart. The in-memory change and the changed
+        // event stand either way (no rollback — refusing the set on an I/O
+        // error would leave no structured channel at all; the env override
+        // remains the last resort). The offline suite never writes the dev
+        // machine's real etc tree — that arm reports true, and the real
+        // write/read round trip is unit-tested against a tempdir.
         #[cfg(not(test))]
-        super::xwayland::persist_xwayland_enabled(value);
+        {
+            let target =
+                super::xwayland::xwayland_enabled_persist_path(&state.xwayland.socket_name);
+            persisted = super::xwayland::write_xwayland_enabled(&target, value).is_ok();
+        }
         queue_prop_change(
             changes,
             path.clone(),
@@ -1968,6 +1985,7 @@ fn service_set_xwayland_enabled(
             path,
             old: PropValue::Bool(old),
             new: PropValue::Bool(value),
+            persisted: Some(persisted),
         });
     }
 }
