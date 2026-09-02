@@ -365,6 +365,7 @@ impl CompositorHandler for WaylandState {
                             .is_none()
                             .then_some(popup.clone()),
                         SurfaceRole::Toplevel(_)
+                        | SurfaceRole::ImePopup(_)
                         | SurfaceRole::Layer(_)
                         | SurfaceRole::LockSurface(_)
                         | SurfaceRole::Subsurface { .. }
@@ -428,7 +429,9 @@ impl CompositorHandler for WaylandState {
                     SurfaceRole::LockSurface(role) => {
                         Some(ConfigureTarget::Lock(role.surface.clone()))
                     }
-                    SurfaceRole::Subsurface { .. } | SurfaceRole::Dormant(_) => None,
+                    SurfaceRole::ImePopup(_)
+                    | SurfaceRole::Subsurface { .. }
+                    | SurfaceRole::Dormant(_) => None,
                     // X11 bypasses the xdg configure/ack gate entirely: its
                     // first buffer must not be retired waiting for a serial
                     // that can never exist. Map eligibility is gated in
@@ -2129,6 +2132,138 @@ impl PointerConstraintsHandler for WaylandState {
     }
 }
 
+impl InputMethodHandler for WaylandState {
+    /// The IME created its candidate window. Give it a record so it renders.
+    ///
+    /// Placement is the compositor's job, not the IME's: the popup goes just
+    /// below the text cursor rectangle the client reported, in the parent
+    /// surface's coordinate space. An IME cannot know where that is — it has
+    /// no idea which window is focused or where it sits.
+    fn new_popup(&mut self, surface: ImePopupSurface) {
+        let wl_surface = surface.wl_surface().clone();
+        let object = wl_surface.id();
+        if self.surfaces.contains_key(&object) {
+            return;
+        }
+        let anchor = self.ime_popup_anchor(&surface);
+        surface.set_location(anchor);
+        let id = SurfaceId(self.next_surface_id);
+        self.next_surface_id = self.next_surface_id.saturating_add(1);
+        // Top band: a candidate window belongs above ordinary windows, the way
+        // a menu does, or it appears behind the very text it is completing.
+        // Size stays 1x1 until the IME commits a buffer, exactly as every
+        // other role starts — the commit path fills it in.
+        let layout = SurfaceLayout {
+            x: anchor.x as f32,
+            y: anchor.y as f32,
+            width: 1.0,
+            height: 1.0,
+            z: SurfaceStackKey {
+                band: StackBand::Top,
+                sequence: 0,
+                tree_index: 0,
+            },
+            source: None,
+            parent: None,
+            transform: SurfaceTransform::Normal,
+            visible: false,
+            toplevel: None,
+        };
+        self.surfaces.insert(
+            object,
+            SurfaceRecord {
+                id,
+                role: SurfaceRole::ImePopup(Box::new(surface)),
+                mapped: false,
+                layout,
+                title: None,
+                app_id: None,
+                window_origin: (layout.x, layout.y),
+                configured_size: (1, 1),
+                commit_count: 0,
+                shm_backing: None,
+                dmabuf_backing: None,
+                buffer_dimensions: None,
+                required_configure: None,
+                last_acked_configure: None,
+                last_acked_size: None,
+                decoration_object_bound: false,
+                committed_decoration: SceneDecorationMode::Unbound,
+                requested_maximized: false,
+                committed_maximized: false,
+                normal_restore: None,
+                pending_window_state: None,
+                configured_window_states: Vec::new(),
+                minimized: false,
+                focused: false,
+                chrome_pointer: ChromePointerSceneState::default(),
+                committed_window_geometry: None,
+                committed_window_geometry_explicit: false,
+                pending_popup_reposition: None,
+                parent_association_committed: true,
+                committed_input_region: None,
+                pixel_probe_logged: false,
+                logged_diagnostics: HashSet::new(),
+            },
+        );
+        self.surface_objects.insert(id, wl_surface.id());
+        tracing::debug!(
+            surface_id = id.0,
+            x = anchor.x,
+            y = anchor.y,
+            "IME popup created"
+        );
+    }
+
+    fn dismiss_popup(&mut self, surface: ImePopupSurface) {
+        let object = surface.wl_surface().id();
+        let Some(record) = self.surfaces.remove(&object) else {
+            return;
+        };
+        self.surface_objects.remove(&record.id);
+        self.events
+            .push(ProtocolEvent::SurfaceDestroyed { id: record.id });
+        tracing::debug!(surface_id = record.id.0, "IME popup dismissed");
+    }
+
+    fn popup_repositioned(&mut self, surface: ImePopupSurface) {
+        let anchor = self.ime_popup_anchor(&surface);
+        surface.set_location(anchor);
+        let object = surface.wl_surface().id();
+        let Some(record) = self.surfaces.get_mut(&object) else {
+            return;
+        };
+        record.layout.x = anchor.x as f32;
+        record.layout.y = anchor.y as f32;
+        record.window_origin = (record.layout.x, record.layout.y);
+        let scene = record.scene_snapshot();
+        let id = record.id;
+        self.events
+            .push(ProtocolEvent::SurfaceRelayout { id, scene });
+    }
+
+    /// Where the popup's parent lives, so Smithay can reason about placement.
+    ///
+    /// Answers in the parent's own terms; an unknown parent gets a zero rect
+    /// rather than a guess, because a fabricated geometry would put the
+    /// candidate window somewhere confidently wrong.
+    fn parent_geometry(&self, parent: &WlSurface) -> Rectangle<i32, Logical> {
+        self.surfaces
+            .get(&parent.id())
+            .map(|record| {
+                Rectangle::new(
+                    (record.layout.x as i32, record.layout.y as i32).into(),
+                    (
+                        record.layout.width.max(1.0) as i32,
+                        record.layout.height.max(1.0) as i32,
+                    )
+                        .into(),
+                )
+            })
+            .unwrap_or_default()
+    }
+}
+
 impl XdgActivationHandler for WaylandState {
     fn activation_state(&mut self) -> &mut XdgActivationState {
         &mut self.xdg_activation_state
@@ -2828,3 +2963,5 @@ delegate_pointer_constraints!(WaylandState);
 delegate_cursor_shape!(WaylandState);
 
 delegate_text_input_manager!(WaylandState);
+
+delegate_input_method_manager!(WaylandState);

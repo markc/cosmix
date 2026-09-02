@@ -910,7 +910,10 @@ fn surface_output<'a>(
         SurfaceRole::Toplevel(_) => default,
         #[cfg(feature = "xwayland")]
         SurfaceRole::X11(_) => default,
-        SurfaceRole::Popup(_) | SurfaceRole::Subsurface { .. } | SurfaceRole::Dormant(_) => None,
+        SurfaceRole::Popup(_)
+        | SurfaceRole::ImePopup(_)
+        | SurfaceRole::Subsurface { .. }
+        | SurfaceRole::Dormant(_) => None,
     }
 }
 

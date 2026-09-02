@@ -29,6 +29,10 @@ use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3::ZwpTextInputManagerV3,
     zwp_text_input_v3::{self, ZwpTextInputV3},
 };
+use wayland_protocols::xdg::activation::v1::client::{
+    xdg_activation_token_v1::{self, XdgActivationTokenV1},
+    xdg_activation_v1::XdgActivationV1,
+};
 use wayland_protocols::xdg::shell::client::{
     xdg_surface::{self, XdgSurface},
     xdg_toplevel::{self, XdgToplevel},
@@ -53,6 +57,7 @@ struct App {
     seat: Option<WlSeat>,
     wm_base: Option<XdgWmBase>,
     text_input_manager: Option<ZwpTextInputManagerV3>,
+    activation: Option<XdgActivationV1>,
     text_input: Option<ZwpTextInputV3>,
     window: Option<WlSurface>,
     xdg_surface: Option<XdgSurface>,
@@ -96,6 +101,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
             }
             "xdg_wm_base" => {
                 state.wm_base = Some(registry.bind::<XdgWmBase, _, _>(name, 1, qh, ()));
+            }
+            "xdg_activation_v1" => {
+                state.activation = Some(registry.bind::<XdgActivationV1, _, _>(name, 1, qh, ()));
             }
             "zwp_text_input_manager_v3" => {
                 state.text_input_manager =
@@ -299,6 +307,33 @@ delegate_noop!(App: ignore WlBuffer);
 delegate_noop!(App: ignore WlSeat);
 delegate_noop!(App: ignore ZwpInputMethodManagerV2);
 delegate_noop!(App: ignore ZwpTextInputManagerV3);
+delegate_noop!(App: ignore XdgActivationV1);
+
+/// The probe asks for focus on its OWN window.
+///
+/// Without this the fixture depends on the compositor volunteering focus to a
+/// newly mapped toplevel, which it is under no obligation to do while another
+/// window holds it — and a gate that needs the compositor to be feeling
+/// generous is not a gate. Using xdg-activation is also honest about what a
+/// real application does when it wants attention.
+impl Dispatch<XdgActivationTokenV1, ()> for App {
+    fn event(
+        state: &mut Self,
+        _: &XdgActivationTokenV1,
+        event: xdg_activation_token_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_activation_token_v1::Event::Done { token } = event {
+            let (Some(activation), Some(window)) = (&state.activation, &state.window) else {
+                return;
+            };
+            activation.activate(token, window);
+            println!("IMEPROBE requested focus for its own window via xdg-activation");
+        }
+    }
+}
 delegate_noop!(App: ignore ZwpInputPopupSurfaceV2);
 
 fn main() {
@@ -385,6 +420,19 @@ fn main() {
     app.xdg_surface = Some(xdg_surface);
     app.toplevel = Some(toplevel);
     let _ = queue.roundtrip(&mut app);
+    // Ask for focus rather than hope for it.
+    if let Some(activation) = app.activation.clone() {
+        let token = activation.get_activation_token(&qh, ());
+        if let Some(surface) = &app.window {
+            token.set_surface(surface);
+        }
+        token.commit();
+        let _ = queue.roundtrip(&mut app);
+    } else {
+        println!(
+            "IMEPROBE note: no xdg_activation_v1 — relying on the compositor to volunteer focus"
+        );
+    }
     println!("IMEPROBE text field mapped, waiting for focus");
 
     // Serve until killed. The harness focuses a text input, waits for the

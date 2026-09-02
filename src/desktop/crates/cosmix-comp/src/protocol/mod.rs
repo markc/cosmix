@@ -105,9 +105,10 @@ use smithay::{
     },
     delegate_cursor_shape, delegate_data_control, delegate_data_device, delegate_dmabuf,
     delegate_ext_data_control, delegate_foreign_toplevel_list, delegate_fractional_scale,
-    delegate_idle_notify, delegate_output, delegate_pointer_constraints,
-    delegate_primary_selection, delegate_relative_pointer, delegate_seat, delegate_session_lock,
-    delegate_shm, delegate_text_input_manager, delegate_viewporter, delegate_xdg_activation,
+    delegate_idle_notify, delegate_input_method_manager, delegate_output,
+    delegate_pointer_constraints, delegate_primary_selection, delegate_relative_pointer,
+    delegate_seat, delegate_session_lock, delegate_shm, delegate_text_input_manager,
+    delegate_viewporter, delegate_xdg_activation,
     desktop::{
         LayerMap, LayerSurface as DesktopLayerSurface, PopupKeyboardGrab, PopupKind, PopupManager,
         PopupPointerGrab, find_popup_root_surface, layer_map_for_output,
@@ -172,6 +173,9 @@ use smithay::{
         },
         fractional_scale::{self, FractionalScaleHandler, FractionalScaleManagerState},
         idle_notify::{IdleNotifierHandler, IdleNotifierState},
+        input_method::{
+            InputMethodHandler, InputMethodManagerState, PopupSurface as ImePopupSurface,
+        },
         output::{OutputHandler, OutputManagerState},
         pointer_constraints::{
             PointerConstraint, PointerConstraintsHandler, PointerConstraintsState,
@@ -2827,6 +2831,17 @@ impl ProtocolServer {
         // input method connected a client simply gets no pre-edit and types
         // exactly as it does today — and it is the half an IME attaches to.
         let text_input_state = TextInputManagerState::new::<WaylandState>(&display_handle);
+        // zwp_input_method_v2: an IME connects here and its candidate window
+        // becomes a surface comp must place and render. Advertised only WITH
+        // that rendering, because an input method that connects and shows
+        // nothing still swallows the keystrokes — the failure is silent and
+        // total. Gated by `cosmix-imeprobe`, a synthetic input method in this
+        // workspace, so the check runs every time rather than once on a
+        // developer's machine.
+        //
+        // The filter admits every client, per the agentic-first law.
+        let input_method_state =
+            InputMethodManagerState::new::<WaylandState, _>(&display_handle, |_client| true);
         let primary_selection_state = PrimarySelectionState::new::<WaylandState>(&display_handle);
         let wlr_data_control_state = WlrDataControlState::new::<WaylandState, _>(
             &display_handle,
@@ -2965,6 +2980,7 @@ impl ProtocolServer {
             pointer_constraints_state,
             cursor_shape_state,
             text_input_state,
+            input_method_state,
             pending_relative_motion: None,
             primary_selection_state,
             wlr_data_control_state,
@@ -4763,6 +4779,12 @@ enum SurfaceRole {
     Popup(PopupSurface),
     Layer(LayerRole),
     LockSurface(LockSurfaceRole),
+    /// An input method's candidate window. Unmanaged and positioned by the
+    /// compositor on the IME's behalf, much like an override-redirect X
+    /// window: rendered, never a focus candidate, never a managed toplevel.
+    /// Boxed for the same reason the X11 role is — every `SurfaceRecord` would
+    /// otherwise pay for the largest variant.
+    ImePopup(Box<ImePopupSurface>),
     Subsurface {
         surface: WlSurface,
         parent: WlSurface,
@@ -5159,6 +5181,9 @@ impl SurfaceRole {
             Self::X11(_) => SceneSurfaceKind::Toplevel,
             Self::Subsurface { .. } => SceneSurfaceKind::Subsurface,
             Self::Popup(_) => SceneSurfaceKind::Popup,
+            // A candidate window IS a popup in every sense the scene cares
+            // about: positioned, transient, above its parent, not a window.
+            Self::ImePopup(_) => SceneSurfaceKind::Popup,
             Self::Layer(_) => SceneSurfaceKind::Subsurface,
             Self::LockSurface(_) => SceneSurfaceKind::Subsurface,
             // Dormant records are excluded by `surface_is_presentable`, so
@@ -5171,6 +5196,7 @@ impl SurfaceRole {
         match self {
             Self::Toplevel(surface) => surface.wl_surface(),
             Self::Popup(surface) => surface.wl_surface(),
+            Self::ImePopup(popup) => popup.wl_surface(),
             Self::Layer(role) => role.surface.wl_surface(),
             Self::LockSurface(role) => role.surface.wl_surface(),
             Self::Subsurface { surface, .. } => surface,
@@ -5184,6 +5210,7 @@ impl SurfaceRole {
         match self {
             Self::Toplevel(surface) => Some(surface),
             Self::Popup(_)
+            | Self::ImePopup(_)
             | Self::Layer(_)
             | Self::LockSurface(_)
             | Self::Subsurface { .. }
@@ -5228,6 +5255,11 @@ impl SurfaceRole {
             Self::Subsurface { parent, .. } => Some(parent),
             Self::Toplevel(_)
             | Self::Popup(_)
+            // The IME popup's parent lives in Smithay's input-method state,
+            // not comp's subsurface tree, so it has no parent HERE — and
+            // claiming one would make it inherit clipping and visibility from
+            // a surface it is not actually a child of.
+            | Self::ImePopup(_)
             | Self::Layer(_)
             | Self::LockSurface(_)
             | Self::Dormant(_) => None,
@@ -5240,6 +5272,10 @@ impl SurfaceRole {
         match self {
             Self::Toplevel(_) => "toplevel",
             Self::Popup(_) => "popup",
+            // Distinct from "popup" for the same legibility reason X-2a gave
+            // override-redirect its own string: an agent reading `surfaces.*`
+            // must be able to tell a candidate window from an app menu.
+            Self::ImePopup(_) => "ime-popup",
             Self::Layer(_) => "layer",
             Self::LockSurface(_) => "lock",
             Self::Subsurface { .. } => "subsurface",
@@ -5638,6 +5674,9 @@ struct WaylandState {
     /// Held, never read — same reason as the globals above.
     #[allow(dead_code)]
     text_input_state: TextInputManagerState,
+    /// Held, never read — same reason as the globals above.
+    #[allow(dead_code)]
+    input_method_state: InputMethodManagerState,
     pending_relative_motion: Option<PendingRelativeMotion>,
     primary_selection_state: PrimarySelectionState,
     wlr_data_control_state: WlrDataControlState,
@@ -9506,6 +9545,7 @@ impl WaylandState {
                 }
                 SurfaceRole::LockSurface(role) => Some(ConfigureTarget::Lock(role.surface.clone())),
                 SurfaceRole::Layer(_)
+                | SurfaceRole::ImePopup(_)
                 | SurfaceRole::Subsurface { .. }
                 | SurfaceRole::Dormant(_) => None,
                 // X11 has no xdg configure/ack cycle; its geometry authority
@@ -9695,6 +9735,7 @@ impl WaylandState {
                 }
                 SurfaceRole::LockSurface(role) => Some(ConfigureTarget::Lock(role.surface.clone())),
                 SurfaceRole::Layer(_)
+                | SurfaceRole::ImePopup(_)
                 | SurfaceRole::Subsurface { .. }
                 | SurfaceRole::Dormant(_) => None,
                 #[cfg(feature = "xwayland")]
@@ -9767,7 +9808,9 @@ impl WaylandState {
                 SurfaceRole::Popup(popup) => Some(ConfigureTarget::Popup(popup.clone())),
                 SurfaceRole::Layer(role) => Some(ConfigureTarget::Layer(role.surface.clone())),
                 SurfaceRole::LockSurface(role) => Some(ConfigureTarget::Lock(role.surface.clone())),
-                SurfaceRole::Subsurface { .. } | SurfaceRole::Dormant(_) => None,
+                SurfaceRole::ImePopup(_)
+                | SurfaceRole::Subsurface { .. }
+                | SurfaceRole::Dormant(_) => None,
                 #[cfg(feature = "xwayland")]
                 SurfaceRole::X11(_) => None,
             });
@@ -9922,6 +9965,7 @@ impl WaylandState {
                 SurfaceRole::Dormant(_) => false,
                 SurfaceRole::Toplevel(_)
                 | SurfaceRole::Popup(_)
+                | SurfaceRole::ImePopup(_)
                 | SurfaceRole::Layer(_)
                 | SurfaceRole::LockSurface(_) => true,
                 // The X11 association is established before the record exists
@@ -12496,6 +12540,23 @@ impl WaylandState {
         SeatFocusTarget::Wayland(surface.clone())
     }
 
+    /// Where an IME candidate window should sit: just below the text cursor
+    /// the client reported, in global coordinates.
+    ///
+    /// The rectangle is the client's own `set_cursor_rectangle`, relative to
+    /// its surface, so it has to be offset by where that surface actually is.
+    /// Falling back to the surface origin when there is no parent keeps the
+    /// popup on screen rather than at (0,0).
+    fn ime_popup_anchor(&self, popup: &ImePopupSurface) -> Point<i32, Logical> {
+        let rect = popup.text_input_rectangle();
+        let origin = popup
+            .get_parent()
+            .and_then(|parent| self.surfaces.get(&parent.surface.id()))
+            .map(|record| (record.layout.x as i32, record.layout.y as i32))
+            .unwrap_or((0, 0));
+        (origin.0 + rect.loc.x, origin.1 + rect.loc.y + rect.size.h).into()
+    }
+
     fn raise_surface(&mut self, surface: &WlSurface) {
         let Some(band) = self
             .surfaces
@@ -13664,6 +13725,7 @@ impl WaylandState {
                 #[cfg(feature = "xwayland")]
                 SurfaceRole::X11(_) => return Some(current),
                 SurfaceRole::Popup(_)
+                | SurfaceRole::ImePopup(_)
                 | SurfaceRole::Layer(_)
                 | SurfaceRole::LockSurface(_)
                 | SurfaceRole::Dormant(_) => {
