@@ -778,11 +778,17 @@ impl XWaylandShellHandler for WaylandState {
         &mut self.xwayland_shell_state
     }
 
+    fn surface_associated(&mut self, _xwm: XwmId, wl_surface: WlSurface, surface: X11Surface) {
+        self.x11_associate_window(wl_surface, surface);
+    }
+}
+
+impl WaylandState {
     /// The association point: this is where an X11 window becomes a
     /// scene-capable entity, synchronously, before the same commit can reach
     /// the common buffer path (Smithay runs this from a pre-commit hook, so
     /// the record exists before `CompositorHandler::commit` sees the buffer).
-    fn surface_associated(&mut self, _xwm: XwmId, wl_surface: WlSurface, surface: X11Surface) {
+    pub(super) fn x11_associate_window(&mut self, wl_surface: WlSurface, surface: X11Surface) {
         let xid = surface.window_id();
         if surface.is_override_redirect() {
             // X-2 gap: recorded, never managed.
@@ -909,18 +915,12 @@ impl XWaylandShellHandler for WaylandState {
     }
 }
 
-impl XwmHandler for WaylandState {
-    fn xwm_state(&mut self, xwm: XwmId) -> &mut X11Wm {
-        match &mut self.xwayland.lifecycle {
-            XwaylandLifecycle::Ready { wm, .. } if wm.id() == xwm => wm,
-            _ => unreachable!(
-                "XWM callback for a generation that is not live; \
-                 the X11 event source must be torn down with its generation"
-            ),
-        }
-    }
-
-    fn new_window(&mut self, _xwm: XwmId, window: X11Surface) {
+/// The XWM behaviour, as inherent methods. The `XwmHandler` impl below
+/// delegates 1:1; the split exists because `XwmId` is unconstructible outside
+/// a live X11 connection, and the deterministic protocol tests must drive
+/// exactly this code.
+impl WaylandState {
+    pub(super) fn x11_new_window(&mut self, window: X11Surface) {
         let xid = window.window_id();
         tracing::debug!(xid, title = %window.title(), "new X11 window");
         self.xwayland
@@ -928,7 +928,7 @@ impl XwmHandler for WaylandState {
             .insert(xid, PendingX11Window::default());
     }
 
-    fn new_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+    pub(super) fn x11_new_override_redirect_window(&mut self, window: X11Surface) {
         // Deliberate X-2 gap: the WM must not manage these; X-1 records them
         // for diagnostics and renders nothing.
         let xid = window.window_id();
@@ -936,7 +936,7 @@ impl XwmHandler for WaylandState {
         tracing::debug!(xid, "recorded override-redirect X11 window (ignored in X-1)");
     }
 
-    fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
+    pub(super) fn x11_map_window_request(&mut self, window: X11Surface) {
         let xid = window.window_id();
         if window.is_override_redirect() {
             return;
@@ -1003,7 +1003,7 @@ impl XwmHandler for WaylandState {
         );
     }
 
-    fn map_window_notify(&mut self, _xwm: XwmId, window: X11Surface) {
+    pub(super) fn x11_map_window_notify(&mut self, window: X11Surface) {
         // Notification only: reconcile, never allocate or publish a second
         // entity.
         let xid = window.window_id();
@@ -1017,7 +1017,7 @@ impl XwmHandler for WaylandState {
         }
     }
 
-    fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+    pub(super) fn x11_mapped_override_redirect_window(&mut self, window: X11Surface) {
         // Deliberate X-2 gap: visually ignored. Logged once per XID so the
         // gate can see the gap without the log flooding.
         let xid = window.window_id();
@@ -1030,7 +1030,7 @@ impl XwmHandler for WaylandState {
         }
     }
 
-    fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
+    pub(super) fn x11_unmapped_window(&mut self, window: X11Surface) {
         let xid = window.window_id();
         if let Some(entry) = self.xwayland.pending_windows.get_mut(&xid) {
             entry.phase.on_unmapped();
@@ -1073,7 +1073,7 @@ impl XwmHandler for WaylandState {
         tracing::debug!(xid, surface_id = id.0, "X11 window unmapped");
     }
 
-    fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+    pub(super) fn x11_destroyed_window(&mut self, window: X11Surface) {
         let xid = window.window_id();
         self.xwayland.pending_windows.remove(&xid);
         self.xwayland.override_redirect_windows.remove(&xid);
@@ -1096,9 +1096,9 @@ impl XwmHandler for WaylandState {
         tracing::debug!(xid, "X11 window destroyed");
     }
 
-    fn configure_request(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn x11_configure_request(
         &mut self,
-        _xwm: XwmId,
         window: X11Surface,
         _x: Option<i32>,
         _y: Option<i32>,
@@ -1181,9 +1181,8 @@ impl XwmHandler for WaylandState {
         }
     }
 
-    fn configure_notify(
+    pub(super) fn x11_configure_notify(
         &mut self,
-        _xwm: XwmId,
         window: X11Surface,
         geometry: Rectangle<i32, Logical>,
         above: Option<X11Window>,
@@ -1200,7 +1199,7 @@ impl XwmHandler for WaylandState {
         }
     }
 
-    fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
+    pub(super) fn x11_property_notify(&mut self, window: X11Surface, property: WmWindowProperty) {
         let xid = window.window_id();
         match property {
             WmWindowProperty::Title => {
@@ -1265,23 +1264,7 @@ impl XwmHandler for WaylandState {
         }
     }
 
-    fn maximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        self.request_x11_maximized(&window, true);
-    }
-
-    fn unmaximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        self.request_x11_maximized(&window, false);
-    }
-
-    fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        self.request_x11_fullscreen(&window, true);
-    }
-
-    fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        self.request_x11_fullscreen(&window, false);
-    }
-
-    fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+    pub(super) fn x11_minimize_request(&mut self, window: X11Surface) {
         let Some(surface) = window.wl_surface() else {
             return;
         };
@@ -1289,7 +1272,7 @@ impl XwmHandler for WaylandState {
         let _ = window.set_suspended(true);
     }
 
-    fn unminimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+    pub(super) fn x11_unminimize_request(&mut self, window: X11Surface) {
         let xid = window.window_id();
         let Some(object) = self.xwayland.surfaces_by_xid.get(&xid).cloned() else {
             return;
@@ -1312,9 +1295,8 @@ impl XwmHandler for WaylandState {
         self.retarget_pointer_after_visibility_change();
     }
 
-    fn resize_request(
+    pub(super) fn x11_resize_request(
         &mut self,
-        _xwm: XwmId,
         window: X11Surface,
         _button: u32,
         resize_edge: X11ResizeEdge,
@@ -1344,7 +1326,7 @@ impl XwmHandler for WaylandState {
         });
     }
 
-    fn move_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32) {
+    pub(super) fn x11_move_request(&mut self, window: X11Surface, _button: u32) {
         if self.chrome_pointer_grab.is_some() || !self.x11_pointer_grab_targets(&window) {
             tracing::debug!(
                 xid = window.window_id(),
@@ -1368,15 +1350,14 @@ impl XwmHandler for WaylandState {
         });
     }
 
-    fn allow_selection_access(&mut self, _xwm: XwmId, selection: SelectionTarget) -> bool {
+    pub(super) fn x11_allow_selection_access(&mut self, selection: SelectionTarget) -> bool {
         // Deliberate X-2 gap: no clipboard/primary bridging in X-1.
         tracing::debug!(?selection, "refused X11 selection access (X-1)");
         false
     }
 
-    fn send_selection(
+    pub(super) fn x11_send_selection(
         &mut self,
-        _xwm: XwmId,
         selection: SelectionTarget,
         mime_type: String,
         fd: std::os::fd::OwnedFd,
@@ -1392,19 +1373,155 @@ impl XwmHandler for WaylandState {
         );
     }
 
-    fn new_selection(&mut self, _xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
+    pub(super) fn x11_new_selection(&mut self, selection: SelectionTarget, mime_types: Vec<String>) {
         // Log-only in X-1; no bridge state is retained.
         tracing::debug!(?selection, ?mime_types, "X11 selection changed (not bridged in X-1)");
     }
 
-    fn cleared_selection(&mut self, _xwm: XwmId, selection: SelectionTarget) {
+    pub(super) fn x11_cleared_selection(&mut self, selection: SelectionTarget) {
         tracing::debug!(?selection, "X11 selection cleared (not bridged in X-1)");
     }
 
-    fn randr_primary_output_change(&mut self, _xwm: XwmId, output_name: Option<String>) {
+    pub(super) fn x11_randr_primary_output_change(&mut self, output_name: Option<String>) {
         // Deliberate X-3 gap: scale/output policy untouched; client scale
         // stays 1.
         tracing::debug!(?output_name, "X11 RandR primary output changed (ignored in X-1)");
+    }
+
+}
+
+/// Thin delegation: every callback body lives in the inherent `x11_*`
+/// methods above so the deterministic tests can drive it without a live
+/// `XwmId`.
+impl XwmHandler for WaylandState {
+    fn xwm_state(&mut self, xwm: XwmId) -> &mut X11Wm {
+        match &mut self.xwayland.lifecycle {
+            XwaylandLifecycle::Ready { wm, .. } if wm.id() == xwm => wm,
+            _ => unreachable!(
+                "XWM callback for a generation that is not live; \
+                 the X11 event source must be torn down with its generation"
+            ),
+        }
+    }
+
+    fn new_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.x11_new_window(window);
+    }
+
+    fn new_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.x11_new_override_redirect_window(window);
+    }
+
+    fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.x11_map_window_request(window);
+    }
+
+    fn map_window_notify(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.x11_map_window_notify(window);
+    }
+
+    fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.x11_mapped_override_redirect_window(window);
+    }
+
+    fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.x11_unmapped_window(window);
+    }
+
+    fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.x11_destroyed_window(window);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn configure_request(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        x: Option<i32>,
+        y: Option<i32>,
+        w: Option<u32>,
+        h: Option<u32>,
+        reorder: Option<Reorder>,
+    ) {
+        self.x11_configure_request(window, x, y, w, h, reorder);
+    }
+
+    fn configure_notify(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        geometry: Rectangle<i32, Logical>,
+        above: Option<X11Window>,
+    ) {
+        self.x11_configure_notify(window, geometry, above);
+    }
+
+    fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
+        self.x11_property_notify(window, property);
+    }
+
+    fn maximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.request_x11_maximized(&window, true);
+    }
+
+    fn unmaximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.request_x11_maximized(&window, false);
+    }
+
+    fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.request_x11_fullscreen(&window, true);
+    }
+
+    fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.request_x11_fullscreen(&window, false);
+    }
+
+    fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.x11_minimize_request(window);
+    }
+
+    fn unminimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.x11_unminimize_request(window);
+    }
+
+    fn resize_request(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        button: u32,
+        resize_edge: X11ResizeEdge,
+    ) {
+        self.x11_resize_request(window, button, resize_edge);
+    }
+
+    fn move_request(&mut self, _xwm: XwmId, window: X11Surface, button: u32) {
+        self.x11_move_request(window, button);
+    }
+
+    fn allow_selection_access(&mut self, _xwm: XwmId, selection: SelectionTarget) -> bool {
+        self.x11_allow_selection_access(selection)
+    }
+
+    fn send_selection(
+        &mut self,
+        _xwm: XwmId,
+        selection: SelectionTarget,
+        mime_type: String,
+        fd: std::os::fd::OwnedFd,
+    ) {
+        self.x11_send_selection(selection, mime_type, fd);
+    }
+
+    fn new_selection(&mut self, _xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
+        self.x11_new_selection(selection, mime_types);
+    }
+
+    fn cleared_selection(&mut self, _xwm: XwmId, selection: SelectionTarget) {
+        self.x11_cleared_selection(selection);
+    }
+
+    fn randr_primary_output_change(&mut self, _xwm: XwmId, output_name: Option<String>) {
+        self.x11_randr_primary_output_change(output_name);
     }
 
     fn disconnected(&mut self, xwm: XwmId) {
