@@ -2025,6 +2025,28 @@ impl SelectionHandler for WaylandState {
     }
 }
 
+impl PrimarySelectionHandler for WaylandState {
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self.primary_selection_state
+    }
+}
+
+// The two data-control protocols are deliberately BOTH offered. `ext` is the
+// standardised successor; `wlr` is what the tools shipping today actually
+// speak (wl-clipboard, cliphist, every clipboard manager). They ride the same
+// selection state, so a client using either sees the same clipboard.
+impl WlrDataControlHandler for WaylandState {
+    fn data_control_state(&self) -> &WlrDataControlState {
+        &self.wlr_data_control_state
+    }
+}
+
+impl ExtDataControlHandler for WaylandState {
+    fn data_control_state(&self) -> &ExtDataControlState {
+        &self.ext_data_control_state
+    }
+}
+
 impl XdgDecorationHandler for WaylandState {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
         let replacement = self
@@ -2483,6 +2505,9 @@ delegate_dmabuf!(WaylandState);
 smithay::delegate_drm_syncobj!(WaylandState);
 delegate_seat!(WaylandState);
 delegate_data_device!(WaylandState);
+delegate_primary_selection!(WaylandState);
+delegate_data_control!(WaylandState);
+delegate_ext_data_control!(WaylandState);
 delegate_output!(WaylandState);
 delegate_idle_notify!(WaylandState);
 delegate_foreign_toplevel_list!(WaylandState);

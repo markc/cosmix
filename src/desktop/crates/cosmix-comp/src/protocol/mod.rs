@@ -100,9 +100,10 @@ use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::{
 use smithay::{
     backend::allocator::{Buffer as _, Format, dmabuf::Dmabuf},
     backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonState, KeyState, TouchSlot},
-    delegate_data_device, delegate_dmabuf, delegate_foreign_toplevel_list,
-    delegate_fractional_scale, delegate_idle_notify, delegate_output, delegate_seat,
-    delegate_session_lock, delegate_shm, delegate_viewporter,
+    delegate_data_control, delegate_data_device, delegate_dmabuf, delegate_ext_data_control,
+    delegate_foreign_toplevel_list, delegate_fractional_scale, delegate_idle_notify,
+    delegate_output, delegate_primary_selection, delegate_seat, delegate_session_lock,
+    delegate_shm, delegate_viewporter,
     desktop::{
         LayerMap, LayerSurface as DesktopLayerSurface, PopupKeyboardGrab, PopupKind, PopupManager,
         PopupPointerGrab, find_popup_root_surface, layer_map_for_output,
@@ -173,6 +174,15 @@ use smithay::{
             data_device::{
                 ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
                 set_data_device_focus,
+            },
+            ext_data_control::{
+                DataControlHandler as ExtDataControlHandler,
+                DataControlState as ExtDataControlState,
+            },
+            primary_selection::{PrimarySelectionHandler, PrimarySelectionState},
+            wlr_data_control::{
+                DataControlHandler as WlrDataControlHandler,
+                DataControlState as WlrDataControlState,
             },
         },
         session_lock::{
@@ -2684,6 +2694,33 @@ impl ProtocolServer {
             .create_global_with_default_feedback::<WaylandState>(&display_handle, &feedback);
 
         let data_device_state = DataDeviceState::new::<WaylandState>(&display_handle);
+        // Primary selection (middle-click paste) and the two data-control
+        // protocols. Data-control is the focus-free clipboard interface: a
+        // caller with no surface, no focus and no input serial cannot use
+        // `wl_data_device` at all, which is every agent driving this desktop
+        // and every clipboard manager. Without it `wl-copy`/`wl-paste` hang
+        // rather than fail, because wl-clipboard falls back to the
+        // focus-dependent path and waits forever for a focus it never gets.
+        //
+        // Both the wlr and ext protocols are offered: `ext-data-control-v1` is
+        // the standardised successor, and the wlr one is what every tool
+        // shipping today actually speaks. They share one selection state, so
+        // offering both costs a global apiece.
+        //
+        // The access filter admits every client, per the agentic-first law:
+        // the unattended path is the default, and a clipboard gate would be
+        // exactly the human-in-the-loop ceremony that law makes opt-in.
+        let primary_selection_state = PrimarySelectionState::new::<WaylandState>(&display_handle);
+        let wlr_data_control_state = WlrDataControlState::new::<WaylandState, _>(
+            &display_handle,
+            Some(&primary_selection_state),
+            |_client| true,
+        );
+        let ext_data_control_state = ExtDataControlState::new::<WaylandState, _>(
+            &display_handle,
+            Some(&primary_selection_state),
+            |_client| true,
+        );
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "cosmix");
         let keyboard = seat
@@ -2806,6 +2843,9 @@ impl ProtocolServer {
             capture_advertisements,
             dmabuf_validation,
             data_device_state,
+            primary_selection_state,
+            wlr_data_control_state,
+            ext_data_control_state,
             seat_state,
             seat,
             keyboard,
@@ -5440,6 +5480,9 @@ struct WaylandState {
     /// the whole of the check.
     dmabuf_validation: Option<SyncSender<DmabufValidationRequest>>,
     data_device_state: DataDeviceState,
+    primary_selection_state: PrimarySelectionState,
+    wlr_data_control_state: WlrDataControlState,
+    ext_data_control_state: ExtDataControlState,
     seat_state: SeatState<Self>,
     seat: Seat<Self>,
     keyboard: KeyboardHandle<Self>,
