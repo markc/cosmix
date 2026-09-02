@@ -36586,27 +36586,19 @@ mod x11 {
             harness.server.state.keyboard.current_focus().is_none(),
             "teardown of a generation that held no focus must not steal one"
         );
-        // The generation's Wayland client is killed at teardown — this is
-        // what closes the commit-hook route into `xwm_state` by
-        // construction. `kill_client` marks it dead synchronously; the
-        // ClientData callback needs a dispatch to run.
-        let mut killed = false;
-        for _ in 0..EVENT_LOOP_PUMP_LIMIT {
-            harness
-                .server
-                .dispatch_cycle(Some(EVENT_LOOP_PUMP_TIMEOUT))
-                .expect("dispatch fabricated client disconnect");
-            if xclient_state
-                .disconnect_reason
-                .lock()
-                .expect("test disconnect-reason mutex poisoned")
-                .is_some()
-            {
-                killed = true;
-                break;
-            }
-        }
-        assert!(killed, "teardown kills the generation's Wayland client");
+        // NOT asserted here: the client kill. In production the ONE kill the
+        // client may ever receive comes from `Drop for XWayland` when
+        // teardown removes the source token (the vendored `disconnected`
+        // panics on a second kill — that is why teardown has no explicit
+        // kill of its own). This fabrication stands a dummy `Timer` behind
+        // the token, so removing it runs no `Drop for XWayland` and no kill
+        // happens; and the fabricated client carries comp's own
+        // `WaylandClientState`, not smithay's `XWaylandClientData`, so the
+        // vendor's non-idempotent child-reaping is not in the picture
+        // either. The two elisions are exactly the two halves of the
+        // double-kill bug this arrangement replaced; the kill itself is
+        // live-gate-only.
+        drop(xclient_state);
         drop(xwayland_side);
         // A stale/duplicate failure callback is a no-op.
         harness
@@ -36824,21 +36816,31 @@ mod x11 {
             "explicit pre-map x/y inside the usable rect is honoured"
         );
 
-        // An origin outside the usable rect cascades instead.
+        // An origin outside the usable rect cascades instead. Assert the
+        // exact cascade origin — a clamp-to-edge would also satisfy a bare
+        // `>= usable.origin`, so that alone can never go red.
         let outside = fake_x11_window(
             62,
             false,
             Rectangle::new((-5000, -5000).into(), (200, 150).into()),
         );
+        let cascade = (harness.server.state.next_layout_index % 6) as f32;
+        let extents = DecoExtents::of(&harness.server.state.decoration.theme);
         harness.server.state.x11_new_window(outside.clone());
         harness.server.state.x11_map_window_request(outside.clone());
         let granted = harness.server.state.xwayland.pending_windows[&outside.window_id()]
             .granted_geometry
             .expect("map grants a geometry");
-        assert!(
-            (granted.loc.x as f32) >= usable.x && (granted.loc.y as f32) >= usable.y,
-            "an off-screen requested origin falls back to the cascade, got {:?}",
-            granted.loc
+        let expected = (
+            (usable.x + CASCADE_ORIGIN + cascade * CASCADE_STEP).max(usable.x + extents.left)
+                as i32,
+            (usable.y + CASCADE_ORIGIN + cascade * CASCADE_STEP).max(usable.y + extents.top)
+                as i32,
+        );
+        assert_eq!(
+            (granted.loc.x, granted.loc.y),
+            expected,
+            "an off-screen requested origin falls back to the exact cascade slot"
         );
     }
 

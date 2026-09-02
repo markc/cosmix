@@ -7,7 +7,11 @@
 //!
 //! - **Selection bridging is refused.** `allow_selection_access` is always
 //!   `false`, `send_selection` is a defensive no-op that drops the fd, and
-//!   X selection changes are only logged. X-2 owns bridging.
+//!   X selection changes are only logged. X-2 owns bridging — and must
+//!   revisit the `draining_wms` teardown proof first: the wm's
+//!   selection-transfer calloop sources call `xwm_state` and are never
+//!   unregistered, so today they are safe only because these refusals stop
+//!   them from ever existing (see `draining_wms`).
 //! - **Override-redirect windows are recorded and ignored.** They get no
 //!   scene record, no SSD, no focus. X-2 must render them; until then X11
 //!   menus/tooltips/dropdowns are absent by design.
@@ -162,15 +166,22 @@ pub(super) enum XwaylandLifecycle {
         token: RegistrationToken,
         client: Client,
     },
+    // Neither live variant retains the generation's Wayland client for
+    // teardown: exactly ONE kill may ever reach it. `Drop for XWayland`
+    // (vendor/smithay/src/xwayland/xserver.rs:330-336) already delivers
+    // `kill_client(client, ConnectionClosed)` when teardown removes `token`,
+    // and the vendored `XWaylandClientData::disconnected` is not idempotent
+    // (`child.lock().unwrap().take().unwrap()`, xserver.rs:378) — a second
+    // kill panics the compositor. The vendor drop still closes the
+    // `serial_commit_hook` route into `xwm_state` by construction: it lands
+    // either synchronously inside `remove(token)` or at the end of the
+    // current calloop iteration (the dispatcher `Rc` cloned for a running
+    // callback defers it), and a commit hook can only run inside the wayland
+    // source's own `process_events` — a later iteration either way.
     Ready {
         token: RegistrationToken,
         wm: Box<X11Wm>,
         stability_timer: Option<RegistrationToken>,
-        /// The generation's Wayland client, retained so teardown can kill it
-        /// explicitly: a killed client dispatches nothing further (buffered
-        /// requests included), which closes the `serial_commit_hook` path to
-        /// `xwm_state` by construction rather than by timing.
-        client: Client,
     },
     RetryArmed {
         timer: RegistrationToken,
@@ -208,9 +219,19 @@ pub(super) struct XwaylandRuntime {
     /// reports `Disconnected` only once the queue is drained) and the source
     /// removes itself after delivering it, so nothing can ask for the id
     /// again. The other entry point to `xwm_state`, the per-surface
-    /// `serial_commit_hook`, dies at teardown itself: the generation's
-    /// Wayland client is killed there, and a killed client dispatches no
-    /// further requests, buffered ones included.
+    /// `serial_commit_hook`, dies with teardown too: removing the XWayland
+    /// source token runs `Drop for XWayland`, which kills the generation's
+    /// Wayland client, and a killed client dispatches no further requests,
+    /// buffered ones included.
+    ///
+    /// This exhaustiveness argument additionally depends on X-1's selection
+    /// refusals: the wm's selection-transfer calloop sources (the incoming
+    /// and outgoing `Generic`s in the vendored `XWmSelection`) also capture
+    /// the `XwmId` and call `xwm_state`, and `Drop for X11Wm` does NOT
+    /// remove them — they can only never exist because
+    /// `allow_selection_access` is always `false` and comp never calls
+    /// `send_selection`. X-2's clipboard bridge must revisit this drain
+    /// before relaxing either refusal.
     pub(super) draining_wms: Vec<X11Wm>,
     pub(super) shutting_down: bool,
 }
@@ -265,17 +286,25 @@ fn publish_xwayland_descriptor(
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temporary)?;
-    file.write_all(format!("DISPLAY=:{display}\nGENERATION={generation}\n").as_bytes())?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&temporary, path)?;
-    Ok(())
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(format!("DISPLAY=:{display}\nGENERATION={generation}\n").as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        // The failed publication fails the generation; do not also leak the
+        // half-written sibling temporary.
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn remove_xwayland_descriptor(path: Option<&PathBuf>) {
@@ -424,7 +453,6 @@ impl WaylandState {
             return;
         };
         let client_for_retry = client.clone();
-        let wm_client = client.clone();
         match X11Wm::start_wm(self.capture_loop_handle.clone(), x11_socket, client) {
             Ok(wm) => {
                 // `DISPLAY` is published only after the XWM owns WM_S0:
@@ -456,12 +484,11 @@ impl WaylandState {
                 };
                 if !published {
                     // Hand the wm to the Ready teardown arm so the source is
-                    // removed, the wm drains, and the client is killed.
+                    // removed (its `Drop` kills the client) and the wm drains.
                     self.xwayland.lifecycle = XwaylandLifecycle::Ready {
                         token,
                         wm: Box::new(wm),
                         stability_timer: None,
-                        client: wm_client,
                     };
                     self.fail_xwayland_generation(generation, "descriptor publication failed");
                     return;
@@ -497,7 +524,6 @@ impl WaylandState {
                     token,
                     wm: Box::new(wm),
                     stability_timer,
-                    client: wm_client,
                 };
             }
             Err(error) => {
@@ -600,15 +626,17 @@ impl WaylandState {
         self.xwayland.descriptor_path = None;
         let lifecycle = mem::replace(&mut self.xwayland.lifecycle, XwaylandLifecycle::Inert);
         match lifecycle {
-            XwaylandLifecycle::Starting { token, client } => {
+            // Removing `token` drops the `XWayland` source, whose `Drop`
+            // kills the generation's Wayland client — the ONLY kill it may
+            // ever receive (see the `XwaylandLifecycle::Ready` comment: the
+            // vendored `disconnected` panics on a second one).
+            XwaylandLifecycle::Starting { token, client: _ } => {
                 self.capture_loop_handle.remove(token);
-                self.kill_xwayland_client(&client);
             }
             XwaylandLifecycle::Ready {
                 token,
                 wm,
                 stability_timer,
-                client,
             } => {
                 self.capture_loop_handle.remove(token);
                 if let Some(timer) = stability_timer {
@@ -620,7 +648,16 @@ impl WaylandState {
                 // would leave a registered callback that panics in
                 // `xwm_state`.
                 self.xwayland.draining_wms.push(*wm);
-                self.kill_xwayland_client(&client);
+                if self.xwayland.draining_wms.len() > 1 {
+                    // No cap: each entry frees itself on its channel's final
+                    // `Closed`. More than one at once means a drain is slow
+                    // or a `Closed` never arrived — make that visible before
+                    // it reads as a leak.
+                    tracing::warn!(
+                        draining = self.xwayland.draining_wms.len(),
+                        "multiple XWMs draining at once"
+                    );
+                }
             }
             XwaylandLifecycle::RetryArmed { timer } => {
                 self.capture_loop_handle.remove(timer);
@@ -653,22 +690,24 @@ impl WaylandState {
         for surface in surfaces {
             self.destroy_surface_record(&surface);
         }
+        // Leak check: teardown just destroyed every X11 record the maps knew
+        // about, so any X11 record still alive was reachable from no map —
+        // it will outlive its generation silently and its XID lookups will
+        // miss. Make it loud with its birth generation.
+        for record in self.surfaces.values() {
+            if let SurfaceRole::X11(role) = &record.role {
+                tracing::warn!(
+                    xid = role.xid,
+                    record_generation = role.generation,
+                    current_generation = self.xwayland.generation,
+                    "X11 record survived generation teardown; surfaces_by_xid leaked it"
+                );
+            }
+        }
         if held_focus {
             self.arbitrate_keyboard_focus(None, true, false);
         }
         self.refresh_chrome_pointer_after_scene_change();
-    }
-
-    /// Kill a torn-down generation's Wayland client. A killed client
-    /// dispatches no further requests — buffered ones included — so the
-    /// `serial_commit_hook` route into `xwm_state` is closed the moment this
-    /// returns, not whenever the dead process happens to be reaped.
-    /// (Dropping the `XWayland` source kills it too; this makes the
-    /// guarantee comp-side and testable instead of vendor-`Drop`-order.)
-    fn kill_xwayland_client(&mut self, client: &Client) {
-        self.display_handle
-            .backend_handle()
-            .kill_client(client.id(), DisconnectReason::ConnectionClosed);
     }
 
     /// Orderly compositor shutdown: reject further launches, remove the
@@ -1080,6 +1119,15 @@ impl WaylandState {
         };
         self.committed_surface_stacks
             .insert(object.clone(), vec![object.clone()]);
+        // Re-association to a DIFFERENT XID: drop the old XID's forward
+        // entry (when it still points at this object), or a later
+        // DestroyNotify for the old XID would destroy the live record.
+        if let Some(previous_xid) = self.xwayland.xids_by_object.get(&object).copied()
+            && previous_xid != xid
+            && self.xwayland.surfaces_by_xid.get(&previous_xid) == Some(&object)
+        {
+            self.xwayland.surfaces_by_xid.remove(&previous_xid);
+        }
         self.xwayland.surfaces_by_xid.insert(xid, object.clone());
         self.xwayland.xids_by_object.insert(object, xid);
         tracing::info!(
@@ -1146,14 +1194,19 @@ impl WaylandState {
             .unwrap_or_else(|| self.choose_initial_x11_geometry(&window));
         // Failure policy for `configure`/`set_maximized`/`set_fullscreen`
         // (here and in the maximize/fullscreen state functions): comp-side
-        // state is recorded even when the X call errors, deliberately. These
-        // are fire-and-forget writes — x11rb surfaces only stream-level
-        // failures here (a broken connection), never a per-request refusal —
-        // so an `Err` means the generation is dying and `disconnected` will
-        // destroy every record shortly. Recording unconditionally keeps comp
-        // internally coherent for that short window; skipping on error would
-        // instead desynchronise phase from geometry with no client to
-        // reconcile against.
+        // state is recorded even when the X call errors, deliberately.
+        // `set_maximized`/`set_fullscreen` bottom out in property writes and
+        // surface only stream-level failures (a broken connection), so for
+        // them an `Err` means the generation is dying and `disconnected`
+        // will destroy every record shortly. `configure` has exactly one
+        // per-request refusal on a healthy connection —
+        // `UnsupportedForOverrideRedirect` — and a client CAN reach it by
+        // unmapping, setting override-redirect, and remapping; that case is
+        // closed by `x11_mapped_override_redirect_window` destroying the
+        // managed record, so no divergent record persists. Recording
+        // unconditionally keeps comp internally coherent for the dying-
+        // connection window; skipping on error would instead desynchronise
+        // phase from geometry with no client to reconcile against.
         if let Err(error) = window.configure(Some(geometry)) {
             tracing::warn!(xid, %error, "failed to grant initial X11 geometry");
         }
@@ -1212,9 +1265,23 @@ impl WaylandState {
     }
 
     pub(super) fn x11_mapped_override_redirect_window(&mut self, window: X11Surface) {
+        let xid = window.window_id();
+        // A managed window can leave management at runtime: unmap, set
+        // override-redirect, remap. From here on every managed-path X write
+        // for this XID is refused per-request
+        // (`UnsupportedForOverrideRedirect`) while a surviving managed
+        // record would keep accepting maximize/move/resize requests —
+        // divergence that outlives the connection until DestroyNotify.
+        // Destroy the record: with no record there is nothing to diverge.
+        if self.xwayland.surfaces_by_xid.contains_key(&xid) {
+            tracing::info!(
+                xid,
+                "managed X11 window remapped as override-redirect; destroying its managed record"
+            );
+            self.x11_destroyed_window(window.clone());
+        }
         // Deliberate X-2 gap: visually ignored. Logged once per XID so the
         // gate can see the gap without the log flooding.
-        let xid = window.window_id();
         if self.xwayland.override_redirect_windows.insert(xid) {
             tracing::info!(
                 xid,
@@ -1287,27 +1354,18 @@ impl WaylandState {
             return;
         };
         self.xwayland.xids_by_object.remove(&object);
-        let Some((wl_surface, record_generation)) = self.surfaces.get(&object).map(|record| {
-            (
-                record.role.wl_surface().clone(),
-                record.role.x11().map(|role| role.generation),
-            )
-        }) else {
+        let Some(wl_surface) = self
+            .surfaces
+            .get(&object)
+            .map(|record| record.role.wl_surface().clone())
+        else {
             return;
         };
-        // The record's birth generation should always be the current one —
-        // teardown destroys a generation's records wholesale. A mismatch
-        // here means a record leaked across generations; make it loud.
-        if let Some(record_generation) = record_generation
-            && record_generation != self.xwayland.generation
-        {
-            tracing::warn!(
-                xid,
-                record_generation,
-                current_generation = self.xwayland.generation,
-                "destroying an X11 record that outlived its generation"
-            );
-        }
+        // No cross-generation check here: the `surfaces_by_xid.remove` above
+        // is cleared wholesale at teardown, so a callback that gets past it
+        // is always current-generation. The leak check for records that
+        // outlive their generation lives in `teardown_xwayland_generation`,
+        // where the leaked shape is actually reachable.
         let held_focus = self.x11_window_holds_keyboard_focus(xid, &wl_surface);
         // Existing destruction path: exactly once; the later wl_surface
         // destroy is a no-op for the absent record.

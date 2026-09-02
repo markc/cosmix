@@ -109,3 +109,9 @@ cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/c
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 wgpu = { version = "=29.0.4", features = ["noop"] }
+# Compiles the vendored `*_offline` X11Surface setters for the deterministic
+# tests; absent from a plain `cargo build --release` graph, so a production
+# call site is a compile error there.
+smithay = { version = "=0.7.0", default-features = false, features = [
+    "cosmix_offline_test",
+] }

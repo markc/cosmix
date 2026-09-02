@@ -317,7 +317,10 @@ impl X11Surface {
     /// fabricate offline `X11Surface`s (dangling connection) and still need
     /// input forwarding and metadata lookups to reach a real `wl_surface`.
     /// Production code must never call this; the commit hook owns the real
-    /// association.
+    /// association. Enforced by the `cosmix_offline_test` feature: only
+    /// downstream dev-dependencies enable it, so a release build graph does
+    /// not compile this method at all.
+    #[cfg(feature = "cosmix_offline_test")]
     pub fn set_wl_surface_offline(&self, surface: Option<WlSurface>) {
         self.state.lock().unwrap().wl_surface = surface;
     }
@@ -329,7 +332,9 @@ impl X11Surface {
     /// downstream deterministic compositor tests fabricate offline
     /// `X11Surface`s and must be able to drive the real
     /// [`Self::is_decorated`] predicate. Production code must never call
-    /// this; `PropertyNotify` owns the real hints.
+    /// this; `PropertyNotify` owns the real hints. Same
+    /// `cosmix_offline_test` feature guard as the association setter.
+    #[cfg(feature = "cosmix_offline_test")]
     pub fn set_motif_hints_offline(&self, hints: [u32; 5]) {
         self.state.lock().unwrap().motif_hints = hints.to_vec();
     }

@@ -11782,15 +11782,21 @@ impl WaylandState {
                 } else {
                     // The only managed toplevel without an xdg handle is an
                     // X11 window; anything else here lost its role mid-grab,
-                    // which the old `.expect` used to make loud.
-                    #[cfg(feature = "xwayland")]
-                    let role_accounted_for = self
-                        .surfaces
-                        .get(&object)
-                        .is_some_and(|record| record.role.x11().is_some());
-                    #[cfg(not(feature = "xwayland"))]
-                    let role_accounted_for = false;
-                    if !role_accounted_for {
+                    // which the old `.expect` used to make loud. An absent
+                    // record is not a lost role — the surface died mid-grab —
+                    // so only a live record with the wrong role asserts.
+                    let lost_role = self.surfaces.get(&object).is_some_and(|record| {
+                        #[cfg(feature = "xwayland")]
+                        {
+                            record.role.x11().is_none()
+                        }
+                        #[cfg(not(feature = "xwayland"))]
+                        {
+                            let _ = record;
+                            true
+                        }
+                    });
+                    if lost_role {
                         debug_assert!(false, "captured resize lost its toplevel role");
                         tracing::error!(
                             surface_id = surface_id.0,

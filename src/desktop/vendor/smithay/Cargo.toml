@@ -48,6 +48,10 @@ rustdoc-args = [
 ]
 
 [features]
+# CosMix vendor addition: compiles the two `*_offline` X11Surface setters
+# used by downstream deterministic compositor tests. Only dev-dependencies
+# enable it, so a plain release build graph cannot compile them.
+cosmix_offline_test = []
 backend_drm = [
     "drm",
     "drm-ffi",

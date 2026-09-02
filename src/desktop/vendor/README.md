@@ -536,6 +536,22 @@ An enable received during that window is held until after `Paused`, so consumers
 always classify the same pause generation before activation. The timeout is
 supplied by the downstream caller rather than fixed in Smithay.
 
+`X11Surface::set_wl_surface_offline` and `X11Surface::set_motif_hints_offline`
+(`src/xwayland/xwm/surface.rs`, added 2026-09-02 for the XWayland X-1 test
+suite) are test-only escape hatches: `cosmix-comp`'s deterministic protocol
+tests fabricate offline `X11Surface`s — a live X11 connection is
+unconstructible in a unit test — and still need input forwarding, metadata
+lookups, and the real `is_decorated()` predicate to reach real state. The
+first sets the associated `wl_surface` directly, bypassing the xwayland-shell
+serial handshake; the second sets the raw `_MOTIF_WM_HINTS` fields, bypassing
+the X11 property machinery. Production code must never call either: both are
+gated behind the vendored crate's `cosmix_offline_test` feature, which only
+`cosmix-comp`'s `[dev-dependencies]` smithay entry enables — a plain
+`cargo build --release` graph carries no dev-dependencies, so the setters do
+not exist there and a production call site fails to compile. (`#[cfg(test)]`
+was deliberately not used: it is false when the vendored crate is compiled as
+a dependency, which would silently compile the setters into every build.)
+
 ### Re-verifying the pristine import
 
 ```sh
