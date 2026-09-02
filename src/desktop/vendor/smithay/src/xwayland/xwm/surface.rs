@@ -310,6 +310,18 @@ impl X11Surface {
         Ok(())
     }
 
+    /// Set the associated `wl_surface` directly, bypassing the xwayland-shell
+    /// serial handshake that normally performs the association.
+    ///
+    /// CosMix vendor addition: downstream deterministic compositor tests
+    /// fabricate offline `X11Surface`s (dangling connection) and still need
+    /// input forwarding and metadata lookups to reach a real `wl_surface`.
+    /// Production code must never call this; the commit hook owns the real
+    /// association.
+    pub fn set_wl_surface_offline(&self, surface: Option<WlSurface>) {
+        self.state.lock().unwrap().wl_surface = surface;
+    }
+
     /// Returns the associated wl_surface.
     ///
     /// This will only return `Some` once:

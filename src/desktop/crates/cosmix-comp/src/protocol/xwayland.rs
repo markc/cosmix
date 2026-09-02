@@ -33,12 +33,7 @@ use smithay::{
         xwm::{Reorder, ResizeEdge as X11ResizeEdge, WmWindowProperty, X11Window, XwmId},
     },
 };
-use std::{
-    io::Write as _,
-    os::unix::fs::OpenOptionsExt as _,
-    path::Path,
-    process::Stdio,
-};
+use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _, path::Path, process::Stdio};
 
 /// One-shot restart backstop after an unexpected XWayland death. This is a
 /// bounded recovery delay, not a maintenance interval (no-poll law: any timer
@@ -98,6 +93,11 @@ impl X11WindowPhase {
 /// window-manager decorations (Smithay surfaces this as
 /// `X11Surface::is_decorated()`, "client-side decorated"). Flag unset, or a
 /// non-zero decorations value, accepts server-side decorations.
+// Consumed by the deterministic tests only: the live path reads the same
+// interpretation through `X11Surface::is_decorated()`, whose raw hint fields
+// Smithay keeps private — this copy pins the semantics so an inversion there
+// (or in a Smithay bump) fails a test instead of double-decorating Firefox.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn motif_refuses_server_decorations(flags: u32, decorations: u32) -> bool {
     const MWM_HINTS_DECORATIONS: u32 = 1 << 1;
     (flags & MWM_HINTS_DECORATIONS) != 0 && decorations == 0
@@ -345,7 +345,10 @@ impl WaylandState {
                 );
                 match token {
                     Ok(token) => {
-                        tracing::info!(generation, "XWayland spawned; waiting for display-fd readiness");
+                        tracing::info!(
+                            generation,
+                            "XWayland spawned; waiting for display-fd readiness"
+                        );
                         self.xwayland.lifecycle = XwaylandLifecycle::Starting { token, client };
                     }
                     Err(error) => {
@@ -378,10 +381,9 @@ impl WaylandState {
             );
             return;
         }
-        let XwaylandLifecycle::Starting { token, client } = mem::replace(
-            &mut self.xwayland.lifecycle,
-            XwaylandLifecycle::Failed,
-        ) else {
+        let XwaylandLifecycle::Starting { token, client } =
+            mem::replace(&mut self.xwayland.lifecycle, XwaylandLifecycle::Failed)
+        else {
             tracing::warn!(generation, "ignored XWayland readiness outside Starting");
             return;
         };
@@ -404,7 +406,9 @@ impl WaylandState {
                         }
                     }
                     None => {
-                        tracing::warn!("XDG_RUNTIME_DIR unset; XWayland DISPLAY descriptor not published");
+                        tracing::warn!(
+                            "XDG_RUNTIME_DIR unset; XWayland DISPLAY descriptor not published"
+                        );
                     }
                 }
                 self.xwayland.descriptor_path = path;
@@ -451,7 +455,10 @@ impl WaylandState {
         {
             *stability_timer = None;
             self.xwayland.retry.on_stable();
-            tracing::debug!(generation, "XWayland generation stable; retry credit restored");
+            tracing::debug!(
+                generation,
+                "XWayland generation stable; retry credit restored"
+            );
         }
     }
 
@@ -510,7 +517,10 @@ impl WaylandState {
     }
 
     fn retry_xwayland(&mut self) {
-        if !matches!(self.xwayland.lifecycle, XwaylandLifecycle::RetryArmed { .. }) {
+        if !matches!(
+            self.xwayland.lifecycle,
+            XwaylandLifecycle::RetryArmed { .. }
+        ) {
             return;
         }
         self.xwayland.lifecycle = XwaylandLifecycle::Inert;
@@ -608,7 +618,8 @@ impl WaylandState {
         let mapped = record.mapped;
         let scene = record.scene_snapshot();
         if mapped {
-            self.events.push(ProtocolEvent::SurfaceRelayout { id, scene });
+            self.events
+                .push(ProtocolEvent::SurfaceRelayout { id, scene });
         }
         self.shift_surface_descendants(id, delta);
         self.invalidate_pointer_hit_test_geometry();
@@ -649,7 +660,8 @@ impl WaylandState {
         if record.mapped {
             let id = record.id;
             let scene = record.scene_snapshot();
-            self.events.push(ProtocolEvent::SurfaceRelayout { id, scene });
+            self.events
+                .push(ProtocolEvent::SurfaceRelayout { id, scene });
         }
         self.invalidate_pointer_hit_test_geometry();
     }
@@ -797,7 +809,10 @@ impl WaylandState {
             return;
         }
         let pending = self.xwayland.pending_windows.remove(&xid);
-        let mut phase = pending.as_ref().map(|entry| entry.phase).unwrap_or_default();
+        let mut phase = pending
+            .as_ref()
+            .map(|entry| entry.phase)
+            .unwrap_or_default();
         phase.on_associated();
         let granted = pending.and_then(|entry| entry.granted_geometry);
         let geometry = granted.unwrap_or_else(|| surface.geometry());
@@ -820,7 +835,7 @@ impl WaylandState {
             visible: false,
             toplevel: None,
         };
-        let role = SurfaceRole::X11(X11ToplevelRole {
+        let role = SurfaceRole::X11(Box::new(X11ToplevelRole {
             wl_surface: wl_surface.clone(),
             surface: surface.clone(),
             xid,
@@ -828,7 +843,7 @@ impl WaylandState {
             phase,
             granted_geometry: geometry,
             fullscreen: false,
-        });
+        }));
         #[cfg(feature = "bus")]
         self.mark_surface_unmapped(&wl_surface);
         let id = if let Some(record) = self.surfaces.get_mut(&object) {
@@ -933,7 +948,10 @@ impl WaylandState {
         // for diagnostics and renders nothing.
         let xid = window.window_id();
         self.xwayland.override_redirect_windows.insert(xid);
-        tracing::debug!(xid, "recorded override-redirect X11 window (ignored in X-1)");
+        tracing::debug!(
+            xid,
+            "recorded override-redirect X11 window (ignored in X-1)"
+        );
     }
 
     pub(super) fn x11_map_window_request(&mut self, window: X11Surface) {
@@ -1038,16 +1056,18 @@ impl WaylandState {
         let Some(object) = self.xwayland.surfaces_by_xid.get(&xid).cloned() else {
             return;
         };
-        let Some((wl_surface, was_mapped, id)) = self.surfaces.get_mut(&object).and_then(|record| {
-            let SurfaceRole::X11(role) = &mut record.role else {
-                return None;
-            };
-            role.phase.on_unmapped();
-            let was_mapped = record.mapped;
-            record.mapped = false;
-            record.minimized = false;
-            Some((role.wl_surface.clone(), was_mapped, record.id))
-        }) else {
+        let Some((wl_surface, was_mapped, id)) =
+            self.surfaces.get_mut(&object).and_then(|record| {
+                let SurfaceRole::X11(role) = &mut record.role else {
+                    return None;
+                };
+                role.phase.on_unmapped();
+                let was_mapped = record.mapped;
+                record.mapped = false;
+                record.minimized = false;
+                Some((role.wl_surface.clone(), was_mapped, record.id))
+            })
+        else {
             return;
         };
         // Keep the association and retained backing for an idempotent remap;
@@ -1190,7 +1210,11 @@ impl WaylandState {
         let xid = window.window_id();
         if window.is_override_redirect() {
             // Diagnostics only in X-1; X-2 must mirror these faithfully.
-            tracing::trace!(xid, ?geometry, "override-redirect configure notify (ignored in X-1)");
+            tracing::trace!(
+                xid,
+                ?geometry,
+                "override-redirect configure notify (ignored in X-1)"
+            );
             return;
         }
         self.apply_x11_geometry(xid, geometry);
@@ -1373,9 +1397,17 @@ impl WaylandState {
         );
     }
 
-    pub(super) fn x11_new_selection(&mut self, selection: SelectionTarget, mime_types: Vec<String>) {
+    pub(super) fn x11_new_selection(
+        &mut self,
+        selection: SelectionTarget,
+        mime_types: Vec<String>,
+    ) {
         // Log-only in X-1; no bridge state is retained.
-        tracing::debug!(?selection, ?mime_types, "X11 selection changed (not bridged in X-1)");
+        tracing::debug!(
+            ?selection,
+            ?mime_types,
+            "X11 selection changed (not bridged in X-1)"
+        );
     }
 
     pub(super) fn x11_cleared_selection(&mut self, selection: SelectionTarget) {
@@ -1385,9 +1417,11 @@ impl WaylandState {
     pub(super) fn x11_randr_primary_output_change(&mut self, output_name: Option<String>) {
         // Deliberate X-3 gap: scale/output policy untouched; client scale
         // stays 1.
-        tracing::debug!(?output_name, "X11 RandR primary output changed (ignored in X-1)");
+        tracing::debug!(
+            ?output_name,
+            "X11 RandR primary output changed (ignored in X-1)"
+        );
     }
-
 }
 
 /// Thin delegation: every callback body lives in the inherent `x11_*`
@@ -1644,11 +1678,7 @@ impl WaylandState {
             }));
             Rectangle::new(
                 (output.x as i32, output.y as i32).into(),
-                (
-                    output.width.max(1.0) as i32,
-                    output.height.max(1.0) as i32,
-                )
-                    .into(),
+                (output.width.max(1.0) as i32, output.height.max(1.0) as i32).into(),
             )
         } else {
             let restore = record.normal_restore.take();

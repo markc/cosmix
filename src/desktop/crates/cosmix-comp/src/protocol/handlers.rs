@@ -1927,15 +1927,13 @@ impl SeatHandler for WaylandState {
         let toplevels = self
             .surfaces
             .values()
-            .filter_map(|record| {
-                record
-                    .role
-                    .managed_toplevel()
-                    .then(|| record.role.wl_surface().clone())
-            })
+            .filter(|record| record.role.managed_toplevel())
+            .map(|record| record.role.wl_surface().clone())
             .collect::<Vec<_>>();
         for surface in toplevels {
-            let active = focused_root.as_ref().is_some_and(|focused| focused == &surface);
+            let active = focused_root
+                .as_ref()
+                .is_some_and(|focused| focused == &surface);
             if let Some(record) = self.surfaces.get_mut(&surface.id())
                 && record.focused != active
             {

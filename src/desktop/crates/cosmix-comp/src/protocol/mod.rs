@@ -2654,10 +2654,9 @@ impl ProtocolServer {
         // Visible only to clients carrying XWaylandClientData; native clients
         // cannot bind it (Smithay's can_view filter).
         #[cfg(feature = "xwayland")]
-        let xwayland_shell_state =
-            smithay::wayland::xwayland_shell::XWaylandShellState::new::<WaylandState>(
-                &display_handle,
-            );
+        let xwayland_shell_state = smithay::wayland::xwayland_shell::XWaylandShellState::new::<
+            WaylandState,
+        >(&display_handle);
         display_handle.create_global::<WaylandState, ZwlrScreencopyManagerV1, _>(3, ());
         let xdg_decoration_state = XdgDecorationState::new::<WaylandState>(&display_handle);
         let fractional_scale_state =
@@ -4595,9 +4594,11 @@ enum SurfaceRole {
     },
     Dormant(WlSurface),
     /// A normal managed X11 toplevel, created at XWayland association time.
-    /// Override-redirect windows never get this role (X-1 refusal).
+    /// Override-redirect windows never get this role (X-1 refusal). Boxed:
+    /// `X11Surface` carries its whole atom table inline, and every
+    /// `SurfaceRecord` would otherwise pay for it.
     #[cfg(feature = "xwayland")]
-    X11(X11ToplevelRole),
+    X11(Box<X11ToplevelRole>),
 }
 
 #[cfg(feature = "xwayland")]
@@ -9925,8 +9926,9 @@ impl WaylandState {
     }
 
     fn clear_focus_for_surface(&mut self, surface: &WlSurface) {
-        let clears_keyboard = focus_targets_surface(self.keyboard.current_focus().as_ref(), surface)
-            || self.exclusive_keyboard_focus.as_ref() == Some(&surface.id());
+        let clears_keyboard =
+            focus_targets_surface(self.keyboard.current_focus().as_ref(), surface)
+                || self.exclusive_keyboard_focus.as_ref() == Some(&surface.id());
         if clears_keyboard {
             self.arbitrate_keyboard_focus(None, false, true);
         }
@@ -9938,7 +9940,9 @@ impl WaylandState {
             .grab_start_data()
             .and_then(|start| start.focus)
             .is_some_and(|(focus, _)| {
-                focus.surface().is_some_and(|focused| focused.as_ref() == surface)
+                focus
+                    .surface()
+                    .is_some_and(|focused| focused.as_ref() == surface)
             });
         if pointer_focus_matches || pointer_grab_matches {
             let pointer = self.pointer.clone();
@@ -11252,9 +11256,7 @@ impl WaylandState {
                 };
                 let root = canonical_root_surface(&self.popup_manager, &focused);
                 match self.surfaces.get(&root.id()).map(|record| &record.role) {
-                    Some(SurfaceRole::Toplevel(toplevel))
-                        if toplevel.wl_surface().is_alive() =>
-                    {
+                    Some(SurfaceRole::Toplevel(toplevel)) if toplevel.wl_surface().is_alive() => {
                         toplevel.send_close();
                         tracing::debug!(surface = ?root.id(), "requested focused toplevel close");
                     }
@@ -12248,7 +12250,9 @@ impl WaylandState {
                         .grab_start_data()
                         .and_then(|start| start.focus)
                         .is_some_and(|(focus, _)| {
-                            focus.surface().is_some_and(|focused| focused.as_ref() == &root)
+                            focus
+                                .surface()
+                                .is_some_and(|focused| focused.as_ref() == &root)
                         });
                     if pointer_grabs_root {
                         self.defer_or_cancel_pointer_grab_for_focus_policy();
@@ -12799,11 +12803,7 @@ impl WaylandState {
                     && let SurfaceRole::X11(role) = &mut record.role
                 {
                     let rect = Rectangle::new(
-                        (
-                            record.window_origin.0 as i32,
-                            record.window_origin.1 as i32,
-                        )
-                            .into(),
+                        (record.window_origin.0 as i32, record.window_origin.1 as i32).into(),
                         (
                             record.configured_size.0.max(1),
                             record.configured_size.1.max(1),
@@ -12924,11 +12924,7 @@ impl WaylandState {
                 #[cfg(feature = "xwayland")]
                 if let SurfaceRole::X11(role) = &mut record.role {
                     let rect = Rectangle::new(
-                        (
-                            record.window_origin.0 as i32,
-                            record.window_origin.1 as i32,
-                        )
-                            .into(),
+                        (record.window_origin.0 as i32, record.window_origin.1 as i32).into(),
                         (new_size.0.max(1), new_size.1.max(1)).into(),
                     );
                     role.granted_geometry = rect;

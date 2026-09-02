@@ -1840,9 +1840,9 @@ impl KeybindingHarness {
             .clone();
         let keyboard = self.server.state.keyboard.clone();
         keyboard.set_focus(
-        &mut self.server.state,
-        Some(SeatFocusTarget::Wayland(focused)),
-        SERIAL_COUNTER.next_serial(),
+            &mut self.server.state,
+            Some(SeatFocusTarget::Wayland(focused)),
+            SERIAL_COUNTER.next_serial(),
         );
         let _ = self.sync();
     }
@@ -26713,7 +26713,10 @@ fn background_layer_mapped_last_and_clicked_never_crosses_normal_band() {
         before
     );
     assert!(test_layer_record(&harness, background.surface).layout.z < normal_key);
-    assert_eq!(focused_surface(harness.server.state.keyboard.current_focus()), focus_before);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        focus_before
+    );
     assert_ne!(
         focused_surface(harness.server.state.keyboard.current_focus()),
         Some(
@@ -26836,7 +26839,10 @@ fn layer_keyboard_interactivity_none_and_on_demand_follow_click_policy() {
     route_pointer_to(&mut none, 5.0, 5.0);
     route_pointer_button(&mut none, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
     route_pointer_button(&mut none, PRIMARY_POINTER_BUTTON, ButtonState::Released);
-    assert_eq!(focused_surface(none.server.state.keyboard.current_focus()), Some(toplevel));
+    assert_eq!(
+        focused_surface(none.server.state.keyboard.current_focus()),
+        Some(toplevel)
+    );
     assert_eq!(
         test_layer_record(&none, none_layer.surface).layout.z,
         none_key
@@ -29129,7 +29135,10 @@ fn output_resize_reconciles_pointer_once_after_layers_and_toplevels_finish_movin
         pointer_bodies(&resized, pointer, 0).is_empty(),
         "the transient toplevel position is never entered: {resized:?}"
     );
-    assert_eq!(focused_surface(harness.server.state.pointer.current_focus()), None);
+    assert_eq!(
+        focused_surface(harness.server.state.pointer.current_focus()),
+        None
+    );
     assert_eq!(
         harness.server.state.pointer_hit_test_reconciliations - reconciliations_before,
         1,
@@ -32370,8 +32379,14 @@ fn session_lock_entry_cancels_grabs_popups_dnd_and_touch() {
             .iter()
             .any(|(object, opcode, _)| *object == touch && *opcode == 4)
     );
-    assert_eq!(focused_surface(harness.server.state.keyboard.current_focus()), None);
-    assert_eq!(focused_surface(harness.server.state.pointer.current_focus()), None);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        None
+    );
+    assert_eq!(
+        focused_surface(harness.server.state.pointer.current_focus()),
+        None
+    );
 }
 
 #[test]
@@ -32554,7 +32569,10 @@ fn session_lock_unlock_restores_scene_focus_input_and_frames() {
         event,
         ProtocolEvent::SurfaceUpserted { id, .. } if *id == normal_id
     )));
-    assert_eq!(focused_surface(harness.server.state.keyboard.current_focus()), Some(normal));
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(normal)
+    );
     assert!(
         restored_events
             .iter()
@@ -33336,8 +33354,14 @@ fn kms_unlock_reconciles_lock_input_and_keeps_normal_focus_hidden() {
 
     assert!(harness.server.state.keyboard.pressed_keys().is_empty());
     assert!(harness.server.state.pointer.current_pressed().is_empty());
-    assert_eq!(focused_surface(harness.server.state.keyboard.current_focus()), None);
-    assert_eq!(focused_surface(harness.server.state.pointer.current_focus()), None);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        None
+    );
+    assert_eq!(
+        focused_surface(harness.server.state.pointer.current_focus()),
+        None
+    );
     assert!(harness.server.state.surface_at(8.0, 8.0).is_none());
     assert!(
         harness
@@ -33526,8 +33550,14 @@ fn kms_locked_pause_unlock_and_resume_restore_only_after_displayed_epoch() {
         LockLifecycle::Unlocked
     ));
     assert!(harness.server.state.kms_session_lock_gate.deferred_unlock);
-    assert_eq!(focused_surface(harness.server.state.keyboard.current_focus()), None);
-    assert_eq!(focused_surface(harness.server.state.pointer.current_focus()), None);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        None
+    );
+    assert_eq!(
+        focused_surface(harness.server.state.pointer.current_focus()),
+        None
+    );
     assert!(harness.server.state.surface_at(8.0, 8.0).is_none());
     assert!(
         harness
@@ -33604,7 +33634,10 @@ fn kms_locked_pause_unlock_and_resume_restore_only_after_displayed_epoch() {
         .as_ref()
         .expect("resume arms ordinary-scene display barrier")
         .presentation_epoch;
-    assert_eq!(focused_surface(harness.server.state.keyboard.current_focus()), None);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        None
+    );
     assert!(
         harness
             .server
@@ -35655,4 +35688,856 @@ fn topology_change_retires_only_changed_kms_capture_generations() {
     assert_eq!(manager_baselines.get(&unchanged_source), Some(&41));
     assert!(!manager_baselines.contains_key(&replaced_source));
     assert_eq!(manager_baselines.get(&nested_source), Some(&5));
+}
+
+// ---------------------------------------------------------------------------
+// XWayland X-1 (feature `xwayland`).
+//
+// A real X client cannot run under `cargo test`, and Smithay's `XwmId` is
+// unconstructible outside a live X11 connection — so these tests drive the
+// inherent `x11_*` methods the `XwmHandler` impl delegates to, with offline
+// `X11Surface`s fabricated on a dangling connection. What is provable here:
+// association/map eligibility, buffer adoption, geometry policy, decoration
+// policy, unmap/remap/destroy, focus wrapper resolution, selection refusal
+// and generation teardown. What is NOT provable here and belongs to the live
+// nested gate: the XWayland process itself, the privileged XWM handshake,
+// pixels (the presented capture), X focus delivery, and XWM stack mirroring
+// over a live connection.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "xwayland")]
+mod x11 {
+    use super::*;
+    use crate::protocol::xwayland::{
+        PendingX11Window, X11WindowPhase, XwaylandRetryDecision, XwaylandRetryPolicy,
+        clamp_x11_content_size, motif_refuses_server_decorations,
+    };
+    use smithay::xwayland::{X11Surface, xwm::Atoms};
+
+    fn fake_atoms() -> Atoms {
+        let mut next = 0;
+        let mut atom = move || {
+            next += 1;
+            next
+        };
+        Atoms {
+            WL_SURFACE_ID: atom(),
+            WL_SURFACE_SERIAL: atom(),
+            _SMITHAY_CLOSE_CONNECTION: atom(),
+            UTF8_STRING: atom(),
+            TEXT: atom(),
+            WM_HINTS: atom(),
+            WM_PROTOCOLS: atom(),
+            WM_TAKE_FOCUS: atom(),
+            WM_DELETE_WINDOW: atom(),
+            WM_CHANGE_STATE: atom(),
+            _NET_WM_NAME: atom(),
+            _NET_WM_MOVERESIZE: atom(),
+            _NET_WM_PID: atom(),
+            _NET_WM_WINDOW_TYPE: atom(),
+            _NET_WM_WINDOW_TYPE_DROPDOWN_MENU: atom(),
+            _NET_WM_WINDOW_TYPE_DIALOG: atom(),
+            _NET_WM_WINDOW_TYPE_MENU: atom(),
+            _NET_WM_WINDOW_TYPE_NOTIFICATION: atom(),
+            _NET_WM_WINDOW_TYPE_NORMAL: atom(),
+            _NET_WM_WINDOW_TYPE_POPUP_MENU: atom(),
+            _NET_WM_WINDOW_TYPE_SPLASH: atom(),
+            _NET_WM_WINDOW_TYPE_TOOLBAR: atom(),
+            _NET_WM_WINDOW_TYPE_TOOLTIP: atom(),
+            _NET_WM_WINDOW_TYPE_UTILITY: atom(),
+            _NET_WM_STATE_MODAL: atom(),
+            _MOTIF_WM_HINTS: atom(),
+            _NET_STARTUP_ID: atom(),
+            WM_S0: atom(),
+            WM_STATE: atom(),
+            _NET_WM_CM_S0: atom(),
+            _NET_SUPPORTED: atom(),
+            _NET_ACTIVE_WINDOW: atom(),
+            _NET_CLIENT_LIST: atom(),
+            _NET_CLIENT_LIST_STACKING: atom(),
+            _NET_WM_PING: atom(),
+            _NET_WM_STATE: atom(),
+            _NET_WM_STATE_MAXIMIZED_VERT: atom(),
+            _NET_WM_STATE_MAXIMIZED_HORZ: atom(),
+            _NET_WM_STATE_HIDDEN: atom(),
+            _NET_WM_STATE_FULLSCREEN: atom(),
+            _NET_WM_STATE_FOCUSED: atom(),
+            _NET_SUPPORTING_WM_CHECK: atom(),
+            _XSETTINGS_SETTINGS: atom(),
+            _WL_SELECTION: atom(),
+            CLIPBOARD_MANAGER: atom(),
+            CLIPBOARD: atom(),
+            PRIMARY: atom(),
+            TARGETS: atom(),
+            TIMESTAMP: atom(),
+            INCR: atom(),
+            DELETE: atom(),
+            _XSETTINGS_S0: atom(),
+        }
+    }
+
+    fn fake_x11_window(
+        xid: u32,
+        override_redirect: bool,
+        geometry: Rectangle<i32, Logical>,
+    ) -> X11Surface {
+        X11Surface::new(
+            None,
+            xid,
+            override_redirect,
+            std::sync::Weak::new(),
+            fake_atoms(),
+            geometry,
+        )
+    }
+
+    /// Create a fresh roleless `wl_surface` through the wire client and hand
+    /// back the protocol id plus the server-side object.
+    fn roleless_wl_surface(harness: &mut KeybindingHarness) -> (u32, WlSurface) {
+        let surface_id = harness.allocate_object_id();
+        send_request(
+            &mut harness.client,
+            TEST_COMPOSITOR_ID,
+            0,
+            &words(&[surface_id]),
+        );
+        harness.dispatch_client();
+        let client = harness
+            .server
+            .state
+            .surfaces
+            .values()
+            .next()
+            .and_then(|record| record.role.wl_surface().client())
+            .expect("in-process client is live");
+        let surface = client
+            .object_from_protocol_id::<WlSurface>(&harness.server.state.display_handle, surface_id)
+            .expect("roleless wl_surface exists");
+        (surface_id, surface)
+    }
+
+    /// Fabricate a normal X11 window, run new-window → map-request →
+    /// association (X-first order), and return the pieces.
+    fn associate_normal_window(
+        harness: &mut KeybindingHarness,
+        xid: u32,
+    ) -> (u32, WlSurface, X11Surface, ObjectId) {
+        let (surface_id, surface) = roleless_wl_surface(harness);
+        let window = fake_x11_window(xid, false, Rectangle::new((0, 0).into(), (200, 150).into()));
+        window.set_wl_surface_offline(Some(surface.clone()));
+        harness.server.state.x11_new_window(window.clone());
+        harness.server.state.x11_map_window_request(window.clone());
+        harness
+            .server
+            .state
+            .x11_associate_window(surface.clone(), window.clone());
+        let object = surface.id();
+        assert!(
+            harness.server.state.surfaces.contains_key(&object),
+            "association creates the record synchronously"
+        );
+        (surface_id, surface, window, object)
+    }
+
+    fn commit_dmabuf(harness: &mut KeybindingHarness, surface_id: u32, width: u32, height: u32) {
+        let buffer = harness.create_dmabuf_buffer_sized(width, height);
+        send_request(&mut harness.client, surface_id, 1, &words(&[buffer, 0, 0]));
+        send_request(&mut harness.client, surface_id, 6, &[]);
+        harness.dispatch_client();
+    }
+
+    #[test]
+    fn x11_window_phase_is_idempotent_for_either_association_order() {
+        // X-first: map granted before the Wayland half arrives.
+        let mut phase = X11WindowPhase::default();
+        assert!(!phase.eligible());
+        assert!(phase.on_map_requested());
+        assert!(!phase.eligible(), "map alone must not present");
+        assert!(phase.on_associated());
+        assert!(phase.eligible());
+
+        // Wayland-first: association before the map request.
+        let mut phase = X11WindowPhase::default();
+        assert!(phase.on_associated());
+        assert!(!phase.eligible(), "association alone must not present");
+        assert!(phase.on_map_requested());
+        assert!(phase.eligible());
+
+        // Duplicate callbacks report non-first and change nothing.
+        assert!(!phase.on_map_requested());
+        assert!(!phase.on_associated());
+        assert!(phase.on_map_notify());
+        assert!(!phase.on_map_notify());
+        assert!(phase.eligible());
+
+        // Unmap withdraws eligibility but keeps the association for remap.
+        phase.on_unmapped();
+        assert!(!phase.eligible());
+        assert!(phase.associated, "unmap must not sever the association");
+        assert!(phase.on_map_requested());
+        assert!(phase.eligible(), "remap restores eligibility");
+    }
+
+    #[test]
+    fn x11_retry_policy_spends_and_restores_a_single_credit() {
+        let mut retry = XwaylandRetryPolicy::new();
+        assert!(retry.has_credit());
+        assert_eq!(retry.on_failure(), XwaylandRetryDecision::Retry);
+        assert!(!retry.has_credit(), "one failure spends the only credit");
+        assert_eq!(
+            retry.on_failure(),
+            XwaylandRetryDecision::StayFailed,
+            "a failed retry stays failed until compositor restart"
+        );
+        retry.on_stable();
+        assert!(retry.has_credit(), "five stable minutes restore one credit");
+        assert_eq!(retry.on_failure(), XwaylandRetryDecision::Retry);
+        assert_eq!(retry.on_failure(), XwaylandRetryDecision::StayFailed);
+    }
+
+    #[test]
+    fn x11_motif_decoration_interpretation_is_pinned() {
+        // Flag unset: the decorations field is meaningless; SSD is accepted.
+        assert!(!motif_refuses_server_decorations(0, 0));
+        assert!(!motif_refuses_server_decorations(0, 1));
+        // Flag set + zero decorations: the client refuses WM decorations.
+        assert!(motif_refuses_server_decorations(1 << 1, 0));
+        // Flag set + non-zero decorations: WM decorations accepted.
+        assert!(!motif_refuses_server_decorations(1 << 1, 1));
+        assert!(!motif_refuses_server_decorations(1 << 1, u32::MAX));
+        // Other flag bits do not imply the decorations flag.
+        assert!(!motif_refuses_server_decorations(1 << 0, 0));
+    }
+
+    #[test]
+    fn x11_content_size_clamp_honours_hints_output_and_fallback() {
+        let fallback = (640, 420);
+        let usable = (1000, 800);
+        // A sane request passes through.
+        assert_eq!(
+            clamp_x11_content_size((300, 200), None, None, fallback, usable),
+            (300, 200)
+        );
+        // A degenerate request falls back to the shared sensible size.
+        assert_eq!(
+            clamp_x11_content_size((0, 0), None, None, fallback, usable),
+            fallback
+        );
+        assert_eq!(
+            clamp_x11_content_size((1, 1), None, None, fallback, usable),
+            fallback
+        );
+        // Hints bound the request from both sides.
+        assert_eq!(
+            clamp_x11_content_size((300, 200), Some((400, 300)), None, fallback, usable),
+            (400, 300)
+        );
+        assert_eq!(
+            clamp_x11_content_size((900, 700), None, Some((500, 400)), fallback, usable),
+            (500, 400)
+        );
+        // The usable output is a hard ceiling even over max hints.
+        assert_eq!(
+            clamp_x11_content_size((5000, 5000), None, Some((4000, 4000)), fallback, usable),
+            usable
+        );
+        // Degenerate hints cannot force a zero-sized window.
+        assert_eq!(
+            clamp_x11_content_size((300, 200), Some((0, 0)), Some((0, 0)), fallback, usable),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn x11_association_then_map_publishes_first_buffer_as_toplevel() {
+        let mut harness = KeybindingHarness::new(true);
+        let (surface_id, _surface, window, object) = associate_normal_window(&mut harness, 41);
+        {
+            let record = &harness.server.state.surfaces[&object];
+            assert!(!record.mapped, "no pixels yet: nothing to present");
+            assert_eq!(record.role.kind(), "x11-toplevel");
+            assert_eq!(record.role.scene_kind(), SceneSurfaceKind::Toplevel);
+            assert!(record.role.managed_toplevel());
+            assert!(
+                record.role.toplevel().is_none(),
+                "an X11 window is not an xdg toplevel"
+            );
+            assert_eq!(
+                record.committed_decoration,
+                SceneDecorationMode::ServerSide,
+                "normal X11 window without Motif refusal gets SSD"
+            );
+        }
+        assert_eq!(
+            harness.server.state.xwayland.surfaces_by_xid.get(&41),
+            Some(&object)
+        );
+        harness.server.state.events.clear();
+        commit_dmabuf(&mut harness, surface_id, 64, 48);
+        let record = &harness.server.state.surfaces[&object];
+        assert!(record.mapped, "association + map grant + buffer presents");
+        assert_eq!(record.buffer_dimensions, Some((64, 48)));
+        // X11 content geometry is the committed buffer at origin; SSD and the
+        // outer frame live outside it.
+        assert_eq!(
+            record.committed_window_geometry,
+            Some(SceneWindowGeometry {
+                x: 0.0,
+                y: 0.0,
+                width: 64.0,
+                height: 48.0,
+            })
+        );
+        assert_eq!(
+            (record.layout.x, record.layout.y),
+            record.window_origin,
+            "zero geometry offset: layout origin equals the granted origin"
+        );
+        assert!(
+            record.layout.toplevel.is_some(),
+            "managed X11 toplevel publishes ToplevelSceneState for SSD"
+        );
+        let upserts = harness
+            .server
+            .state
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ProtocolEvent::SurfaceUpserted { id, scene, .. }
+                        if *id == record.id && scene.kind == SceneSurfaceKind::Toplevel
+                )
+            })
+            .count();
+        assert_eq!(upserts, 1, "exactly one toplevel upsert for the commit");
+        drop(window);
+    }
+
+    #[test]
+    fn x11_buffer_before_map_grant_is_retained_not_presented() {
+        let mut harness = KeybindingHarness::new(true);
+        let (surface_id, surface) = roleless_wl_surface(&mut harness);
+        let window = fake_x11_window(43, false, Rectangle::new((10, 10).into(), (100, 80).into()));
+        window.set_wl_surface_offline(Some(surface.clone()));
+        harness.server.state.x11_new_window(window.clone());
+        // Wayland-first: association before any map grant.
+        harness
+            .server
+            .state
+            .x11_associate_window(surface.clone(), window.clone());
+        let object = surface.id();
+        harness.server.state.events.clear();
+        commit_dmabuf(&mut harness, surface_id, 32, 24);
+        {
+            let record = &harness.server.state.surfaces[&object];
+            assert!(!record.mapped, "no map grant: retained, not presented");
+            assert!(
+                record.dmabuf_backing.is_some() || record.shm_backing.is_some(),
+                "the early buffer is retained for the map grant"
+            );
+            assert!(
+                !harness
+                    .server
+                    .state
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, ProtocolEvent::SurfaceUpserted { .. })),
+                "nothing is published before the map grant"
+            );
+        }
+        harness.server.state.x11_map_window_request(window.clone());
+        let record = &harness.server.state.surfaces[&object];
+        assert!(record.mapped, "map grant presents the retained content");
+        assert!(
+            harness
+                .server
+                .state
+                .pending_full_upserts
+                .contains(&record.id),
+            "retained remap republishes through the full-upsert path"
+        );
+    }
+
+    #[test]
+    fn x11_unmap_retains_backing_and_remap_republishes() {
+        let mut harness = KeybindingHarness::new(true);
+        let (surface_id, _surface, window, object) = associate_normal_window(&mut harness, 44);
+        commit_dmabuf(&mut harness, surface_id, 32, 24);
+        assert!(harness.server.state.surfaces[&object].mapped);
+        harness.server.state.events.clear();
+        harness.server.state.x11_unmapped_window(window.clone());
+        {
+            let record = &harness.server.state.surfaces[&object];
+            assert!(!record.mapped);
+            assert!(
+                record.dmabuf_backing.is_some(),
+                "unmap keeps the retained backing for an idempotent remap"
+            );
+            assert!(
+                harness.server.state.events.iter().any(|event| matches!(
+                    event,
+                    ProtocolEvent::SurfaceUnmapped { id } if *id == record.id
+                )),
+                "unmap is published to the renderer"
+            );
+            assert_eq!(
+                harness.server.state.xwayland.surfaces_by_xid.get(&44),
+                Some(&object),
+                "the association survives the unmap"
+            );
+        }
+        // Duplicate unmap is a no-op.
+        harness.server.state.events.clear();
+        harness.server.state.x11_unmapped_window(window.clone());
+        assert!(
+            !harness
+                .server
+                .state
+                .events
+                .iter()
+                .any(|event| matches!(event, ProtocolEvent::SurfaceUnmapped { .. })),
+            "a second unmap publishes nothing"
+        );
+        // Remap republishes the retained content exactly once.
+        harness.server.state.x11_map_window_request(window.clone());
+        let record = &harness.server.state.surfaces[&object];
+        assert!(record.mapped, "remap restores presentation");
+        assert!(
+            harness
+                .server
+                .state
+                .pending_full_upserts
+                .contains(&record.id)
+        );
+    }
+
+    #[test]
+    fn x11_destroy_runs_common_destruction_once() {
+        let mut harness = KeybindingHarness::new(true);
+        let (surface_id, _surface, window, object) = associate_normal_window(&mut harness, 45);
+        commit_dmabuf(&mut harness, surface_id, 32, 24);
+        let id = harness.server.state.surfaces[&object].id;
+        harness.server.state.events.clear();
+        harness.server.state.x11_destroyed_window(window.clone());
+        assert!(!harness.server.state.surfaces.contains_key(&object));
+        assert!(
+            !harness
+                .server
+                .state
+                .xwayland
+                .surfaces_by_xid
+                .contains_key(&45)
+        );
+        assert!(
+            !harness
+                .server
+                .state
+                .xwayland
+                .xids_by_object
+                .contains_key(&object)
+        );
+        let destroys = harness
+            .server
+            .state
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(event, ProtocolEvent::SurfaceDestroyed { id: gone } if *gone == id)
+            })
+            .count();
+        assert_eq!(destroys, 1, "one tombstone for one destruction");
+        // A duplicate DestroyNotify is a no-op, not a double destruction.
+        harness.server.state.events.clear();
+        harness.server.state.x11_destroyed_window(window);
+        assert!(
+            !harness
+                .server
+                .state
+                .events
+                .iter()
+                .any(|event| matches!(event, ProtocolEvent::SurfaceDestroyed { .. })),
+            "duplicate destroy publishes nothing"
+        );
+    }
+
+    #[test]
+    fn x11_override_redirect_windows_never_get_scene_records() {
+        let mut harness = KeybindingHarness::new(true);
+        let (_, surface) = roleless_wl_surface(&mut harness);
+        let window = fake_x11_window(46, true, Rectangle::new((5, 5).into(), (60, 20).into()));
+        window.set_wl_surface_offline(Some(surface.clone()));
+        harness
+            .server
+            .state
+            .x11_new_override_redirect_window(window.clone());
+        harness
+            .server
+            .state
+            .x11_mapped_override_redirect_window(window.clone());
+        harness
+            .server
+            .state
+            .x11_associate_window(surface.clone(), window.clone());
+        assert!(
+            !harness.server.state.surfaces.contains_key(&surface.id()),
+            "override-redirect windows are recorded, never managed (X-1)"
+        );
+        assert!(
+            harness
+                .server
+                .state
+                .xwayland
+                .override_redirect_windows
+                .contains(&46),
+            "the XID is recorded for diagnostics and cleanup"
+        );
+        assert!(
+            !harness
+                .server
+                .state
+                .xwayland
+                .surfaces_by_xid
+                .contains_key(&46),
+            "no managed association for an override-redirect window"
+        );
+    }
+
+    #[test]
+    fn x11_focus_target_resolves_to_x11_variant() {
+        let mut harness = KeybindingHarness::new(true);
+        let (surface_id, surface, _window, object) = associate_normal_window(&mut harness, 47);
+        commit_dmabuf(&mut harness, surface_id, 32, 24);
+        assert!(harness.server.state.surfaces[&object].mapped);
+        let target = harness.server.state.seat_focus_target_for(&surface);
+        assert!(
+            matches!(target, SeatFocusTarget::X11(_)),
+            "an X11-managed root focuses through Smithay's X11Surface, \
+             which performs the X half of focus"
+        );
+        assert_eq!(
+            target.owned_surface().as_ref(),
+            Some(&surface),
+            "the wrapper still resolves to the associated wl_surface"
+        );
+        // A plain xdg surface resolves to the Wayland variant.
+        let xdg = test_toplevel_record(&harness).role.wl_surface().clone();
+        assert!(matches!(
+            harness.server.state.seat_focus_target_for(&xdg),
+            SeatFocusTarget::Wayland(_)
+        ));
+    }
+
+    #[test]
+    fn x11_keyboard_focus_marks_record_focused_and_falls_back_after_unmap() {
+        let mut harness = KeybindingHarness::new(true);
+        // Map the default xdg toplevel first so fallback has somewhere to go.
+        let initial_serial = test_toplevel_record(&harness)
+            .required_configure
+            .expect("initial toplevel configure")
+            .into();
+        ack_and_map_test_toplevel(&mut harness, initial_serial);
+        let (surface_id, surface, window, object) = associate_normal_window(&mut harness, 48);
+        commit_dmabuf(&mut harness, surface_id, 32, 24);
+        harness
+            .server
+            .state
+            .arbitrate_keyboard_focus(Some(surface.clone()), false, false);
+        assert!(
+            harness.server.state.surfaces[&object].focused,
+            "focus policy marks the X11 record focused"
+        );
+        assert!(
+            matches!(
+                harness.server.state.keyboard.current_focus(),
+                Some(SeatFocusTarget::X11(_))
+            ),
+            "the seat holds the X11 focus target"
+        );
+        // Unmap: focus falls back to the highest visible managed toplevel.
+        harness.server.state.x11_unmapped_window(window);
+        assert!(
+            !harness
+                .server
+                .state
+                .surfaces
+                .get(&object)
+                .is_some_and(|record| record.focused),
+            "an unmapped X11 window cannot stay focused"
+        );
+        let fallback = focused_surface(harness.server.state.keyboard.current_focus());
+        assert_eq!(
+            fallback.as_ref(),
+            Some(test_toplevel_record(&harness).role.wl_surface()),
+            "fallback focus lands on the remaining xdg toplevel"
+        );
+    }
+
+    #[test]
+    fn x11_selection_access_is_refused_and_send_selection_never_panics() {
+        let mut harness = KeybindingHarness::new(true);
+        assert!(
+            !harness
+                .server
+                .state
+                .x11_allow_selection_access(SelectionTarget::Clipboard),
+            "X-1 refuses clipboard bridging"
+        );
+        assert!(
+            !harness
+                .server
+                .state
+                .x11_allow_selection_access(SelectionTarget::Primary),
+            "X-1 refuses primary-selection bridging"
+        );
+        // The trait default panics here; the X-1 implementation must drop the
+        // fd and carry on.
+        let name = CString::new("cosmix-x11-selection-refusal").unwrap();
+        // SAFETY: name is a valid C string and success returns a new owned fd.
+        let raw = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0);
+        // SAFETY: memfd_create returned this descriptor with ownership.
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        harness.server.state.x11_send_selection(
+            SelectionTarget::Clipboard,
+            "text/plain".into(),
+            fd,
+        );
+        // Inert notifications retain no bridge state.
+        harness
+            .server
+            .state
+            .x11_new_selection(SelectionTarget::Clipboard, vec!["text/plain".into()]);
+        harness
+            .server
+            .state
+            .x11_cleared_selection(SelectionTarget::Clipboard);
+        harness
+            .server
+            .state
+            .x11_randr_primary_output_change(Some("X-fake-output".into()));
+    }
+
+    #[test]
+    fn x11_windows_join_the_normal_band_and_raise_with_wayland_windows() {
+        let mut harness = KeybindingHarness::new(true);
+        let initial_serial = test_toplevel_record(&harness)
+            .required_configure
+            .expect("initial toplevel configure")
+            .into();
+        ack_and_map_test_toplevel(&mut harness, initial_serial);
+        let (surface_id, surface, _window, object) = associate_normal_window(&mut harness, 49);
+        commit_dmabuf(&mut harness, surface_id, 32, 24);
+        let xdg_surface = test_toplevel_record(&harness).role.wl_surface().clone();
+        let x11_z = harness.server.state.surfaces[&object].layout.z;
+        let xdg_z = test_toplevel_record(&harness).layout.z;
+        assert_eq!(x11_z.band, StackBand::Normal);
+        assert_eq!(xdg_z.band, StackBand::Normal);
+        assert!(
+            x11_z > xdg_z,
+            "the later X11 window starts above the earlier xdg toplevel"
+        );
+        // Raising the Wayland window puts it above the X11 window...
+        harness.server.state.raise_surface(&xdg_surface);
+        assert!(
+            test_toplevel_record(&harness).layout.z
+                > harness.server.state.surfaces[&object].layout.z
+        );
+        // ...and raising the X11 window inverts it again, in the same band.
+        harness.server.state.raise_surface(&surface);
+        let x11_z = harness.server.state.surfaces[&object].layout.z;
+        assert_eq!(x11_z.band, StackBand::Normal);
+        assert!(x11_z > test_toplevel_record(&harness).layout.z);
+    }
+
+    #[test]
+    fn x11_maximize_saves_and_restores_normal_geometry() {
+        let mut harness = KeybindingHarness::new(true);
+        let (surface_id, _surface, window, object) = associate_normal_window(&mut harness, 50);
+        commit_dmabuf(&mut harness, surface_id, 64, 48);
+        let before = {
+            let record = &harness.server.state.surfaces[&object];
+            (record.window_origin, record.configured_size)
+        };
+        harness.server.state.request_x11_maximized(&window, true);
+        {
+            let record = &harness.server.state.surfaces[&object];
+            assert!(record.committed_maximized);
+            assert!(record.requested_maximized);
+            assert!(record.normal_restore.is_some(), "restore state is saved");
+            assert_ne!(
+                (record.window_origin, record.configured_size),
+                before,
+                "maximize grants a different geometry"
+            );
+        }
+        // Idempotent: a duplicate request changes nothing.
+        harness.server.state.request_x11_maximized(&window, true);
+        harness.server.state.request_x11_maximized(&window, false);
+        let record = &harness.server.state.surfaces[&object];
+        assert!(!record.committed_maximized);
+        assert_eq!(
+            (record.window_origin, record.configured_size),
+            before,
+            "unmaximize restores the saved normal geometry"
+        );
+    }
+
+    #[test]
+    fn x11_fullscreen_suppresses_ssd_and_restore_reapplies_policy() {
+        let mut harness = KeybindingHarness::new(true);
+        let (surface_id, _surface, window, object) = associate_normal_window(&mut harness, 51);
+        commit_dmabuf(&mut harness, surface_id, 64, 48);
+        assert_eq!(
+            harness.server.state.surfaces[&object].committed_decoration,
+            SceneDecorationMode::ServerSide
+        );
+        let before = {
+            let record = &harness.server.state.surfaces[&object];
+            (record.window_origin, record.configured_size)
+        };
+        harness.server.state.request_x11_fullscreen(&window, true);
+        {
+            let record = &harness.server.state.surfaces[&object];
+            assert_eq!(
+                record.committed_decoration,
+                SceneDecorationMode::ClientSide,
+                "fullscreen suppresses SSD"
+            );
+            assert_eq!(record.window_origin, (0.0, 0.0));
+        }
+        harness.server.state.request_x11_fullscreen(&window, false);
+        let record = &harness.server.state.surfaces[&object];
+        assert_eq!(
+            record.committed_decoration,
+            SceneDecorationMode::ServerSide,
+            "leaving fullscreen reapplies the decoration policy"
+        );
+        assert_eq!((record.window_origin, record.configured_size), before);
+    }
+
+    #[test]
+    fn x11_configure_request_grants_clamped_size_and_keeps_position() {
+        let mut harness = KeybindingHarness::new(true);
+        let (surface_id, _surface, window, object) = associate_normal_window(&mut harness, 52);
+        commit_dmabuf(&mut harness, surface_id, 64, 48);
+        let origin_before = harness.server.state.surfaces[&object].window_origin;
+        // The client asks to jump to (0,0) at an absurd size: position is
+        // refused after first placement, size is clamped to the usable output.
+        harness.server.state.x11_configure_request(
+            window.clone(),
+            Some(0),
+            Some(0),
+            Some(50_000),
+            Some(50_000),
+            None,
+        );
+        let record = &harness.server.state.surfaces[&object];
+        assert_eq!(
+            record.window_origin, origin_before,
+            "client x/y is ignored after first placement"
+        );
+        let usable = harness.server.state.usable_output_rect();
+        assert!(
+            record.configured_size.0 <= usable.width as i32
+                && record.configured_size.1 <= usable.height as i32,
+            "granted size is clamped to the usable output, got {:?}",
+            record.configured_size
+        );
+    }
+
+    #[test]
+    fn x11_title_updates_project_to_scene_and_clear_to_none() {
+        let mut harness = KeybindingHarness::new(true);
+        let (surface_id, _surface, window, object) = associate_normal_window(&mut harness, 53);
+        commit_dmabuf(&mut harness, surface_id, 32, 24);
+        // Fake surfaces cannot carry real X titles (the property cache is
+        // private to Smithay); seed the record and prove the comp-side
+        // reconciliation: an empty X title clears to None and republishes.
+        harness
+            .server
+            .state
+            .surfaces
+            .get_mut(&object)
+            .unwrap()
+            .title = Some(Arc::from("stale x11 title"));
+        harness.server.state.events.clear();
+        harness.server.state.x11_property_notify(
+            window.clone(),
+            smithay::xwayland::xwm::WmWindowProperty::Title,
+        );
+        let record = &harness.server.state.surfaces[&object];
+        assert_eq!(record.title, None, "empty X title clears the scene title");
+        assert!(
+            harness.server.state.events.iter().any(|event| matches!(
+                event,
+                ProtocolEvent::SurfaceRelayout { id, .. } if *id == record.id
+            )),
+            "a title change republishes the scene snapshot"
+        );
+        // Unchanged title: no event.
+        harness.server.state.events.clear();
+        harness
+            .server
+            .state
+            .x11_property_notify(window, smithay::xwayland::xwm::WmWindowProperty::Title);
+        assert!(
+            harness.server.state.events.is_empty(),
+            "an unchanged title publishes nothing"
+        );
+    }
+
+    #[test]
+    fn x11_generation_failure_tears_down_records_and_arms_one_retry() {
+        let mut harness = KeybindingHarness::new(true);
+        let (surface_id, _surface, _window, object) = associate_normal_window(&mut harness, 54);
+        commit_dmabuf(&mut harness, surface_id, 32, 24);
+        let generation = harness.server.state.xwayland.generation;
+        harness.server.state.events.clear();
+        harness
+            .server
+            .state
+            .fail_xwayland_generation(generation, "test failure");
+        assert!(
+            !harness.server.state.surfaces.contains_key(&object),
+            "failure destroys every X11 scene record"
+        );
+        assert!(harness.server.state.xwayland.surfaces_by_xid.is_empty());
+        assert!(
+            matches!(
+                harness.server.state.xwayland.lifecycle,
+                xwayland::XwaylandLifecycle::RetryArmed { .. }
+            ),
+            "one 60s one-shot retry backstop is armed"
+        );
+        // A stale/duplicate failure callback is a no-op.
+        harness
+            .server
+            .state
+            .fail_xwayland_generation(generation, "duplicate");
+        assert!(matches!(
+            harness.server.state.xwayland.lifecycle,
+            xwayland::XwaylandLifecycle::RetryArmed { .. }
+        ));
+        // Orderly shutdown arms nothing and refuses further launches.
+        harness.server.state.shutdown_xwayland();
+        assert!(matches!(
+            harness.server.state.xwayland.lifecycle,
+            xwayland::XwaylandLifecycle::Failed
+        ));
+        harness.server.state.start_xwayland();
+        assert!(
+            matches!(
+                harness.server.state.xwayland.lifecycle,
+                xwayland::XwaylandLifecycle::Failed
+            ),
+            "shutdown refuses new launches"
+        );
+    }
+
+    #[test]
+    fn x11_pending_window_default_is_inert() {
+        let pending = PendingX11Window::default();
+        assert!(!pending.phase.eligible());
+        assert!(pending.granted_geometry.is_none());
+    }
 }
