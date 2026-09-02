@@ -35926,6 +35926,16 @@ mod x11 {
             clamp_x11_content_size((1, 1), None, None, fallback, usable),
             fallback
         );
+        // Degeneracy is per-axis: a 1000×1 request keeps its legitimate
+        // width; only the height falls back.
+        assert_eq!(
+            clamp_x11_content_size((1000, 1), None, None, fallback, usable),
+            (1000, fallback.1)
+        );
+        assert_eq!(
+            clamp_x11_content_size((0, 500), None, None, fallback, usable),
+            (fallback.0, 500)
+        );
         // Hints bound the request from both sides.
         assert_eq!(
             clamp_x11_content_size((300, 200), Some((400, 300)), None, fallback, usable),
@@ -36488,9 +36498,64 @@ mod x11 {
 
     #[test]
     fn x11_generation_failure_tears_down_records_and_arms_one_retry() {
+        // `start_xwayland` is compiled out under test, so without fabrication
+        // every teardown in this suite would run the `Inert => {}` arm and
+        // the real teardown branches would be executed by no test at all.
+        // Fabricate a live `Starting` lifecycle: a real calloop token (dummy
+        // timer source on the real loop), a real Wayland client, and a
+        // descriptor file on disk. The `Ready` arm differs from `Starting`
+        // only by the stability-timer removal and the wm drain, and a real
+        // `X11Wm` is unconstructible offline — that half stays with the live
+        // gate.
         let mut harness = KeybindingHarness::new(true);
         let (surface_id, _surface, _window, object) = associate_normal_window(&mut harness, 54);
         commit_dmabuf(&mut harness, surface_id, 32, 24);
+        // Map the default xdg toplevel so an unconditional focus fallback
+        // would have somewhere to steal focus to, then park focus on None:
+        // the teardown must not invent a focus for a generation that held
+        // none.
+        let initial_serial = test_toplevel_record(&harness)
+            .required_configure
+            .expect("initial toplevel configure")
+            .into();
+        ack_and_map_test_toplevel(&mut harness, initial_serial);
+        harness
+            .server
+            .state
+            .arbitrate_keyboard_focus(None, false, true);
+        assert!(
+            harness.server.state.keyboard.current_focus().is_none(),
+            "precondition: no keyboard focus held"
+        );
+        let token = harness
+            .server
+            .state
+            .capture_loop_handle
+            .insert_source(
+                Timer::from_duration(Duration::from_secs(3600)),
+                move |_, (), _state: &mut WaylandState| TimeoutAction::Drop,
+            )
+            .expect("insert dummy XWayland source stand-in");
+        let (xwayland_side, server_stream) =
+            UnixStream::pair().expect("fabricated Xwayland client socket pair");
+        let xclient_state = Arc::new(WaylandClientState::new(
+            harness.server.state.client_disconnect_sender.clone(),
+        ));
+        let client = harness
+            .server
+            .state
+            .display_handle
+            .insert_client(server_stream, xclient_state.clone())
+            .expect("register fabricated Xwayland client");
+        let descriptor = env::temp_dir().join(format!(
+            "cosmix-comp-test-{}.xwayland.env",
+            std::process::id()
+        ));
+        std::fs::write(&descriptor, "DISPLAY=:99\nGENERATION=1\n")
+            .expect("write fabricated descriptor");
+        harness.server.state.xwayland.descriptor_path = Some(descriptor.clone());
+        harness.server.state.xwayland.lifecycle =
+            xwayland::XwaylandLifecycle::Starting { token, client };
         let generation = harness.server.state.xwayland.generation;
         harness.server.state.events.clear();
         harness
@@ -36503,12 +36568,46 @@ mod x11 {
         );
         assert!(harness.server.state.xwayland.surfaces_by_xid.is_empty());
         assert!(
+            !descriptor.exists(),
+            "teardown removes the DISPLAY descriptor from disk"
+        );
+        assert!(
+            harness.server.state.xwayland.descriptor_path.is_none(),
+            "teardown forgets the descriptor path"
+        );
+        assert!(
             matches!(
                 harness.server.state.xwayland.lifecycle,
                 xwayland::XwaylandLifecycle::RetryArmed { .. }
             ),
             "one 60s one-shot retry backstop is armed"
         );
+        assert!(
+            harness.server.state.keyboard.current_focus().is_none(),
+            "teardown of a generation that held no focus must not steal one"
+        );
+        // The generation's Wayland client is killed at teardown — this is
+        // what closes the commit-hook route into `xwm_state` by
+        // construction. `kill_client` marks it dead synchronously; the
+        // ClientData callback needs a dispatch to run.
+        let mut killed = false;
+        for _ in 0..EVENT_LOOP_PUMP_LIMIT {
+            harness
+                .server
+                .dispatch_cycle(Some(EVENT_LOOP_PUMP_TIMEOUT))
+                .expect("dispatch fabricated client disconnect");
+            if xclient_state
+                .disconnect_reason
+                .lock()
+                .expect("test disconnect-reason mutex poisoned")
+                .is_some()
+            {
+                killed = true;
+                break;
+            }
+        }
+        assert!(killed, "teardown kills the generation's Wayland client");
+        drop(xwayland_side);
         // A stale/duplicate failure callback is a no-op.
         harness
             .server
@@ -36531,6 +36630,220 @@ mod x11 {
                 xwayland::XwaylandLifecycle::Failed
             ),
             "shutdown refuses new launches"
+        );
+    }
+
+    #[test]
+    fn x11_unmap_and_destroy_of_unfocused_window_steal_no_focus() {
+        // MAJOR-2 regression: the unconditional `arbitrate_keyboard_focus`
+        // fallback re-focused the highest visible toplevel whenever ANY X11
+        // window unmapped or died — even one that never held the keyboard.
+        // With focus deliberately parked on None (user clicked the desktop),
+        // a background X11 window's death must not conjure a focus.
+        let mut harness = KeybindingHarness::new(true);
+        let initial_serial = test_toplevel_record(&harness)
+            .required_configure
+            .expect("initial toplevel configure")
+            .into();
+        ack_and_map_test_toplevel(&mut harness, initial_serial);
+        let (surface_id, _surface, window, object) = associate_normal_window(&mut harness, 55);
+        commit_dmabuf(&mut harness, surface_id, 32, 24);
+        harness
+            .server
+            .state
+            .arbitrate_keyboard_focus(None, false, true);
+        assert!(
+            harness.server.state.keyboard.current_focus().is_none(),
+            "precondition: no keyboard focus held"
+        );
+        harness.server.state.x11_unmapped_window(window.clone());
+        assert!(
+            harness.server.state.keyboard.current_focus().is_none(),
+            "unmap of an unfocused X11 window must not steal focus"
+        );
+        harness.server.state.x11_destroyed_window(window);
+        assert!(
+            harness.server.state.keyboard.current_focus().is_none(),
+            "destroy of an unfocused X11 window must not steal focus"
+        );
+        assert!(
+            !harness.server.state.surfaces.contains_key(&object),
+            "destroy still removes the record"
+        );
+    }
+
+    #[test]
+    fn x11_motif_hints_drive_the_live_decoration_path() {
+        // CANPASS-2: `motif_refuses_server_decorations` is comp's own copy,
+        // dead in production builds — decoration decisions go through
+        // Smithay's `X11Surface::is_decorated()`. This test drives THAT
+        // path, via the vendored offline hints setter, and pins the two
+        // predicates to each other so an inversion in a Smithay bump reds a
+        // test instead of double-decorating Firefox.
+        let mut harness = KeybindingHarness::new(true);
+        let (surface_id, _surface, window, object) = associate_normal_window(&mut harness, 56);
+        commit_dmabuf(&mut harness, surface_id, 32, 24);
+        assert_eq!(
+            harness.server.state.surfaces[&object].committed_decoration,
+            SceneDecorationMode::ServerSide,
+            "no Motif hints: SSD applies"
+        );
+        // Flag set, decorations zero: the client refuses WM decorations.
+        window.set_motif_hints_offline([1 << 1, 0, 0, 0, 0]);
+        assert!(window.is_decorated(), "Smithay reads the refusal");
+        harness.server.state.x11_property_notify(
+            window.clone(),
+            smithay::xwayland::xwm::WmWindowProperty::MotifHints,
+        );
+        assert_eq!(
+            harness.server.state.surfaces[&object].committed_decoration,
+            SceneDecorationMode::ClientSide,
+            "the live path honours the refusal"
+        );
+        // Flag set, decorations non-zero: WM decorations accepted again.
+        window.set_motif_hints_offline([1 << 1, 0, 1, 0, 0]);
+        harness.server.state.x11_property_notify(
+            window.clone(),
+            smithay::xwayland::xwm::WmWindowProperty::MotifHints,
+        );
+        assert_eq!(
+            harness.server.state.surfaces[&object].committed_decoration,
+            SceneDecorationMode::ServerSide,
+            "the live path restores SSD"
+        );
+        // Pin comp's offline copy to the live predicate across the truth
+        // table, so the pure-function test above cannot drift from reality.
+        for (flags, decorations) in [(0, 0), (0, 1), (1 << 1, 0), (1 << 1, 1), (1, 0)] {
+            window.set_motif_hints_offline([flags, 0, decorations, 0, 0]);
+            assert_eq!(
+                motif_refuses_server_decorations(flags, decorations),
+                window.is_decorated(),
+                "comp copy and Smithay disagree at flags={flags} decorations={decorations}"
+            );
+        }
+    }
+
+    #[test]
+    fn x11_reassociation_of_mapped_record_unmaps_loudly_and_keeps_the_grant() {
+        // CANPASS-3: re-associating an already-presented record used to
+        // reset it silently — `mapped = false` with no `SurfaceUnmapped`, so
+        // the renderer kept a ghost entity, and the phase was rebuilt from
+        // `pending_windows` alone, revoking a map grant the client will
+        // never re-request.
+        let mut harness = KeybindingHarness::new(true);
+        let (surface_id, surface, window, object) = associate_normal_window(&mut harness, 57);
+        commit_dmabuf(&mut harness, surface_id, 32, 24);
+        assert!(harness.server.state.surfaces[&object].mapped);
+        harness.server.state.events.clear();
+        harness
+            .server
+            .state
+            .x11_associate_window(surface, window.clone());
+        let record = &harness.server.state.surfaces[&object];
+        assert!(!record.mapped, "re-association withdraws presentation");
+        let id = record.id;
+        assert!(
+            harness
+                .server
+                .state
+                .events
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    ProtocolEvent::SurfaceUnmapped { id: unmapped } if *unmapped == id
+                )),
+            "the renderer is told the entity is withdrawn"
+        );
+        let SurfaceRole::X11(role) = &harness.server.state.surfaces[&object].role else {
+            panic!("re-association keeps the X11 role");
+        };
+        assert!(
+            role.phase.map_requested,
+            "the XID's map grant survives re-association"
+        );
+        assert!(role.phase.eligible(), "the record stays eligible to remap");
+    }
+
+    #[test]
+    fn x11_initial_placement_honours_a_requested_origin_inside_the_output() {
+        // The `xmessage -center` decision: a client that states where it
+        // wants to appear — a creation origin, or explicit x/y in a pre-map
+        // ConfigureRequest — is honoured at INITIAL placement when the
+        // origin lands inside the usable rect. The ignore-client-x/y rule
+        // governs only windows the compositor has already placed (pinned by
+        // `x11_configure_request_grants_clamped_size_and_keeps_position`).
+        let mut harness = KeybindingHarness::new(true);
+        let usable = harness.server.state.usable_output_rect();
+
+        // Creation origin inside the usable rect (window created centred).
+        let centred_origin = (
+            (usable.x + usable.width / 3.0) as i32,
+            (usable.y + usable.height / 3.0) as i32,
+        );
+        let (surface_id, _surface, _window, object) = {
+            let (surface_id, surface) = roleless_wl_surface(&mut harness);
+            let window = fake_x11_window(
+                60,
+                false,
+                Rectangle::new(centred_origin.into(), (200, 150).into()),
+            );
+            window.set_wl_surface_offline(Some(surface.clone()));
+            harness.server.state.x11_new_window(window.clone());
+            harness.server.state.x11_map_window_request(window.clone());
+            harness
+                .server
+                .state
+                .x11_associate_window(surface.clone(), window);
+            let object = surface.id();
+            (surface_id, surface, (), object)
+        };
+        commit_dmabuf(&mut harness, surface_id, 32, 24);
+        let record = &harness.server.state.surfaces[&object];
+        assert_eq!(
+            record.window_origin,
+            (centred_origin.0 as f32, centred_origin.1 as f32),
+            "a stated creation origin inside the usable rect is honoured"
+        );
+
+        // Explicit x/y in a pre-map ConfigureRequest.
+        let requested = (
+            (usable.x + usable.width / 2.0) as i32,
+            (usable.y + usable.height / 2.0) as i32,
+        );
+        let window = fake_x11_window(61, false, Rectangle::new((0, 0).into(), (200, 150).into()));
+        harness.server.state.x11_new_window(window.clone());
+        harness.server.state.x11_configure_request(
+            window.clone(),
+            Some(requested.0),
+            Some(requested.1),
+            Some(200),
+            Some(150),
+            None,
+        );
+        let granted = harness.server.state.xwayland.pending_windows[&window.window_id()]
+            .granted_geometry
+            .expect("pre-map configure grants a geometry");
+        assert_eq!(
+            (granted.loc.x, granted.loc.y),
+            requested,
+            "explicit pre-map x/y inside the usable rect is honoured"
+        );
+
+        // An origin outside the usable rect cascades instead.
+        let outside = fake_x11_window(
+            62,
+            false,
+            Rectangle::new((-5000, -5000).into(), (200, 150).into()),
+        );
+        harness.server.state.x11_new_window(outside.clone());
+        harness.server.state.x11_map_window_request(outside.clone());
+        let granted = harness.server.state.xwayland.pending_windows[&outside.window_id()]
+            .granted_geometry
+            .expect("map grants a geometry");
+        assert!(
+            (granted.loc.x as f32) >= usable.x && (granted.loc.y as f32) >= usable.y,
+            "an off-screen requested origin falls back to the cascade, got {:?}",
+            granted.loc
         );
     }
 
