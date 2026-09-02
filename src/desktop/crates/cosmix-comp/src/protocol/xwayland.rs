@@ -339,6 +339,9 @@ fn xwayland_enabled_persist_path() -> PathBuf {
 /// propagated: the in-memory value and the changed event already happened,
 /// and refusing the set for an I/O error would leave the operator with no
 /// structured channel at all — the env override remains the last resort.
+// Dead in test builds by design: the sole caller (the props set) cfg-gates
+// the persist out so the offline suite never writes the real etc tree.
+#[cfg_attr(test, allow(dead_code))]
 #[cfg(feature = "bus")]
 pub(super) fn persist_xwayland_enabled(value: bool) {
     let path = xwayland_enabled_persist_path();
