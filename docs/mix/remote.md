@@ -271,6 +271,16 @@ Runs Mix **source** on a remote node with zero quoting pain. It ships `source` o
 Start with the [headline `ssh_mix` + heredoc pattern](#headline-idiom-ssh_mix--heredoc)
 above. This section supplies the remaining option and decoding contract.
 
+> **`mix lint` reads the body (0.69.0).** Because `source` is Mix source,
+> lint parses it when it is a **string literal** and reports its diagnostics
+> against your file, prefixed `[inside ssh_mix body]`, at mapped line numbers.
+> A body it cannot read — a variable, a concatenation, an interpolated string,
+> a `read_file`, or a literal that does not parse — is reported as
+> **`MIX-D3012`** rather than passing silently. Prefer a plain single-quoted
+> literal and the [`bindings`](#options-map) option over interpolation: it is
+> both safer (no injection through string building) and the only form lint can
+> check. See [lint](lint.md#remote-bodies--lint-sees-inside-ssh_mix-0690).
+
 ```mix
 $r = ssh_mix("node1",
              "print(data_encode({host: hostname(), kernel: trim(run(\"uname -r\"))}))",

@@ -45,6 +45,7 @@ in their own summary field, and **never** gating. Current D-codes:
 | `MIX-D3001`–`D3005` | the five pattern-first legacy names `regex_match regex_find regex_replace regex_split grep` — use the subject-first `re_match re_find re_replace re_split grep_lines`. These stay **notes** for now: their promotion to warnings was deferred out of A.1 because the inventory still reads 585 call sites across 202 files, and the migration is an argument swap (pattern-first → subject-first), not a rename. The legacy names are deleted in release B |
 | ~~`MIX-D3006`~~ | **RETIRED in 0.68.0.** Watch note for the map-binding flip, which has landed: a two-variable loop over a MAP now binds (key, value). Code permanently spent, never reused |
 | ~~`MIX-D3007`~~ | **RETIRED in 0.68.0.** Watch note for the equality flip, which has landed: `==`/`!=` with a map or list on **both** sides now raises `TYPE_ERROR` naming `deep_eq`. The shipped rule is narrower than this note's "either operand" wording — a collection compared to a *scalar* still answers, so `$m[$k] == nil` keeps working. Code permanently spent, never reused |
+| `MIX-D3012` | an **`ssh_mix` body that could not be analysed** (0.69.0) — a non-literal second argument (a variable, a concatenation, an interpolated string, a `read_file`), or a literal that does not parse as Mix. Says so explicitly rather than passing silently, because an unreadable body counted as clean is exactly how an inventory reads zero while live sites exist |
 | `MIX-D3008`–`D3011` | the REXX-style `pos lastpos byte_pos byte_lastpos` family, declared legacy — with a sharper message when composed as `substr(.., pos(..))` in one expression (the 1-based/0-based off-by-one). These stay notes until their own fleet count reads zero; they are NOT deleted in release B |
 
 Member-call spellings are covered too: a builtin-named `.name(` desugars
@@ -164,6 +165,45 @@ carry one — the assignment-chain error, for instance, points at the offending
 exercise — data, not warnings.
 `strict_data_files` lists inputs validated by the strict-data fallback rather
 than by the script analyzer.
+
+## Remote bodies — lint sees inside `ssh_mix` (0.69.0)
+
+[`ssh_mix(host, source[, opts])`](remote.md) ships its **second argument** to
+a remote `mix -`. That argument is Mix source, and since 0.69.0 lint treats it
+as such: when it is a **string literal** it is parsed and analysed, and its
+diagnostics are reported against the enclosing file with a
+`[inside ssh_mix body]` prefix and the line mapped into the outer file.
+
+```
+deploy_thing.mix:283: MIX-D3001 note: [inside ssh_mix body] `regex_match` is
+  pattern-first legacy: use `re_match(s, pattern)` (subject first)
+```
+
+Before this, a deploy script's entire remote half was one opaque string —
+invisible to lint and, more consequentially, to every **inventory built from
+lint**. That is not a hypothetical: the `MIX-D3006` inventory that gated
+0.68.0's map-binding flip reported *zero* sites for `deploy_vhost.mix`,
+locally and on 27/27 fleet nodes, while line 283 of that file is a
+two-variable loop over a map living inside such a body.
+
+**A body that cannot be analysed says so** — `MIX-D3012`, for a non-literal
+argument (variable, concatenation, interpolation, `read_file`) or a literal
+that does not parse as Mix. This is the rule that matters more than the
+analysis: an unreadable body silently counted as clean is precisely how an
+inventory reads zero while live sites exist.
+
+**Name resolution is suppressed inside the body.** Its free names come from
+`ssh_mix`'s `bindings` option and from the remote's own environment, neither
+visible locally, so `MIX-E1101`-class findings would be pure noise — and a
+linter that cries wolf about remote bodies gets switched off. The enclosing
+file keeps all of its own name checks. Everything else — legacy-name notes,
+arity, the truthiness trap — applies normally, and **errors from inside a
+body gate exactly as they would anywhere else**.
+
+Only `ssh_mix` carries Mix source this way. `run`/`run_argv`/`run_pipeline`
+execute *shell* commands, Mix has no heredoc syntax, there is no
+`source`/`include`/`eval` builtin taking a string, and `--serve` runs a script
+*file* (which lint reaches directly).
 
 ## What lint deliberately does NOT do (v1)
 

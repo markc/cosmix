@@ -93,6 +93,15 @@ pub struct AnalyzerConfig {
     /// Callables declared external (`--allow-function NAME`), e.g.
     /// embedder extensions.
     pub allow_functions: Vec<String>,
+    /// Suppress every undefined-NAME check, as a `source`/`include` does.
+    ///
+    /// Set only for the nested analysis of an `ssh_mix` remote body
+    /// (v0.69.0). That body is a separate program whose free names come
+    /// from `ssh_mix`'s `bindings` option and from the remote's own
+    /// environment — neither visible here — so name resolution against the
+    /// inner file's universe would be pure noise. Reuses the existing
+    /// `dynamic` suppression rather than inventing a second switch.
+    pub suppress_name_checks: bool,
 }
 
 /// The result of one file's analysis.
@@ -380,6 +389,12 @@ pub fn analyze(stmts: &[Stmt], file: Option<&str>, cfg: &AnalyzerConfig) -> Anal
     );
     check_recurring_silent_bugs(stmts, &ctx, &mut a);
     check_release_transition_advisories(stmts, &ctx, &mut a);
+    // Guarded against unbounded recursion: a remote body may itself contain
+    // an `ssh_mix`, and nothing stops that nesting from being circular
+    // through a shared literal.
+    if !cfg.suppress_name_checks {
+        check_ssh_mix_bodies(stmts, &ctx, &mut a, cfg);
+    }
     collect_capabilities(stmts, &mut a);
     a
 }
@@ -441,7 +456,8 @@ impl FileContext {
         known_callables.extend(prelude_function_names().iter().cloned());
         known_callables.extend(cfg.allow_functions.iter().cloned());
 
-        let (dynamic, _) = has_dynamic_include(stmts);
+        let (has_include, _) = has_dynamic_include(stmts);
+        let dynamic = has_include || cfg.suppress_name_checks;
         FileContext {
             file: file.map(str::to_string),
             top_level_names,
@@ -1491,6 +1507,145 @@ fn check_release_transition_advisories(stmts: &[Stmt], ctx: &FileContext, a: &mu
     for stmt in stmts {
         advisory_stmt(stmt, ctx, a, &mut composed);
     }
+}
+
+/// Lint the Mix source an `ssh_mix` call ships to a remote (v0.69.0).
+///
+/// `ssh_mix(host, source[, opts])` writes its SECOND argument to a remote
+/// `mix -`. That argument is Mix source, but to every prior version of this
+/// analyzer it was an opaque string literal — so a deploy script's entire
+/// remote half was invisible to `mix lint` and to every inventory built
+/// from it.
+///
+/// That is not a theoretical gap. `deploy_vhost.mix:283` is a two-variable
+/// loop over a MAP living inside such a body, and the MIX-D3006 inventory
+/// that gated the 0.68.0 map-binding flip reported ZERO sites in that file,
+/// locally and on 27/27 fleet nodes. The flip happened to fix that line
+/// rather than break it, but the gate was measured over a corpus that
+/// structurally excluded exactly the code deploy scripts verify with.
+///
+/// TWO RULES, and the second matters more than the first:
+///
+/// 1. A **literal** body is parsed and analysed, and its diagnostics are
+///    reported against the enclosing file at mapped line numbers.
+/// 2. A **non-literal** body — a variable, a concatenation, a `read_file`
+///    — cannot be analysed, and is REPORTED as unanalysable (MIX-D3012)
+///    rather than passing silently. An invisible gap counted as clean is
+///    what produced the 0.68.0 near-miss; a visible one is worth more than
+///    the analysis it replaces.
+///
+/// Name resolution is suppressed inside the body (`suppress_name_checks`),
+/// because its free names come from `ssh_mix`'s `bindings` option and the
+/// remote environment. Neither is visible here, so every undefined-name
+/// finding would be noise — and a linter that cries wolf about remote
+/// bodies gets switched off.
+fn check_ssh_mix_bodies(
+    stmts: &[Stmt],
+    ctx: &FileContext,
+    a: &mut Analysis,
+    cfg: &AnalyzerConfig,
+) {
+    fn visit_expr(
+        expr: &Expr,
+        line: usize,
+        ctx: &FileContext,
+        a: &mut Analysis,
+        cfg: &AnalyzerConfig,
+    ) {
+        if let Expr::FunctionCall { name, args } = expr
+            && name == "ssh_mix"
+        {
+            match args.get(1) {
+                Some(Expr::StringLiteral(src) | Expr::EscapedQuoteStringLiteral(src)) => {
+                    analyse_remote_body(src, line, ctx, a, cfg);
+                }
+                // An INTERPOLATED body is only partly knowable: the literal
+                // segments are Mix source but the substitutions are not, so
+                // parsing it would report errors that are artefacts of the
+                // holes. Treated as unanalysable, like any other non-literal.
+                Some(_) => a.diagnostics.push(diag(
+                    ctx,
+                    "MIX-D3012",
+                    Severity::Note,
+                    line,
+                    "ssh_mix body is not a string literal — its Mix source cannot be \
+                     analysed, so lint findings and inventory counts EXCLUDE it"
+                        .to_string(),
+                    Some(
+                        "pass the remote program as a plain single-quoted literal to make \
+                         it lintable; use the `bindings` option instead of interpolation \
+                         to inject values"
+                            .to_string(),
+                    ),
+                )),
+                None => {}
+            }
+        }
+    }
+
+    for stmt in stmts {
+        let line = stmt.line;
+        walk_stmt_exprs(stmt, &mut |expr| visit_expr(expr, line, ctx, a, cfg));
+    }
+}
+
+/// Parse + analyse one literal remote body and fold its diagnostics into
+/// the enclosing file's, with lines mapped.
+///
+/// LINE MAPPING: inner line N reports at `stmt_line + N - 1`. That is exact
+/// for the universal shape — `$x = ssh_mix($HOST, '` with the opening quote
+/// on the statement's first line, so the literal's line 1 IS the statement
+/// line. A body opened further down a multi-line call reports offset by the
+/// same amount for every diagnostic, which still points into the right
+/// region; nothing here silently claims a precision it does not have, and
+/// the alternative (threading source text and re-locating the literal)
+/// buys exactness only for a shape that does not occur.
+fn analyse_remote_body(
+    src: &str,
+    stmt_line: usize,
+    ctx: &FileContext,
+    a: &mut Analysis,
+    cfg: &AnalyzerConfig,
+) {
+    let mut lexer = crate::lexer::Lexer::new(src);
+    let tokens = match lexer.tokenize() {
+        Ok(t) => t,
+        // A body that does not LEX is reported, not swallowed: the remote
+        // would fail the same way, and silence here is the failure mode
+        // this whole pass exists to remove.
+        Err(e) => return push_unparsable(a, ctx, stmt_line, &e.to_string()),
+    };
+    let inner = match crate::parser::Parser::new(tokens, src).parse_program() {
+        Ok(s) => s,
+        Err(e) => return push_unparsable(a, ctx, stmt_line, &e.to_string()),
+    };
+    let inner_cfg = AnalyzerConfig {
+        allow_globals: cfg.allow_globals.clone(),
+        allow_functions: cfg.allow_functions.clone(),
+        suppress_name_checks: true,
+    };
+    let nested = analyze(&inner, None, &inner_cfg);
+    for mut d in nested.diagnostics {
+        d.file.clone_from(&ctx.file);
+        d.line = Some(stmt_line + d.line.unwrap_or(1).saturating_sub(1));
+        d.message = format!("[inside ssh_mix body] {}", d.message);
+        a.diagnostics.push(d);
+    }
+}
+
+fn push_unparsable(a: &mut Analysis, ctx: &FileContext, line: usize, why: &str) {
+    a.diagnostics.push(diag(
+        ctx,
+        "MIX-D3012",
+        Severity::Note,
+        line,
+        format!("ssh_mix body did not parse as Mix, so it was NOT analysed: {why}"),
+        Some(
+            "if this is deliberately not Mix source, the call is shipping it to \
+             `mix -` on the remote and it will fail there too"
+                .to_string(),
+        ),
+    ));
 }
 
 /// Builtins whose "not found" sentinel is `-1` and whose "found at the

@@ -469,6 +469,8 @@ fn allow_flags_respected() {
     let cfg = AnalyzerConfig {
         allow_globals: vec!["EXTERNAL".to_string()],
         allow_functions: vec!["embedder_fn".to_string()],
+        // Only the nested ssh_mix-body analysis sets this (v0.69.0).
+        ..AnalyzerConfig::default()
     };
     assert_eq!(lint_cfg("print($EXTERNAL)\nembedder_fn(1)\n", &cfg), vec![]);
 }
