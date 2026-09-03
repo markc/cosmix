@@ -88,7 +88,23 @@ pub fn classify_input_fns(
     };
     let trimmed = logical.trim();
 
-    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("--") {
+    // EVERY line must be blank-or-comment, not just the first. `starts_with`
+    // is right for a REPL line — the input IS one line — but this classifier
+    // also receives whole `-c` programs, and a program whose FIRST line is a
+    // comment was classified Empty and silently discarded with exit 0:
+    //
+    //     mix -c '-- set up
+    //     print("RAN")'      ->  no output, exit 0
+    //
+    // Comments are the normal way to open a generated script, so this hit the
+    // machine-authored case squarely. Silent discard reporting success is the
+    // worst failure shape available: a script that never ran looks exactly like
+    // one that ran and did nothing.
+    let all_comment_or_blank = trimmed.lines().all(|l| {
+        let t = l.trim();
+        t.is_empty() || t.starts_with('#') || t.starts_with("--")
+    });
+    if trimmed.is_empty() || all_comment_or_blank {
         return InputKind::Empty;
     }
 

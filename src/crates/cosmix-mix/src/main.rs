@@ -452,8 +452,26 @@ fn run_command_line(code: &str, load_rc: bool, script_args: &[String], no_prelud
         // Genuinely-empty input (blank line / `#` or `--` comment) is a clean
         // no-op. Any OTHER input the classifier collapses to Empty is a parse
         // error it has already printed to stderr — that must NOT exit 0.
+        //
+        // EVERY line must be blank-or-comment, not just the first. The original
+        // `trimmed.starts_with("--")` is correct for a REPL line, where the
+        // input IS one line — but `-c` carries whole programs, and a program
+        // whose FIRST line is a comment was silently discarded and reported
+        // success:
+        //
+        //     mix -c '-- set up
+        //     print("RAN")'      ->  no output, exit 0
+        //
+        // Silent discard with exit 0 is the worst available failure mode: a
+        // script that never ran is indistinguishable from one that did nothing.
+        // Comments are the normal way to open a generated script, so this hit
+        // exactly the machine-authored case.
         let trimmed = code.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("--") {
+        let all_comment_or_blank = trimmed.lines().all(|l| {
+            let t = l.trim();
+            t.is_empty() || t.starts_with('#') || t.starts_with("--")
+        });
+        if trimmed.is_empty() || all_comment_or_blank {
             return 0;
         }
 
