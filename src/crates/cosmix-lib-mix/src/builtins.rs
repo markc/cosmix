@@ -10566,9 +10566,36 @@ fn builtin_json_encode(args: Vec<Value>) -> MixResult<Option<Value>> {
 
 #[cfg(feature = "regex")]
 fn compile_regex(pattern: &str) -> MixResult<regex::Regex> {
-    regex::Regex::new(pattern).map_err(|e| MixError::RuntimeError {
-        span: None,
-        msg: format!("invalid regex '{}': {}", pattern, e),
+    regex::Regex::new(pattern).map_err(|e| {
+        // A swapped call (the SUBJECT passed as the pattern) hands a whole
+        // document to the compiler, and both the echo and the regex
+        // crate's own report then contain the full text — a 9 KB roster
+        // printed ~280 lines before the actual complaint (2026-09-03).
+        // For a long or multi-line pattern: truncate the echo, keep only
+        // the crate's final "error: …" line (never contains the input),
+        // and name the usual cause. Short patterns keep the full report.
+        const MAX_ECHO: usize = 80;
+        let suspicious = pattern.chars().count() > MAX_ECHO || pattern.contains('\n');
+        let msg = if suspicious {
+            let head: String = pattern.chars().take(MAX_ECHO).collect();
+            let head = head.replace('\n', "\\n");
+            let err = e.to_string();
+            let last = err
+                .lines()
+                .rev()
+                .find(|l| l.starts_with("error:"))
+                .unwrap_or("regex parse error");
+            format!(
+                "invalid regex '{head}…' ({} chars, truncated): {last}\n  \
+                 (argument 1 is the PATTERN — the subject string comes after \
+                 it; a swapped argument order is the usual cause of a huge \
+                 pattern: see mix man regex)",
+                pattern.chars().count()
+            )
+        } else {
+            format!("invalid regex '{pattern}': {e}")
+        };
+        MixError::RuntimeError { span: None, msg }
     })
 }
 

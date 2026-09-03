@@ -337,6 +337,23 @@ Runtime error at line 1: invalid regex '[unterminated': regex parse error:
 error: unclosed character class
 ```
 
+**Long or multi-line patterns get a truncated diagnostic** (0.63.0). A
+pattern over 80 characters — almost always a **swapped call** that passed
+the *subject* as argument 1 — is echoed truncated with only the regex
+engine's final `error:` line, plus a hint naming the usual cause, instead
+of printing the whole document back:
+
+```text
+Runtime error at line 2: invalid regex 'line of roster text line of …' (8020 chars, truncated): error: repetition quantifier expects a valid decimal
+  (argument 1 is the PATTERN — the subject string comes after it; a swapped
+  argument order is the usual cause of a huge pattern: see mix man regex)
+```
+
+Remember the order: **pattern first, subject second** — a swapped call
+where both compile is *silent* (`regex_match($text, $pattern)` is just a
+"no"), which is why the argument order is worth pinning in muscle memory
+now and why subject-first `re_*` names are planned.
+
 Wrap user-supplied patterns in `try`/`catch` so a bad pattern doesn't abort the
 script ([errors](errors.md)):
 

@@ -131,3 +131,23 @@ async fn hoisted_def_emits_definition_warnings_exactly_once() {
         "exactly one definition-time warning; got: {e}"
     );
 }
+
+#[tokio::test]
+async fn local_def_shadows_prelude_from_the_first_statement() {
+    // Hoisting makes a script-local fn shadow a same-named prelude fn
+    // even at call sites ABOVE the definition — the call site's meaning
+    // no longer depends on its position (documented in functions.md).
+    let source =
+        "print(len(lines(\"a\\nb\")))\nfn lines($s)\n  return [\"shadowed\"]\nend\n";
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize().expect("lex");
+    let mut parser = Parser::new(tokens, source);
+    let stmts = parser.parse_program().expect("parse");
+    let stdout = SharedBuf::new();
+    let stderr = SharedBuf::new();
+    let mut eval = Evaluator::with_output(Box::new(stdout.clone()), Box::new(stderr.clone()));
+    eval.load_prelude().await;
+    eval.execute(&stmts).await.expect("eval");
+    // Prelude lines("a\nb") would give 2; the shadowing def gives 1.
+    assert_eq!(stdout.to_string_lossy(), "1\n");
+}

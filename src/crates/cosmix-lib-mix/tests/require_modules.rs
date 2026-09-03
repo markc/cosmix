@@ -650,3 +650,42 @@ async fn require_error_message_for_missing_file() {
     assert!(err.contains("require: "), "{err}");
     assert!(err.contains("absent.mix"), "{err}");
 }
+
+// --- Top-level fn hoisting in module bodies (0.63.0) ---
+
+#[tokio::test]
+async fn module_top_level_forward_call_works() {
+    // The same file must forward-call identically whether run directly
+    // or require()d: entry-point-first, helpers-last is legal in both.
+    let dir = test_dir("hoist_forward");
+    write_module(
+        &dir,
+        "mod.mix",
+        "$out = helper(1)\nfn helper($x)\n  return $x + 41\nend\n",
+    );
+    let out = run_in_dir(&dir, "$m = require(\"mod.mix\")\nprint($m.out)\n")
+        .await
+        .unwrap();
+    assert_eq!(out, "42\n");
+}
+
+#[tokio::test]
+async fn module_fn_shadowing_prelude_name_still_exports() {
+    // The hoist runs AFTER the prelude-identity snapshot, so a module fn
+    // redefining a prelude name is a fresh Rc and must still auto-export.
+    let dir = test_dir("hoist_prelude_shadow");
+    write_module(
+        &dir,
+        "mod.mix",
+        "fn lines($s)\n  return [\"shadowed\"]\nend\n",
+    );
+    let out = run_in_dir_with(
+        &dir,
+        "$m = require(\"mod.mix\")\nprint(len($m.lines(\"a\\nb\")))\n",
+        true,
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, "1\n");
+}

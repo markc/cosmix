@@ -618,5 +618,5 @@ Inside a [function](functions.md) this is subtler: a loop var (and `for each` el
 
 ```text
 $ mix what for
-for: Numeric loop: for $i = 1 to 10 ... end; or for each $x in LIST ... end
+for: Numeric loop: for $i = 1 to 10 ... end; iteration: for $x in LIST ... end ('each' optional: for each $x in LIST)
 ```

@@ -76,10 +76,19 @@ construction: a Mix `fn` [captures nothing](#the-binding-model--by-value-local-w
 from the enclosing scope, so an early binding cannot close over a
 not-yet-defined value.
 
+The hoist applies to every **invocation root**: a script run directly, a
+[`require`](#grouping-functions-across-files--require-vs-include-vs-source)d
+module's top level (the same file forward-calls identically either way), a
+`source`d file, and a serve-mode `on` handler body — in a handler the
+binding happens on entry, so a top-level `fn` below an early `return` is
+still defined.
+
 Redefinition: with two same-named top-level definitions, a call **before
 both** sees the *last* one (the hoist binds them in order); code *between*
 them still sees the earlier one, exactly as before 0.63.0 — the definition
-statement re-binds when reached.
+statement re-binds when reached. This includes **prelude names**: a script
+that defines its own `fn lines(…)` shadows the prelude's `lines` from the
+first statement, even at call sites above the definition.
 
 *Mutual* recursion no longer needs both definitions to precede the first
 call — calls resolve at call-time, and hoisting has already bound every

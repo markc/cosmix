@@ -9402,9 +9402,6 @@ impl Evaluator {
             .collect()
     }
 
-    /// Emit the dead-push-into-a-by-value-parameter warning (see
-    /// [`dead_param_push_sites`]) to stderr, at most once per unique
-    /// message per program run. Called when a function is defined.
     /// Construct the [`MixFunction`] for a `fn`/`function` definition —
     /// the static analyses (sync prefix, self-recursion shape, fib
     /// bytecode) plus the record itself. Shared by the in-flow
@@ -9433,6 +9430,9 @@ impl Evaluator {
         }
     }
 
+    /// Emit the dead-push-into-a-by-value-parameter warning (see
+    /// [`dead_param_push_sites`]) to stderr, at most once per unique
+    /// message per program run. Called when a function is defined.
     fn warn_dead_param_pushes(&self, fn_name: &str, params: &[Param], body: &FunctionBody) {
         let sites = Self::dead_param_push_sites(params, body);
         if sites.is_empty() {
@@ -13311,6 +13311,19 @@ impl Evaluator {
                     if let Some(f) = self.scope.get_function_owned(&n) {
                         prelude_fns.insert(n, f);
                     }
+                }
+            }
+            // Top-level fn hoisting applies to a module body exactly as
+            // to a directly-run script — same file, same forward-call
+            // semantics either way (the body runs via execute_block, so
+            // execute_inner's own pre-pass never fires here). AFTER the
+            // prelude snapshot above: a module fn shadowing a prelude
+            // name must be bound as a fresh Rc so auto-export still
+            // includes it.
+            for stmt in &stmts {
+                if let StmtKind::FunctionDef { name, params, body } = &stmt.kind {
+                    let f = self.build_function(name, params, body);
+                    self.scope.define_function(f);
                 }
             }
             // Non-unwrapping executor: ONLY an explicit top-level

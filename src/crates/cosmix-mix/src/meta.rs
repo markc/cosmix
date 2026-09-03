@@ -405,7 +405,7 @@ const KEYWORD_DESCRIPTIONS: &[(&str, &str)] = &[
     ),
     (
         "for",
-        "Numeric loop: for $i = 1 to 10 ... end; or for each $x in LIST ... end",
+        "Numeric loop: for $i = 1 to 10 ... end; iteration: for $x in LIST ... end ('each' optional: for each $x in LIST)",
     ),
     ("in", "Iterator source in for-each loops"),
     ("while", "Conditional loop: while EXPR ... end"),
