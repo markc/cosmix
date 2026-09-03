@@ -1,0 +1,119 @@
+-- The hash_* family after v0.66.0: hash_md5 / hash_sha1 added, and the
+-- {raw:true} option that USED TO BE SILENTLY IGNORED.
+--
+-- The digests below are the published test vectors for "abc" and for
+-- "The quick brown fox jumps over the lazy dog", so this test does not
+-- merely check Mix against itself — it checks Mix against the standards.
+-- (They also match md5sum/sha1sum/sha256sum on this machine; that
+-- comparison is in the release notes, not here, because a test may not
+-- depend on coreutils being installed.)
+
+$abc = "abc"
+print(hash_md5($abc))
+print(hash_sha1($abc))
+print(hash_sha256($abc))
+
+$fox = "The quick brown fox jumps over the lazy dog"
+print(hash_md5($fox))
+print(hash_sha1($fox))
+
+-- {raw: true} returns the digest as BYTES. Before 0.66.0 the option was
+-- accepted and discarded, so this call returned the hex string and the
+-- caller was told nothing — the type assertion is the regression guard.
+$raw = hash_sha256($abc, {raw: true})
+print(type($raw) .. " " .. bytes_len($raw))
+
+-- ...and the raw bytes are the SAME digest, not a different encoding.
+print(bytes_to_hex($raw) == hash_sha256($abc))
+
+-- Every algorithm's raw digest is its standard length.
+print(bytes_len(hash_md5($abc, {raw: true})) .. " " ..
+  bytes_len(hash_sha1($abc, {raw: true})) .. " " ..
+  bytes_len(hash_sha256($abc, {raw: true})) .. " " ..
+  bytes_len(hash_blake3($abc, {raw: true})) .. " " ..
+  bytes_len(hmac_sha256("key", $abc, {raw: true})))
+
+-- A falsy or absent option is the hex string, as before.
+print(type(hash_sha256($abc, {raw: false})) .. " " ..
+  type(hash_sha256($abc, nil)) .. " " ..
+  type(hash_sha256($abc)))
+
+-- hmac_sha256's raw MAC agrees with its hex, and can be compared with
+-- constant_time_eq without a hex round trip in between.
+print(bytes_to_hex(hmac_sha256("key", $abc, {raw: true})) == hmac_sha256("key", $abc))
+print(constant_time_eq(hmac_sha256("key", $abc, {raw: true}), hmac_sha256("key", $abc, {raw: true})))
+
+-- ...and the 3-argument shape is checked against an EXTERNAL vector, not
+-- only against its own 2-argument self: RFC 4231 test case 2.
+print(bytes_to_hex(hmac_sha256("Jefe", "what do ya want for nothing?", {raw: true})))
+
+-- bytes and buffer inputs hash their PAYLOAD, never the "<bytes:N>"
+-- placeholder — the same digest as the equivalent string.
+print(hash_md5(string_to_bytes($abc)) == hash_md5($abc))
+print(hash_sha1(buffer($abc)) == hash_sha1($abc))
+
+-- The silent-ignore bug is fixed in both directions: an unknown option key
+-- and a non-map option now raise instead of being discarded.
+try
+  hash_sha256($abc, {rawr: true})
+catch $msg, $err
+  print($err.code .. " " .. $msg)
+end
+try
+  hash_md5($abc, "junk")
+catch $msg, $err
+  print($err.code)
+end
+try
+  hash_sha1($abc, {raw: true}, "surplus")
+catch $msg, $err
+  print($msg)
+end
+-- `raw` selects the RETURN TYPE, so it is a STRICT bool: a truthy non-bool
+-- is refused rather than guessed. (bytes_to_string's `lossy` takes is_truthy;
+-- that flag only picks a decode mode, so it can afford to.)
+try
+  hash_sha256($abc, {raw: "false"})
+catch $msg, $err
+  print($err.code)
+end
+print(type(hash_sha256($abc, {raw: false})) .. " " .. type(hash_sha256($abc, {raw: true})))
+
+-- Options in the ALGO position get a message that names the real mistake,
+-- rather than "unknown algorithm '{raw: true}'".
+try
+  hash_file("/nonexistent", {raw: true})
+catch $msg, $err
+  print($err.code .. " " .. $msg)
+end
+
+-- hash_file's algorithm set is the same one, so a name that works in
+-- memory works on a file. An unknown algorithm names the whole set.
+try
+  hash_file("/nonexistent", "sha512")
+catch $msg, $err
+  print($msg)
+end
+
+-- Expected output:
+-- 900150983cd24fb0d6963f7d28e17f72
+-- a9993e364706816aba3e25717850c26c9cd0d89d
+-- ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+-- 9e107d9d372bb6826bd81d3542a419d6
+-- 2fd4e1c67a2d28fced849ee1bb76e7391b93eb12
+-- bytes 32
+-- true
+-- 16 20 32 32 32
+-- string string string
+-- true
+-- true
+-- 5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843
+-- true
+-- true
+-- OPTION_INVALID hash_sha256(): unknown option 'rawr' (only 'raw' is accepted)
+-- OPTION_INVALID
+-- hash_sha1() expects at most 2 argument(s), got 3
+-- OPTION_INVALID
+-- string bytes
+-- OPTION_INVALID hash_file(): argument 2 is the ALGORITHM ("md5", "sha1", "sha256" or "blake3"), not the options map — write hash_file(path, "sha256", {raw: true})
+-- hash_file: unknown algorithm 'sha512' (expected "md5", "sha1", "sha256" or "blake3")

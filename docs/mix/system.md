@@ -985,14 +985,73 @@ header, or another process's output.
 ```
 uuid()                 random UUID v4 string
 random_password([len]) alphanumeric password (default 16, no O/o, class-diverse)
-hash_sha256(s)         SHA-256 hex digest of a string/bytes value
-hmac_sha256(key, msg)  HMAC-SHA256 (RFC 2104) hex digest — webhook signatures
+hash_sha256(s[, {raw:true}])  SHA-256 digest of a string/bytes/buffer value
+hash_blake3(s[, {raw:true}])  BLAKE3 digest
+hash_md5(s[, {raw:true}])     MD5 digest    -- BROKEN hash, legacy interop only
+hash_sha1(s[, {raw:true}])    SHA-1 digest  -- BROKEN hash, legacy interop only
+hmac_sha256(key, msg[, {raw:true}])  HMAC-SHA256 (RFC 2104) — webhook signatures
 constant_time_eq(a, b) timing-safe equality — compare MACs/secrets with this, not ==
-hash_blake3(s)         BLAKE3 hex digest of a string/bytes value
-hash_file(p[, algo])   streaming hex digest of a FILE (sha256 default, or "blake3")
+hash_file(p[, algo][, {raw:true}])   streaming digest of a FILE
+                       algo: "sha256" (default) "blake3" "md5" "sha1"
+                       (all of the above: lowercase hex, or bytes with raw:true)
 base64_encode(v)       base64 of a string or bytes buffer
 base64_decode(s)       decode base64 -> a bytes buffer
 ```
+
+Every `hash_*` call takes the same trailing options map, and the only option is
+**`{raw: true}`** (v0.66.0): return the digest as raw `bytes` instead of
+lowercase hex. `hash_sha256($x, {raw:true})` is 32 bytes, `hash_md5` 16,
+`hash_sha1` 20, `hash_blake3` 32, and `hmac_sha256` 32 — which lets a MAC be
+compared with `constant_time_eq` without a hex round trip:
+
+```mix
+$mac = hmac_sha256($secret, $payload, {raw: true})
+if constant_time_eq($mac, base64_decode($header)) then
+  print("signature ok")
+end
+```
+
+Before 0.66.0 a second argument was **silently ignored**:
+`hash_sha256("abc", {raw:true})` returned the hex string and said nothing. That
+is fixed, and so is the class of bug behind it — an unknown option key or a
+non-map option now raises `OPTION_INVALID` rather than being discarded.
+
+`raw` is a **strict** boolean, unlike `bytes_to_string`'s `lossy`, which accepts
+any truthy value. The difference is deliberate: `raw` selects the *return type*,
+so `{raw: "false"}` — a string that a config file or an argument might easily
+produce — would hand back bytes and fail somewhere far from the cause.
+`{raw: "false"}` raises; only `true` and `false` are accepted.
+
+### ⚠ MD5 and SHA-1 are broken — legacy interop only
+
+`hash_md5` and `hash_sha1` exist to talk to formats and tools that already chose
+those algorithms: `Content-MD5` headers, mail dedup keys, git object ids, older
+ETags and vendor APIs, and checksums you need to compare against an existing
+`md5sum`/`sha1sum` output. Mix computes them so a script does not have to fork
+coreutils, not because they are fit for anything new.
+
+**They must never carry a security decision.** MD5 has had practical collisions
+since 2004 and SHA-1 since 2017 (SHAttered), so neither can establish that two
+inputs are the same, that a document is unmodified by an adversary, or that a
+signature is valid. For anything of that kind use `hash_sha256` or `hash_blake3`,
+and for authentication `hmac_sha256` with `constant_time_eq`. Note that Mix
+classifies both as capability-`Pure` — that means "touches no host authority",
+which is not the same as "safe"; the sandbox has no opinion about your choice of
+hash.
+
+The digests are the standard ones and interoperate exactly:
+
+```
+$ printf 'The quick brown fox jumps over the lazy dog' > /tmp/fox
+$ mix -c 'print(hash_md5(read_file("/tmp/fox")))'
+9e107d9d372bb6826bd81d3542a419d6
+$ md5sum /tmp/fox
+9e107d9d372bb6826bd81d3542a419d6  /tmp/fox
+```
+
+`hash_file` streams with a fixed 64 KiB working set whatever the file's size, so
+it is the right call for anything large — `hash_sha256(read_file_bytes($p))`
+holds the whole file in memory to compute the same answer.
 
 `uuid()` is a fresh random v4 each call:
 
@@ -1062,8 +1121,10 @@ false
 64 KiB-chunked stream — so a multi-hundred-MB artifact (a release image, a
 rootfs tarball) is digested with bounded memory instead of
 `hash_sha256(read_file(path))` slurping the whole file into a string (which
-also rejects non-UTF-8). `algo` defaults to `"sha256"`; `"blake3"` is the
-other option. The sha256 output is byte-identical to `hash_sha256` over the
+also rejects non-UTF-8). `algo` defaults to `"sha256"`; `"blake3"`, `"md5"` and
+`"sha1"` are the others (the last two added in v0.66.0 — read the warning
+above before reaching for either). It takes the same trailing `{raw: true}`
+as the in-memory family. The sha256 output is byte-identical to `hash_sha256` over the
 same bytes, so it verifies against any `sha256sum`. Capability: **FsRead** (it
 opens a path). This is the factory's "name every release artifact + its
 digest, then sign the manifest" primitive.

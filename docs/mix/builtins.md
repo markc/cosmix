@@ -1,6 +1,6 @@
 # Builtin index
 
-Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.65.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
+Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.66.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
 
 Some builtins are feature-gated on the `cosmix-lib-mix` crate (`json`, `regex`, `toml`, `datetime`, `url`, `crypto`, `http`, `sqlite`, `dkim`, `markdown`, `datastar`) so embedders can pull only what they need — the `mix` binary turns them all on.
 
@@ -273,11 +273,13 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   relative_time   Format timestamp as relative string (e.g. "3 hours ago")
   base64_encode   Encode string as base64
   base64_decode   Decode base64 string
-  hash_blake3     BLAKE3 hash of string, return hex digest
-  hash_sha256     SHA-256 hash of string, return hex digest
-  hmac_sha256     HMAC-SHA256 (RFC 2104) of a message with a secret key, return hex digest — webhook signature verification (Stripe-Signature etc). Accepts string/bytes/buffer for both args (requires crypto feature)
+  hash_blake3     BLAKE3 hash of a string/bytes/buffer → lowercase hex; pass {raw:true} for the raw digest as bytes (v0.66.0)
+  hash_sha256     SHA-256 hash of a string/bytes/buffer → lowercase hex; pass {raw:true} for the raw 32 digest bytes (v0.66.0 — before that a second argument was silently IGNORED)
+  hash_md5        MD5 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (collisions since 2004) — legacy interop only (Content-MD5, mail dedup keys, checksums against existing tools), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)
+  hash_sha1       SHA-1 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (SHAttered, 2017) — legacy interop only (git object ids, older ETags/APIs), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)
+  hmac_sha256     HMAC-SHA256 (RFC 2104) of a message with a secret key → lowercase hex; {raw:true} → the 32 MAC bytes (v0.66.0) — webhook signature verification (Stripe-Signature etc). Accepts string/bytes/buffer for both args (requires crypto feature)
   constant_time_eq Timing-safe equality for secrets/MACs: compares full length with no early exit (plain == leaks a timing oracle). Use for webhook signature comparison. Accepts string/bytes/buffer
-  hash_file       Streaming hex digest of a file: hash_file(path[, "sha256"|"blake3"]) (v0.24.0)
+  hash_file       Streaming digest of a file, fixed 64 KiB working set whatever the size: hash_file(path[, "md5"|"sha1"|"sha256"|"blake3"][, {raw:true}]) → lowercase hex, or bytes with {raw:true}. md5/sha1 added v0.66.0 and are BROKEN hashes for legacy interop only (v0.24.0)
   uuid            Generate a new random UUID v4 string
   dkim_keygen     Generate a DKIM keypair. dkim_keygen("rsa", [bits=2048]) or dkim_keygen("ed25519") → {algorithm, private_pem, public_b64, dns_txt_record}
   http_get        HTTP GET. http_get(url, [headers], [{timeout, ssl_verify, ca_file, ca_pem}] — timeout default 30, 0 disables; ssl_verify default true, false skips TLS cert/hostname checks like curl -k; ca_file/ca_pem ADD a private CA to the default roots — mutually exclusive with each other and with ssl_verify:false, 4 MiB cap, bad PEM raises HTTP_TLS, v0.29.0) → {status, body, bytes, headers, final_url, duration_ms, error_code, error} (headers lowercase-name→list; final_url after redirects; transport failure = status:0 + HTTP_* error_code; v0.30.0). `body` is the response decoded as UTF-8 (nil if not valid UTF-8); `bytes` is the raw byte buffer. Response bodies are capped at 64 MiB (over-cap → {status:0, error}).

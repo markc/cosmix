@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-lib-mix"
-version = "0.65.0"
+version = "0.66.0"
 edition = "2024"
 license = "MIT"
 
@@ -25,7 +25,7 @@ toml = ["dep:toml"]
 serde = ["dep:serde"]
 datetime = ["dep:chrono"]
 url = ["dep:url"]
-crypto = ["dep:blake3", "dep:sha2", "dep:base64", "dep:uuid"]
+crypto = ["dep:blake3", "dep:sha2", "dep:sha1", "dep:md-5", "dep:base64", "dep:uuid"]
 http = ["dep:ureq", "dep:webpki-roots", "dep:rustls-pemfile"]
 sqlite = ["dep:rusqlite"]
 # `tokio-sleep` is an alias-only feature kept for backwards
@@ -94,6 +94,14 @@ datastar = { version = "0.3", default-features = false, optional = true }
 serde = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
+# `crypto` feature — MD5 and SHA-1 for LEGACY INTEROP only (both are
+# cryptographically broken; see the warning on docs/mix/system.md). Same
+# RustCrypto `digest 0.10` family as sha2, so the three share one trait and
+# one hasher shape. Neither adds a crate to the build graph: both were
+# already in the workspace lock as transitive dependencies, so this only
+# declares the direct edge Mix actually uses.
+sha1 = { version = "0.10", optional = true }
+md-5 = { version = "0.10", optional = true }
 toml = { version = "0.8", optional = true }
 # Unconditional — `evaluator::TaskTable` uses `tokio::task::JoinHandle`
 # (needs `rt`) and the async evaluator paths use `sync`, all with no cfg gate,

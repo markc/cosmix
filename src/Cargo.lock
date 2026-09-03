@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-mix"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1440,6 +1440,7 @@ dependencies = [
  "jaq-std",
  "libc",
  "mail-auth",
+ "md-5",
  "proptest",
  "pulldown-cmark",
  "quick-xml 0.41.0",
@@ -1449,6 +1450,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "signal-hook",
  "tokio",
@@ -1727,7 +1729,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-mix"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "blake3",
  "chrono",

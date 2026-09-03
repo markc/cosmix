@@ -145,6 +145,14 @@ async fn test_stdio_raw() {
     run_test_script("stdio_raw.mix").await;
 }
 
+// hash_md5 / hash_sha1 and the {raw:true} option (v0.66.0). The expected
+// digests are the published standard test vectors, so this checks Mix
+// against the standards rather than against itself.
+#[tokio::test]
+async fn test_digests() {
+    run_test_script("digests.mix").await;
+}
+
 #[tokio::test]
 async fn test_re_family() {
     run_test_script("re_family.mix").await;

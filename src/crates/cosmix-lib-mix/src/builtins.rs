@@ -329,11 +329,13 @@ builtin_table! {
     ("relative_time", CapabilityClass::Pure,   "system",  "Format timestamp as relative string (e.g. \"3 hours ago\")", contract!((ts: number) -> string; failure[raises])),
     ("base64_encode", CapabilityClass::Pure,   "system",  "Encode string as base64", contract!((s: any_of(string, bytes, buffer)) -> string)),
     ("base64_decode", CapabilityClass::Pure,   "system",  "Decode base64 string", contract!((s: any_of(string, bytes, buffer)) -> bytes)),
-    ("hash_blake3", CapabilityClass::Pure,     "system",  "BLAKE3 hash of string, return hex digest", contract!((s: any_of(string, bytes, buffer)) -> string)),
-    ("hash_sha256", CapabilityClass::Pure,     "system",  "SHA-256 hash of string, return hex digest", contract!((s: any_of(string, bytes, buffer)) -> string)),
-    ("hmac_sha256", CapabilityClass::Pure,     "system",  "HMAC-SHA256 (RFC 2104) of a message with a secret key, return hex digest — webhook signature verification (Stripe-Signature etc). Accepts string/bytes/buffer for both args (requires crypto feature)", contract!((key: any_of(string, bytes, buffer), msg: any_of(string, bytes, buffer)) -> string)),
+    ("hash_blake3", CapabilityClass::Pure,     "system",  "BLAKE3 hash of a string/bytes/buffer → lowercase hex; pass {raw:true} for the raw digest as bytes (v0.66.0)", contract!((s: any_of(string, bytes, buffer), opts?: map) -> any_of(string, bytes); failure[raises])),
+    ("hash_sha256", CapabilityClass::Pure,     "system",  "SHA-256 hash of a string/bytes/buffer → lowercase hex; pass {raw:true} for the raw 32 digest bytes (v0.66.0 — before that a second argument was silently IGNORED)", contract!((s: any_of(string, bytes, buffer), opts?: map) -> any_of(string, bytes); failure[raises])),
+    ("hash_md5", CapabilityClass::Pure,        "system",  "MD5 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (collisions since 2004) — legacy interop only (Content-MD5, mail dedup keys, checksums against existing tools), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)", contract!((s: any_of(string, bytes, buffer), opts?: map) -> any_of(string, bytes); failure[raises])),
+    ("hash_sha1", CapabilityClass::Pure,       "system",  "SHA-1 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (SHAttered, 2017) — legacy interop only (git object ids, older ETags/APIs), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)", contract!((s: any_of(string, bytes, buffer), opts?: map) -> any_of(string, bytes); failure[raises])),
+    ("hmac_sha256", CapabilityClass::Pure,     "system",  "HMAC-SHA256 (RFC 2104) of a message with a secret key → lowercase hex; {raw:true} → the 32 MAC bytes (v0.66.0) — webhook signature verification (Stripe-Signature etc). Accepts string/bytes/buffer for both args (requires crypto feature)", contract!((key: any_of(string, bytes, buffer), msg: any_of(string, bytes, buffer), opts?: map) -> any_of(string, bytes); failure[raises])),
     ("constant_time_eq", CapabilityClass::Pure, "system",  "Timing-safe equality for secrets/MACs: compares full length with no early exit (plain == leaks a timing oracle). Use for webhook signature comparison. Accepts string/bytes/buffer", contract!((a: any_of(string, bytes, buffer), b: any_of(string, bytes, buffer)) -> bool)),
-    ("hash_file", CapabilityClass::FsRead,     "system",  "Streaming hex digest of a file: hash_file(path[, \"sha256\"|\"blake3\"]) (v0.24.0)", contract!((path: string, algo?: string) -> string; failure[raises])),
+    ("hash_file", CapabilityClass::FsRead,     "system",  "Streaming digest of a file, fixed 64 KiB working set whatever the size: hash_file(path[, \"md5\"|\"sha1\"|\"sha256\"|\"blake3\"][, {raw:true}]) → lowercase hex, or bytes with {raw:true}. md5/sha1 added v0.66.0 and are BROKEN hashes for legacy interop only (v0.24.0)", contract!((path: string, algo?: string, opts?: map) -> any_of(string, bytes); failure[raises])),
     ("uuid", CapabilityClass::Pure,            "system",  "Generate a new random UUID v4 string", contract!(() -> string)),
     ("dkim_keygen", CapabilityClass::Pure,     "system",  "Generate a DKIM keypair. dkim_keygen(\"rsa\", [bits=2048]) or dkim_keygen(\"ed25519\") → {algorithm, private_pem, public_b64, dns_txt_record}", contract!((algo: string, bits?: number) -> map("dkim_keypair", {algorithm: string, private_pem: string, public_b64: string, dns_txt_record: string}))),
     ("http_get", CapabilityClass::Network,        "system",  "HTTP GET. http_get(url, [headers], [{timeout, ssl_verify, ca_file, ca_pem}] — timeout default 30, 0 disables; ssl_verify default true, false skips TLS cert/hostname checks like curl -k; ca_file/ca_pem ADD a private CA to the default roots — mutually exclusive with each other and with ssl_verify:false, 4 MiB cap, bad PEM raises HTTP_TLS, v0.29.0) → {status, body, bytes, headers, final_url, duration_ms, error_code, error} (headers lowercase-name→list; final_url after redirects; transport failure = status:0 + HTTP_* error_code; v0.30.0). `body` is the response decoded as UTF-8 (nil if not valid UTF-8); `bytes` is the raw byte buffer. Response bodies are capped at 64 MiB (over-cap → {status:0, error}).", contract!((url: string, headers?: map, opts?: map) -> map("http_response", {status: number, body: any, bytes: bytes, headers: map, final_url: string, duration_ms: number, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result]; cond_caps[ca_file: FsRead])),
@@ -698,6 +700,10 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "hash_blake3" => builtin_hash_blake3(args),
         #[cfg(feature = "crypto")]
         "hash_sha256" => builtin_hash_sha256(args),
+        #[cfg(feature = "crypto")]
+        "hash_md5" => builtin_hash_md5(args),
+        #[cfg(feature = "crypto")]
+        "hash_sha1" => builtin_hash_sha1(args),
         #[cfg(feature = "crypto")]
         "hmac_sha256" => builtin_hmac_sha256(args),
         #[cfg(not(feature = "crypto"))]
@@ -13493,12 +13499,9 @@ fn builtin_bytes_from(args: Vec<Value>) -> MixResult<Option<Value>> {
 fn builtin_bytes_to_hex(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args_between("bytes_to_hex", &args, 1, 1)?;
     let buf = subject_bytes("bytes_to_hex", &args[0])?;
-    let mut s = String::with_capacity(buf.len() * 2);
-    for b in buf.iter() {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{b:02x}");
-    }
-    Ok(Some(Value::String(s)))
+    // Shares `hex_encode` with the whole `hash_*` family, so a digest's hex
+    // and `bytes_to_hex(hash_sha256($x, {raw:true}))` can never disagree.
+    Ok(Some(Value::String(hex_encode(&buf))))
 }
 
 /// `bytes_from_hex($s)` → `bytes`. Strict: an even number of characters,
@@ -13767,24 +13770,202 @@ fn builtin_freeze(args: Vec<Value>) -> MixResult<Option<Value>> {
     }
 }
 
+/// Lowercase hex of a byte slice — the one renderer every digest and
+/// `bytes_to_hex` share, so no two of them can drift on case or padding.
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// The digest algorithms the `hash_*` family and `hash_file` share
+/// (v0.66.0). One enum so a name added here reaches both surfaces — the
+/// alternative left `hash_file` able to do sha256/blake3 while the
+/// in-memory calls grew md5/sha1, which is exactly the half-surface that
+/// generates the next bug report.
+#[cfg(feature = "crypto")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DigestAlgo {
+    Md5,
+    Sha1,
+    Sha256,
+    Blake3,
+}
+
+#[cfg(feature = "crypto")]
+impl DigestAlgo {
+    /// Accepted spellings, as they appear in `hash_file(path, algo)`.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "md5" => Some(Self::Md5),
+            "sha1" => Some(Self::Sha1),
+            "sha256" => Some(Self::Sha256),
+            "blake3" => Some(Self::Blake3),
+            _ => None,
+        }
+    }
+
+    /// **Cryptographically broken.** MD5 (collisions since 2004) and SHA-1
+    /// (SHAttered, 2017) must never carry a security decision — signatures,
+    /// integrity against an adversary, password derivation. They exist here
+    /// for LEGACY INTEROP with formats and tools that already chose them.
+    ///
+    /// Not decoration: `broken_digests_carry_the_warning` asserts that every
+    /// algorithm answering `true` here has the warning in the registry
+    /// description a user actually reads, so adding a future weak algorithm
+    /// without saying so fails the build. Test-only — the runtime never
+    /// branches on it, because refusing a broken hash a caller explicitly
+    /// asked for would be the wrong kind of paternalism.
+    #[cfg(test)]
+    pub(crate) fn is_broken(self) -> bool {
+        matches!(self, Self::Md5 | Self::Sha1)
+    }
+
+    /// The spelling `hash_file(path, algo)` accepts — the inverse of
+    /// [`from_name`](Self::from_name).
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Md5 => "md5",
+            Self::Sha1 => "sha1",
+            Self::Sha256 => "sha256",
+            Self::Blake3 => "blake3",
+        }
+    }
+
+    /// Every algorithm, in one place, so `hash_file`'s "expected …" error
+    /// and the tests are both DERIVED from the enum rather than repeating a
+    /// list that goes stale the next time one is added.
+    pub(crate) const ALL: &'static [DigestAlgo] =
+        &[Self::Md5, Self::Sha1, Self::Sha256, Self::Blake3];
+
+    /// `"md5", "sha1", "sha256" or "blake3"` — the accepted-values half of
+    /// an error message, built from `ALL`.
+    pub(crate) fn accepted_list() -> String {
+        let names: Vec<String> = Self::ALL.iter().map(|a| format!("\"{}\"", a.name())).collect();
+        match names.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+            _ => names.join(""),
+        }
+    }
+
+    /// One-shot digest of a whole buffer.
+    pub(crate) fn digest(self, data: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Md5 => {
+                use md5::Digest as _;
+                md5::Md5::digest(data).to_vec()
+            }
+            Self::Sha1 => {
+                use sha1::Digest as _;
+                sha1::Sha1::digest(data).to_vec()
+            }
+            Self::Sha256 => {
+                use sha2::Digest as _;
+                sha2::Sha256::digest(data).to_vec()
+            }
+            Self::Blake3 => blake3::hash(data).as_bytes().to_vec(),
+        }
+    }
+}
+
+/// Read the trailing `{raw: true}` option shared by every `hash_*` builtin
+/// and render the digest accordingly (v0.66.0).
+///
+/// Before this, `hash_sha256("abc", {raw: true})` **silently returned the
+/// hex string** — a surplus argument accepted and discarded, which is the
+/// worst answer available: the caller asked for bytes, got text, and was
+/// told nothing. Unknown keys and a non-map option now raise rather than
+/// being ignored, for the same reason.
+#[cfg(feature = "crypto")]
+fn hash_output(name: &str, digest: Vec<u8>, opts: Option<&Value>) -> MixResult<Option<Value>> {
+    let mut raw = false;
+    match opts {
+        None | Some(Value::Nil) => {}
+        Some(Value::Map(m)) => {
+            for key in m.keys() {
+                if key != "raw" {
+                    return Err(MixError::structured(
+                        "OPTION_INVALID",
+                        format!("{name}(): unknown option '{key}' (only 'raw' is accepted)"),
+                    ));
+                }
+            }
+            if let Some(v) = m.get("raw") {
+                // STRICT bool, deliberately unlike `bytes_to_string`'s `lossy`,
+                // which takes `is_truthy`. `raw` decides the RETURN TYPE, so a
+                // `{raw: "false"}` read out of a config string would silently
+                // hand back bytes and fail somewhere else entirely — the same
+                // accepted-but-wrong shape this release exists to remove. A
+                // flag that only changes a decode mode can afford truthiness;
+                // one that changes the type cannot.
+                match v {
+                    Value::Bool(b) => raw = *b,
+                    other => {
+                        return Err(MixError::structured(
+                            "OPTION_INVALID",
+                            format!(
+                                "{name}(): option 'raw' must be true or false, got {} — it \
+                                 selects the RETURN TYPE (bytes vs hex string), so a truthy \
+                                 non-bool is refused rather than guessed",
+                                other.type_name()
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Some(other) => {
+            return Err(MixError::structured(
+                "OPTION_INVALID",
+                format!(
+                    "{name}(): options must be a map or nil, got {}",
+                    other.type_name()
+                ),
+            ));
+        }
+    }
+    if raw {
+        Ok(Some(Value::bytes(digest)))
+    } else {
+        Ok(Some(Value::String(hex_encode(&digest))))
+    }
+}
+
 #[cfg(feature = "crypto")]
 fn builtin_hash_blake3(args: Vec<Value>) -> MixResult<Option<Value>> {
-    expect_args("hash_blake3", &args, 1)?;
-    let buf = value_as_crypto_bytes(&args[0]);
-    let hash = blake3::hash(buf.as_ref());
-    Ok(Some(Value::String(hash.to_hex().to_string())))
+    hash_value("hash_blake3", DigestAlgo::Blake3, args)
 }
 
 #[cfg(feature = "crypto")]
 fn builtin_hash_sha256(args: Vec<Value>) -> MixResult<Option<Value>> {
-    expect_args("hash_sha256", &args, 1)?;
-    use sha2::Digest;
+    hash_value("hash_sha256", DigestAlgo::Sha256, args)
+}
+
+/// `hash_md5($v[, {raw: true}])` — ⚠ BROKEN hash, legacy interop only.
+#[cfg(feature = "crypto")]
+fn builtin_hash_md5(args: Vec<Value>) -> MixResult<Option<Value>> {
+    hash_value("hash_md5", DigestAlgo::Md5, args)
+}
+
+/// `hash_sha1($v[, {raw: true}])` — ⚠ BROKEN hash, legacy interop only.
+#[cfg(feature = "crypto")]
+fn builtin_hash_sha1(args: Vec<Value>) -> MixResult<Option<Value>> {
+    hash_value("hash_sha1", DigestAlgo::Sha1, args)
+}
+
+/// Shared body of every in-memory `hash_*` builtin: one arity rule, one
+/// input coercion, one option surface. Named `hash_<algo>` rather than a
+/// bare `md5`/`sha256` on purpose — the existing family is `hash_*`, and a
+/// bare spelling beside it would recreate the two-families-one-letter-apart
+/// split that `byte_*` vs `bytes_*` already cost a doc note (v0.64.0).
+#[cfg(feature = "crypto")]
+fn hash_value(name: &str, algo: DigestAlgo, args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between(name, &args, 1, 2)?;
     let buf = value_as_crypto_bytes(&args[0]);
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(buf.as_ref());
-    let result = hasher.finalize();
-    let hex: String = result.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(Some(Value::String(hex)))
+    hash_output(name, algo.digest(buf.as_ref()), args.get(1))
 }
 
 /// `hmac_sha256(key, msg)` — RFC 2104 HMAC over the existing sha2 dep (no
@@ -13794,7 +13975,7 @@ fn builtin_hash_sha256(args: Vec<Value>) -> MixResult<Option<Value>> {
 /// "<timestamp>.<payload>" with the endpoint secret).
 #[cfg(feature = "crypto")]
 fn builtin_hmac_sha256(args: Vec<Value>) -> MixResult<Option<Value>> {
-    expect_args("hmac_sha256", &args, 2)?;
+    expect_args_between("hmac_sha256", &args, 2, 3)?;
     use sha2::Digest;
     const BLOCK: usize = 64;
     let key_in = value_as_crypto_bytes(&args[0]);
@@ -13816,12 +13997,10 @@ fn builtin_hmac_sha256(args: Vec<Value>) -> MixResult<Option<Value>> {
     let opad: Vec<u8> = key.iter().map(|b| b ^ 0x5c).collect();
     outer.update(&opad);
     outer.update(inner_hash);
-    let hex: String = outer
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    Ok(Some(Value::String(hex)))
+    // `{raw: true}` (v0.66.0) returns the 32 MAC bytes rather than hex, so a
+    // caller can `constant_time_eq` them against a decoded signature without
+    // a hex round trip in between.
+    hash_output("hmac_sha256", outer.finalize().to_vec(), args.get(2))
 }
 
 /// `constant_time_eq(a, b)` — length-checked, full-scan equality with no
@@ -13865,36 +14044,40 @@ fn builtin_constant_time_eq(args: Vec<Value>) -> MixResult<Option<Value>> {
 #[cfg(feature = "crypto")]
 fn builtin_hash_file(args: Vec<Value>) -> MixResult<Option<Value>> {
     use std::io::Read as _;
-    if args.is_empty() || args.len() > 2 {
-        return Err(MixError::RuntimeError {
-            span: None,
-            msg: format!(
-                "hash_file expects 1 or 2 args (path[, algo]), got {}",
-                args.len()
-            ),
-        });
-    }
+    expect_args_between("hash_file", &args, 1, 3)?;
     let path = args[0].to_mix_string();
     let algo = match args.get(1) {
         None | Some(Value::Nil) => "sha256".to_string(),
+        // A map in the ALGO slot is almost always the options map put one
+        // position early. Stringifying it would report `unknown algorithm
+        // '{raw: true}'`, which sends the caller looking for a typo in an
+        // algorithm name they never wrote.
+        Some(Value::Map(_)) => {
+            return Err(MixError::structured(
+                "OPTION_INVALID",
+                format!(
+                    "hash_file(): argument 2 is the ALGORITHM ({}), not the options map — \
+                     write hash_file(path, \"sha256\", {{raw: true}})",
+                    DigestAlgo::accepted_list()
+                ),
+            ));
+        }
         Some(v) => v.to_mix_string(),
     };
     // Validate the algorithm BEFORE touching the filesystem: an unknown algo
     // is a script bug and should report it as such, not open (and possibly
-    // block on) the path first.
-    enum Algo {
-        Sha256,
-        Blake3,
-    }
-    let which = match algo.as_str() {
-        "sha256" => Algo::Sha256,
-        "blake3" => Algo::Blake3,
-        other => {
+    // block on) the path first. The name set is `DigestAlgo`'s, shared with
+    // the in-memory `hash_*` builtins (v0.66.0) so the two surfaces cannot
+    // offer different algorithms.
+    let which = match DigestAlgo::from_name(&algo) {
+        Some(a) => a,
+        None => {
             return Err(MixError::RuntimeError {
                 span: None,
                 msg: format!(
-                    "hash_file: unknown algorithm '{}' (expected \"sha256\" or \"blake3\")",
-                    other
+                    "hash_file: unknown algorithm '{}' (expected {})",
+                    algo,
+                    DigestAlgo::accepted_list()
                 ),
             });
         }
@@ -13903,43 +14086,89 @@ fn builtin_hash_file(args: Vec<Value>) -> MixResult<Option<Value>> {
         span: None,
         msg: format!("hash_file '{}': {}", path, e),
     })?;
+    // Streaming, so the file is never held in memory: the point of hash_file
+    // over `hash_sha256(read_file_bytes(p))` is a fixed 64 KiB working set
+    // whatever the file's size. `StreamHasher` holds exactly ONE hasher —
+    // instantiating all four and using one would carry blake3's ~2 KB state
+    // on every call regardless of the algorithm asked for.
+    let mut hasher = StreamHasher::new(which);
     let mut buf = [0u8; 65536];
-    let hex = match which {
-        Algo::Sha256 => {
-            use sha2::Digest;
-            let mut hasher = sha2::Sha256::new();
-            loop {
-                let n = f.read(&mut buf).map_err(|e| MixError::RuntimeError {
-                    span: None,
-                    msg: format!("hash_file '{}': {}", path, e),
-                })?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            hasher
-                .finalize()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect()
+    loop {
+        let n = f.read(&mut buf).map_err(|e| MixError::RuntimeError {
+            span: None,
+            msg: format!("hash_file '{}': {}", path, e),
+        })?;
+        if n == 0 {
+            break;
         }
-        Algo::Blake3 => {
-            let mut hasher = blake3::Hasher::new();
-            loop {
-                let n = f.read(&mut buf).map_err(|e| MixError::RuntimeError {
-                    span: None,
-                    msg: format!("hash_file '{}': {}", path, e),
-                })?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            hasher.finalize().to_hex().to_string()
+        hasher.update(&buf[..n]);
+    }
+    hash_output("hash_file", hasher.finalize(), args.get(2))
+}
+
+/// One incremental hasher, selected at construction — the streaming twin of
+/// [`DigestAlgo::digest`].
+///
+/// Kept beside `DigestAlgo` so `hash_file` and the in-memory `hash_*` family
+/// can never end up supporting different algorithm sets: adding a variant to
+/// the enum makes THIS match non-exhaustive, so the compiler asks for the
+/// streaming arm at the same time.
+#[cfg(feature = "crypto")]
+enum StreamHasher {
+    Md5(Box<md5::Md5>),
+    Sha1(Box<sha1::Sha1>),
+    Sha256(Box<sha2::Sha256>),
+    Blake3(Box<blake3::Hasher>),
+}
+
+#[cfg(feature = "crypto")]
+impl StreamHasher {
+    fn new(algo: DigestAlgo) -> Self {
+        match algo {
+            DigestAlgo::Md5 => Self::Md5(Box::default()),
+            DigestAlgo::Sha1 => Self::Sha1(Box::default()),
+            DigestAlgo::Sha256 => Self::Sha256(Box::default()),
+            DigestAlgo::Blake3 => Self::Blake3(Box::new(blake3::Hasher::new())),
         }
-    };
-    Ok(Some(Value::String(hex)))
+    }
+
+    fn update(&mut self, chunk: &[u8]) {
+        match self {
+            Self::Md5(h) => {
+                use md5::Digest as _;
+                h.update(chunk);
+            }
+            Self::Sha1(h) => {
+                use sha1::Digest as _;
+                h.update(chunk);
+            }
+            Self::Sha256(h) => {
+                use sha2::Digest as _;
+                h.update(chunk);
+            }
+            Self::Blake3(h) => {
+                h.update(chunk);
+            }
+        }
+    }
+
+    fn finalize(self) -> Vec<u8> {
+        match self {
+            Self::Md5(h) => {
+                use md5::Digest as _;
+                h.finalize().to_vec()
+            }
+            Self::Sha1(h) => {
+                use sha1::Digest as _;
+                h.finalize().to_vec()
+            }
+            Self::Sha256(h) => {
+                use sha2::Digest as _;
+                h.finalize().to_vec()
+            }
+            Self::Blake3(h) => h.finalize().as_bytes().to_vec(),
+        }
+    }
 }
 
 #[cfg(feature = "crypto")]
@@ -14745,7 +14974,9 @@ fn builtin_help(_args: Vec<Value>) -> MixResult<Option<Value>> {
     println!("JSON:      json_parse json_encode jq jq_all");
     println!("Regex:     regex_match regex_find regex_replace regex_split");
     println!(
-        "Crypto:    hash_blake3 hash_sha256 hmac_sha256 constant_time_eq hash_file base64_encode base64_decode uuid"
+        "Crypto:    hash_blake3 hash_sha256 hmac_sha256 constant_time_eq hash_file base64_encode base64_decode uuid\n\
+         \x20          hash_md5 hash_sha1 (BROKEN hashes — legacy interop only)\n\
+         \x20          all hash_* take {{raw:true}} for the digest as bytes (v0.66.0)"
     );
     println!("Network:   http_get http_post http_request dns_lookup");
     println!("Bytes:     bytes_len string_to_bytes bytes_to_string bytes_find bytes_starts_with");
@@ -20019,6 +20250,65 @@ mod char_aware_tests {
         }
     }
 
+    /// A weak digest must SAY it is weak, in the description a user reads.
+    ///
+    /// `mix what hash_md5` and `docs/mix/builtins.md` are generated from the
+    /// registry description, so that string is where a caller meets the
+    /// algorithm. Tying it to `DigestAlgo::is_broken` means a future weak
+    /// algorithm cannot be added with a neutral one-liner: the test fails
+    /// until the warning is there. The converse arm matters too — labelling
+    /// SHA-256 "broken" would be its own kind of wrong.
+    #[cfg(feature = "crypto")]
+    #[test]
+    fn broken_digests_carry_the_warning() {
+        for &algo in super::DigestAlgo::ALL {
+            let name = format!("hash_{}", algo.name());
+            let name = name.as_str();
+            let info = super::builtin_info_of(name)
+                .unwrap_or_else(|| panic!("'{name}' is not in the registry"));
+            let desc = info.description;
+            if algo.is_broken() {
+                assert!(
+                    desc.contains("BROKEN"),
+                    "'{name}' is a broken digest but its description does not say so: {desc}"
+                );
+                assert!(
+                    desc.contains("hash_sha256") || desc.contains("hash_blake3"),
+                    "'{name}' warns but names no safe alternative: {desc}"
+                );
+            } else {
+                assert!(
+                    !desc.contains("BROKEN"),
+                    "'{name}' is not a broken digest but its description says it is: {desc}"
+                );
+            }
+        }
+        // hash_file reaches the same set, so its error message must list all
+        // of them — a name accepted but unlisted is undiscoverable.
+        let file_desc = super::builtin_info_of("hash_file").unwrap().description;
+        for &algo in super::DigestAlgo::ALL {
+            let spelling = algo.name();
+            assert!(
+                file_desc.contains(spelling),
+                "hash_file accepts '{spelling}' but does not list it: {file_desc}"
+            );
+            assert!(
+                super::DigestAlgo::from_name(spelling).is_some(),
+                "'{spelling}' must round-trip through from_name"
+            );
+        }
+        // The error message a caller sees on a typo is DERIVED from the enum,
+        // not a repeated literal — so it cannot omit a newly added algorithm.
+        let accepted = super::DigestAlgo::accepted_list();
+        for &algo in super::DigestAlgo::ALL {
+            assert!(
+                accepted.contains(algo.name()),
+                "accepted_list() omits '{}': {accepted}",
+                algo.name()
+            );
+        }
+    }
+
     /// The third leg of the inline-special-form invariant, and the one that
     /// used to fail SILENTLY.
     ///
@@ -20231,6 +20521,11 @@ mod char_aware_tests {
             "re_split",
             "grep_lines",
             "hash_blake3",
+            // md5/sha1 are BROKEN hashes but they are still Pure in the
+            // capability sense — they touch no host authority. "Pure" is not
+            // "safe"; the warning lives in the description, not the class.
+            "hash_md5",
+            "hash_sha1",
             "hash_sha256",
             "has_key",
             "hmac_sha256",
@@ -20582,14 +20877,49 @@ mod getopt_tests {
             file_hash(vec![ps.clone(), Value::String("blake3".into())]),
             str_hash("hash_blake3", content)
         );
+        // md5 and sha1 became valid algos in v0.66.0 — this assertion used to
+        // be `hash_file(p, "md5")` ERRORS, and the change is deliberate. Each
+        // is checked against its own in-memory builtin, so the streaming path
+        // and the one-shot path cannot disagree on the same bytes.
+        assert_eq!(
+            file_hash(vec![ps.clone(), Value::String("md5".into())]),
+            str_hash("hash_md5", content)
+        );
+        assert_eq!(
+            file_hash(vec![ps.clone(), Value::String("sha1".into())]),
+            str_hash("hash_sha1", content)
+        );
         // nil algo falls back to sha256 (a `?? "sha256"` caller passes Nil)
         assert_eq!(
             file_hash(vec![ps.clone(), Value::Nil]),
             str_hash("hash_sha256", content)
         );
 
-        // unknown algo and a missing path both error, not silently return a bogus digest
-        assert!(call_builtin("hash_file", vec![ps.clone(), Value::String("md5".into())]).is_err());
+        // {raw: true} on the streaming path yields the SAME digest as the hex
+        // spelling, just as bytes — pinned through bytes_to_hex so a wrong
+        // byte order or a truncated digest would show.
+        let raw = call_builtin(
+            "hash_file",
+            vec![
+                ps.clone(),
+                Value::String("sha256".into()),
+                Value::map(IndexMap::from([("raw".to_string(), Value::Bool(true))])),
+            ],
+        )
+        .unwrap();
+        match &raw {
+            Some(Value::Bytes(b)) => {
+                assert_eq!(b.len(), 32);
+                assert_eq!(super::hex_encode(b), str_hash("hash_sha256", content));
+            }
+            other => panic!("expected bytes from {{raw:true}}, got {other:?}"),
+        }
+
+        // A genuinely unknown algo and a missing path both error, not silently
+        // return a bogus digest.
+        assert!(
+            call_builtin("hash_file", vec![ps.clone(), Value::String("sha512".into())]).is_err()
+        );
         assert!(
             call_builtin(
                 "hash_file",
