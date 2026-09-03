@@ -45,6 +45,11 @@ use crate::token::StringPart;
 pub enum Severity {
     Error,
     Warning,
+    /// Advisory (0.63.0): rendered and counted separately, NEVER gates —
+    /// `--deny-warnings` ignores notes. The severity a deprecation is
+    /// born at; promotion to `Warning` keeps the code, only the
+    /// severity moves.
+    Note,
 }
 
 impl Severity {
@@ -52,13 +57,21 @@ impl Severity {
         match self {
             Severity::Error => "error",
             Severity::Warning => "warning",
+            Severity::Note => "note",
         }
     }
 }
 
-/// One lint finding. `code` is a permanent identifier from the
-/// MIX-E1xxx (error) / MIX-W2xxx (warning) namespaces — never reused,
-/// never semantically repurposed.
+/// One lint finding. `code` is a permanent identifier — never reused,
+/// never semantically repurposed — from three namespaces:
+///   MIX-E1xxx  errors (the letter encodes the fixed severity)
+///   MIX-W2xxx  warnings that were BORN warnings
+///   MIX-D3xxx  deprecations and release-transition advisories — a
+///              severity-INDEPENDENT namespace: a deprecation's
+///              severity is by design not fixed (it starts as `note`
+///              and may be promoted to `warning` in a later release
+///              with the code unchanged), so its letter must not
+///              claim one.
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
     pub code: &'static str,
@@ -366,6 +379,7 @@ pub fn analyze(stmts: &[Stmt], file: Option<&str>, cfg: &AnalyzerConfig) -> Anal
         true,
     );
     check_recurring_silent_bugs(stmts, &ctx, &mut a);
+    check_release_transition_advisories(stmts, &ctx, &mut a);
     collect_capabilities(stmts, &mut a);
     a
 }
@@ -1191,6 +1205,7 @@ fn walk_stmt_exprs(stmt: &Stmt, visit: &mut dyn FnMut(&Expr)) {
 #[derive(Clone, Copy)]
 enum ProvenValue {
     List,
+    Map,
     BuiltinResult(&'static str),
 }
 
@@ -1228,6 +1243,178 @@ fn check_ssh_escaped_quotes(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis)
 
     walk_stmts(stmts, &mut |stmt| {
         walk_stmt_exprs(stmt, &mut |expr| check_expr(expr, stmt.line, ctx, a));
+    });
+}
+
+// ── MIX-D3xxx — deprecations and release-transition advisories ───────
+//
+// All emitted at `Severity::Note` in release A (0.63.0): visible in
+// every lint run, never gating. The five regex/grep codes D3001–D3005
+// promote to `Warning` in release A.1 (codes unchanged) once the fleet
+// inventory reads zero, and the names are deleted in release B. The
+// pos-family codes D3008–D3011 stay notes until THEIR count reads zero,
+// whenever that is. D3006/D3007 are release-transition watch notes for
+// the A.1 behaviour flips (map two-var binding; map/list `==` raising),
+// retired in A.1. Static, analyzer-surface only — never emitted at
+// runtime (the `done`/`next` runtime-warning path is the anti-pattern:
+// it would print on every execution of ~800 live call sites).
+//
+// Coverage: every spelling. A member-call of a BUILTIN name desugars to
+// a FunctionCall at parse time (parser.rs `method_desugars_to_ufcs`),
+// so `$s.regex_match(..)` is seen exactly like the bare call — pinned
+// by the lint_notes CLI tests.
+
+/// Pattern-first regex/grep names → their subject-first 0.63.0 twins.
+const DEPRECATED_REGEX_CALLS: &[(&str, &str, &str)] = &[
+    ("regex_match", "MIX-D3001", "re_match(s, pattern)"),
+    (
+        "regex_find",
+        "MIX-D3002",
+        "re_find(s, pattern) — NOTE: re_find returns CODEPOINT offsets where regex_find returns byte offsets; adjust offset arithmetic when migrating",
+    ),
+    ("regex_replace", "MIX-D3003", "re_replace(s, pattern, replacement)"),
+    ("regex_split", "MIX-D3004", "re_split(s, pattern)"),
+    ("grep", "MIX-D3005", "grep_lines(text, pattern)"),
+];
+
+/// REXX-style 1-based needle-first search family: declared legacy, not
+/// scheduled for deletion — the note points migrants at the replacements.
+const LEGACY_POS_CALLS: &[(&str, &str, &str)] = &[
+    (
+        "pos",
+        "MIX-D3008",
+        "contains() for yes/no, index_of() / after() / split_once() for positions",
+    ),
+    (
+        "lastpos",
+        "MIX-D3009",
+        "last_index_of() / before_last() / after_last()",
+    ),
+    ("byte_pos", "MIX-D3010", "byte_index_of()"),
+    (
+        "byte_lastpos",
+        "MIX-D3011",
+        "byte-offset search has no 0-based last-occurrence twin yet; see strings.md",
+    ),
+];
+
+fn check_release_transition_advisories(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
+    // Pos-family calls already covered by the sharper composed-form note
+    // below (substr/slice over a pos-family call in ONE expression) —
+    // suppressed from the generic note so a site gets one note, not two.
+    let mut composed: HashSet<*const Expr> = HashSet::new();
+
+    fn check_expr(
+        expr: &Expr,
+        line: usize,
+        ctx: &FileContext,
+        a: &mut Analysis,
+        composed: &mut HashSet<*const Expr>,
+    ) {
+        if let Expr::FunctionCall { name, args } = expr {
+            if let Some((_, code, repl)) =
+                DEPRECATED_REGEX_CALLS.iter().find(|(n, _, _)| n == name)
+            {
+                a.diagnostics.push(diag(
+                    ctx,
+                    code,
+                    Severity::Note,
+                    line,
+                    format!("`{name}` is pattern-first legacy: use `{repl}` (subject first)"),
+                    Some(
+                        "the five regex/grep legacy names are deleted in a later release; \
+                         see `mix man regex`"
+                            .to_string(),
+                    ),
+                ));
+            } else if let Some((_, code, repl)) =
+                LEGACY_POS_CALLS.iter().find(|(n, _, _)| n == name)
+                && !composed.contains(&(expr as *const Expr))
+            {
+                a.diagnostics.push(diag(
+                    ctx,
+                    code,
+                    Severity::Note,
+                    line,
+                    format!("`{name}` is declared legacy (1-based, needle-first): prefer {repl}"),
+                    Some(
+                        "legacy search names stay until their fleet count reads zero — \
+                         migrate opportunistically; see `mix man strings`"
+                            .to_string(),
+                    ),
+                ));
+            }
+            // Sharper composed-form note: `substr($s, pos(..) ± n)` /
+            // `slice($s, pos(..))` in one expression — the 1-based/0-based
+            // off-by-one trap. One-expression-deep only, by design: a
+            // `$p = pos(..); substr($s, $p)` split is caught by the plain
+            // pos-family note above instead.
+            if matches!(name.as_str(), "substr" | "slice" | "grapheme_substr") {
+                for arg in args.iter().skip(1) {
+                    let mut found: Option<(*const Expr, &'static str, &'static str)> = None;
+                    let mut scan = |e: &Expr| {
+                        if let Expr::FunctionCall { name: inner, .. } = e
+                            && let Some((n, code, _)) =
+                                LEGACY_POS_CALLS.iter().find(|(n, _, _)| n == inner)
+                            && found.is_none()
+                        {
+                            found = Some((e as *const Expr, code, n));
+                        }
+                    };
+                    scan(arg);
+                    walk_expr_children(arg, &mut |child| scan(child));
+                    if let Some((pos_ptr, code, pos_name)) = found {
+                        composed.insert(pos_ptr);
+                        a.diagnostics.push(diag(
+                            ctx,
+                            code,
+                            Severity::Note,
+                            line,
+                            format!(
+                                "`{name}(.., {pos_name}(..) ..)` composes a 1-based position \
+                                 into a 0-based index — the off-by-one trap"
+                            ),
+                            Some(
+                                "use after() / before() / split_once() instead of \
+                                 position arithmetic"
+                                    .to_string(),
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        walk_expr_children(expr, &mut |child| check_expr(child, line, ctx, a, composed));
+    }
+
+    walk_stmts(stmts, &mut |stmt| {
+        // MIX-D3006 — watch note for the A.1 map-binding flip: every
+        // two-variable iteration, both spellings (`for each $i, $x` and
+        // the 0.63.0 bare `for $i, $x`). Static typing cannot tell a map
+        // iterable from a list, so the note makes every site visible for
+        // one release cycle; it is retired in A.1 when the binding flips.
+        if let StmtKind::ForEach {
+            index_var: Some(_), ..
+        } = &stmt.kind
+        {
+            a.diagnostics.push(diag(
+                ctx,
+                "MIX-D3006",
+                Severity::Note,
+                stmt.line,
+                "two-variable loop binds (index, item) for every iterable today; in release \
+                 A.1 a MAP iterable binds (key, value) instead"
+                    .to_string(),
+                Some(
+                    "over a list nothing changes; if this can iterate a map and uses the \
+                     first variable as a number, migrate to the one-variable key form now"
+                        .to_string(),
+                ),
+            ));
+        }
+        walk_stmt_exprs(stmt, &mut |expr| {
+            check_expr(expr, stmt.line, ctx, a, &mut composed)
+        });
     });
 }
 
@@ -1441,6 +1628,7 @@ fn invalidate_child_binders(kind: &StmtKind, facts: &mut HashMap<String, ProvenV
 fn proven_value(expr: &Expr) -> Option<ProvenValue> {
     match expr {
         Expr::ListLiteral(_) => Some(ProvenValue::List),
+        Expr::MapLiteral(_) => Some(ProvenValue::Map),
         Expr::FunctionCall { name, .. } if builtin_result_fields(name).is_some() => Some(
             ProvenValue::BuiltinResult(builtins::builtin_info_of(name)?.name),
         ),
@@ -1451,6 +1639,13 @@ fn proven_value(expr: &Expr) -> Option<ProvenValue> {
 fn expr_is_proven_list(expr: &Expr, facts: &HashMap<String, ProvenValue>) -> bool {
     matches!(expr, Expr::ListLiteral(_))
         || matches!(expr, Expr::Variable(name) if matches!(facts.get(name), Some(ProvenValue::List)))
+}
+
+/// Map OR list, literal or straight-line-proven — the D3007 operand test.
+fn expr_is_proven_collection(expr: &Expr, facts: &HashMap<String, ProvenValue>) -> bool {
+    matches!(expr, Expr::ListLiteral(_) | Expr::MapLiteral(_))
+        || matches!(expr, Expr::Variable(name)
+            if matches!(facts.get(name), Some(ProvenValue::List | ProvenValue::Map)))
 }
 
 fn builtin_result_fields(name: &str) -> Option<&'static [FieldInfo]> {
@@ -1469,7 +1664,7 @@ fn result_origin<'a>(
         Expr::FunctionCall { name, .. } => builtins::builtin_info_of(name)?.name,
         Expr::Variable(name) => match facts.get(name)? {
             ProvenValue::BuiltinResult(name) => name,
-            ProvenValue::List => return None,
+            ProvenValue::List | ProvenValue::Map => return None,
         },
         _ => return None,
     };
@@ -1497,6 +1692,40 @@ fn check_proven_expr(
             line,
             "`+` stringifies lists instead of joining them".to_string(),
             Some("use concat(list_a, list_b) or push(list, value)".to_string()),
+        ));
+    }
+
+    // MIX-D3007 — watch note for the A.1 equality flip: `==`/`!=` where
+    // an operand is PROVEN a map or list (a literal, or a variable
+    // straight-line-assigned one) is always false/true today — Value's
+    // PartialEq has no structural arm. Best-effort by design: only
+    // proven operands are seen (the same statement-order facts as
+    // W2301), so an untraceable `$a == $b` passes silently — the runtime
+    // raise in A.1 is the real fix, this note is the courtesy.
+    if let Expr::BinaryOp { left, op, right } = expr
+        && matches!(op, BinOp::Eq | BinOp::NotEq)
+        && (expr_is_proven_collection(left, facts) || expr_is_proven_collection(right, facts))
+    {
+        let op_str = if matches!(op, BinOp::Eq) { "==" } else { "!=" };
+        let answer = if matches!(op, BinOp::Eq) {
+            "false"
+        } else {
+            "true"
+        };
+        a.diagnostics.push(diag(
+            ctx,
+            "MIX-D3007",
+            Severity::Note,
+            line,
+            format!(
+                "`{op_str}` on a map or list is always {answer} — structural comparison \
+                 needs deep_eq(a, b)"
+            ),
+            Some(
+                "release A.1 makes map/list `==`/`!=` raise TYPE_ERROR instead of \
+                 silently answering; migrate now"
+                    .to_string(),
+            ),
         ));
     }
 

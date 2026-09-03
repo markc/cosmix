@@ -42,6 +42,9 @@ enum LintOutcome {
 struct LintSummary {
     errors: usize,
     warnings: usize,
+    /// `Severity::Note` findings (0.63.0, schema_version 2) — advisory
+    /// only: NEVER counted as warnings, never denied.
+    notes: usize,
     denied_warnings: bool,
 }
 
@@ -141,9 +144,14 @@ pub fn run_lint(args: &[String], version: &str) -> i32 {
     }
     capabilities.sort_unstable();
 
-    // Errors first, then warnings; within a class, by file+line.
+    // Errors first, then warnings, then notes; within a class, by
+    // file+line.
     all_diags.sort_by(|a, b| {
-        let sev = |d: &Diagnostic| matches!(d.severity, Severity::Warning) as u8;
+        let sev = |d: &Diagnostic| match d.severity {
+            Severity::Error => 0u8,
+            Severity::Warning => 1,
+            Severity::Note => 2,
+        };
         sev(a)
             .cmp(&sev(b))
             .then_with(|| a.file.cmp(&b.file))
@@ -154,11 +162,22 @@ pub fn run_lint(args: &[String], version: &str) -> i32 {
         .iter()
         .filter(|d| d.severity == Severity::Error)
         .count();
-    let warnings = all_diags.len() - errors;
+    // Explicit match, NOT "everything that isn't an error": notes must
+    // never count as warnings, or `--deny-warnings` (a live fleet deploy
+    // gate — deploy_shared.mix) would deny on advisories.
+    let warnings = all_diags
+        .iter()
+        .filter(|d| d.severity == Severity::Warning)
+        .count();
+    let notes = all_diags
+        .iter()
+        .filter(|d| d.severity == Severity::Note)
+        .count();
     let denied = deny_warnings && warnings > 0;
     let summary = LintSummary {
         errors,
         warnings,
+        notes,
         denied_warnings: denied,
     };
 
@@ -185,9 +204,10 @@ pub fn run_lint(args: &[String], version: &str) -> i32 {
                 }
             }
             println!(
-                "{} error(s), {} warning(s){}",
+                "{} error(s), {} warning(s), {} note(s){}",
                 errors,
                 warnings,
+                notes,
                 if denied { " [denied]" } else { "" }
             );
         }
@@ -397,7 +417,10 @@ fn report_json(
     summary: &LintSummary,
 ) -> serde_json::Value {
     serde_json::json!({
-        "schema_version": 1,
+        // 2 (0.63.0): severity domain gains "note"; summary gains
+        // `notes`. No in-tree consumer parses this report (inventoried
+        // 2026-09-03, zero `lint --json` callers fleet-wide).
+        "schema_version": 2,
         "tool": "mix lint",
         "mix_version": version,
         "files": files,
@@ -415,6 +438,7 @@ fn report_json(
         "summary": {
             "errors": summary.errors,
             "warnings": summary.warnings,
+            "notes": summary.notes,
             "denied_warnings": summary.denied_warnings,
         },
     })

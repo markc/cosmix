@@ -15,7 +15,7 @@ mix lint [--json | --data] [--deny-warnings]
          FILE...
 ```
 
-- Exit codes: `0` no errors (warnings allowed unless `--deny-warnings`); `1` one or more errors, or any warning under `--deny-warnings`; `2` invalid usage, unreadable input, or internal failure.
+- Exit codes: `0` no errors (warnings allowed unless `--deny-warnings`); `1` one or more errors, or any warning under `--deny-warnings`; `2` invalid usage, unreadable input, or internal failure. **Notes never affect the exit code** — a file whose only findings are notes exits `0` even under `--deny-warnings` (0.63.0; pinned by CLI tests, because `--deny-warnings` is a live fleet deploy gate).
 - Diagnostics go to **stdout**; CLI errors go to **stderr**. `--deny-warnings` changes only the exit decision, never a severity.
 - `-` reads stdin (at most once); relative `require()` paths from stdin resolve against the current directory.
 - `--allow-global NAME` / `--allow-function NAME` declare names an embedder or environment provides (repeatable).
@@ -27,8 +27,28 @@ mix lint [--json | --data] [--deny-warnings]
 
 ## The rules (v1)
 
-Codes are permanent: `MIX-E1xxx` errors, `MIX-W2xxx` warnings — never reused,
-never repurposed.
+Codes are permanent — never reused, never repurposed — from three
+namespaces: `MIX-E1xxx` errors, `MIX-W2xxx` warnings (born warnings), and
+`MIX-D3xxx` **deprecations and release-transition advisories** (0.63.0) —
+a severity-*independent* namespace: a deprecation starts at severity
+`note` and may later be promoted to `warning` with the **code unchanged**
+(only the wire `severity` field moves), so tooling that suppresses or
+greps by code keeps working across the promotion.
+
+### Notes (severity `note`, 0.63.0)
+
+Rendered with a `note:` prefix, sorted after errors and warnings, counted
+in their own summary field, and **never** gating. Current D-codes:
+
+| code | what it flags |
+|---|---|
+| `MIX-D3001`–`D3005` | the five pattern-first legacy names `regex_match regex_find regex_replace regex_split grep` — use the subject-first `re_match re_find re_replace re_split grep_lines` (these five promote to warnings in release A.1 and the legacy names are deleted in release B) |
+| `MIX-D3006` | any two-variable `for`/`for each` loop — watch note for the A.1 change of MAP iteration to (key, value); retired in A.1 |
+| `MIX-D3007` | `==`/`!=` where an operand is provably a map or list (always false/true today — use `deep_eq`); A.1 makes the comparison raise; retired then |
+| `MIX-D3008`–`D3011` | the REXX-style `pos lastpos byte_pos byte_lastpos` family, declared legacy — with a sharper message when composed as `substr(.., pos(..))` in one expression (the 1-based/0-based off-by-one). These stay notes until their own fleet count reads zero; they are NOT deleted in release B |
+
+Member-call spellings are covered too: a builtin-named `.name(` desugars
+to the same call at parse time.
 
 ```text
 MIX-E1001  lexical error                    MIX-E1301  duplicate function parameter
@@ -111,11 +131,13 @@ MIX-E1202  user-function arity mismatch     MIX-E1502  discarded pure transform
 
 ## Machine output
 
-`--json` (D3 schema, `schema_version: 1`):
+`--json` (D3 schema, `schema_version: 2` since 0.63.0 — the severity
+domain gained `"note"` and `summary` gained `notes`; no in-tree consumer
+parsed v1, inventoried 2026-09-03):
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "tool": "mix lint",
   "mix_version": "0.50.0",
   "files": ["worker.mix"],
@@ -127,7 +149,7 @@ MIX-E1202  user-function arity mismatch     MIX-E1502  discarded pure transform
     "hint": "assign it, use env(\"DOMAIN\") for environment values, or pass --allow-global DOMAIN"
   }],
   "capabilities": ["fs-read", "network", "process"],
-  "summary": {"errors": 1, "warnings": 0, "denied_warnings": false}
+  "summary": {"errors": 1, "warnings": 0, "notes": 0, "denied_warnings": false}
 }
 ```
 

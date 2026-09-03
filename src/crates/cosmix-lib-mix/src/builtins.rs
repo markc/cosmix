@@ -11021,12 +11021,19 @@ fn builtin_re_find(args: Vec<Value>) -> MixResult<Option<Value>> {
     let text = args[0].to_mix_string();
     let re = compile_regex(&args[1].to_mix_string())?;
     let mut results = Vec::new();
+    // Codepoint offsets, counted INCREMENTALLY: matches arrive in byte
+    // order, so advance a (byte, codepoint) cursor instead of recounting
+    // the prefix per match — a match-heavy large subject stays O(n), not
+    // O(n·matches). Match bounds are char boundaries, so slices are valid.
+    let mut cp_cursor = 0usize;
+    let mut byte_cursor = 0usize;
     for caps in re.captures_iter(&text) {
         let m = caps.get(0).unwrap();
-        // Codepoint offsets: count chars in the byte prefix (match starts
-        // and ends on char boundaries, so both slices are valid).
-        let start_cp = text[..m.start()].chars().count();
-        let end_cp = start_cp + text[m.start()..m.end()].chars().count();
+        cp_cursor += text[byte_cursor..m.start()].chars().count();
+        let start_cp = cp_cursor;
+        cp_cursor += text[m.start()..m.end()].chars().count();
+        byte_cursor = m.end();
+        let end_cp = cp_cursor;
         let mut entry = indexmap::IndexMap::new();
         entry.insert("match".into(), Value::String(m.as_str().to_string()));
         entry.insert("start".into(), Value::Number(start_cp as f64));

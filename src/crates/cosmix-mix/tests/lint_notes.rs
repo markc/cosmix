@@ -1,0 +1,117 @@
+//! `Severity::Note` + the MIX-D3xxx advisory namespace (0.63.0,
+//! `schema_version: 2`) — CLI-level pins, because the stakes are
+//! CLI-level: `--deny-warnings` is a live fleet deploy gate
+//! (deploy_shared.mix runs it over every shared-manifest source), so a
+//! note that counted as a warning would stop fleet deploys the day the
+//! deprecation notes ship.
+
+use std::process::Command;
+
+fn write_temp(name: &str, source: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("mix_lint_notes_{name}.mix"));
+    std::fs::write(&path, source).unwrap();
+    path
+}
+
+fn lint(args: &[&str]) -> (i32, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_mix"))
+        .arg("lint")
+        .args(args)
+        .env("MIX_STATS", "off")
+        .output()
+        .expect("run mix lint");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// A file whose ONLY diagnostics are notes (one of each D-code family).
+const NOTES_ONLY: &str = "$t = \"a b\"\n\
+    print(regex_match(\"^a\", $t))\n\
+    print(pos(\"b\", $t))\n\
+    for each $i, $x in [1, 2]\n  print($i .. $x)\nend\n\
+    $m = {a: 1}\n\
+    if $m == {a: 1} then print \"eq\" end\n";
+
+#[test]
+fn notes_only_file_exits_zero_under_deny_warnings() {
+    // THE pin: fleet deploys ride on this exit code.
+    let path = write_temp("deny", NOTES_ONLY);
+    let (code, out) = lint(&["--deny-warnings", path.to_str().unwrap()]);
+    assert_eq!(code, 0, "notes must never deny; output:\n{out}");
+    assert!(out.contains("note:"), "notes still rendered: {out}");
+    assert!(!out.contains("[denied]"), "{out}");
+}
+
+#[test]
+fn notes_render_and_count_separately() {
+    let path = write_temp("plain", NOTES_ONLY);
+    let (code, out) = lint(&[path.to_str().unwrap()]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("MIX-D3001 note:"), "{out}");
+    assert!(out.contains("MIX-D3006 note:"), "{out}");
+    assert!(out.contains("MIX-D3007 note:"), "{out}");
+    assert!(out.contains("MIX-D3008 note:"), "{out}");
+    assert!(
+        out.contains("0 error(s), 0 warning(s), 4 note(s)"),
+        "three-count summary: {out}"
+    );
+}
+
+#[test]
+fn json_schema_v2_carries_notes() {
+    let path = write_temp("json", NOTES_ONLY);
+    let (code, out) = lint(&["--json", path.to_str().unwrap()]);
+    assert_eq!(code, 0, "{out}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+    assert_eq!(v["schema_version"], 2);
+    assert_eq!(v["summary"]["notes"], 4, "{out}");
+    assert_eq!(v["summary"]["warnings"], 0, "notes are not warnings: {out}");
+    assert!(
+        v["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["severity"] == "note"),
+        "{out}"
+    );
+}
+
+#[test]
+fn real_warnings_still_deny() {
+    // W2305 (bare index_of in a condition) is a born-warning; the
+    // --deny-warnings contract for it is unchanged.
+    let src = "if index_of(\"abc\", \"z\") then\n  print \"x\"\nend\n";
+    let path = write_temp("warn", src);
+    let (code, out) = lint(&["--deny-warnings", path.to_str().unwrap()]);
+    assert_eq!(code, 1, "warnings still deny: {out}");
+    assert!(out.contains("[denied]"), "{out}");
+    let (code_plain, _) = lint(&[path.to_str().unwrap()]);
+    assert_eq!(code_plain, 0, "without the flag a warning passes");
+}
+
+#[test]
+fn output_orders_error_then_warning_then_note() {
+    let src =
+        "print($undefined)\nif index_of(\"abc\", \"z\") then\n  print(pos(\"a\", \"ab\"))\nend\n";
+    let path = write_temp("order", src);
+    let (_, out) = lint(&[path.to_str().unwrap()]);
+    let e = out.find("MIX-E1101").expect("error present");
+    let w = out.find("MIX-W2305").expect("warning present");
+    let n = out.find("MIX-D3008").expect("note present");
+    assert!(e < w && w < n, "error < warning < note ordering: {out}");
+}
+
+#[test]
+fn ufcs_spelling_is_noted_too() {
+    // `$s.regex_match(..)` desugars to a FunctionCall at PARSE time
+    // (method_desugars_to_ufcs covers every builtin name), so the
+    // deprecation notes see member-call spellings as well — there is no
+    // UFCS blind spot for builtin-named calls. Pinned so a parser
+    // change that widened MethodCall would surface here.
+    let src = "$s = \"abc\"\nprint($s.regex_match(\"^a\"))\n";
+    let path = write_temp("ufcs", src);
+    let (_, out) = lint(&[path.to_str().unwrap()]);
+    assert!(out.contains("MIX-D3001"), "UFCS spelling noted: {out}");
+}

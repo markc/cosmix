@@ -6,7 +6,9 @@
 -- moment the builtins landed — removed like the max/min/abs/clamp shims
 -- below). Native lines() differs deliberately from the old shim: one
 -- trailing \r stripped per line (CRLF-safe) and the final newline no
--- longer yields a trailing "" element. read_lines() below inherits that.
+-- longer yields a trailing "" element. read_lines() has been NATIVE since
+-- v0.2.3 (it never called the shim), so its behaviour is unchanged; its
+-- dead prelude shim is likewise removed (0.63.0).
 
 function sum($list)
     $total = 0
@@ -25,10 +27,6 @@ end
 -- result is normalized to a number (a numeric-string/bool arg no longer comes
 -- back with its original type), and clamp() errors on an inverted lo > hi
 -- range instead of silently returning a bound.
-
-function read_lines($path)
-    return lines(read_file($path))
-end
 
 function avg($list)
     if is_empty($list) then
