@@ -184,7 +184,7 @@ A guided tour — read in roughly this order, or jump straight to what you need.
 - [strings](strings.md) — `'raw'` vs `"${...}"`, `..` concat, codepoint vs byte vs grapheme ops, unicode escapes, padding/wrapping.
 - [numbers](numbers.md) — the f64 model, `0o`/`0x`/`0b` radix literals, integer-clean printing, numeric coercion.
 - [operators](operators.md) — `..`, arithmetic, comparison/ordering, `and`/`or`/ `not`, the `? :` ternary, `??` nil-coalesce, `&&`/`||` statement chaining.
-- [control flow](control-flow.md) — `if`/`else`, `for each`, `while`, `select`, the `end` rule, if-as-expression, inline single-statement bodies.
+- [control flow](control-flow.md) — `if`/`else`, `for $x in` (a.k.a. `for each`), `while`, `select`, the `end` rule, if-as-expression, inline single-statement bodies.
 - [functions](functions.md) — `function`/`fn`, the terse `fn($x) = expr` lambda, first-class values, closures, the pass-in/return/reassign triad, modules.
 - [collections](collections.md) — lists & maps, indexing (mixed base!), negative indices, `push`/`keys`/`merge`, slicing.
 - [higher-order functions](hof.md) — `map`/`filter`/`reduce`/`sort_by`/ `group_by`/…, the lambda-passing rules.

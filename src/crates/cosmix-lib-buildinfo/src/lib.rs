@@ -52,6 +52,11 @@ pub struct BuildInfo {
     /// Short git sha of the consumer repo's HEAD, or `"unknown"` when
     /// the consumer has no `build.rs` calling [`emit`] / no git.
     pub git_sha: &'static str,
+    /// FULL 40-hex object id of the consumer repo's HEAD (0.63.0 — the
+    /// release-B provenance gate compares a recorded `source_commit`
+    /// against this; equality with the short form can never hold).
+    /// `"unknown"` under the same conditions as `git_sha`.
+    pub git_sha_full: &'static str,
     /// Whether the consumer repo's working tree was dirty at build.
     pub git_dirty: bool,
     /// RFC3339 UTC build timestamp (honours `SOURCE_DATE_EPOCH`).
@@ -87,6 +92,7 @@ macro_rules! build_info {
             pkg: env!("CARGO_PKG_NAME"),
             version: env!("CARGO_PKG_VERSION"),
             git_sha: option_env!("COSMIX_GIT_SHA").unwrap_or("unknown"),
+            git_sha_full: option_env!("COSMIX_GIT_SHA_FULL").unwrap_or("unknown"),
             git_dirty: matches!(option_env!("COSMIX_GIT_DIRTY"), Some("1") | Some("true")),
             build_time: option_env!("COSMIX_BUILD_TIME").unwrap_or("unknown"),
         }
@@ -129,11 +135,13 @@ pub fn now_rfc3339() -> String {
 /// branch-ref watch.
 pub fn emit() {
     let sha = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    let sha_full = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     let dirty = git(&["status", "--porcelain"])
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
 
     println!("cargo:rustc-env=COSMIX_GIT_SHA={sha}");
+    println!("cargo:rustc-env=COSMIX_GIT_SHA_FULL={sha_full}");
     println!(
         "cargo:rustc-env=COSMIX_GIT_DIRTY={}",
         if dirty { 1 } else { 0 }

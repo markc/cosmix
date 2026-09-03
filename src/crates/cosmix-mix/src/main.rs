@@ -1310,6 +1310,23 @@ fn real_main() -> i32 {
                 return 0;
             }
             "--version" | "-V" => {
+                // `--version --json` (0.63.0): machine-readable build
+                // provenance. The release-B gate compares a recorded
+                // 40-hex source_commit against git_sha_full — the short
+                // sha can never satisfy an equality check, and the plain
+                // version line names neither commit nor dirtiness.
+                if args.get(i + 1).map(String::as_str) == Some("--json") {
+                    let bi = cosmix_buildinfo::build_info!();
+                    let v = serde_json::json!({
+                        "version": VERSION,
+                        "git_sha": bi.git_sha,
+                        "git_sha_full": bi.git_sha_full,
+                        "git_dirty": bi.git_dirty,
+                        "build_time": bi.build_time,
+                    });
+                    println!("{v}");
+                    return 0;
+                }
                 println!("{}", meta::version_line(VERSION));
                 return 0;
             }

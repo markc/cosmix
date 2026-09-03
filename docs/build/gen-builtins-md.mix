@@ -1,0 +1,117 @@
+#!/usr/bin/env mix
+-- gen-builtins-md.mix — regenerate docs/mix/builtins.md's category
+-- listings from the binary's own `mix builtins --json`.
+--
+-- The index claimed "generated from `mix builtins`" since 0.21.2 but no
+-- generator existed, which is exactly why it drifted: by 0.62.0 it was
+-- 70 entries short and carried wrong prose (regex_find "returns first
+-- match, or nil" vs the actual full-list return). The binary is the
+-- oracle; this script makes the claim true.
+--
+--   mix docs/build/gen-builtins-md.mix [MIX_BINARY]
+--
+-- MIX_BINARY defaults to the interpreter running this script, so the
+-- regenerated index always matches the binary that produced it. The
+-- prose header (everything before the first category section) and the
+-- tail (from "## Prelude" on) are preserved verbatim; only the category
+-- listings between them are rebuilt. Requires mix >= 0.63.0 (re_replace).
+
+$bin = realpath("/proc/self/exe")
+$argv = args()
+if length($argv) > 0 then
+  $bin = $argv[0]
+end
+
+$repo = trim(run_argv_must(["git", "rev-parse", "--show-toplevel"]))
+$md_path = $repo .. "/docs/mix/builtins.md"
+
+$version_line = trim(run_argv_must([$bin, "--version"]))
+$version = after($version_line, "mix ")
+if $version == nil then
+  die("cannot read version from: " .. $version_line)
+end
+
+$raw = run_argv_must([$bin, "builtins", "--json"])
+$all = json_parse($raw)
+
+-- Category order and page links. A category the binary reports that is
+-- missing here is a HARD ERROR — the map must be extended deliberately,
+-- never silently skipped (silent skipping is how the old index lost 70
+-- entries).
+$sections = [
+  {cat: "string",   page: "strings.md"},
+  {cat: "type",     page: "numbers.md"},
+  {cat: "math",     page: "math.md"},
+  {cat: "list",     page: "collections.md"},
+  {cat: "map",      page: "collections.md"},
+  {cat: "buffer",   page: "buffer.md"},
+  {cat: "io",       page: "io.md"},
+  {cat: "system",   page: "system.md"},
+  {cat: "format",   page: "strings.md"},
+  {cat: "json",     page: "data.md"},
+  {cat: "validate", page: "data.md"},
+  {cat: "hof",      page: "hof.md"},
+  {cat: "bus",      page: "bus.md"},
+  {cat: "db",       page: "capabilities.md"},
+  {cat: "jmap",     page: "capabilities.md"},
+  {cat: "datastar", page: "datastar.md"},
+]
+
+$known = {}
+for $s in $sections
+  $known[$s.cat] = true
+end
+$by_cat = {}
+for $b in $all
+  if $known[$b.category] == nil then
+    die("unmapped builtin category '" .. $b.category .. "' (" .. $b.name ..
+        ") — extend the sections map in gen-builtins-md.mix")
+  end
+  if $by_cat[$b.category] == nil then
+    $by_cat[$b.category] = []
+  end
+  -- push() through an index mutates a temporary copy (MIX-E1501, and it
+  -- really did empty every section on this script's first run) — assign
+  -- the returned list back.
+  $by_cat[$b.category] = push($by_cat[$b.category], $b)
+end
+
+fn section_text($s, $entries)
+  $out = "## " .. $s.cat .. "  — see [" .. before($s.page, ".md") .. "](" .. $s.page .. ")\n\n"
+  for $b in $entries
+    $name = $b.name
+    $pad = 16 - len($name)
+    if $pad < 1 then
+      $pad = 1
+    end
+    $out = $out .. "  " .. $name .. repeat(" ", $pad) .. $b.description .. "\n"
+  end
+  return $out .. "\n"
+end
+
+$old = read_file($md_path)
+$head = before($old, "## string  — see")
+if $head == nil then
+  die("no '## string' section marker in " .. $md_path)
+end
+$tail_rest = after($old, "## Prelude")
+if $tail_rest == nil then
+  die("no '## Prelude' tail marker in " .. $md_path)
+end
+$tail = "## Prelude" .. $tail_rest
+
+-- Refresh the header's version stamp (re_replace: subject first).
+$head = re_replace($head, "\\(mix [0-9][0-9.]*\\)", "(mix " .. $version .. ")")
+
+$mid = ""
+for $s in $sections
+  $entries = $by_cat[$s.cat]
+  if $entries == nil then
+    die("category '" .. $s.cat .. "' in the sections map has no builtins — remove it or fix the map")
+  end
+  $mid = $mid .. section_text($s, $entries)
+end
+
+write_file($md_path, $head .. $mid .. $tail)
+print("regenerated " .. $md_path .. ": " .. length($all) .. " builtins in " ..
+      length($sections) .. " sections (mix " .. $version .. ")")
