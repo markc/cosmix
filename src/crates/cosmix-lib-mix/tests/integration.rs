@@ -153,6 +153,15 @@ async fn test_digests() {
     run_test_script("digests.mix").await;
 }
 
+// rfc2047_decode / rfc2047_encode (v0.67.0), promoted from a production
+// nospam script. The first two assertions are the two lessons that code
+// paid for: the false `?=` terminator, and decoding to bytes before making
+// a string.
+#[tokio::test]
+async fn test_rfc2047() {
+    run_test_script("rfc2047.mix").await;
+}
+
 #[tokio::test]
 async fn test_re_family() {
     run_test_script("re_family.mix").await;

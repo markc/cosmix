@@ -635,6 +635,68 @@ For HTML output use `html_escape`; for Bus/SSE framing see [Bus messaging](bus.m
 and the [Datastar](https://data-star.dev) `ds_*` builtins. To embed a value as
 re-parseable Mix source, use `data_encode` (see [builtins](builtins.md)).
 
+## Mail headers — `rfc2047_decode` / `rfc2047_encode` (0.67.0)
+
+A mail header may only carry ASCII, so anything else travels as RFC 2047
+**encoded-words**: `=?charset?B-or-Q?data?=`. A `Subject:` read raw comes back
+as `=?utf-8?B?Q2Fmw6k=?=`, which is exactly the unreadable output a report
+exists to prevent.
+
+```
+rfc2047_decode(header)             -> plain string
+rfc2047_encode(text[, {encoding}]) -> header value ("B" default, or "Q")
+```
+
+```mix
+print(rfc2047_decode("=?utf-8?B?SGVsbG8gV29ybGQ=?="))
+print(rfc2047_decode("=?ISO-8859-1?Q?caf=E9?="))
+print(rfc2047_decode("Re: =?utf-8?B?dGVzdA==?= (fwd)"))
+print(rfc2047_encode("plain ascii subject"))
+print(rfc2047_encode("café"))
+```
+```text
+Hello World
+café
+Re: test (fwd)
+plain ascii subject
+=?UTF-8?B?Y2Fmw6k=?=
+```
+
+**Decoding.** The charset token is honoured — `utf-8`, `us-ascii` and
+`iso-8859-1` (with the usual aliases, and RFC 2231's `*language` suffix
+stripped) decode properly; **any other charset falls back to UTF-8 with U+FFFD
+substitution**, so a `koi8-r` header is legible-ish rather than exact. Adjacent
+encoded-words are joined at the **byte** level and the whitespace between them
+is dropped, per RFC 2047 §6.2 — which is not cosmetic: a long non-ASCII subject
+is folded by splitting it into several words, and a multi-byte character
+straddling that split only survives if the bytes are joined before decoding.
+Anything that is not a well-formed encoded-word is passed through **literally**,
+never dropped; a visible `=?utf-8?X?…?=` beats a silently lost subject line.
+
+**Encoding.** Plain ASCII is returned **unchanged** (§5 permits an encoded-word
+only where one is needed), unless it contains a literal `=?`, which would
+otherwise be misread by the receiving decoder. Output is always UTF-8 — the
+right answer for modern mail, and not a choice worth offering. `B` (base64) is
+the default; `{encoding: "Q"}` is more readable when the text is mostly ASCII.
+Each emitted word stays within §2's 75-character limit and splits on
+**character** boundaries, because an encoded-word must be independently
+decodable — a 4-byte emoji may never straddle two words.
+
+This pair was promoted from a deployed nospam report script, with **three**
+changes the original could not justify:
+
+1. it decoded every charset as UTF-8-lossy — right for the one mailbox it
+   served, wrong in general;
+2. it joined adjacent words as decoded *strings* rather than bytes, so a
+   character split across the fold became two replacement characters;
+3. on a malformed word it either emitted the raw payload with the wrapper
+   stripped (presenting undecoded bytes as though they had been decoded) or
+   abandoned the whole scan, leaving every later word in the header encoded.
+
+Everything the original got right is unchanged, including the false-terminator
+handling that is the reason this was promoted rather than rewritten. All three
+changes are pinned by tests.
+
 ## Gotchas recap
 
 - `"double"` interpolates **only** `${...}`; a bare `$name` is literal text.

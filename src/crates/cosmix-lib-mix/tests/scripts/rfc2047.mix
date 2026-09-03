@@ -1,0 +1,169 @@
+-- rfc2047_decode / rfc2047_encode (v0.67.0)
+--
+-- Promoted from the `rfc2047`/`qdecode` functions in nospam-shadow-report.mix,
+-- which ran in production. The two lessons that code paid for are pinned
+-- first, because they are the reason this is a promotion and not a rewrite.
+
+-- LESSON 1: the false terminator. The two `?` separators must be located
+-- BEFORE `?=` is searched for. A naive search finds a false terminator at the
+-- encoding separator the moment Q-data begins with an escape, truncating
+-- every subject that starts with an encoded space. If this line ever prints
+-- an empty or truncated result, that bug is back.
+print("[" .. rfc2047_decode("=?utf-8?Q?=20NRO_test_subject?=") .. "]")
+
+-- LESSON 2: decode to BYTES before making a string. `=C3=A9` is ONE character
+-- in two bytes; assembling codepoints instead of bytes mangles it.
+print(rfc2047_decode("=?utf-8?Q?caf=C3=A9?="))
+print(rfc2047_decode("=?utf-8?B?SGVsbG8gV29ybGQ=?="))
+
+-- WHAT CHANGED vs the promoted source, part 1: the charset token is honoured.
+-- The original decoded every word as UTF-8-lossy, so this printed "caf<fffd>".
+print(rfc2047_decode("=?ISO-8859-1?Q?caf=E9?="))
+print(rfc2047_decode("=?iso-8859-1?B?Y2FmyQ==?="))
+print(rfc2047_decode("=?LATIN1?Q?caf=E9?=") .. " " .. rfc2047_decode("=?us-ascii?Q?ok?="))
+-- The RFC 2231 *language suffix must not defeat the charset match.
+print(rfc2047_decode("=?utf-8*en?Q?caf=C3=A9?="))
+
+-- WHAT CHANGED part 2: adjacent encoded-words join at the BYTE level and the
+-- whitespace between them is dropped (RFC 2047 6.2). The original kept the
+-- space, and — worse — decoded each word separately, so a character split
+-- across two words became two replacement characters.
+print(rfc2047_decode("=?utf-8?B?SGVsbG8=?= =?utf-8?B?V29ybGQ=?="))
+print(rfc2047_decode("=?utf-8?Q?caf=C3?= =?utf-8?Q?=A9?="))
+-- ...but whitespace around REAL text is preserved, and a charset change ends
+-- the run rather than mixing two byte sequences.
+print(rfc2047_decode("Re: =?utf-8?B?dGVzdA==?= (fwd)"))
+print(rfc2047_decode("=?utf-8?Q?a?= =?iso-8859-1?Q?=E9?="))
+
+-- Anything that is not a well-formed encoded-word is passed through
+-- LITERALLY, never dropped: a header is someone else's bytes and a lost
+-- subject line is worse than a visible one.
+print(rfc2047_decode("plain subject"))
+print(rfc2047_decode("=?broken"))
+print(rfc2047_decode("=?utf-8?X?zzz?="))
+print(rfc2047_decode("=?utf-8?B?!!!not-base64!!!?="))
+-- Bracketed because the harness parses the expected block line by line and a
+-- BARE "--" would terminate it early — an empty expected line is invisible to
+-- `extract_expected`, so an empty result must be made visible another way.
+print("[" .. rfc2047_decode("") .. "]")
+
+-- CHANGE 3 vs the promoted source: a malformed word is emitted VERBATIM and
+-- the scan CONTINUES. The original emitted the bare payload for a valid-shaped
+-- word with an unreadable encoding — showing undecoded bytes as if they had
+-- been decoded — and abandoned the whole scan on a missing separator, leaving
+-- every later word in the header encoded.
+print(rfc2047_decode("=?utf-8?X?zzz?="))
+print(rfc2047_decode("x =?broken =?utf-8?B?aGk=?= y"))
+-- An empty payload is not a valid encoded-word (RFC 2047 2: encoded-text is
+-- 1*): accepting it would contribute zero bytes and desync the 6.2 run
+-- detector, so the space before the next word would resurface as real text.
+print("[" .. rfc2047_decode("=?utf-8?B??= =?utf-8?B?aGk=?=") .. "]")
+
+-- An unknown charset falls back to UTF-8-lossy, which is what the promoted
+-- implementation did for every charset — so nothing regressed for callers
+-- that were relying on it. The second case is the one that actually
+-- DEMONSTRATES the lossy path: 0xC9 is É in koi8-r/latin-1 and is not valid
+-- UTF-8 on its own, so it must come back as a replacement character. (The
+-- first case would pass either way — D0 9F is both koi8-r "П" and the valid
+-- UTF-8 encoding of U+041F, so on its own it proves nothing.)
+print(rfc2047_decode("=?koi8-r?Q?=D0=9F?="))
+print(rfc2047_decode("=?koi8-r?Q?caf=C9?=") == "caf\u{fffd}")
+
+-- Decode accepts a header carried as BYTES or a buffer, not only a string —
+-- a raw message read with read_file_bytes does not arrive as a string.
+print(rfc2047_decode(string_to_bytes("=?utf-8?B?SGVsbG8=?=")))
+print(rfc2047_decode(buffer("=?ISO-8859-1?Q?caf=E9?=")))
+-- ...and encode is symmetric: it must encode the PAYLOAD, never the
+-- "<bytes:N>" placeholder that to_mix_string would give it.
+print(rfc2047_decode(rfc2047_encode(string_to_bytes("café"))))
+
+-- RFC linear whitespace between adjacent words includes folding: a header
+-- continued onto the next line arrives with CRLF + leading space.
+print(rfc2047_decode("=?utf-8?B?SGVsbG8=?=\r\n =?utf-8?B?V29ybGQ=?="))
+print(rfc2047_decode("=?utf-8?B?SGVsbG8=?=\t=?utf-8?B?V29ybGQ=?="))
+
+-- rfc2047_encode returns plain ASCII UNCHANGED (RFC 2047 5: encode only when
+-- an encoded-word is needed) — but text containing a literal "=?" IS encoded,
+-- or a decoder would misread it.
+print(rfc2047_encode("plain ascii subject"))
+print(rfc2047_encode("literal =? here"))
+print(rfc2047_encode("café"))
+print(rfc2047_encode("café", {encoding: "Q"}))
+
+-- Round trip, both encodings, including an em dash and multiple accents.
+$s = "café — naïve résumé"
+print(rfc2047_decode(rfc2047_encode($s)) == $s)
+print(rfc2047_decode(rfc2047_encode($s, {encoding: "Q"})) == $s)
+
+-- Every emitted word is within the RFC 2047 2 limit of 75 characters, and
+-- splits on CHARACTER boundaries so each word decodes independently. The
+-- emoji case is the sharp one: a 4-byte character straddling a word boundary
+-- would produce replacement characters here.
+$long = "Ce sujet très long avec beaucoup d'accents éàçùôî doit être découpé en plusieurs mots encodés"
+$over = 0
+$split_chars = 0
+for each $enc in ["B", "Q"]
+  for each $w in split(rfc2047_encode($long, {encoding: $enc}), " ")
+    if byte_length($w) > 75 then $over = $over + 1 end
+    if pos("\u{fffd}", rfc2047_decode($w)) > 0 then $split_chars = $split_chars + 1 end
+  end
+end
+print("over75=" .. $over .. " split=" .. $split_chars)
+$emoji = repeat("🎉", 40)
+print(rfc2047_decode(rfc2047_encode($emoji)) == $emoji)
+
+-- Option errors are structured, not silently ignored.
+try
+  rfc2047_encode("x", {encoding: "Z"})
+catch $msg, $err
+  print($err.code .. " " .. $msg)
+end
+try
+  rfc2047_encode("x", {enc: "B"})
+catch $msg, $err
+  print($msg)
+end
+try
+  rfc2047_decode([1])
+catch $msg, $err
+  print($msg)
+end
+
+-- Expected output:
+-- [ NRO test subject]
+-- café
+-- Hello World
+-- café
+-- cafÉ
+-- café ok
+-- café
+-- HelloWorld
+-- café
+-- Re: test (fwd)
+-- aé
+-- plain subject
+-- =?broken
+-- =?utf-8?X?zzz?=
+-- =?utf-8?B?!!!not-base64!!!?=
+-- []
+-- =?utf-8?X?zzz?=
+-- x =?broken hi y
+-- [=?utf-8?B??= hi]
+-- П
+-- true
+-- Hello
+-- café
+-- café
+-- HelloWorld
+-- HelloWorld
+-- plain ascii subject
+-- =?UTF-8?B?bGl0ZXJhbCA9PyBoZXJl?=
+-- =?UTF-8?B?Y2Fmw6k=?=
+-- =?UTF-8?Q?caf=C3=A9?=
+-- true
+-- true
+-- over75=0 split=0
+-- true
+-- OPTION_INVALID rfc2047_encode(): encoding must be "B" or "Q", got "Z"
+-- rfc2047_encode(): unknown option 'enc' (only 'encoding' is accepted)
+-- rfc2047_decode(): expected string, bytes or buffer, got list

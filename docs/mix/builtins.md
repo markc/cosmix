@@ -1,6 +1,6 @@
 # Builtin index
 
-Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.66.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
+Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.67.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
 
 Some builtins are feature-gated on the `cosmix-lib-mix` crate (`json`, `regex`, `toml`, `datetime`, `url`, `crypto`, `http`, `sqlite`, `dkim`, `markdown`, `datastar`) so embedders can pull only what they need — the `mix` binary turns them all on.
 
@@ -90,6 +90,8 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   url_parse       Parse URL into {scheme, host, port, path, query, fragment}
   url_decode      Percent-decode a URL/form-encoded string ('+' → space)
   url_encode      Percent-encode a string for use in a URL/form body
+  rfc2047_decode  Decode RFC 2047 encoded-words in a mail header value (=?charset?B/Q?data?=) to a plain string. Honours the charset token (utf-8/us-ascii/iso-8859-1; anything else falls back to UTF-8-lossy), joins adjacent encoded-words at the BYTE level per §6.2 so a character split across two words survives, and passes malformed words through literally rather than losing the header. Accepts string/bytes/buffer (v0.67.0)
+  rfc2047_encode  Encode a header value as RFC 2047 encoded-words in UTF-8, or return it UNCHANGED when it is already plain ASCII with no "=?" (§5: encode only when needed). Optional {encoding: "B"|"Q"}, default B. Words are kept within the §2 75-character limit and split on CHARACTER boundaries so each stays independently decodable (v0.67.0)
   parse_query     Parse a k=v&k2=v2 query/form string into a map (url-decoded, last-wins)
   parse_form      Parse an x-www-form-urlencoded body into a map (alias of parse_query)
   byte_length     Length of a string in raw UTF-8 bytes (the pre-0.8.0 length() value for strings)

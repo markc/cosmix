@@ -150,6 +150,8 @@ builtin_table! {
     ("url_parse", CapabilityClass::Pure,       "string",  "Parse URL into {scheme, host, port, path, query, fragment}", contract!((url: string) -> map("url_parts", {scheme: string, host: string, port: any, path: string, query: string, fragment: string}))),
     ("url_decode", CapabilityClass::Pure,      "string",  "Percent-decode a URL/form-encoded string ('+' → space)", contract!((s: string) -> string)),
     ("url_encode", CapabilityClass::Pure,      "string",  "Percent-encode a string for use in a URL/form body", contract!((s: string) -> string)),
+    ("rfc2047_decode", CapabilityClass::Pure,  "string",  "Decode RFC 2047 encoded-words in a mail header value (=?charset?B/Q?data?=) to a plain string. Honours the charset token (utf-8/us-ascii/iso-8859-1; anything else falls back to UTF-8-lossy), joins adjacent encoded-words at the BYTE level per §6.2 so a character split across two words survives, and passes malformed words through literally rather than losing the header. Accepts string/bytes/buffer (v0.67.0)", contract!((header: any_of(string, bytes, buffer)) -> string; failure[raises])),
+    ("rfc2047_encode", CapabilityClass::Pure,  "string",  "Encode a header value as RFC 2047 encoded-words in UTF-8, or return it UNCHANGED when it is already plain ASCII with no \"=?\" (§5: encode only when needed). Optional {encoding: \"B\"|\"Q\"}, default B. Words are kept within the §2 75-character limit and split on CHARACTER boundaries so each stays independently decodable (v0.67.0)", contract!((text: string, opts?: map) -> string; failure[raises])),
     ("parse_query", CapabilityClass::Pure,     "string",  "Parse a k=v&k2=v2 query/form string into a map (url-decoded, last-wins)", contract!((s: string) -> map)),
     ("parse_form", CapabilityClass::Pure,      "string",  "Parse an x-www-form-urlencoded body into a map (alias of parse_query)", contract!((s: string) -> map)),
 
@@ -690,6 +692,24 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         // build without the `url` feature still needs form/query decode.
         "url_decode" => builtin_url_decode(args),
         "url_encode" => builtin_url_encode(args),
+        // RFC 2047 lives behind `crypto` because the B encoding is base64,
+        // which is where the base64 engine is gated.
+        #[cfg(feature = "crypto")]
+        "rfc2047_decode" => builtin_rfc2047_decode(args),
+        #[cfg(not(feature = "crypto"))]
+        "rfc2047_decode" => Err(MixError::RuntimeError {
+            span: None,
+            msg: "rfc2047_decode() requires the `crypto` feature (its B encoding is base64)"
+                .to_string(),
+        }),
+        #[cfg(feature = "crypto")]
+        "rfc2047_encode" => builtin_rfc2047_encode(args),
+        #[cfg(not(feature = "crypto"))]
+        "rfc2047_encode" => Err(MixError::RuntimeError {
+            span: None,
+            msg: "rfc2047_encode() requires the `crypto` feature (its B encoding is base64)"
+                .to_string(),
+        }),
         "parse_query" => builtin_parse_urlencoded(args, "parse_query"),
         "parse_form" => builtin_parse_urlencoded(args, "parse_form"),
         #[cfg(feature = "crypto")]
@@ -13127,6 +13147,450 @@ fn builtin_url_encode(args: Vec<Value>) -> MixResult<Option<Value>> {
     Ok(Some(Value::String(out)))
 }
 
+// --- RFC 2047 encoded-words (v0.67.0) ---
+//
+// PROVENANCE: promoted from the `rfc2047`/`qdecode`/`is_b64` functions in
+// `nospam-shadow-report.mix`, which ran in production long enough to earn the
+// two lessons encoded below. It is NOT a transliteration — see "What changed"
+// on `rfc2047_decode` — because the two things that were acceptable in a
+// single-purpose script (one charset, one mailbox) are not acceptable in a
+// language primitive that every future caller inherits.
+
+/// The charsets `rfc2047_decode` understands, resolved from the
+/// encoded-word's charset token (case-insensitive, and the `*language`
+/// suffix of RFC 2231 §5 is stripped before matching).
+#[cfg(feature = "crypto")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeaderCharset {
+    /// UTF-8 and its ASCII subset — decoded strictly, then lossily as a
+    /// fallback, because a truncated multi-byte sequence in a real header is
+    /// far more common than a caller who would rather see an error.
+    Utf8,
+    /// ISO-8859-1 / latin-1: every byte 0x00-0xFF maps to the codepoint of
+    /// the same value, so this decode can never fail.
+    Latin1,
+    /// Anything else. Decoded as UTF-8-lossy, which is what the proven
+    /// implementation did for EVERY charset.
+    Unknown,
+}
+
+#[cfg(feature = "crypto")]
+impl HeaderCharset {
+    fn from_token(token: &str) -> Self {
+        // RFC 2231 §5 allows `charset*language`; the language tag is not part
+        // of the charset name and must not defeat the match.
+        let base = token.split('*').next().unwrap_or(token).to_ascii_lowercase();
+        match base.as_str() {
+            "utf-8" | "utf8" | "us-ascii" | "ascii" | "iso-8859-1" | "iso8859-1" | "latin1"
+            | "latin-1" | "l1" => {
+                if base.starts_with("utf") || base.contains("ascii") {
+                    Self::Utf8
+                } else {
+                    Self::Latin1
+                }
+            }
+            _ => Self::Unknown,
+        }
+    }
+
+    fn decode(self, bytes: &[u8]) -> String {
+        match self {
+            Self::Latin1 => bytes.iter().map(|&b| b as char).collect(),
+            // Strict first so a well-formed sequence is exact; lossy only as
+            // the fallback, so U+FFFD appears exactly where the input was
+            // genuinely malformed rather than everywhere.
+            Self::Utf8 | Self::Unknown => match std::str::from_utf8(bytes) {
+                Ok(s) => s.to_string(),
+                Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+            },
+        }
+    }
+}
+
+/// One decoded encoded-word: its charset and its raw bytes, held UNDECODED
+/// so that adjacent words can be concatenated at the BYTE level first.
+#[cfg(feature = "crypto")]
+struct EncodedWord {
+    charset: HeaderCharset,
+    bytes: Vec<u8>,
+}
+
+/// Decode the `Q` encoding of RFC 2047 §4.2 to raw bytes.
+///
+/// Underscore is a space (that is the whole difference from
+/// quoted-printable), `=XX` is one byte, and a malformed `=` is passed
+/// through literally rather than swallowed — a header is someone else's
+/// bytes and a lenient reader beats a lost subject line.
+#[cfg(feature = "crypto")]
+fn q_decode(data: &str) -> Vec<u8> {
+    let raw = data.as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i] {
+            b'_' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'=' if i + 2 < raw.len() => {
+                let hi = (raw[i + 1] as char).to_digit(16);
+                let lo = (raw[i + 2] as char).to_digit(16);
+                match (hi, lo) {
+                    (Some(h), Some(l)) => {
+                        out.push((h * 16 + l) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(raw[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Parse ONE encoded-word starting at `s[0..]` which begins with `=?`.
+///
+/// Returns the word and the byte offset just past its `?=` terminator, or
+/// `None` when this is not a well-formed encoded-word (in which case the
+/// caller emits the `=?` literally and moves on).
+///
+/// ⚠ THE FALSE-TERMINATOR LESSON, carried over verbatim in spirit from the
+/// production implementation: the two `?` separators must be located BEFORE
+/// the `?=` terminator is searched for. Searching for `?=` from the start of
+/// the word finds a false terminator the moment Q-encoded data begins with an
+/// escape — `=?utf-8?Q?=20NRO...` has a literal `?=` at the encoding
+/// separator, four characters in. Getting this wrong truncates every subject
+/// that starts with an encoded space.
+#[cfg(feature = "crypto")]
+fn parse_encoded_word(s: &str) -> Option<(EncodedWord, usize)> {
+    let rest = s.strip_prefix("=?")?;
+    let q1 = rest.find('?')?;
+    let charset_token = &rest[..q1];
+    let after1 = &rest[q1 + 1..];
+    let q2 = after1.find('?')?;
+    let enc = after1[..q2].to_ascii_uppercase();
+    let data_and_tail = &after1[q2 + 1..];
+    // ONLY NOW is the terminator searched for — see the warning above.
+    let end = data_and_tail.find("?=")?;
+    let data = &data_and_tail[..end];
+    // RFC 2047 §2: an encoded-word's charset and encoding tokens may not be
+    // empty, and §2's `encoded-text = 1*<...>` requires at least one payload
+    // character. Rejecting the empty payload is not pedantry — an accepted
+    // zero-byte word leaves `pending` empty in the caller, which desyncs the
+    // §6.2 run detector and makes the whitespace before the NEXT word read as
+    // real text (`=?utf-8?B??= =?utf-8?B?aGk?=` would give " hi", not "hi").
+    if charset_token.is_empty() || enc.is_empty() || data.is_empty() {
+        return None;
+    }
+    use base64::Engine as _;
+    let bytes = match enc.as_str() {
+        "B" => base64::engine::general_purpose::STANDARD
+            .decode(data.as_bytes())
+            .ok()?,
+        "Q" => q_decode(data),
+        // An unknown encoding token is not an encoded-word we can read.
+        _ => return None,
+    };
+    let consumed = 2 + q1 + 1 + q2 + 1 + end + 2;
+    Some((
+        EncodedWord {
+            charset: HeaderCharset::from_token(charset_token),
+            bytes,
+        },
+        consumed,
+    ))
+}
+
+/// `rfc2047_decode($header)` — decode RFC 2047 encoded-words in a header
+/// value to a plain string (v0.67.0).
+///
+/// **What changed from the production implementation this was promoted
+/// from**, and why each was not safe to carry forward into a builtin:
+///
+/// 1. **The charset token is honoured.** The original decoded every word as
+///    UTF-8-lossy, which is correct for the one mailbox it served and wrong
+///    in general: `=?ISO-8859-1?Q?caf=E9?=` became `caf<U+FFFD>` instead of
+///    `café`. Latin-1 and UTF-8 (and us-ascii) are decoded properly; an
+///    unknown charset still falls back to UTF-8-lossy, which is the old
+///    behaviour, so nothing regressed.
+/// 2. **Adjacent encoded-words are joined at the BYTE level** and the
+///    linear whitespace between them is dropped, per RFC 2047 §6.2. The
+///    original appended each word's decoded string and kept the separating
+///    space. That matters beyond cosmetics: a multi-byte character split
+///    across two words (which is how a long non-ASCII subject is folded)
+///    decoded to two U+FFFDs, because each half was lossily decoded on its
+///    own. Joining the bytes first makes the character whole.
+///
+/// 3. **A malformed word is emitted literally and the scan CONTINUES.** The
+///    original did two different things here, and both lost data: for a
+///    structurally valid word with an unreadable encoding it emitted the
+///    payload alone (`=?utf-8?X?zzz?=` → `zzz`, silently presenting
+///    undecoded bytes as if they had been decoded), and for a missing
+///    separator or terminator it `break`-ed out of the whole scan, leaving
+///    every LATER word in the header still encoded. Passing the word through
+///    verbatim and carrying on means a caller sees `=?utf-8?X?zzz?=` — ugly,
+///    but honest, and the rest of the header is still decoded.
+///
+/// Everything not an encoded-word is passed through untouched. A header is
+/// someone else's bytes, and the caller would rather see `=?x?Q?` than
+/// silently lose a subject line — or worse, be shown raw payload bytes with
+/// no sign that they were never decoded.
+#[cfg(feature = "crypto")]
+fn builtin_rfc2047_decode(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("rfc2047_decode", &args, 1, 1)?;
+    let s = match &args[0] {
+        Value::String(s) => s.clone(),
+        // A header arrives as bytes often enough (read_file_bytes on a raw
+        // message) that refusing them would just make every caller write the
+        // same lossy decode by hand — and worse than this one, because it
+        // would run before the charset is known.
+        Value::Bytes(_) | Value::Buffer(_) => {
+            let raw = subject_bytes("rfc2047_decode", &args[0])?;
+            String::from_utf8_lossy(&raw).into_owned()
+        }
+        other => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "rfc2047_decode(): expected string, bytes or buffer, got {}",
+                    other.type_name()
+                ),
+            });
+        }
+    };
+
+    let mut out = String::with_capacity(s.len());
+    // Bytes of a run of adjacent encoded-words, held until the run ends so
+    // they can be decoded as one unit (see point 2 above).
+    let mut pending: Vec<u8> = Vec::new();
+    let mut pending_charset = HeaderCharset::Utf8;
+    let mut rest = s.as_str();
+
+    macro_rules! flush {
+        () => {
+            if !pending.is_empty() {
+                out.push_str(&pending_charset.decode(&pending));
+                pending.clear();
+            }
+        };
+    }
+
+    while let Some(at) = rest.find("=?") {
+        // Literal text before the word. If it is nothing but whitespace AND a
+        // word is pending AND another word follows, RFC 2047 §6.2 says to
+        // drop it; otherwise it is real text and the run ends here.
+        let literal = &rest[..at];
+        match parse_encoded_word(&rest[at..]) {
+            Some((word, consumed)) => {
+                let joins_run =
+                    !pending.is_empty() && !literal.is_empty() && literal.trim().is_empty();
+                if !joins_run && !literal.is_empty() {
+                    flush!();
+                    out.push_str(literal);
+                }
+                // A charset change ends the run: two charsets cannot share a
+                // byte sequence.
+                if !pending.is_empty() && pending_charset != word.charset {
+                    flush!();
+                }
+                pending_charset = word.charset;
+                pending.extend_from_slice(&word.bytes);
+                rest = &rest[at + consumed..];
+            }
+            None => {
+                // Not a word after all: emit up to and including the `=?` and
+                // keep scanning after it, so a later real word is still found.
+                flush!();
+                out.push_str(literal);
+                out.push_str("=?");
+                rest = &rest[at + 2..];
+            }
+        }
+    }
+    flush!();
+    out.push_str(rest);
+    Ok(Some(Value::String(out)))
+}
+
+/// `rfc2047_encode($text[, {encoding: "B"|"Q"}])` — encode a header value as
+/// RFC 2047 encoded-words in UTF-8 (v0.67.0).
+///
+/// Returns the input UNCHANGED when it is already plain ASCII with no `=?`
+/// in it: RFC 2047 §5 only permits an encoded-word where one is needed, and
+/// a header that does not need encoding must not get it.
+///
+/// UTF-8 is the only output charset on purpose — it is what modern mail
+/// uses, and offering a choice would invite generating headers in charsets
+/// the caller cannot verify. `B` (base64) is the default because its size is
+/// predictable for any input; `Q` is more readable when the text is mostly
+/// ASCII.
+///
+/// Each emitted word is kept within RFC 2047 §2's **75-character** limit, and
+/// splitting happens on CHARACTER boundaries — an encoded-word must be
+/// independently decodable, so a multi-byte character may never straddle two
+/// words. That constraint is why this cannot just chunk the base64 output.
+#[cfg(feature = "crypto")]
+fn builtin_rfc2047_encode(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("rfc2047_encode", &args, 1, 2)?;
+    let text = match &args[0] {
+        Value::String(s) => s.clone(),
+        // SYMMETRY WITH DECODE. `rfc2047_decode` accepts bytes/buffer because
+        // a header often arrives as raw bytes; if encode fell through to
+        // `to_mix_string` here it would encode the literal `<bytes:N>`
+        // PLACEHOLDER — a matched pair where one half serves byte-carried
+        // headers and the other silently encodes their description is a trap,
+        // not a coercion. Decoded the same lossy way decode's input path is.
+        Value::Bytes(_) | Value::Buffer(_) => {
+            let raw = subject_bytes("rfc2047_encode", &args[0])?;
+            String::from_utf8_lossy(&raw).into_owned()
+        }
+        other => other.to_mix_string(),
+    };
+    let mut use_q = false;
+    match args.get(1) {
+        None | Some(Value::Nil) => {}
+        Some(Value::Map(m)) => {
+            for key in m.keys() {
+                if key != "encoding" {
+                    return Err(MixError::structured(
+                        "OPTION_INVALID",
+                        format!(
+                            "rfc2047_encode(): unknown option '{key}' (only 'encoding' is accepted)"
+                        ),
+                    ));
+                }
+            }
+            if let Some(v) = m.get("encoding") {
+                match v.to_mix_string().to_ascii_uppercase().as_str() {
+                    "B" => use_q = false,
+                    "Q" => use_q = true,
+                    other => {
+                        return Err(MixError::structured(
+                            "OPTION_INVALID",
+                            format!(
+                                "rfc2047_encode(): encoding must be \"B\" or \"Q\", got {other:?}"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Some(other) => {
+            return Err(MixError::structured(
+                "OPTION_INVALID",
+                format!(
+                    "rfc2047_encode(): options must be a map or nil, got {}",
+                    other.type_name()
+                ),
+            ));
+        }
+    }
+
+    // §5: leave it alone if it does not need encoding. `=?` is checked too,
+    // because plain text containing it would otherwise be misread as an
+    // encoded-word by the receiving decoder.
+    if text.is_ascii() && !text.contains("=?") {
+        return Ok(Some(Value::String(text)));
+    }
+
+    let prefix = if use_q { "=?UTF-8?Q?" } else { "=?UTF-8?B?" };
+    // RFC 2047 §2 caps a whole encoded-word at 75 characters. DERIVED from the
+    // prefix rather than hand-written as `75 - 10 - 2`, so changing the prefix
+    // cannot silently overshoot the limit.
+    let payload_max = 75 - prefix.len() - "?=".len();
+    let mut words: Vec<String> = Vec::new();
+    let mut chunk = String::new();
+    // For Q, cost is per character and exact. For B it is a function of the
+    // chunk's TOTAL byte length, not a sum of per-character costs: base64
+    // packs 3 input bytes into 4 output chars across character boundaries, so
+    // charging each character its own ceiling over-counts badly — it produced
+    // 40-character words where 75 were allowed, i.e. nearly twice as many
+    // encoded-words as the header needed.
+    let mut q_cost = 0usize;
+    let mut chunk_bytes = 0usize;
+    let b64_len = |bytes: usize| bytes.div_ceil(3) * 4;
+
+    for ch in text.chars() {
+        // Measured per CHARACTER so a word never splits one — an encoded-word
+        // must be independently decodable.
+        let would_exceed = if use_q {
+            q_cost + q_encoded_len(ch) > payload_max
+        } else {
+            b64_len(chunk_bytes + ch.len_utf8()) > payload_max
+        };
+        if would_exceed && !chunk.is_empty() {
+            words.push(encode_word(prefix, &chunk, use_q));
+            chunk.clear();
+            q_cost = 0;
+            chunk_bytes = 0;
+        }
+        chunk.push(ch);
+        q_cost += q_encoded_len(ch);
+        chunk_bytes += ch.len_utf8();
+    }
+    if !chunk.is_empty() {
+        words.push(encode_word(prefix, &chunk, use_q));
+    }
+    // A space between adjacent words is what a decoder is required to drop
+    // (§6.2), and it is what lets a mail agent fold the header.
+    Ok(Some(Value::String(words.join(" "))))
+}
+
+/// Output length of one character under the `Q` encoding.
+#[cfg(feature = "crypto")]
+fn q_encoded_len(ch: char) -> usize {
+    // One output character for a space (which becomes `_`) and for an ASCII
+    // alphanumeric, which travels as itself; `=XX` — three characters — for
+    // every byte of anything else.
+    if q_travels_as_one_char(ch) {
+        1
+    } else {
+        ch.len_utf8() * 3
+    }
+}
+
+/// The characters the `Q` encoding emits as a single output character. Kept
+/// as one predicate so [`q_encoded_len`] and [`encode_word`] can never
+/// disagree about which characters those are — a disagreement would silently
+/// produce encoded-words over the 75-character limit.
+#[cfg(feature = "crypto")]
+fn q_travels_as_one_char(ch: char) -> bool {
+    ch == ' ' || ch.is_ascii_alphanumeric()
+}
+
+/// Wrap one payload chunk into a complete encoded-word.
+#[cfg(feature = "crypto")]
+fn encode_word(prefix: &str, chunk: &str, use_q: bool) -> String {
+    let payload = if use_q {
+        let mut s = String::new();
+        for ch in chunk.chars() {
+            if ch == ' ' {
+                s.push('_');
+            } else if q_travels_as_one_char(ch) {
+                s.push(ch);
+            } else {
+                let mut buf = [0u8; 4];
+                for &b in ch.encode_utf8(&mut buf).as_bytes() {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "={:02X}", b);
+                }
+            }
+        }
+        s
+    } else {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(chunk.as_bytes())
+    };
+    format!("{prefix}{payload}?=")
+}
+
 // --- Crypto builtins (feature-gated) ---
 
 /// Borrow a `Value`'s raw byte view for crypto / encoding builtins.
@@ -14984,6 +15448,7 @@ fn builtin_help(_args: Vec<Value>) -> MixResult<Option<Value>> {
     println!("           (also $b[i], length, slice and `for each` — v0.64.0)");
     println!("SQL:       sqlopen sqlexec sqlclose");
     println!("URL:       url_parse");
+    println!("Mail:      rfc2047_decode rfc2047_encode (header encoded-words, v0.67.0)");
     println!("Bus:       send address emit port_exists");
     println!();
     println!("Keywords:  if/then/else/end  for/to/step/next  for each/in/next");
@@ -20583,6 +21048,11 @@ mod char_aware_tests {
             "repeat",
             "replace",
             "reverse",
+            // Pure string transforms — they are behind the `crypto` feature
+            // only because the B encoding is base64, not because they touch
+            // any host authority.
+            "rfc2047_decode",
+            "rfc2047_encode",
             "right",
             "rpad",
             "rpad_w",
