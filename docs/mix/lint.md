@@ -42,9 +42,9 @@ in their own summary field, and **never** gating. Current D-codes:
 
 | code | what it flags |
 |---|---|
-| `MIX-D3001`–`D3005` | the five pattern-first legacy names `regex_match regex_find regex_replace regex_split grep` — use the subject-first `re_match re_find re_replace re_split grep_lines` (these five promote to warnings in release A.1 and the legacy names are deleted in release B) |
-| `MIX-D3006` | any two-variable `for`/`for each` loop — watch note for the A.1 change of MAP iteration to (key, value); retired in A.1 |
-| `MIX-D3007` | `==`/`!=` where an operand is provably a map or list (always false/true today — use `deep_eq`); A.1 makes the comparison raise; retired then |
+| `MIX-D3001`–`D3005` | the five pattern-first legacy names `regex_match regex_find regex_replace regex_split grep` — use the subject-first `re_match re_find re_replace re_split grep_lines`. These stay **notes** for now: their promotion to warnings was deferred out of A.1 because the inventory still reads 585 call sites across 202 files, and the migration is an argument swap (pattern-first → subject-first), not a rename. The legacy names are deleted in release B |
+| ~~`MIX-D3006`~~ | **RETIRED in 0.68.0.** Watch note for the map-binding flip, which has landed: a two-variable loop over a MAP now binds (key, value). Code permanently spent, never reused |
+| ~~`MIX-D3007`~~ | **RETIRED in 0.68.0.** Watch note for the equality flip, which has landed: `==`/`!=` with a map or list on **both** sides now raises `TYPE_ERROR` naming `deep_eq`. The shipped rule is narrower than this note's "either operand" wording — a collection compared to a *scalar* still answers, so `$m[$k] == nil` keeps working. Code permanently spent, never reused |
 | `MIX-D3008`–`D3011` | the REXX-style `pos lastpos byte_pos byte_lastpos` family, declared legacy — with a sharper message when composed as `substr(.., pos(..))` in one expression (the 1-based/0-based off-by-one). These stay notes until their own fleet count reads zero; they are NOT deleted in release B |
 
 Member-call spellings are covered too: a builtin-named `.name(` desugars

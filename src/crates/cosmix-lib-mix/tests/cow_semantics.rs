@@ -99,18 +99,41 @@ async fn self_assign_shapes_snapshot_not_cycle() {
     assert_eq!(out, "[[0]]\n[1, [1]]\n{a: 1, s: {a: 1}}\n");
 }
 
-// ── Equality pins (no ptr_eq fast path — container equality is always
-// false in Mix, even self-compare; a ptr_eq shortcut would flip these) ──
+// ── Equality pins (no ptr_eq fast path; container `==` RAISES since
+// 0.68.0, even on a self-compare — a ptr_eq shortcut would have made
+// `$l == $l` answer true instead) ──
 
 #[tokio::test]
-async fn container_equality_stays_false_even_shared() {
-    let out = run("$l = [1]\nprint($l == $l)\n$m = $l\nprint($l == $m)\n\
-                   print({a: 1} == {a: 1})\n\
-                   $b1 = string_to_bytes(\"abc\")\n$b2 = string_to_bytes(\"abc\")\nprint($b1 == $b2)\n")
+async fn container_equality_raises_even_when_shared() {
+    // Until 0.68.0 these answered `false`. They now raise TYPE_ERROR: an
+    // answer that is a constant dressed as a comparison was the bug. The
+    // SELF-compare and the shared-Rc alias are the interesting arms — a
+    // ptr_eq fast path would have short-circuited both to `true`, so the
+    // raise is what keeps that door shut.
+    for src in [
+        "$l = [1]\nprint($l == $l)\n",
+        "$l = [1]\n$m = $l\nprint($l == $m)\n",
+        "print({a: 1} == {a: 1})\n",
+        "$l = [1]\nprint($l != $l)\n",
+    ] {
+        let err = run(src).await.expect_err("container == must raise");
+        assert!(err.contains("deep_eq"), "must name the fix: {err}");
+    }
+
+    // ...and `deep_eq` is that fix, including on a self-compare.
+    let out = run("$l = [1, [2]]\nprint(deep_eq($l, $l))\nprint(deep_eq($l, [1, [2]]))\n")
         .await
         .unwrap();
-    // bytes: CONTENT equality across distinct allocations stays true.
-    assert_eq!(out, "false\nfalse\nfalse\ntrue\n");
+    assert_eq!(out, "true\ntrue\n");
+
+    // bytes: CONTENT equality across distinct allocations stays true, and
+    // is NOT swept up by the container raise — bytes have a real structural
+    // arm in PartialEq, so `==` on them was never a constant.
+    let out = run("$b1 = string_to_bytes(\"abc\")\n$b2 = string_to_bytes(\"abc\")\n\
+                   print($b1 == $b2)\nprint($b1 != string_to_bytes(\"abd\"))\n")
+        .await
+        .unwrap();
+    assert_eq!(out, "true\ntrue\n");
 }
 
 // ── Deep-nest drop safety (the Rc-aware iterative Drop) ────────────

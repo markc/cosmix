@@ -162,6 +162,15 @@ async fn test_rfc2047() {
     run_test_script("rfc2047.mix").await;
 }
 
+// Release A.1 (v0.68.0) — the two behaviour flips (map two-var binding
+// becomes (key, value); map/list `==` raises) AND the things that
+// deliberately did not move with them: list/string/bytes binding, bytes
+// equality, scalars, and every internal comparison.
+#[tokio::test]
+async fn test_a1_flips() {
+    run_test_script("a1_flips.mix").await;
+}
+
 #[tokio::test]
 async fn test_re_family() {
     run_test_script("re_family.mix").await;

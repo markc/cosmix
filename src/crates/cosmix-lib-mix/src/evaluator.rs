@@ -6920,11 +6920,34 @@ impl Evaluator {
                         Snap(Rc<Vec<Value>>),
                         Owned(Vec<Value>),
                     }
+                    // `Some(keys)` ONLY for a two-variable map loop: what the
+                    // first variable binds to per iteration. `None` everywhere
+                    // else, and the binding site falls back to the position
+                    // index — so lists, strings and bytes are unchanged.
+                    let mut map_pair_keys: Option<Vec<Value>> = None;
                     let mut src = match &iter_val {
                         Value::List(items) => IterSrc::Snap(Rc::clone(items)),
                         Value::String(s) => IterSrc::Owned(
                             s.chars().map(|c| Value::String(c.to_string())).collect(),
                         ),
+                        // A MAP binds by ARITY (v0.68.0, Release A.1):
+                        //   one variable  → the KEYS      (unchanged)
+                        //   two variables → (KEY, VALUE)  (was (index, key))
+                        // Both are snapshotted at entry, matching the key
+                        // snapshot this arm has always taken, so a body that
+                        // mutates the source map iterates the entry set.
+                        //
+                        // The flip's gate was "no map-pair dependant exists":
+                        // MIX-D3006 made every two-variable loop visible for
+                        // the 0.63.0 cycle and the inventory came back with
+                        // every site iterating a LIST, on the fleet and
+                        // locally. Lists, strings and bytes are untouched —
+                        // they still bind (index, item).
+                        Value::Map(m) if index_var.is_some() => {
+                            map_pair_keys =
+                                Some(m.keys().map(|k| Value::String(k.clone())).collect());
+                            IterSrc::Owned(m.values().cloned().collect())
+                        }
                         Value::Map(m) => {
                             IterSrc::Owned(m.keys().map(|k| Value::String(k.clone())).collect())
                         }
@@ -7183,11 +7206,18 @@ impl Evaluator {
                         // `$p`). The fast paths above are `!in_function`
                         // guarded, so this generic loop owns the in-function case.
                         if let Some(idx_var) = index_var {
+                            // (key, value) for a two-variable MAP loop, else
+                            // the position index. `map_pair_keys` is built
+                            // from the same snapshot as `items`, so the two
+                            // are index-aligned by construction.
+                            let first = match &map_pair_keys {
+                                Some(keys) => keys[i].clone(),
+                                None => Value::Number(i as f64),
+                            };
                             if in_function {
-                                self.scope
-                                    .set_in_current(idx_var.clone(), Value::Number(i as f64));
+                                self.scope.set_in_current(idx_var.clone(), first);
                             } else {
-                                self.scope.update_or_set(idx_var, Value::Number(i as f64));
+                                self.scope.update_or_set(idx_var, first);
                             }
                         }
                         if in_function {
@@ -11582,6 +11612,64 @@ impl Evaluator {
                 Ok(Value::Number(l % r))
             }
             BinOp::Power => num_op(left, right, |a, b| a.powf(b)),
+            // Map/List `==`/`!=` RAISES (v0.68.0, Release A.1) rather than
+            // silently answering false/true. `Value`'s `PartialEq` has no
+            // structural arm, so `[1,2] == [1,2]` was `false` and
+            // `[1,2] != [1,2]` was `true` — an answer that looks like a
+            // comparison and is really a constant. `deep_eq(a, b)` (0.63.0)
+            // is the structural comparison, and the diagnostic names it.
+            //
+            // SCOPED TO THE OPERATORS ONLY, deliberately. `PartialEq` itself
+            // is untouched, so every INTERNAL comparison keeps working:
+            // `contains`, `index_of`, `unique`'s dedup, map key lookup, and
+            // `deep_eq`'s own leaf compares all call `==` on `Value` in Rust
+            // and never come through `eval_binop`. Making PartialEq raise
+            // would have been unimplementable anyway — it returns `bool`.
+            //
+            // BOTH operands must be collections — a DELIBERATE narrowing of
+            // the MIX-D3007 note's "either operand" test, and the narrowing is
+            // the whole safety of this flip.
+            //
+            // The bug being fixed is a comparison that is constant REGARDLESS
+            // OF CONTENTS, and only collection-vs-collection has that shape.
+            // Collection-vs-scalar is a genuine type difference, and `false`
+            // is the truthful answer — exactly as `1 == "a"` is honestly
+            // false. Above all, `$map[$key] == nil` is THE key-absence idiom:
+            // 3,856 `== nil`/`!= nil` sites across 381 local .mix files, 1,059
+            // of them the indexed shape whose value is a list or map whenever
+            // the key happens to be populated. Raising there would have broken
+            // them data-dependently — the worst failure mode available, since
+            // the same line works until the map is non-empty.
+            //
+            // That case is not hypothetical: it broke this repo's own
+            // `docs/build/gen-builtins-md.mix:70` the first time the wider
+            // rule ran. The static D3007 inventory could never have caught it
+            // — the note only fired on PROVABLE collection operands, as its
+            // own comment admitted — so "zero D3007 sites" was evidence for
+            // this narrow scope, never for the wide one.
+            //
+            // Bytes and Buffer are excluded throughout: they have real content
+            // equality (see value.rs), so `==` on them was never a constant.
+            BinOp::Eq | BinOp::NotEq
+                if matches!(&*left, Value::List(_) | Value::Map(_))
+                    && matches!(right, Value::List(_) | Value::Map(_)) =>
+            {
+                let op_str = if matches!(op, BinOp::Eq) { "==" } else { "!=" };
+                Err(MixError::structured(
+                    "TYPE_ERROR",
+                    format!(
+                        "`{op_str}` is not defined for {} and {} — it would always answer {}, \
+                         not compare them. Use deep_eq(a, b) for structural comparison",
+                        left.type_name(),
+                        right.type_name(),
+                        if matches!(op, BinOp::Eq) {
+                            "false"
+                        } else {
+                            "true"
+                        }
+                    ),
+                ))
+            }
             BinOp::Eq => Ok(Value::Bool(&*left == right)),
             BinOp::NotEq => Ok(Value::Bool(&*left != right)),
             BinOp::Gt => num_cmp(

@@ -50,12 +50,16 @@ fn notes_render_and_count_separately() {
     let (code, out) = lint(&[path.to_str().unwrap()]);
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("MIX-D3001 note:"), "{out}");
-    assert!(out.contains("MIX-D3006 note:"), "{out}");
-    assert!(out.contains("MIX-D3007 note:"), "{out}");
     assert!(out.contains("MIX-D3008 note:"), "{out}");
+    // RETIRED in 0.68.0 when their A.1 flips landed. Asserted ABSENT rather
+    // than just dropped from the count: a watch note that outlives its flip
+    // tells every reader to prepare for a change that already happened, and
+    // the fixture still contains both shapes that used to trigger them.
+    assert!(!out.contains("MIX-D3006"), "D3006 is retired: {out}");
+    assert!(!out.contains("MIX-D3007"), "D3007 is retired: {out}");
     assert!(
-        out.contains("0 error(s), 0 warning(s), 4 note(s)"),
-        "three-count summary: {out}"
+        out.contains("0 error(s), 0 warning(s), 2 note(s)"),
+        "two-count summary: {out}"
     );
 }
 
@@ -66,7 +70,7 @@ fn json_schema_v2_carries_notes() {
     assert_eq!(code, 0, "{out}");
     let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
     assert_eq!(v["schema_version"], 2);
-    assert_eq!(v["summary"]["notes"], 4, "{out}");
+    assert_eq!(v["summary"]["notes"], 2, "{out}");
     assert_eq!(v["summary"]["warnings"], 0, "notes are not warnings: {out}");
     assert!(
         v["diagnostics"]
@@ -122,7 +126,13 @@ fn advisory_pass_sees_wrapped_and_expression_shapes() {
     // (finding 2), each pinned: piped two-var loop, chained call,
     // if-expression condition, lambda default + expression body,
     // named-fn `= expr` body — and the nested-substr dedupe (finding 1).
-    let src = "for each $i, $x in [1] print($i) end | cat\n\
+    // NOTE: line 1 used to pin the piped-loop geometry via MIX-D3006 on the
+    // two-variable loop itself. D3006 retired in 0.68.0 when the map-binding
+    // flip landed, so the same geometry is now pinned with a legacy call
+    // INSIDE the piped loop's body — which is the stronger shape anyway: it
+    // proves the walker descends into the body, not merely that it saw the
+    // loop header.
+    let src = "for each $i, $x in [1] print(pos(\"a\", \"ab\")) end | cat\n\
         send noded noded.ping && print(pos(\"a\", \"ab\"))\n\
         $y = if pos(\"b\", \"abc\") > 0 then 1 else 2 end\n\
         $f = fn($a = pos(\"c\", \"c\")) = regex_match(\"^x\", $a)\n\
@@ -131,7 +141,7 @@ fn advisory_pass_sees_wrapped_and_expression_shapes() {
     let path = write_temp("blind_shapes", src);
     let (code, out) = lint(&[path.to_str().unwrap()]);
     assert_eq!(code, 0, "{out}");
-    assert!(out.contains("blind_shapes.mix:1: MIX-D3006"), "piped loop: {out}");
+    assert!(out.contains("blind_shapes.mix:1: MIX-D3008"), "piped loop body: {out}");
     assert!(out.contains("blind_shapes.mix:2: MIX-D3008"), "chained: {out}");
     assert!(out.contains("blind_shapes.mix:3: MIX-D3008"), "if-expr cond: {out}");
     assert!(out.contains("blind_shapes.mix:4: MIX-D3008"), "lambda default: {out}");

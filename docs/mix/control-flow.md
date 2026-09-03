@@ -321,9 +321,34 @@ name = Ada
 lang = Mix
 ```
 
+### Two variables over a map bind (key, value) — changed in 0.68.0
+
+The second variable is what changes by iterable. Over a **list, string or
+bytes** two variables bind **(index, item)**. Over a **map** they bind
+**(key, value)** — so the map form needs no `$m[$k]` lookup:
+
+```mix
+$m = { name: "Ada", lang: "Mix" }
+for each $k, $v in $m
+  print($k .. " = " .. $v)
+end
+```
+```text
+name = Ada
+lang = Mix
+```
+
+**Before 0.68.0 this bound (index, key)** — the first variable was a counter
+and the second was the key, which meant the value still had to be looked up
+and the pairs form did not exist. Both spellings changed together
+(`for each $k, $v` and the bare `for $k, $v`), and the **one-variable map
+form still yields keys**, unchanged — that form was always the migration
+target for code that wanted a counter, and it is what the release-cycle
+`MIX-D3006` note pointed at before the flip landed.
+
 Anything else (a number, nil) raises `cannot iterate over <type>`. An empty list/map/string runs the body zero times.
 
-> **Iterating a list snapshots it.** `for each` takes the list's items up front, so mutating the underlying variable mid-loop does not change what's iterated. (This is also why `for each` is by-value friendly — see the loop-var scoping note below.)
+> **Iterating snapshots the source.** `for each` takes the items up front — for a map, **both the keys and the values** — so mutating the underlying variable mid-loop changes neither the iteration set nor what the remaining iterations bind. (This is also why `for each` is by-value friendly — see the loop-var scoping note below.)
 
 ### Prefer a HOF for value-producing bodies
 

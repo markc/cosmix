@@ -1,0 +1,182 @@
+-- Release A.1 (v0.68.0) — the two behaviour flips, and everything that
+-- deliberately did NOT change alongside them.
+--
+-- These are the first non-additive changes of the sweep, so the "unchanged"
+-- assertions carry as much weight as the flipped ones: a flip that also
+-- moved list binding, or that swept bytes into the equality raise, would be
+-- a regression wearing a feature's clothes.
+
+-- ── FLIP 1: a two-variable loop over a MAP binds (key, value) ──────────
+-- Was (index, key) before 0.68.0.
+$m = {alpha: 10, beta: 20}
+$out = ""
+for each $k, $v in $m
+  $out = $out .. $k .. "=" .. $v .. " "
+end
+print(trim($out))
+
+-- BOTH spellings, because the bare `for $i, $x` form arrived in 0.63.0 and
+-- did not exist when this flip was planned. They parse to the same node, so
+-- one implementation covers both — pinned so that stays true.
+$out = ""
+for $k, $v in $m
+  $out = $out .. $k .. "=" .. $v .. " "
+end
+print(trim($out))
+
+-- ONE variable over a map still yields KEYS. Unchanged, and the reason the
+-- flip is safe: the key-only form was always available as the migration
+-- target for anything that wanted keys.
+$out = ""
+for each $k in $m
+  $out = $out .. $k .. " "
+end
+print(trim($out))
+
+-- Lists, strings and bytes still bind (index, item). Unchanged.
+$out = ""
+for each $i, $x in [7, 8]
+  $out = $out .. $i .. ":" .. $x .. " "
+end
+for each $i, $c in "hi"
+  $out = $out .. $i .. ":" .. $c .. " "
+end
+for each $i, $b in string_to_bytes("A")
+  $out = $out .. $i .. ":" .. $b
+end
+print($out)
+
+-- Keys AND values are snapshotted at loop entry, matching the key snapshot
+-- this arm always took: mutating the source map inside the body neither
+-- extends the loop nor changes what the remaining iterations bind.
+$mut = {a: 1, b: 2}
+$seen = ""
+for each $k, $v in $mut
+  $seen = $seen .. $k .. $v .. " "
+  $mut.c = 3
+  $mut.b = 99
+end
+print(trim($seen) .. " | after: " .. length($mut))
+
+-- Nested loops over different maps keep their own bindings.
+$outer = {x: 1}
+$inner = {y: 2}
+for each $ok, $ov in $outer
+  for each $ik, $iv in $inner
+    print("nested: " .. $ok .. $ov .. " / " .. $ik .. $iv)
+  end
+end
+
+-- A map loop inside a function binds locally and does not clobber a
+-- same-named global (the in_function branch of the binding site).
+$k = "GLOBAL"
+function join_pairs($mm)
+  $acc = ""
+  for each $k, $v in $mm
+    $acc = $acc .. $k .. $v
+  end
+  return $acc
+end
+print(join_pairs({p: 1}) .. " / global still " .. $k)
+
+-- ── FLIP 2: `==` / `!=` on a map or list RAISES ───────────────────────
+-- Was: always false / always true — a constant dressed as a comparison.
+$l1 = [1, 2]
+$l2 = [1, 2]
+try
+  print($l1 == $l2)
+catch $msg, $err
+  print($err.code .. " " .. $msg)
+end
+-- Both operators, and a list-vs-map cross-compare: BOTH operands are
+-- collections in every raising case.
+try
+  print($l1 != $l2)
+catch $msg, $err
+  print($err.code)
+end
+try
+  print({a: 1} == {a: 1})
+catch $msg, $err
+  print($err.code)
+end
+try
+  print($l1 == {a: 1})
+catch $msg, $err
+  print($err.code)
+end
+-- A SELF-compare raises too. A ptr_eq fast path would have answered true
+-- here, which is exactly the shortcut the raise keeps shut.
+try
+  print($l1 == $l1)
+catch $msg, $err
+  print($err.code)
+end
+
+-- ── COLLECTION vs SCALAR still ANSWERS — it does not raise ────────────
+-- Deliberately NARROWER than the retired D3007 note's "either operand"
+-- wording. Only collection-vs-collection is constant regardless of
+-- CONTENTS; a collection and a scalar differ by TYPE, and false is the
+-- truthful answer, exactly as `1 == "a"` is honestly false.
+--
+-- `$map[$key] == nil` is the load-bearing case: it is THE key-absence
+-- idiom, and the value is a list or map whenever the key IS populated.
+-- Raising there would break data-dependently — the same line working
+-- until the map fills up. It is also not hypothetical: the wider rule
+-- broke this repo's own docs/build/gen-builtins-md.mix on first run.
+$reg = {}
+print("absent: " .. ($reg["k"] == nil))
+$reg.k = [1, 2]
+print("present: " .. ($reg["k"] == nil) .. " " .. ($reg["k"] != nil))
+print("scalars: " .. ([1] == "text") .. " " .. ({a: 1} == 5) .. " " .. ([1] != nil))
+
+-- deep_eq is the named replacement, and the error message says so.
+print(deep_eq($l1, $l2) .. " " .. deep_eq($l1, [2, 1]) .. " " .. deep_eq({a: 1}, {a: 1}))
+
+-- NOT swept up: bytes and buffers have real content equality in PartialEq,
+-- so `==` on them was never a constant and must keep answering.
+print((string_to_bytes("ab") == string_to_bytes("ab")) .. " " ..
+  (string_to_bytes("ab") == string_to_bytes("ac")) .. " " ..
+  (buffer("x") == buffer("x")))
+
+-- NOT swept up: scalars.
+print((1 == 1) .. " " .. ("a" == "a") .. " " .. (nil == nil) .. " " .. (true != false))
+
+-- ── Scoped to the OPERATORS ONLY ──────────────────────────────────────
+-- Internal comparisons go through Rust's PartialEq, never through the
+-- operator path, so they keep working — they do NOT raise. What they
+-- ANSWER for containers is unchanged too, and that is a real asymmetry
+-- worth knowing: `==` now shouts where these still quietly say "not
+-- equal". They are documented on the collections page.
+print("contains scalar: " .. contains([1, 2], 2))
+print("contains map:    " .. contains([{a: 1}], {a: 1}))
+print("index_of list:   " .. index_of([[1], [2]], [2]))
+print("unique lists:    " .. length(unique([[1], [1], [2]])))
+print("map key lookup:  " .. {k: 9}["k"])
+print("deep_eq nested:  " .. deep_eq([{d: [1, [2]]}], [{d: [1, [2]]}]))
+
+-- Expected output:
+-- alpha=10 beta=20
+-- alpha=10 beta=20
+-- alpha beta
+-- 0:7 1:8 0:h 1:i 0:65
+-- a1 b2 | after: 3
+-- nested: x1 / y2
+-- p1 / global still GLOBAL
+-- TYPE_ERROR `==` is not defined for list and list — it would always answer false, not compare them. Use deep_eq(a, b) for structural comparison
+-- TYPE_ERROR
+-- TYPE_ERROR
+-- TYPE_ERROR
+-- TYPE_ERROR
+-- absent: true
+-- present: false true
+-- scalars: false false true
+-- true false true
+-- true false true
+-- true true true true
+-- contains scalar: true
+-- contains map:    false
+-- index_of list:   -1
+-- unique lists:    3
+-- map key lookup:  9
+-- deep_eq nested:  true

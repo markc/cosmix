@@ -14,7 +14,7 @@ Get one-line help for any name with `mix what NAME`.
 > end, for reads AND writes); maps are `{key: value}` read with `.key` or
 > `["key"]`. `push`/`pop`/`shift` and index-assignment mutate in place; everything
 > else returns a fresh copy. Lists pass into functions by value, and
-> `List == List` is always `false`.**
+> `List == List` **raises** — use `deep_eq(a, b)`.**
 
 ## Literals & printing
 
@@ -143,9 +143,11 @@ absent.
 
 ## Iterating
 
-`for each` walks a list directly. Over a **map** it yields the **keys** (in
-insertion order) — `for each $k in $m` and `for each $k in keys($m)` are
-equivalent; look values up with `$m[$k]`:
+`for each` walks a list directly. Over a **map** with ONE variable it yields
+the **keys** (in insertion order) — `for each $k in $m` and
+`for each $k in keys($m)` are equivalent; look values up with `$m[$k]`. With
+**two** variables it yields **(key, value)** since 0.68.0, so no lookup is
+needed:
 
 ```mix
 $ports = [22, 80, 443]
@@ -171,6 +173,11 @@ Over a **string** `for each` yields one-character strings, and since **v0.64.0**
 over a `bytes`/`buffer` it yields the bytes as **numbers** 0-255 (see
 [io](io.md#bytes-as-a-sequence-v0640)). Every source is materialised at loop
 entry, so mutating it in the body never extends the loop.
+
+A **second variable** binds the position for a list, string or bytes, and the
+**value** for a map — see
+[control-flow](control-flow.md#two-variables-over-a-map-bind-key-value--changed-in-0680)
+for the 0.68.0 change and what stayed put.
 
 For value-producing transforms prefer a [hof](hof.md) (`map`/`filter`/`reduce`/
 `sort_by`) over a hand-rolled `for each` + `push`.
@@ -535,10 +542,21 @@ deleted:  {host: node1}
 still:    {host: node1, port: 8080}
 ```
 
-## Footgun: `List == List` is always `false`
+## `List == List` raises (0.68.0) — use `deep_eq`
 
-Two lists never compare equal — *even with identical contents*, and even the
-same variable against itself (`$a == $a` is `false`). The same holds for maps.
+`==` and `!=` raise `TYPE_ERROR` when **both** operands are a map or list —
+including a self-compare (`$a == $a`) and a list-vs-map cross-compare.
+
+Until 0.68.0 they answered `false`/`true` instead — always, regardless of
+contents. That is not a comparison; it is a constant wearing a comparison's
+clothes, and it read as working code right up until someone depended on it.
+The raise names the fix:
+
+```
+TYPE_ERROR: `==` is not defined for list and list — it would always answer
+false, not compare them. Use deep_eq(a, b) for structural comparison
+```
+
 **Use `deep_eq(a, b)` (0.63.0)** — structural equality: maps compare by key
 set with insertion order ignored, lists elementwise in order, scalars as
 `==`:
@@ -555,19 +573,65 @@ value is never equal — even to itself, so a callback-bearing map is not
 Nesting deeper than 512 levels raises (catchable) rather than recursing
 unboundedly.
 
-Or compare a derived value (length, `join`, an element):
+Or compare a derived value (length, `join`, an element) — those are scalars,
+so `==` applies normally:
 
 ```mix
 $a = [1, 2, 3]
 $b = [1, 2, 3]
-print("a == b:        " .. ("" .. ($a == $b)))
+print("deep_eq:       " .. ("" .. deep_eq($a, $b)))
 print("same length:   " .. ("" .. (length($a) == length($b))))
 print("same joined:   " .. ("" .. (join($a, ",") == join($b, ","))))
 ```
 ```text
-a == b:        false
+deep_eq:       true
 same length:   true
 same joined:   true
+```
+
+### A collection compared to a SCALAR still answers — `$m[$k] == nil` works
+
+Only collection-vs-collection raises. A collection and a scalar differ by
+*type*, so `false` is the truthful answer — exactly as `1 == "a"` is honestly
+false — and nothing about it is a constant-in-disguise:
+
+```mix
+$reg = {}
+print($reg["k"] == nil)   -- true  (key absent)
+$reg.k = [1, 2]
+print($reg["k"] == nil)   -- false (key present, value is a list)
+print([1] == "text")      -- false
+print([1] != nil)         -- true
+```
+
+That first pattern is the whole reason for the narrower rule: `$map[$key] ==
+nil` is **the** key-absence idiom, and the value on the left is a list or map
+precisely when the key IS populated. Raising there would fail
+data-dependently — the same line working until the map fills up.
+
+### The raise is scoped to the OPERATORS — searching builtins are unchanged
+
+`contains`, `index_of`, `last_index_of` and `unique` compare elements
+internally, without going through `==`. They do **not** raise — and they also
+still treat two equal-looking collections as different:
+
+```mix
+print(contains([{a: 1}], {a: 1}))      -- false, NOT a raise
+print(index_of([[1], [2]], [2]))       -- -1
+print(length(unique([[1], [1], [2]]))) -- 3 — no dedup of equal lists
+```
+
+That asymmetry is deliberate but worth knowing: since 0.68.0 `==` is loud
+about collections while these stay quiet. Scoping the change to the operators
+is what keeps `contains($list, $scalar)` — the overwhelmingly common use —
+working, and there is no `deep_contains` yet. When you need a structural
+search, drive it yourself:
+
+```mix
+$found = false
+for each $item in $haystack
+  if deep_eq($item, $needle) then $found = true end
+end
 ```
 
 ## Footgun: lists pass into functions by value

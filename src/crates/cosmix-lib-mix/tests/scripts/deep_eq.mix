@@ -1,7 +1,8 @@
 -- deep_eq.mix: structural equality (0.63.0) — maps order-independent,
 -- lists order-sensitive, scalars agree with == (so functions are never
 -- equal, even to themselves), adversarial nesting raises catchably,
--- and the == contrast (always false on maps/lists) until the A.1 flip.
+-- and the == contrast — which since 0.68.0 RAISES on maps/lists rather
+-- than answering false (the A.1 flip landed).
 -- Expected output:
 -- true
 -- true
@@ -14,7 +15,7 @@
 -- true
 -- true
 -- false
--- false
+-- TYPE_ERROR
 -- false
 -- deep-eq-depth-raises
 
@@ -31,8 +32,14 @@ print(deep_eq("5", 5))
 print(deep_eq(nil, nil))
 print(deep_eq([{deep: [1, [2]]}], [{deep: [1, [2]]}]))
 print(deep_eq([{deep: [1, [2]]}], [{deep: [1, [3]]}]))
--- contrast: == on the same map is still always false today (flips in A.1)
-print($a == $b)
+-- contrast: `==` on maps/lists RAISES since 0.68.0 (the A.1 flip landed).
+-- Until then this printed `false` — a constant dressed as a comparison,
+-- which is exactly what deep_eq exists to replace.
+try
+  print($a == $b)
+catch $msg, $err
+  print($err.code)
+end
 -- inherited == corners (GLM review MINOR 2): a function value is never
 -- equal, even to itself — a callback-bearing map is not deep_eq itself.
 $h = {on: fn() = 1}

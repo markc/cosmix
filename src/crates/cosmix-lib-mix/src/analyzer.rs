@@ -1253,9 +1253,16 @@ fn check_ssh_escaped_quotes(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis)
 // promote to `Warning` in release A.1 (codes unchanged) once the fleet
 // inventory reads zero, and the names are deleted in release B. The
 // pos-family codes D3008–D3011 stay notes until THEIR count reads zero,
-// whenever that is. D3006/D3007 are release-transition watch notes for
-// the A.1 behaviour flips (map two-var binding; map/list `==` raising),
-// retired in A.1. Static, analyzer-surface only — never emitted at
+// whenever that is.
+//
+// D3006/D3007 were the release-transition watch notes for the A.1
+// behaviour flips (map two-var binding; map/list `==` raising). Both
+// flips SHIPPED in 0.68.0 and the notes are RETIRED — a watch note whose
+// flip has landed is worse than no note, because it describes a future
+// that is now the present. Their codes are permanently spent and must
+// never be reused: a log or a script matching "MIX-D3006" means the
+// pre-0.68.0 world, and reusing the number would make that match lie.
+// Static, analyzer-surface only — never emitted at
 // runtime (the `done`/`next` runtime-warning path is the anti-pattern:
 // it would print on every execution of ~800 live call sites).
 //
@@ -1441,31 +1448,14 @@ fn check_release_transition_advisories(stmts: &[Stmt], ctx: &FileContext, a: &mu
                 advisory_stmt(right, ctx, a, composed);
                 return;
             }
-            // MIX-D3006 — watch note for the A.1 map-binding flip: every
-            // two-variable iteration, both spellings (`for each $i, $x`
-            // and the 0.63.0 bare `for $i, $x`). Static typing cannot
-            // tell a map iterable from a list, so the note makes every
-            // site visible for one release cycle; retired in A.1 when
-            // the binding flips.
-            StmtKind::ForEach {
-                index_var: Some(_), ..
-            } => {
-                a.diagnostics.push(diag(
-                    ctx,
-                    "MIX-D3006",
-                    Severity::Note,
-                    stmt.line,
-                    "two-variable loop binds (index, item) for every iterable today; in \
-                     release A.1 a MAP iterable binds (key, value) instead"
-                        .to_string(),
-                    Some(
-                        "over a list nothing changes; if this can iterate a map and uses \
-                         the first variable as a number, migrate to the one-variable key \
-                         form now"
-                            .to_string(),
-                    ),
-                ));
-            }
+            // MIX-D3006 RETIRED in 0.68.0 — the map-binding flip it watched
+            // has shipped: a two-variable loop over a MAP now binds
+            // (key, value). The note existed to make every two-variable site
+            // visible for one release cycle so the flip could be gated on
+            // "no map-pair dependant exists"; the inventory came back with
+            // every site iterating a list, on the fleet and locally, and the
+            // flip landed. Nothing replaces it — there is no longer a
+            // pending change to warn about.
             // Named-fn parameter defaults and `= expr` bodies:
             // walk_stmt_exprs has no FunctionDef arm and stmt_bodies
             // returns nothing for an Expression body.
@@ -1734,12 +1724,11 @@ fn expr_is_proven_list(expr: &Expr, facts: &HashMap<String, ProvenValue>) -> boo
         || matches!(expr, Expr::Variable(name) if matches!(facts.get(name), Some(ProvenValue::List)))
 }
 
-/// Map OR list, literal or straight-line-proven — the D3007 operand test.
-fn expr_is_proven_collection(expr: &Expr, facts: &HashMap<String, ProvenValue>) -> bool {
-    matches!(expr, Expr::ListLiteral(_) | Expr::MapLiteral(_))
-        || matches!(expr, Expr::Variable(name)
-            if matches!(facts.get(name), Some(ProvenValue::List | ProvenValue::Map)))
-}
+// `expr_is_proven_collection` was the D3007 operand test and went with the
+// note in 0.68.0. Its job — "is this operand provably a map or list" — is
+// now done by the runtime raise in `eval_binop`, which sees the actual
+// VALUES and therefore catches the untraceable `$a == $b` the static test
+// never could.
 
 fn builtin_result_fields(name: &str) -> Option<&'static [FieldInfo]> {
     let info = builtins::builtin_info_of(name)?;
@@ -1788,39 +1777,14 @@ fn check_proven_expr(
         ));
     }
 
-    // MIX-D3007 — watch note for the A.1 equality flip: `==`/`!=` where
-    // an operand is PROVEN a map or list (a literal, or a variable
-    // straight-line-assigned one) is always false/true today — Value's
-    // PartialEq has no structural arm. Best-effort by design: only
-    // proven operands are seen (the same statement-order facts as
-    // W2301), so an untraceable `$a == $b` passes silently — the runtime
-    // raise in A.1 is the real fix, this note is the courtesy.
-    if let Expr::BinaryOp { left, op, right } = expr
-        && matches!(op, BinOp::Eq | BinOp::NotEq)
-        && (expr_is_proven_collection(left, facts) || expr_is_proven_collection(right, facts))
-    {
-        let op_str = if matches!(op, BinOp::Eq) { "==" } else { "!=" };
-        let answer = if matches!(op, BinOp::Eq) {
-            "false"
-        } else {
-            "true"
-        };
-        a.diagnostics.push(diag(
-            ctx,
-            "MIX-D3007",
-            Severity::Note,
-            line,
-            format!(
-                "`{op_str}` on a map or list is always {answer} — structural comparison \
-                 needs deep_eq(a, b)"
-            ),
-            Some(
-                "release A.1 makes map/list `==`/`!=` raise TYPE_ERROR instead of \
-                 silently answering; migrate now"
-                    .to_string(),
-            ),
-        ));
-    }
+    // MIX-D3007 RETIRED in 0.68.0 — the equality flip it watched has
+    // shipped: map/list `==`/`!=` now raises TYPE_ERROR naming deep_eq.
+    // The note was best-effort by design (it only saw operands the
+    // statement-order facts could PROVE were collections, so an
+    // untraceable `$a == $b` passed silently); the runtime raise is the
+    // real fix and it catches every case the note could not. Nothing
+    // replaces it — a static note about a runtime error that now always
+    // fires would be pure noise.
 
     match expr {
         Expr::Index { object, index } => {
