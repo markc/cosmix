@@ -84,13 +84,19 @@ fn out_of_range(
 
 impl NumericDomain {
     pub(crate) fn validate(self, context: &str, value: f64) -> MixResult<f64> {
-        let (valid, expected, min, max) = match self {
-            NumericDomain::Finite => (value.is_finite(), "a finite number", None, None),
+        // `expected` is a String, not a &str, so a domain whose bounds are
+        // supplied by the CALLER can name them. ExactInteger is the case: its
+        // range is per-call (0..63 for a shift count, 1..N for an index), so a
+        // fixed description could only ever say "the declared range" and leave
+        // the reader to guess which one. The bounds were already computed for
+        // `details`; they simply never reached the sentence anyone reads.
+        let (valid, expected, min, max): (bool, String, Option<f64>, Option<f64>) = match self {
+            NumericDomain::Finite => (value.is_finite(), "a finite number".to_string(), None, None),
             NumericDomain::Count { max } => {
                 let max = (max as f64).min(MAX_SAFE_INTEGER);
                 (
                     value.is_finite() && value.fract() == 0.0 && (0.0..=max).contains(&value),
-                    "a non-negative whole number within the supported count range",
+                    "a non-negative whole number within the supported count range".to_string(),
                     Some(0.0),
                     Some(max),
                 )
@@ -99,7 +105,7 @@ impl NumericDomain {
                 value.is_finite()
                     && value.fract() == 0.0
                     && (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&value),
-                "a whole number within the exact signed-index range",
+                "a whole number within the exact signed-index range".to_string(),
                 Some(-MAX_SAFE_INTEGER),
                 Some(MAX_SAFE_INTEGER),
             ),
@@ -128,7 +134,7 @@ impl NumericDomain {
                         && value.fract() == 0.0
                         && iv >= min as i128
                         && iv <= max as i128,
-                    "a whole number within the declared exact-integer range",
+                    format!("a whole number in {min}..={max}"),
                     Some(min as f64),
                     Some(shown_max),
                 )
@@ -137,13 +143,13 @@ impl NumericDomain {
                 value.is_finite()
                     && value >= 0.0
                     && std::time::Duration::try_from_secs_f64(value).is_ok(),
-                "a finite non-negative duration in seconds",
+                "a finite non-negative duration in seconds".to_string(),
                 Some(0.0),
                 None,
             ),
             NumericDomain::ExitCode => (
                 value.is_finite() && value.fract() == 0.0 && (0.0..=255.0).contains(&value),
-                "a whole process exit code in 0..=255",
+                "a whole process exit code in 0..=255".to_string(),
                 Some(0.0),
                 Some(255.0),
             ),
@@ -151,14 +157,14 @@ impl NumericDomain {
                 value.is_finite()
                     && value.fract() == 0.0
                     && (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&value),
-                "a whole timestamp within Mix's exact-integer range",
+                "a whole timestamp within Mix's exact-integer range".to_string(),
                 Some(-MAX_SAFE_INTEGER),
                 Some(MAX_SAFE_INTEGER),
             ),
-            NumericDomain::LoopBound => (value.is_finite(), "a finite loop bound", None, None),
+            NumericDomain::LoopBound => (value.is_finite(), "a finite loop bound".to_string(), None, None),
             NumericDomain::LoopStep => (
                 value.is_finite() && value != 0.0,
-                "a finite non-zero loop step",
+                "a finite non-zero loop step".to_string(),
                 None,
                 None,
             ),
@@ -166,7 +172,7 @@ impl NumericDomain {
         if valid {
             Ok(value)
         } else {
-            Err(out_of_range(context, value, expected, min, max))
+            Err(out_of_range(context, value, &expected, min, max))
         }
     }
 }

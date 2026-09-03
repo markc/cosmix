@@ -255,9 +255,13 @@ async fn range_at_i64_extremes_no_overflow() {
     let err =
         run_err(r#"$x = range(1000000000000000000000000000000, 1000000000000000000000000000000)"#)
             .await;
+    // The message now NAMES the bound (0.69.x) rather than saying "the
+    // declared range" and leaving the reader to guess which one — so this
+    // asserts the stronger property: the refusal states what WAS allowed.
     assert!(
         err.contains("range(): argument 1")
-            && err.contains("within the declared exact-integer range"),
+            && err.contains("must be a whole number in")
+            && err.contains("..="),
         "got: {err}"
     );
     let err = run_err(r#"$x = range(0, -1000000000000000000000000000000)"#).await;
