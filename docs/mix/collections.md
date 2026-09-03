@@ -537,6 +537,12 @@ print(deep_eq({a: 1, b: 2}, {b: 2, a: 1})) -- true (map order ignored)
 print(deep_eq([1, 2], [2, 1]))             -- false (list order matters)
 ```
 
+Scalars compare as `==`, with the corners that implies: a **function**
+value is never equal — even to itself, so a callback-bearing map is not
+`deep_eq` its own copy — and Buffer-vs-Bytes is false (`freeze()` first).
+Nesting deeper than 512 levels raises (catchable) rather than recursing
+unboundedly.
+
 Or compare a derived value (length, `join`, an element):
 
 ```mix

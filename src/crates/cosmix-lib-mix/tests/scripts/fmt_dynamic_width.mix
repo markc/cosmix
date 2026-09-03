@@ -1,6 +1,7 @@
 -- fmt_dynamic_width.mix: printf-convention '*' width (0.63.0) —
--- %*s %-*s %*d %0*d %*f take the width from the next argument;
--- a missing / non-integer / negative width errors, never guesses.
+-- %*s %-*s %*d %0*d %*f take the width from the next argument; a
+-- missing / non-integer / negative width errors, never guesses, and
+-- malformed specs (%*5s, %.*f) name the actual mistake.
 -- Expected output:
 -- [      hi]
 -- [hi      ]
@@ -14,6 +15,8 @@
 -- star-width-missing-raises
 -- star-width-fraction-raises
 -- star-width-negative-raises
+-- star-plus-digits-raises
+-- dynamic-precision-raises
 
 $w = 8
 print("[" .. fmt("%*s", $w, "hi") .. "]")
@@ -45,4 +48,15 @@ try
   fmt("%*d", -2, 3)
 catch $e
   print "star-width-negative-raises"
+end
+-- malformed '*' specs name the actual mistake (GLM review NIT 2)
+try
+  fmt("%*5s", 4, "x")
+catch $e
+  print "star-plus-digits-raises"
+end
+try
+  fmt("%.*f", 2, 1.5)
+catch $e
+  print "dynamic-precision-raises"
 end

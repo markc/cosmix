@@ -1,7 +1,7 @@
 -- string_helpers.mix: subject-first string helpers (0.63.0) — Tier 1
 -- (delimiter family: nil on absent, "" is a real result, empty delim
 -- raises), Tier 2 (unchanged-subject), trim charset, Tier 3 (lines /
--- fields / chars / last_index_of).
+-- fields / chars / last_index_of), and the lines() corner pins.
 -- Expected output:
 -- k
 -- v
@@ -47,6 +47,11 @@
 -- 4
 -- -1
 -- 2
+-- 1:0
+-- 1:0
+-- 1:2:true
+-- 1:0
+-- 2:0
 
 -- Tier 1: found / absent / edge
 print(before("k=v", "="))
@@ -106,3 +111,17 @@ print(last_index_of("banana", "an"))
 print(last_index_of("héxéx", "x"))
 print(last_index_of("abc", "z"))
 print(last_index_of([1, 2, 1], 1))
+-- lines() corner pins (GLM review of 4caec4e1, NIT 1): lone \r, CRLF-only,
+-- exactly-one-\r-stripped, and bare "\n" (CR printed via len/ends_with,
+-- never raw). Drop-before-strip order is load-bearing: "a\n\r" keeps its
+-- final bare-\r line.
+$c1 = lines("\r")
+print(len($c1) .. ":" .. len($c1[0]))
+$c2 = lines("\r\n")
+print(len($c2) .. ":" .. len($c2[0]))
+$c3 = lines("a\r\r\n")
+print(len($c3) .. ":" .. len($c3[0]) .. ":" .. ends_with($c3[0], "\r"))
+$c4 = lines("\n")
+print(len($c4) .. ":" .. len($c4[0]))
+$c5 = lines("a\n\r")
+print(len($c5) .. ":" .. len($c5[1]))

@@ -123,8 +123,8 @@ builtin_table! {
     ("lines", CapabilityClass::Pure,           "string",  "Split into lines: \\n-separated, ONE trailing \\r stripped per line (CRLF and LF both work; a lone \\r is not a terminator), exactly one trailing empty element dropped (the final newline). lines(\"\") -> []; \"a\\n\\n\" -> [\"a\", \"\"]. Native since 0.63.0 (was a prelude fn that kept \\r and the trailing \"\")", contract!((s: string) -> list(string))),
     ("fields", CapabilityClass::Pure,          "string",  "awk-style fields: split on whitespace RUNS, no empties; fields(\"\") -> []. 0-based access fields(s)[2]; the 1-based single-field form is word(s, n)", contract!((s: string) -> list(string))),
     ("chars", CapabilityClass::Pure,           "string",  "Codepoints as 1-char strings (grapheme_* builtins exist for clusters). Native since 0.63.0 (was a prelude fn)", contract!((s: string) -> list(string))),
-    ("last_index_of", CapabilityClass::Pure,   "string",  "0-based codepoint index of the LAST occurrence in a string, or last index of a value in a list; -1 if absent. The 0-based twin of lastpos() (args reversed). ⚠ Like index_of, NEVER bare in a condition: -1 is truthy, 0 is falsy", contract!((seq: any_of(list, string), v: any) -> number)),
-    ("deep_eq", CapabilityClass::Pure,         "type",    "Structural equality for any two values: maps compare by key set + deep_eq values (insertion order IGNORED), lists elementwise in order, scalars as ==. The answer `==` cannot give for maps/lists (it is always false there today)", contract!((a: any, b: any) -> bool)),
+    ("last_index_of", CapabilityClass::Pure,   "string",  "0-based codepoint index of the LAST occurrence in a string, or last index of a value in a list; -1 if absent. The 0-based twin of lastpos() (args reversed). List search compares with == — SCALAR elements only, exactly like index_of (a map/list element never matches; deep_eq is the structural comparison). ⚠ Like index_of, NEVER bare in a condition: -1 is truthy, 0 is falsy", contract!((seq: any_of(list, string), v: any) -> number)),
+    ("deep_eq", CapabilityClass::Pure,         "type",    "Structural equality for any two values: maps compare by key set + deep_eq values (insertion order IGNORED), lists elementwise in order, scalars as ==. The answer `==` cannot give for maps/lists (it is always false there today). Caveats, inherited from ==: a FUNCTION value is never equal (even to itself — a callback-bearing map is not deep_eq its own copy) and Buffer-vs-Bytes is false (freeze() first). Raises past 512 nesting levels", contract!((a: any, b: any) -> bool; failure[raises])),
     ("template", CapabilityClass::Pure,        "string",  "Substitute single-brace {key} placeholders in a string from a map", contract!((tmpl: string, vars: map) -> string)),
     ("word_wrap", CapabilityClass::Pure,       "string",  "Wrap text to a column width (codepoint budget; see word_wrap_w for display cells)", contract!((text: string, width: number) -> string; failure[raises])),
     ("word_wrap_w", CapabilityClass::Pure,     "string",  "Wrap text to a column width in terminal display CELLS (UAX #11; CJK/emoji=2)", contract!((text: string, width: number) -> string; failure[raises])),
@@ -579,6 +579,19 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "re_replace" => builtin_re_replace(args),
         #[cfg(feature = "regex")]
         "re_split" => builtin_re_split(args),
+        // The registry lists these names unconditionally (is_builtin,
+        // capability_category, `mix help` are all table-driven), so a
+        // no-regex build must refuse LOUDLY here — without these arms the
+        // call falls through to a misleading FUNCTION_UNDEFINED (the
+        // markdown/ds_*/xml_parse precedent; GLM review of 4caec4e1,
+        // MAJOR 1 — which also flagged the same pre-existing hole for
+        // the four legacy regex_* names, closed below).
+        #[cfg(not(feature = "regex"))]
+        "re_match" | "re_find" | "re_replace" | "re_split" | "regex_match" | "regex_find"
+        | "regex_replace" | "regex_split" => Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("{name}() requires the `regex` feature"),
+        }),
         #[cfg(feature = "toml")]
         "toml_parse" => builtin_toml_parse(args),
         #[cfg(feature = "toml")]
@@ -1447,26 +1460,56 @@ fn builtin_last_index_of(args: Vec<Value>) -> MixResult<Option<Value>> {
 /// PartialEq is always false there). Maps: same key set, values deep_eq,
 /// insertion order IGNORED. Lists: elementwise, order-sensitive. Scalars:
 /// Value's own PartialEq (including the Number/String coercion, so
-/// deep_eq agrees with == wherever == already works).
-fn deep_eq_values(a: &Value, b: &Value) -> bool {
-    match (a, b) {
+/// deep_eq agrees with == wherever == already works) — which means a
+/// FUNCTION value is never equal, even to itself (`==` on functions is
+/// deliberately false), and Buffer-vs-Bytes is false (freeze first).
+/// Both documented in the table row and pinned by tests.
+///
+/// Depth-capped: this is the one builtin whose whole job is "traverse
+/// everything", so adversarial nesting gets a catchable error instead of
+/// a stack abort (GLM review of 4caec4e1, MINOR 1). 512 is far beyond
+/// legitimate data and small enough that the guard itself fits a 2 MiB
+/// test-thread stack — 4096 overflowed exactly where the pin ran.
+const DEEP_EQ_MAX_DEPTH: usize = 512;
+
+fn deep_eq_values(a: &Value, b: &Value, depth: usize) -> MixResult<bool> {
+    if depth > DEEP_EQ_MAX_DEPTH {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("deep_eq: nesting deeper than {DEEP_EQ_MAX_DEPTH} levels"),
+        });
+    }
+    Ok(match (a, b) {
         (Value::List(la), Value::List(lb)) => {
-            la.len() == lb.len()
-                && la.iter().zip(lb.iter()).all(|(x, y)| deep_eq_values(x, y))
+            if la.len() != lb.len() {
+                return Ok(false);
+            }
+            for (x, y) in la.iter().zip(lb.iter()) {
+                if !deep_eq_values(x, y, depth + 1)? {
+                    return Ok(false);
+                }
+            }
+            true
         }
         (Value::Map(ma), Value::Map(mb)) => {
-            ma.len() == mb.len()
-                && ma
-                    .iter()
-                    .all(|(k, va)| mb.get(k).is_some_and(|vb| deep_eq_values(va, vb)))
+            if ma.len() != mb.len() {
+                return Ok(false);
+            }
+            for (k, va) in ma.iter() {
+                match mb.get(k) {
+                    Some(vb) if deep_eq_values(va, vb, depth + 1)? => {}
+                    _ => return Ok(false),
+                }
+            }
+            true
         }
         _ => a == b,
-    }
+    })
 }
 
 fn builtin_deep_eq(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("deep_eq", &args, 2)?;
-    Ok(Some(Value::Bool(deep_eq_values(&args[0], &args[1]))))
+    Ok(Some(Value::Bool(deep_eq_values(&args[0], &args[1], 0)?)))
 }
 
 fn builtin_split(args: Vec<Value>) -> MixResult<Option<Value>> {
@@ -11854,6 +11897,17 @@ fn mix_format(name: &str, tmpl: &str, args: &[Value]) -> MixResult<String> {
                 });
             }
             width = Some(n as usize);
+            // `%*5s` would silently drop the '*' context into the
+            // unknown-specifier arm; name the actual mistake instead.
+            if i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                return Err(MixError::RuntimeError {
+                    span: None,
+                    msg: format!(
+                        "{}: '*' width cannot be combined with literal digits (in '{}...')",
+                        name, spec_so_far
+                    ),
+                });
+            }
         } else {
             let width_start = i;
             while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
@@ -11867,6 +11921,19 @@ fn mix_format(name: &str, tmpl: &str, args: &[Value]) -> MixResult<String> {
         let mut precision: Option<usize> = None;
         if i < bytes.len() && bytes[i] as char == '.' {
             i += 1;
+            // `%.*f` — dynamic precision is not supported; '*' is
+            // width-only. Without this arm the '*' becomes the conversion
+            // char and errors as an unhelpful "unknown specifier '%*'".
+            if i < bytes.len() && bytes[i] == b'*' {
+                return Err(MixError::RuntimeError {
+                    span: None,
+                    msg: format!(
+                        "{}: dynamic precision '.*' is not supported — '*' is width-only \
+                         (use a literal precision: %.2f)",
+                        name
+                    ),
+                });
+            }
             let prec_start = i;
             while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
                 i += 1;

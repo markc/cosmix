@@ -538,8 +538,10 @@ function ssh_safe_name($n)
   if starts_with($n, ".") or starts_with($n, "-") then return "" end
   if contains($n, "/") or contains($n, "..") then return "" end
   if ends_with(lower($n), ".pub") then return "" end
-  -- charset [A-Za-z0-9_.-], indexed with substr (the webd handler sandbox has
-  -- no chars() builtin, unlike the standalone worker).
+  -- charset [A-Za-z0-9_.-], indexed with substr. (Written when the webd
+  -- handler sandbox had no chars() builtin; chars() is a table-registered
+  -- Pure builtin since 0.63.0, so this loop could be a `for each` over
+  -- chars($n) now — kept as-is, it works either way.)
   $i = 0
   $len = length($n)
   while $i < $len
