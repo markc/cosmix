@@ -827,10 +827,19 @@ impl Parser {
         self.advance(); // skip 'for'
 
         if self.match_token(&Token::Each) {
-            return self.parse_for_each();
+            return self.parse_for_each(None);
         }
 
         let var = self.expect_variable()?;
+        // `each` is optional (0.63.0): `for $x in $xs` and
+        // `for $i, $x in $xs` are the same iteration forms as
+        // `for each …`, which stays accepted indefinitely (~1,600 fleet
+        // call sites — no deprecation). One token of lookahead after the
+        // variable disambiguates: `in`/`,` is iteration, `=` keeps the
+        // counted loop.
+        if matches!(self.peek(), Token::In | Token::Comma) {
+            return self.parse_for_each(Some(var));
+        }
         self.expect(&Token::Assign)?;
         let start = self.parse_expression()?;
         self.expect(&Token::To)?;
@@ -859,9 +868,15 @@ impl Parser {
         })
     }
 
-    fn parse_for_each(&mut self) -> MixResult<StmtKind> {
+    /// Body of both iteration spellings. `pre_var` carries the first
+    /// variable when `parse_for` already consumed it deciding between the
+    /// bare `for $x in …` form and the counted loop.
+    fn parse_for_each(&mut self, pre_var: Option<String>) -> MixResult<StmtKind> {
         // Check for index variable: for each $i, $item in $list
-        let first_var = self.expect_variable()?;
+        let first_var = match pre_var {
+            Some(v) => v,
+            None => self.expect_variable()?,
+        };
         let (index_var, var) = if self.match_token(&Token::Comma) {
             let second = self.expect_variable()?;
             (Some(first_var), second)

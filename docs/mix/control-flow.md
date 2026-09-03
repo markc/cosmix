@@ -261,12 +261,17 @@ A `NaN` start/end/step (e.g. from `sqrt(-1)`) is rejected up front (`for-loop st
 
 ---
 
-## `for each $x in <list>`
+## `for $x in <list>` (a.k.a. `for each`)
 
-Iterates the elements of a list — the workhorse for collections:
+Iterates the elements of a list — the workhorse for collections. Since
+0.63.0 the `each` keyword is **optional**: `for $x in $xs` and
+`for each $x in $xs` are the same statement, and both stay supported
+indefinitely (`each` is not deprecated). What disambiguates iteration from
+the [counted loop](#for-i--a-to-b-step-s) is the token after the variable —
+`in` (or a `,`) iterates, `=` counts:
 
 ```mix
-for each $fruit in ["apple", "pear", "fig"]
+for $fruit in ["apple", "pear", "fig"]
   print($fruit)
 end
 ```
@@ -276,7 +281,8 @@ pear
 fig
 ```
 
-Add an **index variable** with a comma — `for each $i, $x in …` (the index is 0-based):
+Add an **index variable** with a comma — `for $i, $x in …` or
+`for each $i, $x in …` (the index is 0-based):
 
 ```mix
 for each $i, $x in ["a", "b", "c"]

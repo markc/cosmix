@@ -5579,6 +5579,28 @@ impl Evaluator {
         unwrap_top_return: bool,
     ) -> Pin<Box<dyn Future<Output = MixResult<Value>> + 'a>> {
         Box::pin(async move {
+            // Top-level `fn` hoisting (0.63.0): bind every function
+            // declared at the DIRECT top level of an invocation root
+            // before the first statement runs, so a forward call works
+            // (`print(f(2))` above `fn f($x)`). Top level ONLY — a `fn`
+            // nested in a block (an `if` branch, a loop body) still binds
+            // when its branch executes: hoisting those would make a
+            // conditional definition unconditional and change meaning.
+            // Safe because Mix `fn` captures nothing from the enclosing
+            // scope, so an early binding cannot close over a
+            // not-yet-defined value. Diagnostics stay on the in-flow
+            // `FunctionDef` arm (which re-binds identically when reached),
+            // so warning order and count are unchanged; for duplicate
+            // top-level names, code between the two definitions still
+            // sees the earlier one, exactly as before.
+            if unwrap_top_return && self.ctx.function_depth == 0 {
+                for stmt in stmts {
+                    if let StmtKind::FunctionDef { name, params, body } = &stmt.kind {
+                        let f = self.build_function(name, params, body);
+                        self.scope.define_function(f);
+                    }
+                }
+            }
             let mut last = Value::Nil;
             for stmt in stmts {
                 {
@@ -7170,27 +7192,13 @@ impl Evaluator {
                 StmtKind::FunctionDef { name, params, body } => {
                     // Loud diagnostic for the silent push-into-a-by-value-
                     // parameter footgun (dead mutation lost to the caller).
+                    // Emitted HERE and not from the hoisting pre-pass
+                    // (execute_inner), so a hoisted definition warns once,
+                    // at the same point in the output as before hoisting
+                    // existed.
                     self.warn_dead_param_pushes(name, params, body);
-                    let sync_prefix_len = Self::compute_sync_prefix(body);
-                    let block_sync_self = Self::compute_block_sync_self(name, params, body);
-                    let body_no_local_assigns = !Self::body_has_local_assigns(body);
-                    let fib_bytecode = if block_sync_self && body_no_local_assigns {
-                        Self::compile_fib_bytecode(name, params, body)
-                    } else {
-                        None
-                    };
-                    self.scope.define_function(MixFunction {
-                        name: std::rc::Rc::from(name.as_str()),
-                        params: params.clone(),
-                        body: body.clone(),
-                        def_file: self.ctx.current_file.clone(),
-                        captures: None,
-                        sync_prefix_len,
-                        block_sync_self,
-                        body_no_local_assigns,
-                        fib_bytecode,
-                        module_env: None,
-                    });
+                    let f = self.build_function(name, params, body);
+                    self.scope.define_function(f);
                     Ok(Value::Nil)
                 }
 
@@ -9397,6 +9405,34 @@ impl Evaluator {
     /// Emit the dead-push-into-a-by-value-parameter warning (see
     /// [`dead_param_push_sites`]) to stderr, at most once per unique
     /// message per program run. Called when a function is defined.
+    /// Construct the [`MixFunction`] for a `fn`/`function` definition —
+    /// the static analyses (sync prefix, self-recursion shape, fib
+    /// bytecode) plus the record itself. Shared by the in-flow
+    /// `StmtKind::FunctionDef` arm and the top-level hoisting pre-pass in
+    /// `execute_inner`; deliberately emits NO diagnostics (see the arm).
+    fn build_function(&self, name: &str, params: &[Param], body: &FunctionBody) -> MixFunction {
+        let sync_prefix_len = Self::compute_sync_prefix(body);
+        let block_sync_self = Self::compute_block_sync_self(name, params, body);
+        let body_no_local_assigns = !Self::body_has_local_assigns(body);
+        let fib_bytecode = if block_sync_self && body_no_local_assigns {
+            Self::compile_fib_bytecode(name, params, body)
+        } else {
+            None
+        };
+        MixFunction {
+            name: std::rc::Rc::from(name),
+            params: params.to_vec(),
+            body: body.clone(),
+            def_file: self.ctx.current_file.clone(),
+            captures: None,
+            sync_prefix_len,
+            block_sync_self,
+            body_no_local_assigns,
+            fib_bytecode,
+            module_env: None,
+        }
+    }
+
     fn warn_dead_param_pushes(&self, fn_name: &str, params: &[Param], body: &FunctionBody) {
         let sites = Self::dead_param_push_sites(params, body);
         if sites.is_empty() {

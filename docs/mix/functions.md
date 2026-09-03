@@ -51,9 +51,11 @@ neg
 
 > **`fn` needs quoting as a map key.** A keyword is accepted anywhere it is unambiguously a NAME — bare map keys (`{label: 1, to: "x"}`), field access and assignment (`$m.to`, `$cfg.label = 2`). The ONE exception is `fn`: it lexes to the same token as `function`, so `{fn: 1}` and `$m.fn` are parse errors — use a quoted key (`{"fn": 1}`) and index access (`$m["fn"]`).
 
-### Define before you call — no hoisting
+### Top-level functions hoist (0.63.0)
 
-A function must be defined **before the line that calls it**. There is no hoisting:
+Every `function`/`fn` declared at the **direct top level of a script** is
+bound before the first statement runs, so a forward call works — a script
+can put its entry point first and its helpers last:
 
 ```mix
 print(f())
@@ -62,10 +64,26 @@ function f()
 end
 ```
 ```text
-Runtime error at line 1: undefined function 'f'
+1
 ```
 
-*Mutual* recursion is fine **as long as both are defined before either runs** — calls resolve at call-time, not def-time:
+The hoist is **top level only**. A function nested inside a block (an `if`
+branch, a loop body) still binds when — and only when — its branch
+executes; hoisting those would make a conditional definition
+unconditional. Function *bodies* are not pre-scanned either: a nested
+definition inside a body binds when its statement runs, as before. Safe by
+construction: a Mix `fn` [captures nothing](#the-binding-model--by-value-local-writes)
+from the enclosing scope, so an early binding cannot close over a
+not-yet-defined value.
+
+Redefinition: with two same-named top-level definitions, a call **before
+both** sees the *last* one (the hoist binds them in order); code *between*
+them still sees the earlier one, exactly as before 0.63.0 — the definition
+statement re-binds when reached.
+
+*Mutual* recursion no longer needs both definitions to precede the first
+call — calls resolve at call-time, and hoisting has already bound every
+top-level name:
 
 ```mix
 function is_even($n)
@@ -564,7 +582,7 @@ print($mathlib["mul"](3, 4))
 
 - **Sigil everywhere:** `$x`, params `$a`/`$b`. Bare `x = 1` is misparsed as a shell command.
 - **Concat is `..`** (never `+`/`.`): `"hi " .. $name`.
-- **Define before call** — no hoisting. Mutual recursion OK if both defined first; recursion caps at **128** frames (clean runtime error).
+- **Top-level `fn`s hoist** (0.63.0) — forward calls work at the script's top level; a `fn` nested in a block still binds when its branch runs. Recursion caps at **128** frames (clean runtime error).
 - **A keyword can't be a function name** (`function step(...)` errors; `$step = 1` is fine) and **a builtin can't be shadowed** (calls always resolve to the builtin).
 - **Args by value; writes function-local; closures capture for reads only.** Propagate state with the pass-in/return/reassign triad — there is no `global`.
 - **Modules = map of lambdas, index-called** (`$mod["fn"](args)`), not dot-called.
