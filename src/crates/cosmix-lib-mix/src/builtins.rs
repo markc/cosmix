@@ -76,8 +76,8 @@ pub fn clamp_signed_index(idx: i64, len: usize) -> usize {
 // in builtins_hof.rs because HOFs use a different dispatch path).
 builtin_table! {
     BUILTINS, BUILTIN_NAMES,
-    ("length", CapabilityClass::Pure,          "string",  "Return length of string, list, or map", contract!((v: any_of(string, list, map)) -> number)),
-    ("len", CapabilityClass::Pure,             "string",  "Alias for length()", contract!((v: any_of(string, list, map)) -> number)),
+    ("length", CapabilityClass::Pure,          "string",  "Length of a string (codepoints), list/map (elements), or bytes/buffer (bytes, v0.64.0)", contract!((v: any_of(string, list, map, bytes, buffer)) -> number)),
+    ("len", CapabilityClass::Pure,             "string",  "Alias for length()", contract!((v: any_of(string, list, map, bytes, buffer)) -> number)),
     ("upper", CapabilityClass::Pure,           "string",  "Convert string to uppercase", contract!((s: string) -> string)),
     ("lower", CapabilityClass::Pure,           "string",  "Convert string to lowercase", contract!((s: string) -> string)),
     ("left", CapabilityClass::Pure,            "string",  "Return leftmost N characters", contract!((s: string, n: number) -> string; failure[raises])),
@@ -222,7 +222,7 @@ builtin_table! {
     ("range", CapabilityClass::Pure,           "list",    "Generate list of numbers from start to end with optional step. Bounds/step must be whole numbers within i64 — fractional or oversized values raise VALUE_OUT_OF_RANGE instead of silently saturating (strict since v0.59.0)", contract!((start: number, end: number, step?: number) -> list(number); failure[raises])),
     ("flat", CapabilityClass::Pure,            "list",    "Flatten nested lists into a single list", contract!((list: list) -> list)),
     ("concat", CapabilityClass::Pure,          "list",    "Concatenate 2+ lists into one new list (one level; each arg must be a list)", contract!((a: list, b: list, rest: ...list) -> list)),
-    ("slice", CapabilityClass::Pure,           "list",    "Sublist [start, end): negative indices and out-of-range clamp (v0.2.0)", contract!((seq: any_of(list, string), start: number, end?: any_of(number, nil)) -> any_of(list, string))),
+    ("slice", CapabilityClass::Pure,           "list",    "Sub-sequence [start, end): negative indices and out-of-range clamp, a reversed range is empty (v0.2.0). Slices a list (elements), string (codepoints), or bytes/buffer (bytes → a new value-semantic bytes, v0.64.0)", contract!((seq: any_of(list, string, bytes, buffer), start: number, end?: any_of(number, nil)) -> any_of(list, string, bytes))),
     ("take", CapabilityClass::Pure,            "list",    "First N items of a list (negative N = last N) (v0.2.0)", contract!((seq: any_of(list, string), n: number) -> any_of(list, string))),
     ("drop", CapabilityClass::Pure,            "list",    "Skip first N items of a list (negative N = drop last N) (v0.2.0)", contract!((seq: any_of(list, string), n: number) -> any_of(list, string))),
     ("zip", CapabilityClass::Pure,             "list",    "Pair two lists element-wise into [a, b] tuples (v0.2.0)", contract!((a: list, b: list) -> list(list))),
@@ -341,6 +341,13 @@ builtin_table! {
     ("bytes_len", CapabilityClass::Pure,       "system",  "Length of a Value::Bytes buffer in bytes (v0.3.1)", contract!((b: any_of(bytes, buffer)) -> number)),
     ("string_to_bytes", CapabilityClass::Pure, "system",  "Convert a string to its UTF-8 byte representation (v0.3.1)", contract!((s: string) -> bytes)),
     ("bytes_to_string", CapabilityClass::Pure, "system",  "Convert a bytes buffer to a string; strict UTF-8, or pass {lossy:true} for a from_utf8_lossy decode (v0.17.2). Also accepts a Buffer.", contract!((b: any_of(bytes, buffer), opts?: map) -> string)),
+    ("bytes_find", CapabilityClass::Pure,      "system",  "0-based byte offset of needle in a bytes/buffer value, -1 if absent; optional `from` (signed, clamped) starts the scan and the result stays ABSOLUTE. Needle: bytes/buffer/string/byte number 0-255, and must not be empty. ⚠ NEVER use bare in a condition: -1 is truthy, 0 is falsy (MIX-W2305) (v0.64.0)", contract!((b: any_of(bytes, buffer), needle: any_of(bytes, buffer, string, number), from?: number) -> number; failure[raises])),
+    ("bytes_starts_with", CapabilityClass::Pure, "system", "Test whether a bytes/buffer value starts with a prefix (bytes/buffer/string/byte number 0-255); an empty prefix is true (v0.64.0)", contract!((b: any_of(bytes, buffer), prefix: any_of(bytes, buffer, string, number)) -> bool; failure[raises])),
+    ("bytes_split", CapabilityClass::Pure,     "system",  "Split a bytes/buffer value on a separator (bytes/buffer/string/byte number 0-255) → list of bytes. Same piece rules as split(): absent separator → one whole piece, leading/trailing separator → empty piece. An EMPTY separator raises (v0.64.0)", contract!((b: any_of(bytes, buffer), sep: any_of(bytes, buffer, string, number)) -> list(bytes); failure[raises])),
+    ("bytes_concat", CapabilityClass::Pure,    "system",  "Concatenate 1+ bytes/buffer/string values into one new bytes (a string joins as its own UTF-8). A list argument raises and names bytes_from (v0.64.0)", contract!((a: any_of(bytes, buffer, string), rest: ...any_of(bytes, buffer, string)) -> bytes; failure[raises])),
+    ("bytes_from", CapabilityClass::Pure,      "system",  "Build bytes from a LIST, flat-splicing each item — int 0-255 = one byte, string = its UTF-8, bytes/buffer = its content (same item vocabulary as buffer([items])) (v0.64.0)", contract!((items: list) -> bytes; failure[raises])),
+    ("bytes_to_hex", CapabilityClass::Pure,    "system",  "Lowercase hex of a bytes/buffer value, two chars per byte, no separator (v0.64.0)", contract!((b: any_of(bytes, buffer)) -> string; failure[raises])),
+    ("bytes_from_hex", CapabilityClass::Pure,  "system",  "Decode a hex string to bytes — strict: even length, [0-9a-fA-F] only, no separators or whitespace. Exact inverse of bytes_to_hex (v0.64.0)", contract!((hex: string) -> bytes; failure[raises])),
     ("buffer", CapabilityClass::Pure,          "buffer",  "Create a reference-semantic MUTABLE byte buffer (the escape hatch from value semantics for large binary/audio/video). buffer() empty; buffer(n) n zero bytes; buffer(string) UTF-8; buffer(bytes|buffer) independent copy; buffer([items]) flat splice of int 0-255 / string / bytes / buffer. Append with buffer_push (O(1) amortized, aliases share); freeze() to a value-semantic bytes (v0.26.0)", contract!((init?: any_of(number, string, bytes, buffer, list)) -> buffer)),
     ("buffer_push", CapabilityClass::Pure,     "buffer",  "Append bytes to a buffer IN PLACE (reference-semantic: every alias sees the growth). Each item is an int 0-255, string (UTF-8), bytes, or buffer. Self-append-safe (v0.26.0)", contract!((buf: buffer, item: any_of(number, string, bytes, buffer), rest: ...any_of(number, string, bytes, buffer)) -> nil; effects[mutates_args])),
     ("buffer_get", CapabilityClass::Pure,      "buffer",  "Byte at 0-based index i as a number 0-255, or nil if out of range (v0.26.0)", contract!((buf: buffer, i: number) -> any_of(number, nil))),
@@ -715,6 +722,13 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "bytes_len" => builtin_bytes_len(args),
         "string_to_bytes" => builtin_string_to_bytes(args),
         "bytes_to_string" => builtin_bytes_to_string(args),
+        "bytes_find" => builtin_bytes_find(args),
+        "bytes_starts_with" => builtin_bytes_starts_with(args),
+        "bytes_split" => builtin_bytes_split(args),
+        "bytes_concat" => builtin_bytes_concat(args),
+        "bytes_from" => builtin_bytes_from(args),
+        "bytes_to_hex" => builtin_bytes_to_hex(args),
+        "bytes_from_hex" => builtin_bytes_from_hex(args),
         "buffer" => builtin_buffer(args),
         "buffer_push" => builtin_buffer_push(args),
         "buffer_get" => builtin_buffer_get(args),
@@ -1022,6 +1036,12 @@ fn builtin_len(args: Vec<Value>) -> MixResult<Option<Value>> {
         Value::String(s) => s.chars().count() as f64,
         Value::List(l) => l.len() as f64,
         Value::Map(m) => m.len() as f64,
+        // bytes/buffer: the BYTE count (v0.64.0) — the same unit `$b[i]`
+        // and `for each` use, and identical to `bytes_len`, which stays
+        // as the strict spelling for code that wants a non-bytes argument
+        // rejected rather than counted.
+        Value::Bytes(b) => b.len() as f64,
+        Value::Buffer(b) => b.borrow().len() as f64,
         _ => {
             return Err(MixError::RuntimeError {
                 span: None,
@@ -2479,11 +2499,32 @@ fn builtin_slice(args: Vec<Value>) -> MixResult<Option<Value>> {
             let out: String = chars[s_idx..e_idx].iter().collect();
             return Ok(Some(Value::String(out)));
         }
+        // bytes/buffer slice BYTE-wise and always return a value-semantic
+        // `bytes` (v0.64.0) — slicing a mutable Buffer hands back an
+        // independent snapshot, never an alias into it. Same clamping as
+        // the list arm: out-of-range saturates, a reversed range is empty.
+        Value::Bytes(_) | Value::Buffer(_) => {
+            let buf = subject_bytes("slice", &args[0])?;
+            let start = args[1].to_number().ok_or_else(|| MixError::RuntimeError {
+                span: None,
+                msg: "slice(): start must be a number".to_string(),
+            })? as i64;
+            let end = match args.get(2) {
+                None | Some(Value::Nil) => buf.len() as i64,
+                Some(v) => v.to_number().ok_or_else(|| MixError::RuntimeError {
+                    span: None,
+                    msg: "slice(): end must be a number or nil".to_string(),
+                })? as i64,
+            };
+            let s_idx = clamp_signed_index(start, buf.len());
+            let e_idx = clamp_signed_index(end, buf.len()).max(s_idx);
+            return Ok(Some(Value::bytes(buf[s_idx..e_idx].to_vec())));
+        }
         other => {
             return Err(MixError::RuntimeError {
                 span: None,
                 msg: format!(
-                    "slice() expects a list or string, got {}",
+                    "slice() expects a list, string, bytes or buffer, got {}",
                     other.type_name()
                 ),
             });
@@ -13158,6 +13199,275 @@ fn builtin_bytes_to_string(args: Vec<Value>) -> MixResult<Option<Value>> {
     }
 }
 
+// --- bytes-as-a-sequence builtins (v0.64.0) ---
+//
+// NAMING (settled 0.64.0, see docs/mix/io.md "byte_* vs bytes_*"):
+//   `byte_*`  operates on a STRING in byte offsets (byte_length, byte_pos,
+//             byte_lastpos, byte_index_of) — the subject is text.
+//   `bytes_*` operates on a `bytes`/`buffer` VALUE — the subject is a byte
+//             sequence, and the argument type is checked, never coerced.
+// They are NOT duplicates and must not be merged: `byte_length($b)` on a
+// bytes value measures the `<bytes:N>` PLACEHOLDER string, which is why
+// every builtin here rejects a non-bytes subject instead of stringifying it.
+
+/// Snapshot the byte-sequence SUBJECT of a `bytes_*` builtin (argument 1).
+///
+/// Accepts `bytes` (borrowed, no copy) and `buffer` (copied under a borrow
+/// that is dropped here — so `bytes_find($buf, $buf)` and friends can never
+/// hold two live borrows of the same RefCell). Strictly rejects everything
+/// else: coercing a string here would silently answer questions about the
+/// `<bytes:N>` placeholder, the exact bug class `Value::Bytes` exists to
+/// avoid.
+fn subject_bytes<'a>(name: &str, v: &'a Value) -> MixResult<std::borrow::Cow<'a, [u8]>> {
+    match v {
+        Value::Bytes(b) => Ok(std::borrow::Cow::Borrowed(b.as_slice())),
+        Value::Buffer(b) => Ok(std::borrow::Cow::Owned(b.borrow().clone())),
+        other => Err(MixError::RuntimeError {
+            span: None,
+            msg: format!(
+                "{name}(): expected bytes or buffer, got {}",
+                other.type_name()
+            ),
+        }),
+    }
+}
+
+/// Snapshot a byte-sequence OPERAND (a needle, separator, or prefix).
+///
+/// Wider than [`subject_bytes`] on purpose: a literal needle is almost
+/// always written as a string (`bytes_find($b, "\r\n\r\n")`) or a single
+/// byte number (`bytes_split($b, 10)`), and neither spelling can be
+/// mistaken for a placeholder — a String encodes as its own UTF-8 and a
+/// Number must be an exact 0-255. Lists, maps and nil are still refused.
+fn operand_bytes(name: &str, what: &str, v: &Value) -> MixResult<Vec<u8>> {
+    match v {
+        Value::Bytes(b) => Ok(b.to_vec()),
+        Value::Buffer(b) => Ok(b.borrow().clone()),
+        Value::String(s) => Ok(s.as_bytes().to_vec()),
+        Value::Number(n) => Ok(vec![as_exact_integer(
+            &format!("{name}(): {what}"),
+            *n,
+            0,
+            255,
+        )? as u8]),
+        other => Err(MixError::RuntimeError {
+            span: None,
+            msg: format!(
+                "{name}(): {what} must be bytes, buffer, string or a byte number 0-255, got {}",
+                other.type_name()
+            ),
+        }),
+    }
+}
+
+/// First index at which `needle` occurs in `hay` at or after `from`.
+/// Plain O(n*m) scan — the byte sequences these builtins see are message
+/// bodies and protocol frames, not corpora, and a naive scan avoids
+/// pulling a substring-search dependency into a no-default-features build.
+fn find_subslice(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() || needle.len() > hay.len() || from > hay.len() {
+        return None;
+    }
+    let last = hay.len() - needle.len();
+    (from..=last).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+/// `bytes_find($b, needle[, from])` — 0-based byte offset of `needle`,
+/// `-1` when absent. The 0-based/-1 convention (and its condition trap)
+/// is `index_of`'s, not `pos`'s; `bytes_find` is registered in the
+/// analyzer's `MINUS_ONE_SENTINEL_BUILTINS` so a bare use in a condition
+/// is linted (MIX-W2305).
+///
+/// The optional `from` is what makes a scanning parser linear: without it
+/// every step has to `slice` the remainder and add offsets back by hand.
+/// It takes signed indices like `slice` and clamps, and the returned index
+/// is ABSOLUTE (into `$b`), never relative to `from`.
+fn builtin_bytes_find(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("bytes_find", &args, 2, 3)?;
+    let hay = subject_bytes("bytes_find", &args[0])?;
+    let needle = operand_bytes("bytes_find", "needle", &args[1])?;
+    if needle.is_empty() {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: "bytes_find(): needle must not be empty".to_string(),
+        });
+    }
+    let from = match args.get(2) {
+        None | Some(Value::Nil) => 0,
+        Some(v) => {
+            let n = required_number_value("bytes_find(): argument 3", v)? as i64;
+            clamp_signed_index(n, hay.len())
+        }
+    };
+    let pos = find_subslice(&hay, &needle, from)
+        .map(|i| i as f64)
+        .unwrap_or(-1.0);
+    Ok(Some(Value::Number(pos)))
+}
+
+/// `bytes_starts_with($b, prefix)` — bool. An empty prefix is true, as it
+/// is for the string `starts_with`.
+fn builtin_bytes_starts_with(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("bytes_starts_with", &args, 2, 2)?;
+    let subject = subject_bytes("bytes_starts_with", &args[0])?;
+    let prefix = operand_bytes("bytes_starts_with", "prefix", &args[1])?;
+    Ok(Some(Value::Bool(subject.starts_with(&prefix))))
+}
+
+/// `bytes_split($b, sep)` → list of `bytes`.
+///
+/// Splitting rules are the string `split`'s: a separator that never occurs
+/// yields a one-element list holding the whole input, a leading or
+/// trailing separator yields an empty piece at that end, and an empty
+/// input yields one empty piece. The one deliberate divergence is an EMPTY
+/// separator, which `split` treats as "between every char" — meaningless
+/// on raw bytes (and a silent infinite-piece trap), so it raises instead.
+fn builtin_bytes_split(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("bytes_split", &args, 2, 2)?;
+    let subject = subject_bytes("bytes_split", &args[0])?;
+    let sep = operand_bytes("bytes_split", "separator", &args[1])?;
+    if sep.is_empty() {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: "bytes_split(): separator must not be empty".to_string(),
+        });
+    }
+    let mut out: Vec<Value> = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(hit) = find_subslice(&subject, &sep, cursor) {
+        out.push(Value::bytes(subject[cursor..hit].to_vec()));
+        cursor = hit + sep.len();
+    }
+    out.push(Value::bytes(subject[cursor..].to_vec()));
+    Ok(Some(Value::list(out)))
+}
+
+/// `bytes_concat($a, $b, ...)` → one new `bytes`.
+///
+/// Variadic like the list `concat`, but accepts 1+ arguments rather than
+/// 2+ (a one-argument call is a copy, which is what generated/looping code
+/// wants at the base case) and accepts a string as well as bytes/buffer —
+/// a string joins as its own UTF-8, the same encoding `string_to_bytes`
+/// gives. Passing a LIST raises and names `bytes_from`, which is the
+/// list-shaped constructor.
+fn builtin_bytes_concat(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("bytes_concat", &args, 1)?;
+    let mut out: Vec<u8> = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        match a {
+            Value::List(_) => {
+                return Err(MixError::RuntimeError {
+                    span: None,
+                    msg: format!(
+                        "bytes_concat(): argument {} is a list — use bytes_from(list) to build bytes from a list",
+                        i + 1
+                    ),
+                });
+            }
+            _ => out.extend_from_slice(&operand_bytes(
+                "bytes_concat",
+                &format!("argument {}", i + 1),
+                a,
+            )?),
+        }
+    }
+    Ok(Some(Value::bytes(out)))
+}
+
+/// `bytes_from($list)` → `bytes`. The list-shaped constructor, with the
+/// same item vocabulary as `buffer([items])`: an int 0-255 is one byte, a
+/// string contributes its UTF-8, and a bytes/buffer is flat-spliced. Any
+/// other item — including a nested list — raises rather than being
+/// stringified.
+fn builtin_bytes_from(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("bytes_from", &args, 1, 1)?;
+    match &args[0] {
+        Value::List(items) => {
+            let mut out: Vec<u8> = Vec::new();
+            for (i, item) in items.iter().enumerate() {
+                out.extend_from_slice(&buffer_item_bytes(
+                    item,
+                    &format!("bytes_from(): item {}", i + 1),
+                )?);
+            }
+            Ok(Some(Value::bytes(out)))
+        }
+        other => Err(MixError::RuntimeError {
+            span: None,
+            msg: format!(
+                "bytes_from(): expected a list, got {} — for a single value use string_to_bytes()/freeze()",
+                other.type_name()
+            ),
+        }),
+    }
+}
+
+/// `bytes_to_hex($b)` → lowercase hex, two characters per byte, no
+/// separator and no prefix. Deliberately option-free so that
+/// `bytes_from_hex(bytes_to_hex($b))` is an exact round trip; a separated
+/// form is one `join` away and cannot then be fed back in by mistake.
+fn builtin_bytes_to_hex(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("bytes_to_hex", &args, 1, 1)?;
+    let buf = subject_bytes("bytes_to_hex", &args[0])?;
+    let mut s = String::with_capacity(buf.len() * 2);
+    for b in buf.iter() {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    Ok(Some(Value::String(s)))
+}
+
+/// `bytes_from_hex($s)` → `bytes`. Strict: an even number of characters,
+/// each `[0-9a-fA-F]`. Whitespace and separators are NOT stripped — a
+/// caller that has `de:ad:be:ef` knows it does and can say so, whereas a
+/// lenient decoder would silently accept a truncated or corrupted digest.
+fn builtin_bytes_from_hex(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("bytes_from_hex", &args, 1, 1)?;
+    let s = match &args[0] {
+        Value::String(s) => s.as_str(),
+        other => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!("bytes_from_hex(): expected string, got {}", other.type_name()),
+            });
+        }
+    };
+    if !s.len().is_multiple_of(2) {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!(
+                "bytes_from_hex(): hex string must have an even length, got {}",
+                s.len()
+            ),
+        });
+    }
+    let raw = s.as_bytes();
+    let mut out = Vec::with_capacity(raw.len() / 2);
+    for pair in raw.chunks(2) {
+        let hi = hex_nibble(pair[0])?;
+        let lo = hex_nibble(pair[1])?;
+        out.push(hi << 4 | lo);
+    }
+    Ok(Some(Value::bytes(out)))
+}
+
+/// One hex character → its 0-15 value; anything else raises and quotes the
+/// offending character so the caller can see WHICH byte was wrong.
+fn hex_nibble(c: u8) -> MixResult<u8> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(MixError::RuntimeError {
+            span: None,
+            msg: format!(
+                "bytes_from_hex(): '{}' is not a hex digit",
+                (c as char).escape_debug()
+            ),
+        }),
+    }
+}
+
 // --- Buffer builtins (reference-semantic mutable byte buffers) ---
 
 /// Snapshot one `buffer` / `buffer_push` source item into owned bytes:
@@ -14351,7 +14661,9 @@ fn builtin_help(_args: Vec<Value>) -> MixResult<Option<Value>> {
         "Crypto:    hash_blake3 hash_sha256 hmac_sha256 constant_time_eq hash_file base64_encode base64_decode uuid"
     );
     println!("Network:   http_get http_post http_request dns_lookup");
-    println!("Bytes:     bytes_len string_to_bytes bytes_to_string");
+    println!("Bytes:     bytes_len string_to_bytes bytes_to_string bytes_find bytes_starts_with");
+    println!("           bytes_split bytes_concat bytes_from bytes_to_hex bytes_from_hex");
+    println!("           (also $b[i], length, slice and `for each` — v0.64.0)");
     println!("SQL:       sqlopen sqlexec sqlclose");
     println!("URL:       url_parse");
     println!("Bus:       send address emit port_exists");
@@ -18510,6 +18822,212 @@ mod bytes_tests {
         assert!(msg.contains("string"), "msg: {msg}");
     }
 
+    // --- bytes as a sequence (v0.64.0, T1) ---
+
+    fn b(v: &[u8]) -> Value {
+        Value::bytes(v.to_vec())
+    }
+
+    fn as_bytes(v: Option<Value>) -> Vec<u8> {
+        match &v {
+            Some(Value::Bytes(x)) => x.to_vec(),
+            other => panic!("expected bytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn len_counts_bytes_not_chars() {
+        // "héllo" is 5 codepoints / 6 bytes: len() must answer 6 on the
+        // bytes value and 5 on the string, or the two units have blurred.
+        let raw = "héllo".as_bytes().to_vec();
+        assert_eq!(raw.len(), 6);
+        assert_eq!(
+            builtin_len(vec![Value::bytes(raw)]).unwrap(),
+            Some(Value::Number(6.0))
+        );
+        assert_eq!(
+            builtin_len(vec![Value::String("héllo".into())]).unwrap(),
+            Some(Value::Number(5.0))
+        );
+    }
+
+    #[test]
+    fn slice_on_bytes_clamps_and_reverses_empty() {
+        let v = b(&[1, 2, 3, 4, 5]);
+        assert_eq!(
+            as_bytes(builtin_slice(vec![v.clone(), Value::Number(1.0), Value::Number(3.0)]).unwrap()),
+            vec![2, 3]
+        );
+        // Omitted end runs to the end; negative indices count back.
+        assert_eq!(
+            as_bytes(builtin_slice(vec![v.clone(), Value::Number(-2.0)]).unwrap()),
+            vec![4, 5]
+        );
+        // Out of range clamps rather than raising...
+        assert_eq!(
+            as_bytes(
+                builtin_slice(vec![v.clone(), Value::Number(-100.0), Value::Number(100.0)]).unwrap()
+            ),
+            vec![1, 2, 3, 4, 5]
+        );
+        // ...and a reversed range is empty, not a panic and not a wrap.
+        assert_eq!(
+            as_bytes(builtin_slice(vec![v, Value::Number(4.0), Value::Number(1.0)]).unwrap()),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn bytes_find_offsets_are_absolute() {
+        let v = b(b"hello, world");
+        // Plain find, string needle.
+        assert_eq!(
+            builtin_bytes_find(vec![v.clone(), Value::String("world".into())]).unwrap(),
+            Some(Value::Number(7.0))
+        );
+        // Absent is -1, never nil.
+        assert_eq!(
+            builtin_bytes_find(vec![v.clone(), Value::String("zz".into())]).unwrap(),
+            Some(Value::Number(-1.0))
+        );
+        // `from` skips the first 'l' at 2 and finds the one at 3 — the
+        // returned index is into the WHOLE value, not the suffix.
+        assert_eq!(
+            builtin_bytes_find(vec![
+                v.clone(),
+                Value::String("l".into()),
+                Value::Number(3.0)
+            ])
+            .unwrap(),
+            Some(Value::Number(3.0))
+        );
+        assert_eq!(
+            builtin_bytes_find(vec![v.clone(), Value::String("l".into()), Value::Number(4.0)])
+                .unwrap(),
+            Some(Value::Number(10.0))
+        );
+        // A single byte number is a legal needle (0x2C = ',').
+        assert_eq!(
+            builtin_bytes_find(vec![v, Value::Number(44.0)]).unwrap(),
+            Some(Value::Number(5.0))
+        );
+    }
+
+    #[test]
+    fn bytes_find_rejects_string_subject() {
+        // The whole point of the strict subject: a string would otherwise
+        // be answered about as text, or worse, its `<bytes:N>` placeholder.
+        let err =
+            builtin_bytes_find(vec![Value::String("hello".into()), Value::String("l".into())])
+                .unwrap_err();
+        assert!(
+            format!("{err}").contains("expected bytes or buffer"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn bytes_split_matches_string_split_piece_rules() {
+        let pieces = |s: &str, sep: &str| -> Vec<Vec<u8>> {
+            match &builtin_bytes_split(vec![b(s.as_bytes()), Value::String(sep.into())]).unwrap() {
+                Some(Value::List(l)) => l
+                    .iter()
+                    .map(|v| match v {
+                        Value::Bytes(x) => x.to_vec(),
+                        other => panic!("piece is not bytes: {other:?}"),
+                    })
+                    .collect(),
+                other => panic!("expected list, got {other:?}"),
+            }
+        };
+        // Same shapes `split()` produces for the same inputs.
+        assert_eq!(pieces("a,b,,c", ","), vec![b"a".to_vec(), b"b".to_vec(), vec![], b"c".to_vec()]);
+        assert_eq!(pieces(",a,", ","), vec![vec![], b"a".to_vec(), vec![]]);
+        assert_eq!(pieces("abc", "x"), vec![b"abc".to_vec()]);
+        assert_eq!(pieces("", ","), vec![Vec::<u8>::new()]);
+        // Overlapping-separator case: the scan resumes AFTER the match.
+        assert_eq!(
+            pieces("aaaa", "aa"),
+            vec![Vec::<u8>::new(), Vec::new(), Vec::new()]
+        );
+        // Empty separator raises rather than emulating split's per-char form.
+        let err = builtin_bytes_split(vec![b(b"abc"), Value::String(String::new())]).unwrap_err();
+        assert!(format!("{err}").contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn bytes_concat_and_from_build_the_same_value() {
+        assert_eq!(
+            as_bytes(
+                builtin_bytes_concat(vec![
+                    Value::String("ab".into()),
+                    b(&[99]),
+                    Value::Number(100.0)
+                ])
+                .unwrap()
+            ),
+            b"abcd".to_vec()
+        );
+        assert_eq!(
+            as_bytes(
+                builtin_bytes_from(vec![Value::list(vec![
+                    Value::String("ab".into()),
+                    b(&[99]),
+                    Value::Number(100.0),
+                ])])
+                .unwrap()
+            ),
+            b"abcd".to_vec()
+        );
+        // A list handed to bytes_concat names the right builtin instead of
+        // being stringified into "[1, 2]".
+        let err = builtin_bytes_concat(vec![Value::list(vec![Value::Number(1.0)])]).unwrap_err();
+        assert!(format!("{err}").contains("bytes_from"), "{err}");
+    }
+
+    #[test]
+    fn hex_round_trip_is_exact_and_strict() {
+        let raw: Vec<u8> = (0u8..=255).collect();
+        let hex = match &builtin_bytes_to_hex(vec![Value::bytes(raw.clone())]).unwrap() {
+            Some(Value::String(s)) => s.clone(),
+            other => panic!("expected string, got {other:?}"),
+        };
+        assert_eq!(hex.len(), 512);
+        assert!(hex.starts_with("000102"), "{hex}");
+        assert!(hex.ends_with("fdfeff"), "{hex}");
+        assert_eq!(
+            as_bytes(builtin_bytes_from_hex(vec![Value::String(hex)]).unwrap()),
+            raw
+        );
+        // Uppercase decodes; odd length and non-hex characters raise.
+        assert_eq!(
+            as_bytes(builtin_bytes_from_hex(vec![Value::String("DEADbeef".into())]).unwrap()),
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
+        let err = builtin_bytes_from_hex(vec![Value::String("abc".into())]).unwrap_err();
+        assert!(format!("{err}").contains("even length"), "{err}");
+        let err = builtin_bytes_from_hex(vec![Value::String("ab:cd0".into())]).unwrap_err();
+        assert!(format!("{err}").contains("not a hex digit"), "{err}");
+    }
+
+    #[test]
+    fn bytes_starts_with_prefix_forms() {
+        let v = b(b"hello");
+        for (prefix, want) in [
+            (Value::String("hell".into()), true),
+            (Value::String("world".into()), false),
+            (Value::Number(104.0), true),
+            (Value::Number(105.0), false),
+            (b(&[]), true),
+        ] {
+            assert_eq!(
+                builtin_bytes_starts_with(vec![v.clone(), prefix.clone()]).unwrap(),
+                Some(Value::Bool(want)),
+                "prefix {prefix:?}"
+            );
+        }
+    }
+
     #[test]
     fn string_to_bytes_utf8() {
         let v = builtin_string_to_bytes(vec![Value::String("héllo".into())]).unwrap();
@@ -19538,7 +20056,14 @@ mod char_aware_tests {
             "buffer_get",
             "buffer_push",
             "buffer_set",
+            "bytes_concat",
+            "bytes_find",
+            "bytes_from",
+            "bytes_from_hex",
             "bytes_len",
+            "bytes_split",
+            "bytes_starts_with",
+            "bytes_to_hex",
             "bytes_to_string",
             "concat",
             "constant_time_eq",

@@ -151,8 +151,10 @@ $r = http_get("https://example.com")
 write_file("/tmp/example.html", $r["bytes"])
 ```
 
-To measure the buffer use `bytes_len($r["bytes"])` — plain `length()` does not
-accept a bytes value (`len() not supported for bytes`).
+To measure the buffer use `bytes_len($r["bytes"])` or, since **v0.64.0**, plain
+`length($r["bytes"])` — both answer the byte count. The raw body can also be
+indexed, sliced, iterated and searched directly (`bytes_find`, `bytes_split`,
+`bytes_starts_with`); see [io](io.md#bytes-as-a-sequence-v0640).
 
 ## Headers
 

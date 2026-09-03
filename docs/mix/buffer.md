@@ -36,6 +36,36 @@ List the family live with `mix builtins buffer`; one-line help with
 `write_file`/`append_file`/`write_new` all also accept a `Buffer` directly, so
 you rarely need an explicit `freeze` just to hand a buffer to a sink.
 
+Since **v0.64.0** a buffer also answers the generic sequence operations and the
+whole `bytes_*` family — `$buf[i]`, `length($buf)`, `slice($buf, s, e)`,
+`for each $x in $buf`, `bytes_find`, `bytes_split`, `bytes_to_hex` and the rest;
+see [io](io.md#bytes-as-a-sequence-v0640). Three properties matter because a
+buffer is reference-semantic:
+
+- **`slice` returns an independent `bytes`**, never a view — a later
+  `buffer_push` cannot change a slice you already took.
+- **`for each` is pinned at loop entry** — growing the buffer inside the body
+  does not extend the loop.
+- **`$buf[i]` is NOT a synonym for `buffer_get($buf, i)`.** They agree on an
+  in-range non-negative integer, and both answer `nil` when a non-negative
+  index is past the end — but they part company on the other index forms:
+  `$buf[i]` follows Mix's universal *indexing* rules (a negative index counts
+  from the end, a fractional one truncates), while `buffer_get` is a strict
+  accessor that **raises** on both:
+
+  ```mix
+  $buf = buffer("ab")
+  print($buf[-1])              -- 98  (the last byte)
+  print(buffer_get($buf, -1))  -- raises: index must be a non-negative integer
+  ```
+
+  Neither is wrong; `$buf[i]` is consistent with `$list[i]`/`$str[i]`/`$b[i]`,
+  and `buffer_get` is consistent with `buffer_set`, which must refuse a
+  computed-nonsense index rather than write somewhere surprising.
+
+Writing through the index (`$buf[i] = 65`) is still refused; the in-place write
+is `buffer_set`.
+
 ## Building binary — the media-pipeline idiom
 
 ```mix

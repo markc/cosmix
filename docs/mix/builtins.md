@@ -1,6 +1,6 @@
 # Builtin index
 
-Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.62.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
+Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.64.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
 
 Some builtins are feature-gated on the `cosmix-lib-mix` crate (`json`, `regex`, `toml`, `datetime`, `url`, `crypto`, `http`, `sqlite`, `dkim`, `markdown`, `datastar`) so embedders can pull only what they need — the `mix` binary turns them all on.
 
@@ -25,7 +25,7 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
 
 ## string  — see [strings](strings.md)
 
-  length          Return length of string, list, or map
+  length          Length of a string (codepoints), list/map (elements), or bytes/buffer (bytes, v0.64.0)
   len             Alias for length()
   upper           Convert string to uppercase
   lower           Convert string to lowercase
@@ -158,7 +158,7 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   range           Generate list of numbers from start to end with optional step. Bounds/step must be whole numbers within i64 — fractional or oversized values raise VALUE_OUT_OF_RANGE instead of silently saturating (strict since v0.59.0)
   flat            Flatten nested lists into a single list
   concat          Concatenate 2+ lists into one new list (one level; each arg must be a list)
-  slice           Sublist [start, end): negative indices and out-of-range clamp (v0.2.0)
+  slice           Sub-sequence [start, end): negative indices and out-of-range clamp, a reversed range is empty (v0.2.0). Slices a list (elements), string (codepoints), or bytes/buffer (bytes → a new value-semantic bytes, v0.64.0)
   take            First N items of a list (negative N = last N) (v0.2.0)
   drop            Skip first N items of a list (negative N = drop last N) (v0.2.0)
   zip             Pair two lists element-wise into [a, b] tuples (v0.2.0)
@@ -281,6 +281,13 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   bytes_len       Length of a Value::Bytes buffer in bytes (v0.3.1)
   string_to_bytes Convert a string to its UTF-8 byte representation (v0.3.1)
   bytes_to_string Convert a bytes buffer to a string; strict UTF-8, or pass {lossy:true} for a from_utf8_lossy decode (v0.17.2). Also accepts a Buffer.
+  bytes_find      0-based byte offset of needle in a bytes/buffer value, -1 if absent; optional `from` (signed, clamped) starts the scan and the result stays ABSOLUTE. Needle: bytes/buffer/string/byte number 0-255, and must not be empty. ⚠ NEVER use bare in a condition: -1 is truthy, 0 is falsy (MIX-W2305) (v0.64.0)
+  bytes_starts_with Test whether a bytes/buffer value starts with a prefix (bytes/buffer/string/byte number 0-255); an empty prefix is true (v0.64.0)
+  bytes_split     Split a bytes/buffer value on a separator (bytes/buffer/string/byte number 0-255) → list of bytes. Same piece rules as split(): absent separator → one whole piece, leading/trailing separator → empty piece. An EMPTY separator raises (v0.64.0)
+  bytes_concat    Concatenate 1+ bytes/buffer/string values into one new bytes (a string joins as its own UTF-8). A list argument raises and names bytes_from (v0.64.0)
+  bytes_from      Build bytes from a LIST, flat-splicing each item — int 0-255 = one byte, string = its UTF-8, bytes/buffer = its content (same item vocabulary as buffer([items])) (v0.64.0)
+  bytes_to_hex    Lowercase hex of a bytes/buffer value, two chars per byte, no separator (v0.64.0)
+  bytes_from_hex  Decode a hex string to bytes — strict: even length, [0-9a-fA-F] only, no separators or whitespace. Exact inverse of bytes_to_hex (v0.64.0)
   dns_lookup      Resolve a hostname to a list of IP address strings
   help            Show Mix builtin help in the REPL
   require         Load a Mix module: evaluate the file once in an isolated scope, return its exports (map of top-level fns + $vars, or the file's top-level return value). Cached per canonical path; cycles error (v0.27.0)

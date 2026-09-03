@@ -260,6 +260,12 @@ The three boundaries, in one table:
 | user-perceived chars | `grapheme_count`, `grapheme_substr`, `grapheme_reverse` | grapheme clusters (UAX #29) |
 | terminal columns | `display_width`, `lpad_w`, `rpad_w`, `word_wrap_w` | display cells (UAX #11) |
 
+All four rows are operations on **text**. Operations on a raw `bytes`/`buffer`
+*value* are a different family, `bytes_*` — see
+[io](io.md#naming-byte_-vs-bytes_). The two are easy to confuse and are not
+interchangeable: `byte_length($some_bytes)` stringifies its argument first and
+so measures the `<bytes:N>` placeholder, not the bytes.
+
 A plain `substr`/`reverse` is codepoint-based and **splits** an emoji ZWJ sequence or
 combining cluster; the `grapheme_*` ops keep it whole:
 

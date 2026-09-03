@@ -118,3 +118,62 @@ async fn compatible_builtin_surplus_still_tolerated() {
         .unwrap();
     assert_eq!(out, "A\n");
 }
+
+// --- v0.64.0 bytes family -------------------------------------------------
+//
+// The `contract!(...)` row is the ONLY source of truth for --strict-arity
+// (and for `mix lint`'s static arity check), and nothing else compares it to
+// what the implementation accepts. Without these, dropping `from?` from the
+// `bytes_find` row would leave `bytes_find($b, "l", 4)` working in the
+// default mode and raising ARITY_MISMATCH under strict, with no test red.
+
+#[tokio::test]
+async fn strict_accepts_declared_bytes_arities() {
+    // Every optional/variadic form the seven rows declare, exercised at its
+    // boundaries — and each prints its RESULT, so a row that silently
+    // stopped accepting an argument shows up as a wrong value, not just a
+    // raise.
+    let src = concat!(
+        "$b = string_to_bytes(\"hello\")\n",
+        "print(bytes_find($b, \"l\"))\n",
+        "print(bytes_find($b, \"l\", 3))\n",
+        "print(bytes_starts_with($b, \"he\"))\n",
+        "print(length(bytes_split($b, \"l\")))\n",
+        "print(bytes_to_hex(bytes_concat($b)))\n",
+        "print(bytes_to_hex(bytes_concat($b, $b, \"!\")))\n",
+        "print(bytes_to_hex(bytes_from([1, 2])))\n",
+        "print(bytes_to_hex(bytes_from_hex(\"ff00\")))\n",
+        "print(length($b) .. \" \" .. bytes_len(slice($b, 1)) .. \" \" .. bytes_len(slice($b, 1, 3)))\n",
+    );
+    assert_eq!(
+        strict_ok(src).await,
+        "2\n3\ntrue\n3\n68656c6c6f\n68656c6c6f68656c6c6f21\n0102\nff00\n5 4 2\n"
+    );
+}
+
+#[tokio::test]
+async fn strict_rejects_bytes_arity_surplus_and_shortfall() {
+    let src = concat!(
+        "$b = string_to_bytes(\"hello\")\n",
+        "try\n  bytes_find($b, \"l\", 0, 9)\ncatch $m, $e\n  print($e.code)\nend\n",
+        "try\n  bytes_starts_with($b)\ncatch $m, $e\n  print($e.code)\nend\n",
+        "try\n  bytes_split($b, \"l\", \"x\")\ncatch $m, $e\n  print($e.code)\nend\n",
+        "try\n  bytes_concat()\ncatch $m, $e\n  print($e.code)\nend\n",
+        "try\n  bytes_from([1], [2])\ncatch $m, $e\n  print($e.code)\nend\n",
+        "try\n  bytes_to_hex($b, 1)\ncatch $m, $e\n  print($e.code)\nend\n",
+        "try\n  bytes_from_hex(\"ff\", 1)\ncatch $m, $e\n  print($e.code)\nend\n",
+        "try\n  slice($b, 0, 1, 2)\ncatch $m, $e\n  print($e.code)\nend\n",
+        // Zero args on every row: catches a drift in the OPPOSITE direction
+        // from the one above — a row edited to make its SUBJECT optional.
+        "try\n  bytes_find()\ncatch $m, $e\n  print($e.code)\nend\n",
+        "try\n  bytes_starts_with()\ncatch $m, $e\n  print($e.code)\nend\n",
+        "try\n  bytes_split()\ncatch $m, $e\n  print($e.code)\nend\n",
+        "try\n  bytes_from()\ncatch $m, $e\n  print($e.code)\nend\n",
+        "try\n  bytes_to_hex()\ncatch $m, $e\n  print($e.code)\nend\n",
+        "try\n  bytes_from_hex()\ncatch $m, $e\n  print($e.code)\nend\n",
+    );
+    assert_eq!(
+        strict_ok(src).await,
+        "ARITY_MISMATCH\n".repeat(14).as_str()
+    );
+}

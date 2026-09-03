@@ -6923,6 +6923,17 @@ impl Evaluator {
                         Value::Map(m) => {
                             IterSrc::Owned(m.keys().map(|k| Value::String(k.clone())).collect())
                         }
+                        // bytes/buffer iterate as NUMBERS 0-255 (v0.64.0),
+                        // the same unit `$b[i]` yields. Materialised once at
+                        // entry like the String/Map arms, so the iteration
+                        // set is pinned even though a `Buffer` is
+                        // reference-semantic and the body may grow it.
+                        Value::Bytes(b) => {
+                            IterSrc::Owned(b.iter().map(|&x| Value::Number(x as f64)).collect())
+                        }
+                        Value::Buffer(b) => IterSrc::Owned(
+                            b.borrow().iter().map(|&x| Value::Number(x as f64)).collect(),
+                        ),
                         other => {
                             return Err(MixError::RuntimeError {
                                 span: None,
@@ -8102,6 +8113,34 @@ impl Evaluator {
                 let chars: Vec<char> = s.chars().collect();
                 match crate::builtins::resolve_signed_index(*n as i64, chars.len()) {
                     Some(i) => Ok(Value::String(chars[i].to_string())),
+                    None => Ok(Value::Nil),
+                }
+            }
+            // `$b[i]` on bytes/buffer yields the BYTE as a number 0-255
+            // (v0.64.0). Same signed-index and out-of-range rules as a
+            // list: `-1` is the last byte, out of range is `nil` (NOT a
+            // raise — that is what every other indexable value does).
+            //
+            // This is deliberately NOT `buffer_get`'s contract. The two
+            // agree on an in-range non-negative integer, and both answer
+            // nil past the end, but `buffer_get` RAISES on a negative or
+            // fractional index where indexing resolves/truncates it. That
+            // is the right split: an accessor paired with `buffer_set`
+            // must refuse a nonsense index, while `$x[i]` has to read the
+            // same way on every indexable value. Pinned by
+            // tests/scripts/bytes_ops.mix so it can't drift silently.
+            (Value::Bytes(b), Value::Number(n)) => {
+                match crate::builtins::resolve_signed_index(*n as i64, b.len()) {
+                    Some(i) => Ok(Value::Number(b[i] as f64)),
+                    None => Ok(Value::Nil),
+                }
+            }
+            (Value::Buffer(b), Value::Number(n)) => {
+                // Borrow scoped to the read: never held across an eval,
+                // so a script cannot deadlock its own buffer.
+                let buf = b.borrow();
+                match crate::builtins::resolve_signed_index(*n as i64, buf.len()) {
+                    Some(i) => Ok(Value::Number(buf[i] as f64)),
                     None => Ok(Value::Nil),
                 }
             }

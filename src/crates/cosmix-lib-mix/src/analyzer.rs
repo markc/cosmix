@@ -1517,7 +1517,7 @@ fn check_release_transition_advisories(stmts: &[Stmt], ctx: &FileContext, a: &mu
 /// safe in the same position, since their not-found sentinel is `0` and so
 /// is falsy — which is exactly why this trap is easy to walk into after
 /// using those.
-const MINUS_ONE_SENTINEL_BUILTINS: &[&str] = &["index_of", "byte_index_of"];
+const MINUS_ONE_SENTINEL_BUILTINS: &[&str] = &["index_of", "byte_index_of", "bytes_find"];
 
 /// Flag a `-1`-sentinel builtin used directly as a truth value.
 ///
@@ -1540,9 +1540,17 @@ fn check_truthiness_traps(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
                     format!(
                         "`{name}()` in a condition is backwards: -1 (not found) is truthy, 0 (found at the first position) is falsy"
                     ),
-                    Some(format!(
-                        "use contains() for the yes/no question, or compare explicitly: {name}(..) >= 0"
-                    )),
+                    Some(if name == "bytes_find" {
+                        // `contains()` takes a string or list, so it REJECTS a
+                        // bytes/buffer subject — following the generic hint
+                        // here trades a lint for a runtime error. Only the
+                        // explicit comparison is valid advice for this one.
+                        format!("compare explicitly: {name}(..) >= 0")
+                    } else {
+                        format!(
+                            "use contains() for the yes/no question, or compare explicitly: {name}(..) >= 0"
+                        )
+                    }),
                 ));
             }
             // Boolean operators propagate the condition position to their

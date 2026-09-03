@@ -911,6 +911,136 @@ Note `bytes_len` counts **bytes**, while `length` on a string counts **codepoint
 (`length("héllo")` is 5) — see [strings](strings.md) for the codepoint / byte /
 grapheme split.
 
+## bytes as a sequence (v0.64.0)
+
+Before 0.64.0 a `bytes` value was something you could hold but not look
+inside: `$b[3]` said *cannot index bytes with number*, `length($b)` said *len()
+not supported for bytes*, `slice` refused it, and `for each` refused it. The only
+way in was `bytes_to_string({lossy: true})`, which **destroys the very bytes you
+are inspecting** — a lossy decode replaces every invalid sequence with U+FFFD, so
+a digest taken afterwards is a digest of something that never arrived.
+
+The four generic sequence operations now accept `bytes` **and** `buffer`, in
+byte units:
+
+```
+$b[i]                      the byte at i as a NUMBER 0-255
+length($b) / len($b)       byte count (same answer as bytes_len)
+slice($b, start[, end])    a new value-semantic `bytes`
+for each $x in $b          iterates NUMBERS 0-255
+```
+
+The boundary rules are the list's, not new ones:
+
+- **Negative indices count from the end.** `$b[-1]` is the last byte;
+  `slice($b, -5, -1)` is the last five minus one.
+- **An out-of-range `$b[i]` is `nil`, not a raise** — the same answer
+  `[1,2][9]`, `"ab"[9]` and `buffer_get` already give. There is no
+  bounds-check exception in Mix's indexing to be consistent with.
+- **`slice` clamps and never raises**: `slice($b, -100, 100)` is the whole
+  value, and a **reversed** range (`slice($b, 4, 1)`) is empty bytes, not a
+  wrap-around and not an error.
+- **Slicing a `buffer` returns an independent `bytes` snapshot**, never an
+  alias — a later `buffer_push` cannot change a slice you already took.
+- **`for each` is pinned at entry**: growing a `buffer` inside the loop body
+  does not extend that loop, exactly as mutating a list inside `for each`
+  does not.
+- **Index-assignment is still refused** (`$b[0] = 65` → *cannot index-assign
+  into bytes*). `bytes` is value-semantic; the mutable type is `buffer`, and
+  the in-place write is [`buffer_set`](buffer.md).
+
+The framing case this was built for — drop a leading header line from a raw
+mail body without a lossy round-trip, so the digest is over the bytes that
+actually arrived:
+
+```mix
+$framed = read_file_bytes("/tmp/io/body.raw")   -- "text:\n" .. raw 8-bit body
+$body = slice($framed, 6)
+print(bytes_to_hex($body))
+```
+
+### The `bytes_*` family
+
+```
+bytes_find(b, needle[, from])   0-based offset, -1 absent; `from` is signed+clamped
+bytes_starts_with(b, prefix)    bool (an empty prefix is true)
+bytes_split(b, sep)             -> list of bytes
+bytes_concat(a, b, ...)         1+ bytes/buffer/string -> one new bytes
+bytes_from(list)                int 0-255 / string / bytes / buffer, flat-spliced
+bytes_to_hex(b)                 lowercase hex, 2 chars per byte, no separator
+bytes_from_hex(s)               strict decode: even length, [0-9a-fA-F] only
+```
+
+`needle`, `sep` and `prefix` may each be a `bytes`, a `buffer`, a **string**
+(taken as its own UTF-8) or a **single byte number 0-255** — so
+`bytes_split($b, 0)` splits on NUL, which no string separator could express.
+The **subject** (argument 1) is always strict bytes/buffer.
+
+`bytes_find` uses `index_of`'s convention, **not** `pos`'s: 0-based, `-1` when
+absent. ⚠ A bare `bytes_find(...)` in a condition is therefore backwards on both
+branches (`-1` is truthy, `0` is falsy) — `mix lint` flags it as **MIX-W2305**.
+Compare explicitly: `bytes_find($b, "\r\n\r\n") >= 0`. The optional `from` is
+what keeps a scanning parser linear; the index it returns is **absolute** into
+`$b`, never relative to `from`.
+
+`bytes_split` follows `split`'s piece rules exactly — an absent separator yields
+one whole piece, a leading or trailing separator yields an empty piece at that
+end, and an empty input yields one empty piece. The single divergence is that an
+**empty separator raises** rather than splitting between every byte.
+
+`bytes_to_hex` is deliberately option-free (no uppercase flag, no separator) so
+that `bytes_from_hex(bytes_to_hex($b))` is an exact round trip and a separated
+form — one `join` away — can never be fed back in by mistake. `bytes_from_hex`
+accepts either case but refuses whitespace, `:` and `-`: a lenient decoder would
+silently accept a truncated digest.
+
+```mix
+$b = string_to_bytes("hello, world")
+print(bytes_find($b, "world"))              -- 7
+print(bytes_find($b, "l", 4))               -- 10 (absolute, not 6)
+print(bytes_starts_with($b, "hell"))        -- true
+$parts = bytes_split($b, ", ")
+print(bytes_to_string($parts[1]))           -- world
+print(bytes_to_hex(bytes_from([222, 173, 190, 239])))   -- deadbeef
+```
+
+### Naming: `byte_*` vs `bytes_*`
+
+Two families, one letter apart, and they are **not duplicates**:
+
+| prefix | subject | argument handling | members |
+|---|---|---|---|
+| `byte_*` | a **string** | coerced via `to_mix_string`, like `pos`/`substr` | `byte_length` `byte_pos` `byte_lastpos` `byte_index_of` |
+| `bytes_*` | a **`bytes`/`buffer` value** | strict — a wrong type raises | `bytes_len` `bytes_to_string` `bytes_find` `bytes_starts_with` `bytes_split` `bytes_concat` `bytes_from` `bytes_to_hex` `bytes_from_hex` |
+
+`byte_*` answers *"where is this, measured in UTF-8 bytes rather than
+codepoints?"* about **text**. `bytes_*` operates on a **byte sequence**.
+
+The pair that looks most like a duplicate, `byte_length` and `bytes_len`, is the
+sharpest example of why the split matters:
+
+```mix
+$b = string_to_bytes("héllo")
+print(bytes_len($b))        -- 6   the bytes
+print(byte_length($b))      -- 9   the length of the string "<bytes:6>"
+print(byte_length("héllo")) -- 6   the same 6, but only because the subject is text
+```
+
+`byte_length` stringifies its argument first, so on a `bytes` value it measures
+the **`<bytes:N>` placeholder**. They agree on strings and disagree on
+everything else. Neither is going away — the fleet runs both — and neither
+should be "unified".
+
+**Going forward:**
+
+- A new operation on a `bytes`/`buffer` value is `bytes_<verb>` and must
+  **reject** a non-bytes subject rather than stringify it.
+- A new byte-offset operation on text is `byte_<verb>` and takes a string.
+- Conversions use the direction in the name: `bytes_to_<x>` out of bytes,
+  `bytes_from_<x>` into bytes. `string_to_bytes` predates that rule (it would be
+  `bytes_from_string` today) and stays as-is.
+- Never add a `byte_*` that takes bytes, or a `bytes_*` whose subject is text.
+
 ## SQLite — `sqlopen`, `sqlexec`, `sqlclose`
 
 The io category includes an embedded SQLite client (feature-gated `sqlite`; the

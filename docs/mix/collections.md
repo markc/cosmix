@@ -65,7 +65,10 @@ representation use [`data_encode`](data.md) / `json_encode`.
 ## Indexing
 
 Lists are **0-indexed**. A **negative** index counts from the end (`-1` is the
-last element). An **out-of-range** index returns `nil` (never an error):
+last element). An **out-of-range** index returns `nil` (never an error) — the
+same three rules hold for a string (yielding a one-character string) and, since
+**v0.64.0**, for `bytes`/`buffer` (yielding the byte as a **number** 0-255; see
+[io](io.md#bytes-as-a-sequence-v0640)):
 
 ```mix
 $l = [10, 20, 30]
@@ -164,6 +167,11 @@ port = 8080
 tls = true
 ```
 
+Over a **string** `for each` yields one-character strings, and since **v0.64.0**
+over a `bytes`/`buffer` it yields the bytes as **numbers** 0-255 (see
+[io](io.md#bytes-as-a-sequence-v0640)). Every source is materialised at loop
+entry, so mutating it in the body never extends the loop.
+
 For value-producing transforms prefer a [hof](hof.md) (`map`/`filter`/`reduce`/
 `sort_by`) over a hand-rolled `for each` + `push`.
 
@@ -171,7 +179,8 @@ For value-producing transforms prefer a [hof](hof.md) (`map`/`filter`/`reduce`/
 
 `length` (alias `len`) returns the **element count** for a list and the
 **key count** for a map (for a *string* it counts codepoints — see
-[strings](strings.md)). `is_empty` tests for zero length:
+[strings](strings.md); for a **`bytes`/`buffer`** it counts bytes, v0.64.0 —
+see [io](io.md#bytes-as-a-sequence-v0640)). `is_empty` tests for zero length:
 
 ```mix
 print("" .. length([10, 20, 30]))
@@ -444,7 +453,10 @@ print("" .. slice($l, -100, 100))
 ```
 
 `slice` also accepts a **string** (`slice("hello", 1, 3)` → `"el"`, counting
-codepoints — see [strings](strings.md)).
+codepoints — see [strings](strings.md)) and, since **v0.64.0**, a
+**`bytes`/`buffer`** value (counting bytes, returning a new value-semantic
+`bytes` — see [io](io.md#bytes-as-a-sequence-v0640)). A **reversed** range is
+empty in every case: `slice($l, 3, 1)` is `[]`, not a wrap-around.
 
 `take(list, n)` keeps the **first** `n` (negative `n` → **last** `|n|`);
 `drop(list, n)` skips the **first** `n` (negative `n` → drops the **last** `|n|`):
@@ -603,7 +615,8 @@ index_of($l, v)      0-based pos, or -1
 range(a, b[, step])  inclusive both ends
 flat($l)             recursively flatten nested lists
 concat($a, $b, …)    join 2+ lists into one new list (one level)
-slice($l, s[, e])    half-open [s, e); negatives + clamp
+slice($l, s[, e])    half-open [s, e); negatives + clamp; reversed range = empty
+                     (also string -> string, bytes/buffer -> bytes, v0.64.0)
 take($l, n) drop($l, n)   first/last n  (negative n flips the end)
 zip($a, $b)          element-wise [a, b] pairs, min length
 

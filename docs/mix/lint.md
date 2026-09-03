@@ -101,7 +101,8 @@ MIX-E1202  user-function arity mismatch     MIX-E1502  discarded pure transform
   hold that result. The hint names the closest documented key (for example,
   `exit_code` rather than `code`). Dynamic keys, generic maps and result
   shapes without declared fields are deliberately silent.
-- **MIX-W2305** flags `index_of()` / `byte_index_of()` used **bare as a truth
+- **MIX-W2305** flags `index_of()` / `byte_index_of()` / `bytes_find()` (added
+  v0.64.0) used **bare as a truth
   value**. They return `-1` for "not found" and `0` for "found at the first
   position", and Mix treats `0` as falsy and every non-zero number — `-1`
   included — as truthy. So a bare call in a condition is wrong on *both*

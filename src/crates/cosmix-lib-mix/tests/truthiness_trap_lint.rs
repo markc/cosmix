@@ -44,6 +44,20 @@ fn assert_clean(source: &str) {
     assert!(w.is_empty(), "expected no W2305 for:\n{source}\ngot: {w:?}");
 }
 
+/// The `hint` of the single W2305 diagnostic, for the cases where the
+/// advice itself is what is under test.
+fn hint_for(source: &str) -> Option<String> {
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize().expect("lex");
+    let mut parser = Parser::new(tokens, source);
+    let stmts = parser.parse_program().expect("parse");
+    analyze(&stmts, None, &AnalyzerConfig::default())
+        .diagnostics
+        .into_iter()
+        .find(|d| d.code == "MIX-W2305")
+        .and_then(|d| d.hint)
+}
+
 // --- must warn -------------------------------------------------------------
 
 #[test]
@@ -54,6 +68,36 @@ fn flags_if_condition() {
 #[test]
 fn flags_byte_index_of() {
     assert_flagged(r#"if byte_index_of("abc", "z") then print("x") end"#);
+}
+
+// `bytes_find` (v0.64.0) joined the family: same 0-based/-1 contract as
+// `index_of`, so it carries the same condition trap.
+#[test]
+fn flags_bytes_find() {
+    assert_flagged(r#"if bytes_find($b, "z") then print("x") end"#);
+}
+
+/// The hint must not send a `bytes_find` user to `contains()`: that builtin
+/// takes a string or list and REJECTS a bytes/buffer subject, so following
+/// the generic advice would trade a lint warning for a runtime error.
+#[test]
+fn bytes_find_hint_does_not_suggest_contains() {
+    let src = r#"if bytes_find($b, "z") then print("x") end"#;
+    let hint = hint_for(src).expect("W2305 must carry a hint");
+    assert!(
+        !hint.contains("contains("),
+        "bytes_find hint must not suggest contains(): {hint}"
+    );
+    assert!(hint.contains("bytes_find(..) >= 0"), "{hint}");
+    // The generic family keeps the fuller advice — this is a targeted
+    // exception, not a blanket removal.
+    let generic = hint_for(r#"if index_of("abc", "z") then print("x") end"#).unwrap();
+    assert!(generic.contains("contains("), "{generic}");
+}
+
+#[test]
+fn bytes_find_compared_is_clean() {
+    assert_clean(r#"if bytes_find($b, "z") >= 0 then print("x") end"#);
 }
 
 #[test]

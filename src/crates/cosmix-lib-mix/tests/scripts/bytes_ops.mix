@@ -1,0 +1,213 @@
+-- bytes as a first-class sequence (v0.64.0, T1)
+--
+-- Every assertion here prints a VALUE, not a "ran without error" marker:
+-- an index prints the byte it read, a slice prints its decoded content or
+-- hex, a raise prints the message text. A regression that made any of
+-- these a silent no-op would change a printed line, not merely survive.
+
+$b = string_to_bytes("hello, world")
+
+-- length / len on bytes = BYTE count (12), and it agrees with bytes_len.
+print(length($b) .. " " .. len($b) .. " " .. bytes_len($b))
+
+-- Multibyte proof that length($bytes) counts bytes while length($string)
+-- counts codepoints: "héllo" is 5 codepoints in 6 bytes.
+$m = string_to_bytes("héllo")
+print(length("héllo") .. " " .. length($m))
+
+-- $b[i] yields the byte as a NUMBER. 104='h', 100='d'.
+print($b[0] .. " " .. $b[6] .. " " .. $b[-1] .. " " .. $b[11])
+
+-- Out of range is nil, exactly as for a list and a string — not a raise.
+print(type($b[12]) .. " " .. type($b[-13]) .. " " .. type([1,2][9]))
+
+-- slice returns bytes and clamps; a reversed range is empty.
+print(bytes_to_string(slice($b, 7)))
+print(bytes_to_string(slice($b, 0, 5)))
+print(bytes_to_string(slice($b, -5, -1)))
+print(bytes_to_string(slice($b, -100, 100)))
+print(bytes_len(slice($b, 5, 2)) .. " " .. bytes_len(slice($b, 99, 200)))
+print(type(slice($b, 0, 4)))
+
+-- The framing case that motivated T1: drop a leading "text:\n" header
+-- from a raw body WITHOUT a lossy UTF-8 round trip. The body byte here
+-- (0xE9) is not valid UTF-8 on its own, so bytes_to_string({lossy}) would
+-- have replaced it with U+FFFD and changed the digest.
+$framed = bytes_concat("text:\n", bytes_from([0xE9, 0x21]))
+$body = slice($framed, 6)
+print(bytes_to_hex($framed) .. " -> " .. bytes_to_hex($body))
+
+-- for each over bytes yields numbers; sum of "hello, world" = 1160.
+$sum = 0
+$count = 0
+for each $x in $b
+  $sum = $sum + $x
+  $count = $count + 1
+end
+print($sum .. " " .. $count .. " " .. type($b[0]))
+
+-- Two-var form gives (index, value) as it does for a list.
+$trace = ""
+for each $i, $x in string_to_bytes("AB")
+  $trace = $trace .. $i .. "=" .. $x .. " "
+end
+print(trim($trace))
+
+-- bytes_find: 0-based, -1 absent, accepts string / bytes / byte number,
+-- and the optional `from` returns an ABSOLUTE index.
+print(bytes_find($b, "world") .. " " .. bytes_find($b, "zz"))
+print(bytes_find($b, 108) .. " " .. bytes_find($b, 108, 4) .. " " .. bytes_find($b, string_to_bytes("o, ")))
+print(bytes_find($b, "l", -3) .. " " .. bytes_find($b, "h", 99))
+
+-- bytes_starts_with; an empty prefix is true, as for the string twin.
+print(bytes_starts_with($b, "hell") .. " " .. bytes_starts_with($b, "world") .. " " .. bytes_starts_with($b, 104) .. " " .. bytes_starts_with($b, string_to_bytes("")))
+
+-- bytes_split piece rules match split(): 4 / 3 / 1 for the same inputs.
+$p = bytes_split(string_to_bytes("a,b,,c"), ",")
+print(length($p) .. " [" .. bytes_to_string($p[0]) .. "][" .. bytes_to_string($p[1]) .. "][" .. bytes_to_string($p[2]) .. "][" .. bytes_to_string($p[3]) .. "] " .. type($p[0]))
+print(length(bytes_split(string_to_bytes(",a,"), ",")) .. " " .. length(bytes_split(bytes_from([]), ",")) .. " " .. length(bytes_split($b, "@@")))
+-- A binary separator no string could carry: split on the NUL byte.
+$nulsep = bytes_split(bytes_from([1, 0, 2, 3]), 0)
+print(length($nulsep) .. " " .. bytes_to_hex($nulsep[0]) .. " " .. bytes_to_hex($nulsep[1]))
+
+-- bytes_concat is variadic over bytes/buffer/string, 1+ args.
+print(bytes_to_string(bytes_concat("a", string_to_bytes("b"), 99)))
+print(bytes_to_string(bytes_concat(string_to_bytes("solo"))) .. " " .. bytes_len(bytes_concat(bytes_from([]))))
+
+-- bytes_from flat-splices ints / strings / bytes / buffers.
+print(bytes_to_hex(bytes_from([222, 173, 190, 239])))
+print(bytes_to_string(bytes_from(["ab", 99, string_to_bytes("d"), buffer("e")])))
+print(bytes_len(bytes_from([])) .. " " .. type(bytes_from([])))
+
+-- hex round trip is exact and case-insensitive on input, lowercase out.
+print(bytes_to_hex(bytes_from_hex("DEADbeef")))
+print(bytes_to_string(bytes_from_hex(bytes_to_hex(string_to_bytes("round trip")))))
+print(bytes_to_hex(bytes_from([])) .. "|" .. bytes_len(bytes_from_hex("")))
+
+-- Buffers answer the same generic ops (index/len/slice/iterate) and slice
+-- hands back an INDEPENDENT bytes, never an alias into the buffer.
+$buf = buffer("xyz")
+$snap = slice($buf, 0, 2)
+buffer_push($buf, "!")
+print(length($buf) .. " " .. $buf[1] .. " " .. bytes_to_string($snap) .. " " .. bytes_to_string(freeze($buf)))
+
+-- Iteration is pinned at entry: growing the buffer inside the loop does
+-- not extend the iteration (3 items, not 6).
+$buf2 = buffer("abc")
+$seen = 0
+for each $x in $buf2
+  $seen = $seen + 1
+  buffer_push($buf2, 122)
+end
+print($seen .. " " .. length($buf2))
+
+-- `$buf[i]` is NOT a synonym for buffer_get: they agree on an in-range
+-- non-negative integer and on nil-past-the-end, but indexing resolves a
+-- negative index and truncates a fractional one where buffer_get raises.
+-- Pinned so the two contracts cannot silently converge or diverge further.
+$bg = buffer("ab")
+print($bg[1] .. " " .. buffer_get($bg, 1) .. " " .. type($bg[9]) .. " " .. type(buffer_get($bg, 9)))
+print($bg[-1] .. " " .. $bg[1.7])
+try
+  buffer_get($bg, -1)
+catch $msg, $err
+  print($msg)
+end
+
+-- Extreme and non-finite index forms, pinned against the LIST arm so the
+-- two can never drift. A saturating huge index is out of range (nil); a NaN
+-- casts to 0 and therefore reads element 0 — inherited from Mix's existing
+-- read convention, not introduced here, and pinned so a later change to
+-- either arm has to change both.
+$nan = sqrt(-1)
+print(type($b[1e30]) .. " " .. type([1,2,3][1e30]) .. " " .. type($b[-1e30]) .. " " .. type([1,2,3][-1e30]))
+print($b[$nan] .. " " .. [65,66][$nan] .. " " .. bytes_len(slice($b, $nan)) .. " " .. bytes_find($b, "h", $nan))
+
+-- Strictness: the subject of a bytes_* builtin is never stringified.
+-- Without this, bytes_find("a string", "s") would answer about the text.
+try
+  bytes_find("a string", "s")
+catch $msg, $err
+  print($err.code .. " " .. $msg)
+end
+try
+  bytes_split($b, "")
+catch $msg, $err
+  print($msg)
+end
+try
+  bytes_find($b, "")
+catch $msg, $err
+  print($msg)
+end
+try
+  bytes_from_hex("abc")
+catch $msg, $err
+  print($msg)
+end
+try
+  bytes_from_hex("ab:cd0")
+catch $msg, $err
+  print($msg)
+end
+try
+  bytes_concat([1, 2])
+catch $msg, $err
+  print($msg)
+end
+try
+  bytes_from(string_to_bytes("x"))
+catch $msg, $err
+  print($msg)
+end
+
+-- byte_length is NOT the bytes twin of length: on a bytes value it
+-- measures the "<bytes:6>" PLACEHOLDER (9 chars), which is precisely why
+-- the bytes_* family refuses to coerce. Pinned so a future "tidy-up" that
+-- merges the two families has to change this line deliberately.
+print(byte_length($m) .. " " .. bytes_len($m) .. " " .. byte_length("héllo"))
+
+-- Expected output:
+-- 12 12 12
+-- 5 6
+-- 104 32 100 100
+-- nil nil nil
+-- world
+-- hello
+-- worl
+-- hello, world
+-- 0 0
+-- bytes
+-- 746578743a0ae921 -> e921
+-- 1160 12 number
+-- 0=65 1=66
+-- 7 -1
+-- 2 10 4
+-- 10 -1
+-- true false true true
+-- 4 [a][b][][c] bytes
+-- 3 1 1
+-- 2 01 0203
+-- abc
+-- solo 0
+-- deadbeef
+-- abcde
+-- 0 bytes
+-- deadbeef
+-- round trip
+-- |0
+-- 4 121 xy xyz!
+-- 3 6
+-- 98 98 nil nil
+-- 98 98
+-- buffer_get: index must be a non-negative integer, got -1
+-- nil nil nil nil
+-- 104 65 12 0
+-- RUNTIME_ERROR bytes_find(): expected bytes or buffer, got string
+-- bytes_split(): separator must not be empty
+-- bytes_find(): needle must not be empty
+-- bytes_from_hex(): hex string must have an even length, got 3
+-- bytes_from_hex(): ':' is not a hex digit
+-- bytes_concat(): argument 1 is a list — use bytes_from(list) to build bytes from a list
+-- bytes_from(): expected a list, got bytes — for a single value use string_to_bytes()/freeze()
+-- 9 6 6

@@ -1074,7 +1074,9 @@ print(hash_file("./image.raw", "blake3"))
 ```
 
 `base64_encode` accepts a string **or** a `Value::Bytes` buffer (it encodes the
-raw bytes, not a placeholder). `base64_decode` returns **raw bytes** — wrap in
+raw bytes, not a placeholder). `base64_decode` returns **raw bytes** — since
+v0.64.0 those can be indexed, sliced, iterated and searched directly (see
+[io](io.md#bytes-as-a-sequence-v0640)), or wrap in
 `bytes_to_string` (strict UTF-8; pass `{lossy:true}` to tolerate non-UTF-8) to
 read it back as text. The pair round-trips:
 

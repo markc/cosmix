@@ -127,6 +127,15 @@ async fn test_string_helpers() {
     run_test_script("string_helpers.mix").await;
 }
 
+// bytes as a first-class sequence (v0.64.0): $b[i], length/len, slice,
+// `for each`, and the bytes_* family. NOTE: a script under tests/scripts/
+// only runs if it is registered HERE — an unregistered one is silently
+// never executed.
+#[tokio::test]
+async fn test_bytes_ops() {
+    run_test_script("bytes_ops.mix").await;
+}
+
 #[tokio::test]
 async fn test_re_family() {
     run_test_script("re_family.mix").await;
