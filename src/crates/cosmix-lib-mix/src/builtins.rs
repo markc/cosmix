@@ -270,7 +270,8 @@ builtin_table! {
     ("path_parts", CapabilityClass::Pure,      "io",      "Decompose a path into {dir, base, stem, ext} (v0.2.1)", contract!((path: string) -> map("path_parts", {dir: string, base: string, stem: string, ext: string}))),
     ("walk", CapabilityClass::FsRead,            "io",      "Recursive directory walk: walk(dir, {max_depth, follow_symlinks, include_dirs}); invalid max_depth raises instead of becoming unlimited (strict since v0.55.0)", contract!((dir: string, opts?: map) -> list(string); failure[raises])),
     ("readline", CapabilityClass::Env,        "io",      "Read a line from stdin (optional prompt argument)", contract!((prompt?: string) -> string; effects[blocking])),
-    ("read_stdin", CapabilityClass::Env,      "io",      "Read all of stdin to EOF as a string (for pipe/hook input)", contract!(() -> string; effects[blocking])),
+    ("read_stdin", CapabilityClass::Env,      "io",      "Read all of stdin to EOF as a string (for pipe/hook input). STRICT UTF-8 — binary stdin raises; use read_stdin_bytes for that", contract!(() -> string; effects[blocking])),
+    ("read_stdin_bytes", CapabilityClass::Env, "io",     "Read all of stdin to EOF as raw bytes — the binary twin of read_stdin, which refuses invalid UTF-8. Optional arg caps the read: read_stdin_bytes(8192) reads at most 8192 bytes, the same cap contract as read_file_bytes (v0.65.0)", contract!((max?: number) -> bytes; effects[blocking]; failure[raises])),
     ("sqlopen", CapabilityClass::FsWrite,         "io",      "Open a SQLite database and return a handle", contract!((path: string, mode?: string) -> number; failure[raises])),
     ("sqlexec", CapabilityClass::FsWrite,         "io",      "Execute SQL on a SQLite handle, return result rows", contract!((handle: number, sql: string, params?: any) -> any_of(list, map); failure[raises])),
     ("sqlclose", CapabilityClass::FsWrite,        "io",      "Close a SQLite database handle", contract!((handle: number) -> nil; failure[raises])),
@@ -359,6 +360,10 @@ builtin_table! {
     ("fmt", CapabilityClass::Pure,             "format",  "printf-style format string → string. Specs: %s %d %f %.Nf %Nd %-Ns %0Nd %% (v0.2.0; %0Nd zero-pad v0.54.0 — numeric only, use lpad(s,n,\"0\") for strings). Dynamic width `*` takes the width from the next argument: %*s %-*s %*d %0*d %*f (v0.63.0; the width argument must be a non-negative integer)", contract!((tmpl: string, args: ...any) -> string)),
     ("printf", CapabilityClass::Pure,          "format",  "Formatted write to stdout (no trailing newline — include \\n explicitly) (v0.2.0)", contract!((tmpl: string, args: ...any) -> nil)),
     ("eprintf", CapabilityClass::Pure,         "format",  "Formatted write to stderr (v0.2.0)", contract!((tmpl: string, args: ...any) -> nil)),
+    ("write_stdout", CapabilityClass::Pure,    "io",      "Write values to fd 1 AS THEY ARE — no trailing newline, no separator, flushed. bytes/buffer go out verbatim; every other value renders exactly as print() renders it. Never re-opens a path, so it works when fd 1 belongs to another user (the sieve-filter case). A failed write RAISES (catchable): IO_BROKEN_PIPE when the consumer went away, else IO_WRITE_FAILED — unlike print, which swallows it (v0.65.0)", contract!((v: any, rest: ...any) -> nil; failure[raises])),
+    ("write_stderr", CapabilityClass::Pure,    "io",      "Write values to fd 2 as they are — the stderr twin of write_stdout, same contract (v0.65.0)", contract!((v: any, rest: ...any) -> nil; failure[raises])),
+    ("print_raw", CapabilityClass::Pure,       "io",      "ALIAS of write_stdout — identical contract, the spelling for `print` without the trailing newline (v0.65.0)", contract!((v: any, rest: ...any) -> nil; failure[raises])),
+    ("eprint_raw", CapabilityClass::Pure,      "io",      "ALIAS of write_stderr — identical contract, the spelling for `eprint` without the trailing newline (v0.65.0)", contract!((v: any, rest: ...any) -> nil; failure[raises])),
     ("format_bytes", CapabilityClass::Pure,    "format",  "Format byte count as human-readable size (e.g. \"1.5 MB\"); a non-numeric argument raises (strict since v0.55.0)", contract!((n: number) -> string; failure[raises])),
     ("format_number", CapabilityClass::Pure,   "format",  "Format number with thousands separators; non-numeric value/decimals arguments raise (strict since v0.55.0)", contract!((n: number, decimals?: number) -> string; failure[raises])),
 
@@ -751,7 +756,17 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
 /// They are deliberately NOT in the `is_builtin` gate: the gate answers
 /// "will `call_builtin` handle this name", and for these it will not.
 /// Keep in sync with the stdio special-form arms in `evaluator.rs`.
-pub const EVAL_SPECIAL_BUILTINS: &[&str] = &["printf", "eprintf", "readline", "read_stdin"];
+pub const EVAL_SPECIAL_BUILTINS: &[&str] = &[
+    "printf",
+    "eprintf",
+    "readline",
+    "read_stdin",
+    "read_stdin_bytes",
+    "write_stdout",
+    "write_stderr",
+    "print_raw",
+    "eprint_raw",
+];
 
 /// Membership gate the evaluator consults before dispatching to
 /// `call_builtin`. Since 0.29.0 this is GENERATED from `BUILTIN_NAMES`
@@ -9531,6 +9546,75 @@ fn builtin_read_file_bytes(args: Vec<Value>) -> MixResult<Option<Value>> {
     Ok(Some(Value::bytes(bytes)))
 }
 
+/// `read_stdin_bytes([max])` — the binary twin of `read_stdin` (v0.65.0).
+///
+/// `read_stdin` decodes to a `String` and **refuses** invalid UTF-8, which
+/// makes binary stdin unreadable: a mail body in an 8-bit transfer encoding,
+/// an image, a protocol frame. This reads fd 0 to EOF as raw `bytes`, with
+/// the same optional cap `read_file_bytes` takes.
+///
+/// Lives here, next to `read_file_bytes`, so the two share one cap contract;
+/// the evaluator calls it from an inline special form because it also has to
+/// run the capability (Knob A) and collection-size (Knob D) checks that
+/// `read_stdin` runs.
+pub(crate) fn read_stdin_bytes_impl(name: &str, args: &[Value]) -> MixResult<Value> {
+    use std::io::Read as _;
+    if args.len() > 1 {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("{name}() expects 0 or 1 args, got {}", args.len()),
+        });
+    }
+    let mut bytes = Vec::new();
+    let stdin = std::io::stdin();
+    let read = match args.first() {
+        None | Some(Value::Nil) => stdin.lock().read_to_end(&mut bytes),
+        Some(max_val) => {
+            // Same strictness as `read_file_bytes`: a real Number, not
+            // `to_number()`, which would coerce a bool or a numeric string
+            // into a read cap without saying so.
+            let n = match extract_number(max_val, InputPolicy::NumberOnly) {
+                Some(n) => n,
+                None => {
+                    return Err(MixError::RuntimeError {
+                        span: None,
+                        msg: format!(
+                            "{name}(): max must be a number, got {}",
+                            max_val.type_name()
+                        ),
+                    });
+                }
+            };
+            let cap = as_exact_integer(&format!("{name}(): argument 1"), n, 0, i64::MAX)? as u64;
+            stdin.lock().take(cap).read_to_end(&mut bytes)
+        }
+    };
+    // Not `.ok()`: `read_stdin`'s own comment records why swallowing this is
+    // a bug — git feeds pre-push its ref list on stdin, and an error turned
+    // into an empty result reads as "nothing to do". A truncated binary read
+    // is the same class of silence.
+    read.map_err(|e| MixError::RuntimeError {
+        span: None,
+        msg: format!("{name}: {e}"),
+    })?;
+    Ok(Value::bytes(bytes))
+}
+
+/// Append one `write_stdout`/`write_stderr` argument to the output buffer.
+///
+/// `bytes`/`buffer` go out **verbatim** — that is the whole point of the
+/// family, and it is also the one place `to_mix_string` would be actively
+/// wrong (it renders the `<bytes:N>` placeholder). Everything else gets the
+/// exact rendering `print` gives it, so `write_stdout($x)` is `print($x)`
+/// without the newline for every value where `print` is meaningful.
+pub(crate) fn append_output_bytes(v: &Value, out: &mut Vec<u8>) {
+    match v {
+        Value::Bytes(b) => out.extend_from_slice(b),
+        Value::Buffer(b) => out.extend_from_slice(&b.borrow()),
+        other => out.extend_from_slice(other.to_mix_string().as_bytes()),
+    }
+}
+
 /// `load_data($path)` — read a strict-data `.mix` file and parse it
 /// into a Value.
 ///
@@ -14644,6 +14728,9 @@ fn builtin_help(_args: Vec<Value>) -> MixResult<Option<Value>> {
     println!("List:      push pop shift sort index_of unique range flat concat");
     println!("Map:       keys values has_key merge delete");
     println!("I/O:       print eprintf read_file read_file_bytes write_file append_file");
+    println!("           read_stdin read_stdin_bytes");
+    println!("           write_stdout write_stderr (aliases print_raw eprint_raw) — v0.65.0:");
+    println!("           fd 1/2 as they are, no newline, no separator, bytes verbatim");
     println!("           exists is_dir is_file glob ls mkdir chmod chown stat");
     println!("System:    env time pid args exit sleep run run_rc hostname");
     println!("           cwd chdir platform which");
@@ -19932,6 +20019,30 @@ mod char_aware_tests {
         }
     }
 
+    /// The third leg of the inline-special-form invariant, and the one that
+    /// used to fail SILENTLY.
+    ///
+    /// Registering a name in `EVAL_SPECIAL_BUILTINS` but not in
+    /// `INLINE_SPECIAL_FORMS` leaves the bareword call working while the UFCS
+    /// spelling breaks: `parser.rs`'s `method_desugars_to_ufcs` consults only
+    /// `INLINE_SPECIAL_FORMS`, so `$x.write_stdout()` becomes a `MethodCall`,
+    /// and the MethodCall arm dispatches extensions → user functions → address
+    /// blocks → map members and never reaches a builtin. Best case that is
+    /// `FUNCTION_UNDEFINED`; worst case, with a user function of the same name
+    /// in scope, one name quietly means two different things depending on how
+    /// it is spelled. Nothing else in the tree ties the two lists together.
+    #[test]
+    fn eval_special_names_are_all_inline_special_forms() {
+        for &name in super::EVAL_SPECIAL_BUILTINS {
+            assert!(
+                crate::evaluator::INLINE_SPECIAL_FORMS.contains(&name),
+                "'{name}' is EVAL_SPECIAL but missing from INLINE_SPECIAL_FORMS \
+                 — the bareword call would work while `$x.{name}()` silently \
+                 resolved somewhere else"
+            );
+        }
+    }
+
     /// Table-wide invariants of the structured contracts (0.29.0): required
     /// args precede optional args, at most one variadic arg and it is last,
     /// `terminates` effect implies `Terminates` failure mode, and every
@@ -20152,6 +20263,12 @@ mod char_aware_tests {
             "path_parts",
             "pop",
             "pos",
+            // The byte-exact stdio family (v0.65.0) is Pure for the same
+            // reason `printf` is: writing to the fds the process was HANDED
+            // grants no authority it did not already have. Reading stdin is
+            // different — `read_stdin_bytes` is Env, like `read_stdin`.
+            "eprint_raw",
+            "print_raw",
             "printf",
             "push",
             "raise",
@@ -20206,6 +20323,8 @@ mod char_aware_tests {
             "words",
             "word_wrap",
             "word_wrap_w",
+            "write_stderr",
+            "write_stdout",
             "xml_parse",
             "zip",
             // Math (v0.19.0) — pure f64 numerics, no host authority.

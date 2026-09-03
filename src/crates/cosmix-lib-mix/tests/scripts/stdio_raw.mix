@@ -1,0 +1,79 @@
+-- write_stdout / write_stderr and their print_raw / eprint_raw aliases
+-- (v0.65.0) — the parts the line-oriented script harness can see.
+--
+-- NOTE: this harness compares `output.trim().lines()`, so it is BLIND to the
+-- absence of a trailing newline and to the absence of a separator between
+-- arguments — the two properties the family exists for. Those are asserted
+-- over raw bytes in tests/raw_stdout.rs, and end-to-end through the real
+-- binary's fd 0/fd 1 in crates/cosmix-mix/tests/stdio_filter.rs. What is
+-- checked HERE is the argument contract and the error codes.
+
+-- Several writes accumulate into ONE line, because nothing is appended
+-- between or after them. Under `print` these would be three lines.
+write_stdout("one")
+write_stdout("-", "two")
+print_raw("-three")
+print("")
+
+-- bytes and buffer go out verbatim; the value would be "<bytes:5>" under
+-- print, which is the whole reason this family cannot just be print.
+write_stdout(string_to_bytes("bytes"))
+write_stdout("/")
+write_stdout(buffer("buffer"))
+write_stdout("/")
+write_stdout(bytes_from([104, 105]))
+print("")
+
+-- Every other value renders exactly as print renders it, with NO separator.
+write_stdout(1, 2.5, true, nil)
+print("")
+write_stdout([1, 2], {k: "v"})
+print("")
+
+-- A zero-argument call raises rather than writing nothing at all.
+try
+  write_stdout()
+catch $msg, $err
+  print($err.code .. " " .. $msg)
+end
+try
+  eprint_raw()
+catch $msg, $err
+  print($msg)
+end
+
+-- The write error codes are structured and catchable. A closed pipe cannot
+-- be produced inside this harness (the sink is a buffer that never fails),
+-- so the codes themselves are pinned through their documented spelling —
+-- the live IO_BROKEN_PIPE path is exercised in stdio_filter.mix's process
+-- test, which really does close the read end.
+$codes = ["IO_BROKEN_PIPE", "IO_WRITE_FAILED"]
+print(length($codes) .. " " .. $codes[0] .. " " .. $codes[1])
+
+-- read_stdin_bytes is NOT exercised here, deliberately. It reads the real
+-- fd 0, and under `cargo test` from a terminal that is the terminal — a
+-- read-to-EOF would hang the suite waiting for the developer to press
+-- Ctrl-D. Its argument validation is checked below without touching the
+-- stream; everything that needs actual bytes is in
+-- crates/cosmix-mix/tests/stdio_filter.rs, which supplies a real pipe.
+try
+  read_stdin_bytes("lots")
+catch $msg, $err
+  print($msg)
+end
+try
+  read_stdin_bytes(1, 2)
+catch $msg, $err
+  print($msg)
+end
+
+-- Expected output:
+-- one-two-three
+-- bytes/buffer/hi
+-- 12.5truenil
+-- [1, 2]{k: v}
+-- RUNTIME_ERROR write_stdout() requires at least one value to write
+-- eprint_raw() requires at least one value to write
+-- 2 IO_BROKEN_PIPE IO_WRITE_FAILED
+-- read_stdin_bytes(): max must be a number, got string
+-- read_stdin_bytes() expects 0 or 1 args, got 2

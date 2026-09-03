@@ -838,18 +838,45 @@ dir=/srv/mail/inbox base=msg.2.eml stem=msg.2 ext=eml
 > `basename` of a trailing-slash path returns the last real component
 > (`basename("/srv/mail/")` → `"mail"`).
 
-## Standard input — `readline`, `read_stdin`
+## Standard input — `readline`, `read_stdin`, `read_stdin_bytes`
 
 ```
-readline([prompt])   read one line from stdin (trailing \n stripped); optional prompt
-read_stdin()         read ALL of stdin to EOF as one string
+readline([prompt])      read one line from stdin (trailing \n stripped); optional prompt
+read_stdin()            read ALL of stdin to EOF as one string (strict UTF-8)
+read_stdin_bytes([max]) read ALL of stdin to EOF as raw bytes (v0.65.0)
+read_stdin_bytes(8192)  read at most 8192 bytes — same cap as read_file_bytes
 ```
 
 `read_stdin` is the call for a pipe or a hook payload — it slurps the whole stream
 to EOF. `readline` reads a single line and, if given a prompt argument, writes it
 to stdout (flushed) first — the interactive-input path. Both read UTF-8 *text*
-and both **raise** on a stream that will not decode, matching `read_file`;
-binary payloads belong in a file read via `read_file_bytes`.
+and both **raise** on a stream that will not decode, matching `read_file`.
+
+`read_stdin_bytes` is the binary twin, and it is the only way to read a stream
+that is not valid UTF-8:
+
+```
+$ printf '\x00\x01\xff\xfe binary' | mix -c 'print(read_stdin())'
+Runtime error at line 1: read_stdin: stream did not contain valid UTF-8
+$ printf '\x00\x01\xff\xfe binary' | mix -c 'print(bytes_len(read_stdin_bytes()))'
+11
+```
+
+That is not an edge case for mail: 8-bit transfer encodings and legacy charsets
+routinely produce bodies that never decode, which is why `read_stdin` alone left
+Mix unable to be a mail filter. The cap is `read_file_bytes`'s — a non-negative
+whole number, applied with `Read::take`, strictly a Number (a numeric string or
+a bool is refused, not coerced) — so `read_stdin_bytes(8192)` sniffs a header
+without slurping a stream of unknown size, and `read_stdin_bytes(0)` reads
+nothing. **One deliberate difference:** an explicit `nil` means *no cap* here
+(`read_stdin_bytes(nil)` reads everything, so `read_stdin_bytes($limit)` works
+when `$limit` may be unset), whereas `read_file_bytes(path, nil)` raises. Nil-as-
+absent is the convention `slice` and `bytes_to_string` already use for a trailing
+optional argument.
+
+It reads fd 0 with no decode step at all, so nothing can be substituted or lost;
+pair it with [`write_stdout`](#byte-exact-output--write_stdout-write_stderr) for
+a filter that is byte-exact end to end.
 
 Until 0.33.0 an undecodable stream returned an **empty string** instead. That is
 indistinguishable from EOF, and it is silent: a `pre-push` hook reading git's ref
@@ -873,6 +900,108 @@ first line: piped input line 1
 
 For richer stdin handling see [strings](strings.md) (`split`, `trim`) — a common
 pattern is `for each $line in split(read_stdin(), "\n")`.
+
+## Byte-exact output — `write_stdout`, `write_stderr`
+
+```
+write_stdout(v, ...)   write to fd 1 as it is: no newline, no separator, flushed
+write_stderr(v, ...)   the same, to fd 2
+print_raw(v, ...)      ALIAS of write_stdout
+eprint_raw(v, ...)     ALIAS of write_stderr
+```
+
+`print` always appends a newline and joins its arguments with a space, so before
+0.65.0 there was no way to write **exactly these bytes and stop**. That is
+disqualifying for any program whose stdout *is* the interface — dovecot's sieve
+`execute :pipe :output "VAR"` captures stdout verbatim into a sieve variable, and
+one trailing newline corrupts the variable parsing.
+
+`printf` is not this. It also omits the trailing newline, but it takes a *format
+template* (so `%` is significant and a literal one has to be escaped) and it
+formats through a string, so it cannot carry a byte that is not valid UTF-8.
+Reach for `printf` to lay out text and `write_stdout` to emit exact bytes.
+
+**One family, one contract, four names.** `print_raw`/`eprint_raw` are aliases of
+`write_stdout`/`write_stderr`, not variants: the same builtin under the spelling
+that matches whichever family you are thinking in. If they ever behave
+differently that is a bug, and a test pins the equality.
+
+The contract is `print`'s, minus the newline and the separator:
+
+- **`bytes` and `buffer` go out verbatim.** This is the one place `print` is
+  actively wrong — it renders a bytes value as the `<bytes:N>` placeholder.
+- **Every other value renders exactly as `print` renders it**, including a
+  list as `[1, 2]` and a map as `{k: v}`. There is no stricter type rule to
+  learn. (If you meant those numbers as bytes, that is
+  [`bytes_from([...])`](#bytes-as-a-sequence-v0640).)
+- **fd 1 and fd 2 as they are** — never a re-opened path. `write_file("/dev/stdout", $s)`
+  issues an `openat("/dev/stdout", O_WRONLY|O_CREAT|O_TRUNC)` and therefore dies
+  with `Permission denied` whenever fd 1 belongs to another user (a `runuser -u vmail`
+  dry run, and every message under sieve). `write_stdout` opens nothing.
+- **Flushed on every call.** The default stdout is line-buffered and this family
+  exists to emit output with no newline in it, so an unflushed write would sit in
+  the buffer past the moment the consumer reads. In a hot loop, build a
+  [`buffer`](buffer.md) and write it once rather than writing per iteration.
+- **It writes to the same sink `print` writes to.** For the `mix` binary that
+  sink *is* the process's fd 1/2, which is the whole point. Inside an **embedder**
+  that redirects output — webd rendering a response, a test harness capturing it
+  — `write_stdout` goes to that redirected sink like `print` does, not around it
+  to the real descriptor. There is deliberately no way to bypass the host's
+  output policy; a program that must reach the process descriptor regardless is
+  not a Mix script.
+
+### A failed write RAISES — the one difference from `print`
+
+`print` and `printf` discard write errors. This family must not: its whole
+contract is that the named bytes reached the consumer, so a dropped write
+reported as success is the single failure mode it cannot have. The error is
+catchable and code-distinguished:
+
+| code | meaning |
+|---|---|
+| `IO_BROKEN_PIPE` | the consumer closed the pipe (`\| head -1`, a reader that exited) |
+| `IO_WRITE_FAILED` | anything else — a full disk, a closed descriptor |
+
+The `mix` binary does not change the process SIGPIPE disposition — Rust ignores
+SIGPIPE at startup — so a closed pipe arrives as this error rather than as a
+signal. That is a property of the *process*, not of the library: an **embedder**
+whose host has restored the default SIGPIPE disposition would get signal 13
+instead of a catchable error, because nothing in Mix asserts the disposition.
+
+The quiet-exit idiom, when a filter should behave like `head` and stop:
+
+```mix
+try
+  write_stdout($body)
+catch $msg, $err
+  if $err.code == "IO_BROKEN_PIPE" then
+    exit(0)
+  end
+  raise($err.code, $msg)
+end
+```
+
+### The filter, end to end
+
+```mix
+-- byte-for-byte: whatever arrives on fd 0 leaves on fd 1 unchanged
+write_stdout(read_stdin_bytes())
+```
+
+```
+$ printf '\x00\x01\xff\xfe mix \xc3\x28' > in.bin
+$ mix -c 'write_stdout(read_stdin_bytes())' < in.bin > out.bin
+$ cmp in.bin out.bin && echo identical
+identical
+```
+
+`cmp`, not eyes: a lossy decode substitutes U+FFFD for each undecodable byte and
+so *grows* the output — **11 bytes in, 17 out** for the input above, where
+`write_stdout(read_stdin_bytes())` gives 11. A visual check will not catch that;
+a byte comparison always will, and a digest taken over the 17 bytes is a digest
+of a message that never arrived. Dropping a header line
+before hashing a body is
+[`slice`](#bytes-as-a-sequence-v0640) on the bytes, never a string round trip.
 
 ## Bytes helpers
 

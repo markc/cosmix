@@ -1,6 +1,6 @@
 # Builtin index
 
-Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.64.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
+Every Mix builtin grouped by category, generated from `mix builtins` (mix 0.65.0). See the linked topical page for prose and examples; `mix what NAME` prints a one-line description of any single builtin (or keyword), and `mix help` prints the compact names-only summary of the same ten categories.
 
 Some builtins are feature-gated on the `cosmix-lib-mix` crate (`json`, `regex`, `toml`, `datetime`, `url`, `crypto`, `http`, `sqlite`, `dkim`, `markdown`, `datastar`) so embedders can pull only what they need — the `mix` binary turns them all on.
 
@@ -218,10 +218,15 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   path_parts      Decompose a path into {dir, base, stem, ext} (v0.2.1)
   walk            Recursive directory walk: walk(dir, {max_depth, follow_symlinks, include_dirs}); invalid max_depth raises instead of becoming unlimited (strict since v0.55.0)
   readline        Read a line from stdin (optional prompt argument)
-  read_stdin      Read all of stdin to EOF as a string (for pipe/hook input)
+  read_stdin      Read all of stdin to EOF as a string (for pipe/hook input). STRICT UTF-8 — binary stdin raises; use read_stdin_bytes for that
+  read_stdin_bytes Read all of stdin to EOF as raw bytes — the binary twin of read_stdin, which refuses invalid UTF-8. Optional arg caps the read: read_stdin_bytes(8192) reads at most 8192 bytes, the same cap contract as read_file_bytes (v0.65.0)
   sqlopen         Open a SQLite database and return a handle
   sqlexec         Execute SQL on a SQLite handle, return result rows
   sqlclose        Close a SQLite database handle
+  write_stdout    Write values to fd 1 AS THEY ARE — no trailing newline, no separator, flushed. bytes/buffer go out verbatim; every other value renders exactly as print() renders it. Never re-opens a path, so it works when fd 1 belongs to another user (the sieve-filter case). A failed write RAISES (catchable): IO_BROKEN_PIPE when the consumer went away, else IO_WRITE_FAILED — unlike print, which swallows it (v0.65.0)
+  write_stderr    Write values to fd 2 as they are — the stderr twin of write_stdout, same contract (v0.65.0)
+  print_raw       ALIAS of write_stdout — identical contract, the spelling for `print` without the trailing newline (v0.65.0)
+  eprint_raw      ALIAS of write_stderr — identical contract, the spelling for `eprint` without the trailing newline (v0.65.0)
   print           Print values to stdout with newline (statement, not a builtin call); bare `print` emits a blank line
   eprint          Print values to stderr with newline (statement, not a builtin call); bare `eprint` emits a blank line
 

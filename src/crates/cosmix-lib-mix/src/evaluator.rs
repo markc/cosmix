@@ -2730,8 +2730,13 @@ pub(crate) const INLINE_SPECIAL_FORMS: &[&str] = &[
     "sleep",
     "readline",
     "read_stdin",
+    "read_stdin_bytes",
     "printf",
     "eprintf",
+    "write_stdout",
+    "write_stderr",
+    "print_raw",
+    "eprint_raw",
     "db_query",
     "db_exec",
     "jmap",
@@ -10336,6 +10341,15 @@ impl Evaluator {
                         self.check_collection_size(&v)?; // Knob D (read_stdin can be huge)
                         return Ok(v);
                     }
+                    // read_stdin_bytes — the binary twin (v0.65.0). Inline for
+                    // the same two reasons read_stdin is: Knob A capability and
+                    // the Knob D size check on an unbounded read.
+                    if name == "read_stdin_bytes" {
+                        self.check_capability(name)?; // Knob A
+                        let v = builtins::read_stdin_bytes_impl(name, &eval_args)?;
+                        self.check_collection_size(&v)?; // Knob D
+                        return Ok(v);
+                    }
 
                     // printf / eprintf — inline because they must write
                     // through self.globals.stdout / self.globals.stderr (which the test
@@ -10357,6 +10371,77 @@ impl Evaluator {
                             write!(g.stderr, "{}", formatted).ok();
                         } else {
                             write!(g.stdout, "{}", formatted).ok();
+                        }
+                        return Ok(Value::Nil);
+                    }
+
+                    // write_stdout / write_stderr and their print_raw /
+                    // eprint_raw spellings (v0.65.0) — ONE family, ONE
+                    // contract, four names; the `_raw` pair are aliases, not
+                    // variants, and if they ever diverge that is a bug.
+                    //
+                    // Inline for the same reason printf is: the bytes must go
+                    // through globals.stdout/stderr. That is also what makes
+                    // this fd 1/2 *as they are* — the sink is the process's
+                    // own stdout, never a re-opened "/dev/stdout" path (which
+                    // dies with EACCES the moment fd 1 belongs to another
+                    // user, the bug that made Mix unusable as a sieve filter).
+                    //
+                    // Three deliberate differences from `print`: no trailing
+                    // newline, no separator between arguments, and bytes/buffer
+                    // written verbatim instead of as the `<bytes:N>`
+                    // placeholder. A fourth is the error handling below.
+                    if matches!(
+                        name.as_str(),
+                        "write_stdout" | "write_stderr" | "print_raw" | "eprint_raw"
+                    ) {
+                        self.check_capability(name)?; // Knob A
+                        if eval_args.is_empty() {
+                            return Err(MixError::RuntimeError {
+                                span: None,
+                                msg: format!("{name}() requires at least one value to write"),
+                            });
+                        }
+                        let mut out: Vec<u8> = Vec::new();
+                        for v in &eval_args {
+                            builtins::append_output_bytes(v, &mut out);
+                        }
+                        let to_stderr = name == "write_stderr" || name == "eprint_raw";
+                        let res = {
+                            let mut g = self.globals.borrow_mut();
+                            let sink: &mut dyn Write = if to_stderr {
+                                &mut g.stderr
+                            } else {
+                                &mut g.stdout
+                            };
+                            // `write_all` loops over partial writes, so a short
+                            // write is never silently a truncated one. The flush
+                            // is not optional: the default stdout sink is
+                            // line-buffered, and this family exists precisely to
+                            // emit output with NO newline in it — without the
+                            // flush a filter's bytes would sit in the buffer past
+                            // the moment the consumer reads.
+                            sink.write_all(&out).and_then(|()| sink.flush())
+                        };
+                        if let Err(e) = res {
+                            // `print`/`printf` swallow this with `.ok()`. This
+                            // family must not: its entire contract is that the
+                            // named bytes reached the consumer, so a dropped
+                            // write reported as success is the one failure mode
+                            // it cannot have. Catchable and code-distinguished,
+                            // so a pipeline filter can choose the quiet exit:
+                            //   try
+                            //     write_stdout($body)
+                            //   catch $m, $e
+                            //     if $e.code == "IO_BROKEN_PIPE" then exit(0) end
+                            //     raise($e.code, $m)
+                            //   end
+                            let code = if e.kind() == std::io::ErrorKind::BrokenPipe {
+                                "IO_BROKEN_PIPE"
+                            } else {
+                                "IO_WRITE_FAILED"
+                            };
+                            return Err(MixError::structured(code, format!("{name}: {e}")));
                         }
                         return Ok(Value::Nil);
                     }
