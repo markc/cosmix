@@ -1,0 +1,48 @@
+-- fmt_dynamic_width.mix: printf-convention '*' width (0.63.0) —
+-- %*s %-*s %*d %0*d %*f take the width from the next argument;
+-- a missing / non-integer / negative width errors, never guesses.
+-- Expected output:
+-- [      hi]
+-- [hi      ]
+-- [   42]
+-- [00042]
+-- [ab  |     7]
+-- [  1.500000]
+-- [hi]
+-- [hi      |00042]
+-- star-width-non-number-raises
+-- star-width-missing-raises
+-- star-width-fraction-raises
+-- star-width-negative-raises
+
+$w = 8
+print("[" .. fmt("%*s", $w, "hi") .. "]")
+print("[" .. fmt("%-*s", $w, "hi") .. "]")
+print("[" .. fmt("%*d", 5, 42) .. "]")
+print("[" .. fmt("%0*d", 5, 42) .. "]")
+print("[" .. fmt("%-*s|%*d", 4, "ab", 6, 7) .. "]")
+print("[" .. fmt("%*f", 10, 1.5) .. "]")
+print("[" .. fmt("%*s", 0, "hi") .. "]")
+-- literal widths unchanged
+print("[" .. fmt("%-8s|%05d", "hi", 42) .. "]")
+-- a missing width argument errors, never guesses
+try
+  fmt("%*s", "hi")
+catch $e
+  print "star-width-non-number-raises"
+end
+try
+  fmt("%*s")
+catch $e
+  print "star-width-missing-raises"
+end
+try
+  fmt("%*d", 1.5, 3)
+catch $e
+  print "star-width-fraction-raises"
+end
+try
+  fmt("%*d", -2, 3)
+catch $e
+  print "star-width-negative-raises"
+end

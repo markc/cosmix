@@ -34,12 +34,32 @@ h_ll_ w_rld
 [a, b, c, d]
 ```
 
-## The four builtins
+## The subject-first family — `re_*` (0.63.0, prefer these)
+
+The same engine with the arguments the way every literal-string builtin
+takes them: **subject first**. New code should use these; the pattern-first
+legacy names below stay valid through the migration window and are removed
+in a later release.
+
+| Call | Returns | Notes |
+|---|---|---|
+| `re_match(s, pattern)` | **bool** | true if `pattern` matches anywhere in `s` |
+| `re_find(s, pattern)` | **list of maps** | every match, `{match, start, end[, groups]}` — **codepoint** offsets, so `start`/`end` compose with `substr`/`slice`/`index_of` |
+| `re_replace(s, pattern, repl)` | **string** | replaces **all** matches; `$1`/`${name}` backrefs |
+| `re_split(s, pattern)` | **list of strings** | splits on each match |
+| `grep_lines(text, pattern)` | **list of strings** | the lines of `text` matching `pattern` (subject-first `grep()`) |
+
+The offset unit is the visible difference: legacy `regex_find` returns raw
+UTF-8 **byte** offsets (`regex_find("x", "éx")[0].start` is 2), while
+`re_find("éx", "x")[0].start` is 1 — the codepoint index `substr` actually
+accepts. On non-ASCII input only `re_find` composes correctly.
+
+## The four legacy builtins (pattern first)
 
 | Call | Returns | Notes |
 |---|---|---|
 | `regex_match(pattern, text)` | **bool** | true if `pattern` matches *anywhere* in `text` (not anchored) |
-| `regex_find(pattern, text)` | **list of maps** | every non-overlapping match; `[]` when none |
+| `regex_find(pattern, text)` | **list of maps** | every non-overlapping match; `[]` when none; **byte** offsets |
 | `regex_replace(pattern, text, repl)` | **string** | replaces **all** matches; `$1`/`${name}` backrefs in `repl` |
 | `regex_split(pattern, text)` | **list of strings** | splits on each match; keeps empty leading/trailing parts |
 
@@ -349,10 +369,10 @@ Runtime error at line 2: invalid regex 'line of roster text line of …' (8020 c
   argument order is the usual cause of a huge pattern: see mix man regex)
 ```
 
-Remember the order: **pattern first, subject second** — a swapped call
-where both compile is *silent* (`regex_match($text, $pattern)` is just a
-"no"), which is why the argument order is worth pinning in muscle memory
-now and why subject-first `re_*` names are planned.
+Remember the legacy order: **pattern first, subject second** — a swapped
+call where both compile is *silent* (`regex_match($text, $pattern)` is
+just a "no"). The subject-first `re_*` family (0.63.0, above) removes the
+trap; prefer it in new code.
 
 Wrap user-supplied patterns in `try`/`catch` so a bad pattern doesn't abort the
 script ([errors](errors.md)):

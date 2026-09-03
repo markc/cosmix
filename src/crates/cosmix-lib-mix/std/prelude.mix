@@ -1,17 +1,12 @@
 -- Mix standard prelude
 -- Auto-loaded before scripts and .mixrc
 
-function lines($s)
-    return split($s, "\n")
-end
-
-function chars($s)
-    $result = []
-    for $i = 0 to length($s) - 1
-        push($result, substr($s, $i, 1))
-end
-    return $result
-end
+-- lines() and chars() are native builtins since 0.63.0 (a builtin shadows
+-- any same-named function, so the old prelude shims here were dead the
+-- moment the builtins landed — removed like the max/min/abs/clamp shims
+-- below). Native lines() differs deliberately from the old shim: one
+-- trailing \r stripped per line (CRLF-safe) and the final newline no
+-- longer yields a trailing "" element. read_lines() below inherits that.
 
 function sum($list)
     $total = 0

@@ -137,8 +137,9 @@ async fn local_def_shadows_prelude_from_the_first_statement() {
     // Hoisting makes a script-local fn shadow a same-named prelude fn
     // even at call sites ABOVE the definition — the call site's meaning
     // no longer depends on its position (documented in functions.md).
-    let source =
-        "print(len(lines(\"a\\nb\")))\nfn lines($s)\n  return [\"shadowed\"]\nend\n";
+    // Uses `sum` (prelude-only): a NATIVE builtin (e.g. lines since
+    // 0.63.0) always outranks user fns, so only prelude names shadow.
+    let source = "print(sum([1, 2]))\nfn sum($xs)\n  return 0\nend\n";
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize().expect("lex");
     let mut parser = Parser::new(tokens, source);
@@ -148,6 +149,6 @@ async fn local_def_shadows_prelude_from_the_first_statement() {
     let mut eval = Evaluator::with_output(Box::new(stdout.clone()), Box::new(stderr.clone()));
     eval.load_prelude().await;
     eval.execute(&stmts).await.expect("eval");
-    // Prelude lines("a\nb") would give 2; the shadowing def gives 1.
-    assert_eq!(stdout.to_string_lossy(), "1\n");
+    // Prelude sum([1,2]) would give 3; the shadowing def gives 0.
+    assert_eq!(stdout.to_string_lossy(), "0\n");
 }

@@ -422,7 +422,56 @@ print(join(slice([10,20,30,40], 1, 3), ","))
 20,30
 ```
 
+## The delimiter family — `before`/`after`/`split_once` (0.63.0)
+
+The helpers a script reaches for on line 3, replacing every
+`substr($s, pos(..) ± n)` computation. All subject-first. **Contract:**
+absent delimiter → `nil` (never `""` and never the whole string — `""` is
+a *real* result, the delimiter at the edge); empty delimiter raises.
+
+```mix
+print(after("key=value", "="))          -- value
+print(before("key=value", "="))         -- key
+print(after_last("/a/b/base.txt", "/")) -- base.txt   (basename)
+print(after_last("base.txt", "."))      -- txt        (extension)
+$kv = split_once("k=v=w", "=")          -- [head, tail] at the FIRST =
+print($kv[0] .. " / " .. $kv[1])        -- k / v=w    (rsplit_once: LAST)
+print(between("a <b> c", "<", ">"))     -- b
+print(after("no-equals", "=") or "dflt")-- dflt  (nil-coalesce a default)
+```
+
+`before_last` mirrors `before` at the last occurrence. Absence is `nil`,
+so `if after($s, "=") == nil` is the "not found" test — an empty capture
+and a missing delimiter never blur.
+
+**Prefix/suffix forms** return the subject **unchanged** when there is
+nothing to strip ("nothing to do" is an answer, not a failure):
+`strip_prefix(s, p)`, `strip_suffix(s, x)`, `replace_first(s, old, new)`
+(first occurrence only; empty `old` mirrors `replace()`), and
+`count_of(s, needle)` (non-overlapping; 0 for an empty needle).
+
+**Lines, fields, chars** (0.63.0 — `lines`/`chars` were prelude
+functions, now native): `lines(s)` splits on `\n`, strips one trailing
+`\r` per line (CRLF-safe) and drops exactly one trailing empty element
+(the final newline) — `lines("a\nb\n")` is `["a", "b"]`, `lines("")` is
+`[]`, `"a\n\n"` keeps its real empty line. `fields(s)` splits on
+whitespace *runs* like awk (no empties; `word(s, n)` is the 1-based
+single-field form). `chars(s)` yields codepoints as 1-char strings.
+`last_index_of(s, v)` is the 0-based codepoint twin of `lastpos()` (args
+reversed, -1 when absent — same condition warning as `index_of`).
+
 ## Trim, pad, repeat, reverse
+
+`trim`/`strip` take an optional **charset** — a *set* of codepoints to
+strip (PHP-style), honoured since 0.63.0 (before that the second argument
+was silently ignored — the call "worked" and did nothing). One-sided:
+`ltrim`/`rtrim`, same optional charset:
+
+```mix
+print(trim("xxhelloxx", "x"))     -- hello
+print(ltrim("zyxabczyx", "xyz"))  -- abczyx
+print(rtrim("zyxabczyx", "xyz"))  -- zyxabc
+```
 
 ```mix
 print("[" .. trim("  hi  ") .. "]")    -- strip is an alias for trim

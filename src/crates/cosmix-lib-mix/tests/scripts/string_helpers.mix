@@ -1,0 +1,108 @@
+-- string_helpers.mix: subject-first string helpers (0.63.0) — Tier 1
+-- (delimiter family: nil on absent, "" is a real result, empty delim
+-- raises), Tier 2 (unchanged-subject), trim charset, Tier 3 (lines /
+-- fields / chars / last_index_of).
+-- Expected output:
+-- k
+-- v
+-- []
+-- []
+-- before-absent-nil
+-- after-absent-nil
+-- a.b
+-- c
+-- base.txt
+-- a|b=c
+-- a=b|c
+-- split-once-absent-nil
+-- hit
+-- between-absent-nil
+-- empty-delim-raises
+-- rest
+-- rest
+-- [ab]
+-- file
+-- file
+-- a+b-c
+-- abc
+-- [Xab]
+-- 2
+-- 1
+-- 0
+-- hello
+-- helloxx
+-- xxhello
+-- [a  ]
+-- [  a]
+-- abc
+-- [ab]
+-- 3
+-- a|b|c
+-- 0
+-- 2:[]
+-- 3:xyz
+-- 0
+-- 3:é
+-- 3
+-- 4
+-- -1
+-- 2
+
+-- Tier 1: found / absent / edge
+print(before("k=v", "="))
+print(after("k=v", "="))
+print("[" .. before("=v", "=") .. "]")
+print("[" .. after("k=", "=") .. "]")
+if before("kv", "=") == nil then print "before-absent-nil" end
+if after("kv", "=") == nil then print "after-absent-nil" end
+print(before_last("a.b.c", "."))
+print(after_last("a.b.c", "."))
+print(after_last("/x/y/base.txt", "/"))
+$p = split_once("a=b=c", "=")
+print($p[0] .. "|" .. $p[1])
+$q = rsplit_once("a=b=c", "=")
+print($q[0] .. "|" .. $q[1])
+if split_once("abc", "=") == nil then print "split-once-absent-nil" end
+print(between("x<hit>y", "<", ">"))
+if between("x<hit y", "<", ">") == nil then print "between-absent-nil" end
+try
+  before("x", "")
+catch $e
+  print "empty-delim-raises"
+end
+-- Tier 2: unchanged-subject contract
+print(strip_prefix("prefix-rest", "prefix-"))
+print(strip_prefix("rest", "prefix-"))
+print("[" .. strip_prefix("ab", "") .. "]")
+print(strip_suffix("file.mix", ".mix"))
+print(strip_suffix("file", ".mix"))
+print(replace_first("a-b-c", "-", "+"))
+print(replace_first("abc", "x", "+"))
+print("[" .. replace_first("ab", "", "X") .. "]")
+print(count_of("banana", "an"))
+print(count_of("aaa", "aa"))
+print(count_of("abc", ""))
+-- trim family: charset honoured (was silently ignored)
+print(trim("xxhelloxx", "x"))
+print(ltrim("xxhelloxx", "x"))
+print(rtrim("xxhelloxx", "x"))
+print("[" .. ltrim("  a  ") .. "]")
+print("[" .. rtrim("  a  ") .. "]")
+print(trim("zyxabczyx", "xyz"))
+print("[" .. trim("ab", "") .. "]")
+-- Tier 3
+$l = lines("a\r\nb\nc\n")
+print(len($l))
+print($l[0] .. "|" .. $l[1] .. "|" .. $l[2])
+print(len(lines("")))
+$e = lines("a\n\n")
+print(len($e) .. ":[" .. $e[1] .. "]")
+$f = fields("  x   y  z ")
+print(len($f) .. ":" .. $f[0] .. $f[1] .. $f[2])
+print(len(fields("")))
+$c = chars("héo")
+print(len($c) .. ":" .. $c[1])
+print(last_index_of("banana", "an"))
+print(last_index_of("héxéx", "x"))
+print(last_index_of("abc", "z"))
+print(last_index_of([1, 2, 1], 1))

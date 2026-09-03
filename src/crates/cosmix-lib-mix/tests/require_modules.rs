@@ -673,19 +673,20 @@ async fn module_top_level_forward_call_works() {
 async fn module_fn_shadowing_prelude_name_still_exports() {
     // The hoist runs AFTER the prelude-identity snapshot, so a module fn
     // redefining a prelude name is a fresh Rc and must still auto-export.
+    // Uses `sum` (prelude-only; a native builtin name would outrank the
+    // module fn at its own call sites). Called via INDEX access: the
+    // pinned MethodCall precedence puts registry functions (UFCS) before
+    // map members, so `$m.sum(..)` would dispatch to the prelude with $m
+    // as the subject — index access is how a shadowing export is reached.
     let dir = test_dir("hoist_prelude_shadow");
-    write_module(
-        &dir,
-        "mod.mix",
-        "fn lines($s)\n  return [\"shadowed\"]\nend\n",
-    );
+    write_module(&dir, "mod.mix", "fn sum($xs)\n  return -1\nend\n");
     let out = run_in_dir_with(
         &dir,
-        "$m = require(\"mod.mix\")\nprint(len($m.lines(\"a\\nb\")))\n",
+        "$m = require(\"mod.mix\")\nprint(keys($m))\n$f = $m[\"sum\"]\nprint($f([1, 2]))\n",
         true,
         |_| {},
     )
     .await
     .unwrap();
-    assert_eq!(out, "1\n");
+    assert_eq!(out, "[sum]\n-1\n");
 }

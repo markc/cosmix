@@ -84,9 +84,9 @@ builtin_table! {
     ("right", CapabilityClass::Pure,           "string",  "Return rightmost N characters", contract!((s: string, n: number) -> string; failure[raises])),
     ("substr", CapabilityClass::Pure,          "string",  "Extract substring by codepoint position and length (splits emoji/combining; see grapheme_substr)", contract!((s: string, start: number, len?: number) -> string; failure[raises])),
     ("pos", CapabilityClass::Pure,             "string",  "Find first position of needle in haystack (1-based, 0=not found — so `if pos(..)` reads correctly, since 0 is falsy). 0-based twin: index_of(), which takes its args the other way round and is NOT safe in a condition", contract!((needle: string, haystack: string) -> number)),
-    ("lastpos", CapabilityClass::Pure,         "string",  "Find last position of needle in haystack (1-based, 0=not found — safe in a condition, 0 is falsy). No 0-based twin; index_of() finds the FIRST occurrence only", contract!((needle: string, haystack: string) -> number)),
-    ("strip", CapabilityClass::Pure,           "string",  "Remove leading/trailing whitespace", contract!((s: string) -> string)),
-    ("trim", CapabilityClass::Pure,            "string",  "Alias for strip()", contract!((s: string) -> string)),
+    ("lastpos", CapabilityClass::Pure,         "string",  "Find last position of needle in haystack (1-based, 0=not found — safe in a condition, 0 is falsy). 0-based twin: last_index_of(), which takes its args the other way round", contract!((needle: string, haystack: string) -> number)),
+    ("strip", CapabilityClass::Pure,           "string",  "Remove leading/trailing whitespace, or codepoints in charset: strip(s[, charset]) (0.63.0 — the 2nd arg was silently IGNORED before)", contract!((s: string, charset?: string) -> string)),
+    ("trim", CapabilityClass::Pure,            "string",  "Alias for strip(): trim(s[, charset]) — charset is a SET of codepoints to strip from both ends (0.63.0; was silently ignored). One-sided: ltrim/rtrim", contract!((s: string, charset?: string) -> string)),
     ("replace", CapabilityClass::Pure,         "string",  "Replace all occurrences of old with new in string", contract!((s: string, old: string, new: string) -> string)),
     ("split", CapabilityClass::Pure,           "string",  "Split string into list by delimiter (default: space)", contract!((s: string, delim?: string) -> list(string))),
     ("join", CapabilityClass::Pure,            "string",  "Join list into string with delimiter (default: space)", contract!((list: list, delim?: string) -> string)),
@@ -102,6 +102,29 @@ builtin_table! {
     ("words", CapabilityClass::Pure,           "string",  "Count whitespace-delimited words in string", contract!((s: string) -> number)),
     ("word", CapabilityClass::Pure,            "string",  "Extract Nth word from string (1-based)", contract!((s: string, n: number) -> any_of(string, nil); failure[raises])),
     ("grep", CapabilityClass::Pure,            "string",  "Return lines from text matching pattern (regex when enabled)", contract!((pattern: string, text: string) -> list(string))),
+    // --- Subject-first string helpers (0.63.0). Tier 1 (delimiter family):
+    // absent delimiter/marker -> nil, "" is a REAL result (delimiter at the
+    // edge), empty delimiter raises — nil and "" never blur. Tier 2
+    // (prefix/suffix/replace forms): "nothing to strip/replace" returns the
+    // subject UNCHANGED, never nil. Indices are 0-based codepoints.
+    ("before", CapabilityClass::Pure,          "string",  "Text before the FIRST delim: before(s, delim) -> string | nil (nil when delim absent; \"\" is a real result — delim at the start). Empty delim raises", contract!((s: string, delim: string) -> any_of(string, nil); failure[raises])),
+    ("after", CapabilityClass::Pure,           "string",  "Text after the FIRST delim: after(s, delim) -> string | nil (nil when delim absent; \"\" when delim at the end). Empty delim raises. Want a default? `after($s, \"=\") or \"\"`", contract!((s: string, delim: string) -> any_of(string, nil); failure[raises])),
+    ("before_last", CapabilityClass::Pure,     "string",  "Text before the LAST delim -> string | nil (nil when absent). Empty delim raises", contract!((s: string, delim: string) -> any_of(string, nil); failure[raises])),
+    ("after_last", CapabilityClass::Pure,      "string",  "Text after the LAST delim -> string | nil (nil when absent) — basename/extension: after_last(path, \"/\"), after_last(name, \".\"). Empty delim raises", contract!((s: string, delim: string) -> any_of(string, nil); failure[raises])),
+    ("split_once", CapabilityClass::Pure,      "string",  "Split at the FIRST delim: split_once(s, delim) -> [head, tail] | nil (nil when absent — never a 1-element list). Empty delim raises", contract!((s: string, delim: string) -> any_of(list, nil); failure[raises])),
+    ("rsplit_once", CapabilityClass::Pure,     "string",  "Split at the LAST delim -> [head, tail] | nil (nil when absent). Empty delim raises", contract!((s: string, delim: string) -> any_of(list, nil); failure[raises])),
+    ("between", CapabilityClass::Pure,         "string",  "Text after the first a and before the NEXT b: between(s, a, b) -> string | nil (nil if either marker absent, in that order). Empty a or b raises", contract!((s: string, a: string, b: string) -> any_of(string, nil); failure[raises])),
+    ("strip_prefix", CapabilityClass::Pure,    "string",  "s without a leading p, else s UNCHANGED (never nil — \"nothing to strip\" is an answer). Empty p -> unchanged. Kills the starts_with+substr idiom", contract!((s: string, p: string) -> string)),
+    ("strip_suffix", CapabilityClass::Pure,    "string",  "s without a trailing x, else s UNCHANGED (never nil). Empty x -> unchanged", contract!((s: string, x: string) -> string)),
+    ("replace_first", CapabilityClass::Pure,   "string",  "Replace the FIRST occurrence of old; old absent -> s unchanged. Empty old mirrors replace(): inserts new at the start (replace_first(\"ab\", \"\", \"X\") is \"Xab\")", contract!((s: string, old: string, new: string) -> string)),
+    ("count_of", CapabilityClass::Pure,        "string",  "Non-overlapping occurrences of needle in s; 0 for an empty needle. (The HOF count(list, pred) is a different builtin)", contract!((s: string, needle: string) -> number)),
+    ("ltrim", CapabilityClass::Pure,           "string",  "Strip leading whitespace, or leading codepoints in charset: ltrim(s[, charset]) — PHP-style charset is a SET of codepoints, not a prefix string", contract!((s: string, charset?: string) -> string)),
+    ("rtrim", CapabilityClass::Pure,           "string",  "Strip trailing whitespace, or trailing codepoints in charset: rtrim(s[, charset])", contract!((s: string, charset?: string) -> string)),
+    ("lines", CapabilityClass::Pure,           "string",  "Split into lines: \\n-separated, ONE trailing \\r stripped per line (CRLF and LF both work; a lone \\r is not a terminator), exactly one trailing empty element dropped (the final newline). lines(\"\") -> []; \"a\\n\\n\" -> [\"a\", \"\"]. Native since 0.63.0 (was a prelude fn that kept \\r and the trailing \"\")", contract!((s: string) -> list(string))),
+    ("fields", CapabilityClass::Pure,          "string",  "awk-style fields: split on whitespace RUNS, no empties; fields(\"\") -> []. 0-based access fields(s)[2]; the 1-based single-field form is word(s, n)", contract!((s: string) -> list(string))),
+    ("chars", CapabilityClass::Pure,           "string",  "Codepoints as 1-char strings (grapheme_* builtins exist for clusters). Native since 0.63.0 (was a prelude fn)", contract!((s: string) -> list(string))),
+    ("last_index_of", CapabilityClass::Pure,   "string",  "0-based codepoint index of the LAST occurrence in a string, or last index of a value in a list; -1 if absent. The 0-based twin of lastpos() (args reversed). ⚠ Like index_of, NEVER bare in a condition: -1 is truthy, 0 is falsy", contract!((seq: any_of(list, string), v: any) -> number)),
+    ("deep_eq", CapabilityClass::Pure,         "type",    "Structural equality for any two values: maps compare by key set + deep_eq values (insertion order IGNORED), lists elementwise in order, scalars as ==. The answer `==` cannot give for maps/lists (it is always false there today)", contract!((a: any, b: any) -> bool)),
     ("template", CapabilityClass::Pure,        "string",  "Substitute single-brace {key} placeholders in a string from a map", contract!((tmpl: string, vars: map) -> string)),
     ("word_wrap", CapabilityClass::Pure,       "string",  "Wrap text to a column width (codepoint budget; see word_wrap_w for display cells)", contract!((text: string, width: number) -> string; failure[raises])),
     ("word_wrap_w", CapabilityClass::Pure,     "string",  "Wrap text to a column width in terminal display CELLS (UAX #11; CJK/emoji=2)", contract!((text: string, width: number) -> string; failure[raises])),
@@ -113,6 +136,14 @@ builtin_table! {
     ("regex_find", CapabilityClass::Pure,      "string",  "Return ALL regex matches as a list of {match, start, end[, groups]} maps (empty list if none)", contract!((pattern: string, text: string) -> list(map))),
     ("regex_replace", CapabilityClass::Pure,   "string",  "Replace regex matches with replacement text", contract!((pattern: string, text: string, replacement: string) -> string)),
     ("regex_split", CapabilityClass::Pure,     "string",  "Split string by regex pattern", contract!((pattern: string, s: string) -> list(string))),
+    // --- Subject-first regex family (0.63.0): same engine as regex_*, args
+    // the consistent way round (subject first, like every literal-string
+    // builtin). The legacy pattern-first names stay until release B.
+    ("re_match", CapabilityClass::Pure,        "string",  "Subject-first regex test: re_match(s, pattern) -> bool, true if pattern matches anywhere in s", contract!((s: string, pattern: string) -> bool; failure[raises])),
+    ("re_find", CapabilityClass::Pure,         "string",  "All matches as {match, start, end[, groups]} maps with CODEPOINT offsets (compose with substr/slice/index_of; legacy regex_find returns UTF-8 BYTE offsets). [] when none", contract!((s: string, pattern: string) -> list(map); failure[raises])),
+    ("re_replace", CapabilityClass::Pure,      "string",  "Replace ALL matches: re_replace(s, pattern, replacement) — subject FIRST; $1/${name} backrefs in replacement", contract!((s: string, pattern: string, replacement: string) -> string; failure[raises])),
+    ("re_split", CapabilityClass::Pure,        "string",  "Split s on each match of pattern (subject first)", contract!((s: string, pattern: string) -> list(string); failure[raises])),
+    ("grep_lines", CapabilityClass::Pure,      "string",  "Lines of text matching pattern (subject first; regex when enabled, else substring) — grep() with the args the consistent way round", contract!((text: string, pattern: string) -> list(string); failure[raises])),
     ("csv_parse", CapabilityClass::Pure,       "string",  "Parse CSV string into a list of header-keyed row maps", contract!((s: string, delim?: string) -> list(map))),
     ("ini_parse", CapabilityClass::Pure,       "string",  "Parse INI string into nested map of sections", contract!((s: string) -> map)),
     ("xml_parse", CapabilityClass::Pure,       "string",  "Parse a strict-XML string (or bytes, e.g. an HTTP body) into a Value tree (requires xml feature). Default simple mode is the SOAP/RSS consumer shape: {RootName: …} with namespace prefixes stripped, attributes as @name keys, repeated sibling elements collapsed to a list, a leaf element's text as its value, mixed text under #text, xmlns declarations dropped. Pass {mode:\"tree\"} for full fidelity: nodes are {name, attrs, children} with prefixes + xmlns preserved and text children as plain strings. Strict XML only — real-world HTML is tag soup and will NOT parse.", contract!((s: any_of(string, bytes), opts?: map) -> map)),
@@ -317,7 +348,7 @@ builtin_table! {
     ("dns_lookup", CapabilityClass::Network,      "system",  "Resolve a hostname to a list of IP address strings", contract!((host: string) -> list(string); effects[blocking]; failure[raises])),
     ("help", CapabilityClass::Pure,            "system",  "Show Mix builtin help in the REPL", contract!(() -> nil)),
 
-    ("fmt", CapabilityClass::Pure,             "format",  "printf-style format string → string. Specs: %s %d %f %.Nf %Nd %-Ns %0Nd %% (v0.2.0; %0Nd zero-pad v0.54.0 — numeric only, use lpad(s,n,\"0\") for strings)", contract!((tmpl: string, args: ...any) -> string)),
+    ("fmt", CapabilityClass::Pure,             "format",  "printf-style format string → string. Specs: %s %d %f %.Nf %Nd %-Ns %0Nd %% (v0.2.0; %0Nd zero-pad v0.54.0 — numeric only, use lpad(s,n,\"0\") for strings). Dynamic width `*` takes the width from the next argument: %*s %-*s %*d %0*d %*f (v0.63.0; the width argument must be a non-negative integer)", contract!((tmpl: string, args: ...any) -> string)),
     ("printf", CapabilityClass::Pure,          "format",  "Formatted write to stdout (no trailing newline — include \\n explicitly) (v0.2.0)", contract!((tmpl: string, args: ...any) -> nil)),
     ("eprintf", CapabilityClass::Pure,         "format",  "Formatted write to stderr (v0.2.0)", contract!((tmpl: string, args: ...any) -> nil)),
     ("format_bytes", CapabilityClass::Pure,    "format",  "Format byte count as human-readable size (e.g. \"1.5 MB\"); a non-numeric argument raises (strict since v0.55.0)", contract!((n: number) -> string; failure[raises])),
@@ -467,6 +498,25 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "run_pipeline" => builtin_run_pipeline(args),
         "run_pipeline_must" => builtin_run_pipeline_must(args),
         "grep" => builtin_grep(args),
+        "before" => builtin_before(args),
+        "after" => builtin_after(args),
+        "before_last" => builtin_before_last(args),
+        "after_last" => builtin_after_last(args),
+        "split_once" => builtin_split_once(args),
+        "rsplit_once" => builtin_rsplit_once(args),
+        "between" => builtin_between(args),
+        "strip_prefix" => builtin_strip_prefix(args),
+        "strip_suffix" => builtin_strip_suffix(args),
+        "replace_first" => builtin_replace_first(args),
+        "count_of" => builtin_count_of(args),
+        "ltrim" => builtin_ltrim(args),
+        "rtrim" => builtin_rtrim(args),
+        "lines" => builtin_lines(args),
+        "fields" => builtin_fields(args),
+        "chars" => builtin_chars(args),
+        "last_index_of" => builtin_last_index_of(args),
+        "deep_eq" => builtin_deep_eq(args),
+        "grep_lines" => builtin_grep_lines(args),
         "line_count" => builtin_line_count(args),
         "head" => builtin_head(args),
         "tail" => builtin_tail(args),
@@ -521,6 +571,14 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "regex_replace" => builtin_regex_replace(args),
         #[cfg(feature = "regex")]
         "regex_split" => builtin_regex_split(args),
+        #[cfg(feature = "regex")]
+        "re_match" => builtin_re_match(args),
+        #[cfg(feature = "regex")]
+        "re_find" => builtin_re_find(args),
+        #[cfg(feature = "regex")]
+        "re_replace" => builtin_re_replace(args),
+        #[cfg(feature = "regex")]
+        "re_split" => builtin_re_split(args),
         #[cfg(feature = "toml")]
         "toml_parse" => builtin_toml_parse(args),
         #[cfg(feature = "toml")]
@@ -1113,7 +1171,11 @@ fn builtin_display_width(args: Vec<Value>) -> MixResult<Option<Value>> {
 fn builtin_strip(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("strip", &args, 1)?;
     let s = args[0].to_mix_string();
-    Ok(Some(Value::String(s.trim().to_string())))
+    // Optional charset (0.63.0): a SET of codepoints to strip from both
+    // ends. Before this the second argument was accepted and silently
+    // IGNORED — the exact no-op a PHP-style trim(s, chars) caller hits.
+    let cs = args.get(1).map(|v| v.to_mix_string());
+    Ok(Some(Value::String(charset_trim(&s, cs.as_deref(), true, true))))
 }
 
 // Exact-match string ops boundary (char-aware strings P2): `replace`, `contains`,
@@ -1128,6 +1190,283 @@ fn builtin_replace(args: Vec<Value>) -> MixResult<Option<Value>> {
     let old = args[1].to_mix_string();
     let new = args[2].to_mix_string();
     Ok(Some(Value::String(s.replace(&old, &new))))
+}
+
+// --- Subject-first string helpers (0.63.0) -------------------------------
+// Tier 1 contract: absent delimiter -> Nil (never "" and never the whole
+// subject — "" is a REAL result, the delimiter at the edge); empty
+// delimiter raises. Tier 2 contract: nothing to strip/replace -> subject
+// unchanged. All matching is exact UTF-8 bytes like replace/contains.
+
+/// Tier-1 shared guard: the delimiter must be non-empty.
+fn nonempty_delim(name: &str, d: &str) -> MixResult<()> {
+    if d.is_empty() {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("{name}: empty delimiter (matching \"\" everywhere answers nothing — pass a real delimiter)"),
+        });
+    }
+    Ok(())
+}
+
+fn builtin_before(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("before", &args, 2)?;
+    let s = args[0].to_mix_string();
+    let d = args[1].to_mix_string();
+    nonempty_delim("before", &d)?;
+    Ok(Some(match s.find(&d) {
+        Some(b) => Value::String(s[..b].to_string()),
+        None => Value::Nil,
+    }))
+}
+
+fn builtin_after(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("after", &args, 2)?;
+    let s = args[0].to_mix_string();
+    let d = args[1].to_mix_string();
+    nonempty_delim("after", &d)?;
+    Ok(Some(match s.find(&d) {
+        Some(b) => Value::String(s[b + d.len()..].to_string()),
+        None => Value::Nil,
+    }))
+}
+
+fn builtin_before_last(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("before_last", &args, 2)?;
+    let s = args[0].to_mix_string();
+    let d = args[1].to_mix_string();
+    nonempty_delim("before_last", &d)?;
+    Ok(Some(match s.rfind(&d) {
+        Some(b) => Value::String(s[..b].to_string()),
+        None => Value::Nil,
+    }))
+}
+
+fn builtin_after_last(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("after_last", &args, 2)?;
+    let s = args[0].to_mix_string();
+    let d = args[1].to_mix_string();
+    nonempty_delim("after_last", &d)?;
+    Ok(Some(match s.rfind(&d) {
+        Some(b) => Value::String(s[b + d.len()..].to_string()),
+        None => Value::Nil,
+    }))
+}
+
+fn builtin_split_once(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("split_once", &args, 2)?;
+    let s = args[0].to_mix_string();
+    let d = args[1].to_mix_string();
+    nonempty_delim("split_once", &d)?;
+    Ok(Some(match s.split_once(&d) {
+        Some((head, tail)) => Value::list(vec![
+            Value::String(head.to_string()),
+            Value::String(tail.to_string()),
+        ]),
+        None => Value::Nil,
+    }))
+}
+
+fn builtin_rsplit_once(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("rsplit_once", &args, 2)?;
+    let s = args[0].to_mix_string();
+    let d = args[1].to_mix_string();
+    nonempty_delim("rsplit_once", &d)?;
+    Ok(Some(match s.rsplit_once(&d) {
+        Some((head, tail)) => Value::list(vec![
+            Value::String(head.to_string()),
+            Value::String(tail.to_string()),
+        ]),
+        None => Value::Nil,
+    }))
+}
+
+fn builtin_between(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("between", &args, 3)?;
+    let s = args[0].to_mix_string();
+    let a = args[1].to_mix_string();
+    let b = args[2].to_mix_string();
+    nonempty_delim("between", &a)?;
+    nonempty_delim("between", &b)?;
+    let Some(start) = s.find(&a) else {
+        return Ok(Some(Value::Nil));
+    };
+    let rest = &s[start + a.len()..];
+    Ok(Some(match rest.find(&b) {
+        Some(end) => Value::String(rest[..end].to_string()),
+        None => Value::Nil,
+    }))
+}
+
+fn builtin_strip_prefix(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("strip_prefix", &args, 2)?;
+    let s = args[0].to_mix_string();
+    let p = args[1].to_mix_string();
+    // Empty prefix -> unchanged (strip_prefix("", ..) would also be a
+    // no-op via str::strip_prefix, but make the contract explicit).
+    Ok(Some(Value::String(match s.strip_prefix(&p) {
+        Some(rest) if !p.is_empty() => rest.to_string(),
+        _ => s,
+    })))
+}
+
+fn builtin_strip_suffix(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("strip_suffix", &args, 2)?;
+    let s = args[0].to_mix_string();
+    let x = args[1].to_mix_string();
+    Ok(Some(Value::String(match s.strip_suffix(&x) {
+        Some(rest) if !x.is_empty() => rest.to_string(),
+        _ => s,
+    })))
+}
+
+fn builtin_replace_first(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("replace_first", &args, 3)?;
+    let s = args[0].to_mix_string();
+    let old = args[1].to_mix_string();
+    let new = args[2].to_mix_string();
+    // Empty `old` mirrors replace() (Rust str::replace semantics): one
+    // insertion, at the start — siblings must not disagree.
+    Ok(Some(Value::String(s.replacen(&old, &new, 1))))
+}
+
+fn builtin_count_of(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("count_of", &args, 2)?;
+    let s = args[0].to_mix_string();
+    let needle = args[1].to_mix_string();
+    let n = if needle.is_empty() {
+        0
+    } else {
+        s.matches(&needle).count()
+    };
+    Ok(Some(Value::Number(n as f64)))
+}
+
+/// Shared trim engine: default whitespace, or a charset treated as a SET
+/// of codepoints (PHP-style). An empty charset is an empty set — strips
+/// nothing.
+fn charset_trim(s: &str, charset: Option<&str>, from_start: bool, from_end: bool) -> String {
+    match charset {
+        None => match (from_start, from_end) {
+            (true, true) => s.trim(),
+            (true, false) => s.trim_start(),
+            _ => s.trim_end(),
+        }
+        .to_string(),
+        Some(cs) => {
+            let set: Vec<char> = cs.chars().collect();
+            let pred = |c: char| set.contains(&c);
+            let mut out = s;
+            if from_start {
+                out = out.trim_start_matches(pred);
+            }
+            if from_end {
+                out = out.trim_end_matches(pred);
+            }
+            out.to_string()
+        }
+    }
+}
+
+fn builtin_ltrim(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("ltrim", &args, 1)?;
+    let s = args[0].to_mix_string();
+    let cs = args.get(1).map(|v| v.to_mix_string());
+    Ok(Some(Value::String(charset_trim(&s, cs.as_deref(), true, false))))
+}
+
+fn builtin_rtrim(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("rtrim", &args, 1)?;
+    let s = args[0].to_mix_string();
+    let cs = args.get(1).map(|v| v.to_mix_string());
+    Ok(Some(Value::String(charset_trim(&s, cs.as_deref(), false, true))))
+}
+
+fn builtin_lines(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("lines", &args, 1)?;
+    let s = args[0].to_mix_string();
+    if s.is_empty() {
+        return Ok(Some(Value::list(Vec::new())));
+    }
+    let mut parts: Vec<&str> = s.split('\n').collect();
+    // Exactly ONE trailing empty element dropped — the final newline is a
+    // terminator, not the start of an empty line ("a\n\n" keeps its real
+    // empty line: ["a", ""]).
+    if parts.last() == Some(&"") {
+        parts.pop();
+    }
+    let out: Vec<Value> = parts
+        .into_iter()
+        .map(|l| Value::String(l.strip_suffix('\r').unwrap_or(l).to_string()))
+        .collect();
+    Ok(Some(Value::list(out)))
+}
+
+fn builtin_fields(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("fields", &args, 1)?;
+    let s = args[0].to_mix_string();
+    let out: Vec<Value> = s
+        .split_whitespace()
+        .map(|f| Value::String(f.to_string()))
+        .collect();
+    Ok(Some(Value::list(out)))
+}
+
+fn builtin_chars(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("chars", &args, 1)?;
+    let s = args[0].to_mix_string();
+    let out: Vec<Value> = s.chars().map(|c| Value::String(c.to_string())).collect();
+    Ok(Some(Value::list(out)))
+}
+
+fn builtin_last_index_of(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("last_index_of", &args, 2)?;
+    match &args[0] {
+        Value::List(items) => {
+            let pos = items.iter().rposition(|v| v == &args[1]);
+            Ok(Some(Value::Number(pos.map(|p| p as f64).unwrap_or(-1.0))))
+        }
+        Value::String(s) => {
+            // 0-based codepoint index of the LAST occurrence — the twin
+            // of index_of, via rfind.
+            let needle = args[1].to_mix_string();
+            let pos = s
+                .rfind(&needle)
+                .map(|b| s[..b].chars().count() as f64)
+                .unwrap_or(-1.0);
+            Ok(Some(Value::Number(pos)))
+        }
+        _ => Err(MixError::RuntimeError {
+            span: None,
+            msg: "last_index_of() expects a list or string".to_string(),
+        }),
+    }
+}
+
+/// Structural equality: the answer `==` cannot give for maps/lists (Value's
+/// PartialEq is always false there). Maps: same key set, values deep_eq,
+/// insertion order IGNORED. Lists: elementwise, order-sensitive. Scalars:
+/// Value's own PartialEq (including the Number/String coercion, so
+/// deep_eq agrees with == wherever == already works).
+fn deep_eq_values(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::List(la), Value::List(lb)) => {
+            la.len() == lb.len()
+                && la.iter().zip(lb.iter()).all(|(x, y)| deep_eq_values(x, y))
+        }
+        (Value::Map(ma), Value::Map(mb)) => {
+            ma.len() == mb.len()
+                && ma
+                    .iter()
+                    .all(|(k, va)| mb.get(k).is_some_and(|vb| deep_eq_values(va, vb)))
+        }
+        _ => a == b,
+    }
+}
+
+fn builtin_deep_eq(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("deep_eq", &args, 2)?;
+    Ok(Some(Value::Bool(deep_eq_values(&args[0], &args[1]))))
 }
 
 fn builtin_split(args: Vec<Value>) -> MixResult<Option<Value>> {
@@ -8808,12 +9147,23 @@ fn quote_mix_string(s: &str) -> String {
     out
 }
 
+/// grep_lines(text, pattern) — grep() with the args the consistent
+/// (subject-first) way round; the 0.63.0 twin that survives release B.
+fn builtin_grep_lines(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("grep_lines", &args, 2)?;
+    grep_impl(&args[1].to_mix_string(), &args[0].to_mix_string())
+}
+
 /// grep(pattern, text) — return lines from text matching pattern.
 /// Uses regex when the regex feature is enabled, otherwise substring match.
 fn builtin_grep(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("grep", &args, 2)?;
-    let pattern = args[0].to_mix_string();
-    let text = args[1].to_mix_string();
+    grep_impl(&args[0].to_mix_string(), &args[1].to_mix_string())
+}
+
+fn grep_impl(pattern: &str, text: &str) -> MixResult<Option<Value>> {
+    let pattern = pattern.to_string();
+    let text = text.to_string();
 
     #[cfg(feature = "regex")]
     let re = compile_regex(&pattern)?;
@@ -10649,6 +10999,77 @@ fn builtin_regex_replace(args: Vec<Value>) -> MixResult<Option<Value>> {
     )))
 }
 
+// --- Subject-first regex family (0.63.0). Same engine as the legacy
+// pattern-first regex_* names; the argument order matches every literal-
+// string builtin (subject first). re_find additionally returns CODEPOINT
+// offsets so its start/end compose with substr/slice/index_of — the
+// legacy regex_find keeps raw UTF-8 byte offsets until it is deleted.
+
+/// re_match(s, pattern) — subject-first regex test.
+#[cfg(feature = "regex")]
+fn builtin_re_match(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("re_match", &args, 2)?;
+    let re = compile_regex(&args[1].to_mix_string())?;
+    Ok(Some(Value::Bool(re.is_match(&args[0].to_mix_string()))))
+}
+
+/// re_find(s, pattern) — all matches, {match, start, end[, groups]} in
+/// CODEPOINT offsets.
+#[cfg(feature = "regex")]
+fn builtin_re_find(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("re_find", &args, 2)?;
+    let text = args[0].to_mix_string();
+    let re = compile_regex(&args[1].to_mix_string())?;
+    let mut results = Vec::new();
+    for caps in re.captures_iter(&text) {
+        let m = caps.get(0).unwrap();
+        // Codepoint offsets: count chars in the byte prefix (match starts
+        // and ends on char boundaries, so both slices are valid).
+        let start_cp = text[..m.start()].chars().count();
+        let end_cp = start_cp + text[m.start()..m.end()].chars().count();
+        let mut entry = indexmap::IndexMap::new();
+        entry.insert("match".into(), Value::String(m.as_str().to_string()));
+        entry.insert("start".into(), Value::Number(start_cp as f64));
+        entry.insert("end".into(), Value::Number(end_cp as f64));
+        if caps.len() > 1 {
+            let groups: Vec<Value> = (1..caps.len())
+                .map(|i| match caps.get(i) {
+                    Some(g) => Value::String(g.as_str().to_string()),
+                    None => Value::Nil,
+                })
+                .collect();
+            entry.insert("groups".into(), Value::list(groups));
+        }
+        results.push(Value::map(entry));
+    }
+    Ok(Some(Value::list(results)))
+}
+
+/// re_replace(s, pattern, replacement) — replace all matches, subject first.
+#[cfg(feature = "regex")]
+fn builtin_re_replace(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("re_replace", &args, 3)?;
+    let text = args[0].to_mix_string();
+    let re = compile_regex(&args[1].to_mix_string())?;
+    let replacement = args[2].to_mix_string();
+    Ok(Some(Value::String(
+        re.replace_all(&text, replacement.as_str()).into_owned(),
+    )))
+}
+
+/// re_split(s, pattern) — split s on each match, subject first.
+#[cfg(feature = "regex")]
+fn builtin_re_split(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("re_split", &args, 2)?;
+    let text = args[0].to_mix_string();
+    let re = compile_regex(&args[1].to_mix_string())?;
+    let parts: Vec<Value> = re
+        .split(&text)
+        .map(|s| Value::String(s.to_string()))
+        .collect();
+    Ok(Some(Value::list(parts)))
+}
+
 /// regex_split(pattern, text) — split text on regex pattern.
 #[cfg(feature = "regex")]
 fn builtin_regex_split(args: Vec<Value>) -> MixResult<Option<Value>> {
@@ -11398,15 +11819,43 @@ fn mix_format(name: &str, tmpl: &str, args: &[Value]) -> MixResult<String> {
             }
         }
 
-        let width_start = i;
-        while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+        // Width: literal digits, or `*` taking the width from the next
+        // argument (printf convention, 0.63.0) — %*s / %-*s / %*d / %0*d.
+        // The width argument must be a non-negative integer; anything
+        // else is an error, never a guess.
+        let mut width: Option<usize> = None;
+        if i < bytes.len() && bytes[i] == b'*' {
             i += 1;
-        }
-        let width: Option<usize> = if i > width_start {
-            tmpl[width_start..i].parse().ok()
+            let spec_so_far = &tmpl[spec_start..i];
+            let v = take_arg(&mut arg_idx, name, spec_so_far)?;
+            let n = v.to_number().ok_or_else(|| MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "{}: '*' width for '{}' expects a number, got {}",
+                    name,
+                    spec_so_far,
+                    v.type_name()
+                ),
+            })?;
+            if n.fract() != 0.0 || !(0.0..=1_000_000.0).contains(&n) {
+                return Err(MixError::RuntimeError {
+                    span: None,
+                    msg: format!(
+                        "{}: '*' width for '{}' must be a non-negative integer (≤ 1000000), got {}",
+                        name, spec_so_far, n
+                    ),
+                });
+            }
+            width = Some(n as usize);
         } else {
-            None
-        };
+            let width_start = i;
+            while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                i += 1;
+            }
+            if i > width_start {
+                width = tmpl[width_start..i].parse().ok();
+            }
+        }
 
         let mut precision: Option<usize> = None;
         if i < bytes.len() && bytes[i] as char == '.' {
@@ -11493,7 +11942,7 @@ fn mix_format(name: &str, tmpl: &str, args: &[Value]) -> MixResult<String> {
                 return Err(MixError::RuntimeError {
                     span: None,
                     msg: format!(
-                        "{}: unknown format specifier '%{}' (supported: %s %d %f %.Nf %Nd %-Ns %0Nd %%)",
+                        "{}: unknown format specifier '%{}' (supported: %s %d %f %.Nf %Nd %-Ns %0Nd %*s %-*s %0*d %%)",
                         name, other
                     ),
                 });
@@ -19046,6 +19495,30 @@ mod char_aware_tests {
             "grapheme_reverse",
             "grapheme_substr",
             "grep",
+            // Subject-first string helpers + regex family + deep_eq (0.63.0)
+            "before",
+            "after",
+            "before_last",
+            "after_last",
+            "split_once",
+            "rsplit_once",
+            "between",
+            "strip_prefix",
+            "strip_suffix",
+            "replace_first",
+            "count_of",
+            "ltrim",
+            "rtrim",
+            "lines",
+            "fields",
+            "chars",
+            "last_index_of",
+            "deep_eq",
+            "re_match",
+            "re_find",
+            "re_replace",
+            "re_split",
+            "grep_lines",
             "hash_blake3",
             "hash_sha256",
             "has_key",

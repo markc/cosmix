@@ -123,6 +123,26 @@ async fn test_control() {
 }
 
 #[tokio::test]
+async fn test_string_helpers() {
+    run_test_script("string_helpers.mix").await;
+}
+
+#[tokio::test]
+async fn test_re_family() {
+    run_test_script("re_family.mix").await;
+}
+
+#[tokio::test]
+async fn test_deep_eq() {
+    run_test_script("deep_eq.mix").await;
+}
+
+#[tokio::test]
+async fn test_fmt_dynamic_width() {
+    run_test_script("fmt_dynamic_width.mix").await;
+}
+
+#[tokio::test]
 async fn test_ternary() {
     run_test_script("ternary.mix").await;
 }

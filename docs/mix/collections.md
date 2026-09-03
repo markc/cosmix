@@ -527,7 +527,17 @@ still:    {host: node1, port: 8080}
 
 Two lists never compare equal — *even with identical contents*, and even the
 same variable against itself (`$a == $a` is `false`). The same holds for maps.
-To compare lists, compare a derived value (length, `join`, an element):
+**Use `deep_eq(a, b)` (0.63.0)** — structural equality: maps compare by key
+set with insertion order ignored, lists elementwise in order, scalars as
+`==`:
+
+```mix
+print(deep_eq([1, {x: 2}], [1, {x: 2}]))   -- true
+print(deep_eq({a: 1, b: 2}, {b: 2, a: 1})) -- true (map order ignored)
+print(deep_eq([1, 2], [2, 1]))             -- false (list order matters)
+```
+
+Or compare a derived value (length, `join`, an element):
 
 ```mix
 $a = [1, 2, 3]

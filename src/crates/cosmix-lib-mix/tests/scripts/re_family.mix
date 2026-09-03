@@ -1,0 +1,51 @@
+-- re_family.mix: subject-first regex family (0.63.0) — re_match /
+-- re_replace / re_split / grep_lines, and re_find's CODEPOINT offsets
+-- (legacy regex_find keeps byte offsets until release B — both pinned
+-- here on the same input).
+-- Expected output:
+-- true
+-- false
+-- a#b#c
+-- 09/2026-03
+-- 3:abc
+-- 1,2
+-- x
+-- 2
+-- 0-5:caféx:x
+-- 9-14
+-- caféy
+-- re-find-absent-empty
+-- 2
+-- 2:Alpha,Apex
+-- 0
+-- re-bad-pattern-raises
+
+-- subject-first matches
+print(re_match("hello world", "wor.d"))
+print(re_match("hello", "^wor"))
+print(re_replace("a1b22c", "[0-9]+", "#"))
+print(re_replace("2026-09-03", "^([0-9]+)-([0-9]+)", "$2/$1"))
+$parts = re_split("a1b22c", "[0-9]+")
+print(len($parts) .. ":" .. $parts[0] .. $parts[1] .. $parts[2])
+-- re_find: CODEPOINT offsets — the property that composes with substr
+$m = re_find("éx", "x")
+print($m[0].start .. "," .. $m[0].end)
+print(substr("éx", $m[0].start, 1))
+$mm = re_find("caféx et caféy", "café(.)")
+print(len($mm))
+print($mm[0].start .. "-" .. $mm[0].end .. ":" .. $mm[0].match .. ":" .. $mm[0].groups[0])
+print($mm[1].start .. "-" .. $mm[1].end)
+print(substr("caféx et caféy", $mm[1].start, 5))
+if len(re_find("abc", "z")) == 0 then print "re-find-absent-empty" end
+-- legacy regex_find on the same input still returns BYTE offsets (until B)
+print(regex_find("x", "éx")[0].start)
+-- grep_lines: subject first
+$hits = grep_lines("Alpha\nbeta\nApex", "^A")
+print(len($hits) .. ":" .. $hits[0] .. "," .. $hits[1])
+print(len(grep_lines("a\nb", "z")))
+-- errors still loud
+try
+  re_match("x", "[unterminated")
+catch $e
+  print "re-bad-pattern-raises"
+end
